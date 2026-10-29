@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Ahmed ARIF <arif.ing@outlook.com>
 #
-# Builds the Wine Mono payload of a LiberNT release:
-#   libernt-wine-mono-<version>-<release>-<arch>.msi  the upstream Wine Mono MSI with the
+# Builds the Wine Mono payload of a OpenNT release:
+#   opennt-wine-mono-<version>-<release>-<arch>.msi  the upstream Wine Mono MSI with the
 #   assemblies rebuilt from patches/ (build_assemblies.sh, docker) and the runtime DLLs rebuilt
 #   from patches/mono-runtime-*.patch (build_runtime.sh, docker) swapped into image.cab, and
 #   the Windows Runtime projection built from winrt/ added next to mscorlib, and the mscorlib type
@@ -199,8 +199,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("work", type=Path, help="work directory (sources, docker build, upstream MSIs)")
     parser.add_argument("out", type=Path, help="output directory")
-    parser.add_argument("--release", default="1", help="LiberNT release number of the payload")
-    parser.add_argument("--widl", default=shutil.which("widl"), help="widl of a LiberNT build (host-tools/bin/widl)")
+    parser.add_argument("--release", default="1", help="OpenNT release number of the payload")
+    parser.add_argument("--widl", default=shutil.which("widl"), help="widl of a OpenNT build (host-tools/bin/widl)")
     args = parser.parse_args()
     for tool in ("msiinfo", "msibuild", "gcab", "docker", "git", "7zz"):
         if not shutil.which(tool):
@@ -233,7 +233,7 @@ def main():
         run(args.widl, f"--win{bits}", "-t", "-o", out / "mscorlib.tlb", *includes, f"-L{out}", build / f"mscorlib{bits}.idl")
         additions[key] = (component, filename, out / "mscorlib.tlb")
     for arch, msi in msis.items():
-        dst = args.out / f"libernt-wine-mono-{VERSION}-{args.release}-{arch}.msi"
+        dst = args.out / f"opennt-wine-mono-{VERSION}-{args.release}-{arch}.msi"
         repack(msi, dst, replacements, additions)
         print(f"{dst.name} {dst.stat().st_size} {sha256(dst)}")
 

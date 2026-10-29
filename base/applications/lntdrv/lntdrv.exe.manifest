@@ -3,11 +3,11 @@
   xmlns="urn:schemas-microsoft-com:asm.v1"
   manifestVersion="1.0">
 <assemblyIdentity
-    name="LiberNT.lntdrv"
+    name="OpenNT.lntdrv"
     processorArchitecture="*"
     version="1.0.0.0"
     type="win32"/>
-<description>LiberNT Driver Installer</description>
+<description>OpenNT Driver Installer</description>
 <dependency>
     <dependentAssembly>
         <assemblyIdentity

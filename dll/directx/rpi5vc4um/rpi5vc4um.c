@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Raspberry Pi 5 VideoCore VII user-mode display driver
+ * PROJECT:     OpenNT Raspberry Pi 5 VideoCore VII user-mode display driver
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     The user-mode half of the rpi5vc4 WDDM driver
  * COPYRIGHT:   Copyright 2026 LiberNT WDDM Team

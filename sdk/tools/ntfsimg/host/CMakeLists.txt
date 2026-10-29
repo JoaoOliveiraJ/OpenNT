@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.17)
+project(OpenNTNtfsHost LANGUAGES C CXX)
+get_filename_component(REACTOS_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+function(add_host_tool target)
+    add_executable(${target} ${ARGN})
+endfunction()
+add_subdirectory("${REACTOS_SOURCE_DIR}/sdk/tools/ntfsimg" ntfsimg-build)

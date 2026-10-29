@@ -1,5 +1,11 @@
 # Credits
 
+## OpenNT
+
+OpenNT is maintained by João Oliveira (https://github.com/JoaoOliveiraJ).
+This fork builds on LiberNT and ReactOS. The original contributors and their
+copyright notices are retained below and in the source files.
+
 ## LiberNT
 
 LiberNT is available thanks to the work of:

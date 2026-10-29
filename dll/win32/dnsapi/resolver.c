@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT DNS API
+ * PROJECT:     OpenNT DNS API
  * LICENSE:     LGPL-2.1-or-later (https://spdx.org/licenses/LGPL-2.1-or-later)
  * PURPOSE:     DNS stub resolver over IPv4 and IPv6 servers
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>

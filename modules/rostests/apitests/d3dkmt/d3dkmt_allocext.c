@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT D3DKMT API Tests
+ * PROJECT:     OpenNT D3DKMT API Tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     In-depth D3DKMT allocation-feature coverage: standard allocations,
  *              the CreateAllocation flags matrix, allocation priority get/set,

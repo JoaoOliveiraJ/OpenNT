@@ -3979,10 +3979,10 @@ HWND TrayMedia_FindSession(BOOL *pbPlaying)
     BOOL bBestPlaying = FALSE;
     DWORD dwBestTick = 0;
 
-    while ((hwnd = FindWindowExW(HWND_MESSAGE, hwnd, L"LiberNTMediaSession", NULL)) != NULL)
+    while ((hwnd = FindWindowExW(HWND_MESSAGE, hwnd, L"OpenNTMediaSession", NULL)) != NULL)
     {
-        ULONG_PTR Status = (ULONG_PTR)GetPropW(hwnd, L"LiberNTMediaStatus");
-        DWORD dwTick = (DWORD)(ULONG_PTR)GetPropW(hwnd, L"LiberNTMediaTick");
+        ULONG_PTR Status = (ULONG_PTR)GetPropW(hwnd, L"OpenNTMediaStatus");
+        DWORD dwTick = (DWORD)(ULONG_PTR)GetPropW(hwnd, L"OpenNTMediaTick");
         BOOL bPlaying = (Status == 4);
 
         if (!Status)

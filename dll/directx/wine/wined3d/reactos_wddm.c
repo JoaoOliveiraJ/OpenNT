@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Direct3D
+ * PROJECT:     OpenNT Direct3D
  * LICENSE:     LGPL-2.1-or-later (https://spdx.org/licenses/LGPL-2.1-or-later)
  * PURPOSE:     Adapter identity of a WDDM adapter
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

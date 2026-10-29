@@ -1,3 +1,3 @@
 Imported from microsoft/wil a1c0cbe1d7065aef6333399d3e25608eacdffc0f (2026-10-23), include/wil only
-LiberNT changes:
+OpenNT changes:
   wil/common.h: the GCC atomic helpers for non-MSVC compilers are skipped under __REACTOS__, whose headers already define them

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Named Pipe FileSystem
+ * PROJECT:     OpenNT Named Pipe FileSystem
  * LICENSE:     BSD - See COPYING.ARM in the top level directory
  * PURPOSE:     Named pipe directory enumeration
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

@@ -119,7 +119,7 @@ jobs:
     - name: Build images
       run: |
         . "$HOME/.local/opt/rosbe/rosbe-env.sh"
-        ninja -C ${{steps.configure.outputs.outdir}} bootcd liberntimg liberntvhd -k0
+        ninja -C ${{steps.configure.outputs.outdir}} bootcd openntimg openntvhd -k0
 
     - name: Print ccache statistics
       if: ${{ always() && steps.ccache_restore.outcome == 'success' }}
@@ -157,23 +157,23 @@ jobs:
         name: bootcd-iso-${{steps.images.outputs.tag}}
         path: ${{steps.configure.outputs.outdir}}/bootcd.iso
 
-    - name: Upload LiberNT.img
+    - name: Upload OpenNT.img
       uses: actions/upload-artifact@v7
       with:
-        name: LiberNT-img-${{steps.images.outputs.tag}}
-        path: ${{steps.configure.outputs.outdir}}/LiberNT.img
+        name: OpenNT-img-${{steps.images.outputs.tag}}
+        path: ${{steps.configure.outputs.outdir}}/OpenNT.img
 
-    - name: Upload LiberNT.vhd
+    - name: Upload OpenNT.vhd
       uses: actions/upload-artifact@v7
       with:
-        name: LiberNT-vhd-${{steps.images.outputs.tag}}
-        path: ${{steps.configure.outputs.outdir}}/LiberNT.vhd
+        name: OpenNT-vhd-${{steps.images.outputs.tag}}
+        path: ${{steps.configure.outputs.outdir}}/OpenNT.vhd
 
-    - name: Upload LiberNT.vhdx
+    - name: Upload OpenNT.vhdx
       uses: actions/upload-artifact@v7
       with:
-        name: LiberNT-vhdx-${{steps.images.outputs.tag}}
-        path: ${{steps.configure.outputs.outdir}}/LiberNT.vhdx
+        name: OpenNT-vhdx-${{steps.images.outputs.tag}}
+        path: ${{steps.configure.outputs.outdir}}/OpenNT.vhdx
 
     - name: Check build dependencies
       run: python3 sdk/tools/depcheck.py ${{steps.configure.outputs.outdir}} --mode depfiles --nested --fail-on-gaps
@@ -204,7 +204,7 @@ jobs:
       run: |
         choco install -y --no-progress ninja winflexbison3
         python -m pip install --upgrade mako pyyaml packaging
-        # LiberNT's CMake looks for flex/bison; winflexbison3 ships them as
+        # OpenNT's CMake looks for flex/bison; winflexbison3 ships them as
         # win_flex/win_bison, so expose both names on PATH.
         $tools = "C:\ProgramData\chocolatey\lib\winflexbison3\tools"
         if (-not (Test-Path "$tools\win_flex.exe")) { $tools = Split-Path (Get-Command win_flex).Source }

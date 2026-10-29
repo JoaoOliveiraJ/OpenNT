@@ -183,6 +183,17 @@ else()
     include(sdk/cmake/host-tools.cmake)
     setup_host_tools()
 
+    if(CMAKE_HOST_WIN32)
+        set(HOST_NTFSIMG "" CACHE FILEPATH "Host ntfsimg executable built with MSYS2")
+        if(HOST_NTFSIMG AND NOT TARGET native-ntfsimg)
+            if(NOT EXISTS "${HOST_NTFSIMG}")
+                message(FATAL_ERROR "HOST_NTFSIMG does not exist: ${HOST_NTFSIMG}")
+            endif()
+            add_executable(native-ntfsimg IMPORTED GLOBAL)
+            set_target_properties(native-ntfsimg PROPERTIES IMPORTED_LOCATION "${HOST_NTFSIMG}")
+        endif()
+    endif()
+
     # We don't need CMake importlib handling.
     unset(CMAKE_IMPORT_LIBRARY_SUFFIX)
 

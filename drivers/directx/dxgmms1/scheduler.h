@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT DirectX Graphics Memory Manager and Scheduler
+ * PROJECT:     OpenNT DirectX Graphics Memory Manager and Scheduler
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     GPU command-buffer scheduler — public interface exported to the
  *              rest of dxgmms1 and to dxgkrnl via the DXGMMS_INTERFACE table.

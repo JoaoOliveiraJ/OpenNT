@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Boot Loader
+ * PROJECT:     OpenNT Boot Loader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Mark a firmware boot as a test run with the SMBIOS OEM string the harness passes
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -13,7 +13,7 @@
 #define SMBIOS_OEM_STRINGS_LENGTH   5
 #define SMBIOS_MAX_HANDLE           0xFEFF
 
-static const CHAR TestRunString[] = "libernt.applaunch";
+static const CHAR TestRunString[] = "opennt.applaunch";
 static EFI_GUID SmbiosGuid = SMBIOS_TABLE_GUID;
 static EFI_GUID Smbios3Guid = SMBIOS3_TABLE_GUID;
 

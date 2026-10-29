@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT kernel-mode tests
+ * PROJECT:     OpenNT kernel-mode tests
  * FILE:        modules/rostests/kmtests/ntos_mm/NtProcessClone.c
  * PURPOSE:     Process address-space cloning regression tests
  *

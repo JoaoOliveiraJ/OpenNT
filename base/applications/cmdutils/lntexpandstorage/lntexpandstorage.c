@@ -1,7 +1,7 @@
 /*
- * PROJECT:     LiberNT storage expansion tool
+ * PROJECT:     OpenNT storage expansion tool
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
- * PURPOSE:     Grow the flashed LiberNT partition to fill the storage device
+ * PURPOSE:     Grow the flashed OpenNT partition to fill the storage device
  * COPYRIGHT:   Copyright 2026 Ahmed Arif
  *
  * Usage: lntexpandstorage [/d N] [/p N] [/pad MB] [/min MB] [/n] [/y] [/r]
@@ -488,7 +488,7 @@ ScheduleUniqueRetry(void)
     }
 
     RegSetValueExW(Key,
-                   L"LiberNTDiskSignature",
+                   L"OpenNTDiskSignature",
                    0,
                    REG_SZ,
                    (const BYTE*)Command,
@@ -715,7 +715,7 @@ MakeDiskUnique(ULONG DriveNumber)
         return 1;
     }
 
-    if (Layout->PartitionStyle != PARTITION_STYLE_MBR || Layout->Mbr.Signature != LIBERNT_STANDARD_SIGNATURE)
+    if (Layout->PartitionStyle != PARTITION_STYLE_MBR || Layout->Mbr.Signature != OPENNT_STANDARD_SIGNATURE)
     {
         Print("PhysicalDrive%lu already has its own disk signature.\n", DriveNumber);
         HeapFree(GetProcessHeap(), 0, Layout);
@@ -742,7 +742,7 @@ MakeDiskUnique(ULONG DriveNumber)
             CloseHandle(Handle);
             return 1;
         }
-    } while (Signature == 0 || Signature == LIBERNT_STANDARD_SIGNATURE || IsSignatureInUse(DriveNumber, Signature));
+    } while (Signature == 0 || Signature == OPENNT_STANDARD_SIGNATURE || IsSignatureInUse(DriveNumber, Signature));
 
     Devices = (BCD_DEVICE_VALUE*)HeapAlloc(GetProcessHeap(), 0, BCD_MAX_DEVICES * sizeof(*Devices));
     if (!Devices)

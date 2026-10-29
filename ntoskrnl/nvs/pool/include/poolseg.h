@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Pool Allocator
+ * PROJECT:     OpenNT Pool Allocator
  * FILE:        ntoskrnl/nvs/pool/include/poolseg.h
  * PURPOSE:     Pool segment structures and interfaces
  *

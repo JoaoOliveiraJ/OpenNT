@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT DirectX Graphics Kernel (dxgkrnl.sys)
+ * PROJECT:     OpenNT DirectX Graphics Kernel (dxgkrnl.sys)
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Public declarations for adapter.c
  *              (miniport registration and adapter lifecycle)

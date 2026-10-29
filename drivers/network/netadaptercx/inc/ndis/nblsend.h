@@ -1,7 +1,7 @@
 /*
- * PROJECT:     LiberNT NetAdapterCx
+ * PROJECT:     OpenNT NetAdapterCx
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
- * PURPOSE:     WDK ndis/nblsend.h, part of ndis.h in the LiberNT DDK
+ * PURPOSE:     WDK ndis/nblsend.h, part of ndis.h in the OpenNT DDK
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>
  */
 

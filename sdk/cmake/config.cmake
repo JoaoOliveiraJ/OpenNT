@@ -210,7 +210,7 @@ cmake_dependent_option(ENABLE_ROSTESTS "Whether to build the ReactOS test suite.
 
 option(ENABLE_MESA_LLVMPIPE "Package the LLVMpipe OpenGL and Lavapipe Vulkan software ICDs." OFF)
 cmake_dependent_option(MESA_LLVMPIPE_FROM_SOURCE
-                       "Build LLVM and LLVMpipe into mesa_gallium.dll instead of using the LiberNT release payload." OFF
+                       "Build LLVM and LLVMpipe into mesa_gallium.dll instead of using the OpenNT release payload." OFF
                        "ENABLE_MESA_LLVMPIPE" OFF)
 
 cmake_dependent_option(ENABLE_FEX_ARM64EC
@@ -253,7 +253,7 @@ cmake_dependent_option(ENABLE_FFMPEG
                        "Build the H.264 and AAC Media Foundation decoders against the LGPL FFmpeg payload" ON
                        "ARCH STREQUAL i386 OR ARCH STREQUAL amd64 OR ARCH STREQUAL arm64;CMAKE_C_COMPILER_ID STREQUAL Clang;NOT MSVC" OFF)
 cmake_dependent_option(FFMPEG_FROM_SOURCE
-                       "Build the LGPL FFmpeg libraries from the ffmpeg feed instead of using the LiberNT release payload." OFF
+                       "Build the LGPL FFmpeg libraries from the ffmpeg feed instead of using the OpenNT release payload." OFF
                        "ENABLE_FFMPEG" OFF)
 
 cmake_dependent_option(ENABLE_DXILCONV

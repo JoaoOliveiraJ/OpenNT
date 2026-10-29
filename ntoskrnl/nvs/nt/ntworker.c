@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NT Virtual Memory Subsystem
+ * PROJECT:     OpenNT NT Virtual Memory Subsystem
  * FILE:        ntoskrnl/nvs/nt/ntworker.c
  * PURPOSE:     Memory manager background worker integration
  *

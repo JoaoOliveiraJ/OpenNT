@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT API tests
+ * PROJECT:     OpenNT API tests
  * LICENSE:     GPL-3.0-or-later
  * PURPOSE:     Exercise a windowed WGL producer through DWM and display scanout.
  */

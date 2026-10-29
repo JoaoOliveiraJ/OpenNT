@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT FreeLoader
+ * PROJECT:     OpenNT FreeLoader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Long mode exception handling for the PC-AT (BIOS) loader
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

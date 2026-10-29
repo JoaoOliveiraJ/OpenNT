@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Display Driver Model
+ * PROJECT:     OpenNT Display Driver Model
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Windows 11 24H2 dxgkrnl public NtGdi export inventory
  * COPYRIGHT:   Copyright 2026 LiberNT Contributors

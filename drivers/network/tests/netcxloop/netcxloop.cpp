@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT network tests
+ * PROJECT:     OpenNT network tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     NetAdapterCx client that answers ARP and ICMP echo as a simulated link peer
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>

@@ -344,8 +344,8 @@ END
 
 STRINGTABLE
 BEGIN
-    IDS_PARSE_ADDR_ERR_TITLE "LiberNT Intéző"
-    IDS_PARSE_ADDR_ERR_TEXT "A LiberNT Intéző nem találja a következőt: '%1'. Ellenőrizze az elgépeléseket és próbálja újra."
+    IDS_PARSE_ADDR_ERR_TITLE "OpenNT Intéző"
+    IDS_PARSE_ADDR_ERR_TEXT "A OpenNT Intéző nem találja a következőt: '%1'. Ellenőrizze az elgépeléseket és próbálja újra."
 END
 
 STRINGTABLE

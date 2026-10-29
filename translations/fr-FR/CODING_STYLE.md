@@ -2,7 +2,7 @@
 
 > [English](../../CODING_STYLE.md) | [中文](../zh-CN/CODING_STYLE.md) | **Français** | [Español](../es-ES/CODING_STYLE.md) | [日本語](../ja-JP/CODING_STYLE.md) | [العربية](../ar-MA/CODING_STYLE.md)
 
-Cet article décrit les règles générales de style de code à appliquer au nouveau code de LiberNT. Ces règles s'appliquent exclusivement aux fichiers source C et C++. Elles viennent du style de code de ReactOS, adopté par les membres de ReactOS lors de leur réunion d'octobre 2013.
+Cet article décrit les règles générales de style de code à appliquer au nouveau code de OpenNT. Ces règles s'appliquent exclusivement aux fichiers source C et C++. Elles viennent du style de code de ReactOS, adopté par les membres de ReactOS lors de leur réunion d'octobre 2013.
 
 Le code existant n'est pas converti à ce style à l'occasion d'une modification sans rapport. Consultez [Remarques sur le reformatage du code existant](#remarques-sur-le-reformatage-du-code-existant) pour plus de détails.
 
@@ -10,11 +10,11 @@ Le code synchronisé avec d'autres sources (comme Wine) ne doit pas être rééc
 
 ## Structure des fichiers
 
-1. Chaque nouveau fichier source de LiberNT doit comporter un en-tête comme celui-ci :
+1. Chaque nouveau fichier source de OpenNT doit comporter un en-tête comme celui-ci :
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -29,7 +29,7 @@ Ajoutez-vous à la section `COPYRIGHT` d'un fichier si vous y avez apporté une 
 
 La ligne `FILE` de l'ancien en-tête doit être supprimée.
 
-2. Le générateur de documentation [Doxygen](https://www.doxygen.nl/) est utilisé pour le code de LiberNT, avec le `Doxyfile` du répertoire racine ; utilisez donc un en-tête approprié pour les fonctions, voir [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) dans le wiki de ReactOS pour les détails.
+2. Le générateur de documentation [Doxygen](https://www.doxygen.nl/) est utilisé pour le code de OpenNT, avec le `Doxyfile` du répertoire racine ; utilisez donc un en-tête approprié pour les fonctions, voir [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) dans le wiki de ReactOS pour les détails.
 
 ## Indentation et largeur de ligne
 

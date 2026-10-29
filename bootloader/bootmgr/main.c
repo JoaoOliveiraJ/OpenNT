@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Boot Loader
+ * PROJECT:     OpenNT Boot Loader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Boot manager main routine
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -17,11 +17,11 @@
 #define BM_WINDOWS_MANAGER L"\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
 #define BM_WINDOWS_STORE   L"\\EFI\\Microsoft\\Boot\\BCD"
 #define BM_WINDOWS_TITLE   L"Windows Boot Manager"
-#define BM_LIBERNT_ENTRY   L"{354fa6e5-5e45-49af-91bf-1fd2754e470a}"
+#define BM_OPENNT_ENTRY   L"{354fa6e5-5e45-49af-91bf-1fd2754e470a}"
 
 static const PCWSTR BmStorePaths[] =
 {
-    L"\\EFI\\LiberNT\\Boot\\BCD",
+    L"\\EFI\\OpenNT\\Boot\\BCD",
     L"\\Boot\\BCD",
 };
 
@@ -43,7 +43,7 @@ static PCSTR BmToolMenuNames[BM_MAX_TOOLS];
 static ULONG BmCount;
 static ULONG BmToolCount;
 static ULONG BmSelected;
-static ULONG BmLiberNTEntry = MAXULONG;
+static ULONG BmOpenNTEntry = MAXULONG;
 
 static
 PVOID
@@ -186,7 +186,7 @@ BmBuildMenu(VOID)
     {
         BmMenuName(BmEntries[i].Description, BmNames[i]);
         BmMenuNames[i] = BmNames[i];
-        BmMenuIcons[i] = !BmEntries[i].FirmwareDevice ? UiMenuIconLiberNT :
+        BmMenuIcons[i] = !BmEntries[i].FirmwareDevice ? UiMenuIconOpenNT :
                          BmLogos[i].Pixels ? UiMenuIconImage : UiMenuIconDesktop;
         BmMenuImages[i] = BmLogos[i].Pixels ? &BmLogos[i] : NULL;
     }
@@ -271,10 +271,10 @@ BmChooseStartup(
         return TRUE;
     }
 
-    if (BmLiberNTEntry >= BmCount)
+    if (BmOpenNTEntry >= BmCount)
         return FALSE;
 
-    *Entry = &BmEntries[BmLiberNTEntry];
+    *Entry = &BmEntries[BmOpenNTEntry];
     return TRUE;
 }
 
@@ -536,8 +536,8 @@ BlMain(VOID)
 
         for (i = 0; i < BmCount; i++)
         {
-            if (_wcsicmp(BmEntries[i].Id, BM_LIBERNT_ENTRY) == 0)
-                BmLiberNTEntry = i;
+            if (_wcsicmp(BmEntries[i].Id, BM_OPENNT_ENTRY) == 0)
+                BmOpenNTEntry = i;
         }
 
         BmToolCount = BmEnumerateToolEntries(BmTools, RTL_NUMBER_OF(BmTools), &DefaultTool);

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Boot Loader
+ * PROJECT:     OpenNT Boot Loader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Operating system loader main routine
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -27,7 +27,7 @@ PVOID UefiServiceStack;
 
 static const PCWSTR OslStorePaths[] =
 {
-    L"\\EFI\\LiberNT\\Boot\\BCD",
+    L"\\EFI\\OpenNT\\Boot\\BCD",
     L"\\EFI\\Microsoft\\Boot\\BCD",
     L"\\Boot\\BCD",
 };

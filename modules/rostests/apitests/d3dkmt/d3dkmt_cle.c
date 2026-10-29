@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT D3DKMT API Tests
+ * PROJECT:     OpenNT D3DKMT API Tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     V3D 7.1 control-list encoder unit tests (UMD Stage 0).
  *              Pure computation — no adapter required; expected bytes are

@@ -890,7 +890,7 @@ NSP_NbnsQueryThread(LPVOID Parameter)
     {
         SOCKADDR_IN Local = {AF_INET};
 
-        Mutex = CreateMutexW(NULL, FALSE, L"Global\\LiberNTNetbiosNameService");
+        Mutex = CreateMutexW(NULL, FALSE, L"Global\\OpenNTNetbiosNameService");
         if (Mutex)
             WaitForSingleObject(Mutex, NSP_NBNS_TRIES * NSP_NBNS_TIMEOUT * 4);
         Local.sin_port = htons(NSP_NBNS_PORT);

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NetAdapterCx
+ * PROJECT:     OpenNT NetAdapterCx
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Packet Monitor client interface used by NetAdapterCx
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>
@@ -10,7 +10,7 @@
 #include <netiodef.h>
 #include <pktmonloc.h>
 
-/* TODO: attach to a Packet Monitor NMR provider once LiberNT has one. */
+/* TODO: attach to a Packet Monitor NMR provider once OpenNT has one. */
 
 DECLARE_HANDLE(PKTMON_COMPONENT_HANDLE);
 DECLARE_HANDLE(PKTMON_LOWEREDGE_HANDLE);

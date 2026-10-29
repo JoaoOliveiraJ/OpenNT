@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title">
+  <title id="title">OpenNT</title>
+  <rect width="1200" height="300" rx="24" fill="#ffffff"/>
+  <g transform="translate(62 52) scale(.55)" fill="#0161B6">
+    <rect x="0" y="60" width="88" height="296"/>
+    <rect x="0" y="268" width="299" height="88"/>
+    <rect x="108" y="0" width="299" height="89"/>
+    <rect x="319" y="0" width="88" height="296"/>
+  </g>
+  <text x="338" y="202" font-family="Segoe UI, Arial, sans-serif" font-size="156" font-weight="700" fill="#202124">OpenNT</text>
+</svg>

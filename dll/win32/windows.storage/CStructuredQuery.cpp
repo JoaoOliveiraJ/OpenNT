@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Windows Storage
+ * PROJECT:     OpenNT Windows Storage
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Structured query conditions, condition factory and condition evaluation
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Kernel32.dll
+ * PROJECT:     OpenNT Kernel32.dll
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     GetLogicalProcessorInformationEx
  * COPYRIGHT:   Copyright 2026 LiberNT Team

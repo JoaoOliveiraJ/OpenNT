@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NT Virtual Memory Subsystem
+ * PROJECT:     OpenNT NT Virtual Memory Subsystem
  * FILE:        ntoskrnl/nvs/include/mivad.h
  * PURPOSE:     Virtual address descriptor structures and interfaces
  *

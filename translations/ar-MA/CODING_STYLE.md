@@ -4,7 +4,7 @@
 
 > [English](../../CODING_STYLE.md) | [中文](../zh-CN/CODING_STYLE.md) | [Français](../fr-FR/CODING_STYLE.md) | [Español](../es-ES/CODING_STYLE.md) | [日本語](../ja-JP/CODING_STYLE.md) | **العربية**
 
-يصف هذا المقال الإرشادات العامة لأسلوب كتابة الشيفرة، والتي ينبغي اتباعها في الشيفرة الجديدة لـ LiberNT. تنطبق هذه الإرشادات حصرًا على ملفات المصدر بلغتي C وC++. وهي مأخوذة من أسلوب كتابة الشيفرة في ReactOS، الذي اتفق عليه أعضاء ReactOS في اجتماعهم في أكتوبر 2013.
+يصف هذا المقال الإرشادات العامة لأسلوب كتابة الشيفرة، والتي ينبغي اتباعها في الشيفرة الجديدة لـ OpenNT. تنطبق هذه الإرشادات حصرًا على ملفات المصدر بلغتي C وC++. وهي مأخوذة من أسلوب كتابة الشيفرة في ReactOS، الذي اتفق عليه أعضاء ReactOS في اجتماعهم في أكتوبر 2013.
 
 لا تُحوَّل الشيفرة الموجودة إلى هذا الأسلوب ضمن تغيير لا علاقة له بها. راجع [ملاحظات حول إعادة تنسيق الشيفرة الموجودة](#ملاحظات-حول-إعادة-تنسيق-الشيفرة-الموجودة) لمزيد من التفاصيل.
 
@@ -12,13 +12,13 @@
 
 ## بنية الملفات
 
-1. يجب أن يتضمن كل ملف مصدر جديد في LiberNT ترويسة ملف مثل هذه:
+1. يجب أن يتضمن كل ملف مصدر جديد في OpenNT ترويسة ملف مثل هذه:
 
 <div dir="ltr">
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -35,7 +35,7 @@
 
 ينبغي حذف السطر ‎`FILE`‎ من الترويسة القديمة.
 
-2. تُستخدم أداة توليد التوثيق [Doxygen](https://www.doxygen.nl/) في شيفرة LiberNT، مع الملف ‎`Doxyfile`‎ في المجلد الجذر، لذا استخدم ترويسة مناسبة للدوال، وراجع [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) في ويكي ReactOS للتفاصيل.
+2. تُستخدم أداة توليد التوثيق [Doxygen](https://www.doxygen.nl/) في شيفرة OpenNT، مع الملف ‎`Doxyfile`‎ في المجلد الجذر، لذا استخدم ترويسة مناسبة للدوال، وراجع [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) في ويكي ReactOS للتفاصيل.
 
 ## الإزاحة وعرض السطر
 

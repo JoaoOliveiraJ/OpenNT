@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT ACPI bus driver
+ * PROJECT:     OpenNT ACPI bus driver
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     ACPI fan policy driver
  * COPYRIGHT:   Copyright 2026 LiberNT Project

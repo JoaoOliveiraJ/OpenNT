@@ -1,8 +1,8 @@
-# Contribuer à LiberNT
+# Contribuer à OpenNT
 
 > [English](../../CONTRIBUTING.md) | [中文](../zh-CN/CONTRIBUTING.md) | **Français** | [Español](../es-ES/CONTRIBUTING.md) | [日本語](../ja-JP/CONTRIBUTING.md) | [العربية](../ar-MA/CONTRIBUTING.md)
 
-LiberNT accueille volontiers les rapports de bogues, les tests, les correctifs, les nouvelles fonctions et la documentation. Cette page explique comment envoyer votre travail. Les règles d'ingénierie que suit chaque modification se trouvent dans [AGENTS.md](../../AGENTS.md), et elles s'appliquent aussi bien aux contributeurs humains qu'aux outils d'IA.
+OpenNT accueille volontiers les rapports de bogues, les tests, les correctifs, les nouvelles fonctions et la documentation. Cette page explique comment envoyer votre travail. Les règles d'ingénierie que suit chaque modification se trouvent dans [AGENTS.md](../../AGENTS.md), et elles s'appliquent aussi bien aux contributeurs humains qu'aux outils d'IA.
 
 - [Que faire ?](#que-faire)
 - [Comment contribuer ?](#comment-contribuer)
@@ -12,16 +12,16 @@ LiberNT accueille volontiers les rapports de bogues, les tests, les correctifs, 
 **Avis juridique :** si vous avez vu du code source propriétaire de Microsoft Windows, votre contribution ne sera pas acceptée en raison d'une possible violation du droit d'auteur. Avant de contribuer, vous devez affirmer que ce qui suit est vrai :
 >Je jure par la présente que je n'ai ni utilisé ni vu le code source d'aucune version du système d'exploitation Windows
 >ni d'aucun produit Microsoft pouvant être lié au projet proposé et placé sous une licence incompatible
->avec une contribution à LiberNT, notamment, sans s'y limiter, le code source divulgué de Windows NT 3.5, NT 4 et 2000
+>avec une contribution à OpenNT, notamment, sans s'y limiter, le code source divulgué de Windows NT 3.5, NT 4 et 2000
 >et le Windows Research Kernel.
 
-LiberNT est développé en salle blanche : à partir des en-têtes du Windows SDK et du WDK, des symboles publics de Windows 11, de la documentation Microsoft et d'exécutions en boîte noire sous Windows 11. Consultez [Sources de vérité](../../AGENTS.md#sources-of-truth) pour savoir ce qui peut être utilisé ou non.
+OpenNT est développé en salle blanche : à partir des en-têtes du Windows SDK et du WDK, des symboles publics de Windows 11, de la documentation Microsoft et d'exécutions en boîte noire sous Windows 11. Consultez [Sources de vérité](../../AGENTS.md#sources-of-truth) pour savoir ce qui peut être utilisé ou non.
 
 ## Que faire ?
 
 ### Signaler des bogues
 
-Signalez les bogues dans les [Issues](https://github.com/LiberNT/LiberNT/issues). Indiquez l'architecture (amd64, i386, arm64 ou riscv64), le type de compilation, le commit que vous avez compilé et les étapes qui mènent au problème. Un journal de débogage du port série aide beaucoup.
+Signalez les bogues dans les [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues). Indiquez l'architecture (amd64, i386, arm64 ou riscv64), le type de compilation, le commit que vous avez compilé et les étapes qui mènent au problème. Un journal de débogage du port série aide beaucoup.
 
 ### Corriger des bogues
 
@@ -29,23 +29,23 @@ Corrigez le comportement sous-jacent, pas le symptôme, et faites la plus petite
 
 ### Corriger des tests
 
-Les tests vérifient LiberNT par rapport au comportement de Windows. Beaucoup ne passent pas non plus proprement sous Windows 11 ; avant de modifier LiberNT pour satisfaire un test, exécutez donc le même test sous Windows 11 et comparez les résultats vérification par vérification. Si Windows 11 échoue aussi à une vérification, c'est l'attente du test qui est fausse. Consultez [Tester par rapport à Windows 11](../../AGENTS.md#testing-against-windows-11).
+Les tests vérifient OpenNT par rapport au comportement de Windows. Beaucoup ne passent pas non plus proprement sous Windows 11 ; avant de modifier OpenNT pour satisfaire un test, exécutez donc le même test sous Windows 11 et comparez les résultats vérification par vérification. Si Windows 11 échoue aussi à une vérification, c'est l'attente du test qui est fausse. Consultez [Tester par rapport à Windows 11](../../AGENTS.md#testing-against-windows-11).
 
-### Tester LiberNT
+### Tester OpenNT
 
-Lancez LiberNT dans une machine virtuelle ou sur du vrai matériel et signalez ce qui ne fonctionne pas. Le vrai matériel compte surtout pour les pilotes : une machine virtuelle prouve seulement qu'un pilote s'installe et se charge.
+Lancez OpenNT dans une machine virtuelle ou sur du vrai matériel et signalez ce qui ne fonctionne pas. Le vrai matériel compte surtout pour les pilotes : une machine virtuelle prouve seulement qu'un pilote s'installe et se charge.
 
 ### Implémenter des nouveautés
 
-Windows 11 est la référence de compatibilité. Avant de commencer un travail important, demandez dans les [Issues](https://github.com/LiberNT/LiberNT/issues) ou sur [Discord](https://discord.gg/BpcKg7FZ2) si quelqu'un s'en occupe déjà.
+Windows 11 est la référence de compatibilité. Avant de commencer un travail important, demandez dans les [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues) si quelqu'un s'en occupe déjà.
 
 ### Écrire de la documentation
 
-Les guides et les notes de conception vont dans le [Wiki](https://github.com/LiberNT/LiberNT/wiki). Respectez les pratiques de [rétro-ingénierie en salle blanche], et n'écrivez que ce que montrent le code source, la documentation ou une exécution de tests.
+Les guides et les notes de conception vont dans le [dossier de documentation](https://github.com/JoaoOliveiraJ/OpenNT/tree/main/doc). Respectez les pratiques de [rétro-ingénierie en salle blanche], et n'écrivez que ce que montrent le code source, la documentation ou une exécution de tests.
 
 ### Code tiers
 
-Les composants synchronisés avec Wine sont listés dans [media/doc/WINESYNC.txt](../../media/doc/WINESYNC.txt), et le reste du code tiers dans [media/doc/3rd Party Files.txt](../../media/doc/3rd%20Party%20Files.txt). Gardez les modifications de LiberNT dans ce code sous `#ifdef __REACTOS__`, avec le code d'origine dans la branche `#else`, afin que la prochaine synchronisation les conserve.
+Les composants synchronisés avec Wine sont listés dans [media/doc/WINESYNC.txt](../../media/doc/WINESYNC.txt), et le reste du code tiers dans [media/doc/3rd Party Files.txt](../../media/doc/3rd%20Party%20Files.txt). Gardez les modifications de OpenNT dans ce code sous `#ifdef __REACTOS__`, avec le code d'origine dans la branche `#else`, afin que la prochaine synchronisation les conserve.
 
 ## Comment contribuer ?
 
@@ -53,7 +53,7 @@ Nous vous recommandons d'utiliser l'anglais dans les rapports de bogues et les d
 
 ### Pull requests
 
-Envoyez votre travail sous forme de [pull request] vers la branche `main-nt10`. Les pull requests vous permettent d'informer les autres des modifications que vous avez poussées vers un dépôt sur GitHub. Une fois la pull request ouverte, vous pouvez discuter et relire les modifications avec l'équipe et ajouter des commits de suivi avant leur fusion.
+Envoyez votre travail sous forme de [pull request] vers la branche `main`. Les pull requests vous permettent d'informer les autres des modifications que vous avez poussées vers un dépôt sur GitHub. Une fois la pull request ouverte, vous pouvez discuter et relire les modifications avec l'équipe et ajouter des commits de suivi avant leur fusion.
 
 Avant de l'ouvrir :
 
@@ -83,11 +83,11 @@ Vous pouvez utiliser des outils d'IA. Indiquez dans la pull request les parties 
 - *Cherchez des pull requests similaires avant d'envoyer la vôtre.* Une pull request ou une issue semblable a peut-être déjà été ouverte. Commentez et relisez plutôt celle-là.
 - *Gardez votre contribution petite et centrée sur son sujet.* Résistez à la tentation de corriger des problèmes sans rapport que vous croisez ; ouvrez plutôt une issue pour eux.
 - *Respectez notre __[style de code]__.*
-- *N'ayez pas peur de poser des questions.* Interrogez l'équipe sur [Discord](https://discord.gg/BpcKg7FZ2) ou sur [Matrix](https://matrix.to/#/#libernt:matrix.org).
+- *N'ayez pas peur de poser des questions.* Interrogez l'équipe sur [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues).
 
 ## Droits d'auteur et licences
 
-Vous conservez les droits d'auteur sur ce que vous écrivez. LiberNT n'exige ni cession de droits d'auteur ni accord de licence de contributeur.
+Vous conservez les droits d'auteur sur ce que vous écrivez. OpenNT n'exige ni cession de droits d'auteur ni accord de licence de contributeur.
 
 - Les nouveaux fichiers commencent par l'en-tête montré dans [Style de code](../../AGENTS.md#code-style), avec votre nom et votre adresse e-mail sur la ligne `COPYRIGHT` et un identifiant de licence SPDX.
 - Si vous apportez une modification importante à un fichier existant, vous pouvez ajouter votre propre ligne `COPYRIGHT` sous celles qui existent.
@@ -95,14 +95,14 @@ Vous conservez les droits d'auteur sur ce que vous écrivez. LiberNT n'exige ni 
 - Conservez la licence des fichiers que vous modifiez. Le code hérité de ReactOS conserve la licence indiquée dans son en-tête.
 - Ne copiez jamais de code dont la licence est incompatible avec la GNU GPL 3.0, et ne copiez jamais de code GPL de Linux.
 
-Consultez [CREDITS.md](../../CREDITS.md) pour connaître les personnes derrière LiberNT et ReactOS.
+Consultez [CREDITS.md](../../CREDITS.md) pour connaître les personnes derrière OpenNT et ReactOS.
 
 ## Par où commencer ?
 
-- Parcourez les [Issues](https://github.com/LiberNT/LiberNT/issues) ouvertes.
+- Parcourez les [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues) ouvertes.
 - Trouvez un test qui échoue, comparez-le avec Windows 11 et faites-le passer.
-- Lisez le [Wiki](https://github.com/LiberNT/LiberNT/wiki) pour les guides et les notes de conception.
-- Demandez de l'aide sur [Discord](https://discord.gg/BpcKg7FZ2) ou sur [Matrix](https://matrix.to/#/#libernt:matrix.org).
+- Lisez le [dossier de documentation](https://github.com/JoaoOliveiraJ/OpenNT/tree/main/doc) pour les guides et les notes de conception.
+- Demandez de l'aide sur [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues).
 
   [rétro-ingénierie en salle blanche]:                           https://en.wikipedia.org/wiki/Clean_room_design
   [pull request]:                                                https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests

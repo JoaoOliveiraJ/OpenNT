@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Utilities
+ * PROJECT:     OpenNT Utilities
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     USER critical section scalability bench
  */

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT kernel-mode tests
+ * PROJECT:     OpenNT kernel-mode tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Kernel-Mode Test Suite smart card driver library
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -168,8 +168,8 @@ Start(VOID)
         return FALSE;
     Extension.OsData->DeviceObject = TestDevice;
     SetReader(0);
-    RtlCopyMemory(Extension.VendorAttr.VendorName.Buffer, "LiberNT", 7);
-    Extension.VendorAttr.VendorName.Length = 7;
+    RtlCopyMemory(Extension.VendorAttr.VendorName.Buffer, "OpenNT", sizeof("OpenNT") - 1);
+    Extension.VendorAttr.VendorName.Length = sizeof("OpenNT") - 1;
     RtlCopyMemory(Extension.VendorAttr.IfdType.Buffer, "KMT", 3);
     Extension.VendorAttr.IfdType.Length = 3;
     Extension.VendorAttr.UnitNo = 5;

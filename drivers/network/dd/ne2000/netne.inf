@@ -70,7 +70,7 @@ LoadOrderGroup = NDIS
 
 [Strings]
 ; Non-localizable
-ReactOS = "LiberNT Project"
+ReactOS = "OpenNT Project"
 
 RealtekMfg = "Realtek"
 

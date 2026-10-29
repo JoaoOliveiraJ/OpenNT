@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="137" height="86" viewBox="0 0 137 86" role="img">
+  <title>OpenNT logon wordmark</title>
+  <rect width="137" height="86" fill="#7296dc"/>
+  <g transform="translate(53 14) scale(.075)" fill="#ffffff">
+    <rect x="0" y="60" width="88" height="296"/>
+    <rect x="0" y="268" width="299" height="88"/>
+    <rect x="108" y="0" width="299" height="89"/>
+    <rect x="319" y="0" width="88" height="296"/>
+  </g>
+  <text x="68.5" y="70" text-anchor="middle" font-family="Arial" font-size="28" font-weight="700" fill="#ffffff">OpenNT</text>
+</svg>

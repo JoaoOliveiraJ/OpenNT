@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Boot Loader
+ * PROJECT:     OpenNT Boot Loader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Boot manager screens: operating system menu and startup settings
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -429,7 +429,7 @@ BmUiChooseEntry(
         *Selected = 0;
 
     BmUiDrawFrame(Title, L"Choose an operating system to start:", L"ESC=Exit");
-    BmUiPutRow(BMUI_ROW_ADVANCED, L"To choose a startup option for LiberNT, press F8.", BMUI_ATTR_NORMAL);
+    BmUiPutRow(BMUI_ROW_ADVANCED, L"To choose a startup option for OpenNT, press F8.", BMUI_ATTR_NORMAL);
 
     for (;;)
     {

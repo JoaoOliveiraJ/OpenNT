@@ -2,7 +2,7 @@
 
 > **English** | [中文](translations/zh-CN/CODING_STYLE.md) | [Français](translations/fr-FR/CODING_STYLE.md) | [Español](translations/es-ES/CODING_STYLE.md) | [日本語](translations/ja-JP/CODING_STYLE.md) | [العربية](translations/ar-MA/CODING_STYLE.md)
 
-This article describes general coding style guidelines, which should be used for new LiberNT code. These guidelines apply exclusively to C and C++ source files. They come from the ReactOS coding style, which the members of ReactOS agreed on in their October 2013 meeting.
+This article describes general coding style guidelines, which should be used for new OpenNT code. These guidelines apply exclusively to C and C++ source files. They come from the ReactOS coding style, which the members of ReactOS agreed on in their October 2013 meeting.
 
 Existing code is not converted to this style as part of an unrelated change. See [Notes on reformatting existing code](#notes-on-reformatting-existing-code) for more details.
 
@@ -10,11 +10,11 @@ Code synchronized with other sources (like Wine) must not be rewritten. [3rd Par
 
 ## File Structure
 
-1. Every new LiberNT source code file should include a file header like this:
+1. Every new OpenNT source code file should include a file header like this:
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -29,7 +29,7 @@ You should add yourself to the `COPYRIGHT` section of a file if you did a major 
 
 `FILE` line of the old header should be removed.
 
-2. [Doxygen](https://www.doxygen.nl/) documentation generator is used for LiberNT codebase, with the `Doxyfile` in the top level directory, so use a proper header for functions, see [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) in the ReactOS wiki for details.
+2. [Doxygen](https://www.doxygen.nl/) documentation generator is used for OpenNT codebase, with the `Doxyfile` in the top level directory, so use a proper header for functions, see [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) in the ReactOS wiki for details.
 
 ## Indentation and line width
 

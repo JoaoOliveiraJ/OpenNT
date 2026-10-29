@@ -2,7 +2,7 @@
 
 > [English](../../CODING_STYLE.md) | [中文](../zh-CN/CODING_STYLE.md) | [Français](../fr-FR/CODING_STYLE.md) | [Español](../es-ES/CODING_STYLE.md) | **日本語** | [العربية](../ar-MA/CODING_STYLE.md)
 
-この記事では、LiberNT の新しいコードで使うべき一般的なコーディングスタイルのガイドラインを説明します。このガイドラインは C と C++ のソースファイルにのみ適用されます。これは ReactOS のコーディングスタイルに由来し、ReactOS のメンバーが 2013 年 10 月の会合で合意したものです。
+この記事では、OpenNT の新しいコードで使うべき一般的なコーディングスタイルのガイドラインを説明します。このガイドラインは C と C++ のソースファイルにのみ適用されます。これは ReactOS のコーディングスタイルに由来し、ReactOS のメンバーが 2013 年 10 月の会合で合意したものです。
 
 既存のコードを、無関係な変更のついでにこのスタイルへ変換することはしません。詳しくは[既存コードの再フォーマットに関する注意](#既存コードの再フォーマットに関する注意)を参照してください。
 
@@ -10,11 +10,11 @@
 
 ## ファイルの構成
 
-1. LiberNT の新しいソースコードファイルには、次のようなファイルヘッダーを含めてください。
+1. OpenNT の新しいソースコードファイルには、次のようなファイルヘッダーを含めてください。
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -29,7 +29,7 @@ https://spdx.org/licenses にある SPDX ライセンス識別子を使ってく
 
 古いヘッダーの `FILE` 行は削除してください。
 
-2. LiberNT のコードベースではドキュメント生成ツール [Doxygen](https://www.doxygen.nl/) を使い、`Doxyfile` はトップレベルディレクトリにあります。関数には適切なヘッダーを付けてください。詳しくは ReactOS wiki の [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) を参照してください。
+2. OpenNT のコードベースではドキュメント生成ツール [Doxygen](https://www.doxygen.nl/) を使い、`Doxyfile` はトップレベルディレクトリにあります。関数には適切なヘッダーを付けてください。詳しくは ReactOS wiki の [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) を参照してください。
 
 ## インデントと行幅
 

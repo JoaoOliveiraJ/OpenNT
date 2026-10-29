@@ -1,5 +1,5 @@
 [Unit]
-Description=LiberNT login session of user %i
+Description=OpenNT login session of user %i
 After=systemd-user-sessions.service systemd-logind.service
 
 [Service]

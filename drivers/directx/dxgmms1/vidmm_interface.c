@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT DirectX GPU Memory Manager and Scheduler
+ * PROJECT:     OpenNT DirectX GPU Memory Manager and Scheduler
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Static VidMmInterface and VidSchInterface dispatch tables
  * COPYRIGHT:   Copyright 2024-2026 LiberNT Team

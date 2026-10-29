@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NDIS library
+ * PROJECT:     OpenNT NDIS library
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Private interface between NDIS and the NetAdapterCx class extension
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>

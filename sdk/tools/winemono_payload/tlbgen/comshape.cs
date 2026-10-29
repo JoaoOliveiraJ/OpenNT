@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Wine Mono payload
+ * PROJECT:     OpenNT Wine Mono payload
  * LICENSE:     MIT (https://spdx.org/licenses/MIT)
  * PURPOSE:     Applies the COM visibility, class interface attributes and interface layouts of the .NET Framework mscorlib
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

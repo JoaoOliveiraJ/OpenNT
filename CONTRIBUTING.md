@@ -2,7 +2,7 @@
 
 > **English** | [中文](translations/zh-CN/CONTRIBUTING.md) | [Français](translations/fr-FR/CONTRIBUTING.md) | [Español](translations/es-ES/CONTRIBUTING.md) | [日本語](translations/ja-JP/CONTRIBUTING.md) | [العربية](translations/ar-MA/CONTRIBUTING.md)
 
-LiberNT welcomes bug reports, tests, fixes, new features and documentation. This page explains how to send your work. The engineering rules every change follows are in [AGENTS.md](AGENTS.md), and they apply to human contributors and AI tools alike.
+OpenNT welcomes bug reports, tests, fixes, new features and documentation. This page explains how to send your work. The engineering rules every change follows are in [AGENTS.md](AGENTS.md), and they apply to human contributors and AI tools alike.
 
 - [What To Do?](#what-to-do)
 - [How To Contribute?](#how-to-contribute)
@@ -12,16 +12,16 @@ LiberNT welcomes bug reports, tests, fixes, new features and documentation. This
 **Legal notice:** If you have seen proprietary Microsoft Windows source code, your contribution won't be accepted because of potential copyright violation. Before contributing, you must affirm that the following is true:
 >I hereby swear that I have not used nor seen the source code to any version of the Windows operating system
 >nor any Microsoft product that may be related to the proposed project that is under a license incompatible
->with contribution to LiberNT, including but not limited to the leaked Windows NT 3.5, NT 4 and 2000 source code
+>with contribution to OpenNT, including but not limited to the leaked Windows NT 3.5, NT 4 and 2000 source code
 >and the Windows Research Kernel.
 
-LiberNT is built clean-room: from the Windows SDK and WDK headers, Windows 11 public symbols, Microsoft documentation and black-box runs on Windows 11. See [Sources of truth](AGENTS.md#sources-of-truth) for what may and may not be used.
+OpenNT is built clean-room: from the Windows SDK and WDK headers, Windows 11 public symbols, Microsoft documentation and black-box runs on Windows 11. See [Sources of truth](AGENTS.md#sources-of-truth) for what may and may not be used.
 
 ## What To Do?
 
 ### Report bugs
 
-Report bugs in [Issues](https://github.com/LiberNT/LiberNT/issues). Give the architecture (amd64, i386, arm64 or riscv64), the build type, the commit you built and the steps that lead to the problem. A debug log from the serial port helps a lot.
+Report bugs in [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues). Give the architecture (amd64, i386, arm64 or riscv64), the build type, the commit you built and the steps that lead to the problem. A debug log from the serial port helps a lot.
 
 ### Fix bugs
 
@@ -29,23 +29,23 @@ Fix the underlying behavior, not the symptom, and make the smallest correct chan
 
 ### Fix tests
 
-Tests check LiberNT against Windows behavior. Many of them are not clean on Windows 11 either, so before changing LiberNT to satisfy a test, run the same test on Windows 11 and compare the results check by check. If Windows 11 fails a check too, the expectation is the bug. See [Testing against Windows 11](AGENTS.md#testing-against-windows-11).
+Tests check OpenNT against Windows behavior. Many of them are not clean on Windows 11 either, so before changing OpenNT to satisfy a test, run the same test on Windows 11 and compare the results check by check. If Windows 11 fails a check too, the expectation is the bug. See [Testing against Windows 11](AGENTS.md#testing-against-windows-11).
 
-### Test LiberNT
+### Test OpenNT
 
-Run LiberNT in a virtual machine or on real hardware and report what breaks. Real hardware matters most for drivers: a virtual machine proves only that a driver installs and loads.
+Run OpenNT in a virtual machine or on real hardware and report what breaks. Real hardware matters most for drivers: a virtual machine proves only that a driver installs and loads.
 
 ### Implement new things
 
-Windows 11 is the compatibility reference. Before starting a larger piece of work, ask in [Issues](https://github.com/LiberNT/LiberNT/issues) or on [Discord](https://discord.gg/BpcKg7FZ2) whether someone is already working on it.
+The compatibility goal is Windows 10 and later, including device drivers. Windows 11 remains a reference for the inherited NT10 implementation. Before starting a larger piece of work, ask in [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues) whether someone is already working on it.
 
 ### Write documentation
 
-Guides and design notes go in the [Wiki](https://github.com/LiberNT/LiberNT/wiki). Respect [clean room reverse engineering] practices, and write only what the source code, the documentation or a test run shows.
+Guides and design notes go in the [Documentation](https://github.com/JoaoOliveiraJ/OpenNT/tree/main/doc). Respect [clean room reverse engineering] practices, and write only what the source code, the documentation or a test run shows.
 
 ### Third-party code
 
-Components synchronised with Wine are listed in [media/doc/WINESYNC.txt](media/doc/WINESYNC.txt), and other third-party code in [media/doc/3rd Party Files.txt](media/doc/3rd%20Party%20Files.txt). Keep LiberNT changes to that code under `#ifdef __REACTOS__`, with the original code in the `#else` branch, so the next synchronisation keeps them.
+Components synchronised with Wine are listed in [media/doc/WINESYNC.txt](media/doc/WINESYNC.txt), and other third-party code in [media/doc/3rd Party Files.txt](media/doc/3rd%20Party%20Files.txt). Keep OpenNT changes to that code under `#ifdef __REACTOS__`, with the original code in the `#else` branch, so the next synchronisation keeps them.
 
 ## How To Contribute?
 
@@ -53,7 +53,7 @@ We recommend using English in issue reports and community discussions, to keep c
 
 ### Pull Requests
 
-Send your work as a [pull request] against the `main-nt10` branch. Pull requests let you tell others about changes you have pushed to a repository on GitHub. Once a pull request is opened, you can discuss and review the changes with the team and add follow-up commits before they are merged.
+Send your work as a [pull request] against the `main` branch. Pull requests let you tell others about changes you have pushed to a repository on GitHub. Once a pull request is opened, you can discuss and review the changes with the team and add follow-up commits before they are merged.
 
 Before you open it:
 
@@ -83,7 +83,7 @@ You may use AI tools. Tell us in the pull request which parts they helped with a
 - *Search for similar pull requests before submitting.* It may be that a similar pull request or issue was opened previously. Comment and review on that one instead.
 - *Keep your contribution small and focused on the topic.* Resist the temptation to fix unrelated issues as you come across them; open an issue for them instead.
 - *Respect our __[Coding Style]__.*
-- *Do not be afraid to ask questions.* Ask the team on [Discord](https://discord.gg/BpcKg7FZ2) or [Matrix](https://matrix.to/#/#libernt:matrix.org).
+- *Do not be afraid to ask questions.* Ask the team on [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues).
 
 ## Copyright and Licences
 
@@ -95,14 +95,14 @@ You keep the copyright on what you write. LiberNT has no copyright assignment an
 - Keep the licence of the files you change. Code inherited from ReactOS keeps the licence stated in its header.
 - Never copy code whose licence is incompatible with the GNU GPL 3.0, and never copy GPL code from Linux.
 
-See [CREDITS.md](CREDITS.md) for the people behind LiberNT and ReactOS.
+See [CREDITS.md](CREDITS.md) for the people behind OpenNT and ReactOS.
 
 ## Where To Start?
 
-- Look at the open [Issues](https://github.com/LiberNT/LiberNT/issues).
+- Look at the open [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues).
 - Find a test that fails, compare it with Windows 11, and make it pass.
-- Read the [Wiki](https://github.com/LiberNT/LiberNT/wiki) for guides and design notes.
-- Ask for help on [Discord](https://discord.gg/BpcKg7FZ2) or [Matrix](https://matrix.to/#/#libernt:matrix.org).
+- Read the [Documentation](https://github.com/JoaoOliveiraJ/OpenNT/tree/main/doc) for guides and design notes.
+- Ask for help on [GitHub Issues](https://github.com/JoaoOliveiraJ/OpenNT/issues).
 
   [clean room reverse engineering]:                              https://en.wikipedia.org/wiki/Clean_room_design
   [pull request]:                                                https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests

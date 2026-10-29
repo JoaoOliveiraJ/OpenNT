@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Cache Manager
+ * PROJECT:     OpenNT Cache Manager
  * FILE:        ntoskrnl/cc/api/ccinit.c
  * PURPOSE:     Cache manager and file cache initialization
  *

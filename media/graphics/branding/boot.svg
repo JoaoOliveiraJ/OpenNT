@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="652" height="120" viewBox="0 0 652 120" role="img">
+  <title>OpenNT boot wordmark</title>
+  <g transform="translate(60 10) scale(.28)" fill="#0161B6">
+    <rect x="0" y="60" width="88" height="296"/>
+    <rect x="0" y="268" width="299" height="88"/>
+    <rect x="108" y="0" width="299" height="89"/>
+    <rect x="319" y="0" width="88" height="296"/>
+  </g>
+  <text x="190" y="103" font-family="Arial" font-size="104" font-weight="700" fill="#ffffff">OpenNT</text>
+</svg>

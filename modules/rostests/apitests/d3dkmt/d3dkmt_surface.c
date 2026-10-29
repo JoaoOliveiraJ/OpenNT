@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT D3DKMT API Tests
+ * PROJECT:     OpenNT D3DKMT API Tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Breadth coverage of the remaining D3DKMT surface (contract checks)
  * COPYRIGHT:   Copyright 2026 LiberNT WDDM Team

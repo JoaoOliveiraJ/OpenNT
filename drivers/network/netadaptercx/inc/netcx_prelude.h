@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NetAdapterCx
+ * PROJECT:     OpenNT NetAdapterCx
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     First header of every NetAdapterCx translation unit (passed with -include)
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>

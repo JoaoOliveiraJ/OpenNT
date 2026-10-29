@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="205" height="164" viewBox="0 0 205 164" role="img">
+  <title>OpenNT screensaver wordmark</title>
+  <rect width="205" height="164" fill="#000000"/>
+  <g transform="translate(78 36) scale(.12)" fill="#0161B6">
+    <rect x="0" y="60" width="88" height="296"/>
+    <rect x="0" y="268" width="299" height="88"/>
+    <rect x="108" y="0" width="299" height="89"/>
+    <rect x="319" y="0" width="88" height="296"/>
+  </g>
+  <text x="102.5" y="128" text-anchor="middle" font-family="Arial" font-size="44" font-weight="700" fill="#ffffff">OpenNT</text>
+</svg>

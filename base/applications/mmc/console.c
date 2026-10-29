@@ -140,7 +140,7 @@ FrameOnCreate(HWND hwnd,
     {
         /* FIXME */
         Info->AppAuthorMode = TRUE;
-//        Info->lpConsoleTitle = TEXT("LiberNT Management Console");
+//        Info->lpConsoleTitle = TEXT("OpenNT Management Console");
     }
     else
     {
@@ -151,7 +151,7 @@ FrameOnCreate(HWND hwnd,
     SetMenu(Info->hwnd,
             Info->hMenuConsoleSmall);
 
-    SetWindowText(Info->hwnd, TEXT("LiberNT Management Console"));
+    SetWindowText(Info->hwnd, TEXT("OpenNT Management Console"));
 
     ccs.hWindowMenu = GetSubMenu(Info->hMenuConsoleLarge, 1);
     ccs.idFirstChild = IDM_MDI_FIRSTCHILD;

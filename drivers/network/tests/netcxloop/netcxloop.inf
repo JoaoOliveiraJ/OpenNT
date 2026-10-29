@@ -1,4 +1,4 @@
-; PROJECT:     LiberNT network tests
+; PROJECT:     OpenNT network tests
 ; LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
 ; PURPOSE:     Installs the NetAdapterCx simulated link peer test adapter
 ; COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>
@@ -7,7 +7,7 @@
 Signature = "$Windows NT$"
 Class = Net
 ClassGUID = {4d36e972-e325-11ce-bfc1-08002be10318}
-Provider = %LiberNT%
+Provider = %OpenNT%
 DriverVer = 10/29/2026,1.0.0.0
 PnpLockdown = 1
 
@@ -21,12 +21,12 @@ netcxloop.sys = 1,,
 DefaultDestDir = 12
 
 [Manufacturer]
-%LiberNT% = LiberNT,NTamd64,NTarm64
+%OpenNT% = OpenNT,NTamd64,NTarm64
 
-[LiberNT.NTamd64]
+[OpenNT.NTamd64]
 %NetCxLoop.DeviceDesc% = NetCxLoop_Device, ROOT\NETCXLOOP
 
-[LiberNT.NTarm64]
+[OpenNT.NTarm64]
 %NetCxLoop.DeviceDesc% = NetCxLoop_Device, ROOT\NETCXLOOP
 
 [NetCxLoop_Device.NT]
@@ -67,7 +67,7 @@ KmdfService = NetCxLoop, NetCxLoop_WdfSection
 KmdfLibraryVersion = 1.33
 
 [Strings]
-LiberNT = "LiberNT Project"
-DiskName = "LiberNT NetAdapterCx test disk"
-NetCxLoop.DeviceDesc = "LiberNT NetAdapterCx Test Adapter"
-NetCxLoop.ServiceDesc = "LiberNT NetAdapterCx Test Adapter Service"
+OpenNT = "OpenNT Project"
+DiskName = "OpenNT NetAdapterCx test disk"
+NetCxLoop.DeviceDesc = "OpenNT NetAdapterCx Test Adapter"
+NetCxLoop.ServiceDesc = "OpenNT NetAdapterCx Test Adapter Service"

@@ -100,7 +100,7 @@ LoadOrderGroup = Keyboard Class
 
 [Strings]
 ; Non-localizable
-ReactOS = "LiberNT Project"
+ReactOS = "OpenNT Project"
 
 ; Localizable
 KeyboardClassName = "Keyboards"

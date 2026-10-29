@@ -4,7 +4,7 @@
 >
 > 翻译说明：本译文由 AI 初译并排版；术语、代码块、链接与锚点已与英文原版核对，中文术语已经人工核对。如有纰漏，请提交 issue 指出；表述以英文版为准。
 
-本文介绍通用的代码风格准则，新增的 LiberNT 代码都应遵循。这些准则只适用于 C 和 C++ 源文件，来自 ReactOS 代码风格，是 ReactOS 成员在 2013 年 10 月的会议上确定的。
+本文介绍通用的代码风格准则，新增的 OpenNT 代码都应遵循。这些准则只适用于 C 和 C++ 源文件，来自 ReactOS 代码风格，是 ReactOS 成员在 2013 年 10 月的会议上确定的。
 
 无关的改动不必顺手把既有代码转成这套风格。细节见[改写既有代码的注意事项](#改写既有代码的注意事项)。
 
@@ -12,11 +12,11 @@
 
 ## 文件结构
 
-1. 每个新增的 LiberNT 源码文件都应带有这样的文件头：
+1. 每个新增的 OpenNT 源码文件都应带有这样的文件头：
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -30,7 +30,7 @@
 
 旧文件头里的 `FILE` 行应当删除。
 
-2. LiberNT 代码库使用 [Doxygen](https://www.doxygen.nl/) 生成文档，顶层目录里有 `Doxyfile`。函数请使用规范的头部注释，写法参见 ReactOS wiki 的 [API 文档](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation)。
+2. OpenNT 代码库使用 [Doxygen](https://www.doxygen.nl/) 生成文档，顶层目录里有 `Doxyfile`。函数请使用规范的头部注释，写法参见 ReactOS wiki 的 [API 文档](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation)。
 
 ## 缩进与行宽
 

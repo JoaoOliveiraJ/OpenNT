@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NetAdapterCx
+ * PROJECT:     OpenNT NetAdapterCx
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Histogram output layouts of the NDIS statistics IOCTLs
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>

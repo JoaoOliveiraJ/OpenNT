@@ -1,5 +1,5 @@
 Imported from microsoft/Network-Adapter-Class-Extension e8189d3b932261500eb22041bbaa4912f9fc7ec2 (2026-01-29, Windows 11 2025 Update (25H2))
-LiberNT changes:
+OpenNT changes:
   rtl/inc/kmacros.h: code_seg placement disabled (all code stays resident)
   netcx/translator/framelayout/layer2layout.cpp: scoped-enum case labels cast to int for switches over header fields
   netcx/translator/framelayout/layer3layout.cpp: scoped-enum case labels cast to int for switches over header fields
@@ -20,7 +20,7 @@ LiberNT changes:
   netcx/adapter/nxadapter.cpp: null pointers converted with static_cast
   rtl/inc/kptr.h: sized pool allocators declared before the templates that call them
   netcx/adapter/nxadapter.cpp: callback address passed to MmIsDriverVerifyingByAddress converted to a data pointer explicitly
-LiberNT files:
+OpenNT files:
   inc/, lib/: private headers and libraries the public sources do not include; layouts and
     values follow the NetAdapterCx and ndis 10.0.22621 x64 public symbols
   inc/net20.h - inc/net26.h: versioned client structures from the WDK 10.0.28000 NetAdapterCx

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT IF Monitor DLL
+ * PROJECT:     OpenNT IF Monitor DLL
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  * PURPOSE:     NetSh interface ipv6 context
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>

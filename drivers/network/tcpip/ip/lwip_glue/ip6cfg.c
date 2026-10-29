@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT TCP/IP protocol driver
+ * PROJECT:     OpenNT TCP/IP protocol driver
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  * PURPOSE:     IPv6 configuration: manual addresses and routes, router advertisement options
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>

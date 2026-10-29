@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT HAL
+ * PROJECT:     OpenNT HAL
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Header file for MSI (Message Signalled Interrupts) support
  * COPYRIGHT:   Copyright 2026 LiberNT Contributors

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Boot Loader
+ * PROJECT:     OpenNT Boot Loader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Open Firmware entry point and firmware services
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -75,7 +75,7 @@ static ULONG OfwMapCount;
 
 static const PCWSTR OfwStorePaths[] =
 {
-    L"\\EFI\\LiberNT\\Boot\\BCD",
+    L"\\EFI\\OpenNT\\Boot\\BCD",
     L"\\Boot\\BCD",
 };
 

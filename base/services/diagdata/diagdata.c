@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Diagnostic Data Service
+ * PROJECT:     OpenNT Diagnostic Data Service
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Sends the required and the optional diagnostic data, spooled until delivered
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -20,9 +20,9 @@
 #define NDEBUG
 #include <debug.h>
 
-#define DIAGDATA_KEY L"SOFTWARE\\LiberNT\\DiagnosticData"
-#define DIAGDATA_ENDPOINT L"https://ci.libernt.com/api/diagnostic-data/v1/report"
-#define DIAGDATA_AGENT L"LiberNT-DiagnosticData/1"
+#define DIAGDATA_KEY L"SOFTWARE\\OpenNT\\DiagnosticData"
+#define DIAGDATA_ENDPOINT L""
+#define DIAGDATA_AGENT L"OpenNT-DiagnosticData/1"
 #define DIAGDATA_SETTLE_MS 30000
 #define DIAGDATA_PNP_POLL_MS 500
 #define DIAGDATA_OFF_LEVEL 0
@@ -1290,6 +1290,8 @@ static VOID WINAPI ServiceMain(_In_ DWORD ArgumentCount, _In_reads_(ArgumentCoun
     ReadText(DiagDataKey, NULL, L"Channel", DiagDataState.Channel, ARRAYSIZE(DiagDataState.Channel));
     if (!ReadText(DiagDataKey, NULL, L"Endpoint", DiagDataState.Endpoint, ARRAYSIZE(DiagDataState.Endpoint)))
         lstrcpynW(DiagDataState.Endpoint, DIAGDATA_ENDPOINT, ARRAYSIZE(DiagDataState.Endpoint));
+    if (DiagDataState.Endpoint[0] == UNICODE_NULL)
+        goto Stop;
 
     DPRINT("DIAGDATA: previous shutdown %s\n", DiagDataState.PreviousShutdown);
     UpdateServiceStatus(SERVICE_RUNNING);

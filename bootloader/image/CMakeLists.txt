@@ -1,5 +1,5 @@
 ##
-## PROJECT:     LiberNT Boot Loader
+## PROJECT:     OpenNT Boot Loader
 ## LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
 ## PURPOSE:     EFI system partition, BCD store and GPT disk image
 ## COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
@@ -30,9 +30,9 @@ set(BCD_OS_ENTRY "{${BOOTLOADER_ID_NAMESPACE}}")
 set(BCD_DEFAULT_ENTRY "${BCD_OS_ENTRY}")
 set(BCD_DISPLAY_ORDER "\"${BCD_OS_ENTRY}\"")
 set(BCD_HTTP_ENTRY "")
-string(UUID BOOTLOADER_DISK_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "LiberNT disk" TYPE SHA1)
-string(UUID BOOTLOADER_ESP_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "LiberNT EFI system partition" TYPE SHA1)
-string(UUID BOOTLOADER_SYSTEM_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "LiberNT system partition" TYPE SHA1)
+string(UUID BOOTLOADER_DISK_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "OpenNT disk" TYPE SHA1)
+string(UUID BOOTLOADER_ESP_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "OpenNT EFI system partition" TYPE SHA1)
+string(UUID BOOTLOADER_SYSTEM_ID NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "OpenNT system partition" TYPE SHA1)
 
 function(bootloader_guid_bytes _out _guid)
     string(REPLACE "-" "" _hex "${_guid}")
@@ -125,14 +125,14 @@ bootloader_bcd_store(${CMAKE_CURRENT_BINARY_DIR})
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/esp.fat
     COMMAND native-fatten ${CMAKE_CURRENT_BINARY_DIR}/esp.fat
-        -format ${BOOTLOADER_ESP_SECTORS} fat32 LIBERNT
+        -format ${BOOTLOADER_ESP_SECTORS} fat32 OPENNT
         -mkdir EFI
         -mkdir EFI/BOOT
-        -mkdir EFI/LiberNT
-        -mkdir EFI/LiberNT/Boot
+        -mkdir EFI/OpenNT
+        -mkdir EFI/OpenNT/Boot
         -add $<TARGET_FILE:bootmgfw> EFI/BOOT/${_efi_name}
-        -add $<TARGET_FILE:bootmgfw> EFI/LiberNT/Boot/bootmgfw.efi
-        -add ${CMAKE_CURRENT_BINARY_DIR}/BCD EFI/LiberNT/Boot/BCD
+        -add $<TARGET_FILE:bootmgfw> EFI/OpenNT/Boot/bootmgfw.efi
+        -add ${CMAKE_CURRENT_BINARY_DIR}/BCD EFI/OpenNT/Boot/BCD
     DEPENDS native-fatten bootmgfw ${CMAKE_CURRENT_BINARY_DIR}/BCD
     VERBATIM)
 
@@ -144,7 +144,7 @@ endif()
 
 add_custom_target(bootloaderimg
     COMMAND native-mkdiskimg -gpt -diskid ${BOOTLOADER_DISK_ID}
-        -o ${CMAKE_CURRENT_BINARY_DIR}/LiberNT.img
+        -o ${CMAKE_CURRENT_BINARY_DIR}/OpenNT.img
         -partition ${CMAKE_CURRENT_BINARY_DIR}/esp.fat
         -start ${BOOTLOADER_ESP_START}
         -guid c12a7328-f81f-11d2-ba4b-00a0c93ec93b
@@ -154,7 +154,7 @@ add_custom_target(bootloaderimg
         -start ${BOOTLOADER_SYSTEM_START}
         -guid ebd0a0a2-b9e5-4433-87c0-68b6b72699c7
         -id ${BOOTLOADER_SYSTEM_ID}
-        -name LiberNT
+        -name OpenNT
     DEPENDS native-mkdiskimg ${CMAKE_CURRENT_BINARY_DIR}/esp.fat
     VERBATIM)
 
@@ -167,7 +167,7 @@ set(_ramdisk_header "${_zero},${_zero},00,00,00,00,01,00,00,00")
 set(_ramdisk_body "00,00,00,00,03,00,00,00,00,00,00,00,${_zero},${_zero},01,00,00,00")
 set(BCD_BOOT_DEVICE "${_zero},${_zero},${_boot_device}")
 set(BCD_LOADER_DEVICE "${BCD_BOOT_DEVICE}")
-set(BCD_LOADER_PATH "\\EFI\\LiberNT\\Boot\\winload.efi")
+set(BCD_LOADER_PATH "\\EFI\\OpenNT\\Boot\\winload.efi")
 set(BCD_LOAD_OPTIONS "RDRAMSIZE=${BOOTLOADER_MEDIA_RAMDISK_EXTRA} ${BOOTLOADER_LOAD_OPTIONS}${BOOTLOADER_DEBUG_LOAD_OPTIONS}")
 set(BCD_WINPE_ELEMENT
     "BCD,\"BCD00000000\\Objects\\${BCD_OS_ENTRY}\\Elements\\26000022\",\"Element\",0x1,01")
@@ -180,11 +180,11 @@ function(bootloader_media _target _directory _image)
             -format ${BOOTLOADER_MEDIA_SECTORS} fat EFIBOOT
             -mkdir EFI
             -mkdir EFI/BOOT
-            -mkdir EFI/LiberNT
-            -mkdir EFI/LiberNT/Boot
+            -mkdir EFI/OpenNT
+            -mkdir EFI/OpenNT/Boot
             -add $<TARGET_FILE:bootmgfw> EFI/BOOT/${_efi_name}
-            -add $<TARGET_FILE:winload> EFI/LiberNT/Boot/winload.efi
-            -add ${_directory}/BCD EFI/LiberNT/Boot/BCD
+            -add $<TARGET_FILE:winload> EFI/OpenNT/Boot/winload.efi
+            -add ${_directory}/BCD EFI/OpenNT/Boot/BCD
         COMMAND ${CMAKE_COMMAND} -DMODE=list
             -DBASE=${REACTOS_BINARY_DIR}/boot/livecd.$<CONFIG>.lst
             -DOPTIONAL=${REACTOS_BINARY_DIR}/boot/livecd.optional.$<CONFIG>.lst
@@ -198,7 +198,7 @@ function(bootloader_media _target _directory _image)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/medialist.cmake
         COMMAND native-mkisofs -quiet -o ${_image}
             -iso-level 4 -relaxed-filenames
-            -publisher "LiberNT Project" -preparer "LiberNT Project" -volid LiberNT -volset LiberNT
+            -publisher "OpenNT Project" -preparer "OpenNT Project" -volid OpenNT -volset OpenNT
             -eltorito-platform efi -eltorito-boot efi/efisys.bin -no-emul-boot
             -hide boot.catalog
             -duplicates-once -no-cache-inodes -graft-points
@@ -244,10 +244,10 @@ function(bootloader_ramdisk_device _out _path)
 endfunction()
 
 bootloader_ramdisk_device(BCD_OS_DEVICE "")
-bootloader_media(bootloadercd ${CMAKE_CURRENT_BINARY_DIR}/media ${CMAKE_CURRENT_BINARY_DIR}/LiberNT.iso)
+bootloader_media(bootloadercd ${CMAKE_CURRENT_BINARY_DIR}/media ${CMAKE_CURRENT_BINARY_DIR}/OpenNT.iso)
 
 bootloader_ramdisk_device(BCD_OS_DEVICE "\\boot.wim")
-bootloader_media(bootloaderwimcd ${CMAKE_CURRENT_BINARY_DIR}/mediawim ${CMAKE_CURRENT_BINARY_DIR}/LiberNT-wim.iso
+bootloader_media(bootloaderwimcd ${CMAKE_CURRENT_BINARY_DIR}/mediawim ${CMAKE_CURRENT_BINARY_DIR}/OpenNT-wim.iso
     -DWIM=${CMAKE_CURRENT_BINARY_DIR}/mediawim/boot.wim
     -DSTAGE=${CMAKE_CURRENT_BINARY_DIR}/mediawim/stage
     -DWIMAGE=$<TARGET_FILE:native-wimage>)
@@ -255,11 +255,11 @@ bootloader_media(bootloaderwimcd ${CMAKE_CURRENT_BINARY_DIR}/mediawim ${CMAKE_CU
 add_custom_target(bootloadermediabcd DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/media/BCD)
 add_custom_target(bootloadermediawimbcd DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mediawim/BCD)
 
-get_property(_standard_signature GLOBAL PROPERTY LIBERNT_STANDARD_SIGNATURE)
-get_property(_standard_start GLOBAL PROPERTY LIBERNT_STANDARD_SYSTEM_START)
-get_property(_standard_options GLOBAL PROPERTY LIBERNT_STANDARD_OPTIONS)
-get_property(_standard_gpt_disk GLOBAL PROPERTY LIBERNT_STANDARD_GPT_DISK)
-get_property(_standard_gpt_system GLOBAL PROPERTY LIBERNT_STANDARD_GPT_SYSTEM)
+get_property(_standard_signature GLOBAL PROPERTY OPENNT_STANDARD_SIGNATURE)
+get_property(_standard_start GLOBAL PROPERTY OPENNT_STANDARD_SYSTEM_START)
+get_property(_standard_options GLOBAL PROPERTY OPENNT_STANDARD_OPTIONS)
+get_property(_standard_gpt_disk GLOBAL PROPERTY OPENNT_STANDARD_GPT_DISK)
+get_property(_standard_gpt_system GLOBAL PROPERTY OPENNT_STANDARD_GPT_SYSTEM)
 
 if(_standard_signature)
     if(_standard_gpt_disk)
@@ -286,7 +286,7 @@ if(_standard_signature)
     endif()
 
     if(BOOTLOADER_HTTP_BOOT AND BOOTLOADER_HTTP_BOOT_URL)
-        string(UUID _http_entry NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "LiberNT HTTP boot" TYPE SHA1)
+        string(UUID _http_entry NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "OpenNT HTTP boot" TYPE SHA1)
         set(_http_entry "{${_http_entry}}")
         bootloader_ramdisk_device(_http_device "")
         set(_http_options "RDRAMSIZE=${BOOTLOADER_MEDIA_RAMDISK_EXTRA} HTTPBOOTURL=${BOOTLOADER_HTTP_BOOT_URL}")
@@ -298,7 +298,7 @@ if(_standard_signature)
         set(BCD_HTTP_ENTRY "
 ${_object}\\Description\",\"Type\",0x00010001,0x10200003
 ${_object}\\Elements\\11000001\",\"Element\",0x1,${BCD_BOOT_DEVICE}
-${_object}\\Elements\\12000002\",\"Element\",,\"\\EFI\\LiberNT\\Boot\\${BOOTLOADER_OS_LOADER}\"
+${_object}\\Elements\\12000002\",\"Element\",,\"\\EFI\\OpenNT\\Boot\\${BOOTLOADER_OS_LOADER}\"
 ${_object}\\Elements\\12000004\",\"Element\",,\"HTTP boot\"
 ${_object}\\Elements\\12000005\",\"Element\",,\"en-US\"
 ${_object}\\Elements\\14000006\",\"Element\",0x10000,\"{6efb52bf-1766-41db-a6b3-0ee5eff72bd7}\"
@@ -321,7 +321,7 @@ BCD,\"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\24
     endif()
 
     if(BOOTLOADER_HTTP_IMAGE_URL)
-        string(UUID _image_entry NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "LiberNT HTTP disk image" TYPE SHA1)
+        string(UUID _image_entry NAMESPACE ${BOOTLOADER_ID_NAMESPACE} NAME "OpenNT HTTP disk image" TYPE SHA1)
         set(_image_entry "{${_image_entry}}")
         string(LENGTH "${_zero},${_zero}," _image_parent_offset)
         string(SUBSTRING "${BCD_OS_DEVICE}" ${_image_parent_offset} -1 _image_parent)
@@ -335,8 +335,8 @@ BCD,\"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\24
         string(APPEND BCD_HTTP_ENTRY "
 ${_object}\\Description\",\"Type\",0x00010001,0x10200003
 ${_object}\\Elements\\11000001\",\"Element\",0x1,${BCD_BOOT_DEVICE}
-${_object}\\Elements\\12000002\",\"Element\",,\"\\EFI\\LiberNT\\Boot\\${BOOTLOADER_OS_LOADER}\"
-${_object}\\Elements\\12000004\",\"Element\",,\"LiberNT (HTTP disk image)\"
+${_object}\\Elements\\12000002\",\"Element\",,\"\\EFI\\OpenNT\\Boot\\${BOOTLOADER_OS_LOADER}\"
+${_object}\\Elements\\12000004\",\"Element\",,\"OpenNT (HTTP disk image)\"
 ${_object}\\Elements\\12000005\",\"Element\",,\"en-US\"
 ${_object}\\Elements\\14000006\",\"Element\",0x10000,\"{6efb52bf-1766-41db-a6b3-0ee5eff72bd7}\"
 ${_object}\\Elements\\16000009\",\"Element\",0x1,00

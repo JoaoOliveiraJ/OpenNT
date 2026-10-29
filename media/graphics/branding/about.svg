@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="413" height="72" viewBox="0 0 413 72" role="img">
+  <title>OpenNT About banner</title>
+  <defs>
+    <radialGradient id="background" cx="50%" cy="45%" r="70%">
+      <stop offset="0" stop-color="#edf3f6"/>
+      <stop offset="1" stop-color="#bccdd6"/>
+    </radialGradient>
+  </defs>
+  <rect width="413" height="72" fill="url(#background)"/>
+  <g transform="translate(95 8) scale(.12)" fill="#0161B6">
+    <rect x="0" y="60" width="88" height="296"/>
+    <rect x="0" y="268" width="299" height="88"/>
+    <rect x="108" y="0" width="299" height="89"/>
+    <rect x="319" y="0" width="88" height="296"/>
+  </g>
+  <text x="151" y="47" font-family="Arial" font-size="42" font-weight="700" fill="#202124">OpenNT</text>
+  <text x="6" y="68" font-family="Arial" font-size="6.5" fill="#202124" aria-label="Copyright attribution">© 2026 LiberNT - based on ReactOS © 1996–2026 ReactOS Team &amp; Contributors</text>
+</svg>

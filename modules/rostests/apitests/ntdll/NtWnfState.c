@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT API tests
+ * PROJECT:     OpenNT API tests
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Test the WNF state name and state data system calls
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>

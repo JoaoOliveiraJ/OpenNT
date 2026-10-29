@@ -71,7 +71,7 @@ AddService = , 0x00000002
 
 [Strings]
 ; Non-localizable
-ReactOS = "LiberNT Project"
+ReactOS = "OpenNT Project"
 
 ; Localizable
 BTUSB.DeviceDesc="Generic USB Bluetooth Radio"

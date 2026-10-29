@@ -1,4 +1,4 @@
-set(DIAGDATA_CHANNEL "dev" CACHE STRING "Channel recorded in the diagnostic data reports, empty for the builds published to users")
+set(DIAGDATA_CHANNEL "" CACHE STRING "Channel recorded in the diagnostic data reports, empty for the builds published to users")
 if(DIAGDATA_CHANNEL)
     set(DIAGDATA_OPTIONAL_DEFAULT "HKLM,\"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\DataCollection\",\"AllowTelemetry\",0x00010001,0x00000003")
 else()

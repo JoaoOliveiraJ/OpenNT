@@ -184,10 +184,10 @@ if(DEFINED EFI_PLATFORM_ID AND EXISTS "${REACTOS_SOURCE_DIR}/bootloader/arch/${A
         set(_uefi_media_store media)
     endif()
     set(_uefi_loader_files
-        -mkdir EFI/LiberNT
-        -mkdir EFI/LiberNT/Boot
-        -add $<TARGET_FILE:winload> EFI/LiberNT/Boot/winload.efi
-        -add ${REACTOS_BINARY_DIR}/bootloader/image/${_uefi_media_store}/BCD EFI/LiberNT/Boot/BCD)
+        -mkdir EFI/OpenNT
+        -mkdir EFI/OpenNT/Boot
+        -add $<TARGET_FILE:winload> EFI/OpenNT/Boot/winload.efi
+        -add ${REACTOS_BINARY_DIR}/bootloader/image/${_uefi_media_store}/BCD EFI/OpenNT/Boot/BCD)
     set(_uefi_loader_deps bootmgfw winload bootloader${_uefi_media_store}bcd)
     set(_efisys_sectors 16384)
     set_property(GLOBAL PROPERTY BOOTLOADER_UEFI TRUE)
@@ -287,7 +287,7 @@ endif()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/bootfiles.sort ${ISO_SORT_FILE_DATA})
 
 # ISO image identifier names
-set(ISO_MANUFACTURER "LiberNT Project") # For both the publisher and the preparer
+set(ISO_MANUFACTURER "OpenNT Project") # For both the publisher and the preparer
 set(ISO_VOLNAME      "ReactOS")         # For both the Volume ID and the Volume set ID
 
 # ISO image options
@@ -487,7 +487,7 @@ add_custom_target(bootcd
     VERBATIM)
 
 
-## LiberNTImg
+## OpenNTImg
 # Create the file list
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/preinstall.cmake.lst "")
 # The NTFS image importer requires every entry to map an image path to a host path.
@@ -495,9 +495,9 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/preinstall.cmake.lst "")
 set(_preinstall_boot_partition_file ${CMAKE_CURRENT_BINARY_DIR}/partition.boot.fat)
 set(_preinstall_system_partition_file ${CMAKE_CURRENT_BINARY_DIR}/partition.ntfs)
 set(_preinstall_vhd_partition_file ${CMAKE_CURRENT_BINARY_DIR}/partition.vhd.ntfs)
-set(_preinstall_image_file ${REACTOS_BINARY_DIR}/LiberNT.img)
-set(_preinstall_vhd_file ${REACTOS_BINARY_DIR}/LiberNT.vhd)
-set(_preinstall_vhdx_file ${REACTOS_BINARY_DIR}/LiberNT.vhdx)
+set(_preinstall_image_file ${REACTOS_BINARY_DIR}/OpenNT.img)
+set(_preinstall_vhd_file ${REACTOS_BINARY_DIR}/OpenNT.vhd)
+set(_preinstall_vhdx_file ${REACTOS_BINARY_DIR}/OpenNT.vhdx)
 # Keep ROSBOOT as an active MBR ESP. UEFI discovers it by type, while the BIOS
 # MBR follows the active flag and loads its FAT32 boot sector. The Raspberry Pi
 # 1-3 boot ROM only scans for FAT MBR ids and skips 0xEF, so the Raspberry Pi
@@ -783,14 +783,14 @@ if(_preinstall_rpi_overlays)
 endif()
 set(_preinstall_partition_deps native-fatten native-ntfsimg
     ${_preinstall_overlay_deps} ${ARM64_BOOT_FILE_DEPS})
-set(_liberntimg_mbr_args)
-set(_liberntimg_deps native-mkdiskimg)
-set(_liberntimg_leading_args)
-set(_liberntimg_boot_partition_args)
-set(_liberntimg_system_partition_args)
+set(_openntimg_mbr_args)
+set(_openntimg_deps native-mkdiskimg)
+set(_openntimg_leading_args)
+set(_openntimg_boot_partition_args)
+set(_openntimg_system_partition_args)
 if(SPACEMIT_K1_SUPPORT)
-    list(APPEND _liberntimg_mbr_args -gpt -mbr ${SPACEMIT_K1_BOOTINFO})
-    list(APPEND _liberntimg_leading_args
+    list(APPEND _openntimg_mbr_args -gpt -mbr ${SPACEMIT_K1_BOOTINFO})
+    list(APPEND _openntimg_leading_args
         -data ${SPACEMIT_K1_OPENSBI}
         -start ${SPACEMIT_K1_OPENSBI_START}
         -type da
@@ -806,8 +806,8 @@ if(SPACEMIT_K1_SUPPORT)
         -raw ${SPACEMIT_K1_FSBL}
         -at ${SPACEMIT_K1_FSBL_BACKUP_SECTOR})
     set(_preinstall_boot_partition_fs fat32)
-    list(APPEND _liberntimg_boot_partition_args -name bootfs)
-    list(APPEND _liberntimg_system_partition_args -name ReactOS)
+    list(APPEND _openntimg_boot_partition_args -name bootfs)
+    list(APPEND _openntimg_system_partition_args -name ReactOS)
     list(APPEND _preinstall_boot_partition_files
         -add ${SPACEMIT_K1_UBOOT_ENV} env_k1-x.txt
         -add ${SPACEMIT_K1_BOOT_SCRIPT} boot.scr
@@ -815,7 +815,7 @@ if(SPACEMIT_K1_SUPPORT)
         -add ${SPACEMIT_K1_RV2_DTB} dtb/x1_orangepi-rv2.dtb)
     list(APPEND _preinstall_partition_deps
         ${SPACEMIT_K1_UBOOT_ENV} ${SPACEMIT_K1_BOOT_SCRIPT} ${SPACEMIT_K1_RV2_DTB})
-    list(APPEND _liberntimg_deps
+    list(APPEND _openntimg_deps
         ${SPACEMIT_K1_BOOTINFO} ${SPACEMIT_K1_FSBL} ${SPACEMIT_K1_OPENSBI} ${SPACEMIT_K1_UBOOT})
 endif()
 if(STARFIVE_JH7110_SUPPORT)
@@ -827,21 +827,21 @@ if(STARFIVE_JH7110_SUPPORT)
         -add ${STARFIVE_JH7110_UENV} vf2_uEnv.txt)
     list(APPEND _preinstall_partition_deps ${STARFIVE_JH7110_DTB} ${STARFIVE_JH7110_UENV})
 endif()
-macro(libernt_standard_disk_ids)
-    string(UUID _standard_disk NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "LiberNT standard disk" TYPE SHA1)
-    libernt_standard_disk_signature(_standard_signature)
-    string(UUID _standard_system NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "LiberNT standard system partition" TYPE SHA1)
-    if(";${_liberntimg_mbr_args};" MATCHES ";-gpt;")
-        list(APPEND _liberntimg_mbr_args -diskid ${_standard_disk})
-        list(APPEND _liberntimg_system_partition_args -id ${_standard_system})
-        set_property(GLOBAL PROPERTY LIBERNT_STANDARD_GPT_DISK ${_standard_disk})
-        set_property(GLOBAL PROPERTY LIBERNT_STANDARD_GPT_SYSTEM ${_standard_system})
+macro(opennt_standard_disk_ids)
+    string(UUID _standard_disk NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "OpenNT standard disk" TYPE SHA1)
+    opennt_standard_disk_signature(_standard_signature)
+    string(UUID _standard_system NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "OpenNT standard system partition" TYPE SHA1)
+    if(";${_openntimg_mbr_args};" MATCHES ";-gpt;")
+        list(APPEND _openntimg_mbr_args -diskid ${_standard_disk})
+        list(APPEND _openntimg_system_partition_args -id ${_standard_system})
+        set_property(GLOBAL PROPERTY OPENNT_STANDARD_GPT_DISK ${_standard_disk})
+        set_property(GLOBAL PROPERTY OPENNT_STANDARD_GPT_SYSTEM ${_standard_system})
     else()
-        list(APPEND _liberntimg_mbr_args -signature ${_standard_signature})
+        list(APPEND _openntimg_mbr_args -signature ${_standard_signature})
     endif()
-    set_property(GLOBAL PROPERTY LIBERNT_STANDARD_SIGNATURE ${_standard_signature})
-    set_property(GLOBAL PROPERTY LIBERNT_STANDARD_SYSTEM_START ${_preinstall_system_partition_start})
-    set_property(GLOBAL PROPERTY LIBERNT_STANDARD_OPTIONS "${FREELDR_PREINSTALL_OPTIONS}")
+    set_property(GLOBAL PROPERTY OPENNT_STANDARD_SIGNATURE ${_standard_signature})
+    set_property(GLOBAL PROPERTY OPENNT_STANDARD_SYSTEM_START ${_preinstall_system_partition_start})
+    set_property(GLOBAL PROPERTY OPENNT_STANDARD_OPTIONS "${FREELDR_PREINSTALL_OPTIONS}")
 endmacro()
 
 if(FREELDR_HAS_OFW_BOOT)
@@ -857,7 +857,7 @@ if(FREELDR_HAS_OFW_BOOT)
             -add ${REACTOS_BINARY_DIR}/bootloader/bootmgr.bin bootmgr.bin
             -add ${REACTOS_BINARY_DIR}/bootloader/image/standard/BCD Boot/BCD)
         list(APPEND _preinstall_partition_deps bootmgrppc bootloaderstandardbcd)
-        libernt_standard_disk_ids()
+        opennt_standard_disk_ids()
     endif()
 endif()
 if(FREELDR_HAS_BIOS_BOOT)
@@ -870,8 +870,8 @@ if(FREELDR_HAS_BIOS_BOOT)
         -add ${_freeldr_file} freeldr.sys
         -add $<TARGET_FILE:rosload> rosload.exe)
     list(APPEND _preinstall_partition_deps fat32 freeldr rosload)
-    list(APPEND _liberntimg_mbr_args -mbr ${_dosmbr_file})
-    list(APPEND _liberntimg_deps dosmbr)
+    list(APPEND _openntimg_mbr_args -mbr ${_dosmbr_file})
+    list(APPEND _openntimg_deps dosmbr)
 endif()
 if(DEFINED EFI_PLATFORM_ID)
     list(APPEND _preinstall_boot_partition_files
@@ -881,17 +881,17 @@ if(DEFINED EFI_PLATFORM_ID)
     list(APPEND _preinstall_partition_deps ${_uefi_loader})
     if(BOOTLOADER_UEFI)
         list(APPEND _preinstall_boot_partition_files
-            -mkdir EFI/LiberNT
-            -mkdir EFI/LiberNT/Boot
-            -add $<TARGET_FILE:bootmgfw> EFI/LiberNT/Boot/bootmgfw.efi
-            -add ${REACTOS_BINARY_DIR}/bootloader/image/standard/BCD EFI/LiberNT/Boot/BCD)
+            -mkdir EFI/OpenNT
+            -mkdir EFI/OpenNT/Boot
+            -add $<TARGET_FILE:bootmgfw> EFI/OpenNT/Boot/bootmgfw.efi
+            -add ${REACTOS_BINARY_DIR}/bootloader/image/standard/BCD EFI/OpenNT/Boot/BCD)
         list(APPEND _preinstall_partition_deps bootloaderstandardbcd)
         if((BOOTLOADER_HTTP_BOOT AND BOOTLOADER_HTTP_BOOT_URL) OR BOOTLOADER_HTTP_IMAGE_URL)
             list(APPEND _preinstall_boot_partition_files
-                -add $<TARGET_FILE:winload> EFI/LiberNT/Boot/winload.efi)
+                -add $<TARGET_FILE:winload> EFI/OpenNT/Boot/winload.efi)
             list(APPEND _preinstall_partition_deps winload)
         endif()
-        libernt_standard_disk_ids()
+        opennt_standard_disk_ids()
     endif()
     if(_uefi_driver_files)
         list(APPEND _preinstall_boot_partition_files -mkdir EFI/BOOT/drivers)
@@ -902,6 +902,23 @@ if(DEFINED EFI_PLATFORM_ID)
         list(APPEND _preinstall_partition_deps ${_uefi_driver_files})
     endif()
 endif()
+
+set(_preinstall_boot_list "")
+set(_preinstall_boot_file_args ${_preinstall_boot_partition_files})
+while(_preinstall_boot_file_args)
+    list(POP_FRONT _preinstall_boot_file_args _preinstall_boot_action)
+    if(_preinstall_boot_action STREQUAL "-mkdir")
+        list(POP_FRONT _preinstall_boot_file_args _preinstall_boot_dest)
+        string(APPEND _preinstall_boot_list "${_preinstall_boot_dest}\n")
+    elseif(_preinstall_boot_action STREQUAL "-add")
+        list(POP_FRONT _preinstall_boot_file_args _preinstall_boot_source _preinstall_boot_dest)
+        string(APPEND _preinstall_boot_list "${_preinstall_boot_dest}=${_preinstall_boot_source}\n")
+    else()
+        message(FATAL_ERROR "Unsupported boot partition action: ${_preinstall_boot_action}")
+    endif()
+endwhile()
+set(_preinstall_boot_list_file "${CMAKE_CURRENT_BINARY_DIR}/preinstall.boot.$<CONFIG>.lst")
+file(GENERATE OUTPUT "${_preinstall_boot_list_file}" CONTENT "${_preinstall_boot_list}")
 
 image_list_command(preinstall _preinstall_list_command)
 add_custom_target(preinstall_partition
@@ -920,16 +937,16 @@ add_custom_target(preinstall_partition
         -DPACKAGE_PDBS=${ROSPROFILER_PACKAGE_IMAGE_PDBS}
         -P ${REACTOS_SOURCE_DIR}/boot/pack_rosprofiler_symbols.cmake
     COMMAND native-fatten ${_preinstall_boot_partition_file}
-        -format ${_preinstall_boot_partition_sectors} ${_preinstall_boot_partition_fs} LIBERNTBOOT
+        -format ${_preinstall_boot_partition_sectors} ${_preinstall_boot_partition_fs} OPENNTBOOT
         ${_preinstall_boot_partition_options}
-        ${_preinstall_boot_partition_files}
+        -addfiles ${_preinstall_boot_list_file}
     COMMAND native-ntfsimg
         --format
         ${_preinstall_system_partition_file}
         ${_preinstall_system_partition_sectors}
         ${_preinstall_system_partition_start}
         ${_preinstall_ntfs_sectors_per_cluster}
-        LiberNT
+        OpenNT
     COMMAND native-ntfsimg
         --addfiles
         ${_preinstall_system_partition_file}
@@ -941,32 +958,32 @@ add_custom_target(preinstall_partition
     DEPENDS ${_preinstall_partition_deps}
     VERBATIM)
 
-add_custom_target(liberntimg
+add_custom_target(openntimg
     COMMAND ${CMAKE_COMMAND} -E rm -f ${_preinstall_image_file}
     COMMAND native-mkdiskimg
         -o ${_preinstall_image_file}
-        ${_liberntimg_mbr_args}
-        ${_liberntimg_leading_args}
+        ${_openntimg_mbr_args}
+        ${_openntimg_leading_args}
         -partition ${_preinstall_boot_partition_file}
         -start ${_preinstall_boot_partition_start}
         -type ${_preinstall_boot_partition_type}
-        ${_liberntimg_boot_partition_args}
+        ${_openntimg_boot_partition_args}
         -partition ${_preinstall_system_partition_file}
         -start ${_preinstall_system_partition_start}
         -type 07
-        ${_liberntimg_system_partition_args}
-    DEPENDS ${_liberntimg_deps}
+        ${_openntimg_system_partition_args}
+    DEPENDS ${_openntimg_deps}
     VERBATIM)
-add_dependencies(liberntimg preinstall_partition)
+add_dependencies(openntimg preinstall_partition)
 
-set(LIBERNT_RAM_IMAGE_FREE_MB 512 CACHE STRING
-    "Free space in MB added to the system partition of the RAM disk image (liberntramimg)")
-set(_preinstall_ram_image_file ${REACTOS_BINARY_DIR}/LiberNT-ram.img)
+set(OPENNT_RAM_IMAGE_FREE_MB 512 CACHE STRING
+    "Free space in MB added to the system partition of the RAM disk image (openntramimg)")
+set(_preinstall_ram_image_file ${REACTOS_BINARY_DIR}/OpenNT-ram.img)
 set(_preinstall_ram_partition_file ${CMAKE_CURRENT_BINARY_DIR}/partition.ram.ntfs)
-math(EXPR _preinstall_ram_partition_sectors "${_preinstall_system_partition_sectors} + ${LIBERNT_RAM_IMAGE_FREE_MB} * 2048")
-string(UUID _ram_disk NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "LiberNT RAM disk image" TYPE SHA1)
+math(EXPR _preinstall_ram_partition_sectors "${_preinstall_system_partition_sectors} + ${OPENNT_RAM_IMAGE_FREE_MB} * 2048")
+string(UUID _ram_disk NAMESPACE 354fa6e5-5e45-49af-91bf-1fd2754e470a NAME "OpenNT RAM disk image" TYPE SHA1)
 string(SUBSTRING "${_ram_disk}" 0 8 _ram_signature)
-add_custom_target(liberntramimg
+add_custom_target(openntramimg
     COMMAND ${CMAKE_COMMAND} -E rm -f ${_preinstall_ram_image_file} ${_preinstall_ram_partition_file}
     COMMAND native-ntfsimg
         --format
@@ -974,7 +991,7 @@ add_custom_target(liberntramimg
         ${_preinstall_ram_partition_sectors}
         ${_preinstall_system_partition_start}
         ${_preinstall_ntfs_sectors_per_cluster}
-        LiberNT
+        OpenNT
     COMMAND native-ntfsimg
         --addfiles
         ${_preinstall_ram_partition_file}
@@ -990,9 +1007,9 @@ add_custom_target(liberntramimg
         -start ${_preinstall_system_partition_start}
         -type 07
     COMMAND ${CMAKE_COMMAND} -E rm -f ${_preinstall_ram_partition_file}
-    DEPENDS ${_liberntimg_deps} native-ntfsimg native-mkdiskimg
+    DEPENDS ${_openntimg_deps} native-ntfsimg native-mkdiskimg
     VERBATIM)
-add_dependencies(liberntramimg preinstall_partition)
+add_dependencies(openntramimg preinstall_partition)
 
 if(STARFIVE_JH7110_SUPPORT)
     set(_jh7110_boot_partition_file ${CMAKE_CURRENT_BINARY_DIR}/jh7110-bootfs.img)
@@ -1000,7 +1017,7 @@ if(STARFIVE_JH7110_SUPPORT)
     add_custom_target(jh7110sdimg
         COMMAND ${CMAKE_COMMAND} -E rm -f ${_jh7110_boot_partition_file} ${_jh7110_sd_image_file}
         COMMAND native-fatten ${_jh7110_boot_partition_file}
-            -format ${STARFIVE_JH7110_BOOT_SECTORS} fat32 LIBERNTSD
+            -format ${STARFIVE_JH7110_BOOT_SECTORS} fat32 OPENNTSD
             -add ${STARFIVE_JH7110_BOOT_SCRIPT} boot.scr
             -add ${STARFIVE_JH7110_BOOT_SCRIPT_SOURCE} boot.cmd
         COMMAND native-mkdiskimg
@@ -1025,21 +1042,21 @@ if(STARFIVE_JH7110_SUPPORT)
             ${STARFIVE_JH7110_SPL} ${STARFIVE_JH7110_UBOOT}
             ${STARFIVE_JH7110_BOOT_SCRIPT} ${STARFIVE_JH7110_BOOT_SCRIPT_SOURCE}
         VERBATIM)
-    add_dependencies(liberntimg jh7110sdimg)
+    add_dependencies(openntimg jh7110sdimg)
 endif()
 
-set(_liberntvhd_layout_args
-    ${_liberntimg_mbr_args}
-    ${_liberntimg_leading_args}
+set(_openntvhd_layout_args
+    ${_openntimg_mbr_args}
+    ${_openntimg_leading_args}
     -partition ${_preinstall_boot_partition_file}
     -start ${_preinstall_boot_partition_start}
     -type ${_preinstall_boot_partition_type}
-    ${_liberntimg_boot_partition_args}
+    ${_openntimg_boot_partition_args}
     -partition ${_preinstall_vhd_partition_file}
     -start ${_preinstall_system_partition_start}
     -type 07
-    ${_liberntimg_system_partition_args})
-add_custom_target(liberntvhd
+    ${_openntimg_system_partition_args})
+add_custom_target(openntvhd
     COMMAND ${CMAKE_COMMAND} -E rm -f ${_preinstall_vhd_file} ${_preinstall_vhdx_file} ${_preinstall_vhd_partition_file}
     COMMAND native-ntfsimg
         --format
@@ -1047,7 +1064,7 @@ add_custom_target(liberntvhd
         ${_preinstall_vhd_partition_sectors}
         ${_preinstall_system_partition_start}
         ${_preinstall_ntfs_sectors_per_cluster}
-        LiberNT
+        OpenNT
     COMMAND native-ntfsimg
         --addfiles
         ${_preinstall_vhd_partition_file}
@@ -1056,12 +1073,12 @@ add_custom_target(liberntvhd
         --apply-security
         ${_preinstall_vhd_partition_file}
         ${REACTOS_SOURCE_DIR}/boot/bootdata/filesecurity.txt
-    COMMAND native-mkdiskimg -o ${_preinstall_vhd_file} ${_liberntvhd_layout_args} -vhd
-    COMMAND native-mkdiskimg -o ${_preinstall_vhdx_file} ${_liberntvhd_layout_args} -vhdx
+    COMMAND native-mkdiskimg -o ${_preinstall_vhd_file} ${_openntvhd_layout_args} -vhd
+    COMMAND native-mkdiskimg -o ${_preinstall_vhdx_file} ${_openntvhd_layout_args} -vhdx
     COMMAND ${CMAKE_COMMAND} -E rm -f ${_preinstall_vhd_partition_file}
-    DEPENDS ${_liberntimg_deps} native-ntfsimg
+    DEPENDS ${_openntimg_deps} native-ntfsimg
     VERBATIM)
-add_dependencies(liberntvhd preinstall_partition)
+add_dependencies(openntvhd preinstall_partition)
 
 
 if(DEFINED EFI_PLATFORM_ID)

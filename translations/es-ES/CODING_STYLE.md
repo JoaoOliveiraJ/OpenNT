@@ -2,7 +2,7 @@
 
 > [English](../../CODING_STYLE.md) | [中文](../zh-CN/CODING_STYLE.md) | [Français](../fr-FR/CODING_STYLE.md) | **Español** | [日本語](../ja-JP/CODING_STYLE.md) | [العربية](../ar-MA/CODING_STYLE.md)
 
-Este artículo describe las pautas generales de estilo de código que deben usarse en el código nuevo de LiberNT. Estas pautas se aplican exclusivamente a los archivos fuente de C y C++. Proceden del estilo de código de ReactOS, que los miembros de ReactOS acordaron en su reunión de octubre de 2013.
+Este artículo describe las pautas generales de estilo de código que deben usarse en el código nuevo de OpenNT. Estas pautas se aplican exclusivamente a los archivos fuente de C y C++. Proceden del estilo de código de ReactOS, que los miembros de ReactOS acordaron en su reunión de octubre de 2013.
 
 El código existente no se convierte a este estilo como parte de un cambio no relacionado. Consulta [Notas sobre el reformateo del código existente](#notas-sobre-el-reformateo-del-código-existente) para más detalles.
 
@@ -10,11 +10,11 @@ El código sincronizado con otras fuentes (como Wine) no debe reescribirse. Los 
 
 ## Estructura de los archivos
 
-1. Cada archivo nuevo de código fuente de LiberNT debe incluir una cabecera como esta:
+1. Cada archivo nuevo de código fuente de OpenNT debe incluir una cabecera como esta:
 
 ```
 /*
- * PROJECT:     LiberNT Kernel
+ * PROJECT:     OpenNT Kernel
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Does cool things like Memory Management
  * COPYRIGHT:   Copyright 2017 Arno Nymous <abc@mailaddress.com>
@@ -29,7 +29,7 @@ Debes añadirte a la sección `COPYRIGHT` de un archivo si has hecho una contrib
 
 La línea `FILE` de la cabecera antigua debe eliminarse.
 
-2. Para el código de LiberNT se usa el generador de documentación [Doxygen](https://www.doxygen.nl/), con el `Doxyfile` del directorio raíz, así que usa una cabecera adecuada en las funciones; consulta [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) en la wiki de ReactOS para más detalles.
+2. Para el código de OpenNT se usa el generador de documentación [Doxygen](https://www.doxygen.nl/), con el `Doxyfile` del directorio raíz, así que usa una cabecera adecuada en las funciones; consulta [API Documentation](https://reactos.org/wiki/Documentation_Guidelines#API_Documentation) en la wiki de ReactOS para más detalles.
 
 ## Sangría y ancho de línea
 

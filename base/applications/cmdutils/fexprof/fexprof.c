@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT FEX/ARM64EC profiler
+ * PROJECT:     OpenNT FEX/ARM64EC profiler
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Sample where an emulated x86-64 process spends its time
  * COPYRIGHT:   Copyright 2026 LiberNT WDDM Team

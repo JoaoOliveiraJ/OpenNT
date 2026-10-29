@@ -58,8 +58,8 @@ if [ -z "${QEMU_MODULE_DIR:-}" ]; then
     done
 fi
 
-target=liberntimg
-image=${disk_image:-"$build_dir/LiberNT.img"}
+target=openntimg
+image=${disk_image:-"$build_dir/OpenNT.img"}
 if [ "$media" = iso ]; then
     target=bootcd
     image="$build_dir/bootcd.iso"

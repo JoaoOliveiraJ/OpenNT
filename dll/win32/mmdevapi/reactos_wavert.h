@@ -1,5 +1,5 @@
 /*
- * LiberNT cyclic WaveRT buffer scheduling.
+ * OpenNT cyclic WaveRT buffer scheduling.
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 

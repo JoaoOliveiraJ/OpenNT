@@ -65,7 +65,7 @@ AddService = ramdisk, 2, RamdiskBus_Service_Inst
 
 [Strings]
 ; Non-localizable
-ReactOS = "LiberNT Project"
+ReactOS = "OpenNT Project"
 
 ; Localizable
 RamdiskClassName = "Ramdisk"

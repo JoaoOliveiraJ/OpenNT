@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Pool Allocator
+ * PROJECT:     OpenNT Pool Allocator
  * FILE:        ntoskrnl/nvs/pool/ex/exfree.c
  * PURPOSE:     Executive pool deallocation interfaces
  *

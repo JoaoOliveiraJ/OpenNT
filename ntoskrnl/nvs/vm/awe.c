@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NT Virtual Memory Subsystem
+ * PROJECT:     OpenNT NT Virtual Memory Subsystem
  * FILE:        ntoskrnl/nvs/vm/awe.c
  * PURPOSE:     Address Windowing Extensions memory operations
  *

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Cache Manager
+ * PROJECT:     OpenNT Cache Manager
  * FILE:        ntoskrnl/cc/include/ccenv.h
  * PURPOSE:     Cache manager environment interface
  *

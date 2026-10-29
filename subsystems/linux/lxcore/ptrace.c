@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Linux Subsystem
+ * PROJECT:     OpenNT Linux Subsystem
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Process tracing: ptrace(2) requests, tracee stops, tracer wait reports and Yama
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

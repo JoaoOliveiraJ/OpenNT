@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT SDK
+ * PROJECT:     OpenNT SDK
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Direct3D 10/11 user-mode driver adapter and allocation types
  * COPYRIGHT:   Copyright 2026 LiberNT WDDM Team

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT DHCP Client Service
+ * PROJECT:     OpenNT DHCP Client Service
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  * PURPOSE:     DHCPv6 client (RFC 8415): stateless configuration and IA_NA addresses
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>

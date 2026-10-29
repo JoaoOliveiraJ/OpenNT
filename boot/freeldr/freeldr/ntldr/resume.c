@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT FreeLoader
+ * PROJECT:     OpenNT FreeLoader
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     Resume from a hibernation image on BIOS systems
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

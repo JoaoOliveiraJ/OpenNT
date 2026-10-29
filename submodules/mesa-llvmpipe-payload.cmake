@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Ahmed ARIF <arif.ing@outlook.com>
-# Prebuilt LLVMpipe OpenGL and Lavapipe Vulkan ICDs from the LiberNT release payload.
+# Prebuilt LLVMpipe OpenGL and Lavapipe Vulkan ICDs from the OpenNT release payload.
 
 if(NOT ARCH MATCHES "^(amd64|arm64)$")
     message(FATAL_ERROR "The LLVMpipe payload exists for amd64 and arm64 only.")

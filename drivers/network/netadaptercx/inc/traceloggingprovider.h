@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT NetAdapterCx
+ * PROJECT:     OpenNT NetAdapterCx
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
  * PURPOSE:     TraceLogging provider macros used by the NetAdapterCx sources
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193.001@gmail.com>
@@ -7,7 +7,7 @@
 
 #pragma once
 
-/* TODO: emit TraceLogging events once LiberNT has an ETW TraceLogging provider; until then a
+/* TODO: emit TraceLogging events once OpenNT has an ETW TraceLogging provider; until then a
  * registered provider behaves as one with no listener. */
 
 typedef struct _NETCX_TRACELOGGING_PROVIDER

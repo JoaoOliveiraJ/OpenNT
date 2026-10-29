@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Wine Mono payload
+ * PROJECT:     OpenNT Wine Mono payload
  * LICENSE:     MIT (https://spdx.org/licenses/MIT)
  * PURPOSE:     Exports a type library from an assembly with the .NET Framework type library export rules
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>

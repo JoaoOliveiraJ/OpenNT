@@ -1,11 +1,11 @@
 /*
- * PROJECT:     LiberNT Image Helper
+ * PROJECT:     OpenNT Image Helper
  * LICENSE:     LGPL-2.1-or-later (https://spdx.org/licenses/LGPL-2.1-or-later)
  * PURPOSE:     Bounded file-image access for image binding
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
  */
-#ifndef LIBERNT_IMAGEHLP_BIND_PRIVATE_H
-#define LIBERNT_IMAGEHLP_BIND_PRIVATE_H
+#ifndef OPENNT_IMAGEHLP_BIND_PRIVATE_H
+#define OPENNT_IMAGEHLP_BIND_PRIVATE_H
 
 struct image_file
 {

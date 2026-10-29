@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT IP Helper API
+ * PROJECT:     OpenNT IP Helper API
  * LICENSE:     LGPL-2.1-or-later (https://spdx.org/licenses/LGPL-2.1-or-later)
  * PURPOSE:     NETIO unicast address and route configuration APIs
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>

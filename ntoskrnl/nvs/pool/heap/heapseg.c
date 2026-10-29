@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT Pool Allocator
+ * PROJECT:     OpenNT Pool Allocator
  * FILE:        ntoskrnl/nvs/pool/heap/heapseg.c
  * PURPOSE:     Pool heap segment management
  *

@@ -1,5 +1,5 @@
 /*
- * PROJECT:     LiberNT TCP/IP protocol driver
+ * PROJECT:     OpenNT TCP/IP protocol driver
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  * PURPOSE:     IPv4 path cache and path MTU discovery (RFC 1191)
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif193@gmail.com>
