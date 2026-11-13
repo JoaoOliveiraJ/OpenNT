@@ -5,6 +5,13 @@
 //! as políticas ainda sem implementação real: PAGE_GUARD, CFG e promoção a
 //! páginas grandes. Vistas de imagem passam por `mm/section-image-view`
 //! (loader de usuário).
+//!
+//! MmMapViewOfSection/MmUnmapViewOfSection são as versões por ponteiro
+//! (objeto seção e EPROCESS) do Nt/ZwMapViewOfSection. O NT converte handles
+//! em objetos antes de chamar estas rotinas; aqui o caminho é o inverso, com
+//! o mesmo efeito: handles de kernel temporários abertos pelo
+//! ObOpenObjectByPointer em KernelMode, a mesma validação e o mesmo
+//! mapeamento do Nt, e os handles fechados no fim.
 
 use crate::ntos::mm::section::map_view_parameters::{self, Decoded, MapInput, SectionTraits};
 use crate::ntos::mm::section::handles::{self as section_handles, Kind, Reference};
@@ -15,6 +22,14 @@ use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::init::exports::invoke_handler;
+use crate::ntos::ob::{object_types, open_pointer};
+use crate::ntos::ps::previous_mode;
+
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
+const SECTION_ALL_ACCESS: u32 = 0xF_001F;
+const PROCESS_ALL_ACCESS: u32 = 0x1F_FFFF;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 #[allow(clippy::too_many_arguments)]
 pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bits: u64, commit_size: u64, offset_pointer: u64, size_pointer: u64, inherit: u32, allocation: u32, protect: u32, mode: u8) -> Result<u32, KernelError> {
@@ -132,4 +147,56 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
 /// NtUnmapViewOfSection.
 pub fn unmap(process_handle: u64, base: u64, mode: u8) -> Result<u32, KernelError> {
     crate::ntos::mm::section::unmap_view::unmap(process_handle, base, mode)
+}
+
+/// Handle de kernel para `object` (Ok(handle) ou Err(status)).
+fn kernel_handle(object: u64, access: u32, object_type: u64) -> Result<Result<u64, u32>, KernelError> {
+    let slot = guest::alloc_bytes(8);
+    if slot == 0 {
+        return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+    }
+    let status = open_pointer::open(object, OBJ_KERNEL_HANDLE, 0, access, object_type, 0, slot);
+    let handle = guest::read64(slot);
+    guest::free_bytes(slot);
+    Ok(match status? {
+        0 => Ok(handle),
+        status => Err(status),
+    })
+}
+
+fn close(handle: u64) -> Result<(), KernelError> {
+    invoke_handler("ZwClose", &[handle]).map(|_| ())
+}
+
+/// MmMapViewOfSection: `map` em KernelMode sobre handles de kernel
+/// temporários para o objeto seção e o EPROCESS.
+#[allow(clippy::too_many_arguments)]
+pub fn map_by_pointer(section: u64, process: u64, base_pointer: u64, zero_bits: u64, commit_size: u64, offset_pointer: u64, size_pointer: u64, inherit: u32, allocation: u32, protect: u32) -> Result<u32, KernelError> {
+    let section_handle = match kernel_handle(section, SECTION_ALL_ACCESS, 0)? {
+        Ok(handle) => handle,
+        Err(status) => return Ok(status),
+    };
+    let process_handle = match kernel_handle(process, PROCESS_ALL_ACCESS, object_types::process_type().pointer)? {
+        Ok(handle) => handle,
+        Err(status) => {
+            close(section_handle)?;
+            return Ok(status);
+        }
+    };
+    let status = previous_mode::with_kernel(|| map(section_handle, process_handle, base_pointer, zero_bits, commit_size, offset_pointer, size_pointer, inherit, allocation, protect, 0));
+    close(process_handle)?;
+    close(section_handle)?;
+    status?
+}
+
+/// MmUnmapViewOfSection: `unmap` em KernelMode sobre um handle de kernel
+/// temporário para o EPROCESS.
+pub fn unmap_by_pointer(process: u64, base: u64) -> Result<u32, KernelError> {
+    let process_handle = match kernel_handle(process, PROCESS_ALL_ACCESS, object_types::process_type().pointer)? {
+        Ok(handle) => handle,
+        Err(status) => return Ok(status),
+    };
+    let status = previous_mode::with_kernel(|| unmap(process_handle, base, 0));
+    close(process_handle)?;
+    status?
 }

@@ -23,6 +23,7 @@ use crate::ntos::mm::pe_loader::{self, ImageDependency, ImportSymbol, LoadOption
 use self::pe_resolver::{ExportedModule, Symbol};
 use crate::hal::amd64::native_call;
 use crate::ntos::ob::object_manager;
+use crate::ntos::rtl::guest_strings;
 use crate::rtl::{KernelError, SpinLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +405,24 @@ pub fn state(name: &str) -> Option<(String, String, u32, bool, Option<u32>, Opti
     let record = cached(&normalize(name).ok()?).ok()??;
     let record = record.lock();
     Some((alloc::format!("{:?}", record.kind), alloc::format!("{:?}", record.state), record.references, record.pinned, record.initialize_status, record.unload_status))
+}
+
+/// MmGetSystemRoutineAddress: endereço chamável do export do kernel
+/// (trampolim ou dado real) cujo nome vem no UNICODE_STRING `name_string`,
+/// como o GetProcAddress de kernel; nome desconhecido devolve NULL.
+pub fn system_routine_address(name_string: u64) -> Result<u64, KernelError> {
+    let name = guest_strings::read_unicode_string(name_string);
+    match exports::lookup("", &name) {
+        Some(ResolvedImport::Thunk(id)) => exports::thunk_address(id as u64),
+        Some(ResolvedImport::Address { address, .. }) => Ok(address),
+        None => {
+            let length = guest::read16(name_string);
+            let buffer = guest::read64(name_string + 8);
+            let raw: String = (0..length.min(32) as u64).map(|index| guest::read8(buffer + index) as char).collect();
+            debug_print!("[mm] NAO ACHOU: \"{}\" (len={} buf={:#x} raw=\"{}\")", name, length, buffer, raw);
+            Ok(0)
+        }
+    }
 }
 
 pub mod kernel_image_source {

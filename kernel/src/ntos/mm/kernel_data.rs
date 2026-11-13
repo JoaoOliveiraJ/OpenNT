@@ -62,6 +62,12 @@ pub fn address(name: &str) -> Result<u64, KernelError> {
     kernel_address::virtual_address(section()? + offset)
 }
 
+/// Endereço de uma célula que precisa existir, para os getters dos exports
+/// de dados: a falta para o kernel com o nome do export.
+pub fn required_address(name: &str) -> u64 {
+    address(name).unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
 /// Endereço e extensão completa do armazenamento.
 pub fn region(name: &str) -> Result<(u64, u64), KernelError> {
     let (_, entry) = entry(name)?;
