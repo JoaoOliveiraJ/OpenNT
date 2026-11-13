@@ -15,23 +15,25 @@ use crate::ntos::ob::{object_access, object_types, open_pointer};
 use crate::ntos::ps::process;
 use crate::ntos::se::descriptor;
 use crate::ntos::se::token::tokens;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, PortMessage, SecurityDescriptor, Sid, UnicodeString};
+use crate::ntos::alpc::message::buffer::{read_block, read_field};
+use core::mem::offset_of;
 
 /// UNICODE_STRING.Length é o comprimento consumido; MaximumLength não
 /// limita esta captura NT. O nome do endpoint é sensível a caixa.
 pub fn unicode(pointer: u64, mode: u8, allow_empty: bool) -> Result<String, u32> {
-    if !message_buffer::accessible(pointer, 16, mode, false) {
+    if !message_buffer::accessible(pointer, UnicodeString::SIZE, mode, false) {
         return Err(0xC000_0005);
     }
-    let length = guest::read16(pointer) as u64;
-    let buffer = guest::read64(pointer + 8);
+    let length = read_field::<u16>(pointer, offset_of!(UnicodeString, length))? as u64;
+    let buffer = read_field::<u64>(pointer, offset_of!(UnicodeString, buffer))?;
     if length & 1 != 0 || (!allow_empty && length == 0) {
         return Err(0xC000_0033);
     }
     if length != 0 && !message_buffer::accessible(buffer, length, mode, false) {
         return Err(0xC000_0005);
     }
-    let units: Vec<u16> = (0..length).step_by(2).map(|offset| guest::read16(buffer + offset)).collect();
+    let units: Vec<u16> = read_block(buffer, length)?.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
     let name: String = units.iter().map(|&unit| char::from_u32(unit as u32).unwrap_or('\u{FFFD}')).collect();
     if name.contains('\0') || name.ends_with('\\') || name.contains("\\\\") {
         return Err(0xC000_0033);
@@ -45,18 +47,20 @@ pub fn identifier(pointer: u64, mode: u8) -> Result<Option<Vec<u8>>, u32> {
     if pointer == 0 {
         return Ok(None);
     }
-    if !message_buffer::accessible(pointer, 8, mode, false) {
+    let header = offset_of!(Sid, sub_authority) as u64;
+    if !message_buffer::accessible(pointer, header, mode, false) {
         return Err(0xC000_0005);
     }
-    let count = guest::read8(pointer + 1) as u64;
-    if guest::read8(pointer) != 1 || count > 15 {
+    let count = read_field::<u8>(pointer, offset_of!(Sid, sub_authority_count))? as u64;
+    if read_field::<u8>(pointer, offset_of!(Sid, revision))? != 1 || count > 15 {
         return Err(0xC000_0078);
     }
-    let length = 8 + 4 * count;
+    // Cabeçalho mais SubAuthority[count].
+    let length = header + 4 * count;
     if !message_buffer::accessible(pointer, length, mode, false) {
         return Err(0xC000_0005);
     }
-    Ok(Some((0..length).map(|offset| guest::read8(pointer + offset)).collect()))
+    Ok(Some(read_block(pointer, length)?))
 }
 
 /// Endpoint resolvido: nó, registro do servidor e caminho.
@@ -119,13 +123,13 @@ pub fn object_attributes(pointer: u64, mode: u8) -> Result<Creation, u32> {
     if mode != 0 && pointer & 7 != 0 {
         return Err(0x8000_0002);
     }
-    if !message_buffer::accessible(pointer, 48, mode, false) {
+    if !message_buffer::accessible(pointer, ObjectAttributes::SIZE, mode, false) {
         return Err(0xC000_0005);
     }
-    if guest::read32(pointer) != 48 {
+    if read_field::<u32>(pointer, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
         return Err(0xC000_000D);
     }
-    let mut flags = guest::read32(pointer + 24);
+    let mut flags = read_field::<u32>(pointer, offset_of!(ObjectAttributes, attributes))?;
     if flags & !0x1_1F72 != 0 {
         return Err(0xC000_000D);
     }
@@ -138,7 +142,7 @@ pub fn object_attributes(pointer: u64, mode: u8) -> Result<Creation, u32> {
             return Err(0xC000_0061);
         }
     }
-    let security = guest::read64(pointer + 32);
+    let security = read_field::<u64>(pointer, offset_of!(ObjectAttributes, security_descriptor))?;
     if security != 0 {
         if mode != 0 && security & 3 != 0 {
             return Err(0x8000_0002);
@@ -146,15 +150,15 @@ pub fn object_attributes(pointer: u64, mode: u8) -> Result<Creation, u32> {
         if mode != 0 && !create_section::descriptor_probe(security) {
             return Err(0xC000_0005);
         }
-        if guest::read8(security) != 1 {
+        if read_field::<u8>(security, offset_of!(SecurityDescriptor, revision))? != 1 {
             return Err(0xC000_0058);
         }
         if !descriptor::valid(security) {
             return Err(0xC000_0079);
         }
     }
-    let root = guest::read64(pointer + 8);
-    let name_pointer = guest::read64(pointer + 16);
+    let root = read_field::<u64>(pointer, offset_of!(ObjectAttributes, root_directory))?;
+    let name_pointer = read_field::<u64>(pointer, offset_of!(ObjectAttributes, object_name))?;
     let unnamed = Creation { flags, pointer, ..Creation::default() };
     if name_pointer == 0 {
         return if root != 0 { Err(0xC000_0033) } else { Ok(unnamed) };
@@ -216,12 +220,13 @@ pub fn message(pointer: u64, maximum: u32, mode: u8) -> Result<ConnectionMessage
     if header != 0 {
         return Err(header);
     }
-    if !message_buffer::accessible(pointer, 40, mode, false) {
+    let header_size = PortMessage::SIZE;
+    if !message_buffer::accessible(pointer, header_size, mode, false) {
         return Err(0xC000_0005);
     }
-    let data_length = guest::read16(pointer) as u32;
-    let total_length = guest::read16(pointer + 2) as u32;
-    if data_length + 40 != total_length {
+    let data_length = read_field::<u16>(pointer, offset_of!(PortMessage, u1.s1.data_length))? as u32;
+    let total_length = read_field::<u16>(pointer, offset_of!(PortMessage, u1.s1.total_length))? as u32;
+    if data_length + header_size as u32 != total_length {
         return Err(0xC000_000D);
     }
     if total_length > maximum {
@@ -230,6 +235,7 @@ pub fn message(pointer: u64, maximum: u32, mode: u8) -> Result<ConnectionMessage
     if !message_buffer::accessible(pointer, total_length as u64, mode, false) {
         return Err(0xC000_0005);
     }
-    let data = (0..data_length as u64).map(|offset| guest::read8(pointer + 40 + offset)).collect();
-    Ok(ConnectionMessage { data, message_type: 0x200A | if mode == 0 { guest::read16(pointer + 4) & 0x8000 } else { 0 } })
+    let data = read_block(pointer + header_size, data_length as u64)?;
+    let kernel_type = if mode == 0 { read_field::<u16>(pointer, offset_of!(PortMessage, u2.s2.type_))? & 0x8000 } else { 0 };
+    Ok(ConnectionMessage { data, message_type: 0x200A | kernel_type })
 }

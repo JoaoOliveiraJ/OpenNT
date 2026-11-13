@@ -9,8 +9,7 @@ use crate::ntos::alpc::message::buffer as message_buffer;
 use crate::ntos::ke::{clock, thread_alert, thread_lock};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::types::{Kthread, NtStruct};
 
 const WINDOWS_EPOCH: u64 = 116_444_736_000_000_000;
 
@@ -41,7 +40,8 @@ pub fn capture_timeout(pointer: u64, access_mode: u8) -> Result<Timeout, u32> {
     if !message_buffer::accessible(pointer, 8, access_mode, false) {
         return Err(0xC000_0005);
     }
-    let interval = guest::read64(pointer) as i64;
+    // PLARGE_INTEGER Timeout (QuadPart).
+    let interval = message_buffer::read_field::<i64>(pointer, 0)?;
     Ok(if interval <= 0 {
         Timeout { relative_deadline: Some(clock::uptime_ms() * 10_000 + interval.unsigned_abs()), absolute_deadline: None }
     } else {
@@ -59,25 +59,29 @@ impl Timeout {
 /// enfileirada e alerta de kernel; sem Alertable, só a pendência já
 /// publicada de APC interrompe em UserMode.
 pub fn interruption(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
+    // SAFETY: thread viva retida por `begin` até o fim da espera.
+    let kthread = unsafe { Kthread::at(thread) };
     thread_lock::with_lock(thread, || {
-        let kernel_alert = thread + kthread::ALERTED;
-        let selected = kernel_alert + wait_mode as u64;
-        let pending = thread + kthread::APC_STATE + 0x2A;
+        let kernel_alert = &kthread.alerted[0];
+        let selected = &kthread.alerted[wait_mode as usize];
+        let apc_state = &kthread.apc_state;
         if alertable {
-            if guest::read8(selected) != 0 {
-                guest::write8(selected, 0);
+            if selected.get() != 0 {
+                selected.set(0);
                 return Some(0x101);
             }
-            let user_queue = thread + kthread::APC_STATE + 0x10;
-            if wait_mode != 0 && guest::read64(user_queue) != user_queue {
-                guest::write8(pending, guest::read8(pending) | 2);
+            // ApcListHead[UserMode] não vazia.
+            let user_queue = &apc_state.apc_list_head[1];
+            if wait_mode != 0 && user_queue.flink.get() != user_queue.address() {
+                // UserApcPending por CAS no byte (vizinhos preservados).
+                apc_state.set_user_apc_pending(1);
                 return Some(0xC0);
             }
-            if guest::read8(kernel_alert) != 0 {
-                guest::write8(kernel_alert, 0);
+            if kernel_alert.get() != 0 {
+                kernel_alert.set(0);
                 return Some(0x101);
             }
-        } else if wait_mode != 0 && guest::read8(pending) & 2 != 0 {
+        } else if wait_mode != 0 && apc_state.user_apc_pending() != 0 {
             return Some(0xC0);
         }
         None

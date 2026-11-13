@@ -18,9 +18,35 @@ use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, Dispatche
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::IoMiniCompletionPacketUser;
 use crate::ntos::mm::guest_memory as guest;
 
-pub const SIZE: u64 = 0x40;
+/// Corpo privado da porta de conclusão (layout do OpenNT, do tamanho de
+/// uma KQUEUE): contagens espelhadas pelo despachante e o estado da porta.
+#[repr(C)]
+struct CompletionBody {
+    references: Field<u64>,
+    handles: Field<u32>,
+    _pad_c: Reserved<4>,
+    closed: Field<u32>,
+    concurrency: Field<u32>,
+    packet_count: Field<u32>,
+    active_count: Field<u32>,
+    waiter_count: Field<u32>,
+    _reserved: Reserved<0x1C>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CompletionBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CompletionBody>() == 0x40);
+    assert!(core::mem::offset_of!(CompletionBody, closed) == 0x10);
+    assert!(core::mem::offset_of!(CompletionBody, waiter_count) == 0x20);
+};
+
+pub const SIZE: u64 = CompletionBody::SIZE;
 
 /// Pacote de conclusão: valores próprios ou lidos do pacote nativo.
 #[derive(Default)]
@@ -41,8 +67,9 @@ impl Packet {
     /// (key, context, status, information).
     pub fn values(&self) -> (u64, u64, u32, u64) {
         if self.native_pointer != 0 {
-            let pointer = self.native_pointer;
-            (guest::read64(pointer + 0x18), guest::read64(pointer + 0x20), guest::read32(pointer + 0x28), guest::read64(pointer + 0x30))
+            // SAFETY: pacote de memória em custódia da fila até a retirada.
+            let packet = unsafe { IoMiniCompletionPacketUser::at(self.native_pointer) };
+            (packet.key_context.get(), packet.apc_context.get(), packet.io_status.get() as u32, packet.io_status_information.get())
         } else {
             (self.key, self.context, self.status, self.information)
         }
@@ -75,25 +102,32 @@ pub struct Port {
 }
 
 impl Port {
-    pub fn closed(&self) -> bool {
-        guest::read32(self.pointer + 0x10) != 0
+    fn body(&self) -> &'static CompletionBody {
+        // SAFETY: corpo alocado por `create`, liberado só no `dispose`.
+        unsafe { CompletionBody::at(self.pointer) }
     }
 
-    fn set_closed(&self) {
-        guest::write32(self.pointer + 0x10, 1);
+    pub fn closed(&self) -> bool {
+        self.body().closed.get() != 0
+    }
+
+    /// Marca a porta fechada; devolve se ela já estava fechada.
+    fn mark_closed(&self) -> bool {
+        self.body().closed.atomic().swap(1, Ordering::AcqRel) != 0
     }
 
     pub fn concurrency(&self) -> u32 {
-        guest::read32(self.pointer + 0x14)
+        self.body().concurrency.get()
     }
 
     /// Altera as coleções e publica os contadores no corpo nativo.
     pub fn with<R>(&self, body: impl FnOnce(&mut PortState) -> R) -> R {
         let mut state = self.state.lock();
         let result = body(&mut state);
-        guest::write32(self.pointer + 0x18, state.packets.len() as u32);
-        guest::write32(self.pointer + 0x1C, state.active.len() as u32);
-        guest::write32(self.pointer + 0x20, state.waiters.len() as u32);
+        let counts = self.body();
+        counts.packet_count.set(state.packets.len() as u32);
+        counts.active_count.set(state.active.len() as u32);
+        counts.waiter_count.set(state.waiters.len() as u32);
         result
     }
 }
@@ -194,10 +228,9 @@ pub fn deactivate(thread: u64) {
 
 /// Fecha: remove o nome, drena os pacotes e desfaz as associações.
 pub fn close_port(port: &Port) {
-    if port.closed() {
+    if port.mark_closed() {
         return;
     }
-    port.set_closed();
     if let Some(node) = port.node.lock().take() {
         object_manager::remove_named(node);
     }
@@ -242,10 +275,8 @@ pub fn create(name: &str, concurrency: u32, attributes: u64, from_user_mode: boo
     if pointer == 0 {
         return Err(KernelError::with_status("completion body allocation failed", 0xC000_009A));
     }
-    for offset in (0..SIZE).step_by(8) {
-        guest::write64(pointer + offset, 0);
-    }
-    guest::write32(pointer + 0x14, concurrency);
+    // SAFETY: alocação nova (zerada) do tamanho do corpo.
+    unsafe { CompletionBody::at(pointer) }.concurrency.set(concurrency);
     let port = Arc::new(Port { pointer, name: SpinLock::new(String::from(name)), node: SpinLock::new(None), exclusive_process: AtomicU64::new(0), notifying: AtomicBool::new(false), state: SpinLock::new(PortState { packets: VecDeque::new(), active: BTreeSet::new(), waiters: Vec::new(), associated: BTreeSet::new() }), listeners: SpinLock::new(Vec::new()) });
     if let Err(error) = dispatcher_objects::create(pointer, "completion", dispose, None, attributes, from_user_mode, DispatcherHooks { before_handle_open: Some(before_handle_open), on_last_handle_close: Some(on_last_handle_close) }) {
         guest::free_bytes(pointer);

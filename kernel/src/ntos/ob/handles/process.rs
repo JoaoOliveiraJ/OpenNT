@@ -6,13 +6,21 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ob::handle_table::{self, HandleDescription, Row};
 use crate::ntos::ex::rundown;
 use crate::ntos::ke::critical_region;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::types::{Eprocess, NtStruct};
+
+/// O EPROCESS do processo dono. As sondas em ObjectTable preservam a
+/// recusa de um corpo sem mapeamento.
+fn eprocess(process: u64) -> &'static Eprocess {
+    // SAFETY: os chamadores passam o EPROCESS do processo dono; os campos
+    // que podem não estar mapeados são acessados com probe_get/probe_set.
+    unsafe { Eprocess::at(process) }
+}
 
 /// Fechamento pelo provedor dono: (processo, handle).
 pub type Closer = fn(u64, u32);
@@ -41,7 +49,7 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
         return Err(KernelError::new("process already owns a handle table"));
     }
     let table = handle_table::create(process, process_id)?;
-    if let Err(error) = guest::try_write64(process + eprocess::OBJECT_TABLE, table) {
+    if let Err(error) = eprocess(process).object_table.probe_set(table) {
         let _ = handle_table::destroy(table);
         return Err(error);
     }
@@ -52,11 +60,11 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
 /// Adquire o rundown antes de ler ObjectTable. Um ponteiro não nulo
 /// transfere a referência ao chamador.
 pub fn reference(process: u64) -> Result<u64, KernelError> {
-    let rundown_pointer = process + eprocess::RUNDOWN_PROTECT;
+    let rundown_pointer = eprocess(process).rundown_protect.address();
     if !rundown::acquire(rundown_pointer)? {
         return Ok(0);
     }
-    let table = guest::try_read64(process + eprocess::OBJECT_TABLE).unwrap_or(0);
+    let table = eprocess(process).object_table.probe_get().unwrap_or(0);
     if table == 0 {
         rundown::release(rundown_pointer)?;
     }
@@ -64,7 +72,7 @@ pub fn reference(process: u64) -> Result<u64, KernelError> {
 }
 
 pub fn release(process: u64) -> Result<(), KernelError> {
-    rundown::release(process + eprocess::RUNDOWN_PROTECT)
+    rundown::release(eprocess(process).rundown_protect.address())
 }
 
 fn row_is_current(binding: &Binding) -> bool {
@@ -118,7 +126,7 @@ pub fn remove(binding: &Binding, commit: Option<&mut dyn FnMut()>) -> Result<boo
         return Ok(false);
     }
     critical_region::with_critical(|| {
-        let referenced = rundown::acquire(binding.process + eprocess::RUNDOWN_PROTECT)?;
+        let referenced = rundown::acquire(eprocess(binding.process).rundown_protect.address())?;
         let draining = TABLES.lock().get(&binding.process).is_some_and(|owner| owner.draining);
         if !referenced && !draining {
             return Ok(false);
@@ -156,7 +164,7 @@ pub fn change(binding: &Binding, attributes: u32, access: u32, commit: Option<&m
         return Ok(false);
     }
     critical_region::with_critical(|| {
-        let referenced = rundown::acquire(binding.process + eprocess::RUNDOWN_PROTECT)?;
+        let referenced = rundown::acquire(eprocess(binding.process).rundown_protect.address())?;
         let changed = referenced && handle_table::change(binding.table, binding.handle as u64, attributes, access)?;
         if changed {
             if let Some(commit) = commit {
@@ -175,7 +183,7 @@ pub fn destroy(process: u64) -> Result<(), KernelError> {
     let Some(table) = TABLES.lock().get(&process).map(|owner| owner.table) else {
         return Ok(());
     };
-    if guest::compare_exchange64(process + eprocess::RUNDOWN_PROTECT, 0, 0)? != 1 {
+    if eprocess(process).rundown_protect.count.atomic().load(Ordering::SeqCst) != 1 {
         return Err(KernelError::new("process handle table rundown is not complete"));
     }
     // Só esta fase remove linhas depois do rundown.
@@ -192,7 +200,7 @@ pub fn destroy(process: u64) -> Result<(), KernelError> {
             return Err(KernelError::new("provider did not close its process handle"));
         }
     }
-    guest::write64(process + eprocess::OBJECT_TABLE, 0);
+    eprocess(process).object_table.set(0);
     handle_table::destroy(table)?;
     TABLES.lock().remove(&process);
     Ok(())
@@ -206,7 +214,7 @@ pub fn abort(process: u64) -> Result<(), KernelError> {
     if !handle_table::rows(table).is_empty() {
         return Err(KernelError::new("cannot abandon an inhabited process table"));
     }
-    guest::write64(process + eprocess::OBJECT_TABLE, 0);
+    eprocess(process).object_table.set(0);
     handle_table::destroy(table)?;
     TABLES.lock().remove(&process);
     Ok(())

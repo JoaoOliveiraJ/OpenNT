@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_access;
@@ -26,9 +27,55 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::state;
 use crate::ntos::se::token::tokens;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::Eprocess;
 use crate::ntos::mm::guest_memory as guest;
 
-pub const SIZE: u64 = 0x80;
+/// Corpo privado da conexão LPC/ALPC (layout do OpenNT; o NT usa
+/// ALPC_PORT). Contadores das coleções espelhados sob o estado da porta.
+#[repr(C)]
+struct PortBody {
+    references: Field<u64>,
+    handles: Field<u32>,
+    closed: Field<u32>,
+    process: Field<u64>,
+    process_id: Field<u64>,
+    thread_id: Field<u64>,
+    maximum: Field<u32>,
+    sequence: Field<u32>,
+    pending: Field<u32>,
+    jobs: Field<u32>,
+    reserve_bytes: Field<u32>,
+    reserves: Field<u32>,
+    views: Field<u32>,
+    operations: Field<u32>,
+    completion_port: Field<u64>,
+    token: Field<u64>,
+    view_bases: [Field<u64>; 2],
+    started: Field<u32>,
+    cleaned: Field<u32>,
+    completion_key: Field<u64>,
+    _reserved: Reserved<8>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for PortBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PortBody>() == 0x80);
+    assert!(core::mem::offset_of!(PortBody, closed) == 0xC);
+    assert!(core::mem::offset_of!(PortBody, maximum) == 0x28);
+    assert!(core::mem::offset_of!(PortBody, operations) == 0x44);
+    assert!(core::mem::offset_of!(PortBody, view_bases) == 0x58);
+    assert!(core::mem::offset_of!(PortBody, completion_key) == 0x70);
+};
+
+pub const SIZE: u64 = PortBody::SIZE;
+
+fn port_body(pointer: u64) -> &'static PortBody {
+    // SAFETY: corpos alocados por `create`, liberados só no `dispose`.
+    unsafe { PortBody::at(pointer) }
+}
 
 /// Estados da conexão de um cliente; zero = sem conexão pendente.
 pub const CONNECTION_PENDING: u32 = 1;
@@ -102,65 +149,68 @@ pub struct Port {
 
 impl Port {
     /// Altera o estado e publica os contadores das coleções no corpo.
+    fn body(&self) -> &'static PortBody {
+        port_body(self.pointer)
+    }
     pub fn with<R>(&self, body: impl FnOnce(&mut PortState) -> R) -> R {
         let mut state = self.state.lock();
         let result = body(&mut state);
-        guest::write32(self.pointer + 0x30, state.pending.len() as u32);
-        guest::write32(self.pointer + 0x34, state.jobs.len() as u32);
-        guest::write32(self.pointer + 0x3C, state.reserves.len() as u32);
-        guest::write32(self.pointer + 0x40, state.views.len() as u32);
-        guest::write64(self.pointer + 0x58, state.views.first().map_or(0, |view| view.base));
-        guest::write64(self.pointer + 0x60, state.views.get(1).map_or(0, |view| view.base));
-        guest::write64(self.pointer + 0x48, state.completion.as_ref().map_or(0, |completion| completion.port_pointer()));
+        let mirror = self.body();
+        mirror.pending.set(state.pending.len() as u32);
+        mirror.jobs.set(state.jobs.len() as u32);
+        mirror.reserves.set(state.reserves.len() as u32);
+        mirror.views.set(state.views.len() as u32);
+        mirror.view_bases[0].set(state.views.first().map_or(0, |view| view.base));
+        mirror.view_bases[1].set(state.views.get(1).map_or(0, |view| view.base));
+        mirror.completion_port.set(state.completion.as_ref().map_or(0, |completion| completion.port_pointer()));
         result
     }
     pub fn closed(&self) -> bool {
-        guest::read32(self.pointer + 0xC) != 0
+        self.body().closed.get() != 0
     }
-    fn set_closed(&self) {
-        guest::write32(self.pointer + 0xC, 1);
+    /// Marca a conexão fechada; devolve se ela já estava fechada.
+    fn mark_closed(&self) -> bool {
+        self.body().closed.atomic().swap(1, Ordering::AcqRel) != 0
     }
     pub fn handles(&self) -> u32 {
         dispatcher_objects::get(self.pointer).map_or(0, |(_, _, handles)| handles)
     }
     pub fn process_id(&self) -> u64 {
-        guest::read64(self.pointer + 0x18)
+        self.body().process_id.get()
     }
     pub fn thread_id(&self) -> u64 {
-        guest::read64(self.pointer + 0x20)
+        self.body().thread_id.get()
     }
     pub fn maximum(&self) -> u32 {
-        guest::read32(self.pointer + 0x28)
+        self.body().maximum.get()
     }
     pub fn sequence(&self) -> u32 {
-        guest::read32(self.pointer + 0x2C)
+        self.body().sequence.get()
     }
     pub fn set_sequence(&self, sequence: u32) {
-        guest::write32(self.pointer + 0x2C, sequence);
+        self.body().sequence.set(sequence);
     }
     pub fn reserve_bytes(&self) -> u32 {
-        guest::read32(self.pointer + 0x38)
+        self.body().reserve_bytes.get()
     }
+    /// Soma atômica (as reservas são criadas e liberadas em paralelo).
     pub fn add_reserve_bytes(&self, delta: i64) {
-        guest::write32(self.pointer + 0x38, (self.reserve_bytes() as i64 + delta) as u32);
+        self.body().reserve_bytes.atomic().fetch_add(delta as u32, Ordering::SeqCst);
     }
     pub fn operations(&self) -> u32 {
-        guest::read32(self.pointer + 0x44)
+        self.body().operations.get()
     }
     pub fn started(&self) -> bool {
-        guest::read32(self.pointer + 0x68) != 0
+        self.body().started.get() != 0
     }
     pub fn set_started(&self, started: bool) {
-        guest::write32(self.pointer + 0x68, started as u32);
-    }
-    fn cleaned(&self) -> bool {
-        guest::read32(self.pointer + 0x6C) != 0
+        self.body().started.set(started as u32);
     }
     pub fn completion_key(&self) -> u64 {
-        guest::read64(self.pointer + 0x70)
+        self.body().completion_key.get()
     }
     pub fn set_completion_key(&self, key: u64) {
-        guest::write64(self.pointer + 0x70, key);
+        self.body().completion_key.set(key);
     }
     pub fn token(&self) -> u64 {
         *self.token.lock()
@@ -168,10 +218,13 @@ impl Port {
 
     fn cleanup_when_idle(self: &Arc<Self>) {
         let closing = self.with(|state| state.closing);
-        if self.cleaned() || !self.closed() || (!closing && self.kind == "alpc") || self.operations() != 0 {
+        if !self.closed() || (!closing && self.kind == "alpc") || self.operations() != 0 {
             return;
         }
-        guest::write32(self.pointer + 0x6C, 1);
+        // Só a primeira thread que chega aqui executa a limpeza.
+        if self.body().cleaned.atomic().swap(1, Ordering::AcqRel) != 0 {
+            return;
+        }
         (self.cleanup)(self);
     }
 
@@ -181,10 +234,9 @@ impl Port {
         if flags & 1 != 0 {
             self.with(|state| state.skip_pending_flush = true);
         }
-        if self.closed() {
+        if self.mark_closed() {
             return 0xC000_0037;
         }
-        self.set_closed();
         notify_disconnect(self, false);
         self.cleanup_when_idle();
         0
@@ -206,9 +258,10 @@ impl Port {
     /// Cada operação retém o corpo enquanto executa e reavalia a limpeza.
     pub fn run<R>(self: &Arc<Self>, body: impl FnOnce() -> R) -> R {
         let _ = dispatcher_objects::reference(self.pointer);
-        guest::write32(self.pointer + 0x44, self.operations() + 1);
+        let operations = self.body().operations.atomic();
+        operations.fetch_add(1, Ordering::SeqCst);
         let result = body();
-        guest::write32(self.pointer + 0x44, self.operations().saturating_sub(1));
+        let _ = operations.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| Some(count.saturating_sub(1)));
         self.cleanup_when_idle();
         let _ = dispatcher_objects::dereference(self.pointer);
         result
@@ -264,7 +317,7 @@ fn dispose(pointer: u64) {
     let token = core::mem::replace(&mut *port.token.lock(), 0);
     if token != 0 {
         let _ = tokens::release(token);
-        guest::write64(pointer + 0x50, 0);
+        port_body(pointer).token.set(0);
     }
     let _ = process::dereference(port.process_pointer);
     guest::free_bytes(pointer);
@@ -304,16 +357,16 @@ pub fn create(kind: &'static str, initial: PortState, maximum: u32, sequence: u3
     if pointer == 0 {
         return Err(KernelError::with_status("port object status c000009a", 0xC000_009A));
     }
-    for offset in (0..SIZE).step_by(8) {
-        guest::write64(pointer + offset, 0);
-    }
-    guest::write64(pointer + 0x10, process_pointer);
+    // Alocação zerada: só a identidade e a configuração inicial.
+    let body = port_body(pointer);
+    body.process.set(process_pointer);
     // Uma conexão de kernel pode atribuir o corpo ao System; as demais
     // conservam a identidade do processo ativo.
-    guest::write64(pointer + 0x18, if options.owner_process.is_some() { guest::read64(process_pointer + 0x440) } else { process::get_current_process_id() });
-    guest::write64(pointer + 0x20, process::get_current_thread_id());
-    guest::write32(pointer + 0x28, maximum);
-    guest::write32(pointer + 0x2C, sequence);
+    // SAFETY: EPROCESS do dono, com registro vivo (verificado acima).
+    body.process_id.set(if options.owner_process.is_some() { unsafe { Eprocess::at(process_pointer) }.unique_process_id.get() } else { process::get_current_process_id() });
+    body.thread_id.set(process::get_current_thread_id());
+    body.maximum.set(maximum);
+    body.sequence.set(sequence);
     let port = Arc::new(Port { pointer, kind, process_pointer, own_resources: crate::ntos::alpc::resource::handles::new_table(), state: SpinLock::new(initial), cleanup, token: SpinLock::new(0) });
     if let Err(error) = dispatcher_objects::create(pointer, kind, dispose, None, attributes, !options.kernel_mode, DispatcherHooks { before_handle_open: Some(before_handle_open), on_last_handle_close: Some(on_last_handle_close) }) {
         guest::free_bytes(pointer);
@@ -334,7 +387,7 @@ pub fn create(kind: &'static str, initial: PortState, maximum: u32, sequence: u3
         let Some(token) = process::get_primary_token(process_pointer) else { return Err(fail(0xC000_0022)) };
         tokens::retain(token)?;
         *port.token.lock() = token;
-        guest::write64(pointer + 0x50, token);
+        port_body(pointer).token.set(token);
     }
     port.with(|_| ());
     Ok(port)

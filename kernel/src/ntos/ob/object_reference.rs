@@ -15,11 +15,10 @@ use alloc::format;
 use core::sync::atomic::Ordering;
 
 use crate::ntos::ex::callbacks as executive_callbacks;
-use crate::ntos::inc::nt_abi::device_object;
+use crate::ntos::inc::types::{DeviceObject, Field, NtStruct, ObjectHandleInformation};
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::io::io_manager;
-use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::inserted;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::objects::{device as device_objects, dispatcher as dispatcher_objects, driver as driver_objects, file as file_objects, namespace as namespace_objects, section as section_objects};
@@ -35,14 +34,25 @@ const TYPE_MISMATCH: u32 = 0xC000_0024;
 const ACCESS_DENIED: u32 = 0xC000_0022;
 const INVALID_HANDLE: u32 = 0xC000_0008;
 
+/// Saída escalar (`PVOID*`, `PHANDLE`, `PULONG`...) de um chamador de kernel.
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro de saída fornecido por um chamador de kernel.
+    unsafe { Field::<T>::at(address) }
+}
+
 /// Retém o dispositivo pelo dono que o conhece ou pelo contador nativo LONG
 /// (InterlockedIncrement: devolve o valor novo).
+///
+/// O OpenNT não monta OBJECT_HEADER antes dos corpos: um ponteiro que
+/// nenhum dono reconhece cai no DEVICE_OBJECT.ReferenceCount, que no NT é a
+/// contagem de E/S do dispositivo — não o PointerCount do cabeçalho.
 pub(crate) fn reference_device(pointer: u64) -> Result<u64, KernelError> {
     if let Some(count) = device_objects::reference(pointer)? {
         return Ok(count as u64);
     }
-    let count = guest::atomic_u32(pointer + device_object::REFERENCE_COUNT);
-    let value = (count.fetch_add(1, Ordering::SeqCst) as i32).wrapping_add(1);
+    // SAFETY: dispositivo legado fora do registro dos donos.
+    let count = &unsafe { DeviceObject::at(pointer) }.reference_count;
+    let value = count.atomic().fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     Ok(value as i64 as u64)
 }
 
@@ -51,8 +61,9 @@ fn dereference_device(pointer: u64) -> Result<u64, KernelError> {
     if let Some(count) = device_objects::dereference(pointer)? {
         return Ok(count as u64);
     }
-    let count = guest::atomic_u32(pointer + device_object::REFERENCE_COUNT);
-    let value = (count.fetch_sub(1, Ordering::SeqCst) as i32).wrapping_sub(1);
+    // SAFETY: dispositivo legado fora do registro dos donos.
+    let count = &unsafe { DeviceObject::at(pointer) }.reference_count;
+    let value = count.atomic().fetch_sub(1, Ordering::SeqCst).wrapping_sub(1);
     Ok(value as i64 as u64)
 }
 
@@ -165,8 +176,10 @@ pub(crate) fn type_differs(requested: u64, expected: u64) -> bool {
 
 fn write_information(information: u64, attributes: u32, access: u32) {
     if information != 0 {
-        guest::write32(information, attributes);
-        guest::write32(information + 4, access);
+        // SAFETY: POBJECT_HANDLE_INFORMATION de um chamador de kernel.
+        let information = unsafe { ObjectHandleInformation::at(information) };
+        information.handle_attributes.set(attributes);
+        information.granted_access.set(access);
     }
 }
 
@@ -190,7 +203,7 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
             return Ok(status as u64);
         }
         executive_callbacks::reference(target);
-        guest::write64(output, target);
+        out::<u64>(output).set(target);
         return Ok(0);
     }
     if section_objects::is_section(pointer) {
@@ -201,7 +214,7 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
             return Ok(signed_status(ACCESS_DENIED));
         }
         section_objects::reference(pointer);
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         return Ok(0);
     }
     if driver_objects::is_driver(pointer) {
@@ -212,14 +225,14 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
             return Ok(signed_status(ACCESS_DENIED));
         }
         driver_objects::reference(pointer);
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         return Ok(0);
     }
     reference_device(pointer)?;
     if let Some(node) = node {
         object_manager::update_node(node, |node| node.refs += 1);
     }
-    guest::write64(output, pointer);
+    out::<u64>(output).set(pointer);
     Ok(0)
 }
 
@@ -237,7 +250,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         executive_callbacks::reference(callback.native_pointer);
-        guest::write64(output, callback.native_pointer);
+        out::<u64>(output).set(callback.native_pointer);
         write_information(information, callback.attributes, granted);
         return Ok(0);
     }
@@ -252,7 +265,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         tokens::retain(entry.native_pointer)?;
-        guest::write64(output, entry.native_pointer);
+        out::<u64>(output).set(entry.native_pointer);
         write_information(information, entry.attributes, granted);
         return Ok(0);
     }
@@ -270,7 +283,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
         if process::reference_thread(thread).is_none() {
             return Ok(signed_status(INVALID_HANDLE));
         }
-        guest::write64(output, thread);
+        out::<u64>(output).set(thread);
         write_information(information, 0, thread_type.valid_access);
         return Ok(0);
     }
@@ -296,7 +309,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         section_objects::reference(pointer);
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         write_information(information, data.attributes, granted);
         return Ok(0);
     }
@@ -314,7 +327,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         driver_objects::reference(pointer);
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         write_information(information, data.attributes, granted);
         return Ok(0);
     }
@@ -333,7 +346,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         process::reference(pointer);
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         write_information(information, 0, granted);
         return Ok(0);
     }
@@ -346,7 +359,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         kernel_threads::reference(data.native_pointer);
-        guest::write64(output, data.native_pointer);
+        out::<u64>(output).set(data.native_pointer);
         write_information(information, 0, granted);
         return Ok(0);
     }
@@ -375,7 +388,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(ACCESS_DENIED as u64);
         }
         dispatcher_objects::reference(pointer)?;
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         write_information(information, attributes, granted);
         return Ok(0);
     }
@@ -388,7 +401,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
             return Ok(signed_status(ACCESS_DENIED));
         }
         file_objects::reference(pointer)?;
-        guest::write64(output, pointer);
+        out::<u64>(output).set(pointer);
         write_information(information, 0, granted);
         return Ok(0);
     }
@@ -396,7 +409,7 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
     if let Some(node) = node {
         object_manager::update_node(node, |node| node.refs += 1);
     }
-    guest::write64(output, pointer);
+    out::<u64>(output).set(pointer);
     Ok(0)
 }
 

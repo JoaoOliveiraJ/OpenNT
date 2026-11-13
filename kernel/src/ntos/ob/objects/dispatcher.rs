@@ -20,7 +20,23 @@ use crate::ntos::mm::section::create as create_section;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::tokens;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::ObjectAttributes;
 use crate::ntos::mm::guest_memory as guest;
+
+/// Início comum dos corpos privados que espelham as contagens do registro:
+/// referências em +0 e handles em +8 (o resto é do corpo de cada tipo).
+#[repr(C)]
+pub struct MirroredCounts {
+    pub references: Field<u64>,
+    pub handles: Field<u32>,
+    _body: Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for MirroredCounts {}
+
+const _: () = assert!(core::mem::size_of::<MirroredCounts>() == 0x10);
 
 /// Ganchos do dono do objeto.
 #[derive(Clone, Copy, Default)]
@@ -90,7 +106,13 @@ pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -
         return Err(KernelError::new("invalid dispatcher object registration"));
     };
     let subject = object_access::subject();
-    let descriptor = if attributes != 0 { guest::read64(attributes + 32) } else { 0 };
+    let descriptor = if attributes != 0 {
+        // OBJECT_ATTRIBUTES do chamador: de modo usuário vem sondado.
+        let address = attributes + core::mem::offset_of!(ObjectAttributes, security_descriptor) as u64;
+        if from_user_mode { guest::try_read::<u64>(address).map_err(|_| status(0xC000_0005))? } else { guest::read::<u64>(address) }
+    } else {
+        0
+    };
     if descriptor != 0 && from_user_mode && !create_section::descriptor_probe(descriptor) {
         return Err(status(0xC000_0005));
     }
@@ -134,8 +156,10 @@ pub fn collect(pointer: u64) {
 /// Escreve as contagens no corpo quando o registro as mantém nele.
 fn mirror(pointer: u64, body: &Body) {
     if body.mirror {
-        guest::write64(pointer, body.refs as u64);
-        guest::write32(pointer + 8, body.handles);
+        // SAFETY: corpo vivo registrado pelo dono, com as contagens no início.
+        let counts = unsafe { MirroredCounts::at(pointer) };
+        counts.references.set(body.refs as u64);
+        counts.handles.set(body.handles);
     }
 }
 
@@ -330,7 +354,7 @@ pub fn publish(pointer: u64, output: u64, desired: u32, attributes: u32, success
             return if error.status != 0 { Ok(error.status) } else { Err(error) };
         }
     };
-    if let Err(error) = guest::try_write64(output, handle as u64) {
+    if let Err(error) = guest::try_write::<u64>(output, handle as u64) {
         let _ = crate::ntos::ps::user::state::close_user_handle(handle as u64, false, true);
         return if error.status != 0 { Ok(error.status) } else { Err(error) };
     }

@@ -15,6 +15,7 @@ use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
 use crate::ntos::ob::object_access;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{NtStruct, Section};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Estado de vida da seção, visível ao dono (Mm).
@@ -89,11 +90,12 @@ impl ObjectOwner for SectionOwner {
 /// memória.
 pub fn register(state: SectionState, destroy: fn(u64) -> Result<(), KernelError>) -> Result<u64, KernelError> {
     let object_type = object_types::section_type();
-    let pointer = guest::alloc_bytes(0x40);
+    let pointer = guest::alloc_bytes(Section::SIZE);
     if pointer == 0 {
         return Ok(0);
     }
-    guest::write64(pointer + 0x30, state.size);
+    // SAFETY: alocação nova (zerada) do tamanho de um _SECTION.
+    unsafe { Section::at(pointer) }.size_of_section.set(state.size);
     let security = object_access::capture(object_access::subject());
     SECTIONS.lock().insert(pointer, Record { state: SectionState { handles: 0, ..state }, references: 0, destroy, security });
     object_types::account(&object_type.name, 1, 0)?;

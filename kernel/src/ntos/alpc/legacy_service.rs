@@ -6,23 +6,36 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
-use crate::ntos::alpc::message::buffer::Captured;
+use crate::ntos::alpc::message::buffer::{Captured, HEADER_SIZE};
+use crate::ntos::inc::types::{PortMessage, PortMessageView1};
 use super::transport::{Job, JobResult, Reply, Request, ServiceContinuation, ServiceReply};
 use crate::ntos::ob::objects::port::Port;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 
+/// Campo de 16 bits da cópia do PORT_MESSAGE.
+fn get16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+/// Grava `value` (little-endian) no offset do campo da cópia.
+fn put(bytes: &mut [u8], offset: usize, value: &[u8]) {
+    bytes[offset..offset + value.len()].copy_from_slice(value);
+}
+
 fn response(bytes: &[u8], status: u32) -> JobResult {
     if status != 0 {
         return JobResult { status, ..JobResult::default() };
     }
-    let data_length = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    let total_length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-    if total_length != data_length + 40 || total_length > bytes.len() || u16::from_le_bytes([bytes[6], bytes[7]]) != 0 {
+    let header = HEADER_SIZE as usize;
+    let data_length = get16(bytes, offset_of!(PortMessage, u1.s1.data_length)) as usize;
+    let total_length = get16(bytes, offset_of!(PortMessage, u1.s1.total_length)) as usize;
+    if total_length != data_length + header || total_length > bytes.len() || get16(bytes, offset_of!(PortMessage, u2.s2.data_info_offset)) != 0 {
         return JobResult { status: 0xC000_000D, ..JobResult::default() };
     }
-    JobResult { status: 0, data: bytes[40..total_length].to_vec(), sender: None }
+    JobResult { status: 0, data: bytes[header..total_length].to_vec(), sender: None }
 }
 
 /// A continuação do serviço lê o PORT_MESSAGE que ele próprio alterou.
@@ -43,15 +56,18 @@ impl Job for Continuation {
 
 pub fn exchange(port: &Arc<Port>, captured: &Captured, request: &Arc<Request>, datagram: bool) -> Result<Reply, KernelError> {
     let Some(service) = port.with(|state| state.service.clone()) else { return Err(KernelError::new("LPC port has no service")) };
-    let mut bytes = Vec::with_capacity(40 + captured.data.len());
+    let mut bytes = Vec::with_capacity(HEADER_SIZE as usize + captured.data.len());
     bytes.extend_from_slice(&captured.header);
     bytes.extend_from_slice(&captured.data);
-    bytes[4..6].copy_from_slice(&(if datagram { 3u16 } else { 1 }).to_le_bytes());
-    bytes[8..16].copy_from_slice(&process::get_current_process_id().to_le_bytes());
-    bytes[16..24].copy_from_slice(&process::get_current_thread_id().to_le_bytes());
-    bytes[24..28].copy_from_slice(&request.identity.identifier.to_le_bytes());
-    bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
-    bytes[32..40].copy_from_slice(&(request.identity.callback as u64).to_le_bytes());
+    // LPC_DATAGRAM (3) ou LPC_REQUEST (1).
+    put(&mut bytes, offset_of!(PortMessage, u2.s2.type_), &(if datagram { 3u16 } else { 1 }).to_le_bytes());
+    put(&mut bytes, offset_of!(PortMessage, client_id.unique_process), &process::get_current_process_id().to_le_bytes());
+    put(&mut bytes, offset_of!(PortMessage, client_id.unique_thread), &process::get_current_thread_id().to_le_bytes());
+    put(&mut bytes, offset_of!(PortMessage, message_id), &request.identity.identifier.to_le_bytes());
+    // Os quatro bytes depois de MessageId e CallbackId (com a parte alta de
+    // ClientViewSize) zerados.
+    put(&mut bytes, offset_of!(PortMessage, message_id) + 4, &0u32.to_le_bytes());
+    put(&mut bytes, offset_of!(PortMessageView1, callback_id), &(request.identity.callback as u64).to_le_bytes());
     let bytes = Arc::new(SpinLock::new(bytes));
     Ok(match service.request(port, &bytes) {
         ServiceReply::Now(status) => Reply::Now(response(&bytes.lock(), status)),

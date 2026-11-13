@@ -14,7 +14,36 @@ use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::objects::port::Port;
 use crate::ntos::ps::{pool_quota, process};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
+
+/// Registro privado da reserva (layout do OpenNT), espelhado sob o estado.
+#[repr(C)]
+struct ReserveRecord {
+    identifier: Field<u32>,
+    deleted: Field<u32>,
+    references: Field<u64>,
+    owner_port: Field<u64>,
+    creator_process: Field<u64>,
+    message: Field<u64>,
+    size: Field<u64>,
+    extra_pointer: Field<u64>,
+    extra_size: Field<u64>,
+    busy: Field<u32>,
+    _reserved: crate::ntos::inc::field::Reserved<0x1C>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for ReserveRecord {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ReserveRecord>() == 0x60);
+    assert!(core::mem::offset_of!(ReserveRecord, busy) == 0x40);
+};
+
+/// O armazenamento da mensagem começa depois do espaço do cabeçalho do
+/// kernel (KALPC_MESSAGE arredondada).
+const MESSAGE_HEADER_SIZE: u64 = 0x120;
 
 pub struct ReserveState {
     pub references: u32,
@@ -51,16 +80,18 @@ fn release_quota(quota: PoolQuota) {
 
 fn publish_state(record: &Reserve) {
     let state = record.state.lock();
-    guest::write32(record.pointer, record.identifier);
-    guest::write32(record.pointer + 4, state.deleted as u32);
-    guest::write64(record.pointer + 8, state.references as u64);
-    guest::write64(record.pointer + 16, record.owner.pointer);
-    guest::write64(record.pointer + 24, record.creator_process);
-    guest::write64(record.pointer + 32, record.message_pointer);
-    guest::write64(record.pointer + 40, record.size);
-    guest::write64(record.pointer + 48, state.extra_pointer);
-    guest::write64(record.pointer + 56, state.extra_size);
-    guest::write32(record.pointer + 64, state.busy as u32);
+    // SAFETY: registro alocado por `create`, liberado só na última liberação.
+    let native = unsafe { ReserveRecord::at(record.pointer) };
+    native.identifier.set(record.identifier);
+    native.deleted.set(state.deleted as u32);
+    native.references.set(state.references as u64);
+    native.owner_port.set(record.owner.pointer);
+    native.creator_process.set(record.creator_process);
+    native.message.set(record.message_pointer);
+    native.size.set(record.size);
+    native.extra_pointer.set(state.extra_pointer);
+    native.extra_size.set(state.extra_size);
+    native.busy.set(state.busy as u32);
 }
 
 fn release_extra(state: &mut ReserveState) {
@@ -116,13 +147,15 @@ pub fn ensure_payload(record: &Arc<Reserve>, payload: u64) -> Result<u32, Kernel
     Ok(status)
 }
 
-/// Endereço do byte `index` no armazenamento (base de 0x120, depois o extra).
-fn address(record: &Reserve, index: u64) -> u64 {
-    if index < record.size {
-        record.message_pointer + 0x120 + index
-    } else {
-        record.state.lock().extra_pointer + index - record.size
-    }
+/// Divide `[offset, offset + length)` entre o armazenamento base (depois do
+/// cabeçalho) e o extra: (endereço, comprimento) de cada parte não vazia.
+fn segments(record: &Reserve, offset: u64, length: u64) -> [(u64, u64); 2] {
+    let base = if offset < record.size { (record.size - offset).min(length) } else { 0 };
+    let extra = length - base;
+    let base_segment = (record.message_pointer + MESSAGE_HEADER_SIZE + offset, base);
+    let extra_start = (offset + base).saturating_sub(record.size);
+    let extra_segment = (if extra != 0 { record.state.lock().extra_pointer + extra_start } else { 0 }, extra);
+    [base_segment, extra_segment]
 }
 
 pub fn storage_length(record: &Reserve) -> u64 {
@@ -133,8 +166,12 @@ pub fn write(record: &Reserve, bytes: &[u8], offset: u64) -> Result<(), KernelEr
     if offset + bytes.len() as u64 > storage_length(record) {
         return Err(KernelError::new("ALPC reserve write exceeds owned storage"));
     }
-    for (index, &byte) in bytes.iter().enumerate() {
-        guest::write8(address(record, offset + index as u64), byte);
+    let mut copied = 0usize;
+    for (address, length) in segments(record, offset, bytes.len() as u64) {
+        if length != 0 {
+            guest::write_bytes(address, &bytes[copied..copied + length as usize]);
+            copied += length as usize;
+        }
     }
     Ok(())
 }
@@ -143,7 +180,13 @@ pub fn read(record: &Reserve, start: u64, end: u64) -> Result<Vec<u8>, KernelErr
     if end < start || end > storage_length(record) {
         return Err(KernelError::new("ALPC reserve read exceeds owned storage"));
     }
-    Ok((start..end).map(|index| guest::read8(address(record, index))).collect())
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    for (address, length) in segments(record, start, end - start) {
+        if length != 0 {
+            bytes.extend_from_slice(&guest::read_bytes(address, length as usize));
+        }
+    }
+    Ok(bytes)
 }
 
 pub fn release(record: &Arc<Reserve>) -> Result<(), KernelError> {
@@ -209,7 +252,7 @@ pub fn create(port: &Arc<Port>, size: u64) -> Result<Result<Arc<Reserve>, u32>, 
     if size < 40 {
         return Ok(Err(0xC000_000D));
     }
-    let pointer = guest::alloc_bytes(0x60);
+    let pointer = guest::alloc_bytes(ReserveRecord::SIZE);
     if pointer == 0 {
         return Ok(Err(0xC000_009A));
     }
@@ -225,7 +268,7 @@ pub fn create(port: &Arc<Port>, size: u64) -> Result<Result<Arc<Reserve>, u32>, 
             Ok(quota) => base_charge = quota,
             Err(status) => return Ok(Err(status)),
         }
-        message_pointer = guest::alloc_bytes(size + 0x120);
+        message_pointer = guest::alloc_bytes(size + MESSAGE_HEADER_SIZE);
         if message_pointer == 0 {
             return Ok(Err(0xC000_009A));
         }

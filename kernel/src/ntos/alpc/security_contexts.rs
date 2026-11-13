@@ -16,7 +16,33 @@ use crate::ntos::ob::objects::port::Port;
 use crate::ntos::ps::{pool_quota, process};
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::SecurityQualityOfService;
 use crate::ntos::mm::guest_memory as guest;
+use core::mem::offset_of;
+
+/// Registro privado do contexto de segurança (layout do OpenNT, alocado
+/// com o tamanho de uma KALPC_SECURITY_DATA), espelhado sob o estado.
+#[repr(C)]
+struct ContextBody {
+    handle: Field<u64>,
+    references: Field<u64>,
+    owner_port: Field<u64>,
+    creator_process: Field<u64>,
+    token: Field<u64>,
+    level: Field<u32>,
+    deleted: Field<u32>,
+    _reserved: Reserved<0x40>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for ContextBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ContextBody>() == 0x70);
+    assert!(core::mem::offset_of!(ContextBody, level) == 0x28);
+    assert!(core::mem::offset_of!(ContextBody, deleted) == 0x2C);
+};
 
 /// SECURITY_QUALITY_OF_SERVICE capturado (comprimento e alinhamento não são
 /// validados na cópia NT).
@@ -31,10 +57,13 @@ pub fn quality(pointer: u64, mode: u8) -> Result<Option<Quality>, u32> {
     if pointer == 0 {
         return Ok(None);
     }
-    if !message_buffer::accessible(pointer, 12, mode, false) {
+    if !message_buffer::accessible(pointer, SecurityQualityOfService::SIZE, mode, false) {
         return Err(0xC000_0005);
     }
-    Ok(Some(Quality { level: guest::read32(pointer + 4), tracking: guest::read8(pointer + 8), effective_only: guest::read8(pointer + 9) != 0 }))
+    let level = message_buffer::read_field::<u32>(pointer, offset_of!(SecurityQualityOfService, impersonation_level))?;
+    let tracking = message_buffer::read_field::<u8>(pointer, offset_of!(SecurityQualityOfService, context_tracking_mode))?;
+    let effective_only = message_buffer::read_field::<u8>(pointer, offset_of!(SecurityQualityOfService, effective_only))? != 0;
+    Ok(Some(Quality { level, tracking, effective_only }))
 }
 
 /// Identidade capturada de uma thread; `release` solta o token uma vez.
@@ -115,17 +144,19 @@ fn release_charge(charge: Option<PoolQuota>) {
 
 fn publish_state(record: &ContextRecord) {
     let state = record.state.lock();
-    guest::write64(record.pointer, record.handle);
-    guest::write64(record.pointer + 8, state.references as u64);
-    guest::write64(record.pointer + 16, record.owner.pointer);
-    guest::write64(record.pointer + 24, record.creator_process);
-    guest::write64(record.pointer + 32, record.client.token);
-    guest::write32(record.pointer + 40, record.client.level);
-    guest::write32(record.pointer + 44, state.deleted as u32);
+    // SAFETY: registro alocado por `create`, liberado só na última liberação.
+    let body = unsafe { ContextBody::at(record.pointer) };
+    body.handle.set(record.handle);
+    body.references.set(state.references as u64);
+    body.owner_port.set(record.owner.pointer);
+    body.creator_process.set(record.creator_process);
+    body.token.set(record.client.token);
+    body.level.set(record.client.level);
+    body.deleted.set(state.deleted as u32);
 }
 
 pub fn create(port: &Arc<Port>, quality: &Quality, published: bool) -> Result<Result<Arc<ContextRecord>, u32>, KernelError> {
-    let pointer = guest::alloc_bytes(0x70);
+    let pointer = guest::alloc_bytes(ContextBody::SIZE);
     if pointer == 0 {
         return Ok(Err(0xC000_009A));
     }

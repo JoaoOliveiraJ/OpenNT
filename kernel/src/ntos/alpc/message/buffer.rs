@@ -5,12 +5,48 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{NtStruct, PortMessage};
 use crate::ntos::mm::{page_residency, paging};
 use crate::ntos::ps::user::state;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 
-pub const HEADER_SIZE: u64 = 40;
+pub const HEADER_SIZE: u64 = PortMessage::SIZE;
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
+
+// ---- acesso sondado aos buffers do chamador ----------------------------------
+//
+// Depois de `accessible`/`writable` (a validação de faixa do ProbeFor*), cada
+// acesso ainda passa pela sonda de página: um buffer de modo usuário desfeito
+// por outra thread vira ACCESS_VIOLATION, como no `__try` do NT. Os campos
+// são endereçados pelo offset do tipo (`offset_of!`), sem exigir o
+// alinhamento natural da estrutura inteira (vários serviços aceitam
+// estruturas desalinhadas).
+
+/// Lê o campo em `base + offset`.
+pub fn read_field<T: GuestScalar>(base: u64, offset: usize) -> Result<T, u32> {
+    guest::try_read(base + offset as u64).map_err(|_| ACCESS_VIOLATION)
+}
+
+/// Escreve o campo em `base + offset`.
+pub fn write_field<T: GuestScalar>(base: u64, offset: usize, value: T) -> Result<(), u32> {
+    guest::try_write(base + offset as u64, value).map_err(|_| ACCESS_VIOLATION)
+}
+
+/// Copia `length` bytes do chamador.
+pub fn read_block(address: u64, length: u64) -> Result<Vec<u8>, u32> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    guest::try_read_bytes(address, length as usize).map_err(|_| ACCESS_VIOLATION)
+}
+
+/// Copia `bytes` para o chamador.
+pub fn write_block(address: u64, bytes: &[u8]) -> Result<(), u32> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    guest::try_write_bytes(address, bytes).map_err(|_| ACCESS_VIOLATION)
+}
 const USER_PROBE_LIMIT: u64 = 0x7FFF_FFFF_0000;
 
 /// UserMode sonda a faixa de usuário; KernelMode exige páginas presentes
@@ -51,22 +87,21 @@ pub fn capture_message(input: u64, maximum_length: u32, access_mode: u8) -> Resu
     if !accessible(input, HEADER_SIZE, access_mode, false) {
         return Err(ACCESS_VIOLATION);
     }
-    let mut header = [0u8; 40];
-    for (index, byte) in header.iter_mut().enumerate() {
-        *byte = guest::read8(input + index as u64);
-    }
-    let data_length = u16::from_le_bytes([header[0], header[1]]) as u64;
-    let total_length = u16::from_le_bytes([header[2], header[3]]) as u64;
-    if total_length != HEADER_SIZE + data_length || u16::from_le_bytes([header[6], header[7]]) != 0 {
+    let mut header = [0u8; HEADER_SIZE as usize];
+    header.copy_from_slice(&read_block(input, HEADER_SIZE)?);
+    let field = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]) as u64;
+    let data_length = field(core::mem::offset_of!(PortMessage, u1.s1.data_length));
+    let total_length = field(core::mem::offset_of!(PortMessage, u1.s1.total_length));
+    if total_length != HEADER_SIZE + data_length || field(core::mem::offset_of!(PortMessage, u2.s2.data_info_offset)) != 0 {
         return Err(0xC000_000D);
     }
     if total_length > maximum_length as u64 {
         return Err(0xC000_002F);
     }
-    if !accessible(input + 40, data_length, access_mode, false) {
+    if !accessible(input + HEADER_SIZE, data_length, access_mode, false) {
         return Err(ACCESS_VIOLATION);
     }
-    let data = (0..data_length).map(|index| guest::read8(input + 40 + index)).collect();
+    let data = read_block(input + HEADER_SIZE, data_length)?;
     Ok(Captured { header, data })
 }
 
@@ -95,31 +130,38 @@ pub fn capture_length(output: u64, length_address: u64, access_mode: u8) -> Resu
     if length_address != 0 && !writable(length_address, 8, access_mode) {
         return Err(ACCESS_VIOLATION);
     }
-    Ok(Buffer { output, length_address, capacity: if length_address != 0 { guest::read64(length_address) } else { u64::MAX }, access_mode })
+    // PSIZE_T BufferLength, capturado uma vez.
+    Ok(Buffer { output, length_address, capacity: if length_address != 0 { read_field::<u64>(length_address, 0)? } else { u64::MAX }, access_mode })
 }
 
 /// BUFFER_TOO_SMALL informa o tamanho e deixa a mensagem na fila; a entrega
 /// síncrona escreve o comprimento depois dos bytes.
 pub fn deliver(buffer: &Buffer, message: &[u8], synchronous: bool) -> u32 {
+    match deliver_into(buffer, message, synchronous) {
+        Ok(status) | Err(status) => status,
+    }
+}
+
+fn deliver_into(buffer: &Buffer, message: &[u8], synchronous: bool) -> Result<u32, u32> {
     let required = message.len() as u64;
     if buffer.capacity < required {
         if buffer.length_address != 0 {
             if !writable(buffer.length_address, 8, buffer.access_mode) {
-                return ACCESS_VIOLATION;
+                return Ok(ACCESS_VIOLATION);
             }
-            guest::write64(buffer.length_address, required);
+            write_field::<u64>(buffer.length_address, 0, required)?;
         }
-        return 0xC000_0023;
+        return Ok(0xC000_0023);
     }
     if !writable(buffer.output, required, buffer.access_mode) {
-        return ACCESS_VIOLATION;
+        return Ok(ACCESS_VIOLATION);
     }
-    guest::write_bytes(buffer.output, message);
+    write_block(buffer.output, message)?;
     if synchronous && buffer.length_address != 0 {
         if !writable(buffer.length_address, 8, buffer.access_mode) {
-            return ACCESS_VIOLATION;
+            return Ok(ACCESS_VIOLATION);
         }
-        guest::write64(buffer.length_address, required);
+        write_field::<u64>(buffer.length_address, 0, required)?;
     }
-    0
+    Ok(0)
 }

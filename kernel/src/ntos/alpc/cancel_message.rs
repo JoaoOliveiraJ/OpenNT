@@ -10,7 +10,10 @@ use super::port_reference;
 use crate::ntos::ke::critical_region;
 use crate::ntos::ob::objects::port::Port;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use core::mem::offset_of;
+
+use crate::ntos::inc::types::extra_ob_alpc::AlpcContextAttr32;
+use crate::ntos::inc::types::AlpcContextAttr;
 
 /// ALPC_CONTEXT_ATTR capturado.
 #[derive(Clone, Copy, Debug)]
@@ -35,21 +38,33 @@ pub fn cancel(port_handle: u64, flags: u32, context: u64, mode: u8, perform: imp
         // O bit 4 seleciona o layout compacto só em Nt/UserMode; Zw sempre
         // lê o layout x64, mesmo com PreviousMode=UserMode.
         let compact = mode != 0 && flags & 4 != 0;
-        let identifier_address = context + if compact { 12 } else { 20 };
-        let callback_address = context + if compact { 16 } else { 24 };
-        let context_address = context + if compact { 4 } else { 8 };
-        if !message_buffer::accessible(identifier_address, 4, mode, false) {
+        let (identifier_offset, callback_offset, context_offset) = if compact {
+            (offset_of!(AlpcContextAttr32, message_id), offset_of!(AlpcContextAttr32, callback_id), offset_of!(AlpcContextAttr32, message_context))
+        } else {
+            (offset_of!(AlpcContextAttr, message_id), offset_of!(AlpcContextAttr, callback_id), offset_of!(AlpcContextAttr, message_context))
+        };
+        if !message_buffer::accessible(context + identifier_offset as u64, 4, mode, false) {
             return Ok(0xC000_0005);
         }
-        let identifier = guest::read32(identifier_address);
-        if !message_buffer::accessible(callback_address, 4, mode, false) {
+        let identifier = match message_buffer::read_field::<u32>(context, identifier_offset) {
+            Ok(value) => value,
+            Err(status) => return Ok(status),
+        };
+        if !message_buffer::accessible(context + callback_offset as u64, 4, mode, false) {
             return Ok(0xC000_0005);
         }
-        let callback = guest::read32(callback_address);
-        if !message_buffer::accessible(context_address, if compact { 4 } else { 8 }, mode, false) {
+        let callback = match message_buffer::read_field::<u32>(context, callback_offset) {
+            Ok(value) => value,
+            Err(status) => return Ok(status),
+        };
+        if !message_buffer::accessible(context + context_offset as u64, if compact { 4 } else { 8 }, mode, false) {
             return Ok(0xC000_0005);
         }
-        let message_context = if compact { guest::read32(context_address) as u64 } else { guest::read64(context_address) };
+        let message_context = if compact { message_buffer::read_field::<u32>(context, context_offset).map(|value| value as u64) } else { message_buffer::read_field::<u64>(context, context_offset) };
+        let message_context = match message_context {
+            Ok(value) => value,
+            Err(status) => return Ok(status),
+        };
         if identifier == 0 {
             return Ok(0xC000_0109);
         }

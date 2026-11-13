@@ -17,7 +17,9 @@ use crate::ntos::ob::{handle_table, object_access, object_manager};
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::alpc::message::buffer::read_field;
+use crate::ntos::inc::types::{AlpcHandleAttr, AlpcHandleAttr32, NtStruct};
+use core::mem::offset_of;
 
 /// Códigos ALPC são máscaras por espécie, não índices dinâmicos de OBJECT_TYPE.
 fn type_code(name: &str) -> Option<u32> {
@@ -192,42 +194,61 @@ impl Retained for HandleData {
 /// O formato simples ocupa 24 bytes; a forma indireta tem 2..512 entradas
 /// compactas de 16 bytes com handles ULONG, como a captura original.
 pub fn capture(address: u64, mode: u8) -> Result<Result<Arc<HandleData>, u32>, KernelError> {
-    if !message_buffer::accessible(address, 24, mode, false) {
-        return Ok(Err(0xC000_0005));
+    match capture_descriptors(address, mode) {
+        Ok(descriptors) => capture_entries(&descriptors, mode),
+        Err(status) => Ok(Err(status)),
     }
-    let flags = guest::read32(address);
+}
+
+/// Lê ALPC_HANDLE_ATTR (forma simples ou vetor de ALPC_HANDLE_ATTR32) do
+/// buffer do chamador, com sonda em cada campo.
+fn capture_descriptors(address: u64, mode: u8) -> Result<Vec<Descriptor>, u32> {
+    if !message_buffer::accessible(address, AlpcHandleAttr::SIZE, mode, false) {
+        return Err(0xC000_0005);
+    }
+    let flags = read_field::<u32>(address, offset_of!(AlpcHandleAttr, flags))?;
     if flags & !0xF_0000 != 0 {
-        return Ok(Err(0xC000_000D));
+        return Err(0xC000_000D);
     }
     let mut descriptors = Vec::new();
     if flags & 0x4_0000 != 0 {
-        let count = guest::read32(address + 16) as u64;
+        let count = read_field::<u32>(address, offset_of!(AlpcHandleAttr, object_type))? as u64;
         if count > 512 {
-            return Ok(Err(0xC000_0722));
+            return Err(0xC000_0722);
         }
         if count <= 1 {
-            return Ok(Err(0xC000_000D));
+            return Err(0xC000_000D);
         }
-        let array = guest::read64(address + 8);
+        // HandleAttrArray sobrepõe Handle na forma indireta.
+        let array = read_field::<u64>(address, offset_of!(AlpcHandleAttr, handle))?;
         if mode != 0 && array & 3 != 0 {
-            return Ok(Err(0x8000_0002));
+            return Err(0x8000_0002);
         }
-        if !message_buffer::accessible(array, count * 16, mode, false) {
-            return Ok(Err(0xC000_0005));
+        if !message_buffer::accessible(array, count * AlpcHandleAttr32::SIZE, mode, false) {
+            return Err(0xC000_0005);
         }
         for index in 0..count {
-            let element = array + index * 16;
-            let element_flags = guest::read32(element);
+            let element = array + index * AlpcHandleAttr32::SIZE;
+            let element_flags = read_field::<u32>(element, offset_of!(AlpcHandleAttr32, flags))?;
             if element_flags & !0xB_0000 != 0 {
-                return Ok(Err(0xC000_000D));
+                return Err(0xC000_000D);
             }
-            descriptors.push(Descriptor { flags: element_flags, handle: guest::read32(element + 4) as u64, access: guest::read32(element + 12) });
+            let handle = read_field::<u32>(element, offset_of!(AlpcHandleAttr32, handle))? as u64;
+            let access = read_field::<u32>(element, offset_of!(AlpcHandleAttr32, desired_access))?;
+            descriptors.push(Descriptor { flags: element_flags, handle, access });
         }
     } else {
-        descriptors.push(Descriptor { flags, handle: guest::read64(address + 8), access: guest::read32(address + 20) });
+        let handle = read_field::<u64>(address, offset_of!(AlpcHandleAttr, handle))?;
+        let access = read_field::<u32>(address, offset_of!(AlpcHandleAttr, desired_access))?;
+        descriptors.push(Descriptor { flags, handle, access });
     }
+    Ok(descriptors)
+}
+
+/// Captura as entradas dos descritores lidos; uma falha solta as anteriores.
+fn capture_entries(descriptors: &[Descriptor], mode: u8) -> Result<Result<Arc<HandleData>, u32>, KernelError> {
     let mut entries = Vec::new();
-    for descriptor in &descriptors {
+    for descriptor in descriptors {
         match capture_entry(descriptor, mode) {
             Ok(Ok(entry)) => entries.push(entry),
             Ok(Err(status)) => {

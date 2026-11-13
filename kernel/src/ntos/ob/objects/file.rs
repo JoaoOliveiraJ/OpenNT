@@ -13,9 +13,20 @@ use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
 use crate::ntos::ob::object_access;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::se::model::SecurityPolicy;
+use core::sync::atomic::Ordering;
+
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{FileObject, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::file_object as layout;
+
+/// IO_TYPE_FILE.
+const IO_TYPE_FILE: i16 = 5;
+
+/// O FILE_OBJECT de `pointer` (corpo alocado por `create` ou pelo provedor).
+fn file(pointer: u64) -> &'static FileObject {
+    // SAFETY: os chamadores passam FILE_OBJECTs vivos.
+    unsafe { FileObject::at(pointer) }
+}
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const FO_CLEANUP_COMPLETE: u32 = 0x4000;
@@ -90,8 +101,8 @@ impl ObjectOwner for FileOwner {
     }
     fn query_record(&self, pointer: u64) -> crate::ntos::ob::open_pointer::QueryRecord {
         let (handles, references) = FILES.lock().get(&pointer).map_or((0, 0), |record| (record.handles, record.references));
-        let name = crate::ntos::rtl::guest_strings::read_unicode_string(pointer + 0x58);
-        let device = guest::read64(pointer + 8);
+        let name = crate::ntos::rtl::guest_strings::read_unicode_string(file(pointer).file_name.address());
+        let device = file(pointer).device_object.get();
         let prefix = crate::ntos::ob::open_pointer::namespace_path_of(device).unwrap_or_default();
         let full = if prefix.is_empty() { name } else { alloc::format!("{}{}{}", prefix, if name.starts_with('\\') { "" } else { "\\" }, name) };
         crate::ntos::ob::open_pointer::QueryRecord { handles: Some(handles), references, permanent: false, name: full }
@@ -107,7 +118,7 @@ impl ObjectOwner for FileOwner {
 /// Aloca FILE_OBJECT e o nome UTF-16, inicializa eventos e lista de IRPs e
 /// captura a segurança inicial. Uma referência pertence ao chamador.
 pub fn create(device: u64, name: &str) -> Result<u64, KernelError> {
-    let pointer = guest::alloc_bytes(layout::STRUCT_SIZE);
+    let pointer = guest::alloc_bytes(FileObject::SIZE);
     if pointer == 0 {
         return Err(KernelError::with_status("FILE_OBJECT allocation failed", STATUS_INSUFFICIENT_RESOURCES));
     }
@@ -117,19 +128,21 @@ pub fn create(device: u64, name: &str) -> Result<u64, KernelError> {
         guest::free_bytes(pointer);
         return Err(KernelError::with_status("file name allocation failed", STATUS_INSUFFICIENT_RESOURCES));
     }
-    guest::write16(pointer + layout::TYPE, 5);
-    guest::write16(pointer + layout::SIZE, layout::STRUCT_SIZE as u16);
-    guest::write64(pointer + layout::DEVICE_OBJECT, device);
-    guest::write16(pointer + layout::FILE_NAME, units.len() as u16 * 2);
-    guest::write16(pointer + layout::FILE_NAME + 2, if units.is_empty() { 0 } else { (units.len() as u16 + 1) * 2 });
-    guest::write64(pointer + layout::FILE_NAME + 8, name_buffer);
-    for (index, &unit) in units.iter().enumerate() {
-        guest::write16(name_buffer + index as u64 * 2, unit);
+    let object = file(pointer);
+    object.type_.set(IO_TYPE_FILE);
+    object.size.set(FileObject::SIZE as i16);
+    object.device_object.set(device);
+    object.file_name.length.set(units.len() as u16 * 2);
+    object.file_name.maximum_length.set(if units.is_empty() { 0 } else { (units.len() as u16 + 1) * 2 });
+    object.file_name.buffer.set(name_buffer);
+    if !units.is_empty() {
+        let text: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        guest::write_bytes(name_buffer, &text);
     }
-    dispatcher::initialize_event(pointer + layout::LOCK, 1, false);
-    dispatcher::initialize_event(pointer + layout::EVENT, 0, false);
-    guest::write64(pointer + layout::IRP_LIST, pointer + layout::IRP_LIST);
-    guest::write64(pointer + layout::IRP_LIST + 8, pointer + layout::IRP_LIST);
+    dispatcher::initialize_event(object.lock.address(), 1, false);
+    dispatcher::initialize_event(object.event.address(), 0, false);
+    object.irp_list.flink.set(object.irp_list.address());
+    object.irp_list.blink.set(object.irp_list.address());
     let security = object_access::capture(object_access::subject());
     FILES.lock().insert(pointer, Record { name_buffer, references: 1, handles: 0, opened: false, cleaned: false, closing: false, callbacks: FileCallbacks::default(), source: None, ea_index: 0, security });
     object_types::account(&file_type().name, 1, 0)?;
@@ -181,7 +194,8 @@ pub fn cleanup(pointer: u64) -> Result<u32, KernelError> {
         record.callbacks.cleanup.clone()
     };
     let status = routine.map_or(0, |routine| routine());
-    guest::write32(pointer + layout::FLAGS, guest::read32(pointer + layout::FLAGS) | FO_CLEANUP_COMPLETE);
+    // OR atômico: drivers de sistema de arquivos mexem nos mesmos flags.
+    file(pointer).flags.atomic().fetch_or(FO_CLEANUP_COMPLETE, Ordering::SeqCst);
     Ok(status)
 }
 
@@ -233,7 +247,7 @@ pub fn open_handle(pointer: u64) -> Result<(), KernelError> {
         record.handles += 1;
         record.references += 1;
     }
-    guest::write32(pointer + layout::FLAGS, guest::read32(pointer + layout::FLAGS) | FO_HANDLE_CREATED);
+    file(pointer).flags.atomic().fetch_or(FO_HANDLE_CREATED, Ordering::SeqCst);
     object_types::account(&file_type().name, 0, 1)
 }
 
@@ -283,9 +297,8 @@ pub fn create_source(source: Arc<dyn FileSource>) -> Result<u64, KernelError> {
         record.source = Some(source);
         record.callbacks.destroy = Some(Arc::new(move || releaser.release()));
     }
-    // ReadAccess e SharedRead do FILE_OBJECT.
-    guest::write8(pointer + 0x4A, 1);
-    guest::write8(pointer + 0x4D, 1);
+    file(pointer).read_access.set(1);
+    file(pointer).shared_read.set(1);
     Ok(pointer)
 }
 

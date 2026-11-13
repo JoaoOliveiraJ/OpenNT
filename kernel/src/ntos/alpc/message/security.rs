@@ -12,7 +12,9 @@ use crate::ntos::alpc::security_contexts::{self, Borrowed, ClientIdentity, Quali
 use crate::ntos::ob::objects::port::{Port, Role};
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::alpc::message::buffer::{read_field, write_field};
+use crate::ntos::inc::types::AlpcSecurityAttr;
+use core::mem::offset_of;
 
 pub use crate::ntos::alpc::security_contexts::capture as capture_client;
 
@@ -25,15 +27,24 @@ pub enum Captured {
 /// Reutiliza contextos da mesma porta. CREATE publica a identidade atual;
 /// RELEASE retira o contexto sem anexar identidade explícita à mensagem.
 pub fn capture(port: &Arc<Port>, attribute: u64, mode: u8) -> Result<Result<Captured, u32>, KernelError> {
-    let captured = match security_contexts::quality(guest::read64(attribute + 8), mode) {
+    let fields = (|| -> Result<(u64, u32, u64), u32> {
+        Ok((
+            read_field::<u64>(attribute, offset_of!(AlpcSecurityAttr, p_qos))?,
+            read_field::<u32>(attribute, offset_of!(AlpcSecurityAttr, flags))?,
+            read_field::<u64>(attribute, offset_of!(AlpcSecurityAttr, context_handle))?,
+        ))
+    })();
+    let (quality_pointer, flags, handle) = match fields {
+        Ok(fields) => fields,
+        Err(status) => return Ok(Err(status)),
+    };
+    let captured = match security_contexts::quality(quality_pointer, mode) {
         Ok(captured) => captured,
         Err(status) => return Ok(Err(status)),
     };
-    let flags = guest::read32(attribute);
     if flags & !0x3_0000 != 0 || flags & 0x3_0000 == 0x3_0000 {
         return Ok(Err(0xC000_000D));
     }
-    let handle = guest::read64(attribute + 16);
     let mut published = handle;
     let result = if handle == 0xFFFF_FFFF_FFFF_FFFE {
         if flags & 0x1_0000 != 0 {
@@ -65,13 +76,13 @@ pub fn capture(port: &Arc<Port>, attribute: u64, mode: u8) -> Result<Result<Capt
     // UserMode copia ContextHandle de volta mesmo sem mudança; CREATE também
     // escreve em KernelMode. Uma mensagem falha devolve sua retenção.
     if mode != 0 || published != handle {
-        if !message_buffer::writable(attribute + 16, 8, mode) {
+        let context_handle = attribute + offset_of!(AlpcSecurityAttr, context_handle) as u64;
+        if !message_buffer::writable(context_handle, 8, mode) || write_field::<u64>(attribute, offset_of!(AlpcSecurityAttr, context_handle), published).is_err() {
             if let Captured::Borrowed(borrowed) = &result {
                 borrowed.release();
             }
             return Ok(Err(0xC000_0005));
         }
-        guest::write64(attribute + 16, published);
     }
     Ok(Ok(result))
 }

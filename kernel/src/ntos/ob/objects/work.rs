@@ -13,10 +13,95 @@ use crate::ntos::ob::objects::completion::Port;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks};
 use crate::ntos::ps::user::state::UserHandle;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::ObjectAttributes;
 use crate::ntos::mm::guest_memory as guest;
 
-pub const PACKET_SIZE: u64 = 0x50;
-pub const FACTORY_SIZE: u64 = 0xA0;
+/// Início comum dos dois corpos: contagens espelhadas e o fechamento.
+#[repr(C)]
+struct BodyHeader {
+    references: Field<u64>,
+    handles: Field<u32>,
+    closed: Field<u32>,
+}
+
+/// Corpo privado do pacote de espera (layout do OpenNT).
+#[repr(C)]
+struct WaitPacketBody {
+    header: BodyHeader,
+    phase: Field<u32>,
+    _pad_14: Reserved<4>,
+    port: Field<u64>,
+    target: Field<u64>,
+    key: Field<u64>,
+    context: Field<u64>,
+    status: Field<u32>,
+    _pad_3c: Reserved<4>,
+    information: Field<u64>,
+    _reserved: Reserved<8>,
+}
+
+/// Corpo privado da fábrica de workers (layout do OpenNT).
+#[repr(C)]
+struct FactoryBody {
+    header: BodyHeader,
+    priority: Field<u32>,
+    maximum: Field<u32>,
+    minimum: Field<u32>,
+    paused: Field<u32>,
+    shutdown: Field<u32>,
+    creating: Field<u32>,
+    binding_count: Field<u32>,
+    release_count: Field<u32>,
+    last_status: Field<u32>,
+    workers: Field<u32>,
+    port: Field<u64>,
+    process_pointer: Field<u64>,
+    process_id: Field<u64>,
+    start: Field<u64>,
+    parameter: Field<u64>,
+    reserve: Field<u64>,
+    commit: Field<u64>,
+    timeout: Field<u64>,
+    retry_timeout: Field<u64>,
+    idle_timeout: Field<u64>,
+    retry_at: Field<u64>,
+    soft_maximum: Field<u32>,
+    soft_creation_phase: Field<u32>,
+    loader_worker: Field<u32>,
+    _reserved: Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for BodyHeader {}
+unsafe impl NtStruct for WaitPacketBody {}
+unsafe impl NtStruct for FactoryBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<BodyHeader>() == 0x10);
+    assert!(core::mem::size_of::<WaitPacketBody>() == 0x50);
+    assert!(core::mem::offset_of!(WaitPacketBody, phase) == 0x10);
+    assert!(core::mem::offset_of!(WaitPacketBody, key) == 0x28);
+    assert!(core::mem::offset_of!(WaitPacketBody, information) == 0x40);
+    assert!(core::mem::size_of::<FactoryBody>() == 0xA0);
+    assert!(core::mem::offset_of!(FactoryBody, workers) == 0x34);
+    assert!(core::mem::offset_of!(FactoryBody, port) == 0x38);
+    assert!(core::mem::offset_of!(FactoryBody, soft_maximum) == 0x90);
+    assert!(core::mem::offset_of!(FactoryBody, loader_worker) == 0x98);
+};
+
+pub const PACKET_SIZE: u64 = WaitPacketBody::SIZE;
+pub const FACTORY_SIZE: u64 = FactoryBody::SIZE;
+
+fn header(pointer: u64) -> &'static BodyHeader {
+    // SAFETY: corpos alocados por `allocate_body`, vivos até o `dispose`.
+    unsafe { BodyHeader::at(pointer) }
+}
+
+/// Junta as duas palavras (baixa, alta) de um valor de 64 bits.
+fn join(words: [u32; 2]) -> u64 {
+    (words[1] as u64) << 32 | words[0] as u64
+}
 
 /// Fase associada: a porta e o alvo retidos pelos handles.
 #[derive(Clone)]
@@ -46,8 +131,13 @@ pub struct WaitPacket {
 }
 
 impl WaitPacket {
+    fn body(&self) -> &'static WaitPacketBody {
+        // SAFETY: corpo alocado por `packet`, vivo até o `dispose`.
+        unsafe { WaitPacketBody::at(self.pointer) }
+    }
+
     fn phase(&self) -> u32 {
-        guest::read32(self.pointer + 0x10)
+        self.body().phase.get()
     }
 
     pub fn association(&self) -> Option<Association> {
@@ -58,9 +148,10 @@ impl WaitPacket {
     }
 
     pub fn set_association(&self, value: Option<Association>) {
-        guest::write32(self.pointer + 0x10, value.is_some() as u32);
-        guest::write64(self.pointer + 0x18, value.as_ref().map_or(0, |value| value.port.pointer));
-        guest::write64(self.pointer + 0x20, value.as_ref().map_or(0, |value| value.target_pointer));
+        let body = self.body();
+        body.phase.set(value.is_some() as u32);
+        body.port.set(value.as_ref().map_or(0, |value| value.port.pointer));
+        body.target.set(value.as_ref().map_or(0, |value| value.target_pointer));
         self.phases.lock().association = value;
     }
 
@@ -72,39 +163,41 @@ impl WaitPacket {
     }
 
     pub fn set_queued(&self, value: Option<Queued>) {
-        guest::write32(self.pointer + 0x10, if value.is_some() { 2 } else { 0 });
-        guest::write64(self.pointer + 0x18, value.as_ref().map_or(0, |value| value.port.pointer));
-        guest::write64(self.pointer + 0x20, 0);
+        let body = self.body();
+        body.phase.set(if value.is_some() { 2 } else { 0 });
+        body.port.set(value.as_ref().map_or(0, |value| value.port.pointer));
+        body.target.set(0);
         self.phases.lock().queued = value;
     }
 
     pub fn closed(&self) -> bool {
-        guest::read32(self.pointer + 0xC) != 0
+        self.body().header.closed.get() != 0
     }
 
     pub fn key(&self) -> u64 {
-        guest::read64(self.pointer + 0x28)
+        self.body().key.get()
     }
 
     pub fn context(&self) -> u64 {
-        guest::read64(self.pointer + 0x30)
+        self.body().context.get()
     }
 
     pub fn status(&self) -> u32 {
-        guest::read32(self.pointer + 0x38)
+        self.body().status.get()
     }
 
     pub fn information(&self) -> u64 {
-        guest::read64(self.pointer + 0x40)
+        self.body().information.get()
     }
 
-    /// Dados de conclusão em duas palavras cada, como a ABI os entrega.
+    /// Dados de conclusão em duas palavras cada, como a ABI os entrega;
+    /// cada valor de 64 bits vai ao corpo numa única escrita.
     pub fn set_completion(&self, key: [u32; 2], context: [u32; 2], status: u32, information: [u32; 2]) {
-        for (offset, words) in [(0x28, key), (0x30, context), (0x40, information)] {
-            guest::write32(self.pointer + offset, words[0]);
-            guest::write32(self.pointer + offset + 4, words[1]);
-        }
-        guest::write32(self.pointer + 0x38, status);
+        let body = self.body();
+        body.key.set(join(key));
+        body.context.set(join(context));
+        body.information.set(join(information));
+        body.status.set(status);
     }
 }
 
@@ -120,18 +213,16 @@ fn status_error(status: u32) -> KernelError {
 
 /// Corpo zerado; aberturas novas são recusadas depois do encerramento.
 fn allocate_body(size: u64) -> Result<u64, KernelError> {
+    // alloc_bytes devolve memória zerada.
     let pointer = guest::alloc_bytes(size);
     if pointer == 0 {
         return Err(status_error(0xC000_009A));
-    }
-    for offset in (0..size).step_by(8) {
-        guest::write64(pointer + offset, 0);
     }
     Ok(pointer)
 }
 
 fn before_handle_open(pointer: u64) -> Result<(), KernelError> {
-    if guest::read32(pointer + 0xC) != 0 {
+    if header(pointer).closed.get() != 0 {
         return Err(status_error(0xC000_0056));
     }
     Ok(())
@@ -139,7 +230,7 @@ fn before_handle_open(pointer: u64) -> Result<(), KernelError> {
 
 /// O último handle desfaz a associação.
 fn packet_last_handle_close(pointer: u64) {
-    guest::write32(pointer + 0xC, 1);
+    header(pointer).closed.set(1);
     if let Some(packet) = packet_of(pointer) {
         (packet.detach)(&packet, true);
     }
@@ -169,38 +260,47 @@ pub fn packet(attributes: u64, detach: fn(&Arc<WaitPacket>, bool) -> u32) -> Res
 
 /// Handle com a política de acesso e os atributos de OBJECT_ATTRIBUTES.
 pub fn publish(pointer: u64, output: u64, access: u32, attributes: u64, payload: Arc<dyn core::any::Any + Send + Sync>) -> Result<u32, KernelError> {
-    dispatcher_objects::publish(pointer, output, access, if attributes != 0 { guest::read32(attributes + 24) } else { 0 }, 0, false, Some(payload))
+    // Attributes do OBJECT_ATTRIBUTES do chamador (de modo usuário: sondado).
+    let flags = if attributes != 0 {
+        match guest::try_read::<u32>(attributes + core::mem::offset_of!(ObjectAttributes, attributes) as u64) {
+            Ok(flags) => flags,
+            Err(_) => return Ok(0xC000_0005),
+        }
+    } else {
+        0
+    };
+    dispatcher_objects::publish(pointer, output, access, flags, 0, false, Some(payload))
 }
 
 macro_rules! field32 {
-    ($get:ident, $set:ident, $offset:expr) => {
+    ($get:ident, $set:ident, $field:ident) => {
         pub fn $get(&self) -> u32 {
-            guest::read32(self.pointer + $offset)
+            self.body().$field.get()
         }
         pub fn $set(&self, value: u32) {
-            guest::write32(self.pointer + $offset, value);
+            self.body().$field.set(value);
         }
     };
 }
 
 macro_rules! field64 {
-    ($get:ident, $set:ident, $offset:expr, $kind:ty) => {
+    ($get:ident, $set:ident, $field:ident, $kind:ty) => {
         pub fn $get(&self) -> $kind {
-            guest::read64(self.pointer + $offset) as $kind
+            self.body().$field.get() as $kind
         }
         pub fn $set(&self, value: $kind) {
-            guest::write64(self.pointer + $offset, value as u64);
+            self.body().$field.set(value as u64);
         }
     };
 }
 
 macro_rules! flag {
-    ($get:ident, $set:ident, $offset:expr) => {
+    ($get:ident, $set:ident, $field:ident) => {
         pub fn $get(&self) -> bool {
-            guest::read32(self.pointer + $offset) != 0
+            self.body().$field.get() != 0
         }
         pub fn $set(&self, value: bool) {
-            guest::write32(self.pointer + $offset, value as u32);
+            self.body().$field.set(value as u32);
         }
     };
 }
@@ -223,29 +323,41 @@ pub struct Factory {
 }
 
 impl Factory {
-    field32!(priority, set_priority, 0x10);
-    field32!(maximum, set_maximum, 0x14);
-    field32!(minimum, set_minimum, 0x18);
-    field32!(binding_count, set_binding_count, 0x28);
-    field32!(release_count, set_release_count, 0x2C);
-    field32!(last_status, set_last_status, 0x30);
-    field32!(soft_maximum, set_soft_maximum, 0x90);
-    field32!(soft_creation_phase, set_soft_creation_phase, 0x94);
-    field64!(process_pointer, set_process_pointer, 0x40, u64);
-    field64!(process_id, set_process_id, 0x48, u64);
-    field64!(start, set_start, 0x50, u64);
-    field64!(parameter, set_parameter, 0x58, u64);
-    field64!(reserve, set_reserve, 0x60, u64);
-    field64!(commit, set_commit, 0x68, u64);
-    field64!(timeout, set_timeout, 0x70, i64);
-    field64!(retry_timeout, set_retry_timeout, 0x78, i64);
-    field64!(idle_timeout, set_idle_timeout, 0x80, i64);
-    field64!(retry_at, set_retry_at, 0x88, i64);
-    flag!(paused, set_paused, 0x1C);
-    flag!(shutdown, set_shutdown, 0x20);
-    flag!(creating, set_creating, 0x24);
-    flag!(loader_worker, set_loader_worker, 0x98);
-    flag!(closed, set_closed, 0xC);
+    fn body(&self) -> &'static FactoryBody {
+        // SAFETY: corpo alocado por `factory`, vivo até o `dispose`.
+        unsafe { FactoryBody::at(self.pointer) }
+    }
+
+    field32!(priority, set_priority, priority);
+    field32!(maximum, set_maximum, maximum);
+    field32!(minimum, set_minimum, minimum);
+    field32!(binding_count, set_binding_count, binding_count);
+    field32!(release_count, set_release_count, release_count);
+    field32!(last_status, set_last_status, last_status);
+    field32!(soft_maximum, set_soft_maximum, soft_maximum);
+    field32!(soft_creation_phase, set_soft_creation_phase, soft_creation_phase);
+    field64!(process_pointer, set_process_pointer, process_pointer, u64);
+    field64!(process_id, set_process_id, process_id, u64);
+    field64!(start, set_start, start, u64);
+    field64!(parameter, set_parameter, parameter, u64);
+    field64!(reserve, set_reserve, reserve, u64);
+    field64!(commit, set_commit, commit, u64);
+    field64!(timeout, set_timeout, timeout, i64);
+    field64!(retry_timeout, set_retry_timeout, retry_timeout, i64);
+    field64!(idle_timeout, set_idle_timeout, idle_timeout, i64);
+    field64!(retry_at, set_retry_at, retry_at, i64);
+    flag!(paused, set_paused, paused);
+    flag!(shutdown, set_shutdown, shutdown);
+    flag!(creating, set_creating, creating);
+    flag!(loader_worker, set_loader_worker, loader_worker);
+
+    pub fn closed(&self) -> bool {
+        self.body().header.closed.get() != 0
+    }
+
+    pub fn set_closed(&self, value: bool) {
+        self.body().header.closed.set(value as u32);
+    }
 
     pub fn workers(&self) -> alloc::vec::Vec<Arc<crate::ntos::ps::user::threads::UserThread>> {
         self.workers.lock().clone()
@@ -257,14 +369,14 @@ impl Factory {
         if !workers.iter().any(|candidate| Arc::ptr_eq(candidate, &thread)) {
             workers.push(thread);
         }
-        guest::write32(self.pointer + 0x34, workers.len() as u32);
+        self.body().workers.set(workers.len() as u32);
     }
 
     pub fn remove_worker(&self, thread: &Arc<crate::ntos::ps::user::threads::UserThread>) -> bool {
         let mut workers = self.workers.lock();
         let before = workers.len();
         workers.retain(|candidate| !Arc::ptr_eq(candidate, thread));
-        guest::write32(self.pointer + 0x34, workers.len() as u32);
+        self.body().workers.set(workers.len() as u32);
         workers.len() != before
     }
 }
@@ -317,7 +429,7 @@ pub fn factory(initial: FactoryInitial, attributes: u64, dispose: fn(&Arc<Factor
     factory.set_timeout(-100_000_000);
     factory.set_retry_timeout(-10_000_000);
     factory.set_idle_timeout(-100_000_000);
-    guest::write64(pointer + 0x38, factory.port.pointer);
+    factory.body().port.set(factory.port.pointer);
     FACTORIES.lock().insert(pointer, factory.clone());
     if let Err(error) = dispatcher_objects::create(pointer, "workerfactory", factory_dispose, None, attributes, true, DispatcherHooks { before_handle_open: Some(before_handle_open), on_last_handle_close: Some(factory_last_handle_close) }) {
         FACTORIES.lock().remove(&pointer);

@@ -4,13 +4,14 @@
 //! criar o cliente; a separação preserva a ordem de falhas do serviço NT.
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use crate::ntos::alpc::message::buffer as message_buffer;
 use crate::ntos::alpc::security_contexts::Quality;
+use crate::ntos::inc::types::{AlpcPortAttributes, NtStruct};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
-pub const ATTRIBUTES_BYTE_LENGTH: u64 = 72;
+pub const ATTRIBUTES_BYTE_LENGTH: u64 = AlpcPortAttributes::SIZE;
 
 /// Cópia sem ponteiros do chamador, mesmo quando a conexão aguarda o servidor.
 pub struct Captured {
@@ -26,7 +27,7 @@ pub fn capture(pointer: u64, access_mode: u8) -> Result<Captured, u32> {
     if !message_buffer::accessible(pointer, ATTRIBUTES_BYTE_LENGTH, access_mode, false) {
         return Err(0xC000_0005);
     }
-    Ok(Captured { bytes: Some((0..ATTRIBUTES_BYTE_LENGTH).map(|index| guest::read8(pointer + index)).collect()), access_mode })
+    Ok(Captured { bytes: Some(message_buffer::read_block(pointer, ATTRIBUTES_BYTE_LENGTH)?), access_mode })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,10 +70,10 @@ pub fn for_client(captured: &Captured, listener_maximum: u32) -> Result<Result<C
             duplicate_object_types: 0,
         }));
     };
-    let maximum = u64_at(bytes, 16);
-    let flags = u32_at(bytes, 0);
-    let level = u32_at(bytes, 8);
-    let tracking = bytes[12];
+    let maximum = u64_at(bytes, offset_of!(AlpcPortAttributes, max_message_length));
+    let flags = u32_at(bytes, offset_of!(AlpcPortAttributes, flags));
+    let level = u32_at(bytes, offset_of!(AlpcPortAttributes, security_qos.impersonation_level));
+    let tracking = bytes[offset_of!(AlpcPortAttributes, security_qos.context_tracking_mode)];
     // A ordem é significativa: comprimento, porta de sistema, tracking e
     // nível. SecurityQos.Length não é validado neste serviço.
     if !(40..=65535).contains(&maximum) {
@@ -90,12 +91,12 @@ pub fn for_client(captured: &Captured, listener_maximum: u32) -> Result<Result<C
     Ok(Ok(ClientParameters {
         port_flags: flags & 0x03FF_0000,
         maximum: (maximum as u32).min(listener_maximum),
-        security_quality: Quality { level, tracking, effective_only: bytes[13] != 0 },
-        memory_bandwidth: u64_at(bytes, 24),
-        maximum_pool_usage: u64_at(bytes, 32),
-        maximum_section_size: u64_at(bytes, 40),
-        maximum_view_size: u64_at(bytes, 48),
-        maximum_total_section_size: u64_at(bytes, 56),
-        duplicate_object_types: u32_at(bytes, 64) & 0xFFD,
+        security_quality: Quality { level, tracking, effective_only: bytes[offset_of!(AlpcPortAttributes, security_qos.effective_only)] != 0 },
+        memory_bandwidth: u64_at(bytes, offset_of!(AlpcPortAttributes, memory_bandwidth)),
+        maximum_pool_usage: u64_at(bytes, offset_of!(AlpcPortAttributes, max_pool_usage)),
+        maximum_section_size: u64_at(bytes, offset_of!(AlpcPortAttributes, max_section_size)),
+        maximum_view_size: u64_at(bytes, offset_of!(AlpcPortAttributes, max_view_size)),
+        maximum_total_section_size: u64_at(bytes, offset_of!(AlpcPortAttributes, max_total_section_size)),
+        duplicate_object_types: u32_at(bytes, offset_of!(AlpcPortAttributes, dup_object_types)) & 0xFFD,
     }))
 }

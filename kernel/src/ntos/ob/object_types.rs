@@ -1,6 +1,6 @@
 //! Descritores OBJECT_TYPE do gerenciador de objetos.
 //!
-//! Layout do PDB: corpo de 0xD8 bytes, TypeInfo em +0x40 com tamanho 0x78.
+//! Corpo `_OBJECT_TYPE` com o TypeInfo (`_OBJECT_TYPE_INITIALIZER`) embutido.
 //! Ponteiros exportados, verificações de tipo e contadores usam a mesma
 //! identidade (o ponteiro do corpo). ObCreateObjectType e as células
 //! exportadas com ponteiros de tipo também moram aqui.
@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{self as nt, NtStruct, ObjectTypeInitializer, PoolType};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_data;
 use crate::ntos::rtl::guest_strings;
@@ -46,10 +47,19 @@ struct Types {
 static TYPES: SpinLock<Types> =
     SpinLock::new(Types { by_name: BTreeMap::new(), order: Vec::new(), by_body: BTreeMap::new(), next_index: 2 });
 
+/// O `_OBJECT_TYPE` publicado de um tipo registrado.
+fn native(pointer: u64) -> &'static nt::ObjectType {
+    // SAFETY: corpos alocados por `create`, nunca liberados depois de publicados.
+    unsafe { nt::ObjectType::at(pointer) }
+}
+
+/// Espelha as contagens (a fonte é o registro, sob TYPES) no OBJECT_TYPE.
 fn publish_counts(record: &TypeRecord) {
-    for (offset, value) in [(0x2C, record.objects), (0x30, record.handles), (0x34, record.peak_objects), (0x38, record.peak_handles)] {
-        guest::write32(record.info.pointer + offset, value);
-    }
+    let body = native(record.info.pointer);
+    body.total_number_of_objects.set(record.objects);
+    body.total_number_of_handles.set(record.handles);
+    body.high_water_number_of_objects.set(record.peak_objects);
+    body.high_water_number_of_handles.set(record.peak_handles);
 }
 
 fn apply(record: &mut TypeRecord, objects: i64, handles: i64) -> Result<(), KernelError> {
@@ -72,7 +82,7 @@ fn create(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Resul
         return Err(KernelError::new(alloc::format!("duplicate object type: {name}")));
     }
     let units: Vec<u16> = name.encode_utf16().collect();
-    let pointer = guest::alloc_bytes(0xD8);
+    let pointer = guest::alloc_bytes(nt::ObjectType::SIZE);
     let name_buffer = guest::alloc_bytes((units.len() as u64 + 1) * 2);
     if pointer == 0 || name_buffer == 0 {
         if pointer != 0 {
@@ -83,25 +93,28 @@ fn create(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Resul
         }
         return Err(KernelError::with_status("object type allocation failed", STATUS_INSUFFICIENT_RESOURCES));
     }
-    guest::write64(pointer, pointer);
-    guest::write64(pointer + 8, pointer);
-    guest::write16(pointer + 0x10, (units.len() * 2) as u16);
-    guest::write16(pointer + 0x12, ((units.len() + 1) * 2) as u16);
-    guest::write64(pointer + 0x18, name_buffer);
-    for (index, &unit) in units.iter().enumerate() {
-        guest::write16(name_buffer + index as u64 * 2, unit);
-    }
+    let body = native(pointer);
+    body.type_list.flink.set(body.type_list.address());
+    body.type_list.blink.set(body.type_list.address());
+    body.name.length.set((units.len() * 2) as u16);
+    body.name.maximum_length.set(((units.len() + 1) * 2) as u16);
+    body.name.buffer.set(name_buffer);
+    let text: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(name_buffer, &text);
     let index = types.next_index;
     types.next_index = types.next_index.wrapping_add(1);
-    guest::write8(pointer + 0x28, index);
-    guest::write16(pointer + 0x40, 0x78);
-    guest::write16(pointer + 0x42, flags);
-    for (position, value) in mapping.iter().enumerate() {
-        guest::write32(pointer + 0x4C + position as u64 * 4, *value);
-    }
-    guest::write32(pointer + 0x5C, valid_access);
-    guest::write64(pointer + 0xC8, pointer + 0xC8);
-    guest::write64(pointer + 0xD0, pointer + 0xC8);
+    body.index.set(index);
+    let info = &body.type_info;
+    info.length.set(ObjectTypeInitializer::SIZE as u16);
+    info.object_type_flags.set(flags);
+    let generic = &info.generic_mapping;
+    generic.generic_read.set(mapping[0]);
+    generic.generic_write.set(mapping[1]);
+    generic.generic_execute.set(mapping[2]);
+    generic.generic_all.set(mapping[3]);
+    info.valid_access_mask.set(valid_access);
+    body.callback_list.flink.set(body.callback_list.address());
+    body.callback_list.blink.set(body.callback_list.address());
     let info = ObjectType { name: String::from(name), pointer, mapping, valid_access };
     types.by_name.insert(
         String::from(name),
@@ -162,8 +175,8 @@ pub fn define(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> R
 //   POBJECT_TYPE_INITIALIZER Init, PSECURITY_DESCRIPTOR Sd, POBJECT_TYPE *Type)
 //
 // Faithful wrapper over define (the public form of the private
-// create()). The INITIALIZER mirrors the 0xD8 body window: Length/flags in
-// the first dword, GENERIC_MAPPING at +0x0C, ValidAccessMask at +0x1C.
+// create()): ObjectTypeFlags, GenericMapping and ValidAccessMask come from
+// the caller's OBJECT_TYPE_INITIALIZER.
 pub fn create_from_initializer(name_ptr: u64, init: u64, out: u64) -> u32 {
     if init == 0 || name_ptr == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -172,19 +185,17 @@ pub fn create_from_initializer(name_ptr: u64, init: u64, out: u64) -> u32 {
     if name.is_empty() {
         return STATUS_INVALID_PARAMETER;
     }
-    let header = guest::read32(init);
-    let flags = (header >> 16) as u16;
-    let mapping = [
-        guest::read32(init + 0x0C),
-        guest::read32(init + 0x10),
-        guest::read32(init + 0x14),
-        guest::read32(init + 0x18),
-    ];
-    let valid = guest::read32(init + 0x1C);
+    // SAFETY: OBJECT_TYPE_INITIALIZER de um driver (chamador de kernel).
+    let init = unsafe { ObjectTypeInitializer::at(init) };
+    let flags = init.object_type_flags.get();
+    let generic = &init.generic_mapping;
+    let mapping = [generic.generic_read.get(), generic.generic_write.get(), generic.generic_execute.get(), generic.generic_all.get()];
+    let valid = init.valid_access_mask.get();
     match define(&name, mapping, valid, flags) {
         Ok(info) => {
             if out != 0 {
-                guest::write64(out, info.pointer);
+                // SAFETY: POBJECT_TYPE* de saída do mesmo chamador.
+                unsafe { nt::Field::<u64>::at(out) }.set(info.pointer);
             }
             STATUS_SUCCESS
         }
@@ -254,15 +265,15 @@ pub fn user_type(kind: &str) -> Option<ObjectType> {
     create(&name, mapping, valid, flags).ok()
 }
 
-/// Tipo paginável ou não paginável dos contextos de silo, com PoolType em
-/// OBJECT_TYPE_INITIALIZER (+0x24, isto é, +0x64 no corpo).
+/// Tipo paginável ou não paginável dos contextos de silo, com o PoolType
+/// do OBJECT_TYPE_INITIALIZER (TypeInfo.PoolType).
 pub fn silo_context_type(paged: bool) -> ObjectType {
     let name = if paged { "PsSiloContextPaged" } else { "PsSiloContextNonPaged" };
     if let Some(record) = TYPES.lock().by_name.get(name) {
         return record.info.clone();
     }
     let info = create(name, [0x20000, 0x20000, 0x20000, 0xF0000], 0x1F0000, 2).unwrap_or_else(|error| panic!("{error}"));
-    guest::write32(info.pointer + 0x64, if paged { 1 } else { 0x200 });
+    native(info.pointer).type_info.pool_type.set(if paged { PoolType::PAGED_POOL } else { PoolType::NON_PAGED_POOL_NX });
     info
 }
 
@@ -309,8 +320,9 @@ pub fn raise_peaks(name: &str, peak_objects: u32, peak_handles: u32) {
     if let Some(record) = types.by_name.get_mut(name) {
         record.peak_objects = record.peak_objects.max(peak_objects);
         record.peak_handles = record.peak_handles.max(peak_handles);
-        guest::write32(record.info.pointer + 0x34, record.peak_objects);
-        guest::write32(record.info.pointer + 0x38, record.peak_handles);
+        let body = native(record.info.pointer);
+        body.high_water_number_of_objects.set(record.peak_objects);
+        body.high_water_number_of_handles.set(record.peak_handles);
     }
 }
 

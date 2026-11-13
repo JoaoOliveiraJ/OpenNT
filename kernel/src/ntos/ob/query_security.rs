@@ -12,13 +12,15 @@ use crate::ntos::io::file::native_security as file_security;
 use crate::ntos::se::policy_descriptor;
 use crate::ntos::se::query_descriptor::{self, QueryResult};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, FileObject, NtStruct};
 use crate::ntos::io::file::zw as zw_files;
 
 /// Arquivos nativos vão ao driver por IRP; arquivos de volume/fonte sem
 /// ACLs usam o fallback de segurança não suportada.
 fn query_file(pointer: u64, information: u32, buffer: u64, capacity: u32) -> Result<QueryResult, KernelError> {
-    if guest::read64(pointer + 8) == 0 && (zw_files::file_backing(pointer).is_some() || file_objects::source(pointer).is_some()) {
+    // SAFETY: FILE_OBJECT referenciado pelo handle consultado.
+    let device = unsafe { FileObject::at(pointer) }.device_object.get();
+    if device == 0 && (zw_files::file_backing(pointer).is_some() || file_objects::source(pointer).is_some()) {
         return Ok(file_security::query_unsupported_file(information, buffer, capacity));
     }
     file_security::query_file(pointer, information, buffer, capacity, 0)
@@ -45,6 +47,7 @@ pub fn query(handle: u64, information: u32, buffer: u64, capacity: u32, length_n
     })();
     reference.release()?;
     let result = result?;
-    guest::write32(length_needed, result.needed as u32);
+    // SAFETY: PULONG LengthNeeded do chamador (já capturado pelo serviço).
+    unsafe { Field::<u32>::at(length_needed) }.set(result.needed as u32);
     Ok(result.status)
 }

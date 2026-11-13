@@ -24,7 +24,10 @@ use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::sections::{self, MapRequest, Section};
 use crate::rtl::KernelError;
+use crate::ntos::alpc::message::buffer::{read_block, read_field, write_field};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcPortAssociateCompletionPort, AlpcSecurityAttr, NtStruct};
+use core::mem::offset_of;
 
 const INVALID_PARAMETER: u32 = 0xC000_000D;
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -57,13 +60,17 @@ pub fn create_security_context(handle: u64, flags: u32, attribute: u64, mode: u8
         if mode != 0 && attribute & 7 != 0 {
             return Ok(0x8000_0002);
         }
-        if mode != 0 && !message_buffer::writable(attribute, 24, mode) {
+        if mode != 0 && !message_buffer::writable(attribute, AlpcSecurityAttr::SIZE, mode) {
             return Ok(ACCESS_VIOLATION);
         }
-        if !message_buffer::accessible(attribute, 16, mode, false) {
+        if !message_buffer::accessible(attribute, offset_of!(AlpcSecurityAttr, context_handle) as u64, mode, false) {
             return Ok(ACCESS_VIOLATION);
         }
-        let captured = match security_contexts::quality(guest::read64(attribute + 8), mode) {
+        let quality_pointer = match read_field::<u64>(attribute, offset_of!(AlpcSecurityAttr, p_qos)) {
+            Ok(pointer) => pointer,
+            Err(status) => return Ok(status),
+        };
+        let captured = match security_contexts::quality(quality_pointer, mode) {
             Ok(captured) => captured,
             Err(status) => return Ok(status),
         };
@@ -73,10 +80,9 @@ pub fn create_security_context(handle: u64, flags: u32, attribute: u64, mode: u8
                 Ok(record) => record,
                 Err(status) => return Ok(status),
             };
-            let published = message_buffer::writable(attribute + 16, 8, mode);
-            if published {
-                guest::write64(attribute + 16, record.handle);
-            } else {
+            let context_handle = offset_of!(AlpcSecurityAttr, context_handle);
+            let published = message_buffer::writable(attribute + context_handle as u64, 8, mode) && write_field::<u64>(attribute, context_handle, record.handle).is_ok();
+            if !published {
                 security_contexts::delete_referenced(&record)?;
             }
             security_contexts::release(&record)?;
@@ -107,7 +113,8 @@ pub fn create_resource_reserve(port_handle: u64, flags: u32, size: u64, output: 
         if flags != 0 {
             return Ok(INVALID_PARAMETER);
         }
-        if mode != 0 && !message_buffer::writable(output, 4, mode) {
+        // PALPC_HANDLE ResourceId: um HANDLE (8 bytes no x64).
+        if mode != 0 && !message_buffer::writable(output, 8, mode) {
             return Ok(ACCESS_VIOLATION);
         }
         with_port(port_handle, mode, |port| {
@@ -116,11 +123,13 @@ pub fn create_resource_reserve(port_handle: u64, flags: u32, size: u64, output: 
                     Ok(record) => record,
                     Err(status) => return Ok(status),
                 };
-                if !message_buffer::writable(output, 4, mode) {
+                if !message_buffer::writable(output, 8, mode) {
                     return Ok(ACCESS_VIOLATION);
                 }
-                guest::write32(output, record.identifier);
-                Ok(0)
+                Ok(match write_field::<u64>(output, 0, record.identifier as u64) {
+                    Ok(()) => 0,
+                    Err(status) => status,
+                })
             })
         })
     })
@@ -238,15 +247,15 @@ pub fn create_port_section(port_handle: u64, flags: u32, section_handle: u64, re
             let mut delivered = false;
             let status = if !message_buffer::writable(output_handle, 8, mode) {
                 ACCESS_VIOLATION
+            } else if let Err(status) = write_field::<u64>(output_handle, 0, handle as u64) {
+                status
+            } else if !message_buffer::writable(output_size, 8, mode) {
+                ACCESS_VIOLATION
+            } else if let Err(status) = write_field::<u64>(output_size, 0, record.actual_size) {
+                status
             } else {
-                guest::write64(output_handle, handle as u64);
-                if !message_buffer::writable(output_size, 8, mode) {
-                    ACCESS_VIOLATION
-                } else {
-                    guest::write64(output_size, record.actual_size);
-                    delivered = true;
-                    0
-                }
+                delivered = true;
+                0
             };
             if !delivered && !record.state.lock().deleted {
                 port_sections::delete_referenced(&record)?;
@@ -282,13 +291,21 @@ pub fn create_section_view(handle: u64, flags: u32, attributes: u64, mode: u8) -
         if mode != 0 && attributes & 3 != 0 {
             return Ok(0x8000_0002);
         }
-        if !message_buffer::accessible(attributes, 32, mode, mode != 0) {
+        if !message_buffer::accessible(attributes, AlpcDataViewAttr::SIZE, mode, mode != 0) {
             return Ok(ACCESS_VIOLATION);
         }
-        let view_flags = guest::read32(attributes);
-        let section_handle = guest::read64(attributes + 8);
-        let initial_base = guest::read64(attributes + 16);
-        let requested = guest::read64(attributes + 24);
+        let fields = (|| -> Result<(u32, u64, u64, u64), u32> {
+            Ok((
+                read_field::<u32>(attributes, offset_of!(AlpcDataViewAttr, flags))?,
+                read_field::<u64>(attributes, offset_of!(AlpcDataViewAttr, section_handle))?,
+                read_field::<u64>(attributes, offset_of!(AlpcDataViewAttr, view_base))?,
+                read_field::<u64>(attributes, offset_of!(AlpcDataViewAttr, view_size))?,
+            ))
+        })();
+        let (view_flags, section_handle, initial_base, requested) = match fields {
+            Ok(fields) => fields,
+            Err(status) => return Ok(status),
+        };
         if view_flags != 0 || initial_base != 0 || requested == 0 {
             return Ok(INVALID_PARAMETER);
         }
@@ -321,14 +338,14 @@ pub fn create_section_view(handle: u64, flags: u32, attributes: u64, mode: u8) -
                     Ok(view) => temporary = Some(view),
                     Err(_) => return Err(KernelError::new("ALPC created view disappeared before delivery")),
                 }
-                if !message_buffer::writable(attributes + 16, 8, mode) {
-                    return Ok(ACCESS_VIOLATION);
+                for (offset, value) in [(offset_of!(AlpcDataViewAttr, view_base), binding.view.base), (offset_of!(AlpcDataViewAttr, view_size), binding.view.size)] {
+                    if !message_buffer::writable(attributes + offset as u64, 8, mode) {
+                        return Ok(ACCESS_VIOLATION);
+                    }
+                    if let Err(status) = write_field::<u64>(attributes, offset, value) {
+                        return Ok(status);
+                    }
                 }
-                guest::write64(attributes + 16, binding.view.base);
-                if !message_buffer::writable(attributes + 24, 8, mode) {
-                    return Ok(ACCESS_VIOLATION);
-                }
-                guest::write64(attributes + 24, binding.view.size);
                 delivered = true;
                 Ok(0)
             })();
@@ -388,7 +405,10 @@ pub fn set_information(handle: u64, class: u32, input: u64, length: u32, mode: u
             if !message_buffer::accessible(input, length as u64, mode, false) {
                 return Ok(ACCESS_VIOLATION);
             }
-            captured = Some((0..length as u64).map(|index| guest::read8(input + index)).collect());
+            captured = match read_block(input, length as u64) {
+                Ok(bytes) => Some(bytes),
+                Err(status) => return Ok(status),
+            };
         }
         with_port(handle, mode, |port| {
             port.run(|| {
@@ -396,13 +416,19 @@ pub fn set_information(handle: u64, class: u32, input: u64, length: u32, mode: u
                     if length != 16 {
                         return Ok(0xC000_0004);
                     }
+                    let key_offset = offset_of!(AlpcPortAssociateCompletionPort, completion_key);
+                    let port_offset = offset_of!(AlpcPortAssociateCompletionPort, completion_port);
+                    let word = |bytes: &[u8], offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
                     let (key, completion) = match &captured {
-                        Some(bytes) => (u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])), u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]))),
+                        Some(bytes) => (word(bytes, key_offset), word(bytes, port_offset)),
                         None => {
-                            if !message_buffer::accessible(input, 16, mode, false) {
+                            if !message_buffer::accessible(input, AlpcPortAssociateCompletionPort::SIZE, mode, false) {
                                 return Ok(ACCESS_VIOLATION);
                             }
-                            (guest::read64(input), guest::read64(input + 8))
+                            match (read_field::<u64>(input, key_offset), read_field::<u64>(input, port_offset)) {
+                                (Ok(key), Ok(completion)) => (key, completion),
+                                (Err(status), _) | (_, Err(status)) => return Ok(status),
+                            }
                         }
                     };
                     return completion_association::associate(port, completion, key, mode);

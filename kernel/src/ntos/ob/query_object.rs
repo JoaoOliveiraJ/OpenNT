@@ -28,7 +28,14 @@ use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::handles as token_handles;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{Eprocess, Field, NtStruct, ObjectNameInformation};
 use crate::ntos::mm::guest_memory as guest;
+
+/// PULONG ReturnLength de um chamador de kernel (ObQueryNameString).
+fn return_length(address: u64) -> &'static Field<u32> {
+    // SAFETY: ponteiro de saída de um chamador de kernel.
+    unsafe { Field::<u32>::at(address) }
+}
 
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -125,7 +132,8 @@ pub fn resolve(handle: u64) -> Result<Collected, u32> {
         };
     }
     let current = process::get_current_process();
-    if current != process::get_system_process() && state::with(|state| state.current_process_id) == guest::read64(current + 0x440) {
+    // SAFETY: EPROCESS do processo corrente.
+    if current != process::get_system_process() && state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() {
         if let Some(entry) = state::get_user_handle(handle) {
             return resolve_user(entry);
         }
@@ -295,10 +303,11 @@ pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64) -
         let formatted = query_object_format::format(&empty, class, output, length, &list);
         if returned != 0 {
             if let Some(needed) = formatted.needed {
-                if !writable_range(returned, 4) {
+                // ReturnLength pode vir do modo usuário (NtQueryObject), sem
+                // exigência de alinhamento: escrita sondada.
+                if !writable_range(returned, 4) || guest::try_write::<u32>(returned, needed).is_err() {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                guest::write32(returned, needed);
             }
         }
         formatted.status
@@ -325,45 +334,43 @@ fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
 }
 
 /// ObQueryNameString: o caminho completo do objeto (callbacks pelo nome
-/// próprio, com o UNICODE_STRING montado no buffer).
+/// próprio). Como no NT, o OBJECT_NAME_INFORMATION é montado no buffer com
+/// Name.Buffer logo depois da estrutura, e ReturnLength conta a estrutura,
+/// o texto e o terminador.
 pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) -> u32 {
     if callbacks::exists(pointer) {
-        let name = callbacks::name(pointer);
-        let units = name.as_ref().map_or(0, |name| name.encode_utf16().count() as u32);
-        let needed = 16 + if name.is_some() { units * 2 + 2 } else { 0 };
-        if returned != 0 {
-            guest::write32(returned, needed);
-        }
-        if size < needed {
-            return 0xC000_0004;
-        }
-        for offset in 0..16 {
-            guest::write8(output + offset, 0);
-        }
-        if let Some(name) = name {
-            guest::write16(output, units as u16 * 2);
-            guest::write16(output + 2, units as u16 * 2 + 2);
-            guest::write64(output + 8, output + 16);
-            guest_strings::write_wide_string(output + 16, &name);
-        }
-        return 0;
+        return write_name_information(callbacks::name(pointer).as_deref(), output, size, returned);
     }
     let Some(path) = find_path_by_native_pointer(pointer) else {
         if returned != 0 {
-            guest::write32(returned, 0);
+            return_length(returned).set(0);
         }
         return 0xC000_000D;
     };
-    let units = path.encode_utf16().count() as u32;
-    let needed = units * 2 + 2;
+    write_name_information(Some(&path), output, size, returned)
+}
+
+/// OBJECT_NAME_INFORMATION no buffer do chamador de kernel; sem nome, um
+/// UNICODE_STRING vazio.
+fn write_name_information(name: Option<&str>, output: u64, size: u32, returned: u64) -> u32 {
+    let units: Vec<u16> = name.map_or(Vec::new(), |name| name.encode_utf16().collect());
+    let header = ObjectNameInformation::SIZE as u32;
+    let needed = header + if name.is_some() { units.len() as u32 * 2 + 2 } else { 0 };
     if returned != 0 {
-        guest::write32(returned, needed);
+        return_length(returned).set(needed);
     }
     if size < needed {
         return 0xC000_0004;
     }
-    guest_strings::write_wide_string(guest::read64(output + 8), &path);
-    guest::write16(output, units as u16 * 2);
-    guest::write16(output + 2, units as u16 * 2 + 2);
+    guest::write_bytes(output, &[0u8; ObjectNameInformation::SIZE as usize]);
+    if name.is_some() {
+        // SAFETY: buffer de saída do chamador, com `needed` bytes.
+        let information = unsafe { ObjectNameInformation::at(output) };
+        let text = output + ObjectNameInformation::SIZE;
+        information.name.length.set(units.len() as u16 * 2);
+        information.name.maximum_length.set(units.len() as u16 * 2 + 2);
+        information.name.buffer.set(text);
+        guest_strings::write_wide_string(text, name.unwrap_or_default());
+    }
     0
 }

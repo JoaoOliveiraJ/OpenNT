@@ -7,14 +7,32 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use super::completion_reference::{self, Reference};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet, Port as CompletionPort};
 use crate::ntos::ob::objects::port::{Port, PortCompletion};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
-pub const STATE_SIZE: u64 = 16;
+/// Estado privado da associação. `pending` cresce no notify e `published`
+/// cai na retirada do consumidor, em threads diferentes: os contadores são
+/// atômicos.
+#[repr(C)]
+struct AssociationState {
+    limit: Field<u32>,
+    published: Field<u32>,
+    pending: Field<u32>,
+    released: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for AssociationState {}
+
+const _: () = assert!(core::mem::size_of::<AssociationState>() == 0x10);
+
+pub const STATE_SIZE: u64 = AssociationState::SIZE;
 
 #[derive(Default)]
 struct Flags {
@@ -32,9 +50,15 @@ struct Association {
 }
 
 impl Association {
+    fn state(&self) -> &'static AssociationState {
+        // SAFETY: estado alocado por `associate`, liberado só por `collect`
+        // (com storage_released marcado sob `flags`).
+        unsafe { AssociationState::at(self.pointer) }
+    }
+
     fn collect(&self) {
         let mut flags = self.flags.lock();
-        if !flags.storage_released && !flags.draining && flags.released && guest::read32(self.pointer + 4) == 0 {
+        if !flags.storage_released && !flags.draining && flags.released && self.state().published.atomic().load(Ordering::SeqCst) == 0 {
             flags.storage_released = true;
             guest::free_bytes(self.pointer);
         }
@@ -48,24 +72,28 @@ impl Association {
             }
             flags.draining = true;
         }
-        let pointer = self.pointer;
+        let state = self.state();
+        let (pending, published) = (state.pending.atomic(), state.published.atomic());
         if self.queue.closed() {
-            guest::write32(pointer + 8, 0);
+            pending.store(0, Ordering::SeqCst);
         }
-        while guest::read32(pointer + 8) != 0 && guest::read32(pointer + 4) < guest::read32(pointer) {
+        while pending.load(Ordering::SeqCst) != 0 && published.load(Ordering::SeqCst) < state.limit.get() {
             if self.queue.closed() {
-                guest::write32(pointer + 8, 0);
+                pending.store(0, Ordering::SeqCst);
                 break;
             }
-            guest::write32(pointer + 8, guest::read32(pointer + 8) - 1);
-            guest::write32(pointer + 4, guest::read32(pointer + 4) + 1);
+            // Só este laço (sob `draining`) consome pendências.
+            if pending.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1)).is_err() {
+                break;
+            }
+            published.fetch_add(1, Ordering::SeqCst);
             let owner = self.clone();
             completion_objects::enqueue(
                 &self.queue,
                 Packet {
                     key: self.key,
                     on_dequeue: Some(Box::new(move || {
-                        guest::write32(owner.pointer + 4, guest::read32(owner.pointer + 4) - 1);
+                        owner.state().published.atomic().fetch_sub(1, Ordering::SeqCst);
                         // Uma notificação já produzida sobrevive ao consumo da
                         // mensagem e ao fechamento da ALPC; fechar a IOCP
                         // drena e cancela as restantes.
@@ -89,7 +117,7 @@ impl PortCompletion for AssociationHandle {
         if association.flags.lock().released || association.queue.closed() {
             return;
         }
-        guest::write32(association.pointer + 8, guest::read32(association.pointer + 8) + 1);
+        association.state().pending.atomic().fetch_add(1, Ordering::SeqCst);
         association.publish_pending();
     }
     fn port_pointer(&self) -> u64 {
@@ -104,7 +132,7 @@ impl PortCompletion for AssociationHandle {
             }
             flags.released = true;
         }
-        guest::write32(association.pointer + 12, 1);
+        association.state().released.set(1);
         association.collect();
         if let Some(mut reference) = association.reference.lock().take() {
             let _ = reference.release();
@@ -129,10 +157,9 @@ pub fn associate(port: &Arc<Port>, handle: u64, key: u64, access_mode: u8) -> Re
         let _ = reference.release();
         return Ok(0xC000_009A);
     }
-    guest::write32(pointer, queue.concurrency().min(4));
-    for offset in (4..STATE_SIZE).step_by(4) {
-        guest::write32(pointer + offset, 0);
-    }
+    // Alocação zerada: só o limite de pacotes publicados.
+    // SAFETY: alocação nova do tamanho do estado.
+    unsafe { AssociationState::at(pointer) }.limit.set(queue.concurrency().min(4));
     let association = Arc::new(Association { queue, pointer, key, flags: SpinLock::new(Flags::default()), reference: SpinLock::new(Some(reference)) });
     let handle: Arc<dyn PortCompletion> = Arc::new(AssociationHandle(association));
     port.set_completion_key(key);

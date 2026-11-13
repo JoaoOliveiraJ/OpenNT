@@ -12,7 +12,10 @@ use crate::ntos::ob::objects::port::{self as port_objects, Port};
 use crate::ntos::ps::process;
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
+use crate::ntos::alpc::message::buffer::{read_block, read_field, write_field};
+use crate::ntos::inc::types::{AlpcBasicInformation, NtStruct, Sid};
 use crate::ntos::mm::guest_memory as guest;
+use core::mem::offset_of;
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -27,30 +30,36 @@ fn write_length(address: u64, value: u32, mode: u8) -> u32 {
     if !message_buffer::writable(address, 4, mode) {
         return ACCESS_VIOLATION;
     }
-    guest::write32(address, value);
-    0
+    match write_field::<u32>(address, 0, value) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
 }
 
 fn query_basic(port: Option<&Arc<Port>>, output: u64, length: u32, returned: u64, mode: u8) -> u32 {
     let Some(port) = port else { return INVALID_PARAMETER };
-    if length < 16 {
-        let status = write_length(returned, 16, mode);
+    let size = AlpcBasicInformation::SIZE as u32;
+    if length < size {
+        let status = write_length(returned, size, mode);
         return if status != 0 { status } else { 0xC000_0004 };
     }
     let (flags, context) = port.with(|state| (state.port_flags, state.port_context));
     // Escritas separadas mantêm os campos anteriores quando uma página
     // seguinte falha.
-    for (offset, width, value) in [(0u64, 4u64, (flags & 0x3FF_0000) as u64), (4, 4, port.sequence() as u64), (8, 8, context)] {
-        if !message_buffer::writable(output + offset, width, mode) {
+    for (offset, width, value) in [
+        (offset_of!(AlpcBasicInformation, flags), 4u64, (flags & 0x3FF_0000) as u64),
+        (offset_of!(AlpcBasicInformation, sequence_no), 4, port.sequence() as u64),
+        (offset_of!(AlpcBasicInformation, port_context), 8, context),
+    ] {
+        if !message_buffer::writable(output + offset as u64, width, mode) {
             return ACCESS_VIOLATION;
         }
-        if width == 8 {
-            guest::write64(output + offset, value);
-        } else {
-            guest::write32(output + offset, value as u32);
+        let written = if width == 8 { write_field::<u64>(output, offset, value) } else { write_field::<u32>(output, offset, value as u32) };
+        if let Err(status) = written {
+            return status;
         }
     }
-    write_length(returned, 16, mode)
+    write_length(returned, size, mode)
 }
 
 fn query_connected_sid(port: Option<&Arc<Port>>, input: u64, returned: u64, mode: u8) -> Result<u32, KernelError> {
@@ -65,11 +74,16 @@ fn query_connected_sid(port: Option<&Arc<Port>>, input: u64, returned: u64, mode
         if mode != 0 {
             // SeCaptureSid lê a contagem antes do alinhamento, aloca a cópia
             // e só então valida revisão e contagem; Length é ignorado.
-            if !message_buffer::accessible(input + 1, 1, mode, false) {
+            let count_offset = offset_of!(Sid, sub_authority_count);
+            if !message_buffer::accessible(input + count_offset as u64, 1, mode, false) {
                 return Ok(ACCESS_VIOLATION);
             }
-            let count = guest::read8(input + 1);
-            let length = 8 + count as u64 * 4;
+            let count = match read_field::<u8>(input, count_offset) {
+                Ok(count) => count,
+                Err(status) => return Ok(status),
+            };
+            // Cabeçalho mais SubAuthority[count].
+            let length = offset_of!(Sid, sub_authority) as u64 + count as u64 * 4;
             if input & 3 != 0 {
                 return Ok(0x8000_0002);
             }
@@ -83,11 +97,15 @@ fn query_connected_sid(port: Option<&Arc<Port>>, input: u64, returned: u64, mode
             if !message_buffer::accessible(input, length, mode, false) {
                 return Ok(ACCESS_VIOLATION);
             }
-            for index in 0..length {
-                guest::write8(captured + index, guest::read8(input + index));
+            match read_block(input, length) {
+                Ok(bytes) => guest::write_bytes(captured, &bytes),
+                Err(status) => return Ok(status),
             }
-            guest::write8(captured + 1, count);
-            if guest::read8(captured) & 15 != 1 || count > 15 {
+            // A cópia conserva a contagem lida primeiro (sem dupla leitura).
+            // SAFETY: cópia alocada acima com `length` bytes.
+            let copy = unsafe { Sid::at(captured) };
+            copy.sub_authority_count.set(count);
+            if copy.revision.get() & 15 != 1 || count > 15 {
                 return Ok(0xC000_0078);
             }
             input = captured;
@@ -103,16 +121,28 @@ fn query_connected_sid(port: Option<&Arc<Port>>, input: u64, returned: u64, mode
                 if captured == 0 && !message_buffer::accessible(input, 2, mode, false) {
                     return ACCESS_VIOLATION;
                 }
-                if user.len() < 2 || guest::read16(input) != u16::from_le_bytes([user[0], user[1]]) {
+                if user.len() < 2 {
                     return 0xC000_02A0;
                 }
+                let header = (read_field::<u8>(input, offset_of!(Sid, revision)), read_field::<u8>(input, offset_of!(Sid, sub_authority_count)));
+                let (revision, count) = match header {
+                    (Ok(revision), Ok(count)) => (revision, count),
+                    _ => return ACCESS_VIOLATION,
+                };
+                if revision != user[0] || count != user[1] {
+                    return 0xC000_02A0;
+                }
+                // Byte a byte: em KernelMode a primeira diferença encerra a
+                // comparação antes de tocar o resto do SID original.
                 for (index, &byte) in user.iter().enumerate().skip(2) {
                     let address = input + index as u64;
                     if captured == 0 && !message_buffer::accessible(address, 1, mode, false) {
                         return ACCESS_VIOLATION;
                     }
-                    if guest::read8(address) != byte {
-                        return 0xC000_02A0;
+                    match read_field::<u8>(address, 0) {
+                        Ok(value) if value == byte => {}
+                        Ok(_) => return 0xC000_02A0,
+                        Err(status) => return status,
                     }
                 }
                 0

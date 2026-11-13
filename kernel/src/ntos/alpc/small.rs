@@ -2,28 +2,44 @@
 //! de despertar.
 
 use crate::ntos::ps::process;
-use crate::ntos::mm::guest_memory as guest;
 
 /// Contexto ALPC sem alterar os quatro bytes reservados no fim do atributo.
+/// O atributo fica no buffer de atributos do chamador (de modo usuário):
+/// cada campo é escrito com sonda.
 pub mod context_attribute {
-    use super::guest;
-    use crate::ntos::alpc::message::identity::Identity;
+    use core::mem::offset_of;
 
+    use crate::ntos::alpc::message::buffer::{read_field, write_field};
+    use crate::ntos::alpc::message::identity::Identity;
+    use crate::ntos::inc::types::AlpcContextAttr;
+
+    /// Grava o atributo; ACCESS_VIOLATION se o buffer sumiu.
+    pub fn try_write(pointer: u64, port_context: u64, message_context: u64, sequence: u32, identifier: u32, callback: u32) -> Result<(), u32> {
+        write_field::<u64>(pointer, offset_of!(AlpcContextAttr, port_context), port_context)?;
+        write_field::<u64>(pointer, offset_of!(AlpcContextAttr, message_context), message_context)?;
+        write_field::<u32>(pointer, offset_of!(AlpcContextAttr, sequence), sequence)?;
+        write_field::<u32>(pointer, offset_of!(AlpcContextAttr, message_id), identifier)?;
+        write_field::<u32>(pointer, offset_of!(AlpcContextAttr, callback_id), callback)
+    }
+
+    /// Como `try_write`, para chamadores que já validaram o buffer: uma
+    /// falha de sonda deixa o atributo como estava.
     pub fn write(pointer: u64, port_context: u64, message_context: u64, sequence: u32, identifier: u32, callback: u32) {
-        guest::write64(pointer, port_context);
-        guest::write64(pointer + 8, message_context);
-        guest::write32(pointer + 16, sequence);
-        guest::write32(pointer + 20, identifier);
-        guest::write32(pointer + 24, callback);
+        let _ = try_write(pointer, port_context, message_context, sequence, identifier, callback);
     }
 
     /// A captura publica a identidade e sequência zero; MessageContext
     /// permanece opaco.
-    pub fn capture(pointer: u64, port_context: u64, identity: &Identity) -> u64 {
-        let message_context = guest::read64(pointer + 8);
+    pub fn try_capture(pointer: u64, port_context: u64, identity: &Identity) -> Result<u64, u32> {
+        let message_context = read_field::<u64>(pointer, offset_of!(AlpcContextAttr, message_context))?;
         identity.with(|state| state.client_context = message_context);
-        write(pointer, port_context, message_context, 0, identity.identifier, identity.callback);
-        message_context
+        try_write(pointer, port_context, message_context, 0, identity.identifier, identity.callback)?;
+        Ok(message_context)
+    }
+
+    /// Como `try_capture`; uma falha de sonda devolve MessageContext zero.
+    pub fn capture(pointer: u64, port_context: u64, identity: &Identity) -> u64 {
+        try_capture(pointer, port_context, identity).unwrap_or(0)
     }
 }
 

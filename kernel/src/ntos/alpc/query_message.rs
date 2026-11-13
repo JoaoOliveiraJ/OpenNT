@@ -13,28 +13,35 @@ use crate::ntos::ke::critical_region;
 use crate::ntos::ob::objects::port::Port;
 use crate::ntos::se::token::{statistics as token_statistics, tokens};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::alpc::message::buffer::{read_field, write_block, write_field};
+use crate::ntos::inc::types::extra_ob_alpc::PortMessage32;
+use crate::ntos::inc::types::{AlpcMessageHandleInformation, NtStruct, PortMessage, PortMessageView1};
+use core::mem::offset_of;
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const INVALID_PARAMETER: u32 = 0xC000_000D;
 const BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
-/// WOW64 usa os campos de 32 bits em +16/+20; o restante do PORT_MESSAGE
-/// não é lido (pode terminar numa página inacessível).
+/// WOW64 usa os campos do PORT_MESSAGE32; o restante do PORT_MESSAGE não é
+/// lido (pode terminar numa página inacessível).
 fn capture_selection(message: u64, mode: u8) -> Result<(u32, u32), u32> {
     if mode != 0 && message & 3 != 0 {
         return Err(0x8000_0002);
     }
-    if !message_buffer::accessible(message, 1, mode, false) || !message_buffer::accessible(message + 4, 2, mode, false) {
+    let type_offset = offset_of!(PortMessage, u2.s2.type_);
+    if !message_buffer::accessible(message, 1, mode, false) || !message_buffer::accessible(message + type_offset as u64, 2, mode, false) {
         return Err(ACCESS_VIOLATION);
     }
-    let compact = guest::read16(message + 4) & 0x1000 != 0;
-    let identifier = message + if compact { 16 } else { 24 };
-    let callback = message + if compact { 20 } else { 32 };
-    if !message_buffer::accessible(identifier, 4, mode, false) || !message_buffer::accessible(callback, 4, mode, false) {
+    let compact = read_field::<u16>(message, type_offset)? & 0x1000 != 0;
+    let (identifier, callback) = if compact {
+        (offset_of!(PortMessage32, message_id), offset_of!(PortMessage32, callback_id))
+    } else {
+        (offset_of!(PortMessage, message_id), offset_of!(PortMessageView1, callback_id))
+    };
+    if !message_buffer::accessible(message + identifier as u64, 4, mode, false) || !message_buffer::accessible(message + callback as u64, 4, mode, false) {
         return Err(ACCESS_VIOLATION);
     }
-    Ok((guest::read32(identifier), guest::read32(callback)))
+    Ok((read_field::<u32>(message, identifier)?, read_field::<u32>(message, callback)?))
 }
 
 fn write_length(address: u64, length: u32, mode: u8) -> u32 {
@@ -44,18 +51,20 @@ fn write_length(address: u64, length: u32, mode: u8) -> u32 {
     if !message_buffer::writable(address, 4, mode) {
         return ACCESS_VIOLATION;
     }
-    guest::write32(address, length);
-    0
+    match write_field::<u32>(address, 0, length) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
 }
 
 fn write_bytes(address: u64, bytes: &[u8], mode: u8) -> u32 {
     if !message_buffer::writable(address, bytes.len() as u64, mode) {
         return ACCESS_VIOLATION;
     }
-    for (index, &byte) in bytes.iter().enumerate() {
-        guest::write8(address + index as u64, byte);
+    match write_block(address, bytes) {
+        Ok(()) => 0,
+        Err(status) => status,
     }
-    0
 }
 
 fn query_token(port: &Arc<Port>, identity: &Identity, class: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
@@ -83,13 +92,18 @@ fn query_token(port: &Arc<Port>, identity: &Identity, class: u32, output: u64, l
 }
 
 fn query_handle(port: &Arc<Port>, identity: &Identity, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
-    if length != 20 {
+    let size = AlpcMessageHandleInformation::SIZE as u32;
+    if length != size {
         return Ok(0xC000_0004);
     }
-    if !message_buffer::accessible(output, 4, mode, false) {
+    let index_offset = offset_of!(AlpcMessageHandleInformation, index);
+    if !message_buffer::accessible(output + index_offset as u64, 4, mode, false) {
         return Ok(ACCESS_VIOLATION);
     }
-    let index = guest::read32(output);
+    let index = match read_field::<u32>(output, index_offset) {
+        Ok(index) => index,
+        Err(status) => return Ok(status),
+    };
     let Some(handles) = identity.with(|state| state.handles.clone()) else { return Ok(0xC000_0008) };
     let duplicated = {
         let entries = handles.entries.lock();
@@ -100,15 +114,20 @@ fn query_handle(port: &Arc<Port>, identity: &Identity, output: u64, length: u32,
         Ok(duplicated) => duplicated,
         Err(status) => return Ok(status),
     };
-    let mut bytes = [0u8; 20];
-    bytes[0..4].copy_from_slice(&index.to_le_bytes());
-    bytes[8..12].copy_from_slice(&duplicated.handle.to_le_bytes());
-    bytes[12..16].copy_from_slice(&duplicated.object_type.to_le_bytes());
-    bytes[16..20].copy_from_slice(&duplicated.granted.to_le_bytes());
+    // A estrutura inteira (Flags zerado) vai numa cópia só.
+    let mut bytes = [0u8; AlpcMessageHandleInformation::SIZE as usize];
+    for (offset, value) in [
+        (offset_of!(AlpcMessageHandleInformation, index), index),
+        (offset_of!(AlpcMessageHandleInformation, handle), duplicated.handle),
+        (offset_of!(AlpcMessageHandleInformation, object_type), duplicated.object_type),
+        (offset_of!(AlpcMessageHandleInformation, granted_access), duplicated.granted),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
     // O handle já foi criado: o resultado é conservado mesmo se a
     // cópia final falha, sem fechar um objeto já publicado.
     if write_bytes(output, &bytes, mode) == 0 {
-        write_length(returned, 20, mode);
+        write_length(returned, size, mode);
     }
     Ok(0)
 }

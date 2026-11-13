@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
-use crate::ntos::inc::nt_abi::object_attributes;
+use crate::ntos::inc::types::{Field, NtStruct, ObjectAttributes};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::inserted;
 use crate::ntos::ob::object_manager::{self, ObjectData};
@@ -22,6 +22,12 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 const OBJ_KERNEL_HANDLE: u32 = 0x200;
+
+/// Saída escalar (`PVOID*`, `PHANDLE`, `PULONG`...) de um chamador de kernel.
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro de saída fornecido por um chamador de kernel.
+    unsafe { Field::<T>::at(address) }
+}
 
 /// Create-info captured by ObCreateObject, consumed by ObInsertObject or
 /// freed by ObDeleteCapturedInsertInfo. Keyed by the object body pointer.
@@ -62,9 +68,11 @@ pub fn create(type_ptr: u64, attr: u64, body_size: u32, out: u64) -> u32 {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     let (name, attributes) = if attr != 0 {
-        let name_us = guest::read64(attr + object_attributes::OBJECT_NAME);
+        // SAFETY: OBJECT_ATTRIBUTES de um chamador de kernel (ObCreateObject).
+        let attr = unsafe { ObjectAttributes::at(attr) };
+        let name_us = attr.object_name.get();
         let name = (name_us != 0).then(|| guest_strings::read_unicode_string(name_us)).filter(|name| !name.is_empty());
-        (name, guest::read32(attr + object_attributes::ATTRIBUTES))
+        (name, attr.attributes.get())
     } else {
         (None, 0)
     };
@@ -72,7 +80,7 @@ pub fn create(type_ptr: u64, attr: u64, body_size: u32, out: u64) -> u32 {
     let _ = object_types::account(&object_type.name, 1, 0);
     CAPTURED.lock().insert(body, Captured { type_pointer: type_ptr, type_name: object_type.name, name, attributes });
     if out != 0 {
-        guest::write64(out, body);
+        self::out::<u64>(out).set(body);
     }
     STATUS_SUCCESS
 }
@@ -102,10 +110,10 @@ pub fn insert(object: u64, desired: u32, new_object_out: u64, handle_out: u64) -
 
     let handle = inserted::insert(object, cap.type_pointer, cap.type_name, desired, cap.attributes & 7, kernel)?;
     if new_object_out != 0 {
-        guest::write64(new_object_out, object);
+        out::<u64>(new_object_out).set(object);
     }
     if handle_out != 0 {
-        guest::write64(handle_out, handle);
+        out::<u64>(handle_out).set(handle);
     }
     Ok(STATUS_SUCCESS)
 }

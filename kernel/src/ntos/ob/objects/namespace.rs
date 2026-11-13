@@ -10,6 +10,9 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::UnicodeString;
+
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::object_types;
 use crate::ntos::se::model::SecurityPolicy;
@@ -18,7 +21,33 @@ use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 
-pub const SIZE: u64 = 0x40;
+/// Corpo privado de diretório/link (layout do OpenNT; o NT usa
+/// OBJECT_DIRECTORY e OBJECT_SYMBOLIC_LINK).
+#[repr(C)]
+struct NamespaceBody {
+    references: Field<u64>,
+    handles: Field<u32>,
+    permanent: Field<u32>,
+    link_target: UnicodeString,
+    children: Field<u64>,
+    _reserved: Reserved<0x18>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for NamespaceBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<NamespaceBody>() == 0x40);
+    assert!(core::mem::offset_of!(NamespaceBody, link_target) == 0x10);
+    assert!(core::mem::offset_of!(NamespaceBody, children) == 0x20);
+};
+
+pub const SIZE: u64 = NamespaceBody::SIZE;
+
+fn body(pointer: u64) -> &'static NamespaceBody {
+    // SAFETY: corpos alocados por `ensure`, liberados só por `collect`.
+    unsafe { NamespaceBody::at(pointer) }
+}
 
 struct Body {
     node: NodeId,
@@ -63,19 +92,20 @@ pub fn ensure(node: NodeId) -> Result<Option<u64>, KernelError> {
             guest::free_bytes(pointer);
             return Err(status(0xC000_009A));
         }
-        for (index, &unit) in units.iter().enumerate() {
-            guest::write16(target_buffer + index as u64 * 2, unit);
-        }
-        guest::write16(target_buffer + target_length as u64, 0);
-        guest::write16(pointer + 0x10, target_length as u16);
-        guest::write16(pointer + 0x12, target_length as u16 + 2);
-        guest::write64(pointer + 0x18, target_buffer);
+        let mut text: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        text.extend_from_slice(&[0, 0]);
+        guest::write_bytes(target_buffer, &text);
+        let target = &body(pointer).link_target;
+        target.length.set(target_length as u16);
+        target.maximum_length.set(target_length as u16 + 2);
+        target.buffer.set(target_buffer);
     }
     // Um nó ainda ligado à árvore recebe a referência inicial de namespace.
     let attached = snapshot.parent.is_none() || object_manager::is_attached(node);
-    guest::write64(pointer, attached as u64);
-    guest::write32(pointer + 12, if snapshot.permanent == Some(false) { 0 } else { 1 });
-    guest::write64(pointer + 0x20, snapshot.children.as_ref().map_or(0, |children| children.len() as u64));
+    let fresh = body(pointer);
+    fresh.references.set(attached as u64);
+    fresh.permanent.set(if snapshot.permanent == Some(false) { 0 } else { 1 });
+    fresh.children.set(snapshot.children.as_ref().map_or(0, |children| children.len() as u64));
     let security = object_security::namespace(node, directory);
     BODIES.lock().insert(pointer, Body { node, directory, target_buffer, attached, security });
     object_manager::set_native_namespace(node, pointer);
@@ -120,27 +150,27 @@ fn collect(pointer: u64) {
 }
 
 pub fn refs(pointer: u64) -> u64 {
-    guest::read64(pointer)
+    body(pointer).references.get()
 }
 
 pub fn handles(pointer: u64) -> u32 {
-    if BODIES.lock().contains_key(&pointer) { guest::read32(pointer + 8) } else { 0 }
+    if BODIES.lock().contains_key(&pointer) { body(pointer).handles.get() } else { 0 }
 }
 
 pub fn permanent(pointer: u64) -> bool {
-    guest::read32(pointer + 12) != 0
+    body(pointer).permanent.get() != 0
 }
 
 pub fn set_permanent(pointer: u64, permanent: bool) {
-    guest::write32(pointer + 12, permanent as u32);
+    body(pointer).permanent.set(permanent as u32);
 }
 
 fn reference_cell(pointer: u64) -> &'static AtomicU64 {
-    guest::atomic_u64(pointer)
+    body(pointer).references.atomic()
 }
 
 fn handle_cell(pointer: u64) -> &'static AtomicU32 {
-    guest::atomic_u32(pointer + 8)
+    body(pointer).handles.atomic()
 }
 
 pub fn reference(pointer: u64) -> Result<u64, KernelError> {
@@ -200,7 +230,7 @@ pub fn detach(pointer: u64) -> Result<(), KernelError> {
 /// Atualiza o número de filhos e reavalia a coleta.
 pub fn changed(pointer: u64) -> Result<(), KernelError> {
     let node = assert_live(pointer)?;
-    guest::write64(pointer + 0x20, object_manager::child_count(node));
+    body(pointer).children.set(object_manager::child_count(node));
     collect(pointer);
     Ok(())
 }
@@ -208,7 +238,7 @@ pub fn changed(pointer: u64) -> Result<(), KernelError> {
 /// Destino atual do UNICODE_STRING do corpo do link.
 pub fn target(pointer: u64) -> Result<String, KernelError> {
     assert_live(pointer)?;
-    Ok(guest_strings::read_unicode_string(pointer + 0x10))
+    Ok(guest_strings::read_unicode_string(body(pointer).link_target.address()))
 }
 
 /// Nó dono e tipo de um corpo vivo.

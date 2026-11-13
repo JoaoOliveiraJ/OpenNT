@@ -12,7 +12,10 @@ use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ob::{object_access, object_types};
 use crate::ntos::ps::process;
 use crate::ntos::se::model::SecurityPolicy;
-use crate::ntos::mm::guest_memory as guest;
+use core::mem::offset_of;
+
+use crate::ntos::alpc::message::buffer::read_field;
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, SecurityDescriptor, SecurityDescriptorRelative, SecurityQualityOfService};
 
 /// A política explícita não herda owner/DACL do chamador: descreve quais
 /// identidades de servidor o cliente aceita, sem alterar a porta.
@@ -26,15 +29,16 @@ fn descriptor(pointer: u64, mode: u8) -> Result<Option<SecurityPolicy>, u32> {
     if !message_buffer::accessible(pointer, 4, mode, false) {
         return Err(0xC000_0005);
     }
-    if guest::read8(pointer) != 1 {
+    if read_field::<u8>(pointer, offset_of!(SecurityDescriptor, revision))? != 1 {
         return Err(0xC000_0058);
     }
     if mode != 0 && !create_section::descriptor_probe(pointer) {
         return Err(0xC000_0005);
     }
     let mut policy = callback_security::capture(pointer)?;
-    let control = guest::read16(pointer + 2);
-    let owner = if control & 0x8000 != 0 { guest::read32(pointer + 4) as u64 } else { guest::read64(pointer + 8) };
+    let control = read_field::<u16>(pointer, offset_of!(SecurityDescriptor, control))?;
+    // SE_SELF_RELATIVE: Owner é um deslocamento ULONG; senão, um PSID.
+    let owner = if control & 0x8000 != 0 { read_field::<u32>(pointer, offset_of!(SecurityDescriptorRelative, owner))? as u64 } else { read_field::<u64>(pointer, offset_of!(SecurityDescriptor, owner))? };
     if owner == 0 {
         policy.owner = Vec::new();
     }
@@ -57,14 +61,22 @@ fn quality(pointer: u64, mode: u8) -> u32 {
     if mode != 0 && pointer & 3 != 0 {
         return 0x8000_0002;
     }
-    if !message_buffer::accessible(pointer, 12, mode, false) {
+    if !message_buffer::accessible(pointer, SecurityQualityOfService::SIZE, mode, false) {
         return 0xC000_0005;
     }
     // ObCaptureObjectCreateInformation consome os campos, mas ignora Length.
-    if guest::read8(pointer + 8) > 1 {
+    let tracking = match read_field::<u8>(pointer, offset_of!(SecurityQualityOfService, context_tracking_mode)) {
+        Ok(tracking) => tracking,
+        Err(status) => return status,
+    };
+    if tracking > 1 {
         return 0xC000_000D;
     }
-    if guest::read32(pointer + 4) > 3 { 0xC000_00A5 } else { 0 }
+    match read_field::<u32>(pointer, offset_of!(SecurityQualityOfService, impersonation_level)) {
+        Ok(level) if level > 3 => 0xC000_00A5,
+        Ok(_) => 0,
+        Err(status) => status,
+    }
 }
 
 pub fn listener(attributes: u64, required: Option<&SecurityPolicy>, mode: u8) -> Result<Target, u32> {
@@ -74,23 +86,23 @@ pub fn listener(attributes: u64, required: Option<&SecurityPolicy>, mode: u8) ->
     if mode != 0 && attributes & 7 != 0 {
         return Err(0x8000_0002);
     }
-    if !message_buffer::accessible(attributes, 48, mode, false) {
+    if !message_buffer::accessible(attributes, ObjectAttributes::SIZE, mode, false) {
         return Err(0xC000_0005);
     }
-    if guest::read32(attributes) != 48 {
+    if read_field::<u32>(attributes, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
         return Err(0xC000_000D);
     }
-    let flags = guest::read32(attributes + 24);
+    let flags = read_field::<u32>(attributes, offset_of!(ObjectAttributes, attributes))?;
     if flags & !0x1_1F72 != 0 {
         return Err(0xC000_000D);
     }
-    descriptor(guest::read64(attributes + 32), mode)?;
-    let quality_status = quality(guest::read64(attributes + 40), mode);
+    descriptor(read_field::<u64>(attributes, offset_of!(ObjectAttributes, security_descriptor))?, mode)?;
+    let quality_status = quality(read_field::<u64>(attributes, offset_of!(ObjectAttributes, security_quality_of_service))?, mode);
     if quality_status != 0 {
         return Err(quality_status);
     }
-    let root = guest::read64(attributes + 8);
-    let name_pointer = guest::read64(attributes + 16);
+    let root = read_field::<u64>(attributes, offset_of!(ObjectAttributes, root_directory))?;
+    let name_pointer = read_field::<u64>(attributes, offset_of!(ObjectAttributes, object_name))?;
     if name_pointer == 0 {
         return Err(if root != 0 { 0xC000_0033 } else { 0xC000_003B });
     }

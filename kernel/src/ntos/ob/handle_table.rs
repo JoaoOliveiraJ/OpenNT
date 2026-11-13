@@ -7,15 +7,20 @@
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ex::push_lock;
 use crate::ntos::ke::{critical_region, dispatcher};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES;
+use crate::ntos::inc::types::{HandleTable, HandleTableEntry, ListEntry, ObjectHeader};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
-const HANDLE_TABLE_SIZE: u64 = 0x80;
 pub const MAXIMUM_HANDLE_VALUE: u32 = 0x7FFF_FFFC;
+
+/// Distância do corpo ao início do OBJECT_HEADER (`Body` em +0x30).
+const OBJECT_HEADER_BODY: u64 = core::mem::offset_of!(ObjectHeader, body) as u64;
 
 /// Linha publicada: identidade, atributos e direitos de um handle.
 #[derive(Clone, Debug)]
@@ -68,22 +73,33 @@ static NEXT_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 
 static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry { tables: BTreeMap::new(), list_head: 0 });
 
-fn cas64(pointer: u64, expected: u64, replacement: u64) -> u64 {
-    guest::compare_exchange64(pointer, expected, replacement).unwrap_or_else(|error| panic!("{error}"))
+/// A HANDLE_TABLE de `address` (alocada por `create`, viva no registro).
+fn table_at(address: u64) -> &'static HandleTable {
+    // SAFETY: só endereços de tabelas criadas por `create`.
+    unsafe { HandleTable::at(address) }
 }
 
-fn read_entry_word(address: u64) -> u64 {
-    cas64(address, 0, 0)
+/// A entrada de `address` (folhas alocadas por `grow`, nunca liberadas
+/// antes da tabela).
+fn entry_at(address: u64) -> &'static HandleTableEntry {
+    // SAFETY: endereço de slot calculado por `slot_entry`.
+    unsafe { HandleTableEntry::at(address) }
 }
 
-fn store_entry_word(address: u64, value: u64) {
-    let mut previous = read_entry_word(address);
-    loop {
-        let observed = cas64(address, previous, value);
-        if observed == previous {
-            return;
-        }
-        previous = observed;
+/// Palavra baixa da entrada (LowValue), lida de forma atômica.
+fn read_entry_word(entry: &HandleTableEntry) -> u64 {
+    entry.volatile_low_value.atomic().load(Ordering::SeqCst) as u64
+}
+
+/// Troca atômica da palavra baixa da entrada.
+fn store_entry_word(entry: &HandleTableEntry, value: u64) {
+    entry.volatile_low_value.atomic().swap(value as i64, Ordering::SeqCst);
+}
+
+/// LOCK CMPXCHG na palavra baixa; devolve o valor anterior.
+fn cas_entry_word(entry: &HandleTableEntry, expected: u64, replacement: u64) -> u64 {
+    match entry.volatile_low_value.atomic().compare_exchange(expected as i64, replacement as i64, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous as u64,
     }
 }
 
@@ -113,17 +129,18 @@ impl Table {
         let index = (handle / 2) as usize;
         self.free_links[index] = self.last_free;
         self.free_links[index + 1] = 0;
+        let free_list = &table_at(self.pointer).free_lists[0];
         if self.last_free != 0 {
             self.free_links[(self.last_free / 2 + 1) as usize] = handle;
-            guest::write64(self.slot_entry(self.last_free) + 8, entry);
+            entry_at(self.slot_entry(self.last_free)).next_free_handle_entry.set(entry);
         } else {
             self.first_free = handle;
-            guest::write64(self.pointer + 0x48, entry);
+            free_list.first_free_handle_entry.set(entry);
         }
         self.last_free = handle;
         self.free_count += 1;
-        guest::write64(entry + 8, 0);
-        guest::write64(self.pointer + 0x50, entry);
+        entry_at(entry).next_free_handle_entry.set(0);
+        free_list.last_free_handle_entry.set(entry);
     }
 
     /// Retira um slot da lista livre, validando os dois vizinhos.
@@ -136,19 +153,20 @@ impl Table {
         if self.free_count == 0 || !linked || !linked_next {
             return Err(KernelError::new("handle slot is not free"));
         }
+        let free_list = &table_at(self.pointer).free_lists[0];
         let next_entry = if next != 0 { self.slot_entry(next) } else { 0 };
         if previous != 0 {
             self.free_links[(previous / 2 + 1) as usize] = next;
-            guest::write64(self.slot_entry(previous) + 8, next_entry);
+            entry_at(self.slot_entry(previous)).next_free_handle_entry.set(next_entry);
         } else {
             self.first_free = next;
-            guest::write64(self.pointer + 0x48, next_entry);
+            free_list.first_free_handle_entry.set(next_entry);
         }
         if next != 0 {
             self.free_links[(next / 2) as usize] = previous;
         } else {
             self.last_free = previous;
-            guest::write64(self.pointer + 0x50, if previous != 0 { self.slot_entry(previous) } else { 0 });
+            free_list.last_free_handle_entry.set(if previous != 0 { self.slot_entry(previous) } else { 0 });
         }
         self.free_links[index] = 0;
         self.free_links[index + 1] = 0;
@@ -191,17 +209,20 @@ impl Table {
             }
             return Err(error);
         }
+        // Páginas intermediária e de topo: vetores de 512 ponteiros.
+        // SAFETY: páginas recém-alocadas por `allocate_storage` (4 KiB cada).
+        let pointers = |page: u64| unsafe { Field::<u64>::array_at(page, 512) };
         if needed > 1 {
             for index in self.leaves.len()..needed {
-                guest::write64(directories[index / 512] + ((index % 512) * 8) as u64, leaves[index]);
+                pointers(directories[index / 512])[index % 512].set(leaves[index]);
             }
         }
         if needed > 1 && self.directories.is_empty() {
-            guest::write64(directories[0], leaves[0]);
+            pointers(directories[0])[0].set(leaves[0]);
         }
         if top != 0 {
             for (index, &directory) in directories.iter().enumerate() {
-                guest::write64(top + index as u64 * 8, directory);
+                pointers(top)[index].set(directory);
             }
         }
         let old_count = self.leaves.len();
@@ -215,19 +236,20 @@ impl Table {
         for page in old_count..needed {
             for slot in 1..256u32 {
                 let handle = page as u32 * 1024 + slot * 4;
-                self.append_free(handle, self.leaves[page] + slot as u64 * 16);
+                self.append_free(handle, self.leaves[page] + slot as u64 * HandleTableEntry::SIZE);
             }
         }
         let code = if top != 0 { top + 2 } else if needed > 1 { self.directories[0] + 1 } else { self.leaves[0] };
-        store_entry_word(self.pointer + 8, code);
-        guest::write32(self.pointer, needed as u32 * 1024);
+        let table = table_at(self.pointer);
+        table.table_code.atomic().swap(code, Ordering::SeqCst);
+        table.next_handle_needing_pool.set(needed as u32 * 1024);
         Ok(())
     }
 }
 
 /// Cria a tabela vazia de um processo e a insere na lista global.
 pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
-    let pointer = allocate_storage(HANDLE_TABLE_SIZE, false)?;
+    let pointer = allocate_storage(HandleTable::SIZE, false)?;
     let mut table = Table {
         pointer,
         process,
@@ -245,9 +267,11 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
     let mut new_head = 0;
     let result = table.grow(1).and_then(|_| {
         if registry.list_head == 0 {
-            new_head = allocate_storage(16, false)?;
-            guest::write64(new_head, new_head);
-            guest::write64(new_head + 8, new_head);
+            new_head = allocate_storage(ListEntry::SIZE, false)?;
+            // SAFETY: alocação nova do tamanho de um LIST_ENTRY.
+            let head = unsafe { ListEntry::at(new_head) };
+            head.flink.set(new_head);
+            head.blink.set(new_head);
         }
         Ok(())
     });
@@ -263,15 +287,18 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
     if new_head != 0 {
         registry.list_head = new_head;
     }
-    guest::write64(pointer + 0x10, process);
-    guest::write32(pointer + 0x28, process_id as u32);
-    let head = registry.list_head;
-    let entry = pointer + 0x18;
-    let tail = guest::read64(head + 8);
-    guest::write64(entry, head);
-    guest::write64(entry + 8, tail);
-    guest::write64(tail, entry);
-    guest::write64(head + 8, entry);
+    let native = table_at(pointer);
+    native.quota_process.set(process);
+    native.unique_process_id.set(process_id as u32);
+    // InsertTailList na lista global de tabelas (sob o registro).
+    // SAFETY: cabeça alocada acima e entradas de tabelas vivas.
+    let head = unsafe { ListEntry::at(registry.list_head) };
+    let entry = &native.handle_table_list;
+    let tail = head.blink.get();
+    entry.flink.set(head.address());
+    entry.blink.set(tail);
+    unsafe { ListEntry::at(tail) }.flink.set(entry.address());
+    head.blink.set(entry.address());
     registry.tables.insert(pointer, table);
     Ok(pointer)
 }
@@ -284,11 +311,12 @@ fn assert_live(table: u64) -> Result<(), KernelError> {
     }
 }
 
-/// Serializa mudanças estruturais (push lock em +0x38) com APCs adiadas.
+/// Serializa mudanças estruturais (HandleTableLock) com APCs adiadas.
 fn with_table_mutation<T>(table: u64, action: impl FnOnce(&mut Table) -> Result<T, KernelError>) -> Result<T, KernelError> {
     assert_live(table)?;
+    let lock = table_at(table).handle_table_lock.address();
     critical_region::with_critical(|| {
-        push_lock::acquire_exclusive(table + 0x38, 0)?;
+        push_lock::acquire_exclusive(lock, 0)?;
         let result = {
             let mut registry = REGISTRY.lock();
             match registry.tables.get_mut(&table) {
@@ -296,16 +324,16 @@ fn with_table_mutation<T>(table: u64, action: impl FnOnce(&mut Table) -> Result<
                 None => Err(KernelError::new("dead native handle table")),
             }
         };
-        push_lock::release_exclusive(table + 0x38, 0)?;
+        push_lock::release_exclusive(lock, 0)?;
         result
     })
 }
 
 /// Codifica o corpo conforme a decodificação nativa de HANDLE_TABLE_ENTRY.
 pub fn encode_object_pointer(pointer: u64, attributes: u32) -> Result<u64, KernelError> {
-    let header = pointer.wrapping_sub(0x30);
+    let header = pointer.wrapping_sub(OBJECT_HEADER_BODY);
     let canonical = (((header << 16) as i64) >> 16) as u64;
-    if pointer < 0x30 || pointer & 15 != 0 || canonical != header {
+    if pointer < OBJECT_HEADER_BODY || pointer & 15 != 0 || canonical != header {
         return Err(KernelError::new("object body cannot be encoded in a native handle entry"));
     }
     // Bit 0 = entrada destravada; os três atributos ocupam seus bits nativos.
@@ -322,11 +350,12 @@ pub fn insert(table: u64, handle: u64, description: &HandleDescription) -> Resul
         }
         owner.grow((handle / 1024) as usize + 1)?;
         let entry = owner.slot_entry(handle);
-        if read_entry_word(entry) != 0 {
+        let native = entry_at(entry);
+        if read_entry_word(native) != 0 {
             return Err(KernelError::new("free native handle entry was modified externally"));
         }
         owner.take_free(handle)?;
-        guest::write64(entry + 8, description.access as u64);
+        native.high_value.set(description.access as i64);
         let row = Row {
             pointer: description.pointer,
             type_name: description.type_name.clone(),
@@ -339,8 +368,8 @@ pub fn insert(table: u64, handle: u64, description: &HandleDescription) -> Resul
             serial: NEXT_SERIAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         };
         owner.rows.insert(handle, row.clone());
-        store_entry_word(entry, low);
-        guest::write32(owner.pointer + 0x58, owner.rows.len() as u32);
+        store_entry_word(native, low);
+        table_at(owner.pointer).free_lists[0].handle_count.set(owner.rows.len() as i32);
         Ok(row)
     })
 }
@@ -356,7 +385,8 @@ fn acquire_entry(table: u64, handle: u32) -> Result<Option<Row>, KernelError> {
         if current != Some(row.serial) {
             return Ok(None);
         }
-        let low = read_entry_word(row.entry);
+        let entry = entry_at(row.entry);
+        let low = read_entry_word(entry);
         if low == 0 {
             return Err(KernelError::new("live native handle entry was deleted externally"));
         }
@@ -364,19 +394,20 @@ fn acquire_entry(table: u64, handle: u32) -> Result<Option<Row>, KernelError> {
             dispatcher::pump_kernel();
             continue;
         }
-        if cas64(row.entry, low, low - 1) == low {
+        if cas_entry_word(entry, low, low - 1) == low {
             return Ok(Some(row));
         }
     }
 }
 
 fn unlock_entry(entry: u64) -> Result<(), KernelError> {
+    let entry = entry_at(entry);
     let mut value = read_entry_word(entry);
     loop {
         if value == 0 || value & 1 != 0 {
             return Err(KernelError::new("native handle entry lock ownership lost"));
         }
-        let observed = cas64(entry, value, value + 1);
+        let observed = cas_entry_word(entry, value, value + 1);
         if observed == value {
             return Ok(());
         }
@@ -402,8 +433,10 @@ fn entry_operation<T>(table: u64, handle: u32, empty: T, action: impl FnOnce(&Ro
 pub fn change(table: u64, handle: u64, attributes: u32, access: u32) -> Result<bool, KernelError> {
     let handle = handle_value(handle)?;
     entry_operation(table, handle, false, |row| {
-        guest::write64(row.entry + 8, access as u64);
-        store_entry_word(row.entry, (read_entry_word(row.entry) & !(7 << 17)) | ((attributes & 7) as u64) << 17);
+        let entry = entry_at(row.entry);
+        entry.high_value.set(access as i64);
+        // CAS nos bits Attributes (17..=19); a entrada continua travada.
+        entry.set_attributes((attributes & 7) as u64);
         if let Some(stored) = REGISTRY.lock().tables.get_mut(&table).and_then(|owner| owner.rows.get_mut(&handle)) {
             stored.attributes = attributes;
             stored.access = access;
@@ -424,10 +457,10 @@ pub fn remove(table: u64, handle: u64) -> Result<Option<Row>, KernelError> {
     entry_operation(table, handle, None, |row| {
         let row = row.clone();
         with_table_mutation(table, |owner| {
-            store_entry_word(row.entry, 0);
+            store_entry_word(entry_at(row.entry), 0);
             owner.rows.remove(&handle);
             owner.append_free(handle, row.entry);
-            guest::write32(owner.pointer + 0x58, owner.rows.len() as u32);
+            table_at(owner.pointer).free_lists[0].handle_count.set(owner.rows.len() as i32);
             Ok(())
         })?;
         Ok((Some(row), true))
@@ -440,15 +473,21 @@ pub fn destroy(table: u64) -> Result<(), KernelError> {
     let Some(owner) = registry.tables.get(&table) else {
         return Err(KernelError::new("dead native handle table"));
     };
-    if !owner.rows.is_empty() || read_entry_word(table + 0x38) != 0 || read_entry_word(table + 0x30) != 0 {
+    let native = table_at(table);
+    if !owner.rows.is_empty() || native.handle_table_lock.value.atomic().load(Ordering::SeqCst) != 0 || native.handle_contention_event.value.atomic().load(Ordering::SeqCst) != 0 {
         return Err(KernelError::new("native handle table is still owned"));
     }
-    guest::write32(table + 0x2C, guest::read32(table + 0x2C) | 4);
-    let entry = table + 0x18;
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
+    // Flags.Rundown por CAS: outros bits de Flags não se perdem.
+    native.set_rundown(1);
+    // RemoveEntryList da lista global (sob o registro).
+    let entry = &native.handle_table_list;
+    let next = entry.flink.get();
+    let previous = entry.blink.get();
+    // SAFETY: vizinhos são a cabeça global ou entradas de tabelas vivas.
+    unsafe {
+        ListEntry::at(previous).flink.set(next);
+        ListEntry::at(next).blink.set(previous);
+    }
     let owner = registry.tables.remove(&table).unwrap();
     for &allocation in owner.allocations.iter().rev() {
         guest::free_bytes(allocation);

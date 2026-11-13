@@ -22,7 +22,29 @@ use crate::ntos::ps::process;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{AccessState, Eprocess, ObjectHandleInformation};
 use crate::ntos::mm::guest_memory as guest;
+
+/// UniqueProcessId do EPROCESS.
+fn process_id(process: u64) -> u64 {
+    // SAFETY: EPROCESS vivo (processo reconhecido ou o corrente).
+    unsafe { Eprocess::at(process) }.unique_process_id.get()
+}
+
+/// Registro privado de cada handle aberto por ponteiro (32 bytes).
+#[repr(C)]
+struct HandleBody {
+    object: Field<u64>,
+    granted_access: Field<u32>,
+    flags: Field<u32>,
+    _reserved: Reserved<0x10>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for HandleBody {}
+
+const _: () = assert!(core::mem::size_of::<HandleBody>() == 0x20);
 
 /// Operações de um dono de corpos nativos.
 /// Metadados de ZwQueryObject vindos do registro do dono.
@@ -141,7 +163,7 @@ impl ObjectOwner for ProcessOwner {
         process::with_record(pointer, |record| record.security.clone()).unwrap_or_default()
     }
     fn data(&self, pointer: u64) -> ObjectData {
-        ObjectData { native_pointer: pointer, process_id: Some(guest::read64(pointer + 0x440)), ..ObjectData::default() }
+        ObjectData { native_pointer: pointer, process_id: Some(process_id(pointer)), ..ObjectData::default() }
     }
 }
 
@@ -266,7 +288,7 @@ struct HandleBodies {
 
 impl ObjectHooks for HandleBodies {
     fn on_handle_open(&self) -> Result<(), KernelError> {
-        let body = guest::alloc_bytes(32);
+        let body = guest::alloc_bytes(HandleBody::SIZE);
         if body == 0 {
             return Err(KernelError::with_status("object handle allocation failed", 0xC000_009A));
         }
@@ -281,9 +303,11 @@ impl ObjectHooks for HandleBodies {
             guest::free_bytes(body);
             return Err(error);
         }
-        guest::write64(body, self.item.pointer);
-        guest::write32(body + 8, self.granted);
-        guest::write32(body + 12, self.flags);
+        // SAFETY: alocação nova do tamanho do registro.
+        let record = unsafe { HandleBody::at(body) };
+        record.object.set(self.item.pointer);
+        record.granted_access.set(self.granted);
+        record.flags.set(self.flags);
         self.bodies.lock().push(body);
         Ok(())
     }
@@ -315,7 +339,7 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     if irql::get_irql() > 1 {
         return Err(KernelError::new("ObOpenObjectByPointer above APC_LEVEL"));
     }
-    guest::try_write64(output_handle, 0)?;
+    guest::try_write::<u64>(output_handle, 0)?;
     let Some(item) = describe(pointer) else {
         return Err(KernelError::new(alloc::format!("ObOpenObjectByPointer: invalid native object {pointer:#x}")));
     };
@@ -339,12 +363,15 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     let mut remaining = desired_access;
     let mut previously_granted = 0;
     if access_state != 0 {
-        remaining = guest::read32(access_state + 0x10);
-        previously_granted = guest::read32(access_state + 0x14);
+        // SAFETY: ACCESS_STATE de um chamador de kernel.
+        let state = unsafe { AccessState::at(access_state) };
+        remaining = state.remaining_desired_access.get();
+        previously_granted = state.previously_granted_access.get();
         if enforce {
-            let client = guest::read64(access_state + 0x20);
-            let primary = guest::read64(access_state + 0x30);
-            if client != 0 && guest::read32(access_state + 0x28) < 2 {
+            let subject_context = &state.subject_security_context;
+            let client = subject_context.client_token.get();
+            let primary = subject_context.primary_token.get();
+            if client != 0 && subject_context.impersonation_level.get().0 < 2 {
                 return Ok(0xC000_00A5);
             }
             let token = if client != 0 { client } else { primary };
@@ -387,14 +414,16 @@ fn create(item: &Described, attributes: u32, granted: u32, access_state: u64, re
         Err(error) => return failure(error),
     };
     let handle = if attributes & 0x200 != 0 { 0xFFFF_FFFF_8000_0000 | identifier as u64 } else { identifier as u64 };
-    if let Err(error) = guest::try_write64(output_handle, handle) {
+    if let Err(error) = guest::try_write::<u64>(output_handle, handle) {
         let _ = close(handle);
         return failure(error);
     }
     if access_state != 0 {
-        guest::write32(access_state + 0x14, granted);
-        guest::write32(access_state + 0x10, remaining & !(granted | 0x0200_0000));
-        guest::write8(access_state + 8, 1);
+        // SAFETY: ACCESS_STATE de um chamador de kernel.
+        let state = unsafe { AccessState::at(access_state) };
+        state.previously_granted_access.set(granted);
+        state.remaining_desired_access.set(remaining & !(granted | 0x0200_0000));
+        state.security_evaluated.set(1);
     }
     Outcome { status: 0, granted: Some(granted), value: identifier, error: None }
 }
@@ -460,10 +489,10 @@ pub fn reference_handle(handle: u64, desired_access: u32, object_type: u64, acce
         return Ok(Some(0xC000_0022));
     }
     item.reference();
-    let written = guest::try_write64(output_object, item.pointer).and_then(|_| {
+    let written = guest::try_write::<u64>(output_object, item.pointer).and_then(|_| {
         if output_information != 0 {
-            guest::try_write32(output_information, attributes)?;
-            guest::try_write32(output_information + 4, access)?;
+            guest::try_write::<u32>(output_information + core::mem::offset_of!(ObjectHandleInformation, handle_attributes) as u64, attributes)?;
+            guest::try_write::<u32>(output_information + core::mem::offset_of!(ObjectHandleInformation, granted_access) as u64, access)?;
         }
         Ok(())
     });
@@ -480,7 +509,7 @@ fn user_handle_body(handle: u64) -> Option<(Described, u32, u32)> {
         return None;
     }
     let current = crate::ntos::ps::user::state::with(|state| state.current_process_id);
-    if current != guest::read64(process::get_current_process() + 0x440) {
+    if current != process_id(process::get_current_process()) {
         return None;
     }
     let entry = crate::ntos::ps::user::state::get_user_handle(handle)?;

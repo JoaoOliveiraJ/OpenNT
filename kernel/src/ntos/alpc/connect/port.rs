@@ -7,6 +7,8 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::offset_of;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::alpc::connect::capture as connect_capture;
 use crate::ntos::alpc::connect::parameters as connect_parameters;
@@ -26,8 +28,8 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::alpc as transport;
 use crate::ntos::ps::user::events;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{AlpcDirectAttr, AlpcMessageAttributes, Field, Kthread, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
 
 /// Conexões aguardando a decisão do servidor (porta → pedido).
 static PENDING: SpinLock<Vec<(Arc<Port>, Arc<Request>)>> = SpinLock::new(Vec::new());
@@ -177,7 +179,10 @@ fn capture_attributes(request: &Arc<Request>, pointer: u64, flags: u32, mode: u8
     }
     let port = request.identity.port.clone();
     let identity = &request.identity;
-    let valid = guest::read32(pointer + 4);
+    let valid = match message_buffer::read_field::<u32>(pointer, offset_of!(AlpcMessageAttributes, valid_attributes)) {
+        Ok(valid) => valid,
+        Err(status) => return Ok(status),
+    };
     if valid & 0x8000_0000 != 0 {
         match message_security::capture(&port, transport::attribute_address(pointer, 0x8000_0000), mode)? {
             Err(status) => return Ok(status),
@@ -196,7 +201,10 @@ fn capture_attributes(request: &Arc<Request>, pointer: u64, flags: u32, mode: u8
         if !message_buffer::writable(context, 32, mode) {
             return Ok(0xC000_0005);
         }
-        let captured = context_attribute::capture(context, 0, identity);
+        let captured = match context_attribute::try_capture(context, 0, identity) {
+            Ok(captured) => captured,
+            Err(status) => return Ok(status),
+        };
         request.state.lock().context = captured;
     }
     if valid & 0x0400_0000 != 0 {
@@ -204,7 +212,10 @@ fn capture_attributes(request: &Arc<Request>, pointer: u64, flags: u32, mode: u8
         if status != 0 {
             return Ok(status);
         }
-        let handle = guest::read64(transport::attribute_address(pointer, 0x0400_0000));
+        let handle = match message_buffer::read_field::<u64>(transport::attribute_address(pointer, 0x0400_0000), offset_of!(AlpcDirectAttr, event)) {
+            Ok(handle) => handle,
+            Err(status) => return Ok(status),
+        };
         if mode != 0 {
             match events::reference(handle, 2) {
                 Err(status) => return Ok(status),
@@ -248,14 +259,14 @@ fn leave_region(shared: &Shared) -> Result<(), KernelError> {
     if process::get_current_thread() == caller {
         return critical_region::leave_critical();
     }
-    // O cancelamento pode vir de outra thread: devolve o contador ao dono;
-    // as APCs são entregues no próximo despacho dessa thread.
-    let address = caller + kthread::KERNEL_APC_DISABLE;
-    let previous = guest::read16(address) as i16;
-    if previous >= 0 {
-        return Err(KernelError::new("unbalanced ALPC connection critical region"));
-    }
-    guest::write16(address, (previous + 1) as u16);
+    // O cancelamento pode vir de outra thread: devolve o contador ao dono
+    // (atômico: a thread dona mexe no mesmo contador); as APCs são entregues
+    // no próximo despacho dessa thread.
+    // SAFETY: KTHREAD do chamador da conexão, retido enquanto a conexão vive.
+    let counter = unsafe { Kthread::at(caller) }.kernel_apc_disable.atomic();
+    counter
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |previous| (previous < 0).then(|| previous + 1))
+        .map_err(|_| KernelError::new("unbalanced ALPC connection critical region"))?;
     Ok(())
 }
 
@@ -304,7 +315,9 @@ fn publish(shared: &Shared) -> u32 {
     if !message_buffer::writable(connection.output, 8, connection.mode) {
         return 0xC000_0005;
     }
-    guest::write64(connection.output, connection.handle.unwrap_or(0));
+    if let Err(status) = message_buffer::write_field::<u64>(connection.output, 0, connection.handle.unwrap_or(0)) {
+        return status;
+    }
     connection.committed = true;
     if let Some(port) = connection.port.clone() {
         if port.with(|state| state.creation_flags) & 0x10 != 0 {
@@ -441,14 +454,15 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
         let Some(named) = object_manager::insert_named(parent, &creation.leaf, "AlpcPort", None, creation.insensitive) else { return completed(0xC000_0035) };
         port.with(|state| state.named_node = Some(named));
     }
-    let scratch = guest::alloc_bytes(8);
+    let scratch = guest::alloc_bytes(Field::<u64>::SIZE);
     if scratch == 0 {
         return completed(0xC000_009A);
     }
     // A inserção concede o acesso da criação; a DACL regula aberturas posteriores.
     let type_pointer = object_types::user_type("alpc").map_or(0, |object_type| object_type.pointer);
     let opened = open_pointer::open(port.pointer, creation.flags & 0x222, 0, 0x1F_0001, type_pointer, 0, scratch);
-    let handle = guest::read64(scratch);
+    // SAFETY: célula alocada acima, liberada logo depois.
+    let handle = unsafe { Field::<u64>::at(scratch) }.get();
     guest::free_bytes(scratch);
     let status = opened?;
     if status != 0 {

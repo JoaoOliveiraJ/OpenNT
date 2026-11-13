@@ -2155,11 +2155,11 @@ fn ob_group_exports(assert: Assert) {
     call_export("ObReferenceObject", &[device]);
     call_export("ObDereferenceObject", &[device]);
     assert(device_objects::reference_count(device) == Some(before) && status(call_export("ObReferenceObjectByName", &[unicode_at(block + 0x200, "\\Device\\NaoExiste"), 0x40, 0, 0, 0, 0, 0, output])) == 0xC000_0034, "ob: referencias equilibradas e nome ausente");
-    // Nome do objeto.
+    // Nome do objeto: OBJECT_NAME_INFORMATION com o texto logo depois da
+    // estrutura; ReturnLength conta estrutura, texto e terminador.
     let unicode = block + 0x300;
-    at::<nt::ObjectNameInformation>(unicode).name.buffer.set(block + 0x400);
     let queried = call_export("ObQueryNameString", &[device, unicode, 0x200, block + 0xF10]);
-    assert(status(queried) == 0 && guest_strings_read(unicode) == "\\Device\\OpenNtObTest" && guest::read32(block + 0xF10) == 42 && status(call_export("ObQueryNameString", &[device, unicode, 8, block + 0xF10])) == 0xC000_0004, "ob: ObQueryNameString devolve o caminho completo");
+    assert(status(queried) == 0 && guest_strings_read(unicode) == "\\Device\\OpenNtObTest" && at::<nt::ObjectNameInformation>(unicode).name.buffer.get() == unicode + nt::ObjectNameInformation::SIZE && guest::read32(block + 0xF10) == nt::ObjectNameInformation::SIZE as u32 + 42 && status(call_export("ObQueryNameString", &[device, unicode, 8, block + 0xF10])) == 0xC000_0004, "ob: ObQueryNameString devolve o caminho completo");
     // Driver por nome: referência e handle pelo dono dos drivers.
     let driver_name = unicode_at(block + 0x500, "\\Driver\\opennt-ob");
     let driver_reference = call_export("ObReferenceObjectByName", &[driver_name, 0x40, 0, 0, 0, 0, 0, output]);

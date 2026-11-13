@@ -6,24 +6,32 @@
 //! arquivos abertos.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ob::objects::driver as driver_objects;
 use crate::ntos::ob::object_types;
 use crate::hal::cpu;
 use crate::ntos::ke::{irql, pcr};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{DeviceObject, DevobjExtension, DriverObject, Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
-const EXTENSION_OFFSET: u64 = 0x138;
-const ATTACHED_DEVICE: u64 = 0x18;
-const NEXT_DEVICE: u64 = 0x10;
-const FLAGS: u64 = 0x30;
-const STACK_SIZE: u64 = 0x4C;
-const ALIGNMENT: u64 = 0x98;
-const SECTOR_SIZE: u64 = 0x130;
-const SPARE: u64 = 0x132;
-const EXTENSION_FLAGS: u64 = 0x20;
-const ATTACHED_TO: u64 = 0x30;
+/// IO_TYPE_DEVICE_OBJECT_EXTENSION.
+const IO_TYPE_DEVICE_OBJECT_EXTENSION: i16 = 13;
+/// DO_DEVICE_INITIALIZING.
+const DO_DEVICE_INITIALIZING: u32 = 0x80;
+
+/// O DEVICE_OBJECT de `pointer` (dispositivo vivo de um driver).
+fn device(pointer: u64) -> &'static DeviceObject {
+    // SAFETY: os chamadores passam DEVICE_OBJECTs vivos.
+    unsafe { DeviceObject::at(pointer) }
+}
+
+/// A DEVOBJ_EXTENSION ligada por `register`.
+fn device_extension(pointer: u64) -> &'static DevobjExtension {
+    // SAFETY: extensões alocadas por `register`, vivas enquanto o dispositivo.
+    unsafe { DevobjExtension::at(pointer) }
+}
 
 struct Record {
     extension: u64,
@@ -43,11 +51,12 @@ static DATABASE_LOCK: SpinLock<u64> = SpinLock::new(0);
 fn database_lock() -> Result<u64, KernelError> {
     let mut lock = DATABASE_LOCK.lock();
     if *lock == 0 {
-        let pointer = guest::alloc_bytes(8);
+        let pointer = guest::alloc_bytes(Field::<u64>::SIZE);
         if pointer == 0 {
             return Err(KernelError::new("I/O database lock allocation failed"));
         }
-        guest::write64(pointer, 0);
+        // SAFETY: alocação nova de um KSPIN_LOCK.
+        unsafe { Field::<u64>::at(pointer) }.set(0);
         pcr::set_io_database_lock(pointer);
         *lock = pointer;
     }
@@ -59,13 +68,14 @@ pub fn with_lock<T>(operation: impl FnOnce() -> Result<T, KernelError>) -> Resul
     if irql::get_irql() > 2 {
         return Err(KernelError::new("I/O database access above DISPATCH_LEVEL"));
     }
-    let lock = database_lock()?;
+    // SAFETY: KSPIN_LOCK alocado por `database_lock`, nunca liberado.
+    let lock = unsafe { Field::<u64>::at(database_lock()?) }.atomic();
     let previous = irql::raise_irql(2);
-    while guest::compare_exchange64(lock, 0, 1)? != 0 {
+    while lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
         cpu::pause();
     }
     let result = operation();
-    let _ = guest::compare_exchange64(lock, 1, 0);
+    lock.store(0, Ordering::Release);
     irql::lower_irql(previous as u64);
     result
 }
@@ -77,15 +87,16 @@ pub fn register(pointer: u64, destroy: Option<fn(u64)>, unlink: Option<fn(u64)>)
         return Err(KernelError::new("device already registered"));
     }
     database_lock()?;
-    let extension = guest::alloc_bytes(0x70);
+    let extension = guest::alloc_bytes(DevobjExtension::SIZE);
     if extension == 0 {
         return Err(KernelError::new("device extension allocation failed"));
     }
-    guest::write16(extension, 13);
-    guest::write16(extension + 2, 0x70);
-    guest::write64(extension + 8, pointer);
-    guest::write64(pointer + EXTENSION_OFFSET, extension);
-    let driver = guest::read64(pointer + 8);
+    let object_extension = device_extension(extension);
+    object_extension.type_.set(IO_TYPE_DEVICE_OBJECT_EXTENSION);
+    object_extension.size.set(DevobjExtension::SIZE as u16);
+    object_extension.device_object.set(pointer);
+    device(pointer).device_object_extension.set(extension);
+    let driver = device(pointer).driver_object.get();
     let held = driver != 0 && driver_objects::reference(driver).is_some();
     DEVICES.lock().insert(pointer, Record { extension, references: 1, retired: false, destroy, unlink, unlinked: false, driver, held });
     object_types::device_type();
@@ -115,7 +126,7 @@ fn collect(pointer: u64) {
     let (extension, unlink) = {
         let mut devices = DEVICES.lock();
         let Some(record) = devices.get_mut(&pointer) else { return };
-        if !record.retired || guest::read32(pointer + 4) > 1 || guest::read64(pointer + ATTACHED_DEVICE) != 0 || guest::read64(record.extension + ATTACHED_TO) != 0 {
+        if !record.retired || device(pointer).reference_count.get() > 1 || device(pointer).attached_device.get() != 0 || device_extension(record.extension).attached_to.get() != 0 {
             return;
         }
         let unlink = if record.unlinked {
@@ -173,7 +184,8 @@ pub fn retire(pointer: u64) -> Result<bool, KernelError> {
         let mut devices = DEVICES.lock();
         let record = devices.get_mut(&pointer).unwrap();
         record.retired = true;
-        guest::write32(extension + EXTENSION_FLAGS, guest::read32(extension + EXTENSION_FLAGS) | 2);
+        // DOE_DELETE_PENDING (sob o lock da base, e atômico para os demais bits).
+        device_extension(extension).extension_flags.atomic().fetch_or(2, Ordering::SeqCst);
         record.references -= 1;
         Ok(())
     })?;
@@ -187,14 +199,14 @@ pub fn changed(pointer: u64) {
 }
 
 pub fn extension(pointer: u64) -> u64 {
-    guest::read64(pointer + EXTENSION_OFFSET)
+    device(pointer).device_object_extension.get()
 }
 
 /// AttachedDevice até o topo da pilha.
 pub fn top(pointer: u64) -> u64 {
     let mut pointer = pointer;
     loop {
-        let next = guest::read64(pointer + ATTACHED_DEVICE);
+        let next = device(pointer).attached_device.get();
         if next == 0 {
             return pointer;
         }
@@ -206,7 +218,7 @@ pub fn top(pointer: u64) -> u64 {
 pub fn base(pointer: u64) -> u64 {
     let mut pointer = pointer;
     loop {
-        let next = guest::read64(extension(pointer) + ATTACHED_TO);
+        let next = device_extension(extension(pointer)).attached_to.get();
         if next == 0 {
             return pointer;
         }
@@ -231,35 +243,40 @@ pub fn attached_reference(pointer: u64, lowest: bool) -> Result<u64, KernelError
 pub fn attach(source: u64, target: u64, output: u64) -> Result<u64, KernelError> {
     with_lock(|| {
         let lower = top(target);
-        let source_extension = extension(source);
-        let lower_extension = extension(lower);
-        if source == lower || guest::read64(source_extension + ATTACHED_TO) != 0 || guest::read64(source + ATTACHED_DEVICE) != 0 {
+        let (source_device, lower_device) = (device(source), device(lower));
+        let source_extension = device_extension(extension(source));
+        let lower_extension = device_extension(extension(lower));
+        if source == lower || source_extension.attached_to.get() != 0 || source_device.attached_device.get() != 0 {
             return Err(KernelError::new("invalid device attachment"));
         }
-        if guest::read32(lower_extension + EXTENSION_FLAGS) & 0xF != 0 || guest::read32(lower + FLAGS) & 0x80 != 0 || guest::read8(lower + STACK_SIZE) >= 0x7D {
-            if output != 0 {
-                guest::write64(output, 0);
+        // SAFETY: PDEVICE_OBJECT* AttachedToDeviceObject de um chamador de kernel.
+        let output = (output != 0).then(|| unsafe { Field::<u64>::at(output) });
+        if lower_extension.extension_flags.get() & 0xF != 0 || lower_device.flags.get() & DO_DEVICE_INITIALIZING != 0 || lower_device.stack_size.get() as u8 >= 0x7D {
+            if let Some(output) = output {
+                output.set(0);
             }
             return Ok(0);
         }
         // O inferior vai para a saída antes de expor `source` ao despacho.
-        if output != 0 {
-            guest::write64(output, lower);
+        if let Some(output) = output {
+            output.set(lower);
         }
-        guest::write8(source + STACK_SIZE, guest::read8(lower + STACK_SIZE) + 1);
-        guest::write32(source + ALIGNMENT, guest::read32(lower + ALIGNMENT));
-        guest::write16(source + SECTOR_SIZE, guest::read16(lower + SECTOR_SIZE));
-        if guest::read32(lower_extension + EXTENSION_FLAGS) & 0x10 != 0 {
-            guest::write32(source_extension + EXTENSION_FLAGS, guest::read32(source_extension + EXTENSION_FLAGS) | 0x10);
+        source_device.stack_size.set((lower_device.stack_size.get() as u8).wrapping_add(1) as i8);
+        source_device.alignment_requirement.set(lower_device.alignment_requirement.get());
+        source_device.sector_size.set(lower_device.sector_size.get());
+        // Bits copiados do inferior por OR atômico: drivers mexem nos mesmos
+        // flags sem o lock da base.
+        if lower_extension.extension_flags.get() & 0x10 != 0 {
+            source_extension.extension_flags.atomic().fetch_or(0x10, Ordering::SeqCst);
         }
-        if guest::read32(lower + FLAGS) & 0x0800_0000 != 0 {
-            guest::write32(source + FLAGS, guest::read32(source + FLAGS) | 0x0800_0000);
+        if lower_device.flags.get() & 0x0800_0000 != 0 {
+            source_device.flags.atomic().fetch_or(0x0800_0000, Ordering::SeqCst);
         }
-        if guest::compare_exchange64(lower + ATTACHED_DEVICE, 0, source)? != 0 {
+        if lower_device.attached_device.atomic().compare_exchange(0, source, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return Err(KernelError::new("device attachment changed outside I/O lock"));
         }
-        guest::write16(lower + SPARE, guest::read16(lower + SPARE) + 1);
-        guest::write64(source_extension + ATTACHED_TO, lower);
+        lower_device.spare1.atomic().fetch_add(1, Ordering::SeqCst);
+        source_extension.attached_to.set(lower);
         Ok(lower)
     })
 }
@@ -268,10 +285,10 @@ pub fn attach(source: u64, target: u64, output: u64) -> Result<u64, KernelError>
 /// elemento intermediário) e reavalia a exclusão dos dois lados.
 pub fn detach(target: u64) -> Result<u64, KernelError> {
     let upper = with_lock(|| {
-        let upper = guest::read64(target + ATTACHED_DEVICE);
+        let upper = device(target).attached_device.get();
         if upper != 0 {
-            guest::write64(target + ATTACHED_DEVICE, 0);
-            guest::write64(extension(upper) + ATTACHED_TO, 0);
+            device(target).attached_device.set(0);
+            device_extension(extension(upper)).attached_to.set(0);
         }
         Ok(upper)
     })?;
@@ -285,11 +302,11 @@ pub fn detach(target: u64) -> Result<u64, KernelError> {
 /// IoGetLowerDeviceObject: retém o inferior quando os flags permitem.
 pub fn get_lower(pointer: u64) -> Result<u64, KernelError> {
     with_lock(|| {
-        let device_extension = guest::read64(pointer + EXTENSION_OFFSET);
-        if guest::read32(device_extension + EXTENSION_FLAGS) & 0xE != 0 {
+        let object_extension = device_extension(extension(pointer));
+        if object_extension.extension_flags.get() & 0xE != 0 {
             return Ok(0);
         }
-        let lower = guest::read64(device_extension + ATTACHED_TO);
+        let lower = object_extension.attached_to.get();
         if lower != 0 && reference(lower)?.is_none() {
             return Err(KernelError::new("lower device is not an owned object"));
         }
@@ -301,22 +318,28 @@ pub fn get_lower(pointer: u64) -> Result<u64, KernelError> {
 /// retém os dispositivos que cabem na saída.
 pub fn enumerate(driver: u64, output: u64, buffer_length: u32, count_output: u64) -> Result<u32, KernelError> {
     let capacity = buffer_length >> 3;
+    // SAFETY: DRIVER_OBJECT vivo do chamador.
+    let driver = unsafe { DriverObject::at(driver) };
     with_lock(|| {
         let mut count = 0u32;
-        let mut device = guest::read64(driver + 8);
-        while device != 0 {
+        let mut current = driver.device_object.get();
+        while current != 0 {
             count += 1;
-            device = guest::read64(device + NEXT_DEVICE);
+            current = device(current).next_device.get();
         }
-        guest::write32(count_output, count);
-        device = guest::read64(driver + 8);
+        // SAFETY: PULONG ActualNumberDeviceObjects de um chamador de kernel.
+        unsafe { Field::<u32>::at(count_output) }.set(count);
+        // SAFETY: vetor PDEVICE_OBJECT[capacity] do mesmo chamador.
+        let filled = capacity.min(count) as usize;
+        let list: &[Field<u64>] = if filled != 0 { unsafe { Field::<u64>::array_at(output, filled) } } else { &[] };
+        current = driver.device_object.get();
         let mut index = 0;
-        while device != 0 && index < capacity {
-            if reference(device)?.is_none() {
+        while current != 0 && index < capacity {
+            if reference(current)?.is_none() {
                 return Err(KernelError::new("enumerated device is not an owned object"));
             }
-            guest::write64(output + index as u64 * 8, device);
-            device = guest::read64(device + NEXT_DEVICE);
+            list[index as usize].set(current);
+            current = device(current).next_device.get();
             index += 1;
         }
         Ok(if capacity < count { 0xC000_0023 } else { 0 })

@@ -1,8 +1,9 @@
 //! ObRegisterCallbacks.
 //!
-//! Registra callbacks de objetos e mantém as listas nativas (OBJECT_TYPE +
-//! 0xC8) ordenadas por altitude. A confiança vem do registro da imagem no
-//! carregador (LoaderFlags 0x20); os flags do cabeçalho PE não bastam.
+//! Registra callbacks de objetos e mantém as listas nativas
+//! (OBJECT_TYPE.CallbackList) ordenadas por altitude. A confiança vem do
+//! registro da imagem no carregador (LoaderFlags 0x20); os flags do
+//! cabeçalho PE não bastam.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -18,7 +19,70 @@ use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::mm::{kernel_pool, loaded_images};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{self as nt, ExRundownRef, ListEntry, ObCallbackRegistration, ObOperationRegistration, ObPostOperationInformation, ObPostOperationParameters, ObPreOperationInformation, ObPreOperationParameters, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
+
+/// Bloco devolvido por ObRegisterCallbacks como handle do registro. Os
+/// itens seguem o cabeçalho e entram na CallbackList do OBJECT_TYPE, que
+/// drivers podem percorrer: o layout é o do NT.
+#[repr(C)]
+struct RegistrationBlock {
+    version: Field<u16>,
+    operation_registration_count: Field<u16>,
+    _pad_4: Reserved<4>,
+    registration_context: Field<u64>,
+    altitude: UnicodeString,
+}
+
+/// Item de callback de um tipo (um por OB_OPERATION_REGISTRATION).
+#[repr(C)]
+struct CallbackEntryItem {
+    entry_item_list: ListEntry,
+    operations: Field<u32>,
+    active: Field<u32>,
+    /// -> `RegistrationBlock`
+    registration: Field<u64>,
+    /// -> `_OBJECT_TYPE`
+    object_type: Field<u64>,
+    pre_operation: Field<u64>,
+    post_operation: Field<u64>,
+    rundown: ExRundownRef,
+}
+
+/// Informação entregue aos callbacks: a PRE ocupa os primeiros 0x28 bytes
+/// da POST (mesma memória) e os parâmetros vêm logo depois.
+#[repr(C)]
+struct OperationBlock {
+    information: ObPostOperationInformation,
+    parameters: ObPreOperationParameters,
+}
+
+// SAFETY: #[repr(C)] só de células (Field/Reserved/NtStruct).
+unsafe impl NtStruct for RegistrationBlock {}
+unsafe impl NtStruct for CallbackEntryItem {}
+unsafe impl NtStruct for OperationBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegistrationBlock>() == 0x20);
+    assert!(core::mem::offset_of!(RegistrationBlock, altitude) == 0x10);
+    assert!(core::mem::size_of::<CallbackEntryItem>() == 0x40);
+    assert!(core::mem::offset_of!(CallbackEntryItem, operations) == 0x10);
+    assert!(core::mem::offset_of!(CallbackEntryItem, registration) == 0x18);
+    assert!(core::mem::offset_of!(CallbackEntryItem, rundown) == 0x38);
+    assert!(core::mem::size_of::<OperationBlock>() == 0x48);
+    assert!(core::mem::offset_of!(OperationBlock, parameters) == 0x30);
+};
+
+fn entry_item(pointer: u64) -> &'static CallbackEntryItem {
+    // SAFETY: itens alocados por `register`, vivos enquanto o registro existe.
+    unsafe { CallbackEntryItem::at(pointer) }
+}
+
+/// Célula de rundown do item (protege a execução dos callbacks).
+fn rundown_of(pointer: u64) -> u64 {
+    entry_item(pointer).rundown.address()
+}
 
 #[derive(Clone)]
 struct Entry {
@@ -82,16 +146,19 @@ pub fn compare_altitude(left: &str, right: &str) -> Ordering {
     Ordering::Equal
 }
 
-/// Reescreve os links da lista nativa do OBJECT_TYPE (sentinela em +0xC8).
+/// Reescreve os links da lista nativa do OBJECT_TYPE (sentinela CallbackList).
 fn synchronize_type_list(state: &State, type_pointer: u64) {
     let empty = Vec::new();
     let entries = state.by_type.get(&type_pointer).unwrap_or(&empty);
-    let head = type_pointer + 0xC8;
-    guest::write64(head, entries.first().map_or(head, |entry| entry.pointer));
-    guest::write64(head + 8, entries.last().map_or(head, |entry| entry.pointer));
+    // SAFETY: tipos registrados em `object_types` vivem até o desligamento.
+    let list = &unsafe { nt::ObjectType::at(type_pointer) }.callback_list;
+    let head = list.address();
+    list.flink.set(entries.first().map_or(head, |entry| entry.pointer));
+    list.blink.set(entries.last().map_or(head, |entry| entry.pointer));
     for (index, entry) in entries.iter().enumerate() {
-        guest::write64(entry.pointer, entries.get(index + 1).map_or(head, |next| next.pointer));
-        guest::write64(entry.pointer + 8, if index > 0 { entries[index - 1].pointer } else { head });
+        let links = &entry_item(entry.pointer).entry_item_list;
+        links.flink.set(entries.get(index + 1).map_or(head, |next| next.pointer));
+        links.blink.set(if index > 0 { entries[index - 1].pointer } else { head });
     }
 }
 
@@ -104,49 +171,57 @@ fn belongs_to_verified_image(pointer: u64) -> bool {
 /// da publicação de todas as entradas.
 pub fn register(registration: u64, output_handle: u64) -> Result<u32, KernelError> {
     require_callback_level()?;
-    let version = guest::read16(registration);
-    let count = guest::read16(registration + 2) as u64;
+    // SAFETY: OB_CALLBACK_REGISTRATION de um chamador de kernel.
+    let registration = unsafe { ObCallbackRegistration::at(registration) };
+    let version = registration.version.get();
+    let count = registration.operation_registration_count.get() as u64;
     if version & 0xFF00 != 0x100 || count == 0 {
         return Ok(0xC000_000D);
     }
-    let length = guest::read16(registration + 8) as u64;
-    let buffer = guest::read64(registration + 16);
-    // Cabeçalho, entradas de 64 bytes e texto da altitude numa alocação paginável.
-    let pointer = kernel_pool::allocate(32 + count * 64 + length, kernel_pool::AllocateOptions { paged: true, tag: 0x6C46_624F, zero: true, ..Default::default() })?;
+    let length = registration.altitude.length.get() as u64;
+    let buffer = registration.altitude.buffer.get();
+    // Cabeçalho, itens e texto da altitude numa alocação paginável.
+    let pointer = kernel_pool::allocate(RegistrationBlock::SIZE + count * CallbackEntryItem::SIZE + length, kernel_pool::AllocateOptions { paged: true, tag: 0x6C46_624F, zero: true, ..Default::default() })?;
     if pointer == 0 {
         return Ok(0xC000_009A);
     }
-    let altitude_pointer = pointer + 32 + count * 64;
-    let context = guest::read64(registration + 24);
-    guest::write16(pointer, 0x100);
-    guest::write64(pointer + 8, context);
-    guest::write16(pointer + 16, length as u16);
-    guest::write16(pointer + 18, length as u16);
-    guest::write64(pointer + 24, altitude_pointer);
-    for offset in 0..length {
-        guest::write8(altitude_pointer + offset, guest::read8(buffer + offset));
-    }
-    let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(altitude_pointer + index * 2)).collect();
+    // SAFETY: alocação nova do tamanho do cabeçalho, dos itens e do texto.
+    let block = unsafe { RegistrationBlock::at(pointer) };
+    let altitude_pointer = pointer + RegistrationBlock::SIZE + count * CallbackEntryItem::SIZE;
+    let context = registration.registration_context.get();
+    block.version.set(0x100);
+    block.registration_context.set(context);
+    block.altitude.length.set(length as u16);
+    block.altitude.maximum_length.set(length as u16);
+    block.altitude.buffer.set(altitude_pointer);
+    let text = guest::read_bytes(buffer, length as usize);
+    guest::write_bytes(altitude_pointer, &text);
+    let units: Vec<u16> = text.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
     let altitude = String::from_utf16_lossy(&units);
-    let operations = guest::read64(registration + 32);
+    let operations = registration.operation_registration.get();
     let mut created: Vec<u64> = Vec::new();
     let mut status = 0;
     let mut state = STATE.lock();
     state.registrations.insert(pointer, Registration { context, entries: Vec::new(), altitude: altitude.clone(), removing: false });
-    for index in 0..count {
-        let operation = operations + index * 32;
-        let mask = guest::read32(operation + 8);
+    // SAFETY: vetor OperationRegistration com `count` entradas do chamador.
+    let operations = unsafe { ObOperationRegistration::array_at(operations, count as usize) };
+    for (index, operation) in operations.iter().enumerate() {
+        let index = index as u64;
+        let mask = operation.operations.get();
         if mask == 0 {
             status = 0xC000_000D;
             break;
         }
-        let type_pointer = guest::read64(guest::read64(operation));
-        if object_types::find(type_pointer).is_none() || guest::read16(type_pointer + 0x42) & 0x40 == 0 {
+        // ObjectType é um POBJECT_TYPE* (a célula exportada, como PsProcessType).
+        // SAFETY: ponteiro para a célula do tipo, fornecido pelo driver.
+        let type_pointer = unsafe { Field::<u64>::at(operation.object_type.get()) }.get();
+        // SAFETY: só tipos registrados em `object_types` passam do `find`.
+        if object_types::find(type_pointer).is_none() || unsafe { nt::ObjectType::at(type_pointer) }.type_info.supports_object_callbacks() == 0 {
             status = 0xC000_000D;
             break;
         }
-        let pre = guest::read64(operation + 16);
-        let post = guest::read64(operation + 24);
+        let pre = operation.pre_operation.get();
+        let post = operation.post_operation.get();
         if pre == 0 && post == 0 {
             status = 0xC000_000D;
             break;
@@ -162,13 +237,14 @@ pub fn register(registration: u64, output_handle: u64) -> Result<u32, KernelErro
             status = 0xC01C_0011;
             break;
         }
-        let node = pointer + 32 + index * 64;
-        guest::write32(node + 16, mask);
-        guest::write64(node + 24, pointer);
-        guest::write64(node + 32, type_pointer);
-        guest::write64(node + 40, pre);
-        guest::write64(node + 48, post);
-        guest::write64(node + 56, 0);
+        let node = pointer + RegistrationBlock::SIZE + index * CallbackEntryItem::SIZE;
+        let item = entry_item(node);
+        item.operations.set(mask);
+        item.registration.set(pointer);
+        item.object_type.set(type_pointer);
+        item.pre_operation.set(pre);
+        item.post_operation.set(post);
+        item.rundown.count.set(0);
         created.push(node);
         state.registrations.get_mut(&pointer).unwrap().entries.push(node);
         let entry = Entry { pointer: node, record: pointer, mask, pre, post, enabled: false };
@@ -177,7 +253,7 @@ pub fn register(registration: u64, output_handle: u64) -> Result<u32, KernelErro
         entries.push(entry);
         entries.sort_by(|left, right| compare_altitude(&altitudes[&right.record], &altitudes[&left.record]));
         synchronize_type_list(&state, type_pointer);
-        guest::write16(pointer + 2, created.len() as u16);
+        block.operation_registration_count.set(created.len() as u16);
     }
     if status != 0 {
         // Desfaz as entradas parciais.
@@ -198,11 +274,12 @@ pub fn register(registration: u64, output_handle: u64) -> Result<u32, KernelErro
     for entries in state.by_type.values_mut() {
         for entry in entries.iter_mut().filter(|entry| entry.record == pointer) {
             entry.enabled = true;
-            guest::write32(entry.pointer + 20, 1);
+            entry_item(entry.pointer).active.set(1);
         }
     }
     drop(state);
-    guest::write64(output_handle, pointer);
+    // SAFETY: PVOID* RegistrationHandle de um chamador de kernel.
+    unsafe { Field::<u64>::at(output_handle) }.set(pointer);
     Ok(0)
 }
 
@@ -237,7 +314,7 @@ impl RemoveRequest {
         loop {
             let Some(entry) = STATE.lock().registrations.get(&self.record).and_then(|record| record.entries.get(self.index).copied()) else { break };
             if self.wait.is_none() {
-                self.wait = Some(rundown::begin(entry + 56, false)?);
+                self.wait = Some(rundown::begin(rundown_of(entry), false)?);
             }
             if !self.wait.as_mut().unwrap().poll() {
                 return Ok(None);
@@ -324,55 +401,62 @@ pub fn perform(item: &Described, desired_access: u32, options: &PerformOptions, 
     }
     require_callback_level()?;
     let thread = process::get_current_thread();
-    let memory = guest::alloc_bytes(96);
+    let memory = guest::alloc_bytes(OperationBlock::SIZE);
     if memory == 0 {
         return Ok(Outcome { status: 0xC000_009A, granted: None, value: 0, error: None });
     }
-    let information = memory;
-    let parameters = information + 48;
+    // SAFETY: alocação nova do tamanho do bloco, liberada no fim da função.
+    let block = unsafe { OperationBlock::at(memory) };
+    let post_information = &block.information;
+    // SAFETY: a PRE é o prefixo da POST na mesma memória.
+    let information = unsafe { ObPreOperationInformation::at(post_information.address()) };
+    let parameters = &block.parameters;
+    // SAFETY: OB_POST_OPERATION_PARAMETERS sobrepõe os mesmos bytes.
+    let post_parameters = unsafe { ObPostOperationParameters::at(parameters.address()) };
     let original = desired_access;
     let entries: Vec<Entry> = STATE.lock().by_type.get(&item.object_type.pointer).cloned().unwrap_or_default();
     item.reference();
     let result = critical_region::with_critical(|| {
-        guest::write32(information, operation);
-        guest::write32(information + 4, options.kernel_handle as u32);
-        guest::write64(information + 8, item.pointer);
-        guest::write64(information + 16, item.object_type.pointer);
-        guest::write64(information + 32, parameters);
-        guest::write32(parameters, original);
-        guest::write32(parameters + 4, original);
+        information.operation.set(operation);
+        information.flags.set(options.kernel_handle as u32);
+        information.object.set(item.pointer);
+        information.object_type.set(item.object_type.pointer);
+        information.parameters.set(parameters.address());
+        parameters.create_handle_information.desired_access.set(original);
+        parameters.create_handle_information.original_desired_access.set(original);
         if operation == 2 {
-            guest::write64(parameters + 8, if options.source_process != 0 { options.source_process } else { process::get_current_process() });
-            guest::write64(parameters + 16, if options.target_process != 0 { options.target_process } else { process::get_current_process() });
+            let duplicate = &parameters.duplicate_handle_information;
+            duplicate.source_process.set(if options.source_process != 0 { options.source_process } else { process::get_current_process() });
+            duplicate.target_process.set(if options.target_process != 0 { options.target_process } else { process::get_current_process() });
         }
         let mut post_callbacks: Vec<(Entry, u64)> = Vec::new();
         for entry in &entries {
             let context = STATE.lock().registrations.get(&entry.record).map_or(0, |record| record.context);
-            if !entry.enabled || entry.mask & operation == 0 || !rundown::acquire(entry.pointer + 56)? {
+            if !entry.enabled || entry.mask & operation == 0 || !rundown::acquire(rundown_of(entry.pointer))? {
                 continue;
             }
-            guest::write64(information + 24, 0);
+            information.call_context.set(0);
             if entry.pre != 0 {
-                invoke(thread, entry, entry.pre, context, information);
+                invoke(thread, entry, entry.pre, context, information.address());
             }
             if entry.post != 0 {
-                post_callbacks.push((entry.clone(), guest::read64(information + 24)));
+                post_callbacks.push((entry.clone(), information.call_context.get()));
             } else {
-                rundown::release(entry.pointer + 56)?;
+                rundown::release(rundown_of(entry.pointer))?;
             }
         }
-        let filtered = original & guest::read32(parameters);
+        let filtered = original & parameters.create_handle_information.desired_access.get();
         let outcome = action(if options.enforce { filtered } else { original });
-        guest::write32(information + 32, outcome.status);
-        guest::write64(information + 40, parameters);
-        guest::write32(parameters, outcome.granted.unwrap_or(0));
+        post_information.return_status.set(outcome.status as i32);
+        post_information.parameters.set(post_parameters.address());
+        post_parameters.create_handle_information.granted_access.set(outcome.granted.unwrap_or(0));
         for (entry, saved_context) in post_callbacks.iter().rev() {
             let context = STATE.lock().registrations.get(&entry.record).map_or(0, |record| record.context);
-            guest::write64(information + 24, *saved_context);
-            invoke(thread, entry, entry.post, context, information);
+            post_information.call_context.set(*saved_context);
+            invoke(thread, entry, entry.post, context, post_information.address());
         }
         for (entry, _) in &post_callbacks {
-            rundown::release(entry.pointer + 56)?;
+            rundown::release(rundown_of(entry.pointer))?;
         }
         Ok(outcome)
     });

@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, NtStruct, ObjectHandleInformation};
 use crate::ntos::ob::{close, handle_ids, object_types, reference_trace};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
@@ -86,10 +86,12 @@ pub fn reference(handle: u64, access: u32, object_type: u64, mode: u8, tag: u32,
         }
         reference_trace::record(entry.body, tag, 1);
         let _ = object_types::account(&entry.type_name, 1, 0);
-        guest::write64(out, entry.body);
+        // SAFETY: PVOID* Object e POBJECT_HANDLE_INFORMATION de um chamador de kernel.
+        unsafe { Field::<u64>::at(out) }.set(entry.body);
         if info != 0 {
-            guest::write32(info, entry.attributes);
-            guest::write32(info + 4, entry.access);
+            let info = unsafe { ObjectHandleInformation::at(info) };
+            info.handle_attributes.set(entry.attributes);
+            info.granted_access.set(entry.access);
         }
         return Some(STATUS_SUCCESS);
     }
@@ -128,7 +130,8 @@ pub fn duplicate(source_handle: u64, target_process: u64, target_handle_out: u64
         }
     }
     if target_handle_out != 0 {
-        guest::write64(target_handle_out, handle);
+        // SAFETY: PHANDLE TargetHandle de um chamador de kernel.
+        unsafe { Field::<u64>::at(target_handle_out) }.set(handle);
     }
     Ok(STATUS_SUCCESS)
 }

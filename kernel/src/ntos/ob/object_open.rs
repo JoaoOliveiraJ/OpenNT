@@ -7,9 +7,8 @@
 //! NTSTATUS já estendido para 64 bits do jeito que o export o entrega.
 
 use crate::ntos::ex::callbacks as executive_callbacks;
-use crate::ntos::inc::nt_abi::object_attributes;
+use crate::ntos::inc::types::{Field, NtStruct, ObjectAttributes};
 use crate::ntos::init::exports::signed_status;
-use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::object_reference::{native_pointer_of_node, reference_device, type_differs};
 use crate::ntos::ob::object_types;
@@ -21,6 +20,12 @@ const NAME_NOT_FOUND: u32 = 0xC000_0034;
 const TYPE_MISMATCH: u32 = 0xC000_0024;
 const ACCESS_DENIED: u32 = 0xC000_0022;
 
+/// Saída escalar (`PVOID*`, `PHANDLE`, `PULONG`...) de um chamador de kernel.
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro de saída fornecido por um chamador de kernel.
+    unsafe { Field::<T>::at(address) }
+}
+
 /// Abre um callback do Ex pelos atributos já capturados.
 fn open_callback(captured_node: NodeId, flags: u32, object_type: u64, access: u32, mode: u8, output: u64) -> Result<u64, KernelError> {
     if type_differs(object_type, object_types::callback_type().pointer) {
@@ -29,7 +34,7 @@ fn open_callback(captured_node: NodeId, flags: u32, object_type: u64, access: u3
     let target = object_manager::node(captured_node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
     match executive_callbacks::open_handle(target, access, flags, mode != 0)? {
         Ok(handle) => {
-            guest::write64(output, handle);
+            out::<u64>(output).set(handle);
             Ok(0)
         }
         Err(status) => Ok(status as u64),
@@ -44,7 +49,9 @@ pub fn open_by_name(attributes_pointer: u64, object_type: u64, mode: u8, access:
             return open_callback(node, captured.flags, object_type, access, mode, output);
         }
     }
-    let name = guest_strings::read_unicode_string(guest::read64(attributes_pointer + object_attributes::OBJECT_NAME));
+    // SAFETY: OBJECT_ATTRIBUTES de um chamador de kernel (ObOpenObjectByName).
+    let attributes = unsafe { ObjectAttributes::at(attributes_pointer) };
+    let name = guest_strings::read_unicode_string(attributes.object_name.get());
     let node = object_manager::lookup(&name);
     let pointer = native_pointer_of_node(node);
     if pointer == 0 {
@@ -61,7 +68,7 @@ pub fn open_by_name(attributes_pointer: u64, object_type: u64, mode: u8, access:
         }
         return open_callback(node, captured.flags, object_type, access, mode, output);
     }
-    let attributes = guest::read32(attributes_pointer + object_attributes::ATTRIBUTES);
+    let attributes = attributes.attributes.get();
     if section_objects::is_section(pointer) {
         if type_differs(object_type, object_types::section_type().pointer) {
             return Ok(signed_status(TYPE_MISMATCH));
@@ -73,7 +80,7 @@ pub fn open_by_name(attributes_pointer: u64, object_type: u64, mode: u8, access:
         if handle == 0 {
             return Ok(signed_status(NAME_NOT_FOUND));
         }
-        guest::write64(output, handle);
+        out::<u64>(output).set(handle);
         return Ok(0);
     }
     if driver_objects::is_driver(pointer) {
@@ -87,11 +94,11 @@ pub fn open_by_name(attributes_pointer: u64, object_type: u64, mode: u8, access:
         if handle == 0 {
             return Ok(signed_status(NAME_NOT_FOUND));
         }
-        guest::write64(output, handle);
+        out::<u64>(output).set(handle);
         return Ok(0);
     }
     reference_device(pointer)?;
     let handle = object_manager::open(&name)?;
-    guest::write64(output, handle as u64);
+    out::<u64>(output).set(handle as u64);
     Ok(0)
 }

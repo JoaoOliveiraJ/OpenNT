@@ -5,9 +5,23 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use super::object_types::ObjectType;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{self as nt, NtStruct, ObjectBasicInformation, ObjectHandleFlagInformation, ObjectNameInformation, ObjectTypeInformation, ObjectTypesInformation};
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
+
+/// Campo de uma estrutura de saída no buffer do chamador. O NtQueryObject
+/// aceita buffers alinhados só a ULONG, então os campos são escritos pelo
+/// offset do tipo (um MOV da largura do campo), sem exigir o alinhamento
+/// natural da estrutura inteira.
+fn put<T: GuestScalar>(base: u64, offset: usize, value: T) {
+    guest::write(base + offset as u64, value);
+}
+
+fn utf16_bytes(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
 
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 
@@ -38,10 +52,10 @@ fn units(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
-/// 104 bytes fixos mais o nome com terminador, arredondado a oito.
+/// A estrutura fixa mais o nome com terminador, arredondado a oito.
 pub fn type_size(object_type: &ObjectType) -> u32 {
     let length = units(&object_type.name).len() as u32 * 2 + 2;
-    104 + length.div_ceil(8) * 8
+    ObjectTypeInformation::SIZE as u32 + length.div_ceil(8) * 8
 }
 
 /// OBJECT_TYPE_INFORMATION: contadores e mapeamento do OBJECT_TYPE e o nome.
@@ -51,23 +65,39 @@ pub fn type_info(object_type: &ObjectType, buffer: u64, length: u32, offset: u32
     if length < required {
         return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: Some(required) };
     }
-    let source = object_type.pointer;
-    for (destination, from) in [(16u64, 0x2Cu64), (20, 0x30), (40, 0x34), (44, 0x38), (64, 0x48), (68, 0x4C), (72, 0x50), (76, 0x54), (80, 0x58), (84, 0x5C), (92, 0x64), (96, 0x68), (100, 0x6C)] {
-        guest::write32(buffer + destination, guest::read32(source + from));
+    // SAFETY: tipos registrados em `object_types` vivem até o desligamento.
+    let source = unsafe { nt::ObjectType::at(object_type.pointer) };
+    let info = &source.type_info;
+    let generic = &info.generic_mapping;
+    for (offset, value) in [
+        (offset_of!(ObjectTypeInformation, total_number_of_objects), source.total_number_of_objects.get()),
+        (offset_of!(ObjectTypeInformation, total_number_of_handles), source.total_number_of_handles.get()),
+        (offset_of!(ObjectTypeInformation, high_water_number_of_objects), source.high_water_number_of_objects.get()),
+        (offset_of!(ObjectTypeInformation, high_water_number_of_handles), source.high_water_number_of_handles.get()),
+        (offset_of!(ObjectTypeInformation, invalid_attributes), info.invalid_attributes.get()),
+        (offset_of!(ObjectTypeInformation, generic_mapping.generic_read), generic.generic_read.get()),
+        (offset_of!(ObjectTypeInformation, generic_mapping.generic_write), generic.generic_write.get()),
+        (offset_of!(ObjectTypeInformation, generic_mapping.generic_execute), generic.generic_execute.get()),
+        (offset_of!(ObjectTypeInformation, generic_mapping.generic_all), generic.generic_all.get()),
+        (offset_of!(ObjectTypeInformation, valid_access_mask), info.valid_access_mask.get()),
+        (offset_of!(ObjectTypeInformation, pool_type), info.pool_type.get().0 as u32),
+        (offset_of!(ObjectTypeInformation, default_paged_pool_charge), info.default_paged_pool_charge.get()),
+        (offset_of!(ObjectTypeInformation, default_non_paged_pool_charge), info.default_non_paged_pool_charge.get()),
+    ] {
+        put::<u32>(buffer, offset, value);
     }
-    let flags = guest::read8(source + 0x42);
-    guest::write8(buffer + 88, (flags >> 3) & 1);
-    guest::write8(buffer + 89, (flags >> 4) & 1);
-    guest::write8(buffer + 90, guest::read8(source + 0x28));
-    guest::write8(buffer + 91, 0);
+    put::<u8>(buffer, offset_of!(ObjectTypeInformation, security_required), info.security_required());
+    put::<u8>(buffer, offset_of!(ObjectTypeInformation, maintain_handle_count), info.maintain_handle_count());
+    put::<u8>(buffer, offset_of!(ObjectTypeInformation, type_index), source.index.get());
+    put::<u8>(buffer, offset_of!(ObjectTypeInformation, reserved_byte), 0);
     let name = units(&object_type.name);
-    guest::write16(buffer, name.len() as u16 * 2);
-    guest::write16(buffer + 2, name.len() as u16 * 2 + 2);
-    guest::write64(buffer + 8, buffer + 104);
-    for (index, &unit) in name.iter().enumerate() {
-        guest::write16(buffer + 104 + index as u64 * 2, unit);
-    }
-    guest::write16(buffer + 104 + name.len() as u64 * 2, 0);
+    let text = buffer + ObjectTypeInformation::SIZE;
+    put::<u16>(buffer, offset_of!(ObjectTypeInformation, type_name.length), name.len() as u16 * 2);
+    put::<u16>(buffer, offset_of!(ObjectTypeInformation, type_name.maximum_length), name.len() as u16 * 2 + 2);
+    put::<u64>(buffer, offset_of!(ObjectTypeInformation, type_name.buffer), text);
+    let mut bytes = utf16_bytes(&name);
+    bytes.extend_from_slice(&[0, 0]);
+    guest::write_bytes(text, &bytes);
     Formatted { status: 0, needed: Some(required) }
 }
 
@@ -80,8 +110,8 @@ pub fn format(information: &ObjectInformation, class: u32, buffer: u64, length: 
             if length < 4 {
                 return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: Some(8) };
             }
-            guest::write32(buffer, types.len() as u32);
-            let mut required = 8;
+            put::<u32>(buffer, offset_of!(ObjectTypesInformation, number_of_types), types.len() as u32);
+            let mut required = offset_of!(ObjectTypesInformation, type_information) as u32;
             let mut status = 0;
             for object_type in types {
                 let result = type_info(object_type, buffer + required as u64, length, required);
@@ -92,54 +122,62 @@ pub fn format(information: &ObjectInformation, class: u32, buffer: u64, length: 
         }
         // A estrutura básica exige exatamente 56 bytes, reservados zerados.
         0 => {
-            if length != 56 {
+            if length != ObjectBasicInformation::SIZE as u32 {
                 return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: None };
             }
-            guest::write_bytes(buffer, &[0; 56]);
-            let name_length = information.name.as_deref().map_or(0, |name| 18 + units(name).len() as u32 * 2);
+            guest::write_bytes(buffer, &[0; ObjectBasicInformation::SIZE as usize]);
+            // NameInfoSize: OBJECT_NAME_INFORMATION mais o texto e o terminador.
+            let name_length = information.name.as_deref().map_or(0, |name| ObjectNameInformation::SIZE as u32 + 2 + units(name).len() as u32 * 2);
+            // TypeInfoSize: a estrutura fixa mais o nome e o terminador.
+            let type_length = ObjectTypeInformation::SIZE as u32 + 2 + units(&information.object_type.name).len() as u32 * 2;
             for (offset, value) in [
-                (0u64, information.attributes | information.object_flags),
-                (4, information.access),
-                (8, information.handles),
-                (12, information.references),
-                (16, information.paged_charge),
-                (20, information.nonpaged_charge),
-                (36, name_length),
-                (40, 106 + units(&information.object_type.name).len() as u32 * 2),
-                (44, information.security_length),
+                (offset_of!(ObjectBasicInformation, attributes), information.attributes | information.object_flags),
+                (offset_of!(ObjectBasicInformation, granted_access), information.access),
+                (offset_of!(ObjectBasicInformation, handle_count), information.handles),
+                (offset_of!(ObjectBasicInformation, pointer_count), information.references),
+                (offset_of!(ObjectBasicInformation, paged_pool_charge), information.paged_charge),
+                (offset_of!(ObjectBasicInformation, non_paged_pool_charge), information.nonpaged_charge),
+                (offset_of!(ObjectBasicInformation, name_info_size), name_length),
+                (offset_of!(ObjectBasicInformation, type_info_size), type_length),
+                (offset_of!(ObjectBasicInformation, security_descriptor_size), information.security_length),
             ] {
-                guest::write32(buffer + offset, value);
+                put::<u32>(buffer, offset, value);
             }
-            guest::write64(buffer + 48, information.creation_time);
-            Formatted { status: 0, needed: Some(56) }
+            put::<u64>(buffer, offset_of!(ObjectBasicInformation, creation_time), information.creation_time);
+            Formatted { status: 0, needed: Some(ObjectBasicInformation::SIZE as u32) }
         }
         1 => {
             let name = units(information.name.as_deref().unwrap_or(""));
-            let required = if name.is_empty() { 16 } else { 18 + name.len() as u32 * 2 };
+            let header = ObjectNameInformation::SIZE as u32;
+            let required = if name.is_empty() { header } else { header + 2 + name.len() as u32 * 2 };
             if length < required {
                 return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: Some(required) };
             }
-            guest::write16(buffer, name.len() as u16 * 2);
-            guest::write16(buffer + 2, if name.is_empty() { 0 } else { name.len() as u16 * 2 + 2 });
-            guest::write32(buffer + 4, 0);
-            guest::write64(buffer + 8, if name.is_empty() { 0 } else { buffer + 16 });
+            let text = buffer + ObjectNameInformation::SIZE;
+            // Cabeçalho inteiro, com o preenchimento do UNICODE_STRING zerado.
+            guest::write_bytes(buffer, &[0u8; ObjectNameInformation::SIZE as usize]);
+            put::<u16>(buffer, offset_of!(ObjectNameInformation, name.length), name.len() as u16 * 2);
+            put::<u16>(buffer, offset_of!(ObjectNameInformation, name.maximum_length), if name.is_empty() { 0 } else { name.len() as u16 * 2 + 2 });
+            put::<u64>(buffer, offset_of!(ObjectNameInformation, name.buffer), if name.is_empty() { 0 } else { text });
             if !name.is_empty() {
-                for (index, &unit) in name.iter().enumerate() {
-                    guest::write16(buffer + 16 + index as u64 * 2, unit);
-                }
-                guest::write16(buffer + 16 + name.len() as u64 * 2, 0);
+                let mut bytes = utf16_bytes(&name);
+                bytes.extend_from_slice(&[0, 0]);
+                guest::write_bytes(text, &bytes);
             }
             Formatted { status: 0, needed: Some(required) }
         }
         2 => type_info(&information.object_type, buffer, length, 0),
         // ProtectFromClose e Inherit.
         4 => {
-            if length < 2 {
-                return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: Some(2) };
+            let size = ObjectHandleFlagInformation::SIZE as u32;
+            if length < size {
+                return Formatted { status: STATUS_INFO_LENGTH_MISMATCH, needed: Some(size) };
             }
-            guest::write8(buffer, (information.attributes & 2 != 0) as u8);
-            guest::write8(buffer + 1, (information.attributes & 1 != 0) as u8);
-            Formatted { status: 0, needed: Some(2) }
+            // SAFETY: estrutura de bytes (alinhamento 1) no buffer do chamador.
+            let flags = unsafe { ObjectHandleFlagInformation::at(buffer) };
+            flags.inherit.set((information.attributes & 2 != 0) as u8);
+            flags.protect_from_close.set((information.attributes & 1 != 0) as u8);
+            Formatted { status: 0, needed: Some(size) }
         }
         _ => Formatted { status: 0xC000_0003, needed: None },
     }
