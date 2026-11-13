@@ -2,7 +2,9 @@
 //! `system32/ntos/rtl/image.js` (RtlImageNtHeaderEx, RtlImageDirectoryEntryToData).
 //!
 //! Só lê os bytes fornecidos; carregamento, relocação e execução pertencem
-//! ao loader PE.
+//! ao loader PE. Sobre as imagens já carregadas: a base que contém um
+//! endereço (RtlPcToFileHeader) e a busca de export por nome
+//! (RtlFindExportedRoutineByName).
 
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -99,6 +101,44 @@ pub fn directory_entry(base: u64, mapped_as_image: bool, index: u32, output_size
         section += 40;
     }
     Ok(0)
+}
+
+/// RtlPcToFileHeader: base da imagem carregada que contém `pc` (0 se
+/// nenhuma), também gravada em `base_out`.
+pub fn pc_to_file_header(pc: u64, base_out: u64) -> u64 {
+    let base = crate::ntos::mm::loaded_images::find(pc).map_or(0, |image| image.image_base);
+    guest::write64(base_out, base);
+    base
+}
+
+/// RtlFindExportedRoutineByName(PVOID ImageBase, PCCH Name): varre a EDATA
+/// de uma imagem carregada e devolve o VA do export (NULL em forwarder).
+pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {
+    let target = crate::ntos::rtl::guest_strings::read_c_string(name_pointer);
+    let size_cell = guest::alloc_bytes(4);
+    let directory = directory_entry(base, true, 0, size_cell).unwrap_or(0);
+    let directory_size = guest::read32(size_cell) as u64;
+    guest::free_bytes(size_cell);
+    if directory == 0 {
+        return 0;
+    }
+    let export_rva = directory.wrapping_sub(base); // directory = base + export_rva
+    let number_of_names = guest::read32(directory + 0x18) as u64;
+    let functions = base + guest::read32(directory + 0x1C) as u64;
+    let names = base + guest::read32(directory + 0x20) as u64;
+    let ordinals = base + guest::read32(directory + 0x24) as u64;
+    for index in 0..number_of_names {
+        let name_rva = guest::read32(names + index * 4) as u64;
+        if crate::ntos::rtl::guest_strings::read_c_string(base + name_rva) == target {
+            let ordinal = guest::read16(ordinals + index * 2) as u64;
+            let function_rva = guest::read32(functions + ordinal * 4) as u64;
+            if function_rva >= export_rva && function_rva < export_rva + directory_size {
+                return 0; // forwarder
+            }
+            return base + function_rva;
+        }
+    }
+    0
 }
 
 pub mod pe_metadata_reader {

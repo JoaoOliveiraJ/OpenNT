@@ -1,7 +1,12 @@
 //! Rotinas de texto e busca da CRT do kernel — `system32/ntos/rtl/crt.js`.
 //! Classificação no locale C; ponteiros exatos.
+//!
+//! Também as cópias, buscas e concatenações str*/wcs* (as variantes `_s`
+//! devolvem errno: 22 = EINVAL, 34 = ERANGE, 80 = STRUNCATE), as trocas de
+//! caixa no lugar e a guarda `_purecall`.
 
 use crate::hal::amd64::native_call;
+use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -182,4 +187,273 @@ pub fn binary_search(
     }
     guest::free_bytes(frame);
     Ok(result)
+}
+
+// ---- strings de bytes --------------------------------------------------------
+
+/// Grava o texto e o terminador; com `count`, exatamente `count` bytes
+/// (completando com zeros, sem terminador se não couber).
+pub fn write_c_text(destination: u64, text: &str, count: Option<u64>) {
+    let bytes = text.as_bytes();
+    let total = count.unwrap_or(bytes.len() as u64 + 1);
+    for index in 0..total {
+        guest::write8(destination + index, bytes.get(index as usize).copied().unwrap_or(0));
+    }
+}
+
+/// strcpy: devolve o destino.
+pub fn strcpy(destination: u64, source: u64) -> u64 {
+    write_c_text(destination, &guest_strings::read_c_string(source), None);
+    destination
+}
+
+/// strncpy: exatamente `count` bytes; devolve o destino.
+pub fn strncpy(destination: u64, source: u64, count: u64) -> u64 {
+    write_c_text(destination, &guest_strings::read_c_string(source), Some(count));
+    destination
+}
+
+/// strcat: devolve o destino.
+pub fn strcat(destination: u64, source: u64) -> u64 {
+    let combined = alloc::format!("{}{}", guest_strings::read_c_string(destination), guest_strings::read_c_string(source));
+    write_c_text(destination, &combined, None);
+    destination
+}
+
+/// strchr: primeira ocorrência do byte (o terminador não conta).
+pub fn strchr(source: u64, character: u8) -> u64 {
+    let text = guest_strings::read_c_string(source);
+    text.bytes().position(|byte| byte == character).map_or(0, |index| source + index as u64)
+}
+
+/// strstr: primeira ocorrência da agulha.
+pub fn strstr(source: u64, needle: u64) -> u64 {
+    let text = guest_strings::read_c_string(source);
+    let needle = guest_strings::read_c_string(needle);
+    text.find(&needle).map_or(0, |index| source + index as u64)
+}
+
+/// _strupr: maiúsculas ASCII no lugar; devolve a própria string.
+pub fn strupr(source: u64) -> u64 {
+    let mut cursor = source;
+    loop {
+        let byte = guest::read8(cursor);
+        if byte == 0 {
+            break;
+        }
+        if byte.is_ascii_lowercase() {
+            guest::write8(cursor, byte - 0x20);
+        }
+        cursor += 1;
+    }
+    source
+}
+
+/// strnlen(const char*, size_t max).
+pub fn strnlen(source: u64, maximum: u64) -> u64 {
+    let mut count = 0;
+    while count < maximum && guest::read8(source + count) != 0 {
+        count += 1;
+    }
+    count
+}
+
+/// strcpy_s: ERANGE (destino vazio) quando o texto não cabe.
+pub fn strcpy_s(destination: u64, capacity: u64, source: u64) -> u64 {
+    let text = guest_strings::read_c_string(source);
+    if text.len() as u64 + 1 > capacity {
+        guest::write8(destination, 0);
+        return 34;
+    }
+    write_c_text(destination, &text, None);
+    0
+}
+
+/// strncpy_s: _TRUNCATE (-1) trunca; senão ERANGE quando não cabe.
+pub fn strncpy_s(destination: u64, capacity: u64, source: u64, count: i32) -> u64 {
+    let text = guest_strings::read_c_string(source);
+    let bytes = text.as_bytes();
+    let wanted = if count < 0 { bytes.len() as u64 } else { (count as u64).min(bytes.len() as u64) };
+    if wanted >= capacity && count >= 0 {
+        guest::write8(destination, 0);
+        return 34;
+    }
+    let writable = wanted.min(capacity.saturating_sub(1));
+    for index in 0..writable {
+        guest::write8(destination + index, bytes[index as usize]);
+    }
+    guest::write8(destination + writable, 0);
+    if wanted > writable || (count < 0 && bytes.len() as u64 > writable) { 80 } else { 0 }
+}
+
+// ---- strings largas ----------------------------------------------------------
+
+/// _wcsupr: maiúsculas no lugar, unidade a unidade; devolve a própria string.
+pub fn wcsupr(source: u64) -> u64 {
+    let mut cursor = source;
+    loop {
+        let unit = guest::read16(cursor);
+        if unit == 0 {
+            break;
+        }
+        let upper = char::from_u32(unit as u32).and_then(|character| character.to_uppercase().next()).map_or(unit, |character| {
+            let mut buffer = [0u16; 2];
+            character.encode_utf16(&mut buffer)[0]
+        });
+        guest::write16(cursor, upper);
+        cursor += 2;
+    }
+    source
+}
+
+/// _wcslwr(wchar_t*): minúsculas no lugar, unidade a unidade.
+pub fn wcslwr(source: u64) -> u64 {
+    let mut cursor = source;
+    loop {
+        let unit = guest::read16(cursor);
+        if unit == 0 {
+            break;
+        }
+        let lower = char::from_u32(unit as u32).and_then(|character| character.to_lowercase().next()).map_or(unit, |character| {
+            let mut buffer = [0u16; 2];
+            character.encode_utf16(&mut buffer)[0]
+        });
+        guest::write16(cursor, lower);
+        cursor += 2;
+    }
+    source
+}
+
+/// wcsstr: agulha vazia devolve o próprio texto.
+pub fn wcsstr(haystack: u64, needle: u64) -> u64 {
+    let text = guest_strings::read_wide_units(haystack);
+    let pattern = guest_strings::read_wide_units(needle);
+    if pattern.is_empty() {
+        return haystack;
+    }
+    text.windows(pattern.len()).position(|window| window == pattern.as_slice()).map_or(0, |index| haystack + index as u64 * 2)
+}
+
+fn fold(unit: u16) -> u16 {
+    char::from_u32(unit as u32).and_then(|character| character.to_uppercase().next()).map_or(unit, |character| {
+        let mut buffer = [0u16; 2];
+        character.encode_utf16(&mut buffer)[0]
+    })
+}
+
+/// Comparação WCHAR (com dobra de maiúsculas opcional e limite opcional) de
+/// wcscmp/wcsncmp/_wcsicmp/_wcsnicmp: -1, 0 ou 1.
+pub fn compare_wide(left: u64, right: u64, limit: Option<u64>, insensitive: bool) -> u64 {
+    let mut index = 0u64;
+    loop {
+        if limit.is_some_and(|limit| index >= limit) {
+            return 0;
+        }
+        let mut a = guest::read16(left + index * 2);
+        let mut b = guest::read16(right + index * 2);
+        let zero = a == 0;
+        if insensitive {
+            a = fold(a);
+            b = fold(b);
+        }
+        if a != b {
+            return if a < b { (-1i64) as u64 } else { 1 };
+        }
+        if zero {
+            return 0;
+        }
+        index += 1;
+    }
+}
+
+/// wcslen.
+pub fn wcslen(source: u64) -> u64 {
+    let mut count = 0;
+    while guest::read16(source + count * 2) != 0 {
+        count += 1;
+    }
+    count
+}
+
+/// wcsnlen(const wchar_t*, size_t max).
+pub fn wcsnlen(source: u64, maximum: u64) -> u64 {
+    let mut count = 0u64;
+    while count < maximum && guest::read16(source + count * 2) != 0 {
+        count += 1;
+    }
+    count
+}
+
+/// wcsrchr(const wchar_t*, wchar_t): última ocorrência (o terminador conta).
+pub fn wcsrchr(source: u64, target: u16) -> u64 {
+    let (mut index, mut last) = (0u64, 0u64);
+    loop {
+        let unit = guest::read16(source + index * 2);
+        if unit == target {
+            last = source + index * 2;
+        }
+        if unit == 0 {
+            break;
+        }
+        index += 1;
+    }
+    last
+}
+
+/// wcscat_s: EINVAL sem NUL no destino, ERANGE sem espaço.
+pub fn wcscat_s(destination: u64, capacity: u64, source: u64) -> u64 {
+    let text = guest_strings::read_wide_string(source);
+    let mut length = 0;
+    while length < capacity && guest::read16(destination + length * 2) != 0 {
+        length += 1;
+    }
+    if length == capacity {
+        return 22;
+    }
+    if length + text.encode_utf16().count() as u64 + 1 > capacity {
+        guest::write16(destination, 0);
+        return 34;
+    }
+    guest_strings::write_wide_string(destination + length * 2, &text);
+    0
+}
+
+/// wcscpy_s: ERANGE (destino vazio) quando o texto não cabe.
+pub fn wcscpy_s(destination: u64, capacity: u64, source: u64) -> u64 {
+    let text = guest_strings::read_wide_string(source);
+    if text.encode_utf16().count() as u64 + 1 > capacity {
+        guest::write16(destination, 0);
+        return 34;
+    }
+    guest_strings::write_wide_string(destination, &text);
+    0
+}
+
+/// wcsncpy_s(wchar_t* d, size_t n, const wchar_t* s, size_t count): cópia
+/// limitada; _TRUNCATE((size_t)-1) trunca com STRUNCATE, senão ERANGE.
+pub fn wcsncpy_s(destination: u64, capacity: u64, source: u64, count: u64) -> u64 {
+    if capacity == 0 {
+        return 22; // EINVAL
+    }
+    let units = guest_strings::read_wide_units(source);
+    let truncate = count == u64::MAX;
+    let wanted = if truncate { units.len() as u64 } else { count.min(units.len() as u64) };
+    if !truncate && wanted + 1 > capacity {
+        guest::write16(destination, 0);
+        return 34; // ERANGE
+    }
+    let writable = wanted.min(capacity - 1);
+    for index in 0..writable {
+        guest::write16(destination + index * 2, units[index as usize]);
+    }
+    guest::write16(destination + writable * 2, 0);
+    if truncate && units.len() as u64 > writable { 80 } else { 0 } // STRUNCATE/0
+}
+
+// ---- guarda ------------------------------------------------------------------
+
+/// _purecall(): guarda de chamada a função virtual pura. Nunca deve ocorrer
+/// legitimamente; derruba o sistema (KeBugCheckEx), como no ntoskrnl.
+pub fn purecall() -> ! {
+    crate::ntos::ke::bugcheck::bug_check_ex(0x0000_0139, 0x0000_0005, 0, 0, 0)
 }

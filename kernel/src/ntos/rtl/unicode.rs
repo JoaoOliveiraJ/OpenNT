@@ -3,9 +3,15 @@
 //! Length/MaximumLength são contagens de bytes de 16 bits; Buffer fica em +8.
 //! Comparações contadas aceitam zeros internos e usam o trie NLS para a
 //! equivalência de maiúsculas, sem expansão de caracteres.
+//!
+//! Também a inicialização, as trocas de caixa com destino, o prefixo, a
+//! concatenação, a duplicação e o hash X65599 das UNICODE_STRING.
+
+use alloc::vec::Vec;
 
 use super::unicode_case::upcase_char;
 use crate::ntos::mm::kernel_pool;
+use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -196,4 +202,140 @@ pub fn guid_from_string(string: u64, output: u64) -> Result<u32, KernelError> {
     }
     guest::try_write_bytes(output + 8, &tail)?;
     Ok(0)
+}
+
+// ---- inicialização, caixa, prefixo, concatenação, duplicação e hash ---------
+
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+
+/// RtlInitUnicodeString: só aponta o buffer; origem NULL = campos zerados.
+pub fn init(output: u64, source: u64) {
+    if source == 0 {
+        guest_strings::write_string_fields(output, 0, 0, 0);
+        return;
+    }
+    let count = guest_strings::read_wide_units(source).len() as u16;
+    guest_strings::write_string_fields(output, count * 2, count * 2 + 2, source);
+}
+
+/// Escreve o texto numa UNICODE_STRING de destino (alocando se pedido ou
+/// sem buffer; respeitando MaximumLength). Devolve o NTSTATUS.
+fn write_converted_string(destination: u64, text: &str, allocate: bool) -> u32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let needed = units.len() as u64 * 2 + 2;
+    let mut buffer = guest::read64(destination + 8);
+    if allocate || buffer == 0 {
+        buffer = guest::alloc_bytes(needed);
+        guest::write64(destination + 8, buffer);
+        guest::write16(destination + 2, needed as u16);
+    } else if (guest::read16(destination + 2) as u64) < needed {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    for (index, unit) in units.iter().enumerate() {
+        guest::write16(buffer + index as u64 * 2, *unit);
+    }
+    guest::write16(buffer + units.len() as u64 * 2, 0);
+    guest::write16(destination, units.len() as u16 * 2);
+    0
+}
+
+/// RtlUpcaseUnicodeString.
+pub fn upcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
+    let text = guest_strings::read_unicode_string(source).to_uppercase();
+    write_converted_string(destination, &text, allocate)
+}
+
+/// RtlDowncaseUnicodeString.
+pub fn downcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
+    let text = guest_strings::read_unicode_string(source).to_lowercase();
+    write_converted_string(destination, &text, allocate)
+}
+
+/// RtlPrefixUnicodeString.
+pub fn prefix(prefix: u64, string: u64, case_insensitive: bool) -> bool {
+    let mut prefix = guest_strings::read_unicode_string(prefix);
+    let mut text = guest_strings::read_unicode_string(string);
+    if case_insensitive {
+        prefix = prefix.to_lowercase();
+        text = text.to_lowercase();
+    }
+    text.starts_with(&prefix)
+}
+
+/// Grava o texto desde o início do buffer do destino, terminado em NUL
+/// (respeita MaximumLength). Devolve o NTSTATUS.
+pub fn append_text(destination: u64, text: &str) -> u32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let maximum = guest::read16(destination + 2) as u64 / 2;
+    if units.len() as u64 + 1 > maximum {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    let buffer = guest::read64(destination + 8);
+    for (index, unit) in units.iter().enumerate() {
+        guest::write16(buffer + index as u64 * 2, *unit);
+    }
+    guest::write16(buffer + units.len() as u64 * 2, 0);
+    guest::write16(destination, units.len() as u16 * 2);
+    0
+}
+
+/// RtlAppendUnicodeStringToString: concatena no buffer do destino.
+pub fn append_string(destination: u64, source: u64) -> u32 {
+    let current = guest_strings::read_unicode_string(destination);
+    let suffix = guest_strings::read_unicode_string(source);
+    append_text(destination, &alloc::format!("{current}{suffix}"))
+}
+
+/// RtlDuplicateUnicodeString(flags, source, destination): SEMPRE aloca um
+/// buffer novo e copia a origem. `flags` não escolhe alocar — os bits são
+/// NULL_TERMINATE (1) e ALLOCATE_NULL_STRING (2); ambos juntos ou outros bits
+/// são inválidos. (Antes o OpenNT tratava flags!=0 como "alocar" e, com
+/// flags=0, checava a capacidade do destino e devolvia BUFFER_TOO_SMALL.)
+pub fn duplicate(flags: u32, source: u64, destination: u64) -> u32 {
+    const NULL_TERMINATE: u32 = 1;
+    const ALLOCATE_NULL_STRING: u32 = 2;
+    if destination == 0 || flags & !3 != 0 || flags & 3 == 3 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let length = guest::read16(source) as u64;
+    let source_buffer = guest::read64(source + 8);
+    // Origem vazia sem ALLOCATE_NULL_STRING: destino vazio e sem buffer.
+    if length == 0 && flags & ALLOCATE_NULL_STRING == 0 {
+        guest::write16(destination, 0);
+        guest::write16(destination + 2, 0);
+        guest::write64(destination + 8, 0);
+        return 0;
+    }
+    let terminator = if flags & NULL_TERMINATE != 0 { 2 } else { 0 };
+    let buffer = guest::alloc_bytes((length + terminator).max(2));
+    guest::write_bytes(buffer, &guest::read_bytes(source_buffer, length as usize));
+    if terminator != 0 {
+        guest::write16(buffer + length, 0);
+    }
+    guest::write16(destination, length as u16);
+    guest::write16(destination + 2, (length + terminator) as u16);
+    guest::write64(destination + 8, buffer);
+    0
+}
+
+/// RtlHashUnicodeString(PCUNICODE_STRING, CaseInsensitive, Alg, PULONG Hash):
+/// hash X65599 (Alg 0=default/1). Alg>1 = STATUS_INVALID_PARAMETER.
+pub fn hash(string: u64, case_insensitive: bool, algorithm: u32, hash_out: u64) -> u32 {
+    if algorithm > 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let length_units = guest::read16(string) as u64 / 2;
+    let buffer = guest::read64(string + 8);
+    let upcase = |unit: u16| upcase_char(unit).unwrap_or(if (0x61..=0x7A).contains(&unit) { unit - 0x20 } else { unit });
+    let mut hash = 0u32;
+    for index in 0..length_units {
+        let mut unit = guest::read16(buffer + index * 2);
+        if case_insensitive {
+            unit = upcase(unit);
+        }
+        hash = hash.wrapping_mul(65599).wrapping_add(unit as u32);
+    }
+    guest::write32(hash_out, hash);
+    0
 }

@@ -3716,7 +3716,7 @@ fn rtl_crt_extended_exports(assert: Assert) {
     // IEEE-754 exatos. O _purecall derruba o sistema por contrato, então só se
     // verifica o registro — nunca se chama.
     assert(call_export("sqrt", &[0]).is_some(), "crt: sqrt resolve e não quebra");
-    let root = crate::ntos::rtl::exports::rtl_crt_extended::sqrt_bits;
+    let root = crate::ntos::rtl::math::sqrt_bits;
     assert(
         root(0x4010_0000_0000_0000) == 0x4000_0000_0000_0000 // sqrt(4) = 2
             && root(0x4022_0000_0000_0000) == 0x4008_0000_0000_0000 // sqrt(9) = 3

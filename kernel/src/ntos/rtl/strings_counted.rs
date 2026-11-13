@@ -1,6 +1,10 @@
 //! Strings contadas do Rtl — `system32/ntos/rtl/{append-unicode-string,copy-unicode-string,initialize-ansi-string}.js`.
+//!
+//! Também as STRING/ANSI_STRING de bytes: RtlInitString, RtlEqualString,
+//! RtlFreeAnsiString e RtlAppendStringToString.
 
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::rtl::guest_strings;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const MAXIMUM_SOURCE_CHARACTERS: u64 = 0x7FFE;
@@ -82,4 +86,53 @@ pub fn initialize_ansi(destination: u64, source: u64) {
     }
     guest::write16(destination, length as u16);
     guest::write16(destination + 2, (length + 1) as u16);
+}
+
+/// RtlInitString: o texto não é copiado (MaximumLength = Length + 1).
+pub fn init_string(destination: u64, source: u64) {
+    let length = if source != 0 { guest_strings::read_c_string(source).len() as u16 } else { 0 };
+    guest::write16(destination, length);
+    guest::write16(destination + 2, length + 1);
+    guest::write64(destination + 8, source);
+}
+
+/// RtlEqualString: comparação das ANSI_STRING (minúsculas se pedido).
+pub fn equal_ansi(left: u64, right: u64, case_insensitive: bool) -> bool {
+    let mut left = guest_strings::read_ansi_string(left);
+    let mut right = guest_strings::read_ansi_string(right);
+    if case_insensitive {
+        left = left.to_lowercase();
+        right = right.to_lowercase();
+    }
+    left == right
+}
+
+/// RtlFree*String: libera o buffer e zera os campos.
+pub fn free_string(pointer: u64) {
+    let buffer = guest::read64(pointer + 8);
+    if buffer != 0 {
+        guest::free_bytes(buffer);
+    }
+    guest::write16(pointer, 0);
+    guest::write16(pointer + 2, 0);
+    guest::write64(pointer + 8, 0);
+}
+
+/// RtlAppendStringToString(PSTRING Dest, const STRING* Src): concatena uma
+/// STRING ANSI contada (sem terminador), respeitando MaximumLength.
+pub fn append_string(dest: u64, src: u64) -> u32 {
+    let src_len = guest::read16(src) as u64;
+    if src_len == 0 {
+        return 0;
+    }
+    let dest_len = guest::read16(dest) as u64;
+    if dest_len + src_len > guest::read16(dest + 2) as u64 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let (dest_buffer, src_buffer) = (guest::read64(dest + 8), guest::read64(src + 8));
+    for index in 0..src_len {
+        guest::write8(dest_buffer + dest_len + index, guest::read8(src_buffer + index));
+    }
+    guest::write16(dest, (dest_len + src_len) as u16);
+    0
 }
