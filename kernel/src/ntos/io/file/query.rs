@@ -47,7 +47,7 @@ fn file_at(file: u64) -> &'static FileObject {
 /// páginas presentes e graváveis).
 pub fn writable(pointer: u64, length: u64, user: bool) -> bool {
     if user {
-        return pointer < 0x7FFF_FFFF_0000 && user_probe::probe_user_write(pointer, length);
+        return pointer < crate::ntos::mm::memory_map::USER_PROBE_ADDRESS && user_probe::probe_user_write(pointer, length);
     }
     let Some(end) = pointer.checked_add(length) else { return false };
     if pointer == 0 || (pointer < 0xFFFF_8000_0000_0000 && end > 0x8000_0000_0000) {

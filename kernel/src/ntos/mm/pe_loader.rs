@@ -10,7 +10,8 @@
 //! MiLoadSystemImage do NT, a VA vem do espaço de sistema (a janela
 //! `memory_map::SYSTEM_IMAGE_BASE..TOP`), nunca da ImageBase do cabeçalho, e
 //! a imagem é relocada pela diferença. Imagem de usuário: a base preferida do
-//! cabeçalho na metade de usuário, ou a próxima faixa livre.
+//! cabeçalho quando a faixa está livre na metade de usuário, senão a
+//! primeira faixa livre a partir de 64 KB (relocada).
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -23,6 +24,7 @@ use crate::ntos::rtl::image::pe_image_information;
 use crate::ntos::rtl::image::pe_metadata_reader::MetadataReader;
 use crate::hal::{cpu, physical};
 use crate::ntos::ke::smp;
+use crate::ntos::mm::section::address as section_address;
 use crate::ntos::mm::{kernel_address, loaded_images, memory_map, paging, pfn};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ps::notify::image as image_notify;
@@ -44,17 +46,14 @@ struct Arenas {
     /// Faixas devolvidas da janela de sistema (base, tamanho), ordenadas e
     /// coalescidas, todas abaixo de `next_system`.
     free_system: Vec<(u64, u64)>,
-    /// Próxima VA das imagens de usuário fora da base preferida.
-    next_user_bump: u64,
-    /// Faixas ocupadas pelas imagens de usuário. As de kernel ficam só na
-    /// janela de sistema e nunca entram aqui.
+    /// Faixas ocupadas pelas imagens de usuário (base, fim). As de kernel
+    /// ficam só na janela de sistema e nunca entram aqui.
     preferred_ranges: Vec<(u64, u64)>,
 }
 
 static ARENAS: SpinLock<Arenas> = SpinLock::new(Arenas {
     next_system: memory_map::SYSTEM_IMAGE_BASE,
     free_system: Vec::new(),
-    next_user_bump: 0x1_8100_0000,
     preferred_ranges: Vec::new(),
 });
 
@@ -487,10 +486,13 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     let user_view = if user_space { options.user_view } else { None };
     let (view_offset, view_size) = user_view.map_or((0, size_of_image), |view| (view.offset, view.size));
     if let Some(view) = user_view {
-        if view.base < 0x1_0000_0000 || view.base % 0x10000 != 0 || view.base + view_size > memory_map::USER_ADDRESS_LIMIT || view_offset % 4096 != 0 || view_size == 0 || view_size % 4096 != 0 || view_offset + view_size > size_of_image {
+        if view.base % memory_map::ALLOCATION_GRANULARITY != 0 || !memory_map::is_user_range(view.base, view_size) || view_offset % 4096 != 0 || view_size % 4096 != 0 || view_offset + view_size > size_of_image {
             return Err(KernelError::new("PE: invalid partial view"));
         }
     }
+    // A escolha da VA de uma imagem de usuário sem vista vê tudo o que já
+    // ocupa a metade de usuário (lido antes da trava das faixas de imagem).
+    let occupied_user = if user_space && user_view.is_none() { crate::ntos::ps::user::memory::occupied() } else { Vec::new() };
     if size_of_image == 0 || size_of_headers > size_of_image {
         return Err(KernelError::new("PE: SizeOfImage invalido"));
     }
@@ -500,26 +502,28 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     let mut relocation_delta: i64 = 0;
     let result = (|| -> Result<PeImage, KernelError> {
         if user_space {
-            if user_view.is_none() && (preferred_base < 0x1_0000_0000 || preferred_base + size_of_image > memory_map::USER_ADDRESS_LIMIT) {
-                return Err(KernelError::new(alloc::format!("imagem de usuario com base invalida: {preferred_base:#x}")));
-            }
             let mut arenas = ARENAS.lock();
-            let mut target = user_view.map_or(preferred_base, |view| view.base - view_offset);
-            if let Some(view) = user_view {
-                if !preferred_range_is_free(&arenas.preferred_ranges, view.base, view_size) {
-                    return Err(KernelError::new("PE: requested view conflicts"));
+            let target = match user_view {
+                Some(view) => {
+                    if !preferred_range_is_free(&arenas.preferred_ranges, view.base, view_size) {
+                        return Err(KernelError::new("PE: requested view conflicts"));
+                    }
+                    view.base - view_offset
                 }
-            }
-            while user_view.is_none() && !preferred_range_is_free(&arenas.preferred_ranges, target, size_of_image) {
-                target = arenas.next_user_bump / 0x10000 * 0x10000;
-                arenas.next_user_bump = target + size_of_image.div_ceil(0x10000) * 0x10000;
-            }
-            if target + view_offset + view_size > memory_map::USER_ADDRESS_LIMIT {
-                return Err(KernelError::new("espaco de imagens de usuario esgotado"));
-            }
-            if target >= arenas.next_user_bump {
-                arenas.next_user_bump = target + size_of_image.div_ceil(0x10000) * 0x10000;
-            }
+                // Como no NT: a ImageBase do cabeçalho quando a faixa está
+                // livre (um .exe em 0x1_4000_0000), senão a primeira faixa
+                // livre da metade de usuário, e a imagem é relocada.
+                None => {
+                    let mut occupied = occupied_user;
+                    occupied.extend(arenas.preferred_ranges.iter().map(|&(base, top)| section_address::Region { base, size: top - base }));
+                    let at = |base: u64| section_address::find(&section_address::FindOptions { base, size: size_of_image, ..section_address::FindOptions::default() }, &occupied);
+                    let preferred = (preferred_base % memory_map::ALLOCATION_GRANULARITY == 0 && memory_map::is_user_range(preferred_base, size_of_image)).then(|| at(preferred_base).ok()).flatten();
+                    match preferred {
+                        Some(base) => base,
+                        None => at(0).map_err(|status| KernelError::with_status("espaco de imagens de usuario esgotado", status))?,
+                    }
+                }
+            };
             let range = (target + view_offset, target + view_offset + view_size);
             arenas.preferred_ranges.push(range);
             drop(arenas);

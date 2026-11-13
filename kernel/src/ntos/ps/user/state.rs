@@ -40,8 +40,7 @@ pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
 /// 64 KiB de pilha de kernel para o ring 3.
 pub const SYSCALL_STACK_PAGES: u64 = 16;
-/// PML4[1].
-pub const USER_STACK_TOP: u64 = 0x80_0000_0000;
+/// Pilha de usuário da primeira thread (VA escolhida pelo alocador).
 pub const USER_STACK_SIZE: u64 = 0x10_0000;
 /// O endereço real de usuário da KUSER_SHARED_DATA.
 pub const KUSER_SHARED_DATA_USER_VA: u64 = 0x7FFE_0000;
@@ -63,13 +62,6 @@ pub const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
-
-/// 8 GiB: heap e regiões do processo.
-pub const USER_ALLOC_BASE: u64 = 0x2_0000_0000;
-/// Estruturas do processo (PML4[1], junto da pilha).
-pub const USER_STRUCT_BASE: u64 = 0x7F_F000_0000;
-/// Regiões compartilhadas entre processos (NLS, schemas); nunca reiniciam.
-pub const USER_SHARED_BASE: u64 = 0x7F_F100_0000;
 
 /// Dados NLS reais mapeados.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,10 +177,6 @@ pub struct State {
     /// Instantâneo diagnóstico da saída explícita do processo.
     pub termination_rsp: u64,
     pub next_user_handle: u32,
-    pub next_user_alloc_va: u64,
-    pub next_user_alloc_high: u64,
-    pub next_struct_va: u64,
-    pub next_shared_va: u64,
     /// Área de strings das entradas LDR (bump próprio).
     pub next_ldr_string_va: u64,
     pub ldr_string_region_end: u64,
@@ -249,10 +237,6 @@ impl State {
             instrumentation_callback: 0,
             termination_rsp: 0,
             next_user_handle: 0x100,
-            next_user_alloc_va: USER_ALLOC_BASE,
-            next_user_alloc_high: 0x7F_EFF0_0000,
-            next_struct_va: USER_STRUCT_BASE,
-            next_shared_va: USER_SHARED_BASE,
             next_ldr_string_va: 0,
             ldr_string_region_end: 0,
             api_set_map_va: 0,

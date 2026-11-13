@@ -9,7 +9,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ntos::mm::section::map_view_parameters::View as Request;
+use crate::ntos::mm::memory_map;
 use crate::ntos::mm::section::address::{self as section_address, FindOptions};
+use crate::ntos::ps::user::memory as user_memory;
 use crate::ntos::mm::section::views::{self as section_views, ImageView, OwnedView};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ob::objects::section as section_objects;
@@ -68,12 +70,6 @@ fn read32(bytes: &[u8], at: usize) -> Option<u32> {
     bytes.get(at..at + 4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
 }
 
-fn occupied() -> Vec<section_address::Region> {
-    let mut regions: Vec<section_address::Region> = state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).chain(state.shared_user_regions.iter()).map(|region| section_address::Region { base: region.base(), size: region.size() }).collect());
-    regions.extend(section_views::all().iter().map(|view| section_address::Region { base: view.base(), size: view.size() }));
-    regions
-}
-
 pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: RegionKind) -> Result<Result<Mapped, u32>, KernelError> {
     let Some(file) = section.file.clone() else { return Ok(Err(0xC000_0185)) };
     // O cabeçalho PE dá a base preferida.
@@ -86,11 +82,14 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let Some(preferred) = preferred else { return Ok(Err(0xC000_0185)) };
     let (offset, size) = (request.offset, request.size);
     let top_down = request.allocation & 0x10_0000 != 0;
-    let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: 65536, top_down, start: if top_down { 0 } else { 0x1_8000_0000 }, ..FindOptions::default() };
-    let occupied = occupied();
+    let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, ..FindOptions::default() };
+    let occupied = user_memory::occupied();
+    // Sem base pedida: a ImageBase do cabeçalho quando está livre, senão a
+    // primeira faixa livre (STATUS_IMAGE_NOT_AT_BASE).
     let mut found = None;
-    if request.base == 0 && preferred <= (1 << 53) - 1 && preferred >= 0x1_0000_0000 {
-        found = section_address::find(&FindOptions { base: preferred + offset, ..options }, &occupied).ok();
+    let wanted = preferred.wrapping_add(offset);
+    if request.base == 0 && wanted % memory_map::ALLOCATION_GRANULARITY == 0 && memory_map::is_user_range(wanted, size) {
+        found = section_address::find(&FindOptions { base: wanted, ..options }, &occupied).ok();
     }
     let base = match found {
         Some(base) => base,

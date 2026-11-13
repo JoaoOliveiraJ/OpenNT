@@ -17,7 +17,7 @@ pub fn contains(token: u64, identifier: Option<&[u8]>) -> bool {
 /// Bytes do SID de kernel; o construtor nativo da ACL rejeita endereços de
 /// usuário antes de ler.
 pub fn read_security_identifier(pointer: u64) -> Option<Vec<u8>> {
-    if pointer <= 0x7FFF_FFFF_0000 {
+    if pointer <= crate::ntos::mm::memory_map::USER_PROBE_ADDRESS {
         return None;
     }
     let identifier = sid::at(pointer);

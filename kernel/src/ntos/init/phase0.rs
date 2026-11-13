@@ -37,8 +37,8 @@ pub fn init() {
     native_pfn_database::initialize().unwrap_or_else(|error| panic!("PFN nativo: {error}"));
     // registra o ntoskrnl na sua ImageBase e publica os limites de usuário
     loaded_images::init_kernel().unwrap_or_else(|error| panic!("imagem do kernel: {error}"));
-    kernel_data::write("MmUserProbeAddress", memory_map::USER_ADDRESS_LIMIT);
-    kernel_data::write("MmHighestUserAddress", memory_map::USER_ADDRESS_LIMIT - 1);
+    kernel_data::write("MmUserProbeAddress", memory_map::USER_PROBE_ADDRESS);
+    kernel_data::write("MmHighestUserAddress", memory_map::HIGHEST_USER_ADDRESS);
     pcr::init().unwrap_or_else(|error| panic!("KPCR: {error}")); // KPCR do BSP + IA32_GS_BASE
     pool_lock::init().unwrap_or_else(|error| panic!("pool lock: {error}")); // lock nativo da arena NT
     crate::ntos::io::volume_parameters::init().unwrap_or_else(|error| panic!("{error}")); // LockQueueIoVpbLock antes dos drivers nativos

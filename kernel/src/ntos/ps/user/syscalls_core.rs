@@ -316,9 +316,9 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
                 basic.page_size.probe_set(0x1000)?;
                 basic.number_of_physical_pages.probe_set(pages as u32)?;
                 basic.highest_physical_page_number.probe_set((pages - 1) as u32)?;
-                basic.allocation_granularity.probe_set(0x10000)?;
-                basic.minimum_user_mode_address.probe_set(0x10000)?;
-                basic.maximum_user_mode_address.probe_set(memory_map::USER_ADDRESS_LIMIT - 1)?;
+                basic.allocation_granularity.probe_set(memory_map::ALLOCATION_GRANULARITY as u32)?;
+                basic.minimum_user_mode_address.probe_set(memory_map::LOWEST_USER_ADDRESS)?;
+                basic.maximum_user_mode_address.probe_set(memory_map::HIGHEST_USER_ADDRESS)?;
                 basic.active_processors_affinity_mask.probe_set(online_mask())?;
                 basic.number_of_processors.probe_set(smp::online_cpu_count() as i8)?;
                 set_returned(SystemBasicInformation::SIZE as u32)?;

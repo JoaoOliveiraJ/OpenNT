@@ -42,7 +42,7 @@ pub fn length(pointer: u64) -> u32 {
 /// RtlValidSid do kernel: endereços de usuário são rejeitados antes da
 /// leitura; o ULONG final não é sondado.
 pub fn valid(pointer: u64) -> bool {
-    if pointer <= 0x7FFF_FFFF_0000 {
+    if pointer <= crate::ntos::mm::memory_map::USER_PROBE_ADDRESS {
         return false;
     }
     let sid = at(pointer);

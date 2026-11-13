@@ -47,7 +47,8 @@ pub fn write_block(address: u64, bytes: &[u8]) -> Result<(), u32> {
     }
     guest::try_write_bytes(address, bytes).map_err(|_| ACCESS_VIOLATION)
 }
-const USER_PROBE_LIMIT: u64 = 0x7FFF_FFFF_0000;
+/// MmUserProbeAddress.
+const USER_PROBE_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 
 /// UserMode sonda a faixa de usuário; KernelMode exige páginas presentes
 /// (com falha de residência resolvida) e endereço canônico.

@@ -805,22 +805,26 @@ pub struct MapRequest {
     pub commit_size: u64,
     pub upper: Option<u64>,
     pub minimum: Option<u64>,
-    pub wrap: bool,
 }
 
 /// Vista mapeada ou o NTSTATUS da recusa.
 pub type Mapped = Result<Arc<View>, u32>;
 
-fn occupied_regions() -> Vec<section_address::Region> {
-    let mut regions: Vec<section_address::Region> = state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).chain(state.shared_user_regions.iter()).map(|region| section_address::Region { base: region.base(), size: region.size() }).collect());
+/// O que já ocupa a faixa onde a vista vai: a metade de usuário inteira
+/// (`memory::occupied`) ou as vistas do espaço de sistema.
+fn occupied_regions(system_space: bool) -> Vec<section_address::Region> {
+    if !system_space {
+        return super::memory::occupied();
+    }
+    let mut regions: Vec<section_address::Region> = state::with(|state| state.section_kernel_views.iter().map(|region| section_address::Region { base: region.base(), size: region.size() }).collect());
     regions.extend(VIEWS.lock().iter().map(|view| section_address::Region { base: view.base, size: view.size }));
     regions.extend(section_views::all().iter().map(|view| section_address::Region { base: view.base(), size: view.size() }));
     regions
 }
 
 /// Mapeia a vista: alinhamento, proteção compatível, extensão, endereço
-/// livre (cursor de usuário, de cima ou compartilhado), commit pedido e
-/// alias das páginas já confirmadas.
+/// livre (a primeira faixa a partir de 64 KB, ou de cima no MEM_TOP_DOWN),
+/// commit pedido e alias das páginas já confirmadas.
 pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, KernelError> {
     if section.state.lock().destroyed {
         return Ok(Err(0xC000_0008));
@@ -860,17 +864,9 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     } else if base != 0 && (base > MAX_SAFE_INTEGER || base % alignment != 0) {
         return Ok(Err(0xC000_0220));
     }
-    let start = state::with(|state| {
-        if options.supervisor {
-            state.next_shared_va
-        } else if options.top_down {
-            state.next_user_alloc_high
-        } else {
-            state.next_user_alloc_va
-        }
-    });
-    let find = section_address::FindOptions { system_space: options.system_space, size, alignment, base, top_down: options.top_down, upper: options.upper, minimum: options.minimum, start, wrap: options.wrap };
-    let base = match section_address::find(&find, &occupied_regions()) {
+    // Primeira faixa livre (de baixo para cima, ou de cima no MEM_TOP_DOWN).
+    let find = section_address::FindOptions { system_space: options.system_space, size, alignment, base, top_down: options.top_down, upper: options.upper, minimum: options.minimum };
+    let base = match section_address::find(&find, &occupied_regions(options.system_space)) {
         Ok(base) => base,
         Err(status) => return Ok(Err(status)),
     };
@@ -939,16 +935,8 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
             }
         } else if view.supervisor {
             state.section_kernel_views.push(region);
-            if !view.system_space {
-                state.next_shared_va = state.next_shared_va.max(base + size + GRANULARITY);
-            }
         } else {
             state.user_regions.push(region);
-            if options.top_down {
-                state.next_user_alloc_high = base - GRANULARITY;
-            } else {
-                state.next_user_alloc_va = state.next_user_alloc_va.max(base + size + GRANULARITY);
-            }
         }
     });
     Ok(Ok(view))

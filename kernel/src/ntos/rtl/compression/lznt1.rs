@@ -48,7 +48,7 @@ const BOUNDARY: [usize; 17] = [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x800, 0x
 const WORK_SPACE_TABLE: u64 = 0x20;
 const HASH_SLOTS: usize = 4096 * 2;
 /// MM_USER_PROBE_ADDRESS usado pelo LZNT1DecompressChunkNewThread.
-const USER_LIMIT: u64 = 0x7FFF_FFFF_0000;
+const USER_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 
 /// Cabeçalho do workspace do LZNT1 (layout interno do ntoskrnl, sem nome
 /// público): início e fim do chunk corrente, MaxLength do formato vigente e o

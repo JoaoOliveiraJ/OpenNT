@@ -17,7 +17,8 @@ use crate::ntos::inc::types::Ethread;
 const THREAD_PAGE_PRIORITY: u32 = 24;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
 const PAGE_PRIORITY_SIZE: u64 = 4;
-pub(crate) const USER_PROBE_LIMIT: u64 = 0x7FFF_FFFF_0000;
+/// MmUserProbeAddress.
+pub(crate) const USER_PROBE_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 pub(crate) const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 /// Classes do ramo INVALID_INFO_CLASS da imagem de referência 19041.
 const REJECTED_QUERY_CLASSES: [u32; 12] = [2, 3, 4, 5, 7, 8, 10, 13, 15, 19, 27, 28];

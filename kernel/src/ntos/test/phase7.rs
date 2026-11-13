@@ -695,7 +695,7 @@ fn user_virtual_memory(assert: Assert) {
     // MEM_COMMIT|MEM_RESERVE com páginas reais de usuário.
     let committed = allocate(0, 0x2800, 0x3000, 4);
     let data = guest::read64(base_pointer);
-    assert(committed == 0 && data >= 0x2_0000_0000 && guest::read64(size_pointer) == 0x3000 && paging::translate(data + 0x2000) != 0 && paging::access_flags(data) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW, "usermemory: NtAllocateVirtualMemory confirma paginas de usuario");
+    assert(committed == 0 && data >= crate::ntos::mm::memory_map::LOWEST_USER_ADDRESS && data % 0x10000 == 0 && guest::read64(size_pointer) == 0x3000 && paging::translate(data + 0x2000) != 0 && paging::access_flags(data) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW, "usermemory: NtAllocateVirtualMemory confirma paginas de usuario");
     // Reserva e commit da subfaixa.
     let reserved_status = allocate(0, 0x4000, 0x2000, 4);
     let reserved = guest::read64(base_pointer);
@@ -713,7 +713,7 @@ fn user_virtual_memory(assert: Assert) {
         memory::nt_protect_virtual_memory(u64::MAX, parameters, parameters + 8, value, protect_rsp).unwrap_or(1)
     };
     assert(protect(reserved + 0x1000, 0x1000, 2) == 0 && guest::read32(parameters + 16) == 4 && paging::access_flags(reserved + 0x1000) & paging::PAGE_RW == 0 && memory_query::describe(reserved + 0x1000, &Context::current()).protect == 2, "usermemory: NtProtectVirtualMemory devolve a protecao anterior e retira RW");
-    assert(protect(reserved, 0x1000, 2) == 0xC000_002D && guest::read32(parameters + 16) == 1 && protect(0x1_0000, 0x1000, 2) == 0xC000_0018 && protect(reserved + 0x1000, 0x1000, 3) == 0xC000_0045, "usermemory: pagina nao confirmada, endereco sem regiao e protecao invalida");
+    assert(protect(reserved, 0x1000, 2) == 0xC000_002D && guest::read32(parameters + 16) == 1 && protect(0x8000, 0x1000, 2) == 0xC000_0018 && protect(reserved + 0x1000, 0x1000, 3) == 0xC000_0045, "usermemory: pagina nao confirmada, endereco sem regiao e protecao invalida");
     assert(memory::nt_protect_virtual_memory(u64::MAX, block, block + 8, 2, protect_rsp).is_ok_and(|status| status == 0xC000_0005), "usermemory: parametros fora da memoria de usuario");
     // NtRead/WriteVirtualMemory pelas PTEs de usuário.
     let transfer_rsp = data + 0x800;
@@ -729,11 +729,10 @@ fn user_virtual_memory(assert: Assert) {
         memory::nt_free_virtual_memory(u64::MAX, base_pointer, size_pointer, kind, 0).unwrap_or(1)
     };
     assert(free(reserved + 0x1000, 0x1000, 0x4000) == 0 && paging::translate(reserved + 0x1000) == 0 && memory::find_region(reserved).is_some(), "usermemory: MEM_DECOMMIT desmapeia e conserva a reserva");
-    assert(free(reserved, 0x1000, 0x8000) == 0xC000_000D && free(reserved, 0, 0x8000) == 0 && memory::find_region(reserved).is_none() && free(0x1_0000, 0, 0x8000) == 0xC000_000D, "usermemory: MEM_RELEASE exige base e tamanho zero e libera a regiao");
+    assert(free(reserved, 0x1000, 0x8000) == 0xC000_000D && free(reserved, 0, 0x8000) == 0 && memory::find_region(reserved).is_none() && free(0x8000, 0, 0x8000) == 0xC000_000D, "usermemory: MEM_RELEASE exige base e tamanho zero e libera a regiao");
     // Estruturas do processo e regiões compartilhadas.
-    let next = state::with(|state| state.next_struct_va);
     let structures = memory::map_user_region(0x1800);
-    assert(structures.as_ref().is_ok_and(|&va| va == next && paging::translate(va + 0x1000) != 0) && state::with(|state| state.next_struct_va) == next + 0x2000, "usermemory: regiao de estruturas pelo cursor proprio");
+    assert(structures.as_ref().is_ok_and(|&va| va % 0x1000 == 0 && va > data && va + 0x2000 <= memory::USER_ALLOCATION_TOP && paging::translate(va + 0x1000) != 0 && memory::find_region(va).is_some_and(|region| region.base() == va && region.size() == 0x2000)), "usermemory: regiao de estruturas de cima para baixo, pelo alocador");
     let shared = memory::map_shared_user_region(0x1000);
     assert(shared.as_ref().is_ok_and(|&va| paging::translate(va) != 0 && state::with(|state| state.shared_user_regions.iter().any(|region| region.base() == va))), "usermemory: regiao compartilhada mapeada");
     if let Ok(va) = structures {
@@ -1764,13 +1763,13 @@ fn user_system_services(assert: Assert) {
     let process_pointer = guest::alloc_bytes(nt::Eprocess::SIZE);
     guest::write_bytes(process_pointer, &alloc::vec![0u8; nt::Eprocess::SIZE as usize]);
     let (saved_peb, saved_ldr, regions_before) = state::with(|state| (state.current_peb_va, state.current_ldr_va, state.user_regions.len()));
-    let built = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, process_pointer, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44 });
+    let built = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, process_pointer, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44, stack_base: 0x20_0000, stack_top: 0x30_0000 });
     if let Ok(teb) = built {
         let (peb, ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
         let (teb_view, peb_view, ldr_data) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr)) };
         let rupp = peb_view.process_parameters.get();
         let parameters = unsafe { nt::RtlUserProcessParameters::at(rupp) };
-        assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == 0x6F0 && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && unsafe { nt::Eprocess::at(process_pointer) }.peb.get() == peb, "userservices: TEB e PEB publicados");
+        assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == 0x6F0 && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && unsafe { nt::Eprocess::at(process_pointer) }.peb.get() == peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada) e PEB publicados");
         assert(peb_view.image_base_address.get() == 0x1_4000_0000 && peb_view.ldr.get() == ldr && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2");
         assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
         let image_path = parameters.image_path_name.buffer.get();
@@ -1953,7 +1952,7 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && guest::read32(state::EXIT_CODE_CELL) == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
     guest::write32(state::EXIT_CODE_CELL, exit_cell);
     // Informações do sistema.
-    assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.maximum_user_mode_address.get() == crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT - 1 } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION");
+    assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
     assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
     guest::write64(buffer, u64::MAX);
     assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
@@ -2160,6 +2159,123 @@ fn user_ring3(assert: Assert) {
     }
 }
 
+/// A metade de usuário do Windows 10 19041 x64: memória de usuário abaixo de
+/// 4 GB lida e escrita do anel 3, base abaixo de 64 KB recusada como no NT,
+/// a primeira faixa livre de 64 KB numa alocação sem base (sem cursor: uma
+/// faixa liberada volta a ser a escolhida), MEM_TOP_DOWN a partir do topo e
+/// os limites de usuário exportados.
+fn user_address_floor(assert: Assert) {
+    use crate::hal::amd64::usermode;
+    use crate::ntos::mm::{kernel_data, memory_map as map, paging};
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::memory;
+    // (d) MmUserProbeAddress e MmHighestUserAddress do 19041, pela célula e
+    // pelo export que um driver importa.
+    let exported = |name: &str| match crate::ntos::init::exports::lookup("ntoskrnl.exe", name) {
+        Some(ResolvedImport::Address { address, .. }) => guest::read64(address),
+        _ => 0,
+    };
+    assert(kernel_data::read("MmUserProbeAddress") == 0x7FFF_FFFF_0000 && kernel_data::read("MmHighestUserAddress") == 0x7FFF_FFFE_FFFF && exported("MmUserProbeAddress") == 0x7FFF_FFFF_0000 && exported("MmHighestUserAddress") == 0x7FFF_FFFE_FFFF, "userfloor: MmUserProbeAddress e MmHighestUserAddress com os valores do 19041");
+    assert(map::LOWEST_USER_ADDRESS == 0x1_0000 && map::USER_ADDRESS_LIMIT == 0x7FFF_FFFF_0000 && map::HIGHEST_VAD_ADDRESS == 0x7FFF_FFFD_FFFF, "userfloor: constantes internas iguais aos exports");
+    let block = guest::alloc_bytes(0x100);
+    let (base_pointer, size_pointer, rsp) = (block, block + 8, block + 0x40);
+    let allocate = |base: u64, size: u64, kind: u32, protect: u32| {
+        guest::write64(base_pointer, base);
+        guest::write64(size_pointer, size);
+        guest::write32(rsp + 0x28, kind);
+        guest::write32(rsp + 0x30, protect);
+        memory::nt_allocate_virtual_memory(u64::MAX, base_pointer, 0, size_pointer, rsp).unwrap_or(1)
+    };
+    let release = |base: u64| {
+        guest::write64(base_pointer, base);
+        guest::write64(size_pointer, 0);
+        memory::nt_free_virtual_memory(u64::MAX, base_pointer, size_pointer, 0x8000, 0).unwrap_or(1)
+    };
+    // Uma faixa está livre se nenhuma região, vista ou PTE a ocupa.
+    let free = |base: u64, size: u64| {
+        let occupied = memory::occupied();
+        !occupied.iter().any(|region| base < region.base + region.size && base + size > region.base) && paging::find_mapping(base, size).is_none()
+    };
+    // Varredura independente do alocador, de 64 KB em 64 KB.
+    let lowest_free = |size: u64| (map::LOWEST_USER_ADDRESS..0x1_0000_0000).step_by(0x10000).find(|&base| free(base, size)).unwrap_or(0);
+    let highest_free = |size: u64| {
+        let top = (map::HIGHEST_VAD_ADDRESS + 1 - size) & !0xFFFF;
+        (0..0x10000u64).map(|step| top - step * 0x10000).find(|&base| free(base, size)).unwrap_or(0)
+    };
+
+    // (b) Base abaixo de MM_LOWEST_USER_ADDRESS: STATUS_CONFLICTING_ADDRESSES
+    // (a reserva desce a 0, como no MiIsVaRangeAvailable), sem nada mapeado.
+    assert(allocate(0x1000, 0x1000, 0x3000, 4) == 0xC000_0018 && allocate(0xF000, 0x1000, 0x2000, 4) == 0xC000_0018 && allocate(0x8000, 0x1_0000, 0x3000, 4) == 0xC000_0018 && allocate(0xFFFF, 1, 0x1000, 4) == 0xC000_0018, "userfloor: base abaixo de 64 KB recusada com STATUS_CONFLICTING_ADDRESSES");
+    assert(paging::find_mapping(0, map::LOWEST_USER_ADDRESS).is_none() && memory::find_region(0x1000).is_none(), "userfloor: os primeiros 64 KB seguem sem mapeamento");
+    assert(allocate(map::HIGHEST_VAD_ADDRESS + 1, 0x1000, 0x3000, 4) == 0xC000_0018 && allocate(0x7FFF_FFFF_0000, 0x1000, 0x3000, 4) == 0xC000_000D, "userfloor: base acima do ultimo VAD e alem de MmHighestUserAddress");
+
+    // (c) Sem base: a primeira faixa livre alinhada a 64 KB a partir do piso.
+    let expected = lowest_free(0x3000);
+    let first_status = allocate(0, 0x3000, 0x3000, 4);
+    let first = guest::read64(base_pointer);
+    assert(first_status == 0 && expected != 0 && first == expected && first < 0x1_0000_0000 && guest::read64(size_pointer) == 0x3000, "userfloor: sem base, a faixa livre mais baixa de 64 KB a partir do piso");
+    let second_expected = lowest_free(0x1000);
+    let second_status = allocate(0, 0x1000, 0x3000, 4);
+    let second = guest::read64(base_pointer);
+    assert(second_status == 0 && second == second_expected && second != first, "userfloor: a seguinte vai para a proxima faixa livre");
+    let released = release(first);
+    let again_status = allocate(0, 0x3000, 0x3000, 4);
+    let again = guest::read64(base_pointer);
+    assert(released == 0 && again_status == 0 && again == first, "userfloor: faixa liberada volta a ser a primeira escolhida (sem cursor)");
+    // MEM_RESERVE com base: a base desce à granularidade de 64 KB.
+    let reserve_at = lowest_free(0x1_0000);
+    let rounded_status = allocate(reserve_at + 0x3000, 0x1000, 0x2000, 4);
+    assert(rounded_status == 0 && guest::read64(base_pointer) == reserve_at && guest::read64(size_pointer) == 0x4000, "userfloor: reserva com base desce a 64 KB e cobre ate o fim pedido");
+    // MEM_TOP_DOWN: a primeira faixa livre a partir de MM_HIGHEST_VAD_ADDRESS.
+    let top_expected = highest_free(0x1000);
+    let top_status = allocate(0, 0x1000, 0x10_3000, 4);
+    let top = guest::read64(base_pointer);
+    assert(top_status == 0 && top == top_expected && top > 0x7FFF_0000_0000 && top + 0x1000 <= map::HIGHEST_VAD_ADDRESS + 1, "userfloor: MEM_TOP_DOWN a partir do topo das alocacoes");
+
+    // (a) Base fixa abaixo de 4 GB, lida e escrita do anel 3.
+    let target = (0x5000_0000u64..0x7FF0_0000).step_by(0x10000).find(|&base| free(base, 0x1_0000)).unwrap_or(0);
+    let fixed_status = allocate(target, 0x1_0000, 0x3000, 4);
+    let mapped = fixed_status == 0 && target != 0 && guest::read64(base_pointer) == target && paging::access_flags(target) & (paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW;
+    assert(mapped, "userfloor: base fixa abaixo de 4 GB mapeada com paginas de usuario");
+    let code_status = allocate(0, 0x1000, 0x3000, 0x40);
+    let code = guest::read64(base_pointer);
+    let stack_status = allocate(0, 0x4000, 0x3000, 4);
+    let stack = guest::read64(base_pointer);
+    let armed = usermode::ready() && state::with(|state| state.name_by_number.get(&0x2C).is_some_and(|name| name == "NtTerminateProcess"));
+    if mapped && armed && code_status == 0 && stack_status == 0 {
+        guest::write32(target + 8, 0x1234);
+        // mov rax, target; mov edx, [rax+8]; add edx, 0x1111; mov [rax], edx;
+        // NtTerminateProcess(-1, edx).
+        let mut program: alloc::vec::Vec<u8> = alloc::vec![0x48, 0xB8];
+        program.extend_from_slice(&target.to_le_bytes());
+        program.extend_from_slice(&[0x8B, 0x50, 0x08, 0x81, 0xC2, 0x11, 0x11, 0x00, 0x00, 0x89, 0x10]);
+        program.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE]);
+        guest::write_bytes(code, &program);
+        let previous = process::get_current_thread();
+        if let Ok(thread) = process::create_kernel_thread(process::get_current_process(), 0x7F14, true, 1, None) {
+            process::set_current_thread(thread);
+            let exit_cell = guest::read32(state::EXIT_CODE_CELL);
+            let exited = usermode::exec_user_mode(code, stack + 0x4000 - 0x28, 0, 0, 0, 0);
+            guest::write32(state::EXIT_CODE_CELL, exit_cell);
+            process::set_current_thread(previous);
+            let _ = process::release_thread(thread);
+            assert(exited == 0x2345 && guest::read32(target) == 0x2345 && code < 0x1_0000_0000 && stack < 0x1_0000_0000, "userfloor: o anel 3 le e escreve a memoria abaixo de 4 GB, com codigo e pilha tambem abaixo de 4 GB");
+        } else {
+            assert(false, "userfloor: thread de usuario");
+        }
+    } else {
+        assert(false, "userfloor: anel 3 armado com codigo e pilha de usuario");
+    }
+    for base in [first, second, reserve_at, top, target, code, stack] {
+        if memory::find_region(base).is_some() {
+            release(base);
+        }
+    }
+    assert(memory::find_region(target).is_none() && paging::translate(target) == 0, "userfloor: regioes liberadas");
+    guest::free_bytes(block);
+}
+
 /// PE x64 mínimo de uma seção (código ou dados) com o conteúdo dado em 0x1000.
 fn single_section_image(image_base: u64, characteristics: u16, section_name: &[u8], section_flags: u32, entry: u32, content: &[u8]) -> alloc::vec::Vec<u8> {
     let mut image = alloc::vec![0u8; 0x600];
@@ -2233,7 +2349,16 @@ fn user_windows_process(assert: Assert) {
     // Executável que encerra o processo com 0x5A pela syscall.
     let entry: &[u8] = &[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0xBA, 0x5A, 0x00, 0x00, 0x00, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE];
     let exe = single_section_image(0x1_4000_0000, 0x0022, b".text", 0x6000_0020, 0x1000, entry);
-    let result = process::run_windows_process(Some(exe), "opennt-teste.exe", "C:\\opennt-teste.exe", None, process::RunOptions::default());
+    // Onde o processo ficou: a imagem principal, a PEB e a base da pilha
+    // da primeira thread (StackLimit da TEB, logo abaixo da PEB).
+    let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
+    let created = |_process_id: u64| -> Result<(), KernelError> {
+        let (exe_base, peb) = state::with(|state| (state.process_images.iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base()), state.current_peb_va));
+        let stack = if peb != 0 { unsafe { nt::Teb::at(peb - 0x2000) }.nt_tib.stack_limit.get() } else { 0 };
+        placed.set((exe_base, peb, stack));
+        Ok(())
+    };
+    let result = process::run_windows_process(Some(exe), "opennt-teste.exe", "C:\\opennt-teste.exe", None, process::RunOptions { on_process_created: Some(&created), ..process::RunOptions::default() });
     let ran = matches!(result, Ok(0x5A));
     if !ran {
         crate::debug_print!("[userprocess] resultado {:?}", result.as_ref().map_err(|error| alloc::format!("{error}")));
@@ -2241,6 +2366,10 @@ fn user_windows_process(assert: Assert) {
     assert(ran, "userprocess: runWindowsProcess passa por LdrInitializeThunk, entra no exe e sai com o codigo");
     assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0) && state.current_image_path == "C:\\opennt-teste.exe") && crate::ntos::ps::user::threads::all().len() == 1, "userprocess: apiset, NLS, caminho da imagem e thread principal do processo");
     assert(state::with(|state| state.user_regions.is_empty()), "userprocess: recursos do processo liberados na saida");
+    let (exe_base, peb, stack) = placed.get();
+    let user = |address: u64| crate::ntos::mm::memory_map::is_user_range(address, 0x1000);
+    assert(exe_base == 0x1_4000_0000 && user(peb) && peb % 0x1000 == 0 && user(stack) && stack % 0x10000 == 0 && stack < 0x1_0000_0000, "userprocess: exe na ImageBase, PEB e pilha escolhidas pelo alocador (pilha de baixo para cima, abaixo de 4 GB)");
+    assert(crate::ntos::mm::paging::find_mapping(exe_base, 0x2000).is_none() && crate::ntos::mm::paging::translate(stack) == 0, "userprocess: imagem principal e pilha desfeitas na saida");
     // Remove a instalação mínima do volume.
     for (name, _) in &files {
         let Ok(block) = memory::map_user_region(0x1000) else { continue };
@@ -4827,6 +4956,7 @@ pub fn run(assert: Assert) {
     user_syscalls_core(assert);
     user_index(assert);
     user_ring3(assert);
+    user_address_floor(assert);
     user_tokens(assert);
     user_query_object(assert);
     user_remove_completion(assert);

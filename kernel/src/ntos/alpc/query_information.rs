@@ -19,7 +19,7 @@ use core::mem::offset_of;
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const INVALID_PARAMETER: u32 = 0xC000_000D;
-const USER_LIMIT: u64 = 0x7FFF_FFFF_0000;
+const USER_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 
 /// ReturnLength não exige alinhamento. Na classe 0 vem depois dos campos;
 /// na classe 3 recebe zero antes da captura do SID.

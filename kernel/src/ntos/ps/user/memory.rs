@@ -4,11 +4,20 @@
 //! (reserva, commit e top-down), o mapeamento de pilha, estruturas e regiões
 //! compartilhadas (frames do PFN com U/S=1) e os handlers Nt*VirtualMemory.
 //!
+//! A VA segue o NT (Windows 10 19041 x64): nada abaixo de
+//! MM_LOWEST_USER_ADDRESS (64 KB) e nada acima de MM_HIGHEST_VAD_ADDRESS; sem
+//! base, a primeira faixa livre de baixo para cima com granularidade de
+//! 64 KB (MEM_TOP_DOWN: a primeira de cima para baixo); com base, a reserva
+//! desce aos 64 KB e uma base abaixo do piso falha com
+//! STATUS_CONFLICTING_ADDRESSES. Pilhas, PEB/TEB e as demais estruturas que
+//! o kernel monta para o processo também saem do alocador: não há janela
+//! fixa na metade de usuário além da KUSER_SHARED_DATA em 0x7FFE0000.
+//!
 //! O processo de usuário ativo usa os VADs do runtime (`state`); os demais
 //! processos (o System, onde rodam os DriverEntry) têm as próprias regiões
-//! privadas aqui, alocadas por ZwAllocateVirtualMemory de kernel numa janela
-//! alta do espaço de usuário. Como a tabela de páginas é uma só, a escolha de
-//! endereço considera as regiões de todos os espaços.
+//! privadas aqui, alocadas por ZwAllocateVirtualMemory de kernel. Como a
+//! tabela de páginas é uma só, a escolha de endereço considera as regiões de
+//! todos os espaços (`occupied`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -17,9 +26,9 @@ use core::any::Any;
 
 use super::memory_query::{self, Context};
 use super::sections::{self, View};
-use super::state::{self, Region, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER, USER_STACK_SIZE, USER_STACK_TOP};
+use super::state::{self, Region, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER, USER_STACK_SIZE};
 use crate::hal::physical;
-use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
+use crate::ntos::mm::memory_map::{self as map, USER_ADDRESS_LIMIT};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
 use crate::ntos::mm::section::{address as section_address, views as section_views};
@@ -29,7 +38,11 @@ use crate::ntos::inc::types::{Eprocess, MemAddressRequirements, MemExtendedParam
 
 const PAGE: u64 = 0x1000;
 const MAX_SAFE: u64 = (1 << 53) - 1;
-const DEFAULT_HIGHEST: u64 = 0x7FF_FFFF_F000;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_TOP_DOWN: u32 = 0x10_0000;
+/// Limite exclusivo das alocações de usuário (MM_HIGHEST_VAD_ADDRESS + 1).
+pub const USER_ALLOCATION_TOP: u64 = map::HIGHEST_VAD_ADDRESS + 1;
 
 pub struct PrivateMut {
     pub frames: BTreeMap<u64, u64>,
@@ -111,17 +124,8 @@ fn contains(region: &Region, va: u64) -> bool {
     va >= region.base() && va < region.base() + region.size()
 }
 
-/// Janela das regiões privadas dos processos sem runtime de usuário.
-pub const FOREIGN_BASE: u64 = 0x7000_0000_0000;
-const FOREIGN_TOP: u64 = 0x7FFF_FFFE_0000;
-
-struct ForeignSpace {
-    regions: Vec<Region>,
-    next_va: u64,
-    next_high: u64,
-}
-
-static FOREIGN: SpinLock<BTreeMap<u64, ForeignSpace>> = SpinLock::new(BTreeMap::new());
+/// Regiões privadas dos processos sem runtime de usuário, por EPROCESS.
+static FOREIGN: SpinLock<BTreeMap<u64, Vec<Region>>> = SpinLock::new(BTreeMap::new());
 
 /// O espaço de endereçamento de usuário de um processo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,50 +149,14 @@ impl Space {
     fn find(self, va: u64) -> Option<Region> {
         match self {
             Space::Active => find_region(va),
-            Space::Foreign(process) => FOREIGN.lock().get(&process).and_then(|space| space.regions.iter().find(|region| contains(region, va)).cloned()),
+            Space::Foreign(process) => FOREIGN.lock().get(&process).and_then(|regions| regions.iter().find(|region| contains(region, va)).cloned()),
         }
     }
 
-    fn default_highest(self) -> u64 {
+    fn insert(self, region: Region) {
         match self {
-            Space::Active => DEFAULT_HIGHEST,
-            Space::Foreign(_) => FOREIGN_TOP,
-        }
-    }
-
-    fn cursor(self, top_down: bool) -> u64 {
-        match self {
-            Space::Active => state::with(|state| if top_down { state.next_user_alloc_high } else { state.next_user_alloc_va }),
-            Space::Foreign(process) => FOREIGN.lock().get(&process).map_or(if top_down { FOREIGN_TOP } else { FOREIGN_BASE }, |space| if top_down { space.next_high } else { space.next_va }),
-        }
-    }
-
-    /// Registra a região; uma escolha automática avança o cursor.
-    fn insert(self, region: Region, automatic: bool, top_down: bool) {
-        let (base, size) = (region.base(), region.size());
-        let advance = |next_va: &mut u64, next_high: &mut u64| {
-            if automatic {
-                if top_down {
-                    *next_high = base - 0x1_0000;
-                } else {
-                    *next_va = base + size + 0x1_0000;
-                }
-            }
-        };
-        match self {
-            Space::Active => state::with(|state| {
-                state.user_regions.push(region);
-                let (mut va, mut high) = (state.next_user_alloc_va, state.next_user_alloc_high);
-                advance(&mut va, &mut high);
-                state.next_user_alloc_va = va;
-                state.next_user_alloc_high = high;
-            }),
-            Space::Foreign(process) => {
-                let mut foreign = FOREIGN.lock();
-                let space = foreign.entry(process).or_insert(ForeignSpace { regions: Vec::new(), next_va: FOREIGN_BASE, next_high: FOREIGN_TOP });
-                space.regions.push(region);
-                advance(&mut space.next_va, &mut space.next_high);
-            }
+            Space::Active => state::with(|state| state.user_regions.push(region)),
+            Space::Foreign(process) => FOREIGN.lock().entry(process).or_default().push(region),
         }
     }
 
@@ -196,8 +164,8 @@ impl Space {
         match self {
             Space::Active => state::with(|state| state.remove_region(state::RegionKind::User, region)),
             Space::Foreign(process) => {
-                if let Some(space) = FOREIGN.lock().get_mut(&process) {
-                    space.regions.retain(|candidate| !state::same_region(candidate, region));
+                if let Some(regions) = FOREIGN.lock().get_mut(&process) {
+                    regions.retain(|candidate| !state::same_region(candidate, region));
                 }
             }
         }
@@ -206,12 +174,12 @@ impl Space {
 
 /// As regiões privadas de um processo sem runtime de usuário.
 pub fn foreign_regions(process: u64) -> Vec<Region> {
-    FOREIGN.lock().get(&process).map_or_else(Vec::new, |space| space.regions.clone())
+    FOREIGN.lock().get(&process).cloned().unwrap_or_default()
 }
 
 /// Libera as regiões privadas de um processo que saiu.
 pub fn release_foreign(process: u64) {
-    let regions = FOREIGN.lock().remove(&process).map_or_else(Vec::new, |space| space.regions);
+    let regions = FOREIGN.lock().remove(&process).unwrap_or_default();
     for region in regions {
         if let Some(owner) = private(&region) {
             free_region_pages(owner);
@@ -219,23 +187,33 @@ pub fn release_foreign(process: u64) {
     }
 }
 
-/// Tudo o que ocupa VA de usuário na tabela de páginas única.
-fn all_occupied() -> Vec<section_address::Region> {
-    let mut occupied: Vec<section_address::Region> = state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).chain(state.shared_user_regions.iter()).map(|region| section_address::Region { base: region.base(), size: region.size() }).collect());
+/// Tudo o que ocupa VA de usuário na tabela de páginas única: regiões e
+/// imagens do processo ativo, regiões compartilhadas, vistas de seção de
+/// qualquer dono (inclusive reservas ainda sem página) e as regiões
+/// privadas dos outros processos. O que só existe nas PTEs (a
+/// KUSER_SHARED_DATA, imagens mapeadas sem região) o `mm/section/address`
+/// acha pela própria árvore de páginas.
+pub fn occupied() -> Vec<section_address::Region> {
+    let span = |region: &Region| section_address::Region { base: region.base(), size: region.size() };
+    let mut occupied: Vec<section_address::Region> = state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).chain(state.shared_user_regions.iter()).chain(state.section_kernel_views.iter()).map(span).collect());
+    occupied.extend(sections::views().iter().map(|view| section_address::Region { base: view.base, size: view.size }));
     occupied.extend(section_views::all().iter().map(|view| section_address::Region { base: view.base(), size: view.size() }));
-    for space in FOREIGN.lock().values() {
-        occupied.extend(space.regions.iter().map(|region| section_address::Region { base: region.base(), size: region.size() }));
+    for regions in FOREIGN.lock().values() {
+        occupied.extend(regions.iter().map(span));
     }
+    occupied.retain(|region| region.base < USER_ADDRESS_LIMIT);
     occupied
+}
+
+/// A primeira faixa livre de `size` bytes na metade de usuário, de baixo
+/// para cima ou (`top_down`) de cima para baixo, alinhada a `alignment`.
+pub fn find_free(size: u64, alignment: u64, top_down: bool) -> Result<u64, u32> {
+    section_address::find(&section_address::FindOptions { size, alignment, top_down, ..section_address::FindOptions::default() }, &occupied())
 }
 
 /// Região de usuário ou imagem que contém o endereço.
 pub fn find_region(va: u64) -> Option<Region> {
     state::with(|state| state.user_regions.iter().find(|region| contains(region, va)).cloned().or_else(|| state.process_images.iter().find(|region| contains(region, va)).cloned()))
-}
-
-pub fn region_free(base: u64, size: u64) -> bool {
-    base <= MAX_SAFE && size > 0 && size <= MAX_SAFE && base + size <= USER_ADDRESS_LIMIT && !state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).any(|region| base < region.base() + region.size() && base + size > region.base()))
 }
 
 fn private(region: &Region) -> Option<&PrivateRegion> {
@@ -307,22 +285,27 @@ pub fn map_region_pages(region: &PrivateRegion) -> bool {
 }
 
 /// O alocador de VA: commit sobre reserva própria, base fixa ou escolha
-/// pelo `mm/section/address` (MEM_TOP_DOWN desce abaixo das estruturas).
+/// pelo `mm/section/address` (primeira faixa livre; MEM_TOP_DOWN de cima).
 #[allow(clippy::too_many_arguments)]
 pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
     allocate_in(Space::Active, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
 }
 
-/// Reserva/commit no espaço dado; `highest` 0 usa o limite padrão do espaço.
+/// Reserva/commit no espaço dado. `lowest` é o piso pedido (nunca abaixo
+/// de MM_LOWEST_USER_ADDRESS) e `highest` o limite exclusivo (0, ou acima do
+/// topo, = MM_HIGHEST_VAD_ADDRESS + 1).
 #[allow(clippy::too_many_arguments)]
 pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
-    let highest = if highest == 0 { space.default_highest() } else { highest }.min(USER_ADDRESS_LIMIT);
+    let highest = if highest == 0 { USER_ALLOCATION_TOP } else { highest.min(USER_ALLOCATION_TOP) };
+    let lowest = lowest.max(map::LOWEST_USER_ADDRESS);
     // PVOID *BaseAddress e SIZE_T *RegionSize: de usuário (sondados pelo
     // handler) ou do kernel (Zw); os acessos são sondados nos dois casos.
-    let mut base = guest::try_read::<u64>(base_pointer)?;
+    let requested_base = guest::try_read::<u64>(base_pointer)?;
     let requested = guest::try_read::<u64>(size_pointer)?;
-    if base > MAX_SAFE || requested == 0 || requested > MAX_SAFE || base + requested > USER_ADDRESS_LIMIT {
-        debug_print!("[usermode] alloc invalida: base=0x{:x} size=0x{:x} type=0x{:x}", base, requested, allocation_type);
+    // Como o MiAllocateVirtualMemoryPrepare: base até MmHighestUserAddress e
+    // a faixa inteira abaixo de MmUserProbeAddress.
+    if requested_base > map::HIGHEST_USER_ADDRESS || requested == 0 || requested > MAX_SAFE || requested > USER_ADDRESS_LIMIT - requested_base {
+        debug_print!("[usermode] alloc invalida: base=0x{:x} size=0x{:x} type=0x{:x}", requested_base, requested, allocation_type);
         return Ok(STATUS_INVALID_PARAMETER);
     }
     if ![1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80].contains(&(protect & 0xFF)) {
@@ -331,13 +314,24 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     if protect & !0xFF != 0 {
         return Ok(0xC000_00BB);
     }
-    let size = (requested + base % PAGE).div_ceil(PAGE) * PAGE;
-    if base != 0 {
-        base &= !(PAGE - 1);
+    let fixed = requested_base != 0;
+    let reserve = allocation_type & MEM_RESERVE != 0;
+    // Uma reserva com base desce à granularidade de alocação (64 KB); o
+    // commit sobre uma reserva fica em páginas. O tamanho cobre até o fim
+    // pedido, arredondado à página.
+    let base = if !fixed {
+        0
+    } else if reserve {
+        requested_base & !(map::ALLOCATION_GRANULARITY - 1)
+    } else {
+        requested_base & !(PAGE - 1)
+    };
+    let size = if fixed { (requested_base + requested).div_ceil(PAGE) * PAGE - base } else { requested.div_ceil(PAGE) * PAGE };
+    if fixed {
         if let Some(existing) = space.find(base) {
             // COMMIT sem RESERVE dentro de uma região já reservada: comita a
             // subfaixa (só em regiões próprias; imagens nunca).
-            let commit_only = allocation_type & 0x2000 == 0 && allocation_type & 0x1000 != 0;
+            let commit_only = !reserve && allocation_type & MEM_COMMIT != 0;
             let view = view_of(&existing);
             let ours = private(&existing).is_some() || view.is_some();
             if commit_only && ours && base >= existing.base() && base + size <= existing.base() + existing.size() {
@@ -356,35 +350,36 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
             debug_print!("[usermode] alloc CONFLITO: base 0x{:x} size 0x{:x} tipo 0x{:x} - regiao em 0x{:x}", base, size, allocation_type, existing.base());
             return Ok(STATUS_CONFLICTING_ADDRESSES);
         }
+        // Os primeiros 64 KB nunca são mapeáveis (MiIsVaRangeAvailable).
         if base < lowest || base + size > highest {
             return Ok(STATUS_CONFLICTING_ADDRESSES);
         }
     }
-    let automatic = base == 0;
-    let top_down = allocation_type & 0x10_0000 != 0;
-    let occupied = all_occupied();
-    let start = space.cursor(top_down);
-    let find = section_address::FindOptions { base, size, minimum: Some(lowest), upper: Some(highest - 1), alignment: align, top_down, start, wrap: true, ..section_address::FindOptions::default() };
-    let base = match section_address::find(&find, &occupied) {
+    let top_down = allocation_type & MEM_TOP_DOWN != 0;
+    let find = section_address::FindOptions { base, size, minimum: Some(lowest), upper: Some(highest - 1), alignment: align, top_down, ..section_address::FindOptions::default() };
+    let base = match section_address::find(&find, &occupied()) {
         Ok(base) => base,
         Err(status) => return Ok(status),
     };
     let region = PrivateRegion::new(base, size, protect, allocation_type);
-    if allocation_type & 0x1000 != 0 && !map_region_pages(&region) {
+    if allocation_type & MEM_COMMIT != 0 && !map_region_pages(&region) {
         return Ok(0xC000_0017);
     }
-    space.insert(region, automatic, top_down);
+    space.insert(region);
     guest::try_write::<u64>(base_pointer, base)?;
     guest::try_write::<u64>(size_pointer, size)?;
     Ok(0)
 }
 
-fn register_user_region(base: u64, size: u64) -> Result<Arc<PrivateRegion>, KernelError> {
+/// Região privada comitada que o kernel monta para o processo ativo, na
+/// primeira faixa livre (`top_down`: a primeira de cima para baixo).
+fn register_user_region(size: u64, alignment: u64, top_down: bool) -> Result<Arc<PrivateRegion>, KernelError> {
     let size = size.div_ceil(PAGE) * PAGE;
-    if size == 0 || !region_free(base, size) {
-        return Err(KernelError::new("Regiao de usuario invalida ou sobreposta"));
+    if size == 0 {
+        return Err(KernelError::new("Regiao de usuario vazia"));
     }
-    let region = PrivateRegion::new(base, size, 4, 0x3000);
+    let base = find_free(size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
+    let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE);
     if !map_region_pages(&region) {
         return Err(KernelError::new("PFN esgotado na regiao de usuario"));
     }
@@ -393,29 +388,32 @@ fn register_user_region(base: u64, size: u64) -> Result<Arc<PrivateRegion>, Kern
     Ok(region)
 }
 
-/// Pilha do usuário; a entrada vê o rsp "depois de um call" (8 mod 16) com
-/// endereço de retorno 0, para falhar alto se o programa retornar.
-pub fn map_user_stack() -> Result<u64, KernelError> {
-    register_user_region(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE)?;
-    Ok(USER_STACK_TOP - 8)
+/// Pilha da primeira thread, uma alocação comum de baixo para cima (como a
+/// reserva da pilha inicial no NT): devolve a base (StackLimit e
+/// DeallocationStack) e o topo (StackBase) da pilha.
+pub fn map_user_stack() -> Result<(u64, u64), KernelError> {
+    let region = register_user_region(USER_STACK_SIZE, map::ALLOCATION_GRANULARITY, false)?;
+    Ok((region.base, region.base + region.size))
 }
 
-/// Estruturas do processo (bump a partir de USER_STRUCT_BASE).
+/// Estruturas que o kernel monta para o processo (PEB, TEB, parâmetros,
+/// entradas do Ldr): páginas comitadas de cima para baixo, como o
+/// MiCreatePebOrTeb, sem janela fixa.
 pub fn map_user_region(size: u64) -> Result<u64, KernelError> {
-    let va = state::with(|state| state.next_struct_va);
-    let region = register_user_region(va, size)?;
-    state::with(|state| state.next_struct_va += region.size);
-    Ok(va)
+    Ok(register_user_region(size, PAGE, true)?.base)
 }
 
 /// Igual, na área compartilhada (NLS etc.), que sobrevive entre processos.
 pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
     let rounded = size.div_ceil(PAGE) * PAGE;
-    let va = state::with(|state| {
-        let va = state.next_shared_va;
-        state.next_shared_va += rounded;
-        va
-    });
+    if rounded == 0 {
+        return Err(KernelError::new("Regiao compartilhada vazia"));
+    }
+    let va = find_free(rounded, PAGE, true).map_err(|status| KernelError::with_status("sem VA livre para a regiao compartilhada", status))?;
+    // A faixa entra na lista antes das páginas: nenhuma escolha de VA no
+    // meio do mapeamento a reutiliza.
+    let entry: Region = Arc::new(SharedRegion { base: va, size: rounded });
+    state::with(|state| state.shared_user_regions.push(entry));
     let mut offset = 0;
     while offset < size {
         let frame = pfn::alloc_page();
@@ -428,8 +426,6 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
         }
         offset += PAGE;
     }
-    let entry: Region = Arc::new(SharedRegion { base: va, size: rounded });
-    state::with(|state| state.shared_user_regions.push(entry));
     Ok(va)
 }
 
@@ -438,7 +434,7 @@ pub fn nt_allocate_virtual_memory(_process: u64, base_pointer: u64, _zero_bits: 
     let allocation_type = state::stack_arg32(user_rsp, 5);
     let protect = state::stack_arg32(user_rsp, 6);
     // Os ponteiros de saída são acessados por cópias sondadas.
-    state::guarded(|| do_user_allocate(base_pointer, size_pointer, allocation_type, protect, 0, DEFAULT_HIGHEST, 0x1_0000))
+    state::guarded(|| do_user_allocate(base_pointer, size_pointer, allocation_type, protect, 0, 0, map::ALLOCATION_GRANULARITY))
 }
 
 /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*,
@@ -463,7 +459,8 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
     if parameters == 0 || count > 16 {
         count = 0;
     }
-    let (mut lowest, mut highest, mut align) = (0u64, space.default_highest(), 0x1_0000u64);
+    // `highest` exclusivo; 0 = o topo das alocações de usuário.
+    let (mut lowest, mut highest, mut align) = (0u64, 0u64, map::ALLOCATION_GRANULARITY);
     for index in 0..count {
         let entry = state::user_struct::<MemExtendedParameter>(parameters + index * MemExtendedParameter::SIZE)?;
         // Header inteiro (Type nos 8 bits baixos, Reserved zero).
@@ -472,11 +469,9 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
             1 => {
                 let requirements = state::user_struct::<MemAddressRequirements>(entry.pointer.probe_get()?)?;
                 lowest = requirements.lowest_starting_address.probe_get()?;
-                highest = requirements.highest_ending_address.probe_get()?;
-                // HighestEndingAddress 0 = sem limite superior.
-                if highest == 0 {
-                    highest = space.default_highest();
-                }
+                // HighestEndingAddress é inclusivo; 0 = sem limite superior.
+                let ending = requirements.highest_ending_address.probe_get()?;
+                highest = if ending == 0 { 0 } else { ending.saturating_add(1) };
                 let alignment = requirements.alignment.probe_get()?;
                 if alignment != 0 {
                     align = alignment;

@@ -66,7 +66,7 @@ fn extension_flags(file: u64) -> u32 {
 const MAX_SAFE: u64 = (1 << 53) - 1;
 
 fn range(pointer: u64, length: u64) -> bool {
-    length == 0 || pointer.checked_add(length).is_some_and(|end| end <= 0x7FFF_FFFF_0000)
+    length == 0 || pointer.checked_add(length).is_some_and(|end| end <= crate::ntos::mm::memory_map::USER_PROBE_ADDRESS)
 }
 
 /// FastIoWrite do driver: só aceita STATUS_SUCCESS.

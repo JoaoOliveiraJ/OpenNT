@@ -8,7 +8,7 @@ const INVALID: u32 = 0xC000_000D;
 const PROTECTION: u32 = 0xC000_0045;
 const VIEW: u32 = 0xC000_001F;
 const U64: u128 = u64::MAX as u128;
-const LIMIT: u128 = 0x7FFF_FFFF_0000;
+const LIMIT: u128 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS as u128;
 const ACCESS: [u32; 8] = [4, 4, 8, 12, 2, 4, 10, 12];
 const COMPATIBILITY: [u32; 8] = [1, 11, 17, 187, 15, 11, 255, 187];
 

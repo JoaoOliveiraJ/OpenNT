@@ -2056,12 +2056,14 @@ fn section_parameters_and_address(assert: Assert) {
         assert(parameters::file_request(&request) == Ok(0x3) && parameters::file_request(&parameters::Request { protection_mask: 1, ..request }) == Ok(1), "sectionparams: acesso exigido ao arquivo");
     }
     // Endereços de vistas de seção.
-    let regions = [Region { base: 0x1_0000_0000, size: 0x2_0000 }];
-    assert(address::find(&FindOptions { size: 0x1000, ..Default::default() }, &regions) == Ok(0x1_0002_0000), "sectionaddr: primeira faixa livre acima do piso");
-    assert(address::find(&FindOptions { size: 0x1000, base: 0x1_0001_0000, ..Default::default() }, &regions) == Err(0xC000_0018) && address::find(&FindOptions { size: 0, ..Default::default() }, &regions) == Err(0xC000_001F), "sectionaddr: base fixa em conflito e tamanho zero");
+    // A metade de usuário começa em MM_LOWEST_USER_ADDRESS (64 KB).
+    let regions = [Region { base: map::LOWEST_USER_ADDRESS, size: 0x2_0000 }];
+    assert(address::find(&FindOptions { size: 0x1000, ..Default::default() }, &regions) == Ok(0x3_0000), "sectionaddr: primeira faixa livre acima do piso de 64 KB");
+    assert(address::find(&FindOptions { size: 0x1000, base: 0x2_0000, ..Default::default() }, &regions) == Err(0xC000_0018) && address::find(&FindOptions { size: 0, ..Default::default() }, &regions) == Err(0xC000_001F), "sectionaddr: base fixa em conflito e tamanho zero");
+    assert(address::find(&FindOptions { size: 0x1000, base: 0x8000, ..Default::default() }, &[]) == Err(0xC000_0018) && address::find(&FindOptions { size: 0x1000, base: map::HIGHEST_VAD_ADDRESS + 1, ..Default::default() }, &[]) == Err(0xC000_0018), "sectionaddr: base fixa abaixo de 64 KB ou acima do ultimo VAD recusada");
     let top = address::find(&FindOptions { size: 0x1000, top_down: true, ..Default::default() }, &regions);
-    assert(matches!(top, Ok(base) if base + 0x1000 <= map::USER_ADDRESS_LIMIT && base % 0x10000 == 0 && base > 0x7000_0000_0000), "sectionaddr: top-down abaixo do limite de usuario");
-    assert(address::find(&FindOptions { size: 0x1000, upper: Some(0x1_0001_FFFF), ..Default::default() }, &regions) == Err(0xC000_0017), "sectionaddr: faixa esgotada");
+    assert(matches!(top, Ok(base) if base + 0x1000 <= map::HIGHEST_VAD_ADDRESS + 1 && base % 0x10000 == 0 && base > 0x7FFF_0000_0000), "sectionaddr: top-down a partir de MM_HIGHEST_VAD_ADDRESS");
+    assert(address::find(&FindOptions { size: 0x1000, upper: Some(0x2_FFFF), ..Default::default() }, &regions) == Err(0xC000_0017), "sectionaddr: faixa esgotada");
     let system = address::find(&FindOptions { system_space: true, size: 0x10000, ..Default::default() }, &[Region { base: map::KERNEL_SECTION_BASE, size: 0x10000 }]);
     assert(matches!(system, Ok(base) if base >= map::KERNEL_SECTION_BASE + 0x10000 && base + 0x10000 <= map::KERNEL_SECTION_TOP), "sectionaddr: espaco de sistema");
 }

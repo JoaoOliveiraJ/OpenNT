@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use super::loader::{self, BytesSource, ImageRegion, Module};
-use super::state::{self, RegionKind, USER_ALLOC_BASE, USER_STRUCT_BASE};
+use super::state::{self, RegionKind};
 use super::structures::{self, ProcessDescription};
 use super::{files, memory, threads};
 use crate::hal::{bundle, kmalloc};
@@ -81,10 +81,37 @@ pub struct Loaded {
     pub process_pointer: u64,
     pub thread_pointer: u64,
     pub source: Arc<dyn FileSource>,
+    /// A imagem, desfeita junto com o `Loaded`.
+    _image: MainImage,
 }
 
 fn push_image(base: u64, size: u64, name: &str) {
     state::with(|state| state.regions(RegionKind::ProcessImages).push(Arc::new(ImageRegion { base, size, name: String::from(name), file: None })));
+}
+
+/// A imagem principal, desfeita quando o processo acaba (como a vista da
+/// seção de imagem no rundown do NT): as páginas e a faixa voltam ao livre,
+/// e o próximo executável com a mesma ImageBase carrega nela de novo.
+struct MainImage(PeImage);
+
+impl Drop for MainImage {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.release() {
+            crate::debug_print!("[usermode] imagem principal retida: {}", error);
+            return;
+        }
+        if let Err(error) = crate::ntos::ke::smp::flush_remote_tlb(false) {
+            crate::debug_print!("[usermode] TLB da imagem principal: {}", error);
+        }
+    }
+}
+
+/// A pilha da primeira thread: a entrada vê o rsp "depois de um call"
+/// (8 mod 16) com endereço de retorno 0, para falhar alto se o programa
+/// retornar. Devolve (base, topo, rsp inicial).
+fn initial_stack() -> Result<(u64, u64, u64), KernelError> {
+    let (base, top) = memory::map_user_stack()?;
+    Ok((base, top, top - 8))
 }
 
 fn next_process_id() -> u64 {
@@ -103,13 +130,14 @@ fn syscall_stack() -> Option<u64> {
 /// corrente durante a execução.
 pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelError> {
     loader::ensure_ntdll()?;
-    let image = pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?;
-    let stack_top = memory::map_user_stack()?;
+    let image = MainImage(pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?);
+    let (entry_point, image_base, size_of_image) = (image.0.entry_point, image.0.image_base, image.0.size_of_image);
+    let (_, _, stack_top) = initial_stack()?;
     let process_id = next_process_id();
     let source: Arc<dyn FileSource> = Arc::new(BytesSource { name: format!("\\BootBundle\\apps\\{image_name}"), bytes: Arc::new(bytes) });
-    let executable = Executable { source: source.clone(), image_size: image.size_of_image, image_information: Some(image.image_information.to_vec()), command_line: None };
-    let process_pointer = process::create_process(process_id, image_name, image.image_base, Some(&executable))?;
-    push_image(image.image_base, image.size_of_image, source.name());
+    let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: Some(image.0.image_information.to_vec()), command_line: None };
+    let process_pointer = process::create_process(process_id, image_name, image_base, Some(&executable))?;
+    push_image(image_base, size_of_image, source.name());
     let thread_pointer = match process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| thread)) {
         Ok(thread) => thread,
         Err(error) => {
@@ -118,7 +146,7 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
             return Err(error);
         }
     };
-    Ok(Loaded { entry_point: image.entry_point, image_base: image.image_base, size_of_image: image.size_of_image, stack_top, process_pointer, thread_pointer, source })
+    Ok(Loaded { entry_point, image_base, size_of_image, stack_top, process_pointer, thread_pointer, source, _image: image })
 }
 
 /// Notificações das imagens iniciais: o executável (com o FILE_OBJECT da
@@ -168,8 +196,6 @@ fn reset_process_state() {
         state.user_regions.clear();
         state.process_images.clear();
         state.next_user_handle = 0x100;
-        state.next_user_alloc_va = USER_ALLOC_BASE;
-        state.next_struct_va = USER_STRUCT_BASE;
         state.next_ldr_string_va = 0;
         state.ldr_string_region_end = 0;
         state.mapped_image_exports.clear();
@@ -198,7 +224,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     loader::parse_api_set_schema()?;
     // A ntdll real faz o binding e a relocação da imagem principal.
     let load_options = LoadOptions { skip_imports: true, skip_relocations: true, notify_image: false, ..LoadOptions::default() };
-    let (image, source): (PeImage, Arc<dyn FileSource>) = match (&reader, bytes) {
+    let (main_image, source): (PeImage, Arc<dyn FileSource>) = match (&reader, bytes) {
         (Some(file), _) => {
             let name = format!("\\NTFS{}", file.volume_path().replace('/', "\\"));
             let image = pe_loader::load_from_source(Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), &LoadOptions { user_space: true, ..load_options })?;
@@ -210,8 +236,11 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
         }
         (None, None) => return Err(KernelError::new("processo sem imagem")),
     };
+    // Desfeita na saída desta função, depois do processo e dos recursos.
+    let main_image = MainImage(main_image);
+    let image = &main_image.0;
     push_image(image.image_base, image.size_of_image, dos_path);
-    let stack_top = memory::map_user_stack()?;
+    let (stack_base, stack_end, stack_top) = initial_stack()?;
     let process_id = next_process_id();
     state::with(|state| {
         state.current_process_id = process_id;
@@ -221,7 +250,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     let executable = Executable { source: source.clone(), image_size: image.size_of_image, image_information: Some(image.image_information.to_vec()), command_line: Some(format!("\"{dos_path}\"")) };
     let process_pointer = process::create_process(process_id, image_name, image.image_base, Some(&executable))?;
     // A PEB real sai antes das notificações da primeira thread.
-    let created = structures::build_process_structures(&ProcessDescription { process_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output })
+    let created = structures::build_process_structures(&ProcessDescription { process_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output, stack_base, stack_top: stack_end })
         .and_then(|teb| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).map(|thread| (teb, thread)));
     let (teb, thread_pointer) = match created {
         Ok(created) => created,

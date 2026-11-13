@@ -20,7 +20,8 @@ pub const STATUS_RESOURCE_TYPE_NOT_FOUND: u32 = 0xC000_008A;
 pub const STATUS_RESOURCE_NAME_NOT_FOUND: u32 = 0xC000_008B;
 pub const STATUS_RESOURCE_LANG_NOT_FOUND: u32 = 0xC000_0204;
 const MAXIMUM_POINTER: u128 = u64::MAX as u128;
-const USER_ADDRESS_LIMIT: u64 = 0x7FFF_FFFE_FFFF;
+/// MmHighestUserAddress.
+const USER_ADDRESS_LIMIT: u64 = crate::ntos::mm::memory_map::HIGHEST_USER_ADDRESS;
 
 /// Imagem inspecionada: deslocamentos do arquivo, endereços de 64 bits.
 #[derive(Clone, Debug, Default)]

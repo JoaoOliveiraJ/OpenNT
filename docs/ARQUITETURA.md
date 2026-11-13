@@ -263,6 +263,38 @@ páginas de usuário: imagens, pilhas, TEB/PEB, seções e a visão somente
 leitura da KUSER_SHARED_DATA em 0x7FFE0000 (a do kernel fica em
 0xFFFFF780_00000000).
 
+O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
+além da KUSER_SHARED_DATA:
+
+| Constante (`memory_map.rs`) | Valor | No NT |
+| --- | --- | --- |
+| `LOWEST_USER_ADDRESS` | 0x10000 | MM_LOWEST_USER_ADDRESS: os primeiros 64 KB nunca são mapeáveis |
+| `HIGHEST_VAD_ADDRESS` | 0x7FFF_FFFD_FFFF | MM_HIGHEST_VAD_ADDRESS: topo das alocações e do MEM_TOP_DOWN |
+| `HIGHEST_USER_ADDRESS` | 0x7FFF_FFFE_FFFF | MmHighestUserAddress (export) |
+| `USER_PROBE_ADDRESS` = `USER_ADDRESS_LIMIT` | 0x7FFF_FFFF_0000 | MmUserProbeAddress (export) |
+| `ALLOCATION_GRANULARITY` | 0x10000 | granularidade de alocação |
+
+- **Alocação** (`ps/user/memory.rs`, escolha em `mm/section/address.rs`):
+  sem base, a primeira faixa livre alinhada a 64 KB de baixo para cima a
+  partir de 64 KB, como o MiFindEmptyAddressRange (MEM_TOP_DOWN: a primeira
+  de cima para baixo a partir de MM_HIGHEST_VAD_ADDRESS), sem cursor: uma
+  faixa liberada volta a ser a primeira candidata. Com base, a reserva desce a
+  64 KB (o commit sobre uma reserva fica em páginas); uma base abaixo de
+  64 KB ou acima do último VAD falha com STATUS_CONFLICTING_ADDRESSES (como o
+  MiIsVaRangeAvailable), e uma base além de MmHighestUserAddress com
+  STATUS_INVALID_PARAMETER. Vistas de seção usam a mesma escolha.
+- **O que o kernel monta para o processo** também sai do alocador: a pilha da
+  primeira thread é uma alocação de baixo para cima (fica abaixo de 4 GB
+  num processo novo); PEB, TEB, parâmetros, entradas do Ldr e as regiões
+  compartilhadas de NLS são páginas comitadas de cima para baixo, como o
+  MiCreatePebOrTeb. Como a tabela de páginas ainda é uma só, a escolha vê o
+  que todos os processos ocupam (`memory::occupied`) e as PTEs reais.
+- **Imagens de usuário** carregam na ImageBase do cabeçalho quando a faixa
+  está livre (um .exe em 0x1_4000_0000) e, se não estiver, na primeira faixa
+  livre, relocadas (STATUS_IMAGE_NOT_AT_BASE nas vistas de imagem). A imagem
+  principal de um processo é desfeita quando ele termina, e a VA volta ao
+  livre para o próximo.
+
 O stage2 monta o mapa direto (páginas de 2 MB de supervisor, RW e NX; tabelas
 em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
 
@@ -320,8 +352,9 @@ drivers reais.
   de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de
   usuário; o ntoskrnl não passa pelo loader (o stage2 já o mapeia na sua
   ImageBase) e é listado ali.
-- As imagens de usuário continuam na base preferida da metade de usuário (ou
-  na próxima faixa livre), também sobre frames do PFN.
+- As imagens de usuário ficam na ImageBase do cabeçalho quando a faixa está
+  livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
+  relocadas), também sobre frames do PFN.
 
 ## 4. Dependências
 

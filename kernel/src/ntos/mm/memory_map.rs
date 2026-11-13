@@ -28,7 +28,25 @@
 //!
 //! Espaço virtual. A metade de usuário, PML4[0..256), é só dos processos:
 //! nada do kernel fica abaixo de MmSystemRangeStart (`mm/user_half.rs`
-//! confere no fim da fase 0). O que é do kernel mora na metade de sistema:
+//! confere no fim da fase 0). Como no Windows 10 19041 x64, ela vai de
+//! MM_LOWEST_USER_ADDRESS (64 KB; os primeiros 64 KB nunca são mapeáveis) a
+//! MmHighestUserAddress, sem nenhuma janela fixa: imagens, pilhas, PEB/TEB,
+//! vistas de seção e alocações recebem a VA que o alocador escolhe sobre
+//! frames do PFN. O único endereço fixo é a visão de usuário, somente
+//! leitura, da KUSER_SHARED_DATA:
+//!
+//! ```text
+//!   0x00000000_00000000  64 KB nunca mapeáveis (base abaixo: CONFLICTING_ADDRESSES)
+//!   0x00000000_00010000  MM_LOWEST_USER_ADDRESS: a primeira alocação de baixo
+//!                        para cima (granularidade de 64 KB)
+//!   0x00000000_7FFE0000  KUSER_SHARED_DATA (visão de usuário, somente leitura)
+//!   0x00000001_40000000  ImageBase típica de um .exe (carregado nela quando livre)
+//!   0x00007FFF_FFFDFFFF  MM_HIGHEST_VAD_ADDRESS: topo das alocações (MEM_TOP_DOWN)
+//!   0x00007FFF_FFFEFFFF  MmHighestUserAddress
+//!   0x00007FFF_FFFF0000  MmUserProbeAddress
+//! ```
+//!
+//! O que é do kernel mora na metade de sistema:
 //!
 //! ```text
 //!   0xFFFF8000_00000000  (256) tabelas de páginas (mapeamento recursivo)
@@ -47,9 +65,32 @@
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const LARGE_PAGE_SIZE: u64 = 0x20_0000;
-/// Limite exclusivo da VA de usuário; os 64KB finais abaixo da divisão
-/// canônica são reservados.
-pub const USER_ADDRESS_LIMIT: u64 = 0x7FFF_FFFF_0000;
+// ---- Metade de usuário (Windows 10 19041 x64) -------------------------------
+
+/// MM_LOWEST_USER_ADDRESS: nenhuma VA de usuário abaixo de 64 KB; um pedido
+/// com base fixa abaixo daqui falha com STATUS_CONFLICTING_ADDRESSES, como
+/// no MiIsVaRangeAvailable do NT.
+pub const LOWEST_USER_ADDRESS: u64 = 0x1_0000;
+/// MmHighestUserAddress.
+pub const HIGHEST_USER_ADDRESS: u64 = 0x7FFF_FFFE_FFFF;
+/// MmUserProbeAddress: o ProbeForRead/ProbeForWrite recusa daqui para cima.
+pub const USER_PROBE_ADDRESS: u64 = 0x7FFF_FFFF_0000;
+/// Limite exclusivo da VA de usuário (MmUserProbeAddress); os 64 KB finais
+/// abaixo da divisão canônica são reservados.
+pub const USER_ADDRESS_LIMIT: u64 = USER_PROBE_ADDRESS;
+/// MM_HIGHEST_VAD_ADDRESS: a última VA que uma alocação de usuário pode
+/// cobrir, 64 KB abaixo do MmHighestUserAddress (o topo do MEM_TOP_DOWN).
+pub const HIGHEST_VAD_ADDRESS: u64 = HIGHEST_USER_ADDRESS - 0x1_0000;
+/// Granularidade de alocação de VA de usuário (SYSTEM_BASIC_INFORMATION).
+pub const ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+
+const _: () = assert!(HIGHEST_USER_ADDRESS + 1 == USER_PROBE_ADDRESS && HIGHEST_VAD_ADDRESS == 0x7FFF_FFFD_FFFF);
+const _: () = assert!(LOWEST_USER_ADDRESS == ALLOCATION_GRANULARITY && (USER_PROBE_ADDRESS >> 39) == USER_PML4_ENTRIES - 1);
+
+/// A faixa [base, base + size) cabe na metade de usuário alocável.
+pub const fn is_user_range(base: u64, size: u64) -> bool {
+    base >= LOWEST_USER_ADDRESS && size != 0 && base <= HIGHEST_VAD_ADDRESS && size - 1 <= HIGHEST_VAD_ADDRESS - base
+}
 
 // ---- Imagem do kernel e pilha de boot (metade de sistema) -------------------
 //

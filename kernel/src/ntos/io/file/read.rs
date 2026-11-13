@@ -63,7 +63,7 @@ pub(crate) fn probe(pointer: u64, length: u64, write: bool) -> bool {
     if length == 0 {
         return true;
     }
-    pointer > 0 && pointer.checked_add(length).is_some_and(|end| end <= 0x7FFF_FFFF_0000) && if write { user_probe::probe_user_write(pointer, length) } else { user_probe::probe_user_read(pointer, length) }
+    pointer > 0 && pointer.checked_add(length).is_some_and(|end| end <= crate::ntos::mm::memory_map::USER_PROBE_ADDRESS) && if write { user_probe::probe_user_write(pointer, length) } else { user_probe::probe_user_read(pointer, length) }
 }
 
 /// Bytes de um arquivo de volume.

@@ -103,7 +103,7 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
     if mode != 0 && length != 0 && buffer & 1 != 0 {
         return Err(0x8000_0002);
     }
-    if mode != 0 && length != 0 && buffer.saturating_add(length) > 0x7FFF_FFFF_0000 {
+    if mode != 0 && length != 0 && buffer.saturating_add(length) > crate::ntos::mm::memory_map::USER_PROBE_ADDRESS {
         return Err(0xC000_0005);
     }
     if length & 1 != 0 || length == 0xFFFE {

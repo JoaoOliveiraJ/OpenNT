@@ -39,7 +39,7 @@ pub const INTEGER: [u64; 15] = [
 pub fn debug_registers(values: [u64; 6], mode: u8) -> [u64; 6] {
     let mut result = [0u64; 6];
     for index in 0..4 {
-        result[index] = if mode != 0 && values[index] > 0x7FFF_FFFE_FFFF { 0 } else { values[index] };
+        result[index] = if mode != 0 && values[index] > crate::ntos::mm::memory_map::HIGHEST_USER_ADDRESS { 0 } else { values[index] };
     }
     result[5] = values[5] & 0xFFFF_0355;
     result

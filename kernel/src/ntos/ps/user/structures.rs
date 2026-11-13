@@ -8,7 +8,7 @@ use alloc::format;
 use alloc::vec::Vec;
 
 use super::memory;
-use super::state::{self, write_user_wide, USER_STACK_SIZE, USER_STACK_TOP};
+use super::state::{self, write_user_wide};
 use crate::ntos::ke::smp;
 use crate::ntos::ps::session;
 use crate::rtl::KernelError;
@@ -23,6 +23,9 @@ pub struct ProcessDescription<'a> {
     pub dos_path: &'a str,
     pub detached: bool,
     pub console_handle: u64,
+    /// Pilha da primeira thread (`memory::map_user_stack`): base e topo.
+    pub stack_base: u64,
+    pub stack_top: u64,
 }
 
 /// LIST_ENTRY circular vazia (InitializeListHead).
@@ -76,13 +79,13 @@ pub fn build_process_structures(process: &ProcessDescription) -> Result<u64, Ker
     // código de usuário roda no processo ainda.
     let (teb_block, peb_block, ldr_block, parameters) = unsafe { (Teb::at(teb), Peb::at(peb), PebLdrData::at(ldr), RtlUserProcessParameters::at(rupp)) };
     // TEB: StackBase/Limit, Self, ClientId e ProcessEnvironmentBlock.
-    teb_block.nt_tib.stack_base.set(USER_STACK_TOP);
-    teb_block.nt_tib.stack_limit.set(USER_STACK_TOP - USER_STACK_SIZE);
+    teb_block.nt_tib.stack_base.set(process.stack_top);
+    teb_block.nt_tib.stack_limit.set(process.stack_base);
     teb_block.nt_tib.self_.set(teb);
     teb_block.client_id.unique_process.set(process.process_id);
     teb_block.client_id.unique_thread.set(process.process_id); // tid = pid na primeira thread
     teb_block.process_environment_block.set(peb);
-    teb_block.deallocation_stack.set(USER_STACK_TOP - USER_STACK_SIZE);
+    teb_block.deallocation_stack.set(process.stack_base);
 
     // RTL_USER_PROCESS_PARAMETERS no formato entregue pelo kernel:
     // auto-relativo (ponteiros são offsets desde a base, sem NORMALIZED).

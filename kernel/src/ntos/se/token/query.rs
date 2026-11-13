@@ -10,7 +10,8 @@ use crate::ntos::ps::user_probe;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
-const USER_PROBE_LIMIT: u64 = 0x7FFF_FFFF_0000;
+/// MmUserProbeAddress.
+const USER_PROBE_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 const REJECTED_CLASSES: [u32; 7] = [0, 14, 35, 36, 38, 45, 46];
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 

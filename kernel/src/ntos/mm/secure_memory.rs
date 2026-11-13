@@ -33,7 +33,7 @@ use crate::rtl::SpinLock;
 
 const PAGE: u64 = 0x1000;
 /// MmUserProbeAddress.
-const USER_PROBE_ADDRESS: u64 = 0x7FFF_FFFF_0000;
+const USER_PROBE_ADDRESS: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 const PAGE_READONLY: u32 = 2;
 const PAGE_READWRITE: u32 = 4;
 const PAGE_GUARD: u32 = 0x100;

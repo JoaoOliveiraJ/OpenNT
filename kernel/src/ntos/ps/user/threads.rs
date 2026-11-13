@@ -627,7 +627,8 @@ fn allocate_private(size: u64, highest: u64) -> Result<(u64, Region), u32> {
     }
     guest::write64(scratch, 0);
     guest::write64(scratch + 8, size);
-    let status = match memory::do_user_allocate(scratch, scratch + 8, 0x3000, 4, 0x10000, if highest != 0 { highest } else { 0x7FFF_FFFF_F000 }, 0x10000) {
+    // `highest` 0 = o topo das alocações de usuário.
+    let status = match memory::do_user_allocate(scratch, scratch + 8, 0x3000, 4, 0, highest, crate::ntos::mm::memory_map::ALLOCATION_GRANULARITY) {
         Ok(status) => status,
         Err(error) => if error.status != 0 { error.status } else { 0xC000_0017 },
     };

@@ -13,7 +13,8 @@ use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 use crate::rtl::KernelError;
 
 const MAXIMUM_POINTER: u64 = u64::MAX;
-const USER_ADDRESS_LIMIT: u64 = 0x7FFF_FFFE_FFFF;
+/// MmHighestUserAddress.
+const USER_ADDRESS_LIMIT: u64 = crate::ntos::mm::memory_map::HIGHEST_USER_ADDRESS;
 pub const INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const INVALID_IMAGE: u32 = 0xC000_007B;
 /// IMAGE_NT_OPTIONAL_HDR64_MAGIC / IMAGE_NT_OPTIONAL_HDR32_MAGIC.
