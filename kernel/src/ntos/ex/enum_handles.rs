@@ -3,26 +3,48 @@
 //! Percorre a HANDLE_TABLE nativa do chamador. O callback recebe a entrada
 //! bloqueada e libera esse bloqueio antes de retornar.
 
+use core::sync::atomic::Ordering;
+
 use crate::hal::amd64::native_call;
 use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{HandleTable, HandleTableEntry};
 
 /// Descarta os bits de atributo, verifica o limite da tabela e percorre
 /// zero, um ou dois níveis de páginas até a entrada de 16 bytes.
 pub fn lookup(table: u64, handle: u64) -> u64 {
+    // SAFETY: ExEnumHandleTable recebe o PHANDLE_TABLE do chamador.
+    let table = unsafe { HandleTable::at(table) };
     let handle = handle & !3;
-    if handle >= guest::read32(table) as u64 {
+    if handle >= table.next_handle_needing_pool.get() as u64 {
         return 0;
     }
-    let code = guest::read64(table + 8);
+    // Páginas intermediárias: vetores de ponteiros para as páginas seguintes.
+    let pointer = |address: u64| -> u64 {
+        // SAFETY: TableCode e as páginas intermediárias apontam para páginas vivas.
+        unsafe { Field::<u64>::at(address) }.get()
+    };
+    let code = table.table_code.get();
     match code & 3 {
         0 => code + handle * 4,
-        1 => guest::read64(code - 1 + (handle >> 10) * 8) + (handle & 1023) * 4,
+        1 => pointer(code - 1 + (handle >> 10) * 8) + (handle & 1023) * 4,
         _ => {
-            let directory = guest::read64(code - 2 + (handle >> 19) * 8);
-            guest::read64(directory + ((handle >> 10) & 511) * 8) + (handle & 1023) * 4
+            let directory = pointer(code - 2 + (handle >> 19) * 8);
+            pointer(directory + ((handle >> 10) & 511) * 8) + (handle & 1023) * 4
         }
+    }
+}
+
+/// LowValue da entrada (bit 0 = Unlocked) como atômico.
+fn entry_word(entry: u64) -> &'static core::sync::atomic::AtomicI64 {
+    // SAFETY: entradas vêm de `lookup` sobre a tabela viva.
+    unsafe { HandleTableEntry::at(entry) }.volatile_low_value.atomic()
+}
+
+fn cas(entry: u64, expected: u64, replacement: u64) -> u64 {
+    match entry_word(entry).compare_exchange(expected as i64, replacement as i64, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(value) | Err(value) => value as u64,
     }
 }
 
@@ -91,7 +113,7 @@ impl EnumRequest {
             return Err(KernelError::new("handle enumeration callback still running"));
         }
         while self.entry != 0 {
-            let low = guest::compare_exchange64(self.entry, 0, 0)?;
+            let low = entry_word(self.entry).load(Ordering::SeqCst) as u64;
             if low == 0 {
                 self.advance();
                 continue;
@@ -100,7 +122,7 @@ impl EnumRequest {
             if low & 1 == 0 {
                 return Ok(Step::Busy);
             }
-            if guest::compare_exchange64(self.entry, low, low - 1)? != low {
+            if cas(self.entry, low, low - 1) != low {
                 continue;
             }
             // O callback passa a possuir o bloqueio da entrada.
@@ -122,7 +144,8 @@ impl EnumRequest {
         self.result = value as u8;
         if self.result != 0 {
             if self.output_handle != 0 {
-                guest::write64(self.output_handle, self.handle);
+                // SAFETY: o PHANDLE de saída do chamador (modo kernel).
+                unsafe { Field::<u64>::at(self.output_handle) }.set(self.handle);
             }
             self.finish();
         } else {
@@ -134,7 +157,7 @@ impl EnumRequest {
     /// Nenhum callback executou: libera só o bloqueio adquirido para ele.
     pub fn callback_failed(&mut self) {
         if self.pending {
-            let _ = guest::compare_exchange64(self.entry, self.locked_value, self.locked_value + 1);
+            cas(self.entry, self.locked_value, self.locked_value + 1);
             self.pending = false;
         }
         self.finish();

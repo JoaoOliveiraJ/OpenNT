@@ -5,6 +5,7 @@
 //! as notificações iniciais.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::mem::offset_of;
 
 use crate::ntos::ex::wnf::name::DecodedName;
 use crate::ntos::ex::wnf::namespace::{self, NameDefinition};
@@ -15,12 +16,15 @@ use crate::ntos::mm::kernel_pool;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use super::objects::{name_at, process_at, process_context_at, subscription_at};
+use crate::ntos::ex::list_entry;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{WnfSubscription, WnfSubscriptionState};
 
 const SUBSCRIPTION_TAG: u32 = 0x2066_6E57;
-const SUBSCRIPTION_SIZE: u64 = 0x88;
+const SUBSCRIPTION_SIZE: u64 = WnfSubscription::SIZE;
 const STATUS_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-const PROCESS_CONTEXT_OFFSET: u64 = 0x868;
 
 /// Sequência de identificadores do kernel (zero é pulado no wrap).
 static NEXT_IDENTIFIER: AtomicU64 = AtomicU64::new(0);
@@ -50,26 +54,16 @@ fn locked<T>(pointer: u64, exclusive: bool, action: impl FnOnce() -> Result<T, K
 }
 
 fn append(head: u64, entry: u64) -> Result<(), KernelError> {
-    let previous = guest::read64(head + 8);
-    if guest::read64(previous) != head {
+    let head = list_entry::at(head);
+    if !list_entry::tail_consistent(head) {
         return Err(KernelError::new("lista de inscricoes WNF corrompida"));
     }
-    guest::write64(entry, head);
-    guest::write64(entry + 8, previous);
-    guest::write64(previous, entry);
-    guest::write64(head + 8, entry);
+    list_entry::insert_tail(head, list_entry::at(entry));
     Ok(())
 }
 
 fn unlink(entry: u64) -> Result<(), KernelError> {
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    if guest::read64(next + 8) != entry || guest::read64(previous) != entry {
-        return Err(KernelError::new("fila de inscricoes WNF corrompida"));
-    }
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
-    Ok(())
+    list_entry::remove(list_entry::at(entry)).map(|_| ()).ok_or_else(|| KernelError::new("fila de inscricoes WNF corrompida"))
 }
 
 /// Inscrição publicada (com uma referência de rundown para o chamador).
@@ -85,44 +79,44 @@ pub struct Subscribed {
 /// Exige o lock das inscrições do processo. Uma inscrição existente mantém
 /// identificador e carimbo, mesmo quando a máscara muda.
 fn update_existing(name: u64, context: u64, event_mask: u32) -> Result<Option<Subscribed>, KernelError> {
-    let head = context + 0x58;
-    let mut entry = guest::read64(head);
+    let head = process_context_at(context).process_subscription_list_head.address();
+    let mut entry = list_entry::at(head).flink.get();
     while entry != head {
-        let subscription = entry - 0x18;
-        if guest::read64(subscription + 0x30) != name {
-            entry = guest::read64(entry);
+        let subscription = entry - offset_of!(WnfSubscription, process_subscription_list_entry) as u64;
+        if subscription_at(subscription).name_instance.get() != name {
+            entry = list_entry::at(entry).flink.get();
             continue;
         }
-        let (reader_transition, pending_data_removed) = locked(context + 0x68, true, || {
+        let (reader_transition, pending_data_removed) = locked(process_context_at(context).delivery_pending_list_lock.address(), true, || {
             let mut transition = 0;
-            let previous_mask = guest::read32(subscription + 0x64);
+            let previous_mask = subscription_at(subscription).subscribed_event_set.get();
             if (previous_mask ^ event_mask) & 1 != 0 {
                 if event_mask & 1 != 0 {
-                    if change_counter(name + 0xA0, 1)? == 1 {
+                    if change_counter(&name_at(name).data_subscribers_count, 1)? == 1 {
                         transition = 1;
                     }
-                } else if change_counter(name + 0xA0, -1)? == 0 {
+                } else if change_counter(&name_at(name).data_subscribers_count, -1)? == 0 {
                     transition = -1;
                 }
             }
-            let delivery_state = guest::read32(subscription + 0x78);
-            let previous_pending = guest::read32(subscription + 0x7C);
+            let delivery_state = subscription_at(subscription).subscription_state.get().0;
+            let previous_pending = subscription_at(subscription).signaled_event_set.get();
             let removed = delivery_state != 2 && previous_pending & 1 != 0 && event_mask & 1 == 0;
             let pending = previous_pending & event_mask;
-            guest::write64(subscription + 0x50, 0);
-            guest::write64(subscription + 0x58, 0);
-            guest::write32(subscription + 0x64, event_mask);
-            guest::write32(subscription + 0x7C, pending);
-            if delivery_state != 0 && pending == 0 && guest::read32(subscription + 0x80) == 0 {
-                unlink(subscription + 0x68)?;
-                guest::write32(subscription + 0x78, 0);
+            subscription_at(subscription).callback_routine.set(0);
+            subscription_at(subscription).callback_context.set(0);
+            subscription_at(subscription).subscribed_event_set.set(event_mask);
+            subscription_at(subscription).signaled_event_set.set(pending);
+            if delivery_state != 0 && pending == 0 && subscription_at(subscription).in_delivery_event_set.get() == 0 {
+                unlink(subscription_at(subscription).pending_subscription_list_entry.address())?;
+                subscription_at(subscription).subscription_state.set(WnfSubscriptionState(0));
             }
             Ok((transition, removed))
         })?;
-        if !rundown::acquire(subscription + 8)? {
+        if !rundown::acquire(subscription_at(subscription).run_ref.address())? {
             return Err(KernelError::new("inscricao WNF ligada ja esta em rundown"));
         }
-        return Ok(Some(Subscribed { pointer: subscription, identifier: guest::read64(subscription + 0x10), reader_transition, pending_data_removed, notification_performed: false }));
+        return Ok(Some(Subscribed { pointer: subscription, identifier: subscription_at(subscription).subscription_id.get(), reader_transition, pending_data_removed, notification_performed: false }));
     }
     Ok(None)
 }
@@ -131,7 +125,7 @@ fn update_existing(name: u64, context: u64, event_mask: u32) -> Result<Option<Su
 /// notificador compartilhado.
 fn announce_transitions(name: u64, mut result: Subscribed) -> Result<Subscribed, KernelError> {
     let mut event_mask = 0;
-    if result.pending_data_removed && change_counter(name + 0xA4, -1)? == 0 {
+    if result.pending_data_removed && change_counter(&name_at(name).current_delivery_count, -1)? == 0 {
         event_mask |= 8;
     }
     if result.reader_transition > 0 {
@@ -142,7 +136,7 @@ fn announce_transitions(name: u64, mut result: Subscribed) -> Result<Subscribed,
     result.notification_performed = event_mask != 0;
     if event_mask != 0 {
         if let Err(error) = notifications::notify_name(name, event_mask, true, true) {
-            rundown::release(result.pointer + 8)?;
+            rundown::release(subscription_at(result.pointer).run_ref.address())?;
             return Err(error);
         }
     }
@@ -151,11 +145,11 @@ fn announce_transitions(name: u64, mut result: Subscribed) -> Result<Subscribed,
 
 /// Inscreve (ou atualiza) o processo no nome.
 pub fn subscribe_name(name: u64, process: u64, change_stamp: u32, event_mask: u32) -> Result<Result<Subscribed, u32>, KernelError> {
-    let context = guest::read64(process + PROCESS_CONTEXT_OFFSET);
+    let context = process_at(process).wnf_context.get();
     if context == 0 {
         return Err(KernelError::new("processo sem contexto WNF apos resolucao do escopo"));
     }
-    if let Some(existing) = locked(context + 0x50, false, || update_existing(name, context, event_mask))? {
+    if let Some(existing) = locked(process_context_at(context).process_subscription_list_lock.address(), false, || update_existing(name, context, event_mask))? {
         return announce_transitions(name, existing).map(Ok);
     }
     // A variante com quota devolve NULL sem recursos; o free devolve a quota.
@@ -168,29 +162,31 @@ pub fn subscribe_name(name: u64, process: u64, change_stamp: u32, event_mask: u3
         return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
     }
     guest::write_bytes(candidate, &[0u8; SUBSCRIPTION_SIZE as usize]);
-    guest::write32(candidate, 0x0088_0905);
-    guest::write32(candidate + 0x60, change_stamp);
-    guest::write32(candidate + 0x64, event_mask);
-    guest::write64(candidate + 0x38, guest::read64(name + 0x28));
+    let header = &subscription_at(candidate).header;
+    header.node_type_code.set(0x905);
+    header.node_byte_size.set(SUBSCRIPTION_SIZE as u16);
+    subscription_at(candidate).current_change_stamp.set(change_stamp);
+    subscription_at(candidate).subscribed_event_set.set(event_mask);
+    subscription_at(candidate).state_name.bitfield_0.set(name_at(name).state_name.bitfield_0.get());
     let identifier = allocate_identifier();
-    let result = locked(context + 0x50, true, || {
-        locked(name + 0x70, true, || {
-            if guest::read64(name + 0x30) == 0 {
+    let result = locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
+        locked(name_at(name).state_subscription_list_lock.address(), true, || {
+            if name_at(name).scope_instance.get() == 0 {
                 return Ok(Err(STATUS_NOT_FOUND));
             }
             // Outra chamada pode ter inscrito o mesmo nome durante a alocação.
             if let Some(existing) = update_existing(name, context, event_mask)? {
                 return Ok(Ok(existing));
             }
-            guest::write64(candidate + 0x28, process);
-            guest::write64(candidate + 0x30, name);
-            guest::write64(candidate + 0x10, identifier);
-            if !rundown::acquire(candidate + 8)? {
+            subscription_at(candidate).process.set(process);
+            subscription_at(candidate).name_instance.set(name);
+            subscription_at(candidate).subscription_id.set(identifier);
+            if !rundown::acquire(subscription_at(candidate).run_ref.address())? {
                 return Err(KernelError::new("rundown inicial WNF invalido"));
             }
-            append(context + 0x58, candidate + 0x18)?;
-            append(name + 0x78, candidate + 0x40)?;
-            let reader_transition = if event_mask & 1 != 0 && change_counter(name + 0xA0, 1)? == 1 { 1 } else { 0 };
+            append(process_context_at(context).process_subscription_list_head.address(), subscription_at(candidate).process_subscription_list_entry.address())?;
+            append(name_at(name).state_subscription_list_head.address(), subscription_at(candidate).state_subscription_list_entry.address())?;
+            let reader_transition = if event_mask & 1 != 0 && change_counter(&name_at(name).data_subscribers_count, 1)? == 1 { 1 } else { 0 };
             let published = candidate;
             candidate = 0;
             Ok(Ok(Subscribed { pointer: published, identifier, reader_transition, pending_data_removed: false, notification_performed: false }))
@@ -257,11 +253,11 @@ pub fn subscribe_captured(name: &DecodedName, change_stamp: u32, event_mask: u32
         subscription = subscribed.pointer;
         // O marcador de dados 1 também conta como ponteiro não nulo.
         let mut initial = if change_stamp != current.change_stamp() && current.data_pointer() != 0 { 1 } else { 0 };
-        if guest::read32(current.pointer + 0xA4) == 0 {
+        if name_at(current.pointer).current_delivery_count.get() == 0 {
             initial |= 8;
         }
         if !subscribed.notification_performed {
-            initial |= if guest::read32(current.pointer + 0xA0) != 0 { 2 } else { 4 };
+            initial |= if name_at(current.pointer).data_subscribers_count.get() != 0 { 2 } else { 4 };
         }
         initial &= event_mask;
         if initial != 0 {
@@ -270,7 +266,7 @@ pub fn subscribe_captured(name: &DecodedName, change_stamp: u32, event_mask: u32
         Ok(Ok(subscribed.identifier))
     })();
     if subscription != 0 {
-        rundown::release(subscription + 8)?;
+        rundown::release(subscription_at(subscription).run_ref.address())?;
     }
     if let Some(state) = state {
         namespace::release_name(&state)?;

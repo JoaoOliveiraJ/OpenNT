@@ -5,15 +5,51 @@
 //! ativação. ZwQuerySystemInformation (classe 0xBE, Cloudbook) entra por
 //! [`set_system_information`] com o Zw da fase 6.
 
-use alloc::vec::Vec;
-
 use crate::ntos::ex::pool_allocation;
 use crate::ntos::cm::key::services::{self as key_services, fields, Kind};
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::close;
 use crate::ntos::ps::previous_mode;
+use super::layout::{self, byte_at, ulong_at};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{KeyValuePartialInformation, ObjectAttributes, UnicodeString};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+
+/// Moldura de pool da consulta: atributos da chave ProductOptions, o
+/// caminho e o nome do valor (caracteres logo depois da moldura), o handle
+/// aberto e o ResultLength.
+#[repr(C)]
+struct KeyFrame {
+    attributes: ObjectAttributes,
+    path: UnicodeString,
+    handle: Field<u64>,
+    result_length: Field<u32>,
+    _pad_4c: Reserved<0x4>,
+    name: UnicodeString,
+}
+
+/// Saída da classe 0xBE (36 bytes: flags e o identificador) e o DWORD
+/// devolvido como valor "travado".
+#[repr(C)]
+struct DeviceFrame {
+    flags: Field<u32>,
+    identifier: [Field<u8>; 32],
+    locked: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for KeyFrame {}
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for DeviceFrame {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KeyFrame>() == 96);
+    assert!(core::mem::offset_of!(KeyFrame, path) == 0x30);
+    assert!(core::mem::offset_of!(KeyFrame, handle) == 0x40);
+    assert!(core::mem::offset_of!(KeyFrame, name) == 0x50);
+    assert!(core::mem::size_of::<DeviceFrame>() == 40);
+    assert!(core::mem::offset_of!(DeviceFrame, locked) == 36);
+};
 
 const PRODUCT_OPTIONS: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\ProductOptions";
 const FRAME_TAG: u32 = 0x724C_7354;
@@ -39,62 +75,46 @@ pub enum ValueName<'a> {
     Pointer(u64),
 }
 
-/// UNICODE_STRING contada com o terminador reservado à parte.
-fn write_name(descriptor: u64, buffer: u64, text: &str) {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    guest::write16(descriptor, units.len() as u16 * 2);
-    guest::write16(descriptor + 2, (units.len() as u16 + 1) * 2);
-    guest::write64(descriptor + 8, buffer);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    guest::write16(buffer + units.len() as u64 * 2, 0);
-}
-
-fn move_bytes(destination: u64, source: u64, length: u32) {
-    let backwards = destination > source && destination < source + length as u64;
-    for position in 0..length as u64 {
-        let offset = if backwards { length as u64 - position - 1 } else { position };
-        guest::write8(destination + offset, guest::read8(source + offset));
-    }
-}
 
 /// Helper 0x7D13E4: abre ProductOptions, consulta o tamanho e depois o
 /// valor; BUFFER_OVERFLOW não autoriza a segunda consulta.
 pub fn query(name: ValueName, type_pointer: u64, buffer: u64, capacity: u32, length_pointer: u64, handled: u64) -> Result<u32, KernelError> {
-    guest::write8(handled, 1);
+    byte_at(handled).set(1);
     let path_bytes = (PRODUCT_OPTIONS.len() as u64 + 1) * 2;
     let name_bytes = match name {
         ValueName::Text(text) => (text.encode_utf16().count() as u64 + 1) * 2,
         ValueName::Pointer(_) => 0,
     };
-    let Ok(frame) = kernel_pool::allocate(96 + path_bytes + name_bytes, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    let Ok(frame) = kernel_pool::allocate(KeyFrame::SIZE + path_bytes + name_bytes, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    // SAFETY: alocação nova da moldura seguida dos caracteres.
+    let key = unsafe { KeyFrame::at(frame) };
+    let text_area = frame + KeyFrame::SIZE;
     let mut opened = None;
     let mut value = 0u64;
     let result = (|| -> Result<u32, KernelError> {
-        guest::write32(frame, 48);
-        guest::write64(frame + 16, frame + 48);
-        guest::write32(frame + 24, 0x240);
-        write_name(frame + 48, frame + 96, PRODUCT_OPTIONS);
+        key.attributes.length.set(ObjectAttributes::SIZE as u32);
+        key.attributes.object_name.set(key.path.address());
+        key.attributes.attributes.set(0x240);
+        layout::write_name(key.path.address(), text_area, PRODUCT_OPTIONS);
         let name_pointer = match name {
             ValueName::Text(text) => {
-                write_name(frame + 80, frame + 96 + path_bytes, text);
-                frame + 80
+                layout::write_name(key.name.address(), text_area + path_bytes, text);
+                key.name.address()
             }
             ValueName::Pointer(pointer) => pointer,
         };
-        let status = previous_mode::with_kernel(|| key_services::open(frame + 64, 0x20019, frame, false, 0))??;
+        let status = previous_mode::with_kernel(|| key_services::open(key.handle.address(), 0x20019, key.attributes.address(), false, 0))??;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        let handle = guest::read64(frame + 64);
+        let handle = key.handle.get();
         opened = Some(handle);
-        let request = |out: u64, length: u32| fields(&[("name", name_pointer), ("klass", 2), ("out", out), ("length", length as u64), ("returned", frame + 72)]);
+        let request = |out: u64, length: u32| fields(&[("name", name_pointer), ("klass", 2), ("out", out), ("length", length as u64), ("returned", key.result_length.address())]);
         let status = previous_mode::with_kernel(|| key_services::key_operation(Kind::QueryValue, handle, &request(0, 0), false))??;
         if status & 0x8000_0000 != 0 && status != STATUS_BUFFER_TOO_SMALL {
             return Ok(status);
         }
-        let size = guest::read32(frame + 72);
+        let size = key.result_length.get();
         value = pool_allocation::allocate_tagged(1, size as u64, VALUE_TAG).unwrap_or(0);
         if value == 0 {
             return Ok(STATUS_NO_MEMORY);
@@ -103,17 +123,19 @@ pub fn query(name: ValueName, type_pointer: u64, buffer: u64, capacity: u32, len
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        guest::write32(length_pointer, guest::read32(value + 8));
+        // SAFETY: KEY_VALUE_PARTIAL_INFORMATION devolvida em `value`.
+        let information = unsafe { KeyValuePartialInformation::at(value) };
+        ulong_at(length_pointer).set(information.data_length.get());
         if type_pointer != 0 {
-            guest::write32(type_pointer, guest::read32(value + 4));
+            ulong_at(type_pointer).set(information.type_.get());
         }
         // Uma saída pode apontar para os metadados: o comprimento é relido.
-        let length = guest::read32(value + 8);
+        let length = information.data_length.get();
         if capacity < length {
             return Ok(STATUS_BUFFER_TOO_SMALL);
         }
         if buffer != 0 {
-            move_bytes(buffer, value + 12, length);
+            layout::move_bytes(buffer, information.data.as_ptr() as u64, length);
         }
         Ok(status)
     })();
@@ -135,29 +157,31 @@ fn query_device(identifier: bool, type_pointer: u64, buffer: u64, capacity: u32,
     if result & 0x8000_0000 == 0 || result == STATUS_BUFFER_TOO_SMALL {
         return Ok(result);
     }
-    guest::write32(length_pointer, if identifier { 32 } else { 4 });
-    let Ok(frame) = kernel_pool::allocate(40, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    ulong_at(length_pointer).set(if identifier { 32 } else { 4 });
+    let Ok(frame) = kernel_pool::allocate(DeviceFrame::SIZE, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    // SAFETY: alocação nova do tamanho da moldura.
+    let device = unsafe { DeviceFrame::at(frame) };
     let result = (|| -> Result<u32, KernelError> {
         let handler = (*SYSTEM_INFORMATION.lock()).ok_or_else(|| KernelError::new("ZwQuerySystemInformation is not available yet"))?;
-        let status = previous_mode::with_kernel(|| handler(0xBE, frame, 36, 0))?;
+        let status = previous_mode::with_kernel(|| handler(0xBE, frame, core::mem::offset_of!(DeviceFrame, locked) as u32, 0))?;
         let final_status = if status & 0x8000_0000 != 0 {
             if identifier { status } else { STATUS_NAME_NOT_FOUND }
-        } else if identifier && guest::read8(frame) & 4 == 0 {
+        } else if identifier && device.flags.get() & 4 == 0 {
             STATUS_NAME_NOT_FOUND
-        } else if capacity < if identifier { 32 } else { guest::read32(length_pointer) } {
+        } else if capacity < if identifier { 32 } else { ulong_at(length_pointer).get() } {
             STATUS_BUFFER_TOO_SMALL
         } else {
-            let flags = if identifier { 0 } else { guest::read32(frame) };
+            let flags = if identifier { 0 } else { device.flags.get() };
             // Este caminho exige Type e Buffer, sem os testes opcionais.
-            guest::write32(type_pointer, if identifier { 3 } else { 4 });
-            let length = guest::read32(length_pointer);
+            ulong_at(type_pointer).set(if identifier { 3 } else { 4 });
+            let length = ulong_at(length_pointer).get();
             if !identifier {
-                guest::write32(frame + 36, (flags & 5 == 5) as u32);
+                device.locked.set((flags & 5 == 5) as u32);
             }
-            move_bytes(buffer, frame + if identifier { 4 } else { 36 }, length);
+            layout::move_bytes(buffer, if identifier { device.identifier.as_ptr() as u64 } else { device.locked.address() }, length);
             0
         };
-        guest::write8(handled, 1);
+        byte_at(handled).set(1);
         Ok(final_status)
     })();
     let _ = kernel_pool::free(frame, Some(FRAME_TAG));

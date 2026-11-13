@@ -5,7 +5,12 @@
 
 use alloc::vec::Vec;
 
+use super::layout::{capture_at, context_at, descriptor_at, entry_at, header_at, ulong_at, unicode_at, Descriptor, PolicyEntry, PolicyHeader, RAW_ENTRY};
+use crate::ntos::inc::field::NtStruct;
 use crate::ntos::mm::guest_memory as guest;
+
+/// Tamanho do cabeçalho do blob (os valores começam logo depois).
+const HEADER: u64 = PolicyHeader::SIZE;
 
 const STATUS_DATA_ERROR: u32 = 0xC000_003E;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -13,26 +18,26 @@ const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 /// O blob primário tem comprimento e tipo capturados pelo loader em
 /// +0x14000/+0x14004; o secundário vai direto à validação das entradas.
 pub fn validate_header(context: u64) -> u32 {
-    let blob = guest::read64(context);
+    let blob = context_at(context).primary.get();
     if blob == 0 {
         return 0;
     }
-    if guest::read32(blob + 0x14004) != 3 {
+    if capture_at(blob).value_type.get() != 3 {
         return STATUS_DATA_ERROR;
     }
-    let captured = guest::read32(blob + 0x14000);
+    let captured = capture_at(blob).captured_size.get();
     if captured < 24 {
         return STATUS_DATA_ERROR;
     }
-    let total = guest::read32(blob);
+    let total = header_at(blob).total_size.get();
     if captured < total || total < 24 {
         return STATUS_DATA_ERROR;
     }
-    let entries = guest::read32(blob + 4);
+    let entries = header_at(blob).values_size.get();
     if captured < entries || total < entries {
         return STATUS_DATA_ERROR;
     }
-    let footer = guest::read32(blob + 8);
+    let footer = header_at(blob).end_marker_size.get();
     if captured < footer || total < footer {
         return STATUS_DATA_ERROR;
     }
@@ -44,22 +49,22 @@ pub fn validate_header(context: u64) -> u32 {
 /// os descritores anteriores visíveis e conserva a contagem antiga.
 pub fn build(blob: u64, validate: u8, descriptors: u64, capacity: u32, count_pointer: u64) -> u32 {
     if descriptors != 0 {
-        guest::write_bytes(descriptors, &alloc::vec![0u8; capacity as usize * 16]);
+        guest::write_bytes(descriptors, &alloc::vec![0u8; capacity as usize * Descriptor::SIZE as usize]);
     }
-    let end_offset = guest::read32(blob + 4).wrapping_add(20) as u64;
+    let end_offset = header_at(blob).values_size.get().wrapping_add(HEADER as u32) as u64;
     let end = blob + end_offset;
-    let mut entry = blob + 20;
+    let mut entry = blob + HEADER;
     let mut count = 0u32;
     while entry != end {
         if validate == 1 {
-            if entry - blob + 20 > end_offset {
+            if entry - blob + HEADER > end_offset {
                 return STATUS_DATA_ERROR;
             }
-            let size = guest::read16(entry) as u64;
+            let size = entry_at(entry).size.get() as u64;
             if entry - blob + size > end_offset {
                 return STATUS_DATA_ERROR;
             }
-            let name_length = guest::read16(entry + 2) as u64;
+            let name_length = entry_at(entry).name_size.get() as u64;
             if name_length > size {
                 return STATUS_DATA_ERROR;
             }
@@ -67,31 +72,31 @@ pub fn build(blob: u64, validate: u8, descriptors: u64, capacity: u32, count_poi
             if next < entry {
                 return STATUS_DATA_ERROR;
             }
-            let data_start = entry.wrapping_add(16);
+            let data_start = entry.wrapping_add(PolicyEntry::SIZE);
             let name_end = data_start.wrapping_add(name_length);
             if name_end < data_start || name_end > next {
                 return STATUS_DATA_ERROR;
             }
-            let data_length = guest::read16(entry + 6) as u64;
+            let data_length = entry_at(entry).data_size.get() as u64;
             let data_end = data_start.wrapping_add(name_length + data_length);
             if data_end < data_start || data_end > next {
                 return STATUS_DATA_ERROR;
             }
-            let flags = guest::read32(entry + 8);
+            let flags = entry_at(entry).flags.get();
             if flags != 0 && flags & 3 == 0 {
                 return STATUS_DATA_ERROR;
             }
         }
         if descriptors != 0 && count < capacity {
-            let descriptor = descriptors + count as u64 * 16;
-            guest::write8(descriptor, 2);
-            guest::write64(descriptor + 8, entry);
+            let descriptor = descriptor_at(descriptors + count as u64 * Descriptor::SIZE);
+            descriptor.kind.set(RAW_ENTRY);
+            descriptor.entry.set(entry);
         }
         count = count.wrapping_add(1);
-        entry = entry.wrapping_add(guest::read16(entry) as u64);
+        entry = entry.wrapping_add(entry_at(entry).size.get() as u64);
     }
     if count_pointer != 0 {
-        guest::write32(count_pointer, count);
+        ulong_at(count_pointer).set(count);
     }
     if count > capacity { STATUS_BUFFER_TOO_SMALL } else { 0 }
 }
@@ -100,10 +105,13 @@ pub fn build(blob: u64, validate: u8, descriptors: u64, capacity: u32, count_poi
 /// contados, sensível a caixa.
 pub fn compare(left: u64, right: u64) -> i32 {
     let text = |descriptor: u64| -> (u64, u32) {
-        let entry = guest::read64(descriptor + 8);
-        let raw = guest::read8(descriptor) == 2;
-        let text = if raw { entry + 16 } else { guest::read64(entry + 8) };
-        (text, (guest::read16(entry + if raw { 2 } else { 0 }) >> 1) as u32)
+        let entry = descriptor_at(descriptor).entry.get();
+        if descriptor_at(descriptor).kind.get() == RAW_ENTRY {
+            (entry + PolicyEntry::SIZE, (entry_at(entry).name_size.get() >> 1) as u32)
+        } else {
+            let name = unicode_at(entry);
+            (name.buffer.get(), (name.length.get() >> 1) as u32)
+        }
     };
     let (left_text, left_length) = text(left);
     let (right_text, right_length) = text(right);
@@ -125,8 +133,8 @@ fn swap(left: u64, right: u64) {
     if left == right {
         return;
     }
-    let first = guest::read_bytes(left, 16);
-    let second = guest::read_bytes(right, 16);
+    let first = guest::read_bytes(left, Descriptor::SIZE as usize);
+    let second = guest::read_bytes(right, Descriptor::SIZE as usize);
     guest::write_bytes(left, &second);
     guest::write_bytes(right, &first);
 }
@@ -138,7 +146,7 @@ pub fn sort(descriptors: u64, count: u32) {
     if count < 2 {
         return;
     }
-    let pointer = |index: i64| descriptors + index as u64 * 16;
+    let pointer = |index: i64| descriptors + index as u64 * Descriptor::SIZE;
     let compare_at = |left: i64, right: i64| compare(pointer(left), pointer(right));
     let swap_at = |left: i64, right: i64| swap(pointer(left), pointer(right));
     let mut pending: Vec<(i64, i64)> = alloc::vec![(0, count as i64 - 1)];

@@ -5,6 +5,8 @@
 
 use alloc::vec::Vec;
 
+use super::layout::{self, context_at, descriptor_at, entry_at, ulong_at, unicode_at, Descriptor, PolicyEntry, RAW_ENTRY};
+use crate::ntos::inc::field::NtStruct;
 use crate::ntos::mm::guest_memory as guest;
 
 const STATUS_NOT_FOUND: u32 = 0xC000_0034;
@@ -20,9 +22,9 @@ pub trait Entry {
 /// Relê a UNICODE_STRING a cada comparação e só percorre o prefixo
 /// necessário.
 fn compare_name(name: u64, entry: &mut impl Entry) -> i32 {
-    let buffer = guest::read64(name + 8);
+    let buffer = unicode_at(name).buffer.get();
     entry.prepare();
-    let name_characters = (guest::read16(name) >> 1) as u32;
+    let name_characters = (unicode_at(name).length.get() >> 1) as u32;
     let entry_characters = entry.characters();
     for character in 0..name_characters.min(entry_characters) {
         let supplied = guest::read16(buffer + character as u64 * 2) as i32;
@@ -57,18 +59,6 @@ fn search<E: Entry>(count: u32, name: u64, mut get_entry: impl FnMut(u32) -> E) 
     None
 }
 
-/// memmove; comprimento zero não toca o buffer de dados.
-fn move_bytes(destination: u64, source: u64, length: u32) {
-    if destination > source && destination < source + length as u64 {
-        for index in (0..length as u64).rev() {
-            guest::write8(destination + index, guest::read8(source + index));
-        }
-    } else {
-        for index in 0..length as u64 {
-            guest::write8(destination + index, guest::read8(source + index));
-        }
-    }
-}
 
 /// Descritor nativo de 16 bytes: kind 2 aponta para a entrada do blob; os
 /// demais para uma UNICODE_STRING.
@@ -80,12 +70,17 @@ struct NativeEntry {
 
 impl Entry for NativeEntry {
     fn prepare(&mut self) {
-        self.pointer = guest::read64(self.descriptor + 8);
+        self.pointer = descriptor_at(self.descriptor).entry.get();
     }
     fn characters(&mut self) -> u32 {
-        let raw = guest::read8(self.descriptor) == 2;
-        self.text = if raw { self.pointer + 16 } else { guest::read64(self.pointer + 8) };
-        (guest::read16(self.pointer + if raw { 2 } else { 0 }) >> 1) as u32
+        if descriptor_at(self.descriptor).kind.get() == RAW_ENTRY {
+            self.text = self.pointer + PolicyEntry::SIZE;
+            (entry_at(self.pointer).name_size.get() >> 1) as u32
+        } else {
+            let name = unicode_at(self.pointer);
+            self.text = name.buffer.get();
+            (name.length.get() >> 1) as u32
+        }
     }
     fn character(&self, index: u32) -> u16 {
         guest::read16(self.text + index as u64 * 2)
@@ -95,20 +90,20 @@ impl Entry for NativeEntry {
 /// Consulta pelo índice nativo do contexto. As saídas podem apontar para os
 /// metadados: tamanho e deslocamento são relidos depois das escritas.
 pub fn query_native_index(context: u64, name: u64, type_pointer: u64, buffer: u64, capacity: u32, length_pointer: u64) -> u32 {
-    let count = guest::read32(context + 0xB6E8);
-    let Some(entry) = search(count, name, |index| NativeEntry { descriptor: context + 0x18 + index as u64 * 16, pointer: 0, text: 0 }) else { return STATUS_NOT_FOUND };
-    let pointer = guest::read64(entry.descriptor + 8);
-    guest::write32(length_pointer, guest::read16(pointer + 6) as u32);
+    let count = context_at(context).descriptor_count.get();
+    let Some(entry) = search(count, name, |index| NativeEntry { descriptor: context_at(context).descriptor_array() + index as u64 * Descriptor::SIZE, pointer: 0, text: 0 }) else { return STATUS_NOT_FOUND };
+    let pointer = descriptor_at(entry.descriptor).entry.get();
+    ulong_at(length_pointer).set(entry_at(pointer).data_size.get() as u32);
     if type_pointer != 0 {
-        guest::write32(type_pointer, guest::read16(pointer + 4) as u32);
+        ulong_at(type_pointer).set(entry_at(pointer).data_type.get() as u32);
     }
-    let length = guest::read16(pointer + 6) as u32;
+    let length = entry_at(pointer).data_size.get() as u32;
     if length > capacity {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if buffer != 0 {
-        let name_bytes = guest::read16(pointer + 2) as u64;
-        move_bytes(buffer, pointer + 16 + name_bytes, length);
+        let name_bytes = entry_at(pointer).name_size.get() as u64;
+        layout::move_bytes(buffer, pointer + PolicyEntry::SIZE + name_bytes, length);
     }
     0
 }
@@ -145,9 +140,9 @@ pub fn query_owned(values: &OwnedValues, name: u64, type_pointer: u64, buffer: u
         return values.status;
     }
     let Some(OwnedRef(entry)) = search(values.entries.len() as u32, name, |index| OwnedRef(&values.entries[index as usize])) else { return STATUS_NOT_FOUND };
-    guest::write32(length_pointer, entry.data.len() as u32);
+    ulong_at(length_pointer).set(entry.data.len() as u32);
     if type_pointer != 0 {
-        guest::write32(type_pointer, entry.value_type);
+        ulong_at(type_pointer).set(entry.value_type);
     }
     if entry.data.len() as u64 > capacity as u64 {
         return STATUS_BUFFER_TOO_SMALL;

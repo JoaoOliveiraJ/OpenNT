@@ -15,7 +15,9 @@ use crate::ntos::ex::wnf::{physical as wnf_physical, query as wnf_query};
 use crate::ntos::ke::critical_region;
 use crate::ntos::ps::{previous_mode, process};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use super::objects::state_data_at;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::WnfStateData;
 
 static SERVICE: SpinLock<bool> = SpinLock::new(false);
 
@@ -98,7 +100,7 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
             // O anúncio do conteúdo corrente ignora o status.
             push_lock::acquire_shared(current.lock_pointer(), 0)?;
             let data = if current.data_pointer() > 1 { current.data_pointer() } else { 0 };
-            wnf_physical::push(0, name.decoded_name ^ wnf_name::NAME_MASK, current.change_stamp(), if data != 0 { data + 16 } else { 0 }, if data != 0 { guest::read32(data + 8) } else { 0 });
+            wnf_physical::push(0, name.decoded_name ^ wnf_name::NAME_MASK, current.change_stamp(), if data != 0 { data + WnfStateData::SIZE } else { 0 }, if data != 0 { state_data_at(data).data_size.get() } else { 0 });
             push_lock::release_shared(current.lock_pointer(), 0)?;
         }
         notifications::notify_name(current.pointer, 1, true, false)?;
@@ -120,7 +122,8 @@ pub fn update(state_name: u64, buffer: u64, length: u32, type_identifier: u64, e
         critical_region::enter_critical()?;
         let mut captured = None;
         let result = (|| -> Result<u32, KernelError> {
-            let name = wnf_name::decode(guest::read64(state_name));
+            // SAFETY: ZwUpdateWnfStateData recebe PCWNF_STATE_NAME de modo kernel.
+            let name = wnf_name::decode(unsafe { Field::<u64>::at(state_name) }.get());
             if name.status != 0 {
                 return Ok(name.status);
             }

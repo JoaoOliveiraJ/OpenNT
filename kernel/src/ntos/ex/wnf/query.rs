@@ -11,6 +11,8 @@ use crate::ntos::ex::wnf::scope_capture::{self, Captured};
 use crate::ntos::ke::critical_region;
 use crate::ntos::ps::{previous_mode, process};
 use crate::rtl::KernelError;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::status::STATUS_ACCESS_VIOLATION;
 use crate::ntos::mm::guest_memory as guest;
 
 /// Entradas capturadas do modo usuário: capacidade e TypeId copiado.
@@ -77,9 +79,12 @@ fn query_captured(name: &DecodedName, type_identifier: SuppliedType, captured: &
         if let Some(state) = &state {
             return state_data::read(state, change_stamp, buffer, capacity, returned_length);
         }
-        // A ordem é observável quando as saídas se sobrepõem.
-        guest::write32(change_stamp, 0);
-        guest::write32(returned_length, 0);
+        // A ordem é observável quando as saídas se sobrepõem. As saídas de
+        // modo usuário já foram sondadas; a escrita sondada cobre a perda do
+        // mapeamento entre a sonda e aqui.
+        if guest::try_write::<u32>(change_stamp, 0).is_err() || guest::try_write::<u32>(returned_length, 0).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
         Ok(0)
     })();
     if let Some(state) = state {
@@ -101,7 +106,8 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
                     return Ok(0xC000_0005);
                 }
             }
-            let name = wnf_name::decode(guest::read64(state_name));
+            let Ok(encoded) = guest::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            let name = wnf_name::decode(encoded);
             if name.status != 0 {
                 return Ok(name.status);
             }
@@ -110,7 +116,8 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
                     Ok(inputs) => inputs,
                     Err(status) => return Ok(status),
                 },
-                None => UserInputs { capacity: guest::read32(returned_length), type_identifier: if type_identifier != 0 { SuppliedType::Pointer(type_identifier) } else { SuppliedType::None } },
+                // SAFETY: o PULONG BufferSize de um chamador de modo kernel.
+                None => UserInputs { capacity: unsafe { Field::<u32>::at(returned_length) }.get(), type_identifier: if type_identifier != 0 { SuppliedType::Pointer(type_identifier) } else { SuppliedType::None } },
             };
             let capture = if user.is_some() { scope_capture::capture_user(name.scope, explicit_scope)? } else { scope_capture::capture_kernel(name.scope, explicit_scope)? };
             let capture = match capture {

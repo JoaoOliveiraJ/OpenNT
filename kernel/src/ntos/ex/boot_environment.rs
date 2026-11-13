@@ -7,21 +7,35 @@
 use crate::hal::cpu;
 use crate::hal::firmware_environment;
 use crate::ntos::mm::memory_map;
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
 
 static INFORMATION: SpinLock<Option<[u8; 32]>> = SpinLock::new(None);
+
+/// Página de passagem do loader: assinatura 'BOF1', tamanho e as flags.
+#[repr(C)]
+struct BootFlagsHandoff {
+    signature: Field<u32>,
+    size: Field<u32>,
+    flags: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for BootFlagsHandoff {}
+
+const _: () = assert!(core::mem::size_of::<BootFlagsHandoff>() == 16);
 
 pub fn init() -> Result<(), KernelError> {
     if INFORMATION.lock().is_some() {
         return Err(KernelError::new("boot environment already initialized"));
     }
-    let handoff = memory_map::BOOT_FLAGS_PHYS;
-    if guest::read32(handoff) != 0x3146_4F42 || guest::read32(handoff + 4) != 16 {
+    // SAFETY: página física identidade-mapeada preenchida pelo loader.
+    let handoff = unsafe { BootFlagsHandoff::at(memory_map::BOOT_FLAGS_PHYS) };
+    if handoff.signature.get() != 0x3146_4F42 || handoff.size.get() as u64 != BootFlagsHandoff::SIZE {
         return Err(KernelError::new("missing boot flags handoff"));
     }
     let firmware_type = firmware_environment::firmware_type()?;
-    let boot_flags = guest::read64(handoff + 8);
+    let boot_flags = handoff.flags.get();
     let mut information = [0u8; 32];
     for chunk in information[..16].chunks_mut(8) {
         let random = cpu::hardware_random_u64().ok_or_else(|| KernelError::new("hardware entropy unavailable for boot identity"))?;

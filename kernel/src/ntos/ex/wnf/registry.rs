@@ -5,6 +5,7 @@
 //! mantém o dono vivo e fecha os handles na desmontagem.
 
 use alloc::string::String;
+use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 
 use crate::ntos::ex::pool_allocation;
@@ -15,8 +16,38 @@ use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::close;
 use crate::ntos::ps::previous_mode;
 use crate::ntos::se::sid;
+use super::objects::scope_at;
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{ObjectAttributes, Sid, UnicodeString};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+
+/// Moldura de pool do ZwCreateKey: atributos, o caminho, o handle e a
+/// disposição devolvidos; o texto (quando não vem de fora) segue a moldura.
+#[repr(C)]
+struct CreateKeyFrame {
+    attributes: ObjectAttributes,
+    path: UnicodeString,
+    handle: Field<u64>,
+    disposition: Field<u32>,
+    _pad_4c: Reserved<0x4>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CreateKeyFrame {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CreateKeyFrame>() == 80);
+    assert!(core::mem::offset_of!(CreateKeyFrame, path) == 48);
+    assert!(core::mem::offset_of!(CreateKeyFrame, handle) == 64);
+    assert!(core::mem::offset_of!(CreateKeyFrame, disposition) == 72);
+};
+
+/// Uma célula de handle (raiz de definições ou armazém permanente).
+fn slot_at(slot: u64) -> &'static Field<u64> {
+    // SAFETY: slots do host, do SILO_GLOBALS ou da instância de escopo.
+    unsafe { Field::<u64>::at(slot) }
+}
 
 const STORE_TAG: u32 = 0x2066_6E57;
 const FRAME_TAG: u32 = 0x7266_6E57;
@@ -41,24 +72,24 @@ type Outcome<T> = Result<Result<T, u32>, KernelError>;
 #[allow(clippy::too_many_arguments)]
 fn create_key(path: &str, root: u64, access: u32, options: u32, disposition_required: bool, path_buffer: u64, path_capacity: u32) -> Outcome<Opened> {
     let units: Vec<u16> = path.encode_utf16().collect();
-    let size = if path_buffer != 0 { 80 } else { 82 + units.len() as u64 * 2 };
+    let size = CreateKeyFrame::SIZE + if path_buffer != 0 { 0 } else { 2 + units.len() as u64 * 2 };
     let Ok(frame) = kernel_pool::allocate(size, AllocateOptions { zero: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(Err(0xC000_0017)) };
-    let text = if path_buffer != 0 { path_buffer } else { frame + 80 };
-    guest::write32(frame, 48);
-    guest::write64(frame + 8, root);
-    guest::write64(frame + 16, frame + 48);
-    guest::write32(frame + 24, 0x240);
-    guest::write16(frame + 48, units.len() as u16 * 2);
-    guest::write16(frame + 50, if path_capacity != 0 { path_capacity as u16 } else { units.len() as u16 * 2 + 2 });
-    guest::write64(frame + 56, text);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(text + index as u64 * 2, *unit);
-    }
-    guest::write16(text + units.len() as u64 * 2, 0);
-    let created = previous_mode::with_kernel(|| key_services::create(frame + 64, access, frame, 0, 0, options, if disposition_required { frame + 72 } else { 0 }, false));
+    // SAFETY: alocação nova da moldura (mais o texto).
+    let key = unsafe { CreateKeyFrame::at(frame) };
+    let text = if path_buffer != 0 { path_buffer } else { frame + CreateKeyFrame::SIZE };
+    key.attributes.length.set(ObjectAttributes::SIZE as u32);
+    key.attributes.root_directory.set(root);
+    key.attributes.object_name.set(key.path.address());
+    key.attributes.attributes.set(0x240);
+    key.path.length.set(units.len() as u16 * 2);
+    key.path.maximum_length.set(if path_capacity != 0 { path_capacity as u16 } else { units.len() as u16 * 2 + 2 });
+    key.path.buffer.set(text);
+    let bytes: Vec<u8> = units.iter().chain(core::iter::once(&0)).flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(text, &bytes);
+    let created = previous_mode::with_kernel(|| key_services::create(key.handle.address(), access, key.attributes.address(), 0, 0, options, if disposition_required { key.disposition.address() } else { 0 }, false));
     let result = match created {
         Ok(Ok(status)) if status & 0x8000_0000 != 0 => Ok(Err(status)),
-        Ok(Ok(status)) => Ok(Ok(Opened { status, handle: guest::read64(frame + 64), disposition: guest::read32(frame + 72) })),
+        Ok(Ok(status)) => Ok(Ok(Opened { status, handle: key.handle.get(), disposition: key.disposition.get() })),
         Ok(Err(error)) | Err(error) => Err(error),
     };
     let _ = kernel_pool::free(frame, Some(FRAME_TAG));
@@ -67,11 +98,11 @@ fn create_key(path: &str, root: u64, access: u32, options: u32, disposition_requ
 
 /// O slot possui o handle vencedor; o perdedor fecha só o seu.
 fn publish_cached_handle(slot: u64, handle: u64) -> Outcome<Opened> {
-    let previous = guest::compare_exchange64(slot, 0, handle)?;
-    if previous != 0 {
+    let cell = slot_at(slot);
+    if cell.atomic().compare_exchange(0, handle, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         let _ = previous_mode::with_kernel(|| close::close(handle, Some(0)));
     }
-    Ok(Ok(Opened { status: 0, handle: guest::read64(slot), disposition: 0 }))
+    Ok(Ok(Opened { status: 0, handle: cell.get(), disposition: 0 }))
 }
 
 /// Raiz de definições do tempo de vida. Sem provedor de separação de
@@ -80,7 +111,7 @@ pub fn get_definition_store(lifetime: u32, slot: u64) -> Outcome<Opened> {
     if lifetime > 2 {
         return Err(KernelError::new("WNF temporary names do not have a definition store"));
     }
-    let cached = guest::read64(slot);
+    let cached = slot_at(slot).get();
     if cached != 0 {
         return Ok(Ok(Opened { status: 0, handle: cached, disposition: 0 }));
     }
@@ -98,18 +129,23 @@ fn open_permanent_user_store(identifier: u64) -> Outcome<Opened> {
     if !sid::valid(identifier) {
         return Ok(Err(0xC000_0078));
     }
-    let count = guest::read8(identifier + 1) as u32;
-    let hexadecimal = guest::read8(identifier + 2) != 0 || guest::read8(identifier + 3) != 0;
+    // SAFETY: SID validado acima (cópia de kernel da identidade do escopo).
+    let sid_object = unsafe { Sid::at(identifier) };
+    let authority = &sid_object.identifier_authority.value;
+    let count = sid_object.sub_authority_count.get() as u32;
+    let hexadecimal = authority[0].get() != 0 || authority[1].get() != 0;
     let capacity = (if hexadecimal { 36 } else { 28 }) + count * 22;
     let Ok(path_buffer) = pool_allocation::allocate_tagged(1, capacity as u64 + 82, STORE_TAG) else { return Ok(Err(0xC000_009A)) };
     let result = (|| {
-        if guest::read8(identifier) != 1 {
+        if sid_object.revision.get() != 1 {
             return Ok(Err(0xC000_0078));
         }
-        let authority = (0..6).fold(0u64, |value, index| value << 8 | guest::read8(identifier + 2 + index) as u64);
+        let authority = authority.iter().fold(0u64, |value, byte| value << 8 | byte.get() as u64);
         let mut text = if hexadecimal { alloc::format!("S-1-0x{authority:X}") } else { alloc::format!("S-1-{authority}") };
-        for index in 0..count as u64 {
-            text.push_str(&alloc::format!("-{}", guest::read32(identifier + 8 + index * 4)));
+        // SAFETY: SubAuthorityCount entradas seguem o cabeçalho do SID validado.
+        let sub_authorities = unsafe { Field::<u32>::array_at(sid_object.sub_authority.as_ptr() as u64, count as usize) };
+        for sub_authority in sub_authorities {
+            text.push_str(&alloc::format!("-{}", sub_authority.get()));
         }
         if text.len() as u32 * 2 >= capacity {
             return Ok(Err(0x8000_0005));
@@ -144,12 +180,13 @@ pub fn open_permanent_store(scope: u32, lifetime: u32, identity: u64, volatile: 
 /// cache existente precede a validação da abertura.
 pub fn get_permanent_store(scope_instance: u64, lifetime: u32, create: u32, definition_slot: u64) -> Outcome<Opened> {
     let volatile = if lifetime.wrapping_sub(2) <= 1 { 1 } else { 0 };
-    let slot = scope_instance + 0x40 + volatile as u64 * 8;
-    let cached = guest::read64(slot);
+    let instance = scope_at(scope_instance);
+    let slot = if volatile != 0 { instance.volatile_permanent_data_store.address() } else { instance.permanent_data_store.address() };
+    let cached = slot_at(slot).get();
     if cached != 0 {
         return Ok(Ok(Opened { status: 0, handle: cached, disposition: 0 }));
     }
-    let opened = match open_permanent_store(guest::read32(scope_instance + 0x10), lifetime, guest::read64(scope_instance + 0x18), volatile, create, definition_slot)? {
+    let opened = match open_permanent_store(instance.data_scope.get().0 as u32, lifetime, instance.instance_id_data.get(), volatile, create, definition_slot)? {
         Ok(opened) => opened,
         Err(status) => return Ok(Err(status)),
     };

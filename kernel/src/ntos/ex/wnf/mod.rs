@@ -1,6 +1,7 @@
 //! Windows Notification Facility (WNF) do Executive: nomes de estado,
 //! escopos, namespace, dados, assinaturas, notificações e os serviços Nt/Zw.
 
+mod objects;
 pub mod update;
 pub mod physical;
 pub mod name;

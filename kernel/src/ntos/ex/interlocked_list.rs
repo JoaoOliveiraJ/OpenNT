@@ -7,28 +7,34 @@
 //! `spin_lock` (sobe a DISPATCH_LEVEL).
 
 use super::spin_lock;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::SingleListEntry;
 
-fn push_entry(head: u64, entry: u64) -> u64 {
-    let previous = guest::read64(head);
-    guest::write64(entry, previous);
-    guest::write64(head, entry);
+fn entry_at(address: u64) -> &'static SingleListEntry {
+    // SAFETY: cabeça e entradas são SINGLE_LIST_ENTRYs do chamador.
+    unsafe { SingleListEntry::at(address) }
+}
+
+fn push_entry(head: &SingleListEntry, entry: &SingleListEntry) -> u64 {
+    let previous = head.next.get();
+    entry.next.set(previous);
+    head.next.set(entry.address());
     previous
 }
 
-fn pop_entry(head: u64) -> u64 {
-    let first = guest::read64(head);
+fn pop_entry(head: &SingleListEntry) -> u64 {
+    let first = head.next.get();
     if first == 0 {
         return 0;
     }
-    guest::write64(head, guest::read64(first));
+    head.next.set(entry_at(first).next.get());
     first
 }
 
 /// ExInterlockedPushEntryList: devolve a entrada que estava no topo.
 pub fn push(head: u64, entry: u64, lock: u64) -> u64 {
     let previous_irql = spin_lock::lock_with_raise(lock);
-    let previous = push_entry(head, entry);
+    let previous = push_entry(entry_at(head), entry_at(entry));
     spin_lock::unlock_with_lower(lock, previous_irql);
     previous
 }
@@ -36,7 +42,7 @@ pub fn push(head: u64, entry: u64, lock: u64) -> u64 {
 /// ExInterlockedPopEntryList: devolve a entrada removida (0 se vazia).
 pub fn pop(head: u64, lock: u64) -> u64 {
     let previous_irql = spin_lock::lock_with_raise(lock);
-    let removed = pop_entry(head);
+    let removed = pop_entry(entry_at(head));
     spin_lock::unlock_with_lower(lock, previous_irql);
     removed
 }

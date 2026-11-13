@@ -2,7 +2,8 @@
 //! a partir de um gerador xorshift32 semeado no TSC.
 
 use crate::hal::cpu;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Guid;
 use crate::rtl::SpinLock;
 
 /// Gerador xorshift32 semeado no TSC (ExUuidCreate).
@@ -33,8 +34,15 @@ fn next_random64() -> u64 {
 pub fn create(pointer: u64) {
     let low = next_random64();
     let high = next_random64();
-    guest::write64(pointer, low);
-    guest::write64(pointer + 8, high);
-    guest::write8(pointer + 6, (guest::read8(pointer + 6) & 0x0F) | 0x40);
-    guest::write8(pointer + 8, (guest::read8(pointer + 8) & 0x3F) | 0x80);
+    // SAFETY: ExUuidCreate recebe o UUID* de saída do chamador.
+    let guid = unsafe { Guid::at(pointer) };
+    guid.data1.set(low as u32);
+    guid.data2.set((low >> 32) as u16);
+    // Versão 4 no nibble alto de Data3 (o byte 7 na memória).
+    guid.data3.set(((low >> 48) as u16 & 0x0FFF) | 0x4000);
+    for (index, byte) in guid.data4.iter().enumerate() {
+        byte.set((high >> (index * 8)) as u8);
+    }
+    // Variante DCE (10xxxxxx) em Data4[0].
+    guid.data4[0].set((guid.data4[0].get() & 0x3F) | 0x80);
 }

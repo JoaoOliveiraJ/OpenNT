@@ -5,6 +5,7 @@
 //! usam o dispatcher real. Instância única, ligada ao namespace do serviço.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::mem::offset_of;
 
 use crate::ntos::ex::{push_lock, rundown};
 use crate::ntos::ex::wnf::name as wnf_name;
@@ -17,9 +18,12 @@ use crate::ntos::ps::{previous_mode, process, process_context};
 use crate::ntos::ps::silo::query as silo_query;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use super::objects::{name_at, process_at, process_context_at, subscription_at};
+use crate::ntos::ex::list_entry;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{WnfStateName, WnfSubscription, WnfSubscriptionState};
 
 const STATE_TAG: u32 = 0x2066_6E57;
-const PROCESS_CONTEXT_OFFSET: u64 = 0x868;
 
 static WORK_ITEM: AtomicU64 = AtomicU64::new(0);
 static SCHEDULED: AtomicBool = AtomicBool::new(false);
@@ -41,76 +45,59 @@ fn locked<T>(pointer: u64, exclusive: bool, action: impl FnOnce() -> Result<T, K
     result
 }
 
-/// Contador de 32 bits por compare-exchange; devolve o novo valor.
-pub fn change_counter(pointer: u64, delta: i32) -> Result<u32, KernelError> {
-    let mut previous = guest::read32(pointer);
-    loop {
-        let next = previous.wrapping_add(delta as u32);
-        let observed = guest::compare_exchange32(pointer, previous, next)?;
-        if observed == previous {
-            return Ok(next);
-        }
-        previous = observed;
-    }
+/// Contador de 32 bits (DataSubscribersCount/CurrentDeliveryCount) por
+/// LOCK XADD; devolve o novo valor.
+pub fn change_counter(counter: &Field<i32>, delta: i32) -> Result<u32, KernelError> {
+    Ok(counter.atomic().fetch_add(delta, Ordering::SeqCst).wrapping_add(delta) as u32)
 }
 
 fn unlink(entry: u64) -> Result<(), KernelError> {
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    if guest::read64(next + 8) != entry || guest::read64(previous) != entry {
-        return Err(KernelError::new("corrupt WNF subscription list"));
-    }
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
-    Ok(())
+    list_entry::remove(list_entry::at(entry)).map(|_| ()).ok_or_else(|| KernelError::new("corrupt WNF subscription list"))
 }
 
 fn insert_last(head: u64, entry: u64) -> Result<(), KernelError> {
-    let previous = guest::read64(head + 8);
-    if guest::read64(previous) != head {
+    let head = list_entry::at(head);
+    if !list_entry::tail_consistent(head) {
         return Err(KernelError::new("corrupt WNF pending queue"));
     }
-    guest::write64(entry, head);
-    guest::write64(entry + 8, previous);
-    guest::write64(previous, entry);
-    guest::write64(head + 8, entry);
+    list_entry::insert_tail(head, list_entry::at(entry));
     Ok(())
 }
 
 /// Verdadeiro só quando o assinante precisa acordar o consumidor; repetidas
 /// atualizações acumulam a máscara sem duplicar o nó na fila.
 pub fn enqueue(subscription: u64, event_mask: u32) -> Result<bool, KernelError> {
-    let owner = guest::read64(subscription + 0x28);
+    let owner = subscription_at(subscription).process.get();
     if owner == 0 {
         return Ok(false);
     }
-    let context = guest::read64(owner + PROCESS_CONTEXT_OFFSET);
+    let context = process_at(owner).wnf_context.get();
     if context == 0 {
         return Err(KernelError::new("WNF subscription owner has no context"));
     }
-    locked(context + 0x68, true, || {
-        let interest = guest::read32(subscription + 0x64);
+    locked(process_context_at(context).delivery_pending_list_lock.address(), true, || {
+        let interest = subscription_at(subscription).subscribed_event_set.get();
         let accepted = event_mask & interest;
         if accepted == 0 {
             return Ok(false);
         }
-        let state = guest::read32(subscription + 0x78);
+        let state = subscription_at(subscription).subscription_state.get().0;
         let mut wake = false;
         if state == 0 {
-            insert_last(context + 0x70, subscription + 0x68)?;
+            insert_last(process_context_at(context).delivery_pending_list_head.address(), subscription_at(subscription).pending_subscription_list_entry.address())?;
             wake = true;
         } else if state == 3 {
             wake = true;
         }
         if wake {
-            guest::write32(subscription + 0x78, 1);
+            subscription_at(subscription).subscription_state.set(WnfSubscriptionState(1));
         }
-        let pending = guest::read32(subscription + 0x7C);
-        let delivering = guest::read32(subscription + 0x80);
+        let pending = subscription_at(subscription).signaled_event_set.get();
+        let delivering = subscription_at(subscription).in_delivery_event_set.get();
         if accepted & 1 != 0 && (pending | delivering) & 1 == 0 {
-            change_counter(guest::read64(subscription + 0x30) + 0xA4, 1)?;
+            change_counter(&name_at(subscription_at(subscription).name_instance.get()).current_delivery_count, 1)?;
         }
-        guest::write32(subscription + 0x7C, (pending | accepted) & interest);
+        subscription_at(subscription).signaled_event_set.set((pending | accepted) & interest);
         Ok(wake)
     })
 }
@@ -132,8 +119,8 @@ pub fn create() -> Result<bool, KernelError> {
 }
 
 fn signal_process(process: u64) {
-    let context = guest::read64(process + PROCESS_CONTEXT_OFFSET);
-    let event = guest::read64(context + 0x80);
+    let context = process_at(process).wnf_context.get();
+    let event = process_context_at(context).notification_event.get();
     if event != 0 {
         dispatcher::set_event(event);
     }
@@ -142,11 +129,11 @@ fn signal_process(process: u64) {
 /// Notificação inicial de uma inscrição recém-criada ou atualizada; o
 /// consumidor é acordado depois de liberar o lock do nome.
 pub fn notify_subscription(name: u64, subscription: u64, event_mask: u32, inline: bool) -> Result<(), KernelError> {
-    let process = locked(name + 0x70, false, || {
-        if guest::read64(subscription + 0x30) == 0 {
+    let process = locked(name_at(name).state_subscription_list_lock.address(), false, || {
+        if subscription_at(subscription).name_instance.get() == 0 {
             return Ok(0);
         }
-        Ok(if enqueue(subscription, event_mask)? { guest::read64(subscription + 0x28) } else { 0 })
+        Ok(if enqueue(subscription, event_mask)? { subscription_at(subscription).process.get() } else { 0 })
     })?;
     if process == 0 {
         return Ok(());
@@ -163,25 +150,25 @@ pub fn notify_subscription(name: u64, subscription: u64, event_mask: u32, inline
 /// conclusão (máscara 8) é anunciada logo.
 pub fn notify_name(name: u64, event_mask: u32, start_dispatcher: bool, inline: bool) -> Result<(), KernelError> {
     let system = process::get_system_process();
-    let (has_data_subscribers, kernel_pending) = locked(name + 0x70, false, || {
+    let (has_data_subscribers, kernel_pending) = locked(name_at(name).state_subscription_list_lock.address(), false, || {
         let mut data = false;
         let mut kernel = false;
-        let head = name + 0x78;
-        let mut entry = guest::read64(head);
+        let head = name_at(name).state_subscription_list_head.address();
+        let mut entry = list_entry::at(head).flink.get();
         while entry != head {
-            let subscription = entry - 0x40;
-            if guest::read32(subscription + 0x64) & 1 != 0 {
+            let subscription = entry - offset_of!(WnfSubscription, state_subscription_list_entry) as u64;
+            if subscription_at(subscription).subscribed_event_set.get() & 1 != 0 {
                 data = true;
             }
             if enqueue(subscription, event_mask)? {
-                let process = guest::read64(subscription + 0x28);
+                let process = subscription_at(subscription).process.get();
                 if process == system {
                     kernel = true;
                 } else {
                     signal_process(process);
                 }
             }
-            entry = guest::read64(entry);
+            entry = list_entry::at(entry).flink.get();
         }
         Ok((data, kernel))
     })?;
@@ -196,14 +183,16 @@ pub fn notify_name(name: u64, event_mask: u32, start_dispatcher: bool, inline: b
 
 /// Callback de kernel: (inscrição, &nome, máscara, carimbo, TypeId, contexto).
 fn invoke_callback(subscription: u64, name: u64, event_mask: u32) -> Result<(), KernelError> {
-    let frame = guest::alloc_bytes(64);
+    // O nome externo (WNF_STATE_NAME) vai por ponteiro, numa célula própria.
+    let frame = guest::alloc_bytes(WnfStateName::SIZE);
     if frame == 0 {
         return Err(KernelError::new("WNF callback argument frame allocation failed"));
     }
-    guest::write64(frame + 48, guest::read64(subscription + 0x38) ^ wnf_name::NAME_MASK);
-    let stamp = if name != 0 && event_mask & 1 != 0 { guest::read32(name + 0x60) as u64 } else { 0 };
-    let type_identifier = if name != 0 { guest::read64(name + 0x40) } else { 0 };
-    native_call::call(guest::read64(subscription + 0x50), &[subscription, frame + 48, event_mask as u64, stamp, type_identifier, guest::read64(subscription + 0x58)]);
+    // SAFETY: alocação nova de 8 bytes.
+    unsafe { Field::<u64>::at(frame) }.set(subscription_at(subscription).state_name.bitfield_0.get() ^ wnf_name::NAME_MASK);
+    let stamp = if name != 0 && event_mask & 1 != 0 { name_at(name).current_change_stamp.get() as u64 } else { 0 };
+    let type_identifier = if name != 0 { name_at(name).state_name_info.type_id.get() } else { 0 };
+    native_call::call(subscription_at(subscription).callback_routine.get(), &[subscription, frame, event_mask as u64, stamp, type_identifier, subscription_at(subscription).callback_context.get()]);
     guest::free_bytes(frame);
     Ok(())
 }
@@ -211,23 +200,23 @@ fn invoke_callback(subscription: u64, name: u64, event_mask: u32) -> Result<(), 
 /// Consome a fila do processo do sistema, chamando cada callback com a
 /// máscara entregue (dados só com carimbo novo).
 pub fn dispatch_kernel_subscriptions() -> Result<(), KernelError> {
-    let context = guest::read64(process::get_system_process() + PROCESS_CONTEXT_OFFSET);
+    let context = process_at(process::get_system_process()).wnf_context.get();
     if context == 0 {
         return Ok(());
     }
-    let pending_lock = context + 0x68;
-    let pending_head = context + 0x70;
+    let pending_lock = process_context_at(context).delivery_pending_list_lock.address();
+    let pending_head = process_context_at(context).delivery_pending_list_head.address();
     loop {
         let subscription = locked(pending_lock, true, || {
-            let entry = guest::read64(pending_head);
+            let entry = list_entry::at(pending_head).flink.get();
             if entry == pending_head {
                 return Ok(0);
             }
-            let pointer = entry - 0x68;
-            if !rundown::acquire(pointer + 8)? {
+            let pointer = entry - offset_of!(WnfSubscription, pending_subscription_list_entry) as u64;
+            if !rundown::acquire(subscription_at(pointer).run_ref.address())? {
                 return Err(KernelError::new("queued WNF subscription is being freed"));
             }
-            guest::write32(pointer + 0x78, 2);
+            subscription_at(pointer).subscription_state.set(WnfSubscriptionState(2));
             unlink(entry)?;
             Ok(pointer)
         })?;
@@ -237,24 +226,24 @@ pub fn dispatch_kernel_subscriptions() -> Result<(), KernelError> {
         let result = (|| -> Result<(), KernelError> {
             loop {
                 let pending = locked(pending_lock, true, || {
-                    let mask = guest::read32(subscription + 0x7C);
-                    guest::write32(subscription + 0x7C, 0);
+                    let mask = subscription_at(subscription).signaled_event_set.get();
+                    subscription_at(subscription).signaled_event_set.set(0);
                     Ok(mask)
                 })?;
                 let mut delivered = pending;
-                let name = locked(context + 0x50, false, || {
-                    let mut name = guest::read64(subscription + 0x30);
-                    if name != 0 && !rundown::acquire(name + 8)? {
+                let name = locked(process_context_at(context).process_subscription_list_lock.address(), false, || {
+                    let mut name = subscription_at(subscription).name_instance.get();
+                    if name != 0 && !rundown::acquire(name_at(name).run_ref.address())? {
                         name = 0;
                     }
                     if name == 0 {
                         delivered &= !1;
                     } else if delivered & 1 != 0 {
-                        let stamp = guest::read32(name + 0x60);
-                        if stamp <= guest::read32(subscription + 0x60) {
+                        let stamp = name_at(name).current_change_stamp.get();
+                        if stamp <= subscription_at(subscription).current_change_stamp.get() {
                             delivered &= !1;
                         } else {
-                            guest::write32(subscription + 0x60, stamp);
+                            subscription_at(subscription).current_change_stamp.set(stamp);
                         }
                     }
                     Ok(name)
@@ -263,20 +252,20 @@ pub fn dispatch_kernel_subscriptions() -> Result<(), KernelError> {
                     if delivered != 0 {
                         invoke_callback(subscription, name, delivered)?;
                     }
-                    if delivered & 1 != 0 && change_counter(name + 0xA4, -1)? == 0 {
+                    if delivered & 1 != 0 && change_counter(&name_at(name).current_delivery_count, -1)? == 0 {
                         notify_name(name, 8, false, false)?;
                     }
                     Ok(())
                 })();
                 if name != 0 {
-                    rundown::release(name + 8)?;
+                    rundown::release(name_at(name).run_ref.address())?;
                 }
                 delivery?;
                 let repeat = locked(pending_lock, true, || {
-                    if guest::read32(subscription + 0x7C) != 0 {
+                    if subscription_at(subscription).signaled_event_set.get() != 0 {
                         return Ok(true);
                     }
-                    guest::write32(subscription + 0x78, 0);
+                    subscription_at(subscription).subscription_state.set(WnfSubscriptionState(0));
                     Ok(false)
                 })?;
                 if !repeat {
@@ -284,7 +273,7 @@ pub fn dispatch_kernel_subscriptions() -> Result<(), KernelError> {
                 }
             }
         })();
-        rundown::release(subscription + 8)?;
+        rundown::release(subscription_at(subscription).run_ref.address())?;
         result?;
     }
 }
@@ -337,15 +326,15 @@ pub fn start_kernel_dispatcher(inline: bool) -> Result<(), KernelError> {
 /// Desliga os assinantes de um nome antes do rundown dele; a inscrição
 /// continua do processo.
 pub fn detach_name(name: u64) -> Result<(), KernelError> {
-    let head = name + 0x78;
+    let head = name_at(name).state_subscription_list_head.address();
     loop {
-        let subscription = locked(name + 0x70, true, || {
-            let entry = guest::read64(head);
+        let subscription = locked(name_at(name).state_subscription_list_lock.address(), true, || {
+            let entry = list_entry::at(head).flink.get();
             if entry == head {
                 return Ok(0);
             }
-            let pointer = entry - 0x40;
-            if !rundown::acquire(pointer + 8)? {
+            let pointer = entry - offset_of!(WnfSubscription, state_subscription_list_entry) as u64;
+            if !rundown::acquire(subscription_at(pointer).run_ref.address())? {
                 return Err(KernelError::new("linked WNF subscription is in rundown"));
             }
             Ok(pointer)
@@ -353,18 +342,18 @@ pub fn detach_name(name: u64) -> Result<(), KernelError> {
         if subscription == 0 {
             return Ok(());
         }
-        let process = guest::read64(subscription + 0x28);
-        let context = guest::read64(process + PROCESS_CONTEXT_OFFSET);
-        let result = locked(context + 0x50, true, || {
-            locked(name + 0x70, true, || {
-                if guest::read64(subscription + 0x30) == name {
-                    unlink(subscription + 0x40)?;
-                    guest::write64(subscription + 0x30, 0);
+        let process = subscription_at(subscription).process.get();
+        let context = process_at(process).wnf_context.get();
+        let result = locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
+            locked(name_at(name).state_subscription_list_lock.address(), true, || {
+                if subscription_at(subscription).name_instance.get() == name {
+                    unlink(subscription_at(subscription).state_subscription_list_entry.address())?;
+                    subscription_at(subscription).name_instance.set(0);
                 }
                 Ok(())
             })
         });
-        rundown::release(subscription + 8)?;
+        rundown::release(subscription_at(subscription).run_ref.address())?;
         result?;
     }
 }
@@ -372,45 +361,45 @@ pub fn detach_name(name: u64) -> Result<(), KernelError> {
 /// Remove o assinante de todas as listas na desmontagem do processo; o
 /// corpo só sai do pool quando callbacks e consultas devolvem o rundown.
 pub fn delete_process_subscriptions(process: u64, context: u64) -> Result<(), KernelError> {
-    let head = context + 0x58;
+    let head = process_context_at(context).process_subscription_list_head.address();
     let system = process::get_system_process();
     loop {
         let mut name = 0u64;
         let mut last_data_subscriber = false;
         let mut delivery_completed = false;
-        let subscription = locked(context + 0x50, true, || {
-            let entry = guest::read64(head);
+        let subscription = locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
+            let entry = list_entry::at(head).flink.get();
             if entry == head {
                 return Ok(0);
             }
-            let pointer = entry - 0x18;
-            name = guest::read64(pointer + 0x30);
+            let pointer = entry - offset_of!(WnfSubscription, process_subscription_list_entry) as u64;
+            name = subscription_at(pointer).name_instance.get();
             let mut remove = || -> Result<u64, KernelError> {
                 if name != 0 {
-                    if !rundown::acquire(name + 8)? {
+                    if !rundown::acquire(name_at(name).run_ref.address())? {
                         return Err(KernelError::new("WNF subscriber references a closing name"));
                     }
-                    unlink(pointer + 0x40)?;
-                    guest::write64(pointer + 0x30, 0);
-                    if guest::read32(pointer + 0x64) & 1 != 0 {
-                        last_data_subscriber = change_counter(name + 0xA0, -1)? == 0;
+                    unlink(subscription_at(pointer).state_subscription_list_entry.address())?;
+                    subscription_at(pointer).name_instance.set(0);
+                    if subscription_at(pointer).subscribed_event_set.get() & 1 != 0 {
+                        last_data_subscriber = change_counter(&name_at(name).data_subscribers_count, -1)? == 0;
                     }
                 }
-                unlink(pointer + 0x18)?;
-                locked(context + 0x68, true, || {
-                    let state = guest::read32(pointer + 0x78);
+                unlink(subscription_at(pointer).process_subscription_list_entry.address())?;
+                locked(process_context_at(context).delivery_pending_list_lock.address(), true, || {
+                    let state = subscription_at(pointer).subscription_state.get().0;
                     if state == 1 || (process != system && state != 0) {
-                        unlink(pointer + 0x68)?;
-                        if name != 0 && guest::read32(pointer + 0x64) & 1 != 0 && (guest::read32(pointer + 0x7C) | guest::read32(pointer + 0x80)) & 1 != 0 {
-                            delivery_completed = change_counter(name + 0xA4, -1)? == 0;
+                        unlink(subscription_at(pointer).pending_subscription_list_entry.address())?;
+                        if name != 0 && subscription_at(pointer).subscribed_event_set.get() & 1 != 0 && (subscription_at(pointer).signaled_event_set.get() | subscription_at(pointer).in_delivery_event_set.get()) & 1 != 0 {
+                            delivery_completed = change_counter(&name_at(name).current_delivery_count, -1)? == 0;
                         }
                     }
-                    guest::write64(pointer + 0x28, 0);
+                    subscription_at(pointer).process.set(0);
                     Ok(())
                 })?;
                 Ok(pointer)
             };
-            if name != 0 { locked(name + 0x70, true, remove) } else { remove() }
+            if name != 0 { locked(name_at(name).state_subscription_list_lock.address(), true, remove) } else { remove() }
         })?;
         if subscription == 0 {
             break;
@@ -426,18 +415,18 @@ pub fn delete_process_subscriptions(process: u64, context: u64) -> Result<(), Ke
             Ok(())
         })();
         if name != 0 {
-            rundown::release(name + 8)?;
+            rundown::release(name_at(name).run_ref.address())?;
         }
         notified?;
-        rundown::wait(subscription + 8)?;
+        rundown::wait(subscription_at(subscription).run_ref.address())?;
         let _ = kernel_pool::free(subscription, Some(STATE_TAG));
     }
-    let event = guest::read64(context + 0x80);
+    let event = process_context_at(context).notification_event.get();
     if event != 0 {
         if let Some(described) = open_pointer::describe(event) {
             described.dereference();
         }
-        guest::write64(context + 0x80, 0);
+        process_context_at(context).notification_event.set(0);
     }
     Ok(())
 }

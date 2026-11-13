@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::ex::boot_environment_information;
 use crate::ntos::ke::processor_information;
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::module_queries;
 use crate::ntos::ps::system_process_information;
@@ -27,6 +28,19 @@ pub struct EntropyRegistration {
 
 static ENTROPY_TIMING_REGISTRATIONS: SpinLock<Vec<EntropyRegistration>> = SpinLock::new(Vec::new());
 
+/// Buffer da classe 131 (registro de entropia por tempo de interrupção).
+#[repr(C)]
+struct EntropyTimingInformation {
+    entropy_routine: Field<u64>,
+    initialization_routine: Field<u64>,
+    initialization_context: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for EntropyTimingInformation {}
+
+const _: () = assert!(core::mem::size_of::<EntropyTimingInformation>() == 24);
+
 pub fn entropy_registrations() -> Vec<EntropyRegistration> {
     ENTROPY_TIMING_REGISTRATIONS.lock().clone()
 }
@@ -43,11 +57,10 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         // SystemCodeIntegrityCertificateManagementInformation: nenhuma
         // operação de certificados pendente (o cng percorre e segue).
         117 => {
-            for offset in (0..length as u64).step_by(4) {
-                guest::write32(output + offset, 0);
-            }
+            guest::write_bytes(output, &alloc::vec![0u8; length as usize]);
             if returned != 0 {
-                guest::write32(returned, length);
+                // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+                unsafe { Field::<u32>::at(returned) }.set(length);
             }
             return Ok(0);
         }
@@ -61,12 +74,14 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
 /// classes desconhecidas = STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
     if class == 131 {
-        if length < 24 {
+        if (length as u64) < EntropyTimingInformation::SIZE {
             return 0xC000_0004;
         }
         let count = {
             let mut registrations = ENTROPY_TIMING_REGISTRATIONS.lock();
-            registrations.push(EntropyRegistration { entropy_routine: guest::read64(buffer), initialization_routine: guest::read64(buffer + 8), initialization_context: guest::read64(buffer + 16) });
+            // SAFETY: buffer de entrada do chamador (modo kernel), tamanho conferido.
+            let information = unsafe { EntropyTimingInformation::at(buffer) };
+            registrations.push(EntropyRegistration { entropy_routine: information.entropy_routine.get(), initialization_routine: information.initialization_routine.get(), initialization_context: information.initialization_context.get() });
             registrations.len()
         };
         debug_print!("[zw] entropia: rotinas registradas ({} provedor(es))", count);

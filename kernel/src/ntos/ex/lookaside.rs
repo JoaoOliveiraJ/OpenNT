@@ -13,8 +13,12 @@ use crate::ntos::ke::{clock, irql};
 use crate::ntos::mm::page_residency::{self, FaultResult, Provider};
 use crate::ntos::mm::{kernel_pool, pfn};
 use crate::rtl::{KernelError, SpinLock};
+use core::sync::atomic::Ordering;
+
+use super::list_entry;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{GeneralLookaside, ListEntry, PoolType, SlistEntry};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::lookaside_list as layout;
 
 const MINIMUM_DEPTH: u16 = 4;
 const MAXIMUM_DEPTH: u16 = 256;
@@ -44,20 +48,20 @@ fn exported_callback(name: &str) -> Result<u64, KernelError> {
     provider(name).filter(|&address| address != 0).ok_or_else(|| KernelError::new(alloc::format!("lookaside callback export missing: {name}")))
 }
 
-/// CAS32 conserva incrementos concorrentes das macros nativas.
-fn increment(address: u64) {
-    let mut expected = guest::read32(address);
-    loop {
-        let observed = guest::compare_exchange32(address, expected, expected.wrapping_add(1)).unwrap_or(expected.wrapping_add(1));
-        if observed == expected {
-            return;
-        }
-        expected = observed;
-    }
+/// O descritor do chamador: NPAGED/PAGED_LOOKASIDE_LIST.L ou
+/// LOOKASIDE_LIST_EX.L (GENERAL_LOOKASIDE_POOL, mesmos offsets até 0x60).
+fn lookaside(list: u64) -> &'static GeneralLookaside {
+    // SAFETY: os exports recebem o descritor do chamador.
+    unsafe { GeneralLookaside::at(list) }
 }
 
-fn check_irql(address: u64) -> Result<(), KernelError> {
-    let paged = guest::read32(address + layout::POOL_TYPE) & 1 != 0;
+/// LOCK XADD: conserva incrementos concorrentes das macros nativas.
+fn increment(counter: &Field<u32>) {
+    counter.atomic().fetch_add(1, Ordering::SeqCst);
+}
+
+fn check_irql(list: &GeneralLookaside) -> Result<(), KernelError> {
+    let paged = list.type_.get().0 & 1 != 0;
     if irql::get_irql() > if paged { 1 } else { 2 } {
         return Err(KernelError::new("lookaside operation at invalid IRQL"));
     }
@@ -71,12 +75,11 @@ fn registry_for(paged: bool) -> Result<u64, KernelError> {
     if existing != 0 {
         return Ok(existing);
     }
-    let head = guest::alloc_bytes(16);
+    let head = guest::alloc_bytes(ListEntry::SIZE);
     if head == 0 {
         return Err(KernelError::new("lookaside registry allocation failed"));
     }
-    guest::write64(head, head);
-    guest::write64(head + 8, head);
+    list_entry::initialize(list_entry::at(head));
     STATE.lock().registry_heads[index] = head;
     Ok(head)
 }
@@ -88,8 +91,7 @@ fn reclaim_provider(frames: u64) -> Result<u64, KernelError> {
 /// ExInitialize(N)PagedLookasideList.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u32, block_size: u64, tag: u32, paged: bool) -> Result<(), KernelError> {
-    let head = registry_for(paged)?;
-    let entry = list + layout::REGISTRY_ENTRY;
+    let head = list_entry::at(registry_for(paged)?);
     let allocate_callback = if allocate_routine != 0 { allocate_routine } else { exported_callback("ExAllocatePoolWithTag")? };
     // PFREE_FUNCTION tem um argumento: ExFreePool libera sem exigir tag.
     let free_callback = if free_routine != 0 { free_routine } else { exported_callback("ExFreePool")? };
@@ -100,25 +102,25 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
         return Err(KernelError::new("lookaside initialized twice"));
     }
     slist::initialize(list)?;
-    guest::write16(list + layout::DEPTH, MINIMUM_DEPTH);
-    guest::write16(list + layout::MAXIMUM_DEPTH, MAXIMUM_DEPTH);
-    guest::write64(list + layout::ALLOC_COUNT, 0);
-    guest::write64(list + layout::FREE_COUNT, 0);
-    guest::write32(list + layout::POOL_TYPE, flags | paged as u32);
-    guest::write32(list + layout::TAG, tag);
+    let descriptor = lookaside(list);
+    descriptor.depth.set(MINIMUM_DEPTH);
+    descriptor.maximum_depth.set(MAXIMUM_DEPTH);
+    descriptor.total_allocates.set(0);
+    descriptor.allocate_misses.set(0);
+    descriptor.total_frees.set(0);
+    descriptor.free_misses.set(0);
+    descriptor.type_.set(PoolType((flags | paged as u32) as i32));
+    descriptor.tag.set(tag);
     // O parâmetro é SIZE_T, mas o campo persistente Size é ULONG.
-    guest::write32(list + layout::BLOCK_SIZE, block_size as u32);
-    guest::write64(list + layout::ALLOCATE_CALLBACK, allocate_callback);
-    guest::write64(list + layout::FREE_CALLBACK, free_callback);
-    guest::write64(list + layout::LAST_ALLOC_COUNT, 0);
-    let tail = guest::read64(head + 8);
-    if guest::read64(tail) != head {
+    descriptor.size.set(block_size as u32);
+    descriptor.allocate_ex.set(allocate_callback);
+    descriptor.free_ex.set(free_callback);
+    descriptor.last_total_allocates.set(0);
+    descriptor.last_allocate_misses.set(0);
+    if !list_entry::tail_consistent(head) {
         return Err(KernelError::new("corrupt lookaside registry"));
     }
-    guest::write64(entry, head);
-    guest::write64(entry + 8, tail);
-    guest::write64(tail, entry);
-    guest::write64(head + 8, entry);
+    list_entry::insert_tail(head, &descriptor.list_entry);
     let register = {
         let mut state = STATE.lock();
         state.lists.insert(list, paged);
@@ -151,17 +153,18 @@ pub fn initialize_ex(list: u64, allocate_routine: u64, free_routine: u64, pool_t
 /// A primeira falta chama o alocador verdadeiro; uma entrada do cache
 /// conserva o endereço.
 pub fn allocate(list: u64) -> Result<u64, KernelError> {
-    check_irql(list)?;
-    increment(list + layout::ALLOC_COUNT);
+    let descriptor = lookaside(list);
+    check_irql(descriptor)?;
+    increment(&descriptor.total_allocates);
     let entry = slist::pop(list)?;
     if entry != 0 {
         return Ok(entry);
     }
-    increment(list + layout::ALLOC_MISSES);
-    let callback = guest::read64(list + layout::ALLOCATE_CALLBACK);
-    let pool_type = guest::read32(list + layout::POOL_TYPE);
-    let size = guest::read32(list + layout::BLOCK_SIZE);
-    let tag = guest::read32(list + layout::TAG);
+    increment(&descriptor.allocate_misses);
+    let callback = descriptor.allocate_ex.get();
+    let pool_type = descriptor.type_.get().0 as u32;
+    let size = descriptor.size.get();
+    let tag = descriptor.tag.get();
     if exported_callback("ExAllocatePoolWithTag").ok() == Some(callback) {
         return pool_allocation::allocate_tagged(pool_type, size as u64, tag);
     }
@@ -171,7 +174,7 @@ pub fn allocate(list: u64) -> Result<u64, KernelError> {
 /// A entrada já saiu do cache antes do callback (reentrância sem dupla
 /// liberação).
 fn release_entry(list: u64, block: u64) -> Result<(), KernelError> {
-    let callback = guest::read64(list + layout::FREE_CALLBACK);
+    let callback = lookaside(list).free_ex.get();
     if exported_callback("ExFreePool").ok() == Some(callback) {
         kernel_pool::free(block, None)
     } else {
@@ -181,10 +184,11 @@ fn release_entry(list: u64, block: u64) -> Result<(), KernelError> {
 }
 
 pub fn free(list: u64, block: u64) -> Result<(), KernelError> {
-    check_irql(list)?;
-    increment(list + layout::FREE_COUNT);
-    if slist::depth(list) >= guest::read16(list + layout::DEPTH) {
-        increment(list + layout::FREE_MISSES);
+    let descriptor = lookaside(list);
+    check_irql(descriptor)?;
+    increment(&descriptor.total_frees);
+    if slist::depth(list) >= descriptor.depth.get() {
+        increment(&descriptor.free_misses);
         release_entry(list, block)
     } else {
         slist::push(list, block).map(|_| ())
@@ -194,24 +198,21 @@ pub fn free(list: u64, block: u64) -> Result<(), KernelError> {
 /// Excluir libera só o cache; um bloco emprestado vive até ser devolvido, e
 /// com Depth zero a devolução vai direto ao liberador.
 pub fn delete(list: u64) -> Result<(), KernelError> {
-    check_irql(list)?;
+    let descriptor = lookaside(list);
+    check_irql(descriptor)?;
     if !STATE.lock().lists.contains_key(&list) {
         return Err(KernelError::new("lookaside is not registered"));
     }
-    let entry = list + layout::REGISTRY_ENTRY;
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    if guest::read64(next + 8) != entry || guest::read64(previous) != entry {
+    if list_entry::remove(&descriptor.list_entry).is_none() {
         return Err(KernelError::new("corrupt lookaside registry links"));
     }
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
     STATE.lock().lists.remove(&list);
-    guest::write16(list + layout::DEPTH, 0);
-    guest::write64(entry, 0);
+    descriptor.depth.set(0);
+    descriptor.list_entry.flink.set(0);
     let mut block = slist::flush(list)?;
     while block != 0 {
-        let following = guest::read64(block);
+        // SAFETY: os blocos livres do cache começam pela SLIST_ENTRY.
+        let following = unsafe { SlistEntry::at(block) }.next.get();
         release_entry(list, block)?;
         block = following;
     }
@@ -221,14 +222,15 @@ pub fn delete(list: u64) -> Result<(), KernelError> {
 /// ExpComputeLookasideDepth: ajusta o cache pelas alocações e faltas desde
 /// a última amostra.
 fn adjust_depth(list: u64, intervals: u64) {
-    let total = guest::read32(list + layout::ALLOC_COUNT);
-    let misses = guest::read32(list + layout::ALLOC_MISSES);
-    let allocations = total.wrapping_sub(guest::read32(list + layout::LAST_ALLOC_COUNT));
-    let allocation_misses = misses.wrapping_sub(guest::read32(list + layout::LAST_ALLOC_MISSES));
-    let maximum = guest::read16(list + layout::MAXIMUM_DEPTH) as i64;
-    let mut depth = guest::read16(list + layout::DEPTH) as i64;
-    guest::write32(list + layout::LAST_ALLOC_COUNT, total);
-    guest::write32(list + layout::LAST_ALLOC_MISSES, misses);
+    let descriptor = lookaside(list);
+    let total = descriptor.total_allocates.get();
+    let misses = descriptor.allocate_misses.get();
+    let allocations = total.wrapping_sub(descriptor.last_total_allocates.get());
+    let allocation_misses = misses.wrapping_sub(descriptor.last_allocate_misses.get());
+    let maximum = descriptor.maximum_depth.get() as i64;
+    let mut depth = descriptor.depth.get() as i64;
+    descriptor.last_total_allocates.set(total);
+    descriptor.last_allocate_misses.set(misses);
     if maximum == 65535 {
         return;
     }
@@ -242,7 +244,7 @@ fn adjust_depth(list: u64, intervals: u64) {
             depth = maximum.min(depth + 30.min(5 + ((maximum - depth) * miss_rate) / 1000));
         }
     }
-    guest::write16(list + layout::DEPTH, depth.max(MINIMUM_DEPTH as i64) as u16);
+    descriptor.depth.set(depth.max(MINIMUM_DEPTH as i64) as u16);
 }
 
 /// Manutenção periódica (uma amostra por segundo, até APC_LEVEL).

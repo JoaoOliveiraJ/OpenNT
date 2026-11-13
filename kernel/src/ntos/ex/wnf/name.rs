@@ -5,6 +5,8 @@
 
 use alloc::string::String;
 
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Guid;
 use crate::ntos::mm::guest_memory as guest;
 
 pub const NAME_MASK: u64 = 0x41C6_4E6D_A3BC_0074;
@@ -64,16 +66,15 @@ pub fn validate(description: &Description, length: u32, supplied: SuppliedType, 
         }
     }
     if description.type_identifier != 0 {
-        for offset in [0u64, 8] {
-            let expected = guest::read64(description.type_identifier + offset);
-            let provided = match supplied {
-                SuppliedType::None | SuppliedType::Pointer(0) => return INVALID_PARAMETER,
-                SuppliedType::Pointer(pointer) => guest::read64(pointer + offset),
-                SuppliedType::Captured(bytes) => u64::from_le_bytes(bytes[offset as usize..offset as usize + 8].try_into().unwrap_or([0; 8])),
-            };
-            if provided != expected {
-                return INVALID_PARAMETER;
-            }
+        // WNF_TYPE_ID (um GUID) comparado como bloco.
+        let size = Guid::SIZE as usize;
+        let provided = match supplied {
+            SuppliedType::None | SuppliedType::Pointer(0) => return INVALID_PARAMETER,
+            SuppliedType::Pointer(pointer) => guest::read_bytes(pointer, size),
+            SuppliedType::Captured(bytes) => bytes.to_vec(),
+        };
+        if provided != guest::read_bytes(description.type_identifier, size) {
+            return INVALID_PARAMETER;
         }
     }
     if length > description.maximum_size { INVALID_PARAMETER } else { 0 }

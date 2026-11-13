@@ -4,27 +4,54 @@
 //! 0x30 (layout e transferência de posse conferidos com o PE/PDB nativo).
 //! Posse, recursão e filas ficam no convidado, sob o SpinLock do recurso.
 
+use core::sync::atomic::Ordering;
+
+use super::list_entry;
 use crate::hal::cpu;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eresource, Kevent, Kthread, ListEntry, OwnerEntry};
 use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
-pub const STRUCT_SIZE: u64 = 0x68;
-const OWNER_TABLE: u64 = 0x10;
-const ACTIVE_COUNT: u64 = 0x18;
-const FLAGS: u64 = 0x1A;
-const SHARED_WAITERS: u64 = 0x20;
-const EXCLUSIVE_WAITERS: u64 = 0x28;
-const INLINE_OWNER: u64 = 0x30;
-const OWNER_COUNT: u64 = 0x40;
-const CONTENTION_COUNT: u64 = 0x44;
-const SHARED_WAITER_COUNT: u64 = 0x48;
-const EXCLUSIVE_WAITER_COUNT: u64 = 0x4C;
-const SPIN_LOCK: u64 = 0x60;
+pub const STRUCT_SIZE: u64 = <Eresource as NtStruct>::SIZE;
+/// Flag.ResourceOwnedExclusive.
 const EXCLUSIVE_OWNER_FLAG: u16 = 0x80;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+/// Bloco de espera publicado em SharedWaiters/ExclusiveWaiters: vínculo
+/// circular, thread aguardando e o evento cujo SignalState marca a posse
+/// concedida.
+#[repr(C)]
+struct WaitBlock {
+    wait_list: ListEntry,
+    /// -> `_KTHREAD`
+    thread: Field<u64>,
+    event: Kevent,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for WaitBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<WaitBlock>() == 0x30);
+    assert!(core::mem::offset_of!(WaitBlock, thread) == 0x10);
+    assert!(core::mem::offset_of!(WaitBlock, event) == 0x18);
+};
+
+/// Cabeça global dos recursos (ExpSystemResourcesList) e a palavra do lock.
+#[repr(C)]
+struct ResourceList {
+    head: ListEntry,
+    lock: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for ResourceList {}
+
+const _: () = assert!(core::mem::size_of::<ResourceList>() == 0x18);
 
 /// Modo de aquisição de cada export.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,8 +64,13 @@ pub enum Mode {
     WaitExclusive,
 }
 
-/// Cabeça global (16 bytes) seguida da palavra de lock; 0 = ainda não alocada.
+/// Endereço da cabeça global; 0 = ainda não alocada.
 static RESOURCE_LIST: SpinLock<u64> = SpinLock::new(0);
+
+fn resource_at(resource: u64) -> &'static Eresource {
+    // SAFETY: os exports recebem um PERESOURCE do chamador.
+    unsafe { Eresource::at(resource) }
+}
 
 fn current_thread() -> Result<u64, KernelError> {
     match process::get_current_thread() {
@@ -55,17 +87,17 @@ fn require_irql(maximum: u8) -> Result<(), KernelError> {
 }
 
 /// Eleva a DISPATCH_LEVEL, adquire a palavra do lock e executa `action`.
-fn with_lock<T>(lock: u64, action: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
+fn with_lock<T>(lock: &Field<u64>, action: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
     require_irql(2)?;
     let previous = irql::get_irql();
     if previous < 2 {
         irql::raise_irql(2);
     }
-    while guest::compare_exchange64(lock, 0, 1)? != 0 {
+    while lock.atomic().compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
         cpu::pause();
     }
     let result = action();
-    let _ = guest::compare_exchange64(lock, 1, 0);
+    lock.atomic().store(0, Ordering::Release);
     if previous < 2 {
         irql::lower_irql(previous as u64);
     }
@@ -73,29 +105,12 @@ fn with_lock<T>(lock: u64, action: impl FnOnce() -> Result<T, KernelError>) -> R
 }
 
 fn clear(pointer: u64, length: u64) {
-    for offset in (0..length).step_by(8) {
-        guest::write64(pointer + offset, 0);
-    }
+    guest::write_bytes(pointer, &alloc::vec![0u8; length as usize]);
 }
 
-fn insert_tail(head: u64, entry: u64) {
-    let last = guest::read64(head + 8);
-    guest::write64(entry, head);
-    guest::write64(entry + 8, last);
-    guest::write64(last, entry);
-    guest::write64(head + 8, entry);
-}
-
-fn remove_entry(entry: u64) -> Result<u64, KernelError> {
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    if guest::read64(next + 8) != entry || guest::read64(previous) != entry {
-        return Err(KernelError::new("corrupt ERESOURCE list"));
-    }
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
-    guest::write64(entry, entry);
-    guest::write64(entry + 8, entry);
+fn remove_entry(entry: &ListEntry) -> Result<u64, KernelError> {
+    let next = list_entry::remove(entry).ok_or_else(|| KernelError::new("corrupt ERESOURCE list"))?;
+    list_entry::initialize(entry);
     Ok(next)
 }
 
@@ -106,44 +121,60 @@ pub fn initialize(resource: u64) -> Result<u32, KernelError> {
     let list = {
         let mut list = RESOURCE_LIST.lock();
         if *list == 0 {
-            let allocation = guest::alloc_bytes(24);
+            let allocation = guest::alloc_bytes(ResourceList::SIZE);
             if allocation == 0 {
                 return Ok(STATUS_INSUFFICIENT_RESOURCES);
             }
-            clear(allocation, 24);
-            guest::write64(allocation, allocation);
-            guest::write64(allocation + 8, allocation);
+            clear(allocation, ResourceList::SIZE);
+            // SAFETY: alocação nova do tamanho da cabeça.
+            list_entry::initialize(&unsafe { ResourceList::at(allocation) }.head);
             *list = allocation;
         }
-        *list
+        // SAFETY: a cabeça global vive até o fim.
+        unsafe { ResourceList::at(*list) }
     };
     clear(resource, STRUCT_SIZE);
-    with_lock(list + 16, || {
-        insert_tail(list, resource);
+    let body = resource_at(resource);
+    with_lock(&list.lock, || {
+        list_entry::insert_tail(&list.head, &body.system_resources_list);
         Ok(())
     })?;
     Ok(0)
 }
 
-fn has_owners_or_waiters(resource: u64) -> bool {
-    guest::read32(resource + OWNER_COUNT) != 0 || guest::read32(resource + SHARED_WAITER_COUNT) != 0 || guest::read32(resource + EXCLUSIVE_WAITER_COUNT) != 0
+fn has_owners_or_waiters(resource: &Eresource) -> bool {
+    resource.active_entries.get() != 0 || resource.number_of_shared_waiters.get() != 0 || resource.number_of_exclusive_waiters.get() != 0
+}
+
+/// Vetor de OWNER_ENTRY apontado por OwnerTable; a entrada 0 é o cabeçalho
+/// cujo TableSize é a capacidade.
+fn owner_table(resource: &Eresource) -> Option<&'static [OwnerEntry]> {
+    let table = resource.owner_table.get();
+    if table == 0 {
+        return None;
+    }
+    // SAFETY: OwnerTable aponta para TableSize entradas alocadas por nós.
+    let header = unsafe { OwnerEntry::at(table) };
+    Some(unsafe { OwnerEntry::array_at(table, header.table_size.get().max(1) as usize) })
 }
 
 /// ExReinitializeResourceLite: exige recurso ocioso; conserva a tabela, os
 /// vínculos globais e o SpinLock.
 pub fn reinitialize(resource: u64) -> Result<u32, KernelError> {
     require_irql(2)?;
-    with_lock(resource + SPIN_LOCK, || {
-        if has_owners_or_waiters(resource) {
+    let body = resource_at(resource);
+    with_lock(&body.spin_lock, || {
+        if has_owners_or_waiters(body) {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        let table = guest::read64(resource + OWNER_TABLE);
-        if table != 0 {
-            let capacity = guest::read32(table + 8);
-            clear(table, capacity as u64 * 16);
-            guest::write32(table + 8, capacity);
+        if let Some(table) = owner_table(body) {
+            let capacity = table[0].table_size.get();
+            clear(table[0].address(), capacity as u64 * OwnerEntry::SIZE);
+            table[0].table_size.set(capacity);
         }
-        clear(resource + ACTIVE_COUNT, 0x40);
+        // ActiveCount..Reserved2: tudo menos os vínculos, Address e SpinLock.
+        let start = body.active_count.address();
+        clear(start, body.address.address() - start);
         Ok(0)
     })
 }
@@ -151,156 +182,154 @@ pub fn reinitialize(resource: u64) -> Result<u32, KernelError> {
 /// ExDeleteResourceLite.
 pub fn delete(resource: u64) -> Result<u32, KernelError> {
     require_irql(2)?;
-    with_lock(resource + SPIN_LOCK, || {
-        if has_owners_or_waiters(resource) {
+    let body = resource_at(resource);
+    with_lock(&body.spin_lock, || {
+        if has_owners_or_waiters(body) {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let list = *RESOURCE_LIST.lock();
         if list == 0 {
             return Err(KernelError::new("ERESOURCE was not initialized"));
         }
-        with_lock(list + 16, || remove_entry(resource))?;
-        let table = guest::read64(resource + OWNER_TABLE);
+        // SAFETY: a cabeça global vive até o fim.
+        let list = unsafe { ResourceList::at(list) };
+        with_lock(&list.lock, || remove_entry(&body.system_resources_list))?;
+        let table = body.owner_table.get();
         if table != 0 {
             guest::free_bytes(table);
         }
-        guest::write64(resource + OWNER_TABLE, 0);
+        body.owner_table.set(0);
         Ok(0)
     })
 }
 
-/// Entrada embutida e depois a tabela extra; 0 = sem posse nem reserva.
-fn find_owner(resource: u64, thread: u64) -> u64 {
-    if guest::read64(resource + INLINE_OWNER) == thread {
-        return resource + INLINE_OWNER;
+/// Entrada embutida e depois a tabela extra; `None` = sem posse nem reserva.
+fn find_owner(resource: &'static Eresource, thread: u64) -> Option<&'static OwnerEntry> {
+    if resource.owner_entry.owner_thread.get() == thread {
+        return Some(&resource.owner_entry);
     }
-    let table = guest::read64(resource + OWNER_TABLE);
-    if table != 0 {
-        for index in 1..guest::read32(table + 8) as u64 {
-            let entry = table + index * 16;
-            if guest::read64(entry) == thread {
-                return entry;
-            }
-        }
-    }
-    0
+    owner_table(resource).and_then(|table| table.iter().skip(1).find(|entry| entry.owner_thread.get() == thread))
 }
 
 /// Entrada livre; `table_only` evita a embutida. Tabela cheia é ampliada
 /// (3 entradas, depois o dobro) com a primeira entrada como cabeçalho.
-fn reserve_owner(resource: u64, table_only: bool) -> Result<u64, KernelError> {
-    if !table_only && guest::read64(resource + INLINE_OWNER) == 0 {
-        return Ok(resource + INLINE_OWNER);
+fn reserve_owner(resource: &'static Eresource, table_only: bool) -> Result<&'static OwnerEntry, KernelError> {
+    if !table_only && resource.owner_entry.owner_thread.get() == 0 {
+        return Ok(&resource.owner_entry);
     }
-    let table = guest::read64(resource + OWNER_TABLE);
-    let capacity = if table != 0 { guest::read32(table + 8) as u64 } else { 0 };
-    for index in 1..capacity {
-        let entry = table + index * 16;
-        if guest::read64(entry) == 0 {
-            return Ok(entry);
-        }
+    let table = owner_table(resource);
+    let capacity = table.map_or(0, |table| table[0].table_size.get() as u64);
+    if let Some(entry) = table.and_then(|table| table.iter().skip(1).find(|entry| entry.owner_thread.get() == 0)) {
+        return Ok(entry);
     }
     let next_capacity = if capacity != 0 { capacity * 2 } else { 3 };
-    let new_table = guest::alloc_bytes(next_capacity * 16);
+    let new_table = guest::alloc_bytes(next_capacity * OwnerEntry::SIZE);
     if new_table == 0 {
         return Err(KernelError::new("ERESOURCE owner table allocation failed"));
     }
-    clear(new_table, next_capacity * 16);
-    for offset in (0..capacity * 16).step_by(8) {
-        guest::write64(new_table + offset, guest::read64(table + offset));
+    clear(new_table, next_capacity * OwnerEntry::SIZE);
+    // SAFETY: alocação nova de `next_capacity` entradas.
+    let entries = unsafe { OwnerEntry::array_at(new_table, next_capacity as usize) };
+    if let Some(table) = table {
+        for (target, source) in entries.iter().zip(table) {
+            target.owner_thread.set(source.owner_thread.get());
+            target.table_size.set(source.table_size.get());
+        }
     }
-    guest::write32(new_table + 8, next_capacity as u32);
-    guest::write64(resource + OWNER_TABLE, new_table);
-    if table != 0 {
-        guest::free_bytes(table);
+    entries[0].table_size.set(next_capacity as u32);
+    let old = resource.owner_table.get();
+    resource.owner_table.set(new_table);
+    if old != 0 {
+        guest::free_bytes(old);
     }
-    Ok(new_table + capacity.max(1) * 16)
+    Ok(&entries[capacity.max(1) as usize])
 }
 
-/// Os 29 bits de recursão da palavra de controle da entrada.
-fn recursion(entry: u64) -> u32 {
-    guest::read32(entry + 8) >> 3
+/// Os 29 bits de recursão (OwnerCount) da palavra de controle da entrada.
+fn recursion(entry: &OwnerEntry) -> u32 {
+    entry.table_size.get() >> OwnerEntry::OWNER_COUNT_SHIFT
 }
 
-fn set_owner(entry: u64, thread: u64, depth: u32) -> Result<(), KernelError> {
+/// Dono e recursão; os três bits baixos de flags voltam a zero.
+fn set_owner(entry: &OwnerEntry, thread: u64, depth: u32) -> Result<(), KernelError> {
     if depth > 0x1FFF_FFFF {
         return Err(KernelError::new("ERESOURCE recursion overflow"));
     }
-    guest::write64(entry, thread);
-    guest::write32(entry + 8, depth * 8);
+    entry.owner_thread.set(thread);
+    entry.table_size.set(depth << OwnerEntry::OWNER_COUNT_SHIFT);
     Ok(())
 }
 
-fn set_owner_count(resource: u64, count: u32) {
-    guest::write32(resource + OWNER_COUNT, count);
-    guest::write16(resource + ACTIVE_COUNT, (count != 0) as u16);
+fn set_owner_count(resource: &Eresource, count: u32) {
+    resource.active_entries.set(count);
+    resource.active_count.set((count != 0) as i16);
 }
 
-fn set_exclusive(resource: u64, exclusive: bool) {
-    let flags = guest::read16(resource + FLAGS);
-    guest::write16(resource + FLAGS, if exclusive { flags | EXCLUSIVE_OWNER_FLAG } else { flags & !EXCLUSIVE_OWNER_FLAG });
+fn set_exclusive(resource: &Eresource, exclusive: bool) {
+    let flags = resource.flag.get();
+    resource.flag.set(if exclusive { flags | EXCLUSIVE_OWNER_FLAG } else { flags & !EXCLUSIVE_OWNER_FLAG });
 }
 
-fn is_exclusive(resource: u64) -> bool {
-    guest::read16(resource + FLAGS) & EXCLUSIVE_OWNER_FLAG != 0
+fn is_exclusive(resource: &Eresource) -> bool {
+    resource.flag.get() & EXCLUSIVE_OWNER_FLAG != 0
 }
 
-fn enqueue_waiter(resource: u64, block: u64, shared: bool) {
-    let field = resource + if shared { SHARED_WAITERS } else { EXCLUSIVE_WAITERS };
-    let head = guest::read64(field);
-    if head != 0 {
-        insert_tail(head, block);
+fn waiter_fields(resource: &Eresource, shared: bool) -> (&Field<u64>, &Field<u32>) {
+    if shared {
+        (&resource.shared_waiters, &resource.number_of_shared_waiters)
     } else {
-        guest::write64(block, block);
-        guest::write64(block + 8, block);
-        guest::write64(field, block);
+        (&resource.exclusive_waiters, &resource.number_of_exclusive_waiters)
     }
-    let count = resource + if shared { SHARED_WAITER_COUNT } else { EXCLUSIVE_WAITER_COUNT };
-    guest::write32(count, guest::read32(count) + 1);
-    guest::write32(resource + CONTENTION_COUNT, guest::read32(resource + CONTENTION_COUNT).wrapping_add(1));
 }
 
-fn dequeue_waiter(resource: u64, shared: bool) -> Result<u64, KernelError> {
-    let field = resource + if shared { SHARED_WAITERS } else { EXCLUSIVE_WAITERS };
-    let head = guest::read64(field);
-    if head == 0 {
-        return Ok(0);
+fn enqueue_waiter(resource: &Eresource, block: &WaitBlock, shared: bool) {
+    let (field, count) = waiter_fields(resource, shared);
+    let head = field.get();
+    if head != 0 {
+        list_entry::insert_tail(list_entry::at(head), &block.wait_list);
+    } else {
+        list_entry::initialize(&block.wait_list);
+        field.set(block.address());
     }
-    let next = remove_entry(head)?;
-    guest::write64(field, if next == head { 0 } else { next });
-    let count = resource + if shared { SHARED_WAITER_COUNT } else { EXCLUSIVE_WAITER_COUNT };
-    guest::write32(count, guest::read32(count) - 1);
-    Ok(head)
+    count.set(count.get() + 1);
+    resource.contention_count.set(resource.contention_count.get().wrapping_add(1));
+}
+
+fn dequeue_waiter(resource: &Eresource, shared: bool) -> Result<Option<&'static WaitBlock>, KernelError> {
+    let (field, count) = waiter_fields(resource, shared);
+    let head = field.get();
+    if head == 0 {
+        return Ok(None);
+    }
+    let next = remove_entry(list_entry::at(head))?;
+    field.set(if next == head { 0 } else { next });
+    count.set(count.get() - 1);
+    // SAFETY: a fila só contém blocos de espera publicados por `poll`.
+    Ok(Some(unsafe { WaitBlock::at(head) }))
 }
 
 /// Transfere a posse aos leitores aguardando e marca seus blocos concluídos.
-fn wake_shared(resource: u64) -> Result<(), KernelError> {
+fn wake_shared(resource: &'static Eresource) -> Result<(), KernelError> {
     set_exclusive(resource, false);
-    loop {
-        let block = dequeue_waiter(resource, true)?;
-        if block == 0 {
-            return Ok(());
-        }
-        let thread = guest::read64(block + 0x10);
+    while let Some(block) = dequeue_waiter(resource, true)? {
+        let thread = block.thread.get();
         // WaitForExclusive pode conservar uma aquisição antiga.
-        if find_owner(resource, thread) == 0 {
+        if find_owner(resource, thread).is_none() {
             set_owner(reserve_owner(resource, false)?, thread, 1)?;
         }
-        set_owner_count(resource, guest::read32(resource + OWNER_COUNT) + 1);
-        guest::write32(block + 0x1C, 1);
+        set_owner_count(resource, resource.active_entries.get() + 1);
+        block.event.header.signal_state.set(1);
     }
+    Ok(())
 }
 
 /// Entrega a posse exclusiva ao primeiro escritor da fila.
-fn wake_exclusive(resource: u64) -> Result<(), KernelError> {
-    let block = dequeue_waiter(resource, false)?;
-    if block == 0 {
-        return Ok(());
-    }
+fn wake_exclusive(resource: &Eresource) -> Result<(), KernelError> {
+    let Some(block) = dequeue_waiter(resource, false)? else { return Ok(()) };
     set_exclusive(resource, true);
     set_owner_count(resource, 1);
-    set_owner(resource + INLINE_OWNER, guest::read64(block + 0x10), 1)?;
-    guest::write32(block + 0x1C, 1);
+    set_owner(&resource.owner_entry, block.thread.get(), 1)?;
+    block.event.header.signal_state.set(1);
     Ok(())
 }
 
@@ -332,34 +361,37 @@ impl Request {
         if let Some(result) = self.result {
             return Ok(Some(result));
         }
-        let resource = self.resource;
+        let resource = resource_at(self.resource);
         let thread = self.thread;
         let mode = self.mode;
-        let outcome = with_lock(resource + SPIN_LOCK, || -> Result<Option<u64>, KernelError> {
+        let outcome = with_lock(&resource.spin_lock, || -> Result<Option<u64>, KernelError> {
             if self.block != 0 {
-                if guest::read32(self.block + 0x1C) == 0 {
+                // SAFETY: bloco alocado e publicado por esta requisição.
+                if unsafe { WaitBlock::at(self.block) }.event.header.signal_state.get() == 0 {
                     return Ok(None);
                 }
                 guest::free_bytes(self.block);
                 self.block = 0;
                 return Ok(Some(1));
             }
-            let active = guest::read32(resource + OWNER_COUNT);
+            let active = resource.active_entries.get();
             let exclusive = is_exclusive(resource);
             // Uma entrada existente permite recursão; WaitForExclusive ainda
             // respeita escritores aguardando.
             let owned = find_owner(resource, thread);
-            let exclusive_waiters = guest::read32(resource + EXCLUSIVE_WAITER_COUNT);
+            let exclusive_waiters = resource.number_of_exclusive_waiters.get();
             if active == 0 {
-                let entry = if mode == Mode::Exclusive { resource + INLINE_OWNER } else { reserve_owner(resource, false)? };
+                let entry = if mode == Mode::Exclusive { &resource.owner_entry } else { reserve_owner(resource, false)? };
                 set_owner(entry, thread, 1)?;
                 set_owner_count(resource, 1);
                 set_exclusive(resource, mode == Mode::Exclusive);
                 return Ok(Some(1));
             }
-            if owned != 0 && ((exclusive && guest::read64(resource + INLINE_OWNER) == thread) || (mode != Mode::Exclusive && (mode != Mode::WaitExclusive || exclusive_waiters == 0))) {
-                set_owner(owned, thread, recursion(owned) + 1)?;
-                return Ok(Some(1));
+            if let Some(owned) = owned {
+                if (exclusive && resource.owner_entry.owner_thread.get() == thread) || (mode != Mode::Exclusive && (mode != Mode::WaitExclusive || exclusive_waiters == 0)) {
+                    set_owner(owned, thread, recursion(owned) + 1)?;
+                    return Ok(Some(1));
+                }
             }
             if mode != Mode::Exclusive && !exclusive && (mode == Mode::Starve || exclusive_waiters == 0) {
                 set_owner(reserve_owner(resource, false)?, thread, 1)?;
@@ -369,24 +401,26 @@ impl Request {
             if !self.wait {
                 return Ok(Some(0));
             }
-            let block = guest::alloc_bytes(0x30);
-            if block == 0 {
+            let allocation = guest::alloc_bytes(WaitBlock::SIZE);
+            if allocation == 0 {
                 return Err(KernelError::new("ERESOURCE wait block allocation failed"));
             }
-            clear(block, 0x30);
-            guest::write64(block + 0x10, thread);
-            // Tipo e tamanho; +0x1C é o indicador de posse concedida.
-            guest::write32(block + 0x18, 0x60001);
-            guest::write64(block + 0x20, block + 0x20);
-            guest::write64(block + 0x28, block + 0x20);
-            if mode != Mode::Exclusive && owned == 0 {
+            clear(allocation, WaitBlock::SIZE);
+            // SAFETY: alocação nova do tamanho do bloco.
+            let block = unsafe { WaitBlock::at(allocation) };
+            block.thread.set(thread);
+            // Evento de sincronização (Type 1, Size 6); SignalState é o
+            // indicador de posse concedida.
+            block.event.header.lock.set(0x0006_0001);
+            list_entry::initialize(&block.event.header.wait_list_head);
+            if mode != Mode::Exclusive && owned.is_none() {
                 if let Err(error) = reserve_owner(resource, true).and_then(|entry| set_owner(entry, thread, 1)) {
-                    guest::free_bytes(block);
+                    guest::free_bytes(allocation);
                     return Err(error);
                 }
             }
             enqueue_waiter(resource, block, mode != Mode::Exclusive);
-            self.block = block;
+            self.block = allocation;
             Ok(None)
         });
         let result = match outcome {
@@ -401,8 +435,9 @@ impl Request {
             }
         };
         let Some(value) = result else { return Ok(None) };
-        // Os helpers combinados devolvem KTHREAD.Win32Thread (+0x1C8).
-        let value = if self.critical { guest::read64(thread + 0x1C8) } else { value };
+        // Os helpers combinados devolvem KTHREAD.Win32Thread.
+        // SAFETY: a thread corrente é um KTHREAD vivo.
+        let value = if self.critical { unsafe { Kthread::at(thread) }.win32_thread.get() } else { value };
         self.result = Some(value);
         Ok(Some(value))
     }
@@ -446,23 +481,23 @@ pub fn enter_shared(resource: u64) -> Result<u64, KernelError> {
 /// leitores ou escritores conforme a fila e o modo anterior.
 pub fn release_for_thread(resource: u64, thread: u64) -> Result<(), KernelError> {
     require_irql(2)?;
-    with_lock(resource + SPIN_LOCK, || {
-        let entry = find_owner(resource, thread);
-        if entry == 0 || recursion(entry) == 0 {
+    let resource = resource_at(resource);
+    with_lock(&resource.spin_lock, || {
+        let Some(entry) = find_owner(resource, thread).filter(|entry| recursion(entry) != 0) else {
             return Err(KernelError::new("ERESOURCE released by a non-owner"));
-        }
+        };
         let remaining = recursion(entry) - 1;
         if remaining != 0 {
             return set_owner(entry, thread, remaining);
         }
         let exclusive = is_exclusive(resource);
         set_owner(entry, 0, 0)?;
-        set_owner_count(resource, guest::read32(resource + OWNER_COUNT) - 1);
+        set_owner_count(resource, resource.active_entries.get() - 1);
         if exclusive {
             set_exclusive(resource, false);
-            if guest::read32(resource + SHARED_WAITER_COUNT) != 0 { wake_shared(resource) } else { wake_exclusive(resource) }
-        } else if guest::read32(resource + OWNER_COUNT) == 0 {
-            if guest::read32(resource + EXCLUSIVE_WAITER_COUNT) != 0 { wake_exclusive(resource) } else { wake_shared(resource) }
+            if resource.number_of_shared_waiters.get() != 0 { wake_shared(resource) } else { wake_exclusive(resource) }
+        } else if resource.active_entries.get() == 0 {
+            if resource.number_of_exclusive_waiters.get() != 0 { wake_exclusive(resource) } else { wake_shared(resource) }
         } else {
             Ok(())
         }
@@ -483,25 +518,25 @@ pub fn release_and_leave(resource: u64) -> Result<(), KernelError> {
 pub fn is_acquired_shared(resource: u64) -> Result<u32, KernelError> {
     require_irql(2)?;
     let thread = current_thread()?;
-    with_lock(resource + SPIN_LOCK, || {
-        let entry = find_owner(resource, thread);
-        Ok(if entry != 0 { recursion(entry) } else { 0 })
-    })
+    let resource = resource_at(resource);
+    with_lock(&resource.spin_lock, || Ok(find_owner(resource, thread).map_or(0, recursion)))
 }
 
 /// ExIsResourceAcquiredExclusiveLite.
 pub fn is_acquired_exclusive(resource: u64) -> Result<bool, KernelError> {
     require_irql(2)?;
     let thread = current_thread()?;
-    with_lock(resource + SPIN_LOCK, || Ok(is_exclusive(resource) && guest::read64(resource + INLINE_OWNER) == thread))
+    let resource = resource_at(resource);
+    with_lock(&resource.spin_lock, || Ok(is_exclusive(resource) && resource.owner_entry.owner_thread.get() == thread))
 }
 
 /// ExConvertExclusiveToSharedLite: abre o recurso aos leitores aguardando.
 pub fn convert_exclusive_to_shared(resource: u64) -> Result<(), KernelError> {
     require_irql(1)?;
     let thread = current_thread()?;
-    with_lock(resource + SPIN_LOCK, || {
-        if !is_exclusive(resource) || guest::read64(resource + INLINE_OWNER) != thread {
+    let resource = resource_at(resource);
+    with_lock(&resource.spin_lock, || {
+        if !is_exclusive(resource) || resource.owner_entry.owner_thread.get() != thread {
             return Err(KernelError::new("ERESOURCE conversion requires exclusive ownership"));
         }
         wake_shared(resource)
@@ -509,9 +544,9 @@ pub fn convert_exclusive_to_shared(resource: u64) -> Result<(), KernelError> {
 }
 
 pub fn shared_waiters(resource: u64) -> u32 {
-    guest::read32(resource + SHARED_WAITER_COUNT)
+    resource_at(resource).number_of_shared_waiters.get()
 }
 
 pub fn exclusive_waiters(resource: u64) -> u32 {
-    guest::read32(resource + EXCLUSIVE_WAITER_COUNT)
+    resource_at(resource).number_of_exclusive_waiters.get()
 }

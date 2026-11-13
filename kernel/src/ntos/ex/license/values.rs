@@ -11,8 +11,8 @@ use crate::ntos::ex::license::special::Providers;
 use crate::ntos::cm::registry;
 use crate::ntos::ps::silo::query as silo_query;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::ejob;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Ejob, EserversiloGlobals};
 
 pub const PRODUCT_OPTIONS: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\ProductOptions";
 
@@ -65,8 +65,9 @@ pub fn current_context() -> Result<u64, KernelError> {
     if silo == 0 {
         return Ok(host);
     }
-    let globals = guest::read64(silo + ejob::SERVER_SILO_GLOBALS);
-    Ok(guest::read64(globals + 0x388))
+    // SAFETY: o silo de servidor corrente e seus globais vivos.
+    let globals = unsafe { Ejob::at(silo) }.server_silo_globals.get();
+    Ok(unsafe { EserversiloGlobals::at(globals) }.exp_license_state.get())
 }
 
 /// ZwQueryLicenseValue pelo contexto do silo corrente.

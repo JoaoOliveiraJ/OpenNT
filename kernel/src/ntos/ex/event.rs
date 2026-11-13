@@ -7,7 +7,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ntos::inc::nt_abi::object_attributes;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::ObjectAttributes;
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::mm::guest_memory as guest;
@@ -29,7 +30,8 @@ pub fn event_object_type() -> u64 {
     }
     let type_structure = guest::alloc_bytes(0x40);
     let cell = guest::alloc_bytes(8);
-    guest::write64(cell, type_structure);
+    // SAFETY: célula de 8 bytes recém-alocada.
+    unsafe { Field::<u64>::at(cell) }.set(type_structure);
     match EVENT_OBJECT_TYPE.compare_exchange(0, cell, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => cell,
         Err(existing) => {
@@ -41,7 +43,8 @@ pub fn event_object_type() -> u64 {
 }
 
 fn object_name(attributes: u64) -> alloc::string::String {
-    guest_strings::read_unicode_string(guest::read64(attributes + object_attributes::OBJECT_NAME))
+    // SAFETY: ZwOpenEvent recebe POBJECT_ATTRIBUTES de modo kernel.
+    guest_strings::read_unicode_string(unsafe { ObjectAttributes::at(attributes) }.object_name.get())
 }
 
 /// ZwOpenEvent: evento nomeado do namespace. Devolve o valor nativo do

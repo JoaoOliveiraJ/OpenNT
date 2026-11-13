@@ -9,6 +9,8 @@ use crate::ntos::ex::license::{cache as license_cache, state as license_state};
 use crate::ntos::ex::{pool_allocation, push_lock};
 use crate::ntos::ke::clock;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
+use super::layout::{self, byte_at, context_at, ulong_at};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -16,6 +18,30 @@ const FRAME_TAG: u32 = 0x7353_6C54;
 const VALUE_TAG: u32 = 0x2053_4C53;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// Moldura de pool do GenuineLocalStatus posterior: o DWORD de
+/// IgnoreDeferredActivation, a saída da ativação adiada, os tamanhos
+/// devolvidos, o indicador "tratado" e as flags da verificação.
+#[repr(C)]
+struct GenuineFrame {
+    ignore_deferred: Field<u32>,
+    deferred_activation: Field<u32>,
+    value_length: Field<u32>,
+    policy_size: Field<u32>,
+    handled: Field<u8>,
+    _pad_11: Reserved<0xF>,
+    verify_flags: Field<u8>,
+    _pad_21: Reserved<0x1F>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for GenuineFrame {}
+
+const _: () = {
+    assert!(core::mem::size_of::<GenuineFrame>() == 64);
+    assert!(core::mem::offset_of!(GenuineFrame, handled) == 16);
+    assert!(core::mem::offset_of!(GenuineFrame, verify_flags) == 32);
+};
 const STATUS_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
@@ -34,39 +60,39 @@ pub struct Providers {
 
 /// Helper 0x94D3DC: tamanho antes do teste de capacidade; Type opcional.
 pub fn write_dword(type_pointer: u64, buffer: u64, capacity: u32, length: u64, value: u32) -> u32 {
-    guest::write32(length, 4);
+    ulong_at(length).set(4);
     if capacity < 4 {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if type_pointer != 0 {
-        guest::write32(type_pointer, 4);
+        ulong_at(type_pointer).set(4);
     }
     if buffer != 0 {
-        guest::write32(buffer, value);
+        guest::write_bytes(buffer, &value.to_le_bytes());
     }
     0
 }
 
 pub fn query_session_identifier(context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64) -> u32 {
-    guest::write8(handled, 1);
-    guest::write32(length, 16);
+    byte_at(handled).set(1);
+    ulong_at(length).set(16);
     if capacity < 16 {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if type_pointer != 0 {
-        guest::write32(type_pointer, 3);
+        ulong_at(type_pointer).set(3);
     }
     if buffer != 0 {
         // A carga SSE original captura os 16 bytes antes de gravar.
-        let bytes = guest::read_bytes(context + 0xB791, 16);
+        let bytes = guest::read_bytes(context_at(context).session_identifier.as_ptr() as u64, 16);
         guest::write_bytes(buffer, &bytes);
     }
     0
 }
 
 pub fn query_context_value(context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64) -> u32 {
-    guest::write8(handled, 1);
-    write_dword(type_pointer, buffer, capacity, length, guest::read32(context + 8))
+    byte_at(handled).set(1);
+    write_dword(type_pointer, buffer, capacity, length, context_at(context).context_value.get())
 }
 
 /// Registro inicial observado: estado 4 e flag 1, demais campos zerados.
@@ -78,15 +104,15 @@ fn initial_state() -> [u8; 48] {
 }
 
 pub fn read_local_state(context: u64) -> Result<u32, KernelError> {
-    if guest::read64(context + 0xB6F0) == 0 {
-        return Ok(guest::read32(context + 0xB78C));
+    if context_at(context).view.get() == 0 {
+        return Ok(context_at(context).local_state.get());
     }
     if let Some(record) = license_state::snapshot(context)? {
         return Ok(u32::from_le_bytes([record[8], record[9], record[10], record[11]]));
     }
     // A preparação do registro ausente relê o blob e a contagem.
-    let blob = guest::read64(context + 0xB6F0);
-    let _ = guest::read32(context + 0xB6E8);
+    let blob = context_at(context).view.get();
+    let _ = context_at(context).descriptor_count.get();
     if blob != 0 {
         license_state::update_snapshot(context, &initial_state(), 0xFFFF_FFFF, 0)?;
     }
@@ -95,7 +121,7 @@ pub fn read_local_state(context: u64) -> Result<u32, KernelError> {
 
 fn query_local_state(value: u32, context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64) -> Result<u32, KernelError> {
     let state = read_local_state(context)?;
-    guest::write8(handled, (state != 0) as u8);
+    byte_at(handled).set((state != 0) as u8);
     if state == 0 {
         return Ok(STATUS_NAME_NOT_FOUND);
     }
@@ -116,13 +142,13 @@ pub fn query_local_hardware_identifier() -> u32 {
 }
 
 fn has_record(context: u64, exclusive: bool) -> Result<bool, KernelError> {
-    let lock = context + 0xB7B0;
+    let lock = context_at(context).state_lock.address();
     if exclusive {
         push_lock::acquire_exclusive(lock, 0)?;
     } else {
         push_lock::acquire_shared(lock, 0)?;
     }
-    let present = guest::read64(context + 0xB7A8) != 0;
+    let present = context_at(context).state_carrier.get() != 0;
     if exclusive {
         push_lock::release_exclusive(lock, 0)?;
     } else {
@@ -144,20 +170,20 @@ fn refresh_genuine_state(context: u64) -> Result<(), KernelError> {
         if last_check == 0 {
             refresh = true;
         } else {
-            let interval = guest::read32(context + 0xB7B8).min(900_000) as i64;
+            let interval = context_at(context).refresh_interval.get().min(900_000) as i64;
             let deadline = last_check.wrapping_add(interval);
             refresh = deadline < last_check || deadline <= elapsed_milliseconds();
         }
     }
-    if !refresh || guest::read64(context) != 0 || guest::read64(context + 0xB6F0) == 0 {
+    if !refresh || context_at(context).primary.get() != 0 || context_at(context).view.get() == 0 {
         return Ok(());
     }
     if !has_record(context, true)? {
         license_state::set_context_state(context, 5)?;
         return Ok(());
     }
-    let blob = guest::read64(context + 0xB6F0);
-    let _ = guest::read32(context + 0xB6E8);
+    let blob = context_at(context).view.get();
+    let _ = context_at(context).descriptor_count.get();
     if blob == 0 {
         return Ok(());
     }
@@ -170,10 +196,10 @@ fn refresh_genuine_state(context: u64) -> Result<(), KernelError> {
 }
 
 pub fn query_genuine_before(context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64) -> Result<u32, KernelError> {
-    if guest::read64(context) == 0 && guest::read64(context + 0xB6F0) != 0 {
+    if context_at(context).primary.get() == 0 && context_at(context).view.get() != 0 {
         refresh_genuine_state(context)?;
     }
-    if guest::read64(context) != 0 && elapsed_milliseconds() / 1000 > 10800 {
+    if context_at(context).primary.get() != 0 && elapsed_milliseconds() / 1000 > 10800 {
         license_state::set_context_state(context, 2)?;
         license_state::update_snapshot(context, &[0u8; 48], 32, 0)?;
     }
@@ -206,36 +232,27 @@ pub fn expiration_bytes(file_time: u64) -> [u8; 16] {
 
 /// Sem callback, 0x7D38C0 fornece FILETIME zero (sem data configurada).
 pub fn query_expiration(type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64, provider: Option<fn() -> (u32, u64)>) -> u32 {
-    guest::write32(length, 16);
+    ulong_at(length).set(16);
     if capacity < 16 {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if type_pointer != 0 {
-        guest::write32(type_pointer, 3);
+        ulong_at(type_pointer).set(3);
     }
     let (status, value) = provider.map_or((0, 0), |provider| provider());
     if status & 0x8000_0000 != 0 {
         return status;
     }
     guest::write_bytes(buffer, &expiration_bytes(value));
-    guest::write8(handled, 1);
+    byte_at(handled).set(1);
     status
 }
 
-fn write_name(descriptor: u64, text: &str) {
-    let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-    guest::write16(descriptor, units.len() as u16 * 2);
-    guest::write16(descriptor + 2, (units.len() as u16 + 1) * 2);
-    guest::write64(descriptor + 8, descriptor + 16);
-    for (index, unit) in units.iter().chain(core::iter::once(&0)).enumerate() {
-        guest::write16(descriptor + 16 + index as u64 * 2, *unit);
-    }
-}
 
 pub fn query_addon_policy(context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64) -> Result<u32, KernelError> {
-    guest::write8(handled, 1);
+    byte_at(handled).set(1);
     let Ok(frame) = kernel_pool::allocate(64, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
-    write_name(frame, "ConsumeAddonPolicySet");
+    layout::write_inline_name(frame, "ConsumeAddonPolicySet");
     let result = license_cache::query(context, frame, type_pointer, buffer, capacity, length);
     let _ = kernel_pool::free(frame, Some(FRAME_TAG));
     result
@@ -245,57 +262,63 @@ pub fn query_addon_policy(context: u64, type_pointer: u64, buffer: u64, capacity
 /// escrever handled; sem provedor devolve NOT_SUPPORTED com handled=0.
 #[allow(clippy::too_many_arguments)]
 pub fn query_genuine_after(context: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64, handled: u64, query_license: &dyn Fn(&str, u64, u64, u32, u64) -> Result<u32, KernelError>, providers: &Providers) -> Result<u32, KernelError> {
-    guest::write8(handled, 0);
-    if guest::read64(context) != 0 {
+    byte_at(handled).set(0);
+    if context_at(context).primary.get() != 0 {
         let status = write_dword(type_pointer, buffer, capacity, length, 2);
-        guest::write8(handled, 1);
+        byte_at(handled).set(1);
         return Ok(status);
     }
     if buffer != 0 {
-        let value = match capacity {
-            1 => guest::read8(buffer) as u32,
-            2 => guest::read16(buffer) as u32,
-            _ => guest::read32(buffer),
+        // Valor anterior no buffer de dados do chamador (largura pela capacidade).
+        let width = match capacity {
+            1 => 1,
+            2 => 2,
+            _ => 4,
         };
+        let mut bytes = [0u8; 4];
+        bytes[..width].copy_from_slice(&guest::read_bytes(buffer, width));
+        let value = u32::from_le_bytes(bytes);
         if value == 1 {
             return Ok(0);
         }
     }
-    let Ok(frame) = kernel_pool::allocate(64, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    let Ok(frame) = kernel_pool::allocate(GenuineFrame::SIZE, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    // SAFETY: alocação nova do tamanho da moldura.
+    let genuine = unsafe { GenuineFrame::at(frame) };
     let mut policy = 0u64;
     let result = (|| -> Result<u32, KernelError> {
-        guest::write32(frame + 8, 4);
-        let status = query_license("Security-SPP-IgnoreDeferredActivation", 0, frame, 4, frame + 8)?;
-        if status & 0x8000_0000 == 0 && guest::read32(frame) == 1 {
+        genuine.value_length.set(4);
+        let status = query_license("Security-SPP-IgnoreDeferredActivation", 0, genuine.ignore_deferred.address(), 4, genuine.value_length.address())?;
+        if status & 0x8000_0000 == 0 && genuine.ignore_deferred.get() == 1 {
             return Ok(status);
         }
         let Some(deferred) = providers.query_deferred_activation else { return Ok(STATUS_NOT_SUPPORTED) };
-        let status = deferred(frame + 4);
+        let status = deferred(genuine.deferred_activation.address());
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
         let Some(verify) = providers.verify_product_policy else { return Ok(STATUS_NOT_SUPPORTED) };
-        let mut status = license_registry::query(ValueName::Text("ProductPolicy"), 0, 0, 0, frame + 12, frame + 16)?;
+        let mut status = license_registry::query(ValueName::Text("ProductPolicy"), 0, 0, 0, genuine.policy_size.address(), genuine.handled.address())?;
         if status == STATUS_BUFFER_TOO_SMALL {
-            let size = guest::read32(frame + 12);
+            let size = genuine.policy_size.get();
             policy = pool_allocation::allocate_tagged(1, size as u64, VALUE_TAG).unwrap_or(0);
             if policy == 0 {
                 return Ok(STATUS_NO_MEMORY);
             }
-            status = license_registry::query(ValueName::Text("ProductPolicy"), 0, policy, size, frame + 12, frame + 16)?;
+            status = license_registry::query(ValueName::Text("ProductPolicy"), 0, policy, size, genuine.policy_size.address(), genuine.handled.address())?;
         }
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        let mut status = verify(3, policy, 0, 0, 0, 0, frame + 32);
-        if (status & 0x8000_0000 == 0 && guest::read8(frame + 32) & 0x40 != 0) || status == 0xC000_0272 {
+        let mut status = verify(3, policy, 0, 0, 0, 0, genuine.verify_flags.address());
+        if (status & 0x8000_0000 == 0 && genuine.verify_flags.get() & 0x40 != 0) || status == 0xC000_0272 {
             status = 0;
         }
-        if status & 0x8000_0000 != 0 || guest::read32(frame + 4) != 0 {
+        if status & 0x8000_0000 != 0 || genuine.deferred_activation.get() != 0 {
             return Ok(status);
         }
         let status = write_dword(type_pointer, buffer, capacity, length, 2);
-        guest::write8(handled, 1);
+        byte_at(handled).set(1);
         Ok(status)
     })();
     if policy != 0 {

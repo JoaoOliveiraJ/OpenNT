@@ -4,6 +4,8 @@
 //! locks e dados com a consulta Zw; a inscrição sonda e zera a saída antes do
 //! nome; o evento de processo fica registrado no contexto WNF do processo.
 
+use core::sync::atomic::Ordering;
+
 use crate::ntos::ex::wnf::name::{self as wnf_name, SuppliedType};
 use crate::ntos::ex::wnf::query::{UserInputs, UserQuery};
 use crate::ntos::ex::wnf::{namespace as namespace, security as wnf_security, subscriptions as wnf_subscriptions};
@@ -13,8 +15,9 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::state;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use super::objects::process_context_at;
+use crate::ntos::inc::field::{Field, NtStruct};
 
-const PROCESS_NOTIFICATION_EVENT_OFFSET: u64 = 0x80;
 const EVENT_MODIFY_STATE: u64 = 2;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_ALREADY_REGISTERED: u32 = 0xC000_0718;
@@ -27,16 +30,16 @@ fn capture_inputs(type_identifier: u64, change_stamp: u64, buffer: u64, returned
         if !state::probe_user_read(type_identifier, 16) {
             return Err(0xC000_0005);
         }
+        // WNF_TYPE_ID de usuário: cópia sondada (a página pode sumir depois da sonda).
+        let Ok(copy) = guest::try_read_bytes(type_identifier, 16) else { return Err(0xC000_0005) };
         let mut bytes = [0u8; 16];
-        for (offset, byte) in bytes.iter_mut().enumerate() {
-            *byte = guest::read8(type_identifier + offset as u64);
-        }
+        bytes.copy_from_slice(&copy);
         captured = SuppliedType::Captured(bytes);
     }
     if !state::probe_user_write(change_stamp, 4) || !state::probe_user_read(returned_length, 4) {
         return Err(0xC000_0005);
     }
-    let capacity = guest::read32(returned_length);
+    let Ok(capacity) = guest::try_read::<u32>(returned_length) else { return Err(0xC000_0005) };
     if !state::probe_user_write(returned_length, 4) {
         return Err(0xC000_0005);
     }
@@ -69,12 +72,15 @@ pub fn subscribe(state_name: u64, change_stamp: u32, event_mask: u32, identifier
             if !state::probe_user_write(identifier, 8) {
                 return Ok(0xC000_0005);
             }
-            guest::write64(identifier, 0);
+            if guest::try_write::<u64>(identifier, 0).is_err() {
+                return Ok(0xC000_0005);
+            }
         }
         if !state::probe_user_read(state_name, 8) {
             return Ok(0xC000_0005);
         }
-        let name = wnf_name::decode(guest::read64(state_name));
+        let Ok(encoded) = guest::try_read::<u64>(state_name) else { return Ok(0xC000_0005) };
+        let name = wnf_name::decode(encoded);
         if name.status != 0 {
             return Ok(name.status);
         }
@@ -96,7 +102,9 @@ pub fn subscribe(state_name: u64, change_stamp: u32, event_mask: u32, identifier
             if !state::probe_user_write(identifier, 8) {
                 return Ok(0xC000_0005);
             }
-            guest::write64(identifier, subscribed);
+            if guest::try_write::<u64>(identifier, subscribed).is_err() {
+                return Ok(0xC000_0005);
+            }
         }
         Ok(0)
     })();
@@ -121,18 +129,19 @@ pub fn set_process_notification_event(handle: u64) -> Result<u32, KernelError> {
         if output == 0 {
             return Ok(STATUS_INSUFFICIENT_RESOURCES);
         }
-        guest::write64(output, 0);
+        // SAFETY: célula de 8 bytes recém-alocada para o PVOID de saída.
+        let object = unsafe { Field::<u64>::at(output) };
+        object.set(0);
         let status = object_reference::reference_by_handle(handle, EVENT_MODIFY_STATE as u32, object_types::event_type().pointer, 1, output, 0)? as u32;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        let pointer = guest::read64(output);
+        let pointer = object.get();
         let Some(described) = open_pointer::describe(pointer) else { return Err(KernelError::new("referência WNF sem proprietário de evento")) };
         event = Some(described);
         // A publicação atômica aceita só a primeira inscrição; até uma
         // repetição com o mesmo evento falha e devolve a referência extra.
-        let previous = guest::compare_exchange64(context + PROCESS_NOTIFICATION_EVENT_OFFSET, 0, pointer)?;
-        if previous != 0 {
+        if process_context_at(context).notification_event.atomic().compare_exchange(0, pointer, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return Ok(STATUS_ALREADY_REGISTERED);
         }
         // A limpeza das notificações WNF devolve a referência; registrar não

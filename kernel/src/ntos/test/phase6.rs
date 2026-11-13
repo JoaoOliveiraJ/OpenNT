@@ -1223,7 +1223,8 @@ fn ntoskrnl_ex_group(assert: Assert) {
     // UUID, extensões, hora local e Error Management.
     let uuid = block + 0x1A0;
     let uuid_guid = at::<nt::Guid>(uuid);
-    assert(call_export("ExUuidCreate", &[uuid]) == Some(0) && (uuid_guid.data3.get() & 0xFF) >> 4 == 4 && uuid_guid.data4[0].get() >> 6 == 2, "ex: ExUuidCreate versao 4");
+    // UUID v4: versão nos 4 bits altos do Data3 (byte 7) e variante 10b no Data4[0].
+    assert(call_export("ExUuidCreate", &[uuid]) == Some(0) && uuid_guid.data3.get() >> 12 == 4 && uuid_guid.data4[0].get() >> 6 == 2, "ex: ExUuidCreate versao 4");
     let output = block + 0x1B0;
     assert(call_export("ExRegisterExtension", &[output, 1, 0xFFFF_F800_DEAD_0000]) == Some(0) && guest::read16(guest::read64(output)) == 1 && guest::read64(guest::read64(output) + 8) == 0xFFFF_F800_DEAD_0000, "ex: ExRegisterExtension");
     at::<nt::LargeInteger>(block + 0x1B8).quad_part.set(0x01DA_0000_1234_5678);

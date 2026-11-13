@@ -10,8 +10,38 @@ use crate::ntos::ex::license::{cache as license_cache, registry as license_regis
 use crate::ntos::ex::{pool_allocation, push_lock};
 use crate::ntos::ke::critical_region;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
+use super::layout::{self, context_at, ulong_at, unicode_at};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::UnicodeString;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+
+/// Moldura de pool da consulta: o indicador "tratado", o DWORD de
+/// ConsumeAddonPolicySet, o tamanho devolvido e um nome interno com os
+/// caracteres logo depois.
+#[repr(C)]
+struct QueryFrame {
+    handled: Field<u8>,
+    _pad_1: Reserved<0x3>,
+    addon_policy: Field<u32>,
+    value_length: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    name: UnicodeString,
+    _name_text: Reserved<0x40>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for QueryFrame {}
+
+const _: () = {
+    assert!(core::mem::size_of::<QueryFrame>() == 96);
+    assert!(core::mem::offset_of!(QueryFrame, name) == 16);
+};
+
+fn query_frame(frame: u64) -> &'static QueryFrame {
+    // SAFETY: molduras de 96 bytes alocadas por `query`.
+    unsafe { QueryFrame::at(frame) }
+}
 
 const FRAME_TAG: u32 = 0x7351_734C;
 const VALUE_TAG: u32 = 0x2053_4C53;
@@ -70,7 +100,7 @@ const ADDON_EXCLUSIONS: [&str; 7] = [
 ];
 
 fn locked<T>(context: u64, exclusive: bool, operation: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
-    let lock = context + 0xB6F8;
+    let lock = context_at(context).policy_lock.address();
     critical_region::enter_critical()?;
     let acquired = if exclusive { push_lock::acquire_exclusive(lock, 0) } else { push_lock::acquire_shared(lock, 0) };
     let result = match acquired {
@@ -87,35 +117,21 @@ fn locked<T>(context: u64, exclusive: bool, operation: impl FnOnce() -> Result<T
     Ok(result)
 }
 
-fn move_bytes(destination: u64, source: u64, size: u32) {
-    let backwards = destination > source && destination < source + size as u64;
-    for index in 0..size as u64 {
-        let offset = if backwards { size as u64 - index - 1 } else { index };
-        guest::write8(destination + offset, guest::read8(source + offset));
-    }
-}
-
-fn write_name(descriptor: u64, name: &str) {
-    let units: Vec<u16> = name.encode_utf16().collect();
-    guest::write16(descriptor, units.len() as u16 * 2);
-    guest::write16(descriptor + 2, (units.len() as u16 + 1) * 2);
-    guest::write64(descriptor + 8, descriptor + 16);
-    for (index, unit) in units.iter().chain(core::iter::once(&0)).enumerate() {
-        guest::write16(descriptor + 16 + index as u64 * 2, *unit);
-    }
+/// Os WCHARs do nome contado (um bloco de Length bytes).
+fn name_units(name: u64) -> Vec<u16> {
+    let name = unicode_at(name);
+    guest::read_bytes(name.buffer.get(), name.length.get() as usize & !1).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
 }
 
 /// Decodifica todos os WCHARs antes de comparar cada entrada de tamanho
 /// igual (as falhas de um nome em página não mapeada são observáveis).
 fn find_reserved(name: u64) -> Option<(Callback, bool)> {
-    let length = guest::read16(name);
+    let length = unicode_at(name).length.get();
     for (text, callback, needs_lock) in RESERVED_NAMES {
         if length as usize != text.encode_utf16().count() * 2 {
             continue;
         }
-        let pointer = guest::read64(name + 8);
-        let captured: Vec<u16> = (0..length as u64 / 2).map(|index| guest::read16(pointer + index * 2)).collect();
-        if captured.iter().copied().eq(text.encode_utf16()) {
+        if name_units(name).into_iter().eq(text.encode_utf16()) {
             return Some((callback, needs_lock));
         }
     }
@@ -124,11 +140,10 @@ fn find_reserved(name: u64) -> Option<(Callback, bool)> {
 
 fn equals_counted(name: u64, text: &str) -> bool {
     let units: Vec<u16> = text.encode_utf16().collect();
-    if guest::read16(name) as usize != units.len() * 2 {
+    if unicode_at(name).length.get() as usize != units.len() * 2 {
         return false;
     }
-    let buffer = guest::read64(name + 8);
-    units.iter().enumerate().all(|(index, &unit)| guest::read16(buffer + index as u64 * 2) == unit)
+    name_units(name) == units
 }
 
 fn excluded_addon_name(buffer: u64) -> bool {
@@ -160,42 +175,44 @@ pub fn capture_subscription(context: u64, frame: u64) -> Result<(u32, u64), Kern
     let mut transferred = false;
     let result = (|| -> Result<u32, KernelError> {
         let mut status = 0u32;
-        if guest::read8(context + 0xB708) == 0 {
-            write_name(frame + 16, "Clip-SubscriptionPFN");
-            guest::write32(frame + 8, 0);
-            status = license_cache::query(context, frame + 16, 0, 0, 0, frame + 8)?;
+        let query = query_frame(frame);
+        if context_at(context).subscription_cached.get() == 0 {
+            layout::write_inline_name(query.name.address(), "Clip-SubscriptionPFN");
+            query.value_length.set(0);
+            status = license_cache::query(context, query.name.address(), 0, 0, 0, query.value_length.address())?;
             let mut capacity = 0u32;
             if status == STATUS_BUFFER_TOO_SMALL {
-                capacity = guest::read32(frame + 8);
+                capacity = query.value_length.get();
                 allocated = pool_allocation::allocate_tagged(1, capacity as u64, VALUE_TAG).unwrap_or(0);
-                if allocated == 0 || capacity > 0x82 {
+                if allocated == 0 || capacity as usize > context_at(context).subscription_pfn.len() {
                     return Ok(STATUS_INTERNAL_ERROR);
                 }
-                status = license_cache::query(context, frame + 16, 0, allocated, capacity, frame + 8)?;
+                status = license_cache::query(context, query.name.address(), 0, allocated, capacity, query.value_length.address())?;
             }
             locked(context, true, || {
-                if guest::read8(context + 0xB708) != 0 {
+                if context_at(context).subscription_cached.get() != 0 {
                     return Ok(());
                 }
                 if status & 0x8000_0000 == 0 {
-                    move_bytes(context + 0xB70A, allocated, capacity);
+                    layout::move_bytes(context_at(context).subscription_pfn.as_ptr() as u64, allocated, capacity);
                 }
                 if status & 0x8000_0000 == 0 || status == STATUS_NAME_NOT_FOUND {
-                    guest::write8(context + 0xB708, 1);
+                    context_at(context).subscription_cached.set(1);
                 }
                 Ok(())
             })?;
         } else {
             locked(context, false, || {
-                if guest::read8(context + 0xB708) == 0 {
+                if context_at(context).subscription_cached.get() == 0 {
                     return Ok(());
                 }
-                allocated = pool_allocation::allocate_tagged(1, 0x82, VALUE_TAG).unwrap_or(0);
+                let pfn = &context_at(context).subscription_pfn;
+                allocated = pool_allocation::allocate_tagged(1, pfn.len() as u64, VALUE_TAG).unwrap_or(0);
                 if allocated == 0 {
                     status = STATUS_INTERNAL_ERROR;
                     return Ok(());
                 }
-                move_bytes(allocated, context + 0xB70A, 0x82);
+                layout::move_bytes(allocated, pfn.as_ptr() as u64, pfn.len() as u32);
                 Ok(())
             })?;
         }
@@ -212,8 +229,8 @@ pub fn capture_subscription(context: u64, frame: u64) -> Result<(u32, u64), Kern
 /// Recursão de GenuineLocalStatus com uma UNICODE_STRING própria.
 pub fn query_by_name(context: u64, name: &str, type_pointer: u64, buffer: u64, capacity: u32, length: u64, providers: &Providers) -> Result<u32, KernelError> {
     let units = name.encode_utf16().count() as u64;
-    let Ok(frame) = kernel_pool::allocate(16 + (units + 1) * 2, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
-    write_name(frame, name);
+    let Ok(frame) = kernel_pool::allocate(UnicodeString::SIZE + (units + 1) * 2, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    layout::write_inline_name(frame, name);
     let result = query(context, frame, type_pointer, buffer, capacity, length, providers);
     let _ = kernel_pool::free(frame, Some(FRAME_TAG));
     result
@@ -243,21 +260,22 @@ pub fn query(context: u64, name: u64, type_pointer: u64, buffer: u64, capacity: 
     if name == 0 || length == 0 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    if guest::read64(name + 8) == 0 || guest::read16(name) < 2 {
+    if unicode_at(name).buffer.get() == 0 || unicode_at(name).length.get() < 2 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    let Ok(frame) = kernel_pool::allocate(96, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    let Ok(frame) = kernel_pool::allocate(QueryFrame::SIZE, AllocateOptions { zero: true, paged: true, tag: FRAME_TAG, ..Default::default() }) else { return Ok(STATUS_NO_MEMORY) };
+    let query_state = query_frame(frame);
     let mut copied_name = 0u64;
     let mut subscription = 0u64;
     let result = (|| -> Result<u32, KernelError> {
         let initialization = license_cache::prepare(context, providers.notify_corruption)?;
         let mut status = 0;
         if let Some((callback, needs_lock)) = find_reserved(name) {
-            let call = || invoke(callback, context, type_pointer, buffer, capacity, length, frame, providers);
+            let call = || invoke(callback, context, type_pointer, buffer, capacity, length, query_state.handled.address(), providers);
             status = if needs_lock { locked(context, false, call)? } else { call()? };
         }
-        if guest::read8(frame) != 0 {
-            if status & 0x8000_0000 == 0 && guest::read32(length) > capacity {
+        if query_state.handled.get() != 0 {
+            if status & 0x8000_0000 == 0 && ulong_at(length).get() > capacity {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
             return Ok(status);
@@ -265,17 +283,17 @@ pub fn query(context: u64, name: u64, type_pointer: u64, buffer: u64, capacity: 
         if initialization & 0x8000_0000 != 0 {
             return Ok(initialization);
         }
-        write_name(frame + 16, "ConsumeAddonPolicySet");
-        status = license_cache::query(context, frame + 16, 0, frame + 4, 4, frame + 8)?;
+        layout::write_inline_name(query_state.name.address(), "ConsumeAddonPolicySet");
+        status = license_cache::query(context, query_state.name.address(), 0, query_state.addon_policy.address(), 4, query_state.value_length.address())?;
         let mut query_cache = true;
-        if let Some(addon) = providers.query_addon_policy.filter(|_| guest::read32(frame + 4) != 0 && !equals_counted(name, "Clip-SubscriptionPFN")) {
-            let name_bytes = guest::read16(name) as u32 + 2;
+        if let Some(addon) = providers.query_addon_policy.filter(|_| query_state.addon_policy.get() != 0 && !equals_counted(name, "Clip-SubscriptionPFN")) {
+            let name_bytes = unicode_at(name).length.get() as u32 + 2;
             copied_name = pool_allocation::allocate_tagged(1, name_bytes as u64, VALUE_TAG).unwrap_or(0);
             if copied_name == 0 {
                 return Ok(STATUS_NO_MEMORY);
             }
             guest::write_bytes(copied_name, &alloc::vec![0u8; name_bytes as usize]);
-            move_bytes(copied_name, guest::read64(name + 8), guest::read16(name) as u32);
+            layout::move_bytes(copied_name, unicode_at(name).buffer.get(), unicode_at(name).length.get() as u32);
             if !excluded_addon_name(copied_name) {
                 // O status do helper não é testado: NULL também é argumento.
                 subscription = capture_subscription(context, frame)?.1;
@@ -290,7 +308,7 @@ pub fn query(context: u64, name: u64, type_pointer: u64, buffer: u64, capacity: 
             status = license_cache::query(context, name, type_pointer, buffer, capacity, length)?;
             if status == STATUS_DATA_ERROR {
                 locked(context, true, || {
-                    guest::write8(context + 0xB790, 1);
+                    context_at(context).corrupt.set(1);
                     Ok(())
                 })?;
             }
@@ -298,8 +316,8 @@ pub fn query(context: u64, name: u64, type_pointer: u64, buffer: u64, capacity: 
         // O nome é procurado de novo: saídas sobrepostas podem tê-lo mudado.
         if find_reserved(name).is_some_and(|(callback, _)| callback == Callback::GenuineBefore) && (status & 0x8000_0000 == 0 || status == STATUS_NAME_NOT_FOUND || status == STATUS_NOT_FOUND) {
             let recurse = |text: &str, result_type: u64, result_buffer: u64, result_capacity: u32, result_length: u64| query_by_name(context, text, result_type, result_buffer, result_capacity, result_length, providers);
-            let after = special::query_genuine_after(context, type_pointer, buffer, capacity, length, frame, &recurse, providers)?;
-            if guest::read8(frame) != 0 {
+            let after = special::query_genuine_after(context, type_pointer, buffer, capacity, length, query_state.handled.address(), &recurse, providers)?;
+            if query_state.handled.get() != 0 {
                 status = after;
             }
         }

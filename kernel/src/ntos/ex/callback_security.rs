@@ -9,6 +9,8 @@ use crate::ntos::ob::object_access;
 use crate::ntos::se::model::{equal_sids, Ace, SecurityPolicy};
 use crate::ntos::se::{descriptor, sid};
 use crate::ntos::se::token::tokens;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{AccessAllowedAce, Acl, SecurityDescriptor, SecurityDescriptorRelative};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Direitos aceitos pelo tipo Callback, incluindo os padrão do objeto.
@@ -35,12 +37,16 @@ pub fn capture(pointer: u64) -> Result<SecurityPolicy, u32> {
     let control = descriptor::control(pointer);
     policy.control = Some(control);
     // Offsets no descritor autocontido; ponteiros de 64 bits no absoluto.
-    let component = |index: u64| -> u64 {
+    let component = |index: usize| -> u64 {
         if control & 0x8000 != 0 {
-            let offset = guest::read32(pointer + 4 + index * 4);
+            // SAFETY: descritor validado acima (modo kernel), autocontido.
+            let relative = unsafe { SecurityDescriptorRelative::at(pointer) };
+            let offset = [&relative.owner, &relative.group, &relative.sacl, &relative.dacl][index].get();
             if offset != 0 { pointer + offset as u64 } else { 0 }
         } else {
-            guest::read64(pointer + 8 + index * 8)
+            // SAFETY: descritor validado acima (modo kernel), absoluto.
+            let absolute = unsafe { SecurityDescriptor::at(pointer) };
+            [&absolute.owner, &absolute.group, &absolute.sacl, &absolute.dacl][index].get()
         }
     };
     let owner = component(0);
@@ -55,25 +61,31 @@ pub fn capture(pointer: u64) -> Result<SecurityPolicy, u32> {
     if control & 16 != 0 {
         let value = component(2);
         if value != 0 {
-            policy.sacl = Some(guest::read_bytes(value, guest::read16(value + 2) as usize));
+            // SAFETY: a SACL do descritor validado.
+            let sacl = unsafe { Acl::at(value) };
+            policy.sacl = Some(guest::read_bytes(value, sacl.acl_size.get() as usize));
         }
     }
     if control & 4 != 0 {
         let value = component(3);
         policy.dacl = None;
         if value != 0 {
-            policy.dacl_bytes = Some(guest::read_bytes(value, guest::read16(value + 2) as usize));
+            // SAFETY: a DACL do descritor validado.
+            let dacl = unsafe { Acl::at(value) };
+            policy.dacl_bytes = Some(guest::read_bytes(value, dacl.acl_size.get() as usize));
             let mut entries = Vec::new();
-            let mut offset = 8u64;
-            for _ in 0..guest::read16(value + 4) {
+            let mut offset = Acl::SIZE;
+            for _ in 0..dacl.ace_count.get() {
                 let entry = value + offset;
-                let ace_type = guest::read8(entry);
-                let length = guest::read16(entry + 2) as u64;
-                let flags = guest::read8(entry + 1);
-                let mask = guest::read32(entry + 4);
+                // SAFETY: as ACEs seguem o cabeçalho da ACL, cada uma com AceSize.
+                let ace = unsafe { AccessAllowedAce::at(entry) };
+                let ace_type = ace.header.ace_type.get();
+                let length = ace.header.ace_size.get() as u64;
+                let flags = ace.header.ace_flags.get();
+                let mask = ace.mask.get();
                 // Permitir/negar simples expõem SID e máscara; o resto conserva os bytes.
                 if ace_type == 0 || ace_type == 1 {
-                    entries.push(Ace { sid: Some(sid::read(entry + 8)), mask, deny: ace_type == 1, flags, raw: None });
+                    entries.push(Ace { sid: Some(sid::read(ace.sid_start.address())), mask, deny: ace_type == 1, flags, raw: None });
                 } else {
                     entries.push(Ace { sid: None, mask, deny: false, flags, raw: Some(guest::read_bytes(entry, length as usize)) });
                 }

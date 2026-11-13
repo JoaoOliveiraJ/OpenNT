@@ -5,26 +5,37 @@
 //! fila paralela de donos. No fim, o spin lock legado (test-and-set com
 //! subida a DISPATCH_LEVEL) de ExAcquireSpinLock/ExReleaseSpinLock.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::hal::cpu;
 use crate::ntos::ke::irql;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
 
 const WRITER_RESERVED: u32 = 0x8000_0000;
 const WRITER_WAITING: u32 = 0x4000_0000;
 const READER_COUNT_MASK: u32 = 0x3FFF_FFFF;
 
+/// A palavra EX_SPIN_LOCK (um LONG) do chamador.
+fn word(pointer: u64) -> &'static AtomicU32 {
+    // SAFETY: os exports recebem um PEX_SPIN_LOCK do chamador.
+    unsafe { Field::<u32>::at(pointer) }.atomic()
+}
+
+/// Leitura atômica da palavra.
+fn load(pointer: u64) -> u32 {
+    word(pointer).load(Ordering::SeqCst)
+}
+
 /// LOCK CMPXCHG na palavra do chamador: devolve o valor anterior.
 fn cas(pointer: u64, expected: u32, replacement: u32) -> u32 {
-    match guest::atomic_u32(pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+    match word(pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(previous) | Err(previous) => previous,
     }
 }
 
 fn update(pointer: u64, transform: impl Fn(u32) -> u32) -> u32 {
-    let mut expected = guest::read32(pointer);
+    let mut expected = load(pointer);
     loop {
         let observed = cas(pointer, expected, transform(expected));
         if observed == expected {
@@ -61,7 +72,7 @@ fn mark_waiting(pointer: u64, value: u32) {
 
 fn reserve_writer(pointer: u64, try_only: bool, previous: Option<u8>) -> bool {
     loop {
-        let value = guest::read32(pointer);
+        let value = load(pointer);
         if value & WRITER_RESERVED != 0 {
             if try_only {
                 return false;
@@ -79,7 +90,7 @@ fn reserve_writer(pointer: u64, try_only: bool, previous: Option<u8>) -> bool {
 /// Espera a contagem chegar a `remaining` mantendo a reserva e o IRQL.
 fn drain_readers(pointer: u64, remaining: u32) {
     loop {
-        let value = guest::read32(pointer);
+        let value = load(pointer);
         if value & READER_COUNT_MASK == remaining {
             return;
         }
@@ -97,12 +108,12 @@ pub fn acquire_exclusive_at_dpc(pointer: u64) -> Result<(), KernelError> {
 
 fn acquire_shared_core(pointer: u64, previous: Option<u8>) {
     // O primeiro CAS só vence sem o bit exclusivo.
-    let expected = guest::read32(pointer) & !WRITER_RESERVED;
+    let expected = load(pointer) & !WRITER_RESERVED;
     if cas(pointer, expected, expected.wrapping_add(1)) == expected {
         return;
     }
     loop {
-        let value = guest::read32(pointer);
+        let value = load(pointer);
         if value & WRITER_RESERVED != 0 {
             mark_waiting(pointer, value);
             pause_contention(previous);
@@ -124,7 +135,7 @@ pub fn acquire_shared_at_dpc(pointer: u64) -> Result<(), KernelError> {
 /// leitores nem escritor reservado); nunca espera.
 pub fn try_acquire_exclusive_at_dpc(pointer: u64) -> Result<bool, KernelError> {
     require_dispatch_level()?;
-    let value = guest::read32(pointer);
+    let value = load(pointer);
     if value & (WRITER_RESERVED | READER_COUNT_MASK) != 0 {
         return Ok(false);
     }
@@ -135,7 +146,7 @@ pub fn try_acquire_exclusive_at_dpc(pointer: u64) -> Result<bool, KernelError> {
 pub fn try_acquire_shared_at_dpc(pointer: u64) -> Result<bool, KernelError> {
     require_dispatch_level()?;
     loop {
-        let value = guest::read32(pointer);
+        let value = load(pointer);
         if value & WRITER_RESERVED != 0 {
             return Ok(false);
         }
@@ -200,12 +211,13 @@ pub fn try_convert(pointer: u64) -> Result<bool, KernelError> {
 
 // ---- spin lock legado (ExAcquireSpinLock/ExReleaseSpinLock) -----------------
 
-/// Spin lock legado com subida a DISPATCH_LEVEL: a palavra baixa vai de 0 a 1
+/// Spin lock legado com subida a DISPATCH_LEVEL: o KSPIN_LOCK (64 bits) vai de 0 a 1
 /// num LOCK CMPXCHG, então dois processadores nunca saem com o lock.
 pub fn lock_with_raise(lock: u64) -> u8 {
     let previous = irql::get_irql();
     irql::raise_irql(2);
-    let cell = guest::atomic_u32(lock);
+    // SAFETY: o export recebe o PKSPIN_LOCK (ULONG_PTR) do chamador.
+    let cell = unsafe { Field::<u64>::at(lock) }.atomic();
     while cell.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
@@ -213,7 +225,8 @@ pub fn lock_with_raise(lock: u64) -> u8 {
 }
 
 pub fn unlock_with_lower(lock: u64, previous: u8) {
-    guest::atomic_u32(lock).store(0, Ordering::Release);
+    // SAFETY: como em `lock_with_raise`.
+    unsafe { Field::<u64>::at(lock) }.atomic().store(0, Ordering::Release);
     irql::lower_irql(previous as u64);
 }
 
@@ -221,5 +234,6 @@ pub fn unlock_with_lower(lock: u64, previous: u8) {
 /// anterior vai para `old_irql` (um KIRQL: um byte).
 pub fn acquire_legacy(lock: u64, old_irql: u64) {
     let previous = lock_with_raise(lock);
-    guest::write8(old_irql, previous as u8);
+    // SAFETY: OldIrql é o PKIRQL do chamador.
+    unsafe { Field::<u8>::at(old_irql) }.set(previous);
 }

@@ -24,7 +24,8 @@ use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
 use crate::ntos::ps::process;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{ListEntry, ObjectAttributes, UnicodeString};
 use crate::ntos::rtl::guest_strings;
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -36,6 +37,63 @@ const OBJECT_CASE_INSENSITIVE: u32 = 0x40;
 const OBJECT_KERNEL_HANDLE: u32 = 0x200;
 const OBJECT_POOL_TAG: u32 = 0x6C6C_6143;
 const REGISTRATION_POOL_TAG: u32 = 0x6552_4243;
+
+/// Corpo do objeto Callback (0x38 bytes): assinatura 'Call', a lista dos
+/// registros e AllowMultipleCallbacks. O estado real vive em `STATE`; o corpo
+/// espelha a ordem dos registros para quem percorre a lista.
+#[repr(C)]
+struct CallbackObject {
+    signature: Field<u32>,
+    _pad_4: Reserved<0xC>,
+    registered_callbacks: ListEntry,
+    allow_multiple_callbacks: Field<u8>,
+    _pad_21: Reserved<0x17>,
+}
+
+/// Registro de 0x30 bytes: vínculo, objeto, rotina, contexto, chamadas
+/// ativas e retirada pendente.
+#[repr(C)]
+struct CallbackRegistration {
+    link: ListEntry,
+    /// -> corpo do objeto Callback.
+    callback_object: Field<u64>,
+    callback_function: Field<u64>,
+    callback_context: Field<u64>,
+    busy: Field<u32>,
+    unregister_waiting: Field<u8>,
+    _pad_2d: Reserved<0x3>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CallbackObject {}
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CallbackRegistration {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CallbackObject>() == 0x38);
+    assert!(core::mem::offset_of!(CallbackObject, registered_callbacks) == 0x10);
+    assert!(core::mem::offset_of!(CallbackObject, allow_multiple_callbacks) == 0x20);
+    assert!(core::mem::size_of::<CallbackRegistration>() == 0x30);
+    assert!(core::mem::offset_of!(CallbackRegistration, callback_object) == 0x10);
+    assert!(core::mem::offset_of!(CallbackRegistration, busy) == 0x28);
+    assert!(core::mem::offset_of!(CallbackRegistration, unregister_waiting) == 0x2C);
+};
+
+fn object_at(pointer: u64) -> &'static CallbackObject {
+    // SAFETY: só corpos alocados por `allocate_named` chegam aqui.
+    unsafe { CallbackObject::at(pointer) }
+}
+
+/// O PCALLBACK_OBJECT de saída do chamador (modo kernel).
+fn write_output(output: u64, pointer: u64) {
+    // SAFETY: parâmetro de saída do ExCreateCallback.
+    unsafe { Field::<u64>::at(output) }.set(pointer);
+}
+
+fn registration_at(pointer: u64) -> &'static CallbackRegistration {
+    // SAFETY: só registros alocados por `register` chegam aqui.
+    unsafe { CallbackRegistration::at(pointer) }
+}
 
 struct Item {
     references: u32,
@@ -89,13 +147,15 @@ fn require_live(pointer: u64) -> Result<(), KernelError> {
 
 /// Publica a lista circular de registros no corpo, na ordem do dono.
 fn synchronize_registration_list(state: &State, pointer: u64) {
-    let head = pointer + 0x10;
+    let head = &object_at(pointer).registered_callbacks;
+    let head_address = head.address();
     let list: &[u64] = state.objects.get(&pointer).map_or(&[], |item| item.registrations.as_slice());
-    guest::write64(head, list.first().copied().unwrap_or(head));
-    guest::write64(head + 8, list.last().copied().unwrap_or(head));
+    head.flink.set(list.first().copied().unwrap_or(head_address));
+    head.blink.set(list.last().copied().unwrap_or(head_address));
     for (index, &registration) in list.iter().enumerate() {
-        guest::write64(registration, list.get(index + 1).copied().unwrap_or(head));
-        guest::write64(registration + 8, if index > 0 { list[index - 1] } else { head });
+        let link = &registration_at(registration).link;
+        link.flink.set(list.get(index + 1).copied().unwrap_or(head_address));
+        link.blink.set(if index > 0 { list[index - 1] } else { head_address });
     }
 }
 
@@ -167,18 +227,25 @@ pub struct Captured {
 
 /// Captura OBJECT_ATTRIBUTES e o nome, resolve a raiz e confere o caminho.
 pub fn attributes(pointer: u64) -> Result<Captured, u32> {
-    if pointer == 0 || guest::read32(pointer) != 48 {
+    if pointer == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let root = guest::read64(pointer + 8);
-    let name_pointer = guest::read64(pointer + 16);
-    let flags = guest::read32(pointer + 24);
+    // SAFETY: ExCreateCallback recebe POBJECT_ATTRIBUTES de modo kernel.
+    let object_attributes = unsafe { ObjectAttributes::at(pointer) };
+    if object_attributes.length.get() as u64 != ObjectAttributes::SIZE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let root = object_attributes.root_directory.get();
+    let name_pointer = object_attributes.object_name.get();
+    let flags = object_attributes.attributes.get();
     if name_pointer == 0 {
         return Err(0xC000_0001);
     }
-    let length = guest::read16(name_pointer);
-    let maximum = guest::read16(name_pointer + 2);
-    let buffer = guest::read64(name_pointer + 8);
+    // SAFETY: ObjectName é o PUNICODE_STRING do mesmo chamador.
+    let object_name = unsafe { UnicodeString::at(name_pointer) };
+    let length = object_name.length.get();
+    let maximum = object_name.maximum_length.get();
+    let buffer = object_name.buffer.get();
     if length & 1 != 0 || length > maximum || (buffer == 0 && length != 0) {
         return Err(0xC000_0033);
     }
@@ -213,13 +280,13 @@ pub fn attributes(pointer: u64) -> Result<Captured, u32> {
         return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     let node = object_manager::resolve_from(&full, 0, insensitive, false, object_manager::ROOT).0;
-    Ok(Captured { flags, parent, name: String::from(&full[separator + 1..]), full, insensitive, node, security_descriptor: guest::read64(pointer + 32) })
+    Ok(Captured { flags, parent, name: String::from(&full[separator + 1..]), full, insensitive, node, security_descriptor: object_attributes.security_descriptor.get() })
 }
 
 /// Aloca o corpo de 0x38 bytes, registra o tipo e publica o nome opcional.
 fn allocate_named(captured: Option<&Captured>, multiple: bool, permanent: bool, security: SecurityPolicy) -> Result<u64, KernelError> {
     let type_name = callback_type().name;
-    let pointer = kernel_pool::allocate(0x38, AllocateOptions { tag: OBJECT_POOL_TAG, zero: true, ..AllocateOptions::default() })?;
+    let pointer = kernel_pool::allocate(CallbackObject::SIZE, AllocateOptions { tag: OBJECT_POOL_TAG, zero: true, ..AllocateOptions::default() })?;
     if pointer == 0 {
         return Ok(0);
     }
@@ -237,8 +304,9 @@ fn allocate_named(captured: Option<&Captured>, multiple: bool, permanent: bool, 
             }
         }
     }
-    guest::write32(pointer, OBJECT_POOL_TAG);
-    guest::write8(pointer + 0x20, multiple as u8);
+    let body = object_at(pointer);
+    body.signature.set(OBJECT_POOL_TAG);
+    body.allow_multiple_callbacks.set(multiple as u8);
     {
         let mut state = STATE.lock();
         state.objects.insert(pointer, Item { references: 1, handles: 0, permanent, named: captured.is_some(), node, name, registrations: Vec::new(), multiple, security, dpc_notification: false });
@@ -271,7 +339,7 @@ pub fn create(output: u64, object_attributes: u64, create_new: bool, multiple: b
         let pointer = snapshot.data.map_or(0, |data| data.native_pointer);
         require_live(pointer)?;
         reference(pointer);
-        guest::write64(output, pointer);
+        write_output(output, pointer);
         return Ok(0);
     }
     if !create_new {
@@ -291,7 +359,7 @@ pub fn create(output: u64, object_attributes: u64, create_new: bool, multiple: b
     if !permanent {
         remove_object_name(pointer);
     }
-    guest::write64(output, pointer);
+    write_output(output, pointer);
     Ok(0)
 }
 
@@ -307,7 +375,7 @@ pub fn register(pointer: u64, callback: u64, context: u64) -> Result<u64, Kernel
             return Ok(0);
         }
     }
-    let registration = kernel_pool::allocate(0x30, AllocateOptions { tag: REGISTRATION_POOL_TAG, zero: true, ..AllocateOptions::default() })?;
+    let registration = kernel_pool::allocate(CallbackRegistration::SIZE, AllocateOptions { tag: REGISTRATION_POOL_TAG, zero: true, ..AllocateOptions::default() })?;
     if registration == 0 {
         return Ok(0);
     }
@@ -317,9 +385,10 @@ pub fn register(pointer: u64, callback: u64, context: u64) -> Result<u64, Kernel
     let sequence = state.sequence;
     state.registrations.insert(registration, Registration { item: pointer, callback, context, sequence, active: 0, removing: false });
     state.objects.get_mut(&pointer).unwrap().registrations.push(registration);
-    guest::write64(registration + 0x10, pointer);
-    guest::write64(registration + 0x18, callback);
-    guest::write64(registration + 0x20, context);
+    let record = registration_at(registration);
+    record.callback_object.set(pointer);
+    record.callback_function.set(callback);
+    record.callback_context.set(context);
     synchronize_registration_list(&state, pointer);
     Ok(registration)
 }
@@ -337,7 +406,7 @@ pub fn begin_unregister(registration: u64) -> Result<UnregisterRequest, KernelEr
         return Err(KernelError::new("invalid callback registration removal"));
     };
     record.removing = true;
-    guest::write8(registration + 0x2C, 1);
+    registration_at(registration).unregister_waiting.set(1);
     Ok(UnregisterRequest { registration, done: false })
 }
 
@@ -371,7 +440,7 @@ impl UnregisterRequest {
             if let Some(record) = STATE.lock().registrations.get_mut(&self.registration) {
                 record.removing = false;
             }
-            guest::write8(self.registration + 0x2C, 0);
+            registration_at(self.registration).unregister_waiting.set(0);
             self.done = true;
         }
     }
@@ -457,7 +526,7 @@ impl NotifyRequest {
             found.map(|entry| {
                 let record = state.registrations.get_mut(&entry).unwrap();
                 record.active += 1;
-                guest::write32(entry + 0x28, record.active);
+                registration_at(entry).busy.set(record.active);
                 (entry, record.callback, record.context)
             })
         };
@@ -476,7 +545,7 @@ impl NotifyRequest {
         let mut state = STATE.lock();
         if let Some(record) = state.registrations.get_mut(&entry) {
             record.active -= 1;
-            guest::write32(entry + 0x28, record.active);
+            registration_at(entry).busy.set(record.active);
             self.previous_sequence = record.sequence;
         }
         Ok(())
@@ -486,7 +555,7 @@ impl NotifyRequest {
         if let Some(entry) = self.pending.take() {
             if let Some(record) = STATE.lock().registrations.get_mut(&entry) {
                 record.active -= 1;
-                guest::write32(entry + 0x28, record.active);
+                registration_at(entry).busy.set(record.active);
             }
         }
         self.finish()

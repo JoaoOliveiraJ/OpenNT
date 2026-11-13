@@ -16,9 +16,25 @@ use crate::hal;
 use crate::ntos::mm::kernel_address;
 use crate::ntos::ps::previous_mode;
 use crate::ntos::ps::user::{loader, state, syscall_scan};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
+
+/// Bloco de argumentos brutos de um serviço de usuário: o número, os 14
+/// argumentos, o endereço de retorno e a pilha do chamador.
+#[repr(C)]
+struct RawArguments {
+    service: Field<u64>,
+    arguments: [Field<u64>; 14],
+    return_address: Field<u64>,
+    stack_pointer: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for RawArguments {}
+
+const _: () = assert!(core::mem::size_of::<RawArguments>() == 17 * 8);
 
 /// 8192 identificadores privados para as duas tabelas de 4096 posições.
 pub const PRIVATE_SERVICE_BASE: u64 = 0x4000_0000;
@@ -128,8 +144,11 @@ pub fn copy_arguments(destination: u64, user_rsp: u64, count: u64) -> u32 {
     if user_rsp > i64::MAX as u64 || !state::probe_user_read(first, count * 8) {
         return 0xC000_0005;
     }
+    // A pilha de usuário pode perder o mapeamento entre a sonda e a cópia:
+    // a leitura sondada devolve STATUS_ACCESS_VIOLATION, como o SEH nativo.
     for index in 0..count {
-        guest::write64(destination + (index + 4) * 8, guest::read64(first + index * 8));
+        let Ok(value) = guest::try_read::<u64>(first + index * 8) else { return 0xC000_0005 };
+        guest::write64(destination + (index + 4) * 8, value);
     }
     0
 }
@@ -163,22 +182,24 @@ pub fn dispatch(id: u64, args: &[u64; 14], return_address: u64, frame: u64, cont
         return Ok(0xC000_0002);
     }
     let Some(invoker) = *USER_INVOKER.lock() else { return Ok(0xC000_0002) };
-    let raw = guest::alloc_bytes(17 * 8);
+    let raw = guest::alloc_bytes(RawArguments::SIZE);
     if raw == 0 {
         return Ok(0xC000_009A);
     }
-    guest::write64(raw, id);
-    for (index, &value) in args.iter().enumerate() {
-        guest::write64(raw + (index as u64 + 1) * 8, value);
+    // SAFETY: alocação nova do tamanho do bloco.
+    let block = unsafe { RawArguments::at(raw) };
+    block.service.set(id);
+    for (cell, &value) in block.arguments.iter().zip(args) {
+        cell.set(value);
     }
-    guest::write64(raw + 120, return_address);
-    guest::write64(raw + 128, frame);
+    block.return_address.set(return_address);
+    block.stack_pointer.set(frame);
     // Os quatro registradores voltam com o sinal de 32 bits dos pseudo-handles.
     let values = core::array::from_fn(|index| {
-        let value = guest::read64(raw + (index as u64 + 1) * 8);
+        let value = block.arguments[index].get();
         if value >= 0xFFFF_FFFF_8000_0000 { value as i32 as i64 as u64 } else { value }
     });
-    let stack_pointer = guest::read64(raw + 128);
+    let stack_pointer = block.stack_pointer.get();
     let (previous_raw, previous_stack) = state::with(|state| {
         let saved = (state.service_raw_arguments, state.service_stack);
         state.service_raw_arguments = raw;
@@ -187,7 +208,8 @@ pub fn dispatch(id: u64, args: &[u64; 14], return_address: u64, frame: u64, cont
     });
     // O retorno é o RIP do usuário salvo pela entrada de syscall, quando há.
     let service_frame = crate::hal::amd64::usermode::user_service_frame();
-    let return_address = guest::read64(if service_frame != 0 { service_frame + 8 } else { raw + 120 });
+    // O quadro de serviço guarda o retorno do stub em +8.
+    let return_address = if service_frame != 0 { guest::read64(service_frame + 8) } else { block.return_address.get() };
     let result = invoker(&binding.name, values, return_address, stack_pointer);
     state::with(|state| {
         state.service_raw_arguments = previous_raw;

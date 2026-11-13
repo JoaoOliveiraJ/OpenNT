@@ -7,8 +7,37 @@ use alloc::vec::Vec;
 
 use crate::hal::amd64::service_table as storage;
 use crate::ntos::mm::{kernel_address, paging};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+
+/// KSERVICE_TABLE_DESCRIPTOR (KeServiceDescriptorTable[Shadow]): base da
+/// tabela codificada, contadores, limite e a tabela de bytes de argumentos.
+#[repr(C)]
+struct ServiceDescriptor {
+    /// -> tabela de entradas `(relativo << 4) | argumentos`.
+    base: Field<u64>,
+    count: Field<u64>,
+    /// ULONG Limit (gravado com o preenchimento como 64 bits).
+    limit: Field<u64>,
+    /// -> bytes de argumentos de pilha por serviço.
+    number: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for ServiceDescriptor {}
+
+const _: () = assert!(core::mem::size_of::<ServiceDescriptor>() as u64 == DESCRIPTOR_SIZE);
+
+fn descriptor_at(address: u64) -> &'static ServiceDescriptor {
+    // SAFETY: os descritores são células fixas da imagem do kernel.
+    unsafe { ServiceDescriptor::at(address) }
+}
+
+/// A tabela codificada e a de argumentos de uma entrada da imagem.
+fn tables(table: u64, argument_table: u64, count: usize) -> (&'static [Field<u32>], &'static [Field<u8>]) {
+    // SAFETY: as tabelas da imagem têm CAPACITY entradas.
+    unsafe { (Field::<u32>::array_at(table, count), Field::<u8>::array_at(argument_table, count)) }
+}
 
 /// 4096 entradas por tabela; 32 bytes por descritor.
 pub const CAPACITY: usize = 4096;
@@ -97,18 +126,20 @@ pub fn install(index: usize, targets: &[u64], stack_arguments: &[u32]) -> Result
             _ => return Err(KernelError::new("native service provider must be supervisor executable memory")),
         }
     }
-    for (entry, (&value, &arguments)) in encoded.iter().zip(stack_arguments).enumerate() {
-        guest::write32(table + entry as u64 * 4, value);
-        guest::write8(argument_table + entry as u64, (arguments * 4) as u8);
+    let (entries, argument_bytes) = tables(table, argument_table, encoded.len());
+    for ((entry, bytes), (&value, &arguments)) in entries.iter().zip(argument_bytes).zip(encoded.iter().zip(stack_arguments)) {
+        entry.set(value);
+        bytes.set((arguments * 4) as u8);
     }
-    let descriptors = if index == 0 { alloc::vec![addresses.descriptor, addresses.shadow] } else { alloc::vec![addresses.shadow + 32] };
+    let descriptors = if index == 0 { alloc::vec![addresses.descriptor, addresses.shadow] } else { alloc::vec![addresses.shadow + DESCRIPTOR_SIZE] };
     for &descriptor in &descriptors {
-        guest::write64(descriptor, table);
+        let descriptor = descriptor_at(descriptor);
+        descriptor.base.set(table);
         // Sem o vetor opcional de contadores de profiling.
-        guest::write64(descriptor + 8, 0);
-        guest::write64(descriptor + 24, argument_table);
+        descriptor.count.set(0);
+        descriptor.number.set(argument_table);
         // O limite sai por último, depois dos endereços e metadados.
-        guest::write64(descriptor + 16, targets.len() as u64);
+        descriptor.limit.set(targets.len() as u64);
     }
     let record = Installed { index, limit: targets.len(), table, argument_table, values: encoded, descriptors };
     installed[index] = Some(record.clone());
@@ -119,13 +150,15 @@ pub fn install(index: usize, targets: &[u64], stack_arguments: &[u32]) -> Result
 /// `use_shadow` seleciona os descritores que incluem a tabela gráfica.
 pub fn inspect(service_number: u32, use_shadow: bool) -> Result<(u64, u32), KernelError> {
     let addresses = init()?;
-    let descriptor = if use_shadow { addresses.shadow } else { addresses.descriptor } + ((service_number >> 7) & 32) as u64;
+    let descriptor = descriptor_at(if use_shadow { addresses.shadow } else { addresses.descriptor } + ((service_number >> 7) & 32) as u64);
     let index = service_number & 0xFFF;
-    if index >= guest::read32(descriptor + 16) {
+    if index as u64 >= descriptor.limit.get() & 0xFFFF_FFFF {
         return Ok((0, 0));
     }
-    let table = guest::read64(descriptor);
-    Ok(decode_entry(table, guest::read32(table + index as u64 * 4)))
+    let table = descriptor.base.get();
+    // SAFETY: `index` está abaixo do Limit publicado para esta tabela.
+    let entry = unsafe { Field::<u32>::array_at(table, index as usize + 1) }[index as usize].get();
+    Ok(decode_entry(table, entry))
 }
 
 /// Só para o self-test: desfaz uma publicação para que o boot real ainda
@@ -139,13 +172,15 @@ pub fn self_test_reset(index: usize) -> Result<(), KernelError> {
     let addresses = init()?;
     let Some(record) = INSTALLED.lock()[index.min(1)].take() else { return Ok(()) };
     for &descriptor in &record.descriptors {
-        guest::write64(descriptor + 16, 0);
-        guest::write64(descriptor, 0);
-        guest::write64(descriptor + 24, 0);
+        let descriptor = descriptor_at(descriptor);
+        descriptor.limit.set(0);
+        descriptor.base.set(0);
+        descriptor.number.set(0);
     }
-    for entry in 0..record.limit as u64 {
-        guest::write32(addresses.tables[record.index] + entry * 4, 0);
-        guest::write8(addresses.argument_tables[record.index] + entry, 0);
+    let (entries, argument_bytes) = tables(addresses.tables[record.index], addresses.argument_tables[record.index], record.limit);
+    for (entry, bytes) in entries.iter().zip(argument_bytes) {
+        entry.set(0);
+        bytes.set(0);
     }
     Ok(())
 }
