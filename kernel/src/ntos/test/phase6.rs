@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1540 && abi_names::GROUP_LAYOUT.len() == 266 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1540 exports em 266 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1566 && abi_names::GROUP_LAYOUT.len() == 272 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1566 exports em 272 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1540 && exports::export_names().len() == 1540, "ntoskrnl: 266 grupos com os 1540 exports implementados");
+    assert(exports::implemented() == 1566 && exports::export_names().len() == 1566, "ntoskrnl: 272 grupos com os 1566 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -10063,6 +10063,484 @@ fn hvi_hardware_exports(assert: Assert) {
 }
 
 
+fn ke_processors_exports(assert: Assert) {
+    let native = |pointer: u64| crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer);
+    let online = crate::ntos::ke::smp::online_cpu_count() as u64;
+    let active_mask = if online >= 64 { u64::MAX } else { (1u64 << online) - 1 };
+
+    // KeGetProcessorIndexFromNumber: PROCESSOR_NUMBER { Group, Number, Reserved }.
+    let number_address = guest::alloc_bytes(8);
+    let number = at::<nt::ProcessorNumber>(number_address);
+    let set_number = |group: u16, processor: u8, reserved: u8| {
+        number.group.set(group);
+        number.number.set(processor);
+        number.reserved.set(reserved);
+    };
+    set_number(0, 0, 0);
+    let boot = call_export("KeGetProcessorIndexFromNumber", &[number_address]);
+    set_number(0, 0, 1);
+    let reserved = call_export("KeGetProcessorIndexFromNumber", &[number_address]);
+    set_number(1, 0, 0);
+    let other_group = call_export("KeGetProcessorIndexFromNumber", &[number_address]);
+    set_number(0, online as u8, 0);
+    let beyond = call_export("KeGetProcessorIndexFromNumber", &[number_address]);
+    assert(boot == Some(0) && reserved == Some(0xFFFF_FFFF) && other_group == Some(0xFFFF_FFFF) && beyond == Some(0xFFFF_FFFF), "ke-processors: KeGetProcessorIndexFromNumber valida grupo, numero e reservado");
+
+    // Os registros SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX do buffer.
+    let records = |buffer: u64, used: u64| -> alloc::vec::Vec<&'static nt::SystemLogicalProcessorInformationEx> {
+        let mut found = alloc::vec::Vec::new();
+        let mut offset = 0u64;
+        while offset < used {
+            let record = at::<nt::SystemLogicalProcessorInformationEx>(buffer + offset);
+            let size = record.size.get() as u64;
+            if size == 0 {
+                break;
+            }
+            found.push(record);
+            offset += size;
+        }
+        found
+    };
+
+    // RelationGroup sem buffer: STATUS_INFO_LENGTH_MISMATCH com 0x50 bytes exigidos.
+    let length_address = guest::alloc_bytes(4);
+    let length = at::<nt::Field<u32>>(length_address);
+    length.set(0);
+    let probe = call_export("KeQueryLogicalProcessorRelationship", &[0, 4, 0, length_address]);
+    assert(probe == Some(0xFFFF_FFFF_C000_0004) && length.get() == 0x50, "ke-processors: RelationGroup sem buffer pede 0x50 bytes");
+    let buffer = guest::alloc_bytes(0x2000);
+    length.set(0x2000);
+    let group = call_export("KeQueryLogicalProcessorRelationship", &[0, 4, buffer, length_address]);
+    let record = at::<nt::SystemLogicalProcessorInformationEx>(buffer);
+    let information = &record.group.group_info[0];
+    assert(
+        group == Some(0)
+            && length.get() == 0x50
+            && record.relationship.get() == 4
+            && record.size.get() == 0x50
+            && record.group.maximum_group_count.get() == 1
+            && record.group.active_group_count.get() == 1
+            && information.active_processor_count.get() as u64 == online
+            && information.active_processor_mask.get() == active_mask,
+        "ke-processors: GROUP_RELATIONSHIP com o grupo 0 ativo",
+    );
+
+    // RelationProcessorCore: núcleos disjuntos que cobrem os processadores ativos.
+    length.set(0x2000);
+    let core = call_export("KeQueryLogicalProcessorRelationship", &[0, 0, buffer, length_address]);
+    let core_records = records(buffer, length.get() as u64);
+    let (mut union, mut disjoint) = (0u64, true);
+    for record in &core_records {
+        let mask = record.processor.group_mask[0].mask.get();
+        disjoint &= record.relationship.get() == 0 && record.size.get() == 0x30 && record.processor.group_count.get() == 1 && union & mask == 0;
+        union |= mask;
+    }
+    assert(core == Some(0) && !core_records.is_empty() && disjoint && union == active_mask, "ke-processors: RelationProcessorCore cobre os processadores sem sobreposicao");
+
+    // RelationAll para o processador 0: pacote, núcleo, caches e nó, sem registro de grupo.
+    set_number(0, 0, 0);
+    length.set(0x2000);
+    let all = call_export("KeQueryLogicalProcessorRelationship", &[number_address, 0xFFFF, buffer, length_address]);
+    let all_records = records(buffer, length.get() as u64);
+    let has = |wanted: i32| all_records.iter().any(|record| record.relationship.get() == wanted);
+    let core_has_boot = all_records.iter().any(|record| record.relationship.get() == 0 && record.processor.group_mask[0].mask.get() & 1 == 1);
+    let node_mask = all_records.iter().find(|record| record.relationship.get() == 1).map(|record| record.numa_node.group_mask.mask.get());
+    assert(all == Some(0) && has(3) && core_has_boot && node_mask == Some(active_mask) && !has(4), "ke-processors: RelationAll de um processador sem o registro de grupo");
+
+    // Processador inexistente e relação desconhecida.
+    set_number(0, online as u8, 0);
+    length.set(0x1234);
+    let invalid = call_export("KeQueryLogicalProcessorRelationship", &[number_address, 0xFFFF, buffer, length_address]);
+    assert(invalid == Some(0xFFFF_FFFF_C000_000D) && length.get() == 0x1234, "ke-processors: processador invalido nao toca o Length");
+    length.set(0x2000);
+    let unknown = call_export("KeQueryLogicalProcessorRelationship", &[0, 7, buffer, length_address]);
+    assert(unknown == Some(0xFFFF_FFFF_C000_0001) && length.get() == 0, "ke-processors: relacao sem registros devolve STATUS_UNSUCCESSFUL");
+
+    // KeGetRecommendedSharedDataAlignment = max(64, LineSize dos caches L2+ unificados/de dados).
+    length.set(0x2000);
+    call_export("KeQueryLogicalProcessorRelationship", &[0, 2, buffer, length_address]);
+    let expected = records(buffer, length.get() as u64)
+        .iter()
+        .filter(|record| record.relationship.get() == 2 && record.cache.level.get() >= 2 && matches!(record.cache.type_.get(), 0 | 2))
+        .fold(64u64, |largest, record| largest.max(record.cache.line_size.get() as u64));
+    assert(call_export("KeGetRecommendedSharedDataAlignment", &[]) == Some(expected), "ke-processors: KeGetRecommendedSharedDataAlignment = KeLargestCacheLine");
+
+    // KeQueryTotalCycleTimeThread: monotônico, com carimbo TSC.
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let stamp_address = guest::alloc_bytes(8);
+    let stamp = at::<nt::Field<u64>>(stamp_address);
+    stamp.set(0);
+    let first = call_export("KeQueryTotalCycleTimeThread", &[thread, stamp_address]).unwrap_or(0);
+    let second = call_export("KeQueryTotalCycleTimeThread", &[thread, 0]).unwrap_or(0);
+    assert(second >= first && stamp.get() != 0, "ke-processors: KeQueryTotalCycleTimeThread monotonico com carimbo");
+    assert(matches!(call_export("KeShouldYieldProcessor", &[]), Some(0) | Some(1)), "ke-processors: KeShouldYieldProcessor devolve BOOLEAN");
+
+    // KeInitializeThreadedDpc: DWORD 0x11A (ThreadedDpcObject, Medium, Number 0) e a DPC roda pela fila.
+    extern "win64" fn threaded_routine(_dpc: u64, context: u64, _first: u64, _second: u64) {
+        crate::ntos::mm::guest_memory::atomic_u64(context).fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    let dpc_address = guest::alloc_bytes(0x40);
+    guest::write_bytes(dpc_address, &[0xCC; 0x40]);
+    let counter_address = guest::alloc_bytes(8);
+    let counter = at::<nt::Field<u64>>(counter_address);
+    counter.set(0);
+    let routine = native(threaded_routine as extern "win64" fn(u64, u64, u64, u64) as usize as u64);
+    call_export("KeInitializeThreadedDpc", &[dpc_address, routine, counter_address]);
+    let dpc = at::<nt::Kdpc>(dpc_address);
+    let initialized = dpc.target_info_as_ulong.get() == 0x11A && dpc.processor_history.get() == 0 && dpc.deferred_routine.get() == routine && dpc.deferred_context.get() == counter_address && dpc.dpc_data.get() == 0;
+    let queued = call_export("KeInsertQueueDpc", &[dpc_address, 0, 0]);
+    call_export("KeFlushQueuedDpcs", &[]);
+    assert(initialized && queued == Some(1) && counter.get() == 1, "ke-processors: KeInitializeThreadedDpc (ThreadedDpcObject) executa pela fila");
+
+    // KeRegisterProcessorChangeCallback com ADD_EXISTING: AddStart e AddComplete por processador.
+    // Contexto do teste: contadores por estado (0..2) e a soma dos NtNumber em [3].
+    extern "win64" fn change_callback(context: u64, change: u64, _status: u64) {
+        // SAFETY: o contexto do teste (4 contadores) e o KE_PROCESSOR_CHANGE_NOTIFY_CONTEXT do kernel.
+        let (counters, change) = unsafe { (crate::ntos::inc::types::Field::<u64>::array_at(context, 4), crate::ntos::inc::types::extra_keex::KeProcessorChangeNotifyContext::at(change)) };
+        let state = change.state.get() as usize;
+        counters[state].set(counters[state].get() + 1);
+        counters[3].set(counters[3].get() + change.nt_number.get() as u64);
+    }
+    extern "win64" fn refusing_callback(context: u64, change: u64, status: u64) {
+        // SAFETY: como acima; `status` é o PNTSTATUS OperationStatus do kernel.
+        let (counters, change, status) = unsafe {
+            (crate::ntos::inc::types::Field::<u64>::array_at(context, 4), crate::ntos::inc::types::extra_keex::KeProcessorChangeNotifyContext::at(change), crate::ntos::inc::types::Field::<i32>::at(status))
+        };
+        let state = change.state.get() as usize;
+        counters[state].set(counters[state].get() + 1);
+        status.set(0xC000_0001_u32 as i32);
+    }
+    let block = guest::alloc_bytes(0x20);
+    // SAFETY: os quatro contadores de 64 bits alocados acima.
+    let counters = unsafe { nt::Field::<u64>::array_at(block, 4) };
+    let reset = || counters.iter().for_each(|counter| counter.set(0));
+    reset();
+    let callback = native(change_callback as extern "win64" fn(u64, u64, u64) as usize as u64);
+    let handle = call_export("KeRegisterProcessorChangeCallback", &[callback, block, 1]).unwrap_or(0);
+    assert(
+        handle != 0 && counters[0].get() == online && counters[1].get() == online && counters[2].get() == 0 && counters[3].get() == online * (online - 1),
+        "ke-processors: ADD_EXISTING repete AddStart e AddComplete para cada processador",
+    );
+    call_export("KeDeregisterProcessorChangeCallback", &[handle]);
+    reset();
+    let quiet = call_export("KeRegisterProcessorChangeCallback", &[callback, block, 0]).unwrap_or(0);
+    assert(quiet != 0 && counters[0].get() == 0 && counters[1].get() == 0, "ke-processors: sem ADD_EXISTING nenhuma notificacao");
+    call_export("KeDeregisterProcessorChangeCallback", &[quiet]);
+    reset();
+    let refusing = native(refusing_callback as extern "win64" fn(u64, u64, u64) as usize as u64);
+    let refused = call_export("KeRegisterProcessorChangeCallback", &[refusing, block, 1]);
+    assert(refused == Some(0) && counters[0].get() == 1 && counters[1].get() == 0 && counters[2].get() == 0, "ke-processors: falha no AddStart cancela o registro");
+    for pointer in [number_address, length_address, buffer, stamp_address, dpc_address, counter_address, block] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn ke_kernel_stacks_exports(assert: Assert) {
+    let native = |pointer: u64| crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer);
+    let thread = at::<nt::Kthread>(crate::ntos::ps::process::get_current_thread());
+
+    // KeSetKernelStackSwapEnable: devolve o EnableStackSwap anterior de ThreadFlags.
+    let original = call_export("KeSetKernelStackSwapEnable", &[1]).unwrap_or(2);
+    let enabled = thread.enable_stack_swap() == 1;
+    let previous = call_export("KeSetKernelStackSwapEnable", &[0]);
+    let disabled = thread.enable_stack_swap() == 0;
+    let restored = call_export("KeSetKernelStackSwapEnable", &[original]);
+    assert(original <= 1 && enabled && previous == Some(1) && disabled && restored == Some(0) && thread.enable_stack_swap() as u64 == original, "ke-kernel-stacks: KeSetKernelStackSwapEnable troca EnableStackSwap e devolve o anterior");
+
+    // KeExpandKernelStackAndCallout: callout com CalloutActive, STATUS_SUCCESS;
+    // acima de 0x11800 bytes STATUS_INVALID_PARAMETER_3 sem chamar.
+    extern "win64" fn callout(parameter: u64) {
+        // SAFETY: o bloco do teste (contador, CalloutActive visto) e a KTHREAD corrente.
+        let (cells, thread) = unsafe { (crate::ntos::inc::types::Field::<u64>::array_at(parameter, 2), crate::ntos::inc::types::Kthread::at(crate::ntos::ps::process::get_current_thread())) };
+        cells[0].set(cells[0].get() + 1);
+        cells[1].set(thread.callout_active() as u64);
+    }
+    let routine = native(callout as extern "win64" fn(u64) as usize as u64);
+    let block = guest::alloc_bytes(16);
+    // SAFETY: as duas células alocadas acima.
+    let cells = unsafe { nt::Field::<u64>::array_at(block, 2) };
+    cells.iter().for_each(|cell| cell.set(0));
+    let before = thread.callout_active();
+    let expanded = call_export("KeExpandKernelStackAndCallout", &[routine, block, 0x8000]);
+    let after = thread.callout_active();
+    let refused = call_export("KeExpandKernelStackAndCallout", &[routine, block, 0x11801]);
+    assert(
+        expanded == Some(0) && cells[0].get() == 1 && cells[1].get() == 1 && after == before && refused == Some(0xFFFF_FFFF_C000_00F1) && cells[0].get() == 1,
+        "ke-kernel-stacks: KeExpandKernelStackAndCallout chama com CalloutActive e valida o tamanho",
+    );
+
+    // KeAllocateCalloutStackEx: validação dos parâmetros e o contexto 'Stak'.
+    let output_address = guest::alloc_bytes(8);
+    let output = at::<nt::Field<u64>>(output_address);
+    output.set(0);
+    let bad_type = call_export("KeAllocateCalloutStackEx", &[2, 1, 0, output_address]);
+    let bad_depth = call_export("KeAllocateCalloutStackEx", &[0, 0, 0, output_address]);
+    let bad_reserved = call_export("KeAllocateCalloutStackEx", &[0, 1, 1, output_address]);
+    assert(
+        bad_type == Some(0xFFFF_FFFF_C000_00EF) && bad_depth == Some(0xFFFF_FFFF_C000_00F0) && bad_reserved == Some(0xFFFF_FFFF_C000_00F1) && output.get() == 0,
+        "ke-kernel-stacks: KeAllocateCalloutStackEx recusa tipo, profundidade e reservado",
+    );
+    let allocated = call_export("KeAllocateCalloutStackEx", &[1, 2, 0, output_address]);
+    let context_address = output.get();
+    let context = (context_address != 0).then(|| at::<crate::ntos::ke::callout::CalloutStackContext>(context_address));
+    assert(
+        allocated == Some(0)
+            && context.is_some_and(|context| context.signature.get() == 0x6B61_7453
+            && context.large_stack.get() == 1
+            && context.recursion_depth.get() == 2
+            && context.reserved.get() == 0
+            && context.mutex.header.type_.get() == 2
+            && context.mutex.header.signal_state.get() == 1
+            && context.stacks().len() == 2),
+        "ke-kernel-stacks: contexto 'Stak' com Large, Depth e KMUTEX livre",
+    );
+    call_export("KeFreeCalloutStack", &[context_address]);
+    let simple_address = call_export("KeAllocateCalloutStack", &[0]).unwrap_or(0);
+    let simple = (simple_address != 0).then(|| at::<crate::ntos::ke::callout::CalloutStackContext>(simple_address));
+    assert(simple.is_some_and(|simple| simple.large_stack.get() == 0 && simple.recursion_depth.get() == 1), "ke-kernel-stacks: KeAllocateCalloutStack = Ex(normal, 1)");
+    call_export("KeFreeCalloutStack", &[simple_address]);
+    assert(!crate::ntos::mm::kernel_pool::owns(simple_address) && !crate::ntos::mm::kernel_pool::owns(context_address), "ke-kernel-stacks: KeFreeCalloutStack devolve o bloco ao pool");
+    guest::free_bytes(block);
+    guest::free_bytes(output_address);
+}
+
+
+fn ke_service_tables_exports(assert: Assert) {
+    use crate::ntos::ex::service_table;
+    use crate::ntos::ke::service_tables;
+    let Ok(saved) = service_table::shadow_second_table() else {
+        assert(false, "ke-service-tables: descritores de servico publicados");
+        return;
+    };
+    let fresh = service_table::second_table_bases().is_ok_and(|(normal, shadow)| normal == 0 && shadow == 0);
+
+    // Índices fora de 1..2 são recusados.
+    assert(call_export("KeAddSystemServiceTable", &[0x1000, 0, 4, 0x2000, 0]) == Some(0) && call_export("KeAddSystemServiceTable", &[0x1000, 0, 4, 0x2000, 3]) == Some(0), "ke-service-tables: indice 0 e 3 recusados");
+
+    // Índice 1: num sistema novo Shadow[1] recebe Base/Limit/Number uma única vez.
+    let table = guest::alloc_bytes(16);
+    let arguments = guest::alloc_bytes(4);
+    let first = call_export("KeAddSystemServiceTable", &[table, 0, 4, arguments, 1]);
+    let published = service_table::shadow_second_table().is_ok_and(|fields| fields[0] == table && fields[2] == 4 && fields[3] == arguments);
+    let second = call_export("KeAddSystemServiceTable", &[table, 0, 4, arguments, 1]);
+    if fresh {
+        assert(first == Some(1) && published && second == Some(0), "ke-service-tables: Shadow[1] livre publicado uma unica vez");
+    } else {
+        assert(first == Some(0) && second == Some(0), "ke-service-tables: Shadow[1] ocupado recusa a tabela");
+    }
+
+    // Índice 2: tabela filtro; a remoção pelo processo de sistema (sessão -1) não altera nada.
+    service_tables::self_test_reset();
+    let filter = call_export("KeAddSystemServiceTable", &[table, 0, 4, arguments, 2]);
+    let again = call_export("KeAddSystemServiceTable", &[table, 0, 4, arguments, 2]);
+    let removed = call_export("KeRemoveSystemServiceTable", &[2]);
+    assert(filter == Some(1) && again == Some(0) && removed == Some(1) && service_tables::filter_entry() == [table, 4, arguments], "ke-service-tables: Filter[1] e remocao fora da sessao 0");
+
+    // Estado de boot restaurado.
+    service_tables::self_test_reset();
+    let restored = service_table::restore_shadow_second_table(saved).is_ok();
+    assert(restored, "ke-service-tables: Shadow[1] restaurado");
+    guest::free_bytes(table);
+    guest::free_bytes(arguments);
+
+    // MiCompactServiceTable sobre uma imagem PE mínima com os seis exports
+    // W32p*: as tabelas de RVAs viram `((RVA - (Table - Base)) << 4) | (bytes >> 2)`.
+    // Valores esperados calculados à parte (Python) para estas RVAs/tabelas.
+    let image = guest::alloc_bytes(0x800);
+    guest::write_bytes(image, &[0; 0x800]);
+    let (dos_header, nt_headers) = (at::<nt::ImageDosHeader>(image), at::<nt::ImageNtHeaders64>(image + 0x80));
+    dos_header.e_magic.set(0x5A4D);
+    dos_header.e_lfanew.set(0x80);
+    nt_headers.signature.set(0x0000_4550);
+    nt_headers.optional_header.magic.set(0x20B);
+    nt_headers.optional_header.number_of_rva_and_sizes.set(1);
+    nt_headers.optional_header.data_directory[0].virtual_address.set(0x200);
+    nt_headers.optional_header.data_directory[0].size.set(0x100);
+    let directory = at::<nt::ImageExportDirectory>(image + 0x200);
+    let exports: [(&[u8], u32); 6] = [
+        (b"W32pServiceTable\0", 0x400),
+        (b"W32pServiceLimit\0", 0x420),
+        (b"W32pArgumentTable\0", 0x428),
+        (b"W32pServiceTableFilter\0", 0x440),
+        (b"W32pServiceLimitFilter\0", 0x460),
+        (b"W32pArgumentTableFilter\0", 0x468),
+    ];
+    directory.number_of_functions.set(exports.len() as u32);
+    directory.number_of_names.set(exports.len() as u32);
+    directory.address_of_functions.set(0x240);
+    directory.address_of_names.set(0x260);
+    directory.address_of_name_ordinals.set(0x280);
+    // SAFETY: vetores de exports dentro da imagem de teste.
+    let (functions, names, ordinals) = unsafe { (nt::Field::<u32>::array_at(image + 0x240, 6), nt::Field::<u32>::array_at(image + 0x260, 6), nt::Field::<u16>::array_at(image + 0x280, 6)) };
+    for (index, &(name, rva)) in exports.iter().enumerate() {
+        let name_rva = 0x2A0 + index as u32 * 0x20;
+        guest::write_bytes(image + name_rva as u64, name);
+        functions[index].set(rva);
+        names[index].set(name_rva);
+        ordinals[index].set(index as u16);
+    }
+    let main_rvas = [0x600u32, 0x10, 0x7F0];
+    let main_arguments = [0u8, 8, 0x34];
+    let filter_rvas = [0x500u32, 0x404];
+    let filter_arguments = [4u8, 0];
+    // SAFETY: as tabelas, limites e bytes de argumentos dentro da imagem de teste.
+    let (main_table, filter_table) = unsafe { (nt::Field::<u32>::array_at(image + 0x400, 3), nt::Field::<u32>::array_at(image + 0x440, 2)) };
+    for (entry, &rva) in main_table.iter().zip(&main_rvas) {
+        entry.set(rva);
+    }
+    for (entry, &rva) in filter_table.iter().zip(&filter_rvas) {
+        entry.set(rva);
+    }
+    at::<nt::Field<u32>>(image + 0x420).set(3);
+    at::<nt::Field<u32>>(image + 0x460).set(2);
+    guest::write_bytes(image + 0x428, &main_arguments);
+    guest::write_bytes(image + 0x468, &filter_arguments);
+    let compacted = crate::ntos::mm::sysload::compact_service_tables(image);
+    let main_values: alloc::vec::Vec<u32> = main_table.iter().map(|entry| entry.get()).collect();
+    let filter_values: alloc::vec::Vec<u32> = filter_table.iter().map(|entry| entry.get()).collect();
+    assert(
+        matches!(compacted, Ok(0)) && main_values == [0x2000, 0xFFFF_C102, 0x3F0D] && filter_values == [0xC01, 0xFFFF_FC40],
+        "ke-service-tables: MiCompactServiceTable converte as duas tabelas de RVAs",
+    );
+    let decoded = main_values.iter().zip(main_rvas.iter().zip(&main_arguments)).all(|(&value, (&rva, &bytes))| service_table::decode_entry(image + 0x400, value) == (image + rva as u64, bytes as u32 / 4));
+    assert(decoded, "ke-service-tables: entradas compactadas decodificam como o KiSystemCall64 (nt_service_lookup)");
+    // Sem os exports da tabela filtro: STATUS_PROCEDURE_NOT_FOUND e nada muda.
+    names[3].set(0x2A0 + 7 * 0x20);
+    guest::write_bytes(image + 0x2A0 + 7 * 0x20, b"Outro\0");
+    let missing = crate::ntos::mm::sysload::compact_service_tables(image);
+    assert(matches!(missing, Ok(0xC000_007A)) && main_table[0].get() == 0x2000, "ke-service-tables: export W32p ausente devolve STATUS_PROCEDURE_NOT_FOUND");
+    guest::free_bytes(image);
+}
+
+
+fn ke_queues_exports(assert: Assert) {
+    let online = crate::ntos::ke::smp::online_cpu_count() as u32;
+    let thread = at::<nt::Kthread>(crate::ntos::ps::process::get_current_thread());
+    let queue_address = guest::alloc_bytes(0x40);
+    let other_address = guest::alloc_bytes(0x40);
+    let entries = guest::alloc_bytes(0x60);
+    let (e0, e1, e2, a, b) = (entries, entries + 0x10, entries + 0x20, entries + 0x30, entries + 0x40);
+    let array = guest::alloc_bytes(0x20);
+    let zero_timeout = guest::alloc_bytes(8);
+    at::<nt::Field<i64>>(zero_timeout).set(0);
+    let queue = at::<nt::Kqueue>(queue_address);
+    let other = at::<nt::Kqueue>(other_address);
+    let link = |address: u64| at::<nt::ListEntry>(address);
+
+    // KeInitializeQueue: Type 4, Size 0x10, listas vazias, Maximum = processadores ativos.
+    call_export("KeInitializeQueue", &[queue_address, 0]);
+    assert(
+        queue.header.type_.get() == 4
+            && queue.header.size.get() == 0x10
+            && queue.entry_list_head.flink.get() == queue.entry_list_head.address()
+            && queue.thread_list_head.flink.get() == queue.thread_list_head.address()
+            && queue.maximum_count.get() == online
+            && call_export("KeReadStateQueue", &[queue_address]) == Some(0),
+        "ke-queues: KeInitializeQueue com MaximumCount = processadores ativos",
+    );
+
+    // Inserções devolvem o SignalState anterior; a da cabeça sai primeiro.
+    let inserted = (call_export("KeInsertQueue", &[queue_address, e1]), call_export("KeInsertQueue", &[queue_address, e2]), call_export("KeInsertHeadQueue", &[queue_address, e0]));
+    assert(inserted == (Some(0), Some(1), Some(2)) && call_export("KeReadStateQueue", &[queue_address]) == Some(3), "ke-queues: KeInsertQueue/KeInsertHeadQueue contam as entradas");
+
+    // KeRemoveQueue associa a thread (CurrentCount 1) e zera o Flink da entrada.
+    let first = call_export("KeRemoveQueue", &[queue_address, 0, 0]);
+    assert(first == Some(e0) && link(e0).flink.get() == 0 && thread.queue.get() == queue_address && queue.current_count.get() == 1, "ke-queues: KeRemoveQueue associa a thread e devolve a entrada da cabeca");
+
+    // KeRemoveQueueEx no caminho rápido: duas entradas, CurrentCount mantido.
+    let removed = call_export("KeRemoveQueueEx", &[queue_address, 0, 0, 0, array, 4]);
+    // SAFETY: as quatro posições do vetor alocado acima.
+    let slots = unsafe { nt::Field::<u64>::array_at(array, 4) };
+    assert(removed == Some(2) && slots[0].get() == e1 && slots[1].get() == e2 && call_export("KeReadStateQueue", &[queue_address]) == Some(0) && queue.current_count.get() == 1, "ke-queues: KeRemoveQueueEx retira varias entradas sem mudar a vaga");
+
+    // Fila vazia com prazo zero: STATUS_TIMEOUT como ponteiro, a vaga volta.
+    let timed_out = call_export("KeRemoveQueue", &[queue_address, 0, zero_timeout]);
+    assert(timed_out == Some(0x102) && queue.current_count.get() == 1, "ke-queues: KeRemoveQueue com prazo zero devolve STATUS_TIMEOUT");
+
+    // KeRundownQueue: entradas restantes numa lista circular sem a cabeça.
+    call_export("KeInitializeQueue", &[other_address, 2]);
+    call_export("KeInsertQueue", &[other_address, a]);
+    call_export("KeInsertQueue", &[other_address, b]);
+    let chain = call_export("KeRundownQueue", &[other_address]);
+    assert(
+        chain == Some(a) && link(a).flink.get() == b && link(b).flink.get() == a && link(a).blink.get() == b && call_export("KeReadStateQueue", &[other_address]) == Some(0) && other.entry_list_head.flink.get() == other.entry_list_head.address(),
+        "ke-queues: KeRundownQueue devolve as entradas encadeadas e esvazia a fila",
+    );
+
+    // Rundown da fila associada: desassocia a thread; depois a espera devolve STATUS_ABANDONED.
+    let empty = call_export("KeRundownQueue", &[queue_address]);
+    let disassociated = thread.queue.get() == 0 && queue.current_count.get() == 0 && queue.header.abandoned() == 1;
+    let abandoned = call_export("KeRemoveQueue", &[queue_address, 0, zero_timeout]);
+    assert(empty == Some(0) && disassociated && abandoned == Some(0x80), "ke-queues: fila desmontada desassocia as threads e recusa esperas");
+    // A thread não pode ficar apontando para memória liberada.
+    call_export("KeRundownQueue", &[queue_address]);
+    assert(thread.queue.get() == 0, "ke-queues: thread desassociada antes de liberar a fila");
+    for pointer in [queue_address, other_address, entries, array, zero_timeout] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn ex_resource_priority_exports(assert: Assert) {
+    let thread = at::<nt::Ethread>(crate::ntos::ps::process::get_current_thread());
+    let apc_disable = || thread.tcb.kernel_apc_disable.get();
+    let win32_thread = thread.tcb.win32_thread.get();
+    // ETHREAD.IoBoostCount: PsBoostThreadIoEx conta a região aberta.
+    let io_boost = || thread.io_boost_count.get();
+    let boost_before = io_boost();
+    let eresource = guest::alloc_bytes(nt::Eresource::SIZE);
+    guest::write_bytes(eresource, &alloc::vec![0u8; nt::Eresource::SIZE as usize]);
+    assert(call_export("ExInitializeResourceLite", &[eresource]) == Some(0), "ex-resource-priority: ERESOURCE inicializado");
+
+    // Compartilhado: região crítica (KernelApcDisable - 1), impulso de E/S, posse e Win32Thread.
+    let before = apc_disable();
+    let shared = call_export("ExEnterPriorityRegionAndAcquireResourceShared", &[eresource]);
+    let inside = apc_disable();
+    let boosted = io_boost() == boost_before + 1;
+    let owned_shared = call_export("ExIsResourceAcquiredSharedLite", &[eresource]);
+    call_export("ExReleaseResourceAndLeavePriorityRegion", &[eresource]);
+    assert(
+        shared == Some(win32_thread) && inside == before - 1 && boosted && io_boost() == boost_before && owned_shared == Some(1) && apc_disable() == before && call_export("ExIsResourceAcquiredSharedLite", &[eresource]) == Some(0),
+        "ex-resource-priority: aquisicao compartilhada na regiao critica e liberacao simetrica",
+    );
+
+    // Exclusivo.
+    let exclusive = call_export("ExEnterPriorityRegionAndAcquireResourceExclusive", &[eresource]);
+    let owned_exclusive = call_export("ExIsResourceAcquiredExclusiveLite", &[eresource]);
+    let inside_exclusive = apc_disable();
+    let boosted_exclusive = io_boost() == boost_before + 1;
+    call_export("ExReleaseResourceAndLeavePriorityRegion", &[eresource]);
+    assert(
+        exclusive == Some(win32_thread) && owned_exclusive == Some(1) && inside_exclusive == before - 1 && boosted_exclusive && io_boost() == boost_before && apc_disable() == before && call_export("ExIsResourceAcquiredExclusiveLite", &[eresource]) == Some(0),
+        "ex-resource-priority: aquisicao exclusiva na regiao critica e liberacao simetrica",
+    );
+    call_export("ExDeleteResourceLite", &[eresource]);
+    guest::free_bytes(eresource);
+}
+
+
+fn ex_pool_block_size_exports(assert: Assert) {
+    // NonPagedPoolNx, tag 'Test'. 100 bytes -> 112 (round_up(100, 16)); 0x2000 -> PAGE_SIZE.
+    let tag = 0x7473_6554u64;
+    let small = call_export("ExAllocatePoolWithTag", &[0x200, 100, tag]).unwrap_or(0);
+    let large = call_export("ExAllocatePoolWithTag", &[0x200, 0x2000, tag]).unwrap_or(0);
+    let quota_address = guest::alloc_bytes(8);
+    let quota = at::<nt::Field<u8>>(quota_address);
+    quota.set(0xFF);
+    let small_size = call_export("ExQueryPoolBlockSize", &[small, quota_address]);
+    let small_quota = quota.get();
+    quota.set(0xFF);
+    let large_size = call_export("ExQueryPoolBlockSize", &[large, quota_address]);
+    let large_quota = quota.get();
+    assert(small != 0 && small_size == Some(112) && small_quota == 0, "ex-pool-block-size: bloco pequeno com o tamanho util de 16 em 16 bytes");
+    assert(large != 0 && large_size == Some(0x1000) && large_quota == 0, "ex-pool-block-size: bloco do big pool devolve PAGE_SIZE");
+    call_export("ExFreePoolWithTag", &[small, tag]);
+    call_export("ExFreePoolWithTag", &[large, tag]);
+    guest::free_bytes(quota_address);
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -10232,6 +10710,12 @@ pub fn run(assert: Assert) {
     se_audit_alarms_exports(assert);
     se_set_security_exports(assert);
     hvi_hardware_exports(assert);
+    ke_processors_exports(assert);
+    ke_kernel_stacks_exports(assert);
+    ke_service_tables_exports(assert);
+    ke_queues_exports(assert);
+    ex_resource_priority_exports(assert);
+    ex_pool_block_size_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

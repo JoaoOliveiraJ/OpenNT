@@ -648,3 +648,41 @@ pub fn set_owner_pointer(resource: u64, owner_pointer: u64, flags: u32) -> Resul
     }
     Ok(())
 }
+
+// ---- ERESOURCE com região de prioridade -----------------------------------
+//
+// (append de `ex-resource-priority` ao ex/resource.rs.)
+//
+// No ntoskrnl 19041: ExEnterPriorityRegionAndAcquireResource{Shared,Exclusive}
+// = PsBoostThreadIoEx(thread, FALSE, 0, 0) + KeEnterCriticalRegion +
+// ExAcquireResource{Shared,Exclusive}Lite(Wait=TRUE), devolvendo
+// KTHREAD.Win32Thread; ExReleaseResourceAndLeavePriorityRegion =
+// ExReleaseResourceLite + PsBoostThreadIoEx(thread, TRUE, 0, 0) +
+// KeLeaveCriticalRegionThread. O impulso de E/S é o `ps::io_boost`
+// (ETHREAD.IoBoostCount, o mesmo de PsEnter/LeavePriorityRegion).
+
+/// O ETHREAD corrente, alvo do PsBoostThreadIoEx.
+fn boost_thread() -> Result<&'static crate::ntos::inc::types::Ethread, KernelError> {
+    // SAFETY: Prcb.CurrentThread é o ETHREAD vivo em execução.
+    Ok(unsafe { crate::ntos::inc::types::Ethread::at(current_thread()?) })
+}
+
+/// ExEnterPriorityRegionAndAcquireResourceShared: KTHREAD.Win32Thread.
+pub fn enter_priority_region_shared(resource: u64) -> Result<u64, KernelError> {
+    crate::ntos::ps::io_boost::enter_priority_region(boost_thread()?);
+    enter_shared(resource)
+}
+
+/// ExEnterPriorityRegionAndAcquireResourceExclusive: KTHREAD.Win32Thread.
+pub fn enter_priority_region_exclusive(resource: u64) -> Result<u64, KernelError> {
+    crate::ntos::ps::io_boost::enter_priority_region(boost_thread()?);
+    enter_exclusive(resource)
+}
+
+/// ExReleaseResourceAndLeavePriorityRegion: libera, desfaz o impulso e sai
+/// da região crítica, nessa ordem.
+pub fn release_and_leave_priority_region(resource: u64) -> Result<(), KernelError> {
+    release(resource)?;
+    crate::ntos::ps::io_boost::leave_priority_region(boost_thread()?);
+    critical_region::leave_critical()
+}

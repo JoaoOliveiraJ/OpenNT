@@ -761,3 +761,113 @@ pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
     }
     Ok(())
 }
+
+// ---- MiCompactServiceTable e a carga que estende as tabelas de serviço ------
+//
+// (append de `ke-service-tables` ao mm/sysload.rs. Usa o que o arquivo já
+// importa — `BTreeSet`, `Vec`, `Field`, `NtStruct`, `guest`, `SpinLock`,
+// `KernelError` — e o `load_system_image`/`unload_system_image` acima, sem
+// linhas `use` novas.)
+//
+// No ntoskrnl 19041, NtSetSystemInformation(SystemExtendServiceTableInformation)
+// carrega "\SystemRoot\System32\win32k.sys" com LoadFlags 0x80000005; o bit 4
+// faz o MmLoadSystemImageEx chamar o MiCompactServiceTable depois de
+// relocar/resolver a imagem nova (e antes do DriverEntry). Ele acha os seis
+// exports W32pServiceTable[Filter], W32pServiceLimit[Filter] e
+// W32pArgumentTable[Filter] (faltou um: STATUS_PROCEDURE_NOT_FOUND), torna as
+// duas tabelas graváveis (MiSetImageProtection), converte primeiro a filtro e
+// depois a principal com o KeCompactServiceTable e as devolve a somente
+// leitura. No disco as tabelas guardam RVAs (seção TABLERO, somente leitura,
+// sem relocações); depois disso ficam no formato `(relativo << 4) | args` que
+// o KeAddSystemServiceTable publica. Aqui a reescrita passa pelo alias
+// físico das páginas (o mesmo efeito do RW -> escrita -> RO, sem mexer nas
+// PTEs), e cada imagem é convertida uma única vez.
+
+/// STATUS_PROCEDURE_NOT_FOUND (um dos exports W32p* ausente).
+const SERVICE_TABLE_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
+/// O bit do LoadFlags do MmLoadSystemImageEx que pede a compactação.
+pub const MM_LOAD_IMAGE_EXTENDS_SERVICE_TABLE: u32 = 4;
+/// (tabela, limite, argumentos) na ordem do MiCompactServiceTable: a filtro
+/// primeiro, depois a principal.
+const SERVICE_TABLE_EXPORTS: [(&str, &str, &str); 2] = [
+    ("W32pServiceTableFilter", "W32pServiceLimitFilter", "W32pArgumentTableFilter"),
+    ("W32pServiceTable", "W32pServiceLimit", "W32pArgumentTable"),
+];
+
+/// Bases de imagem cujas tabelas já foram convertidas.
+static COMPACTED_SERVICE_TABLES: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+/// RtlFindExportedRoutineByName com um nome do kernel.
+fn service_table_export(image_base: u64, name: &str) -> u64 {
+    let mut text: Vec<u8> = name.as_bytes().to_vec();
+    text.push(0);
+    let pointer = guest::alloc_bytes(text.len() as u64);
+    if pointer == 0 {
+        return 0;
+    }
+    guest::write_bytes(pointer, &text);
+    let address = crate::ntos::rtl::image::find_exported_routine_by_name(image_base, pointer);
+    guest::free_bytes(pointer);
+    address
+}
+
+/// Grava `values` a partir de `address` pelo alias físico de cada página
+/// (a página da imagem continua somente leitura).
+fn write_read_only_words(address: u64, values: &[u32]) -> Result<(), KernelError> {
+    let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let va = address + offset as u64;
+        let chunk = ((0x1000 - (va & 0xFFF)) as usize).min(bytes.len() - offset);
+        let physical = crate::ntos::mm::paging::translate(va);
+        if physical == 0 {
+            return Err(KernelError::new("MiCompactServiceTable: service table page not resident"));
+        }
+        crate::hal::physical::write_bytes(physical, &bytes[offset..offset + chunk]);
+        offset += chunk;
+    }
+    Ok(())
+}
+
+/// MiCompactServiceTable(imagem): Ok(NTSTATUS).
+pub fn compact_service_tables(image_base: u64) -> Result<u32, KernelError> {
+    let mut tables = Vec::new();
+    for (table, limit, arguments) in SERVICE_TABLE_EXPORTS {
+        let addresses = [service_table_export(image_base, table), service_table_export(image_base, limit), service_table_export(image_base, arguments)];
+        if addresses.contains(&0) {
+            return Ok(SERVICE_TABLE_PROCEDURE_NOT_FOUND);
+        }
+        tables.push(addresses);
+    }
+    for [table, limit, arguments] in tables {
+        // SAFETY: exports da imagem recém-carregada: o ULONG do limite, o
+        // vetor de RVAs e o de bytes de argumentos com `count` entradas.
+        let count = unsafe { Field::<u32>::at(limit) }.get() as usize;
+        let (routines, argument_bytes) = unsafe { (Field::<u32>::array_at(table, count), Field::<u8>::array_at(arguments, count)) };
+        let values = crate::ntos::ke::service_tables::compact_entries(table, image_base, routines, argument_bytes);
+        write_read_only_words(table, &values)?;
+    }
+    Ok(0)
+}
+
+/// MmLoadSystemImageEx(ImageFileName, NULL, NULL, LoadFlags, ...) da
+/// SystemExtendServiceTableInformation: a carga do MmLoadSystemImage (bits 0
+/// e 1) e, com MM_LOAD_IMAGE_EXTENDS_SERVICE_TABLE, a compactação das
+/// tabelas da imagem na primeira carga; falha na compactação descarrega.
+pub fn load_system_image_extending_services(file_name: u64, flags: u32, handle_out: u64, base_out: u64) -> Result<u32, KernelError> {
+    let status = load_system_image(file_name, 0, 0, flags & 3, handle_out, base_out)?;
+    if status & 0x8000_0000 != 0 || flags & MM_LOAD_IMAGE_EXTENDS_SERVICE_TABLE == 0 {
+        return Ok(status);
+    }
+    // SAFETY: as saídas acabaram de ser gravadas pelo MmLoadSystemImage.
+    let (handle, image_base) = unsafe { (Field::<u64>::at(handle_out).get(), Field::<u64>::at(base_out).get()) };
+    if !COMPACTED_SERVICE_TABLES.lock().insert(image_base) {
+        return Ok(status);
+    }
+    let compacted = compact_service_tables(image_base);
+    if !matches!(compacted, Ok(0)) {
+        COMPACTED_SERVICE_TABLES.lock().remove(&image_base);
+        unload_system_image(handle)?;
+    }
+    compacted
+}

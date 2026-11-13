@@ -98,3 +98,42 @@ pub fn free(pointer: u64, tag: u64) -> Result<(), KernelError> {
     }
     Ok(())
 }
+
+// ---- tamanho de um bloco de pool ------------------------------------------
+//
+// (append de `ex-pool-block-size` ao ex/pool_allocation.rs; usa o
+// `kernel_pool` já importado pelo arquivo, sem linhas `use` novas.)
+//
+// ExQueryPoolBlockSize no ntoskrnl 19041 (fora do special pool): bloco
+// alinhado à página (big pool) devolve PAGE_SIZE com QuotaCharged = FALSE;
+// senão o POOL_HEADER em Block-0x10 dá BlockSize*16 - 0x10 (o tamanho útil
+// de 16 em 16 bytes) e QuotaCharged = (ExpGetBilledProcess != NULL). O pool
+// do OpenNT não tem POOL_HEADER: as mesmas grandezas saem do registro da
+// alocação. Pedidos acima de 0xFF0 bytes (o que o NT serve do big pool)
+// devolvem PAGE_SIZE; os menores, round_up(bytes, 16). Blocos fora do
+// `kernel_pool` (arena do convidado) não têm registro: 0 e FALSE.
+
+const POOL_PAGE_SIZE: u64 = 0x1000;
+/// PAGE_SIZE - sizeof(POOL_HEADER): acima disso o NT usa o big pool.
+const SMALL_POOL_LIMIT: u64 = 0xFF0;
+/// Granularidade do POOL_HEADER.BlockSize.
+const POOL_GRANULARITY: u64 = 16;
+
+/// ExQueryPoolBlockSize: (tamanho, QuotaCharged).
+pub fn query_block_size(block: u64) -> (u64, bool) {
+    match kernel_pool::info(block) {
+        Some(info) if info.bytes > SMALL_POOL_LIMIT => (POOL_PAGE_SIZE, false),
+        Some(info) => (info.bytes.max(1).next_multiple_of(POOL_GRANULARITY), info.quota_owner != 0),
+        None => (0, false),
+    }
+}
+
+/// ExQueryPoolBlockSize com a saída do BOOLEAN de cota (o Windows a exige;
+/// NULL aqui só não é gravado).
+pub fn query_block_size_with_quota(block: u64, quota_charged: Option<&crate::ntos::inc::field::Field<u8>>) -> u64 {
+    let (size, charged) = query_block_size(block);
+    if let Some(quota_charged) = quota_charged {
+        quota_charged.set(charged as u8);
+    }
+    size
+}

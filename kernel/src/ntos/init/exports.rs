@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 266] {
+fn groups() -> [&'static Group; 272] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -321,6 +321,12 @@ fn groups() -> [&'static Group; 266] {
         &crate::ntos::se::exports::se_audit_alarms::GROUP,
         &crate::ntos::se::exports::se_set_security::GROUP,
         &crate::hal::exports::hvi_hardware::GROUP,
+        &crate::ntos::ke::exports::ke_processors::GROUP,
+        &crate::ntos::ke::exports::ke_kernel_stacks::GROUP,
+        &crate::ntos::ke::exports::ke_service_tables::GROUP,
+        &crate::ntos::ke::exports::ke_queues::GROUP,
+        &crate::ntos::ex::exports::ex_resource_priority::GROUP,
+        &crate::ntos::ex::exports::ex_pool_block_size::GROUP,
     ]
 }
 

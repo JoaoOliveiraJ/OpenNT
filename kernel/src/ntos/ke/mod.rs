@@ -33,6 +33,9 @@ pub mod xstate;
 pub mod version;
 pub mod exports;
 pub mod services;
+pub mod processor_topology;
+pub mod service_tables;
+pub mod queue;
 
 /// O kernel drena timers, DPCs, work items e IoTimers no laço ocioso, como o
 /// NT ao cair de DISPATCH_LEVEL.

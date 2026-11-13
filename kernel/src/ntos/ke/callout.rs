@@ -111,3 +111,161 @@ pub fn signal_call_dpc_synchronize(barrier: u64) -> bool {
     }
     false
 }
+
+// ---- pilha de kernel: expansão, troca e contextos de pilha de callout -----
+//
+// (append de `ke-kernel-stacks` ao ke/callout.rs. Usa o que o arquivo já
+// importa — `irql`, `native_call`, `Field`, `NtStruct`, `Reserved`, `guest`,
+// `KernelError` — e caminhos completos para o resto, sem linhas `use` novas.)
+//
+// KeExpandKernelStackAndCalloutInternal (Wait=2, Context=NULL): Size acima de
+// MAXIMUM_EXPANSION_SIZE -> STATUS_INVALID_PARAMETER_3; IRQL acima de
+// DISPATCH_LEVEL -> KeBugCheckEx(0xA, 2, irql, 0, 0); quando a pilha corrente
+// basta, o callout roda no lugar com KTHREAD.MiscFlags.CalloutActive ligado
+// e o IRQL tem de voltar igual (senão KeBugCheckEx(0xC8, ...)). A pilha de
+// kernel do OpenNT já cobre o tamanho máximo, então é sempre esse caminho.
+// Não há MmCreateKernelStack: os contextos de KeAllocateCalloutStackEx têm o
+// layout real, mas as entradas de pilha ficam NULL (os callouts usam a pilha
+// corrente, como o KeExpandKernelStackAndCalloutEx acima).
+
+const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+/// MAXIMUM_EXPANSION_SIZE do KiExpandKernelStackAndCalloutSwitchStack.
+const MAXIMUM_EXPANSION_SIZE: u64 = 0x11800;
+/// IRQL_NOT_LESS_OR_EQUAL e IRQL_UNEXPECTED_VALUE.
+const IRQL_NOT_LESS_OR_EQUAL: u32 = 0xA;
+const IRQL_UNEXPECTED_VALUE: u32 = 0xC8;
+/// NonPagedPoolNx e a tag 'KeSc' do KeAllocateCalloutStackEx.
+const CALLOUT_STACK_POOL: u32 = 0x200;
+const CALLOUT_STACK_TAG: u32 = 0x6353_654B;
+/// 'Stak'.
+const CALLOUT_STACK_SIGNATURE: u32 = 0x6B61_7453;
+
+/// Cabeçalho do contexto de pilhas de callout (KeAllocateCalloutStackEx);
+/// os ponteiros de pilha seguem em +0x40, um por nível de recursão. Layout
+/// interno do ntoskrnl (não é do WDK), conferido no binário.
+#[repr(C)]
+pub struct CalloutStackContext {
+    pub signature: Field<u32>,
+    pub large_stack: Field<u8>,
+    pub recursion_depth: Field<u8>,
+    pub reserved: Field<u8>,
+    _pad_7: Reserved<1>,
+    pub mutex: crate::ntos::inc::types::Kmutant,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for CalloutStackContext {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CalloutStackContext>() == 0x40);
+    assert!(core::mem::offset_of!(CalloutStackContext, large_stack) == 0x4);
+    assert!(core::mem::offset_of!(CalloutStackContext, recursion_depth) == 0x5);
+    assert!(core::mem::offset_of!(CalloutStackContext, mutex) == 0x8);
+};
+
+impl CalloutStackContext {
+    /// Os `recursion_depth` ponteiros de pilha depois do cabeçalho.
+    pub fn stacks(&self) -> &'static [Field<u64>] {
+        // SAFETY: o bloco foi alocado com 8 bytes por nível depois do cabeçalho.
+        unsafe { Field::<u64>::array_at(self.address() + Self::SIZE, self.recursion_depth.get() as usize) }
+    }
+}
+
+/// KeExpandKernelStackAndCallout: NTSTATUS.
+pub fn expand_kernel_stack_and_callout_internal(callout: u64, parameter: u64, size: u64) -> u32 {
+    use crate::ntos::ke::bugcheck;
+    if size > MAXIMUM_EXPANSION_SIZE {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+    let level = irql::get_irql();
+    if level > irql::DISPATCH_LEVEL {
+        bugcheck::bug_check_ex(IRQL_NOT_LESS_OR_EQUAL, 2, level as u64, 0, 0);
+    }
+    let address = crate::ntos::ps::process::get_current_thread();
+    // SAFETY: a KTHREAD corrente está viva durante a chamada.
+    let thread = (address != 0).then(|| unsafe { crate::ntos::inc::types::Kthread::at(address) });
+    // CalloutActive já ligado = callout aninhado: quem ligou é quem desliga.
+    let owner = thread.filter(|thread| thread.callout_active() == 0);
+    if let Some(thread) = owner {
+        thread.set_callout_active(1);
+    }
+    native_call::call(callout, &[parameter]);
+    if let Some(thread) = owner {
+        thread.set_callout_active(0);
+    }
+    let after = irql::get_irql();
+    if after != level {
+        bugcheck::bug_check_ex(IRQL_UNEXPECTED_VALUE, (after as u64) << 16 | (level as u64) << 8 | 2, callout, parameter, 0);
+    }
+    0
+}
+
+/// KeSetKernelStackSwapEnable: devolve o EnableStackSwap anterior da thread
+/// corrente; só escreve quando muda (CAS no ThreadFlags, como o `lock bts/btr`).
+pub fn set_kernel_stack_swap_enable(thread: &crate::ntos::inc::types::Kthread, enable: bool) -> bool {
+    let previous = thread.enable_stack_swap() != 0;
+    if previous != enable {
+        thread.set_enable_stack_swap(enable as u32);
+    }
+    previous
+}
+
+/// KeAllocateCalloutStackEx(Type, Depth, Reserved): o contexto ou o NTSTATUS
+/// de falha. Tipo 0/1 (1 = pilha grande), profundidade != 0, reservado 0;
+/// bloco NonPagedPoolNx de 0x40 + 8*Depth com 'Stak', Large, Depth e um
+/// KMUTEX inicializado.
+pub fn allocate_callout_stack_context(kind: u32, depth: u8, reserved: u64) -> Result<Result<&'static CalloutStackContext, u32>, KernelError> {
+    let large = match kind {
+        0 => false,
+        1 => true,
+        _ => return Ok(Err(STATUS_INVALID_PARAMETER_1)),
+    };
+    if depth == 0 {
+        return Ok(Err(STATUS_INVALID_PARAMETER_2));
+    }
+    if reserved != 0 {
+        return Ok(Err(STATUS_INVALID_PARAMETER_3));
+    }
+    let size = CalloutStackContext::SIZE + depth as u64 * 8;
+    let address = crate::ntos::ex::pool_allocation::allocate_tagged(CALLOUT_STACK_POOL, size, CALLOUT_STACK_TAG)?;
+    if address == 0 {
+        return Ok(Err(STATUS_NO_MEMORY));
+    }
+    guest::write_bytes(address, &alloc::vec![0u8; size as usize]);
+    // SAFETY: bloco recém-alocado com o cabeçalho e `depth` ponteiros.
+    let context = unsafe { CalloutStackContext::at(address) };
+    context.signature.set(CALLOUT_STACK_SIGNATURE);
+    context.large_stack.set(large as u8);
+    context.recursion_depth.set(depth);
+    context.reserved.set(0);
+    crate::ntos::ke::dispatcher::initialize_mutex(context.mutex.address(), 0);
+    Ok(Ok(context))
+}
+
+/// KeAllocateCalloutStackEx: grava o contexto na saída; devolve o NTSTATUS.
+pub fn allocate_callout_stack_ex(kind: u32, depth: u8, reserved: u64, context_out: &Field<u64>) -> Result<u32, KernelError> {
+    Ok(match allocate_callout_stack_context(kind, depth, reserved)? {
+        Ok(context) => {
+            context_out.set(context.address());
+            0
+        }
+        Err(status) => status,
+    })
+}
+
+/// KeAllocateCalloutStack(LargeStack) = Ex(Large ? 1 : 0, 1, 0); NULL na falha.
+pub fn allocate_callout_stack(large: bool) -> Result<u64, KernelError> {
+    Ok(allocate_callout_stack_context(large as u32, 1, 0)?.map_or(0, |context| context.address()))
+}
+
+/// KeFreeCalloutStack: as pilhas (NULL no OpenNT) e o bloco voltam ao pool
+/// (ExFreePool).
+pub fn free_callout_stack(context: &CalloutStackContext) -> Result<(), KernelError> {
+    for stack in context.stacks() {
+        stack.set(0);
+    }
+    crate::ntos::ex::pool_allocation::free(context.address(), 0)
+}

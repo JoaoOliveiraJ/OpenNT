@@ -148,3 +148,20 @@ pub fn query_watchdog_information(information: u64) {
     information.dpc_watchdog_count.set(0);
     information.reserved.set(0);
 }
+
+// ---- DPC encadeada ----------------------------------------------------------
+//
+// (append de `ke-processors` ao ke/dpc.rs. Usa o `Kdpc` e o `initialize_dpc`
+// do arquivo, sem linhas `use` novas.)
+
+/// ThreadedDpcObject: o KeInitializeThreadedDpc real grava o DWORD 0x11A
+/// (Type 0x1A, Importance Medium, Number 0).
+const THREADED_DPC_OBJECT: u8 = 0x1A;
+
+/// KeInitializeThreadedDpc: o mesmo KDPC do KeInitializeDpc com Type =
+/// ThreadedDpcObject. A fila do OpenNT a executa em DISPATCH_LEVEL, que é o
+/// que o NT faz com as DPCs encadeadas desligadas.
+pub fn initialize_threaded_dpc(dpc: &Kdpc, routine: u64, context: u64) {
+    initialize_dpc(dpc.address(), routine, context);
+    dpc.type_.set(THREADED_DPC_OBJECT);
+}

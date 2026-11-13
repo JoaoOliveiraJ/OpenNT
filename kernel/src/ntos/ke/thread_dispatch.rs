@@ -477,3 +477,74 @@ pub fn set_io_completion_port(thread: u64, port: Option<u64>) {
 pub fn owner(thread: u64) -> Option<Owner> {
     STATE.lock().owners.get(&thread).copied()
 }
+
+// ---- ciclos de thread e cessão do processador -----------------------------
+//
+// (append de `ke-processors` ao ke/thread_dispatch.rs. Usa o que o arquivo
+// já tem — `pcr`, `cpu`, `processor()`, `kthread()`, `sample_cycles` — sem
+// linhas `use` novas.)
+
+/// DpcTimeCount e DpcWatchdogCount acima disto pesam no KeShouldYieldProcessor.
+const YIELD_WATCHDOG_THRESHOLD: u32 = 7;
+
+/// KeQueryTotalCycleTimeThread: KTHREAD.CycleTime atualizado pelo despacho
+/// (o acúmulo TSC do KiStartThreadCycleAccumulation); o carimbo opcional
+/// recebe o TSC da amostra.
+pub fn query_total_cycle_time(thread: u64, stamp: Option<&crate::ntos::inc::types::Field<u64>>) -> u64 {
+    let cycles = if pcr::get_pcr_address() != 0 { sample_cycles(thread) } else { kthread(thread).cycle_time.get() };
+    if let Some(stamp) = stamp {
+        stamp.set(cpu::rdtsc());
+    }
+    cycles
+}
+
+/// Zera os contadores do watchdog de DPC (sem o perfilador global, que o
+/// OpenNT não tem).
+fn reset_dpc_watchdog(prcb: &Kprcb) {
+    prcb.dpc_watchdog_count.set(0);
+    prcb.dpc_time_count.set(0);
+}
+
+/// KeShouldYieldProcessor: a árvore de decisão do binário sobre a KPRCB.
+/// Fora de DPC: DPC pedida, fim de quantum ou próxima thread escolhida.
+/// Dentro de DPC: só com DpcTimeCount ou DpcWatchdogCount acima de 7. A fila
+/// do `ke::dpc` entra como DpcNormalDpcPresent (ela não publica o bit).
+pub fn should_yield_processor() -> bool {
+    if pcr::get_pcr_address() == 0 {
+        return false;
+    }
+    let prcb = processor();
+    let summary = prcb.dpc_request_summary.get() as u32;
+    let requested = summary & 0x1E != 0 || super::dpc::pending() != 0;
+    let watchdog = prcb.dpc_watchdog_count.get() as u32;
+    let dpc_time = prcb.dpc_time_count.get();
+    let quantum_end = prcb.quantum_end.get() != 0;
+    let current = prcb.current_thread.get();
+    let other_work = || -> bool {
+        if requested {
+            return true;
+        }
+        if prcb.idle_thread.get() == current {
+            reset_dpc_watchdog(prcb);
+            return false;
+        }
+        true
+    };
+    if summary & 1 != 0 {
+        if dpc_time > YIELD_WATCHDOG_THRESHOLD {
+            return quantum_end || other_work();
+        }
+        return watchdog > YIELD_WATCHDOG_THRESHOLD && other_work();
+    }
+    if requested || quantum_end {
+        return true;
+    }
+    let next = prcb.next_thread.get();
+    if next != 0 && next != current {
+        return true;
+    }
+    if watchdog > YIELD_WATCHDOG_THRESHOLD {
+        reset_dpc_watchdog(prcb);
+    }
+    false
+}

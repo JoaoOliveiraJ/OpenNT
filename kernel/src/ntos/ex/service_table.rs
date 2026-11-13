@@ -226,3 +226,51 @@ pub fn self_test_reset() -> Result<(), KernelError> {
     }
     Ok(())
 }
+
+// ---- tabela [1] adicional (KeAddSystemServiceTable/KeRemoveSystemServiceTable)
+//
+// (append de `ke-service-tables` ao ex/service_table.rs. Usa o
+// `ServiceDescriptor`/`descriptor_at`, o `init` e o `DESCRIPTOR_SIZE` do
+// arquivo, sem linhas `use` novas.)
+
+/// Base de KeServiceDescriptorTable[1] e de KeServiceDescriptorTableShadow[1].
+pub fn second_table_bases() -> Result<(u64, u64), KernelError> {
+    let addresses = init()?;
+    Ok((descriptor_at(addresses.descriptor + DESCRIPTOR_SIZE).base.get(), descriptor_at(addresses.shadow + DESCRIPTOR_SIZE).base.get()))
+}
+
+/// Publica Shadow[1] na ordem do KeAddSystemServiceTable: Number, Base e por
+/// último o Limit (ULONG); o Count não é tocado.
+pub fn publish_shadow_second_table(base: u64, limit: u32, number: u64) -> Result<(), KernelError> {
+    let descriptor = descriptor_at(init()?.shadow + DESCRIPTOR_SIZE);
+    descriptor.number.set(number);
+    descriptor.base.set(base);
+    descriptor.limit.set(limit as u64);
+    Ok(())
+}
+
+/// KeRemoveSystemServiceTable(1): Base, Limit e Number de Shadow[1] zerados.
+pub fn clear_shadow_second_table() -> Result<(), KernelError> {
+    let descriptor = descriptor_at(init()?.shadow + DESCRIPTOR_SIZE);
+    descriptor.base.set(0);
+    descriptor.limit.set(0);
+    descriptor.number.set(0);
+    Ok(())
+}
+
+/// Só para o self-test: os quatro campos de Shadow[1] (Base, Count, Limit,
+/// Number), para salvar e restaurar o estado de boot.
+pub fn shadow_second_table() -> Result<[u64; 4], KernelError> {
+    let descriptor = descriptor_at(init()?.shadow + DESCRIPTOR_SIZE);
+    Ok([descriptor.base.get(), descriptor.count.get(), descriptor.limit.get(), descriptor.number.get()])
+}
+
+/// Só para o self-test: restaura os campos salvos por [`shadow_second_table`].
+pub fn restore_shadow_second_table(fields: [u64; 4]) -> Result<(), KernelError> {
+    let descriptor = descriptor_at(init()?.shadow + DESCRIPTOR_SIZE);
+    descriptor.base.set(fields[0]);
+    descriptor.count.set(fields[1]);
+    descriptor.limit.set(fields[2]);
+    descriptor.number.set(fields[3]);
+    Ok(())
+}

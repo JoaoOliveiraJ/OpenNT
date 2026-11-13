@@ -73,6 +73,9 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
 /// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador;
 /// classes desconhecidas = STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
+    if class == SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
+        return extend_service_table(buffer, length).unwrap_or_else(|error| if error.status != 0 { error.status } else { 0xC000_0001 });
+    }
     if class == 131 {
         if (length as u64) < EntropyTimingInformation::SIZE {
             return 0xC000_0004;
@@ -89,4 +92,83 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
     }
     debug_print!("[zw] ZwSetSystemInformation classe {} (sem suporte)", class);
     0xC000_0003
+}
+
+// ---- SystemExtendServiceTableInformation (38): a carga do win32k.sys ------
+//
+// (append de `ke-service-tables` ao ex/system_information.rs. Usa o `Field`,
+// o `NtStruct` e o `guest` já importados pelo arquivo, sem linhas `use` novas.)
+//
+// NtSetSystemInformation(38) no ntoskrnl 19041 (modo kernel): a entrada é uma
+// UNICODE_STRING (Length != 0x10 -> STATUS_INFO_LENGTH_MISMATCH). Para
+// "\SystemRoot\System32\win32k.sys" o LoadFlags é 0x80000005 (sessão +
+// compactação das tabelas de serviço, `mm::sysload`); para outra imagem, só
+// sessão. IMAGE_ALREADY_LOADED_AS_DLL vira IMAGE_ALREADY_LOADED; sem cabeçalho
+// NT, descarrega e devolve INVALID_IMAGE_FORMAT; depois o
+// ExpInitializeSessionDriver chama o ponto de entrada com um DRIVER_OBJECT
+// zerado de 0x150 bytes (só o DriverStart = base) e RegistryPath NULL, e uma
+// falha descarrega a imagem. O MmSessionSetUnloadAddress do sucesso guarda o
+// DriverUnload para o fim da sessão; o OpenNT tem sessão única e não o usa.
+
+/// SYSTEM_INFORMATION_CLASS SystemExtendServiceTableInformation.
+pub const SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION: u32 = 38;
+const EXTEND_SERVICE_TABLE_WIN32K: &str = "\\SystemRoot\\System32\\win32k.sys";
+/// LoadFlags do win32k.sys e das demais imagens.
+const EXTEND_SERVICE_TABLE_WIN32K_FLAGS: u32 = 0x8000_0005;
+const EXTEND_SERVICE_TABLE_SESSION_FLAGS: u32 = 1;
+const EXTEND_STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const EXTEND_STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
+const EXTEND_STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
+const EXTEND_STATUS_IMAGE_ALREADY_LOADED_AS_DLL: u32 = 0xC000_019D;
+
+/// ExpInitializeSessionDriver(EntryPoint, ImageBase): o NTSTATUS do ponto de
+/// entrada.
+fn initialize_session_driver(entry_point: u64, image_base: u64) -> u32 {
+    use crate::ntos::inc::types::DriverObject;
+    let address = guest::alloc_bytes(DriverObject::SIZE);
+    if address == 0 {
+        return crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES;
+    }
+    guest::write_bytes(address, &alloc::vec![0u8; DriverObject::SIZE as usize]);
+    // SAFETY: DRIVER_OBJECT recém-alocado e zerado.
+    unsafe { DriverObject::at(address) }.driver_start.set(image_base);
+    let status = crate::hal::amd64::native_call::call(entry_point, &[address, 0]) as u32;
+    guest::free_bytes(address);
+    status
+}
+
+/// SystemExtendServiceTableInformation: carrega a imagem nomeada pela
+/// UNICODE_STRING em `buffer` (convertendo as tabelas de serviço do
+/// win32k.sys) e chama o ponto de entrada; devolve o NTSTATUS.
+pub fn extend_service_table(buffer: u64, length: u32) -> Result<u32, KernelError> {
+    use crate::ntos::mm::sysload;
+    if length as u64 != crate::ntos::inc::types::UnicodeString::SIZE {
+        return Ok(EXTEND_STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let name = crate::ntos::rtl::guest_strings::read_unicode_string(buffer);
+    let flags = if name == EXTEND_SERVICE_TABLE_WIN32K { EXTEND_SERVICE_TABLE_WIN32K_FLAGS } else { EXTEND_SERVICE_TABLE_SESSION_FLAGS };
+    let outputs = guest::alloc_bytes(16);
+    if outputs == 0 {
+        return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let loaded = sysload::load_system_image_extending_services(buffer, flags, outputs, outputs + 8);
+    // SAFETY: as duas células PVOID alocadas acima.
+    let (handle, image_base) = unsafe { (Field::<u64>::at(outputs).get(), Field::<u64>::at(outputs + 8).get()) };
+    guest::free_bytes(outputs);
+    let status = loaded?;
+    if status & 0x8000_0000 != 0 {
+        return Ok(if status == EXTEND_STATUS_IMAGE_ALREADY_LOADED_AS_DLL { EXTEND_STATUS_IMAGE_ALREADY_LOADED } else { status });
+    }
+    let header = crate::ntos::rtl::image::nt_header(image_base)?;
+    if header == 0 {
+        sysload::unload_system_image(handle)?;
+        return Ok(EXTEND_STATUS_INVALID_IMAGE_FORMAT);
+    }
+    // SAFETY: cabeçalho NT da imagem recém-carregada.
+    let entry_point = image_base + unsafe { crate::ntos::inc::types::ImageNtHeaders64::at(header) }.optional_header.address_of_entry_point.get() as u64;
+    let status = initialize_session_driver(entry_point, image_base);
+    if status & 0x8000_0000 != 0 {
+        sysload::unload_system_image(handle)?;
+    }
+    Ok(status)
 }

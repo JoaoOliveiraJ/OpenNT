@@ -737,3 +737,199 @@ pub mod ke_ex_sync {
 }
 
 // =============================================================================
+
+pub mod ke_processors {
+    //! Processadores, topologia, ciclos e DPCs encadeadas: só adaptadores.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{Field, Kdpc, NtStruct, ProcessorNumber};
+    use crate::ntos::ke::{dpc, processor_group, processor_topology, thread_dispatch};
+    use crate::rtl::KernelError;
+
+    fn get_recommended_shared_data_alignment(_: &Call) -> Result<u64, KernelError> {
+        Ok(processor_topology::recommended_shared_data_alignment()? as u64)
+    }
+    fn get_processor_index_from_number(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PPROCESSOR_NUMBER do driver.
+        Ok(processor_group::processor_index_from_number(unsafe { ProcessorNumber::at(call.arg(1)) }))
+    }
+    fn query_logical_processor_relationship(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PPROCESSOR_NUMBER opcional do driver.
+        let number = (call.arg(1) != 0).then(|| unsafe { ProcessorNumber::at(call.arg(1)) });
+        Ok(signed_status(processor_topology::query_logical_processor_relationship(number, call.arg(2) as u32, call.arg(3), call.arg(4))?))
+    }
+    fn query_total_cycle_time_thread(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG64 CycleTimeStamp opcional do driver.
+        let stamp = (call.arg(2) != 0).then(|| unsafe { Field::<u64>::at(call.arg(2)) });
+        Ok(thread_dispatch::query_total_cycle_time(call.arg(1), stamp))
+    }
+    fn should_yield_processor(_: &Call) -> Result<u64, KernelError> {
+        Ok(thread_dispatch::should_yield_processor() as u64)
+    }
+    fn register_processor_change_callback(call: &Call) -> Result<u64, KernelError> {
+        processor_group::register_processor_change_callback(call.arg(1), call.arg(2), call.arg(3) as u32)
+    }
+    fn deregister_processor_change_callback(call: &Call) -> Result<u64, KernelError> {
+        processor_group::deregister_processor_change_callback(call.arg(1)).map(|()| 0)
+    }
+    fn initialize_threaded_dpc(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PRKDPC do driver.
+        dpc::initialize_threaded_dpc(unsafe { Kdpc::at(call.arg(1)) }, call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-processors",
+        names: &[
+            "KeGetRecommendedSharedDataAlignment",
+            "KeGetProcessorIndexFromNumber",
+            "KeQueryLogicalProcessorRelationship",
+            "KeQueryTotalCycleTimeThread",
+            "KeShouldYieldProcessor",
+            "KeRegisterProcessorChangeCallback",
+            "KeDeregisterProcessorChangeCallback",
+            "KeInitializeThreadedDpc",
+        ],
+        handlers: &[
+            get_recommended_shared_data_alignment,
+            get_processor_index_from_number,
+            query_logical_processor_relationship,
+            query_total_cycle_time_thread,
+            should_yield_processor,
+            register_processor_change_callback,
+            deregister_processor_change_callback,
+            initialize_threaded_dpc,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod ke_kernel_stacks {
+    //! Callouts com pilha expandida e contextos de pilha de callout: só adaptadores.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{Field, Kthread, NtStruct};
+    use crate::ntos::ke::callout::{self, CalloutStackContext};
+    use crate::ntos::ps::process;
+    use crate::rtl::KernelError;
+
+    fn expand_kernel_stack_and_callout(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(callout::expand_kernel_stack_and_callout_internal(call.arg(1), call.arg(2), call.arg(3))))
+    }
+    fn set_kernel_stack_swap_enable(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: a KTHREAD corrente (o export só existe com uma thread corrente).
+        let thread = unsafe { Kthread::at(process::get_current_thread()) };
+        Ok(callout::set_kernel_stack_swap_enable(thread, call.arg(1) & 0xFF != 0) as u64)
+    }
+    fn allocate_callout_stack(call: &Call) -> Result<u64, KernelError> {
+        callout::allocate_callout_stack(call.arg(1) & 0xFF != 0)
+    }
+    fn allocate_callout_stack_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PVOID* Context de saída do driver.
+        let output = unsafe { Field::<u64>::at(call.arg(4)) };
+        Ok(signed_status(callout::allocate_callout_stack_ex(call.arg(1) as u32, call.arg(2) as u8, call.arg(3), output)?))
+    }
+    fn free_callout_stack(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o contexto devolvido por KeAllocateCalloutStack(Ex).
+        callout::free_callout_stack(unsafe { CalloutStackContext::at(call.arg(1)) }).map(|()| 0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-kernel-stacks",
+        names: &[
+            "KeExpandKernelStackAndCallout",
+            "KeSetKernelStackSwapEnable",
+            "KeAllocateCalloutStack",
+            "KeAllocateCalloutStackEx",
+            "KeFreeCalloutStack",
+        ],
+        handlers: &[
+            expand_kernel_stack_and_callout,
+            set_kernel_stack_swap_enable,
+            allocate_callout_stack,
+            allocate_callout_stack_ex,
+            free_callout_stack,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod ke_service_tables {
+    //! Tabelas de serviço adicionais (win32k e filtro): só adaptadores.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::service_tables;
+    use crate::rtl::KernelError;
+
+    /// KeAddSystemServiceTable(Base, Count, Limit, Number, Index).
+    fn add_system_service_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(service_tables::add(call.arg(1), call.arg(3) as u32, call.arg(4), call.arg(5) as u32)? as u64)
+    }
+    fn remove_system_service_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(service_tables::remove(call.arg(1) as u32)? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-service-tables",
+        names: &["KeAddSystemServiceTable", "KeRemoveSystemServiceTable"],
+        handlers: &[add_system_service_table, remove_system_service_table],
+        data_exports: &[],
+    };
+}
+
+pub mod ke_queues {
+    //! Objetos KQUEUE: só adaptadores.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{Kqueue, ListEntry, NtStruct};
+    use crate::ntos::ke::queue;
+    use crate::rtl::KernelError;
+
+    /// O PRKQUEUE do driver.
+    fn kqueue(address: u64) -> &'static Kqueue {
+        // SAFETY: KQUEUE do chamador (memória de driver ou do kernel).
+        unsafe { Kqueue::at(address) }
+    }
+
+    fn initialize_queue(call: &Call) -> Result<u64, KernelError> {
+        queue::initialize(kqueue(call.arg(1)), call.arg(2) as u32);
+        Ok(0)
+    }
+    fn read_state_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(queue::read_state(kqueue(call.arg(1))) as i64 as u64)
+    }
+    fn insert_queue(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PLIST_ENTRY do chamador.
+        Ok(queue::insert_entry(kqueue(call.arg(1)), unsafe { ListEntry::at(call.arg(2)) }, false) as i64 as u64)
+    }
+    fn insert_head_queue(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PLIST_ENTRY do chamador.
+        Ok(queue::insert_entry(kqueue(call.arg(1)), unsafe { ListEntry::at(call.arg(2)) }, true) as i64 as u64)
+    }
+    /// KeRemoveQueue(Queue, WaitMode, Timeout).
+    fn remove_queue(call: &Call) -> Result<u64, KernelError> {
+        queue::remove(kqueue(call.arg(1)), call.arg(3))
+    }
+    /// KeRemoveQueueEx(Queue, WaitMode, Alertable, Timeout, Array, Count).
+    fn remove_queue_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(queue::remove_ex(kqueue(call.arg(1)), call.arg(4), call.arg(5), call.arg(6) as u32)? as u64)
+    }
+    fn rundown_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(queue::rundown(kqueue(call.arg(1))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-queues",
+        names: &[
+            "KeInitializeQueue",
+            "KeReadStateQueue",
+            "KeInsertQueue",
+            "KeInsertHeadQueue",
+            "KeRemoveQueue",
+            "KeRemoveQueueEx",
+            "KeRundownQueue",
+        ],
+        handlers: &[initialize_queue, read_state_queue, insert_queue, insert_head_queue, remove_queue, remove_queue_ex, rundown_queue],
+        data_exports: &[],
+    };
+}

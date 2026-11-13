@@ -1092,3 +1092,58 @@ pub mod ex_cache_aware_push_locks {
         data_exports: &[],
     };
 }
+
+pub mod ex_resource_priority {
+    //! ERESOURCE com região de prioridade: só adaptadores.
+
+    use crate::ntos::ex::resource;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn enter_priority_region_and_acquire_shared(call: &Call) -> Result<u64, KernelError> {
+        resource::enter_priority_region_shared(call.arg(1))
+    }
+    fn enter_priority_region_and_acquire_exclusive(call: &Call) -> Result<u64, KernelError> {
+        resource::enter_priority_region_exclusive(call.arg(1))
+    }
+    fn release_resource_and_leave_priority_region(call: &Call) -> Result<u64, KernelError> {
+        resource::release_and_leave_priority_region(call.arg(1)).map(|()| 0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-resource-priority",
+        names: &[
+            "ExEnterPriorityRegionAndAcquireResourceShared",
+            "ExEnterPriorityRegionAndAcquireResourceExclusive",
+            "ExReleaseResourceAndLeavePriorityRegion",
+        ],
+        handlers: &[
+            enter_priority_region_and_acquire_shared,
+            enter_priority_region_and_acquire_exclusive,
+            release_resource_and_leave_priority_region,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_pool_block_size {
+    //! ExQueryPoolBlockSize: só o adaptador.
+
+    use crate::ntos::ex::pool_allocation;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::rtl::KernelError;
+
+    fn query_pool_block_size(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PBOOLEAN QuotaCharged do driver (NULL tolerado).
+        let quota_charged = (call.arg(2) != 0).then(|| unsafe { Field::<u8>::at(call.arg(2)) });
+        Ok(pool_allocation::query_block_size_with_quota(call.arg(1), quota_charged))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-pool-block-size",
+        names: &["ExQueryPoolBlockSize"],
+        handlers: &[query_pool_block_size],
+        data_exports: &[],
+    };
+}

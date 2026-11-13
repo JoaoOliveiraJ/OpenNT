@@ -160,3 +160,167 @@ pub fn query_node_active_affinity(node: u16, affinity: u64, count: u64) {
 pub fn node_maximum_processor_count(node: u16) -> u64 {
     if node == 0 { smp::discovered_cpu_count() as u64 } else { 0 }
 }
+
+// ---- índice de processador e notificações de troca de processadores -------
+//
+// (append de `ke-processors` ao ke/processor_group.rs. Usa o que o arquivo
+// já importa — `smp`, `guest`, `Field`, `NtStruct`, `ProcessorNumber` — e
+// caminhos completos para o resto, sem linhas `use` novas.)
+
+/// INVALID_PROCESSOR_INDEX.
+const INVALID_PROCESSOR_INDEX: u64 = 0xFFFF_FFFF;
+/// MAXIMUM_PROC_PER_GROUP.
+const MAXIMUM_PROCESSORS_PER_GROUP: u8 = 64;
+/// Objeto aberto pelo KeRegisterProcessorChangeCallback real (criado no
+/// boot por `ex::callbacks::init`).
+const PROCESSOR_ADD_CALLBACK: &str = "\\Callback\\ProcessorAdd";
+/// OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, como no binário.
+const PROCESSOR_ADD_ATTRIBUTES: u32 = 0x240;
+
+/// KeGetProcessorIndexFromNumber: Reserved != 0, grupo >= KiMaximumGroups ou
+/// número >= 64 são inválidos; (0, 0) é o índice 0; senão a
+/// KiProcessorNumberToIndexMappingTable do grupo 0 (número = índice dos
+/// processadores ativos; entrada vazia = inválido).
+pub fn processor_index_from_number(number: &ProcessorNumber) -> u64 {
+    let (group, processor) = (number.group.get(), number.number.get());
+    if number.reserved.get() != 0 {
+        return INVALID_PROCESSOR_INDEX;
+    }
+    if group == 0 && processor == 0 {
+        return 0;
+    }
+    if group as u64 >= group_count() || processor >= MAXIMUM_PROCESSORS_PER_GROUP {
+        return INVALID_PROCESSOR_INDEX;
+    }
+    if (processor as usize) < smp::online_cpu_count() { processor as u64 } else { INVALID_PROCESSOR_INDEX }
+}
+
+/// O OBJECT_ATTRIBUTES + UNICODE_STRING + saída que o binário monta na pilha
+/// para o ExCreateCallback (layout do OpenNT, só dentro deste arquivo).
+#[repr(C)]
+struct CallbackOpenBlock {
+    attributes: crate::ntos::inc::types::ObjectAttributes,
+    name: crate::ntos::inc::types::UnicodeString,
+    callback_object: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for CallbackOpenBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CallbackOpenBlock>() == 0x48);
+    assert!(core::mem::offset_of!(CallbackOpenBlock, name) == 0x30);
+    assert!(core::mem::offset_of!(CallbackOpenBlock, callback_object) == 0x40);
+};
+
+/// Contexto entregue ao callback: o KE_PROCESSOR_CHANGE_NOTIFY_CONTEXT
+/// público, o id do HAL que o binário grava logo depois
+/// (HalGetProcessorIdByNtNumber: o APIC id) e o NTSTATUS de saída do callback
+/// (layout do OpenNT, só dentro deste arquivo).
+#[repr(C)]
+struct ProcessorChangeBlock {
+    context: crate::ntos::inc::types::extra_keex::KeProcessorChangeNotifyContext,
+    hal_processor_id: Field<u32>,
+    _pad_14: crate::ntos::inc::field::Reserved<4>,
+    operation_status: Field<i32>,
+    _pad_1c: crate::ntos::inc::field::Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for ProcessorChangeBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ProcessorChangeBlock>() == 0x20);
+    assert!(core::mem::offset_of!(ProcessorChangeBlock, hal_processor_id) == 0x10);
+    assert!(core::mem::offset_of!(ProcessorChangeBlock, operation_status) == 0x18);
+};
+
+/// ExCreateCallback(\Callback\ProcessorAdd, OBJ 0x240, Create=FALSE,
+/// AllowMultiple=FALSE): o objeto referenciado ou None.
+fn open_processor_add_callback() -> Result<Option<u64>, crate::rtl::KernelError> {
+    let text: alloc::vec::Vec<u16> = PROCESSOR_ADD_CALLBACK.encode_utf16().chain(core::iter::once(0)).collect();
+    let text_bytes: alloc::vec::Vec<u8> = text.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    let size = CallbackOpenBlock::SIZE + text_bytes.len() as u64;
+    let address = guest::alloc_bytes(size);
+    if address == 0 {
+        return Ok(None);
+    }
+    guest::write_bytes(address, &alloc::vec![0u8; CallbackOpenBlock::SIZE as usize]);
+    let buffer = address + CallbackOpenBlock::SIZE;
+    guest::write_bytes(buffer, &text_bytes);
+    // SAFETY: bloco recém-alocado do tamanho do layout.
+    let block = unsafe { CallbackOpenBlock::at(address) };
+    let length = ((text.len() - 1) * 2) as u16;
+    block.name.length.set(length);
+    block.name.maximum_length.set(length + 2);
+    block.name.buffer.set(buffer);
+    block.attributes.length.set(crate::ntos::inc::types::ObjectAttributes::SIZE as u32);
+    block.attributes.object_name.set(block.name.address());
+    block.attributes.attributes.set(PROCESSOR_ADD_ATTRIBUTES);
+    let status = crate::ntos::ex::callbacks::create(block.callback_object.address(), block.attributes.address(), false, false);
+    let object = block.callback_object.get();
+    guest::free_bytes(address);
+    Ok((status? == 0 && object != 0).then_some(object))
+}
+
+/// Preenche o contexto de notificação do processador `index`.
+fn fill_processor_change(block: &ProcessorChangeBlock, state: i32, index: usize, status: i32, apic: &[u32]) {
+    block.context.state.set(state);
+    block.context.nt_number.set(index as u32);
+    block.context.status.set(status);
+    block.context.proc_number.group.set(0);
+    block.context.proc_number.number.set(index as u8);
+    block.context.proc_number.reserved.set(0);
+    block.hal_processor_id.set(apic.get(index).copied().unwrap_or(0));
+}
+
+/// KeRegisterProcessorChangeCallback: registra no \Callback\ProcessorAdd e,
+/// com KE_PROCESSOR_CHANGE_ADD_EXISTING, repete AddStart e depois
+/// AddComplete para cada processador ativo. Um status negativo num AddStart
+/// manda AddFailure aos já notificados, desfaz o registro e devolve NULL.
+pub fn register_processor_change_callback(routine: u64, context: u64, flags: u32) -> Result<u64, crate::rtl::KernelError> {
+    use crate::ntos::ex::callbacks;
+    use crate::ntos::inc::types::extra_keex::{processor_change_state, KE_PROCESSOR_CHANGE_ADD_EXISTING};
+    let Some(object) = open_processor_add_callback()? else { return Ok(0) };
+    let registration = callbacks::register(object, routine, context);
+    callbacks::dereference(object)?;
+    let mut handle = registration?;
+    if handle == 0 || flags & KE_PROCESSOR_CHANGE_ADD_EXISTING == 0 {
+        return Ok(handle);
+    }
+    let apic = super::processor_topology::processor_apic_ids();
+    let address = guest::alloc_bytes(ProcessorChangeBlock::SIZE);
+    if address == 0 {
+        return Ok(handle);
+    }
+    guest::write_bytes(address, &alloc::vec![0u8; ProcessorChangeBlock::SIZE as usize]);
+    // SAFETY: bloco recém-alocado do tamanho do layout.
+    let block = unsafe { ProcessorChangeBlock::at(address) };
+    let arguments = [context, block.context.state.address(), block.operation_status.address()];
+    let (mut notified, mut status, mut state) = (0usize, 0i32, processor_change_state::ADD_COMPLETE_NOTIFY);
+    while notified < apic.len() {
+        fill_processor_change(block, processor_change_state::ADD_START_NOTIFY, notified, 0, &apic);
+        block.operation_status.set(0);
+        crate::hal::amd64::native_call::call(routine, &arguments);
+        status = block.operation_status.get();
+        if status < 0 {
+            state = processor_change_state::ADD_FAILURE_NOTIFY;
+            callbacks::unregister(handle)?;
+            handle = 0;
+            break;
+        }
+        notified += 1;
+    }
+    // AddComplete (ou AddFailure) para os que já receberam AddStart.
+    for index in 0..notified {
+        fill_processor_change(block, state, index, status, &apic);
+        crate::hal::amd64::native_call::call(routine, &arguments);
+    }
+    guest::free_bytes(address);
+    Ok(handle)
+}
+
+/// KeDeregisterProcessorChangeCallback = ExUnregisterCallback.
+pub fn deregister_processor_change_callback(handle: u64) -> Result<(), crate::rtl::KernelError> {
+    crate::ntos::ex::callbacks::unregister(handle).map(|_| ())
+}
