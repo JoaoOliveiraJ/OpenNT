@@ -205,7 +205,7 @@ fn match_expression(expr: &[u16], mut ei: usize, name: &[u16], mut ni: usize, ic
 // unicode_case, NtStruct); Field e KernelError vão por caminho absoluto, sem
 // `use` novo.
 //
-// Transcrição do RtlpIsNameInExpressionPrivate (RVA 0x24f290 no ntoskrnl
+// Conferido contra o RtlpIsNameInExpressionPrivate (RVA 0x24f290 no ntoskrnl
 // 19045), o motor de FsRtlIsNameInExpression (0x24f160) e de
 // FsRtlIsNameInUnUpcasedExpression (0x24f1e0). Autômato não determinístico
 // sobre a expressão: um estado é `offset_em_bytes * 2` (+3 depois de `*` /

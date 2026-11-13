@@ -1,5 +1,5 @@
 //! Marca de despertar dos IRPs de energia e flags de DRIPS dirigido de um
-//! dispositivo (NT: po\pocall.c e po\drips.c).
+//! dispositivo, como no Power Manager do NT.
 //!
 //! ntoskrnl 19041:
 //!   PoSetSystemWake rva 0x5652e0 / PoGetSystemWake rva 0x3a7050: o bloco do

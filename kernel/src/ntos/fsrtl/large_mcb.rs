@@ -1,4 +1,4 @@
-//! LARGE_MCB — fsrtl\largemcb.c: as rotinas FsRtl*LargeMcb* são as do
+//! LARGE_MCB do FsRtl: as rotinas FsRtl*LargeMcb* são as do
 //! BASE_MCB (`fsrtl::mcb`, o motor compartilhado) sob a mutex do LARGE_MCB.
 //!
 //! ntoskrnl 10.0.19045: FsRtlInitializeLargeMcb 0x2f25c0 (FAST_MUTEX do

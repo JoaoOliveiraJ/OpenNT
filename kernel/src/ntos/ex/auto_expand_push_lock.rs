@@ -1,6 +1,6 @@
 //! EX_PUSH_LOCK_AUTO_EXPAND — push lock que o NT pode "abrir em leque" (uma
-//! cópia por processador) quando a contenção compartilhada é alta (NT:
-//! ex\pushlock.c). O contrato com o driver é o do push lock comum sobre
+//! cópia por processador) quando a contenção compartilhada é alta. O
+//! contrato com o driver é o do push lock comum sobre
 //! `LocalLock`, mais o token que a aquisição compartilhada devolve.
 //!
 //! Layout: `_EX_PUSH_LOCK_AUTO_EXPAND` (ntkrnlmp.pdb, 0x10 bytes) é
@@ -8,7 +8,7 @@
 //! (Expanded/Transitioning/Pageable, bits 3.. = tabela em leque) e Stats
 //! (amostras de contenção).
 //!
-//! Transcrito do ntoskrnl 10.0.19045:
+//! Comportamento conferido contra o ntoskrnl 10.0.19045:
 //!   ExInitializeAutoExpandPushLock(L, Flags) 0x2ffb80: zera 16 bytes;
 //!     Flags & 1 (não paginável) -> State = 0, senão State = Pageable (4).
 //!   ExCleanupAutoExpandPushLock(L) 0x2e9ed0: se Expanded, ExSaFree(State & ~7).

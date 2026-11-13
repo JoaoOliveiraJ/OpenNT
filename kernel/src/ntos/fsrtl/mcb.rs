@@ -1,10 +1,10 @@
 //! Mapping Control Block (MCB) — o mapa VBN -> LBN que os file systems
-//! guardam por stream (NT: fsrtl\largemcb.c). Este assunto implementa o
+//! guardam por stream, como no FsRtl do NT. Este assunto implementa o
 //! BASE_MCB sobre a memória do convidado; o LARGE_MCB do NT é só
 //! `{ PKGUARDED_MUTEX GuardedMutex; BASE_MCB BaseMcb; }` (BaseMcb em +8), e as
 //! rotinas *LargeMcb* são estas mesmas sob o mutex.
 //!
-//! Transcrito do ntoskrnl 10.0.19045 e verificado contra o próprio código do
+//! Comportamento do ntoskrnl 10.0.19045, verificado contra o próprio código do
 //! ntoskrnl executado num emulador (as mesmas sequências aleatórias de
 //! operações dão os mesmos retornos, saídas, pares e alocações):
 //!   FsRtlInitializeBaseMcbEx 0x202c10   FsRtlUninitializeBaseMcb 0x2f60c0
@@ -60,7 +60,7 @@ pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
-/// Um par do vetor `Mapping` — o `MAPPING` interno do largemcb.c (não é
+/// Um par do vetor `Mapping` — o `MAPPING` interno do FsRtl do NT (não é
 /// público no WDK; layout lido dos acessos `[Mapping + i*8]` / `+4` do
 /// ntoskrnl): o fim exclusivo do trecho e o seu LBN inicial (ou UNUSED_LBN).
 #[repr(C)]
@@ -152,7 +152,7 @@ fn raise_insufficient_resources() -> Result<bool, KernelError> {
     Err(KernelError::new("RtlRaiseStatus retornou"))
 }
 
-// ---- internas do largemcb.c --------------------------------------------------
+// ---- internas do MCB do FsRtl ------------------------------------------------
 
 /// FsRtlFindLargeIndex: busca binária do par que contém `vbn`. Não
 /// encontrado devolve (false, PairCount).

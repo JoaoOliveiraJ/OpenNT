@@ -1,4 +1,4 @@
-//! Extensões de FILE_OBJECT e de IRP — io\iomgr (IopAllocateFileObjectExtension,
+//! Extensões de FILE_OBJECT e de IRP — I/O Manager (IopAllocateFileObjectExtension,
 //! IopAllocateIrpExtension, IopIrpHasExtensionType...).
 //!
 //! FILE_OBJECT.FileObjectExtension aponta para um IOP_FILE_OBJECT_EXTENSION

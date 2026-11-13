@@ -1,4 +1,4 @@
-//! Fluxos com log e consultas de páginas sujas — o papel do `cache\logsup.c`
+//! Fluxos com log e consultas de páginas sujas — o papel do suporte a log do Cc
 //! do NT (CcSetLogHandleForFile, CcGetDirtyPages, ...), mais as consultas de
 //! sujeira por volume e o callback de erro do Cc.
 //!

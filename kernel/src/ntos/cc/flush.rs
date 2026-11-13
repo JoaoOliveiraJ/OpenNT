@@ -1,5 +1,5 @@
-//! Escrita, flush, purge e zeragem — o papel de `cache\lazyrite.c`,
-//! CcFlushCache/CcPurgeCacheSection/CcZeroData (`fssup.c`) e da escrita de
+//! Escrita, flush, purge e zeragem — o papel do lazy writer do Cache Manager,
+//! de CcFlushCache/CcPurgeCacheSection/CcZeroData e da escrita de
 //! seção que o Mm faz por baixo no NT.
 //!
 //! [`write_range`] grava as páginas sujas por corridas contíguas dentro de

@@ -1,6 +1,6 @@
 //! Suporte de volume do FsRtl — estado de inicialização dos volumes,
 //! desmontagem, contadores de disco por processador e o despacho de
-//! "stack overflow" dos file systems (fsrtl\stackovf.c e afins).
+//! "stack overflow" dos file systems.
 //!
 //! ntoskrnl 10.0.19045:
 //!   FsRtlAreVolumeStartupApplicationsComplete 0x62e030: lê o byte

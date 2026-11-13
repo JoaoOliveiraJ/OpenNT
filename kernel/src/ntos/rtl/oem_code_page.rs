@@ -1,4 +1,4 @@
-//! Página OEM e strings OEM do Rtl — rtl\nls.c (RtlOemToUnicodeN,
+//! Página OEM e strings OEM do Rtl (RtlOemToUnicodeN,
 //! RtlOemStringTo[Counted]UnicodeString, RtlUnicodeStringTo[Counted]OemString,
 //! RtlUpcaseUnicodeStringToCountedOemString, RtlxOemStringToUnicodeSize,
 //! RtlUpperString) e os dados NlsMbOemCodePageTag / NlsOemLeadByteInfo.

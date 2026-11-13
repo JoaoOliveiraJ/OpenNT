@@ -30,7 +30,7 @@ use super::*;
 // ---- main ----
 
 /// `_BASE_MCB` (ntifs.h): o mapa VBN -> LBN dos file systems
-/// (FsRtl*BaseMcb*). `Mapping` aponta para os pares internos do largemcb.c
+/// (FsRtl*BaseMcb*). `Mapping` aponta para os pares internos do FsRtl
 /// (8 bytes cada; ver `fsrtl::mcb`). O `_LARGE_MCB` público é
 /// `{ PKGUARDED_MUTEX GuardedMutex; BASE_MCB BaseMcb; }`.
 #[repr(C)]
@@ -40,7 +40,7 @@ pub struct BaseMcb {
     pub pool_type: Field<u16>,
     pub flags: Field<u16>,
     _pad_c: Reserved<0x4>,
-    /// -> `MAPPING[MaximumPairCount]` (interno do largemcb.c)
+    /// -> `MAPPING[MaximumPairCount]` (interno do FsRtl)
     pub mapping: Field<u64>,
 }
 

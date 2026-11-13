@@ -1,4 +1,4 @@
-//! Suporte do I/O Manager a file systems — io\iomgr (iosubs.c/internal.c):
+//! Suporte do I/O Manager a file systems:
 //! banco de file systems registrados (filas disco/CD-ROM/fita/rede),
 //! notificações de registro (filtros legados e o fltmgr), verificação de
 //! volume, stream file objects, cancelamento de abertura e o nome do

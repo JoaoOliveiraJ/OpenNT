@@ -1,4 +1,4 @@
-//! MDLs sobre as páginas do cache — o papel do `cache\mdlsup.c` do NT.
+//! MDLs sobre as páginas do cache, como no Cache Manager do NT.
 //!
 //! CcMdlRead/CcPrepareMdlWrite preparam o intervalo (leitura, ou
 //! sobrescrita: páginas parciais lidas) e devolvem uma cadeia de MDLs, uma por

@@ -1,9 +1,9 @@
 //! Manutenção do descritor de segurança de um objeto já criado: troca de
 //! componentes (SeSetSecurityDescriptorInfoEx = RtlpSetSecurityObject),
 //! cálculo de herança automática e as verificações auxiliares que os FS
-//! chamam ao mudar a segurança (NT: `se\semethod.c`, `rtl\sertl.c`).
+//! chamam ao mudar a segurança (como no Se e no Rtl do NT).
 //!
-//! Transcrito do ntoskrnl 19041 (RtlpSetSecurityObject rva 0x6d70a0):
+//! Conferido contra o ntoskrnl 19041 (RtlpSetSecurityObject rva 0x6d70a0):
 //! - `*ObjectsSecurityDescriptor` NULL -> STATUS_NO_SECURITY_ON_OBJECT; o
 //!   atual precisa ser self-relative (STATUS_BAD_DESCRIPTOR_FORMAT).
 //! - Owner/Group vêm da modificação quando selecionados, senão do atual;

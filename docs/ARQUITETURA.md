@@ -76,17 +76,17 @@ implementa.
 ### 3.1 Onde mora o código de um export
 
 No NT, uma rotina exportada é uma função comum, implementada no arquivo do
-assunto dentro do componente: os byte-range locks em `fsrtl\filelock.c`, as
-MDLs em `mm\iosup.c`, o access check em `se\accchk.c`, as leituras do cache em
-`cache\copysup.c`. Exportar é só pôr o nome na lista do `ntoskrnl.src`. Não
-existe um "arquivo de exports" onde a lógica mora. O OpenNT segue o mesmo
-modelo, em três camadas:
+assunto dentro do componente: os byte-range locks ficam no arquivo de file
+locks do FsRtl, as MDLs no de MDLs do Mm, o access check no de access check
+do Se, as leituras do cache no de cópias do Cache Manager. Exportar é só pôr
+o nome na lista de exports do kernel. Não existe um "arquivo de exports" onde
+a lógica mora. O OpenNT segue o mesmo modelo, em três camadas:
 
 | Camada | Onde | O que contém |
 | --- | --- | --- |
 | **Lógica** | `ntos/<componente>/<assunto>.rs` (ou uma subpasta do assunto) | a implementação: estruturas, estado, tabelas, algoritmos, validação, em funções Rust com tipos de verdade |
 | **Adaptador** | `ntos/<componente>/exports.rs` | um `pub mod <grupo>` por grupo, com um handler curto por export e a `Group` |
-| **Tabela** | `ntos/init/export_names.rs` e `ntos/init/exports.rs` | os nomes na ordem fixa dos ids e a lista de grupos (o papel do `ntoskrnl.src`) |
+| **Tabela** | `ntos/init/export_names.rs` e `ntos/init/exports.rs` | os nomes na ordem fixa dos ids e a lista de grupos (o papel da lista de exports do kernel no NT) |
 
 Regras:
 

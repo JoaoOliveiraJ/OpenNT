@@ -1,4 +1,4 @@
-//! Prioridade de I/O — io\iomgr (IoRetrievePriorityInfo, IoApplyPriorityInfoThread,
+//! Prioridade de I/O — I/O Manager (IoRetrievePriorityInfo, IoApplyPriorityInfoThread,
 //! IoSetIoPriorityHintIntoThread) e o par Ps que elas usam
 //! (PsSetIoPriorityThread 0x277970, PsSetPagePriorityThread 0x277c64,
 //! PsGetIoPriorityThread 0x242180).

@@ -1,4 +1,4 @@
-//! Configuração do Mm publicada aos drivers (o `mminit.c` do NT):
+//! Configuração do Mm publicada aos drivers, como no NT:
 //! MmQuerySystemSize, MmIsThisAnNtAsSystem e os dados MmSystemRangeStart e
 //! MmBadPointer.
 //!

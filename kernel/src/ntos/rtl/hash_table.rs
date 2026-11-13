@@ -4,7 +4,7 @@
 //! Rtl{Expand,Contract}HashTable. A pilha de rede real (ndis.sys, tcpip.sys)
 //! guarda conexões e vizinhos nelas.
 //!
-//! Transcrição do ntoskrnl: diretório de dois níveis (até 16 diretórios
+//! Comportamento do ntoskrnl: diretório de dois níveis (até 16 diretórios
 //! secundários de `128 << i` cabeças LIST_ENTRY; com TableSize <= 128 o
 //! Directory aponta direto para as cabeças), espalhamento linear
 //! (Pivot/DivisorMask), cadeias ordenadas por Signature crescente e

@@ -1,8 +1,8 @@
 //! Eventos nomeados do I/O Manager (IoCreateNotificationEvent /
-//! IoCreateSynchronizationEvent) — o assunto do `io\iosubs.c` do NT para
+//! IoCreateSynchronizationEvent) — as rotinas do I/O Manager do NT para
 //! eventos compartilhados entre drivers.
 //!
-//! Transcrição do ntoskrnl 19041 (IoCreateNotificationEvent rva 0x78d410,
+//! Conferido contra o ntoskrnl 19041 (IoCreateNotificationEvent rva 0x78d410,
 //! IoCreateSynchronizationEvent rva 0x893980): ZwCreateEvent(&Handle,
 //! EVENT_ALL_ACCESS (0x1F0003), OBJECT_ATTRIBUTES { ObjectName = EventName,
 //! Attributes = OBJ_OPENIF|OBJ_KERNEL_HANDLE (0x280) }, NotificationEvent (0) /

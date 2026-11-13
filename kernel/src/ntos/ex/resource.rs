@@ -563,9 +563,9 @@ pub fn exclusive_waiters(resource: u64) -> u32 {
     resource_at(resource).number_of_exclusive_waiters.get()
 }
 
-// ---- Transferência de posse: ExSetResourceOwnerPointer(Ex) (ex\resource.c) ----
+// ---- Transferência de posse: ExSetResourceOwnerPointer(Ex) --------------------
 //
-// Transcrito do ntoskrnl 10.0.19045:
+// Comportamento conferido contra o ntoskrnl 10.0.19045:
 //   ExSetResourceOwnerPointerEx(R, P, F) 0x2dcac0 / ExSetResourceOwnerPointer(R, P)
 //   0x5b53e0 (= ...Ex com F = 0): ReservedLowFlags bit 0 (recurso "fast") ->
 //   KeBugCheckEx(0x1C6, 0xE, R, 0, 0); senão ExpSetResourceOwnerPointerEx 0x2dcae0,

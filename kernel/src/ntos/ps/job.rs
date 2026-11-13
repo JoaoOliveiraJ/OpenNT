@@ -1,6 +1,6 @@
-//! Acessores do objeto job (EJOB), como a parte de consulta do `ps\psjob.c`
+//! Acessores do objeto job (EJOB), como a parte de consulta dos jobs do Ps
 //! do NT: lock, classe de restrições de UI, sessão e job raiz comum a dois
-//! processos. Transcrito do ntoskrnl 19041 (PsGetJobLock 0x32cf40,
+//! processos. Conferido contra o ntoskrnl 19041 (PsGetJobLock 0x32cf40,
 //! PsGetJobUIRestrictionsClass 0x329c10, PsGetJobSessionId 0x2017c0,
 //! PsGetProcessCommonJob 0x36c530).
 //!

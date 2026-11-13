@@ -101,8 +101,8 @@ pub fn release_object_security(sd: u64, allocated: bool) {
     }
 }
 
-// ---- Cache de descritores de segurança (o `obsdata.c` do NT) ---------------
-// ObsSecurityDescriptorCache, transcrito do ntoskrnl 19041:
+// ---- Cache de descritores de segurança (como no NT) ------------------------
+// ObsSecurityDescriptorCache, conferido contra o ntoskrnl 19041:
 // ObLogSecurityDescriptor 0x6d8b90, ObpCreateCacheEntry 0x6d8e84,
 // ObReferenceSecurityDescriptor 0x697550, ObDereferenceSecurityDescriptor
 // 0x6d8380. Cada entrada é um bloco do convidado com o cabeçalho

@@ -1,4 +1,4 @@
-//! Compressão do Rtl, como o `rtl\compress.c` do NT: RtlGetCompressionWorkSpaceSize,
+//! Compressão do Rtl, como no NT: RtlGetCompressionWorkSpaceSize,
 //! RtlCompressBuffer, RtlDecompressBufferEx2 e RtlDecompressFragmentEx.
 //!
 //! Contrato (ntoskrnl 10.0.19045): o formato é o byte baixo de

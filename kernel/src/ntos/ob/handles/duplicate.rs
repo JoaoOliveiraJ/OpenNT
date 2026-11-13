@@ -1,4 +1,4 @@
-//! NtDuplicateObject de modo kernel (ZwDuplicateObject) — NT: ob\obhandle.c
+//! NtDuplicateObject de modo kernel (ZwDuplicateObject) — como no Ob do NT
 //! (NtDuplicateObject -> ObDuplicateObject).
 //!
 //! Semântica do NT para PreviousMode = KernelMode:

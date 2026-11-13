@@ -1,6 +1,6 @@
 //! ACCESS_STATE + AUX_ACCESS_DATA: criação a partir do contexto do sujeito e
 //! liberação, como o par SeCreateAccessState/SeDeleteAccessState do NT.
-//! Transcrito do ntoskrnl 19041: SeCreateAccessState 0x6da590,
+//! Conferido contra o ntoskrnl 19041: SeCreateAccessState 0x6da590,
 //! SeCreateAccessStateEx 0x6da5e0, SepCreateAccessStateFromSubjectContext
 //! 0x345810, SeDeleteAccessState 0x5dc900 / SepDeleteAccessState 0x345670.
 //!

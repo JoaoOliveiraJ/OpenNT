@@ -1,4 +1,4 @@
-//! Notificação de mudança de diretório — fsrtl\notify.c.
+//! Notificação de mudança de diretório do FsRtl.
 //!
 //! ntoskrnl 10.0.19045: FsRtlNotifyInitializeSync 0x675fa0 (REAL_NOTIFY_SYNC de
 //! 0x48 bytes 'FSrN': FAST_MUTEX, OwningThread, OwnerCount),

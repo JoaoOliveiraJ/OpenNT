@@ -77,9 +77,9 @@ pub fn open_device_registry_key(device: u64, output: u64) -> Result<u64, KernelE
 //
 // Propriedades unificadas de dispositivo e de interface (DEVPROPKEY), o
 // armazenamento que o PnP mantém por devnode e por interface (NT:
-// io\pnpmgr\pnpprop.c sobre o PiPnpRtl*ObjectProperty).
+// PnP Manager, sobre o PiPnpRtl*ObjectProperty).
 //
-// Transcrição do ntoskrnl 19041:
+// Comportamento conferido contra o ntoskrnl 19041:
 //   IoSetDevicePropertyData rva 0x743140 -> PnpSetDevicePropertyData 0x742f9c
 //     PDO NULL ou sem devnode: KeBugCheckEx(PNP_DETECTED_FATAL_ERROR 0xCA, 2, ...);
 //     devnode sem instância: STATUS_INVALID_DEVICE_REQUEST; Lcid != 0 passa por

@@ -1,4 +1,4 @@
-//! Tunneling de nomes — fsrtl\tunnel.c (FsRtl*TunnelCache*[Ex]).
+//! Tunneling de nomes do FsRtl (FsRtl*TunnelCache*[Ex]).
 //!
 //! Motor compartilhado: as rotinas Ex (grupo "fsrtl-tunnel", ntfs.sys) e as
 //! clássicas (grupo "fsrtl-tunnel-cache": Initialize/Add/Find/DeleteKey/Delete,

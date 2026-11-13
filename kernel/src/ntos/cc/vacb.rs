@@ -1,4 +1,4 @@
-//! Vistas do cache (VACBs) — o papel do `cache\vacbsup.c` do NT.
+//! Vistas do cache (VACBs), como no Cache Manager do NT.
 //!
 //! Cada vista cobre VACB_MAPPING_GRANULARITY (256 KB) alinhados do arquivo e
 //! é memória de sistema contínua com PFNs independentes

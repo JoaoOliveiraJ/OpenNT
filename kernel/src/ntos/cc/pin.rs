@@ -1,4 +1,4 @@
-//! Mapear e fixar dados do cache — o papel do `cache\pinsup.c` do NT.
+//! Mapear e fixar dados do cache, como no Cache Manager do NT.
 //!
 //! CcMapData devolve `vacb | 1` (só uma referência de vista, como o NT);
 //! CcPinRead/CcPreparePinWrite/CcPinMappedData devolvem um BCB nativo

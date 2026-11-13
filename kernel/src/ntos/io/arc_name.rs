@@ -1,5 +1,5 @@
-//! Nomes ARC e informação do disco de boot (NT: io\iomgr\arcsec.c e
-//! io\iomgr\ioinit.c).
+//! Nomes ARC e informação do disco de boot (NT: I/O Manager, fase de
+//! inicialização).
 //!
 //! No NT as duas rotinas partem do ARC_DISK_INFORMATION que o winload deixa
 //! no LOADER_PARAMETER_BLOCK (KeLoaderBlock->ArcDiskInformation, +0xE8) e da
@@ -7,7 +7,7 @@
 //! do NT: a lista de assinaturas de disco do loader é vazia. As rotinas
 //! seguem o NT com essa lista vazia.
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoCreateArcName               rva 0x780120 -> IopCreateArcName(Device, -1) 0x780138
 //!     IOCTL_STORAGE_GET_DEVICE_NUMBER (0x2D1080, saída 0xC),
 //!     IOCTL_DISK_GET_DRIVE_GEOMETRY (0x70000, saída 0x18) e

@@ -1,5 +1,5 @@
 //! Cópias entre o cache e o buffer do chamador e o controle de escrita —
-//! o papel do `cache\copysup.c` do NT (CcCopyRead/CcFastCopyRead,
+//! o papel das cópias do Cache Manager do NT (CcCopyRead/CcFastCopyRead,
 //! CcCopyWrite/CcFastCopyWrite, CcCanIWrite, CcDeferWrite).
 //!
 //! Leitura: as páginas ausentes vêm do arquivo por paginação e os bytes são

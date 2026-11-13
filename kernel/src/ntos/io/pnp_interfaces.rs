@@ -1,7 +1,7 @@
 //! Consultas de interfaces do PnP — lista de interfaces de dispositivo de uma
 //! classe e interface de IOMMU da HAL.
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoGetDeviceInterfaces  rva 0x69c660 -> IopGetDeviceInterfaces 0x6b32e8
 //!     MULTI_SZ em PagedPool com tag 'Pp  ' (0x20207050); classe sem interfaces
 //!     devolve um único L'\0' (2 bytes) com STATUS_SUCCESS (0x6b36b3); só

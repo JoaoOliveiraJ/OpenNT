@@ -411,9 +411,9 @@ pub fn find_clear_bits_and_set_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx,
 // ---- Faixas e runs livres (RtlNumberOf{Set,Clear}BitsInRange, RtlExtractBitMap,
 // RtlFindClearRuns) ------------------------------------------------------------
 //
-// Transcritos do ntoskrnl 19045 (RtlNumberOfSetBitsInRange 0x587f90,
+// Comportamento do ntoskrnl 19045 (RtlNumberOfSetBitsInRange 0x587f90,
 // RtlNumberOfClearBitsInRange 0x587dc0, RtlExtractBitMap 0x586ce0,
-// RtlFindClearRuns 0x363fe0) e conferidos contra o mesmo código do ntdll.dll
+// RtlFindClearRuns 0x363fe0), conferido contra o mesmo código do ntdll.dll
 // em milhares de bitmaps aleatórios. Os originais varrem bytes com tabelas
 // (bits livres baixos/altos, maior run livre de um byte); aqui as mesmas
 // grandezas são calculadas sobre o armazenamento copiado em bloco.

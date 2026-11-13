@@ -1,8 +1,8 @@
-//! Envio e conclusão de pedidos de IRP — o assunto do `io\iosubs.c` do NT
+//! Envio e conclusão de pedidos de IRP — as rotinas do I/O Manager do NT
 //! para envio síncrono, construção assíncrona, alocação com extensão,
 //! conclusão unload-safe e consultas do solicitante.
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoSynchronousCallDriver        rva 0x318390  (KEVENT de pilha + CmpCompleteFlushAndPurgeIrp)
 //!   IoForwardIrpSynchronously      rva 0x689b00
 //!   IoBuildAsynchronousFsdRequest  rva 0x358db0 -> IopBuildAsynchronousFsdRequest 0x358df0

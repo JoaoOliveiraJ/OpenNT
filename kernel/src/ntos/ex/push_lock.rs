@@ -345,7 +345,7 @@ pub fn try_shared(pointer: u64, flags: u32) -> Result<bool, KernelError> {
     Ok(try_acquire(word(pointer), true))
 }
 
-// ---- EX_PUSH_LOCK_CACHE_AWARE (ex\pushlock.c) ----------------------------------
+// ---- EX_PUSH_LOCK_CACHE_AWARE --------------------------------------------------
 //
 // Derivado do ntoskrnl 10.0.19045:
 //   ExAllocateCacheAwarePushLock(Flags)        RVA 0x3c8090

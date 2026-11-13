@@ -1,4 +1,4 @@
-//! Callbacks de coalescência de I/O do Power Manager (NT: po\coalesc.c).
+//! Callbacks de coalescência de I/O do Power Manager.
 //!
 //! PoRegisterCoalescingCallback (ntoskrnl 19041 rva 0x7998d0)
 //!   (Callback, ClientOnly, Handle*, Context): registro de 0x48 bytes em

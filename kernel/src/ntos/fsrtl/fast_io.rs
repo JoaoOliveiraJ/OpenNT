@@ -1,4 +1,4 @@
-//! Suporte de Fast I/O do FsRtl — o assunto do `fsrtl\fastio.c` do NT.
+//! Suporte de Fast I/O do FsRtl, como no NT.
 //!
 //! * Contadores de leitura rápida do Cache Manager: campos da KPRCB
 //!   (`CcFastReadNoWait`, `CcFastReadWait`, `CcFastReadNotPossible`,

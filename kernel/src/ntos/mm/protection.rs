@@ -1,5 +1,5 @@
 //! Conversão de proteção Win32 (PAGE_*) para a máscara de proteção do Mm — o
-//! MiMakeProtectionMask do `protect.c` do NT.
+//! MiMakeProtectionMask do NT.
 //!
 //! Máscara MM: bits 0..2 = acesso (1 READONLY, 2 EXECUTE, 3 EXECUTE_READ,
 //! 4 READWRITE, 5 WRITECOPY, 6 EXECUTE_READWRITE, 7 EXECUTE_WRITECOPY; 0x18 é

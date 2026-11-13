@@ -1,4 +1,4 @@
-//! LZNT1 (COMPRESSION_FORMAT_LZNT1), como o `rtl\lznt1.c` do NT: compressor
+//! LZNT1 (COMPRESSION_FORMAT_LZNT1), como no Rtl do NT: compressor
 //! standard/maximum, descompressão de buffer e de fragmento.
 //!
 //! Formato: chunks de até 4096 bytes descomprimidos, cada um com cabeçalho
@@ -8,7 +8,7 @@
 //! com o `shift` dado pela posição dentro do chunk (`LZNT1Formats`: 12 até a
 //! posição 16, 11 até 32, ..., 4 a partir de 2048).
 //!
-//! Transcrito do ntoskrnl 19045 e conferido byte a byte contra o mesmo código
+//! Comportamento do ntoskrnl 19045, conferido byte a byte contra o mesmo código
 //! do `ntdll.dll`:
 //! - `RtlCompressBufferLZNT1`/`LZNT1CompressChunk`: chunk que não cabe em
 //!   0xFFF bytes vira chunk não comprimido; STATUS_BUFFER_ALL_ZEROS quando todos

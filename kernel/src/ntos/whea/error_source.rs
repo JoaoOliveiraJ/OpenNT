@@ -1,5 +1,5 @@
-//! Fontes de erro de hardware do WHEA (NT: ntos\whea — whea.c, errsrc.c,
-//! wheadrv.c) sem fontes de plataforma.
+//! Fontes de erro de hardware do WHEA (como no NT)
+//! sem fontes de plataforma.
 //!
 //! O OpenNT não tem tabela HEST de ACPI nem PSHED: o WHEA começa inicializado
 //! (WheapInitializationComplete) e com a WheapErrorSourceTable vazia. As

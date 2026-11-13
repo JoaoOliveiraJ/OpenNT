@@ -1,4 +1,4 @@
-//! Windows Hardware Error Architecture (WHEA) — NT: ntos\whea.
+//! Windows Hardware Error Architecture (WHEA).
 //!
 //! O OpenNT não tem HEST nem PSHED: só as fontes de erro registradas por
 //! drivers (tipos não-HEST) existem. Ver `error_source`.

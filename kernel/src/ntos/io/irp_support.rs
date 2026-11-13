@@ -1,11 +1,11 @@
-//! Suporte a IRPs do I/O Manager (NT: io\iomgr\iosubs.c).
+//! Suporte a IRPs do I/O Manager.
 //!
 //! IRPs associados (IoMakeAssociatedIrp e a conclusão que devolve a contagem
 //! ao mestre), a dica de prioridade de I/O guardada em Irp->Flags, a extensão
 //! de crypto engine do adaptador e o ajuste de StackSize de uma pilha que
 //! redireciona IRPs para outra (IoAdjustStackSizeForRedirection).
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoMakeAssociatedIrp            rva 0x5058d0 -> IoMakeAssociatedIrpPriv 0x2e6098
 //!   IopfCompleteRequest (ramo IRP_ASSOCIATED_IRP)   rva 0x243016..0x243069
 //!   IoSetIoPriorityHint            rva 0x2faba0

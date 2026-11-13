@@ -1,7 +1,7 @@
-//! Notificações de desligamento de "última chance" (NT: io\iomgr\iosubs.c e
-//! io\iomgr\misc.c, IoShutdownSystem fase 1).
+//! Notificações de desligamento de "última chance" (NT: I/O Manager,
+//! IoShutdownSystem fase 1).
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoRegisterLastChanceShutdownNotification rva 0x7be840: bloco de 0x18
 //!     (LIST_ENTRY + DeviceObject) em NonPagedPool; ObReferenceObject(Device);
 //!     inserção na CABEÇA da IopNotifyLastChanceShutdownQueueHead;

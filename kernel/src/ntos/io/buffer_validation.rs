@@ -1,5 +1,5 @@
 //! Validação dos buffers de EA e de cota que os file systems recebem de
-//! chamadores — io\iomgr (IoCheckEaBufferValidity RVA 0x60cf10,
+//! chamadores — I/O Manager (IoCheckEaBufferValidity RVA 0x60cf10,
 //! IoCheckQuotaBufferValidity RVA 0x893720, ntoskrnl 10.0.19045).
 //!
 //! As listas são `FILE_FULL_EA_INFORMATION` e `FILE_QUOTA_INFORMATION`

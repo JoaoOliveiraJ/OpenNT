@@ -1,7 +1,7 @@
-//! Fila de IRPs segura contra cancelamento (Cancel-Safe Queue) — o assunto
-//! do `io\csq.c` do NT.
+//! Fila de IRPs segura contra cancelamento (Cancel-Safe Queue) — as rotinas
+//! IoCsq* do I/O Manager do NT.
 //!
-//! Transcrição do ntoskrnl 19041:
+//! Comportamento conferido contra o ntoskrnl 19041:
 //!   IoCsqInitialize      rva 0x322b40   IoCsqInitializeEx   rva 0x32bcf0
 //!   IoCsqInsertIrp       rva 0x3005d0   IoCsqInsertIrpEx    rva 0x3005f0
 //!   IoCsqRemoveIrp       rva 0x3996c0   IoCsqRemoveNextIrp  rva 0x3023d0

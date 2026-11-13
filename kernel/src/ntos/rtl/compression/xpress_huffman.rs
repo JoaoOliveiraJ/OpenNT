@@ -57,7 +57,7 @@ fn store(words: &mut [u16], index: i64, value: i32) -> bool {
     true
 }
 
-/// XpressBuildHuffmanDecodingTable, transcrito instrução a instrução.
+/// Comportamento conferido contra o XpressBuildHuffmanDecodingTable do ntoskrnl.
 fn build_table(words: &mut [u16], lengths: &[u8]) -> bool {
     for length in 0..16 {
         words[HEAD + length] = END_OF_LIST;

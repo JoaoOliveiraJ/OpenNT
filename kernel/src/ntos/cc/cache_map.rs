@@ -1,4 +1,4 @@
-//! Shared/private cache maps — o papel do `cache\fssup.c` do NT.
+//! Shared/private cache maps, como no Cache Manager do NT.
 //!
 //! Um arquivo em cache tem um `SharedCacheMap` nativo (layout do PDB, com
 //! FileSize em +8 como o `CcGetFileSizePointer` do ntifs.h) pendurado em

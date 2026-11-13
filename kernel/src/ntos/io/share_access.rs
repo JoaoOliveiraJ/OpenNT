@@ -1,4 +1,4 @@
-//! Compartilhamento de arquivos (SHARE_ACCESS) — io\iomgr (IoCheckShareAccess,
+//! Compartilhamento de arquivos (SHARE_ACCESS) — I/O Manager (IoCheckShareAccess,
 //! IoSetShareAccess, IoRemoveShareAccess, IoUpdateShareAccess).
 //!
 //! Os quatro exports clássicos são os casos sem LinkShareAccess dos

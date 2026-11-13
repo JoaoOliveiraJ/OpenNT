@@ -6364,7 +6364,7 @@ fn ps_job_info_exports(assert: Assert) {
     let job = at::<nt::Ejob>(job_block);
     job.ui_restrictions_class.set(0x3F);
     assert(call_export("PsGetJobLock", &[job_block]) == Some(job.job_lock.address()) && call_export("PsGetJobUIRestrictionsClass", &[job_block]) == Some(0x3F), "ps-job-info: JobLock e UIRestrictionsClass");
-    // Vetores de ref_vectors.py: 5 -> 5, 0xFFFFFFFD -> 0xFFFFFFFD, 0xFFFFFFFE/0xFFFFFFFF -> 0xFFFFFFFF.
+    // Vetores do modelo de referência: 5 -> 5, 0xFFFFFFFD -> 0xFFFFFFFD, 0xFFFFFFFE/0xFFFFFFFF -> 0xFFFFFFFF.
     let session = |value: u32| {
         job.session_id.set(value);
         call_export("PsGetJobSessionId", &[job_block])
@@ -6454,7 +6454,7 @@ fn ps_impersonation_exports(assert: Assert) {
     let _ = tokens::release(client);
     guest::free_bytes(outputs);
 
-    // Vetores de ref_vectors.py (RtlSidDominates / RtlIsParentOfChildAppContainer).
+    // Vetores do modelo de referência (RtlSidDominates / RtlIsParentOfChildAppContainer).
     let system = sid(16, &[0x4000]);
     assert(
         security::sid_dominates(&system, &sid(16, &[0x3000])) == Ok(true)
@@ -6565,7 +6565,7 @@ fn se_access_state_exports(assert: Assert) {
     guest::write_bytes(aux_block, &[0xCC; 0xE0]);
     let (state, aux) = (at::<nt::AccessState>(state_block), at::<nt::AuxAccessData>(aux_block));
     let operation = |state: &nt::AccessState| luid_at(state.operation_id.address());
-    // GENERIC_MAPPING de arquivo; vetores de ref_vectors.py (RtlMapGenericMask).
+    // GENERIC_MAPPING de arquivo; vetores do modelo de referência (RtlMapGenericMask).
     let mapping_block = guest::alloc_bytes(nt::GenericMapping::SIZE);
     let mapping = at::<nt::GenericMapping>(mapping_block);
     let set_mapping = |values: [u32; 4]| {
@@ -6613,7 +6613,7 @@ fn se_appcontainer_exports(assert: Assert) {
 
 
 fn alpc_message_attributes_exports(assert: Assert) {
-    // Vetores de ref_vectors.py (AlpcGetHeaderSize transcrito):
+    // Vetores do modelo de referência do AlpcGetHeaderSize:
     // 0 -> 8, 0x80000000 -> 0x20, 0x20000000 -> 0x28, 0xF6000000 -> 0x88, 0x01000000 -> 8.
     let required_block = guest::alloc_bytes(8);
     let required = at::<nt::Field<u64>>(required_block);
@@ -6662,7 +6662,7 @@ fn ob_security_cache_exports(assert: Assert) {
     guest::write_bytes(twin, &minimal_bytes);
     let owned = guest::alloc_bytes(32);
     guest::write_bytes(owned, &owned_bytes);
-    // Vetores de ref_vectors.py: hash(minimal) = 0x400000008, hash(owned) = 0xD2800000040.
+    // Vetores do modelo de referência: hash(minimal) = 0x400000008, hash(owned) = 0xD2800000040.
     assert(object_security::security_descriptor_hash(&minimal_bytes) == 0x4_0000_0008 && object_security::security_descriptor_hash(&owned_bytes) == 0xD28_0000_0040, "ob-sd-cache: FullHash do ObLogSecurityDescriptor");
 
     let output_block = guest::alloc_bytes(8);
@@ -7133,7 +7133,7 @@ fn fsrtl_file_system_support_exports(assert: Assert) {
     let status = |value: Option<u64>| value.map(|value| value as u32);
     let hex = |text: &str| -> Vec<u8> { (0..text.len()).step_by(2).map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap()).collect() };
 
-    // Vetores calculados com SCRATCHPAD/refvec/reparse_ref.py (transcrição de 0x309a70).
+    // Vetores calculados com um modelo de referência do RVA 0x309a70.
     let reparse_cases: [(&str, u64, &str, u32); 14] = [
         ("symlink valido", 0x24, "0c0000a01c00000000000800080008000000000041004100410041004100410041004100", 0),
         ("mount point valido", 0x2A, "030000a02200000000001000120006004200420042004200420042004200420000004300430043000000", 0),
@@ -7160,7 +7160,7 @@ fn fsrtl_file_system_support_exports(assert: Assert) {
     }
     assert(failed.is_none(), "fsrtl-file-system-support: FsRtlValidateReparsePointBuffer segue as regras do NT");
 
-    // Vetores calculados com SCRATCHPAD/refvec/name_ref.py (transcrição de 0x24f290).
+    // Vetores calculados com um modelo de referência do RVA 0x24f290.
     let name_cases: [(&str, &str, u64, u64); 20] = [
         ("*.txt", "a.TXT", 1, 1), ("*.txt", "a.TXT", 0, 0), ("*.TXT", "readme.txt", 1, 1), ("a?c", "abc", 0, 1), ("a?c", "ac", 0, 0),
         ("a*b*c", "axxbyyc", 0, 1), ("a*b*c", "axxbyy", 0, 0), ("<.c", "file.c", 0, 1), ("<.c", "a.b.c", 0, 1), ("a\"b", "ab", 0, 0),
@@ -7312,7 +7312,7 @@ fn fsrtl_base_mcb_exports(assert: Assert) {
     use crate::ntos::fsrtl::mcb;
     use nt::extra_fs_ntfs::BaseMcb;
 
-    // Valores esperados calculados executando o ntoskrnl real (SCRATCHPAD/mcb_selftest_vectors.py).
+    // Valores esperados calculados executando o ntoskrnl real num emulador.
     const HOLE: u32 = 0xFFFF_FFFF;
     const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
     let m = guest::alloc_bytes(BaseMcb::SIZE);
@@ -7401,7 +7401,7 @@ fn fsrtl_base_mcb_exports(assert: Assert) {
 
 
 fn fsrtl_large_mcb_exports(assert: Assert) {
-    // Vetores do ntoskrnl real (SCRATCHPAD/fsfat/large_mcb_vectors.py sobre o oráculo mcb_emu.py).
+    // Vetores obtidos executando o ntoskrnl real num emulador.
     use nt::extra_fs_fat::LargeMcb;
     let mcb = guest::alloc_bytes(LargeMcb::SIZE);
     let out = guest::alloc_bytes(0x40);
@@ -8616,7 +8616,7 @@ fn io_file_system_support_exports(assert: Assert) {
     const QUOTA_INCONSISTENT: u64 = 0xFFFF_FFFF_C000_0266;
     let error = guest::alloc_bytes(8);
     let error_offset = at::<nt::Field<u32>>(error);
-    // EA: AB (valor de 3 bytes, Next 16) + C (sem valor); 26 bytes (vetor de ref_io_fs_support.py).
+    // EA: AB (valor de 3 bytes, Next 16) + C (sem valor); 26 bytes (vetor do modelo de referência).
     let ea_bytes: [u8; 26] = [0x10, 0, 0, 0, 0, 2, 3, 0, 0x41, 0x42, 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0x43, 0];
     let ea = guest::alloc_bytes(32);
     guest::write_bytes(ea, &ea_bytes);
@@ -9496,7 +9496,7 @@ fn rtl_support_routines_exports(assert: Assert) {
 
 
 fn rtl_oem_strings_exports(assert: Assert) {
-    // Vetores das tabelas NLS reais (SCRATCHPAD/fsfat/oem_vectors.py lê c_437.nls/c_1252.nls).
+    // Vetores calculados a partir das tabelas NLS reais (c_437.nls/c_1252.nls).
     let status = |value: Option<u64>| value.map(|status| status as u32);
     let block = guest::alloc_bytes(0x400);
     let (oem, unicode, out) = (block, block + 0x40, block + 0x80);
@@ -9603,7 +9603,7 @@ fn rtl_8dot3_names_exports(assert: Assert) {
 
 
 fn rtl_altitudes_and_time_exports(assert: Assert) {
-    // Vetores do modelo de referência (SCRATCHPAD/fsfat/altitude_ref.py, transcrito do RVA 0x313b70).
+    // Vetores calculados com o modelo de referência do RVA 0x313b70.
     let cases: [(&str, &str, i32); 10] = [
         ("385100", "385100", 0),
         ("385100", "385200", -1),

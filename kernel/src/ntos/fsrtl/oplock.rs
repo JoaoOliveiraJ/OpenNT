@@ -1,4 +1,4 @@
-//! Oplocks do FsRtl — o assunto do `fsrtl\oplock.c` do NT, no estado
+//! Oplocks do FsRtl, no estado
 //! "nenhum oplock é concedido".
 //!
 //! O OpenNT não tem o motor de oplocks. Este assunto reproduz EXATAMENTE o

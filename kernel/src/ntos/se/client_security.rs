@@ -1,6 +1,6 @@
 //! Contexto de segurança do cliente (SECURITY_CLIENT_CONTEXT): criação a
 //! partir de uma thread ou de um contexto de sujeito e impersonação do
-//! cliente pelo servidor, como o `se\seclient.c` do NT. Transcrito do
+//! cliente pelo servidor, como no Se do NT. Conferido contra o
 //! ntoskrnl 19041: SeCreateClientSecurity 0x6d6a50,
 //! SeCreateClientSecurityFromSubjectContext 0x6a1230,
 //! SepCreateClientSecurityEx 0x6d6e40, SeCopyClientToken 0x6daa14,

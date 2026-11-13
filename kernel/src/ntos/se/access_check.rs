@@ -512,7 +512,7 @@ pub fn access_check_from_state_ex(descriptor: u64, primary_token: u64, client_to
 // Access check com requisição/resposta, com hint, e os ajustes por
 // restrições de acesso — rótulo de confiança de processo e filtros de acesso.
 // A avaliação de DACL é a de `access_check` acima; aqui ficam o contrato
-// SE_ACCESS_REQUEST / SE_ACCESS_REPLY e as restrições, transcritos do
+// SE_ACCESS_REQUEST / SE_ACCESS_REPLY e as restrições, conferidos contra o
 // ntoskrnl 19041:
 // - SeAccessCheckWithHint (rva 0x2ce400) = SeAccessCheck com um ULONG de
 //   hint: bit 4 pula SepFilterCheck, bit 2 a integridade obrigatória, bit 1

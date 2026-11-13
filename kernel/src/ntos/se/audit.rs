@@ -65,7 +65,7 @@ pub fn fips_crypto_selftests(general: u32, causing: u32, extra: u32) {
 
 // ---- Política de auditoria e alarmes de auditoria de objeto ------------------
 //
-// NT: `se\adtapi.c`, `se\adtutil.c`, `se\seaudit.c`. Contrato, transcrito do
+// Como na auditoria do Se do NT. Contrato, conferido contra o
 // ntoskrnl 19041:
 // - A política vive em `SeAuditingState` (rva 0xc1d5a0: 64 subcategorias a
 //   partir do id 100, um byte de sucesso e um de falha cada) e em

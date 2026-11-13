@@ -1,4 +1,4 @@
-//! Consulta da auditoria de fechamento de um handle (NT: `ob\obaudit.c`).
+//! Consulta da auditoria de fechamento de um handle, como no Ob do NT.
 //!
 //! ObQueryObjectAuditingByHandle (ntoskrnl 19041 rva 0x664ca0): resolve o
 //! handle na tabela do processo corrente ou, para handle de kernel vindo de

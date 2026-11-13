@@ -1,5 +1,5 @@
-//! Buffers ALPC_MESSAGE_ATTRIBUTES montados pelo próprio chamador, como o
-//! `alpc\alpcmsg.c` do NT: AlpcInitializeMessageAttribute,
+//! Buffers ALPC_MESSAGE_ATTRIBUTES montados pelo próprio chamador, como no
+//! ALPC do NT: AlpcInitializeMessageAttribute,
 //! AlpcGetMessageAttribute e AlpcGetHeaderSize (ntoskrnl 19041, 0x34a380,
 //! 0x34a340, 0x34a3e0). Funções puras sobre o buffer do chamador; o layout é
 //! o mesmo que `ps::user::alpc::attribute_address` usa no transporte. As

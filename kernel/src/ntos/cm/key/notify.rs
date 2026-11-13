@@ -1,4 +1,4 @@
-//! Notificação de mudança de chave do registro (NT: config\cmnotify.c —
+//! Notificação de mudança de chave do registro (NT:
 //! NtNotifyChangeKey -> NtNotifyChangeMultipleKeys, CmpReportNotify,
 //! CmpPostNotify).
 //!

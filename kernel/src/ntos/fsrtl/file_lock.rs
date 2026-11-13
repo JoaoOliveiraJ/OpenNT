@@ -1,4 +1,4 @@
-//! Byte-range locks do FsRtl (FILE_LOCK) — o assunto do `fsrtl\filelock.c`
+//! Byte-range locks (FILE_LOCK) — o assunto dos file locks do FsRtl
 //! do NT. Concessão, conflito, IRPs de trava pendentes e desbloqueio com as
 //! regras do ntoskrnl 10.0.19045 (RVAs abaixo).
 //!

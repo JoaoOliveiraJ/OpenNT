@@ -1,9 +1,9 @@
-//! Suporte do Process Manager ao subsistema Win32k, como o `ps\win32.c` do
+//! Suporte do Process Manager ao subsistema Win32k, como no Ps do
 //! NT: registro e invocação do despachante de callouts
 //! (PsEstablishWin32Callouts / PsInvokeWin32Callout), os callouts de saída de
 //! thread e de processo, a publicação dos ponteiros Win32Process/Win32Thread/
 //! WindowStation/DxgProcess e os filtros de syscalls Win32k do EPROCESS.
-//! Transcrito do ntoskrnl 19041: PsEstablishWin32Callouts 0x7996b0,
+//! Conferido contra o ntoskrnl 19041: PsEstablishWin32Callouts 0x7996b0,
 //! PsInvokeWin32Callout 0x61b5a0 (ExCallCallBack 0x61b29c), PspExitThread
 //! 0x6c35f0 (callouts nos offsets +0x4b0 e +0x593), PsSetProcessWin32Process
 //! 0x68c460, PsSetThreadWin32Thread 0x695e20, PsIsWin32KFilterEnabled

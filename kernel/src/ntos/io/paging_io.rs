@@ -1,4 +1,4 @@
-//! I/O de paginação do I/O Manager (NT: io\iomgr\iosubs.c) — IoPageRead
+//! I/O de paginação do I/O Manager — IoPageRead
 //! (RVA 0x37f0a0 -> IoPageReadEx 0x29c7c0), IoSynchronousPageWrite (RVA
 //! 0x31b920 -> IoSynchronousPageWriteEx 0x29c49c) e o ramo IRP_PAGING_IO do
 //! IopfCompleteRequest (0x24322e..0x24329c).

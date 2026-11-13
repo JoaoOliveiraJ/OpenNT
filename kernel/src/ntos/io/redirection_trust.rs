@@ -1,5 +1,5 @@
 //! Confiança de redirecionamento (junções/links simbólicos criados por
-//! chamadores sem privilégio) — io\iomgr: IoComputeRedirectionTrustLevel
+//! chamadores sem privilégio) — I/O Manager: IoComputeRedirectionTrustLevel
 //! (RVA 0x3f0b10), IoCheckRedirectionTrustLevel (RVA 0x3f09c0) e o
 //! SeTokenGetRedirectionTrustPolicy (RVA 0x3f8654) que elas leem.
 //!

@@ -1,4 +1,4 @@
-//! Consultas do Driver Verifier feitas pelo Mm (o `verifier.c` do NT, lado Mm).
+//! Consultas do Driver Verifier feitas pelo Mm, como no NT.
 //!
 //! O OpenNT não tem Driver Verifier: os ramos abaixo são os que o ntoskrnl
 //! 19041 executa numa máquina sem verificador, não stubs. As duas consultas por

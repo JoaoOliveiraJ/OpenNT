@@ -1,4 +1,4 @@
-//! Nomes 8.3 do DOS — rtl\gen8dot3.c (RtlIsNameLegalDOS8Dot3).
+//! Nomes 8.3 do DOS (RtlIsNameLegalDOS8Dot3).
 //!
 //! ntoskrnl 10.0.19045, RVA 0x678d00: Name.Length > 24 -> FALSE; o nome vai
 //! para OEM em maiúsculas (RtlUpcaseUnicodeStringToCountedOemString no OemName

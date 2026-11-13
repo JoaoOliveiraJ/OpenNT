@@ -7,7 +7,7 @@
 //! (os dois parsers testam `c < 0x80` antes do iswctype): dígitos '0'..'9',
 //! hexadecimais 0-9/A-F/a-f, minúsculas a-z. Os formatadores reproduzem o
 //! swprintf_s dos originais (%u decimal, %x hexadecimal minúsculo).
-//! Modelo de referência (vetores dos testes): SCRATCHPAD/net_ref_ipaddr.py.
+//! Os vetores dos testes foram calculados com um modelo de referência.
 
 use alloc::format;
 use alloc::string::String;

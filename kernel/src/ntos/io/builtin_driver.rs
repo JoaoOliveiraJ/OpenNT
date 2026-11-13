@@ -1,7 +1,7 @@
 //! Drivers embutidos (IoCreateDriver) — DRIVER_OBJECT criado pelo próprio
 //! kernel para um componente sem imagem de serviço (win32k.sys/win32kbase.sys).
 //!
-//! Transcrição do ntoskrnl 19041, IoCreateDriver rva 0x7a5250:
+//! Comportamento conferido contra o ntoskrnl 19041, IoCreateDriver rva 0x7a5250:
 //!   * DriverName NULL -> "\Driver\%08u" (formato em rva 0x7d7ab0) com
 //!     InterlockedIncrement de IopUniqueDriverObjectNumber: o primeiro é 00000001.
 //!   * ObCreateObjectEx(IoDriverObjectType, OBJ_PERMANENT|OBJ_CASE_INSENSITIVE|
