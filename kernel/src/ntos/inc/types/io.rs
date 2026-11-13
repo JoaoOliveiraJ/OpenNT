@@ -1723,6 +1723,18 @@ impl FileInformationClass {
     pub const FILE_MAXIMUM_INFORMATION: Self = Self(76);
 }
 
+impl GuestScalar for FileInformationClass {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IO_STACK_LOCATION::Parameters::NotifyDirectory` (0x10 bytes).
 #[repr(C)]
 pub struct IoStackLocationParametersNotifyDirectory {
@@ -1768,6 +1780,18 @@ pub struct DirectoryNotifyInformationClass(pub i32);
 impl DirectoryNotifyInformationClass {
     pub const DIRECTORY_NOTIFY_INFORMATION: Self = Self(1);
     pub const DIRECTORY_NOTIFY_EXTENDED_INFORMATION: Self = Self(2);
+}
+
+impl GuestScalar for DirectoryNotifyInformationClass {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IO_STACK_LOCATION::Parameters::QueryFile` (0x10 bytes).
@@ -1930,6 +1954,18 @@ impl Fsinfoclass {
     pub const FILE_FS_METADATA_SIZE_INFORMATION: Self = Self(13);
     pub const FILE_FS_FULL_SIZE_INFORMATION_EX: Self = Self(14);
     pub const FILE_FS_MAXIMUM_INFORMATION: Self = Self(15);
+}
+
+impl GuestScalar for Fsinfoclass {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IO_STACK_LOCATION::Parameters::FileSystemControl` (0x20 bytes).
@@ -2113,6 +2149,18 @@ impl DeviceRelationType {
     pub const TRANSPORT_RELATIONS: Self = Self(6);
 }
 
+impl GuestScalar for DeviceRelationType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IO_STACK_LOCATION::Parameters::QueryInterface` (0x20 bytes).
 #[repr(C)]
 pub struct IoStackLocationParametersQueryInterface {
@@ -2229,6 +2277,18 @@ impl BusQueryIdType {
     pub const BUS_QUERY_CONTAINER_ID: Self = Self(5);
 }
 
+impl GuestScalar for BusQueryIdType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IO_STACK_LOCATION::Parameters::QueryDeviceText` (0x10 bytes).
 #[repr(C)]
 pub struct IoStackLocationParametersQueryDeviceText {
@@ -2254,6 +2314,18 @@ pub struct DeviceTextType(pub i32);
 impl DeviceTextType {
     pub const DEVICE_TEXT_DESCRIPTION: Self = Self(0);
     pub const DEVICE_TEXT_LOCATION_INFORMATION: Self = Self(1);
+}
+
+impl GuestScalar for DeviceTextType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IO_STACK_LOCATION::Parameters::UsageNotification` (0x10 bytes).
@@ -2288,6 +2360,18 @@ impl DeviceUsageNotificationType {
     pub const DEVICE_USAGE_TYPE_BOOT: Self = Self(4);
     pub const DEVICE_USAGE_TYPE_POST_DISPLAY: Self = Self(5);
     pub const DEVICE_USAGE_TYPE_GUEST_ASSIGNED: Self = Self(6);
+}
+
+impl GuestScalar for DeviceUsageNotificationType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IO_STACK_LOCATION::Parameters::WaitWake` (0x4 bytes).
@@ -2489,6 +2573,18 @@ impl DevicePowerState {
     pub const POWER_DEVICE_D2: Self = Self(3);
     pub const POWER_DEVICE_D3: Self = Self(4);
     pub const POWER_DEVICE_MAXIMUM: Self = Self(5);
+}
+
+impl GuestScalar for DevicePowerState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IO_STACK_LOCATION::Parameters::StartDevice` (0x10 bytes).
@@ -2719,6 +2815,18 @@ impl InterfaceType {
     pub const VMCS: Self = Self(16);
     pub const ACPI_BUS: Self = Self(17);
     pub const MAXIMUM_INTERFACE_TYPE: Self = Self(18);
+}
+
+impl GuestScalar for InterfaceType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_IOP_IRP_STACK_PROFILER` (0x54 bytes).
@@ -3505,6 +3613,18 @@ impl IrqPriority {
     pub const IRQ_PRIORITY_HIGH: Self = Self(3);
 }
 
+impl GuestScalar for IrqPriority {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IO_RESOURCE_DESCRIPTOR::u::Dma` (0x8 bytes).
 #[repr(C)]
 pub struct IoResourceDescriptorUDma {
@@ -3864,6 +3984,18 @@ impl IopPriorityHint {
     pub const MAX_IOP_IO_PRIORITY_TYPES: Self = Self(6);
 }
 
+impl GuestScalar for IopPriorityHint {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IO_SESSION_STATE`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -3879,6 +4011,18 @@ impl IoSessionState {
     pub const IO_SESSION_STATE_LOGGED_OFF: Self = Self(7);
     pub const IO_SESSION_STATE_TERMINATED: Self = Self(8);
     pub const IO_SESSION_STATE_MAX: Self = Self(9);
+}
+
+impl GuestScalar for IoSessionState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_DEVPROPKEY` (0x14 bytes).

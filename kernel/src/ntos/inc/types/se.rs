@@ -238,6 +238,18 @@ impl TokenType {
     pub const TOKEN_IMPERSONATION: Self = Self(2);
 }
 
+impl GuestScalar for TokenType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_SECURITY_IMPERSONATION_LEVEL`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -248,6 +260,18 @@ impl SecurityImpersonationLevel {
     pub const SECURITY_IDENTIFICATION: Self = Self(1);
     pub const SECURITY_IMPERSONATION: Self = Self(2);
     pub const SECURITY_DELEGATION: Self = Self(3);
+}
+
+impl GuestScalar for SecurityImpersonationLevel {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_SID_AND_ATTRIBUTES_HASH` (0x110 bytes).

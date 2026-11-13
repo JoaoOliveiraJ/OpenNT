@@ -20,6 +20,18 @@ impl SystemPowerState {
     pub const POWER_SYSTEM_MAXIMUM: Self = Self(7);
 }
 
+impl GuestScalar for SystemPowerState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_POWER_STATE_TYPE`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -28,6 +40,18 @@ pub struct PowerStateType(pub i32);
 impl PowerStateType {
     pub const SYSTEM_POWER_STATE: Self = Self(0);
     pub const DEVICE_POWER_STATE: Self = Self(1);
+}
+
+impl GuestScalar for PowerStateType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_POWER_STATE` (0x4 bytes).
@@ -79,6 +103,18 @@ impl PowerAction {
     pub const POWER_ACTION_SHUTDOWN_OFF: Self = Self(6);
     pub const POWER_ACTION_WARM_EJECT: Self = Self(7);
     pub const POWER_ACTION_DISPLAY_OFF: Self = Self(8);
+}
+
+impl GuestScalar for PowerAction {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_PROCESSOR_POWER_STATE` (0x200 bytes).
@@ -335,6 +371,18 @@ impl ProcHypervisorState {
     pub const PROC_HYPERVISOR_PRESENT: Self = Self(1);
     pub const PROC_HYPERVISOR_POWER: Self = Self(2);
     pub const PROC_HYPERVISOR_HV_COUNTERS: Self = Self(3);
+}
+
+impl GuestScalar for ProcHypervisorState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_PPM_FFH_THROTTLE_STATE_INFO` (0x20 bytes).

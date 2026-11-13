@@ -42,8 +42,9 @@
 //! - contadores, locks e flags compartilhados usam `atomic()` (instruções
 //!   `lock`), nunca ler-modificar-escrever em duas chamadas;
 //! - `probe_get`/`probe_set`/`try_at` só para ponteiros não confiáveis: passam
-//!   pelos acessos `try_*` de `guest_memory`, que devolvem
-//!   `STATUS_ACCESS_VIOLATION` numa página sem mapeamento;
+//!   por `guest_memory::try_read`/`try_write` (campos `GuestScalar`: inteiros
+//!   e enums), que sondam a página e devolvem `STATUS_ACCESS_VIOLATION` sem
+//!   mapeamento;
 //! - o `unsafe` fica na fronteira ([`NtStruct::at`]): quem converte o
 //!   endereço garante que ele aponta para um objeto vivo daquele tipo.
 //!
@@ -98,7 +99,7 @@ use core::sync::atomic::{
 };
 
 use crate::ntos::inc::status::STATUS_ACCESS_VIOLATION;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 use crate::rtl::KernelError;
 
 /// `STATUS_DATATYPE_MISALIGNMENT` (o que o ProbeForRead levanta).
@@ -140,16 +141,18 @@ impl<T: Copy> Field<T> {
     pub fn address(&self) -> u64 {
         self.0.get() as u64
     }
+}
 
-    /// Leitura sondada (ponteiro não confiável): ACCESS_VIOLATION se a
-    /// página não estiver mapeada.
+impl<T: GuestScalar> Field<T> {
+    /// Leitura sondada (ponteiro não confiável): `guest_memory::try_read`,
+    /// ACCESS_VIOLATION se a página não estiver mapeada, senão um acesso.
     pub fn probe_get(&self) -> Result<T, KernelError> {
-        probe_read(self.address())
+        guest::try_read(self.address())
     }
 
-    /// Escrita sondada (ponteiro não confiável).
+    /// Escrita sondada (ponteiro não confiável): `guest_memory::try_write`.
     pub fn probe_set(&self, value: T) -> Result<(), KernelError> {
-        probe_write(self.address(), value)
+        guest::try_write(self.address(), value)
     }
 }
 
@@ -259,13 +262,15 @@ impl<T: Copy> UnalignedField<T> {
     pub fn address(&self) -> u64 {
         self.pointer() as u64
     }
+}
 
+impl<T: GuestScalar> UnalignedField<T> {
     pub fn probe_get(&self) -> Result<T, KernelError> {
-        probe_read(self.address())
+        guest::try_read(self.address())
     }
 
     pub fn probe_set(&self, value: T) -> Result<(), KernelError> {
-        probe_write(self.address(), value)
+        guest::try_write(self.address(), value)
     }
 }
 
@@ -352,51 +357,11 @@ fn probe_range(address: u64, length: u64, alignment: u64) -> Result<(), KernelEr
     };
     let mut page = address;
     while page < end {
-        guest::try_read8(page)?;
+        guest::try_read::<u8>(page)?;
         page = (page & !(PAGE_SIZE - 1)) + PAGE_SIZE;
     }
     if length > 0 {
-        guest::try_read8(end - 1)?;
+        guest::try_read::<u8>(end - 1)?;
     }
     Ok(())
-}
-
-/// Leitura sondada de um `T` por largura (um acesso quando a largura é
-/// 1/2/4/8 e o valor não cruza página).
-fn probe_read<T: Copy>(address: u64) -> Result<T, KernelError> {
-    let raw: u64 = match size_of::<T>() {
-        1 => guest::try_read8(address)? as u64,
-        2 => guest::try_read16(address)? as u64,
-        4 => guest::try_read32(address)? as u64,
-        8 => guest::try_read64_single(address)?,
-        length => {
-            let bytes = guest::try_read_bytes(address, length)?;
-            // SAFETY: `bytes` tem exatamente `size_of::<T>()` bytes; `T: Copy`
-            // é um tipo de campo (inteiro, enum newtype ou vetor deles).
-            return Ok(unsafe { ptr::read_unaligned(bytes.as_ptr() as *const T) });
-        }
-    };
-    // SAFETY: `T` tem 1/2/4/8 bytes; os bytes baixos de `raw` (little-endian) são o valor.
-    Ok(unsafe { ptr::read_unaligned(&raw as *const u64 as *const T) })
-}
-
-/// Escrita sondada de um `T` por largura.
-fn probe_write<T: Copy>(address: u64, value: T) -> Result<(), KernelError> {
-    let length = size_of::<T>();
-    let mut raw = 0u64;
-    if length <= 8 {
-        // SAFETY: copia `length <= 8` bytes do valor para os bytes baixos de `raw`.
-        unsafe { ptr::copy_nonoverlapping(&value as *const T as *const u8, &mut raw as *mut u64 as *mut u8, length) };
-    }
-    match length {
-        1 => guest::try_write8(address, raw as u8),
-        2 => guest::try_write16(address, raw as u16),
-        4 => guest::try_write32(address, raw as u32),
-        8 => guest::try_write64(address, raw),
-        _ => {
-            // SAFETY: vista em bytes do próprio valor.
-            let bytes = unsafe { core::slice::from_raw_parts(&value as *const T as *const u8, length) };
-            guest::try_write_bytes(address, bytes)
-        }
-    }
 }

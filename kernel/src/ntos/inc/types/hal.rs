@@ -376,6 +376,18 @@ impl WheaErrorSeverity {
     pub const WHEA_ERR_SEV_INFORMATIONAL: Self = Self(3);
 }
 
+impl GuestScalar for WheaErrorSeverity {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_WHEA_PROCESSOR_GENERIC_ERROR_SECTION` (0xc0 bytes).
 #[repr(C)]
 pub struct WheaProcessorGenericErrorSection {
@@ -694,6 +706,18 @@ impl InterruptConnectionType {
     pub const INTERRUPT_TYPE_XAPIC_MESSAGE: Self = Self(1);
     pub const INTERRUPT_TYPE_HYPERTRANSPORT: Self = Self(2);
     pub const INTERRUPT_TYPE_MESSAGE_REQUEST: Self = Self(3);
+}
+
+impl GuestScalar for InterruptConnectionType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_INTERRUPT_REMAPPING_INFO` (0x10 bytes).
@@ -1129,6 +1153,18 @@ impl HalApicDestinationMode {
     pub const APIC_DESTINATION_MODE_LOGICAL_FLAT: Self = Self(2);
     pub const APIC_DESTINATION_MODE_LOGICAL_CLUSTERED: Self = Self(3);
     pub const APIC_DESTINATION_MODE_UNKNOWN: Self = Self(4);
+}
+
+impl GuestScalar for HalApicDestinationMode {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_HAL_INTEL_ENLIGHTENMENT_INFORMATION` (0x1f8 bytes).

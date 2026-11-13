@@ -850,6 +850,18 @@ impl LdrDllLoadReason {
     pub const LOAD_REASON_UNKNOWN: Self = Self(-1);
 }
 
+impl GuestScalar for LdrDllLoadReason {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_IMAGE_DOS_HEADER` (0x40 bytes).
 #[repr(C)]
 pub struct ImageDosHeader {
@@ -4057,6 +4069,18 @@ impl MiSystemVaType {
     pub const MI_VA_KERNEL_STACKS: Self = Self(14);
     pub const MI_VA_SECURE_NON_PAGED_POOL: Self = Self(15);
     pub const MI_VA_MAXIMUM_TYPE: Self = Self(16);
+}
+
+impl GuestScalar for MiSystemVaType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_MMPFN` (0x30 bytes).

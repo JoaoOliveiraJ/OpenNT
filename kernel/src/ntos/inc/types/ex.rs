@@ -163,6 +163,18 @@ impl PoolType {
     pub const NON_PAGED_POOL_SESSION_NX: Self = Self(544);
 }
 
+impl GuestScalar for PoolType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_EX_RUNDOWN_REF` (0x8 bytes).
 ///
 /// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
@@ -936,6 +948,18 @@ impl WnfSubscriptionState {
     pub const WNF_SUB_STATE_RETRY: Self = Self(3);
 }
 
+impl GuestScalar for WnfSubscriptionState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_WNF_SCOPE_INSTANCE` (0x50 bytes).
 #[repr(C)]
 pub struct WnfScopeInstance {
@@ -983,6 +1007,18 @@ impl WnfDataScope {
     pub const WNF_DATA_SCOPE_PROCESS: Self = Self(3);
     pub const WNF_DATA_SCOPE_MACHINE: Self = Self(4);
     pub const WNF_DATA_SCOPE_PHYSICAL_MACHINE: Self = Self(5);
+}
+
+impl GuestScalar for WnfDataScope {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_WNF_PROCESS_CONTEXT` (0x88 bytes).

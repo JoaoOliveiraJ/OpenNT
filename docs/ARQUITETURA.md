@@ -185,8 +185,8 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   chamadas.
 - **Sondas só para ponteiros não confiáveis** (vindos do modo usuário):
   `Tipo::try_at(endereço)` sonda o objeto inteiro (o `ProbeForRead`) e
-  `probe_get`/`probe_set` fazem cada acesso pelo caminho `try_*` de
-  `mm/guest_memory.rs`, que devolve `STATUS_ACCESS_VIOLATION` — o equivalente
+  `probe_get`/`probe_set` fazem cada acesso por `try_read`/`try_write` de
+  `mm/guest_memory.rs`, que devolvem `STATUS_ACCESS_VIOLATION` — o equivalente
   do `__try/__except`. Memória do kernel e de drivers não é sondada.
 - **Código novo não escreve offsets à mão** (`base + 0x30`, `guest::read32(x +
   CONSTANTE)`). As constantes de `nt_abi.rs` continuam enquanto as chamadas

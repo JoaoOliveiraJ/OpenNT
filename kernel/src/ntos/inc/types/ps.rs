@@ -5351,6 +5351,18 @@ impl ServersiloState {
     pub const SERVERSILO_TERMINATED: Self = Self(4);
 }
 
+impl GuestScalar for ServersiloState {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_EWOW64PROCESS` (0x10 bytes).
 #[repr(C)]
 pub struct Ewow64process {
@@ -5383,6 +5395,18 @@ impl SystemDllType {
     pub const PS_WOW_CHPE_X86_SYSTEM_DLL: Self = Self(4);
     pub const PS_VSM_ENCLAVE_RUNTIME_DLL: Self = Self(5);
     pub const PS_SYSTEM_DLL_TOTAL_TYPES: Self = Self(6);
+}
+
+impl GuestScalar for SystemDllType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_SILO_USER_SHARED_DATA` (0x270 bytes).

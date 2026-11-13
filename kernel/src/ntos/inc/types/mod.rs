@@ -26,6 +26,7 @@
 #![allow(dead_code)]
 
 pub use crate::ntos::inc::field::{Field, NtStruct, Reserved, UnalignedField};
+use crate::ntos::mm::guest_memory::GuestScalar;
 
 mod alpc;
 mod cm;

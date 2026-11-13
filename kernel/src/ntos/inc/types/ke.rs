@@ -3082,6 +3082,18 @@ impl KinterruptMode {
     pub const LATCHED: Self = Self(1);
 }
 
+impl GuestScalar for KinterruptMode {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_KINTERRUPT_POLARITY`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -3096,6 +3108,18 @@ impl KinterruptPolarity {
     pub const INTERRUPT_ACTIVE_BOTH: Self = Self(3);
     pub const INTERRUPT_ACTIVE_BOTH_TRIGGER_LOW: Self = Self(3);
     pub const INTERRUPT_ACTIVE_BOTH_TRIGGER_HIGH: Self = Self(4);
+}
+
+impl GuestScalar for KinterruptPolarity {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_ISRDPCSTATS` (0x60 bytes).
@@ -5030,6 +5054,18 @@ impl KheteroCpuQos {
     pub const K_HETERO_CPU_QOS_MAX: Self = Self(5);
 }
 
+impl GuestScalar for KheteroCpuQos {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_CACHE_DESCRIPTOR` (0xc bytes).
 #[repr(C)]
 pub struct CacheDescriptor {
@@ -5061,6 +5097,18 @@ impl ProcessorCacheType {
     pub const CACHE_INSTRUCTION: Self = Self(1);
     pub const CACHE_DATA: Self = Self(2);
     pub const CACHE_TRACE: Self = Self(3);
+}
+
+impl GuestScalar for ProcessorCacheType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_SYNCH_COUNTERS` (0xb8 bytes).
@@ -6193,6 +6241,18 @@ impl NtProductType {
     pub const NT_PRODUCT_SERVER: Self = Self(3);
 }
 
+impl GuestScalar for NtProductType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
 /// `_ALTERNATIVE_ARCHITECTURE_TYPE`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -6202,6 +6262,18 @@ impl AlternativeArchitectureType {
     pub const STANDARD_DESIGN: Self = Self(0);
     pub const NEC98X86: Self = Self(1);
     pub const END_ALTERNATIVES: Self = Self(2);
+}
+
+impl GuestScalar for AlternativeArchitectureType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
 }
 
 /// `_XSTATE_CONFIGURATION` (0x338 bytes).
