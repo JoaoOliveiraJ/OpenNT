@@ -72,18 +72,69 @@ implementa.
 
 ## 3. Dentro de um componente
 
-- **Exports.** As rotinas que o `ntoskrnl.exe` exporta moram no componente
-  dono: `ntos/<componente>/exports.rs` (Ke* em `ke`, Io* em `io`, Mm* em `mm`...).
-  Cada grupo de exports é um `pub mod <grupo> { ... }` com a sua `Group`. A
-  tabela que junta os grupos, com a ordem fixa dos ids, fica em
-  `ntos/init/exports.rs` e `ntos/init/export_names.rs` (o papel do
-  `ntoskrnl.src` do NT).
+### 3.1 Onde mora o código de um export
+
+No NT, uma rotina exportada é uma função comum, implementada no arquivo do
+assunto dentro do componente: os byte-range locks em `fsrtl\filelock.c`, as
+MDLs em `mm\iosup.c`, o access check em `se\accchk.c`, as leituras do cache em
+`cache\copysup.c`. Exportar é só pôr o nome na lista do `ntoskrnl.src`. Não
+existe um "arquivo de exports" onde a lógica mora. O OpenNT segue o mesmo
+modelo, em três camadas:
+
+| Camada | Onde | O que contém |
+| --- | --- | --- |
+| **Lógica** | `ntos/<componente>/<assunto>.rs` (ou uma subpasta do assunto) | a implementação: estruturas, estado, tabelas, algoritmos, validação, em funções Rust com tipos de verdade |
+| **Adaptador** | `ntos/<componente>/exports.rs` | um `pub mod <grupo>` por grupo, com um handler curto por export e a `Group` |
+| **Tabela** | `ntos/init/export_names.rs` e `ntos/init/exports.rs` | os nomes na ordem fixa dos ids e a lista de grupos (o papel do `ntoskrnl.src`) |
+
+Regras:
+
+- **O `exports.rs` só adapta.** Cada handler lê os argumentos do `Call`, chama
+  a função do assunto e converte o resultado (NTSTATUS, ponteiro, BOOLEAN):
+  poucas linhas, sem `if` de semântica. No `exports.rs` **não** entram:
+  `static`/estado, structs e enums, tabelas e constantes de layout, laços de
+  algoritmo, funções auxiliares, nem validação de parâmetros. Se um grupo do
+  `exports.rs` passa de algumas dezenas de linhas, a lógica está no lugar
+  errado.
+- **Por que existe adaptador.** No NT a assinatura em C já é a interface
+  binária e o export aponta direto para a função. No OpenNT a chamada chega
+  pelo trampolim como um `Call`; o adaptador é só essa ponte, e é a única
+  diferença em relação ao NT.
+- **Arquivo do assunto, com nome do assunto**, no estilo do NT:
+  `fsrtl/file_lock.rs`, `fsrtl/oplock.rs`, `rtl/hash_table.rs`, `cc/copy.rs`,
+  `mm/mdl.rs`, `se/access_check.rs`. Nunca um arquivo por export, nunca um
+  arquivo ou grupo com nome de driver (`dxgkrnl_support.rs`,
+  `watchdog-support`).
+- **Componente certo.** O prefixo do export diz o dono: FsRtl* em `fsrtl`, Cc*
+  em `cc`, Mm* em `mm`, Se* em `se`, Rtl* e a CRT em `rtl`. Um export de um
+  componente não mora no `exports.rs` de outro.
+- **Exports de dados** (`MmSystemRangeStart`, `PsJobType`...) seguem igual: a
+  célula e o valor vêm do assunto; o `exports.rs` só lista o par
+  `(nome, getter)` em `data_exports`.
+
+Exemplo:
+
+```rust
+// ntos/fsrtl/file_lock.rs — a lógica (endereços do convidado como u64)
+pub fn check_lock_for_read_access(file_lock: u64, irp: u64) -> bool { /* ... */ }
+
+// ntos/fsrtl/exports.rs — o adaptador
+fn check_lock_for_read_access(call: &Call) -> Result<u64, KernelError> {
+    Ok(file_lock::check_lock_for_read_access(call.arg(1), call.arg(2)) as u64)
+}
+```
+
+O autoteste da fase 6 chama o export pelo nome (`call_export`) e cobre as duas
+camadas juntas. Testes só da lógica podem chamar a função do assunto direto.
+
+### 3.2 Outras regras
+
 - **Famílias.** Quando um assunto ocupa vários arquivos, eles ficam numa
   subpasta do componente (`ex/wnf/`, `mm/section/`, `se/token/`...), como os
   subdiretórios do NT. Arquivos pequenos do mesmo assunto podem dividir um
   arquivo (`pub mod x { ... }`), como em `io/small.rs`.
-- **Nada de arquivo por export.** Um export novo entra no `exports.rs` do
-  componente; uma rotina nova entra no arquivo do assunto.
+- **Nada de arquivo por export.** Uma rotina nova entra no arquivo do assunto
+  dela; o export novo ganha só o adaptador no `exports.rs` do componente.
 - **Cabeçalho.** Todo módulo começa com um `//!` que diz o papel e o contrato.
 
 ## 4. Dependências
@@ -142,6 +193,10 @@ dos pacotes (`kernel`, `boot`).
 
 ## 8. Pontos em aberto
 
+- Vários `exports.rs` ainda carregam lógica de grupos antigos (o maior grupo
+  tem quase 700 linhas, e o `fsrtl_core` está em `io/exports.rs`). Ela está
+  sendo movida para os arquivos de assunto, componente por componente, conforme
+  a seção 3.1.
 - `rtl/` (suporte do kernel em Rust) e `ntos/rtl/` (a Rtl do NT) ainda têm o
   mesmo nome.
 - `ntos/ps/user/` reúne os serviços Nt* do modo usuário; no NT cada serviço
