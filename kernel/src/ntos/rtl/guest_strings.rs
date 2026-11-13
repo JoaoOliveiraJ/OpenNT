@@ -178,7 +178,7 @@ fn pad_start(text: &str, width: usize, fill: char) -> String {
 pub fn format_guest_text(format_text: &str, arguments: &mut dyn FnMut(usize) -> u64, wide: bool) -> Result<String, KernelError> {
     let characters: Vec<char> = format_text.chars().collect();
     let mut out = String::new();
-    let mut output_units = 0u64; // comprimento em unidades (o `out.length` do JS)
+    let mut output_units = 0u64; // comprimento em unidades UTF-16
     let mut argument_index = 0usize;
     let mut next = |arguments: &mut dyn FnMut(usize) -> u64| {
         let value = arguments(argument_index);

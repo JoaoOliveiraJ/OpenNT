@@ -160,7 +160,7 @@ fn cmd_kill(arguments: &[&str]) {
 
 fn pending_phase(command: &str, requirement: &str) {
     console::print(&format!(
-        "{command}: ainda nao transcrito para Rust (depende de {requirement})"
+        "{command}: ainda nao implementado (depende de {requirement})"
     ));
 }
 

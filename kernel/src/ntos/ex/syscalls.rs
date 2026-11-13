@@ -104,7 +104,7 @@ fn ramsize(_: &[Value]) -> Result<Value, KernelError> {
 /// `open`/`close` pertencem ao Object Manager, ainda não implementado.
 fn object_manager_pending(_: &[Value]) -> Result<Value, KernelError> {
     Err(KernelError::with_status(
-        "syscall depende do Object Manager (ntos/ob), ainda nao transcrito",
+        "syscall depende do Object Manager (ntos/ob), ainda nao implementado",
         STATUS_NOT_IMPLEMENTED,
     ))
 }
