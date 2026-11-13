@@ -476,3 +476,270 @@ pub fn strnicmp(first: u64, second: u64, count: u64) -> i32 {
     }
     0
 }
+
+// ---- memcpy_s, strrchr, wcsspn, wcscspn, wcstoul, isspace, tolower, toupper,
+// ---- iswdigit (crt-strings) ------------------------------------------------
+//
+// As tabelas de classe são as do próprio ntoskrnl (locale C), lidas da imagem
+// com pefile: `pctype` (rva 0xEE00, 257 words com o índice -1 = 0; 128..255
+// são zero) e `pwctype` (rva 0xF002, 256 words, Latin-1). toupper passa pela
+// página ANSI instalada como o original (RtlAnsiCharToUnicodeChar +
+// RtlUpcaseUnicodeToMultiByteN, cujo NLS_UPCASE só consulta a tabela 8:4:4 a
+// partir de U+00C0). O errno global (gbl_errno) que wcstoul grava no estouro
+// não tem export e não é modelado; o tratador de parâmetro inválido do
+// kernel é um `ret`.
+
+const CRT_EINVAL: u32 = 22;
+const CRT_ERANGE: u32 = 34;
+const CRT_CLASS_UPPER: u16 = 0x001;
+const CRT_CLASS_DIGIT: u16 = 0x004;
+const CRT_CLASS_SPACE: u16 = 0x008;
+
+/// `pctype` do ntoskrnl, entradas 0..127 (128..255 são zero).
+static CRT_NARROW_CLASS: [u16; 128] = [
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x028, 0x028, 0x028, 0x028, 0x028, 0x020, 0x020,
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020,
+    0x048, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x010, 0x081, 0x081, 0x081, 0x081, 0x081, 0x081, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001,
+    0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x010, 0x082, 0x082, 0x082, 0x082, 0x082, 0x082, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002,
+    0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x002, 0x010, 0x010, 0x010, 0x010, 0x020,
+];
+
+/// `pwctype` do ntoskrnl (U+0000..U+00FF); acima disso iswctype dá 0.
+static CRT_WIDE_CLASS: [u16; 256] = [
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x068, 0x028, 0x028, 0x028, 0x028, 0x020, 0x020,
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020,
+    0x048, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x084, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x010, 0x181, 0x181, 0x181, 0x181, 0x181, 0x181, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101,
+    0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x010, 0x182, 0x182, 0x182, 0x182, 0x182, 0x182, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102,
+    0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x010, 0x010, 0x010, 0x010, 0x020,
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020,
+    0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020, 0x020,
+    0x048, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x010, 0x010, 0x014, 0x014, 0x010, 0x010, 0x010, 0x010, 0x010, 0x014, 0x010, 0x010, 0x010, 0x010, 0x010, 0x010,
+    0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101,
+    0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x010, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x101, 0x102,
+    0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102,
+    0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x010, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102, 0x102,
+];
+
+/// Inícios dos blocos de dez dígitos que `wchartodigit` reconhece.
+const CRT_DIGIT_BLOCKS: [u16; 18] = [
+    0x0030, 0x0660, 0x06F0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0C66, 0x0CE6, 0x0D66, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x17E0, 0x1810, 0xFF10,
+];
+
+/// Índice do `pctype`: EOF (-1) lê a entrada -1 (zero); o resto usa o byte baixo.
+fn narrow_class(character: u32) -> u16 {
+    if character == u32::MAX { 0 } else { CRT_NARROW_CLASS.get((character & 0xFF) as usize).copied().unwrap_or(0) }
+}
+
+/// iswctype(_l): só U+0000..U+00FF têm classe.
+fn wide_class(unit: u16) -> u16 {
+    CRT_WIDE_CLASS.get(unit as usize).copied().unwrap_or(0)
+}
+
+/// wchartodigit: valor do dígito Unicode ou None.
+fn wide_digit_value(unit: u16) -> Option<u32> {
+    CRT_DIGIT_BLOCKS.iter().find(|&&start| unit >= start && unit < start + 10).map(|&start| (unit - start) as u32)
+}
+
+fn wide_set_contains(set: u64, unit: u16) -> bool {
+    let mut cursor = set;
+    loop {
+        let candidate = guest::read16(cursor);
+        if candidate == 0 {
+            return false;
+        }
+        if candidate == unit {
+            return true;
+        }
+        cursor += 2;
+    }
+}
+
+/// memcpy_s(Dest, DestSize, Src, Count): Count 0 = sucesso; Dest nulo =
+/// EINVAL; Src nulo ou DestSize < Count zeram Dest[0..DestSize] e dão
+/// EINVAL/ERANGE.
+pub fn memcpy_s(destination: u64, size: u64, source: u64, count: u64) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    if destination == 0 {
+        return CRT_EINVAL;
+    }
+    if source != 0 && size >= count {
+        let bytes = guest::read_bytes(source, count as usize);
+        guest::write_bytes(destination, &bytes);
+        return 0;
+    }
+    guest::write_bytes(destination, &alloc::vec![0u8; size as usize]);
+    if source == 0 {
+        return CRT_EINVAL;
+    }
+    if size < count { CRT_ERANGE } else { CRT_EINVAL }
+}
+
+/// strrchr(String, Char): varre de volta a partir do terminador (achar o
+/// próprio NUL devolve o seu endereço).
+pub fn strrchr(start: u64, wanted: u8) -> u64 {
+    let mut cursor = start;
+    while guest::read8(cursor) != 0 {
+        cursor += 1;
+    }
+    loop {
+        if guest::read8(cursor) == wanted {
+            return cursor;
+        }
+        if cursor == start {
+            return 0;
+        }
+        cursor -= 1;
+    }
+}
+
+/// wcsspn(String, Set): prefixo formado só por WCHARs de Set.
+pub fn wcsspn(text: u64, set: u64) -> u64 {
+    let mut index = 0u64;
+    loop {
+        let unit = guest::read16(text + index * 2);
+        if unit == 0 || !wide_set_contains(set, unit) {
+            return index;
+        }
+        index += 1;
+    }
+}
+
+/// wcscspn(String, Set): prefixo sem nenhum WCHAR de Set.
+pub fn wcscspn(text: u64, set: u64) -> u64 {
+    let mut index = 0u64;
+    loop {
+        let unit = guest::read16(text + index * 2);
+        if unit == 0 || wide_set_contains(set, unit) {
+            return index;
+        }
+        index += 1;
+    }
+}
+
+/// wcstoul(String, EndPtr, Base) = wcstoxl(FL_UNSIGNED): brancos de
+/// `pwctype`, sinal, prefixo 0x (Base 0/16), octal com 0 inicial em Base 0,
+/// dígitos de `wchartodigit` ou letras; estouro satura em ULONG_MAX (negado
+/// se houve '-'); sem dígitos, *EndPtr = String e retorno 0.
+pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
+    if end != 0 {
+        guest::write64(end, text);
+    }
+    if text == 0 || (requested != 0 && requested.wrapping_sub(2) > 34) {
+        return 0;
+    }
+    let mut cursor = text + 2;
+    let mut unit = guest::read16(text);
+    while wide_class(unit) & CRT_CLASS_SPACE != 0 {
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let negative = unit == b'-' as u16;
+    if negative || unit == b'+' as u16 {
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let is_x = |candidate: u16| candidate.wrapping_sub(0x58) & 0xFFDF == 0;
+    let mut base = requested;
+    if base == 0 {
+        base = if wide_digit_value(unit) != Some(0) {
+            10
+        } else if is_x(guest::read16(cursor)) {
+            16
+        } else {
+            8
+        };
+    }
+    if base == 16 && wide_digit_value(unit) == Some(0) && is_x(guest::read16(cursor)) {
+        unit = guest::read16(cursor + 2);
+        cursor += 4;
+    }
+    let (limit, remainder) = (u32::MAX / base, u32::MAX % base);
+    let (mut number, mut read_digit, mut overflow) = (0u32, false, false);
+    loop {
+        let digit = match wide_digit_value(unit) {
+            Some(digit) => digit,
+            None if (0x41..=0x5A).contains(&unit) || (0x61..=0x7A).contains(&unit) => (if unit >= 0x61 { unit - 0x20 } else { unit }) as u32 - 0x37,
+            None => break,
+        };
+        if digit >= base {
+            break;
+        }
+        read_digit = true;
+        if number < limit || (number == limit && digit <= remainder) {
+            number = number * base + digit;
+        } else {
+            overflow = true;
+            if end == 0 {
+                break;
+            }
+        }
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let mut stop = cursor - 2;
+    if !read_digit {
+        stop = text;
+        number = 0;
+    } else if overflow {
+        number = u32::MAX;
+    }
+    if end != 0 {
+        guest::write64(end, stop);
+    }
+    if negative { number.wrapping_neg() } else { number }
+}
+
+/// isspace(c): bit _SPACE do `pctype`.
+pub fn isspace(character: u32) -> u32 {
+    (narrow_class(character) & CRT_CLASS_SPACE) as u32
+}
+
+/// tolower(c): soma 0x20 quando o byte baixo é _UPPER (só A..Z no locale C).
+pub fn tolower(character: u32) -> i32 {
+    (if narrow_class(character) & CRT_CLASS_UPPER != 0 { character.wrapping_add(0x20) } else { character }) as i32
+}
+
+/// NLS_UPCASE: a..z direto, < U+00C0 inalterado, resto pela tabela 8:4:4.
+fn nls_upcase_char(unit: u16) -> Result<u16, KernelError> {
+    Ok(match unit {
+        0x61..=0x7A => unit - 0x20,
+        0..=0xBF => unit,
+        _ => crate::ntos::rtl::unicode_case::upcase_char(unit)?,
+    })
+}
+
+/// toupper(c): RtlAnsiCharToUnicodeChar sobre os bytes do int e
+/// RtlUpcaseUnicodeToMultiByteN de um WCHAR (ida e volta pela página,
+/// NLS_UPCASE, de volta a MB). Dois bytes de saída viram (alto << 8) | baixo.
+pub fn toupper(character: u32) -> Result<i32, KernelError> {
+    let code_page = crate::ntos::rtl::ansi_code_page::current()?;
+    let wide = if code_page.double_byte {
+        // Um inicial DBCS consome o segundo byte do int.
+        let scratch = guest::alloc_bytes(4);
+        guest::write32(scratch, character);
+        let written = code_page.write_unicode(scratch, 2, scratch + 2, 2);
+        let unit = guest::read16(scratch + 2);
+        guest::free_bytes(scratch);
+        written?;
+        unit
+    } else {
+        code_page.multi_byte_to_unicode(character as u8 as u16)?
+    };
+    let best_fit = code_page.multi_byte_to_unicode(code_page.unicode_to_multi_byte(wide)?)?;
+    let upper = code_page.unicode_to_multi_byte(nls_upcase_char(best_fit)?)?;
+    Ok(if upper >> 8 != 0 { upper as i32 } else { (upper & 0xFF) as i32 })
+}
+
+/// iswdigit(c) = iswctype(c, _DIGIT): U+00B2/B3/B9 contam, acima de U+00FF não.
+pub fn iswdigit(unit: u16) -> u32 {
+    (wide_class(unit) & CRT_CLASS_DIGIT) as u32
+}

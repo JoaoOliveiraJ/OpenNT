@@ -226,3 +226,52 @@ pub fn reserve_clear_run(header: u64, first_bit: u32, count: u32) -> u32 {
 pub fn find_least_significant_bit(set: u64) -> i8 {
     if set == 0 { -1 } else { set.trailing_zeros() as i8 }
 }
+
+// ---- RtlFindNextForwardRunClear, RtlNumberOfSetBitsUlongPtr,
+// ---- RtlFindMostSignificantBit (rtl-bit-ops) -------------------------------
+
+/// Avança `index` enquanto os bits valem `set`, saltando palavras ULONG
+/// inteiras quando alinhado (como os laços de palavra do original).
+fn skip_run(words: u64, mut index: u32, limit: u32, set: bool) -> u32 {
+    let full = if set { u32::MAX } else { 0 };
+    while index < limit {
+        let word = guest::read32(words + (index / 32) as u64 * 4);
+        if index % 32 == 0 && limit - index >= 32 && word == full {
+            index += 32;
+            continue;
+        }
+        if ((word >> (index % 32)) & 1 != 0) != set {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+/// RtlFindNextForwardRunClear(BitMap, FromIndex, StartingRunIndex*): o
+/// primeiro bit livre em/após FromIndex vai para *StartingRunIndex e o
+/// retorno é o comprimento do run livre, limitado por SizeOfBitMap.
+/// FromIndex >= SizeOfBitMap devolve 0 com *StartingRunIndex = FromIndex;
+/// sem bit livre, *StartingRunIndex = SizeOfBitMap.
+pub fn find_next_forward_run_clear(header: u64, from: u32, start_out: u64) -> u32 {
+    let size = guest::read32(header);
+    if from >= size {
+        guest::write32(start_out, from);
+        return 0;
+    }
+    let start = skip_run(buffer(header), from, size, true);
+    let end = skip_run(buffer(header), start, size, false);
+    guest::write32(start_out, start);
+    end - start
+}
+
+/// RtlNumberOfSetBitsUlongPtr(Target): popcount de 64 bits.
+pub fn number_of_set_bits_ulong_ptr(target: u64) -> u32 {
+    target.count_ones()
+}
+
+/// RtlFindMostSignificantBit(Set): índice do bit 1 mais alto, -1 se a
+/// máscara for zero (CCHAR; o original devolve EAX = 0xFFFFFFFF).
+pub fn find_most_significant_bit(set: u64) -> i8 {
+    if set == 0 { -1 } else { (63 - set.leading_zeros()) as i8 }
+}

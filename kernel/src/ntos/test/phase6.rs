@@ -339,7 +339,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1053 && abi_names::GROUP_LAYOUT.len() == 171 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1053 exports em 171 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1095 && abi_names::GROUP_LAYOUT.len() == 176 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1095 exports em 176 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1319,7 +1319,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1053 && exports::export_names().len() == 1053, "ntoskrnl: 171 grupos com os 1053 exports implementados");
+    assert(exports::implemented() == 1095 && exports::export_names().len() == 1095, "ntoskrnl: 176 grupos com os 1095 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -4298,6 +4298,337 @@ fn mm_system_info_exports(assert: Assert) {
 }
 
 
+fn rtl_hash_tables_exports(assert: Assert) {
+    let holder = guest::alloc_bytes(8);
+    assert(call_export("RtlCreateHashTable", &[holder, 0, 0]) == Some(1), "rtl-hash-tables: RtlCreateHashTable aloca o cabecalho");
+    let table = guest::read64(holder);
+    assert(table != 0 && guest::read32(table) == 1 && guest::read32(table + 8) == 128 && guest::read32(table + 0x10) == 127 && guest::read32(table + 0xC) == 0, "rtl-hash-tables: cabecalho alocado (Flags=1) com 128 baldes, mascara 127");
+    let directory = guest::read64(table + 0x20);
+    let bucket_head = |bucket: u64| directory + bucket * 16;
+    assert(directory != 0 && guest::read64(bucket_head(0)) == bucket_head(0) && guest::read64(bucket_head(127) + 8) == bucket_head(127), "rtl-hash-tables: cabecas iniciadas vazias");
+
+    // Inserções: a segunda assinatura 5 entra antes da primeira (cadeia ordenada,
+    // nova entrada antes da primeira com Signature >= a dela).
+    let (a, b, c, d) = (guest::alloc_bytes(0x20), guest::alloc_bytes(0x20), guest::alloc_bytes(0x20), guest::alloc_bytes(0x20));
+    let inserted = [(a, 5u64), (c, 9), (b, 5), (d, 335)].iter().all(|&(entry, signature)| call_export("RtlInsertEntryHashTable", &[table, entry, signature, 0]) == Some(1));
+    assert(inserted && guest::read32(table + 0x14) == 4 && guest::read32(table + 0x18) == 3, "rtl-hash-tables: 4 entradas em 3 baldes nao vazios");
+    assert(guest::read64(bucket_head(95)) == b && guest::read64(b) == a && guest::read64(a) == bucket_head(95) && guest::read64(bucket_head(0)) == d && guest::read64(d + 0x10) == 335, "rtl-hash-tables: cadeia do balde 95 = [b, a]; 335 no balde 0");
+
+    // Lookup + GetNext percorrem as duplicatas; 7 cai num balde vazio.
+    let context = guest::alloc_bytes(0x18);
+    let first = call_export("RtlLookupEntryHashTable", &[table, 5, context]);
+    assert(first == Some(b) && guest::read64(context) == bucket_head(95) && guest::read64(context + 8) == bucket_head(95) && guest::read64(context + 0x10) == 5, "rtl-hash-tables: Lookup devolve a primeira duplicata e preenche o contexto");
+    assert(call_export("RtlGetNextEntryHashTable", &[table, context]) == Some(a) && call_export("RtlGetNextEntryHashTable", &[table, context]) == Some(0), "rtl-hash-tables: GetNext devolve a segunda duplicata e depois NULL");
+    assert(call_export("RtlLookupEntryHashTable", &[table, 7, 0]) == Some(0) && call_export("RtlLookupEntryHashTable", &[table, 9, 0]) == Some(c), "rtl-hash-tables: Lookup sem contexto (7 ausente, 9 presente)");
+
+    // Enumeração normal: marcador no balde 0; Expand recusa enquanto ativo.
+    let count = |next: &str, enumerator: u64| {
+        let mut seen = 0;
+        while let Some(entry) = call_export(next, &[table, enumerator]) {
+            if entry == 0 || seen > 8 {
+                break;
+            }
+            seen += 1;
+        }
+        seen
+    };
+    let enumerator = guest::alloc_bytes(0x28);
+    assert(call_export("RtlInitEnumerationHashTable", &[table, enumerator]) == Some(1) && guest::read32(table + 0x1C) == 1 && guest::read64(bucket_head(0)) == enumerator && guest::read64(enumerator + 0x18) == bucket_head(0), "rtl-hash-tables: InitEnumeration insere o marcador na cabeca do balde 0");
+    let normal = count("RtlEnumerateEntryHashTable", enumerator);
+    assert(normal == 4 && call_export("RtlExpandHashTable", &[table]) == Some(0), "rtl-hash-tables: enumeracao ve 4 entradas; Expand recusa com enumerador ativo");
+    call_export("RtlEndEnumerationHashTable", &[table, enumerator]);
+    assert(guest::read32(table + 0x1C) == 0 && guest::read32(table + 0x18) == 3 && guest::read64(enumerator + 0x18) == 0, "rtl-hash-tables: EndEnumeration retira o marcador e restaura os contadores");
+
+    // Variantes fraca (encaminha para a normal) e forte (sem marcador).
+    let weak = guest::alloc_bytes(0x28);
+    assert(call_export("RtlInitWeakEnumerationHashTable", &[table, weak]) == Some(1), "rtl-hash-tables: InitWeakEnumeration");
+    let weak_seen = count("RtlWeaklyEnumerateEntryHashTable", weak);
+    call_export("RtlEndWeakEnumerationHashTable", &[table, weak]);
+    let strong = guest::alloc_bytes(0x28);
+    assert(call_export("RtlInitStrongEnumerationHashTable", &[table, strong]) == Some(1) && guest::read32(table + 0x1C) == 0 && guest::read64(strong) == bucket_head(0), "rtl-hash-tables: InitStrongEnumeration nao conta enumerador");
+    let strong_seen = count("RtlStronglyEnumerateEntryHashTable", strong);
+    call_export("RtlEndStrongEnumerationHashTable", &[table, strong]);
+    assert(weak_seen == 4 && strong_seen == 4 && guest::read32(table + 0x1C) == 0, "rtl-hash-tables: enumeracoes fraca e forte veem as 4 entradas");
+
+    // Expand: 128 -> 129 baldes, diretório de dois níveis; 335 migra do balde 0
+    // para o 128 (nível 1, deslocamento 0).
+    assert(call_export("RtlExpandHashTable", &[table]) == Some(1) && guest::read32(table + 8) == 129 && guest::read32(table + 0xC) == 1 && guest::read32(table + 0x10) == 127, "rtl-hash-tables: Expand divide o balde do Pivot");
+    let first_level = guest::read64(table + 0x20);
+    let level1 = guest::read64(first_level + 8);
+    assert(first_level != directory && guest::read64(first_level) == directory && level1 != 0 && guest::read64(level1) == d && guest::read64(bucket_head(0)) == bucket_head(0) && guest::read32(table + 0x18) == 3, "rtl-hash-tables: 335 migra para o balde 128 do nivel 1");
+    assert(call_export("RtlLookupEntryHashTable", &[table, 335, 0]) == Some(d) && call_export("RtlLookupEntryHashTable", &[table, 9, 0]) == Some(c), "rtl-hash-tables: Lookup depois do Expand");
+
+    // Contract: volta a 128 baldes e ao diretório de um nível.
+    assert(call_export("RtlContractHashTable", &[table]) == Some(1) && guest::read32(table + 8) == 128 && guest::read32(table + 0xC) == 0 && guest::read64(table + 0x20) == directory && guest::read64(bucket_head(0)) == d && guest::read32(table + 0x18) == 3, "rtl-hash-tables: Contract funde o balde 128 no 0 e libera o nivel 1");
+    assert(call_export("RtlContractHashTable", &[table]) == Some(0), "rtl-hash-tables: Contract recusa no tamanho minimo");
+
+    // Remove: sem contexto, e com contexto vazio (recebe a posição).
+    assert(call_export("RtlRemoveEntryHashTable", &[table, a, 0]) == Some(1) && guest::read32(table + 0x14) == 3 && guest::read32(table + 0x18) == 3, "rtl-hash-tables: Remove de duplicata mantem o balde");
+    assert(call_export("RtlLookupEntryHashTable", &[table, 5, context]) == Some(b) && call_export("RtlGetNextEntryHashTable", &[table, context]) == Some(0), "rtl-hash-tables: resta uma entrada com assinatura 5");
+    guest::write64(context, 0);
+    assert(call_export("RtlRemoveEntryHashTable", &[table, c, context]) == Some(1) && guest::read32(table + 0x18) == 2 && guest::read64(context) == bucket_head(120) && guest::read64(bucket_head(120)) == bucket_head(120), "rtl-hash-tables: Remove esvazia o balde 120 e preenche o contexto");
+    call_export("RtlDeleteHashTable", &[table]);
+
+    // CreateEx: tamanhos inválidos; 256 baldes em dois níveis.
+    let holder2 = guest::alloc_bytes(8);
+    assert(call_export("RtlCreateHashTableEx", &[holder2, 100, 0, 0]) == Some(0) && call_export("RtlCreateHashTableEx", &[holder2, 64, 0, 0]) == Some(0) && guest::read64(holder2) == 0, "rtl-hash-tables: CreateEx recusa tamanho nao potencia de 2 ou < 128");
+    assert(call_export("RtlCreateHashTableEx", &[holder2, 256, 0, 0]) == Some(1), "rtl-hash-tables: CreateEx com 256 baldes");
+    let big = guest::read64(holder2);
+    let big_directory = guest::read64(big + 0x20);
+    assert(guest::read32(big + 8) == 256 && guest::read32(big + 0x10) == 255 && guest::read64(big_directory) != 0 && guest::read64(big_directory + 8) != 0 && guest::read64(big_directory + 16) == 0, "rtl-hash-tables: diretorio de dois niveis com niveis 0 e 1");
+    let e = guest::alloc_bytes(0x20);
+    assert(call_export("RtlInsertEntryHashTable", &[big, e, 1, 0]) == Some(1) && guest::read64(guest::read64(big_directory + 8) + 70 * 16) == e && call_export("RtlLookupEntryHashTable", &[big, 1, 0]) == Some(e), "rtl-hash-tables: assinatura 1 no balde 198 (nivel 1, deslocamento 70)");
+    call_export("RtlDeleteHashTable", &[big]);
+
+    // Cabeçalho do chamador (sem RTL_HASH_ALLOCATED_HEADER) e Shift=4: 0x50 se
+    // espalha como 5 (balde 95).
+    let header = guest::alloc_bytes(0x28);
+    let holder3 = guest::alloc_bytes(8);
+    guest::write64(holder3, header);
+    assert(call_export("RtlCreateHashTable", &[holder3, 4, 0]) == Some(1) && guest::read64(holder3) == header && guest::read32(header) == 0 && guest::read32(header + 4) == 4, "rtl-hash-tables: cabecalho fornecido pelo chamador mantem Flags=0");
+    let f = guest::alloc_bytes(0x20);
+    assert(call_export("RtlInsertEntryHashTable", &[header, f, 0x50, 0]) == Some(1) && guest::read64(guest::read64(header + 0x20) + 95 * 16) == f, "rtl-hash-tables: Shift=4 espalha 0x50 como 5");
+    call_export("RtlDeleteHashTable", &[header]);
+}
+
+
+fn rtl_strings_exports(assert: Assert) {
+    use crate::ntos::rtl::guest_strings;
+
+    let ansi = |text: &[u8]| {
+        let block = guest::alloc_bytes(16 + text.len() as u64 + 1);
+        guest::write_bytes(block + 16, text);
+        guest::write16(block, text.len() as u16);
+        guest::write16(block + 2, text.len() as u16 + 1);
+        guest::write64(block + 8, block + 16);
+        block
+    };
+    let c_string = |text: &[u8]| {
+        let block = guest::alloc_bytes(text.len() as u64 + 1);
+        guest::write_bytes(block, text);
+        block
+    };
+    let wide = |text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let block = guest::alloc_bytes(units.len() as u64 * 2 + 2);
+        for (index, unit) in units.iter().enumerate() {
+            guest::write16(block + index as u64 * 2, *unit);
+        }
+        block
+    };
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+
+    // ---- RtlInitUnicodeStringEx --------------------------------------------
+    let destination = guest::alloc_bytes(16);
+    let abc = wide("abc");
+    assert(call_export("RtlInitUnicodeStringEx", &[destination, abc]) == Some(0) && guest::read16(destination) == 6 && guest::read16(destination + 2) == 8 && guest::read64(destination + 8) == abc, "rtl-strings: RtlInitUnicodeStringEx mede o texto");
+    assert(call_export("RtlInitUnicodeStringEx", &[destination, 0]) == Some(0) && guest::read64(destination) == 0 && guest::read64(destination + 8) == 0, "rtl-strings: RtlInitUnicodeStringEx com NULL zera");
+    let long = guest::alloc_bytes(0x7FFF * 2 + 2);
+    guest::write_bytes(long, &alloc::vec![b'a'; 0x7FFF * 2]);
+    assert(status(call_export("RtlInitUnicodeStringEx", &[destination, long])) == Some(0xC000_0106) && guest::read32(destination) == 0 && guest::read64(destination + 8) == long, "rtl-strings: 0x7FFF WCHARs -> STATUS_NAME_TOO_LONG com Buffer publicado");
+
+    // ---- RtlFreeOemString: ExFreePool do Buffer, campos preservados ----------
+    let pool = call_export("ExAllocatePoolWithTag", &[0x200, 0x20, 0x7473_6554]).unwrap_or(0);
+    let oem = guest::alloc_bytes(16);
+    guest::write16(oem, 3);
+    guest::write64(oem + 8, pool);
+    call_export("RtlFreeOemString", &[oem]);
+    assert(pool != 0 && !crate::ntos::mm::kernel_pool::owns(pool) && guest::read16(oem) == 3 && guest::read64(oem + 8) == pool, "rtl-strings: RtlFreeOemString libera o Buffer sem zerar os campos");
+
+    // ---- RtlCompareString / RtlPrefixString (RtlUpperChar só ASCII) --------
+    let (s_abc, s_abd, s_upper, s_ab, s_e_acute, s_e_upper) = (ansi(b"abc"), ansi(b"abd"), ansi(b"ABC"), ansi(b"ab"), ansi(b"\xE9"), ansi(b"\xC9"));
+    let compare = |a: u64, b: u64, ci: u64| call_export("RtlCompareString", &[a, b, ci]).map(|value| value as i32);
+    assert(compare(s_abc, s_abd, 0) == Some(-1) && compare(s_upper, s_abc, 1) == Some(0) && compare(s_upper, s_abc, 0) == Some(-32) && compare(s_ab, s_abc, 0) == Some(-1), "rtl-strings: RtlCompareString diferenca de bytes e de comprimentos");
+    assert(compare(s_e_acute, s_e_upper, 1) == Some(32), "rtl-strings: RtlCompareString sem caixa nao dobra o intervalo alto");
+    assert(call_export("RtlPrefixString", &[s_ab, s_abc, 0]) == Some(1) && call_export("RtlPrefixString", &[ansi(b"AB"), s_abc, 1]) == Some(1) && call_export("RtlPrefixString", &[ansi(b"AB"), s_abc, 0]) == Some(0) && call_export("RtlPrefixString", &[ansi(b"abcd"), s_abc, 0]) == Some(0), "rtl-strings: RtlPrefixString");
+
+    // ---- RtlCharToInteger ----------------------------------------------------
+    let value = guest::alloc_bytes(4);
+    let parse = |text: &[u8], base: u64| {
+        guest::write32(value, 0xDEAD_BEEF);
+        call_export("RtlCharToInteger", &[c_string(text), base, value]).map(|status| (status as u32, guest::read32(value)))
+    };
+    assert(parse(b"  -123", 0) == Some((0, 0xFFFF_FF85)) && parse(b"0x1F", 0) == Some((0, 0x1F)) && parse(b"777", 8) == Some((0, 0x1FF)) && parse(b"101", 2) == Some((0, 5)), "rtl-strings: RtlCharToInteger sinal, prefixo 0x e bases 8/2");
+    assert(parse(b"12z", 10) == Some((0, 12)) && parse(b"0b101", 0) == Some((0, 5)) && parse(b"+ff", 16) == Some((0, 0xFF)) && parse(b"0o17", 0) == Some((0, 15)) && parse(b"09", 0) == Some((0, 9)) && parse(b"\t\n42", 10) == Some((0, 42)), "rtl-strings: RtlCharToInteger para no primeiro nao digito; 0 inicial sem prefixo e decimal");
+    assert(parse(b"5", 7).map(|(status, _)| status) == Some(0xC000_000D), "rtl-strings: RtlCharToInteger base 7 -> STATUS_INVALID_PARAMETER");
+
+    // ---- RtlIntegerToUnicode -------------------------------------------------
+    let output = guest::alloc_bytes(32);
+    let render = |number: u64, base: u64, length: i32| {
+        for offset in (0..32).step_by(2) {
+            guest::write16(output + offset, 0xFFFF);
+        }
+        let status = call_export("RtlIntegerToUnicode", &[number, base, length as u32 as u64, output]).map(|status| status as u32);
+        let units: Vec<u16> = (0..16).map(|index| guest::read16(output + index * 2)).collect();
+        (status, units)
+    };
+    let text = |units: &[u16], count: usize| String::from_utf16_lossy(&units[..count]);
+    let (status_a, units_a) = render(1234, 10, 10);
+    let (status_b, units_b) = render(0xBEEF, 16, 4);
+    let (status_c, units_c) = render(5, 2, -8);
+    assert(status_a == Some(0) && text(&units_a, 4) == "1234" && units_a[4] == 0, "rtl-strings: RtlIntegerToUnicode decimal termina com NUL");
+    assert(status_b == Some(0) && text(&units_b, 4) == "BEEF" && units_b[4] == 0xFFFF && status_c == Some(0) && text(&units_c, 8) == "00000101" && units_c[8] == 0xFFFF, "rtl-strings: RtlIntegerToUnicode hex justo sem NUL; comprimento negativo preenche com zeros");
+    assert(render(123456, 10, 3).0 == Some(0x8000_0005) && render(7, 3, 10).0 == Some(0xC000_000D), "rtl-strings: RtlIntegerToUnicode BUFFER_OVERFLOW e base invalida");
+
+    // ---- RtlConvertSidToUnicodeString (SID no pool: RtlValidSid recusa usuário)
+    let sid = call_export("ExAllocatePoolWithTag", &[0x200, 0x40, 0x7473_6554]).unwrap_or(0);
+    let sid_bytes = |authority: [u8; 6], subs: &[u32]| {
+        guest::write8(sid, 1);
+        guest::write8(sid + 1, subs.len() as u8);
+        guest::write_bytes(sid + 2, &authority);
+        for (index, sub) in subs.iter().enumerate() {
+            guest::write32(sid + 8 + index as u64 * 4, *sub);
+        }
+    };
+    sid_bytes([0, 0, 0, 0, 0, 5], &[21, 1_234_567_890, 4_294_967_295, 500]);
+    let unicode_string = guest::alloc_bytes(16);
+    assert(call_export("RtlConvertSidToUnicodeString", &[unicode_string, sid, 1]) == Some(0) && guest_strings::read_unicode_string(unicode_string) == "S-1-5-21-1234567890-4294967295-500", "rtl-strings: RtlConvertSidToUnicodeString aloca o texto decimal");
+    call_export("RtlFreeUnicodeString", &[unicode_string]);
+    sid_bytes([0x12, 0x34, 0, 0, 0, 1], &[7]);
+    let fixed = guest::alloc_bytes(64);
+    guest::write16(unicode_string, 0);
+    guest::write16(unicode_string + 2, 64);
+    guest::write64(unicode_string + 8, fixed);
+    assert(call_export("RtlConvertSidToUnicodeString", &[unicode_string, sid, 0]) == Some(0) && guest_strings::read_unicode_string(unicode_string) == "S-1-0x123400000001-7" && guest::read16(unicode_string) == 40 && guest::read16(fixed + 40) == 0, "rtl-strings: autoridade de 48 bits em hex no buffer do chamador");
+    guest::write16(unicode_string + 2, 40);
+    assert(status(call_export("RtlConvertSidToUnicodeString", &[unicode_string, sid, 0])) == Some(0x8000_0005), "rtl-strings: Length >= MaximumLength -> BUFFER_OVERFLOW");
+    guest::write8(sid, 2);
+    assert(status(call_export("RtlConvertSidToUnicodeString", &[unicode_string, sid, 1])) == Some(0xC000_0078), "rtl-strings: revisao 2 -> STATUS_INVALID_SID");
+    call_export("ExFreePool", &[sid]);
+
+    // ---- RtlUnicodeToMultiByteN / Size (c_1252: é=E9, €=80, 一 -> '?') ----
+    let source = wide("A\u{e9}\u{20ac}\u{4e00}");
+    let bytes = guest::alloc_bytes(16);
+    let written = guest::alloc_bytes(4);
+    guest::write_bytes(bytes, &[0xCC; 8]);
+    assert(call_export("RtlUnicodeToMultiByteN", &[bytes, 3, written, source, 8]) == Some(0) && guest::read32(written) == 3 && guest::read_bytes(bytes, 4) == [0x41, 0xE9, 0x80, 0xCC], "rtl-strings: RtlUnicodeToMultiByteN limitado por MaxBytes");
+    assert(call_export("RtlUnicodeToMultiByteN", &[bytes, 10, written, source, 8]) == Some(0) && guest::read32(written) == 4 && guest::read_bytes(bytes, 4) == [0x41, 0xE9, 0x80, 0x3F], "rtl-strings: RtlUnicodeToMultiByteN usa o caractere padrao da WideCharTable");
+    assert(call_export("RtlUnicodeToMultiByteSize", &[written, source, 8]) == Some(0) && guest::read32(written) == 4 && call_export("RtlUnicodeToMultiByteSize", &[written, source, 7]) == Some(0) && guest::read32(written) == 3, "rtl-strings: RtlUnicodeToMultiByteSize em SBCS = WCHARs");
+
+    // ---- correção do RtlAnsiCharToUnicodeChar: bytes >= 0x80 pela c_1252
+    // (0x80 -> U+20AC, 0x9A -> U+0161), avançando o ponteiro um byte cada.
+    let high = guest::alloc_bytes(4);
+    guest::write_bytes(high, &[0x80, 0x9A]);
+    let pointer_field = guest::alloc_bytes(8);
+    guest::write64(pointer_field, high);
+    let euro = call_export("RtlAnsiCharToUnicodeChar", &[pointer_field]);
+    let caron = call_export("RtlAnsiCharToUnicodeChar", &[pointer_field]);
+    assert(euro == Some(0x20AC) && caron == Some(0x0161) && guest::read64(pointer_field) == high + 2, "rtl-strings: RtlAnsiCharToUnicodeChar traduz bytes >= 0x80 pela pagina ANSI");
+}
+
+
+fn rtl_bit_ops_exports(assert: Assert) {
+    // Bitmap de 100 bits: 0..9 e 40..63 ocupados (palavras 0x3FF, 0xFFFFFF00, 0, 0).
+    let words = guest::alloc_bytes(16);
+    for (index, word) in [0x0000_03FFu32, 0xFFFF_FF00, 0, 0].iter().enumerate() {
+        guest::write32(words + index as u64 * 4, *word);
+    }
+    let header = guest::alloc_bytes(16);
+    guest::write32(header, 100);
+    guest::write64(header + 8, words);
+    let start = guest::alloc_bytes(4);
+    let run = |from: u64| call_export("RtlFindNextForwardRunClear", &[header, from, start]).map(|length| (guest::read32(start), length as u32));
+    assert(run(0) == Some((10, 30)) && run(5) == Some((10, 30)) && run(20) == Some((20, 20)), "rtl-bit-ops: RtlFindNextForwardRunClear acha o primeiro run livre");
+    assert(run(45) == Some((64, 36)) && run(63) == Some((64, 36)) && run(64) == Some((64, 36)), "rtl-bit-ops: run livre atravessa palavras ate SizeOfBitMap");
+    assert(run(100) == Some((100, 0)) && run(150) == Some((150, 0)), "rtl-bit-ops: FromIndex fora do mapa devolve 0");
+    guest::write32(words + 8, u32::MAX);
+    guest::write32(words + 12, u32::MAX);
+    assert(run(64) == Some((100, 0)), "rtl-bit-ops: sem bit livre, StartingRunIndex = SizeOfBitMap");
+
+    assert(call_export("RtlNumberOfSetBitsUlongPtr", &[0xF0F0_0000_0000_0001]) == Some(9) && call_export("RtlNumberOfSetBitsUlongPtr", &[u64::MAX]) == Some(64) && call_export("RtlNumberOfSetBitsUlongPtr", &[0]) == Some(0), "rtl-bit-ops: RtlNumberOfSetBitsUlongPtr");
+    assert(call_export("RtlFindMostSignificantBit", &[0x8000_0000_0000_0000]) == Some(63) && call_export("RtlFindMostSignificantBit", &[1]) == Some(0) && call_export("RtlFindMostSignificantBit", &[0x0000_0100_0000_0000]) == Some(40) && call_export("RtlFindMostSignificantBit", &[0x123]) == Some(8) && call_export("RtlFindMostSignificantBit", &[0]) == Some(0xFFFF_FFFF), "rtl-bit-ops: RtlFindMostSignificantBit (zero -> -1)");
+
+    // CRC-32 de "123456789" = 0xCBF43926, inteiro e encadeado ("1234" + "56789").
+    let digits = guest::alloc_bytes(16);
+    guest::write_bytes(digits, b"123456789");
+    let whole = call_export("RtlComputeCrc32", &[0, digits, 9]);
+    let head = call_export("RtlComputeCrc32", &[0, digits, 4]).unwrap_or(0);
+    let chained = call_export("RtlComputeCrc32", &[head, digits + 4, 5]);
+    assert(whole == Some(0xCBF4_3926) && chained == Some(0xCBF4_3926) && call_export("RtlComputeCrc32", &[0x1234, digits, 0]) == Some(0x1234), "rtl-bit-ops: RtlComputeCrc32 IEEE, encadeavel, Length 0 devolve o parcial");
+}
+
+
+fn crt_strings_exports(assert: Assert) {
+    let int = |value: Option<u64>| value.map(|value| value as i32);
+    let wide = |text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let block = guest::alloc_bytes(units.len() as u64 * 2 + 8);
+        for (index, unit) in units.iter().enumerate() {
+            guest::write16(block + index as u64 * 2, *unit);
+        }
+        block
+    };
+
+    // ---- memcpy_s ------------------------------------------------------------
+    let (destination, source) = (guest::alloc_bytes(16), guest::alloc_bytes(16));
+    guest::write_bytes(source, b"ABCD");
+    guest::write_bytes(destination, &[0xEE; 8]);
+    assert(call_export("memcpy_s", &[destination, 8, source, 4]) == Some(0) && guest::read_bytes(destination, 6) == b"ABCD\xEE\xEE", "crt-strings: memcpy_s copia Count bytes");
+    guest::write_bytes(destination, &[0xEE; 8]);
+    assert(call_export("memcpy_s", &[destination, 2, source, 4]) == Some(34) && guest::read_bytes(destination, 3) == [0, 0, 0xEE], "crt-strings: memcpy_s DestSize < Count -> ERANGE e zera DestSize bytes");
+    guest::write_bytes(destination, &[0xEE; 8]);
+    assert(call_export("memcpy_s", &[destination, 8, 0, 4]) == Some(22) && guest::read_bytes(destination, 8) == [0; 8], "crt-strings: memcpy_s Src nulo -> EINVAL e zera o destino");
+    assert(call_export("memcpy_s", &[0, 8, source, 4]) == Some(22) && call_export("memcpy_s", &[0, 0, 0, 0]) == Some(0), "crt-strings: memcpy_s Dest nulo -> EINVAL; Count 0 -> 0");
+
+    // ---- strrchr -------------------------------------------------------------
+    let path = guest::alloc_bytes(16);
+    guest::write_bytes(path, b"a/b/c");
+    let rooted = guest::alloc_bytes(8);
+    guest::write_bytes(rooted, b"/abc");
+    assert(call_export("strrchr", &[path, b'/' as u64]) == Some(path + 3) && call_export("strrchr", &[path, b'z' as u64]) == Some(0) && call_export("strrchr", &[path, 0]) == Some(path + 5) && call_export("strrchr", &[rooted, b'/' as u64]) == Some(rooted), "crt-strings: strrchr ultima ocorrencia, terminador e primeiro caractere");
+
+    // ---- wcsspn / wcscspn ----------------------------------------------------
+    let (text, empty) = (wide("abcxyz"), wide(""));
+    assert(call_export("wcsspn", &[text, wide("cba")]) == Some(3) && call_export("wcsspn", &[empty, wide("a")]) == Some(0) && call_export("wcsspn", &[text, text]) == Some(6), "crt-strings: wcsspn");
+    assert(call_export("wcscspn", &[text, wide("zyx")]) == Some(3) && call_export("wcscspn", &[text, empty]) == Some(6) && call_export("wcscspn", &[text, wide("a")]) == Some(0), "crt-strings: wcscspn");
+
+    // ---- wcstoul -------------------------------------------------------------
+    let end = guest::alloc_bytes(8);
+    let parse = |text: &str, base: u64| {
+        let block = wide(text);
+        let value = call_export("wcstoul", &[block, end, base]).unwrap_or(0xDEAD);
+        (value, (guest::read64(end) - block) / 2)
+    };
+    assert(parse(" \t+123abc", 10) == (123, 6) && parse("0x1F", 0) == (0x1F, 4) && parse("0X1f", 16) == (0x1F, 4) && parse("017", 0) == (15, 3), "crt-strings: wcstoul brancos, sinal, prefixo 0x e octal");
+    assert(parse("-1", 10) == (0xFFFF_FFFF, 2) && parse("4294967296", 10) == (0xFFFF_FFFF, 10) && parse("-4294967296", 10) == (1, 11), "crt-strings: wcstoul negacao e saturacao em ULONG_MAX");
+    assert(parse("zz", 36) == (1295, 2) && parse("1Z", 36) == (71, 2) && parse("\u{663}\u{664}", 10) == (34, 2) && parse("\u{a0} 42", 0) == (42, 4), "crt-strings: wcstoul letras, digitos arabe-indicos e NBSP como branco");
+    assert(parse("xyz", 10) == (0, 0) && parse("0x", 16) == (0, 0) && parse("5", 1) == (0, 0), "crt-strings: wcstoul sem digitos ou base invalida devolve 0 com EndPtr = String");
+    assert(call_export("wcstoul", &[wide("77"), 0, 8]) == Some(63), "crt-strings: wcstoul sem EndPtr");
+
+    // ---- classificação ---------------------------------------------------------
+    assert(call_export("isspace", &[0x20]) == Some(8) && call_export("isspace", &[0x0B]) == Some(8) && call_export("isspace", &[0xA0]) == Some(0) && call_export("isspace", &[0xFFFF_FFFF]) == Some(0) && call_export("isspace", &[0x109]) == Some(8) && call_export("isspace", &[b'x' as u64]) == Some(0), "crt-strings: isspace pelo pctype (byte baixo, EOF = 0)");
+    assert(int(call_export("tolower", &[b'A' as u64])) == Some(b'a' as i32) && int(call_export("tolower", &[0x141])) == Some(0x161) && int(call_export("tolower", &[0xC9])) == Some(0xC9) && int(call_export("tolower", &[0xFFFF_FFFF])) == Some(-1), "crt-strings: tolower so A..Z do locale C");
+    assert(int(call_export("toupper", &[b'a' as u64])) == Some(b'A' as i32) && int(call_export("toupper", &[0xE9])) == Some(0xC9) && int(call_export("toupper", &[0x9A])) == Some(0x8A) && int(call_export("toupper", &[0xFF])) == Some(0x9F) && int(call_export("toupper", &[0xB5])) == Some(0xB5) && int(call_export("toupper", &[0x161])) == Some(0x41), "crt-strings: toupper pela pagina ANSI (1252)");
+    assert(call_export("iswdigit", &[b'7' as u64]) == Some(4) && call_export("iswdigit", &[0xB2]) == Some(4) && call_export("iswdigit", &[0x663]) == Some(0) && call_export("iswdigit", &[b'a' as u64]) == Some(0), "crt-strings: iswdigit pelo pwctype");
+}
+
+
+fn crt_formatting_exports(assert: Assert) {
+    let int = |value: Option<u64>| value.map(|value| value as i32);
+    let buffer = guest::alloc_bytes(32);
+    let format = guest::alloc_bytes(16);
+    guest::write_bytes(format, b"%d-%s");
+    let word = guest::alloc_bytes(8);
+    guest::write_bytes(word, b"xy");
+    // va_list MS x64: slots de 8 bytes.
+    let va_list = guest::alloc_bytes(16);
+    guest::write64(va_list, 42);
+    guest::write64(va_list + 8, word);
+
+    guest::write_bytes(buffer, &[0xEE; 8]);
+    assert(int(call_export("vsprintf_s", &[buffer, 6, format, va_list])) == Some(5) && guest::read_bytes(buffer, 7) == b"42-xy\0\xEE", "crt-formatting: vsprintf_s formata e termina");
+    guest::write_bytes(buffer, &[0xEE; 8]);
+    assert(int(call_export("vsprintf_s", &[buffer, 5, format, va_list])) == Some(-1) && guest::read8(buffer) == 0 && guest::read8(buffer + 4) == 0 && guest::read8(buffer + 5) == 0xEE, "crt-formatting: vsprintf_s sem espaco para o NUL -> Buffer[0] = 0 e -1");
+    assert(int(call_export("vsprintf_s", &[0, 6, format, va_list])) == Some(-1) && int(call_export("vsprintf_s", &[buffer, 0, format, va_list])) == Some(-1) && int(call_export("vsprintf_s", &[buffer, 6, 0, va_list])) == Some(-1), "crt-formatting: vsprintf_s parametros nulos -> -1");
+    guest::write8(buffer, 0x41);
+    assert(int(call_export("vsprintf_s", &[buffer, 0x8000_0000, format, va_list])) == Some(-1) && guest::read8(buffer) == 0, "crt-formatting: SizeOfBuffer > INT_MAX recusa com Buffer[0] = 0");
+
+    let hex_format = guest::alloc_bytes(16);
+    guest::write_bytes(hex_format, b"%u:%x");
+    assert(int(call_export("sprintf_s", &[buffer, 16, hex_format, 7, 255])) == Some(4) && guest::read_bytes(buffer, 5) == b"7:ff\0", "crt-formatting: sprintf_s variadico");
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -4371,5 +4702,10 @@ pub fn run(assert: Assert) {
     mm_secure_memory_exports(assert);
     mm_physical_memory_exports(assert);
     mm_system_info_exports(assert);
+    rtl_hash_tables_exports(assert);
+    rtl_strings_exports(assert);
+    rtl_bit_ops_exports(assert);
+    crt_strings_exports(assert);
+    crt_formatting_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }

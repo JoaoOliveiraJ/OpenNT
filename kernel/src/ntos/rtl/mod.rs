@@ -45,3 +45,5 @@ pub mod stack_trace;
 pub mod system_volume;
 pub mod time;
 pub mod version;
+pub mod hash_table;
+pub mod checksum;

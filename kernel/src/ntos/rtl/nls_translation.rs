@@ -57,22 +57,93 @@ pub fn ansi_char_to_unicode_char(pointer_field: u64) -> u16 {
     if byte < 0x80 {
         byte as u16
     } else {
-        match crate::ntos::rtl::ansi_code_page::current() {
-            Ok(code_page) => {
-                let input = guest::alloc_bytes(1);
-                let output = guest::alloc_bytes(2);
-                guest::write8(input, byte);
-                let unit = code_page.write_unicode(input, 1, output, 1).ok().map_or(byte as u16, |_| guest::read16(output));
-                guest::free_bytes(input);
-                guest::free_bytes(output);
-                unit
-            }
-            Err(_) => byte as u16,
-        }
+        installed_ansi_char(byte)
     }
 }
 
 /// RtlUpcaseUnicodeChar: ASCII e Latin-1 (exceto ÷).
 pub fn upcase_unicode_char(code: u16) -> u16 {
     if (0x61..=0x7A).contains(&code) || ((0xE0..=0xFE).contains(&code) && code != 0xF7) { code - 0x20 } else { code }
+}
+
+// ---- RtlUnicodeToMultiByteN / RtlUnicodeToMultiByteSize (rtl-strings) -----
+//
+// Pela WideCharTable da página ANSI instalada (c_1252.nls). O ramo de
+// processo UTF-8 do original (RtlpIsUtf8Process: PEB sem AnsiCodePageData)
+// não existe no OpenNT, cujos processos recebem a página instalada.
+
+/// RtlUnicodeToMultiByteN(MbString, MaxBytes, BytesWritten*, Unicode,
+/// UnicodeBytes): SBCS copia min(MaxBytes, WCHARs) bytes; DBCS grava 1 ou 2
+/// bytes por WCHAR e para quando um par não cabe. Sempre STATUS_SUCCESS.
+pub fn unicode_to_multi_byte_n(output: u64, maximum: u32, written: u64, source: u64, source_bytes: u32) -> Result<u32, KernelError> {
+    let code_page = crate::ntos::rtl::ansi_code_page::current()?;
+    let units = source_bytes >> 1;
+    if !code_page.double_byte {
+        let count = maximum.min(units);
+        if written != 0 {
+            guest::write32(written, count);
+        }
+        for index in 0..count as u64 {
+            let code = code_page.unicode_to_multi_byte(guest::read16(source + index * 2))?;
+            guest::write8(output + index, code as u8);
+        }
+        return Ok(0);
+    }
+    let (mut cursor, mut remaining, mut left, mut unit_pointer) = (output, maximum, units, source);
+    while left != 0 && remaining != 0 {
+        let code = code_page.unicode_to_multi_byte(guest::read16(unit_pointer))?;
+        unit_pointer += 2;
+        let lead = (code >> 8) as u8;
+        if lead != 0 {
+            let available = remaining;
+            remaining = remaining.wrapping_sub(1);
+            if available < 2 {
+                break;
+            }
+            guest::write8(cursor, lead);
+            cursor += 1;
+        }
+        guest::write8(cursor, code as u8);
+        remaining = remaining.wrapping_sub(1);
+        cursor += 1;
+        left -= 1;
+    }
+    if written != 0 {
+        guest::write32(written, (cursor - output) as u32);
+    }
+    Ok(0)
+}
+
+/// RtlUnicodeToMultiByteSize(BytesInMultiByte*, Unicode, UnicodeBytes): SBCS
+/// = WCHARs; DBCS soma 2 por WCHAR com inicial. Sempre STATUS_SUCCESS.
+pub fn unicode_to_multi_byte_size(output: u64, source: u64, source_bytes: u32) -> Result<u32, KernelError> {
+    let code_page = crate::ntos::rtl::ansi_code_page::current()?;
+    let units = source_bytes >> 1;
+    let mut size = units;
+    if code_page.double_byte {
+        size = 0;
+        for index in 0..units as u64 {
+            let code = code_page.unicode_to_multi_byte(guest::read16(source + index * 2))?;
+            size += if code >> 8 != 0 { 2 } else { 1 };
+        }
+    }
+    guest::write32(output, size);
+    Ok(0)
+}
+
+// ---- RtlAnsiCharToUnicodeChar: intervalo alto pela página (correção) -------
+//
+// O ramo alto de `ansi_char_to_unicode_char` chamava
+// `write_unicode(input, 1, output, 1)`: com capacidade de 1 byte nada cabe
+// (`written + 2 <= capacity` falha), o WCHAR de saída ficava no zero da
+// alocação e todo byte >= 0x80 virava U+0000. O original lê
+// NlsAnsiToUnicodeData[byte]; este é esse acesso, sem buffers temporários.
+
+/// NlsAnsiToUnicodeData[byte] da página instalada; identidade se o NLS não
+/// estiver disponível (o recuo que `ansi_char_to_unicode_char` documenta).
+fn installed_ansi_char(byte: u8) -> u16 {
+    crate::ntos::rtl::ansi_code_page::current()
+        .ok()
+        .and_then(|code_page| code_page.multi_byte_to_unicode(byte as u16).ok())
+        .unwrap_or(byte as u16)
 }

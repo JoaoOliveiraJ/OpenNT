@@ -160,3 +160,35 @@ pub fn ansi_to_unicode(destination: u64, source: u64, allocate: bool) -> Result<
         }
     }
 }
+
+// ---- Direção Unicode -> MB da página instalada (rtl-strings) ---------------
+
+impl CodePage {
+    /// WideCharTable do RtlInitCodePageTable (NlsUnicodeToAnsiData /
+    /// NlsUnicodeToMbAnsiData): começa em (cabeçalho + word[cabeçalho] + 1)
+    /// words; SBCS guarda um byte por WCHAR e DBCS uma word (byte alto =
+    /// inicial). Conferido na c_1252.nls real: cabeçalho 13, word[13] = 259,
+    /// tabela no byte 546 com exatamente 65536 bytes (U+20AC -> 0x80,
+    /// U+4E00 -> 0x3F).
+    pub fn unicode_to_multi_byte(&self, unit: u16) -> Result<u16, KernelError> {
+        let header = word(&self.table, 0)? as usize;
+        let base = (header + word(&self.table, header * 2)? as usize + 1) * 2;
+        if self.double_byte {
+            word(&self.table, base + unit as usize * 2)
+        } else {
+            self.table.get(base + unit as usize).map(|&byte| byte as u16).ok_or_else(|| KernelError::new("NLS: invalid code-page table offset"))
+        }
+    }
+
+    /// Código MB (byte alto = inicial DBCS, como sai da WideCharTable) de
+    /// volta a WCHAR: NlsMbAnsiCodePageTables para iniciais, senão
+    /// NlsAnsiToUnicodeData.
+    pub fn multi_byte_to_unicode(&self, code: u16) -> Result<u16, KernelError> {
+        let leading = if self.double_byte { self.leading[(code >> 8) as usize] } else { 0 };
+        if leading != 0 {
+            word(&self.table, self.double_byte_offset + (leading as usize + (code & 0xFF) as usize) * 2)
+        } else {
+            Ok(self.single[(code & 0xFF) as usize])
+        }
+    }
+}

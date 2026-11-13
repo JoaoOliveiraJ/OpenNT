@@ -117,3 +117,132 @@ pub fn int64_to_unicode_string(value: u64, base: u32, string: u64) -> u32 {
     }
     store_counted_unicode(string, &format_radix64(value, base))
 }
+
+// ---- RtlCharToInteger e RtlIntegerToUnicode (rtl-strings) ------------------
+
+/// RtlCharToInteger(String, Base, Value): brancos (byte com sinal <= 0x20),
+/// um sinal, prefixo 0x/0o/0b só com Base 0 (um 0 inicial sem prefixo fica
+/// decimal); dígitos 0-9/A-F/a-f abaixo da base, acumulados em 32 bits (por
+/// deslocamento em 2/8/16). Base fora de {0, 2, 8, 10, 16} =
+/// STATUS_INVALID_PARAMETER sem escrever Value.
+pub fn char_to_integer(string: u64, base: u32, value: u64) -> u32 {
+    let mut cursor = string;
+    let mut sign = guest::read8(cursor);
+    let mut character;
+    if sign as i8 <= 0x20 {
+        loop {
+            let previous = cursor;
+            cursor += 1;
+            let next = guest::read8(cursor);
+            if next == 0 {
+                // Só brancos: o último deles vira o caractere corrente.
+                cursor = previous;
+                character = sign;
+                break;
+            }
+            sign = next;
+            if next as i8 > 0x20 {
+                cursor += 1;
+                character = sign;
+                break;
+            }
+        }
+    } else {
+        cursor += 1;
+        character = sign;
+    }
+    if character == b'+' || character == b'-' {
+        character = guest::read8(cursor);
+        cursor += 1;
+    }
+    let after = cursor;
+    let (shift, radix) = match base {
+        0 => {
+            let mut chosen = (0, 10);
+            if character == b'0' {
+                character = guest::read8(cursor);
+                cursor += 1;
+                chosen = match character {
+                    b'x' => (4, 16),
+                    b'o' => (3, 8),
+                    b'b' => (1, 2),
+                    _ => (0, 10),
+                };
+                if chosen.0 != 0 {
+                    character = guest::read8(cursor);
+                    cursor += 1;
+                } else {
+                    cursor = after + 1;
+                }
+            }
+            chosen
+        }
+        16 => (4, 16),
+        10 => (0, 10),
+        2 => (1, 2),
+        8 => (3, 8),
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    let mut result = 0u32;
+    while character != 0 {
+        let digit = match character {
+            b'0'..=b'9' => (character - b'0') as u32,
+            b'A'..=b'F' => (character - 0x37) as u32,
+            b'a'..=b'f' => (character - 0x57) as u32,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        result = if shift != 0 { (result << shift) | digit } else { result.wrapping_mul(radix).wrapping_add(digit) };
+        character = guest::read8(cursor);
+        cursor += 1;
+    }
+    guest::write32(value, if sign == b'-' { result.wrapping_neg() } else { result });
+    0
+}
+
+/// Dígitos de RtlIntegerToUnicode (RtlpIntegerWChars, hex maiúsculo; base 0
+/// vale 10).
+fn integer_text(value: u32, base: u32) -> Option<String> {
+    Some(match base {
+        0 | 10 => alloc::format!("{value}"),
+        16 => alloc::format!("{value:X}"),
+        8 => alloc::format!("{value:o}"),
+        2 => alloc::format!("{value:b}"),
+        _ => return None,
+    })
+}
+
+/// RtlIntegerToUnicode(Value, Base, OutputLength, String): OutputLength
+/// negativo preenche com '0' à esquerda até |OutputLength| e não termina;
+/// positivo termina com NUL quando sobra espaço; dígitos além do limite =
+/// STATUS_BUFFER_OVERFLOW.
+pub fn integer_to_unicode(value: u32, base: u32, length: i32, output: u64) -> u32 {
+    let Some(text) = integer_text(value, base) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let count = text.len() as i32;
+    let mut output = output;
+    let mut limit = length;
+    if length < 0 {
+        limit = length.wrapping_neg();
+        if count < limit {
+            for index in 0..(limit - count) as u64 {
+                guest::write16(output + index * 2, b'0' as u16);
+            }
+            output += (limit - count) as u64 * 2;
+            limit = count;
+        }
+    }
+    if count > limit {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    for (index, digit) in text.bytes().enumerate() {
+        guest::write16(output + index as u64 * 2, digit as u16);
+    }
+    if count < limit {
+        guest::write16(output + count as u64 * 2, 0);
+    }
+    0
+}

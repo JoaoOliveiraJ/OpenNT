@@ -110,3 +110,50 @@ pub fn debug_print_with_prefix(prefix: u64, format: u64, va_list: u64) -> Result
     debug_print!("{}{}", prefix, text);
     Ok(())
 }
+
+// ---- sprintf_s e vsprintf_s (crt-formatting) -------------------------------
+//
+// Contrato do original (vsprintf_s -> soutput_s -> output_s): Buffer,
+// SizeOfBuffer e Format não nulos, senão -1; SizeOfBuffer acima de 0x7FFFFFFF
+// (exceto SIZE_MAX, que vale 0x7FFFFFFF) recusa com Buffer[0] = 0. O texto vai
+// até SizeOfBuffer caracteres e Buffer[Size-1] recebe NUL sempre; se texto +
+// NUL não couberem, Buffer[0] = 0 e -1, senão o comprimento sem o NUL. O
+// tratador de parâmetro inválido do kernel é `ret`.
+
+/// Corpo comum de sprintf_s/vsprintf_s; devolve o int da CRT estendido.
+fn print_secure(buffer: u64, size: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    const FAILED: u64 = -1i64 as u64;
+    const MAXIMUM_COUNT: u64 = 0x7FFF_FFFF;
+    if buffer == 0 || size == 0 || format == 0 {
+        return Ok(FAILED);
+    }
+    if size > MAXIMUM_COUNT && size != u64::MAX {
+        guest::write8(buffer, 0);
+        return Ok(FAILED);
+    }
+    let count = size.min(MAXIMUM_COUNT);
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), arguments, false)?;
+    // Texto estreito: cada `char` é um byte (Latin-1).
+    let bytes: Vec<u8> = text.chars().map(|character| character as u32 as u8).collect();
+    let length = bytes.len() as u64;
+    guest::write_bytes(buffer, &bytes[..length.min(count) as usize]);
+    guest::write8(buffer.wrapping_add(size).wrapping_sub(1), 0);
+    if length < count {
+        guest::write8(buffer + length, 0);
+        Ok(length)
+    } else {
+        guest::write8(buffer, 0);
+        Ok(FAILED)
+    }
+}
+
+/// sprintf_s(Buffer, SizeOfBuffer, Format, ...): o va_list começa no quarto
+/// argumento.
+pub fn sprintf_s(buffer: u64, size: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
+    print_secure(buffer, size, format, &mut variadic(arguments))
+}
+
+/// vsprintf_s(Buffer, SizeOfBuffer, Format, ArgList).
+pub fn vsprintf_s(buffer: u64, size: u64, format: u64, va_list: u64) -> Result<u64, KernelError> {
+    print_secure(buffer, size, format, &mut guest_strings::guest_format_arguments(va_list))
+}

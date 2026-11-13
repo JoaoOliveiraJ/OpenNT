@@ -136,3 +136,56 @@ pub fn append_string(dest: u64, src: u64) -> u32 {
     guest::write16(dest, (dest_len + src_len) as u16);
     0
 }
+
+// ---- RtlFreeOemString, RtlCompareString, RtlPrefixString (rtl-strings) -----
+
+/// RtlFreeOemString: só ExFreePool(Buffer); ao contrário do RtlFreeAnsiString
+/// do OpenNT, os campos ficam como estão (o original não os toca).
+pub fn free_oem_string(string: u64) -> Result<(), crate::rtl::KernelError> {
+    let buffer = guest::read64(string + 8);
+    if buffer != 0 {
+        crate::ntos::ex::pool_allocation::free(buffer, 0)?;
+    }
+    Ok(())
+}
+
+/// RtlUpperChar desta build: só a..z (o resto, inclusive o intervalo alto,
+/// passa igual).
+fn upper_ansi_char(character: u8) -> u8 {
+    if character.wrapping_sub(b'a') <= 25 { character ^ 0x20 } else { character }
+}
+
+/// RtlCompareString(S1, S2, CaseInSensitive): diferença dos bytes sem sinal
+/// (depois do RtlUpperChar, se sem caixa) na primeira divergência; senão
+/// Length1 - Length2.
+pub fn compare_ansi(left: u64, right: u64, case_insensitive: bool) -> i32 {
+    let (left_length, right_length) = (guest::read16(left) as i32, guest::read16(right) as i32);
+    let (left_buffer, right_buffer) = (guest::read64(left + 8), guest::read64(right + 8));
+    for index in 0..left_length.min(right_length) as u64 {
+        let (mut a, mut b) = (guest::read8(left_buffer + index), guest::read8(right_buffer + index));
+        if a != b {
+            if case_insensitive {
+                a = upper_ansi_char(a);
+                b = upper_ansi_char(b);
+                if a == b {
+                    continue;
+                }
+            }
+            return a as i32 - b as i32;
+        }
+    }
+    left_length - right_length
+}
+
+/// RtlPrefixString(S1, S2, CaseInSensitive): S1 é prefixo de S2.
+pub fn prefix_ansi(prefix: u64, text: u64, case_insensitive: bool) -> bool {
+    let length = guest::read16(prefix) as u64;
+    if (guest::read16(text) as u64) < length {
+        return false;
+    }
+    let (prefix_buffer, text_buffer) = (guest::read64(prefix + 8), guest::read64(text + 8));
+    (0..length).all(|index| {
+        let (a, b) = (guest::read8(prefix_buffer + index), guest::read8(text_buffer + index));
+        a == b || (case_insensitive && upper_ansi_char(a) == upper_ansi_char(b))
+    })
+}

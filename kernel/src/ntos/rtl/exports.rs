@@ -1109,3 +1109,268 @@ pub mod rtl_crt_extended {
 }
 
 // ===========================================================================
+
+pub mod rtl_hash_tables {
+    //! RTL_DYNAMIC_HASH_TABLE: adaptadores de `rtl::hash_table`. As variantes
+    //! Weak usam os mesmos handlers da enumeração normal (no ntoskrnl elas só
+    //! encaminham).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::hash_table;
+    use crate::rtl::KernelError;
+
+    fn create_hash_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::create(call.arg(1), call.arg(2) as u32, call.arg(3) as u32)? as u64)
+    }
+    fn create_hash_table_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::create_ex(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32)? as u64)
+    }
+    fn delete_hash_table(call: &Call) -> Result<u64, KernelError> {
+        hash_table::delete(call.arg(1))?;
+        Ok(0)
+    }
+    fn insert_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::insert(call.arg(1), call.arg(2), call.arg(3), call.arg(4)) as u64)
+    }
+    fn remove_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::remove(call.arg(1), call.arg(2), call.arg(3)) as u64)
+    }
+    fn lookup_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::lookup(call.arg(1), call.arg(2), call.arg(3)))
+    }
+    fn get_next_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::get_next(call.arg(1), call.arg(2)))
+    }
+    fn init_enumeration(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::init_enumeration(call.arg(1), call.arg(2)) as u64)
+    }
+    fn enumerate_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::enumerate(call.arg(1), call.arg(2)))
+    }
+    fn end_enumeration(call: &Call) -> Result<u64, KernelError> {
+        hash_table::end_enumeration(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+    fn init_strong_enumeration(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::init_strong_enumeration(call.arg(1), call.arg(2)) as u64)
+    }
+    fn strongly_enumerate_entry(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::strongly_enumerate(call.arg(1), call.arg(2)))
+    }
+    fn end_strong_enumeration(call: &Call) -> Result<u64, KernelError> {
+        hash_table::end_strong_enumeration(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+    fn expand_hash_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::expand(call.arg(1))? as u64)
+    }
+    fn contract_hash_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(hash_table::contract(call.arg(1))? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-hash-tables",
+        names: &[
+            "RtlCreateHashTable",
+            "RtlCreateHashTableEx",
+            "RtlDeleteHashTable",
+            "RtlInsertEntryHashTable",
+            "RtlRemoveEntryHashTable",
+            "RtlLookupEntryHashTable",
+            "RtlGetNextEntryHashTable",
+            "RtlInitEnumerationHashTable",
+            "RtlEnumerateEntryHashTable",
+            "RtlEndEnumerationHashTable",
+            "RtlInitWeakEnumerationHashTable",
+            "RtlWeaklyEnumerateEntryHashTable",
+            "RtlEndWeakEnumerationHashTable",
+            "RtlInitStrongEnumerationHashTable",
+            "RtlStronglyEnumerateEntryHashTable",
+            "RtlEndStrongEnumerationHashTable",
+            "RtlExpandHashTable",
+            "RtlContractHashTable",
+        ],
+        handlers: &[
+            create_hash_table,
+            create_hash_table_ex,
+            delete_hash_table,
+            insert_entry,
+            remove_entry,
+            lookup_entry,
+            get_next_entry,
+            init_enumeration,
+            enumerate_entry,
+            end_enumeration,
+            init_enumeration,
+            enumerate_entry,
+            end_enumeration,
+            init_strong_enumeration,
+            strongly_enumerate_entry,
+            end_strong_enumeration,
+            expand_hash_table,
+            contract_hash_table,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_strings {
+    //! Strings contadas, texto de inteiros/SIDs e Unicode -> ANSI: adaptadores
+    //! de `rtl::{unicode, strings_counted, integer_conversion, security,
+    //! nls_translation}`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::{integer_conversion, nls_translation, security, strings_counted, unicode};
+    use crate::rtl::KernelError;
+
+    fn init_unicode_string_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(unicode::init_ex(call.arg(1), call.arg(2))))
+    }
+    fn free_oem_string(call: &Call) -> Result<u64, KernelError> {
+        strings_counted::free_oem_string(call.arg(1))?;
+        Ok(0)
+    }
+    fn compare_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(strings_counted::compare_ansi(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0) as i64 as u64)
+    }
+    fn prefix_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(strings_counted::prefix_ansi(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0) as u64)
+    }
+    fn char_to_integer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(integer_conversion::char_to_integer(call.arg(1), call.arg(2) as u32, call.arg(3))))
+    }
+    fn integer_to_unicode(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(integer_conversion::integer_to_unicode(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) as u32 as i32, call.arg(4))))
+    }
+    fn convert_sid_to_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::convert_sid_to_unicode_string(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0)?))
+    }
+    fn unicode_to_multi_byte_n(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(nls_translation::unicode_to_multi_byte_n(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u32)?))
+    }
+    fn unicode_to_multi_byte_size(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(nls_translation::unicode_to_multi_byte_size(call.arg(1), call.arg(2), call.arg(3) as u32)?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-strings",
+        names: &[
+            "RtlInitUnicodeStringEx",
+            "RtlFreeOemString",
+            "RtlCompareString",
+            "RtlPrefixString",
+            "RtlCharToInteger",
+            "RtlIntegerToUnicode",
+            "RtlConvertSidToUnicodeString",
+            "RtlUnicodeToMultiByteN",
+            "RtlUnicodeToMultiByteSize",
+        ],
+        handlers: &[
+            init_unicode_string_ex,
+            free_oem_string,
+            compare_string,
+            prefix_string,
+            char_to_integer,
+            integer_to_unicode,
+            convert_sid_to_unicode_string,
+            unicode_to_multi_byte_n,
+            unicode_to_multi_byte_size,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_bit_ops {
+    //! Bits do Rtl: adaptadores de `rtl::bitmap` e `rtl::checksum`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::{bitmap, checksum};
+    use crate::rtl::KernelError;
+
+    fn find_next_forward_run_clear(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_next_forward_run_clear(call.arg(1), call.arg(2) as u32, call.arg(3)) as u64)
+    }
+    fn number_of_set_bits_ulong_ptr(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::number_of_set_bits_ulong_ptr(call.arg(1)) as u64)
+    }
+    /// CCHAR em EAX: -1 sai como 0xFFFFFFFF, como no original.
+    fn find_most_significant_bit(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_most_significant_bit(call.arg(1)) as i32 as u32 as u64)
+    }
+    fn compute_crc32(call: &Call) -> Result<u64, KernelError> {
+        Ok(checksum::compute_crc32(call.arg(1) as u32, call.arg(2), call.arg(3) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-bit-ops",
+        names: &["RtlFindNextForwardRunClear", "RtlNumberOfSetBitsUlongPtr", "RtlFindMostSignificantBit", "RtlComputeCrc32"],
+        handlers: &[find_next_forward_run_clear, number_of_set_bits_ulong_ptr, find_most_significant_bit, compute_crc32],
+        data_exports: &[],
+    };
+}
+
+pub mod crt_strings {
+    //! CRT do ntoskrnl: adaptadores de `rtl::crt`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    fn memcpy_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::memcpy_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4)) as u64)
+    }
+    fn strrchr(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::strrchr(call.arg(1), call.arg(2) as u8))
+    }
+    fn wcsspn(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wcsspn(call.arg(1), call.arg(2)))
+    }
+    fn wcscspn(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wcscspn(call.arg(1), call.arg(2)))
+    }
+    fn wcstoul(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wcstoul(call.arg(1), call.arg(2), call.arg(3) as u32) as u64)
+    }
+    fn isspace(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::isspace(call.arg(1) as u32) as u64)
+    }
+    fn tolower(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::tolower(call.arg(1) as u32) as i64 as u64)
+    }
+    fn toupper(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::toupper(call.arg(1) as u32)? as i64 as u64)
+    }
+    fn iswdigit(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::iswdigit(call.arg(1) as u16) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "crt-strings",
+        names: &["memcpy_s", "strrchr", "wcsspn", "wcscspn", "wcstoul", "isspace", "tolower", "toupper", "iswdigit"],
+        handlers: &[memcpy_s, strrchr, wcsspn, wcscspn, wcstoul, isspace, tolower, toupper, iswdigit],
+        data_exports: &[],
+    };
+}
+
+pub mod crt_formatting {
+    //! sprintf_s/vsprintf_s: adaptadores de `rtl::printf`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::printf;
+    use crate::rtl::KernelError;
+
+    fn vsprintf_s(call: &Call) -> Result<u64, KernelError> {
+        printf::vsprintf_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4))
+    }
+    /// Variádicos: do quarto argumento em diante.
+    fn sprintf_s(call: &Call) -> Result<u64, KernelError> {
+        printf::sprintf_s(call.arg(1), call.arg(2), call.arg(3), &call.args[3..])
+    }
+
+    pub static GROUP: Group = Group {
+        name: "crt-formatting",
+        names: &["vsprintf_s", "sprintf_s"],
+        handlers: &[vsprintf_s, sprintf_s],
+        data_exports: &[],
+    };
+}

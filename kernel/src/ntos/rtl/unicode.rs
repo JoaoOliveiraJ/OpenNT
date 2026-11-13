@@ -339,3 +339,26 @@ pub fn hash(string: u64, case_insensitive: bool, algorithm: u32, hash_out: u64) 
     guest::write32(hash_out, hash);
     0
 }
+
+// ---- RtlInitUnicodeStringEx (rtl-strings) ----------------------------------
+
+/// RtlInitUnicodeStringEx(Dest, Source): zera Length/MaximumLength (qword),
+/// publica Buffer e mede o texto; mais de 0x7FFE WCHARs devolve
+/// STATUS_NAME_TOO_LONG com os comprimentos zerados.
+pub fn init_ex(destination: u64, source: u64) -> u32 {
+    const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
+    guest::write64(destination, 0);
+    guest::write64(destination + 8, source);
+    if source != 0 {
+        let mut count = 0u64;
+        while guest::read16(source + count * 2) != 0 {
+            count += 1;
+        }
+        if count > 0x7FFE {
+            return STATUS_NAME_TOO_LONG;
+        }
+        guest::write16(destination, (count * 2) as u16);
+        guest::write16(destination + 2, (count * 2 + 2) as u16);
+    }
+    0
+}

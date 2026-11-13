@@ -144,3 +144,60 @@ pub fn sub_authority_count(sid: u64) -> u64 {
 pub fn copy_luid(destination: u64, source: u64) {
     guest::write64(destination, guest::read64(source));
 }
+
+// ---- RtlConvertSidToUnicodeString (rtl-strings) ----------------------------
+
+/// RtlConvertSidToUnicodeString(String, Sid, Allocate): SID inválido ou de
+/// revisão != 1 = STATUS_INVALID_SID. O texto é "S-1-" + autoridade (decimal
+/// dos 4 bytes baixos big-endian, ou "0x" + hex maiúsculo dos 6 bytes quando
+/// algum dos dois altos é não nulo) + "-<subautoridade>" decimal. Com
+/// Allocate, RtlCreateUnicodeString (falha = STATUS_NO_MEMORY); senão
+/// RtlCopyUnicodeString se Length < MaximumLength, ou STATUS_BUFFER_OVERFLOW.
+pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool) -> Result<u32, crate::rtl::KernelError> {
+    const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+    const STATUS_INVALID_SID: u32 = 0xC000_0078;
+    const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    if !crate::ntos::se::sid::valid(sid) || guest::read8(sid) != 1 {
+        return Ok(STATUS_INVALID_SID);
+    }
+    let authority: alloc::vec::Vec<u8> = (2..8).map(|offset| guest::read8(sid + offset)).collect();
+    let mut text = alloc::string::String::from("S-1-");
+    if authority[0] != 0 || authority[1] != 0 {
+        let value = authority.iter().fold(0u64, |value, &byte| value << 8 | byte as u64);
+        text.push_str(&alloc::format!("0x{value:X}"));
+    } else {
+        let value = authority[2..].iter().fold(0u32, |value, &byte| value << 8 | byte as u32);
+        text.push_str(&alloc::format!("{value}"));
+    }
+    for index in 0..guest::read8(sid + 1) as u64 {
+        text.push_str(&alloc::format!("-{}", guest::read32(sid + 8 + index * 4)));
+    }
+    // Origem temporária no convidado: UNICODE_STRING (16 bytes) + texto + NUL.
+    let bytes = text.len() as u64 * 2;
+    let scratch = guest::alloc_bytes(16 + bytes + 2);
+    let buffer = scratch + 16;
+    for (index, unit) in text.bytes().enumerate() {
+        guest::write16(buffer + index as u64 * 2, unit as u16);
+    }
+    guest::write16(buffer + bytes, 0);
+    let status = if allocate {
+        match crate::ntos::rtl::unicode::create(destination, buffer) {
+            Ok(0) => STATUS_NO_MEMORY,
+            Ok(_) => 0,
+            Err(error) => {
+                guest::free_bytes(scratch);
+                return Err(error);
+            }
+        }
+    } else if bytes >= guest::read16(destination + 2) as u64 {
+        STATUS_BUFFER_OVERFLOW
+    } else {
+        guest::write16(scratch, bytes as u16);
+        guest::write16(scratch + 2, bytes as u16 + 2);
+        guest::write64(scratch + 8, buffer);
+        crate::ntos::rtl::strings_counted::copy(destination, scratch);
+        0
+    };
+    guest::free_bytes(scratch);
+    Ok(status)
+}
