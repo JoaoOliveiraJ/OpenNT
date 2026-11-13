@@ -380,7 +380,7 @@ fn nt_release_worker_factory_worker(handle: u64, _: u64, _: u64, _: u64, _rsp: u
     // para drenar a fila de trabalho de usuário (19041, RVA 4e2e7/4e412).
     reference(&factory);
     io_completion::enqueue(&factory.port, Packet::default());
-    factory.set_release_count(factory.release_count() + 1);
+    factory.add_release_count();
     let result = request_queued_worker(&factory, false);
     dereference(&factory);
     result

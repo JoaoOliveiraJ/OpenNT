@@ -333,6 +333,11 @@ impl Factory {
     field32!(minimum, set_minimum, minimum);
     field32!(binding_count, set_binding_count, binding_count);
     field32!(release_count, set_release_count, release_count);
+    /// Soma uma liberação atomicamente (o worker que libera e o que consulta
+    /// podem rodar em CPUs diferentes).
+    pub fn add_release_count(&self) {
+        self.body().release_count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
     field32!(last_status, set_last_status, last_status);
     field32!(soft_maximum, set_soft_maximum, soft_maximum);
     field32!(soft_creation_phase, set_soft_creation_phase, soft_creation_phase);
