@@ -18,10 +18,10 @@
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
 //! - **Abaixo de 4GB** o stage2 mapeia identidade com páginas de 2MB RW de
 //!   supervisor; a arena dos convidados e o heap do kernel ficam ali e não
-//!   são pagináveis. VA == PA só onde ninguém remapeou: janelas de usuário e
-//!   slots de imagem baixos podem ser remapeados ou desmapeados (o despejo de
-//!   uma imagem paginável carregada em baixo desmapeia a página).
-//! - **Acima de 4GB** (imagens nas bases preferidas, pool executivo
+//!   são pagináveis. VA == PA só onde ninguém remapeou: as janelas de usuário
+//!   podem ser remapeadas ou desmapeadas.
+//! - **Acima de 4GB** (imagens de usuário, imagens de kernel na janela de
+//!   sistema 0xFFFFF801..., pool executivo
 //!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
 //!   memória contígua/independente e o alias RW da imagem do kernel em
 //!   `KERNEL_VIRTUAL_BASE`) tudo está nas mesmas tabelas de páginas.

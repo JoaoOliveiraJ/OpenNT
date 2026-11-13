@@ -53,8 +53,10 @@ pub fn reference(handle: u64, access_mode: u8) -> Result<Result<Reference, u32>,
             }
             let completion = object_types::user_type("completion").map(|object_type| object_type.name);
             let found = handle_table::with_entry(table, index, |row| {
+                // A linha guarda só os atributos de handle (OBJ_INHERIT...);
+                // o tipo kernel/usuário fica nas opções da abertura.
                 if let Some(native) = object_manager::handle_record(index).filter(|record| record.node == row.identity) {
-                    if (native.attributes & 0x200 != 0) != kernel_handle {
+                    if native.options.kernel_handle != kernel_handle {
                         return Ok(Err(0xC000_0008));
                     }
                 } else if kernel_handle {

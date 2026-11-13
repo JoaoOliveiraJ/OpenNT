@@ -224,7 +224,7 @@ fn get(name: &str) -> Result<Shared, KernelError> {
             let exports = lifecycle::driver_exports(&driver_name).unwrap_or_default();
             return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: true, driver, driver_node: Some(node), image: None, module: exported(&name, exports), initialize_status: None, unload_status: None });
         }
-        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { allow_preferred_va: name.ends_with(".dll"), image_name: Some(String::from(source.name())), ..LoadOptions::default() })?;
+        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { image_name: Some(String::from(source.name())), ..LoadOptions::default() })?;
         let module = Arc::new(ExportedModule { name: name.clone(), exports: image.exports.clone() });
         let mut record = Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Entryless, state: State::Ready, references: 0, pinned: false, driver: 0, driver_node: None, image: None, module, initialize_status: None, unload_status: None };
         if image.exports.exports.contains_key("DllInitialize") {
@@ -502,17 +502,16 @@ pub mod kernel_image_source {
     /// Fonte da imagem pelo nome (minúsculas, `[a-z0-9_.-]+.(dll|sys|exe)`):
     /// primeiro o VFS em memória, depois o volume NTFS.
     /// Fonte de um caminho completo de driver: o disco em memória (bundle)
-    /// primeiro, depois o volume NTFS. Devolve também se veio do NTFS (onde os
-    /// drivers de serviço carregam na base preferida). `None` = não encontrado.
-    pub fn source_for_path(path: &str) -> Result<Option<(Arc<dyn ImageSource>, bool)>, KernelError> {
+    /// primeiro, depois o volume NTFS. `None` = não encontrado.
+    pub fn source_for_path(path: &str) -> Result<Option<Arc<dyn ImageSource>>, KernelError> {
         if let Some(bytes) = memory_file_system::read_bytes(path) {
-            return Ok(Some((Arc::new(MemorySource { name: alloc::format!("\\FS{}", path.replace('/', "\\")), bytes }), false)));
+            return Ok(Some(Arc::new(MemorySource { name: alloc::format!("\\FS{}", path.replace('/', "\\")), bytes })));
         }
         let Some(volume) = ntfs::mounted() else { return Ok(None) };
         let Some(layout) = volume.file_layout(path)? else { return Ok(None) };
         debug_print!("[ntoskrnl] {} via NTFS ({} bytes, streaming/DMA)", path, layout.size);
         let source = NtfsSource { name: alloc::format!("\\NTFS{}", path.replace('/', "\\")), size: layout.size, has_runs: layout.runs.is_some(), path: alloc::string::String::from(path), volume };
-        Ok(Some((Arc::new(source), true)))
+        Ok(Some(Arc::new(source)))
     }
 
     pub fn source_for(name: &str) -> Result<Arc<dyn ImageSource>, KernelError> {

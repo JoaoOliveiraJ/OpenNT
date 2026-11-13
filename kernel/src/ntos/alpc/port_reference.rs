@@ -61,7 +61,7 @@ pub fn reference(handle: u64, desired: u32, access_mode: u8) -> Result<Result<Po
             let port_type = object_types::user_type("alpc").map(|object_type| object_type.name);
             let found = handle_table::with_entry(table, index, |row| {
                 if let Some(native) = object_manager::handle_record(index).filter(|record| record.node == row.identity) {
-                    if (native.attributes & 0x200 != 0) != kernel_handle {
+                    if native.options.kernel_handle != kernel_handle {
                         return Ok(Err(0xC000_0008));
                     }
                 } else if kernel_handle || (from_user_mode && row.attributes & 0x200 != 0) {

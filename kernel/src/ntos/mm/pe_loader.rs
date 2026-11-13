@@ -1,9 +1,16 @@
 //! Loader de executáveis PE32+ (x86-64).
 //!
-//! Faz o parse do PE, mapeia as seções na memória física, aplica relocações,
-//! semeia o cookie GS e resolve a IAT pelos resolvedores registrados
-//! (endereços nativos de outros módulos ou exports do kernel). Os
-//! encaminhamentos de exports são resolvidos pelo gerenciador de módulos.
+//! Faz o parse do PE, copia cabeçalhos e seções para frames do PFN, mapeia a
+//! imagem na VA escolhida, aplica relocações, semeia o cookie GS e resolve a
+//! IAT pelos resolvedores registrados (endereços nativos de outros módulos ou
+//! exports do kernel). Os encaminhamentos de exports são resolvidos pelo
+//! gerenciador de módulos.
+//!
+//! Imagem de kernel (driver, hal.dll, biblioteca de export): como no
+//! MiLoadSystemImage do NT, a VA vem do espaço de sistema (a janela
+//! `memory_map::SYSTEM_IMAGE_BASE..TOP`), nunca da ImageBase do cabeçalho, e
+//! a imagem é relocada pela diferença. Imagem de usuário: a base preferida do
+//! cabeçalho na metade de usuário, ou a próxima faixa livre.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -15,6 +22,7 @@ use crate::ntos::rtl::image::pe_exports::{self, Exports};
 use crate::ntos::rtl::image::pe_image_information;
 use crate::ntos::rtl::image::pe_metadata_reader::MetadataReader;
 use crate::hal::{cpu, physical};
+use crate::ntos::ke::smp;
 use crate::ntos::mm::{kernel_address, loaded_images, memory_map, paging, pfn};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ps::notify::image as image_notify;
@@ -22,71 +30,67 @@ use crate::rtl::{KernelError, SpinLock};
 
 /// Bytes por trampolim da tabela de thunks (`hal::amd64::win32_thunk`).
 const STUB_SIZE: u64 = 10;
-/// Área de imagens de runtime (slots de 512 KB) — `memory_map`.
-const RUNTIME_IMAGE_BASE: u64 = 0x190_0000;
-const RUNTIME_IMAGE_SLOT: u64 = 0x8_0000;
-const RUNTIME_IMAGE_TOP: u64 = 0x1F0_0000;
-/// Base canônica alta estilo NT do experimento `force_high_base`.
-const HIGH_DRIVER_BASE: u64 = 0xFFFF_F800_0100_0000;
-/// Imagens grandes vão para LARGE_IMAGE, alinhadas a 4 MB.
-const LARGE_IMAGE_ALIGN: u64 = 0x40_0000;
+/// IMAGE_FILE_RELOCS_STRIPPED: a imagem só roda na própria ImageBase.
+const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
+/// STATUS_CONFLICTING_ADDRESSES: imagem sem relocações fora da ImageBase.
+const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+/// STATUS_INSUFFICIENT_RESOURCES: sem VA de sistema ou sem frames.
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Allocation {
-    base: u64,
-    length: u64,
-    large: bool,
-}
-
+/// Faixas de VA das imagens.
 struct Arenas {
-    next_runtime: u64,
-    next_large: u64,
-    free_runtime: Vec<(u64, u64)>,
-    free_large: Vec<(u64, u64)>,
+    /// Primeira VA nunca usada da janela de imagens de sistema.
+    next_system: u64,
+    /// Faixas devolvidas da janela de sistema (base, tamanho), ordenadas e
+    /// coalescidas, todas abaixo de `next_system`.
+    free_system: Vec<(u64, u64)>,
+    /// Próxima VA das imagens de usuário fora da base preferida.
     next_user_bump: u64,
+    /// Faixas ocupadas pelas imagens de usuário. As de kernel ficam só na
+    /// janela de sistema e nunca entram aqui.
     preferred_ranges: Vec<(u64, u64)>,
 }
 
 static ARENAS: SpinLock<Arenas> = SpinLock::new(Arenas {
-    next_runtime: RUNTIME_IMAGE_BASE,
-    next_large: memory_map::LARGE_IMAGE_BASE,
-    free_runtime: Vec::new(),
-    free_large: Vec::new(),
+    next_system: memory_map::SYSTEM_IMAGE_BASE,
+    free_system: Vec::new(),
     next_user_bump: 0x1_8100_0000,
     preferred_ranges: Vec::new(),
 });
 
-fn allocate_native_image(size: u64, large: bool) -> Result<Allocation, KernelError> {
-    let alignment = if large { LARGE_IMAGE_ALIGN } else { RUNTIME_IMAGE_SLOT };
-    let length = size.div_ceil(alignment) * alignment;
+/// Reserva a faixa de uma imagem de kernel na janela de sistema: a primeira
+/// que couber a partir da base, em múltiplos de `SYSTEM_IMAGE_ALIGN` (o papel
+/// da reserva de PTEs de sistema do MiLoadSystemImage).
+fn reserve_system_image_range(size: u64) -> Result<(u64, u64), KernelError> {
+    let length = size.div_ceil(memory_map::SYSTEM_IMAGE_ALIGN) * memory_map::SYSTEM_IMAGE_ALIGN;
+    if length == 0 {
+        return Err(KernelError::new("PE: SizeOfImage nulo"));
+    }
     let mut arenas = ARENAS.lock();
-    let free = if large { &mut arenas.free_large } else { &mut arenas.free_runtime };
-    if let Some(index) = free.iter().position(|&(_, available)| available >= length) {
-        let base = free[index].0;
-        free[index].0 += length;
-        free[index].1 -= length;
-        if free[index].1 == 0 {
-            free.remove(index);
+    if let Some(index) = arenas.free_system.iter().position(|&(_, available)| available >= length) {
+        let base = arenas.free_system[index].0;
+        arenas.free_system[index].0 += length;
+        arenas.free_system[index].1 -= length;
+        if arenas.free_system[index].1 == 0 {
+            arenas.free_system.remove(index);
         }
-        return Ok(Allocation { base, length, large });
+        return Ok((base, base + length));
     }
-    let (base, top) = if large { (arenas.next_large, memory_map::LARGE_IMAGE_TOP) } else { (arenas.next_runtime, RUNTIME_IMAGE_TOP) };
-    if base + length > top {
-        return Err(KernelError::new("area de imagens cheia"));
+    let base = arenas.next_system;
+    if memory_map::SYSTEM_IMAGE_TOP - base < length {
+        return Err(KernelError::with_status("janela de imagens de sistema esgotada", STATUS_INSUFFICIENT_RESOURCES));
     }
-    if large {
-        arenas.next_large += length;
-    } else {
-        arenas.next_runtime += length;
-    }
-    Ok(Allocation { base, length, large })
+    arenas.next_system = base + length;
+    Ok((base, base + length))
 }
 
-/// Devolve e coalesce a faixa.
-fn free_native_image(allocation: Allocation) {
+/// Devolve a faixa à janela de sistema, coalesce com as vizinhas e recua o
+/// topo usado quando a última faixa livre encosta nele.
+fn release_system_image_range((base, top): (u64, u64)) {
     let mut arenas = ARENAS.lock();
-    let free = if allocation.large { &mut arenas.free_large } else { &mut arenas.free_runtime };
-    free.push((allocation.base, allocation.length));
+    let arenas = &mut *arenas;
+    let free = &mut arenas.free_system;
+    free.push((base, top - base));
     free.sort_unstable();
     let mut index = 0;
     while index + 1 < free.len() {
@@ -95,6 +99,12 @@ fn free_native_image(allocation: Allocation) {
             free.remove(index + 1);
         } else {
             index += 1;
+        }
+    }
+    if let Some(&(last, length)) = free.last() {
+        if last + length == arenas.next_system {
+            arenas.next_system = last;
+            free.pop();
         }
     }
 }
@@ -194,12 +204,11 @@ pub struct UserView {
     pub size: u64,
 }
 
+/// Sem `user_space`, a imagem é de kernel e vai para a janela de sistema.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
-    pub allow_preferred_va: bool,
     pub user_space: bool,
     pub skip_imports: bool,
-    pub force_high_base: bool,
     pub user_view: Option<UserView>,
     pub no_execute: bool,
     pub skip_relocations: bool,
@@ -210,7 +219,7 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { allow_preferred_va: false, user_space: false, skip_imports: false, force_high_base: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true }
+        Self { user_space: false, skip_imports: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true }
     }
 }
 
@@ -234,14 +243,16 @@ pub struct ResolvedImportRecord {
 
 #[derive(Default)]
 struct Owned {
-    allocation: Option<Allocation>,
+    /// Faixa da janela de imagens de sistema (imagem de kernel).
+    system_range: Option<(u64, u64)>,
+    /// Faixa em `preferred_ranges` (imagem de usuário).
     range: Option<(u64, u64)>,
     mapped: Vec<u64>,
     dependencies: Vec<Arc<dyn ImageDependency>>,
     registered: Option<u64>,
     native_base: Option<u64>,
-    user_pages: Vec<u64>,
-    size_of_image: u64,
+    /// Frames do PFN da imagem, um por página.
+    frames: Vec<u64>,
     released: bool,
 }
 
@@ -260,6 +271,17 @@ impl Owned {
         for &address in &self.mapped {
             paging::unmap_page(address, paging::MapOptions::default());
         }
+        let mut failure = None;
+        // Outra CPU pode guardar a tradução antiga: a VA de sistema e os
+        // frames só voltam ao uso depois da invalidação em todas.
+        if self.system_range.is_some() && !self.mapped.is_empty() {
+            if let Err(error) = smp::flush_remote_tlb(false) {
+                debug_print!("[pe] imagem de sistema retida: {}", error);
+                self.system_range = None;
+                self.frames.clear();
+                failure = Some(error);
+            }
+        }
         self.mapped.clear();
         if let Some(range) = self.range.take() {
             let mut arenas = ARENAS.lock();
@@ -267,15 +289,13 @@ impl Owned {
                 arenas.preferred_ranges.remove(index);
             }
         }
-        for &page in &self.user_pages {
-            pfn::free_page(page);
+        if let Some(range) = self.system_range.take() {
+            release_system_image_range(range);
         }
-        self.user_pages.clear();
-        if let Some(allocation) = self.allocation.take() {
-            physical::zero(allocation.base, self.size_of_image as usize);
-            free_native_image(allocation);
+        for &frame in &self.frames {
+            pfn::free_page(frame);
         }
-        let mut failure = None;
+        self.frames.clear();
         for dependency in self.dependencies.drain(..).rev() {
             if let Err(error) = dependency.release() {
                 failure.get_or_insert(error);
@@ -291,8 +311,10 @@ pub struct PeImage {
     pub image_base: u64,
     pub size_of_image: u64,
     pub exports: Exports,
+    /// Frame da primeira página (as demais não são contíguas).
     pub physical_base: u64,
     pub preferred_base: u64,
+    /// Frames de uma imagem de usuário (vazio na de kernel).
     pub pages: Vec<u64>,
     pub page_protects: Vec<u32>,
     pub sections: Vec<SectionInfo>,
@@ -307,7 +329,7 @@ pub struct PeImage {
 }
 
 impl PeImage {
-    /// Desfaz mapeamentos, registro, arena e dependências.
+    /// Desfaz mapeamentos, registro, faixa de VA, frames e dependências.
     pub fn release(&mut self) -> Result<(), KernelError> {
         self.owned.release()
     }
@@ -358,26 +380,18 @@ pub fn load_from_source(source: Arc<dyn ImageSource>, options: &LoadOptions) -> 
     result
 }
 
+/// A imagem durante a carga: um frame do PFN por página, não contíguos.
 struct Mapping {
-    user_space: bool,
-    physical_base: u64,
-    user_pages: Vec<u64>,
+    frames: Vec<u64>,
 }
 
 impl Mapping {
-    /// Offset da imagem -> endereço físico (frames PFN no modo usuário).
+    /// Offset da imagem -> endereço físico.
     fn to_phys(&self, offset: u64) -> u64 {
-        if !self.user_space {
-            return self.physical_base + offset;
-        }
-        self.user_pages[(offset / 0x1000) as usize] + offset % 0x1000
+        self.frames[(offset / 0x1000) as usize] + offset % 0x1000
     }
 
     fn write(&self, offset: u64, bytes: &[u8]) {
-        if !self.user_space {
-            physical::write_bytes(self.physical_base + offset, bytes);
-            return;
-        }
         let mut done = 0usize;
         while done < bytes.len() {
             let at = offset + done as u64;
@@ -387,12 +401,34 @@ impl Mapping {
         }
     }
 
+    fn read_bytes(&self, offset: u64, length: usize) -> Vec<u8> {
+        (0..length as u64).map(|index| physical::read8(self.to_phys(offset + index))).collect()
+    }
+
+    /// Um campo que cruza a página passa byte a byte (frames não contíguos).
     fn read32(&self, offset: u64) -> u32 {
+        if offset % 0x1000 > 0x1000 - 4 {
+            let bytes = self.read_bytes(offset, 4);
+            return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
         physical::read32(self.to_phys(offset))
     }
 
     fn write32(&self, offset: u64, value: u32) {
+        if offset % 0x1000 > 0x1000 - 4 {
+            self.write(offset, &value.to_le_bytes());
+            return;
+        }
         physical::write32(self.to_phys(offset), value);
+    }
+
+    fn read16(&self, offset: u64) -> u16 {
+        let bytes = self.read_bytes(offset, 2);
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    fn write16(&self, offset: u64, value: u16) {
+        self.write(offset, &value.to_le_bytes());
     }
 
     fn read64(&self, offset: u64) -> u64 {
@@ -455,11 +491,13 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             return Err(KernelError::new("PE: invalid partial view"));
         }
     }
-    let mut owned = Owned { size_of_image, ..Default::default() };
+    if size_of_image == 0 || size_of_headers > size_of_image {
+        return Err(KernelError::new("PE: SizeOfImage invalido"));
+    }
+    let characteristics = metadata.read_u16(coff + 18)? as u16;
+    let mut owned = Owned::default();
     let mut image_base = preferred_base;
-    let mut physical_base = preferred_base;
     let mut relocation_delta: i64 = 0;
-    let mut loaded_at_preferred_va = false;
     let result = (|| -> Result<PeImage, KernelError> {
         if user_space {
             if user_view.is_none() && (preferred_base < 0x1_0000_0000 || preferred_base + size_of_image > memory_map::USER_ADDRESS_LIMIT) {
@@ -486,52 +524,31 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             arenas.preferred_ranges.push(range);
             drop(arenas);
             owned.range = Some(range);
-            for _ in 0..size_of_image.div_ceil(0x1000) {
-                let frame = pfn::alloc_page();
-                if frame == 0 {
-                    return Err(KernelError::new("PFN esgotado carregando imagem de usuario"));
-                }
-                owned.user_pages.push(frame);
-            }
             image_base = target;
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
             if relocation_delta != 0 && reloc_rva == 0 {
                 debug_print!("[pe] sem .reloc: imagem position-independent (data), mapeada em {:#x}", image_base);
             }
-            physical_base = owned.user_pages[0];
-            loaded_at_preferred_va = true;
-        } else if options.force_high_base {
-            if !preferred_range_is_free(&ARENAS.lock().preferred_ranges, HIGH_DRIVER_BASE, size_of_image) {
-                return Err(KernelError::new("base canonica de imagem ocupada"));
+        } else {
+            // MiLoadSystemImage: a VA vem da janela de sistema e a imagem é
+            // relocada pela diferença; sem relocações, só na ImageBase.
+            if reloc_rva == 0 && characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
+                return Err(KernelError::with_status("PE: imagem de kernel sem relocacoes", STATUS_CONFLICTING_ADDRESSES));
             }
-            let allocation = allocate_native_image(size_of_image, true)?;
-            owned.allocation = Some(allocation);
-            physical_base = allocation.base;
-            image_base = HIGH_DRIVER_BASE;
-            let range = (image_base, image_base + size_of_image);
-            ARENAS.lock().preferred_ranges.push(range);
-            owned.range = Some(range);
-        } else if options.allow_preferred_va && (0x1_0000_0000..0x8000_0000_0000).contains(&preferred_base) && preferred_range_is_free(&ARENAS.lock().preferred_ranges, preferred_base, size_of_image) {
-            let allocation = allocate_native_image(size_of_image, true)?;
-            owned.allocation = Some(allocation);
-            physical_base = allocation.base;
-            let range = (preferred_base, preferred_base + size_of_image);
-            ARENAS.lock().preferred_ranges.push(range);
-            owned.range = Some(range);
-            loaded_at_preferred_va = true;
-        } else if preferred_base >= 0x1_0000_0000 || preferred_base + size_of_image > 0x200_0000 || !preferred_range_is_free(&ARENAS.lock().preferred_ranges, preferred_base, size_of_image) {
-            let allocation = allocate_native_image(size_of_image, size_of_image > RUNTIME_IMAGE_SLOT)?;
-            owned.allocation = Some(allocation);
-            image_base = allocation.base;
-            physical_base = allocation.base;
+            let range = reserve_system_image_range(size_of_image)?;
+            owned.system_range = Some(range);
+            image_base = range.0;
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
         }
-        if !user_space && owned.range.is_none() {
-            let range = (image_base, image_base + size_of_image);
-            ARENAS.lock().preferred_ranges.push(range);
-            owned.range = Some(range);
+        for _ in 0..size_of_image.div_ceil(0x1000) {
+            let frame = pfn::alloc_page();
+            if frame == 0 {
+                return Err(KernelError::with_status("PFN esgotado carregando imagem", STATUS_INSUFFICIENT_RESOURCES));
+            }
+            owned.frames.push(frame);
         }
-        let mapping = Mapping { user_space, physical_base, user_pages: owned.user_pages.clone() };
+        let physical_base = owned.frames[0];
+        let mapping = Mapping { frames: owned.frames.clone() };
         let rva_to_file_offset = |rva: u64| -> Result<u64, KernelError> {
             for index in 0..section_count {
                 let header = section_table + index * 40;
@@ -559,14 +576,10 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 offset += 1;
             }
         };
-        debug_print!("[pe] base={:#x}{} imagem={} bytes, {} secoes", image_base, if loaded_at_preferred_va { alloc::format!(" (fisico {physical_base:#x})") } else { String::new() }, size_of_image, section_count);
+        debug_print!("[pe] base={:#x} (fisico {:#x}) imagem={} bytes, {} secoes", image_base, physical_base, size_of_image, section_count);
         // Zera a imagem (BSS) e copia cabeçalhos e seções.
-        if user_space {
-            for &page in &owned.user_pages {
-                physical::zero(page, 0x1000);
-            }
-        } else {
-            physical::zero(physical_base, size_of_image as usize);
+        for &frame in &owned.frames {
+            physical::zero(frame, 0x1000);
         }
         mapping.write(0, &source.read_bytes(0, size_of_headers)?);
         for index in 0..section_count {
@@ -615,11 +628,12 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             }
         }
         let mut page_protects = Vec::new();
-        // Base preferida alta ou canônica: mapeia a VA sobre o backing.
-        if loaded_at_preferred_va || options.force_high_base {
+        // Mapeia a VA escolhida sobre os frames (PTEs de 4 KB; supervisor na
+        // imagem de kernel).
+        {
             let mut page = view_offset;
             while page < view_offset + view_size {
-                let backing = if user_space { owned.user_pages[(page / 0x1000) as usize] } else { physical_base + page };
+                let backing = owned.frames[(page / 0x1000) as usize];
                 let (mut present, mut writable, mut nx) = (true, !options.no_execute, options.no_execute);
                 if user_view.is_some() && !options.no_execute {
                     let mut characteristics = if page < size_of_headers { 0x4000_0000u32 } else { 0 };
@@ -641,7 +655,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 }
                 page_protects[index] = if !present { 1 } else if nx { if writable { 4 } else { 2 } } else if writable { 0x40 } else { 0x20 };
                 if !paging::map_page(image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) {
-                    return Err(KernelError::new(alloc::format!("mapPage falhou p/ imagem grande em {image_base:#x}")));
+                    return Err(KernelError::new(alloc::format!("mapPage falhou p/ imagem em {image_base:#x}")));
                 }
                 owned.mapped.push(image_base + page);
                 page += 0x1000;
@@ -649,15 +663,15 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             debug_print!("[pe] VA {:#x} mapeada ({} paginas)", image_base, size_of_image.div_ceil(0x1000));
             // Verificação real: a página do entry point traduz de volta.
             let entry_page = entry_rva & !0xFFF;
-            let expected = if user_space { owned.user_pages.get((entry_page / 0x1000) as usize).copied().unwrap_or(0) } else { physical_base + entry_page };
+            let expected = owned.frames.get((entry_page / 0x1000) as usize).copied().unwrap_or(0);
             let probe = paging::translate(image_base + entry_page);
             if entry_page >= view_offset && entry_page < view_offset + view_size && probe != expected {
                 return Err(KernelError::new(alloc::format!("mapeamento VA quebrado: entry traduz p/ {probe:#x} (esperado {expected:#x})")));
             }
         }
         // Relocação (IMAGE_BASE_RELOCATION): DIR64, HIGHLOW e HIGH.
-        let delta = if options.force_high_base { HIGH_DRIVER_BASE.wrapping_sub(preferred_base) } else { relocation_delta as u64 };
-        if !options.skip_relocations && (relocation_delta != 0 || options.force_high_base) && reloc_rva != 0 {
+        let delta = relocation_delta as u64;
+        if !options.skip_relocations && relocation_delta != 0 && reloc_rva != 0 {
             let mut count = 0u32;
             let mut block = rva_to_file_offset(reloc_rva)?;
             let end = block + reloc_size;
@@ -671,6 +685,15 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     let entry = metadata.read_u16(block + 8 + entry_index * 2)?;
                     let entry_type = entry >> 12;
                     let target = page_rva + (entry & 0xFFF) as u64;
+                    let width = match entry_type {
+                        10 => 8,
+                        2 => 4,
+                        1 => 2,
+                        _ => 0,
+                    };
+                    if target + width > size_of_image {
+                        return Err(KernelError::new(alloc::format!("PE: relocacao fora da imagem em {target:#x}")));
+                    }
                     match entry_type {
                         10 => {
                             mapping.write64(target, mapping.read64(target).wrapping_add(delta));
@@ -681,9 +704,9 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                             count += 1;
                         }
                         1 => {
-                            let value = physical::read16(mapping.to_phys(target)) as i64;
+                            let value = mapping.read16(target) as i64;
                             let full = (value << 16) + relocation_delta;
-                            physical::write16(mapping.to_phys(target), (full.div_euclid(0x10000) & 0xFFFF) as u16);
+                            mapping.write16(target, (full.div_euclid(0x10000) & 0xFFFF) as u16);
                             count += 1;
                         }
                         0 => {}
@@ -708,15 +731,15 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             let mut cookie = 0u64;
             let load_config_rva = metadata.read_u32(optional + 192)? as u64;
             let load_config_size = metadata.read_u32(optional + 196)? as u64;
-            if load_config_rva != 0 && load_config_size >= 0x60 {
+            if load_config_rva != 0 && load_config_size >= 0x60 && load_config_rva + 0x60 <= size_of_image {
                 cookie = mapping.read64(load_config_rva + 0x58);
-                if cookie < image_base || cookie >= image_base + size_of_image {
+                if cookie < image_base || cookie + 8 > image_base + size_of_image {
                     cookie = 0;
                 }
             }
             if cookie == 0 {
                 let mut offset = 0u64;
-                while offset < size_of_image.min(0x80_0000) {
+                while offset + 8 <= size_of_image.min(0x80_0000) {
                     if mapping.read32(offset) == 0x2DDF_A232 && mapping.read32(offset + 4) == 0x2B99 {
                         cookie = image_base + offset;
                         break;
@@ -816,7 +839,12 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             }
         }
         let entry_point = if entry_rva != 0 { image_base.wrapping_add(entry_rva) } else { 0 };
-        let read_rva = |rva: u64, length: u64| -> Result<Vec<u8>, KernelError> { Ok((0..length).map(|offset| physical::read8(mapping.to_phys(rva + offset))).collect()) };
+        let read_rva = |rva: u64, length: u64| -> Result<Vec<u8>, KernelError> {
+            if rva.checked_add(length).is_none_or(|end| end > size_of_image) {
+                return Err(KernelError::new(alloc::format!("PE: RVA {rva:#x} fora da imagem")));
+            }
+            Ok(mapping.read_bytes(rva, length as usize))
+        };
         let exports = pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)?;
         debug_print!("[pe] entry point = {:#x}", entry_point);
         // O bit consumido por ObRegisterCallbacks é uma decisão da CI, não
@@ -833,7 +861,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             exports,
             physical_base,
             preferred_base,
-            pages: owned.user_pages.clone(),
+            pages: if user_space { owned.frames.clone() } else { Vec::new() },
             page_protects,
             sections: sections.clone(),
             resolved_imports,

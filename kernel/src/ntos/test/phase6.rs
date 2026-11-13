@@ -284,7 +284,8 @@ impl crate::ntos::mm::pe_loader::ImageDependency for TestDependency {
 }
 
 fn pe_loader_kernel_images(assert: Assert) {
-    use crate::hal::physical;
+    use crate::ntos::mm::memory_map::{SYSTEM_IMAGE_BASE, SYSTEM_IMAGE_TOP};
+    use crate::ntos::mm::paging;
     use crate::ntos::mm::pe_loader::{self as loader, ImportSymbol, LoadOptions, ResolvedImport};
     use core::sync::atomic::Ordering;
     let dependency: Arc<dyn loader::ImageDependency> = Arc::new(TestDependency);
@@ -305,19 +306,21 @@ fn pe_loader_kernel_images(assert: Assert) {
         return;
     };
     let base = image.image_base;
-    assert(base >= 0x190_0000 && base < 0x1F0_0000 && image.physical_base == base && image.preferred_base == IMAGE_BASE && image.size_of_image == 0x6000 && image.entry_point == base + 0x1000, "peloader: imagem relocada para a arena de runtime");
-    assert(physical::read64(base + 0x1100) == base + 0x1010, "peloader: fixup DIR64 aplicado");
-    let cookie = physical::read64(base + 0x1200);
+    let supervisor_pages = (0..0x6000u64).step_by(0x1000).all(|offset| paging::query_page(base + offset, false).is_some_and(|page| page.flags & paging::PAGE_USER == 0));
+    assert(base >= SYSTEM_IMAGE_BASE && base + 0x6000 <= SYSTEM_IMAGE_TOP && base % 0x1_0000 == 0 && paging::translate(base) == image.physical_base && supervisor_pages && image.preferred_base == IMAGE_BASE && image.size_of_image == 0x6000 && image.entry_point == base + 0x1000, "peloader: imagem de kernel relocada para a janela de sistema, em PTEs de supervisor");
+    assert(guest::read64(base + 0x1100) == base + 0x1010, "peloader: fixup DIR64 aplicado");
+    let cookie = guest::read64(base + 0x1200);
     assert(cookie != 0x2B99_2DDF_A232 && cookie != 0 && cookie >> 48 == 0, "peloader: cookie GS semeado (48 bits, nunca o padrao)");
-    assert(physical::read64(base + 0x4060) == 0x1234_5678_9ABC && physical::read64(base + 0x4068) == 0x7777 && image.resolved_imports.len() == 2 && image.resolved_imports[1].name == "ordinal #7", "peloader: IAT por nome e por ordinal");
+    assert(guest::read64(base + 0x4060) == 0x1234_5678_9ABC && guest::read64(base + 0x4068) == 0x7777 && image.resolved_imports.len() == 2 && image.resolved_imports[1].name == "ordinal #7", "peloader: IAT por nome e por ordinal");
     assert(DEPENDENCY_RETAINS.load(Ordering::SeqCst) == 1, "peloader: dependencia retida uma vez");
     assert(image.exports.exports.get("Alpha") == Some(&(base + 0x1010)) && image.sections.len() == 5 && image.sections[0].name == ".text", "peloader: exports lidos da imagem mapeada");
     assert(image.loaded_image.as_ref().is_some_and(|loaded| loaded.name == "opennt-loader-test.sys" && loaded.image_base == base) && crate::ntos::mm::loaded_images::find(base + 0x1000).is_some(), "peloader: imagem registrada nas imagens carregadas");
     assert(image.image_information[51] == 4 && image.loader_flags == 0, "peloader: informacao da secao relocada e sem bit de CI");
-    assert(image.release().is_ok() && crate::ntos::mm::loaded_images::find(base + 0x1000).is_none() && DEPENDENCY_RETAINS.load(Ordering::SeqCst) == 0 && physical::read64(base + 0x1100) == 0, "peloader: liberacao desfaz registro, dependencia e arena");
-    // A arena devolvida é reutilizada; erros desfazem a carga.
+    let free_before_release = crate::ntos::mm::pfn::free_count();
+    assert(image.release().is_ok() && crate::ntos::mm::loaded_images::find(base + 0x1000).is_none() && DEPENDENCY_RETAINS.load(Ordering::SeqCst) == 0 && paging::translate(base + 0x1000) == 0 && crate::ntos::mm::pfn::free_count() >= free_before_release + 6, "peloader: liberacao desfaz registro, dependencia, PTEs e frames");
+    // A faixa devolvida é reutilizada; erros desfazem a carga.
     let again = loader::load(loadable_pe(), &options);
-    assert(again.as_ref().is_ok_and(|image| image.image_base == base), "peloader: slot devolvido reutilizado");
+    assert(again.as_ref().is_ok_and(|image| image.image_base == base), "peloader: faixa de sistema devolvida reutilizada");
     if let Ok(mut again) = again {
         let _ = again.release();
     }
@@ -325,7 +328,7 @@ fn pe_loader_kernel_images(assert: Assert) {
     broken[0x40A2..0x40AF].copy_from_slice(b"Ausentefunc\0\0");
     assert(loader::load(broken, &options).is_err_and(|error| error.message.contains("API nao suportada")) && DEPENDENCY_RETAINS.load(Ordering::SeqCst) == 0, "peloader: import nao resolvido desfaz a carga");
     let next = loader::load(loadable_pe(), &options);
-    assert(next.as_ref().is_ok_and(|image| image.image_base == base), "peloader: falha nao vaza a arena");
+    assert(next.as_ref().is_ok_and(|image| image.image_base == base), "peloader: falha nao vaza a faixa de sistema");
     if let Ok(mut next) = next {
         let _ = next.release();
     }
@@ -375,7 +378,7 @@ fn ntoskrnl_exports(assert: Assert) {
         return;
     };
     let base = image.image_base;
-    let iat = |slot: u64| crate::hal::physical::read64(base + 0x4200 + slot * 8);
+    let iat = |slot: u64| guest::read64(base + 0x4200 + slot * 8);
     let (table, count) = win32_thunk::thunk_table();
     let thunk = |id: u64| kernel_address::virtual_address(table + id * win32_thunk::STUB_SIZE).unwrap_or(0);
     assert(count == win32_thunk::MAX_WIN32 && 32 + abi_names::EXPORT_NAMES.len() as u32 <= count && iat(0) == thunk(32 + 652) && iat(1) == thunk(32 + 546) && iat(0) != 0 && image.resolved_imports.len() == 5, "ntoskrnl: IAT recebe os trampolins dos ids");
@@ -11258,6 +11261,7 @@ pub fn run(assert: Assert) {
     vf_device_verification_exports(assert);
     vsl_secure_pci_exports(assert);
     whea_error_source_exports(assert);
+    super::system_images::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

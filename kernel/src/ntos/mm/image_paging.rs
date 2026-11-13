@@ -127,8 +127,9 @@ fn set_busy(base: u64, busy: bool) {
     }
 }
 
-/// Copia toda página antes de trocar qualquer alias (VAs baixas podem ser o
-/// identity map do próprio staging) e passa a imagem para frames PFN.
+/// Copia toda página antes de trocar qualquer PTE (o frame original fica com
+/// o loader, que o devolve no descarregamento) e passa a imagem para frames
+/// PFN próprios da residência.
 fn migrate(base: u64) -> Result<(), KernelError> {
     let originals: Vec<(u64, Original)> = {
         let state = STATE.lock();

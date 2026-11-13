@@ -194,6 +194,26 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   antigas migram; cada uma que corresponde a um campo real é conferida em
   compilação contra `inc::types` (o bloco no fim do arquivo).
 
+### 3.4 Mapa de memória
+
+A fonte única é `ntos/mm/memory_map.rs`; cada faixa nova entra lá, num bloco
+delimitado, com a explicação. Na metade de sistema (a partir de
+`MmSystemRangeStart`, 0xFFFF8000_00000000):
+
+- **Imagens de kernel** (drivers .sys, hal.dll, ci.dll, bibliotecas de export
+  como cng, msrpc, wmilib e WppRecorder): janela `SYSTEM_IMAGE_BASE..TOP`
+  (0xFFFFF801_00000000..0xFFFFF802_00000000). O `pe_loader` faz o papel do
+  MiLoadSystemImage: reserva a faixa (primeiro encaixe, 64 KB), copia a imagem
+  para frames do PFN não contíguos, mapeia em PTEs de 4 KB de supervisor e
+  reloca pela diferença para a ImageBase do cabeçalho. Imagem sem relocações
+  (`IMAGE_FILE_RELOCS_STRIPPED`) é recusada com STATUS_CONFLICTING_ADDRESSES.
+  No descarregamento, a VA e os frames só voltam ao uso depois da invalidação
+  de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de usuário
+  nem na identidade abaixo de 4 GB; o ntoskrnl é listado pelo alias em
+  `KERNEL_VIRTUAL_BASE`.
+- As imagens de usuário continuam na base preferida da metade de usuário (ou
+  na próxima faixa livre), também sobre frames do PFN.
+
 ## 4. Dependências
 
 - Os componentes do executive se chamam entre si, como no NT (`ke` ↔ `ps`,

@@ -230,11 +230,11 @@ pub fn load_driver(file_path: &str, options: &DriverOptions) -> Result<bool, Loa
 }
 
 fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Result<bool, LoadError> {
-    let Some((source, from_ntfs)) = kernel_image_source::source_for_path(file_path)? else {
+    let Some(source) = kernel_image_source::source_for_path(file_path)? else {
         return Err(LoadError { error: KernelError::new(format!("driver nao encontrado: {file_path}")), win32_error: 2, ntstatus: None });
     };
-    // Drivers de serviço do NTFS carregam na base preferida, como o NT.
-    let mut load = options.load.clone().unwrap_or(LoadOptions { allow_preferred_va: from_ntfs, ..Default::default() });
+    // Como todo driver, vai para a janela de imagens de sistema, relocado.
+    let mut load = options.load.clone().unwrap_or_default();
     load.image_name = Some(source.name().to_string());
     let image = pe_loader::load_from_source(source, &load)?;
     let (image_base, size_of_image, entry_point) = (image.image_base, image.size_of_image, image.entry_point);

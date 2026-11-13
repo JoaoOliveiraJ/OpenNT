@@ -8,8 +8,7 @@
 //!   0x060000-0x06FFFF    pilhas dos APs (4KB por CPU, até 16 CPUs)
 //!   0x100000-0xDFFFFF    imagem do kernel (cap de build: 13MB)
 //!   0xF80008 (topo)      pilha do kernel de boot (cresce para baixo)
-//!   0x1000000-0x18FFFFF  drivers .sys do bundle (512KB cada)
-//!   0x1900000-0x1EFFFFF  imagens de runtime (slots de 512KB)
+//!   0x1000000-0x1FFFFFF  sem uso (as imagens de drivers moram no espaço de sistema)
 //!   0x2000000-0x5FFFFFF  heap do kernel (kmalloc), com a arena de 16MB
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
 //!   0x10000000-0x1FFFFFFF espaço de VA para VirtualAlloc (fora do PFN)
@@ -17,8 +16,12 @@
 //!   0x30000000-0x33FFFFFF ring do tracer FULL (64MB)
 //!   0x34000000-0x6FFFFFFF terceira arena PFN (960MB)
 //!   0x70000000-0xAFFFFFFF reservado (KUSER_SHARED_DATA em 0x7FFE0000)
-//!   0xB0000000-0xBEFFFFFF imagens GRANDES executáveis (bit 31 ligado)
+//!   0xB0000000-0xBEFFFFFF sem uso
 //! ```
+//!
+//! Na metade de sistema, as imagens de kernel (drivers .sys, hal.dll,
+//! ci.dll, bibliotecas de export) ficam na janela `SYSTEM_IMAGE_BASE..TOP`
+//! (bloco "Imagens de sistema" abaixo).
 #![allow(dead_code)]
 
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -46,9 +49,27 @@ pub const PHYSICAL_MEMORY_LIMIT: u64 = 0x1_0000_0000;
 pub const VA_ALLOC_BASE: u64 = 0x1000_0000;
 pub const VA_ALLOC_TOP: u64 = 0x2000_0000;
 
-/// Imagens PE grandes demais para a área de drivers, em RAM identity alta.
-pub const LARGE_IMAGE_BASE: u64 = 0xB000_0000;
-pub const LARGE_IMAGE_TOP: u64 = 0xBF00_0000;
+// ---- Imagens de sistema ------------------------------------------------------
+//
+// Toda imagem de kernel carregada pelo `pe_loader` (drivers .sys, hal.dll,
+// ci.dll, kdcom, msrpc, cng, WppRecorder, wmilib, as pilhas de teclado e
+// disco...) recebe uma faixa desta janela, como no MiLoadSystemImage do NT:
+// a VA vem do espaço de sistema, as páginas são frames do PFN (não
+// contíguos) mapeados em PTEs de 4 KB de supervisor, e a imagem é relocada
+// pela diferença entre essa VA e a ImageBase do cabeçalho. Nenhuma imagem
+// carregada fica na metade de usuário nem na identidade abaixo de 4 GB (o
+// ntoskrnl não passa pelo loader: é listado pelo alias em
+// `KERNEL_VIRTUAL_BASE`). A janela ocupa o slot 496 da PML4 (o mesmo da PCR e
+// do alias do kernel), sem cruzar nenhuma outra faixa daqui.
+
+/// Primeira VA da janela de imagens de sistema.
+pub const SYSTEM_IMAGE_BASE: u64 = 0xFFFF_F801_0000_0000;
+/// Limite exclusivo da janela de imagens de sistema (4 GB).
+pub const SYSTEM_IMAGE_TOP: u64 = 0xFFFF_F802_0000_0000;
+/// Granularidade das faixas da janela (a de alocação de VA do NT, 64 KB).
+pub const SYSTEM_IMAGE_ALIGN: u64 = 0x1_0000;
+
+// ---- fim das imagens de sistema ----------------------------------------------
 
 pub const PCR_VIRTUAL_BASE: u64 = 0xFFFF_F800_0000_0000;
 pub const KERNEL_DATA_POOL_BASE: u64 = 0xFFFF_F800_1000_0000;

@@ -298,7 +298,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys e nsiproxy.sys já têm export; nenhum deles é carregado pelos testes ainda."
+notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Como no NT, toda imagem de kernel (drivers, hal.dll, ci.dll, bibliotecas de export) é mapeada no espaço de sistema, na janela que começa em 0xFFFFF80100000000, sobre frames do PFN, e relocada para lá; nenhuma fica na metade de usuário nem abaixo de 4 GB. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys e nsiproxy.sys já têm export; nenhum deles é carregado pelos testes ainda."
 
 [[componente]]
 nome = "Cache Manager"

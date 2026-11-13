@@ -231,6 +231,7 @@ fn real_keyboard() {
         debug_print!("KBDTEST_SKIP (pilha do teclado sem START)");
         return;
     };
+    assert(super::system_images::listed_in_system_window(&["kbdclass.sys", "i8042prt.sys"]), "teclado: kbdclass e i8042prt na janela de imagens de sistema");
     let event = guest_memory::alloc_bytes(0x18);
     dispatcher::initialize_event(event, 0, false); // NotificationEvent (manual)
     let opened = io_manager::open_device("\\Device\\KeyboardClass0", false);

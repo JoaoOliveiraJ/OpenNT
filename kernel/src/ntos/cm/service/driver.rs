@@ -14,7 +14,6 @@ use crate::ntos::cm::service::database::{self as service_database, Configuration
 use crate::rtl::SpinLock;
 use crate::ntos::inc::types::{DriverObject, NtStruct};
 use crate::ntos::io::lifecycle::{self, DriverOptions};
-use crate::ntos::mm::pe_loader::LoadOptions;
 
 /// Falha com o código Win32 preservado (e o NTSTATUS já produzido, se houver).
 #[derive(Debug)]
@@ -168,7 +167,7 @@ fn start_with_chain(name: &str, chain: &mut BTreeSet<String>) -> Result<u32, Dri
         }
         // Publica a transição antes de executar código do driver.
         OPERATIONS.lock().insert(key.clone(), Operation { pending: 2, error: 0 });
-        let options = DriverOptions { service_name: Some(configuration.name.clone()), registry_path: Some(format!("{}\\{}", service_database::ROOT, configuration.name)), load: Some(LoadOptions { allow_preferred_va: true, ..Default::default() }) };
+        let options = DriverOptions { service_name: Some(configuration.name.clone()), registry_path: Some(format!("{}\\{}", service_database::ROOT, configuration.name)), load: None };
         lifecycle::load_driver(&driver_path, &options).map_err(|error| DriverServiceError { win32: error.win32_error, ntstatus: error.ntstatus, message: error.error.message })?;
         if initialized_driver(&configuration).is_none() {
             return fail(31, "driver initialization did not publish an initialized object");

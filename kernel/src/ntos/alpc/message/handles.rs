@@ -120,7 +120,7 @@ fn capture_entry(descriptor: &Descriptor, mode: u8) -> Result<Result<Entry, u32>
             handle_table::with_entry(table, index, |row| {
                 let native = object_manager::handle_record(index);
                 let matches = native.as_ref().is_some_and(|native| native.node == row.identity);
-                if matches && native.as_ref().is_some_and(|native| (native.attributes & 0x200 != 0) != kernel_handle) {
+                if matches && native.as_ref().is_some_and(|native| native.options.kernel_handle != kernel_handle) {
                     return Ok(None);
                 }
                 if !matches && kernel_handle {
