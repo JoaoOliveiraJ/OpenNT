@@ -38,13 +38,19 @@ pub static GROUP: Group = Group {
     name: "hal",
     names: &["READ_PORT_UCHAR", "READ_PORT_USHORT", "READ_PORT_ULONG", "WRITE_PORT_UCHAR", "WRITE_PORT_USHORT", "WRITE_PORT_ULONG"],
     handlers: &[read_port_uchar, read_port_ushort, read_port_ulong, write_port_uchar, write_port_ushort, write_port_ulong],
-    data_exports: &[("HalPrivateDispatchTable", private_dispatch_table_address)],
+    data_exports: &[("HalPrivateDispatchTable", private_dispatch_table_address), ("HalDispatchTable", dispatch_table_address)],
 };
 
 /// HalPrivateDispatchTable: o export de dados preenchido pela HAL
 /// (`ntos::hal::private_dispatch`).
 fn private_dispatch_table_address() -> u64 {
     crate::ntos::mm::kernel_data::address("HalPrivateDispatchTable").unwrap_or_else(|error| panic!("HalPrivateDispatchTable: {error}"))
+}
+
+/// HalDispatchTable: o HAL_DISPATCH público preenchido pela HAL
+/// (`hal::public_dispatch`).
+fn dispatch_table_address() -> u64 {
+    crate::ntos::mm::kernel_data::address("HalDispatchTable").unwrap_or_else(|error| panic!("HalDispatchTable: {error}"))
 }
 
 pub mod hal_platform {

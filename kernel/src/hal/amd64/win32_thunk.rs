@@ -15,8 +15,11 @@
 //!
 //! Ids: 0–31 = kernel32 (modo usuário), >= 32 = exports do ntoskrnl.
 
-/// Quantidade de stubs (`MAX_WIN32` do original).
-pub const MAX_WIN32: u32 = 1024;
+/// Quantidade de stubs. Os ids 0–31 são do kernel32 e cada export do ntoskrnl
+/// ocupa o id `32 + índice`, então a tabela precisa de `32 + EXPORT_NAMES.len()`
+/// stubs — o boot verifica isso (`init::exports`). O `.rept` abaixo usa esta
+/// constante, então os dois não divergem.
+pub const MAX_WIN32: u32 = 2048;
 /// Bytes por stub.
 pub const STUB_SIZE: u64 = 10;
 
@@ -27,7 +30,7 @@ core::arch::global_asm!(
 .balign 16
 opennt_win32_stubs:
 .set opennt_stub_index, 0
-.rept 1024
+.rept {stubs}
     .byte 0xB8
     .long opennt_stub_index
     .byte 0xE9
@@ -299,7 +302,8 @@ opennt_kernel_native_host_rsp: .quad 0
 .global opennt_kernel_sync_active
 opennt_kernel_sync_active: .quad 0
 .popsection
-"#
+"#,
+    stubs = const MAX_WIN32,
 );
 
 extern "C" {

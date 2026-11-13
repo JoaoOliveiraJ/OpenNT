@@ -1422,7 +1422,7 @@ pub mod driver_helpers {
     };
 }
 
-pub mod watchdog_support {
+pub mod io_diagnostics {
     //! Exports que o `watchdog.sys` real (e, abaixo dele, todo o stack de
     //! vídeo) importa do ntoskrnl e que o OpenNT ainda não oferecia: captura de
     //! contexto, consultas de console/WMI e os Zw que o watchdog usa no início.
@@ -1489,7 +1489,7 @@ pub mod watchdog_support {
     }
 
     pub static GROUP: Group = Group {
-        name: "watchdog-support",
+        name: "io-diagnostics",
         names: &[
             "IoRaiseInformationalHardError", "IoWMIOpenBlock", "IoWMIQueryAllData",
             "RtlCaptureContext", "RtlGetActiveConsoleId", "ZwFlushBuffersFileEx", "ZwSystemDebugControl",
@@ -1502,7 +1502,7 @@ pub mod watchdog_support {
     };
 }
 
-pub mod basicdisplay_support {
+pub mod x86bios_sleep_misc {
     //! Exports que o BasicDisplay.sys real (Microsoft Basic Display, driver de
     //! vídeo display-only) importa e que faltavam: o bit-scan e a comparação da
     //! CRT, o bloqueio de sono do Po e os x86Bios. Não há emulador de VBIOS de
@@ -1573,7 +1573,7 @@ pub mod basicdisplay_support {
     }
 
     pub static GROUP: Group = Group {
-        name: "basicdisplay-support",
+        name: "x86bios-sleep-misc",
         names: &[
             "RtlFindLeastSignificantBit", "_strnicmp", "PoDisableSleepStates", "PoReenableSleepStates",
             "x86BiosAllocateBuffer", "x86BiosCall", "x86BiosFreeBuffer", "x86BiosReadMemory", "x86BiosWriteMemory",
@@ -1585,3 +1585,317 @@ pub mod basicdisplay_support {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_core {
+    //! Núcleo puro do FsRtl — correspondência de nomes com curingas DOS,
+    //! helpers de NTSTATUS e o portão de carga do Filter Manager.
+    //!
+    //! `IsNameInExpression`/`DoesNameContainWildCards`/`DissectName` reproduzem
+    //! o `ntoskrnl` real (desmontagem por RVA); `RegisterFltMgrCalls` publica a
+    //! tabela do FltMgr (o `xchg` de uma instrução já existente em
+    //! `drivers::fs::filter_callbacks`) e é a única dependência real do
+    //! `DriverEntry` do `fltmgr.sys`.
+
+    use crate::drivers::fs::filter_callbacks;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::mm::kernel_data;
+    use crate::ntos::mm::kernel_data_layout::FSRTL_LEGAL_ANSI_CHARACTER_ARRAY;
+    use crate::ntos::rtl::unicode_case;
+    use crate::rtl::KernelError;
+
+    // Classe FSRTL_WILD_CHARACTER no bitmap de 256 bytes.
+    const FSRTL_WILD_CHARACTER: u8 = 0x08;
+
+    // Os cinco curingas do FsRtl (valores UTF-16 = ASCII).
+    const WC_STAR: u16 = b'*' as u16; // 0x2A
+    const WC_QM: u16 = b'?' as u16; // 0x3F
+    const WC_DOS_STAR: u16 = b'<' as u16; // 0x3C
+    const WC_DOS_QM: u16 = b'>' as u16; // 0x3E
+    const WC_DOS_DOT: u16 = b'"' as u16; // 0x22
+    const WC_DOT: u16 = b'.' as u16; // 0x2E
+    const WC_BACKSLASH: u16 = 0x5C;
+
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+    // ---- FsRtlLegalAnsiCharacterArray (data export) -------------------------
+
+    /// Endereço da célula `.kdata` com o bitmap de classes (mesmos bytes que o
+    /// `ntoskrnl` real referencia em VA 0x140011b20). O armazenamento de 256
+    /// bytes e os valores iniciais ficam em `mm::kernel_data_layout`
+    /// (ver REGISTRATION) — aqui só devolvemos o endereço público, como a HAL
+    /// faz com `HalPrivateDispatchTable`.
+    fn legal_ansi_character_array_address() -> u64 {
+        kernel_data::address("FsRtlLegalAnsiCharacterArray")
+            .unwrap_or_else(|error| panic!("FsRtlLegalAnsiCharacterArray: {error}"))
+    }
+
+    // ---- NTSTATUS helpers (§2.1) -------------------------------------------
+
+    /// Conjunto exato de status "inesperados" da cadeia de `cmp` em
+    /// FsRtlIsNtstatusExpected (RVA 0x31b530), reproduzido byte-a-byte da
+    /// desmontagem (comparações com sinal; o resultado é este conjunto).
+    fn ntstatus_expected(status: u32) -> bool {
+        !matches!(
+            status,
+            0x8000_0001
+                | 0x8000_0002
+                | 0x8000_0003
+                | 0xC000_0005
+                | 0xC000_001D
+                | 0xC000_0046
+                | 0xC000_0047
+                | 0xC000_008C
+                | 0xC000_0094
+                | 0xC000_0096
+                | 0xC000_00AA
+                | 0xC000_0409
+                | 0xC000_0420
+        )
+    }
+
+    /// FsRtlIsNtstatusExpected(Status) -> BOOLEAN (zero-extendido).
+    fn is_ntstatus_expected(call: &Call) -> Result<u64, KernelError> {
+        Ok(ntstatus_expected(call.arg(1) as u32) as u64)
+    }
+
+    /// FsRtlNormalizeNtstatus(Exception, GenericException) -> NTSTATUS.
+    /// `IsNtstatusExpected(exc) ? exc : generic` (RVA 0x36cae0, `cmove`).
+    fn normalize_ntstatus(call: &Call) -> Result<u64, KernelError> {
+        let exception = call.arg(1) as u32;
+        let generic = call.arg(2) as u32;
+        // `mov eax, edi` zera os 32 bits altos de RAX: devolve sem sinal.
+        Ok(if ntstatus_expected(exception) { exception } else { generic } as u64)
+    }
+
+    // ---- Name helpers (§2.1) -----------------------------------------------
+
+    /// FsRtlDoesNameContainWildCards(Name) -> BOOLEAN (RVA 0x24f730).
+    /// Varre do último caractere para trás; para em `\` (FALSE); para um
+    /// caractere < 0x40 testa o bit FSRTL_WILD_CHARACTER no bitmap; caracteres
+    /// >= 0x40 nunca são curingas e são ignorados.
+    fn does_name_contain_wild_cards(call: &Call) -> Result<u64, KernelError> {
+        let name = call.arg(1);
+        let length = guest::read16(name) as u64; // UNICODE_STRING.Length (bytes)
+        if length == 0 {
+            return Ok(0);
+        }
+        let buffer = guest::read64(name + 8);
+        let mut index = length / 2; // contagem de caracteres
+        while index > 0 {
+            index -= 1;
+            let unit = guest::read16(buffer + index * 2);
+            if unit == WC_BACKSLASH {
+                return Ok(0);
+            }
+            if unit < 0x40 && FSRTL_LEGAL_ANSI_CHARACTER_ARRAY[unit as usize] & FSRTL_WILD_CHARACTER != 0 {
+                return Ok(1);
+            }
+        }
+        Ok(0)
+    }
+
+    /// FsRtlDissectName(Path, FirstName, RemainingName) (RVA 0x2ede60).
+    /// Zera as duas UNICODE_STRING de saída; divide `a\b\c` em first=`a`,
+    /// remaining=`b\c`; pula um `\` inicial. `Path` é passado por ponteiro
+    /// (struct de 16 bytes na ABI x64).
+    fn dissect_name(call: &Call) -> Result<u64, KernelError> {
+        let path = call.arg(1);
+        let first = call.arg(2);
+        let remaining = call.arg(3);
+        // Saídas zeradas (Length, MaximumLength, Buffer).
+        guest::write16(first, 0);
+        guest::write16(first + 2, 0);
+        guest::write64(first + 8, 0);
+        guest::write16(remaining, 0);
+        guest::write16(remaining + 2, 0);
+        guest::write64(remaining + 8, 0);
+
+        let count = guest::read16(path) as u64 / 2;
+        if count == 0 {
+            return Ok(0);
+        }
+        let buffer = guest::read64(path + 8);
+        let leading = if guest::read16(buffer) == WC_BACKSLASH { 1 } else { 0 };
+
+        // Índice do separador `\` (ou `count` se não houver), a partir de `leading`.
+        let mut separator = leading;
+        while separator < count && guest::read16(buffer + separator * 2) != WC_BACKSLASH {
+            separator += 1;
+        }
+
+        let first_len = ((separator - leading) * 2) as u16;
+        guest::write16(first, first_len);
+        guest::write16(first + 2, first_len);
+        guest::write64(first + 8, buffer + leading * 2);
+
+        if separator < count {
+            let remaining_len = ((count - separator - 1) * 2) as u16;
+            guest::write16(remaining, remaining_len);
+            guest::write16(remaining + 2, remaining_len);
+            guest::write64(remaining + 8, buffer + (separator + 1) * 2);
+        }
+        Ok(0)
+    }
+
+    /// FsRtlIsNameInExpression(Expression, Name, IgnoreCase, UpcaseTable)
+    /// -> BOOLEAN (RVA 0x24f160 -> RtlpIsNameInExpressionPrivate 0x24f290).
+    /// Matcher de curingas DOS auto-contido (`* ? < > "`), com upcase opcional.
+    fn is_name_in_expression(call: &Call) -> Result<u64, KernelError> {
+        let expression = read_unicode_string(call.arg(1));
+        let name = read_unicode_string(call.arg(2));
+        let ignore_case = call.arg(3) != 0;
+        Ok(match_expression(&expression, 0, &name, 0, ignore_case) as u64)
+    }
+
+    fn read_unicode_string(pointer: u64) -> alloc::vec::Vec<u16> {
+        let count = guest::read16(pointer) as usize / 2;
+        let buffer = guest::read64(pointer + 8);
+        let mut units = alloc::vec::Vec::with_capacity(count);
+        for index in 0..count {
+            units.push(guest::read16(buffer + (index as u64) * 2));
+        }
+        units
+    }
+
+    fn upcase(unit: u16) -> u16 {
+        unicode_case::upcase_char(unit).unwrap_or(unit)
+    }
+
+    fn unit_eq(a: u16, b: u16, ignore_case: bool) -> bool {
+        a == b || (ignore_case && upcase(a) == upcase(b))
+    }
+
+    /// Correspondência recursiva com retrocesso. `expr`/`name` são listas de
+    /// code units; o retrocesso vive apenas nas ramificações `*` / DOS_STAR.
+    fn match_expression(expr: &[u16], mut ei: usize, name: &[u16], mut ni: usize, ic: bool) -> bool {
+        loop {
+            if ei == expr.len() {
+                return ni == name.len();
+            }
+            match expr[ei] {
+                WC_STAR => {
+                    // Zero ou mais de qualquer caractere.
+                    if ei + 1 == expr.len() {
+                        return true; // `*` final casa com o resto.
+                    }
+                    for split in ni..=name.len() {
+                        if match_expression(expr, ei + 1, name, split, ic) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                WC_DOS_STAR => {
+                    // Zero ou mais caracteres até o último `.` do nome restante.
+                    let mut last_dot = name.len();
+                    for position in ni..name.len() {
+                        if name[position] == WC_DOT {
+                            last_dot = position;
+                        }
+                    }
+                    for split in ni..=last_dot {
+                        if match_expression(expr, ei + 1, name, split, ic) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                WC_QM => {
+                    // Exatamente um caractere.
+                    if ni < name.len() {
+                        ei += 1;
+                        ni += 1;
+                        continue;
+                    }
+                    return false;
+                }
+                WC_DOS_QM => {
+                    // Um caractere qualquer; em `.` ou fim do nome, casa com zero.
+                    if ni < name.len() && name[ni] != WC_DOT {
+                        ni += 1;
+                    }
+                    ei += 1;
+                    continue;
+                }
+                WC_DOS_DOT => {
+                    // Um `.` ou zero caracteres (ponto opcional).
+                    if ni < name.len() && name[ni] == WC_DOT {
+                        ni += 1;
+                    }
+                    ei += 1;
+                    continue;
+                }
+                literal => {
+                    if ni < name.len() && unit_eq(literal, name[ni], ic) {
+                        ei += 1;
+                        ni += 1;
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    // ---- Filter / FltMgr registration (§2.6) -------------------------------
+
+    /// FsRtlRegisterFltMgrCalls(Callbacks) -> previous (RVA 0x7d5640).
+    /// Uma instrução: `xchg [FltMgrCallbacks], rcx`. ** Única dependência real
+    /// do DriverEntry do fltmgr.sys. ** Ligado ao swap já existente.
+    fn register_flt_mgr_calls(call: &Call) -> Result<u64, KernelError> {
+        Ok(filter_callbacks::exchange_callbacks(call.arg(1)))
+    }
+
+    /// FsRtlRegisterFileSystemFilterCallbacks(DriverObject, Callbacks) ->
+    /// NTSTATUS (RVA 0x39a7b0). NULL em qualquer argumento -> INVALID_PARAMETER;
+    /// aloca `Callbacks->SizeOfFsFilterCallbacks` bytes de NonPagedPoolNx com a
+    /// tag 'FSmg', copia a tabela e guarda o ponteiro em
+    /// `DriverObject->DriverExtension (+0x30) + 0x30`.
+    fn register_file_system_filter_callbacks(call: &Call) -> Result<u64, KernelError> {
+        let driver_object = call.arg(1);
+        let callbacks = call.arg(2);
+        if driver_object == 0 || callbacks == 0 {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        const TAG_FSMG: u64 = 0x676D_5346; // 'FSmg'
+        const NON_PAGED_POOL_NX: u64 = 0x200;
+        let size = guest::read32(callbacks) as u64; // SizeOfFsFilterCallbacks
+        let driver_extension = guest::read64(driver_object + 0x30);
+        let pool = crate::ntos::init::exports::invoke_handler("ExAllocatePoolWithTag", &[NON_PAGED_POOL_NX, size, TAG_FSMG])
+            .unwrap_or(0);
+        if pool == 0 {
+            return Ok(signed_status(STATUS_INSUFFICIENT_RESOURCES));
+        }
+        let table = guest::read_bytes(callbacks, size as usize);
+        guest::write_bytes(pool, &table);
+        guest::write64(driver_extension + 0x30, pool);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-core",
+        names: &[
+            "FsRtlIsNameInExpression",
+            "FsRtlDoesNameContainWildCards",
+            "FsRtlDissectName",
+            "FsRtlIsNtstatusExpected",
+            "FsRtlNormalizeNtstatus",
+            "FsRtlRegisterFltMgrCalls",
+            "FsRtlRegisterFileSystemFilterCallbacks",
+        ],
+        handlers: &[
+            is_name_in_expression,
+            does_name_contain_wild_cards,
+            dissect_name,
+            is_ntstatus_expected,
+            normalize_ntstatus,
+            register_flt_mgr_calls,
+            register_file_system_filter_callbacks,
+        ],
+        data_exports: &[("FsRtlLegalAnsiCharacterArray", legal_ansi_character_array_address)],
+    };
+}
+
+// =============================================================================

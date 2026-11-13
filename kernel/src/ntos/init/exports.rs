@@ -54,7 +54,7 @@ pub struct Group {
 }
 
 /// Grupos transcritos (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 155] {
+fn groups() -> [&'static Group; 164] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -197,8 +197,8 @@ fn groups() -> [&'static Group; 155] {
         &crate::ntos::etw::exports::trace_control::ENABLE_TRACE_GROUP,
         &crate::ntos::rtl::exports::rtl_security::GROUP,
         &crate::ntos::io::exports::driver_helpers::GROUP,
-        &crate::ntos::io::exports::watchdog_support::GROUP,
-        &crate::ntos::io::exports::basicdisplay_support::GROUP,
+        &crate::ntos::io::exports::io_diagnostics::GROUP,
+        &crate::ntos::io::exports::x86bios_sleep_misc::GROUP,
         &crate::ntos::se::exports::se_descriptor::GROUP,
         &crate::ntos::ps::exports::process_image::GROUP,
         &crate::ntos::rtl::exports::package_claims::GROUP,
@@ -211,6 +211,15 @@ fn groups() -> [&'static Group; 155] {
         &crate::ntos::ke::exports::GROUP,
         &crate::ntos::mm::exports::GROUP,
         &crate::ntos::mm::exports::image_paging_exports::GROUP,
+        &crate::ntos::se::exports::se_token_info::GROUP,
+        &crate::ntos::po::exports::po_fx::GROUP,
+        &crate::ntos::se::exports::se_assign::GROUP,
+        &crate::ntos::se::exports::se_access::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_extended::GROUP,
+        &crate::ntos::ke::exports::ke_ex_sync::GROUP,
+        &crate::ntos::io::exports::fsrtl_core::GROUP,
+        &crate::ntos::ob::exports::ob_object_lifecycle::GROUP,
+        &crate::ntos::ex::exports::ex_lookaside_wnf::GROUP,
     ]
 }
 
@@ -226,6 +235,15 @@ fn table() -> Arc<Table> {
     let mut table = TABLE.lock();
     table
         .get_or_insert_with(|| {
+            // Cada export usa o trampolim de id `32 + índice`: se a ABI crescer
+            // além dos stubs, os ids altos apontariam para fora da tabela (e o
+            // loader os recusaria). Falha alto aqui, nunca em silêncio.
+            assert!(
+                32 + abi_names::EXPORT_NAMES.len() <= crate::hal::amd64::win32_thunk::MAX_WIN32 as usize,
+                "ntoskrnl: {} exports excedem os {} trampolins (aumente MAX_WIN32)",
+                abi_names::EXPORT_NAMES.len(),
+                crate::hal::amd64::win32_thunk::MAX_WIN32,
+            );
             let mut handlers = alloc::vec![None; abi_names::EXPORT_NAMES.len()];
             let mut data = BTreeMap::new();
             for group in groups() {

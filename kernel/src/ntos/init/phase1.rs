@@ -24,6 +24,8 @@ pub fn init() {
     }
     // HalPrivateDispatchTable preenchida como na inicialização da HAL do NT.
     crate::hal::private_dispatch::initialize().unwrap_or_else(|error| panic!("HAL privada: {error}"));
+    // HalDispatchTable pública, preenchida como na inicialização da HAL do NT.
+    crate::hal::public_dispatch::initialize().unwrap_or_else(|error| panic!("HAL publica: {error}"));
     // NTFS no segundo disco IDE (ata-pio): o carregador de imagens e o
     // ZwCreateFile resolvem a mesma montagem em \NTFS (D:).
     if matches!(crate::drivers::storage::ata_pio::present(1), Ok(true)) {

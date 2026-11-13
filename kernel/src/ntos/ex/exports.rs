@@ -1157,3 +1157,48 @@ pub mod zw {
         data_exports: &[],
     };
 }
+
+pub mod ex_lookaside_wnf {
+    //! ExInitializeLookasideListEx / ExDeleteLookasideListEx e
+    //! ExQueryWnfStateData. O lookaside reusa `ex/lookaside.rs`; a consulta WNF
+    //! reusa `ex/wnf/service::query`. A inscrição/desinscrição de kernel
+    //! (ExSubscribe/ExUnsubscribeWnfStateChange) entra num grupo próprio quando
+    //! o motor WNF tiver remoção de assinatura.
+
+    use crate::ntos::ex::lookaside;
+    use crate::ntos::ex::wnf::service as wnf_service;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExInitializeLookasideListEx(List, AllocateEx, FreeEx, PoolType, Flags,
+    /// Size, Tag, Depth). O PoolType vira o campo Type (+0x24) e escolhe o
+    /// registro paginado/não paginado pelo bit 0; AllocateEx/FreeEx nulos
+    /// recebem ExAllocatePoolWithTag/ExFreePool (feito dentro de `initialize`,
+    /// como nas listas não-Ex). Flags e Depth não têm efeito persistente aqui.
+    fn initialize_lookaside_list_ex(call: &Call) -> Result<u64, KernelError> {
+        let pool_type = call.arg(4) as u32;
+        lookaside::initialize(call.arg(1), call.arg(2), call.arg(3), pool_type, call.arg(6), call.arg(7) as u32, pool_type & 1 != 0)?;
+        Ok(0)
+    }
+
+    /// ExDeleteLookasideListEx(List): tira do registro e esvazia a SLIST pelo
+    /// FreeEx (reusa `lookaside::delete`).
+    fn delete_lookaside_list_ex(call: &Call) -> Result<u64, KernelError> {
+        lookaside::delete(call.arg(1))?;
+        Ok(0)
+    }
+
+    /// ExQueryWnfStateData(StateName, TypeId, ExplicitScope, ChangeStamp,
+    /// Buffer, BufferSize): a mesma entrada do motor que o ZwQueryWnfStateData,
+    /// chamada em modo kernel. Nome indefinido devolve STATUS_OBJECT_NAME_NOT_FOUND.
+    fn query_wnf_state_data(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wnf_service::query(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-lookaside-wnf",
+        names: &["ExInitializeLookasideListEx", "ExDeleteLookasideListEx", "ExQueryWnfStateData"],
+        handlers: &[initialize_lookaside_list_ex, delete_lookaside_list_ex, query_wnf_state_data],
+        data_exports: &[],
+    };
+}

@@ -144,6 +144,12 @@ pub fn callback_type() -> ObjectType {
     get_or_create("Callback", [0x20000, 0x20001, 0x120000, 0x1F0001], 0x1F0001, 0)
 }
 
+/// Cria um tipo de objeto arbitrário — a forma pública do `create`, usada por
+/// ObCreateObjectType quando um driver registra tipos próprios.
+pub fn define(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Result<ObjectType, KernelError> {
+    create(name, mapping, valid_access, flags)
+}
+
 pub fn device_type() -> ObjectType {
     get_or_create("Device", [0x120089, 0x120116, 0x1200A0, 0x1F01FF], 0x1F01FF, 0)
 }

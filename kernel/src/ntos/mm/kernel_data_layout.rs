@@ -24,6 +24,40 @@ const HAL_PRIVATE_DISPATCH_INITIAL: [u8; 0x4B0] = {
     bytes
 };
 
+/// HAL_DISPATCH público (0xC0 bytes = Version + 23 ponteiros): versão 4; os
+/// ponteiros são gravados na inicialização da HAL (`hal::public_dispatch`).
+/// É a tabela que drivers como o BasicDisplay e o dxgkrnl indexam para chegar
+/// a HalQuerySystemInformation (slot 1) — distinta da HalPrivateDispatchTable.
+const HAL_DISPATCH_INITIAL: [u8; 0xC0] = {
+    let mut bytes = [0u8; 0xC0];
+    bytes[0] = 4;
+    bytes
+};
+
+/// FsRtlLegalAnsiCharacterArray: classe de cada byte ANSI (FAT/HPFS/NTFS/OLE e
+/// curinga). 0x00–0x7F são os bytes exatos do ntoskrnl 19041 (tabela de 128
+/// bytes no RVA 0x11b20, conferida contra o binário); 0x80–0xFF = 0x17 (legal,
+/// não-curinga), o padrão para ANSI alto — os testes de curinga só indexam < 0x40.
+pub const FSRTL_LEGAL_ANSI_CHARACTER_ARRAY: [u8; 256] = {
+    let mut table = [0x17u8; 256];
+    let low: [u8; 128] = [
+        0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, // 0x00
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, // 0x10
+        0x17, 0x07, 0x18, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x18, 0x16, 0x16, 0x17, 0x07, 0x00, // 0x20
+        0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x04, 0x16, 0x18, 0x16, 0x18, 0x18, // 0x30
+        0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, // 0x40
+        0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x16, 0x00, 0x16, 0x17, 0x17, // 0x50
+        0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, // 0x60
+        0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x10, 0x17, 0x17, 0x17, // 0x70
+    ];
+    let mut index = 0;
+    while index < 128 {
+        table[index] = low[index];
+        index += 1;
+    }
+    table
+};
+
 const fn pointer(name: &'static str) -> KernelDataEntry {
     KernelDataEntry { name, size: 8, storage_size: 8, alignment: 8, initial: ZERO8 }
 }
@@ -40,6 +74,9 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     pointer("IoDriverObjectType"),
     pointer("IoFileObjectType"),
     pointer("MmSectionObjectType"),
+    pointer("IoDeviceObjectType"),
+    pointer("ExSemaphoreObjectType"),
+    pointer("LpcPortObjectType"),
     pointer("MmUserProbeAddress"),
     pointer("MmHighestUserAddress"),
     pointer("SeTokenObjectType"),
@@ -48,6 +85,8 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // exportado.
     KernelDataEntry { name: "SeExports", size: 8, storage_size: 1064, alignment: 8, initial: ZERO8 },
     KernelDataEntry { name: "HalPrivateDispatchTable", size: 0x4B0, storage_size: 0x4B0, alignment: 8, initial: &HAL_PRIVATE_DISPATCH_INITIAL },
+    KernelDataEntry { name: "HalDispatchTable", size: 0xC0, storage_size: 0xC0, alignment: 8, initial: &HAL_DISPATCH_INITIAL },
+    KernelDataEntry { name: "FsRtlLegalAnsiCharacterArray", size: 256, storage_size: 256, alignment: 16, initial: &FSRTL_LEGAL_ANSI_CHARACTER_ARRAY },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

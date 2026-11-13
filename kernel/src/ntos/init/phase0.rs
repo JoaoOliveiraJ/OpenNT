@@ -62,7 +62,11 @@ pub fn init() {
         kernel_data::write("IoFileObjectType", object_types::file_type().pointer);
         kernel_data::write("MmSectionObjectType", object_types::section_type().pointer);
         kernel_data::write("SeTokenObjectType", object_types::token_type().pointer);
-        object_types::device_type();
+        kernel_data::write("IoDeviceObjectType", object_types::device_type().pointer);
+        // Semaphore e ALPC Port são criados sob demanda pelo user_type; a
+        // ausência seria um tipo que não pôde ser criado — falha alto.
+        kernel_data::write("ExSemaphoreObjectType", object_types::user_type("semaphore").expect("tipo Semaphore").pointer);
+        kernel_data::write("LpcPortObjectType", object_types::user_type("port").expect("tipo ALPC Port").pointer);
         object_types::event_type();
         object_types::meta_type();
         object_types::directory_type();

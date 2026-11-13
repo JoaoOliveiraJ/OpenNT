@@ -815,3 +815,418 @@ pub mod query_security {
 
     pub static GROUP: Group = Group { name: "query-security", names: &["ZwQuerySecurityObject"], handlers: &[query], data_exports: &[] };
 }
+
+pub mod ob_object_lifecycle {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::nt_abi::object_attributes;
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::mm::kernel_data;
+    use crate::ntos::ob::exports::{reference_object_by_handle, security_descriptor};
+    use crate::ntos::ob::object_manager::{self, ObjectData};
+    use crate::ntos::ob::{close, handle_ids, object_access, object_types, open_pointer, reference_trace};
+    use crate::ntos::ps::process;
+    use crate::ntos::rtl::guest_strings;
+    use crate::rtl::{KernelError, SpinLock};
+
+    const STATUS_SUCCESS: u32 = 0;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+    const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+
+    const OBJ_KERNEL_HANDLE: u32 = 0x200;
+    const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
+    const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+    const KERNEL_HANDLE_MASK: u64 = 0xFFFF_FFFF_8000_0000;
+
+    /// Create-info captured by ObCreateObject, consumed by ObInsertObject or
+    /// freed by ObDeleteCapturedInsertInfo. Keyed by the object body pointer.
+    #[derive(Clone)]
+    struct Captured {
+        type_pointer: u64,
+        type_name: String,
+        name: Option<String>,
+        attributes: u32,
+    }
+
+    /// One published dxgkrnl object handle (the body plus its granted access).
+    #[derive(Clone)]
+    struct DxHandle {
+        body: u64,
+        type_pointer: u64,
+        type_name: String,
+        access: u32,
+        attributes: u32,
+        owner: u64,
+        kernel: bool,
+    }
+
+    static CAPTURED: SpinLock<BTreeMap<u64, Captured>> = SpinLock::new(BTreeMap::new());
+    static HANDLES: SpinLock<BTreeMap<u64, DxHandle>> = SpinLock::new(BTreeMap::new());
+
+    fn kernel_handle(id: u32) -> u64 {
+        KERNEL_HANDLE_MASK | id as u64
+    }
+
+    fn is_kernel_value(handle: u64) -> bool {
+        handle & KERNEL_HANDLE_MASK == KERNEL_HANDLE_MASK && !(-6..=-1).contains(&(handle as i64))
+    }
+
+    /// ObjectType of a dxgkrnl body still in CAPTURED or already in HANDLES.
+    fn dx_type(body: u64) -> Option<object_types::ObjectType> {
+        if let Some(cap) = CAPTURED.lock().get(&body) {
+            return object_types::find(cap.type_pointer);
+        }
+        let pointer = HANDLES.lock().values().find(|entry| entry.body == body).map(|entry| entry.type_pointer)?;
+        object_types::find(pointer)
+    }
+
+    // --- ObCreateObjectType ---------------------------------------------------
+    // NTSTATUS ObCreateObjectType(PUNICODE_STRING Name,
+    //   POBJECT_TYPE_INITIALIZER Init, PSECURITY_DESCRIPTOR Sd, POBJECT_TYPE *Type)
+    //
+    // Faithful wrapper over object_types::define (the public form of the private
+    // create()). The INITIALIZER mirrors the 0xD8 body window: Length/flags in
+    // the first dword, GENERIC_MAPPING at +0x0C, ValidAccessMask at +0x1C.
+    fn create_object_type(call: &Call) -> Result<u64, KernelError> {
+        let (name_ptr, init, out) = (call.arg(1), call.arg(2), call.arg(4));
+        if init == 0 || name_ptr == 0 {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        let name = guest_strings::read_unicode_string(name_ptr);
+        if name.is_empty() {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        let header = guest::read32(init);
+        let flags = (header >> 16) as u16;
+        let mapping = [
+            guest::read32(init + 0x0C),
+            guest::read32(init + 0x10),
+            guest::read32(init + 0x14),
+            guest::read32(init + 0x18),
+        ];
+        let valid = guest::read32(init + 0x1C);
+        match object_types::define(&name, mapping, valid, flags) {
+            Ok(info) => {
+                if out != 0 {
+                    guest::write64(out, info.pointer);
+                }
+                Ok(signed_status(STATUS_SUCCESS))
+            }
+            Err(_) => Ok(signed_status(STATUS_OBJECT_NAME_COLLISION)),
+        }
+    }
+
+    // --- ObCreateObject -------------------------------------------------------
+    // NTSTATUS ObCreateObject(KPROCESSOR_MODE ProbeMode, POBJECT_TYPE Type,
+    //   POBJECT_ATTRIBUTES Attr, KPROCESSOR_MODE OwnerMode, PVOID Reserved,
+    //   ULONG BodySize, ULONG PagedCharge, ULONG NonPagedCharge, PVOID *Object)
+    //
+    // Allocates the object body, counts it on its type, and captures the
+    // OBJECT_ATTRIBUTES for a later ObInsertObject (RVA 0x7022d0 ->
+    // ObpAllocateObject stashes the captured create-info in the header).
+    fn create_object(call: &Call) -> Result<u64, KernelError> {
+        let (type_ptr, attr, body_size, out) = (call.arg(2), call.arg(3), call.arg(6) as u32, call.arg(9));
+        let Some(object_type) = object_types::find(type_ptr) else {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        };
+        let body = guest::alloc_bytes(body_size.max(1) as u64);
+        if body == 0 {
+            return Ok(signed_status(STATUS_INSUFFICIENT_RESOURCES));
+        }
+        let (name, attributes) = if attr != 0 {
+            let name_us = guest::read64(attr + object_attributes::OBJECT_NAME);
+            let name = (name_us != 0).then(|| guest_strings::read_unicode_string(name_us)).filter(|name| !name.is_empty());
+            (name, guest::read32(attr + object_attributes::ATTRIBUTES))
+        } else {
+            (None, 0)
+        };
+        // Count the new object on its type (ObpAllocateObject bumps TotalNumberOfObjects).
+        let _ = object_types::account(&object_type.name, 1, 0);
+        CAPTURED.lock().insert(body, Captured { type_pointer: type_ptr, type_name: object_type.name, name, attributes });
+        if out != 0 {
+            guest::write64(out, body);
+        }
+        Ok(signed_status(STATUS_SUCCESS))
+    }
+
+    // --- ObInsertObject -------------------------------------------------------
+    // NTSTATUS ObInsertObject(PVOID Object, PACCESS_STATE AccessState,
+    //   ACCESS_MASK DesiredAccess, ULONG Bias, PVOID *NewObject, PHANDLE Handle)
+    //
+    // Consumes the ObCreateObject create-info, inserts a named body into the
+    // namespace (best-effort, so the name is visible), and opens a handle in the
+    // current (or System, for OBJ_KERNEL_HANDLE) table.
+    fn insert_object(call: &Call) -> Result<u64, KernelError> {
+        let (object, desired, new_object_out, handle_out) = (call.arg(1), call.arg(3) as u32, call.arg(5), call.arg(6));
+        let Some(cap) = CAPTURED.lock().remove(&object) else {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        };
+        let kernel = cap.attributes & OBJ_KERNEL_HANDLE != 0;
+
+        // Best-effort namespace insertion for a fully-qualified name (\Dir\Leaf).
+        if let Some(name) = cap.name.as_deref() {
+            let trimmed = name.strip_prefix('\\').unwrap_or(name);
+            let (parent, leaf) = trimmed.rsplit_once('\\').unwrap_or(("", trimmed));
+            if !leaf.is_empty() {
+                let parent_path = alloc::format!("\\{parent}");
+                let _ = object_manager::create_object(&parent_path, leaf, &cap.type_name, Some(ObjectData::pointer(object)));
+            }
+        }
+
+        let id = handle_ids::allocate(4)?;
+        let handle = if kernel { kernel_handle(id) } else { id as u64 };
+        let owner = if kernel { process::get_system_process() } else { process::get_current_process() };
+        // Count the handle on the type (ObpIncrementHandleCount).
+        let _ = object_types::account(&cap.type_name, 0, 1);
+        HANDLES.lock().insert(handle, DxHandle { body: object, type_pointer: cap.type_pointer, type_name: cap.type_name, access: desired, attributes: cap.attributes & 7, owner, kernel });
+        if new_object_out != 0 {
+            guest::write64(new_object_out, object);
+        }
+        if handle_out != 0 {
+            guest::write64(handle_out, handle);
+        }
+        Ok(signed_status(STATUS_SUCCESS))
+    }
+
+    // --- ObDeleteCapturedInsertInfo -------------------------------------------
+    // VOID ObDeleteCapturedInsertInfo(PVOID Object): frees the captured
+    // create-info when a created object is NOT inserted; undoes the object count.
+    fn delete_captured_insert_info(call: &Call) -> Result<u64, KernelError> {
+        if let Some(cap) = CAPTURED.lock().remove(&call.arg(1)) {
+            let _ = object_types::account(&cap.type_name, -1, 0);
+        }
+        Ok(0)
+    }
+
+    // --- ObReferenceObjectByHandleWithTag -------------------------------------
+    // NTSTATUS ObReferenceObjectByHandleWithTag(HANDLE, ACCESS_MASK, POBJECT_TYPE,
+    //   KPROCESSOR_MODE, ULONG Tag, PVOID *Object, POBJECT_HANDLE_INFORMATION)
+    //
+    // The tag is diagnostic only. dxgkrnl objects resolve through HANDLES; every
+    // other handle forwards to the existing ObReferenceObjectByHandle core (the
+    // real export merely shuffles the tag arg and calls the shared routine).
+    /// O handle está na tabela de quem chama? Handles de kernel ficam na tabela
+    /// do System e valem em qualquer contexto; um handle de usuário só existe
+    /// na tabela do processo dono — como no NT, outro processo não o enxerga
+    /// (e recebe STATUS_INVALID_HANDLE pelo caminho comum do Object Manager).
+    fn visible(entry: &DxHandle) -> bool {
+        entry.kernel || entry.owner == process::get_current_process()
+    }
+
+    fn reference_object_by_handle_with_tag(call: &Call) -> Result<u64, KernelError> {
+        let (handle, access, object_type, mode, tag, out, info) =
+            (call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u8, call.arg(5) as u32, call.arg(6), call.arg(7));
+        if let Some(entry) = HANDLES.lock().get(&handle).cloned().filter(visible) {
+            if object_type != 0 && object_type != entry.type_pointer {
+                return Ok(signed_status(STATUS_OBJECT_TYPE_MISMATCH));
+            }
+            if mode != 0 && access & !entry.access != 0 {
+                return Ok(signed_status(STATUS_ACCESS_DENIED));
+            }
+            reference_trace::record(entry.body, tag, 1);
+            let _ = object_types::account(&entry.type_name, 1, 0);
+            guest::write64(out, entry.body);
+            if info != 0 {
+                guest::write32(info, entry.attributes);
+                guest::write32(info + 4, entry.access);
+            }
+            return Ok(signed_status(STATUS_SUCCESS));
+        }
+        // ObReferenceObjectByHandle(handle, access, type, mode, out, info).
+        let forwarded = Call {
+            args: [handle, access as u64, object_type, mode as u64, out, info, 0, 0, 0, 0, 0, 0, 0, 0],
+            return_address: call.return_address,
+            frame: call.frame,
+            context: call.context,
+        };
+        reference_object_by_handle(&forwarded)
+    }
+
+    // --- ObCheckObjectAccess --------------------------------------------------
+    // BOOLEAN ObCheckObjectAccess(PVOID Object, PSECURITY_SUBJECT_CONTEXT,
+    //   BOOLEAN LockHeld, KPROCESSOR_MODE Mode, PACCESS_MASK GrantedAccess,
+    //   PNTSTATUS Status). GrantedAccess is in/out (desired on entry, granted
+    //   on exit). Wraps object_access::check against the type generic-mapping.
+    fn check_object_access(call: &Call) -> Result<u64, KernelError> {
+        let (object, mode, granted_out, status_out) = (call.arg(1), call.arg(4) as u8, call.arg(5), call.arg(6));
+        let desired = if granted_out != 0 { guest::read32(granted_out) } else { 0 };
+        let (object_type, policy) = if let Some(described) = open_pointer::describe(object) {
+            (described.object_type.clone(), described.owner.security(object))
+        } else if let Some(object_type) = object_types::bound(object).or_else(|| dx_type(object)) {
+            (object_type, object_access::capture(None))
+        } else {
+            if status_out != 0 {
+                guest::write32(status_out, STATUS_INVALID_HANDLE);
+            }
+            return Ok(0);
+        };
+        match object_access::check(&policy, object_access::subject(), desired, &object_type, mode == 0) {
+            Ok(granted) => {
+                if granted_out != 0 {
+                    guest::write32(granted_out, granted);
+                }
+                if status_out != 0 {
+                    guest::write32(status_out, STATUS_SUCCESS);
+                }
+                Ok(1)
+            }
+            Err(status) => {
+                if granted_out != 0 {
+                    guest::write32(granted_out, 0);
+                }
+                if status_out != 0 {
+                    guest::write32(status_out, status);
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    // --- ObGetObjectSecurity --------------------------------------------------
+    // NTSTATUS ObGetObjectSecurity(PVOID Object, PSECURITY_DESCRIPTOR *Sd,
+    //   PBOOLEAN MemoryAllocated). Returns the side-table SD; nothing is
+    //   allocated, so MemoryAllocated is FALSE (pairs with ObReleaseObjectSecurity).
+    fn get_object_security(call: &Call) -> Result<u64, KernelError> {
+        let (object, sd_out, allocated_out) = (call.arg(1), call.arg(2), call.arg(3));
+        let sd = security_descriptor(object).unwrap_or(0);
+        if sd_out != 0 {
+            guest::write64(sd_out, sd);
+        }
+        if allocated_out != 0 {
+            guest::write8(allocated_out, 0);
+        }
+        Ok(signed_status(STATUS_SUCCESS))
+    }
+
+    // --- ObReleaseObjectSecurity ----------------------------------------------
+    // VOID ObReleaseObjectSecurity(PSECURITY_DESCRIPTOR Sd, BOOLEAN MemoryAllocated).
+    fn release_object_security(call: &Call) -> Result<u64, KernelError> {
+        let (sd, allocated) = (call.arg(1), call.arg(2) & 0xFF != 0);
+        if allocated && sd != 0 {
+            guest::free_bytes(sd);
+        }
+        Ok(0)
+    }
+
+    // --- ObDuplicateObject ----------------------------------------------------
+    // NTSTATUS ObDuplicateObject(PEPROCESS Source, HANDLE SourceHandle,
+    //   PEPROCESS Target, PHANDLE TargetHandle, ACCESS_MASK DesiredAccess,
+    //   ULONG HandleAttributes, ULONG Options, KPROCESSOR_MODE Mode)
+    //
+    // Minimal cross-process path over the dxgkrnl handle table: resolve the
+    // source body, publish a new handle owned by Target, honor
+    // DUPLICATE_SAME_ACCESS / DUPLICATE_CLOSE_SOURCE. Standard (Object-Manager)
+    // handles are not duplicated here — see LIMITATIONS.
+    fn duplicate_object(call: &Call) -> Result<u64, KernelError> {
+        let (source_handle, target_process, target_handle_out, desired, handle_attributes, options) =
+            (call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32);
+        let Some(entry) = HANDLES.lock().get(&source_handle).cloned().filter(visible) else {
+            return Ok(signed_status(STATUS_INVALID_HANDLE));
+        };
+        let access = if options & DUPLICATE_SAME_ACCESS != 0 { entry.access } else { desired };
+        let kernel = handle_attributes & OBJ_KERNEL_HANDLE != 0 || entry.kernel;
+        let id = handle_ids::allocate(4)?;
+        let handle = if kernel { kernel_handle(id) } else { id as u64 };
+        let owner = if kernel {
+            process::get_system_process()
+        } else if target_process != 0 {
+            target_process
+        } else {
+            process::get_current_process()
+        };
+        let _ = object_types::account(&entry.type_name, 0, 1);
+        HANDLES.lock().insert(handle, DxHandle { body: entry.body, type_pointer: entry.type_pointer, type_name: entry.type_name.clone(), access, attributes: handle_attributes & 7, owner, kernel });
+        if options & DUPLICATE_CLOSE_SOURCE != 0 {
+            if let Some(source) = HANDLES.lock().remove(&source_handle) {
+                let _ = object_types::account(&source.type_name, 0, -1);
+            }
+        }
+        if target_handle_out != 0 {
+            guest::write64(target_handle_out, handle);
+        }
+        Ok(signed_status(STATUS_SUCCESS))
+    }
+
+    // --- ObIsKernelHandle -----------------------------------------------------
+    // BOOLEAN ObIsKernelHandle(HANDLE Handle): the kernel-handle bit is set and
+    // the handle is not a pseudo-handle (-1..-6).
+    fn is_kernel_handle(call: &Call) -> Result<u64, KernelError> {
+        Ok(is_kernel_value(call.arg(1)) as u64)
+    }
+
+    // --- ObCloseHandle --------------------------------------------------------
+    // NTSTATUS ObCloseHandle(HANDLE Handle, KPROCESSOR_MODE Mode): same path as
+    // NtClose with an explicit mode. dxgkrnl handles leave the local table;
+    // everything else delegates to close::close.
+    fn close_handle(call: &Call) -> Result<u64, KernelError> {
+        let (handle, mode) = (call.arg(1), call.arg(2) as u8);
+        // Só fecha um handle da tabela de quem chama; o de outro processo segue
+        // para o close comum, que o recusa.
+        let removed = {
+            let mut handles = HANDLES.lock();
+            match handles.get(&handle) {
+                Some(entry) if visible(entry) => handles.remove(&handle),
+                _ => None,
+            }
+        };
+        if let Some(entry) = removed {
+            let _ = object_types::account(&entry.type_name, 0, -1);
+            return Ok(signed_status(STATUS_SUCCESS));
+        }
+        Ok(signed_status(close::close(handle, Some(mode))?))
+    }
+
+    // --- object-type pointer DATA exports (heap-populated kdata cells) ---------
+    fn io_device_object_type() -> u64 {
+        kernel_data::address("IoDeviceObjectType").unwrap_or_else(|error| panic!("IoDeviceObjectType: {error}"))
+    }
+    fn ex_semaphore_object_type() -> u64 {
+        kernel_data::address("ExSemaphoreObjectType").unwrap_or_else(|error| panic!("ExSemaphoreObjectType: {error}"))
+    }
+    fn lpc_port_object_type() -> u64 {
+        kernel_data::address("LpcPortObjectType").unwrap_or_else(|error| panic!("LpcPortObjectType: {error}"))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ob-object-lifecycle",
+        names: &[
+            "ObCreateObjectType",
+            "ObCreateObject",
+            "ObInsertObject",
+            "ObDeleteCapturedInsertInfo",
+            "ObReferenceObjectByHandleWithTag",
+            "ObCheckObjectAccess",
+            "ObGetObjectSecurity",
+            "ObReleaseObjectSecurity",
+            "ObDuplicateObject",
+            "ObIsKernelHandle",
+            "ObCloseHandle",
+        ],
+        handlers: &[
+            create_object_type,
+            create_object,
+            insert_object,
+            delete_captured_insert_info,
+            reference_object_by_handle_with_tag,
+            check_object_access,
+            get_object_security,
+            release_object_security,
+            duplicate_object,
+            is_kernel_handle,
+            close_handle,
+        ],
+        data_exports: &[
+            ("IoDeviceObjectType", io_device_object_type),
+            ("ExSemaphoreObjectType", ex_semaphore_object_type),
+            ("LpcPortObjectType", lpc_port_object_type),
+        ],
+    };
+}
+
+// =============================================================================

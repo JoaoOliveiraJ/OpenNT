@@ -1631,3 +1631,695 @@ pub mod rtl_security {
         data_exports: &[],
     };
 }
+
+pub mod rtl_crt_extended {
+    //! Rtl + CRT importados pelo dxgkrnl.sys que faltavam ao OpenNT.
+    //!
+    //! Os 19 Rtl são bit-twiddling/strings/segurança puros ou finos
+    //! encaminhamentos a `se::{descriptor,acl}`, `rtl::image` e
+    //! `rtl::ansi_code_page`. Os 7 da CRT completam `rtl/crt.rs` para drivers C.
+
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::rtl::guest_strings;
+    use crate::rtl::KernelError;
+
+    // ---- NTSTATUS usados (iguais aos irmãos de `se::descriptor`) -----------
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+    const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058; // convenção do componente `se`
+    const STATUS_INVALID_ACL: u32 = 0xC000_0077;
+    const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+    const STATUS_REVISION_MISMATCH: u32 = 0xC000_0059;
+
+    // =======================================================================
+    // Rtl — segurança (descritores, ACLs, SIDs)
+    // =======================================================================
+
+    /// RtlMapGenericMask(PACCESS_MASK, PGENERIC_MAPPING): troca os quatro bits
+    /// GENERIC_* pelos direitos específicos do GENERIC_MAPPING e limpa-os. Puro.
+    fn map_generic_mask(call: &Call) -> Result<u64, KernelError> {
+        let (mask_ptr, mapping) = (call.arg(1), call.arg(2));
+        let mut mask = guest::read32(mask_ptr);
+        if mask & 0x8000_0000 != 0 {
+            mask |= guest::read32(mapping); // GenericRead
+        }
+        if mask & 0x4000_0000 != 0 {
+            mask |= guest::read32(mapping + 4); // GenericWrite
+        }
+        if mask & 0x2000_0000 != 0 {
+            mask |= guest::read32(mapping + 8); // GenericExecute
+        }
+        if mask & 0x1000_0000 != 0 {
+            mask |= guest::read32(mapping + 12); // GenericAll
+        }
+        mask &= 0x0FFF_FFFF; // zera GENERIC_{READ,WRITE,EXECUTE,ALL}
+        guest::write32(mask_ptr, mask);
+        Ok(0)
+    }
+
+    /// RtlAddAce(PACL, Rev, StartIndex, AceList, AceListLength): insere ACEs
+    /// cruas num índice, deslocando a cauda e somando ao AceCount.
+    fn add_ace(call: &Call) -> Result<u64, KernelError> {
+        let (acl, ace_revision, start_index, ace_list, ace_list_len) =
+            (call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5) & 0xFFFF_FFFF);
+        if !crate::ntos::se::acl::valid(acl) {
+            return Ok(signed_status(STATUS_INVALID_ACL));
+        }
+        let acl_revision = guest::read8(acl) as u32;
+        if !(2..=4).contains(&ace_revision) || acl_revision > 4 {
+            return Ok(signed_status(STATUS_REVISION_MISMATCH));
+        }
+        let acl_size = guest::read16(acl + 2) as u64;
+        let count = guest::read16(acl + 4) as u64;
+        let start = (start_index as u64).min(count);
+        // Offset do ponto de inserção (após `start` ACEs) e do fim usado.
+        let mut insert_at = 8u64;
+        for _ in 0..start {
+            insert_at += guest::read16(acl + insert_at + 2) as u64;
+        }
+        let mut used_end = insert_at;
+        for _ in start..count {
+            used_end += guest::read16(acl + used_end + 2) as u64;
+        }
+        if used_end + ace_list_len > acl_size {
+            return Ok(signed_status(STATUS_BUFFER_TOO_SMALL));
+        }
+        // Abre espaço deslocando a cauda para frente (de trás para frente).
+        let tail = used_end - insert_at;
+        for k in 0..tail {
+            let from = acl + used_end - 1 - k;
+            guest::write8(from + ace_list_len, guest::read8(from));
+        }
+        for k in 0..ace_list_len {
+            guest::write8(acl + insert_at + k, guest::read8(ace_list + k));
+        }
+        // Conta as ACEs inseridas e atualiza o cabeçalho.
+        let (mut added, mut p) = (0u64, 0u64);
+        while p < ace_list_len {
+            let size = guest::read16(ace_list + p + 2) as u64;
+            if size == 0 {
+                break;
+            }
+            p += size;
+            added += 1;
+        }
+        guest::write16(acl + 4, (count + added) as u16);
+        if ace_revision > acl_revision {
+            guest::write8(acl, ace_revision as u8);
+        }
+        Ok(0)
+    }
+
+    /// RtlGetSaclSecurityDescriptor(PSD, PBOOLEAN Present, PACL*, PBOOLEAN Defaulted).
+    fn get_sacl_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        use crate::ntos::se::descriptor;
+        let (sd, present, acl_out, defaulted) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4));
+        if guest::read8(sd) != 1 {
+            return Ok(signed_status(STATUS_UNKNOWN_REVISION));
+        }
+        let control = descriptor::control(sd);
+        guest::write8(present, (control & 0x0010 != 0) as u8); // SE_SACL_PRESENT
+        if control & 0x0010 != 0 {
+            guest::write64(acl_out, descriptor::component(sd, control, 2));
+            guest::write8(defaulted, ((control >> 5) & 1) as u8); // SE_SACL_DEFAULTED=0x20
+        }
+        Ok(0)
+    }
+
+    /// RtlGetGroupSecurityDescriptor(PSD, PSID* Group, PBOOLEAN Defaulted).
+    fn get_group_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        use crate::ntos::se::descriptor;
+        let (sd, group_out, defaulted) = (call.arg(1), call.arg(2), call.arg(3));
+        if guest::read8(sd) != 1 {
+            return Ok(signed_status(STATUS_UNKNOWN_REVISION));
+        }
+        let control = descriptor::control(sd);
+        guest::write64(group_out, descriptor::component(sd, control, 1));
+        guest::write8(defaulted, ((control >> 1) & 1) as u8); // SE_GROUP_DEFAULTED=0x2
+        Ok(0)
+    }
+
+    /// RtlSetGroupSecurityDescriptor(PSD, PSID Group, BOOLEAN Defaulted). SD absoluto.
+    fn set_group_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        let (sd, group, defaulted) = (call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0);
+        if guest::read8(sd) != 1 {
+            return Ok(signed_status(STATUS_UNKNOWN_REVISION));
+        }
+        let control = guest::read16(sd + 2);
+        if control & 0x8000 != 0 {
+            return Ok(signed_status(STATUS_INVALID_SECURITY_DESCR)); // SE_SELF_RELATIVE
+        }
+        guest::write64(sd + 0x10, group); // Group está em +0x10 (owner +8, group +0x10)
+        let mut value = control & !0x0002;
+        if defaulted {
+            value |= 0x0002;
+        }
+        guest::write16(sd + 2, value);
+        Ok(0)
+    }
+
+    /// RtlSubAuthorityCountSid(PSID) = &Sid->SubAuthorityCount (lea rax,[rcx+1]).
+    fn sub_authority_count_sid(call: &Call) -> Result<u64, KernelError> {
+        Ok(call.arg(1) + 1)
+    }
+
+    /// RtlCopyLuid(PLUID Dest, PLUID Src): copia os 8 bytes do LUID.
+    fn copy_luid(call: &Call) -> Result<u64, KernelError> {
+        guest::write64(call.arg(1), guest::read64(call.arg(2)));
+        Ok(0)
+    }
+
+    // =======================================================================
+    // Rtl — strings / NLS / números
+    // =======================================================================
+
+    /// RtlAnsiCharToUnicodeChar(PUCHAR* SourcePtr): traduz um char ANSI pela
+    /// página de código instalada e avança *SourcePtr (SBCS = 1 byte).
+    fn ansi_char_to_unicode_char(call: &Call) -> Result<u64, KernelError> {
+        let pointer_field = call.arg(1);
+        let source = guest::read64(pointer_field);
+        let byte = guest::read8(source);
+        guest::write64(pointer_field, source + 1);
+        // ASCII é identidade; o intervalo alto passa pela página instalada,
+        // com recuo para identidade se o NLS não estiver disponível.
+        let wide = if byte < 0x80 {
+            byte as u16
+        } else {
+            match crate::ntos::rtl::ansi_code_page::current() {
+                Ok(code_page) => {
+                    let input = guest::alloc_bytes(1);
+                    let output = guest::alloc_bytes(2);
+                    guest::write8(input, byte);
+                    let unit = code_page.write_unicode(input, 1, output, 1).ok().map_or(byte as u16, |_| guest::read16(output));
+                    guest::free_bytes(input);
+                    guest::free_bytes(output);
+                    unit
+                }
+                Err(_) => byte as u16,
+            }
+        };
+        Ok(wide as u64)
+    }
+
+    /// RtlAppendStringToString(PSTRING Dest, const STRING* Src): concatena uma
+    /// STRING ANSI contada (sem terminador), respeitando MaximumLength.
+    fn append_string_to_string(call: &Call) -> Result<u64, KernelError> {
+        let (dest, src) = (call.arg(1), call.arg(2));
+        let src_len = guest::read16(src) as u64;
+        if src_len == 0 {
+            return Ok(0);
+        }
+        let dest_len = guest::read16(dest) as u64;
+        if dest_len + src_len > guest::read16(dest + 2) as u64 {
+            return Ok(signed_status(STATUS_BUFFER_TOO_SMALL));
+        }
+        let (dest_buffer, src_buffer) = (guest::read64(dest + 8), guest::read64(src + 8));
+        for index in 0..src_len {
+            guest::write8(dest_buffer + dest_len + index, guest::read8(src_buffer + index));
+        }
+        guest::write16(dest, (dest_len + src_len) as u16);
+        Ok(0)
+    }
+
+    fn format_radix64(mut value: u64, base: u32) -> String {
+        if value == 0 {
+            return String::from("0");
+        }
+        let mut digits = Vec::new();
+        while value > 0 {
+            digits.push(core::char::from_digit((value % base as u64) as u32, base).unwrap_or('0'));
+            value /= base as u64;
+        }
+        digits.iter().rev().collect()
+    }
+
+    /// Grava um texto numa UNICODE_STRING de destino (buffer já alocado),
+    /// terminada em NUL; BUFFER_OVERFLOW se não couber.
+    fn store_counted_unicode(destination: u64, text: &str) -> u64 {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if (units.len() + 1) * 2 > guest::read16(destination + 2) as usize {
+            return signed_status(STATUS_BUFFER_OVERFLOW);
+        }
+        let buffer = guest::read64(destination + 8);
+        for (index, unit) in units.iter().enumerate() {
+            guest::write16(buffer + index as u64 * 2, *unit);
+        }
+        guest::write16(buffer + units.len() as u64 * 2, 0);
+        guest::write16(destination, (units.len() * 2) as u16);
+        0
+    }
+
+    /// RtlInt64ToUnicodeString(ULONGLONG, Base, PUNICODE_STRING): formata um
+    /// inteiro de 64 bits (bases 2, 8, 10, 16).
+    fn int64_to_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        let base = match call.arg(2) as u32 {
+            0 => 10,
+            base => base,
+        };
+        if ![2, 8, 10, 16].contains(&base) {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        Ok(store_counted_unicode(call.arg(3), &format_radix64(call.arg(1), base)))
+    }
+
+    /// RtlHashUnicodeString(PCUNICODE_STRING, CaseInsensitive, Alg, PULONG Hash):
+    /// hash X65599 (Alg 0=default/1). Alg>1 = STATUS_INVALID_PARAMETER.
+    fn hash_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        let (string, case_insensitive, algorithm, hash_out) =
+            (call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3) as u32, call.arg(4));
+        if algorithm > 1 {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        let length_units = guest::read16(string) as u64 / 2;
+        let buffer = guest::read64(string + 8);
+        let upcase = |unit: u16| {
+            crate::ntos::rtl::unicode_case::upcase_char(unit).unwrap_or(if (0x61..=0x7A).contains(&unit) { unit - 0x20 } else { unit })
+        };
+        let mut hash = 0u32;
+        for index in 0..length_units {
+            let mut unit = guest::read16(buffer + index * 2);
+            if case_insensitive {
+                unit = upcase(unit);
+            }
+            hash = hash.wrapping_mul(65599).wrapping_add(unit as u32);
+        }
+        guest::write32(hash_out, hash);
+        Ok(0)
+    }
+
+    /// RtlFormatCurrentUserKeyPath(PUNICODE_STRING): monta "\REGISTRY\USER\<SID>"
+    /// do token corrente. Sem usuário interativo o kernel roda como SYSTEM.
+    fn format_current_user_key_path(call: &Call) -> Result<u64, KernelError> {
+        let output = call.arg(1);
+        let text = "\\REGISTRY\\USER\\S-1-5-18";
+        let bytes = text.encode_utf16().count() as u64 * 2;
+        let buffer = guest::alloc_bytes(bytes + 2);
+        guest_strings::write_wide_string(buffer, text);
+        guest::write16(output, bytes as u16);
+        guest::write16(output + 2, (bytes + 2) as u16);
+        guest::write64(output + 8, buffer);
+        Ok(0)
+    }
+
+    // =======================================================================
+    // Rtl — informação do sistema (KUSER_SHARED_DATA / produto)
+    // =======================================================================
+
+    /// RtlGetNtProductType(PNT_PRODUCT_TYPE): NtProductWinNt(1), TRUE.
+    fn get_nt_product_type(call: &Call) -> Result<u64, KernelError> {
+        guest::write32(call.arg(1), 1); // NtProductWinNt
+        Ok(1)
+    }
+
+    /// RtlGetSuiteMask(): KUSER_SHARED_DATA.SuiteMask (estação de trabalho = 0).
+    fn get_suite_mask(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// RtlIsMultiSessionSku(): bit 8 de SharedDataFlags — FALSE.
+    fn is_multi_session_sku(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// RtlGetProductInfo(OSMajor, OSMinor, SpMajor, SpMinor, PULONG ProductType):
+    /// edição fixa PRODUCT_PROFESSIONAL(0x30), TRUE.
+    fn get_product_info(call: &Call) -> Result<u64, KernelError> {
+        guest::write32(call.arg(5), 0x0000_0030); // PRODUCT_PROFESSIONAL
+        Ok(1)
+    }
+
+    // =======================================================================
+    // Rtl — imagens / backtrace / GUID
+    // =======================================================================
+
+    /// RtlFindExportedRoutineByName(PVOID ImageBase, PCCH Name): varre a EDATA
+    /// de uma imagem carregada e devolve o VA do export (NULL em forwarder).
+    fn find_exported_routine_by_name(call: &Call) -> Result<u64, KernelError> {
+        let (base, name_pointer) = (call.arg(1), call.arg(2));
+        let target = guest_strings::read_c_string(name_pointer);
+        let size_cell = guest::alloc_bytes(4);
+        let directory = crate::ntos::rtl::image::directory_entry(base, true, 0, size_cell).unwrap_or(0);
+        let directory_size = guest::read32(size_cell) as u64;
+        guest::free_bytes(size_cell);
+        if directory == 0 {
+            return Ok(0);
+        }
+        let export_rva = directory.wrapping_sub(base); // directory = base + export_rva
+        let number_of_names = guest::read32(directory + 0x18) as u64;
+        let functions = base + guest::read32(directory + 0x1C) as u64;
+        let names = base + guest::read32(directory + 0x20) as u64;
+        let ordinals = base + guest::read32(directory + 0x24) as u64;
+        for index in 0..number_of_names {
+            let name_rva = guest::read32(names + index * 4) as u64;
+            if guest_strings::read_c_string(base + name_rva) == target {
+                let ordinal = guest::read16(ordinals + index * 2) as u64;
+                let function_rva = guest::read32(functions + ordinal * 4) as u64;
+                if function_rva >= export_rva && function_rva < export_rva + directory_size {
+                    return Ok(0); // forwarder
+                }
+                return Ok(base + function_rva);
+            }
+        }
+        Ok(0)
+    }
+
+    /// RtlCaptureStackBackTrace(Skip, Capture, PVOID* BackTrace, PULONG Hash):
+    /// varre a pilha do chamador por endereços de retorno em imagens carregadas.
+    /// Seguro (try_read, limitado) e sem UB se nada for reconhecível.
+    fn capture_stack_back_trace(call: &Call) -> Result<u64, KernelError> {
+        let (skip, want, array, hash_out) =
+            (call.arg(1) as usize, (call.arg(2) as usize).min(0xC0), call.arg(3), call.arg(4));
+        let (mut captured, mut seen, mut hash, mut slot, mut scanned) = (0usize, 0usize, 0u32, call.frame, 0usize);
+        while captured < want && scanned < 1024 {
+            if let Ok(value) = guest::try_read64(slot) {
+                if value != 0 && crate::ntos::mm::loaded_images::find(value).is_some() {
+                    if seen >= skip {
+                        guest::write64(array + captured as u64 * 8, value);
+                        hash = hash.wrapping_add(value as u32);
+                        captured += 1;
+                    }
+                    seen += 1;
+                }
+            }
+            slot += 8;
+            scanned += 1;
+        }
+        if hash_out != 0 {
+            guest::write32(hash_out, hash);
+        }
+        Ok(captured as u64)
+    }
+
+    /// SHA-1 (RFC 3174) — base do GUID v5. Não existia no kernel (só SHA-256).
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+        let bit_length = (data.len() as u64) * 8;
+        let mut message = data.to_vec();
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_length.to_be_bytes());
+        for chunk in message.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (index, word) in w.iter_mut().take(16).enumerate() {
+                *word = u32::from_be_bytes([chunk[index * 4], chunk[index * 4 + 1], chunk[index * 4 + 2], chunk[index * 4 + 3]]);
+            }
+            for index in 16..80 {
+                w[index] = (w[index - 3] ^ w[index - 8] ^ w[index - 14] ^ w[index - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+            for (index, word) in w.iter().enumerate() {
+                let (f, k) = match index {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6),
+                };
+                let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*word);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut output = [0u8; 20];
+        for (index, word) in h.iter().enumerate() {
+            output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        output
+    }
+
+    /// RtlGenerateClass5Guid(GUID Namespace, const UCHAR* Name, Len, GUID* Out):
+    /// UUID v5 (SHA-1, RFC 4122). O GUID por valor (>8 bytes) chega por ponteiro.
+    fn generate_class5_guid(call: &Call) -> Result<u64, KernelError> {
+        let (namespace, name, name_length, output) = (call.arg(1), call.arg(2), call.arg(3) as usize, call.arg(4));
+        if namespace == 0 || output == 0 {
+            return Ok(signed_status(STATUS_INVALID_PARAMETER));
+        }
+        let ns = guest::read_bytes(namespace, 16);
+        // Namespace em ordem de rede (big-endian) nos campos Data1/2/3.
+        let mut message = Vec::with_capacity(16 + name_length);
+        message.extend_from_slice(&[ns[3], ns[2], ns[1], ns[0], ns[5], ns[4], ns[7], ns[6]]);
+        message.extend_from_slice(&ns[8..16]);
+        if name_length > 0 {
+            message.extend_from_slice(&guest::read_bytes(name, name_length));
+        }
+        let digest = sha1(&message);
+        let mut g = [0u8; 16];
+        g.copy_from_slice(&digest[0..16]);
+        g[6] = (g[6] & 0x0F) | 0x50; // versão 5
+        g[8] = (g[8] & 0x3F) | 0x80; // variante RFC 4122
+        // Converte de volta ao layout nativo do GUID (Data1/2/3 little-endian).
+        let out = [g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]];
+        guest::write_bytes(output, &out);
+        Ok(0)
+    }
+
+    // =======================================================================
+    // CRT (C runtime exportada pelo ntoskrnl)
+    // =======================================================================
+
+    /// wcsnlen(const wchar_t*, size_t max).
+    fn wcsnlen(call: &Call) -> Result<u64, KernelError> {
+        let (source, maximum) = (call.arg(1), call.arg(2));
+        let mut count = 0u64;
+        while count < maximum && guest::read16(source + count * 2) != 0 {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// wcsrchr(const wchar_t*, wchar_t): última ocorrência (o terminador conta).
+    fn wcsrchr(call: &Call) -> Result<u64, KernelError> {
+        let (source, target) = (call.arg(1), call.arg(2) as u16);
+        let (mut index, mut last) = (0u64, 0u64);
+        loop {
+            let unit = guest::read16(source + index * 2);
+            if unit == target {
+                last = source + index * 2;
+            }
+            if unit == 0 {
+                break;
+            }
+            index += 1;
+        }
+        Ok(last)
+    }
+
+    /// wcsncpy_s(wchar_t* d, size_t n, const wchar_t* s, size_t count): cópia
+    /// limitada; _TRUNCATE((size_t)-1) trunca com STRUNCATE, senão ERANGE.
+    fn wcsncpy_s(call: &Call) -> Result<u64, KernelError> {
+        let (destination, capacity, source, count) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4));
+        if capacity == 0 {
+            return Ok(22); // EINVAL
+        }
+        let units = guest_strings::read_wide_units(source);
+        let truncate = count == u64::MAX;
+        let wanted = if truncate { units.len() as u64 } else { count.min(units.len() as u64) };
+        if !truncate && wanted + 1 > capacity {
+            guest::write16(destination, 0);
+            return Ok(34); // ERANGE
+        }
+        let writable = wanted.min(capacity - 1);
+        for index in 0..writable {
+            guest::write16(destination + index * 2, units[index as usize]);
+        }
+        guest::write16(destination + writable * 2, 0);
+        Ok(if truncate && units.len() as u64 > writable { 80 } else { 0 }) // STRUNCATE/0
+    }
+
+    /// _snwprintf(wchar_t*, size_t, const wchar_t*, ...): formatador largo
+    /// (semântica legada: -1 quando a saída não cabe).
+    fn snwprintf(call: &Call) -> Result<u64, KernelError> {
+        let arguments = [call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9)];
+        let text = guest_strings::format_guest_text(
+            &guest_strings::read_wide_string(call.arg(3)),
+            &mut |index| arguments.get(index).copied().unwrap_or(0),
+            true,
+        )?;
+        Ok(guest_strings::write_formatted_text(call.arg(1), call.arg(2), &text, true, true) as u64)
+    }
+
+    /// _wcslwr(wchar_t*): minúsculas no lugar, unidade a unidade.
+    fn wcslwr(call: &Call) -> Result<u64, KernelError> {
+        let mut cursor = call.arg(1);
+        loop {
+            let unit = guest::read16(cursor);
+            if unit == 0 {
+                break;
+            }
+            let lower = char::from_u32(unit as u32).and_then(|character| character.to_lowercase().next()).map_or(unit, |character| {
+                let mut buffer = [0u16; 2];
+                character.encode_utf16(&mut buffer)[0]
+            });
+            guest::write16(cursor, lower);
+            cursor += 2;
+        }
+        Ok(call.arg(1))
+    }
+
+    /// sqrt(double): argumento e resultado em XMM0. Lê/grava o slot XMM0 do
+    /// CONTEXT capturado (CONTEXT+0x1A0, dentro do FXSAVE), pois o trampolim
+    /// comum faz FXRSTOR64 na volta — assim o resultado chega ao chamador. O
+    /// kernel é soft-float (sem SSE), então a raiz sai de `sqrt_bits`, em
+    /// aritmética inteira sobre os bits IEEE-754.
+    fn sqrt(call: &Call) -> Result<u64, KernelError> {
+        if call.context == 0 {
+            return Ok(0); // sem CONTEXT (chamada interna): nada a fazer
+        }
+        let slot = call.context + 0x1A0;
+        guest::write64(slot, sqrt_bits(guest::read64(slot)));
+        Ok(0)
+    }
+
+    /// Piso da raiz de um u128 por Newton. O palpite inicial 2^ceil(bits/2) é
+    /// sempre >= a raiz, então a sequência decresce até o piso.
+    fn isqrt_u128(value: u128) -> u128 {
+        if value < 2 {
+            return value;
+        }
+        let bits = 128 - value.leading_zeros();
+        let mut guess: u128 = 1u128 << bits.div_ceil(2);
+        loop {
+            let next = (guess + value / guess) >> 1;
+            if next >= guess {
+                return guess;
+            }
+            guess = next;
+        }
+    }
+
+    /// sqrt de binary64 com arredondamento ao mais próximo, como o `sqrtsd`:
+    /// ±0 -> ±0, +inf -> +inf, NaN -> NaN silenciado, negativo ou -inf -> o NaN
+    /// "indefinido" 0xFFF8_0000_0000_0000. Subnormais são normalizados antes.
+    pub fn sqrt_bits(bits: u64) -> u64 {
+        const INDEFINITE_NAN: u64 = 0xFFF8_0000_0000_0000;
+        let negative = bits >> 63 != 0;
+        let exponent = ((bits >> 52) & 0x7FF) as i64;
+        let fraction = bits & ((1u64 << 52) - 1);
+        if exponent == 0x7FF {
+            if fraction != 0 {
+                return bits | (1u64 << 51);
+            }
+            return if negative { INDEFINITE_NAN } else { bits };
+        }
+        if exponent == 0 && fraction == 0 {
+            return bits;
+        }
+        if negative {
+            return INDEFINITE_NAN;
+        }
+        // valor = mantissa * 2^(power - 52), com a mantissa em [2^52, 2^53).
+        let (mut mantissa, mut power) = if exponent == 0 {
+            let shift = fraction.leading_zeros() as i64 - 11;
+            (fraction << shift, -1022 - shift)
+        } else {
+            (fraction | (1u64 << 52), exponent - 1023)
+        };
+        // Expoente par: sqrt(valor) = sqrt(mantissa << 52) * 2^(power/2 - 52).
+        if power & 1 != 0 {
+            mantissa <<= 1;
+            power -= 1;
+        }
+        let wide = (mantissa as u128) << 52;
+        let mut root = isqrt_u128(wide);
+        // Arredonda para cima quando sqrt(wide) > root + 1/2 (empate exato
+        // é impossível para a raiz de um inteiro).
+        if wide - root * root > root {
+            root += 1;
+        }
+        let mut half = power / 2;
+        if root == 1u128 << 53 {
+            root >>= 1;
+            half += 1;
+        }
+        (((half + 1023) as u64) << 52) | (root as u64 & ((1u64 << 52) - 1))
+    }
+
+    /// _purecall(): guarda de chamada a função virtual pura. Nunca deve ocorrer
+    /// legitimamente; derruba o sistema (KeBugCheckEx), como no ntoskrnl.
+    fn purecall(_: &Call) -> Result<u64, KernelError> {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x0000_0139, 0x0000_0005, 0, 0, 0)
+    }
+
+    // ---- GROUP ------------------------------------------------------------
+
+    pub static GROUP: Group = Group {
+        name: "rtl-crt-extended",
+        names: &[
+            // --- Rtl (19) ---
+            "RtlMapGenericMask",
+            "RtlCaptureStackBackTrace",
+            "RtlAddAce",
+            "RtlAnsiCharToUnicodeChar",
+            "RtlAppendStringToString",
+            "RtlCopyLuid",
+            "RtlFindExportedRoutineByName",
+            "RtlFormatCurrentUserKeyPath",
+            "RtlGenerateClass5Guid",
+            "RtlGetGroupSecurityDescriptor",
+            "RtlGetNtProductType",
+            "RtlGetProductInfo",
+            "RtlGetSaclSecurityDescriptor",
+            "RtlGetSuiteMask",
+            "RtlHashUnicodeString",
+            "RtlInt64ToUnicodeString",
+            "RtlIsMultiSessionSku",
+            "RtlSetGroupSecurityDescriptor",
+            "RtlSubAuthorityCountSid",
+            // --- CRT (7) ---
+            "_purecall",
+            "_snwprintf",
+            "_wcslwr",
+            "sqrt",
+            "wcsncpy_s",
+            "wcsnlen",
+            "wcsrchr",
+        ],
+        handlers: &[
+            // --- Rtl (19) ---
+            map_generic_mask,
+            capture_stack_back_trace,
+            add_ace,
+            ansi_char_to_unicode_char,
+            append_string_to_string,
+            copy_luid,
+            find_exported_routine_by_name,
+            format_current_user_key_path,
+            generate_class5_guid,
+            get_group_security_descriptor,
+            get_nt_product_type,
+            get_product_info,
+            get_sacl_security_descriptor,
+            get_suite_mask,
+            hash_unicode_string,
+            int64_to_unicode_string,
+            is_multi_session_sku,
+            set_group_security_descriptor,
+            sub_authority_count_sid,
+            // --- CRT (7) ---
+            purecall,
+            snwprintf,
+            wcslwr,
+            sqrt,
+            wcsncpy_s,
+            wcsnlen,
+            wcsrchr,
+        ],
+        data_exports: &[],
+    };
+}
+
+// ===========================================================================

@@ -1115,3 +1115,170 @@ pub mod alert_thread {
         data_exports: &[],
     };
 }
+
+pub mod ke_ex_sync {
+    //! Sincronização e miscelânea Ke/Ex que o dxgkrnl.sys real importa e que
+    //! faltavam: anexação legada de processo, KePulseEvent, leitura de mutante,
+    //! tempo de interrupção preciso, o par região-crítica + fast-mutex-unsafe, e
+    //! as constantes/stubs de firmware e licença. Tudo é um invólucro fiel sobre
+    //! o que o OpenNT já tem (eventos/mutantes no `dispatcher`, anexação no
+    //! `process_attachment`, relógio no `clock`, mutex rápido e região crítica no
+    //! `fast_mutex`/`critical_region`); onde o subsistema não existe (IOMMU
+    //! sharing, licença fast-cache) devolve o NTSTATUS que o Windows devolve
+    //! quando o recurso está inerte. Também atende storport/ndis nos nomes
+    //! genéricos (mutex rápido + região crítica, ExGetFirmwareType, etc.).
+
+    use alloc::collections::BTreeMap;
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::hal::cpu;
+    use crate::ntos::ke::{clock, critical_region, dispatcher, fast_mutex, process_attachment};
+    use crate::ntos::ps::process;
+    use crate::rtl::{KernelError, SpinLock};
+    use crate::ntos::mm::guest_memory as guest;
+
+    /// STATUS_NOT_SUPPORTED — recurso ausente (igual ao Windows sem o motor).
+    const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+    /// FIRMWARE_TYPE::FirmwareTypeUefi (0 Unknown, 1 Bios, 2 Uefi).
+    const FIRMWARE_TYPE_UEFI: u64 = 2;
+
+    /// KTHREAD.ApcStateIndex (0 = ambiente original; != 0 = anexado), offset do
+    /// PDB 19041. O KTHREAD.SavedApcState (+0x258) do primeiro attach é
+    /// preenchido pelo próprio `ke/process_attachment.rs`.
+    const APC_STATE_INDEX: u64 = 0x24A;
+
+    /// KeAttachProcess salva o ambiente no KTHREAD.SavedApcState embutido e usa
+    /// um pequeno bloco-marcador separado como "caller_state" do núcleo de
+    /// anexação (o núcleo exige que marcador e estado salvo sejam buffers
+    /// distintos no primeiro attach). thread → bloco-marcador, consumido por
+    /// KeDetachProcess.
+    static LEGACY_ATTACH: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
+
+    /// KeAttachProcess(PKPROCESS): forma legada da anexação. Encaminha ao mesmo
+    /// núcleo de KeStackAttachProcess; no primeiro attach o estado anterior vai
+    /// para o KTHREAD.SavedApcState embutido (previous_index == 0), exatamente
+    /// como o KiAttachProcess. O bloco-marcador fica guardado para o detach.
+    fn attach_process(call: &Call) -> Result<u64, KernelError> {
+        let thread = process::get_current_thread();
+        let marker = guest::alloc_bytes(0x30);
+        guest::write64(marker + 0x20, 0);
+        match process_attachment::attach(call.arg(1), marker) {
+            Ok(_) => {
+                if let Some(previous) = LEGACY_ATTACH.lock().insert(thread, marker) {
+                    guest::free_bytes(previous);
+                }
+                Ok(0)
+            }
+            Err(error) => {
+                guest::free_bytes(marker);
+                Err(error)
+            }
+        }
+    }
+
+    /// KeDetachProcess(void): desfaz a anexação legada da thread corrente.
+    fn detach_process(_: &Call) -> Result<u64, KernelError> {
+        let thread = process::get_current_thread();
+        let marker = LEGACY_ATTACH.lock().remove(&thread);
+        if let Some(marker) = marker {
+            let result = process_attachment::detach(marker);
+            guest::free_bytes(marker);
+            result?;
+        }
+        Ok(0)
+    }
+
+    /// KeIsAttachedProcess(void): TRUE se a thread corrente está anexada
+    /// (ApcStateIndex != 0, isto é, o KAPC_STATE foi trocado).
+    fn is_attached_process(_: &Call) -> Result<u64, KernelError> {
+        let thread = process::get_current_thread();
+        Ok((guest::read8(thread + APC_STATE_INDEX) != 0) as u64)
+    }
+
+    /// KePulseEvent(PRKEVENT, Increment, Wait): sinaliza (libera os waiters) e
+    /// volta a não-sinalizado num único passo, devolvendo o estado anterior —
+    /// composição de KeSetEvent + KeResetEvent do `dispatcher`.
+    fn pulse_event(call: &Call) -> Result<u64, KernelError> {
+        let event = call.arg(1);
+        let previous = dispatcher::set_event(event);
+        dispatcher::reset_event(event);
+        Ok(previous as u64)
+    }
+
+    /// KeQueryInterruptTimePrecise(PULONGLONG QpcValue): devolve o tempo de
+    /// interrupção (100 ns) e grava o contador de desempenho (QPC == TSC, como
+    /// KeQueryPerformanceCounter) no ponteiro. Mesma fonte de relógio por trás
+    /// de KeQueryUnbiasedInterruptTimePrecise.
+    fn query_interrupt_time_precise(call: &Call) -> Result<u64, KernelError> {
+        if call.arg(1) != 0 {
+            guest::write64(call.arg(1), cpu::rdtsc());
+        }
+        Ok(clock::uptime_100ns())
+    }
+
+    /// KeReadStateMutant / KeReadStateMutex (mesmo RVA 0x26e9c0): devolve o
+    /// SignalState do mutante (LONG). Um único handler, dois nomes.
+    fn read_state_mutant(call: &Call) -> Result<u64, KernelError> {
+        Ok(dispatcher::read_state(call.arg(1)) as u64)
+    }
+
+    /// ExEnterCriticalRegionAndAcquireFastMutexUnsafe(PFAST_MUTEX):
+    /// KeEnterCriticalRegion + ExAcquireFastMutexUnsafe; devolve a thread atual
+    /// (o chamador a repassa à função inversa).
+    fn enter_critical_region_and_acquire_fast_mutex_unsafe(call: &Call) -> Result<u64, KernelError> {
+        critical_region::enter_critical()?;
+        fast_mutex::acquire_unsafe(call.arg(1))?;
+        Ok(process::get_current_thread())
+    }
+
+    /// ExReleaseFastMutexUnsafeAndLeaveCriticalRegion(PFAST_MUTEX): inverso
+    /// exato — ExReleaseFastMutexUnsafe + KeLeaveCriticalRegion.
+    fn release_fast_mutex_unsafe_and_leave_critical_region(call: &Call) -> Result<u64, KernelError> {
+        fast_mutex::release_unsafe(call.arg(1))?;
+        critical_region::leave_critical()?;
+        Ok(0)
+    }
+
+    /// ExGetFirmwareType(void): o OpenNT inicia por UEFI.
+    fn get_firmware_type(_: &Call) -> Result<u64, KernelError> {
+        Ok(FIRMWARE_TYPE_UEFI)
+    }
+
+    /// ExIsManufacturingModeEnabled(void): modo de fábrica desligado (FALSE).
+    fn is_manufacturing_mode_enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// ExShareAddressSpaceWithDevice(...): sem motor de compartilhamento
+    /// IOMMU/ATS — STATUS_NOT_SUPPORTED, como o Windows quando o recurso falta.
+    fn share_address_space_with_device(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_NOT_SUPPORTED))
+    }
+
+    /// ExQueryFastCacheDevLicense(...): sem blob de licença "fast cache"
+    /// (DRM) — STATUS_NOT_SUPPORTED.
+    fn query_fast_cache_dev_license(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_NOT_SUPPORTED))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-ex-sync",
+        names: &[
+            "KeAttachProcess", "KeDetachProcess", "KeIsAttachedProcess", "KePulseEvent",
+            "KeQueryInterruptTimePrecise", "KeReadStateMutant", "KeReadStateMutex",
+            "ExEnterCriticalRegionAndAcquireFastMutexUnsafe", "ExReleaseFastMutexUnsafeAndLeaveCriticalRegion",
+            "ExGetFirmwareType", "ExIsManufacturingModeEnabled", "ExShareAddressSpaceWithDevice",
+            "ExQueryFastCacheDevLicense",
+        ],
+        handlers: &[
+            attach_process, detach_process, is_attached_process, pulse_event,
+            query_interrupt_time_precise, read_state_mutant, read_state_mutant, // KeReadStateMutex é alias
+            enter_critical_region_and_acquire_fast_mutex_unsafe, release_fast_mutex_unsafe_and_leave_critical_region,
+            get_firmware_type, is_manufacturing_mode_enabled, share_address_space_with_device,
+            query_fast_cache_dev_license,
+        ],
+        data_exports: &[],
+    };
+}
+
+// =============================================================================
