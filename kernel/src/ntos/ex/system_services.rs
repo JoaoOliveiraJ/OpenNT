@@ -90,8 +90,8 @@ pub fn register(input: &BTreeMap<u32, String>) -> Result<(), KernelError> {
         return Ok(());
     }
     let entries = hal::amd64::service_table::entries();
-    let gateway_base = kernel_address::virtual_address(entries[5])?;
-    let unavailable = kernel_address::virtual_address(entries[6])?;
+    let gateway_base = kernel_address::image_address(entries[5])?;
+    let unavailable = kernel_address::image_address(entries[6])?;
     let limit = names.keys().max().copied().unwrap_or(0) as usize + 1;
     let mut targets = vec![unavailable; limit];
     let mut stack_arguments = vec![0u32; limit];

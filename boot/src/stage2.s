@@ -4,18 +4,24 @@
 # 1. E820 (mapa de memoria) -> 0x4FF0 (count u16) / 0x5000 (entradas 24B)
 # 2. A20 via porta 0x92
 # 3. Modo protegido (GDT flat)
-# 4. Kernel do disco p/ 0x100000 via ATA PIO (LBA 65, sem BIOS)
-# 5. Paginacao identity 4GB e mapa direto em 0xFFFFB000_00000000 (2MB
-#    pages), SSE habilitado
-# 6. PAE + LME -> long mode, stack em 0xF80008, salta p/ o entry do PE
+# 4. Kernel do disco p/ 0x100000 via ATA PIO (LBA 65, sem BIOS) e conferencia
+#    do cabecalho PE (ImageBase, SizeOfImage, entrada)
+# 5. Paginacao: identidade transitoria so de [0, 2MB) (este codigo enquanto
+#    liga a paginacao), mapa direto em 0xFFFFB000_00000000 (2MB pages, NX),
+#    imagem do kernel na sua ImageBase de sistema (PTEs de 4KB) e pilha de
+#    boot de sistema (PTEs de 4KB, NX, guarda embaixo); SSE habilitado
+# 6. PAE + LME -> long mode, GDTR pelo mapa direto, RSP na pilha de sistema,
+#    salta p/ a entrada do kernel na VA de link
 #
 # Marcadores de progresso na serial COM1: B E A P K G L 6
 #
 # ATENCAO: codigo 16-bit NAO pode ser chamado de codigo 32/64-bit (mesmos
 # bytes decodificam diferente). Por isso existem stage2_putc16 e stage2_putc32.
 #
-# Rsp % 16 == 8 na entrada do kernel (como se viesse de um call). A pilha fica
-# no topo de 15.5MB: o kernel ocupa [1MB, 14MB) e os drivers PE ficam em 16MB+.
+# Rsp % 16 == 8 na entrada do kernel (como se viesse de um call). Os
+# enderecos vem de kernel/src/ntos/mm/memory_map.rs: o kernel ocupa os frames
+# [1MB, 14MB) e a pilha de boot os frames logo abaixo de 15.5MB. O kernel
+# desfaz a identidade transitoria na entrada.
 # ---------------------------------------------------------------------------
 .pushsection .boot, "awx", @progbits
 .code16
@@ -167,7 +173,7 @@ stage2_pm32:
     jz stage2_no_disk
     mov dword ptr [stage2_sectors_left], ecx
     mov esi, {KERNEL_LBA}
-    mov edi, {KERNEL_DEST}
+    mov edi, {KERNEL_PHYS}
 stage2_sector:
     mov dx, 0x1F7
 stage2_wait_busy:
@@ -210,28 +216,98 @@ stage2_no_disk:
     mov al, 'K'
     call stage2_putc32
 
-    # ---- paginacao identity 4GB ----
-    # Zera as tabelas da identidade (PML4, PDPT, 4 PDs) e as do mapa direto
-    # (PDPT, 4 PDs), contiguas logo depois.
+    # ---- cabecalho PE do kernel (offsets crus == RVAs) ----
+    # Base fixa = a VA de sistema em que o kernel foi ligado; SizeOfImage
+    # inteiro no disco e dentro da reserva fisica; entrada dentro da imagem.
+    mov ebx, {KERNEL_PHYS}
+    cmp word ptr [ebx], 0x5A4D
+    jne stage2_bad_kernel32
+    mov eax, dword ptr [ebx + 0x3C]
+    cmp eax, 0xF00
+    ja stage2_bad_kernel32
+    add eax, ebx
+    cmp dword ptr [eax], 0x4550
+    jne stage2_bad_kernel32
+    cmp word ptr [eax + 4], 0x8664
+    jne stage2_bad_kernel32
+    cmp word ptr [eax + 24], 0x20B
+    jne stage2_bad_kernel32
+    cmp dword ptr [eax + 48], {KERNEL_BASE_LOW}     # ImageBase
+    jne stage2_bad_kernel32
+    cmp dword ptr [eax + 52], {KERNEL_BASE_HIGH}
+    jne stage2_bad_kernel32
+    mov ecx, dword ptr [eax + 80]       # SizeOfImage
+    test ecx, 0xFFF
+    jnz stage2_bad_kernel32
+    cmp ecx, {KERNEL_IMAGE_MAX}
+    ja stage2_bad_kernel32
+    movzx edx, word ptr [kernel_sectors]
+    shl edx, 9
+    cmp ecx, edx
+    ja stage2_bad_kernel32
+    mov edx, dword ptr [eax + 40]       # AddressOfEntryPoint
+    cmp edx, 0x1000
+    jb stage2_bad_kernel32
+    cmp edx, ecx
+    jae stage2_bad_kernel32
+    mov dword ptr [stage2_entry_rva], edx
+    mov dword ptr [stage2_image_size], ecx
+
+    # ---- tabelas de paginas ----
+    # Zera as da identidade de boot e do mapa direto (contiguas) e as da
+    # imagem do kernel e da pilha de boot (PDPT, PD, PTs da imagem, PT da
+    # pilha, contiguas).
     mov edi, {PML4}
     xor eax, eax
     mov ecx, ({DIRECT_PD} + 0x4000 - {PML4}) / 4
     .byte 0xF3, 0xAB            # rep stosd
-    mov dword ptr [{PML4}], {PDPT} + 3
-    mov dword ptr [{PDPT}], {PD0} + 3
-    mov dword ptr [{PDPT} + 8], {PD0} + 0x1000 + 3
-    mov dword ptr [{PDPT} + 16], {PD0} + 0x2000 + 3
-    mov dword ptr [{PDPT} + 24], {PD0} + 0x3000 + 3
-    mov edi, {PD0}
-    mov eax, 0x83               # present|rw|page-size(2MB)
-    mov ecx, 2048
-stage2_fill:
+    mov edi, {KERNEL_PDPT}
+    mov ecx, ({STACK_PT} + 0x1000 - {KERNEL_PDPT}) / 4
+    .byte 0xF3, 0xAB            # rep stosd
+
+    # Identidade transitoria: so a pagina de 2MB com este codigo. O kernel
+    # a desfaz assim que entra.
+    mov dword ptr [{PML4}], {IDENTITY_PDPT} + 3
+    mov dword ptr [{IDENTITY_PDPT}], {IDENTITY_PD} + 3
+    mov dword ptr [{IDENTITY_PD}], 0x83         # present|rw|page-size(2MB)
+
+    # ---- imagem do kernel: KERNEL_BASE + RVA -> KERNEL_PHYS + RVA ----
+    # Exatamente SizeOfImage paginas de 4KB, supervisor, RW e executaveis.
+    mov dword ptr [{PML4} + {KERNEL_PML4_INDEX} * 8], {KERNEL_PDPT} + 3
+    mov dword ptr [{KERNEL_PDPT} + {KERNEL_PDPT_INDEX} * 8], {KERNEL_PD} + 3
+    mov edi, {KERNEL_PD}
+    mov eax, {KERNEL_PT} + 3
+    mov ecx, {KERNEL_PT_COUNT}
+stage2_kernel_pd:
     mov dword ptr [edi], eax
-    mov dword ptr [edi + 4], 0
-    add eax, 0x200000
+    add eax, 0x1000
     add edi, 8
     dec ecx
-    jnz stage2_fill
+    jnz stage2_kernel_pd
+    mov edi, {KERNEL_PT}
+    mov eax, {KERNEL_PHYS} + 3
+    mov ecx, dword ptr [stage2_image_size]
+    shr ecx, 12
+stage2_kernel_pt:
+    mov dword ptr [edi], eax
+    add eax, 0x1000
+    add edi, 8
+    dec ecx
+    jnz stage2_kernel_pt
+
+    # ---- pilha de boot: STACK_PAGES paginas de 4KB, RW e NX ----
+    # A entrada logo abaixo da primeira fica vazia (pagina de guarda).
+    mov dword ptr [{KERNEL_PD} + {STACK_PD_INDEX} * 8], {STACK_PT} + 3
+    mov edi, {STACK_PT} + {STACK_FIRST_PTE} * 8
+    mov eax, {STACK_PHYS} + 3
+    mov ecx, {STACK_PAGES}
+stage2_stack_pt:
+    mov dword ptr [edi], eax
+    mov dword ptr [edi + 4], 0x80000000     # NX
+    add eax, 0x1000
+    add edi, 8
+    dec ecx
+    jnz stage2_stack_pt
 
     # ---- mapa direto: DIRECT_MAP_BASE + PA -> PA nos mesmos 4GB ----
     # Paginas de 2MB de supervisor, RW e NX (o NXE e exigido abaixo antes
@@ -316,6 +392,13 @@ stage2_no_nx:
 stage2_nx_halt:
     hlt
     jmp stage2_nx_halt
+stage2_bad_kernel32:
+    mov al, '!'                 # PE do kernel fora do layout de boot
+    call stage2_putc32
+    cli
+stage2_bad_kernel32_halt:
+    hlt
+    jmp stage2_bad_kernel32_halt
 
 # ---------------------------------------------------------------------------
 .code64
@@ -326,36 +409,18 @@ stage2_lm64:
     mov ss, ax
     mov fs, ax
     mov gs, ax
-    mov rsp, {STACK_TOP}
+    # A GDT continua a mesma, alcancada agora pela VA do mapa direto: o
+    # kernel nao depende da identidade transitoria nem para recarregar
+    # seletores.
+    lgdt [stage2_gdtr64]
+    movabs rsp, {STACK_TOP} - 8
     mov al, '6'
     call stage2_putc32          # bytes 32-bit validos aqui tambem
-    # O build emite um PE de base fixa cujos offsets crus sao iguais as RVAs.
-    # Confere o cabecalho antes de entrar no entry do kernel ligado.
-    mov ebx, {KERNEL_DEST}
+    # A imagem precisa aparecer na VA de link antes do salto.
+    movabs rbx, {KERNEL_BASE}
     cmp word ptr [rbx], 0x5A4D
     jne stage2_bad_kernel
-    mov eax, dword ptr [rbx + 0x3C]
-    cmp eax, 0xF00
-    ja stage2_bad_kernel
-    add rax, rbx
-    cmp dword ptr [rax], 0x4550
-    jne stage2_bad_kernel
-    cmp word ptr [rax + 4], 0x8664
-    jne stage2_bad_kernel
-    cmp word ptr [rax + 24], 0x20B
-    jne stage2_bad_kernel
-    cmp qword ptr [rax + 48], {KERNEL_DEST}
-    jne stage2_bad_kernel
-    mov ecx, dword ptr [rax + 80]       # SizeOfImage
-    movzx edx, word ptr [kernel_sectors]
-    shl edx, 9
-    cmp ecx, edx
-    ja stage2_bad_kernel
-    mov eax, dword ptr [rax + 40]       # AddressOfEntryPoint
-    cmp eax, 0x1000
-    jb stage2_bad_kernel
-    cmp eax, ecx
-    jae stage2_bad_kernel
+    mov eax, dword ptr [stage2_entry_rva]
     add rax, rbx
     jmp rax
 stage2_bad_kernel:
@@ -380,6 +445,17 @@ stage2_gdt_end:
 stage2_gdtr:
     .word stage2_gdt_end - stage2_gdt - 1
     .long stage2_gdt
+
+.balign 8
+    .word 0, 0, 0
+stage2_gdtr64:
+    .word stage2_gdt_end - stage2_gdt - 1
+    .quad stage2_gdt + {DIRECT_MAP_BASE}
+
+stage2_entry_rva:
+    .long 0
+stage2_image_size:
+    .long 0
 
 stage2_sectors_left:
     .long 0

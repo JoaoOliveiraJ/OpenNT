@@ -405,7 +405,7 @@ pub fn implemented() -> usize {
 /// Endereço virtual do trampolim do id.
 pub fn thunk_address(id: u64) -> Result<u64, KernelError> {
     let (base, _) = win32_thunk::thunk_table();
-    kernel_address::virtual_address(base + id * STUB_SIZE)
+    kernel_address::image_address(base + id * STUB_SIZE)
 }
 
 /// Resolvedor do loader: dado real, corpo nativo próprio ou trampolim.
@@ -419,7 +419,7 @@ pub fn lookup(_dll: &str, name: &str) -> Option<ResolvedImport> {
     if let Some((symbol, _, _)) = native_export_layout::lookup(name) {
         // Corpo x64 próprio; os que ainda não existem entram com seus módulos.
         let entry = crate::hal::amd64::private_entries::entry(symbol)?;
-        return Some(ResolvedImport::Address { address: kernel_address::virtual_address(entry).ok()?, dependencies: Vec::new() });
+        return Some(ResolvedImport::Address { address: kernel_address::image_address(entry).ok()?, dependencies: Vec::new() });
     }
     Some(ResolvedImport::Thunk(32 + index as u32))
 }
@@ -812,6 +812,6 @@ pub mod private_routines {
         if symbol == "SepSetRuntimeUpdatableSigningLevel" {
             return crate::ntos::se::runtime_signing_policy::callback_address().unwrap_or(0);
         }
-        private_entries::entry(symbol).and_then(|entry| kernel_address::virtual_address(entry).ok()).unwrap_or(0)
+        private_entries::entry(symbol).and_then(|entry| kernel_address::image_address(entry).ok()).unwrap_or(0)
     }
 }

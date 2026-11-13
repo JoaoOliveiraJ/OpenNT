@@ -1,10 +1,12 @@
 //! Multiprocessador.
 //!
 //! Descobre processadores pela MADT e inicia APs com INIT-SIPI-SIPI
-//! direcionado via xAPIC. O trampolim faz a troca de modos e consome
-//! trabalhos nativos numa mailbox física compartilhada, que o BSP lê e grava
-//! pelo mapa direto (`hal::physical`). Os offsets devem coincidir com
-//! `hal::amd64::aptrampoline`.
+//! direcionado via xAPIC. O trampolim faz a troca de modos e salta para a
+//! imagem do kernel, onde o AP consome trabalhos nativos numa mailbox física
+//! compartilhada, que o BSP lê e grava pelo mapa direto (`hal::physical`).
+//! A página do trampolim só fica mapeada em identidade enquanto os APs
+//! partem; depois a metade de usuário volta a não ter nada do kernel. Os
+//! offsets devem coincidir com `hal::amd64::aptrampoline`.
 
 use alloc::vec::Vec;
 
@@ -13,6 +15,8 @@ use crate::hal::{cpu, lapic, physical};
 use crate::hal::acpi;
 use crate::ntos::ke::clock;
 use crate::ntos::mm::memory_map as map;
+use crate::ntos::mm::paging::{self, MapOptions};
+use crate::ntos::mm::pfn;
 use crate::rtl::{KernelError, SpinLock};
 
 const MAILBOX: u64 = map::SMP_MAILBOX_PHYS;
@@ -108,7 +112,10 @@ fn discover_processors() -> Vec<u32> {
     acpi::get_table("APIC", 0, false).map(|table| parse_interrupt_controller_table(&table.bytes)).unwrap_or_default()
 }
 
-/// Copia e relê o trampolim, zera a mailbox e publica assinatura e CR3.
+/// Copia e relê o trampolim, prepara a IDT dos APs, zera a mailbox,
+/// publica assinatura e CR3 e mapeia a página do trampolim em identidade
+/// (supervisor, executável): o AP busca instruções nela entre ligar a
+/// paginação e saltar para a imagem do kernel.
 fn install_trampoline() -> Result<(), KernelError> {
     let bytes = aptrampoline::bytes();
     if bytes.is_empty() || bytes.len() > 4096 {
@@ -118,9 +125,31 @@ fn install_trampoline() -> Result<(), KernelError> {
     if !physical::equal_bytes(TRAMPOLINE, bytes) {
         return Err(KernelError::new("AP trampoline copy mismatch"));
     }
+    aptrampoline::prepare_kernel_entry();
     physical::zero(MAILBOX, 0x1000);
     physical::write32(MAILBOX + MAILBOX_MAGIC, MAILBOX_SIGNATURE);
     physical::write64(MAILBOX + MAILBOX_PAGE_TABLE, map::PML4_PHYS);
+    if !paging::map_page(TRAMPOLINE, TRAMPOLINE, paging::PAGE_PRESENT | paging::PAGE_RW, MapOptions::default()) {
+        return Err(KernelError::new("cannot map the AP trampoline page"));
+    }
+    Ok(())
+}
+
+/// Desfaz o mapeamento de identidade do trampolim e as tabelas que ele criou
+/// na metade de usuário: os APs já executam na imagem do kernel. As tabelas
+/// só voltam ao PFN depois que todas as CPUs invalidaram as traduções.
+fn remove_trampoline() -> Result<(), KernelError> {
+    let mut tables = Vec::new();
+    if !paging::unmap_page(TRAMPOLINE, MapOptions { deferred_tables: Some(&mut tables), ..Default::default() }) {
+        return Err(KernelError::new("cannot unmap the AP trampoline page"));
+    }
+    cpu::reload_cr3();
+    flush_remote_tlb(false)?;
+    for frame in tables {
+        if !pfn::free_page(frame) {
+            return Err(KernelError::new("AP trampoline page table lost PFN ownership"));
+        }
+    }
     Ok(())
 }
 
@@ -248,10 +277,13 @@ pub fn init() -> Result<(), KernelError> {
         }
     }
     cpu::restore_interrupts(flags);
-    let mut state = STATE.lock();
-    state.online_slots = online;
-    state.initialized = true;
-    failure.map_or(Ok(()), Err)
+    {
+        let mut state = STATE.lock();
+        state.online_slots = online;
+        state.initialized = true;
+    }
+    let removed = remove_trampoline();
+    failure.map_or(removed, Err)
 }
 
 fn wait_job_free(slot: usize, timeout_ms: u64) -> bool {

@@ -8,15 +8,19 @@
 //! (janela do heap, com a tradução linear para os frames do heap), o pool
 //! (ExAllocatePoolWithTag, ExAllocatePool2), IRPs e MDLs do I/O Manager e
 //! os DRIVER_OBJECTs e DEVICE_OBJECTs vivos, inclusive os criados pelos
-//! drivers reais carregados na janela de imagens de sistema.
+//! drivers reais carregados na janela de imagens de sistema. Confere também
+//! o próprio kernel: uma rotina, uma variável estática e a pilha corrente
+//! ficam na metade de sistema, e o ntoskrnl registrado começa na ImageBase
+//! em que ele foi ligado.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::inc::{types as nt, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::memory_map::{self as map, KERNEL_HEAP_BASE, KERNEL_HEAP_TOP, SYSTEM_IMAGE_BASE, SYSTEM_IMAGE_TOP};
-use crate::ntos::mm::{paging, system_info};
+use crate::ntos::mm::{loaded_images, paging, system_info};
 use crate::ntos::ob::object_manager;
 
 type Assert = fn(bool, &str);
@@ -65,6 +69,19 @@ pub fn run(assert: Assert, call_export: CallExport) {
     let system_range_start = guest::read64(system_info::system_range_start_cell());
     let system = |address: u64| address != 0 && address >= system_range_start;
     assert(system_range_start == 0xFFFF_8000_0000_0000, "sysalloc: MmSystemRangeStart = 0xFFFF800000000000");
+
+    // O kernel executa na sua VA de sistema: código, dados estáticos e pilha.
+    static IMAGE_DATA: AtomicU64 = AtomicU64::new(0x4F70_656E_4E54_0001);
+    let routine = run as fn(Assert, CallExport) as usize as u64;
+    let data = &IMAGE_DATA as *const AtomicU64 as u64;
+    let stack = &system_range_start as *const u64 as u64;
+    let kernel = loaded_images::kernel();
+    let in_kernel = |address: u64| kernel.as_ref().is_some_and(|image| address >= image.image_base && address - image.image_base < image.size_of_image);
+    assert(
+        kernel.as_ref().is_some_and(|image| image.image_base == map::KERNEL_VIRTUAL_BASE) && system(routine) && system(data) && in_kernel(routine) && in_kernel(data),
+        "sysalloc: rotina e estatica do kernel no ntoskrnl em KERNEL_VIRTUAL_BASE, acima de MmSystemRangeStart",
+    );
+    assert(IMAGE_DATA.load(Ordering::Relaxed) == 0x4F70_656E_4E54_0001 && system(stack) && paging::translate(data) != 0, "sysalloc: pilha corrente e dados da imagem pela VA de sistema");
 
     // Arena dos convidados e heap do kernel: VAs da janela do heap.
     let (bytes, page, raw) = (guest::alloc_bytes(0x40), guest::alloc_page(), guest::alloc_raw(0x30));

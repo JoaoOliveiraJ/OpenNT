@@ -1,5 +1,6 @@
-// O kernel é ligado em endereço fixo (0x101000) pelo script `link.ld`. As
-// opções de boot (init/boot_config.rs) chegam como variáveis de ambiente.
+// O kernel é ligado na sua VA de sistema (0xFFFFF800_40001000) pelo script
+// `link.ld`. As opções de boot (init/boot_config.rs) chegam como variáveis de
+// ambiente.
 //
 // Nos builds com testes, o build também gera a ntdll.dll de bring-up do
 // bundle a partir da tabela única de syscalls (`src/ntos/ke/services.rs`):
@@ -131,6 +132,9 @@ fn bring_up_ntdll() -> Vec<u8> {
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     println!("cargo:rustc-link-arg-bins=-T{manifest}/link.ld");
+    // Código PIC (`.cargo/config.toml`) num executável estático: o rustc
+    // pediria um PIE, com relocações para processar no boot.
+    println!("cargo:rustc-link-arg-bins=--no-pie");
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=../apps");
     println!("cargo:rerun-if-changed=src/ntos/ke/services.rs");

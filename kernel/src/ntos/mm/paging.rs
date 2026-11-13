@@ -6,8 +6,7 @@
 //!
 //! Tabelas e entradas são endereçadas pelo endereço FÍSICO (o "entry
 //! address" de [`PageQuery`] e das funções públicas); cada leitura e escrita
-//! passa pelo mapa direto da metade de sistema (`hal::physical`), nunca pela
-//! identidade baixa.
+//! passa pelo mapa direto da metade de sistema (`hal::physical`).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -99,12 +98,27 @@ fn table_of(entry: u64) -> u64 {
     frame
 }
 
-/// A folha é um alias físico do kernel (identidade baixa, mapa direto ou
-/// janela do heap), não um dono do frame.
+/// A folha é um alias físico do kernel (o código do trampolim dos APs na
+/// identidade, só durante a partida deles, o mapa direto ou a janela do
+/// heap), não um dono do frame.
 fn physical_alias(va: u64, pa: u64) -> bool {
     va == pa
         || va == map::direct_map(pa)
         || ((map::KERNEL_HEAP_PHYS_BASE..map::KERNEL_HEAP_PHYS_TOP).contains(&pa) && va == map::kernel_heap_virtual(pa))
+}
+
+/// Desfaz a identidade transitória do stage2 (PML4[0] -> uma página de 2 MB
+/// em [0, 2 MB)), a única coisa que ele mapeia na metade de usuário. Roda na
+/// entrada do kernel, que já executa na sua VA de sistema com a pilha de
+/// boot de sistema e o GDTR pelo mapa direto: daí em diante nenhuma entrada
+/// de [0, 256) da PML4 é do kernel. As tabelas fixas da identidade não voltam
+/// a ser usadas.
+pub fn remove_boot_identity() {
+    for index in 1..map::USER_PML4_ENTRIES {
+        assert!(read_entry_exact(PML4 + index * 8) == 0, "stage2 mapped more than its boot identity in the user half");
+    }
+    write_entry(PML4, 0, false);
+    cpu::reload_cr3();
 }
 
 /// Monta a janela do heap do kernel (`KERNEL_HEAP_BASE..TOP`): os frames do

@@ -4,9 +4,10 @@
 //! inclusive para frames que são, eles próprios, tabelas de páginas.
 //!
 //! Os aliases físicos do kernel não são donos de frame e ficam de fora: a
-//! identidade baixa (VA == PA) e os slots inteiros do mapa direto
-//! (`DIRECT_MAP_PML4_INDEX`) e da janela do heap (`KERNEL_HEAP_PML4_INDEX`),
-//! cujas tabelas nem são acompanhadas.
+//! identidade (VA == PA, só a página do trampolim dos APs enquanto eles
+//! partem) e os slots inteiros do mapa direto (`DIRECT_MAP_PML4_INDEX`) e da
+//! janela do heap (`KERNEL_HEAP_PML4_INDEX`), cujas tabelas nem são
+//! acompanhadas.
 
 use alloc::collections::BTreeMap;
 

@@ -1,65 +1,131 @@
 //! O mapa de memória do OpenNT.
-//! Única fonte de verdade para o layout físico/virtual.
+//! Única fonte de verdade para o layout físico/virtual (o stage2 e o xtask
+//! incluem este arquivo).
+//!
+//! Frames físicos fixos (alcançados só pelo mapa direto, nunca como VA):
 //!
 //! ```text
 //!   0x000000-0x005FFF    IVT/BDA, handoff do stage2 (0x4FD0-0x4FFF), E820 (0x5000)
 //!   0x009000-0x009FFF    trampolim de AP (SMP, SIPI vetor 0x09)
 //!   0x00A000-0x00AFFF    mailbox SMP (handshake + fila de jobs por CPU)
 //!   0x060000-0x06FFFF    pilhas dos APs (4KB por CPU, até 16 CPUs)
-//!   0x070000-0x075FFF    tabelas de identidade do stage2 (PML4, PDPT, 4 PDs)
+//!   0x070000-0x072FFF    PML4 e tabelas da identidade transitória do stage2
 //!   0x076000-0x07AFFF    tabelas do mapa direto (PDPT, 4 PDs)
 //!   0x07B000-0x07CFFF    tabelas da janela do heap (PDPT, PD)
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
+//!   0x083000-0x08CFFF    tabelas da imagem do kernel e da pilha de boot
 //!   0x08F000-0x08FFFF    página de controle do anel 3 (células da HAL)
-//!   0x100000-0xDFFFFF    imagem do kernel (cap de build: 13MB)
-//!   0xF80008 (topo)      pilha do kernel de boot (cresce para baixo)
-//!   0x1000000-0x1FFFFFF  sem uso (as imagens de drivers moram no espaço de sistema)
-//!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB,
-//!                        endereçados só pela janela do heap
+//!   0x100000-0xDFFFFF    frames da imagem do kernel (cap de build: 13MB)
+//!   0xE01000-0xF7FFFF    frames da pilha de boot
+//!   0x1000000-0x1FFFFFF  sem uso
+//!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
-//!   0x10000000-0x1FFFFFFF espaço de VA para VirtualAlloc (fora do PFN)
 //!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
 //!   0x30000000-0x33FFFFFF ring do tracer FULL (64MB)
 //!   0x34000000-0x6FFFFFFF terceira arena PFN (960MB)
-//!   0x70000000-0xAFFFFFFF reservado (KUSER_SHARED_DATA em 0x7FFE0000)
-//!   0xB0000000-0xBEFFFFFF sem uso
-//!
-//!   0xFFFFB000_00000000+  mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
-//!   0xFFFFC000_C0000000+  janela do heap do kernel e da arena dos convidados
 //! ```
 //!
-//! Na metade de sistema, as imagens de kernel (drivers .sys, hal.dll,
-//! ci.dll, bibliotecas de export) ficam na janela `SYSTEM_IMAGE_BASE..TOP`
-//! (bloco "Imagens de sistema" abaixo), e o heap do kernel e a arena dos
-//! convidados na janela `KERNEL_HEAP_BASE..TOP` (bloco "Janela do heap").
+//! Espaço virtual. A metade de usuário, PML4[0..256), é só dos processos:
+//! nada do kernel fica abaixo de MmSystemRangeStart (`mm/user_half.rs`
+//! confere no fim da fase 0). O que é do kernel mora na metade de sistema:
+//!
+//! ```text
+//!   0xFFFF8000_00000000  (256) tabelas de páginas (mapeamento recursivo)
+//!   0xFFFF8080_00000000  (257) banco de PFNs nativo
+//!   0xFFFFA000_00000000  (320) pool executivo, dump, contígua, independente,
+//!                              visões de sistema, VirtualAlloc de kernel
+//!   0xFFFFB000_00000000  (352) mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
+//!   0xFFFFC000_C0000000  (384) janela do heap do kernel e da arena dos convidados
+//!   0xFFFFF780_00000000  (495) KUSER_SHARED_DATA (visão do kernel)
+//!   0xFFFFF800_00000000  (496) KPCR e pool de dados
+//!   0xFFFFF800_40000000  (496) imagem do kernel (ImageBase do ntoskrnl)
+//!   0xFFFFF800_41081000  (496) pilha de boot (até 0xFFFFF800_41200000)
+//!   0xFFFFF801_00000000  (496) janela de imagens de sistema (drivers, hal.dll...)
+//! ```
 #![allow(dead_code)]
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const LARGE_PAGE_SIZE: u64 = 0x20_0000;
-pub const KERNEL_IMAGE_BASE: u64 = 0x10_0000;
-pub const KERNEL_IMAGE_MAX: u64 = 13 * 1024 * 1024;
-pub const BOOT_STACK_TOP: u64 = 0xF8_0008;
-pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_F800_4000_0000;
 /// Limite exclusivo da VA de usuário; os 64KB finais abaixo da divisão
 /// canônica são reservados.
 pub const USER_ADDRESS_LIMIT: u64 = 0x7FFF_FFFF_0000;
+
+// ---- Imagem do kernel e pilha de boot (metade de sistema) -------------------
+//
+// O ntoskrnl é ligado na sua VA de sistema, como no NT (0xFFFFF80x_xxxxxxxx):
+// `KERNEL_VIRTUAL_BASE` é a ImageBase do PE (cabeçalhos na primeira página,
+// `.text` em +0x1000, `kernel/link.ld`), e é essa a base que a lista de
+// módulos carregados e o KDDEBUGGER_DATA64 publicam. O stage2 carrega o
+// arquivo linearmente em `KERNEL_IMAGE_PHYS` (offsets do arquivo == RVAs) e
+// mapeia exatamente SizeOfImage páginas de 4 KB de supervisor, RW e
+// executáveis, de `KERNEL_VIRTUAL_BASE` para `KERNEL_IMAGE_PHYS`, com tabelas
+// fixas abaixo de 1 MB (uma PDPT, uma PD e sete PTs contíguas). O endereço
+// de link fica fora dos 2 GB do topo, então o código do kernel é gerado
+// independente de posição (`relocation-model=pic` em `.cargo/config.toml`)
+// e ligado como executável estático (`--no-pie`): toda referência do código
+// é relativa a RIP, os ponteiros absolutos (vtables, tabelas) são resolvidos
+// pelo linker, e não sobra relocação para processar no boot.
+//
+// A pilha de boot (a do BSP até o escalonador assumir) também é uma VA de
+// sistema, na mesma PD da imagem: 383 páginas de RW e NX que terminam em
+// `BOOT_STACK_TOP`, sobre os frames físicos logo abaixo de 15,5 MB, com uma
+// página de guarda sem mapeamento embaixo. O stage2 entra no kernel com
+// RSP = BOOT_STACK_TOP - 8 (alinhamento de quem acabou de receber um CALL).
+
+/// Endereço físico onde o stage2 carrega o PE do kernel.
+pub const KERNEL_IMAGE_PHYS: u64 = 0x10_0000;
+/// Teto do SizeOfImage do kernel (frames físicos 1 MB a 14 MB).
+pub const KERNEL_IMAGE_MAX: u64 = 13 * 1024 * 1024;
+/// ImageBase do kernel: o endereço em que ele é ligado e executa.
+pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_F800_4000_0000;
+/// Slot da PML4 da imagem (o mesmo da KPCR e da janela de imagens de sistema).
+pub const KERNEL_PML4_INDEX: u64 = 496;
+/// Tabelas do mapeamento da imagem e da pilha de boot montadas pelo stage2.
+pub const KERNEL_PDPT_PHYS: u64 = 0x8_3000;
+pub const KERNEL_PD_PHYS: u64 = 0x8_4000;
+/// Primeira das PTs contíguas da imagem (cada uma cobre 2 MB de VA).
+pub const KERNEL_PT_PHYS: u64 = 0x8_5000;
+pub const KERNEL_PT_COUNT: u64 = KERNEL_IMAGE_MAX.div_ceil(LARGE_PAGE_SIZE);
+pub const BOOT_STACK_PT_PHYS: u64 = KERNEL_PT_PHYS + KERNEL_PT_COUNT * PAGE_SIZE;
+
+/// Topo (exclusivo) da pilha de boot e InitialStack da thread do boot.
+pub const BOOT_STACK_TOP: u64 = KERNEL_VIRTUAL_BASE + 0x120_0000;
+pub const BOOT_STACK_SIZE: u64 = 0x17_F000;
+/// Página mais baixa da pilha; a de baixo dela é a guarda.
+pub const BOOT_STACK_LIMIT: u64 = BOOT_STACK_TOP - BOOT_STACK_SIZE;
+/// Frames físicos da pilha: [BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE, BOOT_STACK_PHYS_TOP).
+pub const BOOT_STACK_PHYS_TOP: u64 = 0xF8_0000;
+pub const BOOT_STACK_PHYS_BASE: u64 = BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE;
+
+/// A VA pertence à faixa reservada da imagem do kernel.
+pub const fn is_kernel_image(address: u64) -> bool {
+    address >= KERNEL_VIRTUAL_BASE && address < KERNEL_VIRTUAL_BASE + KERNEL_IMAGE_MAX
+}
+
+const _: () = assert!((KERNEL_VIRTUAL_BASE >> 39) & 511 == KERNEL_PML4_INDEX && KERNEL_VIRTUAL_BASE % 0x4000_0000 == 0);
+// Uma PD cobre a imagem (PDEs 0..KERNEL_PT_COUNT) e a pilha (uma PT própria,
+// fora das da imagem), sem cruzar a KPCR nem a janela de imagens de sistema.
+const _: () = assert!(KERNEL_IMAGE_PHYS + KERNEL_IMAGE_MAX <= BOOT_STACK_PHYS_BASE - PAGE_SIZE && BOOT_STACK_PHYS_TOP <= 0x100_0000);
+const _: () = assert!(KERNEL_IMAGE_MAX % PAGE_SIZE == 0 && BOOT_STACK_SIZE % PAGE_SIZE == 0 && BOOT_STACK_TOP % LARGE_PAGE_SIZE == 0);
+const _: () = assert!((BOOT_STACK_LIMIT - PAGE_SIZE) / LARGE_PAGE_SIZE == (BOOT_STACK_TOP - 1) / LARGE_PAGE_SIZE);
+const _: () = assert!((BOOT_STACK_TOP - 1 - KERNEL_VIRTUAL_BASE) / LARGE_PAGE_SIZE >= KERNEL_PT_COUNT && BOOT_STACK_TOP - KERNEL_VIRTUAL_BASE <= 0x4000_0000);
+const _: () = assert!(KERNEL_PDPT_PHYS >= 0x8_3000 && BOOT_STACK_PT_PHYS + PAGE_SIZE <= 0x8_F000 && KERNEL_PD_PHYS == KERNEL_PDPT_PHYS + PAGE_SIZE && KERNEL_PT_PHYS == KERNEL_PD_PHYS + PAGE_SIZE);
 
 /// Candidatas, não declaração de RAM: o PFN intersecta estas faixas com a
 /// RAM utilizável do E820 e subtrai entradas reservadas.
 pub const PFN_RANGES: [(u64, u64); 3] =
     [(0x0600_0000, 0x1000_0000), (0x2000_0000, 0x3000_0000), (0x3400_0000, 0x7000_0000)];
 pub const BOOT_FIRMWARE_PHYS: u64 = 0x4FE0;
+/// GDTR do stage2 gravado por SGDT no modo real (limite em +0, base de 32
+/// bits em +2).
+pub const BOOT_GDTR_PHYS: u64 = 0x4FE8;
 pub const BOOT_FLAGS_PHYS: u64 = 0x4FD0;
 pub const E820_COUNT_PHYS: u64 = 0x4FF0;
 pub const E820_TABLE_PHYS: u64 = 0x5000;
 pub const E820_MAX_ENTRIES: u64 = 170;
-/// O stage2 mapeia 4GB em identidade e no mapa direto; RAM acima não é
-/// admitida ainda.
+/// O stage2 mapeia 4GB no mapa direto; RAM acima não é admitida ainda.
 pub const PHYSICAL_MEMORY_LIMIT: u64 = 0x1_0000_0000;
-
-pub const VA_ALLOC_BASE: u64 = 0x1000_0000;
-pub const VA_ALLOC_TOP: u64 = 0x2000_0000;
 
 // ---- Imagens de sistema ------------------------------------------------------
 //
@@ -69,10 +135,10 @@ pub const VA_ALLOC_TOP: u64 = 0x2000_0000;
 // a VA vem do espaço de sistema, as páginas são frames do PFN (não
 // contíguos) mapeados em PTEs de 4 KB de supervisor, e a imagem é relocada
 // pela diferença entre essa VA e a ImageBase do cabeçalho. Nenhuma imagem
-// carregada fica na metade de usuário nem na identidade abaixo de 4 GB (o
-// ntoskrnl não passa pelo loader: é listado pelo alias em
-// `KERNEL_VIRTUAL_BASE`). A janela ocupa o slot 496 da PML4 (o mesmo da PCR e
-// do alias do kernel), sem cruzar nenhuma outra faixa daqui.
+// carregada fica na metade de usuário (o ntoskrnl não passa pelo loader: o
+// stage2 já o mapeia na sua ImageBase, `KERNEL_VIRTUAL_BASE`). A janela ocupa
+// o slot 496 da PML4 (o mesmo da KPCR e da imagem do kernel), sem cruzar
+// nenhuma outra faixa daqui.
 
 /// Primeira VA da janela de imagens de sistema.
 pub const SYSTEM_IMAGE_BASE: u64 = 0xFFFF_F801_0000_0000;
@@ -95,6 +161,10 @@ pub const KERNEL_INDEPENDENT_BASE: u64 = 0xFFFF_A004_0000_0000;
 pub const KERNEL_INDEPENDENT_TOP: u64 = 0xFFFF_A005_0000_0000;
 pub const KERNEL_SECTION_BASE: u64 = 0xFFFF_A005_0000_0000;
 pub const KERNEL_SECTION_TOP: u64 = 0xFFFF_A006_0000_0000;
+/// Janela do VirtualAlloc de kernel (`mm/virtual_memory.rs`): páginas do PFN
+/// em PTEs de supervisor, fora da metade de usuário.
+pub const KERNEL_VIRTUAL_ALLOC_BASE: u64 = 0xFFFF_A006_0000_0000;
+pub const KERNEL_VIRTUAL_ALLOC_TOP: u64 = 0xFFFF_A006_1000_0000;
 
 /// Primeira janela da metade supervisora: as tabelas reais (mapeamento
 /// recursivo), sem alocações comuns.
@@ -103,8 +173,15 @@ pub const PAGE_TABLE_RECURSIVE_INDEX: u64 = 256;
 pub const PFN_DATABASE_BASE: u64 = 0xFFFF_8080_0000_0000;
 pub const PFN_DATABASE_TOP: u64 = 0xFFFF_8080_0400_0000;
 pub const PML4_PHYS: u64 = 0x70000;
-pub const PDPT_PHYS: u64 = 0x71000;
-pub const PD_PHYS: u64 = 0x72000;
+/// Identidade transitória do stage2: PML4[0] -> esta PDPT -> esta PD, com uma
+/// única página de 2 MB em [0, 2 MB) (o código do stage2 enquanto liga a
+/// paginação). O kernel desfaz PML4[0] na entrada
+/// (`paging::remove_boot_identity`); as quatro páginas seguintes (o espaço das
+/// PDs da antiga identidade de 4 GB) ficam sem uso.
+pub const BOOT_IDENTITY_PDPT_PHYS: u64 = 0x71000;
+pub const BOOT_IDENTITY_PD_PHYS: u64 = 0x72000;
+/// Fim da metade de usuário em índices da PML4: [0, 256) é só de usuário.
+pub const USER_PML4_ENTRIES: u64 = 256;
 
 pub const AP_TRAMPOLINE_PHYS: u64 = 0x9000;
 pub const SMP_MAILBOX_PHYS: u64 = 0xA000;
@@ -148,9 +225,10 @@ pub const fn is_direct_map(address: u64) -> bool {
 const _: () = assert!((DIRECT_MAP_BASE >> 39) & 511 == DIRECT_MAP_PML4_INDEX);
 const _: () = assert!(DIRECT_MAP_PML4_INDEX != PAGE_TABLE_RECURSIVE_INDEX && DIRECT_MAP_PML4_INDEX != (PFN_DATABASE_BASE >> 39) & 511);
 const _: () = assert!(DIRECT_MAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 && DIRECT_MAP_PML4_INDEX != (PCR_VIRTUAL_BASE >> 39) & 511);
-// Logo depois das tabelas de identidade do stage2 (0x70000-0x75FFF) e antes
-// da página de contagem de IRQs (0x81000).
-const _: () = assert!(DIRECT_MAP_PDPT_PHYS == PD_PHYS + 4 * PAGE_SIZE && DIRECT_MAP_PD_PHYS == DIRECT_MAP_PDPT_PHYS + PAGE_SIZE);
+// Logo depois das tabelas da identidade de boot do stage2 (0x70000-0x75FFF,
+// com as PDs da antiga identidade de 4 GB sem uso) e antes da página de
+// contagem de IRQs (0x81000).
+const _: () = assert!(DIRECT_MAP_PDPT_PHYS == BOOT_IDENTITY_PD_PHYS + 4 * PAGE_SIZE && DIRECT_MAP_PD_PHYS == DIRECT_MAP_PDPT_PHYS + PAGE_SIZE);
 const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL_MEMORY_LIMIT == 4 * 0x4000_0000);
 
 // ---- Janela do heap do kernel (metade de sistema) --------------------------
@@ -169,9 +247,8 @@ const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL
 // abaixo de 1 MB. Como o mapa direto, é um alias físico do kernel: o
 // rastreador de frames não acompanha o slot (índice 384 da PML4, reservado
 // inteiro), e nenhuma outra janela do OpenNT o usa. Os 32 bits baixos da base
-// (0xC0000000) caem no buraco de MMIO acima de 3 GB, sem RAM e desligado pela
-// `--identity-audit`: um ponteiro do heap truncado para 32 bits falta, em vez
-// de cair na imagem do kernel.
+// (0xC0000000) caem no buraco de MMIO acima de 3 GB; como a metade de usuário
+// não tem nada do kernel, um ponteiro do heap truncado para 32 bits falta.
 pub const KERNEL_HEAP_PHYS_BASE: u64 = 0x200_0000;
 /// Fim exclusivo dos frames do heap (início da primeira arena do PFN).
 pub const KERNEL_HEAP_PHYS_TOP: u64 = 0x600_0000;

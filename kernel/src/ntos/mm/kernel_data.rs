@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::kernel_data_layout::{self as layout, KernelDataEntry};
 use super::{kernel_address, memory_map as map};
-use crate::hal::physical;
+use crate::hal::volatile;
 use crate::ntos::inc::types::{ImageDosHeader, ImageNtHeaders64, ImageSectionHeader};
 use crate::rtl::KernelError;
 
@@ -19,38 +19,39 @@ macro_rules! header_field {
     };
 }
 
-static SECTION_PHYSICAL_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static SECTION_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 /// Localiza `.kdata` e confirma tamanho, escrita e ausência de execução.
 fn section() -> Result<u64, KernelError> {
-    let cached = SECTION_PHYSICAL_ADDRESS.load(Ordering::Relaxed);
+    let cached = SECTION_ADDRESS.load(Ordering::Relaxed);
     if cached != 0 {
         return Ok(cached);
     }
-    let image = map::KERNEL_IMAGE_BASE;
-    let pe = physical::read32(header_field!(image, ImageDosHeader, e_lfanew)) as u64;
+    // Cabeçalhos da imagem em execução, na sua ImageBase.
+    let image = map::KERNEL_VIRTUAL_BASE;
+    let pe = volatile::read32(header_field!(image, ImageDosHeader, e_lfanew)) as u64;
     let headers = image + pe;
-    let count = physical::read16(header_field!(headers, ImageNtHeaders64, file_header.number_of_sections)) as u64;
+    let count = volatile::read16(header_field!(headers, ImageNtHeaders64, file_header.number_of_sections)) as u64;
     let table = header_field!(headers, ImageNtHeaders64, optional_header)
-        + physical::read16(header_field!(headers, ImageNtHeaders64, file_header.size_of_optional_header)) as u64;
+        + volatile::read16(header_field!(headers, ImageNtHeaders64, file_header.size_of_optional_header)) as u64;
     let required = layout::required_byte_length();
     for index in 0..count {
         let header = table + index * core::mem::size_of::<ImageSectionHeader>() as u64;
-        let name = physical::read_bytes(header_field!(header, ImageSectionHeader, name), 8);
+        let name = volatile::read_bytes(header_field!(header, ImageSectionHeader, name), 8);
         let name: alloc::vec::Vec<u8> = name.into_iter().take_while(|&byte| byte != 0).collect();
         if name != b".kdata" {
             continue;
         }
         // Misc.VirtualSize; Characteristics: gravável e não executável.
-        if (physical::read32(header_field!(header, ImageSectionHeader, misc)) as u64) < required
-            || physical::read32(header_field!(header, ImageSectionHeader, characteristics)) & 0xA000_0000 != 0x8000_0000
+        if (volatile::read32(header_field!(header, ImageSectionHeader, misc)) as u64) < required
+            || volatile::read32(header_field!(header, ImageSectionHeader, characteristics)) & 0xA000_0000 != 0x8000_0000
         {
             return Err(KernelError::new("invalid kernel data section"));
         }
-        let address = image + physical::read32(header_field!(header, ImageSectionHeader, virtual_address)) as u64;
+        let address = image + volatile::read32(header_field!(header, ImageSectionHeader, virtual_address)) as u64;
         // Valida o último byte contra os limites da imagem publicada.
-        kernel_address::virtual_address(address + required - 1)?;
-        SECTION_PHYSICAL_ADDRESS.store(address, Ordering::Relaxed);
+        kernel_address::image_address(address + required - 1)?;
+        SECTION_ADDRESS.store(address, Ordering::Relaxed);
         return Ok(address);
     }
     Err(KernelError::new("kernel data section absent"))
@@ -71,7 +72,7 @@ fn cell(name: &str) -> (u64, &'static KernelDataEntry) {
 /// Endereço virtual da célula que a tabela de exports também publica.
 pub fn address(name: &str) -> Result<u64, KernelError> {
     let (offset, _) = entry(name)?;
-    kernel_address::virtual_address(section()? + offset)
+    kernel_address::image_address(section()? + offset)
 }
 
 /// Endereço de uma célula que precisa existir, para os getters dos exports
@@ -89,10 +90,10 @@ pub fn region(name: &str) -> Result<(u64, u64), KernelError> {
 pub fn read(name: &str) -> u64 {
     let (at, entry) = cell(name);
     match entry.size {
-        1 => physical::read8(at) as u64,
-        4 => physical::read32(at) as u64,
+        1 => volatile::read8(at) as u64,
+        4 => volatile::read32(at) as u64,
         // Ponteiros exportados: uma única leitura de 64 bits.
-        8 => physical::read64(at),
+        8 => volatile::read64(at),
         _ => panic!("unsupported kernel data width"),
     }
 }
@@ -101,10 +102,10 @@ pub fn read(name: &str) -> u64 {
 pub fn write(name: &str, value: u64) {
     let (at, entry) = cell(name);
     match entry.size {
-        1 => physical::write8(at, value as u8),
-        4 => physical::write32(at, value as u32),
+        1 => volatile::write8(at, value as u8),
+        4 => volatile::write32(at, value as u32),
         // Uma única escrita de 64 bits: drivers leem a célula concorrentemente.
-        8 => physical::write64(at, value),
+        8 => volatile::write64(at, value),
         _ => panic!("unsupported kernel data width"),
     }
 }

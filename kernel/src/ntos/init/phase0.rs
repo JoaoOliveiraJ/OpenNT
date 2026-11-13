@@ -35,7 +35,7 @@ pub fn init() {
     pfn::init().unwrap_or_else(|error| panic!("PFN: {error}"));
     recursive_mapping::initialize().unwrap_or_else(|error| panic!("mapeamento recursivo: {error}"));
     native_pfn_database::initialize().unwrap_or_else(|error| panic!("PFN nativo: {error}"));
-    // publica as VAs nativas do PE real e os limites de usuário
+    // registra o ntoskrnl na sua ImageBase e publica os limites de usuário
     loaded_images::init_kernel().unwrap_or_else(|error| panic!("imagem do kernel: {error}"));
     kernel_data::write("MmUserProbeAddress", memory_map::USER_ADDRESS_LIMIT);
     kernel_data::write("MmHighestUserAddress", memory_map::USER_ADDRESS_LIMIT - 1);
@@ -45,9 +45,7 @@ pub fn init() {
     crate::hal::pci_config::init().unwrap_or_else(|error| panic!("{error}")); // lock CF8/CFC antes dos APs
     shared_user_data::init(); // página KUSER_SHARED_DATA mapeada (drivers WDK)
     smp::init().unwrap_or_else(|error| panic!("SMP: {error}")); // ACPI MADT + INIT-SIPI dos APs (LAPIC)
-    if crate::ntos::init::boot_config::IDENTITY_AUDIT {
-        crate::ntos::mm::identity_audit::run(); // --identity-audit: prova do mapa direto
-    }
+    crate::ntos::mm::user_half::assert_user_only(); // trampolim desfeito: nada do kernel abaixo de MmSystemRangeStart
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)
     dump_mdl::init().unwrap_or_else(|error| panic!("dump MDL: {error}"));

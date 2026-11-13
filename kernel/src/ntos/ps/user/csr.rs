@@ -80,7 +80,9 @@ pub fn initialize() -> Result<(), KernelError> {
         Ok(section) => section,
         Err(status) => return Err(KernelError::new(alloc::format!("CSR: create section 0x{status:x}"))),
     };
-    let view = match sections::map(&section, &MapRequest { supervisor: true, protect: 4, ..MapRequest::default() })? {
+    // A vista em que o kernel monta os dados da sessão é de supervisor e fica
+    // no espaço de sistema, como toda memória do kernel.
+    let view = match sections::map(&section, &MapRequest { supervisor: true, system_space: true, protect: 4, ..MapRequest::default() })? {
         Ok(view) => view,
         Err(status) => return Err(KernelError::new(alloc::format!("CSR: map section 0x{status:x}"))),
     };

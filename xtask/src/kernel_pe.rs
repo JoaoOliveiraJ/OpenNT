@@ -22,12 +22,16 @@ mod abi_names;
 #[allow(dead_code)]
 mod native_export_layout;
 
+#[path = "../../kernel/src/ntos/mm/memory_map.rs"]
+mod memory_map;
+
 /// Bytes por trampolim (`hal::win32_thunk::STUB_SIZE`).
 const STUB_SIZE: u64 = 10;
 
-pub const BASE: u64 = 0x100000;
+/// ImageBase: a VA de sistema em que `kernel/link.ld` liga o kernel.
+pub const BASE: u64 = memory_map::KERNEL_VIRTUAL_BASE;
 pub const ALIGN: u64 = 0x1000;
-pub const MAX: u64 = 13 * 1024 * 1024;
+pub const MAX: u64 = memory_map::KERNEL_IMAGE_MAX;
 
 fn align(value: u64) -> u64 {
     value.div_ceil(ALIGN) * ALIGN

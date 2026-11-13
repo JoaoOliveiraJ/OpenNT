@@ -10,7 +10,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | Crate | Papel |
 | --- | --- |
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
-| `kernel` | binário `no_std` ligado em 0x101000 por `kernel/link.ld` e empacotado pelo `xtask` como PE32+ de base fixa 0x100000 |
+| `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
 | `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot` e `status` |
 
 ## 2. Árvore do kernel
@@ -196,22 +196,75 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
 
 ### 3.4 Mapa de memória e endereços físicos
 
-A fonte de verdade é `ntos/mm/memory_map.rs`. Como no NT, o que é do kernel
-vai para a metade de sistema (a partir de 0xFFFF8000_00000000):
+A fonte de verdade é `ntos/mm/memory_map.rs` (o stage2 e o `xtask` incluem
+o mesmo arquivo). Como no NT, tudo o que é do kernel fica na metade de
+sistema (a partir de 0xFFFF8000_00000000) e a metade de usuário, PML4[0..256),
+pertence só aos processos:
 
 | VA | Índice da PML4 | Conteúdo |
 | --- | --- | --- |
 | 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
-| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema |
+| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
 | 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
-| 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, o alias RW da imagem do kernel e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
+| 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, a **imagem do kernel** (0xFFFFF800_40000000), a pilha de boot (topo em 0xFFFFF800_41200000) e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
+
+**Imagem do kernel.** O ntoskrnl é ligado na sua VA de sistema, como no NT:
+a ImageBase do PE é `KERNEL_VIRTUAL_BASE` = 0xFFFFF800_40000000 (cabeçalhos
+na primeira página, `.text` em +0x1000), e é essa base que a lista de módulos
+carregados, o KDDEBUGGER_DATA64 e o `RtlPcToFileHeader` veem. O stage2 lê o
+arquivo do disco para os frames a partir de 1 MB (offsets do arquivo == RVAs),
+confere o cabeçalho (ImageBase, SizeOfImage, entrada) e mapeia exatamente
+SizeOfImage páginas de 4 KB de supervisor, RW e executáveis na ImageBase, com
+tabelas fixas em 0x83000-0x8BFFF (PDPT, PD e sete PTs). A pilha de boot é
+outra VA de sistema na mesma PD: 383 páginas RW e NX terminando em
+`BOOT_STACK_TOP`, sobre os frames logo abaixo de 15,5 MB, com uma página de
+guarda sem mapeamento embaixo (PT em 0x8C000). O stage2 carrega o GDTR pela VA
+do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8.
+
+*Modelo de código.* O alvo `x86_64-unknown-none` usa o code model `kernel`,
+cujos endereços absolutos de 32 bits só alcançam os 2 GB do topo; ligar em
+0xFFFFF80x exige outro arranjo. O escolhido é gerar o código independente de
+posição (`-C relocation-model=pic` em `.cargo/config.toml`, o mesmo modelo em
+que a `core` e a `alloc` pré-compiladas do alvo já vêm) e ligar um executável
+estático (`--no-pie` nos `build.rs`): toda referência do código é relativa a
+RIP, os ponteiros absolutos dos dados (vtables, tabelas de despacho, `.quad`
+dos stubs) são resolvidos pelo linker na VA final, e não há relocação para o
+stage2 processar. `.data.rel.ro` vai para `.rodata` no `link.ld`. Medido no
+build de testes, com o mesmo código-fonte: `.text` tem 8.137.799 bytes, 0,22%
+a mais que o código de relocação estática ligado em 1 MB (8.119.815), e
+`.rodata` + `.data` ficam iguais. As alternativas ficaram de fora: o code
+model `large` (relocação estática em 0xFFFFF80x) leva `.text` a 8.954.361
+bytes (+10,3%), porque toda chamada direta vira `movabs` + chamada indireta e
+todo acesso a global carrega o endereço de 64 bits antes; processar
+relocações no stage2 exigiria um carregador de PE em modo real/protegido para
+um resultado que o linker já entrega; e ligar nos 2 GB do topo
+(0xFFFFFFFF_80000000) poria o ntoskrnl fora da faixa em que o NT o carrega e
+que drivers e depuradores esperam.
+
+**Metade de usuário.** O stage2 só mapeia na metade baixa a página de 2 MB
+em que ele mesmo liga a paginação (PML4[0], tabelas em 0x71000-0x72000), e
+o kernel a desfaz na primeira instrução depois de zerar o BSS
+(`paging::remove_boot_identity`). Os APs ganham o mesmo tratamento do stub
+baixo do NT: a página do trampolim (0x9000) é mapeada em identidade
+(supervisor, executável) só enquanto eles partem; o trecho de 64 bits do
+trampolim salta para `ap_kernel_entry`, na imagem do kernel, onde o AP troca
+para a GDT e a IDT da imagem e roda o laço de jobs e o handler de NMI; com
+todos online, o BSP desmapeia a página, invalida as traduções em todas as
+CPUs e devolve as tabelas ao PFN. No fim da fase 0,
+`mm/user_half.rs::assert_user_only` percorre PML4[0..256) e para o sistema se
+achar qualquer folha presente de supervisor; o autoteste
+`ntos/test/user_half.rs` repete a varredura no fim das fases 6 e 7, depois
+dos drivers reais e dos programas de usuário, e confere que nenhuma
+estrutura do kernel tem identidade baixa. Na metade de usuário só ficam
+páginas de usuário: imagens, pilhas, TEB/PEB, seções e a visão somente
+leitura da KUSER_SHARED_DATA em 0x7FFE0000 (a do kernel fica em
+0xFFFFF780_00000000).
 
 O stage2 monta o mapa direto (páginas de 2 MB de supervisor, RW e NX; tabelas
-em 0x76000-0x7AFFF) junto com a identidade dos 4 GB baixos, antes de entrar
-no kernel. A regra:
+em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
 
 - **Endereço físico nunca é ponteiro.** Quem tem um PA usa `hal::physical`,
   que traduz pelo mapa direto e para o sistema se receber algo fora da faixa
@@ -228,12 +281,11 @@ no kernel. A regra:
   (`movabs`) e endereçam por deslocamento; a entrada de syscall troca a pilha
   por `MOV moffs64`, sem registrador livre.
 - O rastreador de frames não conta referências do mapa direto nem da janela
-  do heap, como não conta as da identidade.
-- **Prova:** `--identity-audit` (`ntos/mm/identity_audit.rs`) desliga no boot
-  a identidade baixa do primeiro MB (menos o código do trampolim), da faixa
-  sem uso de 16 MB a 32 MB, dos frames do heap e da arena, das arenas do PFN
-  e do MMIO; com ela a suíte inteira passa, então nenhum acesso por endereço
-  físico nem nenhum ponteiro do heap ou da arena usa a identidade.
+  do heap (nem da identidade temporária do trampolim).
+- **Prova:** não existe identidade baixa para cair por engano: um endereço
+  físico usado como ponteiro, um ponteiro truncado para 32 bits ou um
+  ponteiro de kernel abaixo de MmSystemRangeStart falta no anel 0 e para o
+  sistema com o diagnóstico.
 
 **Heap do kernel e arena dos convidados.** Os frames de 32 MB a 96 MB (fora
 do PFN) aparecem só na janela do heap, `KERNEL_HEAP_BASE + (PA - 32 MB)`, o
@@ -250,7 +302,7 @@ cabeçalhos são lidos e gravados pela VA; os links da arena são offsets a
 partir da base dela. Quem precisa do endereço físico de um bloco (a tabela
 PRD e o buffer de passagem do DMA ATA) traduz pelas tabelas de páginas. Os 32
 bits baixos da base caem no buraco de MMIO acima de 3 GB, então um ponteiro
-truncado para 32 bits falta em vez de cair na imagem do kernel. O teste
+truncado para 32 bits falta. O teste
 `ntos/test/system_allocations.rs`, no fim da fase 6, confere a arena, o heap,
 o pool, IRPs, MDLs e os DRIVER_OBJECTs/DEVICE_OBJECTs vivos, inclusive os dos
 drivers reais.
@@ -265,15 +317,11 @@ drivers reais.
   reloca pela diferença para a ImageBase do cabeçalho. Imagem sem relocações
   (`IMAGE_FILE_RELOCS_STRIPPED`) é recusada com STATUS_CONFLICTING_ADDRESSES.
   No descarregamento, a VA e os frames só voltam ao uso depois da invalidação
-  de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de usuário
-  nem na identidade abaixo de 4 GB; o ntoskrnl é listado pelo alias em
-  `KERNEL_VIRTUAL_BASE`.
+  de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de
+  usuário; o ntoskrnl não passa pelo loader (o stage2 já o mapeia na sua
+  ImageBase) e é listado ali.
 - As imagens de usuário continuam na base preferida da metade de usuário (ou
   na próxima faixa livre), também sobre frames do PFN.
-
-A identidade baixa ainda existe nesta etapa para o que é endereçado como VA
-abaixo de 4 GB: a imagem do kernel (ligada em 0x101000), a pilha de boot, a
-janela do VirtualAlloc de kernel e o código do trampolim dos APs.
 
 ## 4. Dependências
 

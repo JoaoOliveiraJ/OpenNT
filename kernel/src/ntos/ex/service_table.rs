@@ -101,7 +101,7 @@ pub fn init() -> Result<Addresses, KernelError> {
         return Ok(addresses);
     }
     let entries = storage::entries();
-    let entry = |index: usize| kernel_address::virtual_address(entries[index]);
+    let entry = |index: usize| kernel_address::image_address(entries[index]);
     let published = Addresses { lookup: entry(0)?, descriptor: entry(1)?, shadow: entry(2)?, table: entry(3)?, argument_table: entry(4)? };
     *addresses = Some(published);
     Ok(published)

@@ -1722,7 +1722,7 @@ fn service_tables(assert: Assert) {
         let _ = st::self_test_reset();
     }
     assert(addresses.descriptor % 32 == 0 && addresses.shadow == addresses.descriptor + 64 && addresses.argument_table == addresses.table + 0x4000, "services: descritores e tabela no alias da imagem");
-    let alias = |routine: u64| kernel_address::virtual_address(routine).unwrap_or(0);
+    let alias = |routine: u64| kernel_address::image_address(routine).unwrap_or(0);
     let targets = [
         alias(enum_handle_callback as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64),
         alias(special_routine as extern "win64" fn(u64, u64, u64, u64, u64) as usize as u64),

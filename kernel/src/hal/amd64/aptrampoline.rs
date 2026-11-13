@@ -1,27 +1,34 @@
 //! Trampolim de Application Processor.
 //!
-//! O BSP (`ntos::ke::smp`) copia estes bytes para 0x9000, preenche a mailbox
-//! em 0xA000 (CR3, pilha, slot) e dispara INIT-SIPI-SIPI pelo LAPIC. O AP
-//! entra em modo real (CS=0x900), sobe para 64 bits com o MESMO CR3 do BSP,
-//! marca seu slot online e entra no laço de jobs nativos:
+//! O BSP (`ntos::ke::smp`) copia o trampolim para 0x9000, mapeia essa página
+//! em identidade só enquanto os APs partem (como o stub baixo do NT),
+//! preenche a mailbox em 0xA000 (CR3, pilha, slot) e dispara INIT-SIPI-SIPI
+//! pelo LAPIC. O AP entra em modo real (CS=0x900), sobe para 64 bits com o
+//! MESMO CR3 do BSP e salta para `ap_kernel_entry`, na imagem do kernel (VA
+//! de sistema): dali em diante nada do AP depende da página baixa. Na imagem
+//! ele troca para a GDT e a IDT do kernel, marca seu slot online e entra no
+//! laço de jobs nativos:
 //! SLOT_JOB_FUNC != 0 -> func(args 1..4) MS ABI -> SLOT_JOB_RES, SLOT_JOB_DONE=1.
 //!
-//! Os bytes ficam na imagem do kernel; todo endereço absoluto é escrito como
-//! `rótulo - ap_trampoline_start + 0x9000`, resolvido pelo montador, para o
-//! código funcionar depois de copiado.
+//! Os bytes do trampolim ficam na imagem do kernel; todo endereço absoluto
+//! do trecho de 16/32 bits é escrito como `rótulo - ap_trampoline_start +
+//! 0x9000`, resolvido pelo montador, para o código funcionar depois de
+//! copiado. O salto para a imagem leva a VA absoluta de `ap_kernel_entry`,
+//! resolvida pelo linker.
 //!
 //! Antes da paginação (modos real e protegido) o AP lê a mailbox pelo
 //! endereço físico, como exige a CPU. Em 64 bits, os dados (mailbox, slots,
-//! LAPIC, pilha, GDT e IDT do AP) são acessados pelo mapa direto da metade
-//! de sistema; da identidade baixa sobra só a busca de instruções na página
-//! do trampolim.
+//! LAPIC, pilha) são acessados pelo mapa direto da metade de sistema.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::mm::memory_map;
 
-pub const LOAD_ADDRESS: u64 = 0x9000;
+pub const LOAD_ADDRESS: u64 = memory_map::AP_TRAMPOLINE_PHYS;
 const MAILBOX_PHYS: u64 = memory_map::SMP_MAILBOX_PHYS;
+/// Seletor de código de 64 bits das GDTs de boot e do AP.
+const CODE_SELECTOR: u64 = 0x10;
 
 global_asm!(
     r#"
@@ -102,7 +109,34 @@ ap_lm64:
     mov ss, ax
     mov fs, ax
     mov gs, ax
-    # Daqui em diante, dados pelo mapa direto: RSI = mailbox.
+    # Sai da página do trampolim: o resto roda na imagem do kernel.
+    .byte 0x48, 0xB8                                # movabs rax, imm64
+    .quad ap_kernel_entry
+    jmp rax
+
+.balign 8
+ap_gdt:
+    .quad 0                                         # null
+    .quad 0x00CF9A000000FFFF                        # 0x08 code32
+    .quad 0x00209A0000000000                        # 0x10 code64 (L=1)
+    .quad 0x0000920000000000                        # 0x18 data64
+    .quad 0x00CF92000000FFFF                        # 0x20 bootstrap data32
+ap_gdt_end:
+.balign 4
+ap_gdtr:
+    .word ap_gdt_end - ap_gdt - 1
+    .long ap_gdt - ap_trampoline_start + {base}
+ap_trampoline_end:
+.popsection
+
+.pushsection .text.ap_kernel, "ax", @progbits
+.code64
+ap_kernel_entry:
+    # GDT e IDT do AP na imagem do kernel: depois daqui nenhuma carga de
+    # seletor nem NMI passa pela página baixa.
+    lgdt [rip + ap_kernel_gdtr]
+    lidt [rip + ap_kernel_idtr]
+    # Dados pelo mapa direto: RSI = mailbox.
     movabs rsi, {direct_mailbox}
     # Um AP atrasado não pode consumir pilha/mailbox de outro AP.
     movabs rdx, {direct_lapic_id}
@@ -117,15 +151,6 @@ ap_lm64:
     mov dword ptr [rsi + 0x28], 0x64
     shl rbx, 6                                      # * 64 (tamanho do slot)
     lea r15, [rsi + rbx + 0x100]
-    # GDT e IDT do AP também pelo mapa direto.
-    .byte 0x48, 0xB9                                # movabs rcx, imm64
-    .quad ap_gdtr64 - ap_trampoline_start + {direct_base}
-    lgdt [rcx]
-    # NMIs de shootdown podem interromper um job nativo mesmo com IF=0:
-    # instala o handler antes de publicar o processador como online.
-    .byte 0x48, 0xB9                                # movabs rcx, imm64
-    .quad ap_idtr - ap_trampoline_start + {direct_base}
-    lidt [rcx]
     mov dword ptr [r15], eax                        # SLOT_APIC_ID
     mov dword ptr [r15 + 0x38], 1                   # SLOT_JOB_DONE
     mov dword ptr [r15 + 0x04], 1                   # SLOT_ONLINE
@@ -162,6 +187,7 @@ ap_park:
     hlt
     jmp ap_park
 
+.global ap_tlb_nmi
 ap_tlb_nmi:
     push rax
     push rcx
@@ -204,44 +230,39 @@ ap_nmi_done:
     pop rcx
     pop rax
     iretq
+.popsection
 
-.balign 16
-ap_idt:
-    .quad 0, 0, 0, 0                                # vetores 0 e 1
-    .word ap_tlb_nmi - ap_trampoline_start + {base} # vetor 2: NMI
-    .word 0x10
-    .byte 0, 0x8E
-    .word 0
-    .long 0, 0
-ap_idt_end:
-ap_idtr:
-    .word ap_idt_end - ap_idt - 1
-    .quad ap_idt - ap_trampoline_start + {direct_base}
-
+.pushsection .rodata.ap_kernel, "a", @progbits
 .balign 8
-ap_gdt:
+ap_kernel_gdt:
     .quad 0                                         # null
     .quad 0x00CF9A000000FFFF                        # 0x08 code32
     .quad 0x00209A0000000000                        # 0x10 code64 (L=1)
     .quad 0x0000920000000000                        # 0x18 data64
     .quad 0x00CF92000000FFFF                        # 0x20 bootstrap data32
-ap_gdt_end:
-.balign 4
-ap_gdtr:
-    .word ap_gdt_end - ap_gdt - 1
-    .long ap_gdt - ap_trampoline_start + {base}
-.balign 4
-    .word 0
-ap_gdtr64:
-    .word ap_gdt_end - ap_gdt - 1
-    .quad ap_gdt - ap_trampoline_start + {direct_base}
-ap_trampoline_end:
+ap_kernel_gdt_end:
+.balign 8
+    .word 0, 0, 0
+ap_kernel_gdtr:
+    .word ap_kernel_gdt_end - ap_kernel_gdt - 1
+    .quad ap_kernel_gdt
+.balign 8
+    .word 0, 0, 0
+ap_kernel_idtr:
+    .word 3 * 16 - 1                                # vetores 0..2
+    .quad ap_kernel_idt
+.popsection
+
+.pushsection .data.ap_kernel, "aw", @progbits
+.balign 16
+.global ap_kernel_idt
+ap_kernel_idt:
+    .quad 0, 0, 0, 0, 0, 0                          # vetor 2 (NMI): `prepare_kernel_entry`
 .popsection
 .code64
 "#,
     mailbox = const MAILBOX_PHYS,
     base = const LOAD_ADDRESS,
-    direct_base = const memory_map::direct_map(LOAD_ADDRESS),
     direct_mailbox = const memory_map::direct_map(MAILBOX_PHYS),
     direct_lapic_id = const memory_map::direct_map(memory_map::LAPIC_PHYS + 0x20),
 );
@@ -249,6 +270,8 @@ ap_trampoline_end:
 extern "C" {
     static ap_trampoline_start: u8;
     static ap_trampoline_end: u8;
+    static ap_tlb_nmi: u8;
+    static ap_kernel_idt: [AtomicU64; 6];
 }
 
 /// Bytes do trampolim.
@@ -256,4 +279,16 @@ pub fn bytes() -> &'static [u8] {
     let start = core::ptr::addr_of!(ap_trampoline_start);
     let end = core::ptr::addr_of!(ap_trampoline_end);
     unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }
+}
+
+/// Grava o portão de NMI (vetor 2, interrupção de 64 bits, DPL 0) da IDT
+/// dos APs com a VA da rotina de shootdown na imagem do kernel. O BSP chama
+/// antes do primeiro SIPI; a IDT não muda depois.
+pub fn prepare_kernel_entry() {
+    let handler = core::ptr::addr_of!(ap_tlb_nmi) as u64;
+    let low = (handler & 0xFFFF) | (CODE_SELECTOR << 16) | (0x8E << 40) | ((handler >> 16) & 0xFFFF) << 48;
+    // SAFETY: a IDT dos APs é desta camada; nenhum AP está rodando ainda.
+    let table = unsafe { &ap_kernel_idt };
+    table[4].store(low, Ordering::Release);
+    table[5].store(handler >> 32, Ordering::Release);
 }

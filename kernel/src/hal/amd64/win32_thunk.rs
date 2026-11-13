@@ -333,7 +333,7 @@ pub fn kernel_thread_return() -> u64 {
     core::ptr::addr_of!(opennt_kernel_thread_return) as u64
 }
 
-/// Endereço (identidade) da tabela de stubs e quantidade.
+/// Endereço (VA na imagem do kernel) da tabela de stubs e quantidade.
 pub fn thunk_table() -> (u64, u32) {
     (core::ptr::addr_of!(opennt_win32_stubs) as u64, MAX_WIN32)
 }

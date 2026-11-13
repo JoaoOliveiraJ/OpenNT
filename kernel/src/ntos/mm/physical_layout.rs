@@ -1,6 +1,6 @@
 //! RAM admitida por este boot.
 //!
-//! RAM de firmware habilitada abaixo do limite do identity map do stage2.
+//! RAM de firmware habilitada abaixo do limite do mapa direto do stage2.
 //! Reservas de kernel/heap/imagens/PFN continuam sendo RAM física; reservas
 //! de firmware e MMIO não. Uma consulta nunca relê o E820 mutável.
 

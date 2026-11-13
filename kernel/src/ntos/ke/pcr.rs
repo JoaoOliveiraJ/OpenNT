@@ -56,7 +56,7 @@ const LOCK_QUEUE_IO_DATABASE: usize = 10;
 
 const GS_BASE_MSR: u32 = 0xC000_0101;
 /// GDTR do stage2 publicado no handoff (limite em +0, base de 32 bits em +2).
-const DESCRIPTOR_TABLE_REGISTER_CELL: u64 = 0x4FE8;
+const DESCRIPTOR_TABLE_REGISTER_CELL: u64 = map::BOOT_GDTR_PHYS;
 
 struct Pcr {
     address: u64,
@@ -108,8 +108,8 @@ pub fn init() -> Result<(), KernelError> {
     // SAFETY: as páginas recém-zeradas acabaram de ser mapeadas em `base`.
     let kpcr = unsafe { Kpcr::at(base) };
 
-    // A GDT do stage2 continua a mesma, mas o GDTR e a KPCR passam a
-    // alcançá-la pela VA do mapa direto.
+    // A GDT do stage2 continua a mesma; o GDTR (que o stage2 já carregou
+    // assim) e a KPCR a alcançam pela VA do mapa direto.
     let gdt_limit = physical::read16(DESCRIPTOR_TABLE_REGISTER_CELL);
     let gdt_base = physical::to_virtual(physical::read32(DESCRIPTOR_TABLE_REGISTER_CELL + 2) as u64);
     cpu::load_gdt(gdt_base, gdt_limit);
@@ -123,12 +123,12 @@ pub fn init() -> Result<(), KernelError> {
     // Como o KiInitSpinLocks: toda entrada da LockQueue aponta para um
     // KSPIN_LOCK global; as do pool, da VPB e da base de I/O vêm em seguida.
     for (number, entry) in lock_queue.iter().enumerate() {
-        let lock = kernel_address::virtual_address(QUEUED_SPIN_LOCKS.as_ptr() as u64 + number as u64 * 8)?;
+        let lock = kernel_address::image_address(QUEUED_SPIN_LOCKS.as_ptr() as u64 + number as u64 * 8)?;
         entry.next.set(0);
         entry.lock.set(lock);
     }
     // LockQueueNonPagedPoolLock recebe o lock real do alocador.
-    let pool_lock = kernel_address::virtual_address(native_call::non_paged_pool_lock_address())?;
+    let pool_lock = kernel_address::image_address(native_call::non_paged_pool_lock_address())?;
     lock_queue[LOCK_QUEUE_NON_PAGED_POOL].lock.set(pool_lock);
     if pcr.io_database_lock != 0 {
         lock_queue[LOCK_QUEUE_IO_DATABASE].lock.set(pcr.io_database_lock);

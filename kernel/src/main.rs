@@ -34,9 +34,11 @@ extern "C" {
     static mut __bss_end: u8;
 }
 
-/// Entrada 64-bit do kernel. O stage2 chega aqui com RSP = 0xF80008
-/// (alinhamento de quem acabou de receber um CALL), a identidade dos 4 GB
-/// baixos e o mapa direto da mesma faixa física em `DIRECT_MAP_BASE`.
+/// Entrada 64-bit do kernel, na VA de sistema em que ele foi ligado. O
+/// stage2 chega aqui com RSP = BOOT_STACK_TOP - 8 (pilha de boot de sistema,
+/// alinhamento de quem acabou de receber um CALL), o GDTR pelo mapa direto,
+/// o mapa direto de [0, 4 GB) em `DIRECT_MAP_BASE` e a identidade
+/// transitória de [0, 2 MB), que sai antes de tudo.
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub extern "C" fn kernel_main() -> ! {
@@ -48,6 +50,9 @@ pub extern "C" fn kernel_main() -> ! {
         let length = end as usize - start as usize;
         core::ptr::write_bytes(start, 0, length);
     }
+    // Nada do kernel fica na metade de usuário: a página de 2 MB em que o
+    // stage2 ligou a paginação deixa de existir.
+    ntos::mm::paging::remove_boot_identity();
 
     // Disponibiliza a serial, o alocador e a arena de convidados.
     hal::host::init();

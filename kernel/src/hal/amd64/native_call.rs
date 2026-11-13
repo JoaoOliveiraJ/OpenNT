@@ -1,11 +1,9 @@
 //! Ponte para código nativo e células nativas do kernel.
 //!
-//! Nesta fase: o NonPagedPoolLock (célula dentro da imagem do kernel, cujo
-//! alias virtual a PCR publica) e o registro do mapeamento permanente da
-//! imagem em KERNEL_VIRTUAL_BASE. As chamadas MS-ABI (`exec_msabi*`) entram
-//! com o loader PE (fase 6).
+//! O NonPagedPoolLock (célula dentro da imagem do kernel, que a PCR publica)
+//! e o gateway das chamadas MS-ABI (`exec_msabi_n`) para rotinas nativas.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 /// NonPagedPoolLock: lock de 8 bytes na seção de dados da imagem, alinhado em
 /// 16. Os bytes seguintes ficam reservados e zerados (vizinhos como flags e
@@ -23,49 +21,10 @@ pub fn non_paged_pool_lock_address() -> u64 {
     &NON_PAGED_POOL_LOCK.lock as *const AtomicU64 as u64
 }
 
-static PUBLISHED_PHYSICAL_BASE: AtomicU64 = AtomicU64::new(0);
-static PUBLISHED_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
-static PUBLISHED_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
-
-/// O loader publica uma única imagem permanente, depois de mapear suas
-/// páginas. Tamanho zero identifica o boot anterior à publicação.
-pub fn publish_native_kernel_mapping(physical_base: u64, virtual_base: u64, image_size: u64) -> bool {
-    if image_size == 0
-        || (physical_base | virtual_base | image_size) & 0xFFF != 0
-        || virtual_base < 0xFFFF_8000_0000_0000
-        || image_size > u64::MAX - physical_base
-        || image_size > u64::MAX - virtual_base
-    {
-        return false;
-    }
-    let published = PUBLISHED_IMAGE_SIZE.load(Ordering::Acquire);
-    if published != 0 {
-        return physical_base == PUBLISHED_PHYSICAL_BASE.load(Ordering::Relaxed)
-            && virtual_base == PUBLISHED_VIRTUAL_BASE.load(Ordering::Relaxed)
-            && image_size == published;
-    }
-    PUBLISHED_PHYSICAL_BASE.store(physical_base, Ordering::Relaxed);
-    PUBLISHED_VIRTUAL_BASE.store(virtual_base, Ordering::Relaxed);
-    // Publicar o tamanho por último torna as bases visíveis antes.
-    PUBLISHED_IMAGE_SIZE.store(image_size, Ordering::Release);
-    true
-}
-
-/// Endereço de uma rotina do kernel no alias publicado (ou o de boot).
-pub fn native_gateway_address(physical_entry: u64) -> u64 {
-    if PUBLISHED_IMAGE_SIZE.load(Ordering::Acquire) == 0 {
-        return physical_entry;
-    }
-    PUBLISHED_VIRTUAL_BASE.load(Ordering::Relaxed) + physical_entry - PUBLISHED_PHYSICAL_BASE.load(Ordering::Relaxed)
-}
-
 // ---- chamadas MS-ABI (exec_msabi_n) ---------------------------------------
 //
-// O gateway é independente de posição e roda no alias publicado da imagem:
-// o CALL empilha um endereço de retorno dentro da VA real do kernel.
-// A imagem inteira está mapeada nos dois endereços, então referências
-// relativas caem no alias e absolutas no identity map — ambos válidos.
-// A posse de traps para SEH de código nativo entra com o loader PE (fase 6).
+// O gateway roda na VA de sistema da imagem do kernel: o CALL empilha um
+// endereço de retorno dentro do ntoskrnl, como num chamador nativo real.
 
 core::arch::global_asm!(
     r#"
@@ -127,11 +86,11 @@ pub fn call(routine: u64, arguments: &[u64]) -> u64 {
     assert!(arguments.len() <= MAX_NATIVE_ARGUMENTS, "too many native arguments");
     let mut padded = [0u64; MAX_NATIVE_ARGUMENTS];
     padded[..arguments.len()].copy_from_slice(arguments);
-    let gateway = native_gateway_address(exec_msabi_n as *const () as usize as u64);
-    let gateway: extern "C" fn(u64, *const u64, u64) -> u64 = unsafe { core::mem::transmute(gateway as usize) };
     // A posse anterior é guardada para chamadas aninhadas.
     let previous = set_sync_active(1);
-    let result = gateway(routine, padded.as_ptr(), arguments.len().max(4) as u64);
+    // SAFETY: o gateway preserva os registradores do chamador SysV e copia
+    // os argumentos (pelo menos quatro qwords em `padded`).
+    let result = unsafe { exec_msabi_n(routine, padded.as_ptr(), arguments.len().max(4) as u64) };
     set_sync_active(previous);
     result
 }

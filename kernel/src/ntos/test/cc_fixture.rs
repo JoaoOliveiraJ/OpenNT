@@ -120,7 +120,7 @@ pub fn create(size: u64) -> Option<Fixture> {
         return None;
     }
     let routine = dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64;
-    let routine = crate::ntos::mm::kernel_address::virtual_address(routine).unwrap_or(routine);
+    let routine = crate::ntos::mm::kernel_address::image_address(routine).unwrap_or(routine);
     // SAFETY: blocos zerados recém-alocados com o tamanho de cada tipo.
     let (driver_object, device_object, file_sizes) = unsafe { (DriverObject::at(driver), DeviceObject::at(device), CcFileSizes::at(sizes)) };
     driver_object.major_function[irp_mj::READ as usize].set(routine);

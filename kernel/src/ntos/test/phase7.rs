@@ -1739,7 +1739,7 @@ fn user_system_services(assert: Assert) {
         assert(system_services::register(&invalid).is_err() && system_services::register(&unmeasured).is_err() && system_services::register(&alloc::collections::BTreeMap::new()).is_err(), "userservices: numeros e convencao nao medida recusados");
         assert(system_services::register(&expected).is_ok() && state::with(|state| state.name_by_number.get(&0x2C).is_some_and(|name| name == "NtTerminateProcess")), "userservices: tabela nativa registrada");
         let entries = crate::hal::amd64::service_table::entries();
-        let (gateways, unavailable) = (kernel_address::virtual_address(entries[5]).unwrap_or(0), kernel_address::virtual_address(entries[6]).unwrap_or(0));
+        let (gateways, unavailable) = (kernel_address::image_address(entries[5]).unwrap_or(0), kernel_address::image_address(entries[6]).unwrap_or(0));
         assert(service_table::inspect(0x2C, false).is_ok_and(|(address, arguments)| address == gateways + 0x2C * 10 && arguments == 0) && service_table::inspect(0x27, false).is_ok_and(|(address, _)| address == gateways + 0x27 * 10) && service_table::inspect(0x28, false).is_ok_and(|(address, _)| address == unavailable), "userservices: gateways dos provedores e falha comum do slot sem provedor");
         assert(system_services::private_name(0x4000_002C).as_deref() == Some("ZwTerminateProcess") && system_services::private_name(0x4000_0027).as_deref() == Some("ZwDisplayString") && system_services::private_name(0x4000_0028).as_deref() == Some("UnavailableSystemService") && system_services::private_name(5).is_none(), "userservices: nomes privados conforme o PreviousMode");
         let changed: alloc::collections::BTreeMap<u32, alloc::string::String> = [(0x27u32, alloc::string::String::from("NtDisplayString"))].into_iter().collect();
@@ -2051,7 +2051,7 @@ fn user_index(assert: Assert) {
     if state::with(|state| state.name_by_number.get(&0x2C).is_some()) {
         assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && guest::read32(state::EXIT_CODE_CELL) == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
         // Caminho completo em UserMode: gateway, trampolim, despacho e ponte.
-        let gateways = kernel_address::virtual_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
+        let gateways = kernel_address::image_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
         let previous = process::get_current_thread();
         if let Ok(thread) = process::create_kernel_thread(process::get_current_process(), 0x7F00, true, 1, None) {
             process::set_current_thread(thread);
@@ -3479,7 +3479,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let zw = |name: &str, arguments: &[u64]| -> Option<u32> {
         let Some(ResolvedImport::Thunk(id)) = exports::lookup("ntoskrnl.exe", name) else { return None };
         let (table, _) = win32_thunk::thunk_table();
-        let address = crate::ntos::mm::kernel_address::virtual_address(table + id as u64 * win32_thunk::STUB_SIZE).ok()?;
+        let address = crate::ntos::mm::kernel_address::image_address(table + id as u64 * win32_thunk::STUB_SIZE).ok()?;
         Some(native_call::call(address, arguments) as u32)
     };
     let Ok(block) = memory::map_user_region(0x2000) else {
@@ -3793,7 +3793,7 @@ fn user_thread_context(assert: Assert) {
     // PsSetContextThread pelo corpo nativo e PspSetContextThreadInternal.
     let address = match exports::lookup("ntoskrnl.exe", "PsSetContextThread") {
         Some(ResolvedImport::Address { address, .. }) => address,
-        Some(ResolvedImport::Thunk(id)) => crate::ntos::mm::kernel_address::virtual_address(win32_thunk::thunk_table().0 + id as u64 * win32_thunk::STUB_SIZE).unwrap_or(0),
+        Some(ResolvedImport::Thunk(id)) => crate::ntos::mm::kernel_address::image_address(win32_thunk::thunk_table().0 + id as u64 * win32_thunk::STUB_SIZE).unwrap_or(0),
         _ => 0,
     };
     let native = if address != 0 { native_call::call(address, &[thread, source, 0]) as u32 } else { 0 };
@@ -4850,5 +4850,6 @@ pub fn run(assert: Assert) {
     shell_service_control(assert);
     boot_services_hive(assert);
     user_windows_process(assert);
+    crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

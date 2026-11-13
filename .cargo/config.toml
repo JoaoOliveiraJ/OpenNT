@@ -2,10 +2,15 @@
 xtask = "run --quiet --package xtask --"
 
 # Os binários freestanding são carregados em endereços fixos pelo stage2:
-# sem PIE, sem tabelas de unwind e sem SSE no código do kernel (o estado
-# x87/SSE pertence aos programas e drivers nativos).
+# sem tabelas de unwind e sem SSE no código do kernel (o estado x87/SSE
+# pertence aos programas e drivers nativos). O kernel executa na sua VA de
+# sistema (0xFFFFF800_4000_1000, fora dos 2 GB do topo que o code model
+# `kernel` do alvo exige para endereços absolutos de 32 bits): o código é
+# gerado independente de posição, só com referências relativas a RIP, e cada
+# binário é ligado como executável estático (`--no-pie` nos build.rs), então
+# o linker resolve todos os endereços e nada é relocado no boot.
 [target.x86_64-unknown-none]
 rustflags = [
-  "-C", "relocation-model=static",
+  "-C", "relocation-model=pic",
   "-C", "force-frame-pointers=yes",
 ]

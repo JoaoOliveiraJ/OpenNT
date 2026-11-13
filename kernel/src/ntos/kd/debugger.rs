@@ -60,6 +60,6 @@ pub fn entered_debugger_address() -> u64 {
 /// nativo; devolve o resultado de 32 bits.
 pub fn prompt(prompt: u64, response: u64, length: u64) -> Result<u32, KernelError> {
     let entry = private_entries::entry("dbg_prompt").ok_or_else(|| KernelError::new("DbgPrompt native body is missing"))?;
-    let address = kernel_address::virtual_address(entry)?;
+    let address = kernel_address::image_address(entry)?;
     Ok(native_call::call(address, &[prompt, response, length]) as u32)
 }

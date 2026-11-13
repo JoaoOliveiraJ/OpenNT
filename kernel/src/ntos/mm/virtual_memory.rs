@@ -1,7 +1,8 @@
 //! VirtualAlloc/VirtualFree do kernel.
 //!
-//! Páginas virtuais no espaço reservado (256MB-512MB), cada uma lastreada
-//! por um frame do PFN e mapeada na tabela real, com reuso de faixas livres.
+//! Páginas virtuais na janela de sistema `KERNEL_VIRTUAL_ALLOC_BASE..TOP`
+//! (256 MB), cada uma lastreada por um frame do PFN e mapeada em PTE de
+//! supervisor na tabela real, com reuso de faixas livres.
 
 use alloc::vec::Vec;
 
@@ -17,7 +18,7 @@ struct VirtualSpace {
 }
 
 static SPACE: SpinLock<VirtualSpace> =
-    SpinLock::new(VirtualSpace { next_free_va: map::VA_ALLOC_BASE, free_ranges: Vec::new() });
+    SpinLock::new(VirtualSpace { next_free_va: map::KERNEL_VIRTUAL_ALLOC_BASE, free_ranges: Vec::new() });
 
 /// Aloca `size` bytes (arredonda a páginas); VA ou 0.
 pub fn alloc(size: u64) -> u64 {
@@ -27,7 +28,7 @@ pub fn alloc(size: u64) -> u64 {
         if let Some(index) = space.free_ranges.iter().position(|&(_, count)| count == pages) {
             space.free_ranges.remove(index).0
         } else {
-            if space.next_free_va + pages * PAGE > map::VA_ALLOC_TOP {
+            if space.next_free_va + pages * PAGE > map::KERNEL_VIRTUAL_ALLOC_TOP {
                 return 0;
             }
             let va = space.next_free_va;

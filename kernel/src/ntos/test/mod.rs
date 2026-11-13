@@ -11,5 +11,6 @@ pub mod phase7;
 pub mod multiprocess;
 pub mod system_allocations;
 pub mod system_images;
+pub mod user_half;
 pub mod resource_search_fixtures;
 pub mod cc_fixture;

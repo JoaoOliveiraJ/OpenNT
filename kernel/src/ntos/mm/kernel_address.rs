@@ -1,4 +1,9 @@
-//! Endereço virtual do kernel <-> mapeamento físico permanente da imagem.
+//! Endereços da imagem do kernel em execução.
+//!
+//! O kernel executa na sua ImageBase (`KERNEL_VIRTUAL_BASE`, mapeada pelo
+//! stage2): o endereço de uma rotina, célula ou trampolim do kernel já é o
+//! que os módulos nativos recebem. Este módulo só confere que o endereço cai
+//! na imagem publicada por `loaded_images::init_kernel`.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,22 +21,11 @@ pub fn image_size() -> u64 {
     IMAGE_SIZE.load(Ordering::Acquire)
 }
 
-/// Endereço físico da imagem -> endereço virtual nativo.
-pub fn virtual_address(physical_address: u64) -> Result<u64, KernelError> {
+/// O endereço de um símbolo do kernel, conferido contra a imagem publicada.
+pub fn image_address(address: u64) -> Result<u64, KernelError> {
     let size = image_size();
-    if size == 0
-        || physical_address < map::KERNEL_IMAGE_BASE
-        || physical_address >= map::KERNEL_IMAGE_BASE + size
-    {
+    if size == 0 || address < map::KERNEL_VIRTUAL_BASE || address - map::KERNEL_VIRTUAL_BASE >= size {
         return Err(KernelError::new("address outside published kernel image"));
     }
-    Ok(map::KERNEL_VIRTUAL_BASE + (physical_address - map::KERNEL_IMAGE_BASE))
-}
-
-/// Conversão inversa; `None` se o endereço não pertence à imagem.
-pub fn physical_address(virtual_address: u64) -> Option<u64> {
-    let size = image_size();
-    let offset = virtual_address.wrapping_sub(map::KERNEL_VIRTUAL_BASE);
-    (size != 0 && virtual_address >= map::KERNEL_VIRTUAL_BASE && offset < size)
-        .then(|| map::KERNEL_IMAGE_BASE + offset)
+    Ok(address)
 }

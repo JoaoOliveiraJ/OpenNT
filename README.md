@@ -172,9 +172,7 @@ do caminho de escrita do disco, com leitores em outras CPUs, e imprime
 integridade de código ativa, e imprime `DRIVER_START_COMPLETED`),
 `--trace-driver-api` (mostra cada chamada de API do driver enquanto ele inicia:
 objetos abertos, rotinas pedidas ao `MmGetSystemRoutineAddress`, valores do
-Registro e texto formatado), `--identity-audit` (no boot, tira da tabela de
-páginas a identidade baixa de tudo o que só é acessado por endereço físico,
-que passa pelo mapa direto; um acesso que sobrar falta e para o sistema).
+Registro e texto formatado).
 Opções de máquina: `--accel=tcg|whpx`,
 `--memory-mb=N` (padrão 4096), `--smp=N` (padrão 4). Em `--keys`, `\n` digita
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar

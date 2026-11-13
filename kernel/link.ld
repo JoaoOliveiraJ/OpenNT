@@ -1,14 +1,21 @@
-/* link.ld - kernel do OpenNT ligado em 0x100000 (1 MB), identity-mapped.
+/* link.ld - kernel do OpenNT ligado na sua VA de sistema.
  *
- * A primeira página (0x100000) é o cabeçalho PE32+ gerado pelo xtask a
- * partir destas seções; os offsets do arquivo são iguais às RVAs, então o
- * stage2 carrega a imagem linearmente e entra pelo AddressOfEntryPoint.
- * O kernel ocupa [1 MB, 14 MB); a pilha de boot fica em 15,5 MB. */
+ * A ImageBase é KERNEL_VIRTUAL_BASE (0xFFFFF800_40000000,
+ * kernel/src/ntos/mm/memory_map.rs): a primeira página é o cabeçalho PE32+
+ * gerado pelo xtask a partir destas seções, e `.text` começa em +0x1000. Os
+ * offsets do arquivo são iguais às RVAs; o stage2 carrega a imagem
+ * linearmente nos frames de 1 MB a 14 MB, mapeia SizeOfImage páginas na
+ * ImageBase e entra pelo AddressOfEntryPoint.
+ *
+ * O código é independente de posição (relocation-model=pic) e o executável
+ * é estático (--no-pie): o linker resolve toda referência para estes
+ * endereços. `.data.rel.ro` (dados constantes com ponteiros) fica em
+ * `.rodata`, como ficaria num executável de relocação estática. */
 ENTRY(kernel_main)
 
 SECTIONS
 {
-    . = 0x101000;
+    . = 0xFFFFF80040001000;
 
     .text : ALIGN(4096) {
         *(.text.boot)
@@ -18,6 +25,7 @@ SECTIONS
     . = ALIGN(4096);
     .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
+        *(.data.rel.ro .data.rel.ro.*)
     }
 
     . = ALIGN(4096);

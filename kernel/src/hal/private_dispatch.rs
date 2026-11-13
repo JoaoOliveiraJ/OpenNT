@@ -255,7 +255,7 @@ pub fn routine_name(index: usize) -> Option<&'static str> {
 
 fn native(symbol: &str) -> Result<u64, KernelError> {
     let entry = private_entries::entry(symbol).ok_or_else(|| KernelError::new(alloc::format!("corpo nativo ausente: {symbol}")))?;
-    kernel_address::virtual_address(entry)
+    kernel_address::image_address(entry)
 }
 
 /// HalInitSystem: grava a versão e os ponteiros do boot na tabela exportada.

@@ -90,8 +90,10 @@ pub fn run() {
     assert(frame2 == frame1, "pfn reusa frame livre");
     pfn::free_page(frame2);
 
-    // identity: VA conhecida traduz para o mesmo físico
-    assert(paging::translate(0x100000) == 0x100000, "identity map traduz");
+    // a imagem do kernel na ImageBase traduz para os frames que o stage2
+    // carregou; a metade de usuário não tem identidade
+    assert(paging::translate(memory_map::KERNEL_VIRTUAL_BASE + 0x1000) == memory_map::KERNEL_IMAGE_PHYS + 0x1000, "imagem do kernel na ImageBase");
+    assert(paging::translate(memory_map::KERNEL_IMAGE_PHYS) == 0 && paging::translate(memory_map::AP_TRAMPOLINE_PHYS) == 0, "sem identidade baixa");
 
     // VirtualAlloc: VA nova -> frame físico distinto, dados fluem pela tabela
     let va = virtual_memory::alloc(4096);
@@ -107,7 +109,7 @@ pub fn run() {
     // imagem do kernel e dados exportados
     assert(kernel_data::read("MmUserProbeAddress") == memory_map::USER_ADDRESS_LIMIT, "MmUserProbeAddress");
     let kernel_va = memory_map::KERNEL_VIRTUAL_BASE + 0x1000;
-    assert(guest_memory::read32(kernel_va) == physical::read32(0x101000), "alias virtual do kernel");
+    assert(guest_memory::read32(kernel_va) == physical::read32(memory_map::KERNEL_IMAGE_PHYS + 0x1000), "imagem do kernel sobre os frames de boot");
     let block = guest_memory::alloc_bytes(100);
     assert(block != 0 && guest_memory::owns_allocation(block), "arena de convidado");
     guest_memory::free_bytes(block);
@@ -130,7 +132,7 @@ pub fn run() {
     assert(independent != 0 && paging::translate(independent + 4096) != 0, "paginas independentes");
     assert(independent_pages::free(independent).is_ok() && independent_pages::count() == 0, "free independente");
 
-    // DPC: rotina nativa (ABI MS x64) chamada pela ponte no alias do kernel
+    // DPC: rotina nativa (ABI MS x64) chamada pela ponte MS-ABI do kernel
     let dpc = guest_memory::alloc_bytes(0x40);
     dpc::initialize_dpc(dpc, dpc_test_routine as extern "win64" fn(u64, u64, u64, u64) as usize as u64, 0x55);
     assert(dpc::insert_queue_dpc(dpc, 2, 3), "KeInsertQueueDpc");

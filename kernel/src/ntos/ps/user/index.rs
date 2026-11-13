@@ -79,7 +79,7 @@ pub fn init() -> Result<(), KernelError> {
     if !paging::map_page(KUSER_SHARED_DATA_USER_VA, shared, paging::PAGE_PRESENT | paging::PAGE_USER, paging::MapOptions::default()) {
         return Err(KernelError::new("mapPage falhou p/ KUSER_SHARED_DATA de usuario"));
     }
-    crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha de syscall em {:#x}, KUSER user em 0x7FFE0000", gdt, base);
+    crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha de syscall ate {:#x}, KUSER user em 0x7FFE0000", gdt, top);
     registry::seed_registry_for_user_mode()?;
     let initializers = *LATE_INITIALIZERS.lock();
     for initializer in initializers.into_iter().flatten() {

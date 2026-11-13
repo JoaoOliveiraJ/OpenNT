@@ -827,8 +827,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                             if id >= count {
                                 return Err(KernelError::new(alloc::format!("apiId {id} alem da tabela de trampolins ({count})")));
                             }
-                            let physical_thunk = table + id as u64 * STUB_SIZE;
-                            let address = if id >= 32 { kernel_address::virtual_address(physical_thunk)? } else { physical_thunk };
+                            let address = kernel_address::image_address(table + id as u64 * STUB_SIZE)?;
                             mapping.write64(iat, address);
                             resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: false });
                         }

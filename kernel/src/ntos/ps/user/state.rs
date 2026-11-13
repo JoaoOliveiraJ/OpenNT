@@ -40,7 +40,7 @@ pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
 /// 64 KiB de pilha de kernel para o ring 3.
 pub const SYSCALL_STACK_PAGES: u64 = 16;
-/// PML4[1], fora da identidade baixa.
+/// PML4[1].
 pub const USER_STACK_TOP: u64 = 0x80_0000_0000;
 pub const USER_STACK_SIZE: u64 = 0x10_0000;
 /// O endereço real de usuário da KUSER_SHARED_DATA.

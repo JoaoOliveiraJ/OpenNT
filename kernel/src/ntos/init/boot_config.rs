@@ -22,9 +22,5 @@ pub const START_DRIVER: &str = or_default(option_env!("OPENNT_START_DRIVER"), ""
 /// `--start-driver` enquanto ele inicia.
 pub const TRACE_DRIVER_API: bool = option_env!("OPENNT_TRACE_DRIVER_API").is_some();
 
-/// `--identity-audit`: no boot, desliga o PRESENT da identidade baixa sobre o
-/// que só é alcançado por endereço físico (`ntos::mm::identity_audit`).
-pub const IDENTITY_AUDIT: bool = option_env!("OPENNT_IDENTITY_AUDIT").is_some();
-
 /// `--console-mirror`: espelha o texto do console na serial.
 pub const CONSOLE_SERIAL_MIRROR: bool = option_env!("OPENNT_CONSOLE_MIRROR").is_some();

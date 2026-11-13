@@ -9,9 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::paging::{self, MapOptions};
 use super::{kernel_address, memory_map as map};
-use crate::hal::amd64::native_call;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::NtStruct;
@@ -61,7 +59,6 @@ struct Registry {
     /// Imagens donas de mapeamento (inclusive as ocultas).
     owned: BTreeMap<u64, (LoadedImage, Option<fn(u64)>)>,
     kernel: Option<u64>,
-    bootstrap: Option<u64>,
     unload_observers: Vec<fn(&LoadedImage)>,
     list_head: u64,
     native_entries: BTreeMap<u64, NativeEntry>,
@@ -72,7 +69,6 @@ static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     images: Vec::new(),
     owned: BTreeMap::new(),
     kernel: None,
-    bootstrap: None,
     unload_observers: Vec::new(),
     list_head: 0,
     native_entries: BTreeMap::new(),
@@ -117,7 +113,7 @@ fn create_native_entry(image: &LoadedImage) -> Result<NativeEntry, KernelError> 
 
 impl Registry {
     fn enumerated(&self) -> Vec<LoadedImage> {
-        self.images.iter().filter(|image| Some(image.id) != self.bootstrap).cloned().collect()
+        self.images.clone()
     }
 
     /// A preparação termina antes de mudar a lista; uma falta de memória
@@ -204,7 +200,7 @@ pub fn unregister(id: u64) -> Result<bool, KernelError> {
     let image;
     {
         let mut registry = REGISTRY.lock();
-        if Some(id) == registry.kernel || Some(id) == registry.bootstrap {
+        if Some(id) == registry.kernel {
             return Err(KernelError::new("cannot unload the running kernel"));
         }
         let Some((removed, release_paging)) = registry.owned.remove(&id) else { return Ok(false) };
@@ -226,7 +222,7 @@ pub fn unregister(id: u64) -> Result<bool, KernelError> {
 /// Some da enumeração sem liberar o mapeamento (vistas de diagnóstico).
 pub fn hide(id: u64) -> Result<bool, KernelError> {
     let mut registry = REGISTRY.lock();
-    if Some(id) == registry.kernel || Some(id) == registry.bootstrap {
+    if Some(id) == registry.kernel {
         return Err(KernelError::new("cannot hide the running kernel"));
     }
     let before = registry.images.len();
@@ -252,7 +248,7 @@ pub fn find(address: u64) -> Option<LoadedImage> {
         .cloned()
 }
 
-/// Aliases nomeiam a mesma imagem; o kernel é enumerado uma vez.
+/// As imagens na ordem de registro, que é a de enumeração.
 pub fn list() -> Vec<LoadedImage> {
     REGISTRY.lock().enumerated()
 }
@@ -281,24 +277,22 @@ pub fn native_list() -> Result<(u64, Vec<(LoadedImage, u64)>), KernelError> {
     Ok((registry.list_head, entries))
 }
 
-/// Mapeamento supervisor adicional da imagem de boot em KERNEL_VIRTUAL_BASE
-/// e registro do `ntoskrnl.exe`.
+/// Registro do `ntoskrnl.exe` na sua ImageBase: o stage2 já mapeou a imagem
+/// ali e o kernel executa nessa VA, então a base e o tamanho publicados são
+/// os do PE em execução.
 pub fn init_kernel() -> Result<LoadedImage, KernelError> {
     if let Some(kernel) = kernel() {
         return Ok(kernel);
     }
-    let base = map::KERNEL_IMAGE_BASE;
-    // Os cabeçalhos são lidos pelo endereço físico da imagem carregada pelo
-    // stage2, através do mapa direto.
-    let headers = crate::hal::physical::range_to_virtual(base, 0x1000);
-    // SAFETY: a imagem do kernel em execução, alinhada à página.
-    let dos = unsafe { ImageDosHeader::at(headers) };
+    let base = map::KERNEL_VIRTUAL_BASE;
+    // SAFETY: os cabeçalhos da imagem em execução, alinhados à página.
+    let dos = unsafe { ImageDosHeader::at(base) };
     let pe = dos.e_lfanew.get() as u32 as u64;
     // Campo dos cabeçalhos NT: o e_lfanew não garante o alinhamento natural
     // da estrutura inteira, então cada leitura é um MOV no endereço do campo.
     macro_rules! nt {
         ($($field:tt)+) => {
-            guest::read(headers + pe + core::mem::offset_of!(ImageNtHeaders64, $($field)+) as u64)
+            guest::read(base + pe + core::mem::offset_of!(ImageNtHeaders64, $($field)+) as u64)
         };
     }
     let signature: u32 = nt!(signature);
@@ -311,48 +305,30 @@ pub fn init_kernel() -> Result<LoadedImage, KernelError> {
     let entry_point: u32 = nt!(optional_header.address_of_entry_point);
     let (size, entry_rva) = (size_of_image as u64, entry_point as u64);
     let image_base: u64 = nt!(optional_header.image_base);
+    let running = init_kernel as fn() -> Result<LoadedImage, KernelError> as usize as u64;
     if image_base != base
         || size < 0x2000
         || size > map::KERNEL_IMAGE_MAX
         || size % 4096 != 0
         || entry_rva < 4096
         || entry_rva >= size
+        || running < base
+        || running >= base + size
     {
         return Err(KernelError::new("running kernel PE range disagrees with boot layout"));
     }
-    let mut mapped = Vec::new();
-    for offset in (0..size).step_by(4096) {
-        let page = map::KERNEL_VIRTUAL_BASE + offset;
-        if !paging::map_page(page, base + offset, paging::PAGE_PRESENT | paging::PAGE_RW, MapOptions::default()) {
-            for &page in &mapped {
-                paging::unmap_page(page, MapOptions::default());
-            }
-            return Err(KernelError::new("cannot map native kernel image"));
-        }
-        mapped.push(page);
-    }
-    // A ponte nativa passa a executar no alias publicado aos módulos nativos.
-    native_call::publish_native_kernel_mapping(base, map::KERNEL_VIRTUAL_BASE, size);
-    let bootstrap = register(
-        ImageDescription { image_base: base, size_of_image: size, entry_point: base + entry_rva, ..Default::default() },
-        "ntoskrnl.exe (bootstrap mapping)",
-    )?;
     let kernel = register(
         ImageDescription {
-            image_base: map::KERNEL_VIRTUAL_BASE,
+            image_base: base,
             size_of_image: size,
-            entry_point: map::KERNEL_VIRTUAL_BASE + entry_rva,
+            entry_point: base + entry_rva,
             checksum: nt!(optional_header.check_sum),
             time_date_stamp: nt!(file_header.time_date_stamp),
             ..Default::default()
         },
         "\\SystemRoot\\System32\\ntoskrnl.exe",
     )?;
-    {
-        let mut registry = REGISTRY.lock();
-        registry.bootstrap = Some(bootstrap.id);
-        registry.kernel = Some(kernel.id);
-    }
+    REGISTRY.lock().kernel = Some(kernel.id);
     kernel_address::publish(size);
     debug_print!("[mm] kernel PE registrado: base={:#x} size={:#x}", kernel.image_base, size);
     Ok(kernel)

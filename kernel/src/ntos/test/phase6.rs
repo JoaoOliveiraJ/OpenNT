@@ -380,7 +380,7 @@ fn ntoskrnl_exports(assert: Assert) {
     let base = image.image_base;
     let iat = |slot: u64| guest::read64(base + 0x4200 + slot * 8);
     let (table, count) = win32_thunk::thunk_table();
-    let thunk = |id: u64| kernel_address::virtual_address(table + id * win32_thunk::STUB_SIZE).unwrap_or(0);
+    let thunk = |id: u64| kernel_address::image_address(table + id * win32_thunk::STUB_SIZE).unwrap_or(0);
     assert(count == win32_thunk::MAX_WIN32 && 32 + abi_names::EXPORT_NAMES.len() as u32 <= count && iat(0) == thunk(32 + 652) && iat(1) == thunk(32 + 546) && iat(0) != 0 && image.resolved_imports.len() == 5, "ntoskrnl: IAT recebe os trampolins dos ids");
     // Chamadas reais pelos trampolins (ABI MS x64 -> despachante Rust).
     let thread = guest::alloc_bytes(nt::Ethread::SIZE);
@@ -403,7 +403,7 @@ pub(super) fn call_export(name: &str, arguments: &[u64]) -> Option<u64> {
     use crate::ntos::mm::pe_loader::ResolvedImport;
     let Some(ResolvedImport::Thunk(id)) = exports::lookup("ntoskrnl.exe", name) else { return None };
     let (table, _) = win32_thunk::thunk_table();
-    let address = crate::ntos::mm::kernel_address::virtual_address(table + id as u64 * win32_thunk::STUB_SIZE).ok()?;
+    let address = crate::ntos::mm::kernel_address::image_address(table + id as u64 * win32_thunk::STUB_SIZE).ok()?;
     Some(native_call::call(address, arguments))
 }
 
@@ -446,8 +446,8 @@ fn ntoskrnl_small_groups(assert: Assert) {
     // normaliza os comprimentos USHORT e executa o serviço 2 do int 0x2D.
     let entry = crate::hal::amd64::private_entries::entry("dbg_prompt").unwrap_or(0);
     let resolved = crate::ntos::init::exports::lookup("ntoskrnl.exe", "DbgPrompt");
-    let published = matches!(resolved, Some(crate::ntos::mm::pe_loader::ResolvedImport::Address { address, .. }) if entry != 0 && crate::ntos::mm::kernel_address::virtual_address(entry).ok() == Some(address));
-    let body = crate::hal::physical::read_bytes(entry, 48);
+    let published = matches!(resolved, Some(crate::ntos::mm::pe_loader::ResolvedImport::Address { address, .. }) if entry != 0 && crate::ntos::mm::kernel_address::image_address(entry).ok() == Some(address));
+    let body = crate::hal::volatile::read_bytes(entry, 48);
     let service = body.windows(9).any(|window| window == [0xB8, 2, 0, 0, 0, 0xCD, 0x2D, 0xCC, 0xC3]);
     assert(published && service && body.starts_with(&[0x45, 0x89, 0xC1, 0x49, 0x89, 0xD0, 0x31, 0xD2]), "ntoskrnl: DbgPrompt publica o corpo nativo do servico de depuracao");
 }
@@ -2944,7 +2944,7 @@ fn generic_call_routine() -> u64 {
         call_export("KeSignalCallDpcDone", &[done]);
     }
     let pointer = routine as extern "win64" fn(u64, u64, u64, u64) as usize as u64;
-    crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer)
+    crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer)
 }
 
 extern "win64" fn table_compare(_table: u64, first: u64, second: u64) -> u32 {
@@ -2973,7 +2973,7 @@ fn avl_height(node: u64) -> Option<i32> {
 
 /// RTL_GENERIC_TABLE (splay) e RTL_AVL_TABLE com rotinas nativas do chamador.
 fn rtl_generic_tables(assert: Assert) {
-    let native = |pointer: u64| crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer);
+    let native = |pointer: u64| crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer);
     let compare = native(table_compare as extern "win64" fn(u64, u64, u64) -> u32 as usize as u64);
     let allocate = native(table_allocate as extern "win64" fn(u64, u32) -> u64 as usize as u64);
     let free = native(table_free as extern "win64" fn(u64, u64) as usize as u64);
@@ -3911,7 +3911,7 @@ fn hal_dispatch_table_exports(assert: Assert) {
         Some(ResolvedImport::Address { address, .. }) => address,
         _ => 0,
     };
-    let stub = private_entries::entry("hal_default_not_supported").and_then(|entry| crate::ntos::mm::kernel_address::virtual_address(entry).ok()).unwrap_or(0);
+    let stub = private_entries::entry("hal_default_not_supported").and_then(|entry| crate::ntos::mm::kernel_address::image_address(entry).ok()).unwrap_or(0);
     let slots_ok = stub != 0 && (0..public_dispatch::SLOT_COUNT as u64).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
     assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok, "hal: HalDispatchTable publicada (versao 4, slots no stub seguro)");
     assert(native_call::call(at::<nt::HalDispatch>(table).hal_query_system_information.get(), &[0, 0, 0, 0]) == 0xC000_00BB, "hal: HalQuerySystemInformation (slot 1) devolve STATUS_NOT_SUPPORTED");
@@ -5949,7 +5949,7 @@ fn cc_copy_exports(assert: Assert) {
     assert(call_export("CcCanIWrite", &[f.file, 0x1000, 0, 0]) == Some(1) && call_export("CcCopyWriteWontFlush", &[f.file, offset, 0x1000]) == Some(1) && call_export("CcCopyWriteWontFlush", &[f.file, offset, 0x100_0000]) == Some(0), "cc-copy: CcCanIWrite e CcCopyWriteWontFlush abaixo do limite");
     POSTED.store(0, Ordering::SeqCst);
     let routine = post as extern "win64" fn(u64, u64) as usize as u64;
-    let routine = crate::ntos::mm::kernel_address::virtual_address(routine).unwrap_or(routine);
+    let routine = crate::ntos::mm::kernel_address::image_address(routine).unwrap_or(routine);
     let _ = call_export("CcDeferWrite", &[f.file, routine, 0x1234_0000, 0x5678, 0x1000, 0]);
     assert(POSTED.load(Ordering::SeqCst) == 0x1234_5678, "cc-copy: CcDeferWrite posta na hora quando pode escrever");
     // O último CcUninitializeCacheMap grava as quatro páginas sujas.
@@ -6196,7 +6196,7 @@ fn cc_log_exports(assert: Assert) {
         let value = |address: u64| unsafe { nt::LargeInteger::at(address) }.quad_part.get() as u64;
         DIRTY_SEEN.store(if ok { value(offset) ^ (value(oldest) << 32) ^ (value(newest) << 48) } else { u64::MAX }, Ordering::SeqCst);
     }
-    let address = |routine: u64| crate::ntos::mm::kernel_address::virtual_address(routine).unwrap_or(routine);
+    let address = |routine: u64| crate::ntos::mm::kernel_address::image_address(routine).unwrap_or(routine);
     let Some(f) = fixture::create(0x5_0000) else {
         assert(false, "cc-log: fixture");
         return;
@@ -7709,7 +7709,7 @@ fn fsrtl_per_file_teardown_exports(assert: Assert) {
         return;
     };
     let (table, _) = win32_thunk::thunk_table();
-    let callback = crate::ntos::mm::kernel_address::virtual_address(table + id as u64 * win32_thunk::STUB_SIZE).unwrap_or(0);
+    let callback = crate::ntos::mm::kernel_address::image_address(table + id as u64 * win32_thunk::STUB_SIZE).unwrap_or(0);
 
     let support_address = guest::alloc_bytes(8);
     let support = at::<nt::Field<u64>>(support_address);
@@ -8109,7 +8109,7 @@ fn fsrtl_volume_support_exports(assert: Assert) {
     }
     let callback = {
         let pointer = free_context as extern "win64" fn(u64) as usize as u64;
-        crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer)
+        crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer)
     };
     let header_address = guest::alloc_bytes(FsrtlAdvancedFcbHeader::SIZE);
     let context_address = guest::alloc_bytes(FsrtlPerStreamContext::SIZE);
@@ -8419,7 +8419,7 @@ fn io_file_system_exports(assert: Assert) {
     }
     let routine = {
         let pointer = notification as extern "win64" fn(u64, u64) as usize as u64;
-        crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer)
+        crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer)
     };
     // DRIVER_OBJECT/DEVICE_OBJECT sintéticos: MajorFunction vazio (IRPs voltam
     // NOT_SUPPORTED), DriverInit não nulo (FsRtlSetDriverBacking aceita).
@@ -10082,7 +10082,7 @@ fn hvi_hardware_exports(assert: Assert) {
 
 
 fn ke_processors_exports(assert: Assert) {
-    let native = |pointer: u64| crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer);
+    let native = |pointer: u64| crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer);
     let online = crate::ntos::ke::smp::online_cpu_count() as u64;
     let active_mask = if online >= 64 { u64::MAX } else { (1u64 << online) - 1 };
 
@@ -10255,7 +10255,7 @@ fn ke_processors_exports(assert: Assert) {
 
 
 fn ke_kernel_stacks_exports(assert: Assert) {
-    let native = |pointer: u64| crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer);
+    let native = |pointer: u64| crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer);
     let thread = at::<nt::Kthread>(crate::ntos::ps::process::get_current_thread());
 
     // KeSetKernelStackSwapEnable: devolve o EnableStackSwap anterior de ThreadFlags.
@@ -11278,6 +11278,7 @@ pub fn run(assert: Assert) {
     whea_error_source_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
+    super::user_half::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

@@ -292,7 +292,7 @@ pub const ACQUIRE_RUNDOWN_ID: u64 = 277;
 pub const ENUM_HANDLES_ID: u64 = 709;
 pub const RELEASE_RUNDOWN_ID: u64 = 278;
 
-/// Endereço físico (identidade) de um símbolo privado ou corpo nativo.
+/// Endereço (VA na imagem do kernel) de um símbolo privado ou corpo nativo.
 pub fn entry(symbol: &str) -> Option<u64> {
     let address = {
         match symbol {

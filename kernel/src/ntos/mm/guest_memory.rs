@@ -15,22 +15,20 @@
 //!   APs carregam o CR3 do BSP e a anexação de processo recusa qualquer
 //!   DirectoryTableBase diferente e só recarrega o mesmo CR3. Quando o
 //!   kernel toca um buffer de modo usuário, o CR3 ativo é sempre esse: a
-//!   VA de usuário (inclusive a janela do VirtualAlloc, 0x10000000-0x1FFFFFFF,
-//!   remapeada para frames do PFN) é desreferenciável direto.
+//!   VA de usuário é desreferenciável direto.
 //! - **Proteção.** CR0.WP=1 em todas as CPUs (escritas de supervisor
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
-//! - **Abaixo de 4GB** o stage2 ainda mapeia identidade com páginas de 2MB
-//!   RW de supervisor, usada só pela imagem do kernel, pela pilha de boot,
-//!   pela janela do VirtualAlloc de kernel e pelo código do trampolim dos
-//!   APs. A mesma faixa física aparece no mapa direto (`DIRECT_MAP_BASE + PA`,
-//!   supervisor e NX): todo acesso por endereço físico (PTEs, descritores de
-//!   PFN, células de baixo nível) passa por ele, nunca pela identidade.
-//! - **Acima de 4GB** (heap do kernel e esta arena na janela do heap
-//!   0xFFFFC000..., não pagináveis; imagens de usuário, imagens de kernel na
-//!   janela de sistema 0xFFFFF801..., pool executivo 0xFFFFA000..., PCR
-//!   0xFFFFF800..., banco de PFNs, visões de sistema, memória
-//!   contígua/independente e o alias RW da imagem do kernel em
-//!   `KERNEL_VIRTUAL_BASE`) tudo está nas mesmas tabelas de páginas.
+//! - **Metade de usuário** (PML4[0..256)): só páginas de usuário (imagens,
+//!   pilhas, TEB/PEB, seções, a visão de usuário da KUSER_SHARED_DATA). Não
+//!   há identidade: a memória física aparece no mapa direto
+//!   (`DIRECT_MAP_BASE + PA`, supervisor e NX), e todo acesso por endereço
+//!   físico (PTEs, descritores de PFN, células de baixo nível) passa por ele.
+//! - **Metade de sistema** (a imagem do kernel e a pilha de boot em
+//!   `KERNEL_VIRTUAL_BASE` 0xFFFFF800_40000000..., o heap do kernel e esta
+//!   arena na janela do heap 0xFFFFC000..., não pagináveis; imagens de
+//!   kernel na janela de sistema 0xFFFFF801..., pool executivo
+//!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
+//!   memória contígua/independente): tudo nas mesmas tabelas de páginas.
 //! - **Páginas pagináveis** (imagens de drivers, pool paginado, visões de
 //!   seção de sistema, cópia na escrita de seções) têm PTE ausente quando
 //!   despejadas. Os provedores ficam em `page_residency`; `fault` recusa IRQL
