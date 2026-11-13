@@ -390,3 +390,88 @@ pub mod locally_unique_id {
 
     pub static GROUP: Group = Group { name: "locally-unique-id", names: &["ZwAllocateLocallyUniqueId"], handlers: &[allocate], data_exports: &[] };
 }
+
+pub mod se_descriptor {
+    //! Captura, validação e liberação de SECURITY_DESCRIPTOR que drivers reais
+    //! de FS, armazenamento e rede importam. Reusa o `se/descriptor.rs`; a
+    //! captura devolve sempre uma cópia self-relative na arena do convidado.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::se::descriptor;
+    use crate::rtl::KernelError;
+
+    const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+    const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+    const SELF_RELATIVE: u16 = 0x8000;
+
+    /// SeCaptureSecurityDescriptor: devolve em `*arg5` uma cópia self-relative
+    /// do descritor (ou NULL se a entrada for NULL), validando antes de copiar.
+    fn capture(call: &Call) -> Result<u64, KernelError> {
+        let (input, output) = (call.arg(1), call.arg(5));
+        if input == 0 {
+            guest::write64(output, 0);
+            return Ok(0);
+        }
+        if !descriptor::valid(input) {
+            return Ok(signed_status(STATUS_INVALID_SECURITY_DESCR));
+        }
+        let length = descriptor::length(input) as u64;
+        let captured = guest::alloc_bytes(length);
+        if guest::read16(input + 2) & SELF_RELATIVE != 0 {
+            for offset in 0..length {
+                guest::write8(captured + offset, guest::read8(input + offset));
+            }
+        } else {
+            let capacity = guest::alloc_bytes(4);
+            guest::write32(capacity, length as u32);
+            let status = descriptor::absolute_to_relative(input, captured, capacity);
+            guest::free_bytes(capacity);
+            if status != 0 {
+                guest::free_bytes(captured);
+                return Ok(signed_status(status));
+            }
+        }
+        guest::write64(output, captured);
+        Ok(0)
+    }
+
+    /// SeReleaseSecurityDescriptor: libera a cópia feita pela captura.
+    fn release(call: &Call) -> Result<u64, KernelError> {
+        if call.arg(1) != 0 {
+            guest::free_bytes(call.arg(1));
+        }
+        Ok(0)
+    }
+
+    /// SeDeassignSecurity: libera `*arg1` e zera o ponteiro.
+    fn deassign(call: &Call) -> Result<u64, KernelError> {
+        let pointer = guest::read64(call.arg(1));
+        if pointer != 0 {
+            guest::free_bytes(pointer);
+        }
+        guest::write64(call.arg(1), 0);
+        Ok(0)
+    }
+
+    /// SeValidSecurityDescriptor(Length, Sd): valida um SD self-relative.
+    fn valid(call: &Call) -> Result<u64, KernelError> {
+        Ok(descriptor::valid_relative(call.arg(2), call.arg(1) as u32, 0) as u64)
+    }
+
+    /// SeConvertStringSecurityDescriptorToSecurityDescriptor: sem parser SDDL
+    /// nesta plataforma; devolve STATUS_NOT_IMPLEMENTED de forma honesta.
+    fn convert_string(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_NOT_IMPLEMENTED))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-descriptor",
+        names: &[
+            "SeCaptureSecurityDescriptor", "SeReleaseSecurityDescriptor", "SeValidSecurityDescriptor",
+            "SeDeassignSecurity", "SeConvertStringSecurityDescriptorToSecurityDescriptor",
+        ],
+        handlers: &[capture, release, valid, deassign, convert_string],
+        data_exports: &[],
+    };
+}

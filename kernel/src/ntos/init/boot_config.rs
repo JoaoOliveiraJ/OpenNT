@@ -25,3 +25,7 @@ pub const TRACE_DRIVER_API: bool = option_env!("OPENNT_TRACE_DRIVER_API").is_som
 
 /// `--console-mirror`: espelha o texto do console na serial.
 pub const CONSOLE_SERIAL_MIRROR: bool = option_env!("OPENNT_CONSOLE_MIRROR").is_some();
+
+/// `--graphics`: faz o mode-set do framebuffer linear (DISPI) e desenha o
+/// Stage 1 gráfico na fase 1. Por padrão o boot continua em modo texto.
+pub const GRAPHICS: bool = option_env!("OPENNT_GRAPHICS").is_some();

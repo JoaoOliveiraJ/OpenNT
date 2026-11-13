@@ -183,3 +183,93 @@ pub fn valid_relative(descriptor: u64, size: u32, required: u32) -> bool {
     }
     true
 }
+
+// ---- construção e escrita (RtlCreate/Set*SecurityDescriptor) ----------------
+
+const OWNER_DEFAULTED: u16 = 0x0001;
+const DACL_DEFAULTED: u16 = 0x0008;
+const SACL_DEFAULTED: u16 = 0x0020;
+const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058;
+const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+
+fn set_control(descriptor: u64, control: u16) {
+    guest::write16(descriptor.wrapping_add(2), control);
+}
+
+/// RtlCreateSecurityDescriptor: zera o descritor absoluto de 0x28 bytes e
+/// grava a revisão 1; só a revisão 1 é aceita.
+pub fn create(descriptor: u64, revision: u32) -> u32 {
+    if revision != 1 {
+        return STATUS_UNKNOWN_REVISION;
+    }
+    guest::write_bytes(descriptor, &[0u8; 0x28]);
+    guest::write8(descriptor, 1);
+    0
+}
+
+/// Revisão 1 e descritor absoluto (não self-relative) para as escritas.
+fn writable(descriptor: u64) -> Option<u32> {
+    if guest::read8(descriptor) != 1 {
+        Some(STATUS_UNKNOWN_REVISION)
+    } else if control(descriptor) & SELF_RELATIVE != 0 {
+        Some(STATUS_INVALID_SECURITY_DESCR)
+    } else {
+        None
+    }
+}
+
+/// RtlSetDaclSecurityDescriptor.
+pub fn set_dacl(descriptor: u64, present: bool, dacl: u64, defaulted: bool) -> u32 {
+    if let Some(status) = writable(descriptor) {
+        return status;
+    }
+    let mut value = control(descriptor);
+    if !present {
+        value &= !DACL_PRESENT;
+        set_control(descriptor, value);
+        return 0;
+    }
+    value |= DACL_PRESENT;
+    guest::write64(descriptor.wrapping_add(0x20), dacl);
+    value &= !DACL_DEFAULTED;
+    if defaulted {
+        value |= DACL_DEFAULTED;
+    }
+    set_control(descriptor, value);
+    0
+}
+
+/// RtlSetSaclSecurityDescriptor.
+pub fn set_sacl(descriptor: u64, present: bool, sacl: u64, defaulted: bool) -> u32 {
+    if let Some(status) = writable(descriptor) {
+        return status;
+    }
+    let mut value = control(descriptor);
+    if !present {
+        value &= !SACL_PRESENT;
+        set_control(descriptor, value);
+        return 0;
+    }
+    value |= SACL_PRESENT;
+    guest::write64(descriptor.wrapping_add(0x18), sacl);
+    value &= !SACL_DEFAULTED;
+    if defaulted {
+        value |= SACL_DEFAULTED;
+    }
+    set_control(descriptor, value);
+    0
+}
+
+/// RtlSetOwnerSecurityDescriptor (não há bit "present" para o proprietário).
+pub fn set_owner(descriptor: u64, owner: u64, defaulted: bool) -> u32 {
+    if let Some(status) = writable(descriptor) {
+        return status;
+    }
+    guest::write64(descriptor.wrapping_add(0x08), owner);
+    let mut value = control(descriptor) & !OWNER_DEFAULTED;
+    if defaulted {
+        value |= OWNER_DEFAULTED;
+    }
+    set_control(descriptor, value);
+    0
+}

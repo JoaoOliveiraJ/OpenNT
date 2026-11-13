@@ -238,6 +238,10 @@ impl super::volume::FileSystem for Ntfs {
         Ntfs::list(self, "/").ok().flatten().unwrap_or_default()
     }
 
+    fn list_directory(&self, path: &str) -> Vec<String> {
+        Ntfs::list(self, path).ok().flatten().unwrap_or_default()
+    }
+
     fn writable(&self) -> bool {
         true
     }

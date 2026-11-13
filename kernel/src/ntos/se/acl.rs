@@ -148,3 +148,83 @@ pub fn valid(pointer: u64) -> bool {
     }
     true
 }
+
+// ---- construção (RtlCreateAcl / RtlAddAccessAllowedAce[Ex]) -----------------
+
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_REVISION_MISMATCH: u32 = 0xC000_0059;
+const STATUS_INVALID_ACL: u32 = 0xC000_0077;
+const STATUS_INVALID_SID: u32 = 0xC000_0078;
+const STATUS_ALLOTTED_SPACE_EXCEEDED: u32 = 0xC000_0099;
+
+/// RtlCreateAcl: zera o buffer e grava o cabeçalho ACL vazio.
+pub fn create(acl: u64, length: u32, revision: u32) -> u32 {
+    if length < 8 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if revision.wrapping_sub(2) > 2 || length > 0xFFFC {
+        return STATUS_INVALID_PARAMETER;
+    }
+    for offset in 0..length as u64 {
+        guest::write8(acl.wrapping_add(offset), 0);
+    }
+    guest::write8(acl, revision as u8);
+    guest::write8(acl.wrapping_add(1), 0);
+    guest::write16(acl.wrapping_add(2), (length & 0xFFFC) as u16);
+    guest::write32(acl.wrapping_add(4), 0);
+    0
+}
+
+/// RtlpAddKnownAce: acrescenta uma ACE (tipo `ace_type`) ao fim da ACL.
+pub fn add_known_ace(acl: u64, ace_revision: u32, ace_flags: u32, mask: u32, sid: u64, ace_type: u8) -> u32 {
+    // O NT rejeita aqui um Sid em VA de usuário (ponteiro de modo usuário numa
+    // API de kernel); no OpenNT as estruturas do convidado moram na arena, que
+    // é baixa, então basta validar a revisão do SID.
+    if sid == 0 || guest::read8(sid) & 0xF != 1 {
+        return STATUS_INVALID_SID;
+    }
+    let sub_authority_count = guest::read8(sid.wrapping_add(1)) as u32;
+    if sub_authority_count > 15 {
+        return STATUS_INVALID_SID;
+    }
+    let acl_revision = guest::read8(acl) as u32;
+    if acl_revision > 4 || ace_revision > 4 {
+        return STATUS_REVISION_MISMATCH;
+    }
+    if ace_flags & !0x1F != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !valid(acl) {
+        return STATUS_INVALID_ACL;
+    }
+    let acl_size = guest::read16(acl.wrapping_add(2)) as u64;
+    let ace_count = guest::read16(acl.wrapping_add(4)) as u32;
+    let end = acl.wrapping_add(acl_size);
+    let mut cursor = acl.wrapping_add(8);
+    for _ in 0..ace_count {
+        if cursor >= end {
+            return STATUS_INVALID_ACL;
+        }
+        let size = guest::read16(cursor.wrapping_add(2)) as u64;
+        if size == 0 || cursor.wrapping_add(size) > end {
+            return STATUS_INVALID_ACL;
+        }
+        cursor = cursor.wrapping_add(size);
+    }
+    let sid_length = 8 + sub_authority_count * 4;
+    let ace_size = 8 + sid_length as u64;
+    if cursor.wrapping_add(ace_size) > end {
+        return STATUS_ALLOTTED_SPACE_EXCEEDED;
+    }
+    guest::write8(cursor, ace_type);
+    guest::write8(cursor.wrapping_add(1), ace_flags as u8);
+    guest::write16(cursor.wrapping_add(2), ace_size as u16);
+    guest::write32(cursor.wrapping_add(4), mask);
+    for offset in 0..sid_length as u64 {
+        guest::write8(cursor.wrapping_add(8 + offset), guest::read8(sid.wrapping_add(offset)));
+    }
+    guest::write16(acl.wrapping_add(4), (ace_count + 1) as u16);
+    guest::write8(acl, acl_revision.max(ace_revision) as u8);
+    0
+}

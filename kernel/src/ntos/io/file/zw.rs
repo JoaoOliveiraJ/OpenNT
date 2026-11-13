@@ -536,36 +536,59 @@ pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32)
 /// com posição de listagem por handle e filtro de nome exato.
 #[allow(clippy::too_many_arguments)]
 pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32, single: bool, file_name: u64, restart: bool) -> u32 {
-    if class != 1 {
+    if class != 1 && class != 38 {
         return STATUS_INVALID_PARAMETER;
     }
+    // FileDirectoryInformation (1) poe o nome do arquivo em +0x40; a
+    // FileIdFullDirectoryInformation (38), que a ci.dll usa para varrer o
+    // CatRoot atras dos catalogos, o poe em +0x50 (apos EaSize e FileId).
+    let name_offset: u64 = if class == 38 { 0x50 } else { 0x40 };
     let key = (handle as u32) & !3;
     let Some(entry) = FILE_HANDLES.lock().get(&key).cloned() else { return STATUS_INVALID_HANDLE };
     let Backing::Volume { volume, path } = &entry.backing else { return STATUS_INVALID_HANDLE };
     let mut index = if restart { 0 } else { entry.scan_index.unwrap_or(0) };
     let prefix = if path == "/" { String::from("/") } else { format!("{path}/") };
-    let names: alloc::vec::Vec<String> = volume.list().into_iter().filter(|candidate| candidate.starts_with(&prefix) && !candidate[prefix.len()..].contains('/')).map(|candidate| String::from(&candidate[prefix.len()..])).collect();
+    let names: alloc::vec::Vec<String> = volume.list_directory(path).into_iter().filter(|candidate| candidate.starts_with(&prefix) && !candidate[prefix.len()..].contains('/')).map(|candidate| String::from(&candidate[prefix.len()..])).collect();
+    // Casa um nome contra um padrão DOS (`*` e `?`), sem diferenciar
+    // maiúsculas — a ci.dll enumera os catálogos por `*.cat`, não por nome
+    // exato, então o filtro precisa entender curingas.
+    fn wildcard_match(name: &[char], pattern: &[char]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some('*') => wildcard_match(name, &pattern[1..]) || (!name.is_empty() && wildcard_match(&name[1..], pattern)),
+            Some('?') => !name.is_empty() && wildcard_match(&name[1..], &pattern[1..]),
+            Some(&expected) => !name.is_empty() && name[0] == expected && wildcard_match(&name[1..], &pattern[1..]),
+        }
+    }
     let pattern = if file_name != 0 { Some(guest_strings::read_unicode_string(file_name)) } else { None };
     let matched: alloc::vec::Vec<String> = match &pattern {
-        Some(pattern) if pattern != "*" => names.into_iter().filter(|name| name.to_lowercase() == pattern.to_lowercase()).collect(),
-        _ => names,
+        Some(pattern) => {
+            let lowered: alloc::vec::Vec<char> = pattern.to_lowercase().chars().collect();
+            names.into_iter().filter(|name| wildcard_match(&name.to_lowercase().chars().collect::<alloc::vec::Vec<char>>(), &lowered)).collect()
+        }
+        None => names,
     };
     let mut cursor = buffer;
     let mut previous = 0u64;
     let mut emitted = 0;
     while index < matched.len() {
         let name: alloc::vec::Vec<u16> = matched[index].encode_utf16().collect();
-        let record = 0x40 + name.len() as u64 * 2;
+        let record = name_offset + name.len() as u64 * 2;
         if cursor - buffer + record > length as u64 {
             break;
         }
+        guest::write32(cursor, 0);
         guest::write32(cursor + 4, index as u32);
         guest::write64(cursor + 0x28, volume.size(&format!("{prefix}{}", matched[index])).unwrap_or(0));
         guest::write64(cursor + 0x30, 0);
         guest::write32(cursor + 0x38, 0x80);
         guest::write32(cursor + 0x3C, name.len() as u32 * 2);
+        if class == 38 {
+            guest::write32(cursor + 0x40, 0);
+            guest::write64(cursor + 0x48, index as u64 + 1);
+        }
         for (offset, unit) in name.iter().enumerate() {
-            guest::write16(cursor + 0x40 + offset as u64 * 2, *unit);
+            guest::write16(cursor + name_offset + offset as u64 * 2, *unit);
         }
         if previous != 0 {
             guest::write32(previous, (cursor - previous) as u32);

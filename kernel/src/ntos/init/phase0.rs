@@ -197,6 +197,9 @@ fn seed_services() -> Result<(), crate::rtl::KernelError> {
     // vgk: binário real no volume NTFS (D:\VGK.SYS); o cng.sys carrega como
     // módulo de import. Start=3: iniciado pelo SCM ou por `--start-driver=vgk`.
     seed_service("vgk", "vgk.sys", 3)?;
+    // watchdog.sys: binário real da MS (WDM), dependência do stack de vídeo
+    // (dxgkrnl/BasicDisplay). Start=3: iniciado por `--start-driver=watchdog`.
+    seed_service("watchdog", "watchdog.sys", 3)?;
     seed_service_parameters("i8042prt", &[("KeyboardDataQueueSize", 0x64), ("MouseDataQueueSize", 0x64), ("PollStatusIterations", 0x2000), ("PollingIterations", 0x1900), ("ResendIterations", 3), ("OverrideKeyboardType", 0), ("CrashOnCtrlScroll", 0)])?;
     seed_device_class("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"])?;
     seed_device_class("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])?;

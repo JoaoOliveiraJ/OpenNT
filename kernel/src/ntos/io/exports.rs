@@ -1337,3 +1337,251 @@ pub mod device_control {
 
     pub static GROUP: Group = Group { name: "device-control", names: &["ZwDeviceIoControlFile"], handlers: &[control], data_exports: &[] };
 }
+
+pub mod driver_helpers {
+    //! Auxiliares que vários drivers reais importam e que o OpenNT atende com
+    //! a semântica real do ntoskrnl: referência segura/adiada de objetos, o
+    //! mapeamento genérico do FILE_OBJECT e consultas de energia/boot que não
+    //! se aplicam a esta plataforma.
+
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ob::exports::{dereference_with_tag, reference_with_tag};
+    use crate::ntos::ob::reference_trace::DEFAULT_TAG;
+    use crate::rtl::KernelError;
+
+    /// ObReferenceObjectSafe: TRUE se a referência foi adquirida (objeto vivo).
+    fn reference_object_safe(call: &Call) -> Result<u64, KernelError> {
+        Ok(reference_with_tag(call.arg(1), DEFAULT_TAG, true).is_ok() as u64)
+    }
+    fn reference_object_safe_with_tag(call: &Call) -> Result<u64, KernelError> {
+        Ok(reference_with_tag(call.arg(1), call.arg(2) as u32, true).is_ok() as u64)
+    }
+    /// ObDereferenceObjectDeferDelete: a coleta do OpenNT já é feita fora da
+    /// linha do chamador, então o "defer" não muda nada.
+    fn dereference_object_defer_delete(call: &Call) -> Result<u64, KernelError> {
+        dereference_with_tag(call.arg(1), DEFAULT_TAG, true)?;
+        Ok(0)
+    }
+    fn dereference_object_defer_delete_with_tag(call: &Call) -> Result<u64, KernelError> {
+        dereference_with_tag(call.arg(1), call.arg(2) as u32, true)?;
+        Ok(0)
+    }
+
+    /// IoGetFileObjectGenericMapping: &IopFileMapping (os quatro valores reais).
+    static FILE_MAPPING: AtomicU64 = AtomicU64::new(0);
+    fn get_file_object_generic_mapping(_: &Call) -> Result<u64, KernelError> {
+        let mut pointer = FILE_MAPPING.load(Ordering::Acquire);
+        if pointer == 0 {
+            pointer = guest::alloc_bytes(16);
+            guest::write32(pointer, 0x0012_0089);
+            guest::write32(pointer + 4, 0x0012_0116);
+            guest::write32(pointer + 8, 0x0012_00A0);
+            guest::write32(pointer + 12, 0x001F_01FF);
+            FILE_MAPPING.store(pointer, Ordering::Release);
+        }
+        Ok(pointer)
+    }
+
+    /// Sem estimador de energia, sem soft boot e sem Windows-To-Go aqui.
+    fn energy_estimation_enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+    fn update_component_power(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+    fn is_soft_boot(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+    fn check_portable_operating_system(call: &Call) -> Result<u64, KernelError> {
+        if call.arg(1) != 0 {
+            guest::write8(call.arg(1), 0);
+        }
+        Ok(0)
+    }
+    /// ZwFlushKey: o Registry do OpenNT é em memória; nada a descarregar.
+    fn flush_key(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(0))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "driver-helpers",
+        names: &[
+            "ObReferenceObjectSafe", "ObReferenceObjectSafeWithTag", "ObDereferenceObjectDeferDelete",
+            "ObDereferenceObjectDeferDeleteWithTag", "IoGetFileObjectGenericMapping", "PoEnergyEstimationEnabled",
+            "PsUpdateComponentPower", "ExIsSoftBoot", "RtlCheckPortableOperatingSystem", "ZwFlushKey",
+        ],
+        handlers: &[
+            reference_object_safe, reference_object_safe_with_tag, dereference_object_defer_delete,
+            dereference_object_defer_delete_with_tag, get_file_object_generic_mapping, energy_estimation_enabled,
+            update_component_power, is_soft_boot, check_portable_operating_system, flush_key,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod watchdog_support {
+    //! Exports que o `watchdog.sys` real (e, abaixo dele, todo o stack de
+    //! vídeo) importa do ntoskrnl e que o OpenNT ainda não oferecia: captura de
+    //! contexto, consultas de console/WMI e os Zw que o watchdog usa no início.
+    //! São atendidos com a semântica do NT; onde o subsistema não existe nesta
+    //! plataforma (WMI, hard-error de usuário, depuração de kernel) devolvem o
+    //! status que a inicialização do watchdog tolera, como o próprio Windows.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::file::zw as zw_files;
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::rtl::native_context;
+    use crate::rtl::KernelError;
+
+    /// Tamanho do CONTEXT x64 do Windows e ContextFlags de CONTEXT_FULL.
+    const CONTEXT_SIZE: u64 = 0x4D0;
+    const CONTEXT_FULL: u32 = 0x0010_000B;
+    const STATUS_WMI_GUID_NOT_FOUND: u32 = 0xC000_0295;
+    const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+
+    /// IoRaiseInformationalHardError: sem porta de hard-error de usuário neste
+    /// host; o uso do watchdog é não-fatal, então nenhum popup sobe (FALSE).
+    fn raise_informational_hard_error(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// IoWMIOpenBlock / IoWMIQueryAllData: sem provedor WMI, o GUID não existe
+    /// — a inicialização de WMI do watchdog segue mesmo com essa falha.
+    fn wmi_open_block(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_WMI_GUID_NOT_FOUND))
+    }
+    fn wmi_query_all_data(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_WMI_GUID_NOT_FOUND))
+    }
+
+    /// RtlCaptureContext: copia o CONTEXT nativo ativo (o estado do chamador no
+    /// gateway, isto é, logo após o `call` ao export) para o buffer do
+    /// convidado e fixa ContextFlags = CONTEXT_FULL, como o ntoskrnl.
+    fn capture_context(call: &Call) -> Result<u64, KernelError> {
+        let target = call.arg(1);
+        if target != 0 {
+            if let Ok(source) = native_context::current() {
+                native_context::copy(target, source, CONTEXT_SIZE);
+            }
+            guest::write32(target + 0x30, CONTEXT_FULL);
+        }
+        Ok(0)
+    }
+
+    /// RtlGetActiveConsoleId: a sessão de console ativa é a 0.
+    fn get_active_console_id(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// ZwFlushBuffersFileEx: as escritas do OpenNT já são síncronas; valida o
+    /// handle e escreve o IO_STATUS_BLOCK como o ZwFlushBuffersFile (o
+    /// IO_STATUS_BLOCK é o 5º argumento no NtFlushBuffersFileEx).
+    fn flush_buffers_file_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(zw_files::flush_buffers_file(call.arg(1), call.arg(5))))
+    }
+
+    /// ZwSystemDebugControl: depuração de kernel não é suportada neste host.
+    fn system_debug_control(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_NOT_IMPLEMENTED))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "watchdog-support",
+        names: &[
+            "IoRaiseInformationalHardError", "IoWMIOpenBlock", "IoWMIQueryAllData",
+            "RtlCaptureContext", "RtlGetActiveConsoleId", "ZwFlushBuffersFileEx", "ZwSystemDebugControl",
+        ],
+        handlers: &[
+            raise_informational_hard_error, wmi_open_block, wmi_query_all_data,
+            capture_context, get_active_console_id, flush_buffers_file_ex, system_debug_control,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod basicdisplay_support {
+    //! Exports que o BasicDisplay.sys real (Microsoft Basic Display, driver de
+    //! vídeo display-only) importa e que faltavam: o bit-scan e a comparação da
+    //! CRT, o bloqueio de sono do Po e os x86Bios. Não há emulador de VBIOS de
+    //! 16 bits aqui — o OpenNT faz o scanout pelo framebuffer DISPI, então a
+    //! chamada de BIOS falha de modo tolerado (como numa máquina sem VGA BIOS
+    //! legado), e o BasicDisplay segue pelo caminho do framebuffer.
+
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::rtl::KernelError;
+
+    const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+
+    /// RtlFindLeastSignificantBit: índice do bit 1 mais baixo, -1 se a máscara
+    /// for zero (devolvido como CCHAR, 0xFF).
+    fn find_least_significant_bit(call: &Call) -> Result<u64, KernelError> {
+        let mask = call.arg(1);
+        Ok(if mask == 0 { u64::MAX } else { mask.trailing_zeros() as u64 })
+    }
+
+    /// _strnicmp: compara até `count` bytes sem diferenciar maiúsculas/minúsculas.
+    fn strnicmp(call: &Call) -> Result<u64, KernelError> {
+        let (mut first, mut second, count) = (call.arg(1), call.arg(2), call.arg(3));
+        for _ in 0..count {
+            let left = guest::read8(first).to_ascii_lowercase();
+            let right = guest::read8(second).to_ascii_lowercase();
+            if left != right {
+                return Ok(if left < right { u64::MAX } else { 1 });
+            }
+            if left == 0 {
+                break;
+            }
+            first += 1;
+            second += 1;
+        }
+        Ok(0)
+    }
+
+    /// PoDisableSleepStates: o OpenNT não entra em estados de sono; devolve um
+    /// identificador opaco não-nulo (um buffer em cache) que o driver guarda e
+    /// repassa a PoReenableSleepStates, que é um no-op.
+    static SLEEP_HANDLE: AtomicU64 = AtomicU64::new(0);
+    fn disable_sleep_states(_: &Call) -> Result<u64, KernelError> {
+        let mut handle = SLEEP_HANDLE.load(Ordering::Acquire);
+        if handle == 0 {
+            handle = guest::alloc_bytes(16);
+            SLEEP_HANDLE.store(handle, Ordering::Release);
+        }
+        Ok(handle)
+    }
+    fn reenable_sleep_states(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// x86BiosCall: sem VBIOS emulado, devolve FALSE; o BasicDisplay tolera.
+    fn x86_bios_call(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+    /// x86BiosFreeBuffer: nada a liberar — STATUS_SUCCESS.
+    fn x86_bios_free_buffer(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+    /// x86BiosAllocateBuffer/ReadMemory/WriteMemory: recurso de VBIOS ausente.
+    fn x86_bios_not_implemented(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(STATUS_NOT_IMPLEMENTED))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "basicdisplay-support",
+        names: &[
+            "RtlFindLeastSignificantBit", "_strnicmp", "PoDisableSleepStates", "PoReenableSleepStates",
+            "x86BiosAllocateBuffer", "x86BiosCall", "x86BiosFreeBuffer", "x86BiosReadMemory", "x86BiosWriteMemory",
+        ],
+        handlers: &[
+            find_least_significant_bit, strnicmp, disable_sleep_states, reenable_sleep_states,
+            x86_bios_not_implemented, x86_bios_call, x86_bios_free_buffer, x86_bios_not_implemented, x86_bios_not_implemented,
+        ],
+        data_exports: &[],
+    };
+}

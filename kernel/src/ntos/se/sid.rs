@@ -65,3 +65,32 @@ pub fn initialize_ex(pointer: u64, authority: u64, sub_authority_count: u32, sub
 pub fn read(pointer: u64) -> Vec<u8> {
     guest::read_bytes(pointer, length(pointer) as usize)
 }
+
+// ---- RtlInitializeSid / RtlSubAuthoritySid / RtlLengthRequiredSid ----------
+
+/// RtlInitializeSid: grava só o cabeçalho de 8 bytes (não toca nas
+/// subautoridades, como o NT).
+pub fn initialize(pointer: u64, authority: u64, count: u32) -> u32 {
+    if count > MAXIMUM_SUB_AUTHORITIES as u32 {
+        return 0xC000_000D;
+    }
+    guest::write8(pointer.wrapping_add(1), count as u8);
+    guest::write8(pointer, 1);
+    guest::write32(pointer.wrapping_add(2), guest::read32(authority));
+    guest::write16(pointer.wrapping_add(6), guest::read16(authority.wrapping_add(4)));
+    0
+}
+
+/// RtlSubAuthoritySid: ponteiro para a subautoridade de índice `index` (sem
+/// verificação de limite, como o NT).
+pub fn sub_authority(pointer: u64, index: u64) -> u64 {
+    pointer.wrapping_add(8 + index * 4)
+}
+
+/// RtlLengthRequiredSid: bytes para um SID com `count` subautoridades.
+pub fn length_required(count: u32) -> u32 {
+    if count > 0x3FFF_FFF7 {
+        return 0xFFFF_FFFF;
+    }
+    8 + count * 4
+}

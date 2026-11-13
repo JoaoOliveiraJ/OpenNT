@@ -339,7 +339,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 893 && abi_names::GROUP_LAYOUT.len() == 150 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 893 exports em 150 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 934 && abi_names::GROUP_LAYOUT.len() == 155 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 934 exports em 155 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1318,7 +1318,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 893 && exports::export_names().len() == 893, "ntoskrnl: 150 grupos com os 893 exports implementados");
+    assert(exports::implemented() == 934 && exports::export_names().len() == 934, "ntoskrnl: 155 grupos com os 934 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -3080,6 +3080,122 @@ fn etw_trace_control(assert: Assert) {
     assert(no_flag == Some(0xFFFF_FFFF_C000_000D) && small == Some(0xFFFF_FFFF_C000_0206) && max_loggers == Some(0) && guest::read32(properties) == 64 && invalid == Some(0xFFFF_FFFF_C000_0010), "etw: validacoes e MaxLoggers");
 }
 
+/// RtlCreate/Set*SecurityDescriptor, RtlCreateAcl, RtlAddAccessAllowedAce[Ex],
+/// RtlInitializeSid/SubAuthoritySid/LengthRequiredSid.
+fn rtl_security_descriptors(assert: Assert) {
+    let block = guest::alloc_bytes(0x400);
+    guest::write_bytes(block, &[0xAA; 0x400]);
+    let (sd, acl_buf, sid_buf, authority) = (block, block + 0x40, block + 0x100, block + 0x180);
+    // SID S-1-5-32-544 (BUILTIN\Administradores): autoridade NT (5), subs 32,544.
+    guest::write_bytes(authority, &[0, 0, 0, 0, 0, 5]);
+    assert(call_export("RtlLengthRequiredSid", &[2]) == Some(16) && call_export("RtlLengthRequiredSid", &[0]) == Some(8), "rtl: RtlLengthRequiredSid");
+    let init = call_export("RtlInitializeSid", &[sid_buf, authority, 2]);
+    let sub0 = call_export("RtlSubAuthoritySid", &[sid_buf, 0]).unwrap_or(0);
+    let sub1 = call_export("RtlSubAuthoritySid", &[sid_buf, 1]).unwrap_or(0);
+    guest::write32(sub0, 32);
+    guest::write32(sub1, 544);
+    assert(init == Some(0) && guest::read8(sid_buf) == 1 && guest::read8(sid_buf + 1) == 2 && sub0 == sid_buf + 8 && sub1 == sid_buf + 12 && guest::read8(sid_buf + 7) == 5, "rtl: RtlInitializeSid + RtlSubAuthoritySid");
+    // Descritor absoluto vazio, revisão 1.
+    let created = call_export("RtlCreateSecurityDescriptor", &[sd, 1]);
+    let bad_rev = call_export("RtlCreateSecurityDescriptor", &[sd + 0x20, 2]);
+    assert(created == Some(0) && guest::read8(sd) == 1 && guest::read16(sd + 2) == 0 && bad_rev == Some(0xFFFF_FFFF_C000_0058), "rtl: RtlCreateSecurityDescriptor");
+    // ACL vazia e uma ACE de acesso permitido.
+    let acl_created = call_export("RtlCreateAcl", &[acl_buf, 0x80, 2]);
+    let small = call_export("RtlCreateAcl", &[acl_buf + 0x200, 4, 2]);
+    let added = call_export("RtlAddAccessAllowedAce", &[acl_buf, 2, 0x1F01FF, sid_buf]);
+    let ace = acl_buf + 8;
+    let ace_size = 8 + 8 + 2 * 4; // header+mask + SID(8+2*4)
+    assert(acl_created == Some(0) && small == Some(0xFFFF_FFFF_C000_0023) && added == Some(0) && guest::read16(acl_buf + 4) == 1 && guest::read8(ace) == 0 && guest::read16(ace + 2) == ace_size as u16 && guest::read32(ace + 4) == 0x1F01FF, "rtl: RtlCreateAcl + RtlAddAccessAllowedAce");
+    // Liga a DACL ao descritor.
+    let set = call_export("RtlSetDaclSecurityDescriptor", &[sd, 1, acl_buf, 0]);
+    assert(set == Some(0) && guest::read16(sd + 2) & 0x0004 != 0 && guest::read64(sd + 0x20) == acl_buf, "rtl: RtlSetDaclSecurityDescriptor liga a DACL");
+}
+
+/// Auxiliares de drivers: mapeamento do FILE_OBJECT, referência segura de
+/// objeto e as consultas de energia/boot/portabilidade.
+fn driver_helper_exports(assert: Assert) {
+    let mapping = call_export("IoGetFileObjectGenericMapping", &[]).unwrap_or(0);
+    assert(mapping != 0 && guest::read32(mapping) == 0x0012_0089 && guest::read32(mapping + 12) == 0x001F_01FF && call_export("IoGetFileObjectGenericMapping", &[]) == Some(mapping), "io: IoGetFileObjectGenericMapping (valores reais, em cache)");
+    let out = guest::alloc_bytes(8);
+    guest::write8(out, 0xFF);
+    let portable = call_export("RtlCheckPortableOperatingSystem", &[out]);
+    assert(call_export("PoEnergyEstimationEnabled", &[]) == Some(0) && call_export("ExIsSoftBoot", &[]) == Some(0) && portable == Some(0) && guest::read8(out) == 0 && call_export("ZwFlushKey", &[0x1C8]) == Some(0), "misc: energia/soft-boot/portabilidade/flush");
+    // ObReferenceObjectSafe/DeferDelete sobre o processo corrente (objeto vivo).
+    let process = crate::ntos::ps::process::get_current_process();
+    let before = crate::ntos::ps::process::reference_count(process).unwrap_or(0);
+    let safe = call_export("ObReferenceObjectSafe", &[process]);
+    let held = crate::ntos::ps::process::reference_count(process).unwrap_or(0);
+    call_export("ObDereferenceObjectDeferDelete", &[process]);
+    assert(process != 0 && safe == Some(1) && held == before + 1 && crate::ntos::ps::process::reference_count(process).unwrap_or(0) == before, "ob: ObReferenceObjectSafe + ObDereferenceObjectDeferDelete ajustam a referência");
+}
+
+/// Exports que habilitam o watchdog.sys real: status tolerados de WMI, console
+/// e depuração; o ZwFlushBuffersFileEx roteado; e a captura de contexto (sem
+/// contexto nativo ativo no self-test, só marca ContextFlags = CONTEXT_FULL).
+fn watchdog_support_exports(assert: Assert) {
+    let ntstatus = |result: Option<u64>| result.map(|value| value as u32);
+    let context = guest::alloc_bytes(0x4D0);
+    guest::write32(context + 0x30, 0);
+    let captured = call_export("RtlCaptureContext", &[context]);
+    let io_status = guest::alloc_bytes(16);
+    assert(
+        call_export("IoRaiseInformationalHardError", &[0, 0, 0]) == Some(0)
+            && ntstatus(call_export("IoWMIOpenBlock", &[0, 0, 0])) == Some(0xC000_0295)
+            && ntstatus(call_export("IoWMIQueryAllData", &[0, 0, 0])) == Some(0xC000_0295)
+            && call_export("RtlGetActiveConsoleId", &[]) == Some(0)
+            && ntstatus(call_export("ZwSystemDebugControl", &[0])) == Some(0xC000_0002)
+            && captured == Some(0)
+            && guest::read32(context + 0x30) == 0x0010_000B,
+        "watchdog: WMI/console/debug tolerados + RtlCaptureContext marca o CONTEXT",
+    );
+    assert(ntstatus(call_export("ZwFlushBuffersFileEx", &[0x7FF0, 0, 0, 0, io_status])) == Some(0xC000_0008), "watchdog: ZwFlushBuffersFileEx valida o handle");
+}
+
+/// Exports do BasicDisplay.sys real: bit-scan, _strnicmp, bloqueio de sono e os
+/// x86Bios (sem VBIOS emulado, falham de forma tolerada).
+fn basicdisplay_support_exports(assert: Assert) {
+    let ntstatus = |result: Option<u64>| result.map(|value| value as u32);
+    let signed = |result: Option<u64>| result.map(|value| value as i64);
+    let (first, second) = (guest::alloc_bytes(8), guest::alloc_bytes(8));
+    guest::write_bytes(first, b"Abc\0");
+    guest::write_bytes(second, b"aBc\0");
+    let equal = call_export("_strnicmp", &[first, second, 3]);
+    guest::write_bytes(second, b"aBd\0");
+    let less = signed(call_export("_strnicmp", &[first, second, 3]));
+    let handle = call_export("PoDisableSleepStates", &[1]).unwrap_or(0);
+    assert(
+        call_export("RtlFindLeastSignificantBit", &[0x100]) == Some(8)
+            && signed(call_export("RtlFindLeastSignificantBit", &[0])) == Some(-1)
+            && equal == Some(0)
+            && less == Some(-1)
+            && handle != 0
+            && call_export("PoReenableSleepStates", &[handle]) == Some(0)
+            && call_export("x86BiosCall", &[0, 0]) == Some(0)
+            && ntstatus(call_export("x86BiosReadMemory", &[0, 0, 0, 0])) == Some(0xC000_0002),
+        "basicdisplay: bit-scan/_strnicmp/sono/x86Bios",
+    );
+}
+
+/// Captura/validação/deassign de SECURITY_DESCRIPTOR (grupo se-descriptor).
+fn se_descriptor_exports(assert: Assert) {
+    // SD self-relative mínimo: Revision=1, Control=SELF_RELATIVE, sem componentes.
+    let descriptor = guest::alloc_bytes(20);
+    for offset in 0..20 {
+        guest::write8(descriptor + offset, 0);
+    }
+    guest::write8(descriptor, 1);
+    guest::write16(descriptor + 2, 0x8000);
+    let output = guest::alloc_bytes(8);
+    let captured = call_export("SeCaptureSecurityDescriptor", &[descriptor, 0, 0, 0, output]);
+    let copy = guest::read64(output);
+    assert(captured == Some(0), "se: SeCaptureSecurityDescriptor retorna sucesso");
+    assert(copy != 0 && copy != descriptor && guest::read8(copy) == 1, "se: SeCaptureSecurityDescriptor devolve copia self-relative");
+    assert(call_export("SeValidSecurityDescriptor", &[20, copy]) == Some(1), "se: SeValidSecurityDescriptor aceita o SD valido");
+    assert(call_export("SeValidSecurityDescriptor", &[4, descriptor]) == Some(0), "se: SeValidSecurityDescriptor rejeita tamanho pequeno");
+    assert(call_export("SeDeassignSecurity", &[output]) == Some(0) && guest::read64(output) == 0, "se: SeDeassignSecurity libera e zera");
+    assert(call_export("SeCaptureSecurityDescriptor", &[0, 0, 0, 0, output]) == Some(0) && guest::read64(output) == 0, "se: SeCaptureSecurityDescriptor com NULL devolve NULL");
+}
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -3131,5 +3247,10 @@ pub fn run(assert: Assert) {
     process_exit_synchronization(assert);
     thread_process_queries(assert);
     etw_trace_control(assert);
+    rtl_security_descriptors(assert);
+    driver_helper_exports(assert);
+    watchdog_support_exports(assert);
+    basicdisplay_support_exports(assert);
+    se_descriptor_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }

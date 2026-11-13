@@ -611,6 +611,13 @@ pub mod kernel_api_set {
 
     /// `None` = contrato desconhecido; `Some("")` = host explicitamente ausente.
     pub fn resolve(name: &str, importer: &str) -> Result<Option<String>, KernelError> {
+        // O OpenNT não oferece Windows Error Reporting (nenhum dump de kernel
+        // ao vivo): o apiset do werkernel fica com host vazio para cair no
+        // default nativo do próprio driver (stub não-bloqueante da extensão
+        // opcional), em vez de exigir o werkernel.sys e sua cadeia.
+        if name.len() >= 25 && name.get(..25).is_some_and(|prefix| prefix.eq_ignore_ascii_case("ext-ms-win-ntos-werkernel")) {
+            return Ok(Some(String::new()));
+        }
         if SCHEMA.lock().is_none() {
             let schema = api_set::parse_image(kernel_image_source::source_for("apisetschema.dll")?.as_ref())?;
             let mut cached = SCHEMA.lock();

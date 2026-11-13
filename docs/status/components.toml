@@ -290,6 +290,17 @@ fase = "1"
 notas = "Os testes conferem o texto pela serial; a imagem na tela não é conferida."
 
 [[componente]]
+nome = "Framebuffer linear (scanout)"
+categoria = "Drivers internos"
+icone = "monitor"
+descricao = "Faz o mode-set de um framebuffer linear e desenha pixels na tela, a camada de scanout sobre a qual o stack de vídeo real se apoia."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/video/framebuffer.rs"]
+testes = ["boot"]
+fase = "1"
+notas = "Mode-set via Bochs DISPI (portas 0x1CE/0x1CF), base do BAR0 da placa std-VGA. Sob o flag --graphics; `cargo xtask run --graphics` mostra a tela desenhada pelo kernel. Não é um driver de vídeo: é o equivalente ao framebuffer de boot do Windows, o destino onde o BasicDisplay/dxgkrnl reais entregam a imagem."
+
+[[componente]]
 nome = "Console"
 categoria = "Drivers internos"
 icone = "terminal"
@@ -448,6 +459,17 @@ descricao = "Driver anti-cheat de terceiros (Vanguard), usado como alvo de compa
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/init/main.rs"]
 notas = "Testado em WHPX com `--start-driver=vgk --trace-driver-api` (versão 1.19.2). A ci.dll original inicializa e valida a imagem; o DriverEntry resolve 252 funções do ntoskrnl pela própria busca na tabela de exports, todas atendidas pelo OpenNT. Ele então para numa verificação de integridade interna do anticheat (código ofuscado que inspeciona o próprio kernel, sem chamar API), fora do escopo do projeto. O `--trace-driver-api` mostra o log do vgk em texto (`texto:`) e cada nome procurado (`procura:`). O binário nunca entra no repositório: o build o lê de OPENNT_VGK_SYS ou de vgk.sys na raiz."
+
+[[componente]]
+nome = "watchdog.sys"
+categoria = "Drivers do Windows"
+icone = "shield"
+descricao = "Driver inbox da Microsoft (watchdog timer), base do stack de vídeo."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/io/file/zw.rs"]
+testes = ["driver"]
+fase = "6"
+notas = "Driver inbox real da Microsoft que carrega e roda limpo no OpenNT via `--start-driver=watchdog`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Diferente do vgk (assinado embutido), ele é assinado por catálogo — o Code Integrity valida o hash da imagem contra o `.cat` da Microsoft que a própria ci.dll enumera em `CatRoot`. O DriverEntry executa e retorna sucesso. Esse mesmo caminho (catálogo + enumeração de diretório aninhado) destrava os demais drivers inbox, como o BasicDisplay e o dxgkrnl."
 
 [[componente]]
 nome = "Arquivos em memória"

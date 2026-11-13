@@ -33,6 +33,12 @@ pub trait FileSystem: Sync {
     fn exists(&self, path: &str) -> bool;
     /// Todos os caminhos do volume.
     fn list(&self) -> Vec<String>;
+    /// Os caminhos diretamente sob um diretório (`path/filho`). O padrão
+    /// devolve a listagem plana; volumes com diretórios aninhados (NTFS)
+    /// sobrescrevem para enumerar a subpasta certa.
+    fn list_directory(&self, _path: &str) -> Vec<String> {
+        self.list()
+    }
     /// O volume aceita criação e escrita.
     fn writable(&self) -> bool {
         false

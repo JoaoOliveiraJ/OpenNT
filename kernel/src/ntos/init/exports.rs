@@ -54,7 +54,7 @@ pub struct Group {
 }
 
 /// Grupos transcritos (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 150] {
+fn groups() -> [&'static Group; 155] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -195,6 +195,11 @@ fn groups() -> [&'static Group; 150] {
         &crate::ntos::ps::exports::thread_process_queries::GROUP,
         &crate::ntos::etw::exports::trace_control::GROUP,
         &crate::ntos::etw::exports::trace_control::ENABLE_TRACE_GROUP,
+        &crate::ntos::rtl::exports::rtl_security::GROUP,
+        &crate::ntos::io::exports::driver_helpers::GROUP,
+        &crate::ntos::io::exports::watchdog_support::GROUP,
+        &crate::ntos::io::exports::basicdisplay_support::GROUP,
+        &crate::ntos::se::exports::se_descriptor::GROUP,
         &crate::ntos::ps::exports::process_image::GROUP,
         &crate::ntos::rtl::exports::package_claims::GROUP,
         &crate::ntos::rtl::exports::package_identity::GROUP,

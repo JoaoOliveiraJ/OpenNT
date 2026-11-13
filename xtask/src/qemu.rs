@@ -43,7 +43,10 @@ pub fn find_qemu() -> Result<PathBuf, String> {
 fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
     let mut arguments = vec![
         "-accel".to_string(),
-        machine.accelerator.clone(),
+        // No WHPX, um RDMSR/WRMSR de MSR não suportado precisa gerar #GP (como
+        // o hardware real) em vez de ler 0: drivers que leem MSRs opcionais e
+        // tratam a exceção dependem disso. Requer QEMU 11.1+.
+        if machine.accelerator == "whpx" { "whpx,ignore-unknown-msr=off".to_string() } else { machine.accelerator.clone() },
         "-machine".to_string(),
         if machine.accelerator == "whpx" { "pc,kernel-irqchip=off" } else { "pc" }.to_string(),
     ];
@@ -59,6 +62,10 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
         machine.memory_mb.to_string(),
         "-smp".to_string(),
         machine.smp.to_string(),
+        // Placa std-VGA (Bochs DISPI, PCI 1234:1111) fixada: o framebuffer de
+        // `--graphics` faz o mode-set por ela e lê a base linear do BAR0.
+        "-vga".to_string(),
+        "std".to_string(),
         "-drive".to_string(),
         format!("format=raw,file={}", image.display()),
         "-no-reboot".to_string(),

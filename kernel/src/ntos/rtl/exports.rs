@@ -659,24 +659,36 @@ fn string_from_guid(call: &Call) -> Result<u64, KernelError> {
     guest::write64(output + 8, buffer);
     Ok(0)
 }
-/// RtlDuplicateUnicodeString(flags, source, destination).
+/// RtlDuplicateUnicodeString(flags, source, destination): SEMPRE aloca um
+/// buffer novo e copia a origem. `flags` não escolhe alocar — os bits são
+/// NULL_TERMINATE (1) e ALLOCATE_NULL_STRING (2); ambos juntos ou outros bits
+/// são inválidos. (Antes o OpenNT tratava flags!=0 como "alocar" e, com
+/// flags=0, checava a capacidade do destino e devolvia BUFFER_TOO_SMALL.)
 fn duplicate_unicode_string(call: &Call) -> Result<u64, KernelError> {
-    let (allocate, source, destination) = (call.arg(1) as u32 != 0, call.arg(2), call.arg(3));
+    const NULL_TERMINATE: u32 = 1;
+    const ALLOCATE_NULL_STRING: u32 = 2;
+    let (flags, source, destination) = (call.arg(1) as u32, call.arg(2), call.arg(3));
+    if destination == 0 || flags & !3 != 0 || flags & 3 == 3 {
+        return Ok(signed_status(0xC000_000D));
+    }
     let length = guest::read16(source) as u64;
     let source_buffer = guest::read64(source + 8);
-    let destination_buffer = if allocate {
-        let buffer = guest::alloc_bytes(length + 2);
-        guest::write16(destination + 2, length as u16 + 2);
-        buffer
-    } else {
-        if (guest::read16(destination + 2) as u64) < length {
-            return Ok(signed_status(0xC000_0023));
-        }
-        guest::read64(destination + 8)
-    };
-    guest::write_bytes(destination_buffer, &guest::read_bytes(source_buffer, length as usize));
+    // Origem vazia sem ALLOCATE_NULL_STRING: destino vazio e sem buffer.
+    if length == 0 && flags & ALLOCATE_NULL_STRING == 0 {
+        guest::write16(destination, 0);
+        guest::write16(destination + 2, 0);
+        guest::write64(destination + 8, 0);
+        return Ok(0);
+    }
+    let terminator = if flags & NULL_TERMINATE != 0 { 2 } else { 0 };
+    let buffer = guest::alloc_bytes((length + terminator).max(2));
+    guest::write_bytes(buffer, &guest::read_bytes(source_buffer, length as usize));
+    if terminator != 0 {
+        guest::write16(buffer + length, 0);
+    }
     guest::write16(destination, length as u16);
-    guest::write64(destination + 8, destination_buffer);
+    guest::write16(destination + 2, (length + terminator) as u16);
+    guest::write64(destination + 8, buffer);
     Ok(0)
 }
 fn create_registry_key(call: &Call) -> Result<u64, KernelError> {
@@ -1561,6 +1573,60 @@ pub mod generic_tables {
         handlers: &[
             initialize_avl, insert_avl, insert_full_avl, lookup_avl, lookup_full_avl, delete_avl, delete_avl_ex, enumerate_avl,
             enumerate_without_splaying_avl, get_element_avl, number_avl, is_empty_avl, lookup_first_matching_avl, enumerate_like_a_directory,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_security {
+    //! Descritores de segurança, ACLs e SIDs do Rtl — delegam ao componente
+    //! `se`, com as assinaturas e os NTSTATUS do WDK.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::{acl, descriptor, sid};
+    use crate::rtl::KernelError;
+
+    fn create_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(descriptor::create(call.arg(1), call.arg(2) as u32)))
+    }
+    fn set_dacl(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(descriptor::set_dacl(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3), call.arg(4) & 0xFF != 0)))
+    }
+    fn set_sacl(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(descriptor::set_sacl(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3), call.arg(4) & 0xFF != 0)))
+    }
+    fn set_owner(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(descriptor::set_owner(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0)))
+    }
+    fn create_acl(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(acl::create(call.arg(1), call.arg(2) as u32, call.arg(3) as u32)))
+    }
+    fn add_access_allowed_ace(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(acl::add_known_ace(call.arg(1), call.arg(2) as u32, 0, call.arg(3) as u32, call.arg(4), 0)))
+    }
+    fn add_access_allowed_ace_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(acl::add_known_ace(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32, call.arg(5), 0)))
+    }
+    fn initialize_sid(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sid::initialize(call.arg(1), call.arg(2), call.arg(3) as u32)))
+    }
+    fn sub_authority_sid(call: &Call) -> Result<u64, KernelError> {
+        Ok(sid::sub_authority(call.arg(1), call.arg(2)))
+    }
+    fn length_required_sid(call: &Call) -> Result<u64, KernelError> {
+        Ok(sid::length_required(call.arg(1) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-security",
+        names: &[
+            "RtlCreateSecurityDescriptor", "RtlSetDaclSecurityDescriptor", "RtlSetSaclSecurityDescriptor",
+            "RtlSetOwnerSecurityDescriptor", "RtlCreateAcl", "RtlAddAccessAllowedAce", "RtlAddAccessAllowedAceEx",
+            "RtlInitializeSid", "RtlSubAuthoritySid", "RtlLengthRequiredSid",
+        ],
+        handlers: &[
+            create_security_descriptor, set_dacl, set_sacl, set_owner, create_acl, add_access_allowed_ace,
+            add_access_allowed_ace_ex, initialize_sid, sub_authority_sid, length_required_sid,
         ],
         data_exports: &[],
     };
