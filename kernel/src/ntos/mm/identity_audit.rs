@@ -34,7 +34,9 @@ pub fn run() {
             }
         }
     }
-    for (low, high) in [(0x600_0000u64, 0x1000_0000u64), (0x2000_0000, super::memory_map::LARGE_IMAGE_BASE), (0xC000_0000, super::memory_map::PHYSICAL_MEMORY_LIMIT)] {
+    // A faixa 0xB000_0000..0xC000_0000 fica fora: era a arena de imagens grandes,
+    // hoje sem uso (as imagens de kernel moram na janela de sistema).
+    for (low, high) in [(0x600_0000u64, 0x1000_0000u64), (0x2000_0000, 0xB000_0000), (0xC000_0000, super::memory_map::PHYSICAL_MEMORY_LIMIT)] {
         for va in (low..high).step_by(0x20_0000) {
             if clear_present(va, 0x20_0000) {
                 large += 1;
