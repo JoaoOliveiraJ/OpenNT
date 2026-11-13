@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **18 de 44** componentes funcionam; **551 de 772** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.094 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
+Hoje: **18 de 44** componentes funcionam; **550 de 772** módulos do plano têm código (536 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.595 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (52,0%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -114,7 +114,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Cache Manager | Planejado | — |
+| Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl |
 | win32k.sys, win32kbase.sys e win32kfull.sys | Planejado | — |
 | dxgkrnl.sys e BasicDisplay.sys | Planejado | — |
 | ntfs.sys, fastfat.sys e fltmgr.sys | Planejado | — |

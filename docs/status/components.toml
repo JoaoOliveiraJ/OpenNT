@@ -276,7 +276,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
 testes = ["fase4", "teclado"]
 fase = "4"
-notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows)."
+notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows). Para file systems e armazenamento: IRPs associados (com a devolução ao mestre na conclusão), I/O de paginação (IoPageRead/IoSynchronousPageWrite), extensões de FILE_OBJECT e de IRP, registro de file systems e suas notificações, stream file objects, share access, IoReportDetectedDevice, propriedades de dispositivo e IoGetDmaAdapter (que devolve NULL enquanto o PDO PCI não responde QUERY_INTERFACE)."
 
 [[componente]]
 nome = "Registro"
@@ -298,16 +298,18 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta."
+notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys e nsiproxy.sys já têm export; nenhum deles é carregado pelos testes ainda."
 
 [[componente]]
 nome = "Cache Manager"
 categoria = "Núcleo do kernel"
 icone = "layers"
 descricao = "O cache de arquivos do NT (rotinas Cc*), pelo qual os drivers de sistema de arquivos leem e gravam através da memória."
-estado = "planejado"
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/cc"]
+testes = ["fase6"]
 fase = "8"
-notas = "O kernel ainda não exporta nenhuma das 69 rotinas Cc* do ntoskrnl. É pré-requisito do ntfs.sys e do fastfat.sys reais."
+notas = "51 das 69 rotinas Cc* do ntoskrnl: SHARED_CACHE_MAP e PRIVATE_CACHE_MAP nativos pendurados no SECTION_OBJECT_POINTERS, vistas de 256 KB lidas por IRPs de paginação à pilha do próprio arquivo, cópias, map/pin com BCBs, MDLs, flush, purge e as rotinas de LSN e log do NTFS. Modelo síncrono, sem a thread do lazy writer: as páginas sujas vão ao disco no CcFlushCache e no último CcUninitializeCacheMap. Os autotestes usam um dispositivo sintético; nenhum file system real o usa ainda, porque o ntfs.sys e o fastfat.sys ainda não carregam."
 
 [[componente]]
 nome = "Vídeo VGA em modo texto"
@@ -428,7 +430,7 @@ estado = "implementado"
 caminhos = ["kernel/src/ntos/mm/sysload.rs", "xtask/src/windows_binaries.rs", "kernel/src/ntos/dbgk/wer.rs"]
 testes = ["teclado", "drivers"]
 fase = "6"
-notas = "Carregam como drivers de export (DllInitialize) na primeira vez que um driver as importa: a wmilib.sys com o ataport.sys no boot, a WppRecorder.sys com o kbdclass.sys, o i8042prt.sys e o mouclass.sys; os imports desses drivers resolvem nos exports das imagens reais, e o ntoskrnl do OpenNT não publica nenhum nome delas. A WppRecorder.sys procura o RtlQueryModuleInformation pelo MmGetSystemRoutineAddress, que o kernel ainda não tem (ela segue sem ele), e importa o DbgkWerCaptureLiveKernelDump, que falha com STATUS_NOT_SUPPORTED como num Windows sem o werkernel.sys."
+notas = "Carregam como drivers de export (DllInitialize) na primeira vez que um driver as importa: a wmilib.sys com o ataport.sys no boot, a WppRecorder.sys com o kbdclass.sys, o i8042prt.sys e o mouclass.sys; os imports desses drivers resolvem nos exports das imagens reais, e o ntoskrnl do OpenNT não publica nenhum nome delas. A WppRecorder.sys procura o RtlQueryModuleInformation pelo MmGetSystemRoutineAddress, que o kernel agora exporta, e importa o DbgkWerCaptureLiveKernelDump, que falha com STATUS_NOT_SUPPORTED como num Windows sem o werkernel.sys."
 
 [[componente]]
 nome = "atapi.sys e ataport.sys"
@@ -521,7 +523,7 @@ icone = "window"
 descricao = "O subsistema de janelas e gráficos do Windows no kernel (USER e GDI), carregado como imagem de sistema."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda. Sem eles, a tabela 1 do KeServiceDescriptorTableShadow fica vazia, como no Windows: uma syscall gráfica tenta converter a thread em GUI pelo PsConvertToGuiThread, que falha sem os callouts, e devolve STATUS_INVALID_SYSTEM_SERVICE. A KeAddSystemServiceTable e a PsEstablishWin32Callouts, por onde o win32k publica essa tabela e os callouts, ainda não existem."
+notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda. Sem eles, a tabela 1 do KeServiceDescriptorTableShadow fica vazia, como no Windows: uma syscall gráfica tenta converter a thread em GUI pelo PsConvertToGuiThread, que falha sem os callouts, e devolve STATUS_INVALID_SYSTEM_SERVICE. A KeAddSystemServiceTable, a PsEstablishWin32Callouts/PsInvokeWin32Callout e a conversão da W32pServiceTable na carga pela classe 38 do ZwSetSystemInformation já existem, testadas sem o win32k: o PsConvertToGuiThread invoca de fato os callouts de processo e de thread. Dos imports do ntoskrnl, ainda faltam 65 ao win32kbase.sys, 58 ao win32kfull.sys e um (ZwQueryInformationJobObject) ao win32k.sys."
 
 [[componente]]
 nome = "dxgkrnl.sys e BasicDisplay.sys"
@@ -539,7 +541,7 @@ icone = "folder"
 descricao = "Os drivers de sistema de arquivos do Windows (NTFS e FAT) e o Filter Manager, base dos filtros de sistema de arquivos."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais. O ntfs.sys e o fastfat.sys dependem do Cache Manager (importam 39 e 32 rotinas Cc*), que ainda não existe. Hoje o volume NTFS é lido pelo leitor do próprio kernel; o fltmgr.sys só vai para o volume como arquivo, porque o vgk.sys o abre pelo caminho."
+notas = "Alvo de carga dos binários reais. O Cache Manager e o suporte FsRtl/Io de file system já existem, mas dos imports do ntoskrnl ainda faltam 23 ao ntfs.sys e 19 ao fastfat.sys (entre eles FsRtlCopyRead, FsRtlNotifyVolumeEvent e MmFlushImageSection); o fltmgr.sys já tem todos os seus. Nenhum dos três carrega ainda. Hoje o volume NTFS é lido pelo leitor do próprio kernel; o fltmgr.sys só vai para o volume como arquivo, porque o vgk.sys o abre pelo caminho."
 
 [[componente]]
 nome = "ndis.sys, tcpip.sys e E1G6032E.sys"
@@ -548,7 +550,7 @@ icone = "plug"
 descricao = "A pilha de rede do Windows (NDIS e TCP/IP) com o miniport Intel PRO/1000 da Microsoft, que atende a placa e1000 emulada pelo QEMU (PCI 8086:100E)."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda."
+notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda. Dos imports do ntoskrnl, faltam 2 ao ndis.sys (ExSubscribeWnfStateChange e NtQuerySystemInformationEx) e 13 ao tcpip.sys; os do netio.sys já estão todos atendidos."
 
 [[componente]]
 nome = "Arquivos em memória"
@@ -613,7 +615,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/ps/user"]
 testes = ["fase7"]
 fase = "7"
-notas = "Roda um processo de usuário por vez, e todos dividem um só espaço de endereços. O único executável que roda hoje é o PE mínimo gerado pelo teste da fase 7, com a ntdll de bring-up. Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe (ApiPort e SharedSection da sessão 0, ativas em todo boot), mantida só até o csrss.exe real rodar."
+notas = "Roda um processo de usuário por vez, e todos dividem um só espaço de endereços. O único executável que roda hoje é o PE mínimo gerado pelo teste da fase 7, com a ntdll de bring-up. Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe (ApiPort e SharedSection da sessão 0, ativas em todo boot), mantida só até o csrss.exe real rodar. APCs de usuário (NtQueueApcThread/Ex/Ex2 e NtTestAlert) são entregues no retorno ao modo usuário pelo frame do KiUserApcDispatcher, e NtContinueEx, NtGet/SetContextThread, NtOpenProcess e NtGetNextProcess/Thread já têm handler."
 
 [[componente]]
 nome = "ntdll.dll, KERNEL32 e KERNELBASE"
