@@ -251,17 +251,12 @@ fn real_keyboard() {
             };
             inject(0x1E); // 'a' make
             inject(0x9E); // 'a' break
-            let zero_timeout = guest_memory::alloc_bytes(8);
-            let deadline = clock::uptime_ms() + 10_000;
-            let mut completed = false;
-            while clock::uptime_ms() < deadline {
-                interrupts::dispatch_pending(); // IRQ1 -> ISR nativa do i8042prt
-                crate::ntos::ke::run_kernel_tasks(); // DPC -> callback do kbdclass
-                if dispatcher::wait_for_single_object(event, zero_timeout, 0, false) == 0 {
-                    completed = true;
-                    break;
-                }
-            }
+            // Espera como um driver espera: a IRQ1 chega à ISR nativa do
+            // i8042prt e o DPC chama o kbdclass durante o próprio
+            // KeWaitForSingleObject, sem ninguém despachar as IRQs à mão.
+            let timeout = guest_memory::alloc_bytes(8);
+            guest_memory::write64(timeout, (-100_000_000i64) as u64); // 10 s relativos
+            let completed = dispatcher::wait_for_single_object(event, timeout, 0, false) == 0;
             if completed {
                 // KEYBOARD_INPUT_DATA: UnitId u16, MakeCode u16, Flags u16.
                 let data = request.pending_buffer;
@@ -276,7 +271,7 @@ fn real_keyboard() {
                 debug_print!("KBDTEST_SKIP (sem tecla injetada em 10s)");
                 io_manager::cancel_pending_io_request(&mut request);
             }
-            guest_memory::free_bytes(zero_timeout);
+            guest_memory::free_bytes(timeout);
             // Os devices de teclado ficam ABERTOS: o teclado do sistema segue
             // em uso (o close dispararia o disable da porta).
         }

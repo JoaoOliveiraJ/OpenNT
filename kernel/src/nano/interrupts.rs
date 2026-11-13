@@ -178,12 +178,23 @@ pub fn unregister_irq_handler(vector: u8, handler: IrqHandler) -> bool {
 /// Despacha as IRQs pendentes: para cada vetor com contagem nova no
 /// hardware, chama o handler com o número de ocorrências pendentes.
 pub fn dispatch_pending() {
+    dispatch_pending_where(|_| true);
+}
+
+/// Despacha só as IRQs de dispositivo pendentes. O timer do LAPIC fica de
+/// fora: o quantum é do laço principal, e uma espera não troca de tarefa
+/// por ele.
+pub fn dispatch_pending_devices() {
+    dispatch_pending_where(|vector| vector != VECTOR_LAPIC_TIMER);
+}
+
+fn dispatch_pending_where(selected: impl Fn(u8) -> bool) {
     // Os handlers rodam sem o lock da tabela: podem registrar outros vetores.
     let mut due: Vec<(u8, IrqHandler, u32)> = Vec::new();
     {
         let mut table = TABLE.lock();
         let vectors: Vec<(u8, IrqHandler)> =
-            table.handler_by_vector.iter().map(|(&vector, &handler)| (vector, handler)).collect();
+            table.handler_by_vector.iter().map(|(&vector, &handler)| (vector, handler)).filter(|&(vector, _)| selected(vector)).collect();
         for (vector, handler) in vectors {
             let count = irq_count(vector);
             let last_count = table.last_count_by_vector.get(&vector).copied().unwrap_or(0);

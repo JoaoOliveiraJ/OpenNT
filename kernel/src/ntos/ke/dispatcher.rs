@@ -295,8 +295,10 @@ fn pump_scheduler() {
     scheduler::tick(-1);
 }
 
-/// Timers, DPCs, work items, conclusões registradas e escalonador.
+/// Interrupções de dispositivo, timers, DPCs, work items, conclusões
+/// registradas e escalonador.
 pub fn pump_kernel() {
+    super::interrupt_object::service_during_wait();
     timer::check_timers();
     let _ = dpc::run_queue();
     work_items::run_queue();

@@ -136,6 +136,7 @@ pub fn check_timers() {
 }
 
 fn delay_pump() {
+    super::interrupt_object::service_during_wait();
     check_timers();
     let _ = dpc::run_queue();
     work_items::run_queue();
@@ -156,6 +157,7 @@ pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: b
         return Ok(thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut || expired().then_some(0), delay_pump));
     }
     loop {
+        super::interrupt_object::service_during_wait();
         check_timers();
         let _ = dpc::run_queue();
         // Trabalho pendente pode produzir a condição de outra operação.

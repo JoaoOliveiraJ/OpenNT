@@ -111,6 +111,19 @@ fn drain_legacy_disk_interrupt(data_port: u16, status_port: u16) {
     }
 }
 
+/// Interrupções de dispositivo durante uma espera. No NT a IRQ interrompe
+/// qualquer código abaixo do IRQL do dispositivo, inclusive uma thread
+/// parada no KeWaitForSingleObject ou no KeDelayExecutionThread: um driver
+/// que espera o próprio hardware (o i8042prt segura o controlador até o
+/// mouse responder ao reset pela IRQ12) recebe a ISR enquanto espera. Aqui
+/// as ISRs rodam quando as IRQs registradas são despachadas, e as esperas
+/// abaixo de DISPATCH_LEVEL chamam esta rotina a cada volta.
+pub fn service_during_wait() {
+    if super::irql::get_irql() < super::irql::DISPATCH_LEVEL {
+        interrupts::dispatch_pending_devices();
+    }
+}
+
 /// Percorre os objetos do vetor chamando as ISRs nativas. Para quando uma
 /// ISR trata a interrupção e Mode vale zero (latched).
 fn dispatch_chain(vector: u8, _count: u32) {
