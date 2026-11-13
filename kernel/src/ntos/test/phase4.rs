@@ -418,7 +418,7 @@ fn pci_bus_driver(assert: Assert) {
     let synthetic_descriptors = unsafe { CmPartialResourceDescriptor::array_at(synthetic_list.list[0].partial_resource_list.partial_descriptors[0].address(), 3) };
     assert(synthetic_descriptors[1].u.interrupt.affinity.get() as u32 == 0xFFFF_FFFF, "pcibus: afinidade padrao");
     assert(device_resources::consume_next_interrupt(fake_pdo) == Some(device_resources::Interrupt { level: 15, vector: 0x2F, flags: 0 }) && device_resources::consume_next_interrupt(fake_pdo).is_some_and(|found| found.level == 14) && device_resources::consume_next_interrupt(fake_pdo).is_none() && device_resources::consume_next_interrupt(0x9999).is_none(), "devres: interrupcoes LINE_BASED na ordem declarada");
-    assert(device_resources::lookup_resource_list(0x1_0000_0000 | (fake_pdo & 0xFFFF_FFFF)) == synthetic, "devres: chave nos 32 bits baixos do PDO");
+    assert(device_resources::lookup_resource_list(fake_pdo) == synthetic && device_resources::lookup_resource_list(fake_pdo & 0xFFFF_FFFF) == 0, "devres: chave e lista com os 64 bits do PDO");
 }
 
 fn motherboard_bus_driver(assert: Assert) {
@@ -791,7 +791,8 @@ fn io_controller_and_start_io(assert: Assert) {
     let controller_object = unsafe { ControllerObject::at(object) };
     let wait_queue = &controller_object.device_wait_queue;
     let waiting = || wait_queue.device_list_head.flink.get() != wait_queue.device_list_head.address();
-    assert(controller_object.type_.get() == 7 && controller_object.size.get() as u64 == ControllerObject::SIZE + 16 && controller_object.controller_extension.get() == object + ControllerObject::SIZE && wait_queue.type_.get() == 0x14 && wait_queue.size.get() == 0x28 && wait_queue.busy.get() == 0, "controller: IoCreateController com extensao e DeviceWaitQueue");
+    // IO_TYPE_CONTROLLER = 2 (o IoCreateController do ntoskrnl grava 2).
+    assert(controller_object.type_.get() == 2 && controller_object.size.get() as u64 == ControllerObject::SIZE + 16 && controller_object.controller_extension.get() == object + ControllerObject::SIZE && wait_queue.type_.get() == 0x14 && wait_queue.size.get() == 0x28 && wait_queue.busy.get() == 0, "controller: IoCreateController com extensao e DeviceWaitQueue");
     controller::allocate(object, device, routine, 0x11);
     assert(calls() == 1 && CONTROLLER_SEEN[1].load(SeqCst) == 0x11 && CONTROLLER_SEEN[2].load(SeqCst) == 0xABC0 && wait_queue.busy.get() == 1 && !waiting(), "controller: livre executa ja com o CurrentIrp (KeepObject mantem ocupado)");
     controller::allocate(object, device, routine, 0x22);
@@ -828,12 +829,20 @@ fn io_controller_and_start_io(assert: Assert) {
         start_io::start_next_packet(device, false);
     }
     assert(*START_IO_ORDER.lock() == alloc::vec![packets[0], packets[2], packets[1], packets[3]] && device_object.current_irp.get() == 0 && queue.busy.get() == 0 && (1..4).all(|index| queue_entry(index).inserted.get() == 0), "startio: fila ordenada pela chave e esvaziada");
+    // IoSetStartIoAttributes: DOE_SIO_DEFERRED (0x100) e DOE_SIO_NO_CANCEL
+    // (0x200) no StartIoFlags da DEVOBJ_EXTENSION; só liga bits e não toca
+    // nas Characteristics.
+    let extension = guest::alloc_bytes(DevobjExtension::SIZE);
+    let object_extension = unsafe { DevobjExtension::at(extension) };
+    device_object.device_object_extension.set(extension);
     device_object.characteristics.set(0x100);
-    start_io::set_start_io_attributes(device, true, true);
-    let both = device_object.characteristics.get();
+    start_io::set_start_io_attributes(device, true, false);
+    let deferred = object_extension.start_io_flags.get();
+    start_io::set_start_io_attributes(device, false, true);
+    let both = object_extension.start_io_flags.get();
     start_io::set_start_io_attributes(device, false, false);
-    assert(both == 0x3_0100 && device_object.characteristics.get() == 0x100, "startio: IoSetStartIoAttributes preserva os FILE_* baixos");
-    for pointer in packets.into_iter().chain([device, driver, keys]) {
+    assert(deferred == 0x100 && both == 0x300 && object_extension.start_io_flags.get() == 0x300 && device_object.characteristics.get() == 0x100, "startio: IoSetStartIoAttributes no StartIoFlags da DEVOBJ_EXTENSION");
+    for pointer in packets.into_iter().chain([device, driver, keys, extension]) {
         guest::free_bytes(pointer);
     }
 }
