@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use crate::hal::physical;
 use crate::rtl::{KernelError, SpinLock};
 
-const PHYSICAL_LIMIT: u64 = 0x1_0000_0000; // identity map do bootstrap
+const PHYSICAL_LIMIT: u64 = crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT; // fim do mapa direto
 const MAX_TABLE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -57,7 +57,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 fn address64(bytes: &[u8], offset: usize) -> Result<u64, KernelError> {
     let address = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
     if address >= PHYSICAL_LIMIT {
-        return Err(KernelError::new("ACPI address above bootstrap mapping"));
+        return Err(KernelError::new("ACPI address above the direct map"));
     }
     Ok(address)
 }

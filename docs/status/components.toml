@@ -211,7 +211,7 @@ estado = "implementado"
 caminhos = ["kernel/src/ntos/mm/pfn.rs", "kernel/src/ntos/mm/paging.rs", "kernel/src/ntos/mm/kernel_pool.rs", "kernel/src/ntos/mm/guest_memory.rs"]
 testes = ["selftest"]
 fase = "2"
-notas = "A memória que os drivers enxergam é acessada como no NT: uma instrução por acesso, direto pelo endereço virtual, respeitando páginas somente leitura e cópia na escrita; a falta de página do anel 0 passa pelo Mm antes do bugcheck, e as PTEs são gravadas numa única escrita de 64 bits. Ponteiros vindos do modo usuário são sondados antes (o papel do __try/ProbeForRead) e devolvem STATUS_ACCESS_VIOLATION."
+notas = "A memória que os drivers enxergam é acessada como no NT: uma instrução por acesso, direto pelo endereço virtual, respeitando páginas somente leitura e cópia na escrita; a falta de página do anel 0 passa pelo Mm antes do bugcheck, e as PTEs são gravadas numa única escrita de 64 bits. Ponteiros vindos do modo usuário são sondados antes (o papel do __try/ProbeForRead) e devolvem STATUS_ACCESS_VIOLATION. Endereços físicos nunca são usados como ponteiro: toda a memória física aparece num mapa direto na metade de sistema (0xFFFFB000_00000000 + endereço físico), montado no boot, e é por ele que o kernel lê tabelas de páginas, o banco de PFNs, MMIO, tabelas ACPI e os dados dos processadores secundários; MmMapIoSpace devolve endereços desse mapa, como o NT devolve endereços de sistema."
 
 [[componente]]
 nome = "Multiprocessador (SMP)"

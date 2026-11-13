@@ -3,17 +3,22 @@
 //! Blocos livres agrupados por tamanho sobre a RAM detectada pelo E820.
 //! Heap exclusivo de 32 MB até 96 MB, conforme `ntos/mm/memory_map`; os
 //! frames do PFN começam em 96 MB. Também é o `#[global_allocator]` do Rust.
+//!
+//! Os cabeçalhos dos blocos e as listas livres são lidos e gravados pelo
+//! mapa direto da memória física (`DIRECT_MAP_BASE + PA`). O ponteiro
+//! entregue ao chamador ainda é o da identidade baixa (igual ao endereço
+//! físico): [`to_caller`] e [`from_caller`] fazem a fronteira.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, null_mut};
 
+use super::physical;
+use crate::ntos::mm::memory_map as map;
 use crate::rtl::SpinLock;
 
 const HEAP_START: u64 = 0x200_0000; // 32 MB (acima de imagens PE + drivers)
 const HEAP_END: u64 = 0x600_0000; // 96 MB: início dos frames PFN
-const RAM_CAP: u64 = 0x1_0000_0000; // cap de 4 GB (o identity map cobre 4 GB)
-const E820_COUNT_ADDRESS: u64 = 0x4FF0;
-const E820_TABLE_ADDRESS: u64 = 0x5000;
+const RAM_CAP: u64 = map::PHYSICAL_MEMORY_LIMIT; // cap de 4 GB (o mapa direto cobre 4 GB)
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -25,11 +30,22 @@ struct E820Entry {
 }
 
 fn e820_count() -> usize {
-    unsafe { ptr::read_volatile(E820_COUNT_ADDRESS as *const u16) as usize }
+    physical::read16(map::E820_COUNT_PHYS) as usize
 }
 
 fn e820_entry(index: usize) -> E820Entry {
-    unsafe { ptr::read_unaligned((E820_TABLE_ADDRESS as *const E820Entry).add(index)) }
+    let at = map::E820_TABLE_PHYS + index as u64 * core::mem::size_of::<E820Entry>() as u64;
+    E820Entry { base: physical::read64(at), length: physical::read64(at + 8), kind: physical::read32(at + 16), acpi: physical::read32(at + 20) }
+}
+
+/// Payload no mapa direto -> ponteiro de identidade entregue ao chamador.
+fn to_caller(payload: *mut u8) -> *mut u8 {
+    if payload.is_null() { payload } else { (payload as u64 - map::DIRECT_MAP_BASE) as *mut u8 }
+}
+
+/// Ponteiro de identidade do chamador -> payload no mapa direto.
+fn from_caller(pointer: *mut u8) -> *mut u8 {
+    if pointer.is_null() { pointer } else { physical::to_virtual(pointer as u64) as *mut u8 }
 }
 
 #[repr(C)]
@@ -164,7 +180,7 @@ impl Heap {
         if heap_end < HEAP_START + HDR_SIZE as u64 + 16 {
             return;
         }
-        let first = HEAP_START as *mut Block;
+        let first = physical::range_to_virtual(HEAP_START, heap_end - HEAP_START) as *mut Block;
         (*first).size = (heap_end - HEAP_START) as usize - HDR_SIZE;
         (*first).next = null_mut();
         (*first).previous = null_mut();
@@ -275,12 +291,12 @@ pub fn init() {
 
 /// `kmalloc`: bloco alinhado a 16 bytes ou nulo.
 pub fn kmalloc(size: usize) -> *mut u8 {
-    unsafe { HEAP.lock().allocate(size) }
+    to_caller(unsafe { HEAP.lock().allocate(size) })
 }
 
 /// `kfree`.
 pub fn kfree(pointer: *mut u8) {
-    unsafe { HEAP.lock().release(pointer) }
+    unsafe { HEAP.lock().release(from_caller(pointer)) }
 }
 
 /// Ocupação do heap: (total, usado).

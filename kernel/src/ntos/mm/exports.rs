@@ -38,7 +38,7 @@ fn unmap_locked_pages(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn map_io_space_ex(call: &Call) -> Result<u64, KernelError> {
-    Ok(io_space::map_ex(call.arg(1)))
+    Ok(io_space::map_ex(call.arg(1), call.arg(2)))
 }
 fn probe_and_lock_pages(call: &Call) -> Result<u64, KernelError> {
     mdl::probe_and_lock_pages(call.arg(1));

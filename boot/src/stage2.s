@@ -5,7 +5,8 @@
 # 2. A20 via porta 0x92
 # 3. Modo protegido (GDT flat)
 # 4. Kernel do disco p/ 0x100000 via ATA PIO (LBA 65, sem BIOS)
-# 5. Paginacao identity 4GB (2MB pages), SSE habilitado
+# 5. Paginacao identity 4GB e mapa direto em 0xFFFFB000_00000000 (2MB
+#    pages), SSE habilitado
 # 6. PAE + LME -> long mode, stack em 0xF80008, salta p/ o entry do PE
 #
 # Marcadores de progresso na serial COM1: B E A P K G L 6
@@ -210,9 +211,11 @@ stage2_no_disk:
     call stage2_putc32
 
     # ---- paginacao identity 4GB ----
+    # Zera as tabelas da identidade (PML4, PDPT, 4 PDs) e as do mapa direto
+    # (PDPT, 4 PDs), contiguas logo depois.
     mov edi, {PML4}
     xor eax, eax
-    mov ecx, 0x6000 / 4
+    mov ecx, ({DIRECT_PD} + 0x4000 - {PML4}) / 4
     .byte 0xF3, 0xAB            # rep stosd
     mov dword ptr [{PML4}], {PDPT} + 3
     mov dword ptr [{PDPT}], {PD0} + 3
@@ -229,6 +232,25 @@ stage2_fill:
     add edi, 8
     dec ecx
     jnz stage2_fill
+
+    # ---- mapa direto: DIRECT_MAP_BASE + PA -> PA nos mesmos 4GB ----
+    # Paginas de 2MB de supervisor, RW e NX (o NXE e exigido abaixo antes
+    # de ligar a paginacao). E por aqui que o kernel acessa memoria fisica.
+    mov dword ptr [{PML4} + {DIRECT_PML4_INDEX} * 8], {DIRECT_PDPT} + 3
+    mov dword ptr [{DIRECT_PDPT}], {DIRECT_PD} + 3
+    mov dword ptr [{DIRECT_PDPT} + 8], {DIRECT_PD} + 0x1000 + 3
+    mov dword ptr [{DIRECT_PDPT} + 16], {DIRECT_PD} + 0x2000 + 3
+    mov dword ptr [{DIRECT_PDPT} + 24], {DIRECT_PD} + 0x3000 + 3
+    mov edi, {DIRECT_PD}
+    mov eax, 0x83               # present|rw|page-size(2MB)
+    mov ecx, 2048
+stage2_fill_direct:
+    mov dword ptr [edi], eax
+    mov dword ptr [edi + 4], 0x80000000     # NX
+    add eax, 0x200000
+    add edi, 8
+    dec ecx
+    jnz stage2_fill_direct
     mov al, 'G'
     call stage2_putc32
 

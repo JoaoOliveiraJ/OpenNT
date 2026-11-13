@@ -26,6 +26,11 @@ global_asm!(
     PML4 = const 0x70000,
     PDPT = const 0x71000,
     PD0 = const 0x72000,
+    // Mapa direto da memória física (kernel/src/ntos/mm/memory_map.rs):
+    // PML4[352] = 0xFFFF_B000_0000_0000, PDPT e 4 PDs logo após as PDs.
+    DIRECT_PML4_INDEX = const 352,
+    DIRECT_PDPT = const 0x76000,
+    DIRECT_PD = const 0x77000,
     KERNEL_LBA = const 65,
     KERNEL_DEST = const 0x100000,
     STACK_TOP = const 0xF80008,

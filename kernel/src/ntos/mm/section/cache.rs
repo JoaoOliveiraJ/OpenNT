@@ -1,12 +1,14 @@
 //! Tipo de cache dos PFNs de seção.
 //!
-//! Todo alias de um PFN de seção usa o mesmo tipo PAT, inclusive o alias de
-//! identidade usado para zerar e para I/O de arquivo. O mapeamento antigo
-//! volta antes de o frame reentrar no alocador geral de PFNs.
+//! Todo alias de um PFN de seção usa o mesmo tipo PAT, inclusive o alias
+//! físico do kernel, a VA do mapa direto usada para zerar e para I/O de
+//! arquivo (`hal::physical`). O mapeamento antigo volta antes de o frame
+//! reentrar no alocador geral de PFNs.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::ntos::mm::memory_map;
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::hal::cpu;
 use crate::ntos::ke::smp;
@@ -22,10 +24,10 @@ fn flush() -> Result<(), KernelError> {
 }
 
 fn map(frame: u64, flags: u64, nx: bool) -> bool {
-    paging::map_page(frame, frame, flags, MapOptions { nx, skip_invalidate: false, deferred_tables: None })
+    paging::map_page(memory_map::direct_map(frame), frame, flags, MapOptions { nx, skip_invalidate: false, deferred_tables: None })
 }
 
-/// PAGE_NOCACHE (PCD|PWT) ou PAGE_WRITECOMBINE (PAT) no alias de identidade.
+/// PAGE_NOCACHE (PCD|PWT) ou PAGE_WRITECOMBINE (PAT) no alias do mapa direto.
 /// `Ok(false)` = faltou memória para dividir uma página grande.
 pub fn set(frames: &[u64], protection: u32) -> Result<bool, KernelError> {
     let flags = if protection & 0x200 != 0 { 0x18 } else if protection & 0x400 != 0 { 0x80 } else { 0 };
@@ -38,12 +40,13 @@ pub fn set(frames: &[u64], protection: u32) -> Result<bool, KernelError> {
             if OWNED.lock().contains_key(&frame) {
                 return Err((false, KernelError::new("section cache frame already owned")));
             }
-            let mut page = paging::query_page(frame, false).filter(|page| page.physical_address == frame).ok_or((false, KernelError::new("section PFN lacks identity mapping")))?;
+            let alias = memory_map::direct_map(frame);
+            let mut page = paging::query_page(alias, false).filter(|page| page.physical_address == frame).ok_or((false, KernelError::new("section PFN lacks a direct-map alias")))?;
             if page.page_size != 4096 {
-                if !paging::split_large_page(frame, false) {
+                if !paging::split_large_page(alias, false) {
                     return Err((true, KernelError::new("section cache table allocation failed")));
                 }
-                page = paging::query_page(frame, false).ok_or((false, KernelError::new("section PFN lacks identity mapping")))?;
+                page = paging::query_page(alias, false).ok_or((false, KernelError::new("section PFN lacks a direct-map alias")))?;
             }
             OWNED.lock().insert(frame, (page.flags, page.nx));
             changed.push(frame);

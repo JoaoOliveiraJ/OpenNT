@@ -28,10 +28,17 @@ pub fn frame() -> u64 {
     SHARED_FRAME.load(Ordering::Relaxed)
 }
 
-/// A KUSER_SHARED_DATA pelo frame (alias de identidade da página).
+/// A KUSER_SHARED_DATA pelo frame, na VA do mapa direto.
 fn shared(frame: u64) -> &'static KuserSharedData {
-    // SAFETY: frame próprio da página compartilhada, mapeado por identidade.
-    unsafe { KuserSharedData::at(frame) }
+    // SAFETY: frame próprio da página compartilhada, alcançado pelo mapa
+    // direto (que nunca é desfeito).
+    unsafe { KuserSharedData::at(physical::range_to_virtual(frame, 0x1000)) }
+}
+
+/// A página publicada (`None` antes de [`init`]).
+pub fn data() -> Option<&'static KuserSharedData> {
+    let frame = frame();
+    (frame != 0).then(|| shared(frame))
 }
 
 /// Protocolo do KSYSTEM_TIME: High2Time, LowPart e por último High1Time;

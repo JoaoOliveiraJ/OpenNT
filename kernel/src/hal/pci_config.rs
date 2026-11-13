@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::hal::{cpu, physical, port};
+use crate::hal::{cpu, port};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -24,8 +24,7 @@ pub fn init() -> Result<(), KernelError> {
     if lock == 0 {
         return Err(KernelError::new("PCI configuration lock allocation failed"));
     }
-    physical::write32(lock, 0);
-    physical::write32(lock + 4, 0);
+    guest::write64(lock, 0);
     LOCK.store(lock, Ordering::Release);
     Ok(())
 }
@@ -78,11 +77,11 @@ pub fn transaction<T>(bus: u32, device: u32, function: u32, action: impl FnOnce(
         return Err(KernelError::new("invalid PCI bus/device/function"));
     }
     let flags = cpu::save_and_disable_interrupts();
-    while physical::compare_exchange64(lock, 0, 1) != 0 {
+    while guest::atomic_u64(lock).compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         cpu::pause();
     }
     let result = action(&Io { base: 0x8000_0000 | bus << 16 | device << 11 | function << 8 });
-    let released = physical::compare_exchange64(lock, 1, 0) == 1;
+    let released = guest::atomic_u64(lock).compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok();
     cpu::restore_interrupts(flags);
     if !released {
         return Err(KernelError::new("PCI configuration lock ownership corrupted"));

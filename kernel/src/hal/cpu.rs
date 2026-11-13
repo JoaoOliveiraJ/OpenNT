@@ -106,6 +106,17 @@ pub fn load_idt(base: u64, size: u16) {
     }
 }
 
+/// Recarrega o GDTR (sem tocar nos seletores carregados).
+pub fn load_gdt(base: u64, limit: u16) {
+    #[repr(C, packed)]
+    struct TableRegister {
+        limit: u16,
+        base: u64,
+    }
+    let register = TableRegister { limit, base };
+    unsafe { asm!("lgdt [{}]", in(reg) &register, options(readonly, nostack)) }
+}
+
 /// Esvazia os caches (WBINVD).
 pub fn flush_caches() {
     unsafe { asm!("wbinvd", options(nostack)) }

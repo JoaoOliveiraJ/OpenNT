@@ -1,6 +1,7 @@
 //! HAL do OpenNT — a camada de abstração de hardware.
 //!
-//! Hardware: portas (`port`), serial (`serial`), CPU (`cpu`), memória física
+//! Hardware: portas (`port`), serial (`serial`), CPU (`cpu`), acesso volátil
+//! a endereços virtuais (`volatile`), memória física pelo mapa direto
 //! (`physical`), LAPIC (`lapic`), RTC (`rtc`), heap do kernel (`kmalloc`),
 //! arquivos embutidos (`bundle`) e a arena dos convidados (`host`). O código
 //! x64 (interrupções, anel 3, APs, chamadas MS-ABI e trampolins) fica em
@@ -18,6 +19,7 @@ pub mod physical;
 pub mod port;
 pub mod rtc;
 pub mod serial;
+pub mod volatile;
 
 // Interfaces da HAL vistas pelo executivo: ACPI, PCI, firmware, a tabela
 // privada (HalPrivateDispatchTable) e os exports Hal*.

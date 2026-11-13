@@ -35,7 +35,8 @@ extern "C" {
 }
 
 /// Entrada 64-bit do kernel. O stage2 chega aqui com RSP = 0xF80008
-/// (alinhamento de quem acabou de receber um CALL) e o identity map de 4 GB.
+/// (alinhamento de quem acabou de receber um CALL), a identidade dos 4 GB
+/// baixos e o mapa direto da mesma faixa física em `DIRECT_MAP_BASE`.
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub extern "C" fn kernel_main() -> ! {

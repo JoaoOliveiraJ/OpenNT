@@ -30,8 +30,8 @@ const PENDING: u32 = 0x103;
 const NOT_SUPPORTED: u32 = 0xC000_00BB;
 const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
 /// Células da HAL de modo usuário: tipo da saída e estado zerado por execução.
-const EXIT_KIND_CELL: u64 = 0x8_F1B0;
-const RESET_CELLS: [u64; 5] = [0x8_F090, 0x8_F098, 0x8_F138, 0x8_F140, 0x8_F148];
+const EXIT_KIND_CELL: u64 = crate::hal::amd64::usermode::USER_EXIT_KIND;
+const RESET_CELLS: [u64; 5] = crate::hal::amd64::usermode::FAULT_CELLS;
 
 /// Slots dos pumps do laço, em ordem fixa.
 pub mod pump {

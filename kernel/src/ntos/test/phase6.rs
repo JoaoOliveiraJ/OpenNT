@@ -1093,7 +1093,7 @@ fn ntoskrnl_small_modules(assert: Assert) {
     mdl_header.mdl_flags.set(1);
     mdl_header.mapped_system_va.set(va + 0x10);
     mdl_header.byte_count.set(0x100);
-    let flags = || paging::query_page(va, true).map_or((0, false), |page| (guest::read64(page.entry_address), page.nx));
+    let flags = || paging::query_page(va, true).map_or((0, false), |page| (crate::hal::physical::read64(page.entry_address), page.nx));
     let readonly = call_export("MmProtectMdlSystemAddress", &[mdl, 2]);
     let (readonly_entry, readonly_nx) = flags();
     let noaccess = call_export("MmProtectMdlSystemAddress", &[mdl, 1]);
@@ -2800,6 +2800,16 @@ fn rtl_group_exports(assert: Assert) {
     default_entry.default_data.set(default_data);
     default_entry.default_length.set(4);
     assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) == 0 && guest::read32(direct) == 0x1234 && guest::read32(defaulted) == 0x55, "rtl: RtlQueryRegistryValues DIRECT com valor e default");
+    // RTL_REGISTRY_HANDLE: o Path é o handle da chave aberta, que continua aberto.
+    guest::write32(direct, 0);
+    let opened = crate::ntos::cm::key::services::open_path("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\OpenNtRtlTest", false);
+    let handle = opened.as_ref().map_or(0, |&(status, handle)| if status == 0 { handle } else { 0 });
+    let by_handle = handle != 0 && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0 && guest::read32(direct) == 0x1234;
+    let still_open = handle != 0 && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0;
+    if handle != 0 {
+        crate::ntos::cm::registry::close_handle(handle as u32);
+    }
+    assert(by_handle && still_open, "rtl: RtlQueryRegistryValues com RTL_REGISTRY_HANDLE consulta a chave do handle sem fecha-lo");
     default_entry.flags.set(0x24);
     default_entry.default_type.set(0);
     assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) as u32 == 0xC000_0034, "rtl: RtlQueryRegistryValues REQUIRED sem valor nem default");
@@ -8071,7 +8081,10 @@ fn fsrtl_volume_support_exports(assert: Assert) {
         "fsrtl-volume-support: FsRtlIsFatDbcsLegal",
     );
     // DismountComplete conta só sucesso; UpdateDiskCounters soma em KPRCB.FsCounters.
-    let shared = at::<nt::KuserSharedData>(crate::ntos::mm::shared_user_data::frame());
+    let Some(shared) = crate::ntos::mm::shared_user_data::data() else {
+        assert(false, "fsrtl-volume-support: KUSER_SHARED_DATA publicada");
+        return;
+    };
     let before = shared.dismount_count.get();
     call_export("FsRtlDismountComplete", &[0, 0]);
     call_export("FsRtlDismountComplete", &[0, 0xC000_0001]);

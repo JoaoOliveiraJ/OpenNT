@@ -5,12 +5,14 @@
 //! que registra o evento na memória compartilhada, alimenta o ring do
 //! teclado, faz EOI e volta com IRETQ — sem chamar Rust.
 //!
-//! Mapa de memória física compartilhada:
-//!   0x81000: u32 irq_count[256]       (contagem de interrupções por vetor)
-//!   0x81400: ring buffer do teclado   (head u32 @0x81400, tail u32 @0x81404,
-//!                                      dados 256B @0x81408)
-//!   0x81510: byte de controle — não zero quando um port driver nativo
-//!            (i8042prt) é dono da porta 0x60
+//! Página física compartilhada (frame 0x81000), acessada pelo mapa direto
+//! da metade de sistema; os stubs mantêm a VA da página em R9 e a da página
+//! de controle do anel 3 em R8:
+//!   +0x000: u32 irq_count[256]       (contagem de interrupções por vetor)
+//!   +0x400: ring buffer do teclado   (head u32 @+0x400, tail u32 @+0x404,
+//!                                     dados 256B @+0x408)
+//!   +0x510: byte de controle — não zero quando um port driver nativo
+//!           (i8042prt) é dono da porta 0x60
 //!
 //! Exceções (vetores 0–31), o fast-fail `int 0x29` e o serviço de depuração
 //! `int 0x2D` não podem voltar com IRET cego: no anel 3 o processo morre com o
@@ -24,17 +26,23 @@
 
 use core::arch::global_asm;
 
+use crate::hal::amd64::usermode::{cell, CONTROL_PAGE};
 use crate::hal::{cpu, serial};
+use crate::ntos::mm::memory_map;
 use crate::rtl::print::write_args;
 
 /// Tamanho de cada stub em `irq_stub_table` (push imm8 + jmp rel32 + 3 NOPs).
 pub const STUB_SIZE: u64 = 10;
 
-pub const IRQ_COUNT_BASE: u64 = 0x81000;
-pub const KEYBOARD_HEAD: u64 = 0x81400;
-pub const KEYBOARD_TAIL: u64 = 0x81404;
-pub const KEYBOARD_DATA: u64 = 0x81408;
-pub const NATIVE_KEYBOARD_OWNER: u64 = 0x81510;
+/// Endereços FÍSICOS das células (lidos e gravados por `hal::physical`).
+pub const IRQ_PAGE_PHYS: u64 = 0x81000;
+pub const IRQ_COUNT_BASE: u64 = IRQ_PAGE_PHYS;
+pub const KEYBOARD_HEAD: u64 = IRQ_PAGE_PHYS + 0x400;
+pub const KEYBOARD_TAIL: u64 = IRQ_PAGE_PHYS + 0x404;
+pub const KEYBOARD_DATA: u64 = IRQ_PAGE_PHYS + 0x408;
+pub const NATIVE_KEYBOARD_OWNER: u64 = IRQ_PAGE_PHYS + 0x510;
+/// Registrador de EOI do LAPIC (xAPIC) pelo mapa direto.
+const LAPIC_EOI: u64 = memory_map::direct_map(memory_map::LAPIC_PHYS + 0xB0);
 
 global_asm!(
     r#"
@@ -90,10 +98,13 @@ irq_entry_cs:
     call user_debug_leave
 irq_gs_ready:
     movzx edi, byte ptr [rsp + 72]  # vetor (push imm8 estende o sinal: so o byte)
+    # Celulas pelo mapa direto: R8 = pagina de controle, R9 = pagina de IRQ
+    # (os dois ja estao salvos no quadro).
+    movabs r8, {control_page}
+    movabs r9, {irq_page}
 
     # irq_count[vetor]++
-    mov eax, {irq_count}
-    inc dword ptr [rax + rdi*4]
+    inc dword ptr [r9 + rdi*4 + {irq_count}]
 
     # excecoes (0-31), int 0x29 (fast fail) e int 0x2D (servico de depuracao)
     cmp edi, 0x20
@@ -109,7 +120,7 @@ irq_gs_ready:
     jne irq_context_saved
     cmp word ptr [rsp + 88], 0x33
     jne irq_context_saved
-    mov rax, [{context_cell}]
+    mov rax, [r8 + {context_cell}]
     test rax, rax
     jz irq_context_saved
     fxsave64 [rax + 0x100]
@@ -151,22 +162,22 @@ irq_context_saved:
     # um port driver nativo conectou o vetor (byte de controle nao zero)
     cmp edi, 0x21
     jne irq_no_key
-    cmp byte ptr [{native_keyboard}], 0
+    cmp byte ptr [r9 + {native_keyboard}], 0
     jne irq_no_key
     in al, 0x60
-    mov ecx, dword ptr [{kbd_head}]
+    mov ecx, dword ptr [r9 + {kbd_head}]
     mov edx, ecx
     inc edx
     and edx, 0xFF
-    cmp edx, dword ptr [{kbd_tail}]
+    cmp edx, dword ptr [r9 + {kbd_tail}]
     je irq_no_key                   # cheio: descarta
-    mov byte ptr [{kbd_data} + rcx], al
-    mov dword ptr [{kbd_head}], edx
+    mov byte ptr [r9 + rcx + {kbd_data}], al
+    mov dword ptr [r9 + {kbd_head}], edx
 irq_no_key:
     # EOI: vetores >= 0x40 sao do LAPIC (timer etc.)
     cmp edi, 0x40
     jb irq_pic_eoi
-    mov eax, 0xFEE000B0
+    movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
     jmp irq_restore
 irq_pic_eoi:
@@ -184,9 +195,9 @@ irq_restore:
     jne irq_restore_registers
     cmp word ptr [rsp + 88], 0x33
     jne irq_restore_registers
-    cmp qword ptr [{context_cell}], 0
+    cmp qword ptr [r8 + {context_cell}], 0
     je irq_restore_registers
-    mov dword ptr [{exit_kind}], 2
+    mov dword ptr [r8 + {exit_kind}], 2
     xor edi, edi
     jmp user_terminate_current
 irq_restore_registers:
@@ -219,7 +230,7 @@ irq_exception:
     jne irq_kernel_exception
     cmp r10d, 0x29
     je irq_user_context_saved
-    mov rax, [{context_cell}]
+    mov rax, [r8 + {context_cell}]
     test rax, rax
     jz irq_user_context_saved
     fxsave64 [rax + 0x100]
@@ -260,14 +271,14 @@ irq_exception:
     jne irq_user_error_saved
     mov rdx, [rsp + 80]
 irq_user_error_saved:
-    mov [{error_code}], rdx         # codigo de erro do hardware (acesso do #PF)
-    mov dword ptr [{exit_kind}], 3  # excecao, despachada pelo kernel
+    mov [r8 + {error_code}], rdx    # codigo de erro do hardware (acesso do #PF)
+    mov dword ptr [r8 + {exit_kind}], 3  # excecao, despachada pelo kernel
 irq_user_context_saved:
-    mov [{fault_vector}], r10d
+    mov [r8 + {fault_vector}], r10d
     mov rax, [rsp + 56]             # RCX original, inclusive __fastfail(codigo)
-    mov [{fault_rcx}], rax
+    mov [r8 + {fault_rcx}], rax
     mov rax, [rsp + r11 - 8]
-    mov [{fault_rip}], rax
+    mov [r8 + {fault_rip}], rax
     # vetor -> NTSTATUS (o que o KiDispatchException relataria)
     mov edi, 0xC0000005
     cmp r10d, 0x29
@@ -298,9 +309,9 @@ irq_user_fastfail:
 irq_user_terminate:
     # Publica a pilha do usuario e o CR2, e os imprime antes de encerrar.
     mov rax, [rsp + r11 + 16]
-    mov [{fault_rsp}], rax
+    mov [r8 + {fault_rsp}], rax
     mov rax, cr2
-    mov [{fault_cr2}], rax
+    mov [r8 + {fault_cr2}], rax
     mov dx, 0x3F8
     mov al, 0x20
     out dx, al
@@ -499,19 +510,22 @@ irq_exception_halt:
 
 .popsection
 "#,
-    irq_count = const IRQ_COUNT_BASE,
-    native_keyboard = const NATIVE_KEYBOARD_OWNER,
-    kbd_head = const KEYBOARD_HEAD,
-    kbd_tail = const KEYBOARD_TAIL,
-    kbd_data = const KEYBOARD_DATA,
-    context_cell = const 0x8_F1A8u64,
-    exit_kind = const 0x8_F1B0u64,
-    error_code = const 0x8_F1B8u64,
-    fault_vector = const 0x8_F138u64,
-    fault_rcx = const 0x8_F140u64,
-    fault_rip = const 0x8_F148u64,
-    fault_rsp = const 0x8_F090u64,
-    fault_cr2 = const 0x8_F098u64,
+    control_page = const CONTROL_PAGE,
+    irq_page = const memory_map::direct_map(IRQ_PAGE_PHYS),
+    lapic_eoi = const LAPIC_EOI,
+    irq_count = const IRQ_COUNT_BASE - IRQ_PAGE_PHYS,
+    native_keyboard = const NATIVE_KEYBOARD_OWNER - IRQ_PAGE_PHYS,
+    kbd_head = const KEYBOARD_HEAD - IRQ_PAGE_PHYS,
+    kbd_tail = const KEYBOARD_TAIL - IRQ_PAGE_PHYS,
+    kbd_data = const KEYBOARD_DATA - IRQ_PAGE_PHYS,
+    context_cell = const cell::USER_CONTEXT,
+    exit_kind = const cell::EXIT_KIND,
+    error_code = const cell::ERROR_CODE,
+    fault_vector = const cell::FAULT_VECTOR,
+    fault_rcx = const cell::FAULT_RCX,
+    fault_rip = const cell::FAULT_RIP,
+    fault_rsp = const cell::FAULT_RSP,
+    fault_cr2 = const cell::FAULT_CR2,
 );
 
 extern "C" {

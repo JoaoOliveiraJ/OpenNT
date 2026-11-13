@@ -145,10 +145,10 @@ pub fn consume() {
         return;
     }
     guest::write32(usermode::CAPTURE_STATE, 3);
-    let values: Vec<u64> = [0x160u64, 0x168, 0x170, 0x178].iter().map(|offset| guest::read64(0x8_F000 + offset)).collect();
+    let values: Vec<u64> = (0..4u64).map(|index| guest::read64(usermode::CAPTURE_ARGUMENTS_CELL + index * 8)).collect();
     let raw: Vec<String> = values.iter().map(|value| alloc::format!("0x{value:016x}")).collect();
     let export = state::with(|state| state.capture_export.clone());
-    let stack = guest::read64(0x8_F180);
+    let stack = guest::read64(usermode::CAPTURE_STACK_CELL);
     crate::debug_print!("[call-capture] {} args={} rsp=0x{:x}", export, raw.join(","), stack);
     let name = export.split('!').nth(1).unwrap_or("");
     if name == "RtlRaiseException" {

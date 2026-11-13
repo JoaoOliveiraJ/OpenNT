@@ -3,6 +3,11 @@
 //! Anda PML4->PDPT->PD->PT criando os níveis que faltam com frames do PFN,
 //! divide páginas de 2MB em PTs de 4KB sob demanda e invalida a TLB.
 //! Índices de uma VA: PML4[39-47] PDPT[30-38] PD[21-29] PT[12-20].
+//!
+//! Tabelas e entradas são endereçadas pelo endereço FÍSICO (o "entry
+//! address" de [`PageQuery`] e das funções públicas); cada leitura e escrita
+//! passa pelo mapa direto da metade de sistema (`hal::physical`), nunca pela
+//! identidade baixa.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -85,13 +90,19 @@ fn frame_of(entry: u64, size: u64) -> u64 {
 fn add_entry_flags(address: u64, flags: u64) {
     // Uma atualização de permissão não pode apagar NX nem os bits altos nem
     // perder Accessed/Dirty gravados pela CPU: OR atômico na entrada.
-    crate::ntos::mm::guest_memory::atomic_u64(address).fetch_or(flags & 0xFFFF_FFFF, core::sync::atomic::Ordering::SeqCst);
+    physical::atomic_u64(address).fetch_or(flags & 0xFFFF_FFFF, Ordering::SeqCst);
 }
 
 fn table_of(entry: u64) -> u64 {
     let frame = frame_of(entry, 4096);
-    assert!(frame < 0x1_0000_0000, "paging-structure frame outside bootstrap identity map");
+    assert!(frame < map::PHYSICAL_MEMORY_LIMIT, "paging-structure frame outside the direct map");
     frame
+}
+
+/// A folha é um alias físico do kernel (identidade baixa ou mapa direto),
+/// não um dono do frame.
+fn physical_alias(va: u64, pa: u64) -> bool {
+    va == pa || va == map::direct_map(pa)
 }
 
 pub fn pml4_index(va: u64) -> u64 {
@@ -434,9 +445,10 @@ pub fn map_page(va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
     if is_recursive_mapping_address(va) || pa >= 0x10_0000_0000_0000 || pa % 4096 != 0 {
         return false;
     }
-    // A janela identity é acesso físico do kernel, não dono do frame. As
-    // demais folhas, inclusive NOACCESS com backing, exigem RAM reservada.
-    if observed() && va != pa && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 4096) {
+    // A identidade e o mapa direto são acesso físico do kernel, não donos do
+    // frame. As demais folhas, inclusive NOACCESS com backing, exigem RAM
+    // reservada.
+    if observed() && !physical_alias(va, pa) && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 4096) {
         return false;
     }
     let pt_address = ensure_page_table(va, flags & PAGE_USER != 0);
@@ -480,7 +492,7 @@ pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     if is_recursive_mapping_address(va) || offset_at(va, 0x20_0000) != 0 || pa >= 0x10_0000_0000_0000 || pa % 0x20_0000 != 0 {
         return false;
     }
-    if observed() && va != pa && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 0x20_0000) {
+    if observed() && !physical_alias(va, pa) && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 0x20_0000) {
         return false;
     }
     let at = pd_entry_address(va, true, flags & PAGE_USER != 0);

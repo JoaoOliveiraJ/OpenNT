@@ -62,10 +62,11 @@ fn write_exact(field: &Field<u64>, replacement: u64) {
     field.atomic().store(replacement, Ordering::SeqCst);
 }
 
+/// Descritor pelo endereço físico (`physical_base + 48 * frame`).
 fn pfn(address: u64) -> &'static Mmpfn {
-    // SAFETY: descritor do banco de PFNs (physical_base + 48 * frame, no
-    // mapa de identidade), sob o lock STATE.
-    unsafe { Mmpfn::at(address) }
+    // SAFETY: descritor do banco de PFNs, alcançado pela VA do mapa direto,
+    // sob o lock STATE.
+    unsafe { Mmpfn::at(physical::range_to_virtual(address, DESCRIPTOR_SIZE)) }
 }
 
 fn page_location(address: u64) -> u8 {
@@ -305,7 +306,8 @@ pub fn can_map_range(physical_address: u64, byte_length: u64) -> bool {
     true
 }
 
-/// ShareCount conta PTEs reais; a janela identity do boot não é dona.
+/// ShareCount conta PTEs reais; a identidade do boot e o mapa direto não são
+/// donos.
 pub fn add_reference(frame_number: u64, reference: Reference) {
     let mut state = STATE.lock();
     let address = state.existing_address(frame_number);

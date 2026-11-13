@@ -1,4 +1,5 @@
-//! Local APIC em modo xAPIC (MMIO em 0xFEE00000, coberto pelo identity map).
+//! Local APIC em modo xAPIC (MMIO físico em 0xFEE00000, alcançado pelo mapa
+//! direto via `hal::physical`).
 //! Leitura e escrita dos registradores.
 
 use super::physical;

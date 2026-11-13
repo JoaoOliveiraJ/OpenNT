@@ -7,9 +7,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::hal::physical;
 use crate::ntos::mm::memory_map;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 /// 0 = ainda não inicializado; 1 = BIOS legado.
 static FIRMWARE_TYPE: AtomicU32 = AtomicU32::new(0);
@@ -17,10 +17,10 @@ static FIRMWARE_TYPE: AtomicU32 = AtomicU32::new(0);
 /// Lê o handoff "FWT1" do stage2.
 pub fn init() -> Result<(), KernelError> {
     let base = memory_map::BOOT_FIRMWARE_PHYS;
-    if guest::read32(base) != 0x3154_5746 {
+    if physical::read32(base) != 0x3154_5746 {
         return Err(KernelError::new("missing firmware boot handoff"));
     }
-    let actual = guest::read32(base + 4);
+    let actual = physical::read32(base + 4);
     if actual != 1 {
         return Err(KernelError::new(alloc::format!("unsupported firmware boot handoff type {actual}")));
     }

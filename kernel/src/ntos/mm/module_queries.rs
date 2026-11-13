@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use super::kernel_pool::{self, AllocateOptions};
 use super::loaded_images::{self, LoadedImage};
 use super::{paging, physical_layout};
-use crate::hal::cpu;
+use crate::hal::{cpu, physical};
 use crate::ntos::ke::{irql, smp};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -145,7 +145,7 @@ pub fn protect_mdl(mdl: u64, protection: u32) -> Result<u32, KernelError> {
         if page.page_size != 4096 {
             return Ok(0xC000_00BB);
         }
-        let before = guest::read64(page.entry_address);
+        let before = physical::read64(page.entry_address);
         if before & 1 == 0 && before & NOACCESS == 0 {
             return Err(KernelError::new("mapped MDL has an invalid PTE"));
         }
@@ -157,7 +157,8 @@ pub fn protect_mdl(mdl: u64, protection: u32) -> Result<u32, KernelError> {
     let result = (|| -> Result<(), KernelError> {
         for &(va, at, frame) in &pages {
             loop {
-                let before = guest::read64(at);
+                // A PTE pelo endereço físico (mapa direto).
+                let before = physical::read64(at);
                 if before & FRAME != frame {
                     return Err(KernelError::new("MDL mapping changed during protection"));
                 }
@@ -173,7 +174,7 @@ pub fn protect_mdl(mdl: u64, protection: u32) -> Result<u32, KernelError> {
                         after |= NX;
                     }
                 }
-                if guest::compare_exchange64(at, before, after)? == before {
+                if physical::compare_exchange64(at, before, after) == before {
                     break;
                 }
             }

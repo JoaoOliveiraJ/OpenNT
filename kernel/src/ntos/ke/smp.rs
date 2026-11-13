@@ -2,8 +2,9 @@
 //!
 //! Descobre processadores pela MADT e inicia APs com INIT-SIPI-SIPI
 //! direcionado via xAPIC. O trampolim faz a troca de modos e consome
-//! trabalhos nativos numa mailbox física compartilhada. Os offsets devem
-//! coincidir com `hal::amd64::aptrampoline`.
+//! trabalhos nativos numa mailbox física compartilhada, que o BSP lê e grava
+//! pelo mapa direto (`hal::physical`). Os offsets devem coincidir com
+//! `hal::amd64::aptrampoline`.
 
 use alloc::vec::Vec;
 
@@ -143,7 +144,9 @@ fn start_application_processor(slot: usize, identifier: u32) -> Result<bool, Ker
     for offset in [0x20, 0x24, 0x28] {
         physical::write32(MAILBOX + offset, 0);
     }
-    physical::write64(MAILBOX + MAILBOX_BOOT_STACK, map::AP_STACK_BASE + (slot as u64 + 1) * map::AP_STACK_SIZE);
+    // Topo da pilha de boot do AP pela VA do mapa direto (o AP já está em
+    // 64 bits quando a carrega).
+    physical::write64(MAILBOX + MAILBOX_BOOT_STACK, map::direct_map(map::AP_STACK_BASE + (slot as u64 + 1) * map::AP_STACK_SIZE));
 
     if !send_processor_interrupt(identifier, INIT_ASSERT) {
         return Err(KernelError::new("AP INIT delivery failed"));

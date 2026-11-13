@@ -1,112 +1,111 @@
 //! Acesso à memória física: leituras, escritas, zeragem e compare-exchange.
 //!
-//! O stage2 mapeia os primeiros 4 GB em identidade, então o endereço físico
-//! é usado diretamente como ponteiro. Todos os acessos são voláteis: essas
-//! células são compartilhadas com os trampolins de IRQ e com o hardware.
+//! O endereço recebido é FÍSICO e nunca é usado como ponteiro: cada acesso
+//! passa pelo mapa direto da metade de sistema (`DIRECT_MAP_BASE + PA`,
+//! montado pelo stage2 e descrito em `ntos/mm/memory_map.rs`). Um endereço
+//! fora da faixa física mapeada (uma VA passada por engano, por exemplo) para
+//! o sistema. Todos os acessos são voláteis (`hal::volatile`): as células são
+//! compartilhadas com os trampolins de IRQ, com os APs e com o hardware.
 
-use core::arch::asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
-// Cada acesso é um MOV único, como `*(volatile T *)` no C: nunca é elidido
-// nem dividido e aceita endereços desalinhados (o x86 permite).
+use super::volatile;
+use crate::ntos::mm::memory_map as map;
+
+/// VA do mapa direto que alcança `physical_address`. Endereços acima do
+/// limite físico (VAs, sobretudo) não têm tradução e param o sistema.
+#[inline]
+#[track_caller]
+pub fn to_virtual(physical_address: u64) -> u64 {
+    assert!(physical_address < map::PHYSICAL_MEMORY_LIMIT, "endereco fisico fora do mapa direto: {physical_address:#x}");
+    map::direct_map(physical_address)
+}
+
+/// Faixa física inteira dentro do mapa direto: VA do início.
+#[inline]
+#[track_caller]
+pub fn range_to_virtual(physical_address: u64, length: u64) -> u64 {
+    let end = physical_address.checked_add(length);
+    assert!(end.is_some_and(|end| end <= map::PHYSICAL_MEMORY_LIMIT), "faixa fisica fora do mapa direto: {physical_address:#x}+{length:#x}");
+    map::direct_map(physical_address)
+}
 
 #[inline]
 pub fn read8(address: u64) -> u8 {
-    let value: u8;
-    unsafe { asm!("mov {0}, byte ptr [{1}]", out(reg_byte) value, in(reg) address, options(nostack, preserves_flags, readonly)) }
-    value
+    volatile::read8(to_virtual(address))
 }
 
 #[inline]
 pub fn read16(address: u64) -> u16 {
-    let value: u16;
-    unsafe { asm!("mov {0:x}, word ptr [{1}]", out(reg) value, in(reg) address, options(nostack, preserves_flags, readonly)) }
-    value
+    volatile::read16(to_virtual(address))
 }
 
 #[inline]
 pub fn read32(address: u64) -> u32 {
-    let value: u32;
-    unsafe { asm!("mov {0:e}, dword ptr [{1}]", out(reg) value, in(reg) address, options(nostack, preserves_flags, readonly)) }
-    value
+    volatile::read32(to_virtual(address))
 }
 
 #[inline]
 pub fn read64(address: u64) -> u64 {
-    let value: u64;
-    unsafe { asm!("mov {0}, qword ptr [{1}]", out(reg) value, in(reg) address, options(nostack, preserves_flags, readonly)) }
-    value
+    volatile::read64(to_virtual(address))
 }
 
 #[inline]
 pub fn write8(address: u64, value: u8) {
-    unsafe { asm!("mov byte ptr [{0}], {1}", in(reg) address, in(reg_byte) value, options(nostack, preserves_flags)) }
+    volatile::write8(to_virtual(address), value)
 }
 
 #[inline]
 pub fn write16(address: u64, value: u16) {
-    unsafe { asm!("mov word ptr [{0}], {1:x}", in(reg) address, in(reg) value, options(nostack, preserves_flags)) }
+    volatile::write16(to_virtual(address), value)
 }
 
 #[inline]
 pub fn write32(address: u64, value: u32) {
-    unsafe { asm!("mov dword ptr [{0}], {1:e}", in(reg) address, in(reg) value, options(nostack, preserves_flags)) }
+    volatile::write32(to_virtual(address), value)
 }
 
 #[inline]
 pub fn write64(address: u64, value: u64) {
-    unsafe { asm!("mov qword ptr [{0}], {1}", in(reg) address, in(reg) value, options(nostack, preserves_flags)) }
+    volatile::write64(to_virtual(address), value)
 }
 
 pub fn read_bytes(address: u64, length: usize) -> alloc::vec::Vec<u8> {
-    (0..length as u64).map(|offset| read8(address + offset)).collect()
+    volatile::read_bytes(range_to_virtual(address, length as u64), length)
 }
 
 pub fn write_bytes(address: u64, bytes: &[u8]) {
-    for (offset, &byte) in bytes.iter().enumerate() {
-        write8(address + offset as u64, byte);
-    }
+    volatile::write_bytes(range_to_virtual(address, bytes.len() as u64), bytes)
 }
 
 pub fn equal_bytes(address: u64, bytes: &[u8]) -> bool {
-    bytes.iter().enumerate().all(|(offset, &byte)| read8(address + offset as u64) == byte)
+    volatile::equal_bytes(range_to_virtual(address, bytes.len() as u64), bytes)
 }
 
 pub fn zero(address: u64, length: usize) {
-    unsafe { core::ptr::write_bytes(address as *mut u8, 0, length) }
+    volatile::zero(range_to_virtual(address, length as u64), length)
+}
+
+/// A célula física de 32 bits como atômico (pela VA do mapa direto).
+pub fn atomic_u32(address: u64) -> &'static AtomicU32 {
+    assert!(address % 4 == 0, "celula fisica desalinhada: {address:#x}");
+    // SAFETY: o mapa direto cobre toda a faixa física e nunca é desfeito.
+    unsafe { volatile::atomic_u32(to_virtual(address)) }
+}
+
+/// A célula física de 64 bits como atômico (pela VA do mapa direto).
+pub fn atomic_u64(address: u64) -> &'static AtomicU64 {
+    assert!(address % 8 == 0, "celula fisica desalinhada: {address:#x}");
+    // SAFETY: o mapa direto cobre toda a faixa física e nunca é desfeito.
+    unsafe { volatile::atomic_u64(to_virtual(address)) }
 }
 
 /// CMPXCHG de 32 bits: devolve o valor anterior.
 pub fn compare_exchange32(address: u64, expected: u32, desired: u32) -> u32 {
-    let cell = unsafe { &*(address as *const AtomicU32) };
-    match cell.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(previous) | Err(previous) => previous,
-    }
+    volatile::compare_exchange32(to_virtual(address), expected, desired)
 }
 
 /// CMPXCHG de 64 bits: devolve o valor anterior.
 pub fn compare_exchange64(address: u64, expected: u64, desired: u64) -> u64 {
-    let cell = unsafe { &*(address as *const AtomicU64) };
-    match cell.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(previous) | Err(previous) => previous,
-    }
-}
-
-/// CMPXCHG16B: devolve o valor anterior (baixo, alto). O endereço precisa
-/// estar alinhado a 16 bytes.
-pub fn compare_exchange128(address: u64, expected: (u64, u64), replacement: (u64, u64)) -> (u64, u64) {
-    let (mut low, mut high) = expected;
-    unsafe {
-        core::arch::asm!(
-            "xchg rbx, {replacement_low}",
-            "lock cmpxchg16b [{address}]",
-            "xchg rbx, {replacement_low}",
-            address = in(reg) address,
-            replacement_low = inout(reg) replacement.0 => _,
-            in("rcx") replacement.1,
-            inout("rax") low,
-            inout("rdx") high,
-        );
-    }
-    (low, high)
+    volatile::compare_exchange64(to_virtual(address), expected, desired)
 }

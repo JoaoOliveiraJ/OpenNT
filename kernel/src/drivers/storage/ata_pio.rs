@@ -255,7 +255,7 @@ fn task_file(lba: u64, count: u32) {
     port::write8(ATA_LBA_HI, (lba >> 16) as u8);
 }
 
-/// READ DMA real para memória física (identidade).
+/// READ DMA real para memória física (endereço físico do destino).
 pub fn read_sectors_dma_to_physical(lba: u64, count: u32, drive: u8, destination: u64) -> Result<(), KernelError> {
     CHANNEL.lock().transfer_dma(lba, count, drive, destination, false)
 }

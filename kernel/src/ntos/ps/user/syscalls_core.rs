@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use super::state::{self, probe_user_read, probe_user_write, stack_arg, UserHandle, EXIT_CODE_CELL, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, TERMINATE_MAGIC, USER_RSP_CELL_ADDR};
 use super::threads;
-use crate::hal::{cpu, kmalloc, physical, serial};
+use crate::hal::{cpu, kmalloc, serial};
 use crate::ntos::ex::boot_environment_information;
 use crate::ntos::ke::{clock, dispatcher, processor_information, smp};
 use crate::ntos::mm::{memory_map, pfn};
@@ -114,7 +114,7 @@ fn nt_display_string(string: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Re
 fn nt_terminate_process(_handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     state::with(|state| state.termination_rsp = guest::read64(USER_RSP_CELL_ADDR));
     crate::debug_print!("[usermode] NtTerminateProcess(exit={:#x})", exit_code as u32);
-    physical::write32(EXIT_CODE_CELL, exit_code as u32);
+    guest::write32(EXIT_CODE_CELL, exit_code as u32);
     Ok(TERMINATE_MAGIC)
 }
 
@@ -191,8 +191,8 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
         frame.r15.set(r15);
         // A pilha do usuário mora na célula compartilhada lida pela HAL.
         guest::write64(USER_RSP_CELL_ADDR, rsp);
-        guest::write64(0x8_F0A8, rcx); // RCX independente do RIP
-        guest::write64(0x8_F0B0, r11); // R11 independente do RFLAGS
+        guest::write64(crate::hal::amd64::usermode::CONTINUE_RCX, rcx); // RCX independente do RIP
+        guest::write64(crate::hal::amd64::usermode::CONTINUE_R11, r11); // R11 independente do RFLAGS
         if let Some(image) = float_image {
             // Imagem FXSAVE que o retorno da HAL restaura, logo abaixo do frame.
             guest::write_bytes(frame.address() - 0x208, &image);
@@ -203,7 +203,7 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
             }
             guest::free_bytes(debug_bank);
         }
-        guest::write32(0x8_F0A0, 1);
+        guest::write32(crate::hal::amd64::usermode::CONTINUE_FLAG, 1);
         crate::debug_print!("[usermode] NtContinue -> rip {:#x} rsp {:#x}", rip, rsp);
         Ok(rax as u32)
     })

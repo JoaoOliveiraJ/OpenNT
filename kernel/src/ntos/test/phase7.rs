@@ -1949,9 +1949,9 @@ fn user_syscalls_core(assert: Assert) {
     state::write_unicode_string(string, string + 0x10, "OpenNT usuario\r\n");
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
     assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::tsc_frequency_hz() && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia");
-    let exit_cell = crate::hal::physical::read32(state::EXIT_CODE_CELL);
-    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::physical::read32(state::EXIT_CODE_CELL) == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
-    crate::hal::physical::write32(state::EXIT_CODE_CELL, exit_cell);
+    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
+    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && guest::read32(state::EXIT_CODE_CELL) == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
+    guest::write32(state::EXIT_CODE_CELL, exit_cell);
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.maximum_user_mode_address.get() == crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT - 1 } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION");
     assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
@@ -2034,7 +2034,6 @@ fn user_syscalls_core(assert: Assert) {
 
 fn user_index(assert: Assert) {
     use crate::hal::amd64::native_call;
-    use crate::hal::physical;
     use crate::ntos::mm::kernel_address;
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::{index, memory};
@@ -2046,11 +2045,11 @@ fn user_index(assert: Assert) {
     let string = block;
     state::write_user_wide(string + 0x10, "ponte de servico\r\n");
     state::write_unicode_string(string, string + 0x10, "ponte de servico\r\n");
-    let exit_cell = physical::read32(state::EXIT_CODE_CELL);
+    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
     assert(index::handle_service(Some("NtNaoExisteOpenNt"), [0; 4], 0, 0, 0).ok() == Some(0xC000_0002) && index::handle_service(None, [0; 4], 0, 0, 0x99).ok() == Some(0xC000_0002), "userindex: servico sem implementacao");
     assert(index::invoke_service("NtDisplayString", [string, 0, 0, 0], 0x1_4000_1000, block + 0x800).ok() == Some(0) && state::with(|state| state.seen_syscalls.contains("NtDisplayString")), "userindex: invokeService chega ao handler por nome");
     if state::with(|state| state.name_by_number.get(&0x2C).is_some()) {
-        assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && physical::read32(state::EXIT_CODE_CELL) == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
+        assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && guest::read32(state::EXIT_CODE_CELL) == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
         // Caminho completo em UserMode: gateway, trampolim, despacho e ponte.
         let gateways = kernel_address::virtual_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
         let previous = process::get_current_thread();
@@ -2061,19 +2060,18 @@ fn user_index(assert: Assert) {
             let restored = state::with(|state| state.service_raw_arguments == 0 && state.service_stack.is_none());
             process::set_current_thread(previous);
             let _ = process::release_thread(thread);
-            assert(displayed == 0 && terminated as u32 == state::TERMINATE_MAGIC && physical::read32(state::EXIT_CODE_CELL) == 0x55 && restored, "userindex: syscall de UserMode pelo descritor ate o handler, com o contexto restaurado");
+            assert(displayed == 0 && terminated as u32 == state::TERMINATE_MAGIC && guest::read32(state::EXIT_CODE_CELL) == 0x55 && restored, "userindex: syscall de UserMode pelo descritor ate o handler, com o contexto restaurado");
         } else {
             assert(false, "userindex: thread de UserMode");
         }
     }
-    physical::write32(state::EXIT_CODE_CELL, exit_cell);
+    guest::write32(state::EXIT_CODE_CELL, exit_cell);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
 }
 
 fn user_ring3(assert: Assert) {
-    use crate::hal::physical;
     use crate::hal::amd64::usermode;
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::{memory, threads};
@@ -2106,7 +2104,7 @@ fn user_ring3(assert: Assert) {
         return;
     };
     process::set_current_thread(thread);
-    let exit_cell = physical::read32(state::EXIT_CODE_CELL);
+    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
     let terminate: &[u8] = &[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE];
     // 1. NtTerminateProcess(-1, 0x42) direto do anel 3.
     let mut program: alloc::vec::Vec<u8> = alloc::vec![0xBA, 0x42, 0x00, 0x00, 0x00];
@@ -2132,7 +2130,7 @@ fn user_ring3(assert: Assert) {
     // 3. ud2: o processo morre com STATUS_ILLEGAL_INSTRUCTION e o kernel segue.
     guest::write_bytes(code, &[0x0F, 0x0B]);
     let faulted = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
-    assert(faulted == 0xC000_001D && guest::read32(0x8_F138) == 6 && guest::read64(0x8_F148) == code, "userring3: excecao de usuario termina o processo com o NTSTATUS");
+    assert(faulted == 0xC000_001D && guest::read32(usermode::FAULT_VECTOR_CELL) == 6 && guest::read64(usermode::FAULT_RIP_CELL) == code, "userring3: excecao de usuario termina o processo com o NTSTATUS");
     // 4. Um intervalo de escalonamento termina na syscall com o CONTEXT salvo.
     let mut program: alloc::vec::Vec<u8> = alloc::vec![0x48, 0xB9];
     program.extend_from_slice(&string.to_le_bytes());
@@ -2152,7 +2150,7 @@ fn user_ring3(assert: Assert) {
     assert(kind == 1 && { let saved = unsafe { nt::Context::at(context) }; saved.rax.get() == 0 && saved.rip.get() == after_syscall && saved.rsp.get() == stack_top }, "userring3: intervalo encerrado pela syscall com RAX, RIP e RSP no CONTEXT");
     process::set_current_thread(previous);
     let _ = process::release_thread(thread);
-    physical::write32(state::EXIT_CODE_CELL, exit_cell);
+    guest::write32(state::EXIT_CODE_CELL, exit_cell);
     guest::free_bytes(raw_context);
     guest::free_bytes(scratch);
     for base in [code, stack] {
@@ -3878,11 +3876,11 @@ fn user_exceptions(assert: Assert) {
     let missing = { fill(live, block + 0x900, block + 0x3F00); exceptions::deliver(&thread, &[0u8; 0x98]) };
     state::with(|state| state.ntdll_exports = Some([(alloc::string::String::from("KiUserExceptionDispatcher"), dispatcher)].into_iter().collect()));
     // Breakpoint de hardware: RIP recua para o INT3.
-    let saved_vector = guest::read32(0x8_F138);
-    guest::write32(0x8_F138, 3);
+    let saved_vector = guest::read32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL);
+    guest::write32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL, 3);
     fill(live, block + 0x901, block + 0x3F00);
     let delivered = exceptions::hardware(&thread, 0x8000_0003);
-    guest::write32(0x8_F138, saved_vector);
+    guest::write32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL, saved_vector);
     let stack = live_context.rsp.get();
     let (dispatch_context, dispatch_context_ex, dispatch_record, machine_frame) = unsafe { (nt::Context::at(stack), nt::ContextEx::at(stack + nt::Context::SIZE), nt::ExceptionRecord::at(stack + record_offset), nt::MachineFrame::at(stack + machine_offset)) };
     let frame_ok = stack == (block + 0x3F00 - 0x5C0) & !15 && live_context.rip.get() == dispatcher && live_context.rcx.get() == stack + record_offset && live_context.rdx.get() == stack;
@@ -4015,13 +4013,13 @@ fn user_process_information_hooks(assert: Assert) {
     call_capture::arm("kernel32.dll", &exports);
     let other_dll = guest::read32(usermode::CAPTURE_STATE);
     call_capture::arm("NTDLL.DLL", &exports);
-    let armed = (guest::read32(usermode::CAPTURE_STATE), guest::read64(0x8_F188));
+    let armed = (guest::read32(usermode::CAPTURE_STATE), guest::read64(usermode::CAPTURE_ADDRESS));
     guest::write32(usermode::CAPTURE_STATE, 2);
-    guest::write64(0x8_F160, 0x11);
+    guest::write64(usermode::CAPTURE_ARGUMENTS_CELL, 0x11);
     call_capture::consume();
     let consumed = guest::read32(usermode::CAPTURE_STATE);
     call_capture::finish();
-    let finished = (guest::read32(usermode::CAPTURE_STATE), guest::read64(0x8_F188));
+    let finished = (guest::read32(usermode::CAPTURE_STATE), guest::read64(usermode::CAPTURE_ADDRESS));
     state::with(|state| state.capture_export = saved_export);
     assert(other_dll == 0 && armed == (1, block + 0x600) && consumed == 3 && finished == (0, 0) && usermode::arm_user_call_capture(0x100).is_err(), "userinfo: captura de chamada armada, consumida e limpa");
     if let Some(region) = memory::find_region(block) {

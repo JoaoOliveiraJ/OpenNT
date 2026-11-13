@@ -50,8 +50,9 @@ pub const KUSER_SHARED_DATA_USER_VA: u64 = 0x7FFE_0000;
 /// valor e grava o código de saída na célula; o retorno faz o salto de volta
 /// ao executor em vez do sysretq.
 pub const TERMINATE_MAGIC: u32 = 0x5452_4D49; // "TRMI"
-pub const EXIT_CODE_CELL: u64 = 0x8_F078;
-pub const USER_RSP_CELL_ADDR: u64 = 0x8_F060;
+/// Células da página de controle da HAL (VAs do mapa direto).
+pub const EXIT_CODE_CELL: u64 = crate::hal::amd64::usermode::EXIT_CODE_CELL;
+pub const USER_RSP_CELL_ADDR: u64 = crate::hal::amd64::usermode::USER_RSP_CELL;
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;

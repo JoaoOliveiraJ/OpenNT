@@ -4,6 +4,7 @@ pub mod contiguous_memory;
 pub mod data_pool;
 pub mod dump_mdl;
 pub mod frame_mapping_tracker;
+pub mod identity_audit;
 pub mod independent_pages;
 pub mod image_file_signature;
 pub mod io_pins;

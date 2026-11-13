@@ -1,7 +1,8 @@
 //! Gerente de interrupções do nanokernel.
 //!
-//! Constrói a IDT na memória física (0x82000), programa o PIC 8259 e o
-//! timer do LAPIC (100 Hz) pelas portas e carrega a tabela. Os trampolins
+//! Constrói a IDT na memória física (frame 0x82000, gravado pelo mapa
+//! direto), programa o PIC 8259 e o timer do LAPIC (100 Hz) pelas portas e
+//! carrega a tabela pela VA do mapa direto. Os trampolins
 //! (`hal::amd64::irqstubs`) só registram o evento em memória compartilhada, no ring
 //! do teclado, e fazem EOI; a leitura e a política são daqui.
 //!
@@ -17,10 +18,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::hal::{cpu, lapic, physical, port};
 use crate::hal::amd64::irqstubs;
 use crate::ntos::ke::clock;
+use crate::ntos::mm::memory_map;
 use crate::rtl::text::fixed1;
 use crate::rtl::SpinLock;
 
-const IDT_ADDRESS: u64 = 0x82000;
+/// Frame físico da IDT.
+pub const IDT_PHYSICAL_ADDRESS: u64 = 0x82000;
+/// A IDT como a CPU a enxerga (IDTR.Base e KPCR.IdtBase): VA do mapa direto.
+pub const IDT_VIRTUAL_ADDRESS: u64 = memory_map::direct_map(IDT_PHYSICAL_ADDRESS);
 
 const CODE64_SELECTOR: u16 = 0x10; // CS do kernel NT, igual às GDTs do BSP/APs
 const INTERRUPT_GATE: u8 = 0x8E; // presente, ring 0, interrupt gate
@@ -55,7 +60,7 @@ static TABLE: SpinLock<DispatchTable> = SpinLock::new(DispatchTable {
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 
 fn set_gate(vector: u16, handler_address: u64) {
-    let base = IDT_ADDRESS + vector as u64 * 16;
+    let base = IDT_PHYSICAL_ADDRESS + vector as u64 * 16;
     physical::write16(base, (handler_address & 0xFFFF) as u16);
     physical::write16(base + 2, CODE64_SELECTOR);
     physical::write8(base + 4, 0);
@@ -108,7 +113,7 @@ pub fn init() {
     }
 
     // 3. carrega a IDT e liga interrupções (sti dentro do load_idt)
-    cpu::load_idt(IDT_ADDRESS, 256 * 16);
+    cpu::load_idt(IDT_VIRTUAL_ADDRESS, 256 * 16);
     IDT_LOADED.store(true, Ordering::Release);
 
     // 4. LAPIC timer: quantum periódico de 100 Hz (calibrado de verdade)

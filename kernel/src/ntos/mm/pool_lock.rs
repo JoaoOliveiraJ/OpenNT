@@ -4,7 +4,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
-use crate::hal::physical;
 use crate::ntos::ke::irql;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory;
@@ -15,7 +14,8 @@ fn acquire() -> u64 {
     let previous = irql::get_irql();
     irql::raise_irql(previous.max(irql::DISPATCH_LEVEL));
     let pointer = POINTER.load(Ordering::Relaxed);
-    while physical::compare_exchange64(pointer, 0, 1) != 0 {
+    // A célula é um static da imagem do kernel: atômico pela VA.
+    while guest_memory::atomic_u64(pointer).compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         core::hint::spin_loop();
     }
     previous as u64
@@ -23,7 +23,7 @@ fn acquire() -> u64 {
 
 fn release(previous: u64) {
     let pointer = POINTER.load(Ordering::Relaxed);
-    assert!(physical::compare_exchange64(pointer, 1, 0) == 1, "NonPagedPoolLock ownership corrupted");
+    assert!(guest_memory::atomic_u64(pointer).compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok(), "NonPagedPoolLock ownership corrupted");
     irql::lower_irql(previous);
 }
 

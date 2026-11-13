@@ -129,8 +129,9 @@ pub fn virtual_for_physical(physical_address: u64) -> u64 {
     if frame >= database.frame_count {
         return 0;
     }
-    // SAFETY: descritor do banco de PFNs (mapa de identidade).
-    let pte_address = unsafe { Mmpfn::at(database.physical_base + frame * database.descriptor_size) }.pte_address.get();
+    // SAFETY: descritor do banco de PFNs, pela VA do mapa direto.
+    let descriptor = physical::range_to_virtual(database.physical_base + frame * database.descriptor_size, database.descriptor_size);
+    let pte_address = unsafe { Mmpfn::at(descriptor) }.pte_address.get();
     let page = ((pte_address.wrapping_sub(layout.page_table_base) << 25) as i64 >> 16) as u64;
     page.wrapping_add(physical_address & 0xFFF)
 }

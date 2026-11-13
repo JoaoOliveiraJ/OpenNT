@@ -44,6 +44,10 @@ fn guest_registry_path(relative_to: u32, path: u64) -> String {
     resolve_registry_path(relative_to & 0xFFFF, &guest_strings::read_wide_string(path))
 }
 
+/// RTL_REGISTRY_HANDLE (wdm.h): o Path é o HANDLE de uma chave aberta, não
+/// um texto.
+const REGISTRY_HANDLE: u32 = 0x4000_0000;
+
 /// Flags da RTL_QUERY_REGISTRY_TABLE (wdm.h).
 const QUERY_REGISTRY_REQUIRED: u32 = 0x04;
 const QUERY_REGISTRY_DIRECT: u32 = 0x20;
@@ -52,10 +56,18 @@ const QUERY_REGISTRY_DIRECT: u32 = 0x20;
 /// ausente (o driver recebe o default); DIRECT escreve em EntryContext; com
 /// QueryRoutine a rotina do driver é chamada; REQUIRED sem valor nem
 /// default = OBJECT_NAME_NOT_FOUND. Devolve o valor de retorno do export.
-pub fn query_registry_values(_relative_to: u32, path: u64, table: u64, context: u64, _environment: u64) -> Result<u64, KernelError> {
-    let key_path = guest_strings::read_wide_string(path);
-    debug_print!("[rtl] QueryRegistry path=\"{}\" table=0x{:x}", key_path, table);
-    let (open_status, key_handle) = key_services::open_path(&key_path, false)?;
+pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u64, _environment: u64) -> Result<u64, KernelError> {
+    // Com RTL_REGISTRY_HANDLE a chave já está aberta pelo chamador, que
+    // continua dono do handle.
+    let by_handle = relative_to & REGISTRY_HANDLE != 0;
+    let (open_status, key_handle) = if by_handle {
+        debug_print!("[rtl] QueryRegistry handle=0x{:x} table=0x{:x}", path, table);
+        (0, path)
+    } else {
+        let key_path = guest_strings::read_wide_string(path);
+        debug_print!("[rtl] QueryRegistry path=\"{}\" table=0x{:x}", key_path, table);
+        key_services::open_path(&key_path, false)?
+    };
     if open_status != 0 && open_status != 0xC000_0034 {
         return Ok(open_status as u64);
     }
@@ -113,7 +125,7 @@ pub fn query_registry_values(_relative_to: u32, path: u64, table: u64, context: 
             }
         }
     }
-    if key_handle != 0 {
+    if key_handle != 0 && !by_handle {
         cm_registry::close_handle(key_handle as u32);
     }
     Ok(status)

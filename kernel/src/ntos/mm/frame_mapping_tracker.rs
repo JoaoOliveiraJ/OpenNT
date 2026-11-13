@@ -2,6 +2,10 @@
 //!
 //! A PteAddress publicada é um alias recursivo da célula que contém o PFN,
 //! inclusive para frames que são, eles próprios, tabelas de páginas.
+//!
+//! Os aliases físicos do kernel não são donos de frame e ficam de fora: a
+//! identidade baixa (VA == PA) e o slot inteiro do mapa direto
+//! (`DIRECT_MAP_PML4_INDEX`), cujas tabelas nem são acompanhadas.
 
 use alloc::collections::BTreeMap;
 
@@ -146,6 +150,9 @@ impl Tracker {
             let table = &self.tables[&table_pa];
             (table.level, table.prefix)
         };
+        if level == 4 && index == map::DIRECT_MAP_PML4_INDEX {
+            return;
+        }
         let shift = 12 + (level - 1) * 9;
         let prefix = table_prefix | (index << shift);
         let present = entry & 1 != 0;
@@ -182,7 +189,7 @@ impl Tracker {
         let physical_address = entry & PHYSICAL_ADDRESS_MASK & !(byte_length - 1);
         // VA canônica: estende o sinal do bit 47.
         let virtual_address = ((prefix << 16) as i64 >> 16) as u64;
-        if virtual_address == physical_address {
+        if virtual_address == physical_address || virtual_address == map::direct_map(physical_address) {
             return;
         }
         let reference = self.reference_for(table_pa, index, entry, false);

@@ -8,31 +8,83 @@
 //! A saída de syscall é por IRETQ: sob WHPX o SYSRETQ não entrega RIP=RCX,
 //! e o IRETQ é o caminho que o próprio NT usa em KiSystemServiceExit.
 //!
-//! Células compartilhadas (endereços identidade, supervisor):
-//!   0x8F060 u64 pilha do usuário na entrada de syscall
-//!   0x8F068 u64 topo da pilha de kernel das syscalls (RSP0)
-//!   0x8F070 u64 pilha do chamador salva na entrada (retomada no término)
-//!   0x8F078 u32 código de saída (NtTerminateProcess)
-//!   0x8F0A0/A8/B0 NtContinue: flag, RCX e R11 do CONTEXT
-//!   0x8F1A0 callback de instrumentação; 0x8F1A8 CONTEXT do intervalo
-//!   0x8F1B0 tipo da saída: 0 término, 1 syscall, 2 timer, 3 exceção, 4 captura
+//! Células compartilhadas: a página de controle, um frame físico fixo
+//! (0x8F000) acessado pelo mapa direto da metade de sistema (os stubs
+//! carregam a VA da página num registrador; o Rust usa as constantes
+//! abaixo, que já são VAs). Offsets na página:
+//!   0x060 u64 pilha do usuário na entrada de syscall
+//!   0x068 u64 topo da pilha de kernel das syscalls (RSP0)
+//!   0x070 u64 pilha do chamador salva na entrada (retomada no término)
+//!   0x078 u32 código de saída (NtTerminateProcess)
+//!   0x090/098 RSP e CR2 de uma falta de usuário
+//!   0x0A0/A8/B0 NtContinue: flag, RCX e R11 do CONTEXT
+//!   0x138/140/148 vetor, RCX e RIP de uma falta de usuário
+//!   0x150 estado da captura de chamada; 0x160-0x178 argumentos e 0x180 pilha
+//!   capturados; 0x188 endereço; 0x190 máscara; 0x194/198 DR6 do usuário
+//!   0x1A0 callback de instrumentação; 0x1A8 CONTEXT do intervalo
+//!   0x1B0 tipo da saída: 0 término, 1 syscall, 2 timer, 3 exceção, 4 captura
+//!   0x1B8 código de erro do hardware da falta
 
 use core::arch::{asm, global_asm};
 
 use crate::hal::cpu;
 use crate::ntos::ex::system_services;
+use crate::ntos::mm::memory_map;
 use crate::rtl::SpinLock;
 
-pub const USER_RSP_CELL: u64 = 0x8_F060;
-pub const KERNEL_RSP_CELL: u64 = 0x8_F068;
-pub const EXIT_CODE_CELL: u64 = 0x8_F078;
-pub const CONTINUE_FLAG: u64 = 0x8_F0A0;
-pub const CONTINUE_RCX: u64 = 0x8_F0A8;
-pub const CONTINUE_R11: u64 = 0x8_F0B0;
-pub const INSTRUMENTATION_CALLBACK: u64 = 0x8_F1A0;
-pub const USER_CONTEXT_CELL: u64 = 0x8_F1A8;
-pub const USER_EXIT_KIND: u64 = 0x8_F1B0;
-pub const CAPTURE_STATE: u64 = 0x8_F150;
+/// Frame físico da página de controle do anel 3.
+pub const CONTROL_PAGE_PHYS: u64 = 0x8_F000;
+/// A página de controle pela VA do mapa direto.
+pub const CONTROL_PAGE: u64 = memory_map::direct_map(CONTROL_PAGE_PHYS);
+
+/// Offsets das células na página de controle (usados pelos stubs).
+pub mod cell {
+    pub const USER_RSP: u64 = 0x060;
+    pub const KERNEL_RSP: u64 = 0x068;
+    pub const CALLER_STACK: u64 = 0x070;
+    pub const EXIT_CODE: u64 = 0x078;
+    pub const FAULT_RSP: u64 = 0x090;
+    pub const FAULT_CR2: u64 = 0x098;
+    pub const CONTINUE_FLAG: u64 = 0x0A0;
+    pub const CONTINUE_RCX: u64 = 0x0A8;
+    pub const CONTINUE_R11: u64 = 0x0B0;
+    pub const FAULT_VECTOR: u64 = 0x138;
+    pub const FAULT_RCX: u64 = 0x140;
+    pub const FAULT_RIP: u64 = 0x148;
+    pub const CAPTURE_STATE: u64 = 0x150;
+    pub const CAPTURE_ARGUMENTS: u64 = 0x160;
+    pub const CAPTURE_STACK: u64 = 0x180;
+    pub const CAPTURE_ADDRESS: u64 = 0x188;
+    pub const CAPTURE_MASK: u64 = 0x190;
+    pub const DEBUG_CAUSES: u64 = 0x194;
+    pub const DEBUG_STATUS: u64 = 0x198;
+    pub const INSTRUMENTATION_CALLBACK: u64 = 0x1A0;
+    pub const USER_CONTEXT: u64 = 0x1A8;
+    pub const EXIT_KIND: u64 = 0x1B0;
+    pub const ERROR_CODE: u64 = 0x1B8;
+}
+
+pub const USER_RSP_CELL: u64 = CONTROL_PAGE + cell::USER_RSP;
+pub const KERNEL_RSP_CELL: u64 = CONTROL_PAGE + cell::KERNEL_RSP;
+pub const EXIT_CODE_CELL: u64 = CONTROL_PAGE + cell::EXIT_CODE;
+pub const FAULT_RSP_CELL: u64 = CONTROL_PAGE + cell::FAULT_RSP;
+pub const FAULT_CR2_CELL: u64 = CONTROL_PAGE + cell::FAULT_CR2;
+pub const CONTINUE_FLAG: u64 = CONTROL_PAGE + cell::CONTINUE_FLAG;
+pub const CONTINUE_RCX: u64 = CONTROL_PAGE + cell::CONTINUE_RCX;
+pub const CONTINUE_R11: u64 = CONTROL_PAGE + cell::CONTINUE_R11;
+pub const FAULT_VECTOR_CELL: u64 = CONTROL_PAGE + cell::FAULT_VECTOR;
+pub const FAULT_RCX_CELL: u64 = CONTROL_PAGE + cell::FAULT_RCX;
+pub const FAULT_RIP_CELL: u64 = CONTROL_PAGE + cell::FAULT_RIP;
+pub const CAPTURE_STATE: u64 = CONTROL_PAGE + cell::CAPTURE_STATE;
+pub const CAPTURE_ARGUMENTS_CELL: u64 = CONTROL_PAGE + cell::CAPTURE_ARGUMENTS;
+pub const CAPTURE_STACK_CELL: u64 = CONTROL_PAGE + cell::CAPTURE_STACK;
+pub const CAPTURE_ADDRESS: u64 = CONTROL_PAGE + cell::CAPTURE_ADDRESS;
+pub const INSTRUMENTATION_CALLBACK: u64 = CONTROL_PAGE + cell::INSTRUMENTATION_CALLBACK;
+pub const USER_CONTEXT_CELL: u64 = CONTROL_PAGE + cell::USER_CONTEXT;
+pub const USER_EXIT_KIND: u64 = CONTROL_PAGE + cell::EXIT_KIND;
+pub const ERROR_CODE_CELL: u64 = CONTROL_PAGE + cell::ERROR_CODE;
+/// Células de falta zeradas antes de cada entrada em anel 3.
+pub const FAULT_CELLS: [u64; 5] = [FAULT_RSP_CELL, FAULT_CR2_CELL, FAULT_VECTOR_CELL, FAULT_RCX_CELL, FAULT_RIP_CELL];
 const CONTEXT_SIZE: usize = 0x4D0;
 
 const MSR_EFER: u32 = 0xC000_0080;
@@ -68,9 +120,11 @@ user_debug_enter:
     push rdx
     push rsi
     push rdi
+    push r8
+    movabs r8, {control_page}       # celulas pelo mapa direto
     lea rdi, [rip + user_debug_kernel]
     call user_debug_save
-    mov rsi, [{context_cell}]
+    mov rsi, [r8 + {context_cell}]
     test rsi, rsi
     jz opennt_ude_logical_ready
     mov rax, [rsi + 0x48 ]
@@ -98,8 +152,8 @@ opennt_ude_logical_ready:
     mov [rip + user_debug_hardware + 32], rax
     mov rax, [rip + user_debug_user + 40]
     mov [rip + user_debug_hardware + 40], rax
-    mov dword ptr [{capture_mask}], 0
-    cmp dword ptr [{capture_state}], 1
+    mov dword ptr [r8 + {capture_mask}], 0
+    cmp dword ptr [r8 + {capture_state}], 1
     jne opennt_ude_load
     # Um par com habilitação local OU global está ocupado.
     mov rdx, [rip + user_debug_user + 40]
@@ -115,9 +169,9 @@ opennt_ude_find_slot:
 opennt_ude_overlay:
     mov eax, 1
     shl eax, cl
-    mov [{capture_mask}], eax
+    mov [r8 + {capture_mask}], eax
     mov rdi, rcx
-    mov rax, [{capture_address}]
+    mov rax, [r8 + {capture_address}]
     lea rsi, [rip + user_debug_hardware]
     mov [rsi + rdi*8], rax
     mov rax, [rip + user_debug_hardware + 40]
@@ -131,13 +185,14 @@ opennt_ude_overlay:
     shl rdx, cl
     or rax, rdx
     mov [rip + user_debug_hardware + 40], rax
-    mov edx, [{capture_mask}]
+    mov edx, [r8 + {capture_mask}]
     not rdx
     and [rip + user_debug_hardware + 32], rdx
 opennt_ude_load:
     mov byte ptr [rip + user_debug_active], 1
     lea rdi, [rip + user_debug_hardware]
     call user_debug_load
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -154,10 +209,12 @@ user_debug_leave:
     push rdx
     push rsi
     push rdi
+    push r8
+    movabs r8, {control_page}       # celulas pelo mapa direto
     lea rdi, [rip + user_debug_hardware]
     call user_debug_save
     mov rax, [rip + user_debug_hardware + 32]
-    mov [{debug_status}], rax
+    mov [r8 + {debug_status}], rax
     # DR6 pode citar comparadores desligados: só os habilitados são do usuário.
     mov rdx, [rip + user_debug_user + 40]
     mov edi, 0xE000
@@ -172,8 +229,8 @@ opennt_udl_next_slot:
     cmp ecx, 4
     jb opennt_udl_enabled
     and eax, edi
-    mov [{debug_causes}], eax
-    mov edx, [{capture_mask}]
+    mov [r8 + {debug_causes}], eax
+    mov edx, [r8 + {capture_mask}]
     test edx, edx
     jz opennt_udl_captured
     bsf ecx, edx
@@ -200,7 +257,7 @@ opennt_udl_next_slot:
     and [rip + user_debug_hardware + 32], rdx
     or [rip + user_debug_hardware + 32], rax
 opennt_udl_captured:
-    mov rsi, [{context_cell}]
+    mov rsi, [r8 + {context_cell}]
     mov rax, [rip + user_debug_hardware ]
     mov [rip + user_debug_user ], rax
     mov rax, [rip + user_debug_hardware + 8]
@@ -231,6 +288,7 @@ opennt_udl_restore_kernel:
     mov byte ptr [rip + user_debug_active], 0
     lea rdi, [rip + user_debug_kernel]
     call user_debug_load
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -283,7 +341,8 @@ user_exec_context:
     push r15
     sub rsp, 0x208
     fxsave64 [rsp]
-    mov [{c_stack}], rsp
+    movabs rax, {control_page}
+    mov [rax + {c_stack}], rsp
     mov rsp, rsi
     fxrstor64 [rdi + 0x100]
     push {user_ds}
@@ -311,12 +370,15 @@ user_exec_context:
     iretq
 
 # Entrada de syscall (LSTAR): rcx = RIP e r11 = RFLAGS do usuário; a CPU
-# não troca pilha nem GS.
+# não troca pilha nem GS. Sem registrador livre, a troca de pilha passa o
+# RSP do usuário por RAX (MOV moffs64 alcança o mapa direto); IF=0 aqui.
 .global user_syscall_entry
 user_syscall_entry:
     swapgs
-    mov [{user_rsp}], rsp
-    mov rsp, [{kernel_rsp}]
+    xchg rsp, rax
+    movabs qword ptr [{user_rsp_cell}], rax
+    movabs rax, qword ptr [{kernel_rsp_cell}]
+    xchg rsp, rax
     push r15
     push r14
     push r13
@@ -333,27 +395,30 @@ user_syscall_entry:
     push rcx
     push rax
     call user_debug_leave
+    # RBX (salvo no quadro e preservado pelas chamadas) guarda a VA da
+    # página de controle até o IRETQ.
+    movabs rbx, {control_page}
     # A syscall de anel 3 registra a origem na KTHREAD corrente.
     mov rax, gs:[0x188]
     mov byte ptr [rax + 0x232], 1
-    mov dword ptr [{continue_flag}], 0
+    mov dword ptr [rbx + {continue_flag}], 0
     mov rdi, rsp
     sub rsp, 0x208
     fxsave64 [rsp]
-    mov rax, [{c_stack}]
+    mov rax, [rbx + {c_stack}]
     fxrstor64 [rax]
     call opennt_user_syscall
     fxrstor64 [rsp]
     add rsp, 0x208
-    cmp dword ptr [{continue_flag}], 0
+    cmp dword ptr [rbx + {continue_flag}], 0
     jne user_syscall_exit
     mov [rsp], rax
 
 user_syscall_exit:
     # A instrumentação x64 roda nos retornos de syscall, exceto NtContinue.
-    cmp dword ptr [{continue_flag}], 0
+    cmp dword ptr [rbx + {continue_flag}], 0
     jne opennt_usx_instrumentation_ready
-    mov rax, [{instrumentation}]
+    mov rax, [rbx + {instrumentation}]
     test rax, rax
     jz opennt_usx_instrumentation_ready
     mov rcx, [rsp + 0x08]
@@ -361,33 +426,36 @@ user_syscall_exit:
     mov [rsp + 0x08], rax
 opennt_usx_instrumentation_ready:
     call user_debug_enter
-    mov rcx, [rsp + 0x08]
-    mov r11, [rsp + 0x40]
-    mov rax, [rsp + 0x00]
-    mov rdx, [rsp + 0x10]
-    mov rsi, [rsp + 0x18]
-    mov rdi, [rsp + 0x20]
-    mov r8,  [rsp + 0x28]
-    mov r9,  [rsp + 0x30]
-    mov r10, [rsp + 0x38]
-    mov rbx, [rsp + 0x48]
-    mov rbp, [rsp + 0x50]
-    mov r12, [rsp + 0x58]
-    mov r13, [rsp + 0x60]
-    mov r14, [rsp + 0x68]
-    mov r15, [rsp + 0x70]
-    mov rsp, [{kernel_rsp}]
+    # O quadro do IRETQ vai logo abaixo do quadro dos registradores, que
+    # passa a ficar em [rsp + 40]; os registradores saem dele por último.
+    mov rax, [rsp + 0x08]
+    mov rdx, [rsp + 0x40]
     push {user_ds}
-    push qword ptr [{user_rsp}]
-    push r11
+    push qword ptr [rbx + {user_rsp}]
+    push rdx
     push {user_cs}
-    push rcx
-    cmp dword ptr [{continue_flag}], 0
+    push rax
+    mov rcx, [rsp + 40 + 0x08]
+    mov r11, [rsp + 40 + 0x40]
+    cmp dword ptr [rbx + {continue_flag}], 0
     je opennt_usx_registers_ready
-    mov rcx, [{continue_rcx}]
-    mov r11, [{continue_r11}]
-    mov dword ptr [{continue_flag}], 0
+    mov rcx, [rbx + {continue_rcx}]
+    mov r11, [rbx + {continue_r11}]
+    mov dword ptr [rbx + {continue_flag}], 0
 opennt_usx_registers_ready:
+    mov rax, [rsp + 40 + 0x00]
+    mov rdx, [rsp + 40 + 0x10]
+    mov rsi, [rsp + 40 + 0x18]
+    mov rdi, [rsp + 40 + 0x20]
+    mov r8,  [rsp + 40 + 0x28]
+    mov r9,  [rsp + 40 + 0x30]
+    mov r10, [rsp + 40 + 0x38]
+    mov rbx, [rsp + 40 + 0x48]
+    mov rbp, [rsp + 40 + 0x50]
+    mov r12, [rsp + 40 + 0x58]
+    mov r13, [rsp + 40 + 0x60]
+    mov r14, [rsp + 40 + 0x68]
+    mov r15, [rsp + 40 + 0x70]
     swapgs
     iretq
 
@@ -403,7 +471,8 @@ user_exec_ring3:
     push r15
     sub rsp, 0x208
     fxsave64 [rsp]
-    mov [{c_stack}], rsp
+    movabs rax, {control_page}
+    mov [rax + {c_stack}], rsp
     mov qword ptr [rip + user_debug_user ], 0
     mov qword ptr [rip + user_debug_user + 8], 0
     mov qword ptr [rip + user_debug_user + 16], 0
@@ -431,7 +500,8 @@ opennt_uer_have_rflags:
 .global user_terminate_current
 user_terminate_current:
     call user_debug_leave
-    mov rsp, [{c_stack}]
+    movabs rax, {control_page}
+    mov rsp, [rax + {c_stack}]
     fxrstor64 [rsp]
     add rsp, 0x208
     sti
@@ -457,19 +527,21 @@ user_debug_active:   .quad 0
 user_tss_storage:    .zero 136
 .popsection
 "#,
-    context_cell = const USER_CONTEXT_CELL,
-    capture_state = const CAPTURE_STATE,
-    capture_address = const 0x8_F188u64,
-    capture_mask = const 0x8_F190u64,
-    debug_causes = const 0x8_F194u64,
-    debug_status = const 0x8_F198u64,
-    c_stack = const 0x8_F070u64,
-    user_rsp = const USER_RSP_CELL,
-    kernel_rsp = const KERNEL_RSP_CELL,
-    continue_flag = const CONTINUE_FLAG,
-    continue_rcx = const CONTINUE_RCX,
-    continue_r11 = const CONTINUE_R11,
-    instrumentation = const INSTRUMENTATION_CALLBACK,
+    control_page = const CONTROL_PAGE,
+    user_rsp_cell = const USER_RSP_CELL,
+    kernel_rsp_cell = const KERNEL_RSP_CELL,
+    context_cell = const cell::USER_CONTEXT,
+    capture_state = const cell::CAPTURE_STATE,
+    capture_address = const cell::CAPTURE_ADDRESS,
+    capture_mask = const cell::CAPTURE_MASK,
+    debug_causes = const cell::DEBUG_CAUSES,
+    debug_status = const cell::DEBUG_STATUS,
+    c_stack = const cell::CALLER_STACK,
+    user_rsp = const cell::USER_RSP,
+    continue_flag = const cell::CONTINUE_FLAG,
+    continue_rcx = const cell::CONTINUE_RCX,
+    continue_r11 = const cell::CONTINUE_R11,
+    instrumentation = const cell::INSTRUMENTATION_CALLBACK,
     user_ds = const SEL_USER_DATA | 3,
     user_cs = const SEL_USER_CODE | 3,
 );
@@ -590,7 +662,7 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
     };
     let kernel_gs = cpu::read_msr(MSR_GS_BASE);
     let previous_swap = cpu::read_msr(MSR_KERNEL_GS_BASE);
-    for cell in [0x8_F090u64, 0x8_F098, 0x8_F138, 0x8_F140, 0x8_F148] {
+    for cell in FAULT_CELLS {
         write64(cell, 0);
     }
     cpu::write_msr(MSR_KERNEL_GS_BASE, kernel_gs);
@@ -659,9 +731,6 @@ pub fn set_user_debug_registers(bank: u64) {
         }
     }
 }
-
-/// Endereço do pedido de captura de chamada (página de controle 0x8F000).
-const CAPTURE_ADDRESS: u64 = 0x8_F188;
 
 /// Retira o pedido pendente e depois o alvo, sem tocar nos registradores de
 /// depuração da CPU.

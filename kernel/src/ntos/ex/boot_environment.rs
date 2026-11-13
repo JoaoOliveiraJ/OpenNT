@@ -29,8 +29,8 @@ pub fn init() -> Result<(), KernelError> {
     if INFORMATION.lock().is_some() {
         return Err(KernelError::new("boot environment already initialized"));
     }
-    // SAFETY: página física identidade-mapeada preenchida pelo loader.
-    let handoff = unsafe { BootFlagsHandoff::at(memory_map::BOOT_FLAGS_PHYS) };
+    // SAFETY: handoff físico preenchido pelo loader, lido pelo mapa direto.
+    let handoff = unsafe { BootFlagsHandoff::at(crate::hal::physical::range_to_virtual(memory_map::BOOT_FLAGS_PHYS, BootFlagsHandoff::SIZE)) };
     if handoff.signature.get() != 0x3146_4F42 || handoff.size.get() as u64 != BootFlagsHandoff::SIZE {
         return Err(KernelError::new("missing boot flags handoff"));
     }

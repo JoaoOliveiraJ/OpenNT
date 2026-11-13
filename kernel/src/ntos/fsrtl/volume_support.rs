@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{FileObject, Kpcr, KuserSharedData, ObjectAttributes};
+use crate::ntos::inc::types::{FileObject, Kpcr, ObjectAttributes};
 use crate::ntos::ke::pcr;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::shared_user_data;
@@ -40,9 +40,9 @@ pub fn dismount_complete(status: u32) {
     if (status as i32) < 0 {
         return;
     }
-    // SAFETY: o frame da KUSER_SHARED_DATA, mapeado por identidade.
-    let shared = unsafe { KuserSharedData::at(shared_user_data::frame()) };
-    shared.dismount_count.atomic().fetch_add(1, Ordering::SeqCst);
+    if let Some(shared) = shared_user_data::data() {
+        shared.dismount_count.atomic().fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// FsRtlUpdateDiskCounters(BytesRead, BytesWritten): KPRCB.FsCounters do

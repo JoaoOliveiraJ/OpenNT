@@ -9,10 +9,19 @@
 //! Os bytes ficam na imagem do kernel; todo endereço absoluto é escrito como
 //! `rótulo - ap_trampoline_start + 0x9000`, resolvido pelo montador, para o
 //! código funcionar depois de copiado.
+//!
+//! Antes da paginação (modos real e protegido) o AP lê a mailbox pelo
+//! endereço físico, como exige a CPU. Em 64 bits, os dados (mailbox, slots,
+//! LAPIC, pilha, GDT e IDT do AP) são acessados pelo mapa direto da metade
+//! de sistema; da identidade baixa sobra só a busca de instruções na página
+//! do trampolim.
 
 use core::arch::global_asm;
 
+use crate::ntos::mm::memory_map;
+
 pub const LOAD_ADDRESS: u64 = 0x9000;
+const MAILBOX_PHYS: u64 = memory_map::SMP_MAILBOX_PHYS;
 
 global_asm!(
     r#"
@@ -93,38 +102,37 @@ ap_lm64:
     mov ss, ax
     mov fs, ax
     mov gs, ax
+    # Daqui em diante, dados pelo mapa direto: RSI = mailbox.
+    movabs rsi, {direct_mailbox}
     # Um AP atrasado não pode consumir pilha/mailbox de outro AP.
-    mov edx, 0xFEE00020
+    movabs rdx, {direct_lapic_id}
     mov eax, dword ptr [rdx]
     shr eax, 24
-    mov ecx, {mailbox} + 0x2C
-    cmp eax, dword ptr [rcx]
+    cmp eax, dword ptr [rsi + 0x2C]
     jne ap_park
-    mov ecx, {mailbox} + 0x0C
-    mov ebx, dword ptr [rcx]
+    mov ebx, dword ptr [rsi + 0x0C]
     cmp ebx, 15
     jae ap_park
-    mov ecx, {mailbox} + 0x10
-    mov rsp, qword ptr [rcx]
-    mov ecx, {mailbox} + 0x28
-    mov dword ptr [rcx], 0x64
+    mov rsp, qword ptr [rsi + 0x10]                 # pilha (VA do mapa direto)
+    mov dword ptr [rsi + 0x28], 0x64
     shl rbx, 6                                      # * 64 (tamanho do slot)
-    lea r15, [rbx + {mailbox} + 0x100]
+    lea r15, [rsi + rbx + 0x100]
+    # GDT e IDT do AP também pelo mapa direto.
+    .byte 0x48, 0xB9                                # movabs rcx, imm64
+    .quad ap_gdtr64 - ap_trampoline_start + {direct_base}
+    lgdt [rcx]
     # NMIs de shootdown podem interromper um job nativo mesmo com IF=0:
     # instala o handler antes de publicar o processador como online.
-    .byte 0xB9                                      # mov ecx, imm32
-    .long ap_idtr - ap_trampoline_start + {base}
+    .byte 0x48, 0xB9                                # movabs rcx, imm64
+    .quad ap_idtr - ap_trampoline_start + {direct_base}
     lidt [rcx]
     mov dword ptr [r15], eax                        # SLOT_APIC_ID
     mov dword ptr [r15 + 0x38], 1                   # SLOT_JOB_DONE
     mov dword ptr [r15 + 0x04], 1                   # SLOT_ONLINE
-    mov ecx, {mailbox} + 0x04
-    lock inc dword ptr [rcx]                        # MB_ONLINE
-    mov ecx, {mailbox} + 0x0C
-    mov eax, dword ptr [rcx]
+    lock inc dword ptr [rsi + 0x04]                 # MB_ONLINE
+    mov eax, dword ptr [rsi + 0x0C]
     inc eax
-    mov ecx, {mailbox} + 0x08
-    mov dword ptr [rcx], eax                        # confirmação exata do slot
+    mov dword ptr [rsi + 0x08], eax                 # confirmação exata do slot
 
 ap_job_loop:
     mov rax, qword ptr [r15 + 0x08]                 # SLOT_JOB_FUNC
@@ -158,26 +166,25 @@ ap_tlb_nmi:
     push rax
     push rcx
     push rdx
-    mov edx, 0xFEE00020
+    movabs rdx, {direct_lapic_id}
     mov eax, dword ptr [rdx]
     shr eax, 24
-    mov edx, {mailbox} + 0x100
+    movabs rdx, {direct_mailbox} + 0x100
     mov ecx, 15
 ap_find_slot:
     cmp dword ptr [rdx], eax
     je ap_found_slot
-    add edx, 64
+    add rdx, 64
     loop ap_find_slot
     jmp ap_nmi_done
 ap_found_slot:
     cmp dword ptr [rdx + 0x04], 1
     jne ap_nmi_done
-    mov ecx, {mailbox} + 0x30
-    mov eax, dword ptr [rcx]                        # MB_TLB_EPOCH
+    movabs rcx, {direct_mailbox}
+    mov eax, dword ptr [rcx + 0x30]                 # MB_TLB_EPOCH
     cmp dword ptr [rdx + 0x3C], eax
     je ap_nmi_done
-    mov ecx, {mailbox} + 0x34
-    cmp dword ptr [rcx], 0                          # MB_CACHE_FLUSH
+    cmp dword ptr [rcx + 0x34], 0                   # MB_CACHE_FLUSH
     je ap_translations
     wbinvd
 ap_translations:
@@ -189,8 +196,8 @@ ap_translations:
     mov rcx, cr3
     mov cr3, rcx
     mov cr4, rax
-    mov ecx, {mailbox} + 0x30
-    mov eax, dword ptr [rcx]
+    movabs rcx, {direct_mailbox}
+    mov eax, dword ptr [rcx + 0x30]
     mov dword ptr [rdx + 0x3C], eax                 # SLOT_TLB_ACK
 ap_nmi_done:
     pop rdx
@@ -209,7 +216,7 @@ ap_idt:
 ap_idt_end:
 ap_idtr:
     .word ap_idt_end - ap_idt - 1
-    .quad ap_idt - ap_trampoline_start + {base}
+    .quad ap_idt - ap_trampoline_start + {direct_base}
 
 .balign 8
 ap_gdt:
@@ -223,12 +230,20 @@ ap_gdt_end:
 ap_gdtr:
     .word ap_gdt_end - ap_gdt - 1
     .long ap_gdt - ap_trampoline_start + {base}
+.balign 4
+    .word 0
+ap_gdtr64:
+    .word ap_gdt_end - ap_gdt - 1
+    .quad ap_gdt - ap_trampoline_start + {direct_base}
 ap_trampoline_end:
 .popsection
 .code64
 "#,
-    mailbox = const 0xA000,
+    mailbox = const MAILBOX_PHYS,
     base = const LOAD_ADDRESS,
+    direct_base = const memory_map::direct_map(LOAD_ADDRESS),
+    direct_mailbox = const memory_map::direct_map(MAILBOX_PHYS),
+    direct_lapic_id = const memory_map::direct_map(memory_map::LAPIC_PHYS + 0x20),
 );
 
 extern "C" {

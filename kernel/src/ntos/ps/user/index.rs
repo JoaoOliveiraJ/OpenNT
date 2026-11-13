@@ -52,8 +52,8 @@ pub fn consume_capture() {
 pub fn init() -> Result<(), KernelError> {
     let Some(user_mode_init) = *USER_MODE_INIT.lock() else { return Err(KernelError::new("HAL de modo usuario indisponivel")) };
     // Pilha de kernel dedicada (syscalls e IRQs em anel 3): frames PFN
-    // contíguos em VA identidade; o topo vai para TSS.RSP0 e para a célula
-    // que o stub de syscall usa.
+    // fisicamente contíguos, endereçados pela VA do mapa direto; o topo vai
+    // para TSS.RSP0 e para a célula que o stub de syscall usa.
     let mut base = 0u64;
     for index in 0..SYSCALL_STACK_PAGES {
         let frame = pfn::alloc_page();
@@ -67,7 +67,7 @@ pub fn init() -> Result<(), KernelError> {
         }
         physical::zero(frame, 0x1000);
     }
-    let top = base + SYSCALL_STACK_PAGES * 0x1000;
+    let top = physical::to_virtual(base) + SYSCALL_STACK_PAGES * 0x1000;
     let gdt = user_mode_init(top)?;
     state::with(|state| state.syscall_stack_top = top);
     // KUSER_SHARED_DATA no endereço de usuário real (só leitura para o anel

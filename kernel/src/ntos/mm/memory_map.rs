@@ -2,10 +2,15 @@
 //! Única fonte de verdade para o layout físico/virtual.
 //!
 //! ```text
-//!   0x000000-0x07FFF     tabelas do boot, IDT, memória compartilhada IRQ
+//!   0x000000-0x005FFF    IVT/BDA, handoff do stage2 (0x4FD0-0x4FFF), E820 (0x5000)
 //!   0x009000-0x009FFF    trampolim de AP (SMP, SIPI vetor 0x09)
 //!   0x00A000-0x00AFFF    mailbox SMP (handshake + fila de jobs por CPU)
 //!   0x060000-0x06FFFF    pilhas dos APs (4KB por CPU, até 16 CPUs)
+//!   0x070000-0x075FFF    tabelas de identidade do stage2 (PML4, PDPT, 4 PDs)
+//!   0x076000-0x07AFFF    tabelas do mapa direto (PDPT, 4 PDs)
+//!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
+//!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
+//!   0x08F000-0x08FFFF    página de controle do anel 3 (células da HAL)
 //!   0x100000-0xDFFFFF    imagem do kernel (cap de build: 13MB)
 //!   0xF80008 (topo)      pilha do kernel de boot (cresce para baixo)
 //!   0x1000000-0x1FFFFFF  sem uso (as imagens de drivers moram no espaço de sistema)
@@ -17,6 +22,8 @@
 //!   0x34000000-0x6FFFFFFF terceira arena PFN (960MB)
 //!   0x70000000-0xAFFFFFFF reservado (KUSER_SHARED_DATA em 0x7FFE0000)
 //!   0xB0000000-0xBEFFFFFF sem uso
+//!
+//!   0xFFFFB000_00000000+  mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
 //! ```
 //!
 //! Na metade de sistema, as imagens de kernel (drivers .sys, hal.dll,
@@ -43,7 +50,8 @@ pub const BOOT_FLAGS_PHYS: u64 = 0x4FD0;
 pub const E820_COUNT_PHYS: u64 = 0x4FF0;
 pub const E820_TABLE_PHYS: u64 = 0x5000;
 pub const E820_MAX_ENTRIES: u64 = 170;
-/// O stage2 mapeia 4GB em identidade; RAM acima não é admitida ainda.
+/// O stage2 mapeia 4GB em identidade e no mapa direto; RAM acima não é
+/// admitida ainda.
 pub const PHYSICAL_MEMORY_LIMIT: u64 = 0x1_0000_0000;
 
 pub const VA_ALLOC_BASE: u64 = 0x1000_0000;
@@ -100,3 +108,43 @@ pub const AP_STACK_BASE: u64 = 0x60000;
 pub const AP_STACK_SIZE: u64 = 0x1000;
 pub const MAX_CPUS: usize = 16;
 pub const LAPIC_PHYS: u64 = 0xFEE0_0000;
+
+// ---- Mapa direto da memória física (metade de sistema) ---------------------
+//
+// Toda a faixa física [0, PHYSICAL_MEMORY_LIMIT) — RAM, firmware e MMIO
+// (LAPIC, framebuffer de texto, BARs) — aparece uma vez em
+// DIRECT_MAP_BASE + PA, com páginas de 2 MB de supervisor, RW e NX. O stage2
+// monta as tabelas (uma PDPT e quatro PDs, frames fixos abaixo de 1 MB, fora
+// do PFN) e liga a entrada DIRECT_MAP_PML4_INDEX da PML4 antes de entrar no
+// kernel; daí em diante todo acesso por endereço físico (`hal::physical`,
+// tabelas de páginas, descritores de PFN, cabeçalhos do heap e da arena,
+// células de baixo nível, dados do trampolim dos APs, tabelas ACPI) passa
+// por aqui. O slot inteiro da PML4 (512 GB) é reservado; nenhuma outra
+// janela do OpenNT usa o índice 352. O rastreador de frames não conta
+// referências deste mapa, como não contava as da identidade baixa.
+pub const DIRECT_MAP_BASE: u64 = 0xFFFF_B000_0000_0000;
+pub const DIRECT_MAP_PML4_INDEX: u64 = 352;
+/// Fim exclusivo da parte mapeada (o slot reservado vai até +512 GB).
+pub const DIRECT_MAP_TOP: u64 = DIRECT_MAP_BASE + PHYSICAL_MEMORY_LIMIT;
+pub const DIRECT_MAP_SLOT_TOP: u64 = DIRECT_MAP_BASE + 0x80_0000_0000;
+/// Tabelas do mapa direto montadas pelo stage2 (PDPT e PDs contíguas).
+pub const DIRECT_MAP_PDPT_PHYS: u64 = 0x76000;
+pub const DIRECT_MAP_PD_PHYS: u64 = 0x77000;
+
+/// VA do mapa direto do endereço físico `physical_address`.
+pub const fn direct_map(physical_address: u64) -> u64 {
+    DIRECT_MAP_BASE + physical_address
+}
+
+/// A VA está na parte mapeada do mapa direto.
+pub const fn is_direct_map(address: u64) -> bool {
+    address >= DIRECT_MAP_BASE && address < DIRECT_MAP_TOP
+}
+
+const _: () = assert!((DIRECT_MAP_BASE >> 39) & 511 == DIRECT_MAP_PML4_INDEX);
+const _: () = assert!(DIRECT_MAP_PML4_INDEX != PAGE_TABLE_RECURSIVE_INDEX && DIRECT_MAP_PML4_INDEX != (PFN_DATABASE_BASE >> 39) & 511);
+const _: () = assert!(DIRECT_MAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 && DIRECT_MAP_PML4_INDEX != (PCR_VIRTUAL_BASE >> 39) & 511);
+// Logo depois das tabelas de identidade do stage2 (0x70000-0x75FFF) e antes
+// da página de contagem de IRQs (0x81000).
+const _: () = assert!(DIRECT_MAP_PDPT_PHYS == PD_PHYS + 4 * PAGE_SIZE && DIRECT_MAP_PD_PHYS == DIRECT_MAP_PDPT_PHYS + PAGE_SIZE);
+const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL_MEMORY_LIMIT == 4 * 0x4000_0000);

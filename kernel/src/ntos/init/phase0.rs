@@ -45,6 +45,9 @@ pub fn init() {
     crate::hal::pci_config::init().unwrap_or_else(|error| panic!("{error}")); // lock CF8/CFC antes dos APs
     shared_user_data::init(); // página KUSER_SHARED_DATA mapeada (drivers WDK)
     smp::init().unwrap_or_else(|error| panic!("SMP: {error}")); // ACPI MADT + INIT-SIPI dos APs (LAPIC)
+    if crate::ntos::init::boot_config::IDENTITY_AUDIT {
+        crate::ntos::mm::identity_audit::run(); // --identity-audit: prova do mapa direto
+    }
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)
     dump_mdl::init().unwrap_or_else(|error| panic!("dump MDL: {error}"));

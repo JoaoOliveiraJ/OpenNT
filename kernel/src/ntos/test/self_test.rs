@@ -98,8 +98,8 @@ pub fn run() {
     assert(va > 0, "VirtualAlloc");
     let pa = paging::translate(va);
     assert(pa > 0 && (pa & !0xFFF) != (va & !0xFFF), "VA mapeada p/ frame distinto");
-    physical::write32(va, 0xC0FFEE);
-    assert(physical::read32(va) == 0xC0FFEE, "escrita pela VA mapeada");
+    guest_memory::write32(va, 0xC0FFEE);
+    assert(guest_memory::read32(va) == 0xC0FFEE && physical::read32(pa) == 0xC0FFEE, "escrita pela VA mapeada");
     assert(paging::query_page(va, false).is_some_and(|page| page.physical_address == pa), "query_page");
     virtual_memory::free(va, 4096);
     assert(paging::translate(va) == 0, "pagina desmapeada no free");

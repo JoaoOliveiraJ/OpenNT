@@ -28,9 +28,9 @@ const RECORD_OFFSET: u64 = 0x4F0;
 const MACHINE_OFFSET: u64 = 0x590;
 const FRAME_SIZE: u64 = 0x5C0;
 /// Células da HAL na saída de exceção: vetor, código de erro e CR2.
-const FAULT_VECTOR: u64 = 0x8_F138;
-const ERROR_CODE: u64 = 0x8_F1B8;
-const FAULT_CR2: u64 = 0x8_F098;
+const FAULT_VECTOR: u64 = crate::hal::amd64::usermode::FAULT_VECTOR_CELL;
+const ERROR_CODE: u64 = crate::hal::amd64::usermode::ERROR_CODE_CELL;
+const FAULT_CR2: u64 = crate::hal::amd64::usermode::FAULT_CR2_CELL;
 
 const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MACHINE_OFFSET + MachineFrame::SIZE <= FRAME_SIZE);
 

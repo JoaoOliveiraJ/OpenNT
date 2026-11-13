@@ -4,7 +4,10 @@
 //! Arena de 16MB reservada do heap do kernel no boot; blocos livres
 //! separados por tamanho, com split e coalescência. Header de bloco (16B):
 //! +0 size, +4 previous, +8 next, +12 free (u32). Os links das listas livres
-//! ocupam os primeiros 8 bytes do payload livre.
+//! ocupam os primeiros 8 bytes do payload livre. Os links são endereços
+//! físicos de 32 bits e os cabeçalhos são lidos e gravados pelo mapa direto
+//! (`hal::physical`); o endereço entregue ao chamador ainda é o da
+//! identidade baixa, igual ao físico.
 //!
 //! # O mapa de memória que o acesso pressupõe (conferido no código)
 //!
@@ -18,8 +21,12 @@
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
 //! - **Abaixo de 4GB** o stage2 mapeia identidade com páginas de 2MB RW de
 //!   supervisor; a arena dos convidados e o heap do kernel ficam ali e não
-//!   são pagináveis. VA == PA só onde ninguém remapeou: as janelas de usuário
-//!   podem ser remapeadas ou desmapeadas.
+//!   são pagináveis. A mesma faixa física aparece no mapa direto
+//!   (`DIRECT_MAP_BASE + PA`, supervisor e NX): todo acesso por endereço
+//!   físico (cabeçalhos desta arena, PTEs, descritores de PFN, células de
+//!   baixo nível) passa por ele, nunca pela identidade. VA == PA só onde
+//!   ninguém remapeou: as janelas de usuário podem ser remapeadas ou
+//!   desmapeadas.
 //! - **Acima de 4GB** (imagens de usuário, imagens de kernel na janela de
 //!   sistema 0xFFFFF801..., pool executivo
 //!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
@@ -61,7 +68,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::hal::{host, physical};
+use crate::hal::{host, physical, volatile};
 use crate::ntos::mm::{page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -133,15 +140,15 @@ macro_rules! guest_scalar {
 guest_scalar!(u8 => u8, u16 => u16, u32 => u32, u64 => u64, i8 => u8, i16 => u16, i32 => u32, i64 => u64);
 
 /// O MOV de `T::SIZE` bytes (o `*(volatile T *)` do C): nunca elidido nem
-/// dividido; o asm de `hal::physical` usa o endereço como ponteiro.
+/// dividido; o asm de `hal::volatile` usa o endereço virtual como ponteiro.
 #[inline(always)]
 fn load<T: GuestScalar>(address: u64) -> T {
     const { assert!(matches!(T::SIZE, 1 | 2 | 4 | 8), "GuestScalar: largura invalida") };
     T::from_bits(match T::SIZE {
-        1 => physical::read8(address) as u64,
-        2 => physical::read16(address) as u64,
-        4 => physical::read32(address) as u64,
-        _ => physical::read64(address),
+        1 => volatile::read8(address) as u64,
+        2 => volatile::read16(address) as u64,
+        4 => volatile::read32(address) as u64,
+        _ => volatile::read64(address),
     })
 }
 
@@ -150,10 +157,10 @@ fn store<T: GuestScalar>(address: u64, value: T) {
     const { assert!(matches!(T::SIZE, 1 | 2 | 4 | 8), "GuestScalar: largura invalida") };
     let bits = value.to_bits();
     match T::SIZE {
-        1 => physical::write8(address, bits as u8),
-        2 => physical::write16(address, bits as u16),
-        4 => physical::write32(address, bits as u32),
-        _ => physical::write64(address, bits),
+        1 => volatile::write8(address, bits as u8),
+        2 => volatile::write16(address, bits as u16),
+        4 => volatile::write32(address, bits as u32),
+        _ => volatile::write64(address, bits),
     }
 }
 
@@ -427,7 +434,7 @@ pub fn compare_exchange128(
     replacement: (u64, u64),
 ) -> Result<(u64, u64), KernelError> {
     probe_atomic(address, 16)?;
-    Ok(physical::compare_exchange128(address, expected, replacement))
+    Ok(volatile::compare_exchange128(address, expected, replacement))
 }
 
 // ---- heap da arena ---------------------------------------------------------

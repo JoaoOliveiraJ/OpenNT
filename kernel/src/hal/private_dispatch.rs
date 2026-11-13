@@ -411,10 +411,14 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         "HalAcpiGetTable" => {
             let signature = call.arg(2) as u32;
             let text: alloc::string::String = signature.to_le_bytes().iter().map(|&byte| byte as char).collect();
-            super::acpi::get_table(&text, 0, false).map_or(0, |table| table.address)
+            // A tabela pela VA do mapa direto (um ponteiro de sistema).
+            super::acpi::get_table(&text, 0, false).map_or(0, |table| physical::to_virtual(table.address))
         }
-        // A memória física baixa é mapeada em identidade (como o MmMapIoSpace).
-        "HalpMapPhysicalMemoryWriteThrough64" | "HalpMapEarlyPages" => call.arg(1),
+        // Toda a faixa física está no mapa direto (como o MmMapIoSpace).
+        "HalpMapPhysicalMemoryWriteThrough64" | "HalpMapEarlyPages" => {
+            let end = call.arg(1).checked_add(call.arg(2) as u32 as u64 * 0x1000);
+            if end.is_some_and(|end| end <= crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT) { physical::to_virtual(call.arg(1)) } else { 0 }
+        }
         "HalpUnmapVirtualAddress" => {
             if call.arg(3) & 0xFF != 0 {
                 for page in 0..call.arg(2) {

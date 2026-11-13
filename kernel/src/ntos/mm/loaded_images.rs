@@ -288,14 +288,17 @@ pub fn init_kernel() -> Result<LoadedImage, KernelError> {
         return Ok(kernel);
     }
     let base = map::KERNEL_IMAGE_BASE;
+    // Os cabeçalhos são lidos pelo endereço físico da imagem carregada pelo
+    // stage2, através do mapa direto.
+    let headers = crate::hal::physical::range_to_virtual(base, 0x1000);
     // SAFETY: a imagem do kernel em execução, alinhada à página.
-    let dos = unsafe { ImageDosHeader::at(base) };
+    let dos = unsafe { ImageDosHeader::at(headers) };
     let pe = dos.e_lfanew.get() as u32 as u64;
     // Campo dos cabeçalhos NT: o e_lfanew não garante o alinhamento natural
     // da estrutura inteira, então cada leitura é um MOV no endereço do campo.
     macro_rules! nt {
         ($($field:tt)+) => {
-            guest::read(base + pe + core::mem::offset_of!(ImageNtHeaders64, $($field)+) as u64)
+            guest::read(headers + pe + core::mem::offset_of!(ImageNtHeaders64, $($field)+) as u64)
         };
     }
     let signature: u32 = nt!(signature);

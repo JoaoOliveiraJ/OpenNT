@@ -55,8 +55,8 @@ const LOCK_QUEUE_IO_VPB: usize = 9;
 const LOCK_QUEUE_IO_DATABASE: usize = 10;
 
 const GS_BASE_MSR: u32 = 0xC000_0101;
-const INTERRUPT_TABLE_PHYSICAL_ADDRESS: u64 = 0x82000;
-const DESCRIPTOR_TABLE_BASE_CELL: u64 = 0x4FEA;
+/// GDTR do stage2 publicado no handoff (limite em +0, base de 32 bits em +2).
+const DESCRIPTOR_TABLE_REGISTER_CELL: u64 = 0x4FE8;
 
 struct Pcr {
     address: u64,
@@ -108,7 +108,12 @@ pub fn init() -> Result<(), KernelError> {
     // SAFETY: as páginas recém-zeradas acabaram de ser mapeadas em `base`.
     let kpcr = unsafe { Kpcr::at(base) };
 
-    kpcr.gdt_base.set(physical::read32(DESCRIPTOR_TABLE_BASE_CELL) as u64);
+    // A GDT do stage2 continua a mesma, mas o GDTR e a KPCR passam a
+    // alcançá-la pela VA do mapa direto.
+    let gdt_limit = physical::read16(DESCRIPTOR_TABLE_REGISTER_CELL);
+    let gdt_base = physical::to_virtual(physical::read32(DESCRIPTOR_TABLE_REGISTER_CELL + 2) as u64);
+    cpu::load_gdt(gdt_base, gdt_limit);
+    kpcr.gdt_base.set(gdt_base);
     // TssBase fica zerado; isso não descreve a TSS configurada em outras camadas.
     kpcr.tss_base.set(0);
     kpcr.self_.set(base);
@@ -132,7 +137,7 @@ pub fn init() -> Result<(), KernelError> {
         lock_queue[LOCK_QUEUE_IO_VPB].lock.set(pcr.vpb_lock);
     }
     kpcr.used_self.set(base);
-    kpcr.idt_base.set(INTERRUPT_TABLE_PHYSICAL_ADDRESS);
+    kpcr.idt_base.set(crate::nano::interrupts::IDT_VIRTUAL_ADDRESS);
     kpcr.irql.set(0);
     kpcr.major_version.set(1);
     kpcr.minor_version.set(1);

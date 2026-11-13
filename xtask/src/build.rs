@@ -27,6 +27,9 @@ pub struct BuildOptions {
     pub start_driver: String,
     /// `--trace-driver-api`: rastreia as APIs chamadas durante esse início.
     pub trace_driver_api: bool,
+    /// `--identity-audit`: desliga no boot a identidade baixa do que só é
+    /// alcançado por endereço físico (prova de que nada usa PA como ponteiro).
+    pub identity_audit: bool,
 }
 
 pub struct BuildOutput {
@@ -90,6 +93,11 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {
         command.env_remove("OPENNT_TRACE_DRIVER_API");
+    }
+    if options.identity_audit {
+        command.env("OPENNT_IDENTITY_AUDIT", "1");
+    } else {
+        command.env_remove("OPENNT_IDENTITY_AUDIT");
     }
     if options.console_mirror {
         command.env("OPENNT_CONSOLE_MIRROR", "1");

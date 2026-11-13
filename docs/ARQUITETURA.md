@@ -194,11 +194,47 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   antigas migram; cada uma que corresponde a um campo real é conferida em
   compilação contra `inc::types` (o bloco no fim do arquivo).
 
-### 3.4 Mapa de memória
+### 3.4 Mapa de memória e endereços físicos
 
-A fonte única é `ntos/mm/memory_map.rs`; cada faixa nova entra lá, num bloco
-delimitado, com a explicação. Na metade de sistema (a partir de
-`MmSystemRangeStart`, 0xFFFF8000_00000000):
+A fonte de verdade é `ntos/mm/memory_map.rs`. Como no NT, o que é do kernel
+vai para a metade de sistema (a partir de 0xFFFF8000_00000000):
+
+| VA | Índice da PML4 | Conteúdo |
+| --- | --- | --- |
+| 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
+| 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
+| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema |
+| 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
+| 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
+| 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, o alias RW da imagem do kernel e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
+
+O stage2 monta o mapa direto (páginas de 2 MB de supervisor, RW e NX; tabelas
+em 0x76000-0x7AFFF) junto com a identidade dos 4 GB baixos, antes de entrar
+no kernel. A regra:
+
+- **Endereço físico nunca é ponteiro.** Quem tem um PA usa `hal::physical`,
+  que traduz pelo mapa direto e para o sistema se receber algo fora da faixa
+  física (uma VA, por exemplo). Isso vale para PTEs e tabelas (`paging.rs`),
+  descritores de PFN, frames do PFN, cabeçalhos do heap do kernel e da arena
+  dos convidados, MMIO (LAPIC, texto VGA), tabelas ACPI, o handoff do stage2
+  (E820, flags, firmware), as células fixas de baixo nível (0x81000, a IDT em
+  0x82000, a página de controle do anel 3 em 0x8F000) e os dados do
+  trampolim dos APs. A IDT, a GDT do boot e as pilhas dos APs são carregadas
+  pela VA do mapa direto; MmMapIoSpace e os mapeamentos físicos da HAL
+  devolvem VAs dele.
+- **Endereço virtual** é acessado por `mm/guest_memory.rs` (memória confiável
+  ou sondada) ou pelos MOVs de `hal::volatile`.
+- **Stubs em assembly** carregam a VA da página de células num registrador
+  (`movabs`) e endereçam por deslocamento; a entrada de syscall troca a pilha
+  por `MOV moffs64`, sem registrador livre.
+- O rastreador de frames não conta referências do mapa direto, como não
+  conta as da identidade.
+- **Prova:** `--identity-audit` (`ntos/mm/identity_audit.rs`) desliga no boot
+  a identidade baixa do primeiro MB (menos o código do trampolim), das arenas
+  do PFN e do MMIO; com ela a suíte inteira passa, então nenhum acesso por
+  endereço físico usa a identidade.
+
+**Imagens.**
 
 - **Imagens de kernel** (drivers .sys, hal.dll, ci.dll, bibliotecas de export
   como cng, msrpc, wmilib e WppRecorder): janela `SYSTEM_IMAGE_BASE..TOP`
@@ -213,6 +249,12 @@ delimitado, com a explicação. Na metade de sistema (a partir de
   `KERNEL_VIRTUAL_BASE`.
 - As imagens de usuário continuam na base preferida da metade de usuário (ou
   na próxima faixa livre), também sobre frames do PFN.
+
+A identidade baixa ainda existe nesta etapa para o que é endereçado como VA
+abaixo de 4 GB: a imagem do kernel (ligada em 0x101000), a pilha de boot, o
+heap do kernel e a arena dos convidados (as alocações ainda devolvem a VA de
+identidade, igual ao físico), a janela do VirtualAlloc
+de kernel e o código do trampolim dos APs.
 
 ## 4. Dependências
 
