@@ -1,15 +1,29 @@
 //! PsGetNextProcessThread / PsEnumProcessThreads — `system32/ntos/ps/enum-process-threads.js`.
+//!
+//! Também os ZwGetNextProcess/ZwGetNextThread em KernelMode, como o
+//! NtGetNextProcess/NtGetNextThread do NT: a partir do handle dado (ou do
+//! começo), abrem o próximo processo da PsActiveProcessHead (para trás com o
+//! bit 0 de Flags) ou a próxima thread do processo; quem não abre é pulado, e
+//! o fim da lista é STATUS_NO_MORE_ENTRIES.
 
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 use super::process;
 use crate::hal::amd64::native_call;
 use crate::ntos::ex::push_lock;
+use crate::ntos::init::exports::invoke_handler;
 use crate::ntos::ke::{critical_region, dispatcher, irql};
-use crate::ntos::ob::open_pointer;
+use crate::ntos::ob::{object_types, open_pointer};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::{eprocess, kthread};
+
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 fn dereference(pointer: u64) {
     match open_pointer::describe(pointer) {
@@ -173,4 +187,99 @@ pub fn enumerate(target: u64, callback: u64, context: u64) -> Result<u32, Kernel
             return Ok(result);
         }
     }
+}
+
+/// ObReferenceObjectByHandle em KernelMode: Ok(objeto) ou Err(status).
+fn reference_handle(handle: u64, object_type: u64) -> Result<Result<u64, u32>, KernelError> {
+    let slot = guest::alloc_bytes(8);
+    if slot == 0 {
+        return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+    }
+    let status = invoke_handler("ObReferenceObjectByHandle", &[handle, 0, object_type, 0, slot, 0]);
+    let object = guest::read64(slot);
+    guest::free_bytes(slot);
+    let status = status? as u32;
+    Ok(if status == 0 { Ok(object) } else { Err(status) })
+}
+
+/// ObfDereferenceObject.
+fn dereference_object(object: u64) -> Result<(), KernelError> {
+    invoke_handler("ObfDereferenceObject", &[object]).map(|_| ())
+}
+
+/// ZwGetNextProcess(handle, access, attributes, flags, handle*): devolve o
+/// NTSTATUS.
+pub fn open_next_process(handle: u64, access: u32, attributes: u32, flags: u32, output: u64) -> Result<u32, KernelError> {
+    if flags & !1 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_4);
+    }
+    let backward = flags & 1 != 0;
+    let process_type = object_types::process_type().pointer;
+    let current = if handle == 0 {
+        None
+    } else {
+        match reference_handle(handle, process_type)? {
+            Ok(object) => Some(object),
+            Err(status) => return Ok(status),
+        }
+    };
+    let mut list: Vec<u64> = process::list_active_processes().into_iter().map(|entry| entry.address).collect();
+    if backward {
+        list.reverse();
+    }
+    let start = match current {
+        Some(object) => list.iter().position(|&address| address == object).map_or(list.len(), |index| index + 1),
+        None => 0,
+    };
+    if let Some(object) = current {
+        dereference_object(object)?;
+    }
+    for &candidate in &list[start.min(list.len())..] {
+        if open_pointer::open(candidate, attributes, 0, access, process_type, 0, output)? == 0 {
+            return Ok(0);
+        }
+    }
+    Ok(STATUS_NO_MORE_ENTRIES)
+}
+
+/// ZwGetNextThread(process, thread, access, attributes, flags, handle*):
+/// devolve o NTSTATUS.
+pub fn open_next_thread(process_handle: u64, thread_handle: u64, access: u32, attributes: u32, flags: u32, output: u64) -> Result<u32, KernelError> {
+    if flags != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_5);
+    }
+    let target = match reference_handle(process_handle, object_types::process_type().pointer)? {
+        Ok(object) => object,
+        Err(status) => return Ok(status),
+    };
+    let thread_type = object_types::thread_type().pointer;
+    // A referência da thread anterior passa para PsGetNextProcessThread.
+    let mut previous = 0;
+    if thread_handle != 0 {
+        match reference_handle(thread_handle, thread_type)? {
+            Ok(thread) if guest::read64(thread + kthread::PROCESS) == target => previous = thread,
+            Ok(thread) => {
+                dereference_object(thread)?;
+                dereference_object(target)?;
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            Err(status) => {
+                dereference_object(target)?;
+                return Ok(status);
+            }
+        }
+    }
+    let status = loop {
+        let next = get_next(target, previous)?;
+        if next == 0 {
+            break STATUS_NO_MORE_ENTRIES;
+        }
+        if open_pointer::open(next, attributes, 0, access, thread_type, 0, output)? == 0 {
+            dereference_object(next)?;
+            break 0;
+        }
+        previous = next;
+    };
+    dereference_object(target)?;
+    Ok(status)
 }

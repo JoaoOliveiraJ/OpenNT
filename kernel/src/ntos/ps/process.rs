@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::ex::{push_lock, rundown};
 use crate::ntos::ke::{clock, critical_region, pcr};
-use crate::ntos::mm::memory_map;
+use crate::ntos::mm::{kernel_data, memory_map};
 use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::{object_access, object_types};
 use crate::ntos::ob::handles::process as process_handles;
@@ -35,6 +35,8 @@ use crate::ntos::ps::notify::{process as process_notify, thread as thread_notify
 pub const SYSTEM_PROCESS_ID: u64 = 4;
 /// Política inicial de memória, distinta da prioridade de CPU.
 const NORMAL_THREAD_PAGE_PRIORITY: u32 = 5;
+const STATUS_INVALID_CID: u32 = 0xC000_000B;
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
 /// Imagem executável de um processo (`ps/process-image`, fase 6).
 #[derive(Clone, Debug)]
@@ -135,6 +137,8 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 });
 
 static SYSTEM_PROCESS: AtomicU64 = AtomicU64::new(0);
+/// A célula PsJobType, publicada no primeiro acesso.
+static JOB_TYPE: AtomicU64 = AtomicU64::new(0);
 /// O "gs:[0x188]" do kernel.
 static CURRENT_THREAD: AtomicU64 = AtomicU64::new(0);
 
@@ -969,6 +973,17 @@ pub fn list_active_processes() -> Vec<ActiveProcess> {
     result
 }
 
+/// PsLookupProcessByProcessId: anda a lista de processos ativos procurando
+/// o PID; achado, referencia o EPROCESS e o entrega ao chamador.
+pub fn lookup_process_by_id(pid: u64, output: u64) -> u32 {
+    let Some(found) = list_active_processes().into_iter().find(|entry| entry.pid == pid) else {
+        return STATUS_INVALID_CID;
+    };
+    reference(found.address);
+    guest::write64(output, found.address);
+    0
+}
+
 pub fn get_system_process() -> u64 {
     SYSTEM_PROCESS.load(Ordering::Relaxed)
 }
@@ -976,6 +991,59 @@ pub fn get_system_process() -> u64 {
 /// O dump referencia a mesma lista circular da enumeração de processos.
 pub fn get_active_process_head() -> u64 {
     STATE.lock().active_head
+}
+
+/// PsAcquireProcessExitSynchronization: a RundownProtect do EPROCESS, que
+/// o término do processo espera esvaziar; com o processo já saindo,
+/// STATUS_PROCESS_IS_TERMINATING.
+pub fn acquire_exit_synchronization(process: u64) -> Result<u32, KernelError> {
+    if rundown::acquire(process + eprocess::RUNDOWN_PROTECT)? {
+        Ok(0)
+    } else {
+        Ok(STATUS_PROCESS_IS_TERMINATING)
+    }
+}
+
+/// PsReleaseProcessExitSynchronization: ExReleaseRundownProtection em
+/// EPROCESS+0x458; devolve a referência retida por
+/// PsAcquireProcessExitSynchronization (ela pertence ao chamador).
+pub fn release_exit_synchronization(process: u64) -> Result<(), KernelError> {
+    rundown::release(process + eprocess::RUNDOWN_PROTECT)
+}
+
+/// Célula exportada PsInitialSystemProcess.
+pub fn initial_system_process_cell() -> u64 {
+    kernel_data::address("PsInitialSystemProcess").unwrap_or(0)
+}
+
+/// Célula exportada PsProcessType.
+pub fn process_type_cell() -> u64 {
+    kernel_data::address("PsProcessType").unwrap_or(0)
+}
+
+/// Célula exportada PsThreadType.
+pub fn thread_type_cell() -> u64 {
+    kernel_data::address("PsThreadType").unwrap_or(0)
+}
+
+/// Célula exportada PsJobType, publicada no primeiro acesso: o corpo do
+/// tipo Job e a célula que aponta para ele têm alocações distintas.
+pub fn job_type_cell() -> u64 {
+    let current = JOB_TYPE.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let body = guest::alloc_bytes(0x40);
+    let cell = guest::alloc_bytes(8);
+    guest::write64(cell, body);
+    match JOB_TYPE.compare_exchange(0, cell, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => cell,
+        Err(existing) => {
+            guest::free_bytes(cell);
+            guest::free_bytes(body);
+            existing
+        }
+    }
 }
 
 pub fn init() -> Result<(), KernelError> {

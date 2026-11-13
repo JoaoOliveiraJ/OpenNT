@@ -6,7 +6,7 @@
 use crate::ntos::rtl::unicode;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ps::exports::security_tokens;
+use crate::ntos::ps::security;
 
 const ATTRIBUTE_BUFFER_BYTES: u32 = 0x330;
 const SCRATCH_BYTES: u64 = 0x400;
@@ -78,10 +78,10 @@ fn query_identity(token: u64, scratch: u64, claim: u64, presence: u64) -> Result
     if presence != 0 {
         guest::write64(presence, 0);
     }
-    let mut status = security_tokens::query_attributes(token, filters, requested, scratch, ATTRIBUTE_BUFFER_BYTES, returned)?;
+    let mut status = security::query_attributes(token, filters, requested, scratch, ATTRIBUTE_BUFFER_BYTES, returned)?;
     if status == STATUS_NOT_FOUND && requested == 2 {
         has_package_claim = false;
-        status = security_tokens::query_attributes(token, filters, 1, scratch, ATTRIBUTE_BUFFER_BYTES, returned)?;
+        status = security::query_attributes(token, filters, 1, scratch, ATTRIBUTE_BUFFER_BYTES, returned)?;
     }
     if status & 0x8000_0000 != 0 {
         return Ok(status);
@@ -101,7 +101,7 @@ fn query_identity(token: u64, scratch: u64, claim: u64, presence: u64) -> Result
     if presence != 0 {
         guest::write64(presence, guest::read64(presence) | if has_package_claim { 3 } else { 1 });
         for index in 2..ATTRIBUTE_NAMES.len() as u64 {
-            let probe = security_tokens::query_attributes(token, filters + index * 16, 1, 0, 0, returned)?;
+            let probe = security::query_attributes(token, filters + index * 16, 1, 0, 0, returned)?;
             if probe == STATUS_BUFFER_TOO_SMALL {
                 guest::write64(presence, guest::read64(presence) | 1 << index);
             }

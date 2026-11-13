@@ -85,6 +85,23 @@ pub fn reference(pointer: u64) -> Result<Option<u64>, KernelError> {
     change_references(pointer, true).map(Some)
 }
 
+/// PsReferenceSiloContext: o contexto tem de existir.
+pub fn reference_existing(pointer: u64) -> Result<(), KernelError> {
+    if reference(pointer)?.is_none() {
+        return Err(KernelError::new("invalid silo-context reference"));
+    }
+    Ok(())
+}
+
+/// PsDereferenceSiloContext: contagem real; no zero roda o cleanup
+/// registrado e libera. O contexto tem de existir.
+pub fn dereference_existing(pointer: u64) -> Result<(), KernelError> {
+    if dereference(pointer)?.is_none() {
+        return Err(KernelError::new("invalid silo-context reference"));
+    }
+    Ok(())
+}
+
 /// PASSIVE_LEVEL, sem região guardada e com interrupções habilitadas.
 pub fn can_delete_now() -> bool {
     if irql::get_irql() != 0 {

@@ -829,6 +829,15 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
     result
 }
 
+/// PsCreateSystemThread(handle*, access, oa, process, clientId*, start,
+/// context) pelos OBJECT_ATTRIBUTES do chamador: OBJ_KERNEL_HANDLE escolhe a
+/// tabela do System; senão, a do processo corrente.
+pub fn create_system_thread_with_attributes(output_handle: u64, access: u32, object_attributes: u64, client_id: u64, start_routine: u64, context_pointer: u64) -> Result<u64, KernelError> {
+    let flags = if object_attributes != 0 { guest::read32(object_attributes + 24) } else { 0 };
+    let owner = if flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
+    create_system_thread(output_handle, start_routine, context_pointer, access, client_id, Some(HandleOptions { owner_process: Some(owner), attributes: flags }))
+}
+
 /// PsTerminateSystemThread: a thread corrente não retoma o código nativo.
 pub fn terminate_current_thread(status: u32) -> Result<u32, KernelError> {
     let current = CURRENT.lock().clone().ok_or_else(|| KernelError::new("PsTerminateSystemThread outside a scheduled native thread"))?;

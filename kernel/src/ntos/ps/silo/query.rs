@@ -11,6 +11,19 @@ use crate::ntos::inc::nt_abi::{ejob, eprocess, kthread};
 
 pub const INHERIT: u64 = 0xFFFF_FFFF_FFFF_FFFD;
 
+/// O silo hospedeiro é representado por NULL na ABI.
+pub const HOST_SILO: u64 = 0;
+
+/// PsGetHostSilo.
+pub fn host_silo() -> u64 {
+    HOST_SILO
+}
+
+/// PsIsHostSilo.
+pub fn is_host_silo(silo: u64) -> bool {
+    silo == HOST_SILO
+}
+
 pub fn job_silo(job: u64) -> u64 {
     let mut job = job;
     while job != 0 && guest::read32(job + ejob::FLAGS) & 0x4000_0000 == 0 {
@@ -46,6 +59,11 @@ pub fn current_silo() -> u64 {
 /// PsGetCurrentServerSilo: NULL dentro de DPC.
 pub fn current_server_silo() -> u64 {
     if pcr::get_nesting_level() != 0 { 0 } else { thread_server_silo(process::get_current_thread()) }
+}
+
+/// PsIsCurrentThreadInServerSilo.
+pub fn is_current_thread_in_server_silo() -> bool {
+    current_server_silo() != 0
 }
 
 /// PsAttachSiloToCurrentThread: devolve o silo anterior.
