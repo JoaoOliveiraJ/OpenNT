@@ -1,4 +1,4 @@
-//! Identidade e vida dos objetos de espera e conclusão — `system32/ntos/ob/dispatcher-objects.js`.
+//! Identidade e vida dos objetos de espera e conclusão.
 //!
 //! Handles e ponteiros retêm o mesmo corpo dono. O dono entrega `dispose`
 //! (libera os recursos reais) e, opcionalmente, `busy` (impede a coleta

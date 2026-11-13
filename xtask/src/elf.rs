@@ -1,6 +1,5 @@
 //! Leitura mínima de ELF64 little-endian x86-64: seções e símbolos, o
-//! suficiente para empacotar o kernel como PE32+ (como `readKernelElf` em
-//! `tools/kernel-pe.mjs`).
+//! suficiente para empacotar o kernel como PE32+.
 
 use std::collections::HashMap;
 

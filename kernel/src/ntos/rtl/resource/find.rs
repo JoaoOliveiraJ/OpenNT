@@ -1,4 +1,4 @@
-//! LdrResFindResource / LdrResSearchResource — `system32/ntos/rtl/find-resource.js`.
+//! LdrResFindResource / LdrResSearchResource.
 //!
 //! A pesquisa validada com os donos reais de módulos, VADs, arquivos e NLS;
 //! a API só publica endereços de bytes existentes.

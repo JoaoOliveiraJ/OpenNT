@@ -1,4 +1,4 @@
-//! Estado do subsistema de modo usuário — `system32/ntos/ps/user/state.js`.
+//! Estado do subsistema de modo usuário.
 //!
 //! Constantes, o estado mutável único `S` visto por todos os módulos de
 //! `ntos/ps/user`, a tabela de handles do processo e os auxiliares de leitura

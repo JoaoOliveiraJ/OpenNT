@@ -1,4 +1,4 @@
-//! Power Manager (Po*) — `system32/ntos/po/power-manager.js`.
+//! Power Manager (Po*).
 //!
 //! Estado de energia corrente de cada DEVICE_OBJECT (D0..D3), fila de power
 //! IRPs pendentes por dispositivo e encaminhamento pela pilha

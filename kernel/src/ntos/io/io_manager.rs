@@ -1,4 +1,4 @@
-//! I/O Manager — `system32/ntos/io/io-manager.js`.
+//! I/O Manager.
 //!
 //! Toda leitura/escrita em dispositivo vira um IRP entregue à rotina de
 //! despacho do driver dono do DEVICE_OBJECT. Este arquivo tem a camada

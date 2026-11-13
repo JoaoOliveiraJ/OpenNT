@@ -1,5 +1,5 @@
-//! Cabeçalhos e diretórios PE de imagens mapeadas ou bytes de arquivo —
-//! `system32/ntos/rtl/image.js` (RtlImageNtHeaderEx, RtlImageDirectoryEntryToData).
+//! Cabeçalhos e diretórios PE de imagens mapeadas ou bytes de arquivo
+//! (RtlImageNtHeaderEx, RtlImageDirectoryEntryToData).
 //!
 //! Só lê os bytes fornecidos; carregamento, relocação e execução pertencem
 //! ao loader PE. Sobre as imagens já carregadas: a base que contém um
@@ -142,7 +142,7 @@ pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {
 }
 
 pub mod pe_metadata_reader {
-    //! Leitura escalar de metadados PE — `system32/win32/pe-metadata-reader.js`.
+    //! Leitura escalar de metadados PE.
     //!
     //! Cada leitor pertence ao arquivo já validado e retido pelo loader durante
     //! uma carga; não é um cache global do volume. Oito páginas de 4 KiB.
@@ -218,7 +218,7 @@ pub mod pe_metadata_reader {
 }
 
 pub mod pe_exports {
-    //! Tabelas de exports PE — `system32/win32/pe-exports.js`.
+    //! Tabelas de exports PE.
     //!
     //! A EAT inclui ordinais sem nome e encaminhamentos; `read_rva` lê bytes da
     //! imagem (arquivo ou memória), sem depender do hardware.
@@ -314,7 +314,7 @@ pub mod pe_exports {
 }
 
 pub mod pe_image_information {
-    //! SECTION_IMAGE_INFORMATION — `system32/win32/pe-image-information.js`.
+    //! SECTION_IMAGE_INFORMATION.
     //!
     //! Capturada na criação da imagem PE32+; a consulta posterior usa esta
     //! cópia, e escrever nos cabeçalhos mapeados não altera os metadados que o

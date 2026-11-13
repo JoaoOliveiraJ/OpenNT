@@ -1,4 +1,4 @@
-//! ZwQuerySecurityObject — `system32/ntos/ob/query-security.js`.
+//! ZwQuerySecurityObject.
 //!
 //! A tabela real retém o corpo antes de chamar o dono. LengthNeeded é
 //! publicado depois do procedimento, inclusive nos erros; um handle inválido

@@ -1,4 +1,4 @@
-//! Posse da conclusão nos serviços de arquivo — `system32/ntos/io/file-request.js`.
+//! Posse da conclusão nos serviços de arquivo.
 //!
 //! Drivers concluem IRPs reais; a saída paginável do chamador só é finalizada
 //! na thread/contexto que pediu. A requisição guarda arquivo, thread, evento,

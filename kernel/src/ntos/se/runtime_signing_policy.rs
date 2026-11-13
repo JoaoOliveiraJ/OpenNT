@@ -1,4 +1,4 @@
-//! SeILSigningPolicyRuntime — `system32/ntos/se/runtime-signing-policy.js`.
+//! SeILSigningPolicyRuntime.
 //!
 //! O byte pertence à memória nativa do kernel: o setter da CI e os
 //! consumidores leem a mesma célula, sem cópia de estado em Rust.

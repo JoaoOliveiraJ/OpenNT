@@ -1,4 +1,4 @@
-//! Banco de frames legível por código nativo — `ntos/mm/native-pfn-database.js`.
+//! Banco de frames legível por código nativo.
 //!
 //! O armazenamento pertence ao PFN; os descritores acompanham a alocação e
 //! as tabelas de páginas do mesmo boot.

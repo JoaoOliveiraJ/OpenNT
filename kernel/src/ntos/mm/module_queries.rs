@@ -1,5 +1,5 @@
-//! Consultas do Mm sobre imagens, RAM e MDLs:
-//! `system-module-information.js`, `physical-ranges.js` e `protect-mdl.js`.
+//! Consultas do Mm sobre imagens, RAM e MDLs: informação de módulos do sistema,
+//! faixas físicas e proteção de MDL.
 
 use alloc::vec;
 use alloc::vec::Vec;

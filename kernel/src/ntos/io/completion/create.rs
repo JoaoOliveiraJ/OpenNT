@@ -1,4 +1,4 @@
-//! Criação de portas de conclusão — `system32/ntos/io/create-completion.js`.
+//! Criação de portas de conclusão.
 //!
 //! A criação concede a máscara válida pedida; OPENIF verifica a política já
 //! pertencente ao objeto sem mudar concorrência, segurança ou pacotes. A

@@ -1,4 +1,4 @@
-//! SLIST_HEADER x64 — `system32/ntos/ex/slist.js` e `first-slist.js`.
+//! SLIST_HEADER x64.
 //!
 //! Profundidade nos 16 bits baixos, sequência nos 48 seguintes e o primeiro
 //! ponteiro na segunda palavra; CMPXCHG16B conserva o par sob concorrência.

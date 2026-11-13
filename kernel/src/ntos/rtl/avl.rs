@@ -1,4 +1,4 @@
-//! RTL_AVL_TREE na memória do convidado — `system32/ntos/rtl/avl.js`.
+//! RTL_AVL_TREE na memória do convidado.
 //!
 //! A raiz fica em +0; RTL_BALANCED_NODE tem filhos em +0/+8 e o pai com dois
 //! bits de balanço em +16. O chamador fornece nós, ordenação e sincronização;

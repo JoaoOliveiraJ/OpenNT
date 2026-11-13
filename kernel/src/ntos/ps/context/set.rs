@@ -1,4 +1,4 @@
-//! Operação por trás dos wrappers x64 públicos/privados — `system32/ntos/ps/set-thread-context.js`.
+//! Operação por trás dos wrappers x64 públicos/privados.
 //!
 //! O modo de sondagem descreve o buffer de entrada; o modo de contexto
 //! escolhe o estado de execução de destino. A interrupção da HAL já salvou

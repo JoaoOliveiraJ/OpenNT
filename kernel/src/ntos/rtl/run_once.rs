@@ -1,4 +1,4 @@
-//! RTL_RUN_ONCE — `system32/ntos/rtl/run-once.js`.
+//! RTL_RUN_ONCE.
 //!
 //! Bits baixos: 0 inicial, 1 inicialização síncrona (os bits altos apontam
 //! a pilha de esperadores), 2 contexto concluído, 3 inicialização

@@ -1,4 +1,4 @@
-//! Manifesto de plataforma — `system32/ntos/se/platform-manifest.js`.
+//! Manifesto de plataforma.
 //!
 //! Consulta o manifesto da política entregue no boot. A captura conserva uma
 //! cópia privada; consultar um identificador não registra política, não

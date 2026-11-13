@@ -1,4 +1,4 @@
-//! IoVolumeDeviceToDosName — `system32/ntos/io/volume-dos-name.js`.
+//! IoVolumeDeviceToDosName.
 //!
 //! O nome DOS vem dos drivers donos do volume e dos pontos de montagem do
 //! Mount Manager; nenhuma letra é inferida do caminho de um arquivo.

@@ -1,4 +1,4 @@
-//! Prioridade dinâmica do KTHREAD — `system32/ntos/ke/thread-priority.js`.
+//! Prioridade dinâmica do KTHREAD.
 //!
 //! Contrato medido no kernel 19041. As filas e a entrega ao próximo contexto
 //! pertencem a `thread_dispatch`.

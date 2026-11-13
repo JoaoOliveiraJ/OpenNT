@@ -1,4 +1,4 @@
-//! Tabela publicada pelo Filter Manager — `system32/ntos/fs/filter-callbacks.js`.
+//! Tabela publicada pelo Filter Manager.
 //!
 //! O kernel não interpreta nomes, não possui os buffers devolvidos e não
 //! substitui um provedor ausente. FltMgrCallbacks começa nulo; o dono da

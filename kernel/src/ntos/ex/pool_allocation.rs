@@ -1,4 +1,4 @@
-//! Alocação de pool com prioridade pela ABI NT — `system32/ntos/ex/pool-allocation.js`.
+//! Alocação de pool com prioridade pela ABI NT.
 //!
 //! O provedor de memória mantém armazenamento, paginação e propriedade;
 //! pedidos inválidos provocam bugcheck 0xC2 e a falha com RAISE levanta

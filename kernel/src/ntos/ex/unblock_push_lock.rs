@@ -1,4 +1,4 @@
-//! ExfUnblockPushLock — `system32/ntos/ex/unblock-push-lock.js`.
+//! ExfUnblockPushLock.
 //!
 //! Consome uma cadeia simples de blocos aguardando desbloqueio. Recebe o
 //! ponteiro bruto da cadeia, não a palavra marcada de ExAcquirePushLock.

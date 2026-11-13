@@ -1,4 +1,4 @@
-//! MmMapViewInSystemSpace(Ex) — `system32/ntos/mm/map-system-view.js`.
+//! MmMapViewInSystemSpace(Ex).
 //!
 //! A ordem das leituras e escritas segue o wrapper original, inclusive com
 //! buffers sobrepostos. O mapeamento pertence ao provedor de seções e usa

@@ -1,4 +1,4 @@
-//! KeCapturePersistentThreadState — `system32/ntos/ke/persistent-thread-state.js`.
+//! KeCapturePersistentThreadState.
 //!
 //! Triage dump x64 de 256 KiB com o layout, o tamanho devolvido e a ordem de
 //! cópia do ntoskrnl 19041. A captura não causa bugcheck nem executa

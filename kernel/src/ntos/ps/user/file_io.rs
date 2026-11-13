@@ -1,5 +1,4 @@
-//! Contratos de arquivo de modo usuário sobre o NTFS persistente —
-//! `system32/ntos/ps/user/file-io.js`.
+//! Contratos de arquivo de modo usuário sobre o NTFS persistente.
 //!
 //! Transcrito: abertura/criação pelo volume (validação de disposição,
 //! opções, compartilhamento, superseded/overwrite/create, DELETE_ON_CLOSE),

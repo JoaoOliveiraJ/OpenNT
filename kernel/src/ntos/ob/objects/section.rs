@@ -1,4 +1,4 @@
-//! Identidade nativa das seções — `system32/ntos/ob/section-objects.js`.
+//! Identidade nativa das seções.
 //!
 //! Referências por ponteiro, handles e vistas mapeadas retêm o objeto de
 //! forma independente. O estado de memória da seção pertence ao Mm; aqui

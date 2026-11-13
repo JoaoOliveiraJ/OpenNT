@@ -1,4 +1,4 @@
-//! Integridade de código — `system32/ntos/se/code-integrity.js`.
+//! Integridade de código.
 //!
 //! Inicializa a ci.dll original e entrega ao carregador uma decisão real de
 //! assinatura. O bootstrap já carregado é a raiz deste ambiente; novas

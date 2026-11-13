@@ -1,4 +1,4 @@
-//! Retenções de leitura de VAD — `system32/ntos/mm/secured-views.js`.
+//! Retenções de leitura de VAD.
 //!
 //! Impedem a desmontagem e a perda de acesso enquanto um dono de kernel usa
 //! a vista. A autorização é um objeto privado (o token).

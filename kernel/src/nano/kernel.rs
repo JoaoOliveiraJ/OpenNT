@@ -1,4 +1,4 @@
-//! O nanokernel — registro de serviços (`system32/nano/kernel.js`).
+//! O nanokernel — registro de serviços.
 //!
 //! Drivers, FS, console e win32 podem ser serviços registrados aqui e
 //! acessados por chamada de serviço (mensagem). Requisições e respostas são

@@ -1,4 +1,4 @@
-//! Layouts NT de informação de volume — `system32/ntos/fs/volume-information.js`.
+//! Layouts NT de informação de volume.
 //!
 //! Identidade e capacidade pertencem ao volume montado, nunca a um caminho
 //! nem a uma lista de arquivos.

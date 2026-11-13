@@ -1,4 +1,4 @@
-//! Banco nativo de relatos de uso — `system32/ntos/cm/feature-usage-buffer.js`.
+//! Banco nativo de relatos de uso.
 //!
 //! 64 relatos; produtores reservam primeiro a contagem e depois um bit, e o
 //! consumidor só drena um banco fora de uso pelos produtores. Layout de

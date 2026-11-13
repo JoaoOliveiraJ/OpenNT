@@ -1,5 +1,5 @@
-//! Rotinas Rtl de strings contadas: `append-unicode-string.js`,
-//! `copy-unicode-string.js` e `initialize-ansi-string.js`.
+//! Rotinas Rtl de strings contadas: anexar e copiar UNICODE_STRING e
+//! inicializar ANSI_STRING.
 
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;

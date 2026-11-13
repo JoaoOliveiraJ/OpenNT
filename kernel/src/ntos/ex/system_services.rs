@@ -1,4 +1,4 @@
-//! Números de serviço e seus provedores — `system32/ntos/ex/system-services.js`.
+//! Números de serviço e seus provedores.
 //!
 //! Vincula os números lidos das bibliotecas aos provedores das tabelas
 //! nativas: os metadados de `service_abi` descrevem a convenção de chamada

@@ -1,4 +1,4 @@
-//! ProcessTlsInformation da ABI x64 das DLLs do volume — `system32/ntos/ps/user/tls.js`.
+//! ProcessTlsInformation da ABI x64 das DLLs do volume.
 //!
 //! Layout confirmado na ntdll e no ntoskrnl: cabeçalho de 16 bytes e
 //! entradas de 24 bytes; TlsData é entrada/saída.

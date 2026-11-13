@@ -1,4 +1,4 @@
-//! Conexão ALPC retomável — `system32/ntos/alpc/connect-port.js`.
+//! Conexão ALPC retomável.
 //!
 //! O handle possui uma porta real ainda pendente; só a decisão do servidor
 //! conecta a porta ou produz a recusa. Atributos, filas, limpeza e

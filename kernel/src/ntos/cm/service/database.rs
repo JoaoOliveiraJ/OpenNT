@@ -1,4 +1,4 @@
-//! Banco de serviços — `system32/ntos/cm/service-database.js`.
+//! Banco de serviços.
 //!
 //! Configuração dos serviços na hive e ciclo dos processos de serviço. Um
 //! processo lançado fica START_PENDING até relatar SERVICE_RUNNING pelo

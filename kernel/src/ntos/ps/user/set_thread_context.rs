@@ -1,4 +1,4 @@
-//! Ramo de execução de usuário da operação de contexto — `system32/ntos/ps/user/set-thread-context.js`.
+//! Ramo de execução de usuário da operação de contexto.
 //!
 //! O escalonador possui o CONTEXT arquitetural completo salvo pela HAL,
 //! inclusive os não voláteis.

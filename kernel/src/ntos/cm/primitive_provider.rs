@@ -1,4 +1,4 @@
-//! Catálogo do Microsoft Primitive Provider — `system32/ntos/cm/primitive-provider.js`.
+//! Catálogo do Microsoft Primitive Provider.
 //!
 //! Metadados públicos do catálogo criptográfico da instalação Windows dos
 //! binários: nomes, modalidades e módulos, com os identificadores oficiais

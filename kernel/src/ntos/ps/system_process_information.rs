@@ -1,5 +1,4 @@
-//! SYSTEM_PROCESS_INFORMATION + SYSTEM_THREAD_INFORMATION x64 nativos —
-//! `system32/ntos/ps/system-process-information.js`.
+//! SYSTEM_PROCESS_INFORMATION + SYSTEM_THREAD_INFORMATION x64 nativos.
 //!
 //! Os registros vêm do PsActiveProcessHead e do registro de threads do
 //! kernel; os nomes vão em UTF-16 e os ponteiros são relocados para o buffer

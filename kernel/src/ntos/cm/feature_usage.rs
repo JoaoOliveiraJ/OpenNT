@@ -1,4 +1,4 @@
-//! Relatos de uso de funcionalidades — `system32/ntos/cm/feature-usage.js`.
+//! Relatos de uso de funcionalidades.
 //!
 //! Dois bancos de relatos, work items, DPCs e o timer de reenvio. A produção
 //! pode ocorrer com IRQL elevado; a entrega acontece pela fila de trabalho em

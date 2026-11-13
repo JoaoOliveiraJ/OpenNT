@@ -1,4 +1,4 @@
-//! Exports Ob* do ntoskrnl — `system32/win32/ntoskrnl/ob.js`.
+//! Exports Ob* do ntoskrnl.
 //!
 //! Só os adaptadores: cada handler lê os argumentos do `Call`, chama a
 //! rotina do assunto e converte o resultado. As referências e aberturas
@@ -73,7 +73,7 @@ pub mod find_handle {
 }
 
 pub mod get_object_type {
-    //! ObGetObjectType — `system32/win32/ntoskrnl/get-object-type.js`.
+    //! ObGetObjectType.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -92,7 +92,7 @@ pub mod get_object_type {
 }
 
 pub mod object_callbacks {
-    //! ObRegisterCallbacks/ObUnRegisterCallbacks — `system32/win32/ntoskrnl/object-callbacks.js`.
+    //! ObRegisterCallbacks/ObUnRegisterCallbacks.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -115,7 +115,7 @@ pub mod object_callbacks {
 }
 
 pub mod open_pointer_exports {
-    //! ObOpenObjectByPointer — `system32/win32/ntoskrnl/open-pointer.js`.
+    //! ObOpenObjectByPointer.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -166,7 +166,7 @@ pub mod tagged_reference {
 }
 
 pub mod close {
-    //! NtClose — `system32/win32/ntoskrnl/close.js`.
+    //! NtClose.
     //!
     //! Fecha com o modo anterior da thread.
 
@@ -187,7 +187,7 @@ pub mod close {
 }
 
 pub mod query_object {
-    //! ZwQueryObject — `win32/ntoskrnl/query-object.js`: a consulta de objetos
+    //! ZwQueryObject: a consulta de objetos
     //! dos provedores reais.
 
     use crate::ntos::init::exports::{signed_status, Call, Group};

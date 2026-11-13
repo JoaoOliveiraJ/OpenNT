@@ -1,4 +1,4 @@
-//! NDR32 limitado — `system32/ntos/io/ndr.js`.
+//! NDR32 limitado.
 //!
 //! Escalares little-endian, strings conformantes e context handles; os
 //! referentes do fio são identificadores, nunca endereços virtuais.

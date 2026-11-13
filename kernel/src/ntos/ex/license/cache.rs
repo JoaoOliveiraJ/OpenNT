@@ -1,4 +1,4 @@
-//! Preparação e consulta do contexto de ProductPolicy — `system32/ntos/ex/license-cache.js`.
+//! Preparação e consulta do contexto de ProductPolicy.
 //!
 //! O dono conserva os blobs vivos até destruir o contexto e o registro de
 //! estado.

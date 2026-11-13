@@ -1,4 +1,4 @@
-//! Ciclo de vida dos drivers `.sys` — `system32/win32/ntoskrnl/lifecycle.js`.
+//! Ciclo de vida dos drivers `.sys`.
 //!
 //! DRIVER_OBJECT real do NT (Type, Size, DriverStart/Size, DriverName,
 //! DriverInit, MajorFunction zerado, DriverUnload lido do offset real) e a

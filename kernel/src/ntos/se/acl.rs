@@ -1,4 +1,4 @@
-//! Validação estrutural de ACLs e ACEs — `system32/ntos/se/acl.js` (RtlValidAcl).
+//! Validação estrutural de ACLs e ACEs (RtlValidAcl).
 //!
 //! A decisão de acesso pertence a outro provedor; tipos desconhecidos de
 //! entrada passam só pela verificação mínima do cabeçalho do kernel original.

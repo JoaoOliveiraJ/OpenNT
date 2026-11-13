@@ -1,5 +1,5 @@
-//! Sistema de arquivos em memória com namespace plano —
-//! `system32/ntos/fs/memory-file-system.js`. Guarda texto ou binário
+//! Sistema de arquivos em memória com namespace plano.
+//! Guarda texto ou binário
 //! (por exemplo, um .exe).
 
 use alloc::collections::BTreeMap;

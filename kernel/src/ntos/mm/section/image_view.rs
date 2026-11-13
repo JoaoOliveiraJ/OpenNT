@@ -1,4 +1,4 @@
-//! Vista de seção de imagem pelo loader — `system32/ntos/mm/section-image-view.js`.
+//! Vista de seção de imagem pelo loader.
 //!
 //! A imagem é preparada pelo loader de PE com a vista parcial pedida, sem
 //! imports nem relocações (a ntdll real faz o binding). A vista entra nas

@@ -1,4 +1,4 @@
-//! SystemCodeIntegrityInformation (103) — `system32/ntos/se/code-integrity-information.js`.
+//! SystemCodeIntegrityInformation (103).
 //!
 //! Compartilhado pelos exports de kernel e pela chamada de usuário. A ABI tem
 //! dois ULONGs: Length e CodeIntegrityOptions.

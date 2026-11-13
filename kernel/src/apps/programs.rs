@@ -1,4 +1,4 @@
-//! Programas de exemplo do shell — `apps/programs/hello.js` e `pisca.js`.
+//! Programas de exemplo do shell.
 //!
 //! No original eram scripts lidos do MemoryFileSystem e executados com
 //! `new Function('SystemCall', fonte)`. Sem interpretador, o OpenNT os embute
@@ -18,13 +18,13 @@ fn print(text: impl Into<String>) {
     let _ = syscalls::call("print", &[Value::Text(text.into())]);
 }
 
-/// `hello.js`: imprime uma saudação e devolve 6 * 7.
+/// `hello`: imprime uma saudação e devolve 6 * 7.
 pub fn hello() -> Result<Value, KernelError> {
     print("Ola de um programa Rust rodando no OpenNT!");
     Ok(Value::Number(6 * 7))
 }
 
-/// `pisca.js`: processo cooperativo que imprime cinco ticks.
+/// `pisca`: processo cooperativo que imprime cinco ticks.
 pub async fn pisca() -> u32 {
     for tick in 1..=5 {
         print(format!("[pisca] tick {tick}"));
@@ -38,7 +38,7 @@ pub type Program = fn() -> Result<Value, KernelError>;
 pub type ProcessProgram = fn() -> ProcessFuture;
 
 /// Nome canônico de um programa: sem diretório e sem extensão
-/// (`/hello.js`, `C:\hello.js` e `hello` levam a `hello`).
+/// (`/hello.exe`, `C:\hello.exe` e `hello` levam a `hello`).
 fn program_name(path: &str) -> String {
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let stem = base.split('.').next().unwrap_or(base);

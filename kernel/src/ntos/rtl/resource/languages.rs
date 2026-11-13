@@ -1,4 +1,4 @@
-//! Identidade de idiomas do resolvedor de recursos — `system32/ntos/rtl/resource-languages.js`.
+//! Identidade de idiomas do resolvedor de recursos.
 //!
 //! A configuração corrente da máquina vem do proprietário NLS, sem estado
 //! global duplicado nem escolha de idioma pelo processo do host.

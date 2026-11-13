@@ -1,4 +1,4 @@
-//! Driver VGA modo texto 80x25 — `system32/drivers/video/vga.js`.
+//! Driver VGA modo texto 80x25.
 //!
 //! Escreve direto na memória de vídeo 0xB8000 e move o cursor de hardware
 //! pelas portas 0x3D4/0x3D5.

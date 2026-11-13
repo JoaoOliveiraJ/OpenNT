@@ -1,4 +1,4 @@
-//! KDDEBUGGER_DATA64 deste boot — `system32/ntos/ke/debugger-data.js`.
+//! KDDEBUGGER_DATA64 deste boot.
 //!
 //! Layout público de wdbgexts.h; campos sem representação NT ficam nulos.
 //! O bitmap do alocador não é apresentado como array de MMPFN e PteBase só

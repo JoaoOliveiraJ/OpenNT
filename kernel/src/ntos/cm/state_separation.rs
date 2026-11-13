@@ -1,5 +1,4 @@
-//! Política de separação de estado capturada no boot —
-//! `system32/ntos/cm/state-separation.js`.
+//! Política de separação de estado capturada no boot.
 //!
 //! A consulta não ativa isolamento de arquivos/hives e não relê o Registro.
 //! CmControlVector copia até quatro bytes do valor `Enabled`; bytes ausentes

@@ -1,5 +1,5 @@
-//! NonPagedPoolLock da PCR nativa, usado pela arena NT de convidados —
-//! `system32/ntos/mm/pool-lock.js`. O heap do kernel (kmalloc) é separado.
+//! NonPagedPoolLock da PCR nativa, usado pela arena NT de convidados.
+//! O heap do kernel (kmalloc) é separado.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -1,4 +1,4 @@
-//! NtUnmapViewOfSection — `system32/ntos/mm/unmap-view.js`.
+//! NtUnmapViewOfSection.
 //!
 //! Uma falha síncrona de writeback conserva a vista e o backing: o chamador
 //! pode repetir sem perder bytes sujos.

@@ -1,5 +1,5 @@
-//! Módulos pequenos do Mm: `address-validity.js`, `mdl-size.js`,
-//! `page-fault-failure.js` e a sondagem de endereços de usuário
+//! Módulos pequenos do Mm: validade de endereço, tamanho de MDL, falha de
+//! página e a sondagem de endereços de usuário
 //! (ProbeForRead/ProbeForWrite).
 
 use crate::ntos::ke::irql;

@@ -1,4 +1,4 @@
-//! Serviços de arquivo do kernel — núcleo do `system32/win32/ntoskrnl/zw.js`.
+//! Serviços de arquivo do kernel.
 //!
 //! ZwCreateFile sobre dispositivos (CREATE IRP pelo I/O Manager) e sobre
 //! volumes montados no namespace (disco em memória, NTFS), a tabela de

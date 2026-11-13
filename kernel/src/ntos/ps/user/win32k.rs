@@ -1,4 +1,4 @@
-//! Estado USER/GDI da sessão — `system32/ntos/ps/user/win32k.js`.
+//! Estado USER/GDI da sessão.
 //!
 //! Layout das DLLs x64 instaladas (19041), tirado de
 //! USER32!UserClientDllInitialize, win32kfull!NtUserProcessConnect e

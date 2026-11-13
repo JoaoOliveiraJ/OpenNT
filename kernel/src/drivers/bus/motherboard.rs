@@ -1,4 +1,4 @@
-//! Bus driver dos dispositivos fixos da placa-mãe — `system32/drivers/bus/motherboard.js`.
+//! Bus driver dos dispositivos fixos da placa-mãe.
 //!
 //! O que o ACPI enumeraria no PC: PNP0303 (controlador de teclado PS/2 8042)
 //! e PNP0F13 (mouse PS/2). Cria os PDOs com os recursos reais (portas

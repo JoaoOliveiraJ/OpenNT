@@ -1,4 +1,4 @@
-//! Serialização das classes de ZwQueryObject — `system32/ntos/ob/query-object-format.js`.
+//! Serialização das classes de ZwQueryObject.
 //!
 //! Comprimentos em bytes; cada classe tem sua regra de capacidade e
 //! alinhamento.

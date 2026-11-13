@@ -1,4 +1,4 @@
-//! ObFindHandleForObject — `system32/ntos/ob/find-handle.js`.
+//! ObFindHandleForObject.
 //!
 //! Busca um objeto na HANDLE_TABLE viva do processo. A enumeração entrega
 //! cada entrada bloqueada; o filtro libera o bloqueio antes de acordar os

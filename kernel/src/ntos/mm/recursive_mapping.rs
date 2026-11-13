@@ -1,5 +1,5 @@
-//! Janela supervisora para as tabelas que a CPU realmente usa —
-//! `system32/ntos/mm/recursive-mapping.js`. O frame da PML4 reaparece nos
+//! Janela supervisora para as tabelas que a CPU realmente usa.
+//! O frame da PML4 reaparece nos
 //! quatro níveis; não há cópias de PTEs.
 
 use super::memory_map as map;

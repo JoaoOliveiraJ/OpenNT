@@ -1,4 +1,4 @@
-//! SCMR sobre o endpoint ALPC local — `system32/ntos/cm/service-rpc.js`.
+//! SCMR sobre o endpoint ALPC local.
 //!
 //! Operações NDR32 do gerenciador de serviços: os contextos RPC têm dono e
 //! máscara de direitos próprios; códigos de operação e campos do protocolo

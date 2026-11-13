@@ -1,4 +1,4 @@
-//! Pedidos síncronos do FsRtl com posse retida — `system32/ntos/io/retained-irp.js`.
+//! Pedidos síncronos do FsRtl com posse retida.
 //!
 //! A rotina de conclusão sinaliza o evento privado e devolve
 //! STATUS_MORE_PROCESSING_REQUIRED: só o chamador solta o IRP, depois da

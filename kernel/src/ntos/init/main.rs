@@ -1,5 +1,4 @@
-//! Ponto de entrada do kernel (o KiSystemStartup do OpenNT) —
-//! `system32/init/main.js`.
+//! Ponto de entrada do kernel (o KiSystemStartup do OpenNT).
 //!
 //! Boot em fases, estilo NT: fase 0 (núcleo mínimo) -> fase 1 (I/O, drivers,
 //! serviços do Registry, PnP) -> processos (serviço de teclado + shell) ->

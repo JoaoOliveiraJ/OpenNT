@@ -1,4 +1,4 @@
-//! APCs com KAPC x64 de 0x58 bytes — `system32/ntos/ke/apc.js`.
+//! APCs com KAPC x64 de 0x58 bytes.
 //!
 //! As filas pertencem à thread de destino; anexações de processo conservam
 //! ambientes separados. A entrega ocorre nos pontos de drenagem cooperativa,

@@ -1,4 +1,4 @@
-//! Regiões críticas e guardadas — `system32/ntos/ke/critical-region.js`.
+//! Regiões críticas e guardadas.
 //!
 //! Contadores SHORT com sinal em KTHREAD (KernelApcDisable e
 //! SpecialApcDisable). O aninhamento acompanha a thread, não a CPU.

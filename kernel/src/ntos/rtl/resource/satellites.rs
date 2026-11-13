@@ -1,4 +1,4 @@
-//! Cache de arquivos de recursos por imagem carregada — `system32/ntos/rtl/resource-satellites.js`.
+//! Cache de arquivos de recursos por imagem carregada.
 //!
 //! Só o arquivo validado fornece um ponteiro; decisões negativas não criam
 //! bytes nem estado de CI. O cache vive enquanto a imagem dona estiver

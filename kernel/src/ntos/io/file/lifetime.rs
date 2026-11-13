@@ -1,4 +1,4 @@
-//! Exclusão por nome compartilhada — `system32/ntos/io/file-lifetime.js`.
+//! Exclusão por nome compartilhada.
 //!
 //! Descrições de arquivo do kernel, handles de usuário e SECTIONs dividem o
 //! SHARE_ACCESS e a remoção pendente. CLEANUP encerra o compartilhamento; uma

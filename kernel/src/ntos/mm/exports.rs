@@ -1,5 +1,5 @@
 //! Exports Mm* (memória não cacheada, I/O space, MDL, mapeamentos reservados,
-//! sondagem de usuário) — `system32/win32/ntoskrnl/mm.js`.
+//! sondagem de usuário).
 
 use crate::ntos::init::exports::{Call, Group};
 use crate::ntos::mm::guest_memory as guest;
@@ -116,7 +116,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod address_validity {
-    //! MmIsAddressValid — `system32/win32/ntoskrnl/address-validity.js`.
+    //! MmIsAddressValid.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -135,7 +135,7 @@ pub mod address_validity {
 }
 
 pub mod create_section_object {
-    //! MmCreateSection — `win32/ntoskrnl/create-section-object.js`. Entrega um
+    //! MmCreateSection. Entrega um
     //! SECTION referenciado; o construtor comum conserva o arquivo, as proteções
     //! e a vida do objeto sem criar handle oculto.
 
@@ -153,7 +153,7 @@ pub mod create_section_object {
 }
 
 pub mod dump_mdl {
-    //! MmMapMemoryDumpMdl — `system32/win32/ntoskrnl/dump-mdl.js`.
+    //! MmMapMemoryDumpMdl.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -173,7 +173,7 @@ pub mod dump_mdl {
 }
 
 pub mod free_contiguous {
-    //! Memória física contígua — `system32/win32/ntoskrnl/free-contiguous.js`.
+    //! Memória física contígua.
     //!
     //! O provedor mantém metadados e propriedade de cada alocação; a liberação
     //! com cache usa o tamanho e o cache dos metadados, não os argumentos.
@@ -204,7 +204,7 @@ pub mod free_contiguous {
 }
 
 pub mod image_paging_exports {
-    //! Paginação de imagens de drivers — `system32/win32/ntoskrnl/image-paging.js`.
+    //! Paginação de imagens de drivers.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::image_paging;
@@ -235,8 +235,8 @@ pub mod image_paging_exports {
 }
 
 pub mod map_section_in_system_space {
-    //! MmMapViewInSystemSpace — `win32/ntoskrnl/map-section-in-system-space.js`
-    //! (entrada de três argumentos, no fim da ABI para preservar os ids).
+    //! MmMapViewInSystemSpace (entrada de três argumentos, no fim da ABI para
+    //! preservar os ids).
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};
     use crate::ntos::mm::section::map_system_view;
@@ -250,7 +250,7 @@ pub mod map_section_in_system_space {
 }
 
 pub mod map_system_view {
-    //! MmMapViewInSystemSpaceEx — `win32/ntoskrnl/map-system-view.js`; uma falha
+    //! MmMapViewInSystemSpaceEx; uma falha
     //! interna interrompe o convidado sem publicar endereço substituto.
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};
@@ -265,7 +265,7 @@ pub mod map_system_view {
 }
 
 pub mod mdl_size {
-    //! MmSizeOfMdl — `system32/win32/ntoskrnl/mdl-size.js`.
+    //! MmSizeOfMdl.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -284,7 +284,7 @@ pub mod mdl_size {
 }
 
 pub mod physical_ranges {
-    //! MmGetPhysicalMemoryRanges — `system32/win32/ntoskrnl/physical-ranges.js`.
+    //! MmGetPhysicalMemoryRanges.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -303,7 +303,7 @@ pub mod physical_ranges {
 }
 
 pub mod protect_mdl {
-    //! MmProtectMdlSystemAddress — `system32/win32/ntoskrnl/protect-mdl.js`.
+    //! MmProtectMdlSystemAddress.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -322,7 +322,7 @@ pub mod protect_mdl {
 }
 
 pub mod unmap_system_view {
-    //! MmUnmapViewInSystemSpace — `win32/ntoskrnl/unmap-system-view.js`.
+    //! MmUnmapViewInSystemSpace.
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};
     use crate::ntos::mm::section::unmap_system_view;
@@ -336,7 +336,7 @@ pub mod unmap_system_view {
 }
 
 pub mod create_section {
-    //! ZwCreateSection — `win32/ntoskrnl/create-section.js`; o Zw usa KernelMode
+    //! ZwCreateSection; o Zw usa KernelMode
     //! durante toda a operação e restaura o modo anterior.
 
     use crate::ntos::init::exports::{Call, Group};
@@ -353,7 +353,7 @@ pub mod create_section {
 }
 
 pub mod open_section {
-    //! ZwOpenSection — `win32/ntoskrnl/open-section.js`, em KernelMode.
+    //! ZwOpenSection, em KernelMode.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::section::open as open_section;
@@ -368,7 +368,7 @@ pub mod open_section {
 }
 
 pub mod map_view {
-    //! ZwMapViewOfSection — `win32/ntoskrnl/map-view.js`, em KernelMode.
+    //! ZwMapViewOfSection, em KernelMode.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::section::map_view;
@@ -384,7 +384,7 @@ pub mod map_view {
 }
 
 pub mod unmap_view {
-    //! ZwUnmapViewOfSection — `win32/ntoskrnl/unmap-view.js`, em KernelMode.
+    //! ZwUnmapViewOfSection, em KernelMode.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::section::unmap_view;
@@ -399,7 +399,7 @@ pub mod unmap_view {
 }
 
 pub mod query_virtual {
-    //! ZwQueryVirtualMemory — `win32/ntoskrnl/query-virtual.js`; a implementação
+    //! ZwQueryVirtualMemory; a implementação
     //! e o estado pertencem ao `mm/query-virtual`.
 
     use crate::ntos::init::exports::{Call, Group};

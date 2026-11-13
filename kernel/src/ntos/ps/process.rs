@@ -1,4 +1,4 @@
-//! Process Manager com o modelo do NT — `system32/ntos/ps/process.js`.
+//! Process Manager com o modelo do NT.
 //!
 //! Conferido por disassembly do ntoskrnl.exe real (Win10 22H2):
 //!

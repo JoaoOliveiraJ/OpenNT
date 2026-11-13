@@ -1,4 +1,4 @@
-//! IoConvertFileHandleToKernelHandle — `system32/ntos/io/convert-file-handle.js`.
+//! IoConvertFileHandleToKernelHandle.
 //!
 //! Converte um handle de arquivo sem reabrir o caminho nem ampliar os
 //! direitos concedidos; a duplicação cria uma entrada real na tabela do

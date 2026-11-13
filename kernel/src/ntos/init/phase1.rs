@@ -1,4 +1,4 @@
-//! FASE 1 do boot (estilo NT) — `system32/init/phase1.js`.
+//! FASE 1 do boot (estilo NT).
 //!
 //! Sobe o I/O Manager e os exports do kernel, monta o NTFS do segundo disco
 //! IDE em `D:` (driver ata-pio), enumera o PCI, carrega os drivers de

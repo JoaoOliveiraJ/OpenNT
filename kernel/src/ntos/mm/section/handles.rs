@@ -1,4 +1,4 @@
-//! Referências a processo e seção por handle — `system32/ntos/mm/section-handles.js`.
+//! Referências a processo e seção por handle.
 //!
 //! Resolve na tabela do chamador antes de anexar a qualquer alvo: o
 //! pseudo-handle do processo corrente, handles abertos por ponteiro, handles

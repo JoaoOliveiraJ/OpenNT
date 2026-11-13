@@ -1,4 +1,4 @@
-//! PsLookupThreadByThreadId — `system32/ntos/ps/lookup-thread.js`.
+//! PsLookupThreadByThreadId.
 
 use super::process;
 use crate::ntos::ps::silo::query as silo_query;

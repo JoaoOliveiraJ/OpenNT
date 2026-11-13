@@ -1,5 +1,5 @@
-//! Relações de LANGID, nome de idioma e idioma pai da instalação —
-//! `system32/ntos/rtl/resource-language-data.js` (pais verificados contra o
+//! Relações de LANGID, nome de idioma e idioma pai da instalação
+//! (pais verificados contra o
 //! LdrpGetParentLangId original). Não contém instruções do Windows.
 
 /// (LANGID, nome, LANGID pai).

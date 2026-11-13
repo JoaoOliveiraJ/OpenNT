@@ -1,4 +1,4 @@
-//! Classes de informação de chave — `system32/ntos/cm/key-information.js`.
+//! Classes de informação de chave.
 //!
 //! Os offsets pertencem ao contrato de saída; nomes e tamanhos em bytes
 //! UTF-16, sem terminador.

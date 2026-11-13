@@ -1,5 +1,5 @@
-//! Posse das imagens de kernel mapeadas — `system32/ntos/mm/loaded-images.js`
-//! e a vista nativa `loaded-image-list.js` (KLDR_DATA_TABLE_ENTRY x64, 0xA0
+//! Posse das imagens de kernel mapeadas e a vista nativa da lista de imagens
+//! (KLDR_DATA_TABLE_ENTRY x64, 0xA0
 //! bytes, PDB 19041).
 //!
 //! Independe do tempo de vida do DRIVER_OBJECT. Imagens de usuário pertencem
@@ -71,7 +71,7 @@ static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     native_entries: BTreeMap::new(),
 });
 
-// ---- vista nativa (loaded-image-list.js) ---------------------------------
+// ---- vista nativa (lista de imagens carregadas) -------------------------
 
 /// Uma alocação contém corpo e nome completo; BaseDllName aponta para o
 /// sufixo da mesma string.

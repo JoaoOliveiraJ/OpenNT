@@ -1,4 +1,4 @@
-//! Alocações de dados do kernel lastreadas por páginas — `ntos/mm/data-pool.js`.
+//! Alocações de dados do kernel lastreadas por páginas.
 //! Nenhum alias executável ou de usuário é publicado; cada alocação é dona
 //! de seus mapeamentos e frames.
 

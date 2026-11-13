@@ -1,4 +1,4 @@
-//! ProcessDebugPort do NtQueryInformationProcess — `system32/ntos/ps/user/process-debug.js`.
+//! ProcessDebugPort do NtQueryInformationProcess.
 //!
 //! O modo usuário recebe uma indicação, nunca o ponteiro do objeto de
 //! kernel.

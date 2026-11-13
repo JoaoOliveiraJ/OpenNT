@@ -1,4 +1,4 @@
-//! NtOpenProcessTokenEx — `system32/ntos/se/open-process-token.js`.
+//! NtOpenProcessTokenEx.
 
 use crate::ntos::se::token::{thread as thread_tokens, handles as token_handles, tokens};
 use crate::ntos::alpc::message::buffer as message_buffer;

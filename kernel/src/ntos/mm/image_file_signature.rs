@@ -1,4 +1,4 @@
-//! MmGetImageFileSignatureInformation — `system32/ntos/mm/image-file-signature.js`.
+//! MmGetImageFileSignatureInformation.
 //!
 //! Consulta o cache da seção de imagem. Não valida certificados e não
 //! transforma a ausência de cache em confiança.

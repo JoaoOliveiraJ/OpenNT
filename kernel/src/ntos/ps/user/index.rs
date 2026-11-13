@@ -1,4 +1,4 @@
-//! Subsistema de modo usuário — `system32/ntos/ps/user/index.js`.
+//! Subsistema de modo usuário.
 //!
 //! `init` arma o anel 3 (pilha de syscall, GDT/TSS da HAL, KUSER_SHARED_DATA
 //! no endereço de usuário, registro semeado); `invoke_service` é a ponte que

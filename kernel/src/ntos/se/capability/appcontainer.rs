@@ -1,4 +1,4 @@
-//! RtlpIsAppContainer — `system32/ntos/se/capability-appcontainer.js`.
+//! RtlpIsAppContainer.
 //!
 //! No ramo explícito recebe o endereço de TOKEN usado por
 //! SeQueryInformationToken. Sem token, abre o da thread (ou duplica o

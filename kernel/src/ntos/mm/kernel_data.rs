@@ -1,4 +1,4 @@
-//! Células de dados exportadas pelo PE do kernel — `system32/ntos/mm/kernel-data.js`.
+//! Células de dados exportadas pelo PE do kernel.
 //!
 //! A tabela de exports, as importações nativas e o kernel compartilham os
 //! mesmos bytes da seção `.kdata`; não há cópias no heap.

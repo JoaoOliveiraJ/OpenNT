@@ -1,4 +1,4 @@
-//! Referência da porta ALPC pela tabela dona — `system32/ntos/alpc/port-reference.js`.
+//! Referência da porta ALPC pela tabela dona.
 //!
 //! Retém o corpo antes de soltar a entrada travada; o corpo retido
 //! sobrevive ao último fechamento e a desconexão não destrói a referência.

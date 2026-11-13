@@ -1,4 +1,4 @@
-//! Semáforos de usuário — `system32/ntos/ps/user/semaphore.js`.
+//! Semáforos de usuário.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

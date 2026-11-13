@@ -1,4 +1,4 @@
-//! Threads de sistema nativas — `system32/ntos/ps/kernel-threads.js`.
+//! Threads de sistema nativas.
 //!
 //! Cada thread preserva pilha e contexto de CPU/FX próprios; o gateway cede
 //! antes de despachar cada API nativa e nenhum frame Rust fica suspenso. As

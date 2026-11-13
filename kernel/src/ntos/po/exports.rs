@@ -1,4 +1,4 @@
-//! Exports Po* com as assinaturas do WDK — `system32/win32/ntoskrnl/po.js`.
+//! Exports Po* com as assinaturas do WDK.
 //!
 //! Só adaptadores: a lógica mora em `ntos::po::power_manager` (estado e
 //! power IRPs), `power_setting`, `idle` e `fx` (PoFx). Os ponteiros são

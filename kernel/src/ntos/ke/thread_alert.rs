@@ -1,4 +1,4 @@
-//! Alertas de thread — `system32/ntos/ke/thread-alert.js`.
+//! Alertas de thread.
 //!
 //! Os alertas pertencem à KTHREAD; o descritor de espera retido permite
 //! interromper uma espera real. Esperas podem aninhar (uma APC espera durante

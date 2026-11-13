@@ -1,4 +1,4 @@
-//! Descritores KSERVICE_TABLE_DESCRIPTOR — `system32/ntos/ex/service-table.js`.
+//! Descritores KSERVICE_TABLE_DESCRIPTOR.
 //!
 //! Dono dos descritores e das tabelas compactadas nativas. Os endereços
 //! executáveis vêm dos provedores registrados pelo dispatcher de serviços.

@@ -1,4 +1,4 @@
-//! SystemSecureBootPolicyInformation (143) — `system32/ntos/se/secure-boot-information.js`.
+//! SystemSecureBootPolicyInformation (143).
 //!
 //! Metadados reais da política do loader.
 

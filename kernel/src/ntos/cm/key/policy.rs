@@ -1,4 +1,4 @@
-//! Política declarada da hive — `system32/ntos/cm/key-policy.js`.
+//! Política declarada da hive.
 //!
 //! A raiz concede administração a SYSTEM e Administrators e leitura a
 //! Everyone; os descendentes herdam essas ACEs. São permissões aplicadas pelo

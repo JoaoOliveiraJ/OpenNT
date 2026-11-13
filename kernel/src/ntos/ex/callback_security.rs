@@ -1,4 +1,4 @@
-//! Segurança dos objetos de callback — `system32/ntos/ex/callback-security.js`.
+//! Segurança dos objetos de callback.
 //!
 //! Captura cópias próprias dos componentes do descritor e avalia direitos
 //! sobre essa cópia; os buffers do chamador não ficam retidos pelo objeto.

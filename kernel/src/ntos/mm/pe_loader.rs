@@ -1,4 +1,4 @@
-//! Loader de executáveis PE32+ (x86-64) — `system32/win32/pe-loader.js`.
+//! Loader de executáveis PE32+ (x86-64).
 //!
 //! Faz o parse do PE, mapeia as seções na memória física, aplica relocações,
 //! semeia o cookie GS e resolve a IAT pelos resolvedores registrados

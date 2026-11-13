@@ -1,4 +1,4 @@
-//! Mutantes de usuário — `system32/ntos/ps/user/mutants.js`.
+//! Mutantes de usuário.
 //!
 //! KMUTANT de 0x38 bytes: o corpo não é coletado enquanto houver dono
 //! (`busy`); a saída de uma thread abandona os mutantes que ela possui.

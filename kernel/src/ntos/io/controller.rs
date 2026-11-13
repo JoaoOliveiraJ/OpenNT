@@ -1,10 +1,10 @@
 //! CONTROLLER_OBJECT e o modelo StartIo.
 //!
-//! - `controller` — `system32/ntos/io/controller.js`: serializa um
+//! - `controller`: serializa um
 //!   controlador de hardware compartilhado (o 8042 de teclado e mouse); com
 //!   o controlador ocupado o pedido entra numa fila FIFO e IoFreeController
 //!   dispara o próximo.
-//! - `start_io` — `system32/ntos/io/start-io.js`: I/O empacotado serializado
+//! - `start_io`: I/O empacotado serializado
 //!   por dispositivo na KDEVICE_QUEUE real do DEVICE_OBJECT, ordenada pela
 //!   chave (os links ficam em IRP.Tail.Overlay.ListEntry).
 

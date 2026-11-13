@@ -1,4 +1,4 @@
-//! Escritas reais num CONTEXT de usuário salvo — `system32/ntos/ps/user/context-frame.js`.
+//! Escritas reais num CONTEXT de usuário salvo.
 //!
 //! Quando o frame da syscall ainda está vivo, a HAL copia estas faixas
 //! brutas depois de salvar o resultado da syscall; não escolhe grupos de

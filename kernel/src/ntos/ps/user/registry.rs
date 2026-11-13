@@ -1,4 +1,4 @@
-//! O registro visto do ring 3 — `system32/ntos/ps/user/registry.js`.
+//! O registro visto do ring 3.
 //!
 //! Interpretação de OBJECT_ATTRIBUTES de usuário (com raiz de chave, de
 //! diretório ou de diretório aberto como arquivo), o seed dos valores reais

@@ -1,4 +1,4 @@
-//! ExAllocatePoolWithQuotaTag — `system32/ntos/ex/pool-quota.js`.
+//! ExAllocatePoolWithQuotaTag.
 //!
 //! Armazenamento real, cobrança por processo e falhas distintas de memória
 //! e de quota. Nunca devolve um bloco sem cobrar seu dono.

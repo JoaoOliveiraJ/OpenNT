@@ -1,4 +1,4 @@
-//! Consultas do FsRtl — `system32/win32/ntoskrnl/fsrtl.js`.
+//! Consultas do FsRtl.
 //!
 //! Sem VHDs aninhados nem arquivo de paginação.
 
@@ -22,7 +22,7 @@ pub static GROUP: Group = Group {
 
 pub mod file_information {
     //! FsRtlGetFileSize, IoQueryVolumeInformation, FsRtlKernelFsControlFile e
-    //! FsRtlQuery/SetKernelEaFile — `system32/win32/ntoskrnl/file-information.js`.
+    //! FsRtlQuery/SetKernelEaFile.
     //!
     //! Cada provedor interpreta a classe de informação e opera no objeto
     //! nativo de arquivo.
@@ -64,7 +64,7 @@ pub mod file_information {
 }
 
 pub mod file_name_information {
-    //! FsRtlGetFileNameInformation — `system32/win32/ntoskrnl/file-name-information.js`.
+    //! FsRtlGetFileNameInformation.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -83,7 +83,7 @@ pub mod file_name_information {
 }
 
 pub mod release_file_name_information {
-    //! FsRtlReleaseFileNameInformation — `system32/win32/ntoskrnl/release-file-name-information.js`.
+    //! FsRtlReleaseFileNameInformation.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;

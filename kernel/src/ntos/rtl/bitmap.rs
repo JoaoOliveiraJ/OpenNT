@@ -1,4 +1,4 @@
-//! RTL_BITMAP — `system32/ntos/rtl/bitmap.js`.
+//! RTL_BITMAP.
 //!
 //! SizeOfBitMap (32 bits) em +0 e Buffer (64 bits) em +8; índices e
 //! comprimentos em bits sobre palavras ULONG. As operações de intervalo

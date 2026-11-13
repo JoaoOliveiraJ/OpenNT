@@ -1,4 +1,4 @@
-//! Frames físicos de 4KB — `system32/ntos/mm/pfn.js`.
+//! Frames físicos de 4KB.
 //!
 //! Só RAM E820 habilitada dentro das arenas identity pertence a este
 //! alocador; buracos de firmware/MMIO/reservados nunca. Depois do bootstrap,

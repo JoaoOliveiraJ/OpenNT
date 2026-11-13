@@ -1,4 +1,4 @@
-//! Argumentos próprios de uma conexão — `system32/ntos/alpc/connect-capture.js`.
+//! Argumentos próprios de uma conexão.
 //!
 //! Nenhuma destas operações publica handles ou fabrica respostas do servidor.
 

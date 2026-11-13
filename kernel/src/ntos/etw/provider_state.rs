@@ -1,4 +1,4 @@
-//! Registros e habilitações ETW — `system32/ntos/etw/provider-state.js`.
+//! Registros e habilitações ETW.
 //!
 //! Uma sessão só existe com um consumidor real; registrar um provedor não
 //! habilita eventos sozinho. Rotinas de habilitação nativas e consumidores

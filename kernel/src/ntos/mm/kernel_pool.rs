@@ -1,4 +1,4 @@
-//! Armazenamento do pool executivo — `system32/ntos/mm/kernel-pool.js`.
+//! Armazenamento do pool executivo.
 //!
 //! Independe da política de falha/SEH da ABI NT. Alocações pequenas
 //! compartilham páginas sem cruzar seus limites. O conteúdo paginável tem

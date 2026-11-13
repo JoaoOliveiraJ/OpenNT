@@ -1,4 +1,4 @@
-//! Exports Se* (Security Reference Monitor) — `system32/win32/ntoskrnl/se.js`.
+//! Exports Se* (Security Reference Monitor).
 //!
 //! Só adaptadores: a lógica mora nos arquivos de assunto do `se`
 //! (`subject_context.rs`, `audit.rs`, `privilege.rs`, `access_check.rs`,
@@ -109,7 +109,7 @@ pub mod image_verification_remove {
 }
 
 pub mod platform_manifest {
-    //! SeQuerySecureBootPlatformManifest — `system32/win32/ntoskrnl/platform-manifest.js`.
+    //! SeQuerySecureBootPlatformManifest.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -131,7 +131,7 @@ pub mod platform_manifest {
 }
 
 pub mod secure_boot_policy {
-    //! SeQuerySecureBootPolicyValue — `system32/win32/ntoskrnl/secure-boot-policy.js`.
+    //! SeQuerySecureBootPolicyValue.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -153,7 +153,7 @@ pub mod secure_boot_policy {
 }
 
 pub mod duplicate_token {
-    //! ZwDuplicateToken — `system32/win32/ntoskrnl/duplicate-token.js`.
+    //! ZwDuplicateToken.
     //!
     //! A entrada Zw usa KernelMode, inclusive numa thread com PreviousMode
     //! UserMode; EffectiveOnly vale pelo byte baixo.
@@ -175,7 +175,7 @@ pub mod duplicate_token {
 }
 
 pub mod open_process_token {
-    //! ZwOpenProcessTokenEx — `system32/win32/ntoskrnl/open-process-token.js`.
+    //! ZwOpenProcessTokenEx.
     //!
     //! A entrada Zw abre em KernelMode.
 
@@ -196,7 +196,7 @@ pub mod open_process_token {
 }
 
 pub mod query_token {
-    //! ZwQueryInformationToken — `system32/win32/ntoskrnl/query-token.js`.
+    //! ZwQueryInformationToken.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -218,7 +218,7 @@ pub mod query_token {
 }
 
 pub mod impersonate_anonymous {
-    //! ZwImpersonateAnonymousToken — `system32/win32/ntoskrnl/impersonate-anonymous.js`.
+    //! ZwImpersonateAnonymousToken.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;

@@ -1,4 +1,4 @@
-//! Filtros nativos do registro — `system32/ntos/cm/callbacks.js`.
+//! Filtros nativos do registro.
 //!
 //! Cada inscrição tem altitude copiada, cookie e referências das notificações
 //! em andamento. As estruturas ficam na memória do convidado e as rotinas

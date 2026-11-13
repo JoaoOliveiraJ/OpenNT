@@ -1,4 +1,4 @@
-//! Monitores de server silo — `system32/ntos/ps/silo-monitors.js`.
+//! Monitores de server silo.
 //!
 //! PsRegisterSiloMonitor / PsStartSiloMonitor / PsUnregisterSiloMonitor.
 //! Corpo do monitor (0x38 + nome): LIST_ENTRY, CreateAsHost (+0x10),

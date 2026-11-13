@@ -1,4 +1,4 @@
-//! Despacho e desenrolamento de exceções AMD64 — `system32/ntos/rtl/exceptions.js`.
+//! Despacho e desenrolamento de exceções AMD64.
 //!
 //! Pesquisa handlers e executa o desenrolamento; os handlers nativos rodam
 //! em contexto próprio e a transferência de pilha/contexto só ocorre depois

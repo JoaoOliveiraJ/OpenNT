@@ -1,4 +1,4 @@
-//! Despacho de contextos de kernel por prioridade — `system32/ntos/ps/scheduler.js`.
+//! Despacho de contextos de kernel por prioridade.
 //!
 //! No original um processo era uma função geradora: cada `yield` devolvia o
 //! controle ao kernel. Em Rust o processo é um `Future`: cada

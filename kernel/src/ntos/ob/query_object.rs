@@ -1,4 +1,4 @@
-//! ZwQueryObject — `system32/ntos/ob/query-object.js`.
+//! ZwQueryObject.
 //!
 //! Consulta objetos dos provedores reais e dos tipos registrados: nome,
 //! referências e segurança vêm da identidade viva do dono, retida durante a

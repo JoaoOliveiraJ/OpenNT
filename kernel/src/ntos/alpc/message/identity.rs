@@ -1,4 +1,4 @@
-//! Identidade das mensagens ALPC — `system32/ntos/alpc/message-identity.js`.
+//! Identidade das mensagens ALPC.
 //!
 //! Cada mensagem viva pertence à porta dona e à geração do seu slot: a
 //! reserva conserva o slot; o CallbackId muda a cada uso e rejeita respostas

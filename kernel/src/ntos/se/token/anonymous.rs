@@ -1,4 +1,4 @@
-//! Tokens anônimos do sistema — `system32/ntos/se/anonymous-tokens.js`.
+//! Tokens anônimos do sistema.
 //!
 //! Cada variante (com e sem Everyone) tem uma referência permanente do
 //! sistema, como os dois SeAnonymousLogonToken do kernel original.

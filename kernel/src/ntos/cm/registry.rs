@@ -1,4 +1,4 @@
-//! Hive em memória do Configuration Manager — `system32/ntos/cm/registry.js`.
+//! Hive em memória do Configuration Manager.
 //!
 //! Árvore de chaves e valores sem diferença entre maiúsculas e minúsculas. Os
 //! handles internos identificam nós e caminhos; as fronteiras de syscall

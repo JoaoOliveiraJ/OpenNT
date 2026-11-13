@@ -1,4 +1,4 @@
-//! Exports de I/O de porta da HAL — `system32/win32/ntoskrnl/hal.js`.
+//! Exports de I/O de porta da HAL.
 //!
 //! No NT/x64, READ_PORT_*/WRITE_PORT_* são funções reais da HAL; aqui descem
 //! às primitivas de porta. As células de HalPrivateDispatchTable e
@@ -43,7 +43,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod hal_platform {
-    //! Adaptadores ACPI e PCI da HAL — `system32/win32/ntoskrnl/hal-platform.js`.
+    //! Adaptadores ACPI e PCI da HAL.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -94,7 +94,7 @@ pub mod hal_platform {
 }
 
 pub mod hvi {
-    //! Interface de hypervisor (Hvi*, Sk*, Vsl*) — `system32/win32/ntoskrnl/hvi.js`.
+    //! Interface de hypervisor (Hvi*, Sk*, Vsl*).
     //!
     //! Adaptadores de `hal::hypervisor`; sem Secure Kernel (VBS) nesta
     //! máquina, as entradas Sk* têm o comportamento do ntoskrnl sem SK.

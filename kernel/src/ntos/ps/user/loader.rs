@@ -1,4 +1,4 @@
-//! Loader de processos de usuário — `system32/ntos/ps/user/loader.js`.
+//! Loader de processos de usuário.
 //!
 //! A parte do kernel do que o NT faz com ZwCreateUserProcess: a ntdll real
 //! do volume (com o mapa SSN → nome), o apiset schema real, os dados NLS,

@@ -1,4 +1,4 @@
-//! Handles de token — `system32/ntos/se/token-handles.js`.
+//! Handles de token.
 //!
 //! Publica handles de token no Object Manager (kernel) ou na tabela de
 //! handles do processo (usuário) e NtOpenThreadToken(Ex).

@@ -1,4 +1,4 @@
-//! Arquivo capturado por uma seção — `system32/ntos/mm/section-file.js`.
+//! Arquivo capturado por uma seção.
 //!
 //! Captura o arquivo aberto, nunca uma nova busca inferida pelo nome. A
 //! seção é dona desta referência até a última vista, handle ou ponteiro.

@@ -1,4 +1,4 @@
-//! Serviços de chave do registro — `system32/ntos/cm/key-services.js`.
+//! Serviços de chave do registro.
 //!
 //! NtCreateKey/NtOpenKey, consulta, enumeração, alteração, exclusão,
 //! fechamento e segurança, com captura de buffers, direitos por operação e

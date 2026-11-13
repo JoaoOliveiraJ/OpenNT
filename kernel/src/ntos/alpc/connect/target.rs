@@ -1,5 +1,4 @@
-//! Busca e requisito de segurança de Nt/ZwAlpcConnectPortEx —
-//! `system32/ntos/alpc/connect-target.js`.
+//! Busca e requisito de segurança de Nt/ZwAlpcConnectPortEx.
 
 use alloc::string::String;
 use alloc::vec::Vec;

@@ -1,4 +1,4 @@
-//! Associação da porta ALPC a uma IOCP — `system32/ntos/alpc/completion-association.js`.
+//! Associação da porta ALPC a uma IOCP.
 //!
 //! A associação conserva a IOCP real. As notificações usam um conjunto
 //! limitado de pacotes: a retirada de um libera espaço para a próxima

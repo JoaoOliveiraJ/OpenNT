@@ -1,4 +1,4 @@
-//! Índice nativo de ProductPolicy — `system32/ntos/ex/license-index.js`.
+//! Índice nativo de ProductPolicy.
 //!
 //! Validação e montagem do índice; os descritores apontam para o blob do
 //! contexto e nenhuma política é criada.

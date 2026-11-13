@@ -1,4 +1,4 @@
-//! Mutações persistentes do NTFS — `system32/ntos/fs/ntfs-write.js`.
+//! Mutações persistentes do NTFS.
 //!
 //! Toda validação e alocação acontece antes da publicação no disco. Isto
 //! NÃO é um journal NTFS: queda de energia no commit pode rasgar uma

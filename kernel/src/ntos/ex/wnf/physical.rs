@@ -1,4 +1,4 @@
-//! Transporte do escopo PhysicalMachine — `system32/ntos/ex/wnf-physical.js`.
+//! Transporte do escopo PhysicalMachine.
 //!
 //! Sem extensão registrada, ExpCrossVmWnfPush devolve NOT_IMPLEMENTED e o
 //! WNF segue o caminho local. Registrar uma extensão exige operações reais;

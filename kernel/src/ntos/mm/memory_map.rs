@@ -1,4 +1,4 @@
-//! O mapa de memória do OpenNT — `system32/ntos/mm/memory-map.js`.
+//! O mapa de memória do OpenNT.
 //! Única fonte de verdade para o layout físico/virtual.
 //!
 //! ```text

@@ -1,4 +1,4 @@
-//! Canal local do dispatcher de serviços — `system32/ntos/cm/service-channel.js`.
+//! Canal local do dispatcher de serviços.
 //!
 //! Usado pela sechost.dll instalada: o protocolo distingue abrir, trocar
 //! controle e fechar; cada canal pertence ao processo realmente lançado pela

@@ -1,4 +1,4 @@
-//! FASE 0 do boot (estilo NT) — `system32/init/phase0.js`.
+//! FASE 0 do boot (estilo NT).
 //!
 //! Na ordem do original: política da hive, licenças, firmware e identidade
 //! do boot, relógio e interrupções, memória (PFN, mapeamento recursivo,
@@ -109,7 +109,7 @@ pub fn init() {
     crate::ntos::cm::physical_memory_resources::initialize().unwrap_or_else(|error| panic!("{error}"));
 }
 
-/// Diretórios e links do namespace NT, na ordem do `init/phase0.js`, com a
+/// Diretórios e links do namespace NT, na ordem de criação, com a
 /// partição do sistema e os eventos `\KernelObjects\*`.
 fn namespace() -> Result<(), crate::rtl::KernelError> {
     crate::ntos::se::se_exports::init()?; // SE_EXPORTS na reserva permanente da imagem

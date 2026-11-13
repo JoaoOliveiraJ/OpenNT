@@ -1,4 +1,4 @@
-//! RPC local sobre ALPC — `system32/ntos/io/lrpc.js`.
+//! RPC local sobre ALPC.
 //!
 //! Ligação de interface e mensagens NDR32 imediatas, com o layout do
 //! RPCRT4 instalado; modos de transferência sem suporte viram RPC faults.

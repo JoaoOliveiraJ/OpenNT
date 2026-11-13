@@ -1,4 +1,4 @@
-//! Corpos nativos de diretório e link simbólico — `system32/ntos/ob/namespace-objects.js`.
+//! Corpos nativos de diretório e link simbólico.
 //!
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
 //! ponteiro. O corpo privado (64 bytes) guarda referências (+0), handles

@@ -1,5 +1,5 @@
-//! Módulos pequenos do ALPC: `context-attribute.js`, `direct-event.js` e
-//! `wake-policy.js` (em `system32/ntos/alpc/`).
+//! Módulos pequenos do ALPC: atributo de contexto, evento direto e política
+//! de despertar.
 
 use crate::ntos::ps::process;
 use crate::ntos::mm::guest_memory as guest;

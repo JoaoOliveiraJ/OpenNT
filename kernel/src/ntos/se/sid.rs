@@ -1,4 +1,4 @@
-//! SIDs nativos — `system32/ntos/se/sid.js`.
+//! SIDs nativos.
 //!
 //! Layout: revisão, contagem, seis bytes de autoridade e subautoridades
 //! ULONG. A aritmética de ponteiros preserva os endereços canônicos de kernel.

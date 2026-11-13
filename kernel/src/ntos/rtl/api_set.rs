@@ -1,4 +1,4 @@
-//! API_SET_NAMESPACE v6 — `system32/win32/api-set.js`.
+//! API_SET_NAMESPACE v6.
 //!
 //! Lido do apisetschema.dll da mesma instalação das DLLs, com
 //! EntryOffset/HashedLength e os aliases por importador do próprio schema.

@@ -1,4 +1,4 @@
-//! Globais do kernel pertencentes ao PE — `system32/ntos/mm/kernel-data-layout.js`.
+//! Globais do kernel pertencentes ao PE.
 //!
 //! Os valores iniciais descrevem este boot: não há transporte/sessão KD.
 //! Este arquivo também é incluído pelo `xtask` (via `#[path]`), que gera a

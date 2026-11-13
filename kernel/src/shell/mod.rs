@@ -1,7 +1,7 @@
-//! REPL interativo (o "cmd.exe" do OpenNT) — `system32/shell/shell.js`.
+//! REPL interativo (o "cmd.exe" do OpenNT).
 //!
 //! Roda como processo no escalonador (cede a CPU entre teclas). O `sc` vem
-//! de `service_control` (`shell/service-control.js`); `exec`, `loaddriver` e
+//! de `service_control`; `exec`, `loaddriver` e
 //! `objects` ainda mostram a dependência pendente.
 
 pub mod service_control;

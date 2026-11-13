@@ -1,4 +1,4 @@
-//! ObGetObjectType — `system32/ntos/ob/get-object-type.js`.
+//! ObGetObjectType.
 //!
 //! OBJECT_TYPE pela identidade registrada pelo dono do corpo (o vínculo
 //! direto, o próprio objeto de tipo ou a descrição do dono); os cabeçalhos

@@ -1,4 +1,4 @@
-//! RtlQueryPackageIdentity do kernel — `system32/ntos/se/package-identity.js`.
+//! RtlQueryPackageIdentity do kernel.
 //!
 //! Recebe TOKEN*, como RtlQueryPackageClaims. A claim é consultada mesmo sem
 //! a saída Packaged; seus 32 bits baixos viram BOOLEAN só depois do sucesso

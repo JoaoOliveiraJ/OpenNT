@@ -4,7 +4,7 @@
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]...
-//! cargo xtask status     [--reference=NTOSKRNL.EXE] [--jsos=DIR]
+//! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! ```
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),

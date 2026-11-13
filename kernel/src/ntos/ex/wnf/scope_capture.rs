@@ -1,4 +1,4 @@
-//! Captura de ExplicitScope — `system32/ntos/ex/wnf-scope-capture.js`.
+//! Captura de ExplicitScope.
 //!
 //! O SID é emprestado (KernelMode) ou copiado (UserMode); processo e sessão
 //! mantêm uma referência de objeto até o fim da operação. A referência por

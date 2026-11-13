@@ -1,4 +1,4 @@
-//! Nome nativo do arquivo de uma seção — `system32/ntos/fs/native-file-name.js`.
+//! Nome nativo do arquivo de uma seção.
 //!
 //! Identifica o arquivo pelo volume que fornece seus bytes. O Object Manager
 //! publica suas montagens aqui; o caminho é consultado no nó atual, então

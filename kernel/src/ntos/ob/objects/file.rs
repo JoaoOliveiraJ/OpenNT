@@ -1,4 +1,4 @@
-//! Armazenamento e posse de FILE_OBJECT — `system32/ntos/ob/file-objects.js`.
+//! Armazenamento e posse de FILE_OBJECT.
 //!
 //! CLEANUP acompanha o último handle; CLOSE e a liberação do corpo esperam a
 //! última referência por ponteiro, inclusive de operações de I/O.

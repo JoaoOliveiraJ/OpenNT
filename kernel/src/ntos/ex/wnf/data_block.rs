@@ -1,4 +1,4 @@
-//! Bloco de dados WNF — `system32/ntos/ex/wnf-data-block.js`.
+//! Bloco de dados WNF.
 //!
 //! Carga e atualização: lock real, pool/quota, carimbo e persistência na
 //! hive. Namespace, ACL e TypeId são validados pelo chamador.

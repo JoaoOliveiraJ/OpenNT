@@ -1,4 +1,4 @@
-//! Layouts reais das structs do kernel NT x64 — `system32/win32/nt-abi.js`.
+//! Layouts reais das structs do kernel NT x64.
 //!
 //! Extraídos do WDK 10.0.26100 (km/wdm.h) e conferidos por disassembly do
 //! ntoskrnl.exe do Windows 10 22H2. Fonte única da ABI convidado<->kernel:

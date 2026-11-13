@@ -1,4 +1,4 @@
-//! Entradas nativas HalGet/SetBusData sobre as portas PCI — `system32/ntos/hal/pci-native.js`.
+//! Entradas nativas HalGet/SetBusData sobre as portas PCI.
 //!
 //! Esta plataforma tem um espaço de 256 bytes do mecanismo 1 no segmento
 //! zero. ECAM e outros segmentos exigiriam outro transporte; offsets e

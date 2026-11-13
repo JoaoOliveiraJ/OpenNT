@@ -1,5 +1,5 @@
 //! Exports Ex* (pool, mutexes, ERESOURCE, rundown, lookaside, SLIST, timers,
-//! push locks, spin locks) — `system32/win32/ntoskrnl/ex.js`.
+//! push locks, spin locks).
 
 use crate::ntos::init::exports::{signed_status, Call, Group};
 use crate::ntos::ex::{event, extension_host, interlocked_list, lookaside, pool_allocation, push_lock, resource, rundown, slist, spin_lock, system_time, timer, uuid};
@@ -391,7 +391,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod callbacks {
-    //! Objetos de callback do Executive — `system32/win32/ntoskrnl/callbacks.js`.
+    //! Objetos de callback do Executive.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -438,7 +438,7 @@ pub mod datatype_misalignment {
 }
 
 pub mod enum_handles {
-    //! ExEnumHandleTable — `system32/win32/ntoskrnl/enum-handles.js`.
+    //! ExEnumHandleTable.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -457,7 +457,7 @@ pub mod enum_handles {
 }
 
 pub mod pool_allocation_exports {
-    //! ExAllocatePoolWithTagPriority — `system32/win32/ntoskrnl/pool-allocation.js`.
+    //! ExAllocatePoolWithTagPriority.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -476,7 +476,7 @@ pub mod pool_allocation_exports {
 }
 
 pub mod pool_quota {
-    //! ExAllocatePoolWithQuotaTag — `system32/win32/ntoskrnl/pool-quota.js`.
+    //! ExAllocatePoolWithQuotaTag.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -498,7 +498,7 @@ pub mod pool_quota {
 }
 
 pub mod system_exception_filter {
-    //! ExSystemExceptionFilter — `system32/win32/ntoskrnl/system-exception-filter.js`.
+    //! ExSystemExceptionFilter.
     //!
     //! EXCEPTION_EXECUTE_HANDLER quando o modo anterior não é KernelMode.
 
@@ -519,7 +519,7 @@ pub mod system_exception_filter {
 }
 
 pub mod unblock_push_lock {
-    //! ExfUnblockPushLock — `system32/win32/ntoskrnl/unblock-push-lock.js`.
+    //! ExfUnblockPushLock.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -539,7 +539,7 @@ pub mod unblock_push_lock {
 }
 
 pub mod license_values {
-    //! ZwQueryLicenseValue — `system32/win32/ntoskrnl/license-values.js`.
+    //! ZwQueryLicenseValue.
     //!
     //! Consulta em KernelMode (o despachante aplica o modo aos exports `Zw*`);
     //! falha interna interrompe o sistema e o sinal de transferência propaga.
@@ -561,7 +561,7 @@ pub mod license_values {
 }
 
 pub mod wnf_query {
-    //! ZwQueryWnfStateData — `system32/win32/ntoskrnl/wnf-query.js`.
+    //! ZwQueryWnfStateData.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -583,7 +583,7 @@ pub mod wnf_query {
 }
 
 pub mod wnf_update {
-    //! ZwUpdateWnfStateData — `system32/win32/ntoskrnl/wnf-update.js`.
+    //! ZwUpdateWnfStateData.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -605,7 +605,7 @@ pub mod wnf_update {
 }
 
 pub mod firmware_environment {
-    //! Variáveis de firmware — `system32/win32/ntoskrnl/firmware-environment.js`.
+    //! Variáveis de firmware.
     //!
     //! Os cinco argumentos são ponteiros: nome UNICODE_STRING, GUID do
     //! fabricante, buffer, tamanho e atributos; o provedor consulta o firmware
@@ -629,7 +629,7 @@ pub mod firmware_environment {
 }
 
 pub mod zw {
-    //! Rotinas Zw* do ntoskrnl — `system32/win32/ntoskrnl/zw.js` (handlers).
+    //! Rotinas Zw* do ntoskrnl (handlers).
     //!
     //! Chaves pelo serviço de chaves (com callbacks do Cm), arquivos pelo
     //! núcleo `zw_files` e pelos serviços de I/O, objetos do namespace pelos

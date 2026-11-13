@@ -1,4 +1,4 @@
-//! Handles anexados a mensagens — `system32/ntos/alpc/message-handles.js`.
+//! Handles anexados a mensagens.
 //!
 //! Captura referências de objetos antes de entregar a mensagem; consultar
 //! um índice duplica o objeto na tabela do dono da porta consultada.

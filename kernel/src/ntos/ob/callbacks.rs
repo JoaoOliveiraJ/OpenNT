@@ -1,4 +1,4 @@
-//! ObRegisterCallbacks — `system32/ntos/ob/callbacks.js`.
+//! ObRegisterCallbacks.
 //!
 //! Registra callbacks de objetos e mantém as listas nativas (OBJECT_TYPE +
 //! 0xC8) ordenadas por altitude. A confiança vem do registro da imagem no

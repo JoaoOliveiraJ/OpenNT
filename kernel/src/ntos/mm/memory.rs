@@ -1,5 +1,4 @@
-//! Visão de memória do kernel (heap + RAM do E820) —
-//! `system32/ntos/mm/memory.js`.
+//! Visão de memória do kernel (heap + RAM do E820).
 
 use alloc::format;
 use alloc::string::String;

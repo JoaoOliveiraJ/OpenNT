@@ -1,4 +1,4 @@
-//! Segurança por mensagem — `system32/ntos/alpc/message-security.js`.
+//! Segurança por mensagem.
 //!
 //! O contexto pertence à mensagem: trocas posteriores de impersonação não
 //! substituem o token já capturado; o rastreamento estático conserva uma

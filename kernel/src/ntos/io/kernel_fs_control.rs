@@ -1,4 +1,4 @@
-//! FsRtlKernelFsControlFile — `system32/ntos/io/kernel-fs-control.js`.
+//! FsRtlKernelFsControlFile.
 //!
 //! Buffers de kernel do chamador e um IRP retido: a rotina de conclusão
 //! sinaliza o evento privado e devolve MORE_PROCESSING; só este chamador

@@ -1,4 +1,4 @@
-//! Controles de sistema de arquivos do NTFS — `system32/ntos/fs/ntfs-control.js`.
+//! Controles de sistema de arquivos do NTFS.
 //!
 //! Respondem pelos metadados e pelo estado de alocação do volume montado.
 

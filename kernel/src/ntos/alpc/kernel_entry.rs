@@ -1,4 +1,4 @@
-//! Ligação do escalonador ao transporte — `system32/ntos/alpc/kernel-entry.js`.
+//! Ligação do escalonador ao transporte.
 //!
 //! O transporte de `ps/user/alpc` instala as entradas depois da carga dos
 //! módulos, evitando o ciclo entre threads de kernel, transporte ALPC e

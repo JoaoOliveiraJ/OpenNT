@@ -1,4 +1,4 @@
-//! TOKEN_STATISTICS — `system32/ntos/se/token-statistics.js`.
+//! TOKEN_STATISTICS.
 //!
 //! Identidade, contadores e memória do próprio token, na ordem e largura do
 //! serviço nativo observado no MSRPC. O armazenamento dinâmico

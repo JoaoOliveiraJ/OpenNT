@@ -1,4 +1,4 @@
-//! Política de acesso às chaves — `system32/ntos/cm/key-access.js`.
+//! Política de acesso às chaves.
 //!
 //! Consulta o token efetivo da thread, incluindo a impersonação, para
 //! conferir os privilégios reais da solicitação.

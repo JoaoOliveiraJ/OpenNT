@@ -1,5 +1,4 @@
-//! Serviço WNF compartilhado — `system32/ntos/ex/wnf-service.js` (e o ponto
-//! de entrada `wnf-update.js`).
+//! Serviço WNF compartilhado, também usado pela atualização de estado.
 //!
 //! Captura, resolução, definição, dados e notificação. A instância só entra
 //! na árvore depois da carga válida; toda referência adquirida pela operação

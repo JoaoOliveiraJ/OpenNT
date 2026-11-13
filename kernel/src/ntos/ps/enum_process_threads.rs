@@ -1,4 +1,4 @@
-//! PsGetNextProcessThread / PsEnumProcessThreads — `system32/ntos/ps/enum-process-threads.js`.
+//! PsGetNextProcessThread / PsEnumProcessThreads.
 //!
 //! Também os ZwGetNextProcess/ZwGetNextThread em KernelMode, como o
 //! NtGetNextProcess/NtGetNextThread do NT: a partir do handle dado (ou do

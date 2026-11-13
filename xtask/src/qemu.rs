@@ -1,4 +1,4 @@
-//! Execução no QEMU — o papel de `tools/run-kbd.mjs` e `tools/test-boot.mjs`.
+//! Execução no QEMU.
 //!
 //! `run` abre a janela do QEMU com a serial no terminal. `test-boot` roda
 //! sem tela, espera um marcador na serial, opcionalmente digita comandos no

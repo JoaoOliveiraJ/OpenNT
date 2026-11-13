@@ -1,4 +1,4 @@
-//! Referência e duplicação de arquivos por handle — `system32/ntos/ob/file-handles.js`.
+//! Referência e duplicação de arquivos por handle.
 //!
 //! A referência é adquirida na tabela do processo que realmente possui o
 //! handle, sob a trava da entrada; cada entrada mantém o mesmo FILE_OBJECT e

@@ -1,4 +1,4 @@
-//! Exports com corpo x64 próprio — `system32/win32/native-export-layout.js`.
+//! Exports com corpo x64 próprio.
 //!
 //! Compartilhado pelo empacotamento do PE e pelos resolvedores: estes exports
 //! têm corpo real fora da tabela fixa de despachantes de dez bytes.

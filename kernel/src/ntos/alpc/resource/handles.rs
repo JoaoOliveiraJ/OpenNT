@@ -1,4 +1,4 @@
-//! Tabela de recursos ALPC — `system32/ntos/alpc/resource-handles.js`.
+//! Tabela de recursos ALPC.
 //!
 //! Seções, contextos e reservas ocupam a mesma tabela da comunicação: o
 //! listener tem a sua; os endpoints cliente/servidor compartilham a da

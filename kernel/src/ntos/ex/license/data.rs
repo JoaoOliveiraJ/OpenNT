@@ -1,4 +1,4 @@
-//! Busca e cópia dos valores de ProductPolicy — `system32/ntos/ex/license-data.js`.
+//! Busca e cópia dos valores de ProductPolicy.
 //!
 //! O serviço superior valida o contexto e o cache; aqui ficam os acessos
 //! observados no helper nativo.

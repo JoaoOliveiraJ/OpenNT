@@ -1,4 +1,4 @@
-//! Exports ETW para drivers — `system32/win32/ntoskrnl/etw.js`.
+//! Exports ETW para drivers.
 //!
 //! Só adaptadores. Registros, habilitações e traits pertencem ao proprietário
 //! ETW (`ntos::etw::provider_state`); só eventos aceitos por sessões ativas
@@ -47,7 +47,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod event_enabled {
-    //! EtwEventEnabled — `system32/win32/ntoskrnl/event-enabled.js`.
+    //! EtwEventEnabled.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -66,7 +66,7 @@ pub mod event_enabled {
 }
 
 pub mod wpp {
-    //! Exports da WppRecorder.sys (rastreamento WPP) — `system32/win32/ntoskrnl/wpp.js`.
+    //! Exports da WppRecorder.sys (rastreamento WPP).
     //!
     //! Adaptadores das sessões de trace de `ntos::etw::wpp`.
 
@@ -102,7 +102,7 @@ pub mod wpp {
 }
 
 pub mod wmi {
-    //! Exports da WMILIB.SYS — `system32/win32/ntoskrnl/wmi.js`.
+    //! Exports da WMILIB.SYS.
     //!
     //! Adaptadores de `ntos::etw::wmi`; as limitações estão descritas em cada
     //! operação de lá.

@@ -1,4 +1,4 @@
-//! Família Kd* (depurador do kernel) — `system32/win32/ntoskrnl/kd.js`.
+//! Família Kd* (depurador do kernel).
 //!
 //! Só adaptadores: o estado de um boot sem /DEBUG mora em
 //! `ntos::kd::debugger`. Os slots históricos de dado mantêm os ids; o EAT
@@ -36,7 +36,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod debug_prompt {
-    //! DbgPrompt — `system32/win32/ntoskrnl/debug-prompt.js`.
+    //! DbgPrompt.
     //!
     //! A resolução de exports publica o corpo nativo com `int 0x2D`; a chamada
     //! pela tabela entra nesse mesmo corpo (`ntos::kd::debugger::prompt`).

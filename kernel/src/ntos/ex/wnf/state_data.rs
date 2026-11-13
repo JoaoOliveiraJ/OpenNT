@@ -1,4 +1,4 @@
-//! Dados de estado WNF internos — `system32/ntos/ex/wnf-state-data.js`.
+//! Dados de estado WNF internos.
 //!
 //! Registros do kernel para o transporte de uso de funcionalidades. A camada
 //! de syscalls valida namespace, escopo, ACL e tipos antes de chegar aqui.

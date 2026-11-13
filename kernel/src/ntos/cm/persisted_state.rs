@@ -1,4 +1,4 @@
-//! RtlGetPersistedStateLocation — `system32/ntos/cm/persisted-state.js`.
+//! RtlGetPersistedStateLocation.
 //!
 //! Consulta o mapa de redirecionamento da hive. Chave de origem ausente usa o
 //! caminho padrão do chamador; valor ausente numa chave existente é erro.

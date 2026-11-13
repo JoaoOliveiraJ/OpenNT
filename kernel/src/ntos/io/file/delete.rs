@@ -1,4 +1,4 @@
-//! Exclusão por OBJECT_ATTRIBUTES — `system32/ntos/io/delete-file.js`.
+//! Exclusão por OBJECT_ATTRIBUTES.
 //!
 //! O nome é capturado antes da resolução; handles relativos mantêm o objeto
 //! dono referenciado até o fim. A retirada do nome é do volume

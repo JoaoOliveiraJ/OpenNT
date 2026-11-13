@@ -1,4 +1,4 @@
-//! Stores WNF na hive — `system32/ntos/ex/wnf-registry.js`.
+//! Stores WNF na hive.
 //!
 //! Abre as raízes e os stores permanentes pelo Configuration Manager. Os
 //! slots de cache pertencem ao namespace: o chamador seleciona o silo,

@@ -1,4 +1,4 @@
-//! WCHARs e UNICODE_STRING do convidado — `system32/ntos/rtl/unicode.js`.
+//! WCHARs e UNICODE_STRING do convidado.
 //!
 //! Length/MaximumLength são contagens de bytes de 16 bits; Buffer fica em +8.
 //! Comparações contadas aceitam zeros internos e usam o trie NLS para a

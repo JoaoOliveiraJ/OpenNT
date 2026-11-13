@@ -1,4 +1,4 @@
-//! Regras de registro da política de Secure Boot — `system32/ntos/se/secure-boot-policy.js`.
+//! Regras de registro da política de Secure Boot.
 //!
 //! Capturar os bytes do loader valida a estrutura; não autentica nem ativa
 //! Secure Boot.

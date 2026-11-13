@@ -1,5 +1,5 @@
 //! Arena de memória dos convidados (drivers .sys e structs NT) e acesso a
-//! endereços de convidado — `system32/win32/guest-memory.js`.
+//! endereços de convidado.
 //!
 //! Arena de 16MB reservada do heap do kernel no boot; blocos livres
 //! separados por tamanho, com split e coalescência. Header de bloco (16B):

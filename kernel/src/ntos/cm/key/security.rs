@@ -1,4 +1,4 @@
-//! Segurança das chaves — `system32/ntos/cm/key-security.js`.
+//! Segurança das chaves.
 //!
 //! Captura a política da criação e verifica o mesmo descritor que pertence ao
 //! nó da hive; handles diferentes nunca recebem políticas independentes.

@@ -1,4 +1,4 @@
-//! Herança de descritores na criação — `system32/ntos/se/inherit-descriptor.js`.
+//! Herança de descritores na criação.
 //!
 //! Atribui ACLs de criação a partir de descritores já capturados. O chamador
 //! escolhe e valida owner/group; aqui se aplicam herança e direitos do tipo,

@@ -1,4 +1,4 @@
-//! Relógio do kernel baseado no TSC — `system32/ntos/ke/clock.js`.
+//! Relógio do kernel baseado no TSC.
 //!
 //! A frequência vem da folha CPUID 0x15, quando válida, ou de calibração com
 //! o PIT. O RTC fornece apenas a referência inicial do relógio de parede.

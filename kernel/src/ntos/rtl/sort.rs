@@ -1,4 +1,4 @@
-//! qsort do CRT do kernel — `system32/ntos/rtl/sort.js`.
+//! qsort do CRT do kernel.
 //!
 //! Ordena registros na memória do convidado. O comparador nativo recebe
 //! endereços do próprio array; copiar elementos para buffers auxiliares

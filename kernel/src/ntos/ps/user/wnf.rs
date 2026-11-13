@@ -1,4 +1,4 @@
-//! Adaptador das syscalls WNF — `system32/ntos/ps/user/wnf.js`.
+//! Adaptador das syscalls WNF.
 //!
 //! Os argumentos chegam com 64 bits (inclusive ExplicitScope, que também
 //! pode ser um handle de processo); stamp e máscara usam os ULONGs baixos.

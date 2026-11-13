@@ -1,4 +1,4 @@
-//! Tratamentos especiais de SLQueryLicenseValueInternal — `system32/ntos/ex/license-special.js`.
+//! Tratamentos especiais de SLQueryLicenseValueInternal.
 //!
 //! Os valores vêm do contexto, do relógio, da hive ou de um provedor
 //! registrado. Os padrões são ramos medidos no kernel original, não uma

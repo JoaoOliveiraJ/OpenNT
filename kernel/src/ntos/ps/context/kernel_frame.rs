@@ -1,4 +1,4 @@
-//! Vista NT de um frame de interrupção de kernel real — `system32/ntos/ps/kernel-context-frame.js`.
+//! Vista NT de um frame de interrupção de kernel real.
 //!
 //! Cada registrador gravável tem uma posição restaurada pelos stubs de IRQ
 //! (IRETQ). Não é o CONTEXT do chamador do gateway e não inventa um PC

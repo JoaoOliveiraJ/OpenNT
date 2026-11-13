@@ -1,4 +1,4 @@
-//! Políticas de RtlCapabilityCheck — `system32/ntos/se/capability-policy.js`.
+//! Políticas de RtlCapabilityCheck.
 //!
 //! A configuração vem do SKU corrente e do cache ProductPolicy.
 

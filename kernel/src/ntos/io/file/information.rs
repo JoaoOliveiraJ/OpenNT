@@ -1,4 +1,4 @@
-//! Consultas por FILE_OBJECT — `system32/ntos/io/file-information.js`.
+//! Consultas por FILE_OBJECT.
 //!
 //! Drivers nativos recebem o buffer de kernel original num IRP real; a
 //! conclusão é dona do resultado, inclusive no I/O pendente. Para arquivos

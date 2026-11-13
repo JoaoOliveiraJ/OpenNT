@@ -1,4 +1,4 @@
-//! CONTEXT nativo do Windows x64 — `system32/ntos/rtl/native-context.js`.
+//! CONTEXT nativo do Windows x64.
 //!
 //! Liga o gateway nativo ao CONTEXT. Uma transferência de controle é
 //! sinalizada durante o despacho (um `KernelError` marcado, propagado pelos

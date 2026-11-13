@@ -1,4 +1,4 @@
-//! Serviço Nt/ZwQueryInformationFile — `system32/ntos/io/query-file.js`.
+//! Serviço Nt/ZwQueryInformationFile.
 //!
 //! Os metadados pertencem ao arquivo aberto; dispositivos recebem
 //! IRP_MJ_QUERY_INFORMATION e o arquivo fica retido até a conclusão. Os

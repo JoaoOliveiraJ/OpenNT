@@ -1,4 +1,4 @@
-//! CSPs instalados — `system32/ntos/cm/crypto-defaults.js`.
+//! CSPs instalados.
 //!
 //! Registra o RSAENH presente no disco; nomes, tipos e caminho da DLL
 //! correspondem ao catálogo usado pelos binários. Não cria chaves nem

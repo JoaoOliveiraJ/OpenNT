@@ -1,4 +1,4 @@
-//! READ/WRITE bufferizados de dispositivos — `system32/ntos/ps/user/device-io.js`.
+//! READ/WRITE bufferizados de dispositivos.
 //!
 //! IRPs nativos reais, conclusão e posse: a conclusão do driver nunca
 //! escreve direto num buffer de usuário não fixado.

@@ -1,4 +1,4 @@
-//! Árvore de recursos PE numa vista existente — `system32/ntos/rtl/resource-tree.js`.
+//! Árvore de recursos PE numa vista existente.
 //!
 //! Não carrega DLLs, não aloca payloads e não fabrica recursos: o resultado
 //! aponta para os bytes da vista. Todo acesso passa pelo `resource-memory`.

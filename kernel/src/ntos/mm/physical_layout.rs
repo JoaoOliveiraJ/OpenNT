@@ -1,4 +1,4 @@
-//! RAM admitida por este boot — `system32/ntos/mm/physical-layout.js`.
+//! RAM admitida por este boot.
 //!
 //! RAM de firmware habilitada abaixo do limite do identity map do stage2.
 //! Reservas de kernel/heap/imagens/PFN continuam sendo RAM física; reservas

@@ -1,4 +1,4 @@
-//! NtOpenSection — `system32/ntos/mm/open-section.js`.
+//! NtOpenSection.
 //!
 //! Abre a SECTION existente conservando a identidade nativa e o backing. A
 //! ordem de validação segue o NtOpenSection/Ob do NT de referência; as

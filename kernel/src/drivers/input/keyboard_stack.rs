@@ -1,5 +1,4 @@
-//! Inicialização da pilha PS/2 usada pelo shell e pelo teste de teclado —
-//! `system32/drivers/input/keyboard-stack.js`.
+//! Inicialização da pilha PS/2 usada pelo shell e pelo teste de teclado.
 //!
 //! Carrega o kbdclass.sys e o i8042prt.sys reais, monta pelo PnP as pilhas
 //! dos PDOs da placa-mãe (PNP0303 e PNP0F13, com os filtros de classe

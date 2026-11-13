@@ -1,4 +1,4 @@
-//! Objetos de callback do Executive — `system32/ntos/ex/callbacks.js`.
+//! Objetos de callback do Executive.
 //!
 //! ExCreateCallback, ExRegisterCallback, ExUnregisterCallback e
 //! ExNotifyCallback. Corpo nativo de 0x38 bytes (tag 'Call', LIST_ENTRY dos

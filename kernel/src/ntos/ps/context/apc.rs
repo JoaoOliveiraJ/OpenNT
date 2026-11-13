@@ -1,4 +1,4 @@
-//! Transporte de conclusão de uma operação de contexto — `system32/ntos/ps/context-apc.js`.
+//! Transporte de conclusão de uma operação de contexto.
 //!
 //! A operação roda na thread de destino, sob as filas KAPC e os contadores
 //! de desabilitação existentes; não é a implementação pública de

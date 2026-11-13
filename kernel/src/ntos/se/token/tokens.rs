@@ -1,5 +1,4 @@
-//! Tokens de segurança — `system32/ntos/se/tokens.js` e o armazenamento
-//! dinâmico `token-storage.js`.
+//! Tokens de segurança e o seu armazenamento dinâmico.
 //!
 //! Processos de boot herdam o contexto de segurança do sistema. O endereço
 //! nativo (corpo de 0x100 bytes) identifica o registro de identidade, grupos
@@ -91,7 +90,7 @@ pub fn allocate_luid_into(output: u64) -> u32 {
     0
 }
 
-// ---- armazenamento dinâmico (token-storage.js) -----------------------------
+// ---- armazenamento dinâmico ----------------------------------------------
 
 /// ACL padrão com ACEs allow/deny e SID próprio.
 fn encode_default_acl(entries: Option<&[Ace]>) -> Result<Vec<u8>, KernelError> {

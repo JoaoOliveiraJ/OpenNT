@@ -1,10 +1,10 @@
 //! Módulos pequenos do I/O Manager.
 //!
-//! - `delete_device` — `system32/ntos/io/delete-device.js`
-//! - `completion_entry` — `system32/ntos/io/completion-entry.js`
-//! - `boot_drivers_state` — `system32/ntos/io/boot-drivers-state.js`
-//! - `initial_stack` — `system32/ntos/io/initial-stack.js`
-//! - `thread_io` — `system32/ntos/io/thread-io.js`
+//! - `delete_device` — exclusão de objetos de dispositivo
+//! - `completion_entry` — entradas das portas de conclusão
+//! - `boot_drivers_state` — estado dos drivers de boot
+//! - `initial_stack` — pilha de dispositivos inicial
+//! - `thread_io` — I/O pendente por thread
 //! - `configuration_information` — a CONFIGURATION_INFORMATION global
 //! - `error_log` — entradas do log de erros de I/O
 //! - `shutdown_notification` — dispositivos que recebem IRP_MJ_SHUTDOWN

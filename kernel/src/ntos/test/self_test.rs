@@ -1,5 +1,4 @@
-//! Autoteste do kernel — subconjunto da fase 1 de
-//! `system32/ntos/test/self-test.js`.
+//! Autoteste do kernel (fase 1).
 //!
 //! Exercita os módulos já transcritos: MemoryFileSystem, chamadas numeradas,
 //! programa embutido, memória, escalonador, timer do LAPIC, IPC e o registro
@@ -65,7 +64,7 @@ pub fn run() {
     assert(syscalls::system_call(99, &[]).is_err(), "syscall desconhecida");
 
     // programa embutido com a API de syscall
-    let hello = programs::find_program("/hello.js");
+    let hello = programs::find_program("/hello.exe");
     assert(hello.is_some(), "programa hello embutido");
     assert(matches!(hello.unwrap()(), Ok(Value::Number(42))), "exec programa embutido");
 

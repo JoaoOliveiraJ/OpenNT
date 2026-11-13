@@ -1,4 +1,4 @@
-//! Acesso aos estados WNF — `system32/ntos/ex/wnf-security.js`.
+//! Acesso aos estados WNF.
 //!
 //! Direitos medidos em ExpWnfCheckCallerAccess: consulta = 1, atualização = 2
 //! e consulta explícita entre sessões conhecidas = 0x10.

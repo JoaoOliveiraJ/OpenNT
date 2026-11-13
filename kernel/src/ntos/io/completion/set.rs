@@ -1,4 +1,4 @@
-//! IoSetIoCompletionEx — `system32/ntos/io/set-completion.js`.
+//! IoSetIoCompletionEx.
 //!
 //! Publica um pacote de memória na IOCP dona (chave e informação em 64 bits);
 //! a retirada e o fechamento usam a mesma liberação do pacote.

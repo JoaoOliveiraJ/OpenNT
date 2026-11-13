@@ -1,4 +1,4 @@
-//! ZwQueryVirtualMemory (serviço de kernel) — `system32/ntos/mm/query-virtual.js`.
+//! ZwQueryVirtualMemory (serviço de kernel).
 //!
 //! Resolve e retém o processo alvo antes de consultar os metadados reais
 //! das regiões dele; a ordem de validação segue o contrato público de

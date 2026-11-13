@@ -1,4 +1,4 @@
-//! Portas de conclusão de modo usuário — `system32/ntos/ps/user/io-completion.js`.
+//! Portas de conclusão de modo usuário.
 //!
 //! Pacotes em FIFO, consumidores em LIFO, contextos nativos de 64 bits,
 //! associação de threads e limite de consumidores executáveis.

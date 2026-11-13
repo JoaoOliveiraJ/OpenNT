@@ -1,5 +1,5 @@
 //! Dono único dos hooks de falta nativa, acesso de convidado, pressão de
-//! PFN e preparo de AP — `system32/ntos/mm/page-residency.js`.
+//! PFN e preparo de AP.
 //!
 //! Os provedores mantêm seu próprio armazenamento e posse de páginas.
 //! Preparar um AP suprime a recuperação em TODOS os provedores.
@@ -46,7 +46,10 @@ fn providers() -> Vec<(String, Provider)> {
     STATE.lock().providers.clone()
 }
 
-/// `__jsosKernelPageFault`: falta de kernel recuperável.
+/// Falta de página no kernel: pergunta aos provedores de residência e devolve
+/// `true` quando um deles resolveu a falta (a instrução pode ser repetida);
+/// `false` para bit reservado, IRQL acima de APC_LEVEL, erro de leitura da
+/// página (registrado) ou endereço que nenhum provedor reconhece.
 pub fn fault(address: u64, error: u32) -> bool {
     small::clear_page_fault_failure();
     if error & 8 != 0 || irql::get_irql() > 1 {

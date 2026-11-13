@@ -1,4 +1,4 @@
-//! Partição de memória do sistema — `system32/ntos/mm/partition.js`.
+//! Partição de memória do sistema.
 //!
 //! A partição do sistema é o alocador físico real, retida pela vida do
 //! boot. O corpo de 0x20 bytes é privado do OpenNT (não é a MM_PARTITION do

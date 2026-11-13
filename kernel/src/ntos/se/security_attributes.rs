@@ -1,4 +1,4 @@
-//! Atributos de segurança de tokens — `system32/ntos/se/security-attributes.js`.
+//! Atributos de segurança de tokens.
 //!
 //! TOKEN_SECURITY_ATTRIBUTE_V1 usa UNICODE_STRING com tamanho explícito. A
 //! identidade de pacote fica ausente para processos que não pertencem a um.

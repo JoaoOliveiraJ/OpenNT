@@ -1,4 +1,4 @@
-//! FsRtlQueryKernelEaFile / FsRtlSetKernelEaFile — `system32/ntos/io/kernel-ea.js`.
+//! FsRtlQueryKernelEaFile / FsRtlSetKernelEaFile.
 //!
 //! Contratos originais de EA do FsRtl: buffers de kernel do chamador, IRPs
 //! explícitos de consulta/escrita, status da conclusão e posse retida até o

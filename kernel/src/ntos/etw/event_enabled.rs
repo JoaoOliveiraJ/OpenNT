@@ -1,4 +1,4 @@
-//! EtwEventEnabled — `system32/ntos/etw/event-enabled.js`.
+//! EtwEventEnabled.
 //!
 //! Consulta os campos nativos medidos no kernel 19041; o registro e a
 //! publicação desses campos pertencem ao dono ETW (`provider_state`).

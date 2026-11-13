@@ -1,4 +1,4 @@
-//! Rotinas de texto e busca da CRT do kernel — `system32/ntos/rtl/crt.js`.
+//! Rotinas de texto e busca da CRT do kernel.
 //! Classificação no locale C; ponteiros exatos.
 //!
 //! Também as cópias, buscas e concatenações str*/wcs* (as variantes `_s`

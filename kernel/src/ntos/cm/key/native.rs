@@ -1,4 +1,4 @@
-//! Pontos de entrada de kernel do registro — `system32/ntos/cm/native-keys.js`.
+//! Pontos de entrada de kernel do registro.
 //!
 //! PreviousMode zero; os ponteiros de saída continuam do chamador e o corpo
 //! das operações fica em `key_services`. As operações sobre um handle aberto

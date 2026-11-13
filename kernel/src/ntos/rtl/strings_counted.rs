@@ -1,4 +1,4 @@
-//! Strings contadas do Rtl — `system32/ntos/rtl/{append-unicode-string,copy-unicode-string,initialize-ansi-string}.js`.
+//! Strings contadas do Rtl.
 //!
 //! Também as STRING/ANSI_STRING de bytes: RtlInitString, RtlEqualString,
 //! RtlFreeAnsiString e RtlAppendStringToString.

@@ -1,4 +1,4 @@
-//! Gerente de interrupções do nanokernel — `system32/nano/interrupts.js`.
+//! Gerente de interrupções do nanokernel.
 //!
 //! Constrói a IDT na memória física (0x82000), programa o PIC 8259 e o
 //! timer do LAPIC (100 Hz) pelas portas e carrega a tabela. Os trampolins

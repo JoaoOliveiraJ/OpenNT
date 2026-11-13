@@ -1,4 +1,4 @@
-//! KTHREAD.PreviousMode — `system32/ntos/ps/previous-mode.js`.
+//! KTHREAD.PreviousMode.
 
 use super::process;
 use crate::ntos::ke::pcr;

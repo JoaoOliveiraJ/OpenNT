@@ -1,4 +1,4 @@
-//! Política de segurança do namespace de objetos — `system32/ntos/se/object-security.js`.
+//! Política de segurança do namespace de objetos.
 //!
 //! O mesmo descritor é consultado pelos clientes nativos e usado nas
 //! verificações de abertura de diretórios. O nó do namespace é dono da

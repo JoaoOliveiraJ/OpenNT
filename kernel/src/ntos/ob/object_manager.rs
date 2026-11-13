@@ -1,4 +1,4 @@
-//! Gerenciador de objetos — `system32/ntos/ob/object-manager.js`.
+//! Gerenciador de objetos.
 //!
 //! Organiza nomes numa árvore compartilhada e associa handles aos objetos
 //! donos. Um nó pode delegar o restante do caminho a um sistema de arquivos

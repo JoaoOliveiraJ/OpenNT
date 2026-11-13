@@ -1,4 +1,4 @@
-//! KeStackAttachProcess/KeUnstackDetachProcess — `system32/ntos/ke/process-attachment.js`.
+//! KeStackAttachProcess/KeUnstackDetachProcess.
 //!
 //! Anexação da thread corrente com KAPC_STATE x64 de 48 bytes. O MM atual
 //! compartilha uma PML4 entre processos: a identidade APC e as filas mudam

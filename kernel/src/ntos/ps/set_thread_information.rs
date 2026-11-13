@@ -1,4 +1,4 @@
-//! Zw/NtSetInformationThread — `system32/ntos/ps/set-thread-information.js`.
+//! Zw/NtSetInformationThread.
 //!
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração

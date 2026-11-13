@@ -1,4 +1,4 @@
-//! Definições WNF da hive — `system32/ntos/cm/wnf-defaults.js`.
+//! Definições WNF da hive.
 //!
 //! Definições que NTDLL/KERNELBASE consultam durante o carregamento. Os
 //! REG_BINARY conservam descritor de segurança, limite de dados e GUID da

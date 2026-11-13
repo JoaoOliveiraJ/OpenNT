@@ -1,4 +1,4 @@
-//! Política de acesso capturada na criação do corpo — `ntos/ob/object-access.js`.
+//! Política de acesso capturada na criação do corpo.
 //!
 //! A DACL atual do chamador não substitui a política que pertence ao objeto.
 

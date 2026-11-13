@@ -1,4 +1,4 @@
-//! SHA-256 de bytes, FIPS 180-4 — `system32/ntos/rtl/sha256.js`.
+//! SHA-256 de bytes, FIPS 180-4.
 //! Rotina interna: não publica um provedor CNG.
 
 use alloc::vec;

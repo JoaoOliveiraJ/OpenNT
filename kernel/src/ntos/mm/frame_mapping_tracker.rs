@@ -1,5 +1,4 @@
-//! Relaciona células físicas de paginação aos descritores dos frames —
-//! `system32/ntos/mm/frame-mapping-tracker.js`.
+//! Relaciona células físicas de paginação aos descritores dos frames.
 //!
 //! A PteAddress publicada é um alias recursivo da célula que contém o PFN,
 //! inclusive para frames que são, eles próprios, tabelas de páginas.

@@ -1,5 +1,4 @@
-//! Endereço virtual do kernel <-> mapeamento físico permanente da imagem —
-//! `system32/ntos/mm/kernel-address.js`.
+//! Endereço virtual do kernel <-> mapeamento físico permanente da imagem.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

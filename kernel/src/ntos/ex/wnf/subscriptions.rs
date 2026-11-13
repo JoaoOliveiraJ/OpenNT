@@ -1,4 +1,4 @@
-//! Inscrições WNF — `system32/ntos/ex/wnf-subscriptions.js`.
+//! Inscrições WNF.
 //!
 //! Inscrições nas listas nativas do namespace. O processo é dono do bloco e
 //! da quota; a operação só conserva um empréstimo de rundown até publicar

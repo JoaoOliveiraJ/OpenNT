@@ -1,5 +1,4 @@
-//! Gravador black box (classe 94 de ZwPowerInformation) —
-//! `system32/ntos/po/black-box-categories.js` e `black-box-recorder.js`.
+//! Gravador black box (classe 94 de ZwPowerInformation).
 //!
 //! Cada categoria tem até 4096 bytes próprios de pool não paginado,
 //! independentes do buffer do chamador. As categorias seguem PopBlackBoxEntries

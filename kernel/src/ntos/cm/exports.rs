@@ -1,7 +1,7 @@
 //! Exports do Configuration Manager (callbacks de registro).
 
 pub mod registry_callbacks {
-    //! Callbacks do registro — `system32/win32/ntoskrnl/registry-callbacks.js`.
+    //! Callbacks do registro.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;

@@ -1,4 +1,4 @@
-//! Serviços centrais de modo usuário — `system32/ntos/ps/user/syscalls-core.js`.
+//! Serviços centrais de modo usuário.
 //!
 //! Processador corrente, display de boot, término, contador de desempenho,
 //! NtContinue sobre o frame do syscall, esperas reais, informações de

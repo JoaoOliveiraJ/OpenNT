@@ -1,4 +1,4 @@
-//! Montagem e execução de processos de usuário — `system32/ntos/ps/user/process.js`.
+//! Montagem e execução de processos de usuário.
 //!
 //! O processo NT real (EPROCESS/KTHREAD de `ps/process`, com a seção de
 //! imagem da fonte exata) e o LdrInitializeThunk da ntdll em anel 3: a ntdll

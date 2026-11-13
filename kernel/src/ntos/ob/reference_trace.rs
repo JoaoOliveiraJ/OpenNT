@@ -1,4 +1,4 @@
-//! Histórico opcional de referências — `system32/ntos/ob/reference-trace.js`.
+//! Histórico opcional de referências.
 //!
 //! Registra chamadas reais sem reter o objeto observado; a capacidade fixa
 //! impede o crescimento durante o boot. Desligado por padrão.

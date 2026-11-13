@@ -35,7 +35,7 @@ pub mod exports;
 pub mod services;
 
 /// O kernel drena timers, DPCs, work items e IoTimers no laço ocioso, como o
-/// NT ao cair de DISPATCH_LEVEL (`runKernelTasks` de `win32/ntoskrnl.js`).
+/// NT ao cair de DISPATCH_LEVEL.
 pub fn run_kernel_tasks() {
     crate::ntos::mm::kernel_pool::reap();
     crate::ntos::ex::lookaside::maintain();

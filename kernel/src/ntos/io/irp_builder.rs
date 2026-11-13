@@ -1,4 +1,4 @@
-//! IRPs reais na memória do convidado — `system32/win32/ntoskrnl/irp-builder.js`.
+//! IRPs reais na memória do convidado.
 //!
 //! Layout oficial do WDK (offsets em `ntos::inc::nt_abi`) com N stack locations:
 //! a primeira usada fica no endereço mais alto (slot StackCount-1),

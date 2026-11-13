@@ -1,4 +1,4 @@
-//! Serviços de drivers — `system32/ntos/cm/driver-services.js`.
+//! Serviços de drivers.
 //!
 //! Usa a mesma base de configuração dos serviços de usuário. RUNNING exige um
 //! DRIVER_OBJECT inicializado: lançar a carga não equivale a concluir o

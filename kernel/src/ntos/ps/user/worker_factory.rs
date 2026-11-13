@@ -1,4 +1,4 @@
-//! Workers nativos gerenciados pelo kernel — `system32/ntos/ps/user/worker-factory.js`.
+//! Workers nativos gerenciados pelo kernel.
 //!
 //! A NTDLL de modo usuário possui as filas de callbacks; este objeto possui
 //! a criação de workers, as esperas de conclusão e a vida dos workers.

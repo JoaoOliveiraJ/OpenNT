@@ -1,4 +1,4 @@
-//! Tabela de exports do ntoskrnl — `system32/win32/ntoskrnl.js`.
+//! Tabela de exports do ntoskrnl.
 //!
 //! A ordem completa da ABI fica em `abi_names` (ids = 32 + índice; os
 //! ordinais seguem a mesma ordem, com os dados de `kernel_data_layout` no
@@ -391,7 +391,7 @@ pub fn init() {
             ImportSymbol::Ordinal(ordinal) => lookup_ordinal(dll, *ordinal),
         }),
     );
-    // hal.dll, wmilib/wpprecorder e os demais .sys (`init/main.js`).
+    // hal.dll, wmilib/wpprecorder e os demais .sys.
     crate::ntos::mm::sysload::register_resolvers();
 }
 
@@ -605,7 +605,7 @@ pub extern "win64" fn opennt_ntoskrnl_dispatch(id: u64, frame: u64, context: u64
 }
 
 pub mod private_routines {
-    //! Rotinas nativas privadas — `system32/win32/private-routines.js`.
+    //! Rotinas nativas privadas.
     //!
     //! Têm espaço de ids próprio (0x80000000+), nunca entram na EAT e preservam
     //! os ordinais públicos.

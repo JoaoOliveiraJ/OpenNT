@@ -1,4 +1,4 @@
-//! Memória virtual do processo de usuário — `system32/ntos/ps/user/memory.js`.
+//! Memória virtual do processo de usuário.
 //!
 //! O "VAD" (regiões de usuário e imagens do estado), o alocador de VA
 //! (reserva, commit e top-down), o mapeamento de pilha, estruturas e regiões

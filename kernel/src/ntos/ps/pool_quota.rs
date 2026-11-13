@@ -1,4 +1,4 @@
-//! Cobrança real de pool por processo — `system32/ntos/ps/pool-quota.js`.
+//! Cobrança real de pool por processo.
 //!
 //! Os contadores publicados no EPROCESS são a fonte de verdade; o registro
 //! do processo guarda só os limites.

@@ -1,4 +1,4 @@
-//! Verificação de imagens de drivers — `system32/ntos/se/image-verification.js`.
+//! Verificação de imagens de drivers.
 //!
 //! Inscrições e entrega dos pacotes BDCB_IMAGE_INFORMATION de uma
 //! verificação; carregar um PE por si só não produz o evento nem atribui

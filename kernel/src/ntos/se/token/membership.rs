@@ -1,4 +1,4 @@
-//! RtlCheckTokenMembership(Ex) / SeTokenIsMember — `system32/ntos/se/token-membership.js`.
+//! RtlCheckTokenMembership(Ex) / SeTokenIsMember.
 
 use alloc::vec::Vec;
 

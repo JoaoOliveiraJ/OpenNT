@@ -1,4 +1,4 @@
-//! Eventos de usuário — `system32/ntos/ps/user/events.js`.
+//! Eventos de usuário.
 //!
 //! KEVENTs têm vidas independentes de handle e de referência de kernel: um
 //! driver pode manter um evento referenciado depois de o handle de usuário

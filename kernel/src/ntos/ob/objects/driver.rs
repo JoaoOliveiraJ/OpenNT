@@ -1,4 +1,4 @@
-//! Vida de DRIVER_OBJECT — `system32/ntos/ob/driver-objects.js`.
+//! Vida de DRIVER_OBJECT.
 //!
 //! Independe dos dispositivos. A retirada do nome impede novas aberturas; o
 //! corpo vive até o fim dos handles e referências existentes.

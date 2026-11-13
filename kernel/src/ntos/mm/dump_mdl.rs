@@ -1,4 +1,4 @@
-//! Janela de mapeamento do dump legado — `system32/ntos/mm/dump-mdl.js`.
+//! Janela de mapeamento do dump legado.
 //!
 //! Uma janela pré-reservada de 32 PTEs de sistema. Os chamadores serializam
 //! seu uso; o próximo mapeamento substitui a vista do MDL anterior. Mapear

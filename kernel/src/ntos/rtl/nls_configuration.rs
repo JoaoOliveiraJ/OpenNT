@@ -1,4 +1,4 @@
-//! Configuração da instalação convidada — `system32/ntos/rtl/nls-configuration.js`.
+//! Configuração da instalação convidada.
 //! Compartilhada pelas consultas NLS e pelo fallback de recursos.
 
 pub const DEFAULT_LOCALE: u32 = 0x409;

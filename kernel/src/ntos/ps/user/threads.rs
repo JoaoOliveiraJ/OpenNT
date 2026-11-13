@@ -1,4 +1,4 @@
-//! Threads de usuário — `system32/ntos/ps/user/threads.js`.
+//! Threads de usuário.
 //!
 //! As threads executam código nativo em anel 3; a HAL salva CONTEXTs x64
 //! completos nas saídas de syscall/timer e este módulo cuida do

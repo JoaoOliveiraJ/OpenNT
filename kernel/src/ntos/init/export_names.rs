@@ -1,10 +1,10 @@
-//! Ordem da ABI dos exports do ntoskrnl (gerada a partir de `groups.js`).
+//! Ordem da ABI dos exports do ntoskrnl.
 //!
 //! Os ids dos trampolins são 32 + índice nesta tabela e os ordinais do
 //! `ntoskrnl.lib` dos drivers seguem a mesma ordem; a tabela é append-only
 //! dentro de cada grupo. Gerada: não editar à mão.
 
-/// (grupo, primeiro índice, quantidade), na ordem de `groups.js`.
+/// (grupo, primeiro índice, quantidade), na ordem da ABI.
 pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("ke", 0, 96),
     ("io", 96, 104),

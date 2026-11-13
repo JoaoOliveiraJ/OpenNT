@@ -1,4 +1,4 @@
-//! NtReadFile/ZwReadFile — `system32/ntos/io/read-file.js`.
+//! NtReadFile/ZwReadFile.
 //!
 //! Argumentos capturados, bytes reais do arquivo de volume (ou da fonte) ou
 //! IRP_MJ_READ ao driver (Fast I/O primeiro), e conclusão pela mesma posse

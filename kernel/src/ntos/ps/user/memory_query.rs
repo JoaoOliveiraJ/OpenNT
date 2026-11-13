@@ -1,4 +1,4 @@
-//! NtQueryVirtualMemory de usuário — `system32/ntos/ps/user/memory-query.js`.
+//! NtQueryVirtualMemory de usuário.
 //!
 //! Layouts NT x64 distintos por classe (phnt/ntmmapi.h,
 //! MEMORY_INFORMATION_CLASS). `describe` também serve ao serviço de kernel

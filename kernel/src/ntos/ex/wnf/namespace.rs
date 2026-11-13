@@ -1,4 +1,4 @@
-//! Namespace WNF — `system32/ntos/ex/wnf-namespace.js`.
+//! Namespace WNF.
 //!
 //! Instâncias de escopo e de nome: listas, árvore AVL, rundown e caches na
 //! memória do convidado. O serviço fornece a desmontagem dos assinantes; uma

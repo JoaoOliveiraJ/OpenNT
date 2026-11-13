@@ -1,4 +1,4 @@
-//! Seleção e saneamento de registradores x64 — `system32/ntos/ps/thread-context-registers.js`.
+//! Seleção e saneamento de registradores x64.
 //!
 //! Medido contra PspSetContext e o validador de ContextFlags originais. O
 //! agendamento e a captura ficam no provedor de contexto de thread; este

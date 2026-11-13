@@ -1,4 +1,4 @@
-//! RC_CONFIG — `system32/ntos/rtl/resource-configuration.js`.
+//! RC_CONFIG.
 //!
 //! O recurso MUI que declara quais tipos pertencem ao módulo principal e ao
 //! arquivo de idioma; a existência de bytes locais não substitui essa

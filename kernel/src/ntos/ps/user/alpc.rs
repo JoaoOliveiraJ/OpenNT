@@ -1,4 +1,4 @@
-//! Portas ALPC/LPC de modo usuário — `system32/ntos/ps/user/alpc.js`.
+//! Portas ALPC/LPC de modo usuário.
 //!
 //! O transporte de mensagens: respostas e notificações na fila da porta,
 //! pedidos entregues aos serviços hospedados no kernel, cancelamento,

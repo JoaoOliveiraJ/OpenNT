@@ -1,4 +1,4 @@
-//! Spin lock de cancelamento compartilhado e IoCancelIrp — `system32/ntos/io/cancel.js`.
+//! Spin lock de cancelamento compartilhado e IoCancelIrp.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

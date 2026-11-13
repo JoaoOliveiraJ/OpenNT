@@ -1,4 +1,4 @@
-//! Informações da CPU convidada — `system32/ntos/ke/processor-information.js`.
+//! Informações da CPU convidada.
 //!
 //! Combina CPUID, CR4, EFER e o estado de salvamento de contexto. A máscara
 //! KF_* do kernel é distinta dos bits brutos de CPUID; os índices PF_*

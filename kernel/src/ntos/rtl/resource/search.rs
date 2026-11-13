@@ -1,4 +1,4 @@
-//! Política de recursos do kernel — `system32/ntos/rtl/resource-search.js`.
+//! Política de recursos do kernel.
 //!
 //! O contexto fornece os idiomas e a fase de boot reais; os arquivos MUI
 //! são abertos e retidos pelo `resource-satellites`.

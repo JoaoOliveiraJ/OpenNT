@@ -1,4 +1,4 @@
-//! Arquivos do volume de boot — `system32/ntos/fs/volume-files.js`.
+//! Arquivos do volume de boot.
 //!
 //! Compartilha a tradução de caminhos e os objetos de arquivo do volume
 //! entre o loader de usuário, o leitor NLS e as seções. Importar não monta o

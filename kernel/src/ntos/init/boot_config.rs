@@ -1,5 +1,4 @@
-//! Configuração de boot — o `init/boot-config.js` que o `tools/build.mjs`
-//! gerava. Aqui o `cargo xtask build` passa as opções como variáveis de
+//! Configuração de boot. O `cargo xtask build` passa as opções como variáveis de
 //! ambiente lidas em tempo de compilação.
 
 const fn or_default(value: Option<&'static str>, default: &'static str) -> &'static str {

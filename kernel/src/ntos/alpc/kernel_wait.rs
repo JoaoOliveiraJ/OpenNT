@@ -1,4 +1,4 @@
-//! Espera ALPC retomável — `system32/ntos/alpc/kernel-wait.js`.
+//! Espera ALPC retomável.
 //!
 //! O pedido mantém seu chamador e libera os recursos ao concluir; o
 //! escalonador consulta `poll` e pode cancelar sem suspender um frame.

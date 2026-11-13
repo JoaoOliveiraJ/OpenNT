@@ -1,4 +1,4 @@
-//! Estruturas de processo — `system32/ntos/ps/user/structures.js`.
+//! Estruturas de processo.
 //!
 //! TEB, PEB, RTL_USER_PROCESS_PARAMETERS e PEB_LDR_DATA que o loader da
 //! ntdll (LdrInitializeThunk) lê: tudo em páginas de usuário reais. Os

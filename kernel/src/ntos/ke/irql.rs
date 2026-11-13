@@ -1,4 +1,4 @@
-//! Nível de interrupção do runtime — `system32/ntos/ke/irql.js`.
+//! Nível de interrupção do runtime.
 //!
 //! A variável acompanha elevações e reduções; a publicação mantém a célula
 //! física (lida pelo stub de interrupções) e a PCR coerentes.

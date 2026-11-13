@@ -1,4 +1,4 @@
-//! HANDLE_TABLE consumida pela enumeração nativa — `ntos/ob/handle-table.js`.
+//! HANDLE_TABLE consumida pela enumeração nativa.
 //!
 //! O dono do objeto mantém suas referências; a entrada codifica corpo - 0x30,
 //! sem escrever um OBJECT_HEADER antes de uma alocação de outro subsistema.

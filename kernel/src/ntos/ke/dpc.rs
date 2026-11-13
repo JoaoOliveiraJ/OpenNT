@@ -1,4 +1,4 @@
-//! Fila de chamadas diferidas drenada em DISPATCH_LEVEL — `system32/ntos/ke/dpc.js`.
+//! Fila de chamadas diferidas drenada em DISPATCH_LEVEL.
 //!
 //! Descritores e argumentos conservam seus endereços de 64 bits até a
 //! chamada nativa.

@@ -1,4 +1,4 @@
-//! Posse da entrada de PspSetContextThreadInternal — `system32/ntos/ps/thread-context-input.js`.
+//! Posse da entrada de PspSetContextThreadInternal.
 //!
 //! KernelMode conserva o buffer real do chamador; UserMode captura só os
 //! campos selecionados. Não enfileira APC nem informa conclusão.

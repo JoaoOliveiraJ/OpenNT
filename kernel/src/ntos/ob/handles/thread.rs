@@ -1,4 +1,4 @@
-//! Referência de thread por handle — `system32/ntos/ob/thread-handles.js`.
+//! Referência de thread por handle.
 //!
 //! Retém a ETHREAD na tabela que realmente possui o handle, antes de soltar
 //! a trava da entrada.

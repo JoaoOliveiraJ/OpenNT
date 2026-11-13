@@ -1,4 +1,4 @@
-//! Consultas da porta usadas pelo MSRPC — `system32/ntos/alpc/query-information.js`.
+//! Consultas da porta usadas pelo MSRPC.
 //!
 //! Estado básico da porta e SID do processo conectado; Nt e Zw
 //! compartilham objetos e serialização, com a sondagem de cada modo.

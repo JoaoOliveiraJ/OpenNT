@@ -1,4 +1,4 @@
-//! NtWriteFile/ZwWriteFile — `system32/ntos/io/write-file.js`.
+//! NtWriteFile/ZwWriteFile.
 //!
 //! Escreve no arquivo de volume aberto ou monta IRP_MJ_WRITE (Fast I/O
 //! primeiro); a posse do buffer e a conclusão são as mesmas dos demais

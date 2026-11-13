@@ -1,4 +1,4 @@
-//! Retenção de residência de buffers de I/O direto — `system32/ntos/mm/io-pins.js`.
+//! Retenção de residência de buffers de I/O direto.
 //! A posse do buffer continua com o chamador até o I/O terminar.
 
 use alloc::collections::BTreeMap;

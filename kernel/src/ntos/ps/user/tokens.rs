@@ -1,4 +1,4 @@
-//! Tokens de modo usuário — `system32/ntos/ps/user/tokens.js`.
+//! Tokens de modo usuário.
 //!
 //! Abertura de tokens de processo e thread, impersonação anônima e as
 //! classes de NtQueryInformationToken montadas sobre o token real, com os

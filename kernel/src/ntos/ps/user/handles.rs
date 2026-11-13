@@ -1,4 +1,4 @@
-//! Operações nativas de handle — `system32/ntos/ps/user/handles.js`.
+//! Operações nativas de handle.
 //!
 //! Duplicatas referem-se à mesma descrição aberta; acesso, herança e
 //! proteção contra fechamento pertencem a cada handle. Transcrito:

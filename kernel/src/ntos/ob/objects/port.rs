@@ -1,4 +1,4 @@
-//! Conexões LPC/ALPC — `system32/ntos/ob/port-objects.js`.
+//! Conexões LPC/ALPC.
 //!
 //! O corpo privado de 0x80 bytes espelha contadores e estado (refs +0,
 //! handles +8, fechada +0xC, processo +0x10, PID +0x18, TID +0x20, máximo

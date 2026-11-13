@@ -1,4 +1,4 @@
-//! Referência de objetos por handle de kernel — `system32/ntos/ob/security-handles.js`.
+//! Referência de objetos por handle de kernel.
 //!
 //! Zw consulta em KernelMode: os direitos pedidos não são comparados aos
 //! concedidos, mas a tabela, a codificação do handle e a vida do corpo

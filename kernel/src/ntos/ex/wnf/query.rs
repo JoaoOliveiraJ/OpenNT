@@ -1,4 +1,4 @@
-//! Consulta WNF Nt/Zw — `system32/ntos/ex/wnf-query.js`.
+//! Consulta WNF Nt/Zw.
 //!
 //! Nomes definidos sem instância e sem dados permanentes devolvem vazio sem
 //! criar uma instância só para a leitura. O caminho de usuário entra com as

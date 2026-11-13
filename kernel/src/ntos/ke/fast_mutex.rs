@@ -1,4 +1,4 @@
-//! FAST_MUTEX e KGUARDED_MUTEX — `system32/ntos/ke/fast-mutex.js`.
+//! FAST_MUTEX e KGUARDED_MUTEX.
 //!
 //! Layout de 0x38 bytes e o protocolo de Count do kernel de referência:
 //! bit 0 disponível, bit 1 despertar em trânsito e aguardantes nos bits

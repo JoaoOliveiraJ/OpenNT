@@ -1,4 +1,4 @@
-//! Descritores OBJECT_TYPE do gerenciador de objetos — `ntos/ob/object-types.js`.
+//! Descritores OBJECT_TYPE do gerenciador de objetos.
 //!
 //! Layout do PDB: corpo de 0xD8 bytes, TypeInfo em +0x40 com tamanho 0x78.
 //! Ponteiros exportados, verificações de tipo e contadores usam a mesma

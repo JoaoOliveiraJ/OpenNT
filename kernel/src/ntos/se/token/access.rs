@@ -1,4 +1,4 @@
-//! Acesso a objetos token — `system32/ntos/se/token-access.js`.
+//! Acesso a objetos token.
 //!
 //! Mapeamento de direitos genéricos e avaliação ordenada da DACL do token.
 

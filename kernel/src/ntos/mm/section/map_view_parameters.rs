@@ -1,5 +1,4 @@
-//! Validação nativa (19041) dos parâmetros de vista —
-//! `system32/ntos/mm/map-view-parameters.js`.
+//! Validação nativa (19041) dos parâmetros de vista.
 //!
 //! Medida antes de o MM original alocar VADs ou tabelas de páginas; não faz
 //! busca de objeto nem alocação. A aritmética usa u128 onde o original usava

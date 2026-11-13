@@ -139,7 +139,7 @@ estão em **[docs/ARQUITETURA.md](docs/ARQUITETURA.md)**.
 - **QEMU** (`qemu-system-x86_64`). O `xtask` procura na variável `QEMU`, depois
   no `PATH` e em `C:\Program Files\qemu`.
 
-Não são necessários Node.js, Python, NASM nem Zig.
+Não são necessários Python, NASM nem Zig.
 
 ## Compilar, executar e testar
 

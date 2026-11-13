@@ -1,5 +1,4 @@
-//! ObOpenObjectByPointer / ObReferenceObjectByHandle / ObCloseHandle —
-//! `system32/ntos/ob/open-pointer.js`.
+//! ObOpenObjectByPointer / ObReferenceObjectByHandle / ObCloseHandle.
 //!
 //! `describe` identifica o dono do corpo, na ordem do original (processo,
 //! thread, token, callback, driver, seção, arquivo, dispatcher, namespace,

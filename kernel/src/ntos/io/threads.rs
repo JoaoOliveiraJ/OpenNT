@@ -1,8 +1,8 @@
 //! Timers e estado de I/O por dispositivo e por thread.
 //!
-//! - `io_timer` — `system32/ntos/io/io-timer.js`
-//! - `thread_activity` — `system32/ntos/io/thread-activity.js`
-//! - `thread_requests` — `system32/ntos/io/thread-requests.js`
+//! - `io_timer` — IoTimers por dispositivo
+//! - `thread_activity` — atividade de I/O por thread
+//! - `thread_requests` — IRPs pendentes por thread
 
 /// IoInitializeTimer/IoStartTimer/IoStopTimer: uma rotina por dispositivo,
 /// chamada a cada ~1 s enquanto ligada; DEVICE_OBJECT.Timer marca o

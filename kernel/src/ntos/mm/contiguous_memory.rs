@@ -1,4 +1,4 @@
-//! Faixas fisicamente contíguas — `system32/ntos/mm/contiguous-memory.js`.
+//! Faixas fisicamente contíguas.
 //!
 //! Um dono para a faixa física e sua reserva de VA de kernel. `allocate` é a
 //! primitiva do MM; `allocate_default` implementa o contrato observado de

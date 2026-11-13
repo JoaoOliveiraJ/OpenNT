@@ -1,4 +1,4 @@
-//! Mapeamentos NLS nativos — `system32/ntos/ps/user/nls.js`.
+//! Mapeamentos NLS nativos.
 //!
 //! As tabelas vêm da mesma instalação do Windows que as DLLs carregadas
 //! (o volume); nenhum dado sintético de locale ou collation as substitui.

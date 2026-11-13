@@ -1,4 +1,4 @@
-//! Etapas da pesquisa de recursos — `system32/ntos/rtl/resource-lookup.js`.
+//! Etapas da pesquisa de recursos.
 //!
 //! Preparação com a ordem de rejeição do wrapper e de LdrResSearchResource,
 //! extensão da vista, publicação das saídas e validação da tabela de

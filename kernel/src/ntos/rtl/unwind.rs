@@ -1,4 +1,4 @@
-//! Unwind AMD64 — `system32/ntos/rtl/unwind.js`.
+//! Unwind AMD64.
 //!
 //! Localiza RUNTIME_FUNCTION e interpreta UNWIND_INFO versões 1 e 2,
 //! reconstruindo o CONTEXT do chamador sem executar handlers de exceção ou de

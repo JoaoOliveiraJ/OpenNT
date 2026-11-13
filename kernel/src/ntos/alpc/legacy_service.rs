@@ -1,4 +1,4 @@
-//! Contrato LPC dos serviços locais — `system32/ntos/alpc/legacy-service.js`.
+//! Contrato LPC dos serviços locais.
 //!
 //! O servidor recebe o PORT_MESSAGE copiado e pode concluir agora ou por
 //! uma continuação.

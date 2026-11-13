@@ -1,4 +1,4 @@
-//! Build do OpenNT — o papel de `tools/build.mjs`:
+//! Build do OpenNT:
 //!
 //! 1. compila `boot` (setor de boot + stage2) e `kernel` para
 //!    `x86_64-unknown-none`;

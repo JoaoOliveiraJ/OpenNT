@@ -1,4 +1,4 @@
-//! Vistas de seção ALPC — `system32/ntos/alpc/section-views.js`.
+//! Vistas de seção ALPC.
 //!
 //! A vista conserva o SECTION e a porta que a publicou; o mapeamento e a
 //! retirada de PTEs pertencem ao Mm. O callback Delete do original é vazio:

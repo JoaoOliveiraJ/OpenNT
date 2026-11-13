@@ -1,4 +1,4 @@
-//! EX_PUSH_LOCK — `system32/ntos/ex/push-lock.js`.
+//! EX_PUSH_LOCK.
 //!
 //! A palavra nativa e blocos de espera de 0x40 bytes no convidado. Cada
 //! aguardante possui sua alocação até ser desligado e retomar. Os caminhos

@@ -1,4 +1,4 @@
-//! Contextos de licenciamento do boot — `system32/ntos/ex/license-boot.js`.
+//! Contextos de licenciamento do boot.
 //!
 //! A política capturada passa para uma SECTION real antes de o índice ser
 //! publicado. Este dono só faz a primeira publicação; não há serviço de

@@ -1,5 +1,4 @@
-//! Maiúsculas por unidade WCHAR com a tabela NLS instalada —
-//! `system32/ntos/rtl/unicode-case.js`.
+//! Maiúsculas por unidade WCHAR com a tabela NLS instalada.
 //!
 //! A tabela vem de `C:\Windows\System32\l_intl.nls` no volume montado,
 //! lida no primeiro uso; ausência ou estrutura inválida é erro.

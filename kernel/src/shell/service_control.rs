@@ -1,4 +1,4 @@
-//! Comando `sc` do shell — `system32/shell/service-control.js`.
+//! Comando `sc` do shell.
 //!
 //! Consulta a mesma hive e usa o ciclo real de serviços e drivers; o texto
 //! é separado aqui para preservar aspas e caminhos.

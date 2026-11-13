@@ -1,5 +1,4 @@
-//! Retirada de pacotes de conclusão — `system32/ntos/io/remove-completion.js`
-//! (a indireção de `io/completion-entry` não é necessária em Rust).
+//! Retirada de pacotes de conclusão.
 //!
 //! Captura Nt/Zw, associação do consumidor à fila e a continuação da
 //! espera: uma reserva tira o lote da FIFO antes de qualquer callback de

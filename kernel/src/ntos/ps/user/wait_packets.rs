@@ -1,4 +1,4 @@
-//! Pacotes de espera — `system32/ntos/ps/user/wait-packets.js`.
+//! Pacotes de espera.
 //!
 //! Uma associação de uso único consome um objeto esperável e publica os
 //! contextos do chamador numa IOCP. As referências sobrevivem ao fechamento

@@ -1,4 +1,4 @@
-//! Captura de Nt/ZwAlpcCancelMessage — `system32/ntos/alpc/cancel-message.js`.
+//! Captura de Nt/ZwAlpcCancelMessage.
 //!
 //! A operação do transporte recebe só valores capturados e uma porta já
 //! referenciada, na ordem do kernel original.

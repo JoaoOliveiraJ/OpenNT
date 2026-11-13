@@ -1,4 +1,4 @@
-//! PsSetCreateThreadNotifyRoutine — `system32/ntos/ps/thread-notify.js`.
+//! PsSetCreateThreadNotifyRoutine.
 //!
 //! A rotina nativa medida não verifica imagem nem rejeita ponteiro repetido;
 //! o chamador responde por fornecer código válido.

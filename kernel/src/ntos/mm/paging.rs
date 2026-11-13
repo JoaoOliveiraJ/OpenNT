@@ -1,4 +1,4 @@
-//! Edição real das tabelas de páginas x86-64 — `system32/ntos/mm/paging.js`.
+//! Edição real das tabelas de páginas x86-64.
 //!
 //! Anda PML4->PDPT->PD->PT criando os níveis que faltam com frames do PFN,
 //! divide páginas de 2MB em PTs de 4KB sob demanda e invalida a TLB.

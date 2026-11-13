@@ -1,4 +1,4 @@
-//! ExEnumHandleTable — `system32/ntos/ex/enum-handles.js`.
+//! ExEnumHandleTable.
 //!
 //! Percorre a HANDLE_TABLE nativa do chamador. O callback recebe a entrada
 //! bloqueada e libera esse bloqueio antes de retornar.

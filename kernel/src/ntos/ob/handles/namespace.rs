@@ -1,4 +1,4 @@
-//! Handles de diretórios e links do namespace — `system32/ntos/ob/namespace-handles.js`.
+//! Handles de diretórios e links do namespace.
 //!
 //! NtOpen/NtCreateDirectoryObject, NtOpenSymbolicLinkObject,
 //! NtQuerySymbolicLinkObject, NtQueryDirectoryObject e NtMakeTemporaryObject.

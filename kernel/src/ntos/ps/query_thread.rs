@@ -1,4 +1,4 @@
-//! Zw/NtQueryInformationThread — `system32/ntos/ps/query-thread.js`.
+//! Zw/NtQueryInformationThread.
 //!
 //! Contrato ThreadPagePriority medido nos bytes originais e em chamadas do
 //! Windows. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de

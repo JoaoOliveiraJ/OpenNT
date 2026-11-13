@@ -1,4 +1,4 @@
-//! ALPC_PORT_ATTRIBUTES da conexão — `system32/ntos/alpc/connect-parameters.js`.
+//! ALPC_PORT_ATTRIBUTES da conexão.
 //!
 //! Captura a estrutura x64 antes da busca da porta e valida a cópia ao
 //! criar o cliente; a separação preserva a ordem de falhas do serviço NT.

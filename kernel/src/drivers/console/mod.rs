@@ -1,5 +1,4 @@
-//! Console do kernel (tela VGA + espelho serial) —
-//! `system32/drivers/console/console.js`.
+//! Console do kernel (tela VGA + espelho serial).
 //!
 //! O `DriverEntry` estilo NT, que registra `\Driver\Console` e
 //! `\Device\Console` com um handler de IRP_MJ_WRITE, entra junto com o I/O

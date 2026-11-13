@@ -1,4 +1,4 @@
-//! Identidades nativas opacas de chaves — `system32/ntos/cm/key-objects.js`.
+//! Identidades nativas opacas de chaves.
 //!
 //! Respaldadas pelos nós reais da hive. Handles e operações em andamento
 //! mantêm contagens separadas; não se fabricam ponteiros para KCBs privados.

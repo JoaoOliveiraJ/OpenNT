@@ -1,4 +1,4 @@
-//! Referência da IOCP pela tabela dona — `system32/ntos/alpc/completion-reference.js`.
+//! Referência da IOCP pela tabela dona.
 //!
 //! Resolve a porta na tabela de handles do processo (ou do System, para
 //! handles de kernel) e retém o corpo antes de destravar a entrada: handles

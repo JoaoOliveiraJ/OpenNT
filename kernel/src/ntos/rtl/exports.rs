@@ -1,4 +1,4 @@
-//! Exports Rtl*, Interlocked* e da CRT do ntoskrnl — `system32/win32/ntoskrnl/rtl.js`.
+//! Exports Rtl*, Interlocked* e da CRT do ntoskrnl.
 //!
 //! Semântica do NT sobre a memória do convidado. Divergência: os campos
 //! Buffer das UNICODE/ANSI_STRING são lidos e escritos com 64 bits (o
@@ -505,7 +505,7 @@ pub static GROUP: crate::ntos::init::exports::Group = crate::ntos::init::exports
 };
 
 pub mod capability_check {
-    //! RtlCapabilityCheck — `system32/win32/ntoskrnl/capability-check.js`.
+    //! RtlCapabilityCheck.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -527,7 +527,7 @@ pub mod capability_check {
 }
 
 pub mod check_registry_key {
-    //! RtlCheckRegistryKey — `system32/win32/ntoskrnl/check-registry-key.js`.
+    //! RtlCheckRegistryKey.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -564,7 +564,7 @@ pub mod exceptions {
 }
 
 pub mod feature_usage {
-    //! RtlNotifyFeatureUsage — `system32/win32/ntoskrnl/feature-usage.js`.
+    //! RtlNotifyFeatureUsage.
     //!
     //! O IRQL efetivo do chamador e a falha fatal ficam em
     //! `rtl::feature_configuration`.
@@ -586,7 +586,7 @@ pub mod feature_usage {
 }
 
 pub mod first_slist {
-    //! FirstEntrySList — `system32/win32/ntoskrnl/first-slist.js`.
+    //! FirstEntrySList.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -605,7 +605,7 @@ pub mod first_slist {
 }
 
 pub mod package_claims {
-    //! RtlQueryPackageClaims — `system32/win32/ntoskrnl/package-claims.js`.
+    //! RtlQueryPackageClaims.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -627,7 +627,7 @@ pub mod package_claims {
 }
 
 pub mod package_identity {
-    //! RtlQueryPackageIdentity — `system32/win32/ntoskrnl/package-identity.js`.
+    //! RtlQueryPackageIdentity.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.
@@ -649,7 +649,7 @@ pub mod package_identity {
 }
 
 pub mod resource_lookup {
-    //! LdrResFindResource — `system32/win32/ntoskrnl/resource-lookup.js`.
+    //! LdrResFindResource.
     //!
     //! Export observado na IAT da CI; o adaptador não modifica recursos nem
     //! política.
@@ -671,7 +671,7 @@ pub mod resource_lookup {
 }
 
 pub mod resource_search {
-    //! LdrResSearchResource — `system32/win32/ntoskrnl/resource-search.js`.
+    //! LdrResSearchResource.
     //!
     //! Entrada contada observada na IAT da CI: compartilha o parser, os arquivos
     //! e os donos com LdrResFindResource, com os seus guardas próprios.
@@ -693,7 +693,7 @@ pub mod resource_search {
 }
 
 pub mod state_separation {
-    //! RtlIsStateSeparationEnabled — `system32/win32/ntoskrnl/state-separation.js`.
+    //! RtlIsStateSeparationEnabled.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;

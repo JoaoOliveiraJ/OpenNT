@@ -1,4 +1,4 @@
-//! Descrição legada de hardware — `system32/ntos/cm/hw-description.js`.
+//! Descrição legada de hardware.
 //!
 //! Controlador 8042 na hive de hardware e IoQueryDeviceDescription. Mantém a
 //! representação usada pelos drivers deste sistema; os serializadores legados

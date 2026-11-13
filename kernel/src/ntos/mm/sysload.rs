@@ -2,7 +2,7 @@
 //! drivers de export, a fonte dos bytes das imagens, a resolução de
 //! encaminhamentos de exports e os API sets do kernel.
 //!
-//! Bibliotecas de kernel e drivers de export — `system32/win32/kernel-libraries.js`.
+//! Bibliotecas de kernel e drivers de export.
 //!
 //! Drivers de export importados entram pelo DllInitialize (o DriverEntry do
 //! PE não é API de inicialização); bibliotecas sem entrada (o hal.dll com os
@@ -379,7 +379,7 @@ fn import(dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
     }
 }
 
-/// Resolvedores do loader de PE (`init/main.js`): hal.dll pelas bibliotecas,
+/// Resolvedores do loader de PE: hal.dll pelas bibliotecas,
 /// wmilib.sys e wpprecorder.sys pelos exports do kernel, e qualquer outro
 /// .sys como driver de export ou driver importado.
 pub fn register_resolvers() {
@@ -426,7 +426,7 @@ pub fn system_routine_address(name_string: u64) -> Result<u64, KernelError> {
 }
 
 pub mod kernel_image_source {
-    //! Fonte de bytes de imagens nativas — `system32/win32/kernel-image-source.js`.
+    //! Fonte de bytes de imagens nativas.
     //!
     //! Lê imagens dos sistemas de arquivos do boot; ler uma imagem não a
     //! registra como carregada nem executa sua inicialização.
@@ -534,7 +534,7 @@ pub mod kernel_image_source {
 }
 
 pub mod pe_resolver {
-    //! Resolução de exports com encaminhamentos — `system32/win32/pe-resolver.js`.
+    //! Resolução de exports com encaminhamentos.
     //!
     //! Um encaminhamento pode terminar em outro encaminhamento, nome ou ordinal.
     //! Ciclos são detectados por símbolo (ciclos entre DLLs são permitidos).
@@ -616,7 +616,7 @@ pub mod pe_resolver {
 }
 
 pub mod kernel_api_set {
-    //! API sets do kernel — `system32/win32/kernel-api-set.js`.
+    //! API sets do kernel.
     //!
     //! O schema é lido do apisetschema.dll da instalação na primeira consulta.
 

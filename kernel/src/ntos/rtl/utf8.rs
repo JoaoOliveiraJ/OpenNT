@@ -1,5 +1,4 @@
-//! UTF-8 <-> UTF-16 sobre buffers contados — `system32/ntos/rtl/utf8.js`
-//! (RtlUTF8ToUnicodeN / RtlUnicodeToUTF8N).
+//! UTF-8 <-> UTF-16 sobre buffers contados (RtlUTF8ToUnicodeN / RtlUnicodeToUTF8N).
 //!
 //! Sem terminador; zeros internos são dados; comprimentos em bytes. A ordem
 //! de consumo e os resultados parciais seguem as rotinas NT.

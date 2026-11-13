@@ -1,4 +1,4 @@
-//! Arquivos, dispositivos e seções de modo usuário — `system32/ntos/ps/user/files.js`.
+//! Arquivos, dispositivos e seções de modo usuário.
 //!
 //! NtOpenFile/NtCreateFile abrem um arquivo do volume (pelo `file-io`) ou um
 //! dispositivo do NT (`\Device\X`, `\DosDevices\X`, `\GLOBAL??\X`, `\\.\X`,

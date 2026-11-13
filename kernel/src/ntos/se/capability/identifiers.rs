@@ -1,4 +1,4 @@
-//! Derivação dos SIDs de capability — `system32/ntos/se/capability-identifiers.js`.
+//! Derivação dos SIDs de capability.
 //!
 //! Interna a RtlCapabilityCheck: os SIDs vêm do nome completo em maiúsculas
 //! NLS (SHA-256), sem consultar nem alterar o token.

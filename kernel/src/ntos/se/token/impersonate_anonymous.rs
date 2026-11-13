@@ -1,4 +1,4 @@
-//! Nt/ZwImpersonateAnonymousToken — `system32/ntos/se/impersonate-anonymous.js`.
+//! Nt/ZwImpersonateAnonymousToken.
 
 use crate::ntos::se::token::{anonymous as anonymous_tokens, thread as thread_tokens, tokens};
 use crate::ntos::cm::registry;

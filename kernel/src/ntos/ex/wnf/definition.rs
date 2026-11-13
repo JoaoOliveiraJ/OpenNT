@@ -1,4 +1,4 @@
-//! Definição WNF lida do name store — `system32/ntos/ex/wnf-definition.js`.
+//! Definição WNF lida do name store.
 //!
 //! O resolvedor de namespace escolhe o store e o mantém vivo; este módulo só
 //! possui a cópia capturada da definição.

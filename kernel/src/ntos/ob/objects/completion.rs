@@ -1,4 +1,4 @@
-//! Portas de conclusão de E/S — `system32/ntos/ob/completion-objects.js`.
+//! Portas de conclusão de E/S.
 //!
 //! Cada porta tem sua fila de pacotes, as threads associadas e o limite de
 //! concorrência. O corpo privado de 0x40 bytes espelha os contadores (refs

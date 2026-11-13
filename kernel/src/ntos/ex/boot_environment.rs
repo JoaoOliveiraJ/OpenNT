@@ -1,4 +1,4 @@
-//! Identidade e flags desta inicialização — `system32/ntos/ex/boot-environment.js`.
+//! Identidade e flags desta inicialização.
 //!
 //! O loader é dono das flags e do firmware; o kernel cria uma identidade
 //! para o boot (UUID v4 por RDRAND) antes de carregar drivers. Falta de

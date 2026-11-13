@@ -1,4 +1,4 @@
-//! ZwDeviceIoControlFile — `system32/ntos/io/device-control.js`.
+//! ZwDeviceIoControlFile.
 //!
 //! Posse real do arquivo, Fast I/O ou IRP_MJ_DEVICE_CONTROL nativo, os
 //! quatro métodos de buffer e conclusão no contexto da thread que pediu

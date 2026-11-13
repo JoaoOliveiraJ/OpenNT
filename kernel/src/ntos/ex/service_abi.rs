@@ -1,4 +1,4 @@
-//! Convenção de chamada medida das tabelas de serviço — `system32/ntos/ex/service-abi.js`.
+//! Convenção de chamada medida das tabelas de serviço.
 //!
 //! Gerado das tabelas originais de serviço e dos stubs: número, nome e
 //! quantidade de argumentos de pilha além dos quatro registradores. São só

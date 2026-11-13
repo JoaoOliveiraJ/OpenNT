@@ -1,4 +1,4 @@
-//! CM_RESOURCE_LIST de cada PDO — `system32/ntos/io/device-resources.js`.
+//! CM_RESOURCE_LIST de cada PDO.
 //!
 //! Registro (ponteiro do PDO -> lista) para APIs que derivam a configuração
 //! de hardware do dispositivo: o IoConnectInterruptEx LINE_BASED acha a IRQ

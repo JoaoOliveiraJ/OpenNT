@@ -1,4 +1,4 @@
-//! Orquestrador PnP — `system32/ntos/io/pnp.js`.
+//! Orquestrador PnP.
 //!
 //! Liga um driver funcional num PDO (AddDevice real), monta os filtros de
 //! classe, inicia a pilha (START_DEVICE com a CM_RESOURCE_LIST do PDO) e

@@ -1,4 +1,4 @@
-//! Verificações de token de RtlCapabilityCheck — `system32/ntos/se/capability-token-checks.js`.
+//! Verificações de token de RtlCapabilityCheck.
 //!
 //! Compartilham a captura real do token, com validação, status e ordem de
 //! saída próprios.

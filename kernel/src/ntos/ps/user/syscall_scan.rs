@@ -1,4 +1,4 @@
-//! Números de serviço das bibliotecas nativas — `system32/ntos/ps/user/syscall-scan.js`.
+//! Números de serviço das bibliotecas nativas.
 //!
 //! Só os stubs `Nt*` no padrão canônico (`mov r10, rcx; mov eax, SSN`)
 //! entram; o primeiro nome de cada SSN vence, na ordem da tabela de

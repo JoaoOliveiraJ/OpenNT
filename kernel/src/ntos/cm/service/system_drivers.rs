@@ -1,4 +1,4 @@
-//! Drivers de boot/sistema e carga sob demanda — `system32/ntos/cm/services.js`.
+//! Drivers de boot/sistema e carga sob demanda.
 //!
 //! Usa a base comum de serviços (`service_database`/`driver_services`) e
 //! encaminha o início de dispositivos ao I/O Manager.

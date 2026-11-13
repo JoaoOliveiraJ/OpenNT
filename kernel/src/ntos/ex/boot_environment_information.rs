@@ -1,4 +1,4 @@
-//! SystemBootEnvironmentInformation (90) — `system32/ntos/ex/boot-environment-information.js`.
+//! SystemBootEnvironmentInformation (90).
 //!
 //! Compartilhado por Nt/Zw e modo usuário.
 

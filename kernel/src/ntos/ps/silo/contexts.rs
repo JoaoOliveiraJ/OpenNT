@@ -1,4 +1,4 @@
-//! Contextos de silo do NT 19041 — `system32/ntos/ps/silo-contexts.js`.
+//! Contextos de silo do NT 19041.
 //!
 //! 32 slots embutidos e uma extensão preguiçosa de 256. Cada entrada é
 //! {EX_PUSH_LOCK, objeto | bit permanente}; a tabela possui uma referência.

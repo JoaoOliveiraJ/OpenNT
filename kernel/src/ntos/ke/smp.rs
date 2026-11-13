@@ -1,4 +1,4 @@
-//! Multiprocessador — `system32/ntos/ke/smp.js`.
+//! Multiprocessador.
 //!
 //! Descobre processadores pela MADT e inicia APs com INIT-SIPI-SIPI
 //! direcionado via xAPIC. O trampolim faz a troca de modos e consome

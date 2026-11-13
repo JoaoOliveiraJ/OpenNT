@@ -1,4 +1,4 @@
-//! ERESOURCE x64 — `system32/ntos/ex/resource.js`.
+//! ERESOURCE x64.
 //!
 //! ERESOURCE ocupa 0x68 bytes, OWNER_ENTRY 0x10 e o bloco circular de espera
 //! 0x30 (layout e transferência de posse conferidos com o PE/PDB nativo).

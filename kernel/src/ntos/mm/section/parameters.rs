@@ -1,4 +1,4 @@
-//! Decodificação dos argumentos de criação de seção — `system32/ntos/mm/section-parameters.js`.
+//! Decodificação dos argumentos de criação de seção.
 //!
 //! Devolver uma requisição só valida parâmetros; criação, referências de
 //! arquivo, commit e publicação do handle pertencem ao gerenciador de seções.

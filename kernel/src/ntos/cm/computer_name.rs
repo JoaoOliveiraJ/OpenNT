@@ -1,4 +1,4 @@
-//! Nome do computador — `system32/ntos/cm/computer-name.js`.
+//! Nome do computador.
 //!
 //! Configuração de nome do próprio sistema; o KERNELBASE lê esses valores por
 //! consultas normais do registro.

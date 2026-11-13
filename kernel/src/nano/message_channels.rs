@@ -1,5 +1,5 @@
 //! IPC do nanokernel — canais nomeados de mensagens entre serviços e
-//! processos (`system32/nano/message-channels.js`). O produtor não conhece
+//! processos. O produtor não conhece
 //! o consumidor.
 
 use alloc::collections::{BTreeMap, VecDeque};

@@ -1,4 +1,4 @@
-//! Seções de dados e de imagem — `system32/ntos/ps/user/sections.js`.
+//! Seções de dados e de imagem.
 //!
 //! Seções de dados são donas de seus PFNs. Handles e vistas mantêm o objeto
 //! vivo de forma independente; toda vista é alias das mesmas páginas

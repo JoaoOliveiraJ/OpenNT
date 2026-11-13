@@ -1,5 +1,5 @@
 //! Exports Ke* (IRQL, spin locks, DPC, timers, eventos, waits, bugcheck,
-//! APC, regiões críticas, processadores) — `system32/win32/ntoskrnl/ke.js`.
+//! APC, regiões críticas, processadores).
 //!
 //! Só adaptadores: a lógica mora nos arquivos de assunto do `ke`.
 
@@ -534,7 +534,7 @@ pub static PROCESSOR_QUERIES_GROUP: Group = Group {
 };
 
 pub mod test_alert {
-    //! KeTestAlertThread — `system32/win32/ntoskrnl/test-alert.js`.
+    //! KeTestAlertThread.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -553,7 +553,7 @@ pub mod test_alert {
 }
 
 pub mod thread_base_priority {
-    //! KeSetBasePriorityThread — `system32/win32/ntoskrnl/thread-base-priority.js`.
+    //! KeSetBasePriorityThread.
     //!
     //! Qualquer falha interna interrompe o sistema.
 
@@ -580,7 +580,7 @@ pub mod thread_base_priority {
 }
 
 pub mod thread_priority {
-    //! KeSetPriorityThread — `system32/win32/ntoskrnl/thread-priority.js`.
+    //! KeSetPriorityThread.
     //!
     //! Qualquer falha interna interrompe o sistema.
 
@@ -621,7 +621,7 @@ pub mod persistent_thread_state {
 }
 
 pub mod alert_thread {
-    //! ZwAlertThread — `system32/win32/ntoskrnl/alert-thread.js`.
+    //! ZwAlertThread.
     //!
     //! Falha interna interrompe o sistema; o sinal de transferência do CONTEXT
     //! continua propagando.

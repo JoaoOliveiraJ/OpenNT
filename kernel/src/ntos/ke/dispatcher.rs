@@ -1,4 +1,4 @@
-//! Objetos de espera do dispatcher — `system32/ntos/ke/dispatcher.js`.
+//! Objetos de espera do dispatcher.
 //!
 //! Eventos, semáforos, mutants, timers e threads sinalizadas. As esperas são
 //! cooperativas: drenam timers, DPCs, work items e o escalonador enquanto

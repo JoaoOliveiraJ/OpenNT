@@ -1,4 +1,4 @@
-//! NtAlertThread / ZwAlertThread — `system32/ntos/ps/alert-thread.js`.
+//! NtAlertThread / ZwAlertThread.
 //!
 //! Nt usa o PreviousMode; a entrada Zw fixa KernelMode para o acesso e para
 //! o modo do alerta.

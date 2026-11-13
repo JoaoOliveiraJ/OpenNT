@@ -1,4 +1,4 @@
-//! Mecanismo de configuração PCI 1 (PC/i440fx) — `system32/ntos/hal/pci-config.js`.
+//! Mecanismo de configuração PCI 1 (PC/i440fx).
 //!
 //! O latch de endereço e a porta de dados são uma transação única, inclusive
 //! sondagens compostas de BAR e atualizações de comando; nunca há

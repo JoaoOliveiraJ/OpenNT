@@ -1,4 +1,4 @@
-//! GENERAL_LOOKASIDE x64 — `system32/ntos/ex/lookaside.js`.
+//! GENERAL_LOOKASIDE x64.
 //!
 //! Armazenamento e vínculos nativos; o descritor pertence ao cliente. As
 //! macros inline dos drivers chamam `Allocate`/`Free` diretamente, então os

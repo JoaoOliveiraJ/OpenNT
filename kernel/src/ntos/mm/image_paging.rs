@@ -1,4 +1,4 @@
-//! Residência das imagens de drivers nativos — `system32/ntos/mm/image-paging.js`.
+//! Residência das imagens de drivers nativos.
 //!
 //! Os slots virtuais das imagens ficam reservados; o conteúdo residente vai
 //! para frames PFN e o despejado mora no NTFS. Nem um flag paginável nem uma

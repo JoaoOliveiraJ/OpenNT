@@ -1,4 +1,4 @@
-//! WNF_STATE_NAME — `system32/ntos/ex/wnf-name.js`.
+//! WNF_STATE_NAME.
 //!
 //! Formato do nome e pré-condições medidas no kernel original; a resolução
 //! do namespace e a captura dos ponteiros pertencem ao serviço.

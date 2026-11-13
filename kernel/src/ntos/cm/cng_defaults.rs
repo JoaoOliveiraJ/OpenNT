@@ -1,4 +1,4 @@
-//! Catálogo CNG no registro — `system32/ntos/cm/cng-defaults.js`.
+//! Catálogo CNG no registro.
 //!
 //! Publica os provedores criptográficos instalados (nomes, imagens e
 //! algoritmos de `primitive_provider`); não executa algoritmos nem cria

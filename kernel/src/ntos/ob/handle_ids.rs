@@ -1,4 +1,4 @@
-//! Espaço único de identificadores de handle — `system32/ntos/ob/handle-ids.js`.
+//! Espaço único de identificadores de handle.
 //!
 //! Handles de kernel e de usuário compartilham o espaço; registro, arquivos e
 //! namespace mantêm seus próprios descritores sem reutilizar o identificador.

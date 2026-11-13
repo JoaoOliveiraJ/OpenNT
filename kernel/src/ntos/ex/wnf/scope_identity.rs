@@ -1,4 +1,4 @@
-//! Identidade corrente de um escopo WNF — `system32/ntos/ex/wnf-scope-identity.js`.
+//! Identidade corrente de um escopo WNF.
 //!
 //! Não cria instâncias nem nomes: consulta EPROCESS, KTHREAD e tokens dos
 //! provedores reais; a resolução posterior usa os bytes como chave.

@@ -1,7 +1,7 @@
 //! Pacotes de conclusão e transferência de arquivos para o convidado.
 //!
-//! - `completion_packets` — `system32/ntos/io/mini-completion-packets.js`
-//! - `backed_file_transfer` — `system32/ntos/io/backed-file-transfer.js`
+//! - `completion_packets` — mini-pacotes de conclusão
+//! - `backed_file_transfer` — transferência de arquivos com armazenamento
 
 /// Pacotes de conclusão com armazenamento real; o cache limitado conserva
 /// blocos livres e devolve a quota ao dono antes de permitir o reuso.

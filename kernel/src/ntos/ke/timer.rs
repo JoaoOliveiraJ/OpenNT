@@ -1,4 +1,4 @@
-//! Temporizadores KTIMER pelo relógio TSC — `system32/ntos/ke/timer.js`.
+//! Temporizadores KTIMER pelo relógio TSC.
 //!
 //! A fila conserva os endereços virtuais do timer e da DPC. Prazos em
 //! unidades de 100 ns: relativos contra o uptime, absolutos contra a hora do

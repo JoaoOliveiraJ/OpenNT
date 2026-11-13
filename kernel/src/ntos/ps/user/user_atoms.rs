@@ -1,4 +1,4 @@
-//! Átomos USER da sessão — `system32/ntos/ps/user/user-atoms.js`.
+//! Átomos USER da sessão.
 //!
 //! Compartilhados por mensagens registradas, nomes de formato da área de
 //! transferência e classes de janela; separados das tabelas de átomos NT.

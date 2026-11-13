@@ -1,4 +1,4 @@
-//! EX_RUNDOWN_REF — `system32/ntos/ex/rundown.js`.
+//! EX_RUNDOWN_REF.
 //!
 //! Referências deslocadas um bit, ou um ponteiro de espera marcado no bit
 //! zero. O descritor por CPU ocupa 0x18 bytes (RunRefs, PoolToFree,

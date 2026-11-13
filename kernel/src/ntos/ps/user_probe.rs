@@ -1,5 +1,4 @@
-//! Sondagem de buffers de usuário — parte de `system32/ntos/ps/user/state.js`
-//! (ProbeForRead/ProbeForWrite).
+//! Sondagem de buffers de usuário (ProbeForRead/ProbeForWrite).
 //!
 //! O kernel só escreve em buffer de usuário mapeado; se não estiver, a
 //! resposta real do NT é STATUS_ACCESS_VIOLATION (nunca uma exceção no

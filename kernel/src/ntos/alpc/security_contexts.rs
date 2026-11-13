@@ -1,5 +1,4 @@
-//! Identidade de cliente e contextos de segurança ALPC —
-//! `system32/ntos/alpc/{client-security,security-contexts}.js`.
+//! Identidade de cliente e contextos de segurança ALPC.
 //!
 //! Rastreamento dinâmico retém o token escolhido; estático cria uma cópia
 //! independente. Contextos são recursos da porta, retidos também pelas

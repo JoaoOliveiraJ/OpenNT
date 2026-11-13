@@ -1,4 +1,4 @@
-//! Driver de barramento PCI (estilo pci.sys) — `system32/drivers/bus/pci.js`.
+//! Driver de barramento PCI (estilo pci.sys).
 //!
 //! Enumera o hardware pelo espaço de configuração (CF8/CFC), lê
 //! vendor/device/classe/BARs/IRQ de cada função e cria PDOs

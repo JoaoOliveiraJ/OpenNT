@@ -1,4 +1,4 @@
-//! Criação nativa de seções — `system32/ntos/mm/create-section.js`.
+//! Criação nativa de seções.
 //!
 //! A validação nunca publica um handle: o handle só aparece depois de o
 //! backing, o nome e a posse do objeto existirem. MmCreateSection usa o

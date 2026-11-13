@@ -1,4 +1,4 @@
-//! Telemetria de RtlCapabilityCheck — `system32/ntos/se/capability-telemetry.js`.
+//! Telemetria de RtlCapabilityCheck.
 //!
 //! O provedor ETW só entrega o evento quando uma sessão real o habilitou; o
 //! relógio é o QPC/TSC do boot. Um evento a cada 100 consultas.

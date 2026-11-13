@@ -1,4 +1,4 @@
-//! RtlCapabilityCheck — `system32/ntos/se/capability-check.js`.
+//! RtlCapabilityCheck.
 //!
 //! Identifica a capability, avalia token e políticas e conserva o NTSTATUS
 //! da primeira operação que falhar.

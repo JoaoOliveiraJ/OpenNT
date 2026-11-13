@@ -1,4 +1,4 @@
-//! Chamadas numeradas dos programas do OpenNT — `system32/ntos/ex/syscalls.js`.
+//! Chamadas numeradas dos programas do OpenNT.
 //!
 //! A tabela encaminha console, teclado, memória e arquivos aos respectivos
 //! proprietários; seus números são internos ao runtime. Argumentos e

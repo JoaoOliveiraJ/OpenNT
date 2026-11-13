@@ -1,4 +1,4 @@
-//! Ponto de entrada interno da atualização WNF — `system32/ntos/ex/wnf-update.js`.
+//! Ponto de entrada interno da atualização WNF.
 //!
 //! Consulta e escrita pertencem à única instância do serviço WNF.
 

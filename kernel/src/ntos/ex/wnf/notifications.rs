@@ -1,4 +1,4 @@
-//! Entrega WNF — `system32/ntos/ex/wnf-notifications.js`.
+//! Entrega WNF.
 //!
 //! A fila de cada processo conserva máscaras pendentes e o estado de
 //! entrega; callbacks de kernel usam o work item real e eventos de usuário

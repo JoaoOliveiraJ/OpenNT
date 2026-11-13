@@ -1,4 +1,4 @@
-//! Referência de processo por handle — `system32/ntos/ob/process-reference.js`.
+//! Referência de processo por handle.
 //!
 //! QUERY_INFORMATION também satisfaz QUERY_LIMITED_INFORMATION nas tabelas
 //! criadas pelos provedores anteriores; os demais direitos são distintos.

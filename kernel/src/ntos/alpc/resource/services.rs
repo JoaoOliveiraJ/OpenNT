@@ -1,6 +1,6 @@
-//! Serviços ALPC de recursos e de controle da porta —
-//! `system32/ntos/alpc/{create,delete}-{security-context,resource-reserve,
-//! port-section,section-view}.js`, `disconnect-port.js` e `set-information.js`.
+//! Serviços ALPC de recursos e de controle da porta: criar e apagar contexto
+//! de segurança, reserva de recurso, seção e visão da porta; desconectar a porta
+//! e mudar a sua informação.
 //!
 //! Cada serviço referencia a porta pela tabela dona (acesso 1), entra em
 //! região crítica e devolve o NTSTATUS do provedor.

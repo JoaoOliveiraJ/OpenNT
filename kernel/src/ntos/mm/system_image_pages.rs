@@ -1,4 +1,4 @@
-//! Backing compartilhado de seções de imagem — `system32/ntos/mm/system-image-pages.js`.
+//! Backing compartilhado de seções de imagem.
 //!
 //! Copia o layout virtual do PE para o espaço global, sem executar entry
 //! point, resolver imports ou aplicar relocações. A control area é

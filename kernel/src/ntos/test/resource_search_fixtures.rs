@@ -1,4 +1,4 @@
-//! Fixtures da pesquisa de recursos — `system32/ntos/test/resource-search-fixtures.js`.
+//! Fixtures da pesquisa de recursos.
 //!
 //! Dados próprios: status e saídas vêm das instruções originais, não da
 //! implementação. Gerado a partir do arquivo original.

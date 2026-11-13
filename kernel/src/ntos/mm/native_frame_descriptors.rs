@@ -1,5 +1,4 @@
-//! Descritores físicos no layout MMPFN de 48 bytes do NT —
-//! `system32/ntos/mm/native-frame-descriptors.js`.
+//! Descritores físicos no layout MMPFN de 48 bytes do NT.
 //!
 //! O bitmap do PFN decide a propriedade; estes bytes acompanham suas
 //! transições e as referências das tabelas que a CPU realmente usa.

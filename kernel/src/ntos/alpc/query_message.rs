@@ -1,4 +1,4 @@
-//! Nt/ZwAlpcQueryInformationMessage — `system32/ntos/alpc/query-message.js`.
+//! Nt/ZwAlpcQueryInformationMessage.
 //!
 //! Captura, resolução e consulta compartilham os objetos do transporte;
 //! cada classe conserva sua ordem de escrita.

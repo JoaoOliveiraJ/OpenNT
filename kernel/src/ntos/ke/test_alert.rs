@@ -1,4 +1,4 @@
-//! KeTestAlertThread — `system32/ntos/ke/test-alert.js`.
+//! KeTestAlertThread.
 //!
 //! Consulta o estado de alerta da thread publicada na PCR e atualiza seus
 //! flags sob KTHREAD.ThreadLock.

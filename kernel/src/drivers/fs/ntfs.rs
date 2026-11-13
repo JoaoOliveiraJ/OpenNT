@@ -1,4 +1,4 @@
-//! Driver NTFS — `system32/ntos/fs/ntfs.js`.
+//! Driver NTFS.
 //!
 //! Boot sector, MFT com fixup (USA), atributos residentes e não residentes
 //! (runlists com deltas com sinal), $FILE_NAME e diretórios B-tree com

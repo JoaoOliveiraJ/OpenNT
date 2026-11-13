@@ -1,4 +1,4 @@
-//! Associações de espera e fábricas de workers — `system32/ntos/ob/work-objects.js`.
+//! Associações de espera e fábricas de workers.
 //!
 //! Corpos privados com retenção compartilhada pelos handles. O pacote de
 //! espera ocupa 0x50 bytes: refs +0, handles +8, fechado +0xC, fase +0x10

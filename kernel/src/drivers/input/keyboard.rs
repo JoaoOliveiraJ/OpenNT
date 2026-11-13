@@ -1,4 +1,4 @@
-//! Driver de teclado PS/2 — `system32/drivers/input/keyboard.js`.
+//! Driver de teclado PS/2.
 //!
 //! Lê a porta 0x60 quando 0x64 sinaliza dado. Scancodes do set 1 -> ASCII.
 //! O teclado do sistema é o i8042prt.sys + kbdclass.sys da Microsoft (veja

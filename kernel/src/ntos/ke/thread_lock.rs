@@ -1,4 +1,4 @@
-//! KTHREAD.ThreadLock — `system32/ntos/ke/thread-lock.js`.
+//! KTHREAD.ThreadLock.
 //!
 //! Compartilhado pelas consultas de alerta e pelas filas de APC.
 

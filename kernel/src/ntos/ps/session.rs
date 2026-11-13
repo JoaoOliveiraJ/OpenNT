@@ -1,4 +1,4 @@
-//! PsGetProcessSessionId — `system32/ntos/ps/session.js` e `debug-state.js`.
+//! PsGetProcessSessionId.
 
 use super::process;
 use crate::ntos::mm::guest_memory as guest;

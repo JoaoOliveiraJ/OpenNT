@@ -1,4 +1,4 @@
-//! SECURITY_DESCRIPTOR absoluto ou relativo — `system32/ntos/se/descriptor.js`.
+//! SECURITY_DESCRIPTOR absoluto ou relativo.
 //!
 //! Leitura, validação, conversão e captura (cópia self-relative na arena do
 //! convidado); componentes e entradas de ACL são acessados na memória do

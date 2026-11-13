@@ -1,4 +1,4 @@
-//! Driver de disco ATA (LBA28) — `system32/drivers/storage/ata-pio.js`.
+//! Driver de disco ATA (LBA28).
 //!
 //! Fala com o controlador IDE primário pelas portas 0x1F0-0x1F7. Leituras e
 //! escritas usam DMA de bus master (BMIDE do PIIX3) para um buffer físico de

@@ -1,4 +1,4 @@
-//! Estado de despacho de uma CPU — `system32/ntos/ke/thread-dispatch.js`.
+//! Estado de despacho de uma CPU.
 //!
 //! Filas nativas de 32 prioridades na KPRCB, contagem de ciclos próprios e
 //! entrega de contextos. As filas não possuem a ETHREAD: o runtime dono a

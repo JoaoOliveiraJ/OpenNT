@@ -1,4 +1,4 @@
-//! Ambiente de firmware — `system32/ntos/hal/firmware-environment.js`.
+//! Ambiente de firmware.
 //!
 //! As capacidades de firmware vêm do loader que realmente iniciou o sistema:
 //! o handoff BIOS do stage2 não tem serviços de runtime EFI nem armazém de

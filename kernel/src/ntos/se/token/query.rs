@@ -1,4 +1,4 @@
-//! NtQueryInformationToken — `system32/ntos/se/query-token.js`.
+//! NtQueryInformationToken.
 //!
 //! Contrato observado: TokenStatistics (classe 10), pedido pelo MSRPC
 //! original, também pela variante de syscall de usuário (`queryUser`).

@@ -1,4 +1,4 @@
-//! RtlQueryPackageClaims do kernel — `system32/ntos/se/package-claims.js`.
+//! RtlQueryPackageClaims do kernel.
 //!
 //! Recebe o corpo de um token, não um handle; nomes, claims e bits de
 //! presença vêm só dos atributos de segurança dele.

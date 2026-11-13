@@ -1,4 +1,4 @@
-//! Anexação de processo com escopo para callbacks — `system32/ntos/ps/process-context.js`.
+//! Anexação de processo com escopo para callbacks.
 //!
 //! O Mm compartilha um CR3: troca-se o estado real de APC e isola-se a fila
 //! pendente, preservando o KPROCESS/CID dono e o ETHREAD.Silo. Não é um

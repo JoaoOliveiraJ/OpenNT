@@ -1,4 +1,4 @@
-//! ZwDuplicateToken — `system32/ntos/se/duplicate-token.js`.
+//! ZwDuplicateToken.
 //!
 //! O serviço Nt de UserMode ainda exige a política de redução de direitos de
 //! RtlIsSandboxedToken antes de ser exposto (como no original).

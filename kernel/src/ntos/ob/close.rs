@@ -1,4 +1,4 @@
-//! NtClose / ZwClose — `system32/ntos/ob/close.js`.
+//! NtClose / ZwClose.
 //!
 //! Libera o handle pelo subsistema dono do objeto. Classificação, processo
 //! dono e proteção contra fechamento são verificados antes da liberação.

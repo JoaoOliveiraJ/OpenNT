@@ -1,4 +1,4 @@
-//! Um FILE_OBJECT por descrição aberta — `system32/ntos/ps/user/file-objects.js`.
+//! Um FILE_OBJECT por descrição aberta.
 //!
 //! Aliases de usuário, aberturas nativas por ponteiro e referências de seção
 //! retêm o mesmo corpo e o mesmo backing. A posição do arquivo vive no

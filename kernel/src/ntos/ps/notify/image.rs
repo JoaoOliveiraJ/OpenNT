@@ -1,4 +1,4 @@
-//! PsSetLoadImageNotifyRoutine — `system32/ntos/ps/image-notify.js`.
+//! PsSetLoadImageNotifyRoutine.
 //!
 //! 64 slots de rotinas nativas; cada registro ocupa um bloco de pool de 24
 //! bytes, liberado quando a remoção encontra o registro sem execuções.

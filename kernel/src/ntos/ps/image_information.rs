@@ -1,4 +1,4 @@
-//! ProcessImageInformation (classe 37) — `system32/ntos/ps/image-information.js`.
+//! ProcessImageInformation (classe 37).
 //!
 //! Consulta a seção que pertence ao processo referenciado, com o mesmo
 //! rundown e a mesma ordem do kernel NT. O SECTION_IMAGE_INFORMATION

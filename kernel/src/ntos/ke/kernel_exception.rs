@@ -1,4 +1,4 @@
-//! Despacho de primeira chance de traps reais do anel 0 — `system32/ntos/ke/kernel-exception.js`.
+//! Despacho de primeira chance de traps reais do anel 0.
 //!
 //! O provedor materializa EXCEPTION_RECORD e CONTEXT; filtros SEH podem
 //! pedir continuação ou desenrolar a pilha.

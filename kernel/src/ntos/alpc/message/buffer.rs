@@ -1,4 +1,4 @@
-//! Captura e entrega de buffers ALPC x64 — `system32/ntos/alpc/message-buffer.js`.
+//! Captura e entrega de buffers ALPC x64.
 //!
 //! Compartilhadas pelos caminhos Nt e Zw. A capacidade declarada não é a
 //! extensão sondada: só os bytes efetivos são acessados.

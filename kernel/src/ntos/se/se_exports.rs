@@ -1,4 +1,4 @@
-//! Tabela SE_EXPORTS — `system32/ntos/se/exports.js`.
+//! Tabela SE_EXPORTS.
 //!
 //! Corresponde ao kernel 10.0.19041.6456, na ordem da inicialização nativa.
 //! LUIDs de privilégios e SIDs identificam recursos; publicar a tabela não

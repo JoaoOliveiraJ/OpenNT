@@ -1,4 +1,4 @@
-//! Acessos protegidos a VAs — `system32/ntos/rtl/resource-memory.js`.
+//! Acessos protegidos a VAs.
 //!
 //! Cada acesso confirma a proteção efetiva da página e deixa o provedor real
 //! resolver paginação/COW antes de tocar os bytes. A falha vira

@@ -1,4 +1,4 @@
-//! EX_SPIN_LOCK — `system32/ntos/ex/spin-lock.js`.
+//! EX_SPIN_LOCK.
 //!
 //! A palavra nativa de 32 bits do chamador: o bit 31 reserva o escritor, o
 //! bit 30 marca espera por leitores e os bits 0 a 29 contam leitores. Não há

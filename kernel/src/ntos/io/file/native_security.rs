@@ -1,4 +1,4 @@
-//! QuerySecurity dos objetos de I/O — `system32/ntos/io/query-native-file-security.js`.
+//! QuerySecurity dos objetos de I/O.
 //!
 //! Conserva o descritor real do dispositivo ou encaminha a consulta ao
 //! driver por IRP_MJ_QUERY_SECURITY (neither I/O).

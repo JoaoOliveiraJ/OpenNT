@@ -1,4 +1,4 @@
-//! A página KUSER_SHARED_DATA — `system32/ntos/mm/shared-user-data.js`.
+//! A página KUSER_SHARED_DATA.
 //!
 //! O Windows mapeia 0xFFFFF78000000000 em todo espaço de endereço; o kernel
 //! atualiza SharedSystemTime (+0x14) e TickCount (+0x320). Drivers do WDK

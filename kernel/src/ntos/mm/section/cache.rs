@@ -1,4 +1,4 @@
-//! Tipo de cache dos PFNs de seção — `system32/ntos/mm/section-cache.js`.
+//! Tipo de cache dos PFNs de seção.
 //!
 //! Todo alias de um PFN de seção usa o mesmo tipo PAT, inclusive o alias de
 //! identidade usado para zerar e para I/O de arquivo. O mapeamento antigo

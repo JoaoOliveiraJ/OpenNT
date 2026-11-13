@@ -1,5 +1,4 @@
-//! Empacota o kernel ELF ligado como PE32+ de base fixa — transcrição de
-//! `buildKernelPe` em `tools/kernel-pe.mjs`.
+//! Empacota o kernel ELF ligado como PE32+ de base fixa.
 //!
 //! Cada seção alocada mantém endereço e bytes; os offsets do arquivo são
 //! iguais às RVAs para o stage2 carregar a imagem linearmente. A seção

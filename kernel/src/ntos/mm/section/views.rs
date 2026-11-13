@@ -1,4 +1,4 @@
-//! Posse de vistas de seção por processo — `system32/ntos/mm/section-views.js`.
+//! Posse de vistas de seção por processo.
 //!
 //! O bootstrap ainda compartilha o CR3: a posse é rastreada, mas espaços de
 //! endereçamento independentes não são declarados. Conflitos de VA físicos

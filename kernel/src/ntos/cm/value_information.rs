@@ -1,4 +1,4 @@
-//! Classes KEY_VALUE_* — `system32/ntos/cm/value-information.js`.
+//! Classes KEY_VALUE_*.
 //!
 //! Preserva cabeçalhos, alinhamento dos dados e os retornos distintos para
 //! buffer insuficiente e resultado truncado.

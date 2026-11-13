@@ -1,4 +1,4 @@
-//! Associação volume ↔ dispositivo de armazenamento — `system32/ntos/io/volume-parameters.js`.
+//! Associação volume ↔ dispositivo de armazenamento.
 //!
 //! O IoVpbLock protege a associação do volume de sistema de arquivos com o
 //! dispositivo de armazenamento, lida das estruturas nativas reais; nenhum

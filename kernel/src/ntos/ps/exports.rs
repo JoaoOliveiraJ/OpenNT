@@ -1,4 +1,4 @@
-//! Exports Ps* — `system32/win32/ntoskrnl/ps.js`.
+//! Exports Ps*.
 //!
 //! Threads de sistema sobre o escalonador cooperativo, identificadores do
 //! processo e da thread correntes, notificações de criação de processo,
@@ -183,7 +183,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod image_notify {
-    //! Notificações de carga de imagem — `system32/win32/ntoskrnl/image-notify.js`.
+    //! Notificações de carga de imagem.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -206,7 +206,7 @@ pub mod image_notify {
 }
 
 pub mod lookup_thread {
-    //! PsLookupThreadByThreadId — `system32/win32/ntoskrnl/lookup-thread.js`.
+    //! PsLookupThreadByThreadId.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -225,7 +225,7 @@ pub mod lookup_thread {
 }
 
 pub mod previous_mode {
-    //! PsGetCurrentThreadPreviousMode — `system32/win32/ntoskrnl/previous-mode.js`.
+    //! PsGetCurrentThreadPreviousMode.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::ps::previous_mode;
@@ -239,7 +239,7 @@ pub mod previous_mode {
 }
 
 pub mod process_debug {
-    //! PsGetProcessDebugPort — `system32/win32/ntoskrnl/process-debug.js`.
+    //! PsGetProcessDebugPort.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -258,7 +258,7 @@ pub mod process_debug {
 }
 
 pub mod process_exit {
-    //! PsGetProcessExitStatus — `system32/win32/ntoskrnl/process-exit.js`.
+    //! PsGetProcessExitStatus.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -277,7 +277,7 @@ pub mod process_exit {
 }
 
 pub mod process_exit_called {
-    //! PsGetProcessExitProcessCalled — `system32/win32/ntoskrnl/process-exit-called.js`.
+    //! PsGetProcessExitProcessCalled.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -296,7 +296,7 @@ pub mod process_exit_called {
 }
 
 pub mod process_image {
-    //! PsReferenceProcessFilePointer/SeLocateProcessImageName — `system32/win32/ntoskrnl/process-image.js`.
+    //! PsReferenceProcessFilePointer/SeLocateProcessImageName.
     //!
     //! Os NTSTATUS de erro voltam com sinal estendido.
 
@@ -321,7 +321,7 @@ pub mod process_image {
 }
 
 pub mod process_image_name {
-    //! PsGetProcessImageFileName — `system32/win32/ntoskrnl/process-image-name.js`.
+    //! PsGetProcessImageFileName.
     //!
     //! Devolve o endereço do campo ImageFileName do EPROCESS.
 
@@ -342,7 +342,7 @@ pub mod process_image_name {
 }
 
 pub mod process_notify_exports {
-    //! PsSetCreateProcessNotifyRoutineEx — `system32/win32/ntoskrnl/process-notify.js`.
+    //! PsSetCreateProcessNotifyRoutineEx.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -361,7 +361,7 @@ pub mod process_notify_exports {
 }
 
 pub mod process_peb {
-    //! PsGetProcessPeb — `system32/win32/ntoskrnl/process-peb.js`.
+    //! PsGetProcessPeb.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -380,7 +380,7 @@ pub mod process_peb {
 }
 
 pub mod process_query {
-    //! Consultas do EPROCESS — `system32/win32/ntoskrnl/process-query.js`.
+    //! Consultas do EPROCESS.
     //!
     //! Leem a imagem, a proteção e os níveis de assinatura pelo layout da ABI;
     //! uma referência válida mantém o objeto consultável depois da saída.
@@ -419,7 +419,7 @@ pub mod process_query {
 }
 
 pub mod process_session {
-    //! PsGetProcessSessionId — `system32/win32/ntoskrnl/process-session.js`.
+    //! PsGetProcessSessionId.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -438,7 +438,7 @@ pub mod process_session {
 }
 
 pub mod process_win32 {
-    //! PsGetProcessWin32Process — `system32/win32/ntoskrnl/process-win32.js`.
+    //! PsGetProcessWin32Process.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -457,7 +457,7 @@ pub mod process_win32 {
 }
 
 pub mod process_wow64 {
-    //! Consultas WOW64 — `system32/win32/ntoskrnl/process-wow64.js`.
+    //! Consultas WOW64.
     //!
     //! Leem os campos reais do EPROCESS (EWOW64PROCESS) e da thread atual.
 
@@ -482,7 +482,7 @@ pub mod process_wow64 {
 }
 
 pub mod security_tokens {
-    //! Adaptadores nativos de segurança — `system32/win32/ntoskrnl/security-tokens.js`.
+    //! Adaptadores nativos de segurança.
     //!
     //! Usam os tokens e as referências mantidos pelo kernel; o gerenciador de
     //! processos fornece o token primário de cada EPROCESS e o serializador de
@@ -526,7 +526,7 @@ pub mod security_tokens {
 }
 
 pub mod silo_contexts_exports {
-    //! Contextos de silo — `system32/win32/ntoskrnl/silo-contexts.js`.
+    //! Contextos de silo.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -570,7 +570,7 @@ pub mod silo_contexts_exports {
 }
 
 pub mod silo_monitors {
-    //! Monitores de silo — `system32/win32/ntoskrnl/silo-monitors.js`.
+    //! Monitores de silo.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -601,7 +601,7 @@ pub mod silo_monitors {
 }
 
 pub mod silo_query_exports {
-    //! Exports de consulta de silo — `system32/win32/ntoskrnl/silo-query.js`.
+    //! Exports de consulta de silo.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::ps::silo::query as silo_query;
@@ -663,7 +663,7 @@ pub mod silo_query_exports {
 }
 
 pub mod thread_context {
-    //! PsSetContextThread — `win32/ntoskrnl/thread-context.js`.
+    //! PsSetContextThread.
     //!
     //! O export tem corpo x64 próprio (`ps_set_context_thread`): encaminha o
     //! modo de entrada como modo de contexto e chama PspSetContextThreadInternal.
@@ -682,7 +682,7 @@ pub mod thread_context {
 }
 
 pub mod thread_exit {
-    //! PsGetThreadExitStatus — `system32/win32/ntoskrnl/thread-exit.js`.
+    //! PsGetThreadExitStatus.
     //!
     //! Enquanto a proteção de rundown ainda pode ser adquirida, a thread não
     //! terminou: STATUS_PENDING.
@@ -704,7 +704,7 @@ pub mod thread_exit {
 }
 
 pub mod thread_id {
-    //! PsGetThreadId — `system32/win32/ntoskrnl/thread-id.js`.
+    //! PsGetThreadId.
     //!
     //! Consulta o ETHREAD dado, inclusive um objeto retido depois da saída da
     //! thread; não referencia nem substitui o chamador.
@@ -721,7 +721,7 @@ pub mod thread_id {
 }
 
 pub mod thread_notify {
-    //! Notificações de criação de thread — `system32/win32/ntoskrnl/thread-notify.js`.
+    //! Notificações de criação de thread.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -744,7 +744,7 @@ pub mod thread_notify {
 }
 
 pub mod thread_process {
-    //! PsGetThreadProcess/PsGetThreadProcessId — `system32/win32/ntoskrnl/thread-process.js`.
+    //! PsGetThreadProcess/PsGetThreadProcessId.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -767,7 +767,7 @@ pub mod thread_process {
 }
 
 pub mod nt_query_thread {
-    //! NtQueryInformationThread — `system32/win32/ntoskrnl/nt-query-thread.js`.
+    //! NtQueryInformationThread.
     //!
     //! Usa o modo anterior da thread; falha interna interrompe o sistema.
 
@@ -789,7 +789,7 @@ pub mod nt_query_thread {
 }
 
 pub mod query_thread {
-    //! ZwQueryInformationThread — `system32/win32/ntoskrnl/query-thread.js`.
+    //! ZwQueryInformationThread.
     //!
     //! Parâmetros de kernel (modo 0); falha interna interrompe o sistema.
 
@@ -810,7 +810,7 @@ pub mod query_thread {
 }
 
 pub mod set_thread_information {
-    //! ZwSetInformationThread — `system32/win32/ntoskrnl/set-thread-information.js`.
+    //! ZwSetInformationThread.
     //!
     //! Parâmetros de kernel (modo 0); falha interna interrompe o sistema.
 
@@ -831,7 +831,7 @@ pub mod set_thread_information {
 }
 
 pub mod nt_set_thread_information {
-    //! NtSetInformationThread — `system32/win32/ntoskrnl/nt-set-thread-information.js`.
+    //! NtSetInformationThread.
     //!
     //! Usa o modo anterior da thread; falha interna interrompe o sistema.
 

@@ -1,4 +1,4 @@
-//! Identidade executável do processo — `system32/ntos/ps/process-image.js`.
+//! Identidade executável do processo.
 //!
 //! A seção de imagem mapeada, as referências do OB e o nome de auditoria
 //! pertencem ao processo; a fonte do arquivo é o mesmo fluxo de bytes que o

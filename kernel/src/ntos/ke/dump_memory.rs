@@ -1,4 +1,4 @@
-//! Acesso de captura de dump — `system32/ntos/ke/dump-memory.js`.
+//! Acesso de captura de dump.
 //!
 //! Só páginas já residentes; cópias por página física, sem executar o
 //! chamador nem paginar em IRQL elevado.

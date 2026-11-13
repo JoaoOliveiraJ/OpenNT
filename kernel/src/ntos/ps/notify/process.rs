@@ -1,4 +1,4 @@
-//! PsSetCreateProcessNotifyRoutine(Ex) — `system32/ntos/ps/process-notify.js`.
+//! PsSetCreateProcessNotifyRoutine(Ex).
 //!
 //! Os registros compartilham a tabela nativa de 64 slots. Um slot removido
 //! não recebe nova notificação; seu bloco vive até que toda invocação que o

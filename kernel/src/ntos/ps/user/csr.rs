@@ -1,4 +1,4 @@
-//! Serviço de sessão CSR hospedado no processo System — `system32/ntos/ps/user/csr.js`.
+//! Serviço de sessão CSR hospedado no processo System.
 //!
 //! ABI da ntdll/KERNELBASE x64 do Windows 10 (build 19041): informação de
 //! conexão de 48 bytes e ponteiros de dados do servidor expressos no

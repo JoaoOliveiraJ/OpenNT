@@ -1,4 +1,4 @@
-//! Consultas de licenciamento em ProductOptions — `system32/ntos/ex/license-registry.js`.
+//! Consultas de licenciamento em ProductOptions.
 //!
 //! Os dados pertencem à hive e ao provedor de informações do sistema; este
 //! módulo conserva a ordem das consultas e não cria políticas nem estados de

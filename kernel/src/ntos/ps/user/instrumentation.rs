@@ -1,4 +1,4 @@
-//! ProcessInstrumentationCallback x64 versão 0 — `system32/ntos/ps/user/instrumentation.js`.
+//! ProcessInstrumentationCallback x64 versão 0.
 //!
 //! O retorno de syscall transfere o controle no anel 3, com o PC anterior
 //! em R10 e o resultado original em RAX; o callback cuida da contabilidade

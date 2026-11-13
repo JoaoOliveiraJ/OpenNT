@@ -1,4 +1,4 @@
-//! Estado de segurança da thread (impersonação) — `ntos/se/thread-tokens.js`.
+//! Estado de segurança da thread (impersonação).
 //!
 //! Este módulo faz a atribuição interna; o serviço chamador autoriza a
 //! impersonação antes de pedi-la.

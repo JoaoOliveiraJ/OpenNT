@@ -1,4 +1,4 @@
-//! VirtualAlloc/VirtualFree do kernel — `system32/ntos/mm/virtual-memory.js`.
+//! VirtualAlloc/VirtualFree do kernel.
 //!
 //! Páginas virtuais no espaço reservado (256MB-512MB), cada uma lastreada
 //! por um frame do PFN e mapeada na tabela real, com reuso de faixas livres.

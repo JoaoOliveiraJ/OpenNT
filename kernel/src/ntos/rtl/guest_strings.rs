@@ -1,4 +1,4 @@
-//! Strings do convidado — `system32/win32/guest-strings.js`.
+//! Strings do convidado.
 //!
 //! Layout real do NT (WDK): UNICODE_STRING = { u16 Length @0, u16
 //! MaximumLength @2, u32 pad @4, u64 Buffer @8 }; ANSI_STRING é igual com

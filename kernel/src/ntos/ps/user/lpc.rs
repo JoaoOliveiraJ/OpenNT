@@ -1,4 +1,4 @@
-//! Endpoints LPC hospedados por serviços do kernel — `system32/ntos/ps/user/lpc.js`.
+//! Endpoints LPC hospedados por serviços do kernel.
 //!
 //! Os handles de porta possuem os dois aliases da seção de transferência do
 //! cliente. Os pedidos são copiados antes do despacho, com CLIENT_ID e IDs

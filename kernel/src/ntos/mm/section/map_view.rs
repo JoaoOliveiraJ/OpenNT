@@ -1,4 +1,4 @@
-//! NtMapViewOfSection — `system32/ntos/mm/map-view.js`.
+//! NtMapViewOfSection.
 //!
 //! Captura todos os ponteiros do chamador antes de anexar ao alvo, valida
 //! pelo `map-view-parameters` e recusa (em vez de converter em vista comum)

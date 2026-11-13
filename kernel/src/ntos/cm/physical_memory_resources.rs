@@ -1,4 +1,4 @@
-//! RAM no mapa de recursos — `system32/ntos/cm/physical-memory-resources.js`.
+//! RAM no mapa de recursos.
 //!
 //! Publica a RAM admitida pelo Memory Manager na hive volátil de hardware. A
 //! fonte é a mesma de MmGetPhysicalMemoryRanges: inclui RAM já ocupada pelo

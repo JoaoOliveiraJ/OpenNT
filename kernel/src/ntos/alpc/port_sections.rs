@@ -1,4 +1,4 @@
-//! Seções de porta ALPC — `system32/ntos/alpc/{port-sections,section-regions}.js`.
+//! Seções de porta ALPC.
 //!
 //! Uma tabela por comunicação, distinta da tabela de HANDLEs NT; a
 //! publicação retém a porta dona e um SECTION real do Mm. Cada vista

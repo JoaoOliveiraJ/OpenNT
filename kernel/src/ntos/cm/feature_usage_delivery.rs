@@ -1,4 +1,4 @@
-//! Entrega dos relatos de uso — `system32/ntos/cm/feature-usage-delivery.js`.
+//! Entrega dos relatos de uso.
 //!
 //! Cada estado WNF guarda pares únicos (recurso, tipo de relato); as
 //! atualizações usam o carimbo da consulta.

@@ -1,4 +1,4 @@
-//! Descoberta das tabelas de firmware no boot BIOS — `system32/ntos/hal/acpi.js`.
+//! Descoberta das tabelas de firmware no boot BIOS.
 //!
 //! ACPI 6.6, seção 5.2: RSDP, RSDT/XSDT, cabeçalho SDT e links do FADT.
 //! Checksums e tamanhos são conferidos antes de a HAL/SMP consumir uma tabela.

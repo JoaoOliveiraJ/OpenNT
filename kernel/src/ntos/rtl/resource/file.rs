@@ -1,4 +1,4 @@
-//! Arquivo de recursos (MUI/MUN) — `system32/ntos/rtl/resource-file.js`.
+//! Arquivo de recursos (MUI/MUN).
 //!
 //! Um FILE_OBJECT aberto e uma vista global da SECTION, pelos mesmos
 //! caminhos de ZwCreateFile/ZwCreateSection; as referências vivem enquanto o

@@ -382,7 +382,7 @@ pub mod attach_device_safe {
 }
 
 pub mod attached_device {
-    //! IoGetAttachedDevice — `system32/win32/ntoskrnl/attached-device.js`.
+    //! IoGetAttachedDevice.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -459,7 +459,7 @@ pub mod disk_device {
 }
 
 pub mod enumerate_devices {
-    //! IoEnumerateDeviceObjectList — `system32/win32/ntoskrnl/enumerate-devices.js`.
+    //! IoEnumerateDeviceObjectList.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -492,7 +492,7 @@ pub mod initial_stack {
 }
 
 pub mod lower_device {
-    //! IoGetLowerDeviceObject — `system32/win32/ntoskrnl/lower-device.js`.
+    //! IoGetLowerDeviceObject.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::rtl::KernelError;
@@ -511,7 +511,7 @@ pub mod lower_device {
 }
 
 pub mod set_completion {
-    //! IoSetIoCompletionEx — `win32/ntoskrnl/set-completion.js`: publica na fila
+    //! IoSetIoCompletionEx: publica na fila
     //! real e interrompe usos inválidos de ponteiros de kernel.
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};
@@ -554,7 +554,7 @@ pub mod volume_dos_name {
 }
 
 pub mod create_completion {
-    //! ZwCreateIoCompletion — `win32/ntoskrnl/create-completion.js`: KernelMode,
+    //! ZwCreateIoCompletion: KernelMode,
     //! handles de kernel quando pedidos e a ABI de 64 bits.
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};
@@ -569,7 +569,7 @@ pub mod create_completion {
 }
 
 pub mod remove_completion {
-    //! ZwRemoveIoCompletionEx — `win32/ntoskrnl/remove-completion.js`: entrada
+    //! ZwRemoveIoCompletionEx: entrada
     //! Zw de seis argumentos, com espera cooperativa sem contexto suspenso.
 
     use crate::ntos::init::exports::{signed_status, Call, Group};

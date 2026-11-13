@@ -1,4 +1,4 @@
-//! Tipos do transporte de mensagens ALPC/LPC (de `system32/ntos/ps/user/alpc.js`).
+//! Tipos do transporte de mensagens ALPC/LPC.
 //!
 //! Mensagens enfileiradas na porta, pedidos entregues aos serviços
 //! hospedados no kernel e o contrato desses serviços.

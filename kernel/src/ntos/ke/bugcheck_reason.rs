@@ -1,5 +1,4 @@
-//! Callbacks de motivo de bugcheck — `system32/ntos/ke/bugcheck-reason.js` e o
-//! consumidor de dados secundários `bugcheck-secondary-data.js`.
+//! Callbacks de motivo de bugcheck e o consumidor de dados secundários.
 //!
 //! O chamador possui a memória do registro; o kernel guarda só os vínculos e
 //! nunca a libera. Os dados secundários vão para a serial: não se cria um

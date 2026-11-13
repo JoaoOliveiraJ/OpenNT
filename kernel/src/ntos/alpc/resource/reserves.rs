@@ -1,4 +1,4 @@
-//! Reservas de mensagem ALPC — `system32/ntos/alpc/resource-reserves.js`.
+//! Reservas de mensagem ALPC.
 //!
 //! A reserva tem o slot de mensagem, o armazenamento do PORT_MESSAGE (com
 //! a parte extra cobrada sob demanda) e entra na tabela de recursos com o

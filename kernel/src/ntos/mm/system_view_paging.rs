@@ -1,4 +1,4 @@
-//! Paginação de vistas globais de arquivos — `system32/ntos/mm/system-view-paging.js`.
+//! Paginação de vistas globais de arquivos.
 //!
 //! O arquivo real conserva os bytes antes de devolver os PFNs; o page-in
 //! restaura todos os aliases da control area. Os limites de resolução são

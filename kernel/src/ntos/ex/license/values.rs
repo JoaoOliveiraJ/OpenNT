@@ -1,4 +1,4 @@
-//! Seleção do contexto de licenciamento — `system32/ntos/ex/license-values.js`.
+//! Seleção do contexto de licenciamento.
 //!
 //! A hive é capturada na fase 0; o dono nativo só é criado depois de pool,
 //! threads e objetos (e das seções que recebem a política).

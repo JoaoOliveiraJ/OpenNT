@@ -1,5 +1,4 @@
-//! ACLs de RtlCheckTokenMembershipEx e RtlCheckTokenCapability —
-//! `system32/ntos/se/token-capability-access.js`.
+//! ACLs de RtlCheckTokenMembershipEx e RtlCheckTokenCapability.
 //!
 //! A identidade e as restrições vêm do token real.
 

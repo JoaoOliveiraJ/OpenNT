@@ -1,4 +1,4 @@
-//! RtlCheckRegistryKey — `system32/ntos/cm/check-registry-key.js`.
+//! RtlCheckRegistryKey.
 //!
 //! Consulta a existência pela abertura real do Configuration Manager; os
 //! prefixos, direitos e propriedade seguem o kernel 19041.

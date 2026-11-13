@@ -1,4 +1,4 @@
-//! Tabela de handles por processo — `system32/ntos/ob/process-handles.js`.
+//! Tabela de handles por processo.
 //!
 //! Publica a HANDLE_TABLE em EPROCESS.ObjectTable e controla empréstimos com
 //! rundown. A tabela descreve os handles vivos; os provedores continuam

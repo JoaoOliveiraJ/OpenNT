@@ -1,4 +1,4 @@
-//! Atributos estendidos — `system32/ntos/fs/extended-attributes.js`.
+//! Atributos estendidos.
 //!
 //! FILE_FULL_EA_INFORMATION / FILE_GET_EA_INFORMATION e a ordem de EAs do
 //! NTFS. Bytes >= 0x80 são mantidos, como observado no NTFS; nomes ASCII

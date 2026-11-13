@@ -1,4 +1,4 @@
-//! Diagnóstico opcional de chamada de export — `system32/ntos/ps/user/call-capture.js`.
+//! Diagnóstico opcional de chamada de export.
 //!
 //! Um breakpoint de execução de hardware limitado conserva a função nativa
 //! e o seu retorno: nenhum IAT nem código é alterado.

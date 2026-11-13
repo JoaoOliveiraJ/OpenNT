@@ -1,4 +1,4 @@
-//! Escolha de endereço para vistas de seção — `system32/ntos/mm/section-address.js`.
+//! Escolha de endereço para vistas de seção.
 //!
 //! Exclui as vistas do provedor e os mapeamentos reais da árvore de páginas.
 

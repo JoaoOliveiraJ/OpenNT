@@ -1,4 +1,4 @@
-//! Exportações Zw do ALPC — `win32/ntoskrnl/alpc.js`.
+//! Exportações Zw do ALPC.
 //!
 //! Captura de ponteiros exatos e sem sondagem de UserMode. As chamadas em
 //! threads nativas usam a mesma continuação pelo escalonador de kernel; uma

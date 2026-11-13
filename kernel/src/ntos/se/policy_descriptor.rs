@@ -1,4 +1,4 @@
-//! Descritor da política do objeto — `system32/ntos/se/policy-descriptor.js`.
+//! Descritor da política do objeto.
 //!
 //! Identidades, ACEs, flags e bytes capturados vêm do dono; nada é
 //! inferido do handle.

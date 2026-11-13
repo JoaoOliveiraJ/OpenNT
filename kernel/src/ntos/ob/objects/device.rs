@@ -1,4 +1,4 @@
-//! Corpos DEVICE_OBJECT — `system32/ntos/ob/device-objects.js`.
+//! Corpos DEVICE_OBJECT.
 //!
 //! Extensões DEVOBJ_EXTENSION, referências do Object Manager e pilhas de
 //! anexação sob o lock da base de dispositivos (publicado na PCR).

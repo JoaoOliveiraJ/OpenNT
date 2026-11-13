@@ -1,4 +1,4 @@
-//! SepReferenceTokenByHandle — `system32/ntos/se/token-reference.js`.
+//! SepReferenceTokenByHandle.
 //!
 //! A referência sobrevive ao fechamento do handle; `release` ocorre uma vez.
 

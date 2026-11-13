@@ -1,4 +1,4 @@
-//! Serviço de consulta de licenças — `system32/ntos/ex/license-service.js`.
+//! Serviço de consulta de licenças.
 //!
 //! A ordem de preparação, callbacks e busca vem de
 //! SLQueryLicenseValueInternal; nenhum erro do cache ativa um produto.

@@ -1,4 +1,4 @@
-//! SeQuerySecurityDescriptorInfo — `system32/ntos/se/query-descriptor.js`.
+//! SeQuerySecurityDescriptorInfo.
 //!
 //! Seleciona componentes do descritor do objeto; formato e filtros medidos
 //! no original. `query_info` é a forma do export, com os parâmetros por

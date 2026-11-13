@@ -1,4 +1,4 @@
-//! Consultas ACPI da HAL nativa — `system32/ntos/hal/acpi-native.js`.
+//! Consultas ACPI da HAL nativa.
 //!
 //! Devolvem cópias pertencentes ao boot na arena de convidados. As
 //! assinaturas são DWORDs little-endian do cabeçalho ACPI.

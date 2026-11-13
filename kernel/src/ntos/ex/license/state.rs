@@ -1,4 +1,4 @@
-//! Registro privado de estado do licenciamento — `system32/ntos/ex/license-state.js`.
+//! Registro privado de estado do licenciamento.
 //!
 //! Corpo de 48 bytes e portador no pool do contexto; um identificador opaco
 //! liga o portador ao registro próprio, sem aceitar ponteiros forjados.

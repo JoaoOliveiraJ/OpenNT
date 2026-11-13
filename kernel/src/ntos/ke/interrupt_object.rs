@@ -1,5 +1,4 @@
-//! Objetos KINTERRUPT ligados por vetor ao despacho do runtime —
-//! `system32/ntos/ke/interrupt-object.js`.
+//! Objetos KINTERRUPT ligados por vetor ao despacho do runtime.
 //!
 //! Caminho legado com endereços físicos baixos. A sincronização usa leitura
 //! e escrita separadas da palavra de lock, como no original (não estabelece

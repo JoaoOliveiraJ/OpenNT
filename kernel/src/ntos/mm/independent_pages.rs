@@ -1,4 +1,4 @@
-//! Páginas independentes — `system32/ntos/mm/independent-pages.js`.
+//! Páginas independentes.
 //!
 //! VA contínua, PFNs independentes. Diferente do pool ou de faixas
 //! contíguas, todo frame continua possuído por este mapeamento.

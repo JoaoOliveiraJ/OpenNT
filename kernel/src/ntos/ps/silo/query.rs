@@ -1,4 +1,4 @@
-//! Acessores de silo do NT 19041 — `system32/ntos/ps/silo-query.js`.
+//! Acessores de silo do NT 19041.
 //!
 //! O host é NULL; -3 em ETHREAD.Silo significa herdar do processo dono. A
 //! anexação de espaço de endereço (ApcState.Process) não muda esse dono.

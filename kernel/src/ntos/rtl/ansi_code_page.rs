@@ -1,4 +1,4 @@
-//! Página ANSI instalada — `system32/ntos/rtl/{ansi-code-page,ansi-to-unicode}.js`.
+//! Página ANSI instalada.
 //!
 //! Decodifica a tabela NLS real do volume (c_<página>.nls, como o
 //! RtlInitCodePageTable); ausência ou corrupção é erro real, sem fallback

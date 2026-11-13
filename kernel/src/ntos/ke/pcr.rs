@@ -1,4 +1,4 @@
-//! PCR do processador de boot — `system32/ntos/ke/pcr.js`.
+//! PCR do processador de boot.
 //!
 //! Memória virtual do kernel com páginas físicas próprias, publicada em
 //! IA32_GS_BASE. A PRCB embutida começa em +0x180 e seu CurrentThread

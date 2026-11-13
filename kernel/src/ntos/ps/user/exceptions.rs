@@ -1,4 +1,4 @@
-//! Entrega de primeira chance à NTDLL instalada — `system32/ntos/ps/user/exceptions.js`.
+//! Entrega de primeira chance à NTDLL instalada.
 //!
 //! O despacho VEH/SEH e as rotinas de desenrolamento da própria NTDLL rodam
 //! no anel 3; nenhum tratador específico de aplicação aqui. Layout do frame

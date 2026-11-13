@@ -1,4 +1,4 @@
-//! Io Work Items — `system32/ntos/io/work-items.js`.
+//! Io Work Items.
 //!
 //! IoAllocateWorkItem/IoQueueWorkItem/ExQueueWorkItem: o kernel drena a fila
 //! em PASSIVE_LEVEL (o papel das worker threads do sistema). IO_WORKITEM no
