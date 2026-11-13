@@ -6,10 +6,9 @@
 use alloc::boxed::Box;
 
 use crate::ntos::alpc::message::buffer as message_buffer;
-use crate::ntos::ke::{clock, thread_alert, thread_lock};
+use crate::ntos::ke::{clock, thread_alert};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
-use crate::ntos::inc::types::{Kthread, NtStruct};
 
 const WINDOWS_EPOCH: u64 = 116_444_736_000_000_000;
 
@@ -59,33 +58,7 @@ impl Timeout {
 /// enfileirada e alerta de kernel; sem Alertable, só a pendência já
 /// publicada de APC interrompe em UserMode.
 pub fn interruption(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
-    // SAFETY: thread viva retida por `begin` até o fim da espera.
-    let kthread = unsafe { Kthread::at(thread) };
-    thread_lock::with_lock(thread, || {
-        let kernel_alert = &kthread.alerted[0];
-        let selected = &kthread.alerted[wait_mode as usize];
-        let apc_state = &kthread.apc_state;
-        if alertable {
-            if selected.get() != 0 {
-                selected.set(0);
-                return Some(0x101);
-            }
-            // ApcListHead[UserMode] não vazia.
-            let user_queue = &apc_state.apc_list_head[1];
-            if wait_mode != 0 && user_queue.flink.get() != user_queue.address() {
-                // UserApcPending por CAS no byte (vizinhos preservados).
-                apc_state.set_user_apc_pending(1);
-                return Some(0xC0);
-            }
-            if kernel_alert.get() != 0 {
-                kernel_alert.set(0);
-                return Some(0x101);
-            }
-        } else if wait_mode != 0 && apc_state.user_apc_pending() != 0 {
-            return Some(0xC0);
-        }
-        None
-    })
+    thread_alert::consume(thread, wait_mode, alertable)
 }
 
 /// Operação de transporte esperada: `poll` devolve o status quando pronta;

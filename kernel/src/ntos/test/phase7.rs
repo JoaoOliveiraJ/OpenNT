@@ -4564,6 +4564,238 @@ fn boot_services_hive(assert: Assert) {
     assert(boot_drivers_state::is_initialized(), "bootservices: fase de drivers de boot concluida pela fase 1");
 }
 
+fn usermode_syscalls_exports(assert: Assert) {
+    use core::mem::offset_of;
+    use crate::ntos::inc::types::extra_usermode::{ApcCallbackData, KcontinueArgument};
+    use crate::ntos::ke::{apc, thread_alert};
+    use crate::ntos::mm::kernel_pool;
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::handles::UserProcess;
+    use crate::ntos::ps::user::{memory, threads, user_apc};
+    let Ok(block) = memory::map_user_region(0x4000) else {
+        assert(false, "userapc: memoria de usuario");
+        return;
+    };
+    let rsp = block + 0x3800;
+    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+    // Argumentos de pilha 5.. (ULONG_PTR em [rsp+0x28]...).
+    let stack = |index: u64, value: u64| unsafe { nt::Field::<u64>::at(rsp + 0x28 + (index - 5) * 8) }.set(value);
+    let (dispatcher, routine, routine2, oa, cid, out, timeout, name, getbuf, uctx) = (block + 0x100, block + 0x180, block + 0x1C0, block + 0x500, block + 0x540, block + 0x580, block + 0x5C0, block + 0x5D0, block + 0x1000, block + 0x1800);
+    // Processo e threads de usuário simulados (não de sistema).
+    let previous_thread = process::get_current_thread();
+    let saved = state::with(|state| (state.current_process_id, state.ntdll_exports.clone()));
+    let snapshot = threads::all();
+    let previous_current = threads::current();
+    let Ok(owner) = process::create_process(0x7DD0, "apc.exe", 0, None) else {
+        assert(false, "userapc: processo de usuario");
+        return;
+    };
+    let (Ok(first), Ok(second)) = (process::create_kernel_thread(owner, 0x7DD4, true, 1, None), process::create_kernel_thread(owner, 0x7DD8, true, 1, None)) else {
+        assert(false, "userapc: threads do processo");
+        return;
+    };
+    let thread = threads::UserThread::new(0x7DD4, first, 0, 0);
+    let other = threads::UserThread::new(0x7DD8, second, 0, 0);
+    let live = guest::alloc_aligned(nt::Context::SIZE, 16, true);
+    thread.with(|state| state.context = live);
+    threads::clear();
+    threads::push(thread.clone());
+    threads::push(other.clone());
+    process::set_current_thread(first);
+    threads::set_running(true, Some(thread.clone()));
+    state::with(|state| {
+        state.current_process_id = 0x7DD0;
+        state.ntdll_exports = Some([(alloc::string::String::from("KiUserApcDispatcher"), dispatcher)].into_iter().collect());
+    });
+    let (live_context, target) = unsafe { (nt::Context::at(live), nt::Kthread::at(first)) };
+    let reset = || {
+        threads::initialize_context(live, block + 0x200, block + 0x3000, 0, 0);
+        live_context.rax.set(0xC0);
+    };
+    reset();
+    let handle = threads::thread_handle(&thread, 0x1F_FFFF, 0).unwrap_or(0);
+    let limited = threads::thread_handle(&thread, 0x40, 0).unwrap_or(0);
+    let head = &target.apc_state.apc_list_head[1];
+    let pending = || target.apc_state.user_apc_pending_all.get();
+    // Frame do KiUserApcDispatcher: MACHINE_FRAME alinhado logo abaixo da
+    // pilha; CONTEXT 0x530 bytes antes (CONTEXT + CONTEXT_EX/KCONTINUE_ARGUMENT/APC_CALLBACK_DATA, 0x20 cada).
+    let machine = (block + 0x3000 - nt::MachineFrame::SIZE) & !15;
+    let frame = machine - (nt::Context::SIZE + 0x60);
+    let (apc_frame, continuation, callback, machine_frame) = unsafe { (nt::Context::at(frame), KcontinueArgument::at(frame + 0x4F0), ApcCallbackData::at(frame + 0x510), nt::MachineFrame::at(machine)) };
+    let homes = |context: &nt::Context, values: [u64; 5]| [&context.p1_home, &context.p2_home, &context.p3_home, &context.p4_home, &context.p5_home].iter().zip(values).all(|(field, value)| field.get() == value);
+
+    // NtQueueApcThread*: recusas na ordem do NtQueueApcThreadEx2.
+    stack(5, 0x33);
+    stack(6, 0);
+    stack(7, 0);
+    assert(call("NtQueueApcThreadEx2", handle, 0, 2, routine) == 0xC000_000D && call("NtQueueApcThreadEx2", handle, 4, 1, routine) == 0xC000_000D && call("NtQueueApcThread", limited, routine, 0x11, 0x22) == 0xC000_0022 && call("NtQueueApcThreadEx", handle, 0x7FF0, routine, 0x11) == 0xC000_0008, "userapc: flags, reserva com especial, acesso e reserva inexistente");
+    // APC normal: na fila nativa, sem pendência (thread fora de espera alertável).
+    let queued = call("NtQueueApcThread", handle, routine, 0x11, 0x22);
+    let packet = head.flink.get().wrapping_sub(offset_of!(nt::Kapc, apc_list_entry) as u64);
+    let kapc = unsafe { nt::Kapc::at(packet) };
+    assert(queued == 0 && head.flink.get() != head.address() && kapc.reserved[2].get() == routine && kapc.normal_context.get() == 0x11 && kapc.system_argument1.get() == 0x22 && kapc.system_argument2.get() == 0x33 && kapc.apc_mode.get() == 1 && kapc.inserted.get() == 1 && pending() == 0, "userapc: KAPC de usuario na fila nativa sem pendencia");
+    assert(thread_alert::consume(first, 1, false).is_none() && user_apc::deliver(&thread) == 0 && live_context.rip.get() == block + 0x200, "userapc: sem pendencia nada e entregue nem espera nao alertavel interrompida");
+    // SleepEx(..., TRUE): a espera alertável de UserMode volta com STATUS_USER_APC.
+    unsafe { nt::LargeInteger::at(timeout) }.quad_part.set(-10_000_000);
+    assert(call("NtDelayExecution", 1, timeout, 0, 0) == 0xC0 && pending() & 2 != 0 && thread_alert::consume(first, 1, false) == Some(0xC0), "userapc: espera alertavel interrompida e UserApcPending publicado");
+    // Entrega no retorno ao modo usuário.
+    let delivered = user_apc::deliver(&thread);
+    let context_ok = apc_frame.context_flags.get() == 0x10_001B && apc_frame.rip.get() == block + 0x200 && apc_frame.rsp.get() == block + 0x3000 && apc_frame.rax.get() == 0xC0 && apc_frame.e_flags.get() == 0x202;
+    let tail_ok = continuation.continue_type.get() == 1 && continuation.continue_flags.get() == 3 && machine_frame.rip.get() == block + 0x200 && machine_frame.rsp.get() == block + 0x3000;
+    let redirected = live_context.rsp.get() == frame && live_context.rip.get() == dispatcher && live_context.seg_cs.get() == 0x33;
+    assert(delivered == 0 && homes(apc_frame, [0x11, 0x22, 0x33, routine, 1]) && context_ok && tail_ok && redirected && head.flink.get() == head.address() && pending() == 0 && !kernel_pool::owns(packet), "userapc: frame CONTEXT/KCONTINUE_ARGUMENT/MACHINE_FRAME e KAPC liberada");
+    // APC especial (NtQueueApcThreadEx com 1): entregue sem espera alertável.
+    reset();
+    stack(5, 0x55);
+    stack(6, 0x66);
+    let special = call("NtQueueApcThreadEx", handle, 1, routine2, 0x44);
+    let marked = pending() & 1 != 0;
+    let delivered = user_apc::deliver(&thread);
+    assert(special == 0 && marked && delivered == 0 && homes(apc_frame, [0x44, 0x55, 0x66, routine2, 2]) && continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
+    // APC_CALLBACK_DATA (Ex2 com 0x10000) e NtTestAlert publicando a pendência.
+    reset();
+    stack(5, 0x77);
+    stack(6, 0x88);
+    stack(7, 0x99);
+    let queued_callback = call("NtQueueApcThreadEx2", handle, 0, 0x1_0000, routine);
+    let tested = call("NtTestAlert", 0, 0, 0, 0);
+    let delivered = user_apc::deliver(&thread);
+    let callback_ok = callback.parameter.get() == 0x88 && callback.context_record.get() == frame;
+    assert(queued_callback == 0 && tested == 0 && delivered == 0 && callback_ok && homes(apc_frame, [0x77, frame + 0x510, 0x99, routine, 5]), "userapc: NtTestAlert publica a pendencia e APC_CALLBACK_DATA substitui o argumento 1");
+    // NtTestAlert consome o alerta de usuário.
+    let _ = thread_alert::alert(first, 1);
+    assert(call("NtTestAlert", 0, 0, 0, 0) == 0x101 && target.alerted[1].get() == 0 && call("NtTestAlert", 0, 0, 0, 0) == 0, "userapc: NtTestAlert consome o alerta de usuario");
+
+    // NtContinueEx: alinhamentos, entrega no próprio CONTEXT e continuação.
+    guest::write_bytes(uctx, &[0u8; 0x530]);
+    let (user_context, user_continuation) = unsafe { (nt::Context::at(uctx), KcontinueArgument::at(uctx + 0x4F0)) };
+    user_context.context_flags.set(0x10_0001); // sem INTEGER: a restauração recusa
+    user_continuation.continue_type.set(1);
+    user_continuation.continue_flags.set(3);
+    assert(call("NtContinueEx", uctx, uctx + 0x4F4, 0, 0) == 0x8000_0002 && call("NtContinueEx", uctx + 8, 0, 0, 0) == 0x8000_0002 && call("NtContinue", 0, 1, 0, 0) == 0xC000_0005, "userapc: NtContinueEx alinhamentos e NtContinue sem contexto");
+    stack(5, 0xA3);
+    let self_queued = call("NtQueueApcThread", (-2i64) as u64, routine, 0xA1, 0xA2);
+    let in_place = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
+    let in_place_homes = homes(user_context, [0xA1, 0xA2, 0xA3, routine, 1]);
+    let restored = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
+    assert(self_queued == 0 && in_place == 0 && in_place_homes && head.flink.get() == head.address() && pending() == 0 && restored == 0xC000_000D, "userapc: DELIVER_APC entrega no proprio CONTEXT e sem APC segue para a restauracao");
+
+    // NtGetContextThread/NtSetContextThread na thread corrente (-2).
+    reset();
+    live_context.rax.set(0x1234);
+    live_context.dr0.set(0x1111);
+    guest::write_bytes(getbuf, &[0xEE; nt::Context::SIZE as usize]);
+    let buffer = unsafe { nt::Context::at(getbuf) };
+    let current = (-2i64) as u64;
+    buffer.context_flags.set(0x10_0003);
+    let got = call("NtGetContextThread", current, getbuf, 0, 0);
+    let control_ok = buffer.rip.get() == block + 0x200 && buffer.rsp.get() == block + 0x3000 && buffer.seg_cs.get() == 0x33 && buffer.e_flags.get() == 0x202 && buffer.rax.get() == 0x1234;
+    assert(got == 0 && control_ok && buffer.context_flags.get() == 0x10_0003 && buffer.flt_save.control_word.get() == 0xEEEE, "userctx2: NtGetContextThread copia so os grupos pedidos");
+    buffer.context_flags.set(0x10_0014);
+    let segments = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.seg_ds.get() == 0x2B && buffer.seg_es.get() == 0x2B && buffer.seg_fs.get() == 0x53 && buffer.seg_gs.get() == 0x2B && buffer.dr0.get() == 0;
+    live_context.dr7.set(1);
+    let debug = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.dr0.get() == 0x1111 && buffer.dr7.get() == 1;
+    buffer.context_flags.set(0x4010_0001);
+    let reporting = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.context_flags.get() == 0xD010_0001;
+    // getbuf+8 lê ContextFlags em getbuf+0x38 (SegCs/SegDs...): válido, para chegar ao alinhamento.
+    unsafe { nt::Field::<u32>::at(getbuf + 0x38) }.set(0x10_0001);
+    buffer.context_flags.set(0x10_0040);
+    let refusals = call("NtGetContextThread", current, getbuf, 0, 0) == 0xC000_00BB && call("NtGetContextThread", current, getbuf + 8, 0, 0) == 0x8000_0002 && call("NtGetContextThread", limited, getbuf, 0, 0) == 0xC000_0022;
+    assert(segments && debug && reporting && refusals, "userctx2: segmentos fixos, banco de depuracao ativo, REPORTING|SERVICE_ACTIVE e recusas");
+    buffer.context_flags.set(0x10_0002);
+    buffer.rax.set(0xCAFE);
+    let set = call("NtSetContextThread", current, getbuf, 0, 0);
+    let applied = live_context.rax.get() == 0xCAFE && live_context.rip.get() == block + 0x200;
+    let restrict = unsafe { nt::Eprocess::at(owner) };
+    restrict.set_restrict_set_thread_context(1);
+    let restricted = call("NtSetContextThread", current, getbuf, 0, 0);
+    restrict.set_restrict_set_thread_context(0);
+    assert(set == 0 && applied && restricted == 0xC000_060A && call("NtSetContextThread", limited, getbuf, 0, 0) == 0xC000_0022, "userctx2: NtSetContextThread aplica INTEGER e RestrictSetThreadContext recusa");
+
+    // NtOpenProcess.
+    let (attributes, client) = unsafe { (nt::ObjectAttributes::at(oa), nt::ClientId::at(cid)) };
+    set_object_attributes(attributes, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
+    client.unique_process.set(0x7DD0);
+    client.unique_thread.set(0);
+    let opened_handle = unsafe { nt::Field::<u64>::at(out) };
+    let pointer_of = |handle: u64| state::get_user_handle(handle).and_then(|entry| entry.downcast::<UserProcess>().map(|object| (object.pointer, object.process_id)));
+    let access_of = |handle: u64| state::get_user_handle(handle).map(|entry| (entry.kind(), entry.access()));
+    let opened = call("NtOpenProcess", out, 0x1000, oa, cid);
+    let process_handle = opened_handle.get();
+    let entry_ok = access_of(process_handle) == Some(("process", 0x1000)) && pointer_of(process_handle) == Some((owner, 0x7DD0));
+    let maximum = call("NtOpenProcess", out, 0x0200_0000, oa, cid) == 0 && access_of(opened_handle.get()) == Some(("process", 0x1F_FFFF));
+    let maximum_handle = opened_handle.get();
+    client.unique_process.set(0);
+    client.unique_thread.set(0x7DD8);
+    let by_thread = call("NtOpenProcess", out, 0x1400, oa, cid) == 0 && pointer_of(opened_handle.get()).is_some_and(|(pointer, _)| pointer == owner);
+    let query_handle = opened_handle.get();
+    client.unique_process.set(0x7DD4);
+    let wrong_owner = call("NtOpenProcess", out, 0x1000, oa, cid);
+    client.unique_process.set(0x7FFF_FFF0);
+    client.unique_thread.set(0);
+    let missing = call("NtOpenProcess", out, 0x1000, oa, cid);
+    assert(opened == 0 && entry_ok && maximum && by_thread && wrong_owner == 0xC000_000B && missing == 0xC000_000B, "userproc: NtOpenProcess por PID, MAXIMUM_ALLOWED, pela thread e CLIENT_ID invalidos");
+    client.unique_process.set(0x7DD0);
+    let no_cid = call("NtOpenProcess", out, 0x1000, oa, 0);
+    attributes.object_name.set(name);
+    let named = call("NtOpenProcess", out, 0x1000, oa, cid);
+    attributes.object_name.set(0);
+    assert(no_cid == 0xC000_0030 && named == 0xC000_0030 && call("NtOpenProcess", out, 0x1000, 0, cid) == 0xC000_0005 && call("NtOpenProcess", out, 0x1000, oa + 2, cid) == 0x8000_0002 && call("NtOpenProcess", out, 0x1000, oa, cid + 2) == 0x8000_0002 && call("NtOpenProcess", 0, 0x1000, oa, cid) == 0xC000_0005, "userproc: NtOpenProcess recusas de mistura, nome, alinhamento e sonda");
+    // NtGetNextProcess: começo, para trás/frente a partir do processo e Flags inválido.
+    let list: Vec<u64> = process::list_active_processes().into_iter().map(|entry| entry.address).collect();
+    let pointer = |handle: u64| pointer_of(handle).map(|(pointer, _)| pointer);
+    stack(5, out);
+    let from_start = call("NtGetNextProcess", 0, 0, 0, 0) == 0 && pointer(opened_handle.get()) == list.first().copied();
+    let start_handle = opened_handle.get();
+    let index = list.iter().position(|&address| address == owner).unwrap_or(0);
+    let backward = call("NtGetNextProcess", process_handle, 0, 0, 1);
+    let backward_ok = if index == 0 { backward == 0x8000_001A } else { backward == 0 && pointer(opened_handle.get()) == Some(list[index - 1]) };
+    let backward_handle = opened_handle.get();
+    let forward = call("NtGetNextProcess", process_handle, 0, 0, 0);
+    let forward_ok = if index + 1 == list.len() { forward == 0x8000_001A && opened_handle.get() == 0 } else { forward == 0 && pointer(opened_handle.get()) == Some(list[index + 1]) };
+    let forward_handle = opened_handle.get();
+    let bad_flags = call("NtGetNextProcess", 0, 0, 0, 2);
+    stack(5, 0);
+    assert(from_start && backward_ok && forward_ok && bad_flags == 0xC000_000D && call("NtGetNextProcess", 0, 0, 0, 0) == 0xC000_0005, "userproc: NtGetNextProcess pela PsActiveProcessHead");
+    // NtGetNextThread: ordem de criação dentro do processo.
+    stack(5, 0);
+    stack(6, out);
+    let first_thread = call("NtGetNextThread", query_handle, 0, 0x40, 0) == 0 && threads::resolve(opened_handle.get(), 0x40).is_ok_and(|found| Arc::ptr_eq(&found, &thread));
+    let first_handle = opened_handle.get();
+    let second_thread = call("NtGetNextThread", query_handle, first_handle, 0x0200_0000, 0) == 0 && threads::resolve(opened_handle.get(), 0x1F_FFFF).is_ok_and(|found| Arc::ptr_eq(&found, &other));
+    let second_handle = opened_handle.get();
+    let end = call("NtGetNextThread", query_handle, second_handle, 0x40, 0);
+    let denied = call("NtGetNextThread", process_handle, 0, 0x40, 0);
+    stack(5, 1);
+    let bad_thread_flags = call("NtGetNextThread", query_handle, 0, 0x40, 0);
+    assert(first_thread && second_thread && end == 0x8000_001A && denied == 0xC000_0022 && bad_thread_flags == 0xC000_000D, "userproc: NtGetNextThread na ordem de criacao, fim, acesso ao processo e Flags");
+
+    // Restaura o runtime e libera tudo.
+    for value in [handle, limited, process_handle, maximum_handle, query_handle, start_handle, backward_handle, forward_handle, first_handle, second_handle] {
+        if value != 0 {
+            let _ = call("NtClose", value, 0, 0, 0);
+        }
+    }
+    let _ = apc::rundown(first);
+    threads::set_running(false, previous_current);
+    process::set_current_thread(previous_thread);
+    threads::clear();
+    for saved_thread in snapshot {
+        threads::push(saved_thread);
+    }
+    state::with(|state| {
+        state.current_process_id = saved.0;
+        state.ntdll_exports = saved.1;
+    });
+    guest::free_bytes(live);
+    let _ = process::release_thread(first);
+    let _ = process::release_thread(second);
+    let _ = process::terminate_process(owner, 0);
+    if let Some(region) = memory::find_region(block) {
+        memory::release_private_region(&region);
+    }
+}
+
 pub fn run(assert: Assert) {
     user_handle_table(assert);
     user_memory_helpers(assert);
@@ -4611,6 +4843,7 @@ pub fn run(assert: Assert) {
     user_wnf(assert);
     user_thread_context(assert);
     user_exceptions(assert);
+    usermode_syscalls_exports(assert);
     user_process_information_hooks(assert);
     memory_partition(assert);
     service_dispatcher_channel(assert);

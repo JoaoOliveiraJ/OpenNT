@@ -708,13 +708,14 @@ fn nt_create_partition(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Res
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 22] = [
+    let handlers: [(&'static str, state::SyscallHandler); 23] = [
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),
         ("NtDisplayString", nt_display_string),
         ("NtTerminateProcess", nt_terminate_process),
         ("NtQueryPerformanceCounter", nt_query_performance_counter),
-        ("NtContinue", nt_continue),
+        ("NtContinue", nt_continue_legacy),
+        ("NtContinueEx", nt_continue_ex),
         ("NtWaitForSingleObject", nt_wait_for_single_object),
         ("NtWaitForMultipleObjects", nt_wait_for_multiple_objects),
         ("NtQuerySystemInformation", nt_query_system_information),
@@ -735,4 +736,69 @@ pub fn init() {
     for (name, handler) in handlers {
         state::register_handler(name, handler);
     }
+}
+
+// ---- NtContinueEx (KiContinueEx) ----
+//
+// Medido no ntoskrnl 19045: NtContinue é `movzx edx, dl; jmp NtContinueEx`.
+// KiContinueEx: até 0xFF o segundo argumento é o BOOLEAN TestAlert; acima,
+// um KCONTINUE_ARGUMENT alinhado a 8 e legível (ContinueFlags: TEST_ALERT 1,
+// DELIVER_APC 2; o ContinueType não é conferido). O CONTEXT precisa de
+// alinhamento 16; com TestAlert o primeiro e o último byte são sondados para
+// escrita, senão o primeiro para leitura. TestAlert chama
+// KeTestAlertThread(UserMode); com DELIVER_APC e UserApcPending a próxima APC
+// entra no próprio CONTEXT e o serviço devolve 0 sem restaurá-lo; o resto é
+// o KiContinuePreviousModeUser (`nt_continue`). Uma pendência publicada sem
+// DELIVER_APC sai no retorno ao modo usuário (`user_apc::deliver`).
+
+use super::user_apc;
+use crate::ntos::inc::types::extra_usermode::{KcontinueArgument, KCONTINUE_FLAG_DELIVER_APC, KCONTINUE_FLAG_TEST_ALERT};
+use crate::ntos::ke::test_alert;
+use crate::ntos::ps::process;
+
+/// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
+const CONTINUE_MISALIGNED: u32 = 0x8000_0002;
+const CONTINUE_ACCESS_VIOLATION: u32 = 0xC000_0005;
+
+fn nt_continue_ex(context: u64, argument: u64, _a3: u64, _a4: u64, rsp: u64) -> Result<u32, KernelError> {
+    let (alert, deliver_apc) = if argument > 0xFF {
+        if argument & 7 != 0 {
+            return Ok(CONTINUE_MISALIGNED);
+        }
+        if !probe_user_read(argument, KcontinueArgument::SIZE) {
+            return Ok(CONTINUE_ACCESS_VIOLATION);
+        }
+        let flags = match state::user_struct::<KcontinueArgument>(argument).and_then(|continuation| continuation.continue_flags.probe_get()) {
+            Ok(flags) => flags,
+            Err(error) => return Ok(error.status),
+        };
+        (flags & KCONTINUE_FLAG_TEST_ALERT != 0, flags & KCONTINUE_FLAG_DELIVER_APC != 0)
+    } else {
+        (argument as u8 != 0, false)
+    };
+    if context & 15 != 0 {
+        return Ok(CONTINUE_MISALIGNED);
+    }
+    if alert {
+        if !probe_user_write(context, 1) || !probe_user_write(context + Context::SIZE - 1, 1) {
+            return Ok(CONTINUE_ACCESS_VIOLATION);
+        }
+        test_alert::test(1)?;
+        let thread = process::get_current_thread();
+        if deliver_apc && user_apc::user_apc_pending(thread) {
+            if let Some(status) = user_apc::deliver_in_place(thread, context) {
+                return Ok(status);
+            }
+        }
+    } else if !probe_user_read(context, 1) {
+        return Ok(CONTINUE_ACCESS_VIOLATION);
+    }
+    nt_continue(context, 0, 0, 0, rsp)
+}
+
+/// NtContinue(context, testAlert) = NtContinueEx(context, (BYTE)testAlert).
+/// O NtContinue(ctx, TRUE) do LdrInitializeThunk entrega assim as APCs
+/// enfileiradas antes da thread começar.
+fn nt_continue_legacy(context: u64, alertable: u64, a3: u64, a4: u64, rsp: u64) -> Result<u32, KernelError> {
+    nt_continue_ex(context, alertable & 0xFF, a3, a4, rsp)
 }

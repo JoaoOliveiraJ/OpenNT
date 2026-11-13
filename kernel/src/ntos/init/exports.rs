@@ -392,6 +392,7 @@ pub fn init() {
     crate::ntos::ps::user::call_capture::init();
     crate::ntos::ps::user::io_completion::init();
     crate::ntos::ps::user::threads::init();
+    crate::ntos::ps::user::user_apc::init();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();
     crate::ntos::ps::user::syscalls_core::init();

@@ -380,6 +380,14 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             *CURRENT.lock() = Some(next.clone());
             process::set_current_thread(pointer);
             process::dispatch_thread(pointer);
+            // Retorno ao modo usuário (o KiInitiateUserApc do
+            // KiSystemServiceExit/KiExceptionExit): com UserApcPending ou
+            // SpecialUserApcPending, o frame do KiUserApcDispatcher é
+            // montado antes de retomar o CONTEXT salvo.
+            let undeliverable = super::user_apc::deliver(&next);
+            if undeliverable != 0 {
+                return Ok(undeliverable);
+            }
             let kernel_before = process::thread_kernel_time(pointer);
             let started = clock::uptime_ms();
             thread_dispatch::begin_execution(pointer)?;
@@ -1250,4 +1258,6 @@ pub fn init() {
     state::register_handler("NtWaitForAlertByThreadId", nt_wait_for_alert_by_thread_id);
     state::register_handler("NtAlertThreadByThreadId", nt_alert_thread_by_thread_id);
     state::register_handler("NtSetInformationThread", nt_set_information_thread);
+    state::register_handler("NtGetContextThread", super::set_thread_context::nt_get_context_thread);
+    state::register_handler("NtSetContextThread", super::set_thread_context::nt_set_context_thread);
 }

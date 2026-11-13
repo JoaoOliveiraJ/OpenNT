@@ -475,3 +475,165 @@ pub fn current_attachment(thread: u64) -> Option<usize> {
 pub fn current_attachment_state(thread: u64) -> Option<u64> {
     STATE.lock().attachments.get(&thread).and_then(|frames| frames.last()).map(|saved| saved.state)
 }
+
+// ---- APCs de modo usuário: o lado UserMode do KiDeliverApc ----
+//
+// Medido no KiDeliverApc da 19045 (trecho de modo usuário, até a chamada do
+// KiInitializeUserApc): sob o ThreadLock, UserApcPending é limpo; a APC
+// escolhida é a primeira da fila de usuário que seja especial (KernelRoutine
+// == KeSpecialUserApcKernelRoutine) ou, com UserApcPending publicado, a
+// primeira (o KiInsertQueueApc põe as especiais na cabeça); NormalRoutine,
+// NormalContext, SystemArgument1/2 e AllFlags.CallbackDataContext são
+// copiados; a KAPC sai da fila; SpecialUserApcPending só fica se restar
+// outra especial; em APC_LEVEL a KernelRoutine roda sobre as cópias (e
+// devolve a KAPC ao pool). Com UserApcPending: sem rotina normal,
+// KeTestAlertThread(UserMode) rearma e nada é entregue; senão a
+// continuação leva TEST_ALERT. O 7º argumento do KiInitializeUserApc sai
+// em `UserApc::flags`: bit 0 TEST_ALERT, bit 1 APC especial, bit 2
+// APC_CALLBACK_DATA.
+//
+// A APC especial (QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC) do NT nasce como
+// APC de kernel cuja KernelRoutine (KeSpecialUserApcKernelRoutine) a
+// reenfileira como APC de usuário na própria thread e publica
+// SpecialUserApcPending; no escalonador cooperativo do OpenNT o serviço faz
+// esse segundo estágio direto. A identidade da KernelRoutine continua sendo
+// o que a distingue: um trampolim próprio para a rotina que devolve a KAPC
+// ao pool.
+
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// UserApcPendingAll: SpecialUserApcPending (bit 0) e UserApcPending (bit 1).
+const SPECIAL_USER_APC_PENDING: u8 = 1;
+const USER_APC_PENDING: u8 = 2;
+/// Flags do 7º argumento do KiInitializeUserApc.
+pub const USER_APC_TEST_ALERT: u32 = 1;
+pub const USER_APC_SPECIAL: u32 = 2;
+pub const USER_APC_CALLBACK_DATA: u32 = 4;
+
+static SPECIAL_USER_APC_ROUTINE: AtomicU64 = AtomicU64::new(0);
+
+/// APC de usuário retirada da fila, pronta para o KiInitializeUserApc.
+pub struct UserApc {
+    pub normal_routine: u64,
+    pub normal_context: u64,
+    pub system_argument1: u64,
+    pub system_argument2: u64,
+    pub flags: u32,
+}
+
+/// KeSpecialUserApcKernelRoutine: `mov rax, rotina; jmp rax` para a rotina
+/// de liberação comum das APCs de conclusão (ExFreePoolWithTag(apc, 0)).
+pub fn special_user_apc_routine() -> Result<u64, KernelError> {
+    let current = SPECIAL_USER_APC_ROUTINE.load(Ordering::Acquire);
+    if current != 0 {
+        return Ok(current);
+    }
+    let free = crate::ntos::io::file::request::free_routine()?;
+    if free == 0 {
+        return Ok(0);
+    }
+    let code = guest::alloc_bytes(16);
+    if code == 0 {
+        return Ok(0);
+    }
+    let mut bytes = alloc::vec![0x48, 0xB8];
+    bytes.extend_from_slice(&free.to_le_bytes());
+    bytes.extend_from_slice(&[0xFF, 0xE0]);
+    guest::write_bytes(code, &bytes);
+    match SPECIAL_USER_APC_ROUTINE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(code),
+        Err(existing) => {
+            guest::free_bytes(code);
+            Ok(existing)
+        }
+    }
+}
+
+fn is_special_user(packet: &Kapc, special: u64) -> bool {
+    special != 0 && packet.reserved[KERNEL_ROUTINE].get() == special
+}
+
+/// A primeira especial da fila de usuário; sem ela e com `take_normal`, a
+/// primeira da fila.
+fn select_user(state: &KapcState, special: u64, take_normal: bool) -> Option<u64> {
+    let head = &state.apc_list_head[1];
+    let mut cursor = head.flink.get();
+    let mut first = None;
+    while cursor != head.address() && cursor != 0 {
+        let apc = cursor - offset_of!(Kapc, apc_list_entry) as u64;
+        if is_special_user(apc_at(apc), special) {
+            return Some(apc);
+        }
+        if take_normal && first.is_none() {
+            first = Some(apc);
+        }
+        cursor = list_entry(cursor).flink.get();
+    }
+    first
+}
+
+/// KiDeliverApc(UserMode) da thread corrente: `None` quando nada é entregue.
+pub fn deliver_user(thread: u64) -> Result<Option<UserApc>, KernelError> {
+    if thread != process::get_current_thread() {
+        return Err(KernelError::new("user APC delivered to another thread"));
+    }
+    let special = special_user_apc_routine()?;
+    let environment = &kthread(thread).apc_state;
+    let chosen = thread_lock::with_lock(thread, || {
+        let was = environment.user_apc_pending_all.get();
+        environment.set_user_apc_pending(0);
+        select_user(environment, special, was & USER_APC_PENDING != 0).map(|apc| (apc, was))
+    });
+    let Some((apc, was)) = chosen else { return Ok(None) };
+    let packet = apc_at(apc);
+    let mut flags = (if is_special_user(packet, special) { USER_APC_SPECIAL } else { 0 }) | (if packet.all_flags.get() & 1 != 0 { USER_APC_CALLBACK_DATA } else { 0 });
+    let kernel_routine = packet.reserved[KERNEL_ROUTINE].get();
+    let block = guest::alloc_bytes(core::mem::size_of::<ApcCallFrame>() as u64);
+    if block == 0 {
+        return Err(KernelError::new("APC callback frame allocation failed"));
+    }
+    // SAFETY: bloco recém-alocado do tamanho do frame.
+    let frame = unsafe { ApcCallFrame::at(block) };
+    frame.apc.set(apc);
+    let fields = [&packet.reserved[NORMAL_ROUTINE], &packet.normal_context, &packet.system_argument1, &packet.system_argument2];
+    for (index, field) in fields.iter().enumerate() {
+        frame.copies[index].set(field.get());
+        frame.pointers[index].set(frame.copies[index].address());
+    }
+    if !remove(apc)? {
+        guest::free_bytes(block);
+        return Ok(None);
+    }
+    thread_lock::with_lock(thread, || environment.set_special_user_apc_pending(select_user(environment, special, false).is_some() as u8));
+    let previous = irql::raise_irql(irql::APC_LEVEL);
+    let arguments = [frame.apc.get(), frame.pointers[0].get(), frame.pointers[1].get(), frame.pointers[2].get(), frame.pointers[3].get()];
+    native_call::call(kernel_routine, &arguments);
+    irql::lower_irql(previous as u64);
+    let [normal_routine, normal_context, system_argument1, system_argument2] = [0, 1, 2, 3].map(|index| frame.copies[index].get());
+    guest::free_bytes(block);
+    if was & USER_APC_PENDING != 0 {
+        if normal_routine == 0 {
+            super::test_alert::test(1)?;
+            return Ok(None);
+        }
+        flags |= USER_APC_TEST_ALERT;
+    }
+    Ok(Some(UserApc { normal_routine, normal_context, system_argument1, system_argument2, flags }))
+}
+
+/// KiInsertQueueApc de uma APC especial de usuário: publica
+/// SpecialUserApcPending (CAS no byte; os vizinhos não se perdem).
+pub fn mark_special_user_apc(thread: u64) {
+    kthread(thread).apc_state.set_special_user_apc_pending(SPECIAL_USER_APC_PENDING);
+}
+
+/// UserApcPendingAll publicado (o teste do KiInitiateUserApc no retorno ao
+/// modo usuário) e UserApcPending (o teste do KiContinueEx).
+pub fn user_apc_pending_all(thread: u64) -> u8 {
+    kthread(thread).apc_state.user_apc_pending_all.get()
+}
+
+pub fn user_apc_pending(thread: u64) -> bool {
+    kthread(thread).apc_state.user_apc_pending() != 0
+}

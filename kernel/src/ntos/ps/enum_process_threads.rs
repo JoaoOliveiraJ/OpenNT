@@ -22,8 +22,6 @@ use crate::ntos::inc::types::{Eprocess, Ethread, ListEntry};
 
 const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
-const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 fn dereference(pointer: u64) {
@@ -220,7 +218,7 @@ fn dereference_object(object: u64) -> Result<(), KernelError> {
 /// NTSTATUS.
 pub fn open_next_process(handle: u64, access: u32, attributes: u32, flags: u32, output: u64) -> Result<u32, KernelError> {
     if flags & !1 != 0 {
-        return Ok(STATUS_INVALID_PARAMETER_4);
+        return Ok(STATUS_INVALID_PARAMETER);
     }
     let backward = flags & 1 != 0;
     let process_type = object_types::process_type().pointer;
@@ -255,7 +253,7 @@ pub fn open_next_process(handle: u64, access: u32, attributes: u32, flags: u32, 
 /// devolve o NTSTATUS.
 pub fn open_next_thread(process_handle: u64, thread_handle: u64, access: u32, attributes: u32, flags: u32, output: u64) -> Result<u32, KernelError> {
     if flags != 0 {
-        return Ok(STATUS_INVALID_PARAMETER_5);
+        return Ok(STATUS_INVALID_PARAMETER);
     }
     let target = match reference_handle(process_handle, object_types::process_type().pointer)? {
         Ok(object) => object,

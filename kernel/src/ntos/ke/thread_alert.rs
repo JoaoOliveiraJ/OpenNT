@@ -12,6 +12,7 @@ use crate::ntos::inc::types::{Kthread, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
 
 pub const STATUS_ALERTED: u32 = 0x101;
+pub const STATUS_USER_APC: u32 = 0xC0;
 
 /// KWAIT_STATUS_REGISTER.Alert (bit 7).
 const WAIT_REGISTER_ALERT: u8 = 0x80;
@@ -83,19 +84,35 @@ pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
     Ok(previous)
 }
 
-/// Um alerta de kernel também interrompe espera alertável de usuário.
+/// A ordem de KeWaitForSingleObject: alerta do modo pedido, APC de
+/// usuário enfileirada (publica UserApcPending) e alerta de kernel;
+/// sem Alertable, só a pendência já publicada interrompe uma espera
+/// de UserMode.
 pub fn consume(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
-    if !alertable {
+    if !alertable && wait_mode == 0 {
         return None;
     }
-    let alerted = &kthread(thread).alerted;
+    let target = kthread(thread);
     thread_lock::with_lock(thread, || {
-        let modes: &[usize] = if wait_mode != 0 { &[wait_mode as usize, 0] } else { &[0] };
-        for &mode in modes {
-            if alerted[mode].get() != 0 {
-                alerted[mode].set(0);
-                return Some(STATUS_ALERTED);
-            }
+        let apc_state = &target.apc_state;
+        if !alertable {
+            return (apc_state.user_apc_pending() != 0).then_some(STATUS_USER_APC);
+        }
+        let selected = &target.alerted[wait_mode as usize];
+        if selected.get() != 0 {
+            selected.set(0);
+            return Some(STATUS_ALERTED);
+        }
+        // ApcListHead[UserMode] não vazia: UserApcPending por CAS no byte.
+        let user_queue = &apc_state.apc_list_head[1];
+        if wait_mode != 0 && user_queue.flink.get() != user_queue.address() {
+            apc_state.set_user_apc_pending(1);
+            return Some(STATUS_USER_APC);
+        }
+        let kernel = &target.alerted[0];
+        if kernel.get() != 0 {
+            kernel.set(0);
+            return Some(STATUS_ALERTED);
         }
         None
     })

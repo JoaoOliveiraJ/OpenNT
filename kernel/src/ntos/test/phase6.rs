@@ -2911,10 +2911,11 @@ fn ntoskrnl_affinity_and_processes(assert: Assert) {
     let next = call_export("ZwGetNextProcess", &[0, 0x1000, 0x200, 0, handle]);
     let first_process = guest::read64(handle);
     let bad_flags = call_export("ZwGetNextProcess", &[0, 0x1000, 0x200, 2, handle + 8]);
-    assert(next == Some(0) && first_process != 0 && bad_flags == Some(0xFFFF_FFFF_C000_00F2), "ps: ZwGetNextProcess abre o primeiro processo e recusa Flags invalidos");
+    assert(next == Some(0) && first_process != 0 && bad_flags == Some(0xFFFF_FFFF_C000_000D), "ps: ZwGetNextProcess abre o primeiro processo e recusa Flags invalidos");
     let next_thread = call_export("ZwGetNextThread", &[process_handle, 0, 0x800, 0x200, 0, handle + 8]);
     let next_thread_handle = guest::read64(handle + 8);
-    assert(next_thread == Some(0) && next_thread_handle != 0, "ps: ZwGetNextThread abre a primeira thread do processo");
+    let bad_thread_flags = call_export("ZwGetNextThread", &[process_handle, 0, 0x800, 0x200, 1, block + 0x80]);
+    assert(next_thread == Some(0) && next_thread_handle != 0 && bad_thread_flags == Some(0xFFFF_FFFF_C000_000D), "ps: ZwGetNextThread abre a primeira thread do processo e recusa Flags invalidos");
     for opened_handle in [process_handle, thread_handle, first_process, next_thread_handle] {
         call_export("ZwClose", &[opened_handle]);
     }
