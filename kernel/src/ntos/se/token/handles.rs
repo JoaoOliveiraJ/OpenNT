@@ -181,6 +181,15 @@ pub fn close_native(handle: u64) -> Option<u32> {
     Some(if matches!(object_manager::close(identifier), Ok(true)) { 0 } else { 0xC000_0008 })
 }
 
+/// ZwOpenThreadTokenEx: a entrada de kernel; fora de PASSIVE_LEVEL o
+/// sistema para com IRQL_NOT_LESS_OR_EQUAL (0xC4, 0x2001F).
+pub fn open_thread_from_kernel(handle: u64, desired_access: u32, use_primary_identity: bool, attributes: u32, output: u64) -> Result<u32, KernelError> {
+    if crate::ntos::ke::irql::get_irql() != 0 {
+        crate::ntos::ke::exports::raise_bug_check(0xC4, 0x2_001F, 0, 0, 0);
+    }
+    open_thread(handle, desired_access, use_primary_identity, attributes, output, false)
+}
+
 /// NtOpenThreadTokenEx: `use_primary_identity` escolhe a identidade que
 /// autoriza; CopyOnOpen pode exigir um token privado novo.
 pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool, attributes: u32, output: u64, from_user_mode: bool) -> Result<u32, KernelError> {

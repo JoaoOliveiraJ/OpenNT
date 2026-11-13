@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::ntos::se::model::{sid, Ace, Group, Privilege, SecurityPolicy, Sid};
 use crate::ntos::se::security_attributes::{self, SecurityAttribute};
 use crate::ntos::ob::object_types;
-use crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES;
+use crate::ntos::inc::status::{STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
@@ -75,6 +75,20 @@ pub fn allocate_luid() -> u64 {
     let id = tokens.next_identifier;
     tokens.next_identifier += 1;
     id
+}
+
+/// ZwAllocateLocallyUniqueId: grava em `output` um LUID novo do contador
+/// único. Ponteiro nulo (sem consumir LUID) ou não gravável dá
+/// STATUS_ACCESS_VIOLATION; devolve o NTSTATUS.
+pub fn allocate_luid_into(output: u64) -> u32 {
+    if output == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let luid = allocate_luid();
+    if guest::try_write32(output, luid as u32).and_then(|_| guest::try_write32(output + 4, (luid >> 32) as u32)).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    0
 }
 
 // ---- armazenamento dinâmico (token-storage.js) -----------------------------

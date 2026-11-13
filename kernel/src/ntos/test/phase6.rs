@@ -938,7 +938,8 @@ fn ntoskrnl_security_groups(assert: Assert) {
     use crate::ntos::mm::kernel_data;
     use crate::ntos::ps::process;
     use crate::ntos::se::token::tokens;
-    use crate::{ntos::init::exports, ntos::se::exports as se};
+    use crate::ntos::init::exports;
+    use crate::ntos::se::{audit, subject_context};
     use crate::ntos::mm::pe_loader::ResolvedImport;
     // etw: registro, traits e atividade corrente.
     let guid = guest::alloc_bytes(16);
@@ -993,10 +994,10 @@ fn ntoskrnl_security_groups(assert: Assert) {
     call_export("SeLockSubjectContext", &[context]);
     call_export("SeLockSubjectContext", &[context]);
     call_export("SeUnlockSubjectContext", &[context]);
-    let still_locked = se::subject_context_locked();
+    let still_locked = subject_context::is_locked();
     call_export("SeUnlockSubjectContext", &[context]);
-    assert(still_locked && !se::subject_context_locked(), "se: bloqueio aninhado do subject context");
-    assert(call_export("SeAuditFipsCryptoSelftests", &[1, 2, 0x30]) == Some(0) && se::audit_events().last().is_some_and(|event| event.kind == "FipsCryptoSelftest" && event.detail == "general=1 causing=2 extra=0x30"), "se: auditoria gravada no anel");
+    assert(still_locked && !subject_context::is_locked(), "se: bloqueio aninhado do subject context");
+    assert(call_export("SeAuditFipsCryptoSelftests", &[1, 2, 0x30]) == Some(0) && audit::events().last().is_some_and(|event| event.kind == "FipsCryptoSelftest" && event.detail == "general=1 causing=2 extra=0x30"), "se: auditoria gravada no anel");
     guest::free_bytes(luid);
     guest::free_bytes(context);
 }

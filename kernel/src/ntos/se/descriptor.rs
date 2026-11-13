@@ -1,7 +1,8 @@
 //! SECURITY_DESCRIPTOR absoluto ou relativo — `system32/ntos/se/descriptor.js`.
 //!
-//! Leitura, validação e conversão; componentes e entradas de ACL são
-//! acessados na memória do convidado.
+//! Leitura, validação, conversão e captura (cópia self-relative na arena do
+//! convidado); componentes e entradas de ACL são acessados na memória do
+//! convidado.
 
 use super::{acl, sid};
 use crate::ntos::mm::guest_memory as guest;
@@ -272,4 +273,52 @@ pub fn set_owner(descriptor: u64, owner: u64, defaulted: bool) -> u32 {
     }
     set_control(descriptor, value);
     0
+}
+
+// ---- captura (SeCapture/ReleaseSecurityDescriptor) --------------------------
+
+const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+
+/// SeCaptureSecurityDescriptor: devolve em `*output` uma cópia self-relative
+/// do descritor na arena do convidado (ou NULL se a entrada for NULL),
+/// validando antes de copiar. Devolve o NTSTATUS.
+pub fn capture(input: u64, output: u64) -> u32 {
+    if input == 0 {
+        guest::write64(output, 0);
+        return 0;
+    }
+    if !valid(input) {
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    let length = length(input) as u64;
+    let captured = guest::alloc_bytes(length);
+    if guest::read16(input + 2) & SELF_RELATIVE != 0 {
+        for offset in 0..length {
+            guest::write8(captured + offset, guest::read8(input + offset));
+        }
+    } else {
+        let capacity = guest::alloc_bytes(4);
+        guest::write32(capacity, length as u32);
+        let status = absolute_to_relative(input, captured, capacity);
+        guest::free_bytes(capacity);
+        if status != 0 {
+            guest::free_bytes(captured);
+            return status;
+        }
+    }
+    guest::write64(output, captured);
+    0
+}
+
+/// SeReleaseSecurityDescriptor: libera a cópia feita pela captura.
+pub fn release_captured(captured: u64) {
+    if captured != 0 {
+        guest::free_bytes(captured);
+    }
+}
+
+/// SeConvertStringSecurityDescriptorToSecurityDescriptor: sem parser SDDL
+/// nesta plataforma; devolve STATUS_NOT_IMPLEMENTED de forma honesta.
+pub fn convert_string_to_descriptor() -> u32 {
+    STATUS_NOT_IMPLEMENTED
 }

@@ -1,6 +1,6 @@
-//! Tokens de acesso: o objeto token, duplicação, consulta, abertura,
-//! referência, associação, estatísticas, handles e tokens de thread e
-//! anônimos.
+//! Tokens de acesso: o objeto token, duplicação, consulta (por handle e pelo
+//! kernel), abertura, referência, associação, estatísticas, handles e tokens
+//! de thread e anônimos.
 
 pub mod tokens;
 pub mod statistics;
@@ -13,5 +13,6 @@ pub mod thread;
 pub mod anonymous;
 pub mod duplicate;
 pub mod query;
+pub mod information;
 pub mod open_process;
 pub mod impersonate_anonymous;

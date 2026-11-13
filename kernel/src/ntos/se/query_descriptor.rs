@@ -1,7 +1,8 @@
 //! SeQuerySecurityDescriptorInfo — `system32/ntos/se/query-descriptor.js`.
 //!
 //! Seleciona componentes do descritor do objeto; formato e filtros medidos
-//! no original. Módulo interno, sem export adicional.
+//! no original. `query_info` é a forma do export, com os parâmetros por
+//! ponteiro.
 
 use alloc::vec::Vec;
 
@@ -151,4 +152,18 @@ pub fn query_descriptor(descriptor: Option<&OwnedDescriptor>, information: u32, 
         cursor += align4(bytes.len()) as u64;
     }
     QueryResult { status: 0, needed: selection.needed, information: selection.information }
+}
+
+/// SeQuerySecurityDescriptorInfo(*Information, Out, *Length, *ObjectSd):
+/// lê os parâmetros por ponteiro, consulta o descritor do objeto (filtro de
+/// SACL, LengthNeeded e BUFFER_TOO_SMALL ficam em `query_descriptor`),
+/// publica LengthNeeded em `*Length` e devolve o NTSTATUS.
+pub fn query_info(information_pointer: u64, buffer: u64, length_pointer: u64, object_sd_pointer: u64) -> u32 {
+    let information = guest::read32(information_pointer);
+    let object_sd = guest::read64(object_sd_pointer);
+    let descriptor = read_descriptor(object_sd);
+    let length = guest::read32(length_pointer);
+    let result = query_descriptor(descriptor.as_ref(), information, buffer, length);
+    guest::write32(length_pointer, result.needed as u32);
+    result.status
 }
