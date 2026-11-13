@@ -4,6 +4,7 @@
 //! chamada nativa.
 
 use alloc::collections::{BTreeMap, VecDeque};
+use core::sync::atomic::Ordering;
 
 use super::{irql, pcr, smp};
 use crate::hal::amd64::native_call;
@@ -52,14 +53,15 @@ pub fn initialize_kernel_dpc(dpc: u64, routine: KernelDpcRoutine, context: u64) 
     STATE.lock().kernel_routines.insert(dpc, routine);
 }
 
-/// KeInsertQueueDpc: recusa dupla inserção.
+/// KeInsertQueueDpc: recusa dupla inserção. A marca DpcData é tomada num
+/// LOCK CMPXCHG (o InterlockedCompareExchangePointer do NT), então só um
+/// chamador enfileira o descritor.
 pub fn insert_queue_dpc(dpc: u64, first: u64, second: u64) -> bool {
-    if read_field(dpc, kdpc::DPC_DATA) != 0 {
+    if guest::atomic_u64(dpc + kdpc::DPC_DATA).compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return false;
     }
     write_field(dpc, kdpc::SYSARG1, first);
     write_field(dpc, kdpc::SYSARG2, second);
-    write_field(dpc, kdpc::DPC_DATA, 1);
     STATE.lock().queue.push_back(dpc);
     true
 }

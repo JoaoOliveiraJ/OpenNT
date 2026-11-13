@@ -2,7 +2,10 @@
 //!
 //! A palavra nativa e blocos de espera de 0x40 bytes no convidado. Cada
 //! aguardante possui sua alocação até ser desligado e retomar. Os caminhos
-//! rápidos inline dos drivers observam os mesmos bits e ligações.
+//! rápidos inline dos drivers observam os mesmos bits e ligações; toda
+//! leitura, escrita e troca dessas células é uma operação atômica real.
+
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ke::{dispatcher, irql};
 use crate::rtl::KernelError;
@@ -21,42 +24,30 @@ const PREVIOUS_BLOCK: u64 = 0x28;
 const SHARED_COUNT: u64 = 0x30;
 const BLOCK_FLAGS: u64 = 0x34;
 
+/// LOCK CMPXCHG: devolve o valor anterior.
 fn cas64(pointer: u64, expected: u64, replacement: u64) -> u64 {
-    guest::compare_exchange64(pointer, expected, replacement).unwrap_or_else(|error| panic!("{error}"))
-}
-
-fn cas32(pointer: u64, expected: u32, replacement: u32) -> u32 {
-    guest::compare_exchange32(pointer, expected, replacement).unwrap_or_else(|error| panic!("{error}"))
+    match guest::atomic_u64(pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous,
+    }
 }
 
 fn read_atomic(pointer: u64) -> u64 {
-    cas64(pointer, 0, 0)
+    guest::atomic_u64(pointer).load(Ordering::SeqCst)
 }
 
+/// Repete a troca até `transform` valer sobre o valor observado; devolve o
+/// valor anterior.
 fn update_atomic(pointer: u64, transform: impl Fn(u64) -> u64) -> u64 {
-    let mut expected = read_atomic(pointer);
-    loop {
-        let observed = cas64(pointer, expected, transform(expected));
-        if observed == expected {
-            return expected;
-        }
-        expected = observed;
-    }
+    guest::atomic_u64(pointer).update(Ordering::SeqCst, Ordering::SeqCst, transform)
 }
 
+/// XCHG: publicação com barreira completa.
 fn store_atomic(pointer: u64, value: u64) {
-    update_atomic(pointer, |_| value);
+    guest::atomic_u64(pointer).swap(value, Ordering::SeqCst);
 }
 
 fn update_atomic32(pointer: u64, transform: impl Fn(u32) -> u32) -> u32 {
-    let mut expected = guest::read32(pointer);
-    loop {
-        let observed = cas32(pointer, expected, transform(expected));
-        if observed == expected {
-            return expected;
-        }
-        expected = observed;
-    }
+    guest::atomic_u32(pointer).update(Ordering::SeqCst, Ordering::SeqCst, transform)
 }
 
 fn validate(flags: u32, maximum_irql: u8) -> Result<(), KernelError> {

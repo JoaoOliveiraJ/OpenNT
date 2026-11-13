@@ -1,5 +1,8 @@
 //! IO_REMOVE_LOCK — IoInitializeRemoveLockEx, IoAcquire/ReleaseRemoveLockEx e
-//! IoReleaseRemoveLockAndWaitEx, sobre o bloco comum do wdm.h.
+//! IoReleaseRemoveLockAndWaitEx, sobre o bloco comum do wdm.h. O IoCount
+//! muda por InterlockedIncrement/InterlockedDecrement.
+
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
@@ -21,15 +24,19 @@ pub fn acquire(lock: u64) -> u32 {
     if guest::read8(lock + REMOVE_LOCK_REMOVED) != 0 {
         return 0xC000_0056;
     }
-    guest::write32(lock + REMOVE_LOCK_IO_COUNT, guest::read32(lock + REMOVE_LOCK_IO_COUNT).wrapping_add(1));
+    guest::atomic_u32(lock + REMOVE_LOCK_IO_COUNT).fetch_add(1, Ordering::SeqCst);
     0
+}
+
+/// InterlockedDecrement do IoCount: devolve o valor novo.
+fn decrement(lock: u64) -> u32 {
+    guest::atomic_u32(lock + REMOVE_LOCK_IO_COUNT).fetch_sub(1, Ordering::SeqCst).wrapping_sub(1)
 }
 
 /// IoReleaseRemoveLockEx: a última referência de um lock removido acorda o
 /// IoReleaseRemoveLockAndWaitEx.
 pub fn release(lock: u64) {
-    let remaining = guest::read32(lock + REMOVE_LOCK_IO_COUNT).wrapping_sub(1);
-    guest::write32(lock + REMOVE_LOCK_IO_COUNT, remaining);
+    let remaining = decrement(lock);
     if remaining == 0 && guest::read8(lock + REMOVE_LOCK_REMOVED) != 0 {
         dispatcher::set_event(lock + REMOVE_LOCK_WAIT_EVENT);
     }
@@ -38,8 +45,7 @@ pub fn release(lock: u64) {
 /// Marca removido, solta a referência do chamador e espera as pendentes.
 pub fn release_and_wait(lock: u64) {
     guest::write8(lock + REMOVE_LOCK_REMOVED, 1);
-    let remaining = guest::read32(lock + REMOVE_LOCK_IO_COUNT).wrapping_sub(1);
-    guest::write32(lock + REMOVE_LOCK_IO_COUNT, remaining);
+    let remaining = decrement(lock);
     if remaining as i32 > 0 {
         dispatcher::wait_for_single_object(lock + REMOVE_LOCK_WAIT_EVENT, 0, 0, false);
     }

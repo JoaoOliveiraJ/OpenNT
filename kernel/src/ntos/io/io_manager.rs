@@ -700,8 +700,8 @@ pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelE
         return Ok(Opened { status: request.status, handle: 0, file_object: 0 });
     }
     if top != 0 {
-        let count = top + device_object::REFERENCE_COUNT;
-        guest::write32(count, guest::read32(count) + 1);
+        // InterlockedIncrement do DEVICE_OBJECT.ReferenceCount, como o parse.
+        guest::atomic_u32(top + device_object::REFERENCE_COUNT).fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
     update_device(node, |entry| entry.open_count += 1);
     let handle = {
@@ -724,8 +724,7 @@ pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelE
             request.file_object = file_object;
             let _ = call_driver(&close_path, &mut request);
             if top != 0 {
-                let count = top + device_object::REFERENCE_COUNT;
-                guest::write32(count, guest::read32(count).wrapping_sub(1));
+                guest::atomic_u32(top + device_object::REFERENCE_COUNT).fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
                 device_objects::changed(top);
             }
             update_device(node, |entry| entry.open_count -= 1);

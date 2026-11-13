@@ -55,16 +55,16 @@ fn equal_string(call: &Call) -> Result<u64, KernelError> {
     Ok(strings_counted::equal_ansi(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0) as u64)
 }
 fn interlocked_increment(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::increment(call.arg(1)) as u64)
+    Ok(interlocked::increment(call.arg(1))? as u64)
 }
 fn interlocked_decrement(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::decrement(call.arg(1)) as u64)
+    Ok(interlocked::decrement(call.arg(1))? as u64)
 }
 fn interlocked_exchange(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::exchange(call.arg(1), call.arg(2) as u32) as u64)
+    Ok(interlocked::exchange(call.arg(1), call.arg(2) as u32)? as u64)
 }
 fn interlocked_compare_exchange(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::compare_exchange(call.arg(1), call.arg(2) as u32, call.arg(3) as u32) as u64)
+    Ok(interlocked::compare_exchange(call.arg(1), call.arg(2) as u32, call.arg(3) as u32)? as u64)
 }
 fn memset(call: &Call) -> Result<u64, KernelError> {
     memory::fill(call.arg(1), call.arg(3), call.arg(2) as u8);
@@ -115,10 +115,10 @@ fn append_unicode_to_string(call: &Call) -> Result<u64, KernelError> {
     Ok(signed_status(crate::ntos::rtl::strings_counted::append(call.arg(1), call.arg(2))))
 }
 fn interlocked_push_entry_list(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::push_entry_list(call.arg(1), call.arg(2)))
+    interlocked::push_entry_list(call.arg(1), call.arg(2))
 }
 fn interlocked_pop_entry_list(call: &Call) -> Result<u64, KernelError> {
-    Ok(interlocked::pop_entry_list(call.arg(1)))
+    interlocked::pop_entry_list(call.arg(1))
 }
 fn ex_interlocked_insert_tail_list(call: &Call) -> Result<u64, KernelError> {
     Ok(interlocked::insert_tail_list(call.arg(1), call.arg(2), call.arg(3)))

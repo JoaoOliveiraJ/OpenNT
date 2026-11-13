@@ -3,10 +3,12 @@
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
 //! ponteiro. O corpo privado (64 bytes) guarda referências (+0), handles
 //! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10) e o
-//! número de filhos (+0x20). As contagens vivem só na memória do corpo.
+//! número de filhos (+0x20). As contagens vivem só na memória do corpo e
+//! mudam por operações atômicas, como o PointerCount/HandleCount do NT.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::object_types;
@@ -133,20 +135,24 @@ pub fn set_permanent(pointer: u64, permanent: bool) {
     guest::write32(pointer + 12, permanent as u32);
 }
 
+fn reference_cell(pointer: u64) -> &'static AtomicU64 {
+    guest::atomic_u64(pointer)
+}
+
+fn handle_cell(pointer: u64) -> &'static AtomicU32 {
+    guest::atomic_u32(pointer + 8)
+}
+
 pub fn reference(pointer: u64) -> Result<u64, KernelError> {
     assert_live(pointer)?;
-    let value = refs(pointer) + 1;
-    guest::write64(pointer, value);
-    Ok(value)
+    Ok(reference_cell(pointer).fetch_add(1, Ordering::SeqCst) + 1)
 }
 
 pub fn dereference(pointer: u64) -> Result<u64, KernelError> {
     assert_live(pointer)?;
-    let current = refs(pointer);
-    if current == 0 {
-        return Err(KernelError::new("namespace reference underflow"));
-    }
-    guest::write64(pointer, current - 1);
+    let current = reference_cell(pointer)
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_sub(1))
+        .map_err(|_| KernelError::new("namespace reference underflow"))?;
     collect(pointer);
     Ok(current - 1)
 }
@@ -155,7 +161,7 @@ pub fn dereference(pointer: u64) -> Result<u64, KernelError> {
 pub fn open(pointer: u64) -> Result<(), KernelError> {
     let node = assert_live(pointer)?;
     reference(pointer)?;
-    guest::write32(pointer + 8, guest::read32(pointer + 8) + 1);
+    handle_cell(pointer).fetch_add(1, Ordering::SeqCst);
     update_counts(node);
     Ok(())
 }
@@ -164,11 +170,9 @@ pub fn open(pointer: u64) -> Result<(), KernelError> {
 /// preservando referências por ponteiro.
 pub fn close(pointer: u64) -> Result<(), KernelError> {
     let node = assert_live(pointer)?;
-    let open_handles = guest::read32(pointer + 8);
-    if open_handles == 0 {
-        return Err(KernelError::new("namespace handle underflow"));
-    }
-    guest::write32(pointer + 8, open_handles - 1);
+    let open_handles = handle_cell(pointer)
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |handles| handles.checked_sub(1))
+        .map_err(|_| KernelError::new("namespace handle underflow"))?;
     let attached = BODIES.lock().get(&pointer).is_some_and(|body| body.attached);
     if open_handles == 1 && !permanent(pointer) && attached {
         object_manager::remove_named(node);

@@ -6,6 +6,7 @@
 //! thread migra entre aquisição e liberação.
 
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::hal::cpu;
 use crate::ntos::ke::{dispatcher, irql, pcr, smp};
@@ -19,34 +20,25 @@ fn require_irql(maximum: u8) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// LOCK CMPXCHG: devolve o valor anterior.
 fn cas64(pointer: u64, expected: u64, replacement: u64) -> u64 {
-    guest::compare_exchange64(pointer, expected, replacement).unwrap_or_else(|error| panic!("{error}"))
+    match guest::atomic_u64(pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous,
+    }
 }
 
 fn read_atomic(pointer: u64) -> u64 {
-    cas64(pointer, 0, 0)
+    guest::atomic_u64(pointer).load(Ordering::SeqCst)
 }
 
+/// XCHG: devolve o valor anterior.
 fn exchange(pointer: u64, next: u64) -> u64 {
-    let mut expected = read_atomic(pointer);
-    loop {
-        let observed = cas64(pointer, expected, next);
-        if observed == expected {
-            return expected;
-        }
-        expected = observed;
-    }
+    guest::atomic_u64(pointer).swap(next, Ordering::SeqCst)
 }
 
+/// LOCK XADD: devolve o valor anterior.
 fn add(pointer: u64, delta: u64) -> u64 {
-    let mut expected = read_atomic(pointer);
-    loop {
-        let observed = cas64(pointer, expected, expected.wrapping_add(delta));
-        if observed == expected {
-            return expected;
-        }
-        expected = observed;
-    }
+    guest::atomic_u64(pointer).fetch_add(delta, Ordering::SeqCst)
 }
 
 /// ExAcquireRundownProtectionEx: só enquanto o bit de encerramento está livre.
@@ -80,15 +72,7 @@ pub fn release_ex(pointer: u64, count: u32) -> Result<(), KernelError> {
             if previous == count as u64 {
                 // LOCK BTR do caminho lento: encerra a espera ativa (bit 0 de
                 // +0x20) ou, se já terminou, acorda o evento.
-                let flags = block + 0x20;
-                let mut previous_flags = guest::read32(flags);
-                loop {
-                    let observed = guest::compare_exchange32(flags, previous_flags, previous_flags & !1)?;
-                    if observed == previous_flags {
-                        break;
-                    }
-                    previous_flags = observed;
-                }
+                let previous_flags = guest::try_atomic_u32(block + 0x20)?.fetch_and(!1, Ordering::SeqCst);
                 if previous_flags & 1 == 0 {
                     dispatcher::set_event(block + 8);
                 }

@@ -16,7 +16,10 @@
 //! `int 0x2D` não podem voltar com IRET cego: no anel 3 o processo morre com o
 //! NTSTATUS da exceção (CONTEXT salvo, saída tipo 3, longjmp ao chamador) e o
 //! kernel continua; no anel 0 vão para [`rs_kernel_exception`], que imprime o
-//! diagnóstico e para a CPU. O timer encerra intervalos de usuário (tipo 2) e
+//! diagnóstico e para a CPU. Antes disso, uma falta de página do anel 0 passa
+//! pelos provedores de residência ([`rs_kernel_page_fault`]): página paginável
+//! despejada ou cópia na escrita resolvida repete a instrução. O timer
+//! encerra intervalos de usuário (tipo 2) e
 //! as entradas/saídas do anel 3 trocam o GS (SWAPGS) e o banco de depuração.
 
 use core::arch::global_asm;
@@ -345,6 +348,58 @@ irq_hex_emit:
     ret
 
 irq_kernel_exception:
+    # #PF do anel 0: os provedores de residencia (pagina paginavel
+    # despejada, copia na escrita) tratam a falta antes do SEH e do
+    # diagnostico, como o MmAccessFault; resolvida, a instrucao repete.
+    cmp r10d, 14
+    jne irq_kernel_not_resident
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rsp
+    and rsp, -16
+    sub rsp, 512
+    fxsave64 [rsp]
+    cld
+    mov r12, cr2
+    mov r13, [rip + opennt_kernel_native_active]
+    mov r14, [rip + opennt_kernel_native_host_rsp]
+    mov r15, [rip + opennt_kernel_sync_active]
+    mov qword ptr [rip + opennt_kernel_native_active], 0
+    mov qword ptr [rip + opennt_kernel_sync_active], 0
+    mov rdi, r12
+    mov rsi, [rbx + 40 + 80]        # codigo de erro do hardware
+    mov rdx, [rbx + 40 + 104]       # RFLAGS interrompido
+    call rs_kernel_page_fault
+    mov [rip + opennt_kernel_native_host_rsp], r14
+    mov [rip + opennt_kernel_native_active], r13
+    mov [rip + opennt_kernel_sync_active], r15
+    mov cr2, r12                    # faltas aninhadas resolvidas nao mudam o CR2
+    fxrstor64 [rsp]
+    mov rsp, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov r10d, 14                    # vetor e deslocamento do CS (com codigo de erro)
+    mov r11d, 96
+    test eax, eax
+    jz irq_kernel_not_resident
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 16                     # vetor e codigo de erro
+    iretq
+irq_kernel_not_resident:
     # So faltas numa execucao nativa possuida entram no SEH de kernel; o
     # fast fail continua fatal. Machine check e double fault nao rodam
     # tratador.
@@ -538,6 +593,21 @@ struct ProcessorState {
 
 #[repr(C, align(16))]
 struct TrapWorkspace([u8; 0xB00]);
+
+/// #PF do anel 0, antes do SEH e do diagnóstico: os provedores de
+/// residência resolvem uma página paginável despejada ou uma cópia na
+/// escrita (IRQL até APC_LEVEL), e a instrução é repetida. Roda com o IF do
+/// contexto interrompido, como o acesso que faltou; devolve não zero quando
+/// a falta foi resolvida.
+#[no_mangle]
+extern "sysv64" fn rs_kernel_page_fault(address: u64, error_code: u64, interrupted_flags: u64) -> u32 {
+    if interrupted_flags & 0x200 != 0 {
+        cpu::enable_interrupts();
+    }
+    let resolved = crate::ntos::mm::page_residency::fault(address, error_code as u32);
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    resolved as u32
+}
 
 /// Primeira chance de um trap do anel 0 numa execução nativa possuída:
 /// devolve não zero quando o SEH pediu continuação.

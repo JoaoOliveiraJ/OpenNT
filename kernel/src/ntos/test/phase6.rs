@@ -1358,6 +1358,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     };
     let base = image.image_base;
     let original = physical::read_bytes(paging::translate(base + 0x1000), 64);
+    let original_exports = physical::read_bytes(paging::translate(base + 0x2000), 16);
     let handle = call_export("MmLockPagableCodeSection", &[base + 0x1100]).unwrap_or(0);
     let locked = image_paging::state(base).map_or(0, |state| state.locked);
     assert(handle != 0 && locked == 1 && call_export("MmUnlockPagableImageSection", &[handle]) == Some(0) && image_paging::state(base).is_some_and(|state| state.locked == 0), "imgpaging: trava e destrava a secao .text");
@@ -1371,6 +1372,12 @@ fn ntoskrnl_mm_group(assert: Assert) {
     call_export("MmUnlockPagableImageSection", &[handle]);
     let reset_result = call_export("MmResetDriverPaging", &[base]);
     assert(reset_result == Some(0) && image_paging::state(base).is_some_and(|state| !state.entire && state.resident == 5 && state.pageable == 1), "imgpaging: MmResetDriverPaging traz de volta as paginas nao paginaveis (a .edata continua no NTFS)");
+    // Leitura confiável da .edata despejada: um MOV direto na VA; a falta de
+    // página do anel 0 passa pelos provedores de residência e repete o acesso.
+    let faults_before = image_paging::state(base).map_or(0, |state| state.faults);
+    let absent = paging::translate(base + 0x2000) == 0;
+    let paged_in = guest::read64(base + 0x2000).to_le_bytes();
+    assert(absent && paged_in[..] == original_exports[..8] && image_paging::state(base).is_some_and(|state| state.faults == faults_before + 1), "imgpaging: leitura confiavel de pagina despejada entra pela falta do anel 0");
     assert(image.release().is_ok() && image_paging::state(base).is_none(), "imgpaging: liberacao do driver remove a residencia");
 }
 

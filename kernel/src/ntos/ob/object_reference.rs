@@ -12,6 +12,7 @@
 //! NTSTATUS já estendido para 64 bits do jeito que o export o entrega.
 
 use alloc::format;
+use core::sync::atomic::Ordering;
 
 use crate::ntos::ex::callbacks as executive_callbacks;
 use crate::ntos::inc::nt_abi::device_object;
@@ -34,24 +35,24 @@ const TYPE_MISMATCH: u32 = 0xC000_0024;
 const ACCESS_DENIED: u32 = 0xC000_0022;
 const INVALID_HANDLE: u32 = 0xC000_0008;
 
-/// Retém o dispositivo pelo dono que o conhece ou pelo contador nativo LONG.
+/// Retém o dispositivo pelo dono que o conhece ou pelo contador nativo LONG
+/// (InterlockedIncrement: devolve o valor novo).
 pub(crate) fn reference_device(pointer: u64) -> Result<u64, KernelError> {
     if let Some(count) = device_objects::reference(pointer)? {
         return Ok(count as u64);
     }
-    let address = pointer + device_object::REFERENCE_COUNT;
-    let value = (guest::read32(address) as i32).wrapping_add(1);
-    guest::write32(address, value as u32);
+    let count = guest::atomic_u32(pointer + device_object::REFERENCE_COUNT);
+    let value = (count.fetch_add(1, Ordering::SeqCst) as i32).wrapping_add(1);
     Ok(value as i64 as u64)
 }
 
+/// InterlockedDecrement do contador nativo; devolve o valor novo.
 fn dereference_device(pointer: u64) -> Result<u64, KernelError> {
     if let Some(count) = device_objects::dereference(pointer)? {
         return Ok(count as u64);
     }
-    let address = pointer + device_object::REFERENCE_COUNT;
-    let value = (guest::read32(address) as i32).wrapping_sub(1);
-    guest::write32(address, value as u32);
+    let count = guest::atomic_u32(pointer + device_object::REFERENCE_COUNT);
+    let value = (count.fetch_sub(1, Ordering::SeqCst) as i32).wrapping_sub(1);
     Ok(value as i64 as u64)
 }
 

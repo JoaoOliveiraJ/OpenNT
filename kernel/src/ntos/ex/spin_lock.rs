@@ -5,6 +5,8 @@
 //! fila paralela de donos. No fim, o spin lock legado (test-and-set com
 //! subida a DISPATCH_LEVEL) de ExAcquireSpinLock/ExReleaseSpinLock.
 
+use core::sync::atomic::Ordering;
+
 use crate::hal::cpu;
 use crate::ntos::ke::irql;
 use crate::rtl::KernelError;
@@ -14,8 +16,11 @@ const WRITER_RESERVED: u32 = 0x8000_0000;
 const WRITER_WAITING: u32 = 0x4000_0000;
 const READER_COUNT_MASK: u32 = 0x3FFF_FFFF;
 
+/// LOCK CMPXCHG na palavra do chamador: devolve o valor anterior.
 fn cas(pointer: u64, expected: u32, replacement: u32) -> u32 {
-    guest::compare_exchange32(pointer, expected, replacement).unwrap_or_else(|error| panic!("{error}"))
+    match guest::atomic_u32(pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous,
+    }
 }
 
 fn update(pointer: u64, transform: impl Fn(u32) -> u32) -> u32 {
@@ -195,21 +200,20 @@ pub fn try_convert(pointer: u64) -> Result<bool, KernelError> {
 
 // ---- spin lock legado (ExAcquireSpinLock/ExReleaseSpinLock) -----------------
 
-/// Spin lock legado com subida a DISPATCH_LEVEL.
+/// Spin lock legado com subida a DISPATCH_LEVEL: a palavra baixa vai de 0 a 1
+/// num LOCK CMPXCHG, então dois processadores nunca saem com o lock.
 pub fn lock_with_raise(lock: u64) -> u8 {
     let previous = irql::get_irql();
     irql::raise_irql(2);
-    loop {
-        if guest::read32(lock) == 0 {
-            guest::write32(lock, 1);
-            return previous;
-        }
+    let cell = guest::atomic_u32(lock);
+    while cell.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
+    previous
 }
 
 pub fn unlock_with_lower(lock: u64, previous: u8) {
-    guest::write32(lock, 0);
+    guest::atomic_u32(lock).store(0, Ordering::Release);
     irql::lower_irql(previous as u64);
 }
 

@@ -2,93 +2,85 @@
 //! bits, listas simples (InterlockedPushEntryList/PopEntryList) e listas
 //! duplas sob spinlock (ExInterlockedInsertTailList/RemoveHeadList).
 //!
-//! As ExInterlocked* tomam o spinlock do chamador como test-and-set em
-//! DISPATCH_LEVEL; o IRQL anterior volta na liberação.
+//! Cada Interlocked* é uma instrução LOCK sobre a célula do convidado
+//! (ponteiro do driver: sonda e alinhamento natural). As listas simples
+//! trocam a cabeça por CMPXCHG; as ExInterlocked* tomam o spin lock legado
+//! do chamador (`ex::spin_lock`) em DISPATCH_LEVEL e devolvem o IRQL
+//! anterior na liberação.
 
-use crate::ntos::ke::irql;
+use core::sync::atomic::Ordering;
+
+use crate::ntos::ex::spin_lock;
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 /// InterlockedIncrement: devolve o valor novo.
-pub fn increment(address: u64) -> u32 {
-    let value = guest::read32(address).wrapping_add(1);
-    guest::write32(address, value);
-    value
+pub fn increment(address: u64) -> Result<u32, KernelError> {
+    Ok(guest::try_atomic_u32(address)?.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
 }
 
 /// InterlockedDecrement: devolve o valor novo.
-pub fn decrement(address: u64) -> u32 {
-    let value = guest::read32(address).wrapping_sub(1);
-    guest::write32(address, value);
-    value
+pub fn decrement(address: u64) -> Result<u32, KernelError> {
+    Ok(guest::try_atomic_u32(address)?.fetch_sub(1, Ordering::SeqCst).wrapping_sub(1))
 }
 
 /// InterlockedExchange: devolve o valor anterior.
-pub fn exchange(address: u64, value: u32) -> u32 {
-    let previous = guest::read32(address);
-    guest::write32(address, value);
-    previous
+pub fn exchange(address: u64, value: u32) -> Result<u32, KernelError> {
+    Ok(guest::try_atomic_u32(address)?.swap(value, Ordering::SeqCst))
 }
 
-/// InterlockedCompareExchange: troca só se o valor atual for o comparando.
-pub fn compare_exchange(address: u64, exchange: u32, comparand: u32) -> u32 {
-    let previous = guest::read32(address);
-    if previous == comparand {
-        guest::write32(address, exchange);
-    }
-    previous
+/// InterlockedCompareExchange: troca só se o valor atual for o comparando;
+/// devolve o valor anterior.
+pub fn compare_exchange(address: u64, exchange: u32, comparand: u32) -> Result<u32, KernelError> {
+    guest::compare_exchange32(address, comparand, exchange)
 }
 
-/// InterlockedPushEntryList: entry->Next = head->Next; head->Next = entry.
-pub fn push_entry_list(head: u64, entry: u64) -> u64 {
-    let old = guest::read64(head);
-    guest::write64(entry, old);
-    guest::write64(head, entry);
-    old
-}
-
-/// InterlockedPopEntryList: o primeiro item ou NULL com a lista vazia.
-pub fn pop_entry_list(head: u64) -> u64 {
-    let first = guest::read64(head);
-    if first == 0 {
-        return 0;
-    }
-    guest::write64(head, guest::read64(first));
-    first
-}
-
-/// Spinlock test-and-set em DISPATCH_LEVEL dos ExInterlocked* de lista.
-fn spin_lock_acquire(lock: u64) -> u8 {
-    let previous = irql::get_irql();
-    irql::raise_irql(irql::DISPATCH_LEVEL);
+/// InterlockedPushEntryList: entry->Next = head->Next; head->Next = entry,
+/// publicado por CMPXCHG na cabeça. Devolve o antigo primeiro item.
+pub fn push_entry_list(head: u64, entry: u64) -> Result<u64, KernelError> {
+    let cell = guest::try_atomic_u64(head)?;
+    let mut old = cell.load(Ordering::SeqCst);
     loop {
-        if guest::read32(lock) == 0 {
-            guest::write32(lock, 1);
-            return previous;
+        guest::try_write64(entry, old)?;
+        match cell.compare_exchange(old, entry, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(old),
+            Err(observed) => old = observed,
         }
     }
 }
 
-fn spin_lock_release(lock: u64, previous: u8) {
-    guest::write32(lock, 0);
-    irql::lower_irql(previous as u64);
+/// InterlockedPopEntryList: o primeiro item ou NULL com a lista vazia.
+pub fn pop_entry_list(head: u64) -> Result<u64, KernelError> {
+    let cell = guest::try_atomic_u64(head)?;
+    let mut first = cell.load(Ordering::SeqCst);
+    loop {
+        if first == 0 {
+            return Ok(0);
+        }
+        let next = guest::try_read64(first)?;
+        match cell.compare_exchange(first, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(first),
+            Err(observed) => first = observed,
+        }
+    }
 }
 
 /// ExInterlockedInsertTailList: LIST_ENTRY circular sob spinlock; devolve o
 /// antigo último item (NULL com a lista vazia).
 pub fn insert_tail_list(head: u64, entry: u64, lock: u64) -> u64 {
-    let previous = spin_lock_acquire(lock);
+    let previous = spin_lock::lock_with_raise(lock);
     let last = guest::read64(head + 8);
     guest::write64(entry, head);
     guest::write64(entry + 8, last);
     guest::write64(last, entry);
     guest::write64(head + 8, entry);
-    spin_lock_release(lock, previous);
+    spin_lock::unlock_with_lower(lock, previous);
     if last == head { 0 } else { last }
 }
 
 /// ExInterlockedRemoveHeadList: o item removido ou NULL com a lista vazia.
 pub fn remove_head_list(head: u64, lock: u64) -> u64 {
-    let previous = spin_lock_acquire(lock);
+    let previous = spin_lock::lock_with_raise(lock);
     let first = guest::read64(head);
     let mut removed = 0;
     if first != head {
@@ -97,6 +89,6 @@ pub fn remove_head_list(head: u64, lock: u64) -> u64 {
         guest::write64(head, next);
         guest::write64(next + 8, head);
     }
-    spin_lock_release(lock, previous);
+    spin_lock::unlock_with_lower(lock, previous);
     removed
 }

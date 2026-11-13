@@ -78,14 +78,16 @@ pub fn acquire_file(file: u64) -> Result<(), KernelError> {
     if guest::compare_exchange32(file + 0x74, 0, 1)? == 0 {
         return Ok(());
     }
-    guest::write32(file + 0x70, guest::read32(file + 0x70).wrapping_add(1));
+    // Waiters muda por InterlockedIncrement/InterlockedDecrement.
+    let waiters = guest::atomic_u32(file + 0x70);
+    waiters.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let result = (|| -> Result<(), KernelError> {
         while guest::compare_exchange32(file + 0x74, 0, 1)? != 0 {
             dispatcher::wait_for_single_object(file + 0x80, 0, 0, false);
         }
         Ok(())
     })();
-    guest::write32(file + 0x70, guest::read32(file + 0x70).wrapping_sub(1));
+    waiters.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     result
 }
 

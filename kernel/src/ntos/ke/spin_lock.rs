@@ -8,6 +8,8 @@
 //! O KLOCK_QUEUE_HANDLE é { Next, Lock, OldIrql }: a fila fica vazia e o
 //! lock é o mesmo bit do KSPIN_LOCK.
 
+use core::sync::atomic::Ordering;
+
 use super::{irql, pcr};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::KernelError;
@@ -25,10 +27,11 @@ pub fn initialize(lock: u64) {
     guest::write64(lock, 0);
 }
 
-/// Uma tentativa de posse do bit 0.
+/// Uma tentativa de posse do bit 0: LOCK BTS (o InterlockedBitTestAndSet64
+/// do NT) só depois de observar o lock livre.
 fn try_spin(lock: u64) -> bool {
-    let value = guest::read64(lock);
-    value & 1 == 0 && guest::compare_exchange64(lock, value, value | 1).unwrap_or_else(|error| panic!("{error}")) == value
+    let cell = guest::atomic_u64(lock);
+    cell.load(Ordering::Relaxed) & 1 == 0 && cell.fetch_or(1, Ordering::Acquire) & 1 == 0
 }
 
 /// KeAcquireSpinLockAtDpcLevel: gira até a posse, sem mexer no IRQL.
@@ -54,13 +57,13 @@ pub fn acquire(lock: u64) -> u8 {
 /// KeReleaseSpinLock / KfReleaseSpinLock: KIRQL é UCHAR, só o byte baixo do
 /// registrador vale.
 pub fn release(lock: u64, new_irql: u64) {
-    guest::write64(lock, 0);
+    release_from_dpc_level(lock);
     irql::lower_irql(new_irql & 0xFF);
 }
 
-/// KeReleaseSpinLockFromDpcLevel.
+/// KeReleaseSpinLockFromDpcLevel: um store de liberação do qword inteiro.
 pub fn release_from_dpc_level(lock: u64) {
-    guest::write64(lock, 0);
+    guest::atomic_u64(lock).store(0, Ordering::Release);
 }
 
 /// KeAcquireSpinLockForDpc: sobe a DISPATCH_LEVEL (nunca desce).
@@ -106,7 +109,7 @@ pub fn acquire_in_stack_queued_at_dpc_level(lock: u64, handle: u64) {
 
 /// KeReleaseInStackQueuedSpinLockFromDpcLevel.
 pub fn release_in_stack_queued_from_dpc_level(handle: u64) {
-    guest::write64(guest::read64(handle + HANDLE_LOCK), 0);
+    release_from_dpc_level(guest::read64(handle + HANDLE_LOCK));
 }
 
 /// KLOCK_QUEUE_HANDLE no nível pedido (nunca desce).

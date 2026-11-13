@@ -6,22 +6,70 @@
 //! +0 size, +4 previous, +8 next, +12 free (u32). Os links das listas livres
 //! ocupam os primeiros 8 bytes do payload livre.
 //!
-//! Abaixo de 4GB tudo é identity (VA == PA). Endereços altos (imagens na base
-//! preferida, VA do kernel) passam pelas tabelas de páginas. As variantes
-//! `try_*` devolvem `STATUS_ACCESS_VIOLATION` para ponteiros sem mapeamento;
-//! as demais são para memória do próprio kernel e param o sistema numa falha.
+//! # O mapa de memória que o acesso pressupõe (conferido no código)
+//!
+//! - **Um só espaço de endereços.** Há uma PML4 (`PML4_PHYS`, 0x70000): os
+//!   APs carregam o CR3 do BSP e a anexação de processo recusa qualquer
+//!   DirectoryTableBase diferente e só recarrega o mesmo CR3. Quando o
+//!   kernel toca um buffer de modo usuário, o CR3 ativo é sempre esse: a
+//!   VA de usuário (inclusive a janela do VirtualAlloc, 0x10000000-0x1FFFFFFF,
+//!   remapeada para frames do PFN) é desreferenciável direto.
+//! - **Proteção.** CR0.WP=1 em todas as CPUs (escritas de supervisor
+//!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
+//! - **Abaixo de 4GB** o stage2 mapeia identidade com páginas de 2MB RW de
+//!   supervisor; a arena dos convidados e o heap do kernel ficam ali e não
+//!   são pagináveis. VA == PA só onde ninguém remapeou: janelas de usuário e
+//!   slots de imagem baixos podem ser remapeados ou desmapeados (o despejo de
+//!   uma imagem paginável carregada em baixo desmapeia a página).
+//! - **Acima de 4GB** (imagens nas bases preferidas, pool executivo
+//!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
+//!   memória contígua/independente e o alias RW da imagem do kernel em
+//!   `KERNEL_VIRTUAL_BASE`) tudo está nas mesmas tabelas de páginas.
+//! - **Páginas pagináveis** (imagens de drivers, pool paginado, visões de
+//!   seção de sistema, cópia na escrita de seções) têm PTE ausente quando
+//!   despejadas. Os provedores ficam em `page_residency`; `fault` recusa IRQL
+//!   acima de APC_LEVEL. Até aqui só o modo usuário (`ps::user::exceptions`)
+//!   e algumas sondas explícitas chamavam `fault`; uma falta do anel 0 ia
+//!   direto ao SEH (código nativo) ou ao diagnóstico (código Rust). A falta
+//!   de página do anel 0 agora passa pelos provedores antes (o
+//!   `rs_kernel_page_fault` dos trampolins, o papel do MmAccessFault).
+//!
+//! # Acesso
+//!
+//! - [`read`]/[`write`] (e `read8..64`/`write8..64`): memória confiável do
+//!   kernel. Um MOV volátil da largura exata no endereço virtual, sem
+//!   tradução e sem dividir (o x86 aceita desalinhado); 64 bits alinhados são
+//!   atômicos para as outras CPUs, como os drivers esperam. Página ausente
+//!   entra no tratador de faltas; falta irrecuperável para o sistema, como o
+//!   bugcheck do NT.
+//! - [`try_read`]/[`try_write`]/[`try_read_bytes`]/[`try_write_bytes`]:
+//!   ponteiro não confiável. A sonda (o `__try { ProbeFor*; *p }` do NT)
+//!   traz páginas pagináveis de volta, exige PTE presente (e gravável numa
+//!   escrita, depois de dar a chance ao tratador de cópia na escrita) e
+//!   devolve `STATUS_ACCESS_VIOLATION`; depois faz UM acesso. Só um acesso
+//!   que cruza página é dividido, byte a byte em ordem crescente.
+//! - [`atomic_u32`]/[`atomic_u64`]: a célula do convidado como atômico de
+//!   verdade (Interlocked*, spin locks, push locks, contagens de referência);
+//!   [`try_atomic_u32`]/[`try_atomic_u64`] e `compare_exchange32/64/128`
+//!   sondam antes e exigem alinhamento natural.
+//!
+//! Nenhum acesso do kernel passa mais pelo alias de identidade do frame: uma
+//! escrita confiável numa página somente leitura falta, como no NT.
 
 use alloc::collections::BTreeSet;
 use alloc::format;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::{host, physical};
-use crate::ntos::mm::{kernel_address, paging, physical_layout};
+use crate::ntos::mm::{page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
 pub const ARENA_SIZE: u64 = 0x100_0000; // 16MB
 const BLOCK_HEADER_SIZE: u64 = 16;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-const FOUR_GB: u64 = 0x1_0000_0000;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const PAGE_SIZE: u64 = 0x1000;
 
 /// Resolvedor de páginas pagináveis (imagens paginadas), instalado depois.
 static PAGEABLE_RESOLVER: SpinLock<Option<PageableResolver>> = SpinLock::new(None);
@@ -41,7 +89,7 @@ struct GuestHeap {
 static HEAP: SpinLock<GuestHeap> =
     SpinLock::new(GuestHeap { arena_base: 0, ready: false, allocations: BTreeSet::new(), free_bins: [0; 25] });
 
-/// Falha de tradução conhecida: serviços com SEH devolvem ACCESS_VIOLATION.
+/// Falha de sonda conhecida: serviços com SEH devolvem ACCESS_VIOLATION.
 pub fn address_fault(address: u64) -> KernelError {
     KernelError::with_status(format!("unmapped guest VA {address:#x}"), STATUS_ACCESS_VIOLATION)
 }
@@ -54,128 +102,142 @@ pub fn set_pool_lock(lock: Option<(fn() -> u64, fn(u64))>) {
     *POOL_LOCK.lock() = lock;
 }
 
-/// Tradução VA -> físico do convidado.
-pub fn to_physical(address: u64) -> Result<u64, KernelError> {
-    let resolver = *PAGEABLE_RESOLVER.lock();
-    if let Some(resolver) = resolver {
-        if let Some(page) = resolver(address)? {
-            return Ok(page);
+// ---- escalares ---------------------------------------------------------------
+
+/// Valor de 1, 2, 4 ou 8 bytes acessado numa única instrução MOV. Os bits
+/// são o valor little-endian da célula; tipos `#[repr(transparent)]` sobre um
+/// inteiro (ponteiros tipados, por exemplo) implementam pela representação.
+pub trait GuestScalar: Copy {
+    /// Largura da célula: 1, 2, 4 ou 8.
+    const SIZE: u64;
+    fn from_bits(bits: u64) -> Self;
+    fn to_bits(self) -> u64;
+}
+
+macro_rules! guest_scalar {
+    ($($type:ty => $unsigned:ty),* $(,)?) => {$(
+        impl GuestScalar for $type {
+            const SIZE: u64 = core::mem::size_of::<$type>() as u64;
+            #[inline(always)]
+            fn from_bits(bits: u64) -> Self {
+                bits as $unsigned as $type
+            }
+            #[inline(always)]
+            fn to_bits(self) -> u64 {
+                self as $unsigned as u64
+            }
         }
+    )*};
+}
+
+guest_scalar!(u8 => u8, u16 => u16, u32 => u32, u64 => u64, i8 => u8, i16 => u16, i32 => u32, i64 => u64);
+
+/// O MOV de `T::SIZE` bytes (o `*(volatile T *)` do C): nunca elidido nem
+/// dividido; o asm de `hal::physical` usa o endereço como ponteiro.
+#[inline(always)]
+fn load<T: GuestScalar>(address: u64) -> T {
+    const { assert!(matches!(T::SIZE, 1 | 2 | 4 | 8), "GuestScalar: largura invalida") };
+    T::from_bits(match T::SIZE {
+        1 => physical::read8(address) as u64,
+        2 => physical::read16(address) as u64,
+        4 => physical::read32(address) as u64,
+        _ => physical::read64(address),
+    })
+}
+
+#[inline(always)]
+fn store<T: GuestScalar>(address: u64, value: T) {
+    const { assert!(matches!(T::SIZE, 1 | 2 | 4 | 8), "GuestScalar: largura invalida") };
+    let bits = value.to_bits();
+    match T::SIZE {
+        1 => physical::write8(address, bits as u8),
+        2 => physical::write16(address, bits as u16),
+        4 => physical::write32(address, bits as u32),
+        _ => physical::write64(address, bits),
     }
-    if address < FOUR_GB {
-        return Ok(address);
-    }
-    if let Some(mapped) = kernel_address::physical_address(address) {
-        return Ok(mapped);
-    }
-    let page = address & !0xFFF;
-    let translated = paging::translate(page);
-    if translated == 0 && paging::access_flags(page) & paging::PAGE_PRESENT == 0 {
-        return Err(address_fault(address));
-    }
-    Ok(translated + (address & 0xFFF))
+}
+
+/// Leitura confiável: um MOV no endereço virtual, sem tradução.
+#[inline]
+pub fn read<T: GuestScalar>(address: u64) -> T {
+    load(address)
+}
+
+/// Escrita confiável: um MOV no endereço virtual, sem tradução.
+#[inline]
+pub fn write<T: GuestScalar>(address: u64, value: T) {
+    store(address, value)
+}
+
+// ---- sonda (ponteiros não confiáveis) -----------------------------------------
+
+fn canonical(address: u64) -> bool {
+    matches!(address >> 47, 0 | 0x1_FFFF)
 }
 
 fn crosses_page(address: u64, width: u64) -> bool {
-    (address & 0xFFF) + width > 4096
+    (address & 0xFFF) + width > PAGE_SIZE
 }
 
-// ---- leituras -------------------------------------------------------------
-
-pub fn try_read8(address: u64) -> Result<u8, KernelError> {
-    let physical_address = to_physical(address)?;
-    Ok(physical::read8(if physical_address < FOUR_GB { physical_address } else { address }))
-}
-
-fn read_split(address: u64, width: u64) -> Result<u64, KernelError> {
-    let mut value = 0u64;
-    for index in 0..width {
-        value |= (try_read8(address.wrapping_add(index))? as u64) << (index * 8);
+/// Sonda da página de `address`: o resolvedor traz páginas pagináveis de
+/// volta (em qualquer IRQL que o provedor aceite); depois a PTE precisa estar
+/// presente e, numa escrita, gravável — uma página copy-on-write ganha uma
+/// chance no tratador de faltas. Devolve o endereço físico da página.
+fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
+    if !canonical(address) {
+        return Err(address_fault(address));
     }
-    Ok(value)
-}
-
-pub fn try_read16(address: u64) -> Result<u16, KernelError> {
-    if crosses_page(address, 2) {
-        return read_split(address, 2).map(|value| value as u16);
+    let resolver = *PAGEABLE_RESOLVER.lock();
+    if let Some(resolver) = resolver {
+        resolver(address)?;
     }
-    let physical_address = to_physical(address)?;
-    Ok(physical::read16(if physical_address < FOUR_GB { physical_address } else { address }))
-}
-
-pub fn try_read32(address: u64) -> Result<u32, KernelError> {
-    if crosses_page(address, 4) {
-        return read_split(address, 4).map(|value| value as u32);
+    let page = address & !0xFFF;
+    let writable = |mapping: &paging::PageQuery| !write || mapping.access & paging::PAGE_RW != 0;
+    let mut mapping = paging::query_page(page, false);
+    if mapping.as_ref().is_some_and(|mapping| !writable(mapping)) && page_residency::fault(page, 3) {
+        mapping = paging::query_page(page, false);
     }
-    let physical_address = to_physical(address)?;
-    Ok(physical::read32(if physical_address < FOUR_GB { physical_address } else { address }))
-}
-
-/// Duas leituras de DWORD, a baixa primeiro.
-pub fn try_read64(address: u64) -> Result<u64, KernelError> {
-    if crosses_page(address, 8) {
-        let low = try_read32(address)? as u64;
-        return Ok(low | (try_read32(address.wrapping_add(4))? as u64) << 32);
+    match mapping {
+        Some(mapping) if writable(&mapping) => Ok(mapping.physical_address),
+        _ => Err(address_fault(address)),
     }
-    let physical_address = to_physical(address)?;
-    let at = if physical_address < FOUR_GB { physical_address } else { address };
-    Ok(physical::read32(at) as u64 | (physical::read32(at.wrapping_add(4)) as u64) << 32)
 }
 
-/// Uma única carga de qword nativa, sem duas observações de DWORD.
-pub fn try_read64_single(address: u64) -> Result<u64, KernelError> {
-    let physical_address = to_physical(address)?;
-    if crosses_page(address, 8) {
-        to_physical(address.wrapping_add(7))?;
-        return Ok(physical::read64(address));
-    }
-    Ok(physical::read64(if physical_address < FOUR_GB { physical_address } else { address }))
-}
-
-// ---- escritas -------------------------------------------------------------
-
-pub fn try_write8(address: u64, value: u8) -> Result<(), KernelError> {
-    let physical_address = to_physical(address)?;
-    physical::write8(if physical_address < FOUR_GB { physical_address } else { address }, value);
-    Ok(())
-}
-
-fn write_split(address: u64, value: u64, width: u64) -> Result<(), KernelError> {
-    for index in 0..width {
-        try_write8(address.wrapping_add(index), (value >> (index * 8)) as u8)?;
+/// Sonda as páginas tocadas por `width` bytes em `address`.
+fn probe_range(address: u64, width: u64, write: bool) -> Result<(), KernelError> {
+    probe(address, write)?;
+    if crosses_page(address, width) {
+        probe(address.wrapping_add(width - 1), write)?;
     }
     Ok(())
 }
 
-pub fn try_write16(address: u64, value: u16) -> Result<(), KernelError> {
-    if crosses_page(address, 2) {
-        return write_split(address, value as u64, 2);
+/// Leitura de ponteiro não confiável: sonda e UM acesso; só um acesso que
+/// cruza página vira bytes em ordem crescente.
+pub fn try_read<T: GuestScalar>(address: u64) -> Result<T, KernelError> {
+    probe_range(address, T::SIZE, false)?;
+    if !crosses_page(address, T::SIZE) {
+        return Ok(load(address));
     }
-    let physical_address = to_physical(address)?;
-    physical::write16(if physical_address < FOUR_GB { physical_address } else { address }, value);
-    Ok(())
+    let mut bits = 0u64;
+    for index in 0..T::SIZE {
+        bits |= (load::<u8>(address.wrapping_add(index)) as u64) << (index * 8);
+    }
+    Ok(T::from_bits(bits))
 }
 
-pub fn try_write32(address: u64, value: u32) -> Result<(), KernelError> {
-    if crosses_page(address, 4) {
-        return write_split(address, value as u64, 4);
+/// Escrita em ponteiro não confiável: sonda e UM acesso (bytes só quando
+/// cruza página).
+pub fn try_write<T: GuestScalar>(address: u64, value: T) -> Result<(), KernelError> {
+    probe_range(address, T::SIZE, true)?;
+    if !crosses_page(address, T::SIZE) {
+        store(address, value);
+        return Ok(());
     }
-    let physical_address = to_physical(address)?;
-    physical::write32(if physical_address < FOUR_GB { physical_address } else { address }, value);
-    Ok(())
-}
-
-/// Duas escritas de DWORD, a baixa primeiro, inclusive em MMIO.
-pub fn try_write64(address: u64, value: u64) -> Result<(), KernelError> {
-    let (low, high) = (value as u32, (value >> 32) as u32);
-    if crosses_page(address, 8) {
-        try_write32(address, low)?;
-        return try_write32(address.wrapping_add(4), high);
+    let bits = value.to_bits();
+    for index in 0..T::SIZE {
+        store(address.wrapping_add(index), (bits >> (index * 8)) as u8);
     }
-    let physical_address = to_physical(address)?;
-    let at = if physical_address < FOUR_GB { physical_address } else { address };
-    physical::write32(at, low);
-    physical::write32(at.wrapping_add(4), high);
     Ok(())
 }
 
@@ -186,14 +248,15 @@ pub fn try_write_bytes(address: u64, bytes: &[u8]) -> Result<(), KernelError> {
     let mut copied = 0usize;
     while copied < bytes.len() {
         let destination = address.wrapping_add(copied as u64);
-        let physical_address = to_physical(destination)?;
-        let page_offset = (destination & 0xFFF) as usize;
-        let block = (4096 - page_offset).min(bytes.len() - copied);
-        if physical_address < FOUR_GB && physical_layout::contains_ram_range(physical_address, block as u64) {
-            physical::write_bytes(physical_address, &bytes[copied..copied + block]);
+        let physical_address = probe(destination, true)?;
+        let block = ((PAGE_SIZE - (destination & 0xFFF)) as usize).min(bytes.len() - copied);
+        let source = &bytes[copied..copied + block];
+        if physical_layout::contains_ram_range(physical_address + (destination & 0xFFF), block as u64) {
+            // Página de RAM sondada; o buffer de origem pode ser alias dela.
+            unsafe { core::ptr::copy(source.as_ptr(), destination as *mut u8, block) }
         } else {
-            for index in 0..block {
-                try_write8(destination.wrapping_add(index as u64), bytes[copied + index])?;
+            for (index, &byte) in source.iter().enumerate() {
+                store(destination.wrapping_add(index as u64), byte);
             }
         }
         copied += block;
@@ -201,62 +264,159 @@ pub fn try_write_bytes(address: u64, bytes: &[u8]) -> Result<(), KernelError> {
     Ok(())
 }
 
-pub fn try_read_bytes(address: u64, length: usize) -> Result<alloc::vec::Vec<u8>, KernelError> {
-    (0..length as u64).map(|offset| try_read8(address.wrapping_add(offset))).collect()
+pub fn try_read_bytes(address: u64, length: usize) -> Result<Vec<u8>, KernelError> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(length);
+    while bytes.len() < length {
+        let source = address.wrapping_add(bytes.len() as u64);
+        let physical_address = probe(source, false)?;
+        let block = ((PAGE_SIZE - (source & 0xFFF)) as usize).min(length - bytes.len());
+        if physical_layout::contains_ram_range(physical_address + (source & 0xFFF), block as u64) {
+            let start = bytes.len();
+            // Página de RAM sondada; `start + block <= capacity`.
+            unsafe {
+                core::ptr::copy(source as *const u8, bytes.as_mut_ptr().add(start), block);
+                bytes.set_len(start + block);
+            }
+        } else {
+            bytes.extend((0..block as u64).map(|index| load::<u8>(source.wrapping_add(index))));
+        }
+    }
+    Ok(bytes)
 }
 
-// ---- variantes infalíveis (memória do kernel) -------------------------------
+// ---- nomes por largura (as chamadas existentes) --------------------------------
+
+pub fn try_read8(address: u64) -> Result<u8, KernelError> {
+    try_read(address)
+}
+pub fn try_read16(address: u64) -> Result<u16, KernelError> {
+    try_read(address)
+}
+pub fn try_read32(address: u64) -> Result<u32, KernelError> {
+    try_read(address)
+}
+/// Uma carga de qword (64 bits alinhados nunca são observados pela metade).
+pub fn try_read64(address: u64) -> Result<u64, KernelError> {
+    try_read(address)
+}
+pub fn try_write8(address: u64, value: u8) -> Result<(), KernelError> {
+    try_write(address, value)
+}
+pub fn try_write16(address: u64, value: u16) -> Result<(), KernelError> {
+    try_write(address, value)
+}
+pub fn try_write32(address: u64, value: u32) -> Result<(), KernelError> {
+    try_write(address, value)
+}
+/// Um store de qword.
+pub fn try_write64(address: u64, value: u64) -> Result<(), KernelError> {
+    try_write(address, value)
+}
+
+#[inline]
+pub fn read8(address: u64) -> u8 {
+    read(address)
+}
+#[inline]
+pub fn read16(address: u64) -> u16 {
+    read(address)
+}
+#[inline]
+pub fn read32(address: u64) -> u32 {
+    read(address)
+}
+/// Uma carga de qword.
+#[inline]
+pub fn read64(address: u64) -> u64 {
+    read(address)
+}
+/// Mesmo que [`read64`]: toda leitura de qword já é uma carga única.
+#[inline]
+pub fn read64_single(address: u64) -> u64 {
+    read(address)
+}
+#[inline]
+pub fn write8(address: u64, value: u8) {
+    write(address, value)
+}
+#[inline]
+pub fn write16(address: u64, value: u16) {
+    write(address, value)
+}
+#[inline]
+pub fn write32(address: u64, value: u32) {
+    write(address, value)
+}
+/// Um store de qword.
+#[inline]
+pub fn write64(address: u64, value: u64) {
+    write(address, value)
+}
 
 fn kernel_fault(error: KernelError) -> ! {
     panic!("acesso de kernel a memoria de convidado: {}", error)
 }
 
-pub fn read8(address: u64) -> u8 {
-    try_read8(address).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn read16(address: u64) -> u16 {
-    try_read16(address).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn read32(address: u64) -> u32 {
-    try_read32(address).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn read64(address: u64) -> u64 {
-    try_read64(address).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn read64_single(address: u64) -> u64 {
-    try_read64_single(address).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn write8(address: u64, value: u8) {
-    try_write8(address, value).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn write16(address: u64, value: u16) {
-    try_write16(address, value).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn write32(address: u64, value: u32) {
-    try_write32(address, value).unwrap_or_else(|error| kernel_fault(error))
-}
-pub fn write64(address: u64, value: u64) {
-    try_write64(address, value).unwrap_or_else(|error| kernel_fault(error))
-}
+/// Cópia de memória do kernel: a sonda por página escolhe entre bloco (RAM)
+/// e bytes (MMIO); a falha para o sistema.
 pub fn write_bytes(address: u64, bytes: &[u8]) {
     try_write_bytes(address, bytes).unwrap_or_else(|error| kernel_fault(error))
 }
-pub fn read_bytes(address: u64, length: usize) -> alloc::vec::Vec<u8> {
+pub fn read_bytes(address: u64, length: usize) -> Vec<u8> {
     try_read_bytes(address, length).unwrap_or_else(|error| kernel_fault(error))
 }
 
 // ---- operações atômicas ----------------------------------------------------
 
-pub fn compare_exchange32(address: u64, expected: u32, replacement: u32) -> Result<u32, KernelError> {
-    let physical_address = to_physical(address)?;
-    let at = if physical_address < FOUR_GB { physical_address } else { address };
-    Ok(physical::compare_exchange32(at, expected, replacement))
+/// A célula de 32 bits do convidado como atômico (memória confiável, sem
+/// sonda). Exige alinhamento natural, como as operações interlocked.
+#[inline]
+pub fn atomic_u32(address: u64) -> &'static AtomicU32 {
+    debug_assert!(address & 3 == 0, "AtomicU32 desalinhado em {address:#x}");
+    unsafe { AtomicU32::from_ptr(address as *mut u32) }
 }
 
+/// A célula de 64 bits do convidado como atômico (memória confiável).
+#[inline]
+pub fn atomic_u64(address: u64) -> &'static AtomicU64 {
+    debug_assert!(address & 7 == 0, "AtomicU64 desalinhado em {address:#x}");
+    unsafe { AtomicU64::from_ptr(address as *mut u64) }
+}
+
+/// Sonda de escrita e alinhamento natural de uma célula interlocked.
+fn probe_atomic(address: u64, width: u64) -> Result<(), KernelError> {
+    if address & (width - 1) != 0 {
+        return Err(KernelError::with_status(format!("misaligned interlocked guest VA {address:#x}"), STATUS_DATATYPE_MISALIGNMENT));
+    }
+    probe(address, true).map(|_| ())
+}
+
+/// [`atomic_u32`] de um ponteiro não confiável.
+pub fn try_atomic_u32(address: u64) -> Result<&'static AtomicU32, KernelError> {
+    probe_atomic(address, 4)?;
+    Ok(atomic_u32(address))
+}
+
+/// [`atomic_u64`] de um ponteiro não confiável.
+pub fn try_atomic_u64(address: u64) -> Result<&'static AtomicU64, KernelError> {
+    probe_atomic(address, 8)?;
+    Ok(atomic_u64(address))
+}
+
+/// LOCK CMPXCHG: devolve o valor anterior.
+pub fn compare_exchange32(address: u64, expected: u32, replacement: u32) -> Result<u32, KernelError> {
+    let cell = try_atomic_u32(address)?;
+    Ok(match cell.compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous,
+    })
+}
+
+/// LOCK CMPXCHG de 64 bits: devolve o valor anterior.
 pub fn compare_exchange64(address: u64, expected: u64, replacement: u64) -> Result<u64, KernelError> {
-    let physical_address = to_physical(address)?;
-    let at = if physical_address < FOUR_GB { physical_address } else { address };
-    Ok(physical::compare_exchange64(at, expected, replacement))
+    let cell = try_atomic_u64(address)?;
+    Ok(match cell.compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(previous) | Err(previous) => previous,
+    })
 }
 
 /// Cabeçalho SLIST alinhado: compara as duas palavras numa instrução.
@@ -266,9 +426,8 @@ pub fn compare_exchange128(
     expected: (u64, u64),
     replacement: (u64, u64),
 ) -> Result<(u64, u64), KernelError> {
-    let physical_address = to_physical(address)?;
-    let at = if physical_address < FOUR_GB { physical_address } else { address };
-    Ok(physical::compare_exchange128(at, expected, replacement))
+    probe_atomic(address, 16)?;
+    Ok(physical::compare_exchange128(address, expected, replacement))
 }
 
 // ---- heap da arena ---------------------------------------------------------

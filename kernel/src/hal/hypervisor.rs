@@ -4,6 +4,8 @@
 //! máquina, as entradas Sk* têm o comportamento do ntoskrnl sem SK: push
 //! locks comuns e o pool não paginado normal no lugar do pool seguro.
 
+use core::sync::atomic::Ordering;
+
 use crate::hal::cpu;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -47,26 +49,25 @@ pub fn get_features(output: u64) {
 
 // ---- Secure Kernel ausente ---------------------------------------------------
 // SkInitializePushLock, SkAcquirePushLockExclusive e SkReleasePushLockExclusive
-// operam numa EX_PUSH_LOCK normal (bit 0 = Locked).
+// operam numa EX_PUSH_LOCK normal (bit 0 = Locked), trocado atomicamente.
 
 pub fn initialize_push_lock(lock: u64) {
-    guest::write64(lock, 0);
+    guest::atomic_u64(lock).store(0, Ordering::Release);
 }
 
+/// LOCK BTS do bit 0; com o lock ocupado, espera observá-lo livre.
 pub fn acquire_push_lock_exclusive(lock: u64) {
-    loop {
-        let value = guest::read64(lock);
-        if value & 1 != 0 {
+    let cell = guest::atomic_u64(lock);
+    while cell.fetch_or(1, Ordering::Acquire) & 1 != 0 {
+        while cell.load(Ordering::Relaxed) & 1 != 0 {
             core::hint::spin_loop();
-            continue;
         }
-        guest::write64(lock, value | 1);
-        return;
     }
 }
 
+/// LOCK AND: limpa só o bit 0, preservando os demais.
 pub fn release_push_lock_exclusive(lock: u64) {
-    guest::write64(lock, guest::read64(lock) & !1);
+    guest::atomic_u64(lock).fetch_and(!1, Ordering::Release);
 }
 
 /// SkAllocatePool: sem SK o pool seguro não existe, pool não paginado normal.
