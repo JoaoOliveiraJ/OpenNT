@@ -217,7 +217,7 @@ fn groups() -> [&'static Group; 164] {
         &crate::ntos::se::exports::se_access::GROUP,
         &crate::ntos::rtl::exports::rtl_crt_extended::GROUP,
         &crate::ntos::ke::exports::ke_ex_sync::GROUP,
-        &crate::ntos::io::exports::fsrtl_core::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_core::GROUP,
         &crate::ntos::ob::exports::ob_object_lifecycle::GROUP,
         &crate::ntos::ex::exports::ex_lookaside_wnf::GROUP,
     ]

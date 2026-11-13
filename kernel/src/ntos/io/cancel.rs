@@ -20,6 +20,12 @@ pub fn acquire() -> Result<u8, KernelError> {
     Ok(previous)
 }
 
+/// IoAcquireCancelSpinLock(Irql): o IRQL anterior vai para *Irql.
+pub fn acquire_into(irql_output: u64) -> Result<(), KernelError> {
+    guest::write8(irql_output, acquire()?);
+    Ok(())
+}
+
 /// IoReleaseCancelSpinLock.
 pub fn release(previous: u8) -> Result<(), KernelError> {
     if !HELD.load(Ordering::Acquire) {
@@ -51,4 +57,11 @@ pub fn irp(pointer: u64) -> Result<u8, KernelError> {
     guest::write8(pointer + irp::CANCEL_IRQL, previous);
     native_call::call(routine, &[device, pointer]);
     Ok(1)
+}
+
+/// IoSetCancelRoutine: devolve a rotina anterior.
+pub fn set_cancel_routine(pointer: u64, routine: u64) -> u64 {
+    let previous = guest::read64(pointer + irp::CANCEL_ROUTINE);
+    guest::write64(pointer + irp::CANCEL_ROUTINE, routine);
+    previous
 }

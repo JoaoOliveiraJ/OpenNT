@@ -101,3 +101,74 @@ pub mod release_file_name_information {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_core {
+    //! Núcleo puro do FsRtl — correspondência de nomes com curingas DOS,
+    //! helpers de NTSTATUS e o portão de carga do Filter Manager.
+    //!
+    //! Adaptadores: a lógica mora em `fsrtl::name` (nomes e o bitmap
+    //! FsRtlLegalAnsiCharacterArray), `fsrtl::ntstatus` e `fsrtl::filter`.
+
+    use crate::ntos::fsrtl::{filter, name, ntstatus};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn legal_ansi_character_array_address() -> u64 {
+        name::legal_ansi_character_array_address()
+    }
+
+    /// FsRtlIsNtstatusExpected(Status) -> BOOLEAN (zero-extendido).
+    fn is_ntstatus_expected(call: &Call) -> Result<u64, KernelError> {
+        Ok(ntstatus::is_ntstatus_expected(call.arg(1) as u32) as u64)
+    }
+
+    /// FsRtlNormalizeNtstatus: `mov eax, edi` zera os 32 bits altos de RAX —
+    /// devolve sem sinal.
+    fn normalize_ntstatus(call: &Call) -> Result<u64, KernelError> {
+        Ok(ntstatus::normalize_ntstatus(call.arg(1) as u32, call.arg(2) as u32) as u64)
+    }
+
+    fn does_name_contain_wild_cards(call: &Call) -> Result<u64, KernelError> {
+        Ok(name::does_name_contain_wild_cards(call.arg(1)) as u64)
+    }
+
+    fn dissect_name(call: &Call) -> Result<u64, KernelError> {
+        name::dissect_name(call.arg(1), call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    fn is_name_in_expression(call: &Call) -> Result<u64, KernelError> {
+        Ok(name::is_name_in_expression(call.arg(1), call.arg(2), call.arg(3) != 0) as u64)
+    }
+
+    fn register_flt_mgr_calls(call: &Call) -> Result<u64, KernelError> {
+        Ok(filter::register_flt_mgr_calls(call.arg(1)))
+    }
+
+    fn register_file_system_filter_callbacks(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(filter::register_file_system_filter_callbacks(call.arg(1), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-core",
+        names: &[
+            "FsRtlIsNameInExpression",
+            "FsRtlDoesNameContainWildCards",
+            "FsRtlDissectName",
+            "FsRtlIsNtstatusExpected",
+            "FsRtlNormalizeNtstatus",
+            "FsRtlRegisterFltMgrCalls",
+            "FsRtlRegisterFileSystemFilterCallbacks",
+        ],
+        handlers: &[
+            is_name_in_expression,
+            does_name_contain_wild_cards,
+            dissect_name,
+            is_ntstatus_expected,
+            normalize_ntstatus,
+            register_flt_mgr_calls,
+            register_file_system_filter_callbacks,
+        ],
+        data_exports: &[("FsRtlLegalAnsiCharacterArray", legal_ansi_character_array_address)],
+    };
+}

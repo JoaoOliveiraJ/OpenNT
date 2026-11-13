@@ -6,7 +6,7 @@
 //! A associação driver↔dispositivo vem dos ids de hardware, como o NT faz
 //! pelo INF.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,7 +20,7 @@ use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::inc::nt_abi::device_object;
-use crate::ntos::io::lifecycle;
+use crate::ntos::io::{device, lifecycle};
 
 /// hardwareId → serviço do driver funcional (o "INF estático").
 pub const FUNCTION_DRIVER_BY_ID: &[(&str, &str)] = &[
@@ -282,6 +282,33 @@ fn start_pdo_stack(fdo: NodeId) {
         let child_ids = io_manager::device(child_node).and_then(|entry| entry.hardware_ids).unwrap_or_default();
         if find_function_driver(&child_ids).is_some() {
             debug_print!("[pnp] filho \\Device\\{} ({}): montando pilha", name_of(child_node), child_ids.first().map(String::as_str).unwrap_or("?"));
+            enumerate_pdo_stack(child_node);
+        }
+    }
+}
+
+/// Dispositivos invalidados por IoInvalidateDeviceState.
+static INVALIDATED_DEVICES: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+/// IoInvalidateDeviceState.
+pub fn invalidate_device_state(device: u64) {
+    INVALIDATED_DEVICES.lock().insert(device);
+}
+
+/// Dispositivos com estado invalidado (consultados pelo fluxo PnP).
+pub fn invalidated(device: u64) -> bool {
+    INVALIDATED_DEVICES.lock().contains(&device)
+}
+
+/// IoInvalidateDeviceRelations: reenumera as BusRelations do FDO pai.
+pub fn invalidate_device_relations(device: u64, relation_type: u32) {
+    let node = device::find_device_node_by_pointer(device);
+    debug_print!("[pnp] relacoes invalidadas ({}) p/ \\Device\\{}", relation_type, node.map(device::device_name).unwrap_or_else(|| String::from("?")));
+    let Some(node) = node else { return };
+    let parent = io_manager::device(node).and_then(|entry| entry.child_of).unwrap_or(node);
+    for child in query_bus_relations(parent) {
+        let Some(child_node) = register_child_pdo(parent, child) else { continue };
+        if io_manager::device(child_node).and_then(|entry| entry.hardware_ids).is_some_and(|ids| !ids.is_empty()) {
             enumerate_pdo_stack(child_node);
         }
     }

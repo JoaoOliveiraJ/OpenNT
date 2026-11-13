@@ -11,9 +11,10 @@ use alloc::vec::Vec;
 use crate::ntos::alpc::completion_reference::{self, Reference};
 use crate::ntos::alpc::kernel_wait;
 use crate::ntos::alpc::message::buffer as message_buffer;
-use crate::ntos::ke::{clock, thread_alert, thread_dispatch};
+use crate::ntos::ke::{clock, dispatcher, thread_alert, thread_dispatch};
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet, Waiter};
 use crate::ntos::ps::process;
+use crate::ntos::rtl::native_context;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
@@ -281,4 +282,25 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
     });
     reference.port.with(|state| state.waiters.push(waiter.clone()));
     Ok(Removal { immediate: None, state: Some(Active { thread, consumer, output, removed, count, access_mode, alertable, interval, relative_deadline, scratch, reference, alerts, shared, waiter }) })
+}
+
+/// ZwRemoveIoCompletionEx: a entrada Zw de seis argumentos (KernelMode),
+/// com espera cooperativa sem contexto suspenso — bombeia o kernel até a
+/// retirada concluir. O sinal de transferência continua propagando; outra
+/// falha interna interrompe o sistema.
+pub fn remove_cooperative(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, alertable: bool) -> Result<u32, KernelError> {
+    let result = (|| -> Result<u32, KernelError> {
+        let mut request = begin(handle, output, count, removed, timeout, alertable, 0, true, None)?;
+        loop {
+            if let Some(status) = request.poll() {
+                return Ok(status);
+            }
+            dispatcher::pump_kernel();
+        }
+    })();
+    match result {
+        Ok(status) => Ok(status),
+        Err(error) if native_context::is_transfer(&error) => Err(error),
+        Err(error) => panic!("[remove-completion] fatal kernel failure: {error}"),
+    }
 }

@@ -10,6 +10,7 @@
 //! - PoQueryWatchdogTime responde que nenhum watchdog está armado.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::io::io_manager;
@@ -140,4 +141,18 @@ pub fn query_watchdog_time(seconds_out: u64) -> bool {
         guest::write32(seconds_out, 0);
     }
     false
+}
+
+/// PoDisableSleepStates: o OpenNT não entra em estados de sono; devolve um
+/// identificador opaco não-nulo (um buffer em cache) que o driver guarda e
+/// repassa a PoReenableSleepStates, que é um no-op.
+static SLEEP_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+pub fn disable_sleep_states() -> u64 {
+    let mut handle = SLEEP_HANDLE.load(Ordering::Acquire);
+    if handle == 0 {
+        handle = guest::alloc_bytes(16);
+        SLEEP_HANDLE.store(handle, Ordering::Release);
+    }
+    handle
 }

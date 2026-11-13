@@ -457,3 +457,22 @@ pub fn wcsncpy_s(destination: u64, capacity: u64, source: u64, count: u64) -> u6
 pub fn purecall() -> ! {
     crate::ntos::ke::bugcheck::bug_check_ex(0x0000_0139, 0x0000_0005, 0, 0, 0)
 }
+
+/// _strnicmp: compara até `count` bytes sem diferenciar maiúsculas/minúsculas
+/// (-1, 0 ou 1).
+pub fn strnicmp(first: u64, second: u64, count: u64) -> i32 {
+    let (mut first, mut second) = (first, second);
+    for _ in 0..count {
+        let left = guest::read8(first).to_ascii_lowercase();
+        let right = guest::read8(second).to_ascii_lowercase();
+        if left != right {
+            return if left < right { -1 } else { 1 };
+        }
+        if left == 0 {
+            break;
+        }
+        first += 1;
+        second += 1;
+    }
+    0
+}

@@ -220,3 +220,9 @@ pub fn reserve_clear_run(header: u64, first_bit: u32, count: u32) -> u32 {
     }
     1
 }
+
+/// RtlFindLeastSignificantBit: índice do bit 1 mais baixo, -1 se a máscara
+/// for zero (CCHAR).
+pub fn find_least_significant_bit(set: u64) -> i8 {
+    if set == 0 { -1 } else { set.trailing_zeros() as i8 }
+}

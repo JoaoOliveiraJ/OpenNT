@@ -243,3 +243,19 @@ pub fn call(handler: u64, arguments: &[u64], source_context: u64) -> Result<u64,
     guest::free_bytes(processor);
     result
 }
+
+/// Tamanho do CONTEXT x64 do Windows e ContextFlags de CONTEXT_FULL.
+const CONTEXT_SIZE: u64 = 0x4D0;
+const CONTEXT_FULL: u32 = 0x0010_000B;
+
+/// RtlCaptureContext: copia o CONTEXT nativo ativo (o estado do chamador no
+/// gateway, isto é, logo após o `call` ao export) para o buffer do
+/// convidado e fixa ContextFlags = CONTEXT_FULL, como o ntoskrnl.
+pub fn capture_context(target: u64) {
+    if target != 0 {
+        if let Ok(source) = current() {
+            copy(target, source, CONTEXT_SIZE);
+        }
+        guest::write32(target + 0x30, CONTEXT_FULL);
+    }
+}

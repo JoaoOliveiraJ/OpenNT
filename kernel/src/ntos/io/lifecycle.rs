@@ -40,6 +40,8 @@ static DRIVERS: SpinLock<BTreeMap<u64, NativeDriver>> = SpinLock::new(BTreeMap::
 static CURRENT: SpinLock<Option<u64>> = SpinLock::new(None);
 /// IoRegisterDriverReinitialization: rodam depois dos drivers de boot.
 static REINITIALIZATION: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
+/// Extensões de driver object: (DRIVER_OBJECT, tag) → bloco.
+static DRIVER_EXTENSIONS: SpinLock<BTreeMap<(u64, u64), u64>> = SpinLock::new(BTreeMap::new());
 
 /// Erro de carga com o código Win32 do original (1056 já carregado, 2 não
 /// encontrado, 31 DriverEntry falhou).
@@ -82,6 +84,25 @@ pub fn node_by_driver_object(driver: u64) -> Option<NodeId> {
 
 pub fn register_reinitialization(routine: u64, context: u64) {
     REINITIALIZATION.lock().push((routine, context));
+}
+
+/// IoAllocateDriverObjectExtension: uma extensão por (driver, tag);
+/// repetida = STATUS_OBJECT_NAME_COLLISION.
+pub fn allocate_driver_object_extension(driver: u64, tag: u64, size: u32, output: u64) -> u32 {
+    let key = (driver, tag);
+    let mut extensions = DRIVER_EXTENSIONS.lock();
+    if extensions.contains_key(&key) {
+        return 0xC000_0035;
+    }
+    let extension = guest::alloc_bytes(size as u64);
+    extensions.insert(key, extension);
+    guest::write64(output, extension);
+    0
+}
+
+/// IoGetDriverObjectExtension.
+pub fn driver_object_extension(driver: u64, tag: u64) -> u64 {
+    DRIVER_EXTENSIONS.lock().get(&(driver, tag)).copied().unwrap_or(0)
 }
 
 /// Chamado pelo Service Control ao fim da carga dos drivers de boot.

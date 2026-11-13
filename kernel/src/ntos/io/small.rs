@@ -5,6 +5,14 @@
 //! - `boot_drivers_state` — `system32/ntos/io/boot-drivers-state.js`
 //! - `initial_stack` — `system32/ntos/io/initial-stack.js`
 //! - `thread_io` — `system32/ntos/io/thread-io.js`
+//! - `configuration_information` — a CONFIGURATION_INFORMATION global
+//! - `error_log` — entradas do log de erros de I/O
+//! - `shutdown_notification` — dispositivos que recebem IRP_MJ_SHUTDOWN
+//! - `priority_callbacks` — callbacks de prioridade de I/O registrados
+//! - `wmi_registration` — dispositivos com classes WMI registradas
+//! - `sfio_stream` — identificadores de stream do Storage QoS
+//! - `partition_table` — IoReadPartitionTableEx
+//! - `portable_operating_system` — RtlCheckPortableOperatingSystem
 
 /// Remoção compartilhada pelos exports Io* e pelo descarregamento de drivers.
 pub mod delete_device {
@@ -70,6 +78,12 @@ pub mod initial_stack {
     pub fn get() -> u64 {
         guest::read64(process::get_current_thread() + kthread::INITIAL_STACK)
     }
+
+    /// IoGetStackLimits: limites da pilha do kernel do mapa de memória do boot.
+    pub fn limits(low_output: u64, high_output: u64) {
+        guest::write64(low_output, 0x20_0000);
+        guest::write64(high_output, 0x30_0000);
+    }
 }
 
 /// ETHREAD.CrossThreadFlags.HardErrorsAreDisabled (19041); o bit segue a
@@ -93,6 +107,186 @@ pub mod thread_io {
             if guest::compare_exchange32(address, previous, next)? == previous {
                 return Ok(if previous & 16 != 0 { 0 } else { 1 });
             }
+        }
+    }
+}
+
+/// IoGetConfigurationInformation: CONFIGURATION_INFORMATION global, criada
+/// na primeira consulta (drivers incrementam as contagens).
+pub mod configuration_information {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::ntos::mm::guest_memory as guest;
+
+    static CONFIGURATION_INFORMATION: AtomicU64 = AtomicU64::new(0);
+
+    pub fn get() -> u64 {
+        let current = CONFIGURATION_INFORMATION.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let pointer = guest::alloc_bytes(0x40);
+        match CONFIGURATION_INFORMATION.compare_exchange(0, pointer, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => pointer,
+            Err(existing) => {
+                guest::free_bytes(pointer);
+                existing
+            }
+        }
+    }
+}
+
+/// IoAllocateErrorLogEntry / IoWriteErrorLogEntry: o código vai para o log
+/// do sistema (serial).
+pub mod error_log {
+    use crate::ntos::mm::guest_memory as guest;
+
+    pub fn allocate_entry(size: u8) -> u64 {
+        guest::alloc_bytes(size as u64)
+    }
+
+    pub fn write_entry(entry: u64) {
+        debug_print!("[errorlog] codigo=0x{:x}", guest::read32(entry + 4));
+        guest::free_bytes(entry);
+    }
+}
+
+/// IoRegister/UnregisterShutdownNotification: dispositivos que recebem
+/// IRP_MJ_SHUTDOWN no desligamento.
+pub mod shutdown_notification {
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    use crate::ntos::io::{device, io_manager};
+    use crate::rtl::SpinLock;
+
+    static SHUTDOWN_DEVICES: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+    pub fn register(device: u64) {
+        SHUTDOWN_DEVICES.lock().push(device);
+    }
+
+    pub fn unregister(device: u64) {
+        let mut devices = SHUTDOWN_DEVICES.lock();
+        if let Some(index) = devices.iter().position(|&candidate| candidate == device) {
+            devices.remove(index);
+        }
+    }
+
+    /// Chamado no desligamento: IRP_MJ_SHUTDOWN a cada dispositivo registrado.
+    pub fn run_shutdown_notifications() {
+        let devices = SHUTDOWN_DEVICES.lock().clone();
+        for device in devices {
+            let Some(node) = device::find_device_node_by_pointer(device) else { continue };
+            let mut request = io_manager::make_io_request(io_manager::irp_mj::SHUTDOWN, io_manager::IoParams::default());
+            let _ = io_manager::call_driver(&format!("\\Device\\{}", device::device_name(node)), &mut request);
+        }
+    }
+}
+
+/// IoRegister/UnregisterPriorityCallback: callbacks de prioridade de I/O.
+pub mod priority_callbacks {
+    use alloc::vec::Vec;
+
+    use crate::rtl::SpinLock;
+
+    static PRIORITY_CALLBACKS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+    pub fn register(callback: u64) {
+        PRIORITY_CALLBACKS.lock().push(callback);
+    }
+
+    pub fn unregister(callback: u64) {
+        let mut callbacks = PRIORITY_CALLBACKS.lock();
+        if let Some(index) = callbacks.iter().position(|&candidate| candidate == callback) {
+            callbacks.remove(index);
+        }
+    }
+}
+
+/// IoWMIRegistrationControl e as consultas WMI dos drivers: sem provedor
+/// WMI nesta plataforma, os blocos não existem.
+pub mod wmi_registration {
+    use alloc::collections::BTreeSet;
+
+    use crate::rtl::SpinLock;
+
+    const STATUS_WMI_GUID_NOT_FOUND: u32 = 0xC000_0295;
+
+    /// Dispositivos com classes WMI registradas.
+    static WMI_DEVICES: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+    /// IoWMIRegistrationControl: a ação 0 registra; as demais retiram.
+    pub fn registration_control(device: u64, action: u32) {
+        if action == 0 {
+            WMI_DEVICES.lock().insert(device);
+        } else {
+            WMI_DEVICES.lock().remove(&device);
+        }
+    }
+
+    /// IoWMIDeviceObjectToProviderId: um ponteiro único e estável serve de
+    /// id do provedor WMI.
+    pub fn provider_id(device: u64) -> u64 {
+        device as u32 as u64
+    }
+
+    /// IoWMIOpenBlock / IoWMIQueryAllData: sem provedor WMI, o GUID não
+    /// existe — a inicialização de WMI dos drivers segue mesmo com essa falha.
+    pub fn guid_not_found() -> u32 {
+        STATUS_WMI_GUID_NOT_FOUND
+    }
+}
+
+/// IoAllocateSfioStreamIdentifier: Storage QoS sem política configurada,
+/// identificador nulo.
+pub mod sfio_stream {
+    use crate::ntos::mm::guest_memory as guest;
+
+    pub fn allocate_identifier(output: u64) {
+        if output != 0 {
+            guest::write64(output, 0);
+        }
+    }
+}
+
+/// IoReadPartitionTableEx: IOCTL_DISK_GET_DRIVE_LAYOUT_EX ao dispositivo e
+/// o buffer devolvido ao chamador.
+pub mod partition_table {
+    use alloc::format;
+
+    use crate::ntos::io::{device, io_manager};
+    use crate::ntos::ke::dispatcher;
+    use crate::rtl::KernelError;
+    use crate::ntos::mm::guest_memory as guest;
+
+    const IOCTL_DISK_GET_DRIVE_LAYOUT_EX: u32 = 0x0007_0050;
+
+    pub fn read_partition_table_ex(device_object: u64, output: u64) -> Result<u32, KernelError> {
+        let buffer = guest::alloc_bytes(0x1000);
+        let event = guest::alloc_bytes(0x18);
+        dispatcher::initialize_event(event, 0, false);
+        let Some(node) = device::find_device_node_by_pointer(device_object) else { return Ok(0xC000_000D) };
+        let mut request = io_manager::make_io_request(io_manager::irp_mj::DEVICE_CONTROL, io_manager::IoParams { control_code: IOCTL_DISK_GET_DRIVE_LAYOUT_EX, binary: true, buffer_length: Some(0x1000), user_event: event, ..Default::default() });
+        io_manager::call_driver(&format!("\\Device\\{}", device::device_name(node)), &mut request)?;
+        if request.status != 0 {
+            return Ok(request.status as u32);
+        }
+        if let io_manager::IoResult::Bytes(bytes) = &request.result {
+            guest::write_bytes(buffer, &bytes[..bytes.len().min(0x1000)]);
+        }
+        guest::write64(output, buffer);
+        Ok(0)
+    }
+}
+
+/// RtlCheckPortableOperatingSystem: este boot nunca é Windows To Go.
+pub mod portable_operating_system {
+    use crate::ntos::mm::guest_memory as guest;
+
+    pub fn check(output: u64) {
+        if output != 0 {
+            guest::write8(output, 0);
         }
     }
 }

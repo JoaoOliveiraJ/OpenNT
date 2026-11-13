@@ -4,7 +4,11 @@
 //! a primeira usada fica no endereço mais alto (slot StackCount-1),
 //! CurrentLocation = StackCount+1 e CurrentStackLocation aponta uma acima
 //! do topo, como o IopAllocateIrp do NT; cada IofCallDriver desce um nível.
+//! Também a alocação, a reinicialização e a liberação dos exports
+//! (IoAllocateIrp, IoInitializeIrp, IoReuseIrp, IoFreeIrp,
+//! IoSetMasterIrpStatus).
 
+use crate::ntos::io::irp_extension;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::{io_stack_location as stack, irp};
 
@@ -127,4 +131,58 @@ pub fn build(address: u64, options: &BuildOptions) {
 /// IoStatus depois da execução do driver: (NTSTATUS com sinal, Information).
 pub fn read_io_status(address: u64) -> (i32, u64) {
     (guest::read32(address + irp::IO_STATUS) as i32, guest::read64(address + irp::IO_STATUS_INFORMATION))
+}
+
+/// IoAllocateIrp: IRP zerado posicionado acima do topo da pilha.
+pub fn allocate_irp(stack_size: i8) -> u64 {
+    let count = stack_size.max(1) as u64;
+    let size = irp::STRUCT_SIZE + count * irp::STACK_LOCATION_SIZE;
+    let address = guest::alloc_bytes(size);
+    if address == 0 {
+        return 0;
+    }
+    guest::write16(address + irp::TYPE, irp::IO_TYPE);
+    guest::write16(address + irp::SIZE_FIELD, size as u16);
+    guest::write8(address + irp::STACK_COUNT, count as u8);
+    guest::write8(address + irp::CURRENT_LOCATION, count as u8 + 1);
+    guest::write64(address + irp::CURRENT_STACK_LOCATION, address + irp::STRUCT_SIZE + count * irp::STACK_LOCATION_SIZE);
+    address
+}
+
+/// IoFreeIrp: a extensão pertence ao IRP e não sobrevive ao reuso.
+pub fn free_irp(packet: u64) {
+    irp_extension::release(packet);
+    guest::free_bytes(packet);
+}
+
+/// IoReuseIrp: reinicializa mantendo o tamanho e a pilha alocados.
+pub fn reuse_irp(packet: u64, status: u32) {
+    let count = guest::read8(packet + irp::STACK_COUNT);
+    guest::write32(packet + irp::FLAGS, 0);
+    guest::write64(packet + irp::MDL_ADDRESS, 0);
+    guest::write64(packet + irp::SYSTEM_BUFFER, 0);
+    guest::write32(packet + irp::IO_STATUS, status);
+    guest::write64(packet + irp::IO_STATUS_INFORMATION, 0);
+    guest::write8(packet + irp::CURRENT_LOCATION, count.wrapping_add(1));
+    guest::write8(packet + irp::CANCEL, 0);
+    guest::write64(packet + irp::USER_EVENT, 0);
+    guest::write64(packet + irp::CURRENT_STACK_LOCATION, first_stack_location(packet, count as u32) + stack::SIZE);
+}
+
+/// IoInitializeIrp: a forma do IopAllocateIrp, sem a alocação.
+pub fn initialize_irp(packet: u64, size: u16, count: u8) {
+    for offset in (0..size as u64).step_by(4) {
+        guest::write32(packet + offset, 0);
+    }
+    guest::write16(packet + irp::TYPE, irp::IO_TYPE);
+    guest::write16(packet + irp::SIZE_FIELD, size);
+    guest::write8(packet + irp::STACK_COUNT, count);
+    guest::write8(packet + irp::CURRENT_LOCATION, count.wrapping_add(1));
+    guest::write64(packet + irp::CURRENT_STACK_LOCATION, first_stack_location(packet, count as u32) + stack::SIZE);
+}
+
+/// IoSetMasterIrpStatus: grava o status no IRP mestre e o devolve.
+pub fn set_master_irp_status(packet: u64, status: u64) -> u64 {
+    guest::write32(packet + irp::IO_STATUS, status as u32);
+    status
 }

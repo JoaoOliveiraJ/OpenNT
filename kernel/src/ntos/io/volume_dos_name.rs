@@ -12,7 +12,7 @@ use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::irp;
-use crate::ntos::io::exports as io;
+use crate::ntos::io::device as io;
 
 const MOUNT_MANAGER: &str = "\\Device\\MountPointManager";
 const INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -76,7 +76,7 @@ pub fn volume_device_to_dos_name(device: u64, dos_name: u64) -> Result<u32, Kern
             guest::write16(name_buffer + index as u64 * 2, *unit);
         }
         guest::write16(name_buffer + units.len() as u64 * 2, 0);
-        let status = io::get_device_object_pointer(unicode_name, 0x80, file_output, device_output)? as u32;
+        let status = io::get_device_object_pointer(unicode_name, 0x80, file_output, device_output)?;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }

@@ -66,6 +66,24 @@ pub fn queue_work_item(item: u64, routine: u64, queue_type: u32, context: u64) {
     queue_work_item_ex(item, routine, queue_type, context, false);
 }
 
+/// IoAllocateWorkItem: aloca o IO_WORKITEM e o liga ao device dono.
+pub fn allocate_work_item(device: u64) -> u64 {
+    let item = guest::alloc_bytes(layout::SIZE);
+    create_work_item(device, item);
+    item
+}
+
+/// IoFreeWorkItem: tira o item da fila e devolve o armazenamento.
+pub fn free_work_item(item: u64) {
+    unqueue(item);
+    guest::free_bytes(item);
+}
+
+/// IoSizeofWorkItem.
+pub fn work_item_size() -> u64 {
+    layout::SIZE
+}
+
 /// Variante interna: rotina do kernel em vez de código de driver.
 pub fn queue_kernel_work_item(item: u64, routine: KernelWorkRoutine, context: u64, ready: Option<fn() -> bool>) {
     if QUEUE.lock().entries.iter().any(|&(queued, _)| queued == item) {

@@ -1990,7 +1990,7 @@ fn io_group_exports(assert: Assert) {
     use crate::ntos::mm::paging;
     use crate::ntos::ob::object_manager;
     use crate::ntos::inc::nt_abi::{device_object, io_workitem, irp};
-    use crate::{ntos::io::exports as io, ntos::io::lifecycle};
+    use crate::{ntos::io::device_interface, ntos::io::lifecycle};
     let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
     let counter = guest::alloc_bytes(8);
     let entry = [0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00, 0x48, 0x89, 0x41, 0x68, 0x31, 0xC0, 0xC3];
@@ -2067,7 +2067,7 @@ fn io_group_exports(assert: Assert) {
     let interface = call_export("IoRegisterDeviceInterface", &[first, block + 0x720, 0, block + 0x740]);
     let link_name = guest_strings_read(block + 0x740);
     let enabled = call_export("IoSetDeviceInterfaceState", &[block + 0x740, 1]);
-    assert(status(registered) == 0 && status(interface) == 0 && link_name == "\\DosDevices\\#{112233445566778899aabbccddeef001}" && status(enabled) == 0 && guest::read32(context) == 0x55 && io::interface_enabled(&link_name) == Some(true), "io: interface de dispositivo habilitada notifica o callback PnP nativo");
+    assert(status(registered) == 0 && status(interface) == 0 && link_name == "\\DosDevices\\#{112233445566778899aabbccddeef001}" && status(enabled) == 0 && guest::read32(context) == 0x55 && device_interface::interface_enabled(&link_name) == Some(true), "io: interface de dispositivo habilitada notifica o callback PnP nativo");
     assert(status(call_export("IoUnregisterPlugPlayNotification", &[registration])) == 0 && status(call_export("IoUnregisterPlugPlayNotification", &[registration])) == 0xC000_0034, "io: IoUnregisterPlugPlayNotification");
     let configuration = call_export("IoGetConfigurationInformation", &[]);
     assert(configuration.is_some_and(|pointer| pointer != 0) && call_export("IoGetConfigurationInformation", &[]) == configuration && call_export("IoSizeofWorkItem", &[]) == Some(io_workitem::SIZE) && call_export("IoGetRequestorProcess", &[0]) == Some(crate::ntos::ps::process::get_system_process()), "io: configuracao global, tamanho do work item e processo do IRP");
