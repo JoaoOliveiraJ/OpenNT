@@ -55,8 +55,8 @@ impl ReadCache {
         self.per_file.remove(&file);
     }
 
-    /// Libera antes de alocar o bloco novo: a leitura pode falhar sem deixar
-    /// referência órfã nem estourar o orçamento.
+    /// Libera antes de inserir o bloco novo: o orçamento nunca estoura, e
+    /// uma leitura que falha não deixa referência órfã.
     fn reserve(&mut self, file: u64, length: u64) -> Result<(), KernelError> {
         if self.per_file.get(&file).map_or(0, |order| order.len()) >= READ_CACHE_BLOCKS_PER_FILE {
             if let Some(&oldest) = self.per_file.get(&file).and_then(|order| order.front()) {
@@ -212,22 +212,56 @@ impl VolumeFile {
         CACHE.lock().clear(self.id);
     }
 
-    /// Materializa o arquivo inteiro só no primeiro uso da geração.
+    /// Materializa o arquivo inteiro só no primeiro uso da geração. Os bytes
+    /// só ficam guardados se a geração não mudou durante a leitura: um
+    /// refresh de outra CPU no meio já descartou o estado em que ela começou.
     pub fn read_all(&self) -> Option<Arc<Vec<u8>>> {
         self.refresh();
-        if let Some(bytes) = self.state.lock().bytes.clone() {
-            return Some(bytes);
+        let (generation, size) = {
+            let state = self.state.lock();
+            if let Some(bytes) = state.bytes.clone() {
+                return Some(bytes);
+            }
+            (state.generation, state.size)
+        };
+        let bytes = Arc::new(self.volume.read_range(&self.volume_path(), 0, size).ok().flatten()?);
+        let mut state = self.state.lock();
+        if state.generation == generation {
+            state.bytes = Some(bytes.clone());
         }
-        let bytes = Arc::new(self.volume.read_range(&self.volume_path(), 0, self.size()).ok().flatten()?);
-        self.state.lock().bytes = Some(bytes.clone());
         Some(bytes)
+    }
+
+    /// Guarda um bloco lido na geração `generation`. Se outra CPU guardou o
+    /// mesmo bloco antes, vale o dela; se a geração mudou no meio, o bloco
+    /// serve só a esta leitura. Conferir e inserir sob o lock do cache fecha
+    /// a corrida com o `refresh`, que troca a geração antes de limpar os
+    /// blocos.
+    fn publish_block(&self, key: (u64, u64), generation: u64, block: Arc<Vec<u8>>) -> Result<Arc<Vec<u8>>, KernelError> {
+        let mut cache = CACHE.lock();
+        if let Some(existing) = cache.blocks.get(&key).cloned() {
+            cache.touch(key)?;
+            return Ok(existing);
+        }
+        if self.state.lock().generation != generation {
+            return Ok(block);
+        }
+        cache.reserve(self.id, block.len() as u64)?;
+        cache.blocks.insert(key, block.clone());
+        cache.lru.push_back(key);
+        cache.per_file.entry(self.id).or_default().push_back(key.1);
+        cache.bytes += block.len() as u64;
+        Ok(block)
     }
 
     /// Limitado ao EOF; pedidos acima de 64 KiB leem direto, os menores
     /// passam pelo cache.
     pub fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
         self.refresh();
-        let size = self.size();
+        let (generation, size) = {
+            let state = self.state.lock();
+            (state.generation, state.size)
+        };
         if offset >= size {
             return Ok(Vec::new());
         }
@@ -240,24 +274,23 @@ impl VolumeFile {
             let current = offset + result.len() as u64;
             let block_offset = current / READ_CACHE_BLOCK_BYTES * READ_CACHE_BLOCK_BYTES;
             let key = (self.id, block_offset);
-            let cached = CACHE.lock().blocks.get(&key).cloned();
+            let cached = {
+                let mut cache = CACHE.lock();
+                let block = cache.blocks.get(&key).cloned();
+                if block.is_some() {
+                    cache.touch(key)?;
+                }
+                block
+            };
             let block = match cached {
                 Some(block) => block,
                 None => {
                     let block_length = READ_CACHE_BLOCK_BYTES.min(size - block_offset);
-                    CACHE.lock().reserve(self.id, block_length)?;
                     let fetched = self.volume.read_range(&self.volume_path(), block_offset, block_length)?;
                     let Some(fetched) = fetched.filter(|bytes| bytes.len() as u64 == block_length) else { return Err(KernelError::new(alloc::format!("NTFS: leitura falhou: {}", self.volume_path()))) };
-                    let block = Arc::new(fetched);
-                    let mut cache = CACHE.lock();
-                    cache.blocks.insert(key, block.clone());
-                    cache.lru.push_back(key);
-                    cache.per_file.entry(self.id).or_default().push_back(block_offset);
-                    cache.bytes += block.len() as u64;
-                    block
+                    self.publish_block(key, generation, Arc::new(fetched))?
                 }
             };
-            CACHE.lock().touch(key)?;
             let start = (current - block_offset) as usize;
             let count = ((length - result.len() as u64) as usize).min(block.len() - start);
             result.extend_from_slice(&block[start..start + count]);
@@ -332,12 +365,16 @@ pub fn lookup_volume_file(nt_path: &str) -> Option<Arc<VolumeFile>> {
         FILES.lock().remove(&key);
     }
     let (volume, fixed) = volume_entry()?;
+    // A geração vem antes do stat: uma mudança entre os dois deixa o
+    // arquivo numa geração velha (e o próximo refresh relê), nunca um stat
+    // velho numa geração nova.
+    let generation = volume.generation();
     let stat = volume.stat(&volume_path).ok().flatten()?;
     let fs: &'static dyn super::volume::FileSystem = fixed;
     let file = Arc::new(VolumeFile {
         id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
         paths: SpinLock::new(Paths { nt_path: native_file_name::from_volume(fs, &volume_path).unwrap_or_else(|| String::from(nt_path)), base_name: String::from(&volume_path[1..]), volume_path }),
-        state: SpinLock::new(FileState { size: stat.size, directory: stat.directory, generation: volume.generation(), stat, bytes: None }),
+        state: SpinLock::new(FileState { size: stat.size, directory: stat.directory, generation, stat, bytes: None }),
         volume,
         marks: Arc::new(FileMarks::default()),
         opens: SpinLock::new(Vec::new()),

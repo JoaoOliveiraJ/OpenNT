@@ -959,16 +959,21 @@ pub struct Space {
 }
 
 impl Ntfs {
+    /// O estado do writer com o recurso do volume exclusivo: as leituras da
+    /// operação e o commit não se misturam com leituras de outra CPU.
     fn with_writer<T>(&self, action: impl FnOnce(&mut Tx<'_>) -> Result<T, KernelError>) -> Result<T, KernelError> {
+        let _exclusive = self.resource().acquire_exclusive();
         let mut state = self.writer.lock();
         let mut tx = Tx { volume: self, state: &mut state };
         action(&mut tx)
     }
 
     pub fn query_ea(&self, path: &str, length: usize, options: &ea::QueryOptions, state: &mut ea::QueryState) -> Result<ea::QueryResult, KernelError> {
-        let Some(entry) = self.find(path)? else { return fail(0xC000_0034, "arquivo ausente") };
-        let record = self.read_record(entry.reference)?;
-        let entries = self.with_writer(|tx| tx.read_ea(&record))?;
+        let entries = self.with_writer(|tx| {
+            let Some(entry) = tx.volume.find(path)? else { return fail(0xC000_0034, "arquivo ausente") };
+            let record = tx.volume.read_record(entry.reference)?;
+            tx.read_ea(&record)
+        })?;
         Ok(ea::query(&entries, length, options, state))
     }
 

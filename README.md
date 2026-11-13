@@ -165,8 +165,10 @@ cargo xtask test-boot KERNEL_RS_OK 120000 "--keys=run hello\nps\n" "--expect== 4
 cargo xtask status
 ```
 
-Opções de build: `--release`, `--build-dir=DIR`, `--kernel-test-scope=none|all`,
-`--start-driver=NOME` (inicia o serviço pelo gerenciador de serviços, com a
+Opções de build: `--release`, `--build-dir=DIR`,
+`--kernel-test-scope=none|all|disk-stress` (`disk-stress` roda só a estressa
+do caminho de escrita do disco, com leitores em outras CPUs, e imprime
+`DISK_STRESS_OK`), `--start-driver=NOME` (inicia o serviço pelo gerenciador de serviços, com a
 integridade de código ativa, e imprime `DRIVER_START_COMPLETED`),
 `--trace-driver-api` (mostra cada chamada de API do driver enquanto ele inicia:
 objetos abertos, rotinas pedidas ao `MmGetSystemRoutineAddress`, valores do

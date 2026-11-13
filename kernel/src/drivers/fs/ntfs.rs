@@ -4,6 +4,12 @@
 //! (runlists com deltas com sinal), $FILE_NAME e diretórios B-tree com
 //! blocos INDX. As mutações persistentes (`ntfs_write`) e os controles
 //! (`ntfs_control`) se acoplam a este volume.
+//!
+//! Cada drive tem um recurso compartilhado/exclusivo (o `Vcb->Resource` do
+//! NTFS): as leituras do volume o tomam compartilhado e uma transação do
+//! writer o toma exclusivo, do primeiro setor lido ao fim do commit. Assim
+//! nenhuma CPU lê no meio de um commit (com parte dos setores gravados) nem
+//! enche os caches com o que o commit acabou de invalidar.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -12,7 +18,7 @@ use alloc::vec::Vec;
 
 use crate::drivers::storage::ata_pio;
 use crate::hal::physical;
-use crate::rtl::{KernelError, SpinLock};
+use crate::rtl::{KernelError, SharedLock, SpinLock};
 
 const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 
@@ -157,6 +163,10 @@ static GENERATIONS: SpinLock<BTreeMap<u8, u64>> = SpinLock::new(BTreeMap::new())
 fn generation_of(drive: u8) -> u64 {
     GENERATIONS.lock().get(&drive).copied().unwrap_or(0)
 }
+
+/// Recursos dos drives 0 e 1. São por drive, não por montagem: as montagens
+/// do mesmo disco dividem o disco e a geração.
+static VOLUME_RESOURCES: [SharedLock; 2] = [SharedLock::new(), SharedLock::new()];
 
 /// Volume NTFS montado.
 pub struct Ntfs {
@@ -382,8 +392,15 @@ fn apply_fixup(block: &mut [u8], usa: usize, count: usize, sector_size: usize, m
 }
 
 impl Ntfs {
+    /// O recurso do volume: compartilhado nas leituras, exclusivo nas
+    /// transações.
+    pub fn resource(&self) -> &'static SharedLock {
+        &VOLUME_RESOURCES[self.drive as usize % VOLUME_RESOURCES.len()]
+    }
+
     /// Lê setores com as escritas pendentes sobrepostas.
     pub fn read_sectors(&self, lba: u64, count: u64) -> Result<Vec<u8>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let mut bytes = ata_pio::read_sectors(lba, count as u32, self.drive)?;
         for operation in self.pending.lock().iter() {
             let first = lba.max(operation.lba);
@@ -402,6 +419,7 @@ impl Ntfs {
 
     /// Registro MFT com fixup.
     pub fn read_record(&self, number: u64) -> Result<Vec<u8>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let volume = &self.geometry;
         let offset = volume.mft_lcn * volume.cluster_size + number * volume.record_size;
         let mut record = self.read_sectors(offset / volume.sector_size, volume.record_size / volume.sector_size)?;
@@ -419,6 +437,7 @@ impl Ntfs {
 
     /// Conteúdo de um atributo (residente ou pela runlist).
     pub fn read_data(&self, record: &[u8], attribute_type: u32) -> Result<Vec<u8>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let Some(data) = find_attribute(record, attribute_type)? else { return Ok(Vec::new()) };
         if !data.non_resident {
             return Ok(data.value);
@@ -462,12 +481,14 @@ impl Ntfs {
 
     /// Mutação persistente: avança a geração do drive.
     pub fn changed(&self) {
+        let _exclusive = self.resource().acquire_exclusive();
         *GENERATIONS.lock().entry(self.drive).or_insert(0) += 1;
         self.fresh();
     }
 
     /// Entradas do diretório `reference`, com blocos INDX dos índices grandes.
     pub fn root_index(&self, reference: u64) -> Result<Vec<IndexEntry>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         self.fresh();
         if let Some(entries) = self.caches.lock().directories.get(&reference) {
             return Ok(entries.clone());
@@ -564,6 +585,7 @@ impl Ntfs {
 
     /// Resolve um caminho `/A/B` sem diferença de caixa; `.` e `..` são recusados.
     pub fn find(&self, path: &str) -> Result<Option<IndexEntry>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         self.fresh();
         let mut found = IndexEntry { name: String::new(), reference: 5, sequence: 0, value: Vec::new() };
         for part in path.split('/').filter(|part| !part.is_empty()) {
@@ -580,6 +602,7 @@ impl Ntfs {
     }
 
     pub fn volume_information(&self) -> Result<VolumeInformation, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let record = self.read_record(3)?;
         let name = find_attribute(&record, 0x60)?;
         let standard = find_attribute(&record, 0x10)?;
@@ -606,12 +629,14 @@ impl Ntfs {
     }
 
     pub fn list(&self, path: &str) -> Result<Option<Vec<String>>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let Some(entry) = self.find(path)? else { return Ok(None) };
         let prefix = path.trim_end_matches('/');
         Ok(Some(self.root_index(entry.reference)?.into_iter().map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
     }
 
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let Some(entry) = self.find(path)? else { return Ok(None) };
         let record = self.read_record(entry.reference)?;
         let data = find_attribute(&record, 0x80)?;
@@ -634,6 +659,7 @@ impl Ntfs {
 
     /// Tamanho real e runs em setores do $DATA, sem ler o arquivo inteiro.
     pub fn file_layout(&self, path: &str) -> Result<Option<Layout>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         self.fresh();
         let key = path.to_lowercase();
         if let Some(layout) = self.caches.lock().layouts.get(&key) {
@@ -655,6 +681,7 @@ impl Ntfs {
 
     /// Lê `[offset, offset+length)` do $DATA andando pelas runs.
     pub fn read_range(&self, path: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let Some(layout) = self.file_layout(path)? else { return Ok(None) };
         let length = length.min(layout.size.saturating_sub(offset));
         if length == 0 {
@@ -694,6 +721,7 @@ impl Ntfs {
     /// Copia `[offset, offset+length)` do $DATA direto para a memória física:
     /// o miolo alinhado vai por DMA de bus master e os cantos por um setor.
     pub fn copy_range_to_physical(&self, path: &str, offset: u64, destination: u64, length: u64) -> Result<(), KernelError> {
+        let _shared = self.resource().acquire_shared();
         let layout = self.file_layout(path)?.filter(|layout| offset + length <= layout.size).ok_or_else(|| error("NTFS: faixa de copia invalida"))?;
         let Some(runs) = layout.runs else {
             let bytes = self.read_range(path, offset, length)?.unwrap_or_default();
@@ -743,6 +771,7 @@ impl Ntfs {
     }
 
     pub fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>, KernelError> {
+        let _shared = self.resource().acquire_shared();
         let Some(entry) = self.find(path)? else { return Ok(None) };
         let record = self.read_record(entry.reference)?;
         self.read_data(&record, 0x80).map(Some)

@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
-//! `--user-program=shell`, `--kernel-test-scope=none|all`, `--console-mirror`,
+//! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
@@ -34,7 +34,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status> [opcoes]
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
-                   --kernel-test-scope=none|all --console-mirror --start-driver=NOME
+                   --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME
                    --trace-driver-api
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)";

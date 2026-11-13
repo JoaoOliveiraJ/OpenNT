@@ -954,6 +954,165 @@ fn user_file_io_more(assert: Assert) {
     }
 }
 
+/// Fim do leitor concorrente da estressa de disco.
+static DISK_STRESS_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// FNV-1a de 64 bits: a assinatura dos setores relidos.
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01B3))
+}
+
+/// Job de AP: relê `count` setores a partir de `lba` do drive `drive` até o
+/// sinal de parada e confere a assinatura. Devolve falhas << 32 | leituras.
+extern "win64" fn disk_stress_reader(lba: u64, count: u64, drive: u64, expected: u64) -> u64 {
+    use crate::drivers::storage::ata_pio;
+    let (mut reads, mut failures) = (0u64, 0u64);
+    while !DISK_STRESS_STOP.load(Ordering::Acquire) {
+        if !ata_pio::read_sectors(lba, count as u32, drive as u8).is_ok_and(|bytes| fnv64(&bytes) == expected) {
+            failures += 1;
+        }
+        reads += 1;
+    }
+    failures << 32 | reads.min(0xFFFF_FFFF)
+}
+
+/// Arquivo que o BSP regrava inteiro a cada rodada (um só byte repetido)
+/// enquanto um AP o relê.
+const DISK_STRESS_SHARED_FILE: &str = "/STRESSAP.DAT";
+const DISK_STRESS_SHARED_SIZE: usize = 24_000;
+
+/// Job de AP: pelo volume NTFS, lê `HELLO.TXT` (busca na raiz, registro e
+/// dados) enquanto o BSP cria e remove arquivos na mesma raiz, e relê o
+/// arquivo que o BSP regrava, que precisa aparecer inteiro numa só versão.
+/// Devolve falhas << 32 | leituras.
+extern "win64" fn disk_stress_volume_reader(volume: u64, expected: u64, _: u64, _: u64) -> u64 {
+    // SAFETY: o `Ntfs` da montagem do boot; o BSP segura o Arc até o fim do job.
+    let volume = unsafe { &*(volume as *const crate::drivers::fs::ntfs::Ntfs) };
+    let (mut reads, mut failures) = (0u64, 0u64);
+    while !DISK_STRESS_STOP.load(Ordering::Acquire) {
+        let found = volume.stat("/HELLO.TXT").is_ok_and(|stat| stat.is_some_and(|stat| stat.reference == 16 && stat.size == 24));
+        let read = volume.read_bytes("/HELLO.TXT").is_ok_and(|bytes| bytes.is_some_and(|bytes| fnv64(&bytes) == expected));
+        let whole = volume.read_bytes(DISK_STRESS_SHARED_FILE).is_ok_and(|bytes| bytes.is_some_and(|bytes| bytes.len() == DISK_STRESS_SHARED_SIZE && bytes.iter().all(|&byte| byte == bytes[0])));
+        if !found || !read || !whole {
+            failures += 1;
+        }
+        reads += 1;
+    }
+    failures << 32 | reads.min(0xFFFF_FFFF)
+}
+
+/// Estressa o caminho de escrita do disco: a cada rodada um arquivo do NTFS
+/// é criado (FILE_OVERWRITE_IF), escrito, truncado (FileEndOfFileInformation),
+/// estendido com zeros, relido, ganha EAs e é excluído no fechamento, pelos
+/// serviços Nt* do modo usuário; um segundo arquivo passa pelas mesmas
+/// mutações direto no volume. Enquanto isso, um AP relê setores fixos do
+/// disco mestre, outro o setor de boot do volume NTFS (o mesmo canal IDE) e
+/// um terceiro lê um arquivo da mesma raiz pelo volume, conferindo cada
+/// leitura.
+pub fn disk_write_stress(assert: Assert, rounds: u32, readers: usize) {
+    use crate::drivers::fs::extended_attributes::{self as ea, Entry, QueryOptions, QueryState};
+    use crate::drivers::fs::{ntfs, volume_files};
+    use crate::drivers::storage::ata_pio;
+    use crate::ntos::ke::smp;
+    use crate::ntos::ps::user::file_io::{self, OpenRequest};
+    use crate::ntos::ps::user::memory;
+    let Some(volume) = ntfs::mounted() else {
+        assert(false, "diskstress: volume NTFS montado");
+        return;
+    };
+    let Ok(block) = memory::map_user_region(0x2_2000) else {
+        assert(false, "diskstress: memoria de usuario");
+        return;
+    };
+    let (out, iosb, offset, rsp, buffer) = (block, block + 0x10, block + 0x20, block + 0x1000, block + 0x2000);
+    let io_status = unsafe { nt::IoStatusBlock::at(iosb) };
+    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+    // Leitores concorrentes nos APs: (lba, setores, drive) com a assinatura
+    // lida antes de começar.
+    let regions = [(1000u64, 64u64, 0u64), (0, 4, 1)];
+    let mut slots = Vec::new();
+    DISK_STRESS_STOP.store(false, Ordering::Release);
+    for (index, &(lba, count, drive)) in regions.iter().take(readers).enumerate() {
+        let Some(slot) = smp::ap_slot(index) else { break };
+        let Ok(reference) = ata_pio::read_sectors(lba, count as u32, drive as u8) else {
+            assert(false, "diskstress: referencia dos leitores");
+            return;
+        };
+        slots.push(slot);
+        let routine = disk_stress_reader as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
+        assert(smp::start_job(slot, routine, [lba, count, drive, fnv64(&reference)]).is_ok_and(|started| started), "diskstress: leitor concorrente no AP");
+    }
+    let shared_file = volume.create(DISK_STRESS_SHARED_FILE, false, 0x20, 0).and_then(|_| volume.write(DISK_STRESS_SHARED_FILE, 0, &[0; DISK_STRESS_SHARED_SIZE]));
+    assert(shared_file.is_ok(), "diskstress: arquivo regravado criado");
+    if readers > regions.len() {
+        if let Some(slot) = smp::ap_slot(regions.len()) {
+            let expected = volume.read_bytes("/HELLO.TXT").ok().flatten().map(|bytes| fnv64(&bytes)).unwrap_or(0);
+            slots.push(slot);
+            let routine = disk_stress_volume_reader as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
+            assert(smp::start_job(slot, routine, [Arc::as_ptr(&volume) as u64, expected, 0, 0]).is_ok_and(|started| started), "diskstress: leitor do volume no AP");
+        }
+    }
+    let lengths = [10u64, 4096, 24_000, 65_000];
+    for round in 0..rounds {
+        let name = alloc::format!("\\??\\D:\\STRESS-{}.DAT", round % 3);
+        let path = alloc::format!("/STRESS-{}.DAT", round % 3);
+        let length = lengths[round as usize % lengths.len()];
+        let pattern: Vec<u8> = (0..length).map(|index| (index * 7 + round as u64) as u8).collect();
+        guest::write64(out, 0);
+        let opened = file_io::open(out, &name, iosb, 5, &OpenRequest { access: 0xC011_0000, share: 7, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
+        let handle = guest::read64(out);
+        assert(opened == 0, "diskstress: FILE_OVERWRITE_IF cria o arquivo");
+        guest::write_bytes(buffer, &pattern);
+        guest::write64(offset, 0);
+        let transfer = |service: &str, length: u64| {
+            guest::write64(rsp + 0x28, iosb);
+            guest::write64(rsp + 0x30, buffer);
+            guest::write32(rsp + 0x38, length as u32);
+            guest::write64(rsp + 0x40, offset);
+            call(service, handle, 0, 0, 0)
+        };
+        assert(transfer("NtWriteFile", length) == 0 && io_status.information.get() == length, "diskstress: NtWriteFile");
+        let set = |class: u32, data: &[u8]| {
+            guest::write_bytes(block + 0x40, data);
+            guest::write32(rsp + 0x28, class);
+            call("NtSetInformationFile", handle, iosb, block + 0x40, data.len() as u64)
+        };
+        let truncated = length / 3 + 1;
+        assert(set(20, &truncated.to_le_bytes()) == 0 && volume_files::lookup_volume_file(&name).is_some_and(|file| file.size() == truncated), "diskstress: FileEndOfFileInformation trunca");
+        let extended = truncated + 100;
+        assert(set(20, &extended.to_le_bytes()) == 0 && volume_files::lookup_volume_file(&name).is_some_and(|file| file.size() == extended), "diskstress: FileEndOfFileInformation estende");
+        guest::write_bytes(buffer, &alloc::vec![0xEEu8; extended as usize]);
+        let read = transfer("NtReadFile", length + 512);
+        let back = guest::read_bytes(buffer, extended as usize);
+        assert(read == 0 && io_status.information.get() == extended && back[..truncated as usize] == pattern[..truncated as usize] && back[truncated as usize..].iter().all(|&byte| byte == 0), "diskstress: releitura dos dados e da extensao zerada");
+        let value = alloc::vec![round as u8; 1 + round as usize % 300];
+        let encoded = ea::encode(&[Entry { name: b"OPENNT.STRESS".to_vec(), flags: 0, value: value.clone() }], false);
+        let listed = volume.set_ea(&path, &encoded, false).and_then(|()| volume.query_ea(&path, 1024, &QueryOptions { restart: true, ..Default::default() }, &mut QueryState::default()));
+        assert(listed.is_ok_and(|result| result.status == 0 && ea::parse(&result.bytes[..result.information as usize], false, false).is_ok_and(|entries| entries.len() == 1 && entries[0].value == value)), "diskstress: EA gravado e relido");
+        assert(set(13, &[1]) == 0 && state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0) && volume_files::lookup_volume_file(&name).is_none() && matches!(volume.exists(&path), Ok(false)), "diskstress: exclusao no fechamento");
+        // O mesmo ciclo direto no volume.
+        let direct = "/STRESSV.DAT";
+        let created = volume.create(direct, false, 0x20, 0);
+        let written = volume.write(direct, 0, &pattern);
+        let shrunk = volume.resize(direct, truncated);
+        let bytes = volume.read_bytes(direct);
+        let removed = volume.remove(direct);
+        assert(created.is_ok() && written.is_ok_and(|count| count == length) && shrunk.is_ok_and(|size| size == truncated) && bytes.is_ok_and(|bytes| bytes.is_some_and(|bytes| bytes[..] == pattern[..truncated as usize])) && removed.is_ok() && matches!(volume.exists(direct), Ok(false)), "diskstress: ciclo direto no volume");
+        let rewritten = volume.write(DISK_STRESS_SHARED_FILE, 0, &[(round as u8).wrapping_add(1); DISK_STRESS_SHARED_SIZE]);
+        assert(rewritten.is_ok_and(|count| count == DISK_STRESS_SHARED_SIZE as u64), "diskstress: arquivo compartilhado regravado");
+    }
+    DISK_STRESS_STOP.store(true, Ordering::Release);
+    for slot in slots {
+        let result = smp::wait_job(slot, 60_000).unwrap_or(u64::MAX);
+        debug_print!("[diskstress] AP slot {}: {} leituras, {} falhas", slot, result & 0xFFFF_FFFF, result >> 32);
+        assert(result >> 32 == 0 && result & 0xFFFF_FFFF != 0, "diskstress: leituras concorrentes conferidas");
+    }
+    assert(volume.remove(DISK_STRESS_SHARED_FILE).is_ok(), "diskstress: arquivo regravado removido");
+    if let Some(region) = memory::find_region(block) {
+        memory::release_private_region(&region);
+    }
+}
+
 fn user_file_syscalls(assert: Assert) {
     use crate::drivers::fs::volume_files;
     use crate::ntos::ps::user::memory;
@@ -4422,6 +4581,7 @@ pub fn run(assert: Assert) {
     user_registry(assert);
     user_file_io(assert);
     user_file_io_more(assert);
+    disk_write_stress(assert, 12, 3);
     user_file_syscalls(assert);
     user_handle_operations(assert);
     user_events_and_semaphores(assert);

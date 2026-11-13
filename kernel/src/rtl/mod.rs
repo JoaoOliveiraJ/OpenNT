@@ -8,4 +8,4 @@ pub mod text;
 pub mod time;
 
 pub use error::KernelError;
-pub use sync::SpinLock;
+pub use sync::{SharedLock, SpinLock};

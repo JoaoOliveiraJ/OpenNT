@@ -373,7 +373,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/storage/ata_pio.rs"]
 testes = ["fase4"]
 fase = "4"
-notas = "Suporte de boot do próprio kernel, não um substituto do atapi.sys: é por ele que o kernel lê e grava o volume NTFS do segundo disco, de onde vêm o cng.sys, a ci.dll e os catálogos. Hoje ele atende todo acesso a disco, porque a pilha de disco do Windows (atapi.sys, disk.sys) carrega mas não recebe nenhum dispositivo."
+notas = "Suporte de boot do próprio kernel, não um substituto do atapi.sys: é por ele que o kernel lê e grava o volume NTFS do segundo disco, de onde vêm o cng.sys, a ci.dll e os catálogos. Hoje ele atende todo acesso a disco, porque a pilha de disco do Windows (atapi.sys, disk.sys) carrega mas não recebe nenhum dispositivo. Um comando por vez no canal, sob o lock do canal (testado com leitores em outras CPUs), e prazos em tempo de relógio (10 s; 30 s para o FLUSH CACHE) em vez de um número fixo de leituras do status, que sob carga no host dava por falho um flush ainda em andamento."
 
 [[componente]]
 nome = "hal.dll"
@@ -570,7 +570,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/fs/ntfs.rs", "kernel/src/drivers/fs/ntfs_write.rs"]
 testes = ["fase4"]
 fase = "4"
-notas = "Suporte de boot, não o ntfs.sys: monta como D: o volume que o xtask gera no segundo disco IDE, lido pelo driver ATA interno, de onde vêm o cng.sys, a ci.dll, o catálogo de assinaturas e as tabelas NLS. Com 4 CPUs, duas verificações de escrita da suíte já falharam de vez em quando e passaram ao repetir, sem causa encontrada ainda."
+notas = "Suporte de boot, não o ntfs.sys: monta como D: o volume que o xtask gera no segundo disco IDE, lido pelo driver ATA interno, de onde vêm o cng.sys, a ci.dll, o catálogo de assinaturas e as tabelas NLS. Um recurso compartilhado/exclusivo por drive (o papel do Vcb->Resource) separa leituras de transações, então nenhuma CPU lê no meio de um commit. As falhas ocasionais de escrita da suíte com 4 CPUs vinham do driver ATA, que desistia de um FLUSH CACHE lento no host; a estressa de disco da fase 7 cobre o caminho."
 
 [[componente]]
 nome = "Shell"

@@ -201,7 +201,10 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   de cima, a camada de cima se registra: o NTFS registra o volume de paginação
   (`mm::paging_volume::register`), o Mm instala o tradutor de endereços da
   memória de convidado. O registro acontece em `ntos/init`, na ordem do boot.
-- Estado global fica atrás de `SpinLock` (`rtl::sync`).
+- Estado global fica atrás de `SpinLock` (`rtl::sync`). Estado lido muito e
+  mudado em operações longas, como um volume NTFS, fica atrás de
+  `SharedLock`, o papel do ERESOURCE: leituras compartilhadas, mutações
+  exclusivas, readquirível por quem já o possui.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do

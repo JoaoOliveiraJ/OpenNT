@@ -45,6 +45,13 @@ fn is_text(data: Option<FileData>, expected: &str) -> bool {
 }
 
 pub fn run() {
+    // `--kernel-test-scope=disk-stress`: só a estressa do caminho de escrita
+    // do disco, com mais rodadas.
+    if crate::ntos::init::boot_config::KERNEL_TEST_SCOPE == "disk-stress" {
+        super::phase7::disk_write_stress(assert, 300, 3);
+        debug_print!("DISK_STRESS_OK");
+        return;
+    }
     // MemoryFileSystem
     let _ = memory_file_system::write("/tmp/a.txt", "hello OpenNT");
     assert(is_text(memory_file_system::read("/tmp/a.txt"), "hello OpenNT"), "vfs read/write");
