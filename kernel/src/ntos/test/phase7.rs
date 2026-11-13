@@ -10,11 +10,109 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types as nt;
 use crate::ntos::ps::user::state::{self, NativeBody, UserObject};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
 type Assert = fn(bool, &str);
+
+/// Texto UTF-16 sem NUL numa cópia de bloco; devolve o comprimento em bytes.
+fn write_wide(at: u64, text: &str) -> u16 {
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(at, &bytes);
+    bytes.len() as u16
+}
+
+/// UNICODE_STRING com os três campos.
+fn set_unicode(string: &nt::UnicodeString, length: u16, maximum_length: u16, buffer: u64) {
+    string.length.set(length);
+    string.maximum_length.set(maximum_length);
+    string.buffer.set(buffer);
+}
+
+/// OBJECT_ATTRIBUTES completo (os campos não citados ficam zerados).
+fn set_object_attributes(attributes: &nt::ObjectAttributes, length: u32, root: u64, name: u64, flags: u32) {
+    attributes.length.set(length);
+    attributes.root_directory.set(root);
+    attributes.object_name.set(name);
+    attributes.attributes.set(flags);
+    attributes.security_descriptor.set(0);
+    attributes.security_quality_of_service.set(0);
+}
+
+/// Atributo de contexto ALPC no formato compacto (campos de 32 bits) que o
+/// NtAlpcCancelMessage aceita com a flag 4.
+#[repr(C)]
+struct AlpcContextAttr32 {
+    port_context: Field<u32>,
+    message_context: Field<u32>,
+    sequence: Field<u32>,
+    message_id: Field<u32>,
+    callback_id: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for AlpcContextAttr32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<AlpcContextAttr32>() == 0x14);
+    assert!(core::mem::offset_of!(AlpcContextAttr32, callback_id) == 0x10);
+};
+
+/// Informação de conexão da sessão CSR (48 bytes), no formato que
+/// `ps/user/csr` recebe e devolve.
+#[repr(C)]
+struct CsrConnectionInformation {
+    shared_section_base: Field<u64>,
+    shared_static_server_data: Field<u64>,
+    server_process_id: Field<u64>,
+    reserved: Field<u64>,
+    server_id: Field<u32>,
+    status: Field<u32>,
+    /// Dados do servidor 1: o callback de criação de processo.
+    server_data: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CsrConnectionInformation {}
+
+/// Pedido CSR de conexão a um servidor: PORT_MESSAGE seguido do corpo
+/// ApiNumber/ReturnValue e do pedido ClientConnect.
+#[repr(C)]
+struct CsrClientConnectMessage {
+    header: nt::PortMessage,
+    capture_buffer: Field<u64>,
+    api_number: Field<u32>,
+    return_value: Field<u32>,
+    reserved: Field<u32>,
+    _pad_3c: Reserved<4>,
+    server_id: Field<u32>,
+    _pad_44: Reserved<4>,
+    connection_information: Field<u64>,
+    connection_information_length: Field<u32>,
+    _pad_54: Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células e de estruturas do NT.
+unsafe impl NtStruct for CsrClientConnectMessage {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CsrConnectionInformation>() == 48);
+    assert!(core::mem::offset_of!(CsrConnectionInformation, server_id) == 0x20);
+    assert!(core::mem::size_of::<CsrClientConnectMessage>() == 88);
+    assert!(core::mem::offset_of!(CsrClientConnectMessage, return_value) == 0x34);
+    assert!(core::mem::offset_of!(CsrClientConnectMessage, server_id) == 0x40);
+    assert!(core::mem::offset_of!(CsrClientConnectMessage, connection_information_length) == 0x50);
+};
+
+/// Cabeçalho PORT_MESSAGE zerado com os comprimentos dados.
+fn init_port_message(message: &nt::PortMessage, data_length: u16, total_length: u16) {
+    guest::write_bytes(message.address(), &[0u8; nt::PortMessage::SIZE as usize]);
+    message.u1.s1.data_length.set(data_length as i16);
+    message.u1.s1.total_length.set(total_length as i16);
+}
 
 /// Objeto de usuário instrumentado: conta os ganchos de handle.
 struct TestObject {
@@ -132,7 +230,8 @@ fn user_memory_helpers(assert: Assert) {
     assert(!state::probe_user_read(block, 8), "user: memoria de supervisor recusada pela sonda");
     let length = state::write_user_wide(block, "ntdll");
     state::write_unicode_string(block + 0x20, block, "ntdll");
-    assert(length == 10 && state::read_user_wide_string(block, 5) == "ntdll" && guest::read16(block + 0x20) == 10 && guest::read16(block + 0x22) == 12 && guest::read64(block + 0x28) == block, "user: strings largas e UNICODE_STRING de usuario");
+    let string = unsafe { nt::UnicodeString::at(block + 0x20) };
+    assert(length == 10 && state::read_user_wide_string(block, 5) == "ntdll" && string.length.get() == 10 && string.maximum_length.get() == 12 && string.buffer.get() == block, "user: strings largas e UNICODE_STRING de usuario");
     guest::write64(block + 0x28 + 0x08, 0x1234);
     assert(state::stack_arg(block, 6) == 0x1234 && state::stack_arg32(block, 6) == 0x1234, "user: argumento de pilha do syscall");
     guest::free_bytes(block);
@@ -342,19 +441,13 @@ impl crate::ntos::ob::objects::file::FileSource for BytesSource {
     }
 }
 
+/// OBJECT_ATTRIBUTES em `block`, UNICODE_STRING em +0x40 e o nome em +0x60.
 fn object_attributes_named(block: u64, name: &str, flags: u32) -> u64 {
     let unicode = block + 0x40;
     let text = block + 0x60;
-    let length = state::write_user_wide(text, name);
-    guest::write16(unicode, length as u16);
-    guest::write16(unicode + 2, length as u16 + 2);
-    guest::write64(unicode + 8, text);
-    for offset in (0..48).step_by(8) {
-        guest::write64(block + offset, 0);
-    }
-    guest::write32(block, 48);
-    guest::write64(block + 16, unicode);
-    guest::write32(block + 24, flags);
+    let length = state::write_user_wide(text, name) as u16;
+    set_unicode(unsafe { nt::UnicodeString::at(unicode) }, length, length + 2, text);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(block) }, nt::ObjectAttributes::SIZE as u32, 0, unicode, flags);
     block
 }
 
@@ -365,7 +458,8 @@ fn section_creation(assert: Assert) {
     use crate::ntos::ps::user::sections;
     let block = guest::alloc_bytes(0x400);
     let (output, size) = (block + 0x300, block + 0x308);
-    guest::write64(size, 0x3000);
+    let maximum = unsafe { nt::LargeInteger::at(size) };
+    maximum.quad_part.set(0x3000);
     let pointer_of = |handle: u64| open_pointer::resolve(handle, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer);
     // ZwCreateSection de pagefile com SEC_COMMIT.
     let status = create_section::create(output, 0xF_001F, 0, size, 4, 0x0800_0000, 0, 0, None);
@@ -375,19 +469,20 @@ fn section_creation(assert: Assert) {
     assert(open_pointer::close(handle) == Some(0) && sections::by_pointer(pointer).is_none(), "createsection: fechar o ultimo handle destroi a secao");
     // Nome, colisão e OPENIF.
     let attributes = object_attributes_named(block, "\\OpenNtSecaoNt", 0x40);
+    let oa = unsafe { nt::ObjectAttributes::at(attributes) };
     let named = create_section::create(output, 0xF_001F, attributes, size, 4, 0x0800_0000, 0, 0, None);
     let first = guest::read64(output);
     let named_pointer = pointer_of(first);
     assert(named.is_ok_and(|status| status == 0) && object_manager::lookup("\\OpenNtSecaoNt").is_some() && sections::by_pointer(named_pointer).is_some_and(|section| section.name().as_deref() == Some("\\OpenNtSecaoNt")), "createsection: secao nomeada publicada no namespace");
     assert(create_section::create(output, 0xF_001F, attributes, size, 4, 0x0800_0000, 0, 0, None).is_ok_and(|status| status == 0xC000_0035), "createsection: colisao de nome sem OPENIF");
-    guest::write32(attributes + 24, 0xC0);
+    oa.attributes.set(0xC0);
     let reopened = create_section::create(output, 0xF_001F, attributes, size, 4, 0x0800_0000, 0, 0, None);
     let second = guest::read64(output);
     assert(reopened.is_ok_and(|status| status == 0x4000_0000) && pointer_of(second) == named_pointer, "createsection: OPENIF abre a secao existente com OBJECT_NAME_EXISTS");
     assert(open_pointer::close(second) == Some(0) && sections::by_pointer(named_pointer).is_some() && open_pointer::close(first) == Some(0) && sections::by_pointer(named_pointer).is_none() && object_manager::lookup("\\OpenNtSecaoNt").is_none(), "createsection: secao temporaria some com o ultimo handle e o nome");
     // Recusas dos OBJECT_ATTRIBUTES.
-    guest::write32(attributes + 24, 0x40);
-    guest::write32(attributes, 40);
+    oa.attributes.set(0x40);
+    oa.length.set(40);
     assert(create_section::create(output, 0xF_001F, attributes, size, 4, 0x0800_0000, 0, 0, None).is_ok_and(|status| status == 0xC000_000D), "createsection: Length invalido");
     let relative = object_attributes_named(block, "SemBarra", 0x40);
     assert(create_section::create(output, 0xF_001F, relative, size, 4, 0x0800_0000, 0, 0, None).is_ok_and(|status| status == 0xC000_003B), "createsection: nome relativo sem raiz");
@@ -407,7 +502,7 @@ fn section_creation(assert: Assert) {
         return;
     };
     let before = crate::ntos::ob::objects::file::reference_count(file_object);
-    guest::write64(size, 0);
+    maximum.quad_part.set(0);
     let from_file = create_section::create_object(output, 0, 0, size, 2, 0x0800_0000, 0, file_object, 0);
     let file_section = guest::read64(output);
     let mapped = sections::by_pointer(file_section);
@@ -426,7 +521,7 @@ fn section_open_and_map(assert: Assert) {
     use crate::ntos::ps::user::sections;
     let block = guest::alloc_bytes(0x400);
     let (output, size, base, view_size, offset) = (block + 0x300, block + 0x308, block + 0x310, block + 0x318, block + 0x320);
-    guest::write64(size, 0x2000);
+    unsafe { nt::LargeInteger::at(size) }.quad_part.set(0x2000);
     let attributes = object_attributes_named(block, "\\OpenNtSecaoAberta", 0x40);
     let created = create_section::create(output, 0xF_001F, attributes, size, 4, 0x0800_0000, 0, 0, None);
     let creator = guest::read64(output);
@@ -450,9 +545,9 @@ fn section_open_and_map(assert: Assert) {
     assert(open_section::open(output, 4, deep, 0).is_ok_and(|status| status == 0xC000_003A), "opensection: caminho intermediario ausente");
     // NtMapViewOfSection/NtUnmapViewOfSection pelo handle aberto.
     let current = u64::MAX;
-    for (address, value) in [(base, 0u64), (view_size, 0), (offset, 0)] {
-        guest::write64(address, value);
-    }
+    guest::write64(base, 0);
+    guest::write64(view_size, 0);
+    unsafe { nt::LargeInteger::at(offset) }.quad_part.set(0);
     let mapped = map_view::map(handle, current, base, 0, 0, offset, view_size, 2, 0, 4, 0);
     let mapped_base = guest::read64(base);
     let section = sections::by_pointer(pointer);
@@ -474,7 +569,7 @@ fn system_space_views(assert: Assert) {
     use crate::ntos::ps::user::sections::{self, CreateOptions};
     let block = guest::alloc_bytes(0x100);
     let (output, size, base, offset) = (block, block + 8, block + 0x10, block + 0x18);
-    guest::write64(size, 0x3000);
+    unsafe { nt::LargeInteger::at(size) }.quad_part.set(0x3000);
     let created = create_section::create_object(output, 0, 0, size, 4, 0x0800_0000, 0, 0, 0);
     let body = guest::read64(output);
     assert(created.is_ok_and(|status| status == 0) && body != 0, "systemview: MmCreateSection para a vista global");
@@ -488,13 +583,14 @@ fn system_space_views(assert: Assert) {
     assert(unmap_system_view::unmap(address).is_ok_and(|status| status == 0) && paging::translate(address) == 0 && sections::find_system_view(address).is_none(), "systemview: MmUnmapViewInSystemSpace remove a vista");
     // Ex: o offset soma o delta de 64 KiB ao tamanho e é alinhado.
     guest::write64(size, 0x1000);
-    guest::write64(offset, 0x1234);
+    let section_offset = unsafe { nt::LargeInteger::at(offset) };
+    section_offset.quad_part.set(0x1234);
     let extended = map_system_view::map(body, base, size, offset, 0);
     let extended_base = guest::read64(base);
-    assert(extended.is_ok_and(|status| status == 0) && guest::read64(size) == 0x2234 && guest::read64(offset) == 0 && sections::find_system_view(extended_base).is_some(), "systemview: Ex soma o delta do offset e alinha a 64 KiB");
+    assert(extended.is_ok_and(|status| status == 0) && guest::read64(size) == 0x2234 && section_offset.quad_part.get() == 0 && sections::find_system_view(extended_base).is_some(), "systemview: Ex soma o delta do offset e alinha a 64 KiB");
     assert(unmap_system_view::unmap(extended_base).is_ok_and(|status| status == 0), "systemview: vista Ex removida");
     guest::write64(size, 0x1000);
-    guest::write64(offset, 0);
+    section_offset.quad_part.set(0);
     assert(map_system_view::map(body, base, size, offset, 2).is_ok_and(|status| status == 0xC000_00F4), "systemview: flags invalidas");
     guest::write64(size, 0x4000);
     assert(map_system_view::map(body, base, size, offset, 0).is_ok_and(|status| status == 0xC000_001F), "systemview: tamanho alem da secao");
@@ -544,18 +640,21 @@ fn virtual_memory_queries(assert: Assert) {
     let pseudo = u64::MAX;
     // MEMORY_BASIC_INFORMATION da vista mapeada.
     let basic = query_virtual::query(pseudo, view.base + 0x1234, 0, buffer, 48, returned);
-    assert(basic.is_ok_and(|status| status == 0) && guest::read64(buffer) == view.base + 0x1000 && guest::read64(buffer + 8) == view.base && guest::read32(buffer + 16) == 4 && guest::read64(buffer + 24) == 0x2000 && guest::read32(buffer + 32) == 0x1000 && guest::read32(buffer + 36) == 4 && guest::read32(buffer + 40) == 0x4_0000 && guest::read64(returned) == 48, "queryvirtual: MEMORY_BASIC_INFORMATION da vista mapeada");
+    let basic_info = unsafe { nt::MemoryBasicInformation::at(buffer) };
+    assert(basic.is_ok_and(|status| status == 0) && basic_info.base_address.get() == view.base + 0x1000 && basic_info.allocation_base.get() == view.base && basic_info.allocation_protect.get() == 4 && basic_info.region_size.get() == 0x2000 && basic_info.state.get() == 0x1000 && basic_info.protect.get() == 4 && basic_info.type_.get() == 0x4_0000 && guest::read64(returned) == 48, "queryvirtual: MEMORY_BASIC_INFORMATION da vista mapeada");
     // Endereço livre: MEM_FREE com PAGE_NOACCESS.
     let free = view.base + view.size + 0x10_0000;
-    assert(query_virtual::query(pseudo, free, 0, buffer, 48, 0).is_ok_and(|status| status == 0) && guest::read32(buffer + 32) == 0x1_0000 && guest::read32(buffer + 36) == 1 && guest::read64(buffer + 8) == 0, "queryvirtual: regiao livre");
+    assert(query_virtual::query(pseudo, free, 0, buffer, 48, 0).is_ok_and(|status| status == 0) && basic_info.state.get() == 0x1_0000 && basic_info.protect.get() == 1 && basic_info.allocation_base.get() == 0, "queryvirtual: regiao livre");
     // MEMORY_REGION_INFORMATION (classe 3) e o tipo da classe 7.
-    assert(query_virtual::query(pseudo, view.base, 3, buffer, 48, returned).is_ok_and(|status| status == 0) && guest::read64(buffer) == view.base && guest::read32(buffer + 12) == 0x4_0000 && guest::read64(buffer + 16) == 0x3000 && guest::read64(buffer + 24) == 0x3000 && guest::read64(buffer + 40) == 0xFFFF_FFFF && guest::read64(returned) == 48, "queryvirtual: MEMORY_REGION_INFORMATION com commit e NUMA");
-    assert(query_virtual::query(pseudo, view.base, 7, buffer, 32, returned).is_ok_and(|status| status == 0) && guest::read32(buffer + 12) == 8 && guest::read64(returned) == 32, "queryvirtual: classe 7 com o tipo de seção de pagefile");
+    let region = unsafe { nt::MemoryRegionInformation::at(buffer) };
+    assert(query_virtual::query(pseudo, view.base, 3, buffer, 48, returned).is_ok_and(|status| status == 0) && region.allocation_base.get() == view.base && region.region_type.get() == 0x4_0000 && region.region_size.get() == 0x3000 && region.commit_size.get() == 0x3000 && region.node_preference.get() == 0xFFFF_FFFF && guest::read64(returned) == 48, "queryvirtual: MEMORY_REGION_INFORMATION com commit e NUMA");
+    assert(query_virtual::query(pseudo, view.base, 7, buffer, 32, returned).is_ok_and(|status| status == 0) && region.region_type.get() == 8 && guest::read64(returned) == 32, "queryvirtual: classe 7 com o tipo de seção de pagefile");
     assert(query_virtual::query(pseudo, view.base, 2, buffer, 0x100, returned).is_ok_and(|status| status == 0xC000_0098) && query_virtual::query(pseudo, free, 3, buffer, 48, 0).is_ok_and(|status| status == 0xC000_0141), "queryvirtual: secao sem arquivo nao tem nome e regiao livre e endereco invalido");
     // MEMORY_WORKING_SET_EX_INFORMATION.
-    guest::write64(buffer, view.base);
-    guest::write64(buffer + 16, free);
-    assert(query_virtual::query(pseudo, 0, 4, buffer, 32, 0).is_ok_and(|status| status == 0) && guest::read64(buffer + 8) == 0x8041 && guest::read64(buffer + 24) == 0, "queryvirtual: working set com pagina valida, protecao e compartilhamento");
+    let working_set = unsafe { nt::MemoryWorkingSetExInformation::array_at(buffer, 2) };
+    working_set[0].virtual_address.set(view.base);
+    working_set[1].virtual_address.set(free);
+    assert(query_virtual::query(pseudo, 0, 4, buffer, 32, 0).is_ok_and(|status| status == 0) && working_set[0].virtual_attributes.get() == 0x8041 && working_set[1].virtual_attributes.get() == 0, "queryvirtual: working set com pagina valida, protecao e compartilhamento");
     // Recusas.
     assert(query_virtual::query(pseudo, view.base, 9, buffer, 48, 0).is_ok_and(|status| status == 0xC000_0003) && query_virtual::query(pseudo, view.base, 0, buffer, 40, 0).is_ok_and(|status| status == 0xC000_0004) && query_virtual::query(pseudo, 0x7FFF_FFFF_0000, 0, buffer, 48, 0).is_ok_and(|status| status == 0xC000_000D) && query_virtual::query(u64::MAX - 1, view.base, 0, buffer, 48, 0).is_ok_and(|status| status == 0xC000_0024) && query_virtual::query(pseudo, view.base, 4, buffer, 24, 0).is_ok_and(|status| status == 0xC000_0004), "queryvirtual: classe, tamanho, base, handle e vetor desalinhado recusados");
     // Nome da vista de arquivo (classe 2), com o tamanho necessário.
@@ -571,13 +670,13 @@ fn virtual_memory_queries(assert: Assert) {
     let expected = "\\Device\\HarddiskVolume1\\opennt-secao.bin";
     let needed = 16 + (expected.len() as u64 + 1) * 2;
     assert(query_virtual::query(pseudo, file_view.base, 2, buffer, 16, returned).is_ok_and(|status| status == 0xC000_0004) && guest::read64(returned) == needed, "queryvirtual: nome com buffer curto informa o tamanho");
-    assert(query_virtual::query(pseudo, file_view.base, 2, buffer, 0x100, returned).is_ok_and(|status| status == 0) && guest_strings_of(buffer) == expected && guest::read64(returned) == needed, "queryvirtual: nome nativo do arquivo da vista");
+    assert(query_virtual::query(pseudo, file_view.base, 2, buffer, 0x100, returned).is_ok_and(|status| status == 0) && guest_strings_of(unsafe { nt::UnicodeString::at(buffer) }) == expected && guest::read64(returned) == needed, "queryvirtual: nome nativo do arquivo da vista");
     assert(sections::unmap(&file_view, None).is_ok() && sections::unmap(&view, None).is_ok(), "queryvirtual: vistas removidas");
     guest::free_bytes(block);
 }
 
-fn guest_strings_of(unicode: u64) -> String {
-    crate::ntos::rtl::guest_strings::read_unicode_string(unicode)
+fn guest_strings_of(unicode: &nt::UnicodeString) -> String {
+    crate::ntos::rtl::guest_strings::read_unicode_string(unicode.address())
 }
 
 fn user_virtual_memory(assert: Assert) {
@@ -690,18 +789,12 @@ fn user_registry(assert: Assert) {
         let length = state::write_user_wide(text, name);
         state::write_unicode_string(block + 0x40, text, name);
         let _ = length;
-        for offset in (0..0x30).step_by(8) {
-            guest::write64(block + offset, 0);
-        }
-        guest::write32(block, 0x30);
-        guest::write64(block + 8, root);
-        guest::write64(block + 0x10, block + 0x40);
-        guest::write32(block + 0x18, 0x40);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(block) }, nt::ObjectAttributes::SIZE as u32, root, block + 0x40, 0x40);
         block
     };
     let attributes = write_attributes(0, "\\Registry\\Machine\\System");
     assert(user_registry::parse_user_object_attributes(attributes).is_some_and(|parsed| parsed.path == "\\Registry\\Machine\\System" && parsed.root_directory == 0), "userregistry: caminho absoluto dos atributos");
-    guest::write32(block, 0x20);
+    unsafe { nt::ObjectAttributes::at(block) }.length.set(0x20);
     assert(user_registry::parse_user_object_attributes(block).is_none(), "userregistry: Length curto recusado");
     // NtOpenKey de usuário: handle `key` do processo.
     let output = block + 0x300;
@@ -731,6 +824,7 @@ fn user_file_io(assert: Assert) {
         return;
     };
     let (out, iosb, buffer, rsp) = (block, block + 0x10, block + 0x100, block + 0x800);
+    let io_status = unsafe { nt::IoStatusBlock::at(iosb) };
     let open = |name: &str, disposition: u32, access: u32, share: u32, options: u32| {
         guest::write64(out, 0);
         file_io::open(out, name, iosb, disposition, &OpenRequest { access, share, options, ..OpenRequest::default() }).unwrap_or(1)
@@ -738,7 +832,7 @@ fn user_file_io(assert: Assert) {
     // Abertura do arquivo existente com E/S síncrona.
     let opened = open("\\??\\D:\\HELLO.TXT", 1, 0x8010_0000, 1, 0x20);
     let handle = guest::read64(out);
-    assert(opened == 0 && guest::read64(iosb + 8) == 1 && state::get_user_handle(handle).is_some_and(|entry| entry.kind() == "file" && entry.access() == 0x12_0089), "userfiles: abertura com acesso generico mapeado");
+    assert(opened == 0 && io_status.information.get() == 1 && state::get_user_handle(handle).is_some_and(|entry| entry.kind() == "file" && entry.access() == 0x12_0089), "userfiles: abertura com acesso generico mapeado");
     // NtReadFile pela posição síncrona.
     let read = |length: u64| {
         guest::write64(rsp + 0x28, iosb);
@@ -748,28 +842,28 @@ fn user_file_io(assert: Assert) {
         state::handler("NtReadFile").map(|handler| handler(handle, 0, 0, 0, rsp).unwrap_or(1)).unwrap_or(1)
     };
     let expected: &[u8] = b"Ola do NTFS no OpenNT!\r\n";
-    assert(read(64) == 0 && guest::read64(iosb + 8) == expected.len() as u64 && guest::read_bytes(buffer, expected.len()) == expected && read(8) == 0xC000_0011, "userfiles: NtReadFile le ate o fim e devolve END_OF_FILE");
+    assert(read(64) == 0 && io_status.information.get() == expected.len() as u64 && guest::read_bytes(buffer, expected.len()) == expected && read(8) == 0xC000_0011, "userfiles: NtReadFile le ate o fim e devolve END_OF_FILE");
     // NtQueryInformationFile: padrão, posição e nome.
     let query = |class: u32, length: u64| {
         guest::write32(rsp + 0x28, class);
         state::handler("NtQueryInformationFile").map(|handler| handler(handle, iosb, buffer, length, rsp).unwrap_or(1)).unwrap_or(1)
     };
-    assert(query(5, 24) == 0 && guest::read64(buffer + 8) == expected.len() as u64 && guest::read8(buffer + 21) == 0, "userfiles: FILE_STANDARD_INFORMATION com o tamanho");
-    assert(query(14, 8) == 0 && guest::read64(buffer) == expected.len() as u64, "userfiles: FILE_POSITION_INFORMATION depois da leitura");
-    assert(query(9, 64) == 0 && guest::read32(buffer) == 20 && guest::read16(buffer + 4) == b'\\' as u16 && query(99, 64) == 0xC000_0003 && query(5, 8) == 0xC000_0004, "userfiles: nome, classe e tamanho invalidos");
+    assert(query(5, 24) == 0 && { let standard = unsafe { nt::FileStandardInformation::at(buffer) }; standard.end_of_file.quad_part.get() == expected.len() as i64 && standard.directory.get() == 0 }, "userfiles: FILE_STANDARD_INFORMATION com o tamanho");
+    assert(query(14, 8) == 0 && unsafe { nt::FilePositionInformation::at(buffer) }.current_byte_offset.quad_part.get() == expected.len() as i64, "userfiles: FILE_POSITION_INFORMATION depois da leitura");
+    assert(query(9, 64) == 0 && { let name_info = unsafe { nt::FileNameInformation::at(buffer) }; name_info.file_name_length.get() == 20 && name_info.file_name[0].get() == b'\\' as u16 } && query(99, 64) == 0xC000_0003 && query(5, 8) == 0xC000_0004, "userfiles: nome, classe e tamanho invalidos");
     assert(state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0), "userfiles: handle fechado");
     // Criação, escrita, colisão e DELETE_ON_CLOSE.
     let name = "\\??\\D:\\OPENNTUSR.TXT";
     let created = open(name, 2, 0x4010_0000, 0, 0x20);
     let writer = guest::read64(out);
-    assert(created == 0 && guest::read64(iosb + 8) == 2, "userfiles: FILE_CREATE cria o arquivo no volume");
+    assert(created == 0 && io_status.information.get() == 2, "userfiles: FILE_CREATE cria o arquivo no volume");
     guest::write_bytes(buffer, b"OpenNT-usr");
     guest::write64(rsp + 0x28, iosb);
     guest::write64(rsp + 0x30, buffer);
     guest::write32(rsp + 0x38, 10);
     guest::write64(rsp + 0x40, 0);
     let written = state::handler("NtWriteFile").map(|handler| handler(writer, 0, 0, 0, rsp).unwrap_or(1)).unwrap_or(1);
-    assert(written == 0 && guest::read64(iosb + 8) == 10 && volume_files::lookup_volume_file(name).is_some_and(|file| file.size() == 10 && file.read_at(0, 10).is_ok_and(|bytes| bytes == b"OpenNT-usr")), "userfiles: NtWriteFile grava no volume");
+    assert(written == 0 && io_status.information.get() == 10 && volume_files::lookup_volume_file(name).is_some_and(|file| file.size() == 10 && file.read_at(0, 10).is_ok_and(|bytes| bytes == b"OpenNT-usr")), "userfiles: NtWriteFile grava no volume");
     assert(open(name, 2, 0x4010_0000, 0, 0x20) == 0xC000_0035, "userfiles: FILE_CREATE de nome existente");
     assert(state::close_user_handle(writer, true, false).is_ok_and(|status| status == 0), "userfiles: escritor fechado");
     let deleting = open(name, 1, 0x8011_0000, 7, 0x1020);
@@ -777,7 +871,7 @@ fn user_file_io(assert: Assert) {
     assert(deleting == 0 && state::close_user_handle(deleter, true, false).is_ok_and(|status| status == 0) && volume_files::lookup_volume_file(name).is_none(), "userfiles: DELETE_ON_CLOSE remove o arquivo no ultimo fechamento");
     // Recusas.
     let absent = open("\\??\\D:\\NaoExisteOpenNt.txt", 1, 0x8010_0000, 1, 0x20);
-    assert(absent == 0xC000_0034 && guest::read64(iosb) == 0xC000_0034, "userfiles: arquivo ausente com o IOSB");
+    assert(absent == 0xC000_0034 && io_status.status.get() as u32 == 0xC000_0034, "userfiles: arquivo ausente com o IOSB");
     let missing_parent = open("\\??\\D:\\SemPasta\\x.txt", 1, 0x8010_0000, 1, 0x20);
     if missing_parent != 0xC000_003A {
         debug_print!("[userfiles] pasta ausente devolveu 0x{:x}", missing_parent);
@@ -822,11 +916,11 @@ fn user_file_io_more(assert: Assert) {
         guest::write32(rsp + 0x58, 0);
         call("NtQueryDirectoryFile", directory, 0, 0, 0)
     };
-    assert(list(pattern) == 0 && guest::read32(buffer + 60) == 18 && guest::read64(buffer + 40) == 24 && guest::read16(buffer + 64) == b'H' as u16 && guest::read32(buffer) == 0, "userfiles: FileDirectoryInformation com o padrao");
+    assert(list(pattern) == 0 && { let entry = unsafe { nt::FileDirectoryInformation::at(buffer) }; entry.file_name_length.get() == 18 && entry.end_of_file.quad_part.get() == 24 && entry.file_name[0].get() == b'H' as u16 && entry.next_entry_offset.get() == 0 }, "userfiles: FileDirectoryInformation com o padrao");
     assert(list(0) == 0x8000_0006, "userfiles: NO_MORE_FILES na continuacao");
     // Volume da descrição.
     guest::write32(rsp + 0x28, 1);
-    assert(call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x100) == 0 && guest::read64(iosb + 8) >= 18, "userfiles: FileFsVolumeInformation pelo volume do arquivo");
+    assert(call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x100) == 0 && unsafe { nt::IoStatusBlock::at(iosb) }.information.get() >= 18, "userfiles: FileFsVolumeInformation pelo volume do arquivo");
     let _ = state::close_user_handle(directory, true, false);
     // Fim de arquivo, posição, renomeação e disposição de exclusão.
     let name = "\\??\\D:\\OPENNTREN.TXT";
@@ -845,14 +939,14 @@ fn user_file_io_more(assert: Assert) {
     };
     assert(set(20, &4u64.to_le_bytes()) == 0 && volume_files::lookup_volume_file(name).is_some_and(|file| file.size() == 4), "userfiles: FileEndOfFileInformation trunca");
     guest::write32(rsp + 0x28, 14);
-    assert(set(14, &2u64.to_le_bytes()) == 0 && { guest::write32(rsp + 0x28, 14); call("NtQueryInformationFile", handle, iosb, buffer, 8) == 0 } && guest::read64(buffer) == 2, "userfiles: FilePositionInformation definida e consultada");
+    assert(set(14, &2u64.to_le_bytes()) == 0 && { guest::write32(rsp + 0x28, 14); call("NtQueryInformationFile", handle, iosb, buffer, 8) == 0 } && unsafe { nt::FilePositionInformation::at(buffer) }.current_byte_offset.quad_part.get() == 2, "userfiles: FilePositionInformation definida e consultada");
     let mut rename = alloc::vec![0u8; 20];
     let target: Vec<u16> = "OPENNTREN2.TXT".encode_utf16().collect();
     rename[16..20].copy_from_slice(&(target.len() as u32 * 2).to_le_bytes());
     for unit in &target {
         rename.extend_from_slice(&unit.to_le_bytes());
     }
-    assert(set(10, &rename) == 0 && volume_files::lookup_volume_file(name).is_none() && volume_files::lookup_volume_file("\\??\\D:\\OPENNTREN2.TXT").is_some_and(|file| file.size() == 4) && { guest::write32(rsp + 0x28, 9); call("NtQueryInformationFile", handle, iosb, buffer, 64) == 0 } && guest::read32(buffer) == 30, "userfiles: renomeacao relativa atualiza o volume e o nome");
+    assert(set(10, &rename) == 0 && volume_files::lookup_volume_file(name).is_none() && volume_files::lookup_volume_file("\\??\\D:\\OPENNTREN2.TXT").is_some_and(|file| file.size() == 4) && { guest::write32(rsp + 0x28, 9); call("NtQueryInformationFile", handle, iosb, buffer, 64) == 0 } && unsafe { nt::FileNameInformation::at(buffer) }.file_name_length.get() == 30, "userfiles: renomeacao relativa atualiza o volume e o nome");
     assert(call("NtFlushBuffersFile", handle, iosb, 0, 0) == 0, "userfiles: NtFlushBuffersFile");
     assert(set(13, &[1]) == 0 && state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0) && volume_files::lookup_volume_file("\\??\\D:\\OPENNTREN2.TXT").is_none(), "userfiles: FileDispositionInformation remove no fechamento");
     if let Some(region) = memory::find_region(block) {
@@ -872,14 +966,10 @@ fn user_file_syscalls(assert: Assert) {
         let text = attributes + 0x80;
         state::write_user_wide(text, name);
         state::write_unicode_string(attributes + 0x40, text, name);
-        for offset in (0..0x30).step_by(8) {
-            guest::write64(attributes + offset, 0);
-        }
-        guest::write32(attributes, 0x30);
-        guest::write64(attributes + 0x10, attributes + 0x40);
-        guest::write32(attributes + 0x18, 0x40);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
         guest::write64(handle_pointer, 0);
     };
+    let io_status = unsafe { nt::IoStatusBlock::at(iosb) };
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
     // NtOpenFile do volume.
     set_name("\\??\\D:\\HELLO.TXT");
@@ -896,7 +986,7 @@ fn user_file_syscalls(assert: Assert) {
     }
     let created = call("NtCreateFile", handle_pointer, 0x4010_0000, attributes, iosb);
     let file = guest::read64(handle_pointer);
-    assert(created == 0 && guest::read64(iosb + 8) == 2 && volume_files::lookup_volume_file("\\??\\D:\\OPENNTNT.TXT").is_some(), "usersyscalls: NtCreateFile cria pelo FILE_CREATE");
+    assert(created == 0 && io_status.information.get() == 2 && volume_files::lookup_volume_file("\\??\\D:\\OPENNTNT.TXT").is_some(), "usersyscalls: NtCreateFile cria pelo FILE_CREATE");
     let _ = call("NtClose", file, 0, 0, 0);
     guest::write64(rsp + 0x40, 1);
     guest::write64(rsp + 0x48, 0x1020);
@@ -908,7 +998,7 @@ fn user_file_syscalls(assert: Assert) {
     set_name("\\\\.\\OpenNtSemDevice");
     guest::write32(rsp + 0x28, 0);
     guest::write32(rsp + 0x30, 0);
-    assert(call("NtOpenFile", handle_pointer, 0x8010_0000, attributes, iosb) == 0xC000_0034 && guest::read64(iosb) == 0xC000_0034, "usersyscalls: dispositivo inexistente devolve NOT_FOUND");
+    assert(call("NtOpenFile", handle_pointer, 0x8010_0000, attributes, iosb) == 0xC000_0034 && io_status.status.get() as u32 == 0xC000_0034, "usersyscalls: dispositivo inexistente devolve NOT_FOUND");
     // Recusas.
     set_name("\\??\\D:\\HELLO.TXT");
     guest::write32(rsp + 0x28, 1);
@@ -919,7 +1009,7 @@ fn user_file_syscalls(assert: Assert) {
     let _ = call("NtClose", plain, 0, 0, 0);
     // NtCreateSection de usuário (pagefile).
     let size = block + 0x20;
-    guest::write64(size, 0x2000);
+    unsafe { nt::LargeInteger::at(size) }.quad_part.set(0x2000);
     guest::write32(rsp + 0x28, 4);
     guest::write32(rsp + 0x30, 0x0800_0000);
     guest::write64(rsp + 0x38, 0);
@@ -969,8 +1059,10 @@ fn user_handle_operations(assert: Assert) {
     assert(status == 0 && state::get_user_handle(process_handle).is_some_and(|entry| entry.kind() == "process" && entry.access() == 0x1F_FFFF), "userhandles: pseudo-handle de processo vira handle process");
     let _ = state::close_user_handle(process_handle, true, false);
     // NtSetInformationObject: Inherit e ProtectFromClose.
+    let flag_info = unsafe { nt::ObjectHandleFlagInformation::at(input) };
     let set = |handle: u64, flags: [u8; 2], class: u64, length: u64| {
-        guest::write_bytes(input, &flags);
+        flag_info.inherit.set(flags[0]);
+        flag_info.protect_from_close.set(flags[1]);
         state::handler("NtSetInformationObject").map(|handler| handler(handle, class, input, length, rsp).unwrap_or(1)).unwrap_or(1)
     };
     assert(set(copy, [1, 1], 4, 2) == 0 && state::get_user_handle(copy).is_some_and(|entry| entry.attributes() == 3) && state::close_user_handle(copy, true, false).is_ok_and(|status| status == 0xC000_0235), "userhandles: handle protegido contra fechamento");
@@ -993,21 +1085,17 @@ fn user_events_and_semaphores(assert: Assert) {
         let text = attributes + 0x80;
         state::write_user_wide(text, name);
         state::write_unicode_string(attributes + 0x40, text, name);
-        for offset in (0..0x30).step_by(8) {
-            guest::write64(attributes + offset, 0);
-        }
-        guest::write32(attributes, 0x30);
-        guest::write64(attributes + 0x10, attributes + 0x40);
-        guest::write32(attributes + 0x18, flags);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, flags);
         attributes
     };
+    let event_info = unsafe { nt::EventBasicInformation::at(info) };
     // Evento anônimo de sincronização.
     guest::write32(rsp + 0x28, 0);
     let created = call("NtCreateEvent", out, 0x1F_0003, 0, 1);
     let event = guest::read64(out);
     assert(created == 0 && state::get_user_handle(event).is_some_and(|entry| entry.kind() == "event"), "userevents: NtCreateEvent anonimo");
-    assert(call("NtSetEvent", event, previous, 0, 0) == 0 && guest::read32(previous) == 0 && call("NtQueryEvent", event, 0, info, 8) == 0 && guest::read32(info) == 1 && guest::read32(info + 4) == 1, "userevents: NtSetEvent e NtQueryEvent com tipo e estado");
-    assert(call("NtResetEvent", event, previous, 0, 0) == 0 && guest::read32(previous) == 1 && call("NtQueryEvent", event, 0, info, 8) == 0 && guest::read32(info + 4) == 0 && call("NtQueryEvent", event, 1, info, 8) == 0xC000_0003 && call("NtCreateEvent", out, 0x1F_0003, 0, 2) == 0xC000_000D, "userevents: NtResetEvent, classe e tipo invalidos");
+    assert(call("NtSetEvent", event, previous, 0, 0) == 0 && guest::read32(previous) == 0 && call("NtQueryEvent", event, 0, info, 8) == 0 && event_info.event_type.get() == 1 && event_info.event_state.get() == 1, "userevents: NtSetEvent e NtQueryEvent com tipo e estado");
+    assert(call("NtResetEvent", event, previous, 0, 0) == 0 && guest::read32(previous) == 1 && call("NtQueryEvent", event, 0, info, 8) == 0 && event_info.event_state.get() == 0 && call("NtQueryEvent", event, 1, info, 8) == 0xC000_0003 && call("NtCreateEvent", out, 0x1F_0003, 0, 2) == 0xC000_000D, "userevents: NtResetEvent, classe e tipo invalidos");
     // Evento nomeado: colisão, OPENIF, NtOpenEvent e acesso insuficiente.
     let first_attributes = named("\\OpenNtEventoTeste", 0x40);
     assert(call("NtCreateEvent", out, 0x1F_0003, first_attributes, 0) == 0, "userevents: evento nomeado criado");
@@ -1017,7 +1105,7 @@ fn user_events_and_semaphores(assert: Assert) {
     let second = guest::read64(out);
     assert(call("NtOpenEvent", out, 0x10_0000, named("\\OpenNtEventoTeste", 0x40), 0) == 0, "userevents: NtOpenEvent so com SYNCHRONIZE");
     let weak = guest::read64(out);
-    assert(call("NtSetEvent", weak, 0, 0, 0) == 0xC000_0022 && call("NtSetEvent", second, 0, 0, 0) == 0 && call("NtQueryEvent", first, 0, info, 8) == 0 && guest::read32(info + 4) == 1, "userevents: acesso insuficiente e estado compartilhado pelo nome");
+    assert(call("NtSetEvent", weak, 0, 0, 0) == 0xC000_0022 && call("NtSetEvent", second, 0, 0, 0) == 0 && call("NtQueryEvent", first, 0, info, 8) == 0 && event_info.event_state.get() == 1, "userevents: acesso insuficiente e estado compartilhado pelo nome");
     for handle in [first, second, weak] {
         let _ = call("NtClose", handle, 0, 0, 0);
     }
@@ -1030,7 +1118,7 @@ fn user_events_and_semaphores(assert: Assert) {
     assert(semaphore_status == 0 && state::get_user_handle(semaphore).is_some_and(|entry| entry.kind() == "semaphore"), "userevents: NtCreateSemaphore");
     assert(call("NtReleaseSemaphore", semaphore, 1, previous, 0) == 0 && guest::read32(previous) == 1 && call("NtReleaseSemaphore", semaphore, 1, previous, 0) == 0xC000_0047, "userevents: NtReleaseSemaphore ate o limite");
     guest::write64(rsp + 0x28, 0);
-    assert(call("NtQuerySemaphore", semaphore, 0, info, 8) == 0 && guest::read32(info) == 2 && guest::read32(info + 4) == 2, "userevents: NtQuerySemaphore com contagem e limite");
+    assert(call("NtQuerySemaphore", semaphore, 0, info, 8) == 0 && { let semaphore_info = unsafe { nt::SemaphoreBasicInformation::at(info) }; semaphore_info.current_count.get() == 2 && semaphore_info.maximum_count.get() == 2 }, "userevents: NtQuerySemaphore com contagem e limite");
     guest::write32(rsp + 0x28, 0);
     assert(call("NtCreateSemaphore", out, 0x1F_0003, 0, 0) == 0xC000_000D, "userevents: limite zero recusado");
     let _ = call("NtClose", semaphore, 0, 0, 0);
@@ -1051,27 +1139,23 @@ fn user_mutants_and_timers(assert: Assert) {
         let text = attributes + 0x80;
         state::write_user_wide(text, name);
         state::write_unicode_string(attributes + 0x40, text, name);
-        for offset in (0..0x30).step_by(8) {
-            guest::write64(attributes + offset, 0);
-        }
-        guest::write32(attributes, 0x30);
-        guest::write64(attributes + 0x10, attributes + 0x40);
-        guest::write32(attributes + 0x18, flags);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, flags);
         attributes
     };
+    let (mutant_info, owner, timer_info, due_time) = unsafe { (nt::MutantBasicInformation::at(info), nt::ClientId::at(info), nt::TimerBasicInformation::at(info), nt::LargeInteger::at(due)) };
     guest::write64(rsp + 0x28, 0);
     // Mutante com dono inicial: consulta, liberação e não dono.
     let owned = call("NtCreateMutant", out, 0x1F_0001, 0, 1);
     let mutant = guest::read64(out);
-    assert(owned == 0 && call("NtQueryMutant", mutant, 0, info, 8) == 0 && guest::read32(info) == 0 && guest::read8(info + 4) == 1 && guest::read8(info + 5) == 0, "usermutants: mutante possuido pela thread corrente");
+    assert(owned == 0 && call("NtQueryMutant", mutant, 0, info, 8) == 0 && mutant_info.current_count.get() == 0 && mutant_info.owned_by_caller.get() == 1 && mutant_info.abandoned_state.get() == 0, "usermutants: mutante possuido pela thread corrente");
     assert(call("NtReleaseMutant", mutant, previous, 0, 0) == 0 && guest::read32(previous) == 0 && call("NtReleaseMutant", mutant, previous, 0, 0) == 0xC000_0046, "usermutants: liberacao e MUTANT_NOT_OWNED");
-    assert(call("NtQueryMutant", mutant, 1, info, 16) == 0 && guest::read64(info) == 0 && guest::read64(info + 8) == 0 && call("NtQueryMutant", mutant, 2, info, 16) == 0xC000_0003, "usermutants: dono vazio e classe invalida");
+    assert(call("NtQueryMutant", mutant, 1, info, 16) == 0 && owner.unique_process.get() == 0 && owner.unique_thread.get() == 0 && call("NtQueryMutant", mutant, 2, info, 16) == 0xC000_0003, "usermutants: dono vazio e classe invalida");
     let _ = call("NtClose", mutant, 0, 0, 0);
     // Saída de thread abandona o mutante possuído.
     let _ = call("NtCreateMutant", out, 0x1F_0001, 0, 1);
     let abandoned = guest::read64(out);
     mutants::release_thread(crate::ntos::ps::process::get_current_thread());
-    assert(call("NtQueryMutant", abandoned, 0, info, 8) == 0 && guest::read32(info) == 1 && guest::read8(info + 5) == 1, "usermutants: saida da thread abandona o mutante");
+    assert(call("NtQueryMutant", abandoned, 0, info, 8) == 0 && mutant_info.current_count.get() == 1 && mutant_info.abandoned_state.get() == 1, "usermutants: saida da thread abandona o mutante");
     let _ = call("NtClose", abandoned, 0, 0, 0);
     // Nome, colisão, OPENIF e NtOpenMutant.
     assert(call("NtCreateMutant", out, 0x1F_0001, named("\\OpenNtMutanteTeste", 0x40), 0) == 0, "usermutants: mutante nomeado");
@@ -1090,12 +1174,12 @@ fn user_mutants_and_timers(assert: Assert) {
     let timer = guest::read64(out);
     assert(created == 0 && state::get_user_handle(timer).is_some_and(|entry| entry.kind() == "timer"), "usermutants: NtCreateTimer2");
     guest::write64(rsp + 0x28, 0);
-    guest::write64(due, (-1_000_000i64) as u64);
-    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtQueryTimer", timer, 0, info, 16) == 0 && guest::read64(info) > 0 && guest::read64(info) <= 1_000_000 && guest::read64(info + 8) == 0, "usermutants: prazo relativo e tempo restante");
-    guest::write64(due, 116_444_736_000_000_000);
-    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && { timer_objects::pump(); call("NtQueryTimer", timer, 0, info, 16) == 0 } && guest::read64(info + 8) == 1 && guest::read64(info) == 0, "usermutants: prazo absoluto vencido sinaliza pelo pump");
+    due_time.quad_part.set(-1_000_000);
+    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtQueryTimer", timer, 0, info, 16) == 0 && timer_info.remaining_time.quad_part.get() > 0 && timer_info.remaining_time.quad_part.get() <= 1_000_000 && timer_info.timer_state.get() == 0, "usermutants: prazo relativo e tempo restante");
+    due_time.quad_part.set(116_444_736_000_000_000);
+    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && { timer_objects::pump(); call("NtQueryTimer", timer, 0, info, 16) == 0 } && timer_info.timer_state.get() == 1 && timer_info.remaining_time.quad_part.get() == 0, "usermutants: prazo absoluto vencido sinaliza pelo pump");
     assert(call("NtCancelTimer2", timer, 0, 0, 0) == 0 && call("NtCancelTimer2", timer, due, 0, 0) == 0xC000_000D && call("NtQueryTimer", timer, 0, info, 8) == 0xC000_0004, "usermutants: cancelamento e recusas de parametros e tamanho");
-    guest::write64(previous, (-5i64) as u64);
+    unsafe { nt::LargeInteger::at(previous) }.quad_part.set(-5);
     assert(call("NtSetTimer2", timer, due, previous, 0) == 0xC000_000D, "usermutants: periodo negativo recusado");
     guest::write32(rsp + 0x28, 0x1F_0003);
     assert(call("NtCreateTimer2", out, 0, 0, 0x10) == 0xC000_000D && call("NtCreateTimer2", out, 1, 0, 0) == 0xC000_00BB, "usermutants: atributos invalidos e provedor IR");
@@ -1120,12 +1204,7 @@ fn user_io_completion(assert: Assert) {
         let text = attributes + 0x80;
         state::write_user_wide(text, name);
         state::write_unicode_string(attributes + 0x40, text, name);
-        for offset in (0..0x30).step_by(8) {
-            guest::write64(attributes + offset, 0);
-        }
-        guest::write32(attributes, 0x30);
-        guest::write64(attributes + 0x10, attributes + 0x40);
-        guest::write32(attributes + 0x18, flags);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, flags);
         attributes
     };
     guest::write64(rsp + 0x28, 0);
@@ -1135,7 +1214,7 @@ fn user_io_completion(assert: Assert) {
     let port = io_completion::resolve(handle, 0).ok().map(|(_, port)| port);
     assert(created == 0 && port.as_ref().is_some_and(|port| port.concurrency() == crate::ntos::ke::smp::online_cpu_count() as u32 && !port.closed()), "usercompletion: porta anonima com concorrencia dos processadores");
     guest::write64(rsp + 0x28, info + 8);
-    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && guest::read32(info) == 0 && guest::read32(info + 8) == 4, "usercompletion: profundidade vazia e tamanho devolvido");
+    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && unsafe { nt::IoCompletionBasicInformation::at(info) }.depth.get() == 0 && guest::read32(info + 8) == 4, "usercompletion: profundidade vazia e tamanho devolvido");
     assert(call("NtQueryIoCompletion", handle, 0, info, 8) == 0xC000_0004 && call("NtQueryIoCompletion", handle, 1, info, 4) == 0xC000_0003, "usercompletion: tamanho e classe invalidos");
     // NtSetIoCompletion lê chave e contexto em 64 bits do frame bruto.
     guest::write64(raw + 16, 0x1122_3344_5566_7788);
@@ -1147,7 +1226,7 @@ fn user_io_completion(assert: Assert) {
     let front = port.as_ref().and_then(|port| port.with(|state| state.packets.front().map(|packet| packet.values())));
     assert(posted == 0 && front == Some((0x1122_3344_5566_7788, 0xAABB_CCDD_0000_0001, 0x103, 0x99)), "usercompletion: pacote com chave, contexto, status e informacao");
     guest::write64(rsp + 0x28, 0);
-    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && guest::read32(info) == 1 && port.as_ref().is_some_and(|port| guest::read32(port.pointer + 0x18) == 1), "usercompletion: profundidade espelhada no corpo");
+    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && unsafe { nt::IoCompletionBasicInformation::at(info) }.depth.get() == 1 && port.as_ref().is_some_and(|port| guest::read32(port.pointer + 0x18) == 1), "usercompletion: profundidade espelhada no corpo");
     assert(call("NtSetIoCompletion", 0x7FF0, 0, 0, 0) == 0xC000_0008 && call("NtQueryIoCompletion", out, 0, info, 4) == 0xC000_0008, "usercompletion: handle invalido");
     // Pacote de memória do kernel e associação de thread.
     if let Some(port) = port.as_ref() {
@@ -1197,22 +1276,22 @@ fn user_threads(assert: Assert) {
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::threads::{self, Wait};
     use crate::ntos::ps::user::{io_completion, memory};
-    use crate::ntos::inc::nt_abi::eprocess;
     use core::sync::atomic::Ordering;
     let Ok(block) = memory::map_user_region(0x4000) else {
         assert(false, "userthreads: memoria de usuario");
         return;
     };
     let (out, info, list, cid, teb_out, timeout, image, peb, rsp) = (block, block + 0x40, block + 0x100, block + 0x180, block + 0x190, block + 0x1A0, block + 0x1000, block + 0x2000, block + 0x3000);
+    let (client_id, delay) = unsafe { (nt::ClientId::at(cid), nt::LargeInteger::at(timeout)) };
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
     // PEB e cabeçalho de imagem mínimos: reserva de pilha de 0x20000.
-    guest::write64(peb + 0x10, image);
-    guest::write32(image + 0x3C, 0x80);
-    guest::write64(image + 0x80 + 24 + 72, 0x20000);
+    unsafe { nt::Peb::at(peb) }.image_base_address.set(image);
+    unsafe { nt::ImageDosHeader::at(image) }.e_lfanew.set(0x80);
+    unsafe { nt::ImageNtHeaders64::at(image + 0x80) }.optional_header.size_of_stack_reserve.set(0x20000);
     let saved_peb = state::with(|state| core::mem::replace(&mut state.current_peb_va, peb));
     let known = threads::all().len();
     let process_pointer = process::get_current_process();
-    let baseline = guest::read32(process_pointer + eprocess::ACTIVE_THREADS);
+    let baseline = unsafe { nt::Eprocess::at(process_pointer) }.active_threads.get();
     if baseline == 0 {
         process::add_thread(process_pointer);
     }
@@ -1220,13 +1299,14 @@ fn user_threads(assert: Assert) {
     for (offset, value) in [(0x28u64, block + 0x800), (0x30, 0x1122_3344_5566_7788), (0x38, 5), (0x40, 0), (0x48, 0), (0x50, 0), (0x58, list)] {
         guest::write64(rsp + offset, value);
     }
-    guest::write64(list, 8 + 64);
-    for (index, (attribute, size, target, returned)) in [(0x10003u64, 16u64, cid, info + 0x30), (0x10004, 8, teb_out, 0)].into_iter().enumerate() {
-        let entry = list + 8 + index as u64 * 32;
-        guest::write64(entry, attribute);
-        guest::write64(entry + 8, size);
-        guest::write64(entry + 16, target);
-        guest::write64(entry + 24, returned);
+    let attribute_list = unsafe { nt::PsAttributeList::at(list) };
+    attribute_list.total_length.set(8 + 2 * nt::PsAttribute::SIZE);
+    let entries = unsafe { nt::PsAttribute::array_at(attribute_list.attributes[0].address(), 2) };
+    for (entry, (attribute, size, target, returned)) in entries.iter().zip([(0x10003u64, 16u64, cid, info + 0x30), (0x10004, 8, teb_out, 0)]) {
+        entry.attribute.set(attribute);
+        entry.size.set(size);
+        entry.value.set(target);
+        entry.return_length.set(returned);
     }
     assert(call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX) == 0xC000_0005 && call("NtCreateThreadEx", out, 0x1F_FFFF, 0, 4) == 0xC000_0008, "userthreads: criacao fora do laco e processo alheio recusados");
     threads::set_running(true, None);
@@ -1243,13 +1323,15 @@ fn user_threads(assert: Assert) {
         return;
     };
     let (pointer, teb) = (thread.pointer(), thread.with(|thread| thread.teb_va));
-    let stack = guest::read64(teb + 0x10);
-    assert(guest::read64(cid + 8) == thread.thread_id && guest::read64(info + 0x30) == 16 && guest::read64(teb_out) == teb && guest::read64(teb + 0x30) == teb && guest::read64(teb + 0x48) == thread.thread_id && guest::read64(teb + 0x60) == peb && guest::read64(teb + 8) == stack + 0x20000, "userthreads: CLIENT_ID, TEB e pilha pela reserva da imagem");
-    let startup = guest::read64(thread.with(|thread| thread.context) + 0x80);
-    assert(guest::read64(startup + 0x80) == block + 0x800 && guest::read64(startup + 0x88) == 0x1122_3344_5566_7788 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING, "userthreads: contexto inicial com argumento de 64 bits e thread suspensa");
+    let teb_view = unsafe { nt::Teb::at(teb) };
+    let stack = teb_view.nt_tib.stack_limit.get();
+    assert(client_id.unique_thread.get() == thread.thread_id && guest::read64(info + 0x30) == 16 && guest::read64(teb_out) == teb && teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == thread.thread_id && teb_view.process_environment_block.get() == peb && teb_view.nt_tib.stack_base.get() == stack + 0x20000, "userthreads: CLIENT_ID, TEB e pilha pela reserva da imagem");
+    let startup = unsafe { nt::Context::at(nt::Context::at(thread.with(|thread| thread.context)).rcx.get()) };
+    assert(startup.rcx.get() == block + 0x800 && startup.rdx.get() == 0x1122_3344_5566_7788 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING, "userthreads: contexto inicial com argumento de 64 bits e thread suspensa");
     // Consultas.
     guest::write64(rsp + 0x28, info + 0x38);
-    assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && guest::read32(info) == 0x103 && guest::read64(info + 8) == teb && guest::read64(info + 24) == thread.thread_id && guest::read32(info + 0x38) == 48, "userthreads: ThreadBasicInformation");
+    let basic = unsafe { nt::ThreadBasicInformation::at(info) };
+    assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && basic.exit_status.get() == 0x103 && basic.teb_base_address.get() == teb && basic.client_id.unique_thread.get() == thread.thread_id && guest::read32(info + 0x38) == 48, "userthreads: ThreadBasicInformation");
     assert(call("NtQueryInformationThread", handle, 9, info, 8) == 0 && guest::read64(info) == block + 0x800 && call("NtQueryInformationThread", handle, 17, info, 1) == 0 && guest::read8(info) == 1, "userthreads: endereco inicial e oculta do depurador");
     assert(call("NtQueryInformationThread", handle, 0, info, 40) == 0xC000_0004 && call("NtQueryInformationThread", handle, 5, info, 8) == 0xC000_0003, "userthreads: tamanho e classe invalidos");
     // Suspensão, retomada e prioridades.
@@ -1261,14 +1343,14 @@ fn user_threads(assert: Assert) {
     let base = call("NtSetInformationThread", handle, 2, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 10;
     guest::write32(info, 40);
     assert(priority && base && call("NtSetInformationThread", handle, 1, info, 4) == 0xC000_000D && call("NtSetInformationThread", handle, 17, info, 1) == 0xC000_0004, "userthreads: prioridade, base e recusas");
-    guest::write64(teb + 0x1480 + 5 * 8, 0x55);
+    teb_view.tls_slots[5].set(0x55);
     guest::write32(info, 5);
-    assert(call("NtSetInformationThread", handle, 10, info, 4) == 0 && guest::read64(teb + 0x1480 + 5 * 8) == 0, "userthreads: ThreadZeroTlsCell zera o indice nas TEBs");
+    assert(call("NtSetInformationThread", handle, 10, info, 4) == 0 && teb_view.tls_slots[5].get() == 0, "userthreads: ThreadZeroTlsCell zera o indice nas TEBs");
     // Abertura por CLIENT_ID.
-    guest::write64(cid, 0);
+    client_id.unique_process.set(0);
     assert(call("NtOpenThread", out, 0x40, 0, cid) == 0, "userthreads: NtOpenThread pelo id");
     let opened = guest::read64(out);
-    guest::write64(cid, 0x7777_0000);
+    client_id.unique_process.set(0x7777_0000);
     assert(call("NtOpenThread", out, 0x40, 0, cid) == 0xC000_000B && call("NtSuspendThread", opened, 0, 0, 0) == 0xC000_0022, "userthreads: processo alheio e acesso insuficiente");
     // Alertas por id e esperas, com a thread retomada como corrente (laço real).
     let previous_thread = process::get_current_thread();
@@ -1276,9 +1358,9 @@ fn user_threads(assert: Assert) {
     process::set_current_thread(pointer);
     threads::set_running(true, Some(thread.clone()));
     assert(call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0 && call("NtWaitForAlertByThreadId", 0, 0, 0, 0) == 0x101 && call("NtAlertThreadByThreadId", 0xFFFF_0000, 0, 0, 0) == 0xC000_000B, "userthreads: alerta por id consumido");
-    guest::write64(timeout, 0);
+    delay.quad_part.set(0);
     assert(call("NtWaitForAlertByThreadId", 0, timeout, 0, 0) == 0x102, "userthreads: espera de alerta com prazo zero");
-    guest::write64(timeout, (-1i64) as u64);
+    delay.quad_part.set(-1);
     assert(call("NtDelayExecution", 0, timeout, 0, 0) == 0 && !thread.waiting(), "userthreads: atraso vencido retorna sem bloquear");
     let immediate = threads::wait_custom(Wait { poll: Some(alloc::boxed::Box::new(|| Some(0x77))), cleanup: Some(alloc::boxed::Box::new(|status| THREAD_WAIT_CLEANUP.store(status, Ordering::Release))), ..Wait::default() }, 0, Some(None));
     assert(immediate == 0x77 && THREAD_WAIT_CLEANUP.load(Ordering::Acquire) == 0x77, "userthreads: espera personalizada imediata com limpeza");
@@ -1296,13 +1378,13 @@ fn user_threads(assert: Assert) {
     state::with(|state| state.service_raw_arguments = 0);
     guest::write64(rsp + 0x28, 0);
     let removed = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);
-    assert(removed == 0 && guest::read64(info) == 0xABCD && guest::read64(info + 8) == 0x1234 && guest::read64(info + 16) == 0x55 && guest::read64(info + 24) == 0x10 && port.as_ref().is_some_and(|port| port.with(|state| state.active.contains(&pointer) && state.associated.contains(&pointer) && state.waiters.is_empty())), "userthreads: NtRemoveIoCompletion entrega o pacote e ativa a thread");
+    assert(removed == 0 && guest::read64(info) == 0xABCD && guest::read64(info + 8) == 0x1234 && unsafe { nt::IoStatusBlock::at(info + 16) }.status.get() == 0x55 && unsafe { nt::IoStatusBlock::at(info + 16) }.information.get() == 0x10 && port.as_ref().is_some_and(|port| port.with(|state| state.active.contains(&pointer) && state.associated.contains(&pointer) && state.waiters.is_empty())), "userthreads: NtRemoveIoCompletion entrega o pacote e ativa a thread");
     let blocked = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);
     assert(blocked == 0x103 && thread.waiting() && port.as_ref().is_some_and(|port| port.with(|state| state.waiters.len() == 1 && !state.active.contains(&pointer))), "userthreads: fila vazia bloqueia o consumidor");
     // Término: a espera acaba com THREAD_IS_TERMINATING e a porta é solta.
     assert(call("NtTerminateThread", handle, 0x1234, 0, 0) == 0 && thread.dead() && !thread.waiting() && port.as_ref().is_some_and(|port| port.with(|state| state.waiters.is_empty() && state.associated.is_empty())), "userthreads: NtTerminateThread encerra a espera e dissocia");
     guest::write64(rsp + 0x28, 0);
-    assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && guest::read32(info) == 0x1234 && guest::read64(info + 8) == 0 && call("NtTerminateThread", handle, 0, 0, 0) == 0xC000_004B && call("NtResumeThread", handle, 0, 0, 0) == 0xC000_004B, "userthreads: status de saida e recusas apos o termino");
+    assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && basic.exit_status.get() == 0x1234 && basic.teb_base_address.get() == 0 && call("NtTerminateThread", handle, 0, 0, 0) == 0xC000_004B && call("NtResumeThread", handle, 0, 0, 0) == 0xC000_004B, "userthreads: status de saida e recusas apos o termino");
     process::set_current_thread(previous_thread);
     threads::set_running(false, None);
     for value in [port_handle, opened, handle] {
@@ -1344,11 +1426,7 @@ fn user_wait_packets(assert: Assert) {
     let packet_handle = guest::read64(out);
     let packet = state::get_user_handle(packet_handle).and_then(|entry| entry.downcast::<crate::ntos::ob::objects::dispatcher::UserDispatcher>().map(|dispatcher| dispatcher.pointer)).unwrap_or(0);
     let phase = || guest::read32(packet + 0x10);
-    for offset in (0..0x30).step_by(8) {
-        guest::write64(attributes + offset, 0);
-    }
-    guest::write32(attributes, 0x30);
-    guest::write64(attributes + 0x10, attributes + 0x40);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0);
     assert(packet != 0 && call("NtCreateWaitCompletionPacket", out, 0xF_0001, attributes, 0) == 0xC000_0033, "userwaitpackets: pacote sem nome");
     // Associação: chave do frame bruto, contexto/status/informação da pilha.
     let associate = |target: u64| {
@@ -1367,9 +1445,9 @@ fn user_wait_packets(assert: Assert) {
     assert(associate(event) == 0xC000_000D && associate(port_handle) == 0xC000_000D, "userwaitpackets: pacote ja associado");
     assert(call("NtSetEvent", event, 0, 0, 0) == 0 && { wait_packets::pump(); depth() == 1 } && phase() == 2, "userwaitpackets: sinal publicado na porta pelo pump");
     guest::write64(rsp + 0x28, 0);
-    assert(call("NtQueryEvent", event, 0, info, 8) == 0 && guest::read32(info + 4) == 0, "userwaitpackets: evento de sincronizacao consumido");
+    assert(call("NtQueryEvent", event, 0, info, 8) == 0 && unsafe { nt::EventBasicInformation::at(info) }.event_state.get() == 0, "userwaitpackets: evento de sincronizacao consumido");
     let removed = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);
-    assert(removed == 0 && guest::read64(info) == 0x4B45_5900_0000_0001 && guest::read64(info + 8) == 0xC0DE && guest::read64(info + 16) == 0x77 && guest::read64(info + 24) == 0x99 && phase() == 0, "userwaitpackets: retirada entrega os dados e encerra a fase");
+    assert(removed == 0 && guest::read64(info) == 0x4B45_5900_0000_0001 && guest::read64(info + 8) == 0xC0DE && unsafe { nt::IoStatusBlock::at(info + 16) }.status.get() == 0x77 && unsafe { nt::IoStatusBlock::at(info + 16) }.information.get() == 0x99 && phase() == 0, "userwaitpackets: retirada entrega os dados e encerra a fase");
     // Objeto já sinalizado: publicado na hora; cancelamento sem e com remoção.
     let _ = call("NtSetEvent", event, 0, 0, 0);
     assert(associate(event) == 0 && guest::read8(already) == 1 && phase() == 2 && depth() == 1, "userwaitpackets: alvo ja sinalizado publica na associacao");
@@ -1524,24 +1602,24 @@ fn user_system_services(assert: Assert) {
     }
     guest::free_bytes(destination);
     // Estruturas de processo para o loader da ntdll.
-    let process_pointer = guest::alloc_bytes(0x900);
-    for offset in (0..0x900).step_by(8) {
-        guest::write64(process_pointer + offset, 0);
-    }
+    let process_pointer = guest::alloc_bytes(nt::Eprocess::SIZE);
+    guest::write_bytes(process_pointer, &alloc::vec![0u8; nt::Eprocess::SIZE as usize]);
     let (saved_peb, saved_ldr, regions_before) = state::with(|state| (state.current_peb_va, state.current_ldr_va, state.user_regions.len()));
     let built = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, process_pointer, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44 });
     if let Ok(teb) = built {
         let (peb, ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
-        let rupp = guest::read64(peb + 0x20);
-        assert(guest::read64(teb + 0x30) == teb && guest::read64(teb + 0x48) == 0x6F0 && guest::read64(teb + 0x60) == peb && peb == teb + 0x2000 && guest::read64(process_pointer + crate::ntos::inc::nt_abi::eprocess::PEB) == peb, "userservices: TEB e PEB publicados");
-        assert(guest::read64(peb + 0x10) == 0x1_4000_0000 && guest::read64(peb + 0x18) == ldr && guest::read32(peb + 0x118) == 10 && guest::read16(peb + 0x120) == 26100 && guest::read32(peb + 0xB8) == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2");
-        assert(guest::read8(ldr + 4) == 1 && guest::read64(ldr + 0x10) == ldr + 0x10 && guest::read64(ldr + 0x38) == ldr + 0x30, "userservices: PEB_LDR_DATA com listas vazias");
-        let image_path = guest::read64(rupp + 0x68);
-        assert(guest::read32(rupp + 8) == 0 && guest::read64(rupp + 0x10) == u64::MAX && guest::read64(rupp + 0x28) == 0x44 && guest::read16(rupp + 0x60) == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && guest::read64(rupp + 0x80) > rupp, "userservices: parametros auto-relativos com ambiente absoluto");
-        let entry = guest::alloc_bytes(0x110);
-        structures::insert_list_tail(ldr, 0x10, entry, 0);
-        assert(guest::read64(ldr + 0x10) == entry && guest::read64(ldr + 0x18) == entry && guest::read64(entry) == ldr + 0x10, "userservices: insercao no fim da lista LDR");
-        structures::write_list_head(ldr + 0x10);
+        let (teb_view, peb_view, ldr_data) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr)) };
+        let rupp = peb_view.process_parameters.get();
+        let parameters = unsafe { nt::RtlUserProcessParameters::at(rupp) };
+        assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == 0x6F0 && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && unsafe { nt::Eprocess::at(process_pointer) }.peb.get() == peb, "userservices: TEB e PEB publicados");
+        assert(peb_view.image_base_address.get() == 0x1_4000_0000 && peb_view.ldr.get() == ldr && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2");
+        assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
+        let image_path = parameters.image_path_name.buffer.get();
+        assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && parameters.environment.get() > rupp, "userservices: parametros auto-relativos com ambiente absoluto");
+        let entry = guest::alloc_bytes(nt::LdrDataTableEntry::SIZE);
+        structures::insert_list_tail(ldr, core::mem::offset_of!(nt::PebLdrData, in_load_order_module_list) as u64, entry, core::mem::offset_of!(nt::LdrDataTableEntry, in_load_order_links) as u64);
+        assert(ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == entry && unsafe { nt::LdrDataTableEntry::at(entry) }.in_load_order_links.flink.get() == ldr_data.in_load_order_module_list.address(), "userservices: insercao no fim da lista LDR");
+        structures::write_list_head(ldr_data.in_load_order_module_list.address());
         guest::free_bytes(entry);
     } else {
         assert(false, "userservices: estruturas de processo");
@@ -1616,9 +1694,9 @@ fn user_loader(assert: Assert) {
     assert(loader::load_dll_by_name("naoexiste.dll", 0, "").is_err() && loader::load_dll_by_name("kernel32.dll", 129, "").is_err(), "userloader: DLL ausente e cadeia excessiva");
     // Imports: pelo resolvedor do carregador de PE e pelo binding do loader.
     let resolved = pe_loader::load_user(importer_image(), &LoadOptions { notify_image: false, ..LoadOptions::default() });
-    assert(resolved.as_ref().is_ok_and(|image| guest::read64(image.image_base + 0x1060) == terminate), "userloader: resolvedor de imports da ntdll");
+    assert(resolved.as_ref().is_ok_and(|image| unsafe { nt::ImageThunkData64::at(image.image_base + 0x1060) }.u1.function.get() == terminate), "userloader: resolvedor de imports da ntdll");
     let unbound = pe_loader::load_user(importer_image(), &LoadOptions { skip_imports: true, skip_relocations: true, notify_image: false, ..LoadOptions::default() });
-    let bound = unbound.as_ref().is_ok_and(|image| guest::read64(image.image_base + 0x1060) == 0x10A0 && loader::bind_imports(image.image_base, 0).is_ok() && guest::read64(image.image_base + 0x1060) == terminate);
+    let bound = unbound.as_ref().is_ok_and(|image| { let slot = unsafe { nt::ImageThunkData64::at(image.image_base + 0x1060) }; slot.u1.function.get() == 0x10A0 && loader::bind_imports(image.image_base, 0).is_ok() && slot.u1.function.get() == terminate });
     assert(bound, "userloader: binding da IAT contra os exports reais");
     for image in [resolved, unbound].into_iter().flatten() {
         let mut image = image;
@@ -1627,8 +1705,9 @@ fn user_loader(assert: Assert) {
     // Entradas LDR numa PEB_LDR_DATA própria.
     let (saved_ldr, saved_next, saved_end, regions_before) = state::with(|state| (state.current_ldr_va, state.next_ldr_string_va, state.ldr_string_region_end, state.user_regions.len()));
     if let Ok(ldr) = memory::map_user_region(0x1000) {
-        for head in [0x10u64, 0x20, 0x30] {
-            crate::ntos::ps::user::structures::write_list_head(ldr + head);
+        let ldr_data = unsafe { nt::PebLdrData::at(ldr) };
+        for head in [&ldr_data.in_load_order_module_list, &ldr_data.in_memory_order_module_list, &ldr_data.in_initialization_order_module_list] {
+            crate::ntos::ps::user::structures::write_list_head(head.address());
         }
         state::with(|state| {
             state.current_ldr_va = ldr;
@@ -1637,9 +1716,10 @@ fn user_loader(assert: Assert) {
         let entry = loader::create_ldr_entry(&ntdll).unwrap_or(0);
         let exe = loader::Module { name: alloc::string::String::from("teste.exe"), full_name: alloc::string::String::from("C:\\teste.exe"), image_base: 0x1_4000_0000, size_of_image: 0x2000, entry_point: 0x1_4000_1000, exports: Default::default(), is_exe: true, notification_source: None };
         let second = loader::create_ldr_entry(&exe).unwrap_or(0);
-        let full = guest::read64(entry + 0x50);
-        assert(entry != 0 && guest::read64(entry + 0x30) == ntdll.image_base && guest::read64(entry + 0x38) == ntdll.entry_point && guest::read32(entry + 0x68) == 0x4006 && guest::read16(entry + 0x6C) == 0xFFFF && guest::read16(entry + 0x48) == 58 && guest::read16(full) == b'C' as u16, "userloader: entrada LDR da DLL com nomes e flags");
-        assert(second != 0 && guest::read64(second + 0x38) == 0 && guest::read32(second + 0x68) == 0x4002 && guest::read64(ldr + 0x10) == entry && guest::read64(ldr + 0x18) == second && guest::read64(entry) == second && guest::read64(ldr + 0x30) == entry + 0x20, "userloader: exe sem EntryPoint e listas na ordem de carga");
+        let (dll, exe_entry) = unsafe { (nt::LdrDataTableEntry::at(entry), nt::LdrDataTableEntry::at(second)) };
+        let full = dll.full_dll_name.buffer.get();
+        assert(entry != 0 && dll.dll_base.get() == ntdll.image_base && dll.entry_point.get() == ntdll.entry_point && dll.flags.get() == 0x4006 && dll.obsolete_load_count.get() == 0xFFFF && dll.full_dll_name.length.get() == 58 && guest::read16(full) == b'C' as u16, "userloader: entrada LDR da DLL com nomes e flags");
+        assert(second != 0 && exe_entry.entry_point.get() == 0 && exe_entry.flags.get() == 0x4002 && ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == second && dll.in_load_order_links.flink.get() == second && ldr_data.in_initialization_order_module_list.flink.get() == dll.in_initialization_order_links.address(), "userloader: exe sem EntryPoint e listas na ordem de carga");
     }
     let added: alloc::vec::Vec<_> = state::with(|state| {
         state.current_ldr_va = saved_ldr;
@@ -1680,9 +1760,9 @@ fn user_nls(assert: Assert) {
     guest::write64(rsp + 0x28, size);
     let mapped = call("NtGetNlsSectionPtr", 11, 4242, 0, out);
     let base = guest::read64(out);
-    let table_ok = created == 0 && written == 0 && mapped == 0 && base != 0 && guest::read64(size) >= 10 && guest::read_bytes(base, 10) == b"NLS-OpenNT";
+    let table_ok = created == 0 && written == 0 && mapped == 0 && base != 0 && guest::read32(size) >= 10 && guest::read_bytes(base, 10) == b"NLS-OpenNT";
     if !table_ok {
-        crate::debug_print!("[usernls] created={:#x} written={:#x} mapped={:#x} base={:#x} size={:#x}", created, written, mapped, base, guest::read64(size));
+        crate::debug_print!("[usernls] created={:#x} written={:#x} mapped={:#x} base={:#x} size={:#x}", created, written, mapped, base, guest::read32(size));
     }
     assert(table_ok, "usernls: tabela do volume mapeada com o conteudo");
     assert(call("NtGetNlsSectionPtr", 11, 4242, 0, out) == 0 && guest::read64(out) == base && state::with(|state| state.user_regions.iter().filter(|region| region.section().is_some() && region.base() == base).count()) == 1, "usernls: a vista existente do processo e reaproveitada");
@@ -1700,26 +1780,29 @@ fn user_syscalls_core(assert: Assert) {
     let (out, info, string, buffer, attributes, rsp) = (block, block + 0x20, block + 0x80, block + 0x400, block + 0x900, block + 0x2000);
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
     guest::write64(rsp + 0x28, 0);
+    let (processor, counter, frequency) = unsafe { (nt::ProcessorNumber::at(out), nt::LargeInteger::at(out), nt::LargeInteger::at(out + 8)) };
     // Processador, display, contador e término.
-    guest::write32(out, 0xFFFF_FFFF);
-    assert(call("NtGetCurrentProcessorNumber", 0, 0, 0, 0) == 0 && call("NtGetCurrentProcessorNumberEx", out, 0, 0, 0) == 0 && guest::read32(out) == 0 && call("NtGetCurrentProcessorNumberEx", 0x10, 0, 0, 0) == 0xC000_0005, "usercore: processador corrente");
+    processor.group.set(0xFFFF);
+    processor.number.set(0xFF);
+    processor.reserved.set(0xFF);
+    assert(call("NtGetCurrentProcessorNumber", 0, 0, 0, 0) == 0 && call("NtGetCurrentProcessorNumberEx", out, 0, 0, 0) == 0 && processor.group.get() == 0 && processor.number.get() == 0 && processor.reserved.get() == 0 && call("NtGetCurrentProcessorNumberEx", 0x10, 0, 0, 0) == 0xC000_0005, "usercore: processador corrente");
     state::write_user_wide(string + 0x10, "OpenNT usuario\r\n");
     state::write_unicode_string(string, string + 0x10, "OpenNT usuario\r\n");
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
-    assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && guest::read64(out) != 0 && guest::read64(out + 8) == crate::ntos::ke::clock::tsc_frequency_hz() && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia");
+    assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::tsc_frequency_hz() && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia");
     let exit_cell = crate::hal::physical::read32(state::EXIT_CODE_CELL);
     assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::physical::read32(state::EXIT_CODE_CELL) == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
     crate::hal::physical::write32(state::EXIT_CODE_CELL, exit_cell);
     // Informações do sistema.
-    assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && guest::read32(buffer + 8) == 0x1000 && guest::read32(buffer + 0x18) == 0x10000 && guest::read64(buffer + 0x28) == crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT - 1 && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION");
-    assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && guest::read64(buffer) == 0, "usercore: tamanho curto, inicio do sistema e NUMA");
+    assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.maximum_user_mode_address.get() == crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT - 1 } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION");
+    assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
     guest::write64(buffer, u64::MAX);
-    assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && guest::read64(buffer + 8) == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
+    assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
     let topology = call("NtQuerySystemInformationEx", 107, string, 4, buffer);
-    assert(topology == 0 && guest::read32(buffer) == 4 && guest::read16(buffer + 10) == 1 && guest::read8(buffer + 33) == crate::ntos::ke::smp::online_cpu_count() as u8 && call("NtQuerySystemInformationEx", 107, string, 8, buffer) == 0xC000_000D, "usercore: topologia do grupo 0 e entrada invalida");
+    assert(topology == 0 && { let relation = unsafe { nt::SystemLogicalProcessorInformationEx::at(buffer) }; relation.relationship.get() == 4 && relation.group.active_group_count.get() == 1 && relation.group.group_info[0].active_processor_count.get() == crate::ntos::ke::smp::online_cpu_count() as u8 } && call("NtQuerySystemInformationEx", 107, string, 8, buffer) == 0xC000_000D, "usercore: topologia do grupo 0 e entrada invalida");
     guest::write32(string, 9);
     assert(call("NtQuerySystemInformationEx", 107, string, 4, buffer) == 0xC000_0003, "usercore: relacao de topologia invalida");
     // Erro fatal e informações do processo.
@@ -1728,11 +1811,11 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtRaiseHardError", 0xC000_0135, 5, 0, string) == 0xC000_000D && call("NtRaiseHardError", 0xC000_0135, 1, 0, string) == 0 && guest::read32(info) == 2, "usercore: HARDERROR responde ResponseAbort");
     guest::write64(rsp + 0x28, info);
     let (peb, process_id) = state::with(|state| (state.current_peb_va, state.current_process_id));
-    assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x30) == 0 && guest::read32(buffer) == 0x103 && guest::read64(buffer + 8) == peb && guest::read64(buffer + 0x20) == process_id && guest::read32(info) == 0x30, "usercore: ProcessBasicInformation");
-    assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x40) == 0 && guest::read64(buffer) == 0x40 && guest::read32(buffer + 8) == 0x103 && call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x20) == 0xC000_0004 && guest::read32(info) == 0x30, "usercore: informacao basica estendida e tamanho invalido");
+    assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x30) == 0 && { let basic = unsafe { nt::ProcessBasicInformation::at(buffer) }; basic.exit_status.get() == 0x103 && basic.peb_base_address.get() == peb && basic.unique_process_id.get() == process_id } && guest::read32(info) == 0x30, "usercore: ProcessBasicInformation");
+    assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x40) == 0 && { let extended = unsafe { nt::ProcessExtendedBasicInformation::at(buffer) }; extended.size.get() == 0x40 && extended.basic_info.exit_status.get() == 0x103 } && call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x20) == 0xC000_0004 && guest::read32(info) == 0x30, "usercore: informacao basica estendida e tamanho invalido");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
-    assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && guest::read16(buffer) > 0 && guest::read64(buffer + 8) == buffer + 16 && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");
+    assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");
     // Esperas reais sobre eventos.
     guest::write64(rsp + 0x28, 0);
     let _ = call("NtCreateEvent", out, 0x1F_0003, 0, 1);
@@ -1740,7 +1823,7 @@ fn user_syscalls_core(assert: Assert) {
     guest::write64(rsp + 0x28, 1);
     let _ = call("NtCreateEvent", out, 0x1F_0003, 0, 0);
     let second = guest::read64(out);
-    guest::write64(string, 0);
+    unsafe { nt::LargeInteger::at(string) }.quad_part.set(0);
     assert(call("NtWaitForSingleObject", first, 0, string, 0) == 0x102 && call("NtWaitForSingleObject", second, 0, string, 0) == 0 && call("NtWaitForSingleObject", 0x7FF0, 0, 0, 0) == 0xC000_0008, "usercore: espera unica com prazo zero e evento sinalizado");
     let _ = call("NtSetEvent", first, 0, 0, 0);
     let _ = call("NtResetEvent", second, 0, 0, 0);
@@ -1753,35 +1836,29 @@ fn user_syscalls_core(assert: Assert) {
     // Segurança do objeto e namespace.
     guest::write64(rsp + 0x28, info);
     assert(call("NtQuerySecurityObject", first, 4, buffer, 0x200) == 0 && guest::read32(info) > 0 && call("NtQuerySecurityObject", first, 4, buffer, 1) == 0xC000_0023 && call("NtQuerySecurityObject", first, 0x20, buffer, 0x200) == 0xC000_000D, "usercore: descritor do evento e recusas");
-    for offset in (0..0x30).step_by(8) {
-        guest::write64(attributes + offset, 0);
-    }
     state::write_user_wide(attributes + 0x80, "\\");
     state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\");
-    guest::write32(attributes, 0x30);
-    guest::write64(attributes + 0x10, attributes + 0x40);
-    guest::write32(attributes + 0x18, 0x40);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
     let opened = call("NtOpenDirectoryObject", out, 1, attributes, 0);
     let directory = guest::read64(out);
     assert(opened == 0 && call("NtCreatePartition", 0, 0, 0, 0) == 0xC000_0008, "usercore: diretorio raiz e particao inexistente");
     // NtContinue sobre o frame do syscall.
     assert(call("NtContinue", 0, 0, 0, 0) == 0xC000_0005, "usercore: NtContinue sem contexto");
     let context = block + 0x1000;
-    for offset in (0..0x4D0).step_by(8) {
-        guest::write64(context + offset, 0);
-    }
-    guest::write32(context + 0x30, 0x10_0001);
+    guest::write_bytes(context, &[0u8; nt::Context::SIZE as usize]);
+    let context_record = unsafe { nt::Context::at(context) };
+    context_record.context_flags.set(0x10_0001);
     assert(call("NtContinue", context, 0, 0, 0) == 0xC000_000D, "usercore: NtContinue sem CONTROL|INTEGER");
     let frame_block = guest::alloc_bytes(0x1000);
     let saved = state::with(|state| core::mem::replace(&mut state.syscall_stack_top, frame_block + 0x1000));
     let saved_rsp = guest::read64(state::USER_RSP_CELL_ADDR);
-    guest::write32(context + 0x30, 0x10_0003);
-    guest::write16(context + 0x38, 0x33);
-    guest::write16(context + 0x42, 0x2B);
-    guest::write32(context + 0x44, 0xFFFF_FFFF);
-    guest::write64(context + 0x78, 0x1122_3344_5566_7788);
-    guest::write64(context + 0x98, 0x7FF0_0000);
-    guest::write64(context + 0xF8, 0x1_4000_1000);
+    context_record.context_flags.set(0x10_0003);
+    context_record.seg_cs.set(0x33);
+    context_record.seg_ss.set(0x2B);
+    context_record.e_flags.set(0xFFFF_FFFF);
+    context_record.rax.set(0x1122_3344_5566_7788);
+    context_record.rsp.set(0x7FF0_0000);
+    context_record.rip.set(0x1_4000_1000);
     let continued = call("NtContinue", context, 0, 0, 0);
     let frame = frame_block + 0x1000 - 0x78;
     assert(continued == 0x5566_7788 && guest::read64(frame) == 0x1122_3344_5566_7788 && guest::read64(frame + 8) == 0x1_4000_1000 && guest::read64(frame + 0x40) == 0x21_0DD5 | 0x200 && guest::read64(state::USER_RSP_CELL_ADDR) == 0x7FF0_0000, "usercore: NtContinue reescreve o frame com RFLAGS filtrado");
@@ -1906,7 +1983,7 @@ fn user_ring3(assert: Assert) {
         rounds += 1;
     }
     let after_syscall = code + 10 + 10;
-    assert(kind == 1 && guest::read64(context + 0x78) == 0 && guest::read64(context + 0xF8) == after_syscall && guest::read64(context + 0x98) == stack_top, "userring3: intervalo encerrado pela syscall com RAX, RIP e RSP no CONTEXT");
+    assert(kind == 1 && { let saved = unsafe { nt::Context::at(context) }; saved.rax.get() == 0 && saved.rip.get() == after_syscall && saved.rsp.get() == stack_top }, "userring3: intervalo encerrado pela syscall com RAX, RIP e RSP no CONTEXT");
     process::set_current_thread(previous);
     let _ = process::release_thread(thread);
     physical::write32(state::EXIT_CODE_CELL, exit_cell);
@@ -2030,11 +2107,11 @@ fn user_tokens(assert: Assert) {
         call("NtQueryInformationToken", handle, class, buffer, length)
     };
     let user = query(token, 1, 0x100);
-    let sid = guest::read64(buffer);
-    assert(user == 0 && sid >= buffer && sid < buffer + guest::read32(returned) as u64 && guest::read8(sid) == 1, "usertokens: TOKEN_USER com o SID dentro do buffer");
+    let sid = unsafe { nt::TokenUser::at(buffer) }.user.sid.get();
+    assert(user == 0 && sid >= buffer && sid < buffer + guest::read32(returned) as u64 && unsafe { nt::Sid::at(sid) }.revision.get() == 1, "usertokens: TOKEN_USER com o SID dentro do buffer");
     assert(query(token, 8, 4) == 0 && guest::read32(buffer) == 1 && query(token, 9, 4) == 0xC000_0003 && query(token, 18, 4) == 0 && guest::read32(buffer) == 1 && query(token, 19, 4) == 0xC000_000D && query(token, 99, 4) == 0xC000_0003, "usertokens: tipo primario, nivel recusado, elevacao e classes invalidas");
-    assert(query(token, 7, 16) == 0 && guest::read_bytes(buffer, 8) == b"OpenNTbt" && query(token, 1, 4) == 0xC000_0023 && guest::read32(returned) >= 16, "usertokens: TOKEN_SOURCE e buffer curto com o tamanho devolvido");
-    assert(query(token, 2, 0x400) == 0 && guest::read32(buffer) as u64 * 16 + 8 <= guest::read32(returned) as u64 && query(token, 25, 0x100) == 0 && guest::read32(buffer + 8) == 0x60, "usertokens: grupos e rotulo de integridade");
+    assert(query(token, 7, 16) == 0 && guest::read_bytes(unsafe { nt::TokenSource::at(buffer) }.source_name[0].address(), 8) == b"OpenNTbt" && query(token, 1, 4) == 0xC000_0023 && guest::read32(returned) >= 16, "usertokens: TOKEN_SOURCE e buffer curto com o tamanho devolvido");
+    assert(query(token, 2, 0x400) == 0 && unsafe { nt::TokenGroups::at(buffer) }.group_count.get() as u64 * nt::SidAndAttributes::SIZE + core::mem::offset_of!(nt::TokenGroups, groups) as u64 <= guest::read32(returned) as u64 && query(token, 25, 0x100) == 0 && unsafe { nt::SidAndAttributes::at(buffer) }.attributes.get() == 0x60, "usertokens: grupos e rotulo de integridade");
     // Pseudo-handles: -4 consulta o primário; -5 sem impersonação não tem token.
     assert(query((-4i64) as u64, 12, 4) == 0 && query((-5i64) as u64, 1, 0x100) == 0xC000_007C && query((-4i64) as u64, 7, 16) == 0xC000_0022, "usertokens: pseudo-handles de token");
     // TokenStatistics pela variante de syscall (frame bruto).
@@ -2070,14 +2147,9 @@ fn user_query_object(assert: Assert) {
         call("NtQueryObject", handle, class, buffer, length)
     };
     // Evento nomeado do processo.
-    for offset in (0..0x30).step_by(8) {
-        guest::write64(attributes + offset, 0);
-    }
     state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
     state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
-    guest::write32(attributes, 0x30);
-    guest::write64(attributes + 0x10, attributes + 0x40);
-    guest::write32(attributes + 0x18, 0x40);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
     guest::write64(rsp + 0x28, 0);
     let created = call("NtCreateEvent", out, 0x1F_0003, attributes, 0);
     let event = guest::read64(out);
@@ -2095,22 +2167,23 @@ fn user_query_object(assert: Assert) {
     };
     crate::ntos::ps::process::set_current_thread(thread);
     state::with(|state| state.current_process_id = 0x7F20);
-    assert(query(event, 0, 56) == 0 && guest::read32(buffer + 4) == 0x1F_0003 && guest::read32(buffer + 8) == 1 && guest::read32(buffer + 12) >= 1, "userquery: OBJECT_BASIC_INFORMATION com acesso e handles");
+    assert(query(event, 0, 56) == 0 && { let basic = unsafe { nt::ObjectBasicInformation::at(buffer) }; basic.granted_access.get() == 0x1F_0003 && basic.handle_count.get() == 1 && basic.pointer_count.get() >= 1 }, "userquery: OBJECT_BASIC_INFORMATION com acesso e handles");
     let named = query(event, 1, 0x100);
-    let length = guest::read16(buffer) as u64;
-    assert(named == 0 && length == 36 && guest::read64(buffer + 8) == buffer + 16 && state::read_user_wide_string(buffer + 16, length / 2) == "\\OpenNtEventoQuery", "userquery: nome do objeto pelo namespace");
+    let name_info = unsafe { nt::ObjectNameInformation::at(buffer) };
+    let length = name_info.name.length.get() as u64;
+    assert(named == 0 && length == 36 && name_info.name.buffer.get() == buffer + nt::ObjectNameInformation::SIZE && state::read_user_wide_string(name_info.name.buffer.get(), length / 2) == "\\OpenNtEventoQuery", "userquery: nome do objeto pelo namespace");
     let typed = query(event, 2, 0x200);
-    assert(typed == 0 && state::read_user_wide_string(guest::read64(buffer + 8), guest::read16(buffer) as u64 / 2) == "Event", "userquery: OBJECT_TYPE_INFORMATION do evento");
+    assert(typed == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Event", "userquery: OBJECT_TYPE_INFORMATION do evento");
     assert(query(event, 4, 2) == 0 && query(event, 5, 8) == 0xC000_0003 && query(event, 0, 40) == 0xC000_0004 && query(event, 1, 8) == 0xC000_0004 && guest::read32(returned) == 54, "userquery: flags, classe e tamanhos invalidos com o tamanho exigido");
-    assert(query(event, 3, 0x2000) == 0 && guest::read32(buffer) as usize == crate::ntos::ob::object_types::all().len(), "userquery: lista de todos os tipos");
+    assert(query(event, 3, 0x2000) == 0 && unsafe { nt::ObjectTypesInformation::at(buffer) }.number_of_types.get() as usize == crate::ntos::ob::object_types::all().len(), "userquery: lista de todos os tipos");
     // Pseudo-handle do processo, handles inválidos e alinhamento.
     let process = query(u64::MAX, 2, 0x200);
-    assert(process == 0 && state::read_user_wide_string(guest::read64(buffer + 8), guest::read16(buffer) as u64 / 2) == "Process", "userquery: pseudo-handle do processo corrente");
+    assert(process == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Process", "userquery: pseudo-handle do processo corrente");
     guest::write64(rsp + 0x28, returned);
     assert(query(0x7FF0, 0, 56) == 0xC000_0008 && query(0x8000_0000, 0, 56) == 0xC000_0008 && call("NtQueryObject", event, 0, buffer + 1, 56) == 0x8000_0002, "userquery: handles invalidos e saida desalinhada");
     // ZwQueryObject pelo caminho de kernel.
     let kernel = guest::alloc_bytes(0x100);
-    assert(query_object::query(u64::MAX, 0, kernel, 56, 0).ok() == Some(0) && guest::read32(kernel + 4) == crate::ntos::ob::object_types::process_type().valid_access, "userquery: ZwQueryObject do processo corrente em KernelMode");
+    assert(query_object::query(u64::MAX, 0, kernel, 56, 0).ok() == Some(0) && unsafe { nt::ObjectBasicInformation::at(kernel) }.granted_access.get() == crate::ntos::ob::object_types::process_type().valid_access, "userquery: ZwQueryObject do processo corrente em KernelMode");
     guest::free_bytes(kernel);
     crate::ntos::ps::process::set_current_thread(previous);
     state::with(|state| state.current_process_id = saved_pid);
@@ -2144,12 +2217,13 @@ fn user_remove_completion(assert: Assert) {
         state::with(|state| state.service_raw_arguments = 0);
     }
     // Lote de dois em UserMode: FILE_IO_COMPLETION_INFORMATION de 32 bytes.
-    guest::write64(timeout, 0);
+    unsafe { nt::LargeInteger::at(timeout) }.quad_part.set(0);
+    let packets = unsafe { nt::FileIoCompletionInformation::array_at(entries, 2) };
     guest::write64(rsp + 0x28, timeout);
     guest::write64(rsp + 0x30, 0);
     let batch = call("NtRemoveIoCompletionEx", port, entries, 2, removed);
-    assert(batch == 0 && guest::read32(removed) == 2 && guest::read64(entries) == 0x11 && guest::read64(entries + 8) == 0x12 && guest::read64(entries + 24) == 0x13 && guest::read64(entries + 32) == 0x22, "userremove: NtRemoveIoCompletionEx retira o lote em ordem FIFO");
-    assert(call("NtRemoveIoCompletionEx", port, entries, 4, removed) == 0 && guest::read32(removed) == 1 && guest::read64(entries) == 0x33, "userremove: lote maior que a fila entrega o que existe");
+    assert(batch == 0 && guest::read32(removed) == 2 && packets[0].key_context.get() == 0x11 && packets[0].apc_context.get() == 0x12 && packets[0].io_status_block.information.get() == 0x13 && packets[1].key_context.get() == 0x22, "userremove: NtRemoveIoCompletionEx retira o lote em ordem FIFO");
+    assert(call("NtRemoveIoCompletionEx", port, entries, 4, removed) == 0 && guest::read32(removed) == 1 && packets[0].key_context.get() == 0x33, "userremove: lote maior que a fila entrega o que existe");
     assert(call("NtRemoveIoCompletionEx", port, entries, 1, removed) == 0x102, "userremove: fila vazia com prazo zero devolve STATUS_TIMEOUT");
     assert(call("NtRemoveIoCompletionEx", port, entries, 0, removed) == 0xC000_000D && call("NtRemoveIoCompletionEx", port, entries + 4, 1, removed) == 0x8000_0002 && call("NtRemoveIoCompletionEx", 0x7FF0, entries, 1, removed) == 0xC000_0008, "userremove: contagem, alinhamento e handle invalidos");
     guest::write64(rsp + 0x28, 0);
@@ -2166,10 +2240,10 @@ fn user_remove_completion(assert: Assert) {
         let _ = reference.release();
         status
     });
-    guest::write64(kernel + 0x10, 0);
+    unsafe { nt::LargeInteger::at(kernel + 0x10) }.quad_part.set(0);
     let mut request = remove_completion::begin(handle, kernel + 0x40, 1, kernel + 0x18, kernel + 0x10, false, 0, true, None);
     let status = request.as_mut().ok().and_then(|request| request.poll());
-    assert(created == 0 && posted == Some(0) && status == Some(0) && guest::read32(kernel + 0x18) == 1 && guest::read64(kernel + 0x40) == 0x44 && guest::read64(kernel + 0x58) == 0x46, "userremove: retirada em KernelMode por handle de kernel");
+    assert(created == 0 && posted == Some(0) && status == Some(0) && guest::read32(kernel + 0x18) == 1 && { let packet = unsafe { nt::FileIoCompletionInformation::at(kernel + 0x40) }; packet.key_context.get() == 0x44 && packet.io_status_block.information.get() == 0x46 }, "userremove: retirada em KernelMode por handle de kernel");
     assert(completion_reference::reference(0xFFFF_FFFF_8000_0004, 1).ok().is_some_and(|reference| reference.is_err_and(|status| status == 0xC000_0008)) && completion_reference::reference(u64::MAX, 0).ok().is_some_and(|reference| reference.is_err_and(|status| status == 0xC000_0024)), "userremove: handle de kernel recusado em UserMode e pseudo-handle");
     let _ = crate::ntos::ob::open_pointer::close(handle);
     guest::free_bytes(kernel);
@@ -2267,11 +2341,13 @@ fn user_alpc_foundation(assert: Assert) {
     assert(wake_policy::select_charge_mode(0, 0, 0, true).is_none() && wake_policy::select_charge_mode(0, 0x20_0000, 0, false) == Some(3) && wake_policy::select_charge_mode(0, 0x40_0000, 0, false) == Some(1) && wake_policy::select_charge_mode(0, 0, 1, false).is_none() && wake_policy::select_charge_mode(0x2_0000, 0, 3, false) == Some(0x8000_0003), "useralpc: politica de cobranca de ativacao");
     assert(direct_event::validate(0x10, 0x2000_0000) == 0xC000_000D && direct_event::validate(0, 0) == 0xC000_000D && direct_event::validate(0, 0x2000_0000) == 0, "useralpc: validacao do atributo direto");
     let attribute = guest::alloc_bytes(32);
-    guest::write64(attribute + 8, 0xABCD);
-    guest::write32(attribute + 28, 0x5A5A);
+    let context_attribute_view = unsafe { nt::AlpcContextAttr::at(attribute) };
+    let tail = context_attribute_view.callback_id.address() + 4;
+    context_attribute_view.message_context.set(0xABCD);
+    guest::write32(tail, 0x5A5A);
     if let Ok(Some(identity)) = message_identity::activate(&port, None) {
         let captured = context_attribute::capture(attribute, 0x77, &identity);
-        assert(captured == 0xABCD && guest::read64(attribute) == 0x77 && guest::read32(attribute + 16) == 0 && guest::read32(attribute + 20) == identity.identifier && guest::read32(attribute + 28) == 0x5A5A && identity.with(|state| state.client_context) == 0xABCD, "useralpc: atributo de contexto capturado sem tocar o reservado");
+        assert(captured == 0xABCD && context_attribute_view.port_context.get() == 0x77 && context_attribute_view.sequence.get() == 0 && context_attribute_view.message_id.get() == identity.identifier && guest::read32(tail) == 0x5A5A && identity.with(|state| state.client_context) == 0xABCD, "useralpc: atributo de contexto capturado sem tocar o reservado");
         let _ = message_identity::release(&identity);
     }
     guest::free_bytes(attribute);
@@ -2312,9 +2388,10 @@ fn user_alpc_services(assert: Assert) {
     assert(same && status(u64::MAX) == Some(0xC000_0024) && status(handle + 0x400) == Some(0xC000_0008) && status(0xFFFF_FFFF_8000_0004) == Some(0xC000_0008) && status(0x1_0000_0000) == Some(0xC000_0008), "useralpcsvc: referencia da porta pela tabela e recusas");
     // Contexto de segurança pela entrada Nt (qualidade padrão da porta).
     let attribute = block + 0x100;
-    guest::write64(attribute + 8, 0);
+    let security_attribute = unsafe { nt::AlpcSecurityAttr::at(attribute) };
+    security_attribute.p_qos.set(0);
     let create_context = state::handler("NtAlpcCreateSecurityContext").map(|handler| handler(handle, 0, attribute, 0, block + 0x800));
-    let context = guest::read64(attribute + 16);
+    let context = security_attribute.context_handle.get();
     assert(matches!(create_context, Some(Ok(0))) && context >= 0x10 && services::create_security_context(handle, 1, attribute, 1).ok() == Some(0xC000_000D) && services::create_security_context(handle, 0, attribute + 4, 1).ok() == Some(0x8000_0002), "useralpcsvc: contexto de seguranca criado pela syscall");
     assert(services::delete_security_context(handle, 0, context, 1).ok() == Some(0) && services::delete_security_context(handle, 0, context, 1).ok() == Some(0xC000_0008), "useralpcsvc: contexto excluido e identificador retirado");
     // Reserva de mensagem.
@@ -2329,13 +2406,14 @@ fn user_alpc_services(assert: Assert) {
     let section = guest::read64(section_out);
     assert(section_status == Some(0) && guest::read64(size_out) == 0x1_0000 && services::create_port_section(handle, 0x4_0000, 4, 0x2000, section_out, size_out, 1).ok() == Some(0xC000_000D) && services::create_port_section(handle, 0, 0, 0, section_out, size_out, 1).ok() == Some(0xC000_000D), "useralpcsvc: secao de porta de pagefile arredondada a 64 KiB");
     let view = block + 0x300;
-    guest::write32(view, 0);
-    guest::write64(view + 8, section);
-    guest::write64(view + 16, 0);
-    guest::write64(view + 24, 0x1000);
+    let view_attribute = unsafe { nt::AlpcDataViewAttr::at(view) };
+    view_attribute.flags.set(0);
+    view_attribute.section_handle.set(section);
+    view_attribute.view_base.set(0);
+    view_attribute.view_size.set(0x1000);
     let view_status = services::create_section_view(handle, 0, view, 1).ok();
-    let base = guest::read64(view + 16);
-    let mapped = base != 0 && guest::read64(view + 24) == 0x1000 && port.with(|state| state.owned_section_views.len()) == 1;
+    let base = view_attribute.view_base.get();
+    let mapped = base != 0 && view_attribute.view_size.get() == 0x1000 && port.with(|state| state.owned_section_views.len()) == 1;
     if mapped {
         guest::write32(base, 0xA1C0_5EC7);
     }
@@ -2349,8 +2427,9 @@ fn user_alpc_services(assert: Assert) {
         guest::read64(block + 0x380)
     });
     let input = block + 0x400;
-    guest::write64(input, 0x55);
-    guest::write64(input + 8, queue_handle.unwrap_or(0));
+    let association = unsafe { nt::AlpcPortAssociateCompletionPort::at(input) };
+    association.completion_key.set(0x55);
+    association.completion_port.set(queue_handle.unwrap_or(0));
     let associated = services::set_information(handle, 2, input, 16, 1).ok();
     assert(associated == Some(0) && port.completion_key() == 0x55 && services::set_information(handle, 2, input, 16, 1).ok() == Some(0xC000_0048) && services::set_information(handle, 2, input, 8, 1).ok() == Some(0xC000_0004) && services::set_information(handle, 1, input, 8, 1).ok() == Some(0xC000_00BB) && services::set_information(handle, 3, input, 8, 1).ok() == Some(0xC000_000D) && services::set_information(0, 2, input, 16, 1).ok() == Some(0xC000_000D) && services::set_information(handle, 2, input, 80, 1).ok() == Some(0xC000_0004), "useralpcsvc: associacao da IOCP por set-information");
     if let (Ok(queue), Some(completion)) = (&queue, port.with(|state| state.completion.clone())) {
@@ -2438,14 +2517,8 @@ fn user_alpc_connect_capture(assert: Assert) {
         return;
     };
     let unicode = |at: u64, buffer: u64, text: &str| {
-        let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(buffer + index as u64 * 2, *unit);
-        }
-        guest::write16(at, (units.len() * 2) as u16);
-        guest::write16(at + 2, (units.len() * 2) as u16);
-        guest::write32(at + 4, 0);
-        guest::write64(at + 8, buffer);
+        let length = write_wide(buffer, text);
+        set_unicode(unsafe { nt::UnicodeString::at(at) }, length, length, buffer);
     };
     let path = "\\RPC Control\\OpenNtTesteAlpc";
     let Ok(listener) = transport::register(path, alloc::sync::Arc::new(AlpcTestService { deferred: false })) else {
@@ -2467,7 +2540,7 @@ fn user_alpc_connect_capture(assert: Assert) {
     let trailing = connect_capture::listener(name, None, 1).err();
     unicode(name, block + 0x40, "\\RPC Control\\opennttestealpc");
     let case = connect_capture::listener(name, None, 1).err();
-    guest::write16(name, 3);
+    unsafe { nt::UnicodeString::at(name) }.length.set(3);
     let odd = connect_capture::listener(name, None, 1).err();
     assert(relative == Some(0xC000_003B) && missing == Some(0xC000_0034) && directory == Some(0xC000_0024) && trailing == Some(0xC000_0033) && case == Some(0xC000_0034) && odd == Some(0xC000_0033), "useralpcconn: recusas do nome do endpoint");
     // SID exigido do servidor.
@@ -2479,26 +2552,23 @@ fn user_alpc_connect_capture(assert: Assert) {
     }
     assert(connect_capture::listener(name, Some(&user), 1).is_ok() && connect_capture::listener(name, Some(&wrong), 1).err() == Some(0xC000_02A0), "useralpcconn: SID exigido comparado com o token do servidor");
     let sid = block + 0x100;
-    for (index, byte) in user.iter().enumerate() {
-        guest::write8(sid + index as u64, *byte);
-    }
+    guest::write_bytes(sid, &user);
     let captured_sid = connect_capture::identifier(sid, 1);
-    guest::write8(sid, 2);
+    unsafe { nt::Sid::at(sid) }.revision.set(2);
     assert(captured_sid.as_ref().is_ok_and(|bytes| bytes.as_deref() == Some(user.as_slice())) && connect_capture::identifier(sid, 1).err() == Some(0xC000_0078) && connect_capture::identifier(0, 1) == Ok(None), "useralpcconn: SID capturado e revisao invalida");
     // ALPC_PORT_ATTRIBUTES.
     let defaults = connect_parameters::capture(0, 1).ok().and_then(|captured| connect_parameters::for_client(&captured, 0x200).ok().and_then(|result| result.ok()));
     assert(defaults.is_some_and(|parameters| parameters.port_flags == 0x1_0000 && parameters.maximum == 0x200 && parameters.security_quality.tracking == 1 && parameters.maximum_total_section_size == 0x2_0000), "useralpcconn: parametros padrao do cliente");
     let attributes = block + 0x200;
-    for offset in (0..72).step_by(8) {
-        guest::write64(attributes + offset, 0);
-    }
+    guest::write_bytes(attributes, &[0u8; nt::AlpcPortAttributes::SIZE as usize]);
+    let port_attributes = unsafe { nt::AlpcPortAttributes::at(attributes) };
     let client = |flags: u32, level: u32, tracking: u8, maximum: u64| {
-        guest::write32(attributes, flags);
-        guest::write32(attributes + 8, level);
-        guest::write8(attributes + 12, tracking);
-        guest::write8(attributes + 13, 1);
-        guest::write64(attributes + 16, maximum);
-        guest::write32(attributes + 64, 0xFFFF);
+        port_attributes.flags.set(flags);
+        port_attributes.security_qos.impersonation_level.set(nt::SecurityImpersonationLevel(level as i32));
+        port_attributes.security_qos.context_tracking_mode.set(tracking);
+        port_attributes.security_qos.effective_only.set(1);
+        port_attributes.max_message_length.set(maximum);
+        port_attributes.dup_object_types.set(0xFFFF);
         connect_parameters::capture(attributes, 1).ok().and_then(|captured| connect_parameters::for_client(&captured, 0x200).ok())
     };
     let accepted = client(0x8001_0000 | 0x20_0000, 2, 0, 0x1000);
@@ -2506,40 +2576,37 @@ fn user_alpc_connect_capture(assert: Assert) {
     assert(matches!(client(0, 2, 0, 30), Some(Err(0xC000_000D))) && matches!(client(0x10_0000, 2, 0, 0x100), Some(Err(0xC000_000D))) && matches!(client(0, 2, 2, 0x100), Some(Err(0xC000_000D))) && matches!(client(0, 4, 0, 0x100), Some(Err(0xC000_00A5))), "useralpcconn: ordem das recusas dos atributos");
     // OBJECT_ATTRIBUTES da porta cliente.
     let object = block + 0x300;
-    guest::write32(object, 48);
-    guest::write64(object + 8, 0);
-    guest::write64(object + 16, name);
-    guest::write32(object + 24, 0);
-    guest::write64(object + 32, 0);
-    guest::write64(object + 40, 0);
+    let object_attributes = unsafe { nt::ObjectAttributes::at(object) };
+    set_object_attributes(object_attributes, nt::ObjectAttributes::SIZE as u32, 0, name, 0);
     unicode(name, block + 0x40, "\\RPC Control\\OpenNtTesteCliente");
     let creation = connect_capture::object_attributes(object, 1);
     unicode(name, block + 0x40, path);
     let collision = connect_capture::object_attributes(object, 1).err();
     unicode(name, block + 0x40, "\\NaoExiste\\Cliente");
     let parent_missing = connect_capture::object_attributes(object, 1).err();
-    guest::write32(object, 40);
+    object_attributes.length.set(40);
     let bad_length = connect_capture::object_attributes(object, 1).err();
-    guest::write32(object, 48);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
     assert(creation.as_ref().is_ok_and(|creation| creation.leaf == "OpenNtTesteCliente" && creation.parent.is_some() && creation.name.as_deref() == Some("\\RPC Control\\OpenNtTesteCliente")) && collision == Some(0xC000_0035) && parent_missing == Some(0xC000_003A) && bad_length == Some(0xC000_000D), "useralpcconn: OBJECT_ATTRIBUTES da porta cliente");
     // Busca Ex por OBJECT_ATTRIBUTES.
     unicode(name, block + 0x40, path);
     let ex_target = connect_target::listener(object, None, 1);
-    guest::write32(object + 24, 0x8000_0000);
+    object_attributes.attributes.set(0x8000_0000);
     let ex_flags = connect_target::listener(object, None, 1).err();
-    guest::write32(object + 24, 0);
+    object_attributes.attributes.set(0);
     assert(ex_target.is_ok_and(|target| target.node == listener.node) && ex_flags == Some(0xC000_000D) && connect_target::listener(0, None, 1).err() == Some(0xC000_0033) && connect_target::required_security(0x1234, 0).ok().is_some_and(|policy| policy.is_none()), "useralpcconn: busca Ex do endpoint");
     // Mensagem de conexão.
     let message = block + 0x400;
-    guest::write16(message, 4);
-    guest::write16(message + 2, 44);
-    guest::write16(message + 4, 0x8000);
-    guest::write32(message + 40, 0xC0FF_EE11);
+    let connection_message = unsafe { nt::PortMessage::at(message) };
+    connection_message.u1.s1.data_length.set(4);
+    connection_message.u1.s1.total_length.set(44);
+    connection_message.u2.s2.type_.set(0x8000u16 as i16);
+    guest::write_bytes(message + nt::PortMessage::SIZE, &0xC0FF_EE11u32.to_le_bytes());
     let captured = connect_capture::message(message, 0x200, 1);
     let kernel = connect_capture::message(message, 0x200, 0).map(|message| message.message_type);
-    guest::write16(message + 2, 45);
+    connection_message.u1.s1.total_length.set(45);
     let incoherent = connect_capture::message(message, 0x200, 1).err();
-    guest::write16(message + 2, 44);
+    connection_message.u1.s1.total_length.set(44);
     assert(captured.as_ref().is_ok_and(|message| message.data == [0x11, 0xEE, 0xFF, 0xC0] && message.message_type == 0x200A) && kernel == Ok(0xA00A) && incoherent == Some(0xC000_000D) && connect_capture::message(message, 43, 1).err() == Some(0xC000_002F) && connect_capture::message(0, 0x200, 1).is_ok_and(|message| message.data.is_empty()), "useralpcconn: mensagem de conexao capturada");
     // Consultas da porta.
     let Ok(port) = port_objects::create("alpc", PortState { role: Role::Listener, port_flags: 0x8001_0000, port_context: 0x7777, ..PortState::default() }, 0x200, 5, 0, alloc::boxed::Box::new(|_| {}), port_objects::CreateOptions::default()) else {
@@ -2551,10 +2618,8 @@ fn user_alpc_connect_capture(assert: Assert) {
     let (output, returned) = (block + 0x600, block + 0x620);
     let basic = query_information::query(handle, 0, output, 16, returned, 1).ok();
     let short = query_information::query(handle, 0, output, 8, returned, 1).ok();
-    assert(basic == Some(0) && guest::read32(output) == 0x1_0000 && guest::read32(output + 4) == 5 && guest::read64(output + 8) == 0x7777 && short == Some(0xC000_0004) && guest::read32(returned) == 16, "useralpcconn: consulta basica da porta");
-    for (index, byte) in user.iter().enumerate() {
-        guest::write8(sid + index as u64, *byte);
-    }
+    assert(basic == Some(0) && { let basic_info = unsafe { nt::AlpcBasicInformation::at(output) }; basic_info.flags.get() == 0x1_0000 && basic_info.sequence_no.get() == 5 && basic_info.port_context.get() == 0x7777 } && short == Some(0xC000_0004) && guest::read32(returned) == 16, "useralpcconn: consulta basica da porta");
+    guest::write_bytes(sid, &user);
     let own = query_information::query(handle, 3, sid, 0, returned, 1).ok();
     guest::write8(sid + user.len() as u64 - 1, user[user.len() - 1] ^ 0xFF);
     let other = query_information::query(handle, 3, sid, 0, returned, 1).ok();
@@ -2562,11 +2627,12 @@ fn user_alpc_connect_capture(assert: Assert) {
     let query_handler = state::handler("NtAlpcQueryInformation").is_some();
     // Segurança por mensagem: CREATE publicado, seleção explícita e RELEASE.
     let security = block + 0x700;
-    guest::write32(security, 0x2_0000);
-    guest::write64(security + 8, 0);
-    guest::write64(security + 16, 0xFFFF_FFFF_FFFF_FFFE);
+    let security_attribute = unsafe { nt::AlpcSecurityAttr::at(security) };
+    security_attribute.flags.set(0x2_0000);
+    security_attribute.p_qos.set(0);
+    security_attribute.context_handle.set(0xFFFF_FFFF_FFFF_FFFE);
     let created = message_security::capture(&port, security, 1).ok().and_then(|result| result.ok());
-    let context = guest::read64(security + 16);
+    let context = security_attribute.context_handle.get();
     let identity = message_identity::activate(&port, None).ok().flatten();
     let mut selected_token = 0;
     let mut implicit = None;
@@ -2583,30 +2649,31 @@ fn user_alpc_connect_capture(assert: Assert) {
         let _ = message_identity::release(identity);
     }
     assert(matches!(created, Some(message_security::Captured::Borrowed(_))) && context != 0xFFFF_FFFF_FFFF_FFFE && selected_token != 0 && implicit == Some(0xC000_0022), "useralpcconn: contexto de mensagem criado e selecionado");
-    guest::write32(security, 0x1_0000);
+    security_attribute.flags.set(0x1_0000);
     let released = message_security::capture(&port, security, 1).ok().and_then(|result| result.ok());
-    guest::write32(security, 0x3_0000);
+    security_attribute.flags.set(0x3_0000);
     let both = message_security::capture(&port, security, 1).ok().and_then(|result| result.err());
     assert(matches!(released, Some(message_security::Captured::Empty)) && both == Some(0xC000_000D) && crate::ntos::alpc::security_contexts::reference(&port, context).ok().and_then(|result| result.err()) == Some(0xC000_0008), "useralpcconn: RELEASE retira o contexto");
     // Cancelamento: captura dos layouts x64 e compacto.
     let cancel_context = block + 0x800;
-    guest::write64(cancel_context + 8, 0xABCD_0000_1234);
-    guest::write32(cancel_context + 20, 0x40);
-    guest::write32(cancel_context + 24, 7);
+    let (cancel_attribute, compact_attribute) = unsafe { (nt::AlpcContextAttr::at(cancel_context), AlpcContextAttr32::at(cancel_context)) };
+    cancel_attribute.message_context.set(0xABCD_0000_1234);
+    cancel_attribute.message_id.set(0x40);
+    cancel_attribute.callback_id.set(7);
     let mut seen = None;
     let canceled = cancel_message::cancel(handle, 0, cancel_context, 1, |_, selection, _| {
         seen = Some(selection);
         Ok(0x1234)
     });
-    guest::write32(cancel_context + 4, 0x55);
-    guest::write32(cancel_context + 12, 0x80);
-    guest::write32(cancel_context + 16, 9);
+    compact_attribute.message_context.set(0x55);
+    compact_attribute.message_id.set(0x80);
+    compact_attribute.callback_id.set(9);
     let mut compact = None;
     let _ = cancel_message::cancel(handle, 4, cancel_context, 1, |_, selection, _| {
         compact = Some(selection);
         Ok(0)
     });
-    guest::write32(cancel_context + 20, 0);
+    cancel_attribute.message_id.set(0);
     let zero = cancel_message::cancel(handle, 0, cancel_context, 1, |_, _, _| Ok(0)).ok();
     assert(canceled.ok() == Some(0x1234) && seen.is_some_and(|selection| selection.identifier == 0x40 && selection.callback == 7 && selection.message_context == 0xABCD_0000_1234) && compact.is_some_and(|selection| selection.identifier == 0x80 && selection.callback == 9 && selection.message_context == 0x55) && zero == Some(0xC000_0109) && cancel_message::cancel(handle, 0x10, cancel_context, 1, |_, _, _| Ok(0)).ok() == Some(0xC000_000D), "useralpcconn: captura do cancelamento");
     // Serviço LPC legado: imediato e por continuação.
@@ -2671,11 +2738,12 @@ fn user_alpc_message_handles(assert: Assert) {
     assert(matches!(created, Some(Ok(0))) && event != 0, "useralpchnd: evento de origem");
     // Formato simples.
     let attribute = block + 0x100;
+    let handle_attribute = unsafe { nt::AlpcHandleAttr::at(attribute) };
     let simple = |flags: u32, value: u64, access: u32| {
-        guest::write32(attribute, flags);
-        guest::write64(attribute + 8, value);
-        guest::write32(attribute + 16, 0);
-        guest::write32(attribute + 20, access);
+        handle_attribute.flags.set(flags);
+        handle_attribute.handle.set(value);
+        handle_attribute.object_type.set(0);
+        handle_attribute.desired_access.set(access);
         message_handles::capture(attribute, 1).ok()
     };
     let captured = simple(0, event, 0x10_0002).and_then(|result| result.ok());
@@ -2696,16 +2764,16 @@ fn user_alpc_message_handles(assert: Assert) {
     assert(refusals == (Some(0xC000_000D), Some(0xC000_0022), Some(0xC000_0008), Some(0xC000_0008), Some(0xC000_0022)), "useralpchnd: recusas da captura simples");
     // Forma indireta.
     let array = block + 0x200;
-    for index in 0..2u64 {
-        guest::write32(array + index * 16, 0);
-        guest::write32(array + index * 16 + 4, event as u32);
-        guest::write32(array + index * 16 + 8, 0);
-        guest::write32(array + index * 16 + 12, 0x10_0000);
+    for entry in unsafe { nt::AlpcHandleAttr32::array_at(array, 2) } {
+        entry.flags.set(0);
+        entry.handle.set(event as u32);
+        entry.object_type.set(0);
+        entry.desired_access.set(0x10_0000);
     }
     let indirect = |count: u32| {
-        guest::write32(attribute, 0x4_0000);
-        guest::write64(attribute + 8, array);
-        guest::write32(attribute + 16, count);
+        handle_attribute.flags.set(0x4_0000);
+        handle_attribute.handle_attr_array.set(array);
+        handle_attribute.handle_count.set(count);
         message_handles::capture(attribute, 1).ok()
     };
     let pair = indirect(2).and_then(|result| result.ok());
@@ -2725,23 +2793,25 @@ fn user_alpc_message_handles(assert: Assert) {
     };
     identity.with(|state| state.handles = Some(captured.clone()));
     let message = block + 0x300;
-    guest::write16(message + 4, 1);
-    guest::write32(message + 24, identity.identifier);
-    guest::write32(message + 32, identity.callback);
+    let selector = unsafe { nt::PortMessage::at(message) };
+    selector.u2.s2.type_.set(1);
+    selector.message_id.set(identity.identifier);
+    selector.callback_id.set(identity.callback);
     let (output, returned) = (block + 0x400, block + 0x480);
-    guest::write32(output, 0);
+    let handle_info = unsafe { nt::AlpcMessageHandleInformation::at(output) };
+    handle_info.index.set(0);
     let queried = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
-    let duplicated = guest::read32(output + 8) as u64;
+    let duplicated = handle_info.handle.get() as u64;
     // O dono da porta é o System nestes testes: o ULONG traz o bit de kernel.
     let system_owner = port.process_pointer == crate::ntos::ps::process::get_system_process();
     let kernel = duplicated & 0x8000_0000 != 0;
     let duplicated = if kernel { 0xFFFF_FFFF_0000_0000 | duplicated } else { duplicated };
     let resolved = open_pointer::resolve(duplicated, !kernel).and_then(|resolved| resolved.ok()).map(|resolved| resolved.access);
-    assert(queried == Some(0) && kernel == system_owner && duplicated != 0 && duplicated != event && guest::read32(output + 12) == 0x10 && guest::read32(output + 16) == 0x10_0002 && guest::read32(returned) == 20 && resolved == Some(0x10_0002), "useralpchnd: handle duplicado na tabela do dono");
+    assert(queried == Some(0) && kernel == system_owner && duplicated != 0 && duplicated != event && handle_info.object_type.get() == 0x10 && handle_info.granted_access.get() == 0x10_0002 && guest::read32(returned) == 20 && resolved == Some(0x10_0002), "useralpchnd: handle duplicado na tabela do dono");
     let _ = open_pointer::close(duplicated);
-    guest::write32(output, 5);
+    handle_info.index.set(5);
     let missing = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
-    guest::write32(output, 0);
+    handle_info.index.set(0);
     let short = query_message::query(handle, message, 3, output, 16, returned, 1, None).ok();
     port.with(|state| state.duplicate_object_types = 0x20);
     let kind = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
@@ -2750,15 +2820,16 @@ fn user_alpc_message_handles(assert: Assert) {
     // Classes de token e de evento direto.
     let anonymous = query_message::query(handle, message, 0, output, 64, returned, 1, None).ok();
     let security = block + 0x500;
-    guest::write32(security, 0);
-    guest::write64(security + 8, 0);
-    guest::write64(security + 16, 0xFFFF_FFFF_FFFF_FFFE);
+    let security_attribute = unsafe { nt::AlpcSecurityAttr::at(security) };
+    security_attribute.flags.set(0);
+    security_attribute.p_qos.set(0);
+    security_attribute.context_handle.set(0xFFFF_FFFF_FFFF_FFFE);
     if let Ok(Ok(message_security::Captured::Borrowed(borrowed))) = message_security::capture(&port, security, 1) {
         identity.with(|state| state.security = Some(borrowed));
     }
     let user = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process()).and_then(|token| crate::ntos::se::token::tokens::with(token, |token| token.user.clone())).unwrap_or_default();
     let sid_status = query_message::query(handle, message, 0, output, 64, returned, 1, None).ok();
-    let sid: alloc::vec::Vec<u8> = (0..user.len() as u64).map(|index| guest::read8(output + index)).collect();
+    let sid: alloc::vec::Vec<u8> = guest::read_bytes(output, user.len());
     let sid_length = guest::read32(returned);
     let modified_short = query_message::query(handle, message, 1, output, 4, returned, 1, None).ok();
     let modified_short_length = guest::read32(returned);
@@ -2766,12 +2837,12 @@ fn user_alpc_message_handles(assert: Assert) {
     assert(anonymous == Some(0xC000_0022) && sid_status == Some(0) && sid == user && sid_length == user.len() as u32 && modified_short == Some(0xC000_0023) && modified_short_length == 8 && modified == Some(0), "useralpchnd: SID e ModifiedId do contexto da mensagem");
     let direct = query_message::query(handle, message, 2, 0, 0, 0, 1, None).ok();
     let direct_args = query_message::query(handle, message, 2, output, 0, 0, 1, None).ok();
-    guest::write32(message + 24, 0);
+    selector.message_id.set(0);
     let zero = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
-    guest::write32(message + 24, identity.identifier);
-    guest::write32(message + 32, identity.callback.wrapping_add(1));
+    selector.message_id.set(identity.identifier);
+    selector.callback_id.set(identity.callback.wrapping_add(1));
     let wrong = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
-    guest::write32(message + 32, identity.callback);
+    selector.callback_id.set(identity.callback);
     identity.with(|state| state.canceled = true);
     let canceled = query_message::query(handle, message, 3, output, 20, returned, 1, None).ok();
     identity.with(|state| state.canceled = false);
@@ -2846,24 +2917,12 @@ fn user_alpc_transport(assert: Assert) {
         return;
     };
     let unicode = |at: u64, buffer: u64, text: &str| {
-        let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(buffer + index as u64 * 2, *unit);
-        }
-        guest::write16(at, (units.len() * 2) as u16);
-        guest::write16(at + 2, (units.len() * 2) as u16);
-        guest::write32(at + 4, 0);
-        guest::write64(at + 8, buffer);
+        let length = write_wide(buffer, text);
+        set_unicode(unsafe { nt::UnicodeString::at(at) }, length, length, buffer);
     };
     let message = |at: u64, data: &[u8]| {
-        for offset in (0..40).step_by(8) {
-            guest::write64(at + offset, 0);
-        }
-        guest::write16(at, data.len() as u16);
-        guest::write16(at + 2, data.len() as u16 + 40);
-        for (index, byte) in data.iter().enumerate() {
-            guest::write8(at + 40 + index as u64, *byte);
-        }
+        init_port_message(unsafe { nt::PortMessage::at(at) }, data.len() as u16, data.len() as u16 + nt::PortMessage::SIZE as u16);
+        guest::write_bytes(at + nt::PortMessage::SIZE, data);
     };
     let rsp = block + 0x800;
     let stack = |args: &[u64]| {
@@ -2871,7 +2930,7 @@ fn user_alpc_transport(assert: Assert) {
             guest::write64(rsp + 0x28 + index as u64 * 8, *value);
         }
     };
-    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { (0..length).map(|index| guest::read8(at + index)).collect() };
+    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { guest::read_bytes(at, length as usize) };
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     // Conexão com mensagem e atributos de recepção.
     let name = block + 0x10;
@@ -2880,13 +2939,14 @@ fn user_alpc_transport(assert: Assert) {
     message(connection, &[7, 8]);
     guest::write64(block + 0x1F0, 0x100);
     let receive = block + 0x200;
-    guest::write32(receive, 0x2000_0000);
-    guest::write32(receive + 4, 0);
+    let receive_attributes = unsafe { nt::AlpcMessageAttributes::at(receive) };
+    receive_attributes.allocated_attributes.set(0x2000_0000);
+    receive_attributes.valid_attributes.set(0);
     stack(&[0, 0, connection, block + 0x1F0, 0, receive]);
     let connected = call("NtAlpcConnectPort", block + 8, name, 0, 0);
     let handle = guest::read64(block + 8);
     let port = port_objects::resolve(handle, "alpc").map(|(_, port)| port);
-    assert(connected == Some(0) && port.is_some() && guest::read16(connection + 4) == 10 && read(connection + 40, 2) == [0xC0, 0x01] && guest::read64(block + 0x1F0) == 42 && guest::read32(receive + 4) == 0x2000_0000 && guest::read64(receive + 8) == handle, "useralpctrn: conexao com resposta e contexto da porta");
+    assert(connected == Some(0) && port.is_some() && unsafe { nt::PortMessage::at(connection) }.u2.s2.type_.get() == 10 && read(connection + nt::PortMessage::SIZE, 2) == [0xC0, 0x01] && guest::read64(block + 0x1F0) == 42 && receive_attributes.valid_attributes.get() == 0x2000_0000 && unsafe { nt::AlpcContextAttr::at(receive + nt::AlpcMessageAttributes::SIZE) }.port_context.get() == handle, "useralpctrn: conexao com resposta e contexto da porta");
     let Some(port) = port else { return };
     unicode(name, block + 0x40, "\\RPC Control\\NaoExiste");
     let missing = call("NtAlpcConnectPort", block + 0x18, name, 0, 0);
@@ -2894,9 +2954,7 @@ fn user_alpc_transport(assert: Assert) {
     stack(&[0x1_0000]);
     let bad_flags = call("NtAlpcConnectPort", block + 0x18, name, 0, 0);
     let sid = block + 0x180;
-    for (index, byte) in [1u8, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0].iter().enumerate() {
-        guest::write8(sid + index as u64, *byte);
-    }
+    guest::write_bytes(sid, &[1u8, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0]);
     stack(&[0, sid]);
     let bad_sid = call("NtAlpcConnectPort", block + 0x18, name, 0, 0);
     assert(missing == Some(0xC000_0034) && bad_flags == Some(0xC000_00BB) && bad_sid == Some(0xC000_0257), "useralpctrn: recusas da conexao");
@@ -2906,7 +2964,7 @@ fn user_alpc_transport(assert: Assert) {
     guest::write64(length, 0x100);
     stack(&[output, length, 0, 0]);
     let synchronous = call("NtAlpcSendWaitReceivePort", handle, 0x2_0000, input, 0);
-    assert(synchronous == Some(0) && guest::read16(output + 4) == 2 && read(output + 40, 3) == [3, 2, 1] && port.with(|state| state.pending.is_empty()), "useralpctrn: troca sincrona com resposta do servico");
+    assert(synchronous == Some(0) && unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get() == 2 && read(output + nt::PortMessage::SIZE, 3) == [3, 2, 1] && port.with(|state| state.pending.is_empty()), "useralpctrn: troca sincrona com resposta do servico");
     // Envio assíncrono e recepção posterior.
     let sequence = port.sequence();
     stack(&[0, 0, 0, 0]);
@@ -2915,7 +2973,7 @@ fn user_alpc_transport(assert: Assert) {
     let queued = port.with(|state| state.pending.len());
     stack(&[output, length, 0, 0]);
     let received = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
-    assert(sent == Some(0) && queued == 1 && received == Some(0) && read(output + 40, 2) == [5, 4] && port.sequence() == sequence.wrapping_add(1) && port.with(|state| state.pending.is_empty()), "useralpctrn: envio assincrono e recepcao da fila");
+    assert(sent == Some(0) && queued == 1 && received == Some(0) && read(output + nt::PortMessage::SIZE, 2) == [5, 4] && port.sequence() == sequence.wrapping_add(1) && port.with(|state| state.pending.is_empty()), "useralpctrn: envio assincrono e recepcao da fila");
     // Trabalho adiado pelo pump.
     ALPC_TRANSPORT_CLEANUP.store(u32::MAX, Ordering::SeqCst);
     stack(&[0, 0, 0, 0]);
@@ -2928,7 +2986,7 @@ fn user_alpc_transport(assert: Assert) {
     let after_second = port.with(|state| (state.jobs.len(), state.pending.len()));
     stack(&[output, length, 0, 0]);
     let drained = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
-    assert(deferred == Some(0) && jobs == 1 && after_first == (1, 0) && after_second == (0, 1) && ALPC_TRANSPORT_CLEANUP.load(Ordering::SeqCst) == 0 && drained == Some(0) && read(output + 40, 2) == [6, 0xDD], "useralpctrn: trabalho adiado concluido pelo pump");
+    assert(deferred == Some(0) && jobs == 1 && after_first == (1, 0) && after_second == (0, 1) && ALPC_TRANSPORT_CLEANUP.load(Ordering::SeqCst) == 0 && drained == Some(0) && read(output + nt::PortMessage::SIZE, 2) == [6, 0xDD], "useralpctrn: trabalho adiado concluido pelo pump");
     // Cancelamento de um pedido entregue.
     ALPC_TRANSPORT_CLEANUP.store(u32::MAX, Ordering::SeqCst);
     stack(&[0, 0, 0, 0]);
@@ -2936,9 +2994,10 @@ fn user_alpc_transport(assert: Assert) {
     let _ = call("NtAlpcSendWaitReceivePort", handle, 0, input, 0);
     let identity = port.with(|state| state.jobs.first().map(|request| request.identity.clone()));
     let context = block + 0x500;
-    guest::write64(context + 8, 0);
-    guest::write32(context + 20, identity.as_ref().map_or(0, |identity| identity.identifier));
-    guest::write32(context + 24, identity.as_ref().map_or(0, |identity| identity.callback));
+    let cancel_attribute = unsafe { nt::AlpcContextAttr::at(context) };
+    cancel_attribute.message_context.set(0);
+    cancel_attribute.message_id.set(identity.as_ref().map_or(0, |identity| identity.identifier));
+    cancel_attribute.callback_id.set(identity.as_ref().map_or(0, |identity| identity.callback));
     let canceled = call("NtAlpcCancelMessage", handle, 0, context, 0);
     let again = call("NtAlpcCancelMessage", handle, 0, context, 0);
     alpc::pump();
@@ -2946,7 +3005,7 @@ fn user_alpc_transport(assert: Assert) {
     assert(canceled == Some(0x4000_002E) && again == Some(0xC000_0703) && ALPC_TRANSPORT_CLEANUP.load(Ordering::SeqCst) == 0xC000_0703 && port.with(|state| state.jobs.is_empty() && state.pending.is_empty()), "useralpctrn: cancelamento recusa a resposta tardia");
     // Recusas da troca.
     message(input, &[1]);
-    guest::write64(input + 8, 0x44);
+    unsafe { nt::PortMessage::at(input) }.client_id.unique_process.set(0x44);
     stack(&[0, 0, 0, 0]);
     let cid = call("NtAlpcSendWaitReceivePort", handle, 0, input, 0);
     message(input, &[1]);
@@ -2957,7 +3016,7 @@ fn user_alpc_transport(assert: Assert) {
     // Troca de kernel pela entrada instalada.
     message(input, &[0xA, 0xB]);
     let kernel = kernel_entry::begin(&[handle, 0x2_0000, input, 0, output, length, 0, 0]).ok().and_then(|mut pending| pending.poll());
-    assert(kernel == Some(0) && read(output + 40, 2) == [0xB, 0xA], "useralpctrn: troca de kernel imediata");
+    assert(kernel == Some(0) && read(output + nt::PortMessage::SIZE, 2) == [0xB, 0xA], "useralpctrn: troca de kernel imediata");
     // Desconexão e fechamento.
     let disconnected = call("NtAlpcDisconnectPort", handle, 0, 0, 0);
     stack(&[0, 0, 0, 0]);
@@ -3031,26 +3090,19 @@ fn user_alpc_connect_port(assert: Assert) {
         return;
     };
     let name = block + 0x10;
-    let units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(block + 0x40 + index as u64 * 2, *unit);
-    }
-    guest::write16(name, (units.len() * 2) as u16);
-    guest::write16(name + 2, (units.len() * 2) as u16);
-    guest::write64(name + 8, block + 0x40);
+    let length = write_wide(block + 0x40, path);
+    set_unicode(unsafe { nt::UnicodeString::at(name) }, length, length, block + 0x40);
     let connection = block + 0x100;
     let capacity = block + 0x1F0;
     let prepare = || {
-        for offset in (0..0x60).step_by(8) {
-            guest::write64(connection + offset, 0);
-        }
-        guest::write16(connection, 2);
-        guest::write16(connection + 2, 42);
-        guest::write8(connection + 40, 1);
-        guest::write8(connection + 41, 2);
+        guest::write_bytes(connection, &[0u8; 0x60]);
+        let header = unsafe { nt::PortMessage::at(connection) };
+        header.u1.s1.data_length.set(2);
+        header.u1.s1.total_length.set(42);
+        guest::write_bytes(connection + nt::PortMessage::SIZE, &[1, 2]);
         guest::write64(capacity, 0x100);
     };
-    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { (0..length).map(|index| guest::read8(at + index)).collect() };
+    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { guest::read_bytes(at, length as usize) };
     let connect = |output: u64, flags: u64, extended: bool, target: u64| {
         let arguments = [output, target, 0, 0, flags, 0, connection, capacity, 0, 0, 0];
         let begun = if extended { kernel_entry::begin_connection_ex(&arguments) } else { kernel_entry::begin_connection(&arguments) };
@@ -3077,12 +3129,12 @@ fn user_alpc_connect_port(assert: Assert) {
     let first_port = port_objects::port_of(open_pointer::resolve(first, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer));
     let state = first_port.as_ref().map(|port| port.with(|state| (state.connection_state, state.pending.len(), state.role)));
     let received = receive(first);
-    assert(asynchronous == Some(0) && first != 0 && state == Some((port_objects::CONNECTION_CONNECTED, 1, port_objects::Role::Client)) && received == Some(0) && guest::read16(output + 4) == 11 && read(output + 40, 2) == [0x11, 0x22], "useralpccp: conexao assincrona com resposta na fila");
+    assert(asynchronous == Some(0) && first != 0 && state == Some((port_objects::CONNECTION_CONNECTED, 1, port_objects::Role::Client)) && received == Some(0) && unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get() == 11 && read(output + nt::PortMessage::SIZE, 2) == [0x11, 0x22], "useralpccp: conexao assincrona com resposta na fila");
     // Conexão síncrona: a resposta chega no buffer da mensagem.
     prepare();
     let synchronous = connect(block + 0x608, 0x2_0000, false, name);
     let second = guest::read64(block + 0x608);
-    assert(synchronous == Some(0) && second != 0 && second != first && guest::read16(connection + 4) == 11 && read(connection + 40, 2) == [0x11, 0x22] && guest::read64(connection + 8) == crate::ntos::ps::process::get_current_process_id(), "useralpccp: conexao sincrona com resposta do servidor");
+    assert(synchronous == Some(0) && second != 0 && second != first && unsafe { nt::PortMessage::at(connection) }.u2.s2.type_.get() == 11 && read(connection + nt::PortMessage::SIZE, 2) == [0x11, 0x22] && unsafe { nt::PortMessage::at(connection) }.client_id.unique_process.get() == crate::ntos::ps::process::get_current_process_id(), "useralpccp: conexao sincrona com resposta do servidor");
     // Recusa do servidor: o handle não é publicado.
     ALPC_CONNECT_STATUS.store(0xC000_0041, Ordering::SeqCst);
     prepare();
@@ -3099,29 +3151,20 @@ fn user_alpc_connect_port(assert: Assert) {
     let third_port = port_objects::port_of(open_pointer::resolve(third, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer));
     let pending_state = third_port.as_ref().map(|port| port.with(|state| state.connection_state));
     let input = block + 0x300;
-    for offset in (0..40).step_by(8) {
-        guest::write64(input + offset, 0);
-    }
-    guest::write16(input, 1);
-    guest::write16(input + 2, 41);
+    init_port_message(unsafe { nt::PortMessage::at(input) }, 1, 41);
     let blocked = kernel_entry::begin(&[third, 0, input, 0, 0, 0, 0, 0]).ok().and_then(|mut pending| pending.poll());
     alpc::pump();
     alpc::pump();
     let decided = third_port.as_ref().map(|port| port.with(|state| (state.connection_state, state.pending.len())));
     let late = receive(third);
-    assert(deferred == Some(0) && pending_state == Some(port_objects::CONNECTION_PENDING) && blocked == Some(0xC000_0707) && decided == Some((port_objects::CONNECTION_CONNECTED, 1)) && late == Some(0) && read(output + 40, 1) == [0xAA], "useralpccp: decisao adiada concluida pelo pump");
+    assert(deferred == Some(0) && pending_state == Some(port_objects::CONNECTION_PENDING) && blocked == Some(0xC000_0707) && decided == Some((port_objects::CONNECTION_CONNECTED, 1)) && late == Some(0) && read(output + nt::PortMessage::SIZE, 1) == [0xAA], "useralpccp: decisao adiada concluida pelo pump");
     // Variante Ex: OBJECT_ATTRIBUTES da porta de conexão.
     let attributes = block + 0x500;
-    guest::write32(attributes, 48);
-    guest::write64(attributes + 8, 0);
-    guest::write64(attributes + 16, name);
-    guest::write32(attributes + 24, 0);
-    guest::write64(attributes + 32, 0);
-    guest::write64(attributes + 40, 0);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, name, 0);
     prepare();
     let extended = connect(block + 0x620, 0x2_0000, true, attributes);
     let fourth = guest::read64(block + 0x620);
-    assert(extended == Some(0) && fourth != 0 && read(connection + 40, 2) == [0x11, 0x22], "useralpccp: conexao Ex pelo OBJECT_ATTRIBUTES");
+    assert(extended == Some(0) && fourth != 0 && read(connection + nt::PortMessage::SIZE, 2) == [0x11, 0x22], "useralpccp: conexao Ex pelo OBJECT_ATTRIBUTES");
     // Fechamento: cada porta iniciada desconecta o serviço.
     drop(first_port);
     drop(third_port);
@@ -3152,17 +3195,11 @@ fn user_lpc_csr(assert: Assert) {
     };
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     let unicode = |at: u64, buffer: u64, text: &str| {
-        let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(buffer + index as u64 * 2, *unit);
-        }
-        guest::write16(at, (units.len() * 2) as u16);
-        guest::write16(at + 2, (units.len() * 2) as u16);
-        guest::write32(at + 4, 0);
-        guest::write64(at + 8, buffer);
+        let length = write_wide(buffer, text);
+        set_unicode(unsafe { nt::UnicodeString::at(at) }, length, length, buffer);
     };
     // Seção de transferência do cliente.
-    guest::write64(block + 0x10, 0x1_0000);
+    unsafe { nt::LargeInteger::at(block + 0x10) }.quad_part.set(0x1_0000);
     stack(&[4, 0x0800_0000, 0]);
     let created = call("NtCreateSection", block + 0x18, 0xF_001F, 0, block + 0x10);
     let section = guest::read64(block + 0x18);
@@ -3170,21 +3207,22 @@ fn user_lpc_csr(assert: Assert) {
     let name = block + 0x20;
     unicode(name, block + 0x40, "\\Windows\\ApiPort");
     let qos = block + 0x100;
-    guest::write32(qos, 12);
-    guest::write32(qos + 4, 2);
-    guest::write8(qos + 8, 0);
-    guest::write8(qos + 9, 0);
+    let quality = unsafe { nt::SecurityQualityOfService::at(qos) };
+    quality.length.set(nt::SecurityQualityOfService::SIZE as u32);
+    quality.impersonation_level.set(nt::SecurityImpersonationLevel::SECURITY_IMPERSONATION);
+    quality.context_tracking_mode.set(0);
+    quality.effective_only.set(0);
     let view = block + 0x120;
-    guest::write32(view, 48);
-    guest::write64(view + 8, section);
-    guest::write32(view + 16, 0);
-    guest::write64(view + 24, 0x1_0000);
+    let client_view = unsafe { nt::PortView::at(view) };
+    client_view.length.set(nt::PortView::SIZE as u32);
+    client_view.section_handle.set(section);
+    client_view.section_offset.set(0);
+    client_view.view_size.set(0x1_0000);
     let info = block + 0x180;
-    for offset in (0..48).step_by(8) {
-        guest::write64(info + offset, 0);
-    }
-    guest::write32(info + 32, 1);
-    guest::write64(info + 40, 0x1234);
+    guest::write_bytes(info, &[0u8; CsrConnectionInformation::SIZE as usize]);
+    let connection_info = unsafe { CsrConnectionInformation::at(info) };
+    connection_info.server_id.set(1);
+    connection_info.server_data.set(0x1234);
     let (max_length, info_length) = (block + 0x1C0, block + 0x1C8);
     guest::write32(info_length, 48);
     stack(&[0, max_length, info, info_length]);
@@ -3192,39 +3230,39 @@ fn user_lpc_csr(assert: Assert) {
     let handle = guest::read64(block + 0x8);
     let port = port_objects::resolve(handle, "port").map(|(_, port)| port);
     let process_id = port.as_ref().map_or(0, |port| port.process_id());
-    let (local, remote) = (guest::read64(view + 32), guest::read64(view + 40));
+    let (local, remote) = (client_view.view_base.get(), client_view.view_remote_base.get());
     let client = csr::client(process_id);
-    assert(created == Some(0) && connected == Some(0) && port.is_some() && guest::read64(info + 16) == 4 && guest::read32(info + 36) == 0 && guest::read64(info) != 0 && guest::read32(max_length) == 0x3B8 && guest::read32(info_length) == 48 && local != 0 && remote != 0 && local != remote && client.as_ref().is_some_and(|(_, servers, callback)| servers == &[1] && *callback == 0x1234), "userlpc: conexao CSR com os dois aliases da secao");
+    assert(created == Some(0) && connected == Some(0) && port.is_some() && connection_info.server_process_id.get() == 4 && connection_info.status.get() == 0 && connection_info.shared_section_base.get() != 0 && guest::read32(max_length) == 0x3B8 && guest::read32(info_length) == 48 && local != 0 && remote != 0 && local != remote && client.as_ref().is_some_and(|(_, servers, callback)| servers == &[1] && *callback == 0x1234), "userlpc: conexao CSR com os dois aliases da secao");
     let Some(port) = port else { return };
     // Registro de servidor com carga no alias supervisor.
     guest::write64(local + 0x100, 0x5678);
     let message = |at: u64, id: u32, pointer: u64, size: u32| {
-        for offset in (0..88).step_by(8) {
-            guest::write64(at + offset, 0);
-        }
-        guest::write16(at, 48);
-        guest::write16(at + 2, 88);
-        guest::write32(at + 48, 0);
-        guest::write32(at + 64, id);
-        guest::write64(at + 72, pointer);
-        guest::write32(at + 80, size);
+        guest::write_bytes(at, &[0u8; CsrClientConnectMessage::SIZE as usize]);
+        let request = unsafe { CsrClientConnectMessage::at(at) };
+        request.header.u1.s1.data_length.set((CsrClientConnectMessage::SIZE - nt::PortMessage::SIZE) as i16);
+        request.header.u1.s1.total_length.set(CsrClientConnectMessage::SIZE as i16);
+        request.api_number.set(0);
+        request.server_id.set(id);
+        request.connection_information.set(pointer);
+        request.connection_information_length.set(size);
     };
     let (input, output) = (block + 0x300, block + 0x400);
+    let reply = unsafe { CsrClientConnectMessage::at(output) };
     message(input, 1, remote + 0x100, 8);
     let registered = call("NtRequestWaitReplyPort", handle, input, output, 0);
-    let registered_status = guest::read32(output + 52);
-    let reply_type = guest::read16(output + 4);
+    let registered_status = reply.return_value.get();
+    let reply_type = reply.header.u2.s2.type_.get();
     let callback = csr::client(process_id).map(|(_, _, callback)| callback);
     message(input, 1, local + 0x100, 8);
     let _ = call("NtRequestWaitReplyPort", handle, input, output, 0);
-    let outside = guest::read32(output + 52);
+    let outside = reply.return_value.get();
     message(input, 2, remote + 0x100, 8);
     let _ = call("NtRequestWaitReplyPort", handle, input, output, 0);
-    let unknown = guest::read32(output + 52);
+    let unknown = reply.return_value.get();
     message(input, 3, remote + 0x100, 8);
     let _ = call("NtRequestWaitReplyPort", handle, input, output, 0);
-    let user_size = guest::read32(output + 52);
-    assert(registered == Some(0) && registered_status == 0 && reply_type == 2 && callback == Some(0x5678) && outside == 0xC000_000D && unknown == 0xC000_0002 && user_size == 0xC000_000D && guest::read32(output + 24) != 0, "userlpc: registro de servidor pelo alias supervisor e recusas");
+    let user_size = reply.return_value.get();
+    assert(registered == Some(0) && registered_status == 0 && reply_type == 2 && callback == Some(0x5678) && outside == 0xC000_000D && unknown == 0xC000_0002 && user_size == 0xC000_000D && reply.header.message_id.get() != 0, "userlpc: registro de servidor pelo alias supervisor e recusas");
     // Fallback LPC do NtAlpcSendWaitReceivePort.
     message(input, 1, remote + 0x100, 8);
     let length = block + 0x3F0;
@@ -3236,7 +3274,7 @@ fn user_lpc_csr(assert: Assert) {
     let short = call("NtAlpcSendWaitReceivePort", handle, 0x2_0000, input, 0);
     let short_length = guest::read64(length);
     let flags = call("NtAlpcSendWaitReceivePort", handle, 0x1_0000, input, 0);
-    guest::write16(input + 2, 87);
+    unsafe { nt::PortMessage::at(input) }.u1.s1.total_length.set(87);
     let malformed = call("NtRequestWaitReplyPort", handle, input, output, 0);
     assert(alpc == Some(0) && alpc_length == 88 && short == Some(0xC000_0023) && short_length == 88 && flags == Some(0xC000_00BB) && malformed == Some(0xC000_0021), "userlpc: pedido LPC pelo NtAlpcSendWaitReceivePort e recusas");
     // Recusas da conexão.
@@ -3247,9 +3285,9 @@ fn user_lpc_csr(assert: Assert) {
     guest::write32(info_length, 49);
     let too_long = call("NtConnectPort", block + 0x1D0, name, qos, 0);
     guest::write32(info_length, 48);
-    guest::write32(qos + 4, 4);
+    quality.impersonation_level.set(nt::SecurityImpersonationLevel(4));
     let level = call("NtConnectPort", block + 0x1D0, name, qos, 0);
-    guest::write32(qos + 4, 2);
+    quality.impersonation_level.set(nt::SecurityImpersonationLevel::SECURITY_IMPERSONATION);
     stack(&[block + 0x100]);
     let secure = call("NtSecureConnectPort", block + 0x1D0, name, qos, 0);
     stack(&[0, max_length, info, info_length]);
@@ -3290,24 +3328,13 @@ fn user_alpc_zw_group(assert: Assert) {
         return;
     };
     let name = block + 0x10;
-    let units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(block + 0x40 + index as u64 * 2, *unit);
-    }
-    guest::write16(name, (units.len() * 2) as u16);
-    guest::write16(name + 2, (units.len() * 2) as u16);
-    guest::write64(name + 8, block + 0x40);
+    let length = write_wide(block + 0x40, path);
+    set_unicode(unsafe { nt::UnicodeString::at(name) }, length, length, block + 0x40);
     let message = |at: u64, data: &[u8]| {
-        for offset in (0..40).step_by(8) {
-            guest::write64(at + offset, 0);
-        }
-        guest::write16(at, data.len() as u16);
-        guest::write16(at + 2, data.len() as u16 + 40);
-        for (index, byte) in data.iter().enumerate() {
-            guest::write8(at + 40 + index as u64, *byte);
-        }
+        init_port_message(unsafe { nt::PortMessage::at(at) }, data.len() as u16, data.len() as u16 + nt::PortMessage::SIZE as u16);
+        guest::write_bytes(at + nt::PortMessage::SIZE, data);
     };
-    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { (0..length).map(|index| guest::read8(at + index)).collect() };
+    let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { guest::read_bytes(at, length as usize) };
     // ZwAlpcConnectPort síncrono com mensagem de conexão.
     let (connection, capacity, out) = (block + 0x100, block + 0x1F0, block + 0x600);
     message(connection, &[1]);
@@ -3315,56 +3342,54 @@ fn user_alpc_zw_group(assert: Assert) {
     let connected = zw("ZwAlpcConnectPort", &[out, name, 0, 0, 0x2_0000, 0, connection, capacity, 0, 0, 0]);
     let handle = guest::read64(out);
     let port = port_objects::port_of(open_pointer::resolve(handle, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer));
-    assert(connected == Some(0) && port.is_some() && guest::read16(connection + 4) == 11 && read(connection + 40, 2) == [0xC0, 0x01], "zwalpc: ZwAlpcConnectPort sincrono");
+    assert(connected == Some(0) && port.is_some() && unsafe { nt::PortMessage::at(connection) }.u2.s2.type_.get() == 11 && read(connection + nt::PortMessage::SIZE, 2) == [0xC0, 0x01], "zwalpc: ZwAlpcConnectPort sincrono");
     let Some(port) = port else { return };
     // ZwAlpcSendWaitReceivePort: oito argumentos exatos.
     let (input, output, length) = (block + 0x300, block + 0x400, block + 0x3F0);
     message(input, &[7, 8, 9]);
     guest::write64(length, 0x100);
     let exchanged = zw("ZwAlpcSendWaitReceivePort", &[handle, 0x2_0000, input, 0, output, length, 0, 0]);
-    assert(exchanged == Some(0) && guest::read16(output + 4) == 2 && read(output + 40, 3) == [9, 8, 7], "zwalpc: ZwAlpcSendWaitReceivePort sincrono");
+    assert(exchanged == Some(0) && unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get() == 2 && read(output + nt::PortMessage::SIZE, 3) == [9, 8, 7], "zwalpc: ZwAlpcSendWaitReceivePort sincrono");
     // Consulta básica e set-information.
     let basic = zw("ZwAlpcQueryInformation", &[handle, 0, output, 16, block + 0x480]);
     let unsupported = zw("ZwAlpcSetInformation", &[handle, 1, input, 8]);
-    guest::write32(input + 24, 0);
+    unsafe { nt::PortMessage::at(input) }.message_id.set(0);
     let no_message = zw("ZwAlpcQueryInformationMessage", &[handle, input, 0, output, 64, 0]);
-    assert(basic == Some(0) && guest::read32(output + 4) == port.sequence() && guest::read32(block + 0x480) == 16 && unsupported == Some(0xC000_00BB) && no_message == Some(0xC000_000D), "zwalpc: consultas e set-information");
+    assert(basic == Some(0) && unsafe { nt::AlpcBasicInformation::at(output) }.sequence_no.get() == port.sequence() && guest::read32(block + 0x480) == 16 && unsupported == Some(0xC000_00BB) && no_message == Some(0xC000_000D), "zwalpc: consultas e set-information");
     // Recursos: contexto, reserva, seção e vista.
     let attribute = block + 0x500;
-    guest::write64(attribute + 8, 0);
+    let security_attribute = unsafe { nt::AlpcSecurityAttr::at(attribute) };
+    security_attribute.p_qos.set(0);
     let context = zw("ZwAlpcCreateSecurityContext", &[handle, 0, attribute]);
-    let context_handle = guest::read64(attribute + 16);
+    let context_handle = security_attribute.context_handle.get();
     let context_deleted = zw("ZwAlpcDeleteSecurityContext", &[handle, 0, context_handle]);
     let reserve = zw("ZwAlpcCreateResourceReserve", &[handle, 0, 0x80, block + 0x540]);
     let identifier = guest::read32(block + 0x540);
     let section = zw("ZwAlpcCreatePortSection", &[handle, 0, 0, 0x2000, block + 0x548, block + 0x550]);
     let section_handle = guest::read64(block + 0x548);
     let view = block + 0x560;
-    guest::write32(view, 0);
-    guest::write64(view + 8, section_handle);
-    guest::write64(view + 16, 0);
-    guest::write64(view + 24, 0x1000);
+    let view_attribute = unsafe { nt::AlpcDataViewAttr::at(view) };
+    view_attribute.flags.set(0);
+    view_attribute.section_handle.set(section_handle);
+    view_attribute.view_base.set(0);
+    view_attribute.view_size.set(0x1000);
     let mapped = zw("ZwAlpcCreateSectionView", &[handle, 0, view]);
-    let base = guest::read64(view + 16);
+    let base = view_attribute.view_base.get();
     let unmapped = zw("ZwAlpcDeleteSectionView", &[handle, 0, base]);
     let section_deleted = zw("ZwAlpcDeletePortSection", &[handle, 0, section_handle]);
     assert(context == Some(0) && context_handle != 0 && context_deleted == Some(0) && reserve == Some(0) && identifier & 0x8000_0000 != 0 && section == Some(0) && guest::read64(block + 0x550) == 0x1_0000 && mapped == Some(0) && base != 0 && unmapped == Some(0) && section_deleted == Some(0), "zwalpc: contexto, reserva, secao e vista pelas entradas Zw");
     // Cancelamento da reserva: geração no slot reservado.
     let selection = block + 0x5C0;
-    guest::write64(selection + 8, 0);
-    guest::write32(selection + 20, identifier);
-    guest::write32(selection + 24, 0);
+    let selection_attribute = unsafe { nt::AlpcContextAttr::at(selection) };
+    selection_attribute.message_context.set(0);
+    selection_attribute.message_id.set(identifier);
+    selection_attribute.callback_id.set(0);
     let canceled = zw("ZwAlpcCancelMessage", &[handle, 0, selection]);
     let reserve_queued = port.with(|state| state.pending.len());
     assert(canceled == Some(0x4000_002E) && reserve_queued == 0, "zwalpc: ZwAlpcCancelMessage sobre a reserva");
     // ZwAlpcConnectPortEx por OBJECT_ATTRIBUTES.
     let attributes = block + 0x700;
-    guest::write32(attributes, 48);
-    guest::write64(attributes + 8, 0);
-    guest::write64(attributes + 16, name);
-    guest::write32(attributes + 24, 0);
-    guest::write64(attributes + 32, 0);
-    guest::write64(attributes + 40, 0);
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, name, 0);
     message(connection, &[2]);
     let extended = zw("ZwAlpcConnectPortEx", &[out + 8, attributes, 0, 0, 0x2_0000, 0, connection, capacity, 0, 0, 0]);
     let second = guest::read64(out + 8);
@@ -3422,9 +3447,10 @@ fn user_worker_factory(assert: Assert) {
     assert(process == Some(0xC000_0008) && maximum == Some(0xC000_000D) && wrong_port == Some(0xC000_0024), "userwf: recusas da criacao");
     // Consulta: 0x78 bytes.
     let (out, returned) = (block + 0x200, block + 0x2F0);
+    let factory_info = unsafe { nt::WorkerFactoryBasicInformation::at(out) };
     stack(&[returned]);
     let queried = call("NtQueryInformationWorkerFactory", handle, 7, out, 0x78);
-    assert(queried == Some(0) && guest::read32(returned) == 0x78 && guest::read64(out) as i64 == -100_000_000 && guest::read64(out + 8) as i64 == -10_000_000 && guest::read8(out + 27) == 1 && guest::read32(out + 40) == 4 && guest::read32(out + 36) == 0 && guest::read64(out + 72) == start && guest::read64(out + 80) == 0x1122_3344_5566_7788 && guest::read64(out + 96) == 0x1_0000 && guest::read64(out + 104) == 0x1000 && guest::read32(out + 52) == 0, "userwf: consulta basica da fabrica");
+    assert(queried == Some(0) && guest::read32(returned) == 0x78 && factory_info.timeout.quad_part.get() == -100_000_000 && factory_info.retry_timeout.quad_part.get() == -10_000_000 && factory_info.may_create.get() == 1 && factory_info.thread_maximum.get() == 4 && factory_info.thread_minimum.get() == 0 && factory_info.start_routine.get() == start && factory_info.start_parameter.get() == 0x1122_3344_5566_7788 && factory_info.stack_reserve.get() == 0x1_0000 && factory_info.stack_commit.get() == 0x1000 && factory_info.total_worker_count.get() == 0, "userwf: consulta basica da fabrica");
     let short = call("NtQueryInformationWorkerFactory", handle, 7, out, 0x70);
     let class = call("NtQueryInformationWorkerFactory", handle, 1, out, 0x78);
     assert(short == Some(0xC000_0004) && class == Some(0xC000_0003), "userwf: recusas da consulta");
@@ -3458,7 +3484,7 @@ fn user_worker_factory(assert: Assert) {
     stack(&[returned]);
     let _ = call("NtQueryInformationWorkerFactory", handle, 7, out, 0x78);
     let after = (set(5, 4, 4), set(14, 2, 4), call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0));
-    assert(shut == Some(0) && guest::read32(block + 0x320) == 3 && guest::read8(out + 30) == 1 && factory.shutdown() && port.as_ref().is_some_and(|port| port.listeners.lock().len() == listeners_before) && after == (Some(0xC000_010A), Some(0x80), Some(0xC000_010A)), "userwf: encerramento recusa configuracao e liberacao");
+    assert(shut == Some(0) && guest::read32(block + 0x320) == 3 && factory_info.shutdown.get() == 1 && factory.shutdown() && port.as_ref().is_some_and(|port| port.listeners.lock().len() == listeners_before) && after == (Some(0xC000_010A), Some(0x80), Some(0xC000_010A)), "userwf: encerramento recusa configuracao e liberacao");
     // Fechamento: a última referência libera a fábrica e a IOCP.
     drop(factory);
     let _ = call("NtClose", handle, 0, 0, 0);
@@ -3488,8 +3514,16 @@ fn user_wnf(assert: Assert) {
     };
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     let (name, guid, data, stamp, length, output) = (block, block + 0x10, block + 0x20, block + 0x40, block + 0x48, block + 0x60);
-    guest::write64(name, 0x0280_032E_A3BC_0875);
-    guest::write_bytes(guid, &[0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E]);
+    let (state_name, invalid_name) = unsafe { (nt::WnfStateName::at(name), nt::WnfStateName::at(name + nt::WnfStateName::SIZE)) };
+    state_name.data[0].set(0xA3BC_0875);
+    state_name.data[1].set(0x0280_032E);
+    let type_id = unsafe { nt::Guid::at(guid) };
+    type_id.data1.set(0x48F9_6463);
+    type_id.data2.set(0x52D6);
+    type_id.data3.set(0x4E85);
+    for (cell, byte) in type_id.data4.iter().zip([0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E]) {
+        cell.set(byte);
+    }
     guest::write32(data, 0xFEED_BEEF);
     let updated = service::update(name, data, 4, guid, 0, 0, false).ok();
     // NtQueryWnfStateData pela captura de usuário.
@@ -3525,9 +3559,10 @@ fn user_wnf(assert: Assert) {
     let subscribed = call("NtSubscribeWnfStateChange", name, 0, 1, identifier);
     let subscription = guest::read64(identifier);
     let mask = call("NtSubscribeWnfStateChange", name, 0, 0x20, identifier);
-    guest::write64(name + 8, 0x0280_032E_A3BC_0876);
+    invalid_name.data[0].set(0xA3BC_0876);
+    invalid_name.data[1].set(0x0280_032E);
     guest::write64(identifier, 0x1234);
-    let bad_name = call("NtSubscribeWnfStateChange", name + 8, 0, 1, identifier);
+    let bad_name = call("NtSubscribeWnfStateChange", invalid_name.address(), 0, 1, identifier);
     let zeroed = guest::read64(identifier);
     let bad_pointer = call("NtSubscribeWnfStateChange", 0x10, 0, 1, 0);
     assert(subscribed == Some(0) && subscription != 0 && mask == Some(0xC000_000D) && bad_name == Some(0xC000_000D) && zeroed == 0 && bad_pointer == Some(0xC000_0005), "userwnf: NtSubscribeWnfStateChange e recusas");
@@ -3565,18 +3600,20 @@ fn user_thread_context(assert: Assert) {
     let thread = process::get_current_thread();
     // Captura da entrada: KernelMode usa o buffer; UserMode exige alinhamento.
     let source = guest::alloc_aligned(registers::SIZE, 16, true);
-    guest::write32(source + 0x30, 0x10_0002);
-    guest::write64(source + 0x78, 0x1234);
+    let source_context = unsafe { nt::Context::at(source) };
+    source_context.context_flags.set(0x10_0002);
+    source_context.rax.set(0x1234);
     let kernel = thread_context_input::capture(source, 0).ok().and_then(|result| result.ok());
     let user = block + 0x100;
-    guest::write32(user + 0x30, 0x10_0002);
+    let user_context = unsafe { nt::Context::at(user) };
+    user_context.context_flags.set(0x10_0002);
     let misaligned = thread_context_input::capture(user + 8, 1).ok().and_then(|result| result.err());
     let mut owned = thread_context_input::capture(user, 1).ok().and_then(|result| result.ok());
     let copied = owned.as_ref().is_some_and(|captured| captured.source != user && captured.flags == 0x10_0002);
     if let Some(captured) = owned.as_mut() {
         captured.release();
     }
-    guest::write32(user + 0x30, 0x1234_5678);
+    user_context.context_flags.set(0x1234_5678);
     let normalized = thread_context_input::capture(user, 1).ok().and_then(|result| result.ok()).map(|mut captured| {
         let flags = captured.flags;
         captured.release();
@@ -3585,7 +3622,7 @@ fn user_thread_context(assert: Assert) {
     assert(kernel.as_ref().is_some_and(|captured| captured.source == source && captured.flags == 0x10_0002) && misaligned == Some(0x8000_0002) && copied && normalized.is_some_and(|flags| flags & registers::AMD64 != 0), "userctx: captura da entrada em KernelMode e UserMode");
     // Thread de sistema recusa o contexto de usuário; KernelMode sem frame
     // de interrupção vivo é uma falha real.
-    let system_thread = guest::read32(thread + crate::ntos::inc::nt_abi::kthread::MISC_FLAGS) & 0x400 != 0;
+    let system_thread = unsafe { nt::Kthread::at(thread) }.system_thread() != 0;
     let user_mode = set_thread_context::execute(thread, source, 0, 1, 1).ok();
     let kernel_mode = set_thread_context::execute(thread, source, 0, 0, 1).ok();
     assert((!system_thread || user_mode == Some(0xC000_0030)) && kernel_mode == Some(0xC000_0001), "userctx: thread de sistema e KernelMode sem frame vivo");
@@ -3604,10 +3641,10 @@ fn user_thread_context(assert: Assert) {
     let workspace = guest::alloc_aligned(0x980, 16, true);
     guest::write64(frame + 136, 0x10);
     guest::write64(frame + 112, 0x1111);
-    guest::write32(fx + 0x18, 0x1F80);
-    let old_trap = guest::read64(thread + crate::ntos::inc::nt_abi::kthread::TRAP_FRAME);
+    unsafe { nt::XsaveFormat::at(fx) }.mx_csr.set(0x1F80);
+    let old_trap = unsafe { nt::Kthread::at(thread) }.trap_frame.get();
     let applied = kernel_context_frame::with_interrupt(frame, fx, cpu, workspace, || kernel_context_frame::apply_kernel(source), 0);
-    let restored = guest::read64(thread + crate::ntos::inc::nt_abi::kthread::TRAP_FRAME) == old_trap;
+    let restored = unsafe { nt::Kthread::at(thread) }.trap_frame.get() == old_trap;
     let user_frame = { guest::write64(frame + 136, 0x33); kernel_context_frame::with_interrupt(frame, fx, cpu, workspace, || 7, 0).ok() };
     assert(matches!(applied, Ok(Ok(0))) && guest::read64(frame + 112) == 0x1234 && restored && user_frame == Some(7) && kernel_context_frame::with_interrupt(frame, fx, cpu, workspace, || 0, 4).is_err(), "userctx: CONTEXT de KernelMode aplicado ao frame de interrupcao");
     // Faixas retidas só no frame vivo da syscall.
@@ -3629,47 +3666,49 @@ fn user_exceptions(assert: Assert) {
     };
     let (context, record, dispatcher) = (block, block + 0x600, block + 0x800);
     let fill = |pointer: u64, rip: u64, rsp: u64| {
-        for offset in (0..0x4D0).step_by(8) {
-            guest::write64(pointer + offset, 0);
-        }
-        guest::write32(pointer + 0x30, 0x10_0003);
-        guest::write16(pointer + 0x38, 0x33);
-        guest::write16(pointer + 0x42, 0x2B);
-        guest::write32(pointer + 0x44, 0x0004_7346);
-        guest::write64(pointer + 0x98, rsp);
-        guest::write64(pointer + 0xF8, rip);
-        guest::write64(pointer + 0x78, 0xAAAA);
+        guest::write_bytes(pointer, &[0u8; nt::Context::SIZE as usize]);
+        let frame = unsafe { nt::Context::at(pointer) };
+        frame.context_flags.set(0x10_0003);
+        frame.seg_cs.set(0x33);
+        frame.seg_ss.set(0x2B);
+        frame.e_flags.set(0x0004_7346);
+        frame.rsp.set(rsp);
+        frame.rip.set(rip);
+        frame.rax.set(0xAAAA);
     };
+    let (context_record, exception) = unsafe { (nt::Context::at(context), nt::ExceptionRecord::at(record)) };
+    // Quadro do KiUserExceptionDispatcher na pilha: CONTEXT, CONTEXT_EX, EXCEPTION_RECORD e MACHINE_FRAME, alinhados a 16.
+    let record_offset = (nt::Context::SIZE + nt::ContextEx::SIZE + 15) & !15;
+    let machine_offset = (record_offset + nt::ExceptionRecord::SIZE + 15) & !15;
     // Validação do CONTEXT.
     fill(context, block + 0x900, block + 0x3F00);
     let valid = exceptions::validate_context(context);
-    guest::write16(context + 0x38, 0x10);
+    context_record.seg_cs.set(0x10);
     let bad_cs = exceptions::validate_context(context);
-    guest::write16(context + 0x38, 0x33);
-    guest::write32(context + 0x30, 0x10_0002);
+    context_record.seg_cs.set(0x33);
+    context_record.context_flags.set(0x10_0002);
     let no_control = exceptions::validate_context(context);
-    guest::write32(context + 0x30, 0x10_0003);
+    context_record.context_flags.set(0x10_0003);
     assert(valid == 0 && bad_cs == 0xC000_000D && no_control == 0xC000_000D && exceptions::validate_context(0) == 0xC000_0005, "userexc: validacao do CONTEXT");
     // Segunda chance: termina o processo com o código da exceção.
-    for offset in (0..0x98).step_by(8) {
-        guest::write64(record + offset, 0);
-    }
-    guest::write32(record, 0xC000_0096);
-    guest::write64(record + 0x10, block + 0x900);
+    guest::write_bytes(record, &[0u8; nt::ExceptionRecord::SIZE as usize]);
+    exception.exception_code.set(0xC000_0096u32 as i32);
+    exception.exception_address.set(block + 0x900);
     let saved_exit = guest::read32(crate::ntos::ps::user::state::EXIT_CODE_CELL);
     let second = exceptions::raise(record, context, 0).ok();
     let exit_code = guest::read32(crate::ntos::ps::user::state::EXIT_CODE_CELL);
     guest::write32(crate::ntos::ps::user::state::EXIT_CODE_CELL, saved_exit);
-    guest::write32(record + 0x18, 16);
+    exception.number_parameters.set(16);
     let parameters = exceptions::raise(record, context, 1).ok();
-    guest::write32(record + 0x18, 0);
+    exception.number_parameters.set(0);
     let no_thread = exceptions::raise(record, context, 1).ok();
     assert(second == Some(crate::ntos::ps::user::state::TERMINATE_MAGIC) && exit_code == 0xC000_0096 && parameters == Some(0xC000_000D) && no_thread == Some(0xC000_00BB), "userexc: segunda chance termina e recusas do NtRaiseException");
     // Thread de usuário com CONTEXT salvo e a NTDLL simulada.
     let saved_exports = state::with(|state| state.ntdll_exports.clone());
     let thread = threads::UserThread::new(0x7F50, process::get_current_thread(), 0, 0);
-    let live = guest::alloc_aligned(0x4D0, 16, true);
+    let live = guest::alloc_aligned(nt::Context::SIZE, 16, true);
     thread.with(|state| state.context = live);
+    let live_context = unsafe { nt::Context::at(live) };
     let missing = { fill(live, block + 0x900, block + 0x3F00); exceptions::deliver(&thread, &[0u8; 0x98]) };
     state::with(|state| state.ntdll_exports = Some([(alloc::string::String::from("KiUserExceptionDispatcher"), dispatcher)].into_iter().collect()));
     // Breakpoint de hardware: RIP recua para o INT3.
@@ -3678,27 +3717,28 @@ fn user_exceptions(assert: Assert) {
     fill(live, block + 0x901, block + 0x3F00);
     let delivered = exceptions::hardware(&thread, 0x8000_0003);
     guest::write32(0x8_F138, saved_vector);
-    let stack = guest::read64(live + 0x98);
-    let frame_ok = stack == (block + 0x3F00 - 0x5C0) & !15 && guest::read64(live + 0xF8) == dispatcher && guest::read64(live + 0x80) == stack + 0x4F0 && guest::read64(live + 0x88) == stack;
-    let record_ok = guest::read32(stack + 0x4F0) == 0x8000_0003 && guest::read64(stack + 0x4F0 + 0x10) == block + 0x900 && guest::read64(stack + 0x590) == block + 0x900 && guest::read64(stack + 0xF8) == block + 0x900 && guest::read32(stack + 0x30) & 0x10_0010 == 0x10_0010;
-    let flags_ok = guest::read32(live + 0x44) & 0x1_0500 == 0 && guest::read32(stack + 0x44) & 0x1A_7000 == 0 && guest::read32(stack + 0x4D4) == 0x4F0;
+    let stack = live_context.rsp.get();
+    let (dispatch_context, dispatch_context_ex, dispatch_record, machine_frame) = unsafe { (nt::Context::at(stack), nt::ContextEx::at(stack + nt::Context::SIZE), nt::ExceptionRecord::at(stack + record_offset), nt::MachineFrame::at(stack + machine_offset)) };
+    let frame_ok = stack == (block + 0x3F00 - 0x5C0) & !15 && live_context.rip.get() == dispatcher && live_context.rcx.get() == stack + record_offset && live_context.rdx.get() == stack;
+    let record_ok = dispatch_record.exception_code.get() as u32 == 0x8000_0003 && dispatch_record.exception_address.get() == block + 0x900 && machine_frame.rip.get() == block + 0x900 && dispatch_context.rip.get() == block + 0x900 && dispatch_context.context_flags.get() & 0x10_0010 == 0x10_0010;
+    let flags_ok = live_context.e_flags.get() & 0x1_0500 == 0 && dispatch_context.e_flags.get() & 0x1A_7000 == 0 && dispatch_context_ex.all.length.get() as u64 == record_offset;
     assert(missing == 0xC000_0139 && delivered == 0 && frame_ok && record_ok && flags_ok, "userexc: breakpoint de hardware entregue ao KiUserExceptionDispatcher");
     // Primeira chance pelo NtRaiseException: pendente até a saída da syscall.
     let previous = threads::current();
     threads::set_running(false, Some(thread.clone()));
     fill(live, block + 0xA00, block + 0x3E00);
-    guest::write64(live + 0x48, 0x1111);
+    live_context.dr0.set(0x1111);
     fill(context, block + 0x900, block + 0x3F00);
-    guest::write64(context + 0x78, 0xBBBB);
-    guest::write32(context + 0x30, 0x10_0003);
-    guest::write32(record, 0xC000_0005);
+    context_record.rax.set(0xBBBB);
+    context_record.context_flags.set(0x10_0003);
+    exception.exception_code.set(0xC000_0005u32 as i32);
     let raised = exceptions::raise(record, context, 1).ok();
     let marked = thread.with(|state| state.pending_exception);
-    let untouched = guest::read64(live + 0xF8) == block + 0xA00;
+    let untouched = live_context.rip.get() == block + 0xA00;
     let applied = exceptions::pending(&thread);
-    let integer_kept = guest::read64(live + 0x78) == 0xBBBB && guest::read64(live + 0x48) == 0x1111;
-    let stack = guest::read64(live + 0x98);
-    let pending_ok = applied == 0 && guest::read64(live + 0xF8) == dispatcher && stack == (block + 0x3F00 - 0x5C0) & !15 && guest::read32(stack + 0x4F0) == 0xC000_0005 && !thread.with(|state| state.pending_exception);
+    let integer_kept = live_context.rax.get() == 0xBBBB && live_context.dr0.get() == 0x1111;
+    let stack = live_context.rsp.get();
+    let pending_ok = applied == 0 && live_context.rip.get() == dispatcher && stack == (block + 0x3F00 - 0x5C0) & !15 && unsafe { nt::ExceptionRecord::at(stack + record_offset) }.exception_code.get() as u32 == 0xC000_0005 && !thread.with(|state| state.pending_exception);
     threads::set_running(false, previous);
     state::with(|state| state.ntdll_exports = saved_exports);
     guest::free_bytes(live);
@@ -3720,15 +3760,18 @@ fn user_process_information_hooks(assert: Assert) {
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     // ProcessInstrumentationCallback (40): versão 0 e callback na célula da HAL.
     let input = block + 0x100;
-    guest::write64(input, 0);
-    guest::write64(input + 8, block + 0x200);
+    let instrumentation = unsafe { nt::ProcessInstrumentationCallbackInformation::at(input) };
+    instrumentation.version.set(0);
+    instrumentation.reserved.set(0);
+    instrumentation.callback.set(block + 0x200);
     let set = call("NtSetInformationProcess", u64::MAX, 40, input, 16);
     let cell = guest::read64(usermode::INSTRUMENTATION_CALLBACK);
-    guest::write32(input + 4, 1);
+    instrumentation.reserved.set(1);
     let reserved = call("NtSetInformationProcess", u64::MAX, 40, input, 16);
     let other = call("NtSetInformationProcess", 0x10, 40, input, 16);
     let length = call("NtSetInformationProcess", u64::MAX, 40, input, 12);
-    guest::write64(input, 0);
+    instrumentation.version.set(0);
+    instrumentation.reserved.set(0);
     let cleared = call("NtSetInformationProcess", u64::MAX, 40, input, 8);
     let cleared_cell = guest::read64(usermode::INSTRUMENTATION_CALLBACK);
     instrumentation::release_process();
@@ -3740,29 +3783,31 @@ fn user_process_information_hooks(assert: Assert) {
     let vector = block + 0x1800;
     let thread = threads::UserThread::new(0x7F60, process::get_current_thread(), teb, 0);
     threads::push(thread.clone());
-    guest::write64(teb + 0x58, vector);
+    let test_teb = unsafe { nt::Teb::at(teb) };
+    test_teb.thread_local_storage_pointer.set(vector);
     for slot in 0..4u64 {
         guest::write64(vector + slot * 8, 0x1000 + slot);
     }
     let tls = block + 0x400;
+    let tls_information = unsafe { nt::ProcessTlsInformation::at(tls) };
     let header = |operation: u32, index: u32, replacement: u64| {
-        guest::write32(tls, 0);
-        guest::write32(tls + 4, operation);
-        guest::write32(tls + 8, 1);
-        guest::write32(tls + 12, index);
-        guest::write32(tls + 16, 0);
-        guest::write64(tls + 24, replacement);
-        guest::write64(tls + 32, 0);
+        tls_information.flags.set(0);
+        tls_information.operation_type.set(operation);
+        tls_information.thread_data_count.set(1);
+        tls_information.tls_index.set(index);
+        tls_information.thread_data[0].flags.set(0);
+        tls_information.thread_data[0].new_tls_data.set(replacement);
+        tls_information.thread_data[0].thread_id.set(0);
     };
     header(0, 2, 0x5678);
     let slot = call("NtSetInformationProcess", u64::MAX, 35, tls, 40);
-    let slot_ok = slot == Some(0) && guest::read64(vector + 16) == 0x5678 && guest::read64(tls + 24) == 0x1002 && guest::read32(tls + 16) == 2;
+    let slot_ok = slot == Some(0) && guest::read64(vector + 16) == 0x5678 && tls_information.thread_data[0].old_tls_data.get() == 0x1002 && tls_information.thread_data[0].flags.get() == 2;
     let replacement = block + 0x1C00;
     header(1, 3, replacement);
     let swap = call("NtSetInformationProcess", u64::MAX, 35, tls, 40);
-    let swap_ok = swap == Some(0) && guest::read64(teb + 0x58) == replacement && guest::read64(replacement) == 0x1000 && guest::read64(replacement + 16) == 0x5678 && guest::read64(tls + 24) == vector && guest::read64(tls + 32) == 0x7F60;
+    let swap_ok = swap == Some(0) && test_teb.thread_local_storage_pointer.get() == replacement && guest::read64(replacement) == 0x1000 && guest::read64(replacement + 16) == 0x5678 && tls_information.thread_data[0].old_tls_data.get() == vector && tls_information.thread_data[0].thread_id.get() == 0x7F60;
     header(0, 0, 0);
-    guest::write32(tls, 1);
+    tls_information.flags.set(1);
     let wow64 = call("NtSetInformationProcess", u64::MAX, 35, tls, 40);
     let tls_refusals = (call("NtSetInformationProcess", 0x10, 35, tls, 40), call("NtSetInformationProcess", u64::MAX, 35, tls, 30), wow64);
     threads::clear();
@@ -3787,12 +3832,12 @@ fn user_process_information_hooks(assert: Assert) {
     let none = query(u64::MAX, out, 8);
     let none_value = guest::read64(out);
     let current = process::get_current_process();
-    let port_field = current + crate::ntos::inc::nt_abi::eprocess::DEBUG_PORT;
-    let saved_port = guest::read64(port_field);
-    guest::write64(port_field, 0x1234);
+    let current_process = unsafe { nt::Eprocess::at(current) };
+    let saved_port = current_process.debug_port.get();
+    current_process.debug_port.set(0x1234);
     let debugged = query(u64::MAX, out, 8);
     let debugged_value = guest::read64(out);
-    guest::write64(port_field, saved_port);
+    current_process.debug_port.set(saved_port);
     let refusals = (query(u64::MAX, out, 4), query(u64::MAX, out + 1, 8), query(u64::MAX - 1, out, 8), query(0x7FF0, out, 8));
     state::with(|state| state.service_raw_arguments = saved_raw);
     guest::free_bytes(raw);
@@ -3903,20 +3948,9 @@ fn memory_partition(assert: Assert) {
     let (attributes, unicode, text, result, maximum, rsp) = (block, block + 48, block + 64, block + 256, block + 272, block + 0x400);
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     let set_name = |name: &str, flags: u32, root: u64| {
-        for offset in (0..48).step_by(8) {
-            guest::write64(attributes + offset, 0);
-        }
-        guest::write32(attributes, 48);
-        guest::write64(attributes + 8, root);
-        guest::write64(attributes + 16, unicode);
-        guest::write32(attributes + 24, flags);
-        let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
-        guest::write16(unicode, units.len() as u16 * 2);
-        guest::write16(unicode + 2, units.len() as u16 * 2 + 2);
-        guest::write64(unicode + 8, text);
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(text + index as u64 * 2, *unit);
-        }
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, root, unicode, flags);
+        let length = write_wide(text, name);
+        set_unicode(unsafe { nt::UnicodeString::at(unicode) }, length, length + 2, text);
     };
     let saved_pid = state::with(|state| state.current_process_id);
     let previous = process::get_current_thread();
@@ -3937,7 +3971,7 @@ fn memory_partition(assert: Assert) {
     let resolved = partition::resolve(handle, 2, 1);
     assert(opened == Some(0) && handle != 0 && counted == (base_refs + 1, base_handles + 1) && resolved == Ok(body), "partition: NtOpenPartition pelo nome abre o alocador real");
     // Seção ligada à partição: a seção retém o corpo.
-    guest::write64(maximum, 4096);
+    unsafe { nt::LargeInteger::at(maximum) }.quad_part.set(4096);
     guest::write64(rsp + 40, 4);
     guest::write64(rsp + 48, 0x804_0000);
     guest::write64(rsp + 56, handle);

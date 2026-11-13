@@ -42,6 +42,7 @@ mod ps;
 mod rtl;
 mod se;
 mod wdk;
+pub mod extra_test_p7;
 
 pub use alpc::*;
 pub use cm::*;
