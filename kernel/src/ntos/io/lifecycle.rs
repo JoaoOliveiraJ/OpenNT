@@ -273,8 +273,9 @@ fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Re
 }
 
 /// Retira dispositivos e nome, libera o caminho temporário do registro e
-/// entrega o DRIVER_OBJECT ao provedor que controla as referências.
-fn dispose_driver(driver: u64) {
+/// entrega o DRIVER_OBJECT ao provedor que controla as referências. Também é o
+/// desfecho de um IoCreateDriver cujo DriverEntry falhou.
+pub fn dispose_driver(driver: u64) {
     let (name, node, allocations) = {
         let mut drivers = DRIVERS.lock();
         let Some(entry) = drivers.get_mut(&driver) else { return };

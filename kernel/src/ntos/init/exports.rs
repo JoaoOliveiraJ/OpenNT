@@ -54,7 +54,7 @@ pub struct Group {
 }
 
 /// Grupos transcritos (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 176] {
+fn groups() -> [&'static Group; 183] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -232,6 +232,13 @@ fn groups() -> [&'static Group; 176] {
         &crate::ntos::rtl::exports::rtl_bit_ops::GROUP,
         &crate::ntos::rtl::exports::crt_strings::GROUP,
         &crate::ntos::rtl::exports::crt_formatting::GROUP,
+        &crate::ntos::io::exports::io_csq::GROUP,
+        &crate::ntos::io::exports::io_irp_request::GROUP,
+        &crate::ntos::io::exports::io_pnp_interface::GROUP,
+        &crate::ntos::io::exports::io_builtin_driver::GROUP,
+        &crate::ntos::io::exports::io_named_event::GROUP,
+        &crate::ntos::io::exports::io_wmi_data_block::GROUP,
+        &crate::ntos::io::exports::io_work_item_queue::GROUP,
     ]
 }
 
@@ -640,6 +647,8 @@ pub mod private_routines {
     pub const REFERENCE_TABLE_ID: u64 = ID + 7;
     pub const FIND_HANDLE_FILTER_ID: u64 = ID + 8;
     pub const IMAGE_FILE_SIGNATURE_ID: u64 = ID + 9;
+    pub const CSQ_CANCEL_ID: u64 = ID + 10;
+    pub const UNLOAD_SAFE_COMPLETION_ID: u64 = ID + 11;
 
     pub fn name(id: u64) -> Option<&'static str> {
         use crate::hal::private_dispatch;
@@ -657,6 +666,8 @@ pub mod private_routines {
             REFERENCE_TABLE_ID => "ObReferenceProcessHandleTable",
             FIND_HANDLE_FILTER_ID => "ObpFindHandleForObject",
             IMAGE_FILE_SIGNATURE_ID => "MmGetImageFileSignatureInformation",
+            CSQ_CANCEL_ID => "IopCsqCancelRoutine",
+            UNLOAD_SAFE_COMPLETION_ID => "IopUnloadSafeCompletion",
             _ => return None,
         })
     }
@@ -681,6 +692,8 @@ pub mod private_routines {
             CONTEXT_RUNDOWN_ID => crate::ntos::ps::context::apc::rundown(call.arg(1)),
             IMAGE_FILE_SIGNATURE_ID => Ok(crate::ntos::mm::image_file_signature::query(call.arg(1))),
             SET_CONTEXT_ID => crate::ntos::ps::context::set::execute(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(4) as u8, call.arg(5) as u32).map(|status| status as i32 as i64 as u64),
+            CSQ_CANCEL_ID => crate::ntos::io::csq::cancel_routine(call.arg(1), call.arg(2)).map(|()| 0),
+            UNLOAD_SAFE_COMPLETION_ID => crate::ntos::io::irp_request::unload_safe_completion(call.arg(1), call.arg(2), call.arg(3)).map(|status| status as i32 as i64 as u64),
             _ => Err(KernelError::new(alloc::format!("private routine {} enters with its module", name(id).unwrap_or("?")))),
         }
     }

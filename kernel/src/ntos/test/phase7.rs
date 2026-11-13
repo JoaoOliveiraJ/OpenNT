@@ -3377,7 +3377,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1095, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1119, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }

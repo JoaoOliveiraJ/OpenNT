@@ -106,6 +106,20 @@ opennt_mm_get_image_file_signature_information:
     mov eax, 0x80000009
     jmp opennt_win32_common
 
+# Rotina de cancelamento que IoCsqInsertIrp(Ex) põe nos IRPs da fila.
+.balign 16
+.global opennt_iop_csq_cancel_routine
+opennt_iop_csq_cancel_routine:
+    mov eax, 0x8000000A
+    jmp opennt_win32_common
+
+# Rotina de conclusão que IoSetCompletionRoutineEx instala no IRP.
+.balign 16
+.global opennt_iop_unload_safe_completion
+opennt_iop_unload_safe_completion:
+    mov eax, 0x8000000B
+    jmp opennt_win32_common
+
 .balign 16
 .global opennt_psp_context_operation_apc
 opennt_psp_context_operation_apc:
@@ -259,6 +273,8 @@ extern "C" {
     static opennt_dbg_prompt: u8;
     static opennt_probe_kernel_stack: u8;
     static opennt_mm_get_image_file_signature_information: u8;
+    static opennt_iop_csq_cancel_routine: u8;
+    static opennt_iop_unload_safe_completion: u8;
     static opennt_hal_private_stubs: u8;
     static opennt_hal_default_zero: u8;
     static opennt_hal_default_not_supported: u8;
@@ -290,6 +306,8 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "dbg_prompt" => core::ptr::addr_of!(opennt_dbg_prompt),
             "probe_kernel_stack" => core::ptr::addr_of!(opennt_probe_kernel_stack),
             "MmGetImageFileSignatureInformation" => core::ptr::addr_of!(opennt_mm_get_image_file_signature_information),
+            "IopCsqCancelRoutine" => core::ptr::addr_of!(opennt_iop_csq_cancel_routine),
+            "IopUnloadSafeCompletion" => core::ptr::addr_of!(opennt_iop_unload_safe_completion),
             "hal_private_stubs" => core::ptr::addr_of!(opennt_hal_private_stubs),
             "hal_default_zero" => core::ptr::addr_of!(opennt_hal_default_zero),
             "hal_default_not_supported" => core::ptr::addr_of!(opennt_hal_default_not_supported),

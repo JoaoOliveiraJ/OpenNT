@@ -70,3 +70,10 @@ pub fn enabled_links(class: &[u8; 16]) -> Vec<String> {
 pub fn interface_enabled(link: &str) -> Option<bool> {
     DEVICE_INTERFACES.lock().get(link).map(|entry| entry.enabled)
 }
+
+/// Links das interfaces de uma classe — o filtro do IopGetDeviceInterfaces
+/// (ntoskrnl 19041 rva 0x6b32e8): só as habilitadas, ou todas com
+/// DEVICE_INTERFACE_INCLUDE_NONACTIVE (`include_inactive`).
+pub fn class_links(class: &[u8; 16], include_inactive: bool) -> Vec<String> {
+    DEVICE_INTERFACES.lock().iter().filter(|(_, entry)| entry.class == *class && (include_inactive || entry.enabled)).map(|(link, _)| link.clone()).collect()
+}

@@ -339,7 +339,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1095 && abi_names::GROUP_LAYOUT.len() == 176 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1095 exports em 176 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1119 && abi_names::GROUP_LAYOUT.len() == 183 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1119 exports em 183 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1319,7 +1319,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1095 && exports::export_names().len() == 1095, "ntoskrnl: 176 grupos com os 1095 exports implementados");
+    assert(exports::implemented() == 1119 && exports::export_names().len() == 1119, "ntoskrnl: 183 grupos com os 1119 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -4629,6 +4629,464 @@ fn crt_formatting_exports(assert: Assert) {
 }
 
 
+fn io_csq_exports(assert: Assert) {
+    fn code(bytes: &[u8]) -> u64 {
+        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
+        guest::write_bytes(pointer, bytes);
+        pointer
+    }
+    // mov rax, cell; mov [rax], rdx; ret
+    fn store_rdx(cell: u64) -> Vec<u8> {
+        let mut bytes = alloc::vec![0x48, 0xB8];
+        bytes.extend_from_slice(&cell.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0x89, 0x10, 0xC3]);
+        bytes
+    }
+    let cells = guest::alloc_bytes(0x40);
+    let (queued, completed, released) = (cells, cells + 8, cells + 16);
+    // CsqAcquireLock: mov byte [rdx], 5; ret — CsqReleaseLock grava o KIRQL recebido.
+    let acquire = code(&[0xC6, 0x02, 0x05, 0xC3]);
+    let release = code(&store_rdx(released));
+    let insert = code(&store_rdx(queued));
+    // CsqRemoveIrp: mov rax, queued; mov qword [rax], 0; ret
+    let mut remove_bytes = alloc::vec![0x48, 0xB8];
+    remove_bytes.extend_from_slice(&queued.to_le_bytes());
+    remove_bytes.extend_from_slice(&[0x48, 0xC7, 0x00, 0, 0, 0, 0, 0xC3]);
+    let remove = code(&remove_bytes);
+    // CsqPeekNextIrp: Irp != NULL -> NULL; senão *queued.
+    let mut peek_bytes = alloc::vec![0x48, 0x85, 0xD2, 0x75, 0x0E, 0x48, 0xB8];
+    peek_bytes.extend_from_slice(&queued.to_le_bytes());
+    peek_bytes.extend_from_slice(&[0x48, 0x8B, 0x00, 0xC3, 0x31, 0xC0, 0xC3]);
+    let peek = code(&peek_bytes);
+    let complete = code(&store_rdx(completed));
+    // CsqInsertIrpEx que recusa com STATUS_CANCELLED (0xC0000120).
+    let mut insert_ex_bytes = store_rdx(queued);
+    insert_ex_bytes.pop();
+    insert_ex_bytes.extend_from_slice(&[0xB8, 0x20, 0x01, 0x00, 0xC0, 0xC3]);
+    let insert_ex = code(&insert_ex_bytes);
+
+    let csq = guest::alloc_bytes(0x40);
+    let context = guest::alloc_bytes(0x18);
+    // IRP com a stack location corrente válida (CSL = slot 0).
+    let irp = guest::alloc_bytes(0xD0 + 0x48);
+    guest::write64(irp + 0xB8, irp + 0xD0);
+
+    assert(
+        call_export("IoCsqInitialize", &[csq, insert, remove, peek, acquire, release, complete]) == Some(0)
+            && guest::read32(csq) == 2
+            && guest::read64(csq + 0x08) == insert
+            && guest::read64(csq + 0x18) == peek
+            && guest::read64(csq + 0x30) == complete,
+        "io-csq: IoCsqInitialize preenche o IO_CSQ (Type=2)",
+    );
+    call_export("IoCsqInsertIrp", &[csq, irp, context]);
+    assert(
+        guest::read64(queued) == irp
+            && guest::read64(irp + 0x90) == context
+            && guest::read32(context) == 1
+            && guest::read64(context + 8) == irp
+            && guest::read64(context + 0x10) == csq,
+        "io-csq: IoCsqInsertIrp liga IRP, contexto e fila do driver",
+    );
+    assert(
+        guest::read64(irp + 0x68) != 0 && guest::read8(irp + 0xD0 + 3) & 1 == 1 && guest::read64(released) == 5,
+        "io-csq: insert marca pendente, instala a cancel routine e devolve o KIRQL ao release",
+    );
+    assert(
+        call_export("IoCsqRemoveNextIrp", &[csq, 0]) == Some(irp)
+            && guest::read64(queued) == 0
+            && guest::read64(context + 8) == 0
+            && guest::read64(irp + 0x90) == 0
+            && guest::read64(irp + 0x68) == 0,
+        "io-csq: IoCsqRemoveNextIrp retira o IRP e solta o contexto",
+    );
+    assert(call_export("IoCsqRemoveNextIrp", &[csq, 0]) == Some(0), "io-csq: fila vazia devolve NULL");
+    call_export("IoCsqInsertIrp", &[csq, irp, context]);
+    assert(
+        call_export("IoCsqRemoveIrp", &[csq, context]) == Some(irp) && guest::read64(queued) == 0 && guest::read64(context + 8) == 0,
+        "io-csq: IoCsqRemoveIrp pelo contexto",
+    );
+    assert(call_export("IoCsqRemoveIrp", &[csq, context]) == Some(0), "io-csq: contexto sem IRP devolve NULL");
+    // Cancelamento real: IoCancelIrp -> IopCsqCancelRoutine -> CsqCompleteCanceledIrp.
+    call_export("IoCsqInsertIrp", &[csq, irp, 0]);
+    assert(guest::read64(irp + 0x90) == csq, "io-csq: sem contexto o IRP aponta para a IO_CSQ");
+    assert(
+        call_export("IoCancelIrp", &[irp]) == Some(1) && guest::read64(completed) == irp && guest::read64(queued) == 0,
+        "io-csq: IoCancelIrp entrega o IRP ao CsqCompleteCanceledIrp pela IopCsqCancelRoutine",
+    );
+    // Corrida: Cancel já ligado antes do insert.
+    guest::write64(completed, 0);
+    guest::write8(irp + 0x44, 1);
+    call_export("IoCsqInsertIrp", &[csq, irp, context]);
+    assert(
+        guest::read64(completed) == irp && guest::read64(queued) == 0 && guest::read64(irp + 0x68) == 0 && guest::read64(context + 8) == 0 && guest::read64(irp + 0x90) == 0,
+        "io-csq: insert de IRP ja cancelado completa pelo CsqCompleteCanceledIrp",
+    );
+    // Variante Ex: a recusa do driver volta ao chamador sem pendência.
+    guest::write8(irp + 0x44, 0);
+    guest::write8(irp + 0xD0 + 3, 0);
+    guest::write64(irp + 0x68, 0);
+    let csq_ex = guest::alloc_bytes(0x40);
+    assert(call_export("IoCsqInitializeEx", &[csq_ex, insert_ex, remove, peek, acquire, release, complete]) == Some(0) && guest::read32(csq_ex) == 3, "io-csq: IoCsqInitializeEx marca Type=3");
+    let refused = call_export("IoCsqInsertIrpEx", &[csq_ex, irp, 0, 0x1234]).map(|status| status as u32);
+    assert(
+        refused == Some(0xC000_0120) && guest::read64(irp + 0x68) == 0 && guest::read8(irp + 0xD0 + 3) & 1 == 0,
+        "io-csq: IoCsqInsertIrpEx devolve a recusa do CsqInsertIrpEx sem marcar pendente",
+    );
+    for pointer in [cells, acquire, release, insert, remove, peek, complete, insert_ex, csq, csq_ex, context, irp] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn io_irp_request_exports(assert: Assert) {
+    use crate::ntos::ps::process;
+    fn code(bytes: &[u8]) -> u64 {
+        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
+        guest::write_bytes(pointer, bytes);
+        pointer
+    }
+    let complete_request = crate::ntos::init::exports::export_module().ok().and_then(|module| module.exports.exports.get("IofCompleteRequest").copied()).unwrap_or(0);
+    // Despacho que grava IoStatus.Status, chama IofCompleteRequest(Irp, 0) e devolve `result`.
+    let dispatch = |io_status: u32, result: u32| {
+        let mut bytes = alloc::vec![0x48, 0x83, 0xEC, 0x28, 0xC7, 0x42, 0x30];
+        bytes.extend_from_slice(&io_status.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0x89, 0xD1, 0x31, 0xD2, 0x48, 0xB8]);
+        bytes.extend_from_slice(&complete_request.to_le_bytes());
+        bytes.extend_from_slice(&[0xFF, 0xD0, 0xB8]);
+        bytes.extend_from_slice(&result.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        code(&bytes)
+    };
+    let completed_now = dispatch(0x77, 0x77);
+    let completed_later = dispatch(0x66, 0x103);
+    let driver = guest::alloc_bytes(0x200);
+    let device = guest::alloc_bytes(0x150);
+    guest::write64(device + 0x08, driver);
+    guest::write8(device + 0x4C, 1);
+    let device_control = driver + 0x70 + 0x0E * 8;
+
+    // IoSynchronousCallDriver: status síncrono direto, pendente pelo evento.
+    guest::write64(device_control, completed_now);
+    let packet = call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    guest::write8(packet + 0xD0, 0x0E);
+    assert(complete_request != 0 && packet != 0 && call_export("IoSynchronousCallDriver", &[device, packet]).map(|status| status as u32) == Some(0x77), "io-irp-request: IoSynchronousCallDriver devolve o status sincrono do despacho");
+    call_export("IoReuseIrp", &[packet, 0]);
+    guest::write8(packet + 0xD0, 0x0E);
+    guest::write64(device_control, completed_later);
+    assert(call_export("IoSynchronousCallDriver", &[device, packet]).map(|status| status as u32) == Some(0x66), "io-irp-request: IoSynchronousCallDriver espera o evento e devolve IoStatus");
+    call_export("IoFreeIrp", &[packet]);
+
+    // IoForwardIrpSynchronously: copia a stack location corrente para a próxima.
+    guest::write64(device_control, completed_now);
+    let forwarded = call_export("IoAllocateIrp", &[2, 0]).unwrap_or(0);
+    let (slot0, slot1) = (forwarded + 0xD0, forwarded + 0xD0 + 0x48);
+    guest::write8(forwarded + 0x43, 2);
+    guest::write64(forwarded + 0xB8, slot1);
+    guest::write8(slot1, 0x0E);
+    guest::write32(slot1 + 0x18, 0x0022_2003);
+    guest::write8(slot1 + 3, 0xE0);
+    assert(call_export("IoForwardIrpSynchronously", &[device, forwarded]) == Some(1) && guest::read8(slot0) == 0x0E && guest::read32(slot0 + 0x18) == 0x0022_2003 && guest::read32(forwarded + 0x30) == 0x77, "io-irp-request: IoForwardIrpSynchronously copia a stack location e despacha");
+    guest::write8(forwarded + 0x43, 1);
+    assert(call_export("IoForwardIrpSynchronously", &[device, forwarded]) == Some(0), "io-irp-request: IoForwardIrpSynchronously sem stack location livre devolve FALSE");
+    call_export("IoFreeIrp", &[forwarded]);
+
+    // IoBuildAsynchronousFsdRequest: buffered (leitura/escrita) e neither.
+    let buffer = guest::alloc_bytes(16);
+    guest::write_bytes(buffer, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    let offset = guest::alloc_bytes(8);
+    guest::write64(offset, 0x2000);
+    let iosb = guest::alloc_bytes(16);
+    let buffered = guest::alloc_bytes(0x150);
+    guest::write8(buffered + 0x4C, 1);
+    guest::write32(buffered + 0x30, 4);
+    let read = call_export("IoBuildAsynchronousFsdRequest", &[3, buffered, buffer, 16, offset, iosb]).unwrap_or(0);
+    let top = if read != 0 { guest::read64(read + 0xB8) - 0x48 } else { 0 };
+    assert(
+        read != 0
+            && guest::read8(top) == 3
+            && guest::read32(top + 8) == 16
+            && guest::read64(top + 0x18) == 0x2000
+            && guest::read64(read + 0x48) == iosb
+            && guest::read64(read + 0x50) == 0
+            && guest::read64(read + 0x70) == buffer
+            && guest::read32(read + 0x10) & 0xFFFF == 0x70
+            && guest::read64(read + 0x18) != 0
+            && guest::read64(read + 0x98) == process::get_current_thread(),
+        "io-irp-request: IoBuildAsynchronousFsdRequest de leitura buffered",
+    );
+    let write = call_export("IoBuildAsynchronousFsdRequest", &[4, buffered, buffer, 16, offset, iosb]).unwrap_or(0);
+    let system = if write != 0 { guest::read64(write + 0x18) } else { 0 };
+    assert(write != 0 && system != 0 && guest::read_bytes(system, 16) == guest::read_bytes(buffer, 16) && guest::read32(write + 0x10) & 0xFFFF == 0x30 && guest::read64(write + 0x70) == 0, "io-irp-request: IoBuildAsynchronousFsdRequest de escrita copia para o SystemBuffer");
+    let neither = guest::alloc_bytes(0x150);
+    guest::write8(neither + 0x4C, 1);
+    let raw = call_export("IoBuildAsynchronousFsdRequest", &[3, neither, buffer, 16, 0, iosb]).unwrap_or(0);
+    assert(raw != 0 && guest::read64(raw + 0x70) == buffer && guest::read64(raw + 0x18) == 0 && guest::read64(raw + 0x08) == 0, "io-irp-request: IoBuildAsynchronousFsdRequest METHOD_NEITHER usa o UserBuffer");
+    for packet in [read, write, raw] {
+        let system = guest::read64(packet + 0x18);
+        if system != 0 {
+            guest::free_bytes(system);
+        }
+        call_export("IoFreeIrp", &[packet]);
+    }
+
+    // IoAllocateIrpEx: com extensão reserva duas stack locations no topo.
+    let plain = call_export("IoAllocateIrpEx", &[0, 2, 0]).unwrap_or(0);
+    let extended = call_export("IoAllocateIrpEx", &[u64::MAX, 2, 0]).unwrap_or(0);
+    assert(plain != 0 && guest::read8(plain + 0x42) == 2 && guest::read8(plain + 0x43) == 3 && guest::read64(plain + 0xC8) == 0, "io-irp-request: IoAllocateIrpEx sem extensao");
+    assert(
+        extended != 0 && guest::read8(extended + 0x42) == 2 && guest::read8(extended + 0x43) == 3 && guest::read64(extended + 0xB8) == extended + 0xD0 + 2 * 0x48 && guest::read64(extended + 0xC8) == extended + 0xD0 + 2 * 0x48,
+        "io-irp-request: IoAllocateIrpEx(-1) reserva a IOP_IRP_EXTENSION acima da pilha",
+    );
+    call_export("IoFreeIrp", &[plain]);
+    call_export("IoFreeIrp", &[extended]);
+
+    // IoSetCompletionRoutineEx + IofCompleteRequest -> IopUnloadSafeCompletion -> rotina.
+    let cells = guest::alloc_bytes(0x20);
+    // mov rax, cells; mov [rax], rdx; mov [rax+8], r8; mov eax, 0xC0000016; ret
+    let mut routine_bytes = alloc::vec![0x48, 0xB8];
+    routine_bytes.extend_from_slice(&cells.to_le_bytes());
+    routine_bytes.extend_from_slice(&[0x48, 0x89, 0x10, 0x4C, 0x89, 0x40, 0x08, 0xB8, 0x16, 0x00, 0x00, 0xC0, 0xC3]);
+    let routine = code(&routine_bytes);
+    let chained = guest::alloc_bytes(0xD0 + 2 * 0x48);
+    guest::write8(chained + 0x42, 2);
+    guest::write8(chained + 0x43, 2);
+    guest::write64(chained + 0xB8, chained + 0xD0 + 0x48);
+    assert(call_export("IoSetCompletionRoutineEx", &[0, chained, routine, 0xC0DE, 0, 0, 0]).map(|status| status as u32) == Some(0xC000_000D), "io-irp-request: IoSetCompletionRoutineEx sem gatilhos recusa");
+    assert(call_export("IoSetCompletionRoutineEx", &[0, chained, routine, 0xC0DE, 1, 1, 1]) == Some(0) && guest::read8(chained + 0xD0 + 3) == 0xE0 && guest::read64(chained + 0xD0 + 0x38) != routine && guest::read64(chained + 0xD0 + 0x38) != 0, "io-irp-request: IoSetCompletionRoutineEx instala o invólucro unload-safe");
+    guest::write8(chained + 0x43, 1);
+    guest::write64(chained + 0xB8, chained + 0xD0);
+    guest::write32(chained + 0x30, 0);
+    call_export("IofCompleteRequest", &[chained, 0]);
+    assert(guest::read64(cells) == chained && guest::read64(cells + 8) == 0xC0DE, "io-irp-request: IopUnloadSafeCompletion chama a rotina do driver com IRP e contexto");
+    guest::free_bytes(chained);
+
+    // IoIsOperationSynchronous (vetores do modelo de referência da desmontagem).
+    let file = guest::alloc_bytes(0xD8);
+    let probe = guest::alloc_bytes(0xD0 + 0x48);
+    guest::write64(probe + 0xB8, probe + 0xD0);
+    guest::write64(probe + 0xD0 + 0x30, file);
+    let cases: [(u32, u32, u64); 7] = [(0, 0, 0), (4, 0, 1), (0, 2, 1), (2, 2, 0), (0x42, 0, 1), (0x42, 2, 1), (2, 0, 0)];
+    let synchronous = cases.iter().all(|&(irp_flags, file_flags, expected)| {
+        guest::write32(probe + 0x10, irp_flags);
+        guest::write32(file + 0x50, file_flags);
+        call_export("IoIsOperationSynchronous", &[probe]) == Some(expected)
+    });
+    assert(synchronous, "io-irp-request: IoIsOperationSynchronous segue FO_SYNCHRONOUS_IO, IRP_SYNCHRONOUS_API e paging");
+
+    // IoPropagateIrpExtension: só os tipos pedidos nas flags.
+    let source = guest::alloc_bytes(0xD0);
+    let target = guest::alloc_bytes(0xD0);
+    call_export("IoSetGenericIrpExtension", &[source, 0x5A5A, 1]);
+    guest::write_bytes(cells, &[9u8; 16]);
+    call_export("IoSetActivityIdIrp", &[source, cells]);
+    call_export("IoPropagateIrpExtension", &[source, target, 0]);
+    assert(call_export("IoGetGenericIrpExtension", &[target]) == Some(0), "io-irp-request: IoPropagateIrpExtension sem flags nao copia");
+    call_export("IoPropagateIrpExtension", &[source, target, 3]);
+    let activity = call_export("IoGetActivityIdIrp", &[target, cells + 0x10]).map(|status| status as u32);
+    assert(call_export("IoGetGenericIrpExtension", &[target]) == Some(0x5A5A) && activity == Some(0) && guest::read_bytes(cells + 0x10, 16) == [9u8; 16], "io-irp-request: IoPropagateIrpExtension copia extensao generica e activity id");
+    call_export("IoFreeIrp", &[source]);
+    call_export("IoFreeIrp", &[target]);
+
+    // IoGetRequestorProcessId: UniqueProcessId do processo do IRP.
+    let owner = call_export("IoGetRequestorProcess", &[probe]).unwrap_or(0);
+    let expected = if owner != 0 { guest::read32(owner + 0x440) as u64 } else { 0 };
+    assert(call_export("IoGetRequestorProcessId", &[probe]) == Some(expected), "io-irp-request: IoGetRequestorProcessId le o UniqueProcessId");
+
+    // IoGetRequestorSessionId: sem thread -> -1/STATUS_UNSUCCESSFUL; com thread -> sessão do processo.
+    guest::write64(probe + 0x98, 0);
+    let unsuccessful = call_export("IoGetRequestorSessionId", &[probe, cells]).map(|status| status as u32);
+    assert(unsuccessful == Some(0xC000_0001) && guest::read32(cells) == 0xFFFF_FFFF, "io-irp-request: IoGetRequestorSessionId sem thread");
+    let thread = process::get_current_thread();
+    if thread != 0 {
+        guest::write64(probe + 0x98, thread);
+        let owner = guest::read64(thread + 0x220);
+        let session = if owner != 0 { crate::ntos::ps::session::query(owner) } else { 0 };
+        assert(call_export("IoGetRequestorSessionId", &[probe, cells]) == Some(0) && guest::read32(cells) == session, "io-irp-request: IoGetRequestorSessionId devolve a sessao do processo da thread");
+    }
+
+    // IoGetInitiatorProcess: extensão do FILE_OBJECT, slot 1, processo em +8.
+    guest::write64(file + 0xD0, 0);
+    assert(call_export("IoGetInitiatorProcess", &[file]) == Some(0), "io-irp-request: IoGetInitiatorProcess sem extensao devolve NULL");
+    let extension = guest::alloc_bytes(0x40);
+    let initiator = guest::alloc_bytes(0x10);
+    guest::write64(initiator + 8, 0xFFFF_8000_1234_5000);
+    guest::write64(extension + 0x10, initiator);
+    guest::write64(file + 0xD0, extension);
+    assert(call_export("IoGetInitiatorProcess", &[file]) == Some(0xFFFF_8000_1234_5000), "io-irp-request: IoGetInitiatorProcess le o processo iniciador da extensao");
+    guest::write64(file + 0xD0, 0);
+    guest::free_bytes(extension);
+    guest::free_bytes(initiator);
+
+    for pointer in [completed_now, completed_later, driver, device, buffer, offset, iosb, buffered, neither, cells, routine, file, probe] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn io_pnp_interface_exports(assert: Assert) {
+    use crate::hal::amd64::native_call;
+    use crate::ntos::rtl::guest_strings;
+    let block = guest::alloc_bytes(0x400);
+    let guid = block;
+    guest::write_bytes(guid, b"OpenNTIoDevIfcT1");
+    let link_string = block + 0x20;
+    let list_slot = block + 0x40;
+    // PDO sintético sem \Device próprio: o link vai para \Device\PDO0.
+    let pdo = guest::alloc_bytes(0x150);
+    let registered = call_export("IoRegisterDeviceInterface", &[pdo, guid, 0, link_string]).map(|status| status as u32);
+    let link = guest_strings_read(link_string);
+    assert(registered == Some(0) && link.starts_with("\\DosDevices\\#{"), "io-pnp-interface: interface de teste registrada");
+
+    let list_of = |pdo: u64, flags: u64| -> Option<Vec<alloc::string::String>> {
+        if call_export("IoGetDeviceInterfaces", &[guid, pdo, flags, list_slot]) != Some(0) {
+            return None;
+        }
+        let list = guest::read64(list_slot);
+        let mut links = Vec::new();
+        let mut cursor = list;
+        loop {
+            let entry = guest_strings::read_wide_string(cursor);
+            if entry.is_empty() {
+                break;
+            }
+            cursor += (entry.encode_utf16().count() as u64 + 1) * 2;
+            links.push(entry);
+        }
+        call_export("ExFreePool", &[list]);
+        Some(links)
+    };
+    assert(list_of(0, 0).is_some_and(|links| links.is_empty()), "io-pnp-interface: interface desabilitada fica fora da lista (um L'\\0')");
+    assert(list_of(0, 1).is_some_and(|links| links.len() == 1 && links[0] == link), "io-pnp-interface: DEVICE_INTERFACE_INCLUDE_NONACTIVE inclui a interface desabilitada");
+    call_export("IoSetDeviceInterfaceState", &[link_string, 1]);
+    assert(list_of(0, 0).is_some_and(|links| links.len() == 1 && links[0] == link), "io-pnp-interface: interface habilitada entra na lista MULTI_SZ");
+    let stranger = guest::alloc_bytes(0x150);
+    assert(list_of(stranger, 1).is_some_and(|links| links.is_empty()), "io-pnp-interface: filtro por PDO exclui interfaces de outro dispositivo");
+    call_export("IoSetDeviceInterfaceState", &[link_string, 0]);
+
+    // IoGetIommuInterface: o mesmo status da HalPrivateDispatchTable.
+    let table = crate::hal::private_dispatch::table_address();
+    let routine = if table != 0 { guest::read64(table + 0x440) } else { 0 };
+    let expected = if routine != 0 { native_call::call(routine, &[1, block + 0x100]) as u32 } else { 0xC000_00BB };
+    assert(call_export("IoGetIommuInterface", &[1, block + 0x100]).map(|status| status as u32) == Some(expected), "io-pnp-interface: IoGetIommuInterface delega a HalGetIommuInterface");
+
+    guest::free_bytes(guest::read64(link_string + 8));
+    guest::free_bytes(stranger);
+    guest::free_bytes(pdo);
+    guest::free_bytes(block);
+}
+
+
+fn io_builtin_driver_exports(assert: Assert) {
+    use crate::ntos::io::lifecycle;
+    use crate::ntos::ob::object_manager;
+    fn code(bytes: &[u8]) -> u64 {
+        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
+        guest::write_bytes(pointer, bytes);
+        pointer
+    }
+    let previous = lifecycle::current_driver();
+    let cells = guest::alloc_bytes(0x20);
+    // Inicialização: mov rax, cells; mov [rax], rcx; mov [rax+8], rdx; xor eax, eax; ret
+    let mut init_bytes = alloc::vec![0x48, 0xB8];
+    init_bytes.extend_from_slice(&cells.to_le_bytes());
+    init_bytes.extend_from_slice(&[0x48, 0x89, 0x08, 0x48, 0x89, 0x50, 0x08, 0x31, 0xC0, 0xC3]);
+    let init = code(&init_bytes);
+    // Inicialização que falha: mov eax, 0xC0000001; ret
+    let failing = code(&[0xB8, 0x01, 0x00, 0x00, 0xC0, 0xC3]);
+    let block = guest::alloc_bytes(0x200);
+    guest::write64(cells + 8, 0xFFFF);
+    let name = unicode_at(block, "\\Driver\\OpenNtBuiltinTest");
+    let created = call_export("IoCreateDriver", &[name, init]).map(|status| status as u32);
+    let driver = guest::read64(cells);
+    let published = object_manager::lookup("\\Driver\\OpenNtBuiltinTest").and_then(object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+    assert(created == Some(0) && driver != 0 && published == driver && guest::read64(cells + 8) == 0, "io-builtin-driver: IoCreateDriver publica o DRIVER_OBJECT e chama a inicializacao com RegistryPath NULL");
+    let extension = if driver != 0 { guest::read64(driver + 0x30) } else { 0 };
+    assert(
+        extension != 0 && guest::read32(driver + 0x10) & 4 != 0 && guest::read64(driver + 0x58) == init && guest_strings_read(extension + 0x18) == "\\Driver\\OpenNtBuiltinTest" && guest::read64(extension) == driver,
+        "io-builtin-driver: DRVO_BUILTIN_DRIVER, DriverInit, DriverExtension e ServiceKeyName",
+    );
+    assert(call_export("IoCreateDriver", &[name, init]).map(|status| status as u32) == Some(0xC000_0035), "io-builtin-driver: nome repetido colide");
+    let failed_name = unicode_at(block + 0x100, "\\Driver\\OpenNtBuiltinFail");
+    assert(
+        call_export("IoCreateDriver", &[failed_name, failing]).map(|status| status as u32) == Some(0xC000_0001) && object_manager::lookup("\\Driver\\OpenNtBuiltinFail").is_none(),
+        "io-builtin-driver: falha da inicializacao retira o driver",
+    );
+    // Sem nome: "\Driver\%08u".
+    guest::write64(cells, 0);
+    let unnamed = call_export("IoCreateDriver", &[0, init]).map(|status| status as u32);
+    let unnamed_driver = guest::read64(cells);
+    let unnamed_name = lifecycle::node_by_driver_object(unnamed_driver).and_then(object_manager::node).map(|node| node.name).unwrap_or_default();
+    assert(unnamed == Some(0) && unnamed_name.len() == 8 && unnamed_name.bytes().all(|byte| byte.is_ascii_digit()), "io-builtin-driver: IoCreateDriver sem nome gera \\Driver\\%08u");
+    assert(lifecycle::current_driver() == previous, "io-builtin-driver: contexto de driver ambiente restaurado");
+    assert(lifecycle::unload_driver("OpenNtBuiltinTest") && lifecycle::unload_driver(&unnamed_name), "io-builtin-driver: drivers embutidos de teste descarregados");
+    for pointer in [cells, init, failing, block] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn io_named_event_exports(assert: Assert) {
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ob::object_manager;
+    let block = guest::alloc_bytes(0x400);
+    let handles = block + 0x300;
+    let name = unicode_at(block, "\\KernelObjects\\OpenNtIoNotificationTest");
+    let event = call_export("IoCreateNotificationEvent", &[name, handles]).unwrap_or(0);
+    let first = guest::read64(handles);
+    assert(
+        event != 0 && first != 0 && guest::read8(event) == 0 && dispatcher::read_state(event) == 1 && object_manager::lookup("\\KernelObjects\\OpenNtIoNotificationTest").is_some(),
+        "io-named-event: IoCreateNotificationEvent cria o evento nomeado sinalizado com handle de kernel",
+    );
+    let again = call_export("IoCreateNotificationEvent", &[name, handles + 8]).unwrap_or(0);
+    let second = guest::read64(handles + 8);
+    assert(again == event && second != 0 && second != first, "io-named-event: OBJ_OPENIF reabre o mesmo KEVENT com outro handle");
+    let sync_name = unicode_at(block + 0x100, "\\KernelObjects\\OpenNtIoSynchronizationTest");
+    let sync = call_export("IoCreateSynchronizationEvent", &[sync_name, handles + 0x10]).unwrap_or(0);
+    let third = guest::read64(handles + 0x10);
+    assert(sync != 0 && third != 0 && guest::read8(sync) == 1 && dispatcher::read_state(sync) == 1, "io-named-event: IoCreateSynchronizationEvent cria SynchronizationEvent sinalizado");
+    guest::write64(handles + 0x18, 0x5A5A);
+    let directory = unicode_at(block + 0x200, "\\KernelObjects");
+    assert(call_export("IoCreateNotificationEvent", &[directory, handles + 0x18]) == Some(0) && guest::read64(handles + 0x18) == 0x5A5A, "io-named-event: nome de outro tipo devolve NULL sem handle");
+    let orphan = unicode_at(block + 0x280, "\\OpenNtNoSuchDirectory\\Event");
+    assert(call_export("IoCreateNotificationEvent", &[orphan, handles + 0x18]) == Some(0), "io-named-event: diretorio pai inexistente devolve NULL");
+    let closed = [first, second, third].iter().all(|&handle| call_export("ZwClose", &[handle]) == Some(0));
+    assert(closed && object_manager::lookup("\\KernelObjects\\OpenNtIoNotificationTest").is_none(), "io-named-event: fechar o ultimo handle libera o evento e o nome");
+    guest::free_bytes(block);
+}
+
+
+fn io_wmi_data_block_exports(assert: Assert) {
+    let buffer = guest::alloc_bytes(0x40);
+    guest::write32(buffer, 0x20);
+    let opened = call_export("IoWMIOpenBlock", &[buffer + 0x10, 1, buffer + 0x30]).map(|status| status as u32);
+    let query = call_export("IoWMIQuerySingleInstance", &[0, buffer + 0x10, buffer, buffer + 0x20]).map(|status| status as u32);
+    let name = call_export("IoWMIHandleToInstanceName", &[0, 0, buffer + 0x20]).map(|status| status as u32);
+    assert(opened == Some(0xC000_0295) && query == opened && name == opened, "io-wmi-data-block: sem provedor WMI as consultas por bloco seguem o IoWMIOpenBlock (STATUS_WMI_GUID_NOT_FOUND)");
+    guest::free_bytes(buffer);
+}
+
+
+fn io_work_item_queue_exports(assert: Assert) {
+    let cells = guest::alloc_bytes(0x20);
+    // Rotina Ex: mov rax, cells; mov [rax], rcx; mov [rax+8], rdx; mov [rax+0x10], r8; ret
+    let mut routine_bytes = alloc::vec![0x48, 0xB8];
+    routine_bytes.extend_from_slice(&cells.to_le_bytes());
+    routine_bytes.extend_from_slice(&[0x48, 0x89, 0x08, 0x48, 0x89, 0x50, 0x08, 0x4C, 0x89, 0x40, 0x10, 0xC3]);
+    let routine = guest::alloc_bytes(routine_bytes.len() as u64 + 16);
+    guest::write_bytes(routine, &routine_bytes);
+    let device = guest::alloc_bytes(0x150);
+    let item = call_export("IoAllocateWorkItem", &[device]).unwrap_or(0);
+    assert(item != 0 && call_export("IoTryQueueWorkItem", &[item, routine, 1, 0x77]) == Some(1), "io-work-item-queue: IoTryQueueWorkItem aceita o item");
+    crate::ntos::io::work_items::run_queue();
+    assert(guest::read64(cells) == device && guest::read64(cells + 8) == 0x77 && guest::read64(cells + 0x10) == item, "io-work-item-queue: a rotina Ex recebe (IoObject, Context, IoWorkItem)");
+    call_export("IoFreeWorkItem", &[item]);
+    for pointer in [cells, routine, device] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -4707,5 +5165,12 @@ pub fn run(assert: Assert) {
     rtl_bit_ops_exports(assert);
     crt_strings_exports(assert);
     crt_formatting_exports(assert);
+    io_csq_exports(assert);
+    io_irp_request_exports(assert);
+    io_pnp_interface_exports(assert);
+    io_builtin_driver_exports(assert);
+    io_named_event_exports(assert);
+    io_wmi_data_block_exports(assert);
+    io_work_item_queue_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }

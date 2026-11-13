@@ -849,3 +849,176 @@ pub mod x86bios_sleep_misc {
 }
 
 // =============================================================================
+
+pub mod io_csq {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::csq::{self, CsqRoutines};
+    use crate::rtl::KernelError;
+
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        let routines = CsqRoutines { insert: call.arg(2), remove: call.arg(3), peek_next: call.arg(4), acquire_lock: call.arg(5), release_lock: call.arg(6), complete_canceled: call.arg(7) };
+        Ok(csq::initialize(call.arg(1), &routines, false) as u64)
+    }
+    fn initialize_ex(call: &Call) -> Result<u64, KernelError> {
+        let routines = CsqRoutines { insert: call.arg(2), remove: call.arg(3), peek_next: call.arg(4), acquire_lock: call.arg(5), release_lock: call.arg(6), complete_canceled: call.arg(7) };
+        Ok(csq::initialize(call.arg(1), &routines, true) as u64)
+    }
+    fn insert_irp(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(csq::insert_irp(call.arg(1), call.arg(2), call.arg(3), 0)?))
+    }
+    fn insert_irp_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(csq::insert_irp(call.arg(1), call.arg(2), call.arg(3), call.arg(4))?))
+    }
+    fn remove_irp(call: &Call) -> Result<u64, KernelError> {
+        csq::remove_irp(call.arg(1), call.arg(2))
+    }
+    fn remove_next_irp(call: &Call) -> Result<u64, KernelError> {
+        csq::remove_next_irp(call.arg(1), call.arg(2))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-csq",
+        names: &["IoCsqInitialize", "IoCsqInitializeEx", "IoCsqInsertIrp", "IoCsqInsertIrpEx", "IoCsqRemoveIrp", "IoCsqRemoveNextIrp"],
+        handlers: &[initialize, initialize_ex, insert_irp, insert_irp_ex, remove_irp, remove_next_irp],
+        data_exports: &[],
+    };
+}
+
+pub mod io_irp_request {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::irp_request::{self, InvokeOn};
+    use crate::rtl::KernelError;
+
+    fn synchronous_call_driver(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(irp_request::synchronous_call(call.arg(1), call.arg(2))?))
+    }
+    fn forward_irp_synchronously(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::forward_irp_synchronously(call.arg(1), call.arg(2))? as u64)
+    }
+    fn build_asynchronous_fsd_request(call: &Call) -> Result<u64, KernelError> {
+        irp_request::build_asynchronous_fsd_request(call.arg(1) as u32, call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6))
+    }
+    fn allocate_irp_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::allocate_irp_ex(call.arg(1), call.arg(2) as u8, call.arg(3) as u8 != 0))
+    }
+    fn set_completion_routine_ex(call: &Call) -> Result<u64, KernelError> {
+        let invoke = InvokeOn { success: call.arg(5) as u8 != 0, error: call.arg(6) as u8 != 0, cancel: call.arg(7) as u8 != 0 };
+        Ok(signed_status(irp_request::set_completion_routine_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), invoke)?))
+    }
+    fn is_operation_synchronous(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::is_operation_synchronous(call.arg(1)) as u64)
+    }
+    fn propagate_irp_extension(call: &Call) -> Result<u64, KernelError> {
+        irp_request::propagate_irp_extension(call.arg(1), call.arg(2), call.arg(3) as u32);
+        Ok(0)
+    }
+    fn get_requestor_process_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::requestor_process_id(call.arg(1))? as u64)
+    }
+    fn get_requestor_session_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(irp_request::requestor_session_id(call.arg(1), call.arg(2))))
+    }
+    fn get_initiator_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::initiator_process(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-irp-request",
+        names: &[
+            "IoSynchronousCallDriver", "IoForwardIrpSynchronously", "IoBuildAsynchronousFsdRequest", "IoAllocateIrpEx",
+            "IoSetCompletionRoutineEx", "IoIsOperationSynchronous", "IoPropagateIrpExtension", "IoGetRequestorProcessId",
+            "IoGetRequestorSessionId", "IoGetInitiatorProcess",
+        ],
+        handlers: &[
+            synchronous_call_driver, forward_irp_synchronously, build_asynchronous_fsd_request, allocate_irp_ex,
+            set_completion_routine_ex, is_operation_synchronous, propagate_irp_extension, get_requestor_process_id,
+            get_requestor_session_id, get_initiator_process,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod io_pnp_interface {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::pnp_interfaces;
+    use crate::rtl::KernelError;
+
+    fn get_device_interfaces(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(pnp_interfaces::device_interface_list(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4))?))
+    }
+    fn get_iommu_interface(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(pnp_interfaces::iommu_interface(call.arg(1), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-pnp-interface",
+        names: &["IoGetDeviceInterfaces", "IoGetIommuInterface"],
+        handlers: &[get_device_interfaces, get_iommu_interface],
+        data_exports: &[],
+    };
+}
+
+pub mod io_builtin_driver {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::builtin_driver;
+    use crate::rtl::KernelError;
+
+    fn create_driver(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(builtin_driver::create(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "io-builtin-driver", names: &["IoCreateDriver"], handlers: &[create_driver], data_exports: &[] };
+}
+
+pub mod io_named_event {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::named_event;
+    use crate::rtl::KernelError;
+
+    fn create_notification_event(call: &Call) -> Result<u64, KernelError> {
+        named_event::create(call.arg(1), named_event::NOTIFICATION_EVENT, call.arg(2))
+    }
+    fn create_synchronization_event(call: &Call) -> Result<u64, KernelError> {
+        named_event::create(call.arg(1), named_event::SYNCHRONIZATION_EVENT, call.arg(2))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-named-event",
+        names: &["IoCreateNotificationEvent", "IoCreateSynchronizationEvent"],
+        handlers: &[create_notification_event, create_synchronization_event],
+        data_exports: &[],
+    };
+}
+
+pub mod io_wmi_data_block {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::wmi_data_block;
+    use crate::rtl::KernelError;
+
+    fn query_single_instance(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wmi_data_block::query_single_instance(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+    fn handle_to_instance_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wmi_data_block::handle_to_instance_name(call.arg(1), call.arg(2), call.arg(3))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-wmi-data-block",
+        names: &["IoWMIQuerySingleInstance", "IoWMIHandleToInstanceName"],
+        handlers: &[query_single_instance, handle_to_instance_name],
+        data_exports: &[],
+    };
+}
+
+pub mod io_work_item_queue {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::work_items;
+    use crate::rtl::KernelError;
+
+    fn try_queue_work_item(call: &Call) -> Result<u64, KernelError> {
+        work_items::queue_work_item_ex(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), true);
+        Ok(1)
+    }
+
+    pub static GROUP: Group = Group { name: "io-work-item-queue", names: &["IoTryQueueWorkItem"], handlers: &[try_queue_work_item], data_exports: &[] };
+}
