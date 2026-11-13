@@ -10,9 +10,6 @@ use crate::ntos::init::exports::{signed_status, Call, Group};
 use crate::ntos::ob::{object_manager, object_open, object_reference, object_security, reference_trace};
 use crate::rtl::KernelError;
 
-/// Caminho usado por outros componentes para a referência com tag.
-pub use crate::ntos::ob::object_reference::{dereference_with_tag, reference_with_tag};
-
 fn reference_object(call: &Call) -> Result<u64, KernelError> {
     object_reference::reference_with_tag(call.arg(1), reference_trace::DEFAULT_TAG, true)
 }

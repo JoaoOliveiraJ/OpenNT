@@ -664,7 +664,7 @@ pub mod driver_helpers {
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::ntos::io::object_types;
     use crate::ntos::io::small::portable_operating_system;
-    use crate::ntos::ob::exports::{dereference_with_tag, reference_with_tag};
+    use crate::ntos::ob::object_reference::{dereference_with_tag, reference_with_tag};
     use crate::ntos::ob::reference_trace::DEFAULT_TAG;
     use crate::rtl::KernelError;
 
