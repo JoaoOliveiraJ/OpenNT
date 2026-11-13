@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1151 && abi_names::GROUP_LAYOUT.len() == 198 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1151 exports em 198 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1202 && abi_names::GROUP_LAYOUT.len() == 204 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1202 exports em 204 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1151 && exports::export_names().len() == 1151, "ntoskrnl: 198 grupos com os 1151 exports implementados");
+    assert(exports::implemented() == 1202 && exports::export_names().len() == 1202, "ntoskrnl: 204 grupos com os 1202 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -5799,6 +5799,454 @@ fn se_access_from_state_exports(assert: Assert) {
 }
 
 
+fn cc_cache_map_exports(assert: Assert) {
+    use crate::ntos::cc::cache_map;
+    use crate::ntos::inc::types::extra_cc::{CacheUninitializeEvent, CcFileSizes, PrivateCacheMap, SharedCacheMap};
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::Ordering;
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc: fixture de arquivo sintetico");
+        return;
+    };
+    let pointers = at::<nt::SectionObjectPointers>(f.pointers);
+    let file = at::<nt::FileObject>(f.file);
+    assert(call_export("CcInitializeCacheMap", &[f.file, f.sizes, 0, 0, 0x55]) == Some(0), "cc: CcInitializeCacheMap retorna");
+    let address = pointers.shared_cache_map.get();
+    if address == 0 {
+        assert(false, "cc: SHARED_CACHE_MAP pendurado em SectionObjectPointer");
+        fixture::destroy(f);
+        return;
+    }
+    let map = at::<SharedCacheMap>(address);
+    assert(map.node_type_code.get() == 0x2FF && map.node_byte_size.get() == 0x228 && map.open_count.get() == 1, "cc: SHARED_CACHE_MAP nativo em SectionObjectPointer->SharedCacheMap (OpenCount 1)");
+    // FileSize em +8 (CcGetFileSizePointer), SectionSize = AllocationSize em 256 KB, VDL/goal.
+    let sizes_ok = map.file_size.quad_part.get() == 0x5_0000 && map.section_size.quad_part.get() == 0x8_0000 && map.valid_data_length.quad_part.get() == 0x5_0000 && map.valid_data_goal.quad_part.get() == 0x5_0000;
+    assert(sizes_ok && map.lazy_write_context.get() == 0x55 && map.file_object_fast_ref.object.get() & !0xF == f.file, "cc: tamanhos, LazyWriteContext e FileObjectFastRef do mapa");
+    let embedded = &map.private_cache_map;
+    assert(file.private_cache_map.get() == embedded.address() && embedded.node_type_code.get() == 0x2FE && embedded.read_ahead_mask.get() == 0xFFF && embedded.file_object.get() == f.file, "cc: PRIVATE_CACHE_MAP embutido no FILE_OBJECT");
+    assert(fixture::READS.load(Ordering::SeqCst) == 0, "cc: inicializar o cache nao faz I/O");
+    // Segundo FILE_OBJECT: mapa privado alocado, OpenCount 2; reinicializar não conta de novo.
+    let other = fixture::open_another(&f);
+    let _ = call_export("CcInitializeCacheMap", &[other, f.sizes, 0, 0, 0]);
+    let _ = call_export("CcInitializeCacheMap", &[other, f.sizes, 0, 0, 0]);
+    let other_private = at::<nt::FileObject>(other).private_cache_map.get();
+    let other_ok = other_private != 0 && other_private != embedded.address() && at::<PrivateCacheMap>(other_private).node_type_code.get() == 0x2FE;
+    assert(other_ok && map.open_count.get() == 2 && pointers.shared_cache_map.get() == address, "cc: segundo FILE_OBJECT compartilha o mapa com mapa privado proprio");
+    let _ = call_export("CcSetReadAheadGranularity", &[f.file, 0x1_0000]);
+    assert(embedded.read_ahead_mask.get() == 0xFFFF, "cc: CcSetReadAheadGranularity grava Granularity-1");
+    let _ = call_export("CcSetAdditionalCacheAttributes", &[f.file, 1, 1]);
+    let on = map.flags.get();
+    let _ = call_export("CcSetAdditionalCacheAttributes", &[f.file, 0, 0]);
+    let off = map.flags.get();
+    assert(on & 0x203 == 0x203 && off & 0x3 == 0 && off & 0x200 != 0, "cc: CcSetAdditionalCacheAttributes liga 0x1/0x202 e desliga 0x1/0x2");
+    let _ = call_export("CcSetAdditionalCacheAttributesEx", &[f.file, 0x22]);
+    let ex = map.flags.get();
+    let _ = call_export("CcSetParallelFlushFile", &[f.file, 1]);
+    let parallel = map.flags.get();
+    assert(ex & (1 << 0x1B) != 0 && ex & 0x1 != 0 && ex & 0x2 == 0 && parallel & (1 << 18) != 0, "cc: CcSetAdditionalCacheAttributesEx e CcSetParallelFlushFile nos bits de Flags");
+    assert(call_export("CcGetFileObjectFromSectionPtrs", &[f.pointers]) == Some(f.file) && map.flags.get() & (1 << 20) != 0, "cc: CcGetFileObjectFromSectionPtrs devolve o FILE_OBJECT do mapa");
+    // Crescer: SectionSize na granularidade de 1 MB; encolher: FileSize, VDL e goal.
+    let sizes = guest::alloc_bytes(CcFileSizes::SIZE);
+    let new_sizes = at::<CcFileSizes>(sizes);
+    let set_sizes = |allocation: i64, size: i64, valid: i64| {
+        new_sizes.allocation_size.quad_part.set(allocation);
+        new_sizes.file_size.quad_part.set(size);
+        new_sizes.valid_data_length.quad_part.set(valid);
+    };
+    set_sizes(0x9_0000, 0x5_0000, 0x5_0000);
+    let grown = call_export("CcSetFileSizesEx", &[f.file, sizes]);
+    set_sizes(0x2000, 0x1800, 0x1000);
+    let _ = call_export("CcSetFileSizes", &[f.file, sizes]);
+    let shrunk = map.section_size.quad_part.get() == 0x10_0000 && map.file_size.quad_part.get() == 0x1800 && map.valid_data_length.quad_part.get() == 0x1800 && map.valid_data_goal.quad_part.get() == 0x1000;
+    assert(grown == Some(0) && shrunk, "cc: CcSetFileSizes(Ex) cresce a secao e encolhe FileSize/ValidData");
+    // Desinicialização: o segundo FILE_OBJECT sai (FALSE); o último apaga o mapa (TRUE) e sinaliza o evento.
+    let event = guest::alloc_bytes(CacheUninitializeEvent::SIZE);
+    let kevent = at::<CacheUninitializeEvent>(event).event.address();
+    dispatcher::initialize_event(kevent, 0, false);
+    let first = call_export("CcUninitializeCacheMap", &[other, 0, 0]);
+    assert(first == Some(0) && at::<nt::FileObject>(other).private_cache_map.get() == 0 && map.open_count.get() == 1, "cc: CcUninitializeCacheMap de um entre dois FILE_OBJECTs");
+    let last = call_export("CcUninitializeCacheMap", &[f.file, 0, event]);
+    assert(last == Some(1) && pointers.shared_cache_map.get() == 0 && file.private_cache_map.get() == 0 && dispatcher::read_state(kevent) == 1 && cache_map::info(f.pointers).is_none(), "cc: ultimo CcUninitializeCacheMap apaga o mapa e sinaliza o CACHE_UNINITIALIZE_EVENT");
+    dispatcher::initialize_event(kevent, 0, false);
+    assert(call_export("CcUninitializeCacheMap", &[f.file, 0, event]) == Some(0) && dispatcher::read_state(kevent) == 1, "cc: CcUninitializeCacheMap sem cache devolve FALSE e sinaliza o evento");
+    assert(call_export("CcSetFileSizesEx", &[f.file, sizes]) == Some(0) && call_export("CcGetFileObjectFromSectionPtrs", &[f.pointers]) == Some(0), "cc: sem mapa, CcSetFileSizesEx e CcGetFileObjectFromSectionPtrs");
+    guest::free_bytes(event);
+    guest::free_bytes(sizes);
+    fixture::close(other);
+    fixture::destroy(f);
+}
+
+
+fn cc_copy_exports(assert: Assert) {
+    use crate::ntos::cc::cache_map;
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static POSTED: AtomicU64 = AtomicU64::new(0);
+    extern "win64" fn post(context1: u64, context2: u64) {
+        POSTED.store(context1 ^ context2, Ordering::SeqCst);
+    }
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc-copy: fixture");
+        return;
+    };
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 0, 0, 0]);
+    let block = guest::alloc_bytes(0x3800);
+    let (offset, iosb, buffer, source, check) = (block, block + 0x10, block + 0x100, block + 0x2400, block + 0x3400);
+    let file_offset = &at::<nt::LargeInteger>(offset).quad_part;
+    let status_block = at::<nt::IoStatusBlock>(iosb);
+    let reads = || fixture::READS.load(Ordering::SeqCst);
+    let file_bytes = |start: u64, length: u64| -> Vec<u8> { (0..length).map(|index| fixture::pattern(start + index)).collect() };
+    let matches_file = |address: u64, length: u64, start: u64| guest::read_bytes(address, length as usize) == file_bytes(start, length);
+    let written: Vec<u8> = (0..0x100u64).map(|index| (index as u8) ^ 0x5A).collect();
+    // Sem espera e sem dados residentes: FALSE, nenhum IRP.
+    file_offset.set(0x1F00);
+    assert(call_export("CcCopyRead", &[f.file, offset, 0x2200, 0, buffer, iosb]) == Some(0) && reads() == 0, "cc-copy: CcCopyRead sem espera e sem cache devolve FALSE sem I/O");
+    // Com espera: uma leitura de paginação das páginas 1..4 (0x1000, 0x4000).
+    let read = call_export("CcCopyRead", &[f.file, offset, 0x2200, 1, buffer, iosb]);
+    assert(read == Some(1) && reads() == 1 && fixture::LAST_READ_OFFSET.load(Ordering::SeqCst) == 0x1000 && fixture::LAST_READ_LENGTH.load(Ordering::SeqCst) == 0x4000 && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-copy: CcCopyRead le as paginas ausentes com um IRP de paginacao");
+    assert(matches_file(buffer, 0x2200, 0x1F00) && status_block.status.get() == 0 && status_block.information.get() == 0x2200, "cc-copy: CcCopyRead copia os bytes do arquivo e preenche o IoStatus");
+    assert(call_export("CcCopyRead", &[f.file, offset, 0x2200, 0, buffer, iosb]) == Some(1) && reads() == 1, "cc-copy: dados residentes atendem sem espera e sem I/O");
+    // Fronteira de vista (256 KB): página 63 da vista 0 e página 0 da vista 1.
+    file_offset.set(0x3_FF00);
+    assert(call_export("CcCopyReadEx", &[f.file, offset, 0x200, 1, buffer, iosb, 0]) == Some(1) && reads() == 3 && matches_file(buffer, 0x200, 0x3_FF00), "cc-copy: CcCopyReadEx atravessa duas vistas");
+    // Escrita numa página residente: sem leitura, uma página suja.
+    guest::write_bytes(buffer, &written);
+    file_offset.set(0x2080);
+    assert(call_export("CcCopyWrite", &[f.file, offset, 0x100, 1, buffer]) == Some(1) && reads() == 3 && cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 1), "cc-copy: CcCopyWrite em pagina residente so suja a pagina");
+    // Página parcial ausente abaixo de ValidDataGoal: sem espera FALSE, com espera lê antes.
+    file_offset.set(0x1_0010);
+    let no_wait = call_export("CcCopyWriteEx", &[f.file, offset, 0x20, 0, buffer, 0]);
+    let waited = call_export("CcCopyWriteEx", &[f.file, offset, 0x20, 1, buffer, 0]);
+    assert(no_wait == Some(0) && waited == Some(1) && reads() == 4 && fixture::LAST_READ_OFFSET.load(Ordering::SeqCst) == 0x1_0000, "cc-copy: escrita parcial le a pagina antes (FALSE sem espera)");
+    // Página inteira sobrescrita: nenhuma leitura.
+    guest::write_bytes(source, &[0x77u8; 0x1000]);
+    file_offset.set(0x2_0000);
+    assert(call_export("CcCopyWrite", &[f.file, offset, 0x1000, 0, source]) == Some(1) && reads() == 4, "cc-copy: pagina inteira sobrescrita nao e lida");
+    // Releitura mostra a escrita no meio dos dados antigos.
+    let _ = call_export("CcFastCopyRead", &[f.file, 0x2000, 0x200, 1, check, iosb]);
+    let merged = guest::read_bytes(check, 0x200);
+    let expected: Vec<u8> = file_bytes(0x2000, 0x80).into_iter().chain(written.iter().copied()).chain(file_bytes(0x2180, 0x80)).collect();
+    assert(merged == expected && status_block.information.get() == 0x200, "cc-copy: CcFastCopyRead ve a escrita entre os dados do arquivo");
+    let _ = call_export("CcFastCopyWrite", &[f.file, 0x3_0000, 0x10, buffer]);
+    assert(cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 4 && info.valid_data_goal == 0x5_0000), "cc-copy: CcFastCopyWrite suja mais uma pagina");
+    // Controle de escrita abaixo do limite.
+    assert(call_export("CcCanIWrite", &[f.file, 0x1000, 0, 0]) == Some(1) && call_export("CcCopyWriteWontFlush", &[f.file, offset, 0x1000]) == Some(1) && call_export("CcCopyWriteWontFlush", &[f.file, offset, 0x100_0000]) == Some(0), "cc-copy: CcCanIWrite e CcCopyWriteWontFlush abaixo do limite");
+    POSTED.store(0, Ordering::SeqCst);
+    let routine = post as extern "win64" fn(u64, u64) as usize as u64;
+    let routine = crate::ntos::mm::kernel_address::virtual_address(routine).unwrap_or(routine);
+    let _ = call_export("CcDeferWrite", &[f.file, routine, 0x1234_0000, 0x5678, 0x1000, 0]);
+    assert(POSTED.load(Ordering::SeqCst) == 0x1234_5678, "cc-copy: CcDeferWrite posta na hora quando pode escrever");
+    // O último CcUninitializeCacheMap grava as quatro páginas sujas.
+    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let on_disk = (0..0x100u64).all(|index| fixture::disk_byte(0x2080 + index) == Some((index as u8) ^ 0x5A)) && fixture::disk_byte(0x207F) == Some(fixture::pattern(0x207F)) && fixture::disk_byte(0x2_0000) == Some(0x77) && fixture::disk_byte(0x2_0FFF) == Some(0x77);
+    assert(deleted == Some(1) && fixture::WRITES.load(Ordering::SeqCst) == 4 && on_disk && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-copy: ultimo CcUninitializeCacheMap grava os dados sujos por paginacao");
+    guest::free_bytes(block);
+    fixture::destroy(f);
+}
+
+
+fn cc_pin_exports(assert: Assert) {
+    use crate::ntos::cc::{cache_map, layout};
+    use crate::ntos::inc::types::extra_cc::{PublicBcb, SharedCacheMap, Vacb};
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::Ordering;
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc-pin: fixture");
+        return;
+    };
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 1, 0, 0]);
+    let map_address = at::<nt::SectionObjectPointers>(f.pointers).shared_cache_map.get();
+    if map_address == 0 {
+        assert(false, "cc-pin: cache map inicializado");
+        fixture::destroy(f);
+        return;
+    }
+    let map = at::<SharedCacheMap>(map_address);
+    let block = guest::alloc_bytes(0x100);
+    let (offset, iosb, lsn) = (block, block + 0x10, block + 0x20);
+    let file_offset = &at::<nt::LargeInteger>(offset).quad_part;
+    // Parâmetros de saída PVOID* (Bcb, Buffer) em pares a partir de +0x40.
+    let out = |slot: u64| at::<nt::Field<u64>>(block + 0x40 + slot * 8);
+    let reads = || fixture::READS.load(Ordering::SeqCst);
+    let file_bytes = |start: u64, length: u64| -> Vec<u8> { (0..length).map(|index| fixture::pattern(start + index)).collect() };
+    // CcMapData com espera: `vacb | 1`, VACB nativo com ActiveCount 1, dados do arquivo.
+    file_offset.set(0x1100);
+    let mapped = call_export("CcMapData", &[f.file, offset, 0x80, 1, out(0).address(), out(1).address()]);
+    let (tag, data) = (out(0).get(), out(1).get());
+    let vacb = at::<Vacb>(tag & !1);
+    let view_ok = tag & 1 == 1 && vacb.base_address.get() == data - 0x1100 && vacb.shared_cache_map.get() == map_address && vacb.overlay.active_count.get() == 1;
+    assert(mapped == Some(1) && view_ok && guest::read_bytes(data, 0x80) == file_bytes(0x1100, 0x80), "cc-pin: CcMapData devolve vacb|1 e o buffer da vista com os dados");
+    file_offset.set(0x9000);
+    let before = reads();
+    assert(call_export("CcMapData", &[f.file, offset, 0x80, 0, out(2).address(), out(3).address()]) == Some(0) && reads() == before, "cc-pin: CcMapData sem espera e sem dados devolve FALSE");
+    // CcPinRead: BCB nativo com PUBLIC_BCB; o mesmo intervalo reaproveita o BCB.
+    file_offset.set(0x1100);
+    let pinned = call_export("CcPinRead", &[f.file, offset, 0x80, 1, out(4).address(), out(5).address()]);
+    let first_address = out(4).get();
+    let _ = call_export("CcPinRead", &[f.file, offset, 0x80, 1, out(6).address(), out(7).address()]);
+    let public = at::<PublicBcb>(first_address);
+    let first = at::<layout::Bcb>(first_address);
+    let public_ok = public.node_type_code.get() == 0x2FD && public.mapped_length.get() == 0x80 && public.mapped_file_offset.quad_part.get() == 0x1100 && first.shared_cache_map.get() == map_address;
+    assert(pinned == Some(1) && public_ok && out(5).get() == data && out(6).get() == first_address && first.pin_count.get() == 2, "cc-pin: CcPinRead devolve um BCB (PUBLIC_BCB) compartilhado pelo mesmo intervalo");
+    assert(call_export("CcGetFileObjectFromBcb", &[first_address]) == Some(f.file), "cc-pin: CcGetFileObjectFromBcb");
+    file_offset.set(0x8000);
+    assert(call_export("CcPinRead", &[f.file, offset, 0x80, 1 | 8, out(8).address(), out(9).address()]) == Some(0), "cc-pin: PIN_IF_BCB sem BCB devolve FALSE");
+    // CcPreparePinWrite com Zero: sem leitura, zerado e já sujo.
+    file_offset.set(0x2_0000);
+    let reads_before = reads();
+    let prepared = call_export("CcPreparePinWrite", &[f.file, offset, 0x1000, 1, 1, out(10).address(), out(11).address()]);
+    let (written_address, written) = (out(10).get(), out(11).get());
+    let zeroed = guest::read_bytes(written, 0x1000).iter().all(|&byte| byte == 0);
+    assert(prepared == Some(1) && reads() == reads_before && zeroed && at::<layout::Bcb>(written_address).dirty.get() == 1 && cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 1), "cc-pin: CcPreparePinWrite zera sem ler e marca o BCB sujo");
+    // CcSetDirtyPinnedData com LSN e escrita pelo buffer fixado.
+    at::<nt::LargeInteger>(lsn).quad_part.set(0x77);
+    guest::write_bytes(data, &[0xEE]);
+    let _ = call_export("CcSetDirtyPinnedData", &[first_address, lsn]);
+    assert(first.dirty.get() == 1 && first.oldest_lsn.quad_part.get() == 0x77 && first.newest_lsn.quad_part.get() == 0x77 && map.largest_lsn.quad_part.get() == 0x77, "cc-pin: CcSetDirtyPinnedData marca o BCB com Oldest/NewestLsn");
+    // CcRemapBcb soma um mapeamento; CcPinMappedData troca o mapeamento pelo pin.
+    let remapped = call_export("CcRemapBcb", &[first_address]).unwrap_or(0);
+    let active = vacb.overlay.active_count.get();
+    let _ = call_export("CcUnpinData", &[remapped]);
+    out(12).set(tag);
+    file_offset.set(0x1100);
+    let converted = call_export("CcPinMappedData", &[f.file, offset, 0x80, 1, out(12).address()]);
+    assert(remapped == tag && active == 2 && converted == Some(1) && out(12).get() == first_address && first.pin_count.get() == 3 && vacb.overlay.active_count.get() == 0, "cc-pin: CcRemapBcb e CcPinMappedData");
+    // CcRepinBcb + CcUnpinRepinnedBcb(WriteThrough): grava o intervalo e limpa o BCB.
+    let _ = call_export("CcRepinBcb", &[first_address]);
+    let repinned = first.pin_count.get();
+    let _ = call_export("CcUnpinRepinnedBcb", &[first_address, 1, iosb]);
+    let status_block = at::<nt::IoStatusBlock>(iosb);
+    assert(repinned == 4 && first.pin_count.get() == 3 && first.dirty.get() == 0 && fixture::disk_byte(0x1100) == Some(0xEE) && fixture::WRITES.load(Ordering::SeqCst) == 1 && status_block.status.get() == 0, "cc-pin: CcUnpinRepinnedBcb com WriteThrough grava o BCB");
+    // Os três pins restantes; o BCB limpo some, o sujo do CcPreparePinWrite fica.
+    let _ = call_export("CcUnpinData", &[first_address]);
+    let _ = call_export("CcUnpinData", &[first_address]);
+    let _ = call_export("CcUnpinDataForThread", &[first_address, crate::ntos::ps::process::get_current_thread()]);
+    let _ = call_export("CcUnpinData", &[written_address]);
+    assert(cache_map::info(f.pointers).is_some_and(|info| info.bcbs == 1 && info.dirty_pages == 1), "cc-pin: unpin solta o BCB limpo e mantem o sujo ate a escrita");
+    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    assert(deleted == Some(1) && fixture::disk_byte(0x2_0000) == Some(0) && fixture::disk_byte(0x2_0FFF) == Some(0) && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-pin: o BCB sujo vai ao disco no ultimo CcUninitializeCacheMap");
+    guest::free_bytes(block);
+    fixture::destroy(f);
+}
+
+
+fn cc_flush_exports(assert: Assert) {
+    use crate::ntos::cc::{cache_map, copy, pin};
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::Ordering;
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc-flush: fixture");
+        return;
+    };
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 0, 0, 0]);
+    let block = guest::alloc_bytes(0x2100);
+    let (offset, iosb, start, end, bcb, buffer, data) = (block, block + 0x10, block + 0x20, block + 0x28, block + 0x30, block + 0x38, block + 0x100);
+    let file_offset = &at::<nt::LargeInteger>(offset).quad_part;
+    let status_block = at::<nt::IoStatusBlock>(iosb);
+    let mapped_bcb = at::<nt::Field<u64>>(bcb);
+    guest::write_bytes(data, &[0xC3u8; 0x2000]);
+    let writes = || fixture::WRITES.load(Ordering::SeqCst);
+    let dirty = || cache_map::info(f.pointers).map_or(u32::MAX, |info| info.dirty_pages);
+    // Duas páginas sujas contíguas; flush parcial e depois do arquivo todo.
+    assert(copy::copy_write_at(f.file, 0x1000, 0x2000, true, data).is_ok_and(|done| done) && dirty() == 2, "cc-flush: duas paginas sujas pelo motor");
+    file_offset.set(0x1000);
+    let _ = call_export("CcFlushCache", &[f.pointers, offset, 0x1000, iosb]);
+    let partial = writes() == 1 && fixture::LAST_WRITE_OFFSET.load(Ordering::SeqCst) == 0x1000 && fixture::LAST_WRITE_LENGTH.load(Ordering::SeqCst) == 0x1000 && status_block.status.get() == 0 && status_block.information.get() == 0x1000;
+    assert(partial && dirty() == 1 && fixture::disk_byte(0x1000) == Some(0xC3) && fixture::disk_byte(0x2000) == Some(fixture::pattern(0x2000)), "cc-flush: CcFlushCache de um intervalo grava so a sua pagina");
+    let _ = call_export("CcFlushCache", &[f.pointers, 0, 0, iosb]);
+    assert(writes() == 2 && dirty() == 0 && fixture::disk_byte(0x2FFF) == Some(0xC3) && status_block.information.get() == 0x1000, "cc-flush: CcFlushCache do arquivo inteiro grava o resto");
+    // Falha de escrita: status no IoStatus e a página continua suja.
+    let _ = copy::copy_write_at(f.file, 0x4000, 0x10, true, data);
+    fixture::FAIL_WRITES.store(true, Ordering::SeqCst);
+    let _ = call_export("CcFlushCache", &[f.pointers, 0, 0, iosb]);
+    let failed = status_block.status.get() as u32 == fixture::WRITE_FAILURE && dirty() == 1;
+    fixture::FAIL_WRITES.store(false, Ordering::SeqCst);
+    let _ = call_export("CcFlushCache", &[f.pointers, 0, 0, iosb]);
+    assert(failed && status_block.status.get() == 0 && dirty() == 0 && fixture::disk_byte(0x4000) == Some(0xC3), "cc-flush: falha de escrita mantem a pagina suja ate o proximo flush");
+    // Purge: recusado com vista mapeada, aceito sem; depois os dados precisam de I/O.
+    file_offset.set(0x1000);
+    let _ = pin::map_data(f.file, offset, 0x10, 1, bcb, buffer);
+    let refused = call_export("CcPurgeCacheSection", &[f.pointers, 0, 0, 0]);
+    let _ = call_export("CcUnpinData", &[mapped_bcb.get()]);
+    let accepted = call_export("CcPurgeCacheSection", &[f.pointers, 0, 0, 0]);
+    let cold = copy::copy_read_at(f.file, 0x1000, 0x10, false, block + 0x40, 0);
+    assert(refused == Some(0) && accepted == Some(1) && matches!(cold, Ok(false)), "cc-flush: CcPurgeCacheSection recusa vista ativa e descarta o cache");
+    // CcCoherencyFlushAndPurgeCache: grava e purga; com vista ativa, STATUS_CACHE_PAGE_LOCKED.
+    let _ = copy::copy_write_at(f.file, 0x6000, 0x1000, true, data);
+    let _ = call_export("CcCoherencyFlushAndPurgeCache", &[f.pointers, 0, 0, iosb, 0]);
+    let coherent = status_block.status.get() == 0 && dirty() == 0 && fixture::disk_byte(0x6800) == Some(0xC3);
+    file_offset.set(0x7000);
+    let _ = pin::map_data(f.file, offset, 0x10, 1, bcb, buffer);
+    let _ = call_export("CcCoherencyFlushAndPurgeCache", &[f.pointers, 0, 0, iosb, 0]);
+    let locked = status_block.status.get() == 0x115;
+    let _ = call_export("CcUnpinData", &[mapped_bcb.get()]);
+    assert(coherent && locked, "cc-flush: CcCoherencyFlushAndPurgeCache grava, purga e acusa pagina travada");
+    // CcZeroData pelo cache: página parcial lida e zerada no intervalo.
+    let (start_offset, end_offset) = (&at::<nt::LargeInteger>(start).quad_part, &at::<nt::LargeInteger>(end).quad_part);
+    start_offset.set(0x3010);
+    end_offset.set(0x3020);
+    let zero_cold = call_export("CcZeroData", &[f.file, start, end, 0]);
+    let zeroed = call_export("CcZeroData", &[f.file, start, end, 1]);
+    let _ = call_export("CcFlushCache", &[f.pointers, 0, 0, iosb]);
+    let on_disk = (0x3010..0x3020u64).all(|at_offset| fixture::disk_byte(at_offset) == Some(0)) && fixture::disk_byte(0x300F) == Some(fixture::pattern(0x300F)) && fixture::disk_byte(0x3020) == Some(fixture::pattern(0x3020));
+    assert(zero_cold == Some(0) && zeroed == Some(1) && on_disk, "cc-flush: CcZeroData zera pelo cache (FALSE sem espera)");
+    assert(call_export("CcWaitForCurrentLazyWriterActivity", &[]) == Some(0), "cc-flush: CcWaitForCurrentLazyWriterActivity");
+    file_offset.set(0);
+    let views = cache_map::info(f.pointers).map_or(0, |info| info.views);
+    let unmapped = call_export("CcUnmapFileOffsetFromSystemCache", &[f.file, offset, 0x4_0000]);
+    assert(views != 0 && unmapped == Some(1) && cache_map::info(f.pointers).is_some_and(|info| info.views < views), "cc-flush: CcUnmapFileOffsetFromSystemCache retira as vistas ociosas");
+    let _ = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    // Sem cache map, CcZeroData grava zeros direto por paginação.
+    start_offset.set(0x4000);
+    end_offset.set(0x5000);
+    let before = writes();
+    let direct = call_export("CcZeroData", &[f.file, start, end, 1]);
+    assert(direct == Some(1) && writes() == before + 1 && (0x4000..0x5000u64).all(|at_offset| fixture::disk_byte(at_offset) == Some(0)) && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-flush: CcZeroData sem cache grava zeros por paginacao");
+    guest::free_bytes(block);
+    fixture::destroy(f);
+}
+
+
+fn cc_mdl_exports(assert: Assert) {
+    use crate::ntos::cc::cache_map;
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::Ordering;
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc-mdl: fixture");
+        return;
+    };
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 0, 0, 0]);
+    let block = guest::alloc_bytes(0x40);
+    let (offset, chain, iosb) = (block, block + 8, block + 0x10);
+    let file_offset = &at::<nt::LargeInteger>(offset).quad_part;
+    let chain_head = at::<nt::Field<u64>>(chain);
+    let status_block = at::<nt::IoStatusBlock>(iosb);
+    let file_bytes = |start: u64, length: u64| -> Vec<u8> { (0..length).map(|index| fixture::pattern(start + index)).collect() };
+    // CcMdlRead atravessando duas vistas: uma MDL por vista, encadeadas.
+    file_offset.set(0x3_F000);
+    chain_head.set(0);
+    let _ = call_export("CcMdlRead", &[f.file, offset, 0x2000, chain, iosb]);
+    let first_address = chain_head.get();
+    let second_address = if first_address != 0 { at::<nt::Mdl>(first_address).next.get() } else { 0 };
+    if first_address == 0 || second_address == 0 {
+        assert(false, "cc-mdl: CcMdlRead devolve duas MDLs");
+        fixture::destroy(f);
+        return;
+    }
+    let (first, second) = (at::<nt::Mdl>(first_address), at::<nt::Mdl>(second_address));
+    let shape = second.next.get() == 0 && first.byte_count.get() == 0x1000 && second.byte_count.get() == 0x1000 && first.mdl_flags.get() & 6 == 6;
+    let contents = guest::read_bytes(first.mapped_system_va.get(), 0x1000) == file_bytes(0x3_F000, 0x1000) && guest::read_bytes(second.mapped_system_va.get(), 0x1000) == file_bytes(0x4_0000, 0x1000);
+    assert(shape && contents && status_block.status.get() == 0 && status_block.information.get() == 0x2000, "cc-mdl: CcMdlRead devolve a cadeia de MDLs das vistas com os dados");
+    let _ = call_export("CcMdlReadComplete", &[f.file, first_address]);
+    let purged = crate::ntos::cc::flush::purge_cache_section(f.pointers, 0, 0, 0);
+    assert(matches!(purged, Ok(true)), "cc-mdl: CcMdlReadComplete solta as vistas (purge aceito)");
+    // CcPrepareMdlWrite de página inteira: sem leitura; CcMdlWriteComplete suja.
+    let reads = fixture::READS.load(Ordering::SeqCst);
+    file_offset.set(0x6000);
+    chain_head.set(0);
+    let _ = call_export("CcPrepareMdlWrite", &[f.file, offset, 0x1000, chain, iosb]);
+    let write_mdl = chain_head.get();
+    if write_mdl != 0 {
+        guest::write_bytes(at::<nt::Mdl>(write_mdl).mapped_system_va.get(), &[0x3Cu8; 0x1000]);
+    }
+    let _ = call_export("CcMdlWriteComplete", &[f.file, offset, write_mdl]);
+    assert(write_mdl != 0 && fixture::READS.load(Ordering::SeqCst) == reads && status_block.information.get() == 0x1000 && cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 1), "cc-mdl: CcPrepareMdlWrite sem leitura e CcMdlWriteComplete suja a pagina");
+    // CcMdlWriteAbort não suja.
+    file_offset.set(0x8000);
+    chain_head.set(0);
+    let _ = call_export("CcPrepareMdlWrite", &[f.file, offset, 0x1000, chain, iosb]);
+    let _ = call_export("CcMdlWriteAbort", &[f.file, chain_head.get()]);
+    assert(cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 1), "cc-mdl: CcMdlWriteAbort descarta sem sujar");
+    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    assert(deleted == Some(1) && fixture::disk_byte(0x6000) == Some(0x3C) && fixture::disk_byte(0x6FFF) == Some(0x3C) && fixture::disk_byte(0x8000) == Some(fixture::pattern(0x8000)), "cc-mdl: a escrita por MDL vai ao disco");
+    guest::free_bytes(block);
+    fixture::destroy(f);
+}
+
+
+fn cc_log_exports(assert: Assert) {
+    use crate::ntos::cc::{cache_map, pin};
+    use crate::ntos::inc::types::extra_cc::SharedCacheMap;
+    use crate::ntos::test::cc_fixture as fixture;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static FLUSHED_LSN: AtomicU64 = AtomicU64::new(0);
+    static DIRTY_SEEN: AtomicU64 = AtomicU64::new(0);
+    extern "win64" fn flush_to_lsn(handle: u64, lsn: u64) {
+        FLUSHED_LSN.store(if handle == 0x1234 { lsn } else { u64::MAX }, Ordering::SeqCst);
+    }
+    extern "win64" fn dirty_page(file: u64, offset: u64, length: u32, oldest: u64, newest: u64, context1: u64, context2: u64) {
+        let ok = file != 0 && context1 == 0xC1 && context2 == 0xC2 && length == 0x80;
+        // SAFETY: o Cc passa ponteiros para dentro do BCB sujo (LARGE_INTEGERs vivos).
+        let value = |address: u64| unsafe { nt::LargeInteger::at(address) }.quad_part.get() as u64;
+        DIRTY_SEEN.store(if ok { value(offset) ^ (value(oldest) << 32) ^ (value(newest) << 48) } else { u64::MAX }, Ordering::SeqCst);
+    }
+    let address = |routine: u64| crate::ntos::mm::kernel_address::virtual_address(routine).unwrap_or(routine);
+    let Some(f) = fixture::create(0x5_0000) else {
+        assert(false, "cc-log: fixture");
+        return;
+    };
+    // Um VPB falso que aponta para o próprio dispositivo (Vpb->DeviceObject).
+    let vpb = guest::alloc_bytes(nt::Vpb::SIZE);
+    at::<nt::Vpb>(vpb).device_object.set(f.device);
+    let file = at::<nt::FileObject>(f.file);
+    file.vpb.set(vpb);
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 1, 0, 0]);
+    let map_address = at::<nt::SectionObjectPointers>(f.pointers).shared_cache_map.get();
+    if map_address == 0 {
+        assert(false, "cc-log: cache map inicializado");
+        file.vpb.set(0);
+        fixture::destroy(f);
+        return;
+    }
+    let map = at::<SharedCacheMap>(map_address);
+    let flush_routine = address(flush_to_lsn as extern "win64" fn(u64, u64) as usize as u64);
+    let _ = call_export("CcSetLogHandleForFileEx", &[f.file, 0x1234, flush_routine, 0, 0]);
+    assert(map.flags.get() & (1 << 24) != 0 && map.v1.log_handle.get() == 0x1234 && map.v1.flush_to_lsn_routine.get() == flush_routine, "cc-log: CcSetLogHandleForFileEx marca o fluxo com log");
+    // Um BCB sujo com LSN 0x50.
+    let block = guest::alloc_bytes(0x40);
+    let (offset, bcb, buffer, lsn, iosb, count) = (block, block + 8, block + 0x10, block + 0x18, block + 0x20, block + 0x30);
+    at::<nt::LargeInteger>(offset).quad_part.set(0x1100);
+    at::<nt::LargeInteger>(lsn).quad_part.set(0x50);
+    let pinned = pin::pin_read(f.file, offset, 0x80, 1, bcb, buffer).is_ok_and(|done| done);
+    let pinned_bcb = at::<nt::Field<u64>>(bcb).get();
+    let _ = call_export("CcSetDirtyPinnedData", &[pinned_bcb, lsn]);
+    let _ = call_export("CcUnpinData", &[pinned_bcb]);
+    DIRTY_SEEN.store(0, Ordering::SeqCst);
+    let routine = address(dirty_page as extern "win64" fn(u64, u64, u32, u64, u64, u64, u64) as usize as u64);
+    let oldest = call_export("CcGetDirtyPages", &[0x1234, routine, 0xC1, 0xC2]);
+    assert(pinned && oldest == Some(0x50) && DIRTY_SEEN.load(Ordering::SeqCst) == (0x1100 ^ (0x50 << 32) ^ (0x50 << 48)), "cc-log: CcGetDirtyPages entrega o BCB sujo e devolve o menor OldestLsn");
+    let pages = at::<nt::Field<u32>>(count);
+    pages.set(0);
+    assert(call_export("CcIsThereDirtyLoggedPages", &[f.device, count]) == Some(1) && pages.get() == 1 && call_export("CcGetCachedDirtyPageCountForFile", &[f.pointers]) == Some(1), "cc-log: paginas sujas com log do volume e do arquivo");
+    assert(call_export("CcIsThereDirtyData", &[vpb]) == Some(1), "cc-log: CcIsThereDirtyData ve o arquivo sujo do volume");
+    file.flags.atomic().fetch_or(0x8000, Ordering::SeqCst);
+    let temporary = call_export("CcIsThereDirtyData", &[vpb]);
+    file.flags.atomic().fetch_and(!0x8000, Ordering::SeqCst);
+    assert(temporary == Some(0), "cc-log: CcIsThereDirtyData ignora FO_TEMPORARY_FILE");
+    // CcFlushCacheToLsn: abaixo do OldestLsn nada; acima, o log é gravado antes da página.
+    FLUSHED_LSN.store(0, Ordering::SeqCst);
+    let _ = call_export("CcFlushCacheToLsn", &[f.pointers, 0x40, iosb]);
+    let skipped = fixture::WRITES.load(Ordering::SeqCst) == 0 && FLUSHED_LSN.load(Ordering::SeqCst) == 0;
+    let _ = call_export("CcFlushCacheToLsn", &[f.pointers, 0x60, iosb]);
+    let status_block = at::<nt::IoStatusBlock>(iosb);
+    assert(skipped && FLUSHED_LSN.load(Ordering::SeqCst) == 0x50 && fixture::WRITES.load(Ordering::SeqCst) == 1 && status_block.status.get() == 0 && cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 0 && info.bcbs == 0), "cc-log: CcFlushCacheToLsn grava as paginas logadas depois do FlushToLsnRoutine");
+    assert(call_export("CcIsThereDirtyLoggedPages", &[f.device, count]) == Some(0) && call_export("CcGetDirtyPages", &[0x1234, routine, 0xC1, 0xC2]) == Some(0), "cc-log: sem paginas sujas depois do flush");
+    let _ = call_export("CcSetLoggedDataThreshold", &[0x1234, 16]);
+    assert(call_export("CcErrorCallbackRoutine", &[block]) == Some(0) && call_export("CcIsCacheManagerCallbackNeeded", &[0xC000_A008]) == Some(1) && call_export("CcIsCacheManagerCallbackNeeded", &[0]) == Some(0), "cc-log: CcErrorCallbackRoutine e CcIsCacheManagerCallbackNeeded");
+    let _ = call_export("CcSetLogHandleForFileEx", &[f.file, 0, 0, 0, 0]);
+    assert(map.flags.get() & (1 << 24) == 0 && map.v1.log_handle.get() == 0, "cc-log: LogHandle NULL desliga o log");
+    let _ = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let empty = guest::alloc_bytes(nt::SectionObjectPointers::SIZE);
+    assert(call_export("CcGetCachedDirtyPageCountForFile", &[empty]) == Some(0xFFFF_FFFF), "cc-log: sem cache map, 0xFFFFFFFF paginas");
+    file.vpb.set(0);
+    guest::free_bytes(empty);
+    guest::free_bytes(block);
+    guest::free_bytes(vpb);
+    fixture::destroy(f);
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -5900,6 +6348,12 @@ pub fn run(assert: Assert) {
     rtl_crt_wide_exports(assert);
     io_top_level_irp_exports(assert);
     se_access_from_state_exports(assert);
+    cc_cache_map_exports(assert);
+    cc_copy_exports(assert);
+    cc_pin_exports(assert);
+    cc_flush_exports(assert);
+    cc_mdl_exports(assert);
+    cc_log_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 
