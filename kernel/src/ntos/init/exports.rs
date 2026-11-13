@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 204] {
+fn groups() -> [&'static Group; 214] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -259,6 +259,16 @@ fn groups() -> [&'static Group; 204] {
         &crate::ntos::cc::exports::cc_flush::GROUP,
         &crate::ntos::cc::exports::cc_mdl::GROUP,
         &crate::ntos::cc::exports::cc_log::GROUP,
+        &crate::ntos::ps::exports::ps_win32_callouts::GROUP,
+        &crate::ntos::ps::exports::ps_process_info::GROUP,
+        &crate::ntos::ps::exports::ps_job_info::GROUP,
+        &crate::ntos::ps::exports::ps_priority::GROUP,
+        &crate::ntos::ps::exports::ps_impersonation::GROUP,
+        &crate::ntos::se::exports::se_client_security::GROUP,
+        &crate::ntos::se::exports::se_access_state::GROUP,
+        &crate::ntos::se::exports::se_appcontainer::GROUP,
+        &crate::ntos::alpc::exports::alpc_message_attributes::GROUP,
+        &crate::ntos::ob::exports::ob_security_cache::GROUP,
     ]
 }
 
@@ -399,6 +409,7 @@ pub fn init() {
     crate::ntos::ps::user::io_completion::init();
     crate::ntos::ps::user::threads::init();
     crate::ntos::ps::user::user_apc::init();
+    crate::ntos::ps::win32::init();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();
     crate::ntos::ps::user::syscalls_core::init();

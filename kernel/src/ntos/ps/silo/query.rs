@@ -119,3 +119,21 @@ pub fn get_job_server_silo(job: u64, output: u64) -> u32 {
 pub fn is_prefetching() -> bool {
     ethread(process::get_current_thread()).prefetching() != 0
 }
+
+// ---- ps-process-info: sessão de serviço do silo (ntoskrnl 19041) -----------
+
+/// PsGetServerSiloServiceSessionId (0x32d5c0): SILO_USER_SHARED_DATA.
+/// ServiceSessionId do silo (ESERVERSILO_GLOBALS.UserSharedData). O host
+/// (NULL) usa PspHostSiloGlobals, cujo SILO_USER_SHARED_DATA o
+/// PspInitializeSiloStructures zera (só +0x18 recebe -1): a sessão de serviço
+/// do host é 0, a mesma que PsIsServiceSession(0) aceita sem consulta.
+pub fn service_session_id(silo: u64) -> u32 {
+    use crate::ntos::inc::types::{EserversiloGlobals, SiloUserSharedData};
+    if silo == HOST_SILO {
+        return 0;
+    }
+    // SAFETY: um silo de servidor tem ESERVERSILO_GLOBALS e o seu
+    // SILO_USER_SHARED_DATA vivos enquanto o job vive.
+    let globals = unsafe { EserversiloGlobals::at(ejob(silo).server_silo_globals.get()) };
+    unsafe { SiloUserSharedData::at(globals.user_shared_data.get()) }.service_session_id.get()
+}

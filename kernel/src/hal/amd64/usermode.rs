@@ -782,7 +782,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     let mut result: u64 = 0;
     let mut stack_count = 0u64;
     let number = unsafe { *frame };
-    let mut target = service_lookup(number, crate::ntos::ps::win32_callouts::is_gui_thread() as u64, &mut stack_count);
+    let mut target = service_lookup(number, crate::ntos::ps::win32::is_gui_thread() as u64, &mut stack_count);
     if target == 0 {
         match crate::ntos::ex::service_table::out_of_range(number as u32).unwrap_or(Err(STATUS_INVALID_SYSTEM_SERVICE)) {
             Ok((routine, arguments)) => (target, stack_count) = (routine, u64::from(arguments)),

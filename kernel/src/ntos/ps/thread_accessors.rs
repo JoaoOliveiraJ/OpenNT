@@ -120,3 +120,13 @@ pub fn is_impersonating(thread: u64) -> bool {
 pub fn is_executing_dpc() -> u32 {
     pcr::get_dpc_request_summary() & 0x10001
 }
+
+// ---- ps-priority: contagem de congelamento (ntoskrnl 19041) ----------------
+
+/// PsGetThreadFreezeCount (0x325ee0): KPROCESS.DeepFreeze do processo dono da
+/// thread (KTHREAD.Process) somado ao KPROCESS.FreezeCount.
+pub fn freeze_count(thread: u64) -> u32 {
+    // SAFETY: KTHREAD.Process aponta para o KPROCESS (início do EPROCESS) dono.
+    let owner = unsafe { crate::ntos::inc::types::Kprocess::at(ethread(thread).tcb.process.get()) };
+    owner.deep_freeze().wrapping_add(owner.freeze_count.get())
+}

@@ -1076,3 +1076,237 @@ pub mod ps_property_sets {
         data_exports: &[],
     };
 }
+
+pub mod ps_win32_callouts {
+    //! Suporte Ps ao Win32k (win32k/win32kbase/win32kfull, dxgkrnl) — lógica
+    //! em `ps/win32.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::{Eprocess, Ethread};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::win32;
+    use crate::rtl::KernelError;
+
+    fn process(call: &Call, index: usize) -> &'static Eprocess {
+        // SAFETY: PEPROCESS do chamador, como no NT.
+        unsafe { Eprocess::at(call.arg(index)) }
+    }
+
+    /// PsEstablishWin32Callouts(CalloutDispatch): BOOLEAN da troca em AL.
+    fn establish_win32_callouts(call: &Call) -> Result<u64, KernelError> {
+        Ok(win32::establish_callouts(call.arg(1)) as u64)
+    }
+
+    /// PsSetProcessWin32Process(Process, Win32Process, PrevWin32Process).
+    fn set_process_win32_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(win32::set_process_win32_process(process(call, 1), call.arg(2), call.arg(3))?))
+    }
+
+    /// PsSetThreadWin32Thread(Thread, Win32Thread, PrevWin32Thread).
+    fn set_thread_win32_thread(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PETHREAD do chamador.
+        Ok(win32::set_thread_win32_thread(unsafe { Ethread::at(call.arg(1)) }, call.arg(2), call.arg(3)))
+    }
+
+    fn set_process_window_station(call: &Call) -> Result<u64, KernelError> {
+        win32::set_process_window_station(process(call, 1), call.arg(2));
+        Ok(0)
+    }
+
+    fn set_process_dxg_process(call: &Call) -> Result<u64, KernelError> {
+        win32::set_process_dxg_process(process(call, 1), call.arg(2));
+        Ok(0)
+    }
+
+    /// PsGetCurrentThreadWin32ThreadAndEnterCriticalRegion(ProcessId*).
+    fn get_current_thread_win32_thread_and_enter_critical_region(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PHANDLE de saída do chamador (modo kernel).
+        win32::current_win32_thread_and_enter_critical_region(unsafe { Field::<u64>::at(call.arg(1)) })
+    }
+
+    fn is_win32k_filter_enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(win32::current_filter_enabled() as u64)
+    }
+
+    fn is_win32k_filter_audit_enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(win32::current_filter_audit_enabled() as u64)
+    }
+
+    fn is_win32k_filter_enabled_for_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(win32::filter_enabled(process(call, 1)) as u64)
+    }
+
+    fn is_win32k_filter_audit_enabled_for_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(win32::filter_audit_enabled(process(call, 1)) as u64)
+    }
+
+    fn get_win32k_filter_set(_: &Call) -> Result<u64, KernelError> {
+        Ok(win32::current_filter_set() as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-win32-callouts",
+        names: &[
+            "PsEstablishWin32Callouts",
+            "PsSetProcessWin32Process",
+            "PsSetThreadWin32Thread",
+            "PsSetProcessWindowStation",
+            "PsSetProcessDxgProcess",
+            "PsGetCurrentThreadWin32ThreadAndEnterCriticalRegion",
+            "PsIsWin32KFilterEnabled",
+            "PsIsWin32KFilterAuditEnabled",
+            "PsIsWin32KFilterEnabledForProcess",
+            "PsIsWin32KFilterAuditEnabledForProcess",
+            "PsGetWin32KFilterSet",
+        ],
+        handlers: &[
+            establish_win32_callouts,
+            set_process_win32_process,
+            set_thread_win32_thread,
+            set_process_window_station,
+            set_process_dxg_process,
+            get_current_thread_win32_thread_and_enter_critical_region,
+            is_win32k_filter_enabled,
+            is_win32k_filter_audit_enabled,
+            is_win32k_filter_enabled_for_process,
+            is_win32k_filter_audit_enabled_for_process,
+            get_win32k_filter_set,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod ps_process_info {
+    //! Consultas de EPROCESS/silo do win32k, win32kbase, tcpip e dxgkrnl —
+    //! lógica em `ps/process_accessors.rs` e `ps/silo/query.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::process_accessors;
+    use crate::ntos::ps::silo::query as silo_query;
+    use crate::rtl::KernelError;
+
+    fn wow64_get_process_machine(call: &Call) -> Result<u64, KernelError> {
+        Ok(process_accessors::wow64_machine(call.arg(1)) as u64)
+    }
+
+    fn get_process_start_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(process_accessors::start_key(call.arg(1)))
+    }
+
+    fn get_server_silo_service_session_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(silo_query::service_session_id(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-process-info",
+        names: &["PsWow64GetProcessMachine", "PsGetProcessStartKey", "PsGetServerSiloServiceSessionId"],
+        handlers: &[wow64_get_process_machine, get_process_start_key, get_server_silo_service_session_id],
+        data_exports: &[],
+    };
+}
+
+pub mod ps_job_info {
+    //! Acessores de EJOB do win32kbase/win32kfull e do ndis — lógica em
+    //! `ps/job.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::{Ejob, Eprocess};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::job;
+    use crate::rtl::KernelError;
+
+    fn job_at(call: &Call) -> &'static Ejob {
+        // SAFETY: PEJOB do chamador, como no NT.
+        unsafe { Ejob::at(call.arg(1)) }
+    }
+
+    fn get_job_lock(call: &Call) -> Result<u64, KernelError> {
+        Ok(job::lock(job_at(call)))
+    }
+
+    fn get_job_ui_restrictions_class(call: &Call) -> Result<u64, KernelError> {
+        Ok(job::ui_restrictions_class(job_at(call)) as u64)
+    }
+
+    fn get_job_session_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(job::session_id(job_at(call)) as u64)
+    }
+
+    /// PsGetProcessCommonJob(Process1, Process2).
+    fn get_process_common_job(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os dois PEPROCESS do chamador.
+        Ok(job::process_common_job(unsafe { Eprocess::at(call.arg(1)) }, unsafe { Eprocess::at(call.arg(2)) }))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-job-info",
+        names: &["PsGetJobLock", "PsGetJobUIRestrictionsClass", "PsGetJobSessionId", "PsGetProcessCommonJob"],
+        handlers: &[get_job_lock, get_job_ui_restrictions_class, get_job_session_id, get_process_common_job],
+        data_exports: &[],
+    };
+}
+
+pub mod ps_priority {
+    //! Estado de prioridade e congelamento do win32kfull — lógica em
+    //! `ps/thread_accessors.rs` e `ps/process_accessors.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::{process_accessors, thread_accessors};
+    use crate::rtl::KernelError;
+
+    fn get_thread_freeze_count(call: &Call) -> Result<u64, KernelError> {
+        Ok(thread_accessors::freeze_count(call.arg(1)) as u64)
+    }
+
+    fn set_process_priority_class(call: &Call) -> Result<u64, KernelError> {
+        process_accessors::set_priority_class(call.arg(1), call.arg(2) as u8);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-priority",
+        names: &["PsGetThreadFreezeCount", "PsSetProcessPriorityClass"],
+        handlers: &[get_thread_freeze_count, set_process_priority_class],
+        data_exports: &[],
+    };
+}
+
+pub mod ps_impersonation {
+    //! Impersonação de thread (ndis, win32kbase/win32kfull e ~20 drivers de
+    //! FS/rede) — lógica em `ps/security.rs`, política em
+    //! `se/token/impersonation.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::security;
+    use crate::rtl::KernelError;
+
+    /// PsReferenceImpersonationToken(Thread, CopyOnOpen*, EffectiveOnly*, Level*).
+    fn reference_impersonation_token(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PBOOLEAN/PBOOLEAN/PSECURITY_IMPERSONATION_LEVEL de saída do
+        // chamador (modo kernel).
+        let (copy_on_open, effective_only, level) = unsafe { (Field::<u8>::at(call.arg(2)), Field::<u8>::at(call.arg(3)), Field::<u32>::at(call.arg(4))) };
+        security::reference_impersonation_token(call.arg(1), copy_on_open, effective_only, level)
+    }
+
+    fn dereference_impersonation_token(call: &Call) -> Result<u64, KernelError> {
+        security::dereference_impersonation_token(call.arg(1))?;
+        Ok(0)
+    }
+
+    /// PsImpersonateClient(Thread, Token, CopyOnOpen, EffectiveOnly, Level).
+    fn impersonate_client(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::impersonate_client(call.arg(1), call.arg(2), call.arg(3) as u8 != 0, call.arg(4) as u8 != 0, call.arg(5) as u32)?))
+    }
+
+    fn revert_to_self(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::revert_to_self()?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-impersonation",
+        names: &["PsReferenceImpersonationToken", "PsDereferenceImpersonationToken", "PsImpersonateClient", "PsRevertToSelf"],
+        handlers: &[reference_impersonation_token, dereference_impersonation_token, impersonate_client, revert_to_self],
+        data_exports: &[],
+    };
+}

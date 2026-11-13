@@ -329,3 +329,39 @@ pub mod ob_object_lifecycle {
 }
 
 // =============================================================================
+
+pub mod ob_security_cache {
+    //! Cache de descritores de segurança do Ob (tcpip) — lógica em
+    //! `ob/object_security.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::object_security;
+    use crate::rtl::KernelError;
+
+    /// ObLogSecurityDescriptor(InputSD, OutputSD*, RefBias).
+    fn log_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PSECURITY_DESCRIPTOR* de saída do chamador (modo kernel).
+        let output = unsafe { Field::<u64>::at(call.arg(2)) };
+        Ok(signed_status(object_security::log_security_descriptor(call.arg(1), output, call.arg(3) as u32)?))
+    }
+
+    /// ObReferenceSecurityDescriptor(SD, Count).
+    fn reference_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        object_security::reference_security_descriptor(call.arg(1), call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    /// ObDereferenceSecurityDescriptor(SD, Count).
+    fn dereference_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        object_security::dereference_security_descriptor(call.arg(1), call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ob-security-cache",
+        names: &["ObLogSecurityDescriptor", "ObReferenceSecurityDescriptor", "ObDereferenceSecurityDescriptor"],
+        handlers: &[log_security_descriptor, reference_security_descriptor, dereference_security_descriptor],
+        data_exports: &[],
+    };
+}

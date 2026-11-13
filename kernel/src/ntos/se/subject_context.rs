@@ -97,3 +97,31 @@ pub fn unlock() {
         lock.locked = false;
     }
 }
+
+/// SeCaptureSubjectContextEx(Thread, Process, SubjectContext) (ntoskrnl 19041,
+/// 0x6d0a20): ProcessAuditId do processo dado, o token de impersonação
+/// referenciado (e o nível) quando a thread tem ActiveImpersonationInfo, e o
+/// primário do processo referenciado. Sem impersonação o NT não escreve
+/// ImpersonationLevel (os chamadores internos zeram o contexto antes);
+/// Thread NULL captura só o processo.
+pub fn capture_ex(thread: u64, process: u64, subject: &SecuritySubjectContext) -> Result<(), KernelError> {
+    // SAFETY: PEPROCESS do chamador, vivo durante a captura.
+    let owner = unsafe { crate::ntos::inc::types::Eprocess::at(process) };
+    subject.process_audit_id.set(owner.unique_process_id.get());
+    let impersonation = if thread != 0 { thread_tokens::get(thread) } else { None };
+    let client = match impersonation {
+        Some(state) => {
+            reference_token(state.token)?;
+            subject.impersonation_level.set(SecurityImpersonationLevel((state.level & 3) as i32));
+            state.token
+        }
+        None => 0,
+    };
+    subject.client_token.set(client);
+    let primary = process::get_primary_token(process).unwrap_or(0);
+    if primary != 0 {
+        reference_token(primary)?;
+    }
+    subject.primary_token.set(primary);
+    Ok(())
+}

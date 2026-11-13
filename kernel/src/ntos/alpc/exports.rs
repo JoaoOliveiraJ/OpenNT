@@ -116,3 +116,35 @@ pub static GROUP: Group = Group {
     handlers: &[send_wait_receive_port, delete_port_section, delete_section_view, query_information_message, set_information, query_information, create_port_section, create_section_view, disconnect_port, connect_port, connect_port_ex, create_security_context, delete_security_context, cancel, create_resource_reserve],
     data_exports: &[],
 };
+
+pub mod alpc_message_attributes {
+    //! Buffers ALPC_MESSAGE_ATTRIBUTES do chamador (win32kbase) — lógica em
+    //! `alpc/message/attributes.rs`.
+
+    use crate::ntos::alpc::message::attributes;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::AlpcMessageAttributes;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// AlpcInitializeMessageAttribute(AttributeFlags, Buffer, BufferSize, RequiredBufferSize*).
+    fn initialize_message_attribute(call: &Call) -> Result<u64, KernelError> {
+        let buffer = call.arg(2);
+        // SAFETY: buffer opcional e PSIZE_T de saída do chamador (modo kernel).
+        let (buffer, required) = unsafe { ((buffer != 0).then(|| AlpcMessageAttributes::at(buffer)), Field::<u64>::at(call.arg(4))) };
+        Ok(signed_status(attributes::initialize(call.arg(1) as u32, buffer, call.arg(3), required)))
+    }
+
+    /// AlpcGetMessageAttribute(Buffer, AttributeFlag).
+    fn get_message_attribute(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PALPC_MESSAGE_ATTRIBUTES do chamador.
+        Ok(attributes::get(unsafe { AlpcMessageAttributes::at(call.arg(1)) }, call.arg(2) as u32))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "alpc-message-attributes",
+        names: &["AlpcInitializeMessageAttribute", "AlpcGetMessageAttribute"],
+        handlers: &[initialize_message_attribute, get_message_attribute],
+        data_exports: &[],
+    };
+}

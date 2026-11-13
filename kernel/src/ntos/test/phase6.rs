@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1202 && abi_names::GROUP_LAYOUT.len() == 204 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1202 exports em 204 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1240 && abi_names::GROUP_LAYOUT.len() == 214 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1240 exports em 214 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1202 && exports::export_names().len() == 1202, "ntoskrnl: 204 grupos com os 1202 exports implementados");
+    assert(exports::implemented() == 1240 && exports::export_names().len() == 1240, "ntoskrnl: 214 grupos com os 1240 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -6247,6 +6247,451 @@ fn cc_log_exports(assert: Assert) {
 }
 
 
+fn ps_win32_callouts_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_obpsse::{Win32ProcessCalloutParameters, Win32ThreadCalloutParameters};
+    use crate::ntos::ps::{process, win32};
+
+    // PsSetProcessWin32Process sobre um EPROCESS sintético (ProcessLock livre).
+    let process_block = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let eprocess = at::<nt::Eprocess>(process_block);
+    assert(call_export("PsSetProcessWin32Process", &[process_block, 0xFFFF_9000_0000_1000, 0]) == Some(0) && eprocess.win32_process.get() == 0xFFFF_9000_0000_1000, "ps-win32: PsSetProcessWin32Process publica no campo vazio");
+    assert(call_export("PsSetProcessWin32Process", &[process_block, 0xFFFF_9000_0000_2000, 0]) == Some(0xFFFF_FFFF_C000_010A) && eprocess.win32_process.get() == 0xFFFF_9000_0000_1000, "ps-win32: segundo Win32Process recusado (PROCESS_IS_TERMINATING)");
+    assert(call_export("PsSetProcessWin32Process", &[process_block, 0, 0xFFFF_9000_0000_2000]) == Some(0xFFFF_FFFF_C000_0001) && eprocess.win32_process.get() == 0xFFFF_9000_0000_1000, "ps-win32: limpar com anterior errado devolve UNSUCCESSFUL");
+    assert(call_export("PsSetProcessWin32Process", &[process_block, 0, 0xFFFF_9000_0000_1000]) == Some(0) && eprocess.win32_process.get() == 0, "ps-win32: limpar com o anterior certo");
+    eprocess.flags.set(nt::Eprocess::PROCESS_DELETE_MASK);
+    assert(call_export("PsSetProcessWin32Process", &[process_block, 0xFFFF_9000_0000_3000, 0]) == Some(0xFFFF_FFFF_C000_010A) && eprocess.win32_process.get() == 0, "ps-win32: processo em exclusao recusa Win32Process");
+    assert(eprocess.process_lock.value.get() == 0, "ps-win32: ProcessLock liberado");
+
+    // Window station e DxgProcess: os getters existentes leem os mesmos campos.
+    call_export("PsSetProcessWindowStation", &[process_block, 0xFFFF_9000_0000_4440]);
+    call_export("PsSetProcessDxgProcess", &[process_block, 0xFFFF_9000_0000_5550]);
+    assert(eprocess.win32_window_station.get() == 0xFFFF_9000_0000_4440 && eprocess.dxg_process.get() == 0xFFFF_9000_0000_5550, "ps-win32: WindowStation e DxgProcess gravados");
+    assert(call_export("PsGetProcessWin32WindowStation", &[process_block]) == Some(0xFFFF_9000_0000_4440) && call_export("PsGetProcessDxgProcess", &[process_block]) == Some(0xFFFF_9000_0000_5550), "ps-win32: getters existentes leem o mesmo campo");
+
+    // Filtros Win32k por processo: EnableFilteredWin32kAPIs e AuditFilteredWin32kAPIs.
+    let mitigation = &eprocess.mitigation_flags_values.bitfield_0;
+    mitigation.set(nt::EprocessMitigationFlagsValues::ENABLE_FILTERED_WIN32K_AP_IS_MASK);
+    assert(call_export("PsIsWin32KFilterEnabledForProcess", &[process_block]) == Some(1) && call_export("PsIsWin32KFilterAuditEnabledForProcess", &[process_block]) == Some(0), "ps-win32: filtro habilitado sem auditoria");
+    mitigation.set(nt::EprocessMitigationFlagsValues::AUDIT_FILTERED_WIN32K_AP_IS_MASK);
+    assert(call_export("PsIsWin32KFilterEnabledForProcess", &[process_block]) == Some(0) && call_export("PsIsWin32KFilterAuditEnabledForProcess", &[process_block]) == Some(1), "ps-win32: auditoria sem filtro");
+
+    // Variantes do processo corrente: os mesmos campos do ApcState.Process.
+    let current = at::<nt::Eprocess>(process::get_current_process());
+    assert(
+        call_export("PsGetWin32KFilterSet", &[]) == Some(current.win32_k_filter_set.get() as u64)
+            && call_export("PsIsWin32KFilterEnabled", &[]) == Some(current.mitigation_flags_values.enable_filtered_win32k_ap_is() as u64)
+            && call_export("PsIsWin32KFilterAuditEnabled", &[]) == Some(current.mitigation_flags_values.audit_filtered_win32k_ap_is() as u64),
+        "ps-win32: filtros do processo corrente",
+    );
+
+    // PsSetThreadWin32Thread: xchg ao publicar, cmpxchg ao limpar.
+    let thread_block = guest::alloc_bytes(nt::Ethread::SIZE);
+    let ethread = at::<nt::Ethread>(thread_block);
+    assert(call_export("PsSetThreadWin32Thread", &[thread_block, 0xFFFF_9000_0000_A000, 0]) == Some(0) && ethread.tcb.win32_thread.get() == 0xFFFF_9000_0000_A000, "ps-win32: Win32Thread publicado");
+    assert(call_export("PsSetThreadWin32Thread", &[thread_block, 0, 0xFFFF_9000_0000_B000]) == Some(0xFFFF_9000_0000_A000) && ethread.tcb.win32_thread.get() == 0xFFFF_9000_0000_A000, "ps-win32: limpar com anterior errado preserva o campo");
+    assert(call_export("PsSetThreadWin32Thread", &[thread_block, 0, 0xFFFF_9000_0000_A000]) == Some(0xFFFF_9000_0000_A000) && ethread.tcb.win32_thread.get() == 0, "ps-win32: limpar com o anterior certo");
+
+    // Win32Thread da thread corrente + região crítica, desfeita pelo KeLeaveCriticalRegion.
+    let current_thread = at::<nt::Ethread>(process::get_current_thread());
+    let before = current_thread.tcb.kernel_apc_disable.get();
+    let pid = guest::alloc_bytes(8);
+    let win32_thread = call_export("PsGetCurrentThreadWin32ThreadAndEnterCriticalRegion", &[pid]);
+    let inside = current_thread.tcb.kernel_apc_disable.get();
+    call_export("KeLeaveCriticalRegion", &[]);
+    assert(
+        win32_thread == Some(current_thread.tcb.win32_thread.get())
+            && at::<nt::Field<u64>>(pid).get() == current_thread.cid.unique_process.get()
+            && inside == before - 1
+            && current_thread.tcb.kernel_apc_disable.get() == before,
+        "ps-win32: Win32Thread corrente, PID e regiao critica",
+    );
+    guest::free_bytes(pid);
+
+    // Callouts de saída sem despachante (o registro é único por boot e fica
+    // para o win32k.sys real): sem Win32Thread/Win32Process nada é chamado;
+    // com eles e sem bloco, PsInvokeWin32Callout devolve INVALID_PARAMETER.
+    assert(Win32ThreadCalloutParameters::SIZE == 0x10 && Win32ProcessCalloutParameters::SIZE == 0x10, "ps-win32: parametros dos callouts com o layout do PspExitThread");
+    if win32::win32_callout().is_none() {
+        assert(win32::invoke_callout(win32::PS_W32_THREAD_CALLOUT, 0) == 0xC000_000D, "ps-win32: PsInvokeWin32Callout sem despachante");
+        ethread.tcb.win32_thread.set(0xFFFF_9000_0000_C000);
+        eprocess.win32_process.set(0xFFFF_9000_0000_D000);
+        win32::thread_exit_callout(thread_block);
+        win32::process_exit_callout(process_block);
+        assert(ethread.tcb.win32_thread.get() == 0xFFFF_9000_0000_C000 && eprocess.win32_process.get() == 0xFFFF_9000_0000_D000, "ps-win32: callouts de saida sem despachante nao tocam os objetos");
+    }
+    guest::free_bytes(thread_block);
+    guest::free_bytes(process_block);
+}
+
+
+fn ps_process_info_exports(assert: Assert) {
+    use crate::ntos::mm::shared_user_data::SHARED_USER_DATA_VA;
+
+    let process_block = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let eprocess = at::<nt::Eprocess>(process_block);
+    // Sem EWOW64PROCESS: AMD64 (0x8664).
+    assert(call_export("PsWow64GetProcessMachine", &[process_block]) == Some(0x8664), "ps-process-info: processo nativo devolve AMD64");
+    let wow64_block = guest::alloc_bytes(nt::Ewow64process::SIZE);
+    eprocess.wo_w64_process.set(wow64_block);
+    assert(call_export("PsWow64GetProcessMachine", &[process_block]) == Some(0x8664), "ps-process-info: Machine zero devolve AMD64");
+    at::<nt::Ewow64process>(wow64_block).machine.set(0x14C);
+    assert(call_export("PsWow64GetProcessMachine", &[process_block]) == Some(0x14C), "ps-process-info: EWOW64PROCESS.Machine i386");
+
+    // Start key: BootId do KUSER_SHARED_DATA nos 16 bits altos.
+    eprocess.sequence_number.set(0x77);
+    let boot_id = at::<nt::KuserSharedData>(SHARED_USER_DATA_VA).boot_id.get() as u64;
+    assert(call_export("PsGetProcessStartKey", &[process_block]) == Some((boot_id << 48) | 0x77), "ps-process-info: PsGetProcessStartKey");
+    guest::free_bytes(wow64_block);
+    guest::free_bytes(process_block);
+
+    // Sessão de serviço: host = 0; silo sintético lê SILO_USER_SHARED_DATA.
+    assert(call_export("PsGetServerSiloServiceSessionId", &[0]) == Some(0), "ps-process-info: sessao de servico do host");
+    let silo = guest::alloc_bytes(nt::Ejob::SIZE);
+    let globals = guest::alloc_bytes(nt::EserversiloGlobals::SIZE);
+    let shared = guest::alloc_bytes(nt::SiloUserSharedData::SIZE);
+    at::<nt::SiloUserSharedData>(shared).service_session_id.set(7);
+    at::<nt::EserversiloGlobals>(globals).user_shared_data.set(shared);
+    at::<nt::Ejob>(silo).server_silo_globals.set(globals);
+    assert(call_export("PsGetServerSiloServiceSessionId", &[silo]) == Some(7), "ps-process-info: ServiceSessionId do silo");
+    guest::free_bytes(shared);
+    guest::free_bytes(globals);
+    guest::free_bytes(silo);
+}
+
+
+fn ps_job_info_exports(assert: Assert) {
+    let job_block = guest::alloc_bytes(nt::Ejob::SIZE);
+    let job = at::<nt::Ejob>(job_block);
+    job.ui_restrictions_class.set(0x3F);
+    assert(call_export("PsGetJobLock", &[job_block]) == Some(job.job_lock.address()) && call_export("PsGetJobUIRestrictionsClass", &[job_block]) == Some(0x3F), "ps-job-info: JobLock e UIRestrictionsClass");
+    // Vetores de ref_vectors.py: 5 -> 5, 0xFFFFFFFD -> 0xFFFFFFFD, 0xFFFFFFFE/0xFFFFFFFF -> 0xFFFFFFFF.
+    let session = |value: u32| {
+        job.session_id.set(value);
+        call_export("PsGetJobSessionId", &[job_block])
+    };
+    assert(session(5) == Some(5) && session(0xFFFF_FFFD) == Some(0xFFFF_FFFD) && session(0xFFFF_FFFE) == Some(0xFFFF_FFFF) && session(0xFFFF_FFFF) == Some(0xFFFF_FFFF), "ps-job-info: PsGetJobSessionId satura os marcadores");
+
+    // Job comum: mesma raiz, raízes diferentes, processo sem job.
+    let other_block = guest::alloc_bytes(nt::Ejob::SIZE);
+    let other = at::<nt::Ejob>(other_block);
+    let first_block = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let second_block = guest::alloc_bytes(nt::Eprocess::SIZE);
+    job.root_job.set(job_block);
+    other.root_job.set(job_block);
+    at::<nt::Eprocess>(first_block).job.set(job_block);
+    assert(call_export("PsGetProcessCommonJob", &[first_block, second_block]) == Some(0), "ps-job-info: processo sem job nao tem job comum");
+    at::<nt::Eprocess>(second_block).job.set(other_block);
+    assert(call_export("PsGetProcessCommonJob", &[first_block, second_block]) == Some(job_block), "ps-job-info: RootJob comum");
+    other.root_job.set(other_block);
+    assert(call_export("PsGetProcessCommonJob", &[first_block, second_block]) == Some(0), "ps-job-info: raizes diferentes");
+    guest::free_bytes(second_block);
+    guest::free_bytes(first_block);
+    guest::free_bytes(other_block);
+    guest::free_bytes(job_block);
+}
+
+
+fn ps_priority_exports(assert: Assert) {
+    // FreezeCount: DeepFreeze (KPROCESS.ProcessFlags) soma 1.
+    let owner = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let synthetic = guest::alloc_bytes(nt::Ethread::SIZE);
+    at::<nt::Ethread>(synthetic).tcb.process.set(owner);
+    let kprocess = &at::<nt::Eprocess>(owner).pcb;
+    kprocess.freeze_count.set(2);
+    assert(call_export("PsGetThreadFreezeCount", &[synthetic]) == Some(2), "ps-priority: FreezeCount");
+    kprocess.process_flags.set(nt::Kprocess::DEEP_FREEZE_MASK as i32);
+    assert(call_export("PsGetThreadFreezeCount", &[synthetic]) == Some(3), "ps-priority: DeepFreeze soma 1");
+
+    // PriorityClass: o getter existente lê o mesmo byte.
+    call_export("PsSetProcessPriorityClass", &[owner, 3]);
+    assert(at::<nt::Eprocess>(owner).priority_class.get() == 3 && call_export("PsGetProcessPriorityClass", &[owner]) == Some(3), "ps-priority: PsSetProcessPriorityClass");
+    guest::free_bytes(synthetic);
+    guest::free_bytes(owner);
+}
+
+
+fn ps_impersonation_exports(assert: Assert) {
+    use crate::ntos::rtl::security;
+    use crate::ntos::se::token::impersonation;
+    use crate::ntos::ps::process;
+    use crate::ntos::se::model::sid;
+    use crate::ntos::se::token::{thread as thread_tokens, tokens};
+
+    let thread = process::get_current_thread();
+    let primary = process::get_primary_token(process::get_current_process()).unwrap_or(0);
+    let refs = |token: u64| tokens::with(token, |record| record.refs).unwrap_or(0);
+    let baseline = refs(primary);
+    let outputs = guest::alloc_bytes(16);
+    guest::write_bytes(outputs, &[0xAA; 16]);
+    let (copy_on_open, effective_only, level) = (at::<nt::Field<u8>>(outputs), at::<nt::Field<u8>>(outputs + 1), at::<nt::Field<u32>>(outputs + 4));
+    let reference = || call_export("PsReferenceImpersonationToken", &[thread, outputs, outputs + 1, outputs + 4]);
+
+    // Sem impersonação: NULL e as saídas ficam intocadas.
+    assert(thread != 0 && primary != 0 && thread_tokens::get(thread).is_none() && reference() == Some(0) && copy_on_open.get() == 0xAA && level.get() == 0xAAAA_AAAA, "ps-impersonation: thread sem token devolve NULL");
+
+    // O próprio primário (mesmo AuthenticationId): atribuído sem cópia.
+    assert(call_export("PsImpersonateClient", &[thread, primary, 1, 0, 2]) == Some(0) && call_export("PsIsThreadImpersonating", &[thread]) == Some(1) && refs(primary) == baseline + 1, "ps-impersonation: PsImpersonateClient atribui o token");
+    assert(reference() == Some(primary) && copy_on_open.get() == 1 && effective_only.get() == 0 && level.get() == 2 && refs(primary) == baseline + 2, "ps-impersonation: PsReferenceImpersonationToken referencia e publica CopyOnOpen/EffectiveOnly/Level");
+    call_export("PsDereferenceImpersonationToken", &[primary]);
+    call_export("PsDereferenceImpersonationToken", &[0]);
+    assert(refs(primary) == baseline + 1, "ps-impersonation: PsDereferenceImpersonationToken devolve a referencia (NULL ignorado)");
+
+    // Cliente com integridade acima do primário (Protected 0x5000 > System 0x4000):
+    // sem SeImpersonatePrivilege a thread recebe uma cópia de identificação.
+    let client = tokens::duplicate(primary, 2, false, 2).unwrap_or(0);
+    tokens::update(client, |record| record.integrity = sid(16, &[0x5000]));
+    let privileged = tokens::with(primary, |record| record.privileges.iter().any(|privilege| privilege.id == 29 && privilege.attributes & 2 != 0)).unwrap_or(false);
+    assert(call_export("PsImpersonateClient", &[thread, client, 0, 1, 2]) == Some(0) && refs(primary) == baseline, "ps-impersonation: troca de token solta o anterior");
+    let state = thread_tokens::get(thread);
+    let downgraded = state.is_some_and(|state| state.token != client && state.level == 1 && !state.copy_on_open && state.effective_only && tokens::with(state.token, |record| record.kind == 2 && record.impersonation_level == 1).unwrap_or(false));
+    let kept = state.is_some_and(|state| state.token == client && state.level == 2);
+    assert(if privileged { kept } else { downgraded }, "ps-impersonation: integridade nao dominada vira identificacao");
+    assert(impersonation::can_impersonate(primary, client, 1).is_ok(), "ps-impersonation: niveis abaixo de Impersonation sempre permitidos");
+
+    // PsRevertToSelf encerra e devolve todas as referências.
+    call_export("PsRevertToSelf", &[]);
+    assert(thread_tokens::get(thread).is_none() && call_export("PsIsThreadImpersonating", &[thread]) == Some(0) && refs(primary) == baseline, "ps-impersonation: PsRevertToSelf");
+    let _ = tokens::release(client);
+    guest::free_bytes(outputs);
+
+    // Vetores de ref_vectors.py (RtlSidDominates / RtlIsParentOfChildAppContainer).
+    let system = sid(16, &[0x4000]);
+    assert(
+        security::sid_dominates(&system, &sid(16, &[0x3000])) == Ok(true)
+            && security::sid_dominates(&system, &sid(16, &[0x5000])) == Ok(false)
+            && security::sid_dominates(&system, &system) == Ok(true)
+            && security::sid_dominates(&system, &sid(1, &[0])) == Err(0xC000_000D),
+        "ps-impersonation: RtlSidDominates",
+    );
+    let parent = sid(15, &[2, 11, 22, 33, 44, 55, 66, 77]);
+    let child = sid(15, &[2, 11, 22, 33, 44, 55, 66, 77, 1, 2, 3, 4]);
+    let other = sid(15, &[2, 11, 22, 33, 44, 55, 66, 78, 1, 2, 3, 4]);
+    assert(
+        security::is_parent_of_child_app_container(&parent, &child)
+            && !security::is_parent_of_child_app_container(&parent, &other)
+            && !security::is_parent_of_child_app_container(&child, &parent),
+        "ps-impersonation: RtlIsParentOfChildAppContainer",
+    );
+}
+
+
+fn se_client_security_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_obpsse::SecurityClientContext;
+    use crate::ntos::ps::process;
+    use crate::ntos::se::token::{thread as thread_tokens, tokens};
+
+    let thread = process::get_current_thread();
+    let current = process::get_current_process();
+    let primary = process::get_primary_token(current).unwrap_or(0);
+    let refs = |token: u64| tokens::with(token, |record| record.refs).unwrap_or(0);
+    let baseline = refs(primary);
+    let impersonation = nt::SecurityImpersonationLevel::SECURITY_IMPERSONATION;
+
+    // SeCaptureSubjectContextEx sem impersonação: ImpersonationLevel intocado.
+    let subject_block = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    let subject = at::<nt::SecuritySubjectContext>(subject_block);
+    subject.impersonation_level.set(nt::SecurityImpersonationLevel(0x2AAA_AAAA));
+    assert(call_export("SeCaptureSubjectContextEx", &[thread, current, subject_block]) == Some(0), "se-client: SeCaptureSubjectContextEx");
+    assert(
+        subject.client_token.get() == 0 && subject.impersonation_level.get() == nt::SecurityImpersonationLevel(0x2AAA_AAAA) && subject.primary_token.get() == primary && subject.process_audit_id.get() == at::<nt::Eprocess>(current).unique_process_id.get() && refs(primary) == baseline + 1,
+        "se-client: contexto capturado com o primario referenciado",
+    );
+
+    // QOS estático (tracking 0), SecurityImpersonation, sem EffectiveOnly.
+    let qos_block = guest::alloc_bytes(nt::SecurityQualityOfService::SIZE);
+    let qos = at::<nt::SecurityQualityOfService>(qos_block);
+    qos.length.set(12);
+    qos.impersonation_level.set(impersonation);
+    let context_block = guest::alloc_bytes(SecurityClientContext::SIZE);
+    let context = at::<SecurityClientContext>(context_block);
+    assert(call_export("SeCreateClientSecurityFromSubjectContext", &[subject_block, qos_block, 0, context_block]) == Some(0), "se-client: FromSubjectContext estatico");
+    let copy = context.client_token.get();
+    assert(
+        copy != 0 && copy != primary && context.security_qos.length.get() == 12 && context.security_qos.impersonation_level.get() == impersonation && context.directly_access_client_token.get() == 0 && tokens::with(copy, |record| record.kind == 2 && record.impersonation_level == 2).unwrap_or(false) && refs(primary) == baseline + 1,
+        "se-client: copia de impersonacao no nivel do QOS, referencia do export devolvida",
+    );
+    call_export("ObfDereferenceObject", &[copy]);
+    call_export("SeReleaseSubjectContext", &[subject_block]);
+    assert(refs(primary) == baseline, "se-client: contexto do sujeito liberado");
+
+    // Dinâmico: o contexto fica com a referência do próprio primário.
+    qos.context_tracking_mode.set(1);
+    assert(call_export("SeCreateClientSecurity", &[thread, qos_block, 0, context_block]) == Some(0) && context.client_token.get() == primary && context.directly_access_client_token.get() == 1 && context.direct_access_effective_only.get() == 0 && refs(primary) == baseline + 1, "se-client: SeCreateClientSecurity dinamico");
+    call_export("ObfDereferenceObject", &[primary]);
+
+    // QOS inválido: tracking 2 e nível acima de Delegation; nenhuma referência vaza.
+    qos.context_tracking_mode.set(2);
+    let bad_mode = call_export("SeCreateClientSecurity", &[thread, qos_block, 0, context_block]);
+    qos.context_tracking_mode.set(0);
+    qos.impersonation_level.set(nt::SecurityImpersonationLevel(4));
+    let bad_level = call_export("SeCreateClientSecurity", &[thread, qos_block, 0, context_block]);
+    assert(bad_mode == Some(0xFFFF_FFFF_C000_000D) && bad_level == Some(0xFFFF_FFFF_C000_00A5) && refs(primary) == baseline, "se-client: QOS invalido recusado sem vazar referencia");
+
+    // Estático com EffectiveOnly + SeImpersonateClientEx na thread corrente.
+    qos.impersonation_level.set(impersonation);
+    qos.effective_only.set(1);
+    assert(call_export("SeCreateClientSecurity", &[thread, qos_block, 0, context_block]) == Some(0) && refs(primary) == baseline, "se-client: SeCreateClientSecurity estatico");
+    let copy = context.client_token.get();
+    assert(call_export("SeImpersonateClientEx", &[context_block, 0]) == Some(0), "se-client: SeImpersonateClientEx");
+    let state = thread_tokens::get(thread);
+    assert(state.is_some_and(|state| state.token == copy && state.level == 2 && state.copy_on_open && state.effective_only), "se-client: thread impersona a copia com CopyOnOpen e EffectiveOnly do QOS");
+    call_export("PsRevertToSelf", &[]);
+    call_export("ObfDereferenceObject", &[copy]);
+
+    // Thread em Identification: o servidor não pode pedir Impersonation.
+    qos.effective_only.set(0);
+    call_export("PsImpersonateClient", &[thread, primary, 0, 0, 1]);
+    assert(call_export("SeCreateClientSecurity", &[thread, qos_block, 0, context_block]) == Some(0xFFFF_FFFF_C000_00A5) && refs(primary) == baseline + 1, "se-client: nivel do QOS acima do da thread recusado");
+    call_export("PsRevertToSelf", &[]);
+    assert(thread_tokens::get(thread).is_none() && refs(primary) == baseline, "se-client: referencias equilibradas");
+    guest::free_bytes(context_block);
+    guest::free_bytes(qos_block);
+    guest::free_bytes(subject_block);
+}
+
+
+fn se_access_state_exports(assert: Assert) {
+    use crate::ntos::ps::process;
+    use crate::ntos::se::token::tokens;
+
+    let thread = process::get_current_thread();
+    let current = process::get_current_process();
+    let primary = process::get_primary_token(current).unwrap_or(0);
+    let refs = |token: u64| tokens::with(token, |record| record.refs).unwrap_or(0);
+    let baseline = refs(primary);
+    let state_block = guest::alloc_bytes(nt::AccessState::SIZE);
+    let aux_block = guest::alloc_bytes(nt::AuxAccessData::SIZE);
+    guest::write_bytes(state_block, &[0xCC; 0xA0]);
+    guest::write_bytes(aux_block, &[0xCC; 0xE0]);
+    let (state, aux) = (at::<nt::AccessState>(state_block), at::<nt::AuxAccessData>(aux_block));
+    let operation = |state: &nt::AccessState| luid_at(state.operation_id.address());
+    // GENERIC_MAPPING de arquivo; vetores de ref_vectors.py (RtlMapGenericMask).
+    let mapping_block = guest::alloc_bytes(nt::GenericMapping::SIZE);
+    let mapping = at::<nt::GenericMapping>(mapping_block);
+    let set_mapping = |values: [u32; 4]| {
+        mapping.generic_read.set(values[0]);
+        mapping.generic_write.set(values[1]);
+        mapping.generic_execute.set(values[2]);
+        mapping.generic_all.set(values[3]);
+    };
+    set_mapping([0x0012_0089, 0x0012_0116, 0x0012_00A0, 0x001F_01FF]);
+    let expected_flags = tokens::with(primary, |record| {
+        (if record.privileges.iter().any(|privilege| privilege.id == 23 && privilege.attributes & 2 != 0) { 1u32 } else { 0 }) | (if !record.restricted_sids.is_empty() || record.write_restricted { 0x10 } else { 0 })
+    })
+    .unwrap_or(0);
+    assert(call_export("SeCreateAccessState", &[state_block, aux_block, 0x8000_0000, mapping_block]) == Some(0), "se-access-state: SeCreateAccessState");
+    let first_operation = operation(state);
+    assert(
+        state.remaining_desired_access.get() == 0x0012_0089 && state.original_desired_access.get() == 0x0012_0089 && state.previously_granted_access.get() == 0 && state.flags.get() == expected_flags && state.privileges_allocated.get() == 0,
+        "se-access-state: GENERIC_READ mapeado, PreviouslyGranted e Flags",
+    );
+    assert(
+        state.aux_data.get() == aux_block && aux.privileges_used.get() == state.privileges.address() && state.privileges.initial_privilege_set.privilege_count.get() == 0 && aux.generic_mapping.generic_read.get() == 0x0012_0089 && aux.generic_mapping.generic_all.get() == 0x001F_01FF && aux.new_security_descriptor.get() == 0,
+        "se-access-state: AuxData ligado, PrivilegesUsed inline e GenericMapping copiado",
+    );
+    let subject = &state.subject_security_context;
+    assert(subject.client_token.get() == 0 && subject.impersonation_level.get() == nt::SecurityImpersonationLevel::SECURITY_ANONYMOUS && subject.primary_token.get() == primary && first_operation != 0 && refs(primary) == baseline + 1, "se-access-state: contexto do sujeito e OperationID");
+    assert(call_export("SeDeleteAccessState", &[state_block]) == Some(0) && refs(primary) == baseline, "se-access-state: SeDeleteAccessState solta o sujeito");
+
+    // Ex com mapeamento em cascata (GenericRead contém GENERIC_WRITE): 0x80000000 -> 0x3.
+    set_mapping([0x4000_0001, 0x2, 0x4, 0x8]);
+    assert(call_export("SeCreateAccessStateEx", &[thread, current, state_block, aux_block, 0x8000_0000, mapping_block]) == Some(0) && state.remaining_desired_access.get() == 0x3 && operation(state) != first_operation, "se-access-state: RtlMapGenericMask em cascata e novo OperationID");
+    // Sem bits genéricos o pedido passa intacto; sem thread não há ClientToken.
+    assert(call_export("SeDeleteAccessState", &[state_block]) == Some(0) && call_export("SeCreateAccessStateEx", &[0, current, state_block, aux_block, 0x10, mapping_block]) == Some(0) && state.original_desired_access.get() == 0x10 && subject.client_token.get() == 0, "se-access-state: pedido especifico intacto");
+    assert(call_export("SeDeleteAccessState", &[state_block]) == Some(0) && refs(primary) == baseline, "se-access-state: referencias equilibradas");
+    guest::free_bytes(mapping_block);
+    guest::free_bytes(aux_block);
+    guest::free_bytes(state_block);
+}
+
+
+fn se_appcontainer_exports(assert: Assert) {
+    // Números zero: FALSE pelo atalho; números sem entrada no mapa LowBox: FALSE.
+    assert(call_export("SeIsParentOfChildAppContainer", &[1, 0, 7]) == Some(0) && call_export("SeIsParentOfChildAppContainer", &[1, 7, 0]) == Some(0), "se-appcontainer: numero LowBox zero devolve FALSE");
+    assert(call_export("SeIsParentOfChildAppContainer", &[1, 5, 6]) == Some(0) && call_export("SeIsParentOfChildAppContainer", &[9, 5, 6]) == Some(0), "se-appcontainer: numeros sem entrada no mapa devolvem FALSE");
+}
+
+
+fn alpc_message_attributes_exports(assert: Assert) {
+    // Vetores de ref_vectors.py (AlpcGetHeaderSize transcrito):
+    // 0 -> 8, 0x80000000 -> 0x20, 0x20000000 -> 0x28, 0xF6000000 -> 0x88, 0x01000000 -> 8.
+    let required_block = guest::alloc_bytes(8);
+    let required = at::<nt::Field<u64>>(required_block);
+    let buffer = guest::alloc_bytes(0x100);
+    let attributes = at::<nt::AlpcMessageAttributes>(buffer);
+    let measure = |flags: u64| {
+        required.set(0);
+        let status = call_export("AlpcInitializeMessageAttribute", &[flags, 0, 0x100, required_block]);
+        (status, required.get())
+    };
+    assert(
+        measure(0) == (Some(0), 8) && measure(0x8000_0000) == (Some(0), 0x20) && measure(0x2000_0000) == (Some(0), 0x28) && measure(0xF600_0000) == (Some(0), 0x88) && measure(0x0100_0000) == (Some(0), 8),
+        "alpc-attributes: AlpcInitializeMessageAttribute mede o cabecalho",
+    );
+    attributes.allocated_attributes.set(0xDDDD_DDDD);
+    attributes.valid_attributes.set(0xDDDD_DDDD);
+    assert(call_export("AlpcInitializeMessageAttribute", &[0xF600_0000, buffer, 0x87, required_block]) == Some(0xFFFF_FFFF_C000_0023) && required.get() == 0x88 && attributes.allocated_attributes.get() == 0xDDDD_DDDD && attributes.valid_attributes.get() == 0xDDDD_DDDD, "alpc-attributes: buffer curto recusado sem escrita");
+    assert(call_export("AlpcInitializeMessageAttribute", &[0xF600_0000, buffer, 0x88, required_block]) == Some(0) && attributes.allocated_attributes.get() == 0xF600_0000 && attributes.valid_attributes.get() == 0, "alpc-attributes: Allocated gravado e Valid zerado");
+    // get(0xF6000000, ...) = base+0x40 (Context), base+8 (Security), base+0x80 (WorkOnBehalf),
+    // NULL para bit não alocado (0x08000000) e para dois bits (0x30000000).
+    assert(
+        call_export("AlpcGetMessageAttribute", &[buffer, 0x2000_0000]) == Some(buffer + 0x40)
+            && call_export("AlpcGetMessageAttribute", &[buffer, 0x8000_0000]) == Some(buffer + 8)
+            && call_export("AlpcGetMessageAttribute", &[buffer, 0x0200_0000]) == Some(buffer + 0x80)
+            && call_export("AlpcGetMessageAttribute", &[buffer, 0x0800_0000]) == Some(0)
+            && call_export("AlpcGetMessageAttribute", &[buffer, 0x3000_0000]) == Some(0),
+        "alpc-attributes: AlpcGetMessageAttribute",
+    );
+    // Mesmo endereço que o transporte usa para o contexto.
+    attributes.allocated_attributes.set(0xA000_0000);
+    assert(call_export("AlpcGetMessageAttribute", &[buffer, 0x2000_0000]) == Some(buffer + 0x20) && crate::ntos::ps::user::alpc::attribute_address(buffer, 0x2000_0000) == buffer + 0x20, "alpc-attributes: layout igual ao do transporte");
+    guest::free_bytes(buffer);
+    guest::free_bytes(required_block);
+}
+
+
+fn ob_security_cache_exports(assert: Assert) {
+    use crate::ntos::ob::object_security;
+
+    // SD self-relative mínimo (20 bytes) e um com dono S-1-5-18 (32 bytes).
+    let minimal_bytes: [u8; 20] = [1, 0, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let owned_bytes: [u8; 32] = [1, 0, 0x00, 0x80, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let minimal = guest::alloc_bytes(20);
+    guest::write_bytes(minimal, &minimal_bytes);
+    let twin = guest::alloc_bytes(20);
+    guest::write_bytes(twin, &minimal_bytes);
+    let owned = guest::alloc_bytes(32);
+    guest::write_bytes(owned, &owned_bytes);
+    // Vetores de ref_vectors.py: hash(minimal) = 0x400000008, hash(owned) = 0xD2800000040.
+    assert(object_security::security_descriptor_hash(&minimal_bytes) == 0x4_0000_0008 && object_security::security_descriptor_hash(&owned_bytes) == 0xD28_0000_0040, "ob-sd-cache: FullHash do ObLogSecurityDescriptor");
+
+    let output_block = guest::alloc_bytes(8);
+    let output = at::<nt::Field<u64>>(output_block);
+    assert(call_export("ObLogSecurityDescriptor", &[minimal, output_block, 1]) == Some(0), "ob-sd-cache: ObLogSecurityDescriptor cria a entrada");
+    let cached = output.get();
+    assert(cached != 0 && cached != minimal && guest::read_bytes(cached, 20) == minimal_bytes && object_security::cached_descriptor_state(cached) == Some((1, 0x4_0000_0008, 20)), "ob-sd-cache: cabecalho e copia do SD");
+    assert(call_export("ObLogSecurityDescriptor", &[twin, output_block, 2]) == Some(0) && output.get() == cached && object_security::cached_descriptor_state(cached).is_some_and(|(refs, _, _)| refs == 3), "ob-sd-cache: SD igual compartilha a entrada (RefBias somado)");
+    assert(call_export("ObLogSecurityDescriptor", &[owned, output_block, 1]) == Some(0) && output.get() != cached, "ob-sd-cache: SD diferente ganha outra entrada");
+    let other = output.get();
+    let refs = |descriptor: u64| object_security::cached_descriptor_state(descriptor).map(|(refs, _, _)| refs);
+
+    call_export("ObReferenceSecurityDescriptor", &[cached, 4]);
+    assert(refs(cached) == Some(7), "ob-sd-cache: ObReferenceSecurityDescriptor soma");
+    call_export("ObDereferenceSecurityDescriptor", &[cached, 6]);
+    assert(refs(cached) == Some(1), "ob-sd-cache: ObDereferenceSecurityDescriptor subtrai");
+    call_export("ObDereferenceSecurityDescriptor", &[cached, 1]);
+    call_export("ObDereferenceSecurityDescriptor", &[other, 1]);
+    assert(refs(cached).is_none() && refs(other).is_none(), "ob-sd-cache: entradas liberadas no zero");
+    // A entrada liberada não é mais encontrada: o próximo log recomeça em RefBias.
+    assert(call_export("ObLogSecurityDescriptor", &[twin, output_block, 1]) == Some(0) && refs(output.get()) == Some(1), "ob-sd-cache: novo log recomeca em RefBias");
+    call_export("ObDereferenceSecurityDescriptor", &[output.get(), 1]);
+    guest::free_bytes(output_block);
+    guest::free_bytes(owned);
+    guest::free_bytes(twin);
+    guest::free_bytes(minimal);
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -6354,6 +6799,16 @@ pub fn run(assert: Assert) {
     cc_flush_exports(assert);
     cc_mdl_exports(assert);
     cc_log_exports(assert);
+    ps_win32_callouts_exports(assert);
+    ps_process_info_exports(assert);
+    ps_job_info_exports(assert);
+    ps_priority_exports(assert);
+    ps_impersonation_exports(assert);
+    se_client_security_exports(assert);
+    se_access_state_exports(assert);
+    se_appcontainer_exports(assert);
+    alpc_message_attributes_exports(assert);
+    ob_security_cache_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

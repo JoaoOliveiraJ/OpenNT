@@ -491,3 +491,127 @@ pub mod se_access_from_state {
         data_exports: &[],
     };
 }
+
+pub mod se_client_security {
+    //! Contexto de segurança do cliente e captura do sujeito de outra
+    //! thread/processo (tcpip, win32kfull, drivers de FS/RPC) — lógica em
+    //! `se/client_security.rs` e `se/subject_context.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::extra_obpsse::SecurityClientContext;
+    use crate::ntos::inc::types::{SecurityQualityOfService, SecuritySubjectContext};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::{client_security, subject_context};
+    use crate::rtl::KernelError;
+
+    fn qos(call: &Call, index: usize) -> &'static SecurityQualityOfService {
+        // SAFETY: PSECURITY_QUALITY_OF_SERVICE do chamador (modo kernel).
+        unsafe { SecurityQualityOfService::at(call.arg(index)) }
+    }
+
+    fn client_context(call: &Call, index: usize) -> &'static SecurityClientContext {
+        // SAFETY: PSECURITY_CLIENT_CONTEXT do chamador (modo kernel).
+        unsafe { SecurityClientContext::at(call.arg(index)) }
+    }
+
+    fn subject(call: &Call, index: usize) -> &'static SecuritySubjectContext {
+        // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador (modo kernel).
+        unsafe { SecuritySubjectContext::at(call.arg(index)) }
+    }
+
+    /// SeCaptureSubjectContextEx(Thread, Process, SubjectContext).
+    fn capture_subject_context_ex(call: &Call) -> Result<u64, KernelError> {
+        subject_context::capture_ex(call.arg(1), call.arg(2), subject(call, 3))?;
+        Ok(0)
+    }
+
+    /// SeCreateClientSecurity(ClientThread, Qos, RemoteSession, ClientContext).
+    fn create_client_security(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(client_security::create(call.arg(1), qos(call, 2), call.arg(3) as u8 != 0, client_context(call, 4))?))
+    }
+
+    /// SeCreateClientSecurityFromSubjectContext(Subject, Qos, ServerIsRemote, ClientContext).
+    fn create_client_security_from_subject_context(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(client_security::create_from_subject_context(subject(call, 1), qos(call, 2), call.arg(3) as u8 != 0, client_context(call, 4))?))
+    }
+
+    /// SeImpersonateClientEx(ClientContext, ServerThread); SeImpersonateClient
+    /// (VOID) é a mesma chamada.
+    fn impersonate_client_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(client_security::impersonate_client(client_context(call, 1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-client-security",
+        names: &["SeCaptureSubjectContextEx", "SeCreateClientSecurity", "SeCreateClientSecurityFromSubjectContext", "SeImpersonateClientEx", "SeImpersonateClient"],
+        handlers: &[capture_subject_context_ex, create_client_security, create_client_security_from_subject_context, impersonate_client_ex, impersonate_client_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod se_access_state {
+    //! ACCESS_STATE + AUX_ACCESS_DATA (win32kbase, dxgkrnl, drivers de FS) —
+    //! lógica em `se/access_state.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::{AccessState, AuxAccessData, GenericMapping};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::process;
+    use crate::ntos::se::access_state;
+    use crate::rtl::KernelError;
+
+    /// (PACCESS_STATE, PAUX_ACCESS_DATA, PGENERIC_MAPPING opcional) do chamador.
+    fn blocks(call: &Call, first: usize) -> (&'static AccessState, &'static AuxAccessData, Option<&'static GenericMapping>) {
+        let mapping = call.arg(first + 3);
+        // SAFETY: ponteiros de modo kernel do chamador, como no NT; o
+        // GENERIC_MAPPING é opcional.
+        unsafe { (AccessState::at(call.arg(first)), AuxAccessData::at(call.arg(first + 1)), (mapping != 0).then(|| GenericMapping::at(mapping))) }
+    }
+
+    /// SeCreateAccessState(AccessState, AuxData, DesiredAccess, GenericMapping):
+    /// a thread corrente e o seu ApcState.Process.
+    fn create_access_state(call: &Call) -> Result<u64, KernelError> {
+        let (state, aux, mapping) = blocks(call, 1);
+        Ok(signed_status(access_state::create(process::get_current_thread(), process::get_current_process(), state, aux, call.arg(3) as u32, mapping)?))
+    }
+
+    /// SeCreateAccessStateEx(Thread, Process, AccessState, AuxData, DesiredAccess, GenericMapping).
+    fn create_access_state_ex(call: &Call) -> Result<u64, KernelError> {
+        let (state, aux, mapping) = blocks(call, 3);
+        Ok(signed_status(access_state::create(call.arg(1), call.arg(2), state, aux, call.arg(5) as u32, mapping)?))
+    }
+
+    fn delete_access_state(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PACCESS_STATE criado por SeCreateAccessState(Ex).
+        access_state::delete(unsafe { AccessState::at(call.arg(1)) })?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-access-state",
+        names: &["SeCreateAccessState", "SeCreateAccessStateEx", "SeDeleteAccessState"],
+        handlers: &[create_access_state, create_access_state_ex, delete_access_state],
+        data_exports: &[],
+    };
+}
+
+pub mod se_appcontainer {
+    //! SeIsParentOfChildAppContainer (win32kbase/win32kfull) — lógica em
+    //! `se/capability/appcontainer.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::capability::appcontainer;
+    use crate::rtl::KernelError;
+
+    /// SeIsParentOfChildAppContainer(SessionId, ParentLowboxNumber, ChildLowboxNumber) -> BOOLEAN.
+    fn is_parent_of_child_app_container(call: &Call) -> Result<u64, KernelError> {
+        Ok(appcontainer::is_parent_of_child_lowbox(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-appcontainer",
+        names: &["SeIsParentOfChildAppContainer"],
+        handlers: &[is_parent_of_child_app_container],
+        data_exports: &[],
+    };
+}

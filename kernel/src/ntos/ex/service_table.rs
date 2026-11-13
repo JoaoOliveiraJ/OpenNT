@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::hal::amd64::service_table as storage;
 use crate::ntos::mm::{kernel_address, paging};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::ps::win32_callouts;
+use crate::ntos::ps::win32;
 use crate::rtl::{KernelError, SpinLock};
 
 const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000_001C;
@@ -194,7 +194,7 @@ pub fn out_of_range(service_number: u32) -> Result<Result<(u64, u32), u32>, Kern
         return Ok(Err(STATUS_INVALID_SYSTEM_SERVICE));
     }
     let addresses = init()?;
-    while win32_callouts::convert_to_gui_thread() == 0 {
+    while win32::convert_to_gui_thread() == 0 {
         let (target, arguments) = inspect(service_number, true)?;
         if target != 0 {
             return Ok(Ok((target, arguments)));

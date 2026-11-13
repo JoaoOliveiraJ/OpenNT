@@ -157,3 +157,129 @@ pub fn token_object_type_cell() -> u64 {
 pub fn exports_cell() -> u64 {
     kernel_data::address("SeExports").unwrap_or_else(|error| panic!("SeExports: {error}"))
 }
+
+// ---- ps-impersonation: impersonação de thread (ntoskrnl 19041) -------------
+// PsImpersonateClient 0x6d3b80, PsRevertToSelf 0x714500,
+// PsReferenceImpersonationTokenEx 0x6cf720, PsDereferenceImpersonationToken
+// 0x692740 e PspWriteTebImpersonationInfo 0x6d3f60. O estado vive no
+// `se::token::thread` (que publica ETHREAD.ClientSecurity e CrossThreadFlags);
+// a política é o SeTokenCanImpersonate de `se::token::impersonation`. O NT
+// prefere o AdjustedClientToken (ETHREAD.AdjustedClientToken) quando existe;
+// o OpenNT nunca o cria (não há TrustLevelSid). O TEB só é atualizado quando
+// o dono da thread é o espaço de endereço corrente (o NT anexa com
+// KeStackAttachProcess); TEB e TEB32 são memória de modo usuário, sondada.
+
+const IMPERSONATION_STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+const IMPERSONATION_TOKEN_IMPERSONATION: u32 = 2;
+const IMPERSONATION_SECURITY_IDENTIFICATION: u32 = 1;
+const IMPERSONATION_SECURITY_IMPERSONATION: u32 = 2;
+/// IMAGE_FILE_MACHINE_I386 / IMAGE_FILE_MACHINE_ARMNT: processos com TEB32.
+const IMPERSONATION_TEB32_MACHINES: [u16; 2] = [0x14C, 0x1C4];
+const IMPERSONATION_PAGE_SIZE: u64 = 0x1000;
+
+fn impersonation_thread(thread: u64) -> &'static crate::ntos::inc::types::Ethread {
+    // SAFETY: PETHREAD do chamador (vivo enquanto a chamada dura).
+    unsafe { crate::ntos::inc::types::Ethread::at(thread) }
+}
+
+/// PspWriteTebImpersonationInfo: TEB.IsImpersonating = ActiveImpersonationInfo
+/// e TEB.MuiImpersonation = 0, também no TEB32 (TEB + ROUND_TO_PAGES(sizeof
+/// TEB)) de processos x86/ARM32. Threads de sistema não têm TEB.
+fn write_teb_impersonation_info(thread: u64) {
+    use crate::ntos::inc::types::extra_obpsse::Teb32;
+    use crate::ntos::inc::types::{Eprocess, Ewow64process, Teb};
+    let object = impersonation_thread(thread);
+    let teb = object.tcb.teb.get();
+    if teb == 0 || object.tcb.system_thread() != 0 {
+        return;
+    }
+    let owner = object.tcb.process.get();
+    if owner != process::get_current_process() {
+        return;
+    }
+    let active = crate::ntos::se::token::thread::get(thread).is_some() as u32;
+    let Ok(user_teb) = Teb::try_at(teb) else { return };
+    let _ = user_teb.is_impersonating.probe_set(active);
+    let _ = user_teb.mui_impersonation.probe_set(0);
+    // SAFETY: EPROCESS dono da thread, vivo enquanto ela vive.
+    let wow64 = unsafe { Eprocess::at(owner) }.wo_w64_process.get();
+    if wow64 == 0 {
+        return;
+    }
+    // SAFETY: o EWOW64PROCESS vive enquanto o EPROCESS vive.
+    if !IMPERSONATION_TEB32_MACHINES.contains(&unsafe { Ewow64process::at(wow64) }.machine.get()) {
+        return;
+    }
+    let teb32_address = teb + (Teb::SIZE + IMPERSONATION_PAGE_SIZE - 1) / IMPERSONATION_PAGE_SIZE * IMPERSONATION_PAGE_SIZE;
+    if let Ok(teb32) = Teb32::try_at(teb32_address) {
+        let _ = teb32.is_impersonating.probe_set(active);
+        let _ = teb32.mui_impersonation.probe_set(0);
+    }
+}
+
+/// PsImpersonateClient(Thread, Token, CopyOnOpen, EffectiveOnly, Level):
+/// Token NULL encerra a impersonação. Se o primário do dono da thread não
+/// pode impersonar o cliente (SeTokenCanImpersonate), a thread recebe uma
+/// cópia de identificação (SeCopyClientToken; Anonymous se o próprio token de
+/// impersonação já for Anonymous). Devolve o NTSTATUS.
+pub fn impersonate_client(thread: u64, token: u64, copy_on_open: bool, effective_only: bool, level: u32) -> Result<u32, KernelError> {
+    use crate::ntos::se::token::{impersonation, thread as thread_tokens};
+    if token == 0 {
+        thread_tokens::release(thread)?;
+        write_teb_impersonation_info(thread);
+        return Ok(0);
+    }
+    let mut stored_level = level & 3;
+    let mut copy = None;
+    if let Some(primary) = process::get_primary_token(impersonation_thread(thread).tcb.process.get()) {
+        if impersonation::can_impersonate(primary, token, level).is_err() {
+            let (kind, token_level) = tokens::with(token, |record| (record.kind, record.impersonation_level)).ok_or_else(|| KernelError::new("PsImpersonateClient: invalid token"))?;
+            let reduced = if kind == IMPERSONATION_TOKEN_IMPERSONATION && (token_level as i32) < IMPERSONATION_SECURITY_IDENTIFICATION as i32 { token_level } else { IMPERSONATION_SECURITY_IDENTIFICATION };
+            // Só falhas com NTSTATUS explícito viram retorno, como o
+            // SeCopyClientToken; as internas sobem.
+            match tokens::duplicate(token, reduced, false, IMPERSONATION_TOKEN_IMPERSONATION) {
+                Ok(duplicate) => copy = Some(duplicate),
+                Err(error) if error.status != IMPERSONATION_STATUS_UNSUCCESSFUL => return Ok(error.status),
+                Err(error) => return Err(error),
+            }
+            stored_level = reduced & 3;
+        }
+    }
+    // A thread retém a sua referência; a de criação da cópia é devolvida.
+    let assigned = thread_tokens::assign(thread, Some(copy.unwrap_or(token)), stored_level, copy_on_open, effective_only);
+    if let Some(duplicate) = copy {
+        tokens::release(duplicate)?;
+    }
+    assigned?;
+    write_teb_impersonation_info(thread);
+    Ok(0)
+}
+
+/// PsRevertToSelf = PsImpersonateClient(PsGetCurrentThread(), NULL, FALSE,
+/// FALSE, SecurityImpersonation).
+pub fn revert_to_self() -> Result<u32, KernelError> {
+    impersonate_client(process::get_current_thread(), 0, false, false, IMPERSONATION_SECURITY_IMPERSONATION)
+}
+
+/// PsReferenceImpersonationToken(Thread, CopyOnOpen*, EffectiveOnly*,
+/// Level*): sem ActiveImpersonationInfo devolve NULL sem tocar nas saídas;
+/// senão referencia o token (ObfReferenceObject) e publica CopyTokenOnOpen,
+/// EffectiveOnly e o nível de ETHREAD.ClientSecurity.
+pub fn reference_impersonation_token(thread: u64, copy_on_open_out: &Field<u8>, effective_only_out: &Field<u8>, level_out: &Field<u32>) -> Result<u64, KernelError> {
+    use crate::ntos::ob::{object_reference, reference_trace};
+    let Some(state) = crate::ntos::se::token::thread::get(thread) else { return Ok(0) };
+    object_reference::reference_with_tag(state.token, reference_trace::DEFAULT_TAG, true)?;
+    copy_on_open_out.set(state.copy_on_open as u8);
+    level_out.set(state.level & 3);
+    effective_only_out.set(state.effective_only as u8);
+    Ok(state.token)
+}
+
+/// PsDereferenceImpersonationToken: ObDereferenceObject se não for NULL.
+pub fn dereference_impersonation_token(token: u64) -> Result<(), KernelError> {
+    use crate::ntos::ob::{object_reference, reference_trace};
+    if token != 0 {
+        object_reference::dereference_with_tag(token, reference_trace::DEFAULT_TAG, true)?;
+    }
+    Ok(())
+}

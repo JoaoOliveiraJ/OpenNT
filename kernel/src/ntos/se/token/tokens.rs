@@ -43,7 +43,7 @@ const _: () = {
 /// TOKEN_LOWBOX em TokenFlags: token de AppContainer.
 const TOKEN_LOWBOX: u32 = 0x4000;
 
-fn set_luid(luid: &Luid, value: u64) {
+pub fn set_luid(luid: &Luid, value: u64) {
     luid.low_part.set(value as u32);
     luid.high_part.set((value >> 32) as i32);
 }

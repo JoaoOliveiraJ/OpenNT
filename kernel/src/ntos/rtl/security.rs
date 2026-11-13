@@ -226,3 +226,57 @@ pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool)
     guest::free_bytes(scratch);
     Ok(status)
 }
+
+// ---- SIDs de rótulo obrigatório e de pacote (ntoskrnl 19041) ---------------
+// RtlSidDominates 0x2520f0, RtlGetAppContainerSidType 0x6ef210 e
+// RtlIsParentOfChildAppContainer 0x6ec2a4, sobre SIDs já copiados (bytes).
+
+fn sid_sub_authority(sid: &[u8], index: usize) -> u32 {
+    let at = 8 + 4 * index;
+    u32::from_le_bytes([sid[at], sid[at + 1], sid[at + 2], sid[at + 3]])
+}
+
+/// Autoridade SECURITY_MANDATORY_LABEL_AUTHORITY {0,0,0,0,0,16} e as
+/// subautoridades presentes no slice.
+fn is_mandatory_label_sid(sid: &[u8]) -> bool {
+    sid.len() >= 8 && sid[2..6] == [0, 0, 0, 0] && sid[6] == 0 && sid[7] == 0x10 && sid.len() >= 8 + 4 * sid[1] as usize
+}
+
+/// RtlSidDominates: os dois SIDs de rótulo obrigatório (senão
+/// STATUS_INVALID_PARAMETER, 0xC000000D); iguais dominam; senão o último RID
+/// de `a` (0 sem subautoridades) >= o de `b`, e `b` sem subautoridades é
+/// sempre dominado.
+pub fn sid_dominates(a: &[u8], b: &[u8]) -> Result<bool, u32> {
+    if !is_mandatory_label_sid(a) || !is_mandatory_label_sid(b) {
+        return Err(0xC000_000D);
+    }
+    let (count_a, count_b) = (a[1] as usize, b[1] as usize);
+    let length = 8 + 4 * count_a;
+    if a[0] == b[0] && count_a == count_b && a[..length] == b[..length] {
+        return Ok(true);
+    }
+    if count_b == 0 {
+        return Ok(true);
+    }
+    let rid_a = if count_a == 0 { 0 } else { sid_sub_authority(a, count_a - 1) };
+    Ok(rid_a >= sid_sub_authority(b, count_b - 1))
+}
+
+/// RtlGetAppContainerSidType: 2 = pacote pai (8 subautoridades), 1 = filho
+/// (12); None = não é SID de pacote S-1-15-2-... (o NT devolve erro).
+fn app_container_sid_type(sid: &[u8]) -> Option<u32> {
+    if sid.len() < 12 || sid[1] < 2 || sid[0] != 1 || sid[2..8] != [0, 0, 0, 0, 0, 15] || sid_sub_authority(sid, 0) != 2 || sid.len() < 8 + 4 * sid[1] as usize {
+        return None;
+    }
+    match sid[1] {
+        8 => Some(2),
+        12 => Some(1),
+        _ => None,
+    }
+}
+
+/// RtlIsParentOfChildAppContainer: pai de 8 e filho de 12 subautoridades com
+/// as subautoridades 1..7 iguais.
+pub fn is_parent_of_child_app_container(parent: &[u8], child: &[u8]) -> bool {
+    app_container_sid_type(parent) == Some(2) && app_container_sid_type(child) == Some(1) && (1..8).all(|index| sid_sub_authority(parent, index) == sid_sub_authority(child, index))
+}

@@ -163,3 +163,39 @@ pub fn dxg_process(process: u64) -> u64 {
 pub fn is_system_process(process: u64) -> bool {
     eprocess(process).system_process() != 0
 }
+
+// ---- ps-process-info: máquina WOW64 e start key (ntoskrnl 19041) ----------
+
+/// IMAGE_FILE_MACHINE_AMD64: a máquina de um processo sem WOW64.
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+/// PsWow64GetProcessMachine (0x6c14c0): EWOW64PROCESS.Machine, ou AMD64 sem
+/// EWOW64PROCESS (ou com Machine zero).
+pub fn wow64_machine(process: u64) -> u16 {
+    let wow64_process = eprocess(process).wo_w64_process.get();
+    if wow64_process != 0 {
+        // SAFETY: o EWOW64PROCESS vive enquanto o EPROCESS dono vive.
+        let machine = unsafe { Ewow64process::at(wow64_process) }.machine.get();
+        if machine != 0 {
+            return machine;
+        }
+    }
+    IMAGE_FILE_MACHINE_AMD64
+}
+
+/// PsGetProcessStartKey (0x25ed50): (KUSER_SHARED_DATA.BootId << 48) |
+/// SequenceNumber — o ULONG do BootId é estendido a 64 bits antes do
+/// deslocamento.
+pub fn start_key(process: u64) -> u64 {
+    // SAFETY: KUSER_SHARED_DATA é mapeado pelo Mm no boot e nunca sai.
+    let shared = unsafe { crate::ntos::inc::types::KuserSharedData::at(crate::ntos::mm::shared_user_data::SHARED_USER_DATA_VA) };
+    ((shared.boot_id.get() as u64) << 48) | eprocess(process).sequence_number.get()
+}
+
+// ---- ps-priority: classe de prioridade (ntoskrnl 19041) --------------------
+
+/// PsSetProcessPriorityClass (0x581460): grava o byte cru de
+/// EPROCESS.PriorityClass (o par de `priority_class`).
+pub fn set_priority_class(process: u64, priority_class: u8) {
+    eprocess(process).priority_class.set(priority_class);
+}
