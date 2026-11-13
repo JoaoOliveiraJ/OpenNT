@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1119 && abi_names::GROUP_LAYOUT.len() == 183 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1119 exports em 183 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1114 && abi_names::GROUP_LAYOUT.len() == 183 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1114 exports em 183 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -378,7 +378,7 @@ fn ntoskrnl_exports(assert: Assert) {
     let iat = |slot: u64| crate::hal::physical::read64(base + 0x4200 + slot * 8);
     let (table, count) = win32_thunk::thunk_table();
     let thunk = |id: u64| kernel_address::virtual_address(table + id * win32_thunk::STUB_SIZE).unwrap_or(0);
-    assert(count == win32_thunk::MAX_WIN32 && 32 + abi_names::EXPORT_NAMES.len() as u32 <= count && iat(0) == thunk(32 + 658) && iat(1) == thunk(32 + 546) && iat(0) != 0 && image.resolved_imports.len() == 5, "ntoskrnl: IAT recebe os trampolins dos ids");
+    assert(count == win32_thunk::MAX_WIN32 && 32 + abi_names::EXPORT_NAMES.len() as u32 <= count && iat(0) == thunk(32 + 652) && iat(1) == thunk(32 + 546) && iat(0) != 0 && image.resolved_imports.len() == 5, "ntoskrnl: IAT recebe os trampolins dos ids");
     // Chamadas reais pelos trampolins (ABI MS x64 -> despachante Rust).
     let thread = guest::alloc_bytes(nt::Ethread::SIZE);
     at::<nt::Ethread>(thread).cid.unique_thread.set(0xFEDC_BA98_7654_3210);
@@ -930,12 +930,23 @@ fn ntoskrnl_medium_groups(assert: Assert) {
     assert(call_export("HviGetHypervisorFeatures", &[features]) == Some(0), "hvi: features da interface de hypervisor");
     guest::free_bytes(features);
     guest::free_bytes(lock);
-    // wpp: sessões reais com buffer circular.
-    let handle = guest::alloc_bytes(8);
-    assert(call_export("WppAutoLogStart", &[0, handle, 0]) == Some(0) && guest::read64(handle) != 0, "wpp: sessao de trace iniciada");
-    let session = guest::read64(handle);
-    assert(call_export("WppAutoLogTrace", &[session, 4, 0, 0, 7]) == Some(0) && call_export("imp_WppRecorderReplay", &[session]) == Some(0) && call_export("WppAutoLogStop", &[session, 0]) == Some(0) && call_export("imp_WppRecorderReplay", &[session]) == Some(0xFFFF_FFFF_C000_0008), "wpp: trace, replay e encerramento da sessao");
-    guest::free_bytes(handle);
+    // A WppRecorder.sys e a wmilib.sys reais exportam os próprios nomes.
+    assert(["WppAutoLogStart", "WppAutoLogTrace", "WppAutoLogStop", "imp_WppRecorderReplay", "WmiSystemControl", "WmiCompleteRequest"].iter().all(|name| exports::lookup("ntoskrnl.exe", name).is_none()), "wpp/wmilib: exports das bibliotecas reais fora do ntoskrnl");
+    // dbgk: sem host do werkernel, a captura ao vivo falha com o status do stub.
+    let component = guest::alloc_bytes(64);
+    let capture = |name: u64| call_export("DbgkWerCaptureLiveKernelDump", &[name, 0x161, 1, 2, 3, 4, 0, 0, 0]);
+    crate::ntos::rtl::guest_strings::write_wide_string(component, "OpenNtTeste");
+    let unsupported = capture(component);
+    crate::ntos::rtl::guest_strings::write_wide_string(component, "ComponenteLongoDemais");
+    let too_long = capture(component);
+    assert(unsupported == Some(0xFFFF_FFFF_C000_00BB) && too_long == Some(0xFFFF_FFFF_C000_000D) && capture(0) == Some(0xFFFF_FFFF_C000_000D), "dbgk: WerLiveKernelCreateReport ausente e nome do componente validado");
+    let reports = crate::ntos::cm::registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\CrashControl\\FullLiveKernelReports", None).unwrap_or(0);
+    crate::ntos::cm::registry::set_value(reports, "FullLiveReportsMax", 4, alloc::vec![0; 4]);
+    let blocked = capture(component);
+    crate::ntos::cm::registry::delete_key(reports);
+    crate::ntos::cm::registry::close_handle(reports);
+    assert(reports != 0 && blocked == Some(0xFFFF_FFFF_C000_0804), "dbgk: FullLiveReportsMax zero bloqueia a captura");
+    guest::free_bytes(component);
     // wmi: informação de trace zerada até 0x30 bytes.
     let buffer = guest::alloc_bytes(0x40);
     let length = guest::alloc_bytes(8);
@@ -1357,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1119 && exports::export_names().len() == 1119, "ntoskrnl: 183 grupos com os 1119 exports implementados");
+    assert(exports::implemented() == 1114 && exports::export_names().len() == 1114, "ntoskrnl: 183 grupos com os 1114 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -2243,7 +2254,7 @@ fn private_routines_and_small_groups(assert: Assert) {
     let missing = if native != 0 { native_call::call(native, &[current, block, 0, 0, block + 0xF10]) & 0xFF } else { 1 };
     assert(missing == 0, "privadas: objeto sem handle nao e encontrado");
     // Caminho do trampolim (busca do kernel).
-    let thunk = exports::thunk_address(744).unwrap_or(0);
+    let thunk = exports::thunk_address(738).unwrap_or(0);
     guest::write64(block + 0xF10, 0);
     let by_thunk = native_call::call(thunk, &[current, driver, 0, 0, block + 0xF10]) & 0xFF;
     assert(by_thunk == 1 && guest::read64(block + 0xF10) & 0x7FFF_FFFC == handle & 0x7FFF_FFFC, "privadas: ObFindHandleForObject pelo trampolim");

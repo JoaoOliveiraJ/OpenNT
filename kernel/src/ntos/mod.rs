@@ -4,6 +4,7 @@
 //! das estruturas e `init` a inicialização e a tabela de exports.
 
 pub mod cm;
+pub mod dbgk;
 pub mod etw;
 pub mod ex;
 pub mod ke;

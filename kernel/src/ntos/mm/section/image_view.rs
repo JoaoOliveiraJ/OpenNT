@@ -141,13 +141,9 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let finish = || -> Result<(), KernelError> {
         let dll_name = file.base_name().unwrap_or_else(|| String::from(&name[name.rfind(['\\', '/']).map_or(0, |at| at + 1)..]));
         if offset == 0 && size == section.size && regions == RegionKind::ProcessImages {
-            let lower = dll_name.to_ascii_lowercase();
-            state::with(|state| state.mapped_image_exports.insert(lower.clone(), exports.clone()));
+            state::with(|state| state.mapped_image_exports.insert(dll_name.to_ascii_lowercase(), exports.clone()));
             if state::with(|state| !state.capture_export.is_empty()) {
                 crate::ntos::ps::user::call_capture::arm(&dll_name, &exports);
-            }
-            if lower == "win32u.dll" {
-                crate::ntos::ex::system_services::register(1, &crate::ntos::ps::user::syscall_scan::scan_syscall_stubs(&exports))?;
             }
         }
         if !section.no_execute {

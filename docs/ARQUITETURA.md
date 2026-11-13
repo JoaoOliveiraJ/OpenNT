@@ -57,7 +57,7 @@ kernel/src/
 │   ├── rtl/           a Rtl do NT: strings, Unicode, AVL, bitmap, exceções, imagens PE
 │   │   └── resource/  recursos de imagens (ldrrsrc)
 │   ├── alpc/          ALPC (connect/, message/, resource/)
-│   ├── po/ etw/ kd/ fsrtl/
+│   ├── po/ etw/ kd/ dbgk/ fsrtl/
 │   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs)
 ├── drivers/           drivers internos
 │   ├── fs/            sistemas de arquivos: RAMFS de boot, volumes, NTFS

@@ -81,6 +81,7 @@ ntos/cm/services
 ntos/cm/state_separation
 ntos/cm/value_information
 ntos/cm/wnf_defaults
+ntos/dbgk/wer
 ntos/etw/event_enabled
 ntos/etw/provider_state
 ntos/ex/boot_environment_information
@@ -316,6 +317,7 @@ ntos/ps/system_process_information
 ntos/ps/thread_context_input
 ntos/ps/thread_context_registers
 ntos/ps/thread_notify
+ntos/ps/win32_callouts
 ntos/ps/user/alpc
 ntos/ps/user/call_capture
 ntos/ps/user/context_frame
@@ -658,6 +660,7 @@ ntos/exports/create_completion
 ntos/exports/create_section_object
 ntos/exports/create_section
 ntos/exports/datatype_misalignment
+ntos/exports/dbgk
 ntos/exports/debug_prompt
 ntos/exports/delete_file
 ntos/exports/device_control

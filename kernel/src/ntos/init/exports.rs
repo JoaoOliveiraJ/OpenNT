@@ -154,7 +154,6 @@ fn groups() -> [&'static Group; 183] {
         &crate::ntos::ex::exports::pool_quota::GROUP,
         &crate::ntos::rtl::exports::feature_usage::GROUP,
         &crate::ntos::ex::exports::wnf_query::GROUP,
-        &crate::ntos::etw::exports::wpp::GROUP,
         &crate::ntos::ps::exports::process_query::GROUP,
         &crate::ntos::kd::exports::GROUP,
         &crate::ntos::etw::exports::wmi::GROUP,
@@ -238,6 +237,7 @@ fn groups() -> [&'static Group; 183] {
         &crate::ntos::io::exports::io_named_event::GROUP,
         &crate::ntos::io::exports::io_wmi_data_block::GROUP,
         &crate::ntos::io::exports::io_work_item_queue::GROUP,
+        &crate::ntos::dbgk::exports::GROUP,
     ]
 }
 
@@ -407,7 +407,7 @@ pub fn init() {
             ImportSymbol::Ordinal(ordinal) => lookup_ordinal(dll, *ordinal),
         }),
     );
-    // hal.dll, wmilib/wpprecorder e os demais .sys.
+    // hal.dll e os .sys (drivers de export e drivers importados).
     crate::ntos::mm::sysload::register_resolvers();
 }
 
@@ -419,7 +419,7 @@ pub fn handle(id: u64, args: &[u64; 14], return_address: u64, frame: u64, contex
     if crate::ntos::init::exports::private_routines::name(id).is_some() {
         return native_context::invoke(context, || crate::ntos::init::exports::private_routines::dispatch(id, &call));
     }
-    if (0x4000_0000..0x4000_2000).contains(&id) {
+    if crate::ntos::ex::system_services::owns(id) {
         return crate::ntos::ex::system_services::dispatch(id, args, return_address, frame, context);
     }
     native_context::invoke(context, || dispatch(id, &call))
@@ -576,7 +576,7 @@ pub fn invoke_handler(name: &str, arguments: &[u64]) -> Result<u64, KernelError>
 /// Ids aceitos numa saída de contexto nativo: exports públicos e a faixa de
 /// serviços (as rotinas privadas entram com o seu módulo).
 fn valid_id(id: u64) -> bool {
-    id >= 32 && ((id - 32) < abi_names::EXPORT_NAMES.len() as u64 || (0x4000_0000..0x4000_2000).contains(&id) || crate::ntos::init::exports::private_routines::name(id).is_some())
+    id >= 32 && ((id - 32) < abi_names::EXPORT_NAMES.len() as u64 || crate::ntos::ex::system_services::owns(id) || crate::ntos::init::exports::private_routines::name(id).is_some())
 }
 
 /// NTSTATUS devolvido como inteiro de 32 bits com sinal: RAX recebe o valor

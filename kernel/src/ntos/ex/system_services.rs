@@ -1,10 +1,11 @@
 //! Números de serviço e seus provedores.
 //!
-//! Vincula os números lidos das bibliotecas aos provedores das tabelas
-//! nativas: os metadados de `service_abi` descrevem a convenção de chamada
-//! e a disponibilidade depende de uma implementação de usuário (handler
+//! Vincula os números lidos da ntdll aos provedores da tabela nativa: os
+//! metadados de `service_abi` descrevem a convenção de chamada e a
+//! disponibilidade depende de uma implementação de usuário (handler
 //! registrado) ou de kernel (export Nt/Zw). Slots sem provedor apontam para
-//! a falha explícita do runtime; os demais recebem o gateway do número.
+//! a falha explícita do runtime; os demais recebem o gateway do número. A
+//! tabela gráfica (números a partir de 0x1000) é do win32k, não daqui.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -36,9 +37,9 @@ unsafe impl NtStruct for RawArguments {}
 
 const _: () = assert!(core::mem::size_of::<RawArguments>() == 17 * 8);
 
-/// 8192 identificadores privados para as duas tabelas de 4096 posições.
+/// Um identificador privado por posição da tabela nativa.
 pub const PRIVATE_SERVICE_BASE: u64 = 0x4000_0000;
-pub const PRIVATE_SERVICE_COUNT: u64 = 8192;
+pub const PRIVATE_SERVICE_COUNT: u64 = service_table::CAPACITY as u64;
 
 #[derive(Clone)]
 struct Binding {
@@ -48,7 +49,7 @@ struct Binding {
 }
 
 static BINDINGS: SpinLock<BTreeMap<u32, Binding>> = SpinLock::new(BTreeMap::new());
-static REGISTERED: SpinLock<[Option<BTreeMap<u32, String>>; 2]> = SpinLock::new([None, None]);
+static REGISTERED: SpinLock<Option<BTreeMap<u32, String>>> = SpinLock::new(None);
 /// `invoke_service(name, a1..a4, retorno, rsp)` de `ps/user/index`.
 static USER_INVOKER: SpinLock<Option<fn(&str, [u64; 4], u64, u64) -> Result<u32, KernelError>>> = SpinLock::new(None);
 
@@ -60,24 +61,19 @@ fn export_index(name: &str) -> Option<usize> {
     abi_names::EXPORT_NAMES.iter().position(|&candidate| candidate == name)
 }
 
-/// Valida o mapa lido da biblioteca e publica a tabela antes de confirmar
-/// os vínculos; registros repetidos precisam conservar a ABI ativa.
-pub fn register(table_index: usize, input: &BTreeMap<u32, String>) -> Result<(), KernelError> {
-    if table_index > 1 {
-        return Err(KernelError::new("invalid service table index"));
-    }
+/// Valida o mapa lido da ntdll e publica a tabela nativa antes de
+/// confirmar os vínculos; registros repetidos precisam conservar a ABI ativa.
+pub fn register(input: &BTreeMap<u32, String>) -> Result<(), KernelError> {
     let mut names = input.clone();
-    let reference = if table_index == 1 { &service_abi::WIN32 } else { &service_abi::NATIVE };
     // NtQuerySystemTime não tem a rotina canônica nesta imagem: o slot só
     // entra quando todos os demais nomes e números correspondem.
-    let canonical: Vec<&(u32, &str, u32)> = reference.entries.iter().filter(|row| row.1 != "NtQuerySystemTime").collect();
+    let canonical: Vec<&(u32, &str, u32)> = service_abi::NATIVE.entries.iter().filter(|row| row.1 != "NtQuerySystemTime").collect();
     if names.len() == canonical.len() && canonical.iter().all(|row| names.get(&row.0).is_some_and(|name| name == row.1)) {
-        for &(number, name, _) in reference.entries {
+        for &(number, name, _) in service_abi::NATIVE.entries {
             names.insert(number, String::from(name));
         }
     }
-    let base = table_index as u32 * 4096;
-    if names.is_empty() || names.keys().any(|&number| number < base || number >= base + 4096) {
+    if names.is_empty() || names.keys().any(|&number| u64::from(number) >= PRIVATE_SERVICE_COUNT) {
         return Err(KernelError::new("invalid library service numbers"));
     }
     for name in names.values() {
@@ -85,7 +81,7 @@ pub fn register(table_index: usize, input: &BTreeMap<u32, String>) -> Result<(),
             return Err(KernelError::new(alloc::format!("unmeasured service calling convention: {name}")));
         }
     }
-    let existing = REGISTERED.lock()[table_index].clone();
+    let existing = REGISTERED.lock().clone();
     if let Some(existing) = existing {
         if existing != names {
             return Err(KernelError::new("loaded library changes the live service ABI"));
@@ -94,14 +90,14 @@ pub fn register(table_index: usize, input: &BTreeMap<u32, String>) -> Result<(),
         return Ok(());
     }
     let entries = hal::amd64::service_table::entries();
-    let gateway_base = kernel_address::virtual_address(entries[7])?;
-    let unavailable = kernel_address::virtual_address(entries[8])?;
-    let limit = (names.keys().max().copied().unwrap_or(base) - base + 1) as usize;
+    let gateway_base = kernel_address::virtual_address(entries[5])?;
+    let unavailable = kernel_address::virtual_address(entries[6])?;
+    let limit = names.keys().max().copied().unwrap_or(0) as usize + 1;
     let mut targets = vec![unavailable; limit];
     let mut stack_arguments = vec![0u32; limit];
     let mut pending: Vec<(u32, Binding)> = Vec::new();
     for (&number, name) in &names {
-        let slot = (number & 0xFFF) as usize;
+        let slot = number as usize;
         // Primeiro o nome Nt, depois a variante Zw: conserva o índice do
         // export realmente disponível.
         let kernel = export_index(name).or_else(|| export_index(&alloc::format!("Zw{}", &name[2..])));
@@ -113,12 +109,12 @@ pub fn register(table_index: usize, input: &BTreeMap<u32, String>) -> Result<(),
         targets[slot] = gateway_base + number as u64 * 10;
         pending.push((number, Binding { name: name.clone(), kernel, user }));
     }
-    service_table::install(table_index, &targets, &stack_arguments)?;
+    service_table::install(&targets, &stack_arguments)?;
     let providers = pending.len();
     BINDINGS.lock().extend(pending);
-    REGISTERED.lock()[table_index] = Some(names.clone());
+    *REGISTERED.lock() = Some(names.clone());
     state::with(|state| state.name_by_number.extend(names));
-    crate::debug_print!("[services] table={} slots={} providers={} unavailable={}", table_index, limit, providers, limit - providers);
+    crate::debug_print!("[services] table=0 slots={} providers={} unavailable={}", limit, providers, limit - providers);
     Ok(())
 }
 
@@ -126,7 +122,7 @@ pub fn register(table_index: usize, input: &BTreeMap<u32, String>) -> Result<(),
 /// de usuário já foram registrados pelos módulos de `ps/user`.
 pub fn initialize() -> Result<(), KernelError> {
     let (bytes, _) = loader::read_ntdll_input()?;
-    register(0, &syscall_scan::scan_syscall_image(&bytes)?)
+    register(&syscall_scan::scan_syscall_image(&bytes)?)
 }
 
 /// Sonda a pilha de usuário e copia `count` valores de 64 bits para depois

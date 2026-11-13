@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **17 de 43** componentes funcionam; **549 de 770** módulos do plano têm código (535 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.093 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
+Hoje: **18 de 44** componentes funcionam; **551 de 772** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.094 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -88,6 +88,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | i8042prt.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
 | kbdclass.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
 | mouclass.sys | Funciona | Drivers do Windows no boot comum, Teclado real |
+| wmilib.sys e WppRecorder.sys | Funciona | Teclado real, Drivers do Windows no boot comum |
 | atapi.sys e ataport.sys | Parcial | Drivers do Windows no boot comum |
 | disk.sys e classpnp.sys | Parcial | Drivers do Windows no boot comum |
 | mountmgr.sys | Parcial | Drivers do Windows no boot comum |

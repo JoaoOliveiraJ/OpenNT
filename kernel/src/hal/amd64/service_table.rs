@@ -1,10 +1,11 @@
 //! Descritores de serviço nativos.
 //!
-//! KSERVICE_TABLE_DESCRIPTOR (normal e shadow), as tabelas compactadas de
-//! 4096 DWORDs e os bytes de argumentos de cada tabela, mais
-//! `nt_service_lookup`, que decodifica a mesma tabela consumida pela
-//! invocação de serviços. O Executive (`ntos::ex::service_table`) é o dono
-//! do conteúdo; aqui só ficam o armazenamento e a busca nativa.
+//! KSERVICE_TABLE_DESCRIPTOR (normal e shadow), a KiServiceTable compactada
+//! de 4096 DWORDs e os seus bytes de argumentos, mais `nt_service_lookup`,
+//! que decodifica os mesmos descritores consumidos pela invocação de
+//! serviços. A tabela gráfica não mora aqui: é o win32k que a entrega. O
+//! Executive (`ntos::ex::service_table`) é o dono do conteúdo; aqui só ficam
+//! o armazenamento e a busca nativa.
 
 core::arch::global_asm!(
     r#"
@@ -54,12 +55,8 @@ ke_service_descriptor_table_shadow: .zero 64
 .balign 4096
 .global ki_native_service_table
 ki_native_service_table: .zero 16384
-.global ki_win32_service_table
-ki_win32_service_table: .zero 16384
 .global ki_native_argument_table
 ki_native_argument_table: .zero 4096
-.global ki_win32_argument_table
-ki_win32_argument_table: .zero 4096
 .popsection
 "#
 );
@@ -68,13 +65,11 @@ unsafe extern "C" {
     static ke_service_descriptor_table: u8;
     static ke_service_descriptor_table_shadow: u8;
     static ki_native_service_table: u8;
-    static ki_win32_service_table: u8;
     static ki_native_argument_table: u8;
-    static ki_win32_argument_table: u8;
     fn nt_service_lookup();
 }
 
-// Provedores MS x64 das tabelas vivas.
+// Provedores MS x64 da tabela nativa viva.
 // Cada gateway de dez bytes marca o id privado (0x40000000 + número) e cai
 // no trampolim comum; só slots com implementação registrada os recebem. A
 // falha comum dos slots sem provedor nunca relata sucesso.
@@ -85,7 +80,7 @@ core::arch::global_asm!(
 .global nt_service_gateways
 nt_service_gateways:
 .set opennt_service_index, 0
-.rept 8192
+.rept 4096
     .byte 0xB8
     .long 0x40000000 + opennt_service_index
     .byte 0xE9
@@ -105,18 +100,16 @@ extern "C" {
     fn nt_service_unimplemented();
 }
 
-/// Endereços na imagem, nesta ordem: busca, descritor, shadow, tabelas
-/// nativa/win32, argumentos nativo/win32, os gateways e a rotina de serviço
+/// Endereços na imagem, nesta ordem: busca, descritor, shadow, tabela
+/// nativa, argumentos nativos, os gateways e a rotina de serviço
 /// indisponível.
-pub fn entries() -> [u64; 9] {
+pub fn entries() -> [u64; 7] {
     [
         nt_service_lookup as unsafe extern "C" fn() as usize as u64,
         &raw const ke_service_descriptor_table as u64,
         &raw const ke_service_descriptor_table_shadow as u64,
         &raw const ki_native_service_table as u64,
-        &raw const ki_win32_service_table as u64,
         &raw const ki_native_argument_table as u64,
-        &raw const ki_win32_argument_table as u64,
         nt_service_gateways as unsafe extern "C" fn() as usize as u64,
         nt_service_unimplemented as unsafe extern "C" fn() as usize as u64,
     ]

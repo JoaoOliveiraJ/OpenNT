@@ -65,44 +65,8 @@ pub mod event_enabled {
     };
 }
 
-pub mod wpp {
-    //! Exports da WppRecorder.sys (rastreamento WPP).
-    //!
-    //! Adaptadores das sessões de trace de `ntos::etw::wpp`.
-
-    use crate::ntos::etw::wpp;
-    use crate::ntos::init::exports::{signed_status, Call, Group};
-    use crate::rtl::KernelError;
-
-    fn auto_log_start(call: &Call) -> Result<u64, KernelError> {
-        wpp::auto_log_start(call.arg(2));
-        Ok(0)
-    }
-
-    fn auto_log_trace(call: &Call) -> Result<u64, KernelError> {
-        wpp::auto_log_trace(call.arg(1) as u32, call.arg(5) as u32);
-        Ok(0)
-    }
-
-    fn auto_log_stop(call: &Call) -> Result<u64, KernelError> {
-        wpp::auto_log_stop(call.arg(1) as u32);
-        Ok(0)
-    }
-
-    fn recorder_replay(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(wpp::recorder_replay(call.arg(1) as u32)))
-    }
-
-    pub static GROUP: Group = Group {
-        name: "wpp",
-        names: &["WppAutoLogStart", "WppAutoLogTrace", "WppAutoLogStop", "imp_WppRecorderReplay"],
-        handlers: &[auto_log_start, auto_log_trace, auto_log_stop, recorder_replay],
-        data_exports: &[],
-    };
-}
-
 pub mod wmi {
-    //! Exports da WMILIB.SYS.
+    //! WmiTraceMessage, WmiTraceMessageVa e WmiQueryTraceInformation.
     //!
     //! Adaptadores de `ntos::etw::wmi`; as limitações estão descritas em cada
     //! operação de lá.
@@ -110,16 +74,6 @@ pub mod wmi {
     use crate::ntos::etw::wmi;
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::rtl::KernelError;
-
-    fn system_control(call: &Call) -> Result<u64, KernelError> {
-        wmi::system_control(call.arg(4));
-        Ok(0)
-    }
-
-    fn complete_request(call: &Call) -> Result<u64, KernelError> {
-        wmi::complete_request(call.arg(2), call.arg(3) as u32, call.arg(4) as u32);
-        Ok(0)
-    }
 
     fn trace_message(call: &Call) -> Result<u64, KernelError> {
         wmi::trace_message(call.arg(5), [call.arg(6), call.arg(7), call.arg(8), call.arg(9)])?;
@@ -138,8 +92,8 @@ pub mod wmi {
 
     pub static GROUP: Group = Group {
         name: "wmi",
-        names: &["WmiSystemControl", "WmiCompleteRequest", "WmiTraceMessage", "WmiTraceMessageVa", "WmiQueryTraceInformation"],
-        handlers: &[system_control, complete_request, trace_message, trace_message_va, query_trace_information],
+        names: &["WmiTraceMessage", "WmiTraceMessageVa", "WmiQueryTraceInformation"],
+        handlers: &[trace_message, trace_message_va, query_trace_information],
         data_exports: &[],
     };
 }

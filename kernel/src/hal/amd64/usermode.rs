@@ -55,6 +55,7 @@ const SFMASK_VALUE: u64 = 0x47700;
 const TSS_LIMIT: u64 = 104;
 /// Retorno de NtTerminateProcess ("TRMI").
 const TERMINATE_MAGIC: u64 = 0x5452_4D49;
+const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000_001C;
 
 global_asm!(
     r#"
@@ -773,13 +774,21 @@ fn save_syscall_context(frame: *const u64, result: u64) {
 }
 
 /// Chamado pelo stub de syscall com o frame: escolhe a entrada real do
-/// descritor e chama o alvo MS x64 com os argumentos copiados.
+/// descritor da thread (o Shadow só para threads GUI) e chama o alvo MS x64
+/// com os argumentos copiados; um número fora do limite segue o caminho do
+/// Executive (conversão em thread GUI ou STATUS_INVALID_SYSTEM_SERVICE).
 #[no_mangle]
 pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
-    let mut result: u64 = 0xC000_001C;
+    let mut result: u64 = 0;
     let mut stack_count = 0u64;
     let number = unsafe { *frame };
-    let target = service_lookup(number, 1, &mut stack_count);
+    let mut target = service_lookup(number, crate::ntos::ps::win32_callouts::is_gui_thread() as u64, &mut stack_count);
+    if target == 0 {
+        match crate::ntos::ex::service_table::out_of_range(number as u32).unwrap_or(Err(STATUS_INVALID_SYSTEM_SERVICE)) {
+            Ok((routine, arguments)) => (target, stack_count) = (routine, u64::from(arguments)),
+            Err(status) => result = u64::from(status),
+        }
+    }
     capture_syscall_registers(frame, number);
     STATE.lock().frame_context = read64(USER_CONTEXT_CELL);
     {

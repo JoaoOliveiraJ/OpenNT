@@ -190,7 +190,7 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
     });
     LOADED_MODULES.lock().insert(String::from("ntdll.dll"), module.clone());
     *NTDLL_MODULE.lock() = Some(module);
-    system_services::register(0, &syscall_scan::scan_syscall_stubs(&exports))?;
+    system_services::register(&syscall_scan::scan_syscall_stubs(&exports))?;
     pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("ntdll.dll"), Arc::new(ntdll_resolver));
     let mapped = state::with(|state| state.name_by_number.len());
     crate::debug_print!("[usermode] ntdll.dll {} em {:#x} ({} exports, {} syscalls mapeados)", origin, image.image_base, exports.len(), mapped);

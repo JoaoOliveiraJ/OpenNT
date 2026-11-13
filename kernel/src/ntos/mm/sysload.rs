@@ -382,9 +382,9 @@ fn import(dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
     }
 }
 
-/// Resolvedores do loader de PE: hal.dll pelas bibliotecas,
-/// wmilib.sys e wpprecorder.sys pelos exports do kernel, e qualquer outro
-/// .sys como driver de export ou driver importado.
+/// Resolvedores do loader de PE: hal.dll pelas bibliotecas e qualquer .sys
+/// (wmilib.sys, WppRecorder.sys...) como driver de export ou driver
+/// importado.
 pub fn register_resolvers() {
     static REGISTERED: SpinLock<bool> = SpinLock::new(false);
     let mut registered = REGISTERED.lock();
@@ -393,12 +393,6 @@ pub fn register_resolvers() {
     }
     *registered = true;
     pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("hal.dll"), Arc::new(import));
-    let kernel = |dll: &str, symbol: &ImportSymbol| match symbol {
-        ImportSymbol::Name(name) => exports::lookup(dll, name),
-        ImportSymbol::Ordinal(ordinal) => exports::lookup_ordinal(dll, *ordinal),
-    };
-    pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("wmilib.sys"), Arc::new(kernel));
-    pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("wpprecorder.sys"), Arc::new(kernel));
     pe_loader::register_resolver(|dll| dll.to_lowercase().ends_with(".sys"), Arc::new(import));
 }
 

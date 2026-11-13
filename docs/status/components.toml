@@ -420,6 +420,17 @@ fase = "6"
 notas = "Entra como filtro de classe sobre o i8042prt.sys e a pilha do mouse recebe START_DEVICE; nenhum programa consome o mouse ainda."
 
 [[componente]]
+nome = "wmilib.sys e WppRecorder.sys"
+categoria = "Drivers do Windows"
+icone = "chip"
+descricao = "Bibliotecas de export da Microsoft usadas pelos drivers de teclado, mouse e disco: a wmilib.sys atende o IRP_MJ_SYSTEM_CONTROL (WMI) e a WppRecorder.sys guarda o rastreamento WPP de cada driver (In-Flight Recorder)."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "xtask/src/windows_binaries.rs", "kernel/src/ntos/dbgk/wer.rs"]
+testes = ["teclado", "drivers"]
+fase = "6"
+notas = "Carregam como drivers de export (DllInitialize) na primeira vez que um driver as importa: a wmilib.sys com o ataport.sys no boot, a WppRecorder.sys com o kbdclass.sys, o i8042prt.sys e o mouclass.sys; os imports desses drivers resolvem nos exports das imagens reais, e o ntoskrnl do OpenNT não publica nenhum nome delas. A WppRecorder.sys procura o RtlQueryModuleInformation pelo MmGetSystemRoutineAddress, que o kernel ainda não tem (ela segue sem ele), e importa o DbgkWerCaptureLiveKernelDump, que falha com STATUS_NOT_SUPPORTED como num Windows sem o werkernel.sys."
+
+[[componente]]
 nome = "atapi.sys e ataport.sys"
 categoria = "Drivers do Windows"
 icone = "disk"
@@ -510,7 +521,7 @@ icone = "window"
 descricao = "O subsistema de janelas e gráficos do Windows no kernel (USER e GDI), carregado como imagem de sistema."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda."
+notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda. Sem eles, a tabela 1 do KeServiceDescriptorTableShadow fica vazia, como no Windows: uma syscall gráfica tenta converter a thread em GUI pelo PsConvertToGuiThread, que falha sem os callouts, e devolve STATUS_INVALID_SYSTEM_SERVICE. A KeAddSystemServiceTable e a PsEstablishWin32Callouts, por onde o win32k publica essa tabela e os callouts, ainda não existem."
 
 [[componente]]
 nome = "dxgkrnl.sys e BasicDisplay.sys"
@@ -548,7 +559,7 @@ estado = "implementado"
 caminhos = ["kernel/src/drivers/fs/memory_file_system.rs"]
 testes = ["selftest", "fase3"]
 fase = "1"
-notas = "Suporte de boot do próprio kernel. Guarda também as cópias dos drivers do Windows que o build embute (hal.dll, as pilhas de teclado e de disco e o watchdog.sys), de onde o carregador os lê."
+notas = "Suporte de boot do próprio kernel. Guarda também as cópias dos drivers do Windows que o build embute (hal.dll, as pilhas de teclado e de disco, as bibliotecas wmilib.sys e WppRecorder.sys e o watchdog.sys), de onde o carregador os lê."
 
 [[componente]]
 nome = "NTFS (leitor do kernel)"
@@ -819,6 +830,14 @@ descricao = "Event Tracing for Windows."
 fase = "4"
 
 [[subsistema]]
+pasta = "ntos/dbgk"
+nome = "Depuração (Dbgk)"
+icone = "chart"
+descricao = "Relatórios ao vivo do Windows Error Reporting."
+fase = "6"
+notas = "Sem o werkernel.sys, o DbgkWerCaptureLiveKernelDump faz as validações do Windows e falha com STATUS_NOT_SUPPORTED, o status do stub da extensão ausente."
+
+[[subsistema]]
 pasta = "ntos/alpc"
 nome = "Comunicação entre processos (Alpc)"
 icone = "message"
@@ -1007,6 +1026,7 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 "drivers/crypto/ksecdd" = "papel do ksecdd.sys real, alvo de carga; o kernel só dá o suporte"
 "ntos/ps/user/win32k" = "papel do win32k.sys real (win32kbase/win32kfull), alvo de carga; o kernel só dá o suporte"
 "ntos/ps/user/user_atoms" = "papel do win32k.sys real (átomos USER), alvo de carga; o kernel só dá o suporte"
+"ntos/exports/wpp" = "papel da WppRecorder.sys real, carregada como driver de export; o kernel só dá o suporte"
 "win32/argument_precision" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/argument_widths" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/ataport_trace" = "diagnóstico temporário do ataport"

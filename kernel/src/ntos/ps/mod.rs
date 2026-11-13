@@ -24,5 +24,6 @@ pub mod process_accessors;
 pub mod thread_accessors;
 pub mod open;
 pub mod security;
+pub mod win32_callouts;
 pub mod user;
 pub mod exports;

@@ -1717,28 +1717,28 @@ fn service_tables(assert: Assert) {
     };
     // O boot com a ntdll de bring-up já instalou a tabela nativa: o teste a
     // guarda, trabalha com a tabela livre e a reinstala no fim.
-    let live = st::installed(0);
+    let live = st::installed();
     if live.is_some() {
-        let _ = st::self_test_reset(0);
+        let _ = st::self_test_reset();
     }
-    assert(addresses.descriptor % 32 == 0 && addresses.shadow == addresses.descriptor + 64 && addresses.tables[1] == addresses.tables[0] + 0x4000 && addresses.argument_tables[0] == addresses.tables[1] + 0x4000, "services: descritores e tabelas no alias da imagem");
+    assert(addresses.descriptor % 32 == 0 && addresses.shadow == addresses.descriptor + 64 && addresses.argument_table == addresses.table + 0x4000, "services: descritores e tabela no alias da imagem");
     let alias = |routine: u64| kernel_address::virtual_address(routine).unwrap_or(0);
     let targets = [
         alias(enum_handle_callback as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64),
         alias(special_routine as extern "win64" fn(u64, u64, u64, u64, u64) as usize as u64),
         alias(normal_routine as extern "win64" fn(u64, u64, u64) as usize as u64),
     ];
-    let table = addresses.tables[0];
+    let table = addresses.table;
     assert(targets.iter().all(|&target| target != 0) && st::encode_entry(table, targets[1], 3).is_ok_and(|value| st::decode_entry(table, value) == (targets[1], 3)), "services: codificacao relativa de 28 bits");
     assert(st::encode_entry(table, table - 0x10, 1).is_ok_and(|value| st::decode_entry(table, value) == (table - 0x10, 1)), "services: deslocamento negativo");
     assert(st::encode_entry(table, 0, 0).is_err() && st::encode_entry(table, table + 0x800_0000, 0).is_err() && st::encode_entry(table, targets[0], 16).is_err(), "services: entradas fora do formato recusadas");
-    assert(st::install(2, &targets, &[0, 3, 15]).is_err() && st::install(0, &targets, &[0, 3]).is_err(), "services: tabela invalida recusada");
-    assert(st::install(0, &targets, &[0, 3, 15]).is_ok_and(|record| record.limit == 3 && record.descriptors == alloc::vec![addresses.descriptor, addresses.shadow]), "services: KiServiceTable publicada");
+    assert(st::install(&targets, &[0, 3]).is_err(), "services: tabela invalida recusada");
+    assert(st::install(&targets, &[0, 3, 15]).is_ok_and(|record| record.limit == 3 && record.descriptors == alloc::vec![addresses.descriptor, addresses.shadow]), "services: KiServiceTable publicada");
     let native_entry = |descriptor: u64| {
         let descriptor = unsafe { KserviceTableDescriptor::at(descriptor) };
-        descriptor.base.get() == table && descriptor.count.get() == 0 && descriptor.limit.get() == 3 && descriptor.number.get() == addresses.argument_tables[0]
+        descriptor.base.get() == table && descriptor.count.get() == 0 && descriptor.limit.get() == 3 && descriptor.number.get() == addresses.argument_table
     };
-    let arguments = guest::read_bytes(addresses.argument_tables[0], 3);
+    let arguments = guest::read_bytes(addresses.argument_table, 3);
     assert(native_entry(addresses.descriptor) && native_entry(addresses.shadow) && arguments[1] == 12 && arguments[2] == 60, "services: KeServiceDescriptorTable e Shadow");
     assert(matches!(st::inspect(1, false), Ok(found) if found == (targets[1], 3)) && matches!(st::inspect(3, false), Ok((0, 0))) && matches!(st::inspect(0x1000, true), Ok((0, 0))), "services: inspecao e limite");
     let output = guest::alloc_bytes(8);
@@ -1746,14 +1746,28 @@ fn service_tables(assert: Assert) {
     let count = guest::read64(output);
     let missing = native_call::call(addresses.lookup, &[5, 1, output]);
     assert(found == targets[2] && count == 15 && missing == 0 && guest::read64(output) == 0, "services: nt_service_lookup nativo");
-    assert(st::install(0, &targets, &[0, 3, 15]).is_ok() && st::install(0, &targets, &[0, 3, 14]).is_err(), "services: ABI viva so pode ser confirmada");
-    assert(st::install(1, &targets[2..], &[2]).is_ok() && unsafe { KserviceTableDescriptor::array_at(addresses.shadow, 2) }[1].base.get() == addresses.tables[1], "services: tabela win32 so no shadow");
-    assert(matches!(st::inspect(0x1000, true), Ok(found) if found == (targets[2], 2)) && native_call::call(addresses.lookup, &[0x1000, 1, 0]) == targets[2] && matches!(st::inspect(0x1000, false), Ok((0, 0))), "services: servico grafico pelo shadow");
-    assert(st::self_test_reset(0).is_ok() && st::self_test_reset(1).is_ok() && matches!(st::inspect(1, false), Ok((0, 0))) && guest::read32(addresses.tables[0]) == 0, "services: tabelas devolvidas para o boot");
+    assert(st::install(&targets, &[0, 3, 15]).is_ok() && st::install(&targets, &[0, 3, 14]).is_err(), "services: ABI viva so pode ser confirmada");
+    // Sem o win32k a tabela 1 do Shadow fica vazia: a conversão em thread GUI
+    // falha e a syscall gráfica devolve STATUS_INVALID_SYSTEM_SERVICE.
+    let graphics = &unsafe { KserviceTableDescriptor::array_at(addresses.shadow, 2) }[1];
+    assert(graphics.base.get() == 0 && graphics.limit.get() == 0 && native_call::call(addresses.lookup, &[0x1000, 1, 0]) == 0, "services: tabela grafica vazia sem o win32k");
+    assert(st::out_of_range(3).is_ok_and(|located| located == Err(0xC000_001C)) && st::out_of_range(0x1000).is_ok_and(|located| located == Err(0xC000_001C)), "services: fora do limite sem conversao em thread GUI");
+    // Com uma tabela gráfica publicada (o papel do win32k), a falha da
+    // conversão devolve o byte de erro guardado depois das entradas.
+    let published = guest::alloc_bytes(16);
+    guest::write_bytes(published + 8, &[0x00, 0xFF]);
+    graphics.base.set(published);
+    graphics.limit.set(2);
+    let errors = (st::out_of_range(0x1000), st::out_of_range(0x1001), st::out_of_range(0x1002));
+    graphics.limit.set(0);
+    graphics.base.set(0);
+    guest::free_bytes(published);
+    assert(errors.0.is_ok_and(|located| located == Err(0)) && errors.1.is_ok_and(|located| located == Err(0xFFFF_FFFF)) && errors.2.is_ok_and(|located| located == Err(0xC000_001C)), "services: bytes de erro da tabela grafica quando a conversao falha");
+    assert(st::self_test_reset().is_ok() && matches!(st::inspect(1, false), Ok((0, 0))) && guest::read32(addresses.table) == 0, "services: tabela devolvida para o boot");
     guest::free_bytes(output);
     if let Some(record) = live {
         let (targets, arguments): (alloc::vec::Vec<u64>, alloc::vec::Vec<u32>) = record.values.iter().map(|&value| st::decode_entry(record.table, value)).unzip();
-        assert(st::install(0, &targets, &arguments).is_ok_and(|restored| restored.values == record.values && restored.limit == record.limit), "services: tabela do boot reinstalada");
+        assert(st::install(&targets, &arguments).is_ok_and(|restored| restored.values == record.values && restored.limit == record.limit), "services: tabela do boot reinstalada");
     }
 }
 

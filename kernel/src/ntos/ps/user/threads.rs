@@ -173,9 +173,6 @@ static EXECUTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
 /// `call_capture::consume` + `exceptions::hardware`/`pending`: devolve o status
 /// fatal ou 0 para continuar.
 static EXIT_HANDLER: SpinLock<Option<fn(&Arc<UserThread>, u32, u32) -> u32>> = SpinLock::new(None);
-/// Callout de término de thread do win32k (o W32ThreadCallout que o
-/// win32k.sys real registra por PsEstablishWin32Callouts).
-static WIN32K_RELEASE: SpinLock<Option<fn(u64, u64)>> = SpinLock::new(None);
 static PUMPS: SpinLock<[Option<fn()>; 5]> = SpinLock::new([None; 5]);
 
 pub fn set_executor(executor: fn(u64, u64) -> u32) {
@@ -184,10 +181,6 @@ pub fn set_executor(executor: fn(u64, u64) -> u32) {
 
 pub fn set_exit_handler(handler: fn(&Arc<UserThread>, u32, u32) -> u32) {
     *EXIT_HANDLER.lock() = Some(handler);
-}
-
-pub fn set_win32k_release(release: fn(u64, u64)) {
-    *WIN32K_RELEASE.lock() = Some(release);
 }
 
 pub fn set_pump(slot: usize, routine: fn()) {
@@ -577,9 +570,6 @@ pub fn release_execution_resources(thread: &Arc<UserThread>) {
     // A TEB principal divide a região com a PEB do processo.
     let Some(regions) = thread.with(|thread| thread.regions.take()) else { return };
     system_process_information::sample();
-    if let Some(release) = *WIN32K_RELEASE.lock() {
-        release(state::with(|state| state.current_process_id), thread.thread_id);
-    }
     for region in &regions {
         memory::release_private_region(region);
     }

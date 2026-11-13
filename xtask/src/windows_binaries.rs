@@ -1,7 +1,8 @@
 //! Binários reais do Windows desta máquina, copiados no build (nunca ficam
 //! no repositório).
 //!
-//! O hal.dll e as pilhas de teclado/mouse e de armazenamento entram no
+//! O hal.dll, as pilhas de teclado/mouse e de armazenamento e as bibliotecas
+//! de export que elas importam (wmilib.sys e WppRecorder.sys) entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em
 //! memória). O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
 //! e a lista de revogação), os arquivos que o vgk.sys abre pelo caminho
@@ -23,6 +24,7 @@ const BUNDLED: &[&str] = &[
     "System32/drivers/classpnp.sys",
     "System32/drivers/mountmgr.sys",
     "System32/drivers/wmilib.sys",
+    "System32/drivers/WppRecorder.sys",
     "System32/drivers/watchdog.sys",
 ];
 

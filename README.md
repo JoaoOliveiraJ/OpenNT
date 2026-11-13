@@ -46,8 +46,10 @@ que fala a mesma ABI binária que os drivers do Windows esperam.
   validando a integridade das imagens:
   - **Teclado de ponta a ponta:** `i8042prt.sys` + `kbdclass.sys` da Microsoft —
     o shell recebe as teclas pela pilha PnP real.
-  - **Armazenamento:** `ataport`, `atapi`, `disk`, `classpnp`, `mountmgr`,
-    `wmilib`; **mouse:** `mouclass`; **criptografia:** `cng.sys`.
+  - **Armazenamento:** `ataport`, `atapi`, `disk`, `classpnp`, `mountmgr`;
+    **mouse:** `mouclass`; **criptografia:** `cng.sys`.
+  - **Bibliotecas de export** importadas por esses drivers: `wmilib.sys` e
+    `WppRecorder.sys`.
 - **Mais de 900 símbolos** que o `ntoskrnl.exe` do Windows 10 22H2 exporta aos
   drivers já são oferecidos pelo OpenNT (de ~3.070 no total), implementados com
   a semântica real de cada função.

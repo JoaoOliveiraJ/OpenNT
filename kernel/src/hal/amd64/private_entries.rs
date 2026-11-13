@@ -159,7 +159,7 @@ opennt_ob_find_handle_filter:
 # ObFindHandleForObject(process, object, type, handleInformation, handle):
 # a sequência do ntoskrnl 19041, registrador a registrador — contexto de
 # três ponteiros em [rsp+0x20] (cabeçalho, tipo, informação), quinto
-# argumento em [rsp+0x70], ExEnumHandleTable (id 715) e a liberação da
+# argumento em [rsp+0x70], ExEnumHandleTable (id 709) e a liberação da
 # RundownProtect com `lea rcx, [rsi + 0x458]` (id 278).
 .balign 16
 .global opennt_ob_find_handle_for_object
@@ -190,7 +190,7 @@ opennt_ob_find_handle_for_object:
     lea rdx, [rip + opennt_ob_find_handle_filter]
     mov [rsp + 0x28], r14
     mov [rsp + 0x30], rbp
-    call opennt_win32_stubs + 715 * 10
+    call opennt_win32_stubs + 709 * 10
     test al, al
     movzx ebx, bl
     mov edx, 1
@@ -289,7 +289,7 @@ extern "C" {
 /// Ids públicos fixados nos corpos do ObFindHandleForObject e do
 /// ObReferenceProcessHandleTable.
 pub const ACQUIRE_RUNDOWN_ID: u64 = 277;
-pub const ENUM_HANDLES_ID: u64 = 715;
+pub const ENUM_HANDLES_ID: u64 = 709;
 pub const RELEASE_RUNDOWN_ID: u64 = 278;
 
 /// Endereço físico (identidade) de um símbolo privado ou corpo nativo.

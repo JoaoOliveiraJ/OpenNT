@@ -1577,14 +1577,14 @@ fn user_system_services(assert: Assert) {
     if boot_table.is_empty() || boot_table == expected {
         let invalid: alloc::collections::BTreeMap<u32, alloc::string::String> = [(5000u32, alloc::string::String::from("NtClose"))].into_iter().collect();
         let unmeasured: alloc::collections::BTreeMap<u32, alloc::string::String> = [(3u32, alloc::string::String::from("NtBogus"))].into_iter().collect();
-        assert(system_services::register(2, &expected).is_err() && system_services::register(0, &invalid).is_err() && system_services::register(0, &unmeasured).is_err() && system_services::register(0, &alloc::collections::BTreeMap::new()).is_err(), "userservices: indice, numeros e convencao nao medida recusados");
-        assert(system_services::register(0, &expected).is_ok() && state::with(|state| state.name_by_number.get(&0x2C).is_some_and(|name| name == "NtTerminateProcess")), "userservices: tabela nativa registrada");
+        assert(system_services::register(&invalid).is_err() && system_services::register(&unmeasured).is_err() && system_services::register(&alloc::collections::BTreeMap::new()).is_err(), "userservices: numeros e convencao nao medida recusados");
+        assert(system_services::register(&expected).is_ok() && state::with(|state| state.name_by_number.get(&0x2C).is_some_and(|name| name == "NtTerminateProcess")), "userservices: tabela nativa registrada");
         let entries = crate::hal::amd64::service_table::entries();
-        let (gateways, unavailable) = (kernel_address::virtual_address(entries[7]).unwrap_or(0), kernel_address::virtual_address(entries[8]).unwrap_or(0));
+        let (gateways, unavailable) = (kernel_address::virtual_address(entries[5]).unwrap_or(0), kernel_address::virtual_address(entries[6]).unwrap_or(0));
         assert(service_table::inspect(0x2C, false).is_ok_and(|(address, arguments)| address == gateways + 0x2C * 10 && arguments == 0) && service_table::inspect(0x27, false).is_ok_and(|(address, _)| address == gateways + 0x27 * 10) && service_table::inspect(0x28, false).is_ok_and(|(address, _)| address == unavailable), "userservices: gateways dos provedores e falha comum do slot sem provedor");
         assert(system_services::private_name(0x4000_002C).as_deref() == Some("ZwTerminateProcess") && system_services::private_name(0x4000_0027).as_deref() == Some("ZwDisplayString") && system_services::private_name(0x4000_0028).as_deref() == Some("UnavailableSystemService") && system_services::private_name(5).is_none(), "userservices: nomes privados conforme o PreviousMode");
         let changed: alloc::collections::BTreeMap<u32, alloc::string::String> = [(0x27u32, alloc::string::String::from("NtDisplayString"))].into_iter().collect();
-        assert(system_services::register(0, &expected).is_ok() && system_services::register(0, &changed).is_err(), "userservices: a ABI viva nao muda");
+        assert(system_services::register(&expected).is_ok() && system_services::register(&changed).is_err(), "userservices: a ABI viva nao muda");
         // Chamadas nativas: o gateway chega ao export Zw; o slot vazio falha.
         let terminated = native_call::call(gateways + 0x2C * 10, &[0x7FFF_FFF0, 0]);
         assert(terminated as u32 == 0xC000_0008 && native_call::call(unavailable, &[]) == 0xC000_0002, "userservices: gateway em KernelMode e STATUS_NOT_IMPLEMENTED");
@@ -1893,7 +1893,7 @@ fn user_index(assert: Assert) {
     if state::with(|state| state.name_by_number.get(&0x2C).is_some()) {
         assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && physical::read32(state::EXIT_CODE_CELL) == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
         // Caminho completo em UserMode: gateway, trampolim, despacho e ponte.
-        let gateways = kernel_address::virtual_address(crate::hal::amd64::service_table::entries()[7]).unwrap_or(0);
+        let gateways = kernel_address::virtual_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
         let previous = process::get_current_thread();
         if let Ok(thread) = process::create_kernel_thread(process::get_current_process(), 0x7F00, true, 1, None) {
             process::set_current_thread(thread);
@@ -1963,6 +1963,13 @@ fn user_ring3(assert: Assert) {
     guest::write_bytes(code, &program);
     let displayed = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
     assert(displayed == 0x30, "userring3: NtDisplayString retorna ao anel 3 com o status em RAX");
+    // 2b. Serviço gráfico (0x1000) sem o win32k: a conversão em thread GUI
+    // falha e a syscall devolve STATUS_INVALID_SYSTEM_SERVICE.
+    let mut program: alloc::vec::Vec<u8> = alloc::vec![0xB8, 0x00, 0x10, 0x00, 0x00, 0x49, 0x89, 0xCA, 0x0F, 0x05, 0x89, 0xC2];
+    program.extend_from_slice(terminate);
+    guest::write_bytes(code, &program);
+    let graphics = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
+    assert(graphics == 0xC000_001C && unsafe { nt::Ethread::at(thread) }.tcb.gui_thread() == 0, "userring3: syscall da tabela 1 sem o win32k devolve STATUS_INVALID_SYSTEM_SERVICE e a thread segue nao-GUI");
     // 3. ud2: o processo morre com STATUS_ILLEGAL_INSTRUCTION e o kernel segue.
     guest::write_bytes(code, &[0x0F, 0x0B]);
     let faulted = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
@@ -3402,7 +3409,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1119, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1114, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
