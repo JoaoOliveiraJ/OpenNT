@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 
 use super::{bugcheck, processor_group, smp};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{GroupAffinity, NtStruct};
 use crate::ntos::ps::process;
 use crate::rtl::SpinLock;
 
@@ -78,7 +78,9 @@ pub fn revert_to_user_affinity_thread_ex(affinity: u64) {
 /// (opcional) com Mask 0 quando a thread não estava em afinidade de
 /// sistema; só o grupo 0 existe.
 pub fn set_system_group_affinity_thread(requested: u64, previous: u64) {
-    let (mask, group) = (guest::read64(requested), guest::read16(requested + 8));
+    // SAFETY: PGROUP_AFFINITY Affinity do driver.
+    let requested = unsafe { GroupAffinity::at(requested) };
+    let (mask, group) = (requested.mask.get(), requested.group.get());
     if group != 0 {
         bugcheck::bug_check_ex(INVALID_AFFINITY_SET as u32, mask, group as u64, 0, 0);
     }
@@ -91,7 +93,8 @@ pub fn set_system_group_affinity_thread(requested: u64, previous: u64) {
 
 /// KeRevertToUserGroupAffinityThread: Mask 0 volta à afinidade de usuário.
 pub fn revert_to_user_group_affinity_thread(previous_affinity: u64) {
-    let mask = guest::read64(previous_affinity);
+    // SAFETY: PGROUP_AFFINITY PreviousAffinity do driver.
+    let mask = unsafe { GroupAffinity::at(previous_affinity) }.mask.get();
     let system = if mask == 0 { None } else { Some(validated_affinity(mask)) };
     update_affinity(current_thread(), |state| state.system = system);
 }

@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::rtl::SpinLock;
 
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
@@ -27,7 +27,8 @@ static POWER_SETTING_CALLBACKS: SpinLock<Vec<PowerSettingCallback>> = SpinLock::
 pub fn register_callback(device: u64, setting_guid: u64, callback: u64, context: u64, handle_out: u64) {
     POWER_SETTING_CALLBACKS.lock().push(PowerSettingCallback { callback, _context: context, _device: device, _setting_guid: setting_guid });
     if handle_out != 0 {
-        guest::write64(handle_out, callback);
+        // SAFETY: PVOID* Handle de saída do chamador.
+        unsafe { Field::<u64>::at(handle_out) }.set(callback);
     }
 }
 

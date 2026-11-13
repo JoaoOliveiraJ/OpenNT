@@ -10,15 +10,43 @@
 //! (KeSignalCallDpcSynchronize). As duas contam os participantes reais,
 //! então a espera sempre termina.
 
+use core::sync::atomic::Ordering;
+
 use super::{dpc, irql};
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::nt_abi::kdpc;
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::Kdpc;
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::KernelError;
 
-/// Bloco da chamada: +0 pendentes, +8 barreira { restantes, participantes, sentido }.
-const CALL_DPC_BLOCK: u64 = 0x20;
-const CALL_DPC_BARRIER: u64 = 8;
+/// Barreira de KeSignalCallDpcSynchronize (SystemArgument2 da DPC).
+#[repr(C)]
+struct CallDpcBarrier {
+    remaining: Field<i32>,
+    participants: Field<i32>,
+    sense: Field<u32>,
+    _pad_0c: Reserved<4>,
+}
+
+/// Bloco da chamada (memória do OpenNT): pendentes (SystemArgument1 da DPC,
+/// para KeSignalCallDpcDone) e a barreira.
+#[repr(C)]
+struct CallDpcBlock {
+    pending: Field<i32>,
+    _pad_04: Reserved<4>,
+    barrier: CallDpcBarrier,
+    _pad_18: Reserved<8>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CallDpcBarrier {}
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CallDpcBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CallDpcBlock>() == 0x20);
+    assert!(core::mem::offset_of!(CallDpcBlock, barrier) == 8);
+};
 
 /// KeExpandKernelStackAndCalloutEx: chama `callout(parameter, context)` na
 /// pilha atual e devolve o resultado em 32 bits.
@@ -31,37 +59,29 @@ pub fn ipi_generic_call(routine: u64, context: u64) -> u64 {
     native_call::call(routine, &[context, 0])
 }
 
-fn atomic_add32(pointer: u64, delta: i32) -> i32 {
-    loop {
-        let value = guest::read32(pointer);
-        let next = (value as i32).wrapping_add(delta);
-        if guest::compare_exchange32(pointer, value, next as u32).unwrap_or_else(|error| panic!("{error}")) == value {
-            return next;
-        }
-    }
-}
-
 /// KeGenericCallDpc: roda `routine` como DPC em cada participante e espera
 /// todos avisarem o fim.
 pub fn generic_call_dpc(routine: u64, context: u64) -> Result<(), KernelError> {
-    let participants = 1u32;
-    let block = guest::alloc_bytes(CALL_DPC_BLOCK);
-    let dpc = guest::alloc_bytes(kdpc::SIZE);
+    let participants = 1i32;
+    let block = guest::alloc_bytes(CallDpcBlock::SIZE);
+    let dpc = guest::alloc_bytes(Kdpc::SIZE);
     if block == 0 || dpc == 0 {
         return Err(KernelError::new("KeGenericCallDpc: sem memoria para a DPC"));
     }
-    guest::write_bytes(block, &[0; CALL_DPC_BLOCK as usize]);
-    guest::write32(block, participants);
-    guest::write32(block + CALL_DPC_BARRIER, participants);
-    guest::write32(block + CALL_DPC_BARRIER + 4, participants);
+    guest::write_bytes(block, &[0; CallDpcBlock::SIZE as usize]);
+    // SAFETY: blocos recém-alocados dos tamanhos dos tipos.
+    let (call, object) = unsafe { (CallDpcBlock::at(block), Kdpc::at(dpc)) };
+    call.pending.set(participants);
+    call.barrier.remaining.set(participants);
+    call.barrier.participants.set(participants);
     dpc::initialize_dpc(dpc, routine, context);
-    guest::write64(dpc + kdpc::SYSARG1, block);
-    guest::write64(dpc + kdpc::SYSARG2, block + CALL_DPC_BARRIER);
+    object.system_argument1.set(call.pending.address());
+    object.system_argument2.set(call.barrier.address());
     let previous = irql::raise_at_least(irql::DISPATCH_LEVEL);
-    native_call::call(routine, &[dpc, context, block, block + CALL_DPC_BARRIER]);
+    native_call::call(routine, &[dpc, context, call.pending.address(), call.barrier.address()]);
     irql::lower_irql(previous as u64);
     // Todos os participantes avisam o fim antes de a chamada voltar.
-    while guest::read32(block) as i32 > 0 {
+    while call.pending.atomic().load(Ordering::Acquire) > 0 {
         core::hint::spin_loop();
     }
     guest::free_bytes(dpc);
@@ -69,21 +89,24 @@ pub fn generic_call_dpc(routine: u64, context: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// KeSignalCallDpcDone: um participante a menos.
+/// KeSignalCallDpcDone: um participante a menos (LOCK XADD).
 pub fn signal_call_dpc_done(pending: u64) {
-    atomic_add32(pending, -1);
+    // SAFETY: o SystemArgument1 que KeGenericCallDpc entregou à DPC.
+    unsafe { Field::<i32>::at(pending) }.atomic().fetch_sub(1, Ordering::SeqCst);
 }
 
 /// KeSignalCallDpcSynchronize: barreira entre os participantes; TRUE para
 /// exatamente um (o último a chegar), que rearma a barreira.
 pub fn signal_call_dpc_synchronize(barrier: u64) -> bool {
-    let sense = guest::read32(barrier + 8);
-    if atomic_add32(barrier, -1) == 0 {
-        guest::write32(barrier, guest::read32(barrier + 4));
-        guest::write32(barrier + 8, sense ^ 1);
+    // SAFETY: o SystemArgument2 que KeGenericCallDpc entregou à DPC.
+    let barrier = unsafe { CallDpcBarrier::at(barrier) };
+    let sense = barrier.sense.atomic().load(Ordering::Acquire);
+    if barrier.remaining.atomic().fetch_sub(1, Ordering::SeqCst) == 1 {
+        barrier.remaining.set(barrier.participants.get());
+        barrier.sense.atomic().store(sense ^ 1, Ordering::Release);
         return true;
     }
-    while guest::read32(barrier + 8) == sense {
+    while barrier.sense.atomic().load(Ordering::Acquire) == sense {
         core::hint::spin_loop();
     }
     false

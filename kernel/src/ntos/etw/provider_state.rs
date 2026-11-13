@@ -15,12 +15,31 @@ use crate::hal::amd64::native_call;
 use crate::ntos::ke::irql;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::silo::query as silo_query;
-use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{EtwGuidEntry, EtwRegEntry, EventDataDescriptor, EventDescriptor, Field, Guid, ListEntry, NtStruct, TraceEnableInfo};
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::{KernelError, SpinLock};
 
 const ALL_KEYWORDS: u64 = u64::MAX;
-const REGISTRATION_SIZE: u64 = 0x70;
-const GUID_ENTRY_SIZE: u64 = 0x1A8;
+const REGISTRATION_SIZE: u64 = core::mem::size_of::<EtwRegEntry>() as u64;
+const GUID_ENTRY_SIZE: u64 = core::mem::size_of::<EtwGuidEntry>() as u64;
+/// ETW_REG_ENTRY.Flags: DbgKernelRegistration | DbgInserted, mais
+/// DbgClassicRegistration para os provedores clássicos.
+const REGISTRATION_FLAGS: u16 = 0x81;
+const CLASSIC_REGISTRATION: u16 = 0x08;
+/// ETW_REG_ENTRY.Flags.DbgClosed.
+const REGISTRATION_CLOSED: u16 = 0x40;
+/// EVENT_INFO_CLASS EventProviderSetTraits.
+const EVENT_PROVIDER_SET_TRAITS: u32 = 2;
+
+fn guid_entry(pointer: u64) -> &'static EtwGuidEntry {
+    // SAFETY: entrada alocada por `acquire_entry` (pool do kernel).
+    unsafe { EtwGuidEntry::at(pointer) }
+}
+
+fn registration(pointer: u64) -> &'static EtwRegEntry {
+    // SAFETY: registro alocado por `register` (o REGHANDLE).
+    unsafe { EtwRegEntry::at(pointer) }
+}
 const GUID_TAG: u32 = 0x4777_7445;
 const REGISTRATION_TAG: u32 = 0x5277_7445;
 /// GUID reservado comparado literalmente pelo EtwpRegisterProvider medido.
@@ -121,7 +140,7 @@ fn require_passive_level() -> Result<(), KernelError> {
 
 fn read_guid(pointer: u64) -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&guest::read_bytes(pointer, 16));
+    bytes.copy_from_slice(&guest::read_bytes(pointer, Guid::SIZE as usize));
     bytes
 }
 
@@ -134,43 +153,46 @@ fn identifier_key(identifier: &[u8; 16], silo: u64) -> String {
 }
 
 /// Retira IsEnabled enquanto os outros campos são publicados.
-fn publish_information(address: u64, information: &Information, session: u16) {
-    guest::write32(address, 0);
-    guest::write8(address + 4, information.level);
-    guest::write16(address + 6, session);
-    guest::write32(address + 8, information.properties);
-    guest::write64(address + 16, information.any_keyword);
-    guest::write64(address + 24, information.all_keyword);
-    guest::write32(address, information.enabled);
+fn publish_information(target: &TraceEnableInfo, information: &Information, session: u16) {
+    target.is_enabled.set(0);
+    target.level.set(information.level);
+    target.logger_id.set(session);
+    target.enable_property.set(information.properties);
+    target.match_any_keyword.set(information.any_keyword);
+    target.match_all_keyword.set(information.all_keyword);
+    target.is_enabled.set(information.enabled);
 }
 
 fn synchronize(etw: &mut Etw, key: &str) {
     let Some(entry) = etw.entries.get_mut(key) else { return };
+    let native = guid_entry(entry.pointer);
     let mut enabled = Vec::new();
     let mut mask = 0u8;
     for index in 0..8 {
         let subscription = entry.slots[index];
         let information = subscription.map_or_else(empty_information, |subscription| subscription.information);
-        publish_information(entry.pointer + 0x80 + index as u64 * 32, &information, subscription.map_or(0, |subscription| subscription.session));
+        publish_information(&native.enable_info[index], &information, subscription.map_or(0, |subscription| subscription.session));
         if subscription.is_some() {
             mask |= 1 << index;
             enabled.push(information);
         }
     }
     entry.information = aggregate(&enabled);
-    publish_information(entry.pointer + 0x60, &entry.information, 0);
-    for &registration in &entry.registrations {
-        guest::write8(registration + 0x64, mask);
+    publish_information(&native.provider_enable_info, &entry.information, 0);
+    for &pointer in &entry.registrations {
+        registration(pointer).enable_mask.set(mask);
     }
-    let head = entry.pointer + 0x38;
-    let mut links = alloc::vec![head];
+    // Anel RegListHead + RegList de cada registro (ETW_REG_ENTRY.RegList em +0).
+    let mut links = alloc::vec![native.reg_list_head.address()];
     links.extend(entry.registrations.iter().copied());
     let count = links.len();
     for (index, &pointer) in links.iter().enumerate() {
-        guest::write64(pointer, links[(index + 1) % count]);
-        guest::write64(pointer + 8, links[(index + count - 1) % count]);
+        // SAFETY: a cabeça da entrada ou o RegList de um registro vivo.
+        let link = unsafe { ListEntry::at(pointer) };
+        link.flink.set(links[(index + 1) % count]);
+        link.blink.set(links[(index + count - 1) % count]);
     }
-    guest::write64(entry.pointer + 0x20, entry.references);
+    native.ref_count.set(entry.references as i64);
 }
 
 fn discard_unused_entry(etw: &mut Etw, key: &str) {
@@ -187,11 +209,12 @@ fn acquire_entry(etw: &mut Etw, identifier: [u8; 16], silo: u64) -> Option<Strin
         return Some(key);
     }
     let pointer = kernel_pool::allocate(GUID_ENTRY_SIZE, AllocateOptions { tag: GUID_TAG, zero: true, ..Default::default() }).ok()?;
-    for offset in [0u64, 0x10, 0x38] {
-        guest::write64(pointer + offset, pointer + offset);
-        guest::write64(pointer + offset + 8, pointer + offset);
+    let native = guid_entry(pointer);
+    for head in [&native.guid_list, &native.silo_guid_list, &native.reg_list_head] {
+        head.flink.set(head.address());
+        head.blink.set(head.address());
     }
-    guest::write_bytes(pointer + 0x28, &identifier);
+    guest::write_bytes(native.guid.address(), &identifier);
     etw.entries.insert(key.clone(), GuidEntry { pointer, identifier, references: 0, registrations: Vec::new(), slots: [None; 8], information: empty_information() });
     Some(key)
 }
@@ -205,7 +228,7 @@ fn finalize_registration(etw: &mut Etw, pointer: u64) {
     let _ = kernel_pool::free(record.pointer, None);
     if let Some(entry) = etw.entries.get_mut(&record.entry) {
         entry.references -= 1;
-        guest::write64(entry.pointer + 0x20, entry.references);
+        guid_entry(entry.pointer).ref_count.set(entry.references as i64);
     }
     discard_unused_entry(etw, &record.entry);
 }
@@ -274,7 +297,9 @@ pub fn capture_state(session: u16, identifier_pointer: u64) -> Result<(), Kernel
 /// EtwRegister: contexto sem callback e o GUID reservado são recusados.
 pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u64, classic: bool) -> Result<u32, KernelError> {
     require_passive_level()?;
-    guest::write64(output, 0);
+    // SAFETY: PREGHANDLE de saída do driver.
+    let handle_out = unsafe { Field::<u64>::at(output) };
+    handle_out.set(0);
     let identifier = read_guid(identifier_pointer);
     if (callback == 0 && context != 0) || (classic && callback == 0) || identifier == RESERVED_GUID {
         return Ok(0xC000_000D);
@@ -286,13 +311,14 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
             discard_unused_entry(etw, &key);
             return None;
         };
-        guest::write64(pointer + 0x10, pointer + 0x10);
-        guest::write64(pointer + 0x18, pointer + 0x10);
+        let native = registration(pointer);
+        native.group_reg_list.flink.set(native.group_reg_list.address());
+        native.group_reg_list.blink.set(native.group_reg_list.address());
         let entry = etw.entries.get_mut(&key).expect("entrada adquirida");
-        guest::write64(pointer + 0x20, entry.pointer);
-        guest::write64(pointer + 0x50, context);
-        guest::write64(pointer + 0x58, callback);
-        guest::write16(pointer + 0x62, if classic { 0x89 } else { 0x81 });
+        native.guid_entry.set(entry.pointer);
+        native.callback_context.set(context);
+        native.callback.set(callback);
+        native.flags.set(if classic { REGISTRATION_FLAGS | CLASSIC_REGISTRATION } else { REGISTRATION_FLAGS });
         entry.registrations.push(pointer);
         entry.references += 1;
         let enabled = entry.information.enabled != 0;
@@ -302,11 +328,11 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
         Some((pointer, enabled))
     });
     let Some((pointer, enabled)) = created else { return Ok(0xC000_009A) };
-    guest::write64(output, pointer);
+    handle_out.set(pointer);
     if enabled {
         if let Err(error) = notify_registration(pointer, None, None) {
             let _ = unregister(pointer);
-            guest::write64(output, 0);
+            handle_out.set(0);
             return Err(error);
         }
     }
@@ -326,7 +352,8 @@ pub fn unregister(handle: u64) -> Result<u32, KernelError> {
         if let Some(entry) = etw.entries.get_mut(&key) {
             entry.registrations.retain(|&pointer| pointer != handle);
         }
-        guest::write16(handle + 0x62, guest::read16(handle + 0x62) | 0x40);
+        let flags = &registration(handle).flags;
+        flags.set(flags.get() | REGISTRATION_CLOSED);
         synchronize(etw, &key);
         finalize_registration(etw, handle);
         0
@@ -415,7 +442,7 @@ fn disable_subscription(session: u16, key: &str) -> Result<(), KernelError> {
     with(|etw| {
         if let Some(entry) = etw.entries.get_mut(key) {
             entry.references -= 1;
-            guest::write64(entry.pointer + 0x20, entry.references);
+            guid_entry(entry.pointer).ref_count.set(entry.references as i64);
         }
         discard_unused_entry(etw, key);
     });
@@ -451,12 +478,15 @@ pub fn write(handle: u64, descriptor: u64, activity: u64, related: u64, count: u
     if !enabled {
         return Ok(0);
     }
-    let keyword = guest::read64(descriptor + 8);
-    let level = guest::read8(descriptor + 4);
+    // SAFETY: PCEVENT_DESCRIPTOR do driver.
+    let event_descriptor = unsafe { EventDescriptor::at(descriptor) };
+    let keyword = event_descriptor.keyword.get();
+    let level = event_descriptor.level.get();
+    let native = guid_entry(entry_pointer);
     let recipients: Vec<u16> = slots
         .iter()
         .enumerate()
-        .filter_map(|(index, slot)| slot.filter(|_| event_enabled::matches(entry_pointer + 0x80 + index as u64 * 32, level, keyword)).map(|subscription| subscription.session))
+        .filter_map(|(index, slot)| slot.filter(|_| event_enabled::matches(native.enable_info[index].address(), level, keyword)).map(|subscription| subscription.session))
         .collect();
     if recipients.is_empty() {
         return Ok(0);
@@ -466,10 +496,11 @@ pub fn write(handle: u64, descriptor: u64, activity: u64, related: u64, count: u
     }
     let mut segments = Vec::new();
     let mut total = 80u64; // EVENT_HEADER antes dos dados de usuário
-    for index in 0..count as u64 {
-        let descriptor_address = data + index * 16;
-        let pointer = guest::read64(descriptor_address);
-        let size = guest::read32(descriptor_address + 8) as u64;
+    // SAFETY: vetor EVENT_DATA_DESCRIPTOR[UserDataCount] do driver.
+    let user_data = if count == 0 { &[][..] } else { unsafe { EventDataDescriptor::array_at(data, count as usize) } };
+    for item in user_data {
+        let pointer = item.ptr.get();
+        let size = item.size.get() as u64;
         total += size;
         if total > 0xFFFF {
             return Ok(0x8000_0005);
@@ -517,14 +548,16 @@ pub fn delivered(session: u16) -> Option<u64> {
 static TRAITS: SpinLock<BTreeMap<u64, u32>> = SpinLock::new(BTreeMap::new());
 
 /// EtwSetInformation(RegHandle, InformationClass, Information): atualiza os
-/// metadados de um registro conforme a classe (1 = traits). Devolve o
+/// metadados de um registro conforme a classe (2 = traits). Devolve o
 /// NTSTATUS (STATUS_INVALID_HANDLE sem o registro).
 pub fn set_information(handle: u64, class: u32, information: u64) -> u32 {
     if !exists(handle) {
         return 0xC000_0008;
     }
-    if class == 1 && information != 0 {
-        TRAITS.lock().insert(handle, guest::read32(information));
+    if class == EVENT_PROVIDER_SET_TRAITS && information != 0 {
+        // Traits: bytes do driver (sem alinhamento) que começam pelo USHORT
+        // TotalSize; um único acesso desalinhado de 16 bits.
+        TRAITS.lock().insert(handle, guest::read::<u16>(information) as u32);
     }
     0
 }

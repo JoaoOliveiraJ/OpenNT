@@ -3,6 +3,7 @@
 //! O provedor materializa EXCEPTION_RECORD e CONTEXT; filtros SEH podem
 //! pedir continuação ou desenrolar a pilha.
 
+use crate::ntos::inc::types::{Context, ExceptionRecord, NtStruct};
 use crate::ntos::mm::small as mm_small;
 use crate::ntos::ps::context::kernel_frame as kernel_context_frame;
 use crate::ntos::rtl::{exceptions, native_context};
@@ -38,9 +39,9 @@ fn is_model_specific_register_fault(rip: u64, error_code: u64) -> bool {
     // proteção geral sem classificação.
     let mut seen = 0u32;
     for offset in 0..14u64 {
-        let Ok(byte) = guest::try_read8(rip + offset) else { return false };
+        let Ok(byte) = guest::try_read::<u8>(rip + offset) else { return false };
         if byte == 0x0F {
-            return matches!(guest::try_read8(rip + offset + 1), Ok(0x30 | 0x32));
+            return matches!(guest::try_read::<u8>(rip + offset + 1), Ok(0x30 | 0x32));
         }
         let group = match byte {
             0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => 1,
@@ -72,10 +73,15 @@ pub fn dispatch(vector: u32, registers: u64, fx: u64, interrupt: u64, workspace:
         workspace,
         || -> Result<bool, KernelError> {
             let Some(context) = kernel_context_frame::current_context() else { return Ok(false) };
+            // SAFETY: CONTEXT materializado pelo dono do frame no workspace.
+            let frame = unsafe { Context::at(context) };
             // O registro temporário fica em workspace+0xA00, separado do
             // CONTEXT capturado pelo dono do frame.
             let record = workspace + 0xA00;
-            let rip = guest::read64(context + 0xF8);
+            // SAFETY: área própria do workspace de trap, livre durante o despacho.
+            let exception = unsafe { ExceptionRecord::at(record) };
+            let rip = frame.rip.get();
+            // Bloco de estado da interrupção do OpenNT: código de erro e CR2.
             let error_code = guest::read64(interrupt + 64);
             let fault_address = guest::read64(interrupt + 72);
             let page_failure = if vector == 14 { mm_small::consume_page_fault_failure(fault_address, error_code as u32) } else { None };
@@ -83,41 +89,43 @@ pub fn dispatch(vector: u32, registers: u64, fx: u64, interrupt: u64, workspace:
                 return Ok(false);
             }
             let status = if page_failure.is_some() { 0xC000_0006 } else if vector == 13 { 0xC000_0096 } else { status_by_vector(vector).unwrap_or(0) };
-            guest::write32(record, status);
-            guest::write32(record + 4, 0);
-            guest::write64(record + 8, 0);
-            guest::write32(record + 0x18, 0);
-            guest::write64(record + 0x10, rip);
+            exception.exception_code.set(status as i32);
+            exception.exception_flags.set(0);
+            exception.exception_record.set(0);
+            exception.number_parameters.set(0);
+            exception.exception_address.set(rip);
+            let information = &exception.exception_information;
             if vector == 0x2D {
                 // O serviço de depuração ajusta o endereço do breakpoint pelo
                 // caminho nativo observado; este boot não tem transporte KD.
-                let service = guest::read64(context + 0x78);
-                guest::write64(record + 0x10, rip + 1);
-                guest::write32(record + 0x18, 1);
-                guest::write64(record + 0x20, service);
+                let service = frame.rax.get();
+                exception.exception_address.set(rip + 1);
+                exception.number_parameters.set(1);
+                information[0].set(service);
                 // Com KD inativo esses serviços avançam o CONTEXT sem
                 // fabricar resposta de depurador.
                 if matches!(service, 1 | 3 | 4 | 5) {
-                    guest::write64(context + 0xF8, rip + 1);
+                    frame.rip.set(rip + 1);
                     kernel_context_frame::commit_current()?;
                     return Ok(true);
                 }
             } else if vector == 3 {
-                guest::write64(context + 0xF8, rip.wrapping_sub(1));
+                frame.rip.set(rip.wrapping_sub(1));
             } else if vector == 14 {
                 // Bit 4 = execução, bit 1 = escrita; o endereço vem do frame
                 // capturado da CPU.
-                guest::write32(record + 0x18, if page_failure.is_some() { 3 } else { 2 });
-                guest::write64(record + 0x20, if error_code & 16 != 0 { 8 } else if error_code & 2 != 0 { 1 } else { 0 });
-                guest::write64(record + 0x28, fault_address);
+                exception.number_parameters.set(if page_failure.is_some() { 3 } else { 2 });
+                information[0].set(if error_code & 16 != 0 { 8 } else if error_code & 2 != 0 { 1 } else { 0 });
+                information[1].set(fault_address);
                 // O KiPageFault original publica o status de I/O como ULONG.
                 if let Some(failure) = page_failure {
-                    guest::write64(record + 0x30, failure.status as u64);
+                    information[2].set(failure.status as u64);
                 }
             }
             native_context::invoke(context, || exceptions::dispatch_exception(record, context))?;
             // Voltar do despachante sem continuação deixaria a CPU com
             // estado de retorno indefinido.
+            // Ação de continuação: célula do OpenNT logo depois do CONTEXT.
             if guest::read32(context + native_context::ACTION) == 0 {
                 return Err(KernelError::new("kernel exception dispatch returned without a continuation"));
             }

@@ -6,6 +6,7 @@
 //! padrão do Ex).
 
 use crate::hal::cpu;
+use crate::ntos::inc::types::{Guid, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -37,19 +38,11 @@ fn xorshift(state: &mut u32) {
 pub fn control(code: u32, pointer: u64) -> u32 {
     let mut activity = ACTIVITY.lock();
     if activity.current == 0 {
-        activity.current = guest::alloc_bytes(16);
+        activity.current = guest::alloc_bytes(Guid::SIZE);
     }
     let current = activity.current;
-    let copy_current = || {
-        for byte in 0..16 {
-            guest::write8(pointer + byte, guest::read8(current + byte));
-        }
-    };
-    let store_current = || {
-        for byte in 0..16 {
-            guest::write8(current + byte, guest::read8(pointer + byte));
-        }
-    };
+    let copy_current = || guest::write_bytes(pointer, &guest::read_bytes(current, Guid::SIZE as usize));
+    let store_current = || guest::write_bytes(current, &guest::read_bytes(pointer, Guid::SIZE as usize));
     // uuid v4 por xorshift32 semeado no TSC (o mesmo padrão do Ex).
     let generate = |state: &mut u32| {
         xorshift(state);
@@ -59,12 +52,15 @@ pub fn control(code: u32, pointer: u64) -> u32 {
                 seed => seed,
             };
         }
-        for word in 0..4 {
+        let mut bytes = [0u8; 16];
+        for word in bytes.chunks_exact_mut(4) {
             xorshift(state);
-            guest::write32(pointer + word * 4, *state);
+            word.copy_from_slice(&state.to_le_bytes());
         }
-        guest::write8(pointer + 6, (guest::read8(pointer + 6) & 0x0F) | 0x40);
-        guest::write8(pointer + 8, (guest::read8(pointer + 8) & 0x3F) | 0x80);
+        // Versão 4 e variante RFC (ordem de bytes RFC, como antes).
+        bytes[6] = (bytes[6] & 0x0F) | 0x40;
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        guest::write_bytes(pointer, &bytes);
     };
     match code {
         1 => copy_current(),

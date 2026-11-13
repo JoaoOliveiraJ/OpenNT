@@ -6,6 +6,7 @@
 
 use alloc::collections::BTreeMap;
 
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -22,5 +23,6 @@ pub fn register_device(device: u64) -> u64 {
 
 /// PoSetDeviceBusyEx(counter): zera o contador de ociosidade.
 pub fn set_device_busy(counter: u64) {
-    guest::write32(counter, 0);
+    // SAFETY: o contador PULONG devolvido por PoRegisterDeviceForIdleDetection.
+    unsafe { Field::<u32>::at(counter) }.set(0);
 }

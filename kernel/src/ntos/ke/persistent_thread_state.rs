@@ -7,16 +7,15 @@
 use super::{debugger_data, dump_memory, irql, pcr, smp};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::ps::process;
+use crate::ntos::inc::types::{Context, Eprocess, Ethread, Kpcr, Kprcb, Kprocess, KsystemTime, Kthread, KuserSharedData, NtStruct};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
 
 pub const DUMP_BYTE_LENGTH: usize = 0x40000;
 const TRAILER_OFFSET: usize = DUMP_BYTE_LENGTH - 4;
 const CONTEXT_OFFSET: usize = 0x348;
-const CONTEXT_BYTE_LENGTH: usize = 0x4D0;
+const CONTEXT_BYTE_LENGTH: usize = core::mem::size_of::<Context>();
 const SHARED_DATA: u64 = 0xFFFF_F780_0000_0000;
-const PROCESSOR_BYTE_LENGTH: usize = 0xAF00;
+const PROCESSOR_BYTE_LENGTH: usize = core::mem::size_of::<Kprcb>();
 const MODULE_ENTRY_BYTE_LENGTH: usize = 0x90;
 
 /// Montado no boot, antes de consumidores em IRQL alto: o dump usa o
@@ -27,13 +26,18 @@ pub fn init() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// KUSER_SHARED_DATA no endereço fixo do kernel.
+fn shared_data() -> &'static KuserSharedData {
+    // SAFETY: página compartilhada mapeada desde o boot.
+    unsafe { KuserSharedData::at(SHARED_DATA) }
+}
+
 /// High1/Low/High2 rejeitam uma atualização interrompida entre as metades.
-fn shared_time(offset: u64) -> u64 {
-    let address = SHARED_DATA + offset;
+fn shared_time(time: &KsystemTime) -> u64 {
     loop {
-        let high = guest::read32(address + 4);
-        let low = guest::read32(address);
-        if high == guest::read32(address + 8) {
+        let high = time.high1_time.get() as u32;
+        let low = time.low_part.get();
+        if high == time.high2_time.get() as u32 {
             return (high as u64) << 32 | low as u64;
         }
     }
@@ -73,8 +77,11 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
         return Ok(0);
     }
     let thread = if thread != 0 { thread } else { process::get_current_thread() };
-    let process_address = guest::read64(thread + kthread::APC_STATE_PROCESS);
-    let processor = guest::read64(pcr::get_pcr_address() + pcr::layout::CURRENT_PRCB);
+    // SAFETY: a thread pedida (ou a corrente) e o PCONTEXT do chamador.
+    let (kthread, context_record) = unsafe { (Kthread::at(thread), Context::at(context)) };
+    let process_address = kthread.apc_state.process.get();
+    // SAFETY: a KPCR está mapeada desde `pcr::init`.
+    let processor = unsafe { Kpcr::at(pcr::get_pcr_address()) }.current_prcb.get();
     // A saída é limpa antes de ler o CONTEXT (que pode estar no próprio buffer).
     let mut dump = Dump(alloc::vec![0u8; DUMP_BYTE_LENGTH]);
     for offset in (0..0x2000).step_by(4) {
@@ -85,8 +92,10 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
     let (module_head, modules) = loaded_images::native_list()?;
     let debugger = debugger_data::snapshot(module_head)?;
     dump.u32(8, 0xF);
-    dump.u32(0xC, (guest::read32(SHARED_DATA + 0x260) & 0xFFFF) as u64);
-    dump.u64(0x10, guest::read64(process_address + eprocess::DIRECTORY_TABLE_BASE) & !0xFFF);
+    let shared = shared_data();
+    dump.u32(0xC, (shared.nt_build_number.get() & 0xFFFF) as u64);
+    // SAFETY: o processo do ApcState de uma thread viva.
+    dump.u64(0x10, unsafe { Kprocess::at(process_address) }.directory_table_base.get() & !0xFFF);
     dump.u64(0x18, debugger.pfn_database);
     dump.u64(0x20, module_head);
     dump.u64(0x28, process::get_active_process_head());
@@ -99,16 +108,16 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
     dump.u32(0xF00, 0x8000_0003);
     dump.u32(0xF04, 1);
     dump.u64(0xF08, 0);
-    dump.u64(0xF10, guest::read64(context + 0xF8));
+    dump.u64(0xF10, context_record.rip.get());
     dump.u32(0xF18, 0);
     dump.u32(0xF98, 4);
     dump.u64(0xFA0, DUMP_BYTE_LENGTH as u64);
-    dump.u64(0xFA8, shared_time(0x14));
-    dump.u64(0x1030, shared_time(8));
-    dump.u32(0x1040, guest::read32(SHARED_DATA + 0x264) as u64);
-    dump.u32(0x1044, guest::read32(SHARED_DATA + 0x2D0) as u64);
+    dump.u64(0xFA8, shared_time(&shared.system_time));
+    dump.u64(0x1030, shared_time(&shared.interrupt_time));
+    dump.u32(0x1040, shared.nt_product_type.get().0 as u32 as u64);
+    dump.u32(0x1044, shared.suite_mask.get() as u64);
     dump.u32(0x1050, 0x18);
-    dump.u32(0x1054, guest::read32(SHARED_DATA + 0x2C4) as u64);
+    dump.u32(0x1054, shared.boot_id.get() as u64);
     dump.u32(0x2000, 0);
     dump.u32(0x2004, DUMP_BYTE_LENGTH as u64);
     dump.u32(0x2008, TRAILER_OFFSET as u64);
@@ -130,7 +139,7 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
     flags |= 0x400;
     // Registros reais da CPU, processo e thread.
     let mut cursor = 0x2080 + debugger.bytes.len();
-    for (source, length, header, flag) in [(processor, PROCESSOR_BYTE_LENGTH, 0x201C, 4u64), (process_address, eprocess::SIZE as usize, 0x2020, 8), (thread, kthread::SIZE as usize, 0x2024, 16)] {
+    for (source, length, header, flag) in [(processor, PROCESSOR_BYTE_LENGTH, 0x201C, 4u64), (process_address, Eprocess::SIZE as usize, 0x2020, 8), (thread, Ethread::SIZE as usize, 0x2024, 16)] {
         cursor = align8(cursor);
         if cursor + length >= TRAILER_OFFSET {
             return Err(KernelError::new("fixed triage records exceed dump"));
@@ -142,9 +151,9 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
         cursor += length;
     }
     // StackResident controla a cópia do prefixo mapeado da pilha.
-    if guest::read32(thread + 0x78) & 0x2_0000 != 0 {
-        let limit = guest::read64(thread + 0x30);
-        let base = guest::read64(thread + 0x38);
+    if kthread.kernel_stack_resident() != 0 {
+        let limit = kthread.stack_limit.get();
+        let base = kthread.stack_base.get();
         let mut stack = dump.get64(CONTEXT_OFFSET + 0x98);
         if stack < limit || stack >= base {
             stack = limit;

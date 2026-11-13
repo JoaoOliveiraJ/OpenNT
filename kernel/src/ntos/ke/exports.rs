@@ -158,7 +158,7 @@ fn are_apcs_disabled(_: &Call) -> Result<u64, KernelError> {
     Ok(critical_region::disabled() as u64)
 }
 fn register_bug_check_callback(call: &Call) -> Result<u64, KernelError> {
-    Ok(bugcheck::register_callback(call.arg(1), call.arg(2), call.arg(3), call.arg(5)) as u64)
+    Ok(bugcheck::register_callback(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5)) as u64)
 }
 fn deregister_bug_check_callback(call: &Call) -> Result<u64, KernelError> {
     Ok(bugcheck::deregister_callback(call.arg(1)) as u64)
@@ -300,7 +300,7 @@ fn ipi_generic_call(call: &Call) -> Result<u64, KernelError> {
     Ok(callout::ipi_generic_call(call.arg(1), call.arg(2)))
 }
 fn save_extended_processor_state(call: &Call) -> Result<u64, KernelError> {
-    xstate::save(call.arg(2));
+    xstate::save(call.arg(1), call.arg(2));
     Ok(0)
 }
 fn restore_extended_processor_state(call: &Call) -> Result<u64, KernelError> {

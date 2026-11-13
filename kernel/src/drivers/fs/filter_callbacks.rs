@@ -7,7 +7,27 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+
+/// A tabela publicada pelo Filter Manager (sem tipo público): o kernel só
+/// chama as duas rotinas de nome de arquivo.
+#[repr(C)]
+struct FltMgrCallbacks {
+    /// Slots que o kernel não usa.
+    other: [Field<u64>; 3],
+    get_file_name_information: Field<u64>,
+    release_file_name_information: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for FltMgrCallbacks {}
+
+const _: () = assert!(core::mem::offset_of!(FltMgrCallbacks, get_file_name_information) == 0x18);
+
+fn callbacks_at(table: u64) -> &'static FltMgrCallbacks {
+    // SAFETY: o dono da tabela a conserva enquanto publicada ou em execução.
+    unsafe { FltMgrCallbacks::at(table) }
+}
 
 static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 
@@ -29,7 +49,7 @@ pub fn get_file_name_information(file_object: u64, name_options: u32, file_name:
     if table == 0 {
         return 0xC000_00BB;
     }
-    let callback = guest::read64(table + 0x18);
+    let callback = callbacks_at(table).get_file_name_information.get();
     native_call::call(callback, &[file_object, name_options as u64, file_name, information]) as u32
 }
 
@@ -37,6 +57,6 @@ pub fn get_file_name_information(file_object: u64, name_options: u32, file_name:
 /// informação NULL; o dono controla o armazenamento.
 pub fn release_file_name_information(information: u64) {
     let table = current_callbacks();
-    let callback = guest::read64(table + 0x20);
+    let callback = callbacks_at(table).release_file_name_information.get();
     native_call::call(callback, &[information, 0, 0, 0]);
 }

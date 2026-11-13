@@ -32,28 +32,28 @@ fn accessible(request: &Request) -> Result<bool, KernelError> {
 }
 
 fn transfer_bytes(io: &Io, request: &Request, buffer: u64, writing: bool) -> Result<u32, KernelError> {
+    // O buffer do chamador vai e volta numa cópia em bloco; o espaço de
+    // configuração é acessado em pedaços alinhados de 4, 2 ou 1 byte.
+    let source = if writing { guest::read_bytes(buffer, request.length as usize) } else { alloc::vec::Vec::new() };
+    let mut bytes = alloc::vec::Vec::with_capacity(if writing { 0 } else { request.length as usize });
     let mut done = 0;
     while done < request.length {
         let at = request.offset + done;
         let remaining = request.length - done;
         let width = if at % 4 == 0 && remaining >= 4 { 4 } else if at % 2 == 0 && remaining >= 2 { 2 } else { 1 };
-        let pointer = buffer + done as u64;
+        let (start, end) = (done as usize, (done + width) as usize);
         if writing {
-            let value = match width {
-                4 => guest::read32(pointer),
-                2 => guest::read16(pointer) as u32,
-                _ => guest::read8(pointer) as u32,
-            };
-            io.write(at, width, value)?;
+            let mut value = [0u8; 4];
+            value[..end - start].copy_from_slice(&source[start..end]);
+            io.write(at, width, u32::from_le_bytes(value))?;
         } else {
             let value = io.read(at, width)?;
-            match width {
-                4 => guest::write32(pointer, value),
-                2 => guest::write16(pointer, value as u16),
-                _ => guest::write8(pointer, value as u8),
-            }
+            bytes.extend_from_slice(&value.to_le_bytes()[..end - start]);
         }
         done += width;
+    }
+    if !writing {
+        guest::write_bytes(buffer, &bytes);
     }
     Ok(done)
 }
@@ -64,9 +64,7 @@ fn absent(request: &Request, buffer: u64, writing: bool) -> u32 {
         return 0;
     }
     let count = request.length.min(2 - request.offset);
-    for index in 0..count {
-        guest::write8(buffer + index as u64, 0xFF);
-    }
+    guest::write_bytes(buffer, &alloc::vec![0xFF; count as usize]);
     count
 }
 

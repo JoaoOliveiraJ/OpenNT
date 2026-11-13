@@ -11,20 +11,16 @@
 use core::sync::atomic::Ordering;
 
 use super::{irql, pcr};
+use crate::ntos::inc::types::{Field, KlockQueueHandle, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::KernelError;
 
 /// LockQueueIoVpbLock.
 const LOCK_QUEUE_IO_VPB_LOCK: u64 = 9;
 
-/// KLOCK_QUEUE_HANDLE.LockQueue.Lock.
-const HANDLE_LOCK: u64 = 8;
-/// KLOCK_QUEUE_HANDLE.OldIrql.
-const HANDLE_OLD_IRQL: u64 = 0x10;
-
 /// KeInitializeSpinLock.
 pub fn initialize(lock: u64) {
-    guest::write64(lock, 0);
+    guest::atomic_u64(lock).store(0, Ordering::Release);
 }
 
 /// Uma tentativa de posse do bit 0: LOCK BTS (o InterlockedBitTestAndSet64
@@ -82,43 +78,54 @@ pub fn acquire_raise_to_synch(lock: u64) -> u8 {
 
 /// KeTestSpinLock: TRUE quando o lock está livre.
 pub fn test(lock: u64) -> bool {
-    guest::read64(lock) & 1 == 0
+    guest::atomic_u64(lock).load(Ordering::Relaxed) & 1 == 0
 }
 
 // ---- in-stack queued -------------------------------------------------------
 
+/// KLOCK_QUEUE_HANDLE do chamador: fila vazia apontando o KSPIN_LOCK.
+fn prepare_handle(handle: &KlockQueueHandle, lock: u64) {
+    handle.lock_queue.next.set(0);
+    handle.lock_queue.lock.set(lock);
+}
+
 /// KeAcquireInStackQueuedSpinLock.
 pub fn acquire_in_stack_queued(lock: u64, handle: u64) {
-    guest::write64(handle, 0);
-    guest::write64(handle + HANDLE_LOCK, lock);
+    // SAFETY: KLOCK_QUEUE_HANDLE do chamador (pilha ou pool do driver).
+    let handle = unsafe { KlockQueueHandle::at(handle) };
+    prepare_handle(handle, lock);
     let previous = acquire(lock);
-    guest::write8(handle + HANDLE_OLD_IRQL, previous);
+    handle.old_irql.set(previous);
 }
 
 /// KeReleaseInStackQueuedSpinLock / KeReleaseInStackQueuedSpinLockForDpc.
 pub fn release_in_stack_queued(handle: u64) {
-    release(guest::read64(handle + HANDLE_LOCK), guest::read8(handle + HANDLE_OLD_IRQL) as u64);
+    // SAFETY: o handle preenchido pela aquisição.
+    let handle = unsafe { KlockQueueHandle::at(handle) };
+    release(handle.lock_queue.lock.get(), handle.old_irql.get() as u64);
 }
 
 /// KeAcquireInStackQueuedSpinLockAtDpcLevel.
 pub fn acquire_in_stack_queued_at_dpc_level(lock: u64, handle: u64) {
-    guest::write64(handle, 0);
-    guest::write64(handle + HANDLE_LOCK, lock);
+    // SAFETY: KLOCK_QUEUE_HANDLE do chamador.
+    prepare_handle(unsafe { KlockQueueHandle::at(handle) }, lock);
     acquire_at_dpc_level(lock);
 }
 
 /// KeReleaseInStackQueuedSpinLockFromDpcLevel.
 pub fn release_in_stack_queued_from_dpc_level(handle: u64) {
-    release_from_dpc_level(guest::read64(handle + HANDLE_LOCK));
+    // SAFETY: o handle preenchido pela aquisição.
+    release_from_dpc_level(unsafe { KlockQueueHandle::at(handle) }.lock_queue.lock.get());
 }
 
 /// KLOCK_QUEUE_HANDLE no nível pedido (nunca desce).
 fn acquire_in_stack_at(lock: u64, handle: u64, level: u8) {
-    guest::write64(handle, 0);
-    guest::write64(handle + HANDLE_LOCK, lock);
+    // SAFETY: KLOCK_QUEUE_HANDLE do chamador.
+    let handle = unsafe { KlockQueueHandle::at(handle) };
+    prepare_handle(handle, lock);
     let previous = irql::raise_at_least(level);
     acquire_at_dpc_level(lock);
-    guest::write8(handle + HANDLE_OLD_IRQL, previous);
+    handle.old_irql.set(previous);
 }
 
 /// KeAcquireInStackQueuedSpinLockForDpc: numa DPC comum (DISPATCH_LEVEL) só
@@ -147,7 +154,8 @@ fn queued_lock(number: u64) -> Result<u64, KernelError> {
 fn try_acquire_raised(lock: u64, level: u8, old_irql: u64) -> bool {
     let previous = irql::raise_at_least(level);
     if try_spin(lock) {
-        guest::write8(old_irql, previous);
+        // SAFETY: PKIRQL de saída do chamador.
+        unsafe { Field::<u8>::at(old_irql) }.set(previous);
         true
     } else {
         irql::lower_irql(previous as u64);
@@ -188,7 +196,8 @@ pub fn try_to_acquire_queued_raise_to_synch(number: u64, old_irql: u64) -> Resul
 /// anterior vai para a saída.
 pub fn acquire_vpb_spin_lock(old_irql: u64) -> Result<u64, KernelError> {
     let previous = acquire(queued_lock(LOCK_QUEUE_IO_VPB_LOCK)?);
-    guest::write8(old_irql, previous);
+    // SAFETY: PKIRQL de saída do chamador.
+    unsafe { Field::<u8>::at(old_irql) }.set(previous);
     Ok(0)
 }
 

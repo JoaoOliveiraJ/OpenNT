@@ -31,6 +31,7 @@ use crate::ntos::mm::guest_memory::GuestScalar;
 mod alpc;
 mod cm;
 mod etw;
+pub mod extra_ke_misc;
 mod ex;
 mod hal;
 mod io;

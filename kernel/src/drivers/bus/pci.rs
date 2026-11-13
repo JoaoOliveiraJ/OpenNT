@@ -17,8 +17,8 @@ use crate::ntos::io::io_manager::{self as iom, irp_mj, irp_mn, status, DeviceEnt
 use crate::ntos::ob::objects::device as device_objects;
 use crate::ntos::ob::object_manager;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{CmFullResourceDescriptor, CmPartialResourceDescriptor, CmPartialResourceList, CmResourceList, DeviceObject, InterfaceType, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{device_object, io_stack_location as stack, irp};
 
 /// Tipos de CM_PARTIAL_RESOURCE_DESCRIPTOR (wdm.h).
 pub mod cm_resource_type {
@@ -28,10 +28,7 @@ pub mod cm_resource_type {
     pub const DMA: u8 = 4;
 }
 
-/// InterfaceType + BusNumber + cabeçalho da lista parcial.
-const FULL_DESCRIPTOR_SIZE: u64 = 16;
-/// Type + Share + Flags + união de 16 bytes.
-const PARTIAL_DESCRIPTOR_SIZE: u64 = 20;
+
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bar {
@@ -77,28 +74,36 @@ static DEVICES: SpinLock<Vec<PciFunction>> = SpinLock::new(Vec::new());
 
 /// CM_RESOURCE_LIST real (layout wdm.h) na memória do convidado.
 pub fn build_resource_list(resources: &[Resource]) -> u64 {
-    let size = 4 + FULL_DESCRIPTOR_SIZE + PARTIAL_DESCRIPTOR_SIZE * resources.len() as u64;
-    let address = guest::alloc_bytes(size);
-    guest::write32(address, 1); // Count de FULL
-    guest::write32(address + 4, 5); // InterfaceType = PCIBus
-    guest::write32(address + 8, 0); // BusNumber
-    guest::write16(address + 12, 1); // Version
-    guest::write16(address + 14, 1); // Revision
-    guest::write32(address + 16, resources.len() as u32);
-    let mut cursor = address + 20;
-    for resource in resources {
-        guest::write8(cursor, resource.resource_type);
-        guest::write8(cursor + 1, 0); // ShareDisposition exclusiva
-        guest::write16(cursor + 2, resource.flags);
+    use core::mem::{offset_of, size_of};
+    let header = offset_of!(CmResourceList, list) + offset_of!(CmFullResourceDescriptor, partial_resource_list) + offset_of!(CmPartialResourceList, partial_descriptors);
+    let address = guest::alloc_bytes((header + size_of::<CmPartialResourceDescriptor>() * resources.len()) as u64);
+    // SAFETY: bloco recém-alocado com espaço para todos os descritores.
+    let list = unsafe { CmResourceList::at(address) };
+    list.count.set(1); // um FULL descriptor
+    let full = &list.list[0];
+    full.interface_type.set(InterfaceType::PCI_BUS);
+    full.bus_number.set(0);
+    let partial = &full.partial_resource_list;
+    partial.version.set(1);
+    partial.revision.set(1);
+    partial.count.set(resources.len() as u32);
+    // SAFETY: os descritores seguem a lista parcial no mesmo bloco.
+    let descriptors = unsafe { CmPartialResourceDescriptor::array_at(partial.partial_descriptors[0].address(), resources.len()) };
+    for (descriptor, resource) in descriptors.iter().zip(resources) {
+        descriptor.type_.set(resource.resource_type);
+        descriptor.share_disposition.set(0); // exclusiva
+        descriptor.flags.set(resource.flags);
         if resource.resource_type == cm_resource_type::INTERRUPT {
-            guest::write32(cursor + 4, if resource.level != 0 { resource.level } else { resource.vector });
-            guest::write32(cursor + 8, resource.vector);
-            guest::write32(cursor + 12, if resource.affinity != 0 { resource.affinity } else { 0xFFFF_FFFF });
+            let level = if resource.level != 0 { resource.level } else { resource.vector };
+            descriptor.u.interrupt.level.set(level as u16);
+            descriptor.u.interrupt.group.set(0);
+            descriptor.u.interrupt.vector.set(resource.vector);
+            // KAFFINITY inteiro (64 bits).
+            descriptor.u.interrupt.affinity.set(if resource.affinity != 0 { resource.affinity } else { 0xFFFF_FFFF } as u64);
         } else {
-            guest::write64(cursor + 4, resource.start);
-            guest::write32(cursor + 12, resource.length);
+            descriptor.u.port.start.quad_part.set(resource.start as i64);
+            descriptor.u.port.length.set(resource.length);
         }
-        cursor += PARTIAL_DESCRIPTOR_SIZE;
     }
     address
 }
@@ -124,24 +129,23 @@ fn pdo_pnp_dispatch(device: u64, request: &mut IoRequest) {
 /// convidado e o completa, como o pci.sys. `None` = não é PDO nosso.
 pub fn answer_native_pnp_irp(device: u64, packet: u64) -> Option<i32> {
     let entry = DEVICES.lock().iter().find(|entry| entry.node != 0 && entry.pdo_pointer == device).cloned()?;
-    let location = guest::read32(packet + irp::CURRENT_STACK_LOCATION) as u64;
-    let minor = guest::read8(location + stack::MINOR);
+    let (request, location) = super::motherboard::current_stack_location(packet);
+    let minor = location.minor_function.get();
     let information = match minor {
         irp_mn::START_DEVICE | irp_mn::REMOVE_DEVICE => 0,
         irp_mn::QUERY_ID => {
             // Id em pool UTF-16 com duplo NUL (o pool já vem zerado).
             let units: Vec<u16> = hardware_id_of(&entry).encode_utf16().collect();
             let buffer = guest::alloc_bytes((units.len() as u64 + 2) * 2);
-            for (index, &unit) in units.iter().enumerate() {
-                guest::write16(buffer + index as u64 * 2, unit);
-            }
+            let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            guest::write_bytes(buffer, &bytes);
             buffer
         }
         // STATUS_NOT_SUPPORTED sem completar.
         _ => return Some(0xC000_00BBu32 as i32),
     };
-    guest::write32(packet + irp::IO_STATUS, 0);
-    guest::write64(packet + irp::IO_STATUS_INFORMATION, information);
+    request.io_status.status.set(0);
+    request.io_status.information.set(information);
     iom::iof_complete_request(packet);
     Some(0)
 }
@@ -278,11 +282,8 @@ fn create_pdos() -> Result<(), KernelError> {
     for index in 0..count {
         let entry = DEVICES.lock()[index].clone();
         let list = build_resource_list(&resources_of(&entry));
-        let pdo = guest::alloc_bytes(device_object::STRUCT_SIZE);
-        guest::write16(pdo + device_object::TYPE, device_object::IO_TYPE);
-        guest::write16(pdo + device_object::SIZE, device_object::STRUCT_SIZE as u16);
-        guest::write32(pdo + device_object::REFERENCE_COUNT, 1);
-        guest::write8(pdo + device_object::STACK_SIZE, 1);
+        let pdo = guest::alloc_bytes(DeviceObject::SIZE);
+        super::motherboard::initialize_pdo(pdo);
         device_objects::register(pdo, Some(free_pdo), None)?;
         // A lista fica localizável pelo PDO (IoConnectInterruptEx LINE_BASED).
         device_resources::register_device_resources(pdo, list);

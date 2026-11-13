@@ -9,32 +9,61 @@ use alloc::vec::Vec;
 
 use super::{irql, thread_lock};
 use crate::hal::amd64::native_call;
+use crate::ntos::inc::types::{Field, Kapc, KapcState, Kthread, ListEntry, NtStruct};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
 
-/// Offsets da KAPC.
+/// Tamanho e tipo da KAPC (o resto do layout vem de `inc::types::Kapc`).
 pub mod kapc {
-    pub const TYPE: u64 = 0x00;
-    pub const SIZE_FIELD: u64 = 0x02;
-    pub const THREAD: u64 = 0x08;
-    pub const LIST_ENTRY: u64 = 0x10;
-    pub const KERNEL_ROUTINE: u64 = 0x20;
-    pub const RUNDOWN_ROUTINE: u64 = 0x28;
-    pub const NORMAL_ROUTINE: u64 = 0x30;
-    pub const NORMAL_CONTEXT: u64 = 0x38;
-    pub const SYSTEM_ARGUMENT_1: u64 = 0x40;
-    pub const SYSTEM_ARGUMENT_2: u64 = 0x48;
-    pub const APC_STATE_INDEX: u64 = 0x50;
-    pub const APC_MODE: u64 = 0x51;
-    pub const INSERTED: u64 = 0x52;
     pub const SIZE: u8 = 0x58;
     pub const TYPE_APC: u8 = 0x12;
 }
 
-/// O byte em ApcState +0x28 acompanha a execução de uma rotina normal.
-const PROGRESS_OFFSET: u64 = kthread::APC_STATE + 0x28;
+const _: () = assert!(kapc::SIZE as u64 == core::mem::size_of::<Kapc>() as u64);
+
+/// KAPC.Reserved[3] dos símbolos públicos: KernelRoutine, RundownRoutine e
+/// NormalRoutine.
+const KERNEL_ROUTINE: usize = 0;
+const RUNDOWN_ROUTINE: usize = 1;
+const NORMAL_ROUTINE: usize = 2;
+
+/// KAPC_STATE.InProgressFlags bit 0: KernelApcInProgress (rotina normal).
+const KERNEL_APC_IN_PROGRESS: u8 = 1;
+
+/// Frame de chamada da KernelRoutine (memória do OpenNT): a KAPC, os quatro
+/// ponteiros PKNORMAL_ROUTINE*/PVOID* e as cópias que eles apontam.
+#[repr(C)]
+struct ApcCallFrame {
+    apc: Field<u64>,
+    pointers: [Field<u64>; 4],
+    copies: [Field<u64>; 4],
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for ApcCallFrame {}
+
+const _: () = assert!(core::mem::size_of::<ApcCallFrame>() == 72);
+
+fn apc_at(apc: u64) -> &'static Kapc {
+    // SAFETY: KAPC viva do chamador (inicializada por KeInitializeApc).
+    unsafe { Kapc::at(apc) }
+}
+
+fn state_at(state: u64) -> &'static KapcState {
+    // SAFETY: KTHREAD.ApcState/SavedApcState ou um KAPC_STATE salvo.
+    unsafe { KapcState::at(state) }
+}
+
+fn kthread(thread: u64) -> &'static Kthread {
+    // SAFETY: KTHREAD viva dona das filas.
+    unsafe { Kthread::at(thread) }
+}
+
+fn list_entry(address: u64) -> &'static ListEntry {
+    // SAFETY: vínculo de uma lista de APCs viva.
+    unsafe { ListEntry::at(address) }
+}
 
 /// Ambiente salvo por uma anexação de processo.
 pub struct SavedEnvironment {
@@ -60,54 +89,59 @@ static STATE: SpinLock<ApcState> = SpinLock::new(ApcState {
 });
 
 fn environment_address(thread: u64) -> u64 {
-    thread + kthread::APC_STATE
+    kthread(thread).apc_state.address()
+}
+
+/// KernelApcPending (modo kernel) ou UserApcPendingAll (modo usuário).
+fn pending_flag(state: &KapcState, mode: usize) -> &Field<u8> {
+    if mode == 0 { &state.kernel_apc_pending } else { &state.user_apc_pending_all }
 }
 
 /// Insere no fim da lista nativa do modo e publica a pendência de kernel.
-fn link(state: u64, apc: u64) {
-    let head = state + guest::read8(apc + kapc::APC_MODE) as u64 * 16;
-    let entry = apc + kapc::LIST_ENTRY;
-    let last = guest::read64(head + 8);
-    guest::write64(entry, head);
-    guest::write64(entry + 8, last);
-    guest::write64(last, entry);
-    guest::write64(head + 8, entry);
-    if head == state {
-        guest::write8(state + 0x29, 1);
+fn link(state: &KapcState, apc: &Kapc) {
+    let head = &state.apc_list_head[apc.apc_mode.get() as u8 as usize];
+    let entry = &apc.apc_list_entry;
+    let last = head.blink.get();
+    entry.flink.set(head.address());
+    entry.blink.set(last);
+    list_entry(last).flink.set(entry.address());
+    head.blink.set(entry.address());
+    if head.address() == state.address() {
+        state.kernel_apc_pending.set(1);
     }
 }
 
-fn unlink(apc: u64) {
-    let entry = apc + kapc::LIST_ENTRY;
-    let next = guest::read64(entry);
-    let previous = guest::read64(entry + 8);
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
-    guest::write64(entry, 0);
-    guest::write64(entry + 8, 0);
+fn unlink(apc: &Kapc) {
+    let entry = &apc.apc_list_entry;
+    let next = entry.flink.get();
+    let previous = entry.blink.get();
+    list_entry(previous).flink.set(next);
+    list_entry(next).blink.set(previous);
+    entry.flink.set(0);
+    entry.blink.set(0);
 }
 
 /// KiMoveApcState: campos definidos e religação das listas no destino; o
-/// padding em +0x2B fica intacto.
-fn copy_environment_state(source: u64, destination: u64) {
-    guest::write64(destination + 0x20, guest::read64(source + 0x20));
-    for offset in [0x28, 0x29, 0x2A] {
-        guest::write8(destination + offset, guest::read8(source + offset));
-    }
-    for offset in [0u64, 0x10] {
-        let source_head = source + offset;
-        let head = destination + offset;
-        let first = guest::read64(source_head);
-        let last = guest::read64(source_head + 8);
-        if first == source_head {
-            guest::write64(head, head);
-            guest::write64(head + 8, head);
-            guest::write8(destination + if offset == 0 { 0x29 } else { 0x2A }, 0);
+/// padding depois de UserApcPendingAll fica intacto.
+fn copy_environment_state(source: &KapcState, destination: &KapcState) {
+    destination.process.set(source.process.get());
+    destination.in_progress_flags.set(source.in_progress_flags.get());
+    destination.kernel_apc_pending.set(source.kernel_apc_pending.get());
+    destination.user_apc_pending_all.set(source.user_apc_pending_all.get());
+    for mode in 0..2 {
+        let source_head = &source.apc_list_head[mode];
+        let head = &destination.apc_list_head[mode];
+        let first = source_head.flink.get();
+        let last = source_head.blink.get();
+        if first == source_head.address() {
+            head.flink.set(head.address());
+            head.blink.set(head.address());
+            pending_flag(destination, mode).set(0);
         } else {
-            guest::write64(head, first);
-            guest::write64(head + 8, last);
-            guest::write64(first + 8, head);
-            guest::write64(last, head);
+            head.flink.set(first);
+            head.blink.set(last);
+            list_entry(first).blink.set(head.address());
+            list_entry(last).flink.set(head.address());
         }
     }
 }
@@ -120,43 +154,47 @@ pub fn register_disabled_provider(provider: fn(bool) -> bool) {
 /// KeInitializeApc. Sem rotina normal: modo kernel e contexto zero.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize(apc: u64, thread: u64, environment: u8, kernel_routine: u64, rundown_routine: u64, normal_routine: u64, mode: u8, normal_context: u64) {
-    guest::write8(apc + kapc::TYPE, kapc::TYPE_APC);
-    guest::write8(apc + kapc::SIZE_FIELD, kapc::SIZE);
-    guest::write64(apc + kapc::THREAD, thread);
-    guest::write64(apc + kapc::LIST_ENTRY, 0);
-    guest::write64(apc + kapc::LIST_ENTRY + 8, 0);
-    guest::write64(apc + kapc::KERNEL_ROUTINE, kernel_routine);
-    guest::write64(apc + kapc::RUNDOWN_ROUTINE, rundown_routine);
-    guest::write64(apc + kapc::NORMAL_ROUTINE, normal_routine);
-    guest::write64(apc + kapc::NORMAL_CONTEXT, if normal_routine != 0 { normal_context } else { 0 });
-    guest::write64(apc + kapc::SYSTEM_ARGUMENT_1, 0);
-    guest::write64(apc + kapc::SYSTEM_ARGUMENT_2, 0);
+    let packet = apc_at(apc);
+    packet.type_.set(kapc::TYPE_APC);
+    packet.size.set(kapc::SIZE);
+    packet.thread.set(thread);
+    packet.apc_list_entry.flink.set(0);
+    packet.apc_list_entry.blink.set(0);
+    packet.reserved[KERNEL_ROUTINE].set(kernel_routine);
+    packet.reserved[RUNDOWN_ROUTINE].set(rundown_routine);
+    packet.reserved[NORMAL_ROUTINE].set(normal_routine);
+    packet.normal_context.set(if normal_routine != 0 { normal_context } else { 0 });
+    packet.system_argument1.set(0);
+    packet.system_argument2.set(0);
     // CurrentEnvironment é resolvido aqui; InsertEnvironment no enfileiramento.
     let resolved = if environment == 2 { STATE.lock().attachments.contains_key(&thread) as u8 } else { environment };
-    guest::write8(apc + kapc::APC_STATE_INDEX, resolved);
-    guest::write8(apc + kapc::APC_MODE, if normal_routine != 0 { mode } else { 0 });
-    guest::write8(apc + kapc::INSERTED, 0);
+    packet.apc_state_index.set(resolved as i8);
+    packet.apc_mode.set(if normal_routine != 0 { mode as i8 } else { 0 });
+    packet.inserted.set(0);
 }
 
 /// KeInsertQueueApc sob KTHREAD.ThreadLock.
 pub fn insert(apc: u64, first: u64, second: u64) -> bool {
-    let thread = guest::read64(apc + kapc::THREAD);
+    let packet = apc_at(apc);
+    let thread = packet.thread.get();
     thread_lock::with_lock(thread, || {
-        if guest::read8(apc + kapc::INSERTED) != 0 {
+        if packet.inserted.get() != 0 {
             return false;
         }
         let mut state = STATE.lock();
-        if state.in_rundown.contains(&thread) || (guest::read8(thread) == 6 && guest::read32(thread + 4) != 0) {
+        let target = kthread(thread);
+        // Thread terminada (ThreadObject sinalizado) não recebe APCs.
+        if state.in_rundown.contains(&thread) || (target.header.type_.get() == 6 && target.header.signal_state.get() != 0) {
             return false;
         }
-        guest::write64(apc + kapc::SYSTEM_ARGUMENT_1, first);
-        guest::write64(apc + kapc::SYSTEM_ARGUMENT_2, second);
-        guest::write8(apc + kapc::INSERTED, 1);
+        packet.system_argument1.set(first);
+        packet.system_argument2.set(second);
+        packet.inserted.set(1);
         let attached = state.attachments.contains_key(&thread);
-        let mut environment = guest::read8(apc + kapc::APC_STATE_INDEX);
+        let mut environment = packet.apc_state_index.get() as u8;
         if environment == 3 {
             environment = attached as u8;
-            guest::write8(apc + kapc::APC_STATE_INDEX, environment);
+            packet.apc_state_index.set(environment as i8);
         }
         // Uma APC de OriginalEnvironment pertence ao primeiro ambiente salvo.
         if attached && environment == 0 {
@@ -164,11 +202,11 @@ pub fn insert(apc: u64, first: u64, second: u64) -> bool {
             saved.queue.push(apc);
             let saved_state = saved.state;
             drop(state);
-            link(saved_state, apc);
+            link(state_at(saved_state), packet);
         } else {
             state.queue_by_thread.entry(thread).or_default().push(apc);
             drop(state);
-            link(environment_address(thread), apc);
+            link(state_at(environment_address(thread)), packet);
         }
         true
     })
@@ -176,9 +214,10 @@ pub fn insert(apc: u64, first: u64, second: u64) -> bool {
 
 /// KeRemoveQueueApc: procura a fila dona no ambiente atual ou num salvo.
 pub fn remove(apc: u64) -> Result<bool, KernelError> {
-    let thread = guest::read64(apc + 8);
+    let packet = apc_at(apc);
+    let thread = packet.thread.get();
     thread_lock::with_lock(thread, || {
-        if guest::read8(apc + 0x52) == 0 {
+        if packet.inserted.get() == 0 {
             return Ok(false);
         }
         let mut state = STATE.lock();
@@ -204,12 +243,13 @@ pub fn remove(apc: u64) -> Result<bool, KernelError> {
         let Some(environment_state) = owner_state else {
             return Err(KernelError::new("inserted APC has no owning queue"));
         };
-        let mode = guest::read8(apc + 0x51) as u64;
-        let head = environment_state + mode * 16;
-        unlink(apc);
-        guest::write8(apc + 0x52, 0);
-        if guest::read64(head) == head {
-            guest::write8(environment_state + if mode != 0 { 0x2A } else { 0x29 }, 0);
+        let mode = packet.apc_mode.get() as u8 as usize;
+        let environment = state_at(environment_state);
+        let head = &environment.apc_list_head[mode];
+        unlink(packet);
+        packet.inserted.set(0);
+        if head.flink.get() == head.address() {
+            pending_flag(environment, mode).set(0);
         }
         Ok(true)
     })
@@ -218,30 +258,32 @@ pub fn remove(apc: u64) -> Result<bool, KernelError> {
 /// Executa KernelRoutine em APC_LEVEL sobre cópias independentes dos quatro
 /// argumentos e relê a rotina normal (a KAPC pode ser liberada antes).
 fn deliver_one(apc: u64) -> Result<(), KernelError> {
-    let kernel_routine = guest::read64(apc + kapc::KERNEL_ROUTINE);
-    let block = guest::alloc_bytes(72);
+    let packet = apc_at(apc);
+    let kernel_routine = packet.reserved[KERNEL_ROUTINE].get();
+    let block = guest::alloc_bytes(core::mem::size_of::<ApcCallFrame>() as u64);
     if block == 0 {
         return Err(KernelError::new("APC callback frame allocation failed"));
     }
-    guest::write64(block, apc);
-    let fields = [kapc::NORMAL_ROUTINE, kapc::NORMAL_CONTEXT, kapc::SYSTEM_ARGUMENT_1, kapc::SYSTEM_ARGUMENT_2];
-    for (index, &field) in fields.iter().enumerate() {
-        let copy = block + 40 + index as u64 * 8;
-        guest::write64(copy, guest::read64(apc + field));
-        guest::write64(block + 8 + index as u64 * 8, copy);
+    // SAFETY: bloco recém-alocado do tamanho do frame.
+    let frame = unsafe { ApcCallFrame::at(block) };
+    frame.apc.set(apc);
+    let fields = [&packet.reserved[NORMAL_ROUTINE], &packet.normal_context, &packet.system_argument1, &packet.system_argument2];
+    for (index, field) in fields.iter().enumerate() {
+        frame.copies[index].set(field.get());
+        frame.pointers[index].set(frame.copies[index].address());
     }
-    guest::write8(apc + kapc::INSERTED, 0);
+    packet.inserted.set(0);
     let previous = irql::raise_irql(irql::APC_LEVEL);
-    let arguments: Vec<u64> = (0..5).map(|index| guest::read64(block + index * 8)).collect();
+    let arguments = [frame.apc.get(), frame.pointers[0].get(), frame.pointers[1].get(), frame.pointers[2].get(), frame.pointers[3].get()];
     native_call::call(kernel_routine, &arguments);
     irql::lower_irql(previous as u64);
-    let normal_routine = guest::read64(block + 40);
+    let normal_routine = frame.copies[0].get();
     if normal_routine != 0 {
-        let flags = process::get_current_thread() + PROGRESS_OFFSET;
-        guest::write8(flags, guest::read8(flags) | 1);
-        let arguments: Vec<u64> = (0..3).map(|index| guest::read64(block + 48 + index * 8)).collect();
+        let flags = &kthread(process::get_current_thread()).apc_state.in_progress_flags;
+        flags.set(flags.get() | KERNEL_APC_IN_PROGRESS);
+        let arguments = [frame.copies[1].get(), frame.copies[2].get(), frame.copies[3].get()];
         native_call::call(normal_routine, &arguments);
-        guest::write8(flags, guest::read8(flags) & !1);
+        flags.set(flags.get() & !KERNEL_APC_IN_PROGRESS);
     }
     guest::free_bytes(block);
     Ok(())
@@ -261,14 +303,15 @@ pub fn deliver_all_queued() -> Result<(), KernelError> {
             let Some(&apc) = queue.get(index) else { break };
             (apc, state.disabled_provider)
         };
+        let packet = apc_at(apc);
         // APCs de usuário voltam pelo dispatcher de usuário.
-        if guest::read8(apc + kapc::APC_MODE) != 0 {
+        if packet.apc_mode.get() != 0 {
             index += 1;
             continue;
         }
-        let special = guest::read64(apc + kapc::NORMAL_ROUTINE) == 0;
+        let special = packet.reserved[NORMAL_ROUTINE].get() == 0;
         let disabled = disabled_provider.is_some_and(|provider| provider(special));
-        if disabled || (!special && guest::read8(thread + PROGRESS_OFFSET) & 1 != 0) {
+        if disabled || (!special && kthread(thread).apc_state.in_progress_flags.get() & KERNEL_APC_IN_PROGRESS != 0) {
             index += 1;
             continue;
         }
@@ -278,10 +321,11 @@ pub fn deliver_all_queued() -> Result<(), KernelError> {
                     queue.remove(position);
                 }
             }
-            unlink(apc);
-            let environment = environment_address(thread);
-            if guest::read64(environment) == environment {
-                guest::write8(environment + 0x29, 0);
+            unlink(packet);
+            let environment = &kthread(thread).apc_state;
+            let kernel_head = &environment.apc_list_head[0];
+            if kernel_head.flink.get() == kernel_head.address() {
+                environment.kernel_apc_pending.set(0);
             }
         });
         deliver_one(apc)?;
@@ -328,16 +372,18 @@ pub fn rundown(thread: u64) -> Result<(), KernelError> {
     };
     let mut failure = None;
     for apc in queue {
-        let rundown_routine = guest::read64(apc + kapc::RUNDOWN_ROUTINE);
-        thread_lock::with_lock(thread, || unlink(apc));
-        guest::write8(apc + kapc::INSERTED, 0);
+        let packet = apc_at(apc);
+        let rundown_routine = packet.reserved[RUNDOWN_ROUTINE].get();
+        thread_lock::with_lock(thread, || unlink(packet));
+        packet.inserted.set(0);
         if rundown_routine != 0 {
             native_call::call(rundown_routine, &[apc]);
         }
     }
     STATE.lock().in_rundown.remove(&thread);
-    guest::write8(environment_address(thread) + 0x29, 0);
-    guest::write8(environment_address(thread) + 0x2A, 0);
+    let environment = &kthread(thread).apc_state;
+    environment.kernel_apc_pending.set(0);
+    environment.user_apc_pending_all.set(0);
     for environment in saved.into_iter().rev() {
         release_attachment(environment);
     }
@@ -353,14 +399,14 @@ pub fn rundown(thread: u64) -> Result<(), KernelError> {
 pub fn begin_attachment(thread: u64, supplied_state: Option<u64>, transition: Option<&mut dyn FnMut(u64)>) -> Result<usize, KernelError> {
     let state_pointer = match supplied_state {
         Some(state) => state,
-        None => guest::alloc_bytes(0x30),
+        None => guest::alloc_bytes(KapcState::SIZE),
     };
     if state_pointer == 0 {
         return Err(KernelError::new("APC attachment state allocation failed"));
     }
     let mut transition = transition;
     let depth = thread_lock::with_lock(thread, || {
-        copy_environment_state(environment_address(thread), state_pointer);
+        copy_environment_state(state_at(environment_address(thread)), state_at(state_pointer));
         let mut state = STATE.lock();
         let queue = state.queue_by_thread.remove(&thread).unwrap_or_default();
         let frames = state.attachments.entry(thread).or_default();
@@ -403,7 +449,7 @@ pub fn end_attachment(thread: u64, depth: usize, transition: Option<&mut dyn FnM
         if frames.is_empty() {
             state.attachments.remove(&thread);
         }
-        copy_environment_state(saved.state, environment_address(thread));
+        copy_environment_state(state_at(saved.state), state_at(environment_address(thread)));
         let queue = core::mem::take(&mut saved.queue);
         if queue.is_empty() {
             state.queue_by_thread.remove(&thread);

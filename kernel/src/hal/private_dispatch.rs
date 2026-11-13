@@ -24,6 +24,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::{cpu, physical, port};
 use crate::hal::amd64::private_entries;
+use crate::ntos::inc::types::{
+    Field, HalClockTimerConfiguration, HalIntelEnlightenmentInformation, HalIommuDispatch, HalPrivateDispatch, HalUnmaskedInterruptInformation,
+    InterruptConnectionType, InterruptVectorData, KinterruptMode, KinterruptPolarity, LargeInteger, NtStruct, WheaErrorRecordSectionDescriptor,
+    WheaErrorSeverity, WheaProcessorGenericErrorSection,
+};
 use crate::ntos::mm::{kernel_address, kernel_data};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -31,7 +36,20 @@ use crate::ntos::init::exports::Call;
 
 /// HAL_PRIVATE_DISPATCH_VERSION do ntoskrnl de referência.
 pub const VERSION: u32 = 51;
-pub const SIZE: u64 = 0x4B0;
+pub const SIZE: u64 = core::mem::size_of::<HalPrivateDispatch>() as u64;
+
+/// Deslocamento de um campo do HAL_PRIVATE_DISPATCH (tipo gerado dos símbolos).
+macro_rules! slot {
+    ($field:ident) => {
+        core::mem::offset_of!(HalPrivateDispatch, $field) as u64
+    };
+}
+
+/// Saída escalar de uma rotina da HAL (PULONG, PULONG64, PVOID*...).
+fn output<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: parâmetro de saída do chamador nativo.
+    unsafe { Field::<T>::at(address) }
+}
 /// Ids privados das rotinas: `BASE + índice do slot`.
 pub const BASE: u64 = 0x8000_0100;
 pub const SLOT_COUNT: usize = 149;
@@ -51,155 +69,155 @@ use Entry::{Default as D, Null as N, Routine as R};
 
 /// (offset, campo do HAL_PRIVATE_DISPATCH, conteúdo depois da HAL).
 const SLOTS: [(u64, &str, Entry); SLOT_COUNT] = [
-    (0x008, "HalHandlerForBus", D("zero")),
-    (0x010, "HalHandlerForConfigSpace", D("zero")),
-    (0x018, "HalLocateHiberRanges", R("HaliLocateHiberRanges")),
-    (0x020, "HalRegisterBusHandler", D("not_supported")),
-    (0x028, "HalSetWakeEnable", N),
-    (0x030, "HalSetWakeAlarm", R("HaliSetWakeAlarm")),
-    (0x038, "HalPciTranslateBusAddress", R("HalpTranslateBusAddress")),
-    (0x040, "HalPciAssignSlotResources", D("not_supported")),
-    (0x048, "HalHaltSystem", R("HaliHaltSystem")),
-    (0x050, "HalFindBusAddressTranslation", R("HalpFindBusAddressTranslation")),
-    (0x058, "HalResetDisplay", R("HalpBiosDisplayReset")),
-    (0x060, "HalAllocateMapRegisters", R("HalpAllocateMapRegisters")),
-    (0x068, "KdSetupPciDeviceForDebugging", R("HalpKdSetupDebuggingDevice")),
-    (0x070, "KdReleasePciDeviceForDebugging", R("HalpKdReleaseDebuggingDevice")),
-    (0x078, "KdGetAcpiTablePhase0", R("HalAcpiGetTable")),
-    (0x080, "KdCheckPowerButton", R("HalpCheckPowerButton")),
-    (0x088, "HalVectorToIDTEntry", D("vector_identity")),
-    (0x090, "KdMapPhysicalMemory64", R("HalpMapPhysicalMemoryWriteThrough64")),
-    (0x098, "KdUnmapVirtualAddress", R("HalpUnmapVirtualAddress")),
-    (0x0A0, "KdGetPciDataByOffset", R("HalpKdReadPCIConfig")),
-    (0x0A8, "KdSetPciDataByOffset", R("HalpKdWritePCIConfig")),
-    (0x0B0, "HalGetInterruptVectorOverride", D("zero")),
-    (0x0B8, "HalGetVectorInputOverride", D("not_supported")),
-    (0x0C0, "HalLoadMicrocode", R("HalpLoadMicrocode")),
-    (0x0C8, "HalUnloadMicrocode", R("HalpUnloadMicrocode")),
-    (0x0D0, "HalPostMicrocodeUpdate", R("HalpMcUpdatePostUpdate")),
-    (0x0D8, "HalAllocateMessageTargetOverride", D("not_supported")),
-    (0x0E0, "HalFreeMessageTargetOverride", D("void")),
-    (0x0E8, "HalDpReplaceBegin", R("HalpDpReplaceBegin")),
-    (0x0F0, "HalDpReplaceTarget", R("HalpDpReplaceTarget")),
-    (0x0F8, "HalDpReplaceControl", R("HalpDpReplaceControl")),
-    (0x100, "HalDpReplaceEnd", R("HalpDpReplaceEnd")),
-    (0x108, "HalPrepareForBugcheck", R("HalpPrepareForBugcheck")),
-    (0x110, "HalQueryWakeTime", R("HalpTimerQueryWakeTime")),
-    (0x118, "HalReportIdleStateUsage", R("HalpTimerReportIdleStateUsage")),
-    (0x120, "HalTscSynchronization", R("HalpTscSynchronization")),
-    (0x128, "HalWheaInitProcessorGenericSection", R("HalpWheaInitProcessorGenericSection")),
-    (0x130, "HalStopLegacyUsbInterrupts", R("HalpStopLegacyUsbInterrupts")),
-    (0x138, "HalReadWheaPhysicalMemory", R("HalpReadWheaPhysicalMemory")),
-    (0x140, "HalWriteWheaPhysicalMemory", R("HalpWriteWheaPhysicalMemory")),
-    (0x148, "HalDpMaskLevelTriggeredInterrupts", R("HalpInterruptMaskLevelTriggeredLines")),
-    (0x150, "HalDpUnmaskLevelTriggeredInterrupts", R("HalpInterruptUnmaskLevelTriggeredLines")),
-    (0x158, "HalDpGetInterruptReplayState", R("HalpDpGetInterruptReplayState")),
-    (0x160, "HalDpReplayInterrupts", R("HalpDpReplayInterrupts")),
-    (0x168, "HalQueryIoPortAccessSupported", D("true")),
-    (0x170, "KdSetupIntegratedDeviceForDebugging", R("HalpKdSetupDebuggingDevice")),
-    (0x178, "KdReleaseIntegratedDeviceForDebugging", R("HalpKdReleaseDebuggingDevice")),
-    (0x180, "HalGetEnlightenmentInformation", R("HvlGetEnlightenmentInfo")),
-    (0x188, "HalAllocateEarlyPages", R("HalpAllocateEarlyPages")),
-    (0x190, "HalMapEarlyPages", R("HalpMapEarlyPages")),
-    (0x198, "Dummy1", N),
-    (0x1A0, "Dummy2", N),
-    (0x1A8, "HalNotifyProcessorFreeze", R("HalpTimerNotifyProcessorFreeze")),
-    (0x1B0, "HalPrepareProcessorForIdle", R("HalpProcessorPrepareForIdle")),
-    (0x1B8, "HalRegisterLogRoutine", D("void")),
-    (0x1C0, "HalResumeProcessorFromIdle", R("HalpProcessorResumeFromIdle")),
-    (0x1C8, "Dummy", N),
-    (0x1D0, "HalVectorToIDTEntryEx", D("ulong_identity")),
-    (0x1D8, "HalSecondaryInterruptQueryPrimaryInformation", R("HalpSecondaryInterruptQueryPrimaryInformation")),
-    (0x1E0, "HalMaskInterrupt", R("HalpMaskInterrupt")),
-    (0x1E8, "HalUnmaskInterrupt", R("HalpUnmaskInterrupt")),
-    (0x1F0, "HalIsInterruptTypeSecondary", R("HalpIsInterruptTypeSecondary")),
-    (0x1F8, "HalAllocateGsivForSecondaryInterrupt", R("HalpAllocateGsivForSecondaryInterrupt")),
-    (0x200, "HalAddInterruptRemapping", R("HaliAddInterruptRemapping")),
-    (0x208, "HalRemoveInterruptRemapping", R("HaliRemoveInterruptRemapping")),
-    (0x210, "HalSaveAndDisableHvEnlightenment", R("HalpSaveAndDisableEnlightenment")),
-    (0x218, "HalRestoreHvEnlightenment", R("HalpRestoreHvEnlightenment")),
-    (0x220, "HalFlushIoBuffersExternalCache", D("void")),
-    (0x228, "HalFlushExternalCache", D("void")),
-    (0x230, "HalPciEarlyRestore", D("zero")),
-    (0x238, "HalGetProcessorId", R("HalpInterruptGetIdentifiers")),
-    (0x240, "HalAllocatePmcCounterSet", R("HalpAllocatePmcCounterSet")),
-    (0x248, "HalCollectPmcCounters", R("HalpCollectPmcCounters")),
-    (0x250, "HalFreePmcCounterSet", R("HalpFreePmcCounterSet")),
-    (0x258, "HalProcessorHalt", D("processor_halt")),
-    (0x260, "HalTimerQueryCycleCounter", R("HalpTimerQueryCycleCounter")),
-    (0x268, "Dummy3", N),
-    (0x270, "HalPciMarkHiberPhase", D("void")),
-    (0x278, "HalQueryProcessorRestartEntryPoint", R("HalpInterruptQueryProcessorRestartEntryPoint")),
-    (0x280, "HalRequestInterrupt", R("HalpInterruptRequestInterrupt")),
-    (0x288, "HalEnumerateUnmaskedInterrupts", R("HalpInterruptEnumerateUnmaskedInterrupts")),
-    (0x290, "HalFlushAndInvalidatePageExternalCache", D("void")),
-    (0x298, "KdEnumerateDebuggingDevices", R("HalpKdEnumerateDebuggingDevices")),
-    (0x2A0, "HalFlushIoRectangleExternalCache", D("void")),
-    (0x2A8, "HalPowerEarlyRestore", R("HalpPowerEarlyRestore")),
-    (0x2B0, "HalQueryCapsuleCapabilities", R("HalpQueryCapsuleCapabilities")),
-    (0x2B8, "HalUpdateCapsule", R("HalpUpdateCapsule")),
-    (0x2C0, "HalPciMultiStageResumeCapable", D("true")),
-    (0x2C8, "HalDmaFreeCrashDumpRegisters", R("HalpDmaFreeCrashDumpRegisters")),
-    (0x2D0, "HalAcpiAoacCapable", R("HalpAcpiAoacCapable")),
-    (0x2D8, "HalInterruptSetDestination", R("HalpInterruptSetDestination")),
-    (0x2E0, "HalGetClockConfiguration", R("HalpTimerGetClockConfiguration")),
-    (0x2E8, "HalClockTimerActivate", R("HalpTimerClockActivate")),
-    (0x2F0, "HalClockTimerInitialize", R("HalpTimerClockInitialize")),
-    (0x2F8, "HalClockTimerStop", R("HalpTimerClockStop")),
-    (0x300, "HalClockTimerArm", R("HalpTimerClockArm")),
-    (0x308, "HalTimerOnlyClockInterruptPending", R("HalpTimerOnlyClockInterruptPending")),
-    (0x310, "HalAcpiGetMultiNode", R("HalAcpiGetRsdpDispatch")),
-    (0x318, "HalPowerSetRebootHandler", R("HalpPowerSetRebootHandler")),
-    (0x320, "HalIommuRegisterDispatchTable", R("HalpIommuRegisterDispatchTable")),
-    (0x328, "HalTimerWatchdogStart", R("HalpTimerWatchdogStart")),
-    (0x330, "HalTimerWatchdogResetCountdown", R("HalpTimerWatchdogResetCountdown")),
-    (0x338, "HalTimerWatchdogStop", R("HalpTimerWatchdogStop")),
-    (0x340, "HalTimerWatchdogGeneratedLastReset", R("HalpTimerWatchdogGeneratedLastReset")),
-    (0x348, "HalTimerWatchdogTriggerSystemReset", R("HalpTimerWatchdogTriggerSystemReset")),
-    (0x350, "HalInterruptVectorDataToGsiv", R("HalpInterruptVectorDataToGsiv")),
-    (0x358, "HalInterruptGetHighestPriorityInterrupt", R("HalpInterruptGetHighestPriorityInterrupt")),
-    (0x360, "HalProcessorOn", D("not_supported")),
-    (0x368, "HalProcessorOff", D("not_supported")),
-    (0x370, "HalProcessorFreeze", D("not_supported")),
-    (0x378, "HalDmaLinkDeviceObjectByToken", R("HalpDmaLinkDeviceObjectByToken")),
-    (0x380, "HalDmaCheckAdapterToken", R("HalpDmaCheckAdapterToken")),
-    (0x388, "Dummy4", N),
-    (0x390, "HalTimerConvertPerformanceCounterToAuxiliaryCounter", R("HalpTimerConvertPerformanceCounterToAuxiliaryCounter")),
-    (0x398, "HalTimerConvertAuxiliaryCounterToPerformanceCounter", R("HalpTimerConvertAuxiliaryCounterToPerformanceCounter")),
-    (0x3A0, "HalTimerQueryAuxiliaryCounterFrequency", R("HalpTimerQueryAuxiliaryCounterFrequency")),
-    (0x3A8, "HalConnectThermalInterrupt", R("HalpConnectThermalInterrupt")),
-    (0x3B0, "HalIsEFIRuntimeActive", R("HalpIsEFIRuntimeActive")),
-    (0x3B8, "HalTimerQueryAndResetRtcErrors", R("HalpTimerQueryAndResetRtcErrors")),
-    (0x3C0, "HalAcpiLateRestore", D("void")),
-    (0x3C8, "KdWatchdogDelayExpiration", R("HalpWatchdogDelayExpiration")),
-    (0x3D0, "HalGetProcessorStats", D("not_supported")),
-    (0x3D8, "HalTimerWatchdogQueryDueTime", R("HalpTimerWatchdogQueryDueTime")),
-    (0x3E0, "HalConnectSyntheticInterrupt", D("not_supported")),
-    (0x3E8, "HalPreprocessNmi", R("HalpPreprocessNmi")),
-    (0x3F0, "HalEnumerateEnvironmentVariablesWithFilter", R("HalpEnumerateEnvironmentVariablesWithFilter")),
-    (0x3F8, "HalCaptureLastBranchRecordStack", R("HalpLbrCaptureStack")),
-    (0x400, "HalClearLastBranchRecordStack", R("HalpLbrClearStack")),
-    (0x408, "HalConfigureLastBranchRecord", R("HalpLbrConfigureRecording")),
-    (0x410, "HalGetLastBranchInformation", R("HalpLbrGetInformation")),
-    (0x418, "HalResumeLastBranchRecord", R("HalpLbrResumeRecording")),
-    (0x420, "HalStartLastBranchRecord", R("HalpLbrStartRecording")),
-    (0x428, "HalStopLastBranchRecord", R("HalpLbrStopRecording")),
-    (0x430, "HalIommuBlockDevice", R("HalpIommuBlockDevice")),
-    (0x438, "HalIommuUnblockDevice", R("HalpIommuUnblockDevice")),
-    (0x440, "HalGetIommuInterface", R("HalpGetIommuInterface")),
-    (0x448, "HalRequestGenericErrorRecovery", R("HalpRequestGenericErrorRecovery")),
-    (0x450, "HalTimerQueryHostPerformanceCounter", R("HalpTimerQueryHostPerformanceCounter")),
-    (0x458, "HalTopologyQueryProcessorRelationships", D("not_supported")),
-    (0x460, "HalInitPlatformDebugTriggers", R("HaliInitializePlatformDebugTriggers")),
-    (0x468, "HalRunPlatformDebugTriggers", R("HaliRunPlatformDebugTriggers")),
-    (0x470, "HalTimerGetReferencePage", R("HalpTimerGetReferencePage")),
-    (0x478, "HalGetHiddenProcessorPowerInterface", R("HalpBlkPoGetPowerInterface")),
-    (0x480, "HalGetHiddenProcessorPackageId", R("HalpBlkPoGetPackageId")),
-    (0x488, "HalGetHiddenPackageProcessorCount", R("HalpBlkPoGetProcessorCount")),
-    (0x490, "HalGetHiddenProcessorApicIdByIndex", R("HalpBlkPoGetApicIdByIndex")),
-    (0x498, "HalRegisterHiddenProcessorIdleState", R("HalpBlkPoRegisterIdleState")),
-    (0x4A0, "HalIommuReportIommuFault", R("HalpIommuReportIommuFault")),
-    (0x4A8, "HalIommuDmaRemappingCapable", R("HalpIommuDmaRemappingCapable")),
+    (slot!(hal_handler_for_bus), "HalHandlerForBus", D("zero")),
+    (slot!(hal_handler_for_config_space), "HalHandlerForConfigSpace", D("zero")),
+    (slot!(hal_locate_hiber_ranges), "HalLocateHiberRanges", R("HaliLocateHiberRanges")),
+    (slot!(hal_register_bus_handler), "HalRegisterBusHandler", D("not_supported")),
+    (slot!(hal_set_wake_enable), "HalSetWakeEnable", N),
+    (slot!(hal_set_wake_alarm), "HalSetWakeAlarm", R("HaliSetWakeAlarm")),
+    (slot!(hal_pci_translate_bus_address), "HalPciTranslateBusAddress", R("HalpTranslateBusAddress")),
+    (slot!(hal_pci_assign_slot_resources), "HalPciAssignSlotResources", D("not_supported")),
+    (slot!(hal_halt_system), "HalHaltSystem", R("HaliHaltSystem")),
+    (slot!(hal_find_bus_address_translation), "HalFindBusAddressTranslation", R("HalpFindBusAddressTranslation")),
+    (slot!(hal_reset_display), "HalResetDisplay", R("HalpBiosDisplayReset")),
+    (slot!(hal_allocate_map_registers), "HalAllocateMapRegisters", R("HalpAllocateMapRegisters")),
+    (slot!(kd_setup_pci_device_for_debugging), "KdSetupPciDeviceForDebugging", R("HalpKdSetupDebuggingDevice")),
+    (slot!(kd_release_pci_device_for_debugging), "KdReleasePciDeviceForDebugging", R("HalpKdReleaseDebuggingDevice")),
+    (slot!(kd_get_acpi_table_phase0), "KdGetAcpiTablePhase0", R("HalAcpiGetTable")),
+    (slot!(kd_check_power_button), "KdCheckPowerButton", R("HalpCheckPowerButton")),
+    (slot!(hal_vector_to_idt_entry), "HalVectorToIDTEntry", D("vector_identity")),
+    (slot!(kd_map_physical_memory64), "KdMapPhysicalMemory64", R("HalpMapPhysicalMemoryWriteThrough64")),
+    (slot!(kd_unmap_virtual_address), "KdUnmapVirtualAddress", R("HalpUnmapVirtualAddress")),
+    (slot!(kd_get_pci_data_by_offset), "KdGetPciDataByOffset", R("HalpKdReadPCIConfig")),
+    (slot!(kd_set_pci_data_by_offset), "KdSetPciDataByOffset", R("HalpKdWritePCIConfig")),
+    (slot!(hal_get_interrupt_vector_override), "HalGetInterruptVectorOverride", D("zero")),
+    (slot!(hal_get_vector_input_override), "HalGetVectorInputOverride", D("not_supported")),
+    (slot!(hal_load_microcode), "HalLoadMicrocode", R("HalpLoadMicrocode")),
+    (slot!(hal_unload_microcode), "HalUnloadMicrocode", R("HalpUnloadMicrocode")),
+    (slot!(hal_post_microcode_update), "HalPostMicrocodeUpdate", R("HalpMcUpdatePostUpdate")),
+    (slot!(hal_allocate_message_target_override), "HalAllocateMessageTargetOverride", D("not_supported")),
+    (slot!(hal_free_message_target_override), "HalFreeMessageTargetOverride", D("void")),
+    (slot!(hal_dp_replace_begin), "HalDpReplaceBegin", R("HalpDpReplaceBegin")),
+    (slot!(hal_dp_replace_target), "HalDpReplaceTarget", R("HalpDpReplaceTarget")),
+    (slot!(hal_dp_replace_control), "HalDpReplaceControl", R("HalpDpReplaceControl")),
+    (slot!(hal_dp_replace_end), "HalDpReplaceEnd", R("HalpDpReplaceEnd")),
+    (slot!(hal_prepare_for_bugcheck), "HalPrepareForBugcheck", R("HalpPrepareForBugcheck")),
+    (slot!(hal_query_wake_time), "HalQueryWakeTime", R("HalpTimerQueryWakeTime")),
+    (slot!(hal_report_idle_state_usage), "HalReportIdleStateUsage", R("HalpTimerReportIdleStateUsage")),
+    (slot!(hal_tsc_synchronization), "HalTscSynchronization", R("HalpTscSynchronization")),
+    (slot!(hal_whea_init_processor_generic_section), "HalWheaInitProcessorGenericSection", R("HalpWheaInitProcessorGenericSection")),
+    (slot!(hal_stop_legacy_usb_interrupts), "HalStopLegacyUsbInterrupts", R("HalpStopLegacyUsbInterrupts")),
+    (slot!(hal_read_whea_physical_memory), "HalReadWheaPhysicalMemory", R("HalpReadWheaPhysicalMemory")),
+    (slot!(hal_write_whea_physical_memory), "HalWriteWheaPhysicalMemory", R("HalpWriteWheaPhysicalMemory")),
+    (slot!(hal_dp_mask_level_triggered_interrupts), "HalDpMaskLevelTriggeredInterrupts", R("HalpInterruptMaskLevelTriggeredLines")),
+    (slot!(hal_dp_unmask_level_triggered_interrupts), "HalDpUnmaskLevelTriggeredInterrupts", R("HalpInterruptUnmaskLevelTriggeredLines")),
+    (slot!(hal_dp_get_interrupt_replay_state), "HalDpGetInterruptReplayState", R("HalpDpGetInterruptReplayState")),
+    (slot!(hal_dp_replay_interrupts), "HalDpReplayInterrupts", R("HalpDpReplayInterrupts")),
+    (slot!(hal_query_io_port_access_supported), "HalQueryIoPortAccessSupported", D("true")),
+    (slot!(kd_setup_integrated_device_for_debugging), "KdSetupIntegratedDeviceForDebugging", R("HalpKdSetupDebuggingDevice")),
+    (slot!(kd_release_integrated_device_for_debugging), "KdReleaseIntegratedDeviceForDebugging", R("HalpKdReleaseDebuggingDevice")),
+    (slot!(hal_get_enlightenment_information), "HalGetEnlightenmentInformation", R("HvlGetEnlightenmentInfo")),
+    (slot!(hal_allocate_early_pages), "HalAllocateEarlyPages", R("HalpAllocateEarlyPages")),
+    (slot!(hal_map_early_pages), "HalMapEarlyPages", R("HalpMapEarlyPages")),
+    (slot!(dummy1), "Dummy1", N),
+    (slot!(dummy2), "Dummy2", N),
+    (slot!(hal_notify_processor_freeze), "HalNotifyProcessorFreeze", R("HalpTimerNotifyProcessorFreeze")),
+    (slot!(hal_prepare_processor_for_idle), "HalPrepareProcessorForIdle", R("HalpProcessorPrepareForIdle")),
+    (slot!(hal_register_log_routine), "HalRegisterLogRoutine", D("void")),
+    (slot!(hal_resume_processor_from_idle), "HalResumeProcessorFromIdle", R("HalpProcessorResumeFromIdle")),
+    (slot!(dummy), "Dummy", N),
+    (slot!(hal_vector_to_idt_entry_ex), "HalVectorToIDTEntryEx", D("ulong_identity")),
+    (slot!(hal_secondary_interrupt_query_primary_information), "HalSecondaryInterruptQueryPrimaryInformation", R("HalpSecondaryInterruptQueryPrimaryInformation")),
+    (slot!(hal_mask_interrupt), "HalMaskInterrupt", R("HalpMaskInterrupt")),
+    (slot!(hal_unmask_interrupt), "HalUnmaskInterrupt", R("HalpUnmaskInterrupt")),
+    (slot!(hal_is_interrupt_type_secondary), "HalIsInterruptTypeSecondary", R("HalpIsInterruptTypeSecondary")),
+    (slot!(hal_allocate_gsiv_for_secondary_interrupt), "HalAllocateGsivForSecondaryInterrupt", R("HalpAllocateGsivForSecondaryInterrupt")),
+    (slot!(hal_add_interrupt_remapping), "HalAddInterruptRemapping", R("HaliAddInterruptRemapping")),
+    (slot!(hal_remove_interrupt_remapping), "HalRemoveInterruptRemapping", R("HaliRemoveInterruptRemapping")),
+    (slot!(hal_save_and_disable_hv_enlightenment), "HalSaveAndDisableHvEnlightenment", R("HalpSaveAndDisableEnlightenment")),
+    (slot!(hal_restore_hv_enlightenment), "HalRestoreHvEnlightenment", R("HalpRestoreHvEnlightenment")),
+    (slot!(hal_flush_io_buffers_external_cache), "HalFlushIoBuffersExternalCache", D("void")),
+    (slot!(hal_flush_external_cache), "HalFlushExternalCache", D("void")),
+    (slot!(hal_pci_early_restore), "HalPciEarlyRestore", D("zero")),
+    (slot!(hal_get_processor_id), "HalGetProcessorId", R("HalpInterruptGetIdentifiers")),
+    (slot!(hal_allocate_pmc_counter_set), "HalAllocatePmcCounterSet", R("HalpAllocatePmcCounterSet")),
+    (slot!(hal_collect_pmc_counters), "HalCollectPmcCounters", R("HalpCollectPmcCounters")),
+    (slot!(hal_free_pmc_counter_set), "HalFreePmcCounterSet", R("HalpFreePmcCounterSet")),
+    (slot!(hal_processor_halt), "HalProcessorHalt", D("processor_halt")),
+    (slot!(hal_timer_query_cycle_counter), "HalTimerQueryCycleCounter", R("HalpTimerQueryCycleCounter")),
+    (slot!(dummy3), "Dummy3", N),
+    (slot!(hal_pci_mark_hiber_phase), "HalPciMarkHiberPhase", D("void")),
+    (slot!(hal_query_processor_restart_entry_point), "HalQueryProcessorRestartEntryPoint", R("HalpInterruptQueryProcessorRestartEntryPoint")),
+    (slot!(hal_request_interrupt), "HalRequestInterrupt", R("HalpInterruptRequestInterrupt")),
+    (slot!(hal_enumerate_unmasked_interrupts), "HalEnumerateUnmaskedInterrupts", R("HalpInterruptEnumerateUnmaskedInterrupts")),
+    (slot!(hal_flush_and_invalidate_page_external_cache), "HalFlushAndInvalidatePageExternalCache", D("void")),
+    (slot!(kd_enumerate_debugging_devices), "KdEnumerateDebuggingDevices", R("HalpKdEnumerateDebuggingDevices")),
+    (slot!(hal_flush_io_rectangle_external_cache), "HalFlushIoRectangleExternalCache", D("void")),
+    (slot!(hal_power_early_restore), "HalPowerEarlyRestore", R("HalpPowerEarlyRestore")),
+    (slot!(hal_query_capsule_capabilities), "HalQueryCapsuleCapabilities", R("HalpQueryCapsuleCapabilities")),
+    (slot!(hal_update_capsule), "HalUpdateCapsule", R("HalpUpdateCapsule")),
+    (slot!(hal_pci_multi_stage_resume_capable), "HalPciMultiStageResumeCapable", D("true")),
+    (slot!(hal_dma_free_crash_dump_registers), "HalDmaFreeCrashDumpRegisters", R("HalpDmaFreeCrashDumpRegisters")),
+    (slot!(hal_acpi_aoac_capable), "HalAcpiAoacCapable", R("HalpAcpiAoacCapable")),
+    (slot!(hal_interrupt_set_destination), "HalInterruptSetDestination", R("HalpInterruptSetDestination")),
+    (slot!(hal_get_clock_configuration), "HalGetClockConfiguration", R("HalpTimerGetClockConfiguration")),
+    (slot!(hal_clock_timer_activate), "HalClockTimerActivate", R("HalpTimerClockActivate")),
+    (slot!(hal_clock_timer_initialize), "HalClockTimerInitialize", R("HalpTimerClockInitialize")),
+    (slot!(hal_clock_timer_stop), "HalClockTimerStop", R("HalpTimerClockStop")),
+    (slot!(hal_clock_timer_arm), "HalClockTimerArm", R("HalpTimerClockArm")),
+    (slot!(hal_timer_only_clock_interrupt_pending), "HalTimerOnlyClockInterruptPending", R("HalpTimerOnlyClockInterruptPending")),
+    (slot!(hal_acpi_get_multi_node), "HalAcpiGetMultiNode", R("HalAcpiGetRsdpDispatch")),
+    (slot!(hal_power_set_reboot_handler), "HalPowerSetRebootHandler", R("HalpPowerSetRebootHandler")),
+    (slot!(hal_iommu_register_dispatch_table), "HalIommuRegisterDispatchTable", R("HalpIommuRegisterDispatchTable")),
+    (slot!(hal_timer_watchdog_start), "HalTimerWatchdogStart", R("HalpTimerWatchdogStart")),
+    (slot!(hal_timer_watchdog_reset_countdown), "HalTimerWatchdogResetCountdown", R("HalpTimerWatchdogResetCountdown")),
+    (slot!(hal_timer_watchdog_stop), "HalTimerWatchdogStop", R("HalpTimerWatchdogStop")),
+    (slot!(hal_timer_watchdog_generated_last_reset), "HalTimerWatchdogGeneratedLastReset", R("HalpTimerWatchdogGeneratedLastReset")),
+    (slot!(hal_timer_watchdog_trigger_system_reset), "HalTimerWatchdogTriggerSystemReset", R("HalpTimerWatchdogTriggerSystemReset")),
+    (slot!(hal_interrupt_vector_data_to_gsiv), "HalInterruptVectorDataToGsiv", R("HalpInterruptVectorDataToGsiv")),
+    (slot!(hal_interrupt_get_highest_priority_interrupt), "HalInterruptGetHighestPriorityInterrupt", R("HalpInterruptGetHighestPriorityInterrupt")),
+    (slot!(hal_processor_on), "HalProcessorOn", D("not_supported")),
+    (slot!(hal_processor_off), "HalProcessorOff", D("not_supported")),
+    (slot!(hal_processor_freeze), "HalProcessorFreeze", D("not_supported")),
+    (slot!(hal_dma_link_device_object_by_token), "HalDmaLinkDeviceObjectByToken", R("HalpDmaLinkDeviceObjectByToken")),
+    (slot!(hal_dma_check_adapter_token), "HalDmaCheckAdapterToken", R("HalpDmaCheckAdapterToken")),
+    (slot!(dummy4), "Dummy4", N),
+    (slot!(hal_timer_convert_performance_counter_to_auxiliary_counter), "HalTimerConvertPerformanceCounterToAuxiliaryCounter", R("HalpTimerConvertPerformanceCounterToAuxiliaryCounter")),
+    (slot!(hal_timer_convert_auxiliary_counter_to_performance_counter), "HalTimerConvertAuxiliaryCounterToPerformanceCounter", R("HalpTimerConvertAuxiliaryCounterToPerformanceCounter")),
+    (slot!(hal_timer_query_auxiliary_counter_frequency), "HalTimerQueryAuxiliaryCounterFrequency", R("HalpTimerQueryAuxiliaryCounterFrequency")),
+    (slot!(hal_connect_thermal_interrupt), "HalConnectThermalInterrupt", R("HalpConnectThermalInterrupt")),
+    (slot!(hal_is_efi_runtime_active), "HalIsEFIRuntimeActive", R("HalpIsEFIRuntimeActive")),
+    (slot!(hal_timer_query_and_reset_rtc_errors), "HalTimerQueryAndResetRtcErrors", R("HalpTimerQueryAndResetRtcErrors")),
+    (slot!(hal_acpi_late_restore), "HalAcpiLateRestore", D("void")),
+    (slot!(kd_watchdog_delay_expiration), "KdWatchdogDelayExpiration", R("HalpWatchdogDelayExpiration")),
+    (slot!(hal_get_processor_stats), "HalGetProcessorStats", D("not_supported")),
+    (slot!(hal_timer_watchdog_query_due_time), "HalTimerWatchdogQueryDueTime", R("HalpTimerWatchdogQueryDueTime")),
+    (slot!(hal_connect_synthetic_interrupt), "HalConnectSyntheticInterrupt", D("not_supported")),
+    (slot!(hal_preprocess_nmi), "HalPreprocessNmi", R("HalpPreprocessNmi")),
+    (slot!(hal_enumerate_environment_variables_with_filter), "HalEnumerateEnvironmentVariablesWithFilter", R("HalpEnumerateEnvironmentVariablesWithFilter")),
+    (slot!(hal_capture_last_branch_record_stack), "HalCaptureLastBranchRecordStack", R("HalpLbrCaptureStack")),
+    (slot!(hal_clear_last_branch_record_stack), "HalClearLastBranchRecordStack", R("HalpLbrClearStack")),
+    (slot!(hal_configure_last_branch_record), "HalConfigureLastBranchRecord", R("HalpLbrConfigureRecording")),
+    (slot!(hal_get_last_branch_information), "HalGetLastBranchInformation", R("HalpLbrGetInformation")),
+    (slot!(hal_resume_last_branch_record), "HalResumeLastBranchRecord", R("HalpLbrResumeRecording")),
+    (slot!(hal_start_last_branch_record), "HalStartLastBranchRecord", R("HalpLbrStartRecording")),
+    (slot!(hal_stop_last_branch_record), "HalStopLastBranchRecord", R("HalpLbrStopRecording")),
+    (slot!(hal_iommu_block_device), "HalIommuBlockDevice", R("HalpIommuBlockDevice")),
+    (slot!(hal_iommu_unblock_device), "HalIommuUnblockDevice", R("HalpIommuUnblockDevice")),
+    (slot!(hal_get_iommu_interface), "HalGetIommuInterface", R("HalpGetIommuInterface")),
+    (slot!(hal_request_generic_error_recovery), "HalRequestGenericErrorRecovery", R("HalpRequestGenericErrorRecovery")),
+    (slot!(hal_timer_query_host_performance_counter), "HalTimerQueryHostPerformanceCounter", R("HalpTimerQueryHostPerformanceCounter")),
+    (slot!(hal_topology_query_processor_relationships), "HalTopologyQueryProcessorRelationships", D("not_supported")),
+    (slot!(hal_init_platform_debug_triggers), "HalInitPlatformDebugTriggers", R("HaliInitializePlatformDebugTriggers")),
+    (slot!(hal_run_platform_debug_triggers), "HalRunPlatformDebugTriggers", R("HaliRunPlatformDebugTriggers")),
+    (slot!(hal_timer_get_reference_page), "HalTimerGetReferencePage", R("HalpTimerGetReferencePage")),
+    (slot!(hal_get_hidden_processor_power_interface), "HalGetHiddenProcessorPowerInterface", R("HalpBlkPoGetPowerInterface")),
+    (slot!(hal_get_hidden_processor_package_id), "HalGetHiddenProcessorPackageId", R("HalpBlkPoGetPackageId")),
+    (slot!(hal_get_hidden_package_processor_count), "HalGetHiddenPackageProcessorCount", R("HalpBlkPoGetProcessorCount")),
+    (slot!(hal_get_hidden_processor_apic_id_by_index), "HalGetHiddenProcessorApicIdByIndex", R("HalpBlkPoGetApicIdByIndex")),
+    (slot!(hal_register_hidden_processor_idle_state), "HalRegisterHiddenProcessorIdleState", R("HalpBlkPoRegisterIdleState")),
+    (slot!(hal_iommu_report_iommu_fault), "HalIommuReportIommuFault", R("HalpIommuReportIommuFault")),
+    (slot!(hal_iommu_dma_remapping_capable), "HalIommuDmaRemappingCapable", R("HalpIommuDmaRemappingCapable")),
 ];
 
 const STATUS_SUCCESS: u64 = 0;
@@ -244,14 +262,15 @@ fn native(symbol: &str) -> Result<u64, KernelError> {
 pub fn initialize() -> Result<(), KernelError> {
     let table = kernel_data::address("HalPrivateDispatchTable")?;
     let stubs = native("hal_private_stubs")?;
-    guest::write32(table, VERSION);
+    // SAFETY: a célula do export de dados HalPrivateDispatchTable.
+    unsafe { HalPrivateDispatch::at(table) }.version.set(VERSION);
     for (index, &(offset, _, entry)) in SLOTS.iter().enumerate() {
         let pointer = match entry {
             Entry::Null => 0,
             Entry::Default(body) => native(&alloc::format!("hal_default_{body}"))?,
             Entry::Routine(_) => stubs + index as u64 * crate::hal::amd64::win32_thunk::STUB_SIZE,
         };
-        guest::write64(table + offset, pointer);
+        output::<u64>(table + offset).set(pointer);
     }
     TABLE.store(table, Ordering::SeqCst);
     let routines = SLOTS.iter().filter(|(_, _, entry)| matches!(entry, Entry::Routine(_))).count();
@@ -271,23 +290,24 @@ fn pci_transfer(call: &Call, write: bool) -> u64 {
         return 0;
     }
     let length = length.min(256 - offset);
-    for index in 0..length {
-        let ok = if write {
-            super::pci_config::write(bus, device, function, offset + index, 1, guest::read8(buffer + index as u64) as u32).is_ok()
-        } else {
-            match super::pci_config::read(bus, device, function, offset + index, 1) {
-                Ok(value) => {
-                    guest::write8(buffer + index as u64, value as u8);
-                    true
-                }
-                Err(_) => false,
+    if write {
+        let bytes = guest::read_bytes(buffer, length as usize);
+        for (index, &byte) in bytes.iter().enumerate() {
+            if super::pci_config::write(bus, device, function, offset + index as u32, 1, byte as u32).is_err() {
+                return index as u64;
             }
-        };
-        if !ok {
-            return index as u64;
+        }
+        return length as u64;
+    }
+    let mut bytes = alloc::vec::Vec::with_capacity(length as usize);
+    for index in 0..length {
+        match super::pci_config::read(bus, device, function, offset + index, 1) {
+            Ok(value) => bytes.push(value as u8),
+            Err(_) => break,
         }
     }
-    length as u64
+    guest::write_bytes(buffer, &bytes);
+    bytes.len() as u64
 }
 
 /// Linha do PIC legado de uma GSIV (as 16 primeiras são as IRQs ISA).
@@ -354,16 +374,18 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         // ---- barramentos e DMA -----------------------------------------------
         // Tradução identidade: *TranslatedAddress = BusAddress, TRUE.
         "HalpTranslateBusAddress" => {
-            guest::write64(call.arg(5), call.arg(3));
+            // SAFETY: PPHYSICAL_ADDRESS TranslatedAddress do chamador.
+            unsafe { LargeInteger::at(call.arg(5)) }.quad_part.set(call.arg(3) as i64);
             1
         }
         "HalpFindBusAddressTranslation" => {
             let (bus_address, translated, context, next_bus) = (call.arg(1), call.arg(3), call.arg(4), call.arg(5) as u8);
-            if context == 0 || (guest::read64(context) != 0 && next_bus == 1) {
+            if context == 0 || (output::<u64>(context).get() != 0 && next_bus == 1) {
                 0
             } else {
-                guest::write64(context, 1);
-                guest::write64(translated, bus_address);
+                output::<u64>(context).set(1);
+                // SAFETY: PPHYSICAL_ADDRESS TranslatedAddress do chamador.
+                unsafe { LargeInteger::at(translated) }.quad_part.set(bus_address as i64);
                 1
             }
         }
@@ -410,7 +432,7 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             match crate::ntos::mm::contiguous_memory::allocate_default(pages * 0x1000, u64::MAX) {
                 Ok(address) => {
                     if call.arg(3) != 0 {
-                        guest::write64(call.arg(3), crate::ntos::mm::paging::translate(address));
+                        output::<u64>(call.arg(3)).set(crate::ntos::mm::paging::translate(address));
                     }
                     address
                 }
@@ -427,24 +449,27 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         "HalpInterruptMaskLevelTriggeredLines" | "HalpInterruptUnmaskLevelTriggeredLines" => STATUS_SUCCESS,
         "HalpDpGetInterruptReplayState" => {
             if call.arg(2) != 0 {
-                guest::write64(call.arg(2), 0);
+                output::<u64>(call.arg(2)).set(0);
             }
             STATUS_NOT_SUPPORTED
         }
         "HalpDpReplayInterrupts" => STATUS_NOT_SUPPORTED,
         // ---- WHEA ------------------------------------------------------------
         "HalpWheaInitProcessorGenericSection" => {
-            let (descriptor, section) = (call.arg(1), call.arg(2));
-            guest::write_bytes(descriptor, &[0; 0x48]);
-            guest::write32(descriptor + 4, 0xC0);
-            guest::write16(descriptor + 8, 0x300);
-            guest::write_bytes(descriptor + 0x10, &PROCESSOR_GENERIC_SECTION_GUID);
-            guest::write32(descriptor + 0x30, 3);
-            guest::write_bytes(section, &[0; 0xC0]);
-            guest::write8(section + 9, 2);
-            guest::write64(section, 0x143);
-            guest::write64(section + 0x10, cpu::cpuid(1)[0] as u64);
-            guest::write64(section + 0x98, current_apic_id() as u64);
+            let (descriptor_address, section_address) = (call.arg(1), call.arg(2));
+            guest::write_bytes(descriptor_address, &[0; WheaErrorRecordSectionDescriptor::SIZE as usize]);
+            guest::write_bytes(section_address, &[0; WheaProcessorGenericErrorSection::SIZE as usize]);
+            // SAFETY: descritor e seção de erro do chamador (recém-zerados).
+            let (descriptor, section) = unsafe { (WheaErrorRecordSectionDescriptor::at(descriptor_address), WheaProcessorGenericErrorSection::at(section_address)) };
+            descriptor.section_length.set(WheaProcessorGenericErrorSection::SIZE as u32);
+            descriptor.revision.as_ushort.set(0x300);
+            guest::write_bytes(descriptor.section_type.address(), &PROCESSOR_GENERIC_SECTION_GUID);
+            descriptor.section_severity.set(WheaErrorSeverity::WHEA_ERR_SEV_INFORMATIONAL);
+            // InstructionSet X64; ValidBits: tipo, conjunto, versão e id do processador.
+            section.instruction_set.set(2);
+            section.valid_bits.valid_bits.set(0x143);
+            section.cpu_version.set(cpu::cpuid(1)[0] as u64);
+            section.processor_id.set(current_apic_id() as u64);
             STATUS_SUCCESS
         }
         "HalpReadWheaPhysicalMemory" => {
@@ -460,9 +485,9 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         "HalpRequestGenericErrorRecovery" => STATUS_NOT_FOUND,
         // ---- timers ----------------------------------------------------------
         "HalpTimerQueryWakeTime" => {
-            for output in [call.arg(1), call.arg(2)] {
-                if output != 0 {
-                    guest::write64(output, 0);
+            for pointer in [call.arg(1), call.arg(2)] {
+                if pointer != 0 {
+                    output::<u64>(pointer).set(0);
                 }
             }
             0
@@ -474,25 +499,27 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         "HalpTscSynchronization" | "HalpTimerNotifyProcessorFreeze" => 0,
         "HalpTimerQueryCycleCounter" => {
             if call.arg(1) != 0 {
-                guest::write64(call.arg(1), crate::ntos::ke::clock::tsc_frequency_hz());
+                output::<u64>(call.arg(1)).set(crate::ntos::ke::clock::tsc_frequency_hz());
             }
             cpu::rdtsc()
         }
         // Timer do relógio: LAPIC periódico de 100 Hz por CPU (10 ms fixos).
         "HalpTimerGetClockConfiguration" => {
-            let configuration = call.arg(1);
-            guest::write_bytes(configuration, &[0; 32]);
-            guest::write8(configuration, 1 << 2);
-            guest::write32(configuration + 4, 0);
-            guest::write32(configuration + 8, 1);
-            guest::write64(configuration + 0x10, 100_000);
-            guest::write32(configuration + 0x18, 100_000);
+            let address = call.arg(1);
+            guest::write_bytes(address, &[0; HalClockTimerConfiguration::SIZE as usize]);
+            // SAFETY: HAL_CLOCK_TIMER_CONFIGURATION do chamador (recém-zerada).
+            let configuration = unsafe { HalClockTimerConfiguration::at(address) };
+            configuration.flags.set(1 << 2); // PerCpuTimer
+            configuration.known_type.set(0);
+            configuration.capabilities.set(1);
+            configuration.max_increment.set(100_000);
+            configuration.min_increment.set(100_000);
             0
         }
         "HalpTimerClockActivate" | "HalpTimerClockInitialize" | "HalpTimerClockStop" => 0,
         "HalpTimerClockArm" => {
             if call.arg(3) != 0 {
-                guest::write64(call.arg(3), 100_000);
+                output::<u64>(call.arg(3)).set(100_000);
             }
             STATUS_SUCCESS
         }
@@ -520,9 +547,9 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             let apic_ids = crate::ntos::ke::smp::discovered_apic_ids();
             match apic_ids.get(call.arg(1) as u32 as usize) {
                 Some(&apic_id) => {
-                    for output in [call.arg(2), call.arg(3)] {
-                        if output != 0 {
-                            guest::write32(output, apic_id);
+                    for pointer in [call.arg(2), call.arg(3)] {
+                        if pointer != 0 {
+                            output::<u32>(pointer).set(apic_id);
                         }
                     }
                     STATUS_SUCCESS
@@ -531,7 +558,7 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             }
         }
         "HalpInterruptQueryProcessorRestartEntryPoint" => {
-            guest::write64(call.arg(1), 0);
+            output::<u64>(call.arg(1)).set(0);
             STATUS_NOT_SUPPORTED
         }
         // O OpenNT não gera interrupções por GSIV nem redireciona destinos.
@@ -547,13 +574,15 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
                 // Version u16, Size u16, Flags u16, Mode @8 (Latched = 1),
                 // Polarity @0xC (ActiveHigh = 1), Gsiv @0x10, PinNumber @0x14.
                 for line in (0..16u32).filter(|line| mask & (1 << line) == 0 && *line != 2) {
-                    guest::write_bytes(information, &[0; 0x20]);
-                    guest::write16(information, 1);
-                    guest::write16(information + 2, 0x20);
-                    guest::write32(information + 8, 1);
-                    guest::write32(information + 0xC, 1);
-                    guest::write32(information + 0x10, line);
-                    guest::write16(information + 0x14, line as u16);
+                    guest::write_bytes(information, &[0; HalUnmaskedInterruptInformation::SIZE as usize]);
+                    // SAFETY: HAL_UNMASKED_INTERRUPT_INFORMATION do chamador (recém-zerada).
+                    let entry = unsafe { HalUnmaskedInterruptInformation::at(information) };
+                    entry.version.set(1);
+                    entry.size.set(HalUnmaskedInterruptInformation::SIZE as u16);
+                    entry.mode.set(KinterruptMode::LATCHED);
+                    entry.polarity.set(KinterruptPolarity::INTERRUPT_ACTIVE_HIGH);
+                    entry.gsiv.set(line);
+                    entry.pin_number.set(line as u16);
                     if crate::hal::amd64::native_call::call(callback, &[context, information]) & 0xFF == 0 {
                         break;
                     }
@@ -562,13 +591,14 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             }
         }
         "HalpInterruptVectorDataToGsiv" => {
-            let vector_data = call.arg(1);
-            match guest::read32(vector_data) {
-                0 => {
-                    guest::write32(call.arg(2), guest::read32(vector_data + 0x38));
+            // SAFETY: INTERRUPT_VECTOR_DATA do chamador.
+            let vector_data = unsafe { InterruptVectorData::at(call.arg(1)) };
+            match vector_data.type_.get() {
+                InterruptConnectionType::INTERRUPT_TYPE_CONTROLLER_INPUT => {
+                    output::<u32>(call.arg(2)).set(vector_data.controller_input.gsiv.get());
                     STATUS_SUCCESS
                 }
-                3 => STATUS_NOT_SUPPORTED,
+                InterruptConnectionType::INTERRUPT_TYPE_MESSAGE_REQUEST => STATUS_NOT_SUPPORTED,
                 _ => STATUS_UNSUCCESSFUL,
             }
         }
@@ -598,7 +628,7 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         // ---- hipervisor --------------------------------------------------------
         // Sem enlightenments: a estrutura de 504 bytes volta zerada.
         "HvlGetEnlightenmentInfo" => {
-            guest::write_bytes(call.arg(1), &[0; 504]);
+            guest::write_bytes(call.arg(1), &[0; HalIntelEnlightenmentInformation::SIZE as usize]);
             0
         }
         "HalpSaveAndDisableEnlightenment" | "HalpRestoreHvEnlightenment" => 0,
@@ -607,7 +637,8 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             let mut state = STATE.lock();
             if !state.iommu_dispatch_called && call.arg(1) != 0 {
                 state.iommu_dispatch_called = true;
-                guest::write64(call.arg(1), native("hal_default_false")?);
+                // SAFETY: HAL_IOMMU_DISPATCH do chamador.
+                unsafe { HalIommuDispatch::at(call.arg(1)) }.hal_iommu_support_enabled.set(native("hal_default_false")?);
             }
             0
         }

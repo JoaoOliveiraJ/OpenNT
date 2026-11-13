@@ -7,6 +7,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::hal::cpu;
+use crate::ntos::inc::types::{HvX64HypervisorFeatures, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Vendor da interface (CPUID.0x40000000 EBX/ECX/EDX, 12 caracteres).
@@ -29,22 +30,17 @@ pub fn is_microsoft_compatible() -> bool {
     &vendor() == b"Microsoft Hv"
 }
 
-/// HviGetHypervisorFeatures(&features): features/privilégios (0x40000003) e
-/// recomendações (0x40000004); zeros quando a interface não existe.
+/// HviGetHypervisorFeatures(&features): HV_X64_HYPERVISOR_FEATURES é o
+/// CPUID 0x40000003 inteiro (EAX:EBX = máscara de privilégios da partição,
+/// ECX e EDX); zeros quando a interface não existe.
 pub fn get_features(output: u64) {
     let maximum = cpu::cpuid(0x4000_0000)[0];
-    let (mut features, mut privileges, mut recommendations) = (0, 0, 0);
-    if maximum >= 0x4000_0003 {
-        let leaf = cpu::cpuid(0x4000_0003);
-        features = leaf[0];
-        privileges = leaf[1];
-    }
-    if maximum >= 0x4000_0004 {
-        recommendations = cpu::cpuid(0x4000_0004)[0];
-    }
-    guest::write32(output, features);
-    guest::write32(output + 4, privileges);
-    guest::write32(output + 8, recommendations);
+    let leaf = if maximum >= 0x4000_0003 { cpu::cpuid(0x4000_0003) } else { [0; 4] };
+    // SAFETY: HV_X64_HYPERVISOR_FEATURES do chamador.
+    let features = unsafe { HvX64HypervisorFeatures::at(output) };
+    features.partition_privileges.as_uint64.set(u64::from(leaf[1]) << 32 | u64::from(leaf[0]));
+    features.bitfield_8.set(leaf[2]);
+    features.bitfield_c.set(leaf[3]);
 }
 
 // ---- Secure Kernel ausente ---------------------------------------------------

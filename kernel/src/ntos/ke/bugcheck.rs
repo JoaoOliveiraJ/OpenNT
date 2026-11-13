@@ -12,14 +12,31 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use super::bugcheck_reason;
 use crate::hal::amd64::native_call;
 use crate::hal::cpu;
+use crate::ntos::inc::types::extra_ke_misc::KbugcheckCallbackRecord;
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::po::black_box;
 use crate::rtl::SpinLock;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-/// Registros de KeRegisterBugCheckCallback (rotina, componente, contexto).
+/// KBUGCHECK_BUFFER_DUMP_STATE.
+const BUFFER_EMPTY: u8 = 0;
+const BUFFER_INSERTED: u8 = 1;
+const BUFFER_STARTED: u8 = 2;
+const BUFFER_FINISHED: u8 = 3;
+
+/// Os KBUGCHECK_CALLBACK_RECORD inseridos por KeRegisterBugCheckCallback
+/// (memória do chamador, como a KeBugCheckCallbackListHead do NT).
 static BUG_CHECK_CALLBACKS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+/// KiBugCheckData: ULONG_PTR[5] (código e os quatro parâmetros).
+const BUG_CHECK_DATA_COUNT: usize = 5;
+
+fn callback_record(record: u64) -> &'static KbugcheckCallbackRecord {
+    // SAFETY: o registro pertence ao driver enquanto estiver inserido.
+    unsafe { KbugcheckCallbackRecord::at(record) }
+}
 /// KiBugCheckData: código e quatro parâmetros do último bugcheck.
 static BUG_CHECK_DATA: AtomicU64 = AtomicU64::new(0);
 
@@ -51,7 +68,7 @@ pub fn bug_check_data() -> u64 {
     if current != 0 {
         return current;
     }
-    let pointer = guest::alloc_bytes(5 * 8);
+    let pointer = guest::alloc_bytes((BUG_CHECK_DATA_COUNT * 8) as u64);
     match BUG_CHECK_DATA.compare_exchange(0, pointer, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => pointer,
         Err(existing) => {
@@ -65,19 +82,22 @@ pub fn bug_check_data() -> u64 {
 /// callbacks registrados, publica os dados secundários e o black box e para
 /// a máquina.
 pub fn raise_bug_check(code: u32, first: u64, second: u64, third: u64, fourth: u64) -> ! {
-    let data = bug_check_data();
-    guest::write64(data, code as u64);
-    guest::write64(data + 8, first);
-    guest::write64(data + 16, second);
-    guest::write64(data + 24, third);
-    guest::write64(data + 32, fourth);
+    // SAFETY: célula própria de KiBugCheckData.
+    let data = unsafe { Field::<u64>::array_at(bug_check_data(), BUG_CHECK_DATA_COUNT) };
+    for (cell, value) in data.iter().zip([code as u64, first, second, third, fourth]) {
+        cell.set(value);
+    }
     debug_print!("");
     debug_print!("*** STOP (KeBugCheckEx): {:#010x} ({:#x}, {:#x}, {:#x}, {:#x})", code, first, second, third, fourth);
     let callbacks = BUG_CHECK_CALLBACKS.lock().clone();
     for record in callbacks {
-        let routine = guest::read64(record);
+        // KBUGCHECK_CALLBACK_ROUTINE(Buffer, Length).
+        let entry = callback_record(record);
+        let routine = entry.callback_routine.get();
         if routine != 0 {
-            native_call::call(routine, &[record, 0]);
+            entry.state.set(BUFFER_STARTED);
+            native_call::call(routine, &[entry.buffer.get(), entry.length.get() as u64]);
+            entry.state.set(BUFFER_FINISHED);
         }
     }
     if let Err(error) = bugcheck_reason::publish_secondary_data(0) {
@@ -87,28 +107,33 @@ pub fn raise_bug_check(code: u32, first: u64, second: u64, third: u64, fourth: u
     cpu::halt_forever()
 }
 
-/// KeRegisterBugCheckCallback: registro real (rotina, componente, contexto);
-/// os callbacks rodam no KeBugCheckEx. O estado do registro, quando pedido,
-/// fica em 1.
-pub fn register_callback(routine: u64, context: u64, component: u64, record_state: u64) -> bool {
-    let record = guest::alloc_bytes(0x20);
-    guest::write64(record, routine);
-    guest::write64(record + 8, component);
-    guest::write64(record + 16, context);
-    BUG_CHECK_CALLBACKS.lock().push(record);
-    if record_state != 0 {
-        guest::write32(record_state, 1);
+/// KeRegisterBugCheckCallback(CallbackRecord, CallbackRoutine, Buffer,
+/// Length, Component): preenche o KBUGCHECK_CALLBACK_RECORD do chamador e o
+/// insere (FALSE se ele já estiver inserido); a rotina roda no KeBugCheckEx
+/// com (Buffer, Length).
+pub fn register_callback(record: u64, routine: u64, buffer: u64, length: u32, component: u64) -> bool {
+    let entry = callback_record(record);
+    let mut callbacks = BUG_CHECK_CALLBACKS.lock();
+    if entry.state.get() != BUFFER_EMPTY || callbacks.contains(&record) {
+        return false;
     }
+    entry.callback_routine.set(routine);
+    entry.buffer.set(buffer);
+    entry.length.set(length);
+    entry.component.set(component);
+    entry.checksum.set(routine.wrapping_add(buffer).wrapping_add(length as u64).wrapping_add(component));
+    entry.state.set(BUFFER_INSERTED);
+    callbacks.push(record);
     true
 }
 
-/// KeDeregisterBugCheckCallback: FALSE quando o registro não existe.
+/// KeDeregisterBugCheckCallback: FALSE quando o registro não está inserido.
 pub fn deregister_callback(record: u64) -> bool {
     let mut callbacks = BUG_CHECK_CALLBACKS.lock();
     let Some(index) = callbacks.iter().position(|&candidate| candidate == record) else { return false };
     callbacks.remove(index);
     drop(callbacks);
-    guest::free_bytes(record);
+    callback_record(record).state.set(BUFFER_EMPTY);
     true
 }
 

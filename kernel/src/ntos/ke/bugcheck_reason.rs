@@ -10,8 +10,9 @@ use core::fmt::Write;
 
 use super::irql;
 use crate::hal::amd64::native_call;
-use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{KbugcheckReasonCallbackRecord, KbugcheckSecondaryDumpData, ListEntry, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::{KernelError, SpinLock};
 
 const BUFFER_EMPTY: u8 = 0;
 const BUFFER_INSERTED: u8 = 1;
@@ -24,31 +25,38 @@ struct Lists {
     /// Duas LIST_ENTRY permanentes: motivos gerais e AddPages/RemovePages.
     heads: [u64; 2],
     counts: [u64; 2],
-    callback_frame: u64,
     descriptor: u64,
     storage: u64,
 }
 
-static LISTS: SpinLock<Lists> =
-    SpinLock::new(Lists { heads: [0; 2], counts: [0; 2], callback_frame: 0, descriptor: 0, storage: 0 });
+static LISTS: SpinLock<Lists> = SpinLock::new(Lists { heads: [0; 2], counts: [0; 2], descriptor: 0, storage: 0 });
 static PUBLISHING: SpinLock<bool> = SpinLock::new(false);
 
-fn lists() -> Result<([u64; 2], u64), KernelError> {
+fn list_entry(address: u64) -> &'static ListEntry {
+    // SAFETY: cabeça própria ou o Entry de um registro do chamador.
+    unsafe { ListEntry::at(address) }
+}
+
+fn record_at(record: u64) -> &'static KbugcheckReasonCallbackRecord {
+    // SAFETY: o chamador possui o registro enquanto ele está inserido.
+    unsafe { KbugcheckReasonCallbackRecord::at(record) }
+}
+
+fn lists() -> Result<[u64; 2], KernelError> {
     let mut lists = LISTS.lock();
     if lists.heads[0] == 0 {
-        let storage = guest::alloc_bytes(32);
-        let frame = guest::alloc_bytes(32);
-        if storage == 0 || frame == 0 {
+        let storage = guest::alloc_bytes(2 * ListEntry::SIZE);
+        if storage == 0 {
             return Err(KernelError::new("bugcheck callback storage allocation failed"));
         }
-        lists.heads = [storage, storage + 16];
-        lists.callback_frame = frame;
+        lists.heads = [storage, storage + ListEntry::SIZE];
         for head in lists.heads {
-            guest::write64(head, head);
-            guest::write64(head + 8, head);
+            let entry = list_entry(head);
+            entry.flink.set(head);
+            entry.blink.set(head);
         }
     }
-    Ok((lists.heads, lists.callback_frame))
+    Ok(lists.heads)
 }
 
 fn list_index(reason: u32) -> usize {
@@ -62,9 +70,10 @@ fn checksum(routine: u64, component: u64, reason: u32) -> u64 {
 
 /// Uma lista corrompida não pode produzir sucesso nem caminhada infinita.
 fn verify_links(record: u64) -> Result<(u64, u64), KernelError> {
-    let next = guest::read64(record);
-    let previous = guest::read64(record + 8);
-    if next == 0 || previous == 0 || guest::read64(next + 8) != record || guest::read64(previous) != record {
+    let entry = list_entry(record);
+    let next = entry.flink.get();
+    let previous = entry.blink.get();
+    if next == 0 || previous == 0 || list_entry(next).blink.get() != record || list_entry(previous).flink.get() != record {
         return Err(KernelError::new("corrupt bugcheck callback LIST_ENTRY"));
     }
     Ok((next, previous))
@@ -72,7 +81,7 @@ fn verify_links(record: u64) -> Result<(u64, u64), KernelError> {
 
 /// Identidade pelo registro (dois registros podem chamar a mesma rotina).
 fn contains(head: u64, count: u64, record: u64) -> Result<bool, KernelError> {
-    let mut current = guest::read64(head);
+    let mut current = list_entry(head).flink.get();
     verify_links(head)?;
     for _ in 0..count {
         if current == head {
@@ -100,28 +109,29 @@ fn at_high_level<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, 
 /// KeRegisterBugCheckReasonCallback. Triagem (7) entra no fim; os demais
 /// motivos no início.
 pub fn register(record: u64, routine: u64, reason: u32, component: u64) -> Result<bool, KernelError> {
-    let (heads, _) = lists()?;
+    let heads = lists()?;
     let index = list_index(reason);
+    let entry = record_at(record);
     at_high_level(|| {
         let count = LISTS.lock().counts[index];
-        if guest::read8(record + 44) != BUFFER_EMPTY || contains(heads[index], count, record)? {
+        if entry.state.get() != BUFFER_EMPTY || contains(heads[index], count, record)? {
             return Ok(false);
         }
         let head = heads[index];
-        let previous = if reason == 7 { guest::read64(head + 8) } else { head };
-        let next = guest::read64(previous);
-        if guest::read64(next + 8) != previous {
+        let previous = if reason == 7 { list_entry(head).blink.get() } else { head };
+        let next = list_entry(previous).flink.get();
+        if list_entry(next).blink.get() != previous {
             return Err(KernelError::new("corrupt bugcheck callback insertion"));
         }
-        guest::write64(record + 16, routine);
-        guest::write64(record + 24, component);
-        guest::write64(record + 32, checksum(routine, component, reason));
-        guest::write32(record + 40, reason);
-        guest::write8(record + 44, BUFFER_INSERTED);
-        guest::write64(record, next);
-        guest::write64(record + 8, previous);
-        guest::write64(previous, record);
-        guest::write64(next + 8, record);
+        entry.callback_routine.set(routine);
+        entry.component.set(component);
+        entry.checksum.set(checksum(routine, component, reason));
+        entry.reason.set(reason as i32);
+        entry.state.set(BUFFER_INSERTED);
+        entry.entry.flink.set(next);
+        entry.entry.blink.set(previous);
+        list_entry(previous).flink.set(record);
+        list_entry(next).blink.set(record);
         LISTS.lock().counts[index] += 1;
         Ok(true)
     })
@@ -130,20 +140,21 @@ pub fn register(record: u64, routine: u64, reason: u32, component: u64) -> Resul
 /// KeDeregisterBugCheckReasonCallback: State volta a zero; os campos do
 /// driver e os vínculos antigos ficam no registro.
 pub fn remove(record: u64) -> Result<bool, KernelError> {
-    let (heads, _) = lists()?;
+    let heads = lists()?;
+    let entry = record_at(record);
     at_high_level(|| {
-        if guest::read8(record + 44) != BUFFER_INSERTED {
+        if entry.state.get() != BUFFER_INSERTED {
             return Ok(false);
         }
-        let index = list_index(guest::read32(record + 40));
+        let index = list_index(entry.reason.get() as u32);
         let count = LISTS.lock().counts[index];
         if !contains(heads[index], count, record)? {
             return Err(KernelError::new("unowned bugcheck callback record"));
         }
         let (next, previous) = verify_links(record)?;
-        guest::write8(record + 44, BUFFER_EMPTY);
-        guest::write64(previous, next);
-        guest::write64(next + 8, previous);
+        entry.state.set(BUFFER_EMPTY);
+        list_entry(previous).flink.set(next);
+        list_entry(next).blink.set(previous);
         LISTS.lock().counts[index] -= 1;
         Ok(true)
     })
@@ -156,12 +167,12 @@ pub fn consume(
     consumer: &mut dyn FnMut(u64, &mut dyn FnMut(u64, u64)) -> Result<(), KernelError>,
     selected_record: u64,
 ) -> Result<(), KernelError> {
-    let (heads, frame) = lists()?;
+    let heads = lists()?;
     let index = list_index(reason);
     let head = heads[index];
     let count = LISTS.lock().counts[index];
     at_high_level(|| {
-        let mut current = guest::read64(head);
+        let mut current = list_entry(head).flink.get();
         for _ in 0..count {
             if current == head {
                 return Err(KernelError::new("short bugcheck callback consumption list"));
@@ -171,28 +182,26 @@ pub fn consume(
             if selected_record != 0 && record != selected_record {
                 continue;
             }
-            if guest::read32(record + 40) != reason || guest::read8(record + 44) != BUFFER_INSERTED {
+            let entry = record_at(record);
+            if entry.reason.get() as u32 != reason || entry.state.get() != BUFFER_INSERTED {
                 continue;
             }
-            let routine = guest::read64(record + 16);
-            let component = guest::read64(record + 24);
-            if routine == 0 || guest::read64(record + 32) != checksum(routine, component, reason) {
-                guest::write8(record + 44, BUFFER_INCOMPLETE);
+            let routine = entry.callback_routine.get();
+            let component = entry.component.get();
+            if routine == 0 || entry.checksum.get() != checksum(routine, component, reason) {
+                entry.state.set(BUFFER_INCOMPLETE);
                 debug_print!("KERNEL_BUGCHECK_CALLBACK_INVALID record={:#x}", record);
                 continue;
             }
-            guest::write8(record + 44, BUFFER_STARTED);
+            entry.state.set(BUFFER_STARTED);
+            // KBUGCHECK_REASON_CALLBACK_ROUTINE(Reason, Record, Data, Length).
             let mut invoke = |data: u64, length: u64| {
-                guest::write64(frame, reason as u64);
-                guest::write64(frame + 8, record);
-                guest::write64(frame + 16, data);
-                guest::write64(frame + 24, length);
-                native_call::call(routine, &[guest::read64(frame), guest::read64(frame + 8), guest::read64(frame + 16), guest::read64(frame + 24)]);
+                native_call::call(routine, &[reason as u64, record, data, length]);
             };
             match consumer(record, &mut invoke) {
-                Ok(()) => guest::write8(record + 44, BUFFER_FINISHED),
+                Ok(()) => entry.state.set(BUFFER_FINISHED),
                 Err(error) => {
-                    guest::write8(record + 44, BUFFER_INCOMPLETE);
+                    entry.state.set(BUFFER_INCOMPLETE);
                     return Err(error);
                 }
             }
@@ -209,7 +218,7 @@ pub fn consume(
 fn workspace() -> Result<(u64, u64), KernelError> {
     let mut lists = LISTS.lock();
     if lists.descriptor == 0 {
-        let descriptor = guest::alloc_bytes(48);
+        let descriptor = guest::alloc_bytes(KbugcheckSecondaryDumpData::SIZE);
         let storage = guest::alloc_bytes(MAXIMUM_SECONDARY_BYTES);
         if descriptor == 0 || storage == 0 {
             return Err(KernelError::new("bugcheck secondary workspace allocation failed"));
@@ -222,8 +231,8 @@ fn workspace() -> Result<(u64, u64), KernelError> {
 
 fn hexadecimal(address: u64, length: u64) -> Result<String, KernelError> {
     let mut text = String::new();
-    for offset in 0..length {
-        let _ = write!(text, "{:02x}", guest::try_read8(address + offset)?);
+    for byte in guest::try_read_bytes(address, length as usize)? {
+        let _ = write!(text, "{byte:02x}");
     }
     Ok(text)
 }
@@ -237,22 +246,22 @@ pub fn publish_secondary_data(selected_record: u64) -> Result<(), KernelError> {
         }
         *publishing = true;
     }
-    let (descriptor, storage) = workspace()?;
+    let (descriptor_address, storage) = workspace()?;
+    // SAFETY: descritor próprio de 0x30 bytes (workspace).
+    let descriptor = unsafe { KbugcheckSecondaryDumpData::at(descriptor_address) };
     let clear_descriptor = || {
-        for offset in (0..48).step_by(8) {
-            guest::write64(descriptor + offset, 0);
-        }
-        guest::write64(descriptor, storage);
-        guest::write32(descriptor + 8, MAXIMUM_SECONDARY_BYTES as u32);
-        guest::write32(descriptor + 12, MAXIMUM_SECONDARY_BYTES as u32);
+        guest::write_bytes(descriptor_address, &[0; KbugcheckSecondaryDumpData::SIZE as usize]);
+        descriptor.in_buffer.set(storage);
+        descriptor.in_buffer_length.set(MAXIMUM_SECONDARY_BYTES as u32);
+        descriptor.maximum_allowed.set(MAXIMUM_SECONDARY_BYTES as u32);
     };
     let result = consume(
         2,
         &mut |record, invoke| {
             clear_descriptor();
             // OutBuffer nulo pede o tamanho; InBuffer já oferece memória real.
-            invoke(descriptor, 48);
-            let requested = guest::read32(descriptor + 40) as u64;
+            invoke(descriptor_address, KbugcheckSecondaryDumpData::SIZE);
+            let requested = descriptor.out_buffer_length.get() as u64;
             if requested == 0 {
                 return Ok(());
             }
@@ -260,13 +269,13 @@ pub fn publish_secondary_data(selected_record: u64) -> Result<(), KernelError> {
                 return Err(KernelError::new("bugcheck secondary data exceeds MaximumAllowed"));
             }
             guest::write_bytes(storage, &alloc::vec![0u8; requested as usize]);
-            guest::write64(descriptor, storage);
-            guest::write32(descriptor + 8, requested as u32);
+            descriptor.in_buffer.set(storage);
+            descriptor.in_buffer_length.set(requested as u32);
             // OutBuffer == InBuffer distingue a entrega da consulta de tamanho.
-            guest::write64(descriptor + 32, storage);
-            invoke(descriptor, 48);
-            let output = guest::read64(descriptor + 32);
-            let length = guest::read32(descriptor + 40) as u64;
+            descriptor.out_buffer.set(storage);
+            invoke(descriptor_address, KbugcheckSecondaryDumpData::SIZE);
+            let output = descriptor.out_buffer.get();
+            let length = descriptor.out_buffer_length.get() as u64;
             if length == 0 {
                 return Ok(());
             }
@@ -276,7 +285,7 @@ pub fn publish_secondary_data(selected_record: u64) -> Result<(), KernelError> {
             debug_print!(
                 "KERNEL_BUGCHECK_SECONDARY_RECORD {{\"record\":\"{:#x}\",\"guidBytes\":\"{}\",\"length\":{}}}",
                 record,
-                hexadecimal(descriptor + 16, 16)?,
+                hexadecimal(descriptor.guid.address(), 16)?,
                 length
             );
             let mut offset = 0;

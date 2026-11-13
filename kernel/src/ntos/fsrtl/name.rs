@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{NtStruct, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_data;
 use crate::ntos::mm::kernel_data_layout::FSRTL_LEGAL_ANSI_CHARACTER_ARRAY;
@@ -43,15 +44,11 @@ pub fn legal_ansi_character_array_address() -> u64 {
 /// caractere < 0x40 testa o bit FSRTL_WILD_CHARACTER no bitmap; caracteres
 /// >= 0x40 nunca são curingas e são ignorados.
 pub fn does_name_contain_wild_cards(name: u64) -> bool {
-    let length = guest::read16(name) as u64; // UNICODE_STRING.Length (bytes)
-    if length == 0 {
-        return false;
-    }
-    let buffer = guest::read64(name + 8);
-    let mut index = length / 2; // contagem de caracteres
+    let units = read_unicode_string(name);
+    let mut index = units.len();
     while index > 0 {
         index -= 1;
-        let unit = guest::read16(buffer + index * 2);
+        let unit = units[index];
         if unit == WC_BACKSLASH {
             return false;
         }
@@ -67,38 +64,38 @@ pub fn does_name_contain_wild_cards(name: u64) -> bool {
 /// remaining=`b\c`; pula um `\` inicial. `Path` é passado por ponteiro
 /// (struct de 16 bytes na ABI x64).
 pub fn dissect_name(path: u64, first: u64, remaining: u64) {
+    // SAFETY: as três UNICODE_STRING do chamador.
+    let (path_string, first, remaining) = unsafe { (UnicodeString::at(path), UnicodeString::at(first), UnicodeString::at(remaining)) };
     // Saídas zeradas (Length, MaximumLength, Buffer).
-    guest::write16(first, 0);
-    guest::write16(first + 2, 0);
-    guest::write64(first + 8, 0);
-    guest::write16(remaining, 0);
-    guest::write16(remaining + 2, 0);
-    guest::write64(remaining + 8, 0);
+    set_string(first, 0, 0);
+    set_string(remaining, 0, 0);
 
-    let count = guest::read16(path) as u64 / 2;
+    let units = read_unicode_string(path);
+    let count = units.len() as u64;
     if count == 0 {
         return;
     }
-    let buffer = guest::read64(path + 8);
-    let leading = if guest::read16(buffer) == WC_BACKSLASH { 1 } else { 0 };
+    let buffer = path_string.buffer.get();
+    let leading = if units[0] == WC_BACKSLASH { 1 } else { 0 };
 
     // Índice do separador `\` (ou `count` se não houver), a partir de `leading`.
     let mut separator = leading;
-    while separator < count && guest::read16(buffer + separator * 2) != WC_BACKSLASH {
+    while separator < count && units[separator as usize] != WC_BACKSLASH {
         separator += 1;
     }
 
-    let first_len = ((separator - leading) * 2) as u16;
-    guest::write16(first, first_len);
-    guest::write16(first + 2, first_len);
-    guest::write64(first + 8, buffer + leading * 2);
+    set_string(first, ((separator - leading) * 2) as u16, buffer + leading * 2);
 
     if separator < count {
-        let remaining_len = ((count - separator - 1) * 2) as u16;
-        guest::write16(remaining, remaining_len);
-        guest::write16(remaining + 2, remaining_len);
-        guest::write64(remaining + 8, buffer + (separator + 1) * 2);
+        set_string(remaining, ((count - separator - 1) * 2) as u16, buffer + (separator + 1) * 2);
     }
+}
+
+/// UNICODE_STRING de saída apontando para dentro do buffer de entrada.
+fn set_string(string: &UnicodeString, length: u16, buffer: u64) {
+    string.length.set(length);
+    string.maximum_length.set(length);
+    string.buffer.set(buffer);
 }
 
 /// FsRtlIsNameInExpression(Expression, Name, IgnoreCase, UpcaseTable)
@@ -111,13 +108,13 @@ pub fn is_name_in_expression(expression: u64, name: u64, ignore_case: bool) -> b
 }
 
 fn read_unicode_string(pointer: u64) -> Vec<u16> {
-    let count = guest::read16(pointer) as usize / 2;
-    let buffer = guest::read64(pointer + 8);
-    let mut units = Vec::with_capacity(count);
-    for index in 0..count {
-        units.push(guest::read16(buffer + (index as u64) * 2));
+    // SAFETY: UNICODE_STRING do chamador.
+    let string = unsafe { UnicodeString::at(pointer) };
+    let count = string.length.get() as usize / 2;
+    if count == 0 {
+        return Vec::new();
     }
-    units
+    guest::read_bytes(string.buffer.get(), count * 2).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
 }
 
 fn upcase(unit: u16) -> u16 {

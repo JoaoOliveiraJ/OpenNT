@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::hal::amd64::native_call;
+use crate::ntos::inc::types::{Field, NtStruct, PoFxDeviceV1, PopFxDevice};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -19,20 +20,18 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 
 /// Handle (internal POHANDLE context block) offsets, per the disassembly.
-const FLAGS_OFFSET: u64 = 0x20;
-const COMPONENT_COUNT_OFFSET: u64 = 0x33c;
-const COMPONENT_ARRAY_OFFSET: u64 = 0x340;
+
 /// Each component sub-block is large enough to cover the active-condition
 /// pending ref (+0x88) and idle-state pending ref (+0x8c) the `Complete*`
 /// APIs `lock xadd`, so a driver poking them touches valid guest memory.
-const COMPONENT_SIZE: u64 = 0x90;
+const COMPONENT_SIZE: u64 = 0x1B8; // sizeof(POP_FX_COMPONENT)
 /// Bit1 of the handle flags: "directed power not required", cleared by
 /// PoFxReportDevicePoweredOn (`and ...,0xfffffffd` @0x39f5a8).
 const DIRECTED_POWER_FLAG: u32 = 0x2;
 
 /// Index of the two callbacks the inert engine actually fires.
-const CB_ACTIVE_CONDITION: usize = 0; // device + 0x10
-const CB_POWER_REQUIRED: usize = 3; // device + 0x28
+const CB_ACTIVE_CONDITION: usize = 0; // ComponentActiveConditionCallback
+const CB_POWER_REQUIRED: usize = 3; // DevicePowerRequiredCallback
 
 struct Component {
     active_refs: u32,
@@ -40,7 +39,7 @@ struct Component {
 
 struct PoFxDevice {
     device_context: u64,
-    /// Snapshot of the six PO_FX_DEVICE_V1 callbacks (0x10..0x38).
+    /// Snapshot of the six PO_FX_DEVICE_V1 callbacks (0x08..0x30).
     callbacks: [u64; 6],
     components: Vec<Component>,
     /// Guest component sub-blocks to free on unregister.
@@ -58,33 +57,41 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
     if device == 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    // SAFETY: PPO_FX_DEVICE do driver.
+    let description = unsafe { PoFxDeviceV1::at(device) };
     // Only PO_FX_DEVICE_V1 is modeled; V2/V3 use a different layout.
-    if guest::read32(device) != 1 {
+    if description.version.get() != 1 {
         return STATUS_NOT_SUPPORTED;
     }
 
-    let component_count = guest::read32(device + 0x04);
-    let device_context = guest::read64(device + 0x08);
+    let component_count = description.component_count.get();
+    let device_context = description.device_context.get();
     let callbacks = [
-        guest::read64(device + 0x10), // ComponentActiveConditionCallback
-        guest::read64(device + 0x18), // ComponentIdleConditionCallback
-        guest::read64(device + 0x20), // ComponentIdleStateCallback
-        guest::read64(device + 0x28), // DevicePowerRequiredCallback
-        guest::read64(device + 0x30), // DevicePowerNotRequiredCallback
-        guest::read64(device + 0x38), // PowerControlCallback
+        description.component_active_condition_callback.get(),
+        description.component_idle_condition_callback.get(),
+        description.component_idle_state_callback.get(),
+        description.device_power_required_callback.get(),
+        description.device_power_not_required_callback.get(),
+        description.power_control_callback.get(),
     ];
 
-    // Opaque handle with ComponentCount @+0x33c and the component array
-    // @+0x340, exactly where the real component APIs index.
-    let handle = guest::alloc_bytes(COMPONENT_ARRAY_OFFSET + u64::from(component_count) * 8);
-    guest::write32(handle + FLAGS_OFFSET, 0);
-    guest::write32(handle + COMPONENT_COUNT_OFFSET, component_count);
+    // Opaque handle shaped like POP_FX_DEVICE: Status, ComponentCount and
+    // Components (POP_FX_COMPONENT**), whose pointer array follows the body.
+    let handle = guest::alloc_bytes(PopFxDevice::SIZE + u64::from(component_count) * 8);
+    // SAFETY: freshly allocated block of the body plus the pointer array.
+    let body = unsafe { PopFxDevice::at(handle) };
+    let array = handle + PopFxDevice::SIZE;
+    body.status.value.set(0);
+    body.component_count.set(component_count);
+    body.components.set(array);
 
     let mut components = Vec::new();
     let mut component_buffers = Vec::new();
-    for index in 0..u64::from(component_count) {
+    // SAFETY: the pointer array right after the body.
+    let pointers = unsafe { Field::<u64>::array_at(array, component_count as usize) };
+    for pointer in pointers {
         let buffer = guest::alloc_bytes(COMPONENT_SIZE);
-        guest::write64(handle + COMPONENT_ARRAY_OFFSET + index * 8, buffer);
+        pointer.set(buffer);
         components.push(Component { active_refs: 0 });
         component_buffers.push(buffer);
     }
@@ -95,7 +102,8 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
     );
 
     if handle_out != 0 {
-        guest::write64(handle_out, handle);
+        // SAFETY: POHANDLE* de saída do driver.
+        unsafe { Field::<u64>::at(handle_out) }.set(handle);
     }
     0
 }
@@ -150,12 +158,13 @@ pub fn idle_component(handle: u64, component: u32) {
 }
 
 /// PoFxReportDevicePoweredOn(POHANDLE): the driver acks it re-powered the
-/// device; mirror ntoskrnl by clearing the directed-power flag (bit1 of the
-/// handle flags @+0x20). No PEP D0 notification to make.
+/// device; mirror ntoskrnl by clearing bit 1 of POP_FX_DEVICE.Status
+/// (LOCK AND). No PEP D0 notification to make.
 pub fn report_device_powered_on(handle: u64) {
     if DEVICES.lock().contains_key(&handle) {
-        let flags = guest::read32(handle + FLAGS_OFFSET) & !DIRECTED_POWER_FLAG;
-        guest::write32(handle + FLAGS_OFFSET, flags);
+        // SAFETY: a handle created by `register_device`.
+        let body = unsafe { PopFxDevice::at(handle) };
+        body.status.value.atomic().fetch_and(!(DIRECTED_POWER_FLAG as i32), core::sync::atomic::Ordering::SeqCst);
     }
 }
 

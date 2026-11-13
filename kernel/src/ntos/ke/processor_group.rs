@@ -9,10 +9,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::smp;
 use crate::ntos::inc::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use crate::ntos::inc::types::{Field, GroupAffinity, NtStruct, ProcessorNumber};
 use crate::ntos::mm::guest_memory as guest;
 
-/// GROUP_AFFINITY { KAFFINITY Mask; USHORT Group; USHORT Reserved[3]; }.
-const GROUP_AFFINITY_SIZE: usize = 16;
 /// ALL_PROCESSOR_GROUPS.
 const ALL_PROCESSOR_GROUPS: u32 = 0xFFFF;
 
@@ -26,7 +25,8 @@ pub fn number_processors_cell() -> u64 {
         return current;
     }
     let pointer = guest::alloc_bytes(4);
-    guest::write32(pointer, smp::online_cpu_count() as u32);
+    // SAFETY: célula recém-alocada do export de dados.
+    unsafe { Field::<u32>::at(pointer) }.set(smp::online_cpu_count() as u32);
     match NUMBER_PROCESSORS.compare_exchange(0, pointer, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => pointer,
         Err(existing) => {
@@ -47,8 +47,13 @@ pub fn active_mask() -> u64 {
 
 /// GROUP_AFFINITY zerada com a máscara pedida.
 pub fn write_group_affinity(pointer: u64, mask: u64) {
-    guest::write_bytes(pointer, &[0; GROUP_AFFINITY_SIZE]);
-    guest::write64(pointer, mask);
+    // SAFETY: PGROUP_AFFINITY de saída do chamador.
+    let affinity = unsafe { GroupAffinity::at(pointer) };
+    affinity.mask.set(mask);
+    affinity.group.set(0);
+    for reserved in &affinity.reserved {
+        reserved.set(0);
+    }
 }
 
 /// KeGetCurrentProcessorNumber: todo código de driver roda no BSP.
@@ -60,9 +65,18 @@ pub fn current_processor_number() -> u32 {
 /// na saída opcional; devolve o índice 0.
 pub fn current_processor_number_ex(processor_number: u64) -> u32 {
     if processor_number != 0 {
-        guest::write32(processor_number, 0);
+        write_processor_number(processor_number, 0);
     }
     0
+}
+
+/// PROCESSOR_NUMBER de saída do chamador: grupo 0, número e Reserved zero.
+fn write_processor_number(pointer: u64, number: u8) {
+    // SAFETY: PPROCESSOR_NUMBER de saída do chamador.
+    let target = unsafe { ProcessorNumber::at(pointer) };
+    target.group.set(0);
+    target.number.set(number);
+    target.reserved.set(0);
 }
 
 /// KeQueryActiveProcessorCount.
@@ -96,9 +110,7 @@ pub fn processor_number_from_index(index: u64, processor_number: u64) -> u32 {
         return STATUS_INVALID_PARAMETER;
     }
     if processor_number != 0 {
-        guest::write16(processor_number, 0);
-        guest::write8(processor_number + 2, index as u8);
-        guest::write8(processor_number + 3, 0);
+        write_processor_number(processor_number, index as u8);
     }
     STATUS_SUCCESS
 }
@@ -139,7 +151,8 @@ pub fn query_node_active_affinity(node: u16, affinity: u64, count: u64) {
         write_group_affinity(affinity, mask);
     }
     if count != 0 {
-        guest::write16(count, processors);
+        // SAFETY: PUSHORT Count opcional do chamador.
+        unsafe { Field::<u16>::at(count) }.set(processors);
     }
 }
 

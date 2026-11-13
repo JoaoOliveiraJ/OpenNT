@@ -15,9 +15,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::hal::amd64::native_call;
 use crate::ntos::io::io_manager;
 use crate::ntos::io::irp_builder::{self, BuildOptions, Power};
-use crate::rtl::SpinLock;
+use crate::ntos::inc::types::{DeviceObject, DevicePowerState, Field, IoStackLocation, Irp, NtStruct, PowerStateType};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{device_object, device_power_state, io_stack_location, irp, power_state_type};
+use crate::rtl::SpinLock;
 
 /// Quem despacha power IRPs para baixo (registrado pelo I/O Manager, o que
 /// quebra o ciclo `io_manager` <-> `power_manager`).
@@ -42,13 +42,13 @@ pub fn set_power_irp_dispatcher(dispatcher: Option<Dispatcher>) -> Option<Dispat
 }
 
 pub fn get_device_power_state(device: u64) -> u32 {
-    STATE.lock().current.get(&device).copied().unwrap_or(device_power_state::D0)
+    STATE.lock().current.get(&device).copied().unwrap_or(DevicePowerState::POWER_DEVICE_D0.0 as u32)
 }
 
 /// PoSetPowerState(device, POWER_STATE_TYPE, POWER_STATE) -> estado anterior.
 /// SystemPowerState não é rastreado por dispositivo.
 pub fn set_power_state(device: u64, state_type: u32, new_state: u32) -> u32 {
-    if state_type != power_state_type::DEVICE_POWER_STATE {
+    if state_type != PowerStateType::DEVICE_POWER_STATE.0 as u32 {
         return new_state;
     }
     let previous = get_device_power_state(device);
@@ -93,7 +93,8 @@ pub fn start_next_power_request(device: u64) {
 /// PoCallDriver: no fundo da pilha (sem dispositivo anexado) o IRP fica com
 /// o status que já tem. AttachedDevice é lido como DWORD.
 pub fn call_driver_down_the_stack(device: u64, irp: u64) -> u32 {
-    let attached = guest::read32(device + device_object::ATTACHED_DEVICE) as u64;
+    // SAFETY: DEVICE_OBJECT do chamador. AttachedDevice é um ponteiro inteiro.
+    let attached = unsafe { DeviceObject::at(device) }.attached_device.get();
     if attached == 0 {
         return 0;
     }
@@ -103,8 +104,10 @@ pub fn call_driver_down_the_stack(device: u64, irp: u64) -> u32 {
 
 /// Dispositivo dono do IRP: CurrentStackLocation->DeviceObject.
 fn device_of_irp(packet: u64) -> u64 {
-    let stack = guest::read64(packet + irp::CURRENT_STACK_LOCATION);
-    guest::read64(stack + io_stack_location::DEVICE_OBJECT)
+    // SAFETY: IRP vivo do chamador e sua pilha corrente.
+    let stack = unsafe { Irp::at(packet) }.tail.overlay.current_stack_location.get();
+    // SAFETY: IO_STACK_LOCATION corrente do IRP.
+    unsafe { IoStackLocation::at(stack) }.device_object.get()
 }
 
 /// PoStartNextPowerIrp(Irp): dispara o próximo power IRP do dispositivo
@@ -118,18 +121,22 @@ pub fn start_next_power_irp(packet: u64) {
 /// conclusão com a assinatura do wdm.h (device, minor, state, contexto,
 /// IO_STATUS_BLOCK).
 pub fn request_power_irp(device: u64, minor: u32, state: u32, completion: u64, context: u64, irp_out: u64) {
-    let stack_count = match guest::read8(device + device_object::STACK_SIZE) {
+    // SAFETY: DEVICE_OBJECT do chamador.
+    let stack_count = match unsafe { DeviceObject::at(device) }.stack_size.get() as u8 {
         0 => 1,
         count => count as u32,
     };
     let packet = guest::alloc_bytes(irp_builder::size_for(stack_count));
     irp_builder::build(packet, &BuildOptions { major: 0x16, minor: minor as u8, device_object: device, stack_count, power: Some(Power { power_state_type: 1, device_state: state }), ..Default::default() });
     if irp_out != 0 {
-        guest::write64(irp_out, packet);
+        // SAFETY: PIRP* opcional do chamador.
+        unsafe { Field::<u64>::at(irp_out) }.set(packet);
     }
     io_manager::dispatch_native_power_irp(device, packet);
     if completion != 0 {
-        native_call::call(completion, &[device, minor as u64, state as u64, context, packet + irp::IO_STATUS]);
+        // SAFETY: o IRP recém-construído.
+        let io_status = unsafe { Irp::at(packet) }.io_status.address();
+        native_call::call(completion, &[device, minor as u64, state as u64, context, io_status]);
     }
     guest::free_bytes(packet);
 }
@@ -138,7 +145,8 @@ pub fn request_power_irp(device: u64, minor: u32, state: u32, completion: u64, c
 /// e FALSE.
 pub fn query_watchdog_time(seconds_out: u64) -> bool {
     if seconds_out != 0 {
-        guest::write32(seconds_out, 0);
+        // SAFETY: PULONG opcional do chamador.
+        unsafe { Field::<u32>::at(seconds_out) }.set(0);
     }
     false
 }

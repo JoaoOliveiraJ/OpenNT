@@ -9,8 +9,9 @@ use alloc::string::String;
 use super::smp;
 use crate::hal::cpu;
 use crate::ntos::ps::user_probe;
-use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{NtStruct, SystemProcessorInformation, XsaveFormat};
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::{KernelError, SpinLock};
 
 #[derive(Clone, Debug)]
 pub struct ProcessorSnapshot {
@@ -151,7 +152,8 @@ pub fn snapshot() -> Result<ProcessorSnapshot, KernelError> {
         }
         let aligned = allocation.div_ceil(16) * 16;
         cpu::fxsave(aligned);
-        cache.vector_control_mask = Some(guest::read32(aligned + 28));
+        // SAFETY: área FXSAVE própria, alinhada a 16 dentro da alocação.
+        cache.vector_control_mask = Some(unsafe { XsaveFormat::at(aligned) }.mx_csr_mask.get());
         guest::free_bytes(allocation);
     }
     let control_register4 = cpu::read_cr4();
@@ -184,9 +186,13 @@ pub fn query(
             return 0xC000_0005;
         }
     }
-    if buffer_length < 12 {
-        if output_length_pointer != 0 {
-            guest::write32(output_length_pointer, 12);
+    let size = SystemProcessorInformation::SIZE as u32;
+    // ReturnLength: ponteiro do chamador (do modo usuário quando a chamada vem
+    // de lá), escrita sondada.
+    let report_length = || output_length_pointer == 0 || guest::try_write::<u32>(output_length_pointer, size).is_ok();
+    if buffer_length < size {
+        if !report_length() {
+            return 0xC000_0005;
         }
         return 0xC000_0004;
     }
@@ -194,14 +200,15 @@ pub fn query(
         return 0xC000_0005;
     }
     let Ok(snapshot) = snapshot() else { return 0xC000_009A };
-    guest::write16(output, if report_emulated_architecture { 0 } else { snapshot.architecture });
-    guest::write16(output + 2, snapshot.level);
-    guest::write16(output + 4, snapshot.revision);
-    // Sem hot-add: a contagem vem dos processadores confirmados online.
-    guest::write16(output + 6, smp::online_cpu_count() as u16);
-    guest::write32(output + 8, snapshot.feature_bits);
-    if output_length_pointer != 0 {
-        guest::write32(output_length_pointer, 12);
+    let Ok(information) = SystemProcessorInformation::try_at(output) else { return 0xC000_0005 };
+    let written = information.processor_architecture.probe_set(if report_emulated_architecture { 0 } else { snapshot.architecture }).is_ok()
+        && information.processor_level.probe_set(snapshot.level).is_ok()
+        && information.processor_revision.probe_set(snapshot.revision).is_ok()
+        // Sem hot-add: a contagem vem dos processadores confirmados online.
+        && information.maximum_processors.probe_set(smp::online_cpu_count() as u16).is_ok()
+        && information.processor_feature_bits.probe_set(snapshot.feature_bits).is_ok();
+    if !written || !report_length() {
+        return 0xC000_0005;
     }
     0
 }

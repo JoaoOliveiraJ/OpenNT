@@ -8,11 +8,22 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{thread_dispatch, thread_lock};
+use crate::ntos::inc::types::{Kthread, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
 
 pub const STATUS_ALERTED: u32 = 0x101;
+
+/// KWAIT_STATUS_REGISTER.Alert (bit 7).
+const WAIT_REGISTER_ALERT: u8 = 0x80;
+/// KWAIT_STATUS_REGISTER: WaitInProgress.
+const WAIT_IN_PROGRESS: u8 = 1;
+/// KTHREAD.State Waiting.
+const STATE_WAITING: u8 = 5;
+
+fn kthread(thread: u64) -> &'static Kthread {
+    // SAFETY: KTHREAD viva (a thread alertada ou a que espera).
+    unsafe { Kthread::at(thread) }
+}
 
 /// Espera armada: identidade e resultado da interrupção.
 #[derive(Clone, Copy)]
@@ -33,7 +44,7 @@ fn signal(thread: u64) -> bool {
         return false;
     }
     waiter.interrupted = Some(STATUS_ALERTED);
-    guest::write64(thread + kthread::WAIT_STATUS, STATUS_ALERTED as u64);
+    kthread(thread).wait_status.set(STATUS_ALERTED as i64);
     true
 }
 
@@ -41,25 +52,27 @@ fn signal(thread: u64) -> bool {
 pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
     let mode_index = mode as i8 as i64;
     let mut delivered = false;
+    let target = kthread(thread);
     let previous = thread_lock::with_lock(thread, || {
-        let alert_address = (thread + kthread::ALERTED).wrapping_add(mode_index as u64);
-        let previous = guest::read8(alert_address);
+        // Alerted[mode]: KernelMode 0, UserMode 1.
+        let alerted = &target.alerted[mode_index as usize];
+        let previous = alerted.get();
         if previous != 0 {
             return previous;
         }
-        let register = guest::read8(thread + kthread::WAIT_REGISTER);
+        let register = target.wait_register.flags.get();
         let state = register & 7;
-        if guest::read8(thread + kthread::STATE) == 5
+        if target.state.get() == STATE_WAITING
             && state != 3
             && state != 4
-            && guest::read32(thread + kthread::MISC_FLAGS) & 0x10 != 0
-            && mode_index <= guest::read8(thread + kthread::WAIT_MODE) as i64
+            && target.alertable() != 0
+            && mode_index <= target.wait_mode.get() as u8 as i64
         {
             delivered = signal(thread);
-            guest::write8(thread + kthread::WAIT_REGISTER, register | 0x80);
+            target.wait_register.flags.set(register | WAIT_REGISTER_ALERT);
         }
         if !delivered {
-            guest::write8(alert_address, 1);
+            alerted.set(1);
         }
         previous
     });
@@ -75,13 +88,12 @@ pub fn consume(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
     if !alertable {
         return None;
     }
+    let alerted = &kthread(thread).alerted;
     thread_lock::with_lock(thread, || {
-        let kernel = thread + kthread::ALERTED;
-        let selected = kernel + wait_mode as u64;
-        let addresses: &[u64] = if wait_mode != 0 { &[selected, kernel] } else { &[kernel] };
-        for &address in addresses {
-            if guest::read8(address) != 0 {
-                guest::write8(address, 0);
+        let modes: &[usize] = if wait_mode != 0 { &[wait_mode as usize, 0] } else { &[0] };
+        for &mode in modes {
+            if alerted[mode].get() != 0 {
+                alerted[mode].set(0);
                 return Some(STATUS_ALERTED);
             }
         }
@@ -144,18 +156,19 @@ impl AlertWait {
         let thread = self.thread;
         self.previous_state = thread_dispatch::thread_state(thread);
         let me = Waiter { id: self.id, interrupted: None, completed: false };
+        let target = kthread(thread);
         let (previous_waiter, previous_fields) = thread_lock::with_lock(thread, || {
-            let flags = thread + kthread::MISC_FLAGS;
             let previous_waiter = WAITING.lock().insert(thread, me);
             let previous_fields = previous_waiter.map(|_| SavedFields {
-                alertable: guest::read32(flags) & 0x10,
-                mode: guest::read8(thread + kthread::WAIT_MODE),
-                register: guest::read8(thread + kthread::WAIT_REGISTER),
-                status: guest::read64(thread + kthread::WAIT_STATUS),
+                alertable: target.alertable(),
+                mode: target.wait_mode.get() as u8,
+                register: target.wait_register.flags.get(),
+                status: target.wait_status.get() as u64,
             });
-            guest::write32(flags, (guest::read32(flags) & !0x10) | if self.alertable { 0x10 } else { 0 });
-            guest::write8(thread + kthread::WAIT_MODE, self.mode);
-            guest::write8(thread + kthread::WAIT_REGISTER, 1);
+            // MiscFlags.Alertable: CAS atômico (o DWORD tem outros donos).
+            target.set_alertable(self.alertable as u32);
+            target.wait_mode.set(self.mode as i8);
+            target.wait_register.flags.set(WAIT_IN_PROGRESS);
             (previous_waiter, previous_fields)
         });
         self.previous_waiter = previous_waiter;
@@ -165,7 +178,7 @@ impl AlertWait {
         if thread_dispatch::owner(thread).is_some() {
             thread_dispatch::suspend(thread, thread_dispatch::state::WAITING)?;
         } else {
-            guest::write8(thread + kthread::STATE, 5);
+            target.state.set(STATE_WAITING);
         }
         Ok(())
     }
@@ -184,24 +197,24 @@ impl AlertWait {
         }
         let previous_waiter = self.previous_waiter.take();
         let previous_fields = self.previous_fields.take();
+        let target = kthread(thread);
         thread_lock::with_lock(thread, || match (previous_waiter, previous_fields) {
             (Some(waiter), Some(fields)) => {
                 WAITING.lock().insert(thread, waiter);
-                let flags = thread + kthread::MISC_FLAGS;
-                guest::write32(flags, (guest::read32(flags) & !0x10) | fields.alertable);
-                guest::write8(thread + kthread::WAIT_MODE, fields.mode);
-                guest::write8(thread + kthread::WAIT_REGISTER, fields.register);
-                guest::write64(thread + kthread::WAIT_STATUS, fields.status);
+                target.set_alertable(fields.alertable);
+                target.wait_mode.set(fields.mode as i8);
+                target.wait_register.flags.set(fields.register);
+                target.wait_status.set(fields.status as i64);
             }
             _ => {
                 WAITING.lock().remove(&thread);
-                guest::write64(thread + kthread::WAIT_STATUS, status as u64);
+                target.wait_status.set(status as i64);
             }
         });
         if self.cooperative && thread_dispatch::owner(thread).is_some() {
             thread_dispatch::suspend(thread, self.previous_state)?;
         } else if thread_dispatch::owner(thread).is_none() {
-            guest::write8(thread + kthread::STATE, self.previous_state);
+            target.state.set(self.previous_state);
         }
         Ok(())
     }

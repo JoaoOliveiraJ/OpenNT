@@ -9,9 +9,18 @@ use alloc::vec::Vec;
 use super::{clock, dpc, thread_alert};
 use crate::ntos::io::work_items;
 use crate::ntos::ps::{process, scheduler};
-use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{Ktimer, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::ktimer as layout;
+use crate::rtl::{KernelError, SpinLock};
+
+/// KOBJECTS dos timers: TimerNotificationObject e TimerSynchronizationObject.
+const TIMER_NOTIFICATION: u8 = 8;
+const TIMER_SYNCHRONIZATION: u8 = 9;
+
+fn ktimer(timer: u64) -> &'static Ktimer {
+    // SAFETY: KTIMER vivo do chamador (o corpo pertence ao driver).
+    unsafe { Ktimer::at(timer) }
+}
 
 struct TimerEntry {
     timer: u64,
@@ -33,37 +42,40 @@ fn due_time(value: i64) -> (u64, bool) {
     }
 }
 
-/// KeInitializeTimerEx.
+/// KeInitializeTimerEx. O DWORD Header.Lock leva o tipo no byte baixo e
+/// zera TimerControlFlags, Hand e TimerMiscFlags; Period (ms) é o do NT.
 pub fn initialize_timer(timer: u64, timer_type: u32) {
-    guest::write32(timer + layout::TYPE, timer_type);
-    guest::write32(timer + layout::SIGNAL_STATE, 0);
-    guest::write64(timer + layout::DPC, 0);
-    guest::write32(timer + layout::PERIOD, 0);
+    let object = ktimer(timer);
+    object.header.lock.set(timer_type as i32);
+    object.header.signal_state.set(0);
+    object.dpc.set(0);
+    object.period.set(0);
 }
 
 /// KeInitializeTimer: timer de notificação.
 pub fn initialize_notification_timer(timer: u64) {
-    initialize_timer(timer, layout::TIMER_NOTIFICATION as u32);
+    initialize_timer(timer, TIMER_NOTIFICATION as u32);
 }
 
 /// KeInitializeTimerEx com o TIMER_TYPE do chamador: 0 é NotificationTimer,
 /// qualquer outro valor SynchronizationTimer.
 pub fn initialize_timer_of_type(timer: u64, timer_type: u64) {
-    initialize_timer(timer, if timer_type != 0 { layout::TIMER_SYNCHRONIZATION } else { layout::TIMER_NOTIFICATION } as u32);
+    initialize_timer(timer, if timer_type != 0 { TIMER_SYNCHRONIZATION } else { TIMER_NOTIFICATION } as u32);
 }
 
 /// KeReadStateTimer.
 pub fn read_state(timer: u64) -> u32 {
-    guest::read32(timer + layout::SIGNAL_STATE)
+    ktimer(timer).header.signal_state.get() as u32
 }
 
 /// KeSetTimerEx: remove o agendamento anterior e insere o novo. Devolve se
 /// havia entrada na fila.
 pub fn set_timer(timer: u64, due_value: i64, dpc_pointer: u64, period_ms: u32) -> bool {
     let was_queued = cancel_timer(timer);
-    guest::write32(timer + layout::SIGNAL_STATE, 0);
-    guest::write64(timer + layout::DPC, dpc_pointer);
-    guest::write32(timer + layout::PERIOD, period_ms);
+    let object = ktimer(timer);
+    object.header.signal_state.set(0);
+    object.dpc.set(dpc_pointer);
+    object.period.set(period_ms);
     let (due, relative) = due_time(due_value);
     TIMERS.lock().push(TimerEntry { timer, due, relative, period_ms, dpc: dpc_pointer });
     was_queued
@@ -116,7 +128,7 @@ pub fn check_timers() {
         }
     }
     for (timer, dpc_pointer) in fired {
-        guest::write32(timer + layout::SIGNAL_STATE, 1);
+        ktimer(timer).header.signal_state.set(1);
         if dpc_pointer != 0 {
             dpc::insert_queue_dpc(dpc_pointer, 0, 0);
         }
@@ -133,7 +145,8 @@ fn delay_pump() {
 /// KeDelayExecutionThread cooperativo: o prazo relativo usa o uptime, o
 /// absoluto acompanha a hora do sistema.
 pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: bool) -> Result<u32, KernelError> {
-    let interval = guest::try_read64(interval_pointer)? as i64;
+    // Interval pode vir do modo usuário (NtDelayExecution): leitura sondada.
+    let interval = guest::try_read::<i64>(interval_pointer)?;
     let relative_deadline = (interval <= 0).then(|| clock::uptime_100ns() + interval.unsigned_abs());
     let expired = move || match relative_deadline {
         Some(deadline) => clock::uptime_100ns() >= deadline,

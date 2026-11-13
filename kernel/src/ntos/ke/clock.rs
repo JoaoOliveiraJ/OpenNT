@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::{cpu, physical, port};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, LargeInteger, NtStruct};
 use crate::rtl::text::fixed1;
 use crate::rtl::time;
 
@@ -121,19 +121,22 @@ fn driver_system_time() -> u64 {
 
 /// KeQuerySystemTime / KeQuerySystemTimePrecise.
 pub fn query_system_time(current_time: u64) {
-    guest::write64(current_time, driver_system_time());
+    // SAFETY: PLARGE_INTEGER CurrentTime do driver.
+    unsafe { LargeInteger::at(current_time) }.quad_part.set(driver_system_time() as i64);
 }
 
 /// KeQueryTickCount: milissegundos desde o boot.
 pub fn query_tick_count(tick_count: u64) {
-    guest::write64(tick_count, uptime_ms());
+    // SAFETY: PLARGE_INTEGER TickCount do driver.
+    unsafe { LargeInteger::at(tick_count) }.quad_part.set(uptime_ms() as i64);
 }
 
 /// KeQueryPerformanceCounter: contador TSC; a frequência sai no ponteiro
 /// opcional.
 pub fn query_performance_counter(frequency: u64) -> u64 {
     if frequency != 0 {
-        guest::write64(frequency, tsc_frequency_hz());
+        // SAFETY: PLARGE_INTEGER PerformanceFrequency opcional do driver.
+        unsafe { LargeInteger::at(frequency) }.quad_part.set(tsc_frequency_hz() as i64);
     }
     cpu::rdtsc()
 }
@@ -154,7 +157,8 @@ pub fn unbiased_interrupt_time() -> u64 {
 
 /// KeQueryUnbiasedInterruptTimePrecise: o tempo vai para o ponteiro.
 pub fn query_unbiased_interrupt_time_precise(time: u64) {
-    guest::write64(time, uptime_ms() * 10_000);
+    // SAFETY: PULONG64 do driver.
+    unsafe { Field::<u64>::at(time) }.set(uptime_ms() * 10_000);
 }
 
 /// KeQueryInterruptTimePrecise(PULONGLONG QpcValue): devolve o tempo de
@@ -163,7 +167,8 @@ pub fn query_unbiased_interrupt_time_precise(time: u64) {
 /// de KeQueryUnbiasedInterruptTimePrecise.
 pub fn query_interrupt_time_precise(qpc_value: u64) -> u64 {
     if qpc_value != 0 {
-        guest::write64(qpc_value, cpu::rdtsc());
+        // SAFETY: PULONGLONG QpcValue opcional do driver.
+        unsafe { Field::<u64>::at(qpc_value) }.set(cpu::rdtsc());
     }
     uptime_100ns()
 }

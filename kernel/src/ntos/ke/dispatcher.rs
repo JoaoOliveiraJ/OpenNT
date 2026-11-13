@@ -6,45 +6,66 @@
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::{clock, dpc, thread_alert, timer};
+use crate::ntos::inc::types::{DispatcherHeader, Field, Kevent, Kmutant, Ksemaphore, LargeInteger, ListEntry, NtStruct};
 use crate::ntos::io::work_items;
 use crate::ntos::ps::{process, scheduler};
 use crate::rtl::SpinLock;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::dispatcher_header as header;
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_TIMEOUT: u32 = 0x102;
 
-/// KeInitializeEvent: tipo, tamanho, estado e lista de espera vazia.
-pub fn initialize_event(event: u64, event_type: u8, initial_state: bool) {
-    guest::write8(event + header::TYPE, event_type);
-    guest::write8(event + 2, 0x18 / 4);
-    guest::write32(event + header::SIGNAL_STATE, initial_state as u32);
-    guest::write64(event + 8, event + 8);
-    guest::write64(event + 16, event + 8);
+/// KOBJECTS: o DISPATCHER_HEADER.Type de cada objeto de espera.
+mod object_type {
+    pub const EVENT_NOTIFICATION: u8 = 0;
+    pub const EVENT_SYNCHRONIZATION: u8 = 1;
+    pub const MUTANT: u8 = 2;
+    pub const SEMAPHORE: u8 = 5;
+    pub const THREAD: u8 = 6;
+    pub const TIMER_NOTIFICATION: u8 = 8;
+    pub const TIMER_SYNCHRONIZATION: u8 = 9;
 }
 
-/// KeSetEvent: devolve o estado anterior.
+/// LIST_ENTRY vazia (aponta para si mesma).
+fn initialize_list_head(head: &ListEntry) {
+    head.flink.set(head.address());
+    head.blink.set(head.address());
+}
+
+/// O objeto de espera do chamador (evento, semáforo, mutant, timer, thread).
+fn header_at(object: u64) -> &'static DispatcherHeader {
+    // SAFETY: os exports recebem um ponteiro para um objeto de despacho vivo.
+    unsafe { DispatcherHeader::at(object) }
+}
+
+/// KeInitializeEvent: tipo, tamanho, estado e lista de espera vazia.
+pub fn initialize_event(event: u64, event_type: u8, initial_state: bool) {
+    // SAFETY: KEVENT do chamador.
+    let event = unsafe { Kevent::at(event) };
+    event.header.type_.set(event_type);
+    event.header.size.set((Kevent::SIZE / 4) as u8);
+    event.header.signal_state.set(initial_state as i32);
+    initialize_list_head(&event.header.wait_list_head);
+}
+
+/// KeSetEvent: devolve o estado anterior (troca atômica do SignalState).
 pub fn set_event(event: u64) -> u32 {
-    let previous = guest::read32(event + header::SIGNAL_STATE);
-    guest::write32(event + header::SIGNAL_STATE, 1);
-    previous
+    header_at(event).signal_state.atomic().swap(1, Ordering::SeqCst) as u32
 }
 
 pub fn clear_event(event: u64) {
-    guest::write32(event + header::SIGNAL_STATE, 0);
+    header_at(event).signal_state.set(0);
 }
 
+/// KeResetEvent: devolve o estado anterior (troca atômica do SignalState).
 pub fn reset_event(event: u64) -> u32 {
-    let previous = guest::read32(event + header::SIGNAL_STATE);
-    guest::write32(event + header::SIGNAL_STATE, 0);
-    previous
+    header_at(event).signal_state.atomic().swap(0, Ordering::SeqCst) as u32
 }
 
 pub fn read_state(object: u64) -> u32 {
-    guest::read32(object + header::SIGNAL_STATE)
+    header_at(object).signal_state.get() as u32
 }
 
 /// KePulseEvent: sinaliza (libera os waiters) e volta a não sinalizado num
@@ -55,64 +76,88 @@ pub fn pulse_event(event: u64) -> u32 {
     previous
 }
 
-pub fn initialize_semaphore(semaphore: u64, count: u32, limit: u32) {
-    guest::write8(semaphore + header::TYPE, 5);
-    guest::write8(semaphore + 2, 0x20 / 4);
-    guest::write32(semaphore + header::SIGNAL_STATE, count);
-    guest::write32(semaphore + 0x18, limit);
-    guest::write64(semaphore + 8, semaphore + 8);
-    guest::write64(semaphore + 16, semaphore + 8);
+fn semaphore_at(semaphore: u64) -> &'static Ksemaphore {
+    // SAFETY: KSEMAPHORE do chamador.
+    unsafe { Ksemaphore::at(semaphore) }
 }
 
-/// KeReleaseSemaphore: `Ok(contagem anterior)` ou `Err(NTSTATUS)`.
+pub fn initialize_semaphore(semaphore: u64, count: u32, limit: u32) {
+    let semaphore = semaphore_at(semaphore);
+    semaphore.header.type_.set(object_type::SEMAPHORE);
+    semaphore.header.size.set((Ksemaphore::SIZE / 4) as u8);
+    semaphore.header.signal_state.set(count as i32);
+    semaphore.limit.set(limit as i32);
+    initialize_list_head(&semaphore.header.wait_list_head);
+}
+
+/// KeReleaseSemaphore: `Ok(contagem anterior)` ou `Err(NTSTATUS)`. A soma
+/// ao SignalState é um compare-exchange: duas liberações simultâneas nunca
+/// perdem uma permissão nem ultrapassam o Limit.
 pub fn release_semaphore(semaphore: u64, release_count: i64) -> Result<u32, u32> {
-    let previous = read_state(semaphore);
-    let limit = guest::read32(semaphore + 0x18);
+    let semaphore = semaphore_at(semaphore);
+    let state = &semaphore.header.signal_state;
+    let limit = semaphore.limit.get() as u32;
     if release_count <= 0 {
         return Err(0xC000_000D);
     }
-    if release_count > limit as i64 - previous as i64 {
-        return Err(0xC000_0047);
+    let mut previous = state.get();
+    loop {
+        if release_count > limit as i64 - previous as u32 as i64 {
+            return Err(0xC000_0047);
+        }
+        let next = (previous as u32).wrapping_add(release_count as u32) as i32;
+        match state.atomic().compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(previous as u32),
+            Err(observed) => previous = observed,
+        }
     }
-    guest::write32(semaphore + header::SIGNAL_STATE, previous + release_count as u32);
-    Ok(previous)
 }
 
 pub fn semaphore_limit(semaphore: u64) -> u32 {
-    guest::read32(semaphore + 0x18)
+    semaphore_at(semaphore).limit.get() as u32
 }
 
 /// KeInitializeSemaphore dos drivers: KSEMAPHORE com Type 5, SignalState =
-/// contagem e Limit em +0x18 (sem tocar no tamanho nem na lista de espera).
+/// contagem e Limit (sem tocar no tamanho nem na lista de espera).
 pub fn initialize_driver_semaphore(semaphore: u64, count: u32, limit: u32) {
-    guest::write8(semaphore + header::TYPE, 5);
-    guest::write32(semaphore + header::SIGNAL_STATE, count);
-    guest::write32(semaphore + 0x18, limit);
+    let semaphore = semaphore_at(semaphore);
+    semaphore.header.type_.set(object_type::SEMAPHORE);
+    semaphore.header.signal_state.set(count as i32);
+    semaphore.limit.set(limit as i32);
 }
 
 /// KeReleaseSemaphore dos drivers: devolve o SignalState anterior; o novo é
-/// anterior + ajuste, limitado ao Limit.
+/// anterior + ajuste, limitado ao Limit (num compare-exchange).
 pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
-    let state = semaphore + header::SIGNAL_STATE;
-    let previous = guest::read32(state) as i32;
-    let limit = guest::read32(semaphore + 0x18) as i32;
-    let released = previous.wrapping_add(adjustment).min(limit);
-    guest::write32(state, released as u32);
-    previous
+    let semaphore = semaphore_at(semaphore);
+    let limit = semaphore.limit.get();
+    let state = semaphore.header.signal_state.atomic();
+    let mut previous = state.load(Ordering::SeqCst);
+    loop {
+        let released = previous.wrapping_add(adjustment).min(limit);
+        match state.compare_exchange(previous, released, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return previous,
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
+fn mutant_at(mutex: u64) -> &'static Kmutant {
+    // SAFETY: KMUTANT do chamador.
+    unsafe { Kmutant::at(mutex) }
 }
 
 /// Mutants deste caminho começam sem desabilitar APCs de kernel.
 pub fn initialize_mutant(mutex: u64, initial_owner: bool) {
-    guest::write8(mutex + header::TYPE, header::TYPE_MUTANT);
-    guest::write8(mutex + 2, 0x38 / 4);
-    guest::write32(mutex + header::SIGNAL_STATE, if initial_owner { 0 } else { 1 });
-    for offset in [8u64, 0x18] {
-        guest::write64(mutex + offset, mutex + offset);
-        guest::write64(mutex + offset + 8, mutex + offset);
-    }
-    guest::write64(mutex + header::MUTEX_OWNER, if initial_owner { process::get_current_thread() } else { 0 });
-    guest::write8(mutex + 0x30, 0);
-    guest::write8(mutex + 0x31, 0);
+    let mutant = mutant_at(mutex);
+    mutant.header.type_.set(object_type::MUTANT);
+    mutant.header.size.set((Kmutant::SIZE / 4) as u8);
+    mutant.header.signal_state.set(if initial_owner { 0 } else { 1 });
+    initialize_list_head(&mutant.header.wait_list_head);
+    initialize_list_head(&mutant.mutant_list_entry);
+    mutant.owner_thread.set(if initial_owner { process::get_current_thread() } else { 0 });
+    mutant.mutant_flags.set(0);
+    mutant.apc_disable.set(0);
 }
 
 /// KeInitializeMutex: o nível é ignorado pelo contrato atual.
@@ -120,19 +165,27 @@ pub fn initialize_mutex(mutex: u64, _level: u32) {
     initialize_mutant(mutex, false);
 }
 
-/// Exige a posse (salvo abandono explícito). `Ok(estado anterior)`.
+/// Exige a posse (salvo abandono explícito). `Ok(estado anterior)`. O novo
+/// SignalState entra por compare-exchange.
 pub fn release_mutant(mutex: u64, abandon: bool) -> Result<i32, u32> {
-    let previous = guest::read32(mutex + header::SIGNAL_STATE) as i32;
-    if !abandon && (previous > 0 || guest::read64(mutex + header::MUTEX_OWNER) != process::get_current_thread()) {
-        return Err(0xC000_0046);
-    }
-    let next = if abandon { 1 } else { previous + 1 };
-    guest::write32(mutex + header::SIGNAL_STATE, next as u32);
+    let mutant = mutant_at(mutex);
+    let state = mutant.header.signal_state.atomic();
+    let mut previous = state.load(Ordering::SeqCst);
+    let next = loop {
+        if !abandon && (previous > 0 || mutant.owner_thread.get() != process::get_current_thread()) {
+            return Err(0xC000_0046);
+        }
+        let next = if abandon { 1 } else { previous + 1 };
+        match state.compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break next,
+            Err(observed) => previous = observed,
+        }
+    };
     if next == 1 {
-        guest::write64(mutex + header::MUTEX_OWNER, 0);
+        mutant.owner_thread.set(0);
     }
     if abandon {
-        guest::write8(mutex + 0x30, 1);
+        mutant.mutant_flags.set(1);
     }
     Ok(previous)
 }
@@ -146,49 +199,59 @@ pub fn release_mutex(mutex: u64) -> u32 {
 }
 
 /// Consulta ou consome o estado. `None` = indisponível; senão sucesso,
-/// abandono (0x80) ou erro de limite.
+/// abandono (0x80) ou erro de limite. Consumir é um compare-exchange no
+/// SignalState: dois waiters nunca satisfazem a mesma permissão ou sinal.
 pub fn acquire_status(object: u64, consume: bool) -> Option<u32> {
-    let object_type = guest::read8(object + header::TYPE);
-    let state = guest::read32(object + header::SIGNAL_STATE);
-    match object_type {
+    let header = header_at(object);
+    let state = &header.signal_state;
+    match header.type_.get() {
         // Semáforos consomem uma permissão.
-        5 => {
-            if state == 0 {
-                return None;
+        object_type::SEMAPHORE => {
+            let mut current = state.get();
+            loop {
+                if current == 0 {
+                    return None;
+                }
+                if !consume {
+                    return Some(0);
+                }
+                match state.atomic().compare_exchange(current, current.wrapping_sub(1), Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return Some(0),
+                    Err(observed) => current = observed,
+                }
             }
-            if consume {
-                guest::write32(object + header::SIGNAL_STATE, state - 1);
-            }
-            Some(0)
         }
         // Eventos de notificação, timers de notificação e threads terminadas.
-        header::TYPE_EVENT_NOTIFICATION | 8 | 6 => (state != 0).then_some(0),
+        object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::THREAD => (state.get() != 0).then_some(0),
         // Eventos e timers de sincronização consomem o sinal.
-        header::TYPE_EVENT_SYNCHRONIZATION | 9 => {
-            if state == 0 {
-                return None;
-            }
-            if consume {
-                guest::write32(object + header::SIGNAL_STATE, 0);
-            }
-            Some(0)
+        object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION => {
+            let signalled = if consume { state.atomic().swap(0, Ordering::SeqCst) } else { state.get() };
+            (signalled != 0).then_some(0)
         }
-        header::TYPE_MUTANT => {
+        object_type::MUTANT => {
+            let mutant = mutant_at(object);
             let owner = process::get_current_thread();
-            let recursion = state as i32;
-            if recursion <= 0 && guest::read64(object + header::MUTEX_OWNER) != owner {
-                return None;
+            let mut recursion = state.get();
+            loop {
+                if recursion <= 0 && mutant.owner_thread.get() != owner {
+                    return None;
+                }
+                if recursion == i32::MIN {
+                    return Some(0xC000_0191);
+                }
+                let status = if mutant.mutant_flags.get() & 1 != 0 { 0x80 } else { 0 };
+                if !consume {
+                    return Some(status);
+                }
+                match state.atomic().compare_exchange(recursion, recursion - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => {
+                        mutant.owner_thread.set(owner);
+                        mutant.mutant_flags.set(0);
+                        return Some(status);
+                    }
+                    Err(observed) => recursion = observed,
+                }
             }
-            if recursion == i32::MIN {
-                return Some(0xC000_0191);
-            }
-            let abandoned = guest::read8(object + 0x30) & 1;
-            if consume {
-                guest::write32(object + header::SIGNAL_STATE, (recursion - 1) as u32);
-                guest::write64(object + header::MUTEX_OWNER, owner);
-                guest::write8(object + 0x30, 0);
-            }
-            Some(if abandoned != 0 { 0x80 } else { 0 })
         }
         _ => None,
     }
@@ -200,7 +263,8 @@ pub fn timeout_to_100ns(timeout_pointer: u64) -> Option<u64> {
     if timeout_pointer == 0 {
         return None;
     }
-    let value = guest::read64(timeout_pointer) as i64;
+    // SAFETY: PLARGE_INTEGER Timeout do chamador.
+    let value = unsafe { LargeInteger::at(timeout_pointer) }.quad_part.get();
     if value == 0 {
         return Some(0);
     }
@@ -312,7 +376,8 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
     if count == 0 || count > 64 || wait_type > 1 {
         return 0xC000_000D;
     }
-    let objects: Vec<u64> = (0..count as u64).map(|index| guest::read64(objects_pointer + index * 8)).collect();
+    // SAFETY: vetor PVOID Object[Count] do chamador.
+    let objects: Vec<u64> = unsafe { Field::<u64>::array_at(objects_pointer, count as usize) }.iter().map(Field::get).collect();
     if objects.iter().collect::<BTreeSet<_>>().len() != objects.len() {
         return 0xC000_000D;
     }

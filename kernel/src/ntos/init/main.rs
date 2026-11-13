@@ -22,18 +22,19 @@ fn banner() {
     console::print("=================================================");
 }
 
-/// Despeja KEYBOARD_INPUT_DATA (UnitId u16, MakeCode u16, Flags u16, 12
-/// bytes cada) -> ASCII -> canal `kbd`. KEY_BREAK (bit 0) vira o break code.
-fn pump_keyboard_data(read: impl Fn(u64) -> u16, length: u64) {
-    let mut offset = 0;
-    while offset + 12 <= length {
-        let make_code = read(offset + 2);
-        let flags = read(offset + 4);
+/// Despeja os KEYBOARD_INPUT_DATA lidos -> ASCII -> canal `kbd`. KEY_BREAK
+/// (bit 0 de Flags) vira o break code.
+fn pump_keyboard_data(records: &[u8]) {
+    use core::mem::{offset_of, size_of};
+    use crate::ntos::inc::types::KeyboardInputData;
+    let field = |record: &[u8], offset: usize| u16::from_le_bytes([record[offset], record[offset + 1]]);
+    for record in records.chunks_exact(size_of::<KeyboardInputData>()) {
+        let make_code = field(record, offset_of!(KeyboardInputData, make_code));
+        let flags = field(record, offset_of!(KeyboardInputData, flags));
         let scancode = if flags & 1 != 0 { make_code as u8 | 0x80 } else { make_code as u8 };
         if let Some(character) = keyboard::decode(scancode) {
             message_channels::send("kbd", character);
         }
-        offset += 12;
     }
 }
 
@@ -46,6 +47,7 @@ fn pump_keyboard_data(read: impl Fn(u64) -> u16, length: u64) {
 /// buffer -> decode -> canal.
 async fn keyboard_service() -> u32 {
     use crate::ntos::io::io_manager::{self, IoParams, IoResult};
+    use crate::ntos::inc::types::{Irp, NtStruct};
     use crate::ntos::ke::dispatcher;
     use crate::ntos::mm::guest_memory as guest;
     let opened = io_manager::open_device("\\Device\\KeyboardClass0", false);
@@ -70,7 +72,7 @@ async fn keyboard_service() -> u32 {
                     if request.status == 0 && request.info > 0 {
                         // Dados já na fila: o resultado traz os bytes.
                         if let IoResult::Bytes(bytes) = &request.result {
-                            pump_keyboard_data(|offset| bytes.get(offset as usize..offset as usize + 2).map_or(0, |pair| u16::from_le_bytes([pair[0], pair[1]])), request.info);
+                            pump_keyboard_data(&bytes[..(request.info as usize).min(bytes.len())]);
                         }
                     } else if request.status == 0x103 {
                         pending = Some(request);
@@ -81,8 +83,9 @@ async fn keyboard_service() -> u32 {
                 if dispatcher::wait_for_single_object(event, zero_timeout, 0, false) == 0 {
                     // O READ completou: lê os dados ANTES de liberar.
                     let data = request.pending_buffer;
-                    let information = guest::read64(request.pending_irp + crate::ntos::inc::nt_abi::irp::IO_STATUS_INFORMATION);
-                    pump_keyboard_data(|offset| guest::read16(data + offset), information);
+                    // SAFETY: o IRP do READ pendente (liberado só depois).
+                    let information = unsafe { Irp::at(request.pending_irp) }.io_status.information.get();
+                    pump_keyboard_data(&guest::read_bytes(data, information as usize));
                     io_manager::wait_pending_io_request(request, 0);
                     pending = None;
                 }

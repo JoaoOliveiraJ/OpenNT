@@ -449,9 +449,12 @@ fn trace_details(name: &str, call: &Call) {
         _ => None,
     };
     if let Some(index) = object_attributes {
-        let attributes = call.arg(index);
-        let name_pointer = if attributes == 0 { 0 } else { guest::try_read64(attributes + 0x10).unwrap_or(0) };
-        let root = if attributes == 0 { 0 } else { guest::try_read64(attributes + 8).unwrap_or(0) };
+        use crate::ntos::inc::types::{NtStruct, ObjectAttributes};
+        // OBJECT_ATTRIBUTES do chamador (pode vir do modo usuário): sondado.
+        let (name_pointer, root) = match ObjectAttributes::try_at(call.arg(index)) {
+            Ok(attributes) => (attributes.object_name.probe_get().unwrap_or(0), attributes.root_directory.probe_get().unwrap_or(0)),
+            Err(_) => (0, 0),
+        };
         if let Some(text) = unicode(name_pointer) {
             debug_print!("[api]   nome: {} (raiz {:#x})", text, root);
         }

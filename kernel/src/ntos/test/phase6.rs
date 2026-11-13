@@ -1329,10 +1329,12 @@ fn ntoskrnl_ke_group(assert: Assert) {
     let mutex = block + 0x200;
     call_export("KeInitializeGuardedMutex", &[mutex]);
     assert(call_export("KeTryToAcquireGuardedMutex", &[mutex]) == Some(1) && call_export("KeReleaseGuardedMutex", &[mutex]) == Some(0) && at::<nt::FastMutex>(mutex).count.get() == 1, "ke: guarded mutex");
-    let saved = call_export("KeSaveExtendedProcessorState", &[3, block + 0x240]);
-    // O KeSaveExtendedProcessorState do OpenNT guarda o próprio registro em XSTATE_SAVE.Prev (ke/xstate.rs).
-    let state = at::<nt::XstateSave>(block + 0x240).prev.get();
-    assert(saved == Some(0) && guest::read32(state) == 0x5358 && call_export("KeRestoreExtendedProcessorState", &[state]) == Some(0) && call_export("KeRestoreExtendedProcessorState", &[0]) == Some(0xFFFF_FFFF_C000_000D), "ke: estado estendido salvo e restaurado");
+    // O XSTATE_SAVE é do chamador: o kernel preenche o XSTATE_CONTEXT.
+    let state = block + 0x240;
+    let saved = call_export("KeSaveExtendedProcessorState", &[3, state]);
+    let context = &at::<nt::XstateSave>(state).x_state_context;
+    let area_saved = context.mask.get() == 3 && context.area.get() != 0;
+    assert(saved == Some(0) && area_saved && call_export("KeRestoreExtendedProcessorState", &[state]) == Some(0) && context.area.get() == 0 && call_export("KeRestoreExtendedProcessorState", &[0]) == Some(0xFFFF_FFFF_C000_000D), "ke: estado estendido salvo e restaurado");
     assert(call_export("KeDeregisterBugCheckCallback", &[0x1234]) == Some(0), "ke: registro de bugcheck desconhecido");
     // Dados KiBugCheckData/KeNumberProcessors e anexação pelo export.
     let data = |name: &str| match exports::lookup("ntoskrnl.exe", name) {

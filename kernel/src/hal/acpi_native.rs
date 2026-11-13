@@ -35,7 +35,7 @@ fn matches(pointer: u64, bytes: &[u8], offset: usize, size: usize) -> bool {
 }
 
 fn current_copy(pointer: u64, size: u64, table: &AcpiTable) -> bool {
-    size == table.length && (0..table.length).all(|index| guest::read8(pointer + index) == table.bytes[index as usize])
+    size == table.length && guest::read_bytes(pointer, table.length as usize) == table.bytes[..table.length as usize]
 }
 
 /// O kernel revalida a SLIC contra o firmware; as demais ficam em cache

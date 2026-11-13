@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::pcr;
 use crate::hal::{cpu, physical};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, NtStruct};
 
 pub const PASSIVE_LEVEL: u8 = 0;
 pub const APC_LEVEL: u8 = 1;
@@ -62,7 +62,8 @@ pub fn lower_irql(level: u64) {
 pub fn raise_irql_saving(level: u8, old_irql: u64) {
     let previous = raise_irql(level);
     if old_irql != 0 {
-        guest::write8(old_irql, previous);
+        // SAFETY: PKIRQL OldIrql do chamador.
+        unsafe { Field::<u8>::at(old_irql) }.set(previous);
     }
 }
 

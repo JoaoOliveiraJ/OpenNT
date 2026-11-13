@@ -4,18 +4,28 @@
 //! bit 0 disponível, bit 1 despertar em trânsito e aguardantes nos bits
 //! superiores (ExpAcquireFastMutexContended / ExpReleaseFastMutexContended).
 
+use core::sync::atomic::Ordering;
+
 use super::{critical_region, dispatcher, irql};
+use crate::ntos::inc::types::{FastMutex, NtStruct};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 fn current_thread() -> u64 {
     process::get_current_thread()
 }
 
-/// Lê Count atomicamente sem alterar seus bits.
-fn read_atomic(pointer: u64) -> Result<u32, KernelError> {
-    guest::compare_exchange32(pointer, 0, 0)
+/// FAST_MUTEX/KGUARDED_MUTEX do chamador (o mesmo layout de 0x38 bytes).
+fn mutex_at(pointer: u64) -> &'static FastMutex {
+    // SAFETY: os exports recebem um FAST_MUTEX vivo do driver.
+    unsafe { FastMutex::at(pointer) }
+}
+
+/// Compare-exchange do NT: devolve o valor observado.
+fn compare_exchange(cell: &core::sync::atomic::AtomicI32, expected: u32, replacement: u32) -> u32 {
+    match cell.compare_exchange(expected as i32, replacement as i32, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(value) | Err(value) => value as u32,
+    }
 }
 
 /// Exige IRQL até APC_LEVEL; as variantes inseguras em PASSIVE_LEVEL exigem
@@ -34,10 +44,11 @@ fn validate_caller(caller_controls_irql: bool, requires_guarded_region: bool) ->
 /// Count disponível, dono nulo, contador de contenções e evento de
 /// sincronização embutido.
 pub fn initialize(pointer: u64) {
-    guest::write32(pointer, 1);
-    guest::write64(pointer + 8, 0);
-    guest::write32(pointer + 0x10, 0);
-    dispatcher::initialize_event(pointer + 0x18, 1, false);
+    let mutex = mutex_at(pointer);
+    mutex.count.set(1);
+    mutex.owner.set(0);
+    mutex.contention.set(0);
+    dispatcher::initialize_event(mutex.event.address(), 1, false);
 }
 
 /// Aquisição suspensível: acompanha contenção e reserva de despertar.
@@ -69,10 +80,10 @@ pub fn begin(pointer: u64, caller_controls_irql: bool, requires_guarded_region: 
 }
 
 /// Grava o dono e, na variante segura, o IRQL de entrada.
-fn publish_ownership(pointer: u64, thread: u64, old_irql: u8, unsafe_variant: bool) {
-    guest::write64(pointer + 8, thread);
+fn publish_ownership(mutex: &FastMutex, thread: u64, old_irql: u8, unsafe_variant: bool) {
+    mutex.owner.set(thread);
     if !unsafe_variant {
-        guest::write32(pointer + 0x30, old_irql as u32);
+        mutex.old_irql.set(old_irql as u32);
     }
 }
 
@@ -83,23 +94,24 @@ impl Request {
         if self.done {
             return Ok(Some(0));
         }
-        let pointer = self.pointer;
+        let mutex = mutex_at(self.pointer);
+        let count = mutex.count.atomic();
         // O evento é consumido por compare-exchange: leitura e escrita
         // separadas entregariam a mesma reserva a duas CPUs.
         if self.parked {
-            if guest::compare_exchange32(pointer + 0x1C, 1, 0)? != 1 {
+            if compare_exchange(mutex.event.header.signal_state.atomic(), 1, 0) != 1 {
                 return Ok(None);
             }
             self.parked = false;
             self.mask = 3;
             self.increment = 2;
         }
-        let mut value = read_atomic(pointer)?;
+        let mut value = count.load(Ordering::SeqCst) as u32;
         loop {
             if value & 1 != 0 {
-                let observed = guest::compare_exchange32(pointer, value, value ^ self.mask)?;
+                let observed = compare_exchange(count, value, value ^ self.mask);
                 if observed == value {
-                    publish_ownership(pointer, self.thread, self.old_irql, self.unsafe_variant);
+                    publish_ownership(mutex, self.thread, self.old_irql, self.unsafe_variant);
                     self.done = true;
                     return Ok(Some(0));
                 }
@@ -108,17 +120,10 @@ impl Request {
             }
             // Uma contenção por aquisição, mesmo com várias consultas.
             if !self.contended {
-                let mut expected = read_atomic(pointer + 0x10)?;
-                loop {
-                    let observed = guest::compare_exchange32(pointer + 0x10, expected, expected.wrapping_add(1))?;
-                    if observed == expected {
-                        break;
-                    }
-                    expected = observed;
-                }
+                mutex.contention.atomic().fetch_add(1, Ordering::SeqCst);
                 self.contended = true;
             }
-            let observed = guest::compare_exchange32(pointer, value, value.wrapping_add(self.increment))?;
+            let observed = compare_exchange(count, value, value.wrapping_add(self.increment));
             if observed != value {
                 value = observed;
                 continue;
@@ -148,11 +153,13 @@ pub fn try_acquire(pointer: u64) -> Result<u32, KernelError> {
     if old_irql < 1 {
         irql::raise_irql(1);
     }
-    let mut value = read_atomic(pointer)?;
+    let mutex = mutex_at(pointer);
+    let count = mutex.count.atomic();
+    let mut value = count.load(Ordering::SeqCst) as u32;
     while value & 1 != 0 {
-        let observed = guest::compare_exchange32(pointer, value, value & !1)?;
+        let observed = compare_exchange(count, value, value & !1);
         if observed == value {
-            publish_ownership(pointer, thread, old_irql, false);
+            publish_ownership(mutex, thread, old_irql, false);
             return Ok(1);
         }
         value = observed;
@@ -167,7 +174,8 @@ pub fn try_acquire(pointer: u64) -> Result<u32, KernelError> {
 /// quando há aguardantes.
 fn release_with(pointer: u64, caller_controls_irql: bool, requires_guarded_region: bool) -> Result<u32, KernelError> {
     validate_caller(caller_controls_irql, requires_guarded_region)?;
-    if guest::read64(pointer + 8) != current_thread() {
+    let mutex = mutex_at(pointer);
+    if mutex.owner.get() != current_thread() {
         return Err(KernelError::new("mutex released by non-owner"));
     }
     if !caller_controls_irql && irql::get_irql() != 1 {
@@ -175,20 +183,21 @@ fn release_with(pointer: u64, caller_controls_irql: bool, requires_guarded_regio
     }
     // Owner e OldIrql podem ser sobrescritos pelo próximo dono assim que a
     // palavra fica disponível.
-    let old_irql = if caller_controls_irql { irql::get_irql() } else { guest::read8(pointer + 0x30) };
-    guest::write64(pointer + 8, 0);
-    let mut value = guest::compare_exchange32(pointer, 0, 1)?;
+    let old_irql = if caller_controls_irql { irql::get_irql() } else { mutex.old_irql.get() as u8 };
+    mutex.owner.set(0);
+    let count = mutex.count.atomic();
+    let mut value = compare_exchange(count, 0, 1);
     if value != 0 {
         loop {
             let next = if value & 2 != 0 { value.wrapping_add(1) } else { value.wrapping_sub(1) };
-            let observed = guest::compare_exchange32(pointer, value, next)?;
+            let observed = compare_exchange(count, value, next);
             if observed == value {
                 break;
             }
             value = observed;
         }
         if value & 2 == 0 {
-            dispatcher::set_event(pointer + 0x18);
+            dispatcher::set_event(mutex.event.address());
         }
     }
     if !caller_controls_irql && old_irql < 1 {

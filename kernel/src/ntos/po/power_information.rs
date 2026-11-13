@@ -4,7 +4,7 @@
 //! desktop (SYSTEM_POWER_CAPABILITIES sem bateria, AC ligado). Os demais
 //! níveis devolvem STATUS_INVALID_PARAMETER.
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::po::black_box;
 use crate::rtl::KernelError;
 
@@ -22,12 +22,13 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     if output_length < 0x40 {
         return Ok(STATUS_BUFFER_TOO_SMALL);
     }
-    let destination = output;
-    guest::write8(destination, 1);
-    guest::write8(destination + 1, 1);
-    guest::write8(destination + 2, 0);
-    guest::write8(destination + 3, 1);
-    guest::write8(destination + 7, 1);
-    guest::write8(destination + 0x0C, 1);
+    // SAFETY: buffer SYSTEM_POWER_CAPABILITIES do chamador (Zw, KernelMode).
+    let capabilities = unsafe { SystemPowerCapabilities::at(output) };
+    capabilities.power_button_present.set(1);
+    capabilities.sleep_button_present.set(1);
+    capabilities.lid_present.set(0);
+    capabilities.system_s1.set(1);
+    capabilities.system_s5.set(1);
+    capabilities.ups_present.set(1);
     Ok(0)
 }

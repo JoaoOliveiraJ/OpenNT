@@ -18,7 +18,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::private_entries;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, HalDispatch, NtStruct};
 use crate::ntos::mm::{kernel_address, kernel_data};
 use crate::rtl::KernelError;
 
@@ -39,9 +39,15 @@ fn native(symbol: &str) -> Result<u64, KernelError> {
 pub fn initialize() -> Result<(), KernelError> {
     let table = kernel_data::address("HalDispatchTable")?;
     let stub = native("hal_default_not_supported")?;
-    guest::write32(table, VERSION);
-    for slot in 0..SLOT_COUNT as u64 {
-        guest::write64(table + 0x08 + slot * 8, stub);
+    // SAFETY: a célula do export de dados HalDispatchTable.
+    let dispatch = unsafe { HalDispatch::at(table) };
+    dispatch.version.set(VERSION);
+    // Os SLOT_COUNT ponteiros de função seguem Version, a partir de
+    // HalQuerySystemInformation.
+    // SAFETY: os slots de função da própria tabela.
+    let slots = unsafe { Field::<u64>::array_at(dispatch.hal_query_system_information.address(), SLOT_COUNT) };
+    for slot in slots {
+        slot.set(stub);
     }
     TABLE.store(table, Ordering::SeqCst);
     crate::debug_print!("[hal] HalDispatchTable versao {} em {:#x}: {} slots -> STATUS_NOT_SUPPORTED", VERSION, table, SLOT_COUNT);

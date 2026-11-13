@@ -11,8 +11,39 @@ use crate::ntos::io::io_manager::{self as iom, irp_mn, DeviceEntry};
 use crate::ntos::ob::objects::device as device_objects;
 use crate::ntos::ob::object_manager;
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{
+    CmFullResourceDescriptor, CmPartialResourceDescriptor, CmPartialResourceList, CmResourceList, DeviceCapabilities, DeviceObject, DevicePowerState, InterfaceType,
+    IoResourceDescriptor, IoResourceList, IoResourceRequirementsList, IoStackLocation, Irp, NtStruct, SystemPowerState,
+};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{cm_full_resource_descriptor as full, cm_partial_resource_descriptor as part, cm_partial_resource_list as list, cm_resource_list, device_object, io_stack_location as stack, irp};
+
+/// CM_RESOURCE_TYPE (CmResourceTypePort, CmResourceTypeInterrupt).
+mod part {
+    pub const TYPE_PORT: u8 = 1;
+    pub const TYPE_INTERRUPT: u8 = 2;
+}
+
+/// IO_TYPE_DEVICE.
+const IO_TYPE_DEVICE: i16 = 3;
+
+/// O IO_STACK_LOCATION corrente de um IRP vivo.
+pub(crate) fn current_stack_location(packet: u64) -> (&'static Irp, &'static IoStackLocation) {
+    // SAFETY: IRP vivo entregue ao bus; CurrentStackLocation é um ponteiro inteiro.
+    let irp = unsafe { Irp::at(packet) };
+    // SAFETY: a pilha corrente do IRP.
+    (irp, unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) })
+}
+
+/// Um DEVICE_OBJECT nativo de PDO sem driver (o bus responde por ele).
+pub(crate) fn initialize_pdo(device: u64) {
+    // SAFETY: bloco recém-alocado do tamanho de um DEVICE_OBJECT.
+    let object = unsafe { DeviceObject::at(device) };
+    object.type_.set(IO_TYPE_DEVICE);
+    object.size.set(DeviceObject::SIZE as u16);
+    object.driver_object.set(0);
+    object.reference_count.set(1);
+    object.stack_size.set(1);
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MotherboardResource {
@@ -63,108 +94,111 @@ static CREATED: SpinLock<Vec<CreatedPdo>> = SpinLock::new(Vec::new());
 /// CM_RESOURCE_LIST com um FULL descriptor Isa e alinhamento de 4 (stride
 /// 0x14 e união em +4, medidos no i8042prt).
 pub fn build_resource_list(resources: &[MotherboardResource]) -> u64 {
-    let size = cm_resource_list::FULL_DESCRIPTOR + full::PARTIAL_LIST + list::DESCRIPTORS + part::SIZE * resources.len() as u64;
-    let address = guest::alloc_bytes(size);
-    guest::write32(address + cm_resource_list::COUNT, 1);
-    let descriptor = address + cm_resource_list::FULL_DESCRIPTOR;
-    guest::write32(descriptor + full::INTERFACE_TYPE, 1); // Isa
-    guest::write32(descriptor + full::BUS_NUMBER, 0);
-    let partial = descriptor + full::PARTIAL_LIST;
-    guest::write16(partial + list::VERSION, 1);
-    guest::write16(partial + list::REVISION, 1);
-    guest::write32(partial + list::COUNT, resources.len() as u32);
-    let mut cursor = partial + list::DESCRIPTORS;
-    for resource in resources {
-        guest::write8(cursor + part::TYPE, resource.resource_type);
-        guest::write8(cursor + part::SHARE_DISPOSITION, 0); // exclusiva
-        guest::write16(cursor + part::FLAGS, 0); // latched
+    use core::mem::{offset_of, size_of};
+    let header = offset_of!(CmResourceList, list) + offset_of!(CmFullResourceDescriptor, partial_resource_list) + offset_of!(CmPartialResourceList, partial_descriptors);
+    let address = guest::alloc_bytes((header + size_of::<CmPartialResourceDescriptor>() * resources.len()) as u64);
+    // SAFETY: bloco recém-alocado com espaço para todos os descritores.
+    let list = unsafe { CmResourceList::at(address) };
+    list.count.set(1);
+    let full = &list.list[0];
+    full.interface_type.set(InterfaceType::ISA);
+    full.bus_number.set(0);
+    let partial = &full.partial_resource_list;
+    partial.version.set(1);
+    partial.revision.set(1);
+    partial.count.set(resources.len() as u32);
+    // SAFETY: os descritores seguem a lista parcial no mesmo bloco.
+    let descriptors = unsafe { CmPartialResourceDescriptor::array_at(partial.partial_descriptors[0].address(), resources.len()) };
+    for (descriptor, resource) in descriptors.iter().zip(resources) {
+        descriptor.type_.set(resource.resource_type);
+        descriptor.share_disposition.set(0); // exclusiva
+        descriptor.flags.set(0); // latched
         if resource.resource_type == part::TYPE_INTERRUPT {
-            guest::write32(cursor + part::INTERRUPT_LEVEL, resource.level);
-            guest::write32(cursor + part::INTERRUPT_VECTOR, resource.vector);
-            guest::write64(cursor + part::INTERRUPT_AFFINITY, resource.affinity as u64);
+            descriptor.u.interrupt.level.set(resource.level as u16);
+            descriptor.u.interrupt.group.set(0);
+            descriptor.u.interrupt.vector.set(resource.vector);
+            descriptor.u.interrupt.affinity.set(resource.affinity as u64);
         } else {
-            guest::write64(cursor + part::PORT_START, resource.start);
-            guest::write32(cursor + part::PORT_LENGTH, resource.length);
+            descriptor.u.port.start.quad_part.set(resource.start as i64);
+            descriptor.u.port.length.set(resource.length);
         }
-        cursor += part::SIZE;
     }
     address
 }
 
 /// String wide em pool zerado (já termina em NUL).
 fn write_wide_string(text: &str) -> u64 {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let buffer = guest::alloc_bytes((units.len() as u64 + 1) * 2);
-    for (index, &unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, unit);
-    }
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    let buffer = guest::alloc_bytes(bytes.len() as u64 + 2);
+    guest::write_bytes(buffer, &bytes);
     buffer
 }
 
 /// MULTI_SZ wide com duplo NUL garantido pelo pool zerado.
 fn write_multi_sz(strings: &[&str]) -> u64 {
-    let total: usize = 1 + strings.iter().map(|text| text.encode_utf16().count() + 1).sum::<usize>();
-    let buffer = guest::alloc_bytes(total as u64 * 2);
-    let mut cursor = buffer;
+    let mut bytes = Vec::new();
     for text in strings {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        for &unit in &units {
-            guest::write16(cursor, unit);
-            cursor += 2;
-        }
-        cursor += 2;
+        bytes.extend(text.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+        bytes.extend_from_slice(&[0, 0]);
     }
+    bytes.extend_from_slice(&[0, 0]);
+    let buffer = guest::alloc_bytes(bytes.len() as u64);
+    guest::write_bytes(buffer, &bytes);
     buffer
 }
 
 /// DEVICE_CAPABILITIES (0x40 bytes) no buffer do chamador: D0 em tudo, sem wake.
 fn fill_device_capabilities(address: u64) {
-    guest::write_bytes(address, &[0; 0x40]);
-    guest::write16(address, 0x40); // Size
-    guest::write16(address + 2, 1); // Version
-    guest::write32(address + 4, 0);
-    guest::write32(address + 8, 0xFFFF_FFFF); // Address
-    guest::write32(address + 0xC, 0xFFFF_FFFF); // UINumber
-    for index in 0..7 {
-        guest::write32(address + 0x10 + index * 4, 1); // DeviceState = D0
+    guest::write_bytes(address, &[0; DeviceCapabilities::SIZE as usize]);
+    // SAFETY: o DEVICE_CAPABILITIES do IRP (recém-zerado).
+    let capabilities = unsafe { DeviceCapabilities::at(address) };
+    capabilities.size.set(DeviceCapabilities::SIZE as u16);
+    capabilities.version.set(1);
+    capabilities.bitfield_4.set(0);
+    capabilities.address.set(0xFFFF_FFFF);
+    capabilities.ui_number.set(0xFFFF_FFFF);
+    for state in &capabilities.device_state {
+        state.set(DevicePowerState::POWER_DEVICE_D0);
     }
-    guest::write32(address + 0x2C, 0); // SystemWake
-    guest::write32(address + 0x30, 0); // DeviceWake
+    capabilities.system_wake.set(SystemPowerState::POWER_SYSTEM_UNSPECIFIED);
+    capabilities.device_wake.set(DevicePowerState::POWER_DEVICE_UNSPECIFIED);
 }
 
 /// IO_RESOURCE_REQUIREMENTS_LIST: descritores IO com união de 24 bytes
 /// (stride 0x20), uma lista alternativa com uma opção por recurso.
 pub fn build_resource_requirements(resources: &[MotherboardResource]) -> u64 {
-    let descriptor_size = 0x20u64;
-    let size = 0x20 + 0x08 + descriptor_size * resources.len() as u64;
+    use core::mem::{offset_of, size_of};
+    let size = (offset_of!(IoResourceRequirementsList, list) + offset_of!(IoResourceList, descriptors) + size_of::<IoResourceDescriptor>() * resources.len()) as u64;
     let address = guest::alloc_bytes(size);
-    guest::write32(address, size as u32); // ListSize
-    guest::write32(address + 4, 1); // Isa
-    guest::write32(address + 8, 0); // BusNumber
-    guest::write32(address + 0x1C, 1); // AlternativeLists
-    let alternatives = address + 0x20;
-    guest::write16(alternatives, 1);
-    guest::write16(alternatives + 2, 1);
-    guest::write32(alternatives + 4, resources.len() as u32);
-    let mut cursor = alternatives + 8;
-    for resource in resources {
-        guest::write8(cursor, 0); // Option: obrigatório
-        guest::write8(cursor + 1, resource.resource_type);
-        guest::write8(cursor + 2, 0);
-        guest::write16(cursor + 4, 0);
+    // SAFETY: bloco recém-alocado com espaço para todos os descritores.
+    let requirements = unsafe { IoResourceRequirementsList::at(address) };
+    requirements.list_size.set(size as u32);
+    requirements.interface_type.set(InterfaceType::ISA);
+    requirements.bus_number.set(0);
+    requirements.alternative_lists.set(1);
+    let alternatives = &requirements.list[0];
+    alternatives.version.set(1);
+    alternatives.revision.set(1);
+    alternatives.count.set(resources.len() as u32);
+    // SAFETY: os descritores seguem a lista alternativa no mesmo bloco.
+    let descriptors = unsafe { IoResourceDescriptor::array_at(alternatives.descriptors[0].address(), resources.len()) };
+    for (descriptor, resource) in descriptors.iter().zip(resources) {
+        descriptor.option.set(0); // obrigatório
+        descriptor.type_.set(resource.resource_type);
+        descriptor.share_disposition.set(0);
+        descriptor.flags.set(0);
         if resource.resource_type == part::TYPE_INTERRUPT {
             // IRQ ISA crua, antes da tradução da HAL.
             let irq = resource.vector - 0x20;
-            guest::write32(cursor + 8, irq);
-            guest::write32(cursor + 0xC, irq);
-            guest::write64(cursor + 0x18, 0); // TargetedProcessors padrão
+            descriptor.u.interrupt.minimum_vector.set(irq);
+            descriptor.u.interrupt.maximum_vector.set(irq);
+            descriptor.u.interrupt.targeted_processors.set(0); // padrão
         } else {
-            guest::write32(cursor + 8, resource.length);
-            guest::write32(cursor + 0xC, 1); // Alignment
-            guest::write64(cursor + 0x10, resource.start);
-            guest::write64(cursor + 0x18, resource.start + resource.length as u64 - 1);
+            descriptor.u.port.length.set(resource.length);
+            descriptor.u.port.alignment.set(1);
+            descriptor.u.port.minimum_address.quad_part.set(resource.start as i64);
+            descriptor.u.port.maximum_address.quad_part.set((resource.start + resource.length as u64 - 1) as i64);
         }
-        cursor += descriptor_size;
     }
     address
 }
@@ -173,13 +207,13 @@ pub fn build_resource_requirements(resources: &[MotherboardResource]) -> u64 {
 /// deixar pendente travaria o forward+wait do driver funcional.
 pub fn answer_pnp_irp(device: u64, packet: u64) -> Option<i32> {
     let entry = CREATED.lock().iter().find(|pdo| pdo.device_pointer == device).copied()?;
-    let location = guest::read32(packet + irp::CURRENT_STACK_LOCATION) as u64;
-    let minor = guest::read8(location + stack::MINOR);
+    let (request, location) = current_stack_location(packet);
+    let minor = location.minor_function.get();
     let mut information = 0;
     let mut status = 0u32;
     match minor {
         irp_mn::START_DEVICE | irp_mn::REMOVE_DEVICE => {}
-        irp_mn::QUERY_ID => match guest::read32(location + 0x08) {
+        irp_mn::QUERY_ID => match location.parameters.query_id.id_type.get().0 {
             0 => information = write_wide_string(entry.descriptor.device_id),
             1 => information = write_multi_sz(entry.descriptor.hardware_ids),
             2 => information = write_multi_sz(&["PNP0303"]),
@@ -187,14 +221,14 @@ pub fn answer_pnp_irp(device: u64, packet: u64) -> Option<i32> {
             _ => status = 0xC000_00BB,
         },
         // O buffer DEVICE_CAPABILITIES vem pronto em Parameters: o bus o preenche.
-        irp_mn::QUERY_CAPABILITIES => fill_device_capabilities(guest::read32(location + 0x08) as u64),
+        irp_mn::QUERY_CAPABILITIES => fill_device_capabilities(location.parameters.device_capabilities.capabilities.get()),
         irp_mn::QUERY_RESOURCES => information = entry.resource_list_pointer,
         irp_mn::QUERY_RESOURCE_REQUIREMENTS => information = build_resource_requirements(&entry.descriptor.resources),
         irp_mn::FILTER_RESOURCE_REQUIREMENTS => {}
         _ => status = 0xC000_00BB,
     }
-    guest::write32(packet + irp::IO_STATUS, status);
-    guest::write64(packet + irp::IO_STATUS_INFORMATION, information);
+    request.io_status.status.set(status as i32);
+    request.io_status.information.set(information);
     iom::iof_complete_request(packet);
     Some(status as i32)
 }
@@ -206,12 +240,8 @@ fn free_pdo(pointer: u64) {
 /// PDOs com DEVICE_OBJECT nativo sem driver (quem responde é o bus).
 pub fn enumerate() -> Result<Vec<CreatedPdo>, KernelError> {
     for descriptor in MOTHERBOARD_DEVICES {
-        let device = guest::alloc_bytes(device_object::STRUCT_SIZE);
-        guest::write16(device + device_object::TYPE, device_object::IO_TYPE);
-        guest::write16(device + device_object::SIZE, device_object::STRUCT_SIZE as u16);
-        guest::write32(device + device_object::DRIVER_OBJECT, 0);
-        guest::write32(device + device_object::REFERENCE_COUNT, 1);
-        guest::write8(device + device_object::STACK_SIZE, 1);
+        let device = guest::alloc_bytes(DeviceObject::SIZE);
+        initialize_pdo(device);
         device_objects::register(device, Some(free_pdo), None)?;
         let resources = build_resource_list(&descriptor.resources);
         let node = object_manager::create_object("\\Device", descriptor.name, "Device", None)?;

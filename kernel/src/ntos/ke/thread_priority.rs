@@ -6,23 +6,27 @@
 use alloc::vec::Vec;
 
 use super::{thread_dispatch, thread_lock};
+use crate::ntos::inc::types::{Kprocess, Kthread, NtStruct};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+
+fn kthread(thread: u64) -> &'static Kthread {
+    // SAFETY: KTHREAD viva do chamador.
+    unsafe { Kthread::at(thread) }
+}
 
 /// KPRIORITY é LONG; o campo interno é um byte com sinal.
 pub fn query_priority(thread: u64) -> i32 {
-    guest::read8(thread + kthread::PRIORITY) as i8 as i32
+    kthread(thread).priority.get() as i32
 }
 
 pub fn query_base_priority(thread: u64) -> i32 {
-    guest::read8(thread + kthread::BASE_PRIORITY) as i8 as i32
+    kthread(thread).base_priority.get() as i32
 }
 
 /// Usa o maior piso ativo (inclusive o bit 31); não troca o resumo por uma
 /// política fixa.
 pub fn effective_priority(thread: u64, requested: i32) -> i32 {
-    let floor_summary = guest::read32(thread + kthread::PRIORITY_FLOOR_SUMMARY);
+    let floor_summary = kthread(thread).priority_floor_summary.get();
     requested.max(if floor_summary != 0 { 31 - floor_summary.leading_zeros() as i32 } else { 0 })
 }
 
@@ -30,23 +34,24 @@ pub fn effective_priority(thread: u64, requested: i32) -> i32 {
 /// antes da soma QWORD.
 pub fn reset_quantum(thread: u64) {
     let cycles = thread_dispatch::sample_cycles(thread);
-    let quantum_reset = guest::read8(thread + kthread::QUANTUM_RESET) as u32;
+    let target = kthread(thread);
+    let quantum_reset = target.quantum_reset.get() as u32;
     let quantum_cycles = quantum_reset.wrapping_mul(thread_dispatch::cycles_per_quantum());
-    guest::write64(thread + kthread::QUANTUM_TARGET, cycles.wrapping_add(quantum_cycles as u64));
-    let flags = thread + kthread::THREAD_FLAGS;
-    guest::write32(flags, guest::read32(flags) & !0x20);
+    target.quantum_target.set(cycles.wrapping_add(quantum_cycles as u64));
+    // ThreadFlags.QuantumDonation: CAS atômico no DWORD compartilhado.
+    target.set_quantum_donation(0);
 }
 
 /// Remove o boost anterior antes de comparar prioridades, inclusive quando
 /// o pedido é igual.
 fn clear_decrement(thread: u64) {
-    let decrement_address = thread + kthread::PRIORITY_DECREMENT;
-    let decrement = guest::read8(decrement_address);
+    let target = kthread(thread);
+    let decrement = target.priority_decrement.get() as u8;
     if decrement & 15 != 0 {
-        guest::write32(thread + kthread::FOREGROUND_LOSS_TIME, thread_dispatch::tick_count());
+        target.foreground_loss_time.set(thread_dispatch::tick_count());
     }
     if decrement != 0 {
-        guest::write8(decrement_address, 0);
+        target.priority_decrement.set(0);
     }
 }
 
@@ -58,18 +63,19 @@ fn change_priority(thread: u64, requested: i32, deferred: &mut Vec<u64>) -> Resu
     if priority == previous {
         return Ok(());
     }
-    let state = guest::read8(thread + kthread::STATE);
+    let target = kthread(thread);
+    let state = target.state.get();
     if state == thread_dispatch::state::READY {
         thread_dispatch::remove_ready(thread)?;
     }
-    guest::write8(thread + kthread::PRIORITY, priority as u8);
+    target.priority.set(priority as i8);
     if state == thread_dispatch::state::READY {
         // A comparação unsigned reproduz KiPrepareReadyThreadForRescheduling,
         // inclusive o wrap do tick.
-        let wait_time = guest::read32(thread + kthread::WAIT_TIME);
+        let wait_time = target.wait_time.get();
         if (1..=14).contains(&priority) && thread_dispatch::tick_count().wrapping_sub(300) >= wait_time {
-            guest::write8(thread + kthread::PRIORITY_DECREMENT, (((15 - priority) << 4) & 255) as u8);
-            guest::write8(thread + kthread::PRIORITY, 15);
+            target.priority_decrement.set((((15 - priority) << 4) & 255) as u8 as i8);
+            target.priority.set(15);
             thread_dispatch::ensure_minimum_quantum(thread);
         }
         thread_dispatch::defer_ready(thread, deferred);
@@ -82,9 +88,9 @@ fn change_priority(thread: u64, requested: i32, deferred: &mut Vec<u64>) -> Resu
             }
         }
     }
-    // Uma fila local por CPU; não há afinidade com fila partilhada.
-    let flags = thread + kthread::THREAD_FLAGS;
-    guest::write32(flags, guest::read32(flags) & !0x2000);
+    // Uma fila local por CPU; não há afinidade com fila partilhada
+    // (ThreadFlags.SharedReadyQueueAffinity, CAS atômico).
+    target.set_shared_ready_queue_affinity(0);
     Ok(())
 }
 
@@ -125,13 +131,14 @@ pub fn set_base_priority(thread: u64, requested_increment: u64) -> Result<i32, K
     if thread_dispatch::is_idle_thread(thread) {
         return Ok(0);
     }
+    let target = kthread(thread);
     let previous = thread_lock::with_lock(thread, || -> Result<i32, KernelError> {
-        let process = guest::read64(thread + kthread::PROCESS);
-        let process_base = guest::read8(process + eprocess::BASE_PRIORITY) as i8 as i32;
+        // SAFETY: o processo dono de uma thread viva.
+        let process = unsafe { Kprocess::at(target.process.get()) };
+        let process_base = process.base_priority.get() as i32;
         let previous_base = query_base_priority(thread);
         let previous_priority = query_priority(thread);
-        let saturation_address = thread + kthread::SATURATION;
-        let previous_saturation = guest::read8(saturation_address) as i8 as i32;
+        let previous_saturation = target.saturation.get() as i32;
         let previous = if previous_saturation != 0 { previous_saturation * 16 } else { previous_base - process_base };
         // ABS e adição em LONG de 32 bits, inclusive o overflow de LONG_MIN.
         let absolute = increment.wrapping_abs();
@@ -153,14 +160,14 @@ pub fn set_base_priority(thread: u64, requested_increment: u64) -> Result<i32, K
             // base para a prioridade.
             let mut unboosted = previous_priority;
             if previous_priority < 16 {
-                let decrement = guest::read8(thread + kthread::PRIORITY_DECREMENT) as i32;
+                let decrement = target.priority_decrement.get() as u8 as i32;
                 let candidate = (previous_priority - (decrement >> 4) - (decrement & 15)) as i8 as i32;
                 unboosted = effective_priority(thread, previous_base.max(candidate));
             }
             dynamic = (unboosted + base - previous_base).min(15).max(1);
         }
-        guest::write8(saturation_address, saturation as u8);
-        guest::write8(thread + kthread::BASE_PRIORITY, base as u8);
+        target.saturation.set(saturation as i8);
+        target.base_priority.set(base as i8);
         clear_decrement(thread);
         if dynamic != previous_priority {
             reset_quantum(thread);

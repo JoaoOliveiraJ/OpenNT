@@ -9,7 +9,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::rtl::SpinLock;
 
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -29,7 +29,8 @@ pub fn auto_log_start(handle_out: u64) {
     sessions.sessions.insert(handle, VecDeque::new());
     drop(sessions);
     if handle_out != 0 {
-        guest::write64(handle_out, handle);
+        // SAFETY: handle de saída do driver.
+        unsafe { Field::<u64>::at(handle_out) }.set(handle);
     }
 }
 

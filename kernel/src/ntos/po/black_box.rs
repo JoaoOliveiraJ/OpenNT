@@ -8,10 +8,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::ex::push_lock;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::KuserSharedData;
 use crate::ntos::ke::critical_region;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -19,8 +21,23 @@ const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const MAXIMUM_STORED_LENGTH: u64 = 4096;
-const SHARED_INTERRUPT_TIME: u64 = 0xFFFF_F780_0000_0008;
-const SHARED_INTERRUPT_TIME_BIAS: u64 = 0xFFFF_F780_0000_03B0;
+const SHARED_DATA: u64 = 0xFFFF_F780_0000_0000;
+
+/// Pedido KernelMode da classe 94 (32 bytes; sem tipo público): buffer,
+/// comprimento, deslocamento, categoria e flags.
+#[repr(C)]
+struct BlackBoxRequest {
+    buffer: Field<u64>,
+    length: Field<u64>,
+    offset: Field<u64>,
+    category: Field<u32>,
+    flags: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for BlackBoxRequest {}
+
+const _: () = assert!(core::mem::size_of::<BlackBoxRequest>() == 32);
 
 /// (nome, GUID nos 16 bytes nativos, flags). A marca de SCM restringe
 /// chamadas UserMode no NT; Zw executa em KernelMode.
@@ -75,28 +92,25 @@ pub fn init() -> Result<(), KernelError> {
 
 /// Repete a leitura se o desconto de suspensão mudar durante a amostragem.
 fn unbiased_interrupt_time() -> u64 {
+    // SAFETY: página compartilhada mapeada desde o boot.
+    let shared = unsafe { KuserSharedData::at(SHARED_DATA) };
+    // InterruptTime: LowPart + High1Time num único acesso de 64 bits.
+    // SAFETY: os 8 primeiros bytes do KSYSTEM_TIME.
+    let interrupt_time = unsafe { Field::<u64>::at(shared.interrupt_time.address()) };
     loop {
-        let bias = guest::read64_single(SHARED_INTERRUPT_TIME_BIAS);
-        let time = guest::read64_single(SHARED_INTERRUPT_TIME);
-        if bias == guest::read64_single(SHARED_INTERRUPT_TIME_BIAS) {
+        let bias = shared.interrupt_time_bias.get();
+        let time = interrupt_time.get();
+        if bias == shared.interrupt_time_bias.get() {
             return time.wrapping_sub(bias);
         }
     }
 }
 
-/// memmove limitado ao registro; uma falha de endereço interrompe a cópia.
+/// memmove limitado ao registro: a origem é lida (sondada) inteira antes de
+/// gravar o destino; uma falha de endereço interrompe a cópia.
 fn move_payload(destination: u64, source: u64, length: u64) -> Result<(), KernelError> {
-    let copy = |offset: u64| guest::try_read8(source + offset).and_then(|byte| guest::try_write8(destination + offset, byte));
-    if destination > source && destination < source + length {
-        for offset in (0..length).rev() {
-            copy(offset)?;
-        }
-    } else {
-        for offset in 0..length {
-            copy(offset)?;
-        }
-    }
-    Ok(())
+    let bytes = guest::try_read_bytes(source, length as usize)?;
+    guest::try_write_bytes(destination, &bytes)
 }
 
 fn with_record<T>(index: usize, body: impl FnOnce(&mut Record) -> T) -> T {
@@ -105,11 +119,13 @@ fn with_record<T>(index: usize, body: impl FnOnce(&mut Record) -> T) -> T {
 
 /// Núcleo do pedido KernelMode; só o bit 0 de Flags altera o comportamento.
 fn update_kernel_request(request: u64) -> Result<u32, KernelError> {
-    let index = guest::read32(request + 24) as usize;
+    // SAFETY: o buffer de entrada de 32 bytes da classe 94 (KernelMode).
+    let request = unsafe { BlackBoxRequest::at(request) };
+    let index = request.category.get() as usize;
     if index >= CATEGORIES.len() {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    let flags = guest::read32(request + 28);
+    let flags = request.flags.get();
     let lock = LOCK.load(Ordering::Acquire);
     if lock == 0 {
         return Err(KernelError::new("black-box recorder used before phase 0"));
@@ -119,14 +135,14 @@ fn update_kernel_request(request: u64) -> Result<u32, KernelError> {
         push_lock::acquire_exclusive(lock, 0)?;
         with_record(index, |record| record.updating = true);
         let status = (|| -> Result<u32, KernelError> {
-            let length = guest::read64(request + 8);
+            let length = request.length.get();
             let mut offset = 0u64;
             let copy_length;
             if flags & 1 != 0 {
                 if length == 0 {
                     return Ok(STATUS_INVALID_PARAMETER);
                 }
-                offset = guest::read64(request + 16);
+                offset = request.offset.get();
                 let Some(end) = offset.checked_add(length) else { return Ok(STATUS_INTEGER_OVERFLOW) };
                 if end > with_record(index, |record| record.requested_length) {
                     return Ok(STATUS_INVALID_PARAMETER);
@@ -155,7 +171,7 @@ fn update_kernel_request(request: u64) -> Result<u32, KernelError> {
                 return Ok(0);
             }
             // O alias físico da página zero não torna Buffer=NULL válido.
-            let source = guest::read64(request);
+            let source = request.buffer.get();
             if source != 0 && move_payload(buffer + offset, source, copy_length).is_ok() {
                 return Ok(0);
             }
@@ -243,8 +259,8 @@ pub fn publish_crash_records() {
         while offset < record.stored_length {
             let end = (offset + 128).min(record.stored_length);
             let mut hex = alloc::string::String::new();
-            for position in offset..end {
-                hex.push_str(&alloc::format!("{:02x}", guest::read8(record.buffer + position as u64)));
+            for byte in guest::read_bytes(record.buffer + offset as u64, (end - offset) as usize) {
+                hex.push_str(&alloc::format!("{byte:02x}"));
             }
             debug_print!("KERNEL_BLACKBOX_BYTES {{\"index\":{},\"offset\":{},\"bytes\":\"{}\"}}", index, offset, hex);
             offset += 128;

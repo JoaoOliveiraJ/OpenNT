@@ -5,6 +5,7 @@
 //! existe com mapeamento recursivo real.
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{dump_memory, pcr};
@@ -12,7 +13,7 @@ use crate::ntos::mm::{kernel_data, memory_map, native_pfn_database, physical_lay
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::types::{Eprocess, Ethread, KapcState, Kprcb, Kprocess, Kthread, KthreadView1, NtStruct};
 
 pub const DATA_BYTE_LENGTH: usize = 0x380;
 const SUPPORT_BYTE_LENGTH: usize = 0x1000;
@@ -98,16 +99,16 @@ pub fn snapshot(module_list_head: u64) -> Result<Snapshot, KernelError> {
     }
     // Offsets e tamanhos dos corpos que o escalonador mantém.
     for (field, value) in [
-        (0x29E, kthread::INITIAL_STACK),
-        (0x2A0, kthread::APC_STATE_PROCESS),
-        (0x2A2, kthread::STATE),
-        (0x2A8, eprocess::SIZE),
-        (0x2AA, eprocess::PEB),
-        (0x2AE, eprocess::DIRECTORY_TABLE_BASE),
-        (0x2B0, 0xAF00),
+        (0x29E, offset_of!(Kthread, initial_stack) as u64),
+        (0x2A0, (offset_of!(Kthread, apc_state) + offset_of!(KapcState, process)) as u64),
+        (0x2A2, offset_of!(KthreadView1, state) as u64),
+        (0x2A8, Eprocess::SIZE),
+        (0x2AA, offset_of!(Eprocess, peb) as u64),
+        (0x2AE, offset_of!(Kprocess, directory_table_base) as u64),
+        (0x2B0, Kprcb::SIZE),
         (0x2B4, pcr::layout::PRCB_CURRENT_THREAD - pcr::layout::PRCB),
         (0x2BE, pcr::layout::PRCB_NUMBER - pcr::layout::PRCB),
-        (0x2C0, kthread::SIZE),
+        (0x2C0, Ethread::SIZE),
         (0x2E0, pcr::layout::SIZE),
         (0x2E2, pcr::layout::SELF),
         (0x2E4, pcr::layout::CURRENT_PRCB),
@@ -118,7 +119,7 @@ pub fn snapshot(module_list_head: u64) -> Result<Snapshot, KernelError> {
     }
     put32(&mut bytes, 0x340, 0x30);
     put32(&mut bytes, 0x344, 0x38);
-    put32(&mut bytes, 0x34C, kthread::IRP_LIST_HEAD);
+    put32(&mut bytes, 0x34C, offset_of!(Ethread, irp_list) as u64);
     put64(&mut bytes, 0x360, recursive_mapping::layout().map_or(0, |layout| layout.page_table_base));
     let frames = native_pfn_database::information();
     // MmPfnDatabase é uma variável de ponteiro, como no KDBG da imagem NT.
