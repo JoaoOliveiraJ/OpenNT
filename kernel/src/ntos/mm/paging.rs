@@ -52,16 +52,19 @@ pub fn read_entry(address: u64) -> u64 {
     physical::read64(address) & ENTRY_MASK
 }
 
+/// A entrada inteira (com NX), numa única leitura de 64 bits.
 pub fn read_entry_exact(address: u64) -> u64 {
-    physical::read32(address) as u64 | (physical::read32(address + 4) as u64) << 32
+    physical::read64(address)
 }
 
+/// Grava a entrada numa única escrita de 64 bits, como o NT grava uma PTE:
+/// outra CPU percorrendo a tabela nunca vê metade da entrada antiga e metade
+/// da nova.
 fn write_entry(address: u64, value: u64, nx: bool) {
     let tracked = observed() && tracker::tracks_entry(address);
     let previous = if tracked { read_entry_exact(address) } else { 0 };
     let replacement = (value & !NX_BIT) | if nx { NX_BIT } else { 0 };
-    physical::write32(address, replacement as u32);
-    physical::write32(address + 4, (replacement >> 32) as u32);
+    physical::write64(address, replacement);
     if tracked {
         tracker::entry_changed(address, previous, replacement);
     }

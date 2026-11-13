@@ -218,8 +218,8 @@ pub fn unlock_with_lower(lock: u64, previous: u8) {
 }
 
 /// API legada: sobe a DISPATCH_LEVEL e adquire por test-and-set; o IRQL
-/// anterior vai para `old_irql`.
+/// anterior vai para `old_irql` (um KIRQL: um byte).
 pub fn acquire_legacy(lock: u64, old_irql: u64) {
     let previous = lock_with_raise(lock);
-    guest::write32(old_irql, previous as u32);
+    guest::write8(old_irql, previous as u8);
 }

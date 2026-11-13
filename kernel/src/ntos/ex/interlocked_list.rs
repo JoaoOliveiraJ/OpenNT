@@ -1,19 +1,18 @@
 //! Listas simples protegidas por spin lock (ExInterlockedPushEntryList e
 //! ExInterlockedPopEntryList).
 //!
-//! A cabeça é uma SINGLE_LIST_ENTRY com Depth em +8 e Sequence em +0xA; o
-//! spin lock do chamador é o legado de `spin_lock` (sobe a DISPATCH_LEVEL).
+//! A cabeça é uma SINGLE_LIST_ENTRY de 8 bytes (só o ponteiro Next): como no
+//! ntoskrnl, só `[ListHead]` e `[Entry]` são tocados — não há Depth nem
+//! Sequence, que são do SLIST_HEADER. O spin lock do chamador é o legado de
+//! `spin_lock` (sobe a DISPATCH_LEVEL).
 
 use super::spin_lock;
 use crate::ntos::mm::guest_memory as guest;
 
-/// SINGLE_LIST com Depth em +8 e Sequence em +0xA.
 fn push_entry(head: u64, entry: u64) -> u64 {
     let previous = guest::read64(head);
     guest::write64(entry, previous);
     guest::write64(head, entry);
-    guest::write16(head + 8, guest::read16(head + 8).wrapping_add(1));
-    guest::write16(head + 0xA, guest::read16(head + 0xA).wrapping_add(1));
     previous
 }
 
@@ -23,7 +22,6 @@ fn pop_entry(head: u64) -> u64 {
         return 0;
     }
     guest::write64(head, guest::read64(first));
-    guest::write16(head + 8, guest::read16(head + 8).wrapping_sub(1));
     first
 }
 
