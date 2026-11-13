@@ -8,13 +8,15 @@
 //!   0x060000-0x06FFFF    pilhas dos APs (4KB por CPU, até 16 CPUs)
 //!   0x070000-0x075FFF    tabelas de identidade do stage2 (PML4, PDPT, 4 PDs)
 //!   0x076000-0x07AFFF    tabelas do mapa direto (PDPT, 4 PDs)
+//!   0x07B000-0x07CFFF    tabelas da janela do heap (PDPT, PD)
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
 //!   0x08F000-0x08FFFF    página de controle do anel 3 (células da HAL)
 //!   0x100000-0xDFFFFF    imagem do kernel (cap de build: 13MB)
 //!   0xF80008 (topo)      pilha do kernel de boot (cresce para baixo)
 //!   0x1000000-0x1FFFFFF  sem uso (as imagens de drivers moram no espaço de sistema)
-//!   0x2000000-0x5FFFFFF  heap do kernel (kmalloc), com a arena de 16MB
+//!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB,
+//!                        endereçados só pela janela do heap
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
 //!   0x10000000-0x1FFFFFFF espaço de VA para VirtualAlloc (fora do PFN)
 //!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
@@ -24,11 +26,13 @@
 //!   0xB0000000-0xBEFFFFFF sem uso
 //!
 //!   0xFFFFB000_00000000+  mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
+//!   0xFFFFC000_C0000000+  janela do heap do kernel e da arena dos convidados
 //! ```
 //!
 //! Na metade de sistema, as imagens de kernel (drivers .sys, hal.dll,
 //! ci.dll, bibliotecas de export) ficam na janela `SYSTEM_IMAGE_BASE..TOP`
-//! (bloco "Imagens de sistema" abaixo).
+//! (bloco "Imagens de sistema" abaixo), e o heap do kernel e a arena dos
+//! convidados na janela `KERNEL_HEAP_BASE..TOP` (bloco "Janela do heap").
 #![allow(dead_code)]
 
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -148,3 +152,57 @@ const _: () = assert!(DIRECT_MAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 &&
 // da página de contagem de IRQs (0x81000).
 const _: () = assert!(DIRECT_MAP_PDPT_PHYS == PD_PHYS + 4 * PAGE_SIZE && DIRECT_MAP_PD_PHYS == DIRECT_MAP_PDPT_PHYS + PAGE_SIZE);
 const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL_MEMORY_LIMIT == 4 * 0x4000_0000);
+
+// ---- Janela do heap do kernel (metade de sistema) --------------------------
+//
+// O heap do kernel (`hal::kmalloc`, também o alocador global do Rust) e a
+// arena de 16 MB dos convidados, reservada dele no boot (IRPs,
+// DEVICE_OBJECTs, MDLs, ExAllocatePool2 e as demais estruturas NT que os
+// drivers recebem), moram nos frames físicos KERNEL_HEAP_PHYS_BASE..TOP, fora
+// do PFN. Esses frames são endereçados só por esta janela, o papel do pool
+// não paginado inicial do NT: KERNEL_HEAP_BASE + (PA - KERNEL_HEAP_PHYS_BASE),
+// em páginas de 2 MB de supervisor, RW e executáveis (o pool não paginado
+// comum do NT executa; a arena também guarda pequenas rotinas de conclusão
+// geradas em tempo de execução). Toda alocação do heap e da arena é,
+// portanto, uma VA >= MmSystemRangeStart. `paging::map_kernel_heap_window`
+// monta a janela no boot, antes da primeira alocação, com tabelas fixas
+// abaixo de 1 MB. Como o mapa direto, é um alias físico do kernel: o
+// rastreador de frames não acompanha o slot (índice 384 da PML4, reservado
+// inteiro), e nenhuma outra janela do OpenNT o usa. Os 32 bits baixos da base
+// (0xC0000000) caem no buraco de MMIO acima de 3 GB, sem RAM e desligado pela
+// `--identity-audit`: um ponteiro do heap truncado para 32 bits falta, em vez
+// de cair na imagem do kernel.
+pub const KERNEL_HEAP_PHYS_BASE: u64 = 0x200_0000;
+/// Fim exclusivo dos frames do heap (início da primeira arena do PFN).
+pub const KERNEL_HEAP_PHYS_TOP: u64 = 0x600_0000;
+pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_C000_C000_0000;
+pub const KERNEL_HEAP_TOP: u64 = KERNEL_HEAP_BASE + (KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE);
+pub const KERNEL_HEAP_PML4_INDEX: u64 = 384;
+/// Tabelas da janela (PDPT e uma PD), logo depois das do mapa direto.
+pub const KERNEL_HEAP_PDPT_PHYS: u64 = 0x7B000;
+pub const KERNEL_HEAP_PD_PHYS: u64 = 0x7C000;
+
+/// VA da janela do heap do frame `physical_address` (dentro da faixa do heap).
+pub const fn kernel_heap_virtual(physical_address: u64) -> u64 {
+    KERNEL_HEAP_BASE + (physical_address - KERNEL_HEAP_PHYS_BASE)
+}
+
+/// Endereço físico de uma VA da janela do heap.
+pub const fn kernel_heap_physical(address: u64) -> u64 {
+    KERNEL_HEAP_PHYS_BASE + (address - KERNEL_HEAP_BASE)
+}
+
+/// A VA pertence à janela do heap.
+pub const fn is_kernel_heap(address: u64) -> bool {
+    address >= KERNEL_HEAP_BASE && address < KERNEL_HEAP_TOP
+}
+
+const _: () = assert!((KERNEL_HEAP_BASE >> 39) & 511 == KERNEL_HEAP_PML4_INDEX && KERNEL_HEAP_BASE % 0x4000_0000 == 0);
+const _: () = assert!(KERNEL_HEAP_BASE & 0xFFFF_FFFF >= 0xC000_0000 && (KERNEL_HEAP_TOP - 1) & 0xFFFF_FFFF < 0xFEC0_0000);
+const _: () = assert!(KERNEL_HEAP_PML4_INDEX != PAGE_TABLE_RECURSIVE_INDEX && KERNEL_HEAP_PML4_INDEX != (PFN_DATABASE_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != DIRECT_MAP_PML4_INDEX);
+const _: () = assert!(KERNEL_HEAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != (PCR_VIRTUAL_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != (SYSTEM_IMAGE_BASE >> 39) & 511);
+// Uma PD (1 GB) cobre a faixa inteira, em páginas de 2 MB; os frames ficam
+// abaixo da primeira arena do PFN.
+const _: () = assert!(KERNEL_HEAP_PHYS_BASE % LARGE_PAGE_SIZE == 0 && KERNEL_HEAP_PHYS_TOP % LARGE_PAGE_SIZE == 0);
+const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_0000 && KERNEL_HEAP_PHYS_TOP <= PFN_RANGES[0].0);
+const _: () = assert!(KERNEL_HEAP_PDPT_PHYS == DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE && KERNEL_HEAP_PD_PHYS == KERNEL_HEAP_PDPT_PHYS + PAGE_SIZE && KERNEL_HEAP_PD_PHYS + PAGE_SIZE <= 0x8_1000);

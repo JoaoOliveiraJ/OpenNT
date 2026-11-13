@@ -83,11 +83,12 @@ pub fn allocate_uninitialized(bytes: u64) -> u64 {
     guest::alloc_raw(bytes)
 }
 
-/// ExFreePool/ExFreePoolWithTag/ExFreePool2. Encaminha ao alocador dono:
-/// endereços baixos são da arena; a tag opcional só é conferida pelo pool
-/// que guarda o metadado.
+/// ExFreePool/ExFreePoolWithTag/ExFreePool2. Encaminha ao alocador dono
+/// pela faixa de cada um (a arena na janela do heap, o pool de dados e o pool
+/// executivo); a tag opcional só é conferida pelo pool que guarda o
+/// metadado.
 pub fn free(pointer: u64, tag: u64) -> Result<(), KernelError> {
-    if pointer < 0xFFFF_0000_0000_0000 {
+    if guest::in_arena(pointer) {
         guest::free_bytes(pointer);
     } else if data_pool::owns(pointer) {
         data_pool::free(pointer)?;

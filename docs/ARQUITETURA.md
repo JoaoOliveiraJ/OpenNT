@@ -205,6 +205,7 @@ vai para a metade de sistema (a partir de 0xFFFF8000_00000000):
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
 | 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
+| 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
 | 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, o alias RW da imagem do kernel e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
 
@@ -215,11 +216,10 @@ no kernel. A regra:
 - **Endereço físico nunca é ponteiro.** Quem tem um PA usa `hal::physical`,
   que traduz pelo mapa direto e para o sistema se receber algo fora da faixa
   física (uma VA, por exemplo). Isso vale para PTEs e tabelas (`paging.rs`),
-  descritores de PFN, frames do PFN, cabeçalhos do heap do kernel e da arena
-  dos convidados, MMIO (LAPIC, texto VGA), tabelas ACPI, o handoff do stage2
-  (E820, flags, firmware), as células fixas de baixo nível (0x81000, a IDT em
-  0x82000, a página de controle do anel 3 em 0x8F000) e os dados do
-  trampolim dos APs. A IDT, a GDT do boot e as pilhas dos APs são carregadas
+  descritores de PFN, frames do PFN, MMIO (LAPIC, texto VGA), tabelas ACPI,
+  o handoff do stage2 (E820, flags, firmware), as células fixas de baixo
+  nível (0x81000, a IDT em 0x82000, a página de controle do anel 3 em
+  0x8F000) e os dados do trampolim dos APs. A IDT, a GDT do boot e as pilhas dos APs são carregadas
   pela VA do mapa direto; MmMapIoSpace e os mapeamentos físicos da HAL
   devolvem VAs dele.
 - **Endereço virtual** é acessado por `mm/guest_memory.rs` (memória confiável
@@ -227,12 +227,33 @@ no kernel. A regra:
 - **Stubs em assembly** carregam a VA da página de células num registrador
   (`movabs`) e endereçam por deslocamento; a entrada de syscall troca a pilha
   por `MOV moffs64`, sem registrador livre.
-- O rastreador de frames não conta referências do mapa direto, como não
-  conta as da identidade.
+- O rastreador de frames não conta referências do mapa direto nem da janela
+  do heap, como não conta as da identidade.
 - **Prova:** `--identity-audit` (`ntos/mm/identity_audit.rs`) desliga no boot
-  a identidade baixa do primeiro MB (menos o código do trampolim), das arenas
-  do PFN e do MMIO; com ela a suíte inteira passa, então nenhum acesso por
-  endereço físico usa a identidade.
+  a identidade baixa do primeiro MB (menos o código do trampolim), da faixa
+  sem uso de 16 MB a 32 MB, dos frames do heap e da arena, das arenas do PFN
+  e do MMIO; com ela a suíte inteira passa, então nenhum acesso por endereço
+  físico nem nenhum ponteiro do heap ou da arena usa a identidade.
+
+**Heap do kernel e arena dos convidados.** Os frames de 32 MB a 96 MB (fora
+do PFN) aparecem só na janela do heap, `KERNEL_HEAP_BASE + (PA - 32 MB)`, o
+papel do pool não paginado inicial do NT: páginas de 2 MB de supervisor, RW e
+executáveis (o pool não paginado comum do NT executa, e a arena guarda
+pequenas rotinas de conclusão geradas em tempo de execução).
+`paging::map_kernel_heap_window` monta a janela no boot, antes da primeira
+alocação, com a PDPT e a PD fixas em 0x7B000-0x7CFFF. O `kmalloc` (e com ele
+todo `Box`/`Vec` do kernel) e a arena de 16 MB reservada dele devolvem VAs
+dessa janela: toda IRP, DEVICE_OBJECT, MDL, pool do ExAllocatePool2 e
+estrutura NT que um driver recebe fica acima de MmSystemRangeStart, como os
+drivers reais esperam ao comparar ponteiros com MmUserProbeAddress. Os
+cabeçalhos são lidos e gravados pela VA; os links da arena são offsets a
+partir da base dela. Quem precisa do endereço físico de um bloco (a tabela
+PRD e o buffer de passagem do DMA ATA) traduz pelas tabelas de páginas. Os 32
+bits baixos da base caem no buraco de MMIO acima de 3 GB, então um ponteiro
+truncado para 32 bits falta em vez de cair na imagem do kernel. O teste
+`ntos/test/system_allocations.rs`, no fim da fase 6, confere a arena, o heap,
+o pool, IRPs, MDLs e os DRIVER_OBJECTs/DEVICE_OBJECTs vivos, inclusive os dos
+drivers reais.
 
 **Imagens.**
 
@@ -251,10 +272,8 @@ no kernel. A regra:
   na próxima faixa livre), também sobre frames do PFN.
 
 A identidade baixa ainda existe nesta etapa para o que é endereçado como VA
-abaixo de 4 GB: a imagem do kernel (ligada em 0x101000), a pilha de boot, o
-heap do kernel e a arena dos convidados (as alocações ainda devolvem a VA de
-identidade, igual ao físico), a janela do VirtualAlloc
-de kernel e o código do trampolim dos APs.
+abaixo de 4 GB: a imagem do kernel (ligada em 0x101000), a pilha de boot, a
+janela do VirtualAlloc de kernel e o código do trampolim dos APs.
 
 ## 4. Dependências
 

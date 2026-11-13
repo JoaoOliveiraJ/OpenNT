@@ -4,10 +4,10 @@
 //! Arena de 16MB reservada do heap do kernel no boot; blocos livres
 //! separados por tamanho, com split e coalescência. Header de bloco (16B):
 //! +0 size, +4 previous, +8 next, +12 free (u32). Os links das listas livres
-//! ocupam os primeiros 8 bytes do payload livre. Os links são endereços
-//! físicos de 32 bits e os cabeçalhos são lidos e gravados pelo mapa direto
-//! (`hal::physical`); o endereço entregue ao chamador ainda é o da
-//! identidade baixa, igual ao físico.
+//! ocupam os primeiros 8 bytes do payload livre. Como o heap, a arena mora na
+//! janela do heap da metade de sistema (`KERNEL_HEAP_BASE`): toda alocação é
+//! uma VA >= MmSystemRangeStart, os cabeçalhos são lidos e gravados por essa
+//! VA e os links são offsets a partir da base da arena.
 //!
 //! # O mapa de memória que o acesso pressupõe (conferido no código)
 //!
@@ -19,18 +19,17 @@
 //!   remapeada para frames do PFN) é desreferenciável direto.
 //! - **Proteção.** CR0.WP=1 em todas as CPUs (escritas de supervisor
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
-//! - **Abaixo de 4GB** o stage2 mapeia identidade com páginas de 2MB RW de
-//!   supervisor; a arena dos convidados e o heap do kernel ficam ali e não
-//!   são pagináveis. A mesma faixa física aparece no mapa direto
-//!   (`DIRECT_MAP_BASE + PA`, supervisor e NX): todo acesso por endereço
-//!   físico (cabeçalhos desta arena, PTEs, descritores de PFN, células de
-//!   baixo nível) passa por ele, nunca pela identidade. VA == PA só onde
-//!   ninguém remapeou: as janelas de usuário podem ser remapeadas ou
-//!   desmapeadas.
-//! - **Acima de 4GB** (imagens de usuário, imagens de kernel na janela de
-//!   sistema 0xFFFFF801..., pool executivo
-//!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
-//!   memória contígua/independente e o alias RW da imagem do kernel em
+//! - **Abaixo de 4GB** o stage2 ainda mapeia identidade com páginas de 2MB
+//!   RW de supervisor, usada só pela imagem do kernel, pela pilha de boot,
+//!   pela janela do VirtualAlloc de kernel e pelo código do trampolim dos
+//!   APs. A mesma faixa física aparece no mapa direto (`DIRECT_MAP_BASE + PA`,
+//!   supervisor e NX): todo acesso por endereço físico (PTEs, descritores de
+//!   PFN, células de baixo nível) passa por ele, nunca pela identidade.
+//! - **Acima de 4GB** (heap do kernel e esta arena na janela do heap
+//!   0xFFFFC000..., não pagináveis; imagens de usuário, imagens de kernel na
+//!   janela de sistema 0xFFFFF801..., pool executivo 0xFFFFA000..., PCR
+//!   0xFFFFF800..., banco de PFNs, visões de sistema, memória
+//!   contígua/independente e o alias RW da imagem do kernel em
 //!   `KERNEL_VIRTUAL_BASE`) tudo está nas mesmas tabelas de páginas.
 //! - **Páginas pagináveis** (imagens de drivers, pool paginado, visões de
 //!   seção de sistema, cópia na escrita de seções) têm PTE ausente quando
@@ -68,7 +67,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::hal::{host, physical, volatile};
+use crate::hal::{host, volatile};
 use crate::ntos::mm::{page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -90,7 +89,8 @@ struct GuestHeap {
     arena_base: u64,
     ready: bool,
     allocations: BTreeSet<u64>,
-    free_bins: [u32; 25],
+    /// Primeiro bloco livre de cada classe (VA; 0 = vazia).
+    free_bins: [u64; 25],
 }
 
 static HEAP: SpinLock<GuestHeap> =
@@ -438,91 +438,135 @@ pub fn compare_exchange128(
 }
 
 // ---- heap da arena ---------------------------------------------------------
+//
+// Cabeçalho de bloco (16 bytes, pela VA da arena): +0 size, +4 previous,
+// +8 next, +12 free (u32). previous/next (vizinhos de endereço) e os links
+// das listas livres, nos primeiros 8 bytes do payload livre (+16 next,
+// +20 previous), são offsets a partir da base da arena: a arena tem 16 MB e
+// mora na janela do heap, acima de 4 GB. Os primeiros 16 bytes da arena nunca
+// são bloco, então o offset 0 quer dizer "nenhum".
 
-fn block_size(address: u64) -> u32 {
-    physical::read32(address)
-}
-fn block_next(address: u64) -> u32 {
-    physical::read32(address + 8)
-}
-fn block_free(address: u64) -> u32 {
-    physical::read32(address + 12)
-}
+/// Offset do primeiro bloco: o link 0 fica livre para "nenhum".
+const FIRST_BLOCK: u64 = 16;
 
-fn write_block(address: u64, size: u32, next: u32, free: u32, previous: Option<u32>) {
-    physical::write32(address, size);
-    if let Some(previous) = previous {
-        physical::write32(address + 4, previous);
-    }
-    physical::write32(address + 8, next);
-    physical::write32(address + 12, free);
-}
-
-fn free_bin(size: u32) -> usize {
-    (31 - size.leading_zeros()) as usize
+fn free_bin(size: u64) -> usize {
+    (63 - size.leading_zeros()) as usize
 }
 
 impl GuestHeap {
-    fn insert_free(&mut self, block: u32) {
-        let bin = free_bin(block_size(block as u64));
+    fn address(&self, link: u32) -> u64 {
+        if link == 0 { 0 } else { self.arena_base + link as u64 }
+    }
+
+    fn link(&self, address: u64) -> u32 {
+        if address == 0 { 0 } else { (address - self.arena_base) as u32 }
+    }
+
+    fn size(&self, block: u64) -> u64 {
+        volatile::read32(block) as u64
+    }
+
+    fn previous(&self, block: u64) -> u64 {
+        self.address(volatile::read32(block + 4))
+    }
+
+    fn next(&self, block: u64) -> u64 {
+        self.address(volatile::read32(block + 8))
+    }
+
+    fn is_free(&self, block: u64) -> bool {
+        volatile::read32(block + 12) != 0
+    }
+
+    fn set_previous(&self, block: u64, previous: u64) {
+        volatile::write32(block + 4, self.link(previous));
+    }
+
+    fn write_block(&self, block: u64, size: u64, next: u64, free: bool, previous: Option<u64>) {
+        volatile::write32(block, size as u32);
+        if let Some(previous) = previous {
+            self.set_previous(block, previous);
+        }
+        volatile::write32(block + 8, self.link(next));
+        volatile::write32(block + 12, free as u32);
+    }
+
+    fn free_next(&self, block: u64) -> u64 {
+        self.address(volatile::read32(block + 16))
+    }
+
+    fn free_previous(&self, block: u64) -> u64 {
+        self.address(volatile::read32(block + 20))
+    }
+
+    fn set_free_next(&self, block: u64, next: u64) {
+        volatile::write32(block + 16, self.link(next));
+    }
+
+    fn set_free_previous(&self, block: u64, previous: u64) {
+        volatile::write32(block + 20, self.link(previous));
+    }
+
+    fn insert_free(&mut self, block: u64) {
+        let bin = free_bin(self.size(block));
         let next = self.free_bins[bin];
-        physical::write32(block as u64 + 16, next);
-        physical::write32(block as u64 + 20, 0);
+        self.set_free_next(block, next);
+        self.set_free_previous(block, 0);
         if next != 0 {
-            physical::write32(next as u64 + 20, block);
+            self.set_free_previous(next, block);
         }
         self.free_bins[bin] = block;
     }
 
-    fn remove_free(&mut self, block: u32) {
-        let next = physical::read32(block as u64 + 16);
-        let previous = physical::read32(block as u64 + 20);
+    fn remove_free(&mut self, block: u64) {
+        let next = self.free_next(block);
+        let previous = self.free_previous(block);
         if previous != 0 {
-            physical::write32(previous as u64 + 16, next);
+            self.set_free_next(previous, next);
         } else {
-            self.free_bins[free_bin(block_size(block as u64))] = next;
+            self.free_bins[free_bin(self.size(block))] = next;
         }
         if next != 0 {
-            physical::write32(next as u64 + 20, previous);
+            self.set_free_previous(next, previous);
         }
     }
 
     fn init(&mut self) {
         self.arena_base = host::guest_arena();
-        write_block(self.arena_base, (ARENA_SIZE - BLOCK_HEADER_SIZE) as u32, 0, 1, Some(0));
-        self.insert_free(self.arena_base as u32);
+        let first = self.arena_base + FIRST_BLOCK;
+        self.write_block(first, ARENA_SIZE - FIRST_BLOCK - BLOCK_HEADER_SIZE, 0, true, Some(0));
+        self.insert_free(first);
         self.ready = true;
     }
 
     fn allocate_aligned(&mut self, size: u64, align: u64, zero: bool) -> u64 {
-        if size == 0 || size > ARENA_SIZE - BLOCK_HEADER_SIZE {
+        if size == 0 || size > ARENA_SIZE - FIRST_BLOCK - BLOCK_HEADER_SIZE {
             return 0;
         }
         let size = size.div_ceil(16) * 16;
         if !self.ready {
             self.init();
         }
-        for bin in free_bin(size as u32)..self.free_bins.len() {
+        for bin in free_bin(size)..self.free_bins.len() {
             let mut block = self.free_bins[bin];
             while block != 0 {
-                let block_address = block as u64;
-                let next = block_next(block_address) as u64;
-                let corrupt = block_address < self.arena_base
-                    || block_address + 16 > self.arena_base + ARENA_SIZE
-                    || (next != 0 && (next != block_address + 16 + block_size(block_address) as u64 || next <= block_address));
-                assert!(!corrupt, "Guest heap header corrupt at {block_address:#x}, next={next:#x}");
-                let following = physical::read32(block_address + 16);
-                if block_free(block_address) != 0 {
-                    let data_start = block_address + BLOCK_HEADER_SIZE;
+                let next = self.next(block);
+                let corrupt = block < self.arena_base + FIRST_BLOCK
+                    || block + BLOCK_HEADER_SIZE > self.arena_base + ARENA_SIZE
+                    || (next != 0 && (next != block + BLOCK_HEADER_SIZE + self.size(block) || next <= block));
+                assert!(!corrupt, "Guest heap header corrupt at {block:#x}, next={next:#x}");
+                let following = self.free_next(block);
+                if self.is_free(block) {
+                    let data_start = block + BLOCK_HEADER_SIZE;
                     let mut aligned = (data_start + align - 1) & !(align - 1);
                     let mut padding = aligned - data_start;
                     while padding > 0 && padding < BLOCK_HEADER_SIZE + 16 {
                         aligned += align;
                         padding += align;
                     }
-                    let available = block_size(block_address) as u64;
+                    let available = self.size(block);
                     if available >= padding + size {
-                        return self.carve(block_address, aligned, padding, available, size, zero);
+                        return self.carve(block, aligned, padding, available, size, zero);
                     }
                 }
                 block = following;
@@ -533,33 +577,33 @@ impl GuestHeap {
 
     fn carve(&mut self, block_address: u64, aligned: u64, padding: u64, available: u64, size: u64, zero: bool) -> u64 {
         let mut block = block_address;
-        let old_next = block_next(block);
-        self.remove_free(block as u32);
+        let old_next = self.next(block);
+        self.remove_free(block);
         if padding >= BLOCK_HEADER_SIZE + 16 {
             let header = aligned - BLOCK_HEADER_SIZE;
-            write_block(block, (padding - BLOCK_HEADER_SIZE) as u32, header as u32, 1, None);
-            write_block(header, (available - padding) as u32, old_next, 1, Some(block as u32));
+            self.write_block(block, padding - BLOCK_HEADER_SIZE, header, true, None);
+            self.write_block(header, available - padding, old_next, true, Some(block));
             if old_next != 0 {
-                physical::write32(old_next as u64 + 4, header as u32);
+                self.set_previous(old_next, header);
             }
-            self.insert_free(block as u32);
+            self.insert_free(block);
             block = header;
         }
-        let remaining = block_size(block) as u64 - size;
+        let remaining = self.size(block) - size;
         if remaining >= BLOCK_HEADER_SIZE + 16 {
             let next_block = block + BLOCK_HEADER_SIZE + size;
-            write_block(next_block, (remaining - BLOCK_HEADER_SIZE) as u32, block_next(block), 1, Some(block as u32));
+            self.write_block(next_block, remaining - BLOCK_HEADER_SIZE, self.next(block), true, Some(block));
             if old_next != 0 {
-                physical::write32(old_next as u64 + 4, next_block as u32);
+                self.set_previous(old_next, next_block);
             }
-            write_block(block, size as u32, next_block as u32, 0, None);
-            self.insert_free(next_block as u32);
+            self.write_block(block, size, next_block, false, None);
+            self.insert_free(next_block);
         } else {
-            write_block(block, block_size(block), block_next(block), 0, None);
+            self.write_block(block, self.size(block), self.next(block), false, None);
         }
         if zero {
-            // Arena física contígua e não paginável: limpa só o payload.
-            physical::zero(block + BLOCK_HEADER_SIZE, size as usize);
+            // Arena residente e não paginável: limpa só o payload.
+            volatile::zero(block + BLOCK_HEADER_SIZE, size as usize);
         }
         self.allocations.insert(block + BLOCK_HEADER_SIZE);
         block + BLOCK_HEADER_SIZE
@@ -571,28 +615,33 @@ impl GuestHeap {
         }
         assert!(self.allocations.remove(&pointer), "Invalid guest pool free at {pointer:#x}");
         let mut block = pointer - BLOCK_HEADER_SIZE;
-        physical::write32(block + 12, 1);
-        let previous = physical::read32(block + 4) as u64;
-        if previous != 0 && block_free(previous) != 0 {
-            self.remove_free(previous as u32);
-            let merged = block_size(previous) + BLOCK_HEADER_SIZE as u32 + block_size(block);
-            write_block(previous, merged, block_next(block), 1, None);
-            if block_next(block) != 0 {
-                physical::write32(block_next(block) as u64 + 4, previous as u32);
+        volatile::write32(block + 12, 1);
+        let previous = self.previous(block);
+        if previous != 0 && self.is_free(previous) {
+            self.remove_free(previous);
+            let merged = self.size(previous) + BLOCK_HEADER_SIZE + self.size(block);
+            self.write_block(previous, merged, self.next(block), true, None);
+            if self.next(block) != 0 {
+                self.set_previous(self.next(block), previous);
             }
             block = previous;
         }
-        let mut next = block_next(block) as u64;
-        while next != 0 && block_free(next) != 0 && block + BLOCK_HEADER_SIZE + block_size(block) as u64 == next {
-            self.remove_free(next as u32);
-            let merged = block_size(block) + BLOCK_HEADER_SIZE as u32 + block_size(next);
-            write_block(block, merged, block_next(next), 1, None);
-            next = block_next(block) as u64;
+        let mut next = self.next(block);
+        while next != 0 && self.is_free(next) && block + BLOCK_HEADER_SIZE + self.size(block) == next {
+            self.remove_free(next);
+            let merged = self.size(block) + BLOCK_HEADER_SIZE + self.size(next);
+            self.write_block(block, merged, self.next(next), true, None);
+            next = self.next(block);
             if next != 0 {
-                physical::write32(next + 4, block as u32);
+                self.set_previous(next, block);
             }
         }
-        self.insert_free(block as u32);
+        self.insert_free(block);
+    }
+
+    /// A VA cai dentro da arena (alocada ou não).
+    fn contains(&self, address: u64) -> bool {
+        self.ready && address >= self.arena_base && address < self.arena_base + ARENA_SIZE
     }
 }
 
@@ -606,8 +655,9 @@ fn with_pool_lock<T>(body: impl FnOnce() -> T) -> T {
     result
 }
 
-/// `size` bytes alinhados a `align`; endereço físico ou 0. `zero=false`
-/// devolve o conteúdo antigo (ExAllocatePoolUninitialized).
+/// `size` bytes alinhados a `align`: VA da arena (na janela do heap, acima
+/// de MmSystemRangeStart) ou 0. `zero=false` devolve o conteúdo antigo
+/// (ExAllocatePoolUninitialized).
 pub fn alloc_aligned(size: u64, align: u64, zero: bool) -> u64 {
     with_pool_lock(|| HEAP.lock().allocate_aligned(size, align, zero))
 }
@@ -630,4 +680,9 @@ pub fn free_bytes(pointer: u64) {
 
 pub fn owns_allocation(pointer: u64) -> bool {
     HEAP.lock().allocations.contains(&pointer)
+}
+
+/// A VA cai dentro da arena dos convidados (alocada ou não).
+pub fn in_arena(address: u64) -> bool {
+    HEAP.lock().contains(address)
 }

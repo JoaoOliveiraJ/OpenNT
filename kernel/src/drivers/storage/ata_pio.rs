@@ -17,11 +17,12 @@
 
 use alloc::vec::Vec;
 
-use crate::hal::{cpu, physical, port};
+use crate::hal::{cpu, port, volatile};
 use crate::hal::pci_config;
 use crate::ntos::ke::clock;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::paging;
 
 const ATA_DATA: u16 = 0x1F0;
 const ATA_SECTORS: u16 = 0x1F2;
@@ -66,16 +67,31 @@ const BM_TO_MEMORY: u8 = 0x08;
 const BM_STATUS_ERROR: u8 = 0x02;
 const BM_STATUS_INTERRUPT: u8 = 0x04;
 
+/// Uma região da arena (VA na janela do heap) e o endereço físico que o
+/// controlador recebe. A arena é fisicamente contígua.
+#[derive(Clone, Copy)]
+struct DmaBuffer {
+    address: u64,
+    physical: u64,
+}
+
 /// Estado do canal primário; só se mexe com o lock do canal.
 struct Channel {
     /// BAR4 do controlador IDE (registradores de bus master); 0 = ainda não ligado.
     bmide_base: u16,
-    prd_table: u64,
-    bounce: u64,
+    prd_table: DmaBuffer,
+    bounce: DmaBuffer,
     read_log_count: u32,
 }
 
-static CHANNEL: SpinLock<Channel> = SpinLock::new(Channel { bmide_base: 0, prd_table: 0, bounce: 0, read_log_count: 0 });
+const NO_BUFFER: DmaBuffer = DmaBuffer { address: 0, physical: 0 };
+
+static CHANNEL: SpinLock<Channel> = SpinLock::new(Channel { bmide_base: 0, prd_table: NO_BUFFER, bounce: NO_BUFFER, read_log_count: 0 });
+
+/// Bloco da arena para DMA: a VA e a tradução real pelas tabelas de páginas.
+fn dma_buffer(address: u64) -> DmaBuffer {
+    DmaBuffer { address, physical: paging::translate(address) }
+}
 
 fn error(message: &str) -> KernelError {
     KernelError::new(message)
@@ -85,7 +101,7 @@ impl Channel {
     /// Liga I/O decode e bus master e lê o BAR4 na primeira transferência;
     /// a tabela PRD ocupa uma página alinhada (a BMIDE exige endereço físico
     /// alinhado).
-    fn bus_master(&mut self) -> Result<(u16, u64), KernelError> {
+    fn bus_master(&mut self) -> Result<(u16, DmaBuffer), KernelError> {
         if self.bmide_base == 0 {
             pci_config::enable_command(IDE_BUS, IDE_DEVICE, IDE_FUNCTION, PCI_COMMAND_BUS_MASTER | PCI_COMMAND_IO_SPACE)?;
             let base = (pci_config::read(IDE_BUS, IDE_DEVICE, IDE_FUNCTION, 0x20, 4)? & 0xFFFC) as u16;
@@ -93,19 +109,21 @@ impl Channel {
             if table == 0 {
                 return Err(error("ATA DMA: sem memoria para a tabela PRD"));
             }
-            debug_print!("[atapio] BMIDE em {:#x} (bus master ligado; PRD em {:#x})", base, table);
+            let table = dma_buffer(table);
+            debug_print!("[atapio] BMIDE em {:#x} (bus master ligado; PRD em {:#x}, fisico {:#x})", base, table.address, table.physical);
             self.bmide_base = base;
             self.prd_table = table;
         }
         Ok((self.bmide_base, self.prd_table))
     }
 
-    fn bounce(&mut self) -> Result<u64, KernelError> {
-        if self.bounce == 0 {
-            self.bounce = guest::alloc_bytes(READ_BOUNCE_SECTORS as u64 * 512);
-            if self.bounce == 0 {
+    fn bounce(&mut self) -> Result<DmaBuffer, KernelError> {
+        if self.bounce.address == 0 {
+            let bounce = guest::alloc_bytes(READ_BOUNCE_SECTORS as u64 * 512);
+            if bounce == 0 {
                 return Err(error("ATA DMA: sem memoria para transferencia"));
             }
+            self.bounce = dma_buffer(bounce);
         }
         Ok(self.bounce)
     }
@@ -129,16 +147,16 @@ impl Channel {
             let mut remaining = chunk as u64 * 512;
             while remaining > 0 {
                 let length = remaining.min(0x10000 - (region & 0xFFFF));
-                let prd = table + entries * 8;
-                physical::write32(prd, region as u32);
-                physical::write16(prd + 4, (length & 0xFFFF) as u16);
-                physical::write16(prd + 6, if remaining <= length { 0x8000 } else { 0 });
+                let prd = table.address + entries * 8;
+                guest::write32(prd, region as u32);
+                guest::write16(prd + 4, (length & 0xFFFF) as u16);
+                guest::write16(prd + 6, if remaining <= length { 0x8000 } else { 0 });
                 entries += 1;
                 region += length;
                 remaining -= length;
             }
             select_drive(lba + done as u64, drive)?;
-            port::write32(bmide + BM_PRD, table as u32);
+            port::write32(bmide + BM_PRD, table.physical as u32);
             let direction = if write { 0 } else { BM_TO_MEMORY };
             port::write8(bmide + BM_COMMAND, direction);
             port::write8(bmide + BM_STATUS, port::read8(bmide + BM_STATUS) | BM_STATUS_ERROR | BM_STATUS_INTERRUPT);
@@ -279,8 +297,8 @@ pub fn read_sectors(lba: u64, count: u32, drive: u8) -> Result<Vec<u8>, KernelEr
         // O buffer de passagem é do canal: o DMA e a cópia sob o mesmo lock.
         let mut channel = CHANNEL.lock();
         let bounce = channel.bounce()?;
-        channel.transfer_dma(lba + done as u64, chunk, drive, bounce, false)?;
-        out.extend_from_slice(&physical::read_bytes(bounce, chunk as usize * 512));
+        channel.transfer_dma(lba + done as u64, chunk, drive, bounce.physical, false)?;
+        out.extend_from_slice(&volatile::read_bytes(bounce.address, chunk as usize * 512));
         drop(channel);
         done += chunk;
     }
@@ -328,8 +346,8 @@ pub fn write_sectors(lba: u64, bytes: &[u8], drive: u8) -> Result<(), KernelErro
         let chunk = READ_BOUNCE_SECTORS.min(count - done);
         let mut channel = CHANNEL.lock();
         let bounce = channel.bounce()?;
-        physical::write_bytes(bounce, &bytes[done as usize * 512..(done + chunk) as usize * 512]);
-        channel.transfer_dma(lba + done as u64, chunk, drive, bounce, true)?;
+        volatile::write_bytes(bounce.address, &bytes[done as usize * 512..(done + chunk) as usize * 512]);
+        channel.transfer_dma(lba + done as u64, chunk, drive, bounce.physical, true)?;
         drop(channel);
         done += chunk;
     }

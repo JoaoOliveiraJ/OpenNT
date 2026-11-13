@@ -306,8 +306,8 @@ pub fn can_map_range(physical_address: u64, byte_length: u64) -> bool {
     true
 }
 
-/// ShareCount conta PTEs reais; a identidade do boot e o mapa direto não são
-/// donos.
+/// ShareCount conta PTEs reais; a identidade do boot, o mapa direto e a
+/// janela do heap não são donos.
 pub fn add_reference(frame_number: u64, reference: Reference) {
     let mut state = STATE.lock();
     let address = state.existing_address(frame_number);

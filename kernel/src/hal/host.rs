@@ -15,7 +15,8 @@ pub const GUEST_ARENA_SIZE: usize = 16 << 20;
 pub fn init() {
     serial::init();
     kmalloc::init();
-    // A arena fica dentro do heap do kernel, que começa em 32 MB.
+    // A arena fica dentro do heap do kernel: VA da janela do heap, na metade
+    // de sistema.
     let arena = kmalloc::kmalloc(GUEST_ARENA_SIZE);
     if arena.is_null() {
         panic!("arena de convidado falhou");
@@ -23,7 +24,7 @@ pub fn init() {
     GUEST_ARENA_BASE.store(arena as u64, Ordering::Relaxed);
 }
 
-/// Base da arena de convidados.
+/// Base da arena de convidados (VA da janela do heap).
 pub fn guest_arena() -> u64 {
     GUEST_ARENA_BASE.load(Ordering::Relaxed)
 }

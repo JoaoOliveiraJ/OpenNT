@@ -4,8 +4,9 @@
 //! inclusive para frames que são, eles próprios, tabelas de páginas.
 //!
 //! Os aliases físicos do kernel não são donos de frame e ficam de fora: a
-//! identidade baixa (VA == PA) e o slot inteiro do mapa direto
-//! (`DIRECT_MAP_PML4_INDEX`), cujas tabelas nem são acompanhadas.
+//! identidade baixa (VA == PA) e os slots inteiros do mapa direto
+//! (`DIRECT_MAP_PML4_INDEX`) e da janela do heap (`KERNEL_HEAP_PML4_INDEX`),
+//! cujas tabelas nem são acompanhadas.
 
 use alloc::collections::BTreeMap;
 
@@ -150,7 +151,7 @@ impl Tracker {
             let table = &self.tables[&table_pa];
             (table.level, table.prefix)
         };
-        if level == 4 && index == map::DIRECT_MAP_PML4_INDEX {
+        if level == 4 && (index == map::DIRECT_MAP_PML4_INDEX || index == map::KERNEL_HEAP_PML4_INDEX) {
             return;
         }
         let shift = 12 + (level - 1) * 9;

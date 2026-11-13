@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{paging, pfn};
+use super::{memory_map, paging, pfn};
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::Mdl;
 use crate::ntos::mm::guest_memory as guest;
@@ -91,32 +91,45 @@ pub fn build_for_non_paged_pool(descriptor: u64) {
     set_flags(descriptor, MDL_SOURCE_IS_NONPAGED_POOL | MDL_PAGES_LOCKED, 0);
 }
 
-/// MmAllocateMappingAddress — VA reservada, alinhada à página e fora do
-/// alcance de outras alocações; 0 sem memória.
+/// MmAllocateMappingAddress — VA reservada em páginas inteiras da arena
+/// (janela do heap), alinhada à página e fora do alcance de outras
+/// alocações; 0 sem memória.
 pub fn allocate_mapping_address(size: u64, tag: u32) -> u64 {
-    let address = guest::alloc_aligned(size, 0x1000, true);
+    let bytes = (size as u32 as u64).div_ceil(0x1000) * 0x1000;
+    let address = guest::alloc_aligned(bytes, 0x1000, true);
     if address == 0 {
         return 0;
     }
-    RESERVED_MAPPINGS.lock().insert(address, (size as u32 as u64, tag));
+    RESERVED_MAPPINGS.lock().insert(address, (bytes, tag));
     address
 }
 
-/// MmFreeMappingAddress.
+/// MmFreeMappingAddress — a faixa volta à arena com as páginas da janela do
+/// heap republicadas sobre os frames dela (um mapeamento reservado as trocou
+/// pelas do MDL, e MmUnmapReservedMapping as deixou ausentes).
 pub fn free_mapping_address(address: u64) {
-    RESERVED_MAPPINGS.lock().remove(&address);
+    if let Some((bytes, _)) = RESERVED_MAPPINGS.lock().remove(&address) {
+        for page in (address..address + bytes).step_by(0x1000) {
+            let frame = memory_map::kernel_heap_physical(page);
+            if memory_map::is_kernel_heap(page) && paging::translate(page) != frame {
+                paging::map_page(page, frame, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default());
+            }
+        }
+    }
     guest::free_bytes(address);
 }
 
 /// MmMapLockedPagesWithReservedMapping — exige a VA reservada e remapeia as
 /// páginas dela para as do MDL; 0 em falha.
 pub fn map_locked_pages_with_reserved_mapping(address: u64, descriptor: u64) -> u64 {
-    if !RESERVED_MAPPINGS.lock().contains_key(&address) {
-        return 0;
-    }
+    let Some((reserved, _)) = RESERVED_MAPPINGS.lock().get(&address).copied() else { return 0 };
     let descriptor = mdl(descriptor);
     let count = descriptor.byte_count.get() as u64;
     let offset = descriptor.byte_offset.get() as u64;
+    // Só as páginas da reserva: as seguintes pertencem a outros blocos da arena.
+    if (offset + count).div_ceil(0x1000) * 0x1000 > reserved {
+        return 0;
+    }
     for (index, frame) in pfn_array(descriptor, (offset + count).div_ceil(0x1000)).iter().enumerate() {
         if !paging::map_page(address + index as u64 * 0x1000, frame.get() * 0x1000, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default()) {
             return 0;

@@ -397,7 +397,7 @@ fn ntoskrnl_exports(assert: Assert) {
 }
 
 /// Chama um export pelo seu trampolim (como um driver chamaria pela IAT).
-fn call_export(name: &str, arguments: &[u64]) -> Option<u64> {
+pub(super) fn call_export(name: &str, arguments: &[u64]) -> Option<u64> {
     use crate::hal::amd64::{native_call, win32_thunk};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::ResolvedImport;
@@ -1088,8 +1088,10 @@ fn ntoskrnl_small_modules(assert: Assert) {
     let mdl_header = at::<nt::Mdl>(mdl);
     assert(call_export("MmProtectMdlSystemAddress", &[mdl, 2]) == Some(0xC000_0019), "protectmdl: MDL sem mapeamento de sistema");
     let va = 0xFFFF_F800_0300_0000u64;
-    let backing = guest::alloc_page();
-    let mapped = paging::map_page(va, backing, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default());
+    // Frame de uma página da arena (VA na janela do heap), mapeado de novo em `va`.
+    let page = guest::alloc_page();
+    let backing = paging::translate(page);
+    let mapped = backing != 0 && paging::map_page(va, backing, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default());
     mdl_header.mdl_flags.set(1);
     mdl_header.mapped_system_va.set(va + 0x10);
     mdl_header.byte_count.set(0x100);
@@ -1104,7 +1106,7 @@ fn ntoskrnl_small_modules(assert: Assert) {
     assert(noaccess == Some(0) && noaccess_entry & 1 == 0 && noaccess_entry & 0x800 != 0 && noaccess_entry & 0xF_FFFF_FFFF_F000 == backing, "protectmdl: PAGE_NOACCESS conserva o PFN com o bit de software");
     assert(readwrite_execute == Some(0) && rwx_entry & 3 == 3 && rwx_entry & (1 << 63) == 0 && call_export("MmProtectMdlSystemAddress", &[mdl, 3]) == Some(0xC000_0045), "protectmdl: PAGE_EXECUTE_READWRITE e protecao invalida");
     paging::unmap_page(va, paging::MapOptions::default());
-    guest::free_bytes(backing);
+    guest::free_bytes(page);
     guest::free_bytes(mdl);
 }
 
@@ -11274,6 +11276,7 @@ pub fn run(assert: Assert) {
     vf_device_verification_exports(assert);
     vsl_secure_pci_exports(assert);
     whea_error_source_exports(assert);
+    super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }

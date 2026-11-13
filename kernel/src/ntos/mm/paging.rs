@@ -99,10 +99,31 @@ fn table_of(entry: u64) -> u64 {
     frame
 }
 
-/// A folha é um alias físico do kernel (identidade baixa ou mapa direto),
-/// não um dono do frame.
+/// A folha é um alias físico do kernel (identidade baixa, mapa direto ou
+/// janela do heap), não um dono do frame.
 fn physical_alias(va: u64, pa: u64) -> bool {
-    va == pa || va == map::direct_map(pa)
+    va == pa
+        || va == map::direct_map(pa)
+        || ((map::KERNEL_HEAP_PHYS_BASE..map::KERNEL_HEAP_PHYS_TOP).contains(&pa) && va == map::kernel_heap_virtual(pa))
+}
+
+/// Monta a janela do heap do kernel (`KERNEL_HEAP_BASE..TOP`): os frames do
+/// heap em páginas de 2 MB de supervisor, RW e executáveis, com a PDPT e a
+/// PD fixas de `memory_map`. Roda uma vez no boot, antes da primeira
+/// alocação (o heap ainda não existe e o rastreador de frames não foi
+/// instalado); a entrada da PML4 é a mesma para todas as CPUs.
+pub fn map_kernel_heap_window() {
+    let (pdpt, pd) = (map::KERNEL_HEAP_PDPT_PHYS, map::KERNEL_HEAP_PD_PHYS);
+    physical::zero(pdpt, 4096);
+    physical::zero(pd, 4096);
+    let pages = (map::KERNEL_HEAP_PHYS_TOP - map::KERNEL_HEAP_PHYS_BASE) / map::LARGE_PAGE_SIZE;
+    for index in 0..pages {
+        let frame = map::KERNEL_HEAP_PHYS_BASE + index * map::LARGE_PAGE_SIZE;
+        write_entry(pd + (pd_index(map::KERNEL_HEAP_BASE) + index) * 8, frame | PAGE_PRESENT | PAGE_RW | PAGE_PS, false);
+    }
+    write_entry(pdpt + pdpt_index(map::KERNEL_HEAP_BASE) * 8, pd | PAGE_PRESENT | PAGE_RW, false);
+    write_entry(PML4 + map::KERNEL_HEAP_PML4_INDEX * 8, pdpt | PAGE_PRESENT | PAGE_RW, false);
+    cpu::reload_cr3();
 }
 
 pub fn pml4_index(va: u64) -> u64 {

@@ -212,7 +212,7 @@ fn io_manager_native(assert: Assert) {
     let top = builder::first_stack_location(packet, 2);
     let irp = unsafe { Irp::at(packet) };
     let top_slot = unsafe { IoStackLocation::at(top) };
-    assert(packet < 0x1_0000_0000 && iom::iof_call_driver(upper, packet) == 0 && seen(0) == upper && irp.current_location.get() == 2 && irp.tail.overlay.current_stack_location.get() == top && top_slot.device_object.get() == upper, "iom: IofCallDriver desce um nivel");
+    assert(crate::ntos::mm::memory_map::is_kernel_heap(packet) && iom::iof_call_driver(upper, packet) == 0 && seen(0) == upper && irp.current_location.get() == 2 && irp.tail.overlay.current_stack_location.get() == top && top_slot.device_object.get() == upper, "iom: IofCallDriver desce um nivel");
     // O driver superior pede conclusão no slot inferior (IoSetCompletionRoutine).
     let bottom = top - IoStackLocation::SIZE;
     let bottom_slot = unsafe { IoStackLocation::at(bottom) };
@@ -516,8 +516,10 @@ fn ntfs_reader(assert: Assert) {
     let overlaid = volume.read_sectors(0, 2).unwrap_or_default();
     volume.pending.lock().clear();
     assert(overlaid.len() == 1024 && overlaid[..512].iter().all(|&byte| byte == 0) && volume.read_sectors(0, 1).is_ok_and(|boot| &boot[3..11] == b"NTFS    "), "ntfs: escrita pendente sobreposta e removida");
+    // O destino é o endereço físico do bloco da arena (VA na janela do heap).
     let destination = guest::alloc_bytes(64);
-    assert(volume.copy_range_to_physical("/HELLO.TXT", 0, destination, 24).is_ok() && guest::read_bytes(destination, 24) == b"Ola do NTFS no OpenNT!\r\n" && volume.copy_range_to_physical("/HELLO.TXT", 20, destination, 8).is_err(), "ntfs: copia para memoria fisica e faixa invalida");
+    let physical = crate::ntos::mm::paging::translate(destination);
+    assert(physical != 0 && volume.copy_range_to_physical("/HELLO.TXT", 0, physical, 24).is_ok() && guest::read_bytes(destination, 24) == b"Ola do NTFS no OpenNT!\r\n" && volume.copy_range_to_physical("/HELLO.TXT", 20, physical, 8).is_err(), "ntfs: copia para memoria fisica e faixa invalida");
     guest::free_bytes(destination);
     let generation = volume.generation();
     volume.changed();
