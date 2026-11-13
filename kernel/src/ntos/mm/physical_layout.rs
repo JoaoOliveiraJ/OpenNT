@@ -84,3 +84,14 @@ pub fn contains_ram_range(physical_address: u64, byte_count: u64) -> bool {
     let Some(end) = physical_address.checked_add(byte_count) else { return false };
     ranges.iter().any(|&(base, top)| physical_address >= base && end <= top)
 }
+
+// ---- Mm64BitPhysicalAddress (mm-physical-memory) ----------------------------
+//
+// BOOLEAN exportado: no x64 o MiMemoryLicense grava 1 incondicionalmente. A
+// célula é a entrada "Mm64BitPhysicalAddress" de `kernel_data_layout` (valor
+// inicial 1); o PE do kernel e a tabela de exports publicam os mesmos bytes.
+
+/// Endereço da célula Mm64BitPhysicalAddress (export de dados).
+pub fn sixty_four_bit_physical_address_cell() -> u64 {
+    super::kernel_data::required_address("Mm64BitPhysicalAddress")
+}

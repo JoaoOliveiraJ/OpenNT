@@ -259,3 +259,45 @@ pub fn info(address: u64) -> Option<ContiguousInfo> {
 pub fn count() -> usize {
     STATE.lock().records.len()
 }
+
+// ---- MmAllocateContiguousNodeMemory (mm-physical-memory) --------------------
+//
+// Contrato do ntoskrnl 19041: LowestPfn = ceil(Lowest / 4 KiB); Boundary com
+// bits abaixo de 4 KiB -> NULL; PAGE_GUARD -> NULL; MiMakeProtectionMask
+// inválida -> NULL; (mask & 5) != 4 (não leitura/escrita) -> NULL; executável
+// com PAGE_NOCACHE -> NULL; HighestPfn = min(Highest >> 12, 0xFFFFFFFFF);
+// LowestPfn > HighestPfn -> NULL; depois MiAllocateContiguousMemory(bytes,
+// lowPfn, highPfn, Boundary >> 12, mask, nó). O cache vem de `mask >> 3`
+// (0 cacheado, 1 não cacheado, 3 write-combine). O nó preferido é aceito e
+// ignorado (KeNumberNodes = 1, o mesmo que o NT faz numa máquina de um nó).
+// A liberação é a de MmFreeContiguousMemory (`free`).
+
+/// MmAllocateContiguousNodeMemory: a VA de kernel ou 0.
+pub fn allocate_node(bytes: u64, lowest: u64, highest: u64, boundary: u64, protect: u32, _preferred_node: u32) -> Result<u64, KernelError> {
+    use super::protection;
+    let lowest_pfn = (lowest >> 12) + (lowest & 0xFFF != 0) as u64;
+    if boundary & 0xFFF != 0 || protect & protection::PAGE_GUARD != 0 {
+        return Ok(0);
+    }
+    let Some(mask) = protection::make_mask(protect) else { return Ok(0) };
+    if mask & 5 != 4 {
+        return Ok(0);
+    }
+    if mask & 2 != 0 {
+        match mask >> 3 {
+            1 => return Ok(0),
+            3 if mask & 7 != 0 => return Ok(0),
+            _ => {}
+        }
+    }
+    let highest_pfn = (highest >> 12).min(0xF_FFFF_FFFF);
+    if lowest_pfn > highest_pfn {
+        return Ok(0);
+    }
+    let cache = match mask >> 3 {
+        1 => 0,
+        3 => 2,
+        _ => 1,
+    };
+    allocate(bytes, ContiguousOptions { cache, highest_pfn, lowest_pfn, boundary_pages: boundary >> 12, nx: mask & 2 == 0 })
+}

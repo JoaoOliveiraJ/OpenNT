@@ -16,3 +16,4 @@ pub mod unmap_view;
 pub mod map_system_view;
 pub mod unmap_system_view;
 pub mod secured_views;
+pub mod session_view;

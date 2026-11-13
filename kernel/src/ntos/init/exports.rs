@@ -54,7 +54,7 @@ pub struct Group {
 }
 
 /// Grupos transcritos (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 164] {
+fn groups() -> [&'static Group; 171] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -220,6 +220,13 @@ fn groups() -> [&'static Group; 164] {
         &crate::ntos::fsrtl::exports::fsrtl_core::GROUP,
         &crate::ntos::ob::exports::ob_object_lifecycle::GROUP,
         &crate::ntos::ex::exports::ex_lookaside_wnf::GROUP,
+        &crate::ntos::mm::exports::mm_verifier::GROUP,
+        &crate::ntos::mm::exports::mm_session_views::GROUP,
+        &crate::ntos::mm::exports::mm_system_image::GROUP,
+        &crate::ntos::mm::exports::mm_mdl_ex::GROUP,
+        &crate::ntos::mm::exports::mm_secure_memory::GROUP,
+        &crate::ntos::mm::exports::mm_physical_memory::GROUP,
+        &crate::ntos::mm::exports::mm_system_info::GROUP,
     ]
 }
 

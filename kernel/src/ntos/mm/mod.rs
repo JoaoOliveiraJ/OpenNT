@@ -40,3 +40,7 @@ pub mod exports;
 pub mod guest_memory;
 pub mod pe_loader;
 pub mod sysload;
+pub mod verifier;
+pub mod secure_memory;
+pub mod system_info;
+pub mod protection;

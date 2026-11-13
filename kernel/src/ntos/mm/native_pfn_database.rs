@@ -110,3 +110,24 @@ pub fn initialize() -> Result<Published, KernelError> {
     debug_print!("[mm] native PFN: {} descriptors, base={:#x}", frame_count, base);
     Ok(published)
 }
+
+// ---- MmGetVirtualForPhysical (mm-physical-memory) ---------------------------
+//
+// Contrato do ntoskrnl 19041: MMPFN[pa >> 12].PteAddress (+8) volta a ser a VA
+// que a PTE mapeia — sign-extend((PteAddress - PTE_BASE) << 9) + (pa & 0xFFF).
+// O PTE_BASE do OpenNT é a janela recursiva (`recursive_mapping`); a
+// PteAddress é a que o rastreador de frames grava no descritor. Um frame sem
+// mapeamento dá o mesmo valor sem sentido que o NT daria; fora do banco (ou
+// sem banco publicado) devolve 0.
+
+/// MmGetVirtualForPhysical(PhysicalAddress).
+pub fn virtual_for_physical(physical_address: u64) -> u64 {
+    let (Some(database), Some(layout)) = (information(), recursive_mapping::layout()) else { return 0 };
+    let frame = physical_address >> 12;
+    if frame >= database.frame_count {
+        return 0;
+    }
+    let pte_address = physical::read64(database.physical_base + frame * database.descriptor_size + 8);
+    let page = ((pte_address.wrapping_sub(layout.page_table_base) << 25) as i64 >> 16) as u64;
+    page.wrapping_add(physical_address & 0xFFF)
+}

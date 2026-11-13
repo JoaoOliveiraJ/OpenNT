@@ -339,7 +339,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1030 && abi_names::GROUP_LAYOUT.len() == 164 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1030 exports em 164 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1053 && abi_names::GROUP_LAYOUT.len() == 171 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[779] == "ZwDisplayString" && abi_names::EXPORT_NAMES[787] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1053 exports em 171 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1319,7 +1319,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1030 && exports::export_names().len() == 1030, "ntoskrnl: 164 grupos com os 1030 exports implementados");
+    assert(exports::implemented() == 1053 && exports::export_names().len() == 1053, "ntoskrnl: 171 grupos com os 1053 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -4001,6 +4001,303 @@ fn ex_lookaside_wnf_exports(assert: Assert) {
 }
 
 
+fn mm_verifier_exports(assert: Assert) {
+    use crate::ntos::inc::nt_abi::driver_object;
+    use crate::ntos::mm::loaded_images;
+
+    // MmIsVerifierEnabled: saída zerada e STATUS_NOT_SUPPORTED; NULL aceito.
+    let flags = guest::alloc_bytes(8);
+    guest::write32(flags, 0xFFFF_FFFF);
+    assert(call_export("MmIsVerifierEnabled", &[flags]) == Some(0xFFFF_FFFF_C000_00BB) && guest::read32(flags) == 0, "mm-verifier: MmIsVerifierEnabled zera as flags e devolve NOT_SUPPORTED");
+    assert(call_export("MmIsVerifierEnabled", &[0]) == Some(0xFFFF_FFFF_C000_00BB), "mm-verifier: MmIsVerifierEnabled com saida NULL");
+
+    // MmIsDriverVerifying: bit 25 de KLDR_DATA_TABLE_ENTRY.Flags via DriverSection.
+    let driver = guest::alloc_bytes(driver_object::STRUCT_SIZE);
+    let entry = guest::alloc_bytes(0xA0);
+    assert(call_export("MmIsDriverVerifying", &[driver]) == Some(0), "mm-verifier: sem DriverSection nao verifica");
+    guest::write64(driver + driver_object::DRIVER_SECTION, entry);
+    guest::write32(entry + 0x68, 0x0200_0000);
+    assert(call_export("MmIsDriverVerifying", &[driver]) == Some(1), "mm-verifier: LDRP_IMAGE_VERIFYING ligado");
+    guest::write32(entry + 0x68, 0xFDFF_FFFF);
+    assert(call_export("MmIsDriverVerifying", &[driver]) == Some(0), "mm-verifier: so o bit 25 conta");
+    assert(call_export("MmIsDriverSuspectForVerifier", &[driver]) == Some(0), "mm-verifier: lista de suspeitos vazia sem verificador");
+
+    // MmIsDriverVerifyingByAddress: o ntoskrnl não é verificado; endereço sem imagem = FALSE.
+    let kernel = loaded_images::kernel().map_or(0, |image| image.image_base + 0x1000);
+    assert(kernel != 0 && call_export("MmIsDriverVerifyingByAddress", &[kernel]) == Some(0) && call_export("MmIsDriverVerifyingByAddress", &[0]) == Some(0), "mm-verifier: MmIsDriverVerifyingByAddress pela entrada do loader");
+
+    // MmAddVerifierThunks: verificador desligado.
+    assert(call_export("MmAddVerifierThunks", &[flags, 16]) == Some(0xFFFF_FFFF_C000_00BB), "mm-verifier: MmAddVerifierThunks sem verificador");
+    guest::free_bytes(entry);
+    guest::free_bytes(driver);
+    guest::free_bytes(flags);
+}
+
+
+fn mm_session_views_exports(assert: Assert) {
+    use crate::ntos::inc::nt_abi::eprocess;
+    use crate::ntos::mm::section::create as create_section;
+    use crate::ntos::ob::objects::section as section_objects;
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::sections;
+
+    let block = guest::alloc_bytes(0x100);
+    let (output, size, base, offset) = (block, block + 8, block + 0x10, block + 0x18);
+    // SEC_RESERVE: as páginas só entram pelo MmCommitSessionMappedView.
+    guest::write64(size, 0x3000);
+    let created = create_section::create_object(output, 0, 0, size, 4, 0x0400_0000, 0, 0, 0);
+    let body = guest::read64(output);
+    assert(created.is_ok_and(|status| status == 0) && body != 0, "mm-session-views: secao SEC_RESERVE criada");
+    let process = process::get_current_process();
+    let flags = guest::read32(process + eprocess::FLAGS);
+
+    // Fora de sessão (o System não tem ProcessInSession): STATUS_NOT_MAPPED_VIEW.
+    guest::write32(process + eprocess::FLAGS, flags & !0x1_0000);
+    guest::write64(size, 0);
+    assert(call_export("MmMapViewInSessionSpace", &[body, base, size]) == Some(0xFFFF_FFFF_C000_0019), "mm-session-views: processo fora de sessao recusado");
+
+    guest::write32(process + eprocess::FLAGS, flags | 0x1_0000);
+    let mapped = call_export("MmMapViewInSessionSpace", &[body, base, size]);
+    let address = guest::read64(base);
+    let section = sections::by_pointer(body);
+    let reserved = section.as_ref().is_some_and(|section| section.frame(1).is_none());
+    assert(mapped == Some(0) && guest::read64(size) == 0x3000 && sections::find_system_view(address).is_some() && reserved, "mm-session-views: vista de sessao com o tamanho integral e paginas reservadas");
+
+    // Commit da segunda página (faixa dentro dela) e repetição idempotente.
+    let committed = call_export("MmCommitSessionMappedView", &[address + 0x1800, 0x10]);
+    assert(committed == Some(0) && section.as_ref().is_some_and(|section| section.frame(1).is_some() && section.frame(2).is_none()), "mm-session-views: MmCommitSessionMappedView confirma so a pagina pedida");
+    assert(call_export("MmCommitSessionMappedView", &[address + 0x1000, 0x1000]) == Some(0), "mm-session-views: commit repetido aceito");
+    // Validações na ordem do original.
+    assert(call_export("MmCommitSessionMappedView", &[block, 0x1000]) == Some(0xFFFF_FFFF_C000_00EF), "mm-session-views: endereco fora da sessao = INVALID_PARAMETER_1");
+    assert(call_export("MmCommitSessionMappedView", &[address, 0]) == Some(0xFFFF_FFFF_C000_00F0) && call_export("MmCommitSessionMappedView", &[address, 0x4000]) == Some(0xFFFF_FFFF_C000_00F0), "mm-session-views: tamanho nulo ou alem da vista = INVALID_PARAMETER_2");
+    guest::write32(process + eprocess::FLAGS, flags & !0x1_0000);
+    assert(call_export("MmCommitSessionMappedView", &[address, 0x1000]) == Some(0xFFFF_FFFF_C000_0019), "mm-session-views: commit fora de sessao = NOT_MAPPED_VIEW");
+    guest::write32(process + eprocess::FLAGS, flags | 0x1_0000);
+
+    assert(call_export("MmUnmapViewInSessionSpace", &[address]) == Some(0) && sections::find_system_view(address).is_none(), "mm-session-views: MmUnmapViewInSessionSpace remove a vista");
+    assert(call_export("MmCommitSessionMappedView", &[address, 0x1000]) == Some(0xFFFF_FFFF_C000_00EF), "mm-session-views: vista removida deixa de ser sessao");
+
+    // Ex: o delta do offset entra no tamanho e o offset é alinhado (64 KiB).
+    guest::write64(size, 0x1000);
+    guest::write64(offset, 0x1234);
+    let extended = call_export("MmMapViewInSessionSpaceEx", &[body, base, size, offset, 0]);
+    let extended_base = guest::read64(base);
+    assert(extended == Some(0) && guest::read64(size) == 0x2234 && guest::read64(offset) == 0, "mm-session-views: Ex soma o delta do offset e alinha");
+    assert(call_export("MmMapViewInSessionSpaceEx", &[body, base, size, offset, 2]) == Some(0xFFFF_FFFF_C000_00F4), "mm-session-views: Ex com flags invalidas");
+    assert(call_export("MmUnmapViewInSessionSpace", &[extended_base]) == Some(0), "mm-session-views: vista Ex removida");
+
+    guest::write32(process + eprocess::FLAGS, flags);
+    drop(section);
+    assert(section_objects::dereference(body).is_ok() && sections::by_pointer(body).is_none(), "mm-session-views: secao liberada");
+    guest::free_bytes(block);
+}
+
+
+fn mm_system_image_exports(assert: Assert) {
+    use crate::drivers::fs::memory_file_system;
+    use crate::ntos::mm::loaded_images;
+    use crate::ntos::rtl::guest_strings;
+
+    let block = guest::alloc_bytes(0x400);
+    let (name, handle, base, missing) = (block, block + 0x10, block + 0x18, block + 0x20);
+    let set_name = |descriptor: u64, text_at: u64, text: &str| {
+        let units = text.encode_utf16().count() as u64;
+        guest_strings::write_wide_string(text_at, text);
+        guest::write16(descriptor, (units * 2) as u16);
+        guest::write16(descriptor + 2, (units * 2 + 2) as u16);
+        guest::write64(descriptor + 8, text_at);
+    };
+    set_name(name, block + 0x100, "\\SystemRoot\\System32\\opennt-mmload.sys");
+    set_name(missing, block + 0x200, "\\SystemRoot\\System32\\opennt-mmload-ausente.sys");
+    let _ = memory_file_system::write_bytes("/opennt-mmload.sys", ntoskrnl_importer(b"DbgPrint\0"));
+
+    let loaded = call_export("MmLoadSystemImage", &[name, 0, 0, 0, handle, base]);
+    let (entry, image_base) = (guest::read64(handle), guest::read64(base));
+    let published = loaded_images::find(image_base + 0x1000).is_some_and(|image| image.name.ends_with("opennt-mmload.sys"));
+    assert(loaded == Some(0) && entry != 0 && image_base != 0 && guest::read16(image_base) == 0x5A4D && guest::read64(entry + 0x30) == image_base && published, "mm-system-image: MmLoadSystemImage mapeia, resolve os imports e devolve a entrada do loader");
+
+    // Já carregada: mesma entrada e base; sessão = sucesso, senão IMAGE_ALREADY_LOADED.
+    guest::write64(handle, 0);
+    let again = call_export("MmLoadSystemImage", &[name, 0, 0, 0, handle, base]);
+    assert(again == Some(0xFFFF_FFFF_C000_010E) && guest::read64(handle) == entry && guest::read64(base) == image_base, "mm-system-image: segunda carga = STATUS_IMAGE_ALREADY_LOADED com a entrada existente");
+    assert(call_export("MmLoadSystemImage", &[name, 0, 0, 1, handle, base]) == Some(0) && guest::read64(base) == image_base, "mm-system-image: carga de sessao de imagem presente = sucesso");
+
+    // Flags: o wrapper recusa antes de zerar a base; o Ex zera e recusa sessão+lockdown.
+    assert(call_export("MmLoadSystemImage", &[name, 0, 0, 4, handle, base]) == Some(0xFFFF_FFFF_C000_00F2) && guest::read64(base) == image_base, "mm-system-image: flag fora da mascara = INVALID_PARAMETER_4 sem tocar a saida");
+    assert(call_export("MmLoadSystemImage", &[name, 0, 0, 3, handle, base]) == Some(0xFFFF_FFFF_C000_00F2) && guest::read64(base) == 0, "mm-system-image: sessao com lockdown = INVALID_PARAMETER_4 com a base zerada");
+    assert(call_export("MmLoadSystemImage", &[missing, 0, 0, 0, handle, base]) == Some(0xFFFF_FFFF_C000_0034) && guest::read64(base) == 0, "mm-system-image: imagem ausente = OBJECT_NAME_NOT_FOUND");
+
+    assert(call_export("MmUnloadSystemImage", &[entry]) == Some(0) && loaded_images::find(image_base + 0x1000).is_none(), "mm-system-image: MmUnloadSystemImage libera imagem e registro");
+    assert(call_export("MmUnloadSystemImage", &[entry]) == Some(0), "mm-system-image: descarga repetida devolve sucesso sem efeito");
+    guest::free_bytes(block);
+}
+
+
+fn mm_mdl_ex_exports(assert: Assert) {
+    use crate::hal::physical;
+    use crate::ntos::ps::process;
+
+    // MmAllocatePagesForMdlEx: 3 páginas zeradas, MDL_PAGES_LOCKED, Size 0x48.
+    let pages = call_export("MmAllocatePagesForMdlEx", &[0, u64::MAX, 0, 0x2800, 1, 0]).unwrap_or(0);
+    let frames: Vec<u64> = if pages != 0 { (0..3).map(|index| guest::read64(pages + 0x30 + index * 8)).collect() } else { Vec::new() };
+    let zeroed = frames.iter().all(|&frame| frame != 0 && physical::read64(frame * 0x1000 + 0x800) == 0);
+    assert(pages != 0 && guest::read16(pages + 8) == 0x48 && guest::read16(pages + 0xA) == 2 && guest::read32(pages + 0x28) == 0x3000 && guest::read64(pages + 0x20) == 0 && zeroed, "mm-mdl-ex: MmAllocatePagesForMdlEx com frames reais zerados e MDL_PAGES_LOCKED");
+    assert(call_export("MmFreePagesFromMdl", &[pages]) == Some(0), "mm-mdl-ex: MmFreePagesFromMdl devolve os frames");
+    guest::free_bytes(pages);
+    // Faixa física limitada: todos os frames dentro de [64 MiB, 512 MiB).
+    let bounded = call_export("MmAllocatePagesForMdlEx", &[0x400_0000, 0x1FFF_FFFF, 0, 0x2000, 1, 1]).unwrap_or(0);
+    let in_range = bounded != 0 && (0..2).all(|index| (0x4000..=0x1_FFFF).contains(&guest::read64(bounded + 0x30 + index * 8)));
+    assert(in_range, "mm-mdl-ex: frames dentro da faixa fisica pedida");
+    if bounded != 0 {
+        call_export("MmFreePagesFromMdl", &[bounded]);
+        guest::free_bytes(bounded);
+    }
+    // Validações: flags fora da máscara, nó inexistente, total nulo, skip desalinhado.
+    assert(call_export("MmAllocatePagesForMdlEx", &[0, u64::MAX, 0, 0x1000, 1, 0x800]) == Some(0) && call_export("MmAllocateNodePagesForMdlEx", &[0, u64::MAX, 0, 0x1000, 1, 1, 0]) == Some(0) && call_export("MmAllocatePagesForMdlEx", &[0, u64::MAX, 0, 0, 1, 0]) == Some(0) && call_export("MmAllocatePagesForMdlEx", &[0, u64::MAX, 0x800, 0x1000, 1, 0]) == Some(0), "mm-mdl-ex: pedidos invalidos devolvem NULL");
+    // Chunks contíguos: skip potência de dois que não divide o total = NULL.
+    assert(call_export("MmAllocatePagesForMdlEx", &[0, u64::MAX, 0x2000, 0x3000, 1, 0x20]) == Some(0), "mm-mdl-ex: REQUIRE_CONTIGUOUS_CHUNKS exige skip divisor do total");
+    let node = call_export("MmAllocateNodePagesForMdlEx", &[0, u64::MAX, 0, 0x1000, 1, 0, 1]).unwrap_or(0);
+    assert(node != 0 && guest::read32(node + 0x28) == 0x1000, "mm-mdl-ex: MmAllocateNodePagesForMdlEx no no 0");
+    if node != 0 {
+        call_export("MmFreePagesFromMdl", &[node]);
+        guest::free_bytes(node);
+    }
+
+    // MmCreateMdl: StartVa/ByteOffset/Size do original; Length >= 4 GiB = NULL.
+    let created = call_export("MmCreateMdl", &[0, 0x1234_5678_9ABC, 0x2000]).unwrap_or(0);
+    assert(created != 0 && guest::read16(created + 8) == 0x48 && guest::read64(created + 0x20) == 0x1234_5678_9000 && guest::read32(created + 0x2C) == 0xABC && guest::read32(created + 0x28) == 0x2000 && guest::read16(created + 0xA) == 0, "mm-mdl-ex: MmCreateMdl aloca e inicializa o MDL");
+    let caller = guest::alloc_bytes(0x40);
+    guest::write64(caller + 0x18, 0x5555);
+    assert(call_export("MmCreateMdl", &[caller, 0x1000, 0x1000]) == Some(caller) && guest::read16(caller + 8) == 0x38 && guest::read64(caller + 0x18) == 0x5555, "mm-mdl-ex: MmCreateMdl sobre MDL do chamador preserva MappedSystemVa");
+    assert(call_export("MmCreateMdl", &[0, 0x1000, 0x1_0000_0000]) == Some(0), "mm-mdl-ex: MmCreateMdl recusa 4 GiB");
+
+    // MmMdlPageContentsState: consulta/liga/desliga o bit 14 e devolve o State.
+    guest::write16(created + 0xA, 2);
+    assert(call_export("MmMdlPageContentsState", &[created, 1]) == Some(1) && guest::read16(created + 0xA) == 0x4002 && call_export("MmMdlPageContentsState", &[created, 2]) == Some(1), "mm-mdl-ex: MdlPageContentsZeroed liga MDL_PAGE_CONTENTS_INVARIANT");
+    assert(call_export("MmMdlPageContentsState", &[created, 0]) == Some(0) && guest::read16(created + 0xA) == 2 && call_export("MmMdlPageContentsState", &[created, 2]) == Some(0), "mm-mdl-ex: MdlPageContentsDirty desliga o bit");
+
+    // MmMapLockedPages = MmMapLockedPagesSpecifyCache(MmCached): marca o MDL mapeado.
+    let buffer = guest::alloc_bytes(0x2000);
+    let described = call_export("MmCreateMdl", &[0, buffer + 0x10, 0x100]).unwrap_or(0);
+    call_export("MmBuildMdlForNonPagedPool", &[described]);
+    let mapped = call_export("MmMapLockedPages", &[described, 0]);
+    assert(mapped == Some(buffer + 0x10) && guest::read16(described + 0xA) & 1 == 1, "mm-mdl-ex: MmMapLockedPages mapeia e marca o MDL");
+    call_export("MmUnmapLockedPages", &[buffer + 0x10, described]);
+
+    // MmProbeAndLockProcessPages no processo corrente: PFNs e MDL_PAGES_LOCKED.
+    let locked = guest::alloc_bytes(0x40);
+    call_export("MmCreateMdl", &[locked, buffer, 0x1000]);
+    let current = process::get_current_process();
+    assert(call_export("MmProbeAndLockProcessPages", &[locked, current, 0, 2]) == Some(0) && guest::read16(locked + 0xA) & 2 == 2 && guest::read64(locked + 0x30) == crate::ntos::mm::paging::translate(buffer) >> 12, "mm-mdl-ex: MmProbeAndLockProcessPages trava as paginas do processo");
+    call_export("MmUnlockPages", &[locked]);
+    for pointer in [locked, described, buffer, caller, created] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn mm_secure_memory_exports(assert: Assert) {
+    let current = u64::MAX;
+    let block = guest::alloc_bytes(0x40);
+    let (base, size, old) = (block, block + 8, block + 0x10);
+    guest::write64(base, 0);
+    guest::write64(size, 0x3000);
+    let allocated = call_export("ZwAllocateVirtualMemory", &[current, base, 0, size, 0x3000, 4]);
+    let address = guest::read64(base);
+    assert(allocated == Some(0) && address != 0, "mm-secure-memory: regiao privada de 3 paginas");
+
+    // Escrita e leitura sobre páginas RW comitadas: handles distintos e não nulos.
+    let write = call_export("MmSecureVirtualMemory", &[address + 0x10, 0x2000, 4]).unwrap_or(0);
+    let read = call_export("MmSecureVirtualMemory", &[address, 0x3000, 2]).unwrap_or(0);
+    assert(write != 0 && read != 0 && write != read, "mm-secure-memory: MmSecureVirtualMemory devolve handles opacos");
+    // Faixas inválidas: tamanho nulo, além da região, além de MmUserProbeAddress.
+    assert(call_export("MmSecureVirtualMemory", &[address, 0, 4]) == Some(0) && call_export("MmSecureVirtualMemory", &[address, 0x3001, 2]) == Some(0) && call_export("MmSecureVirtualMemory", &[0x7FFF_FFFF_F000, 0x2000, 2]) == Some(0), "mm-secure-memory: faixas invalidas devolvem NULL");
+
+    // Página 3 somente leitura: sonda de escrita falha, de leitura passa.
+    guest::write64(base, address + 0x2000);
+    guest::write64(size, 0x1000);
+    let protected = call_export("ZwProtectVirtualMemory", &[current, base, size, 2, old]);
+    assert(protected == Some(0) && call_export("MmSecureVirtualMemory", &[address, 0x3000, 4]) == Some(0), "mm-secure-memory: sonda de escrita recusa pagina somente leitura");
+    let read_only = call_export("MmSecureVirtualMemory", &[address + 0x2000, 0x1000, 2]).unwrap_or(0);
+    assert(read_only != 0, "mm-secure-memory: sonda de leitura aceita pagina somente leitura");
+    // Página 2 descomitada: até a sonda de leitura falha.
+    guest::write64(base, address + 0x1000);
+    guest::write64(size, 0x1000);
+    let decommitted = call_export("ZwFreeVirtualMemory", &[current, base, size, 0x4000]);
+    assert(decommitted == Some(0) && call_export("MmSecureVirtualMemory", &[address, 0x3000, 2]) == Some(0), "mm-secure-memory: pagina descomitada recusada");
+
+    for handle in [write, read, read_only] {
+        assert(call_export("MmUnsecureVirtualMemory", &[handle]) == Some(0), "mm-secure-memory: MmUnsecureVirtualMemory solta a entrada");
+    }
+    assert(call_export("MmUnsecureVirtualMemory", &[write]) == Some(0), "mm-secure-memory: handle ja solto ignorado");
+    guest::write64(base, address);
+    guest::write64(size, 0);
+    call_export("ZwFreeVirtualMemory", &[current, base, size, 0x8000]);
+    guest::free_bytes(block);
+}
+
+
+fn mm_physical_memory_exports(assert: Assert) {
+    use crate::ntos::init::exports;
+    use crate::ntos::mm::contiguous_memory;
+    use crate::ntos::mm::memory_map as map;
+    use crate::ntos::mm::native_pfn_database;
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+    use crate::ntos::mm::protection;
+
+    // MiMakeProtectionMask contra o modelo de referência.
+    let masks = [(0x02u32, Some(1u32)), (0x04, Some(4)), (0x40, Some(6)), (0x104, Some(0x14)), (0x204, Some(0x0C)), (0x404, Some(0x1C)), (0x240, Some(0x0E)), (0x440, None), (0x01, Some(0x18)), (0x03, None), (0x800, None)];
+    assert(masks.iter().all(|&(protect, mask)| protection::make_mask(protect) == mask), "mm-physical-memory: MiMakeProtectionMask pelas tabelas do ntoskrnl");
+
+    // PAGE_READWRITE: cacheada, NX, na janela contígua do kernel.
+    let cached = call_export("MmAllocateContiguousNodeMemory", &[0x2000, 0, u64::MAX, 0, 4, 0]).unwrap_or(0);
+    let info = contiguous_memory::info(cached);
+    assert(cached != 0 && (map::KERNEL_CONTIGUOUS_BASE..map::KERNEL_CONTIGUOUS_TOP).contains(&cached) && info.as_ref().is_some_and(|info| info.cache == 1 && info.nx && info.bytes == 0x2000), "mm-physical-memory: PAGE_READWRITE cacheada e NX");
+    // MmGetVirtualForPhysical devolve a VA da PTE registrada no MMPFN.
+    let physical = call_export("MmGetPhysicalAddress", &[cached + 0x1234]).unwrap_or(0);
+    let expected = if native_pfn_database::information().is_some() { cached + 0x1234 } else { 0 };
+    assert(physical != 0 && call_export("MmGetVirtualForPhysical", &[physical]) == Some(expected), "mm-physical-memory: MmGetVirtualForPhysical pela PteAddress do PFN");
+    assert(call_export("MmFreeContiguousMemory", &[cached]) == Some(0) && contiguous_memory::info(cached).is_none(), "mm-physical-memory: liberada pelo MmFreeContiguousMemory");
+
+    // PAGE_READWRITE|PAGE_NOCACHE (máscara 0xC) -> não cacheada; EXECUTE_READWRITE (6) -> executável.
+    let uncached = call_export("MmAllocateContiguousNodeMemory", &[0x1000, 0, u64::MAX, 0, 0x204, 0]).unwrap_or(0);
+    let executable = call_export("MmAllocateContiguousNodeMemory", &[0x1000, 0, u64::MAX, 0, 0x40, 0]).unwrap_or(0);
+    assert(contiguous_memory::info(uncached).is_some_and(|info| info.cache == 0) && contiguous_memory::info(executable).is_some_and(|info| info.cache == 1 && !info.nx), "mm-physical-memory: cache e execucao pela mascara de protecao");
+    call_export("MmFreeContiguousMemory", &[uncached]);
+    call_export("MmFreeContiguousMemory", &[executable]);
+
+    // Recusas: READONLY (1), GUARD, EXECUTE_READWRITE|NOCACHE (0xE), WRITECOMBINE com execução (inválida), boundary desalinhado, faixa vazia.
+    let refused = [(2u64, 0u64, 0u64, u64::MAX), (0x104, 0, 0, u64::MAX), (0x240, 0, 0, u64::MAX), (0x440, 0, 0, u64::MAX), (4, 0x800, 0, u64::MAX), (4, 0, 0x2000_0000, 0x1000_0000)];
+    assert(refused.iter().all(|&(protect, boundary, lowest, highest)| call_export("MmAllocateContiguousNodeMemory", &[0x1000, lowest, highest, boundary, protect, 0]) == Some(0)), "mm-physical-memory: protecoes, boundary e faixa invalidos devolvem NULL");
+
+    // Mm64BitPhysicalAddress: BOOLEAN TRUE.
+    let cell = match exports::lookup("ntoskrnl.exe", "Mm64BitPhysicalAddress") {
+        Some(ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    assert(cell != 0 && guest::read8(cell) == 1, "mm-physical-memory: Mm64BitPhysicalAddress = TRUE");
+}
+
+
+fn mm_system_info_exports(assert: Assert) {
+    use crate::ntos::init::exports;
+    use crate::ntos::mm::memory_map;
+    use crate::ntos::mm::paging;
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+
+    let cell = |name: &str| match exports::lookup("ntoskrnl.exe", name) {
+        Some(ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    assert(call_export("MmIsThisAnNtAsSystem", &[]).map(|value| value & 0xFF) == Some(0) && call_export("MmQuerySystemSize", &[]).map(|value| value as u32) == Some(2), "mm-system-info: estacao de trabalho e MmLargeSystem");
+    let range = cell("MmSystemRangeStart");
+    assert(range != 0 && guest::read64(range) == 0xFFFF_8000_0000_0000, "mm-system-info: MmSystemRangeStart = 0xFFFF800000000000");
+    let bad = cell("MmBadPointer");
+    let pointer = if bad != 0 { guest::read64(bad) } else { 0 };
+    assert(pointer == memory_map::KERNEL_POOL_TOP && pointer & 0xFFF == 0 && paging::translate(pointer) == 0 && call_export("MmIsAddressValid", &[pointer]) == Some(0), "mm-system-info: MmBadPointer e uma VA de kernel nunca mapeada");
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -4067,5 +4364,12 @@ pub fn run(assert: Assert) {
     fsrtl_core_exports(assert);
     ob_object_lifecycle_exports(assert);
     ex_lookaside_wnf_exports(assert);
+    mm_verifier_exports(assert);
+    mm_session_views_exports(assert);
+    mm_system_image_exports(assert);
+    mm_mdl_ex_exports(assert);
+    mm_secure_memory_exports(assert);
+    mm_physical_memory_exports(assert);
+    mm_system_info_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }

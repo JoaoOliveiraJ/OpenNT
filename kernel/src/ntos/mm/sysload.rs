@@ -647,3 +647,117 @@ pub mod kernel_api_set {
         Ok(SCHEMA.lock().as_ref().and_then(|schema| schema.resolve(name, importer)))
     }
 }
+
+// ---- MmLoadSystemImage / MmUnloadSystemImage (mm-system-image) --------------
+//
+// Contrato do ntoskrnl 19041:
+// - MmLoadSystemImage(ImageFileName, NamePrefix, LoadedBaseName, LoadFlags,
+//   *ImageHandle, *ImageBaseAddress): `LoadFlags & 0x7FFFFFFC` ->
+//   STATUS_INVALID_PARAMETER_4 antes de tudo; depois MmLoadSystemImageEx.
+// - O Ex zera *ImageBaseAddress primeiro; MM_LOAD_IMAGE_IN_SESSION (1) junto
+//   com MM_LOAD_IMAGE_AND_LOCKDOWN (2) -> STATUS_INVALID_PARAMETER_4.
+// - Nomes de MiGenerateSystemImageNames: base = LoadedBaseName ou o último
+//   componente, com NamePrefix na frente.
+// - Imagem já na lista do loader: *ImageHandle = a KLDR_DATA_TABLE_ENTRY,
+//   *ImageBaseAddress = DllBase; Flags & 0x04000000 ->
+//   STATUS_IMAGE_ALREADY_LOADED_AS_DLL; carga de sessão -> sucesso; senão
+//   STATUS_IMAGE_ALREADY_LOADED (sem incrementar LoadCount).
+// - Imagem nova: mapeia, reloca, resolve os imports (as dependências recebem
+//   o DllInitialize), cria a entrada do loader e notifica a carga; o ponto de
+//   entrada da própria imagem NÃO é chamado.
+// - MmUnloadSystemImage(ImageHandle): MiUnloadSystemImage; sempre sucesso.
+//
+// O OpenNT guarda as imagens de kernel do System32 na raiz do volume de boot,
+// então a busca usa só o nome do arquivo (a mesma fonte do sysload). Lacunas:
+// a exigência de ProcessInSession das cargas de sessão (STATUS_NO_MEMORY) não
+// é aplicada porque o ps ainda não liga esse bit; uma imagem de sessão é
+// mapeada uma vez (sistema de sessão única). Arquivo ausente =
+// STATUS_OBJECT_NAME_NOT_FOUND, o resultado do ZwOpenFile do
+// MiObtainSectionForDriver.
+
+const SYSTEM_IMAGE_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+const SYSTEM_IMAGE_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const SYSTEM_IMAGE_INVALID_FORMAT: u32 = 0xC000_007B;
+const SYSTEM_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
+const SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL: u32 = 0xC000_019D;
+const MM_LOAD_IMAGE_IN_SESSION: u32 = 1;
+const MM_LOAD_IMAGE_AND_LOCKDOWN: u32 = 2;
+/// KLDR_DATA_TABLE_ENTRY.Flags e o bit testado no caminho "já carregada".
+const SYSTEM_IMAGE_LDR_FLAGS: u64 = 0x68;
+const SYSTEM_IMAGE_LOADED_AS_DLL: u32 = 0x0400_0000;
+
+/// Imagens carregadas por MmLoadSystemImage, pela entrada do loader.
+static SYSTEM_IMAGES: SpinLock<BTreeMap<u64, PeImage>> = SpinLock::new(BTreeMap::new());
+
+fn system_image_file_name(path: &str) -> &str {
+    path.rsplit(|character| character == '\\' || character == '/').next().unwrap_or(path)
+}
+
+/// Entrada nativa e base de uma imagem já listada com o mesmo nome-base.
+fn system_image_already_loaded(base_name: &str) -> Result<Option<(u64, u64)>, KernelError> {
+    let (_, entries) = crate::ntos::mm::loaded_images::native_list()?;
+    Ok(entries.into_iter().find(|(image, _)| system_image_file_name(&image.name).eq_ignore_ascii_case(base_name)).map(|(image, entry)| (entry, image.image_base)))
+}
+
+fn system_image_entry(id: u64) -> Result<Option<u64>, KernelError> {
+    let (_, entries) = crate::ntos::mm::loaded_images::native_list()?;
+    Ok(entries.into_iter().find(|(image, _)| image.id == id).map(|(_, entry)| entry))
+}
+
+/// MmLoadSystemImage: devolve o NTSTATUS e grava as duas saídas.
+pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, flags: u32, handle_out: u64, base_out: u64) -> Result<u32, KernelError> {
+    if flags & 0x7FFF_FFFC != 0 {
+        return Ok(SYSTEM_IMAGE_INVALID_PARAMETER_4);
+    }
+    guest::write64(base_out, 0);
+    let session = flags & MM_LOAD_IMAGE_IN_SESSION != 0;
+    if session && flags & MM_LOAD_IMAGE_AND_LOCKDOWN != 0 {
+        return Ok(SYSTEM_IMAGE_INVALID_PARAMETER_4);
+    }
+    let path = guest_strings::read_unicode_string(file_name);
+    let file = String::from(system_image_file_name(&path));
+    let mut base_name = if loaded_base_name != 0 { guest_strings::read_unicode_string(loaded_base_name) } else { file.clone() };
+    if prefix != 0 {
+        base_name = alloc::format!("{}{}", guest_strings::read_unicode_string(prefix), base_name);
+    }
+    let full_name = alloc::format!("{}{}", &path[..path.len() - file.len()], base_name);
+
+    if let Some((entry, image_base)) = system_image_already_loaded(&base_name)? {
+        guest::write64(handle_out, entry);
+        guest::write64(base_out, image_base);
+        if guest::read32(entry + SYSTEM_IMAGE_LDR_FLAGS) & SYSTEM_IMAGE_LOADED_AS_DLL != 0 {
+            return Ok(SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL);
+        }
+        return Ok(if session { 0 } else { SYSTEM_IMAGE_ALREADY_LOADED });
+    }
+
+    let Ok(source) = kernel_image_source::source_for(&file) else { return Ok(SYSTEM_IMAGE_NAME_NOT_FOUND) };
+    let mut image = match pe_loader::load_from_source(source, &LoadOptions { image_name: Some(full_name), ..LoadOptions::default() }) {
+        Ok(image) => image,
+        Err(error) => {
+            debug_print!("[mm] MmLoadSystemImage {}: {}", path, error);
+            return Ok(if error.status & 0x8000_0000 != 0 { error.status } else { SYSTEM_IMAGE_INVALID_FORMAT });
+        }
+    };
+    let entry = match image.loaded_image.as_ref().map(|loaded| loaded.id) {
+        Some(id) => system_image_entry(id)?,
+        None => None,
+    };
+    let Some(entry) = entry else {
+        image.release()?;
+        return Err(KernelError::new("MmLoadSystemImage: kernel image without loader entry"));
+    };
+    guest::write64(handle_out, entry);
+    guest::write64(base_out, image.image_base);
+    SYSTEM_IMAGES.lock().insert(entry, image);
+    Ok(0)
+}
+
+/// MmUnloadSystemImage: descarrega só o que MmLoadSystemImage carregou.
+pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
+    let image = SYSTEM_IMAGES.lock().remove(&handle);
+    if let Some(mut image) = image {
+        image.release()?;
+    }
+    Ok(())
+}

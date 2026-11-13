@@ -34,6 +34,13 @@ const HAL_DISPATCH_INITIAL: [u8; 0xC0] = {
     bytes
 };
 
+/// MmSystemRangeStart: a constante da .rdata do ntoskrnl 19041 (RVA 0x223a8).
+const MM_SYSTEM_RANGE_START_INITIAL: [u8; 8] = 0xFFFF_8000_0000_0000u64.to_le_bytes();
+/// MmBadPointer: a primeira página depois da janela do pool de kernel
+/// (`memory_map::KERNEL_POOL_TOP`), que nada mapeia. O valor é literal porque o
+/// `xtask` também lê este arquivo.
+const MM_BAD_POINTER_INITIAL: [u8; 8] = 0xFFFF_A001_0000_0000u64.to_le_bytes();
+
 /// FsRtlLegalAnsiCharacterArray: classe de cada byte ANSI (FAT/HPFS/NTFS/OLE e
 /// curinga). 0x00–0x7F são os bytes exatos do ntoskrnl 19041 (tabela de 128
 /// bytes no RVA 0x11b20, conferida contra o binário); 0x80–0xFF = 0x17 (legal,
@@ -87,6 +94,10 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     KernelDataEntry { name: "HalPrivateDispatchTable", size: 0x4B0, storage_size: 0x4B0, alignment: 8, initial: &HAL_PRIVATE_DISPATCH_INITIAL },
     KernelDataEntry { name: "HalDispatchTable", size: 0xC0, storage_size: 0xC0, alignment: 8, initial: &HAL_DISPATCH_INITIAL },
     KernelDataEntry { name: "FsRtlLegalAnsiCharacterArray", size: 256, storage_size: 256, alignment: 16, initial: &FSRTL_LEGAL_ANSI_CHARACTER_ARRAY },
+    // BOOLEAN; o MiMemoryLicense do x64 grava 1 incondicionalmente.
+    KernelDataEntry { name: "Mm64BitPhysicalAddress", size: 1, storage_size: 1, alignment: 1, initial: &[1] },
+    KernelDataEntry { name: "MmSystemRangeStart", size: 8, storage_size: 8, alignment: 8, initial: &MM_SYSTEM_RANGE_START_INITIAL },
+    KernelDataEntry { name: "MmBadPointer", size: 8, storage_size: 8, alignment: 8, initial: &MM_BAD_POINTER_INITIAL },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

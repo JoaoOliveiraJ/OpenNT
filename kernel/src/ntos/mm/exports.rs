@@ -469,3 +469,190 @@ pub mod virtual_memory_services {
         data_exports: &[],
     };
 }
+
+pub mod mm_verifier {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::verifier;
+    use crate::rtl::KernelError;
+
+    fn is_verifier_enabled(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(verifier::is_enabled(call.arg(1))))
+    }
+
+    fn is_driver_verifying(call: &Call) -> Result<u64, KernelError> {
+        Ok(verifier::is_driver_verifying(call.arg(1)) as u64)
+    }
+
+    fn is_driver_verifying_by_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(verifier::is_driver_verifying_by_address(call.arg(1)) as u64)
+    }
+
+    fn add_verifier_thunks(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(verifier::add_thunks(call.arg(1), call.arg(2) as u32)))
+    }
+
+    fn is_driver_suspect_for_verifier(call: &Call) -> Result<u64, KernelError> {
+        Ok(verifier::is_driver_suspect(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-verifier",
+        names: &["MmIsVerifierEnabled", "MmIsDriverVerifying", "MmIsDriverVerifyingByAddress", "MmAddVerifierThunks", "MmIsDriverSuspectForVerifier"],
+        handlers: &[is_verifier_enabled, is_driver_verifying, is_driver_verifying_by_address, add_verifier_thunks, is_driver_suspect_for_verifier],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_session_views {
+    use crate::ntos::init::exports::{fatal_unless_transfer, signed_status, Call, Group};
+    use crate::ntos::mm::section::session_view;
+    use crate::rtl::KernelError;
+
+    fn map(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fatal_unless_transfer("map-session-view", session_view::map(call.arg(1), call.arg(2), call.arg(3)))?))
+    }
+
+    fn map_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fatal_unless_transfer("map-session-view", session_view::map_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5)))?))
+    }
+
+    fn unmap(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fatal_unless_transfer("unmap-session-view", session_view::unmap(call.arg(1)))?))
+    }
+
+    fn commit(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(session_view::commit(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-session-views",
+        names: &["MmMapViewInSessionSpace", "MmMapViewInSessionSpaceEx", "MmUnmapViewInSessionSpace", "MmCommitSessionMappedView"],
+        handlers: &[map, map_ex, unmap, commit],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_system_image {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::sysload;
+    use crate::rtl::KernelError;
+
+    fn load(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sysload::load_system_image(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6))?))
+    }
+
+    fn unload(call: &Call) -> Result<u64, KernelError> {
+        sysload::unload_system_image(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-system-image",
+        names: &["MmLoadSystemImage", "MmUnloadSystemImage"],
+        handlers: &[load, unload],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_mdl_ex {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::mdl;
+    use crate::rtl::KernelError;
+
+    fn allocate_pages_for_mdl_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(mdl::allocate_pages_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, 0, call.arg(6) as u32))
+    }
+
+    fn allocate_node_pages_for_mdl_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(mdl::allocate_pages_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32))
+    }
+
+    fn create_mdl(call: &Call) -> Result<u64, KernelError> {
+        Ok(mdl::create(call.arg(1), call.arg(2), call.arg(3)))
+    }
+
+    /// MmMapLockedPagesSpecifyCache(Mdl, AccessMode, MmCached, NULL, TRUE, HighPagePriority).
+    fn map_locked_pages(call: &Call) -> Result<u64, KernelError> {
+        Ok(mdl::map_locked_pages(call.arg(1), 0))
+    }
+
+    fn mdl_page_contents_state(call: &Call) -> Result<u64, KernelError> {
+        Ok(mdl::page_contents_state(call.arg(1), call.arg(2) as u32) as u64)
+    }
+
+    fn probe_and_lock_process_pages(call: &Call) -> Result<u64, KernelError> {
+        mdl::probe_and_lock_process_pages(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(4) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-mdl-ex",
+        names: &["MmAllocatePagesForMdlEx", "MmAllocateNodePagesForMdlEx", "MmCreateMdl", "MmMapLockedPages", "MmMdlPageContentsState", "MmProbeAndLockProcessPages"],
+        handlers: &[allocate_pages_for_mdl_ex, allocate_node_pages_for_mdl_ex, create_mdl, map_locked_pages, mdl_page_contents_state, probe_and_lock_process_pages],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_secure_memory {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::secure_memory;
+    use crate::rtl::KernelError;
+
+    fn secure(call: &Call) -> Result<u64, KernelError> {
+        Ok(secure_memory::secure(call.arg(1), call.arg(2), call.arg(3) as u32))
+    }
+
+    fn unsecure(call: &Call) -> Result<u64, KernelError> {
+        secure_memory::unsecure(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-secure-memory",
+        names: &["MmSecureVirtualMemory", "MmUnsecureVirtualMemory"],
+        handlers: &[secure, unsecure],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_physical_memory {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::{contiguous_memory, native_pfn_database, physical_layout};
+    use crate::rtl::KernelError;
+
+    fn allocate_contiguous_node_memory(call: &Call) -> Result<u64, KernelError> {
+        contiguous_memory::allocate_node(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32)
+    }
+
+    fn get_virtual_for_physical(call: &Call) -> Result<u64, KernelError> {
+        Ok(native_pfn_database::virtual_for_physical(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-physical-memory",
+        names: &["MmAllocateContiguousNodeMemory", "MmGetVirtualForPhysical"],
+        handlers: &[allocate_contiguous_node_memory, get_virtual_for_physical],
+        data_exports: &[("Mm64BitPhysicalAddress", physical_layout::sixty_four_bit_physical_address_cell)],
+    };
+}
+
+pub mod mm_system_info {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::system_info;
+    use crate::rtl::KernelError;
+
+    fn is_this_an_nt_as_system(_: &Call) -> Result<u64, KernelError> {
+        Ok(system_info::is_this_an_nt_as_system() as u64)
+    }
+
+    fn query_system_size(_: &Call) -> Result<u64, KernelError> {
+        Ok(system_info::query_system_size() as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-system-info",
+        names: &["MmIsThisAnNtAsSystem", "MmQuerySystemSize"],
+        handlers: &[is_this_an_nt_as_system, query_system_size],
+        data_exports: &[("MmSystemRangeStart", system_info::system_range_start_cell), ("MmBadPointer", system_info::bad_pointer_cell)],
+    };
+}
