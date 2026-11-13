@@ -27,8 +27,6 @@ pub struct BuildOptions {
     pub start_driver: String,
     /// `--trace-driver-api`: rastreia as APIs chamadas durante esse início.
     pub trace_driver_api: bool,
-    /// `--graphics`: mode-set do framebuffer linear e desenho do Stage 1.
-    pub graphics: bool,
 }
 
 pub struct BuildOutput {
@@ -97,11 +95,6 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         command.env("OPENNT_CONSOLE_MIRROR", "1");
     } else {
         command.env_remove("OPENNT_CONSOLE_MIRROR");
-    }
-    if options.graphics {
-        command.env("OPENNT_GRAPHICS", "1");
-    } else {
-        command.env_remove("OPENNT_GRAPHICS");
     }
     match windows_binaries {
         Some(directory) => command.env("OPENNT_WINDOWS_BINARIES", directory),

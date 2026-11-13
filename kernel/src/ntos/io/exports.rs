@@ -1506,9 +1506,8 @@ pub mod x86bios_sleep_misc {
     //! Exports que o BasicDisplay.sys real (Microsoft Basic Display, driver de
     //! vídeo display-only) importa e que faltavam: o bit-scan e a comparação da
     //! CRT, o bloqueio de sono do Po e os x86Bios. Não há emulador de VBIOS de
-    //! 16 bits aqui — o OpenNT faz o scanout pelo framebuffer DISPI, então a
-    //! chamada de BIOS falha de modo tolerado (como numa máquina sem VGA BIOS
-    //! legado), e o BasicDisplay segue pelo caminho do framebuffer.
+    //! 16 bits aqui, então a chamada de BIOS falha de modo tolerado, como numa
+    //! máquina sem VGA BIOS legado.
 
     use core::sync::atomic::{AtomicU64, Ordering};
 

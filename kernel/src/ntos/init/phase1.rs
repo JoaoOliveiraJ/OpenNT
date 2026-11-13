@@ -50,12 +50,6 @@ pub fn init() {
         Ok(count) => debug_print!("[boot] PCI: {} funcoes", count),
         Err(error) => debug_print!("[pci] enumeracao falhou: {}", error),
     }
-    // Framebuffer linear opcional (`--graphics`): com as BARs da std-VGA já
-    // enumeradas, faz o mode-set DISPI e desenha o Stage 1 gráfico. Sem o flag
-    // o boot segue em modo texto e os testes não são afetados.
-    if crate::ntos::init::boot_config::GRAPHICS {
-        crate::drivers::video::framebuffer::selftest();
-    }
     // Drivers de serviço lidos do Registry + PnP START. O provedor de status
     // dos drivers entra como no carregamento do driver-services original.
     crate::ntos::cm::service::driver::init();

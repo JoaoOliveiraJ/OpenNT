@@ -290,17 +290,6 @@ fase = "1"
 notas = "Os testes conferem o texto pela serial; a imagem na tela não é conferida."
 
 [[componente]]
-nome = "Framebuffer linear (scanout)"
-categoria = "Drivers internos"
-icone = "monitor"
-descricao = "Faz o mode-set de um framebuffer linear e desenha pixels na tela, a camada de scanout sobre a qual o stack de vídeo real se apoia."
-estado = "em desenvolvimento"
-caminhos = ["kernel/src/drivers/video/framebuffer.rs"]
-testes = ["boot"]
-fase = "1"
-notas = "Mode-set via Bochs DISPI (portas 0x1CE/0x1CF), base do BAR0 da placa std-VGA. Sob o flag --graphics; `cargo xtask run --graphics` mostra a tela desenhada pelo kernel. Não é um driver de vídeo: é o equivalente ao framebuffer de boot do Windows, o destino onde o BasicDisplay/dxgkrnl reais entregam a imagem."
-
-[[componente]]
 nome = "Console"
 categoria = "Drivers internos"
 icone = "terminal"

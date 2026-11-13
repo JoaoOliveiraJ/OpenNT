@@ -62,10 +62,6 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
         machine.memory_mb.to_string(),
         "-smp".to_string(),
         machine.smp.to_string(),
-        // Placa std-VGA (Bochs DISPI, PCI 1234:1111) fixada: o framebuffer de
-        // `--graphics` faz o mode-set por ela e lê a base linear do BAR0.
-        "-vga".to_string(),
-        "std".to_string(),
         "-drive".to_string(),
         format!("format=raw,file={}", image.display()),
         "-no-reboot".to_string(),
