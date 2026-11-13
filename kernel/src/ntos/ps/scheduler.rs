@@ -155,6 +155,13 @@ pub fn kill(pid: u32, exit_status: u32) -> bool {
     true
 }
 
+/// ZwTerminateProcess: marca no escalonador preservando o status. Devolve
+/// o NTSTATUS (STATUS_INVALID_HANDLE para pid desconhecido).
+pub fn terminate_by_handle(handle: u64, exit_status: u32) -> u32 {
+    let pid = process::process_id_from_handle(handle);
+    if kill(pid as u32, exit_status) { 0 } else { 0xC000_0008 }
+}
+
 /// Recolhe processos terminados. Descartar o `Future` encerra o processo
 /// (o `gen.return()` do original).
 fn reap() {

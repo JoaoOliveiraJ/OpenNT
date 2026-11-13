@@ -2,9 +2,12 @@
 //!
 //! O provedor de memória mantém armazenamento, paginação e propriedade;
 //! pedidos inválidos provocam bugcheck 0xC2 e a falha com RAISE levanta
-//! STATUS_INSUFFICIENT_RESOURCES.
+//! STATUS_INSUFFICIENT_RESOURCES. Também as variantes ExAllocatePool2/Zero/
+//! Uninitialized e a liberação (ExFreePool*), que encaminha ao pool dono.
 
 use crate::ntos::ke::{bugcheck, irql};
+use crate::ntos::mm::data_pool;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::rtl::KernelError;
 
@@ -67,4 +70,31 @@ pub fn allocate_priority(pool_type: u32, bytes: u64, tag: u32, priority: u32) ->
 /// ExAllocatePoolWithTag: o alocador interno direto (prioridade 32).
 pub fn allocate_tagged(pool_type: u32, bytes: u64, tag: u32) -> Result<u64, KernelError> {
     allocate_priority(pool_type, bytes, tag, 32)
+}
+
+/// ExAllocatePool2/ExAllocatePoolZero: POOL_FLAGS só escolhe paginado/não
+/// paginado; o pool do convidado é único e a memória sai zerada.
+pub fn allocate_zeroed(bytes: u64) -> u64 {
+    guest::alloc_bytes(bytes)
+}
+
+/// ExAllocatePoolUninitialized: o mesmo pool, sem zerar.
+pub fn allocate_uninitialized(bytes: u64) -> u64 {
+    guest::alloc_raw(bytes)
+}
+
+/// ExFreePool/ExFreePoolWithTag/ExFreePool2. Encaminha ao alocador dono:
+/// endereços baixos são da arena; a tag opcional só é conferida pelo pool
+/// que guarda o metadado.
+pub fn free(pointer: u64, tag: u64) -> Result<(), KernelError> {
+    if pointer < 0xFFFF_0000_0000_0000 {
+        guest::free_bytes(pointer);
+    } else if data_pool::owns(pointer) {
+        data_pool::free(pointer)?;
+    } else if kernel_pool::owns(pointer) {
+        kernel_pool::free(pointer, if tag == 0 { None } else { Some(tag as u32) })?;
+    } else {
+        guest::free_bytes(pointer);
+    }
+    Ok(())
 }

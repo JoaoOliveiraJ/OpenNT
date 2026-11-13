@@ -139,6 +139,15 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
     Ok(())
 }
 
+/// ExInitializeLookasideListEx(List, AllocateEx, FreeEx, PoolType, Flags,
+/// Size, Tag, Depth). O PoolType vira o campo Type (+0x24) e escolhe o
+/// registro paginado/não paginado pelo bit 0; AllocateEx/FreeEx nulos
+/// recebem ExAllocatePoolWithTag/ExFreePool (feito dentro de `initialize`,
+/// como nas listas não-Ex). Flags e Depth não têm efeito persistente aqui.
+pub fn initialize_ex(list: u64, allocate_routine: u64, free_routine: u64, pool_type: u32, block_size: u64, tag: u32) -> Result<(), KernelError> {
+    initialize(list, allocate_routine, free_routine, pool_type, block_size, tag, pool_type & 1 != 0)
+}
+
 /// A primeira falta chama o alocador verdadeiro; uma entrada do cache
 /// conserva o endereço.
 pub fn allocate(list: u64) -> Result<u64, KernelError> {

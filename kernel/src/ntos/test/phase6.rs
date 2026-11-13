@@ -1836,7 +1836,7 @@ fn zw_group_exports(assert: Assert) {
     use crate::drivers::fs::memory_file_system;
     use crate::ntos::ke::dispatcher;
     use crate::ntos::ob::object_manager;
-    use crate::ntos::ex::exports::zw;
+    use crate::ntos::ex::system_information;
     let block = guest::alloc_bytes(0x1000);
     let output = block + 0x300;
     let io_status = block + 0x310;
@@ -1885,11 +1885,11 @@ fn zw_group_exports(assert: Assert) {
     guest::write_bytes(buffer, &[0xAA; 16]);
     assert(status(call_export("ZwQuerySystemInformation", &[117, buffer, 16, block + 0x2F0])) == 0 && guest::read64(buffer) == 0 && guest::read32(block + 0x2F0) == 16, "zw: classe 117 sem operacoes de certificado pendentes");
     assert(status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 0x40])) == 0 && guest::read8(buffer) == 1 && guest::read8(buffer + 2) == 0 && status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 8])) == 0xC000_0023, "zw: ZwPowerInformation (SystemPowerCapabilities)");
-    let before = zw::entropy_registrations().len();
+    let before = system_information::entropy_registrations().len();
     guest::write64(buffer, 0x1111);
     guest::write64(buffer + 8, 0x2222);
     guest::write64(buffer + 16, 0x3333);
-    assert(status(call_export("ZwSetSystemInformation", &[131, buffer, 24])) == 0 && zw::entropy_registrations().len() == before + 1 && status(call_export("ZwSetSystemInformation", &[999, buffer, 24])) == 0xC000_0003, "zw: ZwSetSystemInformation registra as rotinas de entropia");
+    assert(status(call_export("ZwSetSystemInformation", &[131, buffer, 24])) == 0 && system_information::entropy_registrations().len() == before + 1 && status(call_export("ZwSetSystemInformation", &[999, buffer, 24])) == 0xC000_0003, "zw: ZwSetSystemInformation registra as rotinas de entropia");
     let basic = call_export("ZwQueryInformationProcess", &[u64::MAX, 0, buffer, 0x30, block + 0x2F0]);
     assert(status(basic) == 0 && guest::read32(buffer) == 0x103 && guest::read64(buffer + 0x20) == process_id_of_current() && guest::read32(block + 0x2F0) == 0x30, "zw: ZwQueryInformationProcess (ProcessBasicInformation)");
     // Evento nomeado: ZwOpenEvent + ZwWaitForSingleObject.

@@ -11,8 +11,10 @@ use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::objects::namespace as namespace_objects;
 use crate::ntos::ob::open_pointer;
 use crate::ntos::ex::callback_security;
+use crate::ntos::ex::callbacks as executive_callbacks;
 use crate::ntos::ps::user_probe;
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -222,6 +224,15 @@ pub fn make_temporary(handle: u64) -> Option<u32> {
         Err(STATUS_OBJECT_TYPE_MISMATCH) => None,
         Err(status) => Some(status),
     }
+}
+
+/// ZwMakeTemporaryObject: os objetos de callback do Executive primeiro,
+/// depois os nós do namespace; outro handle = STATUS_INVALID_HANDLE.
+pub fn make_temporary_object(handle: u64) -> Result<u32, KernelError> {
+    if let Some(status) = executive_callbacks::make_temporary(handle)? {
+        return Ok(status);
+    }
+    Ok(make_temporary(handle).unwrap_or(STATUS_INVALID_HANDLE))
 }
 
 /// NtQueryDirectoryObject: descritores nome/tipo, um terminador vazio e os

@@ -931,6 +931,20 @@ pub fn get_current_process_id() -> u64 {
     guest::read64(thread + kthread::CID_UNIQUE_PROCESS)
 }
 
+/// "Handle de processo" dos serviços Zw: -1/0 = corrente (CID da thread);
+/// senão o pid.
+pub fn process_id_from_handle(handle: u64) -> u64 {
+    let value = handle as u32 as i32;
+    if value == -1 || value == 0 {
+        let thread = get_current_thread();
+        if thread == 0 {
+            return 4;
+        }
+        return guest::read64(thread + kthread::CID_UNIQUE_PROCESS);
+    }
+    value as u32 as u64
+}
+
 pub fn get_current_thread_id() -> u64 {
     let thread = get_current_thread();
     if thread == 0 {

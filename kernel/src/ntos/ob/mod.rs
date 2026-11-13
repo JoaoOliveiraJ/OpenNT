@@ -21,4 +21,5 @@ pub mod object_create;
 pub mod object_open;
 pub mod object_reference;
 pub mod object_security;
+pub mod wait;
 pub mod exports;

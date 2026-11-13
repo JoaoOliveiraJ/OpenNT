@@ -2,7 +2,8 @@
 //!
 //! A palavra nativa de 32 bits do chamador: o bit 31 reserva o escritor, o
 //! bit 30 marca espera por leitores e os bits 0 a 29 contam leitores. Não há
-//! fila paralela de donos.
+//! fila paralela de donos. No fim, o spin lock legado (test-and-set com
+//! subida a DISPATCH_LEVEL) de ExAcquireSpinLock/ExReleaseSpinLock.
 
 use crate::hal::cpu;
 use crate::ntos::ke::irql;
@@ -190,4 +191,31 @@ pub fn try_convert(pointer: u64) -> Result<bool, KernelError> {
     }
     drain_readers(pointer, 1);
     Ok(true)
+}
+
+// ---- spin lock legado (ExAcquireSpinLock/ExReleaseSpinLock) -----------------
+
+/// Spin lock legado com subida a DISPATCH_LEVEL.
+pub fn lock_with_raise(lock: u64) -> u8 {
+    let previous = irql::get_irql();
+    irql::raise_irql(2);
+    loop {
+        if guest::read32(lock) == 0 {
+            guest::write32(lock, 1);
+            return previous;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+pub fn unlock_with_lower(lock: u64, previous: u8) {
+    guest::write32(lock, 0);
+    irql::lower_irql(previous as u64);
+}
+
+/// API legada: sobe a DISPATCH_LEVEL e adquire por test-and-set; o IRQL
+/// anterior vai para `old_irql`.
+pub fn acquire_legacy(lock: u64, old_irql: u64) {
+    let previous = lock_with_raise(lock);
+    guest::write32(old_irql, previous as u32);
 }

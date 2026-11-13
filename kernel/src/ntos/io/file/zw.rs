@@ -331,6 +331,12 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
     publish_file_handle(entry, output, io_status, information)
 }
 
+/// ZwOpenFile = ZwCreateFile com FILE_OPEN (compartilhamento e opções não
+/// são repassados, como no original).
+pub fn open_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64) -> Result<u32, KernelError> {
+    create_kernel_file(output, desired_access, attributes_pointer, io_status, 0, FILE_OPEN, 0)
+}
+
 /// FILE_OBJECT, acesso e opções de um handle de arquivo do kernel; recusa
 /// handle de outro processo ou de kernel pedido do modo usuário.
 pub fn query_file_handle(handle: u64, user: bool) -> Option<Result<(u64, u32, u32), u32>> {

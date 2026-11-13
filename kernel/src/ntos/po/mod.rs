@@ -5,4 +5,5 @@ pub mod power_setting;
 pub mod idle;
 pub mod fx;
 pub mod black_box;
+pub mod power_information;
 pub mod exports;
