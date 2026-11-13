@@ -33,6 +33,7 @@ use crate::ntos::inc::types::{Eprocess, Ethread, Kthread, LargeInteger, ListEntr
 use crate::ntos::ps::silo::query::INHERIT as INHERIT_PROCESS_SILO;
 
 use crate::ntos::ps::notify::{process as process_notify, thread as thread_notify};
+use crate::ntos::ps::user::process_state;
 
 pub const SYSTEM_PROCESS_ID: u64 = 4;
 /// Política inicial de memória, distinta da prioridade de CPU.
@@ -298,7 +299,13 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
         None => None,
     };
     let security = object_access::capture(Some(primary_token));
-    if let Err(error) = process_handles::create(process, process_id) {
+    // O estado por processo nasce com a ObjectTable, antes da lista ativa.
+    let tables = process_state::create(process, process_id).and_then(|_| {
+        process_handles::create(process, process_id).inspect_err(|_| {
+            process_state::destroy(process);
+        })
+    });
+    if let Err(error) = tables {
         if let (Some(image), Some(provider)) = (&image, provider) {
             (provider.destroy)(image);
         }
@@ -631,6 +638,9 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     object.active_threads.set(0);
     write_time(&object.exit_time, timestamp());
     remove_from_active_list(object);
+    // Fora da lista ativa, o estado por processo some; o EPROCESS pode
+    // continuar retido por referências.
+    process_state::destroy(process);
     if let Some(record) = STATE.lock().processes.get_mut(&process) {
         record.terminated = true;
     }

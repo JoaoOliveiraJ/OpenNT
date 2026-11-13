@@ -1,6 +1,7 @@
 //! Subsistema de modo usuário.
 
 pub mod state;
+pub mod process_state;
 pub mod sections;
 pub mod memory_query;
 pub mod memory;

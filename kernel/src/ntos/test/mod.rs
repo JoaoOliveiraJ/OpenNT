@@ -8,5 +8,6 @@ pub mod phase4;
 pub mod phase5;
 pub mod phase6;
 pub mod phase7;
+pub mod multiprocess;
 pub mod resource_search_fixtures;
 pub mod cc_fixture;

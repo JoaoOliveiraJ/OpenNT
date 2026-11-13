@@ -58,7 +58,8 @@ kernel/src/
 │   │   └── resource/  recursos de imagens (ldrrsrc)
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── po/ etw/ kd/ dbgk/ fsrtl/
-│   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs)
+│   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs;
+│                      multiprocess/, um módulo por assunto, chamado pela fase 7)
 ├── drivers/           drivers internos
 │   ├── fs/            sistemas de arquivos: RAMFS de boot, volumes, NTFS
 │   ├── bus/ storage/ input/ video/ console/
@@ -205,6 +206,12 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   mudado em operações longas, como um volume NTFS, fica atrás de
   `SharedLock`, o papel do ERESOURCE: leituras compartilhadas, mutações
   exclusivas, readquirível por quem já o possui.
+- **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
+  guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
+  `ProcessState` por EPROCESS (o System inclusive), criado por
+  `ps::process::create_process` antes da lista ativa e destruído por
+  `terminate_process` depois dela. Estado novo de processo entra ali, não num
+  global de `ps/user/state.rs`.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do

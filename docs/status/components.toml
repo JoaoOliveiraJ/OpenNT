@@ -615,7 +615,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/ps/user"]
 testes = ["fase7"]
 fase = "7"
-notas = "Roda um processo de usuário por vez, e todos dividem um só espaço de endereços. O único executável que roda hoje é o PE mínimo gerado pelo teste da fase 7, com a ntdll de bring-up. Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe (ApiPort e SharedSection da sessão 0, ativas em todo boot), mantida só até o csrss.exe real rodar. APCs de usuário (NtQueueApcThread/Ex/Ex2 e NtTestAlert) são entregues no retorno ao modo usuário pelo frame do KiUserApcDispatcher, e NtContinueEx, NtGet/SetContextThread, NtOpenProcess e NtGetNextProcess/Thread já têm handler."
+notas = "Roda um processo de usuário por vez, e todos dividem um só espaço de endereços. Cada EPROCESS, o System inclusive, já tem um registro de estado próprio (process_state.rs), criado com o processo e destruído no término; a tabela de handles, as regiões de memória e a identidade do processo ainda são globais. O único executável que roda hoje é o PE mínimo gerado pelo teste da fase 7, com a ntdll de bring-up. Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe (ApiPort e SharedSection da sessão 0, ativas em todo boot), mantida só até o csrss.exe real rodar. APCs de usuário (NtQueueApcThread/Ex/Ex2 e NtTestAlert) são entregues no retorno ao modo usuário pelo frame do KiUserApcDispatcher, e NtContinueEx, NtGet/SetContextThread, NtOpenProcess e NtGetNextProcess/Thread já têm handler."
 
 [[componente]]
 nome = "ntdll.dll, KERNEL32 e KERNELBASE"
