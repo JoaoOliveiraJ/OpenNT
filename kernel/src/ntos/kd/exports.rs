@@ -56,3 +56,23 @@ pub mod debug_prompt {
         data_exports: &[],
     };
 }
+
+pub mod kd_debug_filter {
+    //! Adaptador de DbgSetDebugFilterState (lógica em `kd/debug_filter.rs`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::kd::debug_filter;
+    use crate::rtl::KernelError;
+
+    /// (ComponentId, Level, State BOOLEAN).
+    fn set_debug_filter_state(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(debug_filter::set_filter_state(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) & 0xFF != 0)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "kd-debug-filter",
+        names: &["DbgSetDebugFilterState"],
+        handlers: &[set_debug_filter_state],
+        data_exports: &[],
+    };
+}

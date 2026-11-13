@@ -27,3 +27,4 @@ pub mod security;
 pub mod win32_callouts;
 pub mod user;
 pub mod exports;
+pub mod property_set;

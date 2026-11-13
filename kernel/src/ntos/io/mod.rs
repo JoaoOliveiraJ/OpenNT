@@ -39,3 +39,4 @@ pub mod pnp_interfaces;
 pub mod builtin_driver;
 pub mod named_event;
 pub mod wmi_data_block;
+pub mod driver_registry;

@@ -1044,3 +1044,35 @@ pub mod thread_process_queries {
         data_exports: &[],
     };
 }
+
+pub mod ps_property_sets {
+    //! Adaptadores de Ps{Get,Set}{Thread,Job}Property (lógica em
+    //! `ps/property_set.rs`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::property_set;
+    use crate::rtl::KernelError;
+
+    fn set_thread_property(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(property_set::set_thread_property(call.arg(1), call.arg(2), call.arg(3))))
+    }
+
+    fn get_thread_property(call: &Call) -> Result<u64, KernelError> {
+        Ok(property_set::get_thread_property(call.arg(1), call.arg(2), call.arg(3) as u32))
+    }
+
+    fn set_job_property(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(property_set::set_job_property(call.arg(1), call.arg(2), call.arg(3))))
+    }
+
+    fn get_job_property(call: &Call) -> Result<u64, KernelError> {
+        Ok(property_set::get_job_property(call.arg(1), call.arg(2)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-property-sets",
+        names: &["PsSetThreadProperty", "PsGetThreadProperty", "PsSetJobProperty", "PsGetJobProperty"],
+        handlers: &[set_thread_property, get_thread_property, set_job_property, get_job_property],
+        data_exports: &[],
+    };
+}

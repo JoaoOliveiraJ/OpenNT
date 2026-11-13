@@ -367,3 +367,101 @@ pub fn release_captured(captured: u64) {
 pub fn convert_string_to_descriptor() -> u32 {
     STATUS_NOT_IMPLEMENTED
 }
+
+// ---- Self-relative -> absoluto (RtlSelfRelativeToAbsoluteSD, ntoskrnl 19041
+// 0x7675b0, com RtlpQuerySecurityDescriptor 0x767b04) -------------------------
+
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_BAD_DESCRIPTOR_FORMAT: u32 = 0xC000_00E7;
+
+/// Bytes do SID (8 + 4n), como o memcpy do original.
+fn sid_bytes(sid_pointer: u64) -> u32 {
+    8 + 4 * sid::at(sid_pointer).sub_authority_count.get() as u32
+}
+
+/// Tamanho do SID como o RtlpQuerySecurityDescriptor informa (8 + 4n,
+/// arredondado a 4); ausente = 0.
+fn sid_query_length(sid_pointer: u64) -> u32 {
+    if sid_pointer == 0 { 0 } else { align4(sid_bytes(sid_pointer)) }
+}
+
+/// AclSize arredondado a 4; ausente = 0.
+fn acl_query_length(acl_pointer: u64) -> u32 {
+    if acl_pointer == 0 { 0 } else { align4(acl_at(acl_pointer).acl_size.get() as u32) }
+}
+
+/// Cópia em bloco de um componente para o buffer do chamador.
+fn copy_component(destination: u64, source: u64, length: u32) {
+    guest::write_bytes(destination, &guest::read_bytes(source, length as usize));
+}
+
+/// Buffers de saída de RtlSelfRelativeToAbsoluteSD: o SD absoluto (None =
+/// NULL), os buffers de cada componente e as capacidades (PULONG in/out).
+pub struct AbsoluteBuffers<'a> {
+    pub descriptor: Option<&'a SecurityDescriptor>,
+    pub descriptor_size: &'a crate::ntos::inc::types::Field<u32>,
+    pub dacl: u64,
+    pub dacl_size: &'a crate::ntos::inc::types::Field<u32>,
+    pub sacl: u64,
+    pub sacl_size: &'a crate::ntos::inc::types::Field<u32>,
+    pub owner: u64,
+    pub owner_size: &'a crate::ntos::inc::types::Field<u32>,
+    pub group: u64,
+    pub group_size: &'a crate::ntos::inc::types::Field<u32>,
+}
+
+/// RtlSelfRelativeToAbsoluteSD: SD sem SE_SELF_RELATIVE =
+/// STATUS_BAD_DESCRIPTOR_FORMAT; se o SD absoluto (0x28) ou algum componente
+/// não cabe, grava os cinco tamanhos necessários e devolve
+/// STATUS_BUFFER_TOO_SMALL; senão copia os 20 bytes do cabeçalho (os bytes
+/// 4..7 do absoluto ficam com o offset do dono, como o memcpy do original),
+/// limpa SE_SELF_RELATIVE e os quatro ponteiros, e copia cada componente
+/// presente para o buffer dele (SID: 8 + 4n bytes; ACL: AclSize bytes).
+pub fn self_relative_to_absolute(relative: u64, out: &AbsoluteBuffers) -> u32 {
+    let flags = control(relative);
+    if flags & SELF_RELATIVE == 0 {
+        return STATUS_BAD_DESCRIPTOR_FORMAT;
+    }
+    let owner = component(relative, flags, 0);
+    let group = component(relative, flags, 1);
+    let sacl = component(relative, flags, 2);
+    let dacl = component(relative, flags, 3);
+    let (owner_length, group_length) = (sid_query_length(owner), sid_query_length(group));
+    let (sacl_length, dacl_length) = (acl_query_length(sacl), acl_query_length(dacl));
+    let fits = out.descriptor.is_some()
+        && out.descriptor_size.get() >= SecurityDescriptor::SIZE as u32
+        && owner_length <= out.owner_size.get()
+        && dacl_length <= out.dacl_size.get()
+        && sacl_length <= out.sacl_size.get()
+        && group_length <= out.group_size.get();
+    let Some(absolute) = out.descriptor.filter(|_| fits) else {
+        out.descriptor_size.set(SecurityDescriptor::SIZE as u32);
+        out.group_size.set(group_length);
+        out.owner_size.set(owner_length);
+        out.sacl_size.set(sacl_length);
+        out.dacl_size.set(dacl_length);
+        return STATUS_BUFFER_TOO_SMALL;
+    };
+    copy_component(absolute.address(), relative, RELATIVE_HEADER);
+    absolute.control.set(absolute.control.get() & !SELF_RELATIVE);
+    for pointer in [&absolute.owner, &absolute.group, &absolute.sacl, &absolute.dacl] {
+        pointer.set(0);
+    }
+    if owner != 0 {
+        copy_component(out.owner, owner, sid_bytes(owner));
+        absolute.owner.set(out.owner);
+    }
+    if group != 0 {
+        copy_component(out.group, group, sid_bytes(group));
+        absolute.group.set(out.group);
+    }
+    if sacl != 0 {
+        copy_component(out.sacl, sacl, acl_at(sacl).acl_size.get() as u32);
+        absolute.sacl.set(out.sacl);
+    }
+    if dacl != 0 {
+        copy_component(out.dacl, dacl, acl_at(dacl).acl_size.get() as u32);
+        absolute.dacl.set(out.dacl);
+    }
+    0
+}

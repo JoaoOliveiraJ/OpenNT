@@ -1373,3 +1373,180 @@ pub mod crt_formatting {
         data_exports: &[],
     };
 }
+
+pub mod rtl_bitmap_ex {
+    //! Adaptadores dos bitmaps de 64 bits (lógica em `rtl/bitmap.rs`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{NtStruct, RtlBitmapEx};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    /// PRTL_BITMAP_EX do chamador.
+    fn header(address: u64) -> &'static RtlBitmapEx {
+        // SAFETY: o export recebe um RTL_BITMAP_EX vivo e alinhado, como no NT.
+        unsafe { RtlBitmapEx::at(address) }
+    }
+
+    fn initialize_bitmap_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::initialize_ex(header(call.arg(1)), call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    fn set_bit_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::set_bit_ex(header(call.arg(1)), call.arg(2));
+        Ok(0)
+    }
+
+    fn clear_bit_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::clear_bit_ex(header(call.arg(1)), call.arg(2));
+        Ok(0)
+    }
+
+    fn test_bit_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::test_bit_ex(header(call.arg(1)), call.arg(2)) as u64)
+    }
+
+    fn find_clear_bits_and_set_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_clear_bits_and_set_ex(header(call.arg(1)), call.arg(2), call.arg(3)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-bitmap-ex",
+        names: &["RtlInitializeBitMapEx", "RtlSetBitEx", "RtlClearBitEx", "RtlTestBitEx", "RtlFindClearBitsAndSetEx"],
+        handlers: &[initialize_bitmap_ex, set_bit_ex, clear_bit_ex, test_bit_ex, find_clear_bits_and_set_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_self_relative_sd {
+    //! Adaptador de RtlSelfRelativeToAbsoluteSD (lógica em `se/descriptor.rs`).
+
+    use crate::ntos::inc::types::{Field, NtStruct, SecurityDescriptor};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::descriptor::{self, AbsoluteBuffers};
+    use crate::rtl::KernelError;
+
+    /// PULONG in/out do chamador.
+    fn size(address: u64) -> &'static Field<u32> {
+        // SAFETY: os cinco PULONG de capacidade são obrigatórios no NT.
+        unsafe { Field::<u32>::at(address) }
+    }
+
+    /// (SelfRelativeSD, AbsoluteSD, AbsoluteSDSize, Dacl, DaclSize, Sacl,
+    /// SaclSize, Owner, OwnerSize, PrimaryGroup, PrimaryGroupSize).
+    fn self_relative_to_absolute_sd(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: buffer do SD absoluto do chamador (NULL = só consulta tamanhos).
+        let absolute = (call.arg(2) != 0).then(|| unsafe { SecurityDescriptor::at(call.arg(2)) });
+        let buffers = AbsoluteBuffers {
+            descriptor: absolute,
+            descriptor_size: size(call.arg(3)),
+            dacl: call.arg(4),
+            dacl_size: size(call.arg(5)),
+            sacl: call.arg(6),
+            sacl_size: size(call.arg(7)),
+            owner: call.arg(8),
+            owner_size: size(call.arg(9)),
+            group: call.arg(10),
+            group_size: size(call.arg(11)),
+        };
+        Ok(signed_status(descriptor::self_relative_to_absolute(call.arg(1), &buffers)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-self-relative-sd",
+        names: &["RtlSelfRelativeToAbsoluteSD"],
+        handlers: &[self_relative_to_absolute_sd],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_network_address {
+    //! Adaptadores de RtlIpv{4,6}StringToAddressW e RtlIpv{4,6}AddressToString{,Ex}W
+    //! (lógica em `rtl/network_address.rs`).
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::network_address;
+    use crate::rtl::KernelError;
+
+    /// Célula de saída do chamador (PWSTR*, IN_ADDR, PULONG): memória do
+    /// kernel ou de drivers, como no NT.
+    fn cell<T: Copy>(address: u64) -> &'static Field<T> {
+        // SAFETY: ponteiro de saída vivo e alinhado do chamador.
+        unsafe { Field::<T>::at(address) }
+    }
+
+    /// (S, Strict BOOLEAN, Terminator, Addr).
+    fn ipv4_string_to_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv4_string_to_address(call.arg(1), call.arg(2) & 0xFF != 0, cell(call.arg(3)), cell(call.arg(4)))))
+    }
+
+    /// (S, Terminator, Addr).
+    fn ipv6_string_to_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv6_string_to_address(call.arg(1), cell(call.arg(2)), call.arg(3))))
+    }
+
+    /// (Addr, S) -> fim da string.
+    fn ipv4_address_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(network_address::ipv4_address_to_string(call.arg(1), call.arg(2)))
+    }
+
+    /// (Addr, Port, Buffer, Length); Length NULL é recusado pela rotina.
+    fn ipv4_address_to_string_ex(call: &Call) -> Result<u64, KernelError> {
+        let length = (call.arg(4) != 0).then(|| cell::<u32>(call.arg(4)));
+        Ok(signed_status(network_address::ipv4_address_to_string_ex(call.arg(1), call.arg(2) as u16, call.arg(3), length)))
+    }
+
+    /// (Addr, S) -> fim da string.
+    fn ipv6_address_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(network_address::ipv6_address_to_string(call.arg(1), call.arg(2)))
+    }
+
+    /// (Addr, ScopeId, Port, Buffer, Length).
+    fn ipv6_address_to_string_ex(call: &Call) -> Result<u64, KernelError> {
+        let length = (call.arg(5) != 0).then(|| cell::<u32>(call.arg(5)));
+        Ok(signed_status(network_address::ipv6_address_to_string_ex(call.arg(1), call.arg(2) as u32, call.arg(3) as u16, call.arg(4), length)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-network-address",
+        names: &[
+            "RtlIpv4StringToAddressW", "RtlIpv6StringToAddressW", "RtlIpv4AddressToStringW",
+            "RtlIpv4AddressToStringExW", "RtlIpv6AddressToStringW", "RtlIpv6AddressToStringExW",
+        ],
+        handlers: &[ipv4_string_to_address, ipv6_string_to_address, ipv4_address_to_string, ipv4_address_to_string_ex, ipv6_address_to_string, ipv6_address_to_string_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_crt_wide {
+    //! Adaptadores de _wtoi/towlower/RtlPrefetchMemoryNonTemporal (lógica em
+    //! `rtl/crt.rs`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    /// int em eax (sinal estendido para o registrador inteiro).
+    fn wtoi(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wtoi(call.arg(1)) as i64 as u64)
+    }
+
+    /// wint_t em ax.
+    fn towlower(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::towlower(call.arg(1) as u16) as u64)
+    }
+
+    fn prefetch_memory_non_temporal(call: &Call) -> Result<u64, KernelError> {
+        crt::prefetch_memory_non_temporal(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-crt-wide",
+        names: &["_wtoi", "towlower", "RtlPrefetchMemoryNonTemporal"],
+        handlers: &[wtoi, towlower, prefetch_memory_non_temporal],
+        data_exports: &[],
+    };
+}

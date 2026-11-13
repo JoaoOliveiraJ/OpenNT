@@ -461,3 +461,33 @@ pub mod se_access {
 }
 
 // =============================================================================
+
+pub mod se_access_from_state {
+    //! Adaptadores de SeTokenFromAccessInformation e SeAccessCheckFromStateEx
+    //! (lógica em `se/access_check.rs`).
+
+    use crate::ntos::inc::types::{Field, NtStruct, TokenAccessInformation};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::access_check;
+    use crate::rtl::KernelError;
+
+    /// (PTOKEN_ACCESS_INFORMATION, PVOID Token, ULONG Length, PULONG RequiredLength).
+    fn token_from_access_information(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: TOKEN_ACCESS_INFORMATION capturado e PULONG de saída do chamador.
+        let (information, required) = unsafe { (TokenAccessInformation::at(call.arg(1)), Field::<u32>::at(call.arg(4))) };
+        Ok(signed_status(access_check::token_from_access_information_checked(information, call.arg(2), call.arg(3) as u32, required)))
+    }
+
+    /// (Sd, PrimaryToken, ClientToken, Desired, PrevGranted, Privileges,
+    /// GenericMapping, AccessMode, GrantedAccess, AccessStatus) -> BOOLEAN.
+    fn access_check_from_state_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(access_check::access_check_from_state_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(8) as u8 as u32, call.arg(9), call.arg(10)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-access-from-state",
+        names: &["SeTokenFromAccessInformation", "SeAccessCheckFromStateEx"],
+        handlers: &[token_from_access_information, access_check_from_state_ex],
+        data_exports: &[],
+    };
+}

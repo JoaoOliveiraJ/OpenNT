@@ -29,3 +29,40 @@ pub fn query_trace_information(buffer: u64, length: u32, required_out: u64) {
         unsafe { Field::<u32>::at(required_out) }.set(reported);
     }
 }
+
+// ---- Relógio do WMI/ETW (WmiGetClock, ntoskrnl 19041 0x5a66a0) ----------------
+//
+// WmiGetClock(ClockType, Context) -> LARGE_INTEGER, Context ignorado:
+//   0 WMICT_DEFAULT    : o relógio da sessão 0 no estado ETW do silo
+//                        (byte em EtwSiloState + 0x1071): 2 = hora do sistema,
+//                        3 = ciclos (rdtsc), qualquer outro = contador de
+//                        desempenho. Sem sessão 0 configurada o byte é 0, que
+//                        cai no contador de desempenho — o caso do OpenNT, cujo
+//                        logger não usa a entrada 0.
+//   1 WMICT_SYSTEMTIME : RtlGetSystemTimePrecise (também ClockType < 0 e > 5);
+//   2 WMICT_PERFCOUNTER: KeQueryPerformanceCounter(NULL);
+//   3 WMICT_PROCESS, 4 WMICT_THREAD: 0;
+//   5 WMICT_CPUCYCLE   : rdtsc.
+
+/// Relógio da entrada 0 do estado ETW: nenhuma sessão o configura no OpenNT.
+const DEFAULT_SESSION_CLOCK: u8 = 0;
+
+fn wmi_performance_counter() -> u64 {
+    // KeQueryPerformanceCounter do OpenNT: o TSC.
+    crate::hal::cpu::rdtsc()
+}
+
+/// WmiGetClock.
+pub fn get_clock(clock_type: u32, _context: u64) -> u64 {
+    match clock_type as i32 {
+        0 => match DEFAULT_SESSION_CLOCK {
+            2 => crate::ntos::ke::clock::system_time_100ns(),
+            3 => crate::hal::cpu::rdtsc(),
+            _ => wmi_performance_counter(),
+        },
+        2 => wmi_performance_counter(),
+        3 | 4 => 0,
+        5 => crate::hal::cpu::rdtsc(),
+        _ => crate::ntos::ke::clock::system_time_100ns(),
+    }
+}

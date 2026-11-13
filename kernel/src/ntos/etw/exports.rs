@@ -129,3 +129,23 @@ pub mod trace_control {
 
     pub static ENABLE_TRACE_GROUP: Group = Group { name: "enable-trace", names: &["EtwEnableTrace"], handlers: &[enable_trace], data_exports: &[] };
 }
+
+pub mod etw_wmi_clock {
+    //! Adaptador de WmiGetClock (lógica em `etw/wmi.rs`).
+
+    use crate::ntos::etw::wmi;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// (WMI_CLOCK_TYPE, Context) -> LARGE_INTEGER em rax.
+    fn get_clock(call: &Call) -> Result<u64, KernelError> {
+        Ok(wmi::get_clock(call.arg(1) as u32, call.arg(2)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "etw-wmi-clock",
+        names: &["WmiGetClock"],
+        handlers: &[get_clock],
+        data_exports: &[],
+    };
+}

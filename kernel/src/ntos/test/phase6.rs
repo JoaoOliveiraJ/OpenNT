@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1114 && abi_names::GROUP_LAYOUT.len() == 183 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1114 exports em 183 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1151 && abi_names::GROUP_LAYOUT.len() == 198 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1151 exports em 198 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1114 && exports::export_names().len() == 1114, "ntoskrnl: 183 grupos com os 1114 exports implementados");
+    assert(exports::implemented() == 1151 && exports::export_names().len() == 1151, "ntoskrnl: 198 grupos com os 1151 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -5191,6 +5191,613 @@ fn io_work_item_queue_exports(assert: Assert) {
 }
 
 
+fn rtl_bitmap_ex_exports(assert: Assert) {
+    // 200 bits sobre 4 ULONG64: livres 8..15, 32..63, 129..190, 192..199.
+    const BASE: [u64; 4] = [0x0000_0000_FFFF_00FF, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0001, 0];
+    let words = guest::alloc_bytes(32);
+    let header = guest::alloc_bytes(nt::RtlBitmapEx::SIZE);
+    let word = |index: u64| at::<nt::Field<u64>>(words + index * 8);
+    let reset = || {
+        for (index, value) in BASE.iter().enumerate() {
+            word(index as u64).set(*value);
+        }
+    };
+    reset();
+    let bitmap = at::<nt::RtlBitmapEx>(header);
+    assert(call_export("RtlInitializeBitMapEx", &[header, words, 200]).is_some() && bitmap.size_of_bit_map.get() == 200 && bitmap.buffer.get() == words, "rtl-bitmap-ex: RtlInitializeBitMapEx grava Size e Buffer");
+    assert(call_export("RtlTestBitEx", &[header, 0]) == Some(1) && call_export("RtlTestBitEx", &[header, 8]) == Some(0) && call_export("RtlTestBitEx", &[header, 191]) == Some(1), "rtl-bitmap-ex: RtlTestBitEx le bits de palavras distintas");
+    call_export("RtlSetBitEx", &[header, 130]);
+    assert(word(2).get() == 0x8000_0000_0000_0005, "rtl-bitmap-ex: RtlSetBitEx liga o bit 130");
+    call_export("RtlClearBitEx", &[header, 191]);
+    assert(word(2).get() == 0x0000_0000_0000_0005 && call_export("RtlTestBitEx", &[header, 191]) == Some(0), "rtl-bitmap-ex: RtlClearBitEx desliga o bit 191");
+
+    // (NumberToFind, HintIndex) -> (indice, palavra alterada, valor esperado).
+    let cases: [(u64, u64, u64, u64, u64); 8] = [
+        (4, 0, 0x8, 0, 0x0000_0000_FFFF_0FFF),
+        (9, 0, 0x20, 0, 0x0000_01FF_FFFF_00FF),
+        (40, 0, 0x81, 2, 0x8000_01FF_FFFF_FFFF),
+        (3, 150, 0x96, 2, 0x8000_0000_01C0_0001),
+        (60, 150, 0x81, 2, 0x9FFF_FFFF_FFFF_FFFF),
+        (10, 199, 0x20, 0, 0x0000_03FF_FFFF_00FF),
+        (8, 250, 0x8, 0, 0x0000_0000_FFFF_FFFF),
+        (1, 0, 0x8, 0, 0x0000_0000_FFFF_01FF),
+    ];
+    let mut all = true;
+    for (count, hint, index, changed, value) in cases {
+        reset();
+        all &= call_export("RtlFindClearBitsAndSetEx", &[header, count, hint]) == Some(index) && word(changed).get() == value;
+    }
+    assert(all, "rtl-bitmap-ex: RtlFindClearBitsAndSetEx acha o primeiro run e o liga (com segunda passada)");
+    reset();
+    let none = [(63u64, 0u64), (64, 0), (130, 0), (300, 0)].iter().all(|&(count, hint)| call_export("RtlFindClearBitsAndSetEx", &[header, count, hint]) == Some(u64::MAX));
+    assert(none && (0..4u64).all(|index| word(index).get() == BASE[index as usize]), "rtl-bitmap-ex: sem run livre devolve -1 sem alterar o mapa");
+    assert(call_export("RtlFindClearBitsAndSetEx", &[header, 0, 13]) == Some(8) && call_export("RtlFindClearBitsAndSetEx", &[header, 0, 250]) == Some(0), "rtl-bitmap-ex: NumberToFind 0 devolve a dica alinhada a 8");
+    guest::free_bytes(header);
+    guest::free_bytes(words);
+}
+
+
+fn ex_interlocked_exports(assert: Assert) {
+    let cell = guest::alloc_bytes(16);
+    let lock = guest::alloc_bytes(8);
+    let (large, low, neighbour, spin) = (at::<nt::Field<i64>>(cell), at::<nt::Field<u32>>(cell + 8), at::<nt::Field<u32>>(cell + 12), at::<nt::Field<u64>>(lock));
+    spin.set(0);
+    large.set(0x7FFF_FFFF_FFFF_FFF0);
+    let interrupts_before = crate::hal::cpu::save_and_disable_interrupts();
+    crate::hal::cpu::restore_interrupts(interrupts_before);
+    assert(call_export("ExInterlockedAddLargeInteger", &[cell, 0x20, lock]) == Some(0x7FFF_FFFF_FFFF_FFF0) && large.get() as u64 == 0x8000_0000_0000_0010 && spin.get() == 0, "ex-interlocked: ExInterlockedAddLargeInteger devolve o anterior e libera o lock");
+    assert(call_export("ExInterlockedAddLargeInteger", &[cell, (-0x10i64) as u64, lock]) == Some(0x8000_0000_0000_0010) && large.get() as u64 == 0x8000_0000_0000_0000, "ex-interlocked: ExInterlockedAddLargeInteger soma incremento negativo");
+    low.set(0xFFFF_FFFE);
+    neighbour.set(0x1234_5678);
+    assert(call_export("ExInterlockedAddUlong", &[cell + 8, 5, lock]) == Some(0xFFFF_FFFE) && low.get() == 3 && neighbour.get() == 0x1234_5678 && spin.get() == 0, "ex-interlocked: ExInterlockedAddUlong da a volta em 32 bits sem tocar o vizinho");
+    let interrupts_after = crate::hal::cpu::save_and_disable_interrupts();
+    crate::hal::cpu::restore_interrupts(interrupts_after);
+    assert(interrupts_after & 0x200 == interrupts_before & 0x200, "ex-interlocked: estado de IF preservado");
+    guest::free_bytes(lock);
+    guest::free_bytes(cell);
+}
+
+
+fn ex_processor_usage_exports(assert: Assert) {
+    use crate::ntos::ke::pcr;
+    let prcb = at::<nt::Kprcb>(at::<nt::Kpcr>(pcr::get_pcr_address()).current_prcb.get());
+    let (saved_idle, saved_kernel, saved_user) = (prcb.idle_thread.get(), prcb.kernel_time.get(), prcb.user_time.get());
+    let out = guest::alloc_bytes(16);
+    let field = |offset: u64| at::<nt::Field<u32>>(out + offset);
+    // KTHREAD ociosa sintética: só KernelTime; Process aponta para o próprio
+    // bloco, então nenhuma thread real casa com ela em is_idle_thread.
+    let idle = guest::alloc_bytes(nt::Kthread::SIZE);
+    let idle_thread = at::<nt::Kthread>(idle);
+    idle_thread.process.set(idle);
+    idle_thread.kernel_time.set(250);
+    prcb.idle_thread.set(idle);
+    prcb.kernel_time.set(700);
+    prcb.user_time.set(300);
+    call_export("ExGetCurrentProcessorCounts", &[out, out + 4, out + 8]);
+    assert(field(0).get() == 250 && field(4).get() == 1000 && field(8).get() == prcb.number.get(), "ex-processor-usage: ExGetCurrentProcessorCounts le ocioso, kernel+usuario e o numero da KPRCB");
+    call_export("ExGetCurrentProcessorCpuUsage", &[out + 12]);
+    // 100 - 250*100/1000 = 75.
+    assert(field(12).get() == 75, "ex-processor-usage: ExGetCurrentProcessorCpuUsage = 100 - ocioso*100/total");
+    idle_thread.kernel_time.set(999);
+    call_export("ExGetCurrentProcessorCpuUsage", &[out + 12]);
+    // 100 - 99900/1000 = 100 - 99 = 1 (divisão inteira).
+    assert(field(12).get() == 1, "ex-processor-usage: divisao inteira do original");
+    prcb.idle_thread.set(saved_idle);
+    prcb.kernel_time.set(saved_kernel);
+    prcb.user_time.set(saved_user);
+    guest::free_bytes(idle);
+    guest::free_bytes(out);
+}
+
+
+fn io_driver_registry_exports(assert: Assert) {
+    use crate::ntos::cm::key::services as key_services;
+    use crate::ntos::cm::registry;
+    use crate::ntos::io::io_manager;
+    const SERVICE: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\OpenNTDrvKeyTest";
+    // DRIVER_OBJECT + DRIVER_EXTENSION sintéticos com ServiceKeyName "OpenNTDrvKeyTest".
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    let extension = guest::alloc_bytes(nt::DriverExtension::SIZE);
+    let name = guest::alloc_bytes(64);
+    guest::write_bytes(name, &crate::ntos::rtl::guest_strings::wide_bytes_with_nul("OpenNTDrvKeyTest"));
+    let service_key_name = &at::<nt::DriverExtension>(extension).service_key_name;
+    service_key_name.length.set(32);
+    service_key_name.maximum_length.set(34);
+    service_key_name.buffer.set(name);
+    at::<nt::DriverObject>(driver).driver_extension.set(extension);
+    let out = guest::alloc_bytes(8);
+    let handle_out = at::<nt::Field<u64>>(out);
+    let open = |key_type: u64, access: u64, flags: u64| call_export("IoOpenDriverRegistryKey", &[driver, key_type, access, flags, out]);
+    let service = registry::open_or_create(SERVICE, None).unwrap_or(0);
+    let parameters = registry::open_or_create(&alloc::format!("{SERVICE}\\Parameters"), None).unwrap_or(0);
+    assert(service != 0 && parameters != 0 && open(0, 0x2_0019, 1) == Some(0xFFFF_FFFF_C000_000D) && call_export("IoOpenDriverRegistryKey", &[driver, 0, 0x2_0019, 0, 0]) == Some(0xFFFF_FFFF_C000_000D), "io-driver-registry: Flags != 0 ou saida NULL = STATUS_INVALID_PARAMETER");
+    assert(open(0, 0x2_0019, 0) == Some(0xFFFF_FFFF_C000_000D), "io-driver-registry: servico sem Type = STATUS_INVALID_PARAMETER");
+    registry::set_value(service, "Type", 4, 0x10u32.to_le_bytes().to_vec());
+    assert(open(0, 0x2_0019, 0) == Some(0xFFFF_FFFF_C000_000D), "io-driver-registry: Type de servico Win32 recusado");
+    registry::set_value(service, "Type", 1, alloc::vec![0x31, 0, 0, 0]);
+    assert(open(0, 0x2_0019, 0) == Some(0xFFFF_FFFF_C000_014C), "io-driver-registry: Type nao REG_DWORD = STATUS_REGISTRY_CORRUPT");
+    registry::set_value(service, "Type", 4, 1u32.to_le_bytes().to_vec());
+    registry::set_value(parameters, "Probe", 4, 7u32.to_le_bytes().to_vec());
+    handle_out.set(0);
+    let opened = open(0, 0x2_0019, 0) == Some(0) && handle_out.get() != 0;
+    let handle = handle_out.get();
+    // O handle devolvido enxerga o valor gravado em ...\Parameters.
+    let path_ok = key_services::named_value(key_services::Kind::QueryValue, handle, "Probe", 0, &[]).is_ok_and(|(status, value)| status == 0 && value.is_some_and(|value| value.data == 7u32.to_le_bytes()));
+    assert(opened && path_ok, "io-driver-registry: DriverRegKeyParameters abre Services\\<nome>\\Parameters");
+    call_export("ZwClose", &[handle]);
+    assert(open(0, 0x2_0006, 0) == Some(0xFFFF_FFFF_C000_0022), "io-driver-registry: escrita em Parameters = STATUS_ACCESS_DENIED");
+    assert(open(0, 0x0200_0000, 0) == Some(0), "io-driver-registry: MAXIMUM_ALLOWED vira KEY_READ");
+    call_export("ZwClose", &[handle_out.get()]);
+    let state_path = alloc::format!("{SERVICE}\\State");
+    assert(registry::node_by_path(&state_path).is_none() && open(1, 0xF_003F, 0) == Some(0) && registry::node_by_path(&state_path).is_some(), "io-driver-registry: DriverRegKeyPersistentState cria e abre State");
+    call_export("ZwClose", &[handle_out.get()]);
+    assert(open(2, 0x2_0019, 0) == Some(0xFFFF_FFFF_C000_000D), "io-driver-registry: tipo de chave desconhecido recusado");
+    let state = registry::open(&state_path).unwrap_or(0);
+    if state != 0 {
+        registry::delete_key(state);
+        registry::close_handle(state);
+    }
+    registry::delete_key(parameters);
+    registry::close_handle(parameters);
+    registry::delete_key(service);
+    registry::close_handle(service);
+    for pointer in [out, name, extension, driver] {
+        guest::free_bytes(pointer);
+    }
+
+    // IoGetDeviceNumaNode.
+    let node = guest::alloc_bytes(8);
+    let node_number = at::<nt::Field<u16>>(node);
+    node_number.set(0x7777);
+    assert(call_export("IoGetDeviceNumaNode", &[0, node]) == Some(0xFFFF_FFFF_C000_000D) && call_export("IoGetDeviceNumaNode", &[node, node]) == Some(0xFFFF_FFFF_C000_000D) && node_number.get() == 0x7777, "io-driver-registry: IoGetDeviceNumaNode sem devnode = STATUS_INVALID_PARAMETER");
+    if let Some(pdo) = io_manager::devices().into_iter().find(|(_, entry)| entry.pdo && entry.native_device != 0).map(|(_, entry)| entry.native_device) {
+        assert(call_export("IoGetDeviceNumaNode", &[pdo, node]) == Some(0) && node_number.get() == 0, "io-driver-registry: PDO do PnP fica no no 0 (maquina de um no)");
+    }
+    guest::free_bytes(node);
+}
+
+
+fn ps_property_sets_exports(assert: Assert) {
+    use crate::ntos::ps::process;
+    let thread = process::get_current_thread();
+    let refs = || process::thread_reference_count(thread).unwrap_or(0);
+    let baseline = refs();
+    let key = 0x0000_1111u64;
+    assert(call_export("PsSetThreadProperty", &[thread, key, thread]) == Some(0) && refs() == baseline + 1, "ps-property-sets: PsSetThreadProperty insere e referencia o valor");
+    assert(call_export("PsSetThreadProperty", &[thread, key, thread]) == Some(0xFFFF_FFFF_C000_0035) && refs() == baseline + 1, "ps-property-sets: chave repetida = STATUS_OBJECT_NAME_COLLISION");
+    assert(call_export("PsGetThreadProperty", &[thread, key, 0]) == Some(thread) && refs() == baseline + 2, "ps-property-sets: PsGetThreadProperty devolve o objeto referenciado");
+    call_export("ObfDereferenceObject", &[thread]);
+    assert(call_export("PsGetThreadProperty", &[thread, key, 2]) == Some(0) && call_export("PsGetThreadProperty", &[thread, 0x2222, 1]) == Some(0) && call_export("PsGetThreadProperty", &[thread, 0x2222, 0]) == Some(0), "ps-property-sets: flags invalidas e chave ausente devolvem NULL");
+    assert(call_export("PsSetThreadProperty", &[thread, key, 0]) == Some(0) && refs() == baseline, "ps-property-sets: Value NULL remove e solta a referencia");
+    assert(call_export("PsSetThreadProperty", &[thread, key, 0]) == Some(0) && call_export("PsGetThreadProperty", &[thread, key, 0]) == Some(0), "ps-property-sets: remover chave ausente tambem e sucesso");
+    let not_an_object = guest::alloc_bytes(0x40);
+    assert(call_export("PsSetThreadProperty", &[not_an_object, key, thread]) == Some(0xFFFF_FFFF_C000_000D) && call_export("PsGetThreadProperty", &[not_an_object, key, 0]) == Some(0), "ps-property-sets: corpo que nao e Thread recusado em PASSIVE");
+    assert(call_export("PsSetJobProperty", &[not_an_object, key, thread]) == Some(0xFFFF_FFFF_C000_000D) && call_export("PsGetJobProperty", &[not_an_object, key]) == Some(0) && refs() == baseline, "ps-property-sets: corpo que nao e Job recusado em PASSIVE");
+    guest::free_bytes(not_an_object);
+}
+
+
+fn pcw_counters_exports(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::ex::pcw;
+    const KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\pcw";
+    let out = guest::alloc_bytes(8);
+    let registration = at::<nt::Field<u64>>(out);
+    let preexisting = registry::node_by_path(KEY).is_some();
+    if !preexisting {
+        pcw::reset_enable_state_for_test();
+        registration.set(0xDEAD);
+        assert(call_export("PcwRegister", &[out, 0]) == Some(0xFFFF_FFFF_C000_0002) && registration.get() == 0, "pcw-counters: sem chave pcw = STATUS_NOT_IMPLEMENTED e handle NULL");
+    }
+    let handle = registry::open_or_create(KEY, None).unwrap_or(0);
+    let saved = registry::get_value(handle, "Start");
+    registry::set_value(handle, "Start", 4, 4u32.to_le_bytes().to_vec());
+    pcw::reset_enable_state_for_test();
+    registration.set(0xDEAD);
+    assert(handle != 0 && call_export("PcwRegister", &[out, 0]) == Some(0) && registration.get() == 0, "pcw-counters: Start=4 (pcw desligado) = sucesso com handle NULL");
+    assert(call_export("PcwAddInstance", &[0, 0, 7, 1, 0]) == Some(0) && call_export("PcwUnregister", &[0]) == Some(0), "pcw-counters: AddInstance/Unregister sem extensao");
+    registry::set_value(handle, "Start", 4, 0u32.to_le_bytes().to_vec());
+    // O estado fica em cache como no NT: sem reset, Start=0 ainda não conta.
+    assert(call_export("PcwAddInstance", &[0, 0, 7, 1, 0]) == Some(0), "pcw-counters: ExpPcwEnableState calculado uma vez");
+    pcw::reset_enable_state_for_test();
+    assert(call_export("PcwAddInstance", &[0, 0, 7, 1, 0]) == Some(0xFFFF_FFFF_C000_0002), "pcw-counters: Start=0 (boot sem pcw.sys) = STATUS_NOT_IMPLEMENTED");
+    registry::delete_value(handle, "Start");
+    pcw::reset_enable_state_for_test();
+    assert(call_export("PcwRegister", &[out, 0]) == Some(0), "pcw-counters: valor Start ausente usa o default 0xFFFFFFFF");
+    registry::set_value(handle, "Start", 1, alloc::vec![0x41, 0, 0, 0]);
+    pcw::reset_enable_state_for_test();
+    assert(call_export("PcwRegister", &[out, 0]) == Some(0xFFFF_FFFF_C000_0024), "pcw-counters: Start com tipo errado = STATUS_OBJECT_TYPE_MISMATCH");
+    match saved {
+        Some(value) => {
+            registry::set_value(handle, "Start", value.value_type, value.data);
+        }
+        None => {
+            registry::delete_value(handle, "Start");
+        }
+    }
+    if !preexisting {
+        registry::delete_key(handle);
+    }
+    registry::close_handle(handle);
+    pcw::reset_enable_state_for_test();
+    guest::free_bytes(out);
+}
+
+
+fn rtl_self_relative_sd_exports(assert: Assert) {
+    let relative = guest::alloc_bytes(0x60);
+    let bytes: [u8; 0x54] = [
+        // Revision 1, Sbz1 0, Control 0x8014 (SELF_RELATIVE|SACL_PRESENT|DACL_PRESENT).
+        1, 0, 0x14, 0x80, 0x14, 0, 0, 0, 0x20, 0, 0, 0, 0x30, 0, 0, 0, 0x38, 0, 0, 0,
+        // +0x14 dono S-1-5-18 (12 bytes).
+        1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+        // +0x20 grupo S-1-5-32-544 (16 bytes).
+        1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0,
+        // +0x30 SACL vazia: AclRevision 2, AclSize 8, AceCount 0.
+        2, 0, 8, 0, 0, 0, 0, 0,
+        // +0x38 DACL de 0x1C: um ACCESS_ALLOWED_ACE (0x14) com S-1-1-0.
+        2, 0, 0x1C, 0, 1, 0, 0, 0,
+        0, 0, 0x14, 0, 0xFF, 0x01, 0x1F, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    ];
+    guest::write_bytes(relative, &bytes);
+    let sizes = guest::alloc_bytes(20);
+    let (abs_size, dacl_size, sacl_size, owner_size, group_size) = (sizes, sizes + 4, sizes + 8, sizes + 12, sizes + 16);
+    let size = |address: u64| at::<nt::Field<u32>>(address);
+    for address in [abs_size, dacl_size, sacl_size, owner_size, group_size] {
+        size(address).set(0);
+    }
+    let absolute = guest::alloc_bytes(nt::SecurityDescriptor::SIZE);
+    let buffers = guest::alloc_bytes(0x80);
+    let (dacl, sacl, owner, group) = (buffers, buffers + 0x20, buffers + 0x40, buffers + 0x60);
+    let call = |absolute: u64| call_export("RtlSelfRelativeToAbsoluteSD", &[relative, absolute, abs_size, dacl, dacl_size, sacl, sacl_size, owner, owner_size, group, group_size]);
+    assert(call(absolute) == Some(0xFFFF_FFFF_C000_0023) && size(abs_size).get() == 0x28 && size(owner_size).get() == 12 && size(group_size).get() == 16 && size(sacl_size).get() == 8 && size(dacl_size).get() == 0x1C, "rtl-self-relative-sd: buffers pequenos devolvem os tamanhos e STATUS_BUFFER_TOO_SMALL");
+    assert(call(absolute) == Some(0), "rtl-self-relative-sd: conversao com os tamanhos informados");
+    let sd = at::<nt::SecurityDescriptor>(absolute);
+    // Bytes 4..7 (padding do absoluto) recebem o offset do dono, como o memcpy de 0x14 bytes.
+    let header_ok = sd.revision.get() == 1 && sd.control.get() == 0x0014 && guest::read_bytes(absolute + 4, 4) == 0x14u32.to_le_bytes();
+    let pointers_ok = sd.owner.get() == owner && sd.group.get() == group && sd.sacl.get() == sacl && sd.dacl.get() == dacl;
+    let copies_ok = guest::read_bytes(owner, 12) == bytes[0x14..0x20] && guest::read_bytes(group, 16) == bytes[0x20..0x30] && guest::read_bytes(sacl, 8) == bytes[0x30..0x38] && guest::read_bytes(dacl, 0x1C) == bytes[0x38..0x54];
+    assert(header_ok && pointers_ok && copies_ok, "rtl-self-relative-sd: cabecalho sem SELF_RELATIVE, ponteiros e componentes copiados");
+    assert(call_export("RtlSelfRelativeToAbsoluteSD", &[absolute, absolute, abs_size, dacl, dacl_size, sacl, sacl_size, owner, owner_size, group, group_size]) == Some(0xFFFF_FFFF_C000_00E7), "rtl-self-relative-sd: SD absoluto na entrada = STATUS_BAD_DESCRIPTOR_FORMAT");
+    for pointer in [buffers, absolute, sizes, relative] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn kd_debug_filter_exports(assert: Assert) {
+    use crate::ntos::kd::debug_filter;
+    // DPFLTR_IHVNETWORK_ID = 79 (0x4F): o componente do ndis.
+    let before = debug_filter::component_mask(79);
+    assert(call_export("DbgSetDebugFilterState", &[79, 3, 1]) == Some(0) && debug_filter::component_mask(79) == before | 0x8, "kd-debug-filter: nivel 3 liga o bit 3 do componente");
+    assert(call_export("DbgSetDebugFilterState", &[79, 0x30, 1]) == Some(0) && debug_filter::component_mask(79) == before | 0x38, "kd-debug-filter: nivel acima de 31 e a propria mascara");
+    assert(call_export("DbgSetDebugFilterState", &[79, 0x38, 0]) == Some(0) && debug_filter::component_mask(79) == before & !0x38, "kd-debug-filter: State FALSE desliga os bits");
+    let default_before = debug_filter::component_mask(101);
+    call_export("DbgSetDebugFilterState", &[0x9C, 31, 1]);
+    assert(debug_filter::component_mask(101) == default_before | 0x8000_0000 && debug_filter::component_mask(0x9C) == debug_filter::component_mask(101), "kd-debug-filter: componente fora da tabela cai no DEFAULT (101)");
+    call_export("DbgSetDebugFilterState", &[0x9C, 31, 0]);
+    let win2000 = debug_filter::component_mask(0xFFFF_FFFF);
+    call_export("DbgSetDebugFilterState", &[0xFFFF_FFFF, 2, 1]);
+    assert(debug_filter::component_mask(0xFFFF_FFFF) == win2000 | 4, "kd-debug-filter: ComponentId -1 altera Kd_WIN2000_Mask");
+    call_export("DbgSetDebugFilterState", &[0xFFFF_FFFF, 2, (win2000 >> 2) as u64 & 1]);
+}
+
+
+fn etw_wmi_clock_exports(assert: Assert) {
+    use crate::ntos::ke::clock;
+    let before = clock::system_time_100ns();
+    let system = call_export("WmiGetClock", &[1, 0]).unwrap_or(0);
+    let out_of_range = call_export("WmiGetClock", &[9, 0]).unwrap_or(0);
+    let negative = call_export("WmiGetClock", &[0xFFFF_FFFF, 0]).unwrap_or(0);
+    let after = clock::system_time_100ns();
+    assert(system >= before && system <= after && out_of_range >= system && out_of_range <= after && negative >= out_of_range && negative <= after, "etw-wmi-clock: WMICT_SYSTEMTIME, tipo negativo e > 5 = hora do sistema");
+    assert(call_export("WmiGetClock", &[3, 0]) == Some(0) && call_export("WmiGetClock", &[4, 0]) == Some(0), "etw-wmi-clock: WMICT_PROCESS/THREAD = 0");
+    let first = call_export("WmiGetClock", &[2, 0]).unwrap_or(0);
+    let cycle = call_export("WmiGetClock", &[5, 0]).unwrap_or(0);
+    let default = call_export("WmiGetClock", &[0, 0]).unwrap_or(0);
+    assert(first != 0 && cycle >= first && default >= cycle, "etw-wmi-clock: contador de desempenho, ciclos e o padrao (contador) avancam");
+}
+
+
+fn kse_shim_engine_exports(assert: Assert) {
+    let flags = guest::alloc_bytes(8);
+    let flags_cell = at::<nt::Field<u64>>(flags);
+    flags_cell.set(0x1234);
+    let device = guest::alloc_bytes(16);
+    guest::write_bytes(device, &crate::ntos::rtl::guest_strings::wide_bytes_with_nul("PCI"));
+    assert(call_export("KseQueryDeviceFlags", &[device, device, flags]) == Some(0xFFFF_FFFF_C000_0225) && flags_cell.get() == 0x1234, "kse-shim-engine: sem motor = STATUS_NOT_FOUND e Flags intocado");
+    assert(call_export("KseQueryDeviceFlags", &[0, 0, 0]) == Some(0xFFFF_FFFF_C000_0225), "kse-shim-engine: o estado do motor e testado antes dos argumentos");
+    guest::free_bytes(device);
+    guest::free_bytes(flags);
+}
+
+
+fn ex_access_violation_exports(assert: Assert) {
+    use crate::ntos::rtl::{native_context, unwind};
+    use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
+    let mut bytes = ntoskrnl_importer(b"ExRaiseAccessViolation\0");
+    for byte in &mut bytes[0x4442..0x4480] {
+        *byte = 0;
+    }
+    bytes[0x4442..0x444E].copy_from_slice(b"RtlUnwindEx\0");
+    let rel = |from_next: usize, to: usize| ((to as i64 - from_next as i64) as i32).to_le_bytes();
+    // F (0x1300): sub rsp,28h; mov ecx,0; call [ExRaiseAccessViolation]; add rsp,28h; xor eax,eax; ret.
+    // Bloco de tratamento (0x1316): add rsp,28h; ret (RAX = valor do RtlUnwindEx).
+    let mut f = alloc::vec![0x48, 0x83, 0xEC, 0x28, 0xB9, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x15];
+    f.extend_from_slice(&rel(0x130F, 0x4200));
+    f.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x31, 0xC0, 0xC3, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+    bytes[0x1300..0x1300 + f.len()].copy_from_slice(&f);
+    // Handler (0x1330): RtlUnwindEx(frame, 0x1316, record, record->ExceptionCode, NULL, NULL).
+    let mut handler = alloc::vec![0x48, 0x83, 0xEC, 0x38, 0x48, 0x89, 0xC8, 0x48, 0x89, 0xD1, 0x48, 0x8D, 0x15];
+    handler.extend_from_slice(&rel(0x1341, 0x1316));
+    handler.extend_from_slice(&[0x49, 0x89, 0xC0, 0x44, 0x8B, 0x08, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0, 0xFF, 0x15]);
+    handler.extend_from_slice(&rel(0x135F, 0x4210));
+    handler.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+    bytes[0x1330..0x1330 + handler.len()].copy_from_slice(&handler);
+    bytes[0x1400..0x1404].copy_from_slice(&[0x09, 0x04, 0x01, 0x00]);
+    bytes[0x1404..0x1406].copy_from_slice(&(4u16 | (2 << 8) | (4 << 12)).to_le_bytes());
+    bytes[0x1408..0x140C].copy_from_slice(&0x1330u32.to_le_bytes());
+    bytes[0x1500..0x1504].copy_from_slice(&0x1300u32.to_le_bytes());
+    bytes[0x1504..0x1508].copy_from_slice(&0x1320u32.to_le_bytes());
+    bytes[0x1508..0x150C].copy_from_slice(&0x1400u32.to_le_bytes());
+    let Ok(mut image) = loader::load(bytes, &LoadOptions { image_name: Some(String::from("opennt-av.sys")), ..Default::default() }) else {
+        assert(false, "ex-access-violation: imagem de teste carregada");
+        return;
+    };
+    let base = image.image_base;
+    let added = unwind::add_function_table(base + 0x1500, 1, base);
+    let result = native_context::call(base + 0x1300, &[], 0);
+    assert(added.is_ok_and(|added| added == 1) && result.as_ref().is_ok_and(|value| *value as u32 == 0xC000_0005), "ex-access-violation: ExRaiseAccessViolation levanta STATUS_ACCESS_VIOLATION ate o handler");
+    let _ = unwind::delete_function_table(base + 0x1500);
+    let _ = image.release();
+}
+
+
+fn rtl_network_address_exports(assert: Assert) {
+    use crate::ntos::rtl::guest_strings;
+    let text = guest::alloc_bytes(128);
+    let terminator = guest::alloc_bytes(8);
+    let address = guest::alloc_bytes(16);
+    let (end_cell, v4_cell) = (at::<nt::Field<u64>>(terminator), at::<nt::Field<u32>>(address));
+    let put = |value: &str| guest::write_bytes(text, &guest_strings::wide_bytes_with_nul(value));
+    let read_text = |pointer: u64| guest_strings::read_wide_string(pointer);
+    const INVALID: u64 = 0xFFFF_FFFF_C000_000D;
+
+    // IPv4: (texto, strict, status, índice do terminador, endereço em ordem de rede).
+    let v4: [(&str, u64, u64, u64, [u8; 4]); 12] = [
+        ("192.168.0.1", 1, 0, 11, [192, 168, 0, 1]),
+        ("10.1", 0, 0, 4, [10, 0, 0, 1]),
+        ("10.1", 1, INVALID, 4, [0; 4]),
+        ("0x7f.1", 0, 0, 6, [0x7F, 0, 0, 1]),
+        ("0x7f.1", 1, INVALID, 2, [0; 4]),
+        ("010.0.0.1", 0, 0, 9, [8, 0, 0, 1]),
+        ("1.2.3.4.5", 0, INVALID, 7, [0; 4]),
+        ("256.1.1.1", 1, INVALID, 9, [0; 4]),
+        ("1.2.3.4:80", 1, 0, 7, [1, 2, 3, 4]),
+        ("4294967296", 0, INVALID, 9, [0; 4]),
+        ("1.2.65535", 0, 0, 9, [1, 2, 0xFF, 0xFF]),
+        ("09", 0, INVALID, 1, [0; 4]),
+    ];
+    let mut all = true;
+    for (value, strict, status, end, bytes) in v4 {
+        put(value);
+        v4_cell.set(0xAAAA_AAAA);
+        let result = call_export("RtlIpv4StringToAddressW", &[text, strict, terminator, address]);
+        let expected_address = if status == 0 { u32::from_le_bytes(bytes) } else { 0xAAAA_AAAA };
+        all &= result == Some(status) && end_cell.get() == text + end * 2 && v4_cell.get() == expected_address;
+    }
+    assert(all, "rtl-network-address: RtlIpv4StringToAddressW (bases, partes, Strict, terminador)");
+
+    // IPv6: (texto, status, terminador (None = não gravado), endereço).
+    let v6: [(&str, u64, Option<u64>, &str); 14] = [
+        ("::1", 0, Some(3), "00000000000000000000000000000001"),
+        ("::", 0, Some(2), "00000000000000000000000000000000"),
+        ("1:2::3", 0, Some(6), "00010002000000000000000000000003"),
+        ("2001:db8::ff00:42:8329", 0, Some(22), "20010db8000000000000ff0000428329"),
+        ("1:2:3:4:5:6:7:8:9", 0, Some(15), "00010002000300040005000600070008"),
+        ("::ffff:1.2.3.4", 0, Some(14), "00000000000000000000ffff01020304"),
+        ("1:2:3:4:5:6:1.2.3.4", 0, Some(19), "00010002000300040005000601020304"),
+        ("1::2::3", 0, Some(4), "00010000000000000000000000000002"),
+        ("::1.2.3.4a", 0, Some(9), "00000000000000000000000001020304"),
+        ("1:2:3:4:5:6:7::", 0, Some(15), "00010002000300040005000600070000"),
+        ("12345::", INVALID, None, ""),
+        (":1::", INVALID, Some(0), ""),
+        ("::1.2.3", INVALID, Some(7), ""),
+        ("::256.1.1.1", INVALID, None, ""),
+    ];
+    let hex = |value: &str| (0..16).map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap_or(0)).collect::<alloc::vec::Vec<u8>>();
+    let mut all = true;
+    for (value, status, end, bytes) in v6 {
+        put(value);
+        end_cell.set(0x5A5A);
+        let result = call_export("RtlIpv6StringToAddressW", &[text, terminator, address]);
+        let end_ok = match end {
+            Some(end) => end_cell.get() == text + end * 2,
+            None => end_cell.get() == 0x5A5A,
+        };
+        all &= result == Some(status) && end_ok && (status != 0 || guest::read_bytes(address, 16) == hex(bytes));
+    }
+    assert(all, "rtl-network-address: RtlIpv6StringToAddressW (compressao, sufixo IPv4, terminador e erros)");
+
+    // Texto IPv6: (endereço, texto, texto Ex com escopo 3 e porta 80).
+    let s6: [(&str, &str); 9] = [
+        ("00000000000000000000000000000001", "::1"),
+        ("00000000000000000000000000000000", "::"),
+        ("20010db8000000000000ff0000428329", "2001:db8::ff00:42:8329"),
+        ("00000000000000000000ffff01020304", "::ffff:1.2.3.4"),
+        ("00000000000000000000000001020304", "::1.2.3.4"),
+        ("0000000000000000ffff000001020304", "::ffff:0:1.2.3.4"),
+        ("fe8000000000000002005efe0a000001", "fe80::200:5efe:10.0.0.1"),
+        ("00010000000100000000000000000001", "1:0:1::1"),
+        ("00000001000000000000000000000000", "0:1::"),
+    ];
+    let output = guest::alloc_bytes(128);
+    let length = guest::alloc_bytes(4);
+    let length_cell = at::<nt::Field<u32>>(length);
+    let mut all = true;
+    for (bytes, expected) in s6 {
+        guest::write_bytes(address, &hex(bytes));
+        let end = call_export("RtlIpv6AddressToStringW", &[address, output]).unwrap_or(0);
+        all &= read_text(output) == expected && end == output + expected.len() as u64 * 2;
+    }
+    assert(all, "rtl-network-address: RtlIpv6AddressToStringW (zeros, IPv4 embutido, ISATAP)");
+    guest::write_bytes(address, &hex("20010db8000000010000000000000001"));
+    length_cell.set(4);
+    let small = call_export("RtlIpv6AddressToStringExW", &[address, 3, 0x5000, output, length]);
+    let needed = "[2001:db8:0:1::1%3]:80".len() as u32 + 1;
+    assert(small == Some(INVALID) && length_cell.get() == needed, "rtl-network-address: RtlIpv6AddressToStringExW informa o tamanho");
+    assert(call_export("RtlIpv6AddressToStringExW", &[address, 3, 0x5000, output, length]) == Some(0) && read_text(output) == "[2001:db8:0:1::1%3]:80" && length_cell.get() == needed, "rtl-network-address: RtlIpv6AddressToStringExW com escopo e porta");
+
+    // Texto IPv4.
+    guest::write_bytes(address, &[192, 168, 0, 1]);
+    let end = call_export("RtlIpv4AddressToStringW", &[address, output]).unwrap_or(0);
+    assert(read_text(output) == "192.168.0.1" && end == output + 22, "rtl-network-address: RtlIpv4AddressToStringW devolve o fim");
+    guest::write_bytes(address, &[10, 0, 0, 255]);
+    length_cell.set(0);
+    let probe = call_export("RtlIpv4AddressToStringExW", &[address, 0x901F, 0, length]);
+    assert(probe == Some(INVALID) && length_cell.get() == 16, "rtl-network-address: RtlIpv4AddressToStringExW sem buffer informa o tamanho");
+    assert(call_export("RtlIpv4AddressToStringExW", &[address, 0x901F, output, length]) == Some(0) && read_text(output) == "10.0.0.255:8080", "rtl-network-address: RtlIpv4AddressToStringExW com porta");
+    length_cell.set(1);
+    assert(call_export("RtlIpv4AddressToStringExW", &[address, 0, 0, length]) == Some(INVALID), "rtl-network-address: Buffer NULL com Length != 0 recusado");
+    for pointer in [length, output, address, terminator, text] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn rtl_crt_wide_exports(assert: Assert) {
+    let text = guest::alloc_bytes(64);
+    let put = |units: &[u16]| {
+        let mut bytes: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        guest::write_bytes(text, &bytes);
+    };
+    let wtoi = |units: &[u16]| {
+        put(units);
+        call_export("_wtoi", &[text]).map(|value| value as i64)
+    };
+    let ascii = |value: &str| value.encode_utf16().collect::<alloc::vec::Vec<u16>>();
+    assert(wtoi(&ascii("  \t-1234xyz")) == Some(-1234) && wtoi(&ascii("+77")) == Some(77) && wtoi(&ascii("abc")) == Some(0), "rtl-crt-wide: _wtoi com espacos, sinal e lixo final");
+    // 0xA0 é _SPACE; 0x0663/0xFF15 são dígitos (árabe-índico 3, largo 5).
+    assert(wtoi(&[0xA0, 0x31, 0x0663, 0xFF15]) == Some(135) && wtoi(&[0x2003, 0x31]) == Some(0), "rtl-crt-wide: _wtoi usa pwctype e wchartodigit");
+    // 4294967297 dá a volta para 1 (sem clamp em _wtol); -2147483648 inteiro.
+    assert(wtoi(&ascii("4294967297")) == Some(1) && wtoi(&ascii("-2147483648")) == Some(-2147483648), "rtl-crt-wide: _wtoi acumula com volta de 32 bits");
+    assert(call_export("_wtoi", &[0]) == Some(0), "rtl-crt-wide: _wtoi(NULL) = 0");
+    let lower = |c: u64| call_export("towlower", &[c]);
+    assert(lower(0x41) == Some(0x61) && lower(0x5A) == Some(0x7A) && lower(0xC9) == Some(0xE9) && lower(0xD7) == Some(0xD7) && lower(0xDE) == Some(0xFE), "rtl-crt-wide: towlower nas maiusculas Latin-1");
+    assert(lower(0x61) == Some(0x61) && lower(0x100) == Some(0x100) && lower(0x391) == Some(0x391), "rtl-crt-wide: towlower nao toca minusculas nem c >= 0x100");
+    assert(call_export("RtlPrefetchMemoryNonTemporal", &[text, 0x1000]) == Some(0), "rtl-crt-wide: RtlPrefetchMemoryNonTemporal e so uma dica");
+    guest::free_bytes(text);
+}
+
+
+fn io_top_level_irp_exports(assert: Assert) {
+    use crate::ntos::ps::process;
+    let thread = process::get_current_thread();
+    let ethread = at::<nt::Ethread>(thread);
+    let saved = ethread.top_level_irp.get();
+    assert(call_export("IoGetTopLevelIrp", &[]) == Some(saved), "io-top-level-irp: IoGetTopLevelIrp le ETHREAD.TopLevelIrp");
+    // FSRTL_FSP_TOP_LEVEL_IRP (1) e um ponteiro qualquer, como os FS gravam.
+    call_export("IoSetTopLevelIrp", &[1]);
+    let marker = ethread.top_level_irp.get() == 1 && call_export("IoGetTopLevelIrp", &[]) == Some(1);
+    call_export("IoSetTopLevelIrp", &[0xFFFF_8000_1234_5670]);
+    let pointer = call_export("IoGetTopLevelIrp", &[]) == Some(0xFFFF_8000_1234_5670);
+    call_export("IoSetTopLevelIrp", &[saved]);
+    assert(marker && pointer && ethread.top_level_irp.get() == saved, "io-top-level-irp: IoSetTopLevelIrp grava e restaura");
+    assert(call_export("IoThreadToProcess", &[thread]) == Some(ethread.tcb.process.get()) && call_export("IoThreadToProcess", &[thread]) == call_export("IoGetCurrentProcess", &[]), "io-top-level-irp: IoThreadToProcess = KTHREAD.Process");
+}
+
+
+fn se_access_from_state_exports(assert: Assert) {
+    let system_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let admins_sid: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0];
+    let sids = guest::alloc_bytes(32);
+    guest::write_bytes(sids, &system_sid);
+    guest::write_bytes(sids + 16, &admins_sid);
+    let sid_attr = guest::alloc_bytes(2 * nt::SidAndAttributes::SIZE);
+    let groups = [at::<nt::SidAndAttributes>(sid_attr), at::<nt::SidAndAttributes>(sid_attr + nt::SidAndAttributes::SIZE)];
+    groups[0].sid.set(sids);
+    groups[0].attributes.set(0x04);
+    groups[1].sid.set(sids + 16);
+    groups[1].attributes.set(0x60);
+    let hashes = guest::alloc_bytes(3 * nt::SidAndAttributesHash::SIZE);
+    let (sid_hash, restricted_hash, capabilities_hash) = (hashes, hashes + nt::SidAndAttributesHash::SIZE, hashes + 2 * nt::SidAndAttributesHash::SIZE);
+    at::<nt::SidAndAttributesHash>(sid_hash).sid_count.set(2);
+    at::<nt::SidAndAttributesHash>(sid_hash).sid_attr.set(sid_attr);
+    // TOKEN_PRIVILEGES com 2 entradas (o cabeçalho + 2 LUID_AND_ATTRIBUTES).
+    let privileges = guest::alloc_bytes(4 + 2 * nt::LuidAndAttributes::SIZE);
+    at::<nt::TokenPrivileges>(privileges).privilege_count.set(2);
+    let privilege = |index: u64| at::<nt::LuidAndAttributes>(privileges + 4 + index * nt::LuidAndAttributes::SIZE);
+    privilege(0).luid.low_part.set(20); // SeDebugPrivilege
+    privilege(0).attributes.set(3); // ENABLED | ENABLED_BY_DEFAULT
+    privilege(1).luid.low_part.set(40); // fora de 2..36: ignorado
+    privilege(1).attributes.set(2);
+    let information = guest::alloc_bytes(nt::TokenAccessInformation::SIZE);
+    let info = at::<nt::TokenAccessInformation>(information);
+    info.sid_hash.set(sid_hash);
+    info.restricted_sid_hash.set(restricted_hash);
+    info.privileges.set(privileges);
+    info.authentication_id.low_part.set(0x3E7); // SYSTEM_LUID
+    info.token_type.set(nt::TokenType::TOKEN_PRIMARY);
+    info.mandatory_policy.policy.set(1);
+    info.flags.set(0x2000);
+    info.capabilities_hash.set(capabilities_hash);
+    let token = guest::alloc_bytes(nt::Token::SIZE);
+    let required = guest::alloc_bytes(4);
+    let required_cell = at::<nt::Field<u32>>(required);
+    assert(call_export("SeTokenFromAccessInformation", &[information, token, 0x100, required]) == Some(0xFFFF_FFFF_C000_0023) && required_cell.get() == 0x498, "se-access-from-state: buffer menor que TOKEN = STATUS_BUFFER_TOO_SMALL com 0x498");
+    required_cell.set(0);
+    assert(call_export("SeTokenFromAccessInformation", &[information, token, 0x498, required]) == Some(0) && required_cell.get() == 0, "se-access-from-state: SeTokenFromAccessInformation monta o TOKEN");
+    let built = at::<nt::Token>(token);
+    let fields_ok = built.authentication_id.low_part.get() == 0x3E7 && built.token_type.get() == nt::TokenType::TOKEN_PRIMARY && built.user_and_group_count.get() == 2 && built.user_and_groups.get() == sid_attr && built.token_flags.get() == 0x2000 && built.mandatory_policy.get() == 1 && built.integrity_level_index.get() == 1;
+    let privileges_ok = built.privileges.present.get() == 1 << 20 && built.privileges.enabled.get() == 1 << 20 && built.privileges.enabled_by_default.get() == 1 << 20;
+    // SidHash: S-1-5-18 (byte 0x12) -> Hash[2] e Hash[16+1] bit 0;
+    // S-1-5-32-544 (byte 0x20) -> Hash[0] e Hash[16+2] bit 1.
+    let hash = &built.sid_hash;
+    let hash_ok = hash.sid_count.get() == 2 && hash.sid_attr.get() == sid_attr && hash.hash[2].get() == 1 && hash.hash[17].get() == 1 && hash.hash[0].get() == 2 && hash.hash[18].get() == 2;
+    assert(fields_ok && privileges_ok && hash_ok, "se-access-from-state: campos, privilegios e SidHash do TOKEN montado");
+
+    // SD self-relative: dono SYSTEM, DACL com ACCESS_ALLOWED 0x1FF para SYSTEM.
+    let descriptor = guest::alloc_bytes(64);
+    let mut bytes = [0u8; 60];
+    bytes[0] = 1;
+    bytes[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&32u32.to_le_bytes());
+    bytes[20..32].copy_from_slice(&system_sid);
+    bytes[32] = 2;
+    bytes[34..36].copy_from_slice(&28u16.to_le_bytes());
+    bytes[36..38].copy_from_slice(&1u16.to_le_bytes());
+    bytes[42..44].copy_from_slice(&20u16.to_le_bytes());
+    bytes[44..48].copy_from_slice(&0x1FFu32.to_le_bytes());
+    bytes[48..60].copy_from_slice(&system_sid);
+    guest::write_bytes(descriptor, &bytes);
+    let mapping = guest::alloc_bytes(nt::GenericMapping::SIZE);
+    let generic = at::<nt::GenericMapping>(mapping);
+    generic.generic_read.set(0x0012_0089);
+    generic.generic_write.set(0x0012_0116);
+    generic.generic_execute.set(0x0012_00A0);
+    generic.generic_all.set(0x001F_01FF);
+    let out = guest::alloc_bytes(16);
+    let (granted, status, used_privileges) = (out, out + 4, out + 8);
+    let (granted_cell, status_cell, privileges_cell) = (at::<nt::Field<u32>>(granted), at::<nt::Field<u32>>(status), at::<nt::Field<u64>>(used_privileges));
+    let check = |primary: u64, client: u64, desired: u64, mode: u64| call_export("SeAccessCheckFromStateEx", &[descriptor, primary, client, desired, 0, used_privileges, mapping, mode, granted, status]);
+    assert(check(token, 0, 1, 1) == Some(1) && status_cell.get() == 0 && granted_cell.get() == 1 && privileges_cell.get() == 0, "se-access-from-state: concede o direito da DACL ao TOKEN montado");
+    assert(check(token, 0, 0x10000, 1) == Some(0) && status_cell.get() == 0xC000_0022, "se-access-from-state: nega DELETE ausente da DACL");
+    // Cliente em SecurityIdentification = STATUS_BAD_IMPERSONATION_LEVEL.
+    let client = guest::alloc_bytes(nt::Token::SIZE);
+    guest::write_bytes(client, &guest::read_bytes(token, nt::Token::SIZE as usize));
+    let client_token = at::<nt::Token>(client);
+    client_token.impersonation_level.set(nt::SecurityImpersonationLevel::SECURITY_IDENTIFICATION);
+    assert(check(token, client, 1, 1) == Some(0) && status_cell.get() == 0xC000_00A5, "se-access-from-state: cliente em Identification recusado");
+    client_token.impersonation_level.set(nt::SecurityImpersonationLevel::SECURITY_IMPERSONATION);
+    assert(check(0, client, 1, 1) == Some(1) && check(token, 0, 0x10000, 0) == Some(1) && granted_cell.get() == 0x10000, "se-access-from-state: cliente personificando decide; KernelMode concede");
+    for pointer in [client, out, mapping, descriptor, required, token, information, privileges, hashes, sid_attr, sids] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -5277,6 +5884,21 @@ pub fn run(assert: Assert) {
     io_wmi_data_block_exports(assert);
     io_work_item_queue_exports(assert);
     nt_struct_field_access(assert);
+    rtl_bitmap_ex_exports(assert);
+    ex_interlocked_exports(assert);
+    ex_processor_usage_exports(assert);
+    io_driver_registry_exports(assert);
+    ps_property_sets_exports(assert);
+    pcw_counters_exports(assert);
+    rtl_self_relative_sd_exports(assert);
+    kd_debug_filter_exports(assert);
+    etw_wmi_clock_exports(assert);
+    kse_shim_engine_exports(assert);
+    ex_access_violation_exports(assert);
+    rtl_network_address_exports(assert);
+    rtl_crt_wide_exports(assert);
+    io_top_level_irp_exports(assert);
+    se_access_from_state_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

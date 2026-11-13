@@ -215,3 +215,35 @@ pub mod thread_requests {
         })
     }
 }
+
+/// IRP de nível superior da thread corrente e o processo de uma thread —
+/// ntoskrnl 19041 IoGetTopLevelIrp 0x2d73f0, IoSetTopLevelIrp 0x2d73d0
+/// (`gs:[0x188]` -> ETHREAD.TopLevelIrp) e IoThreadToProcess 0x2056c0
+/// (KTHREAD.Process, o mesmo campo de PsGetThreadProcess). Sem validação nem
+/// referência, como os originais. É o mesmo campo que o lazy writer do Cc
+/// salva e zera.
+pub mod top_level_irp {
+    use crate::ntos::inc::types::{Ethread, NtStruct};
+    use crate::ntos::ps::{process, thread_accessors};
+
+    fn current_thread() -> &'static Ethread {
+        // SAFETY: a thread corrente do Process Manager é um ETHREAD vivo.
+        unsafe { Ethread::at(process::get_current_thread()) }
+    }
+
+    /// IoGetTopLevelIrp: o IRP (ou marcador FSRTL_*_TOP_LEVEL_IRP) da thread
+    /// corrente.
+    pub fn get() -> u64 {
+        current_thread().top_level_irp.get()
+    }
+
+    /// IoSetTopLevelIrp(Irp).
+    pub fn set(irp: u64) {
+        current_thread().top_level_irp.set(irp);
+    }
+
+    /// IoThreadToProcess(Thread).
+    pub fn thread_to_process(thread: u64) -> u64 {
+        thread_accessors::process(thread)
+    }
+}

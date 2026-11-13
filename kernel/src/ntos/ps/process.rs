@@ -764,6 +764,7 @@ fn collect_thread(thread: u64) -> Result<(), KernelError> {
     if !collectable {
         return Ok(());
     }
+    crate::ntos::ps::property_set::clear(thread);
     forget_thread(thread)?;
     guest::free_bytes(thread);
     Ok(())

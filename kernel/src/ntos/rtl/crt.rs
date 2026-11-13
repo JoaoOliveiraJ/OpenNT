@@ -738,3 +738,65 @@ pub fn toupper(character: u32) -> Result<i32, KernelError> {
 pub fn iswdigit(unit: u16) -> u32 {
     (wide_class(unit) & CRT_CLASS_DIGIT) as u32
 }
+
+// ---- _wtoi, towlower e RtlPrefetchMemoryNonTemporal (ntoskrnl 19041) ---------
+//
+// _wtoi 0x3d1d30 = _wtol 0x3d1d50 = wcstolX(s, NULL, 10, sem checagem de
+// estouro) -> wcstoxlX 0x3d3b7c. towlower 0x3d36a0 = iswctype(c, _UPPER) ?
+// c + 0x20 : c. iswctype (0x3d426c) só classifica c < 0x100 pela tabela
+// pwctype; as entradas usadas aqui foram lidas da imagem com pefile:
+//   _SPACE: 0x09..0x0D, 0x20, 0xA0
+//   _UPPER: 0x41..0x5A, 0xC0..0xD6, 0xD8..0xDE
+// wchartodigit 0x3d5ac4 aceita os dígitos de '0', 0xFF10 (largos) e os
+// blocos com zero em 0x660, 0x6F0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xC66,
+// 0xCE6, 0xD66, 0xE50, 0xED0, 0xF20, 0x1040, 0x17E0 e 0x1810.
+
+/// iswctype(c, _SPACE) da tabela pwctype.
+fn crt_is_space(c: u16) -> bool {
+    (0x09..=0x0D).contains(&c) || c == 0x20 || c == 0xA0
+}
+
+/// iswctype(c, _UPPER) da tabela pwctype.
+fn crt_is_upper(c: u16) -> bool {
+    (0x41..=0x5A).contains(&c) || (0xC0..=0xD6).contains(&c) || (0xD8..=0xDE).contains(&c)
+}
+
+/// wchartodigit: valor do dígito Unicode ou None.
+fn crt_wide_digit(c: u16) -> Option<u32> {
+    const ZEROS: [u16; 17] = [0x660, 0x6F0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xC66, 0xCE6, 0xD66, 0xE50, 0xED0, 0xF20, 0x1040, 0x17E0, 0x1810, 0xFF10];
+    if (0x30..0x3A).contains(&c) {
+        return Some((c - 0x30) as u32);
+    }
+    ZEROS.iter().find(|&&zero| c >= zero && c < zero + 10).map(|&zero| (c - zero) as u32)
+}
+
+/// _wtoi(s): NULL = 0; espaços (_SPACE), um sinal, dígitos decimais
+/// (wchartodigit) acumulados em 32 bits com volta (sem clamp nem errno, o
+/// modo de _wtol); '-' nega. A string é lida até o NUL de uma vez (o
+/// original para no primeiro caractere que não é dígito, antes do NUL).
+pub fn wtoi(source: u64) -> i32 {
+    if source == 0 {
+        return 0;
+    }
+    let units = guest_strings::read_wide_units(source);
+    let mut chars = units.iter().copied().skip_while(|&c| crt_is_space(c)).peekable();
+    let negative = chars.peek() == Some(&0x2D);
+    if matches!(chars.peek(), Some(&0x2D) | Some(&0x2B)) {
+        chars.next();
+    }
+    let mut value = 0u32;
+    for digit in chars.map_while(crt_wide_digit) {
+        value = value.wrapping_mul(10).wrapping_add(digit);
+    }
+    if negative { (value as i32).wrapping_neg() } else { value as i32 }
+}
+
+/// towlower(c): só as maiúsculas da tabela pwctype (c < 0x100) descem.
+pub fn towlower(c: u16) -> u16 {
+    if crt_is_upper(c) { c + 0x20 } else { c }
+}
+
+/// RtlPrefetchMemoryNonTemporal(Source, Length): o original só emite
+/// `prefetchnta` a cada 64 bytes — uma dica de cache sem efeito
+/// arquitetural nem falta de página; não há estado a reproduzir.
+pub fn prefetch_memory_non_temporal(_source: u64, _length: u64) {}

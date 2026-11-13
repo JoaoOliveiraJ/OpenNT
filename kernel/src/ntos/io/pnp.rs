@@ -318,3 +318,35 @@ pub fn invalidate_device_relations(device: u64, relation_type: u32) {
         }
     }
 }
+
+// ---- Nó NUMA do devnode (IoGetDeviceNumaNode, ntoskrnl 19041 0x7734f0) -------
+//
+// Pdo NULL, DEVICE_OBJECT sem devnode (DeviceObjectExtension->DeviceNode
+// NULL) ou devnode com DNF 0x20000: STATUS_INVALID_PARAMETER. Com
+// DeviceNode->NumaNodeIndex conhecido (<= 0xFFFFFFFD) grava esse USHORT; com
+// o índice desconhecido (sem _PXM) devolve o nó 0 se a máquina tiver um só
+// nó (KeQueryHighestNodeNumber() == 0), senão STATUS_NOT_FOUND. O OpenNT não
+// lê _PXM (todo devnode tem índice desconhecido) e é de um nó só (o
+// KeQueryHighestNodeNumber dele devolve 0); devnode = PDO do PnP do OpenNT.
+
+const NUMA_STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// KeQueryHighestNodeNumber do OpenNT (máquina de um nó).
+const HIGHEST_NODE_NUMBER: u16 = 0;
+
+/// DEVICE_OBJECT com devnode: filho enumerado, PDO de barramento ou relatado.
+fn has_device_node(pdo: u64) -> bool {
+    pdo != 0 && io_manager::devices().into_iter().any(|(_, entry)| entry.native_device == pdo && (entry.pdo || entry.extra.is_some()))
+}
+
+/// IoGetDeviceNumaNode(Pdo, NodeNumber): `node` é o PUSHORT do chamador.
+pub fn device_numa_node(pdo: u64, node: &crate::ntos::inc::types::Field<u16>) -> u32 {
+    if !has_device_node(pdo) {
+        return NUMA_STATUS_INVALID_PARAMETER;
+    }
+    // NumaNodeIndex desconhecido: só uma máquina de um nó responde nó 0.
+    if HIGHEST_NODE_NUMBER != 0 {
+        return 0xC000_0225;
+    }
+    node.set(0);
+    0
+}

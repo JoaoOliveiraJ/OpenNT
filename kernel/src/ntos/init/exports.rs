@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 183] {
+fn groups() -> [&'static Group; 198] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -238,6 +238,21 @@ fn groups() -> [&'static Group; 183] {
         &crate::ntos::io::exports::io_wmi_data_block::GROUP,
         &crate::ntos::io::exports::io_work_item_queue::GROUP,
         &crate::ntos::dbgk::exports::GROUP,
+        &crate::ntos::rtl::exports::rtl_bitmap_ex::GROUP,
+        &crate::ntos::ex::exports::ex_interlocked::GROUP,
+        &crate::ntos::ex::exports::ex_processor_usage::GROUP,
+        &crate::ntos::io::exports::io_driver_registry::GROUP,
+        &crate::ntos::ps::exports::ps_property_sets::GROUP,
+        &crate::ntos::ex::exports::pcw_counters::GROUP,
+        &crate::ntos::rtl::exports::rtl_self_relative_sd::GROUP,
+        &crate::ntos::kd::exports::kd_debug_filter::GROUP,
+        &crate::ntos::etw::exports::etw_wmi_clock::GROUP,
+        &crate::ntos::kse::exports::kse_shim_engine::GROUP,
+        &crate::ntos::ex::exports::ex_access_violation::GROUP,
+        &crate::ntos::rtl::exports::rtl_network_address::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_wide::GROUP,
+        &crate::ntos::io::exports::io_top_level_irp::GROUP,
+        &crate::ntos::se::exports::se_access_from_state::GROUP,
     ]
 }
 

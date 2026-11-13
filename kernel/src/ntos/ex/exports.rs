@@ -831,3 +831,116 @@ pub mod ex_lookaside_wnf {
         data_exports: &[],
     };
 }
+
+pub mod ex_interlocked {
+    //! Adaptadores de ExInterlockedAddLargeInteger/Ulong (lógica em
+    //! `ex/interlocked.rs`).
+
+    use crate::ntos::ex::interlocked;
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// (PLARGE_INTEGER Addend, LARGE_INTEGER Increment por valor, PKSPIN_LOCK).
+    fn add_large_integer(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: Addend vivo e alinhado do chamador, como no NT.
+        let addend = unsafe { Field::<i64>::at(call.arg(1)) };
+        Ok(interlocked::add_large_integer(addend, call.arg(2) as i64, call.arg(3)) as u64)
+    }
+
+    /// (PULONG Addend, ULONG Increment, PKSPIN_LOCK).
+    fn add_ulong(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: idem.
+        let addend = unsafe { Field::<u32>::at(call.arg(1)) };
+        Ok(interlocked::add_ulong(addend, call.arg(2) as u32, call.arg(3)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-interlocked",
+        names: &["ExInterlockedAddLargeInteger", "ExInterlockedAddUlong"],
+        handlers: &[add_large_integer, add_ulong],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_processor_usage {
+    //! Adaptadores de ExGetCurrentProcessorCounts/CpuUsage (lógica em
+    //! `ex/processor_usage.rs`).
+
+    use crate::ntos::ex::processor_usage;
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// PULONG de saída do chamador.
+    fn ulong(address: u64) -> &'static Field<u32> {
+        // SAFETY: os exports recebem PULONGs vivos e alinhados, sem validação no NT.
+        unsafe { Field::<u32>::at(address) }
+    }
+
+    fn get_current_processor_counts(call: &Call) -> Result<u64, KernelError> {
+        processor_usage::counts(ulong(call.arg(1)), ulong(call.arg(2)), ulong(call.arg(3)));
+        Ok(0)
+    }
+
+    fn get_current_processor_cpu_usage(call: &Call) -> Result<u64, KernelError> {
+        processor_usage::cpu_usage(ulong(call.arg(1)));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-processor-usage",
+        names: &["ExGetCurrentProcessorCounts", "ExGetCurrentProcessorCpuUsage"],
+        handlers: &[get_current_processor_counts, get_current_processor_cpu_usage],
+        data_exports: &[],
+    };
+}
+
+pub mod pcw_counters {
+    //! Adaptadores de PcwRegister/PcwUnregister/PcwAddInstance (lógica em
+    //! `ex/pcw.rs`: o ramo do ntoskrnl sem a extensão do pcw.sys).
+
+    use crate::ntos::ex::pcw;
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// (PPCW_REGISTRATION *Registration, PPCW_REGISTRATION_INFORMATION Info).
+    fn register(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: ponteiro de saída vivo do driver, como no NT.
+        let registration = unsafe { Field::<u64>::at(call.arg(1)) };
+        Ok(signed_status(pcw::register(registration, call.arg(2))))
+    }
+
+    fn unregister(call: &Call) -> Result<u64, KernelError> {
+        pcw::unregister(call.arg(1));
+        Ok(0)
+    }
+
+    fn add_instance(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(pcw::add_instance(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, call.arg(5))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "pcw-counters",
+        names: &["PcwRegister", "PcwUnregister", "PcwAddInstance"],
+        handlers: &[register, unregister, add_instance],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_access_violation {
+    //! ExRaiseAccessViolation — STATUS_ACCESS_VIOLATION por `ntos/rtl/exceptions`
+    //! (o RtlRaiseStatus do original; não retorna).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::exceptions;
+    use crate::rtl::KernelError;
+
+    /// Mesmo limite de IRQL do adaptador de RtlRaiseStatus.
+    fn raise_access_violation(_: &Call) -> Result<u64, KernelError> {
+        exceptions::raise_status(0xC000_0005, 0, 0, 1)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-access-violation", names: &["ExRaiseAccessViolation"], handlers: &[raise_access_violation], data_exports: &[] };
+}

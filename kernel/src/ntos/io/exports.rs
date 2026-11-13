@@ -1023,3 +1023,65 @@ pub mod io_work_item_queue {
 
     pub static GROUP: Group = Group { name: "io-work-item-queue", names: &["IoTryQueueWorkItem"], handlers: &[try_queue_work_item], data_exports: &[] };
 }
+
+pub mod io_driver_registry {
+    //! Adaptadores de IoOpenDriverRegistryKey (`io/driver_registry.rs`) e
+    //! IoGetDeviceNumaNode (`io/pnp.rs`).
+
+    use crate::ntos::inc::types::{DriverObject, Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::{driver_registry, pnp};
+    use crate::rtl::KernelError;
+
+    /// (PDRIVER_OBJECT, DRIVER_REGKEY_TYPE, ACCESS_MASK, ULONG Flags, PHANDLE).
+    fn open_driver_registry_key(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DRIVER_OBJECT vivo e PHANDLE de saída do driver chamador
+        // (NULL vira None e é recusado pela rotina, como no NT).
+        let driver = (call.arg(1) != 0).then(|| unsafe { DriverObject::at(call.arg(1)) });
+        let output = (call.arg(5) != 0).then(|| unsafe { Field::<u64>::at(call.arg(5)) });
+        Ok(signed_status(driver_registry::open_driver_registry_key(driver, call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32, output)?))
+    }
+
+    /// (PDEVICE_OBJECT Pdo, PUSHORT NodeNumber).
+    fn get_device_numa_node(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PUSHORT de saída do driver, gravado só em sucesso.
+        let node = unsafe { Field::<u16>::at(call.arg(2)) };
+        Ok(signed_status(pnp::device_numa_node(call.arg(1), node)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-driver-registry",
+        names: &["IoOpenDriverRegistryKey", "IoGetDeviceNumaNode"],
+        handlers: &[open_driver_registry_key, get_device_numa_node],
+        data_exports: &[],
+    };
+}
+
+pub mod io_top_level_irp {
+    //! Adaptadores de Io{Get,Set}TopLevelIrp e IoThreadToProcess (lógica em
+    //! `io/threads.rs`, `top_level_irp`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::threads::top_level_irp;
+    use crate::rtl::KernelError;
+
+    fn get_top_level_irp(_: &Call) -> Result<u64, KernelError> {
+        Ok(top_level_irp::get())
+    }
+
+    fn set_top_level_irp(call: &Call) -> Result<u64, KernelError> {
+        top_level_irp::set(call.arg(1));
+        Ok(0)
+    }
+
+    fn thread_to_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(top_level_irp::thread_to_process(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-top-level-irp",
+        names: &["IoGetTopLevelIrp", "IoSetTopLevelIrp", "IoThreadToProcess"],
+        handlers: &[get_top_level_irp, set_top_level_irp, thread_to_process],
+        data_exports: &[],
+    };
+}
