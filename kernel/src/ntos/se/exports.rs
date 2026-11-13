@@ -80,7 +80,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod image_verification {
-    //! SeRegisterImageVerificationCallback — `ntos/se/image-verification`.
+    //! SeRegisterImageVerificationCallback — `ntos/se/image_verification`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::se::image_verification;
@@ -94,7 +94,7 @@ pub mod image_verification {
 }
 
 pub mod image_verification_remove {
-    //! SeUnregisterImageVerificationCallback — `ntos/se/image-verification`.
+    //! SeUnregisterImageVerificationCallback — `ntos/se/image_verification`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::se::image_verification;
@@ -237,7 +237,7 @@ pub mod impersonate_anonymous {
 }
 
 pub mod token_handles {
-    //! ZwOpenThreadTokenEx — `ntos/se/token-handles`; fora de PASSIVE_LEVEL o
+    //! ZwOpenThreadTokenEx — `ntos/se/token/handles`; fora de PASSIVE_LEVEL o
     //! sistema para com IRQL_NOT_LESS_OR_EQUAL (0xC4, 0x2001F).
 
     use crate::ntos::init::exports::{Call, Group};

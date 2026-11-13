@@ -1,15 +1,14 @@
 //! Despacho de contextos de kernel por prioridade.
 //!
-//! No original um processo era uma função geradora: cada `yield` devolvia o
-//! controle ao kernel. Em Rust o processo é um `Future`: cada
+//! Cada processo é um `Future` que devolve o controle ao kernel: cada
 //! `yield_now().await` devolve `Pending` e o escalonador o retoma depois. O
-//! valor do `yield` (espera com continuação de prontidão, manter o quantum)
-//! é publicado pelo future como sinal de passo antes de devolver `Pending`.
+//! sinal do passo (espera com continuação de prontidão, manter o quantum)
+//! é publicado pelo future antes de devolver `Pending`.
 //! Estados: ready -> running -> waiting/done/killed (recolhidos pelo kernel).
 //!
 //! Cada processo tem um EPROCESS + KTHREAD reais (`ps/process`); o tick
 //! ajusta a thread corrente (o gs:[0x188] do NT) durante o passo de cada um
-//! e a seleção segue as filas de prioridade do `ke/thread-dispatch`.
+//! e a seleção segue as filas de prioridade do `ke/thread_dispatch`.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -71,7 +70,7 @@ struct SchedulerState {
 
 static STATE: SpinLock<SchedulerState> = SpinLock::new(SchedulerState { processes: Vec::new(), next_pid: 8, system_thread: 0 }); // 0-7 reservados (4 = System)
 
-/// O valor do `yield` do passo corrente.
+/// O sinal do passo corrente.
 enum StepSignal {
     Waiting(PrepareDispatch),
     RetainQuantum,
@@ -79,7 +78,7 @@ enum StepSignal {
 
 static STEP: SpinLock<Option<StepSignal>> = SpinLock::new(None);
 
-/// Resumo público de um processo (`Scheduler.list()`).
+/// Resumo público de um processo (`list()`).
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -162,8 +161,7 @@ pub fn terminate_by_handle(handle: u64, exit_status: u32) -> u32 {
     if kill(pid as u32, exit_status) { 0 } else { 0xC000_0008 }
 }
 
-/// Recolhe processos terminados. Descartar o `Future` encerra o processo
-/// (o `gen.return()` do original).
+/// Recolhe processos terminados. Descartar o `Future` encerra o processo.
 fn reap() {
     loop {
         let finished = {
@@ -398,18 +396,18 @@ pub fn current_pid() -> u32 {
     guest::read64(thread + kthread::CID_UNIQUE_PROCESS) as u32
 }
 
-/// Devolve o controle ao escalonador uma vez — o `yield` dos geradores.
+/// Devolve o controle ao escalonador uma vez.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false, signal: None }
 }
 
-/// `yield { retainQuantum: true }`: devolve o controle sem pedir troca.
+/// Devolve o controle sem pedir troca (mantém o quantum).
 pub fn yield_retaining_quantum() -> YieldNow {
     YieldNow { yielded: false, signal: Some(StepSignalKind::RetainQuantum) }
 }
 
-/// `yield { waiting: true, prepareDispatch }`: a thread espera até que a
-/// continuação, sondada pelo escalonador no contexto do dono, a libere.
+/// A thread espera até que a continuação, sondada pelo escalonador no
+/// contexto do dono, a libere.
 pub fn wait_until(prepare: impl FnMut() -> bool + Send + 'static) -> YieldNow {
     YieldNow { yielded: false, signal: Some(StepSignalKind::Waiting(Box::new(prepare))) }
 }

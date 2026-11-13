@@ -131,7 +131,7 @@ fn has_record(context: u64, exclusive: bool) -> Result<bool, KernelError> {
     Ok(present)
 }
 
-/// Milissegundos desde o boot, a unidade dos prazos do original.
+/// Milissegundos desde o boot, a unidade dos prazos.
 fn elapsed_milliseconds() -> i64 {
     clock::uptime_ms() as i64
 }

@@ -2,8 +2,8 @@
 //!
 //! Boot sector, MFT com fixup (USA), atributos residentes e não residentes
 //! (runlists com deltas com sinal), $FILE_NAME e diretórios B-tree com
-//! blocos INDX. As mutações persistentes (`ntfs-write`) e os controles
-//! (`ntfs-control`) se acoplam a este volume.
+//! blocos INDX. As mutações persistentes (`ntfs_write`) e os controles
+//! (`ntfs_control`) se acoplam a este volume.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -165,7 +165,7 @@ pub struct Ntfs {
     boot: Vec<u8>,
     pub pending: SpinLock<Vec<PendingWrite>>,
     caches: SpinLock<Caches>,
-    /// Estado do writer (`ntfs-write`), acoplado na primeira mutação.
+    /// Estado do writer (`ntfs_write`), acoplado na primeira mutação.
     pub(super) writer: super::ntfs_write::WriterLock,
 }
 
@@ -201,7 +201,7 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
     Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer() }))
 }
 
-/// Volume montado em `\NTFS` (`ObjectManager.mount` + o volume que o
+/// Volume montado em `\NTFS` (`object_manager::mount` + o volume que o
 /// carregador de imagens e o ZwCreateFile resolvem).
 static MOUNTED: SpinLock<Option<Arc<Ntfs>>> = SpinLock::new(None);
 

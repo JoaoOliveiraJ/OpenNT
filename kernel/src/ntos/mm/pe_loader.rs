@@ -20,13 +20,13 @@ use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ps::notify::image as image_notify;
 use crate::rtl::{KernelError, SpinLock};
 
-/// Bytes por trampolim da tabela de thunks (`hal/win32/win32thunk.asm`).
+/// Bytes por trampolim da tabela de thunks (`hal::amd64::win32_thunk`).
 const STUB_SIZE: u64 = 10;
 /// Área de imagens de runtime (slots de 512 KB) — `memory_map`.
 const RUNTIME_IMAGE_BASE: u64 = 0x190_0000;
 const RUNTIME_IMAGE_SLOT: u64 = 0x8_0000;
 const RUNTIME_IMAGE_TOP: u64 = 0x1F0_0000;
-/// Base canônica alta estilo NT do experimento forceHighBase.
+/// Base canônica alta estilo NT do experimento `force_high_base`.
 const HIGH_DRIVER_BASE: u64 = 0xFFFF_F800_0100_0000;
 /// Imagens grandes vão para LARGE_IMAGE, alinhadas a 4 MB.
 const LARGE_IMAGE_ALIGN: u64 = 0x40_0000;

@@ -298,7 +298,7 @@ pub fn wait_job(slot: usize, timeout_ms: u64) -> Result<u64, KernelError> {
     Err(KernelError::new(alloc::format!("timeout esperando job do AP slot {slot}")))
 }
 
-/// Postagem + espera síncrona (como no original, o `false` de `start_job`
+/// Postagem + espera síncrona (o `false` de `start_job`
 /// não é tratado separadamente).
 pub fn run_on_ap(slot: usize, routine: u64, arguments: [u64; 4]) -> Result<u64, KernelError> {
     start_job(slot, routine, arguments)?;

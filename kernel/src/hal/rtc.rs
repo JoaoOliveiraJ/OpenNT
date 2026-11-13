@@ -1,4 +1,4 @@
-//! Relógio de tempo real via CMOS (portas 0x70/0x71) — `hal/rtc/rtc.c`.
+//! Relógio de tempo real via CMOS (portas 0x70/0x71).
 
 use super::port;
 

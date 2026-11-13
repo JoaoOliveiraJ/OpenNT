@@ -1,5 +1,4 @@
-//! Relógio de parede a partir do RTC — o que o `Date.now()` do QuickJS
-//! obtinha pela libc shim (`hal/rtl/time.c` sobre `hal/rtc/rtc.c`).
+//! Relógio de parede a partir do RTC.
 
 use crate::hal::rtc;
 
@@ -18,7 +17,7 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-/// `Date.now()`: milissegundos Unix lidos do CMOS (resolução de segundos).
+/// Milissegundos Unix lidos do CMOS (resolução de segundos).
 pub fn rtc_unix_milliseconds() -> u64 {
     let now = rtc::read();
     let days = days_from_civil(now.year as i64, now.month as u32, now.day as u32);

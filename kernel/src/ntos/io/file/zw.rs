@@ -332,7 +332,7 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
 }
 
 /// ZwOpenFile = ZwCreateFile com FILE_OPEN (compartilhamento e opções não
-/// são repassados, como no original).
+/// são repassados).
 pub fn open_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64) -> Result<u32, KernelError> {
     create_kernel_file(output, desired_access, attributes_pointer, io_status, 0, FILE_OPEN, 0)
 }
@@ -447,8 +447,8 @@ pub fn query_file_information_by_object(file: u64, class: u32, length: u32, outp
 
 /// Cria/abre arquivo ou diretório por nome pelo ZwCreateFile e fecha em
 /// seguida (RtlCreateSystemVolumeInformationFolder). Os OBJECT_ATTRIBUTES
-/// levam Length = 48: o original deixava Length zerado e a captura do nome
-/// recusava a chamada.
+/// levam Length = 48: com Length zerado, a captura do nome recusaria a
+/// chamada.
 pub fn create_file_by_name(object_name: &str, disposition: u32, options: u32) -> Result<u32, KernelError> {
     let units: alloc::vec::Vec<u16> = object_name.encode_utf16().collect();
     let block = guest::alloc_bytes(0x80 + units.len() as u64 * 2 + 2);
@@ -474,8 +474,8 @@ pub fn create_file_by_name(object_name: &str, disposition: u32, options: u32) ->
     status
 }
 
-/// Registro de fechamento de um handle de kernel ou de arquivo
-/// (`zw.closeRecord`), instalado como provedor do NtClose.
+/// Registro de fechamento de um handle de kernel ou de arquivo, instalado
+/// como provedor do NtClose.
 fn entry_of(handle: u64) -> Option<FileEntry> {
     FILE_HANDLES.lock().get(&((handle as u32) & !3)).cloned()
 }
@@ -719,9 +719,9 @@ pub fn open_kernel_object(output: u64, node: object_manager::NodeId, access: u32
     Ok(0)
 }
 
-/// Registro de acesso de um handle (closeRecord do original): os handles de
-/// objetos do zw primeiro, depois a tabela do Object Manager. Devolve (forma
-/// de kernel, processo dono, atributos, acesso concedido).
+/// Registro de acesso de um handle: os handles de objetos do zw primeiro,
+/// depois a tabela do Object Manager. Devolve (forma de kernel, processo
+/// dono, atributos, acesso concedido).
 pub fn handle_access_record(handle: u32) -> Option<(bool, u64, u32, u32)> {
     let low = handle & 0x7FFF_FFFC;
     if let Some(entry) = KERNEL_OBJECT_HANDLES.lock().get(&low).cloned() {

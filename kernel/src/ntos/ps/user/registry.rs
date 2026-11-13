@@ -134,7 +134,7 @@ impl UserObject for UserKey {
             }),
         })
     }
-    /// `releaseUserObject` do NtClose: fecha o handle interno da hive.
+    /// Liberação no NtClose: fecha o handle interno da hive.
     fn release(&self) {
         registry::close_handle(self.khandle);
     }

@@ -1,8 +1,8 @@
 //! Validação nativa (19041) dos parâmetros de vista.
 //!
 //! Medida antes de o MM original alocar VADs ou tabelas de páginas; não faz
-//! busca de objeto nem alocação. A aritmética usa u128 onde o original usava
-//! BigInt, para que somas acima de 2^64 sejam comparadas sem truncar.
+//! busca de objeto nem alocação. A aritmética usa u128, para que somas acima
+//! de 2^64 sejam comparadas sem truncar.
 
 const INVALID: u32 = 0xC000_000D;
 const PROTECTION: u32 = 0xC000_0045;

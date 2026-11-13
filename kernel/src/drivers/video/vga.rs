@@ -73,7 +73,7 @@ impl Screen {
             }
             _ => {
                 // A memória de texto guarda um byte por célula (code page 437);
-                // como no original, só o byte baixo do código é escrito.
+                // só o byte baixo do código é escrito.
                 let byte = (character as u32 & 0xFF) as u16;
                 physical::write16(cell(self.cx, self.cy), (self.attribute as u16) << 8 | byte);
                 self.cx += 1;

@@ -2,8 +2,7 @@
 //!
 //! O handle possui uma porta real ainda pendente; só a decisão do servidor
 //! conecta a porta ou produz a recusa. Atributos, filas, limpeza e
-//! cancelamento são os do transporte de `ps/user/alpc` (o adaptador do
-//! original).
+//! cancelamento são os do transporte de `ps/user/alpc`.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

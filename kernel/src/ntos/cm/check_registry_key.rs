@@ -31,7 +31,7 @@ fn allocate(size: u64, zero: bool) -> Option<u64> {
 }
 
 /// Caminho `\REGISTRY\USER\<SID>` do TokenUser efetivo; o texto é montado
-/// num buffer de pool como o original. `Err(status)` em falha.
+/// num buffer de pool. `Err(status)` em falha.
 fn current_user_path() -> Result<Result<String, u32>, KernelError> {
     let Some(token) = thread_tokens::effective(process::get_current_thread(), false) else { return Ok(Err(0xC000_007C)) };
     tokens::retain(token)?;

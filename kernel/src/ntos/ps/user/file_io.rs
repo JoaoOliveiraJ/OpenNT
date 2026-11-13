@@ -1,11 +1,11 @@
 //! Contratos de arquivo de modo usuário sobre o NTFS persistente.
 //!
-//! Transcrito: abertura/criação pelo volume (validação de disposição,
+//! Implementado: abertura/criação pelo volume (validação de disposição,
 //! opções, compartilhamento, superseded/overwrite/create, DELETE_ON_CLOSE),
 //! NtQueryAttributesFile/NtQueryFullAttributesFile, NtQueryInformationFile e
 //! NtReadFile/NtWriteFile de arquivos (e de console). Pendente: o restante do
 //! módulo (NtSetInformationFile em diante) e a transferência de
-//! dispositivos (`ps/user/device-io`).
+//! dispositivos (`ps/user/device_io`).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -488,7 +488,7 @@ fn nt_write_file(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> 
     file_transfer(handle, event, apc, rsp, true)
 }
 
-/// Registra os handlers transcritos (o `attach(fs)` do original).
+/// Registra os handlers implementados.
 pub fn init() {
     state::register_handler("NtQueryAttributesFile", nt_query_attributes_file);
     state::register_handler("NtQueryFullAttributesFile", nt_query_full_attributes_file);

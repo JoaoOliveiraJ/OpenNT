@@ -34,7 +34,7 @@ fn compare_name(name: u64, entry: &mut impl Entry) -> i32 {
     name_characters as i32 - entry_characters as i32
 }
 
-/// bsearch do original: meio inferior quando a quantidade é par.
+/// Busca binária: meio inferior quando a quantidade é par.
 fn search<E: Entry>(count: u32, name: u64, mut get_entry: impl FnMut(u32) -> E) -> Option<E> {
     let mut first = 0u32;
     let mut remaining = count;

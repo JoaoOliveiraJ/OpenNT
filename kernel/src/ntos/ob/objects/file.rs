@@ -28,11 +28,11 @@ pub trait FileSource: Send + Sync {
     fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, KernelError>;
     fn acquire(&self) {}
     fn release(&self) {}
-    /// Metadados do arquivo de origem (`source.stat` do original).
+    /// Metadados do arquivo de origem.
     fn stat(&self) -> Option<crate::drivers::fs::volume::VolumeStat> {
         None
     }
-    /// Volume que guarda os bytes (`source.volume`), quando a fonte é um arquivo de volume.
+    /// Volume que guarda os bytes, quando a fonte é um arquivo de volume.
     fn volume(&self) -> Option<&'static dyn crate::drivers::fs::volume::FileSystem> {
         None
     }
@@ -238,7 +238,7 @@ pub fn open_handle(pointer: u64) -> Result<(), KernelError> {
 }
 
 /// Marca a abertura sem publicar handle: o provedor de usuário é dono de
-/// cada handle publicado (`record.opened = true` do original).
+/// cada handle publicado (`record.opened = true`).
 pub fn mark_opened(pointer: u64) -> Result<(), KernelError> {
     FILES.lock().get_mut(&pointer).map(|record| record.opened = true).ok_or_else(|| KernelError::new("unknown file object"))
 }

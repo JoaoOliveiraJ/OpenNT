@@ -1,4 +1,4 @@
-//! Entradas nativas privadas e corpos x64 próprios — `hal/win32/win32thunk.asm`.
+//! Entradas nativas privadas e corpos x64 próprios.
 //!
 //! As rotinas privadas têm ids próprios (0x80000000+) e nunca entram na EAT;
 //! cada stub marca o id e cai no trampolim comum. O ObFindHandleForObject

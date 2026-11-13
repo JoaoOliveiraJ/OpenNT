@@ -37,7 +37,7 @@ pub fn push(head: u64, entry: u64) -> Result<u64, KernelError> {
     }
 }
 
-/// InterlockedPopEntrySList: só Depth decresce (o DEC BX do original); a
+/// InterlockedPopEntrySList: só Depth decresce (DEC BX); a
 /// sequência muda nas inserções, impedindo ABA.
 pub fn pop(head: u64) -> Result<u64, KernelError> {
     let mut expected = read_header(head)?;

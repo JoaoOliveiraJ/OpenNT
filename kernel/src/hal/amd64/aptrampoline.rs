@@ -1,4 +1,4 @@
-//! Trampolim de Application Processor — transcrição de `boot/aptrampoline.asm`.
+//! Trampolim de Application Processor.
 //!
 //! O BSP (`ntos::ke::smp`) copia estes bytes para 0x9000, preenche a mailbox
 //! em 0xA000 (CR3, pilha, slot) e dispara INIT-SIPI-SIPI pelo LAPIC. O AP
@@ -236,7 +236,7 @@ extern "C" {
     static ap_trampoline_end: u8;
 }
 
-/// Bytes do trampolim (o `boot/aptrampoline.bin` do bundle do original).
+/// Bytes do trampolim.
 pub fn bytes() -> &'static [u8] {
     let start = core::ptr::addr_of!(ap_trampoline_start);
     let end = core::ptr::addr_of!(ap_trampoline_end);

@@ -1,4 +1,4 @@
-//! Suítes de autoteste do kernel — `system32/ntos/test/`.
+//! Suítes de autoteste do kernel.
 //!
 //! Só entram no fluxo de boot com `--kernel-test-scope` diferente de `none`.
 

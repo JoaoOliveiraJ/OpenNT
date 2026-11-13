@@ -154,7 +154,7 @@ fn capture_entry(descriptor: &Descriptor, mode: u8) -> Result<Result<Entry, u32>
         }
         process::reference(source_process);
         retained = true;
-        // O original conserva a herança do handle capturado; INHERIT do
+        // Conserva a herança do handle capturado; INHERIT do
         // atributo não cria esse bit no objeto de origem.
         Ok(Ok(Entry { item: item.clone(), source_process, access: outcome.granted.unwrap_or(desired), object_type, attributes: source_attributes & 2 }))
     })();

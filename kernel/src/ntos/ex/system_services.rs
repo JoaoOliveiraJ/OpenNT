@@ -33,7 +33,7 @@ struct Binding {
 
 static BINDINGS: SpinLock<BTreeMap<u32, Binding>> = SpinLock::new(BTreeMap::new());
 static REGISTERED: SpinLock<[Option<BTreeMap<u32, String>>; 2]> = SpinLock::new([None, None]);
-/// `UserMode.invokeService(name, a1..a4, retorno, rsp)` de `ps/user/index`.
+/// `invoke_service(name, a1..a4, retorno, rsp)` de `ps/user/index`.
 static USER_INVOKER: SpinLock<Option<fn(&str, [u64; 4], u64, u64) -> Result<u32, KernelError>>> = SpinLock::new(None);
 
 pub fn set_user_invoker(invoker: fn(&str, [u64; 4], u64, u64) -> Result<u32, KernelError>) {

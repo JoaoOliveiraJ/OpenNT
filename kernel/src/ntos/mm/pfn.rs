@@ -71,7 +71,7 @@ pub fn unbind_partition(body: u64) {
 /// faltam e devolve se liberou algum.
 static RECLAIMER: SpinLock<Option<fn(u64) -> bool>> = SpinLock::new(None);
 static RECLAIMING: AtomicBool = AtomicBool::new(false);
-/// Banco nativo instalado (o `observer` do original).
+/// Banco nativo instalado.
 static OBSERVED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() -> Result<(), KernelError> {
@@ -246,7 +246,7 @@ pub fn alloc_contiguous(count: u64, alignment: u64, highest_pfn: u64, lowest_pfn
     address
 }
 
-/// `allocContiguous(count, count)` com os padrões do original.
+/// `alloc_contiguous` com os limites padrão.
 pub fn alloc_contiguous_default(count: u64, alignment: u64) -> u64 {
     alloc_contiguous(count, alignment, 0xF_FFFF_FFFF, 0, 0)
 }

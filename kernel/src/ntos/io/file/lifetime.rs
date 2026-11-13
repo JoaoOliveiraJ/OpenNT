@@ -54,7 +54,7 @@ impl LifetimeFileSystem for Ntfs {
     }
 }
 
-/// Adaptador de um volume montado (`node.mount`) para o registro de vida.
+/// Adaptador de um volume montado para o registro de vida.
 struct MountedVolume(&'static dyn crate::drivers::fs::volume::FileSystem);
 
 impl LifetimeFileSystem for MountedVolume {
@@ -92,7 +92,7 @@ pub fn lifetime_volume(volume: &'static dyn crate::drivers::fs::volume::FileSyst
     MOUNTED.lock().entry(key).or_insert_with(|| Arc::new(MountedVolume(volume))).clone()
 }
 
-/// Marcas de um arquivo de usuário (`entry.file` do original).
+/// Marcas de um arquivo de usuário.
 #[derive(Default)]
 pub struct FileMarks {
     pub pending_delete: AtomicBool,
@@ -137,7 +137,7 @@ struct Registry {
     states: BTreeMap<u64, State>,
     descriptions: BTreeMap<u64, Description>,
     sections: BTreeMap<u64, Section>,
-    /// FILE_OBJECT -> descrição (`record.fileLifetime`).
+    /// FILE_OBJECT -> descrição.
     bound: BTreeMap<u64, u64>,
 }
 

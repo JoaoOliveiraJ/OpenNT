@@ -31,8 +31,8 @@ pub struct Packet {
     pub information: u64,
     /// Pacote de memória (IoSetIoCompletionEx): os campos são lidos dele.
     pub native_pointer: u64,
-    /// Identidade do item (`port.packets.indexOf(item)`): o corpo do pacote
-    /// de espera que o publicou.
+    /// Identidade do item na fila: o corpo do pacote de espera que o
+    /// publicou.
     pub tag: u64,
     pub on_dequeue: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -99,7 +99,7 @@ impl Port {
 }
 
 static PORTS: SpinLock<BTreeMap<u64, Arc<Port>>> = SpinLock::new(BTreeMap::new());
-/// `thread.ioCompletionPort`.
+/// Porta de conclusão associada a cada thread.
 static THREAD_PORT: SpinLock<BTreeMap<u64, Arc<Port>>> = SpinLock::new(BTreeMap::new());
 /// Thread elegível (nem morta nem suspensa), instalado por `ps/user/threads`.
 static THREAD_ELIGIBLE: SpinLock<Option<fn(u64) -> bool>> = SpinLock::new(None);

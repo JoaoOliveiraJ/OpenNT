@@ -1,6 +1,6 @@
 //! Lock de rotação com interrupções desligadas durante a posse — o papel do
-//! KSPIN_LOCK adquirido em DISPATCH_LEVEL. No original o interpretador era
-//! monothread; aqui cada estado global de módulo fica atrás de um destes.
+//! KSPIN_LOCK adquirido em DISPATCH_LEVEL. Cada estado global de módulo fica
+//! atrás de um destes.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};

@@ -1,4 +1,4 @@
-//! Descritores de serviço nativos — `hal/win32/service-table.asm`.
+//! Descritores de serviço nativos.
 //!
 //! KSERVICE_TABLE_DESCRIPTOR (normal e shadow), as tabelas compactadas de
 //! 4096 DWORDs e os bytes de argumentos de cada tabela, mais
@@ -74,7 +74,7 @@ unsafe extern "C" {
     fn nt_service_lookup();
 }
 
-// Provedores MS x64 das tabelas vivas — `hal/win32/service-gateways.asm`.
+// Provedores MS x64 das tabelas vivas.
 // Cada gateway de dez bytes marca o id privado (0x40000000 + número) e cai
 // no trampolim comum; só slots com implementação registrada os recebem. A
 // falha comum dos slots sem provedor nunca relata sucesso.
@@ -105,9 +105,9 @@ extern "C" {
     fn nt_service_unimplemented();
 }
 
-/// Endereços na imagem, na ordem de `getSystemServiceEntry`: busca,
-/// descritor, shadow, tabelas nativa/win32, argumentos nativo/win32, os
-/// gateways e a rotina de serviço indisponível.
+/// Endereços na imagem, nesta ordem: busca, descritor, shadow, tabelas
+/// nativa/win32, argumentos nativo/win32, os gateways e a rotina de serviço
+/// indisponível.
 pub fn entries() -> [u64; 9] {
     [
         nt_service_lookup as unsafe extern "C" fn() as usize as u64,

@@ -15,9 +15,8 @@ pub fn init() {
     // Exports do kernel para drivers: resolvedor do loader e trampolins.
     crate::ntos::init::exports::init();
     // hal.dll real da instalação: biblioteca sem entrada com os seus
-    // encaminhamentos (o original o carregava no fim da fase 0; aqui vem
-    // logo depois dos resolvedores do ntoskrnl, de que os encaminhamentos
-    // dependem).
+    // encaminhamentos, carregada logo depois dos resolvedores do ntoskrnl,
+    // de que os encaminhamentos dependem.
     match crate::ntos::mm::sysload::load("hal.dll") {
         Ok(module) => debug_print!("[boot] hal.dll carregado ({} exports, {} encaminhamentos)", module.exports.exports.len(), module.exports.forwarders.len()),
         Err(error) => debug_print!("[boot] hal.dll falhou: {}", error),
@@ -51,7 +50,7 @@ pub fn init() {
         Err(error) => debug_print!("[pci] enumeracao falhou: {}", error),
     }
     // Drivers de serviço lidos do Registry + PnP START. O provedor de status
-    // dos drivers entra como no carregamento do driver-services original.
+    // dos drivers entra com `cm::service::driver`.
     crate::ntos::cm::service::driver::init();
     let loaded = crate::ntos::cm::service::system_drivers::start_boot_drivers();
     debug_print!("[boot] servicos carregados: {}", loaded);

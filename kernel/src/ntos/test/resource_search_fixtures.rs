@@ -1,7 +1,7 @@
 //! Fixtures da pesquisa de recursos.
 //!
 //! Dados próprios: status e saídas vêm das instruções originais, não da
-//! implementação. Gerado a partir do arquivo original.
+//! implementação.
 
 pub struct ImageFixture {
     pub length: usize,

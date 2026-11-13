@@ -30,7 +30,7 @@ pub struct Row {
     pub access: u32,
     pub entry: u64,
     pub handle: u32,
-    /// Identidade da publicação (o `===` de linha do original).
+    /// Identidade da publicação.
     pub serial: u64,
 }
 

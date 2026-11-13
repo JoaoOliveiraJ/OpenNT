@@ -683,7 +683,7 @@ impl ObjectOwner for CallbackOwner {
 
 static OWNERS_REGISTERED: SpinLock<bool> = SpinLock::new(false);
 
-/// Slot Callback do `open-pointer` e dono de handles de kernel do NtClose.
+/// Slot Callback do `open_pointer` e dono de handles de kernel do NtClose.
 fn register_owners() {
     let mut registered = OWNERS_REGISTERED.lock();
     if *registered {

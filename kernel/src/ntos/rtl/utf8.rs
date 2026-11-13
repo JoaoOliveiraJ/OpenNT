@@ -149,7 +149,7 @@ pub fn unicode_to_utf8(destination: u64, capacity: u32, output_length: u64, sour
         }
         written += encoded;
     }
-    // O original escreve o tamanho incondicionalmente; um ponteiro nulo aqui
+    // Escrever o tamanho incondicionalmente com um ponteiro nulo aqui
     // gravaria no endereço físico zero, então só se escreve quando há saída.
     if output_length != 0 {
         guest::try_write32(output_length, written)?;

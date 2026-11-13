@@ -2,7 +2,7 @@
 //!
 //! Contrato ThreadPagePriority medido nos bytes originais e em chamadas do
 //! Windows. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
-//! kernel). A variante de syscall de usuário (`queryUser`) entra com o
+//! kernel). A variante de syscall de usuário (`query_user`) entra com o
 //! estado de modo usuário (fase 7).
 
 use super::user_probe;

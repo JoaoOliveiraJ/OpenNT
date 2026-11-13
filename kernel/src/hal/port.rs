@@ -1,4 +1,4 @@
-//! I/O de porta (host_inb/host_outb... de `hal/core/host.c`).
+//! I/O de porta (IN/OUT).
 
 use core::arch::asm;
 

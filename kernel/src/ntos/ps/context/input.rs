@@ -77,7 +77,7 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelEr
     if mode != 0 && !readable(flag_address.min(USER_ADDRESS_LIMIT), 4) {
         return Ok(Err(AV));
     }
-    // O original lê as flags antes do alinhamento, da extensão total e do
+    // Lê as flags antes do alinhamento, da extensão total e do
     // acesso aos campos selecionados; falhas de kernel não viram status.
     let flags = guest::read32(flag_address);
     let (status, flags) = registers::validate(flags, mode, false);

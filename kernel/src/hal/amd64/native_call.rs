@@ -1,5 +1,4 @@
-//! Ponte para código nativo — `hal/core/native-call.c` e células nativas de
-//! `hal/qjs/primitives_memory.c`.
+//! Ponte para código nativo e células nativas do kernel.
 //!
 //! Nesta fase: o NonPagedPoolLock (célula dentro da imagem do kernel, cujo
 //! alias virtual a PCR publica) e o registro do mapeamento permanente da
@@ -8,11 +7,11 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// `os.getNonPagedPoolLock()`: lock de 8 bytes na seção de dados da imagem,
-/// alinhado em 16 como o original. Os bytes seguintes ficam reservados e
-/// zerados: no original os vizinhos eram flags e ponteiros nulos, e drivers
-/// que acham estruturas do kernel a partir do lock (o vgk lê e grava a partir
-/// de `lock+8`) não podem cair em outras variáveis do kernel.
+/// NonPagedPoolLock: lock de 8 bytes na seção de dados da imagem, alinhado em
+/// 16. Os bytes seguintes ficam reservados e zerados (vizinhos como flags e
+/// ponteiros nulos), e drivers que acham estruturas do kernel a partir do
+/// lock (o vgk lê e grava a partir de `lock+8`) não podem cair em outras
+/// variáveis do kernel.
 #[repr(C, align(16))]
 struct PoolLockCell {
     lock: AtomicU64,
@@ -60,11 +59,11 @@ pub fn native_gateway_address(physical_entry: u64) -> u64 {
     PUBLISHED_VIRTUAL_BASE.load(Ordering::Relaxed) + physical_entry - PUBLISHED_PHYSICAL_BASE.load(Ordering::Relaxed)
 }
 
-// ---- chamadas MS-ABI (exec_msabi_n de hal/win32/win32thunk.asm) -----------
+// ---- chamadas MS-ABI (exec_msabi_n) ---------------------------------------
 //
 // O gateway é independente de posição e roda no alias publicado da imagem:
-// o CALL empilha um endereço de retorno dentro da VA real do kernel, como no
-// original. A imagem inteira está mapeada nos dois endereços, então referências
+// o CALL empilha um endereço de retorno dentro da VA real do kernel.
+// A imagem inteira está mapeada nos dois endereços, então referências
 // relativas caem no alias e absolutas no identity map — ambos válidos.
 // A posse de traps para SEH de código nativo entra com o loader PE (fase 6).
 
@@ -122,8 +121,8 @@ extern "C" {
 
 pub const MAX_NATIVE_ARGUMENTS: usize = 20;
 
-/// `os.execMsAbiExact`/`execMsAbiN`: chama `routine` na ABI MS x64 com os
-/// argumentos inteiros dados e devolve RAX.
+/// Chama `routine` na ABI MS x64 com os argumentos inteiros dados e devolve
+/// RAX.
 pub fn call(routine: u64, arguments: &[u64]) -> u64 {
     assert!(arguments.len() <= MAX_NATIVE_ARGUMENTS, "too many native arguments");
     let mut padded = [0u64; MAX_NATIVE_ARGUMENTS];

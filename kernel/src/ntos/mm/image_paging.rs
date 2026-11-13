@@ -5,7 +5,7 @@
 //! PTE ausente substituem salvar os dados. O estado fica sob um spin lock
 //! liberado durante alocações de frame e I/O (a recuperação de memória pode
 //! reentrar aqui); `busy`, `faulting` e `reclaiming` são as proteções de
-//! reentrada do original.
+//! reentrada.
 
 use alloc::collections::BTreeMap;
 use alloc::format;

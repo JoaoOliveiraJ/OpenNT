@@ -306,7 +306,7 @@ pub fn map_region_pages(region: &PrivateRegion) -> bool {
 }
 
 /// O alocador de VA: commit sobre reserva própria, base fixa ou escolha
-/// pelo `section-address` (MEM_TOP_DOWN desce abaixo das estruturas).
+/// pelo `mm/section/address` (MEM_TOP_DOWN desce abaixo das estruturas).
 #[allow(clippy::too_many_arguments)]
 pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
     allocate_in(Space::Active, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
@@ -744,7 +744,7 @@ fn query(process: u64, base: u64, class: u64, buffer: u64, rsp: u64) -> Result<u
     memory_query::query_virtual_memory(process, base, class, buffer, rsp)
 }
 
-/// Registra os handlers Nt*VirtualMemory (o require-time do original).
+/// Registra os handlers Nt*VirtualMemory.
 pub fn init() {
     state::register_handler("NtAllocateVirtualMemory", nt_allocate_virtual_memory);
     state::register_handler("NtAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);

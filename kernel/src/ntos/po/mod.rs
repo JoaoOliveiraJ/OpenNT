@@ -1,4 +1,4 @@
-//! Power Manager — `system32/ntos/po/`.
+//! Power Manager.
 
 pub mod power_manager;
 pub mod power_setting;

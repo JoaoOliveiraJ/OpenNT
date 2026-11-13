@@ -2,10 +2,10 @@
 //!
 //! As threads executam código nativo em anel 3; a HAL salva CONTEXTs x64
 //! completos nas saídas de syscall/timer e este módulo cuida do
-//! escalonamento e do ciclo de vida. `S.userThreads` vive em `THREADS`.
-//! A execução do contexto (`execUserContext`) é instalada pela HAL de modo
-//! usuário; os pumps de ALPC, device-io, worker factories, timers e pacotes
-//! de espera ocupam slots fixos, na ordem do laço original.
+//! escalonamento e do ciclo de vida. As threads vivem em `THREADS`.
+//! A execução do contexto (`exec_user_context`) é instalada pela HAL de modo
+//! usuário; os pumps de ALPC, `device_io`, worker factories, timers e pacotes
+//! de espera ocupam slots fixos do laço.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -32,7 +32,7 @@ const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
 const EXIT_KIND_CELL: u64 = 0x8_F1B0;
 const RESET_CELLS: [u64; 5] = [0x8_F090, 0x8_F098, 0x8_F138, 0x8_F140, 0x8_F148];
 
-/// Slots dos pumps do laço, na ordem original.
+/// Slots dos pumps do laço, em ordem fixa.
 pub mod pump {
     pub const ALPC: usize = 0;
     pub const DEVICE_IO: usize = 1;
@@ -45,7 +45,7 @@ pub mod pump {
 #[derive(Default)]
 pub struct Wait {
     pub entries: Option<Vec<Arc<UserHandle>>>,
-    /// Ponteiros dos objetos de `entries` (`entries.map(e => e.pointer)`).
+    /// Ponteiros dos objetos de `entries`.
     pub objects: Vec<u64>,
     pub wait_type: u32,
     pub alertable: Option<bool>,
@@ -167,12 +167,12 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static CURRENT: SpinLock<Option<Arc<UserThread>>> = SpinLock::new(None);
 static APC_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
 static DRAINING_APCS: AtomicBool = AtomicBool::new(false);
-/// `os.execUserContext(context, teb)`.
+/// `exec_user_context(context, teb)` da HAL de modo usuário.
 static EXECUTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
-/// `call-capture.consume` + `exceptions.hardware/pending`: devolve o status
+/// `call_capture::consume` + `exceptions::hardware`/`pending`: devolve o status
 /// fatal ou 0 para continuar.
 static EXIT_HANDLER: SpinLock<Option<fn(&Arc<UserThread>, u32, u32) -> u32>> = SpinLock::new(None);
-/// `win32k.releaseThread(pid, tid)`.
+/// `win32k::release_thread(pid, tid)`.
 static WIN32K_RELEASE: SpinLock<Option<fn(u64, u64)>> = SpinLock::new(None);
 static PUMPS: SpinLock<[Option<fn()>; 5]> = SpinLock::new([None; 5]);
 
@@ -200,7 +200,7 @@ pub fn push(thread: Arc<UserThread>) {
     THREADS.lock().push(thread);
 }
 
-/// `S.userThreads.length = 0`.
+/// Esvazia a lista de threads de usuário.
 pub fn clear() {
     THREADS.lock().clear();
 }

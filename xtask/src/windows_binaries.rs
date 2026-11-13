@@ -1,5 +1,5 @@
 //! Binários reais do Windows desta máquina, copiados no build (nunca ficam
-//! no repositório), como o build original fazia.
+//! no repositório).
 //!
 //! O hal.dll e as pilhas de teclado/mouse e de armazenamento entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em

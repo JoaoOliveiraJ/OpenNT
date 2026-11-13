@@ -1,8 +1,8 @@
 //! SeQuerySecurityDescriptorInfo.
 //!
-//! Seleciona componentes do descritor do objeto; formato e filtros medidos
-//! no original. `query_info` é a forma do export, com os parâmetros por
-//! ponteiro.
+//! Seleciona componentes do descritor do objeto; formato e filtros medidos no
+//! kernel de referência. `query_info` é a forma do export, com os parâmetros
+//! por ponteiro.
 
 use alloc::vec::Vec;
 

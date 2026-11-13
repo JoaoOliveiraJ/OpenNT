@@ -1,4 +1,4 @@
-//! I/O Manager (Io) — `system32/ntos/io/`.
+//! I/O Manager (Io).
 //!
 //! Fase 3: work items. O restante do I/O Manager entra na fase 4.
 

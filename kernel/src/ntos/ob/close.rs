@@ -3,9 +3,9 @@
 //! Libera o handle pelo subsistema dono do objeto. Classificação, processo
 //! dono e proteção contra fechamento são verificados antes da liberação.
 //!
-//! Donos ainda não transcritos se registram aqui: a tabela de handles de
+//! Donos de módulos posteriores se registram aqui: a tabela de handles de
 //! usuário (fase 7), os donos de handles de kernel `ex/callbacks` e
-//! `se/token-handles` (nessa ordem) e o provedor Zw (fase 6).
+//! `se/token/handles` (nessa ordem) e o provedor Zw (fase 6).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -29,14 +29,14 @@ pub struct UserHandleTable {
     pub close: fn(u64, bool) -> u32,
 }
 
-/// Dono de handles de kernel próprios (`ex/callbacks`, `se/token-handles`).
+/// Dono de handles de kernel próprios (`ex/callbacks`, `se/token/handles`).
 #[derive(Clone, Copy)]
 pub struct KernelHandleOwner {
     pub attributes: fn(u64) -> Option<u32>,
     pub close: fn(u64) -> u32,
 }
 
-/// Registro devolvido pelo provedor Zw (`win32/ntoskrnl/zw.closeRecord`).
+/// Registro devolvido pelo provedor Zw (`io/file/zw`).
 pub struct ZwRecord {
     pub kernel_handle: bool,
     pub owner_process: u64,

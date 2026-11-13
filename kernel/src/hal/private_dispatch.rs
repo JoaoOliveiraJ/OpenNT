@@ -334,7 +334,7 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         }
         // Sem bloco de eventos PM1 tratado pelo OpenNT: nenhum botão a ler.
         "HalpCheckPowerButton" => 0,
-        // Reinicializa o vídeo em modo texto (o int 10h modo 3 do original).
+        // Reinicializa o vídeo em modo texto (equivale ao int 10h modo 3).
         "HalpBiosDisplayReset" => {
             crate::drivers::video::vga::clear();
             1

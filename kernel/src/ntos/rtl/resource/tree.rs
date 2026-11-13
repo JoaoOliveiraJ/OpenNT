@@ -1,7 +1,7 @@
 //! Árvore de recursos PE numa vista existente.
 //!
 //! Não carrega DLLs, não aloca payloads e não fabrica recursos: o resultado
-//! aponta para os bytes da vista. Todo acesso passa pelo `resource-memory`.
+//! aponta para os bytes da vista. Todo acesso passa pelo `resource::memory`.
 
 use alloc::vec::Vec;
 
@@ -227,7 +227,7 @@ fn compare_name(image: &Image, entry_offset: i64, key: &Key) -> Result<Result<i3
             break;
         }
     }
-    // Com o prefixo igual, o original mede a string terminada inteira.
+    // Com o prefixo igual, mede-se a string terminada inteira.
     let key_length = match key {
         Key::Name(units) => units.len(),
         Key::Pointer(pointer) => {

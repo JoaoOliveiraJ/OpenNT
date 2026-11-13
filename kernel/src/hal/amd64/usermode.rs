@@ -1,4 +1,4 @@
-//! Anel 3 — `hal/win32/usermode.asm` + `hal/qjs/primitives_usermode.c`.
+//! Anel 3 (modo usuário).
 //!
 //! A HAL só oferece as primitivas de CPU: GDT/TSS/MSRs, entrada em anel 3,
 //! a entrada de syscall (o KiSystemCall64 deste kernel, alvo do LSTAR) e o
@@ -520,9 +520,9 @@ fn write32(address: u64, value: u32) {
     unsafe { core::ptr::write_volatile(address as *mut u32, value) }
 }
 
-/// `os.userModeInit(topoDaPilha)`: GDT com os segmentos de usuário e a
-/// TSS (RSP0 = pilha de syscall), LGDT/LTR, EFER.SCE e STAR/LSTAR/SFMASK.
-/// A KPCR continua no GS do kernel; o KernelGSbase do usuário vai a zero.
+/// GDT com os segmentos de usuário e a TSS (RSP0 = pilha de syscall),
+/// LGDT/LTR, EFER.SCE e STAR/LSTAR/SFMASK. A KPCR continua no GS do kernel; o
+/// KernelGSbase do usuário vai a zero.
 pub fn user_mode_init(stack_top: u64) -> Result<u64, crate::rtl::KernelError> {
     if STATE.lock().ready {
         return Err(crate::rtl::KernelError::new("userModeInit: ja inicializado"));
@@ -577,8 +577,7 @@ pub fn ready() -> bool {
     STATE.lock().ready
 }
 
-/// `os.execUserMode(entry, rsp, teb, arg1, rflags, arg2)`: entra no
-/// processo e só volta no término (protocolo GS: GS.base = TEB e
+/// Entra no processo e só volta no término (protocolo GS: GS.base = TEB e
 /// KernelGSbase = KPCR em anel 3).
 pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflags: u64, argument2: u64) -> u64 {
     let stack = {
@@ -602,8 +601,8 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
     exit_code
 }
 
-/// `os.execUserContext(context, teb)`: um intervalo de escalonamento. A
-/// HAL só move o estado dos registradores; o kernel escolhe a thread.
+/// Um intervalo de escalonamento. A HAL só move o estado dos registradores; o
+/// kernel escolhe a thread.
 pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     let stack = {
         let mut state = STATE.lock();
@@ -634,8 +633,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     result as u32
 }
 
-/// `os.setUserDebugRegisters(banco)`: o banco preparado entra no intervalo
-/// de usuário pausado.
+/// O banco preparado entra no intervalo de usuário pausado.
 pub fn set_user_debug_registers(bank: u64) {
     let frame_context = {
         let state = STATE.lock();
@@ -664,8 +662,8 @@ pub fn set_user_debug_registers(bank: u64) {
 /// Endereço do pedido de captura de chamada (página de controle 0x8F000).
 const CAPTURE_ADDRESS: u64 = 0x8_F188;
 
-/// `os.clearUserCallCapture()`: retira o pedido pendente e depois o alvo,
-/// sem tocar nos registradores de depuração da CPU.
+/// Retira o pedido pendente e depois o alvo, sem tocar nos registradores de
+/// depuração da CPU.
 pub fn clear_user_call_capture() {
     unsafe {
         core::ptr::write_volatile(CAPTURE_STATE as *mut u32, 0);
@@ -673,8 +671,8 @@ pub fn clear_user_call_capture() {
     }
 }
 
-/// `os.armUserCallCapture(address)`: pedido de captura única num endereço
-/// de usuário; a entrada em anel 3 escolhe um slot livre do banco USER.
+/// Pedido de captura única num endereço de usuário; a entrada em anel 3
+/// escolhe um slot livre do banco USER.
 pub fn arm_user_call_capture(address: u64) -> Result<(), crate::rtl::KernelError> {
     if !(0x1_0000..0x8000_0000_0000).contains(&address) {
         return Err(crate::rtl::KernelError::new("user call capture address"));
@@ -688,8 +686,8 @@ pub fn arm_user_call_capture(address: u64) -> Result<(), crate::rtl::KernelError
     Ok(())
 }
 
-/// `os.retainUserContextRanges(context, faixas)`: bytes do CONTEXT escritos
-/// pelo kernel que sobrevivem ao salvamento do retorno da syscall.
+/// Bytes do CONTEXT escritos pelo kernel que sobrevivem ao salvamento do
+/// retorno da syscall.
 pub fn retain_user_context_ranges(context: u64, ranges: &[(u32, u32)]) -> bool {
     let frame_context = STATE.lock().frame_context;
     if frame_context == 0 || context != frame_context {
@@ -707,7 +705,7 @@ pub fn retain_user_context_ranges(context: u64, ranges: &[(u32, u32)]) -> bool {
     true
 }
 
-/// `os.getUserServiceCall(0)`: o frame da syscall em despacho.
+/// O frame da syscall em despacho.
 pub fn user_service_frame() -> u64 {
     STATE.lock().service_frame
 }

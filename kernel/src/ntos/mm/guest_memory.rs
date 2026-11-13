@@ -6,11 +6,10 @@
 //! +0 size, +4 previous, +8 next, +12 free (u32). Os links das listas livres
 //! ocupam os primeiros 8 bytes do payload livre.
 //!
-//! Abaixo de 4GB tudo é identity (VA == PA). Endereços altos (imagens na
-//! base preferida, VA do kernel) passam pelas tabelas de páginas. As
-//! variantes `try_*` devolvem `STATUS_ACCESS_VIOLATION` para ponteiros sem
-//! mapeamento (o `guestAddressFault` do original); as demais são para memória
-//! do próprio kernel e param o sistema numa falha.
+//! Abaixo de 4GB tudo é identity (VA == PA). Endereços altos (imagens na base
+//! preferida, VA do kernel) passam pelas tabelas de páginas. As variantes
+//! `try_*` devolvem `STATUS_ACCESS_VIOLATION` para ponteiros sem mapeamento;
+//! as demais são para memória do próprio kernel e param o sistema numa falha.
 
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -112,7 +111,7 @@ pub fn try_read32(address: u64) -> Result<u32, KernelError> {
     Ok(physical::read32(if physical_address < FOUR_GB { physical_address } else { address }))
 }
 
-/// Duas leituras de DWORD, na ordem original (`readGuest64`/`Exact`).
+/// Duas leituras de DWORD, a baixa primeiro.
 pub fn try_read64(address: u64) -> Result<u64, KernelError> {
     if crosses_page(address, 8) {
         let low = try_read32(address)? as u64;
@@ -166,7 +165,7 @@ pub fn try_write32(address: u64, value: u32) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Duas escritas de DWORD na ordem original, inclusive em MMIO.
+/// Duas escritas de DWORD, a baixa primeiro, inclusive em MMIO.
 pub fn try_write64(address: u64, value: u64) -> Result<(), KernelError> {
     let (low, high) = (value as u32, (value >> 32) as u32);
     if crosses_page(address, 8) {

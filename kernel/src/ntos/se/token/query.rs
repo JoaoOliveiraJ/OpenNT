@@ -1,7 +1,7 @@
 //! NtQueryInformationToken.
 //!
 //! Contrato observado: TokenStatistics (classe 10), pedido pelo MSRPC
-//! original, também pela variante de syscall de usuário (`queryUser`).
+//! original, também pela variante de syscall de usuário (`query_user`).
 
 use crate::ntos::se::token::{reference as token_reference, statistics as token_statistics};
 use crate::ntos::ke::irql;

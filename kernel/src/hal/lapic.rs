@@ -1,5 +1,5 @@
 //! Local APIC em modo xAPIC (MMIO em 0xFEE00000, coberto pelo identity map).
-//! Equivale a `os.lapicRead` / `os.lapicWrite`.
+//! Leitura e escrita dos registradores.
 
 use super::physical;
 

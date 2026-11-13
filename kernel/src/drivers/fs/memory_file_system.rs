@@ -43,8 +43,8 @@ impl FileData {
 static FILES: SpinLock<BTreeMap<String, FileData>> = SpinLock::new(BTreeMap::new());
 static CREATION_TIME: AtomicU64 = AtomicU64::new(0);
 
-/// Registra o instante de criação do volume (o `Date.now()` da carga do
-/// módulo no original).
+/// Registra o instante de criação do volume (o relógio de parede na
+/// inicialização do módulo).
 pub fn init(now_unix_ms: u64) {
     CREATION_TIME.store(unix_milliseconds_to_nt_time(now_unix_ms), Ordering::Relaxed);
 }
@@ -198,7 +198,7 @@ pub fn size(path: &str) -> Option<usize> {
     read(path).map(|data| data.len())
 }
 
-/// O MemoryFileSystem como volume montável (`ObjectManager.mount('\FS', ...)`).
+/// O MemoryFileSystem como volume montável (`object_manager::mount` em `\FS`).
 pub struct MemoryVolume;
 
 pub static VOLUME: MemoryVolume = MemoryVolume;

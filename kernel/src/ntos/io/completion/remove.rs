@@ -210,7 +210,7 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
     if count == 0 || count > 0x7FF_FFFF {
         return Ok(Removal::status(0xC000_000D));
     }
-    // O original sonda o vetor inteiro e o ULONG de saída antes da fila.
+    // Sonda o vetor inteiro e o ULONG de saída antes da fila.
     if access_mode != 0 {
         if output & 7 != 0 {
             return Ok(Removal::status(0x8000_0002));

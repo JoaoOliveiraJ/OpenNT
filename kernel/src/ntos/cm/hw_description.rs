@@ -165,7 +165,7 @@ fn optional_enumeration(pointer: u64) -> Option<u32> {
 /// IoQueryDeviceDescription: até quatro barramentos, controladores e
 /// periféricos dos tipos reconhecidos, chamando o callout com onze
 /// argumentos. Só os tipos de controlador e periférico filtram; as
-/// estruturas temporárias pertencem ao chamador nativo como no original.
+/// estruturas temporárias pertencem ao chamador nativo.
 #[allow(clippy::too_many_arguments)]
 pub fn query_device_description(_bus_type: u64, _bus_number: u64, controller_type: u64, _controller_number: u64, peripheral_type: u64, _peripheral_number: u64, callout: u64, context: u64) -> u32 {
     let controller = optional_enumeration(controller_type);

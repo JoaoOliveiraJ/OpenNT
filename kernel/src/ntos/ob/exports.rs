@@ -58,7 +58,7 @@ pub static GROUP: Group = Group {
 };
 
 pub mod find_handle {
-    //! ObFindHandleForObject — `ntos/ob/find-handle` (o resolvedor entrega o corpo
+    //! ObFindHandleForObject — `ntos/ob/find_handle` (o resolvedor entrega o corpo
     //! nativo; o trampolim usa a busca do kernel).
 
     use crate::ntos::init::exports::{Call, Group};
@@ -202,7 +202,7 @@ pub mod query_object {
 }
 
 pub mod query_security {
-    //! ZwQuerySecurityObject — `ntos/ob/query-security`; falha interna interrompe
+    //! ZwQuerySecurityObject — `ntos/ob/query_security`; falha interna interrompe
     //! o sistema.
 
     use crate::ntos::init::exports::{fatal_unless_transfer, Call, Group};

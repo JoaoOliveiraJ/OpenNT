@@ -2,7 +2,7 @@
 //!
 //! Remove vistas globais reais de seção; não usa o contrato de handles do
 //! ZwUnmapViewOfSection. Endereço sem vista = bugcheck 0xD7
-//! (DRIVER_UNMAPPING_INVALID_VIEW) com os parâmetros do original.
+//! (DRIVER_UNMAPPING_INVALID_VIEW) com os parâmetros documentados.
 
 use crate::ntos::ke::{bugcheck, irql};
 use crate::ntos::ps::user::sections;

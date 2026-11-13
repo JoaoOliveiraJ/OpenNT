@@ -1,9 +1,9 @@
-//! Pequenos auxiliares de texto que o JavaScript fornecia nativamente
-//! (`padEnd`, conversão de bytes em texto, formatação de decimais).
+//! Pequenos auxiliares de texto (preenchimento à direita, conversão de
+//! bytes em texto, formatação de decimais).
 
 use alloc::string::String;
 
-/// `String.prototype.padEnd` com espaços.
+/// Preenche à direita com espaços até `width` caracteres.
 pub fn pad_end(text: &str, width: usize) -> String {
     let mut padded = String::from(text);
     while padded.chars().count() < width {
@@ -12,7 +12,7 @@ pub fn pad_end(text: &str, width: usize) -> String {
     padded
 }
 
-/// Formata `numerator / denominator` com uma casa decimal (`toFixed(1)`),
+/// Formata `numerator / denominator` com uma casa decimal,
 /// sem ponto flutuante: o kernel é compilado sem SSE.
 pub fn fixed1(numerator: u64, denominator: u64) -> String {
     if denominator == 0 {
@@ -22,8 +22,7 @@ pub fn fixed1(numerator: u64, denominator: u64) -> String {
     alloc::format!("{}.{}", tenths / 10, tenths % 10)
 }
 
-/// Bytes Latin-1 em texto (o `readBundleText` do original entregava cada byte
-/// como um caractere).
+/// Bytes Latin-1 em texto (cada byte vira um caractere).
 pub fn latin1_to_string(bytes: &[u8]) -> String {
     match core::str::from_utf8(bytes) {
         Ok(text) => String::from(text),

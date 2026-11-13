@@ -1,7 +1,7 @@
 //! Vistas de seção ALPC.
 //!
 //! A vista conserva o SECTION e a porta que a publicou; o mapeamento e a
-//! retirada de PTEs pertencem ao Mm. O callback Delete do original é vazio:
+//! retirada de PTEs pertencem ao Mm. O callback Delete é vazio:
 //! só a última referência executa o Destroy.
 
 use alloc::sync::Arc;

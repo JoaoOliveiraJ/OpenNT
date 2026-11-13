@@ -22,7 +22,7 @@ use crate::ntos::mm::sysload::kernel_image_source;
 use crate::ntos::inc::nt_abi::{device_object, driver_extension, driver_object};
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 
-/// Estado de um driver nativo (o `node.data` do original).
+/// Estado de um driver nativo.
 struct NativeDriver {
     name: String,
     node: NodeId,
@@ -43,7 +43,7 @@ static REINITIALIZATION: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
 /// Extensões de driver object: (DRIVER_OBJECT, tag) → bloco.
 static DRIVER_EXTENSIONS: SpinLock<BTreeMap<(u64, u64), u64>> = SpinLock::new(BTreeMap::new());
 
-/// Erro de carga com o código Win32 do original (1056 já carregado, 2 não
+/// Erro de carga com o código Win32 (1056 já carregado, 2 não
 /// encontrado, 31 DriverEntry falhou).
 #[derive(Debug)]
 pub struct LoadError {
@@ -358,7 +358,7 @@ pub fn call_add_device(driver_name: &str, physical_device: u64) -> u64 {
 
 /// DRIVER_OBJECT de `\Driver\<nome>` cuja inicialização terminou.
 /// Exports do driver carregado (diretório de exports real), para os
-/// importadores do `kernel-libraries`.
+/// importadores de `mm::sysload`.
 pub fn driver_exports(driver_name: &str) -> Option<BTreeMap<String, u64>> {
     DRIVERS.lock().values().find(|entry| entry.name.eq_ignore_ascii_case(driver_name)).map(|entry| entry.exports.clone())
 }

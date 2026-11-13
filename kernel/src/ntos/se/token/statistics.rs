@@ -1,8 +1,8 @@
 //! TOKEN_STATISTICS.
 //!
 //! Identidade, contadores e memória do próprio token, na ordem e largura do
-//! serviço nativo observado no MSRPC. O armazenamento dinâmico
-//! (`token-storage`) vive em `tokens`.
+//! serviço nativo observado no MSRPC. O armazenamento dinâmico vive em
+//! `tokens`.
 
 use alloc::vec::Vec;
 

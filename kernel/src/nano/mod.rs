@@ -1,4 +1,4 @@
-//! Nanokernel — `system32/nano/`.
+//! Nanokernel.
 //!
 //! Filosofia nanokernel: o núcleo faz o mínimo (interrupções, IPC,
 //! escalonamento). Todo o resto — drivers, FS, console, win32 — são serviços.

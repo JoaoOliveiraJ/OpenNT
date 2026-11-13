@@ -3,7 +3,7 @@
 //! O SID é emprestado (KernelMode) ou copiado (UserMode); processo e sessão
 //! mantêm uma referência de objeto até o fim da operação. A referência por
 //! handle do escopo de processo usa ObReferenceObjectByHandle, que entra
-//! por [`set_handle_reference`] junto com `win32/ntoskrnl/ob`.
+//! por [`set_handle_reference`] junto com `ntos/ob`.
 
 use alloc::collections::BTreeSet;
 

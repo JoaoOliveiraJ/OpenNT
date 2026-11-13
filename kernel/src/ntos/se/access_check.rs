@@ -1,6 +1,5 @@
 //! Verificação de acesso contra um SECURITY_DESCRIPTOR e a identidade do
-//! sujeito, como o `se\accchk.c` do NT (SeAccessCheck e
-//! SeAccessCheckFromState).
+//! sujeito (SeAccessCheck e SeAccessCheckFromState).
 //!
 //! Reusa a avaliação ordenada de DACL do `token/access.rs`/`object_security.rs`,
 //! dirigida aqui por um descritor e pelo GENERIC_MAPPING do chamador em vez do

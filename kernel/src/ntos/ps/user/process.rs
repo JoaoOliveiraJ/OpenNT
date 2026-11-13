@@ -28,7 +28,7 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 
-/// Arquivo do volume como fonte da imagem principal (`exeReader.file`).
+/// Arquivo do volume como fonte da imagem principal.
 struct VolumeSource {
     name: String,
     file: Arc<VolumeFile>,
@@ -148,7 +148,7 @@ pub fn run_process(bytes: Vec<u8>, image_name: &str) -> Result<u32, KernelError>
     Ok(exit_code)
 }
 
-/// Opções de `runWindowsProcess`.
+/// Opções de `run_windows_process`.
 #[derive(Default)]
 pub struct RunOptions<'a> {
     /// Sem console pai: DETACHED_PROCESS (padrão dos serviços e ferramentas).

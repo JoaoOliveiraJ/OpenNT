@@ -106,7 +106,7 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
     guest::write64(list + layout::FREE_COUNT, 0);
     guest::write32(list + layout::POOL_TYPE, flags | paged as u32);
     guest::write32(list + layout::TAG, tag);
-    // O original recebe SIZE_T, mas o campo persistente Size é ULONG.
+    // O parâmetro é SIZE_T, mas o campo persistente Size é ULONG.
     guest::write32(list + layout::BLOCK_SIZE, block_size as u32);
     guest::write64(list + layout::ALLOCATE_CALLBACK, allocate_callback);
     guest::write64(list + layout::FREE_CALLBACK, free_callback);

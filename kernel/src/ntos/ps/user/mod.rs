@@ -1,4 +1,4 @@
-//! Subsistema de modo usuário — `system32/ntos/ps/user/`.
+//! Subsistema de modo usuário.
 
 pub mod state;
 pub mod sections;

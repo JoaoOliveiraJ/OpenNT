@@ -1,5 +1,5 @@
 //! Contexto de segurança do sujeito (SECURITY_SUBJECT_CONTEXT): captura,
-//! liberação e bloqueio, como o `se\subject.c` do NT.
+//! liberação e bloqueio.
 //!
 //! O subject context retém o token primário do processo e o token opcional
 //! de impersonação da thread; a liberação devolve essas referências.

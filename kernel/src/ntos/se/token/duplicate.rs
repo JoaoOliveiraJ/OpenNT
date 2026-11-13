@@ -1,7 +1,7 @@
 //! ZwDuplicateToken.
 //!
 //! O serviço Nt de UserMode ainda exige a política de redução de direitos de
-//! RtlIsSandboxedToken antes de ser exposto (como no original).
+//! RtlIsSandboxedToken antes de ser exposto.
 
 use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
 use crate::ntos::se::descriptor;

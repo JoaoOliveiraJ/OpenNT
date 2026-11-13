@@ -1,8 +1,7 @@
 //! Interface de volume montável no namespace — o contrato que o Object
-//! Manager usava em `node.mount` (`exists`, `list`) e as operações de
+//! Manager usa nas montagens (`exists`, `list`) e as operações de
 //! arquivo que os serviços de arquivo do kernel (`zw`) usam sobre ele.
-//! Os métodos opcionais têm padrão "não suportado", como a ausência do
-//! método no volume original.
+//! Os métodos opcionais têm padrão "não suportado".
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -11,7 +10,7 @@ use crate::rtl::KernelError;
 
 const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
 
-/// Metadados de um arquivo do volume (`stat` do original).
+/// Metadados de um arquivo do volume.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VolumeStat {
     pub reference: Option<u64>,
@@ -70,7 +69,7 @@ pub trait FileSystem: Sync {
     fn copy_range_to_physical(&self, _path: &str, _offset: u64, _address: u64, _length: u64) -> Option<Result<(), KernelError>> {
         None
     }
-    /// Cria vazio ou trunca (o `writeFileBytes(fs, path, [])` do original).
+    /// Cria vazio ou trunca.
     fn truncate(&self, _path: &str) -> Result<(), KernelError> {
         Err(KernelError::with_status("volume is read-only", STATUS_MEDIA_WRITE_PROTECTED))
     }
@@ -78,7 +77,7 @@ pub trait FileSystem: Sync {
     fn remove(&self, _path: &str) -> Option<Result<bool, KernelError>> {
         None
     }
-    /// Número de série (`volumeInformation().serial`).
+    /// Número de série.
     fn volume_serial(&self) -> Option<u64> {
         None
     }
@@ -86,21 +85,21 @@ pub trait FileSystem: Sync {
     fn volume_query(&self) -> Option<&dyn crate::drivers::fs::volume_information::VolumeQuery> {
         None
     }
-    /// FSCTL do próprio sistema de arquivos (`fs.control`); `None` = sem suporte.
+    /// FSCTL do próprio sistema de arquivos; `None` = sem suporte.
     fn control(&self, _path: &str, _code: u32, _input: &[u8], _output_length: u32) -> Option<Result<crate::drivers::fs::ntfs_control::ControlResult, KernelError>> {
         None
     }
-    /// Consulta de EAs (`fs.queryEa`); `None` = sem suporte.
+    /// Consulta de EAs; `None` = sem suporte.
     fn query_ea(&self, _path: &str, _length: usize, _options: &crate::drivers::fs::extended_attributes::QueryOptions, _state: &mut crate::drivers::fs::extended_attributes::QueryState) -> Option<Result<crate::drivers::fs::extended_attributes::QueryResult, KernelError>> {
         None
     }
-    /// Escrita de EAs (`fs.setEa`); `None` = sem suporte.
+    /// Escrita de EAs; `None` = sem suporte.
     fn set_ea(&self, _path: &str, _bytes: &[u8], _kernel_call: bool) -> Option<Result<(), KernelError>> {
         None
     }
 }
 
-/// Identidade de um volume (o `===` entre montagens do original).
+/// Identidade de um volume: compara as montagens por endereço.
 pub fn same(left: &'static dyn FileSystem, right: &'static dyn FileSystem) -> bool {
     core::ptr::addr_eq(left as *const dyn FileSystem, right as *const dyn FileSystem)
 }

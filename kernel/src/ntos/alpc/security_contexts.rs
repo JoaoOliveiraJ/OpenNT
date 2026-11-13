@@ -143,7 +143,7 @@ pub fn create(port: &Arc<Port>, quality: &Quality, published: bool) -> Result<Re
             Ok(identity) => client = Some(identity),
             Err(status) => return Ok(Err(status)),
         }
-        // A validação do QoS precede o teste de desconexão no original.
+        // A validação do QoS precede o teste de desconexão.
         if published && port.closed() {
             return Ok(Err(0xC000_009A));
         }

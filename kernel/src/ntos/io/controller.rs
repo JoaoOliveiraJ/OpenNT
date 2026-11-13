@@ -66,7 +66,7 @@ pub mod controller {
     }
 
     /// IoAllocateController: livre executa já; ocupado entra na fila FIFO.
-    /// A fila guarda os 32 bits baixos dos ponteiros, como o original.
+    /// A fila guarda os 32 bits baixos dos ponteiros.
     pub fn allocate(controller: u64, device: u64, routine: u64, context: u64) {
         if guest::read8(controller + co::BUSY) == 0 {
             guest::write8(controller + co::BUSY, 1);

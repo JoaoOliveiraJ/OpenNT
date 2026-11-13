@@ -1,6 +1,5 @@
-//! Atribuição e ajuste do SECURITY_DESCRIPTOR de objetos novos, como o
-//! `se\seassign.c` e o `se\semethod.c` do NT (SeAssignSecurity(Ex),
-//! SeDeassignSecurity e SeSetSecurityDescriptorInfo).
+//! Atribuição e ajuste do SECURITY_DESCRIPTOR de objetos novos
+//! (SeAssignSecurity(Ex), SeDeassignSecurity e SeSetSecurityDescriptorInfo).
 //!
 //! Reusa `inherit_descriptor::assign` (herança) e `query_descriptor`
 //! (leitura dos componentes); a serialização self-relative é a única

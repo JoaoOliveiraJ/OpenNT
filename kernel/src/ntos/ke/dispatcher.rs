@@ -210,7 +210,7 @@ pub fn timeout_to_100ns(timeout_pointer: u64) -> Option<u64> {
     Some((value as u64).saturating_sub(clock::system_time_100ns()))
 }
 
-/// `timeoutPointerToMs` do original, em ms inteiros.
+/// Prazo apontado por `timeout_pointer`, em ms inteiros.
 pub fn timeout_pointer_to_ms(timeout_pointer: u64) -> Option<u64> {
     timeout_to_100ns(timeout_pointer).map(|value| value / 10_000)
 }

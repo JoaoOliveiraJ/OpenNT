@@ -31,11 +31,11 @@ pub type ProcessSetter = fn(u64, u64, u64) -> Result<u32, KernelError>;
 static PROCESS_DEBUG_QUERY: SpinLock<Option<StackQuery>> = SpinLock::new(None);
 static INSTRUMENTATION_SET: SpinLock<Option<ProcessSetter>> = SpinLock::new(None);
 static TLS_SET: SpinLock<Option<ProcessSetter>> = SpinLock::new(None);
-/// `exceptions.raise(record, context, firstChance)`.
+/// `exceptions::raise(record, context, first_chance)`.
 static RAISE_EXCEPTION: SpinLock<Option<fn(u64, u64, u64) -> Result<u32, KernelError>>> = SpinLock::new(None);
-/// `partition.open(out, access, oa, true)`.
+/// `partition::open(out, access, oa, true)`.
 static OPEN_PARTITION: SpinLock<Option<fn(u64, u32, u64) -> Result<u32, KernelError>>> = SpinLock::new(None);
-/// `os.setUserDebugRegisters(bank)` da HAL de modo usuário.
+/// `set_user_debug_registers(bank)` da HAL de modo usuário.
 static SET_USER_DEBUG_REGISTERS: SpinLock<Option<fn(u64)>> = SpinLock::new(None);
 
 pub fn set_process_debug_query(query: StackQuery) {
@@ -548,7 +548,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     }
 }
 
-/// `ps/user/image-information.query`: os 64 bits dos argumentos e as
+/// `image_information::query`: os 64 bits dos argumentos e as
 /// sondagens de UserMode antes de consultar o processo e a seção.
 pub fn query_image_information(rsp: u64) -> Result<u32, KernelError> {
     let argument = |index: u64| {

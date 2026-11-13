@@ -1,6 +1,6 @@
 //! Informação do objeto token consultada pelo kernel: SeQueryInformationToken,
 //! os acessores de campo (SeToken*), o AuthenticationId e os atributos de
-//! segurança, como a parte Se* do `se\tokenqry.c` do NT.
+//! segurança.
 //!
 //! `SeQueryInformationToken` é a forma *alocadora* (ExAllocatePool): serializa
 //! TOKEN_USER/GROUPS/PRIVILEGES/OWNER/PRIMARY_GROUP/STATISTICS a partir do

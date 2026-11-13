@@ -1,10 +1,10 @@
-//! Instruções privilegiadas e de identificação da CPU — as primitivas
-//! `os.cpuid`, `os.rdtsc`, `os.readMsr`, `os.halt`, `os.loadIdt`... de
-//! `hal/qjs/primitives_irq.c` e `primitives_system.c`.
+//! Instruções privilegiadas e de identificação da CPU: CPUID, RDTSC, MSRs,
+//! registradores de controle, IDT, interrupções, caches, FXSAVE, HLT e
+//! RDRAND.
 
 use core::arch::asm;
 
-/// Resultado de CPUID na ordem do original: `[eax, ebx, ecx, edx]`.
+/// Resultado de CPUID na ordem `[eax, ebx, ecx, edx]`.
 pub fn cpuid(leaf: u32) -> [u32; 4] {
     cpuid_subleaf(leaf, 0)
 }
@@ -56,23 +56,23 @@ pub fn read_cr4() -> u64 {
     value
 }
 
-/// `os.reloadCr3`: recarrega CR3 (esvazia a TLB não global).
+/// Recarrega CR3 (esvazia a TLB não global).
 pub fn reload_cr3() {
     unsafe { asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) }
 }
 
-/// `os.invalidatePage`.
+/// Invalida a página de `address` na TLB (INVLPG).
 pub fn invalidate_page(address: u64) {
     unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack)) }
 }
 
-/// `os.cpuPause`.
+/// PAUSE (dica de espera ativa).
 #[inline]
 pub fn pause() {
     core::hint::spin_loop();
 }
 
-/// `os.saveAndDisableInterrupts`: devolve RFLAGS e executa CLI.
+/// Devolve RFLAGS e executa CLI.
 #[inline]
 pub fn save_and_disable_interrupts() -> u64 {
     let flags: u64;
@@ -80,7 +80,7 @@ pub fn save_and_disable_interrupts() -> u64 {
     flags
 }
 
-/// `os.restoreInterrupts`: reativa IF somente se estava ligada antes.
+/// Reativa IF somente se estava ligada antes.
 #[inline]
 pub fn restore_interrupts(flags: u64) {
     if flags & 0x200 != 0 {
@@ -92,7 +92,7 @@ pub fn enable_interrupts() {
     unsafe { asm!("sti", options(nomem, nostack)) }
 }
 
-/// `os.loadIdt(base, tamanho)`: carrega a IDT e liga interrupções.
+/// Carrega a IDT e liga interrupções.
 pub fn load_idt(base: u64, size: u16) {
     #[repr(C, packed)]
     struct TableRegister {
@@ -106,22 +106,22 @@ pub fn load_idt(base: u64, size: u16) {
     }
 }
 
-/// `os.flushCaches`: WBINVD.
+/// Esvazia os caches (WBINVD).
 pub fn flush_caches() {
     unsafe { asm!("wbinvd", options(nostack)) }
 }
 
-/// `os.fxsave64`: grava o estado x87/SSE em `address` (alinhado a 16).
+/// FXSAVE64: grava o estado x87/SSE em `address` (alinhado a 16).
 pub fn fxsave(address: u64) {
     unsafe { asm!("fxsave64 [{}]", in(reg) address, options(nostack)) }
 }
 
-/// `os.fxrstor64`.
+/// FXRSTOR64: restaura o estado x87/SSE de `address` (alinhado a 16).
 pub fn fxrstor(address: u64) {
     unsafe { asm!("fxrstor64 [{}]", in(reg) address, options(nostack)) }
 }
 
-/// `host_halt`: CLI + HLT eterno.
+/// CLI + HLT eterno.
 pub fn halt_forever() -> ! {
     unsafe { asm!("cli", options(nomem, nostack)) }
     loop {
@@ -129,7 +129,7 @@ pub fn halt_forever() -> ! {
     }
 }
 
-/// `os.hardwareRandomBytes`: RDRAND quando disponível.
+/// RDRAND quando disponível.
 pub fn hardware_random_u64() -> Option<u64> {
     if cpuid(1)[2] & (1 << 30) == 0 {
         return None;

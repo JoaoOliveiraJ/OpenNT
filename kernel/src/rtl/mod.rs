@@ -1,5 +1,4 @@
-//! Runtime do kernel: o que o QuickJS e a libc shim (`hal/rtl/`) ofereciam
-//! ao código JavaScript — impressão, locks, erros com NTSTATUS e tempo.
+//! Runtime do kernel: impressão, locks, erros com NTSTATUS e tempo.
 
 #[macro_use]
 pub mod print;

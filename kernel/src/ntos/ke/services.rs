@@ -1,4 +1,4 @@
-// A tabela única da ABI de syscalls do bring-up (o `services.tab` do NT).
+// A tabela única da ABI de syscalls do bring-up.
 // Uma fonte, três consumidores: o build gera a ntdll.dll de bring-up (os
 // stubs `mov r10, rcx; mov eax, N; syscall; ret`, como a ntdll da Microsoft),
 // o loader avisa dos serviços ausentes e o kernel despacha número ->

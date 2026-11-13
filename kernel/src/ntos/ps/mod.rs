@@ -1,4 +1,4 @@
-//! Process Manager (Ps) — `system32/ntos/ps/`.
+//! Process Manager (Ps).
 
 pub mod scheduler;
 pub mod user_probe;

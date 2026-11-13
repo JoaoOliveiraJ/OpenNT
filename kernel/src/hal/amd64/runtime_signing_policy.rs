@@ -1,4 +1,4 @@
-//! Nível de assinatura atualizável em runtime — `hal/win32/runtime-signing-policy.asm`.
+//! Nível de assinatura atualizável em runtime.
 //!
 //! Callback privado da CI que grava o UCHAR recebido em CL (não um NTSTATUS
 //! nem um ponteiro) e a célula única SeILSigningPolicyRuntime. O MOV de um

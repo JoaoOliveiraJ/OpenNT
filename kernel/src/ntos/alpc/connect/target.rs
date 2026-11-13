@@ -126,7 +126,7 @@ pub fn listener(attributes: u64, required: Option<&SecurityPolicy>, mode: u8) ->
     let Some(required) = required else { return Ok(target) };
     let Some(server_token) = process::get_primary_token(target.server.process) else { return Err(0xC000_02A0) };
     let object_type = object_types::user_type("alpc").ok_or(0xC000_0024u32)?;
-    // O original pede MAXIMUM_ALLOWED e exige PORT_CONNECT na máscara concedida.
+    // Pede MAXIMUM_ALLOWED e exige PORT_CONNECT na máscara concedida.
     match object_access::check(required, Some(server_token), 0x0200_0000, &object_type, mode == 0) {
         Ok(access) if access & 1 != 0 => Ok(target),
         _ => Err(0xC000_02A0),

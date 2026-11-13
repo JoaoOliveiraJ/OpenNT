@@ -29,7 +29,7 @@ pub mod io_timer {
 
     static TIMERS: SpinLock<Vec<DeviceTimer>> = SpinLock::new(Vec::new());
 
-    /// Rotina e contexto ficam com os 32 bits baixos, como no original.
+    /// Rotina e contexto ficam com os 32 bits baixos.
     pub fn initialize_timer(device: u64, routine: u64, context: u64) -> u32 {
         let mut timers = TIMERS.lock();
         if timers.iter().any(|timer| timer.device == device) {

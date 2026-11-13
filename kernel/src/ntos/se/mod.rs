@@ -1,4 +1,4 @@
-//! Security Reference Monitor (Se) — `system32/ntos/se/`.
+//! Security Reference Monitor (Se).
 
 pub mod model;
 pub mod object_security;

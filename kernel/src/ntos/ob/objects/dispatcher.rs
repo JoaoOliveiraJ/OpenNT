@@ -25,9 +25,9 @@ use crate::ntos::mm::guest_memory as guest;
 /// Ganchos do dono do objeto.
 #[derive(Clone, Copy, Default)]
 pub struct DispatcherHooks {
-    /// Verificação antes de cada handle (`beforeHandleOpen`).
+    /// Verificação antes de cada handle.
     pub before_handle_open: Option<fn(u64) -> Result<(), KernelError>>,
-    /// Último handle fechado (`onLastHandleClose`).
+    /// Último handle fechado.
     pub on_last_handle_close: Option<fn(u64)>,
 }
 
@@ -210,7 +210,7 @@ pub fn close(pointer: u64) -> Result<(), KernelError> {
     dereference(pointer).map(|_| ())
 }
 
-/// Ganchos de handle para aberturas pelo namespace (o `onHandleOpen` do original).
+/// Ganchos de handle para aberturas pelo namespace.
 struct DispatcherHandle {
     pointer: u64,
 }
@@ -232,7 +232,7 @@ pub fn data(pointer: u64) -> ObjectData {
     ObjectData { native_pointer: pointer, hooks: Some(Arc::new(DispatcherHandle { pointer })), ..ObjectData::default() }
 }
 
-/// Política definida pelo criador (`port.security = policy`).
+/// Política definida pelo criador.
 pub fn set_security(pointer: u64, policy: SecurityPolicy) {
     if let Some(body) = BODIES.lock().get_mut(&pointer) {
         body.security = policy;

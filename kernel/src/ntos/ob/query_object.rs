@@ -4,8 +4,8 @@
 //! referências e segurança vêm da identidade viva do dono, retida durante a
 //! coleta. A serialização das classes 0–4 é `query_object_format`.
 //!
-//! ObQueryNameString também mora aqui (como no `obquery.c` do NT): o caminho
-//! completo pelo corpo nativo, ou o nome próprio de um callback do Ex.
+//! ObQueryNameString também mora aqui: o caminho completo pelo corpo nativo,
+//! ou o nome próprio de um callback do Ex.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

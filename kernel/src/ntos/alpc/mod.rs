@@ -1,4 +1,4 @@
-//! ALPC — `system32/ntos/alpc/`.
+//! ALPC.
 //!
 //! Buffers, identidade de mensagens, recursos da comunicação (seções,
 //! vistas, contextos de segurança e reservas), a referência da IOCP, a

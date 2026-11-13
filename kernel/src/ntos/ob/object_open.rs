@@ -1,5 +1,5 @@
-//! Abertura de objetos por nome — ObOpenObjectByName, como o `obopen.c` do
-//! NT (a abertura por ponteiro é `open_pointer`).
+//! Abertura de objetos por nome — ObOpenObjectByName (a abertura por
+//! ponteiro é `open_pointer`).
 //!
 //! O nome dos OBJECT_ATTRIBUTES resolve no namespace; callbacks do Ex,
 //! seções e drivers abrem o handle pelo próprio dono, e o restante recebe um

@@ -2,7 +2,7 @@
 //!
 //! Drivers, FS, console e win32 podem ser serviços registrados aqui e
 //! acessados por chamada de serviço (mensagem). Requisições e respostas são
-//! valores dinâmicos, como no JavaScript.
+//! valores dinâmicos.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

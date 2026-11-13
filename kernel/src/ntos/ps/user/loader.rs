@@ -3,7 +3,7 @@
 //! A parte do kernel do que o NT faz com ZwCreateUserProcess: a ntdll real
 //! do volume (com o mapa SSN → nome), o apiset schema real, os dados NLS,
 //! as entradas LDR_DATA_TABLE_ENTRY e o binding de imports contra as
-//! tabelas de exports reais das DLLs. `S.loadedModules`/`S.ntdllModule`
+//! tabelas de exports reais das DLLs. Os módulos carregados e a ntdll
 //! vivem em `LOADED_MODULES`/`NTDLL_MODULE`; o schema parseado, em `API_SET`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -33,7 +33,7 @@ use crate::ntos::mm::sysload::pe_resolver::{self, ExportedModule, Symbol};
 /// gerar a ntdll do bundle.
 pub use crate::ntos::ke::services::SYSCALLS;
 
-/// Módulo carregado no processo (`S.loadedModules`).
+/// Módulo carregado no processo.
 pub struct Module {
     pub name: String,
     pub full_name: String,
@@ -99,7 +99,7 @@ fn push_image(base: u64, size: u64, name: String, file: Option<Arc<VolumeFile>>)
     state::with(|state| state.regions(RegionKind::ProcessImages).push(Arc::new(ImageRegion { base, size, name, file })));
 }
 
-/// `S.ntfsVolume`: o volume de onde vêm a ntdll, o schema e o NLS.
+/// O volume de onde vêm a ntdll, o schema e o NLS.
 static NTFS_VOLUME: SpinLock<Option<Arc<Ntfs>>> = SpinLock::new(None);
 static LOADED_MODULES: SpinLock<BTreeMap<String, Arc<Module>>> = SpinLock::new(BTreeMap::new());
 static NTDLL_MODULE: SpinLock<Option<Arc<Module>>> = SpinLock::new(None);
@@ -351,7 +351,7 @@ pub fn bind_imports(image_base: u64, depth: u32) -> Result<(), KernelError> {
     }
 }
 
-/// Fonte de imagem sobre um arquivo do volume (`loadFromReader`).
+/// Fonte de imagem sobre um arquivo do volume.
 struct VolumeImageSource {
     name: String,
     file: Arc<VolumeFile>,

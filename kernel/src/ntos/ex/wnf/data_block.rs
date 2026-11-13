@@ -129,7 +129,7 @@ pub fn load_local(state: &NameState) -> Result<u32, KernelError> {
     let result = (|| -> Result<u32, KernelError> {
         initialize_value_name(frame, state.decoded_name());
         loop {
-            // Soma de 32 bits como o EDX do original; o máximo da definição
+            // Soma de 32 bits, com estouro; o máximo da definição
             // não muda quando o buffer é realocado.
             let allocation_size = capacity.wrapping_add(16);
             block = pool_allocation::allocate_tagged(1, allocation_size as u64, DATA_TAG).unwrap_or(0);

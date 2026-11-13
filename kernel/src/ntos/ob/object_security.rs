@@ -1,5 +1,5 @@
 //! Segurança dos objetos — ObSetSecurityObjectByPointer, ObGetObjectSecurity,
-//! ObReleaseObjectSecurity e ObCheckObjectAccess, como o `obse.c` do NT.
+//! ObReleaseObjectSecurity e ObCheckObjectAccess.
 //!
 //! O descritor escrito por ObSetSecurityObjectByPointer fica numa tabela
 //! lateral por objeto (o slot do OBJECT_HEADER no NT); ObGetObjectSecurity o

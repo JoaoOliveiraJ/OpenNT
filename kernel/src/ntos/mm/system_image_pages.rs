@@ -94,7 +94,7 @@ pub fn prepare(section: &Arc<Section>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// `releaseImage` da última referência da control area.
+/// Liberação da imagem na última referência da control area.
 pub fn release_image(key: &AreaKey) {
     IMAGE_AREAS.lock().remove(key);
 }

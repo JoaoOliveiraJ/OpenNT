@@ -1,9 +1,8 @@
-//! Heap do kernel — transcrição de `hal/mm/kmalloc.c`.
+//! Heap do kernel.
 //!
 //! Blocos livres agrupados por tamanho sobre a RAM detectada pelo E820.
-//! Heap exclusivo de 32 MB até 96 MB, conforme `ntos/mm/memory-map`; os
-//! frames do PFN começam em 96 MB. Também é o `#[global_allocator]` do Rust,
-//! no lugar do alocador que o QuickJS usava.
+//! Heap exclusivo de 32 MB até 96 MB, conforme `ntos/mm/memory_map`; os
+//! frames do PFN começam em 96 MB. Também é o `#[global_allocator]` do Rust.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, null_mut};
@@ -284,13 +283,13 @@ pub fn kfree(pointer: *mut u8) {
     unsafe { HEAP.lock().release(pointer) }
 }
 
-/// `os.getHeapInfo()`: (total, usado).
+/// Ocupação do heap: (total, usado).
 pub fn info() -> (usize, usize) {
     let heap = HEAP.lock();
     (heap.total, heap.used)
 }
 
-/// `os.getRamSize()`: topo da RAM utilizável (limitado a 4 GB).
+/// Topo da RAM utilizável (limitado a 4 GB).
 pub fn ram_top() -> u64 {
     HEAP.lock().ram_top
 }

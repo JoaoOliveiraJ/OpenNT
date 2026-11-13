@@ -2,8 +2,8 @@
 //!
 //! A consulta não ativa isolamento de arquivos/hives e não relê o Registro.
 //! CmControlVector copia até quatro bytes do valor `Enabled`; bytes ausentes
-//! ficam zero. Até o Registro ser transcrito (fase 5), a hive deste boot não
-//! tem a chave, o que resulta em 0 — o mesmo valor que o original obtém.
+//! ficam zero. Até o Registro estar completo (fase 5), a hive deste boot não
+//! tem a chave, o que resulta em 0 — o valor esperado.
 
 use core::sync::atomic::{AtomicI64, Ordering};
 

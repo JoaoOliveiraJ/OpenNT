@@ -1,6 +1,6 @@
 //! Arquivos, dispositivos e seções de modo usuário.
 //!
-//! NtOpenFile/NtCreateFile abrem um arquivo do volume (pelo `file-io`) ou um
+//! NtOpenFile/NtCreateFile abrem um arquivo do volume (pelo `file_io`) ou um
 //! dispositivo do NT (`\Device\X`, `\DosDevices\X`, `\GLOBAL??\X`, `\\.\X`,
 //! `\??\X`): o dispositivo vai ao I/O manager de verdade e o IRP_MJ_CREATE
 //! chega ao driver. Também NtDeviceIoControlFile (driver gerenciado ou pilha
@@ -63,7 +63,7 @@ impl UserObject for UserDevice {
     fn on_handle_closed(&self) {
         super::device_io::cancel_entry(self, 0, false);
     }
-    /// `releaseUserObject`: fecha o handle do I/O manager.
+    /// Liberação do objeto: fecha o handle do I/O manager.
     fn release(&self) {
         let _ = io_manager::close_device(self.device_handle);
     }
@@ -120,7 +120,7 @@ fn fail_iosb(iosb: u64, status: u32) -> u32 {
 }
 
 /// NtOpenFile/NtCreateFile: dispositivo pelo I/O manager ou arquivo do
-/// volume pelo `file-io`.
+/// volume pelo `file_io`.
 pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
     if !state::probe_user_write(handle_pointer, 8) || !state::probe_user_write(iosb, 16) || !state::probe_user_read(attributes, 48) {
         return Ok(0xC000_0005);
@@ -323,8 +323,8 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
 
 /// Fim do processo de usuário: fecha os handles, desmonta as vistas de
 /// seção e de imagem e libera as regiões privadas. As liberações de
-/// device-io, worker-factory, instrumentação, mutantes, threads, win32k,
-/// service-rpc e system-process-information, na ordem do original.
+/// `device_io`, `worker_factory`, instrumentação, mutantes, threads, win32k,
+/// `cm::service::rpc` e `system_process_information`, nesta ordem.
 pub fn release_user_resources() {
     super::device_io::release_process(state::with(|state| state.current_process_id));
     super::worker_factory::release_process();

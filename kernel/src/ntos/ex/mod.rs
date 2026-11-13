@@ -1,4 +1,4 @@
-//! Executive (Ex) — `system32/ntos/ex/`.
+//! Executive (Ex).
 
 pub mod syscalls;
 pub mod push_lock;

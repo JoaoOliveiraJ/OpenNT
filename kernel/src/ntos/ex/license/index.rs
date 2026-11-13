@@ -219,7 +219,7 @@ pub fn sort(descriptors: u64, count: u32) {
                     }
                 }
             }
-            // Adia a partição maior, como o limite de profundidade do original.
+            // Adia a partição maior, limitando a profundidade.
             if equal_end - first >= last - lower {
                 if first < equal_end {
                     pending.push((first, equal_end));

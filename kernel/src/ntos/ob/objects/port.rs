@@ -30,8 +30,7 @@ use crate::ntos::mm::guest_memory as guest;
 
 pub const SIZE: u64 = 0x80;
 
-/// Estados da conexão de um cliente (`connectionState`); zero = sem conexão
-/// pendente.
+/// Estados da conexão de um cliente; zero = sem conexão pendente.
 pub const CONNECTION_PENDING: u32 = 1;
 pub const CONNECTION_REFUSED: u32 = 2;
 pub const CONNECTION_CONNECTED: u32 = 3;
@@ -46,7 +45,7 @@ pub enum Role {
     Server,
 }
 
-/// Associação de conclusão da porta (`completion-association`).
+/// Associação de conclusão da porta (`alpc/completion_association`).
 pub trait PortCompletion: Send + Sync {
     fn notify(&self);
     fn port_pointer(&self) -> u64;

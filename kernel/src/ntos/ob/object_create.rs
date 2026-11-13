@@ -1,5 +1,5 @@
 //! Criação de objetos — ObCreateObject, ObInsertObject e
-//! ObDeleteCapturedInsertInfo, como o `obcreate.c`/`obinsert.c` do NT.
+//! ObDeleteCapturedInsertInfo.
 //!
 //! ObCreateObject aloca o corpo, conta-o no tipo e guarda os
 //! OBJECT_ATTRIBUTES capturados até ObInsertObject (que publica o nome no

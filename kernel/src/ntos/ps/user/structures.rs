@@ -37,7 +37,7 @@ pub mod ldr_entry {
     pub const SIZE: u64 = 0x110;
 }
 
-/// Processo sendo montado (`process` de `runWindowsProcess`).
+/// Processo sendo montado (por `run_windows_process`).
 pub struct ProcessDescription<'a> {
     pub process_id: u64,
     pub process_pointer: u64,
@@ -136,7 +136,7 @@ pub fn build_process_structures(process: &ProcessDescription) -> Result<u64, Ker
     guest::write64(rupp + 0x28, process.console_handle);
     guest::write64(rupp + 0x30, process.console_handle);
 
-    // PEB_LDR_DATA começa vazio: os módulos entram por `createLdrEntry`.
+    // PEB_LDR_DATA começa vazio: os módulos entram por `create_ldr_entry`.
     guest::write32(ldr, 0x58);
     guest::write8(ldr + peb_ldr::INITIALIZED, 1);
     write_list_head(ldr + peb_ldr::IN_LOAD_ORDER);

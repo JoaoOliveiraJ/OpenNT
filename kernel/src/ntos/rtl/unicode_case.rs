@@ -14,7 +14,7 @@ pub type TableSource = fn() -> Result<Vec<u8>, KernelError>;
 static SOURCE: SpinLock<Option<TableSource>> = SpinLock::new(None);
 static TABLE: SpinLock<Option<Vec<u16>>> = SpinLock::new(None);
 
-/// Fonte padrão: o arquivo real do volume de boot (lookupVolumeFile).
+/// Fonte padrão: o arquivo real do volume de boot (`lookup_volume_file`).
 fn volume_table() -> Result<Vec<u8>, KernelError> {
     let file = crate::drivers::fs::volume_files::lookup_volume_file("C:\\Windows\\System32\\l_intl.nls").filter(|file| !file.directory()).ok_or_else(|| KernelError::new("NLS: l_intl.nls missing"))?;
     file.read_at(0, file.size())

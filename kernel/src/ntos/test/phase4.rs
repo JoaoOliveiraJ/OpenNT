@@ -1,7 +1,7 @@
 //! Self-test da fase 4 — I/O e armazenamento.
 //!
 //! Exercita, no hardware emulado do QEMU (PC/i440fx), os módulos de HAL,
-//! barramento, armazenamento e I/O transcritos na fase 4.
+//! barramento, armazenamento e I/O implementados na fase 4.
 
 use crate::ntos::mm::guest_memory as guest;
 

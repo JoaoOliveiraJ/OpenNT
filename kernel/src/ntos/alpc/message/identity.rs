@@ -58,7 +58,7 @@ pub struct IdentityState {
     pub server_context: u64,
     pub canceled: bool,
     pub disconnected: bool,
-    /// Operação de cancelamento do pedido (`cancelRequestedBy`).
+    /// Operação de cancelamento do pedido.
     pub cancel_requested_by: Option<Arc<dyn Fn(&Arc<Port>, u32) -> Result<u32, KernelError> + Send + Sync>>,
 }
 

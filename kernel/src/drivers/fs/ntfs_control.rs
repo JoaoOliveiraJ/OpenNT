@@ -19,7 +19,7 @@ fn result(status: u32, bytes: Vec<u8>) -> ControlResult {
     ControlResult { status, information: bytes.len() as u32, bytes }
 }
 
-/// Escrita little-endian que descarta bytes além do fim, como um Uint8Array.
+/// Escrita little-endian que descarta bytes além do fim.
 fn put(bytes: &mut [u8], at: usize, value: u64, count: usize) {
     for (index, byte) in value.to_le_bytes()[..count].iter().enumerate() {
         if let Some(slot) = bytes.get_mut(at + index) {

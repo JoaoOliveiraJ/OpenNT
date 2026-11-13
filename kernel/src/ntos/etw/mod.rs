@@ -1,4 +1,4 @@
-//! Event Tracing for Windows — `system32/ntos/etw/`.
+//! Event Tracing for Windows.
 
 pub mod event_enabled;
 pub mod provider_state;

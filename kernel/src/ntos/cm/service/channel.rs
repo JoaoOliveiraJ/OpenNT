@@ -26,7 +26,7 @@ pub struct ControlRecord {
     pub finished: bool,
     pub error: Option<u32>,
     pub data: Vec<u8>,
-    /// Contexto de relatório de status ligado a este START (`service-rpc`).
+    /// Contexto de relatório de status ligado a este START (`cm::service::rpc`).
     pub status_handle: Option<Vec<u8>>,
 }
 
@@ -88,7 +88,7 @@ fn close(channel: &Shared) {
         if let Some(current) = &state.current {
             let mut current = current.lock();
             if !current.finished {
-                // No START, o erro vem de dispatchError; nos demais, também o
+                // No START, o erro vem de `dispatch_error`; nos demais, também o
                 // retorno do handler.
                 current.error = Some(1067);
                 current.finished = true;
@@ -318,7 +318,7 @@ fn on_status_change(_service: &str, process_id: u64, status: &ServiceStatus) {
     }
 }
 
-/// O original registra o ouvinte ao carregar o módulo.
+/// Registra o ouvinte uma única vez, na primeira chamada.
 fn ensure_listener() {
     if !LISTENING.swap(true, Ordering::AcqRel) {
         service_database::on_status_change(Arc::new(on_status_change));

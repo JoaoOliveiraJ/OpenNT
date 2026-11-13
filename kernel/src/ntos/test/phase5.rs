@@ -790,7 +790,7 @@ fn wnf_identity_security_and_data(assert: Assert) {
     guest::write32(loaded_instance + 0x38, 4);
     guest::write64(loaded_instance + 0x68, key);
     // Máximo menor que o valor: o CM devolve BUFFER_OVERFLOW (cópia parcial),
-    // que a carga propaga sem publicar o bloco, como no original.
+    // que a carga propaga sem publicar o bloco.
     assert(matches!(data::load_local(&loaded), Ok(0x8000_0005)) && loaded.data_pointer() == 0, "wnfdata: valor maior que o maximo da definicao");
     guest::write32(loaded_instance + 0x38, 16);
     assert(matches!(data::load_local(&loaded), Ok(0)) && loaded.change_stamp() == 1 && matches!(data::read(&loaded, stamp, buffer, 16, returned), Ok(0)) && guest::read32(returned) == 8 && guest::read_bytes(buffer, 8) == b"dadosWNF", "wnfdata: recarga da hive");

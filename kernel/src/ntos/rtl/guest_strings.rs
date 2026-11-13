@@ -4,7 +4,7 @@
 //! MaximumLength @2, u32 pad @4, u64 Buffer @8 }; ANSI_STRING é igual com
 //! bytes de 8 bits. Texto largo vira `String` pelas unidades UTF-16 (pares
 //! substitutos são combinados; unidades soltas viram U+FFFD); texto ANSI é
-//! Latin-1, como `String.fromCharCode(byte)`.
+//! Latin-1, um caractere por byte.
 
 use alloc::format;
 use alloc::string::String;

@@ -7,10 +7,10 @@
 //!
 //! Modelo Rust: os nós vivem numa arena (`NodeId` monotônico, nunca
 //! reutilizado). Um nó desligado da árvore, sem handles e sem corpo de
-//! namespace é recolhido; um id antigo passa a resolver para `None` (o
-//! `pathOf` nulo do original). Os dados dinâmicos de cada dono ficam em
-//! [`ObjectData`]; os ganchos `onHandleOpen`/`onHandleClose` e o estado
-//! específico do dono são um `Arc<dyn ObjectHooks>` chamado fora do lock.
+//! namespace é recolhido; um id antigo passa a resolver para `None`. Os dados
+//! dinâmicos de cada dono ficam em [`ObjectData`]; os ganchos
+//! `on_handle_open`/`on_handle_close` e o estado específico do dono são um
+//! `Arc<dyn ObjectHooks>` chamado fora do lock.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
@@ -42,21 +42,20 @@ pub trait ObjectHooks: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Abertura por ponteiro (`ob/open-pointer`): registro e nó dono.
+/// Abertura por ponteiro (`ob/open_pointer`): registro e nó dono.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeOpen {
     pub record: u64,
     pub node: Option<NodeId>,
 }
 
-/// `node.data` do original: o ponteiro nativo canônico (o primeiro de
-/// `nativePointer`, `processPointer`, `threadPointer`, `driverObjectPointer`,
-/// `fileObject`, `eventPointer`, `nativeDevicePointer`, `token.pointer`,
-/// `section.nativePointer`) e os metadados comuns de abertura.
+/// Dados de um nó: o ponteiro nativo canônico (do processo, thread, driver,
+/// arquivo, evento, dispositivo, token ou seção) e os metadados comuns de
+/// abertura.
 #[derive(Clone, Default)]
 pub struct ObjectData {
     pub native_pointer: u64,
-    /// Destino de um link simbólico (o `node.data` string do original).
+    /// Destino de um link simbólico.
     pub symlink_target: Option<String>,
     /// Caminho no volume de um arquivo aberto por montagem.
     pub file_path: Option<String>,
@@ -107,7 +106,7 @@ pub struct Node {
     pub parent: Option<NodeId>,
     /// `false` marca um objeto temporário (o nome some no último handle).
     pub permanent: Option<bool>,
-    /// Corpo nativo de diretório/link (`node.nativeNamespace`), 0 = nenhum.
+    /// Corpo nativo de diretório/link, 0 = nenhum.
     pub native_namespace: u64,
 }
 
@@ -120,7 +119,7 @@ pub struct TypeStatistics {
     pub peak_handles: u32,
 }
 
-/// `handleRecord`: opções da abertura combinadas com a linha nativa vigente.
+/// Registro de handle: opções da abertura combinadas com a linha nativa vigente.
 #[derive(Clone)]
 pub struct HandleRecord {
     pub node: NodeId,
@@ -176,13 +175,13 @@ pub fn node(id: NodeId) -> Option<Node> {
     with_state(|state| state.nodes.get(&id).cloned())
 }
 
-/// Atualiza um nó vivo (o dono altera `node.data`, `permanent`...).
+/// Atualiza um nó vivo (o dono altera `data`, `permanent`...).
 pub fn update_node<T>(id: NodeId, body: impl FnOnce(&mut Node) -> T) -> Option<T> {
     with_state(|state| state.nodes.get_mut(&id).map(body))
 }
 
-/// Cria um nó fora da árvore (o literal `{ name, type, data, refs: 0 }`
-/// entregue a `openObject` no original).
+/// Cria um nó fora da árvore (nome, tipo, dados e nenhuma referência,
+/// para `open_object`).
 pub fn new_node(name: &str, type_name: &str, data: Option<ObjectData>) -> NodeId {
     with_state(|state| {
         let id = state.next_node;
@@ -764,7 +763,7 @@ pub fn name_of(id: NodeId) -> Option<String> {
     node(id).map(|node| node.name.to_string())
 }
 
-/// Número de filhos do diretório (o `children.size` do original).
+/// Número de filhos do diretório.
 pub fn child_count(id: NodeId) -> u64 {
     node(id).and_then(|node| node.children.map(|children| children.len() as u64)).unwrap_or(0)
 }
@@ -774,7 +773,7 @@ pub fn is_attached(id: NodeId) -> bool {
     with_state(|state| attached(state, id))
 }
 
-/// Liga o corpo de namespace ao nó (`node.nativeNamespace`).
+/// Liga o corpo de namespace ao nó (`native_namespace`).
 pub fn set_native_namespace(id: NodeId, body: u64) {
     update_node(id, |node| node.native_namespace = body);
 }

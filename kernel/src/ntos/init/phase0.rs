@@ -1,6 +1,6 @@
 //! FASE 0 do boot (estilo NT).
 //!
-//! Na ordem do original: política da hive, licenças, firmware e identidade
+//! Em ordem: política da hive, licenças, firmware e identidade
 //! do boot, relógio e interrupções, memória (PFN, mapeamento recursivo,
 //! descritores nativos, imagens carregadas, células de dado), KPCR, SMP,
 //! pool, escalonador com o EPROCESS do System, os tipos de objeto e as suas
@@ -142,7 +142,7 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     Ok(())
 }
 
-/// Serviço de driver (`seedService`): tipo kernel, Start e o caminho em
+/// Serviço de driver: tipo kernel, Start e o caminho em
 /// `\SystemRoot\System32\Drivers`; os de Start <= 1 sobem na fase 1.
 fn seed_service(name: &str, driver_file: &str, start: u32) -> Result<(), crate::rtl::KernelError> {
     use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};

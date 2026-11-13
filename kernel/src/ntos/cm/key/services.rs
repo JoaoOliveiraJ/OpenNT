@@ -6,8 +6,8 @@
 //! (`ps/user/state`) entra por [`set_user_handles`]; sem ela, o caminho de
 //! PreviousMode usuário não resolve nem publica handles.
 //!
-//! A observação diagnóstica da árvore `HARDWARE\RESOURCEMAP` do original
-//! pertence ao coletor externo e não faz parte do kernel.
+//! A observação diagnóstica da árvore `HARDWARE\RESOURCEMAP` pertence ao
+//! coletor externo e não faz parte do kernel.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -855,7 +855,7 @@ pub fn close_native(handle: u32) -> u32 {
     if registry::close_handle(handle) { 0 } else { 0xC000_0008 }
 }
 
-/// Registro Zw de um handle de chave (`zw.closeRecord` → `NativeKeys.closeRecord`).
+/// Registro Zw de um handle de chave, para o provedor Zw do NtClose.
 pub fn zw_record(handle: u32) -> Option<close::ZwRecord> {
     let record = close_record(handle)?;
     Some(close::ZwRecord { kernel_handle: record.kernel_handle, owner_process: record.owner_process, attributes: record.attributes, close: alloc::boxed::Box::new(move || close_native(handle)) })

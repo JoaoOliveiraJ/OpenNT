@@ -1,4 +1,4 @@
-//! Kernel executive (Ke) — `system32/ntos/ke/`.
+//! Kernel executive (Ke).
 
 pub mod bugcheck;
 pub mod bugcheck_reason;

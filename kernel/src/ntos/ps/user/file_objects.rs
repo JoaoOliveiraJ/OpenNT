@@ -33,8 +33,8 @@ pub struct Enumeration {
     pub cursor: usize,
 }
 
-/// O `{ type: 'file', ... }` do original: descrição aberta de um arquivo do
-/// volume, compartilhada pelos handles duplicados.
+/// Descrição aberta de um arquivo do volume, compartilhada pelos handles
+/// duplicados.
 pub struct UserFile {
     pub id: u64,
     pub file: Arc<VolumeFile>,

@@ -105,7 +105,7 @@ fn query_handle(port: &Arc<Port>, identity: &Identity, output: u64, length: u32,
     bytes[8..12].copy_from_slice(&duplicated.handle.to_le_bytes());
     bytes[12..16].copy_from_slice(&duplicated.object_type.to_le_bytes());
     bytes[16..20].copy_from_slice(&duplicated.granted.to_le_bytes());
-    // O handle já foi criado: o original conserva o resultado mesmo se a
+    // O handle já foi criado: o resultado é conservado mesmo se a
     // cópia final falha, sem fechar um objeto já publicado.
     if write_bytes(output, &bytes, mode) == 0 {
         write_length(returned, 20, mode);

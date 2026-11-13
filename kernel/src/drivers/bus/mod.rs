@@ -1,4 +1,4 @@
-//! Drivers de barramento — `system32/drivers/bus/`.
+//! Drivers de barramento.
 
 pub mod pci;
 pub mod motherboard;

@@ -1,4 +1,4 @@
-//! Serial COM1 (canal de depuração), transcrita de `hal/core/host.c`.
+//! Serial COM1 (canal de depuração).
 //!
 //! Cada lote respeita a capacidade detectada da FIFO do 16550A e é enviado
 //! com interrupções desligadas, para que outro escritor não consuma as

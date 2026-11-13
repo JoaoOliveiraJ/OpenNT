@@ -4,7 +4,7 @@
 //! no endereço de usuário, registro semeado); `invoke_service` é a ponte que
 //! o gateway nativo escolhido pelo descritor usa para chegar ao handler
 //! registrado por nome. Os módulos de área registram seus handlers no init
-//! do ntoskrnl, como o `require` do original fazia em tempo de carga.
+//! do ntoskrnl.
 
 use crate::hal::physical;
 use crate::ntos::ex::system_services;
@@ -15,12 +15,12 @@ use crate::ntos::ps::user::registry;
 use crate::ntos::ps::user::state::{self, KUSER_SHARED_DATA_USER_VA, STATUS_NOT_IMPLEMENTED, SYSCALL_STACK_PAGES};
 use crate::rtl::{KernelError, SpinLock};
 
-/// `os.userModeInit(topoDaPilha)` da HAL de modo usuário: devolve a GDT.
+/// `user_mode_init(stack_top)` da HAL de modo usuário: devolve a GDT.
 static USER_MODE_INIT: SpinLock<Option<fn(u64) -> Result<u64, KernelError>>> = SpinLock::new(None);
-/// Inicializações que dependem de módulos posteriores (CSR, service-rpc,
-/// ksecdd), na ordem do original.
+/// Inicializações que dependem de módulos posteriores (CSR, `cm::service::rpc`,
+/// ksecdd), nesta ordem.
 static LATE_INITIALIZERS: SpinLock<[Option<fn() -> Result<(), KernelError>>; 3]> = SpinLock::new([None; 3]);
-/// `call-capture.consume`, quando a captura de export está ligada.
+/// `call_capture::consume`, quando a captura de export está ligada.
 static CAPTURE_CONSUMER: SpinLock<Option<fn()>> = SpinLock::new(None);
 
 pub mod late {
@@ -41,7 +41,7 @@ pub fn set_capture_consumer(consumer: fn()) {
     *CAPTURE_CONSUMER.lock() = Some(consumer);
 }
 
-/// `call-capture.consume()` na saída do intervalo de usuário.
+/// `call_capture::consume()` na saída do intervalo de usuário.
 pub fn consume_capture() {
     if let Some(consume) = *CAPTURE_CONSUMER.lock() {
         consume();

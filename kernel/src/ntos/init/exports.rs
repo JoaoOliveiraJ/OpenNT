@@ -1,14 +1,13 @@
 //! Tabela de exports do ntoskrnl.
 //!
-//! A ordem completa da ABI fica em `abi_names` (ids = 32 + índice; os
-//! ordinais seguem a mesma ordem, com os dados de `kernel_data_layout` no
-//! fim). Cada grupo de `win32/ntoskrnl/*` preenche a sua fatia; um export
-//! cujo grupo ainda não tem provedor não resolve (o import falha). O IAT dos
-//! drivers recebe o trampolim do id (`hal::amd64::win32_thunk`) ou, para exports de
+//! A ordem completa da ABI fica em `abi_names` (ids = 32 + índice; os ordinais
+//! seguem a mesma ordem, com os dados de `kernel_data_layout` no fim). Cada
+//! grupo (`ntos/<componente>/exports.rs`) preenche a sua fatia; um export cujo
+//! grupo ainda não tem provedor não resolve (o import falha). O IAT dos drivers
+//! recebe o trampolim do id (`hal::amd64::win32_thunk`) ou, para exports de
 //! dado, o endereço real do símbolo.
 //!
-//! `argument-precision`/`argument-widths` do original existem porque o JS
-//! perde bits acima de 2^53; os handlers Rust recebem os `u64` exatos.
+//! Os handlers recebem os argumentos como `u64` exatos.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -53,7 +52,7 @@ pub struct Group {
     pub data_exports: &'static [(&'static str, fn() -> u64)],
 }
 
-/// Grupos transcritos (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
+/// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
 fn groups() -> [&'static Group; 183] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
@@ -291,7 +290,7 @@ pub fn export_names() -> &'static [&'static str] {
     abi_names::EXPORT_NAMES
 }
 
-/// Exports com provedor transcrito.
+/// Exports com provedor implementado.
 pub fn implemented() -> usize {
     table().handlers.iter().filter(|handler| handler.is_some()).count()
 }
@@ -414,7 +413,7 @@ pub fn init() {
     crate::ntos::mm::sysload::register_resolvers();
 }
 
-/// `handle` do original: a faixa de serviços vai para o system-services; o
+/// `handle`: a faixa de serviços vai para `ex::system_services`; o
 /// resto roda sob a invocação do CONTEXT capturado (transferências pedidas
 /// pelo handler viram retorno zero com a ação marcada).
 pub fn handle(id: u64, args: &[u64; 14], return_address: u64, frame: u64, context: u64) -> Result<u64, KernelError> {
@@ -428,8 +427,8 @@ pub fn handle(id: u64, args: &[u64; 14], return_address: u64, frame: u64, contex
     native_context::invoke(context, || dispatch(id, &call))
 }
 
-/// Rastreio das chamadas de API (`__traceApiCalls` do original): cada export
-/// despachado imprime nome, quatro primeiros argumentos, resultado e retorno.
+/// Rastreio das chamadas de API: cada export despachado imprime nome, quatro
+/// primeiros argumentos, resultado e retorno.
 static TRACE_API: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn set_api_trace(enabled: bool) {
@@ -564,7 +563,7 @@ fn dispatch_export(id: u64, call: &Call) -> Result<u64, KernelError> {
 }
 
 /// Provedor de um export chamado pelo nome a partir do próprio kernel, sem
-/// o trampolim nativo (como os módulos do original usam os handlers).
+/// o trampolim nativo.
 pub fn invoke_handler(name: &str, arguments: &[u64]) -> Result<u64, KernelError> {
     let table = table();
     let handler = abi_names::EXPORT_NAMES.iter().position(|&candidate| candidate == name).and_then(|index| table.handlers.get(index).copied().flatten()).ok_or_else(|| KernelError::new(alloc::format!("export sem provedor: {name}")))?;
@@ -579,8 +578,8 @@ fn valid_id(id: u64) -> bool {
     id >= 32 && ((id - 32) < abi_names::EXPORT_NAMES.len() as u64 || (0x4000_0000..0x4000_2000).contains(&id) || crate::ntos::init::exports::private_routines::name(id).is_some())
 }
 
-/// NTSTATUS devolvido como inteiro de 32 bits com sinal (`status | 0` do
-/// original): RAX recebe o valor estendido.
+/// NTSTATUS devolvido como inteiro de 32 bits com sinal: RAX recebe o valor
+/// estendido.
 pub fn signed_status(status: u32) -> u64 {
     status as i32 as i64 as u64
 }
@@ -599,7 +598,7 @@ pub fn fatal_unless_transfer<T>(tag: &str, result: Result<T, KernelError>) -> Re
 
 /// Despachante chamado pelo trampolim comum (id, frame original, CONTEXT).
 /// Uma falha interna não tem resultado nativo válido: interrompe o sistema
-/// em vez de devolver zero e pular a operação, como o original.
+/// em vez de devolver zero e pular a operação.
 #[no_mangle]
 pub extern "win64" fn opennt_ntoskrnl_dispatch(id: u64, frame: u64, context: u64) -> u64 {
     // O CONTEXT e o frame estão na pilha do chamador (kernel).

@@ -117,7 +117,7 @@ pub fn query(name: ValueName, type_pointer: u64, buffer: u64, capacity: u32, len
         }
         Ok(status)
     })();
-    // A resposta é liberada antes de fechar a chave, como no original.
+    // A resposta é liberada antes de fechar a chave.
     if value != 0 {
         let _ = kernel_pool::free(value, None);
     }

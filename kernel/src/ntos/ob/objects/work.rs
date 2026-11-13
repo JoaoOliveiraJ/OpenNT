@@ -4,7 +4,7 @@
 //! espera ocupa 0x50 bytes: refs +0, handles +8, fechado +0xC, fase +0x10
 //! (1 associado, 2 enfileirado), porta +0x18, alvo +0x20, chave +0x28,
 //! contexto +0x30, status +0x38 e informação +0x40. A fábrica de workers
-//! (0xA0 bytes) entra com `ps/user/worker-factory`.
+//! (0xA0 bytes) entra com `ps/user/worker_factory`.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

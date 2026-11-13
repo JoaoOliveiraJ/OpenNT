@@ -30,12 +30,12 @@ fn all() -> impl Iterator<Item = &'static BundleFile> {
     FILES.iter().chain(WINDOWS_BINARIES.iter())
 }
 
-/// `os.readBundleBytes(nome)`.
+/// Bytes de um arquivo embutido, pelo nome.
 pub fn read(name: &str) -> Option<&'static [u8]> {
     all().find(|file| file.name == name).map(|file| file.data)
 }
 
-/// `os.listBundleFiles()`.
+/// Nomes dos arquivos embutidos.
 pub fn list() -> impl Iterator<Item = &'static str> {
     all().map(|file| file.name)
 }

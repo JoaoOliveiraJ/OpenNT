@@ -36,7 +36,7 @@ pub fn probe_user_address(address: u64, length: u64, alignment: u32) {
 }
 
 /// Tamanho do MDL x64: cabeçalho de 48 bytes e um PFN de 8 bytes por página
-/// abrangida, com as somas de 64 bits do original (inclusive o estouro).
+/// abrangida, com somas de 64 bits (inclusive o estouro).
 pub fn size_of_memory_descriptor(base_address: u64, byte_length: u64) -> u64 {
     let page_offset = base_address & 0xFFF;
     let rounded_span = byte_length.wrapping_add(page_offset).wrapping_add(0xFFF);

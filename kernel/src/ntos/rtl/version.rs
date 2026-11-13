@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 
 use crate::ntos::mm::guest_memory as guest;
 
-/// Versão publicada (10.0.26100, como no original).
+/// Versão publicada (10.0.26100).
 const VERSION: (u32, u32, u32) = (10, 0, 26100);
 
-/// Status de versão que não confere (o valor do original).
+/// Status de versão que não confere.
 const VERSION_MISMATCH: u32 = 0xC000_0428;
 
 /// KUSER_SHARED_DATA.NtSystemRoot.
@@ -42,7 +42,7 @@ pub fn verify(info: u64, type_mask: u32, condition: u64) -> u32 {
     if type_mask & 4 != 0 {
         checks.push((guest::read32(info + 12), VERSION.2));
     }
-    // O original aplica o operador do bloco baixo a todos os campos.
+    // Aplica o operador do bloco baixo a todos os campos.
     let operator = condition & 7;
     for (expected, actual) in checks {
         let matches = match operator {
@@ -60,8 +60,7 @@ pub fn verify(info: u64, type_mask: u32, condition: u64) -> u32 {
     0
 }
 
-/// VerSetConditionMask: condição deslocada por 3 bits × tipo (a
-/// aproximação do original).
+/// VerSetConditionMask: condição deslocada por 3 bits × tipo (aproximação).
 pub fn set_condition_mask(mask: u64, type_mask: u32, condition: u32) -> u64 {
     let shift = type_mask.saturating_mul(3);
     let increment = if shift < 64 { (condition as u64) << shift } else { 0 };

@@ -6,7 +6,7 @@
 use crate::ntos::mm::guest_memory as guest;
 
 /// UTC para a hora local do runtime: sem fuso configurado o deslocamento é
-/// zero (o `getTimezoneOffset` do runtime original também devolvia 0).
+/// zero.
 pub fn system_time_to_local_time(system_time: u64, local_time: u64) {
     const TIMEZONE_OFFSET_MINUTES: i64 = 0;
     let universal = guest::read64(system_time) as i64;

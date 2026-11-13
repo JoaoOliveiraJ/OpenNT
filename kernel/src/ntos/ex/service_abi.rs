@@ -1823,7 +1823,7 @@ pub static WIN32: Table = Table {
     ],
 };
 
-/// Argumentos de pilha medidos do serviço (`stackArgumentCounts`).
+/// Argumentos de pilha medidos do serviço.
 pub fn stack_arguments(name: &str) -> Option<u32> {
     NATIVE.entries.iter().chain(WIN32.entries.iter()).find(|entry| entry.1 == name).map(|entry| entry.2)
 }

@@ -1,6 +1,4 @@
-//! Acesso à memória física (`os.readPhysical*`, `os.writePhysical*`,
-//! `os.zeroPhysical`, `os.compareExchangePhysical*` de
-//! `hal/qjs/primitives_memory.c`).
+//! Acesso à memória física: leituras, escritas, zeragem e compare-exchange.
 //!
 //! O stage2 mapeia os primeiros 4 GB em identidade, então o endereço físico
 //! é usado diretamente como ponteiro. Todos os acessos são voláteis: essas
@@ -78,7 +76,7 @@ pub fn zero(address: u64, length: usize) {
     unsafe { core::ptr::write_bytes(address as *mut u8, 0, length) }
 }
 
-/// `os.compareExchangePhysical32`: devolve o valor anterior.
+/// CMPXCHG de 32 bits: devolve o valor anterior.
 pub fn compare_exchange32(address: u64, expected: u32, desired: u32) -> u32 {
     let cell = unsafe { &*(address as *const AtomicU32) };
     match cell.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
@@ -86,7 +84,7 @@ pub fn compare_exchange32(address: u64, expected: u32, desired: u32) -> u32 {
     }
 }
 
-/// `os.compareExchangePhysical64`: devolve o valor anterior.
+/// CMPXCHG de 64 bits: devolve o valor anterior.
 pub fn compare_exchange64(address: u64, expected: u64, desired: u64) -> u64 {
     let cell = unsafe { &*(address as *const AtomicU64) };
     match cell.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
@@ -94,8 +92,8 @@ pub fn compare_exchange64(address: u64, expected: u64, desired: u64) -> u64 {
     }
 }
 
-/// `os.compareExchangeVirtual128` (CMPXCHG16B): devolve o valor anterior
-/// (baixo, alto). O endereço precisa estar alinhado a 16 bytes.
+/// CMPXCHG16B: devolve o valor anterior (baixo, alto). O endereço precisa
+/// estar alinhado a 16 bytes.
 pub fn compare_exchange128(address: u64, expected: (u64, u64), replacement: (u64, u64)) -> (u64, u64) {
     let (mut low, mut high) = expected;
     unsafe {

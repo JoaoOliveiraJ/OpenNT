@@ -1,11 +1,8 @@
 //! Autotestes da fase 3 — Ke (dispatcher, APC, timers, alertas), Ex (push
 //! lock, rundown), Ob (handle table, tabela por processo), Ps e Se.
 //!
-//! Correspondem a `ntos/test/{dispatcher,apc-regions,handle-table,
-//! ex-rundown,ex-push-lock,alert-thread,process-handles,primary-tokens}.js`.
-//! Onde o original gerava código nativo que chamava exports do ntoskrnl (fase 6),
-//! as rotinas nativas são funções `extern "win64"` chamadas pelo gateway
-//! MS-ABI, e as chamadas de export viram chamadas diretas à API.
+//! As rotinas nativas são funções `extern "win64"` chamadas pelo gateway
+//! MS-ABI, e as chamadas de export são chamadas diretas à API.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,7 +57,7 @@ fn dispatcher_objects(assert: Assert) {
     }
 }
 
-// Rotinas "nativas" das APCs (mesmo contrato dos fixtures do original).
+// Rotinas "nativas" das APCs.
 extern "win64" fn special_routine(_apc: u64, _normal: u64, _context: u64, first: u64, _second: u64) {
     let state = guest::read64(first);
     guest::write32(state + 4, irql::get_irql() as u32);

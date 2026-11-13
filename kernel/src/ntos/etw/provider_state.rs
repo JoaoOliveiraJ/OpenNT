@@ -500,7 +500,7 @@ pub fn statistics() -> (usize, usize, usize) {
     with(|etw| (etw.registrations.values().filter(|record| !record.closing).count(), etw.entries.len(), etw.sessions.len()))
 }
 
-/// `lookup` do original: o registro existe, mesmo em fechamento.
+/// O registro existe, mesmo em fechamento.
 pub fn exists(handle: u64) -> bool {
     with(|etw| etw.registrations.contains_key(&handle))
 }

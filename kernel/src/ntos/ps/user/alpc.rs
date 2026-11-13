@@ -34,7 +34,7 @@ pub use crate::ntos::alpc::transport::register;
 const AV: u32 = 0xC000_0005;
 const INVALID: u32 = 0xC000_000D;
 
-/// Conexões com trabalho de transporte (o `ports` do original).
+/// Conexões com trabalho de transporte.
 static PORTS: SpinLock<Vec<Arc<Port>>> = SpinLock::new(Vec::new());
 /// O fallback LPC registra NtAlpcSendWaitReceivePort antes desta camada.
 static LPC_SEND_RECEIVE: SpinLock<Option<state::SyscallHandler>> = SpinLock::new(None);

@@ -1,5 +1,5 @@
 //! Privilégios: verificação contra o token efetivo do sujeito e o conjunto
-//! de privilégios usados de um ACCESS_STATE, como o `se\privileg.c` do NT.
+//! de privilégios usados de um ACCESS_STATE.
 //!
 //! Todo código aqui roda em modo kernel: o contexto kernel tem todos os
 //! privilégios habilitados, e KernelMode passa direto.

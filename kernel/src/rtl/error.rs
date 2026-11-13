@@ -1,5 +1,4 @@
-//! Erro do kernel com NTSTATUS opcional — o equivalente de
-//! `Object.assign(new Error(mensagem), { status })` usado em todo o original.
+//! Erro do kernel: mensagem com NTSTATUS opcional.
 
 use alloc::string::String;
 use core::fmt;

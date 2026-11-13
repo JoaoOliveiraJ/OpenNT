@@ -26,7 +26,7 @@ use crate::ntos::io::file::zw as zw_files;
 
 const AV: u32 = 0xC000_0005;
 const INVALID: u32 = 0xC000_000D;
-/// Maior offset+tamanho aceito (Number.MAX_SAFE_INTEGER do original).
+/// Maior offset+tamanho aceito (2^53 - 1).
 const MAX_SAFE: u64 = (1 << 53) - 1;
 
 fn range(pointer: u64, length: u64) -> bool {

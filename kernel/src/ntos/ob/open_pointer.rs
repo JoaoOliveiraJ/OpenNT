@@ -1,9 +1,9 @@
 //! ObOpenObjectByPointer / ObReferenceObjectByHandle / ObCloseHandle.
 //!
-//! `describe` identifica o dono do corpo, na ordem do original (processo,
+//! `describe` identifica o dono do corpo, nesta ordem (processo,
 //! thread, token, callback, driver, seção, arquivo, dispatcher, namespace,
 //! silo), e entrega suas operações reais de retenção, liberação e handle.
-//! Os donos ainda não transcritos registram seu slot quando chegam.
+//! Os donos de módulos posteriores registram seu slot quando chegam.
 //!
 //! O caminho da tabela de handles de usuário (`ps/user/state`) entra na
 //! fase 7; até lá toda abertura segue pelo Object Manager.
@@ -25,7 +25,7 @@ use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Operações de um dono de corpos nativos.
-/// Metadados de ZwQueryObject vindos do registro do dono (`item.record`).
+/// Metadados de ZwQueryObject vindos do registro do dono.
 /// `handles: None` faz a consulta contar os handles das tabelas.
 #[derive(Clone, Debug, Default)]
 pub struct QueryRecord {
@@ -35,7 +35,7 @@ pub struct QueryRecord {
     pub name: alloc::string::String,
 }
 
-/// Caminho do nó do namespace cujo corpo é `pointer` (`namespaceNode`).
+/// Caminho do nó do namespace cujo corpo é `pointer`.
 pub fn namespace_path_of(pointer: u64) -> Option<alloc::string::String> {
     if pointer == 0 {
         return None;
@@ -47,7 +47,7 @@ pub trait ObjectOwner: Send + Sync {
     fn object_type(&self, pointer: u64) -> ObjectType;
     fn reference(&self, pointer: u64);
     fn dereference(&self, pointer: u64);
-    /// Abertura própria de handle (`item.open`); `None` = referência + conta.
+    /// Abertura própria de handle; `None` = referência + conta.
     fn open_handle(&self, _pointer: u64) -> Option<Result<(), KernelError>> {
         None
     }
@@ -64,7 +64,7 @@ pub trait ObjectOwner: Send + Sync {
     fn file_usable(&self, _pointer: u64) -> bool {
         true
     }
-    /// Dados de abertura do dono (`item.data`).
+    /// Dados de abertura do dono.
     fn data(&self, pointer: u64) -> ObjectData;
     /// Nó do namespace dono (diretórios e links).
     fn node(&self, _pointer: u64) -> Option<object_manager::NodeId> {
@@ -98,7 +98,7 @@ impl Described {
     }
 }
 
-/// Slots de dono, na ordem de busca do original.
+/// Slots de dono, na ordem de busca.
 #[derive(Clone, Copy)]
 pub enum Slot {
     Process,
@@ -146,7 +146,7 @@ impl ObjectOwner for ProcessOwner {
 }
 
 /// Threads executadas pelo kernel também passam pela coleta do escalonador
-/// (`KernelThreads.dereference`, instalado com `ps/kernel-threads`).
+/// (rotina instalada com `ps/kernel_threads`).
 static THREAD_DEREFERENCE: SpinLock<Option<fn(u64) -> bool>> = SpinLock::new(None);
 
 pub fn set_thread_dereference(routine: fn(u64) -> bool) {

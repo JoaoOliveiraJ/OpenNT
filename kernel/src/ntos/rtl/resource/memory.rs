@@ -9,7 +9,7 @@ use crate::ntos::mm::{page_residency, paging, small};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
-/// Falha de acesso com o NTSTATUS do original.
+/// Falha de acesso com o NTSTATUS correspondente.
 fn fault(address: u64, in_page_status: Option<u32>) -> KernelError {
     KernelError::with_status(alloc::format!("resource memory access at {address:#x}"), if in_page_status.is_none() { 0xC000_0005 } else { 0xC000_0006 })
 }

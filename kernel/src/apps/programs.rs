@@ -1,10 +1,8 @@
 //! Programas de exemplo do shell.
 //!
-//! No original eram scripts lidos do MemoryFileSystem e executados com
-//! `new Function('SystemCall', fonte)`. Sem interpretador, o OpenNT os embute
-//! como funções Rust que usam a mesma tabela de chamadas
-//! (`ntos::ex::syscalls`). `run` executa um programa síncrono; `spawn` cria um
-//! processo cooperativo no escalonador.
+//! Os programas são funções Rust embutidas no kernel que usam a tabela de
+//! chamadas (`ntos::ex::syscalls`). `run` executa um programa síncrono;
+//! `spawn` cria um processo cooperativo no escalonador.
 
 use alloc::boxed::Box;
 use alloc::format;

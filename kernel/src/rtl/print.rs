@@ -1,5 +1,5 @@
-//! Canal de depuração do kernel (o `os.debugPrint` do original): texto na COM1,
-//! sempre terminado por quebra de linha.
+//! Canal de depuração do kernel: texto na COM1, sempre terminado por quebra
+//! de linha.
 
 use core::fmt::{self, Write};
 
@@ -21,14 +21,14 @@ pub fn write_args(arguments: fmt::Arguments<'_>) {
     let _ = SerialWriter.write_fmt(arguments);
 }
 
-/// Escreve argumentos formatados seguidos de `\n` (debugPrint).
+/// Escreve argumentos formatados seguidos de `\n`.
 pub fn debug_print_args(arguments: fmt::Arguments<'_>) {
     let _ = SerialWriter.write_fmt(arguments);
     serial::write(b"\n");
 }
 
-/// `debug_print!("[irq] plataforma: {}", vendor)` — equivalente a
-/// `os.debugPrint('[irq] plataforma: ' + vendor)`.
+/// `debug_print!("[irq] plataforma: {}", vendor)`: texto formatado na COM1,
+/// seguido de quebra de linha.
 #[macro_export]
 macro_rules! debug_print {
     ($($argument:tt)*) => {

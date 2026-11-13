@@ -3,7 +3,7 @@
 //! Registro (ponteiro do PDO -> lista) para APIs que derivam a configuração
 //! de hardware do dispositivo: o IoConnectInterruptEx LINE_BASED acha a IRQ
 //! aqui (o que o NT resolve pelo devnode e pelos árbitros de recurso). As
-//! chaves são os 32 bits baixos do ponteiro, como no original.
+//! chaves são os 32 bits baixos do ponteiro.
 
 use alloc::collections::BTreeMap;
 

@@ -1,6 +1,6 @@
 //! Tipos compartilhados do modelo de segurança: os objetos `{ sid, mask,
 //! deny, flags }`, `{ sid, attributes }` e as políticas `{ owner, group,
-//! dacl }` que os módulos de `ntos/se` e `ntos/ob` do original trocam entre si.
+//! dacl }` que os módulos de `ntos/se` e `ntos/ob` trocam entre si.
 
 use alloc::vec::Vec;
 
@@ -57,7 +57,7 @@ pub fn equal_sids(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// Serializa a autoridade em seis bytes big-endian e as subautoridades ULONG
-/// em little-endian (`Tokens.sid`).
+/// em little-endian.
 pub fn sid(authority: u64, sub_authorities: &[u32]) -> Sid {
     let mut bytes = alloc::vec![0u8; 8 + sub_authorities.len() * 4];
     bytes[0] = 1;

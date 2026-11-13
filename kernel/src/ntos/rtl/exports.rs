@@ -1,8 +1,7 @@
 //! Exports Rtl*, Interlocked* e da CRT do ntoskrnl.
 //!
-//! Semântica do NT sobre a memória do convidado. Divergência: os campos
-//! Buffer das UNICODE/ANSI_STRING são lidos e escritos com 64 bits (o
-//! original usava 32, suficiente para os endereços baixos dele).
+//! Semântica do NT sobre a memória do convidado. Os campos Buffer das
+//! UNICODE/ANSI_STRING são lidos e escritos com 64 bits.
 //!
 //! Só adaptadores: cada handler lê os argumentos do `Call`, chama a rotina
 //! do arquivo de assunto do Rtl e converte o resultado (NTSTATUS, ponteiro,

@@ -36,7 +36,7 @@ fn initialize_identifier(pointer: u64, sub_authority_count: u8, authority: u8) {
 /// bytes. Falha de alocação mantém as saídas zeradas, como no kernel.
 pub fn derive(name: u64, group: u64, capability: u64) -> Result<u32, KernelError> {
     if name == 0 || group == 0 || capability == 0 {
-        // O original executa INT 29h (FAST_FAIL_INVALID_ARG).
+        // O kernel de referência executa INT 29h (FAST_FAIL_INVALID_ARG).
         return Err(KernelError::with_status("Capability SID derivation: null required pointer", 0xC000_0409));
     }
     // A saída de capability é zerada primeiro.

@@ -17,7 +17,7 @@ const FRAME_TAG: u32 = 0x6466_6E57;
 const GENERIC_MAPPING: [u32; 4] = [0x12_0001, 0x2, 0x1F_0000, 0x1F_0013];
 
 /// Expande os bits genéricos e limita aos direitos WNF; entradas de
-/// auditoria preservam ACCESS_SYSTEM_SECURITY, como o original.
+/// auditoria preservam ACCESS_SYSTEM_SECURITY.
 fn map_entry_permissions(mask: u32, entry_type: u8) -> u32 {
     let mut mapped = mask;
     for (index, &mapping) in GENERIC_MAPPING.iter().enumerate() {
@@ -29,7 +29,7 @@ fn map_entry_permissions(mask: u32, entry_type: u8) -> u32 {
     mapped & 0x0FFF_FFFF & valid
 }
 
-/// Tipos que o original não mapeia e ACEs INHERIT_ONLY conservam os bytes.
+/// Tipos de ACE não mapeados e ACEs INHERIT_ONLY conservam os bytes.
 fn specialize_access_control_list(pointer: u64) {
     let count = guest::read16(pointer + 4);
     let mut entry = pointer + 8;

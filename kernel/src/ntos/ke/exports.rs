@@ -607,7 +607,7 @@ pub mod thread_priority {
 }
 
 pub mod persistent_thread_state {
-    //! KeCapturePersistentThreadState — `ntos/ke/persistent-thread-state`.
+    //! KeCapturePersistentThreadState — `ntos/ke/persistent_thread_state`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::ke::persistent_thread_state;

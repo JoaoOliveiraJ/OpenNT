@@ -400,7 +400,7 @@ pub mod unmap_view {
 
 pub mod query_virtual {
     //! ZwQueryVirtualMemory; a implementação
-    //! e o estado pertencem ao `mm/query-virtual`.
+    //! e o estado pertencem ao `mm/query_virtual`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::query_virtual;

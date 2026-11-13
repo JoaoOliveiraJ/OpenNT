@@ -20,7 +20,7 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::{device_object, device_power_state, io_stack_location, irp, power_state_type};
 
 /// Quem despacha power IRPs para baixo (registrado pelo I/O Manager, o que
-/// quebra o ciclo io-manager <-> power-manager).
+/// quebra o ciclo `io_manager` <-> `power_manager`).
 pub type Dispatcher = fn(u64, u64) -> u32;
 
 struct State {
@@ -91,7 +91,7 @@ pub fn start_next_power_request(device: u64) {
 }
 
 /// PoCallDriver: no fundo da pilha (sem dispositivo anexado) o IRP fica com
-/// o status que já tem. AttachedDevice é lido como DWORD, como no original.
+/// o status que já tem. AttachedDevice é lido como DWORD.
 pub fn call_driver_down_the_stack(device: u64, irp: u64) -> u32 {
     let attached = guest::read32(device + device_object::ATTACHED_DEVICE) as u64;
     if attached == 0 {

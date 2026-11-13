@@ -1,5 +1,4 @@
-//! Entradas WNF de modo usuário — `system32/ntos/ex/{wnf-query-user,
-//! wnf-subscribe-user,wnf-process-event}.js`.
+//! Entradas WNF de modo usuário: consulta, assinatura e eventos de processo.
 //!
 //! A captura de NtQueryWnfStateData compartilha namespace, referências,
 //! locks e dados com a consulta Zw; a inscrição sonda e zera a saída antes do
@@ -20,7 +19,7 @@ const EVENT_MODIFY_STATE: u64 = 2;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_ALREADY_REGISTERED: u32 = 0xC000_0718;
 
-/// O original aceita ULONGs desalinhados: sonda ChangeStamp, lê BufferSize,
+/// Aceita ULONGs desalinhados: sonda ChangeStamp, lê BufferSize,
 /// sonda BufferSize para escrita e por fim o buffer de dados.
 fn capture_inputs(type_identifier: u64, change_stamp: u64, buffer: u64, returned_length: u64) -> Result<UserInputs, u32> {
     let mut captured = SuppliedType::None;
@@ -136,7 +135,7 @@ pub fn set_process_notification_event(handle: u64) -> Result<u32, KernelError> {
         if previous != 0 {
             return Ok(STATUS_ALREADY_REGISTERED);
         }
-        // A limpeza de wnf-notifications devolve a referência; registrar não
+        // A limpeza das notificações WNF devolve a referência; registrar não
         // altera o estado de sinalização do evento.
         event = None;
         Ok(0)

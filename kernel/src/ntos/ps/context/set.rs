@@ -55,7 +55,7 @@ pub fn begin(thread: u64, input: u64, probe_mode: u8, context_mode: u8, flags: u
         Ok(captured) => captured,
         Err(status) => return Ok(Operation::Completed(status)),
     };
-    // A captura e a validação precedem o teste de SystemThread no original.
+    // A captura e a validação precedem o teste de SystemThread.
     if context_mode != 0 && guest::read32(thread + MISC_FLAGS) & 0x400 != 0 {
         captured.release();
         return Ok(Operation::Completed(0xC000_0030));

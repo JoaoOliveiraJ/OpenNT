@@ -17,7 +17,7 @@ use crate::ntos::ps::user::state::{self, Region, RegionKind, UserRegion};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::pe_loader::PeImage;
 
-/// Vista de imagem mapeada pelo loader (`section-image-view`).
+/// Vista de imagem mapeada pelo loader (`image_view`).
 pub struct ImageView {
     pub base: u64,
     pub size: u64,

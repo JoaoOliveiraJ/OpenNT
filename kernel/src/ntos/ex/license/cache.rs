@@ -49,7 +49,7 @@ pub fn prepare(context: u64, notify_corruption: Option<fn(u64)>) -> Result<u32, 
     }
     let mut newly_corrupt = false;
     let status = locked(context, true, || {
-        // Outra thread pode ter terminado a montagem: o original devolve zero.
+        // Outra thread pode ter terminado a montagem: devolve zero.
         if guest::read8(context + 0xB6EC) == 1 {
             return Ok(0);
         }

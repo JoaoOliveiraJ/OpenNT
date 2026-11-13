@@ -1,9 +1,9 @@
 //! NtMapViewOfSection.
 //!
 //! Captura todos os ponteiros do chamador antes de anexar ao alvo, valida
-//! pelo `map-view-parameters` e recusa (em vez de converter em vista comum)
+//! pelo `map_view_parameters` e recusa (em vez de converter em vista comum)
 //! as políticas ainda sem implementação real: PAGE_GUARD, CFG e promoção a
-//! páginas grandes. Vistas de imagem passam por `mm/section-image-view`
+//! páginas grandes. Vistas de imagem passam por `mm/section/image_view`
 //! (loader de usuário).
 //!
 //! MmMapViewOfSection/MmUnmapViewOfSection são as versões por ponteiro

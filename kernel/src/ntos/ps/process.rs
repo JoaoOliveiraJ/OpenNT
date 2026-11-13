@@ -38,7 +38,7 @@ const NORMAL_THREAD_PAGE_PRIORITY: u32 = 5;
 const STATUS_INVALID_CID: u32 = 0xC000_000B;
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
-/// Imagem executável de um processo (`ps/process-image`, fase 6).
+/// Imagem executável de um processo (`ps/process_image`, fase 6).
 #[derive(Clone, Debug)]
 pub struct ProcessImage {
     pub id: u64,
@@ -64,10 +64,10 @@ pub struct ImageProvider {
 }
 
 /// Desmontagens de subsistemas ainda instalados depois do Process Manager,
-/// na ordem do `terminateProcess`.
+/// na ordem de `terminate_process`.
 #[derive(Clone, Copy, Default)]
 pub struct TeardownHooks {
-    /// `mm/section-views.releaseProcess`.
+    /// `mm::section::views::release_process`.
     pub release_section_views: Option<fn(u64)>,
 }
 
@@ -849,14 +849,14 @@ pub fn thread_kernel_time(thread: u64) -> u64 {
     STATE.lock().threads.get(&thread).map_or(0, |record| record.kernel_time)
 }
 
-/// Rotina inicial publicada da thread (`describeThread({ start })`).
+/// Rotina inicial publicada da thread.
 pub fn set_thread_start(thread: u64, start: u64) {
     if let Some(record) = STATE.lock().threads.get_mut(&thread) {
         record.start = start;
     }
 }
 
-/// Liga a thread ao contexto do escalonador (`describeThread({ runtime })`).
+/// Liga a thread ao contexto do escalonador.
 pub fn describe_thread(thread: u64, runtime: Option<u32>, dead: bool) {
     if let Some(record) = STATE.lock().threads.get_mut(&thread) {
         record.runtime = runtime;
@@ -953,7 +953,7 @@ pub fn get_current_thread_id() -> u64 {
     guest::read64(thread + kthread::CID_UNIQUE_THREAD)
 }
 
-/// Entrada de `listActiveProcesses`.
+/// Entrada de `list_active_processes`.
 #[derive(Clone, Debug)]
 pub struct ActiveProcess {
     pub pid: u64,

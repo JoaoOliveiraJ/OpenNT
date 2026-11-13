@@ -1,11 +1,11 @@
-//! Trampolins de interrupção — transcrição de `hal/core/irqstubs.asm`.
+//! Trampolins de interrupção.
 //!
 //! O hardware exige código de máquina no vetor da IDT; a lógica fica no
 //! kernel. Cada stub de 10 bytes empilha o vetor e salta para `irq_common`,
 //! que registra o evento na memória compartilhada, alimenta o ring do
 //! teclado, faz EOI e volta com IRETQ — sem chamar Rust.
 //!
-//! Mapa de memória física compartilhada (o mesmo do original):
+//! Mapa de memória física compartilhada:
 //!   0x81000: u32 irq_count[256]       (contagem de interrupções por vetor)
 //!   0x81400: ring buffer do teclado   (head u32 @0x81400, tail u32 @0x81404,
 //!                                      dados 256B @0x81408)
@@ -463,7 +463,7 @@ extern "C" {
     static irq_stub_table: u8;
 }
 
-/// `os.getIrqStubTable()`: endereço do primeiro stub.
+/// Endereço do primeiro stub.
 pub fn stub_table() -> u64 {
     core::ptr::addr_of!(irq_stub_table) as u64
 }
@@ -526,7 +526,7 @@ fn exception_name(vector: u8) -> &'static str {
 }
 
 /// Estado do processador entregue ao despacho: banco de depuração, base do
-/// GS, seletores, código de erro e CR2 (`processor_state` do original).
+/// GS, seletores, código de erro e CR2.
 #[repr(C)]
 struct ProcessorState {
     debug: [u64; 6],

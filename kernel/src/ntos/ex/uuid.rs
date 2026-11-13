@@ -22,8 +22,8 @@ fn next_random32() -> u32 {
     *state
 }
 
-/// Duas saídas do gerador; os 64 bits saem exatos (o original passava por
-/// Number e podia arredondar os bits baixos).
+/// Duas saídas do gerador; os 64 bits saem exatos, sem arredondar os bits
+/// baixos.
 fn next_random64() -> u64 {
     let low = next_random32() as u64;
     low | (next_random32() as u64) << 32

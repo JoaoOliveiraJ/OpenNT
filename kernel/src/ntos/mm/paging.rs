@@ -23,7 +23,7 @@ pub const PAGE_PS: u64 = 0x80;
 
 const PML4: u64 = map::PML4_PHYS;
 const NX_BIT: u64 = 1 << 63;
-/// Bits que `readEntry` conserva: endereço + flags baixas, sem NX nem 52..62.
+/// Bits que `read_entry` conserva: endereço + flags baixas, sem NX nem 52..62.
 const ENTRY_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 
 struct PagingState {

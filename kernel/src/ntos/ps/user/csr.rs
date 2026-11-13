@@ -32,12 +32,12 @@ struct Session {
     _data: u64,
     _section: Arc<Section>,
     clients: BTreeMap<u64, Client>,
-    /// Porta de conexão → processo cliente (o `port.context` do original).
+    /// Porta de conexão → processo cliente.
     ports: BTreeMap<u64, u64>,
 }
 
 static SESSION: SpinLock<Option<Session>> = SpinLock::new(None);
-/// `win32k.connectUser`, instalado pelo subsistema de janelas.
+/// `win32k::connect_user`, instalado pelo subsistema de janelas.
 static USER_CONNECTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
 
 pub fn set_user_connector(connector: fn(u64, u64) -> u32) {

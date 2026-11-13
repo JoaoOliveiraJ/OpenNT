@@ -67,7 +67,7 @@ pub fn all_disabled() -> bool {
     irql::get_irql() >= 1 || read_count(kthread::SPECIAL_APC_DISABLE, process::get_current_thread()) != 0
 }
 
-/// Região crítica com saída garantida (o try/finally do original).
+/// Região crítica com saída garantida, mesmo quando o corpo falha.
 pub fn with_critical<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
     enter_critical()?;
     let result = body();

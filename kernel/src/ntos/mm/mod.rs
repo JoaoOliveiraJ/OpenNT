@@ -1,4 +1,4 @@
-//! Memory Manager (Mm) — `system32/ntos/mm/`.
+//! Memory Manager (Mm).
 
 pub mod contiguous_memory;
 pub mod data_pool;

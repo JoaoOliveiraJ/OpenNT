@@ -23,7 +23,7 @@ pub fn binaries_present() -> bool {
 }
 
 /// Devolve o FDO da pilha do teclado iniciada (`None` se o PnP não a
-/// iniciou). Idempotente, como o original.
+/// iniciou). Idempotente.
 pub fn initialize() -> Result<Option<NodeId>, KernelError> {
     if let Some(stack) = *KEYBOARD_STACK.lock() {
         return Ok(stack);

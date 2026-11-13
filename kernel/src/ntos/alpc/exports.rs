@@ -2,7 +2,7 @@
 //!
 //! Captura de ponteiros exatos e sem sondagem de UserMode. As chamadas em
 //! threads nativas usam a mesma continuação pelo escalonador de kernel; uma
-//! falha interna do transporte para a máquina, como no original.
+//! falha interna do transporte para a máquina.
 
 use crate::ntos::init::exports::{signed_status, Call, Group};
 use crate::ntos::alpc::kernel_entry;

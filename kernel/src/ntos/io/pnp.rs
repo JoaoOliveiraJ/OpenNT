@@ -158,8 +158,7 @@ pub fn start_device_stack(fdo: NodeId) -> i32 {
 }
 
 /// QUERY_DEVICE_RELATIONS(BusRelations): DEVICE_RELATIONS (Count + PDOs).
-/// Os ponteiros são lidos com 64 bits (o original lia 32, suficiente para os
-/// endereços baixos dele).
+/// Os ponteiros são lidos com 64 bits.
 pub fn query_bus_relations(fdo: NodeId) -> Vec<u64> {
     let request = send_pnp_minor(fdo, irp_mn::QUERY_DEVICE_RELATIONS, IoParams { relations_type: Some(0), ..Default::default() });
     if request.status != 0 || request.info == 0 {

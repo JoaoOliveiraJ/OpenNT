@@ -1,5 +1,5 @@
 //! Auditoria de segurança: os eventos que os drivers reportam ao Security
-//! Reference Monitor, como o `se\seaudit.c` do NT.
+//! Reference Monitor.
 //!
 //! Não há serviço de eventlog em modo usuário: os eventos ficam num anel do
 //! kernel (os mais antigos saem) e são ecoados na serial.

@@ -40,7 +40,7 @@ fn record_of(view: &View) -> Option<RecordRef> {
     AREAS.lock().get(&area_key(&area)).cloned()
 }
 
-/// Gancho instalado na control area (`area.systemPaging`).
+/// Gancho instalado na control area.
 struct AreaHook {
     record: RecordRef,
     key: usize,

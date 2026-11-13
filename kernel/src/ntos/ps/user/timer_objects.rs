@@ -1,7 +1,7 @@
 //! Timers de usuário (NtCreateTimer2).
 //!
-//! O prazo e o período ficam em unidades de 100 ns inteiras (o original
-//! guardava ms em ponto flutuante: as mesmas contas sem perder a fração).
+//! O prazo e o período ficam em unidades de 100 ns inteiras (sem ponto
+//! flutuante e sem perder a fração de ms).
 //! `pump` sinaliza os vencidos e reprograma os periódicos.
 
 use alloc::collections::BTreeMap;

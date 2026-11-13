@@ -2,7 +2,7 @@
 //!
 //! A tabela encaminha console, teclado, memória e arquivos aos respectivos
 //! proprietários; seus números são internos ao runtime. Argumentos e
-//! resultados são valores dinâmicos, como no JavaScript.
+//! resultados são valores dinâmicos.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -101,7 +101,7 @@ fn ramsize(_: &[Value]) -> Result<Value, KernelError> {
     Ok(Value::Number(kmalloc::ram_top()))
 }
 
-/// `open`/`close` pertencem ao Object Manager, ainda não transcrito.
+/// `open`/`close` pertencem ao Object Manager, ainda não implementado.
 fn object_manager_pending(_: &[Value]) -> Result<Value, KernelError> {
     Err(KernelError::with_status(
         "syscall depende do Object Manager (ntos/ob), ainda nao transcrito",
@@ -126,7 +126,7 @@ static SYSTEM_CALL_TABLE: &[(u32, &str, Service)] = &[
     (12, "close", object_manager_pending),
 ];
 
-/// Índice reverso construído da mesma tabela (`SystemCall.byName`).
+/// Índice reverso construído da mesma tabela.
 pub fn number_by_name(name: &str) -> Option<u32> {
     SYSTEM_CALL_TABLE.iter().find(|entry| entry.1 == name).map(|entry| entry.0)
 }

@@ -100,7 +100,7 @@ pub fn set_context_state(context: u64, value: u32) -> Result<u32, KernelError> {
     update_fields(context, 2, 0, |_, _| value as u64)
 }
 
-/// Copia os 48 bytes em três blocos de 16, como o original.
+/// Copia os 48 bytes em três blocos de 16.
 pub fn query(context: u64, output: u64) -> Result<u32, KernelError> {
     if output == 0 {
         return Ok(0xC000_000D);

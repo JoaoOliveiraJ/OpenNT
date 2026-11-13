@@ -2,7 +2,7 @@
 //!
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração
-//! atômica e liberação. A variante de syscall de usuário (`setUser`) entra
+//! atômica e liberação. A variante de syscall de usuário (`set_user`) entra
 //! com o estado de modo usuário (fase 7).
 
 use super::query_thread::{kernel_range_valid, STATUS_ACCESS_VIOLATION, USER_PROBE_LIMIT};

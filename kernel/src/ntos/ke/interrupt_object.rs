@@ -1,7 +1,7 @@
 //! Objetos KINTERRUPT ligados por vetor ao despacho do runtime.
 //!
 //! Caminho legado com endereços físicos baixos. A sincronização usa leitura
-//! e escrita separadas da palavra de lock, como no original (não estabelece
+//! e escrita separadas da palavra de lock (não estabelece
 //! exclusão atômica entre várias CPUs).
 
 use alloc::collections::BTreeMap;
@@ -137,7 +137,7 @@ pub fn io_connect_interrupt(
 }
 
 /// IoDisconnectInterrupt. O lock interno alocado separadamente não é
-/// recuperado (como no original).
+/// recuperado.
 pub fn io_disconnect_interrupt(object: u64) {
     let vector = physical::read32(object + layout::VECTOR);
     let mut previous_link = 0;

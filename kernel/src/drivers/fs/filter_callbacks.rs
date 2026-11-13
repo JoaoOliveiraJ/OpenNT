@@ -34,7 +34,7 @@ pub fn get_file_name_information(file_object: u64, name_options: u32, file_name:
 }
 
 /// FsRtlReleaseFileNameInformation: slot 0x20, sem testar tabela nem
-/// informação NULL, como o original; o dono controla o armazenamento.
+/// informação NULL; o dono controla o armazenamento.
 pub fn release_file_name_information(information: u64) {
     let table = current_callbacks();
     let callback = guest::read64(table + 0x20);

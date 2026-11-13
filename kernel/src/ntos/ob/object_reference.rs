@@ -1,6 +1,6 @@
 //! Referências a objetos — ObReferenceObject/ObDereferenceObject (com e sem
 //! tag), ObReferenceObjectByName, ObReferenceObjectByHandle(WithTag) e
-//! ObReferenceObjectByPointer, como o `obref.c` do NT.
+//! ObReferenceObjectByPointer.
 //!
 //! Retém e solta pelo dono real de cada corpo (namespace, despachante,
 //! callbacks do Ex, contextos de silo, tokens, seções, drivers, arquivos,

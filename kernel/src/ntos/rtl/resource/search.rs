@@ -1,7 +1,7 @@
 //! Política de recursos do kernel.
 //!
 //! O contexto fornece os idiomas e a fase de boot reais; os arquivos MUI
-//! são abertos e retidos pelo `resource-satellites`.
+//! são abertos e retidos pelo `resource::satellites`.
 
 use crate::ntos::rtl::resource::configuration::{self as resource_configuration, Configuration};
 use crate::ntos::rtl::resource::languages as resource_languages;
@@ -73,7 +73,7 @@ pub fn search_mapped(request: &Request, size: u64, context: &Context) -> Result<
     // ordem de erros da árvore PE comum.
     if only_primary || (configuration.is_none() && request.count != 0) {
         let mut result = resource_tree::lookup(&image, &resource_type, &resource_name, &plan, [request.type_key, request.name], options(request))?;
-        // A lista interna do original é mutável: depois de uma busca sem
+        // A lista interna é mutável: depois de uma busca sem
         // sucesso, a etapa MUN recebe o último idioma tentado.
         if result.status != 0 {
             result.next_language = Some(if only_primary && plan.select_first { 0 } else { last });

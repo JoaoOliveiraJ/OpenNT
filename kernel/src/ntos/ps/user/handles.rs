@@ -1,9 +1,9 @@
 //! Operações nativas de handle.
 //!
 //! Duplicatas referem-se à mesma descrição aberta; acesso, herança e
-//! proteção contra fechamento pertencem a cada handle. Transcrito:
+//! proteção contra fechamento pertencem a cada handle. Implementado:
 //! NtDuplicateObject e NtSetInformationObject. Pendente: NtQueryObject (com
-//! `ob/query-object`) e a duplicação do pseudo-handle de thread (com
+//! `ob/query_object`) e a duplicação do pseudo-handle de thread (com
 //! `ps/user/threads`).
 
 use alloc::sync::Arc;

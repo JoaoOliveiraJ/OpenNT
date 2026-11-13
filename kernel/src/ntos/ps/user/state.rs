@@ -6,13 +6,12 @@
 //! handlers de syscall por nome; o despacho usa o mapa SSN→nome lido dos
 //! stubs reais da ntdll carregada.
 //!
-//! Modelo Rust: cada objeto de usuário é um `Arc<dyn UserObject>` (o `obj`
-//! do original: `type`, corpo nativo, ganchos e estado próprio recuperado por
-//! downcast) e cada handle um `Arc<UserHandle>` com acesso, atributos e
-//! referências de espera próprios — o Proxy das duplicatas do original, que
-//! compartilham o resto do objeto. Os campos do estado que pertencem a
-//! módulos ainda não transcritos (regiões, threads, imagens e módulos
-//! carregados) entram junto com eles.
+//! Modelo: cada objeto de usuário é um `Arc<dyn UserObject>` (tipo, corpo
+//! nativo, ganchos e estado próprio recuperado por downcast) e cada handle um
+//! `Arc<UserHandle>` com acesso, atributos e referências de espera próprios;
+//! as duplicatas compartilham o resto do objeto. Os campos do estado que
+//! pertencem a módulos ainda não implementados (regiões, threads, imagens e
+//! módulos carregados) entram junto com eles.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -91,7 +90,7 @@ pub trait UserRegion: Send + Sync {
     fn committed_pages(&self) -> Option<alloc::collections::BTreeSet<u64>> {
         None
     }
-    /// Proteção própria da página (`pageProtects[index]`).
+    /// Proteção própria da página.
     fn page_protect(&self, _index: u64) -> Option<u32> {
         None
     }
@@ -101,23 +100,23 @@ pub trait UserRegion: Send + Sync {
     fn allocation_protect(&self) -> u32 {
         0
     }
-    /// Alocação privada inteiramente confirmada (`region.committed`).
+    /// Alocação privada inteiramente confirmada.
     fn committed(&self) -> bool {
         false
     }
     fn section(&self) -> Option<Arc<crate::ntos::ps::user::sections::Section>> {
         None
     }
-    /// Nome nativo (`view.name`).
+    /// Nome nativo.
     fn name(&self) -> Option<alloc::string::String> {
         None
     }
-    /// Frame da página (`frames`, `pages` ou `protectedFrames`).
+    /// Frame da página (`frames`, `pages` ou `protected_frames`).
     fn frame(&self, _index: u64) -> Option<u64> {
         None
     }
     /// Registra a proteção e o frame de uma página reprotegida
-    /// (`pageProtects`/`protectedFrames`); `false` = região sem esse registro.
+    /// (`page_protects`/`protected_frames`); `false` = região sem esse registro.
     fn record_protect(&self, _index: u64, _protect: u32, _physical: u64) -> bool {
         false
     }
@@ -125,15 +124,15 @@ pub trait UserRegion: Send + Sync {
 
 pub type Region = Arc<dyn UserRegion>;
 
-/// Listas de regiões do estado (`S.userRegions`, `S.processImages`,
-/// `S.sharedUserRegions`, `S.sectionKernelViews`).
+/// Listas de regiões do estado (`user_regions`, `process_images`,
+/// `shared_user_regions`, `section_kernel_views`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionKind {
     User,
     ProcessImages,
     Shared,
     KernelViews,
-    /// Lista temporária do original (`[]`) para processos fora de execução:
+    /// Lista temporária para processos fora de execução:
     /// a região não entra em lista alguma do estado.
     Detached,
 }
@@ -143,7 +142,7 @@ pub fn same_region(left: &Region, right: &Region) -> bool {
     Arc::as_ptr(left) as *const u8 == Arc::as_ptr(right) as *const u8
 }
 
-/// O objeto `S` do original.
+/// Estado global de modo usuário.
 pub struct State {
     /// Regiões do processo, imagens mapeadas, mapeamentos NLS/schema
     /// permanentes e vistas de seção de kernel.
@@ -166,7 +165,7 @@ pub struct State {
     pub seen_syscalls: BTreeSet<String>,
     /// Exports da ntdll mapeada (nome → VA de usuário).
     pub ntdll_exports: Option<BTreeMap<String, u64>>,
-    /// `S.ntdllModule.imageBase`.
+    /// Base da imagem da ntdll mapeada.
     pub ntdll_image_base: u64,
     /// Imagens nativas mapeadas por NtMapViewOfSection (nome minúsculo →
     /// exports), registradas pela vista de imagem.
@@ -416,7 +415,7 @@ pub fn probe_user_read(va: u64, size: u64) -> bool {
 
 // ---- tabela de handles do processo ---------------------------------------
 
-/// Corpo nativo de um objeto (`nativeOpen || nativeBody`).
+/// Corpo nativo de um objeto.
 #[derive(Clone)]
 pub struct NativeBody {
     pub pointer: u64,
@@ -427,15 +426,15 @@ pub struct NativeBody {
     pub dereference: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// O `obj` do original: os objetos vivem no kernel; o usuário só vê HANDLEs
+/// Objeto de usuário: os objetos vivem no kernel; o usuário só vê HANDLEs
 /// opacos.
 pub trait UserObject: Send + Sync {
-    /// `obj.type`.
+    /// Tipo do objeto.
     fn kind(&self) -> &'static str;
     fn native_body(&self) -> Option<NativeBody> {
         None
     }
-    /// `obj.nativeOpen`: a abertura por ponteiro já passou pelos callbacks.
+    /// A abertura por ponteiro já passou pelos callbacks.
     fn opened_natively(&self) -> bool {
         false
     }
@@ -446,14 +445,14 @@ pub trait UserObject: Send + Sync {
     fn callback_data(&self) -> ObjectData {
         ObjectData { native_pointer: self.native_body().map_or(0, |body| body.pointer), ..ObjectData::default() }
     }
-    /// `onEachHandleOpen`; `Ok(true)` quando o gancho existe e reteve algo.
+    /// A cada handle aberto; `Ok(true)` quando o gancho existe e reteve algo.
     fn on_each_handle_open(&self) -> Result<bool, KernelError> {
         Ok(false)
     }
     fn on_each_handle_close(&self) {}
     /// O último handle da descrição foi fechado.
     fn on_handle_closed(&self) {}
-    /// `releaseUserObject` do NtClose (chave, dispositivo ou `close`).
+    /// Liberação no NtClose (chave, dispositivo ou `close`).
     fn release(&self) {}
     /// Caminho usado como raiz de OBJECT_ATTRIBUTES (chave, diretório ou
     /// diretório aberto como arquivo).
@@ -468,11 +467,11 @@ pub trait UserObject: Send + Sync {
     fn namespace_node(&self) -> Option<crate::ntos::ob::object_manager::NodeId> {
         None
     }
-    /// Objeto esperável (`obj.pointer` das esperas Nt).
+    /// Objeto esperável (o ponteiro das esperas Nt).
     fn wait_pointer(&self) -> Option<u64> {
         None
     }
-    /// Política do objeto (`entry.security`).
+    /// Política do objeto.
     fn security(&self) -> Option<crate::ntos::se::model::SecurityPolicy> {
         None
     }
@@ -602,8 +601,8 @@ fn insert_user_handle(entry: &Arc<UserHandle>) -> Result<u32, KernelError> {
 }
 
 /// Os valores de todos os handles do processo.
-/// `S.userHandles.clear()`: reinício da tabela por processo (os handles
-/// já foram fechados pela liberação dos recursos).
+/// Reinício da tabela por processo (os handles já foram fechados pela
+/// liberação dos recursos).
 pub fn clear_user_handles() {
     HANDLES.lock().clear();
 }
@@ -617,7 +616,7 @@ pub fn get_user_handle(value: u64) -> Option<Arc<UserHandle>> {
     HANDLES.lock().get(&(value as u32)).cloned()
 }
 
-/// A descrição aberta compartilhada (`userHandleObject`).
+/// A descrição aberta compartilhada.
 pub fn user_handle_object(entry: &UserHandle) -> Arc<dyn UserObject> {
     entry.object.clone()
 }
@@ -648,8 +647,8 @@ pub fn duplicate_user_handle(entry: &UserHandle, access: u32, attributes: u32) -
     })
 }
 
-/// Fecha o handle; `release` libera o objeto na última referência (o
-/// `releaseUserObject` do NtClose), `force` ignora a proteção individual.
+/// Fecha o handle; `release` libera o objeto na última referência,
+/// `force` ignora a proteção individual.
 pub fn close_user_handle(value: u64, release: bool, force: bool) -> Result<u32, KernelError> {
     let handle = value as u32;
     let Some(entry) = HANDLES.lock().get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };

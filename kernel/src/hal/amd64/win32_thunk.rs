@@ -1,4 +1,4 @@
-//! Trampolins dos exports do kernel — `hal/win32/win32thunk.asm`.
+//! Trampolins dos exports do kernel.
 //!
 //! O IAT de um PE carregado recebe o endereço destes stubs. Cada stub de dez
 //! bytes marca seu id (`mov eax, id` + `jmp rel32` forçado) e cai no
@@ -312,8 +312,8 @@ extern "C" {
     fn opennt_kernel_context_run(context: *mut u64);
 }
 
-/// `os.runKernelContext`: executa o contexto nativo (alinhado a 16) até a
-/// próxima saída e devolve o id dela (32 bits baixos de RAX).
+/// Executa o contexto nativo (alinhado a 16) até a próxima saída e devolve o
+/// id dela (32 bits baixos de RAX).
 pub fn run_kernel_context(context: u64) -> u32 {
     assert!(context != 0 && context & 15 == 0, "kernel context must be 16-byte aligned");
     unsafe {
@@ -322,7 +322,7 @@ pub fn run_kernel_context(context: u64) -> u32 {
     }
 }
 
-/// `os.initKernelContextFx`: estado FX corrente na área FXSAVE do quadro.
+/// Estado FX corrente na área FXSAVE do quadro.
 pub fn init_kernel_context_fx(context: u64) {
     assert!(context != 0 && context & 15 == 0, "kernel context must be 16-byte aligned");
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) context + 0x100) };

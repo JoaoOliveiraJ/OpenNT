@@ -2,7 +2,7 @@
 //!
 //! Layouts NT x64 distintos por classe (phnt/ntmmapi.h,
 //! MEMORY_INFORMATION_CLASS). `describe` também serve ao serviço de kernel
-//! (`mm/query-virtual`), com o contexto de regiões do processo alvo.
+//! (`mm/query_virtual`), com o contexto de regiões do processo alvo.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -15,7 +15,7 @@ use crate::ntos::mm::guest_memory as guest;
 
 const PAGE: u64 = 0x1000;
 
-/// Regiões consultadas (`context` do original; o padrão é o estado `S`).
+/// Regiões consultadas (o padrão é o `State` corrente).
 #[derive(Clone, Default)]
 pub struct Context {
     pub user_regions: Vec<Region>,
@@ -114,7 +114,7 @@ pub fn describe(va: u64, context: &Context) -> Info {
     Info { base, size: end - base, allocation_base: region.base(), allocation_protect, protect: if committed { protection } else { 0 }, state: if committed { 0x1000 } else { 0x2000 }, kind, region: Some(region), image }
 }
 
-/// `NativeFileName.fromView`: arquivo da seção, senão o nome nativo.
+/// Nome de uma vista: arquivo da seção, senão o nome nativo.
 pub fn view_name(region: &Region) -> Option<String> {
     if let Some(file) = region.section().and_then(|section| section.file.clone()) {
         return file.nt_path().filter(|name| name.starts_with('\\'));
@@ -122,8 +122,8 @@ pub fn view_name(region: &Region) -> Option<String> {
     region.name().filter(|name| name.starts_with('\\'))
 }
 
-/// Páginas confirmadas da região (`committedPages.size`), ou a região
-/// inteira quando confirmada sem rastreio por página.
+/// Páginas confirmadas da região, ou a região inteira quando confirmada sem
+/// rastreio por página.
 pub fn committed_bytes(info: &Info) -> u64 {
     let Some(region) = &info.region else { return 0 };
     match region.committed_pages() {

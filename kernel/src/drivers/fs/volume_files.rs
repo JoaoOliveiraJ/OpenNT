@@ -136,7 +136,7 @@ pub struct VolumeFile {
     paths: SpinLock<Paths>,
     volume: Arc<Ntfs>,
     state: SpinLock<FileState>,
-    /// `pendingDelete`/`deleted`, compartilhadas com o `file-lifetime`.
+    /// `pending_delete`/`deleted`, compartilhadas com `io::file::lifetime`.
     pub marks: Arc<FileMarks>,
     /// Descrições abertas pelo processo (`opens`), por id.
     pub opens: SpinLock<Vec<u64>>,
@@ -313,7 +313,7 @@ pub fn fixed_volume() -> Option<&'static Ntfs> {
     volume_entry().map(|(_, fixed)| fixed)
 }
 
-/// Descarta a entrada do cache (`cache.delete`).
+/// Descarta a entrada do cache.
 pub fn forget(volume_path: &str) {
     FILES.lock().remove(&volume_path.to_uppercase());
 }

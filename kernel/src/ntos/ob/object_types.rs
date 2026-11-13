@@ -2,8 +2,8 @@
 //!
 //! Layout do PDB: corpo de 0xD8 bytes, TypeInfo em +0x40 com tamanho 0x78.
 //! Ponteiros exportados, verificações de tipo e contadores usam a mesma
-//! identidade (o ponteiro do corpo). ObCreateObjectType (o `obtype.c` do NT)
-//! e as células exportadas com ponteiros de tipo também moram aqui.
+//! identidade (o ponteiro do corpo). ObCreateObjectType e as células
+//! exportadas com ponteiros de tipo também moram aqui.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

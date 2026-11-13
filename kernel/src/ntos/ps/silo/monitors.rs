@@ -130,7 +130,7 @@ pub fn start(pointer: u64) -> Result<u32, KernelError> {
         if guest::read8(pointer + 0x11) == 0 && !existing().is_empty() {
             return Ok(NOT_SUPPORTED);
         }
-        // O original deixa monitores só de término fora da lista.
+        // Monitores só de término ficam fora da lista.
         if guest::read64(pointer + 0x18) == 0 {
             return Ok(0);
         }

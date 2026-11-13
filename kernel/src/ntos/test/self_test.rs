@@ -1,6 +1,6 @@
 //! Autoteste do kernel (fase 1).
 //!
-//! Exercita os módulos já transcritos: MemoryFileSystem, chamadas numeradas,
+//! Exercita os módulos já implementados: MemoryFileSystem, chamadas numeradas,
 //! programa embutido, memória, escalonador, timer do LAPIC, IPC e o registro
 //! de serviços do nanokernel. Imprime `SELFTEST_OK` na serial; uma falha
 //! imprime `SELFTEST FALHOU: <motivo>` e para a CPU.

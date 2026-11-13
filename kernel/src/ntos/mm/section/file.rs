@@ -1,9 +1,9 @@
 //! Arquivo capturado por uma seção.
 //!
-//! Captura o arquivo aberto, nunca uma nova busca inferida pelo nome. A
-//! seção é dona desta referência até a última vista, handle ou ponteiro.
-//! O ramo de handles de arquivo de usuário (`selected.userEntry`) entra com
-//! `ps/user/files`; hoje o resolvedor devolve handles nativos e de kernel.
+//! Captura o arquivo aberto, nunca uma nova busca inferida pelo nome. A seção
+//! é dona desta referência até a última vista, handle ou ponteiro. O ramo de
+//! handles de arquivo de usuário entra com `ps/user/files`; hoje o resolvedor
+//! devolve handles nativos e de kernel.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -20,7 +20,7 @@ use crate::ntos::ob::objects::file::{self as file_objects, FileSource};
 use crate::ntos::ps::user::sections::SectionFile;
 use crate::rtl::{KernelError, SpinLock};
 
-/// Identidade por objeto (o WeakMap do original) + caminho em minúsculas.
+/// Identidade por objeto + caminho em minúsculas.
 static IDENTITIES: SpinLock<(BTreeMap<usize, u64>, u64)> = SpinLock::new((BTreeMap::new(), 0));
 
 fn key(object: usize, path: &str) -> String {

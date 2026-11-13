@@ -265,7 +265,7 @@ pub fn exists(pointer: u64) -> bool {
     TOKENS.lock().records.contains_key(&pointer)
 }
 
-/// Cópia do registro (o `Tokens.get` do original devolvia o objeto vivo).
+/// Cópia do registro, não o objeto vivo.
 pub fn get(pointer: u64) -> Option<Token> {
     TOKENS.lock().records.get(&pointer).cloned()
 }

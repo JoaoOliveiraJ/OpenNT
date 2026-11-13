@@ -95,7 +95,7 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
             return Ok(status);
         }
         if name.scope == 5 {
-            // O anúncio do conteúdo corrente ignora o status, como o original.
+            // O anúncio do conteúdo corrente ignora o status.
             push_lock::acquire_shared(current.lock_pointer(), 0)?;
             let data = if current.data_pointer() > 1 { current.data_pointer() } else { 0 };
             wnf_physical::push(0, name.decoded_name ^ wnf_name::NAME_MASK, current.change_stamp(), if data != 0 { data + 16 } else { 0 }, if data != 0 { guest::read32(data + 8) } else { 0 });

@@ -62,7 +62,7 @@ pub mod irp_mn {
     pub const QUERY_POWER: u8 = 3;
 }
 
-/// Status internos do I/O Manager (com sinal, como no original).
+/// Status internos do I/O Manager (com sinal).
 pub mod status {
     pub const SUCCESS: i32 = 0;
     pub const NOT_FOUND: i32 = -2;
@@ -107,7 +107,7 @@ pub fn forget_completion(irp: u64) {
 pub fn init() -> Result<(), KernelError> {
     object_manager::create_directory("\\Driver")?;
     power_manager::register_power_irp_dispatcher(dispatch_native_power_irp);
-    // IoTimers vencidos no laço ocioso, como o runKernelTasks do NT.
+    // IoTimers vencidos no laço ocioso.
     dispatcher::register_completion_pump(super::threads::io_timer::check_io_timers);
     Ok(())
 }
@@ -152,7 +152,7 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
 pub fn iof_complete_request(packet: u64) -> i32 {
     let stack_count = guest::read8(packet + irp::STACK_COUNT) as u32;
     let mut current_location = guest::read8(packet + irp::CURRENT_LOCATION) as u32;
-    // CurrentStackLocation e DeviceObject são lidos como DWORD, como no original.
+    // CurrentStackLocation e DeviceObject são lidos como DWORD.
     let mut current_stack = guest::read32(packet + irp::CURRENT_STACK_LOCATION) as u64;
     let mut reviewed = current_stack;
     current_location += 1;
@@ -282,7 +282,7 @@ pub fn build_device_io_control_request(code: u32, device: u64, input: u64, input
 }
 
 /// Entrega um power IRP já construído (PoCallDriver/PoStartNextPowerIrp).
-/// DriverObject é lido como DWORD, como no original.
+/// DriverObject é lido como DWORD.
 pub fn dispatch_native_power_irp(device: u64, packet: u64) -> u32 {
     let driver = guest::read32(device + device_object::DRIVER_OBJECT) as u64;
     let handler = guest::read64(driver + driver_object::MAJOR_FUNCTION + irp_mj::POWER as u64 * 8);
@@ -322,7 +322,7 @@ pub struct IoParams {
     pub user_event: u64,
 }
 
-/// Pedido de I/O (o `ioRequest` do original).
+/// Pedido de I/O.
 #[derive(Clone, Default)]
 pub struct IoRequest {
     pub id: u64,
@@ -420,7 +420,7 @@ use crate::ntos::ob::objects::file::FileCallbacks;
 use crate::ntos::ob::object_manager::NodeId;
 use crate::ntos::rtl::guest_strings;
 
-/// Rotina de despacho de um driver do kernel (o `dispatch[IRP_MJ_x]` JS).
+/// Rotina de despacho de um driver do kernel, por IRP_MJ_x.
 pub type DispatchRoutine = fn(NodeId, &mut IoRequest);
 
 struct DriverEntry {
@@ -429,7 +429,7 @@ struct DriverEntry {
     devices: Vec<NodeId>,
 }
 
-/// Dados de um `\Device\<nome>` (o `device.data` do original).
+/// Dados de um `\Device\<nome>`.
 #[derive(Clone, Default)]
 pub struct DeviceEntry {
     pub driver: Option<NodeId>,

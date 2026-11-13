@@ -1,4 +1,4 @@
-//! Configuration Manager (Cm) — `system32/ntos/cm/`.
+//! Configuration Manager (Cm).
 //!
 //! Hive em memória, objetos de chave, serviços e provedores de boot.
 

@@ -1,10 +1,9 @@
-//! Runtime library do executive (Rtl) — `system32/ntos/rtl/`.
+//! Runtime library do executive (Rtl).
 //!
 //! Fase 3: strings, AVL, bitmap, qsort, SHA-256, imagem PE, UTF-8, CRT e
-//! maiúsculas NLS. `native-context`, `exceptions` e `unwind` acompanham a
+//! maiúsculas NLS. `native_context`, `exceptions` e `unwind` acompanham a
 //! execução de código nativo em contexto próprio (fase 6); os recursos de
-//! imagens (`resource-*`, `find-resource`) e a página ANSI dependem do
-//! volume (fase 4).
+//! imagens (`resource::*`) e a página ANSI dependem do volume (fase 4).
 
 pub mod avl;
 pub mod bitmap;

@@ -86,7 +86,7 @@ struct Thread {
     initial_request: Option<Wait>,
     wait: Option<Wait>,
     callbacks: Vec<Frame>,
-    /// Falha de uma sondagem feita pelo escalonador (prepareDispatch).
+    /// Falha de uma sondagem feita pelo escalonador (`prepare_dispatch`).
     failure: Option<KernelError>,
 }
 
@@ -386,7 +386,7 @@ fn begin_wait(name: &str, args: &[u64; 14]) -> Result<Option<Wait>, KernelError>
     }
     if let Some((mode, enter_critical)) = resource_mode(name) {
         // As variantes com região crítica têm um só argumento e sempre esperam
-        // (o original repassava o RDX residual como Wait).
+        // (sem ler o RDX residual como Wait).
         let wait = enter_critical || args[1] & 0xFF != 0;
         return boxed(Box::new(resource::begin(args[0], mode, wait, enter_critical)?));
     }
@@ -587,7 +587,7 @@ fn step(thread: &Shared) -> Result<bool, KernelError> {
     Ok(thread.lock().terminated)
 }
 
-/// prepareDispatch: o escalonador sonda a espera no contexto da thread antes
+/// O escalonador sonda a espera no contexto da thread antes
 /// da seleção por prioridade; o resultado fica no contexto salvo.
 fn prepare_dispatch(thread: &Shared) -> bool {
     let saved = enter(thread);

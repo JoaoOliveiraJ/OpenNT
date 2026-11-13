@@ -26,7 +26,7 @@ pub mod nano;
 pub mod ntos;
 pub mod shell;
 
-/// Versão exibida no banner (mesma do `Kernel.VERSION` do original).
+/// Versão exibida no banner.
 pub const VERSION: &str = "0.6.0";
 
 extern "C" {
@@ -60,7 +60,7 @@ pub extern "C" fn kernel_main() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Equivalente ao host_panic: mensagem na serial e halt.
+    // Pânico: mensagem na serial e halt.
     hal::serial::puts("\n*** PANIC: ");
     rtl::print::write_args(format_args!("{}", info));
     hal::serial::puts(" ***\n");

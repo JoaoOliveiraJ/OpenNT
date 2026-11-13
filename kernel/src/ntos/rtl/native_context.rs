@@ -2,9 +2,9 @@
 //!
 //! Liga o gateway nativo ao CONTEXT. Uma transferência de controle é
 //! sinalizada durante o despacho (um `KernelError` marcado, propagado pelos
-//! `?` como o sinal do original) e só se efetiva depois que os frames Rust
-//! retornam ao trampolim. Os callbacks nativos rodam em contexto e pilha
-//! próprios (`hal::amd64::win32_thunk::run_kernel_context`), com o despachante
+//! `?`) e só se efetiva depois que os frames Rust retornam ao trampolim. Os
+//! callbacks nativos rodam em contexto e pilha próprios
+//! (`hal::amd64::win32_thunk::run_kernel_context`), com o despachante
 //! registrado depois da montagem da tabela de exports.
 
 use alloc::format;

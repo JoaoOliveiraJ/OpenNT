@@ -51,8 +51,8 @@ fn mutant_of_node(node: NodeId) -> Option<Arc<MutantObject>> {
     MUTANTS.lock().get(&pointer).cloned()
 }
 
-/// Mutante de um handle `mutant` (sem checagem de acesso, como o original
-/// para NtReleaseMutant).
+/// Mutante de um handle `mutant` (sem checagem de acesso para
+/// NtReleaseMutant).
 fn mutant_of_handle(handle: u64) -> Result<(Arc<state::UserHandle>, u64), u32> {
     let Some(entry) = state::get_user_handle(handle) else { return Err(0xC000_0008) };
     if entry.kind() != "mutant" {

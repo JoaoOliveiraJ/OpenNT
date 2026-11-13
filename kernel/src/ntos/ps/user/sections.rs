@@ -52,7 +52,7 @@ fn executable(protect: u32) -> bool {
     protect & 0xF0 != 0
 }
 
-/// Arquivo que sustenta uma seção (`section-file`).
+/// Arquivo que sustenta uma seção (`mm/section/file`).
 pub trait SectionFile: Send + Sync {
     /// Identidade que compartilha a control area entre seções do arquivo.
     fn identity(&self) -> Option<String> {
@@ -73,13 +73,13 @@ pub trait SectionFile: Send + Sync {
     fn nt_path(&self) -> Option<String> {
         None
     }
-    /// Nome-base do arquivo (`file.baseName`).
+    /// Nome-base do arquivo.
     fn base_name(&self) -> Option<String> {
         None
     }
 }
 
-/// Paginação de sistema de uma control area (`system-view-paging`).
+/// Paginação de sistema de uma control area (`mm/system_view_paging`).
 pub trait AreaPaging: Send + Sync {
     fn materialize(&self, section: &Arc<Section>) -> Result<(), KernelError>;
     fn release(&self);
@@ -223,7 +223,7 @@ pub struct ViewMut {
     pub page_protects: BTreeMap<u64, u32>,
     pub retirement: Option<Retirement>,
     pub unmapped: bool,
-    /// Retenções de leitura (`secured-views`).
+    /// Retenções de leitura (`mm/section/secured_views`).
     pub secured_reads: Vec<u64>,
     pub system_paging: bool,
     /// Falha de page-in vira STATUS_IN_PAGE_ERROR em vez de bugcheck.

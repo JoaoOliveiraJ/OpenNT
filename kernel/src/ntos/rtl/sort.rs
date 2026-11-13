@@ -40,8 +40,8 @@ pub fn sort_elements(base: u64, count: u64, element_size: u64, comparator: u64) 
         }
     };
     // Mediana de três, seleção para intervalos curtos; o intervalo maior é
-    // adiado, limitando a pilha a O(log n). Índices com sinal, como os
-    // BigInt do original, para os decrementos abaixo de `first`.
+    // adiado, limitando a pilha a O(log n). Índices com sinal, para os
+    // decrementos abaixo de `first`.
     let mut pending = vec![(0i64, count as i64 - 1)];
     while let Some((mut first, mut last)) = pending.pop() {
         loop {

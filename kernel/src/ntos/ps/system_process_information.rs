@@ -5,7 +5,7 @@
 //! do chamador; o dimensionamento nunca publica uma lista parcial. A amostra
 //! de memória e de handles do processo de usuário corrente vem do estado de
 //! modo usuário (provedor instalado pela fase 7); sem ele os contadores de
-//! memória ficam zerados, como o original faz para os demais processos.
+//! memória ficam zerados, como para os demais processos.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

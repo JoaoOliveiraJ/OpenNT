@@ -7,7 +7,7 @@
 use super::spin_lock;
 use crate::ntos::mm::guest_memory as guest;
 
-/// SINGLE_LIST com Depth em +8 e Sequence em +0xA (como o original).
+/// SINGLE_LIST com Depth em +8 e Sequence em +0xA.
 fn push_entry(head: u64, entry: u64) -> u64 {
     let previous = guest::read64(head);
     guest::write64(entry, previous);

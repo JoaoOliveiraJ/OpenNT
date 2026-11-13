@@ -1,4 +1,4 @@
-//! Object Manager (Ob) — `system32/ntos/ob/`.
+//! Object Manager (Ob).
 
 pub mod callbacks;
 pub mod handle_ids;

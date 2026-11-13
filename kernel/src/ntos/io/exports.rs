@@ -401,7 +401,7 @@ pub mod attached_device {
 }
 
 pub mod convert_file_handle {
-    //! IoConvertFileHandleToKernelHandle — `ntos/io/convert-file-handle`; falha
+    //! IoConvertFileHandleToKernelHandle — `ntos/io/file/convert_handle`; falha
     //! interna interrompe o sistema.
 
     use crate::ntos::init::exports::{Call, Group};
@@ -443,7 +443,7 @@ pub static VPB_SPIN_LOCK_GROUP: Group = Group {
 };
 
 pub mod disk_device {
-    //! IoGetDiskDeviceObject — `ntos/io/volume-parameters`; falha interna
+    //! IoGetDiskDeviceObject — `ntos/io/volume_parameters`; falha interna
     //! interrompe o sistema.
 
     use crate::ntos::init::exports::{Call, Group};
@@ -478,7 +478,7 @@ pub mod enumerate_devices {
 }
 
 pub mod initial_stack {
-    //! IoGetInitialStack — `ntos/io/initial-stack`.
+    //! IoGetInitialStack — `ntos/io/small`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::small::initial_stack;
@@ -526,7 +526,7 @@ pub mod set_completion {
 }
 
 pub mod thread_activity_exports {
-    //! IoSetActivityIdThread — `ntos/io/thread-activity`.
+    //! IoSetActivityIdThread — `ntos/io/threads`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::threads::thread_activity;
@@ -540,7 +540,7 @@ pub mod thread_activity_exports {
 }
 
 pub mod volume_dos_name {
-    //! IoVolumeDeviceToDosName — `ntos/io/volume-dos-name`.
+    //! IoVolumeDeviceToDosName — `ntos/io/volume_dos_name`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::volume_dos_name;
@@ -584,7 +584,7 @@ pub mod remove_completion {
 }
 
 pub mod read_file {
-    //! NtReadFile — adaptador da ABI nativa de `ntos/io/read-file`.
+    //! NtReadFile — adaptador da ABI nativa de `ntos/io/file/read`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::file::read as read_file;
@@ -598,7 +598,7 @@ pub mod read_file {
 }
 
 pub mod write_file {
-    //! NtWriteFile — adaptador da ABI nativa de `ntos/io/write-file`.
+    //! NtWriteFile — adaptador da ABI nativa de `ntos/io/file/write`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::file::write as write_file;
@@ -612,7 +612,7 @@ pub mod write_file {
 }
 
 pub mod query_file {
-    //! NtQueryInformationFile — adaptador da ABI nativa de `ntos/io/query-file`.
+    //! NtQueryInformationFile — adaptador da ABI nativa de `ntos/io/file/query`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::file::query as query_file;
@@ -626,7 +626,7 @@ pub mod query_file {
 }
 
 pub mod delete_file {
-    //! ZwDeleteFile — `ntos/io/delete-file`; o Zw força KernelMode durante todo o
+    //! ZwDeleteFile — `ntos/io/file/delete`; o Zw força KernelMode durante todo o
     //! serviço e conserva o PreviousMode anterior.
 
     use crate::ntos::init::exports::{Call, Group};
@@ -642,7 +642,7 @@ pub mod delete_file {
 }
 
 pub mod device_control {
-    //! ZwDeviceIoControlFile — `ntos/io/device-control`.
+    //! ZwDeviceIoControlFile — `ntos/io/device_control`.
 
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::io::device_control;

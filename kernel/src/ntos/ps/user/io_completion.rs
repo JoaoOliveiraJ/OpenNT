@@ -2,7 +2,7 @@
 //!
 //! Pacotes em FIFO, consumidores em LIFO, contextos nativos de 64 bits,
 //! associação de threads e limite de consumidores executáveis.
-//! NtRemoveIoCompletionEx usa a retirada em lote de `io/remove-completion`.
+//! NtRemoveIoCompletionEx usa a retirada em lote de `io/completion/remove`.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -119,7 +119,7 @@ pub struct RemoveOptions {
     pub entries: Vec<Arc<UserHandle>>,
     pub poll: Option<Box<dyn FnMut() -> Option<u32> + Send>>,
     pub cleanup: Option<Box<dyn FnOnce() + Send>>,
-    /// `timeoutMs` explícito; None deriva do ponteiro.
+    /// Prazo explícito em ms; None deriva do ponteiro.
     pub timeout_ms: Option<Option<u64>>,
 }
 

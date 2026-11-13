@@ -1,3 +1,3 @@
-//! Drivers de armazenamento — `system32/drivers/storage/`.
+//! Drivers de armazenamento.
 
 pub mod ata_pio;

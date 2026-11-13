@@ -41,7 +41,7 @@ pub fn unicode_string_to_integer(string: u64, base: u32, value_out: u64) -> u32 
             base = 10;
         }
     }
-    // parseInt: o prefixo válido mais longo; nenhum dígito = inválido.
+    // O prefixo válido mais longo; nenhum dígito = inválido.
     let digits: String = text.chars().take_while(|character| character.is_digit(base.clamp(2, 36))).collect();
     if digits.is_empty() || !(2..=36).contains(&base) {
         return STATUS_INVALID_PARAMETER;
