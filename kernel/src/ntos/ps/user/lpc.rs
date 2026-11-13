@@ -20,6 +20,7 @@ use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, PortMessage, PortView, RemotePortView, SecurityQualityOfService, UnicodeString};
 
 static NEXT_MESSAGE_ID: AtomicU32 = AtomicU32::new(1);
 static SERVICES: SpinLock<BTreeMap<NodeId, Arc<dyn Service>>> = SpinLock::new(BTreeMap::new());
@@ -33,39 +34,50 @@ pub fn register(path: &str, service: Arc<dyn Service>) -> Result<NodeId, KernelE
     Ok(node)
 }
 
-fn copy_in(address: u64, size: u64) -> Vec<u8> {
-    (0..size).map(|index| guest::read8(address + index)).collect()
+/// Cópia sondada de um buffer de usuário (já validado por `probe_user_*`).
+fn copy_in(address: u64, size: u64) -> Result<Vec<u8>, KernelError> {
+    guest::try_read_bytes(address, size as usize)
+}
+
+/// NtConnectPort: uma falha de sonda em qualquer captura devolve
+/// ACCESS_VIOLATION.
+#[allow(clippy::too_many_arguments)]
+pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64, max_length: u64, info: u64, info_length: u64) -> Result<u32, KernelError> {
+    state::guarded(|| connect_captured(out, name, qos, client_view, server_view, max_length, info, info_length))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64, max_length: u64, info: u64, info_length: u64) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) || !state::probe_user_read(name, 16) || !state::probe_user_read(qos, 12) {
+fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64, max_length: u64, info: u64, info_length: u64) -> Result<u32, KernelError> {
+    if !state::probe_user_write(out, 8) || !state::probe_user_read(name, UnicodeString::SIZE) || !state::probe_user_read(qos, SecurityQualityOfService::SIZE) {
         return Ok(0xC000_0005);
     }
-    let name_bytes = guest::read16(name) as u64;
-    let name_buffer = guest::read64(name + 8);
+    let port_name = state::user_struct::<UnicodeString>(name)?;
+    let name_bytes = port_name.length.probe_get()? as u64;
+    let name_buffer = port_name.buffer.probe_get()?;
     if name_bytes % 2 != 0 || name_bytes > 1024 || !state::probe_user_read(name_buffer, name_bytes) {
         return Ok(0xC000_000D);
     }
-    let path = state::read_user_wide_string(name_buffer, name_bytes / 2);
+    let path = state::try_read_user_wide_string(name_buffer, name_bytes / 2)?;
     let Some(node) = object_manager::lookup(&path) else { return Ok(0xC000_0034) };
     if object_manager::node(node).is_none_or(|record| record.type_name != "Port") {
         return Ok(0xC000_0024);
     }
     // NtConnectPort captura o layout fixo; o cliente CSR da ntdll não
     // inicializa o membro Length.
-    if guest::read32(qos + 4) > 3 || guest::read8(qos + 8) > 1 || guest::read8(qos + 9) > 1 {
+    let quality = state::user_struct::<SecurityQualityOfService>(qos)?;
+    if quality.impersonation_level.probe_get()?.0 as u32 > 3 || quality.context_tracking_mode.probe_get()? > 1 || quality.effective_only.probe_get()? > 1 {
         return Ok(0xC000_000D);
     }
     let Some(service) = SERVICES.lock().get(&node).cloned() else { return Ok(0xC000_0024) };
     if info_length == 0 || !state::probe_user_write(info_length, 4) {
         return Ok(0xC000_0005);
     }
-    let size = guest::read32(info_length) as u64;
+    // ULONG *ConnectionInformationLength (entrada e saída).
+    let size = guest::try_read::<u32>(info_length)? as u64;
     if size > service.max_connection_info() as u64 {
         return Ok(0xC000_000D);
     }
-    if !state::probe_user_write(info, size) || (max_length != 0 && !state::probe_user_write(max_length, 4)) || (server_view != 0 && (!state::probe_user_write(server_view, 24) || guest::read32(server_view) != 24)) {
+    if !state::probe_user_write(info, size) || (max_length != 0 && !state::probe_user_write(max_length, 4)) || (server_view != 0 && (!state::probe_user_write(server_view, RemotePortView::SIZE) || state::user_struct::<RemotePortView>(server_view)?.length.probe_get()? != RemotePortView::SIZE as u32)) {
         return Ok(0xC000_0005);
     }
     let initial = PortState { service: Some(service.clone()), service_process: process::get_system_process(), port_flags: 0x3_0000, message_sequence: 1, port_context: 0, ..PortState::default() };
@@ -95,12 +107,13 @@ pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64
     };
     let result = connection.run(|| -> Result<u32, KernelError> {
         if client_view != 0 {
-            if !state::probe_user_write(client_view, 48) || guest::read32(client_view) != 48 {
+            if !state::probe_user_write(client_view, PortView::SIZE) || state::user_struct::<PortView>(client_view)?.length.probe_get()? != PortView::SIZE as u32 {
                 return Ok(0xC000_000D);
             }
+            let view = state::user_struct::<PortView>(client_view)?;
             // Handle de SECTION de dados do processo (não imagem), com
             // SECTION_MAP_READ|SECTION_MAP_WRITE.
-            let reference = match section_handles::reference(guest::read64(client_view + 8), Kind::Section, 6, 1) {
+            let reference = match section_handles::reference(view.section_handle.probe_get()?, Kind::Section, 6, 1) {
                 Ok(reference) => reference,
                 Err(0xC000_0022) => return Ok(0xC000_0022),
                 Err(_) => return Ok(0xC000_0008),
@@ -108,7 +121,7 @@ pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64
             let section = reference.section.clone().filter(|section| !section.is_image);
             let mapped = (|| -> Result<u32, KernelError> {
                 let Some(section) = section else { return Ok(0xC000_0008) };
-                let request = MapRequest { offset: guest::read32(client_view + 16) as u64, size: guest::read64(client_view + 24), protect: 4, ..MapRequest::default() };
+                let request = MapRequest { offset: view.section_offset.probe_get()? as u64, size: view.view_size.probe_get()?, protect: 4, ..MapRequest::default() };
                 for supervisor in [false, true] {
                     match sections::map(&section, &MapRequest { supervisor, ..request })? {
                         Ok(view) => connection.with(|state| state.views.push(view)),
@@ -124,7 +137,7 @@ pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64
             }
         }
         connection.set_started(true);
-        let result = match service.connect(&connection, &copy_in(info, size), None) {
+        let result = match service.connect(&connection, &copy_in(info, size)?, None) {
             Reply::Now(result) => result,
             Reply::Later(_) => return Err(KernelError::new("LPC service deferred a connection")),
         };
@@ -139,24 +152,28 @@ pub fn connect(out: u64, name: u64, qos: u64, client_view: u64, server_view: u64
         }
         if client_view != 0 {
             let (local, remote) = connection.with(|state| (state.views[0].clone(), state.views[1].clone()));
-            guest::write64(client_view + 24, local.size);
-            guest::write64(client_view + 32, local.base);
-            guest::write64(client_view + 40, remote.base);
+            let view = state::user_struct::<PortView>(client_view)?;
+            view.view_size.probe_set(local.size)?;
+            view.view_base.probe_set(local.base)?;
+            view.view_remote_base.probe_set(remote.base)?;
         }
         if server_view != 0 {
-            guest::write64(server_view + 8, 0);
-            guest::write64(server_view + 16, 0);
+            let view = state::user_struct::<RemotePortView>(server_view)?;
+            view.view_size.probe_set(0)?;
+            view.view_base.probe_set(0)?;
         }
         if max_length != 0 {
-            guest::write32(max_length, service.max_message_length());
+            guest::try_write::<u32>(max_length, service.max_message_length())?;
         }
         state::write_user_bytes(info, &result.data)?;
-        guest::write32(info_length, result.data.len() as u32);
+        guest::try_write::<u32>(info_length, result.data.len() as u32)?;
         let status = port_objects::publish(&connection, out, 0)?;
         if status != 0 {
             return Ok(status);
         }
-        connection.with(|state| state.port_context = guest::read64(out));
+        // O PortHandle publicado acima (lido de volta da saída sondada).
+        let handle = guest::try_read::<u64>(out)?;
+        connection.with(|state| state.port_context = handle);
         crate::debug_print!("[lpc] conectado {} pid={}", path, connection.process_id());
         Ok(0)
     });
@@ -186,13 +203,16 @@ pub fn request(handle: u64, input: u64, output: u64, capacity: u64) -> Result<(u
         if port.closed() {
             return Ok((0xC000_0037, None));
         }
-        if !state::probe_user_read(input, 40) {
+        if !state::probe_user_read(input, PortMessage::SIZE) {
             return Ok((0xC000_0005, None));
         }
-        let length = guest::read16(input + 2) as u64;
-        let data_length = guest::read16(input) as u64;
+        let header = (|| -> Result<(u64, u64, i16), KernelError> {
+            let message = state::user_struct::<PortMessage>(input)?;
+            Ok((message.u1.s1.total_length.probe_get()? as u16 as u64, message.u1.s1.data_length.probe_get()? as u16 as u64, message.u2.s2.data_info_offset.probe_get()?))
+        })();
+        let Ok((length, data_length, data_info_offset)) = header else { return Ok((0xC000_0005, None)) };
         let Some(service) = port.with(|state| state.service.clone()) else { return Ok((0xC000_0037, None)) };
-        if length < 40 || length > service.max_message_length() as u64 || data_length != length - 40 || guest::read16(input + 6) != 0 {
+        if length < PortMessage::SIZE || length > service.max_message_length() as u64 || data_length != length - PortMessage::SIZE || data_info_offset != 0 {
             return Ok((0xC000_0021, None));
         }
         if capacity < length {
@@ -201,7 +221,7 @@ pub fn request(handle: u64, input: u64, output: u64, capacity: u64) -> Result<(u
         if !state::probe_user_read(input, length) || !state::probe_user_write(output, length) {
             return Ok((0xC000_0005, None));
         }
-        let mut message = copy_in(input, length);
+        let Ok(mut message) = copy_in(input, length) else { return Ok((0xC000_0005, None)) };
         message[4..6].copy_from_slice(&1u16.to_le_bytes());
         message[8..16].copy_from_slice(&port.process_id().to_le_bytes());
         message[16..24].copy_from_slice(&process::get_current_thread_id().to_le_bytes());
@@ -239,9 +259,13 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, send_attr
     if input == 0 || output == 0 || length == 0 || !state::probe_user_write(length, 8) {
         return Ok(0xC000_000D);
     }
-    let (status, written) = request(handle, input, output, guest::read64(length))?;
+    // SIZE_T *BufferLength (entrada e saída, sondado acima).
+    let Ok(capacity) = guest::try_read::<u64>(length) else { return Ok(0xC000_0005) };
+    let (status, written) = request(handle, input, output, capacity)?;
     if let Some(written) = written {
-        guest::write64(length, written);
+        if guest::try_write::<u64>(length, written).is_err() {
+            return Ok(0xC000_0005);
+        }
     }
     Ok(status)
 }

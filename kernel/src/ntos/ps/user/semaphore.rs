@@ -4,13 +4,14 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Ksemaphore, NtStruct, SemaphoreBasicInformation};
 
 /// KSEMAPHORE de 0x20 bytes com o nome publicado.
 pub struct SemaphoreObject {
@@ -30,8 +31,10 @@ fn dispose(pointer: u64) {
 }
 
 fn publish(object: &Arc<SemaphoreObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
-    let flags = if attributes != 0 { guest::read32(attributes + 24) } else { 0 };
-    dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    state::guarded(|| {
+        let flags = user_object_attributes(attributes)?;
+        dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    })
 }
 
 fn semaphore_of_node(node: NodeId) -> Option<Arc<SemaphoreObject>> {
@@ -73,8 +76,11 @@ fn nt_create_semaphore(out: u64, access: u64, attributes: u64, initial: u64, rsp
             if object_manager::node(existing).is_none_or(|node| node.type_name != "Semaphore") {
                 return Ok(0xC000_0024);
             }
-            if guest::read32(attributes + 0x18) & 0x80 == 0 {
-                return Ok(0xC000_0035);
+            // OBJ_OPENIF.
+            match user_object_attributes(attributes) {
+                Ok(flags) if flags & 0x80 != 0 => {}
+                Ok(_) => return Ok(0xC000_0035),
+                Err(error) => return Ok(error.status),
             }
             let Some(object) = semaphore_of_node(existing) else { return Ok(0xC000_0024) };
             return publish(&object, out, access as u32, attributes, 0x4000_0000);
@@ -130,10 +136,8 @@ fn nt_release_semaphore(handle: u64, count: u64, previous: u64, _a4: u64, _rsp: 
     }
     Ok(match dispatcher::release_semaphore(pointer, count as u32 as i32 as i64) {
         Ok(old) => {
-            if previous != 0 {
-                guest::write32(previous, old);
-            }
-            0
+            // LONG *PreviousCount, sondado acima.
+            if previous != 0 && guest::try_write::<u32>(previous, old).is_err() { 0xC000_0005 } else { 0 }
         }
         Err(status) => status,
     })
@@ -152,18 +156,23 @@ fn nt_query_semaphore(handle: u64, class: u64, out: u64, length: u64, rsp: u64) 
     if returned != 0 && !state::probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, 8);
-    }
-    if length < 8 {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_write(out, 8) {
-        return Ok(0xC000_0005);
-    }
-    guest::write32(out, dispatcher::read_state(pointer));
-    guest::write32(out + 4, guest::read32(pointer + 0x18));
-    Ok(0)
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, SemaphoreBasicInformation::SIZE as u32)?;
+        }
+        if length < SemaphoreBasicInformation::SIZE {
+            return Ok(0xC000_0004);
+        }
+        if !state::probe_user_write(out, SemaphoreBasicInformation::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        // SAFETY: KSEMAPHORE vivo, retido pelo handle.
+        let semaphore = unsafe { Ksemaphore::at(pointer) };
+        let information = state::user_struct::<SemaphoreBasicInformation>(out)?;
+        information.current_count.probe_set(dispatcher::read_state(pointer) as i32)?;
+        information.maximum_count.probe_set(semaphore.limit.get())?;
+        Ok(0)
+    })
 }
 
 pub fn init() {

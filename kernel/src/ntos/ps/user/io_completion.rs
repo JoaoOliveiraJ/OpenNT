@@ -9,7 +9,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state::{self, probe_user_read, probe_user_write, UserHandle};
 use crate::ntos::io::completion::create as create_completion;
 use super::threads::{self, Wait};
@@ -18,6 +18,7 @@ use crate::ntos::ob::objects::dispatcher::UserDispatcher;
 use crate::ntos::ob::object_manager;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{IoCompletionBasicInformation, NtStruct};
 
 /// Handle de porta com o acesso exigido.
 pub fn resolve(handle: u64, access: u32) -> Result<(Arc<UserHandle>, Arc<Port>), u32> {
@@ -32,10 +33,10 @@ pub fn resolve(handle: u64, access: u32) -> Result<(Arc<UserHandle>, Arc<Port>),
     Ok((entry, port))
 }
 
-/// ULONG_PTR em duas palavras de 32 bits.
-pub fn write_words(out: u64, value: u64) {
-    guest::write32(out, value as u32);
-    guest::write32(out + 4, (value >> 32) as u32);
+/// ULONG_PTR de saída num buffer de usuário (sondado pelo chamador): um
+/// store de qword, nunca observado pela metade.
+pub fn write_words(out: u64, value: u64) -> Result<(), KernelError> {
+    guest::try_write::<u64>(out, value)
 }
 
 fn words(value: [u32; 2]) -> u64 {
@@ -62,7 +63,11 @@ fn nt_open_io_completion(out: u64, access: u64, attributes: u64, _a4: u64, _rsp:
     let Some(node) = object_manager::lookup(&parsed.path) else { return Ok(0xC000_0034) };
     let Some(snapshot) = object_manager::node(node).filter(|node| node.type_name == "IoCompletion") else { return Ok(0xC000_0024) };
     let Some(port) = snapshot.data.and_then(|data| completion_objects::port_of(data.native_pointer)) else { return Ok(0xC000_0024) };
-    completion_objects::publish(&port, out, access as u32, guest::read32(attributes + 24), 0, false)
+    let flags = match user_object_attributes(attributes) {
+        Ok(flags) => flags,
+        Err(error) => return Ok(error.status),
+    };
+    completion_objects::publish(&port, out, access as u32, flags, 0, false)
 }
 
 /// NtSetIoCompletion(handle, key, context, status, information na pilha).
@@ -100,17 +105,19 @@ fn nt_query_io_completion(handle: u64, class: u64, out: u64, length: u64, rsp: u
     if returned != 0 && !probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, 4);
-    }
-    if length != 4 {
-        return Ok(0xC000_0004);
-    }
-    if !probe_user_write(out, 4) {
-        return Ok(0xC000_0005);
-    }
-    guest::write32(out, port.with(|state| state.packets.len() as u32));
-    Ok(0)
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, IoCompletionBasicInformation::SIZE as u32)?;
+        }
+        if length != IoCompletionBasicInformation::SIZE {
+            return Ok(0xC000_0004);
+        }
+        if !probe_user_write(out, IoCompletionBasicInformation::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        state::user_struct::<IoCompletionBasicInformation>(out)?.depth.probe_set(port.with(|state| state.packets.len() as i32))?;
+        Ok(0)
+    })
 }
 
 /// Opções de quem reutiliza a retirada (pacotes de espera, worker factories).
@@ -191,10 +198,9 @@ fn nt_remove_io_completion(handle: u64, key: u64, context: u64, iosb: u64, rsp: 
     let deliver = Box::new(move |packets: &mut VecDeque<Packet>| {
         let mut packet = packets.pop_front()?;
         let (packet_key, packet_context, status, information) = packet.values();
-        write_words(key, packet_key);
-        write_words(context, packet_context);
-        guest::write64(iosb, status as u64);
-        write_words(iosb + 8, information);
+        // As saídas foram sondadas pelo `validate` logo antes; uma página
+        // desmapeada nesse meio tempo perde só a cópia do pacote.
+        let _ = write_words(key, packet_key).and_then(|()| write_words(context, packet_context)).and_then(|()| state::set_user_iosb(iosb, status as u32, information));
         Some(Packet { on_dequeue: packet.on_dequeue.take(), ..Packet::default() })
     });
     Ok(remove_entry(entry, port, state::stack_arg(rsp, 5), false, validate, deliver, RemoveOptions::default()))
@@ -213,7 +219,7 @@ fn nt_remove_io_completion_ex(handle: u64, out: u64, count: u64, removed: u64, r
     let raw = state::with(|state| state.service_raw_arguments);
     let (handle, out, removed) = if raw != 0 { (guest::read64(raw + 8), guest::read64(raw + 16), guest::read64(raw + 32)) } else { (handle, out, removed) };
     let consumer = threads::current().map(|thread| thread.pointer());
-    let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, guest::read64(rsp + 40), guest::read8(rsp + 48) != 0, 1, false, consumer)?;
+    let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6) as u8 != 0, 1, false, consumer)?;
     let request = Arc::new(crate::rtl::SpinLock::new(request));
     let (polled, cancelled) = (request.clone(), request);
     Ok(threads::wait_custom(Wait { poll: Some(Box::new(move || polled.lock().poll())), cleanup: Some(Box::new(move |_status| cancelled.lock().cancel())), ..Wait::default() }, 0, Some(None)))

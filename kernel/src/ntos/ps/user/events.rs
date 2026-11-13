@@ -8,13 +8,14 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{EventBasicInformation, NtStruct};
 
 /// O objeto evento do dono: KEVENT de 0x18 bytes, tipo e nome.
 pub struct EventObject {
@@ -63,8 +64,10 @@ pub fn create(pointer: u64, name: &str, event_type: u32, signaled: bool, attribu
 }
 
 fn publish(object: &Arc<EventObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
-    let flags = if attributes != 0 { guest::read32(attributes + 24) } else { 0 };
-    dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    state::guarded(|| {
+        let flags = user_object_attributes(attributes)?;
+        dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    })
 }
 
 /// Evento de um handle `event` do processo, com o corpo retido.
@@ -112,8 +115,11 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
             if object_manager::node(existing).is_none_or(|node| node.type_name != "Event") {
                 return Ok(0xC000_0024);
             }
-            if guest::read32(attributes + 0x18) & 0x80 == 0 {
-                return Ok(0xC000_0035);
+            // OBJ_OPENIF.
+            match user_object_attributes(attributes) {
+                Ok(flags) if flags & 0x80 != 0 => {}
+                Ok(_) => return Ok(0xC000_0035),
+                Err(error) => return Ok(error.status),
             }
             let Some(object) = event_of_node(existing) else { return Ok(0xC000_0024) };
             return publish(&object, out, access as u32, attributes, 0x4000_0000);
@@ -159,11 +165,10 @@ fn modify(handle: u64, previous: u64, operation: fn(u64) -> u32) -> u32 {
         Err(status) => return status,
     };
     let value = operation(object.pointer);
-    if previous != 0 {
-        guest::write32(previous, value);
-    }
+    // LONG *PreviousState, sondado acima.
+    let written = if previous != 0 { guest::try_write::<u32>(previous, value) } else { Ok(()) };
     release(&object);
-    0
+    if written.is_err() { 0xC000_0005 } else { 0 }
 }
 
 fn nt_set_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -192,18 +197,23 @@ fn nt_query_event(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> R
         if returned != 0 && !state::probe_user_write(returned, 4) {
             return 0xC000_0005;
         }
-        if returned != 0 {
-            guest::write32(returned, 8);
-        }
-        if length < 8 {
-            return 0xC000_0004;
-        }
-        if !state::probe_user_write(out, 8) {
+        if returned != 0 && guest::try_write::<u32>(returned, EventBasicInformation::SIZE as u32).is_err() {
             return 0xC000_0005;
         }
-        guest::write32(out, object.event_type);
-        guest::write32(out + 4, dispatcher::read_state(object.pointer));
-        0
+        if length < EventBasicInformation::SIZE {
+            return 0xC000_0004;
+        }
+        if !state::probe_user_write(out, EventBasicInformation::SIZE) {
+            return 0xC000_0005;
+        }
+        let written = state::user_struct::<EventBasicInformation>(out).and_then(|information| {
+            information.event_type.probe_set(object.event_type as i32)?;
+            information.event_state.probe_set(dispatcher::read_state(object.pointer) as i32)
+        });
+        match written {
+            Ok(()) => 0,
+            Err(error) => error.status,
+        }
     })();
     release(&object);
     Ok(status)

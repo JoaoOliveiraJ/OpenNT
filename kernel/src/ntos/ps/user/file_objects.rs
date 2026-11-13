@@ -18,8 +18,7 @@ use crate::ntos::io::file::lifetime::{self as file_lifetime, Entry};
 use crate::ntos::ob::objects::file::{self as file_objects, FileCallbacks, FileSource};
 use crate::ntos::ob::object_types;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::file_object;
+use crate::ntos::inc::types::{FileObject, NtStruct};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static OPEN_FILES: SpinLock<BTreeMap<u64, Weak<UserFile>>> = SpinLock::new(BTreeMap::new());
@@ -59,18 +58,20 @@ impl UserFile {
         self.file_object.load(Ordering::Acquire)
     }
 
+    /// O FILE_OBJECT nativo da descrição, quando já ligado.
+    fn native(&self) -> Option<&'static FileObject> {
+        // SAFETY: a descrição retém o FILE_OBJECT pela vida da abertura.
+        (self.file_object() != 0).then(|| unsafe { FileObject::at(self.file_object()) })
+    }
+
     /// CurrentByteOffset do FILE_OBJECT.
     pub fn position(&self) -> u64 {
-        match self.file_object() {
-            0 => 0,
-            pointer => guest::read64(pointer + file_object::CURRENT_BYTE_OFFSET),
-        }
+        self.native().map_or(0, |file| file.current_byte_offset.quad_part.get() as u64)
     }
 
     pub fn set_position(&self, value: u64) {
-        let pointer = self.file_object();
-        if pointer != 0 {
-            guest::write64(pointer + file_object::CURRENT_BYTE_OFFSET, value);
+        if let Some(file) = self.native() {
+            file.current_byte_offset.quad_part.set(value as i64);
         }
     }
 }
@@ -149,16 +150,18 @@ pub fn bind(entry: &Arc<UserFile>, destroy: Arc<dyn Fn() + Send + Sync>) -> Resu
     let file = &entry.file;
     let pointer = file_objects::create_source(Arc::new(UserFileSource { file: file.clone(), name: entry.nt_path.lock().clone() }))?;
     let result = (|| -> Result<(), KernelError> {
-        guest::write8(pointer + 0x4A, (entry.access & 1 != 0) as u8);
-        guest::write8(pointer + 0x4B, (entry.access & 6 != 0) as u8);
-        guest::write8(pointer + 0x4C, (entry.access & 0x1_0000 != 0) as u8);
-        for bit in 0..3 {
-            guest::write8(pointer + 0x4D + bit, ((entry.share >> bit) & 1) as u8);
+        // SAFETY: FILE_OBJECT recém-criado acima.
+        let file_object = unsafe { FileObject::at(pointer) };
+        file_object.read_access.set((entry.access & 1 != 0) as u8);
+        file_object.write_access.set((entry.access & 6 != 0) as u8);
+        file_object.delete_access.set((entry.access & 0x1_0000 != 0) as u8);
+        for (bit, shared) in [&file_object.shared_read, &file_object.shared_write, &file_object.shared_delete].into_iter().enumerate() {
+            shared.set(((entry.share >> bit) & 1) as u8);
         }
         let options = entry.options;
         let flags = (if options & 0x30 != 0 { 2 } else { 0 }) | (if options & 0x10 != 0 { 4 } else { 0 }) | (options & 8) | (if options & 2 != 0 { 0x10 } else { 0 }) | (if options & 0x1000 != 0 { 0x1_0000 } else { 0 });
-        guest::write32(pointer + file_object::FLAGS, flags);
-        guest::write8(pointer + 0x49, file.pending_delete() as u8);
+        file_object.flags.set(flags);
+        file_object.delete_pending.set(file.pending_delete() as u8);
         entry.file_object.store(pointer, Ordering::Release);
         file_objects::set_callbacks(pointer, FileCallbacks { cleanup: None, close: None, destroy: Some(destroy) })?;
         let marks = file.marks.clone();
@@ -180,9 +183,8 @@ pub fn update_delete_state(file: &VolumeFile) {
         opens.iter().filter_map(|id| registry.get(id).and_then(Weak::upgrade)).collect()
     };
     for entry in entries {
-        let pointer = entry.file_object();
-        if pointer != 0 {
-            guest::write8(pointer + 0x49, pending);
+        if let Some(file) = entry.native() {
+            file.delete_pending.set(pending);
         }
     }
 }

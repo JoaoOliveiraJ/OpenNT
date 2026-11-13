@@ -87,24 +87,28 @@ fn nt_initialize_nls_files(base: u64, locale: u64, casing_size: u64, version: u6
         Ok(view) => view,
         Err(status) => return Ok(status),
     };
-    guest::write64(base, view);
-    guest::write32(locale, DEFAULT_LOCALE);
-    // A ABI x64 atual deixa as saídas legadas zeradas: o casing é a seção
-    // independente do tipo 10 (PEB.UnicodeCaseTableData).
-    if casing_size != 0 {
-        guest::write64(casing_size, 0);
-    }
-    if version != 0 {
-        guest::write32(version, 0);
-    }
-    Ok(0)
+    // PVOID *BaseAddress, LCID *DefaultLocaleId, LARGE_INTEGER
+    // *DefaultCasingTableSize e ULONG *CurrentNLSVersion, sondados acima.
+    let written = guest::try_write::<u64>(base, view).and_then(|()| guest::try_write::<u32>(locale, DEFAULT_LOCALE)).and_then(|()| {
+        // A ABI x64 atual deixa as saídas legadas zeradas: o casing é a seção
+        // independente do tipo 10 (PEB.UnicodeCaseTableData).
+        if casing_size != 0 {
+            guest::try_write::<u64>(casing_size, 0)?;
+        }
+        if version != 0 {
+            guest::try_write::<u32>(version, 0)?;
+        }
+        Ok(())
+    });
+    Ok(if written.is_err() { 0xC000_0005 } else { 0 })
 }
 
 /// NtGetNlsSectionPtr(type, data, context, out*, size*).
 fn nt_get_nls_section_ptr(section_type: u64, data: u64, context: u64, out: u64, rsp: u64) -> Result<u32, KernelError> {
     let (section_type, data) = (section_type as u32, data as u32);
     let size = state::stack_arg(rsp, 5);
-    if !probe_user_write(out, 8) || !probe_user_write(size, 8) {
+    // SectionPointer (PVOID*) e SectionSize (ULONG*).
+    if !probe_user_write(out, 8) || !probe_user_write(size, 4) {
         return Ok(0xC000_0005);
     }
     if context != 0 {
@@ -126,25 +130,24 @@ fn nt_get_nls_section_ptr(section_type: u64, data: u64, context: u64, out: u64, 
         Ok(view) => view,
         Err(status) => return Ok(status),
     };
-    guest::write64(out, base);
-    guest::write64(size, view_size);
-    Ok(0)
+    let written = guest::try_write::<u64>(out, base).and_then(|()| guest::try_write::<u32>(size, view_size as u32));
+    Ok(if written.is_err() { 0xC000_0005 } else { 0 })
 }
 
 fn nt_query_default_locale(_user: u64, out: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if !probe_user_write(out, 4) {
         return Ok(0xC000_0005);
     }
-    guest::write32(out, DEFAULT_LOCALE);
-    Ok(0)
+    // LCID de saída (sondado acima).
+    Ok(if guest::try_write::<u32>(out, DEFAULT_LOCALE).is_err() { 0xC000_0005 } else { 0 })
 }
 
 fn nt_query_default_ui_language(out: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if !probe_user_write(out, 2) {
         return Ok(0xC000_0005);
     }
-    guest::write16(out, DEFAULT_UI_LANGUAGE as u16);
-    Ok(0)
+    // LANGID de saída (sondado acima).
+    Ok(if guest::try_write::<u16>(out, DEFAULT_UI_LANGUAGE as u16).is_err() { 0xC000_0005 } else { 0 })
 }
 
 pub fn init() {

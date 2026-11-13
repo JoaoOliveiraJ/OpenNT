@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use super::loader::{self, BytesSource, ImageRegion, Module};
 use super::state::{self, RegionKind, USER_ALLOC_BASE, USER_STRUCT_BASE};
@@ -25,6 +26,7 @@ use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions}
 use crate::ntos::ps::process::{self, Executable};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Context, LdrDataTableEntry, ListEntry, NtStruct, Peb, PebLdrData};
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 
@@ -242,7 +244,8 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     // A ntdll inicializa PEB.Ldr e carrega as dependências; o heap e o
     // runtime vêm antes dos DllMain.
     let peb = state::with(|state| state.current_peb_va);
-    guest::write64(peb + 0x18, 0);
+    // SAFETY: a PEB do processo em montagem, criada pelo kernel.
+    unsafe { Peb::at(peb) }.ldr.set(0);
     let context = memory::map_user_region(0x1000)?;
     let (start, initialize) = state::with(|state| {
         let exports = state.ntdll_exports.as_ref();
@@ -251,17 +254,20 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     if initialize == 0 || start == 0 {
         return Err(KernelError::new("ntdll sem inicializacao de processo"));
     }
-    guest::write32(context + 0x30, 0x10_000B); // CONTEXT_FULL
-    guest::write32(context + 0x34, 0x1F80);
-    guest::write16(context + 0x100, 0x37F);
-    guest::write32(context + 0x118, 0x1F80);
-    guest::write16(context + 0x38, 0x33);
-    guest::write16(context + 0x42, 0x2B);
-    guest::write32(context + 0x44, 0x202);
-    guest::write64(context + 0x80, image.entry_point);
-    guest::write64(context + 0x88, peb);
-    guest::write64(context + 0x98, stack_top);
-    guest::write64(context + 0xF8, start);
+    // CONTEXT inicial do LdrInitializeThunk, numa região recém-comprometida.
+    // SAFETY: a região acabou de ser mapeada pelo kernel.
+    let initial = unsafe { Context::at(context) };
+    initial.context_flags.set(0x10_000B); // CONTEXT_FULL
+    initial.mx_csr.set(0x1F80);
+    initial.flt_save.control_word.set(0x37F);
+    initial.flt_save.mx_csr.set(0x1F80);
+    initial.seg_cs.set(0x33);
+    initial.seg_ss.set(0x2B);
+    initial.e_flags.set(0x202);
+    initial.rcx.set(image.entry_point);
+    initial.rdx.set(peb);
+    initial.rsp.set(stack_top);
+    initial.rip.set(start);
     let previous = process::get_current_thread();
     process::set_current_thread(thread_pointer);
     notify_initial_images(process_pointer, Image { image_base: image.image_base, size_of_image: image.size_of_image }, &source)?;
@@ -303,7 +309,7 @@ fn post_mortem() {
             if !state::probe_user_read(at, 8) {
                 break;
             }
-            let address = guest::read64(at);
+            let Ok(address) = guest::try_read::<u64>(at) else { break };
             if let Some((base, _, name)) = images.iter().find(|(base, size, _)| address >= *base && address < base + size) {
                 crate::debug_print!("[exit-stack] +{:#x}: {}+{:#x}", offset, name.rsplit('\\').next().unwrap_or(name), address - base);
                 matches += 1;
@@ -319,26 +325,23 @@ fn post_mortem() {
     if fault_cr2 != 0 {
         crate::debug_print!("[usermode] CR2={:#x} -> pagina traduz p/ {:#x}", fault_cr2, paging::translate(fault_cr2 & !0xFFF));
     }
+    // O Ldr real do processo, em memória de usuário: cada passo é sondado.
     let peb = state::with(|state| state.current_peb_va);
-    let ldr = guest::read64(peb + 0x18);
-    if ldr != 0 {
-        for (tag, list) in [("InLoad", 0x10u64), ("InMem", 0x20), ("InInit", 0x30)] {
-            let head = ldr + list;
-            let mut link = guest::read64(head);
+    let ldr = if state::probe_user_read(peb, Peb::SIZE) { state::user_struct::<Peb>(peb).and_then(|peb| peb.ldr.probe_get()).unwrap_or(0) } else { 0 };
+    if ldr != 0 && state::probe_user_read(ldr, PebLdrData::SIZE) {
+        let lists = [("InLoad", offset_of!(PebLdrData, in_load_order_module_list), offset_of!(LdrDataTableEntry, in_load_order_links)), ("InMem", offset_of!(PebLdrData, in_memory_order_module_list), offset_of!(LdrDataTableEntry, in_memory_order_links)), ("InInit", offset_of!(PebLdrData, in_initialization_order_module_list), offset_of!(LdrDataTableEntry, in_initialization_order_links))];
+        for (tag, list, links) in lists {
+            let head = ldr + list as u64;
+            let mut link = state::user_struct::<ListEntry>(head).and_then(|head| head.flink.probe_get()).unwrap_or(0);
             let mut modules = String::new();
             let mut count = 0;
-            while count < 14 && link != 0 && link != head && state::probe_user_read(link, 16) {
-                let entry = link - match list {
-                    0x10 => 0,
-                    0x30 => 0x20,
-                    _ => 0x10,
-                };
-                let base = guest::read64(entry + 0x30);
-                let length = guest::read16(entry + 0x58) as u64;
-                let buffer = guest::read64(entry + 0x60);
+            while count < 14 && link != 0 && link != head && state::probe_user_read(link - links as u64, LdrDataTableEntry::SIZE) {
+                let Ok(entry) = state::user_struct::<LdrDataTableEntry>(link - links as u64) else { break };
+                let Ok((base, length, buffer)) = (|| Ok::<_, KernelError>((entry.dll_base.probe_get()?, entry.base_dll_name.length.probe_get()? as u64, entry.base_dll_name.buffer.probe_get()?)))() else { break };
                 let name = if state::probe_user_read(buffer, length) { state::read_user_wide_string(buffer, (length / 2).min(40)) } else { String::new() };
                 modules.push_str(&format!(" [{name}@{base:#x}]"));
-                link = guest::read64(link);
+                let Ok(next) = state::user_struct::<ListEntry>(link).and_then(|link| link.flink.probe_get()) else { break };
+                link = next;
                 count += 1;
             }
             crate::debug_print!("[usermode] Ldr {}:{}", tag, modules);
@@ -348,7 +351,7 @@ fn post_mortem() {
         let mut dump = String::new();
         for index in 0..34u64 {
             let at = fault_rsp + index * 8;
-            let value = if state::probe_user_read(at, 8) { guest::read64(at) } else { 0 };
+            let value = if state::probe_user_read(at, 8) { guest::try_read::<u64>(at).unwrap_or(0) } else { 0 };
             dump.push_str(&format!(" +{:x}={value:#x}", index * 8));
         }
         crate::debug_print!("[usermode] pilha da falha @{:#x}:{}", fault_rsp, dump);

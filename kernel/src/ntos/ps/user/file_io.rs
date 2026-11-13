@@ -21,8 +21,21 @@ use crate::ntos::io::file::lifetime as file_lifetime;
 use crate::ntos::ke::dispatcher;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{
+    FileAccessInformation, FileAlignmentInformation, FileAllInformation, FileAttributeTagInformation, FileBasicInformation, FileDirectoryInformation, FileDispositionInformation,
+    FileDispositionInformationEx, FileEaInformation, FileFullDirInformation, FileIdBothDirInformation, FileIdFullDirInformation, FileIdInformation, FileInternalInformation, FileModeInformation,
+    FileNameInformation, FileNamesInformation, FileNetworkOpenInformation, FilePositionInformation, FileRenameInformation, FileStandardInformation, LargeInteger, NtStruct, UnicodeString,
+};
 
 const AV: u32 = 0xC000_0005;
+/// VolumeSerialNumber de FILE_ID_INFORMATION.
+const VOLUME_SERIAL: u64 = 0x4A53_534F_5354_3421;
+
+/// Identificador de arquivo: a referência do volume com o número de
+/// sequência nos 16 bits altos.
+fn file_reference(reference: u64, sequence: u16) -> u64 {
+    (reference & 0x0000_FFFF_FFFF_FFFF) | (sequence as u64) << 48
+}
 const INVALID: u32 = 0xC000_000D;
 const HANDLE: u32 = 0xC000_0008;
 const DENIED: u32 = 0xC000_0022;
@@ -31,10 +44,13 @@ fn fail<T>(status: u32) -> Result<T, KernelError> {
     Err(KernelError::with_status(alloc::format!("file status 0x{status:x}"), status))
 }
 
+/// Grava o IO_STATUS_BLOCK (sondado por `run`) e devolve o status; uma
+/// página desmapeada no meio devolve ACCESS_VIOLATION.
 fn complete(iosb: u64, status: u32, information: u64) -> u32 {
-    guest::write64(iosb, status as u64);
-    guest::write64(iosb + 8, information);
-    status
+    match state::set_user_iosb(iosb, status, information) {
+        Ok(()) => status,
+        Err(_) => AV,
+    }
 }
 
 /// Sonda o IO_STATUS_BLOCK; uma falha com status vira o IOSB e o retorno.
@@ -88,11 +104,10 @@ fn user_file_of(entry: &UserHandle) -> Option<Arc<UserFile>> {
     file_objects::lookup(id)
 }
 
+/// LARGE_INTEGER de usuário (já sondado): uma leitura de qword.
 fn size64(pointer: u64) -> Result<u64, KernelError> {
-    let low = guest::read32(pointer) as u64;
-    let high = guest::read32(pointer + 4) as u64;
-    let value = low + (high << 32);
-    if high & 0x8000_0000 != 0 || value > (1 << 53) - 1 {
+    let value = guest::try_read::<u64>(pointer)?;
+    if value >> 63 != 0 || value > (1 << 53) - 1 {
         return fail(INVALID);
     }
     Ok(value)
@@ -238,7 +253,11 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
         file.opens.lock().push(entry.id);
         match state::alloc_user_handle(entry.clone(), granted, request.handle_attributes & 2) {
             Ok(handle) => {
-                guest::write64(out, handle as u64);
+                // PHANDLE de saída (sondado acima); sem ele o handle não fica.
+                if let Err(error) = guest::try_write::<u64>(out, handle as u64) {
+                    crate::ntos::ob::close::close_user(handle as u64, true);
+                    return Err(error);
+                }
                 let status = complete(iosb, 0, information);
                 debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
                 Ok(status)
@@ -252,35 +271,43 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
     })
 }
 
-/// FILE_BASIC_INFORMATION: os quatro tempos na ordem da ABI e os atributos.
-fn basic(out: u64, stat: &Stat) -> Result<(), KernelError> {
-    for (index, at) in [0usize, 24, 8, 16].iter().enumerate() {
-        let slice: Vec<u8> = (0..8).map(|offset| stat.times.get(at + offset).copied().unwrap_or(0)).collect();
-        state::write_user_bytes(out + index as u64 * 8, &slice)?;
+/// Um tempo do volume: `stat.times` guarda criação, escrita, mudança e
+/// acesso, nesta ordem, em FILETIMEs de 8 bytes.
+fn volume_time(stat: &Stat, at: usize) -> i64 {
+    let bytes: [u8; 8] = core::array::from_fn(|offset| stat.times.get(at + offset).copied().unwrap_or(0));
+    i64::from_le_bytes(bytes)
+}
+
+/// CreationTime, LastAccessTime, LastWriteTime e ChangeTime de uma classe
+/// de informação de usuário (sondada pelo chamador).
+fn times(fields: [&LargeInteger; 4], stat: &Stat) -> Result<(), KernelError> {
+    for (field, at) in fields.into_iter().zip([0usize, 24, 8, 16]) {
+        field.quad_part.probe_set(volume_time(stat, at))?;
     }
-    guest::write32(out + 32, stat.attributes);
-    guest::write32(out + 36, 0);
     Ok(())
 }
 
-fn standard(out: u64, file: &VolumeFile) {
-    let stat = file.stat();
-    guest::write64(out, stat.allocated);
-    guest::write64(out + 8, file.size());
-    guest::write32(out + 16, 1);
-    guest::write8(out + 20, file.pending_delete() as u8);
-    guest::write8(out + 21, file.directory() as u8);
-    guest::write16(out + 22, 0);
+/// FILE_BASIC_INFORMATION: os quatro tempos na ordem da ABI e os atributos.
+fn basic(out: &FileBasicInformation, stat: &Stat) -> Result<(), KernelError> {
+    times([&out.creation_time, &out.last_access_time, &out.last_write_time, &out.change_time], stat)?;
+    out.file_attributes.probe_set(stat.attributes)
 }
 
-fn network(out: u64, file: &VolumeFile) -> Result<(), KernelError> {
+fn standard(out: &FileStandardInformation, file: &VolumeFile) -> Result<(), KernelError> {
     let stat = file.stat();
-    basic(out, &stat)?;
-    guest::write64(out + 32, stat.allocated);
-    guest::write64(out + 40, file.size());
-    guest::write32(out + 48, stat.attributes);
-    guest::write32(out + 52, 0);
-    Ok(())
+    out.allocation_size.quad_part.probe_set(stat.allocated as i64)?;
+    out.end_of_file.quad_part.probe_set(file.size() as i64)?;
+    out.number_of_links.probe_set(1)?;
+    out.delete_pending.probe_set(file.pending_delete() as u8)?;
+    out.directory.probe_set(file.directory() as u8)
+}
+
+fn network(out: &FileNetworkOpenInformation, file: &VolumeFile) -> Result<(), KernelError> {
+    let stat = file.stat();
+    times([&out.creation_time, &out.last_access_time, &out.last_write_time, &out.change_time], &stat)?;
+    out.allocation_size.quad_part.probe_set(stat.allocated as i64)?;
+    out.end_of_file.quad_part.probe_set(file.size() as i64)?;
+    out.file_attributes.probe_set(stat.attributes)
 }
 
 fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, KernelError> {
@@ -295,7 +322,11 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
     if file.pending_delete() {
         return Ok(0xC000_0056);
     }
-    let result = if length == 40 { basic(out, &file.stat()) } else { network(out, &file) };
+    let result = if length == FileBasicInformation::SIZE {
+        state::user_struct::<FileBasicInformation>(out).and_then(|out| basic(out, &file.stat()))
+    } else {
+        state::user_struct::<FileNetworkOpenInformation>(out).and_then(|out| network(out, &file))
+    };
     Ok(match result {
         Ok(()) => 0,
         Err(error) if error.status != 0 => error.status,
@@ -343,48 +374,50 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         if !state::probe_user_write(out, writable) {
             return fail(AV);
         }
-        for offset in 0..writable {
-            guest::write8(out + offset, 0);
-        }
+        guest::try_write_bytes(out, &alloc::vec![0; writable as usize])?;
         let stat = file.stat();
         let handle_access = entry.access();
         let options = user_file.options;
+        let mode = options & 0x103E;
+        let alignment = if options & 8 != 0 { 511 } else { 0 };
         match class {
-            4 => basic(out, &stat)?,
-            5 => standard(out, file),
-            6 => guest::write64(out, stat.reference),
-            7 => guest::write32(out, stat.ea_size),
-            8 => guest::write32(out, handle_access),
-            14 => guest::write64(out, user_file.position()),
-            16 => guest::write32(out, options & 0x103E),
-            17 => guest::write32(out, if options & 8 != 0 { 511 } else { 0 }),
+            4 => basic(state::user_struct::<FileBasicInformation>(out)?, &stat)?,
+            5 => standard(state::user_struct::<FileStandardInformation>(out)?, file)?,
+            6 => state::user_struct::<FileInternalInformation>(out)?.index_number.quad_part.probe_set(stat.reference as i64)?,
+            7 => state::user_struct::<FileEaInformation>(out)?.ea_size.probe_set(stat.ea_size)?,
+            8 => state::user_struct::<FileAccessInformation>(out)?.access_flags.probe_set(handle_access)?,
+            14 => state::user_struct::<FilePositionInformation>(out)?.current_byte_offset.quad_part.probe_set(user_file.position() as i64)?,
+            16 => state::user_struct::<FileModeInformation>(out)?.mode.probe_set(mode)?,
+            17 => state::user_struct::<FileAlignmentInformation>(out)?.alignment_requirement.probe_set(alignment)?,
             18 => {
-                guest::write32(out + 72, stat.ea_size);
-                basic(out, &stat)?;
-                standard(out + 40, file);
-                guest::write64(out + 64, stat.reference);
-                guest::write32(out + 76, handle_access);
-                guest::write64(out + 80, user_file.position());
-                guest::write32(out + 88, options & 0x103E);
-                guest::write32(out + 92, if options & 8 != 0 { 511 } else { 0 });
+                let all = state::user_struct::<FileAllInformation>(out)?;
+                all.ea_information.ea_size.probe_set(stat.ea_size)?;
+                basic(&all.basic_information, &stat)?;
+                standard(&all.standard_information, file)?;
+                all.internal_information.index_number.quad_part.probe_set(stat.reference as i64)?;
+                all.access_information.access_flags.probe_set(handle_access)?;
+                all.position_information.current_byte_offset.quad_part.probe_set(user_file.position() as i64)?;
+                all.mode_information.mode.probe_set(mode)?;
+                all.alignment_information.alignment_requirement.probe_set(alignment)?;
             }
-            34 => network(out, file)?,
-            35 => guest::write32(out, stat.attributes),
+            34 => network(state::user_struct::<FileNetworkOpenInformation>(out)?, file)?,
+            35 => state::user_struct::<FileAttributeTagInformation>(out)?.file_attributes.probe_set(stat.attributes)?,
             59 => {
-                guest::write32(out, 0x5354_3421);
-                guest::write32(out + 4, 0x4A53_534F);
-                guest::write64(out + 8, stat.reference);
-                guest::write16(out + 14, stat.sequence);
+                let id = state::user_struct::<FileIdInformation>(out)?;
+                id.volume_serial_number.probe_set(VOLUME_SERIAL)?;
+                // FILE_ID_128: a referência de 64 bits com o número de
+                // sequência nos 16 bits altos.
+                guest::try_write_bytes(id.file_id.address(), &file_reference(stat.reference, stat.sequence).to_le_bytes())?;
             }
             _ => {}
         }
         if variable {
-            let offset = if class == 9 { 0 } else { 96 };
-            guest::write32(out + offset, name_bytes as u32);
-            let characters = (name.len() as u64).min((length - offset - 4) / 2);
-            for (index, unit) in name.iter().take(characters as usize).enumerate() {
-                guest::write16(out + offset + 4 + index as u64 * 2, *unit);
-            }
+            let information = if class == 9 { state::user_struct::<FileNameInformation>(out)? } else { &state::user_struct::<FileAllInformation>(out)?.name_information };
+            information.file_name_length.probe_set(name_bytes as u32)?;
+            let header = information.file_name.as_ptr() as u64 - out;
+            let characters = (name.len() as u64).min((length - header) / 2);
+            let text: Vec<u8> = name.iter().take(characters as usize).flat_map(|unit| unit.to_le_bytes()).collect();
+            guest::try_write_bytes(information.file_name.as_ptr() as u64, &text)?;
         }
         Ok(complete(iosb, if length < need { 0x8000_0005 } else { 0 }, length.min(need)))
     })
@@ -416,7 +449,7 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
             return super::device_io::transfer(&entry, event, iosb, out, length, pointer, write);
         }
         if entry.kind() == "console" && write {
-            let text: String = (0..length).map(|offset| guest::read8(out + offset) as char).collect();
+            let text: String = guest::try_read_bytes(out, length as usize)?.into_iter().map(|byte| byte as char).collect();
             debug_print!("{}", text.trim_end_matches(['\r', '\n']));
             crate::drivers::console::print(text.trim_end_matches(['\r', '\n']));
             return Ok(complete(iosb, 0, length));
@@ -437,8 +470,9 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
             }
             user_file.position()
         } else {
-            let high = guest::read32(pointer + 4);
-            let low = guest::read32(pointer);
+            // ByteOffset (LARGE_INTEGER): uma leitura de qword sondada.
+            let value = guest::try_read::<u64>(pointer)?;
+            let (high, low) = ((value >> 32) as u32, value as u32);
             if high == 0xFFFF_FFFF && low == 0xFFFF_FFFE && options & 0x30 != 0 {
                 user_file.position()
             } else if high == 0xFFFF_FFFF && low == 0xFFFF_FFFF && write {
@@ -457,7 +491,7 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
         let mut count = 0u64;
         if length != 0 {
             if write {
-                let data: Vec<u8> = (0..length).map(|index| guest::read8(out + index)).collect();
+                let data = guest::try_read_bytes(out, length as usize)?;
                 let volume = volume_files::volume().ok_or_else(|| KernelError::with_status("volume de boot ausente", 0xC000_000E))?;
                 count = volume.write(&file.volume_path(), offset, &data)?;
                 file.refresh();
@@ -555,20 +589,21 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
                 if handle_access & 0x100 == 0 {
                     return fail(DENIED);
                 }
+                // Os quatro tempos na ordem do volume (criação, escrita,
+                // mudança, acesso) e os atributos.
+                let information = state::user_struct::<FileBasicInformation>(buffer)?;
                 let mut times = [0u8; 32];
-                for (index, at) in [0usize, 24, 8, 16].iter().enumerate() {
-                    for offset in 0..8 {
-                        times[at + offset] = guest::read8(buffer + index as u64 * 8 + offset as u64);
-                    }
+                for (field, at) in [&information.creation_time, &information.last_access_time, &information.last_write_time, &information.change_time].into_iter().zip([0usize, 24, 8, 16]) {
+                    times[at..at + 8].copy_from_slice(&field.quad_part.probe_get()?.to_le_bytes());
                 }
-                volume_or_fail()?.set_basic(&file.volume_path(), Some(&times), guest::read32(buffer + 32))?;
+                volume_or_fail()?.set_basic(&file.volume_path(), Some(&times), information.file_attributes.probe_get()?)?;
                 file.refresh();
             }
             13 | 64 => {
                 if handle_access & 0x1_0000 == 0 {
                     return fail(DENIED);
                 }
-                let flags = if class == 13 { guest::read8(buffer) as u32 } else { guest::read32(buffer) };
+                let flags = if class == 13 { state::user_struct::<FileDispositionInformation>(buffer)?.delete_file.probe_get()? as u32 } else { state::user_struct::<FileDispositionInformationEx>(buffer)?.flags.probe_get()? };
                 if flags & !1 != 0 {
                     return fail(0xC000_00BB);
                 }
@@ -587,17 +622,19 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
                 if handle_access & 0x1_0000 == 0 {
                     return fail(DENIED);
                 }
-                let flags = if class == 10 { guest::read8(buffer) as u32 } else { guest::read32(buffer) };
+                let information = state::user_struct::<FileRenameInformation>(buffer)?;
+                // ReplaceIfExists (BOOLEAN) ou, na classe Ex, Flags (ULONG).
+                let flags = if class == 10 { information.replace_if_exists.probe_get()? as u32 } else { information.flags.probe_get()? };
                 if flags & !1 != 0 {
                     return fail(0xC000_00BB);
                 }
-                let root = guest::read64(buffer + 8);
-                let size = guest::read32(buffer + 16) as u64;
-                if size == 0 || size % 2 != 0 || size > length - 20 {
+                let root = information.root_directory.probe_get()?;
+                let size = information.file_name_length.probe_get()? as u64;
+                let header = information.file_name.as_ptr() as u64 - buffer;
+                if size == 0 || size % 2 != 0 || size > length - header {
                     return fail(INVALID);
                 }
-                let units: Vec<u16> = (0..size / 2).map(|index| guest::read16(buffer + 20 + index * 2)).collect();
-                let mut name = String::from_utf16_lossy(&units);
+                let mut name = state::try_read_user_wide_string(information.file_name.as_ptr() as u64, size / 2)?;
                 let old = file.volume_path();
                 if root != 0 {
                     let (_, parent) = object(root)?;
@@ -740,16 +777,16 @@ fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) 
             if !state::probe_user_read(name_pointer, 16) {
                 return fail(AV);
             }
-            let name_length = guest::read16(name_pointer) as u64;
-            let pointer = guest::read64(name_pointer + 8);
+            let file_name = state::user_struct::<UnicodeString>(name_pointer)?;
+            let name_length = file_name.length.probe_get()? as u64;
+            let pointer = file_name.buffer.probe_get()?;
             if name_length % 2 != 0 || name_length > 510 {
                 return fail(INVALID);
             }
             if !state::probe_user_read(pointer, name_length) {
                 return fail(AV);
             }
-            let units: Vec<u16> = (0..name_length / 2).map(|index| guest::read16(pointer + index * 2)).collect();
-            pattern = String::from_utf16_lossy(&units);
+            pattern = state::try_read_user_wide_string(pointer, name_length / 2)?;
             if pattern.contains(['\\', '/', '\0']) {
                 return fail(INVALID);
             }
@@ -793,36 +830,33 @@ fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) 
                 break;
             }
             let take = size.min(length - at);
-            for offset in 0..take {
-                guest::write8(out + at + offset, 0);
-            }
+            guest::try_write_bytes(out + at, &alloc::vec![0; take as usize])?;
             if let Some(previous) = previous {
-                guest::write32(out + previous, (at - previous) as u32);
+                // NextEntryOffset: o primeiro campo de todas as classes.
+                state::user_struct::<FileNamesInformation>(out + previous)?.next_entry_offset.probe_set((at - previous) as u32)?;
             }
             if class != 12 {
-                for (index, origin) in [0usize, 24, 8, 16].iter().enumerate() {
-                    let slice: Vec<u8> = (0..8).map(|offset| stat.times.get(origin + offset).copied().unwrap_or(0)).collect();
-                    state::write_user_bytes(out + at + 8 + index as u64 * 8, &slice)?;
-                }
-                guest::write64(out + at + 40, stat.size);
-                guest::write64(out + at + 48, stat.allocated);
-                guest::write32(out + at + 56, stat.attributes);
-                guest::write32(out + at + 60, units.len() as u32 * 2);
+                // Classes 1, 2, 3, 37 e 38 compartilham o prefixo de
+                // FILE_DIRECTORY_INFORMATION.
+                let entry = state::user_struct::<FileDirectoryInformation>(out + at)?;
+                times([&entry.creation_time, &entry.last_access_time, &entry.last_write_time, &entry.change_time], &stat)?;
+                entry.end_of_file.quad_part.probe_set(stat.size as i64)?;
+                entry.allocation_size.quad_part.probe_set(stat.allocated as i64)?;
+                entry.file_attributes.probe_set(stat.attributes)?;
+                entry.file_name_length.probe_set(units.len() as u32 * 2)?;
                 if [2, 3, 37, 38].contains(&class) {
-                    guest::write32(out + at + 64, stat.ea_size);
+                    state::user_struct::<FileFullDirInformation>(out + at)?.ea_size.probe_set(stat.ea_size)?;
                 }
                 if class == 37 || class == 38 {
-                    let id = if class == 37 { 96 } else { 72 };
-                    guest::write64(out + at + id, stat.reference);
-                    guest::write16(out + at + id + 6, stat.sequence);
+                    let id = if class == 37 { &state::user_struct::<FileIdBothDirInformation>(out + at)?.file_id } else { &state::user_struct::<FileIdFullDirInformation>(out + at)?.file_id };
+                    id.quad_part.probe_set(file_reference(stat.reference, stat.sequence) as i64)?;
                 }
             } else {
-                guest::write32(out + at + 8, units.len() as u32 * 2);
+                state::user_struct::<FileNamesInformation>(out + at)?.file_name_length.probe_set(units.len() as u32 * 2)?;
             }
             let characters = (take.saturating_sub(start) / 2) as usize;
-            for (index, unit) in units.iter().take(characters).enumerate() {
-                guest::write16(out + at + start + index as u64 * 2, *unit);
-            }
+            let text: Vec<u8> = units.iter().take(characters).flat_map(|unit| unit.to_le_bytes()).collect();
+            guest::try_write_bytes(out + at + start, &text)?;
             used = at + take;
             previous = Some(at);
             if take < size {

@@ -14,6 +14,7 @@ use crate::ntos::se::token::{impersonate_anonymous, open_process as open_process
 use crate::ntos::se::security_attributes;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, UnicodeString};
 
 fn current() -> Option<u64> {
     process::get_primary_token(process::get_current_process())
@@ -224,17 +225,16 @@ fn write_result(result: Result<Vec<u8>, u32>, out: u64, length: u32, returned: u
         Ok(bytes) => bytes,
         Err(status) => return status,
     };
-    if !probe_user_write(returned, 4) {
+    // ULONG *ReturnLength e o buffer, sondados; as cópias também.
+    if !probe_user_write(returned, 4) || guest::try_write::<u32>(returned, bytes.len() as u32).is_err() {
         return 0xC000_0005;
     }
-    guest::write32(returned, bytes.len() as u32);
     if (length as usize) < bytes.len() {
         return 0xC000_0023;
     }
-    if !probe_user_write(out, bytes.len() as u64) {
+    if !probe_user_write(out, bytes.len() as u64) || guest::try_write_bytes(out, &bytes).is_err() {
         return 0xC000_0005;
     }
-    guest::write_bytes(out, &bytes);
     0
 }
 
@@ -272,23 +272,29 @@ fn nt_query_security_attributes_token(handle: u64, attributes: u64, count: u64, 
     }
     let mut names: Vec<String> = Vec::new();
     for index in 0..count {
-        let descriptor = attributes + index * 16;
-        let size = guest::read16(descriptor) as u64;
-        let pointer = guest::read64(descriptor + 8);
+        // Vetor de UNICODE_STRINGs de entrada (sondado acima).
+        let name = match state::user_struct::<UnicodeString>(attributes + index * UnicodeString::SIZE).and_then(|name| Ok((name.length.probe_get()? as u64, name.buffer.probe_get()?))) {
+            Ok(name) => name,
+            Err(error) => return Ok(error.status),
+        };
+        let (size, pointer) = name;
         if size == 0 {
-            guest::write32(returned, 0);
+            let _ = guest::try_write::<u32>(returned, 0);
             return Ok(0xC000_000D);
         }
         if !probe_user_read(pointer, size) {
             return Ok(0xC000_0005);
         }
         // MaximumLength não limita a entrada desta API de strings contadas.
-        names.push(state::read_user_wide_string(pointer, size / 2));
+        match state::try_read_user_wide_string(pointer, size / 2) {
+            Ok(text) => names.push(text),
+            Err(error) => return Ok(error.status),
+        }
     }
     let attributes_of_token = tokens::with(token, |record| record.security_attributes.clone()).unwrap_or_default();
     let selected = security_attributes::select(&attributes_of_token, if count != 0 { Some(&names) } else { None })?;
     let Some(selected) = selected else {
-        guest::write32(returned, 0);
+        let _ = guest::try_write::<u32>(returned, 0);
         return Ok(0xC000_0225);
     };
     Ok(write_result(security_attributes::encode(&selected, out), out, length, returned))

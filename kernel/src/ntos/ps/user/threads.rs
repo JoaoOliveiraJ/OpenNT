@@ -22,9 +22,10 @@ use crate::ntos::ps::{alert_thread, process, query_thread, set_thread_informatio
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::types::{ClientId, Context, Eprocess, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
+use core::mem::offset_of;
 
-pub const CONTEXT_SIZE: u64 = 0x4D0;
+pub const CONTEXT_SIZE: u64 = Context::SIZE;
 const PENDING: u32 = 0x103;
 const NOT_SUPPORTED: u32 = 0xC000_00BB;
 const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
@@ -96,7 +97,7 @@ impl UserThread {
     pub fn new(thread_id: u64, thread_pointer: u64, teb_va: u64, start: u64) -> Arc<Self> {
         // KTHREAD.Teb acompanha a TEB da thread (PsGetThreadTeb).
         if thread_pointer != 0 {
-            guest::write64(thread_pointer + crate::ntos::inc::nt_abi::kthread::TEB, teb_va);
+            kernel_thread(thread_pointer).teb.set(teb_va);
         }
         Arc::new(Self {
             thread_id,
@@ -261,21 +262,29 @@ pub fn drain_kernel_apcs() {
     DRAINING_APCS.store(false, Ordering::Release);
 }
 
+/// O KTHREAD de uma thread de usuário.
+fn kernel_thread(pointer: u64) -> &'static Kthread {
+    // SAFETY: KTHREAD vivo, retido pela thread de usuário.
+    unsafe { Kthread::at(pointer) }
+}
+
+/// CONTEXT inicial de usuário (memória do kernel ou região do processo
+/// recém-comprometida, antes de a thread rodar).
 pub fn initialize_context(context: u64, rip: u64, rsp: u64, rcx: u64, rdx: u64) {
-    for offset in (0..CONTEXT_SIZE).step_by(4) {
-        guest::write32(context + offset, 0);
-    }
-    guest::write32(context + 0x30, 0x10_000B);
-    guest::write32(context + 0x34, 0x1F80);
-    guest::write16(context + 0x38, 0x33);
-    guest::write16(context + 0x42, 0x2B);
-    guest::write32(context + 0x44, 0x202);
-    guest::write64(context + 0x80, rcx);
-    guest::write64(context + 0x88, rdx);
-    guest::write64(context + 0x98, rsp);
-    guest::write64(context + 0xF8, rip);
-    guest::write16(context + 0x100, 0x37F);
-    guest::write32(context + 0x118, 0x1F80);
+    guest::write_bytes(context, &[0; CONTEXT_SIZE as usize]);
+    // SAFETY: o CONTEXT acabou de ser zerado e pertence ao chamador.
+    let initial = unsafe { Context::at(context) };
+    initial.context_flags.set(0x10_000B);
+    initial.mx_csr.set(0x1F80);
+    initial.seg_cs.set(0x33);
+    initial.seg_ss.set(0x2B);
+    initial.e_flags.set(0x202);
+    initial.rcx.set(rcx);
+    initial.rdx.set(rdx);
+    initial.rsp.set(rsp);
+    initial.rip.set(rip);
+    initial.flt_save.control_word.set(0x37F);
+    initial.flt_save.mx_csr.set(0x1F80);
 }
 
 fn prepare_main(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_base: u64) -> Result<(), KernelError> {
@@ -365,7 +374,8 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             refresh_ready_user_threads();
             let Some((pointer, owner)) = thread_dispatch::peek()? else {
                 if all().iter().all(|thread| thread.dead()) {
-                    return Ok(guest::read32(process_pointer + eprocess::EXIT_STATUS));
+                    // SAFETY: o EPROCESS é referenciado durante o laço.
+                    return Ok(unsafe { Eprocess::at(process_pointer) }.exit_status.get() as u32);
                 }
                 continue;
             };
@@ -439,7 +449,8 @@ fn finish_wait(thread: &UserThread, mut wait: Wait, status: u32) {
     });
     completion_objects::activate(pointer);
     if context != 0 {
-        guest::write64(context + 0x78, status as u64);
+        // SAFETY: CONTEXT salvo da thread (memória do kernel).
+        unsafe { Context::at(context) }.rax.set(status as u64);
     }
 }
 
@@ -575,7 +586,7 @@ pub fn release_execution_resources(thread: &Arc<UserThread>) {
     let context = thread.with(|thread| {
         thread.teb_va = 0;
         if thread.thread_pointer != 0 {
-            guest::write64(thread.thread_pointer + crate::ntos::inc::nt_abi::kthread::TEB, 0);
+            kernel_thread(thread.thread_pointer).teb.set(0);
         }
         core::mem::replace(&mut thread.context, 0)
     });
@@ -720,6 +731,10 @@ fn nt_create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u
     if !probe_user_write(out, 8) || !state::probe_syscall_stack(rsp, 56) || (attributes != 0 && !probe_user_read(attributes, 48)) {
         return Ok(0xC000_0005);
     }
+    state::guarded(|| create_thread_ex(out, access, attributes, rsp))
+}
+
+fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
     let start = state::stack_arg(rsp, 5);
     let flags = state::stack_arg32(rsp, 7);
     let zero_bits = state::stack_arg(rsp, 8);
@@ -733,7 +748,7 @@ fn nt_create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u
         return Ok(0xC000_000D);
     }
     // Objetos de thread não têm nome.
-    if attributes != 0 && guest::read64(attributes + 16) != 0 {
+    if attributes != 0 && state::user_struct::<ObjectAttributes>(attributes)?.object_name.probe_get()? != 0 {
         return Ok(0xC000_0033);
     }
     let mut outputs: Vec<(u64, u64, u64, u64)> = Vec::new();
@@ -741,20 +756,23 @@ fn nt_create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u
         if !probe_user_read(list, 8) {
             return Ok(0xC000_0005);
         }
-        let bytes = guest::read64(list);
-        if !(8..=0x1008).contains(&bytes) || (bytes - 8) % 32 != 0 {
+        let attribute_list = state::user_struct::<PsAttributeList>(list)?;
+        let bytes = attribute_list.total_length.probe_get()?;
+        let header = offset_of!(PsAttributeList, attributes) as u64;
+        if !(header..=header + 128 * PsAttribute::SIZE).contains(&bytes) || (bytes - header) % PsAttribute::SIZE != 0 {
             return Ok(0xC000_000D);
         }
         if !probe_user_read(list, bytes) {
             return Ok(0xC000_0005);
         }
         let mut seen: Vec<u64> = Vec::new();
-        let mut at = list + 8;
+        let mut at = list + header;
         while at < list + bytes {
-            let attribute = guest::read64(at);
-            let size = guest::read64(at + 8);
-            let target = guest::read64(at + 16);
-            let returned = guest::read64(at + 24);
+            let entry = state::user_struct::<PsAttribute>(at)?;
+            let attribute = entry.attribute.probe_get()?;
+            let size = entry.size.probe_get()?;
+            let target = entry.value_ptr.probe_get()?;
+            let returned = entry.return_length.probe_get()?;
             let need = match attribute {
                 0x10003 => 16,
                 0x10004 => 8,
@@ -768,24 +786,28 @@ fn nt_create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u
             }
             seen.push(attribute);
             outputs.push((attribute, target, returned, size));
-            at += 32;
+            at += PsAttribute::SIZE;
         }
     }
     let thread = match create_user_thread(&CreateRequest { start, argument_words: state::syscall_arg_words(rsp, 6), flags, zero_bits, commit, reserve }) {
         Ok(thread) => thread,
         Err(status) => return Ok(status),
     };
-    guest::write64(out, thread_handle(&thread, access as u32, 0)?);
+    // PHANDLE de saída e os atributos de saída, todos sondados acima.
+    guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?)?;
     let (process_id, teb) = (state::with(|state| state.current_process_id), thread.with(|thread| thread.teb_va));
     for (attribute, target, returned, size) in outputs {
         if attribute == 0x10003 {
-            guest::write64(target, process_id);
-            guest::write64(target + 8, thread.thread_id);
+            // PS_ATTRIBUTE_CLIENT_ID.
+            let client = state::user_struct::<ClientId>(target)?;
+            client.unique_process.probe_set(process_id)?;
+            client.unique_thread.probe_set(thread.thread_id)?;
         } else {
-            guest::write64(target, teb);
+            // PS_ATTRIBUTE_TEB_ADDRESS.
+            guest::try_write::<u64>(target, teb)?;
         }
         if returned != 0 {
-            guest::write64(returned, size);
+            guest::try_write::<u64>(returned, size)?;
         }
     }
     Ok(0)
@@ -801,11 +823,27 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         let exports = state.ntdll_exports.as_ref().map(|exports| (exports.get("RtlUserThreadStart").copied().unwrap_or(0), exports.get("LdrInitializeThunk").copied().unwrap_or(0)));
         (state.current_peb_va, state.syscall_stack_top, state.current_process_id, exports.unwrap_or((0, 0)), state.ntdll_image_base)
     });
-    let image_base = guest::read64(peb + 0x10);
-    let optional = image_base + guest::read32(image_base + 0x3C) as u64 + 24;
-    let default_reserve = match guest::read64(optional + 72) {
-        0 => 0x10_0000,
-        value => value,
+    // SizeOfStackReserve da imagem: a PEB e os cabeçalhos estão em memória
+    // de usuário, então cada passo é sondado.
+    let reserve = (|| -> Result<u64, KernelError> {
+        let image_base = &state::user_struct::<Peb>(peb)?.image_base_address;
+        if !probe_user_read(image_base.address(), 8) {
+            return Err(guest::address_fault(peb));
+        }
+        let image_base = image_base.probe_get()?;
+        if !probe_user_read(image_base, ImageDosHeader::SIZE) {
+            return Err(guest::address_fault(image_base));
+        }
+        let headers = image_base + state::user_struct::<ImageDosHeader>(image_base)?.e_lfanew.probe_get()? as u32 as u64;
+        if !probe_user_read(headers, ImageNtHeaders64::SIZE) {
+            return Err(guest::address_fault(headers));
+        }
+        state::user_struct::<ImageNtHeaders64>(headers)?.optional_header.size_of_stack_reserve.probe_get()
+    })();
+    let default_reserve = match reserve {
+        Ok(0) => 0x10_0000,
+        Ok(value) => value,
+        Err(error) => return Err(error.status),
     };
     let wanted = (if request.reserve != 0 { request.reserve } else { default_reserve }).max(if request.commit != 0 { request.commit } else { 0x1000 }) as u128;
     let stack_size = wanted.div_ceil(0x10000) * 0x10000;
@@ -846,18 +884,21 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             thread.suspend_count = request.flags & 1;
             thread.hidden = request.flags & 4 != 0;
         });
-        guest::write64(teb + 8, stack + stack_size);
-        guest::write64(teb + 0x10, stack);
-        guest::write64(teb + 0x30, teb);
-        guest::write64(teb + 0x40, process_id);
-        guest::write64(teb + 0x48, id);
-        guest::write64(teb + 0x60, peb);
-        guest::write64(teb + 0x1478, stack);
-        guest::write16(teb + 0x17EE, (if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
+        // SAFETY: TEB recém-comprometida; a thread ainda não roda.
+        let block = unsafe { Teb::at(teb) };
+        block.nt_tib.stack_base.set(stack + stack_size);
+        block.nt_tib.stack_limit.set(stack);
+        block.nt_tib.self_.set(teb);
+        block.client_id.unique_process.set(process_id);
+        block.client_id.unique_thread.set(id);
+        block.process_environment_block.set(peb);
+        block.deallocation_stack.set(stack);
+        // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.
+        block.same_teb_flags.set((if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
         initialize_context(startup, exports.0, stack + stack_size - 8, request.start, 0);
         // O argumento é um ULONG_PTR opaco: preserva os 64 bits.
-        guest::write32(startup + 0x88, request.argument_words[0]);
-        guest::write32(startup + 0x8C, request.argument_words[1]);
+        // SAFETY: o CONTEXT de partida acabou de ser montado.
+        unsafe { Context::at(startup) }.rdx.set(request.argument_words[0] as u64 | (request.argument_words[1] as u64) << 32);
         initialize_context(context, exports.1, stack + stack_size - 8, startup, ntdll_base);
         process::add_thread(process_pointer);
         process::describe_thread(thread_pointer, None, false);
@@ -891,10 +932,17 @@ fn nt_open_thread(out: u64, access: u64, attributes: u64, cid: u64, _rsp: u64) -
     if !probe_user_write(out, 8) || !probe_user_read(cid, 16) || (attributes != 0 && !probe_user_read(attributes, 48)) {
         return Ok(0xC000_0005);
     }
-    let (pid, tid) = (guest::read64(cid), guest::read64(cid + 8));
+    let client = match state::user_struct::<ClientId>(cid).and_then(|client| Ok((client.unique_process.probe_get()?, client.unique_thread.probe_get()?))) {
+        Ok(client) => client,
+        Err(error) => return Ok(error.status),
+    };
+    let (pid, tid) = client;
     let thread = all().into_iter().find(|thread| thread.thread_id == tid && thread.with(|thread| !thread.dead || thread.handles != 0));
     let Some(thread) = thread.filter(|_| pid == 0 || pid == state::with(|state| state.current_process_id)) else { return Ok(0xC000_000B) };
-    guest::write64(out, thread_handle(&thread, access as u32, 0)?);
+    // PHANDLE de saída (sondado acima).
+    if guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?).is_err() {
+        return Ok(0xC000_0005);
+    }
     Ok(0)
 }
 
@@ -913,8 +961,9 @@ fn change_suspend(handle: u64, out: u64, delta: i32) -> u32 {
     if delta > 0 && previous == 127 {
         return 0xC000_004A;
     }
-    if out != 0 {
-        guest::write32(out, previous);
+    // ULONG *PreviousSuspendCount (sondado acima).
+    if out != 0 && guest::try_write::<u32>(out, previous).is_err() {
+        return 0xC000_0005;
     }
     let (pointer, registered, suspended, waiting) = thread.with(|thread| {
         thread.suspend_count = (previous as i32 + delta).max(0) as u32;
@@ -963,7 +1012,8 @@ fn nt_terminate_thread(handle: u64, status: u64, _a3: u64, _a4: u64, _rsp: u64) 
     super::mutants::release_thread(pointer);
     process::remove_thread(process_pointer);
     // Notifica antes que a última ETHREAD possa ser recolhida.
-    if guest::read32(process_pointer + eprocess::ACTIVE_THREADS) == 0 {
+    // SAFETY: o EPROCESS da thread, referenciado por ela.
+    if unsafe { Eprocess::at(process_pointer) }.active_threads.get() == 0 {
         let previous = process::get_current_thread();
         process::set_current_thread(pointer);
         let terminated = process::terminate_process(process_pointer, status);
@@ -1003,34 +1053,38 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     if returned != 0 && !probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, need as u32);
-    }
-    if length != need {
-        return Ok(0xC000_0004);
-    }
-    if !probe_user_write(out, need) {
-        return Ok(0xC000_0005);
-    }
-    let (pointer, exit_status, dead, teb, start, hidden) = thread.with(|thread| (thread.thread_pointer, thread.exit_status, thread.dead, thread.teb_va, thread.start, thread.hidden));
-    match class {
-        0 => {
-            for offset in (0..need).step_by(4) {
-                guest::write32(out + offset, 0);
-            }
-            guest::write32(out, exit_status);
-            guest::write64(out + 8, if dead { 0 } else { teb });
-            guest::write64(out + 16, state::with(|state| state.current_process_id));
-            guest::write64(out + 24, thread.thread_id);
-            guest::write64(out + 32, (1u64 << smp::online_cpu_count()) - 1);
-            guest::write32(out + 40, thread_priority::query_priority(pointer) as u32);
-            guest::write32(out + 44, thread_priority::query_base_priority(pointer) as u32);
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, need as u32)?;
         }
-        9 => guest::write64(out, start),
-        17 => guest::write8(out, hidden as u8),
-        _ => guest::write32(out, (all().iter().filter(|thread| !thread.dead()).count() == 1) as u32),
-    }
-    Ok(0)
+        if length != need {
+            return Ok(0xC000_0004);
+        }
+        if !probe_user_write(out, need) {
+            return Ok(0xC000_0005);
+        }
+        let (pointer, exit_status, dead, teb, start, hidden) = thread.with(|thread| (thread.thread_pointer, thread.exit_status, thread.dead, thread.teb_va, thread.start, thread.hidden));
+        match class {
+            0 => {
+                guest::try_write_bytes(out, &[0; ThreadBasicInformation::SIZE as usize])?;
+                let information = state::user_struct::<ThreadBasicInformation>(out)?;
+                information.exit_status.probe_set(exit_status as i32)?;
+                information.teb_base_address.probe_set(if dead { 0 } else { teb })?;
+                information.client_id.unique_process.probe_set(state::with(|state| state.current_process_id))?;
+                information.client_id.unique_thread.probe_set(thread.thread_id)?;
+                information.affinity_mask.probe_set((1u64 << smp::online_cpu_count()) - 1)?;
+                information.priority.probe_set(thread_priority::query_priority(pointer) as i32)?;
+                information.base_priority.probe_set(thread_priority::query_base_priority(pointer) as i32)?;
+            }
+            // ThreadQuerySetWin32StartAddress (PVOID).
+            9 => guest::try_write::<u64>(out, start)?,
+            // ThreadHideFromDebugger (BOOLEAN).
+            17 => guest::try_write::<u8>(out, hidden as u8)?,
+            // ThreadAmILastThread (ULONG).
+            _ => guest::try_write::<u32>(out, (all().iter().filter(|thread| !thread.dead()).count() == 1) as u32)?,
+        }
+        Ok(0)
+    })
 }
 
 fn nt_delay_execution(alertable: u64, timeout: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -1093,7 +1147,11 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
             if !probe_user_read(input, 4) {
                 return Ok(0xC000_0005);
             }
-            let index = guest::read32(input) as u64;
+            // ULONG: o índice TLS (sondado acima).
+            let index = match guest::try_read::<u32>(input) {
+                Ok(index) => index as u64,
+                Err(error) => return Ok(error.status),
+            };
             if index >= 1088 {
                 return Ok(0xC000_000D);
             }
@@ -1103,18 +1161,32 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
                 if dead || teb == 0 {
                     continue;
                 }
-                let expansion = if index >= 64 { guest::read64(teb + 0x1780) } else { 0 };
+                // TEB de usuário: TlsSlots[64] e o vetor TlsExpansionSlots.
+                let Ok(block) = state::user_struct::<Teb>(teb) else { return Ok(0xC000_0005) };
+                let expansion = if index >= 64 {
+                    if !probe_user_read(block.tls_expansion_slots.address(), 8) {
+                        return Ok(0xC000_0005);
+                    }
+                    match block.tls_expansion_slots.probe_get() {
+                        Ok(expansion) => expansion,
+                        Err(error) => return Ok(error.status),
+                    }
+                } else {
+                    0
+                };
                 if index >= 64 && expansion == 0 {
                     continue;
                 }
-                let slot = if index < 64 { teb + 0x1480 + index * 8 } else { expansion + (index - 64) * 8 };
+                let slot = if index < 64 { block.tls_slots[index as usize].address() } else { expansion + (index - 64) * 8 };
                 if !probe_user_write(slot, 8) {
                     return Ok(0xC000_0005);
                 }
                 slots.push(slot);
             }
             for slot in slots {
-                guest::write64(slot, 0);
+                if guest::try_write::<u64>(slot, 0).is_err() {
+                    return Ok(0xC000_0005);
+                }
             }
             Ok(0)
         }
@@ -1132,7 +1204,11 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
             if !probe_user_read(input, 4) {
                 return Ok(0xC000_0005);
             }
-            let priority = guest::read32(input) as i32;
+            // LONG: a prioridade pedida (sondada acima).
+            let priority = match guest::try_read::<i32>(input) {
+                Ok(priority) => priority,
+                Err(error) => return Ok(error.status),
+            };
             let pointer = thread.pointer();
             if class == 1 {
                 if !(1..=31).contains(&priority) {
@@ -1143,7 +1219,7 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
                 if !(-16..=15).contains(&priority) {
                     return Ok(0xC000_000D);
                 }
-                guest::write8(pointer + kthread::BASE_PRIORITY, (8 + priority).clamp(1, 15) as u8);
+                kernel_thread(pointer).base_priority.set((8 + priority).clamp(1, 15) as i8);
                 thread_priority::set_priority(pointer, thread_priority::query_base_priority(pointer) as u64)?;
             }
             Ok(0)

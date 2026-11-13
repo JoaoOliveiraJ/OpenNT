@@ -17,6 +17,7 @@ use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::objects::work::{self as work_objects, Association, Queued, WaitPacket};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::ObjectAttributes;
 
 /// Associações pendentes, na ordem de inserção.
 static PENDING: SpinLock<Vec<Arc<WaitPacket>>> = SpinLock::new(Vec::new());
@@ -62,8 +63,13 @@ fn nt_create_wait_completion_packet(out: u64, access: u64, attributes: u64, _a4:
     if !probe_user_write(out, 8) || (attributes != 0 && !probe_user_read(attributes, 48)) {
         return Ok(0xC000_0005);
     }
-    if attributes != 0 && guest::read64(attributes + 16) != 0 {
-        return Ok(0xC000_0033);
+    // Pacotes de espera não têm nome.
+    if attributes != 0 {
+        match state::user_struct::<ObjectAttributes>(attributes).and_then(|object| object.object_name.probe_get()) {
+            Ok(0) => {}
+            Ok(_) => return Ok(0xC000_0033),
+            Err(error) => return Ok(error.status),
+        }
     }
     let result = work_objects::packet(attributes, detach).and_then(|packet| work_objects::publish(packet.pointer, out, access as u32, attributes, packet.clone()));
     match result {
@@ -147,8 +153,9 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
     packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
     PENDING.lock().push(packet.clone());
     let signaled = poll(&packet);
-    if already != 0 {
-        guest::write8(already, signaled as u8);
+    // BOOLEAN *AlreadySignaled (sondado acima).
+    if already != 0 && guest::try_write::<u8>(already, signaled as u8).is_err() {
+        return Ok(0xC000_0005);
     }
     Ok(0)
 }

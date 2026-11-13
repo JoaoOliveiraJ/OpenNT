@@ -28,7 +28,7 @@ fn collect(exports: &BTreeMap<String, u64>, read32: impl Fn(u64) -> Option<u32>)
 
 /// Stubs da ntdll já mapeada.
 pub fn scan_syscall_stubs(exports: &BTreeMap<String, u64>) -> BTreeMap<u32, String> {
-    collect(exports, |address| Some(guest::read32(address)))
+    collect(exports, |address| guest::try_read::<u32>(address).ok())
 }
 
 fn truncated() -> KernelError {

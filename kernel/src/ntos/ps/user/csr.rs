@@ -17,6 +17,7 @@ use crate::ntos::ob::objects::port::Port;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{KuserSharedData, NtStruct};
 
 /// Cliente CSR de um processo.
 struct Client {
@@ -104,7 +105,16 @@ pub fn initialize() -> Result<(), KernelError> {
     guest::write64(data + 0x170, base + 0x2800); // lista INI-para-registro vazia
     // A sessão zero usa o relógio UTC do convidado, sem fuso de terminal
     // services: hora atual do KUSER_SHARED_DATA.
-    let now = guest::read64(0x7FFE_0014);
+    // SAFETY: a KUSER_SHARED_DATA está mapeada no endereço de usuário fixo.
+    let clock = &unsafe { KuserSharedData::at(state::KUSER_SHARED_DATA_USER_VA) }.system_time;
+    // KSYSTEM_TIME: High1Time, LowPart e High2Time iguais = leitura coerente.
+    let now = loop {
+        let high = clock.high1_time.get();
+        let low = clock.low_part.get();
+        if clock.high2_time.get() == high {
+            break (high as u32 as u64) << 32 | low as u64;
+        }
+    };
     guest::write64(data + 0x140, now);
     guest::write64(data + 0x148, now);
     *SESSION.lock() = Some(Session { base, table, _data: data, _section: section, clients: BTreeMap::new(), ports: BTreeMap::new() });

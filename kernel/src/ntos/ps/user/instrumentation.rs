@@ -8,6 +8,7 @@ use super::{state, syscalls_core};
 use crate::hal::amd64::usermode::INSTRUMENTATION_CALLBACK;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::ProcessInstrumentationCallbackInformation;
 
 /// Só o processo corrente.
 fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelError> {
@@ -20,10 +21,21 @@ fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelE
     if !state::probe_user_read(input, length) {
         return Ok(0xC000_0005);
     }
-    if length == 16 && (guest::read32(input) != 0 || guest::read32(input + 4) != 0) {
-        return Ok(0xC000_000D);
-    }
-    let callback = guest::read64(input + if length == 16 { 8 } else { 0 });
+    // PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION (versão 0) ou o PVOID
+    // da forma antiga de 8 bytes.
+    let callback = if length == 16 {
+        let information = state::user_struct::<ProcessInstrumentationCallbackInformation>(input).and_then(|information| Ok((information.version.probe_get()?, information.reserved.probe_get()?, information.callback.probe_get()?)));
+        match information {
+            Ok((0, 0, callback)) => callback,
+            Ok(_) => return Ok(0xC000_000D),
+            Err(error) => return Ok(error.status),
+        }
+    } else {
+        match guest::try_read::<u64>(input) {
+            Ok(callback) => callback,
+            Err(error) => return Ok(error.status),
+        }
+    };
     if callback != 0 && !state::probe_user_read(callback, 1) {
         return Ok(0xC000_0005);
     }

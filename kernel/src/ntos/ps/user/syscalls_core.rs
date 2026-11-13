@@ -22,6 +22,8 @@ use crate::ntos::ps::context::registers as thread_context_registers;
 use crate::ntos::se::{code_integrity_information, object_security, secure_boot_information};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
+use crate::ntos::inc::types::{Context, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemLogicalProcessorInformationEx, SystemNumaInformation, UnicodeString, XsaveFormat};
 
 /// Gancho: (userRsp, retLen*) → status.
 pub type StackQuery = fn(u64, u64) -> Result<u32, KernelError>;
@@ -74,23 +76,38 @@ fn nt_get_current_processor_number(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp:
 
 /// PROCESSOR_NUMBER de quatro bytes.
 fn nt_get_current_processor_number_ex(number: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if number != 0 {
-        if !probe_user_write(number, 4) {
-            return Ok(0xC000_0005);
+    state::guarded(|| {
+        if number != 0 {
+            if !probe_user_write(number, 4) {
+                return Ok(0xC000_0005);
+            }
+            let processor = state::user_struct::<ProcessorNumber>(number)?;
+            processor.group.probe_set(0)?;
+            processor.number.probe_set(0)?;
+            processor.reserved.probe_set(0)?;
         }
-        guest::write32(number, 0);
-    }
-    Ok(0)
+        Ok(0)
+    })
 }
 
-/// NtDisplayString(PUNICODE_STRING): console de boot e serial.
+/// NtDisplayString(PUNICODE_STRING): console de boot e serial. A string e o
+/// buffer são sondados como no NT.
 fn nt_display_string(string: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    let length = guest::read16(string) as u64;
-    let buffer = guest::read64(string + 8);
-    let text = state::read_user_wide_string(buffer, length / 2);
-    serial::write(text.as_bytes());
-    crate::debug_print!("[usermode] NtDisplayString: {}", text.trim_end_matches(['\r', '\n']));
-    Ok(STATUS_SUCCESS)
+    state::guarded(|| {
+        if !probe_user_read(string, 16) {
+            return Ok(0xC000_0005);
+        }
+        let string = state::user_struct::<UnicodeString>(string)?;
+        let length = string.length.probe_get()? as u64;
+        let buffer = string.buffer.probe_get()?;
+        if !probe_user_read(buffer, length) {
+            return Ok(0xC000_0005);
+        }
+        let text = state::try_read_user_wide_string(buffer, length / 2)?;
+        serial::write(text.as_bytes());
+        crate::debug_print!("[usermode] NtDisplayString: {}", text.trim_end_matches(['\r', '\n']));
+        Ok(STATUS_SUCCESS)
+    })
 }
 
 /// NtTerminateProcess(handle, exitCode): a HAL faz o longjmp de volta.
@@ -105,11 +122,14 @@ fn nt_query_performance_counter(counter: u64, frequency: u64, _a3: u64, _a4: u64
     if counter == 0 || !probe_user_write(counter, 8) || (frequency != 0 && !probe_user_write(frequency, 8)) {
         return Ok(0xC000_0005);
     }
-    guest::write64(counter, cpu::rdtsc());
-    if frequency != 0 {
-        guest::write64(frequency, clock::tsc_frequency_hz());
-    }
-    Ok(STATUS_SUCCESS)
+    state::guarded(|| {
+        // LARGE_INTEGER.QuadPart de cada saída: um store de qword sondado.
+        guest::try_write::<u64>(counter, cpu::rdtsc())?;
+        if frequency != 0 {
+            guest::try_write::<u64>(frequency, clock::tsc_frequency_hz())?;
+        }
+        Ok(STATUS_SUCCESS)
+    })
 }
 
 /// NtContinue(context, alertable): reescreve o frame do syscall com o
@@ -119,69 +139,74 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
     if context == 0 || !probe_user_read(context, 0x300) {
         return Ok(0xC000_0005);
     }
-    let flags = guest::read32(context + 0x30);
-    if flags & 3 != 3 || flags & 0x40 != 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    // Bits reservados fariam o FXRSTOR falhar no kernel.
-    if flags & 8 != 0 && guest::read32(context + 0x118) & !0xFFFF != 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    let frame = state::with(|state| state.syscall_stack_top) - 0x78;
-    let read64 = |offset: u64| guest::read64(context + offset);
-    let canonical = |value: u64| value > 0 && value < 0x8000_0000_0000;
-    if !canonical(read64(0xF8)) || !canonical(read64(0x98)) || guest::read16(context + 0x38) != 0x33 || guest::read16(context + 0x42) != 0x2B {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    // Os registradores de depuração são preparados antes de mudar o frame.
-    let mut debug_bank = 0u64;
-    if flags & 0x10 != 0 {
-        debug_bank = guest::alloc_bytes(48);
-        if debug_bank == 0 {
-            return Ok(0xC000_009A);
+    state::guarded(|| {
+        let user = state::user_struct::<Context>(context)?;
+        let flags = user.context_flags.probe_get()?;
+        if flags & 3 != 3 || flags & 0x40 != 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
         }
-        let values = [read64(0x48), read64(0x50), read64(0x58), read64(0x60), 0, read64(0x70)];
-        for (index, value) in thread_context_registers::debug_registers(values, 1).into_iter().enumerate() {
-            guest::write64(debug_bank + index as u64 * 8, value);
+        // Bits reservados fariam o FXRSTOR falhar no kernel.
+        if flags & 8 != 0 && user.flt_save.mx_csr.probe_get()? & !0xFFFF != 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
         }
-    }
-    let copy = |destination: u64, offset: u64| guest::write64(destination, read64(offset));
-    copy(frame, 0x78); // rax
-    guest::write64(frame + 0x08, read64(0xF8)); // rip
-    copy(frame + 0x10, 0x88); // rdx
-    copy(frame + 0x18, 0xA8); // rsi
-    copy(frame + 0x20, 0xB0); // rdi
-    copy(frame + 0x28, 0xB8); // r8
-    copy(frame + 0x30, 0xC0); // r9
-    copy(frame + 0x38, 0xC8); // r10
-    // RF é preservado (um breakpoint de execução retoma a instrução uma
-    // vez); IOPL/NT/VM/VIF/VIP continuam filtrados.
-    guest::write64(frame + 0x40, ((guest::read32(context + 0x44) & 0x21_0DD5) | 0x200) as u64);
-    copy(frame + 0x48, 0x90); // rbx
-    copy(frame + 0x50, 0xA0); // rbp
-    copy(frame + 0x58, 0xD8); // r12
-    copy(frame + 0x60, 0xE0); // r13
-    copy(frame + 0x68, 0xE8); // r14
-    copy(frame + 0x70, 0xF0); // r15
-    // A pilha do usuário mora na célula compartilhada lida pela HAL.
-    guest::write64(USER_RSP_CELL_ADDR, read64(0x98));
-    copy(0x8_F0A8, 0x80); // RCX independente do RIP
-    copy(0x8_F0B0, 0xD0); // R11 independente do RFLAGS
-    if flags & 8 != 0 {
-        let fx_save = frame - 0x208;
-        for index in 0..512 {
-            guest::write8(fx_save + index, guest::read8(context + 0x100 + index));
+        let canonical = |value: u64| value > 0 && value < 0x8000_0000_0000;
+        let (rip, rsp) = (user.rip.probe_get()?, user.rsp.probe_get()?);
+        if !canonical(rip) || !canonical(rsp) || user.seg_cs.probe_get()? != 0x33 || user.seg_ss.probe_get()? != 0x2B {
+            return Ok(STATUS_INVALID_PARAMETER);
         }
-    }
-    if debug_bank != 0 {
-        if let Some(setter) = *SET_USER_DEBUG_REGISTERS.lock() {
-            setter(debug_bank);
+        // Tudo é capturado antes de mudar o frame: uma falha de sonda nunca
+        // deixa o retorno pela metade.
+        let debug = if flags & 0x10 != 0 { Some([user.dr0.probe_get()?, user.dr1.probe_get()?, user.dr2.probe_get()?, user.dr3.probe_get()?, 0, user.dr7.probe_get()?]) } else { None };
+        let [rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15] = [&user.rax, &user.rcx, &user.rdx, &user.rbx, &user.rbp, &user.rsi, &user.rdi, &user.r8, &user.r9, &user.r10, &user.r11, &user.r12, &user.r13, &user.r14, &user.r15].map(|register| register.probe_get());
+        let (rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15) = (rax?, rcx?, rdx?, rbx?, rbp?, rsi?, rdi?, r8?, r9?, r10?, r11?, r12?, r13?, r14?, r15?);
+        let eflags = user.e_flags.probe_get()?;
+        let float_image = if flags & 8 != 0 { Some(guest::try_read_bytes(user.flt_save.address(), XsaveFormat::SIZE as usize)?) } else { None };
+        // Os registradores de depuração são preparados antes de mudar o frame.
+        let mut debug_bank = 0u64;
+        if let Some(values) = debug {
+            debug_bank = guest::alloc_bytes(48);
+            if debug_bank == 0 {
+                return Ok(0xC000_009A);
+            }
+            let bank: Vec<u8> = thread_context_registers::debug_registers(values, 1).into_iter().flat_map(u64::to_le_bytes).collect();
+            guest::write_bytes(debug_bank, &bank);
         }
-        guest::free_bytes(debug_bank);
-    }
-    guest::write32(0x8_F0A0, 1);
-    crate::debug_print!("[usermode] NtContinue -> rip {:#x} rsp {:#x}", read64(0xF8), read64(0x98));
-    Ok(guest::read32(context + 0x78))
+        let frame = state::syscall_frame();
+        frame.rax.set(rax);
+        frame.rip.set(rip);
+        frame.rdx.set(rdx);
+        frame.rsi.set(rsi);
+        frame.rdi.set(rdi);
+        frame.r8.set(r8);
+        frame.r9.set(r9);
+        frame.r10.set(r10);
+        // RF é preservado (um breakpoint de execução retoma a instrução uma
+        // vez); IOPL/NT/VM/VIF/VIP continuam filtrados.
+        frame.rflags.set(((eflags & 0x21_0DD5) | 0x200) as u64);
+        frame.rbx.set(rbx);
+        frame.rbp.set(rbp);
+        frame.r12.set(r12);
+        frame.r13.set(r13);
+        frame.r14.set(r14);
+        frame.r15.set(r15);
+        // A pilha do usuário mora na célula compartilhada lida pela HAL.
+        guest::write64(USER_RSP_CELL_ADDR, rsp);
+        guest::write64(0x8_F0A8, rcx); // RCX independente do RIP
+        guest::write64(0x8_F0B0, r11); // R11 independente do RFLAGS
+        if let Some(image) = float_image {
+            // Imagem FXSAVE que o retorno da HAL restaura, logo abaixo do frame.
+            guest::write_bytes(frame.address() - 0x208, &image);
+        }
+        if debug_bank != 0 {
+            if let Some(setter) = *SET_USER_DEBUG_REGISTERS.lock() {
+                setter(debug_bank);
+            }
+            guest::free_bytes(debug_bank);
+        }
+        guest::write32(0x8_F0A0, 1);
+        crate::debug_print!("[usermode] NtContinue -> rip {:#x} rsp {:#x}", rip, rsp);
+        Ok(rax as u32)
+    })
 }
 
 /// Objeto esperável do handle com SYNCHRONIZE.
@@ -219,10 +244,15 @@ fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alerta
     if !probe_user_read(handles, count * 8) || (timeout != 0 && !probe_user_read(timeout, 8)) {
         return Ok(0xC000_0005);
     }
+    // O vetor de HANDLEs é capturado de uma vez (cópia sondada).
+    let captured = match guest::try_read_bytes(handles, (count * 8) as usize) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(0xC000_0005),
+    };
     let mut pointers = Vec::new();
     let mut entries = Vec::new();
-    for index in 0..count {
-        match waitable(guest::read64(handles + index * 8)) {
+    for handle in captured.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))) {
+        match waitable(handle) {
             Ok((entry, pointer)) => {
                 entries.push(entry);
                 pointers.push(pointer);
@@ -243,9 +273,8 @@ fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alerta
     if array == 0 {
         return Ok(0xC000_0017);
     }
-    for (index, &pointer) in pointers.iter().enumerate() {
-        guest::write64(array + index as u64 * 8, pointer);
-    }
+    let objects: Vec<u8> = pointers.iter().flat_map(|pointer| pointer.to_le_bytes()).collect();
+    guest::write_bytes(array, &objects);
     let status = dispatcher::wait_for_multiple_objects(count as u32, array, wait_type as u32, timeout, 0, false);
     guest::free_bytes(array);
     Ok(status)
@@ -265,87 +294,87 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         5 => return system_process_information::query(buffer, length, returned, true),
         _ => {}
     }
-    // ProbeForWrite real: o buffer de saída precisa ser gravável.
-    if buffer != 0 && !probe_user_write(buffer, length) {
+    // ProbeForWrite real: o buffer de saída e o ReturnLength opcional
+    // precisam ser graváveis.
+    if (buffer != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
         return Ok(0xC000_0005);
     }
-    let set_returned = |value: u32| {
-        if returned != 0 {
-            guest::write32(returned, value);
-        }
-    };
-    match class {
-        // Basic/EmulationBasic/NativeBasic x64.
-        0 | 62 | 114 => {
-            if length < 0x40 {
-                set_returned(0x40);
-                return Ok(STATUS_INFO_LENGTH_MISMATCH);
-            }
-            let pages = kmalloc::ram_top() / 0x1000;
-            guest::write32(buffer, 0);
-            guest::write32(buffer + 0x04, 156_250); // TimerResolution (100 ns)
-            guest::write32(buffer + 0x08, 0x1000);
-            guest::write32(buffer + 0x0C, pages as u32);
-            guest::write32(buffer + 0x10, 0);
-            guest::write32(buffer + 0x14, (pages - 1) as u32);
-            guest::write32(buffer + 0x18, 0x10000);
-            guest::write32(buffer + 0x1C, 0);
-            guest::write64(buffer + 0x20, 0x10000);
-            guest::write64(buffer + 0x28, memory_map::USER_ADDRESS_LIMIT - 1);
-            guest::write64(buffer + 0x30, online_mask());
-            guest::write64(buffer + 0x38, smp::online_cpu_count() as u64);
-            set_returned(0x40);
-            Ok(STATUS_SUCCESS)
-        }
-        // SystemRangeStartInformation.
-        50 => {
-            set_returned(8);
-            if length < 8 {
-                return Ok(STATUS_INFO_LENGTH_MISMATCH);
-            }
-            guest::write32(buffer, 0);
-            guest::write32(buffer + 4, 0xFFFF_8000);
-            Ok(STATUS_SUCCESS)
-        }
-        // SYSTEM_NUMA_INFORMATION com um único nó.
-        55 => {
-            set_returned(24);
-            if length < 24 {
-                return Ok(STATUS_INFO_LENGTH_MISMATCH);
-            }
-            guest::write64(buffer, 0);
-            guest::write64(buffer + 8, online_mask());
-            guest::write64(buffer + 16, 0);
-            Ok(STATUS_SUCCESS)
-        }
-        _ => {
-            crate::debug_print!("[usermode] NtQuerySystemInformation classe {} (nao coberta ainda)", class);
-            // Classes de política/recurso ausente: buffer zerado, nunca
-            // INVALID_INFO_CLASS (a 24H2 trata como fatal no loader).
-            if class == 192 || class == 197 {
-                for index in 0..length {
-                    guest::write8(buffer + index, 0);
-                }
-                set_returned(length as u32);
-                return Ok(STATUS_SUCCESS);
-            }
-            // SystemMemoryListInformation.
-            if class == 80 {
-                let size = 22 * 8u64;
-                set_returned(size as u32);
-                if length < size {
+    state::guarded(|| {
+        let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
+        match class {
+            // Basic/EmulationBasic/NativeBasic x64.
+            0 | 62 | 114 => {
+                if length < SystemBasicInformation::SIZE {
+                    set_returned(SystemBasicInformation::SIZE as u32)?;
                     return Ok(STATUS_INFO_LENGTH_MISMATCH);
                 }
-                for index in 0..size {
-                    guest::write8(buffer + index, 0);
-                }
-                // Sem lista de páginas zeradas nem standby/pagefile.
-                guest::write64(buffer + 0x08, pfn::free_count());
-                return Ok(STATUS_SUCCESS);
+                let pages = kmalloc::ram_top() / 0x1000;
+                // Preenchimento zerado como o resto da estrutura.
+                guest::try_write_bytes(buffer, &[0; SystemBasicInformation::SIZE as usize])?;
+                let basic = state::user_struct::<SystemBasicInformation>(buffer)?;
+                basic.timer_resolution.probe_set(156_250)?; // 100 ns
+                basic.page_size.probe_set(0x1000)?;
+                basic.number_of_physical_pages.probe_set(pages as u32)?;
+                basic.highest_physical_page_number.probe_set((pages - 1) as u32)?;
+                basic.allocation_granularity.probe_set(0x10000)?;
+                basic.minimum_user_mode_address.probe_set(0x10000)?;
+                basic.maximum_user_mode_address.probe_set(memory_map::USER_ADDRESS_LIMIT - 1)?;
+                basic.active_processors_affinity_mask.probe_set(online_mask())?;
+                basic.number_of_processors.probe_set(smp::online_cpu_count() as i8)?;
+                set_returned(SystemBasicInformation::SIZE as u32)?;
+                Ok(STATUS_SUCCESS)
             }
-            Ok(STATUS_INVALID_INFO_CLASS)
+            // SystemRangeStartInformation: um ULONG_PTR.
+            50 => {
+                set_returned(8)?;
+                if length < 8 {
+                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                guest::try_write::<u64>(buffer, 0xFFFF_8000_0000_0000)?;
+                Ok(STATUS_SUCCESS)
+            }
+            // SYSTEM_NUMA_INFORMATION com um único nó (o prefixo de 24 bytes).
+            55 => {
+                set_returned(24)?;
+                if length < 24 {
+                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                let numa = state::user_struct::<SystemNumaInformation>(buffer)?;
+                numa.highest_node_number.probe_set(0)?;
+                numa.reserved.probe_set(0)?;
+                let node = &numa.active_processors_group_affinity[0];
+                node.mask.probe_set(online_mask())?;
+                node.group.probe_set(0)?;
+                for reserved in &node.reserved {
+                    reserved.probe_set(0)?;
+                }
+                Ok(STATUS_SUCCESS)
+            }
+            _ => {
+                crate::debug_print!("[usermode] NtQuerySystemInformation classe {} (nao coberta ainda)", class);
+                // Classes de política/recurso ausente: buffer zerado, nunca
+                // INVALID_INFO_CLASS (a 24H2 trata como fatal no loader).
+                if class == 192 || class == 197 {
+                    guest::try_write_bytes(buffer, &alloc::vec![0; length as usize])?;
+                    set_returned(length as u32)?;
+                    return Ok(STATUS_SUCCESS);
+                }
+                // SystemMemoryListInformation.
+                if class == 80 {
+                    let size = SystemMemoryListInformation::SIZE;
+                    set_returned(size as u32)?;
+                    if length < size {
+                        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+                    guest::try_write_bytes(buffer, &[0; SystemMemoryListInformation::SIZE as usize])?;
+                    // Sem lista de páginas zeradas nem standby/pagefile.
+                    state::user_struct::<SystemMemoryListInformation>(buffer)?.free_page_count.probe_set(pfn::free_count())?;
+                    return Ok(STATUS_SUCCESS);
+                }
+                Ok(STATUS_INVALID_INFO_CLASS)
+            }
         }
-    }
+    })
 }
 
 /// NtQuerySystemInformationEx(class, input, inputLength, buffer, length,
@@ -362,42 +391,49 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     if input_length as u32 != 4 || input == 0 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    let relationship = guest::read32(input);
-    crate::debug_print!("[usermode] topologia: relationship={}", relationship);
-    let need = match relationship {
-        4 => 80u64,
-        1 | 6 => 48,
-        _ => return Ok(STATUS_INVALID_INFO_CLASS),
-    };
-    if returned != 0 {
-        guest::write32(returned, need as u32);
-    }
-    if length < need {
-        return Ok(STATUS_INFO_LENGTH_MISMATCH);
-    }
-    if buffer == 0 || !probe_user_write(buffer, need) {
+    // InputBuffer e ReturnLength são sondados antes do uso.
+    if !probe_user_read(input, 4) || (returned != 0 && !probe_user_write(returned, 4)) {
         return Ok(0xC000_0005);
     }
-    for index in 0..need {
-        guest::write8(buffer + index, 0);
-    }
-    if relationship == 4 {
-        // RelationGroup: o grupo 0 com as CPUs que deram boot.
-        guest::write32(buffer, 4);
-        guest::write32(buffer + 4, need as u32);
-        guest::write16(buffer + 8, 1);
-        guest::write16(buffer + 10, 1);
-        guest::write8(buffer + 32, 64);
-        guest::write8(buffer + 33, smp::online_cpu_count() as u8);
-        guest::write64(buffer + 72, online_mask());
-    } else {
-        // NUMA_RELATIONSHIP: um único nó.
-        guest::write32(buffer, relationship);
-        guest::write32(buffer + 4, need as u32);
-        guest::write16(buffer + 30, 1);
-        guest::write64(buffer + 32, online_mask());
-    }
-    Ok(STATUS_SUCCESS)
+    state::guarded(|| {
+        // LOGICAL_PROCESSOR_RELATIONSHIP.
+        let relationship = guest::try_read::<u32>(input)?;
+        crate::debug_print!("[usermode] topologia: relationship={}", relationship);
+        let need = match relationship {
+            4 => 80u64,
+            1 | 6 => 48,
+            _ => return Ok(STATUS_INVALID_INFO_CLASS),
+        };
+        if returned != 0 {
+            guest::try_write::<u32>(returned, need as u32)?;
+        }
+        if length < need {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        if buffer == 0 || !probe_user_write(buffer, need) {
+            return Ok(0xC000_0005);
+        }
+        guest::try_write_bytes(buffer, &alloc::vec![0; need as usize])?;
+        let information = state::user_struct::<SystemLogicalProcessorInformationEx>(buffer)?;
+        information.relationship.probe_set(relationship as i32)?;
+        information.size.probe_set(need as u32)?;
+        if relationship == 4 {
+            // RelationGroup: o grupo 0 com as CPUs que deram boot.
+            let group = &information.group;
+            group.maximum_group_count.probe_set(1)?;
+            group.active_group_count.probe_set(1)?;
+            let info = &group.group_info[0];
+            info.maximum_processor_count.probe_set(64)?;
+            info.active_processor_count.probe_set(smp::online_cpu_count() as u8)?;
+            info.active_processor_mask.probe_set(online_mask())?;
+        } else {
+            // NUMA_NODE_RELATIONSHIP: um único nó.
+            let node = &information.numa_node;
+            node.group_count.probe_set(1)?;
+            node.group_mask.mask.probe_set(online_mask())?;
+        }
+        Ok(STATUS_SUCCESS)
+    })
 }
 
 /// NtTraceEvent: aceito e descartado (sessão ETW sem consumidor).
@@ -416,28 +452,32 @@ fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u
     if (count != 0 && !probe_user_read(parameters, count * 8)) || (response != 0 && !probe_user_write(response, 4)) {
         return Ok(0xC000_0005);
     }
-    let mut texts: Vec<String> = Vec::new();
-    for index in 0..count {
-        let value = guest::read64(parameters + index * 8);
-        if unicode_mask & (1 << index) != 0 {
-            if !probe_user_read(value, 16) {
-                return Ok(0xC000_0005);
+    state::guarded(|| {
+        let mut texts: Vec<String> = Vec::new();
+        for index in 0..count {
+            // ULONG_PTR Parameters[index].
+            let value = guest::try_read::<u64>(parameters + index * 8)?;
+            if unicode_mask & (1 << index) != 0 {
+                if !probe_user_read(value, 16) {
+                    return Ok(0xC000_0005);
+                }
+                let string = state::user_struct::<UnicodeString>(value)?;
+                let length = string.length.probe_get()? as u64;
+                let buffer = string.buffer.probe_get()?;
+                if length & 1 != 0 || !probe_user_read(buffer, length) {
+                    return Ok(0xC000_0005);
+                }
+                texts.push(state::try_read_user_wide_string(buffer, (length / 2).min(512))?);
+            } else {
+                texts.push(alloc::format!("{value:#x}"));
             }
-            let length = guest::read16(value) as u64;
-            let buffer = guest::read64(value + 8);
-            if length & 1 != 0 || !probe_user_read(buffer, length) {
-                return Ok(0xC000_0005);
-            }
-            texts.push(state::read_user_wide_string(buffer, (length / 2).min(512)));
-        } else {
-            texts.push(alloc::format!("{value:#x}"));
         }
-    }
-    crate::debug_print!("[usermode] HARDERROR: status={:#x} params={}", status as u32, texts.join(" | "));
-    if response != 0 {
-        guest::write32(response, 2); // ResponseAbort
-    }
-    Ok(STATUS_SUCCESS)
+        crate::debug_print!("[usermode] HARDERROR: status={:#x} params={}", status as u32, texts.join(" | "));
+        if response != 0 {
+            guest::try_write::<u32>(response, 2)?; // ResponseAbort
+        }
+        Ok(STATUS_SUCCESS)
+    })
 }
 
 /// x64 unificado: a coerência de instruções é garantida pelo hardware.
@@ -450,12 +490,19 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     let class = class as u32;
     let length = length as u32 as u64;
     let returned = stack_arg(rsp, 5);
-    let set_returned = |value: u32| {
-        if returned != 0 {
-            guest::write32(returned, value);
+    let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
+    // As classes locais sondam o ReturnLength antes de qualquer escrita.
+    let local = matches!(class, 0 | 27 | 31 | 36);
+    if local && returned != 0 && !probe_user_write(returned, 4) {
+        if class == 0 && handle as i64 != -1 && handle as u32 != u32::MAX {
+            let status = super::handles::current_process(handle, 0x1000);
+            if status != 0 {
+                return Ok(status);
+            }
         }
-    };
-    match class {
+        return Ok(0xC000_0005);
+    }
+    state::guarded(|| match class {
         // ProcessBasicInformation (ou a estendida com Size e Flags).
         0 => {
             if handle as i64 != -1 && handle as u32 != u32::MAX {
@@ -464,33 +511,31 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
                     return Ok(status);
                 }
             }
-            if returned != 0 && !probe_user_write(returned, 4) {
-                return Ok(0xC000_0005);
-            }
-            let extended = length >= 0x40;
-            let size = if extended { 0x40 } else { 0x30 };
-            if length != 0x30 && !extended {
-                set_returned(size as u32);
+            let extended = length >= ProcessExtendedBasicInformation::SIZE;
+            let size = if extended { ProcessExtendedBasicInformation::SIZE } else { ProcessBasicInformation::SIZE };
+            if length != ProcessBasicInformation::SIZE && !extended {
+                set_returned(size as u32)?;
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
             }
             if !probe_user_write(buffer, size) {
                 return Ok(0xC000_0005);
             }
-            for index in 0..size {
-                guest::write8(buffer + index, 0);
-            }
-            let at = if extended { 8 } else { 0 };
-            if extended {
-                guest::write64(buffer, 0x40);
-            }
+            guest::try_write_bytes(buffer, &alloc::vec![0; size as usize])?;
+            let basic = if extended {
+                let information = state::user_struct::<ProcessExtendedBasicInformation>(buffer)?;
+                information.size.probe_set(size)?;
+                &information.basic_info
+            } else {
+                state::user_struct::<ProcessBasicInformation>(buffer)?
+            };
             let (peb, process_id) = state::with(|state| (state.current_peb_va, state.current_process_id));
-            guest::write32(buffer + at, 0x103); // processo vivo: STATUS_PENDING
-            guest::write64(buffer + at + 0x08, peb);
-            guest::write64(buffer + at + 0x10, 1); // o escalonador de usuário roda no BSP
-            guest::write32(buffer + at + 0x18, 8);
-            guest::write64(buffer + at + 0x20, process_id);
-            guest::write64(buffer + at + 0x28, 4); // criado pelo processo System
-            set_returned(size as u32);
+            basic.exit_status.probe_set(0x103)?; // processo vivo: STATUS_PENDING
+            basic.peb_base_address.probe_set(peb)?;
+            basic.affinity_mask.probe_set(1)?; // o escalonador de usuário roda no BSP
+            basic.base_priority.probe_set(8)?;
+            basic.unique_process_id.probe_set(process_id)?;
+            basic.inherited_from_unique_process_id.probe_set(4)?; // criado pelo processo System
+            set_returned(size as u32)?;
             Ok(STATUS_SUCCESS)
         }
         // ProcessDebugPort, do estado da EPROCESS referenciada.
@@ -500,34 +545,43 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         },
         // ProcessImageInformation: dados da seção da imagem do alvo.
         37 => query_image_information(rsp),
-        // ProcessImageFileName.
+        // ProcessImageFileName: UNICODE_STRING seguido do texto.
         27 => {
             let path = state::with(|state| state.current_image_path.clone());
             let path = if path.is_empty() { String::from("C:\\usertest.exe") } else { path };
-            let need = 16 + (path.encode_utf16().count() as u64 + 1) * 2;
+            let need = UnicodeString::SIZE + (path.encode_utf16().count() as u64 + 1) * 2;
             if length < need {
-                set_returned(need as u32);
+                set_returned(need as u32)?;
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
             }
-            state::write_user_wide(buffer + 16, &path);
-            state::write_unicode_string(buffer, buffer + 16, &path);
-            set_returned(need as u32);
+            if !probe_user_write(buffer, need) {
+                return Ok(0xC000_0005);
+            }
+            state::try_write_user_wide(buffer + UnicodeString::SIZE, &path)?;
+            state::try_write_unicode_string(buffer, buffer + UnicodeString::SIZE, &path)?;
+            set_returned(need as u32)?;
             Ok(STATUS_SUCCESS)
         }
-        // ProcessDebugFlags: 1 = sem depurador.
+        // ProcessDebugFlags (ULONG): 1 = sem depurador.
         31 => {
             if length < 4 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
             }
-            guest::write32(buffer, 1);
-            set_returned(4);
+            if !probe_user_write(buffer, 4) {
+                return Ok(0xC000_0005);
+            }
+            guest::try_write::<u32>(buffer, 1)?;
+            set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
-        // ProcessCookie: o cookie de RtlEncodePointer, por processo e
+        // ProcessCookie (ULONG): o cookie de RtlEncodePointer, por processo e
         // nunca zero.
         36 => {
             if length < 4 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !probe_user_write(buffer, 4) {
+                return Ok(0xC000_0005);
             }
             let cookie = state::with(|state| {
                 if state.current_process_cookie == 0 {
@@ -537,15 +591,15 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
                 }
                 state.current_process_cookie
             });
-            guest::write32(buffer, cookie);
-            set_returned(4);
+            guest::try_write::<u32>(buffer, cookie)?;
+            set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
         _ => {
             crate::debug_print!("[usermode] NtQueryInformationProcess classe {}", class);
             Ok(STATUS_INVALID_INFO_CLASS)
         }
-    }
+    })
 }
 
 /// `image_information::query`: os 64 bits dos argumentos e as
@@ -628,7 +682,9 @@ fn nt_query_security_object(handle: u64, flags: u64, out: u64, length: u64, rsp:
         return Ok(0xC000_0005);
     }
     let bytes = object_security::encode(&security, flags);
-    guest::write32(returned, bytes.len() as u32);
+    if guest::try_write::<u32>(returned, bytes.len() as u32).is_err() {
+        return Ok(0xC000_0005);
+    }
     if (length as u32 as usize) < bytes.len() {
         return Ok(0xC000_0023);
     }

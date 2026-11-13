@@ -11,6 +11,7 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::context::{set as set_thread_context, registers as registers};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Context, Kthread, NtStruct, XsaveFormat};
 
 pub fn apply(thread: u64, source: u64) -> Result<u32, KernelError> {
     if irql::get_irql() > 1 {
@@ -33,17 +34,22 @@ pub fn apply(thread: u64, source: u64) -> Result<u32, KernelError> {
     }
     let result = (|| -> Result<u32, KernelError> {
         cpu::fxsave(fx);
-        let selected = guest::read32(source + 0x30);
+        // SAFETY: CONTEXT capturado em memória do kernel pelo `begin`, a
+        // imagem FXSAVE recém-gravada e o CONTEXT salvo da thread corrente.
+        let (captured, image, live) = unsafe { (Context::at(source), XsaveFormat::at(fx), Context::at(context)) };
+        let selected = captured.context_flags.get();
         let prepared = context_frame::prepare(context, selected);
-        let mask = match guest::read32(fx + 0x1C) {
+        let mask = match image.mx_csr_mask.get() {
             0 => 0xFFBF,
             mask => mask,
         };
-        registers::write_saved_context(context, source, 1, mask, guest::read32(fx + 0x18))?;
+        registers::write_saved_context(context, source, 1, mask, image.mx_csr.get())?;
         let debug = selected & 0x10_0010 == 0x10_0010;
         if debug {
-            let active = guest::read64(context + 0x70) & 0x355 != 0;
-            guest::write8(thread + 3, (guest::read8(thread + 3) & !1) | active as u8);
+            // Header.DebugActive.ActiveDR7: CAS atômico no byte (os bits
+            // vizinhos do mesmo byte não se perdem).
+            // SAFETY: KTHREAD da thread corrente.
+            unsafe { Kthread::at(thread) }.header.set_active_dr7((live.dr7.get() & 0x355 != 0) as u8);
         }
         if prepared.retain() && debug {
             usermode::set_user_debug_registers(context + 0x48);

@@ -25,7 +25,7 @@ use crate::ntos::mm::pfn;
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::types::{Eprocess, MemAddressRequirements, MemExtendedParameter, NtStruct};
 
 const PAGE: u64 = 0x1000;
 const MAX_SAFE: u64 = (1 << 53) - 1;
@@ -134,7 +134,8 @@ pub enum Space {
 
 impl Space {
     pub fn of(process: u64) -> Space {
-        if guest::read64(process + eprocess::UNIQUE_PROCESS_ID) == state::with(|state| state.current_process_id) {
+        // SAFETY: EPROCESS vivo, referenciado pelo chamador.
+        if unsafe { Eprocess::at(process) }.unique_process_id.get() == state::with(|state| state.current_process_id) {
             Space::Active
         } else {
             Space::Foreign(process)
@@ -316,8 +317,10 @@ pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u
 #[allow(clippy::too_many_arguments)]
 pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
     let highest = if highest == 0 { space.default_highest() } else { highest }.min(USER_ADDRESS_LIMIT);
-    let mut base = guest::read64(base_pointer);
-    let requested = guest::read64(size_pointer);
+    // PVOID *BaseAddress e SIZE_T *RegionSize: de usuário (sondados pelo
+    // handler) ou do kernel (Zw); os acessos são sondados nos dois casos.
+    let mut base = guest::try_read::<u64>(base_pointer)?;
+    let requested = guest::try_read::<u64>(size_pointer)?;
     if base > MAX_SAFE || requested == 0 || requested > MAX_SAFE || base + requested > USER_ADDRESS_LIMIT {
         debug_print!("[usermode] alloc invalida: base=0x{:x} size=0x{:x} type=0x{:x}", base, requested, allocation_type);
         return Ok(STATUS_INVALID_PARAMETER);
@@ -346,8 +349,8 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                 } else if !map_user_page_range(base, size, private(&existing), protect) {
                     return Ok(0xC000_0017);
                 }
-                guest::write64(base_pointer, base);
-                guest::write64(size_pointer, size);
+                guest::try_write::<u64>(base_pointer, base)?;
+                guest::try_write::<u64>(size_pointer, size)?;
                 return Ok(0);
             }
             debug_print!("[usermode] alloc CONFLITO: base 0x{:x} size 0x{:x} tipo 0x{:x} - regiao em 0x{:x}", base, size, allocation_type, existing.base());
@@ -371,8 +374,8 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         return Ok(0xC000_0017);
     }
     space.insert(region, automatic, top_down);
-    guest::write64(base_pointer, base);
-    guest::write64(size_pointer, size);
+    guest::try_write::<u64>(base_pointer, base)?;
+    guest::try_write::<u64>(size_pointer, size)?;
     Ok(0)
 }
 
@@ -434,17 +437,22 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
 pub fn nt_allocate_virtual_memory(_process: u64, base_pointer: u64, _zero_bits: u64, size_pointer: u64, user_rsp: u64) -> Result<u32, KernelError> {
     let allocation_type = state::stack_arg32(user_rsp, 5);
     let protect = state::stack_arg32(user_rsp, 6);
-    do_user_allocate(base_pointer, size_pointer, allocation_type, protect, 0, DEFAULT_HIGHEST, 0x1_0000)
+    // Os ponteiros de saída são acessados por cópias sondadas.
+    state::guarded(|| do_user_allocate(base_pointer, size_pointer, allocation_type, protect, 0, DEFAULT_HIGHEST, 0x1_0000))
 }
 
 /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*,
 /// count): sem ZeroBits; MEM_ADDRESS_REQUIREMENTS honrado; PartitionHandle
 /// recusado pelo syscall nativo mesmo válido.
 pub fn nt_allocate_virtual_memory_ex(_process: u64, base_pointer: u64, size_pointer: u64, allocation_type: u64, user_rsp: u64) -> Result<u32, KernelError> {
-    if guest::read64(size_pointer) == 0 {
-        debug_print!("[usermode] allocEx tamanho zero chamado de 0x{:x} caller2=0x{:x} sizePtr=0x{:x}", guest::read64(user_rsp), guest::read64(user_rsp + 0x90), size_pointer);
+    let (parameters, count) = (state::stack_arg(user_rsp, 6), state::stack_arg32(user_rsp, 7) as u64);
+    // BaseAddress, RegionSize e o vetor de MEM_EXTENDED_PARAMETER são
+    // acessados por cópias sondadas.
+    if guest::try_read::<u64>(size_pointer).is_ok_and(|size| size == 0) {
+        // Diagnóstico: endereços de retorno na pilha de usuário.
+        debug_print!("[usermode] allocEx tamanho zero chamado de 0x{:x} caller2=0x{:x} sizePtr=0x{:x}", guest::try_read::<u64>(user_rsp).unwrap_or(0), guest::try_read::<u64>(user_rsp + 0x90).unwrap_or(0), size_pointer);
     }
-    allocate_ex_in(Space::Active, base_pointer, size_pointer, allocation_type as u32, state::stack_arg32(user_rsp, 5), state::stack_arg(user_rsp, 6), state::stack_arg32(user_rsp, 7) as u64)
+    state::guarded(|| allocate_ex_in(Space::Active, base_pointer, size_pointer, allocation_type as u32, state::stack_arg32(user_rsp, 5), parameters, count))
 }
 
 /// NtAllocateVirtualMemoryEx no espaço dado: MEM_ADDRESS_REQUIREMENTS
@@ -457,17 +465,19 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
     }
     let (mut lowest, mut highest, mut align) = (0u64, space.default_highest(), 0x1_0000u64);
     for index in 0..count {
-        let entry = parameters + index * 16;
-        match guest::read64(entry) {
+        let entry = state::user_struct::<MemExtendedParameter>(parameters + index * MemExtendedParameter::SIZE)?;
+        // Header inteiro (Type nos 8 bits baixos, Reserved zero).
+        match entry.header.probe_get()? {
+            // MemExtendedParameterAddressRequirements.
             1 => {
-                let requirements = guest::read64(entry + 8);
-                lowest = guest::read64(requirements);
-                highest = guest::read64(requirements + 8);
+                let requirements = state::user_struct::<MemAddressRequirements>(entry.pointer.probe_get()?)?;
+                lowest = requirements.lowest_starting_address.probe_get()?;
+                highest = requirements.highest_ending_address.probe_get()?;
                 // HighestEndingAddress 0 = sem limite superior.
                 if highest == 0 {
                     highest = space.default_highest();
                 }
-                let alignment = guest::read64(requirements + 0x10);
+                let alignment = requirements.alignment.probe_get()?;
                 if alignment != 0 {
                     align = alignment;
                 }
@@ -483,13 +493,13 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
 /// reservada); MEM_RELEASE libera a região privada inteira; seções usam
 /// UnmapView.
 pub fn nt_free_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, free_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
-    free_in(Space::Active, base_pointer, size_pointer, free_type as u32)
+    state::guarded(|| free_in(Space::Active, base_pointer, size_pointer, free_type as u32))
 }
 
 /// MEM_RESET: a faixa (arredondada a páginas) tem de estar comitada numa
 /// região privada do espaço; o conteúdo pode ser preservado.
 pub fn validate_committed(space: Space, base_pointer: u64, size_pointer: u64) -> Result<u32, KernelError> {
-    let (base, size) = (guest::read64(base_pointer), guest::read64(size_pointer));
+    let (base, size) = (guest::try_read::<u64>(base_pointer)?, guest::try_read::<u64>(size_pointer)?);
     if base == 0 || size == 0 || base > MAX_SAFE || size > MAX_SAFE || base + size > USER_ADDRESS_LIMIT {
         return Ok(STATUS_INVALID_PARAMETER);
     }
@@ -504,15 +514,15 @@ pub fn validate_committed(space: Space, base_pointer: u64, size_pointer: u64) ->
     if (first..end).step_by(PAGE as usize).any(|va| !committed.contains(&((va - owner.base) / PAGE))) {
         return Ok(0xC000_002D);
     }
-    guest::write64(base_pointer, first);
-    guest::write64(size_pointer, end - first);
+    guest::try_write::<u64>(base_pointer, first)?;
+    guest::try_write::<u64>(size_pointer, end - first)?;
     Ok(0)
 }
 
 /// MEM_DECOMMIT/MEM_RELEASE no espaço dado.
 pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u32) -> Result<u32, KernelError> {
-    let base = guest::read64(base_pointer);
-    let size = guest::read64(size_pointer);
+    let base = guest::try_read::<u64>(base_pointer)?;
+    let size = guest::try_read::<u64>(size_pointer)?;
     let Some(region) = space.find(base) else {
         debug_print!("[usermode] NtFreeVirtualMemory: base 0x{:x} size 0x{:x} tipo 0x{:x} - NAO MAPEADO", base, size, free_type);
         return Ok(STATUS_INVALID_PARAMETER);
@@ -553,8 +563,8 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
     if release {
         space.remove(&region);
     }
-    guest::write64(base_pointer, first);
-    guest::write64(size_pointer, end - first);
+    guest::try_write::<u64>(base_pointer, first)?;
+    guest::try_write::<u64>(size_pointer, end - first)?;
     Ok(0)
 }
 
@@ -563,7 +573,7 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
 /// da imagem); falha de política devolve PAGE_NOACCESS no OldProtect sem
 /// tocar base, tamanho ou PTEs.
 pub fn nt_protect_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, new_protect: u64, user_rsp: u64) -> Result<u32, KernelError> {
-    protect_in(Space::Active, base_pointer, size_pointer, new_protect as u32, state::stack_arg(user_rsp, 5), true)
+    state::guarded(|| protect_in(Space::Active, base_pointer, size_pointer, new_protect as u32, state::stack_arg(user_rsp, 5), true))
 }
 
 /// Troca a proteção no espaço dado; ponteiros de modo usuário são sondados.
@@ -572,8 +582,8 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     if from_user && (!state::probe_user_write(base_pointer, 8) || !state::probe_user_write(size_pointer, 8) || !state::probe_user_write(old_pointer, 4)) {
         return Ok(0xC000_0005);
     }
-    let requested_base = guest::read64(base_pointer);
-    let requested_size = guest::read64(size_pointer);
+    let requested_base = guest::try_read::<u64>(base_pointer)?;
+    let requested_size = guest::try_read::<u64>(size_pointer)?;
     if requested_base == 0 || requested_base > MAX_SAFE || requested_size == 0 || requested_size > MAX_SAFE || requested_base + requested_size > USER_ADDRESS_LIMIT {
         return Ok(STATUS_INVALID_PARAMETER);
     }
@@ -586,7 +596,8 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
         return Ok(0xC000_0045);
     }
     let Some(region) = region.filter(|region| end <= region.base() + region.size()) else { return Ok(0xC000_0018) };
-    guest::write32(old_pointer, 1);
+    // ULONG *OldProtect = PAGE_NOACCESS até a troca dar certo.
+    guest::try_write::<u32>(old_pointer, 1)?;
     let section = region.section();
     let view = view_of(&region);
     if let Some(view) = &view {
@@ -611,9 +622,9 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
             if status != 0 {
                 return Ok(status);
             }
-            guest::write32(old_pointer, old);
-            guest::write64(base_pointer, base);
-            guest::write64(size_pointer, size);
+            guest::try_write::<u32>(old_pointer, old)?;
+            guest::try_write::<u64>(base_pointer, base)?;
+            guest::try_write::<u64>(size_pointer, size)?;
             return Ok(0);
         }
     }
@@ -636,9 +647,9 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
         paging::map_page(va, physical, flags, MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });
         region.record_protect(index, protect, physical);
     }
-    guest::write32(old_pointer, old);
-    guest::write64(base_pointer, base);
-    guest::write64(size_pointer, size);
+    guest::try_write::<u32>(old_pointer, old)?;
+    guest::try_write::<u64>(base_pointer, base)?;
+    guest::try_write::<u64>(size_pointer, size)?;
     Ok(0)
 }
 
@@ -694,8 +705,9 @@ fn transfer_virtual_memory(process: u64, address: u64, buffer: u64, size: u64, r
         physical::write_bytes(paging::translate(target + offset), &block);
         done += count;
     }
-    if transferred != 0 {
-        guest::write64(transferred, done);
+    // SIZE_T *NumberOfBytesTransferred (sondado acima).
+    if transferred != 0 && guest::try_write::<u64>(transferred, done).is_err() {
+        return Ok(0xC000_0005);
     }
     Ok(if done == size { 0 } else { 0x8000_000D })
 }

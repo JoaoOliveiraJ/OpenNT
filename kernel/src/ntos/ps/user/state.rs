@@ -32,7 +32,11 @@ use crate::ntos::ob::{callbacks, handle_ids};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::status::STATUS_ACCESS_VIOLATION;
+use crate::ntos::inc::types::{Eprocess, Field, IoStatusBlock, NtStruct, UnicodeString};
+
+/// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
+pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
 /// 64 KiB de pilha de kernel para o ring 3.
 pub const SYSCALL_STACK_PAGES: u64 = 16;
@@ -300,40 +304,107 @@ pub fn write_user_bytes(va: u64, bytes: &[u8]) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// `count` WCHARs de um buffer de usuário (já sondado pelo chamador), numa
+/// cópia sondada: uma página desmapeada no meio devolve ACCESS_VIOLATION.
+pub fn try_read_user_wide_string(buffer_va: u64, count: u64) -> Result<String, KernelError> {
+    let bytes = guest::try_read_bytes(buffer_va, (count * 2) as usize)?;
+    let units: alloc::vec::Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// Como [`try_read_user_wide_string`]; uma falha de sonda devolve o texto vazio.
 pub fn read_user_wide_string(buffer_va: u64, count: u64) -> String {
-    let units: alloc::vec::Vec<u16> = (0..count).map(|index| guest::read16(buffer_va + index * 2)).collect();
-    String::from_utf16_lossy(&units)
+    try_read_user_wide_string(buffer_va, count).unwrap_or_default()
 }
 
-/// Grava o texto com NUL; devolve o comprimento em bytes sem o NUL.
+fn wide_with_nul(text: &str) -> alloc::vec::Vec<u8> {
+    text.encode_utf16().chain(core::iter::once(0)).flat_map(u16::to_le_bytes).collect()
+}
+
+/// Grava o texto com NUL numa estrutura de usuário montada pelo kernel;
+/// devolve o comprimento em bytes sem o NUL.
 pub fn write_user_wide(va: u64, text: &str) -> u64 {
-    let mut count = 0u64;
-    for unit in text.encode_utf16() {
-        guest::write16(va + count * 2, unit);
-        count += 1;
-    }
-    guest::write16(va + count * 2, 0);
-    count * 2
+    let bytes = wide_with_nul(text);
+    guest::write_bytes(va, &bytes);
+    bytes.len() as u64 - 2
 }
 
-/// UNICODE_STRING com MaximumLength incluindo o NUL.
+/// [`write_user_wide`] num buffer de usuário (cópia sondada).
+pub fn try_write_user_wide(va: u64, text: &str) -> Result<u64, KernelError> {
+    let bytes = wide_with_nul(text);
+    guest::try_write_bytes(va, &bytes)?;
+    Ok(bytes.len() as u64 - 2)
+}
+
+/// UNICODE_STRING com MaximumLength incluindo o NUL, numa estrutura de
+/// usuário montada pelo kernel.
 pub fn write_unicode_string(struct_va: u64, buffer_va: u64, text: &str) {
-    let bytes = text.encode_utf16().count() as u64 * 2;
-    guest::write16(struct_va, bytes as u16);
-    guest::write16(struct_va + 2, bytes as u16 + 2);
-    guest::write32(struct_va + 4, 0);
-    guest::write64(struct_va + 8, buffer_va);
+    let bytes = text.encode_utf16().count() as u16 * 2;
+    // SAFETY: estrutura do processo criada e comprometida pelo próprio kernel.
+    let string = unsafe { UnicodeString::at(struct_va) };
+    string.length.set(bytes);
+    string.maximum_length.set(bytes + 2);
+    string.buffer.set(buffer_va);
+}
+
+/// [`write_unicode_string`] num buffer de usuário (escritas sondadas).
+pub fn try_write_unicode_string(struct_va: u64, buffer_va: u64, text: &str) -> Result<(), KernelError> {
+    let bytes = text.encode_utf16().count() as u16 * 2;
+    let string = UnicodeString::try_at(struct_va)?;
+    string.length.probe_set(bytes)?;
+    string.maximum_length.probe_set(bytes + 2)?;
+    string.buffer.probe_set(buffer_va)
+}
+
+/// IO_STATUS_BLOCK de modo usuário: Status estendido aos 64 bits do slot
+/// (Status/Pointer), como a cópia da estrutura na conclusão, e Information.
+pub fn set_user_iosb(iosb: u64, status: u32, information: u64) -> Result<(), KernelError> {
+    let block = IoStatusBlock::try_at(iosb)?;
+    block.pointer.probe_set(status as u64)?;
+    block.information.probe_set(information)
+}
+
+/// Estrutura de modo usuário cuja faixa útil o chamador já sondou com
+/// `probe_user_read`/`probe_user_write` (classes de informação de tamanho
+/// variável cabem num prefixo do tipo): aqui só nulo e alinhamento, como no
+/// ProbeForWrite do NT. Cada acesso segue sondado (`probe_get`/`probe_set`).
+pub fn user_struct<T: NtStruct>(address: u64) -> Result<&'static T, KernelError> {
+    if address == 0 {
+        return Err(guest::address_fault(address));
+    }
+    if address % core::mem::align_of::<T>() as u64 != 0 {
+        return Err(KernelError::with_status(format!("datatype misalignment at {address:#x}"), STATUS_DATATYPE_MISALIGNMENT));
+    }
+    // SAFETY: não nulo e alinhado; a faixa foi sondada pelo chamador e os
+    // acessos seguintes são sondados de novo.
+    Ok(unsafe { T::at(address) })
+}
+
+/// Falha de sonda: o `__except` do NT em volta dos acessos a memória de
+/// usuário devolve o código da exceção ao chamador.
+pub fn probe_fault(error: &KernelError) -> bool {
+    matches!(error.status, STATUS_ACCESS_VIOLATION | STATUS_DATATYPE_MISALIGNMENT)
+}
+
+/// Corpo de serviço com acessos sondados: ACCESS_VIOLATION e
+/// DATATYPE_MISALIGNMENT viram o status devolvido; os demais erros sobem.
+pub fn guarded(body: impl FnOnce() -> Result<u32, KernelError>) -> Result<u32, KernelError> {
+    match body() {
+        Err(error) if probe_fault(&error) => Ok(error.status),
+        other => other,
+    }
 }
 
 /// Argumento de pilha do syscall (1-based, a partir do 5): o stub da ntdll
 /// não ajusta a pilha; o chamador pôs o arg5 em [rsp+0x20] e o `call`
-/// empurrou o retorno.
+/// empurrou o retorno. O despachante sonda a área de argumentos; uma pilha
+/// desmapeada lê zero, nunca uma falha de kernel.
 pub fn stack_arg(user_rsp: u64, index: u64) -> u64 {
-    guest::read64(user_rsp + 0x28 + (index - 5) * 8)
+    guest::try_read::<u64>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
 }
 
 pub fn stack_arg32(user_rsp: u64, index: u64) -> u32 {
-    guest::read32(user_rsp + 0x28 + (index - 5) * 8)
+    guest::try_read::<u32>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
 }
 
 /// O despachante nativo sonda a pilha antes de copiá-la; os handlers
@@ -346,24 +417,57 @@ pub fn probe_syscall_stack(rsp: u64, bytes: u64) -> bool {
     probe_user_read(rsp + 0x28, bytes)
 }
 
+/// Frame que o stub de syscall da HAL de modo usuário salva no topo da pilha
+/// de syscall (layout do OpenNT, não do NT): os registradores devolvidos ao
+/// anel 3 no retorno; R10/RDX/R8/R9 são também os quatro primeiros argumentos.
+#[repr(C)]
+pub struct SyscallFrame {
+    pub rax: Field<u64>,
+    pub rip: Field<u64>,
+    pub rdx: Field<u64>,
+    pub rsi: Field<u64>,
+    pub rdi: Field<u64>,
+    pub r8: Field<u64>,
+    pub r9: Field<u64>,
+    pub r10: Field<u64>,
+    pub rflags: Field<u64>,
+    pub rbx: Field<u64>,
+    pub rbp: Field<u64>,
+    pub r12: Field<u64>,
+    pub r13: Field<u64>,
+    pub r14: Field<u64>,
+    pub r15: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for SyscallFrame {}
+
+const _: () = assert!(core::mem::size_of::<SyscallFrame>() == 0x78);
+
+/// O frame do syscall corrente, logo abaixo do topo da pilha de syscall.
+pub fn syscall_frame() -> &'static SyscallFrame {
+    let top = S.lock().syscall_stack_top;
+    // SAFETY: a pilha de syscall é do kernel e o stub sempre salva o frame.
+    unsafe { SyscallFrame::at(top - SyscallFrame::SIZE) }
+}
+
 /// ULONG_PTR opaco em duas palavras (os quatro primeiros vêm dos argumentos
 /// brutos ou do frame salvo; os demais da pilha de usuário).
 pub fn syscall_arg_words(user_rsp: u64, index: u64) -> [u32; 2] {
-    const OFFSETS: [u64; 4] = [0x38, 0x10, 0x28, 0x30];
-    let (raw, top) = {
-        let state = S.lock();
-        (state.service_raw_arguments, state.syscall_stack_top)
-    };
-    let address = if index <= 4 {
+    let raw = S.lock().service_raw_arguments;
+    // Uma carga de qword: o argumento nunca é observado pela metade.
+    let value = if index <= 4 {
+        // Vetor bruto do despacho ou frame do syscall: memória do kernel.
         if raw != 0 {
-            raw + index * 8
+            guest::read::<u64>(raw + index * 8)
         } else {
-            top - 0x78 + OFFSETS[index as usize - 1]
+            let frame = syscall_frame();
+            [&frame.r10, &frame.rdx, &frame.r8, &frame.r9][index as usize - 1].get()
         }
     } else {
-        user_rsp + 0x28 + (index - 5) * 8
+        guest::try_read::<u64>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
     };
-    [guest::read32(address), guest::read32(address + 4)]
+    [value as u32, (value >> 32) as u32]
 }
 
 /// Falha de página de seção (`ps/user/sections.fault`), instalada pelo
@@ -747,7 +851,8 @@ pub fn release_user_handle_reference(entry: &UserHandle) -> Result<(), KernelErr
 
 /// O processo corrente é o processo de usuário em execução.
 fn owns(process: u64) -> bool {
-    S.lock().current_process_id == guest::read64(process + eprocess::UNIQUE_PROCESS_ID)
+    // SAFETY: EPROCESS vivo da tabela de handles.
+    S.lock().current_process_id == unsafe { Eprocess::at(process) }.unique_process_id.get()
 }
 
 fn handle_attributes(handle: u64) -> Option<u32> {

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use super::file_io::{self, OpenRequest};
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state::{self, NativeBody, UserObject, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER};
 use crate::ntos::io::io_manager::{self, IoParams, IoResult, RequestContext};
 use crate::ntos::ke::dispatcher;
@@ -22,6 +22,7 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{IoStatusBlock, NtStruct, SectionBasicInformation};
 
 /// Handle `device` do processo: o caminho, o handle do I/O manager e o
 /// FILE_OBJECT aberto pelo IRP_MJ_CREATE.
@@ -113,10 +114,12 @@ fn device_path_of(path: &str) -> Option<String> {
     device
 }
 
+/// IO_STATUS_BLOCK (sondado) com o status e Information zero.
 fn fail_iosb(iosb: u64, status: u32) -> u32 {
-    guest::write64(iosb, status as u64);
-    guest::write64(iosb + 8, 0);
-    status
+    match state::set_user_iosb(iosb, status, 0) {
+        Ok(()) => status,
+        Err(_) => 0xC000_0005,
+    }
 }
 
 /// NtOpenFile/NtCreateFile: dispositivo pelo I/O manager ou arquivo do
@@ -126,6 +129,11 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
         return Ok(0xC000_0005);
     }
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(STATUS_INVALID_PARAMETER) };
+    // OBJ_* do OA, lido uma vez.
+    let object_flags = match user_object_attributes(attributes) {
+        Ok(flags) => flags,
+        Err(error) => return Ok(error.status),
+    };
     let device_path = device_path_of(&parsed.path);
     if let Some(device_path) = device_path.as_ref().filter(|path| object_manager::lookup(path).is_some()) {
         debug_print!("[usermode] abre device: {}", device_path);
@@ -139,12 +147,14 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
         }
         let object = Arc::new(UserDevice { device_path: device_path.clone(), options: request.options, device_handle: opened.handle, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
         let access = file_objects::access(request.access);
-        return match state::alloc_user_handle(object, access, guest::read32(attributes + 24) & 2) {
+        return match state::alloc_user_handle(object, access, object_flags & 2) {
             Ok(handle) => {
-                guest::write64(handle_pointer, handle as u64);
-                guest::write64(iosb, 0);
-                guest::write64(iosb + 8, 1);
-                Ok(0)
+                if guest::try_write::<u64>(handle_pointer, handle as u64).is_err() {
+                    close::close_user(handle as u64, true);
+                    return Ok(0xC000_0005);
+                }
+                // FILE_OPENED.
+                Ok(if state::set_user_iosb(iosb, 0, 1).is_err() { 0xC000_0005 } else { 0 })
             }
             Err(error) => {
                 let _ = io_manager::close_device(opened.handle);
@@ -161,7 +171,7 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
         debug_print!("[usermode] device NAO EXISTE: {}", device_path);
         return Ok(fail_iosb(iosb, 0xC000_0034));
     }
-    file_io::open(handle_pointer, &parsed.path, iosb, disposition, &OpenRequest { handle_attributes: guest::read32(attributes + 24), ..*request })
+    file_io::open(handle_pointer, &parsed.path, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..*request })
 }
 
 /// NtOpenFile(handle*, access, oa, ioStatus*, share, options).
@@ -209,7 +219,7 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
         if event != 0 && completion.as_ref().is_none_or(|completion| completion.kind() != "event") {
             return Ok(STATUS_INVALID_HANDLE);
         }
-        let data: Vec<u8> = (0..input_length as u64).map(|offset| guest::read8(input + offset)).collect();
+        let Ok(data) = guest::try_read_bytes(input, input_length as usize) else { return Ok(0xC000_0005) };
         let mut request = io_manager::make_io_request(0x0E, IoParams { control_code: code, data: Some(data), binary: true, output_length: Some(output_length), ..IoParams::default() });
         request.file_object = device.file_object;
         io_manager::call_driver(&device.device_path, &mut request)?;
@@ -226,8 +236,9 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
                 state::write_user_bytes(output, &bytes[..request.info as usize])?;
             }
         }
-        guest::write64(iosb, status as u64);
-        guest::write64(iosb + 8, request.info);
+        if state::set_user_iosb(iosb, status, request.info).is_err() {
+            return Ok(0xC000_0005);
+        }
         if let Some(body) = completion.and_then(|completion| completion.object.native_body()) {
             dispatcher::set_event(body.pointer);
         }
@@ -247,11 +258,15 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
     let guest_status = io_manager::iof_call_driver(top, packet) as u32;
     // A conclusão já copiou o IoStatus para o IOSB do usuário; o retorno do
     // dispatch vale quando o IoStatus ficou zerado.
-    let mut status = guest::read32(iosb);
+    let mut status = match state::user_struct::<IoStatusBlock>(iosb).and_then(|block| block.status.probe_get()) {
+        Ok(value) => value as u32,
+        Err(error) => error.status,
+    };
     if status == 0 && guest_status != 0 {
         status = guest_status;
-        guest::write64(iosb, status as u64);
-        guest::write64(iosb + 8, 0);
+        if state::set_user_iosb(iosb, status, 0).is_err() {
+            status = 0xC000_0005;
+        }
     }
     if guest_status != 0x103 {
         guest::free_bytes(packet);
@@ -266,7 +281,7 @@ fn nt_close(handle: u64, force: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u3
 
 /// NtCreateSection(handle*, access, oa?, maxSize*, pageProt, secProt, file).
 fn nt_create_section(handle_pointer: u64, access: u64, attributes: u64, size_pointer: u64, rsp: u64) -> Result<u32, KernelError> {
-    create_section::create(handle_pointer, access as u32, attributes, size_pointer, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), guest::read64(rsp + 0x38), 1, None)
+    create_section::create(handle_pointer, access as u32, attributes, size_pointer, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), 1, None)
 }
 
 fn nt_open_section(handle_pointer: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -305,20 +320,23 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
     if returned != 0 && !state::probe_user_write(returned, 8) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write64(returned, 24);
-    }
-    if length < 24 {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_write(out, 24) {
-        return Ok(0xC000_0005);
-    }
-    guest::write64(out, 0);
-    guest::write32(out + 8, section.attributes);
-    guest::write32(out + 12, 0);
-    guest::write64(out + 16, section.maximum_size);
-    Ok(0)
+    state::guarded(|| {
+        // SIZE_T *ReturnLength.
+        if returned != 0 {
+            guest::try_write::<u64>(returned, SectionBasicInformation::SIZE)?;
+        }
+        if length < SectionBasicInformation::SIZE {
+            return Ok(0xC000_0004);
+        }
+        if !state::probe_user_write(out, SectionBasicInformation::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        guest::try_write_bytes(out, &[0; SectionBasicInformation::SIZE as usize])?;
+        let information = state::user_struct::<SectionBasicInformation>(out)?;
+        information.allocation_attributes.probe_set(section.attributes)?;
+        information.maximum_size.quad_part.probe_set(section.maximum_size as i64)?;
+        Ok(0)
+    })
 }
 
 /// Fim do processo de usuário: fecha os handles, desmonta as vistas de

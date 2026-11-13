@@ -28,6 +28,7 @@ use crate::ntos::ob::object_manager;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{AlpcDirectAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, AlpcWorkOnBehalfTicket, NtStruct, ObjectAttributes, PortMessage, Sid, UnicodeString};
 
 pub use crate::ntos::alpc::transport::register;
 
@@ -121,12 +122,8 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
         let mut state = request.state.lock();
         (state.direct.take(), state.release_direct.take())
     };
-    let sequence = if legacy_synchronous { 0 } else { message_identity::next_sequence(port.with(|state| state.message_sequence)) };
+    let sequence = if legacy_synchronous { 0 } else { next_port_sequence(port) };
     let message = Message { bytes: buffer, context, reserve, id: request.id, identity: identity.clone(), sequence, status: result.status, sender: Some(current_sender()), synchronous, direct: direct.is_some() };
-    if !legacy_synchronous {
-        port.with(|state| state.message_sequence = sequence);
-        port.set_sequence(sequence);
-    }
     identity.with(|state| {
         state.queued = true;
         state.direct = message.direct;
@@ -208,7 +205,7 @@ fn queue_cancellation(port: &Arc<Port>, request: &Arc<Request>) {
         if state.cancellation_queued {
             return;
         }
-        let sequence = message_identity::next_sequence(port.with(|port| port.message_sequence));
+        let sequence = next_port_sequence(port);
         let message = Message { bytes: Some(reply(&[], 12, identity, Some(state.sender))), context: state.context, reserve: state.reserve.clone(), id: request.id, identity: identity.clone(), sequence, status: 0, sender: None, synchronous: false, direct: state.direct.is_some() };
         state.cancellation_queued = true;
         (message, state.direct.take(), state.release_direct.take())
@@ -217,12 +214,7 @@ fn queue_cancellation(port: &Arc<Port>, request: &Arc<Request>) {
         state.queued = true;
         state.direct = message.direct;
     });
-    let sequence = message.sequence;
-    port.with(|state| {
-        state.message_sequence = sequence;
-        state.pending.push(message);
-    });
-    port.set_sequence(sequence);
+    port.with(|state| state.pending.push(message));
     if let Some(event) = direct {
         dispatcher::set_event(event);
         if let Some(release) = release_direct {
@@ -455,8 +447,10 @@ pub fn pump() {
 /// Endereço de um atributo no buffer, pelo tamanho de cada atributo alocado
 /// (AlpcGetHeaderSize da ntdll, com o slot reservado de 24 bytes).
 pub fn attribute_address(pointer: u64, requested: u32) -> u64 {
-    let allocated = guest::read32(pointer);
-    let mut at = pointer + 8;
+    // ALPC_MESSAGE_ATTRIBUTES (de usuário ou de kernel, conforme o modo):
+    // uma falha de sonda não designa atributo algum.
+    let Ok(allocated) = message_attributes(pointer).and_then(|attributes| attributes.allocated_attributes.probe_get()) else { return 0 };
+    let mut at = pointer + AlpcMessageAttributes::SIZE;
     for (flag, size) in [(0x8000_0000u32, 24u64), (0x4000_0000, 32), (0x2000_0000, 32), (0x1000_0000, 24), (0x0800_0000, 24), (0x0400_0000, 8), (0x0200_0000, 8)] {
         if flag == requested {
             return at;
@@ -472,6 +466,12 @@ fn context_attribute(pointer: u64) -> u64 {
     attribute_address(pointer, 0x2000_0000)
 }
 
+/// O cabeçalho ALPC_MESSAGE_ATTRIBUTES; os acessos são sondados porque o
+/// buffer pode ser de usuário.
+fn message_attributes(pointer: u64) -> Result<&'static AlpcMessageAttributes, KernelError> {
+    state::user_struct::<AlpcMessageAttributes>(pointer)
+}
+
 pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
     if pointer == 0 {
         return 0;
@@ -479,8 +479,8 @@ pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
     if !(if input { message_buffer::accessible(pointer, 8, mode, false) } else { message_buffer::writable(pointer, 8, mode) }) {
         return AV;
     }
-    let allocated = guest::read32(pointer);
-    let valid = guest::read32(pointer + 4);
+    let header = message_attributes(pointer).and_then(|header| Ok((header.allocated_attributes.probe_get()?, header.valid_attributes.probe_get()?)));
+    let Ok((allocated, valid)) = header else { return AV };
     if input && valid & !allocated != 0 {
         return INVALID;
     }
@@ -493,7 +493,7 @@ pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
         if !message_buffer::accessible(at, 24, mode, false) {
             return AV;
         }
-        let quality = guest::read64(at + 8);
+        let Ok(quality) = state::user_struct::<AlpcSecurityAttr>(at).and_then(|security| security.p_qos.probe_get()) else { return AV };
         if quality != 0 && !message_buffer::accessible(quality, 12, mode, false) {
             return AV;
         }
@@ -516,31 +516,53 @@ pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
     0
 }
 
-pub fn publish_attributes(pointer: u64, port: &Port, context: u64, sequence: u32, identity: &Identity) {
+/// A próxima sequência de entrega da porta: lida, incrementada e gravada
+/// sob a mesma trava (dois emissores nunca recebem o mesmo número).
+fn next_port_sequence(port: &Port) -> u32 {
+    port.with(|state| {
+        let sequence = message_identity::next_sequence(state.message_sequence);
+        state.message_sequence = sequence;
+        port.set_sequence(sequence);
+        sequence
+    })
+}
+
+/// Publica o ALPC_CONTEXT_ATTR e o ValidAttributes da recepção; uma falha
+/// de sonda devolve ACCESS_VIOLATION.
+pub fn try_publish_attributes(pointer: u64, port: &Port, context: u64, sequence: u32, identity: &Identity) -> Result<(), u32> {
     if pointer == 0 {
-        return;
+        return Ok(());
     }
-    let allocated = guest::read32(pointer) & 0x2000_0000;
+    let header = message_attributes(pointer).map_err(|error| error.status)?;
+    let allocated = header.allocated_attributes.probe_get().map_err(|error| error.status)? & 0x2000_0000;
     let port_context = port.with(|state| state.port_context);
     if allocated != 0 {
-        context_attribute::write(context_attribute(pointer), port_context, context, sequence, identity.identifier, identity.callback);
+        context_attribute::try_write(context_attribute(pointer), port_context, context, sequence, identity.identifier, identity.callback)?;
     }
-    guest::write32(pointer + 4, if port_context != 0 { allocated } else { 0 });
+    header.valid_attributes.probe_set(if port_context != 0 { allocated } else { 0 }).map_err(|error| error.status)
+}
+
+/// Como [`try_publish_attributes`], para quem já validou o buffer: uma falha
+/// de sonda só perde a publicação.
+pub fn publish_attributes(pointer: u64, port: &Port, context: u64, sequence: u32, identity: &Identity) {
+    let _ = try_publish_attributes(pointer, port, context, sequence, identity);
 }
 
 fn capture(address: u64, maximum: u32) -> Result<Vec<u8>, u32> {
-    if !state::probe_user_read(address, 40) {
+    if !state::probe_user_read(address, PortMessage::SIZE) {
         return Err(AV);
     }
-    let size = guest::read16(address + 2) as u32;
-    let data_size = guest::read16(address) as u32;
-    if size < 40 || size > maximum || data_size != size - 40 || guest::read16(address + 6) != 0 {
+    let header = state::user_struct::<PortMessage>(address).and_then(|message| Ok((message.u1.s1.total_length.probe_get()? as u16 as u32, message.u1.s1.data_length.probe_get()? as u16 as u32, message.u2.s2.data_info_offset.probe_get()?)));
+    let (size, data_size, data_info_offset) = header.map_err(|error| error.status)?;
+    let header_size = PortMessage::SIZE as u32;
+    if size < header_size || size > maximum || data_size != size - header_size || data_info_offset != 0 {
         return Err(0xC000_0021);
     }
     if !state::probe_user_read(address, size as u64) {
         return Err(AV);
     }
-    Ok((0..data_size as u64).map(|index| guest::read8(address + 40 + index)).collect())
+    // A carga depois do cabeçalho, numa cópia sondada.
+    guest::try_read_bytes(address + PortMessage::SIZE, data_size as usize).map_err(|error| error.status)
 }
 
 /// Os endpoints deste módulo são hospedados pelo processo System real.
@@ -551,28 +573,35 @@ fn server_sid(pointer: u64) -> u32 {
     if !state::probe_user_read(pointer, 8) {
         return AV;
     }
-    let count = guest::read8(pointer + 1) as u64;
-    let size = 8 + count * 4;
+    let Ok(count) = state::user_struct::<Sid>(pointer).and_then(|sid| sid.sub_authority_count.probe_get()) else { return AV };
+    let size = 8 + count as u64 * 4;
     if count > 15 || !state::probe_user_read(pointer, size) {
         return AV;
     }
+    // S-1-5-18 (LocalSystem), comparado na cópia sondada.
     let sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-    if size == sid.len() as u64 && sid.iter().enumerate().all(|(index, &byte)| guest::read8(pointer + index as u64) == byte) { 0 } else { 0xC000_0257 }
+    let Ok(captured) = guest::try_read_bytes(pointer, size as usize) else { return AV };
+    if captured == sid { 0 } else { 0xC000_0257 }
 }
 
 fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) || !state::probe_user_read(name, 16) || !state::probe_syscall_stack(rsp, 56) || (oa != 0 && !state::probe_user_read(oa, 48)) || (port_attributes != 0 && !state::probe_user_read(port_attributes, 72)) {
+    state::guarded(|| connect_port(out, name, oa, port_attributes, rsp))
+}
+
+fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_user_write(out, 8) || !state::probe_user_read(name, UnicodeString::SIZE) || !state::probe_syscall_stack(rsp, 56) || (oa != 0 && !state::probe_user_read(oa, ObjectAttributes::SIZE)) || (port_attributes != 0 && !state::probe_user_read(port_attributes, AlpcPortAttributes::SIZE)) {
         return Ok(AV);
     }
-    let name_length = guest::read16(name) as u64;
-    let name_buffer = guest::read64(name + 8);
+    let port_name = state::user_struct::<UnicodeString>(name)?;
+    let name_length = port_name.length.probe_get()? as u64;
+    let name_buffer = port_name.buffer.probe_get()?;
     if name_length == 0 || name_length % 2 != 0 || name_length > 1024 {
         return Ok(INVALID);
     }
     if !state::probe_user_read(name_buffer, name_length) {
         return Ok(AV);
     }
-    let path = state::read_user_wide_string(name_buffer, name_length / 2);
+    let path = state::try_read_user_wide_string(name_buffer, name_length / 2)?;
     let Some(node) = object_manager::lookup(&path) else { return Ok(0xC000_0034) };
     if object_manager::node(node).is_none_or(|record| record.type_name != "AlpcPort") {
         return Ok(0xC000_0024);
@@ -609,15 +638,24 @@ fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp:
     } else {
         Vec::new()
     };
-    let capacity = if message != 0 { guest::read64(length) } else { 0 };
+    // SIZE_T *BufferLength (entrada e saída, sondado acima).
+    let capacity = if message != 0 { guest::try_read::<u64>(length)? } else { 0 };
     if capacity > 0x1_0000 {
         return Ok(INVALID);
     }
     if message != 0 && !state::probe_user_write(message, capacity) {
         return Ok(AV);
     }
-    let attribute = |offset: u64| if port_attributes != 0 { guest::read32(port_attributes + offset) } else { 0 };
-    let quality = if port_attributes != 0 { crate::ntos::alpc::security_contexts::Quality { level: guest::read32(port_attributes + 8), tracking: guest::read8(port_attributes + 12), effective_only: guest::read8(port_attributes + 13) != 0 } } else { crate::ntos::alpc::security_contexts::Quality { level: 2, tracking: 0, effective_only: false } };
+    // ALPC_PORT_ATTRIBUTES opcional: Flags, SecurityQos, MaxViewSize e
+    // DupObjectTypes capturados uma vez.
+    let (port_flags, duplicate_object_types, maximum_view_size, quality) = if port_attributes != 0 {
+        let attributes = state::user_struct::<AlpcPortAttributes>(port_attributes)?;
+        let qos = &attributes.security_qos;
+        let quality = crate::ntos::alpc::security_contexts::Quality { level: qos.impersonation_level.probe_get()?.0 as u32, tracking: qos.context_tracking_mode.probe_get()?, effective_only: qos.effective_only.probe_get()? != 0 };
+        (attributes.flags.probe_get()?, attributes.dup_object_types.probe_get()?, attributes.max_view_size.probe_get()?, quality)
+    } else {
+        (0, 0, 0, crate::ntos::alpc::security_contexts::Quality { level: 2, tracking: 0, effective_only: false })
+    };
     let initial = PortState {
         service: Some(service.clone()),
         service_process: process::get_system_process(),
@@ -626,9 +664,9 @@ fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp:
         message_sequence: 1,
         port_context: 0,
         role: Role::Client,
-        port_flags: attribute(0),
-        duplicate_object_types: attribute(64),
-        maximum_view_size: if port_attributes != 0 { guest::read64(port_attributes + 48) } else { 0 },
+        port_flags,
+        duplicate_object_types,
+        maximum_view_size,
         on_disconnect: Some(disconnect_transport),
         security_quality: Some(quality),
         ..PortState::default()
@@ -672,22 +710,27 @@ fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp:
             // tabela de mensagens.
             message_identity::release(&identity)?;
             connection_identity = Some(identity);
-            guest::write64(length, bytes.len() as u64);
+            guest::try_write::<u64>(length, bytes.len() as u64)?;
             if bytes.len() as u64 > capacity {
                 return Ok(0xC000_0023);
             }
             state::write_user_bytes(message, &bytes)?;
         }
         if message == 0 && receive_attributes != 0 {
-            guest::write32(receive_attributes + 4, 0);
+            message_attributes(receive_attributes)?.valid_attributes.probe_set(0)?;
         }
-        let status = port_objects::publish(&port, out, if oa != 0 { guest::read32(oa + 24) } else { 0 })?;
+        let object_flags = if oa != 0 { state::user_struct::<ObjectAttributes>(oa)?.attributes.probe_get()? } else { 0 };
+        let status = port_objects::publish(&port, out, object_flags)?;
         if status != 0 {
             return Ok(status);
         }
-        port.with(|state| state.port_context = guest::read64(out));
+        // O PortHandle publicado acima (lido de volta da saída sondada).
+        let handle = guest::try_read::<u64>(out)?;
+        port.with(|state| state.port_context = handle);
         if let Some(identity) = &connection_identity {
-            publish_attributes(receive_attributes, &port, 0, 1, identity);
+            if let Err(status) = try_publish_attributes(receive_attributes, &port, 0, 1, identity) {
+                return Ok(status);
+            }
         }
         add_port(&port);
         crate::debug_print!("[alpc] conectado {} pid={}", path, port.process_id());
@@ -720,7 +763,16 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     if port.with(|state| state.pending.len() + state.jobs.len()) >= 256 {
         return Ok(Err(0xC000_0044));
     }
-    let context_address = if send_attributes != 0 && guest::read32(send_attributes + 4) & 0x2000_0000 != 0 { context_attribute(send_attributes) } else { 0 };
+    // ValidAttributes do OutMessageAttributes (validado por `attributes`).
+    let valid = if send_attributes != 0 {
+        match message_attributes(send_attributes).and_then(|header| header.valid_attributes.probe_get()) {
+            Ok(valid) => valid,
+            Err(_) => return Ok(Err(AV)),
+        }
+    } else {
+        0
+    };
+    let context_address = if valid & 0x2000_0000 != 0 { context_attribute(send_attributes) } else { 0 };
     // OutMessageAttributes é entrada/saída: o emissor conserva o
     // MessageContext opaco e recebe a identidade atribuída pelo kernel.
     if context_address != 0 && !message_buffer::writable(context_address, 32, mode) {
@@ -785,7 +837,6 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
                 }))
             });
         }
-        let valid = if send_attributes != 0 { guest::read32(send_attributes + 4) } else { 0 };
         if valid & 0x8000_0000 != 0 {
             match message_security::capture(port, attribute_address(send_attributes, 0x8000_0000), mode)? {
                 Err(status) => return Ok(Err(status)),
@@ -800,15 +851,17 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
             }
         }
         if context_address != 0 {
-            let context = context_attribute::capture(context_address, port.with(|state| state.port_context), &identity);
-            request.state.lock().context = context;
+            match context_attribute::try_capture(context_address, port.with(|state| state.port_context), &identity) {
+                Ok(context) => request.state.lock().context = context,
+                Err(status) => return Ok(Err(status)),
+            }
         }
-        if send_attributes != 0 && guest::read32(send_attributes + 4) & 0x0400_0000 != 0 {
-            let status = direct_event::validate(flags | if reserve_id != 0 { 0x10 } else { 0 }, guest::read32(send_attributes + 4));
+        if valid & 0x0400_0000 != 0 {
+            let status = direct_event::validate(flags | if reserve_id != 0 { 0x10 } else { 0 }, valid);
             if status != 0 {
                 return Ok(Err(status));
             }
-            let event_handle = guest::read64(attribute_address(send_attributes, 0x0400_0000));
+            let Ok(event_handle) = state::user_struct::<AlpcDirectAttr>(attribute_address(send_attributes, 0x0400_0000)).and_then(|direct| direct.event.probe_get()) else { return Ok(Err(AV)) };
             if mode != 0 {
                 match events::reference(event_handle, 2) {
                     Err(status) => return Ok(Err(status)),
@@ -950,10 +1003,10 @@ impl Receiver {
         if delivery != 0 {
             return Ok(Some(delivery));
         }
-        publish_attributes(self.receive_attributes, port, context, sequence, &identity);
+        let published = try_publish_attributes(self.receive_attributes, port, context, sequence, &identity);
         take(port);
         message_identity::release(&identity)?;
-        Ok(Some(0))
+        Ok(Some(published.err().unwrap_or(0)))
     }
 
     fn poll(&self) -> Option<u32> {
@@ -1049,8 +1102,15 @@ pub fn exchange_messages(port: &Arc<Port>, flags: u32, input: u64, send_attribut
         None
     };
     let direct_selection = flags & 0x100_0000 != 0;
-    let mut selected = if direct_selection { guest::read32(output + 24) } else { 0 };
-    let selected_callback = if direct_selection { guest::read32(output + 32) } else { 0 };
+    // MessageId e CallbackId pedidos no cabeçalho de recepção (sondado acima).
+    let (mut selected, selected_callback) = if direct_selection {
+        match state::user_struct::<PortMessage>(output).and_then(|message| Ok((message.message_id.probe_get()?, message.callback_id.probe_get()?))) {
+            Ok(selection) => selection,
+            Err(_) => return Ok(Status(AV)),
+        }
+    } else {
+        (0, 0)
+    };
     if direct_selection && selected == 0 {
         return Ok(Status(INVALID));
     }
@@ -1169,15 +1229,20 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attribute
     let status = send_receive(handle, flags, input, attributes, rsp)?;
     if status == INVALID {
         let mut detail = alloc::format!("[alpc] invalid send flags=0x{:x}", flags as u32);
-        if input != 0 && state::probe_user_read(input, 40) {
-            detail.push_str(&alloc::format!(" type={} id={} size={}", guest::read16(input + 4), guest::read32(input + 24), guest::read16(input + 2)));
+        if input != 0 && state::probe_user_read(input, PortMessage::SIZE) {
+            if let Ok((kind, id, size)) = state::user_struct::<PortMessage>(input).and_then(|message| Ok((message.u2.s2.type_.probe_get()?, message.message_id.probe_get()?, message.u1.s1.total_length.probe_get()?))) {
+                detail.push_str(&alloc::format!(" type={} id={} size={}", kind as u16, id, size as u16));
+            }
         }
-        if attributes != 0 && state::probe_user_read(attributes, 8) {
-            let valid = guest::read32(attributes + 4);
-            detail.push_str(&alloc::format!(" attributes=0x{valid:x}"));
-            let at = attribute_address(attributes, 0x0200_0000);
-            if valid & 0x0200_0000 != 0 && state::probe_user_read(at, 8) {
-                detail.push_str(&alloc::format!(" origin={}:{}", guest::read32(at), guest::read32(at + 4)));
+        if attributes != 0 && state::probe_user_read(attributes, AlpcMessageAttributes::SIZE) {
+            if let Ok(valid) = message_attributes(attributes).and_then(|header| header.valid_attributes.probe_get()) {
+                detail.push_str(&alloc::format!(" attributes=0x{valid:x}"));
+                let at = attribute_address(attributes, 0x0200_0000);
+                if valid & 0x0200_0000 != 0 && state::probe_user_read(at, AlpcWorkOnBehalfTicket::SIZE) {
+                    if let Ok((thread, time)) = state::user_struct::<AlpcWorkOnBehalfTicket>(at).and_then(|ticket| Ok((ticket.thread_id.probe_get()?, ticket.thread_creation_time_low.probe_get()?))) {
+                        detail.push_str(&alloc::format!(" origin={thread}:{time}"));
+                    }
+                }
             }
         }
         crate::debug_print!("{}", detail);

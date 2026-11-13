@@ -14,7 +14,7 @@ use core::any::Any;
 
 use super::memory;
 use super::state::{self, write_unicode_string, write_user_bytes, write_user_wide, RegionKind, UserRegion};
-use super::structures::{insert_list_tail, ldr_entry, peb_ldr};
+use super::structures::insert_tail_list;
 use super::syscall_scan;
 use crate::hal::bundle;
 use crate::ntos::ex::system_services;
@@ -23,6 +23,12 @@ use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::rtl::api_set::{self, Schema};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::rtl::guest_strings;
+use crate::ntos::inc::types::extra_ps_user::ApiSetNamespace;
+use crate::ntos::inc::types::{ImageDosHeader, ImageImportByName, ImageImportDescriptor, ImageNtHeaders64, ImageThunkData64, LdrDataTableEntry, NtStruct, PebLdrData};
+
+/// Índice do diretório de imports no DataDirectory do cabeçalho opcional.
+const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::rtl::image::pe_exports::Exports;
@@ -250,8 +256,9 @@ pub fn parse_api_set_schema() -> Result<(), KernelError> {
         return Ok(());
     }
     let base = state::with(|state| state.api_set_map_va);
-    let size = guest::read32(base + 4) as u64;
-    let bytes: Vec<u8> = (0..size).map(|index| guest::read8(base + index)).collect();
+    // SAFETY: a seção .apiset mapeada pelo próprio loader do kernel.
+    let size = unsafe { ApiSetNamespace::at(base) }.size.get() as usize;
+    let bytes = guest::read_bytes(base, size);
     let schema = api_set::parse(&bytes)?;
     crate::debug_print!("[usermode] apiset schema: contratos parseados");
     *API_SET.lock() = Some(Arc::new(schema));
@@ -281,52 +288,51 @@ pub fn place_user_string(text: &str) -> Result<u64, KernelError> {
 /// A mesma entrada para o exe, a ntdll e as DLLs carregadas; a ordem de
 /// inicialização é a de carga (dependências primeiro).
 pub fn create_ldr_entry(module: &Module) -> Result<u64, KernelError> {
-    let entry = memory::map_user_region(ldr_entry::SIZE)?;
-    guest::write64(entry + ldr_entry::DLL_BASE, module.image_base);
+    let entry = memory::map_user_region(LdrDataTableEntry::SIZE)?;
+    // SAFETY: região do processo recém-comprometida pelo kernel.
+    let record = unsafe { LdrDataTableEntry::at(entry) };
+    record.dll_base.set(module.image_base);
     // RVA 0 no PE é EntryPoint nulo, não a base.
     let entry_point = if module.is_exe || module.entry_point <= module.image_base { 0 } else { module.entry_point };
-    guest::write64(entry + ldr_entry::ENTRY_POINT, entry_point);
-    guest::write32(entry + ldr_entry::SIZE_OF_IMAGE, module.size_of_image as u32);
+    record.entry_point.set(entry_point);
+    record.size_of_image.set(module.size_of_image as u32);
     let full = place_user_string(&module.full_name)?;
-    write_unicode_string(entry + ldr_entry::FULL_DLL_NAME, full, &module.full_name);
+    write_unicode_string(record.full_dll_name.address(), full, &module.full_name);
     let base = place_user_string(&module.name)?;
-    write_unicode_string(entry + ldr_entry::BASE_DLL_NAME, base, &module.name);
+    write_unicode_string(record.base_dll_name.address(), base, &module.name);
     // LDRP_STATIC_LINK | LDRP_ENTRY_PROCESSED [| LDRP_IMAGE_DLL].
-    guest::write32(entry + ldr_entry::FLAGS, 0x4002 | if module.is_exe { 0 } else { 0x4 });
-    guest::write16(entry + ldr_entry::LOAD_COUNT, 0xFFFF);
-    let ldr = state::with(|state| state.current_ldr_va);
-    insert_list_tail(ldr, peb_ldr::IN_LOAD_ORDER, entry, ldr_entry::IN_LOAD_ORDER_LINKS);
-    insert_list_tail(ldr, peb_ldr::IN_MEMORY_ORDER, entry, ldr_entry::IN_MEMORY_ORDER_LINKS);
-    insert_list_tail(ldr, peb_ldr::IN_INIT_ORDER, entry, ldr_entry::IN_INIT_ORDER_LINKS);
+    record.flags.set(0x4002 | if module.is_exe { 0 } else { 0x4 });
+    record.obsolete_load_count.set(0xFFFF);
+    // SAFETY: o PEB_LDR_DATA do processo corrente, montado pelo kernel.
+    let ldr = unsafe { PebLdrData::at(state::with(|state| state.current_ldr_va)) };
+    insert_tail_list(&ldr.in_load_order_module_list, &record.in_load_order_links);
+    insert_tail_list(&ldr.in_memory_order_module_list, &record.in_memory_order_links);
+    insert_tail_list(&ldr.in_initialization_order_module_list, &record.in_initialization_order_links);
     Ok(entry)
 }
 
-fn read_ascii(mut cursor: u64) -> String {
-    let mut text = String::new();
-    loop {
-        let byte = guest::read8(cursor);
-        if byte == 0 {
-            return text;
-        }
-        text.push(byte as char);
-        cursor += 1;
-    }
+/// Nome ASCII com NUL da imagem mapeada pelo kernel.
+fn read_ascii(cursor: u64) -> String {
+    guest_strings::read_c_string(cursor)
 }
 
 /// Resolve cada import da imagem mapeada contra os exports reais das DLLs,
 /// carregadas recursivamente antes (a dependência precisa estar pronta).
 pub fn bind_imports(image_base: u64, depth: u32) -> Result<(), KernelError> {
     let importer = state::with(|state| state.regions(RegionKind::ProcessImages).iter().find(|image| image.base() == image_base).and_then(|image| image.name())).unwrap_or_default();
-    let optional = image_base + guest::read32(image_base + 0x3C) as u64 + 24;
-    let directory = guest::read32(optional + 112 + 8) as u64;
+    // SAFETY: imagem mapeada pelo loader do kernel (cabeçalhos validados na carga).
+    let headers = unsafe { ImageNtHeaders64::at(image_base + ImageDosHeader::at(image_base).e_lfanew.get() as u64) };
+    let directory = headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT].virtual_address.get() as u64;
     if directory == 0 {
         return Ok(());
     }
     let mut descriptor = image_base + directory;
     loop {
-        let lookup = guest::read32(descriptor) as u64;
-        let name = guest::read32(descriptor + 12) as u64;
-        let iat = guest::read32(descriptor + 16) as u64;
+        // SAFETY: tabela de imports da imagem, terminada por um descritor nulo.
+        let import = unsafe { ImageImportDescriptor::at(descriptor) };
+        let lookup = import.original_first_thunk.get() as u64;
+        let name = import.name.get() as u64;
+        let iat = import.first_thunk.get() as u64;
         if lookup == 0 && name == 0 && iat == 0 {
             return Ok(());
         }
@@ -336,18 +342,20 @@ pub fn bind_imports(image_base: u64, depth: u32) -> Result<(), KernelError> {
         let table = if lookup != 0 { lookup } else { iat };
         let mut slot = 0u64;
         loop {
-            let low = guest::read32(image_base + table + slot * 8);
-            let high = guest::read32(image_base + table + slot * 8 + 4);
-            if low == 0 && high == 0 {
+            // SAFETY: vetores de thunks da tabela de imports, terminados por zero.
+            let (thunk, bound) = unsafe { (ImageThunkData64::at(image_base + table + slot * ImageThunkData64::SIZE), ImageThunkData64::at(image_base + iat + slot * ImageThunkData64::SIZE)) };
+            let value = thunk.u1.ordinal.get();
+            if value == 0 {
                 break;
             }
-            let symbol = if high & 0x8000_0000 != 0 { Symbol::Ordinal(low & 0xFFFF) } else { Symbol::Name(read_ascii(image_base + low as u64 + 2)) };
+            // IMAGE_ORDINAL_FLAG64, ou o RVA do IMAGE_IMPORT_BY_NAME.
+            let symbol = if value >> 63 != 0 { Symbol::Ordinal(value as u32 & 0xFFFF) } else { Symbol::Name(read_ascii(unsafe { ImageImportByName::at(image_base + value as u32 as u64) }.name.as_ptr() as u64)) };
             let mut loader = |name: &str, parent: &str| load_dll_by_name(name, depth + 1, parent).map(|module| module.exported());
             let address = pe_resolver::resolve_export(&dependency, &symbol, &mut loader, &mut BTreeSet::new())?;
-            guest::write64(image_base + iat + slot * 8, address);
+            bound.u1.function.set(address);
             slot += 1;
         }
-        descriptor += 20;
+        descriptor += ImageImportDescriptor::SIZE;
     }
 }
 

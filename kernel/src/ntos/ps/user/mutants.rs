@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
@@ -16,10 +16,7 @@ use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-
-/// MUTANT_OWNER (KMUTANT.OwnerThread) e Abandoned.
-const OWNER: u64 = 0x28;
-const ABANDONED: u64 = 0x30;
+use crate::ntos::inc::types::{ClientId, Ethread, Kmutant, MutantBasicInformation, NtStruct};
 
 pub struct MutantObject {
     pub pointer: u64,
@@ -37,13 +34,21 @@ fn dispose(pointer: u64) {
     guest::free_bytes(pointer);
 }
 
+/// O KMUTANT do corpo do objeto.
+fn mutant(pointer: u64) -> &'static Kmutant {
+    // SAFETY: corpo vivo registrado em MUTANTS (ou retido por handle).
+    unsafe { Kmutant::at(pointer) }
+}
+
 fn busy(pointer: u64) -> bool {
-    guest::read64(pointer + OWNER) != 0
+    mutant(pointer).owner_thread.get() != 0
 }
 
 fn publish(object: &Arc<MutantObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
-    let flags = if attributes != 0 { guest::read32(attributes + 24) } else { 0 };
-    dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    state::guarded(|| {
+        let flags = user_object_attributes(attributes)?;
+        dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+    })
 }
 
 fn mutant_of_node(node: NodeId) -> Option<Arc<MutantObject>> {
@@ -82,8 +87,11 @@ fn nt_create_mutant(out: u64, access: u64, attributes: u64, initial_owner: u64, 
             if object_manager::node(node).is_none_or(|node| node.type_name != "Mutant") {
                 return Ok(0xC000_0024);
             }
-            if guest::read32(attributes + 0x18) & 0x80 == 0 {
-                return Ok(0xC000_0035);
+            // OBJ_OPENIF.
+            match user_object_attributes(attributes) {
+                Ok(flags) if flags & 0x80 != 0 => {}
+                Ok(_) => return Ok(0xC000_0035),
+                Err(error) => return Ok(error.status),
             }
             let Some(object) = mutant_of_node(node) else { return Ok(0xC000_0024) };
             return publish(&object, out, access as u32, attributes, 0x4000_0000);
@@ -152,10 +160,8 @@ fn nt_release_mutant(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) 
     };
     Ok(match dispatcher::release_mutant(pointer, false) {
         Ok(old) => {
-            if previous != 0 {
-                guest::write32(previous, old as u32);
-            }
-            0
+            // LONG *PreviousCount, sondado acima.
+            if previous != 0 && guest::try_write::<u32>(previous, old as u32).is_err() { 0xC000_0005 } else { 0 }
         }
         Err(status) => status,
     })
@@ -179,32 +185,41 @@ fn nt_query_mutant(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> 
     if returned != 0 && !state::probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, size as u32);
-    }
-    if length < size {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_write(out, size) {
-        return Ok(0xC000_0005);
-    }
-    let owner = guest::read64(pointer + OWNER);
-    if class == 0 {
-        guest::write32(out, dispatcher::read_state(pointer));
-        guest::write8(out + 4, (owner != 0 && owner == process::get_current_thread()) as u8);
-        guest::write8(out + 5, guest::read8(pointer + ABANDONED) & 1);
-        guest::write16(out + 6, 0);
-    } else {
-        // ETHREAD.Cid, compartilhado com as threads reais do gerenciador.
-        guest::write64(out, if owner != 0 { guest::read64(owner + 0x478) } else { 0 });
-        guest::write64(out + 8, if owner != 0 { guest::read64(owner + 0x480) } else { 0 });
-    }
-    Ok(0)
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, size as u32)?;
+        }
+        if length < size {
+            return Ok(0xC000_0004);
+        }
+        if !state::probe_user_write(out, size) {
+            return Ok(0xC000_0005);
+        }
+        let body = mutant(pointer);
+        let owner = body.owner_thread.get();
+        if class == 0 {
+            let information = state::user_struct::<MutantBasicInformation>(out)?;
+            information.current_count.probe_set(dispatcher::read_state(pointer) as i32)?;
+            information.owned_by_caller.probe_set((owner != 0 && owner == process::get_current_thread()) as u8)?;
+            information.abandoned_state.probe_set(body.abandoned() as u8)?;
+            // Preenchimento final zerado, como antes.
+            guest::try_write::<u16>(out + 6, 0)?;
+        } else {
+            // MUTANT_OWNER_INFORMATION: o ETHREAD.Cid, compartilhado com as
+            // threads reais do gerenciador.
+            let client = state::user_struct::<ClientId>(out)?;
+            // SAFETY: o dono de um mutante possuído é um ETHREAD vivo.
+            let cid = (owner != 0).then(|| unsafe { Ethread::at(owner) }).map(|thread| (thread.cid.unique_process.get(), thread.cid.unique_thread.get()));
+            client.unique_process.probe_set(cid.map_or(0, |cid| cid.0))?;
+            client.unique_thread.probe_set(cid.map_or(0, |cid| cid.1))?;
+        }
+        Ok(0)
+    })
 }
 
 /// Saída de thread: abandona os mutantes que ela possui e coleta os sem uso.
 pub fn release_thread(thread: u64) {
-    let owned: Vec<u64> = MUTANTS.lock().keys().copied().filter(|&pointer| guest::read64(pointer + OWNER) == thread).collect();
+    let owned: Vec<u64> = MUTANTS.lock().keys().copied().filter(|&pointer| mutant(pointer).owner_thread.get() == thread).collect();
     for pointer in owned {
         let _ = dispatcher::release_mutant(pointer, true);
         dispatcher_objects::collect(pointer);

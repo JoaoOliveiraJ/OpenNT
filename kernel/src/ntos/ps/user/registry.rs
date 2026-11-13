@@ -18,8 +18,7 @@ use crate::ntos::cm::{computer_name, crypto_defaults, registry};
 use crate::ntos::cm::key::objects as key_objects;
 use crate::ntos::ob::object_types;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::rtl::guest_strings;
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, UnicodeString};
 
 /// OBJECT_ATTRIBUTES interpretado: caminho absoluto (vazio = abertura pela
 /// classe) e a raiz original.
@@ -29,28 +28,32 @@ pub struct Parsed {
     pub root_directory: u64,
 }
 
-/// x64: +0x00 Length, +0x08 RootDirectory, +0x10 ObjectName, +0x18 Attributes.
+/// OBJECT_ATTRIBUTES de usuário: estrutura, ObjectName e o texto são
+/// sondados; cada campo é lido uma vez.
 pub fn parse_user_object_attributes(attributes: u64) -> Option<Parsed> {
-    if !state::probe_user_read(attributes, 0x30) {
+    if !state::probe_user_read(attributes, ObjectAttributes::SIZE) {
         return None;
     }
-    if guest::read32(attributes) < 0x30 {
+    let object = state::user_struct::<ObjectAttributes>(attributes).ok()?;
+    if object.length.probe_get().ok()? < ObjectAttributes::SIZE as u32 {
         return None;
     }
-    let root_directory = guest::read64(attributes + 0x08);
-    let name_pointer = guest::read64(attributes + 0x10);
+    let root_directory = object.root_directory.probe_get().ok()?;
+    let name_pointer = object.object_name.probe_get().ok()?;
     // Sem ObjectName: abertura "pela classe" (o handler decide).
     if name_pointer == 0 {
         return Some(Parsed { path: String::new(), root_directory });
     }
-    if !state::probe_user_read(name_pointer, 16) {
+    if !state::probe_user_read(name_pointer, UnicodeString::SIZE) {
         return None;
     }
-    let length = guest::read16(name_pointer) as u64;
-    if length & 1 != 0 || (length != 0 && !state::probe_user_read(guest::read64(name_pointer + 8), length)) {
+    let object_name = state::user_struct::<UnicodeString>(name_pointer).ok()?;
+    let length = object_name.length.probe_get().ok()? as u64;
+    let buffer = object_name.buffer.probe_get().ok()?;
+    if length & 1 != 0 || (length != 0 && !state::probe_user_read(buffer, length)) {
         return None;
     }
-    let name = guest_strings::read_unicode_string(name_pointer);
+    let name = state::try_read_user_wide_string(buffer, length / 2).ok()?;
     let mut path = name.clone();
     if root_directory != 0 {
         // Raiz de registro (chave) ou de objetos (diretório, inclusive aberto
@@ -60,6 +63,15 @@ pub fn parse_user_object_attributes(attributes: u64) -> Option<Parsed> {
         path = alloc::format!("{}{}{}", root_path, if root_path.ends_with('\\') { "" } else { "\\" }, name);
     }
     Some(Parsed { path, root_directory })
+}
+
+/// OBJECT_ATTRIBUTES.Attributes (OBJ_*) de um OA de usuário já aceito por
+/// [`parse_user_object_attributes`]; sem OA, nenhum atributo.
+pub fn user_object_attributes(attributes: u64) -> Result<u32, KernelError> {
+    if attributes == 0 {
+        return Ok(0);
+    }
+    state::user_struct::<ObjectAttributes>(attributes)?.attributes.probe_get()
 }
 
 fn utf16_bytes(text: &str) -> Vec<u8> {

@@ -58,11 +58,9 @@ fn query(user_rsp: u64, returned: u64) -> Result<u32, KernelError> {
     let status = if !state::probe_user_write(out, 8) {
         0xC000_0005
     } else {
-        guest::write64(out, if session::debug_port(target) != 0 { u64::MAX } else { 0 });
-        if returned != 0 {
-            guest::write32(returned, 8);
-        }
-        0
+        // ProcessDebugPort: um HANDLE indicativo; ReturnLength (ULONG) opcional.
+        let written = guest::try_write::<u64>(out, if session::debug_port(target) != 0 { u64::MAX } else { 0 }).and_then(|()| if returned != 0 { guest::try_write::<u32>(returned, 8) } else { Ok(()) });
+        if written.is_err() { 0xC000_0005 } else { 0 }
     };
     let _ = process::dereference(target);
     Ok(status)

@@ -9,7 +9,8 @@ use alloc::vec::Vec;
 
 use super::{index, state};
 use crate::hal::amd64::usermode;
-use crate::rtl::SpinLock;
+use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{ExceptionRecord, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
 struct Capture {
@@ -63,7 +64,11 @@ fn string_at(address: u64, wide: bool) -> String {
             result.push_str("[unmapped]");
             return result;
         }
-        let value = if wide { guest::read16(at) as u32 } else { guest::read8(at) as u32 };
+        let value = if wide { guest::try_read::<u16>(at).map(u32::from) } else { guest::try_read::<u8>(at).map(u32::from) };
+        let Ok(value) = value else {
+            result.push_str("[unmapped]");
+            return result;
+        };
         if value == 0 {
             return result;
         }
@@ -73,51 +78,65 @@ fn string_at(address: u64, wide: bool) -> String {
     result
 }
 
+/// Estruturas de exceção C++ do MSVC (não são do NT), com RVAs relativos
+/// à imagem: ThrowInfo.pCatchableTypeArray, CatchableTypeArray (contagem e
+/// o primeiro tipo), CatchableType.pType/sizeOrOffset e TypeDescriptor.name.
+const THROW_INFO_CATCHABLE_TYPES: u64 = 12;
+const CATCHABLE_TYPE_ARRAY_FIRST: u64 = 4;
+const CATCHABLE_TYPE_DESCRIPTOR: u64 = 4;
+const CATCHABLE_TYPE_SIZE: u64 = 20;
+const TYPE_DESCRIPTOR_NAME: u64 = 16;
+
 fn exception_at(record: u64) {
-    if !state::probe_user_read(record, 0x98) {
+    if !state::probe_user_read(record, ExceptionRecord::SIZE) {
         return;
     }
-    let code = guest::read32(record);
-    let count = guest::read32(record + 0x18).min(15) as u64;
-    let parameters: Vec<u64> = (0..count).map(|index| guest::read64(record + 0x20 + index * 8)).collect();
-    let listed: Vec<String> = parameters.iter().map(|value| alloc::format!("0x{value:x}")).collect();
-    crate::debug_print!("[call-capture] exception=0x{:x} address=0x{:x} params={}", code, guest::read64(record + 0x10), listed.join(","));
-    if code != 0xE06D_7363 || count != 4 {
-        return;
-    }
-    let (object, info, image) = (parameters[1], parameters[2], parameters[3]);
-    if !state::probe_user_read(info, 16) {
-        return;
-    }
-    let types = image + guest::read32(info + 12) as u64;
-    if !state::probe_user_read(types, 8) || guest::read32(types) == 0 {
-        return;
-    }
-    let kind = image + guest::read32(types + 4) as u64;
-    if !state::probe_user_read(kind, 28) {
-        return;
-    }
-    let descriptor = image + guest::read32(kind + 4) as u64;
-    let size = guest::read32(kind + 20) as u64;
-    crate::debug_print!("[call-capture] C++ type={} size={}", string_at(descriptor + 16, false), size);
-    let length = size.min(128);
-    if !state::probe_user_read(object, length) {
-        return;
-    }
-    let bytes: String = (0..length).map(|index| alloc::format!("{:02x}", guest::read8(object + index))).collect();
-    crate::debug_print!("[call-capture] C++ object={}", bytes);
-    // Só ponteiros de caracteres candidatos; nenhuma chamada pela vtable.
-    let mut offset = 0;
-    while offset + 8 <= length {
-        let pointer = guest::read64(object + offset);
-        if pointer != 0 && state::probe_user_read(pointer, 1) {
-            let candidate = string_at(pointer, false);
-            if candidate.len() >= 4 && candidate.chars().all(|character| matches!(character, '\x20'..='\x7E' | '\r' | '\n' | '\t')) {
-                crate::debug_print!("[call-capture] C++ text@+{}: {}", offset, candidate);
+    // Diagnóstico: qualquer falha de sonda só encerra o relato.
+    let _ = (|| -> Result<(), KernelError> {
+        let exception = state::user_struct::<ExceptionRecord>(record)?;
+        let code = exception.exception_code.probe_get()? as u32;
+        let count = exception.number_parameters.probe_get()?.min(15) as usize;
+        let parameters: Vec<u64> = exception.exception_information[..count].iter().map(|parameter| parameter.probe_get()).collect::<Result<_, _>>()?;
+        let listed: Vec<String> = parameters.iter().map(|value| alloc::format!("0x{value:x}")).collect();
+        crate::debug_print!("[call-capture] exception=0x{:x} address=0x{:x} params={}", code, exception.exception_address.probe_get()?, listed.join(","));
+        if code != 0xE06D_7363 || count != 4 {
+            return Ok(());
+        }
+        let (object, info, image) = (parameters[1], parameters[2], parameters[3]);
+        if !state::probe_user_read(info, 16) {
+            return Ok(());
+        }
+        let types = image + guest::try_read::<u32>(info + THROW_INFO_CATCHABLE_TYPES)? as u64;
+        if !state::probe_user_read(types, 8) || guest::try_read::<u32>(types)? == 0 {
+            return Ok(());
+        }
+        let kind = image + guest::try_read::<u32>(types + CATCHABLE_TYPE_ARRAY_FIRST)? as u64;
+        if !state::probe_user_read(kind, 28) {
+            return Ok(());
+        }
+        let descriptor = image + guest::try_read::<u32>(kind + CATCHABLE_TYPE_DESCRIPTOR)? as u64;
+        let size = guest::try_read::<u32>(kind + CATCHABLE_TYPE_SIZE)? as u64;
+        crate::debug_print!("[call-capture] C++ type={} size={}", string_at(descriptor + TYPE_DESCRIPTOR_NAME, false), size);
+        let length = size.min(128);
+        if !state::probe_user_read(object, length) {
+            return Ok(());
+        }
+        let contents = guest::try_read_bytes(object, length as usize)?;
+        let bytes: String = contents.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
+        crate::debug_print!("[call-capture] C++ object={}", bytes);
+        // Só ponteiros de caracteres candidatos; nenhuma chamada pela vtable.
+        for (index, word) in contents.chunks_exact(8).enumerate() {
+            let offset = index * 8;
+            let pointer = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+            if pointer != 0 && state::probe_user_read(pointer, 1) {
+                let candidate = string_at(pointer, false);
+                if candidate.len() >= 4 && candidate.chars().all(|character| matches!(character, '\x20'..='\x7E' | '\r' | '\n' | '\t')) {
+                    crate::debug_print!("[call-capture] C++ text@+{}: {}", offset, candidate);
+                }
             }
         }
-        offset += 8;
-    }
+        Ok(())
+    })();
 }
 
 /// Registro capturado pela HAL (estado 2 → 3): argumentos e pilha.
@@ -140,7 +159,11 @@ pub fn consume() {
         crate::debug_print!("[call-capture] text: {}", string_at(values[1], name.ends_with('W')));
     }
     if name == "CryptAcquireContextW" || name == "CryptAcquireContextA" {
-        let flags = if state::probe_user_read(stack + 0x28, 4) { alloc::format!("0x{:x}", guest::read32(stack + 0x28)) } else { String::from("[unmapped]") };
+        // Quinto argumento da chamada capturada (dwFlags), na pilha de usuário.
+        let flags = match guest::try_read::<u32>(stack + 0x28) {
+            Ok(value) if state::probe_user_read(stack + 0x28, 4) => alloc::format!("0x{value:x}"),
+            _ => String::from("[unmapped]"),
+        };
         crate::debug_print!("[call-capture] container={} provider={} type={} flags={}", string_at(values[1], name.ends_with('W')), string_at(values[2], name.ends_with('W')), values[3] as u32, flags);
     }
     // O CONTEXT capturado leva RF: rearmar não dispara de novo na instrução

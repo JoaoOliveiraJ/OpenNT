@@ -18,6 +18,8 @@ use crate::ntos::ob::objects::work::{self as work_objects, Factory, FactoryIniti
 use crate::ntos::ps::{process, process_context};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::extra_ps_user::WorkerFactoryDeferredWork;
+use crate::ntos::inc::types::{FileIoCompletionInformation, NtStruct, ObjectAttributes, WorkerFactoryBasicInformation};
 
 static FACTORIES: SpinLock<Vec<Arc<Factory>>> = SpinLock::new(Vec::new());
 
@@ -248,7 +250,11 @@ fn set_worker_flags(handle: u64, input: u64, length: u32) -> u32 {
     if !state::probe_user_read(input, 4) {
         return 0xC000_0005;
     }
-    let value = guest::read32(input);
+    // ULONG de entrada, sondado acima.
+    let value = match guest::try_read::<u32>(input) {
+        Ok(value) => value,
+        Err(error) => return error.status,
+    };
     let factory = match resolve(handle, 4) {
         Ok((_, factory)) => factory,
         Err(status) => return status,
@@ -266,7 +272,11 @@ fn set_thread_soft_maximum(handle: u64, input: u64, length: u32) -> u32 {
     if !state::probe_user_read(input, 4) {
         return 0xC000_0005;
     }
-    let value = guest::read32(input);
+    // ULONG de entrada, sondado acima.
+    let value = match guest::try_read::<u32>(input) {
+        Ok(value) => value,
+        Err(error) => return error.status,
+    };
     let factory = match resolve(handle, 4) {
         Ok((_, factory)) => factory,
         Err(status) => return status,
@@ -297,10 +307,15 @@ fn nt_create_worker_factory(out: u64, access: u64, attributes: u64, port_handle:
         return Ok(0xC000_0005);
     }
     // Objetos sem nome.
-    if attributes != 0 && guest::read64(attributes + 16) != 0 {
-        return Ok(0xC000_0033);
+    if attributes != 0 {
+        match state::user_struct::<ObjectAttributes>(attributes).and_then(|object| object.object_name.probe_get()) {
+            Ok(0) => {}
+            Ok(_) => return Ok(0xC000_0033),
+            Err(error) => return Ok(error.status),
+        }
     }
-    if guest::read64(rsp + 0x28) != u64::MAX {
+    // ProcessHandle (quinto argumento): só o processo corrente.
+    if state::stack_arg(rsp, 5) != u64::MAX {
         return Ok(0xC000_0008);
     }
     let process_pointer = process::get_current_process();
@@ -407,10 +422,17 @@ fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length
     if !state::probe_user_read(input, size as u64) {
         return Ok(0xC000_0005);
     }
-    let value = if size == 1 { guest::read8(input) as u32 } else { guest::read32(input) };
+    // BOOLEAN, ULONG ou LARGE_INTEGER de entrada, sondado acima.
+    let value = match if size == 1 { guest::try_read::<u8>(input).map(u32::from) } else { guest::try_read::<u32>(input) } {
+        Ok(value) => value,
+        Err(error) => return Ok(error.status),
+    };
     match class {
         2 => {
-            let signed = guest::read64(input) as i64;
+            let signed = match guest::try_read::<i64>(input) {
+                Ok(signed) => signed,
+                Err(error) => return Ok(error.status),
+            };
             if signed >= 0 {
                 return Ok(0xC000_000D);
             }
@@ -476,41 +498,42 @@ fn nt_query_information_worker_factory(handle: u64, class: u64, out: u64, length
     if returned != 0 && !state::probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, 0x78);
-    }
-    if length as u32 != 0x78 {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_write(out, 0x78) {
-        return Ok(0xC000_0005);
-    }
-    let workers = live(&factory);
-    for offset in (0..0x78).step_by(4) {
-        guest::write32(out + offset, 0);
-    }
-    guest::write64(out, factory.timeout() as u64);
-    guest::write64(out + 8, factory.retry_timeout() as u64);
-    guest::write64(out + 16, factory.idle_timeout() as u64);
-    guest::write8(out + 24, factory.paused() as u8);
-    guest::write8(out + 26, is_deferred(&factory) as u8);
-    guest::write8(out + 27, (!factory.shutdown() && (workers.len() as u32) < factory.maximum()) as u8);
-    guest::write8(out + 30, factory.shutdown() as u8);
-    guest::write32(out + 32, factory.binding_count());
-    guest::write32(out + 36, factory.minimum());
-    guest::write32(out + 40, factory.maximum());
-    guest::write32(out + 44, workers.iter().filter(|thread| !thread.with(|thread| thread.worker_ready)).count() as u32);
-    guest::write32(out + 48, workers.iter().filter(|thread| thread.wait_worker_factory() == factory.pointer).count() as u32);
-    guest::write32(out + 52, workers.len() as u32);
-    guest::write32(out + 56, factory.release_count());
-    guest::write64(out + 64, factory.minimum() as u64);
-    guest::write64(out + 72, factory.start());
-    io_completion::write_words(out + 80, factory.parameter());
-    guest::write64(out + 88, factory.process_id());
-    guest::write64(out + 96, factory.reserve());
-    guest::write64(out + 104, factory.commit());
-    guest::write32(out + 112, factory.last_status());
-    Ok(0)
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, WorkerFactoryBasicInformation::SIZE as u32)?;
+        }
+        if length != WorkerFactoryBasicInformation::SIZE {
+            return Ok(0xC000_0004);
+        }
+        if !state::probe_user_write(out, WorkerFactoryBasicInformation::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        let workers = live(&factory);
+        guest::try_write_bytes(out, &[0; WorkerFactoryBasicInformation::SIZE as usize])?;
+        let information = state::user_struct::<WorkerFactoryBasicInformation>(out)?;
+        information.timeout.quad_part.probe_set(factory.timeout())?;
+        information.retry_timeout.quad_part.probe_set(factory.retry_timeout())?;
+        information.idle_timeout.quad_part.probe_set(factory.idle_timeout())?;
+        information.paused.probe_set(factory.paused() as u8)?;
+        information.queued_to_ex_worker.probe_set(is_deferred(&factory) as u8)?;
+        information.may_create.probe_set((!factory.shutdown() && (workers.len() as u32) < factory.maximum()) as u8)?;
+        information.shutdown.probe_set(factory.shutdown() as u8)?;
+        information.binding_count.probe_set(factory.binding_count())?;
+        information.thread_minimum.probe_set(factory.minimum())?;
+        information.thread_maximum.probe_set(factory.maximum())?;
+        information.pending_worker_count.probe_set(workers.iter().filter(|thread| !thread.with(|thread| thread.worker_ready)).count() as u32)?;
+        information.waiting_worker_count.probe_set(workers.iter().filter(|thread| thread.wait_worker_factory() == factory.pointer).count() as u32)?;
+        information.total_worker_count.probe_set(workers.len() as u32)?;
+        information.release_count.probe_set(factory.release_count())?;
+        information.infinite_wait_goal.probe_set(factory.minimum() as i64)?;
+        information.start_routine.probe_set(factory.start())?;
+        information.start_parameter.probe_set(factory.parameter())?;
+        information.process_id.probe_set(factory.process_id())?;
+        information.stack_reserve.probe_set(factory.reserve())?;
+        information.stack_commit.probe_set(factory.commit())?;
+        information.last_thread_creation_status.probe_set(factory.last_status() as i32)?;
+        Ok(0)
+    })
 }
 
 fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, returned: u64, rsp: u64) -> Result<u32, KernelError> {
@@ -524,8 +547,13 @@ fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, return
         return Ok(0xC000_0005);
     }
     // Envios ALPC adiados exigem a implementação assíncrona do ALPC.
-    if deferred != 0 && (guest::read64(deferred) != 0 || guest::read64(deferred + 8) != 0) {
-        return Ok(0xC000_00BB);
+    if deferred != 0 {
+        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?)));
+        match work {
+            Ok((0, 0)) => {}
+            Ok(_) => return Ok(0xC000_00BB),
+            Err(error) => return Ok(error.status),
+        }
     }
     let count = count as u32;
     if count == 0 || count > 0x7FFF_FFFF / 32 {
@@ -539,17 +567,20 @@ fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, return
         let mut dequeued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
         for index in 0..size {
             let Some(mut packet) = packets.pop_front() else { break };
-            let at = out + index as u64 * 32;
+            let at = out + index as u64 * FileIoCompletionInformation::SIZE;
             let (key, context, status, information) = packet.values();
-            io_completion::write_words(at, key);
-            io_completion::write_words(at + 8, context);
-            guest::write64(at + 16, status as u64);
-            io_completion::write_words(at + 24, information);
+            // Saídas sondadas pelo `validate` logo antes; uma página desmapeada
+            // nesse meio tempo perde só a cópia do pacote.
+            let _ = state::user_struct::<FileIoCompletionInformation>(at).and_then(|entry| {
+                entry.key_context.probe_set(key)?;
+                entry.apc_context.probe_set(context)?;
+                state::set_user_iosb(entry.io_status_block.address(), status as u32, information)
+            });
             if let Some(on_dequeue) = packet.on_dequeue.take() {
                 dequeued.push(on_dequeue);
             }
         }
-        guest::write32(returned, size as u32);
+        let _ = guest::try_write::<u32>(returned, size as u32);
         let on_dequeue: Option<Box<dyn FnOnce() + Send>> = if dequeued.is_empty() {
             None
         } else {
@@ -582,7 +613,14 @@ fn nt_shutdown_worker_factory(handle: u64, pending_count: u64, _: u64, _: u64, _
         // Workers que ainda não entraram na NTDLL não tomam a referência
         // normal do pool: as pendentes são transferidas no encerramento.
         let pending = live(&factory).iter().filter(|thread| !thread.with(|thread| thread.worker_ready)).count() as u32;
-        guest::write32(pending_count, guest::read32(pending_count) + pending);
+        // `volatile LONG *PendingWorkerCount`: os workers de modo usuário o
+        // alteram ao mesmo tempo; a soma é uma única instrução interlocked.
+        match guest::try_atomic_u32(pending_count) {
+            Ok(counter) => {
+                counter.fetch_add(pending, core::sync::atomic::Ordering::SeqCst);
+            }
+            Err(error) => return Ok(error.status),
+        }
     }
     shutdown(&factory);
     Ok(0)

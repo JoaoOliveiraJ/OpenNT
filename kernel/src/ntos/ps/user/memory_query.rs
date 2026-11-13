@@ -12,6 +12,7 @@ use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT as MAX_USER;
 use crate::ntos::mm::paging;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{MemoryBasicInformation, MemoryImageInformation, MemoryRegionInformation, MemoryWorkingSetExInformation, NtStruct, UnicodeString};
 
 const PAGE: u64 = 0x1000;
 
@@ -148,8 +149,9 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
         return Ok(0xC000_0005);
     }
     let prepare = |need: u64| -> u32 {
-        if return_length != 0 {
-            guest::write64(return_length, need);
+        // SIZE_T *ReturnLength (sondado acima).
+        if return_length != 0 && guest::try_write::<u64>(return_length, need).is_err() {
+            return 0xC000_0005;
         }
         if length < need {
             return 0xC000_0004;
@@ -161,21 +163,21 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
     };
     let context = Context::current();
     let info = describe(base_va, &context);
-    match class {
+    state::guarded(|| match class {
         0 => {
             let status = prepare(0x30);
             if status != 0 {
                 return Ok(status);
             }
-            guest::write64(buffer_va, info.base);
-            guest::write64(buffer_va + 8, info.allocation_base);
-            guest::write32(buffer_va + 16, info.allocation_protect);
-            guest::write32(buffer_va + 20, 0);
-            guest::write64(buffer_va + 24, info.size);
-            guest::write32(buffer_va + 32, info.state);
-            guest::write32(buffer_va + 36, info.protect);
-            guest::write32(buffer_va + 40, info.kind);
-            guest::write32(buffer_va + 44, 0);
+            guest::try_write_bytes(buffer_va, &[0; MemoryBasicInformation::SIZE as usize])?;
+            let basic = state::user_struct::<MemoryBasicInformation>(buffer_va)?;
+            basic.base_address.probe_set(info.base)?;
+            basic.allocation_base.probe_set(info.allocation_base)?;
+            basic.allocation_protect.probe_set(info.allocation_protect)?;
+            basic.region_size.probe_set(info.size)?;
+            basic.state.probe_set(info.state)?;
+            basic.protect.probe_set(info.protect)?;
+            basic.type_.probe_set(info.kind)?;
             Ok(0)
         }
         2 => {
@@ -184,8 +186,8 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
             if status != 0 {
                 return Ok(status);
             }
-            state::write_user_wide(buffer_va + 16, &name);
-            state::write_unicode_string(buffer_va, buffer_va + 16, &name);
+            state::try_write_user_wide(buffer_va + UnicodeString::SIZE, &name)?;
+            state::try_write_unicode_string(buffer_va, buffer_va + UnicodeString::SIZE, &name)?;
             Ok(0)
         }
         3 | 7 => {
@@ -204,14 +206,15 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
                     None => 1,
                 }
             };
-            guest::write64(buffer_va, info.allocation_base);
-            guest::write32(buffer_va + 8, info.allocation_protect);
-            guest::write32(buffer_va + 12, kind);
-            guest::write64(buffer_va + 16, region.size());
-            guest::write64(buffer_va + 24, committed_bytes(&info));
-            if need == 0x30 {
-                guest::write64(buffer_va + 32, 0);
-                guest::write64(buffer_va + 40, 0);
+            let information = state::user_struct::<MemoryRegionInformation>(buffer_va)?;
+            information.allocation_base.probe_set(info.allocation_base)?;
+            information.allocation_protect.probe_set(info.allocation_protect)?;
+            information.region_type.probe_set(kind)?;
+            information.region_size.probe_set(region.size())?;
+            information.commit_size.probe_set(committed_bytes(&info))?;
+            if need == MemoryRegionInformation::SIZE {
+                information.partition_id.probe_set(0)?;
+                information.node_preference.probe_set(0)?;
             }
             Ok(0)
         }
@@ -226,11 +229,13 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
             }
             let mut offset = 0;
             while offset < length {
-                let va = guest::read64(buffer_va + offset);
+                let entry = state::user_struct::<MemoryWorkingSetExInformation>(buffer_va + offset)?;
+                let va = entry.virtual_address.probe_get()?;
                 let page = describe(va, &context);
                 let valid = va < MAX_USER && paging::translate(va) != 0;
-                guest::write64(buffer_va + offset + 8, if valid { 1 + page.protect as u64 * 16 } else { 0 });
-                offset += 16;
+                // VirtualAttributes: Valid e Win32Protection.
+                entry.virtual_attributes.probe_set(if valid { 1 + page.protect as u64 * 16 } else { 0 })?;
+                offset += MemoryWorkingSetExInformation::SIZE;
             }
             Ok(0)
         }
@@ -241,12 +246,12 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
                 return Ok(status);
             }
             let Some(image) = &info.image else { return Ok(0xC000_0019) };
-            guest::write64(buffer_va, image.base());
-            guest::write64(buffer_va + 8, image.size());
-            guest::write32(buffer_va + 16, 0);
-            guest::write32(buffer_va + 20, 0);
+            guest::try_write_bytes(buffer_va, &[0; MemoryImageInformation::SIZE as usize])?;
+            let information = state::user_struct::<MemoryImageInformation>(buffer_va)?;
+            information.image_base.probe_set(image.base())?;
+            information.size_of_image.probe_set(image.size())?;
             Ok(0)
         }
         _ => Ok(0xC000_0003),
-    }
+    })
 }

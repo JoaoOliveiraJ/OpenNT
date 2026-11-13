@@ -15,6 +15,7 @@ use crate::ntos::ob::{close, object_types, open_pointer};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::ObjectHandleFlagInformation;
 
 const INVALID: u32 = 0xC000_000D;
 const BAD_HANDLE: u32 = 0xC000_0008;
@@ -162,7 +163,8 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
         };
         new_handle = Some(handle);
         if out != 0 {
-            guest::write64(out, handle as u64);
+            // PHANDLE de saída (sondado acima).
+            guest::try_write::<u64>(out, handle as u64)?;
         }
         Ok(0)
     })();
@@ -202,7 +204,12 @@ fn nt_set_information_object(handle: u64, class: u64, input: u64, length: u64, _
     if state::get_user_handle(handle).is_none() {
         return Ok(BAD_HANDLE);
     }
-    let attributes = (if guest::read8(input) != 0 { 2 } else { 0 }) | (if guest::read8(input + 1) != 0 { 1 } else { 0 });
+    let information = state::user_struct::<ObjectHandleFlagInformation>(input).and_then(|information| Ok((information.inherit.probe_get()?, information.protect_from_close.probe_get()?)));
+    let (inherit, protect) = match information {
+        Ok(flags) => flags,
+        Err(error) => return Ok(error.status),
+    };
+    let attributes = (if inherit != 0 { 2 } else { 0 }) | (if protect != 0 { 1 } else { 0 });
     state::change_user_handle_attributes(handle, attributes)
 }
 

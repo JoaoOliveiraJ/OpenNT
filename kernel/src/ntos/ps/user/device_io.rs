@@ -15,7 +15,7 @@ use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::dispatcher;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{device_object, irp};
+use crate::ntos::inc::types::{DeviceObject, Irp, NtStruct};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 
 struct RequestState {
@@ -66,11 +66,14 @@ fn finish(request: &Arc<Request>) {
             count = 0;
         } else {
             if !request.write && count != 0 && status >> 30 != 3 {
-                let bytes: Vec<u8> = (0..count).map(|index| guest::read8(request.buffer + index)).collect();
+                // SystemBuffer (pool do kernel) para o buffer de usuário sondado.
+                let bytes = guest::read_bytes(request.buffer, count as usize);
                 let _ = state::write_user_bytes(request.user_buffer, &bytes);
             }
-            guest::write64(request.iosb, status as u64);
-            guest::write64(request.iosb + 8, count);
+            if state::set_user_iosb(request.iosb, status, count).is_err() {
+                status = 0xC000_0005;
+                count = 0;
+            }
         }
         if let Some(device) = device(&request.entry).filter(|device| status == 0 && device.options & 0x30 != 0) {
             *device.position.lock() = request.offset + count;
@@ -115,13 +118,15 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     }
     let Some(device) = device(entry) else { return Ok(0xC000_0008) };
     let Some((_, top)) = io_manager::device_route(&device.device_path) else { return Ok(0xC000_0008) };
-    if top == 0 || guest::read32(top + device_object::FLAGS) & 4 == 0 {
-        return Ok(0xC000_00BB);
-    }
+    // SAFETY: o topo da rota é um DEVICE_OBJECT vivo do I/O manager.
+    let top_device = (top != 0).then(|| unsafe { DeviceObject::at(top) });
+    // DO_BUFFERED_IO.
+    let Some(top_device) = top_device.filter(|device| device.flags.get() & 4 != 0) else { return Ok(0xC000_00BB) };
     let mut offset = *device.position.lock();
     if offset_pointer != 0 {
-        let high = guest::read32(offset_pointer + 4);
-        let low = guest::read32(offset_pointer);
+        // ByteOffset (LARGE_INTEGER, sondado pelo chamador): uma leitura.
+        let Ok(value) = guest::try_read::<u64>(offset_pointer) else { return Ok(0xC000_0005) };
+        let (high, low) = ((value >> 32) as u32, value as u32);
         // FILE_USE_FILE_POINTER_POSITION num handle síncrono usa a posição.
         if !(high == 0xFFFF_FFFF && low == 0xFFFF_FFFE && device.options & 0x30 != 0) {
             offset = low as u64 | (high as u64) << 32;
@@ -138,7 +143,21 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     } else {
         None
     };
-    let count = match guest::read8(top + device_object::STACK_SIZE) {
+    // Dados de uma escrita, capturados do buffer de usuário (sondado pelo chamador).
+    let data = if write {
+        match guest::try_read_bytes(user_buffer, length as usize) {
+            Ok(data) => Some(data),
+            Err(_) => {
+                if let Some(event) = &event {
+                    events::release(event);
+                }
+                return Ok(0xC000_0005);
+            }
+        }
+    } else {
+        None
+    };
+    let count = match top_device.stack_size.get() as u8 {
         0 => 1,
         count => count as u32,
     };
@@ -155,10 +174,8 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
         }
         return Ok(0xC000_0017);
     }
-    if write {
-        for index in 0..length {
-            guest::write8(buffer + index, guest::read8(user_buffer + index));
-        }
+    if let Some(data) = &data {
+        guest::write_bytes(buffer, data);
     }
     let thread = threads::current();
     let request = Arc::new(Request { entry: entry.clone(), event: event.clone(), thread: thread.clone(), iosb, user_buffer, length, offset, write, irp: packet, buffer, pid: state::with(|state| state.current_process_id), state: SpinLock::new(RequestState { done: false, finished: false, abandoned: false, status: 0x103, count: 0 }) });
@@ -167,7 +184,8 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
         threads::retain_thread(thread);
     }
     irp_builder::build(packet, &BuildOptions { major: if write { 4 } else { 3 }, minor: 0, buffer, buffer_length: length as u32, byte_offset: offset, device_object: top, stack_count: count, file_object: device.file_object, requestor_mode: 1, thread: thread.as_ref().map_or(0, |thread| thread.pointer()), ..BuildOptions::default() });
-    guest::write32(packet + irp::FLAGS, 0x10 | if write { 0 } else { 0x40 }); // BUFFERED_IO, INPUT_OPERATION
+    // SAFETY: IRP recém-montado acima.
+    unsafe { Irp::at(packet) }.flags.set(0x10 | if write { 0 } else { 0x40 }); // BUFFERED_IO, INPUT_OPERATION
     let observer = request.clone();
     io_manager::observe_completion(
         packet,
@@ -188,8 +206,8 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     if let Some(event) = &event {
         dispatcher::reset_event(event.pointer);
     }
-    guest::write64(iosb, 0x103);
-    guest::write64(iosb + 8, 0);
+    // A conclusão volta a gravar o IOSB; uma falha aqui reaparece lá.
+    let _ = state::set_user_iosb(iosb, 0x103, 0);
     let result = io_manager::iof_call_driver(top, packet) as u32;
     // Rotinas de despacho ausentes falham antes de o driver possuir o IRP.
     {
@@ -275,8 +293,9 @@ fn cancel_io(handle: u64, target: u64, out: u64, thread_only: bool) -> u32 {
     }
     let found = device(&entry).is_some_and(|device| cancel_entry(device, target, thread_only));
     let status = if found || thread_only { 0 } else { 0xC000_0225 };
-    guest::write64(out, status as u64);
-    guest::write64(out + 8, 0);
+    if state::set_user_iosb(out, status, 0).is_err() {
+        return 0xC000_0005;
+    }
     status
 }
 

@@ -9,13 +9,14 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::registry::parse_user_object_attributes;
+use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state;
 use crate::ntos::ke::{clock, dispatcher};
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Ktimer, NtStruct, T2SetParameters, TimerBasicInformation};
 
 /// Prazo (absoluto, em 100 ns do relógio do sistema) e período.
 #[derive(Clone, Copy, Default)]
@@ -38,8 +39,9 @@ fn now() -> i64 {
     clock::now_ms() as i64 * 10_000
 }
 
-fn signed64(at: u64) -> i64 {
-    guest::read64(at) as i64
+/// LARGE_INTEGER.QuadPart de usuário, já sondado pelo chamador.
+fn signed64(at: u64) -> Result<i64, KernelError> {
+    guest::try_read::<i64>(at)
 }
 
 fn dispose(pointer: u64) {
@@ -51,8 +53,10 @@ fn dispose(pointer: u64) {
 }
 
 fn publish(timer: &Arc<TimerObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
-    let flags = if attributes != 0 { guest::read32(attributes + 24) } else { 0 };
-    dispatcher_objects::publish(timer.pointer, out, access, flags, success, false, Some(timer.clone()))
+    state::guarded(|| {
+        let flags = user_object_attributes(attributes)?;
+        dispatcher_objects::publish(timer.pointer, out, access, flags, success, false, Some(timer.clone()))
+    })
 }
 
 fn timer_of_node(node: NodeId) -> Option<Arc<TimerObject>> {
@@ -100,8 +104,11 @@ fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, r
             if object_manager::node(node).is_none_or(|node| node.type_name != "Timer") {
                 return Ok(0xC000_0024);
             }
-            if guest::read32(attributes + 24) & 0x80 == 0 {
-                return Ok(0xC000_0035);
+            // OBJ_OPENIF.
+            match user_object_attributes(attributes) {
+                Ok(flags) if flags & 0x80 != 0 => {}
+                Ok(_) => return Ok(0xC000_0035),
+                Err(error) => return Ok(error.status),
             }
             let Some(timer) = timer_of_node(node) else { return Ok(0xC000_0024) };
             return publish(&timer, out, access, attributes, 0x4000_0000);
@@ -115,7 +122,8 @@ fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, r
         return Ok(0xC000_0017);
     }
     dispatcher::initialize_event(pointer, if timer_attributes & 0x8000_0000 != 0 { 8 } else { 9 }, false);
-    guest::write8(pointer + 2, 0x40 / 4);
+    // SAFETY: corpo recém-alocado e inicializado acima.
+    unsafe { Ktimer::at(pointer) }.header.size.set((Ktimer::SIZE / 4) as u8);
     let timer = Arc::new(TimerObject { pointer, name: name.clone(), attributes: timer_attributes, schedule: SpinLock::new(Schedule::default()), node: SpinLock::new(None) });
     if let Err(error) = dispatcher_objects::create(pointer, "timer", dispose, None, attributes, true, DispatcherHooks::default()) {
         guest::free_bytes(pointer);
@@ -145,20 +153,26 @@ fn nt_set_timer2(handle: u64, due: u64, period: u64, parameters: u64, _rsp: u64)
     if !state::probe_user_read(due, 8) || (period != 0 && !state::probe_user_read(period, 8)) || (parameters != 0 && !state::probe_user_read(parameters, 16)) {
         return Ok(0xC000_0005);
     }
-    if parameters != 0 && (guest::read32(parameters) != 0 || signed64(parameters + 8) < -1) {
-        debug_print!("[timer] T2_SET_PARAMETERS version={} reserved={} tolerance={}", guest::read32(parameters), guest::read32(parameters + 4), signed64(parameters + 8));
-        return Ok(0xC000_000D);
-    }
-    let interval = if period != 0 { signed64(period) } else { 0 };
-    if interval < 0 {
-        debug_print!("[timer] invalid period={}", interval);
-        return Ok(0xC000_000D);
-    }
-    let value = signed64(due);
-    let absolute = if value < 0 { now() - value } else { value - 116_444_736_000_000_000 };
-    *timer.schedule.lock() = Schedule { due: Some(absolute), period: interval };
-    dispatcher::reset_event(timer.pointer);
-    Ok(0)
+    state::guarded(|| {
+        if parameters != 0 {
+            let settings = state::user_struct::<T2SetParameters>(parameters)?;
+            let (version, tolerance) = (settings.version.probe_get()?, settings.no_wake_tolerance.probe_get()?);
+            if version != 0 || tolerance < -1 {
+                debug_print!("[timer] T2_SET_PARAMETERS version={} reserved={} tolerance={}", version, settings.reserved.probe_get()?, tolerance);
+                return Ok(0xC000_000D);
+            }
+        }
+        let interval = if period != 0 { signed64(period)? } else { 0 };
+        if interval < 0 {
+            debug_print!("[timer] invalid period={}", interval);
+            return Ok(0xC000_000D);
+        }
+        let value = signed64(due)?;
+        let absolute = if value < 0 { now() - value } else { value - 116_444_736_000_000_000 };
+        *timer.schedule.lock() = Schedule { due: Some(absolute), period: interval };
+        dispatcher::reset_event(timer.pointer);
+        Ok(0)
+    })
 }
 
 fn nt_cancel_timer2(handle: u64, parameters: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -186,19 +200,23 @@ fn nt_query_timer(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> R
     if returned != 0 && !state::probe_user_write(returned, 4) {
         return Ok(0xC000_0005);
     }
-    if returned != 0 {
-        guest::write32(returned, 16);
-    }
-    if length != 16 {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_write(out, 16) {
-        return Ok(0xC000_0005);
-    }
-    let remaining = timer.schedule.lock().due.map_or(0, |due| (due - now()).max(0));
-    guest::write64(out, remaining as u64);
-    guest::write64(out + 8, (dispatcher::read_state(timer.pointer) != 0) as u64);
-    Ok(0)
+    state::guarded(|| {
+        if returned != 0 {
+            guest::try_write::<u32>(returned, TimerBasicInformation::SIZE as u32)?;
+        }
+        if length != TimerBasicInformation::SIZE {
+            return Ok(0xC000_0004);
+        }
+        if !state::probe_user_write(out, TimerBasicInformation::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        let remaining = timer.schedule.lock().due.map_or(0, |due| (due - now()).max(0));
+        let information = state::user_struct::<TimerBasicInformation>(out)?;
+        information.remaining_time.quad_part.probe_set(remaining)?;
+        // TimerState (BOOLEAN) e o preenchimento final, num store de qword.
+        guest::try_write::<u64>(information.timer_state.address(), (dispatcher::read_state(timer.pointer) != 0) as u64)?;
+        Ok(0)
+    })
 }
 
 /// Sinaliza os timers vencidos e reprograma os periódicos.
