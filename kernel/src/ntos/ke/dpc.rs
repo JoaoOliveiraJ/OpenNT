@@ -5,11 +5,12 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 
-use super::{irql, pcr};
+use super::{irql, pcr, smp};
 use crate::hal::amd64::native_call;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::nt_abi::kdpc;
+use crate::ntos::inc::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 
 /// Rotina interna do kernel (ex.: adaptador de EX_TIMER) para um KDPC.
 pub type KernelDpcRoutine = fn(u64, u64, u64, u64);
@@ -105,4 +106,32 @@ pub fn run_queue() -> Result<(), KernelError> {
 
 pub fn pending() -> usize {
     STATE.lock().queue.len()
+}
+
+/// KeSetImportanceDpc.
+pub fn set_importance(dpc: u64, importance: u8) {
+    guest::write8(dpc + kdpc::IMPORTANCE, importance);
+}
+
+/// KeSetTargetProcessorDpc: o byte baixo do número vai para KDPC.Number.
+pub fn set_target_processor(dpc: u64, number: u64) {
+    guest::write16(dpc + kdpc::NUMBER, (number & 255) as u16);
+}
+
+/// KeSetTargetProcessorDpcEx: PROCESSOR_NUMBER { USHORT Group; UCHAR Number;
+/// UCHAR Reserved; }; só o grupo 0 e processadores da MADT. Devolve o NTSTATUS.
+pub fn set_target_processor_ex(dpc: u64, processor_number: u64) -> u32 {
+    let (group, processor) = (guest::read16(processor_number), guest::read8(processor_number + 2));
+    if group != 0 || processor as usize >= smp::discovered_cpu_count() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    guest::write16(dpc + kdpc::NUMBER, processor as u16);
+    STATUS_SUCCESS
+}
+
+/// KeQueryDpcWatchdogInformation: sem watchdog de DPC, a estrutura sai zerada.
+pub fn query_watchdog_information(information: u64) {
+    for offset in (0..0x50).step_by(4) {
+        guest::write32(information + offset, 0);
+    }
 }

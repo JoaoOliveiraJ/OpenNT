@@ -185,7 +185,7 @@ pub fn close_native(handle: u64) -> Option<u32> {
 /// sistema para com IRQL_NOT_LESS_OR_EQUAL (0xC4, 0x2001F).
 pub fn open_thread_from_kernel(handle: u64, desired_access: u32, use_primary_identity: bool, attributes: u32, output: u64) -> Result<u32, KernelError> {
     if crate::ntos::ke::irql::get_irql() != 0 {
-        crate::ntos::ke::exports::raise_bug_check(0xC4, 0x2_001F, 0, 0, 0);
+        crate::ntos::ke::bugcheck::raise_bug_check(0xC4, 0x2_001F, 0, 0, 0);
     }
     open_thread(handle, desired_access, use_primary_identity, attributes, output, false)
 }

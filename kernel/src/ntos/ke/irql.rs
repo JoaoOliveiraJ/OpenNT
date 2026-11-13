@@ -7,10 +7,13 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::pcr;
 use crate::hal::{cpu, physical};
+use crate::ntos::mm::guest_memory as guest;
 
 pub const PASSIVE_LEVEL: u8 = 0;
 pub const APC_LEVEL: u8 = 1;
 pub const DISPATCH_LEVEL: u8 = 2;
+/// SYNCH_LEVEL do x64 multiprocessado.
+pub const SYNCH_LEVEL: u8 = 12;
 pub const HIGH_LEVEL: u8 = 15;
 
 /// O stub consulta esta célula para decidir se a IRQ pode preemptar.
@@ -53,4 +56,28 @@ pub fn lower_irql(level: u64) {
     }
     CURRENT.store(level as u8, Ordering::Relaxed);
     publish(level as u8);
+}
+
+/// KeRaiseIrql: o IRQL anterior vai para a saída opcional.
+pub fn raise_irql_saving(level: u8, old_irql: u64) {
+    let previous = raise_irql(level);
+    if old_irql != 0 {
+        guest::write8(old_irql, previous);
+    }
+}
+
+/// KfRaiseIrql: devolve o IRQL anterior.
+pub fn kf_raise_irql(level: u8) -> u8 {
+    let previous = get_irql();
+    raise_irql(level);
+    previous
+}
+
+/// Sobe a `level` (nunca desce) e devolve o IRQL anterior.
+pub fn raise_at_least(level: u8) -> u8 {
+    let previous = get_irql();
+    if level > previous {
+        raise_irql(level);
+    }
+    previous
 }

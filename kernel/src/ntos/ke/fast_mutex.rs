@@ -220,3 +220,19 @@ pub fn acquire_guarded_unsafe(pointer: u64) -> Result<u32, KernelError> {
 pub fn release_guarded_unsafe(pointer: u64) -> Result<u32, KernelError> {
     release_with(pointer, true, true)
 }
+
+/// ExEnterCriticalRegionAndAcquireFastMutexUnsafe(PFAST_MUTEX):
+/// KeEnterCriticalRegion + ExAcquireFastMutexUnsafe; devolve a thread atual
+/// (o chamador a repassa à função inversa).
+pub fn enter_critical_region_and_acquire_unsafe(pointer: u64) -> Result<u64, KernelError> {
+    critical_region::enter_critical()?;
+    acquire_unsafe(pointer)?;
+    Ok(process::get_current_thread())
+}
+
+/// ExReleaseFastMutexUnsafeAndLeaveCriticalRegion(PFAST_MUTEX): inverso
+/// exato — ExReleaseFastMutexUnsafe + KeLeaveCriticalRegion.
+pub fn release_unsafe_and_leave_critical_region(pointer: u64) -> Result<(), KernelError> {
+    release_unsafe(pointer)?;
+    critical_region::leave_critical()
+}

@@ -41,6 +41,22 @@ pub fn initialize_timer(timer: u64, timer_type: u32) {
     guest::write32(timer + layout::PERIOD, 0);
 }
 
+/// KeInitializeTimer: timer de notificação.
+pub fn initialize_notification_timer(timer: u64) {
+    initialize_timer(timer, layout::TIMER_NOTIFICATION as u32);
+}
+
+/// KeInitializeTimerEx com o TIMER_TYPE do chamador: 0 é NotificationTimer,
+/// qualquer outro valor SynchronizationTimer.
+pub fn initialize_timer_of_type(timer: u64, timer_type: u64) {
+    initialize_timer(timer, if timer_type != 0 { layout::TIMER_SYNCHRONIZATION } else { layout::TIMER_NOTIFICATION } as u32);
+}
+
+/// KeReadStateTimer.
+pub fn read_state(timer: u64) -> u32 {
+    guest::read32(timer + layout::SIGNAL_STATE)
+}
+
 /// KeSetTimerEx: remove o agendamento anterior e insere o novo. Devolve se
 /// havia entrada na fila.
 pub fn set_timer(timer: u64, due_value: i64, dpc_pointer: u64, period_ms: u32) -> bool {

@@ -255,6 +255,16 @@ pub fn sample_cycles(thread: u64) -> u64 {
     guest::read64(thread + layout::CYCLE_TIME)
 }
 
+/// KeQueryRuntimeThread: tempo de kernel devolvido e de usuário gravado na
+/// saída opcional, em ticks do relógio (KeQueryTimeIncrement).
+pub fn query_runtime_thread(thread: u64, user_time: u64) -> u64 {
+    let (kernel, user) = crate::ntos::ps::process::thread_record(thread).map_or((0, 0), |record| (record.kernel_time, record.user_time));
+    if user_time != 0 {
+        guest::write32(user_time, (user / clock::TIME_INCREMENT) as u32);
+    }
+    kernel / clock::TIME_INCREMENT & 0xFFFF_FFFF
+}
+
 /// A thread de boot do System não é o processo Idle.
 pub fn is_idle_thread(thread: u64) -> bool {
     let idle = guest::read64(processor_address() + processor::IDLE_THREAD);

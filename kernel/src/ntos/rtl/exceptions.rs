@@ -15,7 +15,7 @@ use crate::hal::amd64::win32_thunk;
 use crate::ntos::ke::irql;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ke::exports as ke;
+use crate::ntos::ke::bugcheck as ke;
 
 const UNWINDING: u32 = 2;
 const EXIT_UNWIND: u32 = 4;

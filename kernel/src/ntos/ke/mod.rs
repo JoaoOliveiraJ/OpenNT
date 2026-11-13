@@ -24,6 +24,13 @@ pub mod process_attachment;
 pub mod debugger_data;
 pub mod persistent_thread_state;
 pub mod kernel_exception;
+pub mod spin_lock;
+pub mod processor_group;
+pub mod affinity;
+pub mod callout;
+pub mod debug_print;
+pub mod xstate;
+pub mod version;
 pub mod exports;
 pub mod services;
 

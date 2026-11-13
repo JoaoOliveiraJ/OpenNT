@@ -153,6 +153,14 @@ pub fn get_pcr_address() -> u64 {
     ADDRESS.load(Ordering::Acquire)
 }
 
+/// KeQueryPrcbAddress: entrada de KiProcessorBlock — a KPRCB embutida na
+/// KPCR de cada processador que tem uma (o OpenNT publica a do processador
+/// de boot); sem KPRCB, NULL.
+pub fn query_prcb_address(number: u32) -> u64 {
+    let base = get_pcr_address();
+    if number == 0 && base != 0 { base + layout::PRCB } else { 0 }
+}
+
 pub fn set_io_database_lock(pointer: u64) {
     PCR.lock().io_database_lock = pointer;
     with_field(layout::LOCK_QUEUE_ARRAY + 10 * 16 + 8, |at| physical::write64(at, pointer));

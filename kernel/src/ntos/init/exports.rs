@@ -329,7 +329,7 @@ pub fn export_module() -> Result<ExportedModule, KernelError> {
 /// Liga a tabela ao loader (resolvedor de `ntoskrnl.exe` e trampolins).
 pub fn init() {
     pe_loader::set_thunk_table(Some(win32_thunk::thunk_table()));
-    crate::ntos::ke::exports::init();
+    crate::ntos::ke::bugcheck::init();
     crate::ntos::io::file::zw::init();
     crate::ntos::ps::user::state::init();
     crate::ntos::ps::user::sections::init();

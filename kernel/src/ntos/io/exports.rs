@@ -1077,10 +1077,10 @@ pub mod convert_file_handle {
 }
 
 fn acquire_vpb_spin_lock(call: &Call) -> Result<u64, KernelError> {
-    crate::ntos::ke::exports::acquire_vpb_spin_lock(call.arg(1))
+    crate::ntos::ke::spin_lock::acquire_vpb_spin_lock(call.arg(1))
 }
 fn release_vpb_spin_lock(call: &Call) -> Result<u64, KernelError> {
-    crate::ntos::ke::exports::release_vpb_spin_lock(call.arg(1))
+    crate::ntos::ke::spin_lock::release_vpb_spin_lock(call.arg(1))
 }
 
 /// IoGetAffinityInterrupt: o processador que recebe a interrupção (o

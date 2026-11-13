@@ -7,7 +7,7 @@
 
 use alloc::collections::BTreeMap;
 
-use super::irql;
+use super::{irql, spin_lock};
 use crate::hal::amd64::native_call;
 use crate::hal::{physical, port};
 use crate::nano::interrupts;
@@ -183,6 +183,20 @@ pub fn ke_synchronize_execution(object: u64, routine: u64, context: u64) -> u64 
     release_lock(lock);
     irql::lower_irql(previous as u64);
     result
+}
+
+/// KeAcquireInterruptSpinLock: sobe ao SynchronizeIrql do objeto (nunca
+/// desce), pega o lock apontado por ActualLock e devolve o IRQL anterior.
+pub fn acquire_interrupt_spin_lock(object: u64) -> u8 {
+    let lock = guest::read64(object + layout::ACTUAL_LOCK);
+    let previous = irql::raise_at_least(guest::read8(object + layout::SYNCHRONIZE_IRQL));
+    spin_lock::acquire_at_dpc_level(lock);
+    previous
+}
+
+/// KeReleaseInterruptSpinLock: solta o ActualLock e volta ao IRQL dado.
+pub fn release_interrupt_spin_lock(object: u64, old_irql: u64) {
+    spin_lock::release(guest::read64(object + layout::ACTUAL_LOCK), old_irql);
 }
 
 pub fn is_vector_connected(vector: u32) -> bool {

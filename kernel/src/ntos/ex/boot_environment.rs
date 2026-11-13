@@ -41,3 +41,11 @@ pub fn init() -> Result<(), KernelError> {
 pub fn get_information() -> Result<[u8; 32], KernelError> {
     INFORMATION.lock().ok_or_else(|| KernelError::new("boot environment not initialized"))
 }
+
+/// FIRMWARE_TYPE::FirmwareTypeUefi (0 Unknown, 1 Bios, 2 Uefi).
+const FIRMWARE_TYPE_UEFI: u64 = 2;
+
+/// ExGetFirmwareType: o OpenNT inicia por UEFI.
+pub fn get_firmware_type() -> u64 {
+    FIRMWARE_TYPE_UEFI
+}

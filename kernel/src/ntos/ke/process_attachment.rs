@@ -32,6 +32,13 @@ struct Frame {
 
 static FRAMES: SpinLock<BTreeMap<(u64, usize), Frame>> = SpinLock::new(BTreeMap::new());
 
+/// KeAttachProcess salva o ambiente no KTHREAD.SavedApcState embutido e usa
+/// um pequeno bloco-marcador separado como "caller_state" do núcleo de
+/// anexação (o núcleo exige que marcador e estado salvo sejam buffers
+/// distintos no primeiro attach). thread → bloco-marcador, consumido por
+/// KeDetachProcess.
+static LEGACY_ATTACH: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
+
 /// IRQL abaixo de DISPATCH_LEVEL; uso inválido não vira sucesso.
 fn require_attach_level() -> Result<(), KernelError> {
     if irql::get_irql() >= 2 {
@@ -192,4 +199,45 @@ pub fn detach(caller_state: u64) -> Result<u32, KernelError> {
     apc::end_attachment(thread, depth, Some(&mut transition))?;
     FRAMES.lock().remove(&(thread, depth));
     failure.map_or(Ok(0), Err)
+}
+
+/// KeAttachProcess(PKPROCESS): forma legada da anexação. Encaminha ao mesmo
+/// núcleo de KeStackAttachProcess; no primeiro attach o estado anterior vai
+/// para o KTHREAD.SavedApcState embutido (previous_index == 0), exatamente
+/// como o KiAttachProcess. O bloco-marcador fica guardado para o detach.
+pub fn attach_legacy(target_process: u64) -> Result<(), KernelError> {
+    let thread = process::get_current_thread();
+    let marker = guest::alloc_bytes(0x30);
+    guest::write64(marker + 0x20, 0);
+    match attach(target_process, marker) {
+        Ok(_) => {
+            if let Some(previous) = LEGACY_ATTACH.lock().insert(thread, marker) {
+                guest::free_bytes(previous);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            guest::free_bytes(marker);
+            Err(error)
+        }
+    }
+}
+
+/// KeDetachProcess(void): desfaz a anexação legada da thread corrente.
+pub fn detach_legacy() -> Result<(), KernelError> {
+    let thread = process::get_current_thread();
+    let marker = LEGACY_ATTACH.lock().remove(&thread);
+    if let Some(marker) = marker {
+        let result = detach(marker);
+        guest::free_bytes(marker);
+        result?;
+    }
+    Ok(())
+}
+
+/// KeIsAttachedProcess(void): TRUE se a thread corrente está anexada
+/// (ApcStateIndex != 0, isto é, o KAPC_STATE foi trocado).
+pub fn is_attached() -> bool {
+    let thread = process::get_current_thread();
+    guest::read8(thread + APC_STATE_INDEX) != 0
 }

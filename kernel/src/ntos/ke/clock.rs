@@ -7,8 +7,13 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::{cpu, physical, port};
+use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::text::fixed1;
 use crate::rtl::time;
+
+/// KeQueryTimeIncrement: quantum do timer do LAPIC, 100 Hz = 10 ms =
+/// 100000 × 100 ns.
+pub const TIME_INCREMENT: u64 = 100_000;
 
 static FREQUENCY_HERTZ: AtomicU64 = AtomicU64::new(0);
 static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
@@ -106,4 +111,59 @@ pub fn spin_ms(milliseconds: u64) {
 
 pub fn tsc_frequency_hz() -> u64 {
     FREQUENCY_HERTZ.load(Ordering::Relaxed)
+}
+
+/// Hora do sistema vista pelos drivers: o relógio de parede em milissegundos
+/// convertido para 100 ns desde 1601.
+fn driver_system_time() -> u64 {
+    now_ms() * 10_000 + 116_444_736_000_000_000
+}
+
+/// KeQuerySystemTime / KeQuerySystemTimePrecise.
+pub fn query_system_time(current_time: u64) {
+    guest::write64(current_time, driver_system_time());
+}
+
+/// KeQueryTickCount: milissegundos desde o boot.
+pub fn query_tick_count(tick_count: u64) {
+    guest::write64(tick_count, uptime_ms());
+}
+
+/// KeQueryPerformanceCounter: contador TSC; a frequência sai no ponteiro
+/// opcional.
+pub fn query_performance_counter(frequency: u64) -> u64 {
+    if frequency != 0 {
+        guest::write64(frequency, tsc_frequency_hz());
+    }
+    cpu::rdtsc()
+}
+
+/// KeStallExecutionProcessor: espera ocupada medida pelo TSC.
+pub fn stall_execution_processor(microseconds: u32) {
+    let ticks = tsc_frequency_hz() / 1_000_000 * (microseconds as u64);
+    let start = cpu::rdtsc();
+    while cpu::rdtsc().wrapping_sub(start) < ticks {
+        core::hint::spin_loop();
+    }
+}
+
+/// KeQueryUnbiasedInterruptTime: sem suspensão, unbiased == interrupt time.
+pub fn unbiased_interrupt_time() -> u64 {
+    uptime_ms() * 10_000
+}
+
+/// KeQueryUnbiasedInterruptTimePrecise: o tempo vai para o ponteiro.
+pub fn query_unbiased_interrupt_time_precise(time: u64) {
+    guest::write64(time, uptime_ms() * 10_000);
+}
+
+/// KeQueryInterruptTimePrecise(PULONGLONG QpcValue): devolve o tempo de
+/// interrupção (100 ns) e grava o contador de desempenho (QPC == TSC, como
+/// KeQueryPerformanceCounter) no ponteiro. Mesma fonte de relógio por trás
+/// de KeQueryUnbiasedInterruptTimePrecise.
+pub fn query_interrupt_time_precise(qpc_value: u64) -> u64 {
+    if qpc_value != 0 {
+        guest::write64(qpc_value, cpu::rdtsc());
+    }
+    uptime_100ns()
 }

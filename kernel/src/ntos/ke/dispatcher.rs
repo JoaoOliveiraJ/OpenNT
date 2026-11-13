@@ -47,6 +47,14 @@ pub fn read_state(object: u64) -> u32 {
     guest::read32(object + header::SIGNAL_STATE)
 }
 
+/// KePulseEvent: sinaliza (libera os waiters) e volta a não sinalizado num
+/// único passo, devolvendo o estado anterior — KeSetEvent + KeResetEvent.
+pub fn pulse_event(event: u64) -> u32 {
+    let previous = set_event(event);
+    reset_event(event);
+    previous
+}
+
 pub fn initialize_semaphore(semaphore: u64, count: u32, limit: u32) {
     guest::write8(semaphore + header::TYPE, 5);
     guest::write8(semaphore + 2, 0x20 / 4);
@@ -72,6 +80,25 @@ pub fn release_semaphore(semaphore: u64, release_count: i64) -> Result<u32, u32>
 
 pub fn semaphore_limit(semaphore: u64) -> u32 {
     guest::read32(semaphore + 0x18)
+}
+
+/// KeInitializeSemaphore dos drivers: KSEMAPHORE com Type 5, SignalState =
+/// contagem e Limit em +0x18 (sem tocar no tamanho nem na lista de espera).
+pub fn initialize_driver_semaphore(semaphore: u64, count: u32, limit: u32) {
+    guest::write8(semaphore + header::TYPE, 5);
+    guest::write32(semaphore + header::SIGNAL_STATE, count);
+    guest::write32(semaphore + 0x18, limit);
+}
+
+/// KeReleaseSemaphore dos drivers: devolve o SignalState anterior; o novo é
+/// anterior + ajuste, limitado ao Limit.
+pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
+    let state = semaphore + header::SIGNAL_STATE;
+    let previous = guest::read32(state) as i32;
+    let limit = guest::read32(semaphore + 0x18) as i32;
+    let released = previous.wrapping_add(adjustment).min(limit);
+    guest::write32(state, released as u32);
+    previous
 }
 
 /// Mutants deste caminho começam sem desabilitar APCs de kernel.
