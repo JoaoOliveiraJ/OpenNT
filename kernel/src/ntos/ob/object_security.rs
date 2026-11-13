@@ -257,3 +257,101 @@ pub fn dereference_security_descriptor(descriptor: u64, count: u32) -> Result<()
     }
     Ok(())
 }
+
+// ---- NtSetSecurityObject em modo kernel (ZwSetSecurityObject) ---------------
+//
+// ntoskrnl 19041 NtSetSecurityObject rva 0x67b860:
+//   SecurityDescriptor NULL                         -> STATUS_ACCESS_VIOLATION
+//   o acesso pedido ao handle vem de SeSetSecurityAccessMask (WRITE_OWNER para
+//   OWNER/GROUP/LABEL, WRITE_DAC para DACL, ACCESS_SYSTEM_SECURITY para SACL) —
+//   em KernelMode não é comparado ao concedido;
+//   o descritor é capturado (SeCaptureSecurityDescriptor, cópia self-relative);
+//   OWNER_SECURITY_INFORMATION sem Owner        -> STATUS_INVALID_OWNER
+//   GROUP_SECURITY_INFORMATION sem Group        -> STATUS_INVALID_PRIMARY_GROUP
+//   ObSetSecurityObjectByPointer chama o SecurityProcedure do tipo: para
+//   arquivos o IopGetSetSecurityObject envia IRP_MJ_SET_SECURITY ao dispositivo
+//   do arquivo (Parameters.SetSecurity { SecurityInformation, SecurityDescriptor });
+//   os demais tipos trocam o descritor do objeto.
+// No OpenNT os tipos não-arquivo usam a tabela lateral do
+// ObSetSecurityObjectByPointer acima (o slot do OBJECT_HEADER). Diferença
+// honesta: chaves de registro e objetos com política própria continuam
+// respondendo às consultas pela política do dono (o registro do OpenNT não
+// regrava o descritor da chave).
+
+const SET_SECURITY_STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const SET_SECURITY_STATUS_INVALID_OWNER: u32 = 0xC000_005A;
+const SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
+const SET_SECURITY_STATUS_PENDING: u32 = 0x103;
+const OWNER_SECURITY_INFORMATION: u32 = 1;
+const GROUP_SECURITY_INFORMATION: u32 = 2;
+const IRP_MJ_SET_SECURITY: u8 = 0x15;
+
+/// IRP_MJ_SET_SECURITY síncrono ao dispositivo do arquivo.
+fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, crate::rtl::KernelError> {
+    use crate::ntos::inc::types::{IoStackLocation, IoStatusBlock, Irp, Kevent};
+    let device = crate::ntos::io::file::information::related_device(file)?;
+    let event = guest::alloc_bytes(Kevent::SIZE);
+    let io_status = guest::alloc_bytes(IoStatusBlock::SIZE);
+    crate::ntos::ke::dispatcher::initialize_event(event, 0, false);
+    let packet = crate::ntos::io::io_manager::build_synchronous_fsd_request(IRP_MJ_SET_SECURITY, device, 0, 0, 0, event, io_status);
+    let mut status = 0xC000_009A;
+    if packet != 0 {
+        // SAFETY: IRP recém-montado pelo I/O Manager.
+        let irp = unsafe { Irp::at(packet) };
+        // SAFETY: a posição do primeiro driver, logo abaixo de CurrentStackLocation.
+        let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get() - IoStackLocation::SIZE) };
+        location.parameters.set_security.security_information.set(information);
+        location.parameters.set_security.security_descriptor.set(captured);
+        location.file_object.set(file);
+        irp.tail.overlay.original_file_object.set(file);
+        status = crate::ntos::io::io_manager::iof_call_driver(device, packet) as u32;
+        if status == SET_SECURITY_STATUS_PENDING {
+            crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
+            // SAFETY: IO_STATUS_BLOCK alocado acima.
+            status = unsafe { IoStatusBlock::at(io_status) }.status.get() as u32;
+        }
+        guest::free_bytes(packet);
+    }
+    guest::free_bytes(event);
+    guest::free_bytes(io_status);
+    Ok(status)
+}
+
+/// ZwSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor).
+pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
+    if descriptor == 0 {
+        return Ok(SET_SECURITY_STATUS_ACCESS_VIOLATION);
+    }
+    let mut reference = match crate::ntos::ob::handles::security::reference_kernel_handle(handle)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let result = (|| -> Result<u32, crate::rtl::KernelError> {
+        let output = guest::alloc_bytes(8);
+        let captured_status = crate::ntos::init::exports::invoke_handler("SeCaptureSecurityDescriptor", &[descriptor, 0, 1, 1, output])? as u32;
+        // SAFETY: PSECURITY_DESCRIPTOR* alocado acima.
+        let captured = unsafe { Field::<u64>::at(output) }.get();
+        guest::free_bytes(output);
+        if captured_status != 0 {
+            return Ok(captured_status);
+        }
+        let control = crate::ntos::se::descriptor::control(captured);
+        if information & OWNER_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 0) == 0 {
+            guest::free_bytes(captured);
+            return Ok(SET_SECURITY_STATUS_INVALID_OWNER);
+        }
+        if information & GROUP_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 1) == 0 {
+            guest::free_bytes(captured);
+            return Ok(SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP);
+        }
+        if reference.object_type.name == object_types::file_type().name {
+            let status = set_file_security(reference.pointer, information, captured);
+            guest::free_bytes(captured);
+            return status;
+        }
+        // O descritor capturado passa a ser o do objeto.
+        Ok(set_security_object_by_pointer(reference.pointer, captured))
+    })();
+    reference.release()?;
+    result
+}

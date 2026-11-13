@@ -394,3 +394,89 @@ pub fn pin_kernel_library(driver: u64) {
         entry.kernel_library_pinned = true;
     }
 }
+
+// ---- Reinicialização de drivers de boot e caminho da imagem -------------------
+//
+// ntoskrnl 19041:
+//   IoRegisterBootDriverReinitialization rva 0x7c6a80: depois de
+//     IopBootDriverReinitCompleted não faz nada; senão ObReferenceObject(Driver),
+//     Driver->Flags |= DRVO_BOOTREINIT_REGISTERED (0x20) e enfileira
+//     { DriverObject, Routine, Context } na IopBootDriverReinitializeQueueHead.
+//   IopCallBootDriverReinitializationRoutines rva 0xa6eeac: retira da cabeça
+//     até esvaziar (rotinas podem se reenfileirar); por item,
+//     DriverExtension->Count++, Flags &= ~0x20, Routine(Driver, Context, Count),
+//     ObDereferenceObject; por fim IopBootDriverReinitCompleted = TRUE.
+//   IoQueryFullDriverPath rva 0x3a66e0: KLDR_DATA_TABLE_ENTRY de
+//     Driver->DriverSection; FullDllName copiado para um buffer PagedPool de
+//     MaximumLength; sem DriverSection, STATUS_NOT_FOUND.
+
+const DRVO_BOOTREINIT_REGISTERED: u32 = 0x20;
+
+static BOOT_REINITIALIZATION: SpinLock<Vec<(u64, u64, u64)>> = SpinLock::new(Vec::new());
+static BOOT_REINITIALIZATION_COMPLETED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// IoRegisterBootDriverReinitialization(DriverObject, Routine, Context).
+pub fn register_boot_driver_reinitialization(driver: &DriverObject, routine: u64, context: u64) {
+    if BOOT_REINITIALIZATION_COMPLETED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let _ = crate::ntos::init::exports::invoke_handler("ObfReferenceObject", &[driver.address()]);
+    driver.flags.atomic().fetch_or(DRVO_BOOTREINIT_REGISTERED, core::sync::atomic::Ordering::SeqCst);
+    BOOT_REINITIALIZATION.lock().push((driver.address(), routine, context));
+}
+
+/// IopCallBootDriverReinitializationRoutines: depois do último driver de boot
+/// e antes dos drivers de sistema. Devolve se alguma rotina rodou.
+pub fn run_boot_driver_reinitialization_routines() -> bool {
+    let mut ran = false;
+    loop {
+        let entry = {
+            let mut queue = BOOT_REINITIALIZATION.lock();
+            if queue.is_empty() {
+                break;
+            }
+            queue.remove(0)
+        };
+        let (address, routine, context) = entry;
+        ran = true;
+        // SAFETY: DRIVER_OBJECT referenciado no registro, vivo até o dereference.
+        let driver = unsafe { DriverObject::at(address) };
+        // SAFETY: DriverObject->DriverExtension de um driver carregado.
+        let extension = unsafe { DriverExtension::at(driver.driver_extension.get()) };
+        let count = extension.count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst).wrapping_add(1);
+        driver.flags.atomic().fetch_and(!DRVO_BOOTREINIT_REGISTERED, core::sync::atomic::Ordering::SeqCst);
+        native_call::call(routine, &[address, context, count as u64]);
+        let _ = crate::ntos::init::exports::invoke_handler("ObfDereferenceObject", &[address]);
+    }
+    BOOT_REINITIALIZATION_COMPLETED.store(true, core::sync::atomic::Ordering::Release);
+    ran
+}
+
+/// IopBootDriverReinitCompleted.
+pub fn boot_driver_reinitialization_completed() -> bool {
+    BOOT_REINITIALIZATION_COMPLETED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// IoQueryFullDriverPath(DriverObject, FullPath*): o OpenNT ainda não publica
+/// um KLDR_DATA_TABLE_ENTRY em DriverSection (o begin_driver o deixa nulo), e
+/// nesse caso o NT devolve STATUS_NOT_FOUND.
+pub fn query_full_driver_path(driver: &DriverObject, full_path: &UnicodeString) -> u32 {
+    let section = driver.driver_section.get();
+    if section == 0 {
+        return 0xC000_0225;
+    }
+    // SAFETY: DriverSection aponta para a entrada do loader do driver.
+    let name = &unsafe { crate::ntos::inc::types::KldrDataTableEntry::at(section) }.full_dll_name;
+    let maximum = name.maximum_length.get();
+    let buffer = guest::alloc_bytes(maximum.max(1) as u64);
+    if buffer == 0 {
+        return 0xC000_009A;
+    }
+    // RtlCopyUnicodeString: Length limitado ao MaximumLength do destino.
+    let copied = name.length.get().min(maximum);
+    guest::write_bytes(buffer, &guest::read_bytes(name.buffer.get(), copied as usize));
+    full_path.length.set(copied);
+    full_path.maximum_length.set(maximum);
+    full_path.buffer.set(buffer);
+    0
+}

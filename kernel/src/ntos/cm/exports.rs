@@ -22,3 +22,15 @@ pub mod registry_callbacks {
         data_exports: &[],
     };
 }
+
+pub mod cm_key_notify {
+    use crate::ntos::cm::key::notify;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn notify_change_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(notify::notify_change_key(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7) & 0xFF != 0, call.arg(8), call.arg(9) as u32, call.arg(10) & 0xFF != 0)))
+    }
+
+    pub static GROUP: Group = Group { name: "cm-key-notify", names: &["ZwNotifyChangeKey"], handlers: &[notify_change_key], data_exports: &[] };
+}

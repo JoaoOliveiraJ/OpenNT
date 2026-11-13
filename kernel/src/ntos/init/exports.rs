@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 272] {
+fn groups() -> [&'static Group; 290] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -327,6 +327,24 @@ fn groups() -> [&'static Group; 272] {
         &crate::ntos::ke::exports::ke_queues::GROUP,
         &crate::ntos::ex::exports::ex_resource_priority::GROUP,
         &crate::ntos::ex::exports::ex_pool_block_size::GROUP,
+        &crate::ntos::cm::exports::cm_key_notify::GROUP,
+        &crate::ntos::ex::exports::ex_legacy_support::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_status::GROUP,
+        &crate::ntos::io::exports::io_boot_disk::GROUP,
+        &crate::ntos::io::exports::io_driver_notification::GROUP,
+        &crate::ntos::io::exports::io_interrupt_state::GROUP,
+        &crate::ntos::io::exports::io_pnp_device::GROUP,
+        &crate::ntos::io::exports::io_wdm_headless::GROUP,
+        &crate::ntos::io::exports::io_work_item::GROUP,
+        &crate::ntos::kse::exports::kse_shim_registration::GROUP,
+        &crate::ntos::ob::exports::ob_duplicate_object::GROUP,
+        &crate::ntos::ob::exports::ob_set_security::GROUP,
+        &crate::ntos::po::exports::po_coalescing::GROUP,
+        &crate::ntos::po::exports::po_device_wake::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_rand::GROUP,
+        &crate::ntos::mm::exports::vf_device_verification::GROUP,
+        &crate::hal::exports::vsl_secure_pci::GROUP,
+        &crate::ntos::whea::exports::whea_error_source::GROUP,
     ]
 }
 

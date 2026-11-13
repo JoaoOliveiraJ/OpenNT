@@ -48,3 +48,5 @@ pub mod buffer_validation;
 pub mod redirection_trust;
 pub mod paging_io;
 pub mod share_access;
+pub mod arc_name;
+pub mod shutdown;

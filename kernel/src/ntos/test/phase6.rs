@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1566 && abi_names::GROUP_LAYOUT.len() == 272 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1566 exports em 272 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1610 && abi_names::GROUP_LAYOUT.len() == 290 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1610 exports em 290 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1566 && exports::export_names().len() == 1566, "ntoskrnl: 272 grupos com os 1566 exports implementados");
+    assert(exports::implemented() == 1610 && exports::export_names().len() == 1610, "ntoskrnl: 290 grupos com os 1610 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -10541,6 +10541,530 @@ fn ex_pool_block_size_exports(assert: Assert) {
 }
 
 
+fn cm_key_notify_exports(assert: Assert) {
+    use crate::ntos::cm::key::services as key_services;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ke::dispatcher;
+    let path = "\\Registry\\Machine\\Software\\OpenNTNotifyTest";
+    let (opened, key) = key_services::open_path(path, true).unwrap_or((1, 0));
+    assert(opened == 0 && key != 0, "cm-key-notify: chave de teste aberta");
+    let event = guest::alloc_bytes(nt::Kevent::SIZE);
+    let io_status = guest::alloc_bytes(nt::IoStatusBlock::SIZE);
+    let iosb = at::<nt::IoStatusBlock>(io_status);
+    dispatcher::initialize_event(event, 0, true);
+    iosb.status.set(-1);
+    // Filtro ilegal recusado antes de tocar no evento.
+    assert(call_export("ZwNotifyChangeKey", &[key, event, 0, 0, io_status, 0x20, 0, 0, 0, 1]) == Some(signed_status(0xC000_000D)), "cm-key-notify: filtro fora de REG_LEGAL_CHANGE_FILTER recusado");
+    // Assíncrono: STATUS_PENDING e o evento zerado até a mudança.
+    let posted = call_export("ZwNotifyChangeKey", &[key, event, 0, 0, io_status, 5, 0, 0, 0, 1]);
+    assert(posted == Some(0x103) && dispatcher::read_state(event) == 0, "cm-key-notify: notificacao postada fica pendente");
+    // Criar uma subchave direta dispara a notificação (NAME).
+    let (created, child) = key_services::open_path(&alloc::format!("{path}\\Child"), true).unwrap_or((1, 0));
+    assert(created == 0 && child != 0 && dispatcher::read_state(event) != 0 && iosb.status.get() == 0x10C, "cm-key-notify: mudanca completa com STATUS_NOTIFY_ENUM_DIR e sinaliza o evento");
+    // Disparo único: outra mudança não toca o bloco já completado.
+    iosb.status.set(0);
+    let _ = key_services::open_path(&alloc::format!("{path}\\Other"), true);
+    assert(iosb.status.get() == 0, "cm-key-notify: notificacao e de disparo unico");
+    assert(call_export("ZwNotifyChangeKey", &[0x7FFF_FFF0, event, 0, 0, io_status, 5, 0, 0, 0, 1]) == Some(signed_status(0xC000_0008)), "cm-key-notify: handle invalido recusado");
+    let _ = call_export("ZwClose", &[child]);
+    let _ = call_export("ZwClose", &[key]);
+}
+
+
+fn ex_legacy_support_exports(assert: Assert) {
+    // ExAllocatePool(NonPagedPoolNx, 0x40): memória utilizável, liberada com ExFreePool.
+    let pool = call_export("ExAllocatePool", &[512, 0x40]).unwrap_or(0);
+    assert(pool != 0, "ex-legacy-support: ExAllocatePool aloca com a tag 'None'");
+    let cell = at::<nt::Field<u64>>(pool);
+    cell.set(0x1234);
+    assert(cell.get() == 0x1234 && call_export("ExFreePool", &[pool]).is_some(), "ex-legacy-support: bloco do ExAllocatePool volta ao pool");
+    // ExInterlockedInsertHeadList: lista vazia devolve NULL; depois a antiga cabeça.
+    let block = guest::alloc_bytes(3 * nt::ListEntry::SIZE + 8);
+    let (head_address, first_address, second_address) = (block, block + nt::ListEntry::SIZE, block + 2 * nt::ListEntry::SIZE);
+    let lock_address = block + 3 * nt::ListEntry::SIZE;
+    let (head, first, second, lock) = (at::<nt::ListEntry>(head_address), at::<nt::ListEntry>(first_address), at::<nt::ListEntry>(second_address), at::<nt::Field<u64>>(lock_address));
+    head.flink.set(head_address);
+    head.blink.set(head_address);
+    lock.set(0);
+    assert(
+        call_export("ExInterlockedInsertHeadList", &[head_address, first_address, lock_address]) == Some(0) && head.flink.get() == first_address && head.blink.get() == first_address && first.flink.get() == head_address && first.blink.get() == head_address,
+        "ex-legacy-support: insercao na lista vazia devolve NULL",
+    );
+    assert(
+        call_export("ExInterlockedInsertHeadList", &[head_address, second_address, lock_address]) == Some(first_address) && head.flink.get() == second_address && second.flink.get() == first_address && first.blink.get() == second_address && lock.get() == 0,
+        "ex-legacy-support: nova cabeca devolve a anterior e solta o lock",
+    );
+    // ExQueryTimerResolution: 10 ms nos três.
+    let times = guest::alloc_bytes(12);
+    let _ = call_export("ExQueryTimerResolution", &[times, times + 4, times + 8]);
+    let time = |offset: u64| at::<nt::Field<u32>>(times + offset).get();
+    assert(time(0) == 100_000 && time(4) == 100_000 && time(8) == 100_000, "ex-legacy-support: ExQueryTimerResolution = KeQueryTimeIncrement");
+}
+
+
+fn fsrtl_status_exports(assert: Assert) {
+    let failure = |status: u64| call_export("FsRtlIsTotalDeviceFailure", &[status]).map(|value| value & 0xFF);
+    assert(failure(0xC000_0185) == Some(1) && failure(0xC000_000E) == Some(1), "fsrtl-status: erros de dispositivo sao falha total");
+    assert(failure(0xC000_003F) == Some(0) && failure(0xC000_009C) == Some(0) && failure(0xC000_0470) == Some(0), "fsrtl-status: CRC, dado do dispositivo e 0xC0000470 nao sao falha total");
+    // O original testa só o bit de sinal (`test ecx, ecx; jns`): avisos também contam.
+    assert(failure(0) == Some(0) && failure(0x4000_0000) == Some(0) && failure(0x103) == Some(0), "fsrtl-status: sucesso, informativo e pendente nao sao falha");
+    assert(failure(0x8000_0005) == Some(1), "fsrtl-status: aviso tem o bit de sinal e conta como falha");
+}
+
+
+fn io_boot_disk_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::BootdiskInformationLite;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ob::objects::device as device_objects;
+
+    let output = guest::alloc_bytes(8);
+    assert(call_export("IoGetBootDiskInformationLite", &[output]) == Some(0) && at::<nt::Field<u64>>(output).get() != 0, "io-boot-disk: IoGetBootDiskInformationLite aloca o bloco");
+    let block = at::<nt::Field<u64>>(output).get();
+    assert(at::<BootdiskInformationLite>(block).number_entries.get() == 0 && guest::read_bytes(block, 0x58).iter().all(|&byte| byte == 0), "io-boot-disk: sem discos do loader, NumberEntries 0 e entradas reservadas zeradas");
+    guest::free_bytes(block);
+
+    // Dispositivo sem driver: o primeiro IOCTL (IOCTL_STORAGE_GET_DEVICE_NUMBER) volta
+    // o NOT_SUPPORTED interno do IofCallDriver do OpenNT (sem driver nem PDO
+    // que responda) e o IopCreateArcName devolve esse status.
+    let address = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let device = at::<nt::DeviceObject>(address);
+    device.type_.set(3);
+    device.size.set(nt::DeviceObject::SIZE as u16);
+    device.stack_size.set(1);
+    let _ = device_objects::register(address, None, None);
+    let not_supported = Some(signed_status(crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32));
+    assert(call_export("IoCreateArcName", &[address]) == not_supported, "io-boot-disk: IoCreateArcName propaga o status do primeiro IOCTL");
+}
+
+
+fn io_driver_notification_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::{lifecycle, shutdown};
+    use crate::ntos::ob::objects::device as device_objects;
+
+    // DRIVER_OBJECT sintético com DRIVER_EXTENSION logo depois.
+    let driver_address = guest::alloc_bytes(nt::DriverObject::SIZE + nt::DriverExtension::SIZE);
+    let extension_address = driver_address + nt::DriverObject::SIZE;
+    let driver = at::<nt::DriverObject>(driver_address);
+    let extension = at::<nt::DriverExtension>(extension_address);
+    driver.type_.set(4);
+    driver.driver_extension.set(extension_address);
+    extension.driver_object.set(driver_address);
+    // Rotina: mov [rdx], rcx; mov [rdx+8], r8; ret — grava (Driver, Count) no contexto.
+    let routine = guest::alloc_bytes(16);
+    guest::write_bytes(routine, &[0x48, 0x89, 0x0A, 0x4C, 0x89, 0x42, 0x08, 0xC3]);
+    let context = guest::alloc_bytes(0x10);
+    let recorded_driver = at::<nt::Field<u64>>(context);
+    let recorded_count = at::<nt::Field<u32>>(context + 8);
+    let completed = lifecycle::boot_driver_reinitialization_completed();
+    let _ = call_export("IoRegisterBootDriverReinitialization", &[driver_address, routine, context]);
+    if completed {
+        // Depois de IopBootDriverReinitCompleted o registro é ignorado.
+        assert(driver.flags.get() & 0x20 == 0 && recorded_driver.get() == 0, "io-driver-notification: registro tardio de boot reinit ignorado");
+    } else {
+        assert(driver.flags.get() & 0x20 != 0, "io-driver-notification: DRVO_BOOTREINIT_REGISTERED ligado");
+        let ran = lifecycle::run_boot_driver_reinitialization_routines();
+        assert(ran && recorded_driver.get() == driver_address && recorded_count.get() == 1 && extension.count.get() == 1 && driver.flags.get() & 0x20 == 0, "io-driver-notification: rotina chamada com (Driver, Context, Count=1)");
+    }
+
+    // IoQueryFullDriverPath: sem DriverSection = STATUS_NOT_FOUND; com KLDR_DATA_TABLE_ENTRY copia FullDllName.
+    let path_address = guest::alloc_bytes(nt::UnicodeString::SIZE);
+    let path = at::<nt::UnicodeString>(path_address);
+    assert(call_export("IoQueryFullDriverPath", &[driver_address, path_address]) == Some(signed_status(0xC000_0225)), "io-driver-notification: sem DriverSection = STATUS_NOT_FOUND");
+    let entry_address = guest::alloc_bytes(nt::KldrDataTableEntry::SIZE);
+    let entry = at::<nt::KldrDataTableEntry>(entry_address);
+    let text: Vec<u8> = "\\SystemRoot\\x.sys".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    let name = guest::alloc_bytes(64);
+    guest::write_bytes(name, &text);
+    entry.full_dll_name.length.set(text.len() as u16);
+    entry.full_dll_name.maximum_length.set(64);
+    entry.full_dll_name.buffer.set(name);
+    driver.driver_section.set(entry_address);
+    let copied = call_export("IoQueryFullDriverPath", &[driver_address, path_address]);
+    let buffer = path.buffer.get();
+    assert(copied == Some(0) && path.length.get() == text.len() as u16 && path.maximum_length.get() == 64 && buffer != name && guest::read_bytes(buffer, text.len()) == text, "io-driver-notification: FullDllName copiado para buffer novo");
+
+    // IoRegisterLastChanceShutdownNotification: cabeça da fila e DO_SHUTDOWN_REGISTERED.
+    let device_address = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let device = at::<nt::DeviceObject>(device_address);
+    device.type_.set(3);
+    device.size.set(nt::DeviceObject::SIZE as u16);
+    device.stack_size.set(1);
+    let _ = device_objects::register(device_address, None, None);
+    assert(
+        call_export("IoRegisterLastChanceShutdownNotification", &[device_address]) == Some(0) && device.flags.get() & 0x800 != 0 && shutdown::last_chance_devices().first() == Some(&device_address),
+        "io-driver-notification: dispositivo na cabeca da fila de ultima chance",
+    );
+}
+
+
+fn io_interrupt_state_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::{IoInterruptMessageInfo, IoInterruptMessageInfoEntry, IoReportInterruptActiveStateParameters};
+    use crate::ntos::ke::interrupt_object::{self, InterruptObject};
+    // Objeto de interrupção fora da faixa do PIC (vetor 0xF0, sem cadeia): só o estado muda.
+    let object = guest::alloc_bytes(InterruptObject::SIZE);
+    at::<InterruptObject>(object).vector.set(0xF0);
+    let parameters_address = guest::alloc_bytes(IoReportInterruptActiveStateParameters::SIZE);
+    let parameters = at::<IoReportInterruptActiveStateParameters>(parameters_address);
+    parameters.version.set(1); // CONNECT_FULLY_SPECIFIED
+    parameters.connection_context.set(object);
+    let _ = call_export("IoReportInterruptInactive", &[parameters_address]);
+    assert(interrupt_object::interrupt_reported_inactive(object), "io-interrupt-state: IoReportInterruptInactive marca o objeto");
+    let _ = call_export("IoReportInterruptActive", &[parameters_address]);
+    assert(!interrupt_object::interrupt_reported_inactive(object), "io-interrupt-state: IoReportInterruptActive reativa o objeto");
+    // MESSAGE_BASED: IO_INTERRUPT_MESSAGE_INFO com duas mensagens.
+    let second = guest::alloc_bytes(InterruptObject::SIZE);
+    at::<InterruptObject>(second).vector.set(0xF1);
+    let table_address = guest::alloc_bytes(IoInterruptMessageInfo::SIZE + IoInterruptMessageInfoEntry::SIZE);
+    let table = at::<IoInterruptMessageInfo>(table_address);
+    table.message_count.set(2);
+    table.message_info[0].interrupt_object.set(object);
+    at::<IoInterruptMessageInfoEntry>(table.message_info[0].address() + IoInterruptMessageInfoEntry::SIZE).interrupt_object.set(second);
+    parameters.version.set(3);
+    parameters.connection_context.set(table_address);
+    let _ = call_export("IoReportInterruptInactive", &[parameters_address]);
+    assert(interrupt_object::interrupt_reported_inactive(object) && interrupt_object::interrupt_reported_inactive(second), "io-interrupt-state: MESSAGE_BASED percorre todas as mensagens");
+    let _ = call_export("IoReportInterruptActive", &[parameters_address]);
+    assert(!interrupt_object::interrupt_reported_inactive(object) && !interrupt_object::interrupt_reported_inactive(second), "io-interrupt-state: MESSAGE_BASED reativa todas as mensagens");
+}
+
+
+fn io_pnp_device_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::DeviceDescription;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::{device_property, io_manager};
+    use crate::ntos::ob::objects::device as device_objects;
+
+    // Driver sintético com ServiceKeyName = "OpenNtDetect".
+    let driver_address = guest::alloc_bytes(nt::DriverObject::SIZE + nt::DriverExtension::SIZE + 0x40);
+    let extension_address = driver_address + nt::DriverObject::SIZE;
+    let service = extension_address + nt::DriverExtension::SIZE;
+    let text: Vec<u8> = "OpenNtDetect".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(service, &text);
+    at::<nt::DriverObject>(driver_address).driver_extension.set(extension_address);
+    let service_key = &at::<nt::DriverExtension>(extension_address).service_key_name;
+    service_key.length.set(text.len() as u16);
+    service_key.maximum_length.set(text.len() as u16);
+    service_key.buffer.set(service);
+
+    // IoReportDetectedDevice(Driver, InterfaceTypeUndefined, -1, -1, NULL, NULL, TRUE, &Pdo).
+    let output = guest::alloc_bytes(8);
+    let pdo_cell = at::<nt::Field<u64>>(output);
+    let reported = call_export("IoReportDetectedDevice", &[driver_address, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 1, output]);
+    let pdo = pdo_cell.get();
+    let device = at::<nt::DeviceObject>(pdo);
+    assert(
+        reported == Some(0) && pdo != 0 && device.driver_object.get() == 0 && device.device_type.get() == 4 && device.characteristics.get() == 0x80 && device.flags.get() & 0x1000 != 0,
+        "io-pnp-device: IoReportDetectedDevice cria o PDO raiz do PnpManager",
+    );
+    assert(call_export("IoReportDetectedDevice", &[driver_address, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 1, output]) == Some(0) && pdo_cell.get() == pdo, "io-pnp-device: PDO ja relatado reaproveitado");
+
+    // QUERY_ID(BusQueryDeviceID) e QUERY_DEVICE_RELATIONS(TargetDeviceRelation) pelo PDO.
+    let send = |minor: u8, parameter: i32| {
+        let packet = io_manager::build_synchronous_fsd_request(io_manager::irp_mj::PNP, pdo, 0, 0, 0, 0, 0);
+        let irp = at::<nt::Irp>(packet);
+        let location = at::<nt::IoStackLocation>(irp.tail.overlay.current_stack_location.get() - nt::IoStackLocation::SIZE);
+        location.minor_function.set(minor);
+        location.parameters.query_id.id_type.set(nt::BusQueryIdType(parameter));
+        irp.io_status.status.set(0xC000_00BBu32 as i32);
+        let status = io_manager::iof_call_driver(pdo, packet);
+        let information = irp.io_status.information.get();
+        guest::free_bytes(packet);
+        (status, information)
+    };
+    let (status, id) = send(0x13, 0);
+    let expected: Vec<u8> = "ROOT\\OPENNTDETECT\0".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    assert(status == 0 && guest::read_bytes(id, expected.len()) == expected, "io-pnp-device: QUERY_ID devolve ROOT\\<servico>");
+    let (status, relations_address) = send(0x07, 4);
+    let relations = at::<nt::DeviceRelations>(relations_address);
+    assert(status == 0 && relations.count.get() == 1 && relations.objects[0].get() == pdo, "io-pnp-device: TargetDeviceRelation devolve o proprio PDO");
+    let _ = device_objects::dereference(pdo);
+
+    // IoGetDmaAdapter: PDO NULL e PDO sem BUS_INTERFACE_STANDARD devolvem NULL.
+    let description_address = guest::alloc_bytes(DeviceDescription::SIZE);
+    let description = at::<DeviceDescription>(description_address);
+    description.version.set(1);
+    description.interface_type.set(nt::InterfaceType::PCI_BUS);
+    let registers = guest::alloc_bytes(4);
+    assert(call_export("IoGetDmaAdapter", &[0, description_address, registers]) == Some(0), "io-pnp-device: IoGetDmaAdapter sem PDO = NULL");
+    assert(call_export("IoGetDmaAdapter", &[pdo, description_address, registers]) == Some(0), "io-pnp-device: barramento sem interface DMA = NULL");
+
+    // IoSetDevicePropertyData / leitura no mesmo armazenamento.
+    let key_address = guest::alloc_bytes(nt::Devpropkey::SIZE);
+    guest::write_bytes(key_address, &[0x11; 16]);
+    let key = at::<nt::Devpropkey>(key_address);
+    key.pid.set(7);
+    let data = guest::alloc_bytes(8);
+    at::<nt::Field<u32>>(data).set(0xCAFE_F00D);
+    assert(call_export("IoSetDevicePropertyData", &[pdo, key_address, 0, 0, 7, 4, data]) == Some(0), "io-pnp-device: IoSetDevicePropertyData grava no PDO");
+    let buffer = guest::alloc_bytes(8);
+    let (required, kind) = (at::<nt::Field<u32>>(guest::alloc_bytes(4)), at::<nt::Field<u32>>(guest::alloc_bytes(4)));
+    assert(device_property::query_device_property_data(pdo, key, 0, 0, 2, buffer, required, kind) == 0xC000_0023 && required.get() == 4 && kind.get() == 7, "io-pnp-device: leitura curta pede o tamanho e o tipo");
+    assert(device_property::query_device_property_data(pdo, key, 0, 0, 8, buffer, required, kind) == 0 && at::<nt::Field<u32>>(buffer).get() == 0xCAFE_F00D, "io-pnp-device: leitura devolve os dados gravados");
+    assert(call_export("IoSetDevicePropertyData", &[pdo, key_address, 0, 0, 7, 4, 0]) == Some(0) && device_property::query_device_property_data(pdo, key, 0, 0, 8, buffer, required, kind) == 0xC000_0034, "io-pnp-device: Data NULL apaga a propriedade");
+    let plain = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    assert(call_export("IoSetDevicePropertyData", &[plain, key_address, 0, 0, 7, 4, data]) == Some(signed_status(0xC000_0010)), "io-pnp-device: DEVICE_OBJECT fora do PnP = STATUS_INVALID_DEVICE_REQUEST");
+
+    // IoSetDeviceInterfacePropertyData: link NULL e interface inexistente.
+    assert(call_export("IoSetDeviceInterfacePropertyData", &[0, key_address, 0, 0, 7, 4, data]) == Some(signed_status(0xC000_000D)), "io-pnp-device: link NULL = STATUS_INVALID_PARAMETER");
+    let link_address = guest::alloc_bytes(nt::UnicodeString::SIZE + 0x80);
+    let name: Vec<u8> = "\\??\\OpenNtNoSuchInterface".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(link_address + nt::UnicodeString::SIZE, &name);
+    let link = at::<nt::UnicodeString>(link_address);
+    link.length.set(name.len() as u16);
+    link.maximum_length.set(name.len() as u16);
+    link.buffer.set(link_address + nt::UnicodeString::SIZE);
+    assert(call_export("IoSetDeviceInterfacePropertyData", &[link_address, key_address, 0, 0, 7, 4, data]) == Some(signed_status(0xC000_0034)), "io-pnp-device: interface inexistente = STATUS_OBJECT_NAME_NOT_FOUND");
+}
+
+
+fn io_wdm_headless_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let wdm = |major: u64, minor: u64| call_export("IoIsWdmVersionAvailable", &[major, minor]).map(|value| value & 0xFF);
+    assert(wdm(1, 0x30) == Some(1) && wdm(6, 0) == Some(1) && wdm(6, 1) == Some(0) && wdm(7, 0) == Some(0), "io-wdm-headless: WDM 6.0 anunciado");
+    // Sem EMS: comando 1 falha; consulta 2 zera a saída; sem saída = STATUS_INVALID_PARAMETER.
+    let output = guest::alloc_bytes(16);
+    let size = guest::alloc_bytes(8);
+    let output_cell = at::<nt::Field<u64>>(output);
+    output_cell.set(u64::MAX);
+    at::<nt::Field<u64>>(size).set(8);
+    assert(call_export("HeadlessDispatch", &[1, 0, 0, 0, 0]) == Some(signed_status(0xC000_0001)), "io-wdm-headless: habilitar terminal sem EMS = STATUS_UNSUCCESSFUL");
+    assert(call_export("HeadlessDispatch", &[2, 0, 0, output, size]) == Some(0) && output_cell.get() == 0, "io-wdm-headless: consulta zera o buffer de saida");
+    assert(call_export("HeadlessDispatch", &[2, 0, 0, 0, size]) == Some(signed_status(0xC000_000D)), "io-wdm-headless: consulta sem buffer recusada");
+    assert(call_export("HeadlessDispatch", &[3, 0, 0, 0, 0]) == Some(0), "io-wdm-headless: demais comandos aceitos");
+}
+
+
+fn io_work_item_exports(assert: Assert) {
+    // IO_WORKITEM embutido (IoSizeofWorkItem bytes), inicializado e nunca
+    // enfileirado: desfeito sem bugcheck.
+    let size = call_export("IoSizeofWorkItem", &[]).unwrap_or(0x30);
+    let item = guest::alloc_bytes(size);
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let _ = call_export("IoInitializeWorkItem", &[device, item]);
+    let queue_item = at::<nt::WorkQueueItem>(item);
+    assert(queue_item.list.flink.get() == 0 && queue_item.worker_routine.get() == 0, "io-work-item: IoInitializeWorkItem deixa o item fora da fila");
+    assert(call_export("IoUninitializeWorkItem", &[item]).is_some() && queue_item.list.flink.get() == 0, "io-work-item: IoUninitializeWorkItem aceita item fora da fila");
+}
+
+
+fn kse_shim_registration_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let shim = guest::alloc_bytes(0x30);
+    assert(call_export("KseRegisterShim", &[0, 0, 0]) == Some(signed_status(0xC000_000D)), "kse-shim-registration: KSE_SHIM NULL = STATUS_INVALID_PARAMETER");
+    assert(call_export("KseRegisterShim", &[shim, 0, 0]) == Some(signed_status(0xC000_0001)), "kse-shim-registration: motor nao inicializado = STATUS_UNSUCCESSFUL");
+}
+
+
+fn ob_duplicate_object_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ob::object_manager;
+    let block = guest::alloc_bytes(0x400);
+    let output = block + 0x300;
+    let event = block + 0x380;
+    dispatcher::initialize_event(event, 0, false);
+    let _ = object_manager::create_object("\\KernelObjects", "OpenNTDupEvent", "Event", Some(object_manager::ObjectData::pointer(event)));
+    let attributes = object_attributes_for(block, "\\KernelObjects\\OpenNTDupEvent", 0x200);
+    let opened = call_export("ZwOpenEvent", &[output, 0x1F0003, attributes]);
+    let source = at::<nt::Field<u64>>(output).get();
+    assert(opened == Some(0) && source != 0, "ob-duplicate-object: evento aberto como handle de kernel");
+    // DUPLICATE_SAME_ACCESS com OBJ_KERNEL_HANDLE para o System.
+    let duplicated = call_export("ZwDuplicateObject", &[u64::MAX, source, u64::MAX, output, 0, 0x200, 2]);
+    let copy = at::<nt::Field<u64>>(output).get();
+    let timeout = block + 0x3F0;
+    at::<nt::Field<i64>>(timeout).set(0);
+    dispatcher::set_event(event);
+    assert(duplicated == Some(0) && copy != 0 && copy != source && call_export("ZwWaitForSingleObject", &[copy, 0, timeout]) == Some(0), "ob-duplicate-object: copia aponta para o mesmo evento");
+    // Opções fora de CLOSE_SOURCE|SAME_ACCESS|SAME_ATTRIBUTES.
+    assert(call_export("ZwDuplicateObject", &[u64::MAX, source, u64::MAX, output, 0, 0, 8]) == Some(signed_status(0xC000_000D)), "ob-duplicate-object: opcao invalida recusada");
+    // Destino NULL com DUPLICATE_CLOSE_SOURCE só fecha a origem.
+    assert(call_export("ZwDuplicateObject", &[u64::MAX, copy, 0, 0, 0, 0, 1]) == Some(0), "ob-duplicate-object: destino NULL fecha a origem");
+    assert(call_export("ZwWaitForSingleObject", &[copy, 0, timeout]) != Some(0), "ob-duplicate-object: handle fechado deixa de valer");
+    let _ = call_export("ZwClose", &[source]);
+}
+
+
+fn ob_set_security_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ob::object_security;
+    // Chave de registro volátil com handle de kernel: um objeto com dono
+    // (Owner::Key) no caminho do ObReferenceObjectByHandle.
+    let block = guest::alloc_bytes(0x400);
+    let output = block + 0x300;
+    let attributes = object_attributes_for(block, "\\Registry\\Machine\\Software\\OpenNT-setsecurity", 0x240);
+    let _ = call_export("ZwCreateKey", &[output, 0xF003F, attributes, 0, 0, 1, 0]);
+    let handle = at::<nt::Field<u64>>(output).get();
+    let key = match crate::ntos::ob::handles::security::reference_kernel_handle(handle) {
+        Ok(Ok(mut reference)) => {
+            let pointer = reference.pointer;
+            let _ = reference.release();
+            pointer
+        }
+        _ => 0,
+    };
+    assert(key != 0, "ob-set-security: handle de kernel da chave resolvido");
+    // SD self-relative: Revision 1, Control SELF_RELATIVE|DACL_PRESENT, DACL nula.
+    let descriptor = guest::alloc_bytes(nt::SecurityDescriptorRelative::SIZE);
+    let relative = at::<nt::SecurityDescriptorRelative>(descriptor);
+    relative.revision.set(1);
+    relative.control.set(0x8004);
+    assert(call_export("ZwSetSecurityObject", &[handle, 4, 0]) == Some(signed_status(0xC000_0005)), "ob-set-security: SD NULL = STATUS_ACCESS_VIOLATION");
+    assert(call_export("ZwSetSecurityObject", &[handle, 1, descriptor]) == Some(signed_status(0xC000_005A)), "ob-set-security: OWNER pedido sem Owner = STATUS_INVALID_OWNER");
+    assert(call_export("ZwSetSecurityObject", &[handle, 2, descriptor]) == Some(signed_status(0xC000_005B)), "ob-set-security: GROUP pedido sem Group = STATUS_INVALID_PRIMARY_GROUP");
+    assert(call_export("ZwSetSecurityObject", &[handle, 4, descriptor]) == Some(0) && object_security::security_descriptor(key).is_some_and(|stored| stored != descriptor && at::<nt::SecurityDescriptorRelative>(stored).control.get() & 0x8004 == 0x8004), "ob-set-security: DACL gravada como copia capturada");
+    assert(call_export("ZwSetSecurityObject", &[0x7FFF_FFF0, 4, descriptor]) == Some(signed_status(0xC000_0008)), "ob-set-security: handle invalido recusado");
+    let _ = call_export("ZwDeleteKey", &[handle]);
+    let _ = call_export("ZwClose", &[handle]);
+}
+
+
+fn po_coalescing_exports(assert: Assert) {
+    use crate::ntos::po::coalescing::{self, CoalescingRegistration};
+    let handle = guest::alloc_bytes(8);
+    let callback = guest::alloc_bytes(16);
+    guest::write_bytes(callback, &[0xC3]);
+    assert(call_export("PoRegisterCoalescingCallback", &[callback, 1, handle, 0x5150]) == Some(0), "po-coalescing: registro aceito");
+    let address = at::<nt::Field<u64>>(handle).get();
+    let registration = at::<CoalescingRegistration>(address);
+    assert(
+        address != 0 && registration.self_pointer.get() == address && registration.callback.get() == callback && registration.client_only.get() == 1 && registration.context.get() == 0x5150 && coalescing::registered(address),
+        "po-coalescing: registro de 0x48 com callback, ClientOnly e contexto",
+    );
+    let _ = call_export("PoUnregisterCoalescingCallback", &[address]);
+    assert(!coalescing::registered(address), "po-coalescing: PoUnregisterCoalescingCallback remove o registro");
+}
+
+
+fn po_device_wake_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::PopIrpData;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::po::device_wake;
+    // IRP com o POP_IRP_DATA no Context da última posição (StackCount 2).
+    let packet = call_export("IoAllocateIrp", &[2, 0]).unwrap_or(0);
+    let last = at::<nt::IoStackLocation>(packet + nt::Irp::SIZE + nt::IoStackLocation::SIZE);
+    let block_address = guest::alloc_bytes(PopIrpData::SIZE);
+    let block = at::<PopIrpData>(block_address);
+    last.context.set(block_address);
+    let wake = || call_export("PoGetSystemWake", &[packet]).map(|value| value & 0xFF);
+    assert(wake() == Some(0), "po-device-wake: IRP sem marca");
+    let _ = call_export("PoSetSystemWake", &[packet]);
+    assert(block.device_system_wake.get() == 1 && wake() == Some(1), "po-device-wake: PoSetSystemWake marca o WAIT_WAKE");
+    block.minor_function.set(2); // IRP_MN_SET_POWER
+    assert(wake() == Some(0), "po-device-wake: bloco de outro IRP de energia devolve FALSE");
+    last.context.set(0);
+    let _ = call_export("PoSetSystemWake", &[packet]);
+    assert(wake() == Some(0), "po-device-wake: IRP sem bloco nao marca");
+    call_export("IoFreeIrp", &[packet]);
+    // DRIPS dirigido: PDO NULL, DEVICE_OBJECT fora do PnP e flags inválidos.
+    let plain = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    assert(call_export("PoDirectedDripsSetDeviceFlags", &[0, 1]) == Some(signed_status(0xC000_000D)) && call_export("PoDirectedDripsSetDeviceFlags", &[plain, 1]) == Some(signed_status(0xC000_000D)) && device_wake::directed_drips_flags(plain) == 0, "po-device-wake: sem devnode = STATUS_INVALID_PARAMETER");
+}
+
+
+fn rtl_crt_rand_exports(assert: Assert) {
+    use crate::ntos::rtl::crt;
+    // Vetores calculados em Python com o mesmo LCG (semente 1 e 0xDEADBEEF).
+    crt::srand(1);
+    let first: Vec<u64> = (0..4).map(|_| call_export("rand", &[]).unwrap_or(u64::MAX)).collect();
+    assert(first == [41, 18467, 6334, 26500], "rtl-crt-rand: sequencia da semente 1");
+    crt::srand(0xDEAD_BEEF);
+    let second: Vec<u64> = (0..2).map(|_| call_export("rand", &[]).unwrap_or(u64::MAX)).collect();
+    assert(second == [18337, 16920], "rtl-crt-rand: sequencia da semente 0xDEADBEEF");
+    crt::srand(1);
+}
+
+
+fn vf_device_verification_exports(assert: Assert) {
+    let device = guest::alloc_bytes(0x150);
+    assert(call_export("VfIsVerificationEnabled", &[1, device]).map(|value| value & 0xFF) == Some(0) && call_export("VfIsVerificationEnabled", &[0, 0]).map(|value| value & 0xFF) == Some(0), "vf-device-verification: verificador desligado");
+    assert(call_export("VfFailDeviceNode", &[device, 0xE6, 1, 2, 0, 0, 0]).is_some() && call_export("VfFailSystemBIOS", &[0xE6, 1, 2, 0, 0, 0]).is_some(), "vf-device-verification: falhas relatadas sem bugcheck com o verificador desligado");
+}
+
+
+fn vsl_secure_pci_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    assert(call_export("VslGetSecurePciEnabled", &[]).map(|value| value & 0xFF) == Some(0), "vsl-secure-pci: PCI seguro desligado sem VSM");
+    let output = guest::alloc_bytes(16);
+    guest::write_bytes(output, &[0xFF; 16]);
+    let device = guest::alloc_bytes(16);
+    assert(call_export("VslQuerySecureDevice", &[device, output]) == Some(signed_status(0xC000_009D)) && guest::read_bytes(output, 16).iter().all(|&byte| byte == 0), "vsl-secure-pci: VslQuerySecureDevice zera a saida e devolve STATUS_DEVICE_NOT_CONNECTED");
+    assert(call_export("VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma", &[0, 0, 1, 1]).map(|value| value & 0xFF) == Some(0xFF), "vsl-secure-pci: sem funcao alternativa = 0xFF");
+}
+
+
+fn whea_error_source_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::{WheaErrorPacketV2, WheaErrorRecordHeader, WheaErrorSourceConfigurationDeviceDriverV1, WheaErrorSourceDescriptor};
+    use crate::ntos::init::exports::signed_status;
+    // Fonte de dispositivo V1: Initialize grava (Context, ErrorSourceId) em [Context].
+    // Initialize: mov [rcx], rcx; mov [rcx+8], edx; ret. Uninitialize: mov dword [rcx+0x10], 1; ret.
+    let initialize = guest::alloc_bytes(16);
+    guest::write_bytes(initialize, &[0x48, 0x89, 0x09, 0x89, 0x51, 0x08, 0xC3]);
+    let uninitialize = guest::alloc_bytes(16);
+    guest::write_bytes(uninitialize, &[0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+    let context = guest::alloc_bytes(0x20);
+    let recorded_context = at::<nt::Field<u64>>(context);
+    let recorded_id = at::<nt::Field<u32>>(context + 8);
+    let uninitialized = at::<nt::Field<u32>>(context + 0x10);
+    let configuration_address = guest::alloc_bytes(WheaErrorSourceConfigurationDeviceDriverV1::SIZE);
+    let configuration = at::<WheaErrorSourceConfigurationDeviceDriverV1>(configuration_address);
+    configuration.version.set(1);
+    configuration.log_tag.set(0x5354);
+    configuration.initialize.set(initialize);
+    configuration.uninitialize.set(uninitialize);
+    let added = call_export("WheaAddErrorSourceDeviceDriverV1", &[context, configuration_address, 2, 0x100]);
+    let id = recorded_id.get();
+    assert(added == Some(0) && recorded_context.get() == context, "whea-error-source: driver V1 adicionado e Initialize chamada com o contexto");
+    let descriptor_address = call_export("WheaGetErrorSource", &[id as u64]).unwrap_or(0);
+    let descriptor = at::<WheaErrorSourceDescriptor>(descriptor_address);
+    assert(
+        descriptor_address != 0 && descriptor.type_.get() == 0x10 && descriptor.state.get() == 2 && descriptor.error_source_id.get() == id && descriptor.max_sections_per_record.get() == 3 && descriptor.max_raw_data_length.get() == 0x300,
+        "whea-error-source: descritor DeviceDriver iniciado com o id",
+    );
+    let info = &descriptor.device_driver;
+    assert(info.initialize.get() == initialize && info.uninitialize.get() == uninitialize && info.log_tag.get() == 0x5354 && info.max_section_data_length.get() == 0x100 && info.creator_id.data1.get() == 0x5721_7C8D, "whea-error-source: Info e o WHEA_DEVICE_DRIVER_DESCRIPTOR do NT");
+    // Relatório corrigido aceito; fonte inexistente = STATUS_INSUFFICIENT_RESOURCES.
+    let data = guest::alloc_bytes(16);
+    let guid = guest::alloc_bytes(16);
+    assert(call_export("WheaReportHwErrorDeviceDriverEx", &[id as u64, 0, data, 16, 0, 0, guid, 0, 2, 0]) == Some(0), "whea-error-source: erro corrigido aceito");
+    assert(call_export("WheaReportHwErrorDeviceDriverEx", &[0xFFFF, 0, data, 16, 0, 0, guid, 0, 2, 0]) == Some(signed_status(0xC000_009A)), "whea-error-source: fonte inexistente = STATUS_INSUFFICIENT_RESOURCES");
+    // Validação do V1.
+    configuration.version.set(2);
+    assert(call_export("WheaAddErrorSourceDeviceDriverV1", &[context, configuration_address, 2, 0x100]) == Some(signed_status(0xC000_00F0)), "whea-error-source: versao diferente de 1 = STATUS_INVALID_PARAMETER_2");
+    configuration.version.set(1);
+    configuration.uninitialize.set(0);
+    assert(call_export("WheaAddErrorSourceDeviceDriverV1", &[context, configuration_address, 2, 0x100]) == Some(signed_status(0xC000_000D)), "whea-error-source: Uninitialize nula = STATUS_INVALID_PARAMETER");
+    // Remoção chama a Uninitialize e tira a fonte da tabela.
+    let _ = call_export("WheaRemoveErrorSource", &[id as u64]);
+    assert(uninitialized.get() == 1 && call_export("WheaGetErrorSource", &[id as u64]) == Some(0), "whea-error-source: WheaRemoveErrorSource desfaz a fonte");
+    // Tipo HEST (PCIe = 6) não é aceito pelo WheaAddErrorSource.
+    let hest_address = guest::alloc_bytes(WheaErrorSourceDescriptor::SIZE);
+    let hest = at::<WheaErrorSourceDescriptor>(hest_address);
+    hest.length.set(WheaErrorSourceDescriptor::SIZE as u32);
+    hest.type_.set(6);
+    assert(call_export("WheaAddErrorSource", &[hest_address, 0]) == Some(signed_status(0xC000_00BB)), "whea-error-source: fonte HEST = STATUS_NOT_SUPPORTED");
+    // Configuração por tipo.
+    assert(call_export("WheaConfigureErrorSource", &[0x11, 0]) == Some(signed_status(0xC000_000D)), "whea-error-source: tipo invalido recusado");
+    assert(call_export("WheaConfigureErrorSource", &[0xE, 0]) == Some(0) && call_export("WheaConfigureErrorSource", &[0xE, 0]) == Some(signed_status(0xC000_0001)), "whea-error-source: segunda configuracao do tipo = STATUS_UNSUCCESSFUL");
+    assert(call_export("WheaUnconfigureErrorSource", &[0xE]) == Some(signed_status(0xC000_0001)), "whea-error-source: WheaUnconfigureErrorSource devolve STATUS_UNSUCCESSFUL");
+    // Cabeçalho CPER.
+    let header_address = guest::alloc_bytes(WheaErrorRecordHeader::SIZE);
+    guest::write_bytes(header_address, &[0xAA; 0x80]);
+    let header = at::<WheaErrorRecordHeader>(header_address);
+    let first = call_export("WheaInitializeRecordHeader", &[header_address]);
+    let record = header.record_id.get();
+    assert(
+        first == Some(0) && header.signature.get() == 0x5245_5043 && header.revision.get() == 0x210 && header.signature_end.get() == 0xFFFF_FFFF && header.severity.get() == 3 && header.valid_bits.get() == 2 && header.timestamp.precise.get() == 0 && header.flags.get() == 0 && header.creator_id.data1.get() == 0xCF07_C4BD,
+        "whea-error-source: cabecalho CPER 2.10 com timestamp",
+    );
+    let _ = call_export("WheaInitializeRecordHeader", &[header_address]);
+    assert(header.record_id.get() == record + 1, "whea-error-source: RecordId incrementa");
+    // Pacote com assinatura errada.
+    let packet = guest::alloc_bytes(WheaErrorPacketV2::SIZE);
+    assert(call_export("WheaReportHwError", &[packet]) == Some(signed_status(0xC000_000D)), "whea-error-source: pacote sem 'ErPt' recusado");
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -10716,6 +11240,24 @@ pub fn run(assert: Assert) {
     ke_queues_exports(assert);
     ex_resource_priority_exports(assert);
     ex_pool_block_size_exports(assert);
+    cm_key_notify_exports(assert);
+    ex_legacy_support_exports(assert);
+    fsrtl_status_exports(assert);
+    io_boot_disk_exports(assert);
+    io_driver_notification_exports(assert);
+    io_interrupt_state_exports(assert);
+    io_pnp_device_exports(assert);
+    io_wdm_headless_exports(assert);
+    io_work_item_exports(assert);
+    kse_shim_registration_exports(assert);
+    ob_duplicate_object_exports(assert);
+    ob_set_security_exports(assert);
+    po_coalescing_exports(assert);
+    po_device_wake_exports(assert);
+    rtl_crt_rand_exports(assert);
+    vf_device_verification_exports(assert);
+    vsl_secure_pci_exports(assert);
+    whea_error_source_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

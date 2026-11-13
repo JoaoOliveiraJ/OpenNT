@@ -53,6 +53,8 @@ pub fn init() {
     // dos drivers entra com `cm::service::driver`.
     crate::ntos::cm::service::driver::init();
     let loaded = crate::ntos::cm::service::system_drivers::start_boot_drivers();
+    // IopCallBootDriverReinitializationRoutines: depois do último driver de boot.
+    crate::ntos::io::lifecycle::run_boot_driver_reinitialization_routines();
     debug_print!("[boot] servicos carregados: {}", loaded);
     // Catálogo CNG publicado antes de qualquer processo de usuário. O cng.sys
     // é o binário real do Windows no volume: o OpenNT não o distribui.

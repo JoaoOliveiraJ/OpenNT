@@ -1147,3 +1147,35 @@ pub mod ex_pool_block_size {
         data_exports: &[],
     };
 }
+
+pub mod ex_legacy_support {
+    use crate::ntos::ex::{interlocked, pool_allocation};
+    use crate::ntos::inc::types::{Field, ListEntry, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::clock;
+    use crate::rtl::KernelError;
+
+    fn allocate_pool(call: &Call) -> Result<u64, KernelError> {
+        pool_allocation::allocate_untagged(call.arg(1) as u32, call.arg(2))
+    }
+
+    fn interlocked_insert_head_list(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: LIST_ENTRYs de um chamador de modo kernel (o lock protege a lista).
+        let (head, entry) = unsafe { (ListEntry::at(call.arg(1)), ListEntry::at(call.arg(2))) };
+        Ok(interlocked::insert_head_list(head, entry, call.arg(3)))
+    }
+
+    fn query_timer_resolution(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG de saída de um chamador de modo kernel.
+        let (maximum, minimum, current) = unsafe { (Field::<u32>::at(call.arg(1)), Field::<u32>::at(call.arg(2)), Field::<u32>::at(call.arg(3))) };
+        clock::query_timer_resolution(maximum, minimum, current);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-legacy-support",
+        names: &["ExAllocatePool", "ExInterlockedInsertHeadList", "ExQueryTimerResolution"],
+        handlers: &[allocate_pool, interlocked_insert_head_list, query_timer_resolution],
+        data_exports: &[],
+    };
+}

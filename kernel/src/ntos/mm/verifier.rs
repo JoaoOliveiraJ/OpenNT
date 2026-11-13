@@ -61,3 +61,28 @@ pub fn is_driver_suspect(driver: u64) -> bool {
     let _section = unsafe { DriverObject::at(driver) }.driver_section.get();
     false
 }
+
+// ---- VfIsVerificationEnabled / VfFailDeviceNode / VfFailSystemBIOS ----------
+//
+// ntoskrnl 19041: VfIsVerificationEnabled rva 0x3a6b10 devolve FALSE enquanto
+// ViDdiInitialized == 0 (o verificador de DDI nunca inicializou: Driver Verifier
+// desligado); VfFailDeviceNode rva 0x3a6ad0 só chama
+// VerifierBugCheckIfAppropriate quando VfIsVerificationEnabled(VFOBJTYPE_DEVICE)
+// é verdadeiro, e VfFailSystemBIOS rva 0x5a0750 só com ViDdiInitialized e o bit
+// 0x40000000 de MmVerifierData. Sem Driver Verifier no OpenNT, os três seguem o
+// ramo "verificador desligado": FALSE e nenhuma ação.
+
+/// VfIsVerificationEnabled(VerifierObjectType, Object).
+pub fn is_verification_enabled(_object_type: u32, _object: u64) -> bool {
+    false
+}
+
+/// VfFailDeviceNode(PhysicalDeviceObject, BugCheckMajorCode, BugCheckMinorCode,
+/// FailureClass, AssertionControl, DebuggerMessageText, ParameterFormatString, ...):
+/// sem verificação ligada para o PDO, retorna sem efeito.
+pub fn fail_device_node(physical_device: u64) {
+    let _ = is_verification_enabled(1, physical_device);
+}
+
+/// VfFailSystemBIOS(BugCheckMajorCode, BugCheckMinorCode, FailureClass, ...).
+pub fn fail_system_bios() {}

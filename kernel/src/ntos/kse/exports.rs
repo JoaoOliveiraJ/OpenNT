@@ -19,3 +19,15 @@ pub mod kse_shim_engine {
         data_exports: &[],
     };
 }
+
+pub mod kse_shim_registration {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::kse::shim_engine;
+    use crate::rtl::KernelError;
+
+    fn register_shim(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(shim_engine::register_shim(call.arg(1), call.arg(2), call.arg(3) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "kse-shim-registration", names: &["KseRegisterShim"], handlers: &[register_shim], data_exports: &[] };
+}

@@ -1898,3 +1898,15 @@ pub mod rtl_acl_trust_label {
 
     pub static GROUP: Group = Group { name: "rtl-acl-trust-label", names: &["RtlAddProcessTrustLabelAce"], handlers: &[add_process_trust_label_ace], data_exports: &[] };
 }
+
+pub mod rtl_crt_rand {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    fn rand(_: &Call) -> Result<u64, KernelError> {
+        Ok(crt::rand() as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-crt-rand", names: &["rand"], handlers: &[rand], data_exports: &[] };
+}

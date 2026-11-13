@@ -126,3 +126,36 @@ pub fn get_hardware_features(output: &[crate::ntos::inc::field::Field<u32>]) {
         cell.set(value);
     }
 }
+
+// ---- VslGetSecurePciEnabled / VslQuerySecureDevice /
+//      VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma ------------------
+//
+// ntoskrnl 19041: as três começam por HvlQueryVsmConnection; sem conexão VSM
+// (nenhum Secure Kernel/VTL1):
+//   VslGetSecurePciEnabled rva 0x3cf530                      -> FALSE
+//   VslQuerySecureDevice rva 0x7c8e90 (Device, Output[16])   -> zera a saída e
+//     devolve o VslpEnterIumSecureMode sem VSM: STATUS_DEVICE_NOT_CONNECTED
+//   VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma rva 0x4fc3f0 -> 0xFF
+// O OpenNT não tem Secure Kernel (o mesmo estado das entradas Sk* acima).
+
+const VSL_STATUS_DEVICE_NOT_CONNECTED: u32 = 0xC000_009D;
+const VSL_NO_ALTERNATE_FUNCTION: u8 = 0xFF;
+/// Saída do VslQuerySecureDevice (zerada antes da chamada ao IUM).
+const VSL_SECURE_DEVICE_INFORMATION_SIZE: usize = 16;
+
+/// VslGetSecurePciEnabled().
+pub fn secure_pci_enabled() -> bool {
+    false
+}
+
+/// VslQuerySecureDevice(DeviceId, SecureDeviceInformation[16]).
+pub fn query_secure_device(_device: u64, output: u64) -> u32 {
+    guest::write_bytes(output, &[0u8; VSL_SECURE_DEVICE_INFORMATION_SIZE]);
+    VSL_STATUS_DEVICE_NOT_CONNECTED
+}
+
+/// VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma(Segment, Bus,
+/// Device, Function).
+pub fn secure_pci_alternate_function(_segment: u32, _bus: u8, _device: u8, _function: u8) -> u8 {
+    VSL_NO_ALTERNATE_FUNCTION
+}

@@ -1500,3 +1500,15 @@ pub mod fsrtl_volume_support {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_status {
+    use crate::ntos::fsrtl::ntstatus;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn is_total_device_failure(call: &Call) -> Result<u64, KernelError> {
+        Ok(ntstatus::is_total_device_failure(call.arg(1) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-status", names: &["FsRtlIsTotalDeviceFailure"], handlers: &[is_total_device_failure], data_exports: &[] };
+}

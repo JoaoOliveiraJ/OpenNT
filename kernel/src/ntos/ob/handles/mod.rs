@@ -7,3 +7,4 @@ pub mod file;
 pub mod namespace;
 pub mod process;
 pub mod inserted;
+pub mod duplicate;

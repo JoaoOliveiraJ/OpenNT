@@ -172,3 +172,21 @@ pub fn query_interrupt_time_precise(qpc_value: u64) -> u64 {
     }
     uptime_100ns()
 }
+
+// ---- ExQueryTimerResolution -------------------------------------------------
+//
+// ExQueryTimerResolution (ntoskrnl 19041 rva 0x3cf850)(MaximumTime*,
+// MinimumTime*, CurrentTime*): KeMaximumIncrement, KeMinimumIncrement e
+// KeTimeIncrement, em unidades de 100 ns. O relógio do OpenNT é o timer do
+// LAPIC a 100 Hz fixos (o mesmo incremento de KeQueryTimeIncrement) e não há
+// ExSetTimerResolution: máximo, mínimo e corrente são o mesmo período.
+
+/// Período do tick do relógio, em 100 ns (10 ms).
+pub const CLOCK_TIME_INCREMENT: u32 = 100_000;
+
+/// ExQueryTimerResolution(MaximumTime*, MinimumTime*, CurrentTime*).
+pub fn query_timer_resolution(maximum: &Field<u32>, minimum: &Field<u32>, current: &Field<u32>) {
+    maximum.set(CLOCK_TIME_INCREMENT);
+    minimum.set(CLOCK_TIME_INCREMENT);
+    current.set(CLOCK_TIME_INCREMENT);
+}

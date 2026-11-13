@@ -163,3 +163,57 @@ pub mod po_fx {
         data_exports: &[],
     };
 }
+
+pub mod po_coalescing {
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::coalescing;
+    use crate::rtl::KernelError;
+
+    fn register_coalescing_callback(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PVOID* de saída de um chamador de modo kernel.
+        let handle = unsafe { Field::<u64>::at(call.arg(3)) };
+        Ok(signed_status(coalescing::register(call.arg(1), call.arg(2) & 0xFF != 0, handle, call.arg(4))))
+    }
+
+    fn unregister_coalescing_callback(call: &Call) -> Result<u64, KernelError> {
+        coalescing::unregister(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-coalescing",
+        names: &["PoRegisterCoalescingCallback", "PoUnregisterCoalescingCallback"],
+        handlers: &[register_coalescing_callback, unregister_coalescing_callback],
+        data_exports: &[],
+    };
+}
+
+pub mod po_device_wake {
+    use crate::ntos::inc::types::{Irp, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::device_wake;
+    use crate::rtl::KernelError;
+
+    fn directed_drips_set_device_flags(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_wake::set_directed_drips_flags(call.arg(1), call.arg(2) as u32)))
+    }
+
+    fn get_system_wake(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PIRP de um driver de modo kernel.
+        Ok(device_wake::get_system_wake(unsafe { Irp::at(call.arg(1)) }) as u64)
+    }
+
+    fn set_system_wake(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PIRP de um driver de modo kernel.
+        device_wake::set_system_wake(unsafe { Irp::at(call.arg(1)) });
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-device-wake",
+        names: &["PoDirectedDripsSetDeviceFlags", "PoGetSystemWake", "PoSetSystemWake"],
+        handlers: &[directed_drips_set_device_flags, get_system_wake, set_system_wake],
+        data_exports: &[],
+    };
+}

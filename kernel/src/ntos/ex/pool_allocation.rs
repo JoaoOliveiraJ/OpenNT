@@ -137,3 +137,9 @@ pub fn query_block_size_with_quota(block: u64, quota_charged: Option<&crate::nto
     }
     size
 }
+
+/// ExAllocatePool(PoolType, NumberOfBytes) (ntoskrnl 19041 rva 0x32bff0): o
+/// ExAllocatePoolWithTag com a tag 'None' (0x656E6F4E).
+pub fn allocate_untagged(pool_type: u32, bytes: u64) -> Result<u64, KernelError> {
+    allocate_tagged(pool_type, bytes, 0x656E_6F4E)
+}

@@ -404,3 +404,27 @@ pub mod ob_temporary_object {
 
     pub static GROUP: Group = Group { name: "ob-temporary-object", names: &["ObMakeTemporaryObject"], handlers: &[make_temporary], data_exports: &[] };
 }
+
+pub mod ob_duplicate_object {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::handles::duplicate;
+    use crate::rtl::KernelError;
+
+    fn duplicate_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(duplicate::duplicate_object(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-duplicate-object", names: &["ZwDuplicateObject"], handlers: &[duplicate_object], data_exports: &[] };
+}
+
+pub mod ob_set_security {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::object_security;
+    use crate::rtl::KernelError;
+
+    fn set_security_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(object_security::set_security_object(call.arg(1), call.arg(2) as u32, call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-set-security", names: &["ZwSetSecurityObject"], handlers: &[set_security_object], data_exports: &[] };
+}

@@ -694,3 +694,30 @@ pub mod mm_file_system_support {
         data_exports: &[],
     };
 }
+
+pub mod vf_device_verification {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::verifier;
+    use crate::rtl::KernelError;
+
+    fn is_verification_enabled(call: &Call) -> Result<u64, KernelError> {
+        Ok(verifier::is_verification_enabled(call.arg(1) as u32, call.arg(2)) as u64)
+    }
+
+    fn fail_device_node(call: &Call) -> Result<u64, KernelError> {
+        verifier::fail_device_node(call.arg(1));
+        Ok(0)
+    }
+
+    fn fail_system_bios(_: &Call) -> Result<u64, KernelError> {
+        verifier::fail_system_bios();
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "vf-device-verification",
+        names: &["VfFailDeviceNode", "VfFailSystemBIOS", "VfIsVerificationEnabled"],
+        handlers: &[fail_device_node, fail_system_bios, is_verification_enabled],
+        data_exports: &[],
+    };
+}

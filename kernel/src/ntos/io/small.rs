@@ -300,3 +300,52 @@ pub mod portable_operating_system {
         }
     }
 }
+
+pub mod wdm_version {
+    //! IoIsWdmVersionAvailable (ntoskrnl 19041 rva 0x89e370): o kernel do
+    //! Windows 10 anuncia WDM 6.0 — versão maior abaixo de 6 é aceita, 6 só com
+    //! a menor 0.
+
+    const WDM_MAJOR_VERSION: u8 = 6;
+    const WDM_MINOR_VERSION: u8 = 0;
+
+    /// IoIsWdmVersionAvailable(MajorVersion, MinorVersion).
+    pub fn is_available(major: u8, minor: u8) -> bool {
+        major < WDM_MAJOR_VERSION || (major == WDM_MAJOR_VERSION && minor <= WDM_MINOR_VERSION)
+    }
+}
+
+pub mod headless {
+    //! HeadlessDispatch (ntoskrnl 19041 rva 0x3aa580) sem Emergency Management
+    //! Services: HeadlessGlobals é NULL no OpenNT (nenhum terminal headless
+    //! configurado no boot). Nesse estado o original devolve:
+    //!   comandos 1 e 0x15                     -> STATUS_UNSUCCESSFUL;
+    //!   comandos de consulta com saída (2, 11, 12, 15, 16 — máscara 0x13804)
+    //!     zeram *OutputBufferSize bytes do OutputBuffer, ou
+    //!     STATUS_INVALID_PARAMETER sem buffer/tamanho;
+    //!   os demais                             -> STATUS_SUCCESS.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::mm::guest_memory as guest;
+
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const QUERY_COMMAND_MASK: u32 = 0x0001_3804;
+
+    /// HeadlessDispatch(Command, InputBuffer, InputBufferSize, OutputBuffer,
+    /// OutputBufferSize*).
+    pub fn dispatch(command: u32, _input: u64, _input_size: u64, output: u64, output_size: u64) -> u32 {
+        if command == 0x15 || command == 1 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        if command <= 0x10 && (QUERY_COMMAND_MASK >> command) & 1 != 0 {
+            if output == 0 || output_size == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            // SAFETY: PSIZE_T OutputBufferSize de um chamador de modo kernel.
+            let size = unsafe { Field::<u64>::at(output_size) }.get();
+            guest::write_bytes(output, &alloc::vec![0u8; size as usize]);
+        }
+        0
+    }
+}

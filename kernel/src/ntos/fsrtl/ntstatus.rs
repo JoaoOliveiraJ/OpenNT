@@ -28,3 +28,20 @@ pub fn is_ntstatus_expected(status: u32) -> bool {
 pub fn normalize_ntstatus(exception: u32, generic: u32) -> u32 {
     if is_ntstatus_expected(exception) { exception } else { generic }
 }
+
+// ---- FsRtlIsTotalDeviceFailure ------------------------------------------------
+//
+// ntoskrnl 19041 rva 0x255200: TRUE para todo status com o bit de sinal
+// (`test ecx, ecx; jns` — avisos 0x8xxxxxxx incluídos) exceto os três que o
+// original compara — STATUS_CRC_ERROR (0xC000003F), STATUS_DEVICE_DATA_ERROR
+// (0xC000009C) e 0xC0000470 —, que indicam falha de um setor e não do
+// dispositivo; sucessos e informativos = FALSE.
+
+const TOTAL_FAILURE_EXCEPT_CRC_ERROR: u32 = 0xC000_003F;
+const TOTAL_FAILURE_EXCEPT_DEVICE_DATA_ERROR: u32 = 0xC000_009C;
+const TOTAL_FAILURE_EXCEPT_0470: u32 = 0xC000_0470;
+
+/// FsRtlIsTotalDeviceFailure(Status).
+pub fn is_total_device_failure(status: u32) -> bool {
+    (status as i32) < 0 && status != TOTAL_FAILURE_EXCEPT_CRC_ERROR && status != TOTAL_FAILURE_EXCEPT_DEVICE_DATA_ERROR && status != TOTAL_FAILURE_EXCEPT_0470
+}

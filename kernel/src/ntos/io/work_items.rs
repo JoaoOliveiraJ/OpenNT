@@ -210,3 +210,17 @@ pub fn queue_ex_work_item(item: u64, _queue_type: u32) {
 pub fn pending() -> usize {
     QUEUE.lock().entries.len()
 }
+
+/// IoUninitializeWorkItem (ntoskrnl 19041 rva 0x320590): um IO_WORKITEM
+/// embutido (IoInitializeWorkItem) só pode ser desfeito fora da fila; ainda
+/// enfileirado é KeBugCheckEx(WORKER_INVALID 0xE4, 2, Item, &Item->IoObject, 0).
+/// No NT o teste é WorkItem.List.Flink != NULL; no OpenNT a posse da fila é
+/// a lista `QUEUE.entries`. Fora da fila, só solta a rotina interna ligada.
+pub fn uninitialize_work_item(item: u64) {
+    let queued = QUEUE.lock().entries.iter().any(|&(queued, _)| queued == item);
+    let body = body_at(item);
+    if queued || body.work_item.list.flink.get() != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(0xE4, 2, item, body.device_object.address(), 0);
+    }
+    forget_kernel_routine(&mut QUEUE.lock(), item);
+}

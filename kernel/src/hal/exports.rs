@@ -192,3 +192,28 @@ pub mod hvi_hardware {
         data_exports: &[],
     };
 }
+
+pub mod vsl_secure_pci {
+    use crate::hal::hypervisor;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn get_secure_pci_device_alternate_function(call: &Call) -> Result<u64, KernelError> {
+        Ok(hypervisor::secure_pci_alternate_function(call.arg(1) as u32, call.arg(2) as u8, call.arg(3) as u8, call.arg(4) as u8) as u64)
+    }
+
+    fn get_secure_pci_enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(hypervisor::secure_pci_enabled() as u64)
+    }
+
+    fn query_secure_device(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hypervisor::query_secure_device(call.arg(1), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "vsl-secure-pci",
+        names: &["VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma", "VslGetSecurePciEnabled", "VslQuerySecureDevice"],
+        handlers: &[get_secure_pci_device_alternate_function, get_secure_pci_enabled, query_secure_device],
+        data_exports: &[],
+    };
+}

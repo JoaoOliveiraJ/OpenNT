@@ -253,3 +253,91 @@ pub fn release_interrupt_spin_lock(object: u64, old_irql: u64) {
 pub fn is_vector_connected(vector: u32) -> bool {
     CHAINS.lock().contains_key(&vector)
 }
+
+// ---- IoReportInterruptActive / IoReportInterruptInactive ---------------------
+//
+// ntoskrnl 19041: IoReportInterruptActive rva 0x38be20, IoReportInterruptInactive
+// rva 0x38c790 -> IopUnmaskInterrupt/IopMaskInterrupt -> KeUnmaskInterrupt /
+// KeMaskInterrupt. O parâmetro é IO_REPORT_INTERRUPT_ACTIVE_STATE_PARAMETERS
+// { ULONG Version; union ConnectionContext } com a versão do IoConnectInterruptEx:
+// 1/4 (FULLY_SPECIFIED[_GROUP]) e 2 (LINE_BASED) trazem o objeto de interrupção,
+// 3 (MESSAGE_BASED) a IO_INTERRUPT_MESSAGE_INFO (MessageCount entradas, cada uma
+// com InterruptObject). Versão inválida é KeBugCheckEx(PNP_DETECTED_FATAL_ERROR
+// 0xCA, 0xC, Version, 0, 0).
+//
+// No OpenNT o contexto de 1/2/4 é o próprio objeto da cadeia do vetor (o
+// IoConnectInterruptEx grava o `InterruptObject`). Mascarar é o que o
+// KeMaskInterrupt faz no controlador: a linha do PIC legado fica mascarada
+// enquanto todos os objetos conectados ao vetor estiverem inativos, e volta a
+// ser entregue quando um deles é reportado ativo.
+
+static INACTIVE_INTERRUPTS: SpinLock<alloc::collections::BTreeSet<u64>> = SpinLock::new(alloc::collections::BTreeSet::new());
+
+const CONNECT_FULLY_SPECIFIED: u32 = 1;
+const CONNECT_LINE_BASED: u32 = 2;
+const CONNECT_MESSAGE_BASED: u32 = 3;
+const CONNECT_FULLY_SPECIFIED_GROUP: u32 = 4;
+
+/// Máscara da linha do PIC legado de um vetor 0x20..0x2F (portas de I/O).
+fn set_legacy_line_masked(vector: u32, masked: bool) {
+    let Some(irq) = vector.checked_sub(0x20).filter(|&irq| irq <= 15) else { return };
+    let (data_port, bit) = if irq >= 8 { (0xA1u16, 1u8 << (irq - 8)) } else { (0x21u16, 1u8 << irq) };
+    let current = port::read8(data_port);
+    port::write8(data_port, if masked { current | bit } else { current & !bit });
+}
+
+/// Estado ativo/inativo de um objeto de interrupção e a máscara resultante da linha.
+fn report_object_active(object: u64, active: bool) {
+    if object == 0 {
+        return;
+    }
+    let vector = interrupt_object(object).vector.get();
+    let all_inactive = {
+        let mut inactive = INACTIVE_INTERRUPTS.lock();
+        if active {
+            inactive.remove(&object);
+        } else {
+            inactive.insert(object);
+        }
+        // Linha sem objetos conectados: o controlador não é tocado.
+        let mut pointer = CHAINS.lock().get(&vector).copied().unwrap_or(0);
+        if pointer == 0 {
+            return;
+        }
+        let mut all = true;
+        while pointer != 0 {
+            if !inactive.contains(&pointer) {
+                all = false;
+                break;
+            }
+            pointer = interrupt_object(pointer).chain_next.get();
+        }
+        all
+    };
+    set_legacy_line_masked(vector, all_inactive);
+}
+
+/// Objeto reportado inativo (IoReportInterruptInactive sem Active posterior).
+pub fn interrupt_reported_inactive(object: u64) -> bool {
+    INACTIVE_INTERRUPTS.lock().contains(&object)
+}
+
+/// IoReportInterruptActive (active = true) / IoReportInterruptInactive.
+pub fn report_interrupt_active_state(parameters: &crate::ntos::inc::types::extra_storage::IoReportInterruptActiveStateParameters, active: bool) {
+    let version = parameters.version.get();
+    let context = parameters.connection_context.get();
+    match version {
+        CONNECT_FULLY_SPECIFIED | CONNECT_LINE_BASED | CONNECT_FULLY_SPECIFIED_GROUP => report_object_active(context, active),
+        CONNECT_MESSAGE_BASED => {
+            // SAFETY: IO_INTERRUPT_MESSAGE_INFO devolvida pelo IoConnectInterruptEx ao driver.
+            let table = unsafe { crate::ntos::inc::types::extra_storage::IoInterruptMessageInfo::at(context) };
+            let count = table.message_count.get() as usize;
+            // SAFETY: o vetor MessageInfo tem MessageCount entradas.
+            let entries = unsafe { crate::ntos::inc::types::extra_storage::IoInterruptMessageInfoEntry::array_at(table.message_info[0].address(), count) };
+            for entry in entries {
+                report_object_active(entry.interrupt_object.get(), active);
+            }
+        }
+        _ => crate::ntos::ke::bugcheck::bug_check_ex(0xCA, 0xC, version as u64, 0, 0),
+    }
+}

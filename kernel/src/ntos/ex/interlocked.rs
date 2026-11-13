@@ -52,3 +52,27 @@ pub fn add_ulong(addend: &Field<u32>, increment: u32, lock: u64) -> u32 {
         previous
     })
 }
+
+/// ExInterlockedInsertHeadList(ListHead, ListEntry, Lock) (ntoskrnl 19041 rva
+/// 0x2f8650): sob ExpAcquireSpinLockDisabled, confere Flink->Blink == ListHead
+/// (senão __fastfail(FAST_FAIL_CORRUPT_LIST_ENTRY = 3), que no kernel é
+/// KERNEL_SECURITY_CHECK_FAILURE 0x139), insere na cabeça e devolve a entrada
+/// que era a primeira, ou NULL se a lista estava vazia.
+pub fn insert_head_list(head: &crate::ntos::inc::types::ListEntry, entry: &crate::ntos::inc::types::ListEntry, lock: u64) -> u64 {
+    use crate::ntos::inc::types::{ListEntry, NtStruct};
+    let head_address = head.address();
+    let first = with_spin_lock_disabled(lock, || {
+        let first = head.flink.get();
+        // SAFETY: Flink de uma lista do chamador protegida pelo lock.
+        let next = unsafe { ListEntry::at(first) };
+        if next.blink.get() != head_address {
+            crate::ntos::ke::bugcheck::bug_check_ex(0x139, 3, 0, 0, 0);
+        }
+        entry.flink.set(first);
+        entry.blink.set(head_address);
+        next.blink.set(entry.address());
+        head.flink.set(entry.address());
+        first
+    });
+    if first == head_address { 0 } else { first }
+}

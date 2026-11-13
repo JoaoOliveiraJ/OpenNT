@@ -316,7 +316,10 @@ fn io_get_device_attachment_base_ref(call: &Call) -> Result<u64, KernelError> {
     device_objects::attached_reference(call.arg(1), true)
 }
 fn io_get_device_property_data(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(device_property::get_device_property_data(call.arg(1), call.arg(3))))
+    use crate::ntos::inc::field::{Field, NtStruct};
+    // SAFETY: DEVPROPKEY e as saídas PULONG/DEVPROPTYPE de um chamador de modo kernel.
+    let (key, required, kind) = unsafe { (crate::ntos::inc::types::Devpropkey::at(call.arg(2)), Field::<u32>::at(call.arg(7)), Field::<u32>::at(call.arg(8))) };
+    Ok(signed_status(device_property::query_device_property_data(call.arg(1), key, call.arg(3) as u32, call.arg(4) as u32, call.arg(5) as u32, call.arg(6), required, kind)))
 }
 fn io_set_hard_error_or_verify_device(call: &Call) -> Result<u64, KernelError> {
     irp_extension::set_hard_error_device(call.arg(1), call.arg(2));
@@ -1631,4 +1634,152 @@ pub mod io_volume_information {
         handlers: &[device_to_guid, device_to_guid_path, query_by_name, set_volume_information],
         data_exports: &[],
     };
+}
+
+pub mod io_boot_disk {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::arc_name;
+    use crate::rtl::KernelError;
+
+    fn create_arc_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(arc_name::create_arc_name(call.arg(1))?))
+    }
+
+    fn get_boot_disk_information_lite(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(arc_name::get_boot_disk_information_lite(call.arg(1))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-boot-disk",
+        names: &["IoCreateArcName", "IoGetBootDiskInformationLite"],
+        handlers: &[create_arc_name, get_boot_disk_information_lite],
+        data_exports: &[],
+    };
+}
+
+pub mod io_driver_notification {
+    use crate::ntos::inc::types::{DriverObject, NtStruct, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::{lifecycle, shutdown};
+    use crate::rtl::KernelError;
+
+    fn register_boot_driver_reinitialization(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PDRIVER_OBJECT do driver chamador.
+        lifecycle::register_boot_driver_reinitialization(unsafe { DriverObject::at(call.arg(1)) }, call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    fn register_last_chance_shutdown_notification(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(shutdown::register_last_chance(call.arg(1))?))
+    }
+
+    fn query_full_driver_path(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PDRIVER_OBJECT e PUNICODE_STRING de saída de um chamador de modo kernel.
+        let (driver, path) = unsafe { (DriverObject::at(call.arg(1)), UnicodeString::at(call.arg(2))) };
+        Ok(signed_status(lifecycle::query_full_driver_path(driver, path)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-driver-notification",
+        names: &["IoRegisterBootDriverReinitialization", "IoRegisterLastChanceShutdownNotification", "IoQueryFullDriverPath"],
+        handlers: &[register_boot_driver_reinitialization, register_last_chance_shutdown_notification, query_full_driver_path],
+        data_exports: &[],
+    };
+}
+
+pub mod io_interrupt_state {
+    use crate::ntos::inc::types::extra_storage::IoReportInterruptActiveStateParameters;
+    use crate::ntos::inc::types::NtStruct;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::interrupt_object;
+    use crate::rtl::KernelError;
+
+    fn report_interrupt_active(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: parâmetros de um driver de modo kernel.
+        interrupt_object::report_interrupt_active_state(unsafe { IoReportInterruptActiveStateParameters::at(call.arg(1)) }, true);
+        Ok(0)
+    }
+
+    fn report_interrupt_inactive(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: parâmetros de um driver de modo kernel.
+        interrupt_object::report_interrupt_active_state(unsafe { IoReportInterruptActiveStateParameters::at(call.arg(1)) }, false);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-interrupt-state",
+        names: &["IoReportInterruptActive", "IoReportInterruptInactive"],
+        handlers: &[report_interrupt_active, report_interrupt_inactive],
+        data_exports: &[],
+    };
+}
+
+pub mod io_pnp_device {
+    use crate::ntos::inc::types::{Devpropkey, Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::{device_property, pnp};
+    use crate::rtl::KernelError;
+
+    fn report_detected_device(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PDEVICE_OBJECT* de entrada/saída de um chamador de modo kernel.
+        let output = unsafe { Field::<u64>::at(call.arg(8)) };
+        Ok(signed_status(pnp::report_detected_device(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32, call.arg(5), call.arg(6), call.arg(7) & 0xFF != 0, output)?))
+    }
+
+    fn get_dma_adapter(call: &Call) -> Result<u64, KernelError> {
+        pnp::get_dma_adapter(call.arg(1), call.arg(2), call.arg(3))
+    }
+
+    fn set_device_property_data(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DEVPROPKEY de um chamador de modo kernel.
+        let key = unsafe { Devpropkey::at(call.arg(2)) };
+        Ok(signed_status(device_property::set_device_property(call.arg(1), key, call.arg(3) as u32, call.arg(4) as u32, call.arg(5) as u32, call.arg(6) as u32, call.arg(7))))
+    }
+
+    fn set_device_interface_property_data(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DEVPROPKEY de um chamador de modo kernel.
+        let key = unsafe { Devpropkey::at(call.arg(2)) };
+        Ok(signed_status(device_property::set_interface_property(call.arg(1), key, call.arg(3) as u32, call.arg(4) as u32, call.arg(5) as u32, call.arg(6) as u32, call.arg(7))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-pnp-device",
+        names: &["IoReportDetectedDevice", "IoGetDmaAdapter", "IoSetDevicePropertyData", "IoSetDeviceInterfacePropertyData"],
+        handlers: &[report_detected_device, get_dma_adapter, set_device_property_data, set_device_interface_property_data],
+        data_exports: &[],
+    };
+}
+
+pub mod io_wdm_headless {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::small::{headless, wdm_version};
+    use crate::rtl::KernelError;
+
+    fn headless_dispatch(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(headless::dispatch(call.arg(1) as u32, call.arg(2), call.arg(3), call.arg(4), call.arg(5))))
+    }
+
+    fn is_wdm_version_available(call: &Call) -> Result<u64, KernelError> {
+        Ok(wdm_version::is_available(call.arg(1) as u8, call.arg(2) as u8) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-wdm-headless",
+        names: &["HeadlessDispatch", "IoIsWdmVersionAvailable"],
+        handlers: &[headless_dispatch, is_wdm_version_available],
+        data_exports: &[],
+    };
+}
+
+pub mod io_work_item {
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::work_items;
+    use crate::rtl::KernelError;
+
+    fn uninitialize_work_item(call: &Call) -> Result<u64, KernelError> {
+        work_items::uninitialize_work_item(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-work-item", names: &["IoUninitializeWorkItem"], handlers: &[uninitialize_work_item], data_exports: &[] };
 }

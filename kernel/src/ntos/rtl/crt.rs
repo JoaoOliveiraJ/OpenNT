@@ -819,3 +819,29 @@ pub fn isprint(character: u32) -> u32 {
         _ => 0,
     }
 }
+
+// ---- rand -------------------------------------------------------------------
+//
+// rand (ntoskrnl 19041 rva 0x3d2bb0): gerador congruente da CRT da Microsoft
+// num único estado global do kernel (holdrand em .data, valor inicial 1, o
+// mesmo que srand grava): holdrand = holdrand * 0x343FD + 0x269EC3;
+// devolve (holdrand >> 16) & 0x7FFF.
+
+static RAND_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// rand().
+pub fn rand() -> u32 {
+    let mut current = RAND_STATE.load(core::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.wrapping_mul(0x343FD).wrapping_add(0x269EC3);
+        match RAND_STATE.compare_exchange_weak(current, next, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed) {
+            Ok(_) => return ((next as i32) >> 16) as u32 & 0x7FFF,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// srand(seed): o estado do rand (o export srand ainda não é do OpenNT).
+pub fn srand(seed: u32) {
+    RAND_STATE.store(seed, core::sync::atomic::Ordering::Release);
+}
