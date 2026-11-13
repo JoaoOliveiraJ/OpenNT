@@ -20,7 +20,8 @@ use crate::ntos::ob::object_manager;
 use crate::ntos::po::power_manager;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{self, device_object, driver_object, io_stack_location as stack, io_status_block, irp};
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, DriverObject, IoStackLocation, IoStatusBlock, Irp, LargeInteger, NtStruct, PowerStateType};
 use crate::ntos::io::irp_builder::{self as builder, BuildOptions, DeviceControl, Power};
 
 /// Major functions (subconjunto do NT).
@@ -73,6 +74,33 @@ pub mod status {
 /// IRP.Flags: buffered e buffer alocado pelo I/O Manager.
 const IRP_BUFFERED_IO: u32 = 0x10;
 const IRP_DEALLOCATE_BUFFER: u32 = 0x20;
+/// IO_STACK_LOCATION.Control.
+const SL_INVOKE_ON_SUCCESS: u8 = 0x40;
+const SL_INVOKE_ON_ERROR: u8 = 0x80;
+const STATUS_MORE_PROCESSING_REQUIRED: i32 = 0xC000_0016u32 as i32;
+
+/// IRP vivo do chamador (o PIRP dos exports e dos construtores daqui).
+fn irp_at(packet: u64) -> &'static Irp {
+    // SAFETY: os chamadores passam IRPs vivos (construídos aqui ou por drivers).
+    unsafe { Irp::at(packet) }
+}
+
+/// DEVICE_OBJECT vivo do chamador.
+fn device_at(device: u64) -> &'static DeviceObject {
+    // SAFETY: os chamadores passam DEVICE_OBJECTs vivos.
+    unsafe { DeviceObject::at(device) }
+}
+
+/// Stack location de um IRP vivo.
+fn location_at(address: u64) -> &'static IoStackLocation {
+    // SAFETY: endereço dentro da pilha de stack locations de um IRP vivo.
+    unsafe { IoStackLocation::at(address) }
+}
+
+/// DEVICE_OBJECT.StackSize lido como byte sem sinal, no mínimo 1.
+fn stack_size_of(device: u64) -> u32 {
+    (device_at(device).stack_size.get() as u8).max(1) as u32
+}
 
 /// Respondedores PnP de PDOs dos bus drivers; `None` = não é meu.
 pub type PdoAnswerer = fn(u64, u64) -> Option<i32>;
@@ -115,18 +143,20 @@ pub fn init() -> Result<(), KernelError> {
 /// IofCallDriver: CL--, CSL--, grava o DeviceObject no slot e chama
 /// MajorFunction[major] do driver dono do dispositivo alvo.
 pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
-    let current_location = guest::read8(packet + irp::CURRENT_LOCATION);
-    let stack_count = guest::read8(packet + irp::STACK_COUNT);
+    let irp = irp_at(packet);
+    let current_location = irp.current_location.get() as u8;
+    let stack_count = irp.stack_count.get() as u8;
     if current_location <= 1 {
         debug_print!("[iom] pilha estourada: irp={:#x} CL={} SC={} dev={:#x}", packet, current_location, stack_count, device);
         return status::NOT_SUPPORTED;
     }
-    let location = guest::read64(packet + irp::CURRENT_STACK_LOCATION) - stack::SIZE;
-    guest::write8(packet + irp::CURRENT_LOCATION, current_location - 1);
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, location);
-    guest::write64(location + stack::DEVICE_OBJECT, device);
-    let major = guest::read8(location + stack::MAJOR);
-    let driver = guest::read64(device + device_object::DRIVER_OBJECT);
+    let address = irp.tail.overlay.current_stack_location.get() - IoStackLocation::SIZE;
+    irp.current_location.set((current_location - 1) as i8);
+    irp.tail.overlay.current_stack_location.set(address);
+    let location = location_at(address);
+    location.device_object.set(device);
+    let major = location.major_function.get();
+    let driver = device_at(device).driver_object.get();
     if driver == 0 {
         // PDO sem driver nativo: o bus driver responde (estilo pci.sys).
         let answerers = PDO_ANSWERERS.lock().clone();
@@ -137,7 +167,8 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
         }
         return status::NOT_SUPPORTED;
     }
-    let handler = guest::read64(driver + driver_object::MAJOR_FUNCTION + major as u64 * 8);
+    // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
+    let handler = unsafe { DriverObject::at(driver) }.major_function.get(major as usize).map_or(0, Field::get);
     if handler == 0 {
         return status::NOT_SUPPORTED;
     }
@@ -150,62 +181,65 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
 /// interrompe. Depois finaliza o IRP síncrono (UserIosb, UserBuffer,
 /// UserEvent, buffer do I/O Manager).
 pub fn iof_complete_request(packet: u64) -> i32 {
-    let stack_count = guest::read8(packet + irp::STACK_COUNT) as u32;
-    let mut current_location = guest::read8(packet + irp::CURRENT_LOCATION) as u32;
-    // CurrentStackLocation e DeviceObject são lidos como DWORD.
-    let mut current_stack = guest::read32(packet + irp::CURRENT_STACK_LOCATION) as u64;
+    let irp = irp_at(packet);
+    let stack_count = irp.stack_count.get() as u8 as u32;
+    let mut current_location = irp.current_location.get() as u8 as u32;
+    let mut current_stack = irp.tail.overlay.current_stack_location.get();
     let mut reviewed = current_stack;
     current_location += 1;
-    current_stack += stack::SIZE;
+    current_stack += IoStackLocation::SIZE;
     while current_location <= stack_count + 1 {
-        let control = guest::read8(reviewed + stack::CONTROL);
-        let routine = guest::read64(reviewed + stack::COMPLETION_ROUTINE);
-        let status = builder::read_io_status(packet).0;
-        let invoke = routine != 0 && ((status >= 0 && control & nt_abi::SL_INVOKE_ON_SUCCESS != 0) || (status < 0 && control & nt_abi::SL_INVOKE_ON_ERROR != 0));
-        guest::write8(packet + irp::CURRENT_LOCATION, current_location as u8);
-        guest::write64(packet + irp::CURRENT_STACK_LOCATION, current_stack);
+        let location = location_at(reviewed);
+        let control = location.control.get();
+        let routine = location.completion_routine.get();
+        let status = irp.io_status.status.get();
+        let invoke = routine != 0 && ((status >= 0 && control & SL_INVOKE_ON_SUCCESS != 0) || (status < 0 && control & SL_INVOKE_ON_ERROR != 0));
+        irp.current_location.set(current_location as u8 as i8);
+        irp.tail.overlay.current_stack_location.set(current_stack);
         if invoke {
-            let device = if current_location == stack_count + 1 { 0 } else { guest::read32(current_stack + stack::DEVICE_OBJECT) as u64 };
-            let context = guest::read64(reviewed + stack::CONTEXT);
+            // O slot acima do topo não existe: a rotina do criador recebe NULL.
+            let device = if current_location == stack_count + 1 { 0 } else { location_at(current_stack).device_object.get() };
+            let context = location.context.get();
             let result = native_call::call(routine, &[device, packet, context]) as i32;
-            if result == nt_abi::status::MORE_PROCESSING_REQUIRED as i32 {
+            if result == STATUS_MORE_PROCESSING_REQUIRED {
                 return result;
             }
         }
-        reviewed += stack::SIZE;
+        reviewed += IoStackLocation::SIZE;
         current_location += 1;
-        current_stack += stack::SIZE;
+        current_stack += IoStackLocation::SIZE;
     }
     let (final_status, information) = builder::read_io_status(packet);
     // O lock sai antes da callback: o dono da conclusão pode esquecer ou
     // registrar outras conclusões dentro dela.
     let managed = MANAGED_COMPLETIONS.lock().remove(&packet);
     if let Some(managed) = managed {
-        managed(final_status, guest::read64(packet + irp::IO_STATUS_INFORMATION));
+        managed(final_status, irp.io_status.information.get());
         return 0;
     }
-    let user_iosb = guest::read64(packet + irp::USER_IOSB);
+    let user_iosb = irp.user_iosb.get();
     if user_iosb != 0 {
-        guest::write32(user_iosb + io_status_block::STATUS, final_status as u32);
-        guest::write64(user_iosb + io_status_block::INFORMATION, guest::read64(packet + irp::IO_STATUS_INFORMATION));
+        // SAFETY: UserIosb de um IRP de modo kernel (os pedidos de modo
+        // usuário são concluídos pelas conclusões gerenciadas acima).
+        let iosb = unsafe { IoStatusBlock::at(user_iosb) };
+        iosb.status.set(final_status);
+        iosb.information.set(irp.io_status.information.get());
     }
-    let user_buffer = guest::read64(packet + irp::USER_BUFFER);
-    let system_buffer = guest::read64(packet + irp::SYSTEM_BUFFER);
+    let user_buffer = irp.user_buffer.get();
+    let system_buffer = irp.associated_irp.system_buffer.get();
     if user_buffer != 0 && system_buffer != 0 && (final_status as u32) >> 30 != 3 && information > 0 {
-        for offset in 0..information {
-            guest::write8(user_buffer + offset, guest::read8(system_buffer + offset));
-        }
+        guest::write_bytes(user_buffer, &guest::read_bytes(system_buffer, information as usize));
     }
-    let user_event = guest::read64(packet + irp::USER_EVENT);
+    let user_event = irp.user_event.get();
     if user_event != 0 {
         dispatcher::set_event(user_event);
     }
     // IRP_BUFFERED_IO + DEALLOCATE_BUFFER: o SystemBuffer é do I/O Manager.
-    if guest::read32(packet + irp::FLAGS) & IRP_DEALLOCATE_BUFFER != 0 {
+    if irp.flags.get() & IRP_DEALLOCATE_BUFFER != 0 {
         if system_buffer != 0 {
             guest::free_bytes(system_buffer);
         }
-        guest::write64(packet + irp::SYSTEM_BUFFER, 0);
+        irp.associated_irp.system_buffer.set(0);
     }
     let observer = COMPLETION_OBSERVERS.lock().remove(&packet);
     if let Some(observer) = observer {
@@ -216,8 +250,9 @@ pub fn iof_complete_request(packet: u64) -> i32 {
 
 /// IoBuildSynchronousFsdRequest: o buffer já é memória de kernel.
 pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length: u32, byte_offset_pointer: u64, event: u64, io_status: u64) -> u64 {
-    let stack_count = guest::read8(device + device_object::STACK_SIZE).max(1) as u32;
-    let byte_offset = if byte_offset_pointer != 0 { guest::read64(byte_offset_pointer) } else { 0 };
+    let stack_count = stack_size_of(device);
+    // SAFETY: StartingOffset (PLARGE_INTEGER) do chamador de modo kernel.
+    let byte_offset = if byte_offset_pointer != 0 { unsafe { LargeInteger::at(byte_offset_pointer) }.quad_part.get() as u64 } else { 0 };
     let address = guest::alloc_bytes(builder::size_for(stack_count));
     builder::build(address, &BuildOptions { major, buffer, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, ..Default::default() });
     address
@@ -238,7 +273,7 @@ pub struct RequestContext {
 pub fn build_device_io_control_request(code: u32, device: u64, input: u64, input_length: u32, output: u64, output_length: u32, internal: u64, event: u64, io_status: u64, context: Option<RequestContext>) -> u64 {
     // `internal` é BOOLEAN: só o byte baixo do slot de 8 vale.
     let is_internal = internal & 0xFF != 0;
-    let stack_count = guest::read8(device + device_object::STACK_SIZE).max(1) as u32;
+    let stack_count = stack_size_of(device);
     let method_neither = code & 3 == 3;
     let mut system_buffer = 0;
     if !method_neither {
@@ -247,9 +282,7 @@ pub fn build_device_io_control_request(code: u32, device: u64, input: u64, input
             return 0;
         }
         if input != 0 {
-            for offset in 0..input_length as u64 {
-                guest::write8(system_buffer + offset, guest::read8(input + offset));
-            }
+            guest::write_bytes(system_buffer, &guest::read_bytes(input, input_length as usize));
         }
     }
     let address = guest::alloc_bytes(builder::size_for(stack_count));
@@ -276,16 +309,16 @@ pub fn build_device_io_control_request(code: u32, device: u64, input: u64, input
         ..Default::default()
     });
     if !method_neither {
-        guest::write32(address + irp::FLAGS, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER);
+        irp_at(address).flags.set(IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER);
     }
     address
 }
 
 /// Entrega um power IRP já construído (PoCallDriver/PoStartNextPowerIrp).
-/// DriverObject é lido como DWORD.
 pub fn dispatch_native_power_irp(device: u64, packet: u64) -> u32 {
-    let driver = guest::read32(device + device_object::DRIVER_OBJECT) as u64;
-    let handler = guest::read64(driver + driver_object::MAJOR_FUNCTION + irp_mj::POWER as u64 * 8);
+    let driver = device_at(device).driver_object.get();
+    // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
+    let handler = unsafe { DriverObject::at(driver) }.major_function[irp_mj::POWER as usize].get();
     if handler == 0 {
         return status::NOT_SUPPORTED as u32;
     }
@@ -371,8 +404,9 @@ pub fn wait_pending_io_request(request: &mut IoRequest, timeout_ms: u64) -> i32 
     }
     let mut timeout = 0;
     if timeout_ms != 0 {
-        timeout = guest::alloc_bytes(8);
-        guest::write64(timeout, (-((timeout_ms * 10_000) as i64)) as u64);
+        timeout = guest::alloc_bytes(LargeInteger::SIZE);
+        // SAFETY: alocação de um LARGE_INTEGER (tempo relativo).
+        unsafe { LargeInteger::at(timeout) }.quad_part.set(-((timeout_ms * 10_000) as i64));
     }
     let wait = dispatcher::wait_for_single_object(request.params.user_event, timeout, 0, false);
     if timeout != 0 {
@@ -397,12 +431,12 @@ pub fn cancel_pending_io_request(request: &mut IoRequest) -> i32 {
     if packet == 0 {
         return request.status;
     }
-    guest::write8(packet + irp::CANCEL, 1);
-    let routine = guest::read64(packet + irp::CANCEL_ROUTINE);
+    let irp = irp_at(packet);
+    irp.cancel.set(1);
+    // IoSetCancelRoutine(Irp, NULL): InterlockedExchangePointer.
+    let routine = irp.cancel_routine.atomic().swap(0, core::sync::atomic::Ordering::SeqCst);
     if routine != 0 {
-        guest::write64(packet + irp::CANCEL_ROUTINE, 0);
-        let location = guest::read32(packet + irp::CURRENT_STACK_LOCATION) as u64;
-        let device = guest::read32(location + stack::DEVICE_OBJECT) as u64;
+        let device = location_at(irp.tail.overlay.current_stack_location.get()).device_object.get();
         native_call::call(routine, &[device, packet]);
     }
     release_pending(request);
@@ -564,7 +598,7 @@ fn device_path(node: NodeId) -> String {
 /// completar depois.
 fn call_native_driver(device: &DeviceEntry, request: &mut IoRequest) -> Result<(), KernelError> {
     let device_pointer = if device.stack_top != 0 { device.stack_top } else { device.native_device };
-    let stack_count = guest::read8(device_pointer + device_object::STACK_SIZE).max(1) as u32;
+    let stack_count = stack_size_of(device_pointer);
     // FILE_OBJECT da operação: o do handle, ou um transitório.
     let transient = request.file_object == 0;
     let file_object = if transient { file_objects::create(device_pointer, "")? } else { request.file_object };
@@ -701,7 +735,7 @@ pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelE
     }
     if top != 0 {
         // InterlockedIncrement do DEVICE_OBJECT.ReferenceCount, como o parse.
-        guest::atomic_u32(top + device_object::REFERENCE_COUNT).fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        device_at(top).reference_count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
     update_device(node, |entry| entry.open_count += 1);
     let handle = {
@@ -724,7 +758,7 @@ pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelE
             request.file_object = file_object;
             let _ = call_driver(&close_path, &mut request);
             if top != 0 {
-                guest::atomic_u32(top + device_object::REFERENCE_COUNT).fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                device_at(top).reference_count.atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
                 device_objects::changed(top);
             }
             update_device(node, |entry| entry.open_count -= 1);
@@ -831,7 +865,7 @@ fn send_power_request(path: &str, minor: u8, device_state: u32) -> Result<IoRequ
         return Ok(request);
     };
     let pointer = device(node).map_or(0, |entry| entry.native_device);
-    let mut request = make_io_request(irp_mj::POWER, IoParams { minor, power: Some(Power { power_state_type: nt_abi::power_state_type::DEVICE_POWER_STATE, device_state }), ..Default::default() });
+    let mut request = make_io_request(irp_mj::POWER, IoParams { minor, power: Some(Power { power_state_type: PowerStateType::DEVICE_POWER_STATE.0 as u32, device_state }), ..Default::default() });
     if pointer != 0 {
         power_manager::mark_power_request_started(pointer);
     }

@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::nt_abi::{driver_extension, driver_object};
+use crate::ntos::inc::types::{DriverExtension, DriverObject, NtStruct};
 use crate::ntos::io::lifecycle;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::loaded_images;
@@ -82,9 +82,14 @@ pub fn create(name_pointer: u64, initialize: u64) -> Result<u32, KernelError> {
         }
     };
     guest_strings::write_wide_string(service_buffer, &full);
-    let extension = guest::read64(driver + driver_object::DRIVER_EXTENSION);
-    guest_strings::write_string_fields(extension + driver_extension::SERVICE_KEY_NAME, units.len() as u16 * 2, units.len() as u16 * 2 + 2, service_buffer);
-    guest::write32(driver + driver_object::FLAGS, guest::read32(driver + driver_object::FLAGS) | DRVO_BUILTIN_DRIVER);
+    // SAFETY: DRIVER_OBJECT recém-criado pelo begin_driver e a extensão dele.
+    let object = unsafe { DriverObject::at(driver) };
+    let extension = unsafe { DriverExtension::at(object.driver_extension.get()) };
+    let service_key = &extension.service_key_name;
+    service_key.length.set(units.len() as u16 * 2);
+    service_key.maximum_length.set(units.len() as u16 * 2 + 2);
+    service_key.buffer.set(service_buffer);
+    object.flags.set(object.flags.get() | DRVO_BUILTIN_DRIVER);
     let status = native_call::call(initialize, &[driver, 0]) as u32;
     lifecycle::set_current_driver(previous);
     if status & 0x8000_0000 != 0 {

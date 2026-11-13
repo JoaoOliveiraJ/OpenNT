@@ -20,11 +20,25 @@ use crate::ntos::ps::user::state;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, SecurityDescriptor, SecurityQualityOfService, UnicodeString};
+use crate::rtl::KernelError as ProbeError;
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const INVALID_PARAMETER: u32 = 0xC000_000D;
 const MISALIGNMENT: u32 = 0x8000_0002;
 const ACCESS_DENIED: u32 = 0xC000_0022;
+
+/// Status NT de uma sonda que falhou (ACCESS_VIOLATION ou o da sonda).
+fn probe_status(error: ProbeError) -> u32 {
+    if error.status != 0 { error.status } else { ACCESS_VIOLATION }
+}
+
+/// Leitura sondada de um campo de estrutura do chamador (modo usuário ou
+/// kernel): o `__try { ... }` da captura do NT.
+fn probe<T: guest::GuestScalar + Copy>(field: &Field<T>) -> Result<T, u32> {
+    field.probe_get().map_err(probe_status)
+}
 
 struct Captured {
     flags: u32,
@@ -46,20 +60,21 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
         if mode != 0 && !state::probe_user_read(attributes, 48) {
             return Err(ACCESS_VIOLATION);
         }
-        if guest::read32(attributes) != 48 {
+        let object_attributes = ObjectAttributes::try_at(attributes).map_err(probe_status)?;
+        if probe(&object_attributes.length)? != ObjectAttributes::SIZE as u32 {
             return Err(INVALID_PARAMETER);
         }
-        flags = guest::read32(attributes + 24);
+        flags = probe(&object_attributes.attributes)?;
         if flags & !0x1EE2 != 0 {
             return Err(INVALID_PARAMETER);
         }
         if mode != 0 {
             flags &= !0x200;
         }
-        root = guest::read64(attributes + 8);
-        name_pointer = guest::read64(attributes + 16);
-        security = guest::read64(attributes + 32);
-        quality = guest::read64(attributes + 40);
+        root = probe(&object_attributes.root_directory)?;
+        name_pointer = probe(&object_attributes.object_name)?;
+        security = probe(&object_attributes.security_descriptor)?;
+        quality = probe(&object_attributes.security_quality_of_service)?;
     }
     if quality != 0 {
         if mode != 0 && quality & 3 != 0 {
@@ -68,10 +83,11 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
         if mode != 0 && !state::probe_user_read(quality, 12) {
             return Err(ACCESS_VIOLATION);
         }
-        if guest::read8(quality + 8) > 1 {
+        let service = SecurityQualityOfService::try_at(quality).map_err(probe_status)?;
+        if probe(&service.context_tracking_mode)? > 1 {
             return Err(INVALID_PARAMETER);
         }
-        if guest::read32(quality + 4) > 3 {
+        if probe(&service.impersonation_level)?.0 as u32 > 3 {
             return Err(0xC000_00A5);
         }
     }
@@ -82,7 +98,9 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
         if mode != 0 && !create_section::descriptor_probe(security) {
             return Err(ACCESS_VIOLATION);
         }
-        if guest::read8(security) != 1 {
+        // SECURITY_DESCRIPTOR.Revision (o primeiro byte, comum às formas
+        // absoluta e relativa).
+        if guest::try_read::<u8>(security + core::mem::offset_of!(SecurityDescriptor, revision) as u64).map_err(probe_status)? != 1 {
             return Err(0xC000_0058);
         }
     }
@@ -94,8 +112,9 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
     if mode != 0 && !state::probe_user_read(name_pointer, 16) {
         return Err(ACCESS_VIOLATION);
     }
-    let length = guest::read16(name_pointer) as u64;
-    let buffer = guest::read64(name_pointer + 8);
+    let name = UnicodeString::try_at(name_pointer).map_err(probe_status)?;
+    let length = probe(&name.length)? as u64;
+    let buffer = probe(&name.buffer)?;
     if length & 1 != 0 {
         return Err(0xC000_0033);
     }
@@ -108,7 +127,8 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
     if buffer == 0 || (mode != 0 && !state::probe_user_read(buffer, length)) {
         return Err(ACCESS_VIOLATION);
     }
-    let units: alloc::vec::Vec<u16> = (0..length / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let bytes = guest::try_read_bytes(buffer, length as usize).map_err(probe_status)?;
+    let units: alloc::vec::Vec<u16> = bytes.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
     captured.name = String::from_utf16_lossy(&units);
     let mut start = ROOT;
     if root != 0 {
@@ -225,7 +245,8 @@ pub fn create(output: u64, desired: u32, attributes: u64, concurrency: u32, mode
         Ok(_) => {
             // O handle já foi publicado: no Nt original uma falha tardia de
             // cópia preserva o status e o handle (o fim do processo o recolhe).
-            let handle = guest::read64(temporary);
+            // SAFETY: célula HANDLE recém-alocada (temporary).
+            let handle = unsafe { Field::<u64>::at(temporary) }.get();
             created = None;
             if mode == 0 {
                 guest::try_write64(output, handle)?;

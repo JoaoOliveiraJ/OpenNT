@@ -27,7 +27,11 @@ use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
-use crate::ntos::inc::nt_abi::{file_object, io_status_block, object_attributes};
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{
+    FileBasicInformation, FileDirectoryInformation, FileDispositionInformation, FileEaInformation, FileIdFullDirInformation, FileNameInformation, FileNetworkOpenInformation, FileObject,
+    FileStandardInformation, IoStatusBlock, NtStruct, ObjectAttributes, UnicodeString,
+};
 
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -81,20 +85,35 @@ pub fn write_io_status(io_status: u64, status: u32, information: u64) {
     if io_status == 0 {
         return;
     }
-    guest::write32(io_status + io_status_block::STATUS, status);
-    guest::write64(io_status + io_status_block::INFORMATION, information);
+    // SAFETY: PIO_STATUS_BLOCK do chamador Zw de modo kernel.
+    let iosb = unsafe { IoStatusBlock::at(io_status) };
+    iosb.status.set(status as i32);
+    iosb.information.set(information);
+}
+
+/// OBJECT_ATTRIBUTES do chamador Zw (modo kernel).
+fn object_attributes_at(attributes: u64) -> &'static ObjectAttributes {
+    // SAFETY: POBJECT_ATTRIBUTES de um chamador de modo kernel.
+    unsafe { ObjectAttributes::at(attributes) }
+}
+
+/// Parâmetro de saída escalar (PHANDLE, PULONG...) de um chamador de modo kernel.
+fn output_at<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro de saída de um chamador de modo kernel.
+    unsafe { Field::<T>::at(address) }
 }
 
 /// Captura o nome antes de tocar no volume ou nos buffers de saída. Sem
 /// RootDirectory o nome NT começa na raiz; um handle de diretório do Object
 /// Manager ou de um arquivo-diretório permite nomes relativos.
 pub fn file_path_from_object_attributes(attributes: u64) -> Result<String, u32> {
-    if attributes == 0 || guest::read32(attributes) != 48 {
+    if attributes == 0 || object_attributes_at(attributes).length.get() != ObjectAttributes::SIZE as u32 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let root = guest::read64(attributes + 8);
-    let name_pointer = guest::read64(attributes + 16);
-    if name_pointer != 0 && guest::read16(name_pointer) & 1 != 0 {
+    let root = object_attributes_at(attributes).root_directory.get();
+    let name_pointer = object_attributes_at(attributes).object_name.get();
+    // SAFETY: ObjectName (PUNICODE_STRING) dos OBJECT_ATTRIBUTES do chamador.
+    if name_pointer != 0 && unsafe { UnicodeString::at(name_pointer) }.length.get() & 1 != 0 {
         return Err(0xC000_0033);
     }
     let name = if name_pointer != 0 { guest_strings::read_unicode_string(name_pointer) } else { String::new() };
@@ -189,7 +208,7 @@ fn publish_file_handle(mut entry: FileEntry, output: u64, io_status: u64, inform
     };
     match published {
         Ok(_) => {
-            guest::write64(output, handle as u64);
+            output_at::<u64>(output).set(handle as u64);
             write_io_status(io_status, 0, information);
             Ok(0)
         }
@@ -212,6 +231,24 @@ fn status_unsuccessful() -> u32 {
     0xC000_0001
 }
 
+/// Argumentos do ZwCreateFile montados pelo create_file_by_name (bloco
+/// privado: o texto do nome segue a estrutura).
+#[repr(C)]
+struct CreateByName {
+    attributes: ObjectAttributes,
+    handle: Field<u64>,
+    name: UnicodeString,
+    io_status: IoStatusBlock,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for CreateByName {}
+
+/// Unidades UTF-16 em bytes little-endian (para uma cópia em bloco).
+fn utf16_bytes(units: &[u16]) -> alloc::vec::Vec<u8> {
+    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
 /// Flags do FILE_OBJECT pelas opções de criação (síncrono, alerta,
 /// sem buffer intermediário, escrita direta).
 fn option_flags(options: u32) -> u32 {
@@ -225,7 +262,7 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         Ok(path) => path,
         Err(status) => return Ok(status),
     };
-    let open_flags = guest::read32(attributes_pointer + object_attributes::ATTRIBUTES);
+    let open_flags = object_attributes_at(attributes_pointer).attributes.get();
     let owner_process = if open_flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
     let access = file_objects::access(desired_access);
     // Dispositivo: CREATE IRP pelo I/O Manager.
@@ -236,8 +273,8 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
             write_io_status(io_status, STATUS_OBJECT_NAME_NOT_FOUND, 0);
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
-        let flags = opened.file_object + file_object::FLAGS;
-        guest::write32(flags, guest::read32(flags) | option_flags(options));
+        // SAFETY: FILE_OBJECT vivo devolvido pelo open_device.
+        unsafe { FileObject::at(opened.file_object) }.flags.atomic().fetch_or(option_flags(options), core::sync::atomic::Ordering::SeqCst);
         let entry = FileEntry { backing: Backing::Device { path: object_name, handle: opened.handle }, file_object: opened.file_object, access, share: share_access, options, owner_process, attributes: open_flags & 2, kernel_handle: open_flags & 0x200 != 0, binding: None, closed: false, scan_index: None };
         return publish_file_handle(entry, output, io_status, FILE_OPENED);
     }
@@ -315,13 +352,15 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         _ => return Ok(STATUS_INVALID_PARAMETER),
     };
     let file = file_objects::create(0, &object_name)?;
-    guest::write8(file + 0x4A, (access & 1 != 0) as u8);
-    guest::write8(file + 0x4B, (access & 6 != 0) as u8);
-    guest::write8(file + 0x4C, (access & 0x10000 != 0) as u8);
-    for bit in 0..3 {
-        guest::write8(file + 0x4D + bit, ((share_access >> bit) & 1) as u8);
-    }
-    guest::write32(file + file_object::FLAGS, option_flags(options));
+    // SAFETY: FILE_OBJECT recém-criado.
+    let body = unsafe { FileObject::at(file) };
+    body.read_access.set((access & 1 != 0) as u8);
+    body.write_access.set((access & 6 != 0) as u8);
+    body.delete_access.set((access & 0x10000 != 0) as u8);
+    body.shared_read.set((share_access & 1) as u8);
+    body.shared_write.set(((share_access >> 1) & 1) as u8);
+    body.shared_delete.set(((share_access >> 2) & 1) as u8);
+    body.flags.set(option_flags(options));
     FILES_BY_OBJECT.lock().insert(file, (volume, path.clone(), options));
     file_objects::set_callbacks(file, FileCallbacks { destroy: Some(Arc::new(move || { FILES_BY_OBJECT.lock().remove(&file); })), ..Default::default() })?;
     file_lifetime::bind(file_lifetime::Entry { access, share: share_access, file_object: file, file: None }, &lifetime, &path)?;
@@ -390,40 +429,46 @@ pub fn query_file_information_by_object(file: u64, class: u32, length: u32, outp
                 return Ok(0xC000_0023);
             }
             let stat = backing.as_ref().and_then(|(volume, path)| volume.stat(path)).or_else(|| source_stat.clone());
-            guest::write32(output, stat.map_or(0, |stat| stat.ea_size));
-            guest::write32(output_length, 4);
+            // SAFETY: buffer de saída do chamador de modo kernel (tamanho conferido).
+            unsafe { FileEaInformation::at(output) }.ea_size.set(stat.map_or(0, |stat| stat.ea_size));
+            output_at::<u32>(output_length).set(FileEaInformation::SIZE as u32);
             Ok(0)
         }
         // FileBasicInformation: tempos da fonte quando existem; atributos.
         4 => {
-            if length < 0x28 {
+            if length < FileBasicInformation::SIZE as u32 {
                 return Ok(0xC000_0023);
             }
-            for offset in 0..0x28 {
-                guest::write8(output + offset, 0);
-            }
+            guest::write_bytes(output, &[0; FileBasicInformation::SIZE as usize]);
+            // SAFETY: buffer de saída do chamador de modo kernel (tamanho conferido).
+            let basic = unsafe { FileBasicInformation::at(output) };
             if let Some(times) = source_stat.as_ref().map(|stat| &stat.times).filter(|times| times.len() >= 32) {
-                for (field, origin) in [0usize, 24, 8, 16].iter().enumerate() {
-                    guest::write_bytes(output + field as u64 * 8, &times[*origin..*origin + 8]);
-                }
+                let time = |origin: usize| i64::from_le_bytes(times[origin..origin + 8].try_into().unwrap_or([0; 8]));
+                basic.creation_time.quad_part.set(time(0));
+                basic.last_access_time.quad_part.set(time(24));
+                basic.last_write_time.quad_part.set(time(8));
+                basic.change_time.quad_part.set(time(16));
             }
-            guest::write32(output + 0x20, source_stat.as_ref().map_or(0x80, |stat| stat.attributes));
-            guest::write32(output_length, 0x28);
+            basic.file_attributes.set(source_stat.as_ref().map_or(0x80, |stat| stat.attributes));
+            output_at::<u32>(output_length).set(FileBasicInformation::SIZE as u32);
             Ok(0)
         }
         // FileStandardInformation.
         5 => {
-            if length < 0x18 {
+            if length < FileStandardInformation::SIZE as u32 {
                 return Ok(0xC000_0023);
             }
-            guest::write64(output, source_stat.as_ref().map_or(size, |stat| stat.allocated));
-            guest::write64(output + 8, size);
-            guest::write32(output + 16, 1);
-            guest::write8(output + 20, 0);
+            // SAFETY: buffer de saída do chamador de modo kernel (tamanho conferido).
+            let standard = unsafe { FileStandardInformation::at(output) };
+            standard.allocation_size.quad_part.set(source_stat.as_ref().map_or(size, |stat| stat.allocated) as i64);
+            standard.end_of_file.quad_part.set(size as i64);
+            standard.number_of_links.set(1);
+            standard.delete_pending.set(0);
             let stat = if source.is_some() { source_stat.clone() } else { entry_stat };
-            guest::write8(output + 21, stat.is_some_and(|stat| stat.directory || stat.attributes & 0x10 != 0) as u8);
-            guest::write16(output + 22, 0);
-            guest::write32(output_length, 0x18);
+            standard.directory.set(stat.is_some_and(|stat| stat.directory || stat.attributes & 0x10 != 0) as u8);
+            // Os dois bytes de preenchimento finais também saem zerados.
+            guest::write_bytes(standard.directory.address() + 1, &[0; 2]);
+            output_at::<u32>(output_length).set(FileStandardInformation::SIZE as u32);
             Ok(0)
         }
         // FileNameInformation { Length, Name[] }.
@@ -431,14 +476,14 @@ pub fn query_file_information_by_object(file: u64, class: u32, length: u32, outp
             let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
             let name_bytes = units.len() as u32 * 2;
             if length < 4 + name_bytes {
-                guest::write32(output_length, 4 + name_bytes);
+                output_at::<u32>(output_length).set(4 + name_bytes);
                 return Ok(0xC000_0023);
             }
-            guest::write32(output, name_bytes);
-            for (index, unit) in units.iter().enumerate() {
-                guest::write16(output + 4 + index as u64 * 2, *unit);
-            }
-            guest::write32(output_length, 4 + name_bytes);
+            // SAFETY: buffer de saída do chamador de modo kernel (tamanho conferido).
+            let information = unsafe { FileNameInformation::at(output) };
+            information.file_name_length.set(name_bytes);
+            guest::write_bytes(information.file_name[0].address(), &utf16_bytes(&units));
+            output_at::<u32>(output_length).set(4 + name_bytes);
             Ok(0)
         }
         _ => Ok(0xC000_0003),
@@ -451,24 +496,23 @@ pub fn query_file_information_by_object(file: u64, class: u32, length: u32, outp
 /// chamada.
 pub fn create_file_by_name(object_name: &str, disposition: u32, options: u32) -> Result<u32, KernelError> {
     let units: alloc::vec::Vec<u16> = object_name.encode_utf16().collect();
-    let block = guest::alloc_bytes(0x80 + units.len() as u64 * 2 + 2);
+    let block = guest::alloc_bytes(CreateByName::SIZE + units.len() as u64 * 2 + 2);
     if block == 0 {
         return Ok(0xC000_009A);
     }
-    let text = block + 0x80;
+    // SAFETY: bloco zerado recém-alocado; o texto vem logo depois dele.
+    let request = unsafe { CreateByName::at(block) };
+    let text = block + CreateByName::SIZE;
     guest_strings::write_wide_string(text, object_name);
-    let unicode = block + 0x40;
-    guest::write16(unicode, units.len() as u16 * 2);
-    guest::write16(unicode + 2, units.len() as u16 * 2 + 2);
-    guest::write64(unicode + 8, text);
-    guest::write32(block, 48);
-    guest::write64(block + object_attributes::OBJECT_NAME, unicode);
-    guest::write32(block + object_attributes::ATTRIBUTES, 0x240);
-    let output = block + 0x30;
-    let io_status = block + 0x60;
-    let status = create_kernel_file(output, 0, block, io_status, 0, disposition, options);
+    request.name.length.set(units.len() as u16 * 2);
+    request.name.maximum_length.set(units.len() as u16 * 2 + 2);
+    request.name.buffer.set(text);
+    request.attributes.length.set(ObjectAttributes::SIZE as u32);
+    request.attributes.object_name.set(request.name.address());
+    request.attributes.attributes.set(0x240);
+    let status = create_kernel_file(request.handle.address(), 0, request.attributes.address(), request.io_status.address(), 0, disposition, options);
     if status.as_ref().is_ok_and(|&status| status == 0) {
-        close_file_entry(guest::read32(output));
+        close_file_entry(request.handle.get() as u32);
     }
     guest::free_bytes(block);
     status
@@ -491,14 +535,14 @@ pub fn query_volume_information_by_object(file: u64, class: u32, length: u32, bu
         Ok(result) => result,
         Err(error) => {
             if returned != 0 {
-                guest::write32(returned, 0);
+                output_at::<u32>(returned).set(0);
             }
             return Ok(if error.status != 0xC000_0001 { error.status } else { 0xC000_0185 });
         }
     };
     volume_information::write(&result, buffer);
     if returned != 0 {
-        guest::write32(returned, result.information);
+        output_at::<u32>(returned).set(result.information);
     }
     Ok(result.status)
 }
@@ -512,7 +556,7 @@ pub fn query_volume_information_file(handle: u64, io_status: u64, buffer: u64, l
     }
     let status = query_volume_information_by_object(entry.file_object, class, length, buffer, returned);
     if let Ok(status) = status {
-        write_io_status(io_status, status, guest::read32(returned) as u64);
+        write_io_status(io_status, status, output_at::<u32>(returned).get() as u64);
     }
     guest::free_bytes(returned);
     status
@@ -525,7 +569,10 @@ pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32)
     if class != 13 && class != 64 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    if guest::read8(input) != 0 {
+    // FileDispositionInformation.DeleteFile ou o byte baixo do
+    // FILE_DISPOSITION_INFORMATION_EX.Flags (FILE_DISPOSITION_DELETE).
+    // SAFETY: buffer de entrada do chamador Zw de modo kernel.
+    if unsafe { FileDispositionInformation::at(input) }.delete_file.get() != 0 {
         let Backing::Volume { volume, path } = &entry.backing else { return Ok(STATUS_MEDIA_WRITE_PROTECTED) };
         match volume.remove(path) {
             None => return Ok(STATUS_MEDIA_WRITE_PROTECTED),
@@ -548,7 +595,7 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
     // FileDirectoryInformation (1) poe o nome do arquivo em +0x40; a
     // FileIdFullDirectoryInformation (38), que a ci.dll usa para varrer o
     // CatRoot atras dos catalogos, o poe em +0x50 (apos EaSize e FileId).
-    let name_offset: u64 = if class == 38 { 0x50 } else { 0x40 };
+    let name_offset = if class == 38 { core::mem::offset_of!(FileIdFullDirInformation, file_name) } else { core::mem::offset_of!(FileDirectoryInformation, file_name) } as u64;
     let key = (handle as u32) & !3;
     let Some(entry) = FILE_HANDLES.lock().get(&key).cloned() else { return STATUS_INVALID_HANDLE };
     let Backing::Volume { volume, path } = &entry.backing else { return STATUS_INVALID_HANDLE };
@@ -583,21 +630,26 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
         if cursor - buffer + record > length as u64 {
             break;
         }
-        guest::write32(cursor, 0);
-        guest::write32(cursor + 4, index as u32);
-        guest::write64(cursor + 0x28, volume.size(&format!("{prefix}{}", matched[index])).unwrap_or(0));
-        guest::write64(cursor + 0x30, 0);
-        guest::write32(cursor + 0x38, 0x80);
-        guest::write32(cursor + 0x3C, name.len() as u32 * 2);
+        // Os campos comuns são os do FILE_DIRECTORY_INFORMATION; a classe 38
+        // acrescenta EaSize e FileId antes do nome.
+        // SAFETY: registro dentro do buffer do chamador (tamanho conferido acima).
+        let record_view = unsafe { FileDirectoryInformation::at(cursor) };
+        record_view.next_entry_offset.set(0);
+        record_view.file_index.set(index as u32);
+        record_view.end_of_file.quad_part.set(volume.size(&format!("{prefix}{}", matched[index])).unwrap_or(0) as i64);
+        record_view.allocation_size.quad_part.set(0);
+        record_view.file_attributes.set(0x80);
+        record_view.file_name_length.set(name.len() as u32 * 2);
         if class == 38 {
-            guest::write32(cursor + 0x40, 0);
-            guest::write64(cursor + 0x48, index as u64 + 1);
+            // SAFETY: mesmo registro, na forma FILE_ID_FULL_DIR_INFORMATION.
+            let full = unsafe { FileIdFullDirInformation::at(cursor) };
+            full.ea_size.set(0);
+            full.file_id.quad_part.set(index as i64 + 1);
         }
-        for (offset, unit) in name.iter().enumerate() {
-            guest::write16(cursor + name_offset + offset as u64 * 2, *unit);
-        }
+        guest::write_bytes(cursor + name_offset, &utf16_bytes(&name));
         if previous != 0 {
-            guest::write32(previous, (cursor - previous) as u32);
+            // SAFETY: registro anterior do mesmo buffer.
+            unsafe { FileDirectoryInformation::at(previous) }.next_entry_offset.set((cursor - previous) as u32);
         }
         previous = cursor;
         cursor += record;
@@ -611,7 +663,8 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
         stored.scan_index = Some(index);
     }
     if previous != 0 {
-        guest::write32(previous, 0);
+        // SAFETY: último registro escrito no buffer do chamador.
+        unsafe { FileDirectoryInformation::at(previous) }.next_entry_offset.set(0);
     }
     let status = if emitted != 0 { 0 } else { 0x8000_0006 };
     write_io_status(io_status, status, cursor - buffer);
@@ -645,9 +698,9 @@ pub fn fs_control_file(handle: u64, io_status: u64, code: u32, input: u64, input
             io_manager::IoResult::Text(text) => text.chars().map(|character| character as u32 as u8).collect(),
             io_manager::IoResult::None => alloc::vec::Vec::new(),
         };
-        for index in 0..request.info as usize {
-            guest::write8(output + index as u64, bytes.get(index).copied().unwrap_or(0));
-        }
+        let mut data = bytes;
+        data.resize(request.info as usize, 0);
+        guest::write_bytes(output, &data);
     }
     Ok(status)
 }
@@ -655,16 +708,22 @@ pub fn fs_control_file(handle: u64, io_status: u64, code: u32, input: u64, input
 /// ZwQueryFullAttributesFile: tempos = agora e atributos NORMAL de um
 /// arquivo existente num volume montado.
 pub fn query_full_attributes_file(attributes: u64, output: u64) -> u32 {
-    let name = guest_strings::read_unicode_string(guest::read64(attributes + object_attributes::OBJECT_NAME));
+    let name = guest_strings::read_unicode_string(object_attributes_at(attributes).object_name.get());
     let Some((volume, path)) = resolve_mounted_file(&name) else { return STATUS_OBJECT_NAME_NOT_FOUND };
     if !volume.exists(&path) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    let now = crate::rtl::time::unix_milliseconds_to_nt_time(crate::ntos::ke::clock::now_ms());
-    for field in 0..4 {
-        guest::write64(output + field * 8, now);
-    }
-    guest::write32(output + 0x20, 0x80);
+    let now = crate::rtl::time::unix_milliseconds_to_nt_time(crate::ntos::ke::clock::now_ms()) as i64;
+    let size = volume.size(&path).unwrap_or(0) as i64;
+    // SAFETY: PFILE_NETWORK_OPEN_INFORMATION do chamador Zw de modo kernel.
+    let information = unsafe { FileNetworkOpenInformation::at(output) };
+    information.creation_time.quad_part.set(now);
+    information.last_access_time.quad_part.set(now);
+    information.last_write_time.quad_part.set(now);
+    information.change_time.quad_part.set(now);
+    information.allocation_size.quad_part.set(size);
+    information.end_of_file.quad_part.set(size);
+    information.file_attributes.set(0x80);
     0
 }
 
@@ -685,7 +744,7 @@ static KERNEL_OBJECT_HANDLES: SpinLock<BTreeMap<u32, KernelObjectEntry>> = SpinL
 /// Publica o objeto no gerenciador; OBJ_KERNEL_HANDLE escolhe o processo
 /// System e a representação de modo kernel do handle.
 pub fn open_kernel_object(output: u64, node: object_manager::NodeId, access: u32, attributes_pointer: u64) -> Result<u32, KernelError> {
-    let flags = guest::read32(attributes_pointer + 24);
+    let flags = object_attributes_at(attributes_pointer).attributes.get();
     let Some(snapshot) = object_manager::node(node) else { return Ok(0xC000_0034) };
     let kernel_handle = flags & 0x200 != 0;
     let entry = KernelObjectEntry {
@@ -715,7 +774,7 @@ pub fn open_kernel_object(output: u64, node: object_manager::NodeId, access: u32
         Err(error) if error.status != 0xC000_0001 => return Ok(error.status),
         Err(error) => return Err(error),
     };
-    guest::write64(output, if kernel_handle { 0xFFFF_FFFF_8000_0000 | handle as u64 } else { handle as u64 });
+    output_at::<u64>(output).set(if kernel_handle { 0xFFFF_FFFF_8000_0000 | handle as u64 } else { handle as u64 });
     Ok(0)
 }
 

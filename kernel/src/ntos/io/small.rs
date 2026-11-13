@@ -71,28 +71,33 @@ pub mod boot_drivers_state {
 
 /// IoGetInitialStack (19041): GS:[188] -> KTHREAD.InitialStack.
 pub mod initial_stack {
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{Kthread, NtStruct};
     use crate::ntos::ps::process;
-    use crate::ntos::mm::guest_memory as guest;
-    use crate::ntos::inc::nt_abi::kthread;
 
     pub fn get() -> u64 {
-        guest::read64(process::get_current_thread() + kthread::INITIAL_STACK)
+        // SAFETY: a thread corrente.
+        unsafe { Kthread::at(process::get_current_thread()) }.initial_stack.get()
     }
 
     /// IoGetStackLimits: limites da pilha do kernel do mapa de memória do boot.
     pub fn limits(low_output: u64, high_output: u64) {
-        guest::write64(low_output, 0x20_0000);
-        guest::write64(high_output, 0x30_0000);
+        // SAFETY: PULONG_PTR LowLimit/HighLimit do chamador de modo kernel.
+        unsafe {
+            Field::<u64>::at(low_output).set(0x20_0000);
+            Field::<u64>::at(high_output).set(0x30_0000);
+        }
     }
 }
 
 /// ETHREAD.CrossThreadFlags.HardErrorsAreDisabled (19041); o bit segue a
 /// thread por esperas e chamadas nativas aninhadas.
 pub mod thread_io {
+    use core::sync::atomic::Ordering;
+
+    use crate::ntos::inc::types::{Ethread, NtStruct};
     use crate::ntos::ps::process;
     use crate::rtl::KernelError;
-    use crate::ntos::mm::guest_memory as guest;
-    use crate::ntos::inc::nt_abi::kthread;
 
     /// IoSetThreadHardErrorMode: devolve o modo anterior (1 = habilitado).
     pub fn set_hard_error_mode(enabled: u8) -> Result<u32, KernelError> {
@@ -100,14 +105,11 @@ pub mod thread_io {
         if thread == 0 {
             return Err(KernelError::new("hard-error mode requires a current thread"));
         }
-        let address = thread + kthread::CROSS_THREAD_FLAGS;
-        loop {
-            let previous = guest::read32(address);
-            let next = if enabled != 0 { previous & !16 } else { previous | 16 };
-            if guest::compare_exchange32(address, previous, next)? == previous {
-                return Ok(if previous & 16 != 0 { 0 } else { 1 });
-            }
-        }
+        // ETHREAD.CrossThreadFlags.HardErrorsAreDisabled (bit 4).
+        // SAFETY: a thread corrente.
+        let flags = unsafe { Ethread::at(thread) }.cross_thread_flags.atomic();
+        let previous = if enabled != 0 { flags.fetch_and(!Ethread::HARD_ERRORS_ARE_DISABLED_MASK, Ordering::SeqCst) } else { flags.fetch_or(Ethread::HARD_ERRORS_ARE_DISABLED_MASK, Ordering::SeqCst) };
+        Ok(if previous & Ethread::HARD_ERRORS_ARE_DISABLED_MASK != 0 { 0 } else { 1 })
     }
 }
 
@@ -146,7 +148,9 @@ pub mod error_log {
     }
 
     pub fn write_entry(entry: u64) {
-        debug_print!("[errorlog] codigo=0x{:x}", guest::read32(entry + 4));
+        // SAFETY: IO_ERROR_LOG_PACKET alocado por allocate_entry e preenchido pelo driver.
+        let code = unsafe { <crate::ntos::inc::types::IoErrorLogPacket as crate::ntos::inc::types::NtStruct>::at(entry) }.error_code.get() as u32;
+        debug_print!("[errorlog] codigo=0x{:x}", code);
         guest::free_bytes(entry);
     }
 }
@@ -241,11 +245,14 @@ pub mod wmi_registration {
 /// IoAllocateSfioStreamIdentifier: Storage QoS sem política configurada,
 /// identificador nulo.
 pub mod sfio_stream {
-    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::NtStruct;
 
+    /// IoAllocateSfioStreamIdentifier: o PVOID* StreamIdentifier recebe NULL.
     pub fn allocate_identifier(output: u64) {
         if output != 0 {
-            guest::write64(output, 0);
+            // SAFETY: PVOID* de saída do chamador de modo kernel.
+            unsafe { Field::<u64>::at(output) }.set(0);
         }
     }
 }
@@ -275,18 +282,21 @@ pub mod partition_table {
         if let io_manager::IoResult::Bytes(bytes) = &request.result {
             guest::write_bytes(buffer, &bytes[..bytes.len().min(0x1000)]);
         }
-        guest::write64(output, buffer);
+        // SAFETY: PDRIVE_LAYOUT_INFORMATION_EX* do chamador de modo kernel.
+        unsafe { <crate::ntos::inc::field::Field<u64> as crate::ntos::inc::types::NtStruct>::at(output) }.set(buffer);
         Ok(0)
     }
 }
 
 /// RtlCheckPortableOperatingSystem: este boot nunca é Windows To Go.
 pub mod portable_operating_system {
-    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::NtStruct;
 
     pub fn check(output: u64) {
         if output != 0 {
-            guest::write8(output, 0);
+            // SAFETY: PBOOLEAN de saída do chamador de modo kernel.
+            unsafe { Field::<u8>::at(output) }.set(0);
         }
     }
 }

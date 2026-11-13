@@ -10,12 +10,20 @@ use crate::ntos::init::exports::signed_status;
 use crate::ntos::io::{device, io_manager};
 use crate::ntos::ob::object_manager;
 use crate::rtl::KernelError;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{Devpropkey, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
+/// Texto UTF-16 (sem terminador) no buffer do chamador, numa cópia.
 fn write_wide(output: u64, text: &str) {
-    for (index, unit) in text.encode_utf16().enumerate() {
-        guest::write16(output + index as u64 * 2, unit);
-    }
+    let bytes: alloc::vec::Vec<u8> = text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(output, &bytes);
+}
+
+/// PULONG ResultLength do chamador de modo kernel.
+fn result_length(returned: u64) -> &'static Field<u32> {
+    // SAFETY: ponteiro de saída de um chamador de modo kernel.
+    unsafe { Field::<u32>::at(returned) }
 }
 
 /// IoGetDeviceProperty(dev, property, bufferLength, buffer, resultLength):
@@ -38,20 +46,22 @@ pub fn get_device_property(device: u64, property: u32, size: u32, output: u64, r
         return 0xC000_000D;
     };
     if size < needed {
-        guest::write32(returned, needed);
+        result_length(returned).set(needed);
         return 0xC000_0023;
     }
     write_wide(output, &text);
     if property == 0xB {
-        guest::write16(output + text.encode_utf16().count() as u64 * 2, 0);
+        guest::write_bytes(output + text.encode_utf16().count() as u64 * 2, &[0; 2]);
     }
-    guest::write32(returned, needed);
+    result_length(returned).set(needed);
     0
 }
 
 /// IoGetDevicePropertyData: propriedade desconhecida = STATUS_NOT_FOUND.
 pub fn get_device_property_data(pdo: u64, key: u64) -> u32 {
-    debug_print!("[io] DevicePropertyData: pdo 0x{:x} key fmtid {:x}-{:x}-{:x} pid {}", pdo, guest::read32(key), guest::read16(key + 4), guest::read16(key + 6), guest::read32(key + 16));
+    // SAFETY: DEVPROPKEY do chamador de modo kernel.
+    let property = unsafe { Devpropkey::at(key) };
+    debug_print!("[io] DevicePropertyData: pdo 0x{:x} key fmtid {:x}-{:x}-{:x} pid {}", pdo, property.fmtid.data1.get(), property.fmtid.data2.get(), property.fmtid.data3.get(), property.pid.get());
     0xC000_0225
 }
 
@@ -66,6 +76,7 @@ pub fn open_device_registry_key(device: u64, output: u64) -> Result<u64, KernelE
     if status != 0 {
         return Ok(status as u64);
     }
-    guest::write64(output, handle);
+    // SAFETY: PHANDLE do chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }.set(handle);
     Ok(0)
 }

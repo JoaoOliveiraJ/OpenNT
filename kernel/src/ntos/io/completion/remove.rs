@@ -16,6 +16,7 @@ use crate::ntos::ps::process;
 use crate::ntos::rtl::native_context;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{FileIoCompletionInformation, NtStruct};
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const WINDOWS_EPOCH: u64 = 116_444_736_000_000_000;
@@ -110,7 +111,10 @@ impl Active {
             if !message_buffer::accessible(self.removed, 4, self.access_mode, true) {
                 status = ACCESS_VIOLATION;
             } else {
-                guest::write32(self.removed, number_removed);
+                // PULONG NumEntriesRemoved (sondado acima): escrita sondada.
+                if guest::try_write::<u32>(self.removed, number_removed).is_err() {
+                    status = ACCESS_VIOLATION;
+                }
             }
         }
         self.cleanup(status)
@@ -126,13 +130,21 @@ impl Active {
             if let Some(on_dequeue) = packet.on_dequeue {
                 on_dequeue();
             }
-            for (field, value) in [key, context, packet_status as u64, information].into_iter().enumerate() {
-                let address = self.output + index as u64 * 32 + field as u64 * 8;
-                if !message_buffer::accessible(address, 8, self.access_mode, true) {
+            // FILE_IO_COMPLETION_INFORMATION[index]: KeyContext, ApcContext e
+            // o IO_STATUS_BLOCK (Status como Pointer de 64 bits, Information).
+            let record = self.output + index as u64 * FileIoCompletionInformation::SIZE;
+            let fields = [
+                (core::mem::offset_of!(FileIoCompletionInformation, key_context), key),
+                (core::mem::offset_of!(FileIoCompletionInformation, apc_context), context),
+                (core::mem::offset_of!(FileIoCompletionInformation, io_status_block), packet_status as u64),
+                (core::mem::offset_of!(FileIoCompletionInformation, io_status_block) + 8, information),
+            ];
+            for (offset, value) in fields {
+                let address = record + offset as u64;
+                if !message_buffer::accessible(address, 8, self.access_mode, true) || guest::try_write::<u64>(address, value).is_err() {
                     status = ACCESS_VIOLATION;
                     break;
                 }
-                guest::write64(address, value);
             }
         }
         self.finish(status, count)
@@ -222,7 +234,15 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
     if access_mode != 0 && timeout != 0 && !message_buffer::accessible(timeout, 8, access_mode, false) {
         return Ok(Removal::status(ACCESS_VIOLATION));
     }
-    let mut interval = if access_mode != 0 && timeout != 0 { Some(guest::read64(timeout) as i64) } else { None };
+    // *Timeout de modo usuário (conferido acima): leitura sondada.
+    let mut interval = if access_mode != 0 && timeout != 0 {
+        match guest::try_read::<i64>(timeout) {
+            Ok(value) => Some(value),
+            Err(_) => return Ok(Removal::status(ACCESS_VIOLATION)),
+        }
+    } else {
+        None
+    };
     let mut count = count;
     let mut scratch = 0;
     if count > 16 {
@@ -249,7 +269,16 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
             }
             return Ok(Removal::status(ACCESS_VIOLATION));
         }
-        interval = Some(guest::read64(timeout) as i64);
+        interval = Some(match guest::try_read::<i64>(timeout) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = reference.release();
+                if scratch != 0 {
+                    guest::free_bytes(scratch);
+                }
+                return Ok(Removal::status(ACCESS_VIOLATION));
+            }
+        });
     }
     let thread = process::get_current_thread();
     if process::thread_record(thread).is_none() {

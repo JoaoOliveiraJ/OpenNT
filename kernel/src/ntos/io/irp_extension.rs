@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 use crate::ntos::io::threads::thread_activity;
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Guid, NtStruct};
 
 /// Extensão de um IRP criada sob demanda (activity id zerado).
 #[derive(Clone, Copy, Default)]
@@ -75,14 +76,14 @@ pub fn propagate(source: u64, target: u64) -> u32 {
 pub fn activity_id(packet: u64, output: u64) -> u32 {
     let extension = REQUEST_EXTENSIONS.lock().get(&packet).copied();
     let Some(extension) = extension.filter(|extension| extension.activity_id_present) else { return 0xC000_0225 };
-    guest::write_bytes(output, &guest::read_bytes(extension.activity_id_pointer, 16));
+    guest::write_bytes(output, &guest::read_bytes(extension.activity_id_pointer, Guid::SIZE as usize));
     0
 }
 
 /// IoSetActivityIdIrp.
 pub fn set_activity_id(packet: u64, guid: u64) {
     let extension = request_extension(packet);
-    guest::write_bytes(extension.activity_id_pointer, &guest::read_bytes(guid, 16));
+    guest::write_bytes(extension.activity_id_pointer, &guest::read_bytes(guid, Guid::SIZE as usize));
     update_extension(packet, |extension| extension.activity_id_present = true);
 }
 

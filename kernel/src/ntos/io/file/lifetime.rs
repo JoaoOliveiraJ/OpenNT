@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::drivers::fs::ntfs::Ntfs;
 use crate::ntos::ob::objects::file::{self as file_objects, FileCallbacks};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{FileObject, NtStruct};
 
 /// Metadados que o tempo de vida consulta no volume.
 #[derive(Clone, Copy, Debug, Default)]
@@ -236,8 +236,8 @@ fn publish_pending(state: u64, pending: bool) {
         if let Some(file) = &entry.file {
             file.pending_delete.store(pending, Ordering::SeqCst);
         }
-        // FILE_OBJECT.DeletePending.
-        guest::write8(entry.file_object + 0x49, pending as u8);
+        // SAFETY: FILE_OBJECT vivo da descrição registrada.
+        unsafe { FileObject::at(entry.file_object) }.delete_pending.set(pending as u8);
     }
 }
 

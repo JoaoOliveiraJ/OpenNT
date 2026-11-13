@@ -12,7 +12,19 @@ pub mod completion_packets {
     use crate::hal::amd64::native_call;
     use crate::ntos::mm::kernel_pool;
     use crate::rtl::{KernelError, SpinLock};
-    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::inc::types::{IoMiniCompletionPacketUser, NtStruct};
+
+    /// Pacote de conclusão (o layout do IO_MINI_COMPLETION_PACKET_USER; os
+    /// de kernel têm só os 0x38 primeiros bytes).
+    pub fn packet_at(pointer: u64) -> &'static IoMiniCompletionPacketUser {
+        // SAFETY: pacote vivo deste cache, de uma IOCP ou fornecido pelo dono.
+        unsafe { IoMiniCompletionPacketUser::at(pointer) }
+    }
+
+    /// PacketType: 1 (pool), 3 (pool com cota) e 4 (pacote de usuário).
+    const PACKET_POOL: u32 = 1;
+    const PACKET_QUOTA: u32 = 3;
+    const PACKET_USER: u32 = 4;
 
     pub const PACKET_BYTE_LENGTH: u64 = 0x38;
     pub const USER_PACKET_BYTE_LENGTH: u64 = 0x50;
@@ -25,7 +37,7 @@ pub mod completion_packets {
     /// helper original devolve NULL (flag 8 do mesmo alocador).
     pub fn allocate(charge_quota: bool) -> u64 {
         if let Some(pointer) = CACHED.lock().pop() {
-            guest::write8(pointer + 0x10, 1);
+            packet_at(pointer).packet_type.set(PACKET_POOL);
             return pointer;
         }
         let pointer = if charge_quota {
@@ -34,7 +46,7 @@ pub mod completion_packets {
             pool_allocation::allocate_tagged(0x200, PACKET_BYTE_LENGTH, PACKET_TAG).unwrap_or(0)
         };
         if pointer != 0 {
-            guest::write8(pointer + 0x10, if charge_quota { 3 } else { 1 });
+            packet_at(pointer).packet_type.set(if charge_quota { PACKET_QUOTA } else { PACKET_POOL });
         }
         pointer
     }
@@ -45,18 +57,18 @@ pub mod completion_packets {
         if CACHED.lock().contains(&pointer) {
             return Err(KernelError::new("completion packet released twice"));
         }
-        let packet_type = guest::read8(pointer + 0x10);
-        if packet_type == 4 {
-            let callback = guest::read64(pointer + 0x38);
+        let packet = packet_at(pointer);
+        let packet_type = packet.packet_type.get();
+        if packet_type == PACKET_USER {
+            let callback = packet.mini_packet_callback.get();
             if callback != 0 {
-                let context = guest::read64(pointer + 0x40);
-                native_call::call(callback, &[pointer, context]);
-            } else if guest::read8(pointer + 0x48) != 0 {
+                native_call::call(callback, &[pointer, packet.context.get()]);
+            } else if packet.allocated.get() != 0 {
                 kernel_pool::free(pointer, None)?;
             }
             return Ok(());
         }
-        if packet_type != 1 && packet_type != 3 {
+        if packet_type != PACKET_POOL && packet_type != PACKET_QUOTA {
             return Err(KernelError::new("invalid mini completion packet type"));
         }
         let owned = kernel_pool::info(pointer).is_some_and(|allocation| !allocation.paged && allocation.bytes >= PACKET_BYTE_LENGTH);

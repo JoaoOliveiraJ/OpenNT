@@ -19,7 +19,8 @@ use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::mm::sysload::kernel_image_source;
-use crate::ntos::inc::nt_abi::{device_object, driver_extension, driver_object};
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, NtStruct, UnicodeString};
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 
 /// Estado de um driver nativo.
@@ -34,6 +35,9 @@ struct NativeDriver {
     import_references: u32,
     kernel_library_pinned: bool,
 }
+
+/// IO_TYPE_DRIVER.
+const IO_TYPE_DRIVER: i16 = 4;
 
 static DRIVERS: SpinLock<BTreeMap<u64, NativeDriver>> = SpinLock::new(BTreeMap::new());
 /// Driver em inicialização (entre begin_driver e end_driver) ou em AddDevice.
@@ -96,7 +100,8 @@ pub fn allocate_driver_object_extension(driver: u64, tag: u64, size: u32, output
     }
     let extension = guest::alloc_bytes(size as u64);
     extensions.insert(key, extension);
-    guest::write64(output, extension);
+    // SAFETY: PVOID* DriverObjectExtension do chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }.set(extension);
     0
 }
 
@@ -134,27 +139,30 @@ fn destroy_driver(driver: u64) {
 
 /// Cria o DRIVER_OBJECT, sua extensão e o nome UTF-16 e os publica.
 pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u64) -> Result<u64, KernelError> {
-    let driver = guest::alloc_bytes(driver_object::STRUCT_SIZE + 0x400);
+    // DRIVER_OBJECT e, logo depois, a DRIVER_EXTENSION (com folga).
+    let driver = guest::alloc_bytes(DriverObject::SIZE + 0x400);
     let name_units: Vec<u16> = name.encode_utf16().collect();
     let name_buffer = guest::alloc_bytes(name_units.len() as u64 * 2 + 2);
     // A extensão ocupa a região adicional da mesma alocação.
-    let extension = driver + driver_object::STRUCT_SIZE;
+    let extension = driver + DriverObject::SIZE;
     guest_strings::write_wide_string(name_buffer, name);
-    guest::write16(driver + driver_object::TYPE, driver_object::IO_TYPE);
-    guest::write16(driver + driver_object::SIZE, driver_object::STRUCT_SIZE as u16);
-    guest::write32(driver + driver_object::DEVICE_OBJECT, 0);
+    // SAFETY: alocação zerada do DRIVER_OBJECT mais a extensão.
+    let (object, driver_extension) = unsafe { (DriverObject::at(driver), DriverExtension::at(extension)) };
+    object.type_.set(IO_TYPE_DRIVER);
+    object.size.set(DriverObject::SIZE as i16);
+    object.device_object.set(0);
     // DriverStart é PVOID: a VA inteira da imagem.
-    guest::write64(driver + driver_object::DRIVER_START, image_base);
-    guest::write32(driver + driver_object::DRIVER_SIZE, image_size as u32);
-    guest::write16(driver + driver_object::DRIVER_NAME, name_units.len() as u16 * 2);
-    guest::write16(driver + driver_object::DRIVER_NAME + 2, name_units.len() as u16 * 2 + 2);
-    guest::write64(driver + driver_object::DRIVER_NAME + 8, name_buffer);
-    guest::write64(driver + driver_object::DRIVER_INIT, entry_point);
-    guest::write64(driver + driver_object::DRIVER_UNLOAD, 0);
+    object.driver_start.set(image_base);
+    object.driver_size.set(image_size as u32);
+    object.driver_name.length.set(name_units.len() as u16 * 2);
+    object.driver_name.maximum_length.set(name_units.len() as u16 * 2 + 2);
+    object.driver_name.buffer.set(name_buffer);
+    object.driver_init.set(entry_point);
+    object.driver_unload.set(0);
     // DRIVER_EXTENSION real: o driver registra AddDevice aqui.
-    guest::write64(driver + driver_object::DRIVER_EXTENSION, extension);
-    guest::write64(extension + driver_extension::DRIVER_OBJECT, driver);
-    guest::write64(extension + driver_extension::ADD_DEVICE, 0);
+    object.driver_extension.set(extension);
+    driver_extension.driver_object.set(driver);
+    driver_extension.add_device.set(0);
     let node = match io_manager::create_native_driver(name, driver) {
         Ok(node) => node,
         Err(error) => {
@@ -250,10 +258,12 @@ fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Re
     let units = registry_path.encode_utf16().count() as u64;
     let path_buffer = guest::alloc_bytes(units * 2 + 2);
     guest_strings::write_wide_string(path_buffer, &registry_path);
-    let descriptor = guest::alloc_bytes(16);
-    guest::write16(descriptor, (units * 2) as u16);
-    guest::write16(descriptor + 2, (units * 2 + 2) as u16);
-    guest::write64(descriptor + 8, path_buffer);
+    let descriptor = guest::alloc_bytes(UnicodeString::SIZE);
+    // SAFETY: alocação de um UNICODE_STRING (RegistryPath do DriverEntry).
+    let registry = unsafe { UnicodeString::at(descriptor) };
+    registry.length.set((units * 2) as u16);
+    registry.maximum_length.set((units * 2 + 2) as u16);
+    registry.buffer.set(path_buffer);
     if let Some(entry) = DRIVERS.lock().get_mut(&driver) {
         entry.registry_allocation = alloc::vec![descriptor, path_buffer];
     }
@@ -318,15 +328,18 @@ pub fn unload_driver(driver_name: &str) -> bool {
         }
         // ReferenceCount conta usos por arquivos; as referências do gerenciador
         // de objetos são contabilizadas pelo provedor.
-        let file_references = guest::read32(native + device_object::REFERENCE_COUNT) as i32;
+        // SAFETY: DEVICE_OBJECT vivo registrado para o driver.
+        let device_object = unsafe { DeviceObject::at(native) };
+        let file_references = device_object.reference_count.get();
         let object_references = device_objects::reference_count(native).unwrap_or(0);
-        if file_references > 1 || object_references > 1 || guest::read64(native + device_object::ATTACHED_DEVICE) != 0 {
+        if file_references > 1 || object_references > 1 || device_object.attached_device.get() != 0 {
             let device_name = object_manager::node(device).map(|node| node.name).unwrap_or_default();
             debug_print!("[ntoskrnl] unload de {} RECUSADO: \\Device\\{} tem referencias de arquivo/objeto vivas", driver_name, device_name);
             return false;
         }
     }
-    let unload_routine = guest::read64(driver + driver_object::DRIVER_UNLOAD);
+    // SAFETY: DRIVER_OBJECT vivo deste registro.
+    let unload_routine = unsafe { DriverObject::at(driver) }.driver_unload.get();
     // PnP primeiro: REMOVE_DEVICE para cada dispositivo, como o NT.
     for device in devices {
         if let Err(error) = io_manager::pnp_remove_device(device) {
@@ -345,8 +358,8 @@ pub fn unload_driver(driver_name: &str) -> bool {
 pub fn call_add_device(driver_name: &str, physical_device: u64) -> u64 {
     let Some(node) = object_manager::lookup(&format!("\\Driver\\{driver_name}")) else { return 0xFFFF_FFFF_C000_0034 };
     let Some(driver) = DRIVERS.lock().iter().find(|(_, entry)| entry.node == node).map(|(&driver, _)| driver) else { return 0xFFFF_FFFF_C000_0034 };
-    let extension = guest::read64(driver + driver_object::DRIVER_EXTENSION);
-    let routine = guest::read64(extension + driver_extension::ADD_DEVICE);
+    // SAFETY: DRIVER_OBJECT vivo deste registro e a extensão dele.
+    let routine = unsafe { DriverExtension::at(DriverObject::at(driver).driver_extension.get()) }.add_device.get();
     if routine == 0 {
         return 0xFFFF_FFFF_C000_0034;
     }

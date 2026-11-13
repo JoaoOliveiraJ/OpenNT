@@ -20,9 +20,24 @@ use crate::ntos::po::power_manager;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
-use crate::ntos::inc::nt_abi::{device_object, driver_object};
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, DevobjExtension, DriverObject, NtStruct};
 
 /// FDO → PDO registrado no attach (IoGetDeviceProperty acha o PDO de hardware).
+/// IO_TYPE_DEVICE e IO_TYPE_DEVICE_OBJECT_EXTENSION.
+const IO_TYPE_DEVICE: i16 = 3;
+const IO_TYPE_DEVICE_OBJECT_EXTENSION: i16 = 0x0D;
+
+fn device_at(device: u64) -> &'static DeviceObject {
+    // SAFETY: DEVICE_OBJECT vivo (registrado em `device_objects`).
+    unsafe { DeviceObject::at(device) }
+}
+
+fn driver_at(driver: u64) -> &'static DriverObject {
+    // SAFETY: DRIVER_OBJECT vivo dono do dispositivo.
+    unsafe { DriverObject::at(driver) }
+}
+
 static PHYSICAL_BY_ATTACHED: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
 static UNNAMED_DEVICES: SpinLock<u32> = SpinLock::new(0);
 
@@ -70,23 +85,35 @@ pub fn create_device(driver: u64, extension_size: u32, name_pointer: u64, device
             name
         }
     };
-    let page = guest::alloc_bytes(device_object::STRUCT_SIZE + extension_size as u64);
+    // Como o IoCreateDevice: DEVICE_OBJECT, extensão do driver (arredondada
+    // a 8) e a DEVOBJ_EXTENSION no fim do mesmo bloco.
+    let extension_bytes = (extension_size as u64 + 7) & !7;
+    let page = guest::alloc_bytes(DeviceObject::SIZE + extension_bytes + DevobjExtension::SIZE);
     if page == 0 {
         return Ok(0xC000_009A);
     }
-    guest::write16(page + device_object::TYPE, device_object::IO_TYPE);
-    guest::write16(page + device_object::SIZE, device_object::STRUCT_SIZE as u16);
-    guest::write32(page + device_object::REFERENCE_COUNT, 1);
-    guest::write64(page + device_object::DRIVER_OBJECT, driver);
-    guest::write32(page + device_object::DEVICE_TYPE, device_type);
-    guest::write32(page + device_object::CHARACTERISTICS, characteristics);
-    guest::write8(page + device_object::STACK_SIZE, 1);
-    guest::write64(page + device_object::DEVICE_EXTENSION, if extension_size != 0 { page + device_object::STRUCT_SIZE } else { 0 });
+    let device = device_at(page);
+    device.type_.set(IO_TYPE_DEVICE);
+    device.size.set(DeviceObject::SIZE as u16);
+    device.reference_count.set(1);
+    device.driver_object.set(driver);
+    device.device_type.set(device_type);
+    device.characteristics.set(characteristics);
+    device.stack_size.set(1);
+    device.device_extension.set(if extension_size != 0 { page + DeviceObject::SIZE } else { 0 });
+    let extension_address = page + DeviceObject::SIZE + extension_bytes;
+    // SAFETY: a DEVOBJ_EXTENSION ocupa o fim do bloco recém-alocado.
+    let object_extension = unsafe { DevobjExtension::at(extension_address) };
+    object_extension.type_.set(IO_TYPE_DEVICE_OBJECT_EXTENSION);
+    object_extension.size.set(DevobjExtension::SIZE as u16);
+    object_extension.device_object.set(page);
+    device.device_object_extension.set(extension_address);
+    super::controller::start_io::queue_initialize(page);
     device_objects::register(page, Some(destroy_device), Some(unlink_device))?;
     device_objects::with_lock(|| {
-        let head = driver + driver_object::DEVICE_OBJECT;
-        guest::write64(page + device_object::NEXT_DEVICE, guest::read64(head));
-        guest::write64(head, page);
+        let head = &driver_at(driver).device_object;
+        device.next_device.set(head.get());
+        head.set(page);
         Ok(())
     })?;
     // O dispositivo pertence ao DRIVER_OBJECT do argumento (cargas aninhadas
@@ -107,13 +134,14 @@ pub fn create_device(driver: u64, extension_size: u32, name_pointer: u64, device
         io_manager::register_device(node, io_manager::DeviceEntry { driver: Some(driver_node), native_device: page, ..Default::default() });
         io_manager::attach_device_to_driver(driver_node, node);
     }
-    guest::write64(output, page);
+    // SAFETY: PDEVICE_OBJECT* do chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }.set(page);
     Ok(0)
 }
 
 /// Retira o dispositivo da coleção do driver e da lista nativa.
 fn unlink_device(device: u64) {
-    let driver = guest::read64(device + 8);
+    let driver = device_at(device).driver_object.get();
     if let Some(driver_node) = lifecycle::node_by_driver_object(driver) {
         for node in io_manager::driver_devices(driver_node) {
             if io_manager::device(node).is_some_and(|entry| entry.native_device == device) {
@@ -122,17 +150,18 @@ fn unlink_device(device: u64) {
         }
     }
     let _ = device_objects::with_lock(|| {
-        let mut link = driver + 8;
+        // DriverObject->DeviceObject e depois cada DeviceObject->NextDevice.
+        let mut link: &Field<u64> = &driver_at(driver).device_object;
         loop {
-            let current = guest::read64(link);
+            let current = link.get();
             if current == 0 {
                 break;
             }
             if current == device {
-                guest::write64(link, guest::read64(device + 0x10));
+                link.set(device_at(device).next_device.get());
                 break;
             }
-            link = current + 0x10;
+            link = &device_at(current).next_device;
         }
         Ok(())
     });
@@ -214,8 +243,11 @@ pub fn get_device_object_pointer(name_pointer: u64, _access: u32, file_output: u
     }
     file_objects::reference(opened.file_object)?;
     io_manager::close_device(opened.handle)?;
-    guest::write64(file_output, opened.file_object);
-    guest::write64(device_output, device);
+    // SAFETY: PFILE_OBJECT* e PDEVICE_OBJECT* do chamador de modo kernel.
+    unsafe {
+        Field::<u64>::at(file_output).set(opened.file_object);
+        Field::<u64>::at(device_output).set(device);
+    }
     Ok(0)
 }
 

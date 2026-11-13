@@ -19,7 +19,8 @@ use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
-use crate::ntos::inc::nt_abi::device_object;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, DeviceRelations, NtStruct};
 use crate::ntos::io::{device, lifecycle};
 
 /// hardwareId → serviço do driver funcional (o "INF estático").
@@ -113,7 +114,8 @@ pub fn attach_upper_filters(pdo: NodeId, fdo: NodeId, hardware_ids: &[String]) {
     }
     let mut top = io_manager::device(fdo).map_or(0, |entry| entry.native_device);
     for _ in 0..16 {
-        let above = guest::read64(top + device_object::ATTACHED_DEVICE);
+        // SAFETY: DEVICE_OBJECT vivo da pilha montada.
+        let above = unsafe { DeviceObject::at(top) }.attached_device.get();
         if above == 0 {
             break;
         }
@@ -164,8 +166,12 @@ pub fn query_bus_relations(fdo: NodeId) -> Vec<u64> {
     if request.status != 0 || request.info == 0 {
         return Vec::new();
     }
-    let count = guest::read32(request.info) as u64;
-    let children = (0..count).map(|index| guest::read64(request.info + 8 + index * 8)).collect();
+    // SAFETY: DEVICE_RELATIONS devolvido pelo driver em IoStatus.Information.
+    let relations = unsafe { DeviceRelations::at(request.info) };
+    let count = relations.count.get() as usize;
+    // SAFETY: Objects[Count] segue o cabeçalho na mesma alocação.
+    let objects = unsafe { Field::<u64>::array_at(relations.objects[0].address(), count) };
+    let children = objects.iter().map(Field::get).collect();
     guest::free_bytes(request.info);
     children
 }

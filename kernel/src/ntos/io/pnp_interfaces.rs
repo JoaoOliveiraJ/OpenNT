@@ -25,6 +25,8 @@ use crate::ntos::ex::pool_allocation;
 use crate::ntos::io::{device_interface, io_manager};
 use crate::ntos::ke::{bugcheck, irql};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{Guid, NtStruct};
 use crate::ntos::ob::object_manager;
 use crate::rtl::KernelError;
 
@@ -47,7 +49,7 @@ fn owned_by(link: &str, pdo: u64) -> bool {
 /// SymbolicLinkList): grava a lista MULTI_SZ e devolve o NTSTATUS.
 pub fn device_interface_list(class_guid: u64, pdo: u64, flags: u32, output: u64) -> Result<u32, KernelError> {
     let mut class = [0u8; 16];
-    class.copy_from_slice(&guest::read_bytes(class_guid, 16));
+    class.copy_from_slice(&guest::read_bytes(class_guid, Guid::SIZE as usize));
     let links = device_interface::class_links(&class, flags & DEVICE_INTERFACE_INCLUDE_NONACTIVE != 0);
     // Cada link termina em L'\0' e a lista em mais um; vazia = um L'\0'.
     let mut units: Vec<u16> = Vec::new();
@@ -60,10 +62,10 @@ pub fn device_interface_list(class_guid: u64, pdo: u64, flags: u32, output: u64)
     if list == 0 {
         return Ok(STATUS_INSUFFICIENT_RESOURCES);
     }
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(list + index as u64 * 2, *unit);
-    }
-    guest::write64(output, list);
+    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(list, &bytes);
+    // SAFETY: PZZWSTR* SymbolicLinkList de saída do chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }.set(list);
     Ok(0)
 }
 

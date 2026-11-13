@@ -4,6 +4,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::ntos::inc::types::{GenericMapping, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_data;
 
@@ -24,11 +25,13 @@ pub fn file_object_type() -> u64 {
 pub fn file_object_generic_mapping() -> u64 {
     let mut pointer = FILE_MAPPING.load(Ordering::Acquire);
     if pointer == 0 {
-        pointer = guest::alloc_bytes(16);
-        guest::write32(pointer, 0x0012_0089);
-        guest::write32(pointer + 4, 0x0012_0116);
-        guest::write32(pointer + 8, 0x0012_00A0);
-        guest::write32(pointer + 12, 0x001F_01FF);
+        pointer = guest::alloc_bytes(GenericMapping::SIZE);
+        // SAFETY: GENERIC_MAPPING recém-alocado.
+        let mapping = unsafe { GenericMapping::at(pointer) };
+        mapping.generic_read.set(0x0012_0089);
+        mapping.generic_write.set(0x0012_0116);
+        mapping.generic_execute.set(0x0012_00A0);
+        mapping.generic_all.set(0x001F_01FF);
         FILE_MAPPING.store(pointer, Ordering::Release);
     }
     pointer

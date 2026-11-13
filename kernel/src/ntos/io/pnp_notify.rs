@@ -15,7 +15,8 @@ use crate::ntos::io::{device_interface, work_items};
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
-use crate::ntos::inc::nt_abi::io_workitem;
+use crate::ntos::inc::field::{Field, Reserved};
+use crate::ntos::inc::types::{DeviceInterfaceChangeNotification, Guid, NtStruct, UnicodeString};
 
 /// Registro de notificação PnP (o handle é o registro nativo).
 #[derive(Clone, Copy)]
@@ -34,6 +35,20 @@ const EVENT_CATEGORY_TARGET_DEVICE_CHANGE: u32 = 3;
 const INTERFACE_ARRIVAL: [u8; 16] = [0x04, 0x40, 0x3A, 0xCB, 0xF0, 0x46, 0xD0, 0x11, 0xB0, 0x8F, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3F];
 const INTERFACE_REMOVAL: [u8; 16] = [0x05, 0x40, 0x3A, 0xCB, 0xF0, 0x46, 0xD0, 0x11, 0xB0, 0x8F, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3F];
 
+/// Registro devolvido como NotificationEntry (privado do OpenNT; o driver
+/// só o devolve ao IoUnregisterPlugPlayNotification).
+#[repr(C)]
+struct RegistrationRecord {
+    callback: Field<u64>,
+    context: Field<u64>,
+    _reserved: Reserved<0x10>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for RegistrationRecord {}
+
+const _: () = assert!(core::mem::size_of::<RegistrationRecord>() == 0x20);
+
 static PLUG_PLAY_REGISTRATIONS: SpinLock<Vec<PlugPlayRegistration>> = SpinLock::new(Vec::new());
 /// Mudanças de dispositivo agendadas: work item → (GUID, contexto, callback).
 static TARGET_CHANGES: SpinLock<BTreeMap<u64, (u64, u64, u64)>> = SpinLock::new(BTreeMap::new());
@@ -44,22 +59,24 @@ static TARGET_CHANGES: SpinLock<BTreeMap<u64, (u64, u64, u64)>> = SpinLock::new(
 fn notify_interface(registrations: &[PlugPlayRegistration], event: &[u8; 16], class: &[u8; 16], link: &str) {
     for registration in registrations.iter().filter(|registration| registration.category == EVENT_CATEGORY_DEVICE_INTERFACE_CHANGE && registration.class == *class) {
         let units = link.encode_utf16().count() as u64;
-        let notification = guest::alloc_bytes(0x30 + 16 + (units + 1) * 2);
+        // DEVICE_INTERFACE_CHANGE_NOTIFICATION, o UNICODE_STRING do link e o texto.
+        let notification = guest::alloc_bytes(DeviceInterfaceChangeNotification::SIZE + UnicodeString::SIZE + (units + 1) * 2);
         if notification == 0 {
             continue;
         }
-        let string = notification + 0x30;
-        let buffer = string + 16;
-        guest::write16(notification, 1);
-        guest::write16(notification + 2, 0x30);
-        guest::write_bytes(notification + 4, event);
-        guest::write_bytes(notification + 20, class);
-        guest::write32(notification + 36, 0);
-        guest::write64(notification + 40, string);
+        let string = notification + DeviceInterfaceChangeNotification::SIZE;
+        let buffer = string + UnicodeString::SIZE;
+        // SAFETY: estruturas dentro do bloco zerado recém-alocado.
+        let (body, name) = unsafe { (DeviceInterfaceChangeNotification::at(notification), UnicodeString::at(string)) };
+        body.version.set(1);
+        body.size.set(DeviceInterfaceChangeNotification::SIZE as u16);
+        guest::write_bytes(body.event.address(), event);
+        guest::write_bytes(body.interface_class_guid.address(), class);
+        body.symbolic_link_name.set(string);
         guest_strings::write_wide_string(buffer, link);
-        guest::write16(string, units as u16 * 2);
-        guest::write16(string + 2, units as u16 * 2 + 2);
-        guest::write64(string + 8, buffer);
+        name.length.set(units as u16 * 2);
+        name.maximum_length.set(units as u16 * 2 + 2);
+        name.buffer.set(buffer);
         native_call::call(registration.callback, &[notification, registration.context]);
         guest::free_bytes(notification);
     }
@@ -85,14 +102,17 @@ pub fn register(category: u32, flags: u32, data: u64, callback: u64, context: u6
         if data == 0 {
             return 0xC000_000D;
         }
-        class.copy_from_slice(&guest::read_bytes(data, 16));
+        class.copy_from_slice(&guest::read_bytes(data, Guid::SIZE as usize));
     }
-    let record = guest::alloc_bytes(0x20);
-    guest::write64(record, callback);
-    guest::write64(record + 8, context);
+    let record = guest::alloc_bytes(RegistrationRecord::SIZE);
+    // SAFETY: registro recém-alocado.
+    let body = unsafe { RegistrationRecord::at(record) };
+    body.callback.set(callback);
+    body.context.set(context);
     let registration = PlugPlayRegistration { category, class, callback, context, record };
     PLUG_PLAY_REGISTRATIONS.lock().push(registration);
-    guest::write64(output, record);
+    // SAFETY: PVOID* NotificationEntry do chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }.set(record);
     if category == EVENT_CATEGORY_DEVICE_INTERFACE_CHANGE && flags & 1 != 0 {
         let existing = device_interface::enabled_links(&class);
         for link in existing {
@@ -131,7 +151,7 @@ fn deliver_target_change(_device: u64, item: u64) {
 /// IoReportTargetDeviceChangeAsynchronous(PhysicalDeviceObject,
 /// NotificationStructure, Callback, Context).
 pub fn report_target_device_change_asynchronous(notification: u64, callback: u64, context: u64) {
-    let item = guest::alloc_bytes(io_workitem::SIZE);
+    let item = guest::alloc_bytes(work_items::work_item_size());
     TARGET_CHANGES.lock().insert(item, (notification, callback, context));
     work_items::queue_kernel_work_item(item, deliver_target_change, item, None);
 }

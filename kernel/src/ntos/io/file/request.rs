@@ -19,7 +19,17 @@ use crate::ntos::ob::object_manager;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::mdl;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
+
+/// MDL_PAGES_LOCKED | MDL_MAPPED_TO_SYSTEM_VA.
+const MDL_PAGES_LOCKED_AND_MAPPED: i16 = 0x0002 | 0x0001;
+
+/// FILE_OBJECT vivo do pedido (referenciado até o fim).
+fn file_at(file: u64) -> &'static FileObject {
+    // SAFETY: o pedido retém o FILE_OBJECT.
+    unsafe { FileObject::at(file) }
+}
 
 const TAG: u32 = 0x7443_6F49;
 /// Requisição sem método de transferência (leitura/escrita).
@@ -237,24 +247,26 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
         return Err(KernelError::new("driver completed I/O with an invalid output length"));
     }
     if (r.copy_output || r.method == 0) && r.system != 0 && count != 0 && status >> 30 != 3 {
-        for offset in 0..count {
-            guest::write8(r.output + offset, guest::read8(r.system + offset));
-        }
+        // O buffer de saída é do solicitante (de modo usuário num pedido de
+        // modo usuário): cópia sondada, uma falha não derruba a conclusão.
+        let _ = guest::try_write_bytes(r.output, &guest::read_bytes(r.system, count as usize));
     }
     if let Some(on_complete) = r.on_complete.as_mut() {
         on_complete(status, count);
     }
-    guest::write32(r.io_status, status);
-    guest::write64(r.io_status + 8, count);
+    // IoStatusBlock do solicitante (sondado na entrada; escrita sondada como
+    // a do IopCompleteRequest, que ignora a exceção).
+    let _ = guest::try_write::<i32>(r.io_status + core::mem::offset_of!(IoStatusBlock, status) as u64, status as i32);
+    let _ = guest::try_write::<u64>(r.io_status + core::mem::offset_of!(IoStatusBlock, information) as u64, count);
     if r.file != 0 {
-        guest::write32(r.file + 0x38, status);
+        file_at(r.file).final_status.set(status as i32);
     }
     if let Some(event) = &r.event {
         if !r.skip_event {
             dispatcher::set_event(event.pointer);
         }
     } else if r.file != 0 && !r.skip_file_event {
-        dispatcher::set_event(r.file + 0x98);
+        dispatcher::set_event(file_at(r.file).event.address());
     }
     if r.apc != 0 && !r.rundown && !r.skip_apc && apc::insert(r.apc, r.io_status, 0) {
         r.apc = 0;
@@ -266,7 +278,8 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
 
 /// Bomba de conclusões em PASSIVE_LEVEL com APCs especiais habilitadas.
 pub fn pump() {
-    if irql::get_irql() != 0 || guest::read16(process::get_current_thread() + 0x1E6) != 0 {
+    // SAFETY: a thread corrente.
+    if irql::get_irql() != 0 || unsafe { Kthread::at(process::get_current_thread()) }.special_apc_disable.get() != 0 {
         return;
     }
     let pending: Vec<Shared> = REQUESTS.lock().clone();
@@ -281,20 +294,23 @@ pub fn pump() {
 pub fn fill_mdl(request: &Shared, write: bool) -> Result<bool, KernelError> {
     let mut r = request.lock();
     let pin = io_pins::pin(r.output, r.output_length as u64, write)?;
-    let size = mdl::PFN_ARRAY + pin.pages.len() as u64 * 8;
+    // O vetor de PFNs (PFN_NUMBER) segue o cabeçalho do MDL.
+    let size = Mdl::SIZE + pin.pages.len() as u64 * 8;
     let descriptor = guest::alloc_bytes(size);
     if descriptor == 0 {
         r.pin = Some(pin);
         return Ok(false);
     }
-    guest::write16(descriptor + mdl::SIZE, size as u16);
-    guest::write16(descriptor + mdl::MDL_FLAGS, mdl::FLAG_PAGES_LOCKED | mdl::FLAG_MAPPED_TO_SYSTEM_VA);
-    guest::write64(descriptor + mdl::START_VA, r.output & !4095);
-    guest::write32(descriptor + mdl::BYTE_OFFSET, (r.output & 4095) as u32);
-    guest::write32(descriptor + mdl::BYTE_COUNT, r.output_length);
-    guest::write64(descriptor + mdl::MAPPED_SYSTEM_VA, r.output);
-    for (index, page) in pin.pages.iter().enumerate() {
-        guest::write64(descriptor + mdl::PFN_ARRAY + index as u64 * 8, page.frame / 4096);
+    // SAFETY: alocação zerada do MDL com o vetor de PFNs.
+    let (header, pfns) = unsafe { (Mdl::at(descriptor), Field::<u64>::array_at(descriptor + Mdl::SIZE, pin.pages.len())) };
+    header.size.set(size as i16);
+    header.mdl_flags.set(MDL_PAGES_LOCKED_AND_MAPPED);
+    header.start_va.set(r.output & !4095);
+    header.byte_offset.set((r.output & 4095) as u32);
+    header.byte_count.set(r.output_length);
+    header.mapped_system_va.set(r.output);
+    for (pfn, page) in pfns.iter().zip(pin.pages.iter()) {
+        pfn.set(page.frame / 4096);
     }
     r.mdl = descriptor;
     r.pin = Some(pin);

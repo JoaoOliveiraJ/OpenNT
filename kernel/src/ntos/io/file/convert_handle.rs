@@ -7,7 +7,14 @@
 use crate::ntos::ke::irql;
 use crate::ntos::ob::handles::file as file_handles;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::NtStruct;
+
+/// PHANDLE de saída do chamador de modo kernel.
+fn output_at(output: u64) -> &'static Field<u64> {
+    // SAFETY: ponteiro de saída de um chamador de modo kernel.
+    unsafe { Field::<u64>::at(output) }
+}
 
 pub fn convert(source: u64, access_mode: u8, desired_access: u32, skip_access_precheck: bool, output: u64) -> Result<u32, KernelError> {
     // Esperas do Object Manager exigem até APC_LEVEL.
@@ -15,7 +22,7 @@ pub fn convert(source: u64, access_mode: u8, desired_access: u32, skip_access_pr
         return Err(KernelError::new("file handle conversion above APC_LEVEL"));
     }
     // A saída fica nula mesmo quando a origem não é válida.
-    guest::write64(output, 0);
+    output_at(output).set(0);
     if source == 0 {
         return Ok(0);
     }
@@ -44,7 +51,7 @@ pub fn convert(source: u64, access_mode: u8, desired_access: u32, skip_access_pr
         if !same {
             return Ok(0xC000_0024);
         }
-        guest::write64(output, handle);
+        output_at(output).set(handle);
         // A propriedade passa ao chamador só depois de publicar a saída.
         duplicated = None;
         Ok(0)

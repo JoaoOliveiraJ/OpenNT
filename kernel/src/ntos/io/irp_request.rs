@@ -24,8 +24,12 @@
 //! adaptador, então é chamado pelo nome). O
 //! IopUnloadSafeCompletion é uma rotina privada (id próprio, fora da EAT).
 
+use core::mem::offset_of;
+
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::nt_abi::{device_object, eprocess, io_stack_location as stack, irp, kthread};
+use crate::ntos::inc::field::{Field, Reserved};
+use crate::ntos::inc::types::extra_io::IrpExtensionField;
+use crate::ntos::inc::types::{DeviceObject, Eprocess, Ethread, FileObject, IoStackLocation, IopFileObjectExtension, Irp, Kthread, LargeInteger, NtStruct};
 use crate::ntos::init::exports::{invoke_handler, private_routines};
 use crate::ntos::io::{io_manager, irp_builder, irp_extension, mdl, retained_irp};
 use crate::ntos::ke::dispatcher;
@@ -41,12 +45,6 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL.
 const INVOKE_ALWAYS: u8 = 0xE0;
 const SL_PENDING_RETURNED: u8 = 0x01;
-/// IRP.PendingReturned / IRP.Tail.Overlay.IrpExtension (PDB _IRP).
-const IRP_PENDING_RETURNED: u64 = 0x41;
-const IRP_EXTENSION: u64 = 0xC8;
-/// FILE_OBJECT.Flags / FILE_OBJECT.FileObjectExtension (PDB _FILE_OBJECT).
-const FILE_OBJECT_FLAGS: u64 = 0x50;
-const FILE_OBJECT_EXTENSION: u64 = 0xD0;
 const FO_SYNCHRONOUS_IO: u32 = 0x02;
 /// DEVICE_OBJECT.Flags.
 const DO_BUFFERED_IO: u32 = 0x04;
@@ -62,20 +60,51 @@ const IO_PRIORITY_MASK: u32 = 0xFFF1_FFFF;
 const IRP_MJ_WRITE: u32 = 0x04;
 /// Majors sem tratamento de buffer: FLUSH_BUFFERS, SHUTDOWN, POWER, PNP (`bt 0x8410200`).
 const NO_BUFFER_MAJORS: u32 = 0x0841_0200;
-/// ETHREAD.IoBoostCount, EPROCESS.Flags (PDB 19041).
-const THREAD_IO_BOOST_COUNT: u64 = 0x550;
-const PROCESS_FLAGS: u64 = 0x464;
-/// Bloco do IoSetCompletionRoutineEx (0x20 bytes, tag 'IoUs').
-const BLOCK_DEVICE: u64 = 0x00;
-const BLOCK_CONTEXT: u64 = 0x08;
-const BLOCK_ROUTINE: u64 = 0x10;
-const BLOCK_ON_ERROR: u64 = 0x18;
-const BLOCK_ON_SUCCESS: u64 = 0x19;
-const BLOCK_ON_CANCEL: u64 = 0x1A;
-const BLOCK_SIZE: u64 = 0x20;
+/// EPROCESS.Flags: prioridade de I/O desligada no processo.
+const PROCESS_NO_IO_PRIORITY: u32 = 0x10_0000;
 /// IoPropagateIrpExtension: tipos pedidos.
 const PROPAGATE_GENERIC: u32 = 0x01;
 const PROPAGATE_ACTIVITY_ID: u32 = 0x02;
+/// Slot do IopGetFileObjectExtension com o bloco do iniciador; o processo
+/// iniciador fica em +8 do bloco (layout privado do kernel, sem tipo nos
+/// símbolos).
+const INITIATOR_EXTENSION_SLOT: usize = 1;
+const INITIATOR_PROCESS: u64 = 8;
+
+/// Bloco do IoSetCompletionRoutineEx (0x20 bytes, tag 'IoUs'): privado do
+/// kernel, entregue como Context ao IopUnloadSafeCompletion.
+#[repr(C)]
+struct UnloadSafeBlock {
+    device: Field<u64>,
+    context: Field<u64>,
+    routine: Field<u64>,
+    on_error: Field<u8>,
+    on_success: Field<u8>,
+    on_cancel: Field<u8>,
+    _pad_1b: Reserved<0x5>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for UnloadSafeBlock {}
+
+const _: () = {
+    assert!(core::mem::size_of::<UnloadSafeBlock>() == 0x20);
+    assert!(offset_of!(UnloadSafeBlock, routine) == 0x10);
+    assert!(offset_of!(UnloadSafeBlock, on_error) == 0x18);
+    assert!(offset_of!(UnloadSafeBlock, on_cancel) == 0x1A);
+};
+
+/// IoGetNextIrpStackLocation.
+fn next_location(irp: &Irp) -> &'static IoStackLocation {
+    // SAFETY: a stack location abaixo da corrente pertence ao mesmo IRP.
+    unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get() - IoStackLocation::SIZE) }
+}
+
+/// IoGetCurrentIrpStackLocation.
+fn current_location(irp: &Irp) -> &'static IoStackLocation {
+    // SAFETY: CurrentStackLocation de um IRP vivo.
+    unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) }
+}
 
 /// IoSynchronousCallDriver(Device, Irp): KEVENT de notificação, rotina de
 /// conclusão na próxima stack location com Control = 0xE0; espera só quando o
@@ -90,14 +119,16 @@ pub fn synchronous_call(device: u64, packet: u64) -> Result<u32, KernelError> {
         return Ok(STATUS_INSUFFICIENT_RESOURCES);
     }
     dispatcher::initialize_event(event, 0, false);
-    let next = guest::read64(packet + irp::CURRENT_STACK_LOCATION) - stack::SIZE;
-    guest::write64(next + stack::COMPLETION_ROUTINE, routine);
-    guest::write64(next + stack::CONTEXT, event);
-    guest::write8(next + stack::CONTROL, INVOKE_ALWAYS);
+    // SAFETY: IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    let next = next_location(irp);
+    next.completion_routine.set(routine);
+    next.context.set(event);
+    next.control.set(INVOKE_ALWAYS);
     let mut status = io_manager::iof_call_driver(device, packet) as u32;
     if status == STATUS_PENDING {
         dispatcher::wait_for_single_object(event, 0, 0, false);
-        status = guest::read32(packet + irp::IO_STATUS);
+        status = irp.io_status.status.get() as u32;
     }
     guest::free_bytes(event);
     Ok(status)
@@ -107,13 +138,15 @@ pub fn synchronous_call(device: u64, packet: u64) -> Result<u32, KernelError> {
 /// IoCopyCurrentIrpStackLocationToNext (0x38 bytes, Control zerado) e a
 /// chamada síncrona.
 pub fn forward_irp_synchronously(device: u64, packet: u64) -> Result<bool, KernelError> {
-    if guest::read8(packet + irp::CURRENT_LOCATION) == 1 {
+    // SAFETY: IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    if irp.current_location.get() == 1 {
         return Ok(false);
     }
-    let current = guest::read64(packet + irp::CURRENT_STACK_LOCATION);
-    let next = current - stack::SIZE;
-    guest::write_bytes(next, &guest::read_bytes(current, stack::COMPLETION_ROUTINE as usize));
-    guest::write8(next + stack::CONTROL, 0);
+    let current = current_location(irp);
+    let next = next_location(irp);
+    guest::write_bytes(next.address(), &guest::read_bytes(current.address(), offset_of!(IoStackLocation, completion_routine)));
+    next.control.set(0);
     synchronous_call(device, packet)?;
     Ok(true)
 }
@@ -123,12 +156,15 @@ fn io_priority(thread: u64) -> u32 {
     if thread == 0 {
         return 0;
     }
-    let mut priority = (guest::read32(thread + kthread::CROSS_THREAD_FLAGS) >> 9) & 7;
-    let owner = guest::read64(thread + kthread::PROCESS);
-    if owner != 0 && guest::read32(owner + PROCESS_FLAGS) & 0x10_0000 != 0 {
+    // SAFETY: ETHREAD vivo (a thread corrente ou a do IRP).
+    let ethread = unsafe { Ethread::at(thread) };
+    let mut priority = ethread.thread_io_priority();
+    let owner = ethread.tcb.process.get();
+    // SAFETY: KTHREAD.Process de uma thread viva é um EPROCESS vivo.
+    if owner != 0 && unsafe { Eprocess::at(owner) }.flags.get() & PROCESS_NO_IO_PRIORITY != 0 {
         priority = 0;
     }
-    if priority < 2 && thread == process::get_current_thread() && guest::read32(thread + THREAD_IO_BOOST_COUNT) != 0 {
+    if priority < 2 && thread == process::get_current_thread() && ethread.io_boost_count.get() != 0 {
         priority = 2;
     }
     priority
@@ -137,16 +173,20 @@ fn io_priority(thread: u64) -> u32 {
 /// IoBuildAsynchronousFsdRequest(Major, Device, Buffer, Length,
 /// StartingOffset, IoStatusBlock): sem UserEvent e fora da fila da thread.
 pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, length: u32, offset: u64, io_status: u64) -> Result<u64, KernelError> {
-    let packet = irp_builder::allocate_irp(guest::read8(device + device_object::STACK_SIZE) as i8);
+    // SAFETY: DEVICE_OBJECT vivo do chamador.
+    let target = unsafe { DeviceObject::at(device) };
+    let packet = irp_builder::allocate_irp(target.stack_size.get());
     if packet == 0 {
         return Ok(0);
     }
+    // SAFETY: IRP recém-alocado.
+    let irp = unsafe { Irp::at(packet) };
     let thread = process::get_current_thread();
-    guest::write64(packet + irp::THREAD, thread);
-    let top = guest::read64(packet + irp::CURRENT_STACK_LOCATION) - stack::SIZE;
-    guest::write8(top + stack::MAJOR, major as u8);
+    irp.tail.overlay.thread.set(thread);
+    let top = next_location(irp);
+    top.major_function.set(major as u8);
     if !(major <= 0x1B && NO_BUFFER_MAJORS & (1 << major) != 0) {
-        let flags = guest::read32(device + device_object::FLAGS);
+        let flags = target.flags.get();
         if flags & DO_BUFFERED_IO != 0 {
             // O SystemBuffer é do I/O Manager (IRP_DEALLOCATE_BUFFER): sai do
             // mesmo pool que o IofCompleteRequest do OpenNT libera.
@@ -155,13 +195,13 @@ pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, leng
                 irp_builder::free_irp(packet);
                 return Ok(0);
             }
-            guest::write64(packet + irp::SYSTEM_BUFFER, system);
+            irp.associated_irp.system_buffer.set(system);
             if major == IRP_MJ_WRITE {
                 guest::write_bytes(system, &guest::read_bytes(buffer, length as usize));
-                guest::write32(packet + irp::FLAGS, IRP_BUFFERED_WRITE);
+                irp.flags.set(IRP_BUFFERED_WRITE);
             } else {
-                guest::write64(packet + irp::USER_BUFFER, buffer);
-                guest::write32(packet + irp::FLAGS, IRP_BUFFERED_READ);
+                irp.user_buffer.set(buffer);
+                irp.flags.set(IRP_BUFFERED_READ);
             }
         } else if flags & DO_DIRECT_IO != 0 {
             // IoAllocateMdl + IopProbeAndLockPages: a memória do OpenNT já é residente.
@@ -170,18 +210,21 @@ pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, leng
                 irp_builder::free_irp(packet);
                 return Ok(0);
             }
-            guest::write64(packet + irp::MDL_ADDRESS, descriptor);
+            irp.mdl_address.set(descriptor);
         } else {
-            guest::write64(packet + irp::USER_BUFFER, buffer);
+            irp.user_buffer.set(buffer);
         }
-        guest::write32(top + stack::READ_LENGTH, length);
+        // Parameters.Read e Parameters.Write têm o mesmo layout.
+        top.parameters.read.length.set(length);
         if offset != 0 {
-            guest::write64(top + stack::READ_OFFSET, guest::read64(offset));
+            // SAFETY: StartingOffset (PLARGE_INTEGER) do chamador de modo kernel.
+            let starting = unsafe { LargeInteger::at(offset) };
+            top.parameters.read.byte_offset.quad_part.set(starting.quad_part.get());
         }
     }
-    let flags = guest::read32(packet + irp::FLAGS) & IO_PRIORITY_MASK;
-    guest::write32(packet + irp::FLAGS, flags | ((io_priority(thread) + 1) << 17));
-    guest::write64(packet + irp::USER_IOSB, io_status);
+    let flags = irp.flags.get() & IO_PRIORITY_MASK;
+    irp.flags.set(flags | ((io_priority(thread) + 1) << 17));
+    irp.user_iosb.set(io_status);
     Ok(packet)
 }
 
@@ -191,7 +234,8 @@ pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, leng
 /// IrpExtension = CSL). ChargeQuota não muda nada: os IRPs do OpenNT saem da
 /// arena sem cota, como no IoAllocateIrp do OpenNT.
 pub fn allocate_irp_ex(device: u64, stack_size: u8, _charge_quota: bool) -> u64 {
-    let extension = device == u64::MAX || (device != 0 && guest::read32(device + device_object::FLAGS) & DO_DEVICE_IRP_REQUIRES_EXTENSION != 0);
+    // SAFETY: DEVICE_OBJECT vivo quando não é nulo nem -1.
+    let extension = device == u64::MAX || (device != 0 && unsafe { DeviceObject::at(device) }.flags.get() & DO_DEVICE_IRP_REQUIRES_EXTENSION != 0);
     if !extension {
         return irp_builder::allocate_irp(stack_size as i8);
     }
@@ -199,11 +243,13 @@ pub fn allocate_irp_ex(device: u64, stack_size: u8, _charge_quota: bool) -> u64 
     if packet == 0 {
         return 0;
     }
-    guest::write8(packet + irp::STACK_COUNT, guest::read8(packet + irp::STACK_COUNT).wrapping_sub(2));
-    guest::write8(packet + irp::CURRENT_LOCATION, guest::read8(packet + irp::CURRENT_LOCATION).wrapping_sub(2));
-    let current = guest::read64(packet + irp::CURRENT_STACK_LOCATION) - 2 * stack::SIZE;
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, current);
-    guest::write64(packet + IRP_EXTENSION, current);
+    // SAFETY: IRP recém-alocado.
+    let irp = unsafe { Irp::at(packet) };
+    irp.stack_count.set(irp.stack_count.get().wrapping_sub(2));
+    irp.current_location.set(irp.current_location.get().wrapping_sub(2));
+    let current = irp.tail.overlay.current_stack_location.get() - 2 * IoStackLocation::SIZE;
+    irp.tail.overlay.current_stack_location.set(current);
+    irp.irp_extension().set(current);
     packet
 }
 
@@ -225,44 +271,50 @@ pub fn set_completion_routine_ex(device: u64, packet: u64, routine: u64, context
     if wrapper == 0 {
         return Err(KernelError::new("IopUnloadSafeCompletion sem entrada nativa"));
     }
-    let block = guest::alloc_bytes(BLOCK_SIZE);
-    if block == 0 {
+    let address = guest::alloc_bytes(UnloadSafeBlock::SIZE);
+    if address == 0 {
         return Ok(STATUS_INSUFFICIENT_RESOURCES);
     }
-    guest::write64(block + BLOCK_DEVICE, device);
-    guest::write64(block + BLOCK_CONTEXT, context);
-    guest::write64(block + BLOCK_ROUTINE, routine);
-    guest::write8(block + BLOCK_ON_ERROR, invoke.error as u8);
-    guest::write8(block + BLOCK_ON_SUCCESS, invoke.success as u8);
-    guest::write8(block + BLOCK_ON_CANCEL, invoke.cancel as u8);
-    let next = guest::read64(packet + irp::CURRENT_STACK_LOCATION) - stack::SIZE;
-    guest::write64(next + stack::COMPLETION_ROUTINE, wrapper);
-    guest::write64(next + stack::CONTEXT, block);
-    guest::write8(next + stack::CONTROL, INVOKE_ALWAYS);
+    // SAFETY: alocação zerada do tamanho do bloco.
+    let block = unsafe { UnloadSafeBlock::at(address) };
+    block.device.set(device);
+    block.context.set(context);
+    block.routine.set(routine);
+    block.on_error.set(invoke.error as u8);
+    block.on_success.set(invoke.success as u8);
+    block.on_cancel.set(invoke.cancel as u8);
+    // SAFETY: IRP vivo do chamador.
+    let next = next_location(unsafe { Irp::at(packet) });
+    next.completion_routine.set(wrapper);
+    next.context.set(address);
+    next.control.set(INVOKE_ALWAYS);
     Ok(0)
 }
 
 /// IopUnloadSafeCompletion(DeviceObject, Irp, Block) — corpo da rotina
 /// privada: retém o dispositivo do bloco durante a rotina do driver; sem
 /// gatilho propaga o pending e devolve STATUS_PENDING/STATUS_SUCCESS.
-pub fn unload_safe_completion(device: u64, packet: u64, block: u64) -> Result<u32, KernelError> {
-    let status = guest::read32(packet + irp::IO_STATUS) as i32;
-    let selected = if status >= 0 { guest::read8(block + BLOCK_ON_SUCCESS) } else { guest::read8(block + BLOCK_ON_ERROR) };
-    let invoke = selected != 0 || (guest::read8(packet + irp::CANCEL) != 0 && guest::read8(block + BLOCK_ON_CANCEL) != 0);
+pub fn unload_safe_completion(device: u64, packet: u64, address: u64) -> Result<u32, KernelError> {
+    // SAFETY: IRP em conclusão e o bloco que set_completion_routine_ex alocou.
+    let (irp, block) = unsafe { (Irp::at(packet), UnloadSafeBlock::at(address)) };
+    let status = irp.io_status.status.get();
+    let selected = if status >= 0 { block.on_success.get() } else { block.on_error.get() };
+    let invoke = selected != 0 || (irp.cancel.get() != 0 && block.on_cancel.get() != 0);
     if !invoke {
         let mut result = 0;
-        if guest::read8(packet + IRP_PENDING_RETURNED) != 0 {
-            let current = guest::read64(packet + irp::CURRENT_STACK_LOCATION);
-            guest::write8(current + stack::CONTROL, guest::read8(current + stack::CONTROL) | SL_PENDING_RETURNED);
+        if irp.pending_returned.get() != 0 {
+            // IoMarkIrpPending.
+            let current = current_location(irp);
+            current.control.set(current.control.get() | SL_PENDING_RETURNED);
             result = STATUS_PENDING;
         }
-        guest::free_bytes(block);
+        guest::free_bytes(address);
         return Ok(result);
     }
-    let held = guest::read64(block + BLOCK_DEVICE);
+    let held = block.device.get();
     let referenced = held != 0 && device_objects::reference(held)?.is_some();
-    let result = native_call::call(guest::read64(block + BLOCK_ROUTINE), &[device, packet, guest::read64(block + BLOCK_CONTEXT)]) as u32;
-    guest::free_bytes(block);
+    let result = native_call::call(block.routine.get(), &[device, packet, block.context.get()]) as u32;
+    guest::free_bytes(address);
     if referenced {
         device_objects::dereference(held)?;
     }
@@ -271,9 +323,12 @@ pub fn unload_safe_completion(device: u64, packet: u64, block: u64) -> Result<u3
 
 /// IoIsOperationSynchronous(Irp).
 pub fn is_operation_synchronous(packet: u64) -> bool {
-    let flags = guest::read32(packet + irp::FLAGS);
-    let file = guest::read64(guest::read64(packet + irp::CURRENT_STACK_LOCATION) + stack::FILE_OBJECT);
-    let synchronous_file = file != 0 && guest::read32(file + FILE_OBJECT_FLAGS) & FO_SYNCHRONOUS_IO != 0;
+    // SAFETY: IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    let flags = irp.flags.get();
+    let file = current_location(irp).file_object.get();
+    // SAFETY: FileObject da stack location corrente, vivo durante o IRP.
+    let synchronous_file = file != 0 && unsafe { FileObject::at(file) }.flags.get() & FO_SYNCHRONOUS_IO != 0;
     let paging = flags & (IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO);
     if flags & IRP_SYNCHRONOUS_API == 0 && !synchronous_file && paging != IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO {
         return false;
@@ -306,30 +361,36 @@ pub fn propagate_irp_extension(source: u64, target: u64, flags: u32) {
 /// IoGetRequestorProcessId: UniqueProcessId (ULONG) do IoGetRequestorProcess.
 pub fn requestor_process_id(packet: u64) -> Result<u32, KernelError> {
     let owner = invoke_handler("IoGetRequestorProcess", &[packet])?;
-    Ok(if owner == 0 { 0 } else { guest::read32(owner + eprocess::UNIQUE_PROCESS_ID) })
+    // SAFETY: o IoGetRequestorProcess devolve um EPROCESS vivo ou NULL.
+    Ok(if owner == 0 { 0 } else { unsafe { Eprocess::at(owner) }.unique_process_id.get() as u32 })
 }
 
 /// IoGetRequestorSessionId(Irp, SessionId): sem Tail.Overlay.Thread grava -1
 /// e devolve STATUS_UNSUCCESSFUL; senão MmGetSessionIdEx do processo da
 /// thread com -1 -> 0 (`ps::session::query` faz o mesmo mapeamento).
 pub fn requestor_session_id(packet: u64, output: u64) -> u32 {
-    let thread = guest::read64(packet + irp::THREAD);
+    // SAFETY: IRP vivo e PULONG SessionId do chamador de modo kernel.
+    let (irp, session_id) = unsafe { (Irp::at(packet), Field::<u32>::at(output)) };
+    let thread = irp.tail.overlay.thread.get();
     if thread == 0 {
-        guest::write32(output, 0xFFFF_FFFF);
+        session_id.set(0xFFFF_FFFF);
         return STATUS_UNSUCCESSFUL;
     }
-    let owner = guest::read64(thread + kthread::PROCESS);
-    guest::write32(output, if owner == 0 { 0 } else { session::query(owner) });
+    // SAFETY: Tail.Overlay.Thread de um IRP vivo.
+    let owner = unsafe { Kthread::at(thread) }.process.get();
+    session_id.set(if owner == 0 { 0 } else { session::query(owner) });
     0
 }
 
 /// IoGetInitiatorProcess(FileObject): IopGetFileObjectExtension(Fo, 1) e o
 /// processo iniciador em +8 do bloco; FILE_OBJECT sem extensão -> NULL.
 pub fn initiator_process(file_object: u64) -> u64 {
-    let extension = guest::read64(file_object + FILE_OBJECT_EXTENSION);
+    // SAFETY: FILE_OBJECT vivo do chamador.
+    let extension = unsafe { FileObject::at(file_object) }.file_object_extension.get();
     if extension == 0 {
         return 0;
     }
-    let block = guest::read64(extension + 0x10);
-    if block == 0 { 0 } else { guest::read64(block + 8) }
+    // SAFETY: FileObjectExtension aponta para a _IOP_FILE_OBJECT_EXTENSION.
+    let block = unsafe { IopFileObjectExtension::at(extension) }.fo_ext_per_type_extension[INITIATOR_EXTENSION_SLOT].get();
+    if block == 0 { 0 } else { guest::read64(block + INITIATOR_PROCESS) }
 }

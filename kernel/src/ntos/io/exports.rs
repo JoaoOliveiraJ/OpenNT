@@ -294,8 +294,9 @@ fn io_build_partial_mdl(call: &Call) -> Result<u64, KernelError> {
 fn io_sizeof_work_item(_: &Call) -> Result<u64, KernelError> {
     Ok(work_items::work_item_size())
 }
+/// IoAllocateSfioStreamIdentifier(FileObject, Length, Signature, StreamIdentifier).
 fn io_allocate_sfio_stream_identifier(call: &Call) -> Result<u64, KernelError> {
-    sfio_stream::allocate_identifier(call.arg(2));
+    sfio_stream::allocate_identifier(call.arg(4));
     Ok(0)
 }
 /// Os IRPs nascem de código de kernel: o dono é o System.

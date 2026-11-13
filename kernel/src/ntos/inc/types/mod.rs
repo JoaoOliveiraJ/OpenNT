@@ -45,6 +45,7 @@ mod wdk;
 pub mod extra_test_p7;
 pub mod extra_se_cm;
 pub mod extra_ps_user;
+pub mod extra_io;
 
 pub use alpc::*;
 pub use cm::*;

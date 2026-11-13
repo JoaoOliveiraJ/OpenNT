@@ -12,8 +12,7 @@ use alloc::vec::Vec;
 use crate::ntos::alpc::transport::{Job, JobResult, Reply, Request, Service};
 use crate::ntos::ob::objects::port::Port;
 use crate::rtl::SpinLock;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::types::{Eprocess, NtStruct};
 
 /// Identidade do cliente da conexão.
 #[derive(Clone, Copy, Debug, Default)]
@@ -287,7 +286,8 @@ impl Service for Endpoint {
     }
 
     fn connect(&self, port: &Arc<Port>, data: &[u8], _request: Option<&[u8]>) -> Reply {
-        let process_id = if port.process_pointer != 0 { guest::read64(port.process_pointer + eprocess::UNIQUE_PROCESS_ID) } else { 0 };
+        // SAFETY: EPROCESS vivo do conector (retido pela porta).
+        let process_id = if port.process_pointer != 0 { unsafe { Eprocess::at(port.process_pointer) }.unique_process_id.get() } else { 0 };
         let token = port.token();
         self.connections.lock().insert(port.pointer, Connection { bindings: BTreeMap::new(), flows: BTreeMap::new(), context: RpcContext { process_id, token } });
         if data.is_empty() {

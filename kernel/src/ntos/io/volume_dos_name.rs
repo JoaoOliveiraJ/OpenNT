@@ -11,7 +11,8 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::irp;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, IoStatusBlock, Irp, MountmgrVolumePaths, NtStruct, UnicodeString};
 use crate::ntos::io::device as io;
 
 const MOUNT_MANAGER: &str = "\\Device\\MountPointManager";
@@ -32,10 +33,12 @@ fn query_device(device: u64, code: u32, input: u64, input_length: u32, output: u
     let mut status = io_manager::iof_call_driver(device, request) as u32;
     if status == 0x103 {
         dispatcher::wait_for_single_object(event, 0, 0, false);
-        status = guest::read32(status_block);
+        // SAFETY: IO_STATUS_BLOCK de rascunho dentro de `scratch`.
+        status = unsafe { IoStatusBlock::at(status_block) }.status.get() as u32;
     }
     // Rejeição imediata sem IoCompleteRequest deixa o buffer do construtor vivo.
-    let buffer = guest::read64(request + irp::SYSTEM_BUFFER);
+    // SAFETY: IRP construído aqui e ainda não liberado.
+    let buffer = unsafe { Irp::at(request) }.associated_irp.system_buffer.get();
     if buffer != 0 {
         guest::free_bytes(buffer);
     }
@@ -46,7 +49,8 @@ fn query_device(device: u64, code: u32, input: u64, input_length: u32, output: u
 /// O pool devolvido pertence ao chamador (ExFreePool); em erro o
 /// UNICODE_STRING fica intocado.
 pub fn volume_device_to_dos_name(device: u64, dos_name: u64) -> Result<u32, KernelError> {
-    let device_type = guest::read32(device + 0x48);
+    // SAFETY: DEVICE_OBJECT vivo do chamador.
+    let device_type = unsafe { DeviceObject::at(device) }.device_type.get();
     if ![2, 7, 31, 36].contains(&device_type) {
         return Ok(0xC000_000D);
     }
@@ -69,25 +73,28 @@ pub fn volume_device_to_dos_name(device: u64, dos_name: u64) -> Result<u32, Kern
         }
         // A abertura percorre o namespace e envia CREATE ao Mount Manager.
         let units: alloc::vec::Vec<u16> = MOUNT_MANAGER.encode_utf16().collect();
-        guest::write16(unicode_name, units.len() as u16 * 2);
-        guest::write16(unicode_name + 2, (units.len() as u16 + 1) * 2);
-        guest::write64(unicode_name + 8, name_buffer);
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(name_buffer + index as u64 * 2, *unit);
-        }
-        guest::write16(name_buffer + units.len() as u64 * 2, 0);
+        // SAFETY: UNICODE_STRING de rascunho dentro de `scratch`.
+        let name = unsafe { UnicodeString::at(unicode_name) };
+        name.length.set(units.len() as u16 * 2);
+        name.maximum_length.set((units.len() as u16 + 1) * 2);
+        name.buffer.set(name_buffer);
+        let text: alloc::vec::Vec<u8> = units.iter().chain(&[0]).flat_map(|unit| unit.to_le_bytes()).collect();
+        guest::write_bytes(name_buffer, &text);
         let status = io::get_device_object_pointer(unicode_name, 0x80, file_output, device_output)?;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        file = guest::read64(file_output);
-        let manager = guest::read64(device_output);
+        // SAFETY: células de saída dentro de `scratch`, preenchidas pelo IoGetDeviceObjectPointer.
+        let (file_cell, device_cell) = unsafe { (Field::<u64>::at(file_output), Field::<u64>::at(device_output)) };
+        file = file_cell.get();
+        let manager = device_cell.get();
         // A primeira consulta mede MultiSzLength (BUFFER_OVERFLOW esperado).
         let status = query_device(manager, 0x6D_0030, device_name, 512, path_header, 8, scratch);
         if status & 0x8000_0000 != 0 && status != BUFFER_OVERFLOW {
             return Ok(status);
         }
-        let size = guest::read32(path_header).wrapping_add(8);
+        // SAFETY: resposta de 8 bytes (MOUNTMGR_VOLUME_PATHS) dentro de `scratch`.
+        let size = unsafe { MountmgrVolumePaths::at(path_header) }.multi_sz_length.get().wrapping_add(8);
         if size > 0xFFFF {
             return Ok(0xC000_0206);
         }
@@ -100,14 +107,18 @@ pub fn volume_device_to_dos_name(device: u64, dos_name: u64) -> Result<u32, Kern
             return Ok(status);
         }
         // MULTI_SZ sem o cabeçalho e os dois terminadores, com um NUL publicado.
-        let length = guest::read16(allocation).wrapping_sub(4);
-        guest::write64(dos_name + 8, allocation);
-        guest::write16(dos_name, length);
-        guest::write16(dos_name + 2, length.wrapping_add(2));
-        for index in 0..length as u64 {
-            guest::write8(allocation + index, guest::read8(allocation + 4 + index));
-        }
-        guest::write16(allocation + (length & !1) as u64, 0);
+        // SAFETY: MOUNTMGR_VOLUME_PATHS completo devolvido pelo IOCTL.
+        let paths = unsafe { MountmgrVolumePaths::at(allocation) };
+        let length = (paths.multi_sz_length.get() as u16).wrapping_sub(4);
+        // SAFETY: UNICODE_STRING DosName do chamador de modo kernel.
+        let dos = unsafe { UnicodeString::at(dos_name) };
+        dos.buffer.set(allocation);
+        dos.length.set(length);
+        dos.maximum_length.set(length.wrapping_add(2));
+        // O MultiSz desce sobre o cabeçalho e ganha o terminador.
+        let name = guest::read_bytes(paths.multi_sz[0].address(), length as usize);
+        guest::write_bytes(allocation, &name);
+        guest::write_bytes(allocation + (length & !1) as u64, &[0; 2]);
         // A propriedade passou ao chamador.
         allocation = 0;
         Ok(0)

@@ -11,7 +11,10 @@ use crate::ntos::ke::dispatcher;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::io_stack_location as stack_location;
+use crate::ntos::inc::types::{Ethread, IoStackLocation, NtStruct};
+
+/// SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL.
+const INVOKE_ALWAYS: u8 = 0xE0;
 
 static COMPLETION: AtomicU64 = AtomicU64::new(0);
 
@@ -43,9 +46,11 @@ pub fn completion_routine() -> Result<u64, KernelError> {
 /// argumentos de cancelamento pré-alocados). `None` = concluído; senão o
 /// status da recusa síncrona.
 pub fn dispatch(device: u64, irp: u64, stack: u64, event: u64, routine: u64) -> Result<Option<u32>, KernelError> {
-    guest::write64(stack + stack_location::COMPLETION_ROUTINE, routine);
-    guest::write64(stack + stack_location::CONTEXT, event);
-    guest::write8(stack + stack_location::CONTROL, 0xE0);
+    // SAFETY: a próxima stack location do IRP recém-construído pelo chamador.
+    let location = unsafe { IoStackLocation::at(stack) };
+    location.completion_routine.set(routine);
+    location.context.set(event);
+    location.control.set(INVOKE_ALWAYS);
     let status = io_manager::iof_call_driver(device, irp) as u32;
     if status != 0x103 && dispatcher::read_state(event) == 0 {
         return Ok(Some(if status & 0x8000_0000 != 0 { status } else { 0xC000_0010 }));
@@ -53,7 +58,8 @@ pub fn dispatch(device: u64, irp: u64, stack: u64, event: u64, routine: u64) -> 
     if status == 0x103 {
         let thread = process::get_current_thread();
         while dispatcher::try_wait_objects(&[event], 1).is_none() {
-            if guest::read32(thread + 0x510) & 1 != 0 {
+            // SAFETY: a thread corrente.
+            if unsafe { Ethread::at(thread) }.terminated() != 0 {
                 cancel::irp(irp)?;
                 dispatcher::wait_for_single_object(event, 0, 0, false);
                 break;

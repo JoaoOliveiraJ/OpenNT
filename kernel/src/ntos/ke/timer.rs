@@ -84,6 +84,11 @@ pub fn cancel_timer(timer: u64) -> bool {
 /// Sinaliza vencidos e enfileira suas DPCs. Periódicos rearmam a partir do
 /// prazo anterior, pulando para agora + período se ficarem no passado.
 pub fn check_timers() {
+    // O papel do KeUpdateSystemTime antes da expiração: InterruptTime,
+    // SystemTime e TickCount da KUSER_SHARED_DATA acompanham o relógio que
+    // vence os timers (drivers medem tempo por KeQueryTickCount, que lê a
+    // página direto).
+    crate::ntos::mm::shared_user_data::update_system_times();
     let system_now = clock::system_time_100ns();
     let uptime_now = clock::uptime_100ns();
     let mut fired = Vec::new();

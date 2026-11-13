@@ -15,10 +15,31 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{io_stack_location, irp};
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, FileStandardInformation, IoStackLocation, IoStatusBlock, IopFileObjectExtension, Irp, LargeInteger, NtStruct, Vpb};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 
 const RESOURCE: u32 = 0xC000_009A;
+/// FILE_OBJECT.Flags.
+const FO_SYNCHRONOUS_IO: u32 = 0x02;
+const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
+/// Slot do IopGetFileObjectExtension com a dica de dispositivo do topo
+/// (TopDeviceObjectHint em +0 do bloco; layout privado do kernel).
+const DEVICE_HINT_EXTENSION_SLOT: usize = 1;
+/// FileStandardInformation e o IO_STATUS_BLOCK de rascunho logo depois.
+const SCRATCH_IO_STATUS: u64 = 24;
+
+/// FILE_OBJECT vivo do chamador.
+fn file_at(file: u64) -> &'static FileObject {
+    // SAFETY: os chamadores passam FILE_OBJECTs vivos (referenciados).
+    unsafe { FileObject::at(file) }
+}
+
+/// DEVICE_OBJECT vivo.
+fn device_at(device: u64) -> &'static DeviceObject {
+    // SAFETY: dispositivos alcançados por um FILE_OBJECT ou VPB vivos.
+    unsafe { DeviceObject::at(device) }
+}
 
 /// ZwQueryInformationFile por objeto: (file, classe, tamanho, buffer, retornado).
 pub type ObjectQuery = fn(u64, u32, u32, u64, u64) -> Result<u32, KernelError>;
@@ -33,14 +54,17 @@ pub fn set_object_query(query: ObjectQuery) {
 /// volume montado) e o topo da pilha, que uma extensão real de arquivo pode
 /// mandar parar num filtro abaixo do topo.
 pub fn related_device(file: u64) -> Result<u64, KernelError> {
-    let vpb = guest::read64(file + 0x10);
-    let mut device = if vpb != 0 { guest::read64(vpb + 8) } else { 0 };
+    let object = file_at(file);
+    let vpb = object.vpb.get();
+    // SAFETY: FileObject->Vpb de um arquivo vivo.
+    let mut device = if vpb != 0 { unsafe { Vpb::at(vpb) }.device_object.get() } else { 0 };
     if device == 0 {
-        device = guest::read64(file + 8);
-        if device != 0 && guest::read32(file + 0x50) & 0x800 == 0 {
-            let volume = guest::read64(device + 0x38);
+        device = object.device_object.get();
+        if device != 0 && object.flags.get() & FO_DIRECT_DEVICE_OPEN == 0 {
+            let volume = device_at(device).vpb.get();
             if volume != 0 {
-                let mounted = guest::read64(volume + 8);
+                // SAFETY: DeviceObject->Vpb de um dispositivo vivo.
+                let mounted = unsafe { Vpb::at(volume) }.device_object.get();
                 if mounted != 0 {
                     device = mounted;
                 }
@@ -50,8 +74,9 @@ pub fn related_device(file: u64) -> Result<u64, KernelError> {
     if device == 0 {
         return Ok(0);
     }
-    let extension = guest::read64(file + 0xD0);
-    let filter = if extension != 0 { guest::read64(extension + 0x10) } else { 0 };
+    let extension = object.file_object_extension.get();
+    // SAFETY: FileObjectExtension aponta para a _IOP_FILE_OBJECT_EXTENSION.
+    let filter = if extension != 0 { unsafe { IopFileObjectExtension::at(extension) }.fo_ext_per_type_extension[DEVICE_HINT_EXTENSION_SLOT].get() } else { 0 };
     let hint = if filter != 0 { guest::read64(filter) } else { 0 };
     let mut seen = BTreeSet::new();
     let mut top = device;
@@ -62,7 +87,7 @@ pub fn related_device(file: u64) -> Result<u64, KernelError> {
         if hint != 0 && top == hint {
             return Ok(top);
         }
-        let next = guest::read64(top + 0x18);
+        let next = device_at(top).attached_device.get();
         if next == 0 {
             return Ok(top);
         }
@@ -71,30 +96,29 @@ pub fn related_device(file: u64) -> Result<u64, KernelError> {
     Ok(device)
 }
 
-/// Trava síncrona do FILE_OBJECT (Busy em +0x74, Waiters em +0x70, Lock em
-/// +0x80) dentro de uma região crítica.
+/// Trava síncrona do FILE_OBJECT (Busy, Waiters e o KEVENT Lock) dentro de
+/// uma região crítica.
 pub fn acquire_file(file: u64) -> Result<(), KernelError> {
+    use core::sync::atomic::Ordering::SeqCst;
     critical_region::enter_critical()?;
-    if guest::compare_exchange32(file + 0x74, 0, 1)? == 0 {
+    let object = file_at(file);
+    if object.busy.atomic().compare_exchange(0, 1, SeqCst, SeqCst).is_ok() {
         return Ok(());
     }
     // Waiters muda por InterlockedIncrement/InterlockedDecrement.
-    let waiters = guest::atomic_u32(file + 0x70);
-    waiters.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let result = (|| -> Result<(), KernelError> {
-        while guest::compare_exchange32(file + 0x74, 0, 1)? != 0 {
-            dispatcher::wait_for_single_object(file + 0x80, 0, 0, false);
-        }
-        Ok(())
-    })();
-    waiters.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-    result
+    object.waiters.atomic().fetch_add(1, SeqCst);
+    while object.busy.atomic().compare_exchange(0, 1, SeqCst, SeqCst).is_err() {
+        dispatcher::wait_for_single_object(object.lock.address(), 0, 0, false);
+    }
+    object.waiters.atomic().fetch_sub(1, SeqCst);
+    Ok(())
 }
 
 pub fn release_file(file: u64) -> Result<(), KernelError> {
-    guest::write32(file + 0x74, 0);
-    if guest::read32(file + 0x70) != 0 {
-        dispatcher::set_event(file + 0x80);
+    let object = file_at(file);
+    object.busy.atomic().store(0, core::sync::atomic::Ordering::SeqCst);
+    if object.waiters.get() != 0 {
+        dispatcher::set_event(object.lock.address());
     }
     critical_region::leave_critical()
 }
@@ -118,20 +142,21 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
     let mut referenced = false;
     let mut old_hard_error = None;
     let result = (|| -> Result<u32, KernelError> {
+        let object = file_at(file);
         if !size_query {
             referenced = file_objects::reference(file)?.is_some();
-            if guest::read32(file + 0x50) & 2 != 0 {
+            if object.flags.get() & FO_SYNCHRONOUS_IO != 0 {
                 acquire_file(file)?;
                 locked = true;
-                dispatcher::clear_event(file + 0x98);
+                dispatcher::clear_event(object.event.address());
             }
         }
-        let event = if locked { file + 0x98 } else { scratch };
-        let io_status = scratch + 24;
+        let event = if locked { object.event.address() } else { scratch };
+        let io_status = scratch + SCRATCH_IO_STATUS;
         if !locked {
             dispatcher::initialize_event(event, if size_query { 0 } else { 1 }, false);
         }
-        let count = match guest::read8(device + 0x4C) {
+        let count = match device_at(device).stack_size.get() as u8 {
             0 => 1,
             count => count as u32,
         };
@@ -140,15 +165,17 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
             return Ok(RESOURCE);
         }
         irp_builder::build(packet, &BuildOptions { major: if volume_query { 10 } else { 5 }, minor: 0, buffer, buffer_length: length, device_object: device, stack_count: count, file_object: file, user_event: event, user_iosb: io_status, thread: process::get_current_thread(), requestor_mode, ..Default::default() });
-        let stack = irp_builder::first_stack_location(packet, count);
+        // SAFETY: IRP recém-construído e o slot do topo dele.
+        let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, count))) };
         let extended = !size_query && requestor_mode == 0 && class == 75;
-        guest::write32(stack + 0x10, if extended { 71 } else { class });
+        // Parameters.QueryFile.FileInformationClass / QueryVolume.FsInformationClass.
+        stack.parameters.query_file.file_information_class.set(crate::ntos::inc::types::FileInformationClass(if extended { 71 } else { class } as i32));
         if extended {
-            guest::write8(stack + io_stack_location::FLAGS, 1);
+            stack.flags.set(1);
         }
-        guest::write32(packet + irp::FLAGS, if size_query { 0x42 } else if locked { 0x10 } else { 0x14 });
+        irp.flags.set(if size_query { 0x42 } else if locked { 0x10 } else { 0x14 });
         if locked {
-            guest::write8(packet + 0x47, guest::read8(packet + 0x47) | 2);
+            irp.allocation_flags.set(irp.allocation_flags.get() | 2);
         }
         if size_query {
             old_hard_error = Some(thread_io::set_hard_error_mode(0)?);
@@ -157,7 +184,9 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
         if status == 0x103 {
             dispatcher::wait_for_single_object(event, 0, 0, false);
         }
-        let completed = guest::read32(io_status) as i32;
+        // SAFETY: IO_STATUS_BLOCK de rascunho dentro de `scratch`.
+        let iosb = unsafe { IoStatusBlock::at(io_status) };
+        let completed = iosb.status.get();
         let result = if size_query {
             if status < 0 {
                 status
@@ -170,10 +199,11 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
             status
         };
         if locked {
-            guest::write32(file + 0x38, completed as u32);
+            object.final_status.set(completed);
         }
         if return_length != 0 {
-            guest::write32(return_length, guest::read32(io_status + 8));
+            // SAFETY: PULONG ReturnLength do chamador de modo kernel.
+            unsafe { Field::<u32>::at(return_length) }.set(iosb.information.get() as u32);
         }
         Ok(result as u32)
     })();
@@ -202,27 +232,34 @@ pub fn get_size(file: u64, output: u64) -> Result<u32, KernelError> {
     }
     let result = (|| -> Result<u32, KernelError> {
         let device = related_device(file)?;
+        let size = FileStandardInformation::SIZE as u32;
         let status = if device != 0 {
-            let driver = guest::read64(device + 8);
-            let fast = if driver != 0 { guest::read64(driver + 0x50) } else { 0 };
-            let routine = if fast != 0 { guest::read64(fast + 0x28) } else { 0 };
-            let handled = routine != 0 && native_call::call(routine, &[file, 1, scratch, scratch + 24, device]) & 0xFF != 0;
+            let driver = device_at(device).driver_object.get();
+            // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
+            let fast = if driver != 0 { unsafe { DriverObject::at(driver) }.fast_io_dispatch.get() } else { 0 };
+            // SAFETY: DriverObject->FastIoDispatch do driver vivo.
+            let routine = if fast != 0 { unsafe { FastIoDispatch::at(fast) }.fast_io_query_standard_info.get() } else { 0 };
+            let handled = routine != 0 && native_call::call(routine, &[file, 1, scratch, scratch + SCRATCH_IO_STATUS, device]) & 0xFF != 0;
             if handled {
-                guest::read32(scratch + 24)
+                // SAFETY: IO_STATUS_BLOCK de rascunho dentro de `scratch`.
+                unsafe { IoStatusBlock::at(scratch + SCRATCH_IO_STATUS) }.status.get() as u32
             } else {
-                query_native(file, 5, 24, scratch, 0, true, false, 0)?
+                query_native(file, 5, size, scratch, 0, true, false, 0)?
             }
         } else {
             let query = (*OBJECT_QUERY.lock()).ok_or_else(|| KernelError::new("kernel file services unavailable"))?;
-            query(file, 5, 24, scratch, scratch + 24)?
+            query(file, 5, size, scratch, scratch + SCRATCH_IO_STATUS)?
         };
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
-        if guest::read8(scratch + 21) != 0 {
+        // SAFETY: FILE_STANDARD_INFORMATION de rascunho no início de `scratch`.
+        let standard = unsafe { FileStandardInformation::at(scratch) };
+        if standard.directory.get() != 0 {
             return Ok(0xC000_00BA);
         }
-        guest::write64(output, guest::read64(scratch + 8));
+        // SAFETY: PLARGE_INTEGER FileSize do chamador de modo kernel.
+        unsafe { LargeInteger::at(output) }.quad_part.set(standard.end_of_file.quad_part.get());
         Ok(status)
     })();
     guest::free_bytes(scratch);

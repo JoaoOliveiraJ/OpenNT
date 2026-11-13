@@ -20,14 +20,17 @@ use crate::ntos::rtl::resource::memory as protected;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::io::file::zw as zw_files;
+use crate::ntos::inc::types::{Kpcr, Kthread, NtStruct, ObjectAttributes, SecurityQualityOfService, UnicodeString};
+use core::mem::offset_of;
 
 /// NtDeleteFile incrementa OtherOperationCount antes do OB, mesmo quando os
 /// atributos não permitem completar a abertura.
 fn count_operation() {
-    let counter = process::get_current_thread() + 0x390;
-    guest::write64(counter, guest::read64(counter).wrapping_add(1));
-    let processor = pcr::get_pcr_address() + 0x2EE4;
-    guest::write32(processor, guest::read32(processor).wrapping_add(1));
+    // SAFETY: a thread corrente e o KPCR da CPU corrente.
+    let (thread, processor) = unsafe { (Kthread::at(process::get_current_thread()), Kpcr::at(pcr::get_pcr_address())) };
+    let counter = &thread.other_operation_count;
+    counter.set(counter.get().wrapping_add(1));
+    processor.prcb.io_other_operation_count.atomic().fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Separadores inválidos sem normalizar; "." e ".." chegam ao volume.
@@ -99,23 +102,25 @@ pub fn remove(attributes: u64) -> Result<u32, KernelError> {
     let mut captured_name = 0u64;
     let mut root_reference: Option<security_handles::Retained> = None;
     let result = (|| -> Result<u32, KernelError> {
-        if protected::read32(attributes)? != 48 {
+        // OBJECT_ATTRIBUTES do chamador, lidos com as leituras protegidas.
+        let field = |offset: usize| attributes + offset as u64;
+        if protected::read32(field(offset_of!(ObjectAttributes, length)))? != ObjectAttributes::SIZE as u32 {
             return Ok(0xC000_000D);
         }
-        let root = protected::read64(attributes + 8)?;
-        let flags = protected::read32(attributes + 24)?;
+        let root = protected::read64(field(offset_of!(ObjectAttributes, root_directory)))?;
+        let flags = protected::read32(field(offset_of!(ObjectAttributes, attributes)))?;
         if flags & 0xFFFE_E00D != 0 {
             return Ok(0xC000_000D);
         }
-        let descriptor = protected::read64(attributes + 16)?;
-        let security = protected::read64(attributes + 32)?;
-        let quality = protected::read64(attributes + 40)?;
+        let descriptor = protected::read64(field(offset_of!(ObjectAttributes, object_name)))?;
+        let security = protected::read64(field(offset_of!(ObjectAttributes, security_descriptor)))?;
+        let quality = protected::read64(field(offset_of!(ObjectAttributes, security_quality_of_service)))?;
         let (mut impersonation_level, mut tracking_mode) = (0, 0);
         if quality != 0 {
             // Length é lido, mas o OB usa o próprio tamanho 12.
-            protected::read32(quality)?;
-            impersonation_level = protected::read32(quality + 4)?;
-            tracking_mode = protected::read32(quality + 8)? & 255;
+            protected::read32(quality + offset_of!(SecurityQualityOfService, length) as u64)?;
+            impersonation_level = protected::read32(quality + offset_of!(SecurityQualityOfService, impersonation_level) as u64)?;
+            tracking_mode = protected::read32(quality + offset_of!(SecurityQualityOfService, context_tracking_mode) as u64)? & 255;
         }
         if security != 0 {
             if let Err(status) = callback_security::capture(security) {
@@ -131,8 +136,9 @@ pub fn remove(attributes: u64) -> Result<u32, KernelError> {
         if descriptor == 0 {
             return Ok(if root != 0 { 0xC000_0033 } else { 0xC000_003B });
         }
-        let length = protected::read32(descriptor)? & 0xFFFF;
-        let buffer = protected::read64(descriptor + 8)?;
+        // UNICODE_STRING.Length (os 16 bits baixos do primeiro dword) e Buffer.
+        let length = protected::read32(descriptor + offset_of!(UnicodeString, length) as u64)? & 0xFFFF;
+        let buffer = protected::read64(descriptor + offset_of!(UnicodeString, buffer) as u64)?;
         if length & 1 != 0 || length == 0xFFFE {
             return Ok(0xC000_0033);
         }
@@ -144,11 +150,10 @@ pub fn remove(attributes: u64) -> Result<u32, KernelError> {
                 return Ok(0xC000_009A);
             }
             for offset in (0..length as u64).step_by(2) {
-                let unit = protected::read16(buffer + offset)?;
-                guest::write16(captured_name + offset, unit);
-                units.push(unit);
+                units.push(protected::read16(buffer + offset)?);
             }
-            guest::write16(captured_name + length as u64, 0);
+            let bytes: Vec<u8> = units.iter().chain(&[0]).flat_map(|unit| unit.to_le_bytes()).collect();
+            guest::write_bytes(captured_name, &bytes);
         }
         let name = String::from_utf16_lossy(&units);
         let mut start = object_manager::ROOT;

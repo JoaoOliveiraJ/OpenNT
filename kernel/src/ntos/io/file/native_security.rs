@@ -17,13 +17,32 @@ use crate::ntos::ps::process;
 use crate::ntos::se::query_descriptor::{self, QueryResult};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{irp, kthread};
+use crate::ntos::inc::types::{DeviceObject, FileObject, IoStackLocation, IoStatusBlock, Irp, Kpcr, Kthread, Mdl, NtStruct, SecurityDescriptorRelative};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+/// SE_SELF_RELATIVE.
+const SE_SELF_RELATIVE: u32 = 0x8000;
+/// FILE_OBJECT.Flags.
+const FO_SYNCHRONOUS_IO: u32 = 0x02;
+const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
+/// DEVICE_OBJECT.Characteristics: FILE_DEVICE_SECURE_OPEN.
+const FILE_DEVICE_SECURE_OPEN: u32 = 0x100;
+/// IO_STATUS_BLOCK de rascunho depois do KEVENT.
+const SCRATCH_IO_STATUS: u64 = 24;
+
+fn file_at(file: u64) -> &'static FileObject {
+    // SAFETY: FILE_OBJECT vivo (referenciado pelo chamador).
+    unsafe { FileObject::at(file) }
+}
+
+fn device_at(device: u64) -> &'static DeviceObject {
+    // SAFETY: dispositivo vivo alcançado por um FILE_OBJECT.
+    unsafe { DeviceObject::at(device) }
+}
 
 /// SeAssignWorldSecurityDescriptor: o fallback para driver sem segurança e
 /// dispositivo sem FILE_DEVICE_SECURE_OPEN; o tamanho necessário é sempre 44.
@@ -32,35 +51,38 @@ pub fn query_unsupported_file(information: u32, buffer: u64, capacity: u32) -> Q
     if capacity < needed as u32 {
         return QueryResult { status: STATUS_BUFFER_TOO_SMALL, needed, information };
     }
-    for offset in 0..20 {
-        guest::write8(buffer + offset, 0);
-    }
-    guest::write8(buffer, 1);
-    let mut cursor = 20u32;
+    guest::write_bytes(buffer, &[0; SecurityDescriptorRelative::SIZE as usize]);
+    // SAFETY: buffer do chamador de modo kernel com capacidade conferida.
+    let descriptor = unsafe { SecurityDescriptorRelative::at(buffer) };
+    descriptor.revision.set(1);
+    let mut cursor = SecurityDescriptorRelative::SIZE as u32;
+    // S-1-1-0 (World).
     let world = [1u8, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-    for (bit, header) in [(1u32, 4u64), (2, 8)] {
+    for (bit, offset) in [(1u32, &descriptor.owner), (2, &descriptor.group)] {
         if information & bit == 0 {
             continue;
         }
-        guest::write32(buffer + header, cursor);
+        offset.set(cursor);
         guest::write_bytes(buffer + cursor as u64, &world);
         cursor += world.len() as u32;
     }
-    guest::write16(buffer + 2, (0x8000 | (information & 4) | ((information & 8) << 1)) as u16);
+    descriptor.control.set((SE_SELF_RELATIVE | (information & 4) | ((information & 8) << 1)) as u16);
     QueryResult { status: 0, needed, information }
 }
 
 /// O descritor do DEVICE_OBJECT (+0x110); ausência continua ausência.
 pub fn query_device(device: u64, information: u32, buffer: u64, capacity: u32) -> QueryResult {
-    let descriptor = guest::read64(device + 0x110);
+    let descriptor = device_at(device).security_descriptor.get();
     query_descriptor::query_descriptor(query_descriptor::read_descriptor(descriptor).as_ref(), information, buffer, capacity)
 }
 
 /// MDLs anexados pelo driver pertencem ao IRP concluído.
 fn release_request_descriptors(request: u64) -> Result<(), KernelError> {
-    let mut descriptor = guest::read64(request + irp::MDL_ADDRESS);
+    // SAFETY: IRP concluído ainda de posse do chamador.
+    let mut descriptor = unsafe { Irp::at(request) }.mdl_address.get();
     while descriptor != 0 {
-        let next = guest::read64(descriptor);
+        // SAFETY: cadeia de MDLs (MDL.Next) anexada ao IRP.
+        let next = unsafe { Mdl::at(descriptor) }.next.get();
         if kernel_pool::owns(descriptor) {
             let _ = kernel_pool::free(descriptor, None);
         } else if data_pool::owns(descriptor) {
@@ -83,7 +105,7 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
         return Ok(QueryResult { status: STATUS_INSUFFICIENT_RESOURCES, needed: capacity as usize, information });
     }
     let thread = process::get_current_thread();
-    let file_flags = guest::read32(file + 0x50);
+    let file_flags = file_at(file).flags.get();
     let mut request = 0u64;
     let mut file_references = 0;
     let mut locked = false;
@@ -99,7 +121,7 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
             return Err(KernelError::new("query-security file has no owner"));
         }
         file_references += 1;
-        if file_flags & 2 != 0 {
+        if file_flags & FO_SYNCHRONOUS_IO != 0 {
             file_information::acquire_file(file)?;
             locked = true;
             if file_objects::reference(file)?.is_none() {
@@ -108,14 +130,14 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
             file_references += 1;
         }
         if file_flags & 0x400_0000 == 0 {
-            dispatcher::clear_event(file + 0x98);
+            dispatcher::clear_event(file_at(file).event.address());
         }
-        let event = if locked { file + 0x98 } else { scratch };
-        let status_block = scratch + 24;
+        let event = if locked { file_at(file).event.address() } else { scratch };
+        let status_block = scratch + SCRATCH_IO_STATUS;
         if !locked {
             dispatcher::initialize_event(event, 1, false);
         }
-        let stack_count = guest::read8(device + 0x4C) as u32;
+        let stack_count = device_at(device).stack_size.get() as u8 as u32;
         if stack_count == 0 {
             return Err(KernelError::new("query-security device has no IRP stack"));
         }
@@ -124,12 +146,13 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
             return Ok(QueryResult { status: STATUS_INSUFFICIENT_RESOURCES, needed: capacity as usize, information });
         }
         irp_builder::build(request, &BuildOptions { major: 0x14, minor: 0, stack_count, device_object: device, file_object: file, user_buffer: buffer, user_iosb: status_block, user_event: if locked { 0 } else { event }, requestor_mode, thread, ..Default::default() });
-        let stack = irp_builder::first_stack_location(request, stack_count);
-        guest::write32(stack + 8, information);
-        guest::write32(stack + 16, capacity);
-        guest::write32(request + irp::FLAGS, if locked { 0 } else { 4 });
+        // SAFETY: IRP recém-construído e o slot do topo dele.
+        let (irp, stack) = unsafe { (Irp::at(request), IoStackLocation::at(irp_builder::first_stack_location(request, stack_count))) };
+        stack.parameters.query_security.security_information.set(information);
+        stack.parameters.query_security.length.set(capacity);
+        irp.flags.set(if locked { 0 } else { 4 });
         if locked {
-            guest::write8(request + 0x47, 2);
+            irp.allocation_flags.set(2);
         }
         if process::reference_thread(thread).is_none() {
             return Err(KernelError::new("query-security thread has no owner"));
@@ -137,11 +160,15 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
         thread_retained = true;
         thread_requests::insert(request, thread)?;
         linked.store(true, Ordering::Release);
-        let counter = thread + kthread::OTHER_OPERATION_COUNT;
-        guest::write64(counter, guest::read64(counter).wrapping_add(1));
+        // IopUpdateOtherOperationCount: contadores da própria thread e da CPU.
+        // SAFETY: a thread corrente.
+        let counter = &unsafe { Kthread::at(thread) }.other_operation_count;
+        counter.set(counter.get().wrapping_add(1));
         let processor = pcr::get_pcr_address();
         if processor != 0 {
-            guest::write32(processor + 0x2EE4, guest::read32(processor + 0x2EE4).wrapping_add(1));
+            // SAFETY: KPCR da CPU corrente.
+            let count = &unsafe { Kpcr::at(processor) }.prcb.io_other_operation_count;
+            count.atomic().fetch_add(1, Ordering::Relaxed);
         }
         {
             let (completed, completion, completion_length, linked) = (completed.clone(), completion.clone(), completion_length.clone(), linked.clone());
@@ -153,9 +180,11 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
                 completion_length.store(information, Ordering::Release);
                 let _ = thread_requests::remove(request, thread);
                 linked.store(false, Ordering::Release);
-                guest::write32(status_block, status as u32);
-                guest::write64(status_block + 8, information);
-                guest::write32(file + 0x38, status as u32);
+                // SAFETY: IO_STATUS_BLOCK de rascunho, vivo até o pedido terminar.
+                let iosb = unsafe { IoStatusBlock::at(status_block) };
+                iosb.status.set(status);
+                iosb.information.set(information);
+                file_at(file).final_status.set(status);
                 dispatcher::set_event(event);
             }));
         }
@@ -210,12 +239,13 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
 /// Volume sem nome e abertura direta usam o dispositivo base; arquivos
 /// normais seguem o dispositivo relacionado e o fallback do Windows.
 pub fn query_file(file: u64, information: u32, buffer: u64, capacity: u32, requestor_mode: u8) -> Result<QueryResult, KernelError> {
-    let base_device = guest::read64(file + 8);
+    let object = file_at(file);
+    let base_device = object.device_object.get();
     if base_device == 0 {
         return Err(KernelError::new("native file security requires a device"));
     }
-    let direct = guest::read32(file + 0x50) & 0x800 != 0;
-    let volume_open = guest::read16(file + 0x58) == 0 && guest::read64(file + 0x40) == 0;
+    let direct = object.flags.get() & FO_DIRECT_DEVICE_OPEN != 0;
+    let volume_open = object.file_name.length.get() == 0 && object.related_file_object.get() == 0;
     if direct || volume_open {
         return Ok(query_device(base_device, information, buffer, capacity));
     }
@@ -224,5 +254,5 @@ pub fn query_file(file: u64, information: u32, buffer: u64, capacity: u32, reque
     if result.status != STATUS_INVALID_DEVICE_REQUEST {
         return Ok(result);
     }
-    Ok(if guest::read32(device + 0x34) & 0x100 != 0 { query_device(device, information, buffer, capacity) } else { query_unsupported_file(information, buffer, capacity) })
+    Ok(if device_at(device).characteristics.get() & FILE_DEVICE_SECURE_OPEN != 0 { query_device(device, information, buffer, capacity) } else { query_unsupported_file(information, buffer, capacity) })
 }

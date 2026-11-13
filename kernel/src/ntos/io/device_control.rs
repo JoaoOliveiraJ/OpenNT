@@ -16,10 +16,26 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{io_stack_location, irp};
+use crate::ntos::inc::types::{DeviceObject, DriverObject, Ethread, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, Irp, Kthread, NtStruct};
 use crate::ntos::io::irp_builder::{self, BuildOptions, DeviceControl};
 
 const TAG: u32 = 0x7443_6F49;
+/// IO_STATUS_BLOCK no bloco de argumentos (88 bytes) do FastIoDeviceControl.
+const FAST_IO_STATUS: u64 = 72;
+/// FAST_IO_DISPATCH até FastIoDeviceControl inclusive.
+const FAST_IO_DEVICE_CONTROL_SIZE: u32 = 0x58;
+
+/// FILE_OBJECT vivo (referenciado pelo handle do pedido).
+fn file_at(file: u64) -> &'static FileObject {
+    // SAFETY: o pedido mantém a referência do FILE_OBJECT.
+    unsafe { FileObject::at(file) }
+}
+
+/// DEVICE_OBJECT vivo (o relacionado ao arquivo).
+fn device_at(device: u64) -> &'static DeviceObject {
+    // SAFETY: dispositivo relacionado a um FILE_OBJECT vivo.
+    unsafe { DeviceObject::at(device) }
+}
 
 fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: u32, access: u32) -> Result<u32, KernelError> {
     let (file, output, output_length, method) = {
@@ -27,20 +43,25 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
         (r.file, r.output, r.output_length, r.method)
     };
     // FastIoDeviceControl (FAST_IO_DISPATCH+0x50).
-    let driver = guest::read64(device + 8);
-    let fast_table = if driver != 0 { guest::read64(driver + 0x50) } else { 0 };
-    let fast = if fast_table != 0 && guest::read32(fast_table) >= 0x58 { guest::read64(fast_table + 0x50) } else { 0 };
+    let driver = device_at(device).driver_object.get();
+    // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
+    let fast_table = if driver != 0 { unsafe { DriverObject::at(driver) }.fast_io_dispatch.get() } else { 0 };
+    // SAFETY: DriverObject->FastIoDispatch do driver vivo.
+    let dispatch = (fast_table != 0).then(|| unsafe { FastIoDispatch::at(fast_table) });
+    let fast = dispatch.filter(|dispatch| dispatch.size_of_fast_io_dispatch.get() >= FAST_IO_DEVICE_CONTROL_SIZE).map_or(0, |dispatch| dispatch.fast_io_device_control.get());
     if fast != 0 {
         let arguments = guest::alloc_bytes(88);
         if arguments == 0 {
             return Ok(0xC000_009A);
         }
-        let handled = native_call::call(fast, &[file, 1, input, input_length as u64, output, output_length as u64, code as u64, arguments + 72, device]) & 0xFF != 0;
+        // SAFETY: IO_STATUS_BLOCK dentro do bloco de argumentos recém-alocado.
+        let iosb = unsafe { IoStatusBlock::at(arguments + FAST_IO_STATUS) };
+        let handled = native_call::call(fast, &[file, 1, input, input_length as u64, output, output_length as u64, code as u64, iosb.address(), device]) & 0xFF != 0;
         let result = if handled {
             let status = {
                 let mut r = request.lock();
-                r.status = guest::read32(arguments + 72);
-                r.information = guest::read64(arguments + 80);
+                r.status = iosb.status.get() as u32;
+                r.information = iosb.information.get();
                 r.done = true;
                 r.status
             };
@@ -53,7 +74,7 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
             return Ok(status);
         }
     }
-    let count = match guest::read8(device + 0x4C) {
+    let count = match device_at(device).stack_size.get() as u8 {
         0 => 1,
         count => count as u32,
     };
@@ -78,9 +99,9 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
         if system == 0 {
             return Ok(0xC000_009A);
         }
-        for index in 0..size as u64 {
-            guest::write8(system + index, if input != 0 && index < input_length as u64 { guest::read8(input + index) } else { 0 });
-        }
+        let mut bytes = if input != 0 { guest::read_bytes(input, (input_length as usize).min(size as usize)) } else { alloc::vec::Vec::new() };
+        bytes.resize(size as usize, 0);
+        guest::write_bytes(system, &bytes);
         request.lock().system = system;
     }
     if (method == 1 || method == 2) && output_length != 0 && !file_request::fill_mdl(request, method == 2)? {
@@ -106,12 +127,13 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
         ioctl: Some(DeviceControl { code, input_length, type3_buffer: if method == 3 { input } else { 0 } }),
         ..Default::default()
     });
-    let stack = irp_builder::first_stack_location(packet, count);
-    guest::write8(stack + io_stack_location::FLAGS, ((access & 1) | ((access & 2) << 1)) as u8);
-    guest::write64(packet + irp::MDL_ADDRESS, mdl_address);
-    guest::write64(packet + 0x58, apc_routine);
-    guest::write64(packet + 0x60, apc_context);
-    guest::write32(packet + irp::FLAGS, if system != 0 { if method == 0 && output_length != 0 { 0x70 } else { 0x30 } } else { 0 });
+    // SAFETY: IRP recém-construído e o slot do topo dele.
+    let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, count))) };
+    stack.flags.set(((access & 1) | ((access & 2) << 1)) as u8);
+    irp.mdl_address.set(mdl_address);
+    irp.overlay.asynchronous_parameters.user_apc_routine.set(apc_routine);
+    irp.overlay.asynchronous_parameters.user_apc_context.set(apc_context);
+    irp.flags.set(if system != 0 { if method == 0 && output_length != 0 { 0x70 } else { 0x30 } } else { 0 });
     let completed = request.clone();
     io_manager::manage_completion(packet, Box::new(move |status, information| {
         {
@@ -146,7 +168,8 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
         return Err(KernelError::new("ZwDeviceIoControlFile requires PASSIVE_LEVEL"));
     }
     let thread = process::get_current_thread();
-    if guest::read16(thread + 0x1E6) != 0 {
+    // SAFETY: a thread corrente.
+    if unsafe { Kthread::at(thread) }.special_apc_disable.get() != 0 {
         return Err(KernelError::new("ZwDeviceIoControlFile requires special APCs enabled"));
     }
     let selected = match query_file::resolve(handle & !3, false) {
@@ -157,7 +180,7 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
         return Ok(0xC000_0010);
     }
     let file = selected.pointer;
-    if guest::read64(file + 0xB0) != 0 && apc_routine & !1 != 0 {
+    if file_at(file).completion_context.get() != 0 && apc_routine & !1 != 0 {
         return Ok(0xC000_000D);
     }
     let device = file_information::related_device(file)?;
@@ -166,7 +189,7 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
     }
     let request = file_request::new(file, thread, None, 0, io_status, output, output_length, apc_routine, apc_context, false);
     request.lock().method = code & 3;
-    let synchronous = guest::read32(file + 0x50) & 2 != 0;
+    let synchronous = file_at(file).flags.get() & 2 != 0;
     let mut locked = false;
     let result = (|| -> Result<u32, KernelError> {
         if file_objects::reference(file)?.is_none() {
@@ -186,7 +209,7 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
             file_information::acquire_file(file)?;
             locked = true;
         }
-        dispatcher::clear_event(file + 0x98);
+        dispatcher::clear_event(file_at(file).event.address());
         if apc_routine != 0 {
             let routine = file_request::free_routine()?;
             if routine == 0 {
@@ -213,7 +236,8 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
                 if request.lock().finished {
                     break;
                 }
-                if guest::read32(thread + 0x510) & 1 != 0 {
+                // SAFETY: a thread corrente.
+                if unsafe { Ethread::at(thread) }.terminated() != 0 {
                     let packet = request.lock().irp;
                     if packet != 0 {
                         let _ = cancel::irp(packet);

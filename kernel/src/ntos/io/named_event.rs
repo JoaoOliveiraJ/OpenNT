@@ -20,6 +20,8 @@
 use alloc::string::String;
 
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::Field;
+use crate::ntos::inc::types::NtStruct;
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::{object_manager, object_types, open_pointer};
 use crate::ntos::ps::user::events;
@@ -74,7 +76,8 @@ pub fn create(name_pointer: u64, event_type: u32, handle_output: u64) -> Result<
         return Ok(0);
     }
     let status = open_pointer::open(pointer, OBJ_KERNEL_HANDLE, 0, EVENT_ALL_ACCESS, object_types::event_type().pointer, 0, slot)?;
-    let handle = guest::read64(slot);
+    // SAFETY: célula HANDLE recém-alocada (slot).
+    let handle = unsafe { Field::<u64>::at(slot) }.get();
     guest::free_bytes(slot);
     if status != 0 {
         if created {
@@ -82,6 +85,7 @@ pub fn create(name_pointer: u64, event_type: u32, handle_output: u64) -> Result<
         }
         return Ok(0);
     }
-    guest::write64(handle_output, handle);
+    // SAFETY: PHANDLE EventHandle de saída do chamador de modo kernel.
+    unsafe { Field::<u64>::at(handle_output) }.set(handle);
     Ok(pointer)
 }

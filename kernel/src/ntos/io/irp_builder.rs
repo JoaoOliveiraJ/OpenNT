@@ -1,25 +1,28 @@
 //! IRPs reais na memória do convidado.
 //!
-//! Layout oficial do WDK (offsets em `ntos::inc::nt_abi`) com N stack locations:
-//! a primeira usada fica no endereço mais alto (slot StackCount-1),
-//! CurrentLocation = StackCount+1 e CurrentStackLocation aponta uma acima
-//! do topo, como o IopAllocateIrp do NT; cada IofCallDriver desce um nível.
-//! Também a alocação, a reinicialização e a liberação dos exports
-//! (IoAllocateIrp, IoInitializeIrp, IoReuseIrp, IoFreeIrp,
+//! Layout oficial do WDK (`ntos::inc::types::Irp`/`IoStackLocation`) com N
+//! stack locations: a primeira usada fica no endereço mais alto (slot
+//! StackCount-1), CurrentLocation = StackCount+1 e CurrentStackLocation
+//! aponta uma acima do topo, como o IopAllocateIrp do NT; cada IofCallDriver
+//! desce um nível. Também a alocação, a reinicialização e a liberação dos
+//! exports (IoAllocateIrp, IoInitializeIrp, IoReuseIrp, IoFreeIrp,
 //! IoSetMasterIrpStatus).
 
+use crate::ntos::inc::types::{IoStackLocation, Irp, NtStruct, PowerStateType, DevicePowerState, DeviceRelationType};
 use crate::ntos::io::irp_extension;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{io_stack_location as stack, irp};
+
+/// IO_TYPE_IRP.
+const IO_TYPE_IRP: i16 = 6;
 
 /// Cabeçalho mais os slots (sempre pelo menos um).
 pub fn size_for(stack_count: u32) -> u64 {
-    irp::STRUCT_SIZE + stack_count.max(1) as u64 * stack::SIZE
+    Irp::SIZE + stack_count.max(1) as u64 * IoStackLocation::SIZE
 }
 
 /// Primeira stack location a ser usada (topo da pilha).
 pub fn first_stack_location(address: u64, stack_count: u32) -> u64 {
-    address + irp::STRUCT_SIZE + (stack_count.max(1) as u64 - 1) * stack::SIZE
+    address + Irp::SIZE + (stack_count.max(1) as u64 - 1) * IoStackLocation::SIZE
 }
 
 /// Parâmetros de IRP_MJ_DEVICE_CONTROL.
@@ -61,91 +64,96 @@ pub struct BuildOptions {
     pub thread: u64,
 }
 
+/// Cabeçalho do IRP recém-zerado: Type, Size, StackCount, CurrentLocation e
+/// CurrentStackLocation uma acima do topo (IofCallDriver decrementa antes de
+/// despachar).
+fn initialize_header(irp: &Irp, size: u16, stack_count: u8) {
+    irp.type_.set(IO_TYPE_IRP);
+    irp.size.set(size);
+    irp.stack_count.set(stack_count as i8);
+    irp.current_location.set(stack_count.wrapping_add(1) as i8);
+    irp.tail.overlay.current_stack_location.set(first_stack_location(irp.address(), stack_count as u32) + IoStackLocation::SIZE);
+}
+
 /// Zera e preenche o IRP em `address` para o primeiro IofCallDriver.
 pub fn build(address: u64, options: &BuildOptions) {
     let stack_count = options.stack_count.max(1);
     let size = size_for(stack_count);
-    let mut offset = 0;
-    while offset < size {
-        guest::write32(address + offset, 0);
-        offset += 4;
-    }
-    // CurrentStackLocation fica acima do primeiro slot: IofCallDriver
-    // decrementa o ponteiro antes de despachar.
-    guest::write16(address + irp::TYPE, irp::IO_TYPE);
-    guest::write16(address + irp::SIZE_FIELD, size as u16);
-    guest::write64(address + irp::SYSTEM_BUFFER, options.buffer);
-    guest::write8(address + irp::STACK_COUNT, stack_count as u8);
-    guest::write8(address + irp::CURRENT_LOCATION, stack_count as u8 + 1);
-    guest::write64(address + irp::CURRENT_STACK_LOCATION, first_stack_location(address, stack_count) + stack::SIZE);
+    guest::write_bytes(address, &alloc::vec![0u8; size as usize]);
+    // SAFETY: `address` é a alocação de `size_for(stack_count)` bytes do chamador.
+    let irp = unsafe { Irp::at(address) };
+    initialize_header(irp, size as u16, stack_count as u8);
+    irp.associated_irp.system_buffer.set(options.buffer);
     if options.user_event != 0 {
-        guest::write64(address + irp::USER_EVENT, options.user_event);
+        irp.user_event.set(options.user_event);
     }
     if options.user_iosb != 0 {
-        guest::write64(address + irp::USER_IOSB, options.user_iosb);
+        irp.user_iosb.set(options.user_iosb);
     }
     if options.user_buffer != 0 {
-        guest::write64(address + irp::USER_BUFFER, options.user_buffer);
+        irp.user_buffer.set(options.user_buffer);
     }
     // O slot do topo é o do primeiro driver a receber o IRP.
-    let location = first_stack_location(address, stack_count);
-    guest::write8(location + stack::MAJOR, options.major);
-    guest::write8(location + stack::MINOR, options.minor);
-    guest::write32(location + stack::READ_LENGTH, options.buffer_length);
-    guest::write64(location + stack::READ_OFFSET, options.byte_offset);
-    guest::write64(location + stack::DEVICE_OBJECT, options.device_object);
-    guest::write64(location + stack::FILE_OBJECT, options.file_object);
-    guest::write8(address + irp::REQUESTOR_MODE, options.requestor_mode);
-    guest::write64(address + irp::THREAD, options.thread);
-    guest::write64(address + irp::ORIGINAL_FILE_OBJECT, options.file_object);
+    // SAFETY: o slot do topo está dentro da mesma alocação.
+    let location = unsafe { IoStackLocation::at(first_stack_location(address, stack_count)) };
+    let parameters = &location.parameters;
+    location.major_function.set(options.major);
+    location.minor_function.set(options.minor);
+    parameters.read.length.set(options.buffer_length);
+    parameters.read.byte_offset.quad_part.set(options.byte_offset as i64);
+    location.device_object.set(options.device_object);
+    location.file_object.set(options.file_object);
+    irp.requestor_mode.set(options.requestor_mode as i8);
+    irp.tail.overlay.thread.set(options.thread);
+    irp.tail.overlay.original_file_object.set(options.file_object);
     // Parameters.Power.{Type,State}, por cima de Read/Write como no wdm.h.
     if let Some(power) = options.power {
-        guest::write32(location + stack::POWER_TYPE, power.power_state_type);
-        guest::write32(location + stack::POWER_STATE, power.device_state);
+        parameters.power.type_.set(PowerStateType(power.power_state_type as i32));
+        parameters.power.state.device_state.set(DevicePowerState(power.device_state as i32));
     }
     // Parameters.DeviceIoControl.
     if let Some(control) = options.ioctl {
-        guest::write32(location + stack::IOCTL_CODE, control.code);
-        guest::write32(location + stack::IOCTL_IN_LENGTH, control.input_length);
-        guest::write32(location + stack::IOCTL_OUT_LENGTH, options.buffer_length);
+        let ioctl = &parameters.device_io_control;
+        ioctl.io_control_code.set(control.code);
+        ioctl.input_buffer_length.set(control.input_length);
+        ioctl.output_buffer_length.set(options.buffer_length);
         if control.type3_buffer != 0 {
-            guest::write64(location + stack::IOCTL_TYPE3_BUFFER, control.type3_buffer);
+            ioctl.type3_input_buffer.set(control.type3_buffer);
         }
     }
     // Parameters.StartDevice.AllocatedResources[Translated].
     if options.resources != 0 {
-        guest::write64(location + stack::PNP_ALLOCATED_RESOURCES, options.resources);
-        guest::write64(location + stack::PNP_ALLOCATED_RESOURCES_TRANSLATED, options.resources);
+        parameters.start_device.allocated_resources.set(options.resources);
+        parameters.start_device.allocated_resources_translated.set(options.resources);
     }
     // Parameters.QueryDeviceRelations.Type.
     if let Some(relations) = options.relations_type {
-        guest::write32(location + stack::READ_LENGTH, relations);
+        parameters.query_device_relations.type_.set(DeviceRelationType(relations as i32));
     }
     // Ponteiro da união Parameters (+0x08) para QUERY_CAPABILITIES e
-    // FILTER_RESOURCE_REQUIREMENTS.
+    // FILTER_RESOURCE_REQUIREMENTS (Capabilities / IoResourceRequirementList).
     if options.pnp_slot_pointer != 0 {
-        guest::write64(location + stack::READ_LENGTH, options.pnp_slot_pointer);
+        parameters.device_capabilities.capabilities.set(options.pnp_slot_pointer);
     }
 }
 
 /// IoStatus depois da execução do driver: (NTSTATUS com sinal, Information).
 pub fn read_io_status(address: u64) -> (i32, u64) {
-    (guest::read32(address + irp::IO_STATUS) as i32, guest::read64(address + irp::IO_STATUS_INFORMATION))
+    // SAFETY: `address` é um IRP vivo do chamador.
+    let irp = unsafe { Irp::at(address) };
+    (irp.io_status.status.get(), irp.io_status.information.get())
 }
 
 /// IoAllocateIrp: IRP zerado posicionado acima do topo da pilha.
 pub fn allocate_irp(stack_size: i8) -> u64 {
     let count = stack_size.max(1) as u64;
-    let size = irp::STRUCT_SIZE + count * irp::STACK_LOCATION_SIZE;
+    let size = Irp::SIZE + count * IoStackLocation::SIZE;
     let address = guest::alloc_bytes(size);
     if address == 0 {
         return 0;
     }
-    guest::write16(address + irp::TYPE, irp::IO_TYPE);
-    guest::write16(address + irp::SIZE_FIELD, size as u16);
-    guest::write8(address + irp::STACK_COUNT, count as u8);
-    guest::write8(address + irp::CURRENT_LOCATION, count as u8 + 1);
-    guest::write64(address + irp::CURRENT_STACK_LOCATION, address + irp::STRUCT_SIZE + count * irp::STACK_LOCATION_SIZE);
+    // SAFETY: alocação zerada de `size` bytes.
+    initialize_header(unsafe { Irp::at(address) }, size as u16, count as u8);
     address
 }
 
@@ -157,32 +165,30 @@ pub fn free_irp(packet: u64) {
 
 /// IoReuseIrp: reinicializa mantendo o tamanho e a pilha alocados.
 pub fn reuse_irp(packet: u64, status: u32) {
-    let count = guest::read8(packet + irp::STACK_COUNT);
-    guest::write32(packet + irp::FLAGS, 0);
-    guest::write64(packet + irp::MDL_ADDRESS, 0);
-    guest::write64(packet + irp::SYSTEM_BUFFER, 0);
-    guest::write32(packet + irp::IO_STATUS, status);
-    guest::write64(packet + irp::IO_STATUS_INFORMATION, 0);
-    guest::write8(packet + irp::CURRENT_LOCATION, count.wrapping_add(1));
-    guest::write8(packet + irp::CANCEL, 0);
-    guest::write64(packet + irp::USER_EVENT, 0);
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, first_stack_location(packet, count as u32) + stack::SIZE);
+    // SAFETY: `packet` é um IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    let count = irp.stack_count.get() as u8;
+    irp.flags.set(0);
+    irp.mdl_address.set(0);
+    irp.associated_irp.system_buffer.set(0);
+    irp.io_status.status.set(status as i32);
+    irp.io_status.information.set(0);
+    irp.current_location.set(count.wrapping_add(1) as i8);
+    irp.cancel.set(0);
+    irp.user_event.set(0);
+    irp.tail.overlay.current_stack_location.set(first_stack_location(packet, count as u32) + IoStackLocation::SIZE);
 }
 
 /// IoInitializeIrp: a forma do IopAllocateIrp, sem a alocação.
 pub fn initialize_irp(packet: u64, size: u16, count: u8) {
-    for offset in (0..size as u64).step_by(4) {
-        guest::write32(packet + offset, 0);
-    }
-    guest::write16(packet + irp::TYPE, irp::IO_TYPE);
-    guest::write16(packet + irp::SIZE_FIELD, size);
-    guest::write8(packet + irp::STACK_COUNT, count);
-    guest::write8(packet + irp::CURRENT_LOCATION, count.wrapping_add(1));
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, first_stack_location(packet, count as u32) + stack::SIZE);
+    guest::write_bytes(packet, &alloc::vec![0u8; size as usize]);
+    // SAFETY: `packet` aponta para `size` bytes do chamador.
+    initialize_header(unsafe { Irp::at(packet) }, size, count);
 }
 
 /// IoSetMasterIrpStatus: grava o status no IRP mestre e o devolve.
 pub fn set_master_irp_status(packet: u64, status: u64) -> u64 {
-    guest::write32(packet + irp::IO_STATUS, status as u32);
+    // SAFETY: `packet` é o IRP mestre vivo do chamador.
+    unsafe { Irp::at(packet) }.io_status.status.set(status as i32);
     status
 }

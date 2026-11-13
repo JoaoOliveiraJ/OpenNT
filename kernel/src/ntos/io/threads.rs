@@ -13,8 +13,7 @@ pub mod io_timer {
     use crate::hal::amd64::native_call;
     use crate::ntos::ke::clock;
     use crate::rtl::SpinLock;
-    use crate::ntos::mm::guest_memory as guest;
-    use crate::ntos::inc::nt_abi::device_object;
+    use crate::ntos::inc::types::{DeviceObject, NtStruct};
 
     const IO_TIMER_PERIOD_MS: u64 = 1000;
 
@@ -29,14 +28,17 @@ pub mod io_timer {
 
     static TIMERS: SpinLock<Vec<DeviceTimer>> = SpinLock::new(Vec::new());
 
-    /// Rotina e contexto ficam com os 32 bits baixos.
+    /// IoInitializeTimer: rotina e contexto guardados inteiros; o
+    /// DEVICE_OBJECT.Timer recebe uma marca não nula (o IO_TIMER do NT fica
+    /// no registro de cá).
     pub fn initialize_timer(device: u64, routine: u64, context: u64) -> u32 {
         let mut timers = TIMERS.lock();
         if timers.iter().any(|timer| timer.device == device) {
             return 0xC000_0035;
         }
-        timers.push(DeviceTimer { device, routine: routine as u32 as u64, context: context as u32 as u64, active: false, next_due_ms: 0 });
-        guest::write64(device + device_object::TIMER, 1);
+        timers.push(DeviceTimer { device, routine, context, active: false, next_due_ms: 0 });
+        // SAFETY: DEVICE_OBJECT vivo do driver.
+        unsafe { DeviceObject::at(device) }.timer.set(1);
         0
     }
 
@@ -95,29 +97,32 @@ pub mod io_timer {
 /// Activity ID da ETHREAD corrente, no mesmo campo lido pelo código nativo.
 /// O chamador mantém o GUID vivo; nada é copiado nem alocado aqui.
 pub mod thread_activity {
-    use crate::ntos::ps::process;
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{Ethread, Guid, NtStruct};
     use crate::ntos::mm::guest_memory as guest;
-    use crate::ntos::inc::nt_abi::kthread;
+    use crate::ntos::ps::process;
 
-    fn field() -> u64 {
-        process::get_current_thread() + kthread::ACTIVITY_ID
+    /// ETHREAD.ActivityId (PGUID) da thread corrente.
+    fn field() -> &'static Field<u64> {
+        // SAFETY: a thread corrente é um ETHREAD vivo.
+        &unsafe { Ethread::at(process::get_current_thread()) }.activity_id
     }
 
     pub fn get() -> u64 {
-        guest::read64(field())
+        field().get()
     }
 
     /// IoSetActivityIdThread: devolve o ponteiro anterior.
     pub fn set(activity: u64) -> u64 {
         let field = field();
-        let previous = guest::read64(field);
-        guest::write64(field, activity);
+        let previous = field.get();
+        field.set(activity);
         previous
     }
 
     /// IoClearActivityIdThread: restaura o ponteiro recebido, mesmo NULL.
     pub fn clear(previous: u64) {
-        guest::write64(field(), previous);
+        field().set(previous);
     }
 
     /// IoPropagateActivityIdToThread: captura os 16 bytes antes de escrever
@@ -126,71 +131,86 @@ pub mod thread_activity {
         if source == 0 {
             return 0xC000_0225;
         }
-        let first = guest::read64(source);
-        let second = guest::read64(source + 8);
-        guest::write64(propagated, first);
-        guest::write64(propagated + 8, second);
+        let guid = guest::read_bytes(source, Guid::SIZE as usize);
+        guest::write_bytes(propagated, &guid);
         let previous = set(propagated);
-        guest::write64(previous_output, previous);
+        // SAFETY: PGUID* PreviousActivityId do chamador de modo kernel.
+        unsafe { Field::<u64>::at(previous_output) }.set(previous);
         0
     }
 }
 
 /// IRPs pendentes ligados à ETHREAD real (lista e trava do 19041).
 pub mod thread_requests {
+    use core::sync::atomic::Ordering;
+
     use crate::hal::cpu;
+    use crate::ntos::inc::types::{Ethread, Irp, ListEntry, NtStruct};
     use crate::ntos::ke::irql;
     use crate::rtl::KernelError;
-    use crate::ntos::mm::guest_memory as guest;
-    use crate::ntos::inc::nt_abi::kthread;
 
-    const THREAD_LIST_ENTRY: u64 = 0x20;
+    fn thread_at(thread: u64) -> &'static Ethread {
+        // SAFETY: ETHREAD vivo (retido pelo pedido).
+        unsafe { Ethread::at(thread) }
+    }
 
+    fn link_at(address: u64) -> &'static ListEntry {
+        // SAFETY: elos da lista IrpList (cabeça na ETHREAD ou ThreadListEntry de um IRP).
+        unsafe { ListEntry::at(address) }
+    }
+
+    /// Irp->ThreadListEntry.
+    fn entry_of(request: u64) -> &'static ListEntry {
+        // SAFETY: IRP vivo do chamador.
+        &unsafe { Irp::at(request) }.thread_list_entry
+    }
+
+    /// ETHREAD.IrpListLock (KSPIN_LOCK) retido em DISPATCH_LEVEL.
     fn with_lock<T>(thread: u64, operation: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
-        let lock = thread + kthread::IRP_LIST_LOCK;
+        let lock = thread_at(thread).irp_list_lock.atomic();
         let previous = irql::raise_irql(2);
-        while guest::compare_exchange64(lock, 0, 1)? != 0 {
+        while lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             cpu::pause();
         }
         let result = operation();
-        let _ = guest::compare_exchange64(lock, 1, 0);
+        lock.store(0, Ordering::Release);
         irql::lower_irql(previous as u64);
         result
     }
 
     /// IopQueueThreadIrp: insere no início da lista da thread.
     pub fn insert(request: u64, thread: u64) -> Result<(), KernelError> {
-        let entry = request + THREAD_LIST_ENTRY;
-        let head = thread + kthread::IRP_LIST_HEAD;
+        let entry = entry_of(request);
+        let head = &thread_at(thread).irp_list;
         with_lock(thread, || {
-            let first = guest::read64(head);
-            if first == 0 || guest::read64(first + 8) != head {
+            let first = head.flink.get();
+            if first == 0 || link_at(first).blink.get() != head.address() {
                 return Err(KernelError::new("invalid ETHREAD IRP list"));
             }
-            if guest::read64(entry) != 0 || guest::read64(entry + 8) != 0 {
+            if entry.flink.get() != 0 || entry.blink.get() != 0 {
                 return Err(KernelError::new("IRP already linked"));
             }
-            guest::write64(entry, first);
-            guest::write64(entry + 8, head);
-            guest::write64(first + 8, entry);
-            guest::write64(head, entry);
+            entry.flink.set(first);
+            entry.blink.set(head.address());
+            link_at(first).blink.set(entry.address());
+            head.flink.set(entry.address());
             Ok(())
         })
     }
 
     /// A conclusão retira só o pedido que possui, fora de ordem inclusive.
     pub fn remove(request: u64, thread: u64) -> Result<(), KernelError> {
-        let entry = request + THREAD_LIST_ENTRY;
+        let entry = entry_of(request);
         with_lock(thread, || {
-            let next = guest::read64(entry);
-            let previous = guest::read64(entry + 8);
-            if next == 0 || previous == 0 || guest::read64(next + 8) != entry || guest::read64(previous) != entry {
+            let next = entry.flink.get();
+            let previous = entry.blink.get();
+            if next == 0 || previous == 0 || link_at(next).blink.get() != entry.address() || link_at(previous).flink.get() != entry.address() {
                 return Err(KernelError::new("invalid linked IRP"));
             }
-            guest::write64(previous, next);
-            guest::write64(next + 8, previous);
-            guest::write64(entry, 0);
-            guest::write64(entry + 8, 0);
+            link_at(previous).flink.set(next);
+            link_at(next).blink.set(previous);
+            entry.flink.set(0);
+            entry.blink.set(0);
             Ok(())
         })
     }

@@ -11,7 +11,6 @@ use crate::ntos::ke::irql;
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet};
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
 
 static IN_FLIGHT: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
 
@@ -30,13 +29,14 @@ pub fn post(port_pointer: u64, key: u64, context: u64, status: u32, information:
     }
     let _ = dispatcher_objects::reference(port_pointer);
     let result = (|| -> Result<u32, KernelError> {
-        if ![1, 3, 4].contains(&guest::read8(pointer + 0x10)) {
+        let packet = completion_packets::packet_at(pointer);
+        if ![1, 3, 4].contains(&packet.packet_type.get()) {
             return Err(KernelError::new("invalid supplied completion packet"));
         }
-        guest::write64(pointer + 0x18, key);
-        guest::write64(pointer + 0x20, context);
-        guest::write32(pointer + 0x28, status);
-        guest::write64(pointer + 0x30, information);
+        packet.key_context.set(key);
+        packet.apc_context.set(context);
+        packet.io_status.set(status as i32);
+        packet.io_status_information.set(information);
         IN_FLIGHT.lock().insert(pointer);
         // A fila assume a custódia antes de notificar: um consumidor pode
         // retirar, liberar e republicar o pacote durante esta chamada.
