@@ -347,11 +347,33 @@ fn referenced_by_tests(path: &str, references: &[Vec<String>]) -> bool {
         .any(|segments| segments.windows(2).any(|pair| pair[0] == parent && pair[1] == module))
 }
 
+/// Quem usa os autotestes. Um grupo de exports (um `pub mod` num
+/// `exports.rs`) conta quando um autoteste chama pelo nome pelo menos um dos
+/// seus exports, como a fase 6 faz com `call_export`, ou cita o submódulo do
+/// grupo pelo caminho; citar só o `exports.rs` não marca todos os grupos do
+/// arquivo. Os demais módulos (e um módulo que é o arquivo inteiro) contam
+/// quando um teste cita o seu caminho Rust.
+fn used_by_tests(root: &Path, path: &str, module: &str, references: &[Vec<String>], export_calls: &BTreeSet<String>) -> bool {
+    if path.ends_with("/exports.rs") {
+        if let Some(names) = sources::group_export_names(root, path, module) {
+            let submodule = format!("{module}_exports");
+            return names.iter().any(|name| export_calls.contains(name))
+                || references
+                    .iter()
+                    .any(|segments| segments.windows(2).any(|pair| pair[0] == "exports" && (pair[1] == module || pair[1] == submodule)));
+        }
+    }
+    referenced_by_tests(path, references)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn subsystem_rows(
     document: &toml::Document,
     plan: &[sources::PlannedModule],
     index: &RustIndex,
+    root: &Path,
     test_refs: &[Vec<String>],
+    export_calls: &BTreeSet<String>,
     test_dirs: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<SubsystemRow> {
@@ -384,7 +406,8 @@ fn subsystem_rows(
         } else {
             (ModuleState::Done, "")
         };
-        let tested = folder != "ntos/test" && rust.as_deref().is_some_and(|path| referenced_by_tests(path, test_refs));
+        let stem = module.path.rsplit('/').next().unwrap_or("");
+        let tested = folder != "ntos/test" && rust.as_deref().is_some_and(|path| used_by_tests(root, path, stem, test_refs, export_calls));
         by_folder.entry(folder).or_default().push(ModuleRow {
             name: module.path.clone(),
             rust,
@@ -582,9 +605,10 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let opennt = sources::opennt_exports();
     let index = RustIndex::build(&root, &rust_dirs)?;
     let test_refs = sources::test_references(&root, &test_dirs)?;
+    let export_calls = sources::test_export_calls(&root, &test_dirs)?;
 
     let mut warnings = Vec::new();
-    let subsystems = subsystem_rows(&document, &plan, &index, &test_refs, &test_dirs, &mut warnings);
+    let subsystems = subsystem_rows(&document, &plan, &index, &root, &test_refs, &export_calls, &test_dirs, &mut warnings);
     let tests = test_rows(&document, &root, &rust_dirs, &mut warnings);
     let components = component_rows(&document, &root, &tests, &mut warnings);
     let categories = category_rows(&document, &components, &mut warnings);

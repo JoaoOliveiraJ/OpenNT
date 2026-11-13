@@ -284,6 +284,120 @@ impl RustIndex {
     }
 }
 
+/// Exports chamados pelo nome nos autotestes (`call_export("Nome", ...)`): é
+/// assim que a fase 6 exercita um grupo de exports.
+pub fn test_export_calls(root: &Path, directories: &[String]) -> Result<BTreeSet<String>, String> {
+    const CALL: &str = "call_export(\"";
+    let mut names = BTreeSet::new();
+    for directory in directories {
+        let path = root.join(directory);
+        if !path.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_files(&path, "rs", &mut files)?;
+        for file in files {
+            let text = read_text(&file)?;
+            let mut rest = text.as_str();
+            while let Some(position) = rest.find(CALL) {
+                let tail = &rest[position + CALL.len()..];
+                let end = tail.find('"').unwrap_or(tail.len());
+                names.insert(tail[..end].to_string());
+                rest = &tail[end..];
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Saldo de chaves de uma linha de Rust, sem contar strings, caracteres e
+/// comentários de linha.
+fn brace_balance(line: &str) -> i32 {
+    let characters: Vec<char> = line.chars().collect();
+    let (mut balance, mut index, mut in_string) = (0, 0, false);
+    while index < characters.len() {
+        let character = characters[index];
+        if in_string {
+            match character {
+                '\\' => index += 1,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match character {
+                '"' => in_string = true,
+                '/' if characters.get(index + 1) == Some(&'/') => break,
+                '\'' if characters.get(index + 2) == Some(&'\'') => index += 2,
+                '{' => balance += 1,
+                '}' => balance -= 1,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    balance
+}
+
+/// Strings citadas nas listas `names: &[...]` e `data_exports: &[...]` de um
+/// trecho de código.
+fn declared_export_names(code: &str, output: &mut Vec<String>) {
+    for marker in ["names: &[", "data_exports: &["] {
+        let mut rest = code;
+        while let Some(position) = rest.find(marker) {
+            let tail = &rest[position + marker.len()..];
+            let end = tail.find(']').unwrap_or(tail.len());
+            let mut list = &tail[..end];
+            while let Some(open) = list.find('"') {
+                let after = &list[open + 1..];
+                let close = after.find('"').unwrap_or(after.len());
+                output.push(after[..close].to_string());
+                list = after.get(close + 1..).unwrap_or("");
+            }
+            rest = &tail[end..];
+        }
+    }
+}
+
+/// Nomes de export (funções e dados) que um grupo declara num `exports.rs`:
+/// os do submódulo `pub mod <grupo> {` (ou `<grupo>_exports`) ou, quando o
+/// grupo é o próprio componente, os das `Group` fora dos submódulos. `None`
+/// quando o módulo planejado corresponde ao arquivo inteiro (sem submódulo
+/// com o nome dele), como a tabela em `ntos/init/exports.rs`.
+pub fn group_export_names(root: &Path, rust_path: &str, group: &str) -> Option<Vec<String>> {
+    let text = fs::read_to_string(root.join(rust_path)).ok()?;
+    let component = rust_path.rsplit('/').nth(1).unwrap_or("");
+    let mut blocks: BTreeMap<String, String> = BTreeMap::new();
+    let mut outside = String::new();
+    let mut current: Option<(String, i32, String)> = None;
+    for line in text.lines() {
+        if let Some((name, depth, body)) = current.as_mut() {
+            *depth += brace_balance(line);
+            body.push_str(line);
+            body.push('\n');
+            if *depth <= 0 {
+                blocks.insert(name.clone(), std::mem::take(body));
+                current = None;
+            }
+            continue;
+        }
+        match line.strip_prefix("pub mod ").and_then(|rest| rest.strip_suffix(" {")) {
+            Some(name) => current = Some((name.to_string(), 1, String::new())),
+            None => {
+                outside.push_str(line);
+                outside.push('\n');
+            }
+        }
+    }
+    let body = match blocks.get(group).or_else(|| blocks.get(&format!("{group}_exports"))) {
+        Some(body) => body.as_str(),
+        None if group == component => outside.as_str(),
+        None => return None,
+    };
+    let mut names = Vec::new();
+    declared_export_names(body, &mut names);
+    Some(names)
+}
+
 /// Caminhos de módulo citados pelas suítes de teste (`use crate::a::{b, c}`
 /// e `crate::a::b` no código), expandidos em segmentos.
 pub fn test_references(root: &Path, directories: &[String]) -> Result<Vec<Vec<String>>, String> {

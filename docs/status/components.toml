@@ -160,6 +160,13 @@ marcador = "[shell] pronto"
 comando = "cargo xtask test-boot KERNEL_RS_OK 120000 \"--keys=run hello\\nps\\n\" \"--expect== 42\" \"--expect=PID  STATE\""
 descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps) e confere a saída: teclado, IPC, shell e console."
 
+[[teste]]
+id = "watchdog"
+titulo = "Driver watchdog.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 \"--expect=name=watchdog state=4 win32=0\""
+descricao = "O gerenciador de serviços inicia o watchdog.sys da Microsoft: o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports no ntoskrnl e o DriverEntry retorna sucesso, com o serviço em execução (state=4)."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -456,7 +463,7 @@ icone = "shield"
 descricao = "Driver inbox da Microsoft (watchdog timer), base do stack de vídeo."
 estado = "implementado"
 caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/io/file/zw.rs"]
-testes = ["driver"]
+testes = ["watchdog"]
 fase = "6"
 notas = "Driver inbox real da Microsoft que carrega e roda limpo no OpenNT via `--start-driver=watchdog`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Diferente do vgk (assinado embutido), ele é assinado por catálogo — o Code Integrity valida o hash da imagem contra o `.cat` da Microsoft que a própria ci.dll enumera em `CatRoot`. O DriverEntry executa e retorna sucesso. Esse mesmo caminho (catálogo + enumeração de diretório aninhado) destrava os demais drivers inbox, como o BasicDisplay e o dxgkrnl."
 

@@ -193,10 +193,10 @@ dos pacotes (`kernel`, `boot`).
 
 ## 8. Pontos em aberto
 
-- Vários `exports.rs` ainda carregam lógica de grupos antigos (o maior grupo
-  tem quase 700 linhas, e o `fsrtl_core` está em `io/exports.rs`). Ela está
-  sendo movida para os arquivos de assunto, componente por componente, conforme
-  a seção 3.1.
+- Alguns grupos de exports ainda misturam componentes e moram no `exports.rs`
+  de um só: `driver_helpers`, `io_diagnostics` e `x86bios_sleep_misc` em `io`,
+  `ke_ex_sync` em `ke`, e rotinas Se*/Ke* que ficaram em `ps`. Falta separá-los
+  pelo prefixo, conforme a seção 3.1.
 - `rtl/` (suporte do kernel em Rust) e `ntos/rtl/` (a Rtl do NT) ainda têm o
   mesmo nome.
 - `ntos/ps/user/` reúne os serviços Nt* do modo usuário; no NT cada serviço
