@@ -5,13 +5,18 @@
 //! (AttachedDevice), como o Po do ntoskrnl:
 //! - PoSetPowerState devolve o estado ANTERIOR (semântica do WDK);
 //! - PoStartNextPowerIrp dispara o próximo power IRP enfileirado;
-//! - PoCallDriver desce o power IRP pela pilha até o fundo.
+//! - PoCallDriver desce o power IRP pela pilha até o fundo;
+//! - PoRequestPowerIrp constrói, despacha e conclui um power IRP real;
+//! - PoQueryWatchdogTime responde que nenhum watchdog está armado.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::hal::amd64::native_call;
+use crate::ntos::io::io_manager;
+use crate::ntos::io::irp_builder::{self, BuildOptions, Power};
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{device_object, device_power_state, power_state_type};
+use crate::ntos::inc::nt_abi::{device_object, device_power_state, io_stack_location, irp, power_state_type};
 
 /// Quem despacha power IRPs para baixo (registrado pelo I/O Manager, o que
 /// quebra o ciclo io-manager <-> power-manager).
@@ -93,4 +98,46 @@ pub fn call_driver_down_the_stack(device: u64, irp: u64) -> u32 {
     }
     let dispatcher = STATE.lock().dispatcher;
     dispatcher.map_or(0, |dispatcher| dispatcher(attached, irp))
+}
+
+/// Dispositivo dono do IRP: CurrentStackLocation->DeviceObject.
+fn device_of_irp(packet: u64) -> u64 {
+    let stack = guest::read64(packet + irp::CURRENT_STACK_LOCATION);
+    guest::read64(stack + io_stack_location::DEVICE_OBJECT)
+}
+
+/// PoStartNextPowerIrp(Irp): dispara o próximo power IRP do dispositivo
+/// dono do IRP.
+pub fn start_next_power_irp(packet: u64) {
+    start_next_power_request(device_of_irp(packet));
+}
+
+/// PoRequestPowerIrp(device, minor, state, completion, context, &irp):
+/// constrói e despacha um IRP de energia real (QUERY/SET) e chama a
+/// conclusão com a assinatura do wdm.h (device, minor, state, contexto,
+/// IO_STATUS_BLOCK).
+pub fn request_power_irp(device: u64, minor: u32, state: u32, completion: u64, context: u64, irp_out: u64) {
+    let stack_count = match guest::read8(device + device_object::STACK_SIZE) {
+        0 => 1,
+        count => count as u32,
+    };
+    let packet = guest::alloc_bytes(irp_builder::size_for(stack_count));
+    irp_builder::build(packet, &BuildOptions { major: 0x16, minor: minor as u8, device_object: device, stack_count, power: Some(Power { power_state_type: 1, device_state: state }), ..Default::default() });
+    if irp_out != 0 {
+        guest::write64(irp_out, packet);
+    }
+    io_manager::dispatch_native_power_irp(device, packet);
+    if completion != 0 {
+        native_call::call(completion, &[device, minor as u64, state as u64, context, packet + irp::IO_STATUS]);
+    }
+    guest::free_bytes(packet);
+}
+
+/// PoQueryWatchdogTime(Pdo, &seconds): nenhum watchdog armado, *seconds = 0
+/// e FALSE.
+pub fn query_watchdog_time(seconds_out: u64) -> bool {
+    if seconds_out != 0 {
+        guest::write32(seconds_out, 0);
+    }
+    false
 }

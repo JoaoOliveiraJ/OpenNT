@@ -1,10 +1,11 @@
 //! Exports de I/O de porta da HAL — `system32/win32/ntoskrnl/hal.js`.
 //!
 //! No NT/x64, READ_PORT_*/WRITE_PORT_* são funções reais da HAL; aqui descem
-//! às primitivas de porta.
+//! às primitivas de porta. As células de HalPrivateDispatchTable e
+//! HalDispatchTable vêm de `hal::private_dispatch` e `hal::public_dispatch`.
 
 use crate::ntos::init::exports::{Call, Group};
-use crate::hal::port;
+use crate::hal::{port, private_dispatch, public_dispatch};
 use crate::rtl::KernelError;
 
 fn read_port_uchar(call: &Call) -> Result<u64, KernelError> {
@@ -38,20 +39,8 @@ pub static GROUP: Group = Group {
     name: "hal",
     names: &["READ_PORT_UCHAR", "READ_PORT_USHORT", "READ_PORT_ULONG", "WRITE_PORT_UCHAR", "WRITE_PORT_USHORT", "WRITE_PORT_ULONG"],
     handlers: &[read_port_uchar, read_port_ushort, read_port_ulong, write_port_uchar, write_port_ushort, write_port_ulong],
-    data_exports: &[("HalPrivateDispatchTable", private_dispatch_table_address), ("HalDispatchTable", dispatch_table_address)],
+    data_exports: &[("HalPrivateDispatchTable", private_dispatch::data_export_address), ("HalDispatchTable", public_dispatch::data_export_address)],
 };
-
-/// HalPrivateDispatchTable: o export de dados preenchido pela HAL
-/// (`ntos::hal::private_dispatch`).
-fn private_dispatch_table_address() -> u64 {
-    crate::ntos::mm::kernel_data::address("HalPrivateDispatchTable").unwrap_or_else(|error| panic!("HalPrivateDispatchTable: {error}"))
-}
-
-/// HalDispatchTable: o HAL_DISPATCH público preenchido pela HAL
-/// (`hal::public_dispatch`).
-fn dispatch_table_address() -> u64 {
-    crate::ntos::mm::kernel_data::address("HalDispatchTable").unwrap_or_else(|error| panic!("HalDispatchTable: {error}"))
-}
 
 pub mod hal_platform {
     //! Adaptadores ACPI e PCI da HAL — `system32/win32/ntoskrnl/hal-platform.js`.
@@ -107,50 +96,23 @@ pub mod hal_platform {
 pub mod hvi {
     //! Interface de hypervisor (Hvi*, Sk*, Vsl*) — `system32/win32/ntoskrnl/hvi.js`.
     //!
-    //! Lê as leaves CPUID reais de hypervisor; sem Secure Kernel (VBS) nesta
+    //! Adaptadores de `hal::hypervisor`; sem Secure Kernel (VBS) nesta
     //! máquina, as entradas Sk* têm o comportamento do ntoskrnl sem SK.
 
     use crate::ntos::init::exports::{signed_status, Call, Group};
-    use crate::hal::cpu;
+    use crate::hal::hypervisor;
     use crate::rtl::KernelError;
-    use crate::ntos::mm::guest_memory as guest;
 
-    /// Vendor da interface (CPUID.0x40000000 EBX/ECX/EDX, 12 caracteres).
-    fn hypervisor_vendor() -> [u8; 12] {
-        let leaf = cpu::cpuid(0x4000_0000);
-        let mut vendor = [0u8; 12];
-        for (index, register) in [leaf[1], leaf[2], leaf[3]].iter().enumerate() {
-            vendor[index * 4..index * 4 + 4].copy_from_slice(&register.to_le_bytes());
-        }
-        vendor
-    }
-
-    /// Bit 31 de CPUID.1:ECX.
     fn is_any_hypervisor_present(_: &Call) -> Result<u64, KernelError> {
-        Ok((cpu::cpuid(1)[2] & 0x8000_0000 != 0) as u64)
+        Ok(hypervisor::is_any_hypervisor_present() as u64)
     }
 
     fn is_hypervisor_microsoft_compatible(_: &Call) -> Result<u64, KernelError> {
-        Ok((&hypervisor_vendor() == b"Microsoft Hv") as u64)
+        Ok(hypervisor::is_microsoft_compatible() as u64)
     }
 
-    /// Features/privilégios (0x40000003) e recomendações (0x40000004); zeros
-    /// quando a interface não existe.
     fn get_hypervisor_features(call: &Call) -> Result<u64, KernelError> {
-        let maximum = cpu::cpuid(0x4000_0000)[0];
-        let (mut features, mut privileges, mut recommendations) = (0, 0, 0);
-        if maximum >= 0x4000_0003 {
-            let leaf = cpu::cpuid(0x4000_0003);
-            features = leaf[0];
-            privileges = leaf[1];
-        }
-        if maximum >= 0x4000_0004 {
-            recommendations = cpu::cpuid(0x4000_0004)[0];
-        }
-        let output = call.arg(1);
-        guest::write32(output, features);
-        guest::write32(output + 4, privileges);
-        guest::write32(output + 8, recommendations);
+        hypervisor::get_features(call.arg(1));
         Ok(0)
     }
 
@@ -160,36 +122,27 @@ pub mod hvi {
         Ok(0xC000_0002)
     }
 
-    /// As três operam numa EX_PUSH_LOCK normal (bit 0 = Locked).
     fn initialize_push_lock(call: &Call) -> Result<u64, KernelError> {
-        guest::write64(call.arg(1), 0);
+        hypervisor::initialize_push_lock(call.arg(1));
         Ok(0)
     }
 
     fn acquire_push_lock_exclusive(call: &Call) -> Result<u64, KernelError> {
-        loop {
-            let value = guest::read64(call.arg(1));
-            if value & 1 != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            guest::write64(call.arg(1), value | 1);
-            return Ok(0);
-        }
-    }
-
-    fn release_push_lock_exclusive(call: &Call) -> Result<u64, KernelError> {
-        guest::write64(call.arg(1), guest::read64(call.arg(1)) & !1);
+        hypervisor::acquire_push_lock_exclusive(call.arg(1));
         Ok(0)
     }
 
-    /// Sem SK o pool seguro não existe: pool não paginado normal.
+    fn release_push_lock_exclusive(call: &Call) -> Result<u64, KernelError> {
+        hypervisor::release_push_lock_exclusive(call.arg(1));
+        Ok(0)
+    }
+
     fn allocate_pool(call: &Call) -> Result<u64, KernelError> {
-        Ok(guest::alloc_bytes(call.arg(1)))
+        Ok(hypervisor::allocate_pool(call.arg(1)))
     }
 
     fn free_pool(call: &Call) -> Result<u64, KernelError> {
-        guest::free_bytes(call.arg(1));
+        hypervisor::free_pool(call.arg(1));
         Ok(0)
     }
 

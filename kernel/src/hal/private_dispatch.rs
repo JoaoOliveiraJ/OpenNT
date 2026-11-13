@@ -622,3 +622,9 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
 pub fn table_address() -> u64 {
     TABLE.load(Ordering::SeqCst)
 }
+
+/// Célula do export de dados HalPrivateDispatchTable na imagem do kernel
+/// (válida também antes da inicialização da HAL).
+pub fn data_export_address() -> u64 {
+    kernel_data::address("HalPrivateDispatchTable").unwrap_or_else(|error| panic!("HalPrivateDispatchTable: {error}"))
+}

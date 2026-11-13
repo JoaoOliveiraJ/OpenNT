@@ -52,3 +52,9 @@ pub fn initialize() -> Result<(), KernelError> {
 pub fn table_address() -> u64 {
     TABLE.load(Ordering::SeqCst)
 }
+
+/// Célula do export de dados HalDispatchTable na imagem do kernel (válida
+/// também antes da inicialização da HAL).
+pub fn data_export_address() -> u64 {
+    kernel_data::address("HalDispatchTable").unwrap_or_else(|error| panic!("HalDispatchTable: {error}"))
+}

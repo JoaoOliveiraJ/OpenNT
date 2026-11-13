@@ -4,19 +4,16 @@
 //! threads nativas usam a mesma continuação pelo escalonador de kernel; uma
 //! falha interna do transporte para a máquina, como no original.
 
-use alloc::boxed::Box;
-
 use crate::ntos::init::exports::{signed_status, Call, Group};
-use crate::ntos::alpc::kernel_entry::{self, Pending};
+use crate::ntos::alpc::kernel_entry;
 use crate::ntos::alpc::{cancel_message, query_information, query_message};
 use crate::ntos::alpc::resource::services;
-use crate::ntos::ke::dispatcher;
 use crate::ntos::ps::user::alpc as transport;
 use crate::ntos::rtl::native_context;
 use crate::rtl::KernelError;
 
-/// Resultado de um provedor: transferências de contexto seguem adiante; as
-/// demais falhas internas são fatais.
+/// Conversão do resultado de um provedor: transferências de contexto seguem
+/// adiante; as demais falhas internas são fatais.
 fn finish(what: &str, result: Result<u32, KernelError>) -> Result<u64, KernelError> {
     match result {
         Ok(status) => Ok(signed_status(status)),
@@ -25,37 +22,19 @@ fn finish(what: &str, result: Result<u32, KernelError>) -> Result<u64, KernelErr
     }
 }
 
-/// Bombeia a operação retomável até concluir; o cancelamento final é
-/// inócuo depois da conclusão.
-fn drive(mut operation: Box<dyn Pending>) -> u32 {
-    let status = loop {
-        if let Some(status) = operation.poll() {
-            break status;
-        }
-        dispatcher::pump_kernel();
-    };
-    operation.cancel();
-    status
-}
-
-/// Onze argumentos x64, incluindo timeout e atributos depois do quarto slot.
-fn connect(call: &Call, extended: bool) -> Result<u64, KernelError> {
-    let arguments: [u64; 11] = core::array::from_fn(|index| call.arg(index + 1));
-    let begun = if extended { kernel_entry::begin_connection_ex(&arguments) } else { kernel_entry::begin_connection(&arguments) };
-    finish("kernel connection", begun.map(drive))
-}
-
 fn connect_port(call: &Call) -> Result<u64, KernelError> {
-    connect(call, false)
+    let arguments: [u64; 11] = core::array::from_fn(|index| call.arg(index + 1));
+    finish("kernel connection", kernel_entry::connect(&arguments))
 }
 
 fn connect_port_ex(call: &Call) -> Result<u64, KernelError> {
-    connect(call, true)
+    let arguments: [u64; 11] = core::array::from_fn(|index| call.arg(index + 1));
+    finish("kernel connection", kernel_entry::connect_ex(&arguments))
 }
 
 fn send_wait_receive_port(call: &Call) -> Result<u64, KernelError> {
     let arguments: [u64; 8] = core::array::from_fn(|index| call.arg(index + 1));
-    finish("kernel failure", kernel_entry::begin(&arguments).map(drive))
+    finish("kernel failure", kernel_entry::send_wait_receive(&arguments))
 }
 
 /// Zw consulta handles no modo kernel sem alterar o PreviousMode do chamador.

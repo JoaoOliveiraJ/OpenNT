@@ -3,6 +3,7 @@
 //! Uma sessão só existe com um consumidor real; registrar um provedor não
 //! habilita eventos sozinho. Rotinas de habilitação nativas e consumidores
 //! rodam sem o lock retido (um callback pode remover o próprio registro).
+//! Os traits de EtwSetInformation ficam guardados por registro.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -510,4 +511,26 @@ pub fn is_registered(handle: u64) -> bool {
 
 pub fn delivered(session: u16) -> Option<u64> {
     with(|etw| etw.sessions.get(&session).map(|found| found.delivered))
+}
+
+/// EventProviderSetTraits: tamanho dos traits por registro.
+static TRAITS: SpinLock<BTreeMap<u64, u32>> = SpinLock::new(BTreeMap::new());
+
+/// EtwSetInformation(RegHandle, InformationClass, Information): atualiza os
+/// metadados de um registro conforme a classe (1 = traits). Devolve o
+/// NTSTATUS (STATUS_INVALID_HANDLE sem o registro).
+pub fn set_information(handle: u64, class: u32, information: u64) -> u32 {
+    if !exists(handle) {
+        return 0xC000_0008;
+    }
+    if class == 1 && information != 0 {
+        TRAITS.lock().insert(handle, guest::read32(information));
+    }
+    0
+}
+
+/// EtwUnregister: os traits guardados saem antes do próprio registro.
+pub fn unregister_with_traits(handle: u64) -> Result<u32, KernelError> {
+    TRAITS.lock().remove(&handle);
+    unregister(handle)
 }
