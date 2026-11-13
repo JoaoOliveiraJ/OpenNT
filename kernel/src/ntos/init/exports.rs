@@ -369,8 +369,6 @@ pub fn init() {
     crate::ntos::cm::service::rpc::init();
     crate::ntos::ps::user::worker_factory::init();
     crate::ntos::ps::user::wnf::init();
-    crate::ntos::ps::user::win32k::init();
-    crate::ntos::ps::user::user_atoms::init();
     crate::ntos::ps::user::exceptions::init();
     crate::ntos::ps::user::device_io::init();
     crate::ntos::ps::user::instrumentation::init();

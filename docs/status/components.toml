@@ -918,6 +918,8 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 
 # Módulos fora das contas.
 [fora_do_escopo]
+"ntos/ps/user/win32k" = "papel do win32k.sys real (win32kbase/win32kfull), que o OpenNT carrega; o kernel só dá o suporte"
+"ntos/ps/user/user_atoms" = "papel do win32k.sys real (átomos USER), que o OpenNT carrega; o kernel só dá o suporte"
 "win32/argument_precision" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/argument_widths" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/ataport_trace" = "diagnóstico temporário do ataport"

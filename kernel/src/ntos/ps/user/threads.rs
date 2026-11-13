@@ -172,7 +172,8 @@ static EXECUTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
 /// `call_capture::consume` + `exceptions::hardware`/`pending`: devolve o status
 /// fatal ou 0 para continuar.
 static EXIT_HANDLER: SpinLock<Option<fn(&Arc<UserThread>, u32, u32) -> u32>> = SpinLock::new(None);
-/// `win32k::release_thread(pid, tid)`.
+/// Callout de término de thread do win32k (o W32ThreadCallout que o
+/// win32k.sys real registra por PsEstablishWin32Callouts).
 static WIN32K_RELEASE: SpinLock<Option<fn(u64, u64)>> = SpinLock::new(None);
 static PUMPS: SpinLock<[Option<fn()>; 5]> = SpinLock::new([None; 5]);
 

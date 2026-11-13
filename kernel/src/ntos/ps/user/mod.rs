@@ -21,8 +21,6 @@ pub mod threads;
 pub mod wait_packets;
 pub mod worker_factory;
 pub mod wnf;
-pub mod win32k;
-pub mod user_atoms;
 pub mod context_frame;
 pub mod set_thread_context;
 pub mod exceptions;

@@ -331,7 +331,6 @@ pub fn release_user_resources() {
     super::instrumentation::release_process();
     super::mutants::release_process();
     super::threads::release_process();
-    super::win32k::release_process(state::with(|state| state.current_process_id));
     for handle in state::user_handle_values() {
         let _ = close::close_user(handle as u64, true);
     }

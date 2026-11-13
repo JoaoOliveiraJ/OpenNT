@@ -16,7 +16,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 6 | loader PE e ntoskrnl | em andamento |
 | 7 | modo usuário | em andamento |
 
-Hoje: **19 de 37** componentes funcionam; **551 de 773** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.001 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (32,6%).
+Hoje: **19 de 37** componentes funcionam; **549 de 771** módulos do plano têm código (535 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.093 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 

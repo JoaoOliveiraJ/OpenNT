@@ -3551,107 +3551,6 @@ fn user_wnf(assert: Assert) {
     }
 }
 
-fn user_win32k_atoms(assert: Assert) {
-    use crate::ntos::ps::process;
-    use crate::ntos::ps::user::{memory, threads, win32k};
-    let Ok(block) = memory::map_user_region(0x3000) else {
-        assert(false, "userw32k: memoria de usuario");
-        return;
-    };
-    let (peb, teb, payload, dispatch, rsp) = (block, block + 0x1000, block + 0x2000, block + 0x2400, block + 0x2800);
-    let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
-    // Runtime simulado: processo, PEB e uma thread de usuário com TEB.
-    let saved = state::with(|state| (state.current_process_id, state.current_peb_va));
-    let snapshot = threads::all();
-    threads::clear();
-    threads::push(threads::UserThread::new(process::get_current_thread_id(), process::get_current_thread(), teb, 0));
-    state::with(|state| {
-        state.current_process_id = 0x7F40;
-        state.current_peb_va = peb;
-    });
-    let last_error = || guest::read32(teb + 0x68);
-    // Átomos USER: mensagens registradas.
-    let descriptor = block + 0x100;
-    let name = |text: &str| {
-        let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(block + 0x200 + index as u64 * 2, *unit);
-        }
-        guest::write16(block + 0x200 + units.len() as u64 * 2, 0);
-        guest::write16(descriptor, (units.len() * 2) as u16);
-        guest::write16(descriptor + 2, (units.len() * 2 + 2) as u16);
-        guest::write64(descriptor + 8, block + 0x200);
-    };
-    // Nomes sem caixa usam a tabela l_intl.nls do volume; sem ela, a
-    // ausência é erro (não há fallback), como no RtlEqualUnicodeString.
-    let casing = crate::ntos::rtl::unicode_case::upcase_char(b'a' as u16).is_ok();
-    name("OpenNtTesteMensagem");
-    let first = call("NtUserRegisterWindowMessage", descriptor, 0, 0, 0);
-    name("opennttestemensagem");
-    let second = call("NtUserRegisterWindowMessage", descriptor, 0, 0, 0);
-    let (atom, again) = if casing { (first.unwrap_or(0), second.unwrap_or(1)) } else { (0xC000, 0xC000) };
-    let casing_ok = if casing { true } else { first.is_none() && second.is_none() };
-    name("#123");
-    let integer = call("NtUserRegisterWindowMessage", descriptor, 0, 0, 0);
-    name("#0");
-    let zero = call("NtUserRegisterWindowMessage", descriptor, 0, 0, 0);
-    let zero_error = last_error();
-    assert(casing_ok && (0xC000..=0xFFFF).contains(&atom) && again == atom && integer == Some(123) && zero == Some(0) && zero_error == 87, "userw32k: mensagens registradas por nome sem caixa e inteiros #n");
-    // Nomes dos átomos.
-    let query = block + 0x300;
-    guest::write16(query, 0);
-    guest::write16(query + 2, 64);
-    guest::write64(query + 8, block + 0x400);
-    let named = if casing { call("NtUserGetAtomName", atom as u64, query, 0, 0) } else { Some(19) };
-    let text = if casing { state::read_user_wide_string(block + 0x400, 19) } else { alloc::string::String::from("OpenNtTesteMensagem") };
-    let numbered = call("NtUserGetAtomName", 0x123, query, 0, 0);
-    let numbered_text = state::read_user_wide_string(block + 0x400, 4);
-    let unknown = call("NtUserGetAtomName", 0xFFF0, query, 0, 0);
-    let unknown_error = last_error();
-    let clipboard = if casing { call("NtUserGetClipboardFormatName", atom as u64, block + 0x400, 32, 0) } else { Some(19) };
-    let predefined = call("NtUserGetClipboardFormatName", 5, block + 0x400, 32, 0);
-    let predefined_error = last_error();
-    assert(named == Some(19) && text == "OpenNtTesteMensagem" && numbered == Some(4) && numbered_text == "#291" && unknown == Some(0) && unknown_error == 6 && clipboard == Some(19) && predefined == Some(0) && predefined_error == 87, "userw32k: nomes de atomos e formatos da area de transferencia");
-    // Estado do processo e da thread Win32.
-    let dpi = call("NtUserGetDpiForCurrentProcess", 0, 0, 0, 0);
-    let startup = call("NtUserModifyUserStartupInfoFlags", 0xF, 0x5, 0, 0);
-    let converted = call("NtUserGetThreadState", 14, 0, 0, 0);
-    let w32thread = guest::read64(teb + 0x78);
-    let active = call("NtUserGetThreadState", 0, 0, 0, 0);
-    let unsupported = call("NtUserGetThreadState", 5, 0, 0, 0);
-    let unsupported_error = last_error();
-    assert(dpi == Some(96) && startup == Some(1) && win32k::process_info(0x7F40).is_some_and(|(dpi, flags, _, _)| dpi == 96 && flags == 5) && converted == Some(1) && w32thread != 0 && guest::read64(w32thread + 16) == process::get_current_thread_id() && guest::read32(teb + 0x810) == 0x400 && active == Some(0) && unsupported == Some(0) && unsupported_error == 120, "userw32k: DPI, flags de inicializacao e conversao para thread Win32");
-    // GDI: vista somente leitura da tabela compartilhada no PEB.
-    let gdi = call("NtGdiInit", 0, 0, 0, 0);
-    assert(gdi == Some(1) && guest::read64(peb + 0xF8) != 0 && guest::read32(peb + 0x108) == 1, "userw32k: NtGdiInit publica a tabela GDI no PEB");
-    // USERCONNECT pelo servidor 3 da CSR.
-    let missing = win32k::connect_user(0x7F40, payload);
-    guest::write32(dispatch, 0x1234_ABCD);
-    state::with(|state| state.mapped_image_exports.insert(alloc::string::String::from("win32u.dll"), [(alloc::string::String::from("gDispatchTableValues"), dispatch)].into_iter().collect()));
-    let connected = win32k::connect_user(0x7F40, payload);
-    let psi = guest::read64(payload + 8);
-    let other = win32k::connect_user(0x7F44, payload);
-    assert(missing == 0xC000_007B && connected == 0 && guest::read32(payload) == 0x1234_ABCD && psi != 0 && guest::read64(payload + 0x10) == psi + 0x1_0000 && guest::read32(payload + 0x18) == 0x20 && guest::read64(psi + 8) == 4096 && guest::read16(psi + 0x1B56) == 96 && other == 0xC000_0008, "userw32k: USERCONNECT com SHAREDINFO na vista somente leitura");
-    // Liberação da thread e do processo.
-    win32k::release_thread(0x7F40, process::get_current_thread_id());
-    let thread_released = guest::read64(teb + 0x78) == 0;
-    win32k::release_process(0x7F40);
-    assert(thread_released && guest::read64(peb + 0xF8) == 0 && win32k::process_info(0x7F40).is_none(), "userw32k: liberacao da thread e do processo");
-    // Restaura o runtime.
-    threads::clear();
-    for thread in snapshot {
-        threads::push(thread);
-    }
-    state::with(|state| {
-        state.current_process_id = saved.0;
-        state.current_peb_va = saved.1;
-        state.mapped_image_exports.remove("win32u.dll");
-    });
-    if let Some(region) = memory::find_region(block) {
-        memory::release_private_region(&region);
-    }
-}
-
 fn user_thread_context(assert: Assert) {
     use crate::hal::amd64::{native_call, win32_thunk};
     use crate::ntos::ps::context::{kernel_frame as kernel_context_frame, set as set_thread_context, input as thread_context_input, registers as registers};
@@ -4509,7 +4408,6 @@ pub fn run(assert: Assert) {
     user_alpc_zw_group(assert);
     user_worker_factory(assert);
     user_wnf(assert);
-    user_win32k_atoms(assert);
     user_thread_context(assert);
     user_exceptions(assert);
     user_process_information_hooks(assert);

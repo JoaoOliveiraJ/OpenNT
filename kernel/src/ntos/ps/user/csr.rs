@@ -37,7 +37,8 @@ struct Session {
 }
 
 static SESSION: SpinLock<Option<Session>> = SpinLock::new(None);
-/// `win32k::connect_user`, instalado pelo subsistema de janelas.
+/// Conexão USER do subsistema de janelas; fica vazia até o win32k.sys real
+/// se registrar.
 static USER_CONNECTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
 
 pub fn set_user_connector(connector: fn(u64, u64) -> u32) {
