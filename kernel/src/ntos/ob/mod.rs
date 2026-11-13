@@ -17,4 +17,8 @@ pub mod reference_trace;
 pub mod find_handle;
 pub mod query_security;
 pub mod query_object;
+pub mod object_create;
+pub mod object_open;
+pub mod object_reference;
+pub mod object_security;
 pub mod exports;

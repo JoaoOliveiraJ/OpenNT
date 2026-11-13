@@ -2,7 +2,8 @@
 //!
 //! Layout do PDB: corpo de 0xD8 bytes, TypeInfo em +0x40 com tamanho 0x78.
 //! Ponteiros exportados, verificações de tipo e contadores usam a mesma
-//! identidade (o ponteiro do corpo).
+//! identidade (o ponteiro do corpo). ObCreateObjectType (o `obtype.c` do NT)
+//! e as células exportadas com ponteiros de tipo também moram aqui.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -11,6 +12,12 @@ use alloc::vec::Vec;
 use crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_data;
+use crate::ntos::rtl::guest_strings;
+
+const STATUS_SUCCESS: u32 = 0;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 
 /// Identidade pública de um tipo (cópia barata).
 #[derive(Clone, Debug)]
@@ -148,6 +155,47 @@ pub fn callback_type() -> ObjectType {
 /// ObCreateObjectType quando um driver registra tipos próprios.
 pub fn define(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Result<ObjectType, KernelError> {
     create(name, mapping, valid_access, flags)
+}
+
+// --- ObCreateObjectType ---------------------------------------------------
+// NTSTATUS ObCreateObjectType(PUNICODE_STRING Name,
+//   POBJECT_TYPE_INITIALIZER Init, PSECURITY_DESCRIPTOR Sd, POBJECT_TYPE *Type)
+//
+// Faithful wrapper over define (the public form of the private
+// create()). The INITIALIZER mirrors the 0xD8 body window: Length/flags in
+// the first dword, GENERIC_MAPPING at +0x0C, ValidAccessMask at +0x1C.
+pub fn create_from_initializer(name_ptr: u64, init: u64, out: u64) -> u32 {
+    if init == 0 || name_ptr == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let name = guest_strings::read_unicode_string(name_ptr);
+    if name.is_empty() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let header = guest::read32(init);
+    let flags = (header >> 16) as u16;
+    let mapping = [
+        guest::read32(init + 0x0C),
+        guest::read32(init + 0x10),
+        guest::read32(init + 0x14),
+        guest::read32(init + 0x18),
+    ];
+    let valid = guest::read32(init + 0x1C);
+    match define(&name, mapping, valid, flags) {
+        Ok(info) => {
+            if out != 0 {
+                guest::write64(out, info.pointer);
+            }
+            STATUS_SUCCESS
+        }
+        Err(_) => STATUS_OBJECT_NAME_COLLISION,
+    }
+}
+
+/// Célula de dados exportada com o ponteiro de um tipo (IoDeviceObjectType,
+/// ExSemaphoreObjectType, LpcPortObjectType), preenchida no heap.
+pub fn exported_cell(name: &str) -> u64 {
+    kernel_data::address(name).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 pub fn device_type() -> ObjectType {

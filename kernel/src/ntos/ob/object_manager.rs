@@ -778,3 +778,9 @@ pub fn is_attached(id: NodeId) -> bool {
 pub fn set_native_namespace(id: NodeId, body: u64) {
     update_node(id, |node| node.native_namespace = body);
 }
+
+/// ObIsDosDeviceLocallyMapped: sem device maps por LUID (sem sessões de
+/// logon), nenhuma letra é mapeada localmente.
+pub fn is_dos_device_locally_mapped() -> bool {
+    false
+}

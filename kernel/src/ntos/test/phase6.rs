@@ -2081,10 +2081,10 @@ fn io_group_exports(assert: Assert) {
 
 fn ob_group_exports(assert: Assert) {
     use crate::drivers::fs::memory_file_system;
-    use crate::ntos::ob::{close, object_manager, object_types, reference_trace};
+    use crate::ntos::ob::{close, object_manager, object_security, object_types, reference_trace};
     use crate::ntos::ob::objects::{device as device_objects, driver as driver_objects};
     use crate::ntos::ps::process;
-    use crate::{ntos::io::lifecycle, ntos::ob::exports as ob};
+    use crate::{ntos::io::lifecycle, ntos::ob::object_reference as ob};
     let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
     let counter = guest::alloc_bytes(8);
     let entry = [0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00, 0x48, 0x89, 0x41, 0x68, 0x31, 0xC0, 0xC3];
@@ -2139,7 +2139,7 @@ fn ob_group_exports(assert: Assert) {
     assert(status(call_export("ObReferenceObjectByPointer", &[current, 0, object_types::process_type().pointer, 1])) == 0 && status(call_export("ObReferenceObjectByPointer", &[current, 0, object_types::thread_type().pointer, 1])) == 0xC000_0024 && status(call_export("ObReferenceObjectByPointer", &[0, 0, 0, 0])) == 0xC000_000D, "ob: ObReferenceObjectByPointer confere o tipo em modo usuario");
     call_export("ObDereferenceObject", &[current]);
     // Segurança, device maps e histórico de referências.
-    assert(status(call_export("ObSetSecurityObjectByPointer", &[device, 0x5000, 4])) == 0 && ob::security_descriptor(device) == Some(0x5000) && call_export("ObIsDosDeviceLocallyMapped", &[0]) == Some(0), "ob: descritor de seguranca e device maps");
+    assert(status(call_export("ObSetSecurityObjectByPointer", &[device, 0x5000, 4])) == 0 && object_security::security_descriptor(device) == Some(0x5000) && call_export("ObIsDosDeviceLocallyMapped", &[0]) == Some(0), "ob: descritor de seguranca e device maps");
     reference_trace::clear();
     reference_trace::set_enabled(true);
     let _ = ob::reference_with_tag(device, 0x4142_4344, false);

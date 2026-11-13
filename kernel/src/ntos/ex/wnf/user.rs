@@ -9,12 +9,11 @@ use crate::ntos::ex::wnf::name::{self as wnf_name, SuppliedType};
 use crate::ntos::ex::wnf::query::{UserInputs, UserQuery};
 use crate::ntos::ex::wnf::{namespace as namespace, security as wnf_security, subscriptions as wnf_subscriptions};
 use crate::ntos::ke::critical_region;
-use crate::ntos::ob::{object_types, open_pointer};
+use crate::ntos::ob::{object_reference, object_types, open_pointer};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::init::exports::Call;
 
 const PROCESS_NOTIFICATION_EVENT_OFFSET: u64 = 0x80;
 const EVENT_MODIFY_STATE: u64 = 2;
@@ -124,9 +123,7 @@ pub fn set_process_notification_event(handle: u64) -> Result<u32, KernelError> {
             return Ok(STATUS_INSUFFICIENT_RESOURCES);
         }
         guest::write64(output, 0);
-        let mut args = [0u64; 14];
-        args[..6].copy_from_slice(&[handle, EVENT_MODIFY_STATE, object_types::event_type().pointer, 1, output, 0]);
-        let status = crate::ntos::ob::exports::reference_object_by_handle(&Call { args, return_address: 0, frame: 0, context: 0 })? as u32;
+        let status = object_reference::reference_by_handle(handle, EVENT_MODIFY_STATE as u32, object_types::event_type().pointer, 1, output, 0)? as u32;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }

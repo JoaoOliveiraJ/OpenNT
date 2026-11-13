@@ -3,6 +3,9 @@
 //! Consulta objetos dos provedores reais e dos tipos registrados: nome,
 //! referências e segurança vêm da identidade viva do dono, retida durante a
 //! coleta. A serialização das classes 0–4 é `query_object_format`.
+//!
+//! ObQueryNameString também mora aqui (como no `obquery.c` do NT): o caminho
+//! completo pelo corpo nativo, ou o nome próprio de um callback do Ex.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -11,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::object_manager;
+use super::object_reference::native_pointer_of_node;
 use super::object_types::{self, ObjectType};
 use super::open_pointer;
 use super::query_object_format::{self, ObjectInformation};
@@ -20,6 +24,7 @@ use crate::ntos::ke::irql;
 use crate::ntos::mm::{kernel_pool, paging};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandle};
+use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::handles as token_handles;
 use crate::rtl::{KernelError, SpinLock};
@@ -302,4 +307,63 @@ pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64) -
         collected.release();
     }
     Ok(result)
+}
+
+/// Caminho completo pelo corpo nativo (\Device, \Driver e \KernelObjects).
+fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
+    for root in ["\\Device", "\\Driver", "\\KernelObjects"] {
+        let Some(children) = object_manager::lookup(root).and_then(object_manager::node).and_then(|node| node.children) else { continue };
+        for &child in children.values() {
+            let Some(node) = object_manager::node(child) else { continue };
+            let Some(data) = node.data.as_ref() else { continue };
+            if native_pointer_of_node(Some(child)) == pointer || (node.type_name == "Event" && data.native_pointer == pointer) {
+                return Some(alloc::format!("{root}\\{}", node.name));
+            }
+        }
+    }
+    None
+}
+
+/// ObQueryNameString: o caminho completo do objeto (callbacks pelo nome
+/// próprio, com o UNICODE_STRING montado no buffer).
+pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) -> u32 {
+    if callbacks::exists(pointer) {
+        let name = callbacks::name(pointer);
+        let units = name.as_ref().map_or(0, |name| name.encode_utf16().count() as u32);
+        let needed = 16 + if name.is_some() { units * 2 + 2 } else { 0 };
+        if returned != 0 {
+            guest::write32(returned, needed);
+        }
+        if size < needed {
+            return 0xC000_0004;
+        }
+        for offset in 0..16 {
+            guest::write8(output + offset, 0);
+        }
+        if let Some(name) = name {
+            guest::write16(output, units as u16 * 2);
+            guest::write16(output + 2, units as u16 * 2 + 2);
+            guest::write64(output + 8, output + 16);
+            guest_strings::write_wide_string(output + 16, &name);
+        }
+        return 0;
+    }
+    let Some(path) = find_path_by_native_pointer(pointer) else {
+        if returned != 0 {
+            guest::write32(returned, 0);
+        }
+        return 0xC000_000D;
+    };
+    let units = path.encode_utf16().count() as u32;
+    let needed = units * 2 + 2;
+    if returned != 0 {
+        guest::write32(returned, needed);
+    }
+    if size < needed {
+        return 0xC000_0004;
+    }
+    guest_strings::write_wide_string(guest::read64(output + 8), &path);
+    guest::write16(output, units as u16 * 2);
+    guest::write16(output + 2, units as u16 * 2 + 2);
+    0
 }
