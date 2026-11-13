@@ -17,8 +17,35 @@ use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
 use crate::ntos::inc::status::STATUS_UNSUCCESSFUL;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::section::create::{caller_read, caller_units};
+use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::{ObjectAttributes, UnicodeString};
 
-pub const SIZE: u64 = 0x20;
+/// Corpo da partição do sistema (layout do OpenNT, não a MM_PARTITION):
+/// contagens espelhadas do objeto e do banco de PFNs.
+#[repr(C)]
+pub(crate) struct PartitionBody {
+    pub(crate) references: Field<u64>,
+    pub(crate) handles: Field<u32>,
+    _pad_c: Reserved<4>,
+    pub(crate) total: Field<u64>,
+    pub(crate) available: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for PartitionBody {}
+
+const _: () = assert!(core::mem::size_of::<PartitionBody>() == 0x20);
+
+pub const SIZE: u64 = PartitionBody::SIZE;
+
+impl PartitionBody {
+    /// O corpo publicado (ou em publicação) em `pointer`.
+    pub(crate) fn of(pointer: u64) -> &'static PartitionBody {
+        // SAFETY: corpo alocado por `init` e vivo até `dispose`.
+        unsafe { PartitionBody::at(pointer) }
+    }
+}
 
 /// Corpo da partição do sistema (0 = ainda não publicado).
 static BODY: SpinLock<u64> = SpinLock::new(0);
@@ -48,8 +75,9 @@ pub fn init() -> Result<u64, KernelError> {
     }
     // A vida é mantida pela referência do alocador, não por OBJ_PERMANENT:
     // o NtQueryObject da partição nativa não informa a flag permanente.
-    guest::write64(pointer, 0);
-    guest::write32(pointer + 8, 0);
+    let body = PartitionBody::of(pointer);
+    body.references.set(0);
+    body.handles.set(0);
     pfn::bind_partition(pointer);
     let result = (|| -> Result<(), KernelError> {
         dispatcher_objects::create(pointer, "partition", dispose, None, 0, false, dispatcher_objects::DispatcherHooks::default())?;
@@ -83,12 +111,23 @@ fn capture(attributes: u64, user: bool) -> Result<Result<(u64, u32), u32>, Kerne
     if user && !state::probe_user_read(attributes, 48) {
         return Ok(Err(0xC000_0005));
     }
-    if guest::read32(attributes) != 48 {
+    let mode = user as u8;
+    let read_attributes = || -> Result<(u32, u32, u64, u64), u32> {
+        let at = |offset: usize| attributes + offset as u64;
+        Ok((
+            caller_read(at(core::mem::offset_of!(ObjectAttributes, length)), mode)?,
+            caller_read(at(core::mem::offset_of!(ObjectAttributes, attributes)), mode)?,
+            caller_read(at(core::mem::offset_of!(ObjectAttributes, root_directory)), mode)?,
+            caller_read(at(core::mem::offset_of!(ObjectAttributes, object_name)), mode)?,
+        ))
+    };
+    let (length, flags, root, unicode) = match read_attributes() {
+        Ok(fields) => fields,
+        Err(status) => return Ok(Err(status)),
+    };
+    if length != ObjectAttributes::SIZE as u32 {
         return Ok(Err(0xC000_000D));
     }
-    let flags = guest::read32(attributes + 24);
-    let root = guest::read64(attributes + 8);
-    let unicode = guest::read64(attributes + 16);
     if flags & !0x1FE2 != 0 {
         return Ok(Err(0xC000_000D));
     }
@@ -98,15 +137,29 @@ fn capture(attributes: u64, user: bool) -> Result<Result<(u64, u32), u32>, Kerne
     if user && !state::probe_user_read(unicode, 16) {
         return Ok(Err(0xC000_0005));
     }
-    let length = guest::read16(unicode) as u64;
-    let buffer = guest::read64(unicode + 8);
-    if length & 1 != 0 || length > guest::read16(unicode + 2) as u64 {
+    let read_name = || -> Result<(u64, u64, u64), u32> {
+        let at = |offset: usize| unicode + offset as u64;
+        Ok((
+            caller_read::<u16>(at(core::mem::offset_of!(UnicodeString, length)), mode)? as u64,
+            caller_read::<u16>(at(core::mem::offset_of!(UnicodeString, maximum_length)), mode)? as u64,
+            caller_read(at(core::mem::offset_of!(UnicodeString, buffer)), mode)?,
+        ))
+    };
+    let (length, maximum, buffer) = match read_name() {
+        Ok(fields) => fields,
+        Err(status) => return Ok(Err(status)),
+    };
+    if length & 1 != 0 || length > maximum {
         return Ok(Err(0xC000_0033));
     }
     if length != 0 && (buffer == 0 || (user && !state::probe_user_read(buffer, length))) {
         return Ok(Err(0xC000_0005));
     }
-    let name: String = (0..length).step_by(2).map(|offset| char::from_u32(guest::read16(buffer + offset) as u32).unwrap_or('\u{FFFD}')).collect();
+    let units = match caller_units(buffer, length, mode) {
+        Ok(units) => units,
+        Err(status) => return Ok(Err(status)),
+    };
+    let name: String = units.iter().map(|&unit| char::from_u32(unit as u32).unwrap_or('\u{FFFD}')).collect();
     let mut start = object_manager::ROOT;
     if root != 0 {
         let opened = match namespace_handles::resolve(root, user) {
@@ -172,7 +225,8 @@ pub fn open(output: u64, access: u32, attributes: u64, user: bool) -> Result<u32
         if status != 0 {
             return Ok(status);
         }
-        let handle = guest::read64(scratch);
+        // SAFETY: a célula de 8 bytes alocada acima.
+        let handle = unsafe { Field::<u64>::at(scratch) }.get();
         if guest::try_write64(output, handle).is_err() {
             let _ = open_pointer::close(handle);
             return Ok(0xC000_0005);

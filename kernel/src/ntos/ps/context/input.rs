@@ -8,6 +8,8 @@ use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
 use crate::ntos::mm::{page_residency, paging};
 use crate::ntos::ps::user::state;
 use crate::rtl::KernelError;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Context, XsaveFormat};
 use crate::ntos::mm::guest_memory as guest;
 
 const AV: u32 = 0xC000_0005;
@@ -37,21 +39,33 @@ fn readable(pointer: u64, length: u64) -> bool {
 }
 
 fn ranges(flags: u32) -> alloc::vec::Vec<(u64, u64)> {
+    use core::mem::offset_of;
+    let field = |offset: usize, length: usize| (offset as u64, length as u64);
     let mut selected = alloc::vec::Vec::new();
     if flags & 1 != 0 {
-        selected.extend([(0xF8, 8), (0x98, 8), (0x38, 2), (0x42, 2), (0x44, 4)]);
+        selected.extend([
+            field(offset_of!(Context, rip), 8),
+            field(offset_of!(Context, rsp), 8),
+            field(offset_of!(Context, seg_cs), 2),
+            field(offset_of!(Context, seg_ss), 2),
+            field(offset_of!(Context, e_flags), 4),
+        ]);
     }
     if flags & 2 != 0 {
         selected.extend(INTEGER.iter().map(|&offset| (offset, 8)));
     }
     if flags & 4 != 0 {
-        selected.push((0x3A, 8));
+        // SegDs, SegEs, SegFs e SegGs.
+        selected.push(field(offset_of!(Context, seg_ds), 8));
     }
     if flags & 8 != 0 {
-        selected.extend([(0x34, 4), (0x100, 0x1A0)]);
+        selected.extend([field(offset_of!(Context, mx_csr), 4), field(offset_of!(Context, flt_save), offset_of!(XsaveFormat, reserved4))]);
     }
     if flags & 0x10 != 0 {
-        selected.extend([(0x48, 48), (0x4B0, 32)]);
+        selected.extend([
+            field(offset_of!(Context, dr0), offset_of!(Context, rax) - offset_of!(Context, dr0)),
+            field(offset_of!(Context, last_branch_to_rip), Context::SIZE as usize - offset_of!(Context, last_branch_to_rip)),
+        ]);
     }
     selected
 }
@@ -73,13 +87,24 @@ impl Captured {
 }
 
 pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelError> {
-    let flag_address = pointer.wrapping_add(0x30);
+    let flag_address = pointer.wrapping_add(core::mem::offset_of!(Context, context_flags) as u64);
     if mode != 0 && !readable(flag_address.min(USER_ADDRESS_LIMIT), 4) {
         return Ok(Err(AV));
     }
     // Lê as flags antes do alinhamento, da extensão total e do
     // acesso aos campos selecionados; falhas de kernel não viram status.
-    let flags = guest::read32(flag_address);
+    let flags = if mode != 0 {
+        // ContextFlags de modo usuário: leitura sondada (a página pode sumir
+        // depois da sondagem).
+        match guest::try_read::<u32>(flag_address) {
+            Ok(flags) => flags,
+            Err(_) => return Ok(Err(AV)),
+        }
+    } else {
+        // KernelMode passa o próprio CONTEXT (sem sondagem nem exigência de
+        // alinhamento, como no NT).
+        guest::read::<u32>(flag_address)
+    };
     let (status, flags) = registers::validate(flags, mode, false);
     if status != 0 {
         return Ok(Err(status));
@@ -105,6 +130,10 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelEr
     let mut captured = Captured { source: storage, flags, owned: true };
     if let Err(error) = registers::capture_registers(storage, pointer, flags) {
         captured.release();
+        // Página de usuário que sumiu durante a cópia: STATUS_ACCESS_VIOLATION.
+        if error.status == AV {
+            return Ok(Err(AV));
+        }
         return Err(error);
     }
     Ok(Ok(captured))

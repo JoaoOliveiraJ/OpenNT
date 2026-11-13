@@ -20,8 +20,8 @@ use core::task::{Context, Poll, Waker};
 use super::process;
 use crate::ntos::ke::{clock, thread_dispatch};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Ethread;
 
 pub type ProcessFuture = Pin<Box<dyn Future<Output = u32> + Send>>;
 /// Continuação de prontidão: consumida no contexto do dono; `true` = pronta.
@@ -393,7 +393,8 @@ pub fn current_pid() -> u32 {
     if thread == 0 {
         return 0;
     }
-    guest::read64(thread + kthread::CID_UNIQUE_PROCESS) as u32
+    // SAFETY: a thread corrente do Process Manager.
+    unsafe { Ethread::at(thread) }.cid.unique_process.get() as u32
 }
 
 /// Devolve o controle ao escalonador uma vez.

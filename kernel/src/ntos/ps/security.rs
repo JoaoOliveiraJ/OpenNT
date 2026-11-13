@@ -11,6 +11,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::process;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::UnicodeString;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_data;
 use crate::ntos::se::security_attributes::{self, OutputWriter};
@@ -27,17 +29,18 @@ struct GuestWriter {
 }
 
 impl OutputWriter for GuestWriter {
+    // O serializador escolhe os offsets do layout nativo; cada escrita é um MOV.
     fn u8(&mut self, offset: u64, value: u8) {
-        guest::write8(self.base + offset, value);
+        guest::write(self.base + offset, value);
     }
     fn u16(&mut self, offset: u64, value: u16) {
-        guest::write16(self.base + offset, value);
+        guest::write(self.base + offset, value);
     }
     fn u32(&mut self, offset: u64, value: u32) {
-        guest::write32(self.base + offset, value);
+        guest::write(self.base + offset, value);
     }
     fn u64(&mut self, offset: u64, value: u64) {
-        guest::write64(self.base + offset, value);
+        guest::write(self.base + offset, value);
     }
 }
 
@@ -48,7 +51,9 @@ pub fn query_attributes(token_pointer: u64, names_pointer: u64, name_count: u32,
         return Ok(0xC000_000D);
     }
     let token = owned_token(token_pointer, "SeQuerySecurityAttributesToken")?;
-    guest::write32(returned_length, 0);
+    // SAFETY: PULONG ReturnLength do chamador de kernel.
+    let returned_length = unsafe { Field::<u32>::at(returned_length) };
+    returned_length.set(0);
     // A seleção começa com todos; os filtros só valem para a lista não vazia.
     let all = &token.security_attributes;
     let mut selected = all.clone();
@@ -56,11 +61,11 @@ pub fn query_attributes(token_pointer: u64, names_pointer: u64, name_count: u32,
         // Valida todos os UNICODE_STRING antes de ler os nomes.
         let mut descriptors = Vec::new();
         let mut odd_length = false;
-        for index in 0..name_count as u64 {
-            let descriptor = names_pointer + index * 16;
-            let length = guest::read16(descriptor);
-            let maximum = guest::read16(descriptor + 2);
-            let text = guest::read64(descriptor + 8);
+        // SAFETY: UNICODE_STRING Attributes[NumberOfAttributes] do chamador de kernel.
+        for descriptor in unsafe { UnicodeString::array_at(names_pointer, name_count as usize) } {
+            let length = descriptor.length.get();
+            let maximum = descriptor.maximum_length.get();
+            let text = descriptor.buffer.get();
             if length == 0 || maximum == 0 || length > maximum || text == 0 {
                 return Ok(0xC000_000D);
             }
@@ -73,7 +78,8 @@ pub fn query_attributes(token_pointer: u64, names_pointer: u64, name_count: u32,
         let names: Vec<String> = descriptors
             .iter()
             .map(|&(text, length)| {
-                let units: Vec<u16> = (0..length as u64 / 2).map(|unit| guest::read16(text + unit * 2)).collect();
+                let bytes = guest::read_bytes(text, (length as usize / 2) * 2);
+                let units: Vec<u16> = bytes.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
                 String::from_utf16_lossy(&units)
             })
             .collect();
@@ -92,16 +98,14 @@ pub fn query_attributes(token_pointer: u64, names_pointer: u64, name_count: u32,
         Err(status) => return Ok(status),
     };
     if (output_length as u64) < size {
-        guest::write32(returned_length, size as u32);
+        returned_length.set(size as u32);
         return Ok(0xC000_0023);
     }
     // Lista não vazia zera o buffer todo; a vazia toca só o cabeçalho.
     let clear = if all.is_empty() { 16 } else { output_length as u64 };
-    for offset in 0..clear {
-        guest::write8(output + offset, 0);
-    }
+    guest::write_bytes(output, &alloc::vec![0; clear as usize]);
     let status = security_attributes::copy_out(&selected, output, output_length as u64, &mut GuestWriter { base: output }, !all.is_empty());
-    guest::write32(returned_length, size as u32);
+    returned_length.set(size as u32);
     Ok(status)
 }
 
@@ -115,10 +119,12 @@ pub fn process_attributes(token_pointer: u64, system_application: u64, package_i
     let token = owned_token(token_pointer, "PsQueryProcessAttributesByToken")?;
     let present = |name: &str| -> Result<u8, KernelError> { Ok(security_attributes::select(&token.security_attributes, Some(&[String::from(name)]))?.is_some() as u8) };
     if system_application != 0 {
-        guest::write8(system_application, present("WIN://SYSAPPID")?);
+        // SAFETY: PBOOLEAN de saída do chamador de kernel.
+        unsafe { Field::<u8>::at(system_application) }.set(present("WIN://SYSAPPID")?);
     }
     if package_identity != 0 {
-        guest::write8(package_identity, present("WIN://PKG")?);
+        // SAFETY: PBOOLEAN de saída do chamador de kernel.
+        unsafe { Field::<u8>::at(package_identity) }.set(present("WIN://PKG")?);
     }
     Ok(0)
 }

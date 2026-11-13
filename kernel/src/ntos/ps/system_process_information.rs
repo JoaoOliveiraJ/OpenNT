@@ -15,7 +15,8 @@ use super::pool_quota::{self, QuotaSnapshot};
 use super::{process, scheduler, session, user_probe};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Ethread;
 
 /// Amostra do processo de usuário corrente.
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,8 +117,10 @@ pub fn snapshot() -> Result<Vec<ProcessRecord>, KernelError> {
                 create_time: record.create_time,
                 start: record.start,
                 id: record.id,
-                priority: guest::read8(pointer + kthread::PRIORITY) as u32,
-                base_priority: guest::read8(pointer + kthread::BASE_PRIORITY) as u32,
+                // SAFETY: ETHREAD vivo da lista do processo.
+                priority: unsafe { Ethread::at(pointer) }.tcb.priority.get() as u8 as u32,
+                // SAFETY: idem.
+                base_priority: unsafe { Ethread::at(pointer) }.tcb.base_priority.get() as u8 as u32,
                 context_switches: record.context_switches,
                 state: if pointer == current { 2 } else if waiting { 5 } else { 1 },
                 wait_reason: 0,
@@ -212,8 +215,10 @@ pub fn query(output: u64, length: u64, returned: u64, user_mode: bool) -> Result
     }
     let records = snapshot()?;
     let needed: u64 = records.iter().map(|record| record.size).sum();
-    if returned != 0 {
-        guest::write32(returned, needed as u32);
+    // ReturnLength e o buffer podem ser de modo usuário: a escrita é sondada
+    // mesmo depois da sondagem do intervalo (a página pode sumir).
+    if returned != 0 && guest::try_write::<u32>(returned, needed as u32).is_err() {
+        return Ok(0xC000_0005);
     }
     if length < needed {
         return Ok(0xC000_0004);
@@ -224,6 +229,8 @@ pub fn query(output: u64, length: u64, returned: u64, user_mode: bool) -> Result
     if output % 8 != 0 {
         return Ok(0x8000_0002);
     }
-    guest::write_bytes(output, &encode(&records, output));
+    if guest::try_write_bytes(output, &encode(&records, output)).is_err() {
+        return Ok(0xC000_0005);
+    }
     Ok(0)
 }

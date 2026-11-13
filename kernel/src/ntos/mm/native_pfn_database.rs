@@ -7,6 +7,8 @@ use super::native_frame_descriptors::{self as descriptors, Configuration, DESCRI
 use super::paging::{self, MapOptions};
 use super::{frame_mapping_tracker as tracker, memory_map as map, pfn, physical_layout, recursive_mapping};
 use crate::hal::physical;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Mmpfn;
 use crate::rtl::{KernelError, SpinLock};
 
 #[derive(Clone, Copy, Debug)]
@@ -127,7 +129,8 @@ pub fn virtual_for_physical(physical_address: u64) -> u64 {
     if frame >= database.frame_count {
         return 0;
     }
-    let pte_address = physical::read64(database.physical_base + frame * database.descriptor_size + 8);
+    // SAFETY: descritor do banco de PFNs (mapa de identidade).
+    let pte_address = unsafe { Mmpfn::at(database.physical_base + frame * database.descriptor_size) }.pte_address.get();
     let page = ((pte_address.wrapping_sub(layout.page_table_base) << 25) as i64 >> 16) as u64;
     page.wrapping_add(physical_address & 0xFFF)
 }

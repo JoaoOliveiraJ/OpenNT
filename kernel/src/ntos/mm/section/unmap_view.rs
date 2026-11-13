@@ -12,8 +12,8 @@ use crate::ntos::ke::irql;
 use crate::ntos::ps::user::sections::View;
 use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Eprocess;
 
 /// Base de usuário acima do limite = MEMORY_NOT_ALLOCATED (só modo usuário).
 pub fn validate_base(base: u64, mode: u8) -> u32 {
@@ -42,7 +42,7 @@ pub fn unmap(handle: u64, base: u64, mode: u8) -> Result<u32, KernelError> {
         }
         let contains = |region_base: u64, size: u64| base >= region_base && base < region_base + size;
         let mut view = section_views::find(process.pointer, base);
-        if view.is_none() && guest::read64(process.pointer + eprocess::UNIQUE_PROCESS_ID) == state::with(|state| state.current_process_id) {
+        if view.is_none() && unsafe { Eprocess::at(process.pointer) }.unique_process_id.get() == state::with(|state| state.current_process_id) {
             let (data, image) = state::with(|state| {
                 let data = state.user_regions.iter().find(|region| region.as_any().downcast_ref::<View>().is_some() && contains(region.base(), region.size())).cloned();
                 let image = state.process_images.iter().find(|region| contains(region.base(), region.size())).cloned();

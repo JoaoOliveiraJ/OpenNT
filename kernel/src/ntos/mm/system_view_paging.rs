@@ -321,7 +321,8 @@ pub fn fault(address: u64, error_code: u32) -> FaultResult {
         return FaultResult::NotMine;
     }
     let entry_address = paging::query_page(address, true).map_or(0, |mapping| mapping.entry_address);
-    let entry_contents = if entry_address != 0 { physical::read32(entry_address) as u64 | (physical::read32(entry_address + 4) as u64) << 32 } else { 0 };
+    // A PTE inteira numa única leitura de 64 bits (sem observar duas metades).
+    let entry_contents = if entry_address != 0 { physical::read64(entry_address) } else { 0 };
     match page_in(&view, index) {
         Ok(()) => FaultResult::Resolved,
         Err(error) if error.status == 0 => panic!("{}", error.message),

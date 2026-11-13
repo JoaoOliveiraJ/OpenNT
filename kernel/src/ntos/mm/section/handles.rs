@@ -13,8 +13,8 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::sections::{self, Section};
 use crate::ntos::ps::user::state;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Eprocess;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -98,7 +98,8 @@ pub fn reference(handle: u64, kind: Kind, desired: u32, mode: u8) -> Result<Refe
     // A referência de SECTION aceita as tags NT dos dois bits baixos.
     let handle = handle & !3;
     let current = process::get_current_process();
-    let pid = guest::read64(current + eprocess::UNIQUE_PROCESS_ID);
+    // SAFETY: o processo corrente.
+    let pid = unsafe { Eprocess::at(current) }.unique_process_id.get();
     let user = if state::with(|state| state.current_process_id) == pid { state::get_user_handle(handle) } else { None };
     let node = if user.is_none() { object_manager::get_object(handle as u32).and_then(object_manager::node) } else { None };
     let (kind_name, owner, access, data) = match (&user, &node) {

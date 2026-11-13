@@ -12,7 +12,8 @@ use crate::ntos::mm::{page_residency, paging};
 use crate::ntos::ob::handles::thread as thread_handles;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Ethread;
 
 const THREAD_PAGE_PRIORITY: u32 = 24;
 const THREAD_SET_INFORMATION: u32 = 0x20;
@@ -67,7 +68,7 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
         return Ok(STATUS_ACCESS_VIOLATION);
     }
     // Captura uma vez: outra thread pode mudar o buffer enquanto o handle é resolvido.
-    let page_priority = guest::read32(input);
+    let Ok(page_priority) = guest::try_read::<u32>(input) else { return Ok(STATUS_ACCESS_VIOLATION) };
     if !(1..=5).contains(&page_priority) {
         return Ok(0xC000_000D);
     }
@@ -76,17 +77,11 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
         Err(status) => return Ok(status),
     };
     let result = (|| -> Result<u32, KernelError> {
-        let flags_address = reference.pointer + kthread::CROSS_THREAD_FLAGS;
-        let mut previous = guest::read32(flags_address);
-        loop {
-            let replacement = (previous & !0x7000) | (page_priority << kthread::PAGE_PRIORITY_SHIFT);
-            let observed = guest::compare_exchange32(flags_address, previous, replacement)?;
-            if observed == previous {
-                return Ok(0);
-            }
-            // Recalcula sobre os flags novos, preservando mudanças concorrentes.
-            previous = observed;
-        }
+        // CAS em CrossThreadFlags.ThreadPagePriority, preservando mudanças
+        // concorrentes dos outros bits.
+        // SAFETY: ETHREAD referenciado pelo handle.
+        unsafe { Ethread::at(reference.pointer) }.set_thread_page_priority(page_priority);
+        Ok(0)
     })();
     reference.release()?;
     result

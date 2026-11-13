@@ -12,6 +12,9 @@ use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::mm::{kernel_pool, loaded_images};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{ImageDosHeader, ImageNtHeaders64, PsCreateNotifyInfo, UnicodeString};
+use super::CallbackBlock;
 
 const POOL_TAG: u32 = 0x6272_6243; // 'Cbrb'
 
@@ -46,8 +49,12 @@ fn verified(callback: u64, extended: bool) -> bool {
     if !extended {
         return true;
     }
-    let pe = guest::read32(image.image_base + 0x3C) as u64;
-    guest::read16(image.image_base + pe + 24 + 70) & 0x80 != 0
+    // SAFETY: cabeçalhos PE da imagem carregada que contém a rotina.
+    let headers = image.image_base + unsafe { ImageDosHeader::at(image.image_base) }.e_lfanew.get() as u64;
+    // SAFETY: idem (DllCharacteristics é um USHORT; o e_lfanew não precisa
+    // alinhar o NT_HEADERS inteiro).
+    let characteristics = unsafe { Field::<u16>::at(headers + core::mem::offset_of!(ImageNtHeaders64, optional_header.dll_characteristics) as u64) };
+    characteristics.get() & 0x80 != 0
 }
 
 fn register(callback: u64, extended: bool) -> Result<u32, KernelError> {
@@ -55,7 +62,7 @@ fn register(callback: u64, extended: bool) -> Result<u32, KernelError> {
     if !verified(callback, extended) {
         return Ok(0xC000_0022);
     }
-    let pointer = kernel_pool::allocate(24, kernel_pool::AllocateOptions { tag: POOL_TAG, zero: true, ..Default::default() })?;
+    let pointer = kernel_pool::allocate(CallbackBlock::SIZE, kernel_pool::AllocateOptions { tag: POOL_TAG, zero: true, ..Default::default() })?;
     if pointer == 0 {
         return Ok(0xC000_009A);
     }
@@ -67,8 +74,9 @@ fn register(callback: u64, extended: bool) -> Result<u32, KernelError> {
     };
     // A imagem de referência permite registros duplicados; cada um ocupa um
     // slot e é removido separadamente.
-    guest::write64(pointer + 8, callback);
-    guest::write64(pointer + 16, if extended { 2 } else { 0 });
+    let block = CallbackBlock::of(pointer);
+    block.function.set(callback);
+    block.context.set(if extended { 2 } else { 0 });
     state.records.push(Registration { pointer, callback, extended, active: 0, removed: false, freed: false });
     let record = state.records.len() - 1;
     state.slots[index] = Some(record);
@@ -170,18 +178,20 @@ fn leave_executing(thread: u64) {
 /// Monta PS_CREATE_NOTIFY_INFO (72 bytes) quando há imagem.
 fn build_info(record: &NotifyRecord, command: &mut u64) -> Result<u64, KernelError> {
     let Some(image) = record.image else { return Ok(0) };
-    let info = guest::alloc_bytes(72);
+    let info = guest::alloc_bytes(PsCreateNotifyInfo::SIZE);
     if info == 0 {
         return Ok(0);
     }
-    guest::write64(info, 72);
-    guest::write32(info + 8, 1);
-    guest::write64(info + 16, record.parent_id);
-    guest::write64(info + 24, process::get_current_process_id());
-    guest::write64(info + 32, process::get_current_thread_id());
-    guest::write64(info + 40, image.file);
-    guest::write64(info + 48, image.cache);
-    guest::write64(info + 56, 0);
+    // SAFETY: PS_CREATE_NOTIFY_INFO recém-alocado.
+    let notify_info = unsafe { PsCreateNotifyInfo::at(info) };
+    notify_info.size.set(PsCreateNotifyInfo::SIZE);
+    notify_info.flags.set(1); // FileOpenNameAvailable
+    notify_info.parent_process_id.set(record.parent_id);
+    notify_info.creating_thread_id.unique_process.set(process::get_current_process_id());
+    notify_info.creating_thread_id.unique_thread.set(process::get_current_thread_id());
+    notify_info.file_object.set(image.file);
+    notify_info.image_file_name.set(image.cache);
+    notify_info.command_line.set(0);
     if let Some(value) = record.command_line {
         let units: Vec<u16> = value.encode_utf16().collect();
         if units.len() > 32766 {
@@ -189,20 +199,21 @@ fn build_info(record: &NotifyRecord, command: &mut u64) -> Result<u64, KernelErr
             return Err(KernelError::new("process command line too long"));
         }
         let bytes = units.len() as u64 * 2;
-        *command = guest::alloc_bytes(18 + bytes);
+        *command = guest::alloc_bytes(UnicodeString::SIZE + bytes + 2);
         if *command == 0 {
             guest::free_bytes(info);
             return Ok(u64::MAX);
         }
-        guest::write16(*command, bytes as u16);
-        guest::write16(*command + 2, bytes as u16 + 2);
-        guest::write64(*command + 8, *command + 16);
-        for (index, &unit) in units.iter().enumerate() {
-            guest::write16(*command + 16 + index as u64 * 2, unit);
-        }
-        guest::write64(info + 56, *command);
+        // SAFETY: UNICODE_STRING recém-alocado, com o buffer logo depois.
+        let string = unsafe { UnicodeString::at(*command) };
+        string.length.set(bytes as u16);
+        string.maximum_length.set(bytes as u16 + 2);
+        string.buffer.set(*command + UnicodeString::SIZE);
+        let characters: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        guest::write_bytes(*command + UnicodeString::SIZE, &characters);
+        notify_info.command_line.set(*command);
     }
-    guest::write32(info + 64, 0);
+    notify_info.creation_status.set(0);
     Ok(info)
 }
 
@@ -245,14 +256,16 @@ pub fn notify(pointer: u64, pid: u64, record: &NotifyRecord, created: bool) -> R
                 failure.get_or_insert(error);
             }
             // PspCallProcessNotifyRoutines para no primeiro CreationStatus negativo.
-            if info != 0 && guest::read32(info + 64) & 0x8000_0000 != 0 {
+            // SAFETY: o PS_CREATE_NOTIFY_INFO montado acima.
+            if info != 0 && unsafe { PsCreateNotifyInfo::at(info) }.creation_status.get() < 0 {
                 break;
             }
         }
         leave_executing(thread);
         match failure {
             Some(error) => Err(error),
-            None => Ok(if info != 0 { guest::read32(info + 64) } else { 0 }),
+            // SAFETY: idem.
+            None => Ok(if info != 0 { unsafe { PsCreateNotifyInfo::at(info) }.creation_status.get() as u32 } else { 0 }),
         }
     });
     if command != 0 {

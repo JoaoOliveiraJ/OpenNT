@@ -17,7 +17,8 @@ use alloc::vec::Vec;
 
 use crate::ntos::mm::guest_memory as guest;
 use self::kernel_image_source::ImageSource;
-use crate::ntos::inc::nt_abi::driver_object;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{DriverObject, KldrDataTableEntry, UnicodeString};
 use crate::ntos::{init::exports, io::lifecycle};
 use crate::ntos::mm::pe_loader::{self, ImageDependency, ImportSymbol, LoadOptions, PeImage, ResolvedImport};
 use self::pe_resolver::{ExportedModule, Symbol};
@@ -114,12 +115,13 @@ fn initialize(record: &mut Record) -> Result<(), KernelError> {
         guest::free_bytes(buffer);
         return Err(KernelError::with_status("kernel library registry string allocation failed", 0xC000_009A));
     }
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    guest::write16(string, units.len() as u16 * 2);
-    guest::write16(string + 2, (units.len() as u16 + 1) * 2);
-    guest::write64(string + 8, buffer);
+    let characters: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(buffer, &characters);
+    // SAFETY: UNICODE_STRING recém-alocado.
+    let registry_path = unsafe { UnicodeString::at(string) };
+    registry_path.length.set(units.len() as u16 * 2);
+    registry_path.maximum_length.set((units.len() as u16 + 1) * 2);
+    registry_path.buffer.set(buffer);
     crate::debug_print!("[kernel-library] DllInitialize {}", record.name);
     let entry = record.module.exports.exports.get("DllInitialize").copied().unwrap_or(0);
     let status = call(entry, &[string]);
@@ -156,7 +158,8 @@ fn unload(shared: &Shared) -> Result<bool, KernelError> {
             }
         }
         Kind::Driver => {
-            if driver == 0 || guest::read64(driver + driver_object::DRIVER_UNLOAD) == 0 || !lifecycle::unload_driver(&driver_name) {
+            // SAFETY: DRIVER_OBJECT vivo do driver carregado.
+            if driver == 0 || unsafe { DriverObject::at(driver) }.driver_unload.get() == 0 || !lifecycle::unload_driver(&driver_name) {
                 restore(shared);
                 return Ok(false);
             }
@@ -416,9 +419,10 @@ pub fn system_routine_address(name_string: u64) -> Result<u64, KernelError> {
         Some(ResolvedImport::Thunk(id)) => exports::thunk_address(id as u64),
         Some(ResolvedImport::Address { address, .. }) => Ok(address),
         None => {
-            let length = guest::read16(name_string);
-            let buffer = guest::read64(name_string + 8);
-            let raw: String = (0..length.min(32) as u64).map(|index| guest::read8(buffer + index) as char).collect();
+            // SAFETY: o UNICODE_STRING do chamador de kernel.
+            let string = unsafe { UnicodeString::at(name_string) };
+            let (length, buffer) = (string.length.get(), string.buffer.get());
+            let raw: String = guest::read_bytes(buffer, length.min(32) as usize).into_iter().map(|byte| byte as char).collect();
             debug_print!("[mm] NAO ACHOU: \"{}\" (len={} buf={:#x} raw=\"{}\")", name, length, buffer, raw);
             Ok(0)
         }
@@ -683,7 +687,6 @@ const SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL: u32 = 0xC000_019D;
 const MM_LOAD_IMAGE_IN_SESSION: u32 = 1;
 const MM_LOAD_IMAGE_AND_LOCKDOWN: u32 = 2;
 /// KLDR_DATA_TABLE_ENTRY.Flags e o bit testado no caminho "já carregada".
-const SYSTEM_IMAGE_LDR_FLAGS: u64 = 0x68;
 const SYSTEM_IMAGE_LOADED_AS_DLL: u32 = 0x0400_0000;
 
 /// Imagens carregadas por MmLoadSystemImage, pela entrada do loader.
@@ -709,7 +712,9 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
     if flags & 0x7FFF_FFFC != 0 {
         return Ok(SYSTEM_IMAGE_INVALID_PARAMETER_4);
     }
-    guest::write64(base_out, 0);
+    // SAFETY: PVOID* de saída do chamador de kernel.
+    let (handle_out, base_out) = unsafe { (Field::<u64>::at(handle_out), Field::<u64>::at(base_out)) };
+    base_out.set(0);
     let session = flags & MM_LOAD_IMAGE_IN_SESSION != 0;
     if session && flags & MM_LOAD_IMAGE_AND_LOCKDOWN != 0 {
         return Ok(SYSTEM_IMAGE_INVALID_PARAMETER_4);
@@ -723,9 +728,10 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
     let full_name = alloc::format!("{}{}", &path[..path.len() - file.len()], base_name);
 
     if let Some((entry, image_base)) = system_image_already_loaded(&base_name)? {
-        guest::write64(handle_out, entry);
-        guest::write64(base_out, image_base);
-        if guest::read32(entry + SYSTEM_IMAGE_LDR_FLAGS) & SYSTEM_IMAGE_LOADED_AS_DLL != 0 {
+        handle_out.set(entry);
+        base_out.set(image_base);
+        // SAFETY: a entrada nativa da imagem já listada.
+        if unsafe { KldrDataTableEntry::at(entry) }.flags.get() & SYSTEM_IMAGE_LOADED_AS_DLL != 0 {
             return Ok(SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL);
         }
         return Ok(if session { 0 } else { SYSTEM_IMAGE_ALREADY_LOADED });
@@ -747,8 +753,8 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
         image.release()?;
         return Err(KernelError::new("MmLoadSystemImage: kernel image without loader entry"));
     };
-    guest::write64(handle_out, entry);
-    guest::write64(base_out, image.image_base);
+    handle_out.set(entry);
+    base_out.set(image.image_base);
     SYSTEM_IMAGES.lock().insert(entry, image);
     Ok(0)
 }

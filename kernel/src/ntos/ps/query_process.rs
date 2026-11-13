@@ -6,7 +6,8 @@
 //! handle. As demais classes devolvem STATUS_INVALID_PARAMETER.
 
 use super::{image_information, process};
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eprocess, ProcessBasicInformation};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::KernelError;
 
@@ -22,24 +23,29 @@ pub fn query_information(handle: u64, class: u32, output: u64, length: u32, retu
     if class != 0 {
         return Ok(0xC000_000D);
     }
-    if length < 0x30 {
+    if (length as u64) < ProcessBasicInformation::SIZE {
         if returned != 0 {
-            guest::write32(returned, 0x30);
+            // SAFETY: PULONG ReturnLength do chamador de kernel.
+            unsafe { Field::<u32>::at(returned) }.set(ProcessBasicInformation::SIZE as u32);
         }
         return Ok(STATUS_BUFFER_TOO_SMALL);
     }
     let pid = process::process_id_from_handle(handle);
     let Some(target) = process::list_active_processes().into_iter().find(|entry| entry.pid == pid) else { return Ok(STATUS_INVALID_HANDLE) };
-    guest::write32(output, 0x103);
-    guest::write32(output + 4, 0);
-    guest::write64(output + 8, guest::read64(target.address + eprocess::PEB));
-    guest::write64(output + 0x10, 1);
-    guest::write32(output + 0x18, 8);
-    guest::write32(output + 0x1C, 0);
-    guest::write64(output + 0x20, pid);
-    guest::write64(output + 0x28, 4);
+    // Zera o buffer inteiro (o preenchimento também) antes dos campos.
+    guest::write_bytes(output, &[0; ProcessBasicInformation::SIZE as usize]);
+    // SAFETY: PROCESS_BASIC_INFORMATION do chamador de kernel (tamanho conferido).
+    let information = unsafe { ProcessBasicInformation::at(output) };
+    information.exit_status.set(0x103);
+    // SAFETY: EPROCESS achado na lista de processos ativos.
+    information.peb_base_address.set(unsafe { Eprocess::at(target.address) }.peb.get());
+    information.affinity_mask.set(1);
+    information.base_priority.set(8);
+    information.unique_process_id.set(pid);
+    information.inherited_from_unique_process_id.set(4);
     if returned != 0 {
-        guest::write32(returned, 0x30);
+        // SAFETY: PULONG ReturnLength do chamador de kernel.
+        unsafe { Field::<u32>::at(returned) }.set(ProcessBasicInformation::SIZE as u32);
     }
     Ok(0)
 }

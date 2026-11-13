@@ -21,7 +21,8 @@ use crate::ntos::ps::user::sections::{self, MapRequest};
 use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::Eprocess;
 use crate::ntos::init::exports::invoke_handler;
 use crate::ntos::ob::{object_types, open_pointer};
 use crate::ntos::ps::previous_mode;
@@ -86,7 +87,8 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
         if section.no_execute && protect != 2 {
             return Ok(0xC000_0045);
         }
-        let pid = guest::read64(process.pointer + eprocess::UNIQUE_PROCESS_ID);
+        // SAFETY: o processo alvo referenciado pelo handle.
+        let pid = unsafe { Eprocess::at(process.pointer) }.unique_process_id.get();
         let active = pid == state::with(|state| state.current_process_id);
         let regions = if !active {
             RegionKind::Detached
@@ -156,7 +158,8 @@ fn kernel_handle(object: u64, access: u32, object_type: u64) -> Result<Result<u6
         return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
     }
     let status = open_pointer::open(object, OBJ_KERNEL_HANDLE, 0, access, object_type, 0, slot);
-    let handle = guest::read64(slot);
+    // SAFETY: a célula de 8 bytes alocada acima.
+    let handle = unsafe { Field::<u64>::at(slot) }.get();
     guest::free_bytes(slot);
     Ok(match status? {
         0 => Ok(handle),

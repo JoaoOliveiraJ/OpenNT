@@ -16,31 +16,32 @@
 //!   ViIsDriverSuspectForVerifier percorre VfSuspectDriversList, vazia sem
 //!   verificador -> FALSE.
 
-use crate::ntos::inc::nt_abi::driver_object;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{DriverObject, KldrDataTableEntry};
 use crate::ntos::mm::loaded_images;
 
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
-/// KLDR_DATA_TABLE_ENTRY.Flags.
-const LDR_FLAGS: u64 = 0x68;
 /// LDRP_IMAGE_VERIFYING (`bt eax, 0x19`).
 const IMAGE_VERIFYING: u32 = 1 << 25;
 
 fn entry_verifying(entry: u64) -> bool {
-    entry != 0 && guest::read32(entry + LDR_FLAGS) & IMAGE_VERIFYING != 0
+    // SAFETY: DRIVER_OBJECT.DriverSection é a KLDR_DATA_TABLE_ENTRY do driver.
+    entry != 0 && unsafe { KldrDataTableEntry::at(entry) }.flags.get() & IMAGE_VERIFYING != 0
 }
 
 /// MmIsVerifierEnabled(PULONG VerifierFlags).
 pub fn is_enabled(verifier_flags: u64) -> u32 {
     if verifier_flags != 0 {
-        guest::write32(verifier_flags, 0);
+        // SAFETY: PULONG de saída do chamador de kernel.
+        unsafe { Field::<u32>::at(verifier_flags) }.set(0);
     }
     STATUS_NOT_SUPPORTED
 }
 
 /// MmIsDriverVerifying(DriverObject).
 pub fn is_driver_verifying(driver: u64) -> bool {
-    entry_verifying(guest::read64(driver + driver_object::DRIVER_SECTION))
+    // SAFETY: o DRIVER_OBJECT do chamador.
+    entry_verifying(unsafe { DriverObject::at(driver) }.driver_section.get())
 }
 
 /// MmIsDriverVerifyingByAddress(Address): nenhuma imagem = FALSE.
@@ -56,6 +57,7 @@ pub fn add_thunks(_buffer: u64, _size: u32) -> u32 {
 /// MmIsDriverSuspectForVerifier(DriverObject): a lista de suspeitos está
 /// vazia sem verificador, com ou sem DriverSection.
 pub fn is_driver_suspect(driver: u64) -> bool {
-    let _section = guest::read64(driver + driver_object::DRIVER_SECTION);
+    // SAFETY: o DRIVER_OBJECT do chamador.
+    let _section = unsafe { DriverObject::at(driver) }.driver_section.get();
     false
 }

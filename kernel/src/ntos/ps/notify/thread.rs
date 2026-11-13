@@ -10,7 +10,8 @@ use crate::hal::amd64::native_call;
 use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::mm::kernel_pool;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use super::CallbackBlock;
 
 const POOL_TAG: u32 = 0x6272_6243;
 
@@ -40,7 +41,7 @@ fn level(maximum: u8) -> Result<(), KernelError> {
 
 pub fn register(callback: u64) -> Result<u32, KernelError> {
     level(0)?;
-    let pointer = kernel_pool::allocate(24, kernel_pool::AllocateOptions { tag: POOL_TAG, zero: true, ..Default::default() })?;
+    let pointer = kernel_pool::allocate(CallbackBlock::SIZE, kernel_pool::AllocateOptions { tag: POOL_TAG, zero: true, ..Default::default() })?;
     if pointer == 0 {
         return Ok(0xC000_009A);
     }
@@ -50,7 +51,7 @@ pub fn register(callback: u64) -> Result<u32, KernelError> {
         kernel_pool::free(pointer, None)?;
         return Ok(0xC000_009A);
     };
-    guest::write64(pointer + 8, callback);
+    CallbackBlock::of(pointer).function.set(callback);
     state.records.push(Registration { pointer, callback, active: 0, removed: false, freed: false });
     let record = state.records.len() - 1;
     state.slots[index] = Some(record);

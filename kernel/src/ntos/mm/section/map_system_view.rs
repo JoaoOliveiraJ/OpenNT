@@ -12,6 +12,8 @@ use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::user::sections::{self, MapRequest, Section, View};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Section as SectionBody;
 
 fn status_of<T>(error: KernelError) -> Result<Result<T, u32>, KernelError> {
     if error.status != 0 {
@@ -74,6 +76,8 @@ fn map_with_offset(section_pointer: u64, base_pointer: u64, size_pointer: u64, o
     }
     let Some(section) = sections::by_pointer(section_pointer).filter(|_| section_objects::is_section(section_pointer)) else { return Err(KernelError::new("invalid SECTION pointer for system view")) };
     section_objects::reference(section_pointer);
+    // SAFETY: o corpo SECTION conferido acima; as leituras dele continuam sondadas.
+    let body = unsafe { SectionBody::at(section_pointer) };
     let result = (|| -> Result<u32, KernelError> {
         let size = guest::try_read64(size_pointer)?;
         if size != 0 {
@@ -84,13 +88,13 @@ fn map_with_offset(section_pointer: u64, base_pointer: u64, size_pointer: u64, o
             let Some(total) = size.checked_add(delta) else { return Ok(0xC000_001F) };
             guest::try_write64(size_pointer, total)?;
             align_section_offset(offset_pointer)?;
-            let remaining = guest::try_read64(section_pointer + 0x30)?.wrapping_sub(read_section_offset(offset_pointer)?);
+            let remaining = body.size_of_section.probe_get()?.wrapping_sub(read_section_offset(offset_pointer)?);
             if guest::try_read64(size_pointer)? > remaining {
                 return Ok(0xC000_001F);
             }
         } else {
             align_section_offset(offset_pointer)?;
-            let whole = guest::try_read64(section_pointer + 0x30)?.wrapping_sub(read_section_offset(offset_pointer)?);
+            let whole = body.size_of_section.probe_get()?.wrapping_sub(read_section_offset(offset_pointer)?);
             guest::try_write64(size_pointer, whole)?;
         }
         let view = match insert(&section, guest::try_read64(size_pointer)?, read_section_offset(offset_pointer)?, flags)? {

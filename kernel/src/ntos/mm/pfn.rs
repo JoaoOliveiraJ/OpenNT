@@ -47,7 +47,7 @@ static DATABASE: SpinLock<FrameDatabase> = SpinLock::new(FrameDatabase {
 /// Espelha o disponível no corpo da partição, quando publicado.
 fn mirror(body: u64, available: u64) {
     if body != 0 {
-        crate::ntos::mm::guest_memory::write64(body + 24, available);
+        crate::ntos::mm::partition::PartitionBody::of(body).available.set(available);
     }
 }
 
@@ -55,7 +55,7 @@ fn mirror(body: u64, available: u64) {
 pub fn bind_partition(body: u64) {
     let mut database = DATABASE.lock();
     database.partition_body = body;
-    crate::ntos::mm::guest_memory::write64(body + 16, database.partition.total);
+    crate::ntos::mm::partition::PartitionBody::of(body).total.set(database.partition.total);
     mirror(body, database.partition.available);
 }
 

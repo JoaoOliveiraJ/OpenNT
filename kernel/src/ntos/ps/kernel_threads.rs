@@ -33,7 +33,8 @@ use crate::ntos::rtl::run_once;
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{ClientId, Ethread, ObjectAttributes};
 use crate::ntos::init::export_names as abi_names;
 use crate::ntos::io::file::zw as zw_files;
 
@@ -41,6 +42,13 @@ const CONTEXT_SIZE: u64 = 0x400;
 const STACK_SIZE: u64 = 0x10000;
 const RAW: u64 = 0x300;
 const ARGUMENT_REGISTERS: [u64; 4] = [8, 16, 0x40, 0x48];
+/// KOBJECTS: ThreadObject.
+const THREAD_OBJECT: u8 = 6;
+
+fn ethread(pointer: u64) -> &'static Ethread {
+    // SAFETY: ETHREAD de uma thread de sistema criada por este módulo.
+    unsafe { Ethread::at(pointer) }
+}
 
 /// Resultado de uma sondagem de espera.
 pub enum WaitPoll {
@@ -398,7 +406,8 @@ fn begin_wait(name: &str, args: &[u64; 14]) -> Result<Option<Wait>, KernelError>
             if count == 0 || count > 64 || wait_type > 1 {
                 return boxed(Box::new(Immediate(0xC000_000D)));
             }
-            let objects: Vec<u64> = (0..count as u64).map(|index| guest::read64(args[1] + index * 8)).collect();
+            // SAFETY: PVOID Object[Count] do chamador de kernel.
+            let objects: Vec<u64> = unsafe { Field::<u64>::array_at(args[1], count as usize) }.iter().map(Field::get).collect();
             let mut unique = objects.clone();
             unique.sort_unstable();
             unique.dedup();
@@ -621,7 +630,7 @@ fn finish_thread(thread: &Shared) {
         wait.cancel();
     }
     let _ = thread_tokens::release(pointer);
-    guest::write32(pointer + 0x510, guest::read32(pointer + 0x510) | 1);
+    ethread(pointer).cross_thread_flags.atomic().fetch_or(Ethread::TERMINATED_MASK, Ordering::SeqCst);
     loop {
         let parent = thread.lock().callbacks.pop();
         let Some(mut parent) = parent else { break };
@@ -640,7 +649,7 @@ fn finish_thread(thread: &Shared) {
         debug_print!("[kernel-threads] APC rundown failed: {}", error);
     }
     swap_irql(caller_irql);
-    guest::write32(pointer + 4, 1);
+    ethread(pointer).tcb.header.signal_state.set(1);
 }
 
 async fn thread_proc(thread: Shared) -> u32 {
@@ -754,9 +763,10 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
         win32_thunk::init_kernel_context_fx(context);
         guest::write64(rsp, win32_thunk::kernel_thread_return());
         // ThreadObject: não sinalizado até o término.
-        guest::write8(pointer, 6);
-        guest::write32(pointer + 4, 0);
-        guest::write16(pointer + kthread::KERNEL_APC_DISABLE, 0xFFFF);
+        let object = ethread(pointer);
+        object.tcb.header.type_.set(THREAD_OBJECT);
+        object.tcb.header.signal_state.set(0);
+        object.tcb.kernel_apc_disable.set(-1);
         let attributes = handle_options.map_or(0, |options| options.attributes);
         // Requisições internas ficam com handles da tabela do System;
         // PsCreateSystemThread repassa os atributos OBJ_* do chamador.
@@ -791,11 +801,14 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
         thread.lock().handle = handle;
         let published = if attributes & 0x200 != 0 { 0xFFFF_FFFF_8000_0000 | handle as u64 } else { handle as u64 };
         if output_handle != 0 {
-            guest::write64(output_handle, published);
+            // SAFETY: PHANDLE de saída do chamador de kernel.
+            unsafe { Field::<u64>::at(output_handle) }.set(published);
         }
         if client_id != 0 {
-            guest::write64(client_id, guest::read64(pointer + kthread::CID_UNIQUE_PROCESS));
-            guest::write64(client_id + 8, id);
+            // SAFETY: PCLIENT_ID de saída do chamador de kernel.
+            let output = unsafe { ClientId::at(client_id) };
+            output.unique_process.set(object.cid.unique_process.get());
+            output.unique_thread.set(id);
         }
         process::set_thread_start(pointer, start_routine);
         process::notify_thread_created(pointer)?;
@@ -807,7 +820,7 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
                 thread.reaped = true;
                 thread.context
             };
-            guest::write32(pointer + 4, 1);
+            ethread(pointer).tcb.header.signal_state.set(1);
             guest::free_bytes(stack);
             guest::free_bytes(context);
             collect(pointer);
@@ -833,7 +846,8 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
 /// context) pelos OBJECT_ATTRIBUTES do chamador: OBJ_KERNEL_HANDLE escolhe a
 /// tabela do System; senão, a do processo corrente.
 pub fn create_system_thread_with_attributes(output_handle: u64, access: u32, object_attributes: u64, client_id: u64, start_routine: u64, context_pointer: u64) -> Result<u64, KernelError> {
-    let flags = if object_attributes != 0 { guest::read32(object_attributes + 24) } else { 0 };
+    // SAFETY: OBJECT_ATTRIBUTES do chamador de kernel (opcional).
+    let flags = if object_attributes != 0 { unsafe { ObjectAttributes::at(object_attributes) }.attributes.get() } else { 0 };
     let owner = if flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
     create_system_thread(output_handle, start_routine, context_pointer, access, client_id, Some(HandleOptions { owner_process: Some(owner), attributes: flags }))
 }
@@ -847,7 +861,7 @@ pub fn terminate_current_thread(status: u32) -> Result<u32, KernelError> {
         thread.terminated = true;
         thread.pointer
     };
-    guest::write32(pointer + 0x510, guest::read32(pointer + 0x510) | 1);
+    ethread(pointer).cross_thread_flags.atomic().fetch_or(Ethread::TERMINATED_MASK, Ordering::SeqCst);
     Ok(0)
 }
 

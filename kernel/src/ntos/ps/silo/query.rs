@@ -6,8 +6,8 @@
 
 use crate::ntos::ps::process;
 use crate::ntos::ke::pcr;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{ejob, eprocess, kthread};
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Ejob, Eprocess, Ethread};
 
 pub const INHERIT: u64 = 0xFFFF_FFFF_FFFF_FFFD;
 
@@ -24,36 +24,52 @@ pub fn is_host_silo(silo: u64) -> bool {
     silo == HOST_SILO
 }
 
+fn ejob(job: u64) -> &'static Ejob {
+    // SAFETY: jobs vivos (o do processo, um pai na cadeia ou o do chamador).
+    unsafe { Ejob::at(job) }
+}
+
+fn eprocess(process: u64) -> &'static Eprocess {
+    // SAFETY: processo vivo (dono da thread ou o do chamador).
+    unsafe { Eprocess::at(process) }
+}
+
+fn ethread(thread: u64) -> &'static Ethread {
+    // SAFETY: thread viva (a corrente ou a do chamador).
+    unsafe { Ethread::at(thread) }
+}
+
 pub fn job_silo(job: u64) -> u64 {
     let mut job = job;
-    while job != 0 && guest::read32(job + ejob::FLAGS) & 0x4000_0000 == 0 {
-        job = guest::read64(job + ejob::PARENT);
+    while job != 0 && ejob(job).silo() == 0 {
+        job = ejob(job).parent_job.get();
     }
     job
 }
 
 pub fn effective_server_silo(silo: u64) -> u64 {
     let mut silo = silo;
-    while silo != 0 && guest::read64(silo + ejob::SERVER_SILO_GLOBALS) == 0 {
-        silo = guest::read64(silo + ejob::PARENT);
+    while silo != 0 && ejob(silo).server_silo_globals.get() == 0 {
+        silo = ejob(silo).parent_job.get();
     }
     silo
 }
 
 pub fn process_server_silo(process: u64) -> u64 {
-    guest::read64(process + eprocess::SERVER_SILO)
+    eprocess(process).server_silo.get()
 }
 
 pub fn thread_server_silo(thread: u64) -> u64 {
-    let silo = guest::read64(thread + kthread::SILO);
-    if silo == INHERIT { process_server_silo(guest::read64(thread + kthread::PROCESS)) } else { effective_server_silo(silo) }
+    let thread = ethread(thread);
+    let silo = thread.silo.get();
+    if silo == INHERIT { process_server_silo(thread.tcb.process.get()) } else { effective_server_silo(silo) }
 }
 
 /// PsGetCurrentSilo.
 pub fn current_silo() -> u64 {
-    let thread = process::get_current_thread();
-    let silo = guest::read64(thread + kthread::SILO);
-    if silo == INHERIT { job_silo(guest::read64(guest::read64(thread + kthread::PROCESS) + eprocess::JOB)) } else { silo }
+    let thread = ethread(process::get_current_thread());
+    let silo = thread.silo.get();
+    if silo == INHERIT { job_silo(eprocess(thread.tcb.process.get()).job.get()) } else { silo }
 }
 
 /// PsGetCurrentServerSilo: NULL dentro de DPC.
@@ -68,14 +84,14 @@ pub fn is_current_thread_in_server_silo() -> bool {
 
 /// PsAttachSiloToCurrentThread: devolve o silo anterior.
 pub fn attach(silo: u64) -> u64 {
-    let field = process::get_current_thread() + kthread::SILO;
-    let previous = guest::read64(field);
-    guest::write64(field, silo);
+    let field = &ethread(process::get_current_thread()).silo;
+    let previous = field.get();
+    field.set(silo);
     previous
 }
 
 pub fn detach(previous: u64) {
-    guest::write64(process::get_current_thread() + kthread::SILO, previous);
+    ethread(process::get_current_thread()).silo.set(previous);
 }
 
 /// PsGetJobSilo: STATUS_JOB_NO_CONTAINER sem silo.
@@ -87,17 +103,19 @@ pub fn get_job_silo(job: u64, output: u64) -> u32 {
     if silo == 0 {
         return 0xC000_0509;
     }
-    guest::write64(output, silo);
+    // SAFETY: PESILO* de saída do chamador de kernel.
+    unsafe { Field::<u64>::at(output) }.set(silo);
     0
 }
 
 /// PsGetJobServerSilo: o 19041 limpa a saída até com job NULL.
 pub fn get_job_server_silo(job: u64, output: u64) -> u32 {
-    guest::write64(output, effective_server_silo(job));
+    // SAFETY: PESILO* de saída do chamador de kernel.
+    unsafe { Field::<u64>::at(output) }.set(effective_server_silo(job));
     if job != 0 { 0 } else { 0xC000_000D }
 }
 
 /// PsIsCurrentThreadPrefetching (bit 6 de SameThreadApcFlags).
 pub fn is_prefetching() -> bool {
-    (guest::read8(process::get_current_thread() + kthread::SAME_THREAD_APC_FLAGS) >> 6) & 1 != 0
+    ethread(process::get_current_thread()).prefetching() != 0
 }

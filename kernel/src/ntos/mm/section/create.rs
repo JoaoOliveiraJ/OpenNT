@@ -22,8 +22,28 @@ use crate::ntos::ps::{process, user_probe};
 use crate::ntos::se::object_security;
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use core::mem::offset_of;
+
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Acl, Eprocess, ObjectAttributes, SecurityDescriptor, SecurityDescriptorRelative, Sid, UnicodeString};
+
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+
+/// Lê um campo de uma estrutura do chamador (OBJECT_ATTRIBUTES, nome,
+/// descritor): em UserMode a leitura é sondada — a página pode sumir depois
+/// da sondagem do intervalo, o `__try` do NT — e falha com
+/// STATUS_ACCESS_VIOLATION; em KernelMode é direta. Pelo endereço do campo:
+/// o NT só exige alinhamento de 4 nessas estruturas.
+pub(crate) fn caller_read<T: GuestScalar>(address: u64, mode: u8) -> Result<T, u32> {
+    if mode != 0 { guest::try_read(address).map_err(|_| STATUS_ACCESS_VIOLATION) } else { Ok(guest::read(address)) }
+}
+
+/// Os caracteres de um nome do chamador (`length` bytes), lidos em bloco.
+pub(crate) fn caller_units(buffer: u64, length: u64, mode: u8) -> Result<Vec<u16>, u32> {
+    let bytes = if mode != 0 { guest::try_read_bytes(buffer, length as usize).map_err(|_| STATUS_ACCESS_VIOLATION)? } else { guest::read_bytes(buffer, length as usize) };
+    Ok(bytes.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect())
+}
 
 fn readable(pointer: u64, length: u64) -> bool {
     user_probe::probe_user_read(pointer, length)
@@ -37,7 +57,7 @@ pub fn descriptor_probe(pointer: u64) -> bool {
     if !readable(pointer, 4) {
         return false;
     }
-    let control = guest::read16(pointer + 2);
+    let Ok(control) = guest::try_read::<u16>(pointer + offset_of!(SecurityDescriptor, control) as u64) else { return false };
     let relative = control & 0x8000 != 0;
     if !readable(pointer, if relative { 20 } else { 40 }) {
         return false;
@@ -46,7 +66,13 @@ pub fn descriptor_probe(pointer: u64) -> bool {
         if (index == 2 && control & 16 == 0) || (index == 3 && control & 4 == 0) {
             continue;
         }
-        let field = if relative { guest::read32(pointer + 4 + index * 4) as u64 } else { guest::read64(pointer + 8 + index * 8) };
+        // Owner, Group, Sacl e Dacl: deslocamentos (auto-relativo) ou ponteiros.
+        let field = if relative {
+            guest::try_read::<u32>(pointer + offset_of!(SecurityDescriptorRelative, owner) as u64 + index * 4).map(u64::from)
+        } else {
+            guest::try_read::<u64>(pointer + offset_of!(SecurityDescriptor, owner) as u64 + index * 8)
+        };
+        let Ok(field) = field else { return false };
         if field == 0 {
             continue;
         }
@@ -54,7 +80,13 @@ pub fn descriptor_probe(pointer: u64) -> bool {
         if !readable(component, 8) {
             return false;
         }
-        let size = if index < 2 { 8 + 4 * guest::read8(component + 1) as u64 } else { guest::read16(component + 2) as u64 };
+        // SID: cabeçalho de 8 bytes + SubAuthorityCount DWORDs; ACL: AclSize.
+        let size = if index < 2 {
+            guest::try_read::<u8>(component + offset_of!(Sid, sub_authority_count) as u64).map(|count| offset_of!(Sid, sub_authority) as u64 + 4 * count as u64)
+        } else {
+            guest::try_read::<u16>(component + offset_of!(Acl, acl_size) as u64).map(u64::from)
+        };
+        let Ok(size) = size else { return false };
         if !readable(component, size) {
             return false;
         }
@@ -83,16 +115,16 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
     if pointer == 0 {
         return Ok(Attributes::default());
     }
-    if guest::read32(pointer) != 48 {
+    if caller_read::<u32>(pointer + offset_of!(ObjectAttributes, length) as u64, mode)? != ObjectAttributes::SIZE as u32 {
         return Err(0xC000_000D);
     }
-    let flags = guest::read32(pointer + 24);
-    let root = guest::read64(pointer + 8);
-    let unicode = guest::read64(pointer + 16);
+    let flags: u32 = caller_read(pointer + offset_of!(ObjectAttributes, attributes) as u64, mode)?;
+    let root: u64 = caller_read(pointer + offset_of!(ObjectAttributes, root_directory) as u64, mode)?;
+    let unicode: u64 = caller_read(pointer + offset_of!(ObjectAttributes, object_name) as u64, mode)?;
     if flags & !0x1FF2 != 0 || (mode != 0 && flags & 0x200 != 0) {
         return Err(0xC000_000D);
     }
-    let security_descriptor = guest::read64(pointer + 32);
+    let security_descriptor: u64 = caller_read(pointer + offset_of!(ObjectAttributes, security_descriptor) as u64, mode)?;
     if mode != 0 && !descriptor_probe(security_descriptor) {
         return Err(0xC000_0005);
     }
@@ -103,9 +135,9 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
     if mode != 0 && !readable(unicode, 16) {
         return Err(0xC000_0005);
     }
-    let length = guest::read16(unicode) as u64;
-    let maximum = guest::read16(unicode + 2) as u64;
-    let buffer = guest::read64(unicode + 8);
+    let length = caller_read::<u16>(unicode + offset_of!(UnicodeString, length) as u64, mode)? as u64;
+    let maximum = caller_read::<u16>(unicode + offset_of!(UnicodeString, maximum_length) as u64, mode)? as u64;
+    let buffer: u64 = caller_read(unicode + offset_of!(UnicodeString, buffer) as u64, mode)?;
     if length & 1 != 0 || length > maximum || (buffer == 0 && length != 0) {
         return Err(0xC000_0033);
     }
@@ -115,7 +147,7 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
     if mode != 0 && !readable(buffer, length) {
         return Err(0xC000_0005);
     }
-    let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let units = caller_units(buffer, length, mode)?;
     let mut name = String::from_utf16_lossy(&units);
     if name.contains('\0') || name.ends_with('\\') || name.contains("\\\\") {
         return Err(0xC000_0033);
@@ -130,7 +162,8 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
         }
         let mut directory = if root <= 0x7FFF_FFFF { object_manager::get_object(root as u32) } else { None };
         let current = process::get_current_process();
-        if root <= 0x7FFF_FFFF && current != process::get_system_process() && state::with(|state| state.current_process_id) == guest::read64(current + eprocess::UNIQUE_PROCESS_ID) {
+        // SAFETY: o processo corrente.
+        if root <= 0x7FFF_FFFF && current != process::get_system_process() && state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() {
             if let Some(entry) = state::get_user_handle(root) {
                 if entry.kind() != "directory" {
                     return Err(0xC000_0024);
@@ -178,7 +211,8 @@ fn open_and_publish(pointer: u64, flags: u32, access: u32, mode: u8, output: u64
         if status != 0 {
             return Ok(status);
         }
-        let handle = guest::read64(scratch);
+        // SAFETY: a célula de 8 bytes alocada acima.
+        let handle = unsafe { Field::<u64>::at(scratch) }.get();
         if let Err(error) = guest::try_write64(output, handle) {
             open_pointer::close(handle);
             return Err(error);

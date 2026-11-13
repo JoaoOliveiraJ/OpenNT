@@ -17,8 +17,12 @@ use crate::ntos::ps::user::state;
 use crate::ntos::se::object_security;
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
+use core::mem::offset_of;
+
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::mm::section::create::{caller_read, caller_units};
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eprocess, ObjectAttributes, SecurityDescriptor, SecurityQualityOfService, UnicodeString};
 
 fn readable(pointer: u64, length: u64) -> bool {
     state::probe_user_read(pointer, length)
@@ -44,10 +48,10 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
     if mode != 0 && !readable(pointer, 48) {
         return Err(0xC000_0005);
     }
-    if guest::read32(pointer) != 48 {
+    if caller_read::<u32>(pointer + offset_of!(ObjectAttributes, length) as u64, mode)? != ObjectAttributes::SIZE as u32 {
         return Err(0xC000_000D);
     }
-    let mut flags = guest::read32(pointer + 24);
+    let mut flags: u32 = caller_read(pointer + offset_of!(ObjectAttributes, attributes) as u64, mode)?;
     if mode != 0 {
         // O Ob limpa OBJ_KERNEL_HANDLE para chamadores de usuário.
         flags &= !0x200;
@@ -55,10 +59,10 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
     if flags & !0x1_1FF2 != 0 {
         return Err(0xC000_000D);
     }
-    let root = guest::read64(pointer + 8);
-    let unicode = guest::read64(pointer + 16);
-    let descriptor = guest::read64(pointer + 32);
-    let qos = guest::read64(pointer + 40);
+    let root: u64 = caller_read(pointer + offset_of!(ObjectAttributes, root_directory) as u64, mode)?;
+    let unicode: u64 = caller_read(pointer + offset_of!(ObjectAttributes, object_name) as u64, mode)?;
+    let descriptor: u64 = caller_read(pointer + offset_of!(ObjectAttributes, security_descriptor) as u64, mode)?;
+    let qos: u64 = caller_read(pointer + offset_of!(ObjectAttributes, security_quality_of_service) as u64, mode)?;
     if qos != 0 {
         if mode != 0 && qos & 3 != 0 {
             return Err(0x8000_0002);
@@ -74,16 +78,16 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
         if mode != 0 && !crate::ntos::mm::section::create::descriptor_probe(descriptor) {
             return Err(0xC000_0005);
         }
-        if guest::read8(descriptor) != 1 {
+        if caller_read::<u8>(descriptor + offset_of!(SecurityDescriptor, revision) as u64, mode)? != 1 {
             return Err(0xC000_0058);
         }
         callback_security::capture(descriptor)?;
     }
     if qos != 0 {
-        if guest::read8(qos + 8) > 1 {
+        if caller_read::<u8>(qos + offset_of!(SecurityQualityOfService, context_tracking_mode) as u64, mode)? > 1 {
             return Err(0xC000_000D);
         }
-        if guest::read32(qos + 4) > 3 {
+        if caller_read::<u32>(qos + offset_of!(SecurityQualityOfService, impersonation_level) as u64, mode)? > 3 {
             return Err(0xC000_00A5);
         }
     }
@@ -93,8 +97,8 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
     if mode != 0 && !readable(unicode, 16) {
         return Err(0xC000_0005);
     }
-    let length = guest::read16(unicode) as u64;
-    let buffer = guest::read64(unicode + 8);
+    let length = caller_read::<u16>(unicode + offset_of!(UnicodeString, length) as u64, mode)? as u64;
+    let buffer: u64 = caller_read(unicode + offset_of!(UnicodeString, buffer) as u64, mode)?;
     // O Ob captura Length bytes; MaximumLength não é entrada de validação.
     if mode != 0 && length != 0 && buffer & 1 != 0 {
         return Err(0x8000_0002);
@@ -108,7 +112,7 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Captured, u32> {
     if mode != 0 && length != 0 && !readable(buffer, length) {
         return Err(0xC000_0005);
     }
-    let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let units: Vec<u16> = caller_units(buffer, length, mode)?;
     Ok(Captured { flags, root, name: String::from_utf16_lossy(&units) })
 }
 
@@ -120,7 +124,8 @@ fn root_directory(handle: u64, mode: u8) -> Result<NodeId, u32> {
     }
     let current = process::get_current_process();
     if !kernel && current != process::get_system_process() {
-        let entry = if state::with(|state| state.current_process_id) == guest::read64(current + eprocess::UNIQUE_PROCESS_ID) { state::get_user_handle(handle) } else { None };
+        // SAFETY: o processo corrente.
+        let entry = if state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() { state::get_user_handle(handle) } else { None };
         let Some(entry) = entry else { return Err(0xC000_0008) };
         if entry.kind() != "directory" {
             return Err(0xC000_0024);
@@ -286,7 +291,8 @@ pub fn open(output: u64, desired: u32, attributes: u64, mode: u8) -> Result<u32,
         }
         let pointer = node.data.as_ref().map_or(0, |data| data.native_pointer);
         let status = open_pointer::open(pointer, info.flags & !0x1_0090, 0, desired, object_types::section_type().pointer, mode, scratch);
-        let opened = guest::read64(scratch);
+        // SAFETY: a célula de 8 bytes alocada acima.
+        let opened = unsafe { Field::<u64>::at(scratch) }.get();
         guest::free_bytes(scratch);
         let status = status?;
         if status != 0 {

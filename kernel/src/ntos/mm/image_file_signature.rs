@@ -4,38 +4,37 @@
 //! transforma a ausência de cache em confiança.
 
 use crate::ntos::ex::spin_lock;
-use crate::ntos::mm::guest_memory as guest;
-
-// Layouts do ntoskrnl de referência (instruções e PDB).
-const SECTION_OBJECT_POINTERS_OFFSET: u64 = 0x28;
-const IMAGE_SECTION_OFFSET: u64 = 0x10;
-const CONTROL_AREA_FLAGS_OFFSET: u64 = 0x38;
-const CONTROL_AREA_LOCK_OFFSET: u64 = 0x48;
-const SEGMENT_SIGNATURE_BYTE_OFFSET: u64 = 0xF;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{ControlArea, FileObject, Segment, SectionObjectPointers};
 
 /// Nível de assinatura guardado no segmento da imagem do FILE_OBJECT (0 =
 /// sem seção de imagem ou control area em transição).
 pub fn query(file_object: u64) -> u64 {
-    let section_pointers = guest::read64(file_object + SECTION_OBJECT_POINTERS_OFFSET);
+    // SAFETY: o FILE_OBJECT referenciado pelo chamador.
+    let section_pointers = unsafe { FileObject::at(file_object) }.section_object_pointer.get();
     if section_pointers == 0 {
         return 0;
     }
+    // SAFETY: FILE_OBJECT.SectionObjectPointer aponta para o SECTION_OBJECT_POINTERS do arquivo.
+    let pointers = unsafe { SectionObjectPointers::at(section_pointers) };
     loop {
-        let control_area = guest::read64(section_pointers + IMAGE_SECTION_OFFSET);
+        let control_area = pointers.image_section_object.get();
         if control_area == 0 {
             return 0;
         }
-        let lock = control_area + CONTROL_AREA_LOCK_OFFSET;
+        // SAFETY: a CONTROL_AREA da seção de imagem, revalidada sob o lock.
+        let area = unsafe { ControlArea::at(control_area) };
+        let lock = area.control_area_lock.address();
         let previous = spin_lock::acquire_exclusive(lock);
         // Revalida a associação já com a exclusão; o byte é lido sob o lock.
-        let result = if guest::read64(section_pointers + IMAGE_SECTION_OFFSET) != control_area {
+        let result = if pointers.image_section_object.get() != control_area {
             None
-        } else if guest::read32(control_area + CONTROL_AREA_FLAGS_OFFSET) & 3 != 0 {
+        } else if area.u.flags.being_deleted() != 0 || area.u.flags.being_created() != 0 {
             // BeingDeleted e BeingCreated: segmento transitório.
             Some(0)
         } else {
-            let segment = guest::read64(control_area);
-            Some((guest::read8(segment + SEGMENT_SIGNATURE_BYTE_OFFSET) >> 4) as u64)
+            // SAFETY: CONTROL_AREA.Segment de uma área viva.
+            Some(unsafe { Segment::at(area.segment.get()) }.segment_flags.image_signing_level() as u64)
         };
         let _ = spin_lock::release_exclusive(lock, previous);
         if let Some(level) = result {

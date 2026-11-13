@@ -14,7 +14,8 @@ use crate::ntos::ps::process;
 use crate::ntos::ke::{dispatcher, irql};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread::MISC_FLAGS;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Context, Ethread};
 
 /// Operação em andamento; a entrada capturada sai na conclusão.
 pub enum Operation {
@@ -56,13 +57,16 @@ pub fn begin(thread: u64, input: u64, probe_mode: u8, context_mode: u8, flags: u
         Err(status) => return Ok(Operation::Completed(status)),
     };
     // A captura e a validação precedem o teste de SystemThread.
-    if context_mode != 0 && guest::read32(thread + MISC_FLAGS) & 0x400 != 0 {
+    // SAFETY: ETHREAD existente (conferido pelo registro acima).
+    if context_mode != 0 && unsafe { Ethread::at(thread) }.tcb.system_thread() != 0 {
         captured.release();
         return Ok(Operation::Completed(0xC000_0030));
     }
     let caller = process::thread_record(process::get_current_thread());
     if context_mode != 0 && flags & 2 == 0 && caller.is_some_and(|caller| caller.process == record.process) && captured.flags & 0x10_0001 == 0x10_0001 {
-        guest::write16(captured.source + 0x38, 0x33);
+        // CONTEXT.SegCs da entrada capturada (a cópia própria ou o buffer de
+        // KernelMode, sem exigência de alinhamento).
+        guest::write::<u16>(captured.source + core::mem::offset_of!(Context, seg_cs) as u64, 0x33);
     }
     let source = captured.source;
     let captured = alloc::sync::Arc::new(SpinLock::new(captured));

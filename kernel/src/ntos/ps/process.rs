@@ -28,7 +28,9 @@ use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eprocess, Ethread, Kthread, LargeInteger, ListEntry};
+use crate::ntos::ps::silo::query::INHERIT as INHERIT_PROCESS_SILO;
 
 use crate::ntos::ps::notify::{process as process_notify, thread as thread_notify};
 
@@ -37,6 +39,12 @@ pub const SYSTEM_PROCESS_ID: u64 = 4;
 const NORMAL_THREAD_PAGE_PRIORITY: u32 = 5;
 const STATUS_INVALID_CID: u32 = 0xC000_000B;
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+/// KOBJECTS: ProcessObject e ThreadObject (DISPATCHER_HEADER.Type).
+const PROCESS_OBJECT: u8 = 3;
+const THREAD_OBJECT: u8 = 6;
+/// KTHREAD.State: Initialized e Terminated.
+const THREAD_INITIALIZED: u8 = 0;
+const THREAD_TERMINATED: u8 = 4;
 
 /// Imagem executável de um processo (`ps/process_image`, fase 6).
 #[derive(Clone, Debug)]
@@ -151,9 +159,26 @@ static NEXT_SEQUENCE_NUMBER: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// PROCESS_PRIORITY_CLASS_NORMAL.
 const PROCESS_PRIORITY_CLASS_NORMAL: u8 = 2;
 
-fn write_time(pointer: u64, value: u64) {
-    guest::write32(pointer, value as u32);
-    guest::write32(pointer + 4, (value >> 32) as u32);
+/// LARGE_INTEGER de tempo numa única escrita de 64 bits.
+fn write_time(time: &LargeInteger, value: u64) {
+    time.quad_part.set(value as i64);
+}
+
+fn eprocess(process: u64) -> &'static Eprocess {
+    // SAFETY: EPROCESS criado por este módulo (ou retido pelo chamador).
+    unsafe { Eprocess::at(process) }
+}
+
+fn ethread(thread: u64) -> &'static Ethread {
+    // SAFETY: ETHREAD criado por este módulo (ou retido pelo chamador).
+    unsafe { Ethread::at(thread) }
+}
+
+/// Elo de uma das listas circulares mantidas aqui (PsActiveProcessHead,
+/// ThreadListHead e seus elementos).
+fn list_entry(address: u64) -> &'static ListEntry {
+    // SAFETY: os elos dessas listas apontam sempre para LIST_ENTRYs vivas.
+    unsafe { ListEntry::at(address) }
 }
 
 pub fn set_image_provider(provider: &'static ImageProvider) {
@@ -164,22 +189,22 @@ pub fn set_teardown_hooks(hooks: TeardownHooks) {
     STATE.lock().hooks = hooks;
 }
 
-fn insert_into_active_list(process: u64) {
-    let head = STATE.lock().active_head;
-    let links = process + eprocess::ACTIVE_PROCESS_LINKS;
-    let last = guest::read64(head + 8);
-    guest::write64(links, head);
-    guest::write64(links + 8, last);
-    guest::write64(last, links);
-    guest::write64(head + 8, links);
+fn insert_into_active_list(process: &Eprocess) {
+    let head = list_entry(STATE.lock().active_head);
+    let links = &process.active_process_links;
+    let last = head.blink.get();
+    links.flink.set(head.address());
+    links.blink.set(last);
+    list_entry(last).flink.set(links.address());
+    head.blink.set(links.address());
 }
 
-fn remove_from_active_list(process: u64) {
-    let links = process + eprocess::ACTIVE_PROCESS_LINKS;
-    let next = guest::read64(links);
-    let previous = guest::read64(links + 8);
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
+fn remove_from_active_list(process: &Eprocess) {
+    let links = &process.active_process_links;
+    let next = links.flink.get();
+    let previous = links.blink.get();
+    list_entry(previous).flink.set(next);
+    list_entry(next).blink.set(previous);
 }
 
 /// A lista nativa de ETHREADs da enumeração privada de processos. Threads
@@ -188,7 +213,7 @@ fn with_thread_list_lock<T>(process: u64, action: impl FnOnce() -> Result<T, Ker
     if get_current_thread() == 0 {
         return action(); // bootstrap de thread única
     }
-    let lock = process + eprocess::PROCESS_LOCK;
+    let lock = eprocess(process).process_lock.value.address();
     critical_region::with_critical(|| {
         push_lock::acquire_exclusive(lock, 0)?;
         let result = action();
@@ -199,13 +224,13 @@ fn with_thread_list_lock<T>(process: u64, action: impl FnOnce() -> Result<T, Ker
 
 fn link_thread(thread: u64, process: u64) -> Result<(), KernelError> {
     with_thread_list_lock(process, || {
-        let head = process + eprocess::THREAD_LIST_HEAD;
-        let entry = thread + kthread::THREAD_LIST_ENTRY;
-        let last = guest::read64(head + 8);
-        guest::write64(entry, head);
-        guest::write64(entry + 8, last);
-        guest::write64(last, entry);
-        guest::write64(head + 8, entry);
+        let head = &eprocess(process).thread_list_head;
+        let entry = &ethread(thread).thread_list_entry;
+        let last = head.blink.get();
+        entry.flink.set(head.address());
+        entry.blink.set(last);
+        list_entry(last).flink.set(entry.address());
+        head.blink.set(entry.address());
         if let Some(record) = STATE.lock().threads.get_mut(&thread) {
             record.list_linked = true;
         }
@@ -221,16 +246,17 @@ fn unlink_thread(thread: u64) -> Result<(), KernelError> {
         return Ok(());
     }
     with_thread_list_lock(process, || {
-        let entry = thread + kthread::THREAD_LIST_ENTRY;
-        let next = guest::read64(entry);
-        let previous = guest::read64(entry + 8);
-        if guest::read64(next + 8) != entry || guest::read64(previous) != entry {
+        let entry = &ethread(thread).thread_list_entry;
+        let entry_address = entry.address();
+        let next = entry.flink.get();
+        let previous = entry.blink.get();
+        if list_entry(next).blink.get() != entry_address || list_entry(previous).flink.get() != entry_address {
             return Err(KernelError::new("corrupt process thread list"));
         }
-        guest::write64(previous, next);
-        guest::write64(next + 8, previous);
-        guest::write64(entry, entry);
-        guest::write64(entry + 8, entry);
+        list_entry(previous).flink.set(next);
+        list_entry(next).blink.set(previous);
+        entry.flink.set(entry_address);
+        entry.blink.set(entry_address);
         if let Some(record) = STATE.lock().threads.get_mut(&thread) {
             record.list_linked = false;
         }
@@ -241,7 +267,7 @@ fn unlink_thread(thread: u64) -> Result<(), KernelError> {
 /// EPROCESS completo para o kernel 19041 correspondente.
 pub fn create_process(process_id: u64, image_name: &str, image_base: u64, executable: Option<&Executable>) -> Result<u64, KernelError> {
     let process_type = object_types::process_type();
-    let process = guest::alloc_bytes(eprocess::SIZE);
+    let process = guest::alloc_bytes(Eprocess::SIZE);
     if process == 0 {
         return Err(KernelError::new("EPROCESS allocation failed"));
     }
@@ -308,54 +334,56 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
         state.primary_tokens.insert(process, primary_token);
     }
     object_types::account(&process_type.name, 1, 0)?;
+    let object = eprocess(process);
     // EX_FAST_REF válido sem referências em cache.
-    guest::write64(process + eprocess::TOKEN, primary_token);
-    guest::write64(process + eprocess::SECTION_BASE_ADDRESS, image_base);
-    guest::write64(process + eprocess::SECTION_OBJECT, section);
-    guest::write64(process + eprocess::IMAGE_FILE_POINTER, file);
-    guest::write64(process + eprocess::AUDIT_IMAGE_NAME, cache);
-    guest::write64(process + eprocess::RUNDOWN_PROTECT, 0);
-    guest::write64(process + eprocess::PROCESS_LOCK, 0);
-    let thread_head = process + eprocess::THREAD_LIST_HEAD;
-    guest::write64(thread_head, thread_head);
-    guest::write64(thread_head + 8, thread_head);
+    object.token.object.set(primary_token);
+    object.section_base_address.set(image_base);
+    object.section_object.set(section);
+    object.image_file_pointer.set(file);
+    object.se_audit_process_creation_info.image_file_name.set(cache);
+    object.rundown_protect.count.set(0);
+    object.process_lock.value.set(0);
+    let thread_head = &object.thread_list_head;
+    thread_head.flink.set(thread_head.address());
+    thread_head.blink.set(thread_head.address());
     // Nenhuma decisão de assinatura ou proteção rodou na criação.
-    guest::write8(process + eprocess::SIGNATURE_LEVEL, 0);
-    guest::write8(process + eprocess::SECTION_SIGNATURE_LEVEL, 0);
-    guest::write8(process + eprocess::PROTECTION, 0);
-    guest::write64(process + eprocess::JOB, 0);
-    guest::write64(process + eprocess::SERVER_SILO, 0);
-    guest::write64(process + eprocess::DEBUG_PORT, 0);
-    guest::write64(process + eprocess::PEB, 0);
+    object.signature_level.set(0);
+    object.section_signature_level.set(0);
+    object.protection.level.set(0);
+    object.job.set(0);
+    object.server_silo.set(0);
+    object.debug_port.set(0);
+    object.peb.set(0);
     // A conversão Win32 nativa ainda não ocorreu; sem ambiente WOW64.
-    guest::write64(process + eprocess::WIN32_PROCESS, 0);
-    guest::write64(process + eprocess::WOW64_PROCESS, 0);
+    object.win32_process.set(0);
+    object.wo_w64_process.set(0);
     // O criador (0 para o System), a ordem de criação e a classe normal.
     let creator = get_current_process();
-    let inherited = if process_id == SYSTEM_PROCESS_ID || creator == 0 { 0 } else { guest::read64(creator + eprocess::UNIQUE_PROCESS_ID) };
-    guest::write64(process + eprocess::INHERITED_FROM_UNIQUE_PROCESS_ID, inherited);
-    guest::write64(process + eprocess::SEQUENCE_NUMBER, NEXT_SEQUENCE_NUMBER.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
-    guest::write8(process + eprocess::PRIORITY_CLASS, PROCESS_PRIORITY_CLASS_NORMAL);
-    guest::write64(process + eprocess::WIN32_WINDOW_STATION, 0);
-    guest::write64(process + eprocess::SECURITY_PORT, 0);
-    guest::write64(process + eprocess::DXG_PROCESS, 0);
-    guest::write32(process + eprocess::EXIT_STATUS, 0x103); // STATUS_PENDING
+    let inherited = if process_id == SYSTEM_PROCESS_ID || creator == 0 { 0 } else { eprocess(creator).unique_process_id.get() };
+    object.inherited_from_unique_process_id.set(inherited);
+    object.sequence_number.set(NEXT_SEQUENCE_NUMBER.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+    object.priority_class.set(PROCESS_PRIORITY_CLASS_NORMAL);
+    object.win32_window_station.set(0);
+    object.security_port.set(0);
+    object.dxg_process.set(0);
+    object.exit_status.set(0x103); // STATUS_PENDING
     // Sem sessões MM separadas: NULL, que PsGetProcessSessionId mapeia para 0.
-    guest::write64(process + eprocess::SESSION, 0);
-    guest::write32(process + eprocess::FLAGS3, if process_id == SYSTEM_PROCESS_ID { eprocess::SYSTEM_PROCESS_FLAG } else { 0 });
-    guest::write32(process + eprocess::FLAGS, 0);
-    // KPROCESS embutido: tipo + DirectoryTableBase (CR3 real do sistema).
-    guest::write32(process, eprocess::TYPE_PROCESS as u32);
-    guest::write8(process + eprocess::BASE_PRIORITY, 8);
-    guest::write64(process + eprocess::DIRECTORY_TABLE_BASE, memory_map::PML4_PHYS);
-    guest::write64(process + eprocess::UNIQUE_PROCESS_ID, process_id);
-    write_time(process + eprocess::CREATE_TIME, create_time);
-    guest::write32(process + eprocess::ACTIVE_THREADS, 1);
+    object.session.set(0);
+    object.flags3.set(if process_id == SYSTEM_PROCESS_ID { Eprocess::SYSTEM_PROCESS_MASK } else { 0 });
+    object.flags.set(0);
+    // KPROCESS embutido: tipo (o DWORD do cabeçalho inteiro) + DirectoryTableBase
+    // (CR3 real do sistema).
+    object.pcb.header.lock.set(PROCESS_OBJECT as i32);
+    object.pcb.base_priority.set(8);
+    object.pcb.directory_table_base.set(memory_map::PML4_PHYS);
+    object.unique_process_id.set(process_id);
+    write_time(&object.create_time, create_time);
+    object.active_threads.set(1);
     let short_name = image_name.as_bytes();
-    for index in 0..15 {
-        guest::write8(process + eprocess::IMAGE_FILE_NAME + index as u64, short_name.get(index).copied().unwrap_or(0));
+    for (index, character) in object.image_file_name.iter().enumerate() {
+        character.set(short_name.get(index).copied().unwrap_or(0));
     }
-    insert_into_active_list(process);
+    insert_into_active_list(object);
     Ok(process)
 }
 
@@ -365,45 +393,49 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         return Err(KernelError::new("invalid initial thread mode"));
     }
     let thread_type = object_types::thread_type();
-    let thread = guest::alloc_bytes(kthread::SIZE);
+    let thread = guest::alloc_bytes(Ethread::SIZE);
     if thread == 0 {
         return Err(KernelError::new("ETHREAD allocation failed"));
     }
-    let process_id = guest::read64(process + eprocess::UNIQUE_PROCESS_ID);
-    guest::write8(thread, 6); // ThreadObject
-    guest::write64(thread + kthread::INITIAL_STACK, initial_stack.unwrap_or(memory_map::BOOT_STACK_TOP));
-    guest::write64(thread + kthread::THREAD_LOCK, 0);
+    let owner = eprocess(process);
+    let process_id = owner.unique_process_id.get();
+    let object = ethread(thread);
+    let tcb = &object.tcb;
+    tcb.header.type_.set(THREAD_OBJECT);
+    tcb.initial_stack.set(initial_stack.unwrap_or(memory_map::BOOT_STACK_TOP));
+    tcb.thread_lock.set(0);
     // Initialized não entra em fila antes de receber contexto executável.
-    guest::write8(thread + kthread::STATE, 0);
-    let base_priority = guest::read8(process + eprocess::BASE_PRIORITY);
-    guest::write8(thread + kthread::PRIORITY, base_priority);
-    guest::write8(thread + kthread::BASE_PRIORITY, base_priority);
-    guest::write8(thread + kthread::SATURATION, 0);
-    guest::write8(thread + kthread::QUANTUM_RESET, 6);
-    guest::write64(thread + kthread::CYCLE_TIME, 0);
-    guest::write64(thread + kthread::QUANTUM_TARGET, 0);
-    guest::write16(thread + kthread::ALERTED, 0);
-    guest::write32(thread + kthread::MISC_FLAGS, if previous_mode == 0 { 0x400 } else { 0 });
-    for offset in [kthread::APC_STATE, kthread::APC_STATE + 0x10, kthread::IRP_LIST_HEAD] {
-        let head = thread + offset;
-        guest::write64(head, head);
-        guest::write64(head + 8, head);
+    tcb.state.set(THREAD_INITIALIZED);
+    let base_priority = owner.pcb.base_priority.get();
+    tcb.priority.set(base_priority);
+    tcb.base_priority.set(base_priority);
+    tcb.saturation.set(0);
+    tcb.quantum_reset.set(6);
+    tcb.cycle_time.set(0);
+    tcb.quantum_target.set(0);
+    for alerted in &tcb.alerted {
+        alerted.set(0);
     }
-    guest::write64(thread + kthread::APC_STATE_PROCESS, process);
-    guest::write64(thread + kthread::PROCESS, process);
-    guest::write8(thread + kthread::PREVIOUS_MODE, previous_mode);
-    guest::write64(thread + kthread::SILO, 0xFFFF_FFFF_FFFF_FFFD);
-    guest::write32(thread + kthread::SAME_THREAD_APC_FLAGS, 0);
+    tcb.misc_flags.set(if previous_mode == 0 { Kthread::SYSTEM_THREAD_MASK as i32 } else { 0 });
+    for head in [&tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list] {
+        head.flink.set(head.address());
+        head.blink.set(head.address());
+    }
+    tcb.apc_state.process.set(process);
+    tcb.process.set(process);
+    tcb.previous_mode.set(previous_mode as i8);
+    object.silo.set(INHERIT_PROCESS_SILO);
+    object.same_thread_apc_flags.set(0);
     // A atividade não é herdada implicitamente de outra thread.
-    guest::write64(thread + kthread::ACTIVITY_ID, 0);
-    guest::write64(thread + kthread::CID_UNIQUE_PROCESS, process_id);
-    guest::write64(thread + kthread::CID_UNIQUE_THREAD, thread_id);
-    guest::write64(thread + kthread::RUNDOWN_PROTECT, 0);
-    guest::write32(thread + kthread::EXIT_STATUS, 0x103);
+    object.activity_id.set(0);
+    object.cid.unique_process.set(process_id);
+    object.cid.unique_thread.set(thread_id);
+    object.rundown_protect.count.set(0);
+    object.exit_status.set(0x103);
     // Sem TEB nem thread Win32 até o modo usuário ou o win32k os criarem.
-    guest::write64(thread + kthread::TEB, 0);
-    guest::write64(thread + kthread::WIN32_THREAD, 0);
-    write_time(thread + kthread::CREATE_TIME, timestamp());
+    tcb.teb.set(0);
+    tcb.win32_thread.set(0);
+    write_time(&object.create_time, timestamp());
     let security = object_access::capture(get_primary_token(process));
     STATE.lock().threads.insert(
         thread,
@@ -429,7 +461,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         },
     );
     // ThreadInserted e prioridade de página normal na criação.
-    guest::write32(thread + kthread::CROSS_THREAD_FLAGS, 2 | (NORMAL_THREAD_PAGE_PRIORITY << kthread::PAGE_PRIORITY_SHIFT));
+    object.cross_thread_flags.set(Ethread::THREAD_INSERTED_MASK | (NORMAL_THREAD_PAGE_PRIORITY << Ethread::THREAD_PAGE_PRIORITY_SHIFT));
     object_types::account(&thread_type.name, 1, 0)?;
     if let Err(error) = link_thread(thread, process) {
         let linked = STATE.lock().threads.get(&thread).is_some_and(|record| record.list_linked);
@@ -500,7 +532,7 @@ pub fn notify_thread_created(thread: u64) -> Result<(), KernelError> {
         record.creation_notified = true;
         record.process
     };
-    thread_notify::notify(guest::read64(process + eprocess::UNIQUE_PROCESS_ID), guest::read64(thread + kthread::CID_UNIQUE_THREAD), true)
+    thread_notify::notify(eprocess(process).unique_process_id.get(), ethread(thread).cid.unique_thread.get(), true)
 }
 
 /// Executa `body` com `thread` como thread corrente, restaurando a anterior.
@@ -522,8 +554,10 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
         record.exiting = true;
         record.process
     };
-    guest::write32(thread + kthread::CROSS_THREAD_FLAGS, guest::read32(thread + kthread::CROSS_THREAD_FLAGS) | 1);
-    guest::write32(thread + kthread::EXIT_STATUS, exit_status);
+    let object = ethread(thread);
+    // PspSetCrossThreadFlag: OR atômico de Terminated.
+    object.cross_thread_flags.atomic().fetch_or(Ethread::TERMINATED_MASK, Ordering::SeqCst);
+    object.exit_status.set(exit_status as i32);
     // Donos de I/O cancelam/drenam requisições antes da notificação, do
     // rundown de APCs e da liberação dos recursos de execução.
     let routines = STATE.lock().thread_exit_routines.clone();
@@ -535,11 +569,10 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
         });
     }
     // O rundown fechado impede consultas novas de relatar uma thread viva.
-    rundown::wait(thread + kthread::RUNDOWN_PROTECT)?;
-    // Uma thread Initialized pode terminar antes de entrar num escalonador.
-    if guest::read8(thread + kthread::STATE) == 0 {
-        guest::write8(thread + kthread::STATE, 4);
-    }
+    rundown::wait(object.rundown_protect.count.address())?;
+    // Uma thread Initialized pode terminar antes de entrar num escalonador; a
+    // troca é atômica para não pisar numa transição do escalonador.
+    let _ = object.tcb.state.atomic().compare_exchange(THREAD_INITIALIZED, THREAD_TERMINATED, Ordering::SeqCst, Ordering::SeqCst);
     {
         let mut state = STATE.lock();
         let Some(record) = state.threads.get_mut(&thread) else { return Ok(()) };
@@ -548,7 +581,7 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
         }
         record.exit_notified = true;
     }
-    as_current(thread, || thread_notify::notify(guest::read64(process + eprocess::UNIQUE_PROCESS_ID), guest::read64(thread + kthread::CID_UNIQUE_THREAD), false))
+    as_current(thread, || thread_notify::notify(eprocess(process).unique_process_id.get(), object.cid.unique_thread.get(), false))
 }
 
 pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelError> {
@@ -562,21 +595,14 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     }
     // Publicado antes dos callbacks de saída; uma saída repetida não troca
     // o primeiro resultado.
-    guest::write32(process + eprocess::EXIT_STATUS, exit_status);
-    let flags_address = process + eprocess::FLAGS;
-    let mut flags = guest::read32(flags_address);
-    loop {
-        let previous = guest::compare_exchange32(flags_address, flags, flags | eprocess::PROCESS_EXITING_FLAG)?;
-        if previous == flags {
-            break;
-        }
-        flags = previous;
-    }
+    let object = eprocess(process);
+    object.exit_status.set(exit_status as i32);
+    object.flags.atomic().fetch_or(Eprocess::PROCESS_EXITING_MASK, Ordering::SeqCst);
     let threads: Vec<u64> = STATE.lock().threads.values().filter(|record| record.process == process).map(|record| record.pointer).collect();
     for thread in threads {
         exit_thread(thread, exit_status)?;
     }
-    let process_id = guest::read64(process + eprocess::UNIQUE_PROCESS_ID);
+    let process_id = object.unique_process_id.get();
     if STATE.lock().processes.get(&process).is_some_and(|record| record.notified) {
         notify_process(process, process_id, false)?;
     }
@@ -588,7 +614,7 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
         routine(process);
     }
     // Leitores de ObjectTable e da imagem usam este mesmo rundown nativo.
-    rundown::wait(process + eprocess::RUNDOWN_PROTECT)?;
+    rundown::wait(object.rundown_protect.count.address())?;
     process_handles::destroy(process)?;
     object_manager::close_process_native_handles(process);
     if let Some(release) = hooks.release_section_views {
@@ -596,15 +622,15 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     }
     let image = STATE.lock().processes.get(&process).and_then(|record| record.image.clone());
     if let Some(image) = image {
-        guest::write64(process + eprocess::SECTION_OBJECT, 0);
-        guest::write64(process + eprocess::IMAGE_FILE_POINTER, 0);
+        object.section_object.set(0);
+        object.image_file_pointer.set(0);
         if let Some(provider) = provider {
             (provider.release_section)(&image);
         }
     }
-    guest::write32(process + eprocess::ACTIVE_THREADS, 0);
-    write_time(process + eprocess::EXIT_TIME, timestamp());
-    remove_from_active_list(process);
+    object.active_threads.set(0);
+    write_time(&object.exit_time, timestamp());
+    remove_from_active_list(object);
     if let Some(record) = STATE.lock().processes.get_mut(&process) {
         record.terminated = true;
     }
@@ -625,7 +651,7 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
         (token, record, state.image_provider)
     };
     if let Some(token) = token {
-        guest::write64(process + eprocess::TOKEN, 0);
+        eprocess(process).token.object.set(0);
         tokens::release(token)?;
     }
     if let (Some(image), Some(provider)) = (&record.image, provider) {
@@ -780,7 +806,7 @@ pub fn reference_thread_by_id(id: u64) -> u64 {
     let mut state = STATE.lock();
     for record in state.threads.values_mut() {
         if record.id == id {
-            if guest::read8(record.pointer) & 0x7F != 6 {
+            if ethread(record.pointer).tcb.header.type_.get() & 0x7F != THREAD_OBJECT {
                 return 0;
             }
             record.references += 1;
@@ -892,15 +918,12 @@ pub fn image_section(process: u64) -> Option<u64> {
 
 /// EPROCESS.ActiveThreads real.
 pub fn add_thread(process: u64) {
-    let active = guest::read32(process + eprocess::ACTIVE_THREADS);
-    guest::write32(process + eprocess::ACTIVE_THREADS, active + 1);
+    eprocess(process).active_threads.atomic().fetch_add(1, Ordering::SeqCst);
 }
 
+/// Decremento atômico que nunca passa de zero.
 pub fn remove_thread(process: u64) {
-    let active = guest::read32(process + eprocess::ACTIVE_THREADS);
-    if active > 0 {
-        guest::write32(process + eprocess::ACTIVE_THREADS, active - 1);
-    }
+    let _ = eprocess(process).active_threads.atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |active| active.checked_sub(1));
 }
 
 /// A troca de thread corrente atualiza a PCR (gs:0x188 =
@@ -920,7 +943,7 @@ pub fn get_current_process() -> u64 {
     if thread == 0 {
         return SYSTEM_PROCESS.load(Ordering::Relaxed);
     }
-    guest::read64(thread + kthread::APC_STATE_PROCESS)
+    ethread(thread).tcb.apc_state.process.get()
 }
 
 pub fn get_current_process_id() -> u64 {
@@ -928,7 +951,7 @@ pub fn get_current_process_id() -> u64 {
     if thread == 0 {
         return SYSTEM_PROCESS_ID;
     }
-    guest::read64(thread + kthread::CID_UNIQUE_PROCESS)
+    ethread(thread).cid.unique_process.get()
 }
 
 /// "Handle de processo" dos serviços Zw: -1/0 = corrente (CID da thread);
@@ -940,7 +963,7 @@ pub fn process_id_from_handle(handle: u64) -> u64 {
         if thread == 0 {
             return 4;
         }
-        return guest::read64(thread + kthread::CID_UNIQUE_PROCESS);
+        return ethread(thread).cid.unique_process.get();
     }
     value as u32 as u64
 }
@@ -950,7 +973,7 @@ pub fn get_current_thread_id() -> u64 {
     if thread == 0 {
         return 0;
     }
-    guest::read64(thread + kthread::CID_UNIQUE_THREAD)
+    ethread(thread).cid.unique_thread.get()
 }
 
 /// Entrada de `list_active_processes`.
@@ -969,20 +992,22 @@ pub fn list_active_processes() -> Vec<ActiveProcess> {
     if head == 0 {
         return result;
     }
-    let mut cursor = guest::read64(head);
+    let mut cursor = list_entry(head).flink.get();
     while cursor != 0 && cursor != head {
-        let process = cursor - eprocess::ACTIVE_PROCESS_LINKS;
+        // CONTAINING_RECORD(cursor, EPROCESS, ActiveProcessLinks).
+        let process = cursor - core::mem::offset_of!(Eprocess, active_process_links) as u64;
+        let object = eprocess(process);
         let mut name = String::new();
-        for index in 0..15 {
-            let character = guest::read8(process + eprocess::IMAGE_FILE_NAME + index);
+        for character in &object.image_file_name {
+            let character = character.get();
             if character == 0 {
                 break;
             }
             name.push(character as char);
         }
         let threads = STATE.lock().threads.values().filter(|record| record.process == process && !record.runtime_dead).map(|record| record.pointer).collect();
-        result.push(ActiveProcess { pid: guest::read64(process + eprocess::UNIQUE_PROCESS_ID), name, address: process, threads });
-        cursor = guest::read64(cursor);
+        result.push(ActiveProcess { pid: object.unique_process_id.get(), name, address: process, threads });
+        cursor = list_entry(cursor).flink.get();
     }
     result
 }
@@ -994,7 +1019,8 @@ pub fn lookup_process_by_id(pid: u64, output: u64) -> u32 {
         return STATUS_INVALID_CID;
     };
     reference(found.address);
-    guest::write64(output, found.address);
+    // SAFETY: PEPROCESS* de saída do chamador de kernel.
+    unsafe { Field::<u64>::at(output) }.set(found.address);
     0
 }
 
@@ -1011,7 +1037,7 @@ pub fn get_active_process_head() -> u64 {
 /// o término do processo espera esvaziar; com o processo já saindo,
 /// STATUS_PROCESS_IS_TERMINATING.
 pub fn acquire_exit_synchronization(process: u64) -> Result<u32, KernelError> {
-    if rundown::acquire(process + eprocess::RUNDOWN_PROTECT)? {
+    if rundown::acquire(eprocess(process).rundown_protect.count.address())? {
         Ok(0)
     } else {
         Ok(STATUS_PROCESS_IS_TERMINATING)
@@ -1022,7 +1048,7 @@ pub fn acquire_exit_synchronization(process: u64) -> Result<u32, KernelError> {
 /// EPROCESS+0x458; devolve a referência retida por
 /// PsAcquireProcessExitSynchronization (ela pertence ao chamador).
 pub fn release_exit_synchronization(process: u64) -> Result<(), KernelError> {
-    rundown::release(process + eprocess::RUNDOWN_PROTECT)
+    rundown::release(eprocess(process).rundown_protect.count.address())
 }
 
 /// Célula exportada PsInitialSystemProcess.
@@ -1049,7 +1075,8 @@ pub fn job_type_cell() -> u64 {
     }
     let body = guest::alloc_bytes(0x40);
     let cell = guest::alloc_bytes(8);
-    guest::write64(cell, body);
+    // SAFETY: a célula de 8 bytes acabou de ser alocada.
+    unsafe { Field::<u64>::at(cell) }.set(body);
     match JOB_TYPE.compare_exchange(0, cell, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => cell,
         Err(existing) => {
@@ -1065,8 +1092,9 @@ pub fn init() -> Result<(), KernelError> {
     if head == 0 {
         return Err(KernelError::new("PsActiveProcessHead allocation failed"));
     }
-    guest::write64(head, head);
-    guest::write64(head + 8, head);
+    let entry = list_entry(head);
+    entry.flink.set(head);
+    entry.blink.set(head);
     STATE.lock().active_head = head;
     let system = create_process(SYSTEM_PROCESS_ID, "System", 0, None)?;
     SYSTEM_PROCESS.store(system, Ordering::Relaxed);

@@ -14,7 +14,8 @@ use crate::ntos::mm::data_pool;
 use crate::ntos::ob::objects::{file as file_objects, section as section_objects};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::eprocess;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eprocess, UnicodeString};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -44,17 +45,18 @@ pub fn create(executable: &Executable) -> Result<ProcessImage, KernelError> {
         Ok(section) => section,
     };
     section_objects::reference(section);
-    let cache = data_pool::alloc(18 + units.len() as u64 * 2);
+    let cache = data_pool::alloc(UnicodeString::SIZE + units.len() as u64 * 2 + 2);
     if cache == 0 {
         let _ = section_objects::dereference(section);
         return Err(KernelError::new("image name allocation failed"));
     }
-    guest::write16(cache, (units.len() * 2) as u16);
-    guest::write16(cache + 2, (units.len() * 2 + 2) as u16);
-    guest::write64(cache + 8, cache + 16);
-    for (index, &unit) in units.iter().enumerate() {
-        guest::write16(cache + 16 + index as u64 * 2, unit);
-    }
+    // SAFETY: UNICODE_STRING recém-alocado, com o buffer logo depois.
+    let name = unsafe { UnicodeString::at(cache) };
+    name.length.set((units.len() * 2) as u16);
+    name.maximum_length.set((units.len() * 2 + 2) as u16);
+    name.buffer.set(cache + UnicodeString::SIZE);
+    let characters: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(cache + UnicodeString::SIZE, &characters);
     Ok(ProcessImage { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), section_native_pointer: section, file, cache })
 }
 
@@ -86,12 +88,14 @@ pub fn destroy(image: &ProcessImage) -> Result<(), KernelError> {
 /// Referencia o FILE_OBJECT da seção de imagem sob a proteção de rundown do
 /// processo.
 pub fn reference_file(process: u64, output: u64) -> Result<u32, KernelError> {
-    let protection = process + eprocess::RUNDOWN_PROTECT;
+    // SAFETY: PEPROCESS do chamador de kernel.
+    let process = unsafe { Eprocess::at(process) };
+    let protection = process.rundown_protect.count.address();
     if !rundown::acquire(protection)? {
         return Ok(0xC000_0001);
     }
     let file = (|| -> Result<Option<u64>, KernelError> {
-        let section = guest::read64(process + eprocess::SECTION_OBJECT);
+        let section = process.section_object.get();
         if section == 0 {
             return Ok(None);
         }
@@ -103,32 +107,37 @@ pub fn reference_file(process: u64, output: u64) -> Result<u32, KernelError> {
     })();
     rundown::release(protection)?;
     let Some(file) = file? else { return Ok(0xC000_0001) };
-    guest::write64(output, file);
+    // SAFETY: PFILE_OBJECT* de saída do chamador de kernel.
+    unsafe { Field::<u64>::at(output) }.set(file);
     Ok(0)
 }
 
 /// Cópia do UNICODE_STRING de auditoria (cabeçalho e MaximumLength bytes)
 /// em pool de dados.
 pub fn locate_name(process: u64, output: u64) -> Result<u32, KernelError> {
-    let cache = guest::read64(process + eprocess::AUDIT_IMAGE_NAME);
+    // SAFETY: PEPROCESS do chamador de kernel.
+    let cache = unsafe { Eprocess::at(process) }.se_audit_process_creation_info.image_file_name.get();
     if cache == 0 {
         return Ok(0xC000_0225);
     }
-    let maximum = guest::read16(cache + 2) as u64;
-    let copy = data_pool::alloc(16 + maximum);
+    // SAFETY: o nome de auditoria (UNICODE_STRING) criado por `create`.
+    let source = unsafe { UnicodeString::at(cache) };
+    let maximum = source.maximum_length.get() as u64;
+    let copy = data_pool::alloc(UnicodeString::SIZE + maximum);
     if copy == 0 {
         return Ok(0xC000_0017);
     }
-    for offset in 0..16 {
-        guest::write8(copy + offset, guest::read8(cache + offset));
-    }
-    let buffer = guest::read64(cache + 8);
+    // SAFETY: cópia recém-alocada (cabeçalho + MaximumLength bytes).
+    let target = unsafe { UnicodeString::at(copy) };
+    target.length.set(source.length.get());
+    target.maximum_length.set(source.maximum_length.get());
+    target.buffer.set(source.buffer.get());
+    let buffer = source.buffer.get();
     if buffer != 0 {
-        guest::write64(copy + 8, copy + 16);
-        for offset in 0..maximum {
-            guest::write8(copy + 16 + offset, guest::read8(buffer + offset));
-        }
+        target.buffer.set(copy + UnicodeString::SIZE);
+        guest::write_bytes(copy + UnicodeString::SIZE, &guest::read_bytes(buffer, maximum as usize));
     }
-    guest::write64(output, copy);
+    // SAFETY: PUNICODE_STRING* de saída do chamador de kernel.
+    unsafe { Field::<u64>::at(output) }.set(copy);
     Ok(0)
 }

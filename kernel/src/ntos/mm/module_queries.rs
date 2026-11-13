@@ -11,6 +11,8 @@ use crate::hal::cpu;
 use crate::ntos::ke::{irql, smp};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Mdl, PhysicalMemoryRange, RtlProcessModuleInformationEx};
 
 // ---- SystemModuleInformation (11) e SystemModuleInformationEx (77) ---------
 // Layout conferido em ExpQueryModuleInformationEx: registros EX de 320 bytes
@@ -53,7 +55,7 @@ pub fn query_system_modules(class: u32, output: u64, length: u64, returned: u64)
     let (header, stride) = if extended { (2, 320) } else { (8, 296) };
     let needed = header + records.len() as u64 * stride;
     if returned != 0 {
-        guest::try_write32(returned, needed as u32)?;
+        guest::try_write::<u32>(returned, needed as u32)?;
     }
     if length < header {
         return Ok(0xC000_0004);
@@ -62,10 +64,13 @@ pub fn query_system_modules(class: u32, output: u64, length: u64, returned: u64)
         return Ok(0xC000_0005);
     }
     if extended {
-        guest::try_write16(output, 0)?;
+        // NextOffset do primeiro registro EX (zero para lista vazia).
+        guest::try_write::<u16>(output + core::mem::offset_of!(RtlProcessModuleInformationEx, next_offset) as u64, 0)?;
     } else {
-        guest::try_write32(output, records.len() as u32)?;
-        guest::try_write32(output + 4, 0)?;
+        // RTL_PROCESS_MODULES: NumberOfModules e o preenchimento até Modules[].
+        let mut head = [0u8; 8];
+        head[..4].copy_from_slice(&(records.len() as u32).to_le_bytes());
+        guest::try_write_bytes(output, &head)?;
     }
     let mut cursor = if extended { 0 } else { 8 };
     for (index, image) in records.iter().enumerate() {
@@ -76,7 +81,8 @@ pub fn query_system_modules(class: u32, output: u64, length: u64, returned: u64)
         guest::try_write_bytes(output + cursor, &module_bytes(image, index, extended))?;
         cursor += stride;
         if extended {
-            guest::try_write16(output + cursor, 0)?;
+            // NextOffset terminador logo depois do último registro.
+            guest::try_write::<u16>(output + cursor + core::mem::offset_of!(RtlProcessModuleInformationEx, next_offset) as u64, 0)?;
         }
     }
     Ok(if length < needed { 0xC000_0004 } else { 0 })
@@ -95,14 +101,13 @@ pub fn query_physical_ranges() -> Result<u64, KernelError> {
     if pointer == 0 {
         return Ok(0);
     }
-    let mut at = pointer;
-    for (base, top) in ranges {
-        guest::write64(at, base);
-        guest::write64(at + 8, top - base);
-        at += 16;
+    // SAFETY: vetor recém-alocado com uma entrada a mais (o terminador zero).
+    let entries = unsafe { PhysicalMemoryRange::array_at(pointer, ranges.len() + 1) };
+    for (entry, range) in entries.iter().zip(ranges.iter().copied().map(Some).chain(core::iter::once(None))) {
+        let (base, length) = range.map_or((0, 0), |(base, top)| (base, top - base));
+        entry.base_address.quad_part.set(base as i64);
+        entry.number_of_bytes.quad_part.set(length as i64);
     }
-    guest::write64(at, 0);
-    guest::write64(at + 8, 0);
     Ok(pointer)
 }
 
@@ -118,17 +123,20 @@ pub fn protect_mdl(mdl: u64, protection: u32) -> Result<u32, KernelError> {
     if irql::get_irql() > 2 {
         return Err(KernelError::new("MmProtectMdlSystemAddress above DISPATCH_LEVEL"));
     }
-    if guest::try_read16(mdl + 0xA)? & 1 == 0 {
+    // SAFETY: o PMDL do driver; as leituras continuam sondadas.
+    let descriptor = unsafe { Mdl::at(mdl) };
+    // MDL_MAPPED_TO_SYSTEM_VA.
+    if descriptor.mdl_flags.probe_get()? & 1 == 0 {
         return Ok(0xC000_0019);
     }
-    let mapped = guest::try_read64(mdl + 0x18)?;
+    let mapped = descriptor.mapped_system_va.probe_get()?;
     if paging::query_page(mapped, true).is_some_and(|page| page.page_size != 4096) {
         return Ok(0xC000_00BB);
     }
     if ![1, 2, 4, 0x10, 0x20, 0x40].contains(&protection) {
         return Ok(0xC000_0045);
     }
-    let count = (guest::try_read32(mdl + 0x28)? as u64 + (mapped & 4095)).div_ceil(4096);
+    let count = (descriptor.byte_count.probe_get()? as u64 + (mapped & 4095)).div_ceil(4096);
     let base = mapped & !4095;
     let mut pages = Vec::new();
     for index in 0..count {

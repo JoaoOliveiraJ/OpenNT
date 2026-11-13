@@ -2,19 +2,23 @@
 //!
 //! O bitmap do PFN decide a propriedade; estes bytes acompanham suas
 //! transições e as referências das tabelas que a CPU realmente usa.
-//! Campos usados: +0 u1.Flink, +8 PteAddress, +24 u2 (Blink/ShareCount),
-//! +32 ReferenceCount, +34 PageLocation|CacheAttribute<<6, +40 PteFrame|flags.
+//! Campos usados: u1.Flink, PteAddress, u2 (Blink/ShareCount),
+//! u3.ReferenceCount, u3.e1 (PageLocation, CacheAttribute) e u4
+//! (PteFrame, PfnExists).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::{memory_map as map, pfn::AllocationSnapshot};
 use crate::hal::physical;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Mmpfn, Mmpfnentry1, MmpfnU4};
 use crate::rtl::{KernelError, SpinLock};
 
-pub const DESCRIPTOR_SIZE: u64 = 48;
+pub const DESCRIPTOR_SIZE: u64 = Mmpfn::SIZE;
 const FRAME_NUMBER_MASK: u64 = 0xF_FFFF_FFFF;
-const FRAME_EXISTS: u64 = 1 << 50;
+const FRAME_EXISTS: u64 = MmpfnU4::PFN_EXISTS_MASK;
 const FREE_PAGE: u8 = 1;
 const ACTIVE_PAGE: u8 = 6;
 const CACHED_MEMORY: u8 = 1;
@@ -52,20 +56,25 @@ static STATE: SpinLock<Descriptors> = SpinLock::new(Descriptors {
     primary_table_frames: BTreeSet::new(),
 });
 
-/// Ponteiros de 64 bits nunca ficam publicados como duas metades.
-fn write_exact(address: u64, replacement: u64) {
-    let mut expected = physical::read64(address);
-    loop {
-        let observed = physical::compare_exchange64(address, expected, replacement);
-        if observed == expected {
-            return;
-        }
-        expected = observed;
-    }
+/// Ponteiros de 64 bits nunca ficam publicados como duas metades: uma
+/// escrita atômica (com barreira) do qword inteiro.
+fn write_exact(field: &Field<u64>, replacement: u64) {
+    field.atomic().store(replacement, Ordering::SeqCst);
+}
+
+fn pfn(address: u64) -> &'static Mmpfn {
+    // SAFETY: descritor do banco de PFNs (physical_base + 48 * frame, no
+    // mapa de identidade), sob o lock STATE.
+    unsafe { Mmpfn::at(address) }
 }
 
 fn page_location(address: u64) -> u8 {
-    physical::read8(address + 34) & 7
+    pfn(address).u3.e1.page_location()
+}
+
+/// PageLocation (bits baixos) | CacheAttribute << 6 (o byte u3.e1).
+fn entry_byte(location: u8, cache: u8) -> u8 {
+    location | cache << Mmpfnentry1::CACHE_ATTRIBUTE_SHIFT
 }
 
 impl Descriptors {
@@ -78,33 +87,35 @@ impl Descriptors {
 
     fn existing_address(&self, frame_number: u64) -> u64 {
         let address = self.descriptor_address(frame_number);
-        if address != 0 && physical::read32(address + 44) & 0x40000 != 0 { address } else { 0 }
+        if address != 0 && pfn(address).u4.pfn_exists() != 0 { address } else { 0 }
     }
 
     /// Os links da lista livre são números de frames (campos de 36 bits).
     fn remove_free_frame(&mut self, address: u64) {
-        let next = physical::read64(address) & FRAME_NUMBER_MASK;
-        let previous = physical::read64(address + 24) & FRAME_NUMBER_MASK;
+        let entry = pfn(address);
+        let next = entry.u1.flink();
+        let previous = entry.u2.blink();
         if previous == LIST_END {
             self.first_free_frame = next;
         } else {
-            write_exact(self.descriptor_address(previous), next);
+            write_exact(&pfn(self.descriptor_address(previous)).u1.next, next);
         }
         if next == LIST_END {
             self.last_free_frame = previous;
         } else {
-            write_exact(self.descriptor_address(next) + 24, previous);
+            write_exact(&pfn(self.descriptor_address(next)).u2.entire_field, previous);
         }
         self.free_frame_count -= 1;
     }
 
     fn append_free_frame(&mut self, frame_number: u64, address: u64) {
-        write_exact(address, FRAME_NUMBER_MASK);
-        write_exact(address + 24, self.last_free_frame);
+        let entry = pfn(address);
+        write_exact(&entry.u1.next, FRAME_NUMBER_MASK);
+        write_exact(&entry.u2.entire_field, self.last_free_frame);
         if self.last_free_frame == LIST_END {
             self.first_free_frame = frame_number;
         } else {
-            write_exact(self.descriptor_address(self.last_free_frame), frame_number);
+            write_exact(&pfn(self.descriptor_address(self.last_free_frame)).u1.next, frame_number);
         }
         self.last_free_frame = frame_number;
         self.free_frame_count += 1;
@@ -114,27 +125,29 @@ impl Descriptors {
         let address = self.existing_address(physical_address / 4096);
         address != 0
             && page_location(address) == ACTIVE_PAGE
-            && physical::read16(address + 32) == 1
-            && physical::read64(address + 24) == 0
+            && pfn(address).u3.reference_count.get() == 1
+            && pfn(address).u2.entire_field.get() == 0
     }
 
     fn primary_reference(&self, frame_number: u64, address: u64) -> Reference {
-        let pointer = physical::read64(address + 8);
-        let table_frame = physical::read64(address + 40) & FRAME_NUMBER_MASK;
+        let entry = pfn(address);
+        let pointer = entry.pte_address.get();
+        let table_frame = entry.u4.pte_frame();
         Reference {
             physical_address: table_frame * 4096 + (pointer & 4095),
             virtual_address: pointer,
             table_page: self.primary_table_frames.contains(&frame_number),
-            cache_attribute: physical::read8(address + 34) >> 6,
+            cache_attribute: entry.u3.e1.cache_attribute(),
         }
     }
 
     fn publish_primary(&mut self, frame_number: u64, address: u64, reference: &Reference) {
-        let flags = physical::read64(address + 40) & !FRAME_NUMBER_MASK;
-        write_exact(address + 40, flags | reference.physical_address / 4096);
-        let state = physical::read8(address + 34) & 63;
-        physical::write8(address + 34, state | reference.cache_attribute << 6);
-        write_exact(address + 8, reference.virtual_address);
+        let entry = pfn(address);
+        let flags = entry.u4.entire_field.get() & !FRAME_NUMBER_MASK;
+        write_exact(&entry.u4.entire_field, flags | reference.physical_address / 4096);
+        let state = entry.u3.e1.bitfield_0.get() & !Mmpfnentry1::CACHE_ATTRIBUTE_MASK;
+        entry.u3.e1.bitfield_0.set(state | reference.cache_attribute << Mmpfnentry1::CACHE_ATTRIBUTE_SHIFT);
+        write_exact(&entry.pte_address, reference.virtual_address);
         if reference.table_page {
             self.primary_table_frames.insert(frame_number);
         } else {
@@ -144,7 +157,7 @@ impl Descriptors {
 
     fn refresh_reference(&mut self, frame_number: u64, reference: &Reference) {
         let address = self.existing_address(frame_number);
-        if address == 0 || page_location(address) != ACTIVE_PAGE || physical::read64(address + 24) == 0 {
+        if address == 0 || page_location(address) != ACTIVE_PAGE || pfn(address).u2.entire_field.get() == 0 {
             return;
         }
         let primary = self.primary_reference(frame_number, address);
@@ -214,16 +227,16 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
         if admitted_index == admitted.len() || frame_number < admitted[admitted_index].0 {
             continue;
         }
-        let at = configuration.physical_base + frame_number * DESCRIPTOR_SIZE;
+        let entry = pfn(configuration.physical_base + frame_number * DESCRIPTOR_SIZE);
         let available = free_frames.get(free_index).is_some_and(|&frame| frame as u64 == frame_number);
-        physical::write64(at + 40, FRAME_EXISTS);
-        physical::write16(at + 32, if available { 0 } else { 1 });
-        physical::write8(at + 34, if available { FREE_PAGE } else { ACTIVE_PAGE } | CACHED_MEMORY << 6);
+        entry.u4.entire_field.set(FRAME_EXISTS);
+        entry.u3.reference_count.set(if available { 0 } else { 1 });
+        entry.u3.e1.bitfield_0.set(entry_byte(if available { FREE_PAGE } else { ACTIVE_PAGE }, CACHED_MEMORY));
         if available {
             let next = free_frames.get(free_index + 1).map_or(LIST_END, |&frame| frame as u64);
             let previous = if free_index > 0 { free_frames[free_index - 1] as u64 } else { LIST_END };
-            physical::write64(at, next);
-            physical::write64(at + 24, previous);
+            entry.u1.next.set(next);
+            entry.u2.entire_field.set(previous);
             free_index += 1;
         }
     }
@@ -252,10 +265,12 @@ pub fn allocated(physical_address: u64) {
     let address = state.existing_address(frame_number);
     assert!(address != 0 && page_location(address) == FREE_PAGE, "allocated PFN was not on native free list");
     state.remove_free_frame(address);
-    physical::zero(address, 40);
-    write_exact(address + 40, FRAME_EXISTS);
-    physical::write16(address + 32, 1);
-    physical::write8(address + 34, ACTIVE_PAGE | CACHED_MEMORY << 6);
+    // u1..u3 zerados (os 40 bytes antes de u4).
+    physical::zero(address, core::mem::offset_of!(Mmpfn, u4));
+    let entry = pfn(address);
+    write_exact(&entry.u4.entire_field, FRAME_EXISTS);
+    entry.u3.reference_count.set(1);
+    entry.u3.e1.bitfield_0.set(entry_byte(ACTIVE_PAGE, CACHED_MEMORY));
 }
 
 pub fn can_release(physical_address: u64) -> bool {
@@ -267,9 +282,10 @@ pub fn released(physical_address: u64) {
     let frame_number = physical_address / 4096;
     assert!(state.can_release(physical_address), "native PFN still referenced at release");
     let address = state.existing_address(frame_number);
-    physical::zero(address, 40);
-    write_exact(address + 40, FRAME_EXISTS);
-    physical::write8(address + 34, FREE_PAGE | CACHED_MEMORY << 6);
+    physical::zero(address, core::mem::offset_of!(Mmpfn, u4));
+    let entry = pfn(address);
+    write_exact(&entry.u4.entire_field, FRAME_EXISTS);
+    entry.u3.e1.bitfield_0.set(entry_byte(FREE_PAGE, CACHED_MEMORY));
     state.additional_references.remove(&frame_number);
     state.primary_table_frames.remove(&frame_number);
     state.append_free_frame(frame_number, address);
@@ -297,7 +313,7 @@ pub fn add_reference(frame_number: u64, reference: Reference) {
         return;
     }
     assert!(page_location(address) == ACTIVE_PAGE, "mapping unowned RAM frame");
-    let count = physical::read64(address + 24);
+    let count = pfn(address).u2.entire_field.get();
     if count == 0 {
         state.publish_primary(frame_number, address, &reference);
     } else {
@@ -319,7 +335,7 @@ pub fn add_reference(frame_number: u64, reference: Reference) {
             state.publish_primary(frame_number, address, &reference);
         }
     }
-    write_exact(address + 24, count + 1);
+    write_exact(&pfn(address).u2.entire_field, count + 1);
 }
 
 pub fn remove_reference(frame_number: u64, entry_physical_address: u64) {
@@ -328,13 +344,14 @@ pub fn remove_reference(frame_number: u64, entry_physical_address: u64) {
     if address == 0 {
         return;
     }
-    let count = physical::read64(address + 24);
+    let entry = pfn(address);
+    let count = entry.u2.entire_field.get();
     let primary = state.primary_reference(frame_number, address);
     assert!(count != 0, "removing absent native PFN reference");
     if count == 1 {
         assert!(primary.physical_address == entry_physical_address, "PFN reference mismatch");
-        write_exact(address + 8, 0);
-        write_exact(address + 40, physical::read64(address + 40) & !FRAME_NUMBER_MASK);
+        write_exact(&entry.pte_address, 0);
+        write_exact(&entry.u4.entire_field, entry.u4.entire_field.get() & !FRAME_NUMBER_MASK);
         state.primary_table_frames.remove(&frame_number);
     } else {
         let references = state.additional_references.get_mut(&frame_number).expect("PFN alias missing");
@@ -352,7 +369,7 @@ pub fn remove_reference(frame_number: u64, entry_physical_address: u64) {
             state.additional_references.remove(&frame_number);
         }
     }
-    write_exact(address + 24, count - 1);
+    write_exact(&entry.u2.entire_field, count - 1);
 }
 
 /// Trocar o caminho até uma tabela compartilhada muda seu alias recursivo,

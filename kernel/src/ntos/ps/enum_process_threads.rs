@@ -17,7 +17,8 @@ use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::ob::{object_types, open_pointer};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Eprocess, Ethread, ListEntry};
 
 const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -104,27 +105,34 @@ impl NextRequest {
             critical_region::enter_critical()?;
             self.region = true;
         }
-        let lock = self.process + eprocess::PROCESS_LOCK;
+        // SAFETY: o processo retido por esta enumeração.
+        let process = unsafe { Eprocess::at(self.process) };
+        let lock = process.process_lock.value.address();
         // A tentativa real não publica um aguardante não cancelável.
         if !push_lock::try_shared(lock, 0)? {
             return Ok(None);
         }
-        let head = self.process + eprocess::THREAD_LIST_HEAD;
+        let head = process.thread_list_head.address();
         let selected = (|| -> Result<u64, KernelError> {
-            let mut cursor = guest::read64(if self.previous != 0 { self.previous + kthread::THREAD_LIST_ENTRY } else { head });
+            // SAFETY: a thread anterior continua referenciada pelo chamador.
+            let start = if self.previous != 0 { unsafe { Ethread::at(self.previous) }.thread_list_entry.address() } else { head };
+            // SAFETY: elos da ThreadListHead, sob o ProcessLock compartilhado.
+            let mut cursor = unsafe { ListEntry::at(start) }.flink.get();
             let mut seen = BTreeSet::new();
             while cursor != head {
                 if cursor == 0 || !seen.insert(cursor) {
                     return Err(KernelError::new("corrupt process thread enumeration list"));
                 }
-                let pointer = cursor - kthread::THREAD_LIST_ENTRY;
+                // CONTAINING_RECORD(cursor, ETHREAD, ThreadListEntry).
+                let pointer = cursor - core::mem::offset_of!(Ethread, thread_list_entry) as u64;
                 if !process::thread_record(pointer).is_some_and(|record| record.process == self.process) {
                     return Err(KernelError::new("thread list contains an unowned object"));
                 }
                 if process::reference_thread_safe(pointer) {
                     return Ok(pointer);
                 }
-                cursor = guest::read64(cursor);
+                // SAFETY: elo seguinte da mesma lista.
+                cursor = unsafe { ListEntry::at(cursor) }.flink.get();
             }
             Ok(0)
         })();
@@ -196,7 +204,8 @@ fn reference_handle(handle: u64, object_type: u64) -> Result<Result<u64, u32>, K
         return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
     }
     let status = invoke_handler("ObReferenceObjectByHandle", &[handle, 0, object_type, 0, slot, 0]);
-    let object = guest::read64(slot);
+    // SAFETY: a célula de 8 bytes alocada acima.
+    let object = unsafe { Field::<u64>::at(slot) }.get();
     guest::free_bytes(slot);
     let status = status? as u32;
     Ok(if status == 0 { Ok(object) } else { Err(status) })
@@ -257,7 +266,8 @@ pub fn open_next_thread(process_handle: u64, thread_handle: u64, access: u32, at
     let mut previous = 0;
     if thread_handle != 0 {
         match reference_handle(thread_handle, thread_type)? {
-            Ok(thread) if guest::read64(thread + kthread::PROCESS) == target => previous = thread,
+            // SAFETY: ETHREAD referenciado pelo handle.
+            Ok(thread) if unsafe { Ethread::at(thread) }.tcb.process.get() == target => previous = thread,
             Ok(thread) => {
                 dereference_object(thread)?;
                 dereference_object(target)?;

@@ -14,8 +14,15 @@ use super::{kernel_address, memory_map as map};
 use crate::hal::amd64::native_call;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{ImageDosHeader, ImageNtHeaders64, KldrDataTableEntry, ListEntry};
 
-const ENTRY_BYTE_LENGTH: u64 = 0xA0;
+const ENTRY_BYTE_LENGTH: u64 = KldrDataTableEntry::SIZE;
+
+fn list_entry(address: u64) -> &'static ListEntry {
+    // SAFETY: cabeça e entradas da lista nativa mantidas por este módulo.
+    unsafe { ListEntry::at(address) }
+}
 
 /// Registro imutável de uma imagem.
 #[derive(Clone, Debug)]
@@ -87,23 +94,24 @@ fn create_native_entry(image: &LoadedImage) -> Result<NativeEntry, KernelError> 
     }
     let name_pointer = pointer + ENTRY_BYTE_LENGTH;
     let base_offset = full_name.iter().rposition(|&unit| unit == b'\\' as u16).map_or(0, |index| index + 1) as u64 * 2;
-    guest::write64(pointer + 0x30, image.image_base);
-    guest::write64(pointer + 0x38, image.entry_point);
-    guest::write32(pointer + 0x40, image.size_of_image as u32);
-    guest::write16(pointer + 0x48, name_bytes as u16);
-    guest::write16(pointer + 0x4A, name_bytes as u16 + 2);
-    guest::write64(pointer + 0x50, name_pointer);
-    guest::write16(pointer + 0x58, (name_bytes - base_offset) as u16);
-    guest::write16(pointer + 0x5A, (name_bytes - base_offset + 2) as u16);
-    guest::write64(pointer + 0x60, name_pointer + base_offset);
-    guest::write32(pointer + 0x68, image.loader_flags);
-    guest::write16(pointer + 0x6C, 1); // uma referência de propriedade no loader
-    guest::write32(pointer + 0x78, image.checksum);
-    guest::write32(pointer + 0x98, image.size_of_image as u32);
-    guest::write32(pointer + 0x9C, image.time_date_stamp);
-    for (index, &unit) in full_name.iter().enumerate() {
-        guest::write16(name_pointer + index as u64 * 2, unit);
-    }
+    // SAFETY: entrada recém-alocada (zerada).
+    let entry = unsafe { KldrDataTableEntry::at(pointer) };
+    entry.dll_base.set(image.image_base);
+    entry.entry_point.set(image.entry_point);
+    entry.size_of_image.set(image.size_of_image as u32);
+    entry.full_dll_name.length.set(name_bytes as u16);
+    entry.full_dll_name.maximum_length.set(name_bytes as u16 + 2);
+    entry.full_dll_name.buffer.set(name_pointer);
+    entry.base_dll_name.length.set((name_bytes - base_offset) as u16);
+    entry.base_dll_name.maximum_length.set((name_bytes - base_offset + 2) as u16);
+    entry.base_dll_name.buffer.set(name_pointer + base_offset);
+    entry.flags.set(image.loader_flags);
+    entry.load_count.set(1); // uma referência de propriedade no loader
+    entry.check_sum.set(image.checksum);
+    entry.size_of_image_not_rounded.set(image.size_of_image as u32);
+    entry.time_date_stamp.set(image.time_date_stamp);
+    let characters: Vec<u8> = full_name.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(name_pointer, &characters);
     Ok(NativeEntry { pointer })
 }
 
@@ -138,11 +146,13 @@ impl Registry {
         }
         let ordered: Vec<u64> = images.iter().map(|image| self.native_entries[&image.id].pointer).collect();
         let head = self.list_head;
-        guest::write64(head, ordered.first().copied().unwrap_or(head));
-        guest::write64(head + 8, ordered.last().copied().unwrap_or(head));
+        list_entry(head).flink.set(ordered.first().copied().unwrap_or(head));
+        list_entry(head).blink.set(ordered.last().copied().unwrap_or(head));
         for (index, &pointer) in ordered.iter().enumerate() {
-            guest::write64(pointer, ordered.get(index + 1).copied().unwrap_or(head));
-            guest::write64(pointer + 8, if index > 0 { ordered[index - 1] } else { head });
+            // SAFETY: entrada nativa viva (InLoadOrderLinks no início).
+            let links = &unsafe { KldrDataTableEntry::at(pointer) }.in_load_order_links;
+            links.flink.set(ordered.get(index + 1).copied().unwrap_or(head));
+            links.blink.set(if index > 0 { ordered[index - 1] } else { head });
         }
         let retained: Vec<u64> = images.iter().map(|image| image.id).collect();
         let stale: Vec<u64> = self.native_entries.keys().copied().filter(|id| !retained.contains(id)).collect();
@@ -261,8 +271,8 @@ pub fn native_list() -> Result<(u64, Vec<(LoadedImage, u64)>), KernelError> {
         if head == 0 {
             return Err(KernelError::new("kernel loader list head allocation failed"));
         }
-        guest::write64(head, head);
-        guest::write64(head + 8, head);
+        list_entry(head).flink.set(head);
+        list_entry(head).blink.set(head);
         registry.list_head = head;
     }
     registry.synchronize()?;
@@ -278,15 +288,27 @@ pub fn init_kernel() -> Result<LoadedImage, KernelError> {
         return Ok(kernel);
     }
     let base = map::KERNEL_IMAGE_BASE;
-    let r16 = |offset: u64| guest::read16(base + offset) as u64;
-    let r32 = |offset: u64| guest::read32(base + offset) as u64;
-    let pe = r32(0x3C);
-    if r16(0) != 0x5A4D || !(0x40..=0xF00).contains(&pe) || r32(pe) != 0x4550 || r16(pe + 4) != 0x8664 || r16(pe + 24) != 0x20B {
+    // SAFETY: a imagem do kernel em execução, alinhada à página.
+    let dos = unsafe { ImageDosHeader::at(base) };
+    let pe = dos.e_lfanew.get() as u32 as u64;
+    // Campo dos cabeçalhos NT: o e_lfanew não garante o alinhamento natural
+    // da estrutura inteira, então cada leitura é um MOV no endereço do campo.
+    macro_rules! nt {
+        ($($field:tt)+) => {
+            guest::read(base + pe + core::mem::offset_of!(ImageNtHeaders64, $($field)+) as u64)
+        };
+    }
+    let signature: u32 = nt!(signature);
+    let machine: u16 = nt!(file_header.machine);
+    let magic: u16 = nt!(optional_header.magic);
+    if dos.e_magic.get() != 0x5A4D || !(0x40..=0xF00).contains(&pe) || signature != 0x4550 || machine != 0x8664 || magic != 0x20B {
         return Err(KernelError::new("running kernel has no valid PE header"));
     }
-    let size = r32(pe + 80);
-    let entry_rva = r32(pe + 40);
-    if guest::read64(base + pe + 48) != base
+    let size_of_image: u32 = nt!(optional_header.size_of_image);
+    let entry_point: u32 = nt!(optional_header.address_of_entry_point);
+    let (size, entry_rva) = (size_of_image as u64, entry_point as u64);
+    let image_base: u64 = nt!(optional_header.image_base);
+    if image_base != base
         || size < 0x2000
         || size > map::KERNEL_IMAGE_MAX
         || size % 4096 != 0
@@ -317,8 +339,8 @@ pub fn init_kernel() -> Result<LoadedImage, KernelError> {
             image_base: map::KERNEL_VIRTUAL_BASE,
             size_of_image: size,
             entry_point: map::KERNEL_VIRTUAL_BASE + entry_rva,
-            checksum: r32(pe + 88) as u32,
-            time_date_stamp: r32(pe + 8) as u32,
+            checksum: nt!(optional_header.check_sum),
+            time_date_stamp: nt!(file_header.time_date_stamp),
             ..Default::default()
         },
         "\\SystemRoot\\System32\\ntoskrnl.exe",

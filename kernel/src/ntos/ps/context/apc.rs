@@ -11,6 +11,8 @@ use alloc::sync::Arc;
 use crate::ntos::ke::{apc, critical_region, irql};
 use crate::ntos::ps::{kernel_threads, process};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Kapc;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::init::exports::private_routines;
 
@@ -119,7 +121,7 @@ pub fn begin(thread: u64, operation: Operation) -> Result<Request, KernelError> 
             critical_region::leave_guarded()?;
             return Ok(());
         }
-        let pointer = guest::alloc_bytes(apc::kapc::SIZE as u64);
+        let pointer = guest::alloc_bytes(Kapc::SIZE);
         if pointer == 0 {
             finish(&entry, 0xC000_009A, None);
             return Ok(());
@@ -134,7 +136,8 @@ pub fn begin(thread: u64, operation: Operation) -> Result<Request, KernelError> 
     })();
     if let Err(error) = started {
         let pointer = entry.state.lock().pointer;
-        if pointer != 0 && guest::read8(pointer + 0x52) != 0 {
+        // SAFETY: o KAPC da requisição, inicializado acima.
+        if pointer != 0 && unsafe { Kapc::at(pointer) }.inserted.get() != 0 {
             let _ = apc::remove(pointer);
         }
         if entry.state.lock().done {

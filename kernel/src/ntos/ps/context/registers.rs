@@ -4,15 +4,35 @@
 //! agendamento e a captura ficam no provedor de contexto de thread; este
 //! módulo nunca reporta a conclusão de uma API.
 
-use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use core::mem::offset_of;
 
-pub const SIZE: u64 = 0x4D0;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{Context, XsaveFormat};
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
+use crate::rtl::KernelError;
+
+pub const SIZE: u64 = Context::SIZE;
 pub const AMD64: u32 = 0x10_0000;
 const INVALID_PARAMETER: u32 = 0xC000_000D;
 const NOT_SUPPORTED: u32 = 0xC000_00BB;
 /// Rax..R15 (sem Rsp) no CONTEXT.
-pub const INTEGER: [u64; 15] = [0x78, 0x80, 0x88, 0x90, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0];
+pub const INTEGER: [u64; 15] = [
+    offset_of!(Context, rax) as u64,
+    offset_of!(Context, rcx) as u64,
+    offset_of!(Context, rdx) as u64,
+    offset_of!(Context, rbx) as u64,
+    offset_of!(Context, rbp) as u64,
+    offset_of!(Context, rsi) as u64,
+    offset_of!(Context, rdi) as u64,
+    offset_of!(Context, r8) as u64,
+    offset_of!(Context, r9) as u64,
+    offset_of!(Context, r10) as u64,
+    offset_of!(Context, r11) as u64,
+    offset_of!(Context, r12) as u64,
+    offset_of!(Context, r13) as u64,
+    offset_of!(Context, r14) as u64,
+    offset_of!(Context, r15) as u64,
+];
 
 /// Dr0..Dr3, Dr6 e Dr7 saneados (também em KiContextToKframes, o escritor
 /// comum de KiContinuePreviousModeUser e KiRaiseException).
@@ -42,50 +62,82 @@ pub fn validate(flags: u32, mode: u8, xstate: bool) -> (u32, u32) {
     (status, flags)
 }
 
-/// Cópia em QWORDs.
+/// Cópia em QWORDs entre duas áreas de registradores (CONTEXT, KTRAP_FRAME,
+/// quadro do HAL, imagem FXSAVE).
 pub fn copy(to: u64, from: u64, size: u64) {
-    let mut offset = 0;
-    while offset < size {
-        guest::write64(to + offset, guest::read64(from + offset));
-        offset += 8;
+    let count = (size / 8) as usize;
+    // SAFETY: os chamadores passam áreas de registradores do kernel de pelo
+    // menos `size` bytes, alinhadas a 8.
+    let (target, source) = unsafe { (Field::<u64>::array_at(to, count), Field::<u64>::array_at(from, count)) };
+    for (target, source) in target.iter().zip(source) {
+        target.set(source.get());
     }
+}
+
+fn context(address: u64) -> &'static Context {
+    // SAFETY: CONTEXT do kernel (cópia capturada, buffer de KernelMode ou o
+    // CONTEXT salvo do quadro).
+    unsafe { Context::at(address) }
+}
+
+/// Rax..R15 sem Rsp, na ordem de [`INTEGER`].
+pub(crate) fn integer_registers(context: &Context) -> [&Field<u64>; 15] {
+    [
+        &context.rax, &context.rcx, &context.rdx, &context.rbx, &context.rbp, &context.rsi, &context.rdi, &context.r8,
+        &context.r9, &context.r10, &context.r11, &context.r12, &context.r13, &context.r14, &context.r15,
+    ]
+}
+
+/// Lê um campo do CONTEXT de modo usuário com sonda (o `__try` do NT): a
+/// página pode sumir entre a sondagem do intervalo e a leitura.
+fn probe<T: GuestScalar>(source: u64, offset: usize) -> Result<T, KernelError> {
+    guest::try_read(source + offset as u64)
+}
+
+/// Copia `length` bytes do CONTEXT de modo usuário para o do kernel.
+fn probe_block(target: &Context, source: u64, offset: usize, length: usize) -> Result<(), KernelError> {
+    let bytes = guest::try_read_bytes(source + offset as u64, length)?;
+    guest::write_bytes(target.address() + offset as u64, &bytes);
+    Ok(())
 }
 
 /// Captura um CONTEXT de usuário legado num armazenamento zerado do kernel:
 /// copia os campos selecionados e publica os flags normalizados, sem tocar
-/// homes, grupos não selecionados, padding ou a extensão vetorial.
+/// homes, grupos não selecionados, padding ou a extensão vetorial. A origem
+/// é memória de modo usuário: toda leitura dela é sondada.
 pub fn capture_registers(target: u64, source: u64, flags: u32) -> Result<(), KernelError> {
     if flags & 0x40 != 0 {
         return Err(KernelError::new("thread context: XSTATE must be validated before capture"));
     }
     guest::write_bytes(target, &[0; SIZE as usize]);
-    guest::write32(target + 0x30, flags);
-    let word = |offset: u64| guest::write16(target + offset, guest::read16(source + offset));
-    let dword = |offset: u64| guest::write32(target + offset, guest::read32(source + offset));
+    let target = context(target);
+    target.context_flags.set(flags);
     if flags & 1 != 0 {
-        copy(target + 0xF8, source + 0xF8, 8);
-        copy(target + 0x98, source + 0x98, 8);
-        word(0x38);
-        word(0x42);
-        dword(0x44);
+        target.rip.set(probe(source, offset_of!(Context, rip))?);
+        target.rsp.set(probe(source, offset_of!(Context, rsp))?);
+        target.seg_cs.set(probe(source, offset_of!(Context, seg_cs))?);
+        target.seg_ss.set(probe(source, offset_of!(Context, seg_ss))?);
+        target.e_flags.set(probe(source, offset_of!(Context, e_flags))?);
     }
     if flags & 2 != 0 {
-        for offset in INTEGER {
-            copy(target + offset, source + offset, 8);
+        for (field, offset) in integer_registers(target).into_iter().zip(INTEGER) {
+            field.set(probe(source, offset as usize)?);
         }
     }
     if flags & 4 != 0 {
-        for offset in [0x3A, 0x3C, 0x3E, 0x40] {
-            word(offset);
-        }
+        target.seg_ds.set(probe(source, offset_of!(Context, seg_ds))?);
+        target.seg_es.set(probe(source, offset_of!(Context, seg_es))?);
+        target.seg_fs.set(probe(source, offset_of!(Context, seg_fs))?);
+        target.seg_gs.set(probe(source, offset_of!(Context, seg_gs))?);
     }
     if flags & 8 != 0 {
-        dword(0x34);
-        copy(target + 0x100, source + 0x100, 0x1A0);
+        target.mx_csr.set(probe(source, offset_of!(Context, mx_csr))?);
+        // Parte legada do FltSave e Xmm0..15.
+        probe_block(target, source, offset_of!(Context, flt_save), offset_of!(XsaveFormat, reserved4))?;
     }
     if flags & 0x10 != 0 {
-        copy(target + 0x48, source + 0x48, 48);
-        copy(target + 0x4B0, source + 0x4B0, 32);
+        probe_block(target, source, offset_of!(Context, dr0), offset_of!(Context, rax) - offset_of!(Context, dr0))?;
+        probe_block(target, source, offset_of!(Context, last_branch_to_rip), SIZE as usize - offset_of!(Context, last_branch_to_rip))?;
     }
     Ok(())
 }
@@ -93,41 +145,46 @@ pub fn capture_registers(target: u64, source: u64, flags: u32) -> Result<(), Ker
 /// Projeta o CONTEXT de entrada no CONTEXT salvo (trap frame real e não
 /// voláteis). SEGMENTS sozinho não altera segmentos; CONTROL é dono de CS/SS.
 pub fn write_registers(target: u64, source: u64, mode: u8, mxcsr_mask: u32, current_mxcsr: u32) -> Result<(), KernelError> {
-    let flags = guest::read32(source + 0x30);
+    let (target, source) = (context(target), context(source));
+    let flags = source.context_flags.get();
     let selected = |mask: u32| flags & (AMD64 | mask) == AMD64 | mask;
     if selected(0x40) {
         return Err(KernelError::new("thread context: XSTATE must be validated before register writes"));
     }
     if selected(1) {
-        let mut rip = guest::read64(source + 0xF8);
-        let cs: u16 = if mode == 1 { if guest::read16(source + 0x38) == 0x33 { 0x33 } else { 0x23 } } else { 0x10 };
+        let mut rip = source.rip.get();
+        let cs: u16 = if mode == 1 { if source.seg_cs.get() == 0x33 { 0x33 } else { 0x23 } } else { 0x10 };
         if mode == 1 {
             rip = if cs == 0x33 { ((rip << 16) as i64 >> 16) as u64 } else { rip & 0xFFFF_FFFF };
         }
-        let eflags = (guest::read32(source + 0x44) & if mode != 0 { 0x21_0DD5 } else { 0x25_0FD5 }) | if mode != 0 { 0x200 } else { 0 };
-        guest::write32(target + 0x44, eflags);
-        guest::write64(target + 0xF8, rip);
-        guest::write64(target + 0x98, guest::read64(source + 0x98));
-        guest::write16(target + 0x38, cs);
-        guest::write16(target + 0x42, if mode == 1 { 0x2B } else { 0 });
+        let eflags = (source.e_flags.get() & if mode != 0 { 0x21_0DD5 } else { 0x25_0FD5 }) | if mode != 0 { 0x200 } else { 0 };
+        target.e_flags.set(eflags);
+        target.rip.set(rip);
+        target.rsp.set(source.rsp.get());
+        target.seg_cs.set(cs);
+        target.seg_ss.set(if mode == 1 { 0x2B } else { 0 });
     }
     if selected(2) {
-        for offset in INTEGER {
-            copy(target + offset, source + offset, 8);
+        for (target, source) in integer_registers(target).into_iter().zip(integer_registers(source)) {
+            target.set(source.get());
         }
     }
     if selected(8) {
-        copy(target + 0x1A0, source + 0x1A0, 16 * 16);
-        guest::write32(target + 0x34, guest::read32(source + 0x34) & mxcsr_mask);
+        for (target, source) in target.flt_save.xmm_registers.iter().zip(&source.flt_save.xmm_registers) {
+            target.low.set(source.low.get());
+            target.high.set(source.high.get());
+        }
+        target.mx_csr.set(source.mx_csr.get() & mxcsr_mask);
         // PspSetContext prepara a imagem FXSAVE de entrada para o FXRSTOR
         // da APC especial; em KernelMode o buffer do chamador é a entrada.
-        guest::write32(source + 0x118, current_mxcsr);
-        guest::write16(source + 0x100, guest::read16(source + 0x100) & 0x1F3F);
+        source.flt_save.mx_csr.set(current_mxcsr);
+        source.flt_save.control_word.set(source.flt_save.control_word.get() & 0x1F3F);
     }
     if selected(0x10) {
-        let values = [guest::read64(source + 0x48), guest::read64(source + 0x50), guest::read64(source + 0x58), guest::read64(source + 0x60), 0, guest::read64(source + 0x70)];
-        for (index, value) in debug_registers(values, mode).into_iter().enumerate() {
-            guest::write64(target + 0x48 + index as u64 * 8, value);
+        let values = [source.dr0.get(), source.dr1.get(), source.dr2.get(), source.dr3.get(), 0, source.dr7.get()];
+        let fields = [&target.dr0, &target.dr1, &target.dr2, &target.dr3, &target.dr6, &target.dr7];
+        for (field, value) in fields.into_iter().zip(debug_registers(values, mode)) {
+            field.set(value);
         }
     }
     Ok(())
@@ -136,13 +193,15 @@ pub fn write_registers(target: u64, source: u64, mode: u8, mxcsr_mask: u32, curr
 /// O escalonador guarda uma imagem FXSAVE inteira em vez de MXCSR/XMM do
 /// trap frame; só a APC especial de UserMode restaura x87/MMX.
 pub fn write_saved_context(target: u64, source: u64, mode: u8, mxcsr_mask: u32, current_mxcsr: u32) -> Result<(), KernelError> {
-    let flags = guest::read32(source + 0x30);
+    let flags = context(source).context_flags.get();
     write_registers(target, source, mode, mxcsr_mask, current_mxcsr)?;
     if flags & 0x10_0008 == 0x10_0008 {
+        let (saved, input) = (context(target), context(source));
         if mode == 1 {
-            copy(target + 0x100, source + 0x100, 0xA0);
+            // A parte x87/MMX da imagem FXSAVE (antes dos XMM).
+            copy(saved.flt_save.address(), input.flt_save.address(), offset_of!(XsaveFormat, xmm_registers) as u64);
         }
-        guest::write32(target + 0x118, guest::read32(target + 0x34));
+        saved.flt_save.mx_csr.set(saved.mx_csr.get());
     }
     Ok(())
 }

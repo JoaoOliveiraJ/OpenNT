@@ -11,7 +11,8 @@ use crate::ntos::mm::{page_residency, paging};
 use crate::ntos::ob::handles::thread as thread_handles;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Ethread;
 
 const THREAD_PAGE_PRIORITY: u32 = 24;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
@@ -85,19 +86,23 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
         Err(status) => return Ok(status),
     };
     let result = (|| {
-        let flags = guest::read32(reference.pointer + kthread::CROSS_THREAD_FLAGS);
-        let page_priority = (flags >> kthread::PAGE_PRIORITY_SHIFT) & 7;
+        // SAFETY: ETHREAD referenciado pelo handle.
+        let page_priority = unsafe { Ethread::at(reference.pointer) }.thread_page_priority();
         // A escrita vem depois da referência; erros anteriores preservam os buffers.
         if !can_write_priority_output(output, from_user_mode) {
             return STATUS_ACCESS_VIOLATION;
         }
-        guest::write32(output, page_priority);
+        if guest::try_write::<u32>(output, page_priority).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
         if returned_length != 0 {
             // Em KernelMode esta falha pode vir depois da escrita, como no NT.
             if !can_write_priority_output(returned_length, from_user_mode) {
                 return STATUS_ACCESS_VIOLATION;
             }
-            guest::write32(returned_length, PAGE_PRIORITY_SIZE as u32);
+            if guest::try_write::<u32>(returned_length, PAGE_PRIORITY_SIZE as u32).is_err() {
+                return STATUS_ACCESS_VIOLATION;
+            }
         }
         0
     })();

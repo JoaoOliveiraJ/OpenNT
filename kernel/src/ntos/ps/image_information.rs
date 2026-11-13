@@ -13,7 +13,8 @@ use crate::ntos::ob::process_reference;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Eprocess, Ethread};
 use crate::ntos::rtl::image::pe_image_information::INFORMATION_SIZE;
 
 /// Seção → `None` sem registro de seção; `Some(None)` = não é imagem;
@@ -35,9 +36,12 @@ pub fn query(process_handle: u64, output: u64, length: u32, returned: u64, acces
         Err(status) => return Ok(status),
     };
     let process_pointer = reference.pointer;
-    let owning = guest::read64(process::get_current_thread() + kthread::PROCESS);
+    // SAFETY: a thread corrente do Process Manager.
+    let owning = unsafe { Ethread::at(process::get_current_thread()) }.tcb.process.get();
     let remote = process_pointer != owning;
-    let rundown_pointer = process_pointer + eprocess::RUNDOWN_PROTECT;
+    // SAFETY: EPROCESS referenciado pelo handle.
+    let target = unsafe { Eprocess::at(process_pointer) };
+    let rundown_pointer = target.rundown_protect.count.address();
     let mut section = 0;
     let mut retained = false;
     // A comparação usa a dona da thread, não ApcState.Process: uma thread
@@ -47,7 +51,7 @@ pub fn query(process_handle: u64, output: u64, length: u32, returned: u64, acces
             return Ok(Some(0xC000_010A));
         }
         let result = (|| -> Result<Option<u32>, KernelError> {
-            section = guest::read64(process_pointer + eprocess::SECTION_OBJECT);
+            section = target.section_object.get();
             if section == 0 {
                 return Ok(Some(if remote { 0xC000_000D } else { 0xC000_010A }));
             }
@@ -82,7 +86,10 @@ pub fn query(process_handle: u64, output: u64, length: u32, returned: u64, acces
         if probe_output.is_some_and(|probe| !probe(output, INFORMATION_SIZE as u64)) {
             return Ok(0xC000_0005);
         }
-        guest::write_bytes(output, &information);
+        // Saída de modo usuário: a cópia é sondada (a página pode sumir).
+        if guest::try_write_bytes(output, &information).is_err() {
+            return Ok(0xC000_0005);
+        }
         Ok(0)
     })();
     if retained {
@@ -90,8 +97,8 @@ pub fn query(process_handle: u64, output: u64, length: u32, returned: u64, acces
     }
     let status = result?;
     // A escrita por último preserva o caso ReturnLength aliased à saída.
-    if status == 0 && returned != 0 {
-        guest::write32(returned, INFORMATION_SIZE as u32);
+    if status == 0 && returned != 0 && guest::try_write::<u32>(returned, INFORMATION_SIZE as u32).is_err() {
+        return Ok(0xC000_0005);
     }
     Ok(status)
 }

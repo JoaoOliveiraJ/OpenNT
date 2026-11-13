@@ -83,8 +83,9 @@ fn frame_of(entry: u64, size: u64) -> u64 {
 }
 
 fn add_entry_flags(address: u64, flags: u64) {
-    // Uma atualização de permissão não pode apagar NX nem os bits altos.
-    physical::write32(address, physical::read32(address) | flags as u32);
+    // Uma atualização de permissão não pode apagar NX nem os bits altos nem
+    // perder Accessed/Dirty gravados pela CPU: OR atômico na entrada.
+    crate::ntos::mm::guest_memory::atomic_u64(address).fetch_or(flags & 0xFFFF_FFFF, core::sync::atomic::Ordering::SeqCst);
 }
 
 fn table_of(entry: u64) -> u64 {

@@ -26,15 +26,13 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 use super::{map_system_view, unmap_system_view};
-use crate::ntos::inc::nt_abi::eprocess;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::Eprocess;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::sections::{self, View};
 use crate::rtl::{KernelError, SpinLock};
 
 const PAGE: u64 = 0x1000;
-/// EPROCESS.Flags.ProcessInSession.
-const PROCESS_IN_SESSION: u32 = 1 << 16;
 const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const STATUS_ALREADY_COMMITTED: u32 = 0xC000_0021;
 const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
@@ -46,7 +44,8 @@ static SESSION_VIEWS: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new
 
 /// O processo anexado (ApcState.Process) está numa sessão.
 fn in_session() -> bool {
-    guest::read32(process::get_current_process() + eprocess::FLAGS) & PROCESS_IN_SESSION != 0
+    // SAFETY: o processo corrente (o anexado).
+    unsafe { Eprocess::at(process::get_current_process()) }.process_in_session() != 0
 }
 
 /// A vista de sessão viva que contém o endereço.
@@ -58,7 +57,8 @@ fn session_view(address: u64) -> Option<Arc<View>> {
 
 fn record(base_pointer: u64, status: u32) -> u32 {
     if status == 0 {
-        if let Some(view) = sections::find_system_view(guest::read64(base_pointer)) {
+        // SAFETY: PVOID* MappedBase do chamador de kernel, gravado pelo mapeamento.
+        if let Some(view) = sections::find_system_view(unsafe { Field::<u64>::at(base_pointer) }.get()) {
             SESSION_VIEWS.lock().insert(view.base, view.size);
         }
     }

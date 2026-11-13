@@ -14,6 +14,9 @@ use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::objects::file::{self as file_objects, FileSource};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{ImageInfoEx, UnicodeString};
+use super::CallbackBlock;
 
 const SLOTS: usize = 64;
 
@@ -38,7 +41,7 @@ fn passive() -> Result<(), KernelError> {
 
 pub fn register(callback: u64) -> Result<u32, KernelError> {
     passive()?;
-    let Ok(pointer) = kernel_pool::allocate(24, AllocateOptions { tag: 0x6272_6243, zero: true, ..Default::default() }) else {
+    let Ok(pointer) = kernel_pool::allocate(CallbackBlock::SIZE, AllocateOptions { tag: 0x6272_6243, zero: true, ..Default::default() }) else {
         return Ok(0xC000_009A);
     };
     let mut slots = REGISTRATIONS.lock();
@@ -47,7 +50,7 @@ pub fn register(callback: u64) -> Result<u32, KernelError> {
         kernel_pool::free(pointer, None)?;
         return Ok(0xC000_009A);
     };
-    guest::write64(pointer + 8, callback);
+    CallbackBlock::of(pointer).function.set(callback);
     slots[index] = Some(Arc::new(Registration { pointer, callback, active: AtomicU32::new(0), removed: AtomicBool::new(false), freed: AtomicBool::new(false) }));
     Ok(0)
 }
@@ -141,33 +144,36 @@ pub fn notify(image: Image, options: &NotifyOptions) -> Result<(), KernelError> 
         } else if let Some(source) = &options.source {
             file = file_objects::create_source(source.clone())?;
         }
-        block = guest::alloc_bytes(56);
+        block = guest::alloc_bytes(ImageInfoEx::SIZE);
         if block == 0 {
             return Err(KernelError::new("image notification allocation failed"));
         }
-        let info = block + 8;
-        guest::write64(block, 56);
+        // SAFETY: IMAGE_INFO_EX recém-alocado.
+        let extended = unsafe { ImageInfoEx::at(block) };
+        let info = extended.image_info.address();
+        extended.size.set(ImageInfoEx::SIZE);
         // IMAGE_ADDRESSING_MODE_32BIT vale 3 mesmo em x64; nenhuma decisão de
         // assinatura da CI ocorreu, então nível e tipo ficam zero.
-        guest::write32(info, 3 | if options.system { 0x100 } else { 0 } | if file != 0 { 0x400 } else { 0 });
-        guest::write64(info + 8, image.image_base);
-        guest::write64(info + 24, image.size_of_image);
-        guest::write64(block + 48, file);
+        extended.image_info.properties.set(3 | if options.system { 0x100 } else { 0 } | if file != 0 { 0x400 } else { 0 });
+        extended.image_info.image_base.set(image.image_base);
+        extended.image_info.image_size.set(image.size_of_image);
+        extended.file_object.set(file);
         if let Some(name) = &options.name {
             let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
             if units.len() > 32766 {
                 return Err(KernelError::new("invalid load-image name"));
             }
-            unicode = guest::alloc_bytes(18 + units.len() as u64 * 2);
+            unicode = guest::alloc_bytes(UnicodeString::SIZE + units.len() as u64 * 2 + 2);
             if unicode == 0 {
                 return Err(KernelError::new("image notification name allocation failed"));
             }
-            guest::write16(unicode, units.len() as u16 * 2);
-            guest::write16(unicode + 2, units.len() as u16 * 2 + 2);
-            guest::write64(unicode + 8, unicode + 16);
-            for (index, &unit) in units.iter().enumerate() {
-                guest::write16(unicode + 16 + index as u64 * 2, unit);
-            }
+            // SAFETY: UNICODE_STRING recém-alocado, com o buffer logo depois.
+            let string = unsafe { UnicodeString::at(unicode) };
+            string.length.set(units.len() as u16 * 2);
+            string.maximum_length.set(units.len() as u16 * 2 + 2);
+            string.buffer.set(unicode + UnicodeString::SIZE);
+            let characters: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            guest::write_bytes(unicode + UnicodeString::SIZE, &characters);
         }
         let process_id = if options.system { 0 } else { options.process_id.unwrap_or_else(process::get_current_process_id) };
         critical_region::enter_critical()?;

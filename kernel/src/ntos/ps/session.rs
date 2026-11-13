@@ -1,16 +1,23 @@
 //! PsGetProcessSessionId.
 
 use super::process;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{Eprocess, Ethread, MmSessionSpace};
+
+fn eprocess(process: u64) -> &'static Eprocess {
+    // SAFETY: PEPROCESS do chamador (vivo ou retido).
+    unsafe { Eprocess::at(process) }
+}
 
 /// Sessão NULL ou processo de sistema = 0; -1 também vira 0.
 pub fn query(process: u64) -> u32 {
-    let session = guest::read64(process + eprocess::SESSION);
-    if session == 0 || guest::read32(process + eprocess::FLAGS3) & eprocess::SYSTEM_PROCESS_FLAG != 0 {
+    let object = eprocess(process);
+    let session = object.session.get();
+    if session == 0 || object.system_process() != 0 {
         return 0;
     }
-    match guest::read32(session + 8) {
+    // SAFETY: EPROCESS.Session aponta para o MM_SESSION_SPACE da sessão.
+    match unsafe { MmSessionSpace::at(session) }.session_id.get() {
         0xFFFF_FFFF => 0,
         id => id,
     }
@@ -19,7 +26,7 @@ pub fn query(process: u64) -> u32 {
 /// PsGetProcessDebugPort: acessor opaco exato, sem referência nem
 /// substituição pelo processo corrente.
 pub fn debug_port(process: u64) -> u64 {
-    guest::read64(process + eprocess::DEBUG_PORT)
+    eprocess(process).debug_port.get()
 }
 
 /// PsIsProcessBeingDebugged: há uma porta de depuração no EPROCESS.
@@ -30,7 +37,7 @@ pub fn is_being_debugged(process: u64) -> bool {
 /// PsGetProcessSessionIdEx: (ULONG)-1 para quem não pertence a uma sessão
 /// (o processo de sistema).
 pub fn query_ex(process: u64) -> u32 {
-    if guest::read32(process + eprocess::FLAGS3) & eprocess::SYSTEM_PROCESS_FLAG != 0 {
+    if eprocess(process).system_process() != 0 {
         return 0xFFFF_FFFF;
     }
     query(process)
@@ -38,7 +45,8 @@ pub fn query_ex(process: u64) -> u32 {
 
 /// PsGetThreadSessionId: a sessão do processo dono da thread.
 pub fn thread_session_id(thread: u64) -> u32 {
-    query(guest::read64(thread + kthread::PROCESS))
+    // SAFETY: PETHREAD do chamador.
+    query(unsafe { Ethread::at(thread) }.tcb.process.get())
 }
 
 /// PsGetCurrentProcessSessionId: a sessão do processo corrente (o anexado).
