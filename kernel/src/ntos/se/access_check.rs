@@ -18,7 +18,11 @@ use crate::ntos::inc::types::{
     AccessAllowedAce, AceHeader, Acl, GenericMapping, NtStruct, SecurityImpersonationLevel, SecuritySubjectContext,
     SidAndAttributes, SidAndAttributesHash, TokenAccessInformation,
 };
+use crate::ntos::inc::types::{AccessReasons, AccessState, Field};
+use crate::ntos::inc::types::extra_fs_ntfs::{SeAccessReply, SeAccessRequest, SeSecurityDescriptor};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::ob::object_types;
+use crate::ntos::se::acl;
 use crate::ntos::se::model::Sid;
 use crate::ntos::se::token::tokens;
 use crate::ntos::se::{descriptor, out, sid};
@@ -501,4 +505,225 @@ pub fn access_check_from_state_ex(descriptor: u64, primary_token: u64, client_to
         primary_token
     };
     decide(descriptor, subject_from_token(token), desired, previous, mapping, granted_out, status_out)
+}
+
+// ---- SeAccessCheckEx / SeAccessCheckWithHint / restrições de acesso ----------
+//
+// Access check com requisição/resposta, com hint, e os ajustes por
+// restrições de acesso — rótulo de confiança de processo e filtros de acesso.
+// A avaliação de DACL é a de `access_check` acima; aqui ficam o contrato
+// SE_ACCESS_REQUEST / SE_ACCESS_REPLY e as restrições, transcritos do
+// ntoskrnl 19041:
+// - SeAccessCheckWithHint (rva 0x2ce400) = SeAccessCheck com um ULONG de
+//   hint: bit 4 pula SepFilterCheck, bit 2 a integridade obrigatória, bit 1
+//   o atalho de direitos do dono, bit 8 o SeLogAccessFailure. O avaliador do
+//   OpenNT não executa nenhuma dessas etapas, então o hint não muda o
+//   resultado.
+// - SeAccessCheckEx (rva 0x3737f0 -> SepCommonAccessCheckExWithAdminlessChecks
+//   0x373854): validação de tamanhos (REPLY 0x28, REQUEST 0x38,
+//   SE_SECURITY_DESCRIPTOR 0x10 com Flags <= 7, SE_AUDIT_INFO 0x60), saídas
+//   pré-zeradas, AccessReasons limpos (AuthzBasepSetAccessReasons), atalho de
+//   KernelMode (GenericAll, sem STANDARD_RIGHTS_ALL), Sd/impersonação/
+//   Desired == 0, e ResultListCount == 1 ou igual a ObjectTypeListCount.
+//   As três estruturas vêm de um chamador de kernel (o ntfs as monta na
+//   pilha), então não são sondadas.
+// - O OpenNT não tem processos protegidos: nenhum token carrega
+//   TrustLevelSid (TOKEN+0x450 nulo), e não há avaliador de ACEs
+//   condicionais, então SYSTEM_ACCESS_FILTER_ACE (0x15) não restringe.
+
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+const SE_ACCESS_REQUEST_SIZE: u32 = SeAccessRequest::SIZE as u32;
+const SE_ACCESS_REPLY_SIZE: u32 = SeAccessReply::SIZE as u32;
+const SE_SECURITY_DESCRIPTOR_SIZE: u32 = SeSecurityDescriptor::SIZE as u32;
+/// `sizeof(SE_AUDIT_INFO)` (ntifs.h): o quinto argumento só tem o Size conferido.
+const SE_AUDIT_INFO_SIZE: u32 = 0x60;
+
+// ACCESS_STATE.Flags: TOKEN_HAS_BACKUP_PRIVILEGE / TOKEN_HAS_RESTORE_PRIVILEGE.
+const TOKEN_HAS_BACKUP_PRIVILEGE: u32 = 0x02;
+const TOKEN_HAS_RESTORE_PRIVILEGE: u32 = 0x04;
+
+const SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE: u8 = 0x14;
+const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// SeAccessCheckWithHint(Sd, Hint, Subject, Locked, Desired, Previous,
+/// *Privileges, Mapping, Mode, *Granted, *Status) sem o Hint, que só pula
+/// etapas que o avaliador do OpenNT não tem.
+#[allow(clippy::too_many_arguments)]
+pub fn access_check_with_hint(descriptor: u64, subject: u64, desired: u32, previous: u32, privileges: u64, mapping: u64, mode: u32, granted: u64, status: u64) -> bool {
+    access_check(descriptor, subject, desired, previous, privileges, mapping, mode, granted, status)
+}
+
+/// AuthzBasepSetAccessReasons(Mask, 0, Reasons, 0, TRUE): zera o motivo de
+/// cada bit de acesso ainda pedido.
+fn clear_access_reasons(mask: u32, reasons: u64) {
+    if reasons == 0 {
+        return;
+    }
+    // SAFETY: PACCESS_REASONS do SE_ACCESS_REPLY de um chamador de kernel.
+    let reasons = unsafe { AccessReasons::at(reasons) };
+    for (bit, reason) in reasons.data.iter().enumerate() {
+        if mask & (1 << bit) != 0 {
+            reason.set(0);
+        }
+    }
+}
+
+fn access_request_is_valid(subject: u64, request: u64, reply: &SeAccessReply, audit_info: u64) -> bool {
+    if subject == 0 || request == 0 || reply.granted_access.get() == 0 {
+        return false;
+    }
+    // SAFETY: PSE_ACCESS_REQUEST não nulo de um chamador de kernel.
+    let request = unsafe { SeAccessRequest::at(request) };
+    if request.size.get() != SE_ACCESS_REQUEST_SIZE {
+        return false;
+    }
+    let se_descriptor = request.se_security_descriptor.get();
+    if se_descriptor != 0 {
+        // SAFETY: PSE_SECURITY_DESCRIPTOR não nulo do pedido.
+        let se_descriptor = unsafe { SeSecurityDescriptor::at(se_descriptor) };
+        if se_descriptor.size.get() != SE_SECURITY_DESCRIPTOR_SIZE || se_descriptor.flags.get() & !7 != 0 {
+            return false;
+        }
+    }
+    audit_info == 0 || out::<u32>(audit_info).get() == SE_AUDIT_INFO_SIZE
+}
+
+/// SeAccessCheckEx(Subject, SubjectLocked, AccessRequest, AccessReply,
+/// AuditInfo, AccessMode). Com várias entradas de resultado (lista de tipos
+/// de objeto), todas recebem o resultado do objeto inteiro: o avaliador do
+/// OpenNT não distingue ACEs de objeto por GUID.
+pub fn access_check_ex(subject: u64, request: u64, reply: u64, audit_info: u64, mode: u32) -> bool {
+    if reply == 0 {
+        return false;
+    }
+    // SAFETY: PSE_ACCESS_REPLY não nulo de um chamador de kernel.
+    let reply = unsafe { SeAccessReply::at(reply) };
+    if reply.size.get() != SE_ACCESS_REPLY_SIZE || reply.access_status.get() == 0 {
+        return false;
+    }
+    let status = out::<u32>(reply.access_status.get());
+    if !access_request_is_valid(subject, request, reply, audit_info) {
+        status.set(STATUS_INVALID_PARAMETER);
+        return false;
+    }
+    // SAFETY: validado acima.
+    let request = unsafe { SeAccessRequest::at(request) };
+    let granted = out::<u32>(reply.granted_access.get());
+    granted.set(0);
+    status.set(STATUS_ACCESS_DENIED);
+    let privileges = reply.privileges.get();
+    if privileges != 0 {
+        out::<u64>(privileges).set(0);
+    }
+    let desired = request.desired_access.get();
+    let previous = request.previously_granted_access.get();
+    let mapping = request.generic_mapping.get();
+    clear_access_reasons(desired & !previous & !MAXIMUM_ALLOWED, reply.access_reason.get());
+    if mode == 0 {
+        let generic_all = if mapping != 0 { generic_mapping(mapping).generic_all.get() } else { 0 };
+        granted.set(if desired & MAXIMUM_ALLOWED != 0 { generic_all | (desired & !MAXIMUM_ALLOWED) | previous } else { desired | previous });
+        status.set(0);
+        return true;
+    }
+    let se_descriptor = request.se_security_descriptor.get();
+    // SAFETY: PSE_SECURITY_DESCRIPTOR já validado.
+    let object_descriptor = if se_descriptor != 0 { unsafe { SeSecurityDescriptor::at(se_descriptor) }.security_descriptor.get() } else { 0 };
+    if object_descriptor == 0 {
+        return false;
+    }
+    // SAFETY: PSECURITY_SUBJECT_CONTEXT capturado pelo chamador.
+    let context = unsafe { SecuritySubjectContext::at(subject) };
+    if context.client_token.get() != 0 && context.impersonation_level.get().0 < SECURITY_IMPERSONATION.0 {
+        status.set(STATUS_BAD_IMPERSONATION_LEVEL);
+        return false;
+    }
+    if desired == 0 {
+        if previous == 0 {
+            return false;
+        }
+        granted.set(previous);
+        status.set(0);
+        return true;
+    }
+    let results = reply.result_list_count.get();
+    if results != 1 && results != request.object_type_list_count.get() {
+        status.set(STATUS_INVALID_PARAMETER);
+        return false;
+    }
+    let allowed = access_check(object_descriptor, subject, desired, previous, privileges, mapping, mode, granted.address(), status.address());
+    // SAFETY: GrantedAccess[] e AccessStatus[] têm ResultListCount entradas.
+    let (granted_list, status_list) = unsafe { (Field::<u32>::array_at(granted.address(), results as usize), Field::<u32>::array_at(status.address(), results as usize)) };
+    for index in 1..results as usize {
+        granted_list[index].set(granted.get());
+        status_list[index].set(status.get());
+    }
+    allowed
+}
+
+/// SeGetTrustLabelAce: primeira SYSTEM_PROCESS_TRUST_LABEL_ACE efetiva da
+/// SACL (endereço da ACE; o layout é o KNOWN_ACE de AccessAllowedAce). As
+/// ACEs podem ficar desalinhadas, então são lidas pelo offset do layout.
+fn trust_label_ace(object_descriptor: u64) -> Option<u64> {
+    if object_descriptor == 0 {
+        return None;
+    }
+    let sacl = descriptor::component(object_descriptor, descriptor::control(object_descriptor), 2);
+    if sacl == 0 {
+        return None;
+    }
+    // SAFETY: componente SACL do descritor (PACL alinhada a WORD).
+    let count = unsafe { Acl::at(sacl) }.ace_count.get();
+    let mut cursor = sacl + Acl::SIZE;
+    for _ in 0..count {
+        let ace_type = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_type) as u64);
+        let ace_flags = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_flags) as u64);
+        if ace_type == SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE && ace_flags & INHERIT_ONLY_ACE == 0 {
+            return Some(cursor);
+        }
+        cursor += guest::read::<u16>(cursor + offset_of!(AceHeader, ace_size) as u64) as u64;
+    }
+    None
+}
+
+/// RtlSidDominatesForTrust com o token sem TrustLevelSid: domina só um SID
+/// de confiança válido do tipo 0 (S-1-19-0-0); SID inválido não domina. O
+/// SID segue a ACE em SidStart.
+fn token_dominates(ace: u64) -> bool {
+    // SAFETY: a ACE está numa ACL validada (ACEs com AceSize múltiplo de 4,
+    // o alinhamento do SID).
+    let trust_sid = unsafe { crate::ntos::inc::types::Sid::at(ace + offset_of!(AccessAllowedAce, sid_start) as u64) };
+    acl::is_valid_process_trust_label_sid(trust_sid) && trust_sid.sub_authority[0].get() == 0
+}
+
+/// SeAdjustAccessStateForAccessConstraints(ObjectType, Sd, AccessState):
+/// tira dos acessos concedidos por backup/restore o que o rótulo de
+/// confiança do objeto nega a um token que não o domina.
+pub fn adjust_access_state_for_access_constraints(object_type: u64, object_descriptor: u64, access_state: &AccessState) {
+    let flags = access_state.flags.get();
+    if flags & (TOKEN_HAS_BACKUP_PRIVILEGE | TOKEN_HAS_RESTORE_PRIVILEGE) == 0 {
+        return;
+    }
+    let Some(ace) = trust_label_ace(object_descriptor).filter(|&ace| !token_dominates(ace)) else { return };
+    let denied = !guest::read::<u32>(ace + offset_of!(AccessAllowedAce, mask) as u64);
+    let (backup, restore) = match object_types::find(object_type).map(|object_type| object_type.name).as_deref() {
+        Some("File") => (0x0112_0089u32, 0x011F_0116u32),
+        Some("Key") => (0x0102_0019, 0x010F_0006),
+        _ => (0, 0),
+    };
+    let mut previously_granted = access_state.previously_granted_access.get();
+    if flags & TOKEN_HAS_BACKUP_PRIVILEGE != 0 {
+        previously_granted &= !(backup & denied);
+    }
+    if flags & TOKEN_HAS_RESTORE_PRIVILEGE != 0 {
+        previously_granted &= !(restore & denied);
+    }
+    access_state.previously_granted_access.set(previously_granted);
+}
+
+/// SeShouldCheckForAccessRightsFromParent(ObjectType, ChildSd, AccessState):
+/// TRUE quando o token domina o rótulo de confiança do filho (ou não há
+/// rótulo); sem avaliador de filtros, nenhum filtro corta o acesso pedido.
+pub fn should_check_for_access_rights_from_parent(child_descriptor: u64) -> bool {
+    trust_label_ace(child_descriptor).is_none_or(token_dominates)
 }

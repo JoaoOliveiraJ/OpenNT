@@ -247,3 +247,63 @@ pub mod top_level_irp {
         thread_accessors::process(thread)
     }
 }
+
+/// Consultas de thread usadas por file systems e filtros: IoIsSystemThread
+/// (RVA 0x3096d0, KTHREAD.MiscFlags.SystemThread) e IoWithinStackLimits
+/// (RVA 0x2e53b0).
+pub mod thread_queries {
+    use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
+    use crate::ntos::inc::types::{Kthread, NtStruct};
+    use crate::ntos::ps::process;
+
+    pub fn is_system_thread(thread: &Kthread) -> bool {
+        thread.system_thread() != 0
+    }
+
+    /// [Start, Start+Size] dentro da pilha corrente: [StackLimit, StackBase] da
+    /// thread e, a partir de InitialStack, os segmentos anteriores do
+    /// KERNEL_STACK_CONTROL de pilhas expandidas. O OpenNT ainda não preenche
+    /// KTHREAD.StackBase/StackLimit (só InitialStack): sem limites publicados
+    /// a região não pode ser provada na pilha e a resposta é FALSE. O ramo da
+    /// pilha de DPC (Prcb.DpcStack) também não existe no OpenNT.
+    pub fn within_stack_limits(start: u64, size: u64) -> bool {
+        let address = process::get_current_thread();
+        if address == 0 {
+            return false;
+        }
+        // SAFETY: o KTHREAD corrente.
+        let thread = unsafe { Kthread::at(address) };
+        let end = start.wrapping_add(size);
+        let (mut high, mut low) = (thread.stack_base.get(), thread.stack_limit.get());
+        if high == 0 || low == 0 {
+            return false;
+        }
+        let mut control = thread.initial_stack.get();
+        for _ in 0..64 {
+            if start >= low && end <= high {
+                return true;
+            }
+            if control == 0 {
+                return false;
+            }
+            // SAFETY: com limites publicados, InitialStack aponta o KERNEL_STACK_CONTROL.
+            let previous = &unsafe { KernelStackControl::at(control) }.previous;
+            if previous.stack_base.get() == 0 {
+                return false;
+            }
+            high = previous.stack_base.get();
+            low = previous.stack_limit.get();
+            control = previous.initial_stack.get();
+        }
+        false
+    }
+}
+
+/// IoTransferActivityId(ActivityId, RelatedActivityId) (RVA 0x398c60): só
+/// escreve o evento IoTrace_ActivityIdTransfer (EtwWriteEx no IoTraceHandle)
+/// quando uma sessão habilitou o provedor IoTrace do kernel. O OpenNT não
+/// registra esse provedor interno do ntoskrnl, então nenhuma sessão o
+/// habilita: a rotina não faz nada, como no Windows sem sessão IoTrace.
+pub mod activity_transfer {
+    pub fn transfer(_activity: u64, _related_activity: u64) {}
+}

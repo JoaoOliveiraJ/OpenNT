@@ -344,3 +344,34 @@ fn query_directory_into(item: &Opened, output_buffer: u64, length: u32, single_e
     }
     Ok(if !single_entry && start + rows.len() < children.len() { 0x105 } else { 0 })
 }
+
+/// ObMakeTemporaryObject(Object) (ntoskrnl 0x6f6210): limpa OBJ_PERMANENT
+/// (OBJECT_HEADER.Flags 0x10, sob o lock do objeto) e roda o
+/// ObpDeleteNameCheck: sem handles abertos, o nome sai do diretório já.
+///
+/// No OpenNT a permanência é modelada nos corpos de Directory/SymbolicLink
+/// (`objects::namespace`); para eles o nome sai quando não há handles (senão
+/// no último fechamento, pelo `namespace_objects::close`). Os corpos
+/// publicados por ObInsertObject com nome (`ob::object_create`) não contam
+/// handles nem permanência: o nome nunca seria retirado, então sai aqui, que é
+/// o momento em que o NT o retira no caso comum (FltCloseCommunicationPort
+/// depois de fechar o handle do criador).
+pub fn make_temporary_by_pointer(object: u64) {
+    if let Some((node, _)) = namespace_objects::get(object) {
+        namespace_objects::set_permanent(object, false);
+        if namespace_objects::handles(object) == 0 && object_manager::is_attached(node) {
+            object_manager::remove_named(node);
+        }
+        return;
+    }
+    let named = object_manager::namespace_entries().into_iter().map(|(node, _)| node).find(|&node| {
+        object_manager::node(node).and_then(|node| node.data).is_some_and(|data| data.native_pointer == object)
+    });
+    if let Some(node) = named {
+        let type_name = object_manager::node(node).map(|node| node.type_name).unwrap_or_default();
+        // Dispositivos e drivers têm donos próprios no OpenNT e não passam por aqui.
+        if type_name != "Device" && type_name != "Driver" {
+            object_manager::remove_named(node);
+        }
+    }
+}

@@ -250,13 +250,15 @@ fn recursion(entry: &OwnerEntry) -> u32 {
     entry.table_size.get() >> OwnerEntry::OWNER_COUNT_SHIFT
 }
 
-/// Dono e recursão; os três bits baixos de flags voltam a zero.
+/// Dono e recursão; os três bits baixos de flags voltam a zero quando o
+/// dono muda.
 fn set_owner(entry: &OwnerEntry, thread: u64, depth: u32) -> Result<(), KernelError> {
     if depth > 0x1FFF_FFFF {
         return Err(KernelError::new("ERESOURCE recursion overflow"));
     }
+    let flags = if thread != 0 && entry.owner_thread.get() == thread { entry.table_size.get() & !OwnerEntry::OWNER_COUNT_MASK } else { 0 };
     entry.owner_thread.set(thread);
-    entry.table_size.set(depth << OwnerEntry::OWNER_COUNT_SHIFT);
+    entry.table_size.set(depth << OwnerEntry::OWNER_COUNT_SHIFT | flags);
     Ok(())
 }
 
@@ -482,6 +484,7 @@ pub fn enter_shared(resource: u64) -> Result<u64, KernelError> {
 pub fn release_for_thread(resource: u64, thread: u64) -> Result<(), KernelError> {
     require_irql(2)?;
     let resource = resource_at(resource);
+    let mut referenced = 0u64;
     with_lock(&resource.spin_lock, || {
         let Some(entry) = find_owner(resource, thread).filter(|entry| recursion(entry) != 0) else {
             return Err(KernelError::new("ERESOURCE released by a non-owner"));
@@ -491,6 +494,11 @@ pub fn release_for_thread(resource: u64, thread: u64) -> Result<(), KernelError>
             return set_owner(entry, thread, remaining);
         }
         let exclusive = is_exclusive(resource);
+        // OwnerReferenced: a última liberação solta a referência da thread
+        // (o ObDereferenceObjectDeferDelete de ExpRelease*ResourceForThreadLite).
+        if entry.owner_referenced() != 0 {
+            referenced = thread & !3;
+        }
         set_owner(entry, 0, 0)?;
         set_owner_count(resource, resource.active_entries.get() - 1);
         if exclusive {
@@ -501,7 +509,11 @@ pub fn release_for_thread(resource: u64, thread: u64) -> Result<(), KernelError>
         } else {
             Ok(())
         }
-    })
+    })?;
+    if referenced != 0 {
+        crate::ntos::ob::object_reference::dereference_with_tag(referenced, THREAD_REFERENCE_TAG, false)?;
+    }
+    Ok(())
 }
 
 pub fn release(resource: u64) -> Result<(), KernelError> {
@@ -549,4 +561,90 @@ pub fn shared_waiters(resource: u64) -> u32 {
 
 pub fn exclusive_waiters(resource: u64) -> u32 {
     resource_at(resource).number_of_exclusive_waiters.get()
+}
+
+// ---- Transferência de posse: ExSetResourceOwnerPointer(Ex) (ex\resource.c) ----
+//
+// Transcrito do ntoskrnl 10.0.19045:
+//   ExSetResourceOwnerPointerEx(R, P, F) 0x2dcac0 / ExSetResourceOwnerPointer(R, P)
+//   0x5b53e0 (= ...Ex com F = 0): ReservedLowFlags bit 0 (recurso "fast") ->
+//   KeBugCheckEx(0x1C6, 0xE, R, 0, 0); senão ExpSetResourceOwnerPointerEx 0x2dcae0,
+//   sob o spin lock do recurso:
+//   - exclusivo: (ExpResourceEnforcesOwnershipTransfer é FALSE: a global
+//     ExpResourceEnforceOwnerTransfer vale 0) a entrada embutida passa a P;
+//   - compartilhado: acha a entrada de P e a da thread corrente (sem a da
+//     corrente: KeBugCheckEx(0xE3, R, thread, OwnerTable, 4)). Se P já tem
+//     entrada, as contagens se somam nela e a da corrente é liberada
+//     (ActiveEntries - 1); senão a entrada da corrente passa a P.
+//   - F & FLAG_OWNER_POINTER_IS_THREAD: P & ~3 tem de ser a thread corrente
+//     (senão KeBugCheckEx(0x132, R, OwnerTable, thread, P)); a thread ganha uma
+//     referência (ObfReferenceObjectWithTag 'Dflt') e a entrada o bit
+//     OwnerReferenced, que a liberação final desfaz (ObDereferenceObjectDeferDelete).
+//   Os bits IoPriorityBoosted/IoQoSPriorityBoosted que o NT repassa
+//   (PsBoostThreadIoEx/PsBoostThreadIoQoS) nunca são ligados pelo ERESOURCE do
+//   OpenNT, que não dá boost de E/S; não há o que repassar.
+
+/// FLAG_OWNER_POINTER_IS_THREAD.
+pub const OWNER_POINTER_IS_THREAD: u32 = 1;
+/// ReservedLowFlags bit 0: recurso "fast" (ExInitializeResourceFast...).
+const FAST_RESOURCE: u8 = 1;
+/// 'Dflt': a tag da referência da thread dona.
+pub const THREAD_REFERENCE_TAG: u32 = 0x746C_6644;
+
+/// ExSetResourceOwnerPointerEx(Resource, OwnerPointer, Flags); ExSetResourceOwnerPointer
+/// é esta com Flags = 0.
+pub fn set_owner_pointer(resource: u64, owner_pointer: u64, flags: u32) -> Result<(), KernelError> {
+    let body = resource_at(resource);
+    if body.reserved_low_flags.get() & FAST_RESOURCE != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x1C6, 0xE, resource, 0, 0);
+    }
+    let thread = current_thread()?;
+    let is_thread = flags & OWNER_POINTER_IS_THREAD != 0;
+    let validate = || {
+        if owner_pointer & !3 != thread {
+            crate::ntos::ke::bugcheck::bug_check_ex(0x132, resource, body.owner_table.get(), thread, owner_pointer);
+        }
+    };
+    let reference = with_lock(&body.spin_lock, || -> Result<bool, KernelError> {
+        if is_exclusive(body) {
+            let entry = &body.owner_entry;
+            if is_thread {
+                validate();
+                entry.set_owner_referenced(1);
+            }
+            entry.owner_thread.set(owner_pointer);
+            return Ok(is_thread);
+        }
+        let target = find_owner(body, owner_pointer);
+        let Some(current) = find_owner(body, thread) else {
+            crate::ntos::ke::bugcheck::bug_check_ex(0xE3, resource, thread, body.owner_table.get(), 4);
+        };
+        let Some(target) = target else {
+            if is_thread {
+                validate();
+                current.set_owner_referenced(1);
+            }
+            current.owner_thread.set(owner_pointer);
+            return Ok(is_thread);
+        };
+        let mut referenced = false;
+        if is_thread {
+            validate();
+            if target.owner_referenced() == 0 {
+                target.set_owner_referenced(1);
+                referenced = true;
+            }
+        }
+        // OwnerCount somado na entrada de P (que mantém os seus bits baixos); a
+        // da corrente fica livre com os bits baixos que tinha, como no NT.
+        target.set_owner_count(target.owner_count().wrapping_add(current.owner_count()));
+        current.set_owner_count(0);
+        current.owner_thread.set(0);
+        set_owner_count(body, body.active_entries.get().wrapping_sub(1));
+        Ok(referenced)
+    })?;
+    if reference {
+        crate::ntos::ob::object_reference::reference_with_tag(thread, THREAD_REFERENCE_TAG, false)?;
+    }
+    Ok(())
 }

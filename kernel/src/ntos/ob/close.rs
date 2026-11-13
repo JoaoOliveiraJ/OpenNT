@@ -171,3 +171,39 @@ pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError>
     }
     Ok((record.close)())
 }
+
+/// Atributos do handle (OBJ_PROTECT_CLOSE 1, OBJ_INHERIT 2,
+/// OBJ_AUDIT_OBJECT_CLOSE 4) no mesmo dono que `close` escolheria, com a
+/// regra de ObpIsKernelHandle: o prefixo de kernel só vale vindo de
+/// KernelMode. `None` = handle inválido para o chamador.
+pub fn handle_attributes(handle: u64, from_user_mode: bool) -> Option<u32> {
+    let kernel_handle = !from_user_mode && handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000;
+    if !kernel_handle && handle > 0x7FFF_FFFF {
+        return None;
+    }
+    let value = handle & !3;
+    let current = process::get_current_process();
+    let user = PROVIDERS.lock().user;
+    if let Some(table) = user.filter(|table| !kernel_handle && current != process::get_system_process() && (table.owns)(current)) {
+        if let Some(attributes) = (table.attributes)(value) {
+            return Some(attributes);
+        }
+    }
+    match open_pointer::resolve(value, from_user_mode) {
+        Some(Ok(opened)) => return Some(opened.attributes),
+        Some(Err(_)) => return None,
+        None => {}
+    }
+    if kernel_handle {
+        let owners = PROVIDERS.lock().kernel_owners.clone();
+        if let Some(attributes) = owners.iter().find_map(|owner| (owner.attributes)(value)) {
+            return Some(attributes);
+        }
+        let identifier = (value & 0x7FFF_FFFF) as u32;
+        return object_manager::handle_record(identifier).filter(|record| record.options.kernel_handle).map(|record| record.attributes);
+    }
+    let provider = PROVIDERS.lock().zw;
+    let record = provider.and_then(|provider| provider(value as u32))?;
+    let foreign = (from_user_mode && record.kernel_handle) || (!record.kernel_handle && record.owner_process != current);
+    (!foreign).then_some(record.attributes)
+}

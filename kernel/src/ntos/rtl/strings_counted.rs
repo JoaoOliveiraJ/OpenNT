@@ -201,3 +201,20 @@ pub fn prefix_ansi(prefix: u64, text: u64, case_insensitive: bool) -> bool {
     let text_bytes = guest::read_bytes(text.buffer.get(), length);
     prefix_bytes.iter().zip(&text_bytes).all(|(&a, &b)| a == b || (case_insensitive && upper_ansi_char(a) == upper_ansi_char(b)))
 }
+
+/// RtlCopyString(Destination, Source) (ntoskrnl 19045, 0x585370): zera o
+/// Length; com Source, copia min(Source.Length, Destination.MaximumLength)
+/// bytes e grava esse Length (sem terminador).
+pub fn copy_string(destination: &AnsiString, source: u64) {
+    destination.length.set(0);
+    if source == 0 {
+        return;
+    }
+    let source = ansi(source);
+    let length = source.length.get().min(destination.maximum_length.get());
+    destination.length.set(length);
+    if length != 0 {
+        let bytes = guest::read_bytes(source.buffer.get(), length as usize);
+        guest::write_bytes(destination.buffer.get(), &bytes);
+    }
+}

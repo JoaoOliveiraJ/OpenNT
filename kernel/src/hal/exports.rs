@@ -161,3 +161,34 @@ pub mod hvi {
         data_exports: &[],
     };
 }
+
+pub mod hvi_hardware {
+    //! HviIsHypervisorVendorMicrosoft e HviGetHardwareFeatures pelo CPUID real.
+
+    use crate::hal::hypervisor;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ULONGs do HV_X64_HYPERVISOR_HARDWARE_FEATURES (EAX..EDX da leaf 0x40000006).
+    const HARDWARE_FEATURE_REGISTERS: usize = 4;
+
+    /// HviGetHardwareFeatures(*HV_X64_HYPERVISOR_HARDWARE_FEATURES) -> VOID.
+    fn get_hardware_features(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: estrutura de saída de 16 bytes do chamador de modo kernel.
+        hypervisor::get_hardware_features(unsafe { Field::<u32>::array_at(call.arg(1), HARDWARE_FEATURE_REGISTERS) });
+        Ok(0)
+    }
+
+    /// HviIsHypervisorVendorMicrosoft() -> BOOLEAN.
+    fn is_hypervisor_vendor_microsoft(_: &Call) -> Result<u64, KernelError> {
+        Ok(hypervisor::is_vendor_microsoft() as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "hvi-hardware",
+        names: &["HviGetHardwareFeatures", "HviIsHypervisorVendorMicrosoft"],
+        handlers: &[get_hardware_features, is_hypervisor_vendor_microsoft],
+        data_exports: &[],
+    };
+}

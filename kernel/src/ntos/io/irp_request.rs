@@ -152,7 +152,7 @@ pub fn forward_irp_synchronously(device: u64, packet: u64) -> Result<bool, Kerne
 }
 
 /// PsGetIoPriorityThread.
-fn io_priority(thread: u64) -> u32 {
+pub fn io_priority(thread: u64) -> u32 {
     if thread == 0 {
         return 0;
     }

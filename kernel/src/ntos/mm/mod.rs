@@ -44,3 +44,5 @@ pub mod verifier;
 pub mod secure_memory;
 pub mod system_info;
 pub mod protection;
+pub mod dangling_extent;
+pub mod modified_pages;

@@ -39,3 +39,29 @@ pub fn capture_back_trace(frame: u64, skip: usize, capture: usize, back_trace: u
     }
     captured as u64
 }
+
+/// Flags aceitos pelo RtlWalkFrameChain: modo (bits 0..1) e quadros a pular
+/// (bits 8..15).
+const WALK_INVALID_FLAGS: u32 = 0xFFFF_00FC;
+const WALK_USER_MODE_STACK: u32 = 1;
+
+/// RtlWalkFrameChain(Callers, Count, Flags) (ntoskrnl 19045, 0x21ce70):
+/// flags inválidos, mais de 0xFE quadros a pular ou Count = -1 devolvem 0. A
+/// pilha de kernel é percorrida a partir do quadro de entrada do export com a
+/// mesma varredura do RtlCaptureStackBackTrace (endereços de retorno em imagens
+/// carregadas), pulando `(Flags >> 8) & 0xFF` quadros.
+///
+/// Pilha de usuário (Flags bit 0): o NT desenrola a partir do trap frame de
+/// modo usuário da thread; esse caminho não tem o trap frame do usuário aqui e
+/// devolve 0 quadros, o mesmo resultado do NT para uma thread sem contexto de
+/// usuário.
+pub fn walk_frame_chain(frame: u64, callers: u64, count: u32, flags: u32) -> u32 {
+    let skip = flags >> 8;
+    if flags & WALK_INVALID_FLAGS != 0 || skip > 0xFE || count == u32::MAX {
+        return 0;
+    }
+    if flags & WALK_USER_MODE_STACK != 0 {
+        return 0;
+    }
+    capture_back_trace(frame, skip as usize, count as usize, callers, 0) as u32
+}

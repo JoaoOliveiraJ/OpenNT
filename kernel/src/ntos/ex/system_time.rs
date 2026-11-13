@@ -15,3 +15,16 @@ pub fn system_time_to_local_time(system_time: u64, local_time: u64) {
     let local = universal.quad_part.get() - TIMEZONE_OFFSET_MINUTES * 60 * 10_000_000;
     local_time.quad_part.set(local);
 }
+
+/// Viés do fuso (UTC - local) em unidades de 100 ns: o ExpTimeZoneBias que o
+/// NT guarda nos globais do silo e publica em SYSTEM_TIMEOFDAY_INFORMATION.
+/// O OpenNT não configura fuso: zero, o mesmo valor que
+/// `system_time_to_local_time` já aplica.
+pub fn time_zone_bias() -> i64 {
+    0
+}
+
+/// ExLocalTimeToSystemTime (RVA 0x30cc80): *SystemTime = *LocalTime + viés.
+pub fn local_time_to_system_time(local_time: &LargeInteger, system_time: &LargeInteger) {
+    system_time.quad_part.set(local_time.quad_part.get().wrapping_add(time_zone_bias()));
+}

@@ -75,3 +75,54 @@ pub fn allocate_pool(size: u64) -> u64 {
 pub fn free_pool(pointer: u64) {
     guest::free_bytes(pointer);
 }
+
+// ---- Fornecedor e features de hardware (hvi-hardware) ------------------------
+//
+// HviIsHypervisorVendorMicrosoft (0x3aa5f0) e HviGetHardwareFeatures
+// (0x5beeb0) do ntoskrnl 10.0.19045, sobre o HviIsAnyHypervisorPresent
+// (0x3a5310) e o HviGetHypervisorVendorAndMaxFunction (0x5bef30) exatos:
+// "algum hipervisor" é CPUID.1:ECX bit 31 com interface (leaf 0x40000001 EAX)
+// diferente de "Xbnv". Tudo vem do CPUID da máquina em que o OpenNT roda
+// (com QEMU/WHPX, o que o anfitrião expõe ao convidado).
+//
+// Nota para o integrador: `is_any_hypervisor_present` acima não exclui a
+// interface "Xbnv", e o HviIsHypervisorMicrosoftCompatible real (0x3a9060)
+// compara a interface da leaf 0x40000001 com "Hv#1" (0x31237648), não o
+// fornecedor; `any_hypervisor_interface_present` é a versão exata.
+
+const HYPERVISOR_PRESENT: u32 = 1 << 31;
+const LEAF_VENDOR_AND_MAX_FUNCTION: u32 = 0x4000_0000;
+const LEAF_INTERFACE: u32 = 0x4000_0001;
+const LEAF_HARDWARE_FEATURES: u32 = 0x4000_0006;
+/// Interface "Xbnv" (EAX da leaf 0x40000001), que o NT não conta como hipervisor.
+const INTERFACE_XBNV: u32 = 0x766E_6258;
+/// "Microsoft Hv" em EBX, ECX, EDX da leaf 0x40000000.
+const VENDOR_MICROSOFT: [u32; 3] = [0x7263_694D, 0x666F_736F, 0x7648_2074];
+
+/// HviIsAnyHypervisorPresent exato (bit 31 e interface diferente de "Xbnv").
+pub fn any_hypervisor_interface_present() -> bool {
+    cpu::cpuid(1)[2] & HYPERVISOR_PRESENT != 0 && cpu::cpuid(LEAF_INTERFACE)[0] != INTERFACE_XBNV
+}
+
+/// HviGetHypervisorVendorAndMaxFunction: a leaf 0x40000000 ou zeros.
+fn vendor_and_max_function() -> [u32; 4] {
+    if any_hypervisor_interface_present() { cpu::cpuid(LEAF_VENDOR_AND_MAX_FUNCTION) } else { [0; 4] }
+}
+
+/// HviIsHypervisorVendorMicrosoft.
+pub fn is_vendor_microsoft() -> bool {
+    any_hypervisor_interface_present() && cpu::cpuid(LEAF_VENDOR_AND_MAX_FUNCTION)[1..] == VENDOR_MICROSOFT
+}
+
+/// EAX..EDX da leaf 0x40000006, ou zeros quando a função máxima não chega lá.
+pub fn hardware_features() -> [u32; 4] {
+    if vendor_and_max_function()[0] >= LEAF_HARDWARE_FEATURES { cpu::cpuid(LEAF_HARDWARE_FEATURES) } else { [0; 4] }
+}
+
+/// HviGetHardwareFeatures(*HV_X64_HYPERVISOR_HARDWARE_FEATURES): os quatro
+/// ULONGs da estrutura (EAX..EDX da leaf 0x40000006).
+pub fn get_hardware_features(output: &[crate::ntos::inc::field::Field<u32>]) {
+    for (cell, value) in output.iter().zip(hardware_features()) {
+        cell.set(value);
+    }
+}

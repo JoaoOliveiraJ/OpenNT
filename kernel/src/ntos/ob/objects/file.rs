@@ -234,6 +234,8 @@ pub fn dereference(pointer: u64) -> Result<Option<u32>, KernelError> {
             guest::free_bytes(record.name_buffer);
         }
     }
+    // IopDeleteFile: FILE_OBJECT.FileObjectExtension vai junto.
+    crate::ntos::io::extensions::free_file_object_extension(pointer);
     guest::free_bytes(pointer);
     Ok(Some(0))
 }
@@ -326,4 +328,10 @@ pub fn reference_count(pointer: u64) -> Option<u32> {
 /// (handles, aberto, cleanup feito, fechando).
 pub fn state(pointer: u64) -> Option<(u32, bool, bool, bool)> {
     FILES.lock().get(&pointer).map(|record| (record.handles, record.opened, record.cleaned, record.closing))
+}
+
+/// IoReplaceFileObjectName: FileName.Buffer passou a ser outro bloco da arena
+/// (o antigo já foi liberado pelo chamador); a destruição libera o novo.
+pub fn set_name_buffer(pointer: u64, buffer: u64) -> Result<(), KernelError> {
+    FILES.lock().get_mut(&pointer).map(|record| record.name_buffer = buffer).ok_or_else(|| KernelError::new("unknown file object"))
 }

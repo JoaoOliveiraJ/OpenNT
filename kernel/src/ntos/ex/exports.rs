@@ -944,3 +944,151 @@ pub mod ex_access_violation {
 
     pub static GROUP: Group = Group { name: "ex-access-violation", names: &["ExRaiseAccessViolation"], handlers: &[raise_access_violation], data_exports: &[] };
 }
+
+pub mod ex_auto_expand_push_lock {
+    //! EX_PUSH_LOCK_AUTO_EXPAND: adaptadores finos sobre `ex::auto_expand_push_lock`.
+    //! O PEX_PUSH_LOCK_AUTO_EXPAND do driver vira `&ExPushLockAutoExpand` aqui.
+
+    use crate::ntos::ex::auto_expand_push_lock;
+    use crate::ntos::inc::types::extra_fs_ntfs::ExPushLockAutoExpand;
+    use crate::ntos::inc::NtStruct;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::initialize(unsafe { ExPushLockAutoExpand::at(call.arg(1)) }, call.arg(2) as u32);
+        Ok(0)
+    }
+
+    fn cleanup(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::cleanup(unsafe { ExPushLockAutoExpand::at(call.arg(1)) })?;
+        Ok(0)
+    }
+
+    fn acquire_exclusive(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::acquire_exclusive(unsafe { ExPushLockAutoExpand::at(call.arg(1)) }, call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    fn release_exclusive(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::release_exclusive(unsafe { ExPushLockAutoExpand::at(call.arg(1)) }, call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    /// ExAcquireAutoExpandPushLockShared(PushLock, Flags) -> PVOID token.
+    fn acquire_shared(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::acquire_shared(unsafe { ExPushLockAutoExpand::at(call.arg(1)) }, call.arg(2) as u32)
+    }
+
+    /// ExReleaseAutoExpandPushLockShared(Token, Flags).
+    fn release_shared(call: &Call) -> Result<u64, KernelError> {
+        auto_expand_push_lock::release_shared(call.arg(1), call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-auto-expand-push-lock",
+        names: &[
+            "ExInitializeAutoExpandPushLock",
+            "ExCleanupAutoExpandPushLock",
+            "ExAcquireAutoExpandPushLockExclusive",
+            "ExReleaseAutoExpandPushLockExclusive",
+            "ExAcquireAutoExpandPushLockShared",
+            "ExReleaseAutoExpandPushLockShared",
+        ],
+        handlers: &[initialize, cleanup, acquire_exclusive, release_exclusive, acquire_shared, release_shared],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_resource_owner {
+    //! ExSetResourceOwnerPointerEx: adaptador fino sobre `ex::resource::set_owner_pointer`.
+
+    use crate::ntos::ex::resource;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExSetResourceOwnerPointerEx(Resource, OwnerPointer, Flags).
+    fn set_owner_pointer_ex(call: &Call) -> Result<u64, KernelError> {
+        resource::set_owner_pointer(call.arg(1), call.arg(2), call.arg(3) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-resource-owner",
+        names: &["ExSetResourceOwnerPointerEx"],
+        handlers: &[set_owner_pointer_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_resource_owner_and_local_time {
+    //! ExSetResourceOwnerPointer (= ExSetResourceOwnerPointerEx com Flags 0) e
+    //! ExLocalTimeToSystemTime: a lógica mora em `ex/resource.rs` e `ex/system_time.rs`.
+
+    use crate::ntos::ex::{resource, system_time};
+    use crate::ntos::inc::types::{LargeInteger, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn set_owner_pointer(call: &Call) -> Result<u64, KernelError> {
+        resource::set_owner_pointer(call.arg(1), call.arg(2), 0).map(|_| 0)
+    }
+    fn local_time_to_system_time(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os PLARGE_INTEGER do chamador (modo kernel).
+        system_time::local_time_to_system_time(unsafe { LargeInteger::at(call.arg(1)) }, unsafe { LargeInteger::at(call.arg(2)) });
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-resource-owner-and-local-time",
+        names: &["ExSetResourceOwnerPointer", "ExLocalTimeToSystemTime"],
+        handlers: &[set_owner_pointer, local_time_to_system_time],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_cache_aware_push_locks {
+    //! EX_PUSH_LOCK_CACHE_AWARE: a lógica mora em `ex/push_lock.rs`.
+
+    use crate::ntos::ex::push_lock;
+    use crate::ntos::inc::types::extra_fs_fat::ExPushLockCacheAware;
+    use crate::ntos::inc::types::NtStruct;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// PEX_PUSH_LOCK_CACHE_AWARE devolvido por ExAllocateCacheAwarePushLock.
+    fn table(call: &Call) -> &'static ExPushLockCacheAware {
+        // SAFETY: o driver passa a tabela que o Allocate lhe entregou.
+        unsafe { ExPushLockCacheAware::at(call.arg(1)) }
+    }
+
+    fn allocate(call: &Call) -> Result<u64, KernelError> {
+        push_lock::allocate_cache_aware(call.arg(1) as u32)
+    }
+    fn acquire_exclusive(call: &Call) -> Result<u64, KernelError> {
+        push_lock::acquire_cache_aware_exclusive(table(call)).map(|_| 0)
+    }
+    fn release_exclusive(call: &Call) -> Result<u64, KernelError> {
+        push_lock::release_cache_aware_exclusive(table(call)).map(|_| 0)
+    }
+    fn acquire_shared(call: &Call) -> Result<u64, KernelError> {
+        push_lock::acquire_cache_aware_shared(table(call), call.arg(2) as u32)
+    }
+    fn release_shared(call: &Call) -> Result<u64, KernelError> {
+        push_lock::release_cache_aware_shared(call.arg(1), call.arg(2) as u32).map(|_| 0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-cache-aware-push-locks",
+        names: &[
+            "ExAllocateCacheAwarePushLock",
+            "ExAcquireCacheAwarePushLockExclusive",
+            "ExReleaseCacheAwarePushLockExclusive",
+            "ExAcquireCacheAwarePushLockSharedEx",
+            "ExReleaseCacheAwarePushLockSharedEx",
+        ],
+        handlers: &[allocate, acquire_exclusive, release_exclusive, acquire_shared, release_shared],
+        data_exports: &[],
+    };
+}

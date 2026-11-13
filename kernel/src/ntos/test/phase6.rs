@@ -364,7 +364,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1240 && abi_names::GROUP_LAYOUT.len() == 214 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1240 exports em 214 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1540 && abi_names::GROUP_LAYOUT.len() == 266 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1540 exports em 266 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1368,7 +1368,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1240 && exports::export_names().len() == 1240, "ntoskrnl: 214 grupos com os 1240 exports implementados");
+    assert(exports::implemented() == 1540 && exports::export_names().len() == 1540, "ntoskrnl: 266 grupos com os 1540 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -6692,6 +6692,3377 @@ fn ob_security_cache_exports(assert: Assert) {
 }
 
 
+fn tm_transaction_manager_exports(assert: Assert) {
+    use crate::ntos::tm::extension;
+
+    const NOT_SUPPORTED: u32 = 0xC000_00BB;
+    let not_supported = |name: &str, args: &[u64]| call_export(name, args).map(|status| status as u32) == Some(NOT_SUPPORTED);
+    let out = guest::alloc_bytes(16);
+    let (first, second) = (at::<nt::Field<u64>>(out), at::<nt::Field<u64>>(out + 8));
+    first.set(0x1234);
+    second.set(0x5678);
+    let untouched = || first.get() == 0x1234 && second.get() == 0x5678;
+
+    // TmCurrentTransaction: o sinal "sem KTM" que o ntfs.sys/FsRtlIsMobileOS testam; saída intocada.
+    assert(not_supported("TmCurrentTransaction", &[out]) && untouched(), "tm: TmCurrentTransaction sem tm.sys -> STATUS_NOT_SUPPORTED, saida intocada");
+    assert(
+        not_supported("TmReferenceEnlistmentKey", &[0x1000, out])
+            && not_supported("TmDereferenceEnlistmentKey", &[0x1000, out])
+            && not_supported("TmRecoverResourceManager", &[0x2000])
+            && not_supported("TmRequestOutcomeEnlistment", &[0x1000, out])
+            && untouched(),
+        "tm: Tm* de enlistment/RM sem tm.sys -> STATUS_NOT_SUPPORTED",
+    );
+    // Stubs BOOLEAN (xor al,al) e VOID (ret: o GUID não é escrito).
+    assert(
+        call_export("TmIsTransactionActive", &[0x3000]) == Some(0)
+            && call_export("TmIsKTMCommitCoordinator", &[0x3000]) == Some(0)
+            && call_export("TmGetTransactionId", &[0x3000, out]).is_some()
+            && untouched(),
+        "tm: TmIsTransactionActive/IsKTMCommitCoordinator FALSE, TmGetTransactionId nao escreve",
+    );
+    // Serviços Zw* do KTM: o thunk Nt* cai no mesmo stub; handle de saída intocado.
+    assert(
+        not_supported("ZwOpenEnlistment", &[out, 0x1F_0000, 4, 0, 0])
+            && not_supported("ZwOpenResourceManager", &[out, 0x1F_0000, 4, 0, 0])
+            && not_supported("ZwQueryInformationTransactionManager", &[4, 0, out, 8, out + 8])
+            && not_supported("ZwRecoverEnlistment", &[4, 0])
+            && not_supported("ZwRecoverTransactionManager", &[4])
+            && untouched(),
+        "tm: Zw* do KTM -> STATUS_NOT_SUPPORTED sem efeito",
+    );
+    // Tipos de objeto: células publicadas e NULL (TmInitSystem nunca rodou).
+    assert(
+        extension::OBJECT_TYPE_CELLS.iter().all(|name| extension::object_type(name) == 0)
+            && at::<nt::Field<u64>>(extension::transaction_object_type_cell()).get() == 0
+            && extension::transaction_object_type_cell() != extension::enlistment_object_type_cell(),
+        "tm: Tm*ObjectType publicados e NULL sem KTM",
+    );
+    guest::free_bytes(out);
+}
+
+
+fn tm_extension_exports(assert: Assert) {
+    let handle = guest::alloc_bytes(8);
+    let cell = at::<nt::Field<u64>>(handle);
+    cell.set(0x1234);
+    let not_supported = |name: &str, args: &[u64]| call_export(name, args).map(|status| status as u32) == Some(0xC000_00BB);
+    assert(
+        not_supported("TmCommitComplete", &[0, 0])
+            && not_supported("TmCreateEnlistment", &[handle, 0, 0, 0, 0, 0, 0, 0, 0])
+            && not_supported("TmEnableCallbacks", &[0, 0, 0])
+            && not_supported("TmPrePrepareComplete", &[0, 0])
+            && not_supported("TmPrepareComplete", &[0, 0])
+            && not_supported("TmReadOnlyEnlistment", &[0, 0])
+            && not_supported("TmRollbackComplete", &[0, 0])
+            && not_supported("TmRollbackEnlistment", &[0, 0]),
+        "tm-extension: Tm* sem tm.sys -> STATUS_NOT_SUPPORTED",
+    );
+    assert(
+        not_supported("ZwCreateTransactionManager", &[handle, 0, 0, 0, 0, 0])
+            && not_supported("ZwCreateResourceManager", &[handle, 0, 0, 0, 0, 0, 0])
+            && cell.get() == 0x1234,
+        "tm-extension: ZwCreate{Transaction,Resource}Manager nao suportados e sem efeito",
+    );
+    guest::free_bytes(handle);
+}
+
+
+fn vf_verifier_exports(assert: Assert) {
+    assert(call_export("VfCheckNxPoolType", &[0x200, 0, 0x7465_7354]).is_some(), "vf-verifier: VfCheckNxPoolType sem verificador e no-op");
+    assert(
+        call_export("VfQueryDispatchTable", &[0, 0]) == Some(0) && call_export("VfQueryDispatchTable", &[3, 1]) == Some(0),
+        "vf-verifier: VfQueryDispatchTable sem verificador devolve NULL",
+    );
+}
+
+
+fn fsrtl_file_locks_exports(assert: Assert) {
+    use crate::ntos::fsrtl::file_lock::LockInfo;
+
+    let io = guest::alloc_bytes(0x100);
+    let (offset, length, iosb) = (io, io + 8, io + 0x10);
+    let set_range = |start: u64, bytes: u64| {
+        at::<nt::LargeInteger>(offset).quad_part.set(start as i64);
+        at::<nt::LargeInteger>(length).quad_part.set(bytes as i64);
+    };
+    let status = || at::<nt::IoStatusBlock>(iosb).status.get() as u32;
+    // FILE_OBJECTs reais: FastUnlockAll zera FileObject->LastLock.
+    let (fo_a, fo_b) = (guest::alloc_bytes(nt::FileObject::SIZE), guest::alloc_bytes(nt::FileObject::SIZE));
+    let (pid_a, pid_b) = (0x100u64, 0x200u64);
+
+    // FILE_LOCK sem rotinas; lock vazio concede leitura e escrita.
+    let file_lock = call_export("FsRtlAllocateFileLock", &[0, 0]).unwrap_or(0);
+    assert(file_lock != 0 && at::<nt::extra_fsrtl::FileLock>(file_lock).lock_information.get() == 0, "fsrtl-file-locks: AllocateFileLock sem LockInformation");
+    let lock = at::<nt::extra_fsrtl::FileLock>(file_lock);
+    set_range(100, 50);
+    assert(
+        call_export("FsRtlFastCheckLockForRead", &[file_lock, offset, length, 0, fo_a, pid_a]) == Some(1)
+            && call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 0, fo_a, pid_a]) == Some(1),
+        "fsrtl-file-locks: sem travas tudo e permitido",
+    );
+
+    // A pega exclusiva [100,150): concede, liga FastIoIsQuestionable e LockInformation.
+    let granted = call_export("FsRtlPrivateLock", &[file_lock, fo_a, offset, length, pid_a, 7, 1, 1, iosb, 0, 0, 0]);
+    assert(
+        granted == Some(1) && status() == 0 && lock.fast_io_is_questionable.get() == 1 && lock.lock_information.get() != 0,
+        "fsrtl-file-locks: PrivateLock exclusiva concedida",
+    );
+    let info = at::<LockInfo>(lock.lock_information.get());
+    assert(info.lowest_lock_offset.get() == 100, "fsrtl-file-locks: LowestLockOffset atualizado");
+
+    // B lê/escreve [120,130): bloqueado; A (mesma chave 7) lê/escreve: permitido.
+    set_range(120, 10);
+    assert(
+        call_export("FsRtlFastCheckLockForRead", &[file_lock, offset, length, 7, fo_b, pid_b]) == Some(0)
+            && call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 7, fo_b, pid_b]) == Some(0)
+            && call_export("FsRtlFastCheckLockForRead", &[file_lock, offset, length, 7, fo_a, pid_a]) == Some(1)
+            && call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 7, fo_a, pid_a]) == Some(1),
+        "fsrtl-file-locks: conflito exclusivo por dono",
+    );
+
+    // B pede compartilhada sobreposta com FailImmediately -> LOCK_NOT_GRANTED;
+    // sem FailImmediately e sem IRP (fast I/O) -> FALSE.
+    let refused = call_export("FsRtlPrivateLock", &[file_lock, fo_b, offset, length, pid_b, 0, 1, 0, iosb, 0, 0, 0]);
+    assert(refused == Some(1) && status() == 0xC000_0055, "fsrtl-file-locks: compartilhada conflitante recusada");
+    assert(call_export("FsRtlPrivateLock", &[file_lock, fo_b, offset, length, pid_b, 0, 0, 0, iosb, 0, 0, 0]) == Some(0), "fsrtl-file-locks: fast I/O nao espera");
+
+    // B pega compartilhada fora [200,210): concedida; escrita de A nela é bloqueada.
+    set_range(200, 10);
+    let shared = call_export("FsRtlPrivateLock", &[file_lock, fo_b, offset, length, pid_b, 0, 1, 0, iosb, 0, 0, 0]);
+    assert(shared == Some(1) && status() == 0, "fsrtl-file-locks: compartilhada concedida");
+    assert(
+        call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 7, fo_a, pid_a]) == Some(0)
+            && call_export("FsRtlFastCheckLockForRead", &[file_lock, offset, length, 7, fo_a, pid_a]) == Some(1),
+        "fsrtl-file-locks: compartilhada bloqueia escrita, nao leitura",
+    );
+
+    // Intervalo que dá a volta com Length != 0 -> STATUS_INVALID_LOCK_RANGE.
+    set_range(u64::MAX - 1, 4);
+    let wrapped = call_export("FsRtlPrivateLock", &[file_lock, fo_a, offset, length, pid_a, 0, 1, 1, iosb, 0, 0, 0]);
+    assert(wrapped == Some(1) && status() == 0xC000_01A1, "fsrtl-file-locks: faixa invalida");
+
+    // UnlockSingle: faixa errada -> RANGE_NOT_LOCKED; exata -> SUCCESS e B passa a escrever.
+    set_range(100, 49);
+    let wrong = call_export("FsRtlFastUnlockSingle", &[file_lock, fo_a, offset, length, pid_a, 7, 0, 0]).map(|s| s as u32);
+    set_range(100, 50);
+    let right = call_export("FsRtlFastUnlockSingle", &[file_lock, fo_a, offset, length, pid_a, 7, 0, 0]);
+    set_range(120, 10);
+    let writable = call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 0, fo_b, pid_b]);
+    assert(wrong == Some(0xC000_007E) && right == Some(0) && writable == Some(1), "fsrtl-file-locks: FastUnlockSingle exato");
+
+    // UnlockAllByKey com chave errada não remove; UnlockAll remove a compartilhada de B.
+    set_range(200, 10);
+    call_export("FsRtlFastUnlockAllByKey", &[file_lock, fo_b, pid_b, 9, 0]);
+    let still = call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 0, fo_a, pid_a]);
+    let all = call_export("FsRtlFastUnlockAll", &[file_lock, fo_b, pid_b, 0]);
+    let free = call_export("FsRtlFastCheckLockForWrite", &[file_lock, offset, length, 0, fo_a, pid_a]);
+    assert(still == Some(0) && all == Some(0) && free == Some(1) && info.lowest_lock_offset.get() == u64::MAX, "fsrtl-file-locks: FastUnlockAll/AllByKey");
+
+    // Sem travas restantes, UnlockAll -> RANGE_NOT_LOCKED; InitializeFileLock grava as rotinas.
+    assert(call_export("FsRtlFastUnlockAll", &[file_lock, fo_b, pid_b, 0]).map(|s| s as u32) == Some(0xC000_007E), "fsrtl-file-locks: UnlockAll sem travas");
+    let embedded = guest::alloc_bytes(nt::extra_fsrtl::FileLock::SIZE);
+    call_export("FsRtlInitializeFileLock", &[embedded, 0x1111, 0x2222]);
+    let embedded_lock = at::<nt::extra_fsrtl::FileLock>(embedded);
+    assert(
+        embedded_lock.complete_lock_irp_routine.get() == 0x1111
+            && embedded_lock.unlock_routine.get() == 0x2222
+            && embedded_lock.lock_information.get() == 0
+            && embedded_lock.fast_io_is_questionable.get() == 0,
+        "fsrtl-file-locks: InitializeFileLock grava rotinas e zera o estado",
+    );
+    call_export("FsRtlUninitializeFileLock", &[embedded]);
+    call_export("FsRtlFreeFileLock", &[file_lock]);
+    for block in [embedded, io, fo_a, fo_b] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_oplocks_exports(assert: Assert) {
+    // OPLOCK opaco zerado pelo FS; Initialize é `ret`.
+    let oplock = guest::alloc_bytes(8);
+    let handle = at::<nt::Field<u64>>(oplock);
+    handle.set(0);
+    call_export("FsRtlInitializeOplock", &[oplock]);
+    assert(
+        handle.get() == 0
+            && call_export("FsRtlCurrentOplock", &[oplock]) == Some(0)
+            && call_export("FsRtlCurrentBatchOplock", &[oplock]) == Some(0)
+            && call_export("FsRtlCurrentOplockH", &[oplock]) == Some(0)
+            && call_export("FsRtlOplockIsFastIoPossible", &[oplock]) == Some(1),
+        "fsrtl-oplocks: handle NULL sem oplock e fast I/O possivel",
+    );
+
+    // IRP sintético com um slot corrente e um SystemBuffer REQUEST_OPLOCK_INPUT_BUFFER.
+    let irp_address = guest::alloc_bytes(nt::Irp::SIZE);
+    let stack_address = guest::alloc_bytes(nt::IoStackLocation::SIZE);
+    let system_buffer = guest::alloc_bytes(0x40);
+    let irp = at::<nt::Irp>(irp_address);
+    let stack = at::<nt::IoStackLocation>(stack_address);
+    let request = at::<nt::extra_fsrtl::RequestOplockInputBuffer>(system_buffer);
+    irp.tail.overlay.current_stack_location.set(stack_address);
+    irp.associated_irp.system_buffer.set(system_buffer);
+    stack.major_function.set(0x0D); // IRP_MJ_FILE_SYSTEM_CONTROL
+
+    // IsSharedRequest: REQUEST_OPLOCK nível R|H -> TRUE; R|W -> FALSE; LEVEL_2 -> TRUE; LEVEL_1 -> FALSE.
+    let code = &stack.parameters.file_system_control.fs_control_code;
+    code.set(0x0009_0240);
+    request.requested_oplock_level.set(3);
+    let shared_rh = call_export("FsRtlOplockIsSharedRequest", &[irp_address]);
+    request.requested_oplock_level.set(5);
+    let shared_rw = call_export("FsRtlOplockIsSharedRequest", &[irp_address]);
+    code.set(0x0009_0004);
+    let level2 = call_export("FsRtlOplockIsSharedRequest", &[irp_address]);
+    code.set(0x0009_0000);
+    let level1 = call_export("FsRtlOplockIsSharedRequest", &[irp_address]);
+    assert(shared_rh == Some(1) && shared_rw == Some(0) && level2 == Some(1) && level1 == Some(0), "fsrtl-oplocks: OplockIsSharedRequest");
+
+    // CheckOplock/BreakToNone/BreakH sem oplock -> STATUS_SUCCESS; Ex com flag 0x10 -> INVALID_PARAMETER.
+    assert(
+        call_export("FsRtlCheckOplock", &[oplock, irp_address, 0, 0, 0]) == Some(0)
+            && call_export("FsRtlCheckOplockEx", &[oplock, irp_address, 0, 0, 0, 0]) == Some(0)
+            && call_export("FsRtlOplockBreakH", &[oplock, irp_address, 0, 0, 0, 0]) == Some(0)
+            && call_export("FsRtlOplockBreakToNone", &[oplock, stack_address, irp_address, 0, 0, 0]) == Some(0)
+            && call_export("FsRtlOplockBreakToNoneEx", &[oplock, irp_address, 0x10, 0, 0, 0]).map(|s| s as u32) == Some(0xC000_000D),
+        "fsrtl-oplocks: checagem e quebra sem oplock",
+    );
+
+    // KeysEqual: mesmo FILE_OBJECT -> TRUE; objetos distintos sem extensão -> FALSE.
+    let first = guest::alloc_bytes(nt::FileObject::SIZE);
+    let second = guest::alloc_bytes(nt::FileObject::SIZE);
+    assert(
+        call_export("FsRtlOplockKeysEqual", &[first, first]) == Some(1) && call_export("FsRtlOplockKeysEqual", &[first, second]) == Some(0),
+        "fsrtl-oplocks: OplockKeysEqual",
+    );
+
+    // Create com FILE_OPEN_REQUIRING_OPLOCK -> NOT_GRANTED sem concluir; create comum -> SUCCESS.
+    stack.major_function.set(0x00);
+    stack.parameters.create.options.set(0x0001_0000);
+    let requiring = call_export("FsRtlOplockFsctrlEx", &[oplock, irp_address, 1, 0]).map(|s| s as u32);
+    stack.parameters.create.options.set(0);
+    let plain = call_export("FsRtlOplockFsctrlEx", &[oplock, irp_address, 1, 0]);
+    assert(requiring == Some(0xC000_00E2) && plain == Some(0), "fsrtl-oplocks: OplockFsctrlEx no create");
+
+    handle.set(0);
+    call_export("FsRtlUninitializeOplock", &[oplock]);
+    assert(handle.get() == 0, "fsrtl-oplocks: UninitializeOplock com handle NULL");
+
+    for block in [oplock, irp_address, stack_address, system_buffer, first, second] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_ecp_exports(assert: Assert) {
+    use crate::ntos::fsrtl::ecp::header_of;
+
+    let cells = guest::alloc_bytes(0x80);
+    let (list_out, ctx_out, size_out, type_out) = (cells, cells + 8, cells + 0x10, cells + 0x18);
+    let list_cell = at::<nt::Field<u64>>(list_out);
+    let ctx = at::<nt::Field<u64>>(ctx_out);
+    let size = at::<nt::Field<u32>>(size_out);
+    // Dois GUIDs distintos.
+    let guid_a = guest::alloc_bytes(nt::Guid::SIZE);
+    let guid_b = guest::alloc_bytes(nt::Guid::SIZE);
+    guest::write_bytes(guid_a, &[0x11; 16]);
+    guest::write_bytes(guid_b, &[0x22; 16]);
+
+    assert(call_export("FsRtlAllocateExtraCreateParameterList", &[0, list_out]) == Some(0) && list_cell.get() != 0, "fsrtl-ecp: AllocateExtraCreateParameterList");
+    let list_address = list_cell.get();
+    let list = at::<nt::extra_fsrtl::EcpList>(list_address);
+    assert(list.signature.get() == 0x4C70_6345 && list.ecp_list.flink.get() == list.ecp_list.address(), "fsrtl-ecp: lista 'EcpL' vazia");
+
+    // Entrada A (24 bytes de contexto, paginada): cabeçalho 'EcpH', tamanho total 0x60.
+    assert(call_export("FsRtlAllocateExtraCreateParameter", &[guid_a, 24, 0, 0, 0x7465_7354, ctx_out]) == Some(0), "fsrtl-ecp: AllocateExtraCreateParameter");
+    let ecp_a = ctx.get();
+    assert(
+        header_of(ecp_a).signature.get() == 0x4870_6345 && header_of(ecp_a).total_size.get() == 0x60 && header_of(ecp_a).flags.get() == 2,
+        "fsrtl-ecp: cabecalho EcpH com tamanho e flags",
+    );
+
+    // Insert A; repetir A -> INVALID_PARAMETER (e A ganha a flag 4).
+    let inserted = call_export("FsRtlInsertExtraCreateParameter", &[list_address, ecp_a]);
+    call_export("FsRtlAllocateExtraCreateParameter", &[guid_a, 8, 2, 0, 0x7465_7354, ctx_out]);
+    let duplicate = ctx.get();
+    let clash = call_export("FsRtlInsertExtraCreateParameter", &[list_address, duplicate]).map(|s| s as u32);
+    assert(inserted == Some(0) && clash == Some(0xC000_000D) && header_of(ecp_a).flags.get() & 4 != 0, "fsrtl-ecp: GUID repetido recusado");
+    assert(header_of(duplicate).flags.get() == 0x42, "fsrtl-ecp: entrada nao paginada leva flag 0x40");
+    call_export("FsRtlFreeExtraCreateParameter", &[duplicate]);
+
+    // Find A -> contexto e tamanho 24; Find B -> NOT_FOUND com saídas zeradas.
+    let found = call_export("FsRtlFindExtraCreateParameter", &[list_address, guid_a, ctx_out, size_out]);
+    assert(found == Some(0) && ctx.get() == ecp_a && size.get() == 24, "fsrtl-ecp: FindExtraCreateParameter");
+    let missing = call_export("FsRtlFindExtraCreateParameter", &[list_address, guid_b, ctx_out, size_out]).map(|s| s as u32);
+    assert(missing == Some(0xC000_0225) && ctx.get() == 0, "fsrtl-ecp: GUID ausente");
+
+    // Ack / IsAcknowledged / PrepareToReuse / IsFromUserMode.
+    call_export("FsRtlAcknowledgeEcp", &[ecp_a]);
+    let acked = call_export("FsRtlIsEcpAcknowledged", &[ecp_a]);
+    call_export("FsRtlPrepareToReuseEcp", &[ecp_a]);
+    let reused = call_export("FsRtlIsEcpAcknowledged", &[ecp_a]);
+    assert(acked == Some(1) && reused == Some(0) && call_export("FsRtlIsEcpFromUserMode", &[ecp_a]) == Some(0), "fsrtl-ecp: flags de reconhecimento");
+
+    // B por lookaside paginada de 32 bytes; GetNext percorre A depois B.
+    let lookaside_list = guest::alloc_bytes(nt::PagedLookasideList::SIZE);
+    call_export("FsRtlInitExtraCreateParameterLookasideList", &[lookaside_list, 0, 32, 0x7465_7354]);
+    assert(at::<nt::GeneralLookaside>(lookaside_list).size.get() == 32 + 0x48, "fsrtl-ecp: lookaside com blocos de Size+0x48");
+    assert(call_export("FsRtlAllocateExtraCreateParameterFromLookasideList", &[guid_b, 16, 0, 0, lookaside_list, ctx_out]) == Some(0), "fsrtl-ecp: alocacao pela lookaside");
+    let ecp_b = ctx.get();
+    assert(header_of(ecp_b).lookaside.get() == lookaside_list && header_of(ecp_b).total_size.get() == 16 + 0x48, "fsrtl-ecp: entrada lembra a lookaside dona");
+    call_export("FsRtlInsertExtraCreateParameter", &[list_address, ecp_b]);
+    let first = call_export("FsRtlGetNextExtraCreateParameter", &[list_address, 0, type_out, ctx_out, size_out]);
+    let first_ctx = ctx.get();
+    let second = call_export("FsRtlGetNextExtraCreateParameter", &[list_address, first_ctx, type_out, ctx_out, size_out]);
+    let second_ctx = ctx.get();
+    let second_type = at::<nt::Guid>(type_out).data1.get();
+    let end = call_export("FsRtlGetNextExtraCreateParameter", &[list_address, second_ctx, type_out, ctx_out, size_out]).map(|s| s as u32);
+    assert(
+        first == Some(0) && first_ctx == ecp_a && second == Some(0) && second_ctx == ecp_b && second_type == 0x2222_2222 && end == Some(0xC000_0225) && ctx.get() == 0,
+        "fsrtl-ecp: GetNextExtraCreateParameter em ordem",
+    );
+
+    // Remove B (sai da lista, devolve tamanho 16) e libera pela lookaside.
+    let removed = call_export("FsRtlRemoveExtraCreateParameter", &[list_address, guid_b, ctx_out, size_out]);
+    assert(removed == Some(0) && ctx.get() == ecp_b && size.get() == 16, "fsrtl-ecp: RemoveExtraCreateParameter");
+    call_export("FsRtlFreeExtraCreateParameter", &[ecp_b]);
+
+    // IRP de create: Set/Get da lista; IRP comum recusado; segunda lista recusada.
+    let irp_address = guest::alloc_bytes(nt::Irp::SIZE);
+    let irp = at::<nt::Irp>(irp_address);
+    let refused = call_export("FsRtlSetEcpListIntoIrp", &[irp_address, list_address]).map(|s| s as u32);
+    irp.flags.set(0x80); // IRP_CREATE_OPERATION
+    let set = call_export("FsRtlSetEcpListIntoIrp", &[irp_address, list_address]);
+    let again = call_export("FsRtlSetEcpListIntoIrp", &[irp_address, list_address]).map(|s| s as u32);
+    let got = call_export("FsRtlGetEcpListFromIrp", &[irp_address, list_out]);
+    assert(
+        refused == Some(0xC000_00EF) && set == Some(0) && again == Some(0xC000_00F0) && got == Some(0) && list_cell.get() == list_address && list.flags.get() & 8 != 0,
+        "fsrtl-ecp: Set/GetEcpListFromIrp",
+    );
+
+    // FreeList libera A junto; a lookaside é excluída.
+    call_export("FsRtlFreeExtraCreateParameterList", &[list_address]);
+    call_export("FsRtlDeleteExtraCreateParameterLookasideList", &[lookaside_list, 0]);
+    for block in [cells, guid_a, guid_b, lookaside_list, irp_address] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_filter_contexts_exports(assert: Assert) {
+    // Registro de contexto: Links, OwnerId, InstanceId, FreeCallback.
+    let make = |owner: u64, instance: u64| {
+        let address = guest::alloc_bytes(nt::extra_fsrtl::FsrtlPerStreamContext::SIZE);
+        let context = at::<nt::extra_fsrtl::FsrtlPerStreamContext>(address);
+        context.owner_id.set(owner);
+        context.instance_id.set(instance);
+        address
+    };
+
+    // Cabeçalho avançado v1 com SUPPORTS_FILTER_CONTEXTS e lista vazia.
+    let header_address = guest::alloc_bytes(nt::extra_fsrtl::FsrtlAdvancedFcbHeader::SIZE);
+    let header = at::<nt::extra_fsrtl::FsrtlAdvancedFcbHeader>(header_address);
+    header.flags2.set(0x02);
+    header.set_version(1);
+    header.filter_contexts.flink.set(header.filter_contexts.address());
+    header.filter_contexts.blink.set(header.filter_contexts.address());
+    header.push_lock.set(0);
+    let (s1, s2) = (make(0xA, 1), make(0xB, 2));
+    assert(
+        call_export("FsRtlInsertPerStreamContext", &[header_address, s1]) == Some(0) && call_export("FsRtlInsertPerStreamContext", &[header_address, s2]) == Some(0),
+        "fsrtl-filter-contexts: InsertPerStreamContext",
+    );
+    assert(
+        call_export("FsRtlLookupPerStreamContextInternal", &[header_address, 0xA, 0]) == Some(s1)
+            && call_export("FsRtlLookupPerStreamContextInternal", &[header_address, 0xB, 2]) == Some(s2)
+            && call_export("FsRtlLookupPerStreamContextInternal", &[header_address, 0xB, 9]) == Some(0)
+            && call_export("FsRtlLookupPerStreamContextInternal", &[header_address, 0, 0]) == Some(s2),
+        "fsrtl-filter-contexts: Lookup por dono/instancia e cabeca da lista (InsertHead)",
+    );
+    assert(
+        call_export("FsRtlRemovePerStreamContext", &[header_address, 0xA, 1]) == Some(s1) && call_export("FsRtlLookupPerStreamContextInternal", &[header_address, 0xA, 0]) == Some(0),
+        "fsrtl-filter-contexts: RemovePerStreamContext",
+    );
+    header.flags2.set(0);
+    assert(
+        call_export("FsRtlInsertPerStreamContext", &[header_address, s1]).map(|s| s as u32) == Some(0xC000_0010) && call_export("FsRtlRemovePerStreamContext", &[header_address, 0xB, 0]) == Some(0),
+        "fsrtl-filter-contexts: sem SUPPORTS_FILTER_CONTEXTS recusado",
+    );
+
+    // Per-file: ponteiro de suporte vazio ganha o bloco 'FSfc' na primeira inserção.
+    let support = guest::alloc_bytes(8);
+    let support_cell = at::<nt::Field<u64>>(support);
+    support_cell.set(0);
+    let f1 = make(0xC, 3);
+    let lookup_empty = call_export("FsRtlLookupPerFileContext", &[support, 0xC, 0]);
+    let inserted = call_export("FsRtlInsertPerFileContext", &[support, f1]);
+    assert(lookup_empty == Some(0) && inserted == Some(0) && support_cell.get() != 0, "fsrtl-filter-contexts: InsertPerFileContext cria o bloco");
+    assert(
+        call_export("FsRtlLookupPerFileContext", &[support, 0xC, 3]) == Some(f1) && call_export("FsRtlRemovePerFileContext", &[support, 0xC, 0]) == Some(f1) && call_export("FsRtlLookupPerFileContext", &[support, 0xC, 0]) == Some(0),
+        "fsrtl-filter-contexts: Lookup/RemovePerFileContext",
+    );
+    assert(call_export("FsRtlInsertPerFileContext", &[0, f1]).map(|s| s as u32) == Some(0xC000_0010), "fsrtl-filter-contexts: ponteiro NULL recusado");
+
+    // Per-file-object: a extensão do FILE_OBJECT nasce sob demanda.
+    let file_object = guest::alloc_bytes(nt::FileObject::SIZE);
+    let o1 = make(0xD, 4);
+    let absent = call_export("FsRtlLookupPerFileObjectContext", &[file_object, 0xD, 0]);
+    let object_inserted = call_export("FsRtlInsertPerFileObjectContext", &[file_object, o1]);
+    let extension = at::<nt::FileObject>(file_object).file_object_extension.get();
+    assert(
+        absent == Some(0) && object_inserted == Some(0) && extension != 0 && at::<nt::IopFileObjectExtension>(extension).fo_ext_per_type_extension[3].get() != 0,
+        "fsrtl-filter-contexts: InsertPerFileObjectContext cria extensao e lista",
+    );
+    assert(
+        call_export("FsRtlLookupPerFileObjectContext", &[file_object, 0xD, 4]) == Some(o1)
+            && call_export("FsRtlRemovePerFileObjectContext", &[file_object, 0xD, 4]) == Some(o1)
+            && call_export("FsRtlLookupPerFileObjectContext", &[file_object, 0xD, 0]) == Some(0),
+        "fsrtl-filter-contexts: Lookup/RemovePerFileObjectContext",
+    );
+    assert(call_export("FsRtlInsertPerFileObjectContext", &[0, o1]).map(|s| s as u32) == Some(0xC000_000D), "fsrtl-filter-contexts: FILE_OBJECT NULL recusado");
+
+    for block in [header_address, s1, s2, support, f1, file_object, o1] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_file_system_support_exports(assert: Assert) {
+    use crate::ntos::ps::process;
+
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    let hex = |text: &str| -> Vec<u8> { (0..text.len()).step_by(2).map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap()).collect() };
+
+    // Vetores calculados com SCRATCHPAD/refvec/reparse_ref.py (transcrição de 0x309a70).
+    let reparse_cases: [(&str, u64, &str, u32); 14] = [
+        ("symlink valido", 0x24, "0c0000a01c00000000000800080008000000000041004100410041004100410041004100", 0),
+        ("mount point valido", 0x2A, "030000a02200000000001000120006004200420042004200420042004200420000004300430043000000", 0),
+        ("tag reservada 2", 0x10, "02000000080000000000000000000000", 0xC000_0276),
+        ("so name surrogate", 0x10, "05000040080000000000000000000000", 0xC000_0276),
+        ("bits 29:28", 0x10, "010000b0080000000000000000000000", 0xC000_0276),
+        ("global reparse", 0x10, "190000a0080000000000000000000000", 0xC000_0276),
+        ("comprimento 4", 0x4, "1700008000000000", 0xC000_0278),
+        ("tag nao-MS sem GUID", 0x10, "23010000080000000000000000000000", 0xC000_0278),
+        ("tag nao-MS GUID nulo", 0x20, "2301000008000000000000000000000000000000000000000000000000000000", 0xC000_0278),
+        ("tag nao-MS GUID", 0x20, "23010000080000000102030405060708090a0b0c0d0e0f100000000000000000", 0),
+        ("mount point com GUID", 0x20, "030000a0080000000102030405060708090a0b0c0d0e0f100000000000000000", 0xC000_0278),
+        ("mount point estouro", 0x28, "030000a0200000000000f0ff00002000000000000000000000000000000000000000000000000000", 0xC000_0095),
+        ("symlink impar", 0x24, "0c0000a01c00000000000700080008000000000041004100410041004100410041004100", 0xC000_0278),
+        ("tag MS generica", 0x10, "17000080080000000000000000000000", 0),
+    ];
+    let buffer = guest::alloc_bytes(0x40);
+    let mut failed: Option<&str> = None;
+    for (label, length, bytes, expected) in reparse_cases {
+        guest::write_bytes(buffer, &hex(bytes));
+        if status(call_export("FsRtlValidateReparsePointBuffer", &[length, buffer])) != Some(expected) && failed.is_none() {
+            failed = Some(label);
+        }
+    }
+    assert(failed.is_none(), "fsrtl-file-system-support: FsRtlValidateReparsePointBuffer segue as regras do NT");
+
+    // Vetores calculados com SCRATCHPAD/refvec/name_ref.py (transcrição de 0x24f290).
+    let name_cases: [(&str, &str, u64, u64); 20] = [
+        ("*.txt", "a.TXT", 1, 1), ("*.txt", "a.TXT", 0, 0), ("*.TXT", "readme.txt", 1, 1), ("a?c", "abc", 0, 1), ("a?c", "ac", 0, 0),
+        ("a*b*c", "axxbyyc", 0, 1), ("a*b*c", "axxbyy", 0, 0), ("<.c", "file.c", 0, 1), ("<.c", "a.b.c", 0, 1), ("a\"b", "ab", 0, 0),
+        ("a\"", "a", 0, 1), ("a>>", "a", 0, 1), ("a>>.c", "ab.c", 0, 1), ("x<", "x.y.z", 0, 0), ("*", "", 0, 0), ("", "", 0, 1),
+        ("ABC*", "abcdef", 1, 1), ("abc*", "ABCDEF", 1, 1), ("*a*", "bab", 0, 1), ("*.*", "noext", 0, 0),
+    ];
+    let expression = guest::alloc_bytes(0x40);
+    let name = guest::alloc_bytes(0x40);
+    let mut name_failed: Option<(&str, &str)> = None;
+    for (pattern, text, ignore_case, expected) in name_cases {
+        unicode_at(expression, pattern);
+        unicode_at(name, text);
+        if call_export("FsRtlIsNameInUnUpcasedExpression", &[expression, name, ignore_case, 0]) != Some(expected) && name_failed.is_none() {
+            name_failed = Some((pattern, text));
+        }
+    }
+    assert(name_failed.is_none(), "fsrtl-file-system-support: FsRtlIsNameInUnUpcasedExpression reproduz o automato do NT");
+    // Tabela de maiúsculas do chamador com as 0x10000 WCHARs (a-z -> A-Z); a expressão também passa por ela.
+    let upper = |unit: u32| -> u16 {
+        let mapped = if (0x61..=0x7A).contains(&unit) { unit - 0x20 } else { unit };
+        mapped as u16
+    };
+    let units: Vec<u8> = (0..0x1_0000u32).flat_map(|unit| upper(unit).to_le_bytes()).collect();
+    let table = guest::alloc_bytes(units.len() as u64);
+    guest::write_bytes(table, &units);
+    unicode_at(expression, "*.txt");
+    unicode_at(name, "a.TXT");
+    let tabled_tail = call_export("FsRtlIsNameInUnUpcasedExpression", &[expression, name, 1, table]) == Some(1);
+    unicode_at(expression, "a*b?d");
+    unicode_at(name, "AxxBcD");
+    let tabled_general = call_export("FsRtlIsNameInUnUpcasedExpression", &[expression, name, 1, table]) == Some(1);
+    assert(tabled_tail && tabled_general, "fsrtl-file-system-support: UpcaseTable converte nome e expressao");
+
+    // EPROCESS falso: WoW64Process -> EWOW64PROCESS.Machine.
+    let fake_process = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let wow64 = guest::alloc_bytes(nt::Ewow64process::SIZE);
+    let eprocess = at::<nt::Eprocess>(fake_process);
+    let native = call_export("FsRtlIs32BitProcess", &[fake_process]) == Some(0);
+    eprocess.wo_w64_process.set(wow64);
+    let machines = [(0x14Cu16, 1u64), (0x1C4, 1), (0x8664, 0), (0xAA64, 0)].iter().all(|&(machine, expected)| {
+        at::<nt::Ewow64process>(wow64).machine.set(machine);
+        call_export("FsRtlIs32BitProcess", &[fake_process]) == Some(expected)
+    });
+    assert(native && machines, "fsrtl-file-system-support: FsRtlIs32BitProcess aceita so i386 e ARMNT WoW64");
+
+    let level = call_export("FsRtlQueryMaximumVirtualDiskNestingLevel", &[]);
+    assert(level.is_some_and(|level| level <= 2) && call_export("FsRtlQueryMaximumVirtualDiskNestingLevel", &[]) == level, "fsrtl-file-system-support: nivel maximo de aninhamento <= 2 e em cache");
+    assert(call_export("FsRtlIsExtentDangling", &[0x1000, 0x20]) == Some(0x1020), "fsrtl-file-system-support: sem extensoes pendentes devolve Start+Count");
+
+    // Lista do loader do processo corrente quando há PEB com Ldr legível.
+    let thread = at::<nt::Ethread>(process::get_current_thread());
+    let peb = at::<nt::Eprocess>(thread.tcb.apc_state.process.get()).peb.get();
+    if let Ok(ldr) = nt::Peb::try_at(peb).and_then(|peb| peb.ldr.probe_get()) {
+        let expected = ldr + core::mem::offset_of!(nt::PebLdrData, in_load_order_module_list) as u64;
+        assert(call_export("FsRtlGetCurrentProcessLoaderList", &[]) == Some(expected), "fsrtl-file-system-support: lista InLoadOrder do PEB corrente");
+    }
+
+    // FsRtlChangeBackingFileObject: validação e SOP sem CONTROL_AREA (sucesso sem mudança).
+    let pointers = guest::alloc_bytes(nt::SectionObjectPointers::SIZE);
+    let other_pointers = guest::alloc_bytes(nt::SectionObjectPointers::SIZE);
+    let current = guest::alloc_bytes(nt::FileObject::SIZE);
+    let new = guest::alloc_bytes(nt::FileObject::SIZE);
+    at::<nt::FileObject>(current).section_object_pointer.set(pointers);
+    at::<nt::FileObject>(new).section_object_pointer.set(pointers);
+    let flags_rejected = status(call_export("FsRtlChangeBackingFileObject", &[current, new, 0, 1])) == Some(0xC000_00F2);
+    let type_rejected = status(call_export("FsRtlChangeBackingFileObject", &[current, new, 3, 0])) == Some(0xC000_00F1);
+    let no_section = status(call_export("FsRtlChangeBackingFileObject", &[current, new, 0, 0])) == Some(0) && status(call_export("FsRtlChangeBackingFileObject", &[0, new, 1, 0])) == Some(0);
+    at::<nt::FileObject>(new).section_object_pointer.set(other_pointers);
+    let mismatch = status(call_export("FsRtlChangeBackingFileObject", &[current, new, 0, 0])) == Some(0xC000_00F0);
+    assert(flags_rejected && type_rejected && no_section && mismatch, "fsrtl-file-system-support: FsRtlChangeBackingFileObject valida e troca so com CONTROL_AREA");
+
+    for pointer in [buffer, expression, name, table, fake_process, wow64, pointers, other_pointers, current, new] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn fsrtl_misc_exports(assert: Assert) {
+    // IsPagingFile: FsContext com Flags2 bit 0x08 -> TRUE; sem bit / sem FCB -> FALSE.
+    let file_object = guest::alloc_bytes(nt::FileObject::SIZE);
+    let fcb = guest::alloc_bytes(nt::extra_fsrtl::FsrtlCommonFcbHeader::SIZE);
+    let object = at::<nt::FileObject>(file_object);
+    let header = at::<nt::extra_fsrtl::FsrtlCommonFcbHeader>(fcb);
+    object.fs_context.set(fcb);
+    header.flags2.set(0x08);
+    let paging = call_export("FsRtlIsPagingFile", &[file_object]);
+    header.flags2.set(0x02);
+    let not_paging = call_export("FsRtlIsPagingFile", &[file_object]);
+    object.fs_context.set(0);
+    let no_fcb = call_export("FsRtlIsPagingFile", &[file_object]);
+    assert(paging == Some(1) && not_paging == Some(0) && no_fcb == Some(0), "fsrtl-misc: IsPagingFile le Flags2 do FCB");
+
+    assert(call_export("FsRtlIsMobileOS", &[]) == Some(1), "fsrtl-misc: IsMobileOS TRUE (extensao do KTM ausente)");
+
+    // Tags: IO_REPARSE_TAG_CLOUD (0x9000001A, bit 28) e WCI (0x80000018) permitidos;
+    // IO_REPARSE_TAG_SYMLINK (0xA000000C) e MOUNT_POINT (0xA0000003) não.
+    assert(
+        call_export("FsRtlIsNonEmptyDirectoryReparsePointAllowed", &[0x9000_001A]) == Some(1)
+            && call_export("FsRtlIsNonEmptyDirectoryReparsePointAllowed", &[0x8000_0018]) == Some(1)
+            && call_export("FsRtlIsNonEmptyDirectoryReparsePointAllowed", &[0xA000_000C]) == Some(0)
+            && call_export("FsRtlIsNonEmptyDirectoryReparsePointAllowed", &[0xA000_0003]) == Some(0),
+        "fsrtl-misc: IsNonEmptyDirectoryReparsePointAllowed",
+    );
+
+    // SetDriverBacking: sem flag -> 0; flag com DriverInit NULL -> 0xC0000263; com DriverInit -> 0.
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    let without_flag = call_export("FsRtlSetDriverBacking", &[driver, 0]);
+    let no_init = call_export("FsRtlSetDriverBacking", &[driver, 1]).map(|s| s as u32);
+    at::<nt::DriverObject>(driver).driver_init.set(0xFFFF_F800_0000_1000);
+    let with_init = call_export("FsRtlSetDriverBacking", &[driver, 1]);
+    assert(without_flag == Some(0) && no_init == Some(0xC000_0263) && with_init == Some(0), "fsrtl-misc: SetDriverBacking");
+
+    // SendModernAppTermination: validação local (sem chegar ao WNF).
+    let payload = guest::alloc_bytes(0x2000);
+    assert(
+        call_export("FsRtlSendModernAppTermination", &[payload, 0x1001, 0]).map(|s| s as u32) == Some(0x8000_0005)
+            && call_export("FsRtlSendModernAppTermination", &[payload, 8, 2]).map(|s| s as u32) == Some(0xC000_000D),
+        "fsrtl-misc: SendModernAppTermination valida tamanho e tipo",
+    );
+
+    // CancellableWaitForSingleObject: evento sinalizado -> STATUS_SUCCESS;
+    // não sinalizado com timeout 0 -> STATUS_TIMEOUT.
+    let event = guest::alloc_bytes(nt::Kevent::SIZE);
+    call_export("KeInitializeEvent", &[event, 0, 1]);
+    let zero = guest::alloc_bytes(nt::LargeInteger::SIZE);
+    at::<nt::LargeInteger>(zero).quad_part.set(0);
+    let signaled = call_export("FsRtlCancellableWaitForSingleObject", &[event, zero, 0]);
+    call_export("KeClearEvent", &[event]);
+    let timed_out = call_export("FsRtlCancellableWaitForSingleObject", &[event, zero, 0]);
+    assert(signaled == Some(0) && timed_out == Some(0x102), "fsrtl-misc: CancellableWaitForSingleObject sucesso/timeout");
+
+    // Multiple (WaitAny) sobre dois eventos, o segundo sinalizado -> índice 1.
+    let second = guest::alloc_bytes(nt::Kevent::SIZE);
+    call_export("KeInitializeEvent", &[second, 0, 1]);
+    let array = guest::alloc_bytes(16);
+    // SAFETY: vetor de dois PVOID recém-alocado.
+    let objects = unsafe { nt::Field::<u64>::array_at(array, 2) };
+    objects[0].set(event);
+    objects[1].set(second);
+    assert(call_export("FsRtlCancellableWaitForMultipleObjects", &[2, array, 1, zero, 0, 0]) == Some(1), "fsrtl-misc: CancellableWaitForMultipleObjects WaitAny");
+
+    for block in [file_object, fcb, driver, payload, event, zero, second, array] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_base_mcb_exports(assert: Assert) {
+    use crate::ntos::fsrtl::mcb;
+    use nt::extra_fs_ntfs::BaseMcb;
+
+    // Valores esperados calculados executando o ntoskrnl real (SCRATCHPAD/mcb_selftest_vectors.py).
+    const HOLE: u32 = 0xFFFF_FFFF;
+    const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let m = guest::alloc_bytes(BaseMcb::SIZE);
+    let base = at::<BaseMcb>(m);
+    let out = guest::alloc_bytes(5 * 8);
+    let o = |i: u64| out + i * 8;
+    let cell = |i: u64| at::<nt::Field<u64>>(o(i));
+    let fill = || (0..5).for_each(|i| cell(i).set(PATTERN));
+    let ok = |name: &str, args: &[u64], expected: u64| call_export(name, args) == Some(expected);
+    let status = |name: &str, args: &[u64]| call_export(name, args).map(|value| value as u32);
+
+    assert(ok("FsRtlInitializeBaseMcbEx", &[m, 1, 0], 1) && base.maximum_pair_count.get() == 15 && base.pair_count.get() == 0, "fsrtl-base-mcb: Initialize (PagedPool) -> 15 pares, vazio");
+    assert(
+        status("FsRtlAddBaseMcbEntryEx", &[m, 10, 100, 5]) == Some(0)
+            && status("FsRtlAddBaseMcbEntryEx", &[m, 15, 105, 5]) == Some(0)
+            && mcb::pairs(base) == [(10, HOLE), (20, 100)],
+        "fsrtl-base-mcb: Add com buraco inicial e fusao do trecho contiguo",
+    );
+    assert(status("FsRtlAddBaseMcbEntryEx", &[m, 12, 999, 5]) == Some(0xC000_0001) && mcb::pairs(base) == [(10, HOLE), (20, 100)], "fsrtl-base-mcb: Add conflitante -> STATUS_UNSUCCESSFUL sem efeito");
+    assert(
+        ok("FsRtlAddBaseMcbEntry", &[m, 30, 500, 4], 1)
+            && status("FsRtlAddBaseMcbEntryEx", &[m, 12, 102, 3]) == Some(0)
+            && mcb::pairs(base) == [(10, HOLE), (20, 100), (30, HOLE), (34, 500)]
+            && ok("FsRtlNumberOfRunsInBaseMcb", &[m], 4),
+        "fsrtl-base-mcb: Add apos lacuna e re-Add identico aceito; 4 runs",
+    );
+    fill();
+    assert(
+        ok("FsRtlLookupBaseMcbEntry", &[m, 12, o(0), o(1), o(2), o(3), o(4)], 1)
+            && [cell(0).get(), cell(1).get(), cell(2).get(), cell(3).get()] == [0x66, 8, 0x64, 10]
+            && cell(4).get() == 0xA5A5_A5A5_0000_0001,
+        "fsrtl-base-mcb: Lookup num trecho mapeado",
+    );
+    fill();
+    assert(
+        ok("FsRtlLookupBaseMcbEntry", &[m, 25, o(0), o(1), o(2), o(3), o(4)], 1)
+            && [cell(0).get(), cell(1).get(), cell(2).get(), cell(3).get()] == [u64::MAX, 5, u64::MAX, 10]
+            && at::<nt::Field<u32>>(o(4)).get() == 2,
+        "fsrtl-base-mcb: Lookup num buraco -> TRUE com LBN -1",
+    );
+    fill();
+    assert(ok("FsRtlLookupBaseMcbEntry", &[m, 40, o(0), o(1), o(2), o(3), o(4)], 0) && cell(0).get() == PATTERN, "fsrtl-base-mcb: Lookup alem do fim -> FALSE sem escrever");
+    fill();
+    assert(ok("FsRtlLookupLastBaseMcbEntry", &[m, o(0), o(1)], 1) && cell(0).get() == 0x21 && cell(1).get() == 0x1F7, "fsrtl-base-mcb: LookupLast");
+    fill();
+    assert(
+        ok("FsRtlLookupLastBaseMcbEntryAndIndex", &[m, o(0), o(1), o(2)], 1) && cell(0).get() == 0x21 && cell(1).get() == 0x1F7 && cell(2).get() == 0xA5A5_A5A5_0000_0003,
+        "fsrtl-base-mcb: LookupLastAndIndex",
+    );
+    fill();
+    assert(
+        ok("FsRtlGetNextBaseMcbEntry", &[m, 2, o(0), o(1), o(2)], 1)
+            && [cell(0).get(), cell(1).get(), cell(2).get()] == [0x14, u64::MAX, 10]
+            && ok("FsRtlGetNextBaseMcbEntry", &[m, 4, o(0), o(1), o(2)], 0),
+        "fsrtl-base-mcb: GetNext (buraco) e indice alem do fim",
+    );
+    assert(
+        ok("FsRtlRemoveBaseMcbEntry", &[m, 15, 3], 1)
+            && mcb::pairs(base) == [(10, HOLE), (15, 100), (18, HOLE), (20, 108), (30, HOLE), (34, 500)]
+            && status("FsRtlAddBaseMcbEntryEx", &[m, 25, 200, 5]) == Some(0)
+            && mcb::pairs(base) == [(10, HOLE), (15, 100), (18, HOLE), (20, 108), (25, HOLE), (30, 200), (34, 500)],
+        "fsrtl-base-mcb: Remove abre buraco; Add no fim de um buraco",
+    );
+    call_export("FsRtlTruncateBaseMcb", &[m, 32]);
+    assert(mcb::pairs(base).last() == Some(&(32, 500)) && base.pair_count.get() == 7, "fsrtl-base-mcb: Truncate apara o ultimo trecho");
+    for i in 0..20u64 {
+        call_export("FsRtlAddBaseMcbEntryEx", &[m, 40 + 2 * i, 1000 + 7 * i, 1]);
+    }
+    assert(ok("FsRtlNumberOfRunsInBaseMcb", &[m], 47) && base.maximum_pair_count.get() == 60, "fsrtl-base-mcb: vetor cresce 15 -> 30 -> 60 pares");
+    call_export("FsRtlTruncateBaseMcb", &[m, 20]);
+    assert(base.maximum_pair_count.get() == 15 && mcb::pairs(base) == [(10, HOLE), (15, 100), (18, HOLE), (20, 108)], "fsrtl-base-mcb: Truncate encolhe o vetor para 15 pares");
+    call_export("FsRtlResetBaseMcb", &[m]);
+    cell(0).set(0xFFFF_FFFF);
+    cell(1).set(0x7_0000_0005);
+    assert(
+        base.pair_count.get() == 0
+            && ok("FsRtlLookupLastBaseMcbEntryAndIndex", &[m, o(0), o(1), o(2)], 0)
+            && cell(0).get() == u64::MAX
+            && cell(1).get() == 5,
+        "fsrtl-base-mcb: Reset; LookupLastAndIndex vazio estende as partes baixas (quirk do NT)",
+    );
+    call_export("FsRtlUninitializeBaseMcb", &[m]);
+    guest::free_bytes(out);
+    guest::free_bytes(m);
+}
+
+
+fn fsrtl_large_mcb_exports(assert: Assert) {
+    // Vetores do ntoskrnl real (SCRATCHPAD/fsfat/large_mcb_vectors.py sobre o oráculo mcb_emu.py).
+    use nt::extra_fs_fat::LargeMcb;
+    let mcb = guest::alloc_bytes(LargeMcb::SIZE);
+    let out = guest::alloc_bytes(0x40);
+    let large = at::<LargeMcb>(mcb);
+    let base = &large.base_mcb;
+    let pairs = || crate::ntos::fsrtl::mcb::pairs(base);
+    let cell = |offset: u64| at::<nt::Field<u64>>(out + offset).get();
+    let index = |offset: u64| at::<nt::Field<u32>>(out + offset).get();
+    const HOLE: u32 = u32::MAX;
+    call_export("FsRtlInitializeLargeMcb", &[mcb, 1]);
+    assert(
+        large.guarded_mutex.get() != 0 && base.maximum_pair_count.get() == 15 && base.pair_count.get() == 0 && base.pool_type.get() == 1,
+        "fsrtl-large-mcb: Initialize (mutex, 15 pares, PagedPool)",
+    );
+
+    let add = |vbn: u64, lbn: u64, count: u64| call_export("FsRtlAddLargeMcbEntry", &[mcb, vbn, lbn, count]);
+    let first = add(0, 100, 10);
+    let merged = add(10, 110, 5);
+    let after_merge = pairs();
+    let gap = add(20, 200, 5);
+    assert(first == Some(1) && merged == Some(1) && after_merge == [(15, 100)] && gap == Some(1) && pairs() == [(15, 100), (20, HOLE), (25, 200)], "fsrtl-large-mcb: Add funde contiguos e abre buraco");
+    assert(add(5, 999, 2) == Some(0) && add(5, 105, 3) == Some(1) && pairs() == [(15, 100), (20, HOLE), (25, 200)], "fsrtl-large-mcb: Add conflitante recusado, coerente aceito");
+    assert(call_export("FsRtlNumberOfRunsInLargeMcb", &[mcb]) == Some(3), "fsrtl-large-mcb: NumberOfRuns conta o buraco");
+
+    // Lookup(22) = (202, 3, 200, 5, 2); Lookup(17) = buraco; Lookup(25) = FALSE.
+    let lookup = |vbn: u64| {
+        let found = call_export("FsRtlLookupLargeMcbEntry", &[mcb, vbn, out, out + 8, out + 0x10, out + 0x18, out + 0x20]);
+        (found, cell(0), cell(8), cell(0x10), cell(0x18), index(0x20))
+    };
+    assert(lookup(22) == (Some(1), 202, 3, 200, 5, 2), "fsrtl-large-mcb: Lookup numa corrida");
+    assert(lookup(17) == (Some(1), u64::MAX, 3, u64::MAX, 5, 1), "fsrtl-large-mcb: Lookup num buraco");
+    assert(call_export("FsRtlLookupLargeMcbEntry", &[mcb, 25, 0, 0, 0, 0, 0]) == Some(0), "fsrtl-large-mcb: Lookup alem do fim");
+    let last = call_export("FsRtlLookupLastLargeMcbEntryAndIndex", &[mcb, out, out + 8, out + 0x10]);
+    assert(last == Some(1) && cell(0) == 24 && cell(8) == 204 && index(0x10) == 2, "fsrtl-large-mcb: LookupLastAndIndex");
+    let next = call_export("FsRtlGetNextLargeMcbEntry", &[mcb, 1, out, out + 8, out + 0x10]);
+    assert(
+        next == Some(1) && cell(0) == 15 && cell(8) == u64::MAX && cell(0x10) == 5 && call_export("FsRtlGetNextLargeMcbEntry", &[mcb, 3, out, out + 8, out + 0x10]) == Some(0),
+        "fsrtl-large-mcb: GetNext",
+    );
+
+    // Remove abre buracos e não deixa buraco no fim; Truncate corta; Reset zera.
+    call_export("FsRtlRemoveLargeMcbEntry", &[mcb, 2, 3]);
+    let removed = pairs();
+    call_export("FsRtlRemoveLargeMcbEntry", &[mcb, 20, 5]);
+    let tail_removed = pairs();
+    call_export("FsRtlTruncateLargeMcb", &[mcb, 10]);
+    assert(
+        removed == [(2, 100), (5, HOLE), (15, 105), (20, HOLE), (25, 200)] && tail_removed == [(2, 100), (5, HOLE), (15, 105)] && pairs() == [(2, 100), (5, HOLE), (10, 105)],
+        "fsrtl-large-mcb: Remove e Truncate",
+    );
+    call_export("FsRtlResetLargeMcb", &[mcb, 0]);
+    assert(call_export("FsRtlNumberOfRunsInLargeMcb", &[mcb]) == Some(0), "fsrtl-large-mcb: Reset");
+    call_export("FsRtlUninitializeLargeMcb", &[mcb]);
+    assert(large.guarded_mutex.get() == 0, "fsrtl-large-mcb: Uninitialize solta a mutex");
+    guest::free_bytes(mcb);
+    guest::free_bytes(out);
+}
+
+
+fn fsrtl_eof_lock_exports(assert: Assert) {
+    use crate::ntos::fsrtl::eof_lock::{EofLock, EofWaitBlock};
+    use crate::ntos::inc::types::extra_fsrtl::FsrtlAdvancedFcbHeader;
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ps::process;
+
+    let current = process::get_current_thread();
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    // FSRTL_ADVANCED_FCB_HEADER com FastMutex e FileSize = 0x1000.
+    let mutex = guest::alloc_bytes(nt::FastMutex::SIZE);
+    call_export("ExInitializeFastMutex", &[mutex]);
+    let header_address = guest::alloc_bytes(FsrtlAdvancedFcbHeader::SIZE);
+    let header = at::<FsrtlAdvancedFcbHeader>(header_address);
+    header.file_size.quad_part.set(0x1000);
+    header.fast_mutex.set(mutex);
+    let lock_address = guest::alloc_bytes(EofLock::SIZE);
+    guest::write_bytes(lock_address, &[0xAA; 0x28]);
+    let lock = at::<EofLock>(lock_address);
+    let counter_address = guest::alloc_bytes(4);
+    let counter = at::<nt::Field<u32>>(counter_address);
+    let out_address = guest::alloc_bytes(1);
+    let out = at::<nt::Field<u8>>(out_address);
+    let owner = &at::<nt::FastMutex>(mutex).owner;
+
+    call_export("FsRtlInitializeEofLock", &[lock_address, header_address]);
+    assert(
+        lock.owner.get() == 0
+            && lock.wait_list.flink.get() == lock.wait_list.address()
+            && lock.wait_list.blink.get() == lock.wait_list.address()
+            && lock.header.get() == header_address
+            && lock.owner_priority.get() == 0
+            && lock.recursion.get() == 0,
+        "fsrtl-eof-lock: InitializeEofLock zera dono, lista vazia e liga o cabecalho",
+    );
+
+    // Mutex do cabeçalho: o contador sobe na aquisição e na liberação.
+    call_export("FsRtlAcquireHeaderMutex", &[lock_address, counter_address]);
+    let owned = owner.get() == current && counter.get() == 1;
+    let busy = call_export("FsRtlTryToAcquireHeaderMutex", &[lock_address, counter_address]) == Some(0) && counter.get() == 1;
+    call_export("FsRtlReleaseHeaderMutex", &[lock_address, counter_address]);
+    let released = owner.get() == 0 && counter.get() == 2;
+    let tried = call_export("FsRtlTryToAcquireHeaderMutex", &[lock_address, counter_address]) == Some(1) && counter.get() == 3;
+    call_export("FsRtlReleaseHeaderMutex", &[lock_address, counter_address]);
+    assert(owned && busy && released && tried && counter.get() == 4, "fsrtl-eof-lock: mutex do cabecalho adquire, tenta e conta 2x por ciclo");
+
+    // EOF lock recursivo: cada operação passa pelo mutex do cabeçalho (2 contagens).
+    call_export("FsRtlAcquireEofLock", &[lock_address, counter_address]);
+    call_export("FsRtlAcquireEofLock", &[lock_address, counter_address]);
+    let recursive = lock.owner.get() == current && lock.recursion.get() == 2 && counter.get() == 8;
+    call_export("FsRtlReleaseEofLock", &[lock_address, counter_address]);
+    let still_owned = lock.owner.get() == current && lock.recursion.get() == 1;
+    call_export("FsRtlReleaseEofLock", &[lock_address, counter_address]);
+    assert(
+        recursive && still_owned && lock.owner.get() == 0 && lock.recursion.get() == 0 && counter.get() == 12 && owner.get() == 0,
+        "fsrtl-eof-lock: Acquire/ReleaseEofLock recursivos devolvem o lock livre",
+    );
+
+    // FsRtlGetIoAtEof sob o mutex: livre -> posse; dono -> recursão; outro dono sem Wait -> conflito.
+    call_export("FsRtlAcquireHeaderMutex", &[lock_address, counter_address]);
+    out.set(0);
+    let first = status(call_export("FsRtlGetIoAtEof", &[lock_address, counter_address, 0x800, 0x1000, 0, out_address])) == Some(0) && out.get() == 1 && lock.owner.get() == current;
+    out.set(0);
+    let again = status(call_export("FsRtlGetIoAtEof", &[lock_address, counter_address, 0x800, 0x1000, 0, out_address])) == Some(0) && out.get() == 1 && lock.recursion.get() == 2;
+    lock.owner.set(0x1234_5000);
+    let conflict = status(call_export("FsRtlGetIoAtEof", &[lock_address, counter_address, u64::MAX, 0x10, 0, out_address])) == Some(0xC000_0054);
+    lock.owner.set(current);
+    call_export("FsRtlReleaseHeaderMutex", &[lock_address, counter_address]);
+    call_export("FsRtlReleaseEofLock", &[lock_address, counter_address]);
+    call_export("FsRtlReleaseEofLock", &[lock_address, counter_address]);
+    assert(first && again && conflict && lock.owner.get() == 0, "fsrtl-eof-lock: GetIoAtEof concede, recursa e devolve STATUS_FILE_LOCK_CONFLICT sem Wait");
+
+    // Transferência na liberação: um aguardante dentro do arquivo (0x800 <= 0x1000) é só
+    // despertado; o primeiro que passa do fim (-1) vira o dono com recursão 1.
+    let inside_address = guest::alloc_bytes(EofWaitBlock::SIZE);
+    let beyond_address = guest::alloc_bytes(EofWaitBlock::SIZE);
+    let (inside, beyond) = (at::<EofWaitBlock>(inside_address), at::<EofWaitBlock>(beyond_address));
+    for (block, ending, thread) in [(inside, 0x800i64, 0x1111_0000u64), (beyond, -1, 0x2222_0000)] {
+        dispatcher::initialize_event(block.event.address(), 1, false);
+        block.ending_offset.set(ending);
+        block.thread.set(thread);
+        block.priority.set(8);
+        block.io_priority.set(2);
+    }
+    let head = lock.wait_list.address();
+    lock.wait_list.flink.set(inside_address);
+    inside.links.flink.set(beyond_address);
+    inside.links.blink.set(head);
+    beyond.links.flink.set(head);
+    beyond.links.blink.set(inside_address);
+    lock.wait_list.blink.set(beyond_address);
+    lock.owner.set(current);
+    lock.recursion.set(1);
+    call_export("FsRtlReleaseEofLock", &[lock_address, counter_address]);
+    assert(
+        lock.owner.get() == 0x2222_0000
+            && lock.recursion.get() == 1
+            && lock.owner_priority.get() == 8
+            && lock.wait_list.flink.get() == head
+            && inside.event.header.signal_state.get() == 1
+            && beyond.event.header.signal_state.get() == 1,
+        "fsrtl-eof-lock: ReleaseEofLock entrega a posse ao aguardante alem do fim e desperta os demais",
+    );
+    for pointer in [inside_address, beyond_address, out_address, counter_address, lock_address, header_address, mutex] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn fsrtl_fast_io_exports(assert: Assert) {
+    use crate::ntos::ke::pcr;
+
+    // Cada contador é um campo da KPRCB; o export soma exatamente 1 no próprio campo.
+    let prcb = &at::<nt::Kpcr>(pcr::get_pcr_address()).prcb;
+    let fields: [&nt::Field<u32>; 5] = [
+        &prcb.cc_fast_read_no_wait,
+        &prcb.cc_fast_read_wait,
+        &prcb.cc_fast_read_not_possible,
+        &prcb.cc_fast_mdl_read_wait,
+        &prcb.cc_fast_read_resource_miss,
+    ];
+    let names = [
+        "FsRtlIncrementCcFastReadNoWait",
+        "FsRtlIncrementCcFastReadWait",
+        "FsRtlIncrementCcFastReadNotPossible",
+        "FsRtlIncrementCcFastMdlReadWait",
+        "FsRtlIncrementCcFastReadResourceMiss",
+    ];
+    let mut all = true;
+    for (target, name) in names.iter().enumerate() {
+        let before: [u32; 5] = fields.map(|field| field.get());
+        call_export(name, &[]);
+        for (index, field) in fields.iter().enumerate() {
+            let expected = if index == target { before[index].wrapping_add(1) } else { before[index] };
+            all &= field.get() == expected;
+        }
+    }
+    assert(all, "fsrtl-fast-io: FsRtlIncrementCc* somam 1 so no proprio campo da KPRCB");
+}
+
+
+fn fsrtl_heat_exports(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::fsrtl::heat::HeatInfo;
+
+    let tiered = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\TieredStorage";
+    let disabled = registry::read_value_by_path(tiered, "Enabled").is_some_and(|value| !value.data.is_empty() && value.data.iter().take(4).all(|&byte| byte == 0));
+    let measured = registry::read_value_by_path(tiered, "MeasuredOperations")
+        .filter(|value| !value.data.is_empty())
+        .map_or(7, |value| value.data[0] as u32 & 7);
+
+    // GUID 00..0F -> id 0x0C060609 ((g[10]<<24|g[15]) ^ (g16[2]<<16|g16[3]) ^ g32[0], calculado em Python);
+    // o segundo GUID colide no mesmo id e recebe id+1.
+    let guid = guest::alloc_bytes(nt::Guid::SIZE);
+    let colliding = guest::alloc_bytes(nt::Guid::SIZE);
+    let mut bytes: [u8; 16] = core::array::from_fn(|index| index as u8);
+    guest::write_bytes(guid, &bytes);
+    bytes[0] = 1;
+    bytes[15] = 0x0E;
+    guest::write_bytes(colliding, &bytes);
+    let infos = [guest::alloc_bytes(HeatInfo::SIZE), guest::alloc_bytes(HeatInfo::SIZE), guest::alloc_bytes(HeatInfo::SIZE)];
+    let [first, again, second] = infos.map(at::<HeatInfo>);
+    for info in [first, again, second] {
+        info.volume_id.set(u32::MAX);
+        info.measured_operations.set(u32::MAX);
+    }
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    let init = status(call_export("FsRtlHeatInit", &[infos[0], guid, 0]));
+    if disabled {
+        assert(init == Some(0xC000_0001) && first.volume_id.get() == 0 && first.measured_operations.get() == 0, "fsrtl-heat: TieredStorage\\Enabled=0 desliga o calor");
+    } else {
+        let same = status(call_export("FsRtlHeatInit", &[infos[1], guid, 0])) == Some(0);
+        let other = status(call_export("FsRtlHeatInit", &[infos[2], colliding, 0])) == Some(0);
+        assert(
+            init == Some(0) && first.volume_id.get() == 0x0C06_0609 && first.measured_operations.get() == measured && same && again.volume_id.get() == 0x0C06_0609 && other && second.volume_id.get() == 0x0C06_060A,
+            "fsrtl-heat: HeatInit registra o GUID, reusa o id e resolve colisao com id+1",
+        );
+        call_export("FsRtlHeatUninit", &[infos[1], guid]);
+        call_export("FsRtlHeatUninit", &[infos[0], guid]);
+        call_export("FsRtlHeatUninit", &[infos[2], colliding]);
+        let reused = status(call_export("FsRtlHeatInit", &[infos[2], colliding, 0])) == Some(0) && second.volume_id.get() == 0x0C06_0609;
+        call_export("FsRtlHeatUninit", &[infos[2], colliding]);
+        assert(reused, "fsrtl-heat: HeatUninit remove o volume na ultima referencia");
+    }
+
+    // FsRtlHeatLogIo: READ/WRITE/CLEANUP aceitos (provedor ETW desligado), outros majors rejeitados.
+    let packet = guest::alloc_bytes(nt::Irp::SIZE);
+    let location = guest::alloc_bytes(nt::IoStackLocation::SIZE);
+    at::<nt::Irp>(packet).tail.overlay.current_stack_location.set(location);
+    let majors = [(3u8, 0u32), (4, 0), (0x12, 0), (0, 0xC000_00F0), (0xE, 0xC000_00F0)].iter().all(|&(major, expected)| {
+        at::<nt::IoStackLocation>(location).major_function.set(major);
+        status(call_export("FsRtlHeatLogIo", &[infos[0], packet, 0, 0])) == Some(expected)
+    });
+    assert(majors, "fsrtl-heat: HeatLogIo aceita leitura, escrita e cleanup");
+    for pointer in [guid, colliding, infos[0], infos[1], infos[2], packet, location] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn fsrtl_oplock_ex_exports(assert: Assert) {
+    // Handle de oplock inicializado (NULL): nada a quebrar.
+    let handle = guest::alloc_bytes(8);
+    at::<nt::Field<u64>>(handle).set(0);
+    let packet = guest::alloc_bytes(nt::Irp::SIZE);
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    assert(
+        status(call_export("FsRtlCheckOplockEx2", &[handle, packet, 0, 0, 0, 0, 0, 0, 0, 0])) == Some(0)
+            && status(call_export("FsRtlCheckOplockEx2", &[handle, packet, 0x2, 0, 0, 0, 0, 0, 0, 0])) == Some(0),
+        "fsrtl-oplock-ex: CheckOplockEx2 sem oplock devolve STATUS_SUCCESS",
+    );
+    assert(status(call_export("FsRtlCheckOplockEx2", &[handle, packet, 0, 1, 0, 0, 0, 0, 0, 0])) == Some(0xC000_000D), "fsrtl-oplock-ex: FlagsEx2 nao zero e STATUS_INVALID_PARAMETER");
+    assert(
+        call_export("FsRtlOplockGetAnyBreakOwnerProcess", &[0]) == Some(0) && call_export("FsRtlOplockGetAnyBreakOwnerProcess", &[handle]) == Some(0),
+        "fsrtl-oplock-ex: sem bloco de oplock nao ha dono de quebra",
+    );
+    guest::free_bytes(handle);
+    guest::free_bytes(packet);
+}
+
+
+fn fsrtl_per_file_teardown_exports(assert: Assert) {
+    use crate::hal::amd64::win32_thunk;
+    use crate::ntos::inc::types::extra_fsrtl::FsrtlPerFileContext;
+    use crate::ntos::init::exports;
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+
+    // FreeCallback nativo observável: o trampolim de ExInitializeFastMutex grava
+    // Count = 1 no início do contexto que recebe (o FAST_MUTEX cabe em 0x40 bytes).
+    let Some(ResolvedImport::Thunk(id)) = exports::lookup("ntoskrnl.exe", "ExInitializeFastMutex") else {
+        assert(false, "fsrtl-per-file-teardown: ExInitializeFastMutex resolvido");
+        return;
+    };
+    let (table, _) = win32_thunk::thunk_table();
+    let callback = crate::ntos::mm::kernel_address::virtual_address(table + id as u64 * win32_thunk::STUB_SIZE).unwrap_or(0);
+
+    let support_address = guest::alloc_bytes(8);
+    let support = at::<nt::Field<u64>>(support_address);
+    let contexts = [guest::alloc_bytes(nt::FastMutex::SIZE), guest::alloc_bytes(nt::FastMutex::SIZE)];
+    for (index, &address) in contexts.iter().enumerate() {
+        let context = at::<FsrtlPerFileContext>(address);
+        context.owner_id.set(0xC0 + index as u64);
+        context.free_callback.set(callback);
+        call_export("FsRtlInsertPerFileContext", &[support_address, address]);
+    }
+    let populated = support.get() != 0;
+    call_export("FsRtlTeardownPerFileContexts", &[support_address]);
+    assert(
+        callback != 0 && populated && support.get() == 0 && contexts.iter().all(|&address| at::<nt::FastMutex>(address).count.get() == 1),
+        "fsrtl-per-file-teardown: esvazia a lista chamando cada FreeCallback e zera o ponteiro",
+    );
+    // Ponteiro já vazio: nada acontece.
+    call_export("FsRtlTeardownPerFileContexts", &[support_address]);
+    assert(support.get() == 0, "fsrtl-per-file-teardown: ponteiro NULL e no-op");
+    for pointer in [support_address, contexts[0], contexts[1]] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn fsrtl_tunnel_cache_exports(assert: Assert) {
+    use nt::extra_fs_fat::Tunnel;
+    let cache = guest::alloc_bytes(Tunnel::SIZE);
+    let tunnel = at::<Tunnel>(cache);
+    let block = guest::alloc_bytes(0x300);
+    let string = |address: u64, text: &str, maximum: u16| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        guest::write_bytes(address + 16, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let string = at::<nt::UnicodeString>(address);
+        string.length.set(units.len() as u16 * 2);
+        string.maximum_length.set(maximum.max(units.len() as u16 * 2));
+        string.buffer.set(address + 16);
+        address
+    };
+    let units = |address: u64| -> Vec<u16> {
+        let string = at::<nt::UnicodeString>(address);
+        guest::read_bytes(string.buffer.get(), string.length.get() as usize).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+    };
+    let text = |value: &str| -> Vec<u16> { value.encode_utf16().collect() };
+    let (short, long) = (string(block, "LONGFI~1.TXT", 0), string(block + 0x60, "LongFileName.txt", 0));
+    let data = block + 0x200;
+    at::<nt::Field<u64>>(data).set(0xDEAD_BEEF);
+
+    call_export("FsRtlInitializeTunnelCache", &[cache]);
+    assert(
+        tunnel.mutex.count.get() == 1 && tunnel.cache.get() == 0 && tunnel.timer_queue.flink.get() == tunnel.timer_queue.address() && tunnel.num_entries.get() == 0,
+        "fsrtl-tunnel-cache: Initialize (mutex, arvore, fila, contagem)",
+    );
+    let enabled = crate::ntos::fsrtl::tunnel::parameters().0 != 0;
+    // Chave pelo nome longo (KeyByShortName FALSE): achado pelo longo sem caixa.
+    call_export("FsRtlAddToTunnelCache", &[cache, 0x55, short, long, 0, 8, data]);
+    let (out_short, out_long, out_length, out_data) = (string(block + 0xC0, "", 0x40), string(block + 0x120, "", 0x40), block + 0x210, block + 0x218);
+    let (length_cell, data_cell) = (at::<nt::Field<u32>>(out_length), at::<nt::Field<u64>>(out_data));
+    let lookup = string(block + 0x180, "LONGFILENAME.TXT", 0);
+    let found = call_export("FsRtlFindInTunnelCache", &[cache, 0x55, lookup, out_short, out_long, out_length, out_data]);
+    if !enabled {
+        assert(found == Some(0), "fsrtl-tunnel-cache: tunelamento desligado pelo registro");
+    } else {
+        assert(
+            found == Some(1) && units(out_short) == text("LONGFI~1.TXT") && units(out_long) == text("LongFileName.txt") && length_cell.get() == 8 && data_cell.get() == 0xDEAD_BEEF && tunnel.num_entries.get() == 1,
+            "fsrtl-tunnel-cache: Add/Find devolvem nomes e dados",
+        );
+        // O nome curto não é a chave deste nó; outra DirKey também não acha.
+        assert(
+            call_export("FsRtlFindInTunnelCache", &[cache, 0x55, short, out_short, out_long, out_length, out_data]) == Some(0)
+                && call_export("FsRtlFindInTunnelCache", &[cache, 0x56, lookup, out_short, out_long, out_length, out_data]) == Some(0),
+            "fsrtl-tunnel-cache: chave e DirKey",
+        );
+        // KeyByShortName TRUE indexa pelo curto; DeleteKey limpa a DirKey toda.
+        call_export("FsRtlAddToTunnelCache", &[cache, 0x55, short, long, 1, 0, data]);
+        let by_short = call_export("FsRtlFindInTunnelCache", &[cache, 0x55, short, out_short, out_long, out_length, out_data]) == Some(1) && length_cell.get() == 0;
+        call_export("FsRtlDeleteKeyFromTunnelCache", &[cache, 0x55]);
+        assert(by_short && tunnel.num_entries.get() == 0, "fsrtl-tunnel-cache: KeyByShortName e DeleteKey");
+    }
+    call_export("FsRtlAddToTunnelCache", &[cache, 0x57, short, long, 0, 8, data]);
+    call_export("FsRtlDeleteTunnelCache", &[cache]);
+    assert(tunnel.num_entries.get() == 0 && call_export("FsRtlFindInTunnelCache", &[cache, 0x57, lookup, out_short, out_long, out_length, out_data]) == Some(0), "fsrtl-tunnel-cache: DeleteTunnelCache esvazia");
+    guest::free_bytes(cache);
+    guest::free_bytes(block);
+}
+
+
+fn fsrtl_tunnel_exports(assert: Assert) {
+    use crate::ntos::fsrtl::tunnel;
+    use crate::ntos::inc::types::extra_fs_fat::Tunnel;
+
+    let block = guest::alloc_bytes(Tunnel::SIZE);
+    let cache = at::<Tunnel>(block);
+    tunnel::initialize(block);
+    let (max_entries, _) = tunnel::parameters();
+    let strings = guest::alloc_bytes(0x200);
+    let short = unicode_at(strings, "FOO~1.TXT");
+    let long = unicode_at(strings + 0x40, "foolong.txt");
+    let lookup = unicode_at(strings + 0x80, "FOOLONG.TXT");
+    let data_address = guest::alloc_bytes(8);
+    let data = at::<nt::Field<u64>>(data_address);
+    data.set(0x1122_3344_5566_7788);
+    // Saídas: UNICODE_STRINGs com buffers próprios (Length 0, Maximum 0x40).
+    let out_short_address = guest::alloc_bytes(0x50);
+    let out_long_address = guest::alloc_bytes(0x50);
+    let (out_short, out_long) = (at::<nt::UnicodeString>(out_short_address), at::<nt::UnicodeString>(out_long_address));
+    let reset_out = || {
+        for (string, buffer) in [(out_short, out_short_address + 0x10), (out_long, out_long_address + 0x10)] {
+            string.length.set(0);
+            string.maximum_length.set(0x40);
+            string.buffer.set(buffer);
+        }
+    };
+    let out_data_address = guest::alloc_bytes(8);
+    let out_data = at::<nt::Field<u64>>(out_data_address);
+    let out_length_address = guest::alloc_bytes(4);
+    let out_length = at::<nt::Field<u32>>(out_length_address);
+    let units = |string: &nt::UnicodeString| -> Vec<u16> {
+        guest::read_bytes(string.buffer.get(), string.length.get() as usize).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+    };
+    let text = |value: &str| -> Vec<u16> { value.encode_utf16().collect() };
+    let find = |directory: u64, name: u64, flags: u64| call_export("FsRtlFindInTunnelCacheEx", &[block, directory, name, out_short_address, out_long_address, flags, out_length_address, out_data_address]);
+
+    call_export("FsRtlAddToTunnelCacheEx", &[block, 7, short, long, 0, 8, data_address]);
+    reset_out();
+    let found = find(7, lookup, 0);
+    if max_entries == 0 {
+        assert(found == Some(0) && cache.num_entries.get() == 0, "fsrtl-tunnel: MaximumTunnelEntries/Age zero desliga o tunelamento");
+    } else {
+        assert(
+            found == Some(1)
+                && units(out_short) == text("FOO~1.TXT")
+                && units(out_long) == text("foolong.txt")
+                && out_length.get() == 8
+                && out_data.get() == 0x1122_3344_5566_7788
+                && cache.num_entries.get() == 1,
+            "fsrtl-tunnel: Find sem caixa devolve nomes curto/longo e dados",
+        );
+        assert(find(7, lookup, 1) == Some(0) && find(8, long, 0) == Some(0), "fsrtl-tunnel: com caixa ou outra DirKey nao acha");
+        // Mesma chave substitui o nó; chave pelo nome curto (Flags 2) convive.
+        data.set(0x99);
+        call_export("FsRtlAddToTunnelCacheEx", &[block, 7, short, long, 0, 8, data_address]);
+        call_export("FsRtlAddToTunnelCacheEx", &[block, 7, short, long, 2, 0, data_address]);
+        reset_out();
+        let replaced = find(7, long, 0) == Some(1) && out_data.get() == 0x99;
+        reset_out();
+        let by_short = find(7, short, 0) == Some(1) && out_length.get() == 0;
+        assert(replaced && by_short && cache.num_entries.get() == 2, "fsrtl-tunnel: Add substitui a mesma chave e indexa pelo nome curto");
+        // Buffer longo pequeno: o NT aloca um novo do tamanho exato.
+        out_long.length.set(0);
+        out_long.maximum_length.set(4);
+        let small_buffer = out_long.buffer.get();
+        let grown = find(7, long, 0) == Some(1) && out_long.buffer.get() != small_buffer && out_long.maximum_length.get() == 22 && units(out_long) == text("foolong.txt");
+        assert(grown, "fsrtl-tunnel: LongName pequeno ganha buffer novo");
+        let _ = tunnel::delete_key(block, 7);
+        assert(cache.num_entries.get() == 0, "fsrtl-tunnel: DeleteKey remove todos os nos da DirKey");
+    }
+    tunnel::delete_cache(block);
+    for pointer in [block, strings, data_address, out_short_address, out_long_address, out_data_address, out_length_address] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn fsrtl_file_lock_irp_exports(assert: Assert) {
+    // IRP sintético de uma posição com IO_STACK_LOCATION de LOCK_CONTROL/READ.
+    let file_lock = call_export("FsRtlAllocateFileLock", &[0, 0]).unwrap_or(0);
+    let file_object = guest::alloc_bytes(nt::FileObject::SIZE);
+    let irp = guest::alloc_bytes(nt::Irp::SIZE + nt::IoStackLocation::SIZE);
+    let stack_address = irp + nt::Irp::SIZE;
+    let length = guest::alloc_bytes(nt::LargeInteger::SIZE);
+    let (packet, stack, length_cell) = (at::<nt::Irp>(irp), at::<nt::IoStackLocation>(stack_address), at::<nt::LargeInteger>(length));
+    let setup = |minor: u8, flags: u8, offset: u64, bytes: u64, key: u32| {
+        guest::write_bytes(irp, &alloc::vec![0u8; (nt::Irp::SIZE + nt::IoStackLocation::SIZE) as usize]);
+        packet.type_.set(6);
+        packet.stack_count.set(1);
+        packet.current_location.set(1);
+        packet.tail.overlay.current_stack_location.set(stack_address);
+        packet.tail.overlay.thread.set(crate::ntos::ps::process::get_current_thread());
+        stack.major_function.set(0x11);
+        stack.minor_function.set(minor);
+        stack.flags.set(flags);
+        length_cell.quad_part.set(bytes as i64);
+        if minor == 0 {
+            stack.parameters.read.length.set(bytes as u32);
+            stack.parameters.read.key.set(key);
+            stack.parameters.read.byte_offset.quad_part.set(offset as i64);
+        } else {
+            stack.parameters.lock_control.length.set(length);
+            stack.parameters.lock_control.key.set(key);
+            stack.parameters.lock_control.byte_offset.quad_part.set(offset as i64);
+        }
+        stack.file_object.set(file_object);
+    };
+    // Sem LockInformation: tudo liberado, nada em andamento ou esperando.
+    setup(0, 0, 0, 0x100, 0);
+    assert(
+        call_export("FsRtlCheckLockForReadAccess", &[file_lock, irp]) == Some(1)
+            && call_export("FsRtlCheckLockForWriteAccess", &[file_lock, irp]) == Some(1)
+            && call_export("FsRtlAreThereCurrentOrInProgressFileLocks", &[file_lock]) == Some(0)
+            && call_export("FsRtlAreThereWaitingFileLocks", &[file_lock]) == Some(0)
+            && call_export("FsRtlAreThereWaitingFileLocks", &[0]) == Some(0),
+        "fsrtl-file-lock-irp: FILE_LOCK vazio",
+    );
+    // IRP_MN_LOCK exclusivo e imediato em [0x1000, 0x1100): concedido (o IRP é concluído).
+    setup(1, 3, 0x1000, 0x100, 9);
+    let locked = call_export("FsRtlProcessFileLock", &[file_lock, irp, 0]);
+    assert(locked == Some(0) && call_export("FsRtlAreThereCurrentOrInProgressFileLocks", &[file_lock]) == Some(1), "fsrtl-file-lock-irp: IRP_MN_LOCK concede");
+    // Leitura de outro FILE_OBJECT sobreposta: bloqueada; abaixo de LowestLockOffset: livre.
+    let other = guest::alloc_bytes(nt::FileObject::SIZE);
+    setup(0, 0, 0x1080, 0x10, 9);
+    stack.file_object.set(other);
+    let blocked = call_export("FsRtlCheckLockForReadAccess", &[file_lock, irp]);
+    setup(0, 0, 0, 0x100, 9);
+    stack.file_object.set(other);
+    let below = call_export("FsRtlCheckLockForWriteAccess", &[file_lock, irp]);
+    assert(blocked == Some(0) && below == Some(1), "fsrtl-file-lock-irp: CheckLockForRead/WriteAccess");
+    // Oplock: tamanho que cobre a trava -> FALSE; abaixo dela -> TRUE.
+    length_cell.quad_part.set(0x2000);
+    let covered = call_export("FsRtlCheckLockForOplockRequest", &[file_lock, length]);
+    length_cell.quad_part.set(0x800);
+    assert(covered == Some(0) && call_export("FsRtlCheckLockForOplockRequest", &[file_lock, length]) == Some(1), "fsrtl-file-lock-irp: CheckLockForOplockRequest");
+    // IRP_MN_UNLOCK_SINGLE exato; IRP_MN_UNLOCK_ALL sem travas -> RANGE_NOT_LOCKED; minor 9 -> INVALID_DEVICE_REQUEST.
+    setup(2, 0, 0x1000, 0x100, 9);
+    let unlocked = call_export("FsRtlProcessFileLock", &[file_lock, irp, 0]);
+    setup(3, 0, 0, 0, 0);
+    let none = call_export("FsRtlProcessFileLock", &[file_lock, irp, 0]).map(|status| status as u32);
+    setup(9, 0, 0, 0, 0);
+    let invalid = call_export("FsRtlProcessFileLock", &[file_lock, irp, 0]).map(|status| status as u32);
+    assert(
+        unlocked == Some(0)
+            && none == Some(0xC000_007E)
+            && invalid == Some(0xC000_0010)
+            && packet.io_status.status.get() as u32 == 0xC000_0010
+            && call_export("FsRtlAreThereCurrentOrInProgressFileLocks", &[file_lock]) == Some(0),
+        "fsrtl-file-lock-irp: UNLOCK_SINGLE, UNLOCK_ALL e minor invalido",
+    );
+    call_export("FsRtlFreeFileLock", &[file_lock]);
+    for block in [file_object, other, irp, length] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn fsrtl_notify_exports(assert: Assert) {
+    use nt::extra_fs_fat::FileNotifyInformation;
+    let block = guest::alloc_bytes(0x400);
+    let (sync_cell, list_address, file, out) = (block, block + 0x10, block + 0x40, block + 0x300);
+    let sync_slot = at::<nt::Field<u64>>(sync_cell);
+    let list = at::<nt::ListEntry>(list_address);
+    list.flink.set(list_address);
+    list.blink.set(list_address);
+    let unicode = |address: u64, text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        guest::write_bytes(address + 16, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let string = at::<nt::UnicodeString>(address);
+        string.length.set(units.len() as u16 * 2);
+        string.maximum_length.set(units.len() as u16 * 2);
+        string.buffer.set(address + 16);
+        address
+    };
+    let directory = unicode(block + 0x200, "\\dir");
+    let target = unicode(block + 0x240, "\\dir\\a.txt");
+    guest::write_bytes(file, &alloc::vec![0u8; nt::FileObject::SIZE as usize]);
+    let irp = guest::alloc_bytes(nt::Irp::SIZE + nt::IoStackLocation::SIZE);
+    let (packet, stack) = (at::<nt::Irp>(irp), at::<nt::IoStackLocation>(irp + nt::Irp::SIZE));
+    let new_irp = || {
+        guest::write_bytes(irp, &alloc::vec![0u8; (nt::Irp::SIZE + nt::IoStackLocation::SIZE) as usize]);
+        packet.type_.set(6);
+        packet.stack_count.set(1);
+        packet.current_location.set(1);
+        packet.tail.overlay.current_stack_location.set(stack.address());
+        packet.user_buffer.set(out);
+        packet.tail.overlay.thread.set(crate::ntos::ps::process::get_current_thread());
+        stack.major_function.set(0x0C);
+        stack.minor_function.set(2);
+        stack.parameters.notify_directory.length.set(0x100);
+        stack.file_object.set(file);
+    };
+    let record = at::<FileNotifyInformation>(out);
+    call_export("FsRtlNotifyInitializeSync", &[sync_cell]);
+    let sync = sync_slot.get();
+    assert(sync != 0 && at::<nt::FastMutex>(sync).count.get() == 1, "fsrtl-notify: InitializeSync aloca a FAST_MUTEX");
+
+    // Pedido pendente: o NOTIFY_CHANGE entra na lista e o IRP na fila dele
+    // (Irp->IoStatus.Information aponta o NOTIFY_CHANGE; o elo do IRP está ligado).
+    new_irp();
+    call_export("FsRtlNotifyFullChangeDirectory", &[sync, list_address, 0x1234, directory, 0, 0, 1, irp, 0, 0]);
+    let irp_link = &packet.tail.overlay.list_entry;
+    let queued = irp_link.flink.get() != 0 && at::<nt::ListEntry>(irp_link.blink.get()).flink.get() == irp_link.address();
+    assert(
+        packet.io_status.information.get() != 0 && list.flink.get() != list_address && queued && stack.control.get() & 1 != 0,
+        "fsrtl-notify: FullChangeDirectory enfileira o IRP",
+    );
+
+    // Mudança no diretório: o IRP conclui com um FILE_NOTIFY_INFORMATION "a.txt".
+    call_export("FsRtlNotifyFullReportChange", &[sync, list_address, target, 10, 0, 0, 1, 1, 0]);
+    let name = |count: u64| -> Vec<u16> { (0..count).map(|index| at::<nt::Field<u16>>(record.file_name[0].address() + index * 2).get()).collect() };
+    assert(
+        packet.io_status.status.get() == 0
+            && packet.io_status.information.get() == 24
+            && record.next_entry_offset.get() == 0
+            && record.action.get() == 1
+            && record.file_name_length.get() == 10
+            && name(5) == "a.txt".encode_utf16().collect::<Vec<u16>>(),
+        "fsrtl-notify: FullReportChange conclui com o registro relativo",
+    );
+
+    // Filtro que não casa não acumula; o que casa sem IRP fica guardado e sai,
+    // sozinho, no próximo pedido.
+    call_export("FsRtlNotifyFullReportChange", &[sync, list_address, target, 10, 0, 0, 0x10, 3, 0]);
+    call_export("FsRtlNotifyFullReportChange", &[sync, list_address, target, 10, 0, 0, 1, 2, 0]);
+    new_irp();
+    record.action.set(0);
+    call_export("FsRtlNotifyFullChangeDirectory", &[sync, list_address, 0x1234, directory, 0, 0, 1, irp, 0, 0]);
+    assert(
+        packet.io_status.status.get() == 0 && record.action.get() == 2 && record.next_entry_offset.get() == 0,
+        "fsrtl-notify: mudanca acumulada sai no proximo pedido",
+    );
+
+    // Cleanup: o IRP pendente volta STATUS_NOTIFY_CLEANUP e a lista esvazia.
+    new_irp();
+    call_export("FsRtlNotifyFullChangeDirectory", &[sync, list_address, 0x1234, directory, 0, 0, 1, irp, 0, 0]);
+    call_export("FsRtlNotifyCleanup", &[sync, list_address, 0x1234]);
+    assert(packet.io_status.status.get() as u32 == 0x10B && list.flink.get() == list_address, "fsrtl-notify: Cleanup conclui e retira");
+    call_export("FsRtlNotifyUninitializeSync", &[sync_cell]);
+    assert(sync_slot.get() == 0, "fsrtl-notify: UninitializeSync");
+    guest::free_bytes(irp);
+    guest::free_bytes(block);
+}
+
+
+fn fsrtl_volume_support_exports(assert: Assert) {
+    let block = guest::alloc_bytes(0x200);
+    let unicode = |address: u64, text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        guest::write_bytes(address + 16, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let string = at::<nt::UnicodeString>(address);
+        string.length.set(units.len() as u16 * 2);
+        string.maximum_length.set(units.len() as u16 * 2);
+        string.buffer.set(address + 16);
+        address
+    };
+    // AreNamesEqual: com e sem caixa.
+    let (a, b, c) = (unicode(block, "File.Txt"), unicode(block + 0x40, "FILE.TXT"), unicode(block + 0x80, "FILE.TXu"));
+    assert(
+        call_export("FsRtlAreNamesEqual", &[a, b, 0, 0]) == Some(0) && call_export("FsRtlAreNamesEqual", &[a, b, 1, 0]) == Some(1) && call_export("FsRtlAreNamesEqual", &[a, c, 1, 0]) == Some(0),
+        "fsrtl-volume-support: FsRtlAreNamesEqual",
+    );
+    // IsFatDbcsLegal: 8.3 legal, base longa, extensão longa, espaço antes do ponto, curinga, caminho.
+    let ansi = |text: &[u8]| {
+        let address = block + 0x100;
+        guest::write_bytes(address + 16, text);
+        let string = at::<nt::String>(address);
+        string.length.set(text.len() as u16);
+        string.maximum_length.set(text.len() as u16);
+        string.buffer.set(address + 16);
+        address
+    };
+    let legal = |text: &[u8], wild: u64, path: u64, lead: u64| call_export("FsRtlIsFatDbcsLegal", &[ansi(text), wild, path, lead]);
+    assert(
+        legal(b"README.TXT", 0, 0, 0) == Some(1)
+            && legal(b"LONGNAME1.TXT", 0, 0, 0) == Some(0)
+            && legal(b"A.TEXT", 0, 0, 0) == Some(0)
+            && legal(b"A .TXT", 0, 0, 0) == Some(0)
+            && legal(b"A*.TXT", 0, 0, 0) == Some(0)
+            && legal(b"A*.TXT", 1, 0, 0) == Some(1)
+            && legal(b"\\DIR\\FILE.TXT", 0, 1, 1) == Some(1)
+            && legal(b"\\DIR\\FILE.TXT", 0, 1, 0) == Some(0)
+            && legal(b"NAME.", 0, 0, 0) == Some(0),
+        "fsrtl-volume-support: FsRtlIsFatDbcsLegal",
+    );
+    // DismountComplete conta só sucesso; UpdateDiskCounters soma em KPRCB.FsCounters.
+    let shared = at::<nt::KuserSharedData>(crate::ntos::mm::shared_user_data::frame());
+    let before = shared.dismount_count.get();
+    call_export("FsRtlDismountComplete", &[0, 0]);
+    call_export("FsRtlDismountComplete", &[0, 0xC000_0001]);
+    let counters = &at::<nt::Kpcr>(crate::ntos::ke::pcr::get_pcr_address()).prcb.fs_counters;
+    let (read, written) = (counters.fs_bytes_read.get(), counters.fs_bytes_written.get());
+    call_export("FsRtlUpdateDiskCounters", &[0x200, 0x400]);
+    assert(
+        shared.dismount_count.get() == before + 1
+            && counters.fs_bytes_read.get() == read + 0x200
+            && counters.fs_bytes_written.get() == written + 0x400
+            && call_export("FsRtlAreVolumeStartupApplicationsComplete", &[]) == Some(0),
+        "fsrtl-volume-support: DismountComplete, UpdateDiskCounters e startup",
+    );
+    // Teardown: cabeçalho avançado (Version 1) com um contexto cujo FreeCallback conta.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use nt::extra_fsrtl::{FsrtlAdvancedFcbHeader, FsrtlPerStreamContext};
+    static FREED: AtomicU64 = AtomicU64::new(0);
+    extern "win64" fn free_context(context: u64) {
+        FREED.store(context, Ordering::SeqCst);
+    }
+    let callback = {
+        let pointer = free_context as extern "win64" fn(u64) as usize as u64;
+        crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer)
+    };
+    let header_address = guest::alloc_bytes(FsrtlAdvancedFcbHeader::SIZE);
+    let context_address = guest::alloc_bytes(FsrtlPerStreamContext::SIZE);
+    let (header, context) = (at::<FsrtlAdvancedFcbHeader>(header_address), at::<FsrtlPerStreamContext>(context_address));
+    let head = header.filter_contexts.address();
+    header.flags2.set(2);
+    header.set_version(1);
+    header.filter_contexts.flink.set(context_address);
+    header.filter_contexts.blink.set(context_address);
+    context.links.flink.set(head);
+    context.links.blink.set(head);
+    context.free_callback.set(callback);
+    call_export("FsRtlTeardownPerStreamContexts", &[header_address]);
+    assert(
+        FREED.load(Ordering::SeqCst) == context_address && header.filter_contexts.flink.get() == head && header.push_lock.get() == 0,
+        "fsrtl-volume-support: FsRtlTeardownPerStreamContexts",
+    );
+    // CreateSectionForDataScan: proteção e atributos validados antes de tocar no arquivo.
+    let file = guest::alloc_bytes(nt::FileObject::SIZE);
+    let out = guest::alloc_bytes(0x18);
+    let status = |protection: u64, allocation: u64| call_export("FsRtlCreateSectionForDataScan", &[out, out + 8, 0, file, 0xF001F, 0, 0, protection, allocation, 0]).map(|value| value as u32);
+    assert(
+        status(0x40, 0x800_0000) == Some(0xC000_00F6) && status(2, 0x100_0000) == Some(0xC000_00F7) && status(2, 0x800_0000) == Some(0xC000_0020),
+        "fsrtl-volume-support: FsRtlCreateSectionForDataScan valida protecao, atributos e SectionObjectPointer",
+    );
+    for allocation in [block, header_address, context_address, file, out] {
+        guest::free_bytes(allocation);
+    }
+}
+
+
+fn ex_auto_expand_push_lock_exports(assert: Assert) {
+    use nt::extra_fs_ntfs::ExPushLockAutoExpand;
+
+    let lock = guest::alloc_bytes(ExPushLockAutoExpand::SIZE);
+    let body = at::<ExPushLockAutoExpand>(lock);
+    body.local_lock.value.set(0xDEAD);
+    body.state.set(0xFFFF_FFFF);
+    body.stats.set(0xFFFF_FFFF);
+    call_export("ExInitializeAutoExpandPushLock", &[lock, 0]);
+    assert(
+        body.local_lock.value.get() == 0 && body.state.get() == 4 && body.pageable() == 1 && body.stats.get() == 0,
+        "ex-auto-expand: Initialize paginavel -> State = Pageable (4)",
+    );
+    call_export("ExInitializeAutoExpandPushLock", &[lock, 1]);
+    assert(body.state.get() == 0, "ex-auto-expand: Initialize NONPAGED -> State = 0");
+
+    // Compartilhado: token = Lock | 1 (LocalLock) | 2 (AutoBoost, sem o flag 2).
+    let token = call_export("ExAcquireAutoExpandPushLockShared", &[lock, 0]);
+    assert(token == Some(lock | 3) && body.local_lock.value.get() == 0x11, "ex-auto-expand: AcquireShared devolve Lock|3 e trava LocalLock compartilhado");
+    let second = call_export("ExAcquireAutoExpandPushLockShared", &[lock, 2]);
+    assert(second == Some(lock | 1) && body.local_lock.value.get() == 0x21, "ex-auto-expand: segundo leitor com flag 2 -> Lock|1");
+    call_export("ExReleaseAutoExpandPushLockShared", &[lock | 1, 2]);
+    call_export("ExReleaseAutoExpandPushLockShared", &[lock | 3, 0]);
+    assert(body.local_lock.value.get() == 0, "ex-auto-expand: ReleaseShared solta os dois leitores");
+
+    // Exclusivo.
+    call_export("ExAcquireAutoExpandPushLockExclusive", &[lock, 0]);
+    assert(body.local_lock.locked() == 1 && body.local_lock.value.get() == 1, "ex-auto-expand: AcquireExclusive trava LocalLock");
+    call_export("ExReleaseAutoExpandPushLockExclusive", &[lock, 0]);
+    assert(body.local_lock.value.get() == 0 && call_export("ExCleanupAutoExpandPushLock", &[lock]) == Some(0), "ex-auto-expand: ReleaseExclusive e Cleanup sem leque");
+    guest::free_bytes(lock);
+}
+
+
+fn ex_resource_owner_exports(assert: Assert) {
+    use crate::ntos::ex::resource;
+    use crate::ntos::ps::process;
+
+    let res = guest::alloc_bytes(nt::Eresource::SIZE);
+    let body = at::<nt::Eresource>(res);
+    let entry = &body.owner_entry;
+    let thread = process::get_current_thread();
+    let refs = || process::thread_reference_count(thread);
+    assert(call_export("ExInitializeResourceLite", &[res]) == Some(0), "ex-resource-owner: recurso inicializado");
+    // O NT exige APCs normais desligadas em volta de ExAcquireResource*.
+    call_export("KeEnterCriticalRegion", &[]);
+
+    // Compartilhado, FLAG_OWNER_POINTER_IS_THREAD: a entrada passa a Thread|3, com
+    // OwnerReferenced e uma referência na thread que a liberação final devolve.
+    let before = refs();
+    call_export("ExAcquireResourceSharedLite", &[res, 1]);
+    call_export("ExSetResourceOwnerPointerEx", &[res, thread | 3, resource::OWNER_POINTER_IS_THREAD as u64]);
+    assert(
+        entry.owner_thread.get() == thread | 3 && entry.owner_count() == 1 && entry.owner_referenced() == 1 && refs() == before.map(|count| count + 1),
+        "ex-resource-owner: posse compartilhada transferida para Thread|3 com referencia",
+    );
+    call_export("ExReleaseResourceForThreadLite", &[res, thread | 3]);
+    assert(entry.owner_thread.get() == 0 && body.active_entries.get() == 0 && refs() == before, "ex-resource-owner: liberacao pelo ponteiro dono devolve a referencia");
+
+    // Compartilhado sem flag e fusão: P já é dono (2) e recebe a entrada nova da thread (1).
+    let owner = 0x2003u64;
+    call_export("ExAcquireResourceSharedLite", &[res, 1]);
+    call_export("ExAcquireResourceSharedLite", &[res, 1]);
+    call_export("ExSetResourceOwnerPointerEx", &[res, owner, 0]);
+    call_export("ExAcquireResourceSharedLite", &[res, 1]);
+    assert(body.active_entries.get() == 2, "ex-resource-owner: P e a thread corrente sao donos distintos");
+    call_export("ExSetResourceOwnerPointerEx", &[res, owner, 0]);
+    assert(entry.owner_thread.get() == owner && entry.owner_count() == 3 && body.active_entries.get() == 1, "ex-resource-owner: entradas fundidas em P (contagem 3, ActiveEntries 1)");
+    for _ in 0..3 {
+        call_export("ExReleaseResourceForThreadLite", &[res, owner]);
+    }
+    assert(body.active_entries.get() == 0, "ex-resource-owner: P libera as tres posses");
+
+    // Exclusivo sem flag: a thread deixa de ser a dona exclusiva.
+    call_export("ExAcquireResourceExclusiveLite", &[res, 1]);
+    call_export("ExSetResourceOwnerPointerEx", &[res, 0x1003, 0]);
+    assert(entry.owner_thread.get() == 0x1003 && call_export("ExIsResourceAcquiredExclusiveLite", &[res]) == Some(0), "ex-resource-owner: posse exclusiva transferida");
+    call_export("ExReleaseResourceForThreadLite", &[res, 0x1003]);
+    call_export("KeLeaveCriticalRegion", &[]);
+    assert(body.active_entries.get() == 0 && call_export("ExDeleteResourceLite", &[res]) == Some(0), "ex-resource-owner: liberado pelo novo dono e apagado");
+    guest::free_bytes(res);
+}
+
+
+fn ex_resource_owner_and_local_time_exports(assert: Assert) {
+    // ExLocalTimeToSystemTime desfaz o ExSystemTimeToLocalTime (mesmo viés).
+    let times = guest::alloc_bytes(0x18);
+    let time = |index: u64| at::<nt::LargeInteger>(times + index * 8);
+    time(0).quad_part.set(0x01D9_0000_1234_5678);
+    call_export("ExSystemTimeToLocalTime", &[times, times + 8]);
+    call_export("ExLocalTimeToSystemTime", &[times + 8, times + 0x10]);
+    assert(time(2).quad_part.get() == 0x01D9_0000_1234_5678, "ex-local-time: ExLocalTimeToSystemTime inverte ExSystemTimeToLocalTime");
+
+    // ExSetResourceOwnerPointer: a posse exclusiva passa ao ponteiro (bits baixos 3)
+    // e o ExReleaseResourceForThreadLite com esse ponteiro a devolve.
+    let resource = guest::alloc_bytes(nt::Eresource::SIZE);
+    let body = at::<nt::Eresource>(resource);
+    call_export("ExInitializeResourceLite", &[resource]);
+    call_export("KeEnterCriticalRegion", &[]);
+    call_export("ExAcquireResourceExclusiveLite", &[resource, 1]);
+    let owner = (times + 0x10) | 3;
+    call_export("ExSetResourceOwnerPointer", &[resource, owner]);
+    let transferred = body.owner_entry.owner_thread.get() == owner;
+    call_export("ExReleaseResourceForThreadLite", &[resource, owner]);
+    call_export("KeLeaveCriticalRegion", &[]);
+    assert(transferred && body.active_entries.get() == 0 && body.owner_entry.owner_thread.get() == 0, "ex-resource-owner: ExSetResourceOwnerPointer transfere a posse exclusiva");
+    call_export("ExDeleteResourceLite", &[resource]);
+    guest::free_bytes(resource);
+    guest::free_bytes(times);
+}
+
+
+fn ex_cache_aware_push_locks_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_fs_fat::{ExPushLockCacheAware, ExPushLockCacheAwarePadded};
+    use crate::ntos::inc::types::ExPushLock;
+    // Pool paginado (Flags=0): 32 slots de 0x80 num bloco, Single = 1, ParentLock = tabela.
+    let address = call_export("ExAllocateCacheAwarePushLock", &[0]).unwrap_or(0);
+    assert(address != 0, "ex-cache-aware-push-locks: Allocate devolve a tabela");
+    if address == 0 {
+        return;
+    }
+    let table = at::<ExPushLockCacheAware>(address);
+    let slot = |index: usize| at::<ExPushLockCacheAwarePadded>(table.locks[index].get());
+    let first = table.locks[0].get();
+    let layout = (0..32).all(|index| {
+        let padded = slot(index);
+        table.locks[index].get() == first + index as u64 * 0x80 && padded.lock.value.get() == 0 && padded.single.get() == 1 && padded.parent_lock.get() == address
+    });
+    assert(layout, "ex-cache-aware-push-locks: 32 slots de 0x80 com Single e ParentLock");
+
+    // Exclusivo: os 32 EX_PUSH_LOCK com LOCKED; liberar zera todos.
+    call_export("ExAcquireCacheAwarePushLockExclusive", &[address]);
+    let all_locked = (0..32).all(|index| slot(index).lock.value.get() & 1 == 1);
+    call_export("ExReleaseCacheAwarePushLockExclusive", &[address]);
+    let all_free = (0..32).all(|index| slot(index).lock.value.get() == 0);
+    assert(all_locked && all_free, "ex-cache-aware-push-locks: exclusivo trava e solta todos os slots");
+
+    // Compartilhado: devolve o slot da CPU com um leitor (0x11); os demais livres.
+    let lock = call_export("ExAcquireCacheAwarePushLockSharedEx", &[address, 0]).unwrap_or(0);
+    let index = (0..32).find(|&index| table.locks[index].get() == lock);
+    let shared_word = if lock != 0 { at::<ExPushLock>(lock).value.get() } else { 0 };
+    let others_free = (0..32).filter(|&other| Some(other) != index).all(|other| slot(other).lock.value.get() == 0);
+    assert(index.is_some() && shared_word == 0x11 && others_free, "ex-cache-aware-push-locks: SharedEx trava so o slot da CPU");
+    call_export("ExReleaseCacheAwarePushLockSharedEx", &[lock, 0]);
+    assert(lock != 0 && at::<ExPushLock>(lock).value.get() == 0, "ex-cache-aware-push-locks: ReleaseSharedEx solta o slot");
+    call_export("ExFreePool", &[first]);
+    call_export("ExFreePool", &[address]);
+}
+
+
+fn io_file_object_extensions_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_io::IrpExtensionField;
+    let out = guest::alloc_bytes(0x10);
+    let status = |value: Option<u64>| value.map(|status| status as u32);
+
+    // IRP sem extensão: os getters/setters de zeroing offset não acham o tipo 4.
+    let irp = call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    assert(
+        irp != 0 && status(call_export("IoGetFsZeroingOffset", &[irp, out])) == Some(0xC000_0225) && status(call_export("IoSetFsZeroingOffset", &[irp, 5])) == Some(0xC000_0225),
+        "io-file-object-extensions: zeroing offset ausente",
+    );
+    // Required aloca IOP_IRP_EXTENSION ('IrpX'): AllocationFlags 0x40, TypesAllocated = 1<<4.
+    let required = call_export("IoSetFsZeroingOffsetRequired", &[irp]);
+    let packet = at::<nt::Irp>(irp);
+    let extension = packet.irp_extension().get();
+    assert(
+        required == Some(0) && packet.allocation_flags.get() & 0x40 != 0 && extension != 0 && at::<nt::extra_fs_ntfs::IopIrpExtension>(extension).types_allocated.get() == 0x10 && at::<nt::extra_fs_ntfs::IopIrpExtension>(extension).extension_flags.get() & 1 == 1,
+        "io-file-object-extensions: IoSetFsZeroingOffsetRequired aloca o tipo 4",
+    );
+    assert(status(call_export("IoSetFsZeroingOffsetRequired", &[irp])) == Some(0xC000_0021), "io-file-object-extensions: Required duas vezes = ALREADY_COMMITTED");
+    call_export("IoSetFsZeroingOffset", &[irp, 0x1234]);
+    at::<nt::Field<u32>>(out).set(0);
+    assert(call_export("IoGetFsZeroingOffset", &[irp, out]) == Some(0) && at::<nt::Field<u32>>(out).get() == 0x1234, "io-file-object-extensions: Set/Get zeroing offset");
+    // Track offset divide a união com o tipo 4: combinação inválida.
+    assert(status(call_export("IoSetFsTrackOffsetState", &[irp, 0xAA, 0xBB])) == Some(0xC000_00BB), "io-file-object-extensions: track offset nao convive com zeroing");
+    assert(status(call_export("IoGetCopyInformationExtension", &[irp, out])) == Some(0xC000_0225), "io-file-object-extensions: sem CopyInformation");
+    call_export("IoFreeIrp", &[irp]);
+
+    // IRP limpo: track offset grava blob (+0x28) e offset (+0x30).
+    let second = call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    let tracked = call_export("IoSetFsTrackOffsetState", &[second, 0xAA, 0xBB]);
+    let extension = at::<nt::extra_fs_ntfs::IopIrpExtension>(at::<nt::Irp>(second).irp_extension().get());
+    assert(
+        tracked == Some(0) && extension.types_allocated.get() == 0x20 && extension.fs_track_offset_blob.get() == 0xAA && extension.fs_tracked_offset.get() == 0xBB,
+        "io-file-object-extensions: IoSetFsTrackOffsetState",
+    );
+    call_export("IoFreeIrp", &[second]);
+
+    // FILE_OBJECT: sem extensão -> 0; com extensão -> PerType[0] e PerType[7]->Silo.
+    let file = guest::alloc_bytes(nt::FileObject::SIZE);
+    let empty = call_export("IoGetTransactionParameterBlock", &[file]) == Some(0) && call_export("IoGetSilo", &[file]) == Some(0);
+    let file_extension = guest::alloc_bytes(nt::IopFileObjectExtension::SIZE);
+    let silo_context = guest::alloc_bytes(0x10);
+    at::<nt::IopFileObjectExtension>(file_extension).fo_ext_per_type_extension[0].set(0x5555);
+    at::<nt::Field<u64>>(silo_context + 8).set(0x7777);
+    at::<nt::IopFileObjectExtension>(file_extension).fo_ext_per_type_extension[7].set(silo_context);
+    at::<nt::FileObject>(file).file_object_extension.set(file_extension);
+    assert(
+        empty && call_export("IoGetTransactionParameterBlock", &[file]) == Some(0x5555) && call_export("IoGetSilo", &[file]) == Some(0x7777),
+        "io-file-object-extensions: TxnParameterBlock e silo da extensao do FILE_OBJECT",
+    );
+    for block in [file, file_extension, silo_context, out] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn io_priority_exports(assert: Assert) {
+    let thread_address = crate::ntos::ps::process::get_current_thread();
+    let thread = at::<nt::Ethread>(thread_address);
+    let (saved, saved_boost) = (thread.cross_thread_flags.get(), thread.io_boost_count.get());
+    let info_address = guest::alloc_bytes(nt::extra_fs_fat::IoPriorityInfo::SIZE);
+    let output_address = guest::alloc_bytes(nt::extra_fs_fat::IoPriorityInfo::SIZE);
+    let (info, output) = (at::<nt::extra_fs_fat::IoPriorityInfo>(info_address), at::<nt::extra_fs_fat::IoPriorityInfo>(output_address));
+
+    // Dica na thread: ThreadIoPriority; 5 é inválido.
+    let set = call_export("IoSetIoPriorityHintIntoThread", &[thread_address, 1]);
+    let invalid = call_export("IoSetIoPriorityHintIntoThread", &[thread_address, 5]).map(|status| status as u32);
+    assert(set == Some(0) && thread.thread_io_priority() == 1 && invalid == Some(0xC000_000D), "io-priority: IoSetIoPriorityHintIntoThread");
+
+    // Só a thread: IoPriority da thread (1, sem IoBoostCount), base e página.
+    thread.io_boost_count.set(0);
+    call_export("IoRetrievePriorityInfo", &[0, 0, thread_address, info_address]);
+    let base = thread.tcb.base_priority.get() as i32 as u32;
+    assert(info.io_priority.get() == 1 && info.thread_priority.get() == base && info.page_priority.get() == thread.thread_page_priority(), "io-priority: IoRetrievePriorityInfo da thread");
+    // Sem IRP, arquivo nem thread: Normal e -1/-1.
+    call_export("IoRetrievePriorityInfo", &[0, 0, 0, info_address]);
+    assert(info.io_priority.get() == 2 && info.thread_priority.get() == u32::MAX && info.page_priority.get() == u32::MAX, "io-priority: IoRetrievePriorityInfo vazio");
+
+    // IRP com dica 3 (Flags bits 17..19 = 4) vence a thread.
+    let irp_address = guest::alloc_bytes(nt::Irp::SIZE);
+    at::<nt::Irp>(irp_address).flags.set(4 << 17);
+    call_export("IoRetrievePriorityInfo", &[irp_address, 0, thread_address, info_address]);
+    assert(info.io_priority.get() == 3, "io-priority: dica do IRP");
+
+    // Dica no FILE_OBJECT: extensão alocada, FoIoPriorityHint = dica + 1.
+    let file_address = guest::alloc_bytes(nt::FileObject::SIZE);
+    let hinted = call_export("IoSetIoPriorityHintIntoFileObject", &[file_address, 4]);
+    let extension = at::<nt::FileObject>(file_address).file_object_extension.get();
+    call_export("IoRetrievePriorityInfo", &[0, file_address, 0, info_address]);
+    assert(
+        hinted == Some(0) && extension != 0 && at::<nt::IopFileObjectExtension>(extension).fo_io_priority_hint.get().0 == 5 && info.io_priority.get() == 4,
+        "io-priority: dica no FILE_OBJECT",
+    );
+
+    // Apply: troca a IoPriority e devolve a anterior; ThreadPriority 0xFFFF é inválido.
+    info.size.set(0x10);
+    info.thread_priority.set(u32::MAX);
+    info.page_priority.set(u32::MAX);
+    info.io_priority.set(2);
+    let applied = call_export("IoApplyPriorityInfoThread", &[info_address, output_address, thread_address]);
+    assert(
+        applied == Some(0) && output.size.get() == 0x10 && output.thread_priority.get() == u32::MAX && output.page_priority.get() == u32::MAX && output.io_priority.get() == 1 && thread.thread_io_priority() == 2,
+        "io-priority: IoApplyPriorityInfoThread",
+    );
+    info.thread_priority.set(0xFFFF);
+    assert(call_export("IoApplyPriorityInfoThread", &[info_address, 0, thread_address]).map(|status| status as u32) == Some(0xC000_00EF), "io-priority: ThreadPriority 0xFFFF");
+
+    thread.cross_thread_flags.set(saved);
+    thread.io_boost_count.set(saved_boost);
+    guest::free_bytes(extension);
+    for block in [info_address, output_address, irp_address, file_address] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn io_file_system_exports(assert: Assert) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::ntos::ob::object_manager;
+    static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+    static LAST_DEVICE: AtomicU64 = AtomicU64::new(0);
+    extern "win64" fn notification(device: u64, active: u64) {
+        NOTIFIED.fetch_add(if active & 0xFF != 0 { 1 } else { 0x100 }, Ordering::SeqCst);
+        LAST_DEVICE.store(device, Ordering::SeqCst);
+    }
+    let routine = {
+        let pointer = notification as extern "win64" fn(u64, u64) as usize as u64;
+        crate::ntos::mm::kernel_address::virtual_address(pointer).unwrap_or(pointer)
+    };
+    // DRIVER_OBJECT/DEVICE_OBJECT sintéticos: MajorFunction vazio (IRPs voltam
+    // NOT_SUPPORTED), DriverInit não nulo (FsRtlSetDriverBacking aceita).
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    at::<nt::DriverObject>(driver).driver_init.set(1);
+    let new_device = |device_type: u32, flags: u32| {
+        let address = guest::alloc_bytes(nt::DeviceObject::SIZE);
+        let device = at::<nt::DeviceObject>(address);
+        device.type_.set(3);
+        device.driver_object.set(driver);
+        device.flags.set(flags);
+        device.device_type.set(device_type);
+        device.stack_size.set(1);
+        address
+    };
+    let device = |address: u64| at::<nt::DeviceObject>(address);
+    let registered = |kind: u32| crate::ntos::io::file_system::registered_file_systems(kind);
+    let before = registered(8).len();
+    let first = new_device(8, 0x80);
+    let second = new_device(8, 0x1_0000); // DO_LOW_PRIORITY_FILESYSTEM: vai para o fim
+    let third = new_device(8, 0x200); // DO_LONG_TERM_REQUESTS: vai para a frente
+    for address in [first, second, third] {
+        call_export("IoRegisterFileSystem", &[address]);
+    }
+    let queue = registered(8);
+    assert(
+        queue.len() == before + 3 && queue.first() == Some(&third) && queue.last() == Some(&second) && device(first).flags.get() & 0x80 == 0 && device(first).reference_count.get() == 1 && at::<nt::DriverObject>(driver).flags.get() & 0x80 != 0,
+        "io-file-system: IoRegisterFileSystem ordena a fila de disco e limpa DO_DEVICE_INITIALIZING",
+    );
+
+    // Notificação (com um DRIVER_OBJECT real, que o Ob referencia): chamada para
+    // os FS já registrados; o último de cada fila local (o RAW) é pulado.
+    let real_driver = object_manager::namespace_entries()
+        .into_iter()
+        .filter(|(_, path)| path.starts_with("\\Driver\\"))
+        .filter_map(|(node, _)| object_manager::node(node).and_then(|node| node.data).map(|data| data.native_pointer))
+        .find(|&pointer| pointer != 0 && crate::ntos::ob::objects::driver::is_driver(pointer) && at::<nt::DriverObject>(pointer).driver_init.get() != 0)
+        .unwrap_or(0);
+    let count = |kind: u32| registered(kind).len() as u64;
+    let expected = count(0x14) + count(3).saturating_sub(1) + count(8).saturating_sub(1) + count(0x20).saturating_sub(1);
+    let notified_before = NOTIFIED.load(Ordering::SeqCst);
+    let attached = call_export("IoRegisterFsRegistrationChangeMountAware", &[real_driver, routine, 0]);
+    let calls = NOTIFIED.load(Ordering::SeqCst) - notified_before;
+    let duplicate = call_export("IoRegisterFsRegistrationChangeMountAware", &[real_driver, routine, 0]).map(|status| status as u32);
+    assert(real_driver != 0 && attached == Some(0) && calls == expected && duplicate == Some(0xC000_0038), "io-file-system: MountAware notifica os ja registrados e recusa duplicata");
+
+    // EnumerateRegisteredFiltersList: tamanho pequeno -> BUFFER_TOO_SMALL com a contagem.
+    let list = guest::alloc_bytes(0x100);
+    let actual = guest::alloc_bytes(8);
+    let small = call_export("IoEnumerateRegisteredFiltersList", &[list, 0, actual]).map(|status| status as u32);
+    let filters = at::<nt::Field<u32>>(actual).get() as usize;
+    let full = call_export("IoEnumerateRegisteredFiltersList", &[list, 0x100, actual]);
+    let listed: Vec<u64> = (0..filters.min(32) as u64).map(|index| at::<nt::Field<u64>>(list + index * 8).get()).collect();
+    assert(small == Some(0xC000_0023) && filters >= 1 && full == Some(0) && listed.contains(&real_driver), "io-file-system: IoEnumerateRegisteredFiltersList");
+    for pointer in listed {
+        call_export("ObfDereferenceObject", &[pointer]);
+    }
+
+    // Unregister notifica com FALSE e tira da fila.
+    let notified_before = NOTIFIED.load(Ordering::SeqCst);
+    call_export("IoUnregisterFileSystem", &[first]);
+    assert(
+        NOTIFIED.load(Ordering::SeqCst) - notified_before == 0x100 && LAST_DEVICE.load(Ordering::SeqCst) == first && !registered(8).contains(&first) && device(first).reference_count.get() == 0,
+        "io-file-system: IoUnregisterFileSystem notifica e desliga",
+    );
+
+    // Base FS device: VPB montado do dispositivo, senão o próprio dispositivo.
+    let volume = new_device(7, 0);
+    let file = guest::alloc_bytes(nt::FileObject::SIZE);
+    at::<nt::FileObject>(file).device_object.set(volume);
+    let plain = call_export("IoGetBaseFileSystemDeviceObject", &[file]);
+    let vpb = guest::alloc_bytes(nt::Vpb::SIZE);
+    at::<nt::Vpb>(vpb).device_object.set(second);
+    device(volume).vpb.set(vpb);
+    assert(plain == Some(volume) && call_export("IoGetBaseFileSystemDeviceObject", &[file]) == Some(second), "io-file-system: IoGetBaseFileSystemDeviceObject");
+
+    // DeviceToVerify / IsSystemThread.
+    let thread_address = crate::ntos::ps::process::get_current_thread();
+    let thread = at::<nt::Ethread>(thread_address);
+    let saved = thread.device_to_verify.get();
+    call_export("IoSetDeviceToVerify", &[thread_address, volume]);
+    let verify = call_export("IoGetDeviceToVerify", &[thread_address]);
+    thread.device_to_verify.set(saved);
+    assert(verify == Some(volume) && call_export("IoIsSystemThread", &[thread_address]) == Some(thread.tcb.system_thread() as u64), "io-file-system: DeviceToVerify e IsSystemThread");
+
+    // Stream file object Lite: FO_STREAM_FILE|FO_HANDLE_CREATED, referencia dispositivo e VPB.
+    at::<nt::Vpb>(vpb).reference_count.set(0);
+    let references = device(volume).reference_count.get();
+    let stream = call_export("IoCreateStreamFileObjectLite", &[0, volume]).unwrap_or(0);
+    let stream_object = at::<nt::FileObject>(stream);
+    assert(
+        stream != 0 && stream_object.flags.get() == 0x4_0100 && stream_object.device_object.get() == volume && device(volume).reference_count.get() == references + 1 && at::<nt::Vpb>(vpb).reference_count.get() == 1,
+        "io-file-system: IoCreateStreamFileObjectLite",
+    );
+    // O nome cresce para 0x38 bytes e o resto é zerado.
+    let name = guest::alloc_bytes(0x10);
+    let units: Vec<u16> = "\\a.txt".encode_utf16().collect();
+    guest::write_bytes(name, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    let replaced = call_export("IoReplaceFileObjectName", &[stream, name, 12]);
+    let file_name = &stream_object.file_name;
+    assert(
+        replaced == Some(0) && file_name.length.get() == 12 && file_name.maximum_length.get() == 0x38 && at::<nt::Field<u16>>(file_name.buffer.get() + 2).get() == b'a' as u16,
+        "io-file-system: IoReplaceFileObjectName",
+    );
+    // A última referência envia CLOSE (NOT_SUPPORTED do driver vazio) e solta as referências.
+    call_export("ObfDereferenceObject", &[stream]);
+    assert(device(volume).reference_count.get() == references && at::<nt::Vpb>(vpb).reference_count.get() == 0, "io-file-system: CLOSE do stream solta dispositivo e VPB");
+
+    // VerifyVolume sem VPB montado: o remount precisa do IopMountVolume ausente.
+    device(volume).flags.set(2);
+    let verified = call_export("IoVerifyVolume", &[volume, 0]).map(|status| status as u32);
+    assert(verified == Some(0xC000_014F) && device(volume).flags.get() & 2 == 0 && device(volume).vpb.get() != vpb, "io-file-system: IoVerifyVolume sem mount path");
+    call_export("ExFreePool", &[device(volume).vpb.get()]);
+
+    // Stack limits: um local da pilha só é provado com KTHREAD.StackBase/StackLimit publicados.
+    let local = 0u64;
+    let address = &local as *const u64 as u64;
+    let published = thread.tcb.stack_base.get() != 0;
+    assert(call_export("IoWithinStackLimits", &[address, 8]) == Some(published as u64) && call_export("IoWithinStackLimits", &[0x1000, 8]) == Some(0), "io-file-system: IoWithinStackLimits");
+
+    call_export("IoUnregisterFileSystem", &[second]);
+    call_export("IoUnregisterFileSystem", &[third]);
+    for block in [name, list, actual, file, vpb] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn io_irp_support_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ob::objects::device as device_objects;
+
+    // IoMakeAssociatedIrp: mestre com 2 posições, NOCACHE + prioridade e thread.
+    let master_address = call_export("IoAllocateIrp", &[2, 0]).unwrap_or(0);
+    let master = at::<nt::Irp>(master_address);
+    let event = guest::alloc_bytes(nt::Kevent::SIZE);
+    dispatcher::initialize_event(event, 0, false);
+    master.user_event.set(event);
+    master.flags.set(0x0002_0002 | 0x0000_0010);
+    master.tail.overlay.thread.set(0x1234_5000);
+    let associated_address = call_export("IoMakeAssociatedIrp", &[master_address, 3]).unwrap_or(0);
+    let associated = at::<nt::Irp>(associated_address);
+    let size = nt::Irp::SIZE + 3 * nt::IoStackLocation::SIZE;
+    assert(
+        associated_address != 0
+            && associated.type_.get() == 6
+            && associated.size.get() == size as u16
+            && associated.stack_count.get() == 3
+            && associated.current_location.get() == 4
+            && associated.tail.overlay.current_stack_location.get() == associated_address + size
+            && associated.thread_list_entry.flink.get() == associated.thread_list_entry.flink.address(),
+        "io-irp-support: IoMakeAssociatedIrp monta o IRP com StackSize posicoes",
+    );
+    // Flags = IRP_ASSOCIATED_IRP | (0x20012 & 0xE0002) = 0x2000A; MasterIrp e Thread do mestre.
+    assert(
+        associated.flags.get() == 0x0002_000A && associated.associated_irp.master_irp.get() == master_address && associated.tail.overlay.thread.get() == 0x1234_5000,
+        "io-irp-support: associado herda os bits de cache e aponta para o mestre",
+    );
+    // Conclusão do associado com IrpCount = 1: o associado sai e o mestre completa.
+    master.associated_irp.irp_count.set(1);
+    call_export("IofCompleteRequest", &[associated_address, 0]);
+    assert(master.associated_irp.irp_count.get() == 0 && dispatcher::read_state(event) != 0, "io-irp-support: ultimo associado completa o mestre");
+    let second = call_export("IoMakeAssociatedIrp", &[master_address, 1]).unwrap_or(0);
+    master.associated_irp.irp_count.set(2);
+    dispatcher::reset_event(event);
+    call_export("IofCompleteRequest", &[second, 0]);
+    assert(master.associated_irp.irp_count.get() == 1 && dispatcher::read_state(event) == 0, "io-irp-support: associado com irmaos pendentes so decrementa");
+    call_export("IoFreeIrp", &[master_address]);
+
+    // IoSetIoPriorityHint: (hint + 1) << 17 em Flags; hint >= 5 recusado.
+    let packet = call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    let irp = at::<nt::Irp>(packet);
+    irp.flags.set(0x000E_0001);
+    assert(call_export("IoSetIoPriorityHint", &[packet, 3]) == Some(0) && irp.flags.get() == 0x0008_0001, "io-irp-support: IoSetIoPriorityHint grava (hint + 1) << 17");
+    assert(call_export("IoSetIoPriorityHint", &[packet, 5]) == Some(signed_status(0xC000_000D)) && irp.flags.get() == 0x0008_0001, "io-irp-support: IoSetIoPriorityHint recusa MaxIoPriorityTypes");
+    // IoGetAdapterCryptoEngineExtension: IRP sem extensão tipo 7.
+    let output = guest::alloc_bytes(8);
+    assert(call_export("IoGetAdapterCryptoEngineExtension", &[packet, output]) == Some(signed_status(0xC000_0225)), "io-irp-support: sem extensao de crypto engine = STATUS_NOT_FOUND");
+    call_export("IoFreeIrp", &[packet]);
+
+    // IoAdjustStackSizeForRedirection: base (1) <- upper (2), alvo com 4.
+    let make = |size: i8| {
+        let address = guest::alloc_bytes(nt::DeviceObject::SIZE);
+        let device = at::<nt::DeviceObject>(address);
+        device.type_.set(3);
+        device.size.set(nt::DeviceObject::SIZE as u16);
+        device.stack_size.set(size);
+        let _ = device_objects::register(address, None, None);
+        address
+    };
+    let base = make(1);
+    let upper = make(1);
+    let _ = call_export("IoAttachDeviceToDeviceStack", &[upper, base]);
+    let target = make(4);
+    let delta = guest::alloc_bytes(8);
+    let stack = |address: u64| at::<nt::DeviceObject>(address).stack_size.get();
+    let adjusted = call_export("IoAdjustStackSizeForRedirection", &[base, target, delta]);
+    assert(adjusted == Some(0) && at::<nt::Field<i8>>(delta).get() == 3 && stack(base) == 4 && stack(upper) == 5, "io-irp-support: IoAdjustStackSizeForRedirection soma a diferenca a pilha inteira");
+    at::<nt::Field<i8>>(delta).set(-1);
+    assert(call_export("IoAdjustStackSizeForRedirection", &[base, target, delta]) == Some(0) && at::<nt::Field<i8>>(delta).get() == 0, "io-irp-support: origem ja suficiente devolve delta zero");
+    // Topo 5 + (0x7C - 4) = 0x7D atinge o limite: nada muda.
+    let huge = make(0x7C);
+    assert(call_export("IoAdjustStackSizeForRedirection", &[base, huge, delta]) == Some(signed_status(0xC000_000D)) && stack(base) == 4 && stack(upper) == 5, "io-irp-support: estouro do StackSize maximo recusado sem alterar a pilha");
+    call_export("IoDetachDevice", &[base]);
+}
+
+
+fn io_file_system_support_exports(assert: Assert) {
+    use nt::extra_fs_ntfs::{FileFullEaInformation, FileQuotaInformation};
+    const EA_INCONSISTENT: u64 = 0xFFFF_FFFF_8000_0014;
+    const QUOTA_INCONSISTENT: u64 = 0xFFFF_FFFF_C000_0266;
+    let error = guest::alloc_bytes(8);
+    let error_offset = at::<nt::Field<u32>>(error);
+    // EA: AB (valor de 3 bytes, Next 16) + C (sem valor); 26 bytes (vetor de ref_io_fs_support.py).
+    let ea_bytes: [u8; 26] = [0x10, 0, 0, 0, 0, 2, 3, 0, 0x41, 0x42, 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0x43, 0];
+    let ea = guest::alloc_bytes(32);
+    guest::write_bytes(ea, &ea_bytes);
+    let ea_check = |length: u64| {
+        error_offset.set(0xAAAA_AAAA);
+        (call_export("IoCheckEaBufferValidity", &[ea, length, error]), error_offset.get())
+    };
+    assert(ea_check(26).0 == Some(0) && ea_check(24) == (Some(EA_INCONSISTENT), 16) && ea_check(0x8000_0000) == (Some(EA_INCONSISTENT), 0), "io-fs-support: IoCheckEaBufferValidity aceita a lista e mede o truncamento");
+    let second = at::<FileFullEaInformation>(ea + 16);
+    second.ea_name[0].set(b'C');
+    guest::write_bytes(second.ea_name[0].address() + 1, &[0x41]);
+    assert(ea_check(26) == (Some(EA_INCONSISTENT), 16), "io-fs-support: nome de EA sem NUL");
+    guest::write_bytes(second.ea_name[0].address() + 1, &[0]);
+    at::<FileFullEaInformation>(ea).next_entry_offset.set(20);
+    assert(ea_check(26) == (Some(EA_INCONSISTENT), 0), "io-fs-support: NextEntryOffset fora do alinhamento");
+    // Cota: duas entradas S-1-5-32-544 (SidLength 16, Next 0x38), em pool
+    // (o RtlValidSid do kernel recusa endereços abaixo do espaço de sistema).
+    let quota = call_export("ExAllocatePoolWithTag", &[0x200, 0x80, 0x7473_6554]).unwrap_or(0);
+    guest::write_bytes(quota, &[0u8; 0x80]);
+    // Cada entrada ocupa exatamente sizeof(FILE_QUOTA_INFORMATION) = 0x38 (SID de 16 bytes).
+    for (entry, next) in [(0u64, FileQuotaInformation::SIZE as u32), (FileQuotaInformation::SIZE, 0)] {
+        let information = at::<FileQuotaInformation>(quota + entry);
+        information.next_entry_offset.set(next);
+        information.sid_length.set(16);
+        guest::write_bytes(information.sid.address(), &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0]);
+    }
+    let quota_check = |buffer: u64, length: u64| {
+        error_offset.set(0xAAAA_AAAA);
+        (call_export("IoCheckQuotaBufferValidity", &[buffer, length, error]), error_offset.get())
+    };
+    assert(
+        quota_check(quota, 0x70).0 == Some(0) && quota_check(quota, 0x30) == (Some(QUOTA_INCONSISTENT), 0) && quota_check(quota + 4, 0x70) == (Some(0xFFFF_FFFF_8000_0002), 0),
+        "io-fs-support: IoCheckQuotaBufferValidity, comprimento curto e desalinhamento",
+    );
+    at::<FileQuotaInformation>(quota + FileQuotaInformation::SIZE).sid_length.set(12);
+    assert(quota_check(quota, 0x70) == (Some(QUOTA_INCONSISTENT), 0x38), "io-fs-support: SidLength divergente na segunda entrada");
+    at::<FileQuotaInformation>(quota + FileQuotaInformation::SIZE).sid_length.set(16);
+    at::<FileQuotaInformation>(quota).next_entry_offset.set(0x3C);
+    assert(quota_check(quota, 0x70) == (Some(QUOTA_INCONSISTENT), 0), "io-fs-support: NextEntryOffset nao multiplo de 8");
+    call_export("ExFreePool", &[quota]);
+
+    // Confiança de redirecionamento: kernel = 2; usuário = 2 se o token for admin.
+    let level = guest::alloc_bytes(4);
+    let process = crate::ntos::ps::process::get_current_process();
+    let primary = crate::ntos::ps::process::get_primary_token(process).unwrap_or(0);
+    let expected = if crate::ntos::se::token::information::is_admin(primary) { 2 } else { 1 };
+    assert(call_export("IoComputeRedirectionTrustLevel", &[0, 0, 0, level]) == Some(0) && at::<nt::Field<u32>>(level).get() == 2, "io-fs-support: nivel de confianca do modo kernel");
+    assert(call_export("IoComputeRedirectionTrustLevel", &[0, 1, 0, level]) == Some(0) && at::<nt::Field<u32>>(level).get() == expected, "io-fs-support: nivel de confianca pelo SeTokenIsAdmin");
+    assert(
+        call_export("IoCheckRedirectionTrustLevel", &[1, 1, 0, 1, 0]) == Some(0) && call_export("IoCheckRedirectionTrustLevel", &[1, 0, 0, 1, 0]) == Some(0) && call_export("IoCheckRedirectionTrustLevel", &[1, 1, 0, 2, 0]) == Some(0),
+        "io-fs-support: sem politica RedirectionTrust no token nada e imposto",
+    );
+
+    // Dica de dispositivo copiada entre FILE_OBJECTs (bloco do slot 1 de 0x20 bytes).
+    let new_file = || guest::alloc_bytes(nt::FileObject::SIZE);
+    let (source, target, plain, other) = (new_file(), new_file(), new_file(), new_file());
+    let (source_extension, hint) = (guest::alloc_bytes(nt::IopFileObjectExtension::SIZE), guest::alloc_bytes(0x20));
+    at::<nt::Field<u64>>(hint).set(0xFFFF_8000_1234_0000);
+    at::<nt::IopFileObjectExtension>(source_extension).fo_ext_per_type_extension[1].set(hint);
+    at::<nt::FileObject>(source).file_object_extension.set(source_extension);
+    let copied = call_export("IoCopyDeviceObjectHint", &[source, target]);
+    let target_extension = at::<nt::FileObject>(target).file_object_extension.get();
+    let copied_hint = if target_extension != 0 { at::<nt::IopFileObjectExtension>(target_extension).fo_ext_per_type_extension[1].get() } else { 0 };
+    assert(copied == Some(0) && copied_hint != 0 && at::<nt::Field<u64>>(copied_hint).get() == 0xFFFF_8000_1234_0000, "io-fs-support: IoCopyDeviceObjectHint copia o DEVICE_OBJECT");
+    assert(call_export("IoCopyDeviceObjectHint", &[source, target]) == Some(0xFFFF_FFFF_C000_0001), "io-fs-support: destino com dica -> STATUS_UNSUCCESSFUL");
+    assert(call_export("IoCopyDeviceObjectHint", &[plain, other]) == Some(0) && at::<nt::FileObject>(other).file_object_extension.get() == 0, "io-fs-support: origem sem dica nao muda o destino");
+
+    // IoCreateFileSpecifyDeviceObjectHint segue o IoCreateFileEx.
+    let path: alloc::vec::Vec<u8> = "\\Device\\OpenNTNoSuchDevice\\x".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    let name_buffer = guest::alloc_bytes(path.len() as u64 + 2);
+    guest::write_bytes(name_buffer, &path);
+    let name = guest::alloc_bytes(nt::UnicodeString::SIZE);
+    let unicode = at::<nt::UnicodeString>(name);
+    unicode.length.set(path.len() as u16);
+    unicode.maximum_length.set(path.len() as u16 + 2);
+    unicode.buffer.set(name_buffer);
+    let attributes = guest::alloc_bytes(nt::ObjectAttributes::SIZE);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.object_name.set(name);
+    object_attributes.attributes.set(0x240);
+    let (handle, io_status) = (guest::alloc_bytes(8), guest::alloc_bytes(nt::IoStatusBlock::SIZE));
+    let arguments = [handle, 0x10_0080, attributes, io_status, 0, 0, 7, 1, 0x20, 0, 0, 0, 0, 0];
+    // O IoCreateFileEx do OpenNT devolve o NTSTATUS sem extensão de sinal: compara os 32 bits.
+    let hinted = call_export("IoCreateFileSpecifyDeviceObjectHint", &arguments).map(|status| status as u32);
+    let plain_create = call_export("IoCreateFileEx", &arguments).map(|status| status as u32);
+    assert(hinted.is_some() && hinted == plain_create && hinted.unwrap_or(0) & 0x8000_0000 != 0, "io-fs-support: IoCreateFileSpecifyDeviceObjectHint = IoCreateFileEx");
+
+    // Stream file object com e sem handle num dispositivo sintético (MajorFunction vazio).
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let fake_device = at::<nt::DeviceObject>(device);
+    fake_device.type_.set(3);
+    fake_device.driver_object.set(driver);
+    fake_device.device_type.set(8);
+    fake_device.stack_size.set(1);
+    let references = fake_device.reference_count.get();
+    let stream_handle = guest::alloc_bytes(8);
+    let stream = call_export("IoCreateStreamFileObjectEx", &[0, device, stream_handle]).unwrap_or(0);
+    let returned_handle = at::<nt::Field<u64>>(stream_handle).get();
+    assert(stream != 0 && at::<nt::FileObject>(stream).flags.get() == 0x4_0100 && returned_handle != 0 && fake_device.reference_count.get() == references + 1, "io-fs-support: IoCreateStreamFileObjectEx devolve o handle de kernel");
+    // FileModeInformation é aplicada pelo I/O Manager sem chamar o driver.
+    let mode = guest::alloc_bytes(nt::FileModeInformation::SIZE);
+    at::<nt::FileModeInformation>(mode).mode.set(4);
+    assert(call_export("IoSetInformation", &[stream, 16, 4, mode]) == Some(0) && at::<nt::FileObject>(stream).flags.get() & 0x20 != 0, "io-fs-support: IoSetInformation FileModeInformation");
+    // Classe comum vai ao driver: MajorFunction vazio -> o status interno
+    // NOT_SUPPORTED do IofCallDriver do OpenNT, devolvido como veio.
+    let empty_slot = Some(crate::ntos::init::exports::signed_status(crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32));
+    let basic = guest::alloc_bytes(0x28);
+    assert(call_export("IoSetInformation", &[stream, 4, 0x28, basic]) == empty_slot, "io-fs-support: IoSetInformation propaga o status do driver");
+    // Rename com diretório de destino: sem IopOpenLinkOrRenameTarget -> NOT_IMPLEMENTED; ReplaceIfExists vai ao IRP.
+    let rename = guest::alloc_bytes(nt::FileRenameInformation::SIZE + 8);
+    let rename_information = at::<nt::FileRenameInformation>(rename);
+    rename_information.replace_if_exists.set(1);
+    rename_information.file_name_length.set(2);
+    rename_information.file_name[0].set(b'\\' as u16);
+    assert(call_export("IoSetInformation", &[stream, 10, nt::FileRenameInformation::SIZE + 8, rename]) == Some(0xFFFF_FFFF_C000_0002), "io-fs-support: rename com destino absoluto nao suportado");
+    // Nome DOS: o FS sem rotina de consulta devolve a falha da FileNameInformation.
+    let information_output = guest::alloc_bytes(8);
+    assert(call_export("IoQueryFileDosDeviceName", &[stream, information_output]) == empty_slot && at::<nt::Field<u64>>(information_output).get() == 0, "io-fs-support: IoQueryFileDosDeviceName propaga a falha do FS");
+    call_export("ZwClose", &[returned_handle]);
+    call_export("ObfDereferenceObject", &[stream]);
+    let lone = call_export("IoCreateStreamFileObjectEx", &[0, device, 0]).unwrap_or(0);
+    // Sem FileHandle o handle criado é fechado na hora: o IRP_MJ_CLEANUP sai
+    // e o IopCloseFile marca FO_CLEANUP_COMPLETE.
+    assert(lone != 0 && at::<nt::FileObject>(lone).flags.get() == 0x4_4100, "io-fs-support: IoCreateStreamFileObjectEx sem handle");
+    call_export("ObfDereferenceObject", &[lone]);
+    assert(fake_device.reference_count.get() == references, "io-fs-support: CLOSE dos streams solta o dispositivo");
+
+    let activity = guest::alloc_bytes(16);
+    assert(call_export("IoTransferActivityId", &[activity, activity]) == Some(0), "io-fs-support: IoTransferActivityId sem sessao IoTrace");
+}
+
+
+fn io_paging_exports(assert: Assert) {
+    use nt::extra_fs_ntfs::IopIrpExtension;
+    use nt::extra_io::IrpExtensionField;
+    // FsTrackOffset numa extensão alocada à mão (TypesAllocated bit 5, blob em +0x28).
+    let packet = call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    let extension = guest::alloc_bytes(IopIrpExtension::SIZE);
+    let irp_extension = at::<IopIrpExtension>(extension);
+    irp_extension.types_allocated.set(1 << 5);
+    irp_extension.fs_track_offset_blob.set(0x1234);
+    irp_extension.fs_tracked_offset.set(0x5678);
+    let irp = at::<nt::Irp>(packet);
+    irp.irp_extension().set(extension);
+    assert(call_export("IoIrpHasFsTrackOffsetExtensionType", &[packet]) == Some(1), "io-paging: IRP com FsTrackOffset");
+    assert(
+        call_export("IoClearFsTrackOffsetState", &[packet]) == Some(0) && irp_extension.fs_track_offset_blob.get() == 0 && irp_extension.fs_tracked_offset.get() == 0x5678 && irp_extension.types_allocated.get() == 0,
+        "io-paging: IoClearFsTrackOffsetState zera o blob e o tipo",
+    );
+    assert(call_export("IoIrpHasFsTrackOffsetExtensionType", &[packet]) == Some(0) && call_export("IoClearFsTrackOffsetState", &[packet]) == Some(0xFFFF_FFFF_C000_0225), "io-paging: sem FsTrackOffset -> STATUS_NOT_FOUND");
+    irp_extension.types_allocated.set(1 << 5);
+    irp.allocation_flags.set(0x80);
+    assert(call_export("IoIrpHasFsTrackOffsetExtensionType", &[packet]) == Some(0), "io-paging: generica embutida nao tem FsTrackOffset");
+    irp.allocation_flags.set(0);
+    irp.irp_extension().set(0);
+    call_export("IoFreeIrp", &[packet]);
+    guest::free_bytes(extension);
+
+    // IRP associado: dispositivo com DO_DEVICE_IRP_REQUIRES_EXTENSION reserva duas posições.
+    let master = call_export("IoAllocateIrp", &[2, 0]).unwrap_or(0);
+    at::<nt::Irp>(master).flags.set(0x43);
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let fake_device = at::<nt::DeviceObject>(device);
+    fake_device.flags.set(0x0800_0000);
+    let associated = call_export("IoMakeAssociatedIrpEx", &[master, device, 3]).unwrap_or(0);
+    let top = associated + nt::Irp::SIZE + 3 * nt::IoStackLocation::SIZE;
+    let embedded = at::<nt::Irp>(associated);
+    assert(
+        associated != 0
+            && embedded.stack_count.get() == 3
+            && embedded.current_location.get() == 4
+            && embedded.tail.overlay.current_stack_location.get() == top
+            && embedded.irp_extension().get() == top
+            && embedded.flags.get() == 0xA
+            && embedded.associated_irp.master_irp.get() == master,
+        "io-paging: IoMakeAssociatedIrpEx com extensao embutida",
+    );
+    fake_device.flags.set(0);
+    let simple = call_export("IoMakeAssociatedIrpEx", &[master, device, 3]).unwrap_or(0);
+    let plain = at::<nt::Irp>(simple);
+    assert(simple != 0 && plain.stack_count.get() == 3 && plain.tail.overlay.current_stack_location.get() == simple + nt::Irp::SIZE + 3 * nt::IoStackLocation::SIZE && plain.irp_extension().get() == 0, "io-paging: IoMakeAssociatedIrpEx sem extensao");
+    embedded.irp_extension().set(0);
+    for packet in [associated, simple, master] {
+        call_export("IoFreeIrp", &[packet]);
+    }
+
+    // IoPageRead / IoSynchronousPageWrite num dispositivo sem MajorFunction.
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    fake_device.type_.set(3);
+    fake_device.driver_object.set(driver);
+    fake_device.stack_size.set(1);
+    let file = guest::alloc_bytes(nt::FileObject::SIZE);
+    let file_object = at::<nt::FileObject>(file);
+    file_object.type_.set(5);
+    file_object.device_object.set(device);
+    let buffer = guest::alloc_page();
+    let descriptor = guest::alloc_bytes(nt::Mdl::SIZE + 8);
+    let mdl = at::<nt::Mdl>(descriptor);
+    mdl.start_va.set(buffer);
+    mdl.byte_offset.set(0x10);
+    mdl.byte_count.set(0x200);
+    let (offset, event, io_status) = (guest::alloc_bytes(nt::LargeInteger::SIZE), guest::alloc_bytes(nt::Kevent::SIZE), guest::alloc_bytes(nt::IoStatusBlock::SIZE));
+    at::<nt::LargeInteger>(offset).quad_part.set(0x4000);
+    call_export("KeInitializeEvent", &[event, 0, 0]);
+    let (iosb, signal) = (at::<nt::IoStatusBlock>(io_status), &at::<nt::Kevent>(event).header.signal_state);
+    for (name, major) in [("IoPageRead", 3u8), ("IoSynchronousPageWrite", 4u8)] {
+        let status = call_export(name, &[file, descriptor, offset, event, io_status]);
+        let packet = iosb.information.get();
+        let paging = at::<nt::Irp>(packet);
+        let location = at::<nt::IoStackLocation>(paging.tail.overlay.current_stack_location.get());
+        let flags = paging.flags.get();
+        assert(
+            status == Some(crate::ntos::init::exports::signed_status(crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32))
+                && packet != 0
+                && flags & 0xFFFF == 0x43
+                && flags & 0xE_0000 != 0
+                && paging.mdl_address.get() == descriptor
+                && paging.user_buffer.get() == buffer + 0x10
+                && paging.tail.overlay.original_file_object.get() == file
+                && location.major_function.get() == major
+                && location.parameters.read.length.get() == 0x200
+                && location.parameters.read.byte_offset.quad_part.get() == 0x4000
+                && location.file_object.get() == file,
+            "io-paging: IRP de paginacao montado como no NT",
+        );
+        // O driver não completou: completa como um FS faria; o IopfCompleteRequest
+        // devolve o IoStatus ao IOSB do Mm e libera o IRP de paginação.
+        paging.io_status.status.set(0);
+        paging.io_status.information.set(0x200);
+        call_export("IofCompleteRequest", &[packet, 0]);
+        assert(iosb.status.get() == 0 && iosb.information.get() == 0x200 && signal.get() != 0, "io-paging: conclusao copia o IOSB e sinaliza o evento");
+        signal.set(0);
+    }
+}
+
+
+fn io_share_access_exports(assert: Assert) {
+    let share = guest::alloc_bytes(nt::extra_fs_ntfs::ShareAccess::SIZE);
+    let (fo1, fo2, fo3) = (guest::alloc_bytes(nt::FileObject::SIZE), guest::alloc_bytes(nt::FileObject::SIZE), guest::alloc_bytes(nt::FileObject::SIZE));
+    let counters = |share: u64| -> [u32; 7] {
+        let share = at::<nt::extra_fs_ntfs::ShareAccess>(share);
+        [share.open_count.get(), share.readers.get(), share.writers.get(), share.deleters.get(), share.shared_read.get(), share.shared_write.get(), share.shared_delete.get()]
+    };
+    let file = |address: u64| at::<nt::FileObject>(address);
+
+    // Primeiro opener: FILE_READ_DATA com FILE_SHARE_READ.
+    call_export("IoSetShareAccess", &[1, 1, fo1, share]);
+    assert(
+        counters(share) == [1, 1, 0, 0, 1, 0, 0] && file(fo1).read_access.get() == 1 && file(fo1).write_access.get() == 0 && file(fo1).shared_read.get() == 1 && file(fo1).shared_write.get() == 0,
+        "io-share-access: IoSetShareAccess grava o primeiro opener",
+    );
+    // Escrita sem a outra parte compartilhar escrita: SHARING_VIOLATION, sem mudar contadores.
+    let violation = call_export("IoCheckShareAccess", &[2, 3, fo2, share, 1]).map(|status| status as u32);
+    assert(violation == Some(0xC000_0043) && counters(share) == [1, 1, 0, 0, 1, 0, 0], "io-share-access: escrita conflita com leitor exclusivo de escrita");
+    // Leitor compatível com Update: soma; sem Update: só confere.
+    let granted = call_export("IoCheckShareAccess", &[1, 1, fo2, share, 1]);
+    let probed = call_export("IoCheckShareAccess", &[1, 1, fo3, share, 0]);
+    assert(granted == Some(0) && probed == Some(0) && counters(share) == [2, 2, 0, 0, 2, 0, 0], "io-share-access: IoCheckShareAccess com e sem Update");
+    // Sem acesso a dados (FILE_READ_ATTRIBUTES): sucesso e nada contabilizado.
+    assert(call_export("IoCheckShareAccess", &[0x80, 0, fo3, share, 1]) == Some(0) && counters(share)[0] == 2, "io-share-access: acesso so a atributos nao conta");
+    // Remove e Update pelo estado gravado no FILE_OBJECT.
+    call_export("IoRemoveShareAccess", &[fo2, share]);
+    let removed = counters(share);
+    call_export("IoUpdateShareAccess", &[fo2, share]);
+    assert(removed == [1, 1, 0, 0, 1, 0, 0] && counters(share) == [2, 2, 0, 0, 2, 0, 0], "io-share-access: IoRemoveShareAccess / IoUpdateShareAccess");
+    // DELETE sem FILE_SHARE_DELETE dos outros: conflito de delete.
+    let delete = call_export("IoCheckShareAccess", &[0x1_0000, 7, fo3, share, 1]).map(|status| status as u32);
+    assert(delete == Some(0xC000_0043), "io-share-access: DELETE conflita sem SharedDelete");
+    for block in [share, fo1, fo2, fo3] {
+        guest::free_bytes(block);
+    }
+}
+
+
+fn io_share_access_link_exports(assert: Assert) {
+    use nt::extra_fs_ntfs::{LinkShareAccess, ShareAccess};
+    let (first, second, ignored) = (guest::alloc_bytes(nt::FileObject::SIZE), guest::alloc_bytes(nt::FileObject::SIZE), guest::alloc_bytes(nt::FileObject::SIZE));
+    let (share, link) = (guest::alloc_bytes(ShareAccess::SIZE), guest::alloc_bytes(LinkShareAccess::SIZE));
+    let counts = || {
+        let (share, link) = (at::<ShareAccess>(share), at::<LinkShareAccess>(link));
+        (
+            [share.open_count.get(), share.readers.get(), share.writers.get(), share.deleters.get(), share.shared_read.get(), share.shared_write.get(), share.shared_delete.get()],
+            [link.open_count.get(), link.deleters.get(), link.shared_deleters.get()],
+        )
+    };
+    // Primeira abertura: FILE_READ_DATA|DELETE com FILE_SHARE_READ|FILE_SHARE_DELETE.
+    call_export("IoSetLinkShareAccess", &[0x1_0001, 5, first, share, link, 0]);
+    assert(counts() == ([1, 1, 0, 1, 1, 0, 1], [1, 1, 1]), "io-share-access-link: IoSetLinkShareAccess conta arquivo e link");
+    // Escrita contra leitor sem FILE_SHARE_WRITE; leitura sem compartilhar exclusão contra o Deleter do link.
+    assert(call_export("IoCheckLinkShareAccess", &[2, 7, second, share, link, 0]) == Some(0xFFFF_FFFF_C000_0043), "io-share-access-link: escrita viola o compartilhamento");
+    assert(call_export("IoCheckLinkShareAccess", &[1, 1, second, share, link, 1]) == Some(0xFFFF_FFFF_C000_0043) && counts() == ([1, 1, 0, 1, 1, 0, 1], [1, 1, 1]), "io-share-access-link: Deleters do link exigem FILE_SHARE_DELETE");
+    let file = at::<nt::FileObject>(second);
+    assert(
+        call_export("IoCheckLinkShareAccess", &[1, 5, second, share, link, 1]) == Some(0) && counts() == ([2, 2, 0, 1, 2, 0, 2], [2, 1, 2]) && file.read_access.get() == 1 && file.shared_delete.get() == 1,
+        "io-share-access-link: IoCheckLinkShareAccess com update soma arquivo e link",
+    );
+    call_export("IoRemoveLinkShareAccessEx", &[second, share, link, 0]);
+    assert(counts() == ([1, 1, 0, 1, 1, 0, 1], [1, 1, 1]), "io-share-access-link: IoRemoveLinkShareAccessEx desfaz a abertura");
+    call_export("IoUpdateLinkShareAccessEx", &[second, share, link, 0x80]);
+    assert(counts() == ([2, 2, 0, 1, 2, 0, 2], [2, 1, 2]), "io-share-access-link: flag 0x80 nao conta Deleters do link");
+    assert(call_export("IoCheckLinkShareAccess", &[1, 0, second, 0, 0, 0]) == Some(0xFFFF_FFFF_C000_000D), "io-share-access-link: ShareAccess NULL exige checagens desligadas");
+    // FoExtFlags & 1 (IO_IGNORE_SHARE_ACCESS_CHECK): sucesso sem contar.
+    let extension = guest::alloc_bytes(nt::IopFileObjectExtension::SIZE);
+    at::<nt::IopFileObjectExtension>(extension).fo_ext_flags.set(1);
+    at::<nt::FileObject>(ignored).file_object_extension.set(extension);
+    assert(call_export("IoCheckLinkShareAccess", &[2, 0, ignored, share, link, 1]) == Some(0) && counts() == ([2, 2, 0, 1, 2, 0, 2], [2, 1, 2]), "io-share-access-link: extensao ignora o compartilhamento");
+    for pointer in [first, second, ignored, share, link, extension] {
+        guest::free_bytes(pointer);
+    }
+}
+
+
+fn io_volume_information_exports(assert: Assert) {
+    use crate::drivers::fs::memory_file_system;
+    let status = |value: Option<u64>| value.map(|status| status as u32);
+    let block = guest::alloc_bytes(0x800);
+    let (guid, path, io_status, buffer, output) = (block + 0x700, block + 0x720, block + 0x740, block + 0x400, block + 0x760);
+
+    // Tipo de dispositivo fora de {CD-ROM, DISK, VIRTUAL_DISK, 0x24}: INVALID_PARAMETER.
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let volume = at::<nt::DeviceObject>(device);
+    volume.driver_object.set(driver);
+    volume.device_type.set(0x22);
+    volume.stack_size.set(1);
+    assert(
+        status(call_export("IoVolumeDeviceToGuidPath", &[device, path])) == Some(0xC000_000D) && status(call_export("IoVolumeDeviceToGuid", &[device, guid])) == Some(0xC000_000D),
+        "io-volume-information: tipo de dispositivo invalido",
+    );
+    // Disco sem IRP_MJ_DEVICE_CONTROL: o IOCTL_MOUNTDEV_QUERY_DEVICE_NAME falha e o erro volta.
+    volume.device_type.set(7);
+    let failed = status(call_export("IoVolumeDeviceToGuidPath", &[device, path])).unwrap_or(0);
+    assert(failed & 0x8000_0000 != 0, "io-volume-information: falha do IOCTL de nome do volume propaga");
+
+    // ZwSetVolumeInformationFile: classe sem tamanho, tamanho curto, handle inválido.
+    assert(
+        status(call_export("ZwSetVolumeInformationFile", &[0, io_status, buffer, 0x40, 1])) == Some(0xC000_0003)
+            && status(call_export("ZwSetVolumeInformationFile", &[0, io_status, buffer, 4, 2])) == Some(0xC000_0004)
+            && status(call_export("ZwSetVolumeInformationFile", &[0x1234_5678, io_status, buffer, 0x10, 2])) == Some(0xC000_0008),
+        "io-volume-information: validacao do ZwSetVolumeInformationFile",
+    );
+
+    // IoQueryInformationByName: classe fora do conjunto -> INVALID_PARAMETER; num
+    // arquivo existente, o mesmo status de abrir + ZwQueryInformationFile + fechar.
+    let _ = memory_file_system::write_bytes("/opennt-qbn.txt", b"abc".to_vec());
+    let attributes = object_attributes_for(block, "\\FS\\opennt-qbn.txt", 0x240);
+    assert(status(call_export("IoQueryInformationByName", &[attributes, io_status, buffer, 0x100, 4, 0, 0])) == Some(0xC000_000D), "io-volume-information: classe 4 recusada");
+    let by_name = status(call_export("IoQueryInformationByName", &[attributes, io_status, buffer, 0x100, 68, 0, 0]));
+    let opened = status(call_export("ZwOpenFile", &[output, 0x80, attributes, io_status, 7, 0x20_4000]));
+    let direct = if opened == Some(0) {
+        let handle = at::<nt::Field<u64>>(output).get();
+        let result = status(call_export("ZwQueryInformationFile", &[handle, io_status, buffer, 0x100, 68]));
+        call_export("ZwClose", &[handle]);
+        result
+    } else {
+        opened
+    };
+    assert(by_name.is_some() && by_name == direct, "io-volume-information: IoQueryInformationByName = abrir, consultar, fechar");
+    let missing = object_attributes_for(block + 0x200, "\\FS\\opennt-qbn-ausente.txt", 0x240);
+    let absent = status(call_export("IoQueryInformationByName", &[missing, io_status, buffer, 0x100, 68, 0, 0])).unwrap_or(0);
+    assert(absent & 0x8000_0000 != 0 && at::<nt::IoStatusBlock>(io_status).status.get() as u32 == absent, "io-volume-information: arquivo ausente propaga o erro do open");
+    for allocation in [block, driver, device] {
+        guest::free_bytes(allocation);
+    }
+}
+
+
+fn mm_file_system_support_exports(assert: Assert) {
+    // Sem CONTROL_AREA nos SECTION_OBJECT_POINTERS: nada a fechar -> TRUE.
+    let pointers = guest::alloc_bytes(nt::SectionObjectPointers::SIZE);
+    assert(call_export("MmForceSectionClosed", &[pointers, 0]) == Some(1) && call_export("MmForceSectionClosed", &[pointers, 1]) == Some(1), "mm-fs-support: MmForceSectionClosed sem secao");
+    // CONTROL_AREA com uma vista mapeada: em uso; o fechamento atrasado marca o bit 18.
+    let area = guest::alloc_bytes(nt::ControlArea::SIZE);
+    let control_area = at::<nt::ControlArea>(area);
+    control_area.number_of_mapped_views.set(1);
+    at::<nt::SectionObjectPointers>(pointers).data_section_object.set(area);
+    assert(call_export("MmForceSectionClosed", &[pointers, 0]) == Some(0) && control_area.u.long_flags.get() == 0, "mm-fs-support: secao mapeada continua aberta");
+    assert(call_export("MmForceSectionClosed", &[pointers, 1]) == Some(0) && control_area.u.long_flags.get() == 1 << 18, "mm-fs-support: DelayClose marca a CONTROL_AREA");
+    guest::free_bytes(area);
+    guest::free_bytes(pointers);
+
+    // MDL: precisa de MDL_PAGES_LOCKED|MDL_PAGE_CONTENTS_INVARIANT; sem página zero do sistema só o vazio passa.
+    let descriptor = guest::alloc_bytes(nt::Mdl::SIZE + 16);
+    let mdl = at::<nt::Mdl>(descriptor);
+    mdl.start_va.set(0xFFFF_8000_0000_0000);
+    assert(call_export("MmMdlPagesAreZero", &[descriptor]) == Some(0), "mm-fs-support: MDL sem as flags");
+    mdl.mdl_flags.set(0x4002);
+    assert(call_export("MmMdlPagesAreZero", &[descriptor]) == Some(1), "mm-fs-support: MDL invariante vazio");
+    mdl.byte_count.set(0x1000);
+    assert(call_export("MmMdlPagesAreZero", &[descriptor]) == Some(0), "mm-fs-support: PFN diferente da pagina zero");
+    guest::free_bytes(descriptor);
+
+    // Faixa escrita: o resultado é o bit Dirty do PTE válido (referência: paging::query_page).
+    let page = guest::alloc_page();
+    at::<nt::Field<u64>>(page).set(0x55);
+    let expected = crate::ntos::mm::paging::query_page(page, false).is_some_and(|query| query.flags & 0x40 != 0);
+    assert(call_export("MmSetAddressRangeModified", &[page, 8]) == Some(expected as u64), "mm-fs-support: MmSetAddressRangeModified segue o bit Dirty");
+}
+
+
+fn ob_audit_exports(assert: Assert) {
+    // Porta de conclusão de kernel sem nome (OBJECT_ATTRIBUTES com
+    // OBJ_KERNEL_HANDLE): sem auditoria de fechamento.
+    let attributes = guest::alloc_bytes(nt::ObjectAttributes::SIZE);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.root_directory.set(0);
+    object_attributes.object_name.set(0);
+    object_attributes.attributes.set(0x200);
+    object_attributes.security_descriptor.set(0);
+    object_attributes.security_quality_of_service.set(0);
+    let handle_out = guest::alloc_bytes(8);
+    let generate = guest::alloc_bytes(8);
+    let created = call_export("ZwCreateIoCompletion", &[handle_out, 0x001F_0003, attributes, 0]);
+    let handle = at::<nt::Field<u64>>(handle_out).get();
+    let generate_on_close = at::<nt::Field<u8>>(generate);
+    generate_on_close.set(0xFF);
+    let queried = call_export("ObQueryObjectAuditingByHandle", &[handle, generate]);
+    assert(created == Some(0) && queried == Some(0) && generate_on_close.get() == 0, "ob-audit: handle de kernel sem OBJ_AUDIT_OBJECT_CLOSE");
+    call_export("ZwClose", &[handle]);
+    generate_on_close.set(0x55);
+    let closed = call_export("ObQueryObjectAuditingByHandle", &[handle, generate]).map(|status| status as u32);
+    let bogus = call_export("ObQueryObjectAuditingByHandle", &[0x7FFF_FFF8, generate]).map(|status| status as u32);
+    assert(closed == Some(0xC000_0008) && bogus == Some(0xC000_0008) && generate_on_close.get() == 0x55, "ob-audit: handle fechado ou inexistente -> STATUS_INVALID_HANDLE sem escrita");
+}
+
+
+fn ob_temporary_object_exports(assert: Assert) {
+    use crate::ntos::ob::object_manager;
+    // Diretório permanente sem handles: ObMakeTemporaryObject tira o nome do namespace.
+    let _ = object_manager::create_directory("\\OpenNtTemporaryTest");
+    let node = object_manager::lookup("\\OpenNtTemporaryTest");
+    let body = node.and_then(|node| crate::ntos::ob::objects::namespace::ensure(node).ok().flatten()).unwrap_or(0);
+    crate::ntos::ob::objects::namespace::set_permanent(body, true);
+    call_export("ObMakeTemporaryObject", &[body]);
+    assert(
+        body != 0 && !crate::ntos::ob::objects::namespace::permanent(body) && object_manager::lookup("\\OpenNtTemporaryTest").is_none(),
+        "ob-temporary-object: diretorio sem handles perde o nome",
+    );
+}
+
+
+fn ps_io_boost_exports(assert: Assert) {
+    let count = &at::<nt::Ethread>(crate::ntos::ps::process::get_current_thread()).io_boost_count;
+    let before = count.get();
+    call_export("PsEnterPriorityRegion", &[]);
+    call_export("PsEnterPriorityRegion", &[]);
+    assert(count.get() == before + 2, "ps-io-boost: PsEnterPriorityRegion soma IoBoostCount");
+    call_export("PsLeavePriorityRegion", &[]);
+    call_export("PsLeavePriorityRegion", &[]);
+    assert(count.get() == before, "ps-io-boost: PsLeavePriorityRegion desfaz");
+    count.set(0);
+    call_export("PsLeavePriorityRegion", &[]);
+    assert(count.get() == 0, "ps-io-boost: sair sem regiao aberta nao estoura o contador");
+    count.set(before);
+}
+
+
+fn ps_disk_counters_exports(assert: Assert) {
+    // PsDisableDiskCounters = 0 -> habilitado; com um PROCESS_DISK_COUNTERS os campos somam.
+    let process = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let block = guest::alloc_bytes(nt::ProcessDiskCounters::SIZE);
+    guest::write_bytes(block, &[0u8; nt::ProcessDiskCounters::SIZE as usize]);
+    let eprocess = at::<nt::Eprocess>(process);
+    let counters = at::<nt::ProcessDiskCounters>(block);
+    eprocess.disk_counters.set(0);
+    call_export("PsUpdateDiskCounters", &[process, 1, 2, 3, 4, 5]);
+    eprocess.disk_counters.set(block);
+    call_export("PsUpdateDiskCounters", &[process, 0x1000, 0x2000, 3, 0, 1]);
+    assert(
+        call_export("PsIsDiskCountersEnabled", &[]) == Some(1)
+            && counters.bytes_read.get() == 0x1000
+            && counters.bytes_written.get() == 0x2000
+            && counters.read_operation_count.get() == 3
+            && counters.write_operation_count.get() == 0
+            && counters.flush_operation_count.get() == 1,
+        "ps-disk-counters: PsIsDiskCountersEnabled e PsUpdateDiskCounters",
+    );
+    guest::free_bytes(process);
+    guest::free_bytes(block);
+}
+
+
+fn rtl_bitmap_ranges_exports(assert: Assert) {
+    // 60 bits: 00 81 18 ff 00 00 24 07 (bits 60..63 do último byte fora do mapa).
+    let words = guest::alloc_bytes(8);
+    guest::write_bytes(words, &[0x00, 0x81, 0x18, 0xff, 0x00, 0x00, 0x24, 0x07]);
+    let header = guest::alloc_bytes(nt::RtlBitmap::SIZE);
+    at::<nt::RtlBitmap>(header).size_of_bit_map.set(60);
+    at::<nt::RtlBitmap>(header).buffer.set(words);
+    let set = |start: u64, length: u64| call_export("RtlNumberOfSetBitsInRange", &[header, start, length]);
+    assert(
+        set(0, 60) == Some(0x11) && set(8, 8) == Some(2) && set(13, 30) == Some(0xb) && set(59, 1) == Some(0),
+        "rtl-bitmap-ranges: RtlNumberOfSetBitsInRange",
+    );
+    assert(
+        set(60, 1) == Some(0xFFFF_FFFF)
+            && set(10, 51) == Some(0xFFFF_FFFF)
+            && set(5, 0) == Some(0xFFFF_FFFF)
+            && call_export("RtlNumberOfClearBitsInRange", &[header, 13, 30]) == Some(30 - 0xb)
+            && call_export("RtlNumberOfClearBitsInRange", &[header, 60, 1]) == Some(0xFFFF_FFFF),
+        "rtl-bitmap-ranges: faixas invalidas e RtlNumberOfClearBitsInRange",
+    );
+
+    let runs = guest::alloc_bytes(16 * nt::extra_fs_ntfs::RtlBitmapRun::SIZE);
+    let read_runs = |count: usize| {
+        let array = unsafe { nt::extra_fs_ntfs::RtlBitmapRun::array_at(runs, count) };
+        array.iter().map(|run| (run.starting_index.get(), run.number_of_bits.get())).collect::<alloc::vec::Vec<_>>()
+    };
+    assert(
+        call_export("RtlFindClearRuns", &[header, runs, 16, 0]) == Some(8)
+            && read_runs(8) == [(0, 8), (9, 6), (16, 3), (21, 3), (32, 18), (51, 2), (54, 2), (59, 1)],
+        "rtl-bitmap-ranges: RtlFindClearRuns todos os runs em ordem",
+    );
+    assert(
+        call_export("RtlFindClearRuns", &[header, runs, 3, 0]) == Some(3)
+            && read_runs(3) == [(0, 8), (9, 6), (16, 3)]
+            && call_export("RtlFindClearRuns", &[header, runs, 3, 1]) == Some(3)
+            && read_runs(3) == [(32, 18), (0, 8), (9, 6)],
+        "rtl-bitmap-ranges: RtlFindClearRuns primeiros e mais longos",
+    );
+
+    // Extração de 20 bits (limitada pelo destino) a partir do bit 5.
+    let source_words = guest::alloc_bytes(8);
+    guest::write_bytes(source_words, &[0xA5, 0x3C, 0xF0, 0x0F]);
+    let source = guest::alloc_bytes(nt::RtlBitmap::SIZE);
+    at::<nt::RtlBitmap>(source).size_of_bit_map.set(32);
+    at::<nt::RtlBitmap>(source).buffer.set(source_words);
+    let target_words = guest::alloc_bytes(8);
+    guest::write_bytes(target_words, &[0xFF, 0xFF, 0xFF]);
+    let target = guest::alloc_bytes(nt::RtlBitmap::SIZE);
+    at::<nt::RtlBitmap>(target).size_of_bit_map.set(20);
+    at::<nt::RtlBitmap>(target).buffer.set(target_words);
+    call_export("RtlExtractBitMap", &[source, target, 5, 40]);
+    assert(guest::read_bytes(target_words, 3) == [0xe5, 0x81, 0xff], "rtl-bitmap-ranges: RtlExtractBitMap preserva bits alem do tamanho");
+    for address in [words, header, runs, source_words, source, target_words, target] {
+        guest::free_bytes(address);
+    }
+}
+
+
+fn rtl_compression_exports(assert: Assert) {
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    let put = |bytes: &[u8]| {
+        let address = guest::alloc_bytes(bytes.len().max(1) as u64 + 16);
+        guest::write_bytes(address, bytes);
+        address
+    };
+    let sizes = guest::alloc_bytes(8);
+
+    // Tamanhos de workspace e validação de formato/engine.
+    assert(
+        status(call_export("RtlGetCompressionWorkSpaceSize", &[2, sizes, sizes + 4])) == Some(0)
+            && at::<nt::Field<u32>>(sizes).get() == 0x10020
+            && at::<nt::Field<u32>>(sizes + 4).get() == 0x1000
+            && status(call_export("RtlGetCompressionWorkSpaceSize", &[0x104, sizes, sizes + 4])) == Some(0)
+            && at::<nt::Field<u32>>(sizes).get() == 0x15_9B3F
+            && at::<nt::Field<u32>>(sizes + 4).get() == 0x1429,
+        "rtl-compression: RtlGetCompressionWorkSpaceSize LZNT1 / XPRESS_HUFF maximum",
+    );
+    assert(
+        status(call_export("RtlGetCompressionWorkSpaceSize", &[5, sizes, sizes + 4])) == Some(0xC000_025F)
+            && status(call_export("RtlGetCompressionWorkSpaceSize", &[1, sizes, sizes + 4])) == Some(0xC000_000D)
+            && status(call_export("RtlGetCompressionWorkSpaceSize", &[0x202, sizes, sizes + 4])) == Some(0xC000_00BB),
+        "rtl-compression: formato/engine invalidos",
+    );
+
+    // LZNT1 standard e maximum: bytes exatos do ntoskrnl/ntdll.
+    let text = b"hello hello hello world, hello world!";
+    let source = put(&text[..]);
+    let work = guest::alloc_bytes(0x10020);
+    guest::write_bytes(work, &alloc::vec![0u8; 0x10020]);
+    let output = guest::alloc_bytes(128);
+    let final_size = guest::alloc_bytes(4);
+    let standard: [u8; 23] = [0x14, 0xb0, 0x40, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x09, 0x50, 0x77, 0x60, 0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x04, 0x90, 0x02, 0x60, 0x21];
+    let maximum: [u8; 21] = [0x12, 0xb0, 0x40, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x09, 0x50, 0x77, 0x20, 0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x09, 0x60, 0x21];
+    let compressed_std = status(call_export("RtlCompressBuffer", &[2, source, text.len() as u64, output, 128, 4096, final_size, work])) == Some(0)
+        && at::<nt::Field<u32>>(final_size).get() == 23
+        && guest::read_bytes(output, 25) == [&standard[..], &[0u8, 0][..]].concat();
+    let compressed_max = status(call_export("RtlCompressBuffer", &[0x102, source, text.len() as u64, output, 128, 4096, final_size, work])) == Some(0)
+        && at::<nt::Field<u32>>(final_size).get() == 21
+        && guest::read_bytes(output, 21) == maximum;
+    assert(compressed_std && compressed_max, "rtl-compression: LZNT1 standard/maximum byte a byte");
+    let zeros = put(&[0u8; 100][..]);
+    assert(
+        status(call_export("RtlCompressBuffer", &[2, zeros, 100, output, 128, 4096, final_size, work])) == Some(0x117)
+            && at::<nt::Field<u32>>(final_size).get() == 6
+            && guest::read_bytes(output, 8) == [0x03, 0xb0, 0x02, 0x00, 0x60, 0x00, 0x00, 0x00]
+            && status(call_export("RtlCompressBuffer", &[2, source, text.len() as u64, output, 10, 4096, final_size, work])) == Some(0xC000_0023),
+        "rtl-compression: LZNT1 STATUS_BUFFER_ALL_ZEROS e STATUS_BUFFER_TOO_SMALL",
+    );
+
+    // LZNT1: buffer, chunk curto completado com zeros, fragmentos.
+    let packed = put(&standard[..]);
+    let plain = guest::alloc_bytes(64);
+    assert(
+        status(call_export("RtlDecompressBufferEx2", &[2, plain, 64, packed, 23, 0, final_size, 0])) == Some(0)
+            && at::<nt::Field<u32>>(final_size).get() == 37
+            && guest::read_bytes(plain, 37) == text,
+        "rtl-compression: LZNT1 descomprime o vetor do NT",
+    );
+    let two_chunks: [u8; 20] = [0x03, 0xb0, 0x02, 0x00, 0xfc, 0x0f, 0x0b, 0xb0, 0x00, 0x54, 0x41, 0x49, 0x4c, 0x74, 0x61, 0x69, 0x6c, 0x01, 0x15, 0x70];
+    let chunks = put(&two_chunks[..]);
+    let big = guest::alloc_bytes(4128);
+    let tail: alloc::vec::Vec<u8> = b"TAILtail".iter().copied().cycle().take(32).collect();
+    let whole = status(call_export("RtlDecompressBufferEx2", &[2, big, 4128, chunks, 20, 0, final_size, 0])) == Some(0)
+        && at::<nt::Field<u32>>(final_size).get() == 4128
+        && guest::read_bytes(big, 4096).iter().all(|&byte| byte == 0)
+        && guest::read_bytes(big + 4096, 32) == tail;
+    assert(whole, "rtl-compression: LZNT1 dois chunks (4096 zeros + cauda)");
+    let fragment = guest::alloc_bytes(16);
+    let scratch = guest::alloc_bytes(0x1000);
+    let fragments = status(call_export("RtlDecompressFragmentEx", &[2, fragment, 12, chunks, 20, 4090, 0, final_size, scratch])) == Some(0)
+        && at::<nt::Field<u32>>(final_size).get() == 12
+        && guest::read_bytes(fragment, 12) == [0, 0, 0, 0, 0, 0, 0x54, 0x41, 0x49, 0x4c, 0x74, 0x61]
+        && status(call_export("RtlDecompressFragmentEx", &[2, fragment, 6, chunks, 20, 4100, 0, final_size, scratch])) == Some(0)
+        && guest::read_bytes(fragment, 6) == [0x74, 0x61, 0x69, 0x6c, 0x54, 0x41]
+        && status(call_export("RtlDecompressFragmentEx", &[2, fragment, 4, chunks, 20, 4128, 0, final_size, scratch])) == Some(0)
+        && at::<nt::Field<u32>>(final_size).get() == 0;
+    assert(fragments, "rtl-compression: LZNT1 fragmentos no meio, depois e alem do fim");
+    let raw = put(&[0x02u8, 0x30, b'A', b'B', b'C'][..]);
+    assert(
+        status(call_export("RtlDecompressBufferEx2", &[2, plain, 10, raw, 5, 0, final_size, 0])) == Some(0)
+            && at::<nt::Field<u32>>(final_size).get() == 3
+            && guest::read_bytes(plain, 3) == b"ABC"
+            && status(call_export("RtlDecompressBufferEx2", &[2, plain, 10, raw, 4, 0, final_size, 0])) == Some(0xC000_0242)
+            && at::<nt::Field<u32>>(final_size).get() == raw as u32,
+        "rtl-compression: LZNT1 chunk nao comprimido e truncado",
+    );
+    let backwards = put(&[0x02u8, 0xb0, 0x01, 0x00, 0x00][..]);
+    assert(status(call_export("RtlDecompressBufferEx2", &[2, plain, 10, backwards, 5, 0, final_size, 0])) == Some(0xC000_0242), "rtl-compression: LZNT1 deslocamento antes do inicio");
+
+    // XPRESS LZ77 (vetor montado e conferido no ntdll).
+    let lz = put(&[0xffu8, 0xff, 0xff, 0x1f, b'a', b'b', b'c', 0x13, 0x00][..]);
+    let lz_bad = put(&[0xffu8, 0xff, 0xff, 0x1f, b'a', b'b', b'c', 0x23, 0x00][..]);
+    assert(
+        status(call_export("RtlDecompressBufferEx2", &[3, plain, 9, lz, 9, 0, final_size, 0])) == Some(0)
+            && at::<nt::Field<u32>>(final_size).get() == 9
+            && guest::read_bytes(plain, 9) == b"abcabcabc"
+            && status(call_export("RtlDecompressBufferEx2", &[3, plain, 8, lz, 9, 0, final_size, 0])) == Some(0xC000_0242)
+            && status(call_export("RtlDecompressBufferEx2", &[3, plain, 9, lz_bad, 9, 0, final_size, 0])) == Some(0xC000_0242)
+            && status(call_export("RtlDecompressFragmentEx", &[3, plain, 9, lz, 9, 0, 0, final_size, scratch])) == Some(0xC000_025F),
+        "rtl-compression: XPRESS descomprime, tamanho exato, offset invalido, sem fragmento",
+    );
+
+    // XPRESS Huffman: tabela 'A'=0,'B'=1; super-subscrita; incompleta; vazia.
+    let mut table = alloc::vec![0u8; 256];
+    table[0x20] = 0x10;
+    table[0x21] = 0x01;
+    let huffman = put(&[&table[..], &[0x00u8, 0x60, 0x00, 0x00][..]].concat());
+    let huff_work = guest::alloc_bytes(0x1429);
+    table[0x21] = 0x11;
+    let oversubscribed = put(&[&table[..], &[0u8; 4][..]].concat());
+    let mut incomplete = alloc::vec![0u8; 260];
+    incomplete[0x20] = 0x20;
+    let incomplete = put(&incomplete);
+    let mut empty = alloc::vec![0u8; 260];
+    empty[0] = 1;
+    let empty = put(&empty);
+    assert(
+        status(call_export("RtlDecompressBufferEx2", &[4, plain, 4, huffman, 260, 0, final_size, huff_work])) == Some(0)
+            && guest::read_bytes(plain, 4) == b"ABBA"
+            && status(call_export("RtlDecompressBufferEx2", &[4, plain, 5, huffman, 260, 0, final_size, huff_work])) == Some(0)
+            && guest::read_bytes(plain, 5) == b"ABBAA"
+            && status(call_export("RtlDecompressBufferEx2", &[4, plain, 1, oversubscribed, 260, 0, final_size, huff_work])) == Some(0xC000_0242)
+            && status(call_export("RtlDecompressBufferEx2", &[4, plain, 1, incomplete, 260, 0, final_size, huff_work])) == Some(0xC000_0242)
+            && status(call_export("RtlDecompressBufferEx2", &[4, plain, 0, empty, 260, 0, final_size, huff_work])) == Some(0)
+            && at::<nt::Field<u32>>(final_size).get() == 0
+            && status(call_export("RtlDecompressBufferEx2", &[4, plain, 4, huffman, 260, 0, final_size, 0])) == Some(0xC000_00E8),
+        "rtl-compression: XPRESS Huffman tabelas validas, super-subscritas, incompletas e vazias",
+    );
+
+    // Compressores XPRESS: ida e volta e contrato de tamanho.
+    let long: alloc::vec::Vec<u8> = text.iter().copied().cycle().take(600).collect();
+    let long_source = put(&long);
+    let packed_out = guest::alloc_bytes(1024);
+    let round_trip = |format: u64| {
+        status(call_export("RtlCompressBuffer", &[format, long_source, 600, packed_out, 1024, 4096, final_size, work])) == Some(0) && {
+            let packed_size = at::<nt::Field<u32>>(final_size).get() as u64;
+            let unpacked = guest::alloc_bytes(600);
+            let ok = status(call_export("RtlDecompressBufferEx2", &[format, unpacked, 600, packed_out, packed_size, 0, final_size, huff_work])) == Some(0)
+                && at::<nt::Field<u32>>(final_size).get() == 600
+                && guest::read_bytes(unpacked, 600) == long;
+            guest::free_bytes(unpacked);
+            ok
+        }
+    };
+    assert(round_trip(3) && round_trip(4) && round_trip(2), "rtl-compression: ida e volta XPRESS, XPRESS Huffman e LZNT1");
+    assert(
+        status(call_export("RtlCompressBuffer", &[3, source, 7, packed_out, 1024, 4096, final_size, work])) == Some(0xC000_0023)
+            && status(call_export("RtlCompressBuffer", &[3, source, 37, packed_out, 0x3F, 4096, final_size, work])) == Some(0xC000_0023)
+            && status(call_export("RtlCompressBuffer", &[4, source, 37, packed_out, 0x12B, 4096, final_size, work])) == Some(0xC000_0023)
+            && status(call_export("RtlCompressBuffer", &[0x203, source, 37, packed_out, 1024, 4096, final_size, work])) == Some(0xC000_00BB),
+        "rtl-compression: XPRESS buffers pequenos e engine invalido",
+    );
+    for address in [sizes, source, work, output, final_size, zeros, packed, plain, chunks, big, fragment, scratch, raw, backwards, lz, lz_bad, huffman, huff_work, oversubscribed, incomplete, empty, long_source, packed_out] {
+        guest::free_bytes(address);
+    }
+}
+
+
+fn rtl_nonvolatile_memory_exports(assert: Assert) {
+    let token = guest::alloc_bytes(8);
+    let buffer = guest::alloc_bytes(16);
+    guest::write_bytes(buffer, &[0x11; 16]);
+    assert(
+        call_export("RtlGetNonVolatileToken", &[buffer, 16, token]) == Some(0) && at::<nt::Field<u64>>(token).get() == 3,
+        "rtl-nonvolatile-memory: token valido com flush necessario",
+    );
+    assert(
+        call_export("RtlFreeNonVolatileToken", &[3]) == Some(0) && call_export("RtlFreeNonVolatileToken", &[2]).map(|status| status as u32) == Some(0xC000_000D),
+        "rtl-nonvolatile-memory: RtlFreeNonVolatileToken valida o bit 0",
+    );
+    assert(
+        call_export("RtlFillNonVolatileMemory", &[3, buffer, 10, 0xAB, 0]) == Some(0)
+            && guest::read_bytes(buffer, 16) == [0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]
+            && call_export("RtlFillNonVolatileMemory", &[3, buffer, 16, 0x5C, 2]) == Some(0)
+            && guest::read_bytes(buffer, 16).iter().all(|&byte| byte == 0x5C)
+            && call_export("RtlFillNonVolatileMemory", &[0, buffer, 16, 0, 0]).map(|status| status as u32) == Some(0xC000_000D)
+            && at::<nt::Field<u8>>(buffer).get() == 0x5C,
+        "rtl-nonvolatile-memory: RtlFillNonVolatileMemory",
+    );
+    guest::free_bytes(token);
+    guest::free_bytes(buffer);
+}
+
+
+fn rtl_security_descriptor_ops_exports(assert: Assert) {
+    // SD self-relative: SACL vazia, DACL {allow U, allow SYSTEM, allow U (dup), deny OWNER RIGHTS},
+    // dono S-1-5-21-11-22-33-500, grupo Administradores.
+    let sd_bytes: [u8; 192] = [
+        0x01, 0x00, 0x14, 0x80, 0x94, 0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x78, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00, 0xff, 0x01, 0x1f, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00,
+        0x21, 0x00, 0x00, 0x00, 0xe9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0xff, 0x01, 0x1f, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00,
+        0xff, 0x01, 0x1f, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00, 0xe9, 0x03, 0x00, 0x00,
+        0x01, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00,
+        0x0b, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00, 0xf4, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+    ];
+    let normalized: [u8; 148] = [
+        0x01, 0x00, 0x14, 0x80, 0x68, 0x00, 0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x02, 0x00, 0x54, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00,
+        0xff, 0x01, 0x1f, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00, 0xe9, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x14, 0x00, 0xff, 0x01, 0x1f, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00,
+        0xf4, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+    ];
+    let sd = guest::alloc_bytes(192);
+    guest::write_bytes(sd, &sd_bytes);
+    let sd_cell = guest::alloc_bytes(8);
+    at::<nt::Field<u64>>(sd_cell).set(sd);
+    let target = guest::alloc_bytes(192);
+    let target_cell = guest::alloc_bytes(8);
+    at::<nt::Field<u64>>(target_cell).set(target);
+    let length = guest::alloc_bytes(4);
+    assert(
+        call_export("RtlNormalizeSecurityDescriptor", &[sd_cell, 192, 0, 0, 1]) == Some(1)
+            && call_export("RtlNormalizeSecurityDescriptor", &[sd_cell, 192, target_cell, length, 0]) == Some(1)
+            && at::<nt::Field<u32>>(length).get() == 148
+            && guest::read_bytes(target, 148) == normalized
+            && at::<nt::Field<u64>>(sd_cell).get() == sd
+            && at::<nt::Field<u64>>(target_cell).get() == target,
+        "rtl-security-descriptor-ops: RtlNormalizeSecurityDescriptor tira SACL vazia e ACE duplicado",
+    );
+    at::<nt::Field<u64>>(target_cell).set(target);
+    assert(call_export("RtlNormalizeSecurityDescriptor", &[target_cell, 148, 0, 0, 1]) == Some(0), "rtl-security-descriptor-ops: SD normalizado nao muda");
+
+    // DACL em +0x1c: FindAceByType e OWNER RIGHTS.
+    let dacl = sd + 0x1c;
+    let index = guest::alloc_bytes(4);
+    at::<nt::Field<u32>>(index).set(1);
+    let found_allow = call_export("RtlFindAceByType", &[dacl, 0, index]) == Some(dacl + 44) && at::<nt::Field<u32>>(index).get() == 1;
+    at::<nt::Field<u32>>(index).set(0);
+    let found_deny = call_export("RtlFindAceByType", &[dacl, 1, index]) == Some(dacl + 100) && at::<nt::Field<u32>>(index).get() == 3;
+    assert(found_allow && found_deny && call_export("RtlFindAceByType", &[dacl, 2, 0]) == Some(0), "rtl-security-descriptor-ops: RtlFindAceByType");
+    let owner_rights = call_export("RtlOwnerAcesPresent", &[dacl]) == Some(1);
+    at::<nt::AceHeader>(dacl + 100).ace_flags.set(0x08);
+    let inherit_only = call_export("RtlOwnerAcesPresent", &[dacl]) == Some(0);
+    at::<nt::AceHeader>(dacl + 100).ace_flags.set(0x00);
+    assert(owner_rights && inherit_only, "rtl-security-descriptor-ops: RtlOwnerAcesPresent ignora INHERIT_ONLY");
+
+    // Troca do prefixo S-1-5-21-11-22-33 por S-1-5-21-11-22-44: dono e os dois ACEs do usuário.
+    let old_sid = guest::alloc_bytes(24);
+    guest::write_bytes(old_sid, &[1, 4, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 11, 0, 0, 0, 22, 0, 0, 0, 33, 0, 0, 0]);
+    let new_sid = guest::alloc_bytes(24);
+    guest::write_bytes(new_sid, &[1, 4, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 11, 0, 0, 0, 22, 0, 0, 0, 44, 0, 0, 0]);
+    let changes = guest::alloc_bytes(4);
+    let replaced = call_export("RtlReplaceSidInSd", &[sd, old_sid, new_sid, changes]) == Some(0) && at::<nt::Field<u32>>(changes).get() == 3;
+    let bytes = guest::read_bytes(sd, 192);
+    let differences: alloc::vec::Vec<usize> = (0..192).filter(|&at| bytes[at] != sd_bytes[at]).collect();
+    assert(replaced && differences == [64, 120, 168], "rtl-security-descriptor-ops: RtlReplaceSidInSd troca o prefixo do dominio");
+
+    // Sandbox: KernelMode nunca; personificacao abaixo de SecurityImpersonation sim;
+    // o contexto do System (integridade System) nao.
+    let context = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    at::<nt::SecuritySubjectContext>(context).client_token.set(0x1234);
+    at::<nt::SecuritySubjectContext>(context).impersonation_level.set(nt::SecurityImpersonationLevel::SECURITY_IDENTIFICATION);
+    assert(
+        call_export("RtlIsSandboxedToken", &[context, 0]) == Some(0)
+            && call_export("RtlIsSandboxedToken", &[context, 1]) == Some(1)
+            && call_export("RtlIsSandboxedToken", &[0, 1]) == Some(0),
+        "rtl-security-descriptor-ops: RtlIsSandboxedToken",
+    );
+    for address in [sd, sd_cell, target, target_cell, length, index, old_sid, new_sid, changes, context] {
+        guest::free_bytes(address);
+    }
+}
+
+
+fn rtl_support_routines_exports(assert: Assert) {
+    // RtlCopyString: trunca em MaximumLength e zera o Length com Source NULL.
+    let text = guest::alloc_bytes(8);
+    guest::write_bytes(text, b"hello");
+    let source = guest::alloc_bytes(nt::String::SIZE);
+    at::<nt::String>(source).length.set(5);
+    at::<nt::String>(source).maximum_length.set(8);
+    at::<nt::String>(source).buffer.set(text);
+    let storage = guest::alloc_bytes(8);
+    let destination = guest::alloc_bytes(nt::String::SIZE);
+    at::<nt::String>(destination).length.set(9);
+    at::<nt::String>(destination).maximum_length.set(4);
+    at::<nt::String>(destination).buffer.set(storage);
+    call_export("RtlCopyString", &[destination, source]);
+    let copied = at::<nt::String>(destination).length.get() == 4 && guest::read_bytes(storage, 4) == b"hell";
+    call_export("RtlCopyString", &[destination, 0]);
+    assert(copied && at::<nt::String>(destination).length.get() == 0, "rtl-support-routines: RtlCopyString");
+
+    // RtlCrc64 (CRC-64/NVME), valores do ntdll.
+    let digits = guest::alloc_bytes(16);
+    guest::write_bytes(digits, b"123456789");
+    let abc = guest::alloc_bytes(8);
+    guest::write_bytes(abc, b"abc");
+    assert(
+        call_export("RtlCrc64", &[digits, 9, 0]) == Some(0xAE8B_1486_0A79_9888)
+            && call_export("RtlCrc64", &[abc, 3, 0xDEAD_BEEF_CAFE_BABE]) == Some(0xF190_0535_BD3F_AC35)
+            && call_export("RtlCrc64", &[abc, 0, 0x1234]) == Some(0x1234),
+        "rtl-support-routines: RtlCrc64",
+    );
+
+    // isprint: classes do _pctype do ntoskrnl, byte baixo, EOF.
+    let classes: [(u64, u64); 11] = [(0x1F, 0), (0x20, 0x40), (0x21, 0x10), (0x41, 1), (0x61, 2), (0x30, 4), (0x7E, 0x10), (0x7F, 0), (0x80, 0), (0xFFFF_FFFF, 0), (0x141, 1)];
+    assert(classes.iter().all(|&(character, class)| call_export("isprint", &[character]) == Some(class)), "rtl-support-routines: isprint");
+
+    let reparse = |tag: u64| call_export("RtlIsNonEmptyDirectoryReparsePointAllowed", &[tag]);
+    assert(
+        reparse(0x9000_001A) == Some(1) && reparse(0x8000_0018) == Some(1) && reparse(0x1000_0000) == Some(1) && reparse(0xA000_000C) == Some(0) && reparse(0xA000_0003) == Some(0) && reparse(0x8000_001B) == Some(0),
+        "rtl-support-routines: RtlIsNonEmptyDirectoryReparsePointAllowed",
+    );
+
+    // RtlQueryModuleInformation: validação, tamanho com buffer NULL, buffer curto e cheio.
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    let length = guest::alloc_bytes(4);
+    let validated = status(call_export("RtlQueryModuleInformation", &[length, 16, 0])) == Some(0xC000_00F0)
+        && status(call_export("RtlQueryModuleInformation", &[length, 8, 0x1004])) == Some(0xC000_00F1);
+    let sized = status(call_export("RtlQueryModuleInformation", &[length, 8, 0])) == Some(0) && at::<nt::Field<u32>>(length).get() >= 8 && at::<nt::Field<u32>>(length).get() % 8 == 0;
+    let needed = at::<nt::Field<u32>>(length).get() as u64;
+    let modules = guest::alloc_bytes(needed + 8);
+    at::<nt::Field<u32>>(length).set(0);
+    let short = status(call_export("RtlQueryModuleInformation", &[length, 8, modules])) == Some(0xC000_0023) && at::<nt::Field<u32>>(length).get() as u64 == needed;
+    let filled = status(call_export("RtlQueryModuleInformation", &[length, 8, modules])) == Some(0) && at::<nt::extra_fs_ntfs::RtlModuleBasicInfo>(modules).image_base.get() != 0;
+    assert(validated && sized && short && filled, "rtl-support-routines: RtlQueryModuleInformation");
+
+    // RtlWalkFrameChain: flags invalidos, contagem -1, pulo > 0xFE e pilha de usuario dao 0.
+    let callers = guest::alloc_bytes(8 * 8);
+    assert(
+        call_export("RtlWalkFrameChain", &[callers, 4, 4]) == Some(0)
+            && call_export("RtlWalkFrameChain", &[callers, 0xFFFF_FFFF, 0]) == Some(0)
+            && call_export("RtlWalkFrameChain", &[callers, 4, 0xFF00]) == Some(0)
+            && call_export("RtlWalkFrameChain", &[callers, 4, 0x401]) == Some(0)
+            && call_export("RtlWalkFrameChain", &[callers, 4, 0]).is_some_and(|count| count <= 4),
+        "rtl-support-routines: RtlWalkFrameChain",
+    );
+    for address in [text, source, storage, destination, digits, abc, length, modules, callers] {
+        guest::free_bytes(address);
+    }
+}
+
+
+fn rtl_oem_strings_exports(assert: Assert) {
+    // Vetores das tabelas NLS reais (SCRATCHPAD/fsfat/oem_vectors.py lê c_437.nls/c_1252.nls).
+    let status = |value: Option<u64>| value.map(|status| status as u32);
+    let block = guest::alloc_bytes(0x400);
+    let (oem, unicode, out) = (block, block + 0x40, block + 0x80);
+    let (oem_string, unicode_string, out_string) = (at::<nt::String>(oem), at::<nt::UnicodeString>(unicode), at::<nt::String>(out));
+    let out_unicode = at::<nt::UnicodeString>(out);
+    let wide = |address: u64, count: u64| -> Vec<u16> { guest::read_bytes(address, count as usize * 2).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect() };
+    let oem_bytes = block + 0x200;
+    guest::write_bytes(oem_bytes, &[0x41, 0x82, 0x9B]);
+    oem_string.length.set(3);
+    oem_string.maximum_length.set(3);
+    oem_string.buffer.set(oem_bytes);
+
+    // RtlOemToUnicodeN: 41 82 9B -> U+0041 U+00E9 U+00A2; buffer de 2 WCHARs = BUFFER_OVERFLOW.
+    let written = block + 0x300;
+    let full = status(call_export("RtlOemToUnicodeN", &[block + 0x240, 8, written, oem_bytes, 3]));
+    let units = wide(block + 0x240, 3);
+    let short = status(call_export("RtlOemToUnicodeN", &[block + 0x240, 4, written, oem_bytes, 3]));
+    assert(full == Some(0) && units == [0x41, 0xE9, 0xA2] && short == Some(0x8000_0005) && at::<nt::Field<u32>>(written).get() == 4, "rtl-oem-strings: RtlOemToUnicodeN");
+    assert(call_export("RtlxOemStringToUnicodeSize", &[oem]) == Some(8), "rtl-oem-strings: RtlxOemStringToUnicodeSize");
+
+    // OEM_STRING -> UNICODE_STRING alocada (com NUL) e contada (sem NUL).
+    let converted = status(call_export("RtlOemStringToUnicodeString", &[unicode, oem, 1]));
+    let buffer = unicode_string.buffer.get();
+    assert(
+        converted == Some(0) && unicode_string.length.get() == 6 && unicode_string.maximum_length.get() == 8 && wide(buffer, 4) == [0x41, 0xE9, 0xA2, 0],
+        "rtl-oem-strings: RtlOemStringToUnicodeString",
+    );
+    let counted = status(call_export("RtlOemStringToCountedUnicodeString", &[out, oem, 1]));
+    assert(counted == Some(0) && out_unicode.length.get() == 6 && out_unicode.maximum_length.get() == 6, "rtl-oem-strings: RtlOemStringToCountedUnicodeString");
+    call_export("ExFreePool", &[out_unicode.buffer.get()]);
+
+    // UNICODE_STRING "Aé" -> OEM 41 82; maiúsculas "AÉ" -> 41 90; U+4E00 não tem mapeamento.
+    let set_units = |units: &[u16]| {
+        guest::write_bytes(buffer, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        unicode_string.length.set(units.len() as u16 * 2);
+    };
+    set_units(&[0x41, 0xE9]);
+    let to_oem = status(call_export("RtlUnicodeStringToOemString", &[out, unicode, 1]));
+    let oem_out = out_string.buffer.get();
+    assert(to_oem == Some(0) && out_string.length.get() == 2 && guest::read_bytes(oem_out, 3) == [0x41, 0x82, 0], "rtl-oem-strings: RtlUnicodeStringToOemString");
+    call_export("ExFreePool", &[oem_out]);
+    set_units(&[0x61, 0xE9]);
+    let upcased = status(call_export("RtlUpcaseUnicodeStringToCountedOemString", &[out, unicode, 1]));
+    let oem_out = out_string.buffer.get();
+    assert(
+        upcased == Some(0) && out_string.length.get() == 2 && out_string.maximum_length.get() == 2 && guest::read_bytes(oem_out, 2) == [0x41, 0x90],
+        "rtl-oem-strings: RtlUpcaseUnicodeStringToCountedOemString",
+    );
+    call_export("ExFreePool", &[oem_out]);
+    set_units(&[0x61, 0x4E00]);
+    let unmappable = status(call_export("RtlUnicodeStringToCountedOemString", &[out, unicode, 1]));
+    assert(unmappable == Some(0xC000_0162), "rtl-oem-strings: caractere sem mapeamento OEM");
+    call_export("ExFreePool", &[buffer]);
+
+    // RtlUpperString pela página ANSI: "ab\xE9" -> "AB\xC9".
+    let (source, destination) = (block + 0x100, block + 0x120);
+    let (source_string, destination_string) = (at::<nt::String>(source), at::<nt::String>(destination));
+    guest::write_bytes(block + 0x140, &[0x61, 0x62, 0xE9]);
+    source_string.length.set(3);
+    source_string.maximum_length.set(3);
+    source_string.buffer.set(block + 0x140);
+    destination_string.length.set(0);
+    destination_string.maximum_length.set(8);
+    destination_string.buffer.set(block + 0x160);
+    call_export("RtlUpperString", &[destination, source]);
+    assert(destination_string.length.get() == 3 && guest::read_bytes(block + 0x160, 3) == [0x41, 0x42, 0xC9], "rtl-oem-strings: RtlUpperString");
+
+    // Dados: página OEM SBCS -> tag FALSE e tabela de iniciais zerada.
+    let tag = crate::ntos::rtl::oem_code_page::mb_oem_code_page_tag_address();
+    let info = crate::ntos::rtl::oem_code_page::oem_lead_byte_info_address();
+    let table = at::<nt::Field<u64>>(info).get();
+    assert(
+        at::<nt::Field<u8>>(tag).get() == 0 && table == info + 8 && guest::read_bytes(table, 512).iter().all(|&byte| byte == 0),
+        "rtl-oem-strings: NlsMbOemCodePageTag e NlsOemLeadByteInfo",
+    );
+    guest::free_bytes(block);
+}
+
+
+fn rtl_8dot3_names_exports(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    let spaces = block + 0xF0;
+    let check = |text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        guest::write_bytes(block + 16, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let string = at::<nt::UnicodeString>(block);
+        string.length.set(units.len() as u16 * 2);
+        string.maximum_length.set(units.len() as u16 * 2);
+        string.buffer.set(block + 16);
+        let cell = at::<nt::Field<u8>>(spaces);
+        cell.set(0xAA);
+        (call_export("RtlIsNameLegalDOS8Dot3", &[block, 0, spaces]), cell.get())
+    };
+    // Bitmap 0x983bb0 do ntoskrnl e as regras 8.3 (minúsculas viram maiúsculas OEM).
+    assert(check("readme.txt") == (Some(1), 0), "rtl-8dot3: nome 8.3 legal");
+    assert(check("MY FILE.TXT") == (Some(1), 1), "rtl-8dot3: espaco interno marca NameContainsSpaces");
+    assert(check("..") == (Some(1), 0) && check(".") == (Some(1), 0), "rtl-8dot3: . e ..");
+    assert(
+        check("toolongname.txt").0 == Some(0) && check("a+b.txt").0 == Some(0) && check("name.text").0 == Some(0) && check("name .txt").0 == Some(0) && check("name.").0 == Some(0) && check("a.b.c").0 == Some(0),
+        "rtl-8dot3: nomes ilegais",
+    );
+    guest::free_bytes(block);
+}
+
+
+fn rtl_altitudes_and_time_exports(assert: Assert) {
+    // Vetores do modelo de referência (SCRATCHPAD/fsfat/altitude_ref.py, transcrito do RVA 0x313b70).
+    let cases: [(&str, &str, i32); 10] = [
+        ("385100", "385100", 0),
+        ("385100", "385200", -1),
+        ("40000", "385100", -1),
+        ("0385100", "385100", 0),
+        ("385100.5", "385100", 1),
+        ("385100.50", "385100.5", 0),
+        ("385100.25", "385100.3", -1),
+        ("328000", "0328000.000", 0),
+        ("1.2", "1.10", 1),
+        ("", "0", 0),
+    ];
+    let block = guest::alloc_bytes(0x200);
+    let unicode = |address: u64, text: &str| {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        guest::write_bytes(address + 16, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let string = at::<nt::UnicodeString>(address);
+        string.length.set(units.len() as u16 * 2);
+        string.maximum_length.set(units.len() as u16 * 2);
+        string.buffer.set(address + 16);
+        address
+    };
+    let all = cases.iter().all(|&(left, right, expected)| {
+        let (a, b) = (unicode(block, left), unicode(block + 0x100, right));
+        call_export("RtlCompareAltitudes", &[a, b]).map(|value| value as i32) == Some(expected)
+            && call_export("RtlCompareAltitudes", &[b, a]).map(|value| value as i32) == Some(if left == right || expected == 0 { 0 } else { -expected })
+    });
+    assert(all, "rtl-altitudes: RtlCompareAltitudes nos vetores de referencia");
+
+    // 10^9 s depois de 1970: (10^9 + 11644473600) * 10^7 = 126444736000000000.
+    call_export("RtlSecondsSince1970ToTime", &[1_000_000_000, block]);
+    let time = |offset: u64| at::<nt::LargeInteger>(block + offset).quad_part.get();
+    assert(time(0) == 126_444_736_000_000_000, "rtl-time: RtlSecondsSince1970ToTime");
+    // Hora local = sistema - viés, igual ao ExSystemTimeToLocalTime.
+    call_export("ExSystemTimeToLocalTime", &[block, block + 8]);
+    let status = call_export("RtlSystemTimeToLocalTime", &[block, block + 0x10]);
+    assert(status == Some(0) && time(0x10) == time(8), "rtl-time: RtlSystemTimeToLocalTime");
+    guest::free_bytes(block);
+}
+
+
+fn rtl_acl_trust_label_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let acl = guest::alloc_bytes(0x40);
+    assert(call_export("RtlCreateAcl", &[acl, 0x40, 2]) == Some(0), "rtl-acl-trust-label: RtlCreateAcl prepara a ACL");
+    // S-1-19-512-8192 (PROTECTION_TYPE_FULL, LEVEL_WINTCB), em pool: o
+    // RtlValidSid do kernel recusa endereços abaixo do espaço de sistema.
+    let pool_sid = || call_export("ExAllocatePoolWithTag", &[0x200, 16, 0x7473_6554]).unwrap_or(0);
+    let sid = pool_sid();
+    guest::write_bytes(sid, &[1, 2, 0, 0, 0, 0, 0, 0x13, 0x00, 0x02, 0, 0, 0x00, 0x20, 0, 0]);
+    let added = call_export("RtlAddProcessTrustLabelAce", &[acl, 2, 0, sid, 0x14, 0x0002_0019]);
+    // ACE esperada: tipo 0x14, flags 0, tamanho 0x18, máscara 0x20019 e o SID copiado.
+    let expected: [u8; 24] = [0x14, 0x00, 0x18, 0x00, 0x19, 0x00, 0x02, 0x00, 1, 2, 0, 0, 0, 0, 0, 0x13, 0x00, 0x02, 0, 0, 0x00, 0x20, 0, 0];
+    let header = at::<nt::Acl>(acl);
+    assert(added == Some(0) && header.ace_count.get() == 1 && guest::read_bytes(acl + nt::Acl::SIZE, 24) == expected, "rtl-acl-trust-label: ACE de rotulo de confianca no primeiro espaco livre");
+    // Revisão da ACE maior sobe a revisão da ACL.
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 4, 0, sid, 0x14, 0]) == Some(0) && header.acl_revision.get() == 4 && header.ace_count.get() == 2, "rtl-acl-trust-label: revisao da ACL acompanha a ACE");
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 2, 0, sid, 0x11, 0]) == Some(signed_status(0xC000_000D)), "rtl-acl-trust-label: tipo diferente de 0x14 recusado");
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 2, 0, sid, 0x14, 0x0100_0000]) == Some(signed_status(0xC000_000D)), "rtl-acl-trust-label: mascara com bits altos recusada");
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 5, 0, sid, 0x14, 0]) == Some(signed_status(0xC000_0059)), "rtl-acl-trust-label: revisao 5 = STATUS_REVISION_MISMATCH");
+    // S-1-16-12288 (integridade) não é SID de confiança de processo.
+    let integrity = pool_sid();
+    guest::write_bytes(integrity, &[1, 1, 0, 0, 0, 0, 0, 0x10, 0x00, 0x30, 0, 0]);
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 2, 0, integrity, 0x14, 0]) == Some(signed_status(0xC000_000D)), "rtl-acl-trust-label: SID fora de S-1-19 recusado");
+    // 0x40 - 8 - 2*0x18 = 8 bytes livres: a terceira ACE não cabe.
+    assert(call_export("RtlAddProcessTrustLabelAce", &[acl, 2, 0, sid, 0x14, 0]) == Some(signed_status(0xC000_0099)), "rtl-acl-trust-label: sem espaco = STATUS_ALLOTTED_SPACE_EXCEEDED");
+    assert(call_export("RtlAddProcessTrustLabelAce", &[0, 2, 0, sid, 0x14, 0]) == Some(signed_status(0xC000_0077)), "rtl-acl-trust-label: ACL NULL = STATUS_INVALID_ACL");
+    call_export("ExFreePool", &[sid]);
+    call_export("ExFreePool", &[integrity]);
+}
+
+
+fn se_access_check_ex_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_fs_ntfs::{SeAccessReply, SeAccessRequest, SeSecurityDescriptor};
+
+    // SD self-relative: owner=SYSTEM@20, DACL@32 com ACCESS_ALLOWED(0x1FF, SYSTEM).
+    let system_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let mut bytes = alloc::vec![0u8; 60];
+    bytes[0] = 1;
+    bytes[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&32u32.to_le_bytes());
+    bytes[20..32].copy_from_slice(&system_sid);
+    bytes[32] = 2;
+    bytes[34..36].copy_from_slice(&28u16.to_le_bytes());
+    bytes[36..38].copy_from_slice(&1u16.to_le_bytes());
+    bytes[42..44].copy_from_slice(&20u16.to_le_bytes());
+    bytes[44..48].copy_from_slice(&0x1FFu32.to_le_bytes());
+    bytes[48..60].copy_from_slice(&system_sid);
+    let descriptor = guest::alloc_bytes(0x80);
+    guest::write_bytes(descriptor, &bytes);
+    let mapping = guest::alloc_bytes(nt::GenericMapping::SIZE);
+    let generic = at::<nt::GenericMapping>(mapping);
+    generic.generic_read.set(0x0012_0089);
+    generic.generic_write.set(0x0012_0116);
+    generic.generic_execute.set(0x0012_00A0);
+    generic.generic_all.set(0x001F_01FF);
+    let context = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    call_export("SeCaptureSubjectContext", &[context]);
+
+    // SE_SECURITY_DESCRIPTOR, SE_ACCESS_REQUEST e SE_ACCESS_REPLY (como o ntfs monta na pilha).
+    let se_address = guest::alloc_bytes(SeSecurityDescriptor::SIZE);
+    let se_descriptor = at::<SeSecurityDescriptor>(se_address);
+    se_descriptor.size.set(SeSecurityDescriptor::SIZE as u32);
+    se_descriptor.flags.set(0);
+    se_descriptor.security_descriptor.set(descriptor);
+    let request_address = guest::alloc_bytes(SeAccessRequest::SIZE);
+    let request = at::<SeAccessRequest>(request_address);
+    request.size.set(SeAccessRequest::SIZE as u32);
+    request.se_security_descriptor.set(se_address);
+    request.principal_self_sid.set(0);
+    request.generic_mapping.set(mapping);
+    request.object_type_list_count.set(0);
+    request.object_type_list.set(0);
+    let (granted_address, status_address, reasons_address, privileges_address) =
+        (guest::alloc_bytes(8), guest::alloc_bytes(8), guest::alloc_bytes(nt::AccessReasons::SIZE), guest::alloc_bytes(8));
+    let (granted, status) = (at::<nt::Field<u32>>(granted_address), at::<nt::Field<u32>>(status_address));
+    let reasons = at::<nt::AccessReasons>(reasons_address);
+    let privileges = at::<nt::Field<u64>>(privileges_address);
+    let reply_address = guest::alloc_bytes(SeAccessReply::SIZE);
+    let reply = at::<SeAccessReply>(reply_address);
+    reply.size.set(SeAccessReply::SIZE as u32);
+    reply.result_list_count.set(1);
+    reply.granted_access.set(granted_address);
+    reply.access_status.set(status_address);
+    reply.access_reason.set(reasons_address);
+    reply.privileges.set(privileges_address);
+    let ex = |desired: u32, previous: u32, mode: u64| {
+        request.desired_access.set(desired);
+        request.previously_granted_access.set(previous);
+        call_export("SeAccessCheckEx", &[context, 1, request_address, reply_address, 0, mode])
+    };
+
+    assert(ex(1, 0, 1) == Some(1) && status.get() == 0 && granted.get() & 1 != 0, "se-access-check-ex: UserMode concede o acesso da DACL");
+    assert(ex(0x10000, 0, 1) == Some(0) && status.get() == 0xC000_0022 && granted.get() == 0, "se-access-check-ex: UserMode nega DELETE ausente");
+    // KernelMode + MAXIMUM_ALLOWED: GenericAll | resto | anterior; motivo do bit 0 zerado, Privileges NULL.
+    reasons.data[0].set(0xAAAA);
+    reasons.data[5].set(0xBBBB);
+    privileges.set(0xDEAD);
+    assert(
+        ex(0x0200_0001, 0x10000, 0) == Some(1) && granted.get() == 0x001F_01FF && status.get() == 0 && reasons.data[0].get() == 0 && reasons.data[5].get() == 0xBBBB && privileges.get() == 0,
+        "se-access-check-ex: KernelMode concede e limpa motivos/privilegios",
+    );
+    assert(ex(0, 0, 1) == Some(0) && status.get() == 0xC000_0022, "se-access-check-ex: Desired=0 sem anterior nega");
+    assert(ex(0, 0x20000, 1) == Some(1) && granted.get() == 0x20000 && status.get() == 0, "se-access-check-ex: Desired=0 devolve o ja concedido");
+    // ResultListCount 2 sem lista de tipos: STATUS_INVALID_PARAMETER.
+    reply.result_list_count.set(2);
+    assert(ex(1, 0, 1) == Some(0) && status.get() == 0xC000_000D, "se-access-check-ex: ResultListCount incoerente");
+    reply.result_list_count.set(1);
+    // Tamanhos errados: REQUEST -> INVALID_PARAMETER; REPLY -> FALSE sem tocar no status.
+    request.size.set(0x30);
+    assert(ex(1, 0, 1) == Some(0) && status.get() == 0xC000_000D, "se-access-check-ex: SE_ACCESS_REQUEST com tamanho errado");
+    request.size.set(SeAccessRequest::SIZE as u32);
+    reply.size.set(0x20);
+    status.set(0x1234);
+    assert(ex(1, 0, 1) == Some(0) && status.get() == 0x1234, "se-access-check-ex: SE_ACCESS_REPLY com tamanho errado");
+    reply.size.set(SeAccessReply::SIZE as u32);
+
+    // SeAccessCheckWithHint: o hint não muda a decisão.
+    let hint = |desired: u64| call_export("SeAccessCheckWithHint", &[descriptor, 0xF, context, 1, desired, 0, 0, mapping, 1, granted_address, status_address]);
+    assert(hint(1) == Some(1) && status.get() == 0, "se-access-check-ex: SeAccessCheckWithHint concede");
+    assert(hint(0x10000) == Some(0) && status.get() == 0xC000_0022, "se-access-check-ex: SeAccessCheckWithHint nega");
+
+    // SD com SACL só com SYSTEM_PROCESS_TRUST_LABEL_ACE(mask 0x20009, S-1-19-sub0-sub1).
+    let trust_sd = |sub0: u32, sub1: u32| {
+        let mut sd = alloc::vec![0u8; 52];
+        sd[0] = 1;
+        sd[2..4].copy_from_slice(&0x8010u16.to_le_bytes());
+        sd[12..16].copy_from_slice(&20u32.to_le_bytes());
+        sd[20] = 2;
+        sd[22..24].copy_from_slice(&32u16.to_le_bytes());
+        sd[24..26].copy_from_slice(&1u16.to_le_bytes());
+        sd[28] = 0x14;
+        sd[30..32].copy_from_slice(&24u16.to_le_bytes());
+        sd[32..36].copy_from_slice(&0x0002_0009u32.to_le_bytes());
+        sd[36..44].copy_from_slice(&[1, 2, 0, 0, 0, 0, 0, 19]);
+        sd[44..48].copy_from_slice(&sub0.to_le_bytes());
+        sd[48..52].copy_from_slice(&sub1.to_le_bytes());
+        let pointer = guest::alloc_bytes(52);
+        guest::write_bytes(pointer, &sd);
+        pointer
+    };
+    let protected = trust_sd(512, 8192);
+    let untrusted = trust_sd(0, 0);
+    let file_type = crate::ntos::ob::object_types::file_type().pointer;
+    let state_address = guest::alloc_bytes(nt::AccessState::SIZE);
+    let access_state = at::<nt::AccessState>(state_address);
+    let adjust = |flags: u32, granted_access: u32, sd: u64| {
+        access_state.flags.set(flags);
+        access_state.previously_granted_access.set(granted_access);
+        call_export("SeAdjustAccessStateForAccessConstraints", &[file_type, sd, state_address]);
+        access_state.previously_granted_access.get()
+    };
+    assert(adjust(2, 0x0112_0089, protected) == 0x0002_0009 && adjust(4, 0x011F_0116, protected) == 0x0002_0000, "se-access-check-ex: rotulo de confianca corta backup/restore");
+    assert(adjust(0, 0x0112_0089, protected) == 0x0112_0089 && adjust(2, 0x0112_0089, descriptor) == 0x0112_0089 && adjust(2, 0x0112_0089, untrusted) == 0x0112_0089, "se-access-check-ex: sem privilegio, sem rotulo ou rotulo dominado nao muda");
+    assert(
+        call_export("SeShouldCheckForAccessRightsFromParent", &[file_type, protected, state_address]) == Some(0)
+            && call_export("SeShouldCheckForAccessRightsFromParent", &[file_type, descriptor, state_address]) == Some(1)
+            && call_export("SeShouldCheckForAccessRightsFromParent", &[file_type, untrusted, state_address]) == Some(1),
+        "se-access-check-ex: SeShouldCheckForAccessRightsFromParent segue o rotulo de confianca",
+    );
+    call_export("SeReleaseSubjectContext", &[context]);
+}
+
+
+fn se_audit_alarms_exports(assert: Assert) {
+    use crate::ntos::se::audit;
+
+    let context = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    call_export("SeCaptureSubjectContext", &[context]);
+    // SD self-relative com SACL de uma SYSTEM_AUDIT_ACE (sucesso|falha, 0x1F01FF, Everyone S-1-1-0).
+    let mut bytes = alloc::vec![0u8; 48];
+    bytes[0] = 1;
+    bytes[2..4].copy_from_slice(&0x8010u16.to_le_bytes());
+    bytes[12..16].copy_from_slice(&20u32.to_le_bytes());
+    bytes[20] = 2;
+    bytes[22..24].copy_from_slice(&28u16.to_le_bytes());
+    bytes[24..26].copy_from_slice(&1u16.to_le_bytes());
+    bytes[28] = 2;
+    bytes[29] = 0xC0;
+    bytes[30..32].copy_from_slice(&20u16.to_le_bytes());
+    bytes[32..36].copy_from_slice(&0x001F_01FFu32.to_le_bytes());
+    bytes[36..48].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+    let audited = guest::alloc_bytes(48);
+    guest::write_bytes(audited, &bytes);
+    let plain = guest::alloc_bytes(nt::SecurityDescriptorRelative::SIZE);
+    let plain_header = at::<nt::SecurityDescriptorRelative>(plain);
+    plain_header.revision.set(1);
+    plain_header.control.set(0x8000);
+    let staging = guest::alloc_bytes(8);
+    let staging_enabled = at::<nt::Field<u8>>(staging);
+
+    // Portões da política zerada: FALSE e staging FALSE.
+    staging_enabled.set(0xFF);
+    assert(call_export("SeAuditingAnyFileEventsWithContextEx", &[audited, context, staging]) == Some(0) && staging_enabled.get() == 0, "se-audit-alarms: SeAuditingAnyFileEventsWithContextEx FALSE e staging FALSE");
+    assert(call_export("SeAuditingAnyFileEventsWithContextEx", &[audited, context, 0]) == Some(0), "se-audit-alarms: SeAuditingAnyFileEventsWithContextEx sem staging");
+    staging_enabled.set(0xFF);
+    assert(
+        call_export("SeAuditingFileEventsWithContextEx", &[1, audited, context, staging]) == Some(0) && staging_enabled.get() == 0 && call_export("SeAuditingFileEventsWithContextEx", &[0, audited, context, 0]) == Some(0),
+        "se-audit-alarms: SeAuditingFileEventsWithContextEx FALSE",
+    );
+    assert(call_export("SeAuditingHardLinkEventsWithContext", &[1, audited, context]) == Some(0) && call_export("SeAuditingHardLinkEventsWithContext", &[0, plain, context]) == Some(0), "se-audit-alarms: SeAuditingHardLinkEventsWithContext FALSE");
+
+    // ACCESS_STATE + AUX_ACCESS_DATA com marcadores; motivo em staging e privilégio usado.
+    let state_address = guest::alloc_bytes(nt::AccessState::SIZE);
+    let aux_address = guest::alloc_bytes(nt::AuxAccessData::SIZE);
+    let used = guest::alloc_bytes(nt::PrivilegeSet::SIZE);
+    let access_state = at::<nt::AccessState>(state_address);
+    let aux = at::<nt::AuxAccessData>(aux_address);
+    at::<nt::PrivilegeSet>(used).privilege_count.set(1);
+    aux.privileges_used.set(used);
+    aux.access_reasons.data[0].set(0x8000_0001);
+    access_state.aux_data.set(aux_address);
+    access_state.remaining_desired_access.set(0x0012_0089);
+    access_state.audit_privileges.set(0);
+    call_export("SeCaptureSubjectContext", &[access_state.subject_security_context.address()]);
+    let type_name = unicode_at(guest::alloc_bytes(0x40), "File");
+    let object_name = unicode_at(guest::alloc_bytes(0x40), "\\a.txt");
+    let generate = guest::alloc_bytes(8);
+    let generate_on_close = at::<nt::Field<u8>>(generate);
+    let reset = || {
+        access_state.generate_audit.set(0xFF);
+        aux.generate_staging_events.set(0xFF);
+        generate_on_close.set(0x77);
+    };
+    reset();
+    call_export("SeOpenObjectAuditAlarm", &[type_name, 0, object_name, audited, state_address, 0, 1, 1, generate]);
+    assert(
+        access_state.generate_audit.get() == 0 && aux.generate_staging_events.get() == 0 && generate_on_close.get() == 0x77 && access_state.audit_privileges.get() == 0,
+        "se-audit-alarms: SeOpenObjectAuditAlarm UserMode zera GenerateAudit/staging e nao toca GenerateOnClose",
+    );
+    reset();
+    call_export("SeOpenObjectAuditAlarmWithTransaction", &[type_name, 0, object_name, audited, state_address, 0, 1, 0, 0, generate]);
+    assert(access_state.generate_audit.get() == 0xFF && aux.generate_staging_events.get() == 0xFF, "se-audit-alarms: KernelMode nao audita");
+    reset();
+    call_export("SeOpenObjectAuditAlarmWithTransaction", &[type_name, 0, object_name, 0, state_address, 0, 0, 1, 0, generate]);
+    assert(access_state.generate_audit.get() == 0 && aux.generate_staging_events.get() == 0xFF, "se-audit-alarms: sem Sd so GenerateAudit e escrito");
+    reset();
+    call_export("SeOpenObjectForDeleteAuditAlarm", &[type_name, 0, object_name, audited, state_address, 0, 1, 1, generate]);
+    call_export("SeOpenObjectForDeleteAuditAlarmWithTransaction", &[type_name, 0, object_name, audited, state_address, 0, 0, 1, 0, generate]);
+    assert(access_state.generate_audit.get() == 0xFF && aux.generate_staging_events.get() == 0xFF && generate_on_close.get() == 0x77, "se-audit-alarms: OpenForDelete com o portao fechado nao escreve nada");
+
+    // Exclusão: portão fechado, nada no anel. Hard link e transação: sempre gravados.
+    let last = || audit::events().last().map(|event| (event.kind, event.detail.clone(), event.at_ms));
+    let before = last();
+    call_export("SeDeleteObjectAuditAlarm", &[state_address, 0x44]);
+    call_export("SeDeleteObjectAuditAlarmWithTransaction", &[state_address, 0x44, 0]);
+    assert(last() == before, "se-audit-alarms: SeDeleteObjectAuditAlarm nao registra com a politica zerada");
+    let file = unicode_at(guest::alloc_bytes(0x40), "a.txt");
+    let link = unicode_at(guest::alloc_bytes(0x40), "b.txt");
+    let transaction = guest::alloc_bytes(nt::Guid::SIZE);
+    let guid = at::<nt::Guid>(transaction);
+    guid.data1.set(0x1122_3344);
+    guid.data2.set(0x5566);
+    guid.data3.set(0x7788);
+    for (cell, byte) in guid.data4.iter().zip([0x99u8, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]) {
+        cell.set(byte);
+    }
+    call_export("SeAuditHardLinkCreation", &[file, link, 1]);
+    assert(last().is_some_and(|(kind, detail, _)| kind == "HardLinkCreation" && detail == "event=4664 file=a.txt link=b.txt success=true transaction={none}"), "se-audit-alarms: SeAuditHardLinkCreation registra o 4664");
+    call_export("SeAuditHardLinkCreationWithTransaction", &[file, link, 0, transaction]);
+    assert(
+        last().is_some_and(|(kind, detail, _)| kind == "HardLinkCreation" && detail == "event=4664 file=a.txt link=b.txt success=false transaction={11223344-5566-7788-99aabbccddeeff00}"),
+        "se-audit-alarms: SeAuditHardLinkCreationWithTransaction registra a transacao",
+    );
+    call_export("SeAuditTransactionStateChange", &[transaction, 0, 6]);
+    assert(
+        last().is_some_and(|(kind, detail, _)| kind == "TransactionStateChange" && detail == "event=4985 transaction={11223344-5566-7788-99aabbccddeeff00} rm={none} state=6"),
+        "se-audit-alarms: SeAuditTransactionStateChange registra o 4985",
+    );
+    call_export("SeReleaseSubjectContext", &[access_state.subject_security_context.address()]);
+    call_export("SeReleaseSubjectContext", &[context]);
+}
+
+
+fn se_set_security_exports(assert: Assert) {
+    let system: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let everyone: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let high_label: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x30, 0, 0];
+    let mapping = guest::alloc_bytes(nt::GenericMapping::SIZE);
+    let generic = at::<nt::GenericMapping>(mapping);
+    generic.generic_read.set(0x0012_0089);
+    generic.generic_write.set(0x0012_0116);
+    generic.generic_execute.set(0x0012_00A0);
+    generic.generic_all.set(0x001F_01FF);
+    let blob = |bytes: &[u8]| {
+        let pointer = guest::alloc_bytes(bytes.len() as u64);
+        guest::write_bytes(pointer, bytes);
+        pointer
+    };
+    let ace = |ace_type: u8, flags: u8, mask: u32, sid: &[u8; 12]| {
+        let mut entry = alloc::vec![ace_type, flags, 20, 0];
+        entry.extend_from_slice(&mask.to_le_bytes());
+        entry.extend_from_slice(sid);
+        entry
+    };
+    let acl = |entries: &[Vec<u8>]| {
+        let size = 8 + entries.iter().map(Vec::len).sum::<usize>();
+        let mut bytes = alloc::vec![2u8, 0, size as u8, 0, entries.len() as u8, 0, 0, 0];
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+        }
+        bytes
+    };
+    // Descritor atual self-relative: owner/group SYSTEM, sem DACL.
+    let mut current = alloc::vec![0u8; 20];
+    current[0] = 1;
+    current[2..4].copy_from_slice(&0x8000u16.to_le_bytes());
+    current[4..8].copy_from_slice(&20u32.to_le_bytes());
+    current[8..12].copy_from_slice(&32u32.to_le_bytes());
+    current.extend_from_slice(&system);
+    current.extend_from_slice(&system);
+    let old = blob(&current);
+    // Modificações em SECURITY_DESCRIPTOR absoluto.
+    let absolute = |control: u16, owner: u64, group: u64, sacl: u64, dacl: u64| {
+        let pointer = guest::alloc_bytes(nt::SecurityDescriptor::SIZE);
+        let descriptor = at::<nt::SecurityDescriptor>(pointer);
+        descriptor.revision.set(1);
+        descriptor.sbz1.set(0);
+        descriptor.control.set(control);
+        descriptor.owner.set(owner);
+        descriptor.group.set(group);
+        descriptor.sacl.set(sacl);
+        descriptor.dacl.set(dacl);
+        pointer
+    };
+    let information = guest::alloc_bytes(4);
+    let slot = guest::alloc_bytes(8);
+    let object_descriptor = at::<nt::Field<u64>>(slot);
+    let set = |info: u32, modification: u64, sd: u64, flags: u64| {
+        at::<nt::Field<u32>>(information).set(info);
+        object_descriptor.set(sd);
+        call_export("SeSetSecurityDescriptorInfoEx", &[0, information, modification, slot, flags, 1, mapping]).map(|status| status as u32)
+    };
+
+    // DACL nova com GENERIC_READ para SYSTEM: genéricos mapeados, owner/group do atual, antigo intacto.
+    let dacl_modification = absolute(0x0004, 0, 0, 0, blob(&acl(&[ace(0, 0, 0x8000_0000, &system)])));
+    let expected: [u8; 72] = [
+        0x01, 0x00, 0x04, 0x80, 0x30, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x02, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x89, 0x00, 0x12, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00,
+    ];
+    assert(set(4, dacl_modification, old, 0) == Some(0), "se-set-security: SeSetSecurityDescriptorInfoEx troca a DACL");
+    let created = object_descriptor.get();
+    assert(created != old && guest::read_bytes(created, 72) == expected && guest::read_bytes(old, 44) == current, "se-set-security: SD self-relative novo exato e antigo nao liberado");
+
+    // Owner: SYSTEM aceito; sem owner -> INVALID_OWNER; AutoInheritFlags 8 pula a verificação.
+    let owner_bytes = |sd: u64| guest::read_bytes(sd + at::<nt::SecurityDescriptorRelative>(sd).owner.get() as u64, 12);
+    let system_owner = blob(&system);
+    assert(set(1, absolute(0, system_owner, 0, 0, 0), old, 0) == Some(0) && owner_bytes(object_descriptor.get()) == system, "se-set-security: owner SYSTEM atribuivel");
+    assert(set(1, absolute(0, 0, 0, 0, 0), old, 0) == Some(0xC000_005A), "se-set-security: owner ausente -> STATUS_INVALID_OWNER");
+    assert(set(1, absolute(0, blob(&everyone), 0, 0, 0), old, 8) == Some(0) && owner_bytes(object_descriptor.get()) == everyone, "se-set-security: SEF_AVOID_OWNER_CHECK aceita qualquer owner valido");
+    assert(set(2, absolute(0, 0, 0, 0, 0), old, 0) == Some(0xC000_005B), "se-set-security: group ausente -> STATUS_INVALID_PRIMARY_GROUP");
+
+    // SACL: o seletor SACL troca a auditoria e preserva o rótulo do atual.
+    let mut labelled = alloc::vec![0u8; 20];
+    labelled[0] = 1;
+    labelled[2..4].copy_from_slice(&0x8010u16.to_le_bytes());
+    labelled[4..8].copy_from_slice(&48u32.to_le_bytes());
+    labelled[8..12].copy_from_slice(&60u32.to_le_bytes());
+    labelled[12..16].copy_from_slice(&20u32.to_le_bytes());
+    labelled.extend_from_slice(&acl(&[ace(0x11, 0, 1, &high_label)]));
+    labelled.extend_from_slice(&system);
+    labelled.extend_from_slice(&system);
+    let audit_modification = absolute(0x0010, 0, 0, blob(&acl(&[ace(2, 0x80, 0x10000, &everyone)])), 0);
+    assert(set(8, audit_modification, blob(&labelled), 0) == Some(0), "se-set-security: SeSetSecurityDescriptorInfoEx troca a SACL");
+    let merged = object_descriptor.get();
+    let merged_header = at::<nt::SecurityDescriptorRelative>(merged);
+    let sacl = merged + merged_header.sacl.get() as u64;
+    let first = at::<nt::AccessAllowedAce>(sacl + nt::Acl::SIZE);
+    let second = at::<nt::AceHeader>(sacl + nt::Acl::SIZE + first.header.ace_size.get() as u64);
+    assert(
+        merged_header.control.get() == 0x8010 && at::<nt::Acl>(sacl).ace_count.get() == 2 && first.header.ace_type.get() == 2 && first.mask.get() == 0x10000 && second.ace_type.get() == 0x11,
+        "se-set-security: SACL nova = auditoria da modificacao + rotulo preservado",
+    );
+
+    // Erros de formato.
+    assert(set(4, dacl_modification, 0, 0) == Some(0xC000_00D7), "se-set-security: sem descritor -> STATUS_NO_SECURITY_ON_OBJECT");
+    assert(set(4, dacl_modification, absolute(0, system_owner, system_owner, 0, 0), 0) == Some(0xC000_00E7), "se-set-security: descritor absoluto -> STATUS_BAD_DESCRIPTOR_FORMAT");
+
+    // SeComputeAutoInheritByObjectType: pai autoherdado (DACL|SACL), filho sem/com DACL.
+    let parent = blob(&[1, 0, 0x14, 0x8C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let child_with_dacl = blob(&[1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert(
+        call_export("SeComputeAutoInheritByObjectType", &[0, old, parent]) == Some(3)
+            && call_export("SeComputeAutoInheritByObjectType", &[0, child_with_dacl, parent]) == Some(2)
+            && call_export("SeComputeAutoInheritByObjectType", &[0, old, 0]) == Some(0),
+        "se-set-security: SeComputeAutoInheritByObjectType",
+    );
+
+    let removed = guest::alloc_bytes(8);
+    let ace_removed = at::<nt::Field<u8>>(removed);
+    ace_removed.set(0xFF);
+    call_export("SeCheckForCriticalAceRemoval", &[old, dacl_modification, 0, removed]);
+    assert(ace_removed.get() == 0, "se-set-security: SeCheckForCriticalAceRemoval sempre FALSE");
+    assert(call_export("SeAdjustObjectSecurity", &[0, old, dacl_modification, 0, 0, 0]).map(|status| status as u32) == Some(0xC000_0002), "se-set-security: SeAdjustObjectSecurity -> STATUS_NOT_IMPLEMENTED");
+}
+
+
+fn hvi_hardware_exports(assert: Assert) {
+    use crate::hal::cpu;
+    // Referência: as leaves CPUID lidas diretamente, na ordem do hvilib.
+    let present = cpu::cpuid(1)[2] & (1 << 31) != 0 && cpu::cpuid(0x4000_0001)[0] != 0x766E_6258;
+    let leaf = if present { cpu::cpuid(0x4000_0000) } else { [0; 4] };
+    let expected = if leaf[0] >= 0x4000_0006 { cpu::cpuid(0x4000_0006) } else { [0; 4] };
+    let microsoft = present && leaf[1..] == [0x7263_694D, 0x666F_736F, 0x7648_2074];
+    let features = guest::alloc_bytes(16);
+    // SAFETY: bloco de 16 bytes alocado aqui.
+    let registers = unsafe { nt::Field::<u32>::array_at(features, 4) };
+    for cell in registers {
+        cell.set(0xDEAD_BEEF);
+    }
+    let written = call_export("HviGetHardwareFeatures", &[features]);
+    let observed: [u32; 4] = core::array::from_fn(|index| registers[index].get());
+    assert(written == Some(0) && observed == expected, "hvi-hardware: HviGetHardwareFeatures = leaf 0x40000006 ou zeros");
+    assert(call_export("HviIsHypervisorVendorMicrosoft", &[]) == Some(microsoft as u64), "hvi-hardware: HviIsHypervisorVendorMicrosoft pela assinatura Microsoft Hv");
+    guest::free_bytes(features);
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -6809,6 +10180,58 @@ pub fn run(assert: Assert) {
     se_appcontainer_exports(assert);
     alpc_message_attributes_exports(assert);
     ob_security_cache_exports(assert);
+    tm_transaction_manager_exports(assert);
+    tm_extension_exports(assert);
+    vf_verifier_exports(assert);
+    fsrtl_file_locks_exports(assert);
+    fsrtl_oplocks_exports(assert);
+    fsrtl_ecp_exports(assert);
+    fsrtl_filter_contexts_exports(assert);
+    fsrtl_file_system_support_exports(assert);
+    fsrtl_misc_exports(assert);
+    fsrtl_base_mcb_exports(assert);
+    fsrtl_large_mcb_exports(assert);
+    fsrtl_eof_lock_exports(assert);
+    fsrtl_fast_io_exports(assert);
+    fsrtl_heat_exports(assert);
+    fsrtl_oplock_ex_exports(assert);
+    fsrtl_per_file_teardown_exports(assert);
+    fsrtl_tunnel_cache_exports(assert);
+    fsrtl_tunnel_exports(assert);
+    fsrtl_file_lock_irp_exports(assert);
+    fsrtl_notify_exports(assert);
+    fsrtl_volume_support_exports(assert);
+    ex_auto_expand_push_lock_exports(assert);
+    ex_resource_owner_exports(assert);
+    ex_resource_owner_and_local_time_exports(assert);
+    ex_cache_aware_push_locks_exports(assert);
+    io_file_object_extensions_exports(assert);
+    io_priority_exports(assert);
+    io_file_system_exports(assert);
+    io_irp_support_exports(assert);
+    io_file_system_support_exports(assert);
+    io_paging_exports(assert);
+    io_share_access_exports(assert);
+    io_share_access_link_exports(assert);
+    io_volume_information_exports(assert);
+    mm_file_system_support_exports(assert);
+    ob_audit_exports(assert);
+    ob_temporary_object_exports(assert);
+    ps_io_boost_exports(assert);
+    ps_disk_counters_exports(assert);
+    rtl_bitmap_ranges_exports(assert);
+    rtl_compression_exports(assert);
+    rtl_nonvolatile_memory_exports(assert);
+    rtl_security_descriptor_ops_exports(assert);
+    rtl_support_routines_exports(assert);
+    rtl_oem_strings_exports(assert);
+    rtl_8dot3_names_exports(assert);
+    rtl_altitudes_and_time_exports(assert);
+    rtl_acl_trust_label_exports(assert);
+    se_access_check_ex_exports(assert);
+    se_audit_alarms_exports(assert);
+    se_set_security_exports(assert);
+    hvi_hardware_exports(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

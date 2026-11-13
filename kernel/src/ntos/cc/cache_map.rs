@@ -602,6 +602,46 @@ pub fn file_object_from_section_pointers(pointers: u64) -> u64 {
     map.native().file_object_fast_ref.object.get() & !0xF
 }
 
+/// CcChangeBackingFileObject(CurrentFileObject, NewFileObject): o mapa do
+/// stream (pela SectionObjectPointer do novo arquivo) passa a paginar pelo
+/// novo FILE_OBJECT — sem dono atual informado, troca qualquer arquivo; com
+/// dono, só se for ele. O mapa referencia o novo e solta o antigo, fora do
+/// lock do Cc (o OB do OpenNT pode apagar o objeto de forma síncrona). Sem
+/// cache map no stream não há o que trocar: STATUS_SUCCESS sem mudança,
+/// como o MmChangeSectionBackingFile sem CONTROL_AREA.
+pub fn change_backing_file_object(current: u64, new: u64) -> Result<u32, KernelError> {
+    const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+    let pointers = section_pointers_of(new);
+    if current != 0 && section_pointers_of(current) != pointers {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    let Some(base) = map_of_pointers(pointers) else { return Ok(0) };
+    let referenced_new = matches!(file_objects::reference(new), Ok(Some(_)));
+    let released = {
+        let mut cache = CACHE.lock();
+        match cache.maps.get_mut(&base) {
+            Some(map) if current == 0 || map.file_object == current => {
+                let previous = (map.file_object, map.referenced);
+                map.native().file_object_fast_ref.object.set(new & !0xF);
+                map.file_object = new;
+                map.referenced = referenced_new;
+                Some(previous)
+            }
+            _ => None,
+        }
+    };
+    match released {
+        Some((old, true)) => {
+            let _ = file_objects::dereference(old);
+        }
+        None if referenced_new => {
+            let _ = file_objects::dereference(new);
+        }
+        _ => {}
+    }
+    Ok(0)
+}
+
 /// Snapshot de leitura de um mapa (testes e diagnósticos).
 pub struct MapInfo {
     pub open_count: u32,

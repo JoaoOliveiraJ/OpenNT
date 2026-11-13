@@ -159,6 +159,7 @@ pub fn allocate_irp(stack_size: i8) -> u64 {
 
 /// IoFreeIrp: a extensão pertence ao IRP e não sobrevive ao reuso.
 pub fn free_irp(packet: u64) {
+    let _ = crate::ntos::io::extensions::free_irp_extension(packet);
     irp_extension::release(packet);
     guest::free_bytes(packet);
 }

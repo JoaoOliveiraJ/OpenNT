@@ -69,3 +69,20 @@ pub fn time_fields_to_time(time_fields: u64, time: u64) -> bool {
     time_at(time).quad_part.set((seconds * 10_000_000 + millisecond as u64 * 10_000) as i64);
     true
 }
+
+/// Segundos entre 1601-01-01 e 1970-01-01 (SecondsToStartOf1970 do ntoskrnl).
+pub const SECONDS_TO_START_OF_1970: u64 = 11_644_473_600;
+
+/// RtlSecondsSince1970ToTime (RVA 0x3ccef0): (ULONG + 11644473600) * 10^7.
+pub fn seconds_since_1970_to_time(seconds: u32, time: &LargeInteger) {
+    time.quad_part.set((seconds as u64 + SECONDS_TO_START_OF_1970).wrapping_mul(10_000_000) as i64);
+}
+
+/// RtlSystemTimeToLocalTime (RVA 0x7cd960): o NT lê TimeZoneBias de
+/// ZwQuerySystemInformation(SystemTimeOfDayInformation) e grava
+/// SystemTime - TimeZoneBias; o viés vem da mesma fonte do Executive.
+pub fn system_time_to_local_time(system_time: &LargeInteger, local_time: &LargeInteger) -> u32 {
+    let bias = crate::ntos::ex::system_time::time_zone_bias();
+    local_time.quad_part.set(system_time.quad_part.get().wrapping_sub(bias));
+    0
+}

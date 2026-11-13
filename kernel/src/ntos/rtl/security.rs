@@ -280,3 +280,407 @@ fn app_container_sid_type(sid: &[u8]) -> Option<u32> {
 pub fn is_parent_of_child_app_container(parent: &[u8], child: &[u8]) -> bool {
     app_container_sid_type(parent) == Some(2) && app_container_sid_type(child) == Some(1) && (1..8).all(|index| sid_sub_authority(parent, index) == sid_sub_authority(child, index))
 }
+
+// ---- ACEs, troca de SIDs, normalização e sandbox (ntoskrnl 19045) -----------
+//
+// RtlFindAceByType 0x2d29c0, RtlOwnerAcesPresent 0x2f43d0 (RtlpOwnerAcesPresent
+// 0x2f43f0), RtlReplaceSidInSd 0x9138b0, RtlNormalizeSecurityDescriptor
+// 0x2024f0, RtlIsSandboxedToken 0x652b50. Usa os auxiliares do arquivo
+// (`out`, `acl_at`) e as estruturas de `inc::types`.
+
+use crate::ntos::inc::types::{AccessAllowedAce, AccessAllowedObjectAce, CompoundAccessAllowedAce, Guid, SecurityDescriptorRelative, SecuritySubjectContext};
+
+const ACE_INHERIT_ONLY: u8 = 0x08;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+const COMPOUND_ACE_TYPE: u8 = 0x04;
+/// Tipos de ACE de objeto (5..8, 0xB, 0xC, 0xF, 0x10): bitmap 0x199e0 do original.
+const OBJECT_ACE_TYPES: u32 = 0x1_99E0;
+/// ACE_OBJECT_TYPE_PRESENT / ACE_INHERITED_OBJECT_TYPE_PRESENT.
+const ACE_OBJECT_TYPE_PRESENT: u32 = 1;
+const ACE_INHERITED_OBJECT_TYPE_PRESENT: u32 = 2;
+/// S-1-3-4 (SeExports->SeOwnerRightsSid).
+const OWNER_RIGHTS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+/// ExAllocatePoolWithTag(PagedPool, Length, 'SeSd').
+const PAGED_POOL: u32 = 1;
+const NORMALIZE_TAG: u32 = 0x6453_6553;
+
+const ACL_HEADER: u64 = core::mem::size_of::<Acl>() as u64;
+const SID_HEADER: u64 = core::mem::offset_of!(Sid, sub_authority) as u64;
+const RELATIVE_HEADER: u32 = core::mem::size_of::<SecurityDescriptorRelative>() as u32;
+
+// SAFETY (conversões abaixo): ACEs e SIDs dentro de ACLs/SDs do chamador,
+// percorridos pelos tamanhos gravados neles, como no NT.
+fn ace_header_at(ace: u64) -> &'static AceHeader {
+    unsafe { AceHeader::at(ace) }
+}
+fn sid_at(sid: u64) -> &'static Sid {
+    unsafe { Sid::at(sid) }
+}
+fn relative_at(descriptor: u64) -> &'static SecurityDescriptorRelative {
+    unsafe { SecurityDescriptorRelative::at(descriptor) }
+}
+
+/// RtlFindAceByType(Acl, AceType, *Index): primeiro ACE do tipo; com `Index`,
+/// só a partir de `*Index`, que recebe a posição encontrada. NULL se nenhum.
+pub fn find_ace_by_type(acl: u64, ace_type: u32, index: u64) -> u64 {
+    if acl == 0 {
+        return 0;
+    }
+    let index = (index != 0).then(|| out::<u32>(index));
+    let mut ace = acl + ACL_HEADER;
+    for position in 0..acl_at(acl).ace_count.get() as u32 {
+        let header = ace_header_at(ace);
+        let matches = header.ace_type.get() as u32 == ace_type;
+        match index {
+            None if matches => return ace,
+            Some(index) if matches && position >= index.get() => {
+                index.set(position);
+                return ace;
+            }
+            _ => {}
+        }
+        ace += header.ace_size.get() as u64;
+    }
+    0
+}
+
+/// SID de um ACE para o RtlpOwnerAcesPresent (0 = tipo sem SID examinado).
+fn owner_scan_sid(ace: u64) -> u64 {
+    let ace_type = ace_header_at(ace).ace_type.get();
+    if ace_type <= 0x10 && OBJECT_ACE_TYPES & (1u32 << ace_type) != 0 {
+        // SAFETY: ACE de objeto (cabeçalho, máscara e Flags presentes).
+        let flags = unsafe { AccessAllowedObjectAce::at(ace) }.flags.get();
+        let guid = core::mem::size_of::<Guid>() as u64;
+        let mut sid = ace + core::mem::offset_of!(AccessAllowedObjectAce, object_type) as u64;
+        if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+            sid += guid;
+        }
+        if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+            sid += guid;
+        }
+        return sid;
+    }
+    match ace_type {
+        COMPOUND_ACE_TYPE => ace + core::mem::offset_of!(CompoundAccessAllowedAce, sid_start) as u64,
+        0..=0xA | 0xD | 0xE => ace + core::mem::offset_of!(AccessAllowedAce, sid_start) as u64,
+        _ => 0,
+    }
+}
+
+/// RtlOwnerAcesPresent(Acl): algum ACE efetivo (não INHERIT_ONLY) com o SID
+/// OWNER RIGHTS (S-1-3-4).
+pub fn owner_aces_present(acl: u64) -> bool {
+    if acl == 0 {
+        return false;
+    }
+    let mut ace = acl + ACL_HEADER;
+    for _ in 0..acl_at(acl).ace_count.get() {
+        let header = ace_header_at(ace);
+        if header.ace_flags.get() & ACE_INHERIT_ONLY == 0 {
+            let sid = owner_scan_sid(ace);
+            if sid != 0 {
+                let target = sid_at(sid);
+                if target.revision.get() == OWNER_RIGHTS_SID[0] && target.sub_authority_count.get() == OWNER_RIGHTS_SID[1] && guest::read_bytes(sid, OWNER_RIGHTS_SID.len()) == OWNER_RIGHTS_SID {
+                    return true;
+                }
+            }
+        }
+        ace += header.ace_size.get() as u64;
+    }
+    false
+}
+
+/// SID igual ao antigo ou o antigo mais um RID (prefixo de domínio): mesma
+/// revisão, contagem igual ou +1, mesma autoridade e as subautoridades do antigo.
+fn sid_has_prefix(sid: u64, old: u64) -> bool {
+    let (candidate, prefix) = (sid_at(sid), sid_at(old));
+    let (count, old_count) = (candidate.sub_authority_count.get(), prefix.sub_authority_count.get());
+    let compared = SID_HEADER as usize - 2 + old_count as usize * 4;
+    candidate.revision.get() == prefix.revision.get()
+        && (count == old_count || count as u32 == old_count as u32 + 1)
+        && guest::read_bytes(sid + 2, compared) == guest::read_bytes(old + 2, compared)
+}
+
+/// RtlReplaceSidInSd(Sd, OldSid, NewSid, *NumChanges): troca o prefixo
+/// `OldSid` pelas subautoridades de `NewSid` no dono, no grupo e nos ACEs
+/// (tipos 0..3 e o SID cliente do composto) da DACL e da SACL. O cabeçalho
+/// (Revision/Control) é comum às formas absoluta e relativa.
+pub fn replace_sid_in_sd(sd: u64, old_sid: u64, new_sid: u64, changes: &Field<u32>) -> u32 {
+    changes.set(0);
+    let header = relative_at(sd);
+    if header.revision.get() != 1 {
+        return STATUS_UNKNOWN_REVISION;
+    }
+    let length = sid_at(old_sid).sub_authority_count.get() as usize * 4;
+    let replacement = guest::read_bytes(new_sid + SID_HEADER, length);
+    let control = header.control.get();
+    let replace = |sid: u64| {
+        if sid != 0 && sid_has_prefix(sid, old_sid) {
+            guest::write_bytes(sid + SID_HEADER, &replacement);
+            changes.set(changes.get() + 1);
+        }
+    };
+    replace(descriptor::component(sd, control, 0));
+    replace(descriptor::component(sd, control, 1));
+    for index in [3u64, 2] {
+        let acl = descriptor::component(sd, control, index);
+        if acl == 0 {
+            continue;
+        }
+        let mut ace = acl + ACL_HEADER;
+        for _ in 0..acl_at(acl).ace_count.get() {
+            let header = ace_header_at(ace);
+            match header.ace_type.get() {
+                0..=3 => replace(ace + core::mem::offset_of!(AccessAllowedAce, sid_start) as u64),
+                COMPOUND_ACE_TYPE => {
+                    let server = ace + core::mem::offset_of!(CompoundAccessAllowedAce, sid_start) as u64;
+                    replace(server + SID_HEADER + 4 * sid_at(server).sub_authority_count.get() as u64);
+                }
+                _ => {}
+            }
+            ace += header.ace_size.get() as u64;
+        }
+    }
+    0
+}
+
+/// Componente de um SD relativo cujo offset a normalização reescreve.
+#[derive(Clone, Copy)]
+enum Component {
+    Owner,
+    Group,
+    Sacl,
+    Dacl,
+}
+
+fn component_offset(header: &SecurityDescriptorRelative, component: Component) -> &Field<u32> {
+    match component {
+        Component::Owner => &header.owner,
+        Component::Group => &header.group,
+        Component::Sacl => &header.sacl,
+        Component::Dacl => &header.dacl,
+    }
+}
+
+/// Destino da normalização: escrito só fora do modo de verificação.
+struct NormalizedOutput {
+    base: u64,
+    write: bool,
+}
+
+impl NormalizedOutput {
+    fn bytes(&self, offset: u32, bytes: &[u8]) {
+        if self.write {
+            guest::write_bytes(self.base + offset as u64, bytes);
+        }
+    }
+
+    fn header(&self) -> Option<&'static SecurityDescriptorRelative> {
+        self.write.then(|| relative_at(self.base))
+    }
+
+    fn acl(&self, offset: u32) -> Option<&'static Acl> {
+        self.write.then(|| acl_at(self.base + offset as u64))
+    }
+}
+
+/// RtlNormalizeSecurityDescriptor(*Sd, Length, *NewSd, *NewLength, CheckOnly):
+/// reempacota um SD self-relative na ordem SACL, DACL, dono, grupo — sem SACL
+/// vazia, sem ACCESS_ALLOWED duplicado (comparação de memória do ACE inteiro),
+/// com AclSize/AceCount refeitos, enchimento zerado e offsets compactos.
+/// Devolve TRUE se algo mudou (CheckOnly: TRUE na primeira diferença, sem
+/// escrever). Sem mudança o SD novo alocado é liberado; com mudança e `NewSd`
+/// NULL, o SD antigo é liberado e `*Sd` recebe o novo.
+pub fn normalize_security_descriptor(sd_cell: &Field<u64>, length: u32, new_sd_cell: u64, new_length_out: u64, check_only: bool) -> Result<bool, crate::rtl::KernelError> {
+    let source = sd_cell.get();
+    if !descriptor::valid_relative(source, length, 0) {
+        return Ok(false);
+    }
+    let new_sd = (new_sd_cell != 0).then(|| out::<u64>(new_sd_cell));
+    let (mut target, mut allocated) = (0u64, false);
+    if !check_only {
+        match new_sd.map(|cell| cell.get()).filter(|&buffer| buffer != 0) {
+            Some(buffer) => target = buffer,
+            None => {
+                target = crate::ntos::ex::pool_allocation::allocate_tagged(PAGED_POOL, length as u64, NORMALIZE_TAG)?;
+                if target == 0 {
+                    return Ok(false);
+                }
+                allocated = true;
+            }
+        }
+        guest::write_bytes(target, &guest::read_bytes(source, RELATIVE_HEADER as usize));
+    }
+    let output = NormalizedOutput { base: target, write: !check_only };
+    let Some((changed, size)) = normalize_into(source, &output, check_only) else {
+        // Verificação: primeira diferença achada.
+        return Ok(true);
+    };
+    if changed && !check_only {
+        match new_sd {
+            None => {
+                crate::ntos::ex::pool_allocation::free(source, 0)?;
+                sd_cell.set(target);
+            }
+            Some(cell) if allocated => cell.set(target),
+            Some(_) => {}
+        }
+        if new_length_out != 0 {
+            out::<u32>(new_length_out).set(size);
+        }
+        return Ok(true);
+    }
+    if allocated {
+        crate::ntos::ex::pool_allocation::free(target, 0)?;
+    }
+    Ok(changed)
+}
+
+/// Corpo da normalização: Some((mudou, tamanho)) ou None quando o modo de
+/// verificação achou a primeira diferença.
+fn normalize_into(source: u64, output: &NormalizedOutput, check_only: bool) -> Option<(bool, u32)> {
+    let header = relative_at(source);
+    let mut changed = false;
+    let mut differ = || {
+        changed = true;
+        !check_only
+    };
+    let mut cursor = RELATIVE_HEADER;
+    for component in [Component::Sacl, Component::Dacl] {
+        let offset = component_offset(header, component).get();
+        if offset == 0 {
+            continue;
+        }
+        let acl_address = source + offset as u64;
+        let acl = acl_at(acl_address);
+        let ace_count = acl.ace_count.get() as u32;
+        let new_offset = if matches!(component, Component::Sacl) && ace_count == 0 { 0 } else { cursor };
+        if new_offset != offset {
+            if !differ() {
+                return None;
+            }
+            if let Some(target) = output.header() {
+                component_offset(target, component).set(new_offset);
+            }
+        }
+        if new_offset == 0 {
+            continue;
+        }
+        output.bytes(new_offset, &guest::read_bytes(acl_address, ACL_HEADER as usize));
+        cursor += ACL_HEADER as u32;
+        let mut kept: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        let mut earlier: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        let mut ace = acl_address + ACL_HEADER;
+        for _ in 0..ace_count {
+            let ace_header = ace_header_at(ace);
+            let size = ace_header.ace_size.get() as usize;
+            let bytes = guest::read_bytes(ace, size);
+            let duplicate = ace_header.ace_type.get() == ACCESS_ALLOWED_ACE_TYPE && if check_only { earlier.contains(&bytes) } else { kept.contains(&bytes) };
+            if duplicate {
+                if !differ() {
+                    return None;
+                }
+            } else {
+                output.bytes(cursor, &bytes);
+                cursor += size as u32;
+                kept.push(bytes.clone());
+            }
+            earlier.push(bytes);
+            ace += size as u64;
+        }
+        let aligned = (cursor + 3) & !3;
+        let new_size = aligned - new_offset;
+        let old_size = acl.acl_size.get() as u32;
+        if new_size != old_size {
+            if !differ() {
+                return None;
+            }
+            if let Some(target) = output.acl(new_offset) {
+                target.acl_size.set(new_size as u16);
+            }
+        }
+        if kept.len() as u32 != ace_count {
+            if let Some(target) = output.acl(new_offset) {
+                target.ace_count.set(kept.len() as u16);
+            }
+        }
+        if cursor != aligned {
+            let same_place = new_offset == offset && new_size == old_size;
+            if same_place && guest::read_bytes(source + cursor as u64, (aligned - cursor) as usize).iter().any(|&byte| byte != 0) && !differ() {
+                return None;
+            }
+            output.bytes(cursor, &alloc::vec![0u8; (aligned - cursor) as usize]);
+            cursor = aligned;
+        }
+    }
+    for (component, optional) in [(Component::Owner, false), (Component::Group, true)] {
+        let offset = component_offset(header, component).get();
+        if optional && offset == 0 {
+            continue;
+        }
+        if cursor != offset {
+            if !differ() {
+                return None;
+            }
+            if let Some(target) = output.header() {
+                component_offset(target, component).set(cursor);
+            }
+        }
+        let sid = source + offset as u64;
+        let size = SID_HEADER as u32 + 4 * sid_at(sid).sub_authority_count.get() as u32;
+        output.bytes(cursor, &guest::read_bytes(sid, size as usize));
+        cursor += size;
+    }
+    Some((changed, cursor))
+}
+
+/// RtlIsSandboxedToken(SubjectContext, PreviousMode): o NT faz um access check
+/// de READ_CONTROL contra `SeMediumDaclSd` (sem DACL; SACL = rótulo Medium com
+/// NO_READ_UP) e devolve a negação do resultado. Sem DACL só o rótulo decide:
+/// sujeito abaixo de Medium (ou personificação abaixo de SecurityImpersonation,
+/// que o access check recusa) é sandbox; KernelMode nunca é. Sem SubjectContext,
+/// o da thread corrente é capturado e liberado. O ramo de kernel CET (que
+/// também marca AppContainers) não se aplica: KeIsKernelCetEnabled é FALSE.
+pub fn is_sandboxed_token(subject_context: u64, previous_mode: u8) -> Result<bool, crate::rtl::KernelError> {
+    use crate::ntos::inc::types::SecurityImpersonationLevel;
+    use crate::ntos::se::subject_context as subject;
+    if previous_mode == 0 {
+        return Ok(false);
+    }
+    let captured = if subject_context == 0 {
+        let context = guest::alloc_bytes(SecuritySubjectContext::SIZE);
+        subject::capture(context)?;
+        Some(context)
+    } else {
+        None
+    };
+    // SAFETY: SECURITY_SUBJECT_CONTEXT do chamador ou o capturado acima.
+    let context = unsafe { SecuritySubjectContext::at(captured.unwrap_or(subject_context)) };
+    let client = context.client_token.get();
+    let granted = if client != 0 && context.impersonation_level.get().0 < SecurityImpersonationLevel::SECURITY_IMPERSONATION.0 {
+        false
+    } else {
+        let token = if client != 0 { client } else { context.primary_token.get() };
+        crate::ntos::se::token::tokens::with(token, |token| integrity_rid(&token.integrity) >= SECURITY_MANDATORY_MEDIUM_RID).unwrap_or(false)
+    };
+    if let Some(address) = captured {
+        subject::release(address)?;
+        guest::free_bytes(address);
+    }
+    Ok(!granted)
+}
+
+/// RID do SID de integridade do token; sem rótulo vale Medium (a mesma regra do
+/// `se::object_security` do OpenNT).
+fn integrity_rid(sid: &[u8]) -> u32 {
+    if sid.len() < 12 {
+        return SECURITY_MANDATORY_MEDIUM_RID;
+    }
+    let count = sid[1] as usize;
+    let at = 8 + 4 * count.saturating_sub(1);
+    if sid.len() < at + 4 {
+        return SECURITY_MANDATORY_MEDIUM_RID;
+    }
+    u32::from_le_bytes([sid[at], sid[at + 1], sid[at + 2], sid[at + 3]])
+}

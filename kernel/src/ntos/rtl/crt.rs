@@ -800,3 +800,22 @@ pub fn towlower(c: u16) -> u16 {
 /// `prefetchnta` a cada 64 bytes — uma dica de cache sem efeito
 /// arquitetural nem falta de página; não há estado a reproduzir.
 pub fn prefetch_memory_non_temporal(_source: u64, _length: u64) {}
+
+/// isprint(c) (ntoskrnl 19045, 0x3d2030): `_pctype[c] & 0x157` sobre o byte
+/// baixo de `c` (EOF = -1 indexa a entrada zero de antes da tabela). Na
+/// tabela do locale C do ntoskrnl (lida com pefile): espaço 0x40; pontuação
+/// 0x21..0x2F, 0x3A..0x40, 0x5B..0x60, 0x7B..0x7E = 0x10; dígitos = 0x4;
+/// maiúsculas = 0x1; minúsculas = 0x2; o resto (controle, 0x7F..0xFF) = 0.
+pub fn isprint(character: u32) -> u32 {
+    if character == u32::MAX {
+        return 0;
+    }
+    match character as u8 {
+        b' ' => 0x40,
+        b'0'..=b'9' => 0x4,
+        b'A'..=b'Z' => 0x1,
+        b'a'..=b'z' => 0x2,
+        0x21..=0x7E => 0x10,
+        _ => 0,
+    }
+}

@@ -405,3 +405,29 @@ pub fn probe_and_lock_process_pages(descriptor: u64, target: u64, _access_mode: 
     guest::free_bytes(state);
     detached.map(|_| ())
 }
+
+// ---- MmMdlPagesAreZero (mm-file-system-support) -------------------------------
+//
+// Usa `pfn_array`, `MDL_PAGES_LOCKED` e `CONTENTS_INVARIANT_FLAG` deste arquivo.
+
+/// PFN da página zero compartilhada do sistema — o global que o NT compara
+/// em 0x322a5d e que MiZeroPageFile/MiCaptureSparsePages põem nos MDLs de
+/// leitura de faixas zeradas. O OpenNT não tem essa página compartilhada:
+/// nenhum PFN de MDL pode ser igual a ela.
+fn system_zero_page_frame() -> Option<u64> {
+    None
+}
+
+/// MmMdlPagesAreZero(Mdl) (RVA 0x322a20): exige MDL_PAGES_LOCKED e
+/// MDL_PAGE_CONTENTS_INVARIANT e todos os PFNs iguais à página zero do
+/// sistema (um MDL de zero páginas é verdadeiro).
+pub fn pages_are_zero(descriptor: &Mdl) -> bool {
+    let required = MDL_PAGES_LOCKED as u16 | CONTENTS_INVARIANT_FLAG;
+    if descriptor.mdl_flags.get() as u16 & required != required {
+        return false;
+    }
+    let start = (descriptor.byte_offset.get().wrapping_add(descriptor.start_va.get() as u32) & 0xFFF) as u64;
+    let pages = (descriptor.byte_count.get() as u64 + 0xFFF + start) >> 12;
+    let zero = system_zero_page_frame();
+    pfn_array(descriptor, pages).iter().all(|frame| Some(frame.get()) == zero)
+}

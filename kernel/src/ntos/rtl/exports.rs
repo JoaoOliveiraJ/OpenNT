@@ -1550,3 +1550,351 @@ pub mod rtl_crt_wide {
         data_exports: &[],
     };
 }
+
+pub mod rtl_bitmap_ranges {
+    //! Adaptadores das contagens por faixa, extração e runs livres do RTL_BITMAP.
+
+    use crate::ntos::inc::types::{NtStruct, RtlBitmap};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    /// PRTL_BITMAP do chamador.
+    fn bitmap_at(address: u64) -> &'static RtlBitmap {
+        // SAFETY: cabeçalho RTL_BITMAP vivo e alinhado do chamador.
+        unsafe { RtlBitmap::at(address) }
+    }
+
+    /// RtlNumberOfSetBitsInRange(BitMap, StartingIndex, Length) -> ULONG.
+    fn number_set_in_range(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::number_set_in_range(bitmap_at(call.arg(1)), call.arg(2) as u32, call.arg(3) as u32) as u64)
+    }
+
+    /// RtlNumberOfClearBitsInRange(BitMap, StartingIndex, Length) -> ULONG.
+    fn number_clear_in_range(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::number_clear_in_range(bitmap_at(call.arg(1)), call.arg(2) as u32, call.arg(3) as u32) as u64)
+    }
+
+    /// RtlExtractBitMap(Source, Destination, TargetBit, NumberOfBits).
+    fn extract(call: &Call) -> Result<u64, KernelError> {
+        bitmap::extract(bitmap_at(call.arg(1)), bitmap_at(call.arg(2)), call.arg(3) as u32, call.arg(4) as u32);
+        Ok(0)
+    }
+
+    /// RtlFindClearRuns(BitMap, RunArray, SizeOfRunArray, LocateLongestRuns) -> ULONG.
+    fn find_clear_runs(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_clear_runs(bitmap_at(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) as u8 != 0) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-bitmap-ranges",
+        names: &["RtlNumberOfSetBitsInRange", "RtlNumberOfClearBitsInRange", "RtlExtractBitMap", "RtlFindClearRuns"],
+        handlers: &[number_set_in_range, number_clear_in_range, extract, find_clear_runs],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_compression {
+    //! Adaptadores da compressão do Rtl: argumentos do `Call` → `rtl::compression`.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::compression;
+    use crate::rtl::KernelError;
+
+    /// PULONG de saída do chamador.
+    fn out(address: u64) -> &'static Field<u32> {
+        // SAFETY: parâmetro de saída obrigatório (kernel/driver), vivo e alinhado.
+        unsafe { Field::<u32>::at(address) }
+    }
+
+    /// RtlGetCompressionWorkSpaceSize(FormatAndEngine, *BufferSize, *FragmentSize).
+    fn work_space_size(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::work_space_size(call.arg(1) as u16, out(call.arg(2)), out(call.arg(3)))))
+    }
+
+    /// RtlCompressBuffer(FormatAndEngine, Uncompressed, UncompressedSize,
+    /// Compressed, CompressedSize, UncompressedChunkSize, *FinalSize, WorkSpace).
+    fn compress_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::compress_buffer(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, out(call.arg(7)), call.arg(8))))
+    }
+
+    /// RtlDecompressBufferEx2(Format, Uncompressed, UncompressedSize, Compressed,
+    /// CompressedSize, UncompressedChunkSize, *FinalSize, WorkSpace).
+    fn decompress_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::decompress_buffer(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, out(call.arg(7)), call.arg(8))))
+    }
+
+    /// RtlDecompressFragmentEx(Format, Fragment, FragmentSize, Compressed,
+    /// CompressedSize, FragmentOffset, UncompressedChunkSize, *FinalSize, WorkSpace).
+    fn decompress_fragment(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::decompress_fragment(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32, out(call.arg(8)), call.arg(9))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-compression",
+        names: &["RtlGetCompressionWorkSpaceSize", "RtlCompressBuffer", "RtlDecompressBufferEx2", "RtlDecompressFragmentEx"],
+        handlers: &[work_space_size, compress_buffer, decompress_buffer, decompress_fragment],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_nonvolatile_memory {
+    //! Adaptadores da memória não volátil do Rtl.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::non_volatile;
+    use crate::rtl::KernelError;
+
+    /// RtlGetNonVolatileToken(NvBuffer, Size, *NvToken) -> NTSTATUS.
+    fn get_token(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PNV_TOKEN de saída obrigatório do chamador.
+        Ok(signed_status(non_volatile::get_token(unsafe { Field::<u64>::at(call.arg(3)) })))
+    }
+
+    /// RtlFreeNonVolatileToken(NvToken) -> NTSTATUS.
+    fn free_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(non_volatile::free_token(call.arg(1))))
+    }
+
+    /// RtlFillNonVolatileMemory(NvToken, NvDestination, Size, Value, Flags) -> NTSTATUS.
+    fn fill_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(non_volatile::fill_memory(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-nonvolatile-memory",
+        names: &["RtlGetNonVolatileToken", "RtlFreeNonVolatileToken", "RtlFillNonVolatileMemory"],
+        handlers: &[get_token, free_token, fill_memory],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_security_descriptor_ops {
+    //! Adaptadores das rotinas de ACE/SD do Rtl e do teste de sandbox.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::security;
+    use crate::rtl::KernelError;
+
+    /// RtlFindAceByType(Acl, AceType, *Index) -> PVOID.
+    fn find_ace_by_type(call: &Call) -> Result<u64, KernelError> {
+        Ok(security::find_ace_by_type(call.arg(1), call.arg(2) as u32, call.arg(3)))
+    }
+
+    /// RtlOwnerAcesPresent(Acl) -> BOOLEAN.
+    fn owner_aces_present(call: &Call) -> Result<u64, KernelError> {
+        Ok(security::owner_aces_present(call.arg(1)) as u64)
+    }
+
+    /// RtlReplaceSidInSd(Sd, OldSid, NewSid, *NumChanges) -> NTSTATUS.
+    fn replace_sid_in_sd(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG NumChanges obrigatório do chamador.
+        let changes = unsafe { Field::<u32>::at(call.arg(4)) };
+        Ok(signed_status(security::replace_sid_in_sd(call.arg(1), call.arg(2), call.arg(3), changes)))
+    }
+
+    /// RtlNormalizeSecurityDescriptor(*Sd, Length, *NewSd, *NewLength, CheckOnly) -> BOOLEAN.
+    fn normalize_security_descriptor(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PSECURITY_DESCRIPTOR* obrigatório do chamador.
+        let descriptor = unsafe { Field::<u64>::at(call.arg(1)) };
+        Ok(security::normalize_security_descriptor(descriptor, call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u8 != 0)? as u64)
+    }
+
+    /// RtlIsSandboxedToken(SubjectContext, PreviousMode) -> BOOLEAN.
+    fn is_sandboxed_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(security::is_sandboxed_token(call.arg(1), call.arg(2) as u8)? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-security-descriptor-ops",
+        names: &["RtlFindAceByType", "RtlOwnerAcesPresent", "RtlReplaceSidInSd", "RtlNormalizeSecurityDescriptor", "RtlIsSandboxedToken"],
+        handlers: &[find_ace_by_type, owner_aces_present, replace_sid_in_sd, normalize_security_descriptor, is_sandboxed_token],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_support_routines {
+    //! Adaptadores de rotinas de apoio do Rtl e da CRT.
+
+    use crate::ntos::inc::types::{Field, NtStruct, String as AnsiString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::{checksum, crt, module_information, reparse, stack_trace, strings_counted};
+    use crate::rtl::KernelError;
+
+    /// RtlCopyString(Destination, Source).
+    fn copy_string(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PSTRING DestinationString obrigatório do chamador.
+        strings_counted::copy_string(unsafe { AnsiString::at(call.arg(1)) }, call.arg(2));
+        Ok(0)
+    }
+
+    /// RtlCrc64(Buffer, Size, InitialCrc) -> ULONGLONG.
+    fn crc64(call: &Call) -> Result<u64, KernelError> {
+        Ok(checksum::crc64(call.arg(1), call.arg(2), call.arg(3)))
+    }
+
+    /// isprint(c) -> int.
+    fn isprint(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::isprint(call.arg(1) as u32) as u64)
+    }
+
+    /// RtlIsNonEmptyDirectoryReparsePointAllowed(ReparseTag) -> BOOLEAN.
+    fn is_non_empty_directory_reparse_point_allowed(call: &Call) -> Result<u64, KernelError> {
+        Ok(reparse::is_non_empty_directory_reparse_point_allowed(call.arg(1) as u32) as u64)
+    }
+
+    /// RtlQueryModuleInformation(*InformationLength, SizePerModule, Buffer) -> NTSTATUS.
+    fn query_module_information(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG InformationLength obrigatório do chamador.
+        let length = unsafe { Field::<u32>::at(call.arg(1)) };
+        Ok(signed_status(module_information::query(length, call.arg(2) as u32, call.arg(3))?))
+    }
+
+    /// RtlWalkFrameChain(Callers, Count, Flags) -> ULONG.
+    fn walk_frame_chain(call: &Call) -> Result<u64, KernelError> {
+        Ok(stack_trace::walk_frame_chain(call.frame, call.arg(1), call.arg(2) as u32, call.arg(3) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-support-routines",
+        names: &["RtlCopyString", "RtlCrc64", "isprint", "RtlIsNonEmptyDirectoryReparsePointAllowed", "RtlQueryModuleInformation", "RtlWalkFrameChain"],
+        handlers: &[copy_string, crc64, isprint, is_non_empty_directory_reparse_point_allowed, query_module_information, walk_frame_chain],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_oem_strings {
+    //! Strings OEM e os dados NLS da página OEM: a lógica mora em `rtl/oem_code_page.rs`.
+
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{NtStruct, String as AnsiString, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::oem_code_page as oem;
+    use crate::rtl::KernelError;
+
+    // SAFETY (todas): strings e células de kernel do chamador (as rotinas Rtl
+    // não sondam ponteiros).
+    fn unicode(address: u64) -> &'static UnicodeString {
+        unsafe { UnicodeString::at(address) }
+    }
+    fn ansi(address: u64) -> &'static AnsiString {
+        unsafe { AnsiString::at(address) }
+    }
+
+    fn oem_to_unicode_n(call: &Call) -> Result<u64, KernelError> {
+        let written = (call.arg(3) != 0).then(|| unsafe { Field::<u32>::at(call.arg(3)) });
+        oem::oem_to_unicode_n(call.arg(1), call.arg(2) as u32, written, call.arg(4), call.arg(5) as u32).map(signed_status)
+    }
+    fn oem_string_to_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        oem::oem_string_to_unicode(unicode(call.arg(1)), ansi(call.arg(2)), call.arg(3) & 0xFF != 0, false).map(signed_status)
+    }
+    fn oem_string_to_counted_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        oem::oem_string_to_unicode(unicode(call.arg(1)), ansi(call.arg(2)), call.arg(3) & 0xFF != 0, true).map(signed_status)
+    }
+    fn unicode_string_to_oem_string(call: &Call) -> Result<u64, KernelError> {
+        oem::unicode_string_to_oem(ansi(call.arg(1)), unicode(call.arg(2)), call.arg(3) & 0xFF != 0, false, false).map(signed_status)
+    }
+    fn unicode_string_to_counted_oem_string(call: &Call) -> Result<u64, KernelError> {
+        oem::unicode_string_to_oem(ansi(call.arg(1)), unicode(call.arg(2)), call.arg(3) & 0xFF != 0, true, false).map(signed_status)
+    }
+    fn upcase_unicode_string_to_counted_oem_string(call: &Call) -> Result<u64, KernelError> {
+        oem::unicode_string_to_oem(ansi(call.arg(1)), unicode(call.arg(2)), call.arg(3) & 0xFF != 0, true, true).map(signed_status)
+    }
+    fn oem_string_to_unicode_size(call: &Call) -> Result<u64, KernelError> {
+        oem::oem_string_to_unicode_size(ansi(call.arg(1))).map(u64::from)
+    }
+    fn upper_string(call: &Call) -> Result<u64, KernelError> {
+        oem::upper_string(ansi(call.arg(1)), ansi(call.arg(2))).map(|_| 0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-oem-strings",
+        names: &[
+            "RtlOemToUnicodeN",
+            "RtlOemStringToUnicodeString",
+            "RtlOemStringToCountedUnicodeString",
+            "RtlUnicodeStringToOemString",
+            "RtlUnicodeStringToCountedOemString",
+            "RtlUpcaseUnicodeStringToCountedOemString",
+            "RtlxOemStringToUnicodeSize",
+            "RtlUpperString",
+        ],
+        handlers: &[
+            oem_to_unicode_n,
+            oem_string_to_unicode_string,
+            oem_string_to_counted_unicode_string,
+            unicode_string_to_oem_string,
+            unicode_string_to_counted_oem_string,
+            upcase_unicode_string_to_counted_oem_string,
+            oem_string_to_unicode_size,
+            upper_string,
+        ],
+        data_exports: &[("NlsMbOemCodePageTag", oem::mb_oem_code_page_tag_address), ("NlsOemLeadByteInfo", oem::oem_lead_byte_info_address)],
+    };
+}
+
+pub mod rtl_8dot3_names {
+    //! RtlIsNameLegalDOS8Dot3: a lógica mora em `rtl/gen8dot3.rs`.
+
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{NtStruct, String as AnsiString, UnicodeString};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::gen8dot3;
+    use crate::rtl::KernelError;
+
+    fn is_name_legal(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PCUNICODE_STRING Name, POEM_STRING OemName e PBOOLEAN opcionais do FS.
+        let name = unsafe { UnicodeString::at(call.arg(1)) };
+        let oem_name = (call.arg(2) != 0).then(|| unsafe { AnsiString::at(call.arg(2)) });
+        let spaces = (call.arg(3) != 0).then(|| unsafe { Field::<u8>::at(call.arg(3)) });
+        gen8dot3::is_name_legal_dos_8dot3(name, oem_name, spaces).map(|legal| legal as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-8dot3-names", names: &["RtlIsNameLegalDOS8Dot3"], handlers: &[is_name_legal], data_exports: &[] };
+}
+
+pub mod rtl_altitudes_and_time {
+    //! RtlCompareAltitudes, RtlSecondsSince1970ToTime, RtlSystemTimeToLocalTime:
+    //! a lógica mora em `rtl/altitude.rs` e `rtl/time.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{LargeInteger, NtStruct, UnicodeString};
+    use crate::ntos::rtl::{altitude, time};
+    use crate::rtl::KernelError;
+
+    fn compare_altitudes(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: as PCUNICODE_STRING de altitude do chamador.
+        Ok(altitude::compare_altitudes(unsafe { UnicodeString::at(call.arg(1)) }, unsafe { UnicodeString::at(call.arg(2)) }) as i64 as u64)
+    }
+    fn seconds_since_1970_to_time(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PLARGE_INTEGER de saída do chamador.
+        time::seconds_since_1970_to_time(call.arg(1) as u32, unsafe { LargeInteger::at(call.arg(2)) });
+        Ok(0)
+    }
+    fn system_time_to_local_time(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os PLARGE_INTEGER do chamador.
+        Ok(signed_status(time::system_time_to_local_time(unsafe { LargeInteger::at(call.arg(1)) }, unsafe { LargeInteger::at(call.arg(2)) })))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-altitudes-and-time",
+        names: &["RtlCompareAltitudes", "RtlSecondsSince1970ToTime", "RtlSystemTimeToLocalTime"],
+        handlers: &[compare_altitudes, seconds_since_1970_to_time, system_time_to_local_time],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_acl_trust_label {
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::acl;
+    use crate::rtl::KernelError;
+
+    fn add_process_trust_label_ace(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(acl::add_process_trust_label_ace(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5) as u8, call.arg(6) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-acl-trust-label", names: &["RtlAddProcessTrustLabelAce"], handlers: &[add_process_trust_label_ace], data_exports: &[] };
+}

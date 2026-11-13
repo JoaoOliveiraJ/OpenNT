@@ -291,6 +291,15 @@ fn io_build_partial_mdl(call: &Call) -> Result<u64, KernelError> {
     mdl::build_partial_mdl(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32);
     Ok(0)
 }
+/// IoGetIoPriorityHint: a prioridade gravada em Irp->Flags (a mesma que o
+/// IoSetIoPriorityHint escreve).
+fn io_get_io_priority_hint(call: &Call) -> Result<u64, KernelError> {
+    use crate::ntos::inc::types::{Irp, NtStruct};
+    // SAFETY: PIRP de um chamador de modo kernel.
+    let irp = unsafe { Irp::at(call.arg(1)) };
+    Ok(crate::ntos::io::irp_support::get_io_priority_hint(irp) as u64)
+}
+
 fn io_sizeof_work_item(_: &Call) -> Result<u64, KernelError> {
     Ok(work_items::work_item_size())
 }
@@ -362,7 +371,7 @@ pub static GROUP: Group = Group {
         "IoCreateDevice", "IoCreateSymbolicLink", "IoDeleteDevice", "IoDeleteSymbolicLink", "IoAllocateIrp", "IoFreeIrp", "IoCompleteRequest", "IofCompleteRequest", "IoAllocateWorkItem", "IoQueueWorkItem", "IoFreeWorkItem", "IoCallDriver", "IofCallDriver", "IoAttachDeviceToDeviceStack", "IoDetachDevice", "IoGetDeviceObjectPointer", "IoBuildSynchronousFsdRequest", "IoBuildDeviceIoControlRequest", "IoInitializeTimer", "IoStartTimer", "IoStopTimer", "IoQueueWorkItemEx", "IoAllocateMdl", "IoFreeMdl", "IoGetCurrentThread", "IoSetCancelRoutine", "IoCancelIrp", "IoAllocateDriverObjectExtension", "IoGetDriverObjectExtension", "IoGetCurrentProcess", "IoCreateFile", "IoGetRelatedDeviceObject", "IoGetDeviceProperty", "IoGetStackLimits", "IoInitializeRemoveLockEx", "IoAcquireRemoveLockEx", "IoReleaseRemoveLockEx", "IoReleaseRemoveLockAndWaitEx", "IoAllocateErrorLogEntry", "IoWriteErrorLogEntry", "IoAcquireCancelSpinLock", "IoReleaseCancelSpinLock", "IoRegisterDeviceInterface", "IoSetDeviceInterfaceState", "IoRegisterPlugPlayNotification", "IoUnregisterPlugPlayNotification", "IoRegisterDriverReinitialization", "IoOpenDeviceRegistryKey", "IoWMIRegistrationControl", "IoConnectInterrupt", "IoDisconnectInterrupt", "IoCreateController", "IoDeleteController", "IoAllocateController", "IoFreeController", "IoStartPacket", "IoStartNextPacket", "IoSetStartIoAttributes", "IoGetAttachedDeviceReference", "IoInvalidateDeviceState", "IoQueryDeviceDescription", "IoConnectInterruptEx", "IoDisconnectInterruptEx", "IoReadPartitionTableEx", "IoGetConfigurationInformation", "IoInvalidateDeviceRelations", "IoGetGenericIrpExtension", "IoSetGenericIrpExtension", "IoPropagateIrpExtensionEx", "IoGetActivityIdIrp", "IoSetActivityIdIrp", "IoGetActivityIdThread", "IoClearActivityIdThread", "IoPropagateActivityIdToThread", "IoIsActivityTracingEnabled", "IoReuseIrp", "IoInitializeIrp", "IoSetMasterIrpStatus", "IoBuildPartialMdl", "IoSizeofWorkItem", "IoAllocateSfioStreamIdentifier", "IoGetSfioStreamIdentifier", "IoFreeSfioStreamIdentifier", "IoGetIoAttributionHandle", "IoRecordIoAttribution", "IoGetIoPriorityHint", "IoGetPagingIoPriority", "IoGetRequestorProcess", "IoIs32bitProcess", "IoGetDeviceAttachmentBaseRef", "IoGetDevicePropertyData", "IoSetHardErrorOrVerifyDevice", "IoSetThreadHardErrorMode", "IoRegisterShutdownNotification", "IoUnregisterShutdownNotification", "IoReportTargetDeviceChangeAsynchronous", "IoRegisterPriorityCallback", "IoUnregisterPriorityCallback", "IoWMIDeviceObjectToProviderId", "IoWMIWriteEvent", "IoCreateFileEx", "IoInitializeWorkItem", "IoQueryFileInformation", "IoUnregisterPlugPlayNotificationEx",
     ],
     handlers: &[
-        io_create_device, io_create_symbolic_link, io_delete_device, io_delete_symbolic_link, io_allocate_irp, io_free_irp, io_complete_request, io_complete_request, io_allocate_work_item, io_queue_work_item, io_free_work_item, io_call_driver, io_call_driver, io_attach_device_to_device_stack, io_detach_device, get_device_object_pointer_export, io_build_synchronous_fsd_request, io_build_device_io_control_request, io_initialize_timer, io_start_timer, io_stop_timer, io_queue_work_item_ex, io_allocate_mdl, io_free_mdl, io_get_current_thread, io_set_cancel_routine, io_cancel_irp, io_allocate_driver_object_extension, io_get_driver_object_extension, io_get_current_process, io_create_file, io_get_related_device_object, io_get_device_property, io_get_stack_limits, io_initialize_remove_lock, io_acquire_remove_lock, io_release_remove_lock, io_release_remove_lock_and_wait, io_allocate_error_log_entry, io_write_error_log_entry, io_acquire_cancel_spin_lock, io_release_cancel_spin_lock, io_register_device_interface, io_set_device_interface_state, io_register_plug_play_notification, io_unregister_plug_play_notification, io_register_driver_reinitialization, io_open_device_registry_key, io_wmi_registration_control, io_connect_interrupt, io_disconnect_interrupt, io_create_controller, io_delete_controller, io_allocate_controller, io_free_controller, io_start_packet, io_start_next_packet, io_set_start_io_attributes, io_get_attached_device_reference, io_invalidate_device_state, io_query_device_description, io_connect_interrupt_ex, io_disconnect_interrupt_ex, io_read_partition_table_ex, io_get_configuration_information, io_invalidate_device_relations, io_get_generic_irp_extension, io_set_generic_irp_extension, io_propagate_irp_extension, io_get_activity_id_irp, io_set_activity_id_irp, io_get_activity_id_thread, io_clear_activity_id_thread, io_propagate_activity_id_to_thread, zero, io_reuse_irp, io_initialize_irp, io_set_master_irp_status, io_build_partial_mdl, io_sizeof_work_item, io_allocate_sfio_stream_identifier, zero, zero, zero, zero, zero, zero, io_get_requestor_process, zero, io_get_device_attachment_base_ref, io_get_device_property_data, io_set_hard_error_or_verify_device, io_set_thread_hard_error_mode, io_register_shutdown_notification, io_unregister_shutdown_notification, io_report_target_device_change_asynchronous, io_register_priority_callback, io_unregister_priority_callback, io_wmi_device_object_to_provider_id, zero, io_create_file, io_initialize_work_item, io_query_file_information, io_unregister_plug_play_notification,
+        io_create_device, io_create_symbolic_link, io_delete_device, io_delete_symbolic_link, io_allocate_irp, io_free_irp, io_complete_request, io_complete_request, io_allocate_work_item, io_queue_work_item, io_free_work_item, io_call_driver, io_call_driver, io_attach_device_to_device_stack, io_detach_device, get_device_object_pointer_export, io_build_synchronous_fsd_request, io_build_device_io_control_request, io_initialize_timer, io_start_timer, io_stop_timer, io_queue_work_item_ex, io_allocate_mdl, io_free_mdl, io_get_current_thread, io_set_cancel_routine, io_cancel_irp, io_allocate_driver_object_extension, io_get_driver_object_extension, io_get_current_process, io_create_file, io_get_related_device_object, io_get_device_property, io_get_stack_limits, io_initialize_remove_lock, io_acquire_remove_lock, io_release_remove_lock, io_release_remove_lock_and_wait, io_allocate_error_log_entry, io_write_error_log_entry, io_acquire_cancel_spin_lock, io_release_cancel_spin_lock, io_register_device_interface, io_set_device_interface_state, io_register_plug_play_notification, io_unregister_plug_play_notification, io_register_driver_reinitialization, io_open_device_registry_key, io_wmi_registration_control, io_connect_interrupt, io_disconnect_interrupt, io_create_controller, io_delete_controller, io_allocate_controller, io_free_controller, io_start_packet, io_start_next_packet, io_set_start_io_attributes, io_get_attached_device_reference, io_invalidate_device_state, io_query_device_description, io_connect_interrupt_ex, io_disconnect_interrupt_ex, io_read_partition_table_ex, io_get_configuration_information, io_invalidate_device_relations, io_get_generic_irp_extension, io_set_generic_irp_extension, io_propagate_irp_extension, io_get_activity_id_irp, io_set_activity_id_irp, io_get_activity_id_thread, io_clear_activity_id_thread, io_propagate_activity_id_to_thread, zero, io_reuse_irp, io_initialize_irp, io_set_master_irp_status, io_build_partial_mdl, io_sizeof_work_item, io_allocate_sfio_stream_identifier, zero, zero, zero, zero, io_get_io_priority_hint, zero, io_get_requestor_process, zero, io_get_device_attachment_base_ref, io_get_device_property_data, io_set_hard_error_or_verify_device, io_set_thread_hard_error_mode, io_register_shutdown_notification, io_unregister_shutdown_notification, io_report_target_device_change_asynchronous, io_register_priority_callback, io_unregister_priority_callback, io_wmi_device_object_to_provider_id, zero, io_create_file, io_initialize_work_item, io_query_file_information, io_unregister_plug_play_notification,
     ],
     data_exports: &[("IoDriverObjectType", io_driver_object_type), ("IoFileObjectType", io_file_object_type)],
 };
@@ -1082,6 +1091,544 @@ pub mod io_top_level_irp {
         name: "io-top-level-irp",
         names: &["IoGetTopLevelIrp", "IoSetTopLevelIrp", "IoThreadToProcess"],
         handlers: &[get_top_level_irp, set_top_level_irp, thread_to_process],
+        data_exports: &[],
+    };
+}
+
+pub mod io_file_object_extensions {
+    //! Extensões de IRP (zeroing/track offset, copy information) e de
+    //! FILE_OBJECT (transação, silo): a lógica mora em `io/extensions.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{FileObject, NtStruct};
+    use crate::ntos::io::extensions;
+    use crate::rtl::KernelError;
+
+    fn get_zeroing_offset(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG de saída do FS.
+        Ok(signed_status(extensions::fs_zeroing_offset(call.arg(1), unsafe { Field::<u32>::at(call.arg(2)) })))
+    }
+    fn set_zeroing_offset(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(extensions::set_fs_zeroing_offset(call.arg(1), call.arg(2) as u32)))
+    }
+    fn set_zeroing_offset_required(call: &Call) -> Result<u64, KernelError> {
+        extensions::set_fs_zeroing_offset_required(call.arg(1)).map(signed_status)
+    }
+    fn set_track_offset_state(call: &Call) -> Result<u64, KernelError> {
+        extensions::set_fs_track_offset_state(call.arg(1), call.arg(2), call.arg(3)).map(signed_status)
+    }
+    fn get_copy_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(extensions::copy_information(call.arg(1), call.arg(2))))
+    }
+    fn get_transaction_parameter_block(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT vivo do chamador.
+        Ok(extensions::transaction_parameter_block(unsafe { FileObject::at(call.arg(1)) }))
+    }
+    fn get_silo(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT vivo do chamador.
+        Ok(extensions::file_object_silo(unsafe { FileObject::at(call.arg(1)) }))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-file-object-extensions",
+        names: &[
+            "IoGetFsZeroingOffset",
+            "IoSetFsZeroingOffset",
+            "IoSetFsZeroingOffsetRequired",
+            "IoSetFsTrackOffsetState",
+            "IoGetCopyInformationExtension",
+            "IoGetTransactionParameterBlock",
+            "IoGetSilo",
+        ],
+        handlers: &[
+            get_zeroing_offset,
+            set_zeroing_offset,
+            set_zeroing_offset_required,
+            set_track_offset_state,
+            get_copy_information,
+            get_transaction_parameter_block,
+            get_silo,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod io_priority {
+    //! Prioridade de I/O: a lógica mora em `io/priority.rs` e `io/extensions.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::extra_fs_fat::IoPriorityInfo;
+    use crate::ntos::inc::types::{Ethread, FileObject, Irp, NtStruct};
+    use crate::ntos::io::{extensions, priority};
+    use crate::rtl::KernelError;
+
+    // SAFETY (todas): o chamador passa IRP/FILE_OBJECT/ETHREAD vivos (ou NULL onde o
+    // NT aceita NULL) e um IO_PRIORITY_INFO de kernel.
+    fn retrieve(call: &Call) -> Result<u64, KernelError> {
+        let irp = (call.arg(1) != 0).then(|| unsafe { Irp::at(call.arg(1)) });
+        let file = (call.arg(2) != 0).then(|| unsafe { FileObject::at(call.arg(2)) });
+        let thread = (call.arg(3) != 0).then(|| unsafe { Ethread::at(call.arg(3)) });
+        Ok(signed_status(priority::retrieve_priority_info(irp, file, thread, unsafe { IoPriorityInfo::at(call.arg(4)) })))
+    }
+    fn apply(call: &Call) -> Result<u64, KernelError> {
+        let output = (call.arg(2) != 0).then(|| unsafe { IoPriorityInfo::at(call.arg(2)) });
+        priority::apply_priority_info(unsafe { IoPriorityInfo::at(call.arg(1)) }, output, unsafe { Ethread::at(call.arg(3)) }).map(signed_status)
+    }
+    fn hint_into_thread(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(priority::set_thread_priority_hint(unsafe { Ethread::at(call.arg(1)) }, call.arg(2) as u32)))
+    }
+    fn hint_into_file_object(call: &Call) -> Result<u64, KernelError> {
+        extensions::set_file_object_priority_hint(unsafe { FileObject::at(call.arg(1)) }, call.arg(2) as u32).map(signed_status)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-priority",
+        names: &["IoRetrievePriorityInfo", "IoApplyPriorityInfoThread", "IoSetIoPriorityHintIntoThread", "IoSetIoPriorityHintIntoFileObject"],
+        handlers: &[retrieve, apply, hint_into_thread, hint_into_file_object],
+        data_exports: &[],
+    };
+}
+
+pub mod io_file_system {
+    //! Registro de file systems, notificações, verificação de volume, stream
+    //! file objects: a lógica mora em `io/file_system.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{DeviceObject, Ethread, FileObject, Irp, Kthread, NtStruct};
+    use crate::ntos::io::file_system;
+    use crate::ntos::io::threads::thread_queries;
+    use crate::rtl::KernelError;
+
+    // SAFETY (todas): os FSs e filtros passam DEVICE_OBJECT/FILE_OBJECT/IRP/ETHREAD vivos.
+    fn device(address: u64) -> &'static DeviceObject {
+        unsafe { DeviceObject::at(address) }
+    }
+    fn file(address: u64) -> &'static FileObject {
+        unsafe { FileObject::at(address) }
+    }
+    fn thread(address: u64) -> &'static Ethread {
+        unsafe { Ethread::at(address) }
+    }
+
+    fn register(call: &Call) -> Result<u64, KernelError> {
+        file_system::register_file_system(device(call.arg(1))).map(|_| 0)
+    }
+    fn unregister(call: &Call) -> Result<u64, KernelError> {
+        file_system::unregister_file_system(device(call.arg(1))).map(|_| 0)
+    }
+    fn register_change_mount_aware(call: &Call) -> Result<u64, KernelError> {
+        file_system::register_fs_registration_change(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0).map(signed_status)
+    }
+    fn enumerate_filters(call: &Call) -> Result<u64, KernelError> {
+        file_system::enumerate_registered_filters(call.arg(1), call.arg(2) as u32, unsafe { Field::<u32>::at(call.arg(3)) }).map(signed_status)
+    }
+    fn base_file_system_device(call: &Call) -> Result<u64, KernelError> {
+        Ok(file_system::base_file_system_device(file(call.arg(1))))
+    }
+    fn verify_volume(call: &Call) -> Result<u64, KernelError> {
+        file_system::verify_volume(device(call.arg(1)), call.arg(2) & 0xFF != 0).map(signed_status)
+    }
+    fn get_device_to_verify(call: &Call) -> Result<u64, KernelError> {
+        Ok(file_system::device_to_verify(thread(call.arg(1))))
+    }
+    fn set_device_to_verify(call: &Call) -> Result<u64, KernelError> {
+        file_system::set_device_to_verify(thread(call.arg(1)), call.arg(2));
+        Ok(0)
+    }
+    fn create_stream(call: &Call) -> Result<u64, KernelError> {
+        file_system::create_stream_file_object(call.arg(1), call.arg(2), false)
+    }
+    fn create_stream_lite(call: &Call) -> Result<u64, KernelError> {
+        file_system::create_stream_file_object(call.arg(1), call.arg(2), true)
+    }
+    fn cancel_file_open(call: &Call) -> Result<u64, KernelError> {
+        file_system::cancel_file_open(device(call.arg(1)), file(call.arg(2))).map(|_| 0)
+    }
+    fn replace_name(call: &Call) -> Result<u64, KernelError> {
+        file_system::replace_file_object_name(file(call.arg(1)), call.arg(2), call.arg(3) as u16).map(signed_status)
+    }
+    fn raise_hard_error(call: &Call) -> Result<u64, KernelError> {
+        file_system::raise_hard_error(unsafe { Irp::at(call.arg(1)) }).map(|_| 0)
+    }
+    fn is_system_thread(call: &Call) -> Result<u64, KernelError> {
+        Ok(thread_queries::is_system_thread(unsafe { Kthread::at(call.arg(1)) }) as u64)
+    }
+    fn within_stack_limits(call: &Call) -> Result<u64, KernelError> {
+        Ok(thread_queries::within_stack_limits(call.arg(1), call.arg(2)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-file-system",
+        names: &[
+            "IoRegisterFileSystem",
+            "IoUnregisterFileSystem",
+            "IoRegisterFsRegistrationChangeMountAware",
+            "IoEnumerateRegisteredFiltersList",
+            "IoGetBaseFileSystemDeviceObject",
+            "IoVerifyVolume",
+            "IoGetDeviceToVerify",
+            "IoSetDeviceToVerify",
+            "IoCreateStreamFileObject",
+            "IoCreateStreamFileObjectLite",
+            "IoCancelFileOpen",
+            "IoReplaceFileObjectName",
+            "IoRaiseHardError",
+            "IoIsSystemThread",
+            "IoWithinStackLimits",
+        ],
+        handlers: &[
+            register,
+            unregister,
+            register_change_mount_aware,
+            enumerate_filters,
+            base_file_system_device,
+            verify_volume,
+            get_device_to_verify,
+            set_device_to_verify,
+            create_stream,
+            create_stream_lite,
+            cancel_file_open,
+            replace_name,
+            raise_hard_error,
+            is_system_thread,
+            within_stack_limits,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod io_irp_support {
+    use crate::ntos::inc::types::{Irp, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::irp_support;
+    use crate::rtl::KernelError;
+
+    fn make_associated_irp(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_support::make_associated_irp(call.arg(1), call.arg(2) as u8))
+    }
+
+    fn adjust_stack_size_for_redirection(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(irp_support::adjust_stack_size_for_redirection(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    fn set_io_priority_hint(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PIRP de um chamador de modo kernel.
+        let irp = unsafe { Irp::at(call.arg(1)) };
+        Ok(signed_status(irp_support::set_io_priority_hint(irp, call.arg(2) as u32)))
+    }
+
+    fn get_adapter_crypto_engine_extension(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PIRP de um chamador de modo kernel.
+        let irp = unsafe { Irp::at(call.arg(1)) };
+        Ok(signed_status(irp_support::get_adapter_crypto_engine_extension(irp, call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-irp-support",
+        names: &["IoMakeAssociatedIrp", "IoAdjustStackSizeForRedirection", "IoSetIoPriorityHint", "IoGetAdapterCryptoEngineExtension"],
+        handlers: &[make_associated_irp, adjust_stack_size_for_redirection, set_io_priority_hint, get_adapter_crypto_engine_extension],
+        data_exports: &[],
+    };
+}
+
+pub mod io_file_system_support {
+    //! Validação de EA/cota, confiança de redirecionamento, dica de
+    //! dispositivo, stream file object com handle, IoSetInformation, nome DOS
+    //! do arquivo e transferência de ActivityId: a lógica mora nos assuntos.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::{FileObject, SecuritySubjectContext};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::file::{information, zw as zw_files};
+    use crate::ntos::io::{buffer_validation, extensions, file_system, redirection_trust, threads};
+    use crate::rtl::KernelError;
+
+    /// IoCheckEaBufferValidity(EaBuffer, EaLength, *ErrorOffset).
+    fn check_ea_buffer_validity(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG ErrorOffset do FS chamador (modo kernel).
+        let error_offset = unsafe { Field::<u32>::at(call.arg(3)) };
+        Ok(signed_status(buffer_validation::check_ea_buffer_validity(call.arg(1), call.arg(2) as u32, error_offset)))
+    }
+
+    /// IoCheckQuotaBufferValidity(QuotaBuffer, QuotaLength, *ErrorOffset).
+    fn check_quota_buffer_validity(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG ErrorOffset do FS chamador (modo kernel).
+        let error_offset = unsafe { Field::<u32>::at(call.arg(3)) };
+        Ok(signed_status(buffer_validation::check_quota_buffer_validity(call.arg(1), call.arg(2) as u32, error_offset)))
+    }
+
+    /// IoCheckRedirectionTrustLevel(TrustLevel, UserMode, SubjectContext, Flags, Context).
+    fn check_redirection_trust_level(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: SECURITY_SUBJECT_CONTEXT opcional do chamador de modo kernel.
+        let subject = (call.arg(3) != 0).then(|| unsafe { SecuritySubjectContext::at(call.arg(3)) });
+        redirection_trust::check_trust_level(call.arg(2) as u8 != 0, subject, call.arg(4) as u32).map(signed_status)
+    }
+
+    /// IoComputeRedirectionTrustLevel(Reserved, UserMode, SubjectContext, *TrustLevel).
+    fn compute_redirection_trust_level(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: SECURITY_SUBJECT_CONTEXT opcional e PULONG TrustLevel do chamador de modo kernel.
+        let (subject, output) = unsafe { ((call.arg(3) != 0).then(|| SecuritySubjectContext::at(call.arg(3))), Field::<u32>::at(call.arg(4))) };
+        redirection_trust::compute_trust_level(call.arg(2) as u8 != 0, subject, output).map(signed_status)
+    }
+
+    /// IoCopyDeviceObjectHint(SourceFileObject, TargetFileObject).
+    fn copy_device_object_hint(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECTs vivos do FS chamador.
+        let (source, target) = unsafe { (FileObject::at(call.arg(1)), FileObject::at(call.arg(2))) };
+        extensions::copy_device_object_hint(source, target).map(signed_status)
+    }
+
+    /// IoCreateFileSpecifyDeviceObjectHint(FileHandle, DesiredAccess,
+    /// ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes,
+    /// ShareAccess, Disposition, CreateOptions, EaBuffer, EaLength,
+    /// CreateFileType, InternalParameters, Options, DeviceObject) = IoCreateFileEx
+    /// com IO_DRIVER_CREATE_CONTEXT{DeviceObjectHint}: o mesmo caminho do
+    /// IoCreateFileEx do OpenNT (que não modela DriverContext; o 15º argumento
+    /// fica além dos 14 do trampolim).
+    fn create_file_specify_device_object_hint(call: &Call) -> Result<u64, KernelError> {
+        zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32).map(signed_status)
+    }
+
+    /// IoCreateStreamFileObjectEx(FileObject, DeviceObject, *FileHandle) -> PFILE_OBJECT.
+    fn create_stream_file_object_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PHANDLE opcional do FS chamador (modo kernel).
+        let handle = (call.arg(3) != 0).then(|| unsafe { Field::<u64>::at(call.arg(3)) });
+        file_system::create_stream_file_object_ex(call.arg(1), call.arg(2), handle)
+    }
+
+    /// IoSetInformation(FileObject, FileInformationClass, Length, FileInformation).
+    fn set_information(call: &Call) -> Result<u64, KernelError> {
+        information::set_native(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4)).map(signed_status)
+    }
+
+    /// IoQueryFileDosDeviceName(FileObject, *ObjectNameInformation).
+    fn query_file_dos_device_name(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: POBJECT_NAME_INFORMATION* de saída do FS chamador (modo kernel).
+        let output = unsafe { Field::<u64>::at(call.arg(2)) };
+        information::query_dos_device_name(call.arg(1), output).map(signed_status)
+    }
+
+    /// IoTransferActivityId(ActivityId, RelatedActivityId) -> VOID.
+    fn transfer_activity_id(call: &Call) -> Result<u64, KernelError> {
+        threads::activity_transfer::transfer(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-file-system-support",
+        names: &[
+            "IoCheckEaBufferValidity",
+            "IoCheckQuotaBufferValidity",
+            "IoCheckRedirectionTrustLevel",
+            "IoComputeRedirectionTrustLevel",
+            "IoCopyDeviceObjectHint",
+            "IoCreateFileSpecifyDeviceObjectHint",
+            "IoCreateStreamFileObjectEx",
+            "IoSetInformation",
+            "IoQueryFileDosDeviceName",
+            "IoTransferActivityId",
+        ],
+        handlers: &[
+            check_ea_buffer_validity,
+            check_quota_buffer_validity,
+            check_redirection_trust_level,
+            compute_redirection_trust_level,
+            copy_device_object_hint,
+            create_file_specify_device_object_hint,
+            create_stream_file_object_ex,
+            set_information,
+            query_file_dos_device_name,
+            transfer_activity_id,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod io_paging {
+    //! IoPageRead/IoSynchronousPageWrite (LFS e TxF do ntfs.sys),
+    //! IoMakeAssociatedIrpEx (I/O não cacheado em várias extensões) e o par
+    //! FsTrackOffset que o NtfsCommonRead/Write limpa em todo IRP.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::{DeviceObject, FileObject, IoStatusBlock, Irp, LargeInteger, Mdl};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::paging_io::{self, PagingRequest};
+    use crate::ntos::io::{extensions, irp_support};
+    use crate::rtl::KernelError;
+
+    /// IoPageRead(FileObject, Mdl, StartingOffset, Event, IoStatusBlock) -> NTSTATUS.
+    /// Os dois bits baixos do FileObject e do MDL são marcas do Mm.
+    fn page_read(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT, MDL, LARGE_INTEGER e IO_STATUS_BLOCK do Mm/FS (modo kernel).
+        let request = unsafe { PagingRequest { file: FileObject::at(call.arg(1) & !3), descriptor: Mdl::at(call.arg(2) & !3), offset: LargeInteger::at(call.arg(3)), event: call.arg(4), io_status: IoStatusBlock::at(call.arg(5)) } };
+        paging_io::page_read(&request, call.arg(1) & 3, call.arg(2) & 3).map(signed_status)
+    }
+
+    /// IoSynchronousPageWrite(FileObject, Mdl, FileOffset, Event, IoStatusBlock) -> NTSTATUS.
+    fn synchronous_page_write(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT, MDL, LARGE_INTEGER e IO_STATUS_BLOCK do Mm/FS (modo kernel).
+        let request = unsafe { PagingRequest { file: FileObject::at(call.arg(1)), descriptor: Mdl::at(call.arg(2)), offset: LargeInteger::at(call.arg(3)), event: call.arg(4), io_status: IoStatusBlock::at(call.arg(5)) } };
+        paging_io::synchronous_page_write(&request).map(signed_status)
+    }
+
+    /// IoMakeAssociatedIrpEx(Irp, DeviceObject, StackSize) -> PIRP.
+    fn make_associated_irp_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP mestre vivo e DEVICE_OBJECT opcional do FS.
+        let (master, device) = unsafe { (Irp::at(call.arg(1)), (call.arg(2) != 0).then(|| DeviceObject::at(call.arg(2)))) };
+        Ok(irp_support::make_associated_irp_ex(master, device, call.arg(3) as u8))
+    }
+
+    /// IoIrpHasFsTrackOffsetExtensionType(Irp) -> BOOLEAN.
+    fn irp_has_fs_track_offset_extension_type(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP vivo do FS.
+        Ok(extensions::irp_has_fs_track_offset(unsafe { Irp::at(call.arg(1)) }) as u64)
+    }
+
+    /// IoClearFsTrackOffsetState(Irp) -> NTSTATUS.
+    fn clear_fs_track_offset_state(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP vivo do FS.
+        Ok(signed_status(extensions::clear_fs_track_offset_state(unsafe { Irp::at(call.arg(1)) })))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-paging",
+        names: &["IoPageRead", "IoSynchronousPageWrite", "IoMakeAssociatedIrpEx", "IoIrpHasFsTrackOffsetExtensionType", "IoClearFsTrackOffsetState"],
+        handlers: &[page_read, synchronous_page_write, make_associated_irp_ex, irp_has_fs_track_offset_extension_type, clear_fs_track_offset_state],
+        data_exports: &[],
+    };
+}
+
+pub mod io_share_access {
+    //! SHARE_ACCESS: a lógica mora em `io/share_access.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::extra_fs_ntfs::ShareAccess;
+    use crate::ntos::inc::types::{FileObject, NtStruct};
+    use crate::ntos::io::share_access;
+    use crate::rtl::KernelError;
+
+    fn objects(file: u64, share: u64) -> (&'static FileObject, &'static ShareAccess) {
+        // SAFETY: o FS passa o FILE_OBJECT do IRP_MJ_CREATE e o SHARE_ACCESS do seu FCB.
+        unsafe { (FileObject::at(file), ShareAccess::at(share)) }
+    }
+
+    fn check(call: &Call) -> Result<u64, KernelError> {
+        let (file, share) = objects(call.arg(3), call.arg(4));
+        Ok(signed_status(share_access::check(call.arg(1) as u32, call.arg(2) as u32, file, share, call.arg(5) & 0xFF != 0)))
+    }
+    fn set(call: &Call) -> Result<u64, KernelError> {
+        let (file, share) = objects(call.arg(3), call.arg(4));
+        share_access::set(call.arg(1) as u32, call.arg(2) as u32, file, share);
+        Ok(0)
+    }
+    fn remove(call: &Call) -> Result<u64, KernelError> {
+        let (file, share) = objects(call.arg(1), call.arg(2));
+        share_access::remove(file, share);
+        Ok(0)
+    }
+    fn update(call: &Call) -> Result<u64, KernelError> {
+        let (file, share) = objects(call.arg(1), call.arg(2));
+        share_access::update(file, share);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-share-access",
+        names: &["IoCheckShareAccess", "IoSetShareAccess", "IoRemoveShareAccess", "IoUpdateShareAccess"],
+        handlers: &[check, set, remove, update],
+        data_exports: &[],
+    };
+}
+
+pub mod io_share_access_link {
+    //! Io*LinkShareAccess*: o SHARE_ACCESS do arquivo mais a contagem de
+    //! exclusão por hard link (LINK_SHARE_ACCESS) que o ntfs.sys mantém.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::extra_fs_ntfs::{LinkShareAccess, ShareAccess};
+    use crate::ntos::inc::types::FileObject;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::share_access;
+    use crate::rtl::KernelError;
+
+    /// IoCheckLinkShareAccess(DesiredAccess, DesiredShareAccess, FileObject,
+    /// ShareAccess, LinkShareAccess, IoShareAccessFlags) -> NTSTATUS.
+    fn check_link_share_access(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: estruturas do FS chamador; NULL só onde as flags permitem.
+        let (file, share, link) = unsafe {
+            (
+                (call.arg(3) != 0).then(|| FileObject::at(call.arg(3))),
+                (call.arg(4) != 0).then(|| ShareAccess::at(call.arg(4))),
+                (call.arg(5) != 0).then(|| LinkShareAccess::at(call.arg(5))),
+            )
+        };
+        Ok(signed_status(share_access::check_link(call.arg(1) as u32, call.arg(2) as u32, file, share, link, call.arg(6) as u32)))
+    }
+
+    /// IoSetLinkShareAccess(DesiredAccess, DesiredShareAccess, FileObject,
+    /// ShareAccess, LinkShareAccess, IoShareAccessFlags) -> VOID.
+    fn set_link_share_access(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT e SHARE_ACCESS do FS; LinkShareAccess opcional.
+        let (file, share, link) = unsafe { (FileObject::at(call.arg(3)), ShareAccess::at(call.arg(4)), (call.arg(5) != 0).then(|| LinkShareAccess::at(call.arg(5)))) };
+        share_access::set_link(call.arg(1) as u32, call.arg(2) as u32, file, share, link, call.arg(6) as u32);
+        Ok(0)
+    }
+
+    /// IoRemoveLinkShareAccessEx(FileObject, ShareAccess, LinkShareAccess, IoShareAccessFlags) -> VOID.
+    fn remove_link_share_access_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT e SHARE_ACCESS do FS; LinkShareAccess opcional.
+        let (file, share, link) = unsafe { (FileObject::at(call.arg(1)), ShareAccess::at(call.arg(2)), (call.arg(3) != 0).then(|| LinkShareAccess::at(call.arg(3)))) };
+        share_access::remove_link(file, share, link, call.arg(4) as u32);
+        Ok(0)
+    }
+
+    /// IoUpdateLinkShareAccessEx(FileObject, ShareAccess, LinkShareAccess, IoShareAccessFlags) -> VOID.
+    fn update_link_share_access_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT e SHARE_ACCESS do FS; LinkShareAccess opcional.
+        let (file, share, link) = unsafe { (FileObject::at(call.arg(1)), ShareAccess::at(call.arg(2)), (call.arg(3) != 0).then(|| LinkShareAccess::at(call.arg(3)))) };
+        share_access::update_link(file, share, link, call.arg(4) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-share-access-link",
+        names: &["IoCheckLinkShareAccess", "IoSetLinkShareAccess", "IoRemoveLinkShareAccessEx", "IoUpdateLinkShareAccessEx"],
+        handlers: &[check_link_share_access, set_link_share_access, remove_link_share_access_ex, update_link_share_access_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod io_volume_information {
+    //! GUID de volume pelo Mount Manager, consulta por nome e definição de
+    //! informação de volume: a lógica mora em `io/volume_dos_name.rs` e
+    //! `io/file/zw.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{DeviceObject, NtStruct, UnicodeString};
+    use crate::ntos::io::file::zw;
+    use crate::ntos::io::volume_dos_name;
+    use crate::rtl::KernelError;
+
+    // SAFETY (ambas): o FS/filtro passa o DEVICE_OBJECT do volume e uma UNICODE_STRING/GUID de kernel.
+    fn device_to_guid(call: &Call) -> Result<u64, KernelError> {
+        volume_dos_name::volume_device_to_guid(unsafe { DeviceObject::at(call.arg(1)) }, call.arg(2)).map(signed_status)
+    }
+    fn device_to_guid_path(call: &Call) -> Result<u64, KernelError> {
+        volume_dos_name::volume_device_to_guid_path(unsafe { DeviceObject::at(call.arg(1)) }, unsafe { UnicodeString::at(call.arg(2)) }).map(signed_status)
+    }
+    fn query_by_name(call: &Call) -> Result<u64, KernelError> {
+        zw::query_information_by_name(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32, call.arg(6) as u32).map(signed_status)
+    }
+    fn set_volume_information(call: &Call) -> Result<u64, KernelError> {
+        zw::set_volume_information_file(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32).map(signed_status)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-volume-information",
+        names: &["IoVolumeDeviceToGuid", "IoVolumeDeviceToGuidPath", "IoQueryInformationByName", "ZwSetVolumeInformationFile"],
+        handlers: &[device_to_guid, device_to_guid_path, query_by_name, set_volume_information],
         data_exports: &[],
     };
 }

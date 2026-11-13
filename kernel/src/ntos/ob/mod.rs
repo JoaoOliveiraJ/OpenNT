@@ -23,3 +23,4 @@ pub mod object_reference;
 pub mod object_security;
 pub mod wait;
 pub mod exports;
+pub mod audit;

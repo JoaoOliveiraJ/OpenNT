@@ -275,3 +275,96 @@ pub fn add_known_ace(acl: u64, ace_revision: u32, ace_flags: u32, mask: u32, sid
     header.acl_revision.set(acl_revision.max(ace_revision) as u8);
     0
 }
+
+// ---- RtlAddProcessTrustLabelAce ----------------------------------------------
+//
+// ntoskrnl 19041 RtlAddProcessTrustLabelAce rva 0x79e0e0 (Acl, AceRevision,
+// AceFlags, ProcessTrustLabelSid, AceType, AccessMask), com RtlFirstFreeAce
+// rva 0x6d4560 e RtlIsValidProcessTrustLabelSid rva 0x347780:
+//   ACL NULL ou inválida              -> STATUS_INVALID_ACL
+//   AceType != SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE (0x14) -> STATUS_INVALID_PARAMETER
+//   SID inválido                      -> STATUS_INVALID_SID
+//   SID que não é de confiança de processo (S-1-19-x-y) -> STATUS_INVALID_PARAMETER
+//   AclRevision > 4 ou AceRevision > 4 -> STATUS_REVISION_MISMATCH
+//   AceFlags fora de 0x1F ou AccessMask com bits 24..31 -> STATUS_INVALID_PARAMETER
+//   RtlFirstFreeAce falha             -> STATUS_INVALID_ACL
+//   sem espaço                        -> STATUS_ALLOTTED_SPACE_EXCEEDED
+// A ACE (SYSTEM_PROCESS_TRUST_LABEL_ACE do winnt.h: o layout de ACCESS_ALLOWED_ACE,
+// AceSize = 8 + 4*(2 + SubAuthorityCount)) vai no primeiro espaço livre,
+// AceCount++, e a revisão da ACL sobe para a da ACE.
+
+const SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE: u8 = 0x14;
+/// SECURITY_PROCESS_TRUST_AUTHORITY {0,0,0,0,0,19}.
+const PROCESS_TRUST_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 0x13];
+const MAXIMUM_ACL_REVISION: u8 = 4;
+
+/// RtlFirstFreeAce: `None` = ACL inconsistente; `Some(0)` = sem espaço livre.
+pub fn first_free_ace(acl: &Acl) -> Option<u64> {
+    let end = acl.address() + acl.acl_size.get() as u64;
+    let mut current = acl.address() + Acl::SIZE;
+    for _ in 0..acl.ace_count.get() {
+        if current >= end {
+            return None;
+        }
+        // SAFETY: cabeçalho de ACE dentro dos AclSize bytes da ACL.
+        current += unsafe { AceHeader::at(current) }.ace_size.get() as u64;
+    }
+    Some(if current <= end { current } else { 0 })
+}
+
+/// RtlIsValidProcessTrustLabelSid: S-1-19-x-y com duas subautoridades; o par
+/// (0, y) só é aceito com y = 0.
+pub fn is_valid_process_trust_label_sid(sid: &Sid) -> bool {
+    if sid.sub_authority_count.get() != 2 || sid.revision.get() != 1 {
+        return false;
+    }
+    if !sid.identifier_authority.value.iter().zip(PROCESS_TRUST_AUTHORITY).all(|(cell, byte)| cell.get() == byte) {
+        return false;
+    }
+    // SAFETY: SubAuthorityCount == 2: as duas subautoridades pertencem ao SID.
+    let sub_authorities = unsafe { crate::ntos::inc::field::Field::<u32>::array_at(sid.sub_authority[0].address(), 2) };
+    sub_authorities[0].get() != 0 || sub_authorities[1].get() == 0
+}
+
+/// RtlAddProcessTrustLabelAce.
+pub fn add_process_trust_label_ace(acl_address: u64, ace_revision: u32, ace_flags: u32, sid_address: u64, ace_type: u8, access_mask: u32) -> u32 {
+    if acl_address == 0 || !valid(acl_address) {
+        return STATUS_INVALID_ACL;
+    }
+    // SAFETY: ACL validada acima, do chamador de modo kernel.
+    let acl = unsafe { Acl::at(acl_address) };
+    if ace_type != SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !crate::ntos::se::sid::valid(sid_address) {
+        return STATUS_INVALID_SID;
+    }
+    // SAFETY: SID validado acima.
+    let sid = unsafe { Sid::at(sid_address) };
+    if !is_valid_process_trust_label_sid(sid) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let acl_revision = acl.acl_revision.get();
+    if acl_revision > MAXIMUM_ACL_REVISION || ace_revision > MAXIMUM_ACL_REVISION as u32 {
+        return STATUS_REVISION_MISMATCH;
+    }
+    if ace_flags & !0x1F != 0 || access_mask & 0xFF00_0000 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(free) = first_free_ace(acl) else { return STATUS_INVALID_ACL };
+    let sid_length = 8 + sid.sub_authority_count.get() as u64 * 4;
+    let ace_size = offset_of!(AccessAllowedAce, sid_start) as u64 + sid_length;
+    if free == 0 || free + ace_size > acl.address() + acl.acl_size.get() as u64 {
+        return STATUS_ALLOTTED_SPACE_EXCEEDED;
+    }
+    // SAFETY: o espaço livre comporta a ACE inteira (conferido acima).
+    let ace = unsafe { AccessAllowedAce::at(free) };
+    ace.header.ace_size.set(ace_size as u16);
+    ace.header.ace_flags.set(ace_flags as u8);
+    ace.header.ace_type.set(SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE);
+    ace.mask.set(access_mask);
+    crate::ntos::se::sid::copy(sid_length as u32, ace.sid_start.address(), sid_address);
+    acl.ace_count.set(acl.ace_count.get() + 1);
+    acl.acl_revision.set(acl_revision.max(ace_revision as u8));
+    0
+}

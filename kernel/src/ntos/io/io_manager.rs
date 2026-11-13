@@ -209,6 +209,15 @@ pub fn iof_complete_request(packet: u64) -> i32 {
         current_location += 1;
         current_stack += IoStackLocation::SIZE;
     }
+    // IRP associado: libera o associado e devolve a contagem ao mestre.
+    if crate::ntos::io::irp_support::complete_associated_irp(packet).unwrap_or(false) {
+        return 0;
+    }
+    // IRP de paginação síncrono (IoPageRead/IoSynchronousPageWrite): UserIosb inteiro,
+    // UserEvent e IoFreeIrp, como o ramo IRP_PAGING_IO do IopfCompleteRequest.
+    if crate::ntos::io::paging_io::complete_paging_request(packet) {
+        return 0;
+    }
     let (final_status, information) = builder::read_io_status(packet);
     // O lock sai antes da callback: o dono da conclusão pode esquecer ou
     // registrar outras conclusões dentro dela.

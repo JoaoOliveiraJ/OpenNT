@@ -35,3 +35,43 @@ pub fn compute_crc32(partial: u32, buffer: u64, length: u32) -> u32 {
     }
     !crc
 }
+
+// ---- RtlCrc64 (ntoskrnl 19045, 0x305d70 -> RtlpComputeCrcInternal, Crc64Ctrl) ----
+//
+// Crc64Ctrl: polinômio refletido 0x9A6C9329AC4BC9B5 (CRC-64/NVME) e valor de
+// inversão 0xFFFFFFFFFFFFFFFF; o estado começa em InitialCrc ^ ~0 e o resultado
+// é invertido de novo (conferido contra o RtlCrc64 do ntdll).
+
+const fn crc64_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 { (value >> 1) ^ 0x9A6C_9329_AC4B_C9B5 } else { value >> 1 };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+static CRC64_TABLE: [u64; 256] = crc64_table();
+
+/// RtlCrc64(Buffer, Size, InitialCrc) -> ULONGLONG.
+pub fn crc64(buffer: u64, size: u64, initial: u64) -> u64 {
+    let mut crc = !initial;
+    let mut cursor = buffer;
+    let mut remaining = size;
+    while remaining != 0 {
+        let chunk = remaining.min(0x1000);
+        for byte in guest::read_bytes(cursor, chunk as usize) {
+            crc = CRC64_TABLE[((crc ^ byte as u64) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        cursor += chunk;
+        remaining -= chunk;
+    }
+    !crc
+}

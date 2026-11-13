@@ -826,3 +826,90 @@ pub fn init() {
     close::set_zw_provider(close_record);
     crate::ntos::io::file::information::set_object_query(query_file_information_by_object);
 }
+
+// ---- NtSetVolumeInformationFile (kernel) e IoQueryInformationByName -------------
+
+/// IopSetFsOperationLength (ntoskrnl 0x983880): tamanho mínimo por
+/// FS_INFORMATION_CLASS; 0 = classe que não se define.
+const SET_FS_OPERATION_LENGTH: [u32; 15] = [0, 0, 8, 0, 0, 0, 48, 0, 64, 0, 4, 0, 0, 0, 0];
+/// IopQueryOperationLength (ntoskrnl 0x984b10), FILE_INFORMATION_CLASS < 0x4C.
+const QUERY_OPERATION_LENGTH: [u8; 0x4C] = [
+    0, 0, 0, 0, 40, 24, 8, 4, 4, 8, 0, 0, 0, 0, 8, 0, 4, 4, 104, 0, 0, 8, 32, 8, 40, 16, 24, 0, 16, 72, 0, 0, 56, 16, 56, 8, 0, 0,
+    0, 0, 0, 4, 0, 4, 20, 12, 32, 16, 8, 8, 0, 1, 0, 2, 12, 116, 0, 0, 8, 24, 0, 0, 36, 0, 0, 0, 0, 8, 72, 0, 96, 4, 0, 0, 4, 4,
+];
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+
+/// ZwSetVolumeInformationFile(Handle, IoStatusBlock, FsInformation, Length, Class).
+/// Um handle de dispositivo nativo recebe IRP_MJ_SET_VOLUME_INFORMATION real;
+/// os volumes servidos pelo próprio kernel (`drivers::fs`) não implementam
+/// rótulo/controle/ObjectId de volume.
+pub fn set_volume_information_file(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32) -> Result<u32, KernelError> {
+    let required = SET_FS_OPERATION_LENGTH.get(class as usize).copied().unwrap_or(0);
+    if required == 0 {
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    if length < required {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };
+    match &entry.backing {
+        Backing::Device { .. } => {
+            let (status, information) = crate::ntos::io::file::information::set_volume_native(entry.file_object, class, length, buffer)?;
+            if status != 0x103 {
+                write_io_status(io_status, status, information);
+            }
+            Ok(status)
+        }
+        Backing::Volume { .. } => Ok(STATUS_INVALID_DEVICE_REQUEST),
+    }
+}
+
+/// IoQueryInformationByName(ObjectAttributes, IoStatusBlock, Buffer, Length,
+/// Class, Options, DriverContext) (RVA 0x5d8b10): só FileStatInformation (68),
+/// FileStatLxInformation (70), FileCaseSensitiveInformation (71) e, em modo
+/// kernel, 75; o modo usuário passa antes pelo IopValidateQueryInformationParameters.
+/// O NT faz CREATE+QUERY+CLOSE num OPEN_PACKET "QueryOnly" sem handle; aqui a
+/// mesma sequência passa pelos serviços de arquivo do kernel (abrir com
+/// FILE_READ_ATTRIBUTES, compartilhamento total, FILE_OPEN_REPARSE_POINT |
+/// FILE_OPEN_FOR_BACKUP_INTENT; consultar; fechar).
+pub fn query_information_by_name(attributes: u64, io_status: u64, buffer: u64, length: u32, class: u32, options: u32) -> Result<u32, KernelError> {
+    use crate::ntos::init::exports::invoke_handler;
+    let thread = process::get_current_thread();
+    // IO_NO_PARAMETER_CHECKING (0x100) trata o pedido como de modo kernel;
+    // senão vale o PreviousMode da thread.
+    // SAFETY: o KTHREAD corrente.
+    let mode = if options & 0x100 != 0 || thread == 0 { 0 } else { unsafe { crate::ntos::inc::types::Kthread::at(thread) }.previous_mode.get() };
+    if mode != 0 {
+        let minimum = QUERY_OPERATION_LENGTH.get(class as usize).copied().unwrap_or(0) as u32;
+        if minimum == 0 {
+            return Ok(STATUS_INVALID_INFO_CLASS);
+        }
+        if length < minimum {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+    }
+    let effective = if class == 75 && mode == 0 { 71 } else { class };
+    if !matches!(effective, 68 | 70 | 71) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let scratch = guest::alloc_bytes(0x20);
+    if scratch == 0 {
+        return Ok(0xC000_009A);
+    }
+    let (handle_output, open_status) = (scratch, scratch + 0x10);
+    let status = invoke_handler("ZwOpenFile", &[handle_output, 0x80, attributes, open_status, 7, 0x20_4000])? as u32;
+    let result = if status & 0x8000_0000 != 0 {
+        write_io_status(io_status, status, 0);
+        Ok(status)
+    } else {
+        // SAFETY: o PHANDLE de rascunho que o ZwOpenFile preencheu.
+        let handle = unsafe { Field::<u64>::at(handle_output) }.get();
+        let status = invoke_handler("ZwQueryInformationFile", &[handle, io_status, buffer, length as u64, class as u64])? as u32;
+        invoke_handler("ZwClose", &[handle])?;
+        Ok(status)
+    };
+    guest::free_bytes(scratch);
+    result
+}

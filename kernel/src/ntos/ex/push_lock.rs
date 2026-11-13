@@ -344,3 +344,93 @@ pub fn try_shared(pointer: u64, flags: u32) -> Result<bool, KernelError> {
     validate(flags, 2)?;
     Ok(try_acquire(word(pointer), true))
 }
+
+// ---- EX_PUSH_LOCK_CACHE_AWARE (ex\pushlock.c) ----------------------------------
+//
+// Derivado do ntoskrnl 10.0.19045:
+//   ExAllocateCacheAwarePushLock(Flags)        RVA 0x3c8090
+//     tabela = ExAllocatePoolWithTag(Flags&1 ? NonPagedPoolNx : PagedPool, 0x100, 'Plcp')
+//     KeNumberNodes == 1 (um nó no OpenNT) -> um bloco de 0x1000 ('Plcl'):
+//     slot i = bloco + i*0x80 (EX_PUSH_LOCK_CACHE_AWARE_PADDED): Lock = 0,
+//     Single = 1, ParentLock = tabela; tabela.Locks[i] = slot. Falha -> NULL.
+//   ExAcquireCacheAwarePushLockExclusive       RVA 0x273160 -> ExfAcquire...ExclusiveEx
+//     0x2731b0: trava Locks[0..32] exclusivos, em ordem.
+//   ExReleaseCacheAwarePushLockExclusive       RVA 0x271a50: solta Locks[0..32].
+//   ExAcquireCacheAwarePushLockSharedEx(L, F)  RVA 0x2caae0: F & ~3 -> bugcheck 0x152;
+//     trava compartilhado Locks[Prcb.Number & 0x1f] e DEVOLVE esse slot.
+//   ExReleaseCacheAwarePushLockSharedEx(P, F)  RVA 0x2caca0: solta o slot P.
+// O KeAbPreAcquire/KeAbPostRelease (AutoBoost) não existe no OpenNT.
+
+use crate::ntos::inc::types::extra_fs_fat::{ExPushLockCacheAware, ExPushLockCacheAwarePadded};
+use crate::ntos::inc::types::Kpcr;
+
+pub const CACHE_AWARE_SLOT_COUNT: usize = 32;
+const CACHE_AWARE_TAG_TABLE: u32 = 0x7063_6C50; // 'Plcp'
+const CACHE_AWARE_TAG_BLOCK: u32 = 0x6C63_6C50; // 'Plcl'
+
+/// EX_PUSH_LOCK flags inválidos: KeBugCheckEx(0x152, Flags, Lock, 0, 0).
+fn cache_aware_check_flags(lock: u64, flags: u32) {
+    if flags & !3 != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x152, flags as u64, lock, 0, 0);
+    }
+}
+
+/// ExAllocateCacheAwarePushLock: devolve a tabela (PEX_PUSH_LOCK_CACHE_AWARE) ou 0.
+pub fn allocate_cache_aware(flags: u32) -> Result<u64, KernelError> {
+    let pool_type = if flags & 1 != 0 { 0x200 } else { 1 }; // NonPagedPoolNx : PagedPool
+    let table_bytes = ExPushLockCacheAware::SIZE;
+    let slot_bytes = ExPushLockCacheAwarePadded::SIZE;
+    let address = crate::ntos::ex::pool_allocation::allocate_tagged(pool_type, table_bytes, CACHE_AWARE_TAG_TABLE)?;
+    if address == 0 {
+        return Ok(0);
+    }
+    guest::write_bytes(address, &[0u8; ExPushLockCacheAware::SIZE as usize]);
+    let block = crate::ntos::ex::pool_allocation::allocate_tagged(pool_type, slot_bytes * CACHE_AWARE_SLOT_COUNT as u64, CACHE_AWARE_TAG_BLOCK)?;
+    if block == 0 {
+        crate::ntos::mm::kernel_pool::free(address, Some(CACHE_AWARE_TAG_TABLE))?;
+        return Ok(0);
+    }
+    guest::write_bytes(block, &alloc::vec![0u8; (slot_bytes * CACHE_AWARE_SLOT_COUNT as u64) as usize]);
+    // SAFETY: a tabela e o bloco acabaram de ser alocados com esses tamanhos.
+    let table = unsafe { ExPushLockCacheAware::at(address) };
+    let slots = unsafe { ExPushLockCacheAwarePadded::array_at(block, CACHE_AWARE_SLOT_COUNT) };
+    for (cell, slot) in table.locks.iter().zip(slots) {
+        slot.lock.value.set(0);
+        slot.single.set(1);
+        slot.parent_lock.set(address);
+        cell.set(slot.address());
+    }
+    Ok(address)
+}
+
+/// ExAcquireCacheAwarePushLockExclusive: todos os slots, em ordem.
+pub fn acquire_cache_aware_exclusive(table: &ExPushLockCacheAware) -> Result<(), KernelError> {
+    for cell in &table.locks {
+        acquire_exclusive(cell.get(), 0)?;
+    }
+    Ok(())
+}
+
+/// ExReleaseCacheAwarePushLockExclusive.
+pub fn release_cache_aware_exclusive(table: &ExPushLockCacheAware) -> Result<(), KernelError> {
+    for cell in &table.locks {
+        release_exclusive(cell.get(), 0)?;
+    }
+    Ok(())
+}
+
+/// ExAcquireCacheAwarePushLockSharedEx: o slot da CPU (Prcb.Number & 31).
+pub fn acquire_cache_aware_shared(table: &ExPushLockCacheAware, flags: u32) -> Result<u64, KernelError> {
+    cache_aware_check_flags(table.address(), flags);
+    // SAFETY: a KPCR da CPU corrente fica mapeada desde o boot.
+    let processor = unsafe { Kpcr::at(crate::ntos::ke::pcr::get_pcr_address()) }.prcb.number.get() as usize;
+    let lock = table.locks[processor & (CACHE_AWARE_SLOT_COUNT - 1)].get();
+    acquire_shared(lock, flags)?;
+    Ok(lock)
+}
+
+/// ExReleaseCacheAwarePushLockSharedEx: o slot devolvido pela aquisição.
+pub fn release_cache_aware_shared(lock: u64, flags: u32) -> Result<(), KernelError> {
+    cache_aware_check_flags(lock, flags);
+    release_shared(lock, flags)
+}

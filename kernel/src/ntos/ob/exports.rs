@@ -365,3 +365,42 @@ pub mod ob_security_cache {
         data_exports: &[],
     };
 }
+
+pub mod ob_audit {
+    //! Adaptador de `ob/audit.rs`: ObQueryObjectAuditingByHandle, que o ntfs
+    //! consulta antes de SeDeleteObjectAuditAlarm (NtfsSetDispositionInfo).
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::audit;
+    use crate::rtl::KernelError;
+
+    /// ObQueryObjectAuditingByHandle(Handle, *GenerateOnClose) -> NTSTATUS.
+    fn query_object_auditing_by_handle(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PBOOLEAN de saída de um chamador de kernel, como no NT.
+        let generate_on_close = unsafe { Field::<u8>::at(call.arg(2)) };
+        Ok(signed_status(audit::query_object_auditing_by_handle(call.arg(1), generate_on_close)?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ob-audit",
+        names: &["ObQueryObjectAuditingByHandle"],
+        handlers: &[query_object_auditing_by_handle],
+        data_exports: &[],
+    };
+}
+
+pub mod ob_temporary_object {
+    //! ObMakeTemporaryObject: a lógica mora em `ob/handles/namespace.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ob::handles::namespace;
+    use crate::rtl::KernelError;
+
+    fn make_temporary(call: &Call) -> Result<u64, KernelError> {
+        namespace::make_temporary_by_pointer(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ob-temporary-object", names: &["ObMakeTemporaryObject"], handlers: &[make_temporary], data_exports: &[] };
+}

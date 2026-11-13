@@ -98,6 +98,15 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     KernelDataEntry { name: "Mm64BitPhysicalAddress", size: 1, storage_size: 1, alignment: 1, initial: &[1] },
     KernelDataEntry { name: "MmSystemRangeStart", size: 8, storage_size: 8, alignment: 8, initial: &MM_SYSTEM_RANGE_START_INITIAL },
     KernelDataEntry { name: "MmBadPointer", size: 8, storage_size: 8, alignment: 8, initial: &MM_BAD_POINTER_INITIAL },
+    // POBJECT_TYPE do KTM (ALMOSTRO, NULL até o TmInitSystem do tm.sys, que
+    // o OpenNT não tem).
+    pointer("TmTransactionObjectType"),
+    pointer("TmResourceManagerObjectType"),
+    pointer("TmEnlistmentObjectType"),
+    // Página OEM 437 (SBCS): NlsMbOemCodePageTag = FALSE e NlsOemLeadByteInfo
+    // aponta para os 512 bytes zerados guardados logo depois da célula.
+    KernelDataEntry { name: "NlsMbOemCodePageTag", size: 1, storage_size: 1, alignment: 1, initial: &[0] },
+    KernelDataEntry { name: "NlsOemLeadByteInfo", size: 8, storage_size: 8 + 512, alignment: 8, initial: ZERO8 },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

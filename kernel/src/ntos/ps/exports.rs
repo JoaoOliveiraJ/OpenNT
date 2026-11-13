@@ -1310,3 +1310,56 @@ pub mod ps_impersonation {
         data_exports: &[],
     };
 }
+
+pub mod ps_io_boost {
+    //! PsEnterPriorityRegion/PsLeavePriorityRegion: o IoBoostCount da thread
+    //! corrente (PsBoostThreadIoEx); a lógica mora em `ps/io_boost.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::Ethread;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::{io_boost, process};
+    use crate::rtl::KernelError;
+
+    /// PsEnterPriorityRegion() -> VOID.
+    fn enter_priority_region(_: &Call) -> Result<u64, KernelError> {
+        // SAFETY: a ETHREAD corrente está viva enquanto ela executa.
+        io_boost::enter_priority_region(unsafe { Ethread::at(process::get_current_thread()) });
+        Ok(0)
+    }
+
+    /// PsLeavePriorityRegion() -> VOID.
+    fn leave_priority_region(_: &Call) -> Result<u64, KernelError> {
+        // SAFETY: a ETHREAD corrente está viva enquanto ela executa.
+        io_boost::leave_priority_region(unsafe { Ethread::at(process::get_current_thread()) });
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-io-boost",
+        names: &["PsEnterPriorityRegion", "PsLeavePriorityRegion"],
+        handlers: &[enter_priority_region, leave_priority_region],
+        data_exports: &[],
+    };
+}
+
+pub mod ps_disk_counters {
+    //! PsIsDiskCountersEnabled / PsUpdateDiskCounters: a lógica mora em `ps/process_accessors.rs`.
+
+    use crate::ntos::inc::types::{Eprocess, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::process_accessors;
+    use crate::rtl::KernelError;
+
+    fn enabled(_: &Call) -> Result<u64, KernelError> {
+        Ok(process_accessors::disk_counters_enabled() as u64)
+    }
+    fn update(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o EPROCESS vivo passado pelo FS/filtro.
+        let process = unsafe { Eprocess::at(call.arg(1)) };
+        process_accessors::update_disk_counters(process, call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32, call.arg(6) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-disk-counters", names: &["PsIsDiskCountersEnabled", "PsUpdateDiskCounters"], handlers: &[enabled, update], data_exports: &[] };
+}

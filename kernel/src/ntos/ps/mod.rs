@@ -29,3 +29,4 @@ pub mod exports;
 pub mod property_set;
 pub mod win32;
 pub mod job;
+pub mod io_boost;

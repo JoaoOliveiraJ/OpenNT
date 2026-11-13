@@ -615,3 +615,207 @@ pub mod se_appcontainer {
         data_exports: &[],
     };
 }
+
+pub mod se_access_check_ex {
+    //! Adaptadores de `se/access_check.rs`: access check com requisição/
+    //! resposta e com hint, e os ajustes por restrições de acesso que o ntfs
+    //! chama no caminho de create (TxfAccessCheck, NtfsAccessCheck).
+
+    use crate::ntos::inc::types::{AccessState, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::access_check;
+    use crate::rtl::KernelError;
+
+    /// SeAccessCheckEx(Subject, SubjectLocked, AccessRequest, AccessReply,
+    /// AuditInfo, AccessMode) -> BOOLEAN. Os ponteiros nulos fazem parte do
+    /// contrato (validação na ordem do NT), então seguem como endereços.
+    fn access_check_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(access_check::access_check_ex(call.arg(1), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u8 as u32) as u64)
+    }
+
+    /// SeAccessCheckWithHint(Sd, Hint, Subject, Locked, Desired, Previous,
+    /// *Privileges, Mapping, Mode, *Granted, *Status) -> BOOLEAN.
+    fn access_check_with_hint(call: &Call) -> Result<u64, KernelError> {
+        Ok(access_check::access_check_with_hint(call.arg(1), call.arg(3), call.arg(5) as u32, call.arg(6) as u32, call.arg(7), call.arg(8), call.arg(9) as u8 as u32, call.arg(10), call.arg(11)) as u64)
+    }
+
+    /// SeAdjustAccessStateForAccessConstraints(ObjectType, Sd, AccessState).
+    fn adjust_access_state_for_access_constraints(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PACCESS_STATE de um chamador de kernel (NtfsAccessCheck).
+        let access_state = unsafe { AccessState::at(call.arg(3)) };
+        access_check::adjust_access_state_for_access_constraints(call.arg(1), call.arg(2), access_state);
+        Ok(0)
+    }
+
+    /// SeShouldCheckForAccessRightsFromParent(ObjectType, ChildSd, AccessState) -> BOOLEAN.
+    fn should_check_for_access_rights_from_parent(call: &Call) -> Result<u64, KernelError> {
+        Ok(access_check::should_check_for_access_rights_from_parent(call.arg(2)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-access-check-ex",
+        names: &["SeAccessCheckEx", "SeAccessCheckWithHint", "SeAdjustAccessStateForAccessConstraints", "SeShouldCheckForAccessRightsFromParent"],
+        handlers: &[access_check_ex, access_check_with_hint, adjust_access_state_for_access_constraints, should_check_for_access_rights_from_parent],
+        data_exports: &[],
+    };
+}
+
+pub mod se_audit_alarms {
+    //! Adaptadores de `se/audit.rs`: portões da política de auditoria de
+    //! arquivos, alarmes de abertura/exclusão de objeto e os registros de
+    //! hard link e de transação que o ntfs chama (NtfsAccessCheck,
+    //! NtfsSetDispositionInfo, NtfsSetLinkInfo, TxfAuditTransactionState).
+
+    use crate::ntos::inc::types::{AccessState, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::audit;
+    use crate::rtl::KernelError;
+
+    fn access_state(address: u64) -> &'static AccessState {
+        // SAFETY: PACCESS_STATE do chamador de kernel (SeCreateAccessState).
+        unsafe { AccessState::at(address) }
+    }
+
+    /// SeAuditHardLinkCreation(FileName, LinkName, bSuccess).
+    fn audit_hard_link_creation(call: &Call) -> Result<u64, KernelError> {
+        audit::audit_hard_link_creation(call.arg(1), call.arg(2), call.arg(3) as u8 != 0, 0);
+        Ok(0)
+    }
+
+    /// SeAuditHardLinkCreationWithTransaction(FileName, LinkName, bSuccess, TransactionId).
+    fn audit_hard_link_creation_with_transaction(call: &Call) -> Result<u64, KernelError> {
+        audit::audit_hard_link_creation(call.arg(1), call.arg(2), call.arg(3) as u8 != 0, call.arg(4));
+        Ok(0)
+    }
+
+    /// SeAuditTransactionStateChange(TransactionId, ResourceManagerId, NewState).
+    fn audit_transaction_state_change(call: &Call) -> Result<u64, KernelError> {
+        audit::audit_transaction_state_change(call.arg(1), call.arg(2), call.arg(3) as u32);
+        Ok(0)
+    }
+
+    /// SeAuditingAnyFileEventsWithContextEx(Sd, Subject, *StagingEnabled) -> BOOLEAN.
+    fn auditing_any_file_events(call: &Call) -> Result<u64, KernelError> {
+        Ok(audit::auditing_any_file_events(call.arg(3)) as u64)
+    }
+
+    /// SeAuditingFileEventsWithContextEx(AccessGranted, Sd, Subject, *StagingEnabled) -> BOOLEAN.
+    fn auditing_file_events(call: &Call) -> Result<u64, KernelError> {
+        Ok(audit::auditing_file_events(call.arg(1) as u8 != 0, call.arg(4)) as u64)
+    }
+
+    /// SeAuditingHardLinkEventsWithContext(AccessGranted, Sd, Subject) -> BOOLEAN.
+    fn auditing_hard_link_events(call: &Call) -> Result<u64, KernelError> {
+        Ok(audit::auditing_hard_link_events(call.arg(1) as u8 != 0, call.arg(2)) as u64)
+    }
+
+    /// SeDeleteObjectAuditAlarm(Object, Handle).
+    fn delete_object_audit_alarm(call: &Call) -> Result<u64, KernelError> {
+        audit::delete_object_audit_alarm(call.arg(1), call.arg(2), 0);
+        Ok(0)
+    }
+
+    /// SeDeleteObjectAuditAlarmWithTransaction(Object, Handle, TransactionId).
+    fn delete_object_audit_alarm_with_transaction(call: &Call) -> Result<u64, KernelError> {
+        audit::delete_object_audit_alarm(call.arg(1), call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    /// SeOpenObjectAuditAlarm(TypeName, Object, AbsoluteName, Sd, AccessState,
+    /// ObjectCreated, AccessGranted, AccessMode, *GenerateOnClose).
+    fn open_object_audit_alarm(call: &Call) -> Result<u64, KernelError> {
+        audit::open_object_audit_alarm(call.arg(1), call.arg(2), call.arg(3), call.arg(4), access_state(call.arg(5)), call.arg(7) as u8 != 0, call.arg(8) as u8, 0, call.arg(9));
+        Ok(0)
+    }
+
+    /// SeOpenObjectAuditAlarmWithTransaction(..., AccessMode, TransactionId, *GenerateOnClose).
+    fn open_object_audit_alarm_with_transaction(call: &Call) -> Result<u64, KernelError> {
+        audit::open_object_audit_alarm(call.arg(1), call.arg(2), call.arg(3), call.arg(4), access_state(call.arg(5)), call.arg(7) as u8 != 0, call.arg(8) as u8, call.arg(9), call.arg(10));
+        Ok(0)
+    }
+
+    /// SeOpenObjectForDeleteAuditAlarm(TypeName, Object, AbsoluteName, Sd,
+    /// AccessState, ObjectCreated, AccessGranted, AccessMode, *GenerateOnClose).
+    fn open_object_for_delete_audit_alarm(call: &Call) -> Result<u64, KernelError> {
+        audit::open_object_for_delete_audit_alarm(call.arg(1), call.arg(2), call.arg(3), call.arg(4), access_state(call.arg(5)), call.arg(7) as u8 != 0, call.arg(8) as u8, 0, call.arg(9));
+        Ok(0)
+    }
+
+    /// SeOpenObjectForDeleteAuditAlarmWithTransaction(..., AccessMode, TransactionId, *GenerateOnClose).
+    fn open_object_for_delete_audit_alarm_with_transaction(call: &Call) -> Result<u64, KernelError> {
+        audit::open_object_for_delete_audit_alarm(call.arg(1), call.arg(2), call.arg(3), call.arg(4), access_state(call.arg(5)), call.arg(7) as u8 != 0, call.arg(8) as u8, call.arg(9), call.arg(10));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-audit-alarms",
+        names: &[
+            "SeAuditHardLinkCreation",
+            "SeAuditHardLinkCreationWithTransaction",
+            "SeAuditTransactionStateChange",
+            "SeAuditingAnyFileEventsWithContextEx",
+            "SeAuditingFileEventsWithContextEx",
+            "SeAuditingHardLinkEventsWithContext",
+            "SeDeleteObjectAuditAlarm",
+            "SeDeleteObjectAuditAlarmWithTransaction",
+            "SeOpenObjectAuditAlarm",
+            "SeOpenObjectAuditAlarmWithTransaction",
+            "SeOpenObjectForDeleteAuditAlarm",
+            "SeOpenObjectForDeleteAuditAlarmWithTransaction",
+        ],
+        handlers: &[
+            audit_hard_link_creation,
+            audit_hard_link_creation_with_transaction,
+            audit_transaction_state_change,
+            auditing_any_file_events,
+            auditing_file_events,
+            auditing_hard_link_events,
+            delete_object_audit_alarm,
+            delete_object_audit_alarm_with_transaction,
+            open_object_audit_alarm,
+            open_object_audit_alarm_with_transaction,
+            open_object_for_delete_audit_alarm,
+            open_object_for_delete_audit_alarm_with_transaction,
+        ],
+        data_exports: &[],
+    };
+}
+
+pub mod se_set_security {
+    //! Adaptadores de `se/set_security.rs`: troca de componentes do descritor
+    //! de um objeto existente e as verificações auxiliares que o ntfs chama
+    //! ao mudar a segurança (NtfsModifySecurity, NtfsCacheSharedSecurityForCreate).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::set_security;
+    use crate::rtl::KernelError;
+
+    /// SeSetSecurityDescriptorInfoEx(Object, *SecurityInformation, Modification,
+    /// *ObjectsSecurityDescriptor, AutoInheritFlags, PoolType, GenericMapping).
+    fn set_security_descriptor_info_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(set_security::set_security_descriptor_info(call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(7))))
+    }
+
+    /// SeComputeAutoInheritByObjectType(ObjectType, Sd, ParentSd) -> ULONG.
+    fn compute_auto_inherit_by_object_type(call: &Call) -> Result<u64, KernelError> {
+        Ok(set_security::compute_auto_inherit_by_object_type(call.arg(2), call.arg(3)) as u64)
+    }
+
+    /// SeCheckForCriticalAceRemoval(CurrentSd, NewSd, Subject, *AceRemoved).
+    fn check_for_critical_ace_removal(call: &Call) -> Result<u64, KernelError> {
+        set_security::check_for_critical_ace_removal(call.arg(4));
+        Ok(0)
+    }
+
+    /// SeAdjustObjectSecurity(...) -> NTSTATUS.
+    fn adjust_object_security(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(set_security::adjust_object_security()))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-set-security",
+        names: &["SeSetSecurityDescriptorInfoEx", "SeComputeAutoInheritByObjectType", "SeCheckForCriticalAceRemoval", "SeAdjustObjectSecurity"],
+        handlers: &[set_security_descriptor_info_ex, compute_auto_inherit_by_object_type, check_for_critical_ace_removal, adjust_object_security],
+        data_exports: &[],
+    };
+}

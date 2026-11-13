@@ -656,3 +656,41 @@ pub mod mm_system_info {
         data_exports: &[("MmSystemRangeStart", system_info::system_range_start_cell), ("MmBadPointer", system_info::bad_pointer_cell)],
     };
 }
+
+pub mod mm_file_system_support {
+    //! MmForceSectionClosed, MmMdlPagesAreZero e MmSetAddressRangeModified:
+    //! a lógica mora em `mm/section/object_pointers.rs`, `mm/mdl.rs` e
+    //! `mm/modified_pages.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::{Mdl, SectionObjectPointers};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::section::object_pointers;
+    use crate::ntos::mm::{mdl, modified_pages};
+    use crate::rtl::KernelError;
+
+    /// MmForceSectionClosed(SectionObjectPointer, DelayClose) -> BOOLEAN.
+    fn force_section_closed(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: SECTION_OBJECT_POINTERS do FCB do FS chamador.
+        let pointers = unsafe { SectionObjectPointers::at(call.arg(1)) };
+        Ok(object_pointers::force_section_closed(pointers, call.arg(2) as u8 != 0) as u64)
+    }
+
+    /// MmMdlPagesAreZero(Mdl) -> BOOLEAN.
+    fn mdl_pages_are_zero(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: MDL vivo do FS chamador.
+        Ok(mdl::pages_are_zero(unsafe { Mdl::at(call.arg(1)) }) as u64)
+    }
+
+    /// MmSetAddressRangeModified(Address, Length) -> BOOLEAN.
+    fn set_address_range_modified(call: &Call) -> Result<u64, KernelError> {
+        Ok(modified_pages::set_address_range_modified(call.arg(1), call.arg(2)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-file-system-support",
+        names: &["MmForceSectionClosed", "MmMdlPagesAreZero", "MmSetAddressRangeModified"],
+        handlers: &[force_section_closed, mdl_pages_are_zero, set_address_range_modified],
+        data_exports: &[],
+    };
+}

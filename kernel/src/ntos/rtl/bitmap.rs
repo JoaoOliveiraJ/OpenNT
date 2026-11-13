@@ -407,3 +407,202 @@ pub fn find_clear_bits_and_set_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx,
     }
     found
 }
+
+// ---- Faixas e runs livres (RtlNumberOf{Set,Clear}BitsInRange, RtlExtractBitMap,
+// RtlFindClearRuns) ------------------------------------------------------------
+//
+// Transcritos do ntoskrnl 19045 (RtlNumberOfSetBitsInRange 0x587f90,
+// RtlNumberOfClearBitsInRange 0x587dc0, RtlExtractBitMap 0x586ce0,
+// RtlFindClearRuns 0x363fe0) e conferidos contra o mesmo código do ntdll.dll
+// em milhares de bitmaps aleatórios. Os originais varrem bytes com tabelas
+// (bits livres baixos/altos, maior run livre de um byte); aqui as mesmas
+// grandezas são calculadas sobre o armazenamento copiado em bloco.
+
+use crate::ntos::inc::types::extra_fs_ntfs::RtlBitmapRun;
+
+/// Bits livres (0) contíguos a partir do bit 0 de um byte (tabela 0x1e8a0).
+fn low_clear_bits(byte: u8) -> u32 {
+    (byte as u32 | 0x100).trailing_zeros()
+}
+
+/// Bits livres contíguos a partir do bit 7 de um byte (tabela 0x1e7a0).
+fn high_clear_bits(byte: u8) -> u32 {
+    if byte == 0 { 8 } else { byte.leading_zeros() }
+}
+
+/// Maior run livre dentro de um byte (tabela 0x18580).
+fn longest_clear_bits(byte: u8) -> u32 {
+    let (mut best, mut current) = (0, 0);
+    for bit in 0..8 {
+        if (byte >> bit) & 1 != 0 {
+            current = 0;
+        } else {
+            current += 1;
+            best = best.max(current);
+        }
+    }
+    best
+}
+
+/// Bytes do armazenamento do bitmap `[first_byte, first_byte + count)`.
+fn storage_bytes(bitmap: &RtlBitmap, first_byte: u64, count: usize) -> alloc::vec::Vec<u8> {
+    crate::ntos::mm::guest_memory::read_bytes(bitmap.buffer.get() + first_byte, count)
+}
+
+/// RtlNumberOfSetBitsInRange: ULONG -1 para início fora do mapa, faixa que
+/// passa do fim ou comprimento zero.
+pub fn number_set_in_range(bitmap: &RtlBitmap, start: u32, length: u32) -> u32 {
+    let size = bitmap.size_of_bit_map.get();
+    if start >= size || size - start < length || length == 0 {
+        return NO_MATCH;
+    }
+    let end = start + length;
+    let first = start / 8;
+    let bytes = storage_bytes(bitmap, first as u64, ((end - 1) / 8 - first + 1) as usize);
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            let byte_start = (first + index as u32) * 8;
+            let low = start.saturating_sub(byte_start).min(8);
+            let high = (end - byte_start).min(8);
+            let mask = (((1u32 << high) - 1) & !((1u32 << low) - 1)) as u8;
+            (byte & mask).count_ones()
+        })
+        .sum()
+}
+
+/// RtlNumberOfClearBitsInRange: Length menos os ligados (ou -1 do erro).
+pub fn number_clear_in_range(bitmap: &RtlBitmap, start: u32, length: u32) -> u32 {
+    match number_set_in_range(bitmap, start, length) {
+        NO_MATCH => NO_MATCH,
+        set => length - set,
+    }
+}
+
+/// RtlExtractBitMap(Source, Destination, TargetBit, NumberOfBits): copia
+/// min(NumberOfBits, Source.Size - TargetBit, Destination.Size) bits de
+/// `TargetBit` para o bit 0 do destino; os demais bits do destino ficam.
+pub fn extract(source: &RtlBitmap, destination: &RtlBitmap, target_bit: u32, bit_count: u32) {
+    let available = source.size_of_bit_map.get().wrapping_sub(target_bit);
+    let count = bit_count.min(available).min(destination.size_of_bit_map.get());
+    if count == 0 {
+        return;
+    }
+    let first = (target_bit / 8) as u64;
+    let source_bytes = storage_bytes(source, first, ((target_bit as u64 + count as u64 - 1) / 8 - first + 1) as usize);
+    let mut bytes = storage_bytes(destination, 0, count.div_ceil(8) as usize);
+    let shift = target_bit % 8;
+    for offset in 0..count {
+        let from = shift + offset;
+        let bit = (source_bytes[(from / 8) as usize] >> (from % 8)) & 1;
+        let byte = &mut bytes[(offset / 8) as usize];
+        *byte = (*byte & !(1 << (offset % 8))) | (bit << (offset % 8));
+    }
+    crate::ntos::mm::guest_memory::write_bytes(destination.buffer.get(), &bytes);
+}
+
+/// Estado do RtlFindClearRuns: os runs (StartingIndex, NumberOfBits) achados.
+struct ClearRuns {
+    runs: alloc::vec::Vec<(u32, u32)>,
+    capacity: usize,
+    longest: bool,
+}
+
+impl ClearRuns {
+    fn full(&self) -> bool {
+        self.runs.len() >= self.capacity
+    }
+
+    /// Comprimento do último run guardado (o menor, no modo dos mais longos).
+    fn smallest(&self) -> u32 {
+        self.runs.last().map_or(0, |run| run.1)
+    }
+
+    /// Inserção do original: anexa (ou ordena por comprimento decrescente,
+    /// estável, descartando o último quando cheio).
+    fn insert(&mut self, start: u32, length: u32) {
+        if self.full() {
+            self.runs.pop();
+        }
+        let mut index = self.runs.len();
+        if self.longest {
+            while index > 0 && self.runs[index - 1].1 < length {
+                index -= 1;
+            }
+        }
+        self.runs.insert(index, (start, length));
+    }
+
+    /// Fora do modo dos mais longos, o vetor cheio encerra a busca.
+    fn stop(&self) -> bool {
+        !self.longest && self.full()
+    }
+}
+
+/// RtlFindClearRuns(BitMap, RunArray, SizeOfRunArray, LocateLongestRuns):
+/// varre por bytes; o run que termina num byte entra antes dos runs internos
+/// do byte, e esses em ordem de comprimento decrescente (o mais baixo primeiro
+/// no empate). Devolve o número de runs escritos em RunArray.
+///
+/// Com SizeOfRunArray zero o original lê RunArray[-1] (acesso fora do vetor);
+/// aqui nada é lido e o resultado é zero.
+pub fn find_clear_runs(bitmap: &RtlBitmap, run_array: u64, capacity: u32, locate_longest: bool) -> u32 {
+    if capacity == 0 {
+        return 0;
+    }
+    let size = bitmap.size_of_bit_map.get();
+    let byte_count = size.div_ceil(8) as usize;
+    let bytes = if byte_count == 0 { alloc::vec::Vec::new() } else { storage_bytes(bitmap, 0, byte_count) };
+    let mut state = ClearRuns { runs: alloc::vec::Vec::new(), capacity: capacity as usize, longest: locate_longest };
+    let (mut run_start, mut run_length) = (0u32, 0u32);
+    'scan: for (index, &raw) in bytes.iter().enumerate() {
+        let bit = index as u32 * 8;
+        let mut byte = raw;
+        if index + 1 == byte_count && size % 8 != 0 {
+            byte |= 0xFFu8 << (size % 8);
+        }
+        if byte == 0 {
+            run_length += 8;
+            continue;
+        }
+        run_length += low_clear_bits(byte);
+        if run_length != 0 && !(state.full() && state.smallest() >= run_length) {
+            state.insert(run_start, run_length);
+            if state.stop() {
+                break 'scan;
+            }
+        }
+        let (high, low) = (high_clear_bits(byte), low_clear_bits(byte));
+        run_start = bit + 8 - high;
+        run_length = high;
+        byte |= ((1u16 << low) - 1) as u8 | (0xFF00u16 >> high) as u8;
+        while byte != 0xFF {
+            let length = longest_clear_bits(byte);
+            if state.full() && state.smallest() >= length {
+                break;
+            }
+            let mut mask = ((1u16 << length) - 1) as u8;
+            let mut offset = 0;
+            while byte & mask != 0 {
+                mask <<= 1;
+                offset += 1;
+            }
+            state.insert(bit + offset, length);
+            if state.stop() {
+                break 'scan;
+            }
+            byte |= mask;
+        }
+    }
+    if !state.stop() && run_length != 0 && !(state.full() && state.smallest() >= run_length) {
+        state.insert(run_start, run_length);
+    }
+    // SAFETY: RTL_BITMAP_RUN RunArray[SizeOfRunArray] do chamador (não vazio).
+    let output = unsafe { RtlBitmapRun::array_at(run_array, capacity as usize) };
+    for (run, &(start, length)) in output.iter().zip(state.runs.iter()) {
+        run.starting_index.set(start);
+        run.number_of_bits.set(length);
+    }
+    state.runs.len() as u32
+}

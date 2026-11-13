@@ -199,3 +199,40 @@ pub fn start_key(process: u64) -> u64 {
 pub fn set_priority_class(process: u64, priority_class: u8) {
     eprocess(process).priority_class.set(priority_class);
 }
+
+// ---- Contadores de disco do processo (ps-disk-counters) -----------------------------
+//
+// ntoskrnl 10.0.19045: PsIsDiskCountersEnabled 0x3ca4b0 = (PsDisableDiskCounters
+// == 0), e o global vale 0 na imagem; PsUpdateDiskCounters 0x30f3d0:
+// EPROCESS.DiskCounters (PROCESS_DISK_COUNTERS) nulo -> nada; senão lock xadd
+// de BytesRead, BytesWritten, ReadOperationCount, WriteOperationCount e
+// FlushOperationCount, só os não nulos. O EPROCESS do OpenNT não aloca o
+// bloco DiskCounters (o NT o cria no PspAllocateProcess), então hoje a
+// atualização não encontra destino, como o NT para um processo sem o bloco.
+
+/// PsDisableDiskCounters (o OpenNT não oferece a chave que o liga).
+pub fn disk_counters_enabled() -> bool {
+    true
+}
+
+fn add_counter(counter: &Field<u64>, delta: u64) {
+    if delta != 0 {
+        counter.atomic().fetch_add(delta, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PsUpdateDiskCounters(Process, BytesRead, BytesWritten, ReadOperationCount,
+/// WriteOperationCount, FlushOperationCount).
+pub fn update_disk_counters(process: &Eprocess, bytes_read: u64, bytes_written: u64, reads: u32, writes: u32, flushes: u32) {
+    let address = process.disk_counters.get();
+    if address == 0 {
+        return;
+    }
+    // SAFETY: EPROCESS.DiskCounters não nulo aponta para o PROCESS_DISK_COUNTERS do processo.
+    let counters = unsafe { crate::ntos::inc::types::ProcessDiskCounters::at(address) };
+    add_counter(&counters.bytes_read, bytes_read);
+    add_counter(&counters.bytes_written, bytes_written);
+    add_counter(&counters.read_operation_count, reads as u64);
+    add_counter(&counters.write_operation_count, writes as u64);
+    add_counter(&counters.flush_operation_count, flushes as u64);
+}
