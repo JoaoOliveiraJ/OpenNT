@@ -15,8 +15,9 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 5 | Registro e serviços | concluída |
 | 6 | loader PE e ntoskrnl | em andamento |
 | 7 | modo usuário | em andamento |
+| 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **19 de 37** componentes funcionam; **549 de 771** módulos do plano têm código (535 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.093 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
+Hoje: **17 de 43** componentes funcionam; **549 de 770** módulos do plano têm código (535 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.093 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (35,6%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -64,8 +65,8 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 | Console | Parcial | Boot completo, Teste do shell |
 | Barramento PCI | Parcial | Autoteste de I/O e armazenamento |
 | Dispositivos da placa-mãe | Parcial | Autoteste de I/O e armazenamento |
-| Disco ATA (PIO) | Parcial | Autoteste de I/O e armazenamento |
-| NTFS | Parcial | Autoteste de I/O e armazenamento |
+| Disco ATA (interno) | Parcial | Autoteste de I/O e armazenamento |
+| NTFS (leitor do kernel) | Parcial | Autoteste de I/O e armazenamento |
 
 ## Fase 5 — Registro e serviços (concluída)
 
@@ -78,32 +79,45 @@ Configuration Manager (hives, chaves e valores) e o controle de serviços e driv
 
 ## Fase 6 — loader PE e ntoskrnl (em andamento)
 
-Carregador de PE, funções exportadas pelo kernel, carga dos drivers reais do Windows (i8042prt, kbdclass, cng.sys) e KsecDD.
+Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys) e o ksecdd.sys.
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Carregador de PE e exports do kernel | Parcial | Autoteste do carregador de PE e do ntoskrnl, Boot completo |
-| KsecDD | Planejado | — |
-| hal.dll | Funciona | Boot completo, Autoteste do kernel |
-| i8042prt.sys | Funciona | Teclado real, Teste do shell |
-| kbdclass.sys | Funciona | Teclado real, Teste do shell |
-| mouclass.sys | Funciona | Teclado real |
-| atapi.sys e ataport.sys | Funciona | Boot completo, Autoteste do kernel |
-| disk.sys e classpnp.sys | Funciona | Boot completo, Autoteste do kernel |
-| mountmgr.sys | Funciona | Boot completo, Autoteste do kernel |
-| cng.sys | Funciona | Boot completo, Autoteste do kernel |
-| Drivers de teste do WDK | Planejado | — |
+| hal.dll | Funciona | Drivers do Windows no boot comum |
+| i8042prt.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
+| kbdclass.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
+| mouclass.sys | Funciona | Drivers do Windows no boot comum, Teclado real |
+| atapi.sys e ataport.sys | Parcial | Drivers do Windows no boot comum |
+| disk.sys e classpnp.sys | Parcial | Drivers do Windows no boot comum |
+| mountmgr.sys | Parcial | Drivers do Windows no boot comum |
+| cng.sys | Funciona | Drivers do Windows no boot comum |
+| ci.dll (Code Integrity) | Funciona | Driver watchdog.sys real |
 | watchdog.sys | Funciona | Driver watchdog.sys real |
+| ksecdd.sys | Planejado | — |
 
 ## Fase 7 — modo usuário (em andamento)
 
-Processos e threads de usuário, comunicação ALPC, chamadas de sistema e as bibliotecas ntdll e KERNEL32 reais.
+Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bibliotecas ntdll e KERNEL32 reais e o csrss.exe real.
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Modo usuário | Parcial | Autoteste do modo usuário |
 | ntdll.dll, KERNEL32 e KERNELBASE | Planejado | — |
 | Executáveis .exe (comando exec) | Planejado | — |
+| csrss.exe | Planejado | — |
+
+## Fase 8 — vídeo, arquivos e rede (planejada)
+
+Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dxgkrnl.sys, BasicDisplay.sys), os sistemas de arquivos (ntfs.sys, fastfat.sys, fltmgr.sys) e a rede (ndis.sys, tcpip.sys, E1G6032E.sys), com o kernel dando só o suporte.
+
+| Componente | Estado | Teste automático |
+| --- | --- | --- |
+| Cache Manager | Planejado | — |
+| win32k.sys, win32kbase.sys e win32kfull.sys | Planejado | — |
+| dxgkrnl.sys e BasicDisplay.sys | Planejado | — |
+| ntfs.sys, fastfat.sys e fltmgr.sys | Planejado | — |
+| ndis.sys, tcpip.sys e E1G6032E.sys | Planejado | — |
 
 ## Sem fase definida
 

@@ -38,11 +38,11 @@ testes = ["kernel/src/ntos/test"]
 # Frase que abre cada categoria na página de componentes.
 [descricoes_categoria]
 "Núcleo do kernel" = "As partes centrais do kernel, escritas em Rust: boot, interrupções, memória, processos, sincronização, objetos, segurança, I/O, Registro e o carregador de drivers."
-"Drivers internos" = "Drivers escritos em Rust que fazem parte do próprio OpenNT: vídeo, console, teclado, barramento, disco e segurança."
-"Drivers do Windows" = "Drivers do Windows (.sys e .dll) carregados como estão, sem recompilar nem modificar. Os binários vêm da máquina de build, copiados pelo xtask, e nunca entram no repositório. Aqui, Funciona quer dizer que o binário do próprio Windows carrega e roda durante um teste automático de boot."
-"Sistemas de arquivos" = "Os sistemas de arquivos que o kernel monta e lê."
-"Aplicações do kernel" = "Programas que rodam dentro do próprio kernel: o shell e os programas de exemplo."
-"Programas do Windows" = "Programas do Windows (.exe) rodando em modo usuário, com as bibliotecas de sistema do próprio Windows."
+"Drivers internos" = "O suporte de boot do próprio kernel, escrito em Rust: vídeo em modo texto, console, teclado, barramento PCI, dispositivos da placa-mãe e disco, o mínimo para o kernel iniciar, ler o volume de dados e carregar os drivers reais do Windows. Não substituem os drivers do Windows: no teclado, onde o i8042prt.sys já roda, o driver interno fica só de reserva."
+"Drivers do Windows" = "Drivers do Windows (.sys e .dll) carregados como estão, sem recompilar nem modificar. Os binários vêm da máquina de build, copiados pelo xtask, e nunca entram no repositório. Aqui, Funciona quer dizer que o binário do próprio Windows carrega e roda durante um teste automático de boot que confere o resultado; Parcial, que ele carrega mas ainda não cumpre o seu papel; Planejado, que é um alvo que ainda não carrega."
+"Sistemas de arquivos" = "Os sistemas de arquivos do próprio kernel, montados no boot. Os drivers de sistema de arquivos do Windows (ntfs.sys, fastfat.sys) aparecem em Drivers do Windows, como alvos."
+"Aplicações do kernel" = "Programas que rodam dentro do próprio kernel, não em modo usuário: o shell, o sc e os programas de exemplo."
+"Programas do Windows" = "Programas do Windows (.exe) em modo usuário, com as bibliotecas de sistema do próprio Windows. Do lado do kernel já existem o anel 3, as chamadas de sistema, as seções e o ALPC; nenhum programa real do Windows roda ainda."
 
 # ---- fases do roadmap -------------------------------------------------------------
 
@@ -80,13 +80,19 @@ escopo = "Configuration Manager (hives, chaves e valores) e o controle de servi�
 numero = "6"
 nome = "loader PE e ntoskrnl"
 estado = "em andamento"
-escopo = "Carregador de PE, funções exportadas pelo kernel, carga dos drivers reais do Windows (i8042prt, kbdclass, cng.sys) e KsecDD."
+escopo = "Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys) e o ksecdd.sys."
 
 [[fase]]
 numero = "7"
 nome = "modo usuário"
 estado = "em andamento"
-escopo = "Processos e threads de usuário, comunicação ALPC, chamadas de sistema e as bibliotecas ntdll e KERNEL32 reais."
+escopo = "Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bibliotecas ntdll e KERNEL32 reais e o csrss.exe real."
+
+[[fase]]
+numero = "8"
+nome = "vídeo, arquivos e rede"
+estado = "planejada"
+escopo = "Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dxgkrnl.sys, BasicDisplay.sys), os sistemas de arquivos (ntfs.sys, fastfat.sys, fltmgr.sys) e a rede (ndis.sys, tcpip.sys, E1G6032E.sys), com o kernel dando só o suporte."
 
 # ---- testes automáticos de boot -------------------------------------------------
 
@@ -108,8 +114,8 @@ descricao = "As fases 0 e 1 do boot terminaram: relógio, interrupções, memór
 id = "selftest"
 titulo = "Autoteste do kernel"
 marcador = "SELFTEST_OK"
-comando = "cargo xtask test-boot SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests"
-descricao = "Roda dentro do kernel todas as suítes de autoteste: arquivos em memória, programas de exemplo, memória, escalonador, timer, IPC e serviços; depois as suítes das fases 3 a 7 (objetos e executive, I/O e armazenamento, Registro e serviços, carregador de PE, modo usuário) e o teclado real. O marcador só aparece se todas passarem."
+comando = "cargo xtask test-boot PHASE7_SELFTEST_OK 600000 --kernel-test-scope=all --build-dir=build/tests --expect=SELFTEST_OK"
+descricao = "Roda dentro do kernel todas as suítes de autoteste: arquivos em memória, programas de exemplo, memória, escalonador, timer, IPC e serviços; depois as suítes das fases 3 a 7 (objetos e executive, I/O e armazenamento, Registro e serviços, carregador de PE, modo usuário) e o teclado real. O SELFTEST_OK final só aparece se todas passarem. O comando espera antes o PHASE7_SELFTEST_OK porque o texto SELFTEST_OK também está dentro dos marcadores de cada fase e, sozinho, já casaria com o da fase 3."
 
 [[teste]]
 id = "fase3"
@@ -144,21 +150,28 @@ id = "fase7"
 titulo = "Autoteste do modo usuário"
 marcador = "PHASE7_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE7_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
-descricao = "Seções e memória virtual de usuário, arquivos, eventos e threads, chamadas de sistema, entrada no anel 3, ALPC, controle de serviços (sc) e um processo do Windows em modo usuário."
+descricao = "Seções e memória virtual de usuário, arquivos, eventos e threads, chamadas de sistema, entrada no anel 3, ALPC, controle de serviços (sc) e um processo em modo usuário: um executável PE mínimo, gerado pelo próprio teste, que passa pelo LdrInitializeThunk da ntdll de bring-up e sai com o código esperado."
 
 [[teste]]
 id = "teclado"
 titulo = "Teclado real"
 marcador = "KBDTEST_OK"
-comando = "cargo xtask test-boot SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+comando = "cargo xtask test-boot KBDTEST_OK 600000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Monta pelo PnP as pilhas do i8042prt.sys com kbdclass.sys e mouclass.sys, injeta um scancode pelo controlador 8042 e lê a tecla em \\Device\\KeyboardClass0 (IRQ1, ISR do driver, DPC e callback do kbdclass)."
+
+[[teste]]
+id = "drivers"
+titulo = "Drivers do Windows no boot comum"
+marcador = "[boot] hal.dll carregado"
+comando = "cargo xtask test-boot \"[boot] hal.dll carregado\" 240000 --smp=1 --build-dir=build/drivers \"--expect=[boot] servicos carregados: 3\" \"--expect=[boot] cng.sys carregado;\" \"--expect=AddDevice do filtro mouclass -> 0x0\" \"--expect=[kbd] lendo teclas do driver real\""
+descricao = "No boot sem autotestes, confere pela serial, nesta ordem: a hal.dll carregada; os três serviços de boot (atapi, disk e mountmgr) com a imagem carregada e o DriverEntry bem-sucedido; o cng.sys carregado com \\Device\\CNG publicado; o filtro mouclass anexado; e o serviço de teclado lendo do i8042prt.sys com o kbdclass.sys."
 
 [[teste]]
 id = "shell"
 titulo = "Teste do shell"
 marcador = "[shell] pronto"
 comando = "cargo xtask test-boot KERNEL_RS_OK 120000 \"--keys=run hello\\nps\\n\" \"--expect== 42\" \"--expect=PID  STATE\""
-descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps) e confere a saída: teclado, IPC, shell e console."
+descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps) e confere a saída: teclado, IPC, shell e console. Com os binários do Windows no build, as teclas chegam pelo i8042prt.sys e pelo kbdclass.sys reais."
 
 [[teste]]
 id = "watchdog"
@@ -220,7 +233,7 @@ estado = "implementado"
 caminhos = ["kernel/src/ntos/ps/scheduler.rs", "kernel/src/ntos/ps/process.rs"]
 testes = ["selftest", "fase3"]
 fase = "3"
-notas = "O escalonador cooperativo veio na fase 1; as estruturas reais de processo e thread, na fase 3."
+notas = "O escalonador veio na fase 1; as estruturas reais de processo e thread, na fase 3. Os processos do kernel são tarefas cooperativas: cada passo roda até a tarefa ceder a CPU, e o timer de 100 Hz só dispara o passo seguinte."
 
 [[componente]]
 nome = "Sincronização e despacho"
@@ -242,7 +255,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/ob/object_manager.rs", "kernel/src/ntos/ob/handle_table.rs", "kernel/src/ntos/init/phase0.rs"]
 testes = ["fase3"]
 fase = "3"
-notas = "Os eventos \\KernelObjects\\* e parte dos tipos de objeto ainda faltam."
+notas = "Em \\KernelObjects já existem a MemoryPartition0 e os eventos de memória e de commit (High/LowMemoryCondition, High/Low/MaximumCommitCondition, abertos pelo mountmgr.sys); os demais eventos de \\KernelObjects e parte dos tipos de objeto (Job, Session, WindowStation, Desktop, entre outros) ainda faltam."
 
 [[componente]]
 nome = "Segurança e tokens"
@@ -263,7 +276,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
 testes = ["fase4", "teclado"]
 fase = "4"
-notas = "A pilha de teclado do Windows (i8042prt.sys e kbdclass.sys) já roda sobre ele. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows)."
+notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows)."
 
 [[componente]]
 nome = "Registro"
@@ -285,7 +298,16 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers da categoria Drivers do Windows já carregam por ele; dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda (o caminho do win32k.sys real). A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta, como no NT."
+notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta."
+
+[[componente]]
+nome = "Cache Manager"
+categoria = "Núcleo do kernel"
+icone = "layers"
+descricao = "O cache de arquivos do NT (rotinas Cc*), pelo qual os drivers de sistema de arquivos leem e gravam através da memória."
+estado = "planejado"
+fase = "8"
+notas = "O kernel ainda não exporta nenhuma das 69 rotinas Cc* do ntoskrnl. É pré-requisito do ntfs.sys e do fastfat.sys reais."
 
 [[componente]]
 nome = "Vídeo VGA em modo texto"
@@ -296,7 +318,7 @@ estado = "implementado"
 caminhos = ["kernel/src/drivers/video/vga.rs"]
 testes = ["boot"]
 fase = "1"
-notas = "Os testes conferem o texto pela serial; a imagem na tela não é conferida."
+notas = "Suporte de boot do próprio kernel, para as mensagens e o shell; a tela gráfica do Windows é o alvo dxgkrnl.sys e BasicDisplay.sys. Os testes conferem o texto pela serial; a imagem na tela não é conferida."
 
 [[componente]]
 nome = "Console"
@@ -307,17 +329,18 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/console/mod.rs"]
 testes = ["boot", "shell"]
 fase = "4"
-notas = "Tela e espelho serial funcionam desde a fase 1; o registro como dispositivo do I/O Manager (\\Device\\Console) entra na fase 4."
+notas = "Tela e espelho serial funcionam desde a fase 1. O registro como dispositivo do I/O Manager (\\Device\\Console), previsto no módulo, ainda não existe."
 
 [[componente]]
 nome = "Teclado PS/2"
 categoria = "Drivers internos"
 icone = "keyboard"
-descricao = "Lê as teclas da controladora PS/2 a cada interrupção e as envia ao shell como caracteres."
+descricao = "Traduz os scancodes do teclado em caracteres para o shell e, sem os drivers do Windows no build, lê a controladora PS/2 direto pela IRQ1."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard.rs"]
 testes = ["shell"]
 fase = "1"
+notas = "Suporte de boot do próprio kernel. Quando o build traz o i8042prt.sys e o kbdclass.sys (o xtask os copia sempre que existem na máquina de build), as teclas chegam pelos drivers do Windows e este driver só faz a tradução; a leitura direta pela IRQ1 é o caminho de reserva, sem teste automático."
 
 [[componente]]
 nome = "Barramento PCI"
@@ -328,6 +351,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/bus/pci.rs", "kernel/src/hal/pci_config.rs"]
 testes = ["fase4"]
 fase = "4"
+notas = "Suporte de boot do próprio kernel: faz a enumeração que no Windows é do pci.sys, que não é carregado, e cria um PDO por função com os recursos dela. O PDO responde só START_DEVICE, REMOVE_DEVICE e QUERY_ID (sempre com o HardwareID, qualquer que seja o tipo de id pedido); os outros pedidos PnP, como QUERY_INTERFACE, voltam STATUS_NOT_SUPPORTED."
 
 [[componente]]
 nome = "Dispositivos da placa-mãe"
@@ -338,24 +362,18 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/bus/motherboard.rs"]
 testes = ["fase4"]
 fase = "4"
+notas = "Suporte de boot do próprio kernel: cria os PDOs do teclado (PNP0303) e do mouse (PNP0F13) PS/2 com as portas e as IRQs, papel que no Windows é do ACPI.sys. É sobre eles que o PnP monta a pilha do i8042prt.sys."
 
 [[componente]]
-nome = "Disco ATA (PIO)"
+nome = "Disco ATA (interno)"
 categoria = "Drivers internos"
 icone = "disk"
-descricao = "Lê e grava setores do disco IDE diretamente pelas portas da controladora."
+descricao = "Lê e grava setores dos discos do canal IDE primário (LBA28) por DMA de bus master da controladora PIIX3, com PIO como alternativa."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/storage/ata_pio.rs"]
 testes = ["fase4"]
 fase = "4"
-
-[[componente]]
-nome = "KsecDD"
-categoria = "Drivers internos"
-icone = "lock"
-descricao = "Dispositivo de segurança do kernel: números aleatórios do hardware e avisos de mudança na configuração de criptografia."
-estado = "planejado"
-fase = "6"
+notas = "Suporte de boot do próprio kernel, não um substituto do atapi.sys: é por ele que o kernel lê e grava o volume NTFS do segundo disco, de onde vêm o cng.sys, a ci.dll e os catálogos. Hoje ele atende todo acesso a disco, porque a pilha de disco do Windows (atapi.sys, disk.sys) carrega mas não recebe nenhum dispositivo."
 
 [[componente]]
 nome = "hal.dll"
@@ -363,9 +381,10 @@ categoria = "Drivers do Windows"
 icone = "chip"
 descricao = "A biblioteca de abstração de hardware do Windows, carregada como módulo do kernel."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs"]
-testes = ["boot", "selftest"]
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs", "kernel/src/hal/private_dispatch.rs", "kernel/src/hal/public_dispatch.rs"]
+testes = ["drivers"]
 fase = "6"
+notas = "No Windows 10 da máquina de build, a hal.dll não tem rotinas próprias nem ponto de entrada: são 91 encaminhamentos para o ntoskrnl. O OpenNT carrega a imagem real na fase 1 do boot e liga cada encaminhamento a um export do próprio kernel, que faz o trabalho da HAL. O kernel também publica a HalPrivateDispatchTable e a HalDispatchTable; os 23 slots desta última ainda devolvem STATUS_NOT_SUPPORTED."
 
 [[componente]]
 nome = "i8042prt.sys"
@@ -374,9 +393,9 @@ icone = "keyboard"
 descricao = "Driver da Microsoft para a controladora de teclado e mouse PS/2."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/io/pnp.rs"]
-testes = ["teclado", "shell"]
+testes = ["teclado", "drivers", "shell"]
 fase = "6"
-notas = "Sem ele, o teclado usa o driver PS/2 interno."
+notas = "O PnP o anexa aos PDOs PS/2 da placa-mãe, com START_DEVICE e as ISRs nativas conectadas às IRQs 1 e 12; no boot comum, é por ele que o shell recebe as teclas. Sem os binários no build, o teclado usa o driver PS/2 interno."
 
 [[componente]]
 nome = "kbdclass.sys"
@@ -385,8 +404,9 @@ icone = "keyboard"
 descricao = "Driver de classe de teclado: entrega as teclas pelo dispositivo \\Device\\KeyboardClass0."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/init/main.rs"]
-testes = ["teclado", "shell"]
+testes = ["teclado", "drivers", "shell"]
 fase = "6"
+notas = "Entra como filtro de classe sobre o i8042prt.sys; o serviço de teclado do kernel mantém um READ pendente em \\Device\\KeyboardClass0 e repassa as teclas ao shell."
 
 [[componente]]
 nome = "mouclass.sys"
@@ -395,40 +415,42 @@ icone = "mouse"
 descricao = "Driver de classe de mouse."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/cm/hw_description.rs"]
-testes = ["teclado"]
+testes = ["drivers", "teclado"]
 fase = "6"
-notas = "A pilha inicia; nenhum programa consome o mouse ainda."
+notas = "Entra como filtro de classe sobre o i8042prt.sys e a pilha do mouse recebe START_DEVICE; nenhum programa consome o mouse ainda."
 
 [[componente]]
 nome = "atapi.sys e ataport.sys"
 categoria = "Drivers do Windows"
 icone = "disk"
 descricao = "Drivers da Microsoft para controladoras de disco IDE/ATA."
-estado = "implementado"
-caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/mm/sysload.rs"]
-testes = ["boot", "selftest"]
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/io/pnp.rs"]
+testes = ["drivers"]
 fase = "6"
-notas = "Carregam no boot como serviços; os discos seguem lidos pelo driver ATA interno."
+notas = "Carregam no boot como serviço (o ataport.sys como biblioteca de import do atapi.sys, com DllInitialize) e o DriverEntry retorna sucesso: sc query atapi mostra RUNNING. Mas o PnP ainda não liga o atapi ao controlador IDE (PCI 8086:7010): o AddDevice nunca é chamado, não há START_DEVICE e nenhum canal ou disco é enumerado. A tabela de associação do kernel já tem o id do controlador, mas o boot não a percorre para o barramento PCI, e o PDO PCI não responde QUERY_INTERFACE nem outros pedidos PnP além de START_DEVICE, REMOVE_DEVICE e QUERY_ID. Os discos são lidos pelo driver ATA interno, que monta o NTFS antes de estes drivers carregarem."
 
 [[componente]]
 nome = "disk.sys e classpnp.sys"
 categoria = "Drivers do Windows"
 icone = "disk"
 descricao = "Driver de classe de disco: apresenta cada disco e cada partição ao resto do sistema."
-estado = "implementado"
+estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/mm/sysload.rs"]
-testes = ["boot", "selftest"]
+testes = ["drivers"]
 fase = "6"
+notas = "Carregam no boot (o classpnp.sys como biblioteca de import do disk.sys, com DllInitialize) e o DriverEntry do disk.sys retorna sucesso: sc query disk mostra RUNNING. Nenhum disco chega a ele: sem o atapi.sys anexado ao controlador, não existe PDO de disco IDE e o AddDevice do disk.sys nunca é chamado."
 
 [[componente]]
 nome = "mountmgr.sys"
 categoria = "Drivers do Windows"
 icone = "folder"
 descricao = "Mount Manager: dá nomes aos volumes e atribui as letras de unidade."
-estado = "implementado"
+estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs"]
-testes = ["boot", "selftest"]
+testes = ["drivers"]
 fase = "6"
+notas = "Carrega no boot e o DriverEntry retorna sucesso (lê NoAutoMount do Registro; sc query mountmgr mostra RUNNING). Nenhum volume chega a ele: as letras C: e D: são links que o próprio kernel cria para os seus sistemas de arquivos."
 
 [[componente]]
 nome = "cng.sys"
@@ -436,38 +458,86 @@ categoria = "Drivers do Windows"
 icone = "lock"
 descricao = "A criptografia do kernel do Windows (Cryptography Next Generation), usada por outros drivers e pelos programas."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs"]
-testes = ["boot", "selftest"]
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs", "kernel/src/ntos/cm/cng_defaults.rs"]
+testes = ["drivers"]
 fase = "6"
-notas = "Carrega do volume NTFS e publica \\Device\\CNG."
+notas = "Carrega do volume NTFS na fase 1 do boot, roda o DriverEntry, registra a sua fonte de entropia e publica \\Device\\CNG. O vgk.sys o usa como biblioteca de import."
 
 [[componente]]
-nome = "Drivers de teste do WDK"
+nome = "ci.dll (Code Integrity)"
 categoria = "Drivers do Windows"
-icone = "check"
-descricao = "Drivers pequenos, compilados com o kit de drivers da Microsoft, que exercitam APIs do kernel nas suítes de teste."
-estado = "planejado"
+icone = "shield"
+descricao = "A integridade de código do Windows: confere a assinatura de cada imagem de kernel antes de ela rodar."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/se/code_integrity_information.rs", "kernel/src/ntos/io/file/zw.rs"]
+testes = ["watchdog"]
 fase = "6"
+notas = "A ci.dll real e o msrpc.sys, de que ela depende, carregam do volume NTFS; a CI inicializa, lê a política e valida cada imagem nova, pela assinatura embutida (vgk.sys) ou pelo catálogo da Microsoft que ela mesma procura em System32\\CatRoot (watchdog.sys); com ela ativa, os drivers carregados depois, como o kbdclass.sys, também passam pela validação. Só é ativada no boot com --start-driver; no boot comum, os drivers do bundle carregam sem essa verificação."
 
 [[componente]]
 nome = "vgk.sys"
 categoria = "Drivers do Windows"
 icone = "shield"
-descricao = "Driver anti-cheat de terceiros (Vanguard), usado como alvo de compatibilidade."
+descricao = "Driver anti-cheat de terceiros, usado como alvo de compatibilidade."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/init/main.rs"]
-notas = "Testado em WHPX com `--start-driver=vgk --trace-driver-api` (versão 1.19.2). A ci.dll original inicializa e valida a imagem; o DriverEntry resolve 252 funções do ntoskrnl pela própria busca na tabela de exports, todas atendidas pelo OpenNT. Ele então para numa verificação de integridade interna do anticheat (código ofuscado que inspeciona o próprio kernel, sem chamar API), fora do escopo do projeto. O `--trace-driver-api` mostra o log do vgk em texto (`texto:`) e cada nome procurado (`procura:`). O binário nunca entra no repositório: o build o lê de OPENNT_VGK_SYS ou de vgk.sys na raiz."
+notas = "Testado em WHPX com `--start-driver=vgk --trace-driver-api` (versão 1.19.2). A ci.dll original valida a imagem pela assinatura embutida; o DriverEntry resolve 252 funções do ntoskrnl pela própria busca na tabela de exports, todas atendidas pelo OpenNT. Depois da última busca, sem chamar mais nenhuma API do kernel, o código ofuscado do anticheat registra o erro E00001AC no próprio log, e o DriverEntry desiste com 0xC000007A. Essa verificação do ambiente é do anticheat e passar por ela está fora do escopo do projeto; o trabalho no vgk para aqui. O `--trace-driver-api` mostra o log do vgk em texto (`texto:`) e cada nome procurado (`procura:`). O binário nunca entra no repositório: o build o lê de OPENNT_VGK_SYS ou de vgk.sys na raiz."
 
 [[componente]]
 nome = "watchdog.sys"
 categoria = "Drivers do Windows"
 icone = "shield"
-descricao = "Driver inbox da Microsoft (watchdog timer), base do stack de vídeo."
+descricao = "Driver inbox da Microsoft (watchdog) do qual o dxgkrnl.sys e o win32k.sys importam funções: uma dependência da pilha de vídeo."
 estado = "implementado"
 caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/io/file/zw.rs"]
 testes = ["watchdog"]
 fase = "6"
-notas = "Driver inbox real da Microsoft que carrega e roda limpo no OpenNT via `--start-driver=watchdog`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Diferente do vgk (assinado embutido), ele é assinado por catálogo — o Code Integrity valida o hash da imagem contra o `.cat` da Microsoft que a própria ci.dll enumera em `CatRoot`. O DriverEntry executa e retorna sucesso. Esse mesmo caminho (catálogo + enumeração de diretório aninhado) destrava os demais drivers inbox, como o BasicDisplay e o dxgkrnl."
+notas = "Carrega e roda com `--start-driver=watchdog`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Diferente do vgk (assinado embutido), ele é assinado por catálogo: o Code Integrity valida o hash da imagem contra o `.cat` da Microsoft que a própria ci.dll enumera em `CatRoot`. O DriverEntry executa e retorna sucesso. No boot comum ele não é iniciado (Start=3, sob demanda)."
+
+[[componente]]
+nome = "ksecdd.sys"
+categoria = "Drivers do Windows"
+icone = "lock"
+descricao = "O driver de segurança do kernel do Windows (\\Device\\KsecDD), usado por outros drivers e pelos serviços de segurança."
+estado = "planejado"
+fase = "6"
+notas = "Alvo de carga do binário real. Ele importa funções do msrpc.sys, que o OpenNT já carrega para a ci.dll; o ksecdd.sys em si ainda não é carregado."
+
+[[componente]]
+nome = "win32k.sys, win32kbase.sys e win32kfull.sys"
+categoria = "Drivers do Windows"
+icone = "window"
+descricao = "O subsistema de janelas e gráficos do Windows no kernel (USER e GDI), carregado como imagem de sistema."
+estado = "planejado"
+fase = "8"
+notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda."
+
+[[componente]]
+nome = "dxgkrnl.sys e BasicDisplay.sys"
+categoria = "Drivers do Windows"
+icone = "monitor"
+descricao = "O núcleo gráfico do Windows (DirectX Graphics Kernel) e o driver de vídeo básico da Microsoft, que juntos dão a tela gráfica."
+estado = "planejado"
+fase = "8"
+notas = "Alvo de carga dos binários reais. O dxgkrnl.sys importa 53 funções do watchdog.sys, que já carrega e roda; nenhum dos dois carrega ainda."
+
+[[componente]]
+nome = "ntfs.sys, fastfat.sys e fltmgr.sys"
+categoria = "Drivers do Windows"
+icone = "folder"
+descricao = "Os drivers de sistema de arquivos do Windows (NTFS e FAT) e o Filter Manager, base dos filtros de sistema de arquivos."
+estado = "planejado"
+fase = "8"
+notas = "Alvo de carga dos binários reais. O ntfs.sys e o fastfat.sys dependem do Cache Manager (importam 39 e 32 rotinas Cc*), que ainda não existe. Hoje o volume NTFS é lido pelo leitor do próprio kernel; o fltmgr.sys só vai para o volume como arquivo, porque o vgk.sys o abre pelo caminho."
+
+[[componente]]
+nome = "ndis.sys, tcpip.sys e E1G6032E.sys"
+categoria = "Drivers do Windows"
+icone = "plug"
+descricao = "A pilha de rede do Windows (NDIS e TCP/IP) com o miniport Intel PRO/1000 da Microsoft, que atende a placa e1000 emulada pelo QEMU (PCI 8086:100E)."
+estado = "planejado"
+fase = "8"
+notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda."
 
 [[componente]]
 nome = "Arquivos em memória"
@@ -478,17 +548,18 @@ estado = "implementado"
 caminhos = ["kernel/src/drivers/fs/memory_file_system.rs"]
 testes = ["selftest", "fase3"]
 fase = "1"
+notas = "Suporte de boot do próprio kernel. Guarda também as cópias dos drivers do Windows que o build embute (hal.dll, as pilhas de teclado e de disco e o watchdog.sys), de onde o carregador os lê."
 
 [[componente]]
-nome = "NTFS"
+nome = "NTFS (leitor do kernel)"
 categoria = "Sistemas de arquivos"
 icone = "disk"
-descricao = "Lê e grava volumes NTFS, o sistema de arquivos do Windows."
+descricao = "Lê e grava volumes NTFS com código do próprio kernel."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/fs/ntfs.rs", "kernel/src/drivers/fs/ntfs_write.rs"]
 testes = ["fase4"]
 fase = "4"
-notas = "O cng.sys é carregado de um volume NTFS durante o boot."
+notas = "Suporte de boot, não o ntfs.sys: monta como D: o volume que o xtask gera no segundo disco IDE, lido pelo driver ATA interno, de onde vêm o cng.sys, a ci.dll, o catálogo de assinaturas e as tabelas NLS. Com 4 CPUs, duas verificações de escrita da suíte já falharam de vez em quando e passaram ao repetir, sem causa encontrada ainda."
 
 [[componente]]
 nome = "Shell"
@@ -499,7 +570,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/shell/mod.rs"]
 testes = ["shell"]
 fase = "1"
-notas = "exec, loaddriver e objects ainda avisam de qual parte do sistema dependem; o sc (controle de serviços) já funciona."
+notas = "exec, loaddriver e objects ainda respondem só “ainda nao implementado” com a parte do sistema de que dependem; o sc já consulta e controla os serviços de verdade."
 
 [[componente]]
 nome = "Programas hello e pisca"
@@ -520,16 +591,18 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/shell/service_control.rs"]
 testes = ["fase7"]
 fase = "5"
+notas = "Com drivers, usa o ciclo de vida real: sc query mostra atapi, disk, mountmgr, i8042prt e mouclass em RUNNING no boot comum, e sc start carrega a imagem e roda o DriverEntry. Serviços de processo (.exe) passam pelo loader do modo usuário, que ainda não roda programas reais do Windows."
 
 [[componente]]
 nome = "Modo usuário"
 categoria = "Programas do Windows"
 icone = "user"
-descricao = "Processos e threads de usuário isolados do kernel, que chamam o sistema pela instrução SYSCALL."
+descricao = "Processos e threads de usuário no anel 3, separados do kernel pela proteção de página, que chamam o sistema pela instrução SYSCALL."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/ps/user"]
 testes = ["fase7"]
 fase = "7"
+notas = "Roda um processo de usuário por vez, e todos dividem um só espaço de endereços. O único executável que roda hoje é o PE mínimo gerado pelo teste da fase 7, com a ntdll de bring-up. Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe (ApiPort e SharedSection da sessão 0, ativas em todo boot), mantida só até o csrss.exe real rodar."
 
 [[componente]]
 nome = "ntdll.dll, KERNEL32 e KERNELBASE"
@@ -538,6 +611,7 @@ icone = "layers"
 descricao = "As bibliotecas de sistema reais do Windows, pelas quais os programas falam com o kernel."
 estado = "planejado"
 fase = "7"
+notas = "Nenhum processo carrega as DLLs reais ainda. A ntdll.dll real vai para o volume só porque o vgk.sys a abre pelo caminho; o kernel procura a ntdll na raiz do volume (D:\\NTDLL.DLL), onde o build não a põe, e no boot comum registra “ntdll.dll ausente”. Os testes do modo usuário usam uma ntdll de bring-up que o build gera, só com os stubs das chamadas de sistema."
 
 [[componente]]
 nome = "Executáveis .exe (comando exec)"
@@ -546,7 +620,16 @@ icone = "window"
 descricao = "Programas do Windows carregados pelo shell e executados em modo usuário."
 estado = "planejado"
 fase = "7"
-notas = "Depende do carregador de PE (fase 6) e do modo usuário (fase 7)."
+notas = "O comando exec do shell ainda responde “ainda nao implementado”. A parte do kernel da criação de processos (PEB, TEB, seções, ntdll mapeada e entrada pelo LdrInitializeThunk) existe em Modo usuário, mas nenhum .exe real do Windows roda ainda: falta a ntdll real e o resto do modo usuário."
+
+[[componente]]
+nome = "csrss.exe"
+categoria = "Programas do Windows"
+icone = "message"
+descricao = "O processo do subsistema Windows (Client/Server Runtime), que os programas Win32 contatam ao iniciar."
+estado = "planejado"
+fase = "7"
+notas = "Alvo: rodar o csrss.exe real em modo usuário. Até lá, o kernel mantém uma imitação provisória do lado servidor dele (ps/user/csr.rs), descrita em Modo usuário."
 
 # ---- subsistemas do kernel ----------------------------------------------------
 # `pasta` é a pasta dos módulos em modulos-planejados.txt.
@@ -605,14 +688,14 @@ fase = "4"
 pasta = "drivers/storage"
 nome = "Drivers de armazenamento"
 icone = "disk"
-descricao = "Disco ATA por PIO."
+descricao = "Disco ATA do próprio kernel (DMA de bus master, com PIO como alternativa)."
 fase = "4"
 
 [[subsistema]]
 pasta = "drivers/crypto"
 nome = "Drivers de criptografia"
 icone = "lock"
-descricao = "KsecDD."
+descricao = "Nenhum driver interno: a criptografia do kernel é papel do cng.sys real, que já carrega, e do ksecdd.sys real, alvo de carga."
 fase = "6"
 
 [[subsistema]]
@@ -670,6 +753,7 @@ nome = "Modo usuário (Ps)"
 icone = "user"
 descricao = "PEB/TEB, carregamento da ntdll e chamadas de sistema dos programas."
 fase = "7"
+notas = "Inclui csr.rs, uma imitação dentro do kernel do lado servidor do csrss.exe, mantida só até o csrss.exe real rodar."
 
 [[subsistema]]
 pasta = "ntos/ex"
@@ -905,8 +989,8 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 [parciais]
 "drivers/console/console" = "falta o registro como dispositivo (fase 4)"
 "shell/shell" = "exec, loaddriver e objects pendentes"
-"ntos/init/phase0" = "etapas pendentes listadas no módulo"
-"ntos/init/phase1" = "só o aviso; o conteúdo entra nas fases 4 a 6"
+"ntos/init/phase0" = "ainda não faz tudo o que a fase 0 do NT faz"
+"ntos/init/phase1" = "faz I/O Manager, hal.dll, NTFS, PCI, drivers de boot e cng.sys; o resto da fase 1 do NT ainda falta"
 "ntos/ps/user/state" = "só a sondagem de endereços de usuário"
 "ntos/test/self_test" = "subconjunto"
 "ntos/test/dispatcher" = "chamadas diretas no lugar dos exports (fase 6)"
@@ -920,8 +1004,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 
 # Módulos fora das contas.
 [fora_do_escopo]
-"ntos/ps/user/win32k" = "papel do win32k.sys real (win32kbase/win32kfull), que o OpenNT carrega; o kernel só dá o suporte"
-"ntos/ps/user/user_atoms" = "papel do win32k.sys real (átomos USER), que o OpenNT carrega; o kernel só dá o suporte"
+"drivers/crypto/ksecdd" = "papel do ksecdd.sys real, alvo de carga; o kernel só dá o suporte"
+"ntos/ps/user/win32k" = "papel do win32k.sys real (win32kbase/win32kfull), alvo de carga; o kernel só dá o suporte"
+"ntos/ps/user/user_atoms" = "papel do win32k.sys real (átomos USER), alvo de carga; o kernel só dá o suporte"
 "win32/argument_precision" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/argument_widths" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
 "win32/ataport_trace" = "diagnóstico temporário do ataport"
@@ -932,5 +1017,5 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 "win32/hal_reference_experiment" = "experimento de diagnóstico"
 "win32/private_mm_diagnostic" = "diagnóstico"
 "win32/user_call_evidence" = "diagnóstico"
-"win32/win32" = "kernel32 mínimo de bring-up, substituído pelas DLLs reais"
+"win32/win32" = "kernel32 mínimo de bring-up; o alvo são as DLLs reais do Windows"
 "ntos/ke/tracer" = "diagnóstico fora do escopo"
