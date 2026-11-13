@@ -1,0 +1,154 @@
+//! SeQuerySecurityDescriptorInfo — `system32/ntos/se/query-descriptor.js`.
+//!
+//! Seleciona componentes do descritor do objeto; formato e filtros medidos
+//! no original. Módulo interno, sem export adicional.
+
+use alloc::vec::Vec;
+
+use super::policy_descriptor::OwnedDescriptor;
+use crate::ntos::mm::guest_memory as guest;
+
+fn align4(length: usize) -> usize {
+    (length + 3) & !3
+}
+
+/// Aceita os dois layouts NT; descritor NULL = sem componentes.
+pub fn read_descriptor(pointer: u64) -> Option<OwnedDescriptor> {
+    if pointer == 0 {
+        return None;
+    }
+    let control = guest::read16(pointer + 2);
+    let mut descriptor = OwnedDescriptor { control, ..OwnedDescriptor::default() };
+    for index in 0..4u64 {
+        if (index == 2 && control & 16 == 0) || (index == 3 && control & 4 == 0) {
+            continue;
+        }
+        let component = if control & 0x8000 != 0 {
+            let offset = guest::read32(pointer + 4 + index * 4);
+            if offset != 0 { pointer + offset as u64 } else { 0 }
+        } else {
+            guest::read64(pointer + 8 + index * 8)
+        };
+        if component == 0 {
+            continue;
+        }
+        let length = if index < 2 { 8 + 4 * guest::read8(component + 1) as usize } else { guest::read16(component + 2) as usize };
+        let bytes = Some(guest::read_bytes(component, length));
+        match index {
+            0 => descriptor.owner = bytes,
+            1 => descriptor.group = bytes,
+            2 => descriptor.sacl = bytes,
+            _ => descriptor.dacl = bytes,
+        }
+    }
+    Some(descriptor)
+}
+
+/// A SACL conserva só as categorias pedidas: auditoria usa
+/// SACL_SECURITY_INFORMATION; label, atributos, escopo, confiança e filtro
+/// de acesso (tipos 17–21) usam seus bits; ordem e bytes ficam intactos.
+fn filter_system_acl(source: &[u8], information: u32) -> Vec<u8> {
+    let count = u16::from_le_bytes([source[4], source[5]]);
+    let mut entries: Vec<&[u8]> = Vec::new();
+    let mut offset = 8usize;
+    for _ in 0..count {
+        let ace_type = source[offset];
+        let length = u16::from_le_bytes([source[offset + 2], source[offset + 3]]) as usize;
+        let bit = if (17..=21).contains(&ace_type) { 0x10 << (ace_type - 17) } else { 8 };
+        if information & bit != 0 {
+            entries.push(&source[offset..offset + length]);
+        }
+        offset += length;
+    }
+    let total = 8 + entries.iter().map(|entry| entry.len()).sum::<usize>();
+    let mut bytes = Vec::with_capacity(total);
+    bytes.extend_from_slice(&source[..8]);
+    bytes[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+    bytes[4..6].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(entry);
+    }
+    bytes
+}
+
+/// Plano da cópia: informação efetiva, Control, LengthNeeded e componentes
+/// (offset do campo no cabeçalho, bytes).
+pub struct Selection {
+    pub information: u32,
+    pub control: u16,
+    pub needed: usize,
+    pub components: Vec<(u64, Vec<u8>)>,
+}
+
+/// Planeja antes de escrever: BUFFER_TOO_SMALL não deixa cópia parcial.
+pub fn select_descriptor(descriptor: Option<&OwnedDescriptor>, security_information: u32) -> Selection {
+    let original = security_information;
+    let mut information = original;
+    let mut control = 0x8000u16;
+    let mut needed = 20usize;
+    let mut components = Vec::new();
+    let Some(descriptor) = descriptor else {
+        return Selection { information, control, needed, components };
+    };
+    // BACKUP inclui os componentes tradicionais; confiança e filtro de acesso
+    // só com seus bits explícitos.
+    if information & 0x10000 != 0 {
+        information |= 0x1FF;
+        if original & 0x80 == 0 {
+            information &= !0x80;
+        }
+        if original & 0x100 == 0 {
+            information &= !0x100;
+        }
+    }
+    let source_control = descriptor.control & 0x7FFF;
+    for (bytes, bit, header) in [(&descriptor.owner, 1u32, 4u64), (&descriptor.group, 2, 8)] {
+        let Some(bytes) = bytes.as_ref().filter(|_| information & bit != 0) else { continue };
+        control |= source_control & bit as u16;
+        needed += align4(bytes.len());
+        components.push((header, bytes.clone()));
+    }
+    if information & 4 != 0 {
+        control |= source_control & 0x140C;
+        if let Some(dacl) = descriptor.dacl.as_ref().filter(|_| source_control & 4 != 0) {
+            needed += align4(dacl.len());
+            components.push((16, dacl.clone()));
+        }
+    }
+    if information & 0x1F8 != 0 {
+        control |= source_control & 0x2830;
+        if let Some(sacl) = descriptor.sacl.as_ref().filter(|_| source_control & 16 != 0) {
+            let bytes = filter_system_acl(sacl, information);
+            needed += align4(bytes.len());
+            components.push((12, bytes));
+        }
+    }
+    Selection { information, control, needed, components }
+}
+
+/// Resultado: NTSTATUS, LengthNeeded e a informação efetiva.
+pub struct QueryResult {
+    pub status: u32,
+    pub needed: usize,
+    pub information: u32,
+}
+
+/// SECURITY_DESCRIPTOR_RELATIVE no buffer; o chamador publica LengthNeeded.
+pub fn query_descriptor(descriptor: Option<&OwnedDescriptor>, information: u32, buffer: u64, buffer_length: u32) -> QueryResult {
+    let selection = select_descriptor(descriptor, information);
+    if (buffer_length as usize) < selection.needed {
+        return QueryResult { status: 0xC000_0023, needed: selection.needed, information: selection.information };
+    }
+    for offset in 0..20 {
+        guest::write8(buffer + offset, 0);
+    }
+    guest::write8(buffer, 1);
+    guest::write16(buffer + 2, selection.control);
+    let mut cursor = (buffer + 23) & !3;
+    for (header, bytes) in &selection.components {
+        guest::write_bytes(cursor, bytes);
+        guest::write32(buffer + header, (cursor - buffer) as u32);
+        cursor += align4(bytes.len()) as u64;
+    }
+    QueryResult { status: 0, needed: selection.needed, information: selection.information }
+}

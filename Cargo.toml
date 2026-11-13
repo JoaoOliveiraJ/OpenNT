@@ -1,0 +1,23 @@
+# OpenNT: um kernel compatível com o Windows NT, em Rust (x86-64).
+#
+# Os crates `boot` e `kernel` são freestanding (alvo x86_64-unknown-none) e
+# só compilam pelo `cargo xtask`, que escolhe o alvo, empacota o kernel como
+# PE32+ e monta a imagem de disco. O `xtask` roda no host.
+[workspace]
+resolver = "2"
+members = ["boot", "kernel", "xtask"]
+default-members = ["xtask"]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true

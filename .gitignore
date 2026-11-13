@@ -1,0 +1,15 @@
+# Artefatos gerados pelo cargo e pelo xtask (kernel.elf, os.img, logs...)
+/target/
+/target-site/
+/build/
+*.log
+
+# Binários de terceiros — nunca entram no repositório
+/vgk.sys
+/vgc.exe
+
+# Estado local da ferramenta
+/.claude/
+
+# Documento interno de desenvolvimento
+/docs/TRANSCRICAO.md

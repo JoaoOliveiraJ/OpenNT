@@ -1,0 +1,104 @@
+//! Definições WNF da hive — `system32/ntos/cm/wnf-defaults.js`.
+//!
+//! Definições que NTDLL/KERNELBASE consultam durante o carregamento. Os
+//! REG_BINARY conservam descritor de segurança, limite de dados e GUID da
+//! referência Windows; não contêm dados publicados nem estado do host.
+
+use alloc::vec::Vec;
+
+use super::registry;
+use crate::rtl::KernelError;
+
+const DEFINITION_PATH: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Notifications";
+
+/// WNF_FEATURE_CONFIGURATION_CHANGED — 412 bytes.
+/// SHA-256: ecd3426a3c40d7e15008495c08efb5205fe0256cb69a920cb77022d1a9dcbacf.
+const FEATURE_CONFIGURATION_CHANGED: (&str, &str) = (
+    "0280032EA3BC0875",
+    concat!(
+        "010014800000000000000000140000003000000002001c000100000011001400",
+        "01000000010100000000001000000000020058010b0000000000140000000080",
+        "0101000000000005120000000000180000000080010200000000000520000000",
+        "200200000000180000000080010200000000000f020000000100000000001400",
+        "0000008001010000000000050400000000001400000000800101000000000005",
+        "0b000000000014000000008001010000000000050c0000000000140000000080",
+        "0101000000000001000000000000180000000080010200000000000520000000",
+        "210200000000380000000080010a00000000000f030000000004000067654a3e",
+        "49314419963593b3728fe903ecfb366f1f35088c6d87872df7a51d4000003400",
+        "0000008001090000000000052000000067654a3e49314419963593b3728fe903",
+        "ecfb366f1f35088c6d87872df7a51d400000380000000080010a00000000000f",
+        "0300000000040000ce4a9359b9cf0b7575c0f29bb2b4c298d446ddf9027a87ec",
+        "14651177d6e99655080000006364f948d652854e9c02f2c14e17264e",
+    ),
+);
+
+/// Primeira inscrição do KERNELBASE (ID 2) — 364 bytes.
+/// SHA-256: 11c7c0d08e87c9736f3e5960f3e9f81df0a7f7d45171a4f5562b73852ce478a7.
+const KERNELBASE_NOTIFICATION: (&str, &str) = (
+    "418A073AA3BC7C75",
+    concat!(
+        "0100048000000000000000000000000014000000020054010a00000000001400",
+        "ffff1f1101010000000000051200000000001800ffff1f110102000000000005",
+        "2000000020020000000014000000008001010000000000050400000000001400",
+        "0000008001010000000000050b00000000001400000000800101000000000005",
+        "04000000000034000000008001090000000000052000000067654a3e49314419",
+        "963593b3728fe903ecfb366f1f35088c6d87872df7a51d400000180000000080",
+        "010200000000000f02000000010000000000380000000080010a00000000000f",
+        "030000000004000067654a3e49314419963593b3728fe903ecfb366f1f35088c",
+        "6d87872df7a51d4000002800000000800106000000000005500000005ef30fb1",
+        "8164ae04b14ca22914b14c21a65686560000380000000080010a00000000000f",
+        "0300000000040000ce4a9359b9cf0b7575c0f29bb2b4c298d446ddf9027a87ec",
+        "14651177d6e9965500100000",
+    ),
+);
+
+/// Segundo nome consultado pelo KERNELBASE, com escopo de usuário e as ACLs
+/// originais — 364 bytes.
+/// SHA-256: 184cc85379abdb03cb7cef32c8322c801cb4f13f085964117c5c593298078ea3.
+const KERNELBASE_SECOND_NOTIFICATION: (&str, &str) = (
+    "418A073AA3BC88F5",
+    concat!(
+        "0100048000000000000000000000000014000000020054010a0000000000",
+        "1400ffff1f1101010000000000051200000000001800ffff1f1101020000",
+        "000000052000000020020000000014000000008001010000000000050400",
+        "0000000014000000008001010000000000050b0000000000140000000010",
+        "010100000000000504000000000034000000001001090000000000052000",
+        "000067654a3e49314419963593b3728fe903ecfb366f1f35088c6d87872d",
+        "f7a51d400000180000000080010200000000000f02000000010000000000",
+        "380000000010010a00000000000f030000000004000067654a3e49314419",
+        "963593b3728fe903ecfb366f1f35088c6d87872df7a51d40000028000300",
+        "00000106000000000005500000005ef30fb18164ae04b14ca22914b14c21",
+        "a65686560000380000000080010a00000000000f0300000000040000ce4a",
+        "9359b9cf0b7575c0f29bb2b4c298d446ddf9027a87ec14651177d6e99655",
+        "00100000",
+    ),
+);
+
+pub const DEFINITIONS: [(&str, &str); 3] = [FEATURE_CONFIGURATION_CHANGED, KERNELBASE_NOTIFICATION, KERNELBASE_SECOND_NOTIFICATION];
+
+pub fn decode(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2).map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap_or(0)).collect()
+}
+
+/// Acrescenta só as definições ausentes; a configuração já instalada é
+/// preservada. Devolve quantas foram instaladas.
+pub fn initialize() -> Result<usize, KernelError> {
+    let handle = registry::open_or_create(DEFINITION_PATH, None)?;
+    if handle == 0 {
+        return Err(KernelError::new("WNF: nao foi possivel abrir a hive de definicoes"));
+    }
+    let mut installed = 0;
+    let mut result = Ok(());
+    for (name, bytes) in DEFINITIONS {
+        if registry::get_value(handle, name).is_some() {
+            continue;
+        }
+        if !registry::set_value(handle, name, 3, decode(bytes)) {
+            result = Err(KernelError::new("WNF: nao foi possivel instalar a definicao na hive"));
+            break;
+        }
+        installed += 1;
+    }
+    registry::close_handle(handle);
+    result.map(|_| installed)
+}

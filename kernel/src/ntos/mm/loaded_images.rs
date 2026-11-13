@@ -1,0 +1,334 @@
+//! Posse das imagens de kernel mapeadas — `system32/ntos/mm/loaded-images.js`
+//! e a vista nativa `loaded-image-list.js` (KLDR_DATA_TABLE_ENTRY x64, 0xA0
+//! bytes, PDB 19041).
+//!
+//! Independe do tempo de vida do DRIVER_OBJECT. Imagens de usuário pertencem
+//! ao loader do processo e nunca são registradas aqui.
+
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use super::paging::{self, MapOptions};
+use super::{kernel_address, memory_map as map};
+use crate::hal::amd64::native_call;
+use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::mm::guest_memory as guest;
+
+const ENTRY_BYTE_LENGTH: u64 = 0xA0;
+
+/// Registro imutável de uma imagem.
+#[derive(Clone, Debug)]
+pub struct LoadedImage {
+    pub id: u64,
+    pub image_base: u64,
+    pub size_of_image: u64,
+    pub name: String,
+    pub entry_point: u64,
+    pub checksum: u32,
+    pub time_date_stamp: u32,
+    pub loader_flags: u32,
+}
+
+/// Descrição de uma imagem a registrar.
+#[derive(Clone, Debug, Default)]
+pub struct ImageDescription {
+    pub image_base: u64,
+    pub size_of_image: u64,
+    pub entry_point: u64,
+    pub checksum: u32,
+    pub time_date_stamp: u32,
+    pub loader_flags: u32,
+    /// Liberação da paginação da imagem no descarregamento final.
+    pub release_paging: Option<fn(u64)>,
+}
+
+struct NativeEntry {
+    pointer: u64,
+}
+
+struct Registry {
+    next_id: u64,
+    /// Ordem de registro = ordem de enumeração.
+    images: Vec<LoadedImage>,
+    /// Imagens donas de mapeamento (inclusive as ocultas).
+    owned: BTreeMap<u64, (LoadedImage, Option<fn(u64)>)>,
+    kernel: Option<u64>,
+    bootstrap: Option<u64>,
+    unload_observers: Vec<fn(&LoadedImage)>,
+    list_head: u64,
+    native_entries: BTreeMap<u64, NativeEntry>,
+}
+
+static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
+    next_id: 1,
+    images: Vec::new(),
+    owned: BTreeMap::new(),
+    kernel: None,
+    bootstrap: None,
+    unload_observers: Vec::new(),
+    list_head: 0,
+    native_entries: BTreeMap::new(),
+});
+
+// ---- vista nativa (loaded-image-list.js) ---------------------------------
+
+/// Uma alocação contém corpo e nome completo; BaseDllName aponta para o
+/// sufixo da mesma string.
+fn create_native_entry(image: &LoadedImage) -> Result<NativeEntry, KernelError> {
+    let full_name: Vec<u16> = image.name.replace('/', "\\").encode_utf16().collect();
+    if full_name.len() > 32766 {
+        return Err(KernelError::new("kernel image name exceeds UNICODE_STRING"));
+    }
+    let name_bytes = full_name.len() as u64 * 2;
+    let pointer = guest::alloc_bytes(ENTRY_BYTE_LENGTH + name_bytes + 2);
+    if pointer == 0 {
+        return Err(KernelError::new("kernel loader list allocation failed"));
+    }
+    let name_pointer = pointer + ENTRY_BYTE_LENGTH;
+    let base_offset = full_name.iter().rposition(|&unit| unit == b'\\' as u16).map_or(0, |index| index + 1) as u64 * 2;
+    guest::write64(pointer + 0x30, image.image_base);
+    guest::write64(pointer + 0x38, image.entry_point);
+    guest::write32(pointer + 0x40, image.size_of_image as u32);
+    guest::write16(pointer + 0x48, name_bytes as u16);
+    guest::write16(pointer + 0x4A, name_bytes as u16 + 2);
+    guest::write64(pointer + 0x50, name_pointer);
+    guest::write16(pointer + 0x58, (name_bytes - base_offset) as u16);
+    guest::write16(pointer + 0x5A, (name_bytes - base_offset + 2) as u16);
+    guest::write64(pointer + 0x60, name_pointer + base_offset);
+    guest::write32(pointer + 0x68, image.loader_flags);
+    guest::write16(pointer + 0x6C, 1); // uma referência de propriedade no loader
+    guest::write32(pointer + 0x78, image.checksum);
+    guest::write32(pointer + 0x98, image.size_of_image as u32);
+    guest::write32(pointer + 0x9C, image.time_date_stamp);
+    for (index, &unit) in full_name.iter().enumerate() {
+        guest::write16(name_pointer + index as u64 * 2, unit);
+    }
+    Ok(NativeEntry { pointer })
+}
+
+impl Registry {
+    fn enumerated(&self) -> Vec<LoadedImage> {
+        self.images.iter().filter(|image| Some(image.id) != self.bootstrap).cloned().collect()
+    }
+
+    /// A preparação termina antes de mudar a lista; uma falta de memória
+    /// libera só as entradas novas.
+    fn synchronize(&mut self) -> Result<(), KernelError> {
+        if self.list_head == 0 {
+            return Ok(());
+        }
+        let images = self.enumerated();
+        let mut prepared = Vec::new();
+        for image in &images {
+            if !self.native_entries.contains_key(&image.id) {
+                match create_native_entry(image) {
+                    Ok(entry) => prepared.push((image.id, entry)),
+                    Err(error) => {
+                        for (_, entry) in prepared {
+                            guest::free_bytes(entry.pointer);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        for (id, entry) in prepared {
+            self.native_entries.insert(id, entry);
+        }
+        let ordered: Vec<u64> = images.iter().map(|image| self.native_entries[&image.id].pointer).collect();
+        let head = self.list_head;
+        guest::write64(head, ordered.first().copied().unwrap_or(head));
+        guest::write64(head + 8, ordered.last().copied().unwrap_or(head));
+        for (index, &pointer) in ordered.iter().enumerate() {
+            guest::write64(pointer, ordered.get(index + 1).copied().unwrap_or(head));
+            guest::write64(pointer + 8, if index > 0 { ordered[index - 1] } else { head });
+        }
+        let retained: Vec<u64> = images.iter().map(|image| image.id).collect();
+        let stale: Vec<u64> = self.native_entries.keys().copied().filter(|id| !retained.contains(id)).collect();
+        for id in stale {
+            if let Some(entry) = self.native_entries.remove(&id) {
+                guest::free_bytes(entry.pointer);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn register(description: ImageDescription, name: &str) -> Result<LoadedImage, KernelError> {
+    let (base, size) = (description.image_base, description.size_of_image);
+    if base == 0 || size == 0 || base.checked_add(size).is_none() {
+        return Err(KernelError::new("invalid kernel image range"));
+    }
+    let mut registry = REGISTRY.lock();
+    let overlaps = registry
+        .owned
+        .values()
+        .any(|(other, _)| base < other.image_base + other.size_of_image && base + size > other.image_base);
+    if overlaps {
+        return Err(KernelError::new(alloc::format!("overlapping kernel images: {}", if name.is_empty() { "unnamed" } else { name })));
+    }
+    let image = LoadedImage {
+        id: registry.next_id,
+        image_base: base,
+        size_of_image: size,
+        name: String::from(name),
+        entry_point: description.entry_point,
+        checksum: description.checksum,
+        time_date_stamp: description.time_date_stamp,
+        loader_flags: description.loader_flags,
+    };
+    registry.next_id += 1;
+    registry.images.push(image.clone());
+    registry.owned.insert(image.id, (image.clone(), description.release_paging));
+    if let Err(error) = registry.synchronize() {
+        registry.images.retain(|other| other.id != image.id);
+        registry.owned.remove(&image.id);
+        return Err(error);
+    }
+    Ok(image)
+}
+
+pub fn unregister(id: u64) -> Result<bool, KernelError> {
+    let observers;
+    let image;
+    {
+        let mut registry = REGISTRY.lock();
+        if Some(id) == registry.kernel || Some(id) == registry.bootstrap {
+            return Err(KernelError::new("cannot unload the running kernel"));
+        }
+        let Some((removed, release_paging)) = registry.owned.remove(&id) else { return Ok(false) };
+        if let Some(release) = release_paging {
+            release(removed.image_base);
+        }
+        registry.images.retain(|other| other.id != id);
+        registry.synchronize()?;
+        observers = registry.unload_observers.clone();
+        image = removed;
+    }
+    // Só o descarregamento final de uma imagem possuída notifica.
+    for observer in observers {
+        observer(&image);
+    }
+    Ok(true)
+}
+
+/// Some da enumeração sem liberar o mapeamento (vistas de diagnóstico).
+pub fn hide(id: u64) -> Result<bool, KernelError> {
+    let mut registry = REGISTRY.lock();
+    if Some(id) == registry.kernel || Some(id) == registry.bootstrap {
+        return Err(KernelError::new("cannot hide the running kernel"));
+    }
+    let before = registry.images.len();
+    registry.images.retain(|other| other.id != id);
+    let removed = registry.images.len() != before;
+    registry.synchronize()?;
+    Ok(removed)
+}
+
+pub fn observe_unload(observer: fn(&LoadedImage)) {
+    REGISTRY.lock().unload_observers.push(observer);
+}
+
+pub fn find(address: u64) -> Option<LoadedImage> {
+    if address == 0 {
+        return None;
+    }
+    REGISTRY
+        .lock()
+        .images
+        .iter()
+        .find(|image| address >= image.image_base && address < image.image_base + image.size_of_image)
+        .cloned()
+}
+
+/// Aliases nomeiam a mesma imagem; o kernel é enumerado uma vez.
+pub fn list() -> Vec<LoadedImage> {
+    REGISTRY.lock().enumerated()
+}
+
+pub fn kernel() -> Option<LoadedImage> {
+    let registry = REGISTRY.lock();
+    let id = registry.kernel?;
+    registry.owned.get(&id).map(|(image, _)| image.clone())
+}
+
+/// A vista nativa só é materializada quando um consumidor pede o endereço.
+pub fn native_list() -> Result<(u64, Vec<(LoadedImage, u64)>), KernelError> {
+    let mut registry = REGISTRY.lock();
+    if registry.list_head == 0 {
+        let head = guest::alloc_bytes(16);
+        if head == 0 {
+            return Err(KernelError::new("kernel loader list head allocation failed"));
+        }
+        guest::write64(head, head);
+        guest::write64(head + 8, head);
+        registry.list_head = head;
+    }
+    registry.synchronize()?;
+    let entries =
+        registry.enumerated().into_iter().map(|image| (image.clone(), registry.native_entries[&image.id].pointer)).collect();
+    Ok((registry.list_head, entries))
+}
+
+/// Mapeamento supervisor adicional da imagem de boot em KERNEL_VIRTUAL_BASE
+/// e registro do `ntoskrnl.exe`.
+pub fn init_kernel() -> Result<LoadedImage, KernelError> {
+    if let Some(kernel) = kernel() {
+        return Ok(kernel);
+    }
+    let base = map::KERNEL_IMAGE_BASE;
+    let r16 = |offset: u64| guest::read16(base + offset) as u64;
+    let r32 = |offset: u64| guest::read32(base + offset) as u64;
+    let pe = r32(0x3C);
+    if r16(0) != 0x5A4D || !(0x40..=0xF00).contains(&pe) || r32(pe) != 0x4550 || r16(pe + 4) != 0x8664 || r16(pe + 24) != 0x20B {
+        return Err(KernelError::new("running kernel has no valid PE header"));
+    }
+    let size = r32(pe + 80);
+    let entry_rva = r32(pe + 40);
+    if guest::read64(base + pe + 48) != base
+        || size < 0x2000
+        || size > map::KERNEL_IMAGE_MAX
+        || size % 4096 != 0
+        || entry_rva < 4096
+        || entry_rva >= size
+    {
+        return Err(KernelError::new("running kernel PE range disagrees with boot layout"));
+    }
+    let mut mapped = Vec::new();
+    for offset in (0..size).step_by(4096) {
+        let page = map::KERNEL_VIRTUAL_BASE + offset;
+        if !paging::map_page(page, base + offset, paging::PAGE_PRESENT | paging::PAGE_RW, MapOptions::default()) {
+            for &page in &mapped {
+                paging::unmap_page(page, MapOptions::default());
+            }
+            return Err(KernelError::new("cannot map native kernel image"));
+        }
+        mapped.push(page);
+    }
+    // A ponte nativa passa a executar no alias publicado aos módulos nativos.
+    native_call::publish_native_kernel_mapping(base, map::KERNEL_VIRTUAL_BASE, size);
+    let bootstrap = register(
+        ImageDescription { image_base: base, size_of_image: size, entry_point: base + entry_rva, ..Default::default() },
+        "ntoskrnl.exe (bootstrap mapping)",
+    )?;
+    let kernel = register(
+        ImageDescription {
+            image_base: map::KERNEL_VIRTUAL_BASE,
+            size_of_image: size,
+            entry_point: map::KERNEL_VIRTUAL_BASE + entry_rva,
+            checksum: r32(pe + 88) as u32,
+            time_date_stamp: r32(pe + 8) as u32,
+            ..Default::default()
+        },
+        "\\SystemRoot\\System32\\ntoskrnl.exe",
+    )?;
+    {
+        let mut registry = REGISTRY.lock();
+        registry.bootstrap = Some(bootstrap.id);
+        registry.kernel = Some(kernel.id);
+    }
+    kernel_address::publish(size);
+    debug_print!("[mm] kernel PE registrado: base={:#x} size={:#x}", kernel.image_base, size);
+    Ok(kernel)
+}

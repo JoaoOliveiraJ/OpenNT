@@ -1,0 +1,4 @@
+OpenNT - kernel x86-64 escrito 100% em Rust.
+Drivers (VGA, teclado), shell, syscalls e este FS moram em Rust.
+Digite "help" para os comandos do shell.
+Programas embutidos: "run hello" e "spawn pisca".

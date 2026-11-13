@@ -1,0 +1,914 @@
+# Dados editados à mão para `cargo xtask status` (páginas em docs/site/ e
+# docs/ROADMAP.md).
+#
+# O gerador confere o que dá para conferir: os caminhos citados precisam
+# existir no repositório, e o marcador de cada teste precisa aparecer nas
+# fontes Rust. O que não confere sai como aviso na geração e no fim da página
+# de componentes.
+#
+# Estado declarado de cada componente:
+#   "implementado"        vira "Funciona" se algum teste listado em `testes`
+#                         tiver o marcador presente nas fontes; sem teste,
+#                         aparece como "Parcial", com o aviso de que falta teste
+#   "em desenvolvimento"  uma parte já existe; aparece como "Parcial"
+#   "planejado"           previsto numa fase do roadmap
+#   "fora"                fora do escopo atual
+# `fase` é o número da fase em [[fase]] (texto livre também vale).
+# `icone`: cpu, memory, cube, threads, io, sliders, book, shield, database,
+# power, folder, chip, terminal, plug, window, check, message, chart, rocket,
+# atom, keyboard, monitor, disk, bus, lock, list, layers, clock, mouse, play,
+# user.
+
+[fontes]
+# Pastas varridas para achar o arquivo Rust de cada módulo planejado (mesma
+# pasta-pai e mesmo nome). Atualize junto com a reorganização de
+# docs/ARQUITETURA.md.
+rust = ["kernel/src"]
+# Pastas das suítes de autoteste do kernel.
+testes = ["kernel/src/ntos/test"]
+
+[icones_categoria]
+"Núcleo do kernel" = "cpu"
+"Drivers internos" = "plug"
+"Drivers do Windows" = "window"
+"Sistemas de arquivos" = "folder"
+"Aplicações do kernel" = "terminal"
+"Programas do Windows" = "layers"
+
+# Frase que abre cada categoria na página de componentes.
+[descricoes_categoria]
+"Núcleo do kernel" = "As partes centrais do kernel, escritas em Rust: boot, interrupções, memória, processos, sincronização, objetos, segurança, I/O, Registro e o carregador de drivers."
+"Drivers internos" = "Drivers escritos em Rust que fazem parte do próprio OpenNT: vídeo, console, teclado, barramento, disco e segurança."
+"Drivers do Windows" = "Drivers do Windows (.sys e .dll) carregados como estão, sem recompilar nem modificar. Os binários vêm da máquina de build, copiados pelo xtask, e nunca entram no repositório. Aqui, Funciona quer dizer que o binário do próprio Windows carrega e roda durante um teste automático de boot."
+"Sistemas de arquivos" = "Os sistemas de arquivos que o kernel monta e lê."
+"Aplicações do kernel" = "Programas que rodam dentro do próprio kernel: o shell e os programas de exemplo."
+"Programas do Windows" = "Programas do Windows (.exe) rodando em modo usuário, com as bibliotecas de sistema do próprio Windows."
+
+# ---- fases do roadmap -------------------------------------------------------------
+
+[[fase]]
+numero = "1"
+nome = "base"
+estado = "concluída"
+escopo = "Boot pela BIOS até o modo de 64 bits, HAL, nanokernel (interrupções, canais de mensagens, serviços), relógio, escalonador cooperativo, sistema de arquivos em memória, vídeo, console, teclado, shell e a ferramenta de build e testes (cargo xtask)."
+
+[[fase]]
+numero = "2"
+nome = "memória e CPU"
+estado = "concluída"
+escopo = "Banco de páginas físicas, mapeamento recursivo, pool do kernel, variáveis exportadas, imagens carregadas, KUSER_SHARED_DATA, KPCR, IRQL, DPCs, multiprocessador, ACPI, estruturas do NT e acesso à memória de convidado."
+
+[[fase]]
+numero = "3"
+nome = "objetos e executive"
+estado = "concluída"
+escopo = "Object Manager (tipos, handles, namespace, callbacks), biblioteca de runtime, Executive (locks, rundown, listas lookaside, callbacks), segurança (SIDs, ACLs, descritores, tokens) e processos e threads com as estruturas reais do NT."
+
+[[fase]]
+numero = "4"
+nome = "I/O e armazenamento"
+estado = "concluída"
+escopo = "I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco ATA e NTFS."
+
+[[fase]]
+numero = "5"
+nome = "Registro e serviços"
+estado = "concluída"
+escopo = "Configuration Manager (hives, chaves e valores) e o controle de serviços e drivers (sc)."
+
+[[fase]]
+numero = "6"
+nome = "loader PE e ntoskrnl"
+estado = "em andamento"
+escopo = "Carregador de PE, funções exportadas pelo kernel, carga dos drivers reais do Windows (i8042prt, kbdclass, cng.sys) e KsecDD."
+
+[[fase]]
+numero = "7"
+nome = "modo usuário"
+estado = "em andamento"
+escopo = "Processos e threads de usuário, comunicação ALPC, chamadas de sistema e as bibliotecas ntdll e KERNEL32 reais."
+
+# ---- testes automáticos de boot -------------------------------------------------
+
+[[teste]]
+id = "entrada"
+titulo = "Entrada no kernel"
+marcador = "HELLO_KERNEL_OK"
+comando = "cargo xtask test-boot HELLO_KERNEL_OK"
+descricao = "O carregador de boot levou a máquina ao modo de 64 bits, entregou o controle ao kernel e a saída serial funciona."
+
+[[teste]]
+id = "boot"
+titulo = "Boot completo"
+marcador = "KERNEL_RS_OK"
+comando = "cargo xtask test-boot"
+descricao = "As fases 0 e 1 do boot terminaram: relógio, interrupções, memória, processadores, pool, processos e namespace prontos."
+
+[[teste]]
+id = "selftest"
+titulo = "Autoteste do kernel"
+marcador = "SELFTEST_OK"
+comando = "cargo xtask test-boot SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Roda dentro do kernel todas as suítes de autoteste: arquivos em memória, programas de exemplo, memória, escalonador, timer, IPC e serviços; depois as suítes das fases 3 a 7 (objetos e executive, I/O e armazenamento, Registro e serviços, carregador de PE, modo usuário) e o teclado real. O marcador só aparece se todas passarem."
+
+[[teste]]
+id = "fase3"
+titulo = "Autoteste de objetos e executive"
+marcador = "PHASE3_SELFTEST_OK"
+comando = "cargo xtask test-boot PHASE3_SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Dispatcher, APCs, timers e alertas; push locks e rundown; tabelas de handles, namespace e callbacks de objetos; processos e segurança."
+
+[[teste]]
+id = "fase4"
+titulo = "Autoteste de I/O e armazenamento"
+marcador = "PHASE4_SELFTEST_OK"
+comando = "cargo xtask test-boot PHASE4_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "No hardware emulado do QEMU: configuração e barramento PCI, dispositivos da placa-mãe, disco ATA, leitura e escrita de NTFS, I/O Manager (IRPs, dispositivos e arquivos), energia e ETW."
+
+[[teste]]
+id = "fase5"
+titulo = "Autoteste de Registro e serviços"
+marcador = "PHASE5_SELFTEST_OK"
+comando = "cargo xtask test-boot PHASE5_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Hive em memória, chaves e valores, callbacks do Registro, banco de serviços, WNF, licenciamento e capacidades."
+
+[[teste]]
+id = "fase6"
+titulo = "Autoteste do carregador de PE e do ntoskrnl"
+marcador = "PHASE6_SELFTEST_OK"
+comando = "cargo xtask test-boot PHASE6_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Formato PE, carga de imagens do kernel, os exports do ntoskrnl grupo por grupo (Ke, Mm, Ex, Io, Ob, Rtl, Zw...), ciclo de vida de drivers e tratamento de exceções."
+
+[[teste]]
+id = "fase7"
+titulo = "Autoteste do modo usuário"
+marcador = "PHASE7_SELFTEST_OK"
+comando = "cargo xtask test-boot PHASE7_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Seções e memória virtual de usuário, arquivos, eventos e threads, chamadas de sistema, entrada no anel 3, ALPC, controle de serviços (sc) e um processo do Windows em modo usuário."
+
+[[teste]]
+id = "teclado"
+titulo = "Teclado real"
+marcador = "KBDTEST_OK"
+comando = "cargo xtask test-boot SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
+descricao = "Monta pelo PnP as pilhas do i8042prt.sys com kbdclass.sys e mouclass.sys, injeta um scancode pelo controlador 8042 e lê a tecla em \\Device\\KeyboardClass0 (IRQ1, ISR do driver, DPC e callback do kbdclass)."
+
+[[teste]]
+id = "shell"
+titulo = "Teste do shell"
+marcador = "[shell] pronto"
+comando = "cargo xtask test-boot KERNEL_RS_OK 120000 \"--keys=run hello\\nps\\n\" \"--expect== 42\" \"--expect=PID  STATE\""
+descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps) e confere a saída: teclado, IPC, shell e console."
+
+# ---- componentes e drivers ------------------------------------------------------
+
+[[componente]]
+nome = "Boot em 64 bits"
+categoria = "Núcleo do kernel"
+icone = "rocket"
+descricao = "Leva a máquina do modo real da BIOS ao modo de 64 bits, carrega o kernel em 1 MB e entrega o controle a ele."
+estado = "implementado"
+caminhos = ["boot/src/boot.s", "boot/src/stage2.s", "kernel/src/main.rs"]
+testes = ["entrada", "boot"]
+fase = "1"
+
+[[componente]]
+nome = "Interrupções e timer"
+categoria = "Núcleo do kernel"
+icone = "atom"
+descricao = "Monta a tabela de interrupções, programa o timer do processador a 100 Hz e despacha as interrupções de hardware."
+estado = "implementado"
+caminhos = ["kernel/src/nano/interrupts.rs", "kernel/src/hal/amd64/irqstubs.rs", "kernel/src/hal/lapic.rs"]
+testes = ["boot", "selftest"]
+fase = "1"
+
+[[componente]]
+nome = "Gerência de memória"
+categoria = "Núcleo do kernel"
+icone = "memory"
+descricao = "Controla as páginas de memória física, as tabelas de páginas e o pool de memória do kernel."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/mm/pfn.rs", "kernel/src/ntos/mm/paging.rs", "kernel/src/ntos/mm/kernel_pool.rs"]
+testes = ["selftest"]
+fase = "2"
+
+[[componente]]
+nome = "Multiprocessador (SMP)"
+categoria = "Núcleo do kernel"
+icone = "cpu"
+descricao = "Acorda os outros núcleos do processador para que o kernel use mais de uma CPU."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ke/smp.rs", "kernel/src/hal/amd64/aptrampoline.rs"]
+testes = ["selftest"]
+fase = "2"
+notas = "Verificado com 4 CPUs no QEMU."
+
+[[componente]]
+nome = "Processos e threads"
+categoria = "Núcleo do kernel"
+icone = "threads"
+descricao = "Alterna a CPU entre os processos do kernel e mantém as estruturas de processo e thread do NT (EPROCESS e KTHREAD)."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ps/scheduler.rs", "kernel/src/ntos/ps/process.rs"]
+testes = ["selftest", "fase3"]
+fase = "3"
+notas = "O escalonador cooperativo veio na fase 1; as estruturas reais de processo e thread, na fase 3."
+
+[[componente]]
+nome = "Sincronização e despacho"
+categoria = "Núcleo do kernel"
+icone = "clock"
+descricao = "Os objetos de espera do NT (eventos, timers, APCs e DPCs), que drivers e o kernel usam para esperar e sinalizar."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ke/dispatcher.rs", "kernel/src/ntos/ke/apc.rs", "kernel/src/ntos/ke/timer.rs", "kernel/src/ntos/ke/dpc.rs"]
+testes = ["fase3", "selftest"]
+fase = "3"
+
+[[componente]]
+nome = "Gerenciador de objetos e namespace"
+categoria = "Núcleo do kernel"
+icone = "cube"
+descricao = "Dá nome e contagem de referências aos objetos do kernel e monta a árvore \\Device, \\Driver, \\GLOBAL?? e os links de unidade como C:."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/ob/object_manager.rs", "kernel/src/ntos/ob/handle_table.rs", "kernel/src/ntos/init/phase0.rs"]
+testes = ["fase3"]
+fase = "3"
+notas = "Os eventos \\KernelObjects\\* e parte dos tipos de objeto ainda faltam."
+
+[[componente]]
+nome = "Segurança e tokens"
+categoria = "Núcleo do kernel"
+icone = "shield"
+descricao = "Tokens de acesso e descritores de segurança, usados para decidir quem pode abrir cada objeto."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/se/token/tokens.rs", "kernel/src/ntos/se/object_security.rs"]
+testes = ["fase3"]
+fase = "3"
+
+[[componente]]
+nome = "I/O Manager"
+categoria = "Núcleo do kernel"
+icone = "io"
+descricao = "O contrato entre o kernel e os drivers: dispositivos, pedidos de I/O (IRPs), pilhas de drivers e Plug and Play."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
+testes = ["fase4", "teclado"]
+fase = "4"
+notas = "A pilha de teclado do Windows (i8042prt.sys e kbdclass.sys) já roda sobre ele."
+
+[[componente]]
+nome = "Registro"
+categoria = "Núcleo do kernel"
+icone = "database"
+descricao = "O banco de configuração do sistema (hives, chaves e valores), de onde vêm, entre outras coisas, os serviços e drivers a carregar."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/cm/registry.rs", "kernel/src/ntos/cm/key"]
+testes = ["fase5"]
+fase = "5"
+notas = "Hive em memória com chaves, valores, callbacks e o banco de serviços."
+
+[[componente]]
+nome = "Carregador de PE e exports do kernel"
+categoria = "Núcleo do kernel"
+icone = "list"
+descricao = "Carrega drivers .sys e bibliotecas no formato PE do Windows e liga cada import a uma função exportada pelo kernel."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
+testes = ["fase6", "boot"]
+fase = "6"
+notas = "Os drivers da categoria Drivers do Windows já carregam por ele; dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl)."
+
+[[componente]]
+nome = "Vídeo VGA em modo texto"
+categoria = "Drivers internos"
+icone = "monitor"
+descricao = "Escreve texto na tela de 80x25 caracteres e move o cursor."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/video/vga.rs"]
+testes = ["boot"]
+fase = "1"
+notas = "Os testes conferem o texto pela serial; a imagem na tela não é conferida."
+
+[[componente]]
+nome = "Console"
+categoria = "Drivers internos"
+icone = "terminal"
+descricao = "Junta a tela e a saída serial num só lugar para as mensagens do kernel e do shell."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/console/mod.rs"]
+testes = ["boot", "shell"]
+fase = "4"
+notas = "Tela e espelho serial funcionam desde a fase 1; o registro como dispositivo do I/O Manager (\\Device\\Console) entra na fase 4."
+
+[[componente]]
+nome = "Teclado PS/2"
+categoria = "Drivers internos"
+icone = "keyboard"
+descricao = "Lê as teclas da controladora PS/2 a cada interrupção e as envia ao shell como caracteres."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/input/keyboard.rs"]
+testes = ["shell"]
+fase = "1"
+
+[[componente]]
+nome = "Barramento PCI"
+categoria = "Drivers internos"
+icone = "bus"
+descricao = "Percorre o barramento PCI e descobre os dispositivos e os recursos de cada um (portas, memória, interrupções)."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/bus/pci.rs", "kernel/src/hal/pci_config.rs"]
+testes = ["fase4"]
+fase = "4"
+
+[[componente]]
+nome = "Dispositivos da placa-mãe"
+categoria = "Drivers internos"
+icone = "chip"
+descricao = "Descreve os dispositivos fixos do PC, como a controladora de teclado e mouse PS/2, para que os drivers os encontrem."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/bus/motherboard.rs"]
+testes = ["fase4"]
+fase = "4"
+
+[[componente]]
+nome = "Disco ATA (PIO)"
+categoria = "Drivers internos"
+icone = "disk"
+descricao = "Lê e grava setores do disco IDE diretamente pelas portas da controladora."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/storage/ata_pio.rs"]
+testes = ["fase4"]
+fase = "4"
+
+[[componente]]
+nome = "KsecDD"
+categoria = "Drivers internos"
+icone = "lock"
+descricao = "Dispositivo de segurança do kernel: números aleatórios do hardware e avisos de mudança na configuração de criptografia."
+estado = "planejado"
+fase = "6"
+
+[[componente]]
+nome = "hal.dll"
+categoria = "Drivers do Windows"
+icone = "chip"
+descricao = "A biblioteca de abstração de hardware do Windows, carregada como módulo do kernel."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs"]
+testes = ["boot", "selftest"]
+fase = "6"
+
+[[componente]]
+nome = "i8042prt.sys"
+categoria = "Drivers do Windows"
+icone = "keyboard"
+descricao = "Driver da Microsoft para a controladora de teclado e mouse PS/2."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/io/pnp.rs"]
+testes = ["teclado", "shell"]
+fase = "6"
+notas = "Sem ele, o teclado usa o driver PS/2 interno."
+
+[[componente]]
+nome = "kbdclass.sys"
+categoria = "Drivers do Windows"
+icone = "keyboard"
+descricao = "Driver de classe de teclado: entrega as teclas pelo dispositivo \\Device\\KeyboardClass0."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/init/main.rs"]
+testes = ["teclado", "shell"]
+fase = "6"
+
+[[componente]]
+nome = "mouclass.sys"
+categoria = "Drivers do Windows"
+icone = "mouse"
+descricao = "Driver de classe de mouse."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/cm/hw_description.rs"]
+testes = ["teclado"]
+fase = "6"
+notas = "A pilha inicia; nenhum programa consome o mouse ainda."
+
+[[componente]]
+nome = "atapi.sys e ataport.sys"
+categoria = "Drivers do Windows"
+icone = "disk"
+descricao = "Drivers da Microsoft para controladoras de disco IDE/ATA."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/mm/sysload.rs"]
+testes = ["boot", "selftest"]
+fase = "6"
+notas = "Carregam no boot como serviços; os discos seguem lidos pelo driver ATA interno."
+
+[[componente]]
+nome = "disk.sys e classpnp.sys"
+categoria = "Drivers do Windows"
+icone = "disk"
+descricao = "Driver de classe de disco: apresenta cada disco e cada partição ao resto do sistema."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/mm/sysload.rs"]
+testes = ["boot", "selftest"]
+fase = "6"
+
+[[componente]]
+nome = "mountmgr.sys"
+categoria = "Drivers do Windows"
+icone = "folder"
+descricao = "Mount Manager: dá nomes aos volumes e atribui as letras de unidade."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs"]
+testes = ["boot", "selftest"]
+fase = "6"
+
+[[componente]]
+nome = "cng.sys"
+categoria = "Drivers do Windows"
+icone = "lock"
+descricao = "A criptografia do kernel do Windows (Cryptography Next Generation), usada por outros drivers e pelos programas."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/phase1.rs"]
+testes = ["boot", "selftest"]
+fase = "6"
+notas = "Carrega do volume NTFS e publica \\Device\\CNG."
+
+[[componente]]
+nome = "Drivers de teste do WDK"
+categoria = "Drivers do Windows"
+icone = "check"
+descricao = "Drivers pequenos, compilados com o kit de drivers da Microsoft, que exercitam APIs do kernel nas suítes de teste."
+estado = "planejado"
+fase = "6"
+
+[[componente]]
+nome = "vgk.sys"
+categoria = "Drivers do Windows"
+icone = "shield"
+descricao = "Driver anti-cheat de terceiros (Vanguard), usado como alvo de compatibilidade."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/init/main.rs"]
+notas = "Testado em WHPX com `--start-driver=vgk --trace-driver-api` (versão 1.19.2). A ci.dll original inicializa e valida a imagem; o DriverEntry resolve 252 funções do ntoskrnl pela própria busca na tabela de exports, todas atendidas pelo OpenNT. Ele então para numa verificação de integridade interna do anticheat (código ofuscado que inspeciona o próprio kernel, sem chamar API), fora do escopo do projeto. O `--trace-driver-api` mostra o log do vgk em texto (`texto:`) e cada nome procurado (`procura:`). O binário nunca entra no repositório: o build o lê de OPENNT_VGK_SYS ou de vgk.sys na raiz."
+
+[[componente]]
+nome = "Arquivos em memória"
+categoria = "Sistemas de arquivos"
+icone = "memory"
+descricao = "Sistema de arquivos em memória com os arquivos embutidos no kernel, montado em \\FS e visto como C:."
+estado = "implementado"
+caminhos = ["kernel/src/drivers/fs/memory_file_system.rs"]
+testes = ["selftest", "fase3"]
+fase = "1"
+
+[[componente]]
+nome = "NTFS"
+categoria = "Sistemas de arquivos"
+icone = "disk"
+descricao = "Lê e grava volumes NTFS, o sistema de arquivos do Windows."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/fs/ntfs.rs", "kernel/src/drivers/fs/ntfs_write.rs"]
+testes = ["fase4"]
+fase = "4"
+notas = "O cng.sys é carregado de um volume NTFS durante o boot."
+
+[[componente]]
+nome = "Shell"
+categoria = "Aplicações do kernel"
+icone = "terminal"
+descricao = "Linha de comando do kernel: arquivos, processos, memória e informações do sistema."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/shell/mod.rs"]
+testes = ["shell"]
+fase = "1"
+notas = "exec, loaddriver e objects ainda avisam de qual parte do sistema dependem; o sc (controle de serviços) já funciona."
+
+[[componente]]
+nome = "Programas hello e pisca"
+categoria = "Aplicações do kernel"
+icone = "play"
+descricao = "Programas de exemplo: hello imprime uma saudação e devolve 42; pisca roda como processo e imprime cinco ticks."
+estado = "implementado"
+caminhos = ["kernel/src/apps/programs.rs"]
+testes = ["selftest", "shell"]
+fase = "1"
+
+[[componente]]
+nome = "sc (controle de serviços)"
+categoria = "Aplicações do kernel"
+icone = "sliders"
+descricao = "Consulta, inicia e para os serviços e drivers registrados no Registro."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/shell/service_control.rs"]
+testes = ["fase7"]
+fase = "5"
+
+[[componente]]
+nome = "Modo usuário"
+categoria = "Programas do Windows"
+icone = "user"
+descricao = "Processos e threads de usuário isolados do kernel, que chamam o sistema pela instrução SYSCALL."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/ps/user"]
+testes = ["fase7"]
+fase = "7"
+
+[[componente]]
+nome = "ntdll.dll, KERNEL32 e KERNELBASE"
+categoria = "Programas do Windows"
+icone = "layers"
+descricao = "As bibliotecas de sistema reais do Windows, pelas quais os programas falam com o kernel."
+estado = "planejado"
+fase = "7"
+
+[[componente]]
+nome = "Executáveis .exe (comando exec)"
+categoria = "Programas do Windows"
+icone = "window"
+descricao = "Programas do Windows carregados pelo shell e executados em modo usuário."
+estado = "planejado"
+fase = "7"
+notas = "Depende do carregador de PE (fase 6) e do modo usuário (fase 7)."
+
+# ---- subsistemas do kernel ----------------------------------------------------
+# `pasta` é a pasta dos módulos em modulos-planejados.txt.
+
+[[subsistema]]
+pasta = "nano"
+nome = "Nanokernel"
+icone = "atom"
+descricao = "Interrupções, canais de mensagens e registro de serviços."
+fase = "1"
+
+[[subsistema]]
+pasta = "ntos/init"
+nome = "Boot em fases"
+icone = "rocket"
+descricao = "A sequência de inicialização do kernel e o laço principal."
+fase = "1"
+notas = "A fase 1 do boot (I/O, drivers, NTFS, serviços) entra nas fases 4 a 6 do roadmap."
+
+[[subsistema]]
+pasta = "shell"
+nome = "Shell"
+icone = "terminal"
+descricao = "Linha de comando e controle de serviços."
+fase = "1 e 5"
+
+[[subsistema]]
+pasta = "drivers/video"
+nome = "Driver de vídeo"
+icone = "monitor"
+descricao = "VGA em modo texto."
+fase = "1"
+
+[[subsistema]]
+pasta = "drivers/console"
+nome = "Driver de console"
+icone = "terminal"
+descricao = "Tela e espelho serial."
+fase = "1 e 4"
+
+[[subsistema]]
+pasta = "drivers/input"
+nome = "Drivers de entrada"
+icone = "keyboard"
+descricao = "Teclado PS/2 e a pilha de teclado do Windows."
+fase = "1 e 6"
+
+[[subsistema]]
+pasta = "drivers/bus"
+nome = "Drivers de barramento"
+icone = "bus"
+descricao = "PCI e dispositivos da placa-mãe."
+fase = "4"
+
+[[subsistema]]
+pasta = "drivers/storage"
+nome = "Drivers de armazenamento"
+icone = "disk"
+descricao = "Disco ATA por PIO."
+fase = "4"
+
+[[subsistema]]
+pasta = "drivers/crypto"
+nome = "Drivers de criptografia"
+icone = "lock"
+descricao = "KsecDD."
+fase = "6"
+
+[[subsistema]]
+pasta = "ntos/inc"
+nome = "Cabeçalhos do NT (inc)"
+icone = "book"
+descricao = "Layouts das estruturas do WDK (wdm.h/ntddk.h) e os NTSTATUS usados pelo kernel."
+fase = "2"
+
+[[subsistema]]
+pasta = "win32"
+nome = "Diagnósticos de drivers"
+icone = "chart"
+descricao = "Instrumentação de diagnóstico de drivers, fora da conta: esse papel é do --trace-driver-api e dos traços do QEMU."
+fase = "—"
+
+[[subsistema]]
+pasta = "ntos/exports"
+nome = "Exports do kernel"
+icone = "list"
+descricao = "A tabela de exports do ntoskrnl; as rotinas moram no componente de cada uma (ntos/<componente>/exports.rs)."
+fase = "6"
+
+[[subsistema]]
+pasta = "ntos/ke"
+nome = "Kernel (Ke)"
+icone = "cpu"
+descricao = "Relógio, IRQL, DPCs, processadores, despacho de threads, APCs, timers."
+fase = "1 a 3"
+
+[[subsistema]]
+pasta = "ntos/mm"
+nome = "Memória (Mm)"
+icone = "memory"
+descricao = "Páginas físicas, tabelas de páginas, pool, seções e imagens carregadas."
+fase = "2, 3 e 6"
+
+[[subsistema]]
+pasta = "ntos/ob"
+nome = "Objetos (Ob)"
+icone = "cube"
+descricao = "Tipos de objeto, handles, namespace e callbacks."
+fase = "3"
+
+[[subsistema]]
+pasta = "ntos/ps"
+nome = "Processos e threads (Ps)"
+icone = "threads"
+descricao = "Processos, threads, notificações e escalonador."
+fase = "1, 3 e 7"
+
+[[subsistema]]
+pasta = "ntos/ps/user"
+nome = "Modo usuário (Ps)"
+icone = "user"
+descricao = "PEB/TEB, carregamento da ntdll e chamadas de sistema dos programas."
+fase = "7"
+
+[[subsistema]]
+pasta = "ntos/ex"
+nome = "Executive (Ex)"
+icone = "sliders"
+descricao = "Locks, pool, listas lookaside, callbacks e WNF."
+fase = "1 e 3"
+
+[[subsistema]]
+pasta = "ntos/rtl"
+nome = "Runtime library (Rtl)"
+icone = "book"
+descricao = "Strings, árvores, bitmaps, ordenação, imagens PE e Unicode."
+fase = "3 e 6"
+
+[[subsistema]]
+pasta = "ntos/se"
+nome = "Segurança (Se)"
+icone = "shield"
+descricao = "SIDs, ACLs, descritores, tokens e privilégios."
+fase = "3"
+
+[[subsistema]]
+pasta = "ntos/io"
+nome = "Entrada e saída (Io)"
+icone = "io"
+descricao = "Dispositivos, IRPs, drivers, Plug and Play e work items."
+fase = "3 e 4"
+
+[[subsistema]]
+pasta = "drivers/fs"
+nome = "Sistemas de arquivos"
+icone = "folder"
+descricao = "Arquivos em memória, volumes e NTFS."
+fase = "1, 3 e 4"
+
+[[subsistema]]
+pasta = "hal"
+nome = "HAL executiva"
+icone = "chip"
+descricao = "Tabelas ACPI, PCI e firmware."
+fase = "2 e 4"
+
+[[subsistema]]
+pasta = "ntos/cm"
+nome = "Registro (Cm)"
+icone = "database"
+descricao = "Hives, chaves, valores e serviços."
+fase = "2 e 5"
+
+[[subsistema]]
+pasta = "ntos/po"
+nome = "Energia (Po)"
+icone = "power"
+descricao = "Estados de energia e registro de falhas."
+fase = "4"
+
+[[subsistema]]
+pasta = "ntos/etw"
+nome = "Rastreamento (Etw)"
+icone = "chart"
+descricao = "Event Tracing for Windows."
+fase = "4"
+
+[[subsistema]]
+pasta = "ntos/alpc"
+nome = "Comunicação entre processos (Alpc)"
+icone = "message"
+descricao = "Portas ALPC entre processos."
+fase = "7"
+
+[[subsistema]]
+pasta = "ntos/test"
+nome = "Autotestes"
+icone = "check"
+descricao = "Suítes que rodam dentro do kernel no QEMU."
+fase = "contínua"
+notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mesmo nome existe, ou pela tabela [correspondencias]."
+
+# ---- dados internos do cálculo de módulos -------------------------------------
+# Chaves: nome do módulo planejado (veja docs/status/modulos-planejados.txt).
+
+# Módulos planejados cujo arquivo Rust tem outro nome. "" = sem arquivo.
+[correspondencias]
+"ntos/alpc/connect_capture" = "kernel/src/ntos/alpc/connect/capture.rs"
+"ntos/alpc/connect_parameters" = "kernel/src/ntos/alpc/connect/parameters.rs"
+"ntos/alpc/connect_port" = "kernel/src/ntos/alpc/connect/port.rs"
+"ntos/alpc/connect_target" = "kernel/src/ntos/alpc/connect/target.rs"
+"ntos/alpc/message_buffer" = "kernel/src/ntos/alpc/message/buffer.rs"
+"ntos/alpc/message_handles" = "kernel/src/ntos/alpc/message/handles.rs"
+"ntos/alpc/message_identity" = "kernel/src/ntos/alpc/message/identity.rs"
+"ntos/alpc/message_security" = "kernel/src/ntos/alpc/message/security.rs"
+"ntos/alpc/resource_handles" = "kernel/src/ntos/alpc/resource/handles.rs"
+"ntos/alpc/resource_reserves" = "kernel/src/ntos/alpc/resource/reserves.rs"
+"ntos/cm/driver_services" = "kernel/src/ntos/cm/service/driver.rs"
+"ntos/cm/key_access" = "kernel/src/ntos/cm/key/access.rs"
+"ntos/cm/key_information" = "kernel/src/ntos/cm/key/information.rs"
+"ntos/cm/key_objects" = "kernel/src/ntos/cm/key/objects.rs"
+"ntos/cm/key_policy" = "kernel/src/ntos/cm/key/policy.rs"
+"ntos/cm/key_security" = "kernel/src/ntos/cm/key/security.rs"
+"ntos/cm/key_services" = "kernel/src/ntos/cm/key/services.rs"
+"ntos/cm/native_keys" = "kernel/src/ntos/cm/key/native.rs"
+"ntos/cm/service_channel" = "kernel/src/ntos/cm/service/channel.rs"
+"ntos/cm/service_database" = "kernel/src/ntos/cm/service/database.rs"
+"ntos/cm/service_rpc" = "kernel/src/ntos/cm/service/rpc.rs"
+"ntos/cm/services" = "kernel/src/ntos/cm/service/system_drivers.rs"
+"ntos/ex/license_boot" = "kernel/src/ntos/ex/license/boot.rs"
+"ntos/ex/license_cache" = "kernel/src/ntos/ex/license/cache.rs"
+"ntos/ex/license_data" = "kernel/src/ntos/ex/license/data.rs"
+"ntos/ex/license_index" = "kernel/src/ntos/ex/license/index.rs"
+"ntos/ex/license_registry" = "kernel/src/ntos/ex/license/registry.rs"
+"ntos/ex/license_service" = "kernel/src/ntos/ex/license/service.rs"
+"ntos/ex/license_special" = "kernel/src/ntos/ex/license/special.rs"
+"ntos/ex/license_state" = "kernel/src/ntos/ex/license/state.rs"
+"ntos/ex/license_values" = "kernel/src/ntos/ex/license/values.rs"
+"ntos/ex/wnf_data_block" = "kernel/src/ntos/ex/wnf/data_block.rs"
+"ntos/ex/wnf_definition" = "kernel/src/ntos/ex/wnf/definition.rs"
+"ntos/ex/wnf_name" = "kernel/src/ntos/ex/wnf/name.rs"
+"ntos/ex/wnf_namespace" = "kernel/src/ntos/ex/wnf/namespace.rs"
+"ntos/ex/wnf_notifications" = "kernel/src/ntos/ex/wnf/notifications.rs"
+"ntos/ex/wnf_physical" = "kernel/src/ntos/ex/wnf/physical.rs"
+"ntos/ex/wnf_query" = "kernel/src/ntos/ex/wnf/query.rs"
+"ntos/ex/wnf_registry" = "kernel/src/ntos/ex/wnf/registry.rs"
+"ntos/ex/wnf_scope_capture" = "kernel/src/ntos/ex/wnf/scope_capture.rs"
+"ntos/ex/wnf_scope_identity" = "kernel/src/ntos/ex/wnf/scope_identity.rs"
+"ntos/ex/wnf_security" = "kernel/src/ntos/ex/wnf/security.rs"
+"ntos/ex/wnf_service" = "kernel/src/ntos/ex/wnf/service.rs"
+"ntos/ex/wnf_state_data" = "kernel/src/ntos/ex/wnf/state_data.rs"
+"ntos/ex/wnf_subscriptions" = "kernel/src/ntos/ex/wnf/subscriptions.rs"
+"ntos/ex/wnf_update" = "kernel/src/ntos/ex/wnf/update.rs"
+"ntos/io/convert_file_handle" = "kernel/src/ntos/io/file/convert_handle.rs"
+"ntos/io/create_completion" = "kernel/src/ntos/io/completion/create.rs"
+"ntos/io/delete_file" = "kernel/src/ntos/io/file/delete.rs"
+"ntos/io/file_information" = "kernel/src/ntos/io/file/information.rs"
+"ntos/io/file_lifetime" = "kernel/src/ntos/io/file/lifetime.rs"
+"ntos/io/file_request" = "kernel/src/ntos/io/file/request.rs"
+"ntos/io/query_file" = "kernel/src/ntos/io/file/query.rs"
+"ntos/io/query_native_file_security" = "kernel/src/ntos/io/file/native_security.rs"
+"ntos/io/read_file" = "kernel/src/ntos/io/file/read.rs"
+"ntos/io/remove_completion" = "kernel/src/ntos/io/completion/remove.rs"
+"ntos/io/set_completion" = "kernel/src/ntos/io/completion/set.rs"
+"ntos/io/write_file" = "kernel/src/ntos/io/file/write.rs"
+"ntos/mm/create_section" = "kernel/src/ntos/mm/section/create.rs"
+"ntos/mm/map_system_view" = "kernel/src/ntos/mm/section/map_system_view.rs"
+"ntos/mm/map_view_parameters" = "kernel/src/ntos/mm/section/map_view_parameters.rs"
+"ntos/mm/map_view" = "kernel/src/ntos/mm/section/map_view.rs"
+"ntos/mm/open_section" = "kernel/src/ntos/mm/section/open.rs"
+"ntos/mm/section_address" = "kernel/src/ntos/mm/section/address.rs"
+"ntos/mm/section_cache" = "kernel/src/ntos/mm/section/cache.rs"
+"ntos/mm/section_file" = "kernel/src/ntos/mm/section/file.rs"
+"ntos/mm/section_handles" = "kernel/src/ntos/mm/section/handles.rs"
+"ntos/mm/section_image_view" = "kernel/src/ntos/mm/section/image_view.rs"
+"ntos/mm/section_parameters" = "kernel/src/ntos/mm/section/parameters.rs"
+"ntos/mm/section_views" = "kernel/src/ntos/mm/section/views.rs"
+"ntos/mm/secured_views" = "kernel/src/ntos/mm/section/secured_views.rs"
+"ntos/mm/unmap_system_view" = "kernel/src/ntos/mm/section/unmap_system_view.rs"
+"ntos/mm/unmap_view" = "kernel/src/ntos/mm/section/unmap_view.rs"
+"ntos/ob/completion_objects" = "kernel/src/ntos/ob/objects/completion.rs"
+"ntos/ob/device_objects" = "kernel/src/ntos/ob/objects/device.rs"
+"ntos/ob/dispatcher_objects" = "kernel/src/ntos/ob/objects/dispatcher.rs"
+"ntos/ob/driver_objects" = "kernel/src/ntos/ob/objects/driver.rs"
+"ntos/ob/file_handles" = "kernel/src/ntos/ob/handles/file.rs"
+"ntos/ob/file_objects" = "kernel/src/ntos/ob/objects/file.rs"
+"ntos/ob/namespace_handles" = "kernel/src/ntos/ob/handles/namespace.rs"
+"ntos/ob/namespace_objects" = "kernel/src/ntos/ob/objects/namespace.rs"
+"ntos/ob/port_objects" = "kernel/src/ntos/ob/objects/port.rs"
+"ntos/ob/process_handles" = "kernel/src/ntos/ob/handles/process.rs"
+"ntos/ob/section_objects" = "kernel/src/ntos/ob/objects/section.rs"
+"ntos/ob/security_handles" = "kernel/src/ntos/ob/handles/security.rs"
+"ntos/ob/thread_handles" = "kernel/src/ntos/ob/handles/thread.rs"
+"ntos/ob/work_objects" = "kernel/src/ntos/ob/objects/work.rs"
+"ntos/ps/context_apc" = "kernel/src/ntos/ps/context/apc.rs"
+"ntos/ps/image_notify" = "kernel/src/ntos/ps/notify/image.rs"
+"ntos/ps/kernel_context_frame" = "kernel/src/ntos/ps/context/kernel_frame.rs"
+"ntos/ps/process_notify" = "kernel/src/ntos/ps/notify/process.rs"
+"ntos/ps/set_thread_context" = "kernel/src/ntos/ps/context/set.rs"
+"ntos/ps/silo_contexts" = "kernel/src/ntos/ps/silo/contexts.rs"
+"ntos/ps/silo_monitors" = "kernel/src/ntos/ps/silo/monitors.rs"
+"ntos/ps/silo_query" = "kernel/src/ntos/ps/silo/query.rs"
+"ntos/ps/thread_context_input" = "kernel/src/ntos/ps/context/input.rs"
+"ntos/ps/thread_context_registers" = "kernel/src/ntos/ps/context/registers.rs"
+"ntos/ps/thread_notify" = "kernel/src/ntos/ps/notify/thread.rs"
+"ntos/rtl/find_resource" = "kernel/src/ntos/rtl/resource/find.rs"
+"ntos/rtl/resource_configuration" = "kernel/src/ntos/rtl/resource/configuration.rs"
+"ntos/rtl/resource_file" = "kernel/src/ntos/rtl/resource/file.rs"
+"ntos/rtl/resource_language_data" = "kernel/src/ntos/rtl/resource/language_data.rs"
+"ntos/rtl/resource_languages" = "kernel/src/ntos/rtl/resource/languages.rs"
+"ntos/rtl/resource_lookup" = "kernel/src/ntos/rtl/resource/lookup.rs"
+"ntos/rtl/resource_memory" = "kernel/src/ntos/rtl/resource/memory.rs"
+"ntos/rtl/resource_satellites" = "kernel/src/ntos/rtl/resource/satellites.rs"
+"ntos/rtl/resource_search" = "kernel/src/ntos/rtl/resource/search.rs"
+"ntos/rtl/resource_tree" = "kernel/src/ntos/rtl/resource/tree.rs"
+"ntos/se/anonymous_tokens" = "kernel/src/ntos/se/token/anonymous.rs"
+"ntos/se/capability_appcontainer" = "kernel/src/ntos/se/capability/appcontainer.rs"
+"ntos/se/capability_check" = "kernel/src/ntos/se/capability/check.rs"
+"ntos/se/capability_identifiers" = "kernel/src/ntos/se/capability/identifiers.rs"
+"ntos/se/capability_policy" = "kernel/src/ntos/se/capability/policy.rs"
+"ntos/se/capability_telemetry" = "kernel/src/ntos/se/capability/telemetry.rs"
+"ntos/se/capability_token_checks" = "kernel/src/ntos/se/capability/token_checks.rs"
+"ntos/se/duplicate_token" = "kernel/src/ntos/se/token/duplicate.rs"
+"ntos/se/impersonate_anonymous" = "kernel/src/ntos/se/token/impersonate_anonymous.rs"
+"ntos/se/open_process_token" = "kernel/src/ntos/se/token/open_process.rs"
+"ntos/se/query_token" = "kernel/src/ntos/se/token/query.rs"
+"ntos/se/thread_tokens" = "kernel/src/ntos/se/token/thread.rs"
+"ntos/se/token_access" = "kernel/src/ntos/se/token/access.rs"
+"ntos/se/token_capability_access" = "kernel/src/ntos/se/token/capability_access.rs"
+"ntos/se/token_handles" = "kernel/src/ntos/se/token/handles.rs"
+"ntos/se/token_membership" = "kernel/src/ntos/se/token/membership.rs"
+"ntos/se/token_reference" = "kernel/src/ntos/se/token/reference.rs"
+"ntos/se/token_statistics" = "kernel/src/ntos/se/token/statistics.rs"
+"ntos/se/tokens" = "kernel/src/ntos/se/token/tokens.rs"
+"ntos/exports/ntoskrnl" = "kernel/src/ntos/init/exports.rs"
+"drivers/console/console" = "kernel/src/drivers/console/mod.rs"
+"shell/shell" = "kernel/src/shell/mod.rs"
+"ntos/mm/loaded_image_list" = "kernel/src/ntos/mm/loaded_images.rs"
+"ntos/mm/system_module_information" = "kernel/src/ntos/mm/module_queries.rs"
+"ntos/mm/physical_ranges" = "kernel/src/ntos/mm/module_queries.rs"
+"ntos/mm/protect_mdl" = "kernel/src/ntos/mm/module_queries.rs"
+"ntos/mm/address_validity" = "kernel/src/ntos/mm/small.rs"
+"ntos/mm/mdl_size" = "kernel/src/ntos/mm/small.rs"
+"ntos/mm/page_fault_failure" = "kernel/src/ntos/mm/small.rs"
+"ntos/ps/user/state" = "kernel/src/ntos/ps/user_probe.rs"
+"ntos/test/dispatcher" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/apc_regions" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/handle_table" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/ex_rundown" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/ex_push_lock" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/alert_thread" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/process_handles" = "kernel/src/ntos/test/phase3.rs"
+"ntos/test/primary_tokens" = "kernel/src/ntos/test/phase3.rs"
+
+# Módulos que existem só em parte.
+[parciais]
+"drivers/console/console" = "falta o registro como dispositivo (fase 4)"
+"shell/shell" = "exec, loaddriver e objects pendentes"
+"ntos/init/phase0" = "etapas pendentes listadas no módulo"
+"ntos/init/phase1" = "só o aviso; o conteúdo entra nas fases 4 a 6"
+"ntos/ps/user/state" = "só a sondagem de endereços de usuário"
+"ntos/test/self_test" = "subconjunto"
+"ntos/test/dispatcher" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/apc_regions" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/handle_table" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/ex_rundown" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/ex_push_lock" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/alert_thread" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/process_handles" = "chamadas diretas no lugar dos exports (fase 6)"
+"ntos/test/primary_tokens" = "chamadas diretas no lugar dos exports (fase 6)"
+
+# Módulos fora das contas.
+[fora_do_escopo]
+"win32/argument_precision" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
+"win32/argument_widths" = "desnecessário: o kernel lê os argumentos de 64 bits direto do quadro da ABI"
+"win32/ataport_trace" = "diagnóstico temporário do ataport"
+"win32/ci_view_experiment" = "experimento de diagnóstico"
+"win32/driver_diagnostics" = "diagnóstico; substituído pelo --trace-driver-api"
+"win32/export_sentinels" = "diagnóstico"
+"win32/hal_data_diagnostic" = "diagnóstico"
+"win32/hal_reference_experiment" = "experimento de diagnóstico"
+"win32/private_mm_diagnostic" = "diagnóstico"
+"win32/user_call_evidence" = "diagnóstico"
+"win32/win32" = "kernel32 mínimo de bring-up, substituído pelas DLLs reais"
+"ntos/ke/tracer" = "diagnóstico fora do escopo"

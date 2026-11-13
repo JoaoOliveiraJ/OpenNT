@@ -1,0 +1,12 @@
+[package]
+name = "boot"
+description = "Setor de boot e stage2 (modo real -> protegido -> long mode) do OpenNT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "boot"
+path = "src/main.rs"
+test = false
+bench = false
