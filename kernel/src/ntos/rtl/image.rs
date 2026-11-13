@@ -6,13 +6,29 @@
 //! endereço (RtlPcToFileHeader) e a busca de export por nome
 //! (RtlFindExportedRoutineByName).
 
+use core::mem::offset_of;
+
+use crate::ntos::inc::types::{Field, ImageDosHeader, ImageExportDirectory, ImageNtHeaders64, ImageOptionalHeader64, ImageSectionHeader, NtStruct};
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 const MAXIMUM_POINTER: u64 = u64::MAX;
 const USER_ADDRESS_LIMIT: u64 = 0x7FFF_FFFE_FFFF;
 pub const INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const INVALID_IMAGE: u32 = 0xC000_007B;
+/// IMAGE_NT_OPTIONAL_HDR64_MAGIC / IMAGE_NT_OPTIONAL_HDR32_MAGIC.
+const PE32_PLUS_MAGIC: u16 = 0x20B;
+const PE32_MAGIC: u16 = 0x10B;
+/// IMAGE_OPTIONAL_HEADER32.DataDirectory (o cabeçalho de 32 bits não tem
+/// ImageBase de 64 bits: o vetor começa 16 bytes antes).
+const OPTIONAL32_DATA_DIRECTORY: u64 = 96;
+
+/// Campo de um cabeçalho PE em memória não confiável, pelo nome do NT: o
+/// e_lfanew não garante alinhamento natural, então cada campo é uma leitura
+/// sondada no próprio endereço.
+fn header_field<T: GuestScalar>(base: u64, offset: usize) -> Result<T, KernelError> {
+    guest::try_read(base.wrapping_add(offset as u64))
+}
 
 /// Valida flags, assinatura DOS, e_lfanew e assinatura NT. A flag 1 dispensa
 /// a verificação contra o tamanho (os testes de overflow continuam).
@@ -21,21 +37,21 @@ pub fn inspect_header(flags: u32, base: u64, length: u64) -> Result<(u32, u64), 
         return Ok((INVALID_PARAMETER, 0));
     }
     let invalid = Ok((INVALID_IMAGE, 0));
-    if flags & 1 == 0 && length < 64 {
+    if flags & 1 == 0 && length < ImageDosHeader::SIZE {
         return invalid;
     }
-    if base > MAXIMUM_POINTER - 63 || guest::try_read16(base)? != 0x5A4D {
+    if base > MAXIMUM_POINTER - (ImageDosHeader::SIZE - 1) || header_field::<u16>(base, offset_of!(ImageDosHeader, e_magic))? != 0x5A4D {
         return invalid;
     }
-    let header_offset = guest::try_read32(base + 0x3C)? as u64;
+    let header_offset = header_field::<u32>(base, offset_of!(ImageDosHeader, e_lfanew))? as u64;
     if flags & 1 == 0 && (header_offset >= length || header_offset >= 0xFFFF_FFE7 || header_offset + 24 >= length) {
         return invalid;
     }
     let Some(header) = base.checked_add(header_offset) else { return invalid };
-    if base < USER_ADDRESS_LIMIT && header + 0x108 >= USER_ADDRESS_LIMIT {
+    if base < USER_ADDRESS_LIMIT && header + ImageNtHeaders64::SIZE >= USER_ADDRESS_LIMIT {
         return invalid;
     }
-    if guest::try_read32(header)? != 0x4550 {
+    if header_field::<u32>(header, offset_of!(ImageNtHeaders64, signature))? != 0x4550 {
         return invalid;
     }
     Ok((0, header))
@@ -46,10 +62,11 @@ pub fn nt_header_ex(flags: u32, base: u64, length: u64, output: u64) -> Result<u
     if output == 0 {
         return Ok(INVALID_PARAMETER);
     }
-    guest::try_write64(output, 0)?;
+    let output = Field::<u64>::try_at(output)?;
+    output.probe_set(0)?;
     let (status, address) = inspect_header(flags, base, length)?;
     if status == 0 {
-        guest::try_write64(output, address)?;
+        output.probe_set(address)?;
     }
     Ok(status)
 }
@@ -70,35 +87,37 @@ pub fn directory_entry(base: u64, mapped_as_image: bool, index: u32, output_size
     if status != 0 {
         return Ok(0);
     }
-    let optional = header + 24;
-    let array_offset = match guest::try_read16(optional)? {
-        0x20B => 112,
-        0x10B => 96,
+    let optional = header + offset_of!(ImageNtHeaders64, optional_header) as u64;
+    let array_offset = match header_field::<u16>(optional, offset_of!(ImageOptionalHeader64, magic))? {
+        PE32_PLUS_MAGIC => offset_of!(ImageOptionalHeader64, data_directory) as u64,
+        PE32_MAGIC => OPTIONAL32_DATA_DIRECTORY,
         _ => 0,
     };
-    if array_offset == 0 || index >= guest::try_read32(optional + array_offset - 4)? {
+    // NumberOfRvaAndSizes precede o vetor nos dois formatos.
+    if array_offset == 0 || index >= header_field::<u32>(optional, (array_offset - 4) as usize)? {
         return Ok(0);
     }
+    // IMAGE_DATA_DIRECTORY { VirtualAddress, Size }.
     let entry = optional + array_offset + index as u64 * 8;
-    let rva = guest::try_read32(entry)? as u64;
+    let rva = header_field::<u32>(entry, 0)? as u64;
     if rva == 0 || base.checked_add(rva).is_none() || (base < USER_ADDRESS_LIMIT && base + rva >= USER_ADDRESS_LIMIT) {
         return Ok(0);
     }
     // O tamanho é publicado antes da tradução por seções.
-    guest::try_write32(output_size, guest::try_read32(entry + 4)?)?;
-    if mapped_as_image || rva < guest::try_read32(optional + 60)? as u64 {
+    guest::try_write::<u32>(output_size, header_field::<u32>(entry, 4)?)?;
+    if mapped_as_image || rva < header_field::<u32>(optional, offset_of!(ImageOptionalHeader64, size_of_headers))? as u64 {
         return Ok(base + rva);
     }
-    let count = guest::try_read16(header + 6)?;
-    let mut section = optional + guest::try_read16(header + 20)? as u64;
+    let count = header_field::<u16>(header, offset_of!(ImageNtHeaders64, file_header.number_of_sections))?;
+    let mut section = optional + header_field::<u16>(header, offset_of!(ImageNtHeaders64, file_header.size_of_optional_header))? as u64;
     for _ in 0..count {
-        let section_rva = guest::try_read32(section + 12)? as u64;
-        let raw_size = guest::try_read32(section + 16)? as u64;
+        let section_rva = header_field::<u32>(section, offset_of!(ImageSectionHeader, virtual_address))? as u64;
+        let raw_size = header_field::<u32>(section, offset_of!(ImageSectionHeader, size_of_raw_data))? as u64;
         if rva >= section_rva && rva - section_rva < raw_size {
-            let file_offset = guest::try_read32(section + 20)? as u64 + rva - section_rva;
+            let file_offset = header_field::<u32>(section, offset_of!(ImageSectionHeader, pointer_to_raw_data))? as u64 + rva - section_rva;
             return Ok(base.checked_add(file_offset).unwrap_or(0));
         }
-        section += 40;
+        section += ImageSectionHeader::SIZE;
     }
     Ok(0)
 }
@@ -107,7 +126,8 @@ pub fn directory_entry(base: u64, mapped_as_image: bool, index: u32, output_size
 /// nenhuma), também gravada em `base_out`.
 pub fn pc_to_file_header(pc: u64, base_out: u64) -> u64 {
     let base = crate::ntos::mm::loaded_images::find(pc).map_or(0, |image| image.image_base);
-    guest::write64(base_out, base);
+    // SAFETY: PVOID* BaseOfImage do chamador.
+    unsafe { Field::<u64>::at(base_out) }.set(base);
     base
 }
 
@@ -117,21 +137,24 @@ pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {
     let target = crate::ntos::rtl::guest_strings::read_c_string(name_pointer);
     let size_cell = guest::alloc_bytes(4);
     let directory = directory_entry(base, true, 0, size_cell).unwrap_or(0);
-    let directory_size = guest::read32(size_cell) as u64;
+    // SAFETY: célula ULONG alocada acima.
+    let directory_size = unsafe { Field::<u32>::at(size_cell) }.get() as u64;
     guest::free_bytes(size_cell);
     if directory == 0 {
         return 0;
     }
     let export_rva = directory.wrapping_sub(base); // directory = base + export_rva
-    let number_of_names = guest::read32(directory + 0x18) as u64;
-    let functions = base + guest::read32(directory + 0x1C) as u64;
-    let names = base + guest::read32(directory + 0x20) as u64;
-    let ordinals = base + guest::read32(directory + 0x24) as u64;
+    // SAFETY: diretório de exports de uma imagem carregada (validada pelo loader).
+    let exports = unsafe { ImageExportDirectory::at(directory) };
+    let number_of_names = exports.number_of_names.get() as usize;
+    let functions = base + exports.address_of_functions.get() as u64;
+    let names = guest::read_bytes(base + exports.address_of_names.get() as u64, number_of_names * 4);
+    let ordinals = guest::read_bytes(base + exports.address_of_name_ordinals.get() as u64, number_of_names * 2);
     for index in 0..number_of_names {
-        let name_rva = guest::read32(names + index * 4) as u64;
+        let name_rva = u32::from_le_bytes([names[index * 4], names[index * 4 + 1], names[index * 4 + 2], names[index * 4 + 3]]) as u64;
         if crate::ntos::rtl::guest_strings::read_c_string(base + name_rva) == target {
-            let ordinal = guest::read16(ordinals + index * 2) as u64;
-            let function_rva = guest::read32(functions + ordinal * 4) as u64;
+            let ordinal = u16::from_le_bytes([ordinals[index * 2], ordinals[index * 2 + 1]]) as u64;
+            let function_rva = guest::read::<u32>(functions + ordinal * 4) as u64;
             if function_rva >= export_rva && function_rva < export_rva + directory_size {
                 return 0; // forwarder
             }

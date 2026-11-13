@@ -10,10 +10,11 @@
 use alloc::vec::Vec;
 
 use super::unicode_case::upcase_char;
+use crate::ntos::inc::types::{Field, Guid, NtStruct, UnicodeString};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool;
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 /// Diferença assinada de caracteres ou de comprimentos. `ignore_case` usa o
 /// byte baixo da flag BOOLEAN.
@@ -37,11 +38,12 @@ pub fn compare(left: u64, left_count: u64, right: u64, right_count: u64, ignore_
 
 /// RtlCompareUnicodeString: um Length ímpar é truncado a WCHARs inteiros.
 pub fn compare_string(left: u64, right: u64, ignore_case: u32) -> Result<i32, KernelError> {
+    let (left, right) = (UnicodeString::try_at(left)?, UnicodeString::try_at(right)?);
     compare(
-        guest::try_read64(left + 8)?,
-        (guest::try_read16(left)? >> 1) as u64,
-        guest::try_read64(right + 8)?,
-        (guest::try_read16(right)? >> 1) as u64,
+        left.buffer.probe_get()?,
+        (left.length.probe_get()? >> 1) as u64,
+        right.buffer.probe_get()?,
+        (right.length.probe_get()? >> 1) as u64,
         ignore_case,
     )
 }
@@ -49,25 +51,27 @@ pub fn compare_string(left: u64, right: u64, ignore_case: u32) -> Result<i32, Ke
 /// RtlEqualUnicodeString: mesmo comprimento em bytes; inclui o último WCHAR
 /// completo quando Length é ímpar.
 pub fn equal_string(left: u64, right: u64, ignore_case: u32) -> Result<u32, KernelError> {
-    let length = guest::try_read16(left)?;
-    if length != guest::try_read16(right)? {
+    let (left, right) = (UnicodeString::try_at(left)?, UnicodeString::try_at(right)?);
+    let length = left.length.probe_get()?;
+    if length != right.length.probe_get()? {
         return Ok(0);
     }
     let count = (length as u64 + 1) >> 1;
-    let difference = compare(guest::try_read64(left + 8)?, count, guest::try_read64(right + 8)?, count, ignore_case)?;
+    let difference = compare(left.buffer.probe_get()?, count, right.buffer.probe_get()?, count, ignore_case)?;
     Ok((difference == 0) as u32)
 }
 
 /// RtlFindUnicodeSubstring: posições alinhadas a WCHAR; o caminho sensível
 /// compara bytes, o insensível compara WCHARs.
 pub fn find(source: u64, search: u64, ignore_case: u32) -> Result<u64, KernelError> {
-    let length = guest::try_read16(source)? as u64;
-    let search_length = guest::try_read16(search)? as u64;
+    let (source, search) = (UnicodeString::try_at(source)?, UnicodeString::try_at(search)?);
+    let length = source.length.probe_get()? as u64;
+    let search_length = search.length.probe_get()? as u64;
     if length < search_length {
         return Ok(0);
     }
-    let source_buffer = guest::try_read64(source + 8)?;
-    let search_buffer = guest::try_read64(search + 8)?;
+    let source_buffer = source.buffer.probe_get()?;
+    let search_buffer = search.buffer.probe_get()?;
     let mut start = 0u64;
     while start <= length - search_length {
         let mut offset = 0u64;
@@ -108,31 +112,32 @@ pub fn create(destination: u64, source: u64) -> Result<u32, KernelError> {
     if bytes > 0xFFFE {
         return Ok(0);
     }
+    let string = UnicodeString::try_at(destination)?;
     let buffer = guest::alloc_bytes(bytes);
-    guest::try_write64(destination + 8, buffer)?;
+    string.buffer.probe_set(buffer)?;
     if buffer == 0 {
         return Ok(0);
     }
-    guest::try_write16(destination + 2, bytes as u16)?;
-    for offset in (0..bytes).step_by(2) {
-        guest::try_write16(buffer + offset, guest::try_read16(source + offset)?)?;
-    }
-    guest::try_write16(destination, (bytes - 2) as u16)?;
+    string.maximum_length.probe_set(bytes as u16)?;
+    guest::try_write_bytes(buffer, &guest::try_read_bytes(source, bytes as usize)?)?;
+    string.length.probe_set((bytes - 2) as u16)?;
     Ok(1)
 }
 
 /// RtlFreeUnicodeString: cada buffer volta ao alocador que o possui (pool
 /// paginável da conversão ANSI ou arena).
 pub fn free(string: u64) -> Result<u32, KernelError> {
-    let buffer = guest::try_read64(string + 8)?;
+    let string = UnicodeString::try_at(string)?;
+    let buffer = string.buffer.probe_get()?;
     if buffer != 0 {
         if kernel_pool::owns(buffer) {
             kernel_pool::free(buffer, None)?;
         } else {
             guest::free_bytes(buffer);
         }
-        guest::try_write64(string, 0)?;
-        guest::try_write64(string + 8, 0)?;
+        string.length.probe_set(0)?;
+        string.maximum_length.probe_set(0)?;
+        string.buffer.probe_set(0)?;
     }
     Ok(0)
 }
@@ -141,8 +146,9 @@ pub fn free(string: u64) -> Result<u32, KernelError> {
 /// depois de validar o formato completo.
 pub fn guid_from_string(string: u64, output: u64) -> Result<u32, KernelError> {
     const INVALID_PARAMETER: u32 = 0xC000_000D;
-    let count = (guest::try_read16(string)? >> 1) as u64;
-    let buffer = guest::try_read64(string + 8)?;
+    let string = UnicodeString::try_at(string)?;
+    let count = (string.length.probe_get()? >> 1) as u64;
+    let buffer = string.buffer.probe_get()?;
     let index = core::cell::Cell::new(0u64);
     let mut next = || -> Result<i32, KernelError> {
         if index.get() < count {
@@ -169,15 +175,16 @@ pub fn guid_from_string(string: u64, output: u64) -> Result<u32, KernelError> {
     if next()? != 123 {
         return Ok(INVALID_PARAMETER);
     }
+    let guid = Guid::try_at(output)?;
     for field in 0..3 {
         let value = hexadecimal(if field == 0 { 8 } else { 4 }, &mut next)?;
         if value < 0 {
             return Ok(INVALID_PARAMETER);
         }
         match field {
-            0 => guest::try_write32(output, value as u32)?,
-            1 => guest::try_write16(output + 4, value as u16)?,
-            _ => guest::try_write16(output + 6, value as u16)?,
+            0 => guid.data1.probe_set(value as u32)?,
+            1 => guid.data2.probe_set(value as u16)?,
+            _ => guid.data3.probe_set(value as u16)?,
         }
         if next()? != 45 {
             return Ok(INVALID_PARAMETER);
@@ -200,7 +207,7 @@ pub fn guid_from_string(string: u64, output: u64) -> Result<u32, KernelError> {
     if index.get() < count && next()? != 0 {
         return Ok(INVALID_PARAMETER);
     }
-    guest::try_write_bytes(output + 8, &tail)?;
+    guest::try_write_bytes(guid.data4[0].address(), &tail)?;
     Ok(0)
 }
 
@@ -221,35 +228,34 @@ pub fn init(output: u64, source: u64) {
 
 /// Escreve o texto numa UNICODE_STRING de destino (alocando se pedido ou
 /// sem buffer; respeitando MaximumLength). Devolve o NTSTATUS.
-fn write_converted_string(destination: u64, text: &str, allocate: bool) -> u32 {
+fn write_converted_string(destination: &UnicodeString, text: &str, allocate: bool) -> u32 {
     let units: Vec<u16> = text.encode_utf16().collect();
     let needed = units.len() as u64 * 2 + 2;
-    let mut buffer = guest::read64(destination + 8);
+    let mut buffer = destination.buffer.get();
     if allocate || buffer == 0 {
         buffer = guest::alloc_bytes(needed);
-        guest::write64(destination + 8, buffer);
-        guest::write16(destination + 2, needed as u16);
-    } else if (guest::read16(destination + 2) as u64) < needed {
+        destination.buffer.set(buffer);
+        destination.maximum_length.set(needed as u16);
+    } else if (destination.maximum_length.get() as u64) < needed {
         return STATUS_BUFFER_OVERFLOW;
     }
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    guest::write16(buffer + units.len() as u64 * 2, 0);
-    guest::write16(destination, units.len() as u16 * 2);
+    guest::write_bytes(buffer, &guest_strings::wide_bytes_with_nul(text));
+    destination.length.set(units.len() as u16 * 2);
     0
 }
 
 /// RtlUpcaseUnicodeString.
 pub fn upcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
     let text = guest_strings::read_unicode_string(source).to_uppercase();
-    write_converted_string(destination, &text, allocate)
+    // SAFETY: PUNICODE_STRING do chamador.
+    write_converted_string(unsafe { UnicodeString::at(destination) }, &text, allocate)
 }
 
 /// RtlDowncaseUnicodeString.
 pub fn downcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
     let text = guest_strings::read_unicode_string(source).to_lowercase();
-    write_converted_string(destination, &text, allocate)
+    // SAFETY: PUNICODE_STRING do chamador.
+    write_converted_string(unsafe { UnicodeString::at(destination) }, &text, allocate)
 }
 
 /// RtlPrefixUnicodeString.
@@ -266,17 +272,15 @@ pub fn prefix(prefix: u64, string: u64, case_insensitive: bool) -> bool {
 /// Grava o texto desde o início do buffer do destino, terminado em NUL
 /// (respeita MaximumLength). Devolve o NTSTATUS.
 pub fn append_text(destination: u64, text: &str) -> u32 {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let maximum = guest::read16(destination + 2) as u64 / 2;
-    if units.len() as u64 + 1 > maximum {
+    // SAFETY: PUNICODE_STRING do chamador.
+    let destination = unsafe { UnicodeString::at(destination) };
+    let count = text.encode_utf16().count() as u64;
+    let maximum = destination.maximum_length.get() as u64 / 2;
+    if count + 1 > maximum {
         return STATUS_BUFFER_OVERFLOW;
     }
-    let buffer = guest::read64(destination + 8);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    guest::write16(buffer + units.len() as u64 * 2, 0);
-    guest::write16(destination, units.len() as u16 * 2);
+    guest::write_bytes(destination.buffer.get(), &guest_strings::wide_bytes_with_nul(text));
+    destination.length.set(count as u16 * 2);
     0
 }
 
@@ -298,24 +302,25 @@ pub fn duplicate(flags: u32, source: u64, destination: u64) -> u32 {
     if destination == 0 || flags & !3 != 0 || flags & 3 == 3 {
         return STATUS_INVALID_PARAMETER;
     }
-    let length = guest::read16(source) as u64;
-    let source_buffer = guest::read64(source + 8);
+    // SAFETY: PCUNICODE_STRING e PUNICODE_STRING do chamador.
+    let (source, destination) = unsafe { (UnicodeString::at(source), UnicodeString::at(destination)) };
+    let length = source.length.get() as u64;
+    let source_buffer = source.buffer.get();
     // Origem vazia sem ALLOCATE_NULL_STRING: destino vazio e sem buffer.
     if length == 0 && flags & ALLOCATE_NULL_STRING == 0 {
-        guest::write16(destination, 0);
-        guest::write16(destination + 2, 0);
-        guest::write64(destination + 8, 0);
+        destination.length.set(0);
+        destination.maximum_length.set(0);
+        destination.buffer.set(0);
         return 0;
     }
     let terminator = if flags & NULL_TERMINATE != 0 { 2 } else { 0 };
     let buffer = guest::alloc_bytes((length + terminator).max(2));
-    guest::write_bytes(buffer, &guest::read_bytes(source_buffer, length as usize));
-    if terminator != 0 {
-        guest::write16(buffer + length, 0);
-    }
-    guest::write16(destination, length as u16);
-    guest::write16(destination + 2, (length + terminator) as u16);
-    guest::write64(destination + 8, buffer);
+    let mut bytes = guest::read_bytes(source_buffer, length as usize);
+    bytes.resize((length + terminator) as usize, 0);
+    guest::write_bytes(buffer, &bytes);
+    destination.length.set(length as u16);
+    destination.maximum_length.set((length + terminator) as u16);
+    destination.buffer.set(buffer);
     0
 }
 
@@ -325,30 +330,36 @@ pub fn hash(string: u64, case_insensitive: bool, algorithm: u32, hash_out: u64) 
     if algorithm > 1 {
         return STATUS_INVALID_PARAMETER;
     }
-    let length_units = guest::read16(string) as u64 / 2;
-    let buffer = guest::read64(string + 8);
+    // SAFETY: PCUNICODE_STRING do chamador.
+    let string = unsafe { UnicodeString::at(string) };
+    let length_units = string.length.get() as u64 / 2;
+    let text = guest::read_bytes(string.buffer.get(), length_units as usize * 2);
     let upcase = |unit: u16| upcase_char(unit).unwrap_or(if (0x61..=0x7A).contains(&unit) { unit - 0x20 } else { unit });
     let mut hash = 0u32;
-    for index in 0..length_units {
-        let mut unit = guest::read16(buffer + index * 2);
+    for pair in text.chunks_exact(2) {
+        let mut unit = u16::from_le_bytes([pair[0], pair[1]]);
         if case_insensitive {
             unit = upcase(unit);
         }
         hash = hash.wrapping_mul(65599).wrapping_add(unit as u32);
     }
-    guest::write32(hash_out, hash);
+    // SAFETY: PULONG HashValue do chamador.
+    unsafe { Field::<u32>::at(hash_out) }.set(hash);
     0
 }
 
 // ---- RtlInitUnicodeStringEx (rtl-strings) ----------------------------------
 
-/// RtlInitUnicodeStringEx(Dest, Source): zera Length/MaximumLength (qword),
-/// publica Buffer e mede o texto; mais de 0x7FFE WCHARs devolve
+/// RtlInitUnicodeStringEx(Dest, Source): zera Length/MaximumLength, publica
+/// Buffer e mede o texto; mais de 0x7FFE WCHARs devolve
 /// STATUS_NAME_TOO_LONG com os comprimentos zerados.
 pub fn init_ex(destination: u64, source: u64) -> u32 {
     const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
-    guest::write64(destination, 0);
-    guest::write64(destination + 8, source);
+    // SAFETY: PUNICODE_STRING do chamador.
+    let destination = unsafe { UnicodeString::at(destination) };
+    destination.length.set(0);
+    destination.maximum_length.set(0);
+    destination.buffer.set(source);
     if source != 0 {
         let mut count = 0u64;
         while guest::read16(source + count * 2) != 0 {
@@ -357,8 +368,8 @@ pub fn init_ex(destination: u64, source: u64) -> u32 {
         if count > 0x7FFE {
             return STATUS_NAME_TOO_LONG;
         }
-        guest::write16(destination, (count * 2) as u16);
-        guest::write16(destination + 2, (count * 2 + 2) as u16);
+        destination.length.set((count * 2) as u16);
+        destination.maximum_length.set((count * 2 + 2) as u16);
     }
     0
 }

@@ -7,7 +7,7 @@
 
 use crate::ntos::mm::{page_residency, paging, small};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 
 /// Falha de acesso com o NTSTATUS correspondente.
 fn fault(address: u64, in_page_status: Option<u32>) -> KernelError {
@@ -49,38 +49,45 @@ pub fn check(address: u64, length: u64, write: bool) -> Result<u64, KernelError>
     Ok(address)
 }
 
+/// Leitura conferida: proteção da faixa e então UM acesso da largura de `T`.
+fn read<T: GuestScalar>(address: u64) -> Result<T, KernelError> {
+    Ok(guest::read(check(address, T::SIZE, false)?))
+}
+
+/// Escrita conferida (página gravável, cópia privada resolvida antes).
+fn write<T: GuestScalar>(address: u64, value: T) -> Result<(), KernelError> {
+    guest::write(check(address, T::SIZE, true)?, value);
+    Ok(())
+}
+
 pub fn read8(address: u64) -> Result<u8, KernelError> {
-    Ok(guest::read8(check(address, 1, false)?))
+    read(address)
 }
 
 pub fn read16(address: u64) -> Result<u16, KernelError> {
-    Ok(guest::read16(check(address, 2, false)?))
+    read(address)
 }
 
 pub fn read32(address: u64) -> Result<u32, KernelError> {
-    Ok(guest::read32(check(address, 4, false)?))
+    read(address)
 }
 
 pub fn read64(address: u64) -> Result<u64, KernelError> {
-    Ok(guest::read64(check(address, 8, false)?))
+    read(address)
 }
 
 pub fn write8(address: u64, value: u8) -> Result<(), KernelError> {
-    guest::write8(check(address, 1, true)?, value);
-    Ok(())
+    write(address, value)
 }
 
 pub fn write16(address: u64, value: u16) -> Result<(), KernelError> {
-    guest::write16(check(address, 2, true)?, value);
-    Ok(())
+    write(address, value)
 }
 
 pub fn write32(address: u64, value: u32) -> Result<(), KernelError> {
-    guest::write32(check(address, 4, true)?, value);
-    Ok(())
+    write(address, value)
 }
 
 pub fn write64(address: u64, value: u64) -> Result<(), KernelError> {
-    guest::write64(check(address, 8, true)?, value);
-    Ok(())
+    write(address, value)
 }

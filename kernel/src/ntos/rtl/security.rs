@@ -6,8 +6,25 @@
 //! NTSTATUS seguem as convenções do componente `se`. Cada rotina com status
 //! devolve o NTSTATUS.
 
+use crate::ntos::inc::types::{AceHeader, Acl, Field, GenericMapping, Luid, NtStruct, SecurityDescriptor, Sid, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::se::descriptor;
+
+// SAFETY (conversões deste arquivo): estruturas e parâmetros de saída do
+// chamador (kernel ou driver), vivos e alinhados como no NT.
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    unsafe { Field::<T>::at(address) }
+}
+fn acl_at(acl: u64) -> &'static Acl {
+    unsafe { Acl::at(acl) }
+}
+fn ace_size(ace: u64) -> u64 {
+    // ACEs começam alinhadas a DWORD dentro da ACL.
+    unsafe { AceHeader::at(ace) }.ace_size.get() as u64
+}
+fn descriptor_at(sd: u64) -> &'static SecurityDescriptor {
+    unsafe { SecurityDescriptor::at(sd) }
+}
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058; // convenção do componente `se`
@@ -23,21 +40,23 @@ const SE_SELF_RELATIVE: u16 = 0x8000;
 /// RtlMapGenericMask(PACCESS_MASK, PGENERIC_MAPPING): troca os quatro bits
 /// GENERIC_* pelos direitos específicos do GENERIC_MAPPING e limpa-os. Puro.
 pub fn map_generic_mask(mask_address: u64, mapping: u64) {
-    let mut mask = guest::read32(mask_address);
+    let access = out::<u32>(mask_address);
+    let mapping = unsafe { GenericMapping::at(mapping) };
+    let mut mask = access.get();
     if mask & 0x8000_0000 != 0 {
-        mask |= guest::read32(mapping); // GenericRead
+        mask |= mapping.generic_read.get();
     }
     if mask & 0x4000_0000 != 0 {
-        mask |= guest::read32(mapping + 4); // GenericWrite
+        mask |= mapping.generic_write.get();
     }
     if mask & 0x2000_0000 != 0 {
-        mask |= guest::read32(mapping + 8); // GenericExecute
+        mask |= mapping.generic_execute.get();
     }
     if mask & 0x1000_0000 != 0 {
-        mask |= guest::read32(mapping + 12); // GenericAll
+        mask |= mapping.generic_all.get();
     }
     mask &= 0x0FFF_FFFF; // zera GENERIC_{READ,WRITE,EXECUTE,ALL}
-    guest::write32(mask_address, mask);
+    access.set(mask);
 }
 
 /// RtlAddAce(PACL, Rev, StartIndex, AceList, AceListLength): insere ACEs
@@ -47,91 +66,88 @@ pub fn add_ace(acl: u64, ace_revision: u32, start_index: u32, ace_list: u64, ace
     if !crate::ntos::se::acl::valid(acl) {
         return STATUS_INVALID_ACL;
     }
-    let acl_revision = guest::read8(acl) as u32;
+    let header = acl_at(acl);
+    let acl_revision = header.acl_revision.get() as u32;
     if !(2..=4).contains(&ace_revision) || acl_revision > 4 {
         return STATUS_REVISION_MISMATCH;
     }
-    let acl_size = guest::read16(acl + 2) as u64;
-    let count = guest::read16(acl + 4) as u64;
+    let acl_size = header.acl_size.get() as u64;
+    let count = header.ace_count.get() as u64;
     let start = (start_index as u64).min(count);
     // Offset do ponto de inserção (após `start` ACEs) e do fim usado.
-    let mut insert_at = 8u64;
+    let mut insert_at = Acl::SIZE;
     for _ in 0..start {
-        insert_at += guest::read16(acl + insert_at + 2) as u64;
+        insert_at += ace_size(acl + insert_at);
     }
     let mut used_end = insert_at;
     for _ in start..count {
-        used_end += guest::read16(acl + used_end + 2) as u64;
+        used_end += ace_size(acl + used_end);
     }
     if used_end + ace_list_len > acl_size {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    // Abre espaço deslocando a cauda para frente (de trás para frente).
-    let tail = used_end - insert_at;
-    for k in 0..tail {
-        let from = acl + used_end - 1 - k;
-        guest::write8(from + ace_list_len, guest::read8(from));
-    }
-    for k in 0..ace_list_len {
-        guest::write8(acl + insert_at + k, guest::read8(ace_list + k));
-    }
+    // Abre espaço deslocando a cauda para frente (memmove: lida inteira antes).
+    let tail = guest::read_bytes(acl + insert_at, (used_end - insert_at) as usize);
+    guest::write_bytes(acl + insert_at + ace_list_len, &tail);
+    guest::write_bytes(acl + insert_at, &guest::read_bytes(ace_list, ace_list_len as usize));
     // Conta as ACEs inseridas e atualiza o cabeçalho.
     let (mut added, mut p) = (0u64, 0u64);
     while p < ace_list_len {
-        let size = guest::read16(ace_list + p + 2) as u64;
+        let size = ace_size(ace_list + p);
         if size == 0 {
             break;
         }
         p += size;
         added += 1;
     }
-    guest::write16(acl + 4, (count + added) as u16);
+    header.ace_count.set((count + added) as u16);
     if ace_revision > acl_revision {
-        guest::write8(acl, ace_revision as u8);
+        header.acl_revision.set(ace_revision as u8);
     }
     0
 }
 
 /// RtlGetSaclSecurityDescriptor(PSD, PBOOLEAN Present, PACL*, PBOOLEAN Defaulted).
 pub fn get_sacl(sd: u64, present: u64, acl_out: u64, defaulted: u64) -> u32 {
-    if guest::read8(sd) != 1 {
+    if descriptor_at(sd).revision.get() != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
     let control = descriptor::control(sd);
-    guest::write8(present, (control & SE_SACL_PRESENT != 0) as u8);
+    out::<u8>(present).set((control & SE_SACL_PRESENT != 0) as u8);
     if control & SE_SACL_PRESENT != 0 {
-        guest::write64(acl_out, descriptor::component(sd, control, 2));
-        guest::write8(defaulted, ((control >> 5) & 1) as u8); // SE_SACL_DEFAULTED=0x20
+        out::<u64>(acl_out).set(descriptor::component(sd, control, 2));
+        out::<u8>(defaulted).set(((control >> 5) & 1) as u8); // SE_SACL_DEFAULTED=0x20
     }
     0
 }
 
 /// RtlGetGroupSecurityDescriptor(PSD, PSID* Group, PBOOLEAN Defaulted).
 pub fn get_group(sd: u64, group_out: u64, defaulted: u64) -> u32 {
-    if guest::read8(sd) != 1 {
+    if descriptor_at(sd).revision.get() != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
     let control = descriptor::control(sd);
-    guest::write64(group_out, descriptor::component(sd, control, 1));
-    guest::write8(defaulted, ((control >> 1) & 1) as u8); // SE_GROUP_DEFAULTED=0x2
+    out::<u64>(group_out).set(descriptor::component(sd, control, 1));
+    out::<u8>(defaulted).set(((control >> 1) & 1) as u8); // SE_GROUP_DEFAULTED=0x2
     0
 }
 
 /// RtlSetGroupSecurityDescriptor(PSD, PSID Group, BOOLEAN Defaulted). SD absoluto.
 pub fn set_group(sd: u64, group: u64, defaulted: bool) -> u32 {
-    if guest::read8(sd) != 1 {
+    let descriptor = descriptor_at(sd);
+    if descriptor.revision.get() != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
-    let control = guest::read16(sd + 2);
+    let control = descriptor.control.get();
     if control & SE_SELF_RELATIVE != 0 {
         return STATUS_INVALID_SECURITY_DESCR;
     }
-    guest::write64(sd + 0x10, group); // Group está em +0x10 (owner +8, group +0x10)
+    descriptor.group.set(group);
     let mut value = control & !SE_GROUP_DEFAULTED;
     if defaulted {
         value |= SE_GROUP_DEFAULTED;
     }
-    guest::write16(sd + 2, value);
+    descriptor.control.set(value);
     0
 }
 
@@ -142,7 +158,9 @@ pub fn sub_authority_count(sid: u64) -> u64 {
 
 /// RtlCopyLuid(PLUID Dest, PLUID Src): copia os 8 bytes do LUID.
 pub fn copy_luid(destination: u64, source: u64) {
-    guest::write64(destination, guest::read64(source));
+    let (destination, source) = unsafe { (Luid::at(destination), Luid::at(source)) };
+    destination.low_part.set(source.low_part.get());
+    destination.high_part.set(source.high_part.get());
 }
 
 // ---- RtlConvertSidToUnicodeString (rtl-strings) ----------------------------
@@ -157,10 +175,15 @@ pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool)
     const STATUS_NO_MEMORY: u32 = 0xC000_0017;
     const STATUS_INVALID_SID: u32 = 0xC000_0078;
     const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
-    if !crate::ntos::se::sid::valid(sid) || guest::read8(sid) != 1 {
+    if !crate::ntos::se::sid::valid(sid) {
         return Ok(STATUS_INVALID_SID);
     }
-    let authority: alloc::vec::Vec<u8> = (2..8).map(|offset| guest::read8(sid + offset)).collect();
+    // SAFETY: SID validado acima (RtlValidSid).
+    let sid = unsafe { Sid::at(sid) };
+    if sid.revision.get() != 1 {
+        return Ok(STATUS_INVALID_SID);
+    }
+    let authority: alloc::vec::Vec<u8> = sid.identifier_authority.value.iter().map(Field::get).collect();
     let mut text = alloc::string::String::from("S-1-");
     if authority[0] != 0 || authority[1] != 0 {
         let value = authority.iter().fold(0u64, |value, &byte| value << 8 | byte as u64);
@@ -169,17 +192,17 @@ pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool)
         let value = authority[2..].iter().fold(0u32, |value, &byte| value << 8 | byte as u32);
         text.push_str(&alloc::format!("{value}"));
     }
-    for index in 0..guest::read8(sid + 1) as u64 {
-        text.push_str(&alloc::format!("-{}", guest::read32(sid + 8 + index * 4)));
+    // SubAuthority[SubAuthorityCount] continua depois do ANYSIZE_ARRAY de um elemento.
+    let count = sid.sub_authority_count.get() as usize;
+    // SAFETY: RtlValidSid confere SubAuthorityCount contra o tamanho do SID.
+    for sub_authority in unsafe { Field::<u32>::array_at(sid.sub_authority[0].address(), count) } {
+        text.push_str(&alloc::format!("-{}", sub_authority.get()));
     }
     // Origem temporária no convidado: UNICODE_STRING (16 bytes) + texto + NUL.
     let bytes = text.len() as u64 * 2;
-    let scratch = guest::alloc_bytes(16 + bytes + 2);
-    let buffer = scratch + 16;
-    for (index, unit) in text.bytes().enumerate() {
-        guest::write16(buffer + index as u64 * 2, unit as u16);
-    }
-    guest::write16(buffer + bytes, 0);
+    let scratch = guest::alloc_bytes(UnicodeString::SIZE + bytes + 2);
+    let buffer = scratch + UnicodeString::SIZE;
+    guest::write_bytes(buffer, &crate::ntos::rtl::guest_strings::wide_bytes_with_nul(&text));
     let status = if allocate {
         match crate::ntos::rtl::unicode::create(destination, buffer) {
             Ok(0) => STATUS_NO_MEMORY,
@@ -189,12 +212,14 @@ pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool)
                 return Err(error);
             }
         }
-    } else if bytes >= guest::read16(destination + 2) as u64 {
+    } else if bytes >= unsafe { UnicodeString::at(destination) }.maximum_length.get() as u64 {
         STATUS_BUFFER_OVERFLOW
     } else {
-        guest::write16(scratch, bytes as u16);
-        guest::write16(scratch + 2, bytes as u16 + 2);
-        guest::write64(scratch + 8, buffer);
+        // SAFETY: UNICODE_STRING temporária no início do bloco alocado acima.
+        let source = unsafe { UnicodeString::at(scratch) };
+        source.length.set(bytes as u16);
+        source.maximum_length.set(bytes as u16 + 2);
+        source.buffer.set(buffer);
         crate::ntos::rtl::strings_counted::copy(destination, scratch);
         0
     };

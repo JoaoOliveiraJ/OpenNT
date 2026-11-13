@@ -2678,8 +2678,10 @@ fn rtl_group_exports(assert: Assert) {
     assert(call("RtlRandom", &[seed]) == 41 && guest::read32(seed) == 2_745_024, "rtl: RtlRandom (LCG)");
     // Versão.
     let info = block + 0x400;
+    // dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOEXW): wSuiteMask (+0x118) e wProductType (+0x11A).
+    guest::write32(info, 0x11C);
     call("RtlGetVersion", &[info]);
-    assert(guest::read32(info + 4) == 10 && guest::read32(info + 12) == 26100 && guest::read32(info + 16) == 2 && guest::read16(info + 0x114) == 0x100 && guest::read8(info + 0x116) == 1, "rtl: RtlGetVersion 10.0.26100 estacao de trabalho");
+    assert(guest::read32(info + 4) == 10 && guest::read32(info + 12) == 26100 && guest::read32(info + 16) == 2 && guest::read16(info + 0x118) == 0x100 && guest::read8(info + 0x11A) == 1, "rtl: RtlGetVersion 10.0.26100 estacao de trabalho");
     assert(call("RtlVerifyVersionInfo", &[info, 1, 1]) == 0, "rtl: RtlVerifyVersionInfo aceita a versao igual");
     guest::write32(info + 4, 11);
     assert(call("RtlVerifyVersionInfo", &[info, 1, 1]) as u32 == 0xC000_0428 && call("VerSetConditionMask", &[0, 2, 3]) == 192, "rtl: RtlVerifyVersionInfo recusa e VerSetConditionMask desloca 3 bits por tipo");

@@ -5,19 +5,61 @@
 //! assíncrona. Bloco de espera de 0x30 bytes: Next +0, KTHREAD +0x18,
 //! Flags +0x24 (bit 4 = liberado).
 
+use core::mem::{offset_of, size_of};
+use core::sync::atomic::Ordering;
+
 use crate::hal::amd64::native_call;
+use crate::ntos::inc::field::Reserved;
+use crate::ntos::inc::types::{Field, NtStruct, RtlRunOnce};
 use crate::ntos::ke::{critical_region, dispatcher, irql};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 const PENDING: u32 = 0x103;
 const UNSUCCESSFUL: u32 = 0xC000_0001;
 const BAD_FLAGS: u32 = 0xC000_00F0;
 const BAD_CONTEXT: u32 = 0xC000_00F1;
 
+/// Bloco de espera da inicialização síncrona (do OpenNT; fica na pilha de
+/// esperadores apontada pelos bits altos do RTL_RUN_ONCE).
+#[repr(C)]
+struct WaitBlock {
+    next: Field<u64>,
+    _reserved_8: Reserved<0x10>,
+    thread: Field<u64>,
+    _reserved_20: Reserved<0x4>,
+    /// Bit 4: liberado pelo RtlRunOnceComplete.
+    flags: Field<u32>,
+    _reserved_28: Reserved<0x8>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for WaitBlock {}
+
+const _: () = {
+    assert!(size_of::<WaitBlock>() == 0x30);
+    assert!(offset_of!(WaitBlock, thread) == 0x18);
+    assert!(offset_of!(WaitBlock, flags) == 0x24);
+};
+
+/// Bit de liberação do bloco de espera.
+const RELEASED: u32 = 4;
+
+fn wait_block(block: u64) -> &'static WaitBlock {
+    // SAFETY: bloco alocado por um esperador e liberado só por ele depois do bit 4.
+    unsafe { WaitBlock::at(block) }
+}
+
+/// PRTL_RUN_ONCE do chamador.
+fn run_once(pointer: u64) -> &'static RtlRunOnce {
+    // SAFETY: RTL_RUN_ONCE vivo e alinhado do chamador.
+    unsafe { RtlRunOnce::at(pointer) }
+}
+
+/// CAS do RTL_RUN_ONCE inteiro (LOCK CMPXCHG).
 fn exchange(pointer: u64, previous: u64, updated: u64) -> Result<bool, KernelError> {
-    Ok(guest::compare_exchange64(pointer, previous, updated)? == previous)
+    Ok(run_once(pointer).ptr.atomic().compare_exchange(previous, updated, Ordering::SeqCst, Ordering::SeqCst).is_ok())
 }
 
 fn require_passive_or_apc() -> Result<(), KernelError> {
@@ -30,7 +72,7 @@ fn require_passive_or_apc() -> Result<(), KernelError> {
 /// RtlRunOnceInitialize.
 pub fn initialize(pointer: u64) -> Result<u32, KernelError> {
     require_passive_or_apc()?;
-    guest::write64(pointer, 0);
+    run_once(pointer).ptr.set(0);
     Ok(0)
 }
 
@@ -54,14 +96,14 @@ impl BeginRequest {
         }
         // O esperador só libera o próprio bloco depois do bit 4 publicado.
         if self.wait_block != 0 {
-            if guest::read32(self.wait_block + 0x24) & 4 == 0 {
+            if wait_block(self.wait_block).flags.atomic().load(Ordering::Acquire) & RELEASED == 0 {
                 return Ok(None);
             }
             guest::free_bytes(self.wait_block);
             self.wait_block = 0;
         }
         loop {
-            let word = guest::read64(self.pointer);
+            let word = run_once(self.pointer).ptr.get();
             let state = word & 3;
             let finish = |request: &mut Self, status: u32| {
                 request.result = Some(status);
@@ -69,7 +111,8 @@ impl BeginRequest {
             };
             if state == 2 {
                 if self.context != 0 {
-                    guest::write64(self.context, word & !3);
+                    // SAFETY: PVOID* Context do chamador.
+                    unsafe { Field::<u64>::at(self.context) }.set(word & !3);
                 }
                 return finish(self, 0);
             }
@@ -89,15 +132,14 @@ impl BeginRequest {
                 return finish(self, BAD_FLAGS);
             }
             // Bloco zerado com a thread atual ligado ao topo; CAS perdido tenta de novo.
-            let block = guest::alloc_bytes(0x30);
+            let block = guest::alloc_bytes(WaitBlock::SIZE);
             if block == 0 {
                 return Err(KernelError::new("RTL_RUN_ONCE wait block allocation failed"));
             }
-            for offset in (0..0x30).step_by(8) {
-                guest::write64(block + offset, 0);
-            }
-            guest::write64(block + 0x18, process::get_current_thread());
-            guest::write64(block, word & !3);
+            guest::write_bytes(block, &[0; size_of::<WaitBlock>()]);
+            let waiter = wait_block(block);
+            waiter.thread.set(process::get_current_thread());
+            waiter.next.set(word & !3);
             if exchange(self.pointer, word, block | 1)? {
                 self.wait_block = block;
                 return Ok(None);
@@ -135,7 +177,7 @@ pub fn complete(pointer: u64, flags: u32, context: u64) -> Result<u32, KernelErr
     }
     let updated = if flags == 4 { 0 } else { context | 2 };
     loop {
-        let previous = guest::read64(pointer);
+        let previous = run_once(pointer).ptr.get();
         let state = previous & 3;
         if state != 1 && state != 3 {
             return Ok(UNSUCCESSFUL);
@@ -154,13 +196,9 @@ pub fn complete(pointer: u64, flags: u32, context: u64) -> Result<u32, KernelErr
             let mut block = previous & !3;
             while block != 0 {
                 // Next é lido antes de liberar: o acordado pode liberar o bloco já.
-                let next = guest::read64(block);
-                loop {
-                    let current = guest::read32(block + 0x24);
-                    if guest::compare_exchange32(block + 0x24, current, current | 4)? == current {
-                        break;
-                    }
-                }
+                let waiter = wait_block(block);
+                let next = waiter.next.get();
+                waiter.flags.atomic().fetch_or(RELEASED, Ordering::Release);
                 block = next;
             }
         }
@@ -223,7 +261,9 @@ impl ExecutionRequest {
     /// contexto inválido vira erro, nunca conclusão.
     pub fn resume(&mut self, value: u64) -> Result<(), KernelError> {
         let succeeded = value & 0xFFFF_FFFF != 0;
-        let status = complete(self.pointer, if succeeded { 0 } else { 4 }, if succeeded && self.context != 0 { guest::read64(self.context) } else { 0 })?;
+        // SAFETY: PVOID* Context do chamador (contexto publicado pela inicialização).
+        let context = if succeeded && self.context != 0 { unsafe { Field::<u64>::at(self.context) }.get() } else { 0 };
+        let status = complete(self.pointer, if succeeded { 0 } else { 4 }, context)?;
         self.finish(if status != 0 { status } else if succeeded { 0 } else { UNSUCCESSFUL });
         if status != 0 {
             return Err(KernelError::with_status(alloc::format!("RtlRunOnceExecuteOnce invalid completion 0x{status:x}"), status));

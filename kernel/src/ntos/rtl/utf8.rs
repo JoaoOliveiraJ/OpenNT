@@ -3,8 +3,9 @@
 //! Sem terminador; zeros internos são dados; comprimentos em bytes. A ordem
 //! de consumo e os resultados parciais seguem as rotinas NT.
 
-use crate::rtl::KernelError;
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 const SOME_NOT_MAPPED: u32 = 0x107;
 const BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -91,7 +92,8 @@ pub fn utf8_to_unicode(destination: u64, capacity: u32, output_length: u64, sour
         }
     }
     if output_length != 0 {
-        guest::try_write32(output_length, written)?;
+        // PULONG do chamador: escrita sondada.
+        Field::<u32>::try_at(output_length)?.probe_set(written)?;
     }
     Ok(status)
 }
@@ -152,7 +154,8 @@ pub fn unicode_to_utf8(destination: u64, capacity: u32, output_length: u64, sour
     // Escrever o tamanho incondicionalmente com um ponteiro nulo aqui
     // gravaria no endereço físico zero, então só se escreve quando há saída.
     if output_length != 0 {
-        guest::try_write32(output_length, written)?;
+        // PULONG do chamador: escrita sondada.
+        Field::<u32>::try_at(output_length)?.probe_set(written)?;
     }
     Ok(status)
 }

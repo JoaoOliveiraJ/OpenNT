@@ -12,10 +12,40 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::native_context;
 use super::unwind;
 use crate::hal::amd64::win32_thunk;
-use crate::ntos::ke::irql;
-use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Context, DispatcherContext, ExceptionPointers, ExceptionRecord, NtStruct, ScopeTableAmd64, ScopeTableAmd64ScopeRecord};
 use crate::ntos::ke::bugcheck as ke;
+use crate::ntos::ke::irql;
+use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::{KernelError, SpinLock};
+
+/// EXCEPTION_NONCONTINUABLE.
+const NONCONTINUABLE: u32 = 1;
+/// STATUS_UNWIND.
+const STATUS_UNWIND: u32 = 0xC000_0027;
+
+// SAFETY (conversões deste arquivo): registros, CONTEXTs e DISPATCHER_CONTEXT
+// vivos e alinhados — do chamador, do despachante de hardware ou montados
+// pelo próprio despacho num bloco de trabalho alocado (layout do NT, pois
+// vão para handlers reais).
+fn record_at(record: u64) -> &'static ExceptionRecord {
+    unsafe { ExceptionRecord::at(record) }
+}
+fn context_at(context: u64) -> &'static Context {
+    unsafe { Context::at(context) }
+}
+fn dispatcher_at(dispatcher: u64) -> &'static DispatcherContext {
+    unsafe { DispatcherContext::at(dispatcher) }
+}
+
+/// EXCEPTION_RECORD não continuável montado pelo despacho, zerado antes.
+fn build_record(record: u64, status: u32, flags: u32, linked: u64, address: u64) {
+    guest::write_bytes(record, &[0; core::mem::size_of::<ExceptionRecord>()]);
+    let record = record_at(record);
+    record.exception_code.set(status as i32);
+    record.exception_flags.set(flags);
+    record.exception_record.set(linked);
+    record.exception_address.set(address);
+}
 
 const UNWINDING: u32 = 2;
 const EXIT_UNWIND: u32 = 4;
@@ -68,23 +98,35 @@ fn with_workspace<T>(length: u64, operation: impl FnOnce(u64) -> Result<T, Kerne
 
 /// Exceção não tratada: KMODE_EXCEPTION_NOT_HANDLED pelo KeBugCheckEx real.
 fn stop_for_unhandled_exception(record: u64, context: u64, message: &str) -> ! {
-    debug_print!("[kernel-seh] {} code=0x{:x} pc=0x{:x}", message, guest::read32(record), guest::read64(context + 0xF8));
-    ke::raise_bug_check(0x1E, guest::read32(record) as u64, guest::read64(record + 0x10), 0, 0)
+    let (exception, frame) = (record_at(record), context_at(context));
+    let code = exception.exception_code.get() as u32;
+    debug_print!("[kernel-seh] {} code=0x{:x} pc=0x{:x}", message, code, frame.rip.get());
+    ke::raise_bug_check(0x1E, code as u64, exception.exception_address.get(), 0, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_dispatcher_context(dispatcher: u64, ip: u64, base: u64, entry: u64, frame: u64, target: u64, context: u64, handler: u64, data: u64) {
-    for (offset, value) in [(0u64, ip), (8, base), (16, entry), (24, frame), (32, target), (40, context), (48, handler), (56, data), (64, 0), (72, 0)] {
-        guest::write64(dispatcher + offset, value);
-    }
+    let dispatcher = dispatcher_at(dispatcher);
+    dispatcher.control_pc.set(ip);
+    dispatcher.image_base.set(base);
+    dispatcher.function_entry.set(entry);
+    dispatcher.establisher_frame.set(frame);
+    dispatcher.target_ip.set(target);
+    dispatcher.context_record.set(context);
+    dispatcher.language_handler.set(handler);
+    dispatcher.handler_data.set(data);
+    dispatcher.history_table.set(0);
+    dispatcher.scope_index.set(0);
+    dispatcher.fill0.set(0);
 }
 
 /// Reconstrói o chamador por metadados ou retorno de folha; para no limite
 /// com frames sem tabelas e recusa pilha que não avança ou frame inválido.
 fn unwind_one_frame(walking: u64, frame_context: u64, dispatcher: u64, output: u64, handler_type: u32, target: u64) -> Result<Option<(u64, u64)>, KernelError> {
     native_context::copy(frame_context, walking, native_context::SIZE);
-    let ip = guest::read64(walking + 0xF8);
-    let sp = guest::read64(walking + 0x98);
+    let walking_context = context_at(walking);
+    let ip = walking_context.rip.get();
+    let sp = walking_context.rsp.get();
     if ip == 0 || ip == win32_thunk::kernel_thread_return() {
         return Ok(None);
     }
@@ -106,10 +148,10 @@ fn unwind_one_frame(walking: u64, frame_context: u64, dispatcher: u64, output: u
             data = guest::read64(output);
         }
     } else {
-        guest::write64(walking + 0xF8, guest::read64(sp));
-        guest::write64(walking + 0x98, sp + 8);
+        walking_context.rip.set(guest::read64(sp));
+        walking_context.rsp.set(sp + 8);
     }
-    let caller_sp = guest::read64(walking + 0x98);
+    let caller_sp = walking_context.rsp.get();
     if caller_sp <= sp || frame < sp || frame & 7 != 0 {
         return Err(KernelError::new("invalid kernel exception stack frame"));
     }
@@ -121,7 +163,7 @@ fn unwind_one_frame(walking: u64, frame_context: u64, dispatcher: u64, output: u
 /// disposição é um inteiro de 32 bits com sinal.
 fn invoke_handler(record: u64, frame: u64, original: u64, dispatcher: u64, frame_context: u64) -> Result<i32, KernelError> {
     HANDLER_INVOCATIONS.lock().push((record, dispatcher));
-    let result = native_context::call(guest::read64(dispatcher + 48), &[record, frame, original, dispatcher], frame_context);
+    let result = native_context::call(dispatcher_at(dispatcher).language_handler.get(), &[record, frame, original, dispatcher], frame_context);
     HANDLER_INVOCATIONS.lock().pop();
     result.map(|value| value as i32)
 }
@@ -135,7 +177,8 @@ fn unwind_to_target(request: UnwindRequest, source: u64, exception_context: u64,
         let dispatcher = workspace + 0xA00;
         let output = workspace + 0xA80;
         native_context::copy(walking, source, native_context::SIZE);
-        let saved_flags = guest::read32(request.record + 4);
+        let record = record_at(request.record);
+        let saved_flags = record.exception_flags.get();
         let result = (|| -> Result<u64, KernelError> {
             for _ in 0..1024 {
                 let Some((frame, handler)) = unwind_one_frame(walking, frame_context, dispatcher, output, 2, request.ip)? else { break };
@@ -143,7 +186,7 @@ fn unwind_to_target(request: UnwindRequest, source: u64, exception_context: u64,
                     return Err(KernelError::new("kernel unwind target not on stack"));
                 }
                 let is_target = frame == request.frame;
-                guest::write32(request.record + 4, saved_flags | UNWINDING | if request.frame == 0 { EXIT_UNWIND } else { 0 } | if is_target { TARGET_UNWIND } else { 0 });
+                record.exception_flags.set(saved_flags | UNWINDING | if request.frame == 0 { EXIT_UNWIND } else { 0 } | if is_target { TARGET_UNWIND } else { 0 });
                 if handler != 0 {
                     let disposition = invoke_handler(request.record, frame, exception_context, dispatcher, frame_context)?;
                     if disposition != 1 {
@@ -152,9 +195,10 @@ fn unwind_to_target(request: UnwindRequest, source: u64, exception_context: u64,
                 }
                 // O alvo conserva seus registradores; RSP, RIP e RAX vêm do pedido.
                 if is_target {
-                    guest::write64(frame_context + 0x98, frame);
-                    guest::write64(frame_context + 0xF8, request.ip);
-                    guest::write64(frame_context + 0x78, request.value);
+                    let target = context_at(frame_context);
+                    target.rsp.set(frame);
+                    target.rip.set(request.ip);
+                    target.rax.set(request.value);
                     if output_context != 0 {
                         native_context::copy(output_context, frame_context, native_context::SIZE);
                     }
@@ -163,7 +207,7 @@ fn unwind_to_target(request: UnwindRequest, source: u64, exception_context: u64,
             }
             stop_for_unhandled_exception(request.record, source, "unwind target unavailable")
         })();
-        guest::write32(request.record + 4, saved_flags);
+        record.exception_flags.set(saved_flags);
         result
     })
 }
@@ -191,7 +235,7 @@ fn search_exception_handlers(record: u64, context: u64, maximum_irql: u8) -> Res
             };
             if disposition == 0 {
                 // Continuar uma exceção não continuável cria uma nova encadeada.
-                if guest::read32(record + 4) & 1 != 0 {
+                if record_at(record).exception_flags.get() & NONCONTINUABLE != 0 {
                     return raise_status(0xC000_0025, record, context, maximum_irql);
                 }
                 return Err(native_context::transfer(context));
@@ -228,13 +272,7 @@ fn raise_status_core(status: u32, linked: u64, source: u64, maximum_irql: u8) ->
         let context = workspace + 0x100;
         let source = if source != 0 { source } else { native_context::current()? };
         native_context::copy(context, source, native_context::SIZE);
-        for offset in (0..0x98).step_by(8) {
-            guest::write64(workspace + offset, 0);
-        }
-        guest::write32(workspace, status);
-        guest::write32(workspace + 4, 1);
-        guest::write64(workspace + 8, linked);
-        guest::write64(workspace + 0x10, guest::read64(context + 0xF8));
+        build_record(workspace, status, NONCONTINUABLE, linked, context_at(context).rip.get());
         if irql::get_irql() > maximum_irql {
             stop_for_unhandled_exception(workspace, context, "software exception at invalid IRQL");
         }
@@ -256,7 +294,7 @@ fn raise_status_core(status: u32, linked: u64, source: u64, maximum_irql: u8) ->
 
 /// RtlUnwindEx (a tabela de histórico não é usada).
 pub fn unwind_ex(frame: u64, target: u64, record: u64, value: u64, context: u64, _history: u64) -> Result<u64, KernelError> {
-    run_nonreturning_operation(|| unwind_ex_core(frame, target, record, value, context), 0xC000_0027)
+    run_nonreturning_operation(|| unwind_ex_core(frame, target, record, value, context), STATUS_UNWIND)
 }
 
 /// De dentro do handler corrente o pedido sobe ao despachante; fora dele o
@@ -273,11 +311,7 @@ fn unwind_ex_core(frame: u64, target: u64, record: u64, value: u64, context: u64
             native_context::copy(context, source, native_context::SIZE);
         }
         if record == 0 {
-            for offset in (0..0x98).step_by(8) {
-                guest::write64(workspace + offset, 0);
-            }
-            guest::write32(workspace, 0xC000_0027);
-            guest::write64(workspace + 0x10, guest::read64(source + 0xF8));
+            build_record(workspace, STATUS_UNWIND, 0, 0, context_at(source).rip.get());
             request.record = workspace;
         }
         unwind_to_target(request, source, source, context)
@@ -287,23 +321,24 @@ fn unwind_ex_core(frame: u64, target: u64, record: u64, value: u64, context: u64
 /// __C_specific_handler: a tabela de escopos escolhe filtros ou
 /// finalizadores pelo RIP, flags e destino.
 pub fn specific_handler(record: u64, frame: u64, context: u64, dispatcher: u64) -> Result<u64, KernelError> {
-    let image_base = guest::read64(dispatcher + 8);
-    let scope_table = guest::read64(dispatcher + 56);
-    let instruction = guest::read64(dispatcher).wrapping_sub(image_base);
-    let target = guest::read64(dispatcher + 32).wrapping_sub(image_base);
-    let count = guest::read32(scope_table);
-    let flags = guest::read32(record + 4);
+    let dispatcher_context = dispatcher_at(dispatcher);
+    let image_base = dispatcher_context.image_base.get();
+    // HandlerData do __C_specific_handler: a SCOPE_TABLE da imagem.
+    // SAFETY: dados do handler na .xdata da imagem, alinhados a DWORD.
+    let scope_table = unsafe { ScopeTableAmd64::at(dispatcher_context.handler_data.get()) };
+    let instruction = dispatcher_context.control_pc.get().wrapping_sub(image_base);
+    let target = dispatcher_context.target_ip.get().wrapping_sub(image_base);
+    let count = scope_table.count.get();
+    let flags = record_at(record).exception_flags.get();
     if count > 0x10_0000 {
         return Err(KernelError::new("invalid kernel scope count"));
     }
-    // Registros de 16 bytes: início, fim, handler e salto (RVAs).
-    let scopes: Vec<(u64, u64, u32, u32)> = (0..count as u64)
-        .map(|index| {
-            let at = scope_table + 4 + index * 16;
-            (guest::read32(at) as u64, guest::read32(at + 4) as u64, guest::read32(at + 8), guest::read32(at + 12))
-        })
-        .collect();
-    let mut index = guest::read32(dispatcher + 72) as usize;
+    // ScopeRecord[Count]: início, fim, handler e salto (RVAs).
+    // SAFETY: Count registros seguem o contador na mesma tabela.
+    let records = unsafe { ScopeTableAmd64ScopeRecord::array_at(scope_table.scope_record[0].address(), count as usize) };
+    let scopes: Vec<(u64, u64, u32, u32)> =
+        records.iter().map(|scope| (scope.begin_address.get() as u64, scope.end_address.get() as u64, scope.handler_address.get(), scope.jump_target.get())).collect();
+    let mut index = dispatcher_context.scope_index.get() as usize;
     while index < count as usize {
         let (begin, end, handler, jump) = scopes[index];
         if instruction < begin || instruction >= end {
@@ -320,8 +355,8 @@ pub fn specific_handler(record: u64, frame: u64, context: u64, dispatcher: u64) 
             }
             if jump == 0 {
                 // O próximo ScopeIndex é publicado antes do finalizador (reentrada).
-                guest::write32(dispatcher + 72, index as u32 + 1);
-                native_context::call(image_base + handler as u64, &[1, frame], guest::read64(dispatcher + 40))?;
+                dispatcher_context.scope_index.set(index as u32 + 1);
+                native_context::call(image_base + handler as u64, &[1, frame], dispatcher_context.context_record.get())?;
             }
         } else if jump != 0 {
             // Filtro: negativo continua a execução, zero continua a busca,
@@ -329,17 +364,19 @@ pub fn specific_handler(record: u64, frame: u64, context: u64, dispatcher: u64) 
             let filter = if handler == 1 {
                 1
             } else {
-                with_workspace(16, |pointers| {
-                    guest::write64(pointers, record);
-                    guest::write64(pointers + 8, context);
-                    Ok(native_context::call(image_base + handler as u64, &[pointers, frame], guest::read64(dispatcher + 40))? as i32)
+                with_workspace(ExceptionPointers::SIZE, |pointers| {
+                    // SAFETY: EXCEPTION_POINTERS no bloco de trabalho recém-alocado.
+                    let exception_pointers = unsafe { ExceptionPointers::at(pointers) };
+                    exception_pointers.exception_record.set(record);
+                    exception_pointers.context_record.set(context);
+                    Ok(native_context::call(image_base + handler as u64, &[pointers, frame], dispatcher_context.context_record.get())? as i32)
                 })?
             };
             if filter < 0 {
                 return Ok(0);
             }
             if filter > 0 {
-                return Err(unwind_signal(UnwindRequest { frame, ip: image_base + jump as u64, record, value: guest::read32(record) as i32 as i64 as u64 }));
+                return Err(unwind_signal(UnwindRequest { frame, ip: image_base + jump as u64, record, value: record_at(record).exception_code.get() as i64 as u64 }));
             }
         }
         index += 1;
@@ -359,6 +396,6 @@ pub fn dispatch_exception(record: u64, context: u64) -> Result<u64, KernelError>
             NESTING.fetch_sub(1, Ordering::AcqRel);
             result
         },
-        guest::read32(record),
+        record_at(record).exception_code.get() as u32,
     )
 }

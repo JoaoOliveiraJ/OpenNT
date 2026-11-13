@@ -12,8 +12,31 @@ use crate::ntos::mm::section::{create as create_section, map_system_view, handle
 use crate::ntos::ob::close;
 use crate::ntos::ps::user::sections::{self, View};
 use crate::rtl::{KernelError, SpinLock};
+use crate::ntos::inc::types::{Field, ImageOptionalHeader64, IoStatusBlock, NtStruct, ObjectAttributes, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::io::file::zw as zw_files;
+
+/// Parâmetros do ZwCreateFile/ZwCreateSection montados num bloco alocado
+/// (layout do OpenNT; as estruturas do NT dentro dele são as reais). O nome
+/// do arquivo segue o bloco.
+#[repr(C)]
+struct OpenParameters {
+    file_attributes: ObjectAttributes,
+    file_name: UnicodeString,
+    file_handle: Field<u64>,
+    section_handle: Field<u64>,
+    io_status: IoStatusBlock,
+    section_attributes: ObjectAttributes,
+    _reserved_90: [Field<u64>; 2],
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for OpenParameters {}
+
+const _: () = assert!(core::mem::size_of::<OpenParameters>() == 0xA0);
+
+/// OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE.
+const OPEN_ATTRIBUTES: u32 = 0x240;
 
 /// Handles e vista retidos por um arquivo publicado.
 pub struct Owner {
@@ -90,42 +113,41 @@ pub fn drain_releases() -> Result<(), KernelError> {
 pub fn open(path: &str, primary: &Image) -> Result<Result<Opened, u32>, KernelError> {
     drain_releases()?;
     let units: Vec<u16> = path.encode_utf16().collect();
-    let scratch = guest::alloc_bytes(160 + (units.len() as u64 + 1) * 2);
+    let scratch = guest::alloc_bytes(OpenParameters::SIZE + (units.len() as u64 + 1) * 2);
     if scratch == 0 {
         return Ok(Err(0xC000_009A));
     }
+    let name_buffer = scratch + OpenParameters::SIZE;
     let owner = Arc::new(Owner { state: SpinLock::new(OwnerState::default()) });
     let mut published = false;
     let result = (|| -> Result<Result<Opened, u32>, KernelError> {
         // OBJECT_ATTRIBUTES/UNICODE_STRING com os tamanhos AMD64 reais.
-        for offset in (0..160).step_by(8) {
-            guest::write64(scratch + offset, 0);
-        }
-        guest::write32(scratch, 48);
-        guest::write64(scratch + 16, scratch + 48);
-        guest::write32(scratch + 24, 0x240);
-        guest::write16(scratch + 48, units.len() as u16 * 2);
-        guest::write16(scratch + 50, (units.len() as u16 + 1) * 2);
-        guest::write64(scratch + 56, scratch + 160);
-        for (index, unit) in units.iter().chain(core::iter::once(&0)).enumerate() {
-            guest::write16(scratch + 160 + index as u64 * 2, *unit);
-        }
-        let status = zw_files::create_kernel_file(scratch + 64, 0x8000_0000, scratch, scratch + 80, 5, 1, 0)?;
+        guest::write_bytes(scratch, &[0; core::mem::size_of::<OpenParameters>()]);
+        // SAFETY: bloco recém-alocado e zerado acima.
+        let parameters = unsafe { OpenParameters::at(scratch) };
+        parameters.file_attributes.length.set(ObjectAttributes::SIZE as u32);
+        parameters.file_attributes.object_name.set(parameters.file_name.address());
+        parameters.file_attributes.attributes.set(OPEN_ATTRIBUTES);
+        parameters.file_name.length.set(units.len() as u16 * 2);
+        parameters.file_name.maximum_length.set((units.len() as u16 + 1) * 2);
+        parameters.file_name.buffer.set(name_buffer);
+        guest::write_bytes(name_buffer, &crate::ntos::rtl::guest_strings::wide_bytes_with_nul(path));
+        let status = zw_files::create_kernel_file(parameters.file_handle.address(), 0x8000_0000, parameters.file_attributes.address(), parameters.io_status.address(), 5, 1, 0)?;
         if status != 0 {
             return Ok(Err(status));
         }
-        owner.state.lock().file_handle = guest::read64(scratch + 64);
-        guest::write32(scratch + 96, 48);
-        guest::write32(scratch + 120, 0x240);
+        owner.state.lock().file_handle = parameters.file_handle.get();
+        parameters.section_attributes.length.set(ObjectAttributes::SIZE as u32);
+        parameters.section_attributes.attributes.set(OPEN_ATTRIBUTES);
         // WRITECOPY para imagens anteriores à versão 6 do subsistema, senão
         // READONLY; nenhum desses mapeamentos executa o arquivo.
-        let subsystem_version = guest::read16(primary.base.wrapping_add(primary.optional_header as u64 + 48));
+        let subsystem_version = guest::read::<u16>(primary.base.wrapping_add(primary.optional_header as u64 + core::mem::offset_of!(ImageOptionalHeader64, major_subsystem_version) as u64));
         let file_handle = owner.state.lock().file_handle;
-        let status = create_section::create(scratch + 72, 0xF_0005, scratch + 96, 0, if subsystem_version < 6 { 8 } else { 2 }, 0x0800_0000, file_handle, 0, None)?;
+        let status = create_section::create(parameters.section_handle.address(), 0xF_0005, parameters.section_attributes.address(), 0, if subsystem_version < 6 { 8 } else { 2 }, 0x0800_0000, file_handle, 0, None)?;
         if status != 0 {
             return Ok(Err(status));
         }
-        let section_handle = guest::read64(scratch + 72);
+        let section_handle = parameters.section_handle.get();
         owner.state.lock().section_handle = section_handle;
         let reference = section_handles::reference(section_handle, section_handles::Kind::Section, 0, 0).map_err(|_| KernelError::new("created resource SECTION has no owner"))?;
         let section = reference.section.clone();

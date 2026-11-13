@@ -4,15 +4,27 @@
 //! bits de balanço em +16. O chamador fornece nós, ordenação e sincronização;
 //! este módulo não aloca nem copia dados.
 
+use crate::ntos::inc::types::{NtStruct, RtlAvlTree, RtlBalancedNode};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+
+/// PRTL_BALANCED_NODE do chamador.
+fn node_at(node: u64) -> &'static RtlBalancedNode {
+    // SAFETY: nó vivo e alinhado fornecido pelo chamador (o módulo não aloca).
+    unsafe { RtlBalancedNode::at(node) }
+}
+
+/// PRTL_AVL_TREE do chamador.
+fn tree_at(tree: u64) -> &'static RtlAvlTree {
+    // SAFETY: idem `node_at`.
+    unsafe { RtlAvlTree::at(tree) }
+}
 
 fn child(node: u64, side: u64) -> u64 {
-    guest::read64(node + side * 8)
+    node_at(node).children[side as usize].get()
 }
 
 fn parent_and_balance(node: u64) -> u64 {
-    guest::read64(node + 16)
+    node_at(node).parent_value.get()
 }
 
 fn parent(node: u64) -> u64 {
@@ -29,17 +41,17 @@ fn balance(node: u64) -> Result<i64, KernelError> {
 }
 
 fn set_balance(node: u64, factor: i64) {
-    guest::write64(node + 16, parent(node) | (factor as u64 & 3));
+    node_at(node).parent_value.set(parent(node) | (factor as u64 & 3));
 }
 
 fn set_parent(node: u64, linked: u64) {
     if node != 0 {
-        guest::write64(node + 16, (parent_and_balance(node) & 3) | linked);
+        node_at(node).parent_value.set((parent_and_balance(node) & 3) | linked);
     }
 }
 
 fn set_child(node: u64, side: u64, linked: u64) {
-    guest::write64(node + side * 8, linked);
+    node_at(node).children[side as usize].set(linked);
     set_parent(linked, node);
 }
 
@@ -57,12 +69,12 @@ fn child_side(node: u64, linked: u64) -> Result<u64, KernelError> {
 fn replace_node(tree: u64, node: u64, replacement: u64) -> Result<(), KernelError> {
     let parent_address = parent(node);
     if parent_address != 0 {
-        guest::write64(parent_address + child_side(parent_address, node)? * 8, replacement);
+        node_at(parent_address).children[child_side(parent_address, node)? as usize].set(replacement);
     } else {
-        if guest::read64(tree) != node {
+        if tree_at(tree).root.get() != node {
             return Err(KernelError::new("corrupt RTL_AVL_TREE root"));
         }
-        guest::write64(tree, replacement);
+        tree_at(tree).root.set(replacement);
     }
     set_parent(replacement, parent_address);
     Ok(())
@@ -106,15 +118,17 @@ fn rebalance(tree: u64, node: u64, factor: i64) -> Result<(u64, bool), KernelErr
 /// RtlAvlInsertNodeEx: exige alinhamento e posição vazia.
 pub fn insert(tree: u64, parent_node: u64, insert_on_right: u64, node: u64) -> Result<u32, KernelError> {
     let right = insert_on_right & 255;
-    let occupied = if parent_node != 0 { right <= 1 && child(parent_node, right) != 0 } else { guest::read64(tree) != 0 };
-    if node == 0 || node & 3 != 0 || parent_node & 3 != 0 || right > 1 || occupied {
+    let misplaced = node == 0 || node & 3 != 0 || parent_node & 3 != 0 || right > 1;
+    // A posição só é lida com ponteiros alinhados.
+    if misplaced || if parent_node != 0 { child(parent_node, right) != 0 } else { tree_at(tree).root.get() != 0 } {
         return Err(KernelError::new("invalid RTL_AVL_TREE insertion position"));
     }
-    guest::write64(node, 0);
-    guest::write64(node + 8, 0);
-    guest::write64(node + 16, parent_node);
+    let inserted = node_at(node);
+    inserted.left.set(0);
+    inserted.right.set(0);
+    inserted.parent_value.set(parent_node);
     if parent_node == 0 {
-        guest::write64(tree, node);
+        tree_at(tree).root.set(node);
         return Ok(0);
     }
     set_child(parent_node, right, node);

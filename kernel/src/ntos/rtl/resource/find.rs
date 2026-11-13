@@ -10,6 +10,7 @@ use crate::ntos::rtl::resource::search::{self as resource_search, Context};
 use crate::ntos::io::small::boot_drivers_state;
 use crate::ntos::mm::{loaded_images, query_virtual};
 use crate::rtl::KernelError;
+use crate::ntos::inc::types::{MemoryRegionInformation, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Extensão da alocação: a imagem carregada ou a região da VAD
@@ -18,12 +19,13 @@ fn allocation_size(base: u64) -> Result<Result<u64, u32>, KernelError> {
     if let Some(image) = loaded_images::find(base) {
         return Ok(Ok(image.size_of_image));
     }
-    let buffer = guest::alloc_bytes(48);
+    let buffer = guest::alloc_bytes(MemoryRegionInformation::SIZE);
     if buffer == 0 {
         return Ok(Err(0xC000_009A));
     }
-    let status = query_virtual::query(u64::MAX, base, 3, buffer, 48, 0);
-    let result = status.map(|status| if status != 0 { Err(status) } else { Ok(guest::read64(buffer + 16)) });
+    let status = query_virtual::query(u64::MAX, base, 3, buffer, MemoryRegionInformation::SIZE, 0);
+    // SAFETY: MEMORY_REGION_INFORMATION recém-preenchido no bloco alocado acima.
+    let result = status.map(|status| if status != 0 { Err(status) } else { Ok(unsafe { MemoryRegionInformation::at(buffer) }.region_size.get()) });
     guest::free_bytes(buffer);
     result
 }

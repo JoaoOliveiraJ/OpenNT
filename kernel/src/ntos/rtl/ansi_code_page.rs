@@ -9,9 +9,10 @@ use alloc::vec::Vec;
 
 use super::nls_configuration;
 use crate::ntos::ex::pool_allocation;
+use crate::ntos::inc::types::{NtStruct, String as AnsiString, UnicodeString};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
 
 const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
@@ -67,11 +68,12 @@ impl CodePage {
         if !self.double_byte {
             return length * 2;
         }
+        let text = guest::read_bytes(source, length as usize);
         let (mut offset, mut count) = (0, 0);
-        while offset < length {
-            let first = guest::read8(source + offset);
+        while offset < text.len() {
+            let first = text[offset];
             offset += 1;
-            if self.leading[first as usize] != 0 && offset < length {
+            if self.leading[first as usize] != 0 && offset < text.len() {
                 offset += 1;
             }
             count += 1;
@@ -81,24 +83,28 @@ impl CodePage {
 
     /// String contada (NUL interno é dado); inicial DBCS isolado gera WCHAR zero.
     pub fn write_unicode(&self, source: u64, length: u64, destination: u64, capacity: u64) -> Result<u64, KernelError> {
-        let (mut offset, mut written) = (0, 0);
-        while offset < length && written + 2 <= capacity {
-            let first = guest::read8(source + offset) as usize;
+        // A origem contada só é lida até onde a saída alcança (2 bytes por
+        // WCHAR no pior caso de DBCS).
+        let text = guest::read_bytes(source, length.min(capacity) as usize);
+        let mut output = alloc::vec::Vec::new();
+        let mut offset = 0;
+        while offset < text.len() && output.len() as u64 + 2 <= capacity {
+            let first = text[offset] as usize;
             offset += 1;
             let leading = self.leading[first];
             let mut character = self.single[first];
             if leading != 0 {
                 character = 0;
-                if offset < length {
-                    let second = guest::read8(source + offset) as usize;
+                if offset < text.len() {
+                    let second = text[offset] as usize;
                     offset += 1;
                     character = word(&self.table, self.double_byte_offset + (leading as usize + second) * 2)?;
                 }
             }
-            guest::write16(destination + written, character);
-            written += 2;
+            output.extend_from_slice(&character.to_le_bytes());
         }
-        Ok(written)
+        guest::write_bytes(destination, &output);
+        Ok(output.len() as u64)
     }
 }
 
@@ -121,8 +127,10 @@ pub fn current() -> Result<Arc<CodePage>, KernelError> {
 
 /// RtlAnsiStringToUnicodeString pela página instalada.
 pub fn ansi_to_unicode(destination: u64, source: u64, allocate: bool) -> Result<u32, KernelError> {
-    let length = guest::read16(source) as u64;
-    let buffer = guest::read64(source + 8);
+    // SAFETY: PUNICODE_STRING e PCANSI_STRING do chamador.
+    let (destination, source) = unsafe { (UnicodeString::at(destination), AnsiString::at(source)) };
+    let length = source.length.get() as u64;
+    let buffer = source.buffer.get();
     let code_page = current()?;
     let bytes = code_page.unicode_byte_length(buffer, length);
     let required = bytes + 2;
@@ -131,30 +139,30 @@ pub fn ansi_to_unicode(destination: u64, source: u64, allocate: bool) -> Result<
     if required > 0xFFFE {
         return Ok(STATUS_INVALID_PARAMETER_2);
     }
-    guest::write16(destination, bytes as u16);
+    destination.length.set(bytes as u16);
     if allocate {
         // Buffer e MaximumLength publicados mesmo se a alocação falhar.
-        guest::write16(destination + 2, required as u16);
+        destination.maximum_length.set(required as u16);
         let allocated = pool_allocation::allocate_tagged(1, required, STRING_POOL_TAG).unwrap_or(0);
-        guest::write64(destination + 8, allocated);
+        destination.buffer.set(allocated);
         if allocated == 0 {
             return Ok(STATUS_NO_MEMORY);
         }
-    } else if required > guest::read16(destination + 2) as u64 {
+    } else if required > destination.maximum_length.get() as u64 {
         return Ok(STATUS_BUFFER_OVERFLOW);
     }
     // Relê os descritores depois das escritas, como o código original.
-    let written = code_page.write_unicode(guest::read64(source + 8), guest::read16(source) as u64, guest::read64(destination + 8), guest::read16(destination) as u64);
+    let written = code_page.write_unicode(source.buffer.get(), source.length.get() as u64, destination.buffer.get(), destination.length.get() as u64);
     match written {
         Ok(written) => {
-            guest::write16(guest::read64(destination + 8) + written, 0);
+            guest::write_bytes(destination.buffer.get() + written, &[0, 0]);
             Ok(0)
         }
         Err(error) => {
             // O __finally original libera a alocação e limpa o Buffer.
             if allocate {
-                let _ = kernel_pool::free(guest::read64(destination + 8), None);
-                guest::write64(destination + 8, 0);
+                let _ = kernel_pool::free(destination.buffer.get(), None);
+                destination.buffer.set(0);
             }
             Err(error)
         }

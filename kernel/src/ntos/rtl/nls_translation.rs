@@ -6,29 +6,36 @@
 //! byte → WCHAR); RtlAnsiCharToUnicodeChar passa o intervalo alto pela página
 //! ANSI instalada, com identidade se o NLS não estiver disponível.
 
+use crate::ntos::inc::types::{Field, NtStruct, String as AnsiString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
+
+/// Parâmetro de saída escalar do chamador (PULONG, PUCHAR*...).
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro do chamador, vivo e alinhado.
+    unsafe { Field::<T>::at(address) }
+}
 
 /// RtlUnicodeStringToAnsiString: byte baixo de cada unidade; aloca quando
 /// pedido ou sem buffer de destino.
 pub fn unicode_string_to_ansi_string(ansi: u64, unicode: u64, allocate: bool) -> Result<(), KernelError> {
     let units = guest_strings::try_read_unicode_units(unicode)?;
-    let mut buffer = guest::read64(ansi + 8);
+    // SAFETY: PANSI_STRING DestinationString do chamador.
+    let mut buffer = unsafe { AnsiString::at(ansi) }.buffer.get();
     if allocate || buffer == 0 {
         buffer = guest::alloc_bytes(units.len() as u64 + 1);
     }
-    for (index, unit) in units.iter().enumerate() {
-        guest::write8(buffer + index as u64, *unit as u8);
-    }
-    guest::write8(buffer + units.len() as u64, 0);
+    let bytes: alloc::vec::Vec<u8> = units.iter().map(|&unit| unit as u8).chain(core::iter::once(0)).collect();
+    guest::write_bytes(buffer, &bytes);
     guest_strings::write_string_fields(ansi, units.len() as u16, units.len() as u16 + 1, buffer);
     Ok(())
 }
 
 /// RtlxAnsiStringToUnicodeSize: bytes da UNICODE_STRING com terminador.
 pub fn ansi_string_to_unicode_size(ansi: u64) -> u64 {
-    (guest::read16(ansi) as u64 + 1) * 2
+    // SAFETY: PCANSI_STRING do chamador.
+    (unsafe { AnsiString::at(ansi) }.length.get() as u64 + 1) * 2
 }
 
 /// RtlMultiByteToUnicodeN: byte → WCHAR até caber em `maximum_bytes`; o
@@ -36,22 +43,21 @@ pub fn ansi_string_to_unicode_size(ansi: u64) -> u64 {
 pub fn multi_byte_to_unicode_n(destination: u64, maximum_bytes: u32, needed: u64, source: u64, length: u32) {
     let (maximum, length) = (maximum_bytes as u64, length as u64);
     let capacity = maximum / 2;
-    let mut written = 0;
-    while written < length && written < capacity {
-        guest::write16(destination + written * 2, guest::read8(source + written) as u16);
-        written += 1;
-    }
+    let written = length.min(capacity);
+    let units: alloc::vec::Vec<u8> = guest::read_bytes(source, written as usize).into_iter().flat_map(|byte| (byte as u16).to_le_bytes()).collect();
+    guest::write_bytes(destination, &units);
     if needed != 0 {
-        guest::write32(needed, (length * 2) as u32);
+        out::<u32>(needed).set((length * 2) as u32);
     }
 }
 
 /// RtlAnsiCharToUnicodeChar(PUCHAR* SourcePtr): traduz um char ANSI pela
 /// página de código instalada e avança *SourcePtr (SBCS = 1 byte).
 pub fn ansi_char_to_unicode_char(pointer_field: u64) -> u16 {
-    let source = guest::read64(pointer_field);
+    let cursor = out::<u64>(pointer_field);
+    let source = cursor.get();
     let byte = guest::read8(source);
-    guest::write64(pointer_field, source + 1);
+    cursor.set(source + 1);
     // ASCII é identidade; o intervalo alto passa pela página instalada,
     // com recuo para identidade se o NLS não estiver disponível.
     if byte < 0x80 {
@@ -81,12 +87,14 @@ pub fn unicode_to_multi_byte_n(output: u64, maximum: u32, written: u64, source: 
     if !code_page.double_byte {
         let count = maximum.min(units);
         if written != 0 {
-            guest::write32(written, count);
+            out::<u32>(written).set(count);
         }
-        for index in 0..count as u64 {
-            let code = code_page.unicode_to_multi_byte(guest::read16(source + index * 2))?;
-            guest::write8(output + index, code as u8);
+        let text = guest::read_bytes(source, count as usize * 2);
+        let mut bytes = alloc::vec::Vec::with_capacity(count as usize);
+        for pair in text.chunks_exact(2) {
+            bytes.push(code_page.unicode_to_multi_byte(u16::from_le_bytes([pair[0], pair[1]]))? as u8);
         }
+        guest::write_bytes(output, &bytes);
         return Ok(0);
     }
     let (mut cursor, mut remaining, mut left, mut unit_pointer) = (output, maximum, units, source);
@@ -109,7 +117,7 @@ pub fn unicode_to_multi_byte_n(output: u64, maximum: u32, written: u64, source: 
         left -= 1;
     }
     if written != 0 {
-        guest::write32(written, (cursor - output) as u32);
+        out::<u32>(written).set((cursor - output) as u32);
     }
     Ok(0)
 }
@@ -127,7 +135,7 @@ pub fn unicode_to_multi_byte_size(output: u64, source: u64, source_bytes: u32) -
             size += if code >> 8 != 0 { 2 } else { 1 };
         }
     }
-    guest::write32(output, size);
+    out::<u32>(output).set(size);
     Ok(0)
 }
 

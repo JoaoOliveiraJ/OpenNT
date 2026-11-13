@@ -7,6 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{Field, NtStruct, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::{guest_strings, unicode};
 
@@ -48,7 +49,8 @@ pub fn unicode_string_to_integer(string: u64, base: u32, value_out: u64) -> u32 
     }
     let parsed = u64::from_str_radix(&digits, base).unwrap_or(u64::MAX);
     let value = if negative { (parsed as i64).wrapping_neg() as u64 } else { parsed } as u32;
-    guest::write32(value_out, value);
+    // SAFETY: PULONG Value do chamador.
+    unsafe { Field::<u32>::at(value_out) }.set(value);
     0
 }
 
@@ -92,16 +94,14 @@ fn format_radix64(mut value: u64, base: u32) -> String {
 /// Grava um texto numa UNICODE_STRING de destino (buffer já alocado),
 /// terminada em NUL; BUFFER_OVERFLOW se não couber.
 fn store_counted_unicode(destination: u64, text: &str) -> u32 {
+    // SAFETY: PUNICODE_STRING do chamador.
+    let destination = unsafe { UnicodeString::at(destination) };
     let units: Vec<u16> = text.encode_utf16().collect();
-    if (units.len() + 1) * 2 > guest::read16(destination + 2) as usize {
+    if (units.len() + 1) * 2 > destination.maximum_length.get() as usize {
         return STATUS_BUFFER_OVERFLOW;
     }
-    let buffer = guest::read64(destination + 8);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    guest::write16(buffer + units.len() as u64 * 2, 0);
-    guest::write16(destination, (units.len() * 2) as u16);
+    guest::write_bytes(destination.buffer.get(), &guest_strings::wide_bytes_with_nul(text));
+    destination.length.set((units.len() * 2) as u16);
     0
 }
 
@@ -198,7 +198,8 @@ pub fn char_to_integer(string: u64, base: u32, value: u64) -> u32 {
         character = guest::read8(cursor);
         cursor += 1;
     }
-    guest::write32(value, if sign == b'-' { result.wrapping_neg() } else { result });
+    // SAFETY: PULONG Value do chamador.
+    unsafe { Field::<u32>::at(value) }.set(if sign == b'-' { result.wrapping_neg() } else { result });
     0
 }
 
@@ -228,9 +229,8 @@ pub fn integer_to_unicode(value: u32, base: u32, length: i32, output: u64) -> u3
     if length < 0 {
         limit = length.wrapping_neg();
         if count < limit {
-            for index in 0..(limit - count) as u64 {
-                guest::write16(output + index * 2, b'0' as u16);
-            }
+            let zeros: Vec<u8> = core::iter::repeat_n(b'0' as u16, (limit - count) as usize).flat_map(u16::to_le_bytes).collect();
+            guest::write_bytes(output, &zeros);
             output += (limit - count) as u64 * 2;
             limit = count;
         }
@@ -238,11 +238,8 @@ pub fn integer_to_unicode(value: u32, base: u32, length: i32, output: u64) -> u3
     if count > limit {
         return STATUS_BUFFER_OVERFLOW;
     }
-    for (index, digit) in text.bytes().enumerate() {
-        guest::write16(output + index as u64 * 2, digit as u16);
-    }
-    if count < limit {
-        guest::write16(output + count as u64 * 2, 0);
-    }
+    let terminator = (count < limit).then_some(0u16);
+    let digits: Vec<u8> = text.bytes().map(u16::from).chain(terminator).flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(output, &digits);
     0
 }

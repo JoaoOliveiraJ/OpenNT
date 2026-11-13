@@ -46,12 +46,11 @@ pub fn snprintf_s(buffer: u64, size: u32, count: i32, format: u64, arguments: &[
     let limit = if count < 0 { capacity - 1 } else { (count as i64).min(capacity - 1) };
     let bytes = text.as_bytes();
     let writable = (bytes.len() as i64).min(limit).max(0);
-    for index in 0..writable {
-        guest::write8(buffer + index as u64, bytes[index as usize]);
-    }
+    let mut output = bytes[..writable as usize].to_vec();
     if capacity > 0 {
-        guest::write8(buffer + writable as u64, 0);
+        output.push(0);
     }
+    guest::write_bytes(buffer, &output);
     Ok(if writable < bytes.len() as i64 && count >= 0 { (-1i64) as u64 } else { writable as u64 })
 }
 
@@ -74,12 +73,9 @@ pub fn snwprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Res
 fn write_wide_bounded(buffer: u64, capacity: u64, text: &str) -> u64 {
     let units: Vec<u16> = text.encode_utf16().collect();
     let writable = (units.len() as i64).min(capacity as i64 - 1).max(0) as usize;
-    for (index, unit) in units.iter().take(writable).enumerate() {
-        guest::write16(buffer + index as u64 * 2, *unit);
-    }
-    if capacity > 0 {
-        guest::write16(buffer + writable as u64 * 2, 0);
-    }
+    let terminator = (capacity > 0).then_some(0u16);
+    let output: Vec<u8> = units[..writable].iter().copied().chain(terminator).flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(buffer, &output);
     if writable < units.len() {
         (-1i64) as u64
     } else {

@@ -10,6 +10,7 @@ use alloc::string::String;
 use crate::hal::amd64::native_call;
 use crate::ntos::cm::key::services as key_services;
 use crate::ntos::cm::registry as cm_registry;
+use crate::ntos::inc::types::{NtStruct, RtlQueryRegistryTable, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
@@ -61,17 +62,19 @@ pub fn query_registry_values(_relative_to: u32, path: u64, table: u64, context: 
     let mut cursor = table;
     let mut status = 0u64;
     for index in 0..=64 {
-        let routine = guest::read64(cursor);
-        let flags = guest::read32(cursor + 8);
-        let name_pointer = guest::read64(cursor + 0x10);
-        let entry_context = guest::read64(cursor + 0x18);
-        let default_type = guest::read32(cursor + 0x20);
-        let default_data = guest::read64(cursor + 0x28);
-        let default_length = guest::read32(cursor + 0x30);
+        // SAFETY: vetor RTL_QUERY_REGISTRY_TABLE do driver, terminado pela entrada nula.
+        let entry = unsafe { RtlQueryRegistryTable::at(cursor) };
+        let routine = entry.query_routine.get();
+        let flags = entry.flags.get();
+        let name_pointer = entry.name.get();
+        let entry_context = entry.entry_context.get();
+        let default_type = entry.default_type.get();
+        let default_data = entry.default_data.get();
+        let default_length = entry.default_length.get();
         if routine == 0 && name_pointer == 0 {
             break;
         }
-        cursor += 0x38;
+        cursor += RtlQueryRegistryTable::SIZE;
         let value_name = if name_pointer != 0 { guest_strings::read_wide_string(name_pointer) } else { String::new() };
         let queried = if key_handle != 0 && !value_name.is_empty() { Some(key_services::named_value(key_services::Kind::QueryValue, key_handle, &value_name, 0, &[])?) } else { None };
         if let Some((query_status, _)) = &queried {
@@ -158,7 +161,9 @@ pub fn format_current_user_key_path(output: u64) {
     let bytes = text.encode_utf16().count() as u64 * 2;
     let buffer = guest::alloc_bytes(bytes + 2);
     guest_strings::write_wide_string(buffer, text);
-    guest::write16(output, bytes as u16);
-    guest::write16(output + 2, (bytes + 2) as u16);
-    guest::write64(output + 8, buffer);
+    // SAFETY: PUNICODE_STRING CurrentUserKeyPath do chamador.
+    let output = unsafe { UnicodeString::at(output) };
+    output.length.set(bytes as u16);
+    output.maximum_length.set((bytes + 2) as u16);
+    output.buffer.set(buffer);
 }

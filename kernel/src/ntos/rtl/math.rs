@@ -4,18 +4,18 @@
 //! O kernel é soft-float (sem SSE): a raiz sai de aritmética inteira e o
 //! argumento/resultado em XMM0 passa pelo slot do CONTEXT capturado.
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Context, Field, NtStruct};
 
 /// RtlRandom/RtlRandomEx: o LCG documentado; atualiza a semente e devolve
 /// 15 bits.
 pub fn random(seed_address: u64) -> u32 {
-    let seed = guest::read32(seed_address).wrapping_mul(214_013).wrapping_add(2_531_011);
-    guest::write32(seed_address, seed);
+    // SAFETY: PULONG Seed do chamador (o NT também não o trata como interlocked).
+    let cell = unsafe { Field::<u32>::at(seed_address) };
+    let seed = cell.get().wrapping_mul(214_013).wrapping_add(2_531_011);
+    cell.set(seed);
     (seed >> 16) & 0x7FFF
 }
 
-/// Offset do slot XMM0 no CONTEXT (dentro do FXSAVE).
-const CONTEXT_XMM0: u64 = 0x1A0;
 
 /// sqrt(double): argumento e resultado em XMM0. Lê/grava o slot XMM0 do
 /// CONTEXT capturado (CONTEXT+0x1A0, dentro do FXSAVE), pois o trampolim
@@ -25,8 +25,9 @@ pub fn sqrt_in_context(context: u64) {
     if context == 0 {
         return;
     }
-    let slot = context + CONTEXT_XMM0;
-    guest::write64(slot, sqrt_bits(guest::read64(slot)));
+    // SAFETY: CONTEXT capturado pelo gateway nativo.
+    let xmm0 = &unsafe { Context::at(context) }.flt_save.xmm_registers[0];
+    xmm0.low.set(sqrt_bits(xmm0.low.get()));
 }
 
 /// Piso da raiz de um u128 por Newton. O palpite inicial 2^ceil(bits/2) é

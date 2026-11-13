@@ -20,24 +20,12 @@ pub fn sort_elements(base: u64, count: u64, element_size: u64, comparator: u64) 
         if left == right {
             return;
         }
+        // Elementos distintos do mesmo array não se sobrepõem: troca em bloco.
         let (left, right) = (element(left), element(right));
-        let mut offset = 0u64;
-        if (left | right) & 3 == 0 {
-            while offset + 4 <= element_size {
-                let a = guest::read32(left + offset);
-                let b = guest::read32(right + offset);
-                guest::write32(left + offset, b);
-                guest::write32(right + offset, a);
-                offset += 4;
-            }
-        }
-        while offset < element_size {
-            let a = guest::read8(left + offset);
-            let b = guest::read8(right + offset);
-            guest::write8(left + offset, b);
-            guest::write8(right + offset, a);
-            offset += 1;
-        }
+        let a = guest::read_bytes(left, element_size as usize);
+        let b = guest::read_bytes(right, element_size as usize);
+        guest::write_bytes(left, &b);
+        guest::write_bytes(right, &a);
     };
     // Mediana de três, seleção para intervalos curtos; o intervalo maior é
     // adiado, limitando a pilha a O(log n). Índices com sinal, para os

@@ -4,13 +4,20 @@
 //! milissegundo, dia da semana); o tempo do sistema conta intervalos de
 //! 100 ns desde 1601-01-01, no calendário civil gregoriano.
 
-use alloc::vec::Vec;
+use crate::ntos::inc::types::{LargeInteger, NtStruct, TimeFields};
 
-use crate::ntos::mm::guest_memory as guest;
+// SAFETY (conversões deste arquivo): PLARGE_INTEGER e PTIME_FIELDS do
+// chamador, vivos e alinhados.
+fn time_at(time: u64) -> &'static LargeInteger {
+    unsafe { LargeInteger::at(time) }
+}
+fn fields_at(fields: u64) -> &'static TimeFields {
+    unsafe { TimeFields::at(fields) }
+}
 
 /// RtlTimeToTimeFields: calendário civil a partir de 1601 (dia da semana incluso).
 pub fn time_to_time_fields(time: u64, time_fields: u64) {
-    let filetime = guest::read64(time);
+    let filetime = time_at(time).quad_part.get() as u64;
     let total_seconds = (filetime / 10_000_000) as i64;
     let days = total_seconds.div_euclid(86_400);
     let seconds_of_day = total_seconds.rem_euclid(86_400);
@@ -24,17 +31,30 @@ pub fn time_to_time_fields(time: u64, time_fields: u64) {
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     let full_year = year + if month <= 2 { 1 } else { 0 };
-    let fields = [full_year, month, day, seconds_of_day / 3600, (seconds_of_day % 3600) / 60, seconds_of_day % 60, ((filetime % 10_000_000) / 10_000) as i64, (days + 1).rem_euclid(7)];
-    for (index, value) in fields.iter().enumerate() {
-        guest::write16(time_fields + index as u64 * 2, *value as u16);
-    }
+    let output = fields_at(time_fields);
+    output.year.set(full_year as i16);
+    output.month.set(month as i16);
+    output.day.set(day as i16);
+    output.hour.set((seconds_of_day / 3600) as i16);
+    output.minute.set(((seconds_of_day % 3600) / 60) as i16);
+    output.second.set((seconds_of_day % 60) as i16);
+    output.milliseconds.set(((filetime % 10_000_000) / 10_000) as i16);
+    output.weekday.set((days + 1).rem_euclid(7) as i16);
 }
 
 /// RtlTimeFieldsToTime: campos validados (1601–30827) → 100 ns desde 1601;
 /// FALSE (sem escrever) com campos inválidos.
 pub fn time_fields_to_time(time_fields: u64, time: u64) -> bool {
-    let fields: Vec<i64> = (0..7).map(|index| guest::read16(time_fields + index * 2) as i16 as i64).collect();
-    let (year, month, day, hour, minute, second, millisecond) = (fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]);
+    let input = fields_at(time_fields);
+    let (year, month, day, hour, minute, second, millisecond) = (
+        input.year.get() as i64,
+        input.month.get() as i64,
+        input.day.get() as i64,
+        input.hour.get() as i64,
+        input.minute.get() as i64,
+        input.second.get() as i64,
+        input.milliseconds.get() as i64,
+    );
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     if !(1601..=30827).contains(&year) || !(1..=12).contains(&month) || day < 1 || day > months[month as usize - 1] || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) || !(0..=999).contains(&millisecond) {
@@ -46,6 +66,6 @@ pub fn time_fields_to_time(time_fields: u64, time: u64) -> bool {
         days += length;
     }
     let seconds = days as u64 * 86_400 + (hour * 3600 + minute * 60 + second) as u64;
-    guest::write64(time, seconds * 10_000_000 + millisecond as u64 * 10_000);
+    time_at(time).quad_part.set((seconds * 10_000_000 + millisecond as u64 * 10_000) as i64);
     true
 }

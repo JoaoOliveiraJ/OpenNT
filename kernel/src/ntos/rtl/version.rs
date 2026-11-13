@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, NtStruct, OsVersionInfoExW};
 
 /// Versão publicada (10.0.26100).
 const VERSION: (u32, u32, u32) = (10, 0, 26100);
@@ -29,18 +29,34 @@ const PRODUCT_PROFESSIONAL: u32 = 0x0000_0030;
 /// XSTATE_MASK das features habilitadas: x87 e SSE.
 const ENABLED_EXTENDED_FEATURES: u64 = 3;
 
+/// VER_PLATFORM_WIN32_NT.
+const VER_PLATFORM_WIN32_NT: u32 = 2;
+/// VER_SUITE_SINGLEUSERTS (estação de trabalho com uma sessão interativa).
+const VER_SUITE_SINGLEUSERTS: u16 = 0x100;
+/// VER_NT_WORKSTATION.
+const VER_NT_WORKSTATION: u8 = 1;
+
+/// RTL_OSVERSIONINFO[EX]W do chamador: os campos comuns às duas versões
+/// valem para ambas; os do EX só existem quando dwOSVersionInfoSize diz.
+fn version_info(info: u64) -> &'static OsVersionInfoExW {
+    // SAFETY: estrutura de versão viva e alinhada do chamador; só os campos
+    // da versão declarada em dwOSVersionInfoSize são tocados.
+    unsafe { OsVersionInfoExW::at(info) }
+}
+
 /// RtlVerifyVersionInfo: blocos de 3 bits da máscara de condição. Devolve o
 /// NTSTATUS.
 pub fn verify(info: u64, type_mask: u32, condition: u64) -> u32 {
+    let info = version_info(info);
     let mut checks = Vec::new();
     if type_mask & 1 != 0 {
-        checks.push((guest::read32(info + 4), VERSION.0));
+        checks.push((info.dw_major_version.get(), VERSION.0));
     }
     if type_mask & 2 != 0 {
-        checks.push((guest::read32(info + 8), VERSION.1));
+        checks.push((info.dw_minor_version.get(), VERSION.1));
     }
     if type_mask & 4 != 0 {
-        checks.push((guest::read32(info + 12), VERSION.2));
+        checks.push((info.dw_build_number.get(), VERSION.2));
     }
     // Aplica o operador do bloco baixo a todos os campos.
     let operator = condition & 7;
@@ -67,19 +83,30 @@ pub fn set_condition_mask(mask: u64, type_mask: u32, condition: u32) -> u64 {
     mask.wrapping_add(increment)
 }
 
-/// RtlGetVersion: 10.0.26100, Win32 NT, estação de trabalho.
+/// RtlGetVersion: 10.0.26100, Win32 NT, sem service pack (szCSDVersion
+/// vazio). Os campos do RTL_OSVERSIONINFOEXW (service pack, suíte e tipo de
+/// produto: estação de trabalho) só são escritos quando dwOSVersionInfoSize
+/// é o tamanho do EX — um RTL_OSVERSIONINFOW termina antes deles.
 pub fn write_version_information(info: u64) {
-    guest::write32(info + 4, VERSION.0);
-    guest::write32(info + 8, VERSION.1);
-    guest::write32(info + 12, VERSION.2);
-    guest::write32(info + 16, 2);
-    guest::write16(info + 0x114, 0x100);
-    guest::write8(info + 0x116, 1);
+    let info = version_info(info);
+    info.dw_major_version.set(VERSION.0);
+    info.dw_minor_version.set(VERSION.1);
+    info.dw_build_number.set(VERSION.2);
+    info.dw_platform_id.set(VER_PLATFORM_WIN32_NT);
+    info.sz_csd_version[0].set(0);
+    if info.dw_os_version_info_size.get() as u64 == OsVersionInfoExW::SIZE {
+        info.w_service_pack_major.set(0);
+        info.w_service_pack_minor.set(0);
+        info.w_suite_mask.set(VER_SUITE_SINGLEUSERTS);
+        info.w_product_type.set(VER_NT_WORKSTATION);
+        info.w_reserved.set(0);
+    }
 }
 
 /// RtlGetNtProductType(PNT_PRODUCT_TYPE): NtProductWinNt, TRUE.
 pub fn nt_product_type(output: u64) -> bool {
-    guest::write32(output, NT_PRODUCT_WIN_NT);
+    // SAFETY: PNT_PRODUCT_TYPE do chamador.
+    unsafe { Field::<u32>::at(output) }.set(NT_PRODUCT_WIN_NT);
     true
 }
 
@@ -96,7 +123,8 @@ pub fn is_multi_session_sku() -> bool {
 /// RtlGetProductInfo(OSMajor, OSMinor, SpMajor, SpMinor, PULONG ProductType):
 /// edição fixa PRODUCT_PROFESSIONAL, TRUE.
 pub fn product_info(product_type: u64) -> bool {
-    guest::write32(product_type, PRODUCT_PROFESSIONAL);
+    // SAFETY: PULONG ReturnedProductType do chamador.
+    unsafe { Field::<u32>::at(product_type) }.set(PRODUCT_PROFESSIONAL);
     true
 }
 

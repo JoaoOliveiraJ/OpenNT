@@ -4,6 +4,7 @@
 //! caem dentro de imagens carregadas (endereços de retorno). As leituras são
 //! protegidas e limitadas: sem nada reconhecível, nada é capturado.
 
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
 /// Máximo de quadros por captura.
@@ -21,7 +22,8 @@ pub fn capture_back_trace(frame: u64, skip: usize, capture: usize, back_trace: u
         if let Ok(value) = guest::try_read64(slot) {
             if value != 0 && crate::ntos::mm::loaded_images::find(value).is_some() {
                 if seen >= skip {
-                    guest::write64(back_trace + captured as u64 * 8, value);
+                    // SAFETY: PVOID BackTrace[FramesToCapture] do chamador.
+                    unsafe { Field::<u64>::at(back_trace + captured as u64 * 8) }.set(value);
                     hash = hash.wrapping_add(value as u32);
                     captured += 1;
                 }
@@ -32,7 +34,8 @@ pub fn capture_back_trace(frame: u64, skip: usize, capture: usize, back_trace: u
         scanned += 1;
     }
     if hash_out != 0 {
-        guest::write32(hash_out, hash);
+        // SAFETY: PULONG BackTraceHash do chamador.
+        unsafe { Field::<u32>::at(hash_out) }.set(hash);
     }
     captured as u64
 }

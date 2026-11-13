@@ -11,8 +11,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::hal::cpu;
-use crate::rtl::KernelError;
+use crate::ntos::inc::types::{NtStruct, String as AnsiString, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 /// Guarda contra leitura descontrolada de um ponteiro errado.
 pub const MAX_GUEST_STRING_CHARS: u64 = 65536;
@@ -62,14 +63,21 @@ pub fn read_wide_string(address: u64) -> String {
     units_to_string(&read_wide_units(address))
 }
 
-/// Unidades de uma UNICODE_STRING (Buffer é PVOID de 64 bits).
+/// Unidades UTF-16 little-endian de um bloco de bytes.
+fn units_from_bytes(bytes: &[u8]) -> Vec<u16> {
+    bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+}
+
+/// Unidades de uma UNICODE_STRING (ponteiro não confiável: descritor e
+/// texto sondados).
 pub fn try_read_unicode_units(pointer: u64) -> Result<Vec<u16>, KernelError> {
-    let count = guest::try_read16(pointer)? as u64 / 2;
-    let buffer = guest::try_read64(pointer + 8)?;
+    let string = UnicodeString::try_at(pointer)?;
+    let count = string.length.probe_get()? as u64 / 2;
+    let buffer = string.buffer.probe_get()?;
     if count > MAX_GUEST_STRING_CHARS {
         runaway(&format!("UNICODE_STRING len={count}"), pointer);
     }
-    (0..count).map(|index| guest::try_read16(buffer.wrapping_add(index * 2))).collect()
+    Ok(units_from_bytes(&guest::try_read_bytes(buffer, count as usize * 2)?))
 }
 
 pub fn try_read_unicode_string(pointer: u64) -> Result<String, KernelError> {
@@ -81,39 +89,41 @@ pub fn read_unicode_string(pointer: u64) -> String {
 }
 
 pub fn try_read_ansi_string(pointer: u64) -> Result<String, KernelError> {
-    let length = guest::try_read16(pointer)? as u64;
-    let buffer = guest::try_read64(pointer + 8)?;
+    let string = AnsiString::try_at(pointer)?;
+    let length = string.length.probe_get()? as u64;
+    let buffer = string.buffer.probe_get()?;
     if length > MAX_GUEST_STRING_CHARS {
         runaway(&format!("ANSI_STRING len={length}"), pointer);
     }
-    (0..length).map(|index| guest::try_read8(buffer.wrapping_add(index)).map(|byte| byte as char)).collect()
+    Ok(guest::try_read_bytes(buffer, length as usize)?.into_iter().map(|byte| byte as char).collect())
 }
 
 pub fn read_ansi_string(pointer: u64) -> String {
     try_read_ansi_string(pointer).unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// Campos de uma (UNICODE|ANSI)_STRING: { u16 len, u16 max, u32 pad, u64 buf }.
+/// Campos de uma (UNICODE|ANSI)_STRING — as duas têm o mesmo layout
+/// (Length, MaximumLength, Buffer); o preenchimento entre eles não é tocado,
+/// como no RtlInitUnicodeString.
 pub fn write_string_fields(pointer: u64, length_bytes: u16, maximum_bytes: u16, buffer: u64) {
-    guest::write16(pointer, length_bytes);
-    guest::write16(pointer + 2, maximum_bytes);
-    guest::write32(pointer + 4, 0);
-    guest::write64(pointer + 8, buffer);
+    // SAFETY: descritor do chamador (kernel ou driver), vivo e alinhado.
+    let string = unsafe { UnicodeString::at(pointer) };
+    string.length.set(length_bytes);
+    string.maximum_length.set(maximum_bytes);
+    string.buffer.set(buffer);
+}
+
+/// Bytes little-endian das unidades UTF-16 de `text` seguidas do NUL.
+pub fn wide_bytes_with_nul(text: &str) -> Vec<u8> {
+    text.encode_utf16().chain(core::iter::once(0)).flat_map(u16::to_le_bytes).collect()
 }
 
 pub fn write_wide_string(address: u64, text: &str) {
-    let mut count = 0u64;
-    for unit in text.encode_utf16() {
-        guest::write16(address + count * 2, unit);
-        count += 1;
-    }
-    guest::write16(address + count * 2, 0);
+    guest::write_bytes(address, &wide_bytes_with_nul(text));
 }
 
 pub fn write_bytes(address: u64, bytes: &[u8]) {
-    for (index, &byte) in bytes.iter().enumerate() {
-        guest::write8(address + index as u64, byte);
-    }
+    guest::write_bytes(address, bytes);
 }
 
 /// va_list MS x64: slots de 8 bytes lidos sob demanda.
@@ -126,19 +136,24 @@ fn read_format_string(pointer: u64, wide: bool, precision: Option<u64>, counted:
         return String::from("(null)");
     }
     let mut limit = precision.unwrap_or(u64::MAX);
-    let mut pointer = pointer;
     if counted {
-        limit = limit.min(guest::read16(pointer) as u64 / if wide { 2 } else { 1 });
-        pointer = guest::read64(pointer + 8);
-        if pointer == 0 {
+        // %Z/%wZ: STRING ou UNICODE_STRING (mesmo layout); o texto contado
+        // vem num bloco.
+        // SAFETY: argumento de printf do chamador, descritor vivo e alinhado.
+        let string = unsafe { UnicodeString::at(pointer) };
+        limit = limit.min(string.length.get() as u64 / if wide { 2 } else { 1 });
+        let buffer = string.buffer.get();
+        if buffer == 0 {
             return String::from("(null)");
         }
+        let bytes = guest::read_bytes(buffer, (limit * if wide { 2 } else { 1 }) as usize);
+        return if wide { units_to_string(&units_from_bytes(&bytes)) } else { bytes.iter().map(|&byte| byte as char).collect() };
     }
     let mut units = Vec::new();
     let mut index = 0u64;
     while index < limit {
         let unit = if wide { guest::read16(pointer + index * 2) } else { guest::read8(pointer + index) as u16 };
-        if !counted && unit == 0 {
+        if unit == 0 {
             break;
         }
         if index >= MAX_GUEST_STRING_CHARS {
@@ -307,15 +322,13 @@ pub fn format_guest_text(format_text: &str, arguments: &mut dyn FnMut(usize) -> 
             }
             zero_pad = precision.is_none() && flags.contains('0');
         } else if spec == 'n' {
+            // Ponteiro do argumento: uma escrita sondada da largura do inteiro
+            // (`long long` num único store de 64 bits).
             match bits {
-                8 => guest::try_write8(value, output_units as u8)?,
-                16 => guest::try_write16(value, output_units as u16)?,
-                _ => {
-                    guest::try_write32(value, output_units as u32)?;
-                    if bits == 64 {
-                        guest::try_write32(value + 4, (output_units >> 32) as u32)?;
-                    }
-                }
+                8 => guest::try_write::<u8>(value, output_units as u8)?,
+                16 => guest::try_write::<u16>(value, output_units as u16)?,
+                64 => guest::try_write::<u64>(value, output_units)?,
+                _ => guest::try_write::<u32>(value, output_units as u32)?,
             }
             continue;
         } else {
@@ -356,18 +369,9 @@ pub fn write_formatted_text(pointer: u64, count: u64, text: &str, wide: bool, le
     let units: Vec<u16> = if wide { text.encode_utf16().collect() } else { text.chars().map(|character| character as u32 as u16).collect() };
     let length = units.len() as u64;
     let writable = length.min(if legacy { count } else { count.saturating_sub(1) });
-    let write = |index: u64, unit: u16| {
-        if wide {
-            guest::write16(pointer + index * 2, unit);
-        } else {
-            guest::write8(pointer + index, unit as u8);
-        }
-    };
-    for index in 0..writable {
-        write(index, units[index as usize]);
-    }
-    if writable < count {
-        write(writable, 0);
-    }
+    let terminator = (writable < count).then_some(0u16);
+    let output = units[..writable as usize].iter().copied().chain(terminator);
+    let bytes: Vec<u8> = if wide { output.flat_map(u16::to_le_bytes).collect() } else { output.map(|unit| unit as u8).collect() };
+    guest::write_bytes(pointer, &bytes);
     if legacy && length > count { -1 } else { length as i64 }
 }

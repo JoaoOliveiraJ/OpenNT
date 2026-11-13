@@ -3,10 +3,17 @@
 
 use crate::ntos::mm::guest_memory as guest;
 
+/// Bloco de preenchimento: blocos de até uma página por cópia.
+const FILL_CHUNK: u64 = 4096;
+
 /// memset/RtlZeroMemory/RtlFillMemory: grava `value` em `length` bytes.
 pub fn fill(destination: u64, length: u64, value: u8) {
-    for offset in 0..length {
-        guest::write8(destination + offset, value);
+    let pattern = [value; FILL_CHUNK as usize];
+    let mut offset = 0;
+    while offset < length {
+        let chunk = (length - offset).min(FILL_CHUNK);
+        guest::write_bytes(destination + offset, &pattern[..chunk as usize]);
+        offset += chunk;
     }
 }
 
@@ -17,8 +24,14 @@ pub fn move_memory(destination: u64, source: u64, length: u64) {
     guest::write_bytes(destination, &bytes);
 }
 
-/// RtlCopyMemory: cópia byte a byte, do início para o fim.
+/// RtlCopyMemory: cópia do início para o fim. Sem sobreposição à frente
+/// da origem é um bloco; com o destino dentro da origem, byte a byte (o
+/// padrão se repete, como na cópia crescente).
 pub fn copy_memory(destination: u64, source: u64, length: u64) {
+    if destination <= source || destination >= source.wrapping_add(length) {
+        move_memory(destination, source, length);
+        return;
+    }
     for offset in 0..length {
         guest::write8(destination + offset, guest::read8(source + offset));
     }

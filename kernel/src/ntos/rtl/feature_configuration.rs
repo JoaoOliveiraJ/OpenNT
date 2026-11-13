@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::cm::feature_usage;
 use crate::ntos::ke::irql;
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Context, Field, NtStruct};
 use crate::ntos::rtl::native_context;
 use crate::rtl::{KernelError, SpinLock};
 
@@ -31,7 +31,8 @@ pub fn query() -> u32 {
 pub fn register_change_notification(callback: u64, context: u64, handle_out: u64) {
     FEATURE_NOTIFICATIONS.lock().push((callback, context));
     if handle_out != 0 {
-        guest::write64(handle_out, callback);
+        // SAFETY: PRTL_FEATURE_CONFIGURATION_CHANGE_REGISTRATION do chamador.
+        unsafe { Field::<u64>::at(handle_out) }.set(callback);
     }
 }
 
@@ -46,7 +47,8 @@ pub fn unregister_change_notification(handle: u64) -> u32 {
 
 /// RtlNotifyFeatureUsage: entrega o relato ao Cm no IRQL efetivo.
 pub fn notify_usage(report: u64) -> Result<u32, KernelError> {
-    let flags = guest::read32(native_context::current()? + 0x44);
+    // SAFETY: o CONTEXT da invocação nativa ativa.
+    let flags = unsafe { Context::at(native_context::current()?) }.e_flags.get();
     let level = if flags & 0x200 != 0 { irql::get_irql() } else { 15 };
     match feature_usage::notify(report, Some(level)) {
         Err(error) if !native_context::is_transfer(&error) => {

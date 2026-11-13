@@ -9,31 +9,14 @@
 //! lugar (nunca copia dados): o ponteiro devolvido para um elemento continua
 //! válido até ele sair da tabela.
 
+use core::mem::size_of;
+
 use crate::hal::amd64::native_call;
+use crate::ntos::inc::types::{Field, NtStruct, RtlAvlTable, RtlBalancedLinks};
 use crate::ntos::mm::guest_memory as guest;
 
-/// Offsets do RTL_AVL_TABLE.
-pub mod table {
-    pub const BALANCED_ROOT: u64 = 0x00;
-    pub const ORDERED_POINTER: u64 = 0x20;
-    pub const WHICH_ORDERED_ELEMENT: u64 = 0x28;
-    pub const NUMBER_ELEMENTS: u64 = 0x2C;
-    pub const DEPTH_OF_TREE: u64 = 0x30;
-    pub const RESTART_KEY: u64 = 0x38;
-    pub const DELETE_COUNT: u64 = 0x40;
-    pub const COMPARE_ROUTINE: u64 = 0x48;
-    pub const ALLOCATE_ROUTINE: u64 = 0x50;
-    pub const FREE_ROUTINE: u64 = 0x58;
-    pub const TABLE_CONTEXT: u64 = 0x60;
-    pub const SIZE: u64 = 0x68;
-}
-
-const PARENT: u64 = 0x00;
-const LEFT: u64 = 0x08;
-const RIGHT: u64 = 0x10;
-const BALANCE: u64 = 0x18;
 /// Os dados do usuário depois do RTL_BALANCED_LINKS (TABLE_ENTRY_HEADER).
-pub const USER_DATA: u64 = 0x20;
+pub const USER_DATA: u64 = RtlBalancedLinks::SIZE;
 
 /// RTL_GENERIC_COMPARE_RESULTS.
 pub const LESS_THAN: u64 = 0;
@@ -49,37 +32,59 @@ pub const INSERT_AS_RIGHT: u32 = 3;
 const STATUS_NO_MATCH: u32 = 0xC000_0272;
 const STATUS_NO_MORE_MATCHES: u32 = 0xC000_0273;
 
+/// PRTL_BALANCED_LINKS: nós vivos da árvore (a sentinela é o BalancedRoot).
+fn links(node: u64) -> &'static RtlBalancedLinks {
+    // SAFETY: nó vivo e alinhado (elemento da tabela ou a sentinela).
+    unsafe { RtlBalancedLinks::at(node) }
+}
 fn parent(node: u64) -> u64 {
-    guest::read64(node + PARENT)
+    links(node).parent.get()
 }
 fn left(node: u64) -> u64 {
-    guest::read64(node + LEFT)
+    links(node).left_child.get()
 }
 fn right(node: u64) -> u64 {
-    guest::read64(node + RIGHT)
+    links(node).right_child.get()
 }
 fn balance(node: u64) -> i8 {
-    guest::read8(node + BALANCE) as i8
+    links(node).balance.get()
 }
 fn set_parent(node: u64, value: u64) {
-    guest::write64(node + PARENT, value);
+    links(node).parent.set(value);
 }
 fn set_left(node: u64, value: u64) {
-    guest::write64(node + LEFT, value);
+    links(node).left_child.set(value);
 }
 fn set_right(node: u64, value: u64) {
-    guest::write64(node + RIGHT, value);
+    links(node).right_child.set(value);
 }
 fn set_balance(node: u64, value: i8) {
-    guest::write8(node + BALANCE, value as u8);
+    links(node).balance.set(value);
+}
+
+/// PRTL_AVL_TABLE do chamador.
+fn avl(table: u64) -> &'static RtlAvlTable {
+    // SAFETY: tabela viva e alinhada, inicializada pelo RtlInitializeGenericTableAvl.
+    unsafe { RtlAvlTable::at(table) }
+}
+
+/// A sentinela BalancedRoot (Parent aponta para si; RightChild é a raiz).
+fn sentinel_of(table: u64) -> u64 {
+    avl(table).balanced_root.address()
+}
+
+/// Parâmetro escalar do chamador (PBOOLEAN, PVOID*, PULONG...).
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro do chamador, vivo e alinhado.
+    unsafe { Field::<T>::at(address) }
 }
 
 fn root(table: u64) -> u64 {
-    right(table + table::BALANCED_ROOT)
+    right(sentinel_of(table))
 }
 
 pub fn number(table: u64) -> u32 {
-    guest::read32(table + table::NUMBER_ELEMENTS)
+    avl(table).number_generic_table_elements.get()
 }
 
 pub fn is_empty(table: u64) -> bool {
@@ -88,16 +93,17 @@ pub fn is_empty(table: u64) -> bool {
 
 /// RtlInitializeGenericTableAvl.
 pub fn initialize(table: u64, compare: u64, allocate: u64, free: u64, context: u64) {
-    guest::write_bytes(table, &[0; table::SIZE as usize]);
-    set_parent(table + table::BALANCED_ROOT, table + table::BALANCED_ROOT);
-    guest::write64(table + table::COMPARE_ROUTINE, compare);
-    guest::write64(table + table::ALLOCATE_ROUTINE, allocate);
-    guest::write64(table + table::FREE_ROUTINE, free);
-    guest::write64(table + table::TABLE_CONTEXT, context);
+    guest::write_bytes(table, &[0; size_of::<RtlAvlTable>()]);
+    set_parent(sentinel_of(table), sentinel_of(table));
+    let avl = avl(table);
+    avl.compare_routine.set(compare);
+    avl.allocate_routine.set(allocate);
+    avl.free_routine.set(free);
+    avl.table_context.set(context);
 }
 
 fn compare(table: u64, buffer: u64, node: u64) -> u64 {
-    native_call::call(guest::read64(table + table::COMPARE_ROUTINE), &[table, buffer, node + USER_DATA]) & 0xFFFF_FFFF
+    native_call::call(avl(table).compare_routine.get(), &[table, buffer, node + USER_DATA]) & 0xFFFF_FFFF
 }
 
 /// Busca: (resultado, nó encontrado ou pai do ponto de inserção).
@@ -147,7 +153,7 @@ pub fn successor(table: u64, node: u64) -> u64 {
     if right(node) != 0 {
         return leftmost(right(node));
     }
-    let sentinel = table + table::BALANCED_ROOT;
+    let sentinel = sentinel_of(table);
     let (mut child, mut up) = (node, parent(node));
     while up != sentinel && right(up) == child {
         child = up;
@@ -161,7 +167,7 @@ pub fn predecessor(table: u64, node: u64) -> u64 {
     if left(node) != 0 {
         return rightmost(left(node));
     }
-    let sentinel = table + table::BALANCED_ROOT;
+    let sentinel = sentinel_of(table);
     let (mut child, mut up) = (node, parent(node));
     while up != sentinel && left(up) == child {
         child = up;
@@ -171,7 +177,7 @@ pub fn predecessor(table: u64, node: u64) -> u64 {
 }
 
 fn replace_child(table: u64, up: u64, old: u64, new: u64) {
-    let sentinel = table + table::BALANCED_ROOT;
+    let sentinel = sentinel_of(table);
     if up == sentinel || right(up) == old {
         set_right(up, new);
     } else {
@@ -260,12 +266,12 @@ fn rebalance(table: u64, node: u64) -> (u64, bool) {
 }
 
 fn changed(table: u64) {
-    guest::write64(table + table::ORDERED_POINTER, 0);
-    guest::write32(table + table::WHICH_ORDERED_ELEMENT, 0);
+    avl(table).ordered_pointer.set(0);
+    avl(table).which_ordered_element.set(0);
 }
 
 fn link(table: u64, node: u64, result: u32, at: u64) {
-    let sentinel = table + table::BALANCED_ROOT;
+    let sentinel = sentinel_of(table);
     set_left(node, 0);
     set_right(node, 0);
     set_balance(node, 0);
@@ -283,7 +289,7 @@ fn link(table: u64, node: u64, result: u32, at: u64) {
             set_right(sentinel, node);
         }
     }
-    guest::write32(table + table::NUMBER_ELEMENTS, number(table) + 1);
+    avl(table).number_generic_table_elements.set(number(table) + 1);
     changed(table);
     let (mut child, mut up) = (node, parent(node));
     while up != sentinel {
@@ -330,7 +336,7 @@ fn swap_with_successor(table: u64, node: u64, next: u64) {
 
 /// Tira o nó da árvore e reequilibra; não libera a memória.
 fn unlink(table: u64, node: u64) {
-    let sentinel = table + table::BALANCED_ROOT;
+    let sentinel = sentinel_of(table);
     if left(node) != 0 && right(node) != 0 {
         swap_with_successor(table, node, leftmost(right(node)));
     }
@@ -341,8 +347,9 @@ fn unlink(table: u64, node: u64) {
     if child != 0 {
         set_parent(child, up);
     }
-    guest::write32(table + table::NUMBER_ELEMENTS, number(table).saturating_sub(1));
-    guest::write32(table + table::DELETE_COUNT, guest::read32(table + table::DELETE_COUNT).wrapping_add(1));
+    let avl = avl(table);
+    avl.number_generic_table_elements.set(number(table).saturating_sub(1));
+    avl.delete_count.set(avl.delete_count.get().wrapping_add(1));
     changed(table);
     let mut up = up;
     while up != sentinel {
@@ -366,31 +373,31 @@ fn unlink(table: u64, node: u64) {
 }
 
 fn free(table: u64, node: u64) {
-    native_call::call(guest::read64(table + table::FREE_ROUTINE), &[table, node]);
+    native_call::call(avl(table).free_routine.get(), &[table, node]);
 }
 
 /// RtlInsertElementGenericTableFullAvl: com o resultado de uma busca anterior.
 pub fn insert_full(table: u64, buffer: u64, size: u32, new_element: u64, node_or_parent: u64, result: u32) -> u64 {
     if result == FOUND_NODE {
         if new_element != 0 {
-            guest::write8(new_element, 0);
+            out::<u8>(new_element).set(0);
         }
         return node_or_parent + USER_DATA;
     }
-    let node = native_call::call(guest::read64(table + table::ALLOCATE_ROUTINE), &[table, size as u64 + USER_DATA]);
+    let node = native_call::call(avl(table).allocate_routine.get(), &[table, size as u64 + USER_DATA]);
     if node == 0 {
         if new_element != 0 {
-            guest::write8(new_element, 0);
+            out::<u8>(new_element).set(0);
         }
         return 0;
     }
-    guest::write_bytes(node, &[0; USER_DATA as usize]);
+    guest::write_bytes(node, &[0; size_of::<RtlBalancedLinks>()]);
     if size != 0 && buffer != 0 {
         guest::write_bytes(node + USER_DATA, &guest::read_bytes(buffer, size as usize));
     }
     link(table, node, result, node_or_parent);
     if new_element != 0 {
-        guest::write8(new_element, 1);
+        out::<u8>(new_element).set(1);
     }
     node + USER_DATA
 }
@@ -404,8 +411,8 @@ pub fn insert(table: u64, buffer: u64, size: u32, new_element: u64) -> u64 {
 /// RtlLookupElementGenericTableFullAvl.
 pub fn lookup_full(table: u64, buffer: u64, node_or_parent: u64, search_result: u64) -> u64 {
     let (result, at) = find(table, buffer);
-    guest::write64(node_or_parent, at);
-    guest::write32(search_result, result);
+    out::<u64>(node_or_parent).set(at);
+    out::<u32>(search_result).set(result);
     if result == FOUND_NODE { at + USER_DATA } else { 0 }
 }
 
@@ -437,18 +444,19 @@ pub fn delete_node(table: u64, node: u64) {
 
 /// RtlEnumerateGenericTableWithoutSplayingAvl: a chave guarda o último nó.
 pub fn enumerate_without_splaying(table: u64, restart_key: u64) -> u64 {
-    let previous = guest::read64(restart_key);
+    let key = out::<u64>(restart_key);
+    let previous = key.get();
     let node = if previous == 0 { first(table) } else { successor(table, previous) };
-    guest::write64(restart_key, node);
+    key.set(node);
     if node == 0 { 0 } else { node + USER_DATA }
 }
 
 /// RtlEnumerateGenericTableAvl: a chave fica no RestartKey da tabela.
 pub fn enumerate(table: u64, restart: bool) -> u64 {
     if restart {
-        guest::write64(table + table::RESTART_KEY, 0);
+        avl(table).restart_key.set(0);
     }
-    enumerate_without_splaying(table, table + table::RESTART_KEY)
+    enumerate_without_splaying(table, avl(table).restart_key.address())
 }
 
 /// RtlGetElementGenericTableAvl: o I-ésimo em ordem (OrderedPointer guarda o
@@ -458,9 +466,9 @@ pub fn get_element(table: u64, index: u32) -> u64 {
         return 0;
     }
     let wanted = index + 1;
-    let cached = guest::read32(table + table::WHICH_ORDERED_ELEMENT);
+    let cached = avl(table).which_ordered_element.get();
     let (mut node, mut position) = if cached != 0 && cached <= wanted {
-        (guest::read64(table + table::ORDERED_POINTER), cached)
+        (avl(table).ordered_pointer.get(), cached)
     } else {
         (first(table), 1)
     };
@@ -471,8 +479,8 @@ pub fn get_element(table: u64, index: u32) -> u64 {
     if node == 0 {
         return 0;
     }
-    guest::write64(table + table::ORDERED_POINTER, node);
-    guest::write32(table + table::WHICH_ORDERED_ELEMENT, wanted);
+    avl(table).ordered_pointer.set(node);
+    avl(table).which_ordered_element.set(wanted);
     node + USER_DATA
 }
 
@@ -481,7 +489,7 @@ pub fn get_element(table: u64, index: u32) -> u64 {
 pub fn lookup_first_matching(table: u64, buffer: u64, restart_key: u64) -> u64 {
     let (result, mut node) = find(table, buffer);
     if result != FOUND_NODE {
-        guest::write64(restart_key, 0);
+        out::<u64>(restart_key).set(0);
         return 0;
     }
     loop {
@@ -491,7 +499,7 @@ pub fn lookup_first_matching(table: u64, buffer: u64, restart_key: u64) -> u64 {
         }
         node = previous;
     }
-    guest::write64(restart_key, node);
+    out::<u64>(restart_key).set(node);
     node + USER_DATA
 }
 
@@ -502,11 +510,11 @@ pub fn lookup_first_matching(table: u64, buffer: u64, restart_key: u64) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub fn enumerate_like_a_directory(table: u64, match_function: u64, match_data: u64, next_flag: bool, restart_key: u64, delete_count: u64, buffer: u64) -> u64 {
     if is_empty(table) {
-        guest::write64(restart_key, 0);
+        out::<u64>(restart_key).set(0);
         return 0;
     }
-    let saved = guest::read64(restart_key);
-    let mut node = if saved != 0 && guest::read32(delete_count) == guest::read32(table + table::DELETE_COUNT) {
+    let saved = out::<u64>(restart_key).get();
+    let mut node = if saved != 0 && out::<u32>(delete_count).get() == avl(table).delete_count.get() {
         successor(table, saved)
     } else {
         match find(table, buffer) {
@@ -524,12 +532,12 @@ pub fn enumerate_like_a_directory(table: u64, match_function: u64, match_data: u
             STATUS_NO_MATCH => node = successor(table, node),
             STATUS_NO_MORE_MATCHES => break,
             _ => {
-                guest::write64(restart_key, node);
-                guest::write32(delete_count, guest::read32(table + table::DELETE_COUNT));
+                out::<u64>(restart_key).set(node);
+                out::<u32>(delete_count).set(avl(table).delete_count.get());
                 return node + USER_DATA;
             }
         }
     }
-    guest::write64(restart_key, 0);
+    out::<u64>(restart_key).set(0);
     0
 }

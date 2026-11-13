@@ -6,9 +6,15 @@
 //! caixa no lugar e a guarda `_purecall`.
 
 use crate::hal::amd64::native_call;
+use crate::ntos::inc::types::{Field, NtStruct};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
+
+/// Bytes little-endian de unidades UTF-16.
+fn unit_bytes(units: impl IntoIterator<Item = u16>) -> alloc::vec::Vec<u8> {
+    units.into_iter().flat_map(u16::to_le_bytes).collect()
+}
 
 pub fn strlen(source: u64) -> Result<u64, KernelError> {
     let mut length = 0;
@@ -105,38 +111,31 @@ pub fn ultow(value: u32, output: u64, capacity: u64, radix: i32) -> Result<u32, 
     if output == 0 || capacity == 0 {
         return Ok(22);
     }
-    guest::try_write16(output, 0)?;
+    guest::try_write_bytes(output, &[0, 0])?;
     if capacity <= 1 {
         return Ok(34);
     }
     if !(2..=36).contains(&radix) {
         return Ok(22);
     }
+    // Dígitos do menos significativo para o mais, como são gerados.
     let mut value = value;
-    let mut written = 0u64;
+    let mut digits = alloc::vec::Vec::new();
     loop {
         let digit = value % radix as u32;
-        guest::try_write16(output + written * 2, (digit + if digit <= 9 { 48 } else { 87 }) as u16)?;
-        written += 1;
+        digits.push((digit + if digit <= 9 { 48 } else { 87 }) as u16);
         value /= radix as u32;
-        if value == 0 || written >= capacity {
+        if value == 0 || digits.len() as u64 >= capacity {
             break;
         }
     }
-    if written >= capacity {
-        guest::try_write16(output, 0)?;
+    if digits.len() as u64 >= capacity {
+        // Sem espaço: os dígitos gerados ficam e o primeiro vira NUL.
+        guest::try_write_bytes(output, &unit_bytes(digits))?;
+        guest::try_write_bytes(output, &[0, 0])?;
         return Ok(34);
     }
-    guest::try_write16(output + written * 2, 0)?;
-    let (mut left, mut right) = (0u64, written - 1);
-    while left < right {
-        let a = guest::try_read16(output + left * 2)?;
-        let b = guest::try_read16(output + right * 2)?;
-        guest::try_write16(output + left * 2, b)?;
-        guest::try_write16(output + right * 2, a)?;
-        left += 1;
-        right -= 1;
-    }
+    guest::try_write_bytes(output, &unit_bytes(digits.into_iter().rev().chain(core::iter::once(0))))?;
     Ok(0)
 }
 
@@ -194,11 +193,9 @@ pub fn binary_search(
 /// Grava o texto e o terminador; com `count`, exatamente `count` bytes
 /// (completando com zeros, sem terminador se não couber).
 pub fn write_c_text(destination: u64, text: &str, count: Option<u64>) {
-    let bytes = text.as_bytes();
-    let total = count.unwrap_or(bytes.len() as u64 + 1);
-    for index in 0..total {
-        guest::write8(destination + index, bytes.get(index as usize).copied().unwrap_or(0));
-    }
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.resize(count.unwrap_or(bytes.len() as u64 + 1) as usize, 0);
+    guest::write_bytes(destination, &bytes);
 }
 
 /// strcpy: devolve o destino.
@@ -279,10 +276,9 @@ pub fn strncpy_s(destination: u64, capacity: u64, source: u64, count: i32) -> u6
         return 34;
     }
     let writable = wanted.min(capacity.saturating_sub(1));
-    for index in 0..writable {
-        guest::write8(destination + index, bytes[index as usize]);
-    }
-    guest::write8(destination + writable, 0);
+    let mut output = bytes[..writable as usize].to_vec();
+    output.push(0);
+    guest::write_bytes(destination, &output);
     if wanted > writable || (count < 0 && bytes.len() as u64 > writable) { 80 } else { 0 }
 }
 
@@ -443,10 +439,7 @@ pub fn wcsncpy_s(destination: u64, capacity: u64, source: u64, count: u64) -> u6
         return 34; // ERANGE
     }
     let writable = wanted.min(capacity - 1);
-    for index in 0..writable {
-        guest::write16(destination + index * 2, units[index as usize]);
-    }
-    guest::write16(destination + writable * 2, 0);
+    guest::write_bytes(destination, &unit_bytes(units[..writable as usize].iter().copied().chain(core::iter::once(0))));
     if truncate && units.len() as u64 > writable { 80 } else { 0 } // STRUNCATE/0
 }
 
@@ -630,8 +623,10 @@ pub fn wcscspn(text: u64, set: u64) -> u64 {
 /// dígitos de `wchartodigit` ou letras; estouro satura em ULONG_MAX (negado
 /// se houve '-'); sem dígitos, *EndPtr = String e retorno 0.
 pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
-    if end != 0 {
-        guest::write64(end, text);
+    // SAFETY: wchar_t** EndPtr do chamador (opcional).
+    let end_pointer = (end != 0).then(|| unsafe { Field::<u64>::at(end) });
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(text);
     }
     if text == 0 || (requested != 0 && requested.wrapping_sub(2) > 34) {
         return 0;
@@ -692,8 +687,8 @@ pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
     } else if overflow {
         number = u32::MAX;
     }
-    if end != 0 {
-        guest::write64(end, stop);
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(stop);
     }
     if negative { number.wrapping_neg() } else { number }
 }

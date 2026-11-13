@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{Field, Guid, NtStruct, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::{guest_strings, sha1};
 
@@ -13,21 +14,26 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
 /// RtlStringFromGUID: "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" alocado.
 pub fn string_from_guid(guid: u64, output: u64) {
-    let mut text = alloc::format!("{{{:08X}-{:04X}-{:04X}-", guest::read32(guid), guest::read16(guid + 4), guest::read16(guid + 6));
-    for index in 0..2 {
-        text.push_str(&alloc::format!("{:02X}", guest::read8(guid + 8 + index)));
+    // SAFETY: GUID do chamador, vivo e alinhado.
+    let guid = unsafe { Guid::at(guid) };
+    let data4: Vec<u8> = guid.data4.iter().map(Field::get).collect();
+    let mut text = alloc::format!("{{{:08X}-{:04X}-{:04X}-", guid.data1.get(), guid.data2.get(), guid.data3.get());
+    for byte in &data4[..2] {
+        text.push_str(&alloc::format!("{byte:02X}"));
     }
     text.push('-');
-    for index in 2..8 {
-        text.push_str(&alloc::format!("{:02X}", guest::read8(guid + 8 + index)));
+    for byte in &data4[2..] {
+        text.push_str(&alloc::format!("{byte:02X}"));
     }
     text.push('}');
     let length = text.len() as u64 * 2;
     let buffer = guest::alloc_bytes(length + 2);
     guest_strings::write_wide_string(buffer, &text);
-    guest::write16(output, length as u16);
-    guest::write16(output + 2, length as u16 + 2);
-    guest::write64(output + 8, buffer);
+    // SAFETY: PUNICODE_STRING GuidString do chamador.
+    let output = unsafe { UnicodeString::at(output) };
+    output.length.set(length as u16);
+    output.maximum_length.set(length as u16 + 2);
+    output.buffer.set(buffer);
 }
 
 /// RtlGenerateClass5Guid(GUID Namespace, const UCHAR* Name, Len, GUID* Out):
@@ -37,7 +43,7 @@ pub fn generate_class5(namespace: u64, name: u64, name_length: usize, output: u6
     if namespace == 0 || output == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    let ns = guest::read_bytes(namespace, 16);
+    let ns = guest::read_bytes(namespace, Guid::SIZE as usize);
     // Namespace em ordem de rede (big-endian) nos campos Data1/2/3.
     let mut message = Vec::with_capacity(16 + name_length);
     message.extend_from_slice(&[ns[3], ns[2], ns[1], ns[0], ns[5], ns[4], ns[7], ns[6]]);

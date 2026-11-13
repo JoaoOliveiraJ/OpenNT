@@ -3,6 +3,12 @@
 //! Não carrega DLLs, não aloca payloads e não fabrica recursos: o resultado
 //! aponta para os bytes da vista. Todo acesso passa pelo `resource::memory`.
 
+use core::mem::offset_of;
+
+use crate::ntos::inc::types::{
+    ImageDosHeader, ImageNtHeaders64, ImageOptionalHeader64, ImageResourceDataEntry, ImageResourceDirStringU, ImageResourceDirectory, ImageResourceDirectoryEntry,
+    ImageSectionHeader, ImageSectionHeaderMisc, NtStruct,
+};
 use alloc::vec::Vec;
 
 use crate::ntos::rtl::resource::memory as resource_memory;
@@ -93,6 +99,22 @@ fn address_at(image: &Image, offset: i64) -> u64 {
     image.base.wrapping_add(offset as u64)
 }
 
+/// Deslocamento de um campo como `i64` (as contas da árvore são com sinal).
+macro_rules! field {
+    ($type:ty, $($field:tt)+) => {
+        offset_of!($type, $($field)+) as i64
+    };
+}
+
+/// IMAGE_NT_OPTIONAL_HDR64_MAGIC / IMAGE_NT_OPTIONAL_HDR32_MAGIC.
+const PE32_PLUS_MAGIC: u32 = 0x20B;
+const PE32_MAGIC: u32 = 0x10B;
+/// IMAGE_OPTIONAL_HEADER32.DataDirectory (16 bytes antes do PE32+).
+const OPTIONAL32_DATA_DIRECTORY: i64 = 96;
+/// IMAGE_DIRECTORY_ENTRY_RESOURCE e o tamanho de um IMAGE_DATA_DIRECTORY.
+const RESOURCE_DIRECTORY: i64 = 2;
+const DATA_DIRECTORY_SIZE: i64 = 8;
+
 fn read_word(image: &Image, offset: i64) -> Result<u32, KernelError> {
     Ok(resource_memory::read16(address_at(image, offset))? as u32)
 }
@@ -110,16 +132,19 @@ fn contains(image: &Image, offset: i64, length: i64) -> bool {
 /// A seção é escolhida pelo SizeOfRawData, mesmo com VirtualSize diferente;
 /// o limite é exclusivo, salvo o RVA inicial da seção.
 fn section_for_address(image: &Image, relative_address: u32) -> Result<Option<Section>, KernelError> {
+    let section_size = ImageSectionHeader::SIZE as i64;
     for index in 0..image.section_count as i64 {
-        let offset = image.section_table + index * 40;
-        if image.validate && !contains(image, offset, 40) {
+        let offset = image.section_table + index * section_size;
+        if image.validate && !contains(image, offset, section_size) {
             return Ok(None);
         }
-        let virtual_address = read_dword(image, offset + 12)?;
-        let raw_size = read_dword(image, offset + 16)?;
+        let virtual_address = read_dword(image, offset + field!(ImageSectionHeader, virtual_address))?;
+        let raw_size = read_dword(image, offset + field!(ImageSectionHeader, size_of_raw_data))?;
         let raw_end = virtual_address.wrapping_add(raw_size);
         if relative_address == virtual_address || (relative_address > virtual_address && relative_address < raw_end) {
-            return Ok(Some(Section { virtual_address, virtual_size: read_dword(image, offset + 8)?, raw_size, raw_offset: read_dword(image, offset + 20)? }));
+            // Misc.VirtualSize (a união fica no início de `misc`).
+            let virtual_size = read_dword(image, offset + field!(ImageSectionHeader, misc) + field!(ImageSectionHeaderMisc, physical_address))?;
+            return Ok(Some(Section { virtual_address, virtual_size, raw_size, raw_offset: read_dword(image, offset + field!(ImageSectionHeader, pointer_to_raw_data))? }));
         }
     }
     Ok(None)
@@ -130,26 +155,33 @@ fn section_for_address(image: &Image, relative_address: u32) -> Result<Option<Se
 pub fn inspect_header(image_base: u64, mapping_size: u128, raw_file: bool, validate: bool) -> Result<Result<Image, u32>, KernelError> {
     let mut image = Image { base: image_base & !3, size: mapping_size, raw_file, validate, ..Image::default() };
     let invalid = Ok(Err(STATUS_INVALID_IMAGE_FORMAT));
-    if image.base == 0 || image.base as u128 > MAXIMUM_POINTER - 63 || (validate && image.size < 64) || read_word(&image, 0)? != 0x5A4D {
+    let dos_size = ImageDosHeader::SIZE as u128;
+    if image.base == 0 || image.base as u128 > MAXIMUM_POINTER - (dos_size - 1) || (validate && image.size < dos_size) || read_word(&image, field!(ImageDosHeader, e_magic))? != 0x5A4D {
         return invalid;
     }
-    let header_offset = read_dword(&image, 0x3C)?;
+    let header_offset = read_dword(&image, field!(ImageDosHeader, e_lfanew))?;
     let header_address = image.base as u128 + header_offset as u128;
-    if (validate && (header_offset >= 0xFFFF_FFE7 || header_offset as u128 + 24 >= image.size)) || header_address > MAXIMUM_POINTER || (image.base < USER_ADDRESS_LIMIT && header_address + 0x108 >= USER_ADDRESS_LIMIT as u128) || read_dword(&image, header_offset as i64)? != 0x4550 {
+    let optional_start = field!(ImageNtHeaders64, optional_header);
+    if (validate && (header_offset >= 0xFFFF_FFE7 || header_offset as u128 + optional_start as u128 >= image.size))
+        || header_address > MAXIMUM_POINTER
+        || (image.base < USER_ADDRESS_LIMIT && header_address + ImageNtHeaders64::SIZE as u128 >= USER_ADDRESS_LIMIT as u128)
+        || read_dword(&image, header_offset as i64 + field!(ImageNtHeaders64, signature))? != 0x4550
+    {
         return invalid;
     }
-    let optional_header = header_offset as i64 + 24;
-    let directories_offset = match read_word(&image, optional_header)? {
-        0x20B => 112,
-        0x10B => 96,
+    let optional_header = header_offset as i64 + optional_start;
+    let directories_offset = match read_word(&image, optional_header + field!(ImageOptionalHeader64, magic))? {
+        PE32_PLUS_MAGIC => field!(ImageOptionalHeader64, data_directory),
+        PE32_MAGIC => OPTIONAL32_DATA_DIRECTORY,
         _ => return invalid,
     };
     image.optional_header = optional_header;
     image.directories_offset = directories_offset;
-    image.image_size = read_dword(&image, optional_header + 56)?;
-    image.section_count = read_word(&image, header_offset as i64 + 6)?;
-    image.section_table = optional_header + read_word(&image, header_offset as i64 + 20)? as i64;
-    image.headers_size = read_dword(&image, optional_header + 60)?;
+    // SizeOfImage e SizeOfHeaders têm o mesmo deslocamento no PE32.
+    image.image_size = read_dword(&image, optional_header + field!(ImageOptionalHeader64, size_of_image))?;
+    image.section_count = read_word(&image, header_offset as i64 + field!(ImageNtHeaders64, file_header.number_of_sections))?;
+    image.section_table = optional_header + read_word(&image, header_offset as i64 + field!(ImageNtHeaders64, file_header.size_of_optional_header))? as i64;
+    image.headers_size = read_dword(&image, optional_header + field!(ImageOptionalHeader64, size_of_headers))?;
     Ok(Ok(image))
 }
 
@@ -160,10 +192,11 @@ pub fn inspect(image_base: u64, mapping_size: u128, raw_file: bool, validate: bo
     };
     let (optional_header, directories_offset) = (image.optional_header, image.directories_offset);
     let invalid = Ok(Err(STATUS_INVALID_IMAGE_FORMAT));
-    if read_dword(&image, optional_header + directories_offset - 4)? <= 2 {
+    // NumberOfRvaAndSizes precede o vetor de diretórios nos dois formatos.
+    if read_dword(&image, optional_header + directories_offset - 4)? <= RESOURCE_DIRECTORY as u32 {
         return Ok(Err(STATUS_RESOURCE_DATA_NOT_FOUND));
     }
-    image.resource_address = read_dword(&image, optional_header + directories_offset + 16)?;
+    image.resource_address = read_dword(&image, optional_header + directories_offset + RESOURCE_DIRECTORY * DATA_DIRECTORY_SIZE)?;
     if image.resource_address == 0 {
         return Ok(Err(STATUS_RESOURCE_DATA_NOT_FOUND));
     }
@@ -179,14 +212,14 @@ pub fn inspect(image_base: u64, mapping_size: u128, raw_file: bool, validate: bo
         }
         image.root_offset = image.resource_address as i64 - section.virtual_address as i64 + section.raw_offset as i64;
     }
-    if image.validate && (image.root_offset <= 0 || !contains(&image, image.root_offset, 16)) {
+    if image.validate && (image.root_offset <= 0 || !contains(&image, image.root_offset, ImageResourceDirectory::SIZE as i64)) {
         return invalid;
     }
     // O tamanho do DataDirectory não limita a árvore: o kernel usa a extensão
     // da vista. Directory.Size == 0 continua pesquisável.
-    let names = read_word(&image, image.root_offset + 12)? as i64;
-    let identifiers = read_word(&image, image.root_offset + 14)? as i64;
-    if image.validate && !contains(&image, image.root_offset, (names + identifiers) * 8) {
+    let names = read_word(&image, image.root_offset + field!(ImageResourceDirectory, number_of_named_entries))? as i64;
+    let identifiers = read_word(&image, image.root_offset + field!(ImageResourceDirectory, number_of_id_entries))? as i64;
+    if image.validate && !contains(&image, image.root_offset, (names + identifiers) * ImageResourceDirectoryEntry::SIZE as i64) {
         return invalid;
     }
     Ok(Ok(image))
@@ -195,7 +228,7 @@ pub fn inspect(image_base: u64, mapping_size: u128, raw_file: bool, validate: bo
 /// Compara as unidades UTF-16 sem alterar a caixa; identificadores inteiros
 /// usam a outra faixa do diretório.
 fn compare_name(image: &Image, entry_offset: i64, key: &Key) -> Result<Result<i32, u32>, KernelError> {
-    let encoded = read_dword(image, entry_offset)?;
+    let encoded = read_dword(image, entry_offset + field!(ImageResourceDirectoryEntry, name))?;
     if let Key::Id(identifier) = key {
         if encoded & 0x8000_0000 != 0 {
             return Ok(Ok(1));
@@ -212,14 +245,14 @@ fn compare_name(image: &Image, entry_offset: i64, key: &Key) -> Result<Result<i3
     if image.validate && (name_offset < image.root_offset || name_offset as u128 > image.size) {
         return Ok(Err(STATUS_INVALID_IMAGE_FORMAT));
     }
-    let length = read_word(image, name_offset)? as usize;
+    let length = read_word(image, name_offset + field!(ImageResourceDirStringU, length))? as usize;
     for index in 0..length {
         let wanted = match key {
             Key::Name(units) => units.get(index).copied().unwrap_or(0),
             Key::Pointer(pointer) => resource_memory::read16(pointer.wrapping_add(index as u64 * 2))?,
             Key::Id(_) => 0,
         } as u32;
-        let available = read_word(image, name_offset + 2 + index as i64 * 2)?;
+        let available = read_word(image, name_offset + field!(ImageResourceDirStringU, name_string) + index as i64 * 2)?;
         if wanted != available {
             return Ok(Ok(if wanted < available { -1 } else { 1 }));
         }
@@ -253,15 +286,18 @@ enum Entry {
 }
 
 fn find_entry(image: &Image, directory_offset: i64, key: &Key, select_first: bool) -> Result<Entry, KernelError> {
-    if image.validate && !contains(image, directory_offset, 24) {
+    let entry_size = ImageResourceDirectoryEntry::SIZE as i64;
+    let entries = ImageResourceDirectory::SIZE as i64;
+    if image.validate && !contains(image, directory_offset, entries + entry_size) {
         return Ok(Entry::Status(STATUS_INVALID_IMAGE_FORMAT));
     }
-    let named = read_word(image, directory_offset + 12)? as i64;
-    let identifiers = read_word(image, directory_offset + 14)? as i64;
+    let named = read_word(image, directory_offset + field!(ImageResourceDirectory, number_of_named_entries))? as i64;
+    let identifiers = read_word(image, directory_offset + field!(ImageResourceDirectory, number_of_id_entries))? as i64;
     let numeric = matches!(key, Key::Id(_));
-    let first = directory_offset + 16 + if numeric { named * 8 } else { 0 };
+    // As entradas seguem o diretório: primeiro as nomeadas, depois as de Id.
+    let first = directory_offset + entries + if numeric { named * entry_size } else { 0 };
     let count = if numeric { identifiers } else { named };
-    if image.validate && (!contains(image, directory_offset + 16, named * 8) || !contains(image, first, count * 8)) {
+    if image.validate && (!contains(image, directory_offset + entries, named * entry_size) || !contains(image, first, count * entry_size)) {
         return Ok(Entry::Status(STATUS_INVALID_IMAGE_FORMAT));
     }
     if count == 0 {
@@ -277,7 +313,7 @@ fn find_entry(image: &Image, directory_offset: i64, key: &Key, select_first: boo
     while remaining != 0 {
         let half = remaining >> 1;
         let middle = lower + if half != 0 { half - if remaining % 2 != 0 { 0 } else { 1 } } else { 0 };
-        let entry = first + middle * 8;
+        let entry = first + middle * entry_size;
         let order = match compare_name(image, entry, key)? {
             Ok(order) => order,
             Err(status) => return Ok(Entry::Status(status)),
@@ -298,16 +334,16 @@ fn find_entry(image: &Image, directory_offset: i64, key: &Key, select_first: boo
 /// Folha: em layout bruto, o RVA dos dados pode pertencer a outra seção.
 /// Sem validação, a aritmética do contrato é preservada.
 fn resolve_leaf(image: &Image, entry_offset: i64, selected_language: u32) -> Result<Found, KernelError> {
-    let encoded_child = read_dword(image, entry_offset + 4)?;
+    let encoded_child = read_dword(image, entry_offset + field!(ImageResourceDirectoryEntry, offset_to_data))?;
     if image.validate && encoded_child & 0x8000_0000 != 0 {
         return Ok(Found::fail(STATUS_INVALID_IMAGE_FORMAT));
     }
     let leaf = image.root_offset + encoded_child as i64;
-    if image.validate && (leaf <= image.root_offset || !contains(image, leaf, 16)) {
+    if image.validate && (leaf <= image.root_offset || !contains(image, leaf, ImageResourceDataEntry::SIZE as i64)) {
         return Ok(Found::fail(STATUS_INVALID_IMAGE_FORMAT));
     }
-    let data_address = read_dword(image, leaf)?;
-    let data_size = read_dword(image, leaf + 4)?;
+    let data_address = read_dword(image, leaf + field!(ImageResourceDataEntry, offset_to_data))?;
+    let data_size = read_dword(image, leaf + field!(ImageResourceDataEntry, size))?;
     let mut data_offset = data_address as i64;
     if image.raw_file {
         let Some(resource_section) = section_for_address(image, image.resource_address)? else { return Ok(Found::fail(STATUS_INVALID_IMAGE_FORMAT)) };
@@ -341,7 +377,7 @@ pub fn lookup_unchecked(image: &Image, resource_type: &Key, resource_name: &Key,
             Entry::Missing => return Ok(Found::fail(missing)),
             Entry::At(entry) => entry,
         };
-        let child = read_dword(image, entry + 4)?;
+        let child = read_dword(image, entry + field!(ImageResourceDirectoryEntry, offset_to_data))?;
         if child & 0x8000_0000 == 0 {
             if image.validate {
                 return Ok(Found::fail(STATUS_INVALID_IMAGE_FORMAT));
@@ -356,7 +392,7 @@ pub fn lookup_unchecked(image: &Image, resource_type: &Key, resource_name: &Key,
         directory_offset = image.root_offset + (child & 0x7FFF_FFFF) as i64;
         if options.count == index as u32 + 1 {
             // A própria IMAGE_RESOURCE_DIRECTORY, sem tamanho nem cópia.
-            if image.validate && !contains(image, directory_offset, 24) {
+            if image.validate && !contains(image, directory_offset, (ImageResourceDirectory::SIZE + ImageResourceDirectoryEntry::SIZE) as i64) {
                 return Ok(Found::fail(STATUS_INVALID_IMAGE_FORMAT));
             }
             return Ok(Found { address: address_at(image, directory_offset), directory: true, ..Found::default() });
@@ -383,7 +419,7 @@ pub fn lookup_unchecked(image: &Image, resource_type: &Key, resource_name: &Key,
                 if options.directory {
                     return Ok(Found::fail(STATUS_RESOURCE_LANG_NOT_FOUND));
                 }
-                return resolve_leaf(image, entry, read_dword(image, entry)? & 0xFFFF);
+                return resolve_leaf(image, entry, read_dword(image, entry + field!(ImageResourceDirectoryEntry, name))? & 0xFFFF);
             }
         }
     }

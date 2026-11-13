@@ -8,49 +8,55 @@
 //! busca e a enumeração em ordem sobem o elemento achado para a raiz, e
 //! RtlGetElementGenericTable segue a ordem de inserção.
 
-use crate::hal::amd64::native_call;
-use crate::ntos::mm::guest_memory as guest;
+use core::mem::{offset_of, size_of};
+
 use super::avltable::{EMPTY_TREE, FOUND_NODE, GREATER_THAN, INSERT_AS_LEFT, INSERT_AS_RIGHT, LESS_THAN};
+use crate::hal::amd64::native_call;
+use crate::ntos::inc::types::{Field, ListEntry, NtStruct, RtlGenericTable, RtlSplayLinks};
+use crate::ntos::mm::guest_memory as guest;
 
-const PARENT: u64 = 0x00;
-const LEFT: u64 = 0x08;
-const RIGHT: u64 = 0x10;
-
-/// Offsets do RTL_GENERIC_TABLE.
-pub mod table {
-    pub const TABLE_ROOT: u64 = 0x00;
-    pub const INSERT_ORDER_LIST: u64 = 0x08;
-    pub const ORDERED_POINTER: u64 = 0x18;
-    pub const WHICH_ORDERED_ELEMENT: u64 = 0x20;
-    pub const NUMBER_ELEMENTS: u64 = 0x24;
-    pub const COMPARE_ROUTINE: u64 = 0x28;
-    pub const ALLOCATE_ROUTINE: u64 = 0x30;
-    pub const FREE_ROUTINE: u64 = 0x38;
-    pub const TABLE_CONTEXT: u64 = 0x40;
-    pub const SIZE: u64 = 0x48;
+/// Cabeçalho de cada elemento (o TABLE_ENTRY_HEADER privado do gentable):
+/// os splay links, o LIST_ENTRY da ordem de inserção e então os dados.
+#[repr(C)]
+struct TableEntryHeader {
+    splay_links: RtlSplayLinks,
+    list_entry: ListEntry,
 }
 
-/// O LIST_ENTRY da ordem de inserção e os dados, depois dos splay links.
-const LIST_ENTRY: u64 = 0x18;
-pub const USER_DATA: u64 = 0x28;
+// SAFETY: #[repr(C)] só de estruturas de células.
+unsafe impl NtStruct for TableEntryHeader {}
 
+const _: () = {
+    assert!(size_of::<TableEntryHeader>() == 0x28);
+    assert!(offset_of!(TableEntryHeader, list_entry) == 0x18);
+};
+
+/// Deslocamento do LIST_ENTRY e dos dados do usuário no elemento.
+const LIST_ENTRY: u64 = offset_of!(TableEntryHeader, list_entry) as u64;
+pub const USER_DATA: u64 = TableEntryHeader::SIZE;
+
+/// PRTL_SPLAY_LINKS: nós vivos da árvore do chamador.
+fn links(node: u64) -> &'static RtlSplayLinks {
+    // SAFETY: nó vivo e alinhado (alocado pelo chamador ou pela tabela).
+    unsafe { RtlSplayLinks::at(node) }
+}
 fn parent(node: u64) -> u64 {
-    guest::read64(node + PARENT)
+    links(node).parent.get()
 }
 fn left(node: u64) -> u64 {
-    guest::read64(node + LEFT)
+    links(node).left_child.get()
 }
 fn right(node: u64) -> u64 {
-    guest::read64(node + RIGHT)
+    links(node).right_child.get()
 }
 fn set_parent(node: u64, value: u64) {
-    guest::write64(node + PARENT, value);
+    links(node).parent.set(value);
 }
 fn set_left(node: u64, value: u64) {
-    guest::write64(node + LEFT, value);
+    links(node).left_child.set(value);
 }
 fn set_right(node: u64, value: u64) {
-    guest::write64(node + RIGHT, value);
+    links(node).right_child.set(value);
 }
 fn is_root(node: u64) -> bool {
     parent(node) == node
@@ -241,53 +247,66 @@ pub fn delete(node: u64) -> u64 {
 /// RtlDeleteNoSplay: tira o nó sem reorganizar; a raiz muda só se era ele.
 pub fn delete_no_splay(node: u64, root: u64) {
     if let (Some(new_root), _) = detach(node) {
-        guest::write64(root, new_root);
+        // SAFETY: PRTL_SPLAY_LINKS* Root do chamador.
+        unsafe { Field::<u64>::at(root) }.set(new_root);
     }
 }
 
 // ---- RTL_GENERIC_TABLE --------------------------------------------------
 
-fn root(table: u64) -> u64 {
-    guest::read64(table + table::TABLE_ROOT)
+/// PRTL_GENERIC_TABLE do chamador.
+fn generic(table: u64) -> &'static RtlGenericTable {
+    // SAFETY: tabela viva e alinhada, inicializada pelo RtlInitializeGenericTable.
+    unsafe { RtlGenericTable::at(table) }
 }
 
-fn set_root(table: u64, node: u64) {
-    guest::write64(table + table::TABLE_ROOT, node);
+/// O cabeçalho do elemento `node`.
+fn header(node: u64) -> &'static TableEntryHeader {
+    // SAFETY: elemento vivo alocado pela AllocateRoutine da tabela.
+    unsafe { TableEntryHeader::at(node) }
+}
+
+/// Parâmetro de saída escalar do chamador (PBOOLEAN, PVOID*, enum...).
+fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: ponteiro de saída do chamador, vivo e alinhado.
+    unsafe { Field::<T>::at(address) }
 }
 
 pub fn number(table: u64) -> u32 {
-    guest::read32(table + table::NUMBER_ELEMENTS)
+    generic(table).number_generic_table_elements.get()
 }
 
 pub fn is_empty(table: u64) -> bool {
-    root(table) == 0
+    generic(table).table_root.get() == 0
 }
 
-fn reset_order_cache(table: u64) {
-    guest::write64(table + table::ORDERED_POINTER, table + table::INSERT_ORDER_LIST);
-    guest::write32(table + table::WHICH_ORDERED_ELEMENT, 0);
+fn reset_order_cache(table: &RtlGenericTable) {
+    table.ordered_pointer.set(table.insert_order_list.address());
+    table.which_ordered_element.set(0);
 }
 
 /// RtlInitializeGenericTable.
 pub fn initialize(table: u64, compare: u64, allocate: u64, free: u64, context: u64) {
-    guest::write_bytes(table, &[0; table::SIZE as usize]);
-    let list = table + table::INSERT_ORDER_LIST;
-    guest::write64(list, list);
-    guest::write64(list + 8, list);
+    guest::write_bytes(table, &[0; size_of::<RtlGenericTable>()]);
+    let table = generic(table);
+    let list = &table.insert_order_list;
+    list.flink.set(list.address());
+    list.blink.set(list.address());
     reset_order_cache(table);
-    guest::write64(table + table::COMPARE_ROUTINE, compare);
-    guest::write64(table + table::ALLOCATE_ROUTINE, allocate);
-    guest::write64(table + table::FREE_ROUTINE, free);
-    guest::write64(table + table::TABLE_CONTEXT, context);
+    table.compare_routine.set(compare);
+    table.allocate_routine.set(allocate);
+    table.free_routine.set(free);
+    table.table_context.set(context);
 }
 
-fn compare(table: u64, buffer: u64, node: u64) -> u64 {
-    native_call::call(guest::read64(table + table::COMPARE_ROUTINE), &[table, buffer, node + USER_DATA]) & 0xFFFF_FFFF
+fn compare(table: &RtlGenericTable, buffer: u64, node: u64) -> u64 {
+    native_call::call(table.compare_routine.get(), &[table.address(), buffer, node + USER_DATA]) & 0xFFFF_FFFF
 }
 
 /// Busca sem reorganizar: (resultado, nó ou pai do ponto de inserção).
 pub fn find(table: u64, buffer: u64) -> (u32, u64) {
-    let mut node = root(table);
+    let table = generic(table);
+    let mut node = table.table_root.get();
     if node == 0 {
         return (EMPTY_TREE, 0);
     }
@@ -308,21 +327,22 @@ pub fn find(table: u64, buffer: u64) -> (u32, u64) {
 
 /// RtlInsertElementGenericTableFull.
 pub fn insert_full(table: u64, buffer: u64, size: u32, new_element: u64, node_or_parent: u64, result: u32) -> u64 {
+    let table = generic(table);
     if result == FOUND_NODE {
-        set_root(table, splay(node_or_parent));
+        table.table_root.set(splay(node_or_parent));
         if new_element != 0 {
-            guest::write8(new_element, 0);
+            out::<u8>(new_element).set(0);
         }
         return node_or_parent + USER_DATA;
     }
-    let node = native_call::call(guest::read64(table + table::ALLOCATE_ROUTINE), &[table, size as u64 + USER_DATA]);
+    let node = native_call::call(table.allocate_routine.get(), &[table.address(), size as u64 + USER_DATA]);
     if node == 0 {
         if new_element != 0 {
-            guest::write8(new_element, 0);
+            out::<u8>(new_element).set(0);
         }
         return 0;
     }
-    guest::write_bytes(node, &[0; USER_DATA as usize]);
+    guest::write_bytes(node, &[0; size_of::<TableEntryHeader>()]);
     set_parent(node, node);
     if size != 0 && buffer != 0 {
         guest::write_bytes(node + USER_DATA, &guest::read_bytes(buffer, size as usize));
@@ -339,17 +359,19 @@ pub fn insert_full(table: u64, buffer: u64, size: u32, new_element: u64, node_or
         _ => {}
     }
     // InsertTailList na ordem de inserção.
-    let list = table + table::INSERT_ORDER_LIST;
-    let entry = node + LIST_ENTRY;
-    let tail = guest::read64(list + 8);
-    guest::write64(entry, list);
-    guest::write64(entry + 8, tail);
-    guest::write64(tail, entry);
-    guest::write64(list + 8, entry);
-    guest::write32(table + table::NUMBER_ELEMENTS, number(table) + 1);
-    set_root(table, splay(node));
+    let list = &table.insert_order_list;
+    let entry = &header(node).list_entry;
+    let tail = list.blink.get();
+    entry.flink.set(list.address());
+    entry.blink.set(tail);
+    // SAFETY: o último LIST_ENTRY da ordem de inserção (ou a própria cabeça).
+    unsafe { ListEntry::at(tail) }.flink.set(entry.address());
+    list.blink.set(entry.address());
+    let count = &table.number_generic_table_elements;
+    count.set(count.get() + 1);
+    table.table_root.set(splay(node));
     if new_element != 0 {
-        guest::write8(new_element, 1);
+        out::<u8>(new_element).set(1);
     }
     node + USER_DATA
 }
@@ -363,8 +385,8 @@ pub fn insert(table: u64, buffer: u64, size: u32, new_element: u64) -> u64 {
 /// RtlLookupElementGenericTableFull: sem reorganizar.
 pub fn lookup_full(table: u64, buffer: u64, node_or_parent: u64, search_result: u64) -> u64 {
     let (result, at) = find(table, buffer);
-    guest::write64(node_or_parent, at);
-    guest::write32(search_result, result);
+    out::<u64>(node_or_parent).set(at);
+    out::<u32>(search_result).set(result);
     if result == FOUND_NODE { at + USER_DATA } else { 0 }
 }
 
@@ -372,7 +394,7 @@ pub fn lookup_full(table: u64, buffer: u64, node_or_parent: u64, search_result: 
 pub fn lookup(table: u64, buffer: u64) -> u64 {
     match find(table, buffer) {
         (FOUND_NODE, node) => {
-            set_root(table, splay(node));
+            generic(table).table_root.set(splay(node));
             node + USER_DATA
         }
         _ => 0,
@@ -380,17 +402,22 @@ pub fn lookup(table: u64, buffer: u64) -> u64 {
 }
 
 /// RtlDeleteElementGenericTable.
-pub fn delete_element(table: u64, buffer: u64) -> bool {
-    let (FOUND_NODE, node) = find(table, buffer) else { return false };
-    set_root(table, delete(node));
+pub fn delete_element(address: u64, buffer: u64) -> bool {
+    let (FOUND_NODE, node) = find(address, buffer) else { return false };
+    let table = generic(address);
+    table.table_root.set(delete(node));
     // RemoveEntryList da ordem de inserção.
-    let entry = node + LIST_ENTRY;
-    let (next, previous) = (guest::read64(entry), guest::read64(entry + 8));
-    guest::write64(previous, next);
-    guest::write64(next + 8, previous);
-    guest::write32(table + table::NUMBER_ELEMENTS, number(table).saturating_sub(1));
+    let entry = &header(node).list_entry;
+    let (next, previous) = (entry.flink.get(), entry.blink.get());
+    // SAFETY: vizinhos vivos na lista da ordem de inserção.
+    unsafe {
+        ListEntry::at(previous).flink.set(next);
+        ListEntry::at(next).blink.set(previous);
+    }
+    let count = &table.number_generic_table_elements;
+    count.set(count.get().saturating_sub(1));
     reset_order_cache(table);
-    native_call::call(guest::read64(table + table::FREE_ROUTINE), &[table, node]);
+    native_call::call(table.free_routine.get(), &[address, node]);
     true
 }
 
@@ -403,7 +430,8 @@ fn leftmost(mut node: u64) -> u64 {
 
 /// RtlEnumerateGenericTable: em ordem, com o último devolvido na raiz.
 pub fn enumerate(table: u64, restart: bool) -> u64 {
-    let current = root(table);
+    let table = generic(table);
+    let current = table.table_root.get();
     if current == 0 {
         return 0;
     }
@@ -411,44 +439,47 @@ pub fn enumerate(table: u64, restart: bool) -> u64 {
     if node == 0 {
         return 0;
     }
-    set_root(table, splay(node));
+    table.table_root.set(splay(node));
     node + USER_DATA
 }
 
 /// RtlEnumerateGenericTableWithoutSplaying: a chave guarda o último nó.
 pub fn enumerate_without_splaying(table: u64, restart_key: u64) -> u64 {
-    let previous = guest::read64(restart_key);
+    let key = out::<u64>(restart_key);
+    let previous = key.get();
     let node = if previous == 0 {
-        match root(table) {
+        match generic(table).table_root.get() {
             0 => 0,
             current => leftmost(current),
         }
     } else {
         real_successor(previous)
     };
-    guest::write64(restart_key, node);
+    key.set(node);
     if node == 0 { 0 } else { node + USER_DATA }
 }
 
 /// RtlGetElementGenericTable: o I-ésimo na ordem de inserção, a partir do
 /// último achado (OrderedPointer/WhichOrderedElement) quando ele vem antes.
 pub fn get_element(table: u64, index: u32) -> u64 {
-    if index == u32::MAX || index >= number(table) {
+    let table = generic(table);
+    if index == u32::MAX || index >= table.number_generic_table_elements.get() {
         return 0;
     }
     let wanted = index + 1;
-    let list = table + table::INSERT_ORDER_LIST;
-    let cached = guest::read32(table + table::WHICH_ORDERED_ELEMENT);
+    let cached = table.which_ordered_element.get();
     let (mut entry, mut position) = if cached != 0 && cached <= wanted {
-        (guest::read64(table + table::ORDERED_POINTER), cached)
+        (table.ordered_pointer.get(), cached)
     } else {
-        (list, 0)
+        (table.insert_order_list.address(), 0)
     };
     while position < wanted {
-        entry = guest::read64(entry);
+        // SAFETY: LIST_ENTRY vivo da ordem de inserção.
+        entry = unsafe { ListEntry::at(entry) }.flink.get();
         position += 1;
     }
-    guest::write64(table + table::ORDERED_POINTER, entry);
-    guest::write32(table + table::WHICH_ORDERED_ELEMENT, wanted);
+    table.ordered_pointer.set(entry);
+    table.which_ordered_element.set(wanted);
     entry - LIST_ENTRY + USER_DATA
 }
+
