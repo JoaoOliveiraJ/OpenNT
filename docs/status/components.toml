@@ -195,9 +195,10 @@ categoria = "Núcleo do kernel"
 icone = "memory"
 descricao = "Controla as páginas de memória física, as tabelas de páginas e o pool de memória do kernel."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/mm/pfn.rs", "kernel/src/ntos/mm/paging.rs", "kernel/src/ntos/mm/kernel_pool.rs"]
+caminhos = ["kernel/src/ntos/mm/pfn.rs", "kernel/src/ntos/mm/paging.rs", "kernel/src/ntos/mm/kernel_pool.rs", "kernel/src/ntos/mm/guest_memory.rs"]
 testes = ["selftest"]
 fase = "2"
+notas = "A memória que os drivers enxergam é acessada como no NT: uma instrução por acesso, direto pelo endereço virtual, respeitando páginas somente leitura e cópia na escrita; a falta de página do anel 0 passa pelo Mm antes do bugcheck, e as PTEs são gravadas numa única escrita de 64 bits. Ponteiros vindos do modo usuário são sondados antes (o papel do __try/ProbeForRead) e devolvem STATUS_ACCESS_VIOLATION."
 
 [[componente]]
 nome = "Multiprocessador (SMP)"
@@ -230,6 +231,7 @@ estado = "implementado"
 caminhos = ["kernel/src/ntos/ke/dispatcher.rs", "kernel/src/ntos/ke/apc.rs", "kernel/src/ntos/ke/timer.rs", "kernel/src/ntos/ke/dpc.rs"]
 testes = ["fase3", "selftest"]
 fase = "3"
+notas = "Interlocked*, spin locks, push locks, rundown e contagens de referência usam instruções atômicas de verdade (lock cmpxchg/xadd), como no NT, seguras com várias CPUs."
 
 [[componente]]
 nome = "Gerenciador de objetos e namespace"
@@ -261,7 +263,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
 testes = ["fase4", "teclado"]
 fase = "4"
-notas = "A pilha de teclado do Windows (i8042prt.sys e kbdclass.sys) já roda sobre ele."
+notas = "A pilha de teclado do Windows (i8042prt.sys e kbdclass.sys) já roda sobre ele. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows)."
 
 [[componente]]
 nome = "Registro"
@@ -283,7 +285,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers da categoria Drivers do Windows já carregam por ele; dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl)."
+notas = "Os drivers da categoria Drivers do Windows já carregam por ele; dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda (o caminho do win32k.sys real). A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta, como no NT."
 
 [[componente]]
 nome = "Vídeo VGA em modo texto"
@@ -617,7 +619,7 @@ fase = "6"
 pasta = "ntos/inc"
 nome = "Cabeçalhos do NT (inc)"
 icone = "book"
-descricao = "Layouts das estruturas do WDK (wdm.h/ntddk.h) e os NTSTATUS usados pelo kernel."
+descricao = "As estruturas do NT geradas dos símbolos do próprio ntoskrnl (466 tipos, com tamanho e offsets conferidos na compilação), as do WDK que os símbolos não trazem e os NTSTATUS; acesso tipado por campo, como o C do NT."
 fase = "2"
 
 [[subsistema]]
