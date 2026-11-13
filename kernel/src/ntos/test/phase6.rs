@@ -5179,5 +5179,117 @@ pub fn run(assert: Assert) {
     io_named_event_exports(assert);
     io_wmi_data_block_exports(assert);
     io_work_item_queue_exports(assert);
+    nt_struct_field_access(assert);
     debug_print!("PHASE6_SELFTEST_OK");
+}
+
+/// Estruturas do NT tipadas (`inc::types`, geradas dos símbolos) sobre
+/// memória de convidado: células `Field`, caminhos aninhados, vistas de
+/// uniões, atômicos, bitfields, vetores, campo desalinhado e sondas.
+fn nt_struct_field_access(assert: Assert) {
+    use core::sync::atomic::Ordering;
+
+    use crate::ntos::inc::nt_abi::{driver_object, irp as irp_layout};
+    use crate::ntos::inc::types::{
+        CmPartialResourceDescriptor, DispatcherHeader, DriverObject, Irp, Kthread, ObjectHeader,
+    };
+    use crate::ntos::inc::NtStruct;
+
+    // IRP: u8/u16/u32/u64 e caminhos aninhados (IoStatus, Tail.Overlay).
+    let block = guest::alloc_bytes(Irp::SIZE);
+    // SAFETY: bloco zerado e alinhado do tamanho do IRP.
+    let irp = unsafe { Irp::at(block) };
+    irp.size.set(0xD0);
+    irp.stack_count.set(3);
+    irp.cancel.set(1);
+    irp.flags.set(0x1234_5678);
+    irp.io_status.status.set(0x103);
+    irp.io_status.information.set(0x1122_3344_5566_7788);
+    irp.tail.overlay.current_stack_location.set(0xFFFF_8000_1234_5678);
+    assert(guest::read16(block + irp_layout::SIZE_FIELD) == 0xD0 && guest::read8(block + irp_layout::STACK_COUNT) == 3 && guest::read8(block + irp_layout::CANCEL) == 1 && guest::read32(block + irp_layout::FLAGS) == 0x1234_5678 && guest::read32(block + irp_layout::IO_STATUS) == 0x103 && guest::read64(block + irp_layout::IO_STATUS_INFORMATION) == 0x1122_3344_5566_7788 && guest::read64(block + irp_layout::CURRENT_STACK_LOCATION) == 0xFFFF_8000_1234_5678, "ntstruct: set de u8/u16/u32/u64 e caminhos aninhados no IRP");
+    guest::write32(block + irp_layout::IO_STATUS, 0xC000_0001);
+    guest::write64(block + irp_layout::USER_BUFFER, 0x7FFE_0000_1000);
+    assert(irp.io_status.status.get() == 0xC000_0001u32 as i32 && irp.user_buffer.get() == 0x7FFE_0000_1000 && irp.stack_count.get() == 3, "ntstruct: get le o que outro escritor gravou");
+    assert(irp.address() == block && irp.io_status.address() == block + irp_layout::IO_STATUS && irp.io_status.information.address() == block + irp_layout::IO_STATUS_INFORMATION, "ntstruct: enderecos de objeto e de campo");
+
+    // União anônima: IO_STATUS_BLOCK.Pointer sobre Status (vista por Deref).
+    irp.io_status.pointer.set(0xAAAA_BBBB_CCCC_DDDD);
+    assert(irp.io_status.status.get() as u32 == 0xCCCC_DDDD && guest::read64(block + irp_layout::IO_STATUS) == 0xAAAA_BBBB_CCCC_DDDD, "ntstruct: membro de uniao anonima (Status/Pointer)");
+
+    // Sondas (ponteiro não confiável).
+    assert(Irp::try_at(0).is_err() && Irp::try_at(block + 1).is_err() && Irp::try_at(block).is_ok_and(|probed| probed.flags.get() == 0x1234_5678), "ntstruct: try_at recusa nulo e desalinhado e aceita o IRP");
+    assert(irp.flags.probe_get().is_ok_and(|flags| flags == 0x1234_5678) && irp.io_status.information.probe_set(7).is_ok() && irp.io_status.information.get() == 7, "ntstruct: probe_get/probe_set");
+    guest::free_bytes(block);
+
+    // Atômicos: contador de referências do OBJECT_HEADER.
+    let block = guest::alloc_bytes(ObjectHeader::SIZE);
+    // SAFETY: bloco zerado do tamanho do cabeçalho.
+    let header = unsafe { ObjectHeader::at(block) };
+    header.pointer_count.set(1);
+    header.pointer_count.atomic().fetch_add(2, Ordering::SeqCst);
+    let previous = header.handle_count.atomic().fetch_sub(1, Ordering::SeqCst);
+    assert(header.pointer_count.get() == 3 && previous == 0 && header.handle_count.get() == -1 && guest::read64(block) == 3, "ntstruct: fetch_add/fetch_sub atomicos em i64");
+    header.flags.set(0);
+    header.set_permanent_object(1);
+    header.set_kernel_object(1);
+    assert(header.flags.get() == 0x12 && header.permanent_object() == 1 && header.new_object() == 0 && ObjectHeader::PERMANENT_OBJECT_MASK == 0x10, "ntstruct: bitfields do OBJECT_HEADER (Flags)");
+    guest::free_bytes(block);
+
+    // Vistas do DISPATCHER_HEADER (Lock sobre Type/Signalling/Size) e bitfield do KTHREAD.
+    let block = guest::alloc_bytes(Kthread::SIZE);
+    // SAFETY: bloco zerado do tamanho do KTHREAD.
+    let thread = unsafe { Kthread::at(block) };
+    let dispatcher: &DispatcherHeader = &thread.header;
+    dispatcher.lock.set(0x0004_0601);
+    dispatcher.signal_state.set(-2);
+    assert(dispatcher.type_.get() == 1 && dispatcher.signalling.get() == 6 && dispatcher.size.get() == 4 && guest::read32(block + 4) == 0xFFFF_FFFE, "ntstruct: vistas do DISPATCHER_HEADER");
+    thread.misc_flags.set(0x11);
+    thread.set_system_thread(1);
+    thread.state.set(5);
+    assert(thread.misc_flags.get() == 0x411 && thread.system_thread() == 1 && thread.alertable() == 1 && Kthread::SYSTEM_THREAD_SHIFT == 10 && guest::read8(block + 0x184) == 5, "ntstruct: bitfield com CAS e campo sobreposto (State)");
+    guest::free_bytes(block);
+
+    // Vetor de células: DRIVER_OBJECT.MajorFunction[IRP_MJ_DEVICE_CONTROL].
+    let block = guest::alloc_bytes(DriverObject::SIZE);
+    // SAFETY: bloco zerado do tamanho do DRIVER_OBJECT.
+    let driver = unsafe { DriverObject::at(block) };
+    driver.major_function[0x0E].set(0xFFFF_F800_0000_1234);
+    assert(guest::read64(block + driver_object::MAJOR_FUNCTION + 0x0E * 8) == 0xFFFF_F800_0000_1234 && driver.major_function.len() == 28, "ntstruct: vetor de celulas (MajorFunction)");
+    guest::free_bytes(block);
+
+    // Campo desalinhado (#pragma pack(4)): u.Interrupt.Affinity em +0xC.
+    let block = guest::alloc_bytes(0x20);
+    // SAFETY: bloco zerado maior que o descritor.
+    let descriptor = unsafe { CmPartialResourceDescriptor::at(block) };
+    descriptor.type_.set(2);
+    descriptor.u.interrupt.affinity.set(0x8000_0000_0000_0003);
+    assert(CmPartialResourceDescriptor::SIZE == 0x14 && guest::read32(block + 0xC) == 3 && guest::read32(block + 0x10) == 0x8000_0000 && descriptor.u.interrupt.affinity.get() == 0x8000_0000_0000_0003, "ntstruct: campo desalinhado de estrutura empacotada");
+    guest::free_bytes(block);
+
+    // Estrutura do WDK fora dos símbolos (types/wdk.rs) e struct própria fora
+    // dos arquivos gerados, com a mesma receita (Field/Reserved/NtStruct).
+    use crate::ntos::inc::field::{Field, Reserved};
+    use crate::ntos::inc::types::{ListEntry, ObCallbackRegistration};
+    #[repr(C)]
+    struct PrivateBody {
+        count: Field<u32>,
+        _pad_4: Reserved<4>,
+        links: ListEntry,
+    }
+    // SAFETY: #[repr(C)] só de células.
+    unsafe impl NtStruct for PrivateBody {}
+    const _: () = assert!(core::mem::size_of::<PrivateBody>() == 0x18 && core::mem::offset_of!(PrivateBody, links) == 8);
+    let block = guest::alloc_bytes(0x40);
+    // SAFETY: bloco zerado de 0x40 bytes.
+    let registration = unsafe { ObCallbackRegistration::at(block) };
+    registration.version.set(0x100);
+    registration.altitude.length.set(12);
+    registration.operation_registration.set(0xFFFF_8000_0000_0040);
+    assert(guest::read16(block) == 0x100 && guest::read16(block + 8) == 12 && guest::read64(block + 0x20) == 0xFFFF_8000_0000_0040, "ntstruct: estrutura do WDK fora dos simbolos (OB_CALLBACK_REGISTRATION)");
+    // SAFETY: mesmo bloco, reinterpretado como a struct própria.
+    let body = unsafe { PrivateBody::at(block) };
+    body.count.atomic().fetch_add(5, Ordering::SeqCst);
+    body.links.flink.set(block + 8);
+    assert(body.count.get() == 0x105 &&guest::read64(block + 8) == block + 8 && body.links.address() == block + 8, "ntstruct: struct propria com NtStruct fora dos arquivos gerados");
+    guest::free_bytes(block);
 }

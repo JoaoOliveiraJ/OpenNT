@@ -500,3 +500,337 @@ pub mod cm_partial_resource_descriptor {
     pub const TYPE_INTERRUPT: u8 = 2;
     pub const TYPE_MEMORY: u8 = 3;
 }
+
+// ---- Prova contra os símbolos do ntoskrnl (gerado por gen_nt_types.py) ----
+//
+// Cada constante de offset acima que corresponde a um campo do layout real
+// é conferida em compilação contra `inc::types` (gerado dos símbolos).
+// Divergem dos símbolos (constantes mantidas como estão; a conferir):
+//   driver_object::STRUCT_SIZE = 0x158; símbolos: sizeof(_DRIVER_OBJECT) = 0x150
+//   driver_extension::SIZE = 0x40; símbolos: sizeof(_DRIVER_EXTENSION) = 0x50
+//   device_object::DEVICE_QUEUE = 0x60; símbolos: _DEVICE_OBJECT.DeviceQueue = 0xa0
+//   device_object::DPC = 0x88; símbolos: _DEVICE_OBJECT.Dpc = 0xc8
+//   ktimer::PERIOD = 0x38; símbolos: _KTIMER.Period = 0x3c
+//   io_workitem::DEVICE_OBJECT = 0x20; símbolos: _IO_WORKITEM.IoObject = 0x28
+//   io_workitem::TYPE = 0x28; símbolos: _IO_WORKITEM.Type = 0x40
+//   io_workitem::SIZE = 0x30; símbolos: sizeof(_IO_WORKITEM) = 0x58
+//   kinterrupt::SERVICE_CONTEXT = 0x20; símbolos: _KINTERRUPT.ServiceContext = 0x30
+//   kinterrupt::SPIN_LOCK = 0x28; símbolos: _KINTERRUPT.SpinLock = 0x38
+//   kinterrupt::TICK_COUNT = 0x30; símbolos: _KINTERRUPT.TickCount = 0x40
+//   kinterrupt::ACTUAL_LOCK = 0x38; símbolos: _KINTERRUPT.ActualLock = 0x48
+//   kinterrupt::VECTOR = 0x40; símbolos: _KINTERRUPT.Vector = 0x58
+//   kinterrupt::IRQL = 0x44; símbolos: _KINTERRUPT.Irql = 0x5c
+//   kinterrupt::SYNCHRONIZE_IRQL = 0x45; símbolos: _KINTERRUPT.SynchronizeIrql = 0x5d
+//   kinterrupt::FLOATING_SAVE = 0x46; símbolos: _KINTERRUPT.FloatingSave = 0x5e
+//   kinterrupt::CONNECTED = 0x47; símbolos: _KINTERRUPT.Connected = 0x5f
+//   kinterrupt::NUMBER = 0x48; símbolos: _KINTERRUPT.Number = 0x60
+//   kinterrupt::SHARE_VECTOR = 0x4a; símbolos: _KINTERRUPT.ShareVector = 0x64
+//   kinterrupt::MODE = 0x4c; símbolos: _KINTERRUPT.Mode = 0x6c
+//   kinterrupt::SHARE_DISPOSITION = 0x50; símbolos: _KINTERRUPT.Polarity = 0x70
+//   kinterrupt::DISPATCH_ADDRESS = 0x58; símbolos: _KINTERRUPT.DispatchAddress = 0x50
+//   kinterrupt::SIZE = 0x100; símbolos: sizeof(_KINTERRUPT) = 0x120
+//   kdevice_queue::LOCK = 0x8; símbolos: _KDEVICE_QUEUE.Lock = 0x18
+//   kdevice_queue::BUSY = 0x10; símbolos: _KDEVICE_QUEUE.Busy = 0x20
+//   kdevice_queue::ENTRY = 0x18; símbolos: _KDEVICE_QUEUE.DeviceListHead = 0x8
+//   controller_object::SIZE = 0x40; símbolos: sizeof(_CONTROLLER_OBJECT) = 0x48
+const _: () = {
+    use crate::ntos::inc::types::*;
+    assert!(driver_object::TYPE as usize == core::mem::offset_of!(DriverObject, type_));
+    assert!(driver_object::SIZE as usize == core::mem::offset_of!(DriverObject, size));
+    assert!(driver_object::DEVICE_OBJECT as usize == core::mem::offset_of!(DriverObject, device_object));
+    assert!(driver_object::FLAGS as usize == core::mem::offset_of!(DriverObject, flags));
+    assert!(driver_object::DRIVER_START as usize == core::mem::offset_of!(DriverObject, driver_start));
+    assert!(driver_object::DRIVER_SIZE as usize == core::mem::offset_of!(DriverObject, driver_size));
+    assert!(driver_object::DRIVER_SECTION as usize == core::mem::offset_of!(DriverObject, driver_section));
+    assert!(driver_object::DRIVER_EXTENSION as usize == core::mem::offset_of!(DriverObject, driver_extension));
+    assert!(driver_object::DRIVER_NAME as usize == core::mem::offset_of!(DriverObject, driver_name));
+    assert!(driver_object::HARDWARE_DATABASE as usize == core::mem::offset_of!(DriverObject, hardware_database));
+    assert!(driver_object::FAST_IO_DISPATCH as usize == core::mem::offset_of!(DriverObject, fast_io_dispatch));
+    assert!(driver_object::DRIVER_INIT as usize == core::mem::offset_of!(DriverObject, driver_init));
+    assert!(driver_object::DRIVER_START_IO as usize == core::mem::offset_of!(DriverObject, driver_start_io));
+    assert!(driver_object::DRIVER_UNLOAD as usize == core::mem::offset_of!(DriverObject, driver_unload));
+    assert!(driver_object::MAJOR_FUNCTION as usize == core::mem::offset_of!(DriverObject, major_function));
+    assert!(driver_extension::DRIVER_OBJECT as usize == core::mem::offset_of!(DriverExtension, driver_object));
+    assert!(driver_extension::ADD_DEVICE as usize == core::mem::offset_of!(DriverExtension, add_device));
+    assert!(driver_extension::COUNT as usize == core::mem::offset_of!(DriverExtension, count));
+    assert!(driver_extension::SERVICE_KEY_NAME as usize == core::mem::offset_of!(DriverExtension, service_key_name));
+    assert!(device_object::TYPE as usize == core::mem::offset_of!(DeviceObject, type_));
+    assert!(device_object::SIZE as usize == core::mem::offset_of!(DeviceObject, size));
+    assert!(device_object::REFERENCE_COUNT as usize == core::mem::offset_of!(DeviceObject, reference_count));
+    assert!(device_object::DRIVER_OBJECT as usize == core::mem::offset_of!(DeviceObject, driver_object));
+    assert!(device_object::NEXT_DEVICE as usize == core::mem::offset_of!(DeviceObject, next_device));
+    assert!(device_object::ATTACHED_DEVICE as usize == core::mem::offset_of!(DeviceObject, attached_device));
+    assert!(device_object::CURRENT_IRP as usize == core::mem::offset_of!(DeviceObject, current_irp));
+    assert!(device_object::TIMER as usize == core::mem::offset_of!(DeviceObject, timer));
+    assert!(device_object::FLAGS as usize == core::mem::offset_of!(DeviceObject, flags));
+    assert!(device_object::CHARACTERISTICS as usize == core::mem::offset_of!(DeviceObject, characteristics));
+    assert!(device_object::VPB as usize == core::mem::offset_of!(DeviceObject, vpb));
+    assert!(device_object::DEVICE_EXTENSION as usize == core::mem::offset_of!(DeviceObject, device_extension));
+    assert!(device_object::DEVICE_TYPE as usize == core::mem::offset_of!(DeviceObject, device_type));
+    assert!(device_object::STACK_SIZE as usize == core::mem::offset_of!(DeviceObject, stack_size));
+    assert!(device_object::QUEUE_LIST as usize == core::mem::offset_of!(DeviceObject, queue));
+    assert!(device_object::DEVICE_OBJECT_EXTENSION as usize == core::mem::offset_of!(DeviceObject, device_object_extension));
+    assert!(device_object::STRUCT_SIZE as usize == core::mem::size_of::<DeviceObject>());
+    assert!(devobj_extension::STRUCT_SIZE as usize == core::mem::size_of::<DevobjExtension>());
+    assert!(devobj_extension::DEVICE_OBJECT as usize == core::mem::offset_of!(DevobjExtension, device_object));
+    assert!(devobj_extension::VPB as usize == core::mem::offset_of!(DevobjExtension, vpb));
+    assert!(vpb::TYPE as usize == core::mem::offset_of!(Vpb, type_));
+    assert!(vpb::SIZE as usize == core::mem::offset_of!(Vpb, size));
+    assert!(vpb::FLAGS as usize == core::mem::offset_of!(Vpb, flags));
+    assert!(vpb::VOLUME_LABEL_LENGTH as usize == core::mem::offset_of!(Vpb, volume_label_length));
+    assert!(vpb::DEVICE_OBJECT as usize == core::mem::offset_of!(Vpb, device_object));
+    assert!(vpb::REAL_DEVICE as usize == core::mem::offset_of!(Vpb, real_device));
+    assert!(vpb::SERIAL_NUMBER as usize == core::mem::offset_of!(Vpb, serial_number));
+    assert!(vpb::REFERENCE_COUNT as usize == core::mem::offset_of!(Vpb, reference_count));
+    assert!(vpb::VOLUME_LABEL as usize == core::mem::offset_of!(Vpb, volume_label));
+    assert!(vpb::STRUCT_SIZE as usize == core::mem::size_of::<Vpb>());
+    assert!(irp::TYPE as usize == core::mem::offset_of!(Irp, type_));
+    assert!(irp::SIZE_FIELD as usize == core::mem::offset_of!(Irp, size));
+    assert!(irp::MDL_ADDRESS as usize == core::mem::offset_of!(Irp, mdl_address));
+    assert!(irp::FLAGS as usize == core::mem::offset_of!(Irp, flags));
+    assert!(irp::SYSTEM_BUFFER as usize == core::mem::offset_of!(Irp, associated_irp) + core::mem::offset_of!(IrpAssociatedIrpView2, system_buffer));
+    assert!(irp::IO_STATUS as usize == core::mem::offset_of!(Irp, io_status));
+    assert!(irp::IO_STATUS_INFORMATION as usize == core::mem::offset_of!(Irp, io_status) + core::mem::offset_of!(IoStatusBlock, information));
+    assert!(irp::REQUESTOR_MODE as usize == core::mem::offset_of!(Irp, requestor_mode));
+    assert!(irp::STACK_COUNT as usize == core::mem::offset_of!(Irp, stack_count));
+    assert!(irp::CURRENT_LOCATION as usize == core::mem::offset_of!(Irp, current_location));
+    assert!(irp::CANCEL as usize == core::mem::offset_of!(Irp, cancel));
+    assert!(irp::CANCEL_IRQL as usize == core::mem::offset_of!(Irp, cancel_irql));
+    assert!(irp::CANCEL_ROUTINE as usize == core::mem::offset_of!(Irp, cancel_routine));
+    assert!(irp::USER_IOSB as usize == core::mem::offset_of!(Irp, user_iosb));
+    assert!(irp::USER_EVENT as usize == core::mem::offset_of!(Irp, user_event));
+    assert!(irp::USER_BUFFER as usize == core::mem::offset_of!(Irp, user_buffer));
+    assert!(irp::THREAD as usize == core::mem::offset_of!(Irp, tail) + core::mem::offset_of!(IrpTail, overlay) + core::mem::offset_of!(IrpTailOverlay, thread));
+    assert!(irp::ORIGINAL_FILE_OBJECT as usize == core::mem::offset_of!(Irp, tail) + core::mem::offset_of!(IrpTail, overlay) + core::mem::offset_of!(IrpTailOverlay, original_file_object));
+    assert!(irp::CURRENT_STACK_LOCATION as usize == core::mem::offset_of!(Irp, tail) + core::mem::offset_of!(IrpTail, overlay) + core::mem::offset_of!(IrpTailOverlay, current_stack_location));
+    assert!(irp::STRUCT_SIZE as usize == core::mem::size_of::<Irp>());
+    assert!(irp::STACK_LOCATION_SIZE as usize == core::mem::size_of::<IoStackLocation>());
+    assert!(io_stack_location::MAJOR as usize == core::mem::offset_of!(IoStackLocation, major_function));
+    assert!(io_stack_location::MINOR as usize == core::mem::offset_of!(IoStackLocation, minor_function));
+    assert!(io_stack_location::FLAGS as usize == core::mem::offset_of!(IoStackLocation, flags));
+    assert!(io_stack_location::CONTROL as usize == core::mem::offset_of!(IoStackLocation, control));
+    assert!(io_stack_location::READ_LENGTH as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView3, read) + core::mem::offset_of!(IoStackLocationParametersRead, length));
+    assert!(io_stack_location::READ_KEY as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView3, read) + core::mem::offset_of!(IoStackLocationParametersRead, key));
+    assert!(io_stack_location::READ_OFFSET as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView3, read) + core::mem::offset_of!(IoStackLocationParametersRead, byte_offset));
+    assert!(io_stack_location::IOCTL_OUT_LENGTH as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView16, device_io_control) + core::mem::offset_of!(IoStackLocationParametersDeviceIoControl, output_buffer_length));
+    assert!(io_stack_location::IOCTL_IN_LENGTH as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView16, device_io_control) + core::mem::offset_of!(IoStackLocationParametersDeviceIoControl, input_buffer_length));
+    assert!(io_stack_location::IOCTL_CODE as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView16, device_io_control) + core::mem::offset_of!(IoStackLocationParametersDeviceIoControl, io_control_code));
+    assert!(io_stack_location::IOCTL_TYPE3_BUFFER as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView16, device_io_control) + core::mem::offset_of!(IoStackLocationParametersDeviceIoControl, type3_input_buffer));
+    assert!(io_stack_location::POWER_SYSTEM_CONTEXT as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView35, power) + core::mem::offset_of!(IoStackLocationParametersPower, system_context));
+    assert!(io_stack_location::POWER_TYPE as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView35, power) + core::mem::offset_of!(IoStackLocationParametersPower, type_));
+    assert!(io_stack_location::POWER_STATE as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView35, power) + core::mem::offset_of!(IoStackLocationParametersPower, state));
+    assert!(io_stack_location::POWER_SHUTDOWN_TYPE as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView35, power) + core::mem::offset_of!(IoStackLocationParametersPower, shutdown_type));
+    assert!(io_stack_location::PNP_ALLOCATED_RESOURCES as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView36, start_device) + core::mem::offset_of!(IoStackLocationParametersStartDevice, allocated_resources));
+    assert!(io_stack_location::PNP_ALLOCATED_RESOURCES_TRANSLATED as usize == core::mem::offset_of!(IoStackLocation, parameters) + core::mem::offset_of!(IoStackLocationParametersView36, start_device) + core::mem::offset_of!(IoStackLocationParametersStartDevice, allocated_resources_translated));
+    assert!(io_stack_location::DEVICE_OBJECT as usize == core::mem::offset_of!(IoStackLocation, device_object));
+    assert!(io_stack_location::FILE_OBJECT as usize == core::mem::offset_of!(IoStackLocation, file_object));
+    assert!(io_stack_location::COMPLETION_ROUTINE as usize == core::mem::offset_of!(IoStackLocation, completion_routine));
+    assert!(io_stack_location::CONTEXT as usize == core::mem::offset_of!(IoStackLocation, context));
+    assert!(io_stack_location::SIZE as usize == core::mem::size_of::<IoStackLocation>());
+    assert!(file_object::TYPE as usize == core::mem::offset_of!(FileObject, type_));
+    assert!(file_object::SIZE as usize == core::mem::offset_of!(FileObject, size));
+    assert!(file_object::DEVICE_OBJECT as usize == core::mem::offset_of!(FileObject, device_object));
+    assert!(file_object::FLAGS as usize == core::mem::offset_of!(FileObject, flags));
+    assert!(file_object::FILE_NAME as usize == core::mem::offset_of!(FileObject, file_name));
+    assert!(file_object::CURRENT_BYTE_OFFSET as usize == core::mem::offset_of!(FileObject, current_byte_offset));
+    assert!(file_object::LOCK as usize == core::mem::offset_of!(FileObject, lock));
+    assert!(file_object::EVENT as usize == core::mem::offset_of!(FileObject, event));
+    assert!(file_object::IRP_LIST as usize == core::mem::offset_of!(FileObject, irp_list));
+    assert!(file_object::STRUCT_SIZE as usize == core::mem::size_of::<FileObject>());
+    assert!(io_status_block::STATUS as usize == core::mem::offset_of!(IoStatusBlock, status));
+    assert!(io_status_block::INFORMATION as usize == core::mem::offset_of!(IoStatusBlock, information));
+    assert!(io_status_block::SIZE as usize == core::mem::size_of::<IoStatusBlock>());
+    assert!(object_attributes::LENGTH as usize == core::mem::offset_of!(ObjectAttributes, length));
+    assert!(object_attributes::ROOT_DIRECTORY as usize == core::mem::offset_of!(ObjectAttributes, root_directory));
+    assert!(object_attributes::OBJECT_NAME as usize == core::mem::offset_of!(ObjectAttributes, object_name));
+    assert!(object_attributes::ATTRIBUTES as usize == core::mem::offset_of!(ObjectAttributes, attributes));
+    assert!(object_attributes::SIZE as usize == core::mem::size_of::<ObjectAttributes>());
+    assert!(unicode_string::LENGTH as usize == core::mem::offset_of!(UnicodeString, length));
+    assert!(unicode_string::MAXIMUM_LENGTH as usize == core::mem::offset_of!(UnicodeString, maximum_length));
+    assert!(unicode_string::BUFFER as usize == core::mem::offset_of!(UnicodeString, buffer));
+    assert!(unicode_string::SIZE as usize == core::mem::size_of::<UnicodeString>());
+    assert!(dispatcher_header::TYPE as usize == core::mem::offset_of!(DispatcherHeaderView2, type_));
+    assert!(dispatcher_header::SIGNAL_STATE as usize == core::mem::offset_of!(DispatcherHeader, signal_state));
+    assert!(dispatcher_header::WAIT_LIST_HEAD as usize == core::mem::offset_of!(DispatcherHeader, wait_list_head));
+    assert!(dispatcher_header::SIZE as usize == core::mem::size_of::<DispatcherHeader>());
+    assert!(dispatcher_header::MUTEX_OWNER as usize == core::mem::offset_of!(Kmutant, owner_thread));
+    assert!(kevent::SIZE as usize == core::mem::size_of::<Kevent>());
+    assert!(kmutex::SIZE as usize == core::mem::size_of::<Kmutant>());
+    assert!(fast_mutex::COUNT as usize == core::mem::offset_of!(FastMutex, count));
+    assert!(fast_mutex::OWNER as usize == core::mem::offset_of!(FastMutex, owner));
+    assert!(fast_mutex::CONTENTION as usize == core::mem::offset_of!(FastMutex, contention));
+    assert!(fast_mutex::EVENT as usize == core::mem::offset_of!(FastMutex, event));
+    assert!(fast_mutex::OLD_IRQL as usize == core::mem::offset_of!(FastMutex, old_irql));
+    assert!(fast_mutex::SIZE as usize == core::mem::size_of::<FastMutex>());
+    assert!(kdpc::TYPE as usize == core::mem::offset_of!(KdpcView1, type_));
+    assert!(kdpc::IMPORTANCE as usize == core::mem::offset_of!(KdpcView1, importance));
+    assert!(kdpc::NUMBER as usize == core::mem::offset_of!(KdpcView1, number));
+    assert!(kdpc::DPC_LIST_ENTRY as usize == core::mem::offset_of!(Kdpc, dpc_list_entry));
+    assert!(kdpc::PROCESSOR_HISTORY as usize == core::mem::offset_of!(Kdpc, processor_history));
+    assert!(kdpc::ROUTINE as usize == core::mem::offset_of!(Kdpc, deferred_routine));
+    assert!(kdpc::CONTEXT as usize == core::mem::offset_of!(Kdpc, deferred_context));
+    assert!(kdpc::SYSARG1 as usize == core::mem::offset_of!(Kdpc, system_argument1));
+    assert!(kdpc::SYSARG2 as usize == core::mem::offset_of!(Kdpc, system_argument2));
+    assert!(kdpc::DPC_DATA as usize == core::mem::offset_of!(Kdpc, dpc_data));
+    assert!(kdpc::SIZE as usize == core::mem::size_of::<Kdpc>());
+    assert!(ktimer::TYPE as usize == core::mem::offset_of!(Ktimer, header) + core::mem::offset_of!(DispatcherHeaderView2, type_));
+    assert!(ktimer::SIGNAL_STATE as usize == core::mem::offset_of!(Ktimer, header) + core::mem::offset_of!(DispatcherHeader, signal_state));
+    assert!(ktimer::DUE_TIME as usize == core::mem::offset_of!(Ktimer, due_time));
+    assert!(ktimer::TIMER_LIST_ENTRY as usize == core::mem::offset_of!(Ktimer, timer_list_entry));
+    assert!(ktimer::DPC as usize == core::mem::offset_of!(Ktimer, dpc));
+    assert!(ktimer::SIZE as usize == core::mem::size_of::<Ktimer>());
+    assert!(io_workitem::LIST_FLINK as usize == core::mem::offset_of!(IoWorkitem, work_item) + core::mem::offset_of!(WorkQueueItem, list) + core::mem::offset_of!(ListEntry, flink));
+    assert!(io_workitem::LIST_BLINK as usize == core::mem::offset_of!(IoWorkitem, work_item) + core::mem::offset_of!(WorkQueueItem, list) + core::mem::offset_of!(ListEntry, blink));
+    assert!(io_workitem::FUNCTION as usize == core::mem::offset_of!(IoWorkitem, work_item) + core::mem::offset_of!(WorkQueueItem, worker_routine));
+    assert!(io_workitem::CONTEXT as usize == core::mem::offset_of!(IoWorkitem, work_item) + core::mem::offset_of!(WorkQueueItem, parameter));
+    assert!(key_value_partial::TITLE_INDEX as usize == core::mem::offset_of!(KeyValuePartialInformation, title_index));
+    assert!(key_value_partial::TYPE as usize == core::mem::offset_of!(KeyValuePartialInformation, type_));
+    assert!(key_value_partial::DATA_LENGTH as usize == core::mem::offset_of!(KeyValuePartialInformation, data_length));
+    assert!(key_value_partial::DATA as usize == core::mem::offset_of!(KeyValuePartialInformation, data));
+    assert!(mdl::NEXT as usize == core::mem::offset_of!(Mdl, next));
+    assert!(mdl::SIZE as usize == core::mem::offset_of!(Mdl, size));
+    assert!(mdl::MDL_FLAGS as usize == core::mem::offset_of!(Mdl, mdl_flags));
+    assert!(mdl::PROCESS as usize == core::mem::offset_of!(Mdl, process));
+    assert!(mdl::MAPPED_SYSTEM_VA as usize == core::mem::offset_of!(Mdl, mapped_system_va));
+    assert!(mdl::START_VA as usize == core::mem::offset_of!(Mdl, start_va));
+    assert!(mdl::BYTE_COUNT as usize == core::mem::offset_of!(Mdl, byte_count));
+    assert!(mdl::BYTE_OFFSET as usize == core::mem::offset_of!(Mdl, byte_offset));
+    assert!(mdl::PFN_ARRAY as usize == core::mem::size_of::<Mdl>());
+    assert!(lookaside_list::DEPTH as usize == core::mem::offset_of!(GeneralLookaside, depth));
+    assert!(lookaside_list::MAXIMUM_DEPTH as usize == core::mem::offset_of!(GeneralLookaside, maximum_depth));
+    assert!(lookaside_list::ALLOC_COUNT as usize == core::mem::offset_of!(GeneralLookaside, total_allocates));
+    assert!(lookaside_list::ALLOC_MISSES as usize == core::mem::offset_of!(GeneralLookaside, allocate_misses));
+    assert!(lookaside_list::FREE_COUNT as usize == core::mem::offset_of!(GeneralLookaside, total_frees));
+    assert!(lookaside_list::FREE_MISSES as usize == core::mem::offset_of!(GeneralLookaside, free_misses));
+    assert!(lookaside_list::POOL_TYPE as usize == core::mem::offset_of!(GeneralLookaside, type_));
+    assert!(lookaside_list::TAG as usize == core::mem::offset_of!(GeneralLookaside, tag));
+    assert!(lookaside_list::BLOCK_SIZE as usize == core::mem::offset_of!(GeneralLookaside, size));
+    assert!(lookaside_list::ALLOCATE_CALLBACK as usize == core::mem::offset_of!(GeneralLookasideView1, allocate));
+    assert!(lookaside_list::FREE_CALLBACK as usize == core::mem::offset_of!(GeneralLookasideView1, free));
+    assert!(lookaside_list::REGISTRY_ENTRY as usize == core::mem::offset_of!(GeneralLookaside, list_entry));
+    assert!(lookaside_list::LAST_ALLOC_COUNT as usize == core::mem::offset_of!(GeneralLookaside, last_total_allocates));
+    assert!(lookaside_list::LAST_ALLOC_MISSES as usize == core::mem::offset_of!(GeneralLookaside, last_allocate_misses));
+    assert!(lookaside_list::SIZE as usize == core::mem::size_of::<GeneralLookaside>());
+    assert!(kthread::QUANTUM_TARGET as usize == core::mem::offset_of!(Kthread, quantum_target));
+    assert!(kthread::INITIAL_STACK as usize == core::mem::offset_of!(Kthread, initial_stack));
+    assert!(kthread::STACK_LIMIT as usize == core::mem::offset_of!(Kthread, stack_limit));
+    assert!(kthread::STACK_BASE as usize == core::mem::offset_of!(Kthread, stack_base));
+    assert!(kthread::TEB as usize == core::mem::offset_of!(Kthread, teb));
+    assert!(kthread::WIN32_THREAD as usize == core::mem::offset_of!(KthreadView1, win32_thread));
+    assert!(kthread::CREATE_TIME as usize == core::mem::offset_of!(Ethread, create_time));
+    assert!(kthread::THREAD_LOCK as usize == core::mem::offset_of!(Kthread, thread_lock));
+    assert!(kthread::CYCLE_TIME as usize == core::mem::offset_of!(Kthread, cycle_time));
+    assert!(kthread::WAIT_REGISTER as usize == core::mem::offset_of!(Kthread, wait_register));
+    assert!(kthread::RUNNING as usize == core::mem::offset_of!(Kthread, running));
+    assert!(kthread::ALERTED as usize == core::mem::offset_of!(Kthread, alerted));
+    assert!(kthread::MISC_FLAGS as usize == core::mem::offset_of!(Kthread, misc_flags));
+    assert!(kthread::THREAD_FLAGS as usize == core::mem::offset_of!(Kthread, thread_flags));
+    assert!(kthread::READY_TIME as usize == core::mem::offset_of!(Kthread, ready_time));
+    assert!(kthread::TRAP_FRAME as usize == core::mem::offset_of!(Kthread, trap_frame));
+    assert!(kthread::APC_STATE as usize == core::mem::offset_of!(Kthread, apc_state));
+    assert!(kthread::APC_STATE_PROCESS as usize == core::mem::offset_of!(Kthread, apc_state) + core::mem::offset_of!(KapcState, process));
+    assert!(kthread::PRIORITY as usize == core::mem::offset_of!(KthreadView1, priority));
+    assert!(kthread::WAIT_STATUS as usize == core::mem::offset_of!(Kthread, wait_status));
+    assert!(kthread::WAIT_LIST_ENTRY as usize == core::mem::offset_of!(Kthread, wait_list_entry));
+    assert!(kthread::STATE as usize == core::mem::offset_of!(KthreadView1, state));
+    assert!(kthread::WAIT_MODE as usize == core::mem::offset_of!(KthreadView1, wait_mode));
+    assert!(kthread::WAIT_TIME as usize == core::mem::offset_of!(KthreadView1, wait_time));
+    assert!(kthread::KERNEL_APC_DISABLE as usize == core::mem::offset_of!(KthreadView1, kernel_apc_disable));
+    assert!(kthread::SPECIAL_APC_DISABLE as usize == core::mem::offset_of!(KthreadView1, special_apc_disable));
+    assert!(kthread::PROCESS as usize == core::mem::offset_of!(Kthread, process));
+    assert!(kthread::PREVIOUS_MODE as usize == core::mem::offset_of!(KthreadView1, previous_mode));
+    assert!(kthread::BASE_PRIORITY as usize == core::mem::offset_of!(KthreadView1, base_priority));
+    assert!(kthread::PRIORITY_DECREMENT as usize == core::mem::offset_of!(KthreadView1, priority_decrement));
+    assert!(kthread::SATURATION as usize == core::mem::offset_of!(KthreadView1, saturation));
+    assert!(kthread::QUANTUM_RESET as usize == core::mem::offset_of!(KthreadView1, quantum_reset));
+    assert!(kthread::PRIORITY_FLOOR_SUMMARY as usize == core::mem::offset_of!(Kthread, priority_floor_summary));
+    assert!(kthread::FOREGROUND_LOSS_TIME as usize == core::mem::offset_of!(Kthread, foreground_loss_time));
+    assert!(kthread::OTHER_OPERATION_COUNT as usize == core::mem::offset_of!(Kthread, other_operation_count));
+    assert!(kthread::CID as usize == core::mem::offset_of!(Ethread, cid));
+    assert!(kthread::CID_UNIQUE_PROCESS as usize == core::mem::offset_of!(Ethread, cid) + core::mem::offset_of!(ClientId, unique_process));
+    assert!(kthread::CID_UNIQUE_THREAD as usize == core::mem::offset_of!(Ethread, cid) + core::mem::offset_of!(ClientId, unique_thread));
+    assert!(kthread::IRP_LIST_HEAD as usize == core::mem::offset_of!(Ethread, irp_list));
+    assert!(kthread::THREAD_LIST_ENTRY as usize == core::mem::offset_of!(Ethread, thread_list_entry));
+    assert!(kthread::RUNDOWN_PROTECT as usize == core::mem::offset_of!(Ethread, rundown_protect));
+    assert!(kthread::INSERTION_LOCK as usize == core::mem::offset_of!(Ethread, thread_lock));
+    assert!(kthread::CROSS_THREAD_FLAGS as usize == core::mem::offset_of!(Ethread, cross_thread_flags));
+    assert!(kthread::SAME_THREAD_APC_FLAGS as usize == core::mem::offset_of!(Ethread, same_thread_apc_flags));
+    assert!(kthread::EXIT_STATUS as usize == core::mem::offset_of!(Ethread, exit_status));
+    assert!(kthread::IRP_LIST_LOCK as usize == core::mem::offset_of!(Ethread, irp_list_lock));
+    assert!(kthread::ACTIVITY_ID as usize == core::mem::offset_of!(Ethread, activity_id));
+    assert!(kthread::SILO as usize == core::mem::offset_of!(Ethread, silo));
+    assert!(kthread::EXPECTED_RUN_TIME as usize == core::mem::offset_of!(Ethread, last_expected_run_time));
+    assert!(kthread::SIZE as usize == core::mem::size_of::<Ethread>());
+    assert!(eprocess::DIRECTORY_TABLE_BASE as usize == core::mem::offset_of!(Eprocess, pcb) + core::mem::offset_of!(Kprocess, directory_table_base));
+    assert!(eprocess::BASE_PRIORITY as usize == core::mem::offset_of!(Eprocess, pcb) + core::mem::offset_of!(Kprocess, base_priority));
+    assert!(eprocess::PROCESS_LOCK as usize == core::mem::offset_of!(Eprocess, process_lock));
+    assert!(eprocess::UNIQUE_PROCESS_ID as usize == core::mem::offset_of!(Eprocess, unique_process_id));
+    assert!(eprocess::ACTIVE_PROCESS_LINKS as usize == core::mem::offset_of!(Eprocess, active_process_links));
+    assert!(eprocess::RUNDOWN_PROTECT as usize == core::mem::offset_of!(Eprocess, rundown_protect));
+    assert!(eprocess::FLAGS as usize == core::mem::offset_of!(Eprocess, flags));
+    assert!(eprocess::CREATE_TIME as usize == core::mem::offset_of!(Eprocess, create_time));
+    assert!(eprocess::WIN32_WINDOW_STATION as usize == core::mem::offset_of!(Eprocess, win32_window_station));
+    assert!(eprocess::INHERITED_FROM_UNIQUE_PROCESS_ID as usize == core::mem::offset_of!(Eprocess, inherited_from_unique_process_id));
+    assert!(eprocess::PRIORITY_CLASS as usize == core::mem::offset_of!(Eprocess, priority_class));
+    assert!(eprocess::SECURITY_PORT as usize == core::mem::offset_of!(Eprocess, security_port));
+    assert!(eprocess::SEQUENCE_NUMBER as usize == core::mem::offset_of!(Eprocess, sequence_number));
+    assert!(eprocess::DXG_PROCESS as usize == core::mem::offset_of!(Eprocess, dxg_process));
+    assert!(eprocess::POOL_QUOTA_USAGE as usize == core::mem::offset_of!(Eprocess, process_quota_usage));
+    assert!(eprocess::POOL_QUOTA_PEAK as usize == core::mem::offset_of!(Eprocess, process_quota_peak));
+    assert!(eprocess::TOKEN as usize == core::mem::offset_of!(Eprocess, token));
+    assert!(eprocess::WIN32_PROCESS as usize == core::mem::offset_of!(Eprocess, win32_process));
+    assert!(eprocess::JOB as usize == core::mem::offset_of!(Eprocess, job));
+    assert!(eprocess::SECTION_OBJECT as usize == core::mem::offset_of!(Eprocess, section_object));
+    assert!(eprocess::SECTION_BASE_ADDRESS as usize == core::mem::offset_of!(Eprocess, section_base_address));
+    assert!(eprocess::PEB as usize == core::mem::offset_of!(Eprocess, peb));
+    assert!(eprocess::SESSION as usize == core::mem::offset_of!(Eprocess, session));
+    assert!(eprocess::OBJECT_TABLE as usize == core::mem::offset_of!(Eprocess, object_table));
+    assert!(eprocess::DEBUG_PORT as usize == core::mem::offset_of!(Eprocess, debug_port));
+    assert!(eprocess::WOW64_PROCESS as usize == core::mem::offset_of!(Eprocess, wo_w64_process));
+    assert!(eprocess::IMAGE_FILE_POINTER as usize == core::mem::offset_of!(Eprocess, image_file_pointer));
+    assert!(eprocess::IMAGE_FILE_NAME as usize == core::mem::offset_of!(Eprocess, image_file_name));
+    assert!(eprocess::AUDIT_IMAGE_NAME as usize == core::mem::offset_of!(Eprocess, se_audit_process_creation_info));
+    assert!(eprocess::THREAD_LIST_HEAD as usize == core::mem::offset_of!(Eprocess, thread_list_head));
+    assert!(eprocess::ACTIVE_THREADS as usize == core::mem::offset_of!(Eprocess, active_threads));
+    assert!(eprocess::EXIT_STATUS as usize == core::mem::offset_of!(Eprocess, exit_status));
+    assert!(eprocess::EXIT_TIME as usize == core::mem::offset_of!(Eprocess, exit_time));
+    assert!(eprocess::SERVER_SILO as usize == core::mem::offset_of!(Eprocess, server_silo));
+    assert!(eprocess::SIGNATURE_LEVEL as usize == core::mem::offset_of!(Eprocess, signature_level));
+    assert!(eprocess::SECTION_SIGNATURE_LEVEL as usize == core::mem::offset_of!(Eprocess, section_signature_level));
+    assert!(eprocess::PROTECTION as usize == core::mem::offset_of!(Eprocess, protection));
+    assert!(eprocess::FLAGS3 as usize == core::mem::offset_of!(Eprocess, flags3));
+    assert!(eprocess::SIZE as usize == core::mem::size_of::<Eprocess>());
+    assert!(ejob::PARENT as usize == core::mem::offset_of!(Ejob, parent_job));
+    assert!(ejob::SERVER_SILO_GLOBALS as usize == core::mem::offset_of!(Ejob, server_silo_globals));
+    assert!(ejob::SILO_CONTEXT as usize == core::mem::offset_of!(Ejob, storage));
+    assert!(ejob::FLAGS as usize == core::mem::offset_of!(Ejob, job_flags));
+    assert!(ejob::SIZE as usize == core::mem::size_of::<Ejob>());
+    assert!(kinterrupt::TYPE as usize == core::mem::offset_of!(Kinterrupt, type_));
+    assert!(kinterrupt::SIZE_FIELD as usize == core::mem::offset_of!(Kinterrupt, size));
+    assert!(kinterrupt::LIST_ENTRY as usize == core::mem::offset_of!(Kinterrupt, interrupt_list_entry));
+    assert!(kinterrupt::SERVICE_ROUTINE as usize == core::mem::offset_of!(Kinterrupt, service_routine));
+    assert!(kdevice_queue::TYPE as usize == core::mem::offset_of!(KdeviceQueue, type_));
+    assert!(kdevice_queue::SIZE_FIELD as usize == core::mem::offset_of!(KdeviceQueue, size));
+    assert!(kdevice_queue::SIZE as usize == core::mem::size_of::<KdeviceQueue>());
+    assert!(controller_object::TYPE as usize == core::mem::offset_of!(ControllerObject, type_));
+    assert!(controller_object::SIZE_FIELD as usize == core::mem::offset_of!(ControllerObject, size));
+    assert!(controller_object::CONTROLLER_EXTENSION as usize == core::mem::offset_of!(ControllerObject, controller_extension));
+    assert!(cm_resource_list::COUNT as usize == core::mem::offset_of!(CmResourceList, count));
+    assert!(cm_resource_list::FULL_DESCRIPTOR as usize == core::mem::offset_of!(CmResourceList, list));
+    assert!(cm_full_resource_descriptor::INTERFACE_TYPE as usize == core::mem::offset_of!(CmFullResourceDescriptor, interface_type));
+    assert!(cm_full_resource_descriptor::BUS_NUMBER as usize == core::mem::offset_of!(CmFullResourceDescriptor, bus_number));
+    assert!(cm_full_resource_descriptor::PARTIAL_LIST as usize == core::mem::offset_of!(CmFullResourceDescriptor, partial_resource_list));
+    assert!(cm_partial_resource_list::VERSION as usize == core::mem::offset_of!(CmPartialResourceList, version));
+    assert!(cm_partial_resource_list::REVISION as usize == core::mem::offset_of!(CmPartialResourceList, revision));
+    assert!(cm_partial_resource_list::COUNT as usize == core::mem::offset_of!(CmPartialResourceList, count));
+    assert!(cm_partial_resource_list::DESCRIPTORS as usize == core::mem::offset_of!(CmPartialResourceList, partial_descriptors));
+    assert!(cm_partial_resource_descriptor::TYPE as usize == core::mem::offset_of!(CmPartialResourceDescriptor, type_));
+    assert!(cm_partial_resource_descriptor::SHARE_DISPOSITION as usize == core::mem::offset_of!(CmPartialResourceDescriptor, share_disposition));
+    assert!(cm_partial_resource_descriptor::FLAGS as usize == core::mem::offset_of!(CmPartialResourceDescriptor, flags));
+    assert!(cm_partial_resource_descriptor::PORT_START as usize == core::mem::offset_of!(CmPartialResourceDescriptor, u) + core::mem::offset_of!(CmPartialResourceDescriptorUUnalignedView1, port) + core::mem::offset_of!(CmPartialResourceDescriptorUGenericUnaligned, start));
+    assert!(cm_partial_resource_descriptor::PORT_LENGTH as usize == core::mem::offset_of!(CmPartialResourceDescriptor, u) + core::mem::offset_of!(CmPartialResourceDescriptorUUnalignedView1, port) + core::mem::offset_of!(CmPartialResourceDescriptorUGenericUnaligned, length));
+    assert!(cm_partial_resource_descriptor::INTERRUPT_LEVEL as usize == core::mem::offset_of!(CmPartialResourceDescriptor, u) + core::mem::offset_of!(CmPartialResourceDescriptorUUnalignedView2, interrupt) + core::mem::offset_of!(CmPartialResourceDescriptorUInterruptUnaligned, level));
+    assert!(cm_partial_resource_descriptor::INTERRUPT_VECTOR as usize == core::mem::offset_of!(CmPartialResourceDescriptor, u) + core::mem::offset_of!(CmPartialResourceDescriptorUUnalignedView2, interrupt) + core::mem::offset_of!(CmPartialResourceDescriptorUInterruptUnaligned, vector));
+    assert!(cm_partial_resource_descriptor::INTERRUPT_AFFINITY as usize == core::mem::offset_of!(CmPartialResourceDescriptor, u) + core::mem::offset_of!(CmPartialResourceDescriptorUUnalignedView2, interrupt) + core::mem::offset_of!(CmPartialResourceDescriptorUInterruptUnaligned, affinity));
+    assert!(cm_partial_resource_descriptor::SIZE as usize == core::mem::size_of::<CmPartialResourceDescriptor>());
+};

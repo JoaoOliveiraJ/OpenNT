@@ -26,7 +26,8 @@ kernel/src/
 │                      KernelError, texto, tempo
 ├── nano/              IDT/PIC/timer, canais de IPC, registro de serviços
 ├── ntos/              o executive (o ntoskrnl)
-│   ├── inc/           cabeçalhos: layouts do WDK (nt_abi) e NTSTATUS
+│   ├── inc/           cabeçalhos: estruturas do NT geradas dos símbolos (types),
+│   │                  acesso tipado (field), offsets legados (nt_abi) e NTSTATUS
 │   ├── init/          boot em fases, configuração de build e a tabela de exports
 │   ├── ke/            kernel: relógio, IRQL, DPCs, APCs, timers, despacho, SMP,
 │   │                  bugcheck e a tabela de serviços (services)
@@ -136,6 +137,61 @@ camadas juntas. Testes só da lógica podem chamar a função do assunto direto.
 - **Nada de arquivo por export.** Uma rotina nova entra no arquivo do assunto
   dela; o export novo ganha só o adaptador no `exports.rs` do componente.
 - **Cabeçalho.** Todo módulo começa com um `//!` que diz o papel e o contrato.
+
+### 3.3 Acesso à memória e estruturas do NT
+
+No NT, kernel e drivers dividem o espaço de endereçamento e o C usa as
+estruturas direto: `Irp->IoStatus.Status = STATUS_SUCCESS;` é um `mov`, com o
+layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
+
+- **As estruturas vêm de `ntos/inc/types`**, geradas a partir dos símbolos do
+  ntoskrnl (`build/symbols/ntkrnlmp.pdb`, Windows 10 19041): o mesmo layout com
+  que o kernel real foi compilado, `#[repr(C)]`, com `size_of`/`offset_of!`
+  conferidos em compilação. Os nomes são os do NT em snake_case (`IoStatus` ->
+  `io_status`, `Tail.Overlay.CurrentStackLocation` ->
+  `tail.overlay.current_stack_location`; palavras reservadas ganham `_`, como
+  `type_`). Membros que o C sobrepõe (uniões anônimas) ficam em vistas
+  encadeadas por `Deref`, então o nome resolve direto (`thread.state`,
+  `iosb.pointer`). O diretório é gerado e não se edita à mão, com uma
+  exceção: `types/wdk.rs`, mantido à mão no mesmo estilo, com as estruturas
+  públicas do WDK/SDK que não constam dos símbolos (OB_CALLBACK_*, classes de
+  informação dos Nt*, atributos ALPC...), cada uma citando o cabeçalho de
+  origem.
+- **Estruturas próprias do OpenNT** (corpos de objeto, registros internos que
+  não são layouts do NT) ficam privadas no componente dono, com a mesma
+  receita: `#[repr(C)]` de `Field<T>`/`Reserved<N>`/structs do NT,
+  `unsafe impl NtStruct` e asserções de `size_of`/`offset_of!` (exemplo no
+  cabeçalho de `inc/field.rs`).
+- **Acesso pelos campos** (`ntos/inc/field.rs`): cada folha escalar é um
+  `Field<T>` na memória do próprio objeto; `get`/`set` são **um** acesso
+  volátil da largura do campo, no endereço virtual, sem tradução por acesso.
+  Ponteiros são `Field<u64>`. Bitfields têm `<nome>()`/`set_<nome>()` e as
+  constantes `<NOME>_SHIFT`/`<NOME>_MASK`.
+- **A fronteira é o único `unsafe`.** O adaptador do export converte o
+  argumento uma vez (`unsafe { Irp::at(call.arg(1)) }`) e a rotina do assunto
+  recebe `&Irp`, como as do NT recebem `PIRP`:
+
+  ```rust
+  fn complete_request(irp: &Irp, status: i32, information: u64) {
+      irp.io_status.status.set(status);
+      irp.io_status.information.set(information);
+  }
+  // contador compartilhado: atômico de verdade
+  header.pointer_count.atomic().fetch_add(1, Ordering::SeqCst);
+  ```
+- **Atômicos para o que é compartilhado**: contadores de referência, locks,
+  push locks, flags alteradas por outra CPU e todo `Interlocked*` usam
+  `field.atomic()` (instruções `lock`). Nunca ler-modificar-escrever em duas
+  chamadas.
+- **Sondas só para ponteiros não confiáveis** (vindos do modo usuário):
+  `Tipo::try_at(endereço)` sonda o objeto inteiro (o `ProbeForRead`) e
+  `probe_get`/`probe_set` fazem cada acesso pelo caminho `try_*` de
+  `mm/guest_memory.rs`, que devolve `STATUS_ACCESS_VIOLATION` — o equivalente
+  do `__try/__except`. Memória do kernel e de drivers não é sondada.
+- **Código novo não escreve offsets à mão** (`base + 0x30`, `guest::read32(x +
+  CONSTANTE)`). As constantes de `nt_abi.rs` continuam enquanto as chamadas
+  antigas migram; cada uma que corresponde a um campo real é conferida em
+  compilação contra `inc::types` (o bloco no fim do arquivo).
 
 ## 4. Dependências
 
