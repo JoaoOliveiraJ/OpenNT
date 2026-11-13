@@ -15,7 +15,14 @@ use crate::ntos::ps::process;
 use crate::ntos::se::token::tokens;
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{eprocess, kthread};
+use crate::ntos::inc::types::{
+    AccessAllowedAce, Context, DeviceObject, DevobjExtension, DriverObject, Ejob, Eprocess, Ethread, ExPushLock, ExRundownRef,
+    ExRundownRefCacheAware, Field, FileObject, HandleTable, HandleTableEntry, ImageInfo, ImageInfoEx, Kevent, Kmutant, Kthread,
+    LargeInteger, ListEntry, Luid, NpagedLookasideList, NtStruct, ObCallbackRegistration, ObOperationRegistration,
+    ObjectAttributes, ObjectBasicInformation, ObjectDirectoryInformation, ObjectHandleFlagInformation, ObjectHandleInformation,
+    ObjectNameInformation, ObjectType, ObjectTypeInformation, ObjectTypesInformation, Reserved, Section,
+    SecurityDescriptorRelative, SiloMonitorRegistration, Sid, SlistHeader, Token, TokenStatistics, UnicodeString,
+};
 
 type Assert = fn(bool, &str);
 
@@ -26,10 +33,11 @@ fn dispatcher_objects(assert: Assert) {
     let timeout = guest::alloc_bytes(8);
     guest::write64(vector, first);
     guest::write64(vector + 8, second);
-    guest::write64(timeout, 0);
+    unsafe { LargeInteger::at(timeout) }.quad_part.set(0);
     dispatcher::initialize_event(first, 1, false);
     dispatcher::initialize_event(second, 0, true);
-    assert(guest::read64(first + 8) == first + 8 && guest::read64(first + 16) == first + 8, "dispatcher: links canonicos do evento");
+    let wait_list = &unsafe { Kevent::at(first) }.header.wait_list_head;
+    assert(wait_list.flink.get() == wait_list.address() && wait_list.blink.get() == wait_list.address(), "dispatcher: links canonicos do evento");
     assert(dispatcher::read_state(first) == 0, "dispatcher: estado inicial BOOLEAN");
     assert(dispatcher::wait_for_multiple_objects(2, vector, 1, timeout, 0, false) == 1, "dispatcher: WaitAny devolve o indice");
     assert(dispatcher::read_state(second) == 1, "dispatcher: notificacao conserva o sinal");
@@ -46,7 +54,8 @@ fn dispatcher_objects(assert: Assert) {
     assert(dispatcher::wait_for_single_object(first, timeout, 0, false) == 0, "dispatcher: mutex recursivo");
     dispatcher::release_mutex(first);
     dispatcher::release_mutex(first);
-    assert(guest::read32(first + 4) == 1 && guest::read64(first + 0x28) == 0, "dispatcher: mutex liberado por completo");
+    let mutant = unsafe { Kmutant::at(first) };
+    assert(mutant.header.signal_state.get() == 1 && mutant.owner_thread.get() == 0, "dispatcher: mutex liberado por completo");
     assert(dispatcher::release_mutant(first, false) == Err(0xC000_0046), "dispatcher: liberar sem posse");
     dispatcher::initialize_semaphore(second, 1, 2);
     assert(dispatcher::release_semaphore(second, 1) == Ok(1), "dispatcher: semaforo libera");
@@ -82,14 +91,15 @@ extern "win64" fn normal_routine(context: u64, first: u64, second: u64) {
 
 fn apc_regions(assert: Assert) {
     let thread = process::get_current_thread();
+    let tcb = unsafe { Kthread::at(thread) };
     let state = guest::alloc_bytes(40);
     let special = guest::alloc_bytes(0x58);
     let normal = guest::alloc_bytes(0x58);
     assert(state != 0 && special != 0 && normal != 0, "apc: alocacoes");
-    assert(guest::read32(thread + kthread::KERNEL_APC_DISABLE) == 0, "apc: regioes iniciais");
+    assert(tcb.combined_apc_disable.get() == 0, "apc: regioes iniciais");
     let entered = critical_region::enter_critical().and_then(|_| critical_region::enter_critical()).and_then(|_| critical_region::enter_guarded());
     assert(entered.is_ok(), "apc: entra nas regioes");
-    assert(guest::read16(thread + kthread::KERNEL_APC_DISABLE) == 0xFFFE && guest::read16(thread + kthread::SPECIAL_APC_DISABLE) == 0xFFFF, "apc: contadores SHORT da KTHREAD");
+    assert(tcb.kernel_apc_disable.get() == -2 && tcb.special_apc_disable.get() == -1, "apc: contadores SHORT da KTHREAD");
     assert(critical_region::disabled() && critical_region::all_disabled(), "apc: estado guardado");
     let address = |routine: u64| routine;
     apc::initialize(normal, thread, 0, address(kernel_routine as extern "win64" fn(u64, u64, u64, u64, u64) as usize as u64), 0, address(normal_routine as extern "win64" fn(u64, u64, u64) as usize as u64), 0, state);
@@ -106,7 +116,7 @@ fn apc_regions(assert: Assert) {
     assert(guest::read32(state + 8) == 1 && guest::read32(state + 12) == 1, "apc: IRQL da KernelRoutine e KAPC liberada");
     assert(guest::read32(state + 16) == 1 && guest::read32(state + 20) == 0, "apc: NormalRoutine em PASSIVE_LEVEL");
     assert(guest::read64(state + 24) == 0xFEDC_BA98_7654_3210 && guest::read64(state + 32) == 0x8000_0000_0000_0001, "apc: argumentos opacos");
-    assert(guest::read32(thread + kthread::KERNEL_APC_DISABLE) == 0 && guest::read8(thread + kthread::APC_STATE + 0x28) & 1 == 0, "apc: estado restaurado");
+    assert(tcb.combined_apc_disable.get() == 0 && tcb.apc_state.kernel_apc_in_progress() == 0, "apc: estado restaurado");
     assert(critical_region::leave_critical().is_err(), "apc: saida sem entrada recusada");
     guest::free_bytes(special);
     guest::free_bytes(state);
@@ -132,28 +142,31 @@ fn handle_table_storage(assert: Assert) {
         assert(handle_table::insert(table, handle, &description).is_ok(), "handle table: insercao");
     }
     let (leaves, free, links) = handle_table::storage(table).unwrap();
-    assert(leaves == 513 && guest::read64(table + 8) & 3 == 2, "handle table: nivel dois real");
+    let native = unsafe { HandleTable::at(table) };
+    assert(leaves == 513 && native.table_code.get() & 3 == 2, "handle table: nivel dois real");
     assert(free == 513 * 255 - 4 && links == 513 * 512, "handle table: lista livre completa");
     // Travessia nativa: TableCode -> raiz -> diretórios -> folhas.
-    let code = guest::read64(table + 8);
+    let code = native.table_code.get();
     let top = code & !3;
     for (index, &handle) in handles.iter().enumerate() {
         let leaf_index = handle / 1024;
         let directory = guest::read64(top + (leaf_index / 512) * 8);
         let leaf = guest::read64(directory + (leaf_index % 512) * 8);
-        let entry = leaf + (handle & 1023) * 4;
-        let low = guest::read64(entry);
+        let entry = &unsafe { HandleTableEntry::array_at(leaf, 256) }[(handle as usize & 1023) / 4];
+        let low = entry.low_value.get() as u64;
         let body = ((((low as i64) >> 16) as u64) & !15) + 0x30;
         assert(body == identities[index] && low & 1 != 0, "handle table: identidade real do objeto");
-        assert((low >> 17) & 7 == index as u64 && guest::read64(entry + 8) == 0x120080 + index as u64, "handle table: atributos e acesso");
+        assert((low >> 17) & 7 == index as u64 && entry.high_value.get() as u64 == 0x120080 + index as u64, "handle table: atributos e acesso");
     }
     assert(matches!(handle_table::change(table, 0x404, 5, 0x210031), Ok(true)), "handle table: mudanca de entrada");
     let row = handle_table::row(table, 0x404).unwrap();
-    assert((guest::read64(row.entry) >> 17) & 7 == 5 && guest::read64(row.entry + 8) == 0x210031, "handle table: mudanca visivel");
-    let before = guest::read16(thread + kthread::KERNEL_APC_DISABLE);
+    let changed = unsafe { HandleTableEntry::at(row.entry) };
+    assert((changed.low_value.get() as u64 >> 17) & 7 == 5 && changed.high_value.get() == 0x210031, "handle table: mudanca visivel");
+    let tcb = unsafe { Kthread::at(thread) };
+    let before = tcb.kernel_apc_disable.get();
     let removed = handle_table::remove(table, 4);
     assert(matches!(&removed, Ok(Some(row)) if row.pointer == process), "handle table: remocao devolve a identidade");
-    assert(guest::read16(thread + kthread::KERNEL_APC_DISABLE) == before, "handle table: regioes criticas restauradas");
+    assert(tcb.kernel_apc_disable.get() == before, "handle table: regioes criticas restauradas");
     assert(handle_table::destroy(table).is_err(), "handle table: destruicao com handles vivos recusada");
     for handle in [0x3FC, 0x404, 0x80004] {
         let _ = handle_table::remove(table, handle);
@@ -173,13 +186,14 @@ fn rundown_protection(assert: Assert) {
         assert(initialized.is_ok(), "rundown: inicializacao");
         let acquired = if cache { rundown::acquire_cache(p, 2) } else { rundown::acquire_ex(p, 2) };
         assert(matches!(acquired, Ok(true)), "rundown: aquisicao de duas referencias");
-        let slot = if cache { guest::read64(p) } else { p };
-        assert(guest::read64(slot) == 4, "rundown: contador de 64 bits");
+        let slot = if cache { unsafe { ExRundownRefCacheAware::at(p) }.run_refs.get() } else { p };
+        let reference = unsafe { ExRundownRef::at(slot) };
+        assert(reference.count.get() == 4, "rundown: contador de 64 bits");
         let request = rundown::begin(p, cache);
         assert(request.is_ok(), "rundown: inicio do encerramento");
         let mut request = request.unwrap();
-        assert(guest::read64(slot) & 1 != 0, "rundown: bloco publicado");
-        let block = guest::read64(slot) & !1;
+        assert(reference.count.get() & 1 != 0, "rundown: bloco publicado");
+        let block = reference.count.get() & !1;
         assert(block != 0 && guest::read64(block) == 2, "rundown: bloco guarda as referencias");
         let refused = if cache { rundown::acquire_cache(p, 1) } else { rundown::acquire(p) };
         assert(matches!(refused, Ok(false)), "rundown: recusa novas referencias");
@@ -187,7 +201,7 @@ fn rundown_protection(assert: Assert) {
         assert(released.is_ok() && !request.poll() && guest::read64(block) == 1, "rundown: espera continua com uma referencia");
         let released = if cache { rundown::release_cache(p, 1) } else { rundown::release(p) };
         assert(released.is_ok() && request.poll(), "rundown: retoma apos a ultima liberacao");
-        assert(guest::read64(slot) == 1, "rundown: marcador terminal");
+        assert(reference.count.get() == 1, "rundown: marcador terminal");
         let finished = if cache {
             rundown::wait_cache(p).and_then(|_| rundown::completed_cache(p)).and_then(|_| rundown::reinitialize_cache(p))
         } else {
@@ -211,22 +225,23 @@ fn rundown_protection(assert: Assert) {
 
 fn push_locks(assert: Assert) {
     let lock = guest::alloc_bytes(16);
+    let word = &unsafe { ExPushLock::at(lock) }.value;
     push_lock::initialize(lock);
-    assert(push_lock::acquire_exclusive(lock, 0).is_ok() && guest::read64(lock) == 1, "push lock: exclusivo");
+    assert(push_lock::acquire_exclusive(lock, 0).is_ok() && word.get() == 1, "push lock: exclusivo");
     assert(matches!(push_lock::try_shared(lock, 0), Ok(false)), "push lock: compartilhado recusado");
     let request = push_lock::begin(lock, true, 0);
     assert(request.is_ok(), "push lock: inicio da espera");
     let mut request = request.unwrap();
     assert(matches!(request.poll(), Ok(None)), "push lock: aguardante enfileirado");
-    let word = guest::read64(lock);
-    assert(word & 3 == 3 && word & !15 != 0, "push lock: bloco de espera publicado");
+    let published = word.get();
+    assert(published & 3 == 3 && published & !15 != 0, "push lock: bloco de espera publicado");
     assert(push_lock::release_exclusive(lock, 0).is_ok(), "push lock: liberacao acorda");
     assert(matches!(request.poll(), Ok(Some(()))), "push lock: aguardante adquire");
-    assert(guest::read64(lock) == 17, "push lock: um leitor");
-    assert(push_lock::release_shared(lock, 0).is_ok() && guest::read64(lock) == 0, "push lock: livre");
+    assert(word.get() == 17, "push lock: um leitor");
+    assert(push_lock::release_shared(lock, 0).is_ok() && word.get() == 0, "push lock: livre");
     assert(push_lock::acquire_exclusive(lock, 0).is_ok(), "push lock: exclusivo de novo");
     push_lock::convert_exclusive_to_shared(lock);
-    assert(guest::read64(lock) == 17 && push_lock::release_any(lock, 0).is_ok() && guest::read64(lock) == 0, "push lock: conversao e liberacao generica");
+    assert(word.get() == 17 && push_lock::release_any(lock, 0).is_ok() && word.get() == 0, "push lock: conversao e liberacao generica");
     assert(push_lock::acquire_exclusive(lock, 4).is_err(), "push lock: flags invalidas");
     guest::free_bytes(lock);
 }
@@ -255,7 +270,7 @@ fn timers(assert: Assert) {
     assert(timer::set_timer(ktimer, -10_000_000, 0, 0) == false && timer::cancel_timer(ktimer), "timer: cancelamento");
     // Espera relativa de 1 ms pelo caminho cooperativo.
     let interval = guest::alloc_bytes(8);
-    guest::write64(interval, (-10_000i64) as u64);
+    unsafe { LargeInteger::at(interval) }.quad_part.set(-10_000);
     assert(matches!(timer::delay_execution_thread(interval, 0, false), Ok(0)), "timer: KeDelayExecutionThread");
     for pointer in [ktimer, kdpc, interval] {
         guest::free_bytes(pointer);
@@ -264,14 +279,15 @@ fn timers(assert: Assert) {
 
 fn thread_alerts(assert: Assert) {
     let thread = process::get_current_thread();
+    let tcb = unsafe { Kthread::at(thread) };
     assert(matches!(thread_alert::alert(thread, 0), Ok(0)), "alerta: primeiro alerta");
-    assert(guest::read8(thread + kthread::ALERTED) == 1, "alerta: byte de kernel");
+    assert(tcb.alerted[0].get() == 1, "alerta: byte de kernel");
     assert(matches!(thread_alert::alert(thread, 0), Ok(1)), "alerta: repetido nao conta");
     let event = guest::alloc_bytes(0x18);
     dispatcher::initialize_event(event, 0, false);
     assert(dispatcher::wait_for_single_object(event, 0, 0, true) == thread_alert::STATUS_ALERTED, "alerta: espera alertavel interrompida");
     assert(thread_alert::consume(thread, 0, true).is_none(), "alerta: consumido uma vez");
-    assert(guest::read8(thread + kthread::STATE) == 2, "alerta: thread volta a executar");
+    assert(tcb.state.get() == 2, "alerta: thread volta a executar");
     guest::free_bytes(event);
 }
 
@@ -285,7 +301,7 @@ fn close_published(_process: u64, _handle: u32) {
 
 fn processes(assert: Assert) {
     let system = process::get_system_process();
-    assert(system != 0 && guest::read64(system + eprocess::UNIQUE_PROCESS_ID) == 4, "ps: EPROCESS do System");
+    assert(system != 0 && unsafe { Eprocess::at(system) }.unique_process_id.get() == 4, "ps: EPROCESS do System");
     assert(process::get_primary_token(system).is_some_and(tokens::exists), "ps: token primario do System");
     assert(process::list_active_processes().iter().any(|entry| entry.pid == 4 && entry.name == "System"), "ps: PsActiveProcessHead");
     let objects_before = object_types::counts("Process").map(|counts| counts.0);
@@ -295,12 +311,15 @@ fn processes(assert: Assert) {
     let thread = process::create_kernel_thread(target, 0x7A3C, false, 0, None);
     assert(thread.is_ok(), "ps: criacao de thread");
     let thread = thread.unwrap();
-    assert(guest::read64(thread + kthread::APC_STATE_PROCESS) == target && guest::read64(thread + kthread::CID_UNIQUE_PROCESS) == 0x7A38, "ps: KTHREAD ligado ao processo");
+    let ethread = unsafe { Ethread::at(thread) };
+    let eprocess = unsafe { Eprocess::at(target) };
+    assert(ethread.tcb.apc_state.process.get() == target && ethread.cid.unique_process.get() == 0x7A38, "ps: KTHREAD ligado ao processo");
     let token = process::get_primary_token(target);
     assert(token.is_some_and(|token| token != process::get_primary_token(system).unwrap()), "ps: token proprio herdado");
-    assert(guest::read64(target + eprocess::TOKEN) == token.unwrap(), "ps: EPROCESS.Token");
+    // EX_FAST_REF: os 4 bits baixos são o RefCnt do cache rápido.
+    assert(eprocess.token.value.get() & !15 == token.unwrap(), "ps: EPROCESS.Token");
     let table = process_handles::get(target);
-    assert(table.is_some_and(|table| guest::read64(target + eprocess::OBJECT_TABLE) == table), "ps: ObjectTable publicado");
+    assert(table.is_some_and(|table| eprocess.object_table.get() == table), "ps: ObjectTable publicado");
     assert(process::list_active_processes().iter().any(|entry| entry.pid == 0x7A38 && entry.name == "phase3-test.exe" && entry.threads.contains(&thread)), "ps: processo e thread enumerados");
     // Handle publicado na tabela do processo e fechado pelo dono na saída.
     let description = HandleDescription { pointer: target, type_name: alloc::string::String::from("Process"), identity: target, native_body: 0, attributes: 0, access: 0x1F_FFFF };
@@ -309,7 +328,7 @@ fn processes(assert: Assert) {
     *PUBLISHED.lock() = binding.ok();
     assert(process::reference(target) == Some(1), "ps: referencia de driver");
     assert(process::terminate_process(target, 0x1234).is_ok(), "ps: terminacao");
-    assert(guest::read32(target + eprocess::EXIT_STATUS) == 0x1234 && guest::read32(target + eprocess::FLAGS) & eprocess::PROCESS_EXITING_FLAG != 0, "ps: status e flag de saida");
+    assert(eprocess.exit_status.get() == 0x1234 && eprocess.process_exiting() != 0, "ps: status e flag de saida");
     assert(PUBLISHED.lock().is_none() && process_handles::get(target).is_none(), "ps: handles fechados pelo dono");
     assert(process::is_process(target), "ps: referencia retem o EPROCESS");
     assert(!process::list_active_processes().iter().any(|entry| entry.pid == 0x7A38), "ps: fora da lista ativa");
@@ -437,24 +456,27 @@ fn object_callbacks(assert: Assert) {
     let output = scratch + 0xC0;
     let process_type = object_types::process_type();
     guest::write64(type_cell, process_type.pointer);
-    guest::write64(operation, type_cell);
-    guest::write32(operation + 8, 3); // CREATE | DUPLICATE
-    guest::write64(operation + 16, page);
-    guest::write64(operation + 24, page + 12);
+    let operation_registration = unsafe { ObOperationRegistration::at(operation) };
+    operation_registration.object_type.set(type_cell);
+    operation_registration.operations.set(3); // CREATE | DUPLICATE
+    operation_registration.pre_operation.set(page);
+    operation_registration.post_operation.set(page + 12);
     crate::ntos::rtl::guest_strings::write_wide_string(altitude, "321000");
-    guest::write16(registration, 0x100);
-    guest::write16(registration + 2, 1);
-    guest::write16(registration + 8, 12);
-    guest::write16(registration + 10, 14);
-    guest::write64(registration + 16, altitude);
-    guest::write64(registration + 24, counters);
-    guest::write64(registration + 32, operation);
+    let callback_registration = unsafe { ObCallbackRegistration::at(registration) };
+    callback_registration.version.set(0x100);
+    callback_registration.operation_registration_count.set(1);
+    callback_registration.altitude.length.set(12);
+    callback_registration.altitude.maximum_length.set(14);
+    callback_registration.altitude.buffer.set(altitude);
+    callback_registration.registration_context.set(counters);
+    callback_registration.operation_registration.set(operation);
     assert(matches!(callbacks::register(registration, output), Ok(0)), "ob callbacks: registro");
     let handle = guest::read64(output);
-    assert(handle != 0 && guest::read64(process_type.pointer + 0xC8) == handle + 32, "ob callbacks: lista nativa do OBJECT_TYPE");
+    let callback_list = &unsafe { ObjectType::at(process_type.pointer) }.callback_list;
+    assert(handle != 0 && callback_list.flink.get() == handle + 32, "ob callbacks: lista nativa do OBJECT_TYPE");
     assert(matches!(callbacks::register(registration, output), Ok(0xC01C_0011)), "ob callbacks: altitude duplicada");
     // Callback fora de imagem verificada é recusado.
-    guest::write64(operation + 16, kernel_routine as extern "win64" fn(u64, u64, u64, u64, u64) as usize as u64);
+    operation_registration.pre_operation.set(kernel_routine as extern "win64" fn(u64, u64, u64, u64, u64) as usize as u64);
     crate::ntos::rtl::guest_strings::write_wide_string(altitude, "321001");
     assert(matches!(callbacks::register(registration, output), Ok(0xC000_0022)), "ob callbacks: imagem nao verificada");
     let target = process::create_process(0x7B20, "phase3-obcb.exe", 0, None).unwrap_or(0);
@@ -467,7 +489,7 @@ fn object_callbacks(assert: Assert) {
     assert(crate::ntos::ob::object_manager::handle_record(opened).is_some_and(|record| record.access == 0x1F_FFFF), "ob callbacks: modo kernel conserva o acesso");
     let _ = crate::ntos::ob::object_manager::close(opened);
     assert(matches!(callbacks::unregister(handle), Ok(0)), "ob callbacks: remocao");
-    assert(guest::read64(process_type.pointer + 0xC8) == process_type.pointer + 0xC8 && callbacks::registration_count() == 0, "ob callbacks: lista vazia apos remocao");
+    assert(callback_list.flink.get() == callback_list.address() && callbacks::registration_count() == 0, "ob callbacks: lista vazia apos remocao");
     let _ = process::terminate_process(target, 0);
     let _ = process::release_thread(thread);
     assert(matches!(loaded_images::unregister(image.id), Ok(true)), "ob callbacks: imagem descarregada");
@@ -500,7 +522,7 @@ fn open_by_pointer(assert: Assert) {
     let record = om::handle_record(handle as u32);
     assert(record.is_some_and(|record| record.pointer == target && record.access == 0x1000 && record.options.owner_process == Some(process::get_current_process())), "open-pointer: linha nativa do handle");
     assert(matches!(open_pointer::reference_handle(handle, 0x1000, process_type.pointer, 1, object, information), Ok(Some(0))), "open-pointer: ObReferenceObjectByHandle");
-    assert(guest::read64(object) == target && guest::read32(information + 4) == 0x1000 && process::reference_count(target) == Some(references + 2), "open-pointer: corpo e informacao do handle");
+    assert(guest::read64(object) == target && unsafe { ObjectHandleInformation::at(information) }.granted_access.get() == 0x1000 && process::reference_count(target) == Some(references + 2), "open-pointer: corpo e informacao do handle");
     let _ = process::dereference(target);
     assert(matches!(open_pointer::reference_handle(handle, 0x1F_FFFF, process_type.pointer, 1, object, 0), Ok(Some(0xC000_0022))), "open-pointer: acesso alem do concedido");
     assert(matches!(open_pointer::reference_handle(handle, 0, object_types::token_type().pointer, 0, object, 0), Ok(Some(0xC000_0024))), "open-pointer: tipo do handle");
@@ -552,7 +574,7 @@ fn security_descriptors(assert: Assert) {
     let dacl = descriptor::component(pool, control, 3);
     assert(acl::valid(dacl), "se: RtlValidAcl");
     let out = pool + 0x180;
-    assert(descriptor::get_ace(dacl, 1, out) == 0 && guest::read32(guest::read64(out) + 4) == 0x20003, "se: RtlGetAce");
+    assert(descriptor::get_ace(dacl, 1, out) == 0 && unsafe { AccessAllowedAce::at(guest::read64(out)) }.mask.get() == 0x20003, "se: RtlGetAce");
     assert(descriptor::get_ace(dacl, 2, out) == 0xC000_000D, "se: indice de ACE fora da ACL");
     let capacity = pool + 0x190;
     guest::write32(capacity, 0x100);
@@ -565,7 +587,7 @@ fn security_descriptors(assert: Assert) {
     assert(callback_security::access(&captured, 1, false) == Ok(1), "ex: acesso sem verificacao");
     assert(callback_security::access(&captured, 0x0200_0000, false) == Ok(0x1F_0001), "ex: MAXIMUM_ALLOWED sem verificacao");
     assert(callback_security::access(&captured, 0x4, false) == Err(0xC000_0022), "ex: direito fora do tipo Callback");
-    guest::write8(pool, 2);
+    unsafe { SecurityDescriptorRelative::at(pool) }.revision.set(2);
     assert(callback_security::capture(pool) == Err(0xC000_0079), "ex: descritor invalido");
     let _ = kernel_pool::free(pool, None);
 }
@@ -607,23 +629,29 @@ fn dispatcher_bodies_and_close(assert: Assert) {
     guest::free_bytes(event);
 }
 
-/// OBJECT_ATTRIBUTES de 48 bytes com o nome dado (UNICODE_STRING em +0x30).
+/// OBJECT_ATTRIBUTES com o nome dado: o UNICODE_STRING logo depois da
+/// estrutura e o texto depois dele.
 fn object_attributes(scratch: u64, root: u64, name: &str, flags: u32) -> u64 {
-    let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
-    for offset in (0..48).step_by(8) {
-        guest::write64(scratch + offset, 0);
-    }
-    guest::write32(scratch, 48);
-    guest::write64(scratch + 8, root);
-    guest::write64(scratch + 16, scratch + 0x30);
-    guest::write32(scratch + 24, flags);
-    guest::write16(scratch + 0x30, units.len() as u16 * 2);
-    guest::write16(scratch + 0x32, units.len() as u16 * 2);
-    guest::write64(scratch + 0x38, scratch + 0x40);
-    for (index, &unit) in units.iter().enumerate() {
-        guest::write16(scratch + 0x40 + index as u64 * 2, unit);
-    }
+    let name_address = scratch + ObjectAttributes::SIZE;
+    let text = name_address + UnicodeString::SIZE;
+    guest::write_bytes(scratch, &[0; ObjectAttributes::SIZE as usize]);
+    let attributes = unsafe { ObjectAttributes::at(scratch) };
+    attributes.length.set(ObjectAttributes::SIZE as u32);
+    attributes.root_directory.set(root);
+    attributes.object_name.set(name_address);
+    attributes.attributes.set(flags);
+    guest_unicode_at(name_address, text, name);
     scratch
+}
+
+/// UNICODE_STRING em `descriptor` com o texto UTF-16 copiado para `text`.
+fn guest_unicode_at(descriptor: u64, text: u64, value: &str) {
+    let bytes: alloc::vec::Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(text, &bytes);
+    let string = unsafe { UnicodeString::at(descriptor) };
+    string.length.set(bytes.len() as u16);
+    string.maximum_length.set(bytes.len() as u16);
+    string.buffer.set(text);
 }
 
 fn namespace_handles(assert: Assert) {
@@ -654,17 +682,19 @@ fn namespace_handles(assert: Assert) {
     object_attributes(attributes, directory, "link", 0x40);
     assert(nh::open(output, 1, attributes, "SymbolicLink", false, false) == 0, "ns: NtOpenSymbolicLinkObject relativo");
     let link = guest::read64(output);
-    guest::write16(link_buffer, 0);
-    guest::write16(link_buffer + 2, 4);
-    guest::write64(link_buffer + 8, link_buffer + 0x10);
+    let link_target = unsafe { UnicodeString::at(link_buffer) };
+    link_target.length.set(0);
+    link_target.maximum_length.set(4);
+    link_target.buffer.set(link_buffer + UnicodeString::SIZE);
     assert(nh::query_link(link, link_buffer, length, false) == 0xC000_0023 && guest::read32(length) == 14, "ns: buffer pequeno informa o tamanho");
-    guest::write16(link_buffer + 2, 0x40);
-    assert(nh::query_link(link, link_buffer, length, false) == 0 && guest::read16(link_buffer) == 14 && crate::ntos::rtl::guest_strings::read_unicode_string(link_buffer) == "\\Device", "ns: NtQuerySymbolicLinkObject");
+    link_target.maximum_length.set(0x40);
+    assert(nh::query_link(link, link_buffer, length, false) == 0 && link_target.length.get() == 14 && crate::ntos::rtl::guest_strings::read_unicode_string(link_buffer) == "\\Device", "ns: NtQuerySymbolicLinkObject");
     assert(nh::query_link(directory, link_buffer, length, false) == 0xC000_0024, "ns: diretorio nao e link");
     // Enumeração do diretório.
     assert(nh::query_directory(directory, query, 0x100, false, true, context, length) == 0, "ns: NtQueryDirectoryObject");
-    assert(guest::read32(context) == 1 && crate::ntos::rtl::guest_strings::read_unicode_string(query) == "Link" && crate::ntos::rtl::guest_strings::read_unicode_string(query + 16) == "SymbolicLink", "ns: entrada nome/tipo");
-    assert(guest::read64(query + 32) == 0 && guest::read64(query + 40) == 0, "ns: terminador vazio");
+    let entries = unsafe { ObjectDirectoryInformation::array_at(query, 2) };
+    assert(guest::read32(context) == 1 && crate::ntos::rtl::guest_strings::read_unicode_string(entries[0].name.address()) == "Link" && crate::ntos::rtl::guest_strings::read_unicode_string(entries[0].type_name.address()) == "SymbolicLink", "ns: entrada nome/tipo");
+    assert(entries[1].name.length.get() == 0 && entries[1].name.maximum_length.get() == 0 && entries[1].name.buffer.get() == 0, "ns: terminador vazio");
     assert(nh::query_directory(directory, query, 0x100, false, false, context, length) == 0x8000_001A, "ns: STATUS_NO_MORE_ENTRIES");
     assert(nh::query_directory(directory, query, 40, false, true, context, length) == 0xC000_0023, "ns: buffer insuficiente");
     // O último handle remove o nome do diretório temporário.
@@ -688,19 +718,20 @@ extern "win64" fn lookaside_free(block: u64) {
 
 fn executive_primitives(assert: Assert) {
     use crate::ntos::ex::{lookaside, pool_allocation, slist, spin_lock};
-    use crate::ntos::inc::nt_abi::lookaside_list as layout;
     // SLIST: profundidade, sequência e ABA.
     let area = guest::alloc_aligned(0x200, 16, true);
     let head = area;
+    // HeaderX64: Depth nos bits 0-15, Sequence nos bits 16-63.
+    let sequence = || unsafe { SlistHeader::at(head) }.alignment.get() >> 16;
     assert(slist::initialize(head + 8).is_err_and(|error| error.status == 0x8000_0002), "slist: desalinhamento");
     assert(slist::initialize(head).is_ok(), "slist: InitializeSListHead");
     let entries = [area + 0x40, area + 0x60, area + 0x80];
     for &entry in &entries {
         assert(slist::push(head, entry).is_ok(), "slist: push");
     }
-    assert(slist::depth(head) == 3 && slist::first(head) == entries[2] && guest::read64(head) >> 16 == 3, "slist: profundidade, sequencia e primeiro");
-    assert(matches!(slist::pop(head), Ok(entry) if entry == entries[2]) && slist::depth(head) == 2 && guest::read64(head) >> 16 == 3, "slist: pop so decrementa a profundidade");
-    assert(matches!(slist::flush(head), Ok(entry) if entry == entries[1]) && slist::depth(head) == 0 && slist::first(head) == 0 && guest::read64(head) >> 16 == 3, "slist: flush conserva a sequencia");
+    assert(slist::depth(head) == 3 && slist::first(head) == entries[2] && sequence() == 3, "slist: profundidade, sequencia e primeiro");
+    assert(matches!(slist::pop(head), Ok(entry) if entry == entries[2]) && slist::depth(head) == 2 && sequence() == 3, "slist: pop so decrementa a profundidade");
+    assert(matches!(slist::flush(head), Ok(entry) if entry == entries[1]) && slist::depth(head) == 0 && slist::first(head) == 0 && sequence() == 3, "slist: flush conserva a sequencia");
     assert(matches!(slist::pop(head), Ok(0)), "slist: lista vazia");
     // EX_SPIN_LOCK: escritor, leitores e conversão.
     let lock = area + 0x100;
@@ -720,27 +751,28 @@ fn executive_primitives(assert: Assert) {
     assert(crate::ntos::mm::kernel_pool::info(block).is_some_and(|info| info.tag == 0x7473_6554), "pool: tag registrada");
     let _ = crate::ntos::mm::kernel_pool::free(block, None);
     // Sem rotinas próprias, a lista usa os exports públicos de pool.
-    let list = guest::alloc_aligned(layout::SIZE, 16, true);
+    let list = guest::alloc_aligned(NpagedLookasideList::SIZE, 16, true);
+    let general = &unsafe { NpagedLookasideList::at(list) }.l;
     let export = |name: &str| crate::ntos::init::exports::export_module().ok().and_then(|module| module.exports.exports.get(name).copied());
-    let defaults = lookaside::initialize(list, 0, 0, 0, 0x30, 0x6B6F_6F4C, false).is_ok() && Some(guest::read64(list + layout::ALLOCATE_CALLBACK)) == export("ExAllocatePoolWithTag") && Some(guest::read64(list + layout::FREE_CALLBACK)) == export("ExFreePool");
+    let defaults = lookaside::initialize(list, 0, 0, 0, 0x30, 0x6B6F_6F4C, false).is_ok() && Some(general.allocate.get()) == export("ExAllocatePoolWithTag") && Some(general.free.get()) == export("ExFreePool");
     assert(defaults && lookaside::delete(list).is_ok(), "lookaside: callbacks padrao sao os exports de pool");
     // Lookaside com callbacks próprios.
     let registered = lookaside::registered_count();
     let allocate_routine = lookaside_allocate as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64;
     let free_routine = lookaside_free as extern "win64" fn(u64) as usize as u64;
     assert(lookaside::initialize(list, allocate_routine, free_routine, 0, 0x30, 0x6B6F_6F4C, false).is_ok() && lookaside::registered_count() == registered + 1, "lookaside: ExInitializeNPagedLookasideList");
-    assert(guest::read16(list + layout::DEPTH) == 4 && guest::read32(list + layout::BLOCK_SIZE) == 0x30, "lookaside: profundidade inicial e tamanho");
+    assert(general.depth.get() == 4 && general.size.get() == 0x30, "lookaside: profundidade inicial e tamanho");
     let first = lookaside::allocate(list).unwrap_or(0);
-    assert(first != 0 && guest::read32(list + layout::ALLOC_MISSES) == 1, "lookaside: falta chama o alocador");
+    assert(first != 0 && general.allocate_misses.get() == 1, "lookaside: falta chama o alocador");
     assert(lookaside::free(list, first).is_ok() && slist::depth(list) == 1, "lookaside: devolucao vai ao cache");
-    assert(lookaside::allocate(list).ok() == Some(first) && guest::read32(list + layout::ALLOC_COUNT) == 2 && guest::read32(list + layout::ALLOC_MISSES) == 1, "lookaside: acerto no cache");
+    assert(lookaside::allocate(list).ok() == Some(first) && general.total_allocates.get() == 2 && general.allocate_misses.get() == 1, "lookaside: acerto no cache");
     let blocks: alloc::vec::Vec<u64> = (0..5).map(|_| lookaside::allocate(list).unwrap_or(0)).collect();
     LOOKASIDE_FREES.store(0, Ordering::SeqCst);
     for &block in &blocks {
         let _ = lookaside::free(list, block);
     }
     let _ = lookaside::free(list, first);
-    assert(slist::depth(list) == 4 && guest::read32(list + layout::FREE_MISSES) == 2 && LOOKASIDE_FREES.load(Ordering::SeqCst) == 2, "lookaside: cache cheio libera pelo callback");
+    assert(slist::depth(list) == 4 && general.free_misses.get() == 2 && LOOKASIDE_FREES.load(Ordering::SeqCst) == 2, "lookaside: cache cheio libera pelo callback");
     assert(lookaside::delete(list).is_ok() && LOOKASIDE_FREES.load(Ordering::SeqCst) == 6 && lookaside::registered_count() == registered, "lookaside: exclusao esvazia o cache");
     guest::free_bytes(list);
     guest::free_bytes(area);
@@ -788,9 +820,10 @@ fn executive_resources(assert: Assert) {
     assert(resource::release(lock).is_err(), "eresource: liberacao por quem nao e dono");
     process::set_current_thread(first);
     // Helpers combinados com região crítica.
-    let apc_disable = guest::read16(first + kthread::KERNEL_APC_DISABLE);
-    assert(resource::enter_exclusive(lock).is_ok() && guest::read16(first + kthread::KERNEL_APC_DISABLE) == apc_disable.wrapping_sub(1), "eresource: entra na regiao critica e adquire");
-    assert(resource::release_and_leave(lock).is_ok() && guest::read16(first + kthread::KERNEL_APC_DISABLE) == apc_disable, "eresource: libera e sai da regiao critica");
+    let apc_disable = &unsafe { Kthread::at(first) }.kernel_apc_disable;
+    let before = apc_disable.get();
+    assert(resource::enter_exclusive(lock).is_ok() && apc_disable.get() == before.wrapping_sub(1), "eresource: entra na regiao critica e adquire");
+    assert(resource::release_and_leave(lock).is_ok() && apc_disable.get() == before, "eresource: libera e sai da regiao critica");
     assert(matches!(resource::reinitialize(lock), Ok(0)) && matches!(resource::delete(lock), Ok(0)), "eresource: reinicializacao e exclusao");
     guest::free_bytes(lock);
     let _ = process::release_thread(second);
@@ -821,12 +854,13 @@ fn executive_callbacks(assert: Assert) {
     // Registro unico e notificação pela ABI nativa.
     let routine = callback_routine as extern "win64" fn(u64, u64, u64) as usize as u64;
     let registration = callbacks::register(object, routine, 100).unwrap_or(0);
-    assert(registration != 0 && guest::read64(object + 0x10) == registration && guest::read64(registration + 0x10) == object, "excb: ExRegisterCallback na lista nativa");
+    let registered = &unsafe { CallbackObject::at(object) }.registered_callbacks;
+    assert(registration != 0 && registered.flink.get() == registration && unsafe { CallbackRegistration::at(registration) }.callback_object.get() == object, "excb: ExRegisterCallback na lista nativa");
     assert(matches!(callbacks::register(object, routine, 1), Ok(0)), "excb: objeto sem multiplos registros");
     NOTIFIED.store(0, Ordering::SeqCst);
     assert(callbacks::notify(object, 2, 3).is_ok() && NOTIFIED.load(Ordering::SeqCst) == 105, "excb: ExNotifyCallback");
     assert(callbacks::counts(object) == Some((2, 0, 1)), "excb: registro retem o objeto");
-    assert(matches!(callbacks::unregister(registration), Ok(0)) && callbacks::counts(object) == Some((1, 0, 0)) && guest::read64(object + 0x10) == object + 0x10, "excb: ExUnregisterCallback");
+    assert(matches!(callbacks::unregister(registration), Ok(0)) && callbacks::counts(object) == Some((1, 0, 0)) && registered.flink.get() == registered.address(), "excb: ExUnregisterCallback");
     // Handle de kernel fechado pelo NtClose através do dono registrado.
     let opened = callbacks::open_handle(object, 0x1F_0001, 0x200, false);
     assert(matches!(opened, Ok(Ok(handle)) if handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000), "excb: handle de kernel");
@@ -891,9 +925,10 @@ fn token_services(assert: Assert) {
     // TokenStatistics (classe 10).
     assert(matches!(query_token::query(handle, 10, output, 56, returned, 0), Ok(0)) && guest::read32(returned) == 56, "token: TokenStatistics");
     let record = tokens::get(system).unwrap();
-    assert(guest::read64(output) == record.id && guest::read32(output + 24) == 1 && guest::read32(output + 40) == record.groups.len() as u32 && guest::read64(output + 48) == record.modified_id, "token: campos de TOKEN_STATISTICS");
+    let statistics = unsafe { TokenStatistics::at(output) };
+    assert(luid(&statistics.token_id) == record.id && statistics.token_type.get() == 1 && statistics.group_count.get() == record.groups.len() as u32 && luid(&statistics.modified_id) == record.modified_id, "token: campos de TOKEN_STATISTICS");
     let (charged, available) = tokens::accounting(system).unwrap_or((0, 0));
-    assert(guest::read32(output + 32) as u64 == charged && guest::read32(output + 36) as u64 == available, "token: memoria dinamica do token");
+    assert(statistics.dynamic_charged.get() as u64 == charged && statistics.dynamic_available.get() as u64 == available, "token: memoria dinamica do token");
     assert(matches!(query_token::query(handle, 10, output, 8, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == 56, "token: buffer pequeno informa o tamanho");
     assert(matches!(query_token::query(handle, 0, output, 56, returned, 0), Ok(0xC000_0003)) && matches!(query_token::query(handle, 5, output, 56, returned, 0), Ok(0xC000_0002)), "token: classes recusadas e nao implementadas");
     // ZwDuplicateToken para um token de impersonação.
@@ -1025,28 +1060,24 @@ fn capabilities_and_anonymous(assert: Assert) {
     let group = area + 0x80;
     let capability = area + 0xC0;
     let output = area + 0x1F0;
-    let write_name = |value: &str| {
-        let units: alloc::vec::Vec<u16> = value.encode_utf16().collect();
-        for (index, &unit) in units.iter().enumerate() {
-            guest::write16(text + index as u64 * 2, unit);
-        }
-        guest::write16(name, units.len() as u16 * 2);
-        guest::write16(name + 2, units.len() as u16 * 2);
-        guest::write64(name + 8, text);
-    };
+    let write_name = |value: &str| guest_unicode_at(name, text, value);
     // Nome legado: SID de capability S-1-15-3-1; o de grupo continua por hash.
     write_name("internetClient");
     assert(matches!(capability_identifiers::derive(name, group, capability), Ok(0)), "cap: derivacao de nome legado");
     assert(guest::read_bytes(capability, 16) == model::sid(15, &[3, 1]), "cap: S-1-15-3-1 para internetClient");
     let upper: alloc::vec::Vec<u8> = "INTERNETCLIENT".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
     let digest = sha256::hash_bytes(&upper);
-    assert(guest::read8(group + 1) == 9 && guest::read8(group + 7) == 5 && guest::read32(group + 8) == 32 && guest::read_bytes(group + 12, 32) == digest, "cap: SID de grupo S-1-5-32 por SHA-256 do nome em maiusculas");
+    let group_sid = unsafe { Sid::at(group) };
+    let group_subs = sub_authorities(group_sid, 9);
+    assert(group_sid.sub_authority_count.get() == 9 && group_sid.identifier_authority.value[5].get() == 5 && group_subs[0].get() == 32 && guest::read_bytes(group_subs[1].address(), 32) == digest, "cap: SID de grupo S-1-5-32 por SHA-256 do nome em maiusculas");
     assert(capability_token_checks::is_capability_identifier(capability) && !capability_token_checks::is_capability_identifier(group), "cap: RtlIsCapabilitySid");
     // Nome por hash: S-1-15-3-1024-<digest>.
     write_name("phase3Capability");
     assert(matches!(capability_identifiers::derive(name, group, capability), Ok(0)), "cap: derivacao por hash");
     let upper: alloc::vec::Vec<u8> = "PHASE3CAPABILITY".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
-    assert(guest::read8(capability + 1) == 10 && guest::read32(capability + 12) == 1024 && guest::read_bytes(capability + 16, 32) == sha256::hash_bytes(&upper), "cap: SID de capability por hash");
+    let capability_sid = unsafe { Sid::at(capability) };
+    let capability_subs = sub_authorities(capability_sid, 10);
+    assert(capability_sid.sub_authority_count.get() == 10 && capability_subs[1].get() == 1024 && guest::read_bytes(capability_subs[2].address(), 32) == sha256::hash_bytes(&upper), "cap: SID de capability por hash");
     assert(capability_identifiers::derive(0, group, capability).is_err(), "cap: ponteiro nulo e fast fail");
     // Verificações de token (modo kernel concede pela regra medida).
     assert(matches!(capability_token_checks::check_capability(0, capability, output), Ok(0)) && guest::read8(output) == 1, "cap: RtlCheckTokenCapability em modo kernel");
@@ -1072,17 +1103,16 @@ fn capabilities_and_anonymous(assert: Assert) {
 fn process_accessors(assert: Assert) {
     use crate::ntos::ps::{lookup_thread, pool_quota, process_context, session};
     use crate::ntos::ps::silo::query as silo_query;
-    use crate::ntos::inc::nt_abi::ejob;
     // Silos: o host é NULL; -3 herda do processo dono.
     let system = process::get_system_process();
     assert(silo_query::current_silo() == 0 && silo_query::current_server_silo() == 0, "silo: host sem silo");
     let previous = silo_query::attach(0x1234);
     assert(previous == silo_query::INHERIT && silo_query::current_silo() == 0x1234, "silo: PsAttachSiloToCurrentThread");
     silo_query::detach(previous);
-    let job = guest::alloc_bytes(ejob::SIZE);
+    let job = guest::alloc_bytes(Ejob::SIZE);
     let output = guest::alloc_bytes(8);
     assert(silo_query::get_job_silo(0, output) == 0xC000_000D && silo_query::get_job_silo(job, output) == 0xC000_0509, "silo: job sem container");
-    guest::write32(job + ejob::FLAGS, 0x4000_0000);
+    unsafe { Ejob::at(job) }.set_silo(1);
     assert(silo_query::get_job_silo(job, output) == 0 && guest::read64(output) == job, "silo: PsGetJobSilo");
     guest::write64(output, 0xFFFF);
     assert(silo_query::get_job_server_silo(job, output) == 0 && guest::read64(output) == 0, "silo: job sem server silo");
@@ -1164,7 +1194,6 @@ extern "win64" fn silo_cleanup(_context: u64) {
 fn silo_contexts(assert: Assert) {
     use crate::ntos::ob::open_pointer;
     use crate::ntos::ps::silo::contexts;
-    use crate::ntos::inc::nt_abi::ejob;
     let scratch = guest::alloc_bytes(0x40);
     let slot_out = scratch;
     let output = scratch + 8;
@@ -1192,9 +1221,10 @@ fn silo_contexts(assert: Assert) {
     }
     assert(!contexts::exists(context) && SILO_CLEANUPS.load(Ordering::SeqCst) == 1, "silo: ultima referencia chama o cleanup");
     // Tabela própria de um silo, desmontada com seus contextos.
-    let job = guest::alloc_bytes(ejob::SIZE);
+    let job = guest::alloc_bytes(Ejob::SIZE);
+    let storage = &unsafe { Ejob::at(job) }.storage;
     let table = contexts::create_table(job).unwrap_or(0);
-    assert(table != 0 && guest::read64(job + ejob::SILO_CONTEXT) == table && contexts::create_table(job).is_err(), "silo: tabela de contextos do silo");
+    assert(table != 0 && storage.get() == table && contexts::create_table(job).is_err(), "silo: tabela de contextos do silo");
     let _ = contexts::alloc_slot(slot_out);
     let slot = guest::read32(slot_out);
     let _ = contexts::create(job, 0x10, 1, cleanup, output);
@@ -1202,7 +1232,7 @@ fn silo_contexts(assert: Assert) {
     assert(matches!(contexts::insert(0, slot, owned, false), Ok(0xC000_000D)), "silo: contexto de outro silo recusado");
     assert(matches!(contexts::insert(job, slot, owned, true), Ok(0)), "silo: insercao permanente no silo");
     let _ = contexts::dereference(owned);
-    assert(contexts::destroy_table(job).is_ok() && guest::read64(job + ejob::SILO_CONTEXT) == 0, "silo: desmontagem da tabela");
+    assert(contexts::destroy_table(job).is_ok() && storage.get() == 0, "silo: desmontagem da tabela");
     if contexts::exists(owned) {
         crate::ntos::io::work_items::run_queue();
     }
@@ -1231,21 +1261,17 @@ fn silo_monitors(assert: Assert) {
     let name = scratch + 0x20;
     let text = scratch + 0x30;
     let output = scratch + 0x60;
-    for (index, unit) in "Phase3Mon".encode_utf16().enumerate() {
-        guest::write16(text + index as u64 * 2, unit);
-    }
-    guest::write16(name, 18);
-    guest::write16(name + 2, 18);
-    guest::write64(name + 8, text);
-    guest::write8(registration, 1);
-    guest::write8(registration + 1, 1); // CreateAsHost
-    guest::write8(registration + 2, 1); // MonitorExistingSilos
-    guest::write64(registration + 8, name);
-    guest::write64(registration + 0x10, 0);
-    guest::write64(registration + 0x18, 0);
+    guest_unicode_at(name, text, "Phase3Mon");
+    let monitor_registration = unsafe { SiloMonitorRegistration::at(registration) };
+    monitor_registration.version.set(1);
+    monitor_registration.monitor_host.set(1);
+    monitor_registration.monitor_existing_silos.set(1);
+    monitor_registration.driver_object_name.set(name);
+    monitor_registration.create_callback.set(0);
+    monitor_registration.terminate_callback.set(0);
     assert(matches!(monitors::register(registration, output), Ok(0xC000_000D)), "monitor: sem callbacks recusado");
-    guest::write64(registration + 0x10, monitor_create as extern "win64" fn(u64) -> u32 as usize as u64);
-    guest::write64(registration + 0x18, monitor_terminate as extern "win64" fn(u64) as usize as u64);
+    monitor_registration.create_callback.set(monitor_create as extern "win64" fn(u64) -> u32 as usize as u64);
+    monitor_registration.terminate_callback.set(monitor_terminate as extern "win64" fn(u64) as usize as u64);
     MONITOR_CREATES.store(0, Ordering::SeqCst);
     MONITOR_TERMINATES.store(0, Ordering::SeqCst);
     MONITOR_CREATE_STATUS.store(0, Ordering::SeqCst);
@@ -1300,7 +1326,7 @@ fn driver_and_section_objects(assert: Assert) {
     // Seção: handles, vistas e permanência retêm o corpo de forma independente.
     let state = section_objects::SectionState { size: 0x2000, name: alloc::string::String::from("Phase3Sec"), ..section_objects::SectionState::default() };
     let section = section_objects::register(state.clone(), destroy_section).unwrap_or(0);
-    assert(section != 0 && guest::read64(section + 0x30) == 0x2000 && open_pointer::describe(section).is_some_and(|item| item.object_type.name == "Section"), "secao: corpo com SizeOfSection");
+    assert(section != 0 && unsafe { Section::at(section) }.size_of_section.get() == 0x2000 && open_pointer::describe(section).is_some_and(|item| item.object_type.name == "Section"), "secao: corpo com SizeOfSection");
     let handle = section_objects::open_handle(section, 0x4, 0).unwrap_or(0);
     assert(handle != 0 && section_objects::state(section).is_some_and(|state| state.handles == 1), "secao: handle conta no estado");
     let _ = section_objects::update(section, |state| state.views += 1);
@@ -1339,10 +1365,10 @@ impl crate::ntos::ob::objects::file::FileSource for TestSource {
 fn file_objects(assert: Assert) {
     use crate::ntos::ob::objects::file::{self as files, FileCallbacks};
     use crate::ntos::ob::{close, open_pointer};
-    use crate::ntos::inc::nt_abi::file_object as layout;
     let file = files::create(0, "\\Phase3\\a.txt").unwrap_or(0);
-    assert(file != 0 && guest::read16(file) == 5 && crate::ntos::rtl::guest_strings::read_unicode_string(file + layout::FILE_NAME) == "\\Phase3\\a.txt", "file: FILE_OBJECT com nome UTF-16");
-    assert(guest::read64(file + layout::IRP_LIST) == file + layout::IRP_LIST && files::reference_count(file) == Some(1), "file: lista de IRPs vazia e referencia do criador");
+    let file_object = unsafe { FileObject::at(file) };
+    assert(file != 0 && file_object.type_.get() == 5 && crate::ntos::rtl::guest_strings::read_unicode_string(file_object.file_name.address()) == "\\Phase3\\a.txt", "file: FILE_OBJECT com nome UTF-16");
+    assert(file_object.irp_list.flink.get() == file_object.irp_list.address() && files::reference_count(file) == Some(1), "file: lista de IRPs vazia e referencia do criador");
     FILE_EVENTS.store(0, Ordering::SeqCst);
     let callbacks = FileCallbacks {
         cleanup: Some(alloc::sync::Arc::new(|| {
@@ -1359,11 +1385,11 @@ fn file_objects(assert: Assert) {
     assert(files::set_callbacks(file, callbacks).is_ok(), "file: rotinas de vida");
     let output = guest::alloc_bytes(8);
     assert(matches!(open_pointer::open(file, 0, 0, 1, object_types::file_type().pointer, 0, output), Ok(0xC000_0128)), "file: sem handle o arquivo nao abre por ponteiro");
-    assert(files::open_handle(file).is_ok() && guest::read32(file + layout::FLAGS) & 0x40000 != 0, "file: FO_HANDLE_CREATED");
+    assert(files::open_handle(file).is_ok() && file_object.flags.get() & 0x40000 != 0, "file: FO_HANDLE_CREATED");
     assert(matches!(open_pointer::open(file, 0, 0, 1, object_types::file_type().pointer, 0, output), Ok(0)), "file: abertura por ponteiro de arquivo aberto");
     let handle = guest::read64(output);
     assert(files::state(file).is_some_and(|state| state.0 == 2) && matches!(close::close(handle, Some(0)), Ok(0)), "file: handle por ponteiro conta e fecha");
-    assert(matches!(files::close_handle(file), Ok(0)) && FILE_EVENTS.load(Ordering::SeqCst) == 1 && guest::read32(file + layout::FLAGS) & 0x4000 != 0, "file: ultimo handle executa CLEANUP");
+    assert(matches!(files::close_handle(file), Ok(0)) && FILE_EVENTS.load(Ordering::SeqCst) == 1 && file_object.flags.get() & 0x4000 != 0, "file: ultimo handle executa CLEANUP");
     assert(matches!(open_pointer::open(file, 0, 0, 1, object_types::file_type().pointer, 0, output), Ok(0xC000_0128)), "file: arquivo limpo recusa abertura");
     assert(matches!(files::dereference(file), Ok(Some(0))) && FILE_EVENTS.load(Ordering::SeqCst) == 0x111 && !files::is_file(file), "file: ultima referencia executa CLOSE e destroy");
     // Fonte exata de imagem retida pelo FILE_OBJECT.
@@ -1392,20 +1418,22 @@ fn device_objects(assert: Assert) {
     let driver = guest::alloc_bytes(0x150);
     let node = om::create_object("\\Driver", "Phase3Dev", "Driver", Some(ObjectData::pointer(driver))).unwrap_or(0);
     let _ = driver_objects::register(node, destroy_driver);
-    let lower = guest::alloc_bytes(0x150);
-    let upper = guest::alloc_bytes(0x150);
-    for &device in &[lower, upper] {
-        guest::write64(device + 8, driver);
+    let lower = guest::alloc_bytes(DeviceObject::SIZE);
+    let upper = guest::alloc_bytes(DeviceObject::SIZE);
+    let (lower_device, upper_device) = unsafe { (DeviceObject::at(lower), DeviceObject::at(upper)) };
+    for device in [lower_device, upper_device] {
+        device.driver_object.set(driver);
     }
-    guest::write64(driver + 8, lower);
-    guest::write64(lower + 0x10, upper);
-    guest::write8(lower + 0x4C, 1);
+    unsafe { DriverObject::at(driver) }.device_object.set(lower);
+    lower_device.next_device.set(upper);
+    lower_device.stack_size.set(1);
     DEVICE_EVENTS.store(0, Ordering::SeqCst);
     assert(devices::register(lower, Some(device_destroyed), Some(device_unlinked)).is_ok() && devices::register(upper, Some(device_destroyed), Some(device_unlinked)).is_ok(), "device: registro de dois DEVICE_OBJECT");
-    assert(guest::read16(devices::extension(lower)) == 13 && guest::read64(devices::extension(lower) + 8) == lower && driver_objects::reference_count(driver) == Some(2), "device: DEVOBJ_EXTENSION e retencao do driver");
+    let extension = unsafe { DevobjExtension::at(devices::extension(lower)) };
+    assert(extension.type_.get() == 13 && extension.device_object.get() == lower && driver_objects::reference_count(driver) == Some(2), "device: DEVOBJ_EXTENSION e retencao do driver");
     let output = guest::alloc_bytes(0x20);
     assert(matches!(devices::attach(upper, lower, output), Ok(attached) if attached == lower) && guest::read64(output) == lower, "device: IoAttachDeviceToDeviceStackSafe");
-    assert(devices::top(lower) == upper && devices::base(upper) == lower && guest::read8(upper + 0x4C) == 2, "device: topo, base e StackSize");
+    assert(devices::top(lower) == upper && devices::base(upper) == lower && upper_device.stack_size.get() == 2, "device: topo, base e StackSize");
     assert(devices::attach(upper, lower, output).is_err(), "device: anexacao repetida recusada");
     assert(matches!(devices::attached_reference(lower, false), Ok(found) if found == upper) && devices::reference_count(upper) == Some(2), "device: IoGetAttachedDeviceReference");
     let _ = devices::dereference(upper);
@@ -1447,18 +1475,28 @@ fn query_object_format(assert: Assert) {
     assert(qof::type_size(&event) == 120 && qof::type_size(&file) == 120, "queryobject: tamanho de OBJECT_TYPE_INFORMATION");
     assert(qof::format(&information, 0, buffer, 48, &[]) == Formatted { status: MISMATCH, needed: None }, "queryobject: basica exige 56 bytes");
     guest::write_bytes(buffer, &[0xCC; 56]);
-    assert(qof::format(&information, 0, buffer, 56, &[]).status == 0 && guest::read32(buffer) == 0x13 && guest::read32(buffer + 4) == 0x1F0003 && guest::read32(buffer + 8) == 2 && guest::read32(buffer + 12) == 5 && guest::read32(buffer + 20) == 0x58 && guest::read32(buffer + 24) == 0 && guest::read32(buffer + 36) == 18 + 21 * 2 && guest::read32(buffer + 40) == 106 + 10 && guest::read32(buffer + 44) == 0x5C && guest::read64(buffer + 48) == 0x1234_5678, "queryobject: OBJECT_BASIC_INFORMATION");
+    let basic = unsafe { ObjectBasicInformation::at(buffer) };
+    assert(qof::format(&information, 0, buffer, 56, &[]).status == 0 && basic.attributes.get() == 0x13 && basic.granted_access.get() == 0x1F0003 && basic.handle_count.get() == 2 && basic.pointer_count.get() == 5 && basic.non_paged_pool_charge.get() == 0x58 && basic.reserved[0].get() == 0 && basic.name_info_size.get() == 18 + 21 * 2 && basic.type_info_size.get() == 106 + 10 && basic.security_descriptor_size.get() == 0x5C && basic.creation_time.quad_part.get() == 0x1234_5678, "queryobject: OBJECT_BASIC_INFORMATION");
+    let name_information = unsafe { ObjectNameInformation::at(buffer) };
+    let name_text = buffer + ObjectNameInformation::SIZE;
     assert(qof::format(&information, 1, buffer, 16, &[]) == Formatted { status: MISMATCH, needed: Some(60) }, "queryobject: nome com buffer curto");
-    assert(qof::format(&information, 1, buffer, 60, &[]).status == 0 && guest::read16(buffer) == 42 && guest::read16(buffer + 2) == 44 && guest::read64(buffer + 8) == buffer + 16 && guest::read16(buffer + 16) == b'\\' as u16 && guest::read16(buffer + 16 + 42) == 0, "queryobject: OBJECT_NAME_INFORMATION");
+    assert(qof::format(&information, 1, buffer, 60, &[]).status == 0 && name_information.name.length.get() == 42 && name_information.name.maximum_length.get() == 44 && name_information.name.buffer.get() == name_text && guest::read16(name_text) == b'\\' as u16 && guest::read16(name_text + 42) == 0, "queryobject: OBJECT_NAME_INFORMATION");
     let anonymous = ObjectInformation { name: None, ..information.clone() };
-    assert(qof::format(&anonymous, 1, buffer, 16, &[]).status == 0 && guest::read16(buffer + 2) == 0 && guest::read64(buffer + 8) == 0, "queryobject: objeto sem nome");
+    assert(qof::format(&anonymous, 1, buffer, 16, &[]).status == 0 && name_information.name.maximum_length.get() == 0 && name_information.name.buffer.get() == 0, "queryobject: objeto sem nome");
     assert(qof::format(&information, 2, buffer, 100, &[]) == Formatted { status: MISMATCH, needed: Some(120) }, "queryobject: tipo com buffer curto");
-    assert(qof::format(&information, 2, buffer, 128, &[]).status == 0 && guest::read16(buffer) == 10 && guest::read64(buffer + 8) == buffer + 104 && guest::read16(buffer + 104) == b'E' as u16 && guest::read32(buffer + 16) == guest::read32(event.pointer + 0x2C) && guest::read32(buffer + 64) == guest::read32(event.pointer + 0x48), "queryobject: OBJECT_TYPE_INFORMATION");
+    let type_information = unsafe { ObjectTypeInformation::at(buffer) };
+    let event_type = unsafe { ObjectType::at(event.pointer) };
+    let type_text = buffer + ObjectTypeInformation::SIZE;
+    assert(qof::format(&information, 2, buffer, 128, &[]).status == 0 && type_information.type_name.length.get() == 10 && type_information.type_name.buffer.get() == type_text && guest::read16(type_text) == b'E' as u16 && type_information.total_number_of_objects.get() == event_type.total_number_of_objects.get() && type_information.invalid_attributes.get() == event_type.type_info.invalid_attributes.get(), "queryobject: OBJECT_TYPE_INFORMATION");
     let types = [event.clone(), file.clone()];
     assert(qof::format(&information, 3, buffer, 2, &types) == Formatted { status: MISMATCH, needed: Some(8) }, "queryobject: lista de tipos sem contador");
-    assert(qof::format(&information, 3, buffer, 0xC0, &types) == Formatted { status: MISMATCH, needed: Some(248) } && guest::read32(buffer) == 2, "queryobject: lista de tipos curta informa o total");
-    assert(qof::format(&information, 3, buffer, 0x200, &types) == Formatted { status: 0, needed: Some(248) } && guest::read16(buffer + 8 + 104) == b'E' as u16 && guest::read16(buffer + 128 + 104) == b'F' as u16, "queryobject: OBJECT_TYPES_INFORMATION");
-    assert(qof::format(&information, 4, buffer, 1, &[]) == Formatted { status: MISMATCH, needed: Some(2) } && qof::format(&information, 4, buffer, 2, &[]).status == 0 && guest::read8(buffer) == 1 && guest::read8(buffer + 1) == 1, "queryobject: OBJECT_HANDLE_FLAG_INFORMATION");
+    assert(qof::format(&information, 3, buffer, 0xC0, &types) == Formatted { status: MISMATCH, needed: Some(248) } && unsafe { ObjectTypesInformation::at(buffer) }.number_of_types.get() == 2, "queryobject: lista de tipos curta informa o total");
+    // Entradas alinhadas a 8 depois do contador; o nome segue cada OBJECT_TYPE_INFORMATION.
+    let first_entry = buffer + 8;
+    let second_entry = first_entry + 120;
+    assert(qof::format(&information, 3, buffer, 0x200, &types) == Formatted { status: 0, needed: Some(248) } && guest::read16(first_entry + ObjectTypeInformation::SIZE) == b'E' as u16 && guest::read16(second_entry + ObjectTypeInformation::SIZE) == b'F' as u16, "queryobject: OBJECT_TYPES_INFORMATION");
+    let flags = unsafe { ObjectHandleFlagInformation::at(buffer) };
+    assert(qof::format(&information, 4, buffer, 1, &[]) == Formatted { status: MISMATCH, needed: Some(2) } && qof::format(&information, 4, buffer, 2, &[]).status == 0 && flags.inherit.get() == 1 && flags.protect_from_close.get() == 1, "queryobject: OBJECT_HANDLE_FLAG_INFORMATION");
     assert(qof::format(&information, 9, buffer, 0x200, &[]) == Formatted { status: 0xC000_0003, needed: None }, "queryobject: classe invalida");
     guest::free_bytes(buffer);
 }
@@ -1556,15 +1594,17 @@ fn unblock_and_quota_pool(assert: Assert) {
         guest::write_bytes(block, &[0; 0x40]);
         dispatcher::initialize_event(block, 0, false);
     }
-    guest::write64(lock, first);
-    guest::write64(first + 0x18, second);
-    guest::write32(second + 0x34, 2);
-    assert(unblock::unblock(lock, 0).is_ok() && guest::read64(lock) == 0, "unblock: cadeia retirada da cabeca");
-    assert(dispatcher::read_state(first) == 1 && dispatcher::read_state(second) == 0 && guest::read32(second + 0x34) == 0, "unblock: evento sinalizado e espera ativa dispensada");
+    let word = &unsafe { ExPushLock::at(lock) }.value;
+    let (first_block, second_block, own_block) = unsafe { (PushLockWaitBlock::at(first), PushLockWaitBlock::at(second), PushLockWaitBlock::at(own)) };
+    word.set(first);
+    first_block.next.set(second);
+    second_block.flags.set(PUSH_LOCK_FLAGS_SPINNING);
+    assert(unblock::unblock(lock, 0).is_ok() && word.get() == 0, "unblock: cadeia retirada da cabeca");
+    assert(dispatcher::read_state(first) == 1 && dispatcher::read_state(second) == 0 && second_block.flags.get() == 0, "unblock: evento sinalizado e espera ativa dispensada");
     // O bloco do chamador já foi retirado por outro desbloqueador.
-    guest::write32(own + 0x34, 2);
+    own_block.flags.set(PUSH_LOCK_FLAGS_SPINNING);
     let mut request = unblock::begin(lock, own);
-    assert(matches!(request.poll(), Ok(None)) && guest::read32(own + 0x34) == 0, "unblock: espera o proprio bloco");
+    assert(matches!(request.poll(), Ok(None)) && own_block.flags.get() == 0, "unblock: espera o proprio bloco");
     dispatcher::set_event(own);
     assert(matches!(request.poll(), Ok(Some(()))), "unblock: conclui quando o bloco e sinalizado");
     assert(unblock::unblock(lock, own).is_ok(), "unblock: bloco sem espera ativa nao estaciona");
@@ -1598,14 +1638,9 @@ fn unblock_and_quota_pool(assert: Assert) {
     let _ = process::release_thread(thread);
 }
 
-/// Destrava a entrada (bit 0) como ExUnlockHandleTableEntry.
-fn unlock_entry(entry: u64) {
-    loop {
-        let low = guest::read64(entry);
-        if guest::compare_exchange64(entry, low, low | 1).ok() == Some(low) {
-            return;
-        }
-    }
+/// Destrava a entrada (bit 0) como ExUnlockHandleTableEntry: um OR atômico.
+fn unlock_entry(entry: &HandleTableEntry) {
+    entry.low_value.atomic().fetch_or(1, Ordering::SeqCst);
 }
 
 /// Callback de ExEnumHandleTable: anota o handle, destrava e para no alvo
@@ -1614,7 +1649,8 @@ extern "win64" fn enum_handle_callback(_table: u64, entry: u64, handle: u64, con
     let count = guest::read64(context + 8);
     guest::write64(context + 0x10 + count * 8, handle);
     guest::write64(context + 8, count + 1);
-    let locked = guest::read64(entry) & 1 == 0;
+    let entry = unsafe { HandleTableEntry::at(entry) };
+    let locked = entry.low_value.get() & 1 == 0;
     unlock_entry(entry);
     (locked && handle == guest::read64(context)) as u64
 }
@@ -1633,10 +1669,12 @@ fn enum_handle_table(assert: Assert) {
     let context = guest::alloc_bytes(0x80);
     let output = guest::alloc_bytes(8);
     let callback = enum_handle_callback as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
-    let disabled = guest::read16(thread + kthread::KERNEL_APC_DISABLE);
+    let apc_disable = &unsafe { Kthread::at(thread) }.kernel_apc_disable;
+    let disabled = apc_disable.get();
+    let unlocked = |entry: u64| unsafe { HandleTableEntry::at(entry) }.low_value.get() & 1 != 0;
     guest::write_bytes(context, &[0; 0x80]);
     assert(matches!(enum_handles::enumerate(table, callback, context, output), Ok(0)) && guest::read64(context + 8) == 4 && (0..4).all(|index| guest::read64(context + 0x10 + index * 8) == handles[index as usize]), "enumhandles: percorre todas as entradas em ordem");
-    assert(handles.iter().all(|&handle| handle_table::row(table, handle as u32).is_some_and(|row| guest::read64(row.entry) & 1 != 0)) && guest::read16(thread + kthread::KERNEL_APC_DISABLE) == disabled, "enumhandles: entradas destravadas e regiao critica encerrada");
+    assert(handles.iter().all(|&handle| handle_table::row(table, handle as u32).is_some_and(|row| unlocked(row.entry))) && apc_disable.get() == disabled, "enumhandles: entradas destravadas e regiao critica encerrada");
     guest::write_bytes(context, &[0; 0x80]);
     guest::write64(context, 0x404);
     assert(matches!(enum_handles::enumerate(table, callback, context, output), Ok(1)) && guest::read64(output) == 0x404 && guest::read64(context + 8) == 3, "enumhandles: callback interrompe e publica o handle");
@@ -1645,19 +1683,21 @@ fn enum_handle_table(assert: Assert) {
     let mut request = enum_handles::begin(table, callback, context, 0).ok();
     let first = request.as_mut().map(|request| request.poll());
     if let Some(Ok(Step::Callback { arguments, .. })) = first {
-        unlock_entry(arguments[1]);
+        unlock_entry(unsafe { HandleTableEntry::at(arguments[1]) });
     }
-    let _ = guest::compare_exchange64(busy, guest::read64(busy), guest::read64(busy) & !1);
+    // Trava a entrada (zera o bit 0) com um AND atômico.
+    let busy_entry = unsafe { HandleTableEntry::at(busy) };
+    busy_entry.low_value.atomic().fetch_and(!1, Ordering::SeqCst);
     let resumed = request.as_mut().map(|request| request.resume(0));
     assert(matches!(first, Some(Ok(Step::Callback { arguments, .. })) if arguments[2] == 4 && arguments[0] == table) && matches!(resumed, Some(Ok(()))), "enumhandles: callback com tabela, entrada e handle");
-    assert(matches!(request.as_mut().map(|request| request.poll()), Some(Ok(Step::Busy))) && guest::read16(thread + kthread::KERNEL_APC_DISABLE) != disabled, "enumhandles: entrada ocupada suspende dentro da regiao critica");
-    unlock_entry(busy);
+    assert(matches!(request.as_mut().map(|request| request.poll()), Some(Ok(Step::Busy))) && apc_disable.get() != disabled, "enumhandles: entrada ocupada suspende dentro da regiao critica");
+    unlock_entry(busy_entry);
     let next = request.as_mut().map(|request| request.poll());
     assert(matches!(next, Some(Ok(Step::Callback { arguments, .. })) if arguments[2] == 8), "enumhandles: retoma depois do desbloqueio");
     if let Some(request) = request.as_mut() {
         request.callback_failed();
     }
-    assert(guest::read64(busy) & 1 != 0 && guest::read16(thread + kthread::KERNEL_APC_DISABLE) == disabled, "enumhandles: falha do callback devolve o bloqueio");
+    assert(unlocked(busy) && apc_disable.get() == disabled, "enumhandles: falha do callback devolve o bloqueio");
     drop(request);
     for &handle in &handles {
         let _ = handle_table::remove(table, handle);
@@ -1694,7 +1734,12 @@ fn service_tables(assert: Assert) {
     assert(st::encode_entry(table, 0, 0).is_err() && st::encode_entry(table, table + 0x800_0000, 0).is_err() && st::encode_entry(table, targets[0], 16).is_err(), "services: entradas fora do formato recusadas");
     assert(st::install(2, &targets, &[0, 3, 15]).is_err() && st::install(0, &targets, &[0, 3]).is_err(), "services: tabela invalida recusada");
     assert(st::install(0, &targets, &[0, 3, 15]).is_ok_and(|record| record.limit == 3 && record.descriptors == alloc::vec![addresses.descriptor, addresses.shadow]), "services: KiServiceTable publicada");
-    assert([addresses.descriptor, addresses.shadow].iter().all(|&descriptor| guest::read64(descriptor) == table && guest::read64(descriptor + 8) == 0 && guest::read64(descriptor + 16) == 3 && guest::read64(descriptor + 24) == addresses.argument_tables[0]) && guest::read8(addresses.argument_tables[0] + 1) == 12 && guest::read8(addresses.argument_tables[0] + 2) == 60, "services: KeServiceDescriptorTable e Shadow");
+    let native_entry = |descriptor: u64| {
+        let descriptor = unsafe { KserviceTableDescriptor::at(descriptor) };
+        descriptor.base.get() == table && descriptor.count.get() == 0 && descriptor.limit.get() == 3 && descriptor.number.get() == addresses.argument_tables[0]
+    };
+    let arguments = guest::read_bytes(addresses.argument_tables[0], 3);
+    assert(native_entry(addresses.descriptor) && native_entry(addresses.shadow) && arguments[1] == 12 && arguments[2] == 60, "services: KeServiceDescriptorTable e Shadow");
     assert(matches!(st::inspect(1, false), Ok(found) if found == (targets[1], 3)) && matches!(st::inspect(3, false), Ok((0, 0))) && matches!(st::inspect(0x1000, true), Ok((0, 0))), "services: inspecao e limite");
     let output = guest::alloc_bytes(8);
     let found = native_call::call(addresses.lookup, &[2, 0, output]);
@@ -1702,7 +1747,7 @@ fn service_tables(assert: Assert) {
     let missing = native_call::call(addresses.lookup, &[5, 1, output]);
     assert(found == targets[2] && count == 15 && missing == 0 && guest::read64(output) == 0, "services: nt_service_lookup nativo");
     assert(st::install(0, &targets, &[0, 3, 15]).is_ok() && st::install(0, &targets, &[0, 3, 14]).is_err(), "services: ABI viva so pode ser confirmada");
-    assert(st::install(1, &targets[2..], &[2]).is_ok() && guest::read64(addresses.shadow + 32) == addresses.tables[1], "services: tabela win32 so no shadow");
+    assert(st::install(1, &targets[2..], &[2]).is_ok() && unsafe { KserviceTableDescriptor::array_at(addresses.shadow, 2) }[1].base.get() == addresses.tables[1], "services: tabela win32 so no shadow");
     assert(matches!(st::inspect(0x1000, true), Ok(found) if found == (targets[2], 2)) && native_call::call(addresses.lookup, &[0x1000, 1, 0]) == targets[2] && matches!(st::inspect(0x1000, false), Ok((0, 0))), "services: servico grafico pelo shadow");
     assert(st::self_test_reset(0).is_ok() && st::self_test_reset(1).is_ok() && matches!(st::inspect(1, false), Ok((0, 0))) && guest::read32(addresses.tables[0]) == 0, "services: tabelas devolvidas para o boot");
     guest::free_bytes(output);
@@ -1742,7 +1787,7 @@ fn signing_policy_and_appcontainer(assert: Assert) {
     guest::write8(output, 0xCC);
     assert(matches!(capability_appcontainer::check(system, output), Ok(0)) && guest::read8(output) == 0, "appcontainer: token comum");
     let lowbox = tokens::duplicate(system, 2, false, 2).unwrap_or(0);
-    guest::write32(lowbox + 0xC8, guest::read32(lowbox + 0xC8) | 0x4000);
+    unsafe { Token::at(lowbox) }.token_flags.atomic().fetch_or(0x4000, Ordering::SeqCst); // TOKEN_LOWBOX
     assert(matches!(capability_appcontainer::check(lowbox, output), Ok(0)) && guest::read8(output) == 1, "appcontainer: TOKEN_LOWBOX em TokenFlags");
     let _ = tokens::release(lowbox);
     let handles = object_types::counts("Token").map_or(0, |counts| counts.1);
@@ -1761,15 +1806,9 @@ fn counted_utf16(text: &str) -> alloc::vec::Vec<u8> {
     bytes
 }
 
-/// UNICODE_STRING no convidado (descritor em +0, texto em +0x10).
+/// UNICODE_STRING no convidado com o texto logo depois do descritor.
 fn guest_unicode(pointer: u64, text: &str) {
-    let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-    guest::write16(pointer, units.len() as u16 * 2);
-    guest::write16(pointer + 2, units.len() as u16 * 2);
-    guest::write64(pointer + 8, pointer + 0x10);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(pointer + 0x10 + index as u64 * 2, *unit);
-    }
+    guest_unicode_at(pointer, pointer + UnicodeString::SIZE, text);
 }
 
 fn boot_policies(assert: Assert) {
@@ -1864,10 +1903,12 @@ fn se_exports(assert: Assert) {
     let table = kernel_data::read("SeExports");
     let (storage, size) = kernel_data::region("SeExports").unwrap_or((0, 0));
     assert(table != 0 && table == storage + 8 && matches!(exports::init(), Ok(found) if found == table), "seexports: ponteiro publicado uma vez na reserva da imagem");
-    let field = |name: &str| exports::field_index(name).map_or(0, |index| guest::read64(table + index as u64 * 8));
+    // SE_EXPORTS: LUIDs e PSIDs, todos de 8 bytes, na ordem do ntddk.h.
+    let slots = unsafe { Field::<u64>::array_at(table, exports::field_count() as usize) };
+    let field = |name: &str| exports::field_index(name).map_or(0, |index| slots[index as usize].get());
     assert(field("SeCreateTokenPrivilege") == 2 && field("SeCreatePagefilePrivilege") == 15 && field("SeIncreaseBasePriorityPrivilege") == 14 && field("SeDebugPrivilege") == 20 && field("SeDelegateSessionUserImpersonatePrivilege") == 36, "seexports: LUIDs na ordem nativa");
     let sid_at = |pointer: u64| {
-        let count = guest::read8(pointer + 1) as usize;
+        let count = unsafe { Sid::at(pointer) }.sub_authority_count.get() as usize;
         guest::read_bytes(pointer, 8 + count * 4)
     };
     let body_start = table + exports::field_count() as u64 * 8;
@@ -1882,7 +1923,11 @@ static IMAGE_SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static IMAGE_CALLBACK: AtomicU64 = AtomicU64::new(0);
 
 extern "win64" fn image_notify_callback(name: u64, process_id: u64, info: u64) {
-    let values = [process_id, guest::read32(info) as u64, guest::read64(info + 8), guest::read64(info + 24), guest::read64(info + 40), if name != 0 { guest::read16(name) as u64 } else { u64::MAX }];
+    let image = unsafe { ImageInfo::at(info) };
+    // ImageInfo é o membro de IMAGE_INFO_EX (ExtendedInfoPresent).
+    let extended = unsafe { ImageInfoEx::at(info - core::mem::offset_of!(ImageInfoEx, image_info) as u64) };
+    let name_length = if name != 0 { unsafe { UnicodeString::at(name) }.length.get() as u64 } else { u64::MAX };
+    let values = [process_id, image.properties.get() as u64, image.image_base.get(), image.image_size.get(), extended.file_object.get(), name_length];
     for (slot, value) in IMAGE_SEEN.iter().zip(values) {
         slot.store(value, Ordering::SeqCst);
     }
@@ -1934,44 +1979,46 @@ fn thread_context_registers(assert: Assert) {
     assert(tcr::validate(AMD64 | 0x1F, 0, false) == (0, AMD64 | 0x1F) && tcr::validate(AMD64 | 0x40, 0, false) == (0xC000_00BB, AMD64 | 0x40) && tcr::validate(AMD64 | 0x40, 0, true) == (0, AMD64 | 0x40), "context: CONTEXT_ALL e XSTATE");
     assert(tcr::validate(0, 0, false) == (0xC000_000D, 0) && tcr::validate(0, 1, false) == (0, AMD64) && tcr::validate(0x1_0001, 1, false) == (0, 0x10_0001) && tcr::validate(0x1_0001, 0, false).0 == 0xC000_000D, "context: flags invalidos so normalizados em UserMode");
     assert(tcr::debug_registers([0x7FFF_FFFF_0000, 0x1000, 0x7FFF_FFFE_FFFF, u64::MAX, 0xAA, 0xFFFF_FFFF], 1) == [0, 0x1000, 0x7FFF_FFFE_FFFF, 0, 0, 0xFFFF_0355] && tcr::debug_registers([u64::MAX, 0, 0, 0, 0, 0], 0)[0] == u64::MAX, "context: registradores de depuracao saneados");
-    let source = guest::alloc_bytes(tcr::SIZE);
-    let target = guest::alloc_bytes(tcr::SIZE);
+    let source = guest::alloc_bytes(Context::SIZE);
+    let target = guest::alloc_bytes(Context::SIZE);
+    let (from, to) = unsafe { (Context::at(source), Context::at(target)) };
     let fill = |pointer: u64, seed: u64| {
-        let mut offset = 0;
-        while offset < tcr::SIZE {
-            guest::write64(pointer + offset, seed ^ offset.wrapping_mul(0x0101_0101_0101));
-            offset += 8;
-        }
+        let bytes: alloc::vec::Vec<u8> = (0..Context::SIZE).step_by(8).flat_map(|offset| (seed ^ offset.wrapping_mul(0x0101_0101_0101)).to_le_bytes()).collect();
+        guest::write_bytes(pointer, &bytes);
     };
+    // Rax..R15 sem o Rsp (o grupo INTEGER do CONTEXT).
+    let integer = |context: &Context| [context.rax.get(), context.rcx.get(), context.rdx.get(), context.rbx.get(), context.rbp.get(), context.rsi.get(), context.rdi.get(), context.r8.get(), context.r9.get(), context.r10.get(), context.r11.get(), context.r12.get(), context.r13.get(), context.r14.get(), context.r15.get()];
     // Captura: só os grupos selecionados, flags publicados.
     fill(source, 0x5A5A_0000_0000_0000);
     assert(tcr::capture_registers(target, source, AMD64 | 0x40).is_err(), "context: XSTATE exige validacao antes da captura");
-    assert(tcr::capture_registers(target, source, AMD64 | 1).is_ok() && guest::read32(target + 0x30) == AMD64 | 1 && guest::read64(target + 0xF8) == guest::read64(source + 0xF8) && guest::read16(target + 0x38) == guest::read16(source + 0x38) && guest::read32(target + 0x44) == guest::read32(source + 0x44), "context: CONTROL capturado");
-    assert(guest::read64(target + 0x78) == 0 && guest::read64(target + 0x100) == 0 && guest::read64(target + 0x48) == 0, "context: grupos nao selecionados ficam zerados");
-    assert(tcr::capture_registers(target, source, AMD64 | 0x1F).is_ok() && tcr::INTEGER.iter().all(|&offset| guest::read64(target + offset) == guest::read64(source + offset)) && guest::read64(target + 0x298) == guest::read64(source + 0x298) && guest::read64(target + 0x4B0) == guest::read64(source + 0x4B0) && guest::read64(target + 0x2A0) == 0, "context: CONTEXT_ALL sem extensao vetorial");
+    assert(tcr::capture_registers(target, source, AMD64 | 1).is_ok() && to.context_flags.get() == AMD64 | 1 && to.rip.get() == from.rip.get() && to.seg_cs.get() == from.seg_cs.get() && to.e_flags.get() == from.e_flags.get(), "context: CONTROL capturado");
+    assert(to.rax.get() == 0 && to.header[0].low.get() == 0 && to.dr0.get() == 0, "context: grupos nao selecionados ficam zerados");
+    // O primeiro qword depois do Xmm15 (Reserved4 do FXSAVE) fica zerado sem extensão vetorial.
+    let after_xmm15 = to.flt_save.xmm_registers[15].address() + 16;
+    assert(tcr::capture_registers(target, source, AMD64 | 0x1F).is_ok() && integer(to) == integer(from) && to.flt_save.xmm_registers[15].high.get() == from.flt_save.xmm_registers[15].high.get() && to.last_branch_to_rip.get() == from.last_branch_to_rip.get() && guest::read64(after_xmm15) == 0, "context: CONTEXT_ALL sem extensao vetorial");
     // Escrita em UserMode: CS/SS de usuário, RIP canônico, EFLAGS e Dr saneados.
     fill(target, 0);
-    guest::write32(source + 0x30, AMD64 | 0x1B);
-    guest::write64(source + 0xF8, 0x0000_8000_0000_1234);
-    guest::write16(source + 0x38, 0x33);
-    guest::write32(source + 0x44, 0xFFFF_FFFF);
-    guest::write64(source + 0x48, 0x7FFF_FFFF_0000);
-    guest::write64(source + 0x50, 0x1000);
-    guest::write64(source + 0x70, 0xFFFF_FFFF);
-    guest::write32(source + 0x34, 0xFFFF);
-    assert(tcr::write_registers(target, source, 1, 0xFFBF, 0x1F80).is_ok() && guest::read64(target + 0xF8) == 0xFFFF_8000_0000_1234 && guest::read16(target + 0x38) == 0x33 && guest::read16(target + 0x42) == 0x2B && guest::read32(target + 0x44) == 0x21_0FD5, "context: CONTROL em UserMode");
-    assert(guest::read64(target + 0x48) == 0 && guest::read64(target + 0x50) == 0x1000 && guest::read64(target + 0x68) == 0 && guest::read64(target + 0x70) == 0xFFFF_0355, "context: Dr0-Dr7 de usuario");
-    assert(guest::read32(target + 0x34) == 0xFFBF && guest::read32(source + 0x118) == 0x1F80 && guest::read16(source + 0x100) & !0x1F3F == 0, "context: MXCSR mascarado e imagem FXSAVE preparada");
-    guest::write16(source + 0x38, 0x23);
-    guest::write64(source + 0xF8, 0x1234_5678_9ABC_DEF0);
-    assert(tcr::write_registers(target, source, 1, 0xFFBF, 0x1F80).is_ok() && guest::read64(target + 0xF8) == 0x9ABC_DEF0 && guest::read16(target + 0x38) == 0x23, "context: segmento de 32 bits trunca o RIP");
+    from.context_flags.set(AMD64 | 0x1B);
+    from.rip.set(0x0000_8000_0000_1234);
+    from.seg_cs.set(0x33);
+    from.e_flags.set(0xFFFF_FFFF);
+    from.dr0.set(0x7FFF_FFFF_0000);
+    from.dr1.set(0x1000);
+    from.dr7.set(0xFFFF_FFFF);
+    from.mx_csr.set(0xFFFF);
+    assert(tcr::write_registers(target, source, 1, 0xFFBF, 0x1F80).is_ok() && to.rip.get() == 0xFFFF_8000_0000_1234 && to.seg_cs.get() == 0x33 && to.seg_ss.get() == 0x2B && to.e_flags.get() == 0x21_0FD5, "context: CONTROL em UserMode");
+    assert(to.dr0.get() == 0 && to.dr1.get() == 0x1000 && to.dr6.get() == 0 && to.dr7.get() == 0xFFFF_0355, "context: Dr0-Dr7 de usuario");
+    assert(to.mx_csr.get() == 0xFFBF && from.flt_save.mx_csr.get() == 0x1F80 && from.flt_save.control_word.get() & !0x1F3F == 0, "context: MXCSR mascarado e imagem FXSAVE preparada");
+    from.seg_cs.set(0x23);
+    from.rip.set(0x1234_5678_9ABC_DEF0);
+    assert(tcr::write_registers(target, source, 1, 0xFFBF, 0x1F80).is_ok() && to.rip.get() == 0x9ABC_DEF0 && to.seg_cs.get() == 0x23, "context: segmento de 32 bits trunca o RIP");
     // KernelMode: CS do kernel, SS nulo, EFLAGS do kernel.
-    assert(tcr::write_registers(target, source, 0, 0xFFBF, 0x1F80).is_ok() && guest::read64(target + 0xF8) == 0x1234_5678_9ABC_DEF0 && guest::read16(target + 0x38) == 0x10 && guest::read16(target + 0x42) == 0 && guest::read32(target + 0x44) == 0x25_0FD5 && guest::read64(target + 0x48) == 0x7FFF_FFFF_0000, "context: CONTROL em KernelMode");
+    assert(tcr::write_registers(target, source, 0, 0xFFBF, 0x1F80).is_ok() && to.rip.get() == 0x1234_5678_9ABC_DEF0 && to.seg_cs.get() == 0x10 && to.seg_ss.get() == 0 && to.e_flags.get() == 0x25_0FD5 && to.dr0.get() == 0x7FFF_FFFF_0000, "context: CONTROL em KernelMode");
     // CONTEXT salvo com imagem FXSAVE: x87/MMX só em UserMode.
-    guest::write64(source + 0x120, 0xABCD);
-    guest::write64(target + 0x120, 0);
-    assert(tcr::write_saved_context(target, source, 0, 0xFFBF, 0x1F80).is_ok() && guest::read64(target + 0x120) == 0 && guest::read32(target + 0x118) == guest::read32(target + 0x34), "context: KernelMode conserva x87");
-    assert(tcr::write_saved_context(target, source, 1, 0xFFBF, 0x1F80).is_ok() && guest::read64(target + 0x120) == 0xABCD && guest::read32(target + 0x118) == guest::read32(target + 0x34), "context: UserMode restaura x87 e MXCSR da imagem");
+    from.flt_save.float_registers[0].low.set(0xABCD);
+    to.flt_save.float_registers[0].low.set(0);
+    assert(tcr::write_saved_context(target, source, 0, 0xFFBF, 0x1F80).is_ok() && to.flt_save.float_registers[0].low.get() == 0 && to.flt_save.mx_csr.get() == to.mx_csr.get(), "context: KernelMode conserva x87");
+    assert(tcr::write_saved_context(target, source, 1, 0xFFBF, 0x1F80).is_ok() && to.flt_save.float_registers[0].low.get() == 0xABCD && to.flt_save.mx_csr.get() == to.mx_csr.get(), "context: UserMode restaura x87 e MXCSR da imagem");
     guest::free_bytes(source);
     guest::free_bytes(target);
 }
@@ -2009,6 +2056,87 @@ fn section_parameters_and_address(assert: Assert) {
 fn om_access(handle: u64) -> Option<u32> {
     crate::ntos::ob::object_manager::handle_record((handle & 0x7FFF_FFFF) as u32).map(|record| record.access)
 }
+
+/// LUID como o inteiro de 64 bits que os registros de token guardam.
+fn luid(value: &Luid) -> u64 {
+    (value.high_part.get() as u32 as u64) << 32 | value.low_part.get() as u64
+}
+
+/// `SubAuthority[0..count]` de um SID (o vetor do NT é ANYSIZE_ARRAY).
+fn sub_authorities(sid: &Sid, count: usize) -> &'static [Field<u32>] {
+    unsafe { Field::<u32>::array_at(sid.sub_authority[0].address(), count) }
+}
+
+// Layouts do kernel que não constam dos símbolos nem dos cabeçalhos públicos,
+// lidos aqui como os componentes donos os publicam.
+
+/// `CALLBACK_OBJECT` (ExCreateCallback).
+#[repr(C)]
+struct CallbackObject {
+    signature: Field<u32>,
+    _pad_4: Reserved<4>,
+    lock: Field<u64>,
+    registered_callbacks: ListEntry,
+    allow_multiple_callbacks: Field<u8>,
+    _pad_21: Reserved<7>,
+}
+
+/// `CALLBACK_REGISTRATION` (ExRegisterCallback).
+#[repr(C)]
+struct CallbackRegistration {
+    link: ListEntry,
+    callback_object: Field<u64>,
+    callback_function: Field<u64>,
+    callback_context: Field<u64>,
+    busy: Field<u32>,
+    unregister_waiting: Field<u8>,
+    _pad_2d: Reserved<3>,
+}
+
+/// `EX_PUSH_LOCK_WAIT_BLOCK` do x64.
+#[repr(C)]
+struct PushLockWaitBlock {
+    wake_event: Kevent,
+    next: Field<u64>,
+    last: Field<u64>,
+    previous: Field<u64>,
+    share_count: Field<i32>,
+    flags: Field<u32>,
+}
+
+/// `EX_PUSH_LOCK_FLAGS_SPINNING`.
+const PUSH_LOCK_FLAGS_SPINNING: u32 = 2;
+
+/// `KSERVICE_TABLE_DESCRIPTOR` (KeServiceDescriptorTable[Shadow]).
+#[repr(C)]
+struct KserviceTableDescriptor {
+    base: Field<u64>,
+    count: Field<u64>,
+    limit: Field<u32>,
+    _pad_14: Reserved<4>,
+    number: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for CallbackObject {}
+unsafe impl NtStruct for CallbackRegistration {}
+unsafe impl NtStruct for PushLockWaitBlock {}
+unsafe impl NtStruct for KserviceTableDescriptor {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CallbackObject>() == 0x28);
+    assert!(core::mem::offset_of!(CallbackObject, registered_callbacks) == 0x10);
+    assert!(core::mem::offset_of!(CallbackObject, allow_multiple_callbacks) == 0x20);
+    assert!(core::mem::size_of::<CallbackRegistration>() == 0x30);
+    assert!(core::mem::offset_of!(CallbackRegistration, callback_object) == 0x10);
+    assert!(core::mem::offset_of!(CallbackRegistration, busy) == 0x28);
+    assert!(core::mem::size_of::<PushLockWaitBlock>() == 0x38);
+    assert!(core::mem::offset_of!(PushLockWaitBlock, next) == 0x18);
+    assert!(core::mem::offset_of!(PushLockWaitBlock, flags) == 0x34);
+    assert!(core::mem::size_of::<KserviceTableDescriptor>() == 0x20);
+    assert!(core::mem::offset_of!(KserviceTableDescriptor, limit) == 0x10);
+    assert!(core::mem::offset_of!(KserviceTableDescriptor, number) == 0x18);
+};
 
 pub fn run(assert: Assert) {
     dispatcher_objects(assert);

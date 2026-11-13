@@ -7,8 +7,26 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{
+    CmKeyBody, Eprocess, KeyBasicInformation, KeyCachedInformation, KeyFullInformation, KeyHandleTagsInformation, KeyNameInformation,
+    KeyValueFullInformation, KeyValuePartialInformation, KeyValuePartialInformationAlign64, LargeInteger, NtStruct, ObjectAttributes,
+    RegPostOperationInformation, RtlFeatureUsageReport, SecurityDescriptorRelative, UnicodeString, WnfDataScope, WnfNameInstance,
+    WnfProcessContext, WnfScopeInstance, WnfStateData, WnfStateName, WnfSubscription, WnfSubscriptionState,
+};
 
 type Assert = fn(bool, &str);
+
+/// WNF_STATE_NAME (dois ULONGs) como o valor de 64 bits.
+fn read_state_name(address: u64) -> u64 {
+    let name = unsafe { WnfStateName::at(address) };
+    (name.data[1].get() as u64) << 32 | name.data[0].get() as u64
+}
+
+fn write_state_name(address: u64, value: u64) {
+    let name = unsafe { WnfStateName::at(address) };
+    name.data[0].set(value as u32);
+    name.data[1].set((value >> 32) as u32);
+}
 
 static NOTIFICATIONS: AtomicU32 = AtomicU32::new(0);
 
@@ -66,21 +84,28 @@ fn key_information_classes(assert: Assert) {
     let buffer = guest::alloc_bytes(0x200);
     let length = guest::alloc_bytes(8);
     // KeyBasicInformation: 16 + nome em UTF-16.
-    assert(key_information::write(node, path, 0, buffer, 0x200, length, 0) == 0 && guest::read32(length) == 16 + 20 && guest::read32(buffer + 12) == 20 && guest::read16(buffer + 16) == b'O' as u16, "keyinfo: Basic com nome do no");
+    let basic = unsafe { KeyBasicInformation::at(buffer) };
+    assert(key_information::write(node, path, 0, buffer, 0x200, length, 0) == 0 && guest::read32(length) == 16 + 20 && basic.name_length.get() == 20 && basic.name[0].get() == b'O' as u16, "keyinfo: Basic com nome do no");
     assert(key_information::write(node, path, 0, buffer, 8, length, 0) == 0xC000_0023 && guest::read32(length) == 36, "keyinfo: buffer menor que o cabecalho");
     guest::write_bytes(buffer, &[0xEE; 40]);
-    assert(key_information::write(node, path, 0, buffer, 20, length, 0) == 0x8000_0005 && guest::read16(buffer + 16) == b'O' as u16 && guest::read8(buffer + 20) == 0xEE, "keyinfo: nome truncado devolve BUFFER_OVERFLOW");
+    assert(key_information::write(node, path, 0, buffer, 20, length, 0) == 0x8000_0005 && basic.name[0].get() == b'O' as u16 && guest::read_bytes(basic.name[0].address() + 4, 1) == [0xEE], "keyinfo: nome truncado devolve BUFFER_OVERFLOW");
     // KeyFullInformation: contagens e máximos.
-    assert(key_information::write(node, path, 2, buffer, 0x200, length, 0) == 0 && guest::read32(length) == 44 && guest::read32(buffer + 12) == 0xFFFF_FFFF && guest::read32(buffer + 20) == 1 && guest::read32(buffer + 24) == 16 && guest::read32(buffer + 32) == 2 && guest::read32(buffer + 36) == 10 && guest::read32(buffer + 40) == 6, "keyinfo: Full com subchaves, valores e maximos");
-    assert(key_information::write(node, path, 4, buffer, 0x200, length, 0) == 0 && guest::read32(buffer + 12) == 1 && guest::read32(buffer + 20) == 2 && guest::read32(buffer + 32) == 20, "keyinfo: Cached com o nome do no");
-    assert(key_information::write(node, path, 3, buffer, 0x200, length, 0) == 0 && guest::read32(buffer) == path.len() as u32 * 2 && guest::read16(buffer + 4) == b'\\' as u16, "keyinfo: Name com caminho absoluto");
-    assert(key_information::write(node, path, 7, buffer, 0x200, length, 0x5) == 0 && guest::read32(buffer) == 5 && key_information::write(node, path, 5, buffer, 0x200, length, 0) == 0xC000_0003, "keyinfo: HandleTags e classe invalida");
+    let full = unsafe { KeyFullInformation::at(buffer) };
+    assert(key_information::write(node, path, 2, buffer, 0x200, length, 0) == 0 && guest::read32(length) == 44 && full.class_offset.get() == 0xFFFF_FFFF && full.sub_keys.get() == 1 && full.max_name_len.get() == 16 && full.values.get() == 2 && full.max_value_name_len.get() == 10 && full.max_value_data_len.get() == 6, "keyinfo: Full com subchaves, valores e maximos");
+    let cached = unsafe { KeyCachedInformation::at(buffer) };
+    assert(key_information::write(node, path, 4, buffer, 0x200, length, 0) == 0 && cached.sub_keys.get() == 1 && cached.values.get() == 2 && cached.name_length.get() == 20, "keyinfo: Cached com o nome do no");
+    let name = unsafe { KeyNameInformation::at(buffer) };
+    assert(key_information::write(node, path, 3, buffer, 0x200, length, 0) == 0 && name.name_length.get() == path.len() as u32 * 2 && name.name[0].get() == b'\\' as u16, "keyinfo: Name com caminho absoluto");
+    assert(key_information::write(node, path, 7, buffer, 0x200, length, 0x5) == 0 && unsafe { KeyHandleTagsInformation::at(buffer) }.handle_tags.get() == 5 && key_information::write(node, path, 5, buffer, 0x200, length, 0) == 0xC000_0003, "keyinfo: HandleTags e classe invalida");
     // KEY_VALUE_*.
     let value = registry::get_value(handle, "valor").unwrap_or(registry::Value { name: alloc::string::String::new(), value_type: 0, data: alloc::vec::Vec::new() });
-    assert(value_information::write(&value, 2, buffer, 0x200, length) == 0 && guest::read32(length) == 16 && guest::read32(buffer + 4) == 4 && guest::read32(buffer + 8) == 4 && guest::read32(buffer + 12) == 0x1234_5678, "valueinfo: Partial");
-    assert(value_information::write(&value, 1, buffer, 0x200, length) == 0 && guest::read32(length) == 36 && guest::read32(buffer + 8) == 32 && guest::read32(buffer + 12) == 4 && guest::read32(buffer + 16) == 10 && guest::read32(buffer + 32) == 0x1234_5678, "valueinfo: Full com dados alinhados depois do nome");
-    assert(value_information::write(&value, 3, buffer + 4, 0x200, length) == 0x8000_0002 && value_information::write(&value, 3, buffer, 0x200, length) == 0 && guest::read32(buffer + 8) == 32, "valueinfo: Align64 exige saida alinhada");
-    assert(value_information::write(&value, 4, buffer, 0x200, length) == 0 && guest::read32(buffer) == 4 && guest::read32(buffer + 4) == 4 && guest::read32(buffer + 8) == 0x1234_5678, "valueinfo: PartialAlign64");
+    let partial = unsafe { KeyValuePartialInformation::at(buffer) };
+    assert(value_information::write(&value, 2, buffer, 0x200, length) == 0 && guest::read32(length) == 16 && partial.type_.get() == 4 && partial.data_length.get() == 4 && guest::read32(partial.data[0].address()) == 0x1234_5678, "valueinfo: Partial");
+    let full_value = unsafe { KeyValueFullInformation::at(buffer) };
+    assert(value_information::write(&value, 1, buffer, 0x200, length) == 0 && guest::read32(length) == 36 && full_value.data_offset.get() == 32 && full_value.data_length.get() == 4 && full_value.name_length.get() == 10 && guest::read32(buffer + full_value.data_offset.get() as u64) == 0x1234_5678, "valueinfo: Full com dados alinhados depois do nome");
+    assert(value_information::write(&value, 3, buffer + 4, 0x200, length) == 0x8000_0002 && value_information::write(&value, 3, buffer, 0x200, length) == 0 && full_value.data_offset.get() == 32, "valueinfo: Align64 exige saida alinhada");
+    let aligned = unsafe { KeyValuePartialInformationAlign64::at(buffer) };
+    assert(value_information::write(&value, 4, buffer, 0x200, length) == 0 && aligned.type_.get() == 4 && aligned.data_length.get() == 4 && guest::read32(aligned.data[0].address()) == 0x1234_5678, "valueinfo: PartialAlign64");
     assert(value_information::write(&value, 0, buffer, 14, length) == 0x8000_0005 && guest::read32(length) == 22 && value_information::write(&value, 2, buffer, 11, length) == 0xC000_0023 && value_information::write(&value, 9, buffer, 0x200, length) == 0xC000_0003, "valueinfo: truncado, curto e classe invalida");
     registry::delete_key(child);
     registry::delete_key(handle);
@@ -97,7 +122,7 @@ fn key_objects_and_security(assert: Assert) {
     let handle = registry::open_or_create("\\Registry\\Machine\\Software\\OpenNTBody", None).unwrap_or(0);
     let body = key_objects::for_handle(handle).unwrap_or(0);
     assert(body != 0 && key_objects::for_handle(handle) == Some(body) && key_objects::get(body).is_some_and(|record| record.handles == 1 && record.references == 0 && record.path.ends_with("OpenNTBody")), "keyobjects: corpo materializado uma vez por handle");
-    assert(guest::read64(body + 24) == crate::ntos::ps::process::get_current_process_id(), "keyobjects: processo criador em +24");
+    assert(unsafe { CmKeyBody::at(body) }.process_id.get() == crate::ntos::ps::process::get_current_process_id(), "keyobjects: processo criador no CM_KEY_BODY");
     key_objects::hold(body);
     key_objects::detach(handle);
     assert(key_objects::get(body).is_some_and(|record| record.handles == 0 && record.references == 1), "keyobjects: retencao mantem o corpo sem handles");
@@ -125,7 +150,7 @@ fn key_objects_and_security(assert: Assert) {
     let output = guest::alloc_bytes(0x100);
     let body = key_objects::for_handle(handle).unwrap_or(0);
     let result = key_security::query(body, 4, output, 0x100);
-    assert(result.as_ref().is_ok_and(|result| result.status == 0 && result.needed > 20) && guest::read16(output + 2) & 0x8004 == 0x8004, "keysecurity: consulta da DACL autocontida");
+    assert(result.as_ref().is_ok_and(|result| result.status == 0 && result.needed > 20) && unsafe { SecurityDescriptorRelative::at(output) }.control.get() & 0x8004 == 0x8004, "keysecurity: consulta da DACL autocontida");
     registry::delete_key(handle);
     assert(key_security::query(body, 4, output, 0x100).is_ok_and(|result| result.status == 0xC000_017C && result.needed == 0x100), "keysecurity: chave excluida");
     registry::close_handle(handle);
@@ -142,7 +167,7 @@ extern "win64" fn test_registry_callback(context: u64, class: u64, information: 
     // CallContext próprio da inscrição, conferido na notificação posterior.
     if class == 1 {
         guest::write64(information + 0x20, 0xC000 + context);
-    } else if class == 2 && guest::read64(information + 32) != 0xC000 + context {
+    } else if class == 2 && unsafe { RegPostOperationInformation::at(information) }.call_context.get() != 0xC000 + context {
         return 0xC000_0001;
     }
     if CALLBACK_RULE[0].load(Ordering::SeqCst) == context && CALLBACK_RULE[1].load(Ordering::SeqCst) == class {
@@ -178,28 +203,20 @@ fn registry_callbacks(assert: Assert) {
     use crate::ntos::cm::callbacks::{self, Operation, CALLBACK_BYPASS};
     let storage = guest::alloc_bytes(0x200);
     let altitude = storage;
-    let text = storage + 0x10;
     let cookie = storage + 0x80;
     let information = storage + 0x100;
-    let write_altitude = |value: &str| {
-        let units: alloc::vec::Vec<u16> = value.encode_utf16().collect();
-        guest::write16(altitude, units.len() as u16 * 2);
-        guest::write16(altitude + 2, units.len() as u16 * 2);
-        guest::write64(altitude + 8, text);
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(text + index as u64 * 2, *unit);
-        }
-    };
+    let write_altitude = |value: &str| license_unicode(altitude, value);
+    let cookie_value = || unsafe { LargeInteger::at(cookie) }.quad_part.get() as u64;
     let routine = test_registry_callback as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64;
     write_altitude("380000");
     assert(matches!(callbacks::register(routine, altitude, 0, 1, cookie, 0), Ok(0xC000_00F1)) && matches!(callbacks::register(routine, altitude, 1, 1, cookie, 8), Ok(0xC000_00F4)), "cmcallbacks: Driver nulo e Reserved recusados");
     assert(matches!(callbacks::register(routine, altitude, 1, 1, cookie, 0), Ok(0)), "cmcallbacks: CmRegisterCallbackEx");
-    let high = guest::read64(cookie);
+    let high = cookie_value();
     write_altitude("0380000.000");
-    assert(matches!(callbacks::register(routine, altitude, 1, 9, cookie, 0), Ok(0xC01C_0011)) && guest::read64(cookie) == high + 1 && callbacks::get(high + 1).is_none(), "cmcallbacks: altitude equivalente recusada com cookie publicado");
+    assert(matches!(callbacks::register(routine, altitude, 1, 9, cookie, 0), Ok(0xC01C_0011)) && cookie_value() == high + 1 && callbacks::get(high + 1).is_none(), "cmcallbacks: altitude equivalente recusada com cookie publicado");
     write_altitude("370000");
     assert(matches!(callbacks::register(routine, altitude, 1, 2, cookie, 0), Ok(0)), "cmcallbacks: segunda altitude");
-    let low = guest::read64(cookie);
+    let low = cookie_value();
     assert(callbacks::get(high).is_some_and(|(pointer, text, active, removing)| text == "380000" && active == 0 && !removing && guest::read64(pointer + 24) == high && guest::read64(pointer + 40) == routine), "cmcallbacks: registro de 80 bytes com cookie e rotina");
     // Pré em altitude decrescente, ação, pós em ordem inversa.
     let operation = Operation::<TestOutcome> { pre: 1, post: 2, info: information, call_offset: 0x20, object: 0x55, unblockable: false, bypass: None };
@@ -252,20 +269,16 @@ extern "win64" fn test_key_logger(_context: u64, class: u64, _information: u64) 
     0
 }
 
-/// OBJECT_ATTRIBUTES (48 bytes) com UNICODE_STRING logo depois.
+/// OBJECT_ATTRIBUTES com o UNICODE_STRING logo depois (e o texto depois dele).
 fn object_attributes(pointer: u64, root: u64, name: &str, attributes: u32) {
-    let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
-    guest::write_bytes(pointer, &[0; 64]);
-    guest::write32(pointer, 48);
-    guest::write64(pointer + 8, root);
-    guest::write64(pointer + 16, pointer + 48);
-    guest::write32(pointer + 24, attributes);
-    guest::write16(pointer + 48, units.len() as u16 * 2);
-    guest::write16(pointer + 50, units.len() as u16 * 2);
-    guest::write64(pointer + 56, pointer + 64);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(pointer + 64 + index as u64 * 2, *unit);
-    }
+    let name_address = pointer + ObjectAttributes::SIZE;
+    guest::write_bytes(pointer, &[0; (ObjectAttributes::SIZE + UnicodeString::SIZE) as usize]);
+    let object_attributes = unsafe { ObjectAttributes::at(pointer) };
+    object_attributes.length.set(ObjectAttributes::SIZE as u32);
+    object_attributes.root_directory.set(root);
+    object_attributes.object_name.set(name_address);
+    object_attributes.attributes.set(attributes);
+    license_unicode(name_address, name);
 }
 
 fn key_services_kernel_mode(assert: Assert) {
@@ -297,33 +310,30 @@ fn key_services_kernel_mode(assert: Assert) {
     assert(matches!(keys::open(output, 0x20019, attributes, false, 0), Ok(0xC000_003B)), "keyservices: nome absoluto com raiz");
     object_attributes(attributes, parent, "Filho", 0x240);
     assert(matches!(keys::open(output, 0x20019, attributes, false, 2), Ok(0xC000_00F2)) && matches!(keys::create(output, 0x20019, attributes, 0, 0, 4, 0, false), Ok(0xC000_000D)), "keyservices: opcoes invalidas");
-    guest::write32(attributes, 40);
+    unsafe { ObjectAttributes::at(attributes) }.length.set(40);
     assert(matches!(keys::open(output, 0x20019, attributes, false, 0), Ok(0xC000_000D)), "keyservices: OBJECT_ATTRIBUTES com tamanho errado");
     object_attributes(attributes, 0x7FFF_FFF0, "Filho", 0x240);
     assert(matches!(keys::open(output, 0x20019, attributes, false, 0), Ok(0xC000_0008)), "keyservices: raiz invalida");
     // Enumeração e consulta.
     let enumerate = |index: u64, class: u64| keys::key_operation(Kind::EnumerateKey, parent, &fields(&[("index", index), ("klass", class), ("out", buffer), ("length", 0x100), ("returned", returned)]), false);
-    assert(matches!(enumerate(0, 0), Ok(0)) && guest::read32(buffer + 12) == 10 && guest::read16(buffer + 16) == 0x46, "keyservices: NtEnumerateKey");
+    let basic = unsafe { KeyBasicInformation::at(buffer) };
+    assert(matches!(enumerate(0, 0), Ok(0)) && basic.name_length.get() == 10 && basic.name[0].get() == 0x46, "keyservices: NtEnumerateKey");
     assert(matches!(enumerate(1, 0), Ok(0x8000_001A)) && matches!(enumerate(0, 3), Ok(0xC000_0003)), "keyservices: fim da enumeracao e classe invalida");
-    assert(matches!(keys::key_operation(Kind::EnumerateValue, parent, &fields(&[("index", 0), ("klass", 2), ("out", buffer), ("length", 0x100), ("returned", returned)]), false), Ok(0)) && guest::read32(buffer + 12) == 7, "keyservices: NtEnumerateValueKey");
+    assert(matches!(keys::key_operation(Kind::EnumerateValue, parent, &fields(&[("index", 0), ("klass", 2), ("out", buffer), ("length", 0x100), ("returned", returned)]), false), Ok(0)) && guest::read32(unsafe { KeyValuePartialInformation::at(buffer) }.data[0].address()) == 7, "keyservices: NtEnumerateValueKey");
     let child_path_length = "\\Registry\\Machine\\Software\\OpenNTKeys\\Filho".len() as u32 * 2;
-    assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 3), ("out", buffer), ("length", 0x100), ("returned", returned)]), false), Ok(0)) && guest::read32(buffer) == child_path_length, "keyservices: KeyNameInformation pelo caminho do handle");
+    assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 3), ("out", buffer), ("length", 0x100), ("returned", returned)]), false), Ok(0)) && unsafe { KeyNameInformation::at(buffer) }.name_length.get() == child_path_length, "keyservices: KeyNameInformation pelo caminho do handle");
     // Tags do handle (KeySetHandleTagsInformation).
-    guest::write32(buffer, 0x5A);
+    let tags = &unsafe { KeyHandleTagsInformation::at(buffer) }.handle_tags;
+    tags.set(0x5A);
     assert(matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 5), ("data", buffer), ("length", 4)]), false), Ok(0)), "keyservices: NtSetInformationKey de tags");
     assert(matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 5), ("data", buffer), ("length", 8)]), false), Ok(0xC000_0004)) && matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 1), ("data", buffer), ("length", 4)]), false), Ok(0xC000_0003)), "keyservices: classe e tamanho de SetInformation");
-    assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && guest::read32(buffer) == 0x5A, "keyservices: tags por handle");
-    assert(matches!(keys::key_operation(Kind::QueryKey, second, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && guest::read32(buffer) == 0, "keyservices: tags independentes por handle");
+    assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && tags.get() == 0x5A, "keyservices: tags por handle");
+    assert(matches!(keys::key_operation(Kind::QueryKey, second, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && tags.get() == 0, "keyservices: tags independentes por handle");
     // Filtros veem as operações e o fechamento.
-    guest::write16(storage + 0x300, 12);
-    guest::write16(storage + 0x302, 12);
-    guest::write64(storage + 0x308, storage + 0x320);
-    for (index, unit) in "320000".encode_utf16().enumerate() {
-        guest::write16(storage + 0x320 + index as u64 * 2, unit);
-    }
+    license_unicode(storage + 0x300, "320000");
     let logger = test_key_logger as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64;
     assert(matches!(callbacks::register(logger, storage + 0x300, 1, 0, storage + 0x340, 0), Ok(0)), "keyservices: filtro registrado");
-    let cookie = guest::read64(storage + 0x340);
+    let cookie = unsafe { LargeInteger::at(storage + 0x340) }.quad_part.get() as u64;
     KEY_LOG.lock().clear();
     let (status, filtered) = keys::open_path("\\Registry\\Machine\\Software\\OpenNTKeys\\Filho", false).unwrap_or((1, 0));
     assert(status == 0 && filtered != 0 && *KEY_LOG.lock() == [28, 29], "keyservices: RegNtPreOpenKeyEx/PostOpenKeyEx");
@@ -460,7 +470,7 @@ fn hardware_description_and_feature_usage(assert: Assert) {
     let arguments = *CALLOUT_ARGS.lock();
     let path = crate::ntos::rtl::guest_strings::read_unicode_string(arguments[1]);
     let peripheral_identifier = guest::read64(arguments[10]);
-    let data_offset = guest::read32(peripheral_identifier + 8) as u64;
+    let data_offset = unsafe { KeyValueFullInformation::at(peripheral_identifier) }.data_offset.get() as u64;
     assert(arguments[0] == 0xC0FFEE && path == leaf && arguments[2] == 1 && arguments[3] == 0 && arguments[5] == 22 && arguments[8] == 32 && guest::read_bytes(peripheral_identifier + data_offset, 4) == b"AT-C", "hwdesc: caminho, tipos e informacao do periferico");
     CALLOUT_STATUS.store(0xC000_0001, Ordering::SeqCst);
     assert(hw_description::query_device_description(0, 0, types, 0, types + 4, 0, callout, 0) == 0xC000_0034, "hwdesc: callout recusa e a busca termina sem sucesso");
@@ -479,8 +489,9 @@ fn hardware_description_and_feature_usage(assert: Assert) {
     // Banco de relatos: capacidade, descarte, retenção.
     let storage = guest::alloc_bytes(bank::SIZE);
     let report = guest::alloc_bytes(16);
-    guest::write32(report, 0x1234);
-    guest::write16(report + 4, 1);
+    let usage_report = unsafe { RtlFeatureUsageReport::at(report) };
+    usage_report.feature_id.set(0x1234);
+    usage_report.reporting_kind.set(1);
     let mut accepted = 0;
     for _ in 0..64 {
         if matches!(bank::enqueue(storage, report), Ok(0)) {
@@ -504,11 +515,12 @@ fn hardware_description_and_feature_usage(assert: Assert) {
     assert(matches!(feature_usage::notify(report, None), Ok(0)), "featureusage: relato produzido");
     deliver();
     let state = wnf::query(target, buffer, 0x40);
-    assert(state.status == 0 && state.size == 8 && guest::read32(buffer) == 0x1234 && guest::read16(buffer + 4) == 1 && feature_usage::snapshot().counts == [0, 0], "featureusage: relato entregue ao estado WNF");
+    let delivered = unsafe { RtlFeatureUsageReport::at(buffer) };
+    assert(state.status == 0 && state.size == 8 && delivered.feature_id.get() == 0x1234 && delivered.reporting_kind.get() == 1 && feature_usage::snapshot().counts == [0, 0], "featureusage: relato entregue ao estado WNF");
     assert(matches!(feature_usage::notify(report, None), Ok(0)), "featureusage: relato repetido");
     deliver();
     assert(wnf::query(target, buffer, 0x40).size == 8, "featureusage: par recurso/tipo deduplicado");
-    guest::write32(report, 0x9999);
+    usage_report.feature_id.set(0x9999);
     assert(matches!(feature_usage::notify(report, Some(2)), Ok(0)), "featureusage: produção em DISPATCH_LEVEL usa DPC");
     let _ = crate::ntos::ke::dpc::run_queue();
     deliver();
@@ -645,15 +657,16 @@ fn wnf_names_definitions_and_stores(assert: Assert) {
     let definitions = guest::alloc_bytes(8);
     assert(matches!(stores::open_permanent_store(1, 1, 0, 0, 1, definitions), Ok(Err(0xC000_0002))) && matches!(stores::open_permanent_store(1, 1, 0, 0, 0, definitions), Ok(Err(0xC000_0034))) && matches!(stores::open_permanent_store(4, 1, 0, 1, 0, definitions), Ok(Err(0xC000_0034))), "wnfregistry: combinacoes sem store");
     let instance = guest::alloc_bytes(0x60);
-    guest::write32(instance + 0x10, 4);
+    let scope_instance = unsafe { WnfScopeInstance::at(instance) };
+    scope_instance.data_scope.set(WnfDataScope::WNF_DATA_SCOPE_MACHINE);
     // Sem a semeadura do registro de usuário, a raiz Windows NT\CurrentVersion
     // ainda não existe e o CM devolve OBJECT_PATH_NOT_FOUND.
     let seeded = crate::ntos::cm::registry::node_by_path(r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion").is_some();
-    assert(seeded || (matches!(stores::get_permanent_store(instance, 1, 1, definitions), Ok(Err(0xC000_003A))) && guest::read64(instance + 0x40) == 0), "wnfregistry: raiz de definicoes permanentes ausente antes da semeadura");
+    assert(seeded || (matches!(stores::get_permanent_store(instance, 1, 1, definitions), Ok(Err(0xC000_003A))) && scope_instance.permanent_data_store.get() == 0), "wnfregistry: raiz de definicoes permanentes ausente antes da semeadura");
     let parent = crate::ntos::cm::registry::open_or_create(r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion", None).unwrap_or(0);
     crate::ntos::cm::registry::close_handle(parent);
     let opened = stores::get_permanent_store(instance, 1, 1, definitions);
-    let permanent = guest::read64(instance + 0x40);
+    let permanent = scope_instance.permanent_data_store.get();
     assert(matches!(opened, Ok(Ok(store)) if store.handle == permanent && permanent != 0) && crate::ntos::cm::registry::node_by_path("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data").is_some() && guest::read64(definitions) != 0, "wnfregistry: store permanente da maquina em Notifications\\Data");
     assert(matches!(stores::get_permanent_store(instance, 1, 1, definitions), Ok(Ok(store)) if store.handle == permanent), "wnfregistry: store permanente do cache");
     let system = crate::ntos::mm::kernel_pool::allocate(16, crate::ntos::mm::kernel_pool::AllocateOptions { zero: true, ..Default::default() }).unwrap_or(0);
@@ -751,11 +764,12 @@ fn wnf_identity_security_and_data(assert: Assert) {
     let session = wnf_name::decode(wnf_name::NAME_MASK ^ (1 | 1 << 6));
     assert(matches!(security::check_cross_scope(&physical, |_| Ok(Err(0xC000_0001))), Ok(0)) && matches!(security::check_cross_scope(&session, |_| Ok(Err(0xC000_0034))), Ok(0xC000_0034)), "wnfsecurity: escopo fisico livre; definicao ausente propagada");
     // Bloco de dados sem persistência.
-    let instance = guest::alloc_bytes(0xA0);
+    let name_instance = |pointer: u64| unsafe { WnfNameInstance::at(pointer) };
+    let instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let state = NameState { pointer: instance };
     let decoded = wnf_name::NAME_MASK ^ 0x0000_0099_0000_0011;
-    guest::write64(instance + 0x28, decoded);
-    guest::write32(instance + 0x38, 16);
+    name_instance(instance).state_name.bitfield_0.set(decoded);
+    name_instance(instance).state_name_info.max_state_size.set(16);
     let stamp = storage + 0x50;
     let returned = storage + 0x58;
     guest::write32(stamp, 9);
@@ -766,40 +780,40 @@ fn wnf_identity_security_and_data(assert: Assert) {
     assert(matches!(data::read(&state, stamp, buffer, 4, returned), Ok(0xC000_0023)) && guest::read32(returned) == 8, "wnfdata: buffer curto informa o tamanho");
     let block = state.data_pointer();
     assert(matches!(data::write(&state, storage + 0x60, 4, 7, true), Ok(0xC000_0001)) && matches!(data::write(&state, storage + 0x64, 4, 1, true), Ok(0)) && state.data_pointer() == block && state.change_stamp() == 2, "wnfdata: carimbo condicional e reaproveitamento do bloco");
-    let empty_instance = guest::alloc_bytes(0xA0);
+    let empty_instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let empty = NameState { pointer: empty_instance };
-    guest::write64(empty_instance + 0x28, decoded);
+    name_instance(empty_instance).state_name.bitfield_0.set(decoded);
     assert(matches!(data::write(&empty, 0, 0, 0, false), Ok(0)) && empty.data_pointer() == 1 && empty.change_stamp() == 1 && matches!(data::read(&empty, stamp, buffer, 16, returned), Ok(0)) && guest::read32(stamp) == 1 && guest::read32(returned) == 0, "wnfdata: marcador de dados vazios com carimbo valido");
-    let temporary_instance = guest::alloc_bytes(0xA0);
+    let temporary_instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let temporary = NameState { pointer: temporary_instance };
-    guest::write64(temporary_instance + 0x28, decoded | 0x30);
+    name_instance(temporary_instance).state_name.bitfield_0.set(decoded | 0x30);
     assert(matches!(data::write(&temporary, storage + 0x60, 4, 0, false), Ok(0xC000_0034)), "wnfdata: estado temporario sem processo criador");
     // Persistência na hive e recarga.
     let (status, key) = crate::ntos::cm::key::services::open_path("\\Registry\\Machine\\Software\\OpenNTWnfData", true).unwrap_or((1, 0));
-    let persistent_instance = guest::alloc_bytes(0xA0);
+    let persistent_instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let persistent = NameState { pointer: persistent_instance };
-    guest::write64(persistent_instance + 0x28, decoded);
-    guest::write32(persistent_instance + 0x38, 16);
-    guest::write64(persistent_instance + 0x68, key);
+    name_instance(persistent_instance).state_name.bitfield_0.set(decoded);
+    name_instance(persistent_instance).state_name_info.max_state_size.set(16);
+    name_instance(persistent_instance).permanent_data_store.set(key);
     assert(status == 0 && matches!(data::write(&persistent, storage + 0x60, 8, 0, false), Ok(0)), "wnfdata: atualizacao persistida");
     let stored = crate::ntos::cm::registry::read_value_by_path("\\Registry\\Machine\\Software\\OpenNTWnfData", &wnf_name::value_name(decoded));
     assert(stored.is_some_and(|value| value.value_type == 3 && value.data.len() == 12 && value.data[0..4] == [1, 0, 0, 0] && value.data[4..] == *b"dadosWNF"), "wnfdata: REG_BINARY com carimbo e dados");
-    let loaded_instance = guest::alloc_bytes(0xA0);
+    let loaded_instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let loaded = NameState { pointer: loaded_instance };
-    guest::write64(loaded_instance + 0x28, decoded);
-    guest::write32(loaded_instance + 0x38, 4);
-    guest::write64(loaded_instance + 0x68, key);
+    name_instance(loaded_instance).state_name.bitfield_0.set(decoded);
+    name_instance(loaded_instance).state_name_info.max_state_size.set(4);
+    name_instance(loaded_instance).permanent_data_store.set(key);
     // Máximo menor que o valor: o CM devolve BUFFER_OVERFLOW (cópia parcial),
     // que a carga propaga sem publicar o bloco.
     assert(matches!(data::load_local(&loaded), Ok(0x8000_0005)) && loaded.data_pointer() == 0, "wnfdata: valor maior que o maximo da definicao");
-    guest::write32(loaded_instance + 0x38, 16);
+    name_instance(loaded_instance).state_name_info.max_state_size.set(16);
     assert(matches!(data::load_local(&loaded), Ok(0)) && loaded.change_stamp() == 1 && matches!(data::read(&loaded, stamp, buffer, 16, returned), Ok(0)) && guest::read32(returned) == 8 && guest::read_bytes(buffer, 8) == b"dadosWNF", "wnfdata: recarga da hive");
-    let absent_instance = guest::alloc_bytes(0xA0);
+    let absent_instance = guest::alloc_bytes(WnfNameInstance::SIZE);
     let absent = NameState { pointer: absent_instance };
-    guest::write64(absent_instance + 0x28, decoded ^ 0x100_0000);
-    guest::write32(absent_instance + 0x38, 16);
-    guest::write64(absent_instance + 0x68, key);
-    assert(matches!(data::load_local(&absent), Ok(0)) && absent.data_pointer() > 1 && absent.change_stamp() == 0 && guest::read32(absent.data_pointer() + 8) == 0, "wnfdata: valor ausente vira estado inicial vazio");
+    name_instance(absent_instance).state_name.bitfield_0.set(decoded ^ 0x100_0000);
+    name_instance(absent_instance).state_name_info.max_state_size.set(16);
+    name_instance(absent_instance).permanent_data_store.set(key);
+    assert(matches!(data::load_local(&absent), Ok(0)) && absent.data_pointer() > 1 && absent.change_stamp() == 0 && unsafe { WnfStateData::at(absent.data_pointer()) }.data_size.get() == 0, "wnfdata: valor ausente vira estado inicial vazio");
     for state in [state, persistent, loaded, absent] {
         if state.data_pointer() > 1 {
             let _ = crate::ntos::mm::kernel_pool::free(state.data_pointer(), Some(data::DATA_TAG));
@@ -841,14 +855,21 @@ fn wnf_namespace(assert: Assert) {
     assert(system_scope != 0 && matches!(system_again, Ok(Ok(pointer)) if pointer == system_scope) && matches!(machine, Ok(Ok(pointer)) if pointer != system_scope && pointer != 0), "wnfnamespace: escopos de sistema (cache) e maquina");
     let machine_scope = match machine { Ok(Ok(pointer)) => pointer, _ => 0 };
     let process_scope = match namespace::resolve_kernel_scope(current, 3, 0) { Ok(Ok(pointer)) => pointer, _ => 0 };
-    let context = guest::read64(current + 0x868);
-    assert(process_scope != 0 && context != 0 && guest::read64(context + 8) == current && guest::read64(context + 0x30) == process_scope && guest::read32(process_scope + 0x14) == 8 && guest::read64(process_scope + 0x50) == current, "wnfnamespace: escopo de processo pelo EPROCESS e contexto WnfContext");
+    let wnf_context = &unsafe { Eprocess::at(current) }.wnf_context;
+    let context = wnf_context.get();
+    assert(process_scope != 0 && context != 0, "wnfnamespace: escopo de processo e contexto WnfContext publicados");
+    let process_context = unsafe { WnfProcessContext::at(context) };
+    let process_instance = unsafe { WnfScopeInstance::at(process_scope) };
+    // A identidade do escopo fica logo depois da instância (InstanceIdData aponta para lá).
+    assert(process_context.process.get() == current && process_context.implicit_scope_instances[2].get() == process_scope && process_instance.instance_id_size.get() == 8 && guest::read64(process_scope + WnfScopeInstance::SIZE) == current, "wnfnamespace: escopo de processo pelo EPROCESS e contexto WnfContext");
     let session_identity = guest::alloc_bytes(8);
     guest::write32(session_identity, 5);
     let session = namespace::resolve_kernel_scope(current, 1, session_identity);
     let session_again = namespace::resolve_kernel_scope(current, 1, session_identity);
     let session_scope = match session { Ok(Ok(pointer)) => pointer, _ => 0 };
-    assert(session_scope != 0 && matches!(session_again, Ok(Ok(pointer)) if pointer == session_scope) && guest::read32(session_scope + 0x14) == 4 && guest::read32(guest::read64(session_scope + 0x18)) == 5 && guest::read64(context + 0x20) == 0, "wnfnamespace: identidade explicita encontrada na lista, sem cache");
+    assert(session_scope != 0 && matches!(session_again, Ok(Ok(pointer)) if pointer == session_scope), "wnfnamespace: escopo de sessao pela identidade explicita");
+    let session_instance = unsafe { WnfScopeInstance::at(session_scope) };
+    assert(session_instance.instance_id_size.get() == 4 && guest::read32(session_instance.instance_id_data.get()) == 5 && process_context.implicit_scope_instances[0].get() == 0, "wnfnamespace: identidade explicita encontrada na lista, sem cache");
     assert(namespace::resolve_kernel_scope(current, 6, 0).is_err(), "wnfnamespace: escopo nao capturado");
     // Nomes: definição bem conhecida, criação, consulta e dados.
     let well_known = wnf_name::decode(0x0280_032E_A3BC_0875).decoded_name;
@@ -872,18 +893,19 @@ fn wnf_namespace(assert: Assert) {
     // Nome temporário na lista do processo criador.
     let temporary = (wnf_name::NAME_MASK ^ 0x0000_00AB_0000_00F1) & !0x3C0 | 0x30;
     let temporary_state = match namespace::create_name(process_scope, temporary, NameDefinition { maximum_size: 16, type_identifier: 0, security_descriptor: definition.security_descriptor }, current) { Ok(Ok(state)) => state, _ => data::NameState { pointer: 0 } };
-    assert(temporary_state.pointer != 0 && temporary_state.creator_process() == current && guest::read64(context + 0x40) == temporary_state.pointer + 0x88, "wnfnamespace: nome temporario ligado ao contexto do criador");
+    let temporary_names = &process_context.temporary_names_list_head;
+    assert(temporary_state.pointer != 0 && temporary_state.creator_process() == current && temporary_names.flink.get() == unsafe { WnfNameInstance::at(temporary_state.pointer) }.temporary_name_list_entry.address(), "wnfnamespace: nome temporario ligado ao contexto do criador");
     drop(definition);
     // Exclusão depois de devolver as referências de rundown.
     for state in [state, state, second_state, temporary_state] {
         let _ = namespace::release_name(&state);
     }
-    assert(namespace::delete_name(temporary_state.pointer).is_ok() && guest::read64(context + 0x40) == context + 0x40 && namespace::delete_name(second_state.pointer).is_ok() && NAME_TEARDOWNS.load(Ordering::SeqCst) == 2, "wnfnamespace: exclusao desmonta os assinantes");
+    assert(namespace::delete_name(temporary_state.pointer).is_ok() && temporary_names.flink.get() == temporary_names.address() && namespace::delete_name(second_state.pointer).is_ok() && NAME_TEARDOWNS.load(Ordering::SeqCst) == 2, "wnfnamespace: exclusao desmonta os assinantes");
     assert(namespace::delete_name(second_state.pointer).is_err(), "wnfnamespace: nome excluido nao tem dono");
     for scope in [system_scope, system_scope, machine_scope, process_scope, session_scope, session_scope] {
         let _ = namespace::release_scope(scope);
     }
-    assert(namespace::dispose().is_ok() && !namespace::exists() && NAME_TEARDOWNS.load(Ordering::SeqCst) == 3 && PROCESS_TEARDOWNS.load(Ordering::SeqCst) == 1 && guest::read64(current + 0x868) == 0, "wnfnamespace: dispose libera nomes, escopos e o contexto do processo");
+    assert(namespace::dispose().is_ok() && !namespace::exists() && NAME_TEARDOWNS.load(Ordering::SeqCst) == 3 && PROCESS_TEARDOWNS.load(Ordering::SeqCst) == 1 && wnf_context.get() == 0, "wnfnamespace: dispose libera nomes, escopos e o contexto do processo");
     guest::free_bytes(session_identity);
     guest::free_bytes(buffer);
 }
@@ -895,7 +917,7 @@ extern "win64" fn test_wnf_callback(_subscription: u64, name: u64, mask: u64, st
     WNF_CALLBACK[0].fetch_add(1, Ordering::SeqCst);
     WNF_CALLBACK[1].store(mask, Ordering::SeqCst);
     WNF_CALLBACK[2].store(stamp, Ordering::SeqCst);
-    WNF_CALLBACK[3].store(guest::read64(name), Ordering::SeqCst);
+    WNF_CALLBACK[3].store(read_state_name(name), Ordering::SeqCst);
     WNF_CALLBACK[4].store(context, Ordering::SeqCst);
     0
 }
@@ -920,36 +942,40 @@ fn wnf_notifications_and_subscriptions(assert: Assert) {
     // Inscrição de kernel só de dados: a transição de leitor (máscara 2) não é aceita.
     let subscribed = subscriptions::subscribe_name(state.pointer, system, 0, 1);
     let subscription = match subscribed { Ok(Ok(subscribed)) => subscribed, _ => subscriptions::Subscribed::default() };
-    let context = guest::read64(system + 0x868);
-    assert(subscription.pointer != 0 && subscription.identifier != 0 && subscription.reader_transition == 1 && subscription.notification_performed && guest::read32(state.pointer + 0xA0) == 1 && guest::read64(subscription.pointer + 0x28) == system && guest::read64(subscription.pointer + 0x30) == state.pointer && guest::read64(context + 0x58) == subscription.pointer + 0x18 && guest::read64(state.pointer + 0x78) == subscription.pointer + 0x40, "wnfsubscribe: inscricao publicada nas listas do processo e do nome");
-    let _ = crate::ntos::ex::rundown::release(subscription.pointer + 8);
+    let wnf_context = &unsafe { Eprocess::at(system) }.wnf_context;
+    assert(subscription.pointer != 0 && subscription.identifier != 0 && subscription.reader_transition == 1 && subscription.notification_performed && wnf_context.get() != 0, "wnfsubscribe: inscricao criada com contexto do processo");
+    let process_context = unsafe { WnfProcessContext::at(wnf_context.get()) };
+    let name_instance = unsafe { WnfNameInstance::at(state.pointer) };
+    let subscriber = unsafe { WnfSubscription::at(subscription.pointer) };
+    assert(name_instance.data_subscribers_count.get() == 1 && subscriber.process.get() == system && subscriber.name_instance.get() == state.pointer && process_context.process_subscription_list_head.flink.get() == subscriber.process_subscription_list_entry.address() && name_instance.state_subscription_list_head.flink.get() == subscriber.state_subscription_list_entry.address(), "wnfsubscribe: inscricao publicada nas listas do processo e do nome");
+    let _ = crate::ntos::ex::rundown::release(subscriber.run_ref.address());
     let callback = test_wnf_callback as extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
-    guest::write64(subscription.pointer + 0x50, callback);
-    guest::write64(subscription.pointer + 0x58, 0xC0DE);
+    subscriber.callback_routine.set(callback);
+    subscriber.callback_context.set(0xC0DE);
     // Dados publicados e notificação pelo work item do dispatcher.
     let buffer = guest::alloc_bytes(0x20);
     guest::write32(buffer, 0x1234_5678);
     assert(matches!(data::write(&state, buffer, 4, 0, false), Ok(0)) && state.change_stamp() == 1, "wnfnotify: dados publicados");
-    assert(notifications::notify_name(state.pointer, 1, true, false).is_ok() && guest::read32(subscription.pointer + 0x78) == 1 && guest::read32(state.pointer + 0xA4) == 1 && WNF_CALLBACK[0].load(Ordering::SeqCst) == 0, "wnfnotify: pendente na fila do processo do sistema");
+    assert(notifications::notify_name(state.pointer, 1, true, false).is_ok() && subscriber.subscription_state.get() == WnfSubscriptionState::WNF_SUB_STATE_READY_TO_DELIVER && name_instance.current_delivery_count.get() == 1 && WNF_CALLBACK[0].load(Ordering::SeqCst) == 0, "wnfnotify: pendente na fila do processo do sistema");
     crate::ntos::io::work_items::run_queue();
     assert(WNF_CALLBACK[0].load(Ordering::SeqCst) == 1 && WNF_CALLBACK[1].load(Ordering::SeqCst) == 1 && WNF_CALLBACK[2].load(Ordering::SeqCst) == 1 && WNF_CALLBACK[3].load(Ordering::SeqCst) == decoded ^ wnf_name::NAME_MASK && WNF_CALLBACK[4].load(Ordering::SeqCst) == 0xC0DE, "wnfnotify: callback com mascara, carimbo, nome codificado e contexto");
-    assert(guest::read32(subscription.pointer + 0x78) == 0 && guest::read32(subscription.pointer + 0x60) == 1 && guest::read32(state.pointer + 0xA4) == 0, "wnfnotify: entrega concluida e carimbo da inscricao atualizado");
+    assert(subscriber.subscription_state.get() == WnfSubscriptionState::WNF_SUB_STATE_QUIESCENT && subscriber.current_change_stamp.get() == 1 && name_instance.current_delivery_count.get() == 0, "wnfnotify: entrega concluida e carimbo da inscricao atualizado");
     assert(notifications::notify_name(state.pointer, 1, true, true).is_ok() && WNF_CALLBACK[0].load(Ordering::SeqCst) == 1, "wnfnotify: carimbo repetido nao reentrega dados");
     // Atualização da inscrição existente: mesmo identificador, callback zerado.
     let updated = subscriptions::subscribe_name(state.pointer, system, 0, 1 | 8);
-    assert(matches!(updated, Ok(Ok(ref again)) if again.pointer == subscription.pointer && again.identifier == subscription.identifier && again.reader_transition == 0) && guest::read64(subscription.pointer + 0x50) == 0 && guest::read32(subscription.pointer + 0x64) == 9, "wnfsubscribe: inscricao existente atualizada");
-    let _ = crate::ntos::ex::rundown::release(subscription.pointer + 8);
-    guest::write64(subscription.pointer + 0x50, callback);
+    assert(matches!(updated, Ok(Ok(ref again)) if again.pointer == subscription.pointer && again.identifier == subscription.identifier && again.reader_transition == 0) && subscriber.callback_routine.get() == 0 && subscriber.subscribed_event_set.get() == 9, "wnfsubscribe: inscricao existente atualizada");
+    let _ = crate::ntos::ex::rundown::release(subscriber.run_ref.address());
+    subscriber.callback_routine.set(callback);
     assert(notifications::notify_name(state.pointer, 8, true, true).is_ok() && WNF_CALLBACK[0].load(Ordering::SeqCst) == 2 && WNF_CALLBACK[1].load(Ordering::SeqCst) == 8, "wnfnotify: conclusao entregue inline");
     // NtSubscribeWnfStateChange com o nome capturado.
     let captured = subscriptions::subscribe_captured(&wnf_name::decode(decoded ^ wnf_name::NAME_MASK), 1, 1 | 8);
     assert(matches!(captured, Ok(Ok(identifier)) if identifier == subscription.identifier) && WNF_CALLBACK[0].load(Ordering::SeqCst) == 2, "wnfsubscribe: inscricao capturada reaproveita a existente");
-    guest::write64(subscription.pointer + 0x50, callback);
+    subscriber.callback_routine.set(callback);
     // Exclusão do nome desliga o assinante; o dispose libera a inscrição.
     let _ = namespace::release_name(&state);
-    assert(namespace::delete_name(state.pointer).is_ok() && guest::read64(subscription.pointer + 0x30) == 0, "wnfnotify: exclusao do nome desliga o assinante");
+    assert(namespace::delete_name(state.pointer).is_ok() && subscriber.name_instance.get() == 0, "wnfnotify: exclusao do nome desliga o assinante");
     let _ = namespace::release_scope(scope);
-    assert(namespace::dispose().is_ok() && guest::read64(system + 0x868) == 0 && notifications::dispose().is_ok() && notifications::dispose().is_err(), "wnfnotify: dispose libera inscricoes, contexto e work item");
+    assert(namespace::dispose().is_ok() && wnf_context.get() == 0 && notifications::dispose().is_ok() && notifications::dispose().is_err(), "wnfnotify: dispose libera inscricoes, contexto e work item");
     guest::free_bytes(descriptor);
     guest::free_bytes(buffer);
 }
@@ -963,7 +989,7 @@ fn wnf_service_update_and_query(assert: Assert) {
     let stamp = storage + 0x40;
     let length = storage + 0x48;
     let output = storage + 0x60;
-    guest::write64(name, 0x0280_032E_A3BC_0875);
+    write_state_name(name, 0x0280_032E_A3BC_0875);
     guest::write_bytes(guid, &[0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E]);
     guest::write32(data, 0xCAFE_F00D);
     // Consulta antes da primeira atualização: vazio, sem criar a instância.
@@ -983,10 +1009,10 @@ fn wnf_service_update_and_query(assert: Assert) {
     guest::write32(length, 8);
     assert(matches!(service::query(name, guid, 0, stamp, output, length), Ok(0)) && guest::read32(stamp) == 2 && guest::read32(length) == 2, "wnfservice: segunda versao publicada");
     // Nomes inválidos, escopo explícito recusado e temporário inexistente.
-    guest::write64(name + 8, 0x0280_032E_A3BC_0876);
+    write_state_name(name + WnfStateName::SIZE, 0x0280_032E_A3BC_0876);
     assert(matches!(service::update(name + 8, data, 4, guid, 0, 0, false), Ok(0xC000_000D)), "wnfservice: versao invalida do nome");
     assert(matches!(service::update(name, data, 4, guid, 0x1234, 0, false), Ok(0xC000_000D)), "wnfservice: escopo de sistema nao aceita ExplicitScope");
-    guest::write64(name + 8, wnf_name::NAME_MASK ^ 0x0000_00EE_0000_0031);
+    write_state_name(name + WnfStateName::SIZE, wnf_name::NAME_MASK ^ 0x0000_00EE_0000_0031);
     assert(matches!(service::update(name + 8, data, 4, 0, 0, 0, false), Ok(0xC000_0034)), "wnfservice: nome temporario sem instancia");
     // Captura de ExplicitScope.
     let sid = storage + 0x100;
@@ -1033,14 +1059,15 @@ fn license_blob(entries: &[alloc::vec::Vec<u8>], header_flags: u32) -> alloc::ve
     bytes
 }
 
+/// UNICODE_STRING em `pointer` com o texto UTF-16 logo depois do descritor.
 fn license_unicode(pointer: u64, text: &str) {
-    let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
-    guest::write16(pointer, units.len() as u16 * 2);
-    guest::write16(pointer + 2, units.len() as u16 * 2);
-    guest::write64(pointer + 8, pointer + 16);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(pointer + 16 + index as u64 * 2, *unit);
-    }
+    let bytes: alloc::vec::Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let buffer = pointer + UnicodeString::SIZE;
+    guest::write_bytes(buffer, &bytes);
+    let string = unsafe { UnicodeString::at(pointer) };
+    string.length.set(bytes.len() as u16);
+    string.maximum_length.set(bytes.len() as u16);
+    string.buffer.set(buffer);
 }
 
 fn license_cache_index_and_state(assert: Assert) {
@@ -1305,7 +1332,8 @@ fn capability_policy_and_check(assert: Assert) {
     assert(multi <= 1, "capabilitypolicy: SKU multissessao pelo KUSER_SHARED_DATA");
     // Sem ProductPolicy no boot, o contexto de licenças está corrompido.
     guest::write_bytes(output, &[0; 16]);
-    assert(matches!(policy::query_system_policy(name, output), Ok(0xC000_003E)) && guest::read64(output + 8) == 0 && guest::read16(output) == 0, "capabilitypolicy: politica do sistema sem ProductPolicy");
+    let policy_string = unsafe { UnicodeString::at(output) };
+    assert(matches!(policy::query_system_policy(name, output), Ok(0xC000_003E)) && policy_string.buffer.get() == 0 && policy_string.length.get() == 0, "capabilitypolicy: politica do sistema sem ProductPolicy");
     assert(matches!(policy::query_system_policy(0, output), Ok(0xC000_000D)), "capabilitypolicy: nome nulo");
     // RtlCapabilityCheck em modo kernel chega à política do sistema.
     guest::write8(output, 0x55);

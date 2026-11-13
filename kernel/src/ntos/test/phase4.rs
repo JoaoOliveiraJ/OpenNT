@@ -4,8 +4,18 @@
 //! barramento, armazenamento e I/O implementados na fase 4.
 
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{
+    CmPartialResourceDescriptor, CmResourceList, ControllerObject, DeviceCapabilities, DeviceObject, DevobjExtension, DriverObject,
+    Ethread, EtwRegEntry, EventDataDescriptor, EventDescriptor, InterfaceType, IoMiniCompletionPacketUser, IoResourceRequirementsList,
+    IoStackLocation, IoStatusBlock, Irp, Kthread, LargeInteger, ListEntry, NtStruct, Vpb,
+};
 
 type Assert = fn(bool, &str);
+
+/// `IRP_MJ_*` como índice de `DRIVER_OBJECT.MajorFunction`.
+fn major_function(driver: &DriverObject, major: u8, routine: u64) {
+    driver.major_function[major as usize].set(routine);
+}
 
 fn pci_configuration(assert: Assert) {
     use crate::hal::{pci_config, pci_native};
@@ -35,7 +45,6 @@ fn pci_configuration(assert: Assert) {
 }
 
 fn irp_builder(assert: Assert) {
-    use crate::ntos::inc::nt_abi::{io_stack_location as stack, irp};
     use crate::ntos::io::irp_builder::{self as builder, BuildOptions, DeviceControl, Power};
     assert(builder::size_for(0) == 0xD0 + 0x48 && builder::size_for(3) == 0xD0 + 3 * 0x48, "irp: tamanho com pelo menos um slot");
     let packet = guest::alloc_bytes(builder::size_for(3));
@@ -43,23 +52,30 @@ fn irp_builder(assert: Assert) {
     // IRP_MJ_READ com três níveis de pilha.
     builder::build(packet, &BuildOptions { major: 3, buffer: 0x1000, buffer_length: 0x200, device_object: 0xD000, stack_count: 3, file_object: 0xF000, byte_offset: 0x400, user_event: 0xE000, user_iosb: 0xE100, requestor_mode: 1, thread: 0xA000, ..Default::default() });
     let top = builder::first_stack_location(packet, 3);
-    assert(guest::read16(packet + irp::TYPE) == 6 && guest::read16(packet + irp::SIZE_FIELD) == 0x1A8 && guest::read8(packet + irp::STACK_COUNT) == 3 && guest::read8(packet + irp::CURRENT_LOCATION) == 4, "irp: cabecalho IO_TYPE_IRP");
-    assert(top == packet + 0xD0 + 2 * 0x48 && guest::read64(packet + irp::CURRENT_STACK_LOCATION) == top + 0x48, "irp: CurrentStackLocation uma acima do topo");
-    assert(guest::read8(top + stack::MAJOR) == 3 && guest::read32(top + stack::READ_LENGTH) == 0x200 && guest::read64(top + stack::READ_OFFSET) == 0x400 && guest::read64(top + stack::DEVICE_OBJECT) == 0xD000 && guest::read64(top + stack::FILE_OBJECT) == 0xF000, "irp: slot do topo com Parameters.Read");
-    assert(guest::read64(packet + irp::SYSTEM_BUFFER) == 0x1000 && guest::read64(packet + irp::USER_EVENT) == 0xE000 && guest::read64(packet + irp::USER_IOSB) == 0xE100 && guest::read8(packet + irp::REQUESTOR_MODE) == 1 && guest::read64(packet + irp::THREAD) == 0xA000 && guest::read64(packet + irp::ORIGINAL_FILE_OBJECT) == 0xF000, "irp: buffers, evento, modo e thread");
-    assert(guest::read64(packet + 0xD0) == 0 && guest::read32(packet + irp::IO_STATUS) == 0 && guest::read64(packet + irp::USER_BUFFER) == 0, "irp: campos opcionais zerados");
+    let irp = unsafe { Irp::at(packet) };
+    // As IO_STACK_LOCATIONs seguem o IRP.
+    let slots = unsafe { IoStackLocation::array_at(packet + Irp::SIZE, 3) };
+    assert(irp.type_.get() == 6 && irp.size.get() == 0x1A8 && irp.stack_count.get() == 3 && irp.current_location.get() == 4, "irp: cabecalho IO_TYPE_IRP");
+    assert(top == slots[2].address() && irp.tail.overlay.current_stack_location.get() == top + IoStackLocation::SIZE, "irp: CurrentStackLocation uma acima do topo");
+    let top_slot = &slots[2];
+    assert(top_slot.major_function.get() == 3 && top_slot.parameters.read.length.get() == 0x200 && top_slot.parameters.read.byte_offset.quad_part.get() == 0x400 && top_slot.device_object.get() == 0xD000 && top_slot.file_object.get() == 0xF000, "irp: slot do topo com Parameters.Read");
+    assert(irp.associated_irp.system_buffer.get() == 0x1000 && irp.user_event.get() == 0xE000 && irp.user_iosb.get() == 0xE100 && irp.requestor_mode.get() == 1 && irp.tail.overlay.thread.get() == 0xA000 && irp.tail.overlay.original_file_object.get() == 0xF000, "irp: buffers, evento, modo e thread");
+    let bottom_slot = &slots[0];
+    assert(bottom_slot.major_function.get() == 0 && bottom_slot.minor_function.get() == 0 && bottom_slot.flags.get() == 0 && bottom_slot.control.get() == 0 && irp.io_status.status.get() == 0 && irp.user_buffer.get() == 0, "irp: campos opcionais zerados");
     // IRP_MJ_DEVICE_CONTROL (METHOD_NEITHER) e IRP_MJ_POWER num slot.
     builder::build(packet, &BuildOptions { major: 0x0E, buffer_length: 0x40, ioctl: Some(DeviceControl { code: 0x2D_1400, input_length: 8, type3_buffer: 0xB000 }), ..Default::default() });
     let single = builder::first_stack_location(packet, 1);
-    assert(single == packet + 0xD0 && guest::read8(packet + irp::STACK_COUNT) == 1 && guest::read32(single + stack::IOCTL_CODE) == 0x2D_1400 && guest::read32(single + stack::IOCTL_IN_LENGTH) == 8 && guest::read32(single + stack::IOCTL_OUT_LENGTH) == 0x40 && guest::read64(single + stack::IOCTL_TYPE3_BUFFER) == 0xB000, "irp: Parameters.DeviceIoControl");
+    let slot = &slots[0];
+    let parameters = &slot.parameters;
+    assert(single == slot.address() && irp.stack_count.get() == 1 && parameters.device_io_control.io_control_code.get() == 0x2D_1400 && parameters.device_io_control.input_buffer_length.get() == 8 && parameters.device_io_control.output_buffer_length.get() == 0x40 && parameters.device_io_control.type3_input_buffer.get() == 0xB000, "irp: Parameters.DeviceIoControl");
     builder::build(packet, &BuildOptions { major: 0x16, minor: 2, power: Some(Power { power_state_type: 1, device_state: 4 }), ..Default::default() });
-    assert(guest::read8(single + stack::MINOR) == 2 && guest::read32(single + stack::POWER_TYPE) == 1 && guest::read32(single + stack::POWER_STATE) == 4, "irp: Parameters.Power");
+    assert(slot.minor_function.get() == 2 && parameters.power.type_.get().0 == 1 && parameters.power.state.device_state.get().0 == 4, "irp: Parameters.Power");
     builder::build(packet, &BuildOptions { major: 0x1B, minor: 7, buffer_length: 0x99, relations_type: Some(0), ..Default::default() });
-    assert(guest::read32(single + stack::READ_LENGTH) == 0, "irp: QueryDeviceRelations.Type sobre a uniao");
+    assert(parameters.query_device_relations.type_.get().0 == 0, "irp: QueryDeviceRelations.Type sobre a uniao");
     builder::build(packet, &BuildOptions { major: 0x1B, resources: 0xC000, ..Default::default() });
-    assert(guest::read64(single + stack::PNP_ALLOCATED_RESOURCES) == 0xC000 && guest::read64(single + stack::PNP_ALLOCATED_RESOURCES_TRANSLATED) == 0xC000, "irp: StartDevice.AllocatedResources");
-    guest::write32(packet + irp::IO_STATUS, 0xC000_0001);
-    guest::write64(packet + irp::IO_STATUS_INFORMATION, 0x1234);
+    assert(parameters.start_device.allocated_resources.get() == 0xC000 && parameters.start_device.allocated_resources_translated.get() == 0xC000, "irp: StartDevice.AllocatedResources");
+    irp.io_status.status.set(0xC000_0001u32 as i32);
+    irp.io_status.information.set(0x1234);
     assert(builder::read_io_status(packet) == (0xC000_0001u32 as i32, 0x1234), "irp: IoStatus com sinal");
     guest::free_bytes(packet);
 }
@@ -74,9 +90,9 @@ fn test_power_dispatcher(device: u64, irp: u64) -> u32 {
 
 fn power_manager(assert: Assert) {
     use crate::ntos::po::power_manager as po;
-    use crate::ntos::inc::nt_abi::{device_object, device_power_state as d, power_state_type};
-    let device = guest::alloc_bytes(0x150);
-    guest::write_bytes(device, &[0; 0x150]);
+    use crate::ntos::inc::nt_abi::{device_power_state as d, power_state_type};
+    let device = guest::alloc_bytes(DeviceObject::SIZE);
+    guest::write_bytes(device, &[0; DeviceObject::SIZE as usize]);
     assert(po::get_device_power_state(device) == d::D0 && po::set_power_state(device, power_state_type::DEVICE_POWER_STATE, d::D3) == d::D0 && po::get_device_power_state(device) == d::D3, "power: PoSetPowerState devolve o estado anterior");
     assert(po::set_power_state(device, power_state_type::SYSTEM_POWER_STATE, 5) == 5 && po::get_device_power_state(device) == d::D3, "power: SystemPowerState nao e rastreado por dispositivo");
     let previous = po::set_power_irp_dispatcher(Some(test_power_dispatcher));
@@ -90,7 +106,7 @@ fn power_manager(assert: Assert) {
     assert(*POWER_CALLS.lock() == alloc::vec![(device, 0x1000), (device, 0x2000)], "power: PoStartNextPowerIrp em ordem FIFO");
     po::mark_power_request_done(device);
     assert(po::call_driver_down_the_stack(device, 0x3000) == 0, "power: fundo da pilha conclui sem despachar");
-    guest::write64(device + device_object::ATTACHED_DEVICE, 0x5000);
+    unsafe { DeviceObject::at(device) }.attached_device.set(0x5000);
     assert(po::call_driver_down_the_stack(device, 0x3000) == 0x42 && POWER_CALLS.lock().last() == Some(&(0x5000, 0x3000)), "power: PoCallDriver desce para o dispositivo anexado");
     po::forget_device(device);
     assert(po::get_device_power_state(device) == d::D0, "power: dispositivo esquecido volta a D0");
@@ -142,10 +158,10 @@ fn record(index: usize, value: u64) {
 }
 
 extern "win64" fn test_read_dispatch(device: u64, packet: u64) -> u64 {
-    use crate::ntos::inc::nt_abi::irp;
     record(0, device);
-    guest::write32(packet + irp::IO_STATUS, 0);
-    guest::write64(packet + irp::IO_STATUS_INFORMATION, 5);
+    let irp = unsafe { Irp::at(packet) };
+    irp.io_status.status.set(0);
+    irp.io_status.information.set(5);
     0
 }
 
@@ -168,23 +184,24 @@ extern "win64" fn test_cancel(device: u64, _packet: u64) -> u64 {
 fn io_manager_native(assert: Assert) {
     use crate::ntos::io::io_manager::{self as iom, irp_mj, status, IoParams};
     use crate::ntos::ke::dispatcher;
-    use crate::ntos::inc::nt_abi::{device_object, driver_object, io_stack_location as stack, irp, SL_INVOKE_ON_ERROR, SL_INVOKE_ON_SUCCESS};
+    use crate::ntos::inc::nt_abi::{SL_INVOKE_ON_ERROR, SL_INVOKE_ON_SUCCESS};
     use crate::ntos::io::irp_builder::{self as builder, BuildOptions};
     for slot in &IO_SEEN {
         slot.store(0, core::sync::atomic::Ordering::SeqCst);
     }
     let driver = guest::alloc_bytes(0x160);
-    let upper = guest::alloc_bytes(0x150);
-    let lower = guest::alloc_bytes(0x150);
-    for &(pointer, size) in &[(driver, 0x160usize), (upper, 0x150), (lower, 0x150)] {
+    let upper = guest::alloc_bytes(DeviceObject::SIZE);
+    let lower = guest::alloc_bytes(DeviceObject::SIZE);
+    for &(pointer, size) in &[(driver, 0x160usize), (upper, DeviceObject::SIZE as usize), (lower, DeviceObject::SIZE as usize)] {
         guest::write_bytes(pointer, &alloc::vec![0; size]);
     }
-    let function = |major: u8, routine: u64| guest::write64(driver + driver_object::MAJOR_FUNCTION + major as u64 * 8, routine);
-    function(irp_mj::READ, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
-    function(irp_mj::POWER, test_power_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    let driver_object = unsafe { DriverObject::at(driver) };
+    major_function(driver_object, irp_mj::READ, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    major_function(driver_object, irp_mj::POWER, test_power_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
     for &device in &[upper, lower] {
-        guest::write64(device + device_object::DRIVER_OBJECT, driver);
-        guest::write8(device + device_object::STACK_SIZE, 2);
+        let device = unsafe { DeviceObject::at(device) };
+        device.driver_object.set(driver);
+        device.stack_size.set(2);
     }
     // IofCallDriver desce dois níveis e recusa o terceiro.
     let packet = guest::alloc_bytes(builder::size_for(2));
@@ -193,26 +210,30 @@ fn io_manager_native(assert: Assert) {
     dispatcher::initialize_event(event, 0, false);
     builder::build(packet, &BuildOptions { major: irp_mj::READ, stack_count: 2, user_iosb: iosb, user_event: event, ..Default::default() });
     let top = builder::first_stack_location(packet, 2);
-    assert(packet < 0x1_0000_0000 && iom::iof_call_driver(upper, packet) == 0 && seen(0) == upper && guest::read8(packet + irp::CURRENT_LOCATION) == 2 && guest::read64(packet + irp::CURRENT_STACK_LOCATION) == top && guest::read64(top + stack::DEVICE_OBJECT) == upper, "iom: IofCallDriver desce um nivel");
+    let irp = unsafe { Irp::at(packet) };
+    let top_slot = unsafe { IoStackLocation::at(top) };
+    assert(packet < 0x1_0000_0000 && iom::iof_call_driver(upper, packet) == 0 && seen(0) == upper && irp.current_location.get() == 2 && irp.tail.overlay.current_stack_location.get() == top && top_slot.device_object.get() == upper, "iom: IofCallDriver desce um nivel");
     // O driver superior pede conclusão no slot inferior (IoSetCompletionRoutine).
-    let bottom = top - stack::SIZE;
-    guest::write8(bottom + stack::MAJOR, irp_mj::READ);
-    guest::write8(bottom + stack::CONTROL, SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR);
-    guest::write64(bottom + stack::COMPLETION_ROUTINE, test_completion as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64);
-    guest::write64(bottom + stack::CONTEXT, 0xC0FFEE);
-    assert(iom::iof_call_driver(lower, packet) == 0 && guest::read8(packet + irp::CURRENT_LOCATION) == 1 && guest::read64(bottom + stack::DEVICE_OBJECT) == lower, "iom: segundo nivel da pilha");
+    let bottom = top - IoStackLocation::SIZE;
+    let bottom_slot = unsafe { IoStackLocation::at(bottom) };
+    bottom_slot.major_function.set(irp_mj::READ);
+    bottom_slot.control.set(SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR);
+    bottom_slot.completion_routine.set(test_completion as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64);
+    bottom_slot.context.set(0xC0FFEE);
+    assert(iom::iof_call_driver(lower, packet) == 0 && irp.current_location.get() == 1 && bottom_slot.device_object.get() == lower, "iom: segundo nivel da pilha");
     assert(iom::iof_call_driver(lower, packet) == status::NOT_SUPPORTED, "iom: pilha estourada recusada");
     // MORE_PROCESSING_REQUIRED interrompe antes da finalização.
     record(5, 0xC000_0016);
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, bottom);
-    guest::write8(packet + irp::CURRENT_LOCATION, 1);
-    assert(iom::iof_complete_request(packet) == 0xC000_0016u32 as i32 && seen(1) == 0xC0FFEE && seen(2) == upper && guest::read32(iosb) == 0 && dispatcher::read_state(event) == 0, "iom: rotina de conclusao com o dispositivo de cima e MORE_PROCESSING_REQUIRED");
+    let user_iosb = unsafe { IoStatusBlock::at(iosb) };
+    irp.tail.overlay.current_stack_location.set(bottom);
+    irp.current_location.set(1);
+    assert(iom::iof_complete_request(packet) == 0xC000_0016u32 as i32 && seen(1) == 0xC0FFEE && seen(2) == upper && user_iosb.status.get() == 0 && dispatcher::read_state(event) == 0, "iom: rotina de conclusao com o dispositivo de cima e MORE_PROCESSING_REQUIRED");
     // Conclusão completa: UserIosb e UserEvent.
     record(5, 0);
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, bottom);
-    guest::write8(packet + irp::CURRENT_LOCATION, 1);
-    guest::write32(packet + irp::IO_STATUS, 0);
-    assert(iom::iof_complete_request(packet) == 0 && seen(4) == 2 && guest::read32(iosb) == 0 && guest::read64(iosb + 8) == 5 && dispatcher::read_state(event) == 1 && guest::read8(packet + irp::CURRENT_LOCATION) == 3, "iom: IofCompleteRequest finaliza UserIosb e UserEvent");
+    irp.tail.overlay.current_stack_location.set(bottom);
+    irp.current_location.set(1);
+    irp.io_status.status.set(0);
+    assert(iom::iof_complete_request(packet) == 0 && seen(4) == 2 && user_iosb.status.get() == 0 && user_iosb.information.get() == 5 && dispatcher::read_state(event) == 1 && irp.current_location.get() == 3, "iom: IofCompleteRequest finaliza UserIosb e UserEvent");
     // IoBuildDeviceIoControlRequest METHOD_BUFFERED e METHOD_NEITHER.
     let input = guest::alloc_bytes(16);
     let output = guest::alloc_bytes(16);
@@ -220,46 +241,53 @@ fn io_manager_native(assert: Assert) {
     guest::write_bytes(output, &[0; 16]);
     let buffered = iom::build_device_io_control_request(0x22_0000, upper, input, 8, output, 4, 0x100, 0, iosb, None);
     let buffered_top = builder::first_stack_location(buffered, 2);
-    let system = guest::read64(buffered + irp::SYSTEM_BUFFER);
-    assert(buffered != 0 && system != 0 && guest::read_bytes(system, 8) == b"ABCDEFGH" && guest::read8(buffered_top + stack::MAJOR) == irp_mj::DEVICE_CONTROL && guest::read32(buffered + irp::FLAGS) == 0x30 && guest::read32(buffered_top + stack::IOCTL_OUT_LENGTH) == 4, "iom: METHOD_BUFFERED copia a entrada para o SystemBuffer");
-    guest::write64(buffered + irp::CURRENT_STACK_LOCATION, buffered_top);
-    guest::write8(buffered + irp::CURRENT_LOCATION, 2);
-    guest::write64(buffered + irp::IO_STATUS_INFORMATION, 4);
-    assert(iom::iof_complete_request(buffered) == 0 && guest::read_bytes(output, 4) == b"ABCD" && guest::read8(output + 4) == 0 && guest::read64(buffered + irp::SYSTEM_BUFFER) == 0, "iom: conclusao copia o SystemBuffer e o libera");
+    let buffered_irp = unsafe { Irp::at(buffered) };
+    let buffered_slot = unsafe { IoStackLocation::at(buffered_top) };
+    let system = buffered_irp.associated_irp.system_buffer.get();
+    assert(buffered != 0 && system != 0 && guest::read_bytes(system, 8) == b"ABCDEFGH" && buffered_slot.major_function.get() == irp_mj::DEVICE_CONTROL && buffered_irp.flags.get() == 0x30 && buffered_slot.parameters.device_io_control.output_buffer_length.get() == 4, "iom: METHOD_BUFFERED copia a entrada para o SystemBuffer");
+    buffered_irp.tail.overlay.current_stack_location.set(buffered_top);
+    buffered_irp.current_location.set(2);
+    buffered_irp.io_status.information.set(4);
+    assert(iom::iof_complete_request(buffered) == 0 && guest::read_bytes(output, 5) == b"ABCD\0" && buffered_irp.associated_irp.system_buffer.get() == 0, "iom: conclusao copia o SystemBuffer e o libera");
     let neither = iom::build_device_io_control_request(0x22_0003, upper, input, 8, 0, 0, 1, 0, 0, None);
     let neither_top = builder::first_stack_location(neither, 2);
-    assert(guest::read64(neither + irp::SYSTEM_BUFFER) == 0 && guest::read64(neither_top + stack::IOCTL_TYPE3_BUFFER) == input && guest::read8(neither_top + stack::MAJOR) == irp_mj::INTERNAL_DEVICE_CONTROL && guest::read32(neither + irp::FLAGS) == 0, "iom: METHOD_NEITHER e IRP interno");
+    let neither_irp = unsafe { Irp::at(neither) };
+    let neither_slot = unsafe { IoStackLocation::at(neither_top) };
+    assert(neither_irp.associated_irp.system_buffer.get() == 0 && neither_slot.parameters.device_io_control.type3_input_buffer.get() == input && neither_slot.major_function.get() == irp_mj::INTERNAL_DEVICE_CONTROL && neither_irp.flags.get() == 0, "iom: METHOD_NEITHER e IRP interno");
     // IoBuildSynchronousFsdRequest.
-    guest::write64(input, 0x2000);
+    unsafe { LargeInteger::at(input) }.quad_part.set(0x2000);
     let fsd = iom::build_synchronous_fsd_request(irp_mj::READ, upper, output, 0x200, input, event, iosb);
     let fsd_top = builder::first_stack_location(fsd, 2);
-    assert(guest::read8(fsd + irp::STACK_COUNT) == 2 && guest::read64(fsd_top + stack::READ_OFFSET) == 0x2000 && guest::read32(fsd_top + stack::READ_LENGTH) == 0x200 && guest::read64(fsd + irp::SYSTEM_BUFFER) == output, "iom: IoBuildSynchronousFsdRequest");
+    let fsd_irp = unsafe { Irp::at(fsd) };
+    let fsd_slot = unsafe { IoStackLocation::at(fsd_top) };
+    assert(fsd_irp.stack_count.get() == 2 && fsd_slot.parameters.read.byte_offset.quad_part.get() == 0x2000 && fsd_slot.parameters.read.length.get() == 0x200 && fsd_irp.associated_irp.system_buffer.get() == output, "iom: IoBuildSynchronousFsdRequest");
     // Conclusões gerenciadas e observadas.
     let managed = alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
     let sink = managed.clone();
     iom::manage_completion(fsd, alloc::boxed::Box::new(move |status, information| sink.store(((status as u32 as u64) << 32) | information, core::sync::atomic::Ordering::SeqCst)));
-    guest::write32(iosb, 0xFFFF_FFFF);
-    guest::write32(fsd + irp::IO_STATUS, 0xC000_0001);
-    guest::write64(fsd + irp::IO_STATUS_INFORMATION, 7);
-    guest::write64(fsd + irp::CURRENT_STACK_LOCATION, fsd_top);
-    assert(iom::iof_complete_request(fsd) == 0 && managed.load(core::sync::atomic::Ordering::SeqCst) == (0xC000_0001u64 << 32) | 7 && guest::read32(iosb) == 0xFFFF_FFFF, "iom: conclusao gerenciada substitui a finalizacao");
+    user_iosb.status.set(-1);
+    fsd_irp.io_status.status.set(0xC000_0001u32 as i32);
+    fsd_irp.io_status.information.set(7);
+    fsd_irp.tail.overlay.current_stack_location.set(fsd_top);
+    assert(iom::iof_complete_request(fsd) == 0 && managed.load(core::sync::atomic::Ordering::SeqCst) == (0xC000_0001u64 << 32) | 7 && user_iosb.status.get() == -1, "iom: conclusao gerenciada substitui a finalizacao");
     // Power IRP: status de retorno quando o IoStatus fica zero.
     let power = guest::alloc_bytes(builder::size_for(1));
     builder::build(power, &BuildOptions { major: irp_mj::POWER, ..Default::default() });
     assert(iom::dispatch_native_power_irp(upper, power) == 0x103, "iom: despacho de power IRP");
-    guest::write32(power + irp::IO_STATUS, 0xC000_00BB);
+    unsafe { Irp::at(power) }.io_status.status.set(0xC000_00BBu32 as i32);
     assert(iom::dispatch_native_power_irp(upper, power) == 0xC000_00BB, "iom: power IRP devolve o IoStatus nao nulo");
     // IRP pendente: espera com o evento já sinalizado e cancelamento.
     let mut request = iom::make_io_request(irp_mj::READ, IoParams { user_event: event, ..Default::default() });
     request.pending_irp = iom::build_synchronous_fsd_request(irp_mj::READ, upper, output, 4, 0, event, 0);
-    guest::write64(request.pending_irp + irp::IO_STATUS_INFORMATION, 9);
+    unsafe { Irp::at(request.pending_irp) }.io_status.information.set(9);
     dispatcher::set_event(event);
     assert(iom::wait_pending_io_request(&mut request, 100) == 0 && request.info == 9 && request.pending_irp == 0, "iom: espera de IRP pendente");
     request.pending_irp = iom::build_synchronous_fsd_request(irp_mj::READ, upper, output, 4, 0, 0, 0);
     let pending_top = builder::first_stack_location(request.pending_irp, 2);
-    guest::write64(request.pending_irp + irp::CURRENT_STACK_LOCATION, pending_top);
-    guest::write64(pending_top + stack::DEVICE_OBJECT, upper);
-    guest::write64(request.pending_irp + irp::CANCEL_ROUTINE, test_cancel as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    let pending_irp = unsafe { Irp::at(request.pending_irp) };
+    pending_irp.tail.overlay.current_stack_location.set(pending_top);
+    unsafe { IoStackLocation::at(pending_top) }.device_object.set(upper);
+    pending_irp.cancel_routine.set(test_cancel as extern "win64" fn(u64, u64) -> u64 as usize as u64);
     assert(iom::cancel_pending_io_request(&mut request) == 0xC000_0120u32 as i32 && seen(3) == upper && request.pending_irp == 0, "iom: IoCancelIrp chama a cancel routine");
     for pointer in [driver, upper, lower, packet, iosb, event, input, output, buffered, neither, fsd, power] {
         guest::free_bytes(pointer);
@@ -299,7 +327,7 @@ fn io_manager_devices(assert: Assert) {
     use crate::ntos::io::io_manager::{self as iom, irp_mj, status, DeviceEntry, IoParams, IoResult};
     use crate::ntos::ob::objects::file as file_objects;
     use crate::ntos::ob::object_manager as om;
-    use crate::ntos::inc::nt_abi::{device_object, device_power_state, driver_object};
+    use crate::ntos::inc::nt_abi::device_power_state;
     // Driver do kernel com despacho por major function.
     ECHO_EVENTS.store(0, core::sync::atomic::Ordering::SeqCst);
     let driver = iom::create_driver("Phase4Echo", &[(irp_mj::READ, echo_read), (irp_mj::WRITE, echo_write), (irp_mj::CREATE, echo_create), (irp_mj::CLEANUP, echo_cleanup), (irp_mj::CLOSE, echo_close), (irp_mj::PNP, echo_pnp)]);
@@ -319,13 +347,15 @@ fn io_manager_devices(assert: Assert) {
     assert(external.status == 0 && file_objects::state(external.file_object).is_some_and(|state| state.0 == 0 && state.1) && matches!(iom::close_device(external.handle), Ok(0)) && !file_objects::is_file(external.file_object), "iomdev: handles externos retem so a referencia do CREATE");
     // Pilha nativa: IRP real entregue ao DEVICE_OBJECT.
     let native_driver = guest::alloc_bytes(0x160);
-    let native_device = guest::alloc_bytes(0x150);
+    let native_device = guest::alloc_bytes(DeviceObject::SIZE);
     guest::write_bytes(native_driver, &[0; 0x160]);
-    guest::write_bytes(native_device, &[0; 0x150]);
-    guest::write64(native_driver + driver_object::MAJOR_FUNCTION + irp_mj::READ as u64 * 8, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
-    guest::write64(native_driver + driver_object::MAJOR_FUNCTION + irp_mj::POWER as u64 * 8, test_power_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
-    guest::write64(native_device + device_object::DRIVER_OBJECT, native_driver);
-    guest::write8(native_device + device_object::STACK_SIZE, 1);
+    guest::write_bytes(native_device, &[0; DeviceObject::SIZE as usize]);
+    let driver_object = unsafe { DriverObject::at(native_driver) };
+    major_function(driver_object, irp_mj::READ, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    major_function(driver_object, irp_mj::POWER, test_power_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    let device_object = unsafe { DeviceObject::at(native_device) };
+    device_object.driver_object.set(native_driver);
+    device_object.stack_size.set(1);
     let native_node = om::create_object("\\Device", "Phase4Native", "Device", None).unwrap_or(0);
     iom::register_device(native_node, DeviceEntry { native_device, ..Default::default() });
     let native_path = "\\Device\\Phase4Native";
@@ -347,7 +377,6 @@ fn pci_bus_driver(assert: Assert) {
     use crate::drivers::bus::pci::{self, cm_resource_type, Resource};
     use crate::ntos::io::{device_resources, io_manager as iom};
     use crate::ntos::ob::object_manager as om;
-    use crate::ntos::inc::nt_abi::irp;
     use crate::ntos::io::irp_builder::{self as builder, BuildOptions};
     let devices = pci::devices();
     assert(devices.first().is_some_and(|entry| entry.vendor_id == 0x8086 && entry.device_id == 0x1237 && entry.pdo_name == "PDO0" && entry.node != 0), "pcibus: host bridge enumerado como PDO0");
@@ -361,15 +390,19 @@ fn pci_bus_driver(assert: Assert) {
     let path = alloc::format!("\\Device\\{}", ide.pdo_name);
     let node = om::lookup(&path).unwrap_or(0);
     assert(node == ide.node && iom::device(node).is_some_and(|entry| entry.native_device == ide.pdo_pointer && entry.resources == ide.resource_list_pointer) && device_resources::lookup_resource_list(ide.pdo_pointer) == ide.resource_list_pointer, "pcibus: PDO no namespace com CM_RESOURCE_LIST registrado");
-    let list = ide.resource_list_pointer;
-    assert(guest::read32(list) == 1 && guest::read32(list + 4) == 5 && guest::read32(list + 16) == resources.len() as u32 && guest::read8(list + 20) == cm_resource_type::PORT && guest::read64(list + 24) == 0x1F0, "pcibus: CM_RESOURCE_LIST no layout do wdm.h");
-    assert(guest::read16(ide.pdo_pointer) == 3 && guest::read32(ide.pdo_pointer + 4) == 1 && guest::read8(ide.pdo_pointer + 0x4C) == 1, "pcibus: DEVICE_OBJECT do PDO");
+    let list = unsafe { CmResourceList::at(ide.resource_list_pointer) };
+    let full = &list.list[0];
+    let first = &full.partial_resource_list.partial_descriptors[0];
+    assert(list.count.get() == 1 && full.interface_type.get() == InterfaceType::PCI_BUS && full.partial_resource_list.count.get() == resources.len() as u32 && first.type_.get() == cm_resource_type::PORT && first.u.port.start.quad_part.get() == 0x1F0, "pcibus: CM_RESOURCE_LIST no layout do wdm.h");
+    let pdo = unsafe { DeviceObject::at(ide.pdo_pointer) };
+    assert(pdo.type_.get() == 3 && pdo.reference_count.get() == 1 && pdo.stack_size.get() == 1, "pcibus: DEVICE_OBJECT do PDO");
     // QUERY_ID pelo despacho do bus driver e pela pilha nativa.
     assert(matches!(iom::query_device_id(&path, 1), Ok(Some(id)) if id == "PCI\\VEN_8086&DEV_7010"), "pcibus: QUERY_ID pelo bus driver");
     let packet = guest::alloc_bytes(builder::size_for(1));
     builder::build(packet, &BuildOptions { major: 0x1B, minor: 0x13, device_object: ide.pdo_pointer, ..Default::default() });
-    assert(iom::iof_call_driver(ide.pdo_pointer, packet) == 0 && guest::read32(packet + irp::IO_STATUS) == 0, "pcibus: PDO sem driver nativo respondido pelo bus");
-    let information = guest::read64(packet + irp::IO_STATUS_INFORMATION);
+    let irp = unsafe { Irp::at(packet) };
+    assert(iom::iof_call_driver(ide.pdo_pointer, packet) == 0 && irp.io_status.status.get() == 0, "pcibus: PDO sem driver nativo respondido pelo bus");
+    let information = irp.io_status.information.get();
     assert(information != 0 && crate::ntos::rtl::guest_strings::read_wide_string(information) == "PCI\\VEN_8086&DEV_7010", "pcibus: id UTF-16 em pool no Information");
     guest::free_bytes(information);
     builder::build(packet, &BuildOptions { major: 0x1B, minor: 0x09, device_object: ide.pdo_pointer, ..Default::default() });
@@ -381,7 +414,9 @@ fn pci_bus_driver(assert: Assert) {
     let synthetic = pci::build_resource_list(&[Resource { resource_type: cm_resource_type::PORT, flags: 0, start: 0x170, length: 8, level: 0, vector: 0, affinity: 0 }, interrupt(15), interrupt(14)]);
     let fake_pdo = 0x7_0000_1000;
     device_resources::register_device_resources(fake_pdo, synthetic);
-    assert(guest::read32(synthetic + 20 + 20 + 12) == 0xFFFF_FFFF, "pcibus: afinidade padrao");
+    let synthetic_list = unsafe { CmResourceList::at(synthetic) };
+    let synthetic_descriptors = unsafe { CmPartialResourceDescriptor::array_at(synthetic_list.list[0].partial_resource_list.partial_descriptors[0].address(), 3) };
+    assert(synthetic_descriptors[1].u.interrupt.affinity.get() as u32 == 0xFFFF_FFFF, "pcibus: afinidade padrao");
     assert(device_resources::consume_next_interrupt(fake_pdo) == Some(device_resources::Interrupt { level: 15, vector: 0x2F, flags: 0 }) && device_resources::consume_next_interrupt(fake_pdo).is_some_and(|found| found.level == 14) && device_resources::consume_next_interrupt(fake_pdo).is_none() && device_resources::consume_next_interrupt(0x9999).is_none(), "devres: interrupcoes LINE_BASED na ordem declarada");
     assert(device_resources::lookup_resource_list(0x1_0000_0000 | (fake_pdo & 0xFFFF_FFFF)) == synthetic, "devres: chave nos 32 bits baixos do PDO");
 }
@@ -390,38 +425,45 @@ fn motherboard_bus_driver(assert: Assert) {
     use crate::drivers::bus::motherboard;
     use crate::ntos::io::io_manager as iom;
     use crate::ntos::ob::object_manager as om;
-    use crate::ntos::inc::nt_abi::irp;
     use crate::ntos::io::irp_builder::{self as builder, BuildOptions};
     // A pilha de teclado enumera no boot quando existir; senão o teste enumera.
     let pdos = if motherboard::created().is_empty() { motherboard::enumerate().unwrap_or_default() } else { motherboard::created() };
     assert(pdos.len() == 2 && om::lookup("\\Device\\I8042Kbd") == Some(pdos[0].node) && om::lookup("\\Device\\I8042Mou") == Some(pdos[1].node), "motherboard: PDOs PNP0303 e PNP0F13");
     let keyboard = pdos[0];
-    assert(iom::device(keyboard.node).is_some_and(|entry| entry.driver.is_none() && entry.native_device == keyboard.device_pointer && entry.resources == keyboard.resource_list_pointer) && guest::read64(keyboard.device_pointer + 0x08) == 0, "motherboard: PDO nativo sem driver");
+    assert(iom::device(keyboard.node).is_some_and(|entry| entry.driver.is_none() && entry.native_device == keyboard.device_pointer && entry.resources == keyboard.resource_list_pointer) && unsafe { DeviceObject::at(keyboard.device_pointer) }.driver_object.get() == 0, "motherboard: PDO nativo sem driver");
     // QUERY_ID pela pilha nativa: o IofCallDriver cai no respondedor do bus.
     assert(matches!(iom::query_device_id("\\Device\\I8042Kbd", 0), Ok(Some(id)) if id == "PNP0303") && matches!(iom::query_device_id("\\Device\\I8042Kbd", 3), Ok(Some(id)) if id == "00") && matches!(iom::query_device_id("\\Device\\I8042Mou", 1), Ok(Some(id)) if id == "PNP0F13"), "motherboard: QUERY_ID DeviceID, InstanceID e HardwareIDs");
     assert(matches!(iom::query_device_id("\\Device\\I8042Kbd", 5), Ok(None)), "motherboard: tipo de id sem suporte");
     let packet = guest::alloc_bytes(builder::size_for(1));
+    let irp = unsafe { Irp::at(packet) };
     let query = |minor: u8, slot: u64| {
         builder::build(packet, &BuildOptions { major: 0x1B, minor, device_object: keyboard.device_pointer, pnp_slot_pointer: slot, ..Default::default() });
         let status = iom::iof_call_driver(keyboard.device_pointer, packet);
-        (status, guest::read32(packet + irp::IO_STATUS), guest::read64(packet + irp::IO_STATUS_INFORMATION))
+        (status, irp.io_status.status.get() as u32, irp.io_status.information.get())
     };
     // QUERY_RESOURCES: o CM_RESOURCE_LIST Isa com alinhamento de 4.
     let (status, io_status, list) = query(0x0A, 0);
-    let interrupt = list + 4 + 8 + 8 + 2 * 0x14;
-    assert(status == 0 && io_status == 0 && list == keyboard.resource_list_pointer && guest::read32(list) == 1 && guest::read32(list + 4) == 1 && guest::read32(list + 4 + 8 + 4) == 3 && guest::read8(list + 20) == 1 && guest::read64(list + 24) == 0x60, "motherboard: QUERY_RESOURCES com portas 0x60/0x64");
-    assert(guest::read8(interrupt) == 2 && guest::read32(interrupt + 4) == 8 && guest::read32(interrupt + 8) == 0x21 && guest::read64(interrupt + 0xC) == 0xFF, "motherboard: IRQ1 no DIRQL 8");
+    let resource_list = unsafe { CmResourceList::at(list) };
+    let full = &resource_list.list[0];
+    let descriptors = unsafe { CmPartialResourceDescriptor::array_at(full.partial_resource_list.partial_descriptors[0].address(), 3) };
+    assert(status == 0 && io_status == 0 && list == keyboard.resource_list_pointer && resource_list.count.get() == 1 && full.interface_type.get() == InterfaceType::ISA && full.partial_resource_list.count.get() == 3 && descriptors[0].type_.get() == 1 && descriptors[0].u.port.start.quad_part.get() == 0x60, "motherboard: QUERY_RESOURCES com portas 0x60/0x64");
+    let interrupt = &descriptors[2];
+    assert(interrupt.type_.get() == 2 && interrupt.u.interrupt.level.get() == 8 && interrupt.u.interrupt.vector.get() == 0x21 && interrupt.u.interrupt.affinity.get() == 0xFF, "motherboard: IRQ1 no DIRQL 8");
     // QUERY_RESOURCE_REQUIREMENTS: descritores IO com stride 0x20.
     let (_, _, requirements) = query(0x0B, 0);
-    assert(requirements != 0 && guest::read32(requirements) == 0x88 && guest::read32(requirements + 0x1C) == 1 && guest::read32(requirements + 0x24) == 3 && guest::read64(requirements + 0x28 + 0x10) == 0x60 && guest::read32(requirements + 0x28 + 2 * 0x20 + 8) == 1, "motherboard: IO_RESOURCE_REQUIREMENTS_LIST com a IRQ ISA crua");
+    let requirements_list = unsafe { IoResourceRequirementsList::at(requirements) };
+    let alternative = &requirements_list.list[0];
+    let io_descriptors = unsafe { crate::ntos::inc::types::IoResourceDescriptor::array_at(alternative.descriptors[0].address(), 3) };
+    assert(requirements != 0 && requirements_list.list_size.get() == 0x88 && requirements_list.alternative_lists.get() == 1 && alternative.count.get() == 3 && io_descriptors[0].u.port.minimum_address.quad_part.get() == 0x60 && io_descriptors[2].u.interrupt.minimum_vector.get() == 1, "motherboard: IO_RESOURCE_REQUIREMENTS_LIST com a IRQ ISA crua");
     guest::free_bytes(requirements);
     // QUERY_CAPABILITIES preenche o buffer do chamador.
-    let capabilities = guest::alloc_bytes(0x40);
-    guest::write_bytes(capabilities, &[0xCC; 0x40]);
+    let capabilities = guest::alloc_bytes(DeviceCapabilities::SIZE);
+    guest::write_bytes(capabilities, &[0xCC; DeviceCapabilities::SIZE as usize]);
     let (status, _, _) = query(0x09, capabilities);
-    assert(status == 0 && guest::read16(capabilities) == 0x40 && guest::read16(capabilities + 2) == 1 && guest::read32(capabilities + 8) == 0xFFFF_FFFF && guest::read32(capabilities + 0x10) == 1 && guest::read32(capabilities + 0x28) == 1 && guest::read32(capabilities + 0x2C) == 0, "motherboard: DEVICE_CAPABILITIES em D0 sem wake");
+    let device_capabilities = unsafe { DeviceCapabilities::at(capabilities) };
+    assert(status == 0 && device_capabilities.size.get() == 0x40 && device_capabilities.version.get() == 1 && device_capabilities.address.get() == 0xFFFF_FFFF && device_capabilities.device_state[0].get().0 == 1 && device_capabilities.device_state[6].get().0 == 1 && device_capabilities.system_wake.get().0 == 0, "motherboard: DEVICE_CAPABILITIES em D0 sem wake");
     let (status, io_status, _) = query(0x15, 0);
-    assert(status == 0xC000_00BBu32 as i32 && io_status == 0xC000_00BB && guest::read8(packet + irp::CURRENT_LOCATION) == 2, "motherboard: minor sem suporte e completado mesmo assim");
+    assert(status == 0xC000_00BBu32 as i32 && io_status == 0xC000_00BB && irp.current_location.get() == 2, "motherboard: minor sem suporte e completado mesmo assim");
     assert(motherboard::answer_pnp_irp(0x5555_0000, packet).is_none(), "motherboard: dispositivo de outro bus");
     guest::free_bytes(packet);
     guest::free_bytes(capabilities);
@@ -625,10 +667,9 @@ static IO_SMALL_SEEN: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::
 
 /// Rotina de cancelamento: libera o spin lock com o CancelIrql do IRP.
 extern "win64" fn test_cancel_spin(device: u64, packet: u64) -> u64 {
-    use crate::ntos::inc::nt_abi::irp;
     IO_SMALL_SEEN[0].store(device, core::sync::atomic::Ordering::SeqCst);
     IO_SMALL_SEEN[1].store(crate::ntos::io::cancel::is_held() as u64, core::sync::atomic::Ordering::SeqCst);
-    let _ = crate::ntos::io::cancel::release(guest::read8(packet + irp::CANCEL_IRQL));
+    let _ = crate::ntos::io::cancel::release(unsafe { Irp::at(packet) }.cancel_irql.get());
     0
 }
 
@@ -645,7 +686,6 @@ fn io_small_modules(assert: Assert) {
     use crate::ntos::ke::irql;
     use crate::ntos::ps::process;
     use crate::ntos::ob::objects::device as device_objects;
-    use crate::ntos::inc::nt_abi::{device_object, irp, io_stack_location as stack, kthread};
     use crate::ntos::io::irp_builder::{self as builder, BuildOptions};
     let seen = |index: usize| IO_SMALL_SEEN[index].load(core::sync::atomic::Ordering::SeqCst);
     // Spin lock de cancelamento e IoCancelIrp.
@@ -654,27 +694,30 @@ fn io_small_modules(assert: Assert) {
     assert(previous == level && irql::get_irql() == 2 && cancel::acquire().is_err() && cancel::release(previous).is_ok() && irql::get_irql() == level && cancel::release(previous).is_err(), "cancel: IoAcquire/ReleaseCancelSpinLock");
     let packet = guest::alloc_bytes(builder::size_for(1));
     builder::build(packet, &BuildOptions { major: 3, device_object: 0xDE00, ..Default::default() });
-    guest::write64(packet + irp::CURRENT_STACK_LOCATION, builder::first_stack_location(packet, 1));
-    assert(matches!(cancel::irp(packet), Ok(0)) && guest::read8(packet + irp::CANCEL) == 1 && !cancel::is_held(), "cancel: IRP sem rotina so marca Cancel");
-    guest::write64(packet + irp::CANCEL_ROUTINE, test_cancel_spin as extern "win64" fn(u64, u64) -> u64 as usize as u64);
-    assert(matches!(cancel::irp(packet), Ok(1)) && seen(0) == guest::read64(builder::first_stack_location(packet, 1) + stack::DEVICE_OBJECT) && seen(1) == 1 && guest::read64(packet + irp::CANCEL_ROUTINE) == 0 && guest::read8(packet + irp::CANCEL_IRQL) == level && !cancel::is_held() && irql::get_irql() == level, "cancel: rotina recebe o lock e o CancelIrql");
+    let irp = unsafe { Irp::at(packet) };
+    let slot = unsafe { IoStackLocation::at(builder::first_stack_location(packet, 1)) };
+    irp.tail.overlay.current_stack_location.set(slot.address());
+    assert(matches!(cancel::irp(packet), Ok(0)) && irp.cancel.get() == 1 && !cancel::is_held(), "cancel: IRP sem rotina so marca Cancel");
+    irp.cancel_routine.set(test_cancel_spin as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    assert(matches!(cancel::irp(packet), Ok(1)) && seen(0) == slot.device_object.get() && seen(1) == 1 && irp.cancel_routine.get() == 0 && irp.cancel_irql.get() == level && !cancel::is_held() && irql::get_irql() == level, "cancel: rotina recebe o lock e o CancelIrql");
     guest::free_bytes(packet);
     // IoDeleteDevice.
-    let device = guest::alloc_bytes(device_object::STRUCT_SIZE);
+    let device = guest::alloc_bytes(DeviceObject::SIZE);
     let _ = device_objects::register(device, None, None);
     assert(matches!(delete_device::delete_device(device), Ok(0)) && !device_objects::is_device(device) && delete_device::delete_device(device).is_err(), "iodelete: IoDeleteDevice retira o dispositivo registrado");
     guest::free_bytes(device);
     // Estado dos drivers de boot, pilha inicial e hard errors.
     boot_drivers_state::complete();
     let thread = process::get_current_thread();
-    assert(boot_drivers_state::is_initialized() && initial_stack::get() == guest::read64(thread + kthread::INITIAL_STACK), "io: drivers de boot concluidos e IoGetInitialStack");
+    let ethread = unsafe { Ethread::at(thread) };
+    assert(boot_drivers_state::is_initialized() && initial_stack::get() == unsafe { Kthread::at(thread) }.initial_stack.get(), "io: drivers de boot concluidos e IoGetInitialStack");
     let mode = thread_io::set_hard_error_mode(0).unwrap_or(9);
-    assert(guest::read32(thread + kthread::CROSS_THREAD_FLAGS) & 16 != 0 && matches!(thread_io::set_hard_error_mode(1), Ok(0)) && guest::read32(thread + kthread::CROSS_THREAD_FLAGS) & 16 == 0 && mode <= 1, "io: IoSetThreadHardErrorMode");
+    assert(ethread.hard_errors_are_disabled() != 0 && matches!(thread_io::set_hard_error_mode(1), Ok(0)) && ethread.hard_errors_are_disabled() == 0 && mode <= 1, "io: IoSetThreadHardErrorMode");
     // IoTimer por dispositivo.
-    let timed = guest::alloc_bytes(device_object::STRUCT_SIZE);
+    let timed = guest::alloc_bytes(DeviceObject::SIZE);
     let routine = test_io_timer as extern "win64" fn(u64, u64) -> u64 as usize as u64;
     IO_SMALL_SEEN[3].store(0, core::sync::atomic::Ordering::SeqCst);
-    assert(io_timer::initialize_timer(timed, routine, 7) == 0 && guest::read64(timed + device_object::TIMER) == 1 && io_timer::initialize_timer(timed, routine, 7) == 0xC000_0035 && io_timer::start_timer(0x1234) == 0xC000_000D, "iotimer: IoInitializeTimer");
+    assert(io_timer::initialize_timer(timed, routine, 7) == 0 && unsafe { DeviceObject::at(timed) }.timer.get() == 1 && io_timer::initialize_timer(timed, routine, 7) == 0xC000_0035 && io_timer::start_timer(0x1234) == 0xC000_000D, "iotimer: IoInitializeTimer");
     assert(io_timer::start_timer(timed) == 0, "iotimer: IoStartTimer");
     io_timer::expire_now(timed);
     io_timer::check_io_timers();
@@ -697,13 +740,14 @@ fn io_small_modules(assert: Assert) {
     assert(thread_activity::propagate(guid, guid + 16, output) == 0 && guest::read_bytes(guid + 16, 16) == b"0123456789ABCDEF" && thread_activity::get() == guid + 16 && guest::read64(output) == original, "activity: IoPropagateActivityIdToThread");
     thread_activity::clear(original);
     // Lista de IRPs da ETHREAD.
-    let fake = guest::alloc_bytes(0x600);
-    let head = fake + kthread::IRP_LIST_HEAD;
-    guest::write64(head, head);
-    guest::write64(head + 8, head);
-    let (first, second) = (guest::alloc_bytes(0x40), guest::alloc_bytes(0x40));
-    assert(thread_requests::insert(first, fake).is_ok() && thread_requests::insert(second, fake).is_ok() && guest::read64(head) == second + 0x20 && guest::read64(second + 0x20) == first + 0x20 && guest::read64(first + 0x20) == head, "threadirp: IopQueueThreadIrp insere no inicio");
-    assert(thread_requests::insert(first, fake).is_err() && thread_requests::remove(first, fake).is_ok() && guest::read64(head) == second + 0x20 && guest::read64(second + 0x20) == head && thread_requests::remove(second, fake).is_ok() && guest::read64(head) == head && thread_requests::remove(second, fake).is_err(), "threadirp: remocao fora de ordem e lista vazia");
+    let fake = guest::alloc_bytes(Ethread::SIZE);
+    let head: &ListEntry = &unsafe { Ethread::at(fake) }.irp_list;
+    head.flink.set(head.address());
+    head.blink.set(head.address());
+    let (first, second) = (guest::alloc_bytes(Irp::SIZE), guest::alloc_bytes(Irp::SIZE));
+    let (first_links, second_links) = unsafe { (&Irp::at(first).thread_list_entry, &Irp::at(second).thread_list_entry) };
+    assert(thread_requests::insert(first, fake).is_ok() && thread_requests::insert(second, fake).is_ok() && head.flink.get() == second_links.address() && second_links.flink.get() == first_links.address() && first_links.flink.get() == head.address(), "threadirp: IopQueueThreadIrp insere no inicio");
+    assert(thread_requests::insert(first, fake).is_err() && thread_requests::remove(first, fake).is_ok() && head.flink.get() == second_links.address() && second_links.flink.get() == head.address() && thread_requests::remove(second, fake).is_ok() && head.flink.get() == head.address() && thread_requests::remove(second, fake).is_err(), "threadirp: remocao fora de ordem e lista vazia");
     for pointer in [guid, output, fake, first, second] {
         guest::free_bytes(pointer);
     }
@@ -728,56 +772,67 @@ extern "win64" fn test_start_io(_device: u64, packet: u64, _context: u64) -> u64
 
 fn io_controller_and_start_io(assert: Assert) {
     use crate::ntos::io::controller::{controller, start_io};
-    use crate::ntos::inc::nt_abi::{controller_object as co, device_object, driver_object, kdevice_queue};
     use core::sync::atomic::Ordering::SeqCst;
+    /// IO_ALLOCATION_ACTION.
+    const KEEP_OBJECT: u64 = 1;
+    const DEALLOCATE_OBJECT: u64 = 2;
     let calls = || CONTROLLER_SEEN[0].load(SeqCst);
     for slot in &CONTROLLER_SEEN {
         slot.store(0, SeqCst);
     }
-    // CONTROLLER_OBJECT.
+    CONTROLLER_SEEN[3].store(KEEP_OBJECT, SeqCst);
+    // CONTROLLER_OBJECT: a fila de espera é a DeviceWaitQueue (KDEVICE_QUEUE).
     let routine = test_controller_routine as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
-    let device = guest::alloc_bytes(device_object::STRUCT_SIZE);
-    guest::write_bytes(device, &[0; 0x150]);
-    guest::write64(device + device_object::CURRENT_IRP, 0xABC0);
+    let device = guest::alloc_bytes(DeviceObject::SIZE);
+    guest::write_bytes(device, &[0; DeviceObject::SIZE as usize]);
+    let device_object = unsafe { DeviceObject::at(device) };
+    device_object.current_irp.set(0xABC0);
     let object = controller::create(16);
-    assert(guest::read32(object + co::TYPE) == 7 | 0x40 << 16 && guest::read32(object + co::REFERENCE_COUNT) == 1 && guest::read64(object + co::CONTROLLER_EXTENSION) == object + co::SIZE, "controller: IoCreateController com extensao");
+    let controller_object = unsafe { ControllerObject::at(object) };
+    let wait_queue = &controller_object.device_wait_queue;
+    let waiting = || wait_queue.device_list_head.flink.get() != wait_queue.device_list_head.address();
+    assert(controller_object.type_.get() == 7 && controller_object.size.get() as u64 == ControllerObject::SIZE + 16 && controller_object.controller_extension.get() == object + ControllerObject::SIZE && wait_queue.type_.get() == 0x14 && wait_queue.size.get() == 0x28 && wait_queue.busy.get() == 0, "controller: IoCreateController com extensao e DeviceWaitQueue");
     controller::allocate(object, device, routine, 0x11);
-    assert(calls() == 1 && CONTROLLER_SEEN[1].load(SeqCst) == 0x11 && CONTROLLER_SEEN[2].load(SeqCst) == 0xABC0 && guest::read8(object + co::BUSY) == 1, "controller: livre executa ja com o CurrentIrp (KeepObject mantem ocupado)");
+    assert(calls() == 1 && CONTROLLER_SEEN[1].load(SeqCst) == 0x11 && CONTROLLER_SEEN[2].load(SeqCst) == 0xABC0 && wait_queue.busy.get() == 1 && !waiting(), "controller: livre executa ja com o CurrentIrp (KeepObject mantem ocupado)");
     controller::allocate(object, device, routine, 0x22);
-    assert(calls() == 1 && guest::read32(object + co::QUEUED) == 1, "controller: ocupado entra na fila");
+    assert(calls() == 1 && waiting(), "controller: ocupado entra na DeviceWaitQueue");
     controller::free(object);
-    assert(calls() == 2 && CONTROLLER_SEEN[1].load(SeqCst) == 0x22 && guest::read32(object + co::QUEUED) == 0 && guest::read8(object + co::BUSY) == 0, "controller: IoFreeController dispara o proximo");
-    CONTROLLER_SEEN[3].store(1, SeqCst);
+    assert(calls() == 2 && CONTROLLER_SEEN[1].load(SeqCst) == 0x22 && !waiting() && wait_queue.busy.get() == 1, "controller: IoFreeController dispara o proximo, que fica com o controlador (KeepObject)");
+    controller::free(object);
+    assert(calls() == 2 && wait_queue.busy.get() == 0, "controller: IoFreeController com a fila vazia libera");
+    CONTROLLER_SEEN[3].store(DEALLOCATE_OBJECT, SeqCst);
     controller::allocate(object, device, routine, 0x33);
-    assert(calls() == 3 && guest::read8(object + co::BUSY) == 0, "controller: DeallocateObject libera na hora");
+    assert(calls() == 3 && wait_queue.busy.get() == 0, "controller: DeallocateObject libera na hora");
     controller::delete(object);
     // StartIo com a KDEVICE_QUEUE do DEVICE_OBJECT.
     let driver = guest::alloc_bytes(0x160);
     guest::write_bytes(driver, &[0; 0x160]);
-    guest::write64(driver + driver_object::DRIVER_START_IO, test_start_io as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64);
-    guest::write_bytes(device, &[0; 0x150]);
-    guest::write64(device + device_object::DRIVER_OBJECT, driver);
+    unsafe { DriverObject::at(driver) }.driver_start_io.set(test_start_io as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64);
+    guest::write_bytes(device, &[0; DeviceObject::SIZE as usize]);
+    device_object.driver_object.set(driver);
     START_IO_ORDER.lock().clear();
-    let packets: alloc::vec::Vec<u64> = (0..4).map(|_| guest::alloc_bytes(0xD0)).collect();
+    let packets: alloc::vec::Vec<u64> = (0..4).map(|_| guest::alloc_bytes(Irp::SIZE)).collect();
+    let queue_entry = |index: usize| &unsafe { Irp::at(packets[index]) }.tail.overlay.device_queue_entry;
     let keys = guest::alloc_bytes(8);
     guest::write32(keys, 5);
     guest::write32(keys + 4, 2);
     start_io::start_packet(device, packets[0], 0, 0);
-    let queue = device + device_object::DEVICE_QUEUE;
-    assert(guest::read64(device + device_object::CURRENT_IRP) == packets[0] && guest::read8(queue + kdevice_queue::BUSY) == 1 && guest::read32(queue) == 0x14 | 0x28 << 16 && *START_IO_ORDER.lock() == alloc::vec![packets[0]], "startio: dispositivo livre roda o StartIo na hora");
+    let queue = &device_object.device_queue;
+    assert(device_object.current_irp.get() == packets[0] && queue.busy.get() == 1 && queue.type_.get() == 0x14 && queue.size.get() == 0x28 && *START_IO_ORDER.lock() == alloc::vec![packets[0]], "startio: dispositivo livre roda o StartIo na hora");
     start_io::start_packet(device, packets[1], keys, 0);
     start_io::start_packet(device, packets[2], keys + 4, 0);
     start_io::start_packet(device, packets[3], 0, 0);
-    assert(START_IO_ORDER.lock().len() == 1 && guest::read64(packets[3] + 0x80) == 0xFFFF_FFFF, "startio: ocupado entra na fila com a chave");
+    // KeInsertByKeyDeviceQueue grava a SortKey; sem chave o IRP entra no fim.
+    assert(START_IO_ORDER.lock().len() == 1 && queue_entry(1).sort_key.get() == 5 && queue_entry(2).sort_key.get() == 2 && (1..4).all(|index| queue_entry(index).inserted.get() == 1), "startio: ocupado entra na fila com a chave");
     for _ in 0..4 {
         start_io::start_next_packet(device, false);
     }
-    assert(*START_IO_ORDER.lock() == alloc::vec![packets[0], packets[2], packets[1], packets[3]] && guest::read64(device + device_object::CURRENT_IRP) == 0 && guest::read8(queue + kdevice_queue::BUSY) == 0, "startio: fila ordenada pela chave e esvaziada");
-    guest::write32(device + device_object::CHARACTERISTICS, 0x100);
+    assert(*START_IO_ORDER.lock() == alloc::vec![packets[0], packets[2], packets[1], packets[3]] && device_object.current_irp.get() == 0 && queue.busy.get() == 0 && (1..4).all(|index| queue_entry(index).inserted.get() == 0), "startio: fila ordenada pela chave e esvaziada");
+    device_object.characteristics.set(0x100);
     start_io::set_start_io_attributes(device, true, true);
-    let both = guest::read32(device + device_object::CHARACTERISTICS);
+    let both = device_object.characteristics.get();
     start_io::set_start_io_attributes(device, false, false);
-    assert(both == 0x3_0100 && guest::read32(device + device_object::CHARACTERISTICS) == 0x100, "startio: IoSetStartIoAttributes preserva os FILE_* baixos");
+    assert(both == 0x3_0100 && device_object.characteristics.get() == 0x100, "startio: IoSetStartIoAttributes preserva os FILE_* baixos");
     for pointer in packets.into_iter().chain([device, driver, keys]) {
         guest::free_bytes(pointer);
     }
@@ -810,7 +865,7 @@ fn io_file_lifetime(assert: Assert) {
     assert(matches!(life::request_delete(&file_system, path, 0), Ok(0xC000_0043)), "lifetime: exclusao bloqueada por handle sem FILE_SHARE_DELETE");
     let _ = files::close_handle(reader);
     let deleter = open(path, 0x1_0000, 7);
-    assert(matches!(life::request_delete(&file_system, path, deleter), Ok(0)) && guest::read8(deleter + 0x49) == 1 && matches!(volume.exists(path), Ok(true)) && life::validate_open(&file_system, path, 0x1, 7) == 0xC000_0056, "lifetime: DELETE_PENDING publicado no FILE_OBJECT");
+    assert(matches!(life::request_delete(&file_system, path, deleter), Ok(0)) && unsafe { crate::ntos::inc::types::FileObject::at(deleter) }.delete_pending.get() == 1 && matches!(volume.exists(path), Ok(true)) && life::validate_open(&file_system, path, 0x1, 7) == 0xC000_0056, "lifetime: DELETE_PENDING publicado no FILE_OBJECT");
     let _ = files::close_handle(deleter);
     assert(matches!(volume.exists(path), Ok(false)), "lifetime: remocao fisica no CLEANUP da ultima descricao");
     // SECTION de dados conserva os bytes depois da retirada do nome.
@@ -839,7 +894,6 @@ fn io_handles_and_volumes(assert: Assert) {
     use crate::ntos::ob::{close, object_manager, object_types, open_pointer};
     use crate::ntos::ob::objects::{device as device_objects, file as files};
     use crate::ntos::ob::handles::file as file_handles;
-    use crate::ntos::inc::nt_abi::{device_object, devobj_extension, vpb};
     // IoConvertFileHandleToKernelHandle.
     let file = files::create(0, "\\Phase4\\convert.txt").unwrap_or(0);
     let _ = files::open_handle(file);
@@ -865,21 +919,24 @@ fn io_handles_and_volumes(assert: Assert) {
     let _ = files::close_handle(file);
     let _ = files::dereference(file);
     // IoGetDiskDeviceObject pelo VPB do volume.
-    let storage = guest::alloc_bytes(device_object::STRUCT_SIZE);
-    guest::write64(storage + device_object::VPB, 0x1000);
+    /// `VPB_MOUNTED`.
+    const VPB_MOUNTED: u16 = 1;
+    let storage = guest::alloc_bytes(DeviceObject::SIZE);
+    unsafe { DeviceObject::at(storage) }.vpb.set(0x1000);
     assert(matches!(volumes::get_disk_device(storage, output), Ok(0xC000_000D)), "vpb: dispositivo de armazenamento recusado");
-    let file_system = guest::alloc_bytes(device_object::STRUCT_SIZE);
-    let extension = guest::alloc_bytes(devobj_extension::STRUCT_SIZE);
-    let volume = guest::alloc_bytes(vpb::STRUCT_SIZE);
-    guest::write64(file_system + device_object::DEVICE_OBJECT_EXTENSION, extension);
+    let file_system = guest::alloc_bytes(DeviceObject::SIZE);
+    let extension = guest::alloc_bytes(DevobjExtension::SIZE);
+    let volume = guest::alloc_bytes(Vpb::SIZE);
+    unsafe { DeviceObject::at(file_system) }.device_object_extension.set(extension);
     assert(matches!(volumes::get_disk_device(file_system, output), Ok(0xC000_000D)), "vpb: volume sem VPB");
-    guest::write64(extension + devobj_extension::VPB, volume);
+    unsafe { DevobjExtension::at(extension) }.vpb.set(volume);
     assert(matches!(volumes::get_disk_device(file_system, output), Ok(0xC000_026E)), "vpb: volume nao montado");
-    let disk = guest::alloc_bytes(device_object::STRUCT_SIZE);
+    let disk = guest::alloc_bytes(DeviceObject::SIZE);
     let _ = device_objects::register(disk, None, None);
-    guest::write32(volume + vpb::REFERENCE_COUNT, 1);
-    guest::write16(volume + vpb::FLAGS, vpb::MOUNTED as u16);
-    guest::write64(volume + vpb::REAL_DEVICE, disk);
+    let vpb = unsafe { Vpb::at(volume) };
+    vpb.reference_count.set(1);
+    vpb.flags.set(VPB_MOUNTED);
+    vpb.real_device.set(disk);
     let before = device_objects::reference_count(disk).unwrap_or(0);
     assert(matches!(volumes::get_disk_device(file_system, output), Ok(0)) && guest::read64(output) == disk && device_objects::reference_count(disk) == Some(before + 1), "vpb: disco real com referencia do Ob");
     let _ = device_objects::dereference(disk);
@@ -920,12 +977,13 @@ fn io_packets_and_transfer(assert: Assert) {
     use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
     // Mini pacotes de conclusão com cache limitado.
     packets::trim();
+    let packet_type = |packet: u64| unsafe { IoMiniCompletionPacketUser::at(packet) }.packet_type.get();
     let first = packets::allocate(false);
-    assert(first != 0 && guest::read8(first + 0x10) == 1 && packets::release(first).is_ok() && packets::is_cached(first) && packets::release(first).is_err(), "packets: bloco devolvido ao cache uma unica vez");
+    assert(first != 0 && packet_type(first) == 1 && packets::release(first).is_ok() && packets::is_cached(first) && packets::release(first).is_err(), "packets: bloco devolvido ao cache uma unica vez");
     let reused = packets::allocate(true);
-    assert(reused == first && guest::read8(reused + 0x10) == 1 && packets::cached_count() == 0, "packets: bloco do cache sem nova cobranca");
+    assert(reused == first && packet_type(reused) == 1 && packets::cached_count() == 0, "packets: bloco do cache sem nova cobranca");
     let charged = packets::allocate(true);
-    assert(charged != 0 && guest::read8(charged + 0x10) == 3 && packets::release(charged).is_ok() && packets::release(reused).is_ok() && packets::cached_count() == 2, "packets: pacote cobrado (tipo 3) tambem volta ao cache");
+    assert(charged != 0 && packet_type(charged) == 3 && packets::release(charged).is_ok() && packets::release(reused).is_ok() && packets::cached_count() == 2, "packets: pacote cobrado (tipo 3) tambem volta ao cache");
     let many: alloc::vec::Vec<u64> = (0..20).map(|_| packets::allocate(false)).collect();
     for &packet in &many {
         let _ = packets::release(packet);
@@ -935,15 +993,16 @@ fn io_packets_and_transfer(assert: Assert) {
     assert(packets::cached_count() == 0, "packets: trim libera os ociosos");
     // Pacotes de usuário (tipo 4).
     let user = kernel_pool::allocate(packets::USER_PACKET_BYTE_LENGTH, AllocateOptions { tag: packets::PACKET_TAG, zero: true, ..Default::default() }).unwrap_or(0);
-    guest::write8(user + 0x10, 4);
-    guest::write64(user + 0x38, test_packet_callback as extern "win64" fn(u64, u64) -> u64 as usize as u64);
-    guest::write64(user + 0x40, 0xC0DE);
+    let user_packet = unsafe { IoMiniCompletionPacketUser::at(user) };
+    user_packet.packet_type.set(4);
+    user_packet.mini_packet_callback.set(test_packet_callback as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    user_packet.context.set(0xC0DE);
     assert(packets::release(user).is_ok() && PACKET_CALLBACK[0].load(core::sync::atomic::Ordering::SeqCst) == user && PACKET_CALLBACK[1].load(core::sync::atomic::Ordering::SeqCst) == 0xC0DE && kernel_pool::info(user).is_some(), "packets: callback do usuario recebe a posse");
-    guest::write64(user + 0x38, 0);
-    guest::write8(user + 0x48, 1);
+    user_packet.mini_packet_callback.set(0);
+    user_packet.allocated.set(1);
     assert(packets::release(user).is_ok() && kernel_pool::info(user).is_none(), "packets: Allocated devolve o bloco ao pool");
-    let invalid = guest::alloc_bytes(0x40);
-    guest::write8(invalid + 0x10, 7);
+    let invalid = guest::alloc_bytes(IoMiniCompletionPacketUser::SIZE);
+    unsafe { IoMiniCompletionPacketUser::at(invalid) }.packet_type.set(7);
     assert(packets::release(invalid).is_err(), "packets: tipo invalido recusado");
     guest::free_bytes(invalid);
     // Transferência de arquivo para o buffer do chamador.
@@ -990,8 +1049,9 @@ fn etw_firmware_and_telemetry(assert: Assert) {
     guest::write_bytes(guid, &[0x11; 16]);
     let output = guest::alloc_bytes(16);
     let descriptor = guid + 0x20;
-    guest::write8(descriptor + 4, 4); // Level
-    guest::write64(descriptor + 8, 0x10); // Keyword
+    let event_descriptor = unsafe { EventDescriptor::at(descriptor) };
+    event_descriptor.level.set(4);
+    event_descriptor.keyword.set(0x10);
     let (registrations, guids, sessions) = etw::statistics();
     assert(matches!(etw::register(guid, 0, 0x1234, output, false), Ok(0xC000_000D)) && guest::read64(output) == 0, "etw: contexto sem callback recusado");
     let reserved = guid + 0x40;
@@ -1006,15 +1066,16 @@ fn etw_firmware_and_telemetry(assert: Assert) {
         slot.store(0, SeqCst);
     }
     let session = etw::open_session(alloc::sync::Arc::new(|event: &etw::Event| ETW_EVENTS.lock().push(event.clone())), Some(0), None).unwrap_or(0);
-    assert(session != 0 && etw::enable(session, guid, etw::EnableOptions::default()).is_ok() && event_enabled::query(plain, descriptor) == 1 && guest::read8(plain + 0x64) == 1, "etw: sessao habilita o provedor (mascara de slots)");
+    assert(session != 0 && etw::enable(session, guid, etw::EnableOptions::default()).is_ok() && event_enabled::query(plain, descriptor) == 1 && unsafe { EtwRegEntry::at(plain) }.enable_mask.get() == 1, "etw: sessao habilita o provedor (mascara de slots)");
     let callback = test_etw_enable as extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
     assert(matches!(etw::register(guid, callback, 0xC0DE, output, false), Ok(0)) && ETW_CALLBACK[0].load(SeqCst) == 1 && ETW_CALLBACK[1].load(SeqCst) == 1 && ETW_CALLBACK[2].load(SeqCst) == 255 && ETW_CALLBACK[3].load(SeqCst) == 0xC0DE, "etw: registro habilitado chama o callback na hora");
     let notified = guest::read64(output);
     // EtwWrite entrega cópias dos dados à sessão.
     let data = guid + 0x60;
     guest::write_bytes(guid + 0x50, b"etw!");
-    guest::write64(data, guid + 0x50);
-    guest::write32(data + 8, 4);
+    let data_descriptor = unsafe { EventDataDescriptor::at(data) };
+    data_descriptor.ptr.set(guid + 0x50);
+    data_descriptor.size.set(4);
     assert(matches!(etw::write(plain, descriptor, 0, 0, 1, data), Ok(0)) && ETW_EVENTS.lock().len() == 1 && ETW_EVENTS.lock()[0].data == alloc::vec![b"etw!".to_vec()] && ETW_EVENTS.lock()[0].provider == [0x11; 16] && etw::delivered(session) == Some(1), "etw: EtwWrite entrega o evento ao consumidor");
     assert(matches!(etw::write(plain, descriptor, 0, 0, 129, data), Ok(0xC000_000D)), "etw: descritores demais");
     assert(etw::enable(session, guid, etw::EnableOptions { level: 2, ..Default::default() }).is_ok() && ETW_CALLBACK[2].load(SeqCst) == 2 && matches!(etw::write(plain, descriptor, 0, 0, 1, data), Ok(0)) && ETW_EVENTS.lock().len() == 1, "etw: nivel acima do habilitado nao entrega");
