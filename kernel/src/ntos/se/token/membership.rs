@@ -7,6 +7,7 @@ use crate::ntos::ob::{object_types, open_pointer};
 use crate::ntos::ps::{previous_mode, process};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::se::{out, sid};
 
 /// A consulta sem flags usa a mesma ACL de membership Ex com flags zero.
 pub fn contains(token: u64, identifier: Option<&[u8]>) -> bool {
@@ -19,8 +20,9 @@ pub fn read_security_identifier(pointer: u64) -> Option<Vec<u8>> {
     if pointer <= 0x7FFF_FFFF_0000 {
         return None;
     }
-    let count = guest::read8(pointer + 1);
-    if guest::read8(pointer) & 15 != 1 || count > 15 {
+    let identifier = sid::at(pointer);
+    let count = identifier.sub_authority_count.get();
+    if identifier.revision.get() & 15 != 1 || count > 15 {
         return None;
     }
     Some(guest::read_bytes(pointer, 8 + count as usize * 4))
@@ -107,14 +109,14 @@ pub fn with_token(handle: u64, evaluate: impl FnOnce(u64, &Context) -> Result<u3
 /// Membership num BOOLEAN. KernelMode conserva a regra medida no
 /// SeAccessCheck original; UserMode verifica a ACL e a impersonação.
 pub fn check(handle: u64, sid_pointer: u64, output: u64) -> Result<u32, KernelError> {
-    guest::write8(output, 0);
+    out::<u8>(output).set(0);
     with_token(handle, |token, context| {
         let identifier = read_security_identifier(sid_pointer);
         if context.previous_mode != 0 && context.client_level.is_some_and(|level| level < 2) {
             return Ok(0xC000_00A5);
         }
         if context.previous_mode == 0 || contains(token, identifier.as_deref()) {
-            guest::write8(output, 1);
+            out::<u8>(output).set(1);
         }
         Ok(0)
     })

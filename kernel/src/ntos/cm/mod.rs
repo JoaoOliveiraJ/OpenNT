@@ -2,6 +2,16 @@
 //!
 //! Hive em memória, objetos de chave, serviços e provedores de boot.
 
+use crate::ntos::inc::types::{Field, NtStruct};
+
+/// Célula escalar passada por ponteiro (PULONG, PBOOLEAN, PHANDLE, PVOID*,
+/// globais de dado): a célula no endereço, como `*Saida = valor` no C.
+pub(crate) fn out<T: Copy>(address: u64) -> &'static Field<T> {
+    // SAFETY: o export recebe um ponteiro de saída vivo e alinhado ao tipo,
+    // como o NT; ponteiros de modo usuário usam `probe_get`/`probe_set`.
+    unsafe { Field::<T>::at(address) }
+}
+
 pub mod callbacks;
 pub mod check_registry_key;
 pub mod cng_defaults;

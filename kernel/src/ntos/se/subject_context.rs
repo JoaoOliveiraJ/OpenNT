@@ -4,16 +4,15 @@
 //! O subject context retém o token primário do processo e o token opcional
 //! de impersonação da thread; a liberação devolve essas referências.
 
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, SecurityImpersonationLevel, SecuritySubjectContext};
 use crate::ntos::ps::process;
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 use crate::rtl::{KernelError, SpinLock};
 
-// SECURITY_SUBJECT_CONTEXT (wdm.h x64, 0x20 bytes).
-pub const CLIENT_TOKEN: u64 = 0x00;
-pub const IMPERSONATION_LEVEL: u64 = 0x08;
-pub const PRIMARY_TOKEN: u64 = 0x10;
-pub const PROCESS_AUDIT_ID: u64 = 0x18;
+fn context_at(context: u64) -> &'static SecuritySubjectContext {
+    // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador (Se{Capture,Release}SubjectContext).
+    unsafe { SecuritySubjectContext::at(context) }
+}
 
 /// Estado de bloqueio do adaptador e profundidade de aninhamento.
 struct SubjectLock {
@@ -57,25 +56,27 @@ pub fn capture(context: u64) -> Result<(), KernelError> {
     if let Some(impersonation) = &impersonation {
         reference_token(impersonation.token)?;
     }
-    guest::write64(context + CLIENT_TOKEN, impersonation.as_ref().map_or(0, |impersonation| impersonation.token));
-    guest::write64(context + PRIMARY_TOKEN, token);
-    guest::write32(context + IMPERSONATION_LEVEL, impersonation.as_ref().map_or(0, |impersonation| impersonation.level));
-    guest::write64(context + PROCESS_AUDIT_ID, process::get_current_process_id());
+    let context = context_at(context);
+    context.client_token.set(impersonation.as_ref().map_or(0, |impersonation| impersonation.token));
+    context.primary_token.set(token);
+    context.impersonation_level.set(SecurityImpersonationLevel(impersonation.as_ref().map_or(0, |impersonation| impersonation.level) as i32));
+    context.process_audit_id.set(process::get_current_process_id());
     Ok(())
 }
 
 /// SeReleaseSubjectContext: devolve as referências capturadas.
 pub fn release(context: u64) -> Result<(), KernelError> {
-    let primary = guest::read64(context + PRIMARY_TOKEN);
-    let client = guest::read64(context + CLIENT_TOKEN);
+    let context = context_at(context);
+    let primary = context.primary_token.get();
+    let client = context.client_token.get();
     if primary != 0 {
         dereference_token(primary)?;
     }
     if client != 0 {
         dereference_token(client)?;
     }
-    guest::write64(context + PRIMARY_TOKEN, 0);
-    guest::write64(context + CLIENT_TOKEN, 0);
+    context.primary_token.set(0);
+    context.client_token.set(0);
     Ok(())
 }
 

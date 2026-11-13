@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, UnicodeString};
 
 const HEADER_SIZE: usize = 0x3C;
 const REGISTRY_RULE_SIZE: usize = 16;
@@ -52,11 +53,13 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 /// QWORDs iguais como caminho rápido, depois WCHARs convertendo só a..z
 /// ASCII. MaximumLength não participa.
 fn equal_policy_name(descriptor: u64, bytes: &[u8], name_offset: usize) -> bool {
-    let length = guest::read16(descriptor) as usize;
+    // SAFETY: PCUNICODE_STRING do chamador.
+    let descriptor = unsafe { UnicodeString::at(descriptor) };
+    let length = descriptor.length.get() as usize;
     if length != u16_at(bytes, name_offset) as usize {
         return false;
     }
-    let buffer = guest::read64(descriptor + 8);
+    let buffer = descriptor.buffer.get();
     let text = name_offset + 2;
     let mut offset = 0usize;
     while offset + 8 <= length {
@@ -148,7 +151,7 @@ impl Captured {
             if !rule.supported {
                 return 0xC000_0002;
             }
-            guest::write32(returned_length, rule.data_length);
+            super::out::<u32>(returned_length).set(rule.data_length);
             if buffer == 0 {
                 return 0;
             }

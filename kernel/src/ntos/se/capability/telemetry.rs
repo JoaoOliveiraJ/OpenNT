@@ -8,6 +8,7 @@ use crate::ntos::ke::clock;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::rtl::SpinLock;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{EventDataDescriptor, EventDescriptor, NtStruct};
 
 /// Metadados TraceLogging do contrato original: GUID, nome do provedor e a
 /// descrição dos cinco campos, com os comprimentos do helper nativo medido.
@@ -27,11 +28,12 @@ struct State {
 static STATE: SpinLock<State> = SpinLock::new(State { initialized: false, registration: 0, metadata: 0, frequency: 0, remaining: 1 });
 
 fn write_hex(pointer: u64, text: &str) {
-    let bytes = text.as_bytes();
-    for index in (0..bytes.len()).step_by(2) {
-        let value = u8::from_str_radix(core::str::from_utf8(&bytes[index..index + 2]).unwrap_or("00"), 16).unwrap_or(0);
-        guest::write8(pointer + index as u64 / 2, value);
-    }
+    let bytes: alloc::vec::Vec<u8> = text
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap_or("00"), 16).unwrap_or(0))
+        .collect();
+    guest::write_bytes(pointer, &bytes);
 }
 
 /// RunOnce: o inicializador original conclui mesmo se o registro ETW falhar.
@@ -46,9 +48,11 @@ fn initialize() {
         write_hex(metadata, PROVIDER_IDENTIFIER);
         write_hex(metadata + 32, PROVIDER_METADATA);
         write_hex(metadata + 96, EVENT_METADATA);
-        guest::write8(metadata + 19, 11); // Channel do EVENT_DESCRIPTOR
-        guest::write8(metadata + 20, 5); // TRACE_LEVEL_VERBOSE
-        guest::write64(metadata + 24, 0x2000_0000_0000);
+        // SAFETY: EVENT_DESCRIPTOR logo depois do GUID no bloco privado.
+        let descriptor = unsafe { EventDescriptor::at(metadata + 16) };
+        descriptor.channel.set(11);
+        descriptor.level.set(5); // TRACE_LEVEL_VERBOSE
+        descriptor.keyword.set(0x2000_0000_0000);
         match providers::register(metadata, 0, 0, metadata + 240, false) {
             Ok(0) => registration = guest::read64(metadata + 240),
             _ => {
@@ -95,11 +99,13 @@ pub fn record(start: u64, end: u64, administrator: u8, interactive: u8, admin_ca
                 (frame + 122, 1, 0),
                 (frame + 123, 1, 0),
             ];
-            for (index, (pointer, size, kind)) in segments.iter().enumerate() {
-                let descriptor = frame + index as u64 * 16;
-                guest::write64(descriptor, *pointer);
-                guest::write32(descriptor + 8, *size);
-                guest::write32(descriptor + 12, *kind);
+            // SAFETY: vetor de EVENT_DATA_DESCRIPTOR no início do frame privado.
+            let descriptors = unsafe { EventDataDescriptor::array_at(frame, segments.len()) };
+            for (descriptor, (pointer, size, kind)) in descriptors.iter().zip(segments.iter()) {
+                descriptor.ptr.set(*pointer);
+                descriptor.size.set(*size);
+                // Type do TraceLogging no byte baixo de Reserved.
+                descriptor.reserved.set(*kind);
             }
             let _ = providers::write(registration, metadata + 16, 0, 0, segments.len() as u32, frame);
             let _ = kernel_pool::free(frame, None);

@@ -7,6 +7,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use crate::ntos::se::model::{sid, Ace, Group, Privilege, SecurityPolicy, Sid};
 use crate::ntos::se::security_attributes::{self, SecurityAttribute};
@@ -14,6 +15,61 @@ use crate::ntos::ob::object_types;
 use crate::ntos::inc::status::{STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, Luid, NtStruct, Reserved};
+
+/// Corpo nativo do objeto token: layout do OpenNT, não o `_TOKEN` do NT. O
+/// estado do token vive no registro [`Token`]; o corpo só publica o que o
+/// kernel lê por endereço: AuthenticationId (SeQueryAuthenticationIdToken),
+/// TokenId e TokenFlags. TokenFlags fica no mesmo offset do `_TOKEN` (0xC8)
+/// porque RtlpIsAppContainer o lê direto do corpo, como no NT.
+#[repr(C)]
+pub struct TokenBody {
+    pub authentication_id: Luid,
+    pub token_id: Luid,
+    _reserved_10: Reserved<0xB8>,
+    pub token_flags: Field<u32>,
+    _reserved_cc: Reserved<0x34>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for TokenBody {}
+
+const _: () = {
+    assert!(core::mem::size_of::<TokenBody>() == 0x100);
+    assert!(offset_of!(TokenBody, token_id) == 0x8);
+    assert!(offset_of!(TokenBody, token_flags) == 0xC8);
+};
+
+/// TOKEN_LOWBOX em TokenFlags: token de AppContainer.
+const TOKEN_LOWBOX: u32 = 0x4000;
+
+fn set_luid(luid: &Luid, value: u64) {
+    luid.low_part.set(value as u32);
+    luid.high_part.set((value >> 32) as i32);
+}
+
+pub fn luid_value(luid: &Luid) -> u64 {
+    luid.low_part.get() as u64 | (luid.high_part.get() as u32 as u64) << 32
+}
+
+/// O corpo nativo de um token vivo.
+pub fn body(pointer: u64) -> &'static TokenBody {
+    // SAFETY: corpo de 0x100 bytes alocado por `create` e vivo enquanto o
+    // registro existir.
+    unsafe { TokenBody::at(pointer) }
+}
+
+/// Publica no corpo os campos lidos por endereço: identidade e o bit LowBox
+/// (os demais bits de TokenFlags são preservados).
+fn publish_body(token: &Token) {
+    let body = body(token.pointer);
+    set_luid(&body.authentication_id, token.authentication_id);
+    set_luid(&body.token_id, token.id);
+    let lowbox = if token.app_container.is_some() { TOKEN_LOWBOX } else { 0 };
+    let _ = body.token_flags.atomic().try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |flags| {
+        Some(flags & !TOKEN_LOWBOX | lowbox)
+    });
+}
 
 #[derive(Clone, Debug)]
 pub struct Token {
@@ -84,7 +140,9 @@ pub fn allocate_luid_into(output: u64) -> u32 {
         return STATUS_ACCESS_VIOLATION;
     }
     let luid = allocate_luid();
-    if guest::try_write32(output, luid as u32).and_then(|_| guest::try_write32(output + 4, (luid >> 32) as u32)).is_err() {
+    let low = output + offset_of!(Luid, low_part) as u64;
+    let high = output + offset_of!(Luid, high_part) as u64;
+    if guest::try_write(low, luid as u32).and_then(|_| guest::try_write(high, (luid >> 32) as u32)).is_err() {
         return STATUS_ACCESS_VIOLATION;
     }
     0
@@ -152,7 +210,7 @@ pub fn accounting(token_pointer: u64) -> Result<(u64, u64), KernelError> {
 /// fica acessível depois de publicar os campos nativos e a referência inicial.
 pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> Result<u64, KernelError> {
     let object_type = object_types::token_type();
-    let pointer = guest::alloc_bytes(0x100);
+    let pointer = guest::alloc_bytes(TokenBody::SIZE);
     if pointer == 0 {
         return Err(KernelError::with_status("Token allocation failed", STATUS_INSUFFICIENT_RESOURCES));
     }
@@ -217,8 +275,7 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         guest::free_bytes(pointer);
         return Err(error);
     }
-    guest::write64(pointer, token.authentication_id);
-    guest::write64(pointer + 8, token.id);
+    publish_body(&token);
     tokens.records.insert(pointer, token);
     drop(tokens);
     object_types::account(&object_type.name, 1, 0)?;
@@ -275,9 +332,13 @@ pub fn with<T>(pointer: u64, body: impl FnOnce(&Token) -> T) -> Option<T> {
     TOKENS.lock().records.get(&pointer).map(body)
 }
 
-/// Altera o registro vivo.
-pub fn update<T>(pointer: u64, body: impl FnOnce(&mut Token) -> T) -> Option<T> {
-    TOKENS.lock().records.get_mut(&pointer).map(body)
+/// Altera o registro vivo e republica o corpo nativo.
+pub fn update<T>(pointer: u64, change: impl FnOnce(&mut Token) -> T) -> Option<T> {
+    TOKENS.lock().records.get_mut(&pointer).map(|token| {
+        let result = change(token);
+        publish_body(token);
+        result
+    })
 }
 
 /// Interface por endereço: nova contagem, ou `None` sem objeto.

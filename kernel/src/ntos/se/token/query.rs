@@ -67,7 +67,9 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
         if !writable(returned, 4, from_user_mode) {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
-        guest::write32(returned, 56);
+        if guest::try_write::<u32>(returned, 56).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
         if length < 56 {
             return Ok(0xC000_0023);
         }
@@ -77,10 +79,10 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
             if !writable(destination, width as u64, from_user_mode) {
                 return Ok(STATUS_ACCESS_VIOLATION);
             }
-            if width == 8 {
-                guest::write64(destination, value);
-            } else {
-                guest::write32(destination, value as u32);
+            // TOKEN_STATISTICS na saída do chamador (sondada campo a campo).
+            let written = if width == 8 { guest::try_write::<u64>(destination, value) } else { guest::try_write::<u32>(destination, value as u32) };
+            if written.is_err() {
+                return Ok(STATUS_ACCESS_VIOLATION);
             }
         }
         Ok(0)

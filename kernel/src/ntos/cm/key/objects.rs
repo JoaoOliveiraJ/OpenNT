@@ -12,6 +12,7 @@ use crate::ntos::ob::object_types;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{CmKeyBody, NtStruct};
 
 pub const BODY_SIZE: u64 = 104;
 
@@ -44,8 +45,9 @@ fn create_body(node: NodeId, path: &str) -> Option<u64> {
     if pointer == 0 {
         return None;
     }
-    // +24: identificador do processo criador; o resto permanece opaco.
-    guest::write64(pointer + 24, process::get_current_process_id());
+    // ProcessID do processo criador; o resto do CM_KEY_BODY permanece opaco.
+    // SAFETY: corpo próprio recém-alocado com sizeof(CM_KEY_BODY).
+    unsafe { CmKeyBody::at(pointer) }.process_id.set(process::get_current_process_id());
     let key_type = object_types::key_type();
     if object_types::bind_native(pointer, &key_type.name).is_err() {
         guest::free_bytes(pointer);

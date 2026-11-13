@@ -18,6 +18,8 @@ use crate::ntos::se::model::sid;
 use crate::ntos::se::security_attributes;
 use crate::ntos::se::token::statistics;
 use crate::ntos::se::token::tokens::{self, Token};
+use crate::ntos::inc::types::{NtStruct, UnicodeString};
+use crate::ntos::se::out;
 use crate::rtl::KernelError;
 
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
@@ -122,7 +124,7 @@ pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, Ker
         _ => unreachable!(),
     };
     guest::write_bytes(base, &bytes);
-    guest::write64(output, base);
+    out::<u64>(output).set(base);
     Ok(0)
 }
 
@@ -133,7 +135,7 @@ pub fn query_authentication_id(token: u64, output: u64) -> u32 {
     if tokens::get(token).is_none() {
         return STATUS_INVALID_HANDLE;
     }
-    guest::write64(output, guest::read64(token));
+    out::<u64>(output).set(tokens::luid_value(&tokens::body(token).authentication_id));
     0
 }
 
@@ -198,7 +200,7 @@ pub fn query_security_attributes_access_information(token: u64, output: u64) -> 
             return status;
         }
     }
-    guest::write64(output, base);
+    out::<u64>(output).set(base);
     0
 }
 
@@ -212,12 +214,14 @@ pub fn security_attribute_present(token: u64, name_pointer: u64) -> Result<bool,
         return Ok(false);
     }
     // UNICODE_STRING: Length@0 (USHORT), Buffer@8 (PWSTR).
-    let length = guest::read16(name_pointer) as u64;
-    let buffer = guest::read64(name_pointer + 8);
+    // SAFETY: PUNICODE_STRING do chamador.
+    let name = unsafe { UnicodeString::at(name_pointer) };
+    let length = name.length.get() as u64;
+    let buffer = name.buffer.get();
     if length == 0 || buffer == 0 || length & 1 != 0 {
         return Ok(false);
     }
-    let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let units: Vec<u16> = guest::read_bytes(buffer, length as usize).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
     let name = String::from_utf16_lossy(&units);
     let present = security_attributes::select(&record.security_attributes, Some(&[name]))?.is_some();
     Ok(present)

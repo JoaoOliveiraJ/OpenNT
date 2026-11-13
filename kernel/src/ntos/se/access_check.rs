@@ -12,15 +12,18 @@
 //! objeto token.
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
+use crate::ntos::inc::types::{
+    AccessAllowedAce, AceHeader, Acl, GenericMapping, NtStruct, SecurityImpersonationLevel, SecuritySubjectContext,
+    SidAndAttributes, SidAndAttributesHash, TokenAccessInformation,
+};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::se::descriptor;
 use crate::ntos::se::model::Sid;
-use crate::ntos::se::subject_context::{CLIENT_TOKEN, IMPERSONATION_LEVEL, PRIMARY_TOKEN};
 use crate::ntos::se::token::tokens;
+use crate::ntos::se::{descriptor, out, sid};
 
-// SECURITY_IMPERSONATION_LEVEL: SecurityImpersonation.
-const SECURITY_IMPERSONATION: u32 = 2;
+const SECURITY_IMPERSONATION: SecurityImpersonationLevel = SecurityImpersonationLevel::SECURITY_IMPERSONATION;
 
 // ACCESS_MASK bits.
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
@@ -50,7 +53,7 @@ struct Subject {
 
 /// Lê um SID do convidado (cabeçalho de 8 bytes + 4 por subautoridade).
 fn read_sid(pointer: u64) -> Sid {
-    let count = guest::read8(pointer.wrapping_add(1)) as usize;
+    let count = sid::at(pointer).sub_authority_count.get() as usize;
     guest::read_bytes(pointer, 8 + 4 * count)
 }
 
@@ -58,27 +61,33 @@ fn read_sid(pointer: u64) -> Sid {
 /// do chamador (Read/Write/Execute/All em 0/4/8/12) e os remove.
 fn map_generic(mut mask: u32, mapping: u64) -> u32 {
     if mapping != 0 {
+        let mapping = generic_mapping(mapping);
         if mask & 0x8000_0000 != 0 {
-            mask |= guest::read32(mapping);
+            mask |= mapping.generic_read.get();
         }
         if mask & 0x4000_0000 != 0 {
-            mask |= guest::read32(mapping + 4);
+            mask |= mapping.generic_write.get();
         }
         if mask & 0x2000_0000 != 0 {
-            mask |= guest::read32(mapping + 8);
+            mask |= mapping.generic_execute.get();
         }
         if mask & 0x1000_0000 != 0 {
-            mask |= guest::read32(mapping + 12);
+            mask |= mapping.generic_all.get();
         }
     }
     mask & !GENERIC_MASK
+}
+
+fn generic_mapping(mapping: u64) -> &'static GenericMapping {
+    // SAFETY: PGENERIC_MAPPING do chamador de SeAccessCheck.
+    unsafe { GenericMapping::at(mapping) }
 }
 
 /// Conjunto "todo o acesso" para MAXIMUM_ALLOWED: GenericAll do mapeamento
 /// mais os direitos padrão.
 fn all_access(mapping: u64) -> u32 {
     if mapping != 0 {
-        guest::read32(mapping + 12) | STANDARD_RIGHTS_ALL
+        generic_mapping(mapping).generic_all.get() | STANDARD_RIGHTS_ALL
     } else {
         STANDARD_RIGHTS_ALL | 0x1FF
     }
@@ -86,10 +95,10 @@ fn all_access(mapping: u64) -> u32 {
 
 fn write_result(granted_out: u64, status_out: u64, granted: u32, status: u32) {
     if granted_out != 0 {
-        guest::write32(granted_out, granted);
+        out::<u32>(granted_out).set(granted);
     }
     if status_out != 0 {
-        guest::write32(status_out, status);
+        out::<u32>(status_out).set(status);
     }
 }
 
@@ -122,17 +131,20 @@ fn evaluate(descriptor: u64, subject: &Subject) -> Option<u32> {
         return None;
     }
     let mut denied = 0u32;
-    let count = guest::read16(dacl + 4);
-    let mut cursor = dacl + 8;
+    // SAFETY: componente DACL do descritor (PACL alinhada a WORD).
+    let count = unsafe { Acl::at(dacl) }.ace_count.get();
+    let mut cursor = dacl + Acl::SIZE;
+    // A DACL não é revalidada aqui: com um AceSize ímpar a entrada seguinte
+    // fica desalinhada, então os campos são lidos pelo offset do layout.
     for _ in 0..count {
-        let ace_type = guest::read8(cursor);
-        let ace_size = guest::read16(cursor + 2) as u64;
+        let ace_type = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_type) as u64);
+        let ace_size = guest::read::<u16>(cursor + offset_of!(AceHeader, ace_size) as u64) as u64;
         if ace_size == 0 {
             break;
         }
         if ace_type == ACCESS_ALLOWED_ACE_TYPE || ace_type == ACCESS_DENIED_ACE_TYPE {
-            let mask = guest::read32(cursor + 4);
-            let ace_sid = read_sid(cursor + 8);
+            let mask = guest::read::<u32>(cursor + offset_of!(AccessAllowedAce, mask) as u64);
+            let ace_sid = read_sid(cursor + offset_of!(AccessAllowedAce, sid_start) as u64);
             let deny = ace_type == ACCESS_DENIED_ACE_TYPE;
             let matches = ace_sid == subject.user
                 || subject.groups.iter().any(|(sid, attributes)| {
@@ -200,7 +212,7 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
     let mut desired = desired;
     // Sem caminho de concessão por privilégio: nenhum privilégio foi usado.
     if privileges_out != 0 {
-        guest::write64(privileges_out, 0);
+        out::<u64>(privileges_out).set(0);
     }
     if mode == 0 {
         return kernel_grant(desired, previous, mapping, granted_out, status_out);
@@ -214,15 +226,17 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
     }
     // Token efetivo: ClientToken ao personificar (>= Impersonation), senão
     // PrimaryToken. Personificação fraca com ClientToken nega.
-    let client = guest::read64(subject_context + CLIENT_TOKEN);
+    // SAFETY: PSECURITY_SUBJECT_CONTEXT capturado pelo chamador.
+    let context = unsafe { SecuritySubjectContext::at(subject_context) };
+    let client = context.client_token.get();
     let token = if client != 0 {
-        if guest::read32(subject_context + IMPERSONATION_LEVEL) < SECURITY_IMPERSONATION {
+        if context.impersonation_level.get().0 < SECURITY_IMPERSONATION.0 {
             write_result(granted_out, status_out, 0, STATUS_BAD_IMPERSONATION_LEVEL);
             return false;
         }
         client
     } else {
-        guest::read64(subject_context + PRIMARY_TOKEN)
+        context.primary_token.get()
     };
     let subject = tokens::with(token, |token| Subject {
         user: token.user.clone(),
@@ -238,21 +252,24 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
     if information == 0 {
         return None;
     }
-    let hash = guest::read64(information);
+    // SAFETY: PTOKEN_ACCESS_INFORMATION capturado pelo chamador.
+    let hash = unsafe { TokenAccessInformation::at(information) }.sid_hash.get();
     if hash == 0 {
         return None;
     }
-    let count = guest::read32(hash);
-    let array = guest::read64(hash + 8);
+    // SAFETY: SidHash aponta para o SID_AND_ATTRIBUTES_HASH do mesmo bloco.
+    let hash = unsafe { SidAndAttributesHash::at(hash) };
+    let count = hash.sid_count.get();
+    let array = hash.sid_attr.get();
     if array == 0 || count == 0 {
         return None;
     }
     let mut sids: Vec<(Sid, u32)> = Vec::new();
-    for index in 0..count as u64 {
-        let entry = array + index * 0x10;
-        let sid = guest::read64(entry);
+    // SAFETY: SidAttr tem SidCount entradas.
+    for entry in unsafe { SidAndAttributes::array_at(array, count as usize) } {
+        let sid = entry.sid.get();
         if sid != 0 {
-            sids.push((read_sid(sid), guest::read32(entry + 8)));
+            sids.push((read_sid(sid), entry.attributes.get()));
         }
     }
     if sids.is_empty() {
@@ -269,7 +286,7 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
 pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: u64, desired: u32, previous: u32, privileges_out: u64, mapping: u64, mode: u32, granted_out: u64, status_out: u64) -> bool {
     let mut desired = desired;
     if privileges_out != 0 {
-        guest::write64(privileges_out, 0);
+        out::<u64>(privileges_out).set(0);
     }
     if mode == 0 {
         return kernel_grant(desired, previous, mapping, granted_out, status_out);
@@ -281,9 +298,10 @@ pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: 
     if desired & GENERIC_MASK != 0 {
         desired = map_generic(desired, mapping);
     }
-    // ImpersonationLevel@0x24 do TOKEN_ACCESS_INFORMATION do cliente.
+    // ImpersonationLevel do TOKEN_ACCESS_INFORMATION do cliente.
     let information = if client_info != 0 {
-        if guest::read32(client_info + 0x24) < SECURITY_IMPERSONATION {
+        // SAFETY: PTOKEN_ACCESS_INFORMATION do chamador.
+        if unsafe { TokenAccessInformation::at(client_info) }.impersonation_level.get().0 < SECURITY_IMPERSONATION.0 {
             write_result(granted_out, status_out, 0, STATUS_BAD_IMPERSONATION_LEVEL);
             return false;
         }

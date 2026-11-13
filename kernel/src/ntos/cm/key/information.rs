@@ -44,8 +44,10 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
     let name: Vec<u16> = if class == 3 { absolute_path.encode_utf16().collect() } else { key.name.encode_utf16().collect() };
     let header = [16usize, 24, 44, 4, 40].get(class as usize).copied().unwrap_or(4);
     let required = header + if matches!(class, 0 | 1 | 3) { name.len() * 2 } else { 0 };
-    if output_length != 0 {
-        guest::write32(output_length, required as u32);
+    // ResultLength e o buffer podem ser de modo usuário (sondados pelo
+    // serviço): escritas sondadas, falha = STATUS_ACCESS_VIOLATION.
+    if output_length != 0 && guest::try_write::<u32>(output_length, required as u32).is_err() {
+        return 0xC000_0005;
     }
     if (buffer_length as usize) < header {
         return 0xC000_0023;
@@ -93,6 +95,8 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
             bytes[header + index * 2..header + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
     }
-    guest::write_bytes(output, &bytes[..required.min(buffer_length as usize)]);
+    if guest::try_write_bytes(output, &bytes[..required.min(buffer_length as usize)]).is_err() {
+        return 0xC000_0005;
+    }
     if (buffer_length as usize) < required { 0x8000_0005 } else { 0 }
 }

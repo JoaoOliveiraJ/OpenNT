@@ -13,6 +13,17 @@ use crate::ntos::mm::section::create as create_section;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::guest_memory::GuestScalar;
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, SecurityDescriptor, SecurityQualityOfService, UnicodeString};
+use core::mem::offset_of;
+
+/// Campo de uma estrutura do chamador, pelo offset do layout. Com
+/// PreviousMode usuário o endereço já passou por `message_buffer::accessible`;
+/// a leitura continua sondada (a página pode sumir entre a sonda e o uso) e
+/// a falha vira STATUS_ACCESS_VIOLATION, como o `__except` do NT.
+fn captured<T: GuestScalar>(base: u64, offset: usize) -> Result<T, u32> {
+    guest::try_read(base + offset as u64).map_err(|_| 0xC000_0005)
+}
 
 /// SECURITY_QUALITY_OF_SERVICE (alinhamento ULONG), capturado antes da
 /// resolução do handle. `Ok(None)` = sem QoS.
@@ -26,7 +37,7 @@ fn capture_quality(attributes: u64, mode: u8) -> Result<Option<u32>, u32> {
     if !message_buffer::accessible(attributes, 48, mode, false) {
         return Err(0xC000_0005);
     }
-    let quality = guest::read64(attributes + 40);
+    let quality: u64 = captured(attributes, offset_of!(ObjectAttributes, security_quality_of_service))?;
     if quality == 0 {
         return Ok(None);
     }
@@ -36,10 +47,12 @@ fn capture_quality(attributes: u64, mode: u8) -> Result<Option<u32>, u32> {
     if !message_buffer::accessible(quality, 12, mode, false) {
         return Err(0xC000_0005);
     }
-    if guest::read32(quality) != 12 || guest::read8(quality + 8) > 1 {
+    if captured::<u32>(quality, offset_of!(SecurityQualityOfService, length))? != SecurityQualityOfService::SIZE as u32
+        || captured::<u8>(quality, offset_of!(SecurityQualityOfService, context_tracking_mode))? > 1
+    {
         return Err(0xC000_000D);
     }
-    let level = guest::read32(quality + 4);
+    let level: u32 = captured(quality, offset_of!(SecurityQualityOfService, impersonation_level))?;
     if level > 3 { Err(0xC000_00A5) } else { Ok(Some(level)) }
 }
 
@@ -81,10 +94,10 @@ fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation,
         if mode != 0 && attributes & 7 != 0 {
             return Err(0x8000_0002);
         }
-        if guest::read32(attributes) != 48 {
+        if captured::<u32>(attributes, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
             return Err(0xC000_000D);
         }
-        flags = guest::read32(attributes + 24);
+        flags = captured(attributes, offset_of!(ObjectAttributes, attributes))?;
         // Token aceita EXCLUSIVE na criação, mas não OPENLINK nem bits indefinidos.
         if flags & !0x11EF2 != 0 {
             return Err(0xC000_000D);
@@ -92,8 +105,8 @@ fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation,
         if mode != 0 {
             flags &= !0x200;
         }
-        let root = guest::read64(attributes + 8);
-        let name = guest::read64(attributes + 16);
+        let root: u64 = captured(attributes, offset_of!(ObjectAttributes, root_directory))?;
+        let name: u64 = captured(attributes, offset_of!(ObjectAttributes, object_name))?;
         if name != 0 {
             if mode != 0 && name & 7 != 0 {
                 return Err(0x8000_0002);
@@ -102,13 +115,13 @@ fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation,
                 return Err(0xC000_0005);
             }
             // Tokens não são nomeados; um descritor vazio é aceito.
-            if guest::read16(name) != 0 {
+            if captured::<u16>(name, offset_of!(UnicodeString, length))? != 0 {
                 return Err(0xC000_0033);
             }
         } else if root != 0 {
             return Err(0xC000_0033);
         }
-        security = guest::read64(attributes + 32);
+        security = captured(attributes, offset_of!(ObjectAttributes, security_descriptor))?;
     }
     if flags & 0x10 != 0 && !privilege(subject, 16, mode) {
         return Err(0xC000_0061);
@@ -120,7 +133,7 @@ fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation,
         if mode != 0 && !create_section::descriptor_probe(security) {
             return Err(0xC000_0005);
         }
-        if guest::read8(security) != 1 {
+        if captured::<u8>(security, offset_of!(SecurityDescriptor, revision))? != 1 {
             return Err(0xC000_0058);
         }
         if !descriptor::valid(security) {
@@ -212,10 +225,9 @@ pub fn duplicate(existing: u64, access: u32, attributes: u64, effective_only: bo
         }
         // A cópia final vem depois da publicação; uma falha conserva a entrada
         // já pertencente ao processo.
-        if !message_buffer::accessible(output, 8, mode, true) {
+        if !message_buffer::accessible(output, 8, mode, true) || guest::try_write::<u64>(output, handle).is_err() {
             return Ok(0xC000_0005);
         }
-        guest::write64(output, handle);
         Ok(0)
     })();
     if created != 0 {

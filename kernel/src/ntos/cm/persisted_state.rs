@@ -48,7 +48,7 @@ pub fn query(source_name: u64, custom_value_name: u64, default_path: u64, locati
         bytes = registry::encode_wide(&guest_strings::read_wide_string(default_path));
     }
     if required_length != 0 {
-        guest::write32(required_length, bytes.len() as u32);
+        super::out::<u32>(required_length).set(bytes.len() as u32);
     }
     // Capacidade insuficiente: BUFFER_OVERFLOW sem cópia parcial.
     if (capacity as usize) < bytes.len() {

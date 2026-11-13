@@ -40,7 +40,7 @@ pub fn query(output: u64, buffer_length: u64, output_length: u64, from_user_mode
         }
     };
     // A contagem é escrita depois da saída, inclusive nas falhas de capacidade.
-    if output_length != 0 && guest::try_write32(output_length, returned).is_err() {
+    if output_length != 0 && guest::try_write::<u32>(output_length, returned).is_err() {
         status = STATUS_ACCESS_VIOLATION;
     }
     Ok(status)

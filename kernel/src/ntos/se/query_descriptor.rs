@@ -7,6 +7,8 @@
 use alloc::vec::Vec;
 
 use super::policy_descriptor::OwnedDescriptor;
+use super::{descriptor, out, sid};
+use crate::ntos::inc::types::{Acl, NtStruct, SecurityDescriptorRelative};
 use crate::ntos::mm::guest_memory as guest;
 
 fn align4(length: usize) -> usize {
@@ -18,31 +20,30 @@ pub fn read_descriptor(pointer: u64) -> Option<OwnedDescriptor> {
     if pointer == 0 {
         return None;
     }
-    let control = guest::read16(pointer + 2);
-    let mut descriptor = OwnedDescriptor { control, ..OwnedDescriptor::default() };
-    for index in 0..4u64 {
-        if (index == 2 && control & 16 == 0) || (index == 3 && control & 4 == 0) {
-            continue;
-        }
-        let component = if control & 0x8000 != 0 {
-            let offset = guest::read32(pointer + 4 + index * 4);
-            if offset != 0 { pointer + offset as u64 } else { 0 }
-        } else {
-            guest::read64(pointer + 8 + index * 8)
-        };
+    let control = descriptor::control(pointer);
+    let mut owned = OwnedDescriptor { control, ..OwnedDescriptor::default() };
+    for index in 0..4usize {
+        // Componente nos dois formatos (offset relativo ou ponteiro absoluto);
+        // SACL/DACL ausentes pelo Control dão zero.
+        let component = descriptor::component(pointer, control, index as u64);
         if component == 0 {
             continue;
         }
-        let length = if index < 2 { 8 + 4 * guest::read8(component + 1) as usize } else { guest::read16(component + 2) as usize };
+        let length = if index < 2 {
+            8 + 4 * sid::at(component).sub_authority_count.get() as usize
+        } else {
+            // SAFETY: componente SACL/DACL do descritor.
+            unsafe { Acl::at(component) }.acl_size.get() as usize
+        };
         let bytes = Some(guest::read_bytes(component, length));
         match index {
-            0 => descriptor.owner = bytes,
-            1 => descriptor.group = bytes,
-            2 => descriptor.sacl = bytes,
-            _ => descriptor.dacl = bytes,
+            0 => owned.owner = bytes,
+            1 => owned.group = bytes,
+            2 => owned.sacl = bytes,
+            _ => owned.dacl = bytes,
         }
     }
-    Some(descriptor)
+    Some(owned)
 }
 
 /// A SACL conserva só as categorias pedidas: auditoria usa
@@ -140,15 +141,21 @@ pub fn query_descriptor(descriptor: Option<&OwnedDescriptor>, information: u32, 
     if (buffer_length as usize) < selection.needed {
         return QueryResult { status: 0xC000_0023, needed: selection.needed, information: selection.information };
     }
-    for offset in 0..20 {
-        guest::write8(buffer + offset, 0);
-    }
-    guest::write8(buffer, 1);
-    guest::write16(buffer + 2, selection.control);
-    let mut cursor = (buffer + 23) & !3;
+    guest::write_bytes(buffer, &[0u8; SecurityDescriptorRelative::SIZE as usize]);
+    // SAFETY: buffer do chamador com pelo menos `needed` bytes.
+    let relative = unsafe { SecurityDescriptorRelative::at(buffer) };
+    relative.revision.set(1);
+    relative.control.set(selection.control);
+    let mut cursor = (buffer + SecurityDescriptorRelative::SIZE + 3) & !3;
     for (header, bytes) in &selection.components {
         guest::write_bytes(cursor, bytes);
-        guest::write32(buffer + header, (cursor - buffer) as u32);
+        let offset = match header {
+            4 => &relative.owner,
+            8 => &relative.group,
+            12 => &relative.sacl,
+            _ => &relative.dacl,
+        };
+        offset.set((cursor - buffer) as u32);
         cursor += align4(bytes.len()) as u64;
     }
     QueryResult { status: 0, needed: selection.needed, information: selection.information }
@@ -159,11 +166,11 @@ pub fn query_descriptor(descriptor: Option<&OwnedDescriptor>, information: u32, 
 /// SACL, LengthNeeded e BUFFER_TOO_SMALL ficam em `query_descriptor`),
 /// publica LengthNeeded em `*Length` e devolve o NTSTATUS.
 pub fn query_info(information_pointer: u64, buffer: u64, length_pointer: u64, object_sd_pointer: u64) -> u32 {
-    let information = guest::read32(information_pointer);
-    let object_sd = guest::read64(object_sd_pointer);
+    let information = out::<u32>(information_pointer).get();
+    let object_sd = out::<u64>(object_sd_pointer).get();
     let descriptor = read_descriptor(object_sd);
-    let length = guest::read32(length_pointer);
-    let result = query_descriptor(descriptor.as_ref(), information, buffer, length);
-    guest::write32(length_pointer, result.needed as u32);
+    let length = out::<u32>(length_pointer);
+    let result = query_descriptor(descriptor.as_ref(), information, buffer, length.get());
+    length.set(result.needed as u32);
     result.status
 }

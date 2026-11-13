@@ -8,10 +8,8 @@ use alloc::collections::BTreeMap;
 use crate::ntos::se::token::tokens;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::guest_memory as guest;
-
-const THREAD_FLAGS_OFFSET: u64 = 0x510;
-const IMPERSONATION_TOKEN_OFFSET: u64 = 0x4A8;
+use crate::ntos::inc::types::{Ethread, NtStruct};
+use core::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Impersonation {
@@ -46,13 +44,19 @@ pub fn assign(thread: u64, token: Option<u64>, level: u32, copy_on_open: bool, e
             None => map.remove(&thread),
         }
     };
-    // Os bits baixos do ponteiro codificam nível e effectiveOnly.
+    // SAFETY: `is_thread` conferiu o ETHREAD vivo.
+    let ethread = unsafe { Ethread::at(thread) };
+    // Os bits baixos do ponteiro codificam nível e effectiveOnly
+    // (PS_CLIENT_SECURITY_CONTEXT).
     let native = token.map_or(0, |token| token | level as u64 | if effective_only { 4 } else { 0 });
-    guest::write64(thread + IMPERSONATION_TOKEN_OFFSET, native);
-    // Só ActiveImpersonationInfo e CopyOnOpen mudam.
-    let flags = guest::read32(thread + THREAD_FLAGS_OFFSET) & !0x108;
-    let active = if token.is_some() { 8 } else { 0 } | if token.is_some() && copy_on_open { 0x100 } else { 0 };
-    guest::write32(thread + THREAD_FLAGS_OFFSET, flags | active);
+    ethread.client_security.impersonation_data.set(native);
+    // Só ActiveImpersonationInfo e CopyTokenOnOpen mudam: outras CPUs mexem
+    // nos demais bits de CrossThreadFlags, então a troca é um CAS (o NT usa
+    // operações interlocked de bits).
+    let mask = Ethread::ACTIVE_IMPERSONATION_INFO_MASK | Ethread::COPY_TOKEN_ON_OPEN_MASK;
+    let active = if token.is_some() { Ethread::ACTIVE_IMPERSONATION_INFO_MASK } else { 0 }
+        | if token.is_some() && copy_on_open { Ethread::COPY_TOKEN_ON_OPEN_MASK } else { 0 };
+    let _ = ethread.cross_thread_flags.atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |flags| Some(flags & !mask | active));
     if let Some(previous) = previous {
         tokens::release(previous.token)?;
     }

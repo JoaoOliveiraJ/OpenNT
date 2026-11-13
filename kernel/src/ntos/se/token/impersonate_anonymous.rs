@@ -7,8 +7,7 @@ use crate::ntos::ob::handles::thread as thread_handles;
 use crate::ntos::ps::process;
 use crate::ntos::ps::silo::query as silo_query;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{ejob, kthread};
+use crate::ntos::inc::types::{Ejob, EserversiloGlobals, Ethread, NtStruct, SiloUserSharedData};
 
 const POLICY_PATH: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Lsa";
 
@@ -78,16 +77,20 @@ pub fn impersonate(thread_handle: u64, access_mode: u8) -> Result<u32, KernelErr
         // PsGetSiloSessionId consulta SILO_USER_SHARED_DATA.
         let mut session_id = -1i64;
         if server_silo != 0 {
-            let globals = guest::read64(server_silo + ejob::SERVER_SILO_GLOBALS);
-            let shared = guest::read64(globals + 0x468);
-            session_id = guest::read32(shared) as i64;
+            // SAFETY: server silo vivo com globais e SILO_USER_SHARED_DATA publicados.
+            session_id = unsafe {
+                let globals = Ejob::at(server_silo).server_silo_globals.get();
+                let shared = EserversiloGlobals::at(globals).user_shared_data.get();
+                SiloUserSharedData::at(shared).service_session_id.get() as i64
+            };
         }
         let (mut token, copy_on_open) = anonymous_tokens::acquire(subject, include_everyone, server_silo, session_id)?;
         identity = Some(token);
         if subject_info.2.is_none() && primary_info.1 && !primary_info.2 {
             return Ok(0xC000_0022);
         }
-        let owner_process = guest::read64(target.pointer + kthread::PROCESS);
+        // SAFETY: thread alvo referenciada pelo handle (ETHREAD).
+        let owner_process = unsafe { Ethread::at(target.pointer) }.tcb.process.get();
         let owner_container = process::get_primary_token(owner_process).map(|owner| tokens::with(owner, |token| token.app_container.clone()).flatten());
         let anonymous_container = tokens::with(token, |token| token.app_container.clone()).flatten();
         let mut level = 2;

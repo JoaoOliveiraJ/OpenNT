@@ -2,17 +2,41 @@
 //!
 //! Leitura, validação, conversão e captura (cópia self-relative na arena do
 //! convidado); componentes e entradas de ACL são acessados na memória do
-//! convidado.
+//! convidado. Os dois formatos compartilham o cabeçalho (Revision, Sbz1,
+//! Control): o absoluto (`_SECURITY_DESCRIPTOR`) guarda ponteiros, o relativo
+//! (`_SECURITY_DESCRIPTOR_RELATIVE`) offsets de 32 bits.
 
-use super::{acl, sid};
+use core::mem::offset_of;
+
+use super::{acl, out, sid};
+use crate::ntos::inc::types::{AceHeader, Acl, NtStruct, SecurityDescriptor, SecurityDescriptorRelative};
 use crate::ntos::mm::guest_memory as guest;
 
 const SELF_RELATIVE: u16 = 0x8000;
 const DACL_PRESENT: u16 = 4;
 const SACL_PRESENT: u16 = 16;
+/// Tamanho do cabeçalho relativo (`sizeof(SECURITY_DESCRIPTOR_RELATIVE)`).
+const RELATIVE_HEADER: u32 = SecurityDescriptorRelative::SIZE as u32;
 
 fn align4(size: u32) -> u32 {
     (size + 3) & !3
+}
+
+/// Cabeçalho comum aos dois formatos; a vista relativa tem o menor
+/// alinhamento (4) e os mesmos offsets de Revision/Control.
+fn header(descriptor: u64) -> &'static SecurityDescriptorRelative {
+    // SAFETY: PSECURITY_DESCRIPTOR vivo, como nas rotinas Rtl*SecurityDescriptor.
+    unsafe { SecurityDescriptorRelative::at(descriptor) }
+}
+
+fn absolute(descriptor: u64) -> &'static SecurityDescriptor {
+    // SAFETY: descritor absoluto (SE_SELF_RELATIVE limpo), alinhado a ponteiro.
+    unsafe { SecurityDescriptor::at(descriptor) }
+}
+
+fn acl_at(pointer: u64) -> &'static Acl {
+    // SAFETY: PACL viva (componente do descritor ou parâmetro).
+    unsafe { Acl::at(pointer) }
 }
 
 /// Índices: proprietário, grupo, SACL, DACL. O modo relativo guarda offsets
@@ -22,37 +46,46 @@ pub fn component(descriptor: u64, control: u16, index: u64) -> u64 {
         return 0;
     }
     if control & SELF_RELATIVE == 0 {
-        return guest::read64(descriptor.wrapping_add(8 + index * 8));
+        // O NT só exige alinhamento ULONG do descritor capturado
+        // (ProbeForRead), então os ponteiros são lidos pelo offset do layout.
+        let offset = [
+            offset_of!(SecurityDescriptor, owner),
+            offset_of!(SecurityDescriptor, group),
+            offset_of!(SecurityDescriptor, sacl),
+            offset_of!(SecurityDescriptor, dacl),
+        ][index as usize];
+        return guest::read::<u64>(descriptor.wrapping_add(offset as u64));
     }
-    let offset = guest::read32(descriptor.wrapping_add(4 + index * 4));
+    let sd = header(descriptor);
+    let offset = [&sd.owner, &sd.group, &sd.sacl, &sd.dacl][index as usize].get();
     if offset != 0 { descriptor.wrapping_add(offset as u64) } else { 0 }
 }
 
 pub fn control(descriptor: u64) -> u16 {
-    guest::read16(descriptor.wrapping_add(2))
+    header(descriptor).control.get()
 }
 
 /// RtlGetOwnerSecurityDescriptor: `owner` e `defaulted` são saídas.
 pub fn get_owner(descriptor: u64, owner: u64, defaulted: u64) -> u32 {
-    if guest::read8(descriptor) != 1 {
+    if header(descriptor).revision.get() != 1 {
         return 0xC000_0058;
     }
     let control = control(descriptor);
-    guest::write64(owner, component(descriptor, control, 0));
-    guest::write8(defaulted, (control & 1) as u8);
+    out::<u64>(owner).set(component(descriptor, control, 0));
+    out::<u8>(defaulted).set((control & 1) as u8);
     0
 }
 
 /// RtlGetDaclSecurityDescriptor: ponteiro e origem só com a DACL presente.
 pub fn get_dacl(descriptor: u64, present: u64, acl_pointer: u64, defaulted: u64) -> u32 {
-    if guest::read8(descriptor) != 1 {
+    if header(descriptor).revision.get() != 1 {
         return 0xC000_0058;
     }
     let control = control(descriptor);
-    guest::write8(present, (control & DACL_PRESENT != 0) as u8);
+    out::<u8>(present).set((control & DACL_PRESENT != 0) as u8);
     if control & DACL_PRESENT != 0 {
-        guest::write64(acl_pointer, component(descriptor, control, 3));
-        guest::write8(defaulted, ((control >> 3) & 1) as u8);
+        out::<u64>(acl_pointer).set(component(descriptor, control, 3));
+        out::<u8>(defaulted).set(((control >> 3) & 1) as u8);
     }
     0
 }
@@ -62,14 +95,14 @@ fn component_length(pointer: u64, index: u64) -> u32 {
     if pointer == 0 {
         return 0;
     }
-    align4(if index < 2 { sid::length(pointer) } else { guest::read16(pointer.wrapping_add(2)) as u32 })
+    align4(if index < 2 { sid::length(pointer) } else { acl_at(pointer).acl_size.get() as u32 })
 }
 
 /// RtlLengthSecurityDescriptor: cabeçalho e componentes no formato compacto,
 /// inclusive ponteiros compartilhados ou lacunas de um relativo.
 pub fn length(descriptor: u64) -> u32 {
     let control = control(descriptor);
-    let mut size = if control & SELF_RELATIVE != 0 { 20 } else { 40 };
+    let mut size = if control & SELF_RELATIVE != 0 { RELATIVE_HEADER } else { SecurityDescriptor::SIZE as u32 };
     for index in 0..4 {
         size += component_length(component(descriptor, control, index), index);
     }
@@ -85,60 +118,66 @@ pub fn absolute_to_relative(descriptor: u64, destination: u64, capacity_pointer:
     }
     let mut pointers = [0u64; 4];
     let mut lengths = [0u32; 4];
-    let mut required = 20;
+    let mut required = RELATIVE_HEADER;
     for index in 0..4 {
         pointers[index] = component(descriptor, control, index as u64);
         lengths[index] = component_length(pointers[index], index as u64);
         required += lengths[index];
     }
-    if guest::read32(capacity_pointer) < required {
-        guest::write32(capacity_pointer, required);
+    let capacity = out::<u32>(capacity_pointer);
+    if capacity.get() < required {
+        capacity.set(required);
         return 0xC000_0023;
     }
     if destination == 0 {
         return 0xC000_000D;
     }
-    for offset in 0..required as u64 {
-        guest::write8(destination.wrapping_add(offset), 0);
-    }
-    guest::write32(destination, guest::read32(descriptor));
-    let mut offset = 20u32;
+    guest::write_bytes(destination, &alloc::vec![0u8; required as usize]);
+    let source = header(descriptor);
+    let relative = header(destination);
+    relative.revision.set(source.revision.get());
+    relative.sbz1.set(source.sbz1.get());
+    relative.control.set(source.control.get());
+    let offsets = [&relative.owner, &relative.group, &relative.sacl, &relative.dacl];
+    let mut offset = RELATIVE_HEADER;
     for index in [2usize, 3, 0, 1] {
         if lengths[index] != 0 {
-            for byte in 0..lengths[index] as u64 {
-                guest::write8(destination.wrapping_add(offset as u64 + byte), guest::read8(pointers[index].wrapping_add(byte)));
-            }
-            guest::write32(destination.wrapping_add(4 + index as u64 * 4), offset);
+            guest::write_bytes(destination.wrapping_add(offset as u64), &guest::read_bytes(pointers[index], lengths[index] as usize));
+            offsets[index].set(offset);
             offset += lengths[index];
         }
     }
-    guest::write16(destination.wrapping_add(2), control | SELF_RELATIVE);
+    relative.control.set(control | SELF_RELATIVE);
     0
 }
 
 /// RtlGetAce: percorre os tamanhos declarados até o índice, escrevendo cada
 /// endereço visitado na saída (ordem de escritas das falhas nativas).
 pub fn get_ace(acl_pointer: u64, index: u32, output: u64) -> u32 {
-    let revision = guest::read8(acl_pointer);
-    if !(2..=4).contains(&revision) || index >= guest::read16(acl_pointer.wrapping_add(4)) as u32 {
+    let header = acl_at(acl_pointer);
+    let revision = header.acl_revision.get();
+    if !(2..=4).contains(&revision) || index >= header.ace_count.get() as u32 {
         return 0xC000_000D;
     }
-    let end = acl_pointer.wrapping_add(guest::read16(acl_pointer.wrapping_add(2)) as u64);
-    let mut current = acl_pointer.wrapping_add(8);
-    guest::write64(output, current);
+    let end = acl_pointer.wrapping_add(header.acl_size.get() as u64);
+    let mut current = acl_pointer.wrapping_add(Acl::SIZE);
+    let output = out::<u64>(output);
+    output.set(current);
     for _ in 0..index {
         if current >= end {
             return 0xC000_000D;
         }
-        current = current.wrapping_add(guest::read16(current.wrapping_add(2)) as u64);
-        guest::write64(output, current);
+        // RtlGetAce não valida a ACL: um AceSize ímpar desalinharia a próxima
+        // entrada, então o campo é lido pelo offset, sem referência.
+        current = current.wrapping_add(guest::read::<u16>(current + offset_of!(AceHeader, ace_size) as u64) as u64);
+        output.set(current);
     }
     if current < end { 0 } else { 0xC000_000D }
 }
 
 /// RtlValidSecurityDescriptor.
 pub fn valid(descriptor: u64) -> bool {
-    if guest::read8(descriptor) != 1 {
+    if header(descriptor).revision.get() != 1 {
         return false;
     }
     let control = control(descriptor);
@@ -151,34 +190,40 @@ pub fn valid(descriptor: u64) -> bool {
 /// RtlValidRelativeSecurityDescriptor: offsets e limites dentro de `size`;
 /// `required` exige proprietário (bit 0) e grupo (bit 1).
 pub fn valid_relative(descriptor: u64, size: u32, required: u32) -> bool {
-    if size < 20 || guest::read8(descriptor) != 1 {
+    if size < RELATIVE_HEADER {
         return false;
     }
-    let control = control(descriptor);
+    let relative = header(descriptor);
+    if relative.revision.get() != 1 {
+        return false;
+    }
+    let control = relative.control.get();
     if control & SELF_RELATIVE == 0 {
         return false;
     }
-    for index in [0u64, 1, 3, 2] {
+    let offsets = [&relative.owner, &relative.group, &relative.sacl, &relative.dacl];
+    for index in [0usize, 1, 3, 2] {
         if (index == 2 && control & SACL_PRESENT == 0) || (index == 3 && control & DACL_PRESENT == 0) {
             continue;
         }
-        let offset = guest::read32(descriptor.wrapping_add(4 + index * 4));
+        let offset = offsets[index].get();
         if offset == 0 {
             if index < 2 && required & (1 << index) != 0 {
                 return false;
             }
             continue;
         }
-        if offset < 20 || offset & 3 != 0 || offset >= size || size - offset < if index < 2 { 12 } else { 8 } {
+        if offset < RELATIVE_HEADER || offset & 3 != 0 || offset >= size || size - offset < if index < 2 { 12 } else { 8 } {
             return false;
         }
         let pointer = descriptor.wrapping_add(offset as u64);
         if index < 2 {
-            let count = guest::read8(pointer.wrapping_add(1)) as u32;
-            if guest::read8(pointer) != 1 || count > 15 || size - offset < 8 + count * 4 {
+            let identifier = sid::at(pointer);
+            let count = identifier.sub_authority_count.get() as u32;
+            if identifier.revision.get() != 1 || count > 15 || size - offset < 8 + count * 4 {
                 return false;
             }
-        } else if guest::read16(pointer.wrapping_add(2)) as u32 > size - offset || !acl::valid(pointer) {
+        } else if acl_at(pointer).acl_size.get() as u32 > size - offset || !acl::valid(pointer) {
             return false;
         }
     }
@@ -194,7 +239,7 @@ const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058;
 const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
 
 fn set_control(descriptor: u64, control: u16) {
-    guest::write16(descriptor.wrapping_add(2), control);
+    absolute(descriptor).control.set(control);
 }
 
 /// RtlCreateSecurityDescriptor: zera o descritor absoluto de 0x28 bytes e
@@ -203,14 +248,14 @@ pub fn create(descriptor: u64, revision: u32) -> u32 {
     if revision != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
-    guest::write_bytes(descriptor, &[0u8; 0x28]);
-    guest::write8(descriptor, 1);
+    guest::write_bytes(descriptor, &[0u8; SecurityDescriptor::SIZE as usize]);
+    absolute(descriptor).revision.set(1);
     0
 }
 
 /// Revisão 1 e descritor absoluto (não self-relative) para as escritas.
 fn writable(descriptor: u64) -> Option<u32> {
-    if guest::read8(descriptor) != 1 {
+    if header(descriptor).revision.get() != 1 {
         Some(STATUS_UNKNOWN_REVISION)
     } else if control(descriptor) & SELF_RELATIVE != 0 {
         Some(STATUS_INVALID_SECURITY_DESCR)
@@ -231,7 +276,7 @@ pub fn set_dacl(descriptor: u64, present: bool, dacl: u64, defaulted: bool) -> u
         return 0;
     }
     value |= DACL_PRESENT;
-    guest::write64(descriptor.wrapping_add(0x20), dacl);
+    absolute(descriptor).dacl.set(dacl);
     value &= !DACL_DEFAULTED;
     if defaulted {
         value |= DACL_DEFAULTED;
@@ -252,7 +297,7 @@ pub fn set_sacl(descriptor: u64, present: bool, sacl: u64, defaulted: bool) -> u
         return 0;
     }
     value |= SACL_PRESENT;
-    guest::write64(descriptor.wrapping_add(0x18), sacl);
+    absolute(descriptor).sacl.set(sacl);
     value &= !SACL_DEFAULTED;
     if defaulted {
         value |= SACL_DEFAULTED;
@@ -266,7 +311,7 @@ pub fn set_owner(descriptor: u64, owner: u64, defaulted: bool) -> u32 {
     if let Some(status) = writable(descriptor) {
         return status;
     }
-    guest::write64(descriptor.wrapping_add(0x08), owner);
+    absolute(descriptor).owner.set(owner);
     let mut value = control(descriptor) & !OWNER_DEFAULTED;
     if defaulted {
         value |= OWNER_DEFAULTED;
@@ -283,8 +328,9 @@ const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 /// do descritor na arena do convidado (ou NULL se a entrada for NULL),
 /// validando antes de copiar. Devolve o NTSTATUS.
 pub fn capture(input: u64, output: u64) -> u32 {
+    let output = out::<u64>(output);
     if input == 0 {
-        guest::write64(output, 0);
+        output.set(0);
         return 0;
     }
     if !valid(input) {
@@ -292,13 +338,12 @@ pub fn capture(input: u64, output: u64) -> u32 {
     }
     let length = length(input) as u64;
     let captured = guest::alloc_bytes(length);
-    if guest::read16(input + 2) & SELF_RELATIVE != 0 {
-        for offset in 0..length {
-            guest::write8(captured + offset, guest::read8(input + offset));
-        }
+    if control(input) & SELF_RELATIVE != 0 {
+        guest::write_bytes(captured, &guest::read_bytes(input, length as usize));
     } else {
+        // A capacidade é um ULONG do chamador na rotina nativa.
         let capacity = guest::alloc_bytes(4);
-        guest::write32(capacity, length as u32);
+        out::<u32>(capacity).set(length as u32);
         let status = absolute_to_relative(input, captured, capacity);
         guest::free_bytes(capacity);
         if status != 0 {
@@ -306,7 +351,7 @@ pub fn capture(input: u64, output: u64) -> u32 {
             return status;
         }
     }
-    guest::write64(output, captured);
+    output.set(captured);
     0
 }
 

@@ -19,6 +19,106 @@ use crate::ntos::ps::user::sections::{self, Section, SectionFile, View};
 use crate::ntos::se::code_integrity_information;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Field, IoStatusBlock, NtStruct, ObjectAttributes, Reserved, UnicodeString};
+use core::mem::offset_of;
+
+/// Tabela SeCiCallbacks que o CiInitialize preenche (0xE8 bytes no 19041).
+/// Contrato entre o kernel e a ci.dll, sem tipo nos símbolos públicos: só os
+/// campos que o OpenNT usa têm nome.
+#[repr(C)]
+struct CiCallbacks {
+    /// Tamanho da tabela, informado pelo kernel.
+    size: Field<u32>,
+    _reserved_04: Reserved<0x14>,
+    /// CiQueryInformation (SystemCodeIntegrityInformation).
+    query_information: Field<u64>,
+    /// CiValidateImageHeader.
+    validate_image_header: Field<u64>,
+    _reserved_28: Reserved<0x38>,
+    /// CiInitializePolicy.
+    initialize_policy: Field<u64>,
+    _reserved_68: Reserved<0x8>,
+    /// Nível de assinatura exigido: precisa ficar NULL neste contrato.
+    required_signing_level: Field<u64>,
+    _reserved_78: Reserved<0x68>,
+    /// Versão/flags do contrato, informados pelo kernel.
+    kernel_version: Field<u64>,
+}
+
+/// Provedores privados do kernel entregues ao CiInitialize (só os slots
+/// reais publicados; os ausentes ficam NULL).
+#[repr(C)]
+struct CiPrivateCallbacks {
+    _reserved_00: Reserved<0x20>,
+    /// SepSetRuntimeUpdatableSigningLevel.
+    set_runtime_signing_level: Field<u64>,
+    _reserved_28: Reserved<0x8>,
+    /// MmGetImageFileSignatureInformation.
+    image_file_signature: Field<u64>,
+    _reserved_38: Reserved<0x8>,
+}
+
+/// Saídas do CiValidateImageHeader.
+#[repr(C)]
+struct CiValidation {
+    validation_mode: Field<u32>,
+    _reserved_04: Reserved<0x4>,
+    signature_context: Field<u64>,
+    signing_level: Field<u8>,
+    _reserved_11: Reserved<0x7>,
+    image_flags: Field<u32>,
+    _reserved_1c: Reserved<0xC>,
+    verification_flags: Field<u32>,
+    _reserved_2c: Reserved<0x4>,
+}
+
+/// Locais da abertura da imagem (substituem a pilha nativa): atributos,
+/// nome, handles, IO_STATUS_BLOCK e as saídas da CI; o texto do caminho
+/// segue a estrutura.
+#[repr(C)]
+struct ImageRequest {
+    attributes: ObjectAttributes,
+    name: UnicodeString,
+    file_handle: Field<u64>,
+    section_handle: Field<u64>,
+    io_status: IoStatusBlock,
+    _reserved_60: Reserved<0x10>,
+    validation: CiValidation,
+    _reserved_a0: Reserved<0x60>,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for CiCallbacks {}
+unsafe impl NtStruct for CiPrivateCallbacks {}
+unsafe impl NtStruct for CiValidation {}
+unsafe impl NtStruct for ImageRequest {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CiCallbacks>() == 0xE8);
+    assert!(offset_of!(CiCallbacks, query_information) == 0x18);
+    assert!(offset_of!(CiCallbacks, validate_image_header) == 0x20);
+    assert!(offset_of!(CiCallbacks, initialize_policy) == 0x60);
+    assert!(offset_of!(CiCallbacks, required_signing_level) == 0x70);
+    assert!(offset_of!(CiCallbacks, kernel_version) == 0xE0);
+    assert!(core::mem::size_of::<CiPrivateCallbacks>() == 0x40);
+    assert!(offset_of!(CiPrivateCallbacks, set_runtime_signing_level) == 0x20);
+    assert!(offset_of!(CiPrivateCallbacks, image_file_signature) == 0x30);
+    assert!(core::mem::size_of::<CiValidation>() == 0x30);
+    assert!(offset_of!(CiValidation, signature_context) == 0x8);
+    assert!(offset_of!(CiValidation, signing_level) == 0x10);
+    assert!(offset_of!(CiValidation, image_flags) == 0x18);
+    assert!(offset_of!(CiValidation, verification_flags) == 0x28);
+    assert!(offset_of!(ImageRequest, name) == 0x30);
+    assert!(offset_of!(ImageRequest, file_handle) == 0x40);
+    assert!(offset_of!(ImageRequest, io_status) == 0x50);
+    assert!(offset_of!(ImageRequest, validation) == 0x70);
+    assert!(core::mem::size_of::<ImageRequest>() == 0x100);
+};
+
+fn request_at(storage: u64) -> &'static ImageRequest {
+    // SAFETY: bloco próprio alocado por `open_image`, vivo até `release`.
+    unsafe { ImageRequest::at(storage) }
+}
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::mm::sysload::{self, Acquired};
 use crate::ntos::init::exports;
@@ -60,13 +160,20 @@ fn invoke(address: u64, arguments: &[u64]) -> u32 {
 }
 
 /// Callback publicado pela CI, que precisa morar dentro da imagem dela.
-fn callback(offset: u64) -> Result<u64, KernelError> {
+fn callback(slot: fn(&CiCallbacks) -> &Field<u64>) -> Result<u64, KernelError> {
     let (callbacks, base, size) = {
         let state = STATE.lock();
         let (base, size) = state.initialization.as_ref().map_or((0, 0), |library| (library.image_base, library.size_of_image));
         (state.callbacks, base, size)
     };
-    let address = if callbacks == 0 { 0 } else { guest::read64(callbacks + offset) };
+    let (address, offset) = if callbacks == 0 {
+        (0, 0)
+    } else {
+        // SAFETY: tabela própria de 0xE8 bytes, viva enquanto a CI estiver carregada.
+        let table = unsafe { CiCallbacks::at(callbacks) };
+        let field = slot(table);
+        (field.get(), field.address() - callbacks)
+    };
     if address < base || address >= base + size {
         return Err(failure(&format!("CI callback absent at {offset:x}"), 0xC000_007A));
     }
@@ -121,24 +228,24 @@ fn open_image(name: &str) -> Result<Request, KernelError> {
     if !name.starts_with('\\') || units.len() > 1024 {
         return Err(failure("CI requires an owned kernel image path", 0xC000_0033));
     }
-    let storage = allocate(256 + ((units.len() as u64 + 1) * 2).div_ceil(8) * 8)?;
+    let storage = allocate(ImageRequest::SIZE + ((units.len() as u64 + 1) * 2).div_ceil(8) * 8)?;
     let mut request = Request { storage, file_handle: 0, section_handle: 0, reference: None, view: None, section: None };
     let opened = (|| -> Result<(), KernelError> {
-        guest::write32(storage, 48);
-        guest::write64(storage + 16, storage + 48);
-        guest::write32(storage + 24, 0x240);
-        guest::write16(storage + 48, units.len() as u16 * 2);
-        guest::write16(storage + 50, (units.len() as u16 + 1) * 2);
-        guest::write64(storage + 56, storage + 256);
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(storage + 256 + index as u64 * 2, *unit);
-        }
-        let status = exports::invoke_handler("ZwOpenFile", &[storage + 64, 0x8000_0020, storage, storage + 80, 1, 0])? as u32;
+        let locals = request_at(storage);
+        let text = storage + ImageRequest::SIZE;
+        locals.attributes.length.set(ObjectAttributes::SIZE as u32);
+        locals.attributes.object_name.set(locals.name.address());
+        locals.attributes.attributes.set(0x240);
+        locals.name.length.set(units.len() as u16 * 2);
+        locals.name.maximum_length.set((units.len() as u16 + 1) * 2);
+        locals.name.buffer.set(text);
+        guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let status = exports::invoke_handler("ZwOpenFile", &[locals.file_handle.address(), 0x8000_0020, locals.attributes.address(), locals.io_status.address(), 1, 0])? as u32;
         require_success(status, "CI open image")?;
-        request.file_handle = guest::read64(storage + 64);
-        let status = exports::invoke_handler("ZwCreateSection", &[storage + 72, 0xF001F, 0, 0, 0x10, 0x100_0000, request.file_handle])? as u32;
+        request.file_handle = locals.file_handle.get();
+        let status = exports::invoke_handler("ZwCreateSection", &[locals.section_handle.address(), 0xF001F, 0, 0, 0x10, 0x100_0000, request.file_handle])? as u32;
         require_success(status, "CI create image section")?;
-        request.section_handle = guest::read64(storage + 72);
+        request.section_handle = locals.section_handle.get();
         let reference = section_handles::reference(request.section_handle, section_handles::Kind::Section, 4, 0).map_err(|status| failure("CI reference image section", status))?;
         let section = reference.section.clone();
         request.reference = Some(reference);
@@ -197,16 +304,33 @@ fn validate_kernel_image(source: &Arc<dyn ImageSource>, options: &LoadOptions) -
         let section = request.section.clone().ok_or_else(|| failure("CI section missing", 0xC000_0008))?;
         let view = request.view.clone().ok_or_else(|| failure("CI view missing", 0xC000_0008))?;
         let file = section.file.clone().ok_or_else(|| failure("CI section without file", 0xC000_0008))?;
-        let outputs = request.storage + 112;
-        guest::write32(outputs, 2);
-        guest::write8(outputs + 16, 1);
+        let outputs = &request_at(request.storage).validation;
+        outputs.validation_mode.set(2);
+        outputs.signing_level.set(1);
         let image_file_object = section.state.lock().image_file_object;
-        let arguments = [image_file_object, view.base, section.size, view.base, section.size, outputs, process::get_current_process(), 0, 1, outputs + 8, 1, 0, outputs + 16, outputs + 24, 0, outputs + 40];
+        let arguments = [
+            image_file_object,
+            view.base,
+            section.size,
+            view.base,
+            section.size,
+            outputs.validation_mode.address(),
+            process::get_current_process(),
+            0,
+            1,
+            outputs.signature_context.address(),
+            1,
+            0,
+            outputs.signing_level.address(),
+            outputs.image_flags.address(),
+            0,
+            outputs.verification_flags.address(),
+        ];
         debug_print!("[ci-loader] validating {} bytes={}", name, file.size());
-        let status = invoke(callback(0x20)?, &arguments);
-        let result = CodeIntegrity { status, validation_mode: guest::read32(outputs), signature_context: guest::read64(outputs + 8), signing_level: guest::read8(outputs + 16) as u32 };
-        let image_flags = guest::read32(outputs + 24);
-        let verification_flags = guest::read32(outputs + 40);
+        let status = invoke(callback(|table| &table.validate_image_header)?, &arguments);
+        let result = CodeIntegrity { status, validation_mode: outputs.validation_mode.get(), signature_context: outputs.signature_context.get(), signing_level: outputs.signing_level.get() as u32 };
+        let image_flags = outputs.image_flags.get();
+        let verification_flags = outputs.verification_flags.get();
         debug_print!(
             "CI_KERNEL_IMAGE_RESULT name={} status=0x{:x} validationMode={} signatureContext=0x{:x} signingLevel={} imageFlags=0x{:x} verificationFlags=0x{:x} importsResolved=false relocationsApplied=false entryPointExecuted=false",
             name, status, result.validation_mode, result.signature_context, result.signing_level, image_flags, verification_flags
@@ -281,40 +405,42 @@ pub fn initialize() -> Result<(), KernelError> {
 fn initialize_library() -> Result<(), KernelError> {
     let library = sysload::acquire("ci.dll")?;
     let entry = library.export("CiInitialize");
-    let callbacks = allocate(0xE8)?;
+    let callbacks = allocate(CiCallbacks::SIZE)?;
     {
         let mut state = STATE.lock();
         state.initialization = Some(library);
         state.callbacks = callbacks;
     }
     let entry = entry.ok_or_else(|| failure("CiInitialize export absent", 0xC000_0139))?;
-    let private_callbacks = allocate(64)?;
+    let private_callbacks = allocate(CiPrivateCallbacks::SIZE)?;
     let policy_output = allocate(16)?;
     let result = (|| -> Result<(), KernelError> {
-        guest::write32(callbacks, 0xE8);
-        guest::write64(callbacks + 0xE0, 0xA00_0008);
+        // SAFETY: blocos próprios recém-alocados e zerados.
+        let (table, private) = unsafe { (CiCallbacks::at(callbacks), CiPrivateCallbacks::at(private_callbacks)) };
+        table.size.set(CiCallbacks::SIZE as u32);
+        table.kernel_version.set(0xA00_0008);
         // Só provedores privados reais; os slots ausentes ficam NULL.
         let signing_policy = private_routines::address("SepSetRuntimeUpdatableSigningLevel");
         if signing_policy == 0 {
             return Err(failure("CI runtime signing provider absent", 0xC000_007A));
         }
-        guest::write64(private_callbacks + 32, signing_policy);
+        private.set_runtime_signing_level.set(signing_policy);
         let image_file_signature = private_routines::address("MmGetImageFileSignatureInformation");
         if image_file_signature == 0 {
             return Err(failure("CI image signature provider absent", 0xC000_007A));
         }
-        guest::write64(private_callbacks + 48, image_file_signature);
+        private.image_file_signature.set(image_file_signature);
         let status = invoke(entry, &[6, 0, callbacks, private_callbacks]);
         debug_print!("CI_KERNEL_INITIALIZE status=0x{:x}", status);
         require_success(status, "CiInitialize")?;
-        let policy_status = invoke(callback(0x60)?, &[0, policy_output, policy_output + 8]);
+        let policy_status = invoke(callback(|table| &table.initialize_policy)?, &[0, policy_output, policy_output + 8]);
         debug_print!("CI_KERNEL_POLICY status=0x{:x} elements={}", policy_status, guest::read32(policy_output + 8));
         require_success(policy_status, "CiInitializePolicy")?;
-        if guest::read64(callbacks + 0x70) != 0 {
+        if table.required_signing_level.get() != 0 {
             return Err(failure("CI required-signing-level contract changed", 0xC000_00BB));
         }
-        callback(0x20)?;
-        INFORMATION.store(callback(0x18)?, Ordering::SeqCst);
+        callback(|table| &table.validate_image_header)?;
+        INFORMATION.store(callback(|table| &table.query_information)?, Ordering::SeqCst);
         pe_loader::register_kernel_image_validator(validate_kernel_image)?;
         code_integrity_information::install_query(query_information)?;
         debug_print!("CI_KERNEL_ENFORCEMENT_READY scope=kernel-image-loads bootstrap=preloaded");

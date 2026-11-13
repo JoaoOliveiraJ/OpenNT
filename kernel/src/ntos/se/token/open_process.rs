@@ -6,7 +6,6 @@ use crate::ntos::ke::irql;
 use crate::ntos::ob::{object_access, object_types, process_reference};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 /// Abre o token primário do processo do handle.
 pub fn open(process_handle: u64, desired_access: u32, attributes: u32, output: u64, access_mode: u8) -> Result<u32, KernelError> {
@@ -59,7 +58,10 @@ pub fn open(process_handle: u64, desired_access: u32, attributes: u32, output: u
         if !message_buffer::accessible(output, 8, from_user_mode as u8, true) {
             return Ok(0xC000_0005);
         }
-        guest::write64(output, handle);
+        // Escrita sondada: o ponteiro pode ser de modo usuário.
+        if crate::ntos::mm::guest_memory::try_write::<u64>(output, handle).is_err() {
+            return Ok(0xC000_0005);
+        }
         Ok(0)
     })();
     tokens::release(token)?;

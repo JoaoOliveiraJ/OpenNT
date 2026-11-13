@@ -12,8 +12,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::cm::service::database::{self as service_database, Configuration, ServiceError, ServiceStatus};
 use crate::rtl::SpinLock;
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::driver_object;
+use crate::ntos::inc::types::{DriverObject, NtStruct};
 use crate::ntos::io::lifecycle::{self, DriverOptions};
 use crate::ntos::mm::pe_loader::LoadOptions;
 
@@ -112,7 +111,8 @@ pub fn status(configuration: &Configuration, status: &mut ServiceStatus) {
     let driver = initialized_driver(configuration);
     status.current_state = if driver.is_some() { 4 } else { 1 };
     status.process_id = 0;
-    status.controls_accepted = driver.is_some_and(|driver| guest::read64(driver + driver_object::DRIVER_UNLOAD) != 0) as u32;
+    // SAFETY: DRIVER_OBJECT nativo de um driver inicializado.
+    status.controls_accepted = driver.is_some_and(|driver| unsafe { DriverObject::at(driver) }.driver_unload.get() != 0) as u32;
     status.win32_exit_code = if driver.is_some() { 0 } else { operation.map_or(0, |operation| operation.error) };
     status.service_specific_exit_code = 0;
     status.checkpoint = 0;

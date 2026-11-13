@@ -5,6 +5,10 @@
 //! primário) e passa o *handle* adiante, como a rotina original; a leitura
 //! de TokenFlags num handle não mapeado é uma falha de memória.
 
+use core::mem::offset_of;
+
+use crate::ntos::se::out;
+use crate::ntos::se::token::tokens::TokenBody;
 use crate::ntos::se::token::{handles as token_handles, tokens};
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::{previous_mode, process};
@@ -12,7 +16,6 @@ use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
 const STATUS_NO_TOKEN: u32 = 0xC000_007C;
-const TOKEN_FLAGS: u64 = 0xC8;
 const TOKEN_LOWBOX: u32 = 0x4000;
 
 /// Abre o token da thread corrente ou uma cópia de impersonação do
@@ -40,7 +43,7 @@ fn open_temporary(frame: u64, handle: &mut u64) -> Result<u32, KernelError> {
 }
 
 pub fn check(token_or_handle: u64, output: u64) -> Result<u32, KernelError> {
-    guest::write8(output, 0);
+    out::<u8>(output).set(0);
     let mut token = token_or_handle;
     let mut temporary = 0u64;
     let mut frame = 0u64;
@@ -61,9 +64,10 @@ pub fn check(token_or_handle: u64, output: u64) -> Result<u32, KernelError> {
             }
             token = temporary;
         }
-        // Classe 29 de SeQueryInformationToken: TOKEN.TokenFlags direto.
-        let flags = guest::try_read32(token + TOKEN_FLAGS)?;
-        guest::write8(output, (flags & TOKEN_LOWBOX != 0) as u8);
+        // Classe 29 de SeQueryInformationToken: TokenFlags direto do corpo
+        // (sondado: no ramo sem token o valor ainda é um handle).
+        let flags = guest::try_read::<u32>(token + offset_of!(TokenBody, token_flags) as u64)?;
+        out::<u8>(output).set((flags & TOKEN_LOWBOX != 0) as u8);
         Ok(0)
     })();
     if temporary != 0 {

@@ -14,6 +14,7 @@ use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::kernel_threads::{self, KernelWait, WaitPoll};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{BdcbImageInformation, NtStruct};
 
 const VERIFICATION_POOL_TAG: u32 = 0x6373_4943;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
@@ -64,7 +65,7 @@ pub fn register(image_type: u32, callback_type: u32, callback: u64, context: u64
         return Ok(STATUS_NO_MEMORY);
     }
     HANDLES.lock().insert(handle);
-    guest::write64(output, handle);
+    super::out::<u64>(output).set(handle);
     Ok(0)
 }
 
@@ -92,9 +93,14 @@ pub fn remove(handle: u64) -> Result<(), KernelError> {
 /// (RegistryPath.Buffer fica com o valor original, como na rotina NT).
 pub fn copy_information(source: u64, destination: u64, size: u64) {
     guest::write_bytes(destination, &guest::read_bytes(source, size as usize));
-    for offset in [0x10u64, 0x30, 0x40, 0x48, 0x50] {
-        guest::write64(destination + offset, guest::read64(source + offset).wrapping_sub(source).wrapping_add(destination));
-    }
+    // SAFETY: pacote BDCB_IMAGE_INFORMATION e cópia com `size` bytes cada.
+    let (from, to) = unsafe { (BdcbImageInformation::at(source), BdcbImageInformation::at(destination)) };
+    let rebase = |pointer: u64| pointer.wrapping_sub(source).wrapping_add(destination);
+    to.image_name.buffer.set(rebase(from.image_name.buffer.get()));
+    to.certificate_publisher.buffer.set(rebase(from.certificate_publisher.buffer.get()));
+    to.certificate_issuer.buffer.set(rebase(from.certificate_issuer.buffer.get()));
+    to.image_hash.set(rebase(from.image_hash.get()));
+    to.certificate_thumbprint.set(rebase(from.certificate_thumbprint.get()));
 }
 
 /// Entrega de um pacote: cada chamada recebe uma cópia com os ponteiros

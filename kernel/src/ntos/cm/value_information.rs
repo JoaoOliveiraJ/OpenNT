@@ -37,8 +37,10 @@ pub fn write(value: &Value, class: u32, output: u64, buffer_length: u32, output_
     }
     let required = if class == 0 { header + name_length } else { data_offset + data_length };
     // O tamanho exigido é publicado mesmo sem espaço para o cabeçalho.
-    if output_length != 0 {
-        guest::write32(output_length, required as u32);
+    // ResultLength e o buffer podem ser de modo usuário (sondados pelo
+    // serviço): escritas sondadas, falha = STATUS_ACCESS_VIOLATION.
+    if output_length != 0 && guest::try_write::<u32>(output_length, required as u32).is_err() {
+        return 0xC000_0005;
     }
     if (buffer_length as usize) < header {
         return 0xC000_0023;
@@ -63,6 +65,8 @@ pub fn write(value: &Value, class: u32, output: u64, buffer_length: u32, output_
         bytes[data_offset..data_offset + data_length].copy_from_slice(&value.data);
     }
     // A cópia truncada preserva o cabeçalho e devolve BUFFER_OVERFLOW.
-    guest::write_bytes(output, &bytes[..required.min(buffer_length as usize)]);
+    if guest::try_write_bytes(output, &bytes[..required.min(buffer_length as usize)]).is_err() {
+        return 0xC000_0005;
+    }
     if (buffer_length as usize) < required { 0x8000_0005 } else { 0 }
 }

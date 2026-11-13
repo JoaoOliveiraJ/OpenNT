@@ -16,6 +16,29 @@ use crate::ntos::ob::callbacks::compare_altitude;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::cm::out;
+use crate::ntos::inc::types::{Field, LargeInteger, NtStruct, RegPostOperationInformation, Reserved, UnicodeString};
+
+/// Registro de inscrição em pool paginado (layout do OpenNT, modelado no
+/// bloco de callback do NT): cookie, contexto, rotina e a altitude copiada.
+#[repr(C)]
+struct CallbackRecord {
+    _reserved_00: Reserved<0x18>,
+    cookie: Field<u64>,
+    context: Field<u64>,
+    function: Field<u64>,
+    altitude: UnicodeString,
+    _reserved_40: Reserved<0x10>,
+}
+
+// SAFETY: #[repr(C)] só de células e estruturas do NT.
+unsafe impl NtStruct for CallbackRecord {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CallbackRecord>() == 80);
+    assert!(core::mem::offset_of!(CallbackRecord, cookie) == 0x18);
+    assert!(core::mem::offset_of!(CallbackRecord, altitude) == 0x30);
+};
 
 pub const CALLBACK_BYPASS: u32 = 0xC000_0503;
 
@@ -63,33 +86,35 @@ pub fn register(callback: u64, altitude: u64, driver: u64, context: u64, output_
     if reserved != 0 {
         return Ok(0xC000_00F4);
     }
-    // Registro de 80 bytes em pool paginado: cookie +24, contexto +32,
-    // rotina +40 e UNICODE_STRING da altitude +48.
-    let Ok(record) = kernel_pool::allocate(80, AllocateOptions { paged: true, tag: 0x6263_4D43, zero: true, ..Default::default() }) else {
+    let Ok(record) = kernel_pool::allocate(CallbackRecord::SIZE, AllocateOptions { paged: true, tag: 0x6263_4D43, zero: true, ..Default::default() }) else {
         return Ok(0xC000_009A);
     };
-    let length = guest::read16(altitude);
-    let source = guest::read64(altitude + 8);
+    // SAFETY: PCUNICODE_STRING Altitude do chamador.
+    let altitude = unsafe { UnicodeString::at(altitude) };
+    let length = altitude.length.get();
+    let source = altitude.buffer.get();
     let Ok(buffer) = kernel_pool::allocate((length as u64).max(1), AllocateOptions { paged: true, tag: 0x6163_4D43, zero: true, ..Default::default() }) else {
         let _ = kernel_pool::free(record, None);
         return Ok(0xC000_009A);
     };
-    for offset in 0..length as u64 {
-        guest::write8(buffer + offset, guest::read8(source + offset));
-    }
-    let units: Vec<u16> = (0..length as u64 / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let copied = guest::read_bytes(source, length as usize);
+    guest::write_bytes(buffer, &copied);
+    let units: Vec<u16> = copied.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
     let text = String::from_utf16_lossy(&units);
     let (cookie, collision) = with(|callbacks| {
         callbacks.sequence += 1;
         (callbacks.sequence, callbacks.by_cookie.values().any(|existing| compare_altitude(&existing.altitude, &text) == Ordering::Equal))
     });
-    guest::write64(record + 24, cookie);
-    guest::write64(record + 32, context);
-    guest::write64(record + 40, callback);
-    guest::write16(record + 48, length);
-    guest::write16(record + 50, length);
-    guest::write64(record + 56, buffer);
-    guest::write64(output_cookie, cookie);
+    // SAFETY: registro próprio recém-alocado e zerado.
+    let block = unsafe { CallbackRecord::at(record) };
+    block.cookie.set(cookie);
+    block.context.set(context);
+    block.function.set(callback);
+    block.altitude.length.set(length);
+    block.altitude.maximum_length.set(length);
+    block.altitude.buffer.set(buffer);
+    // SAFETY: PLARGE_INTEGER Cookie do chamador.
+    unsafe { LargeInteger::at(output_cookie) }.quad_part.set(cookie as i64);
     if collision {
         let _ = kernel_pool::free(buffer, None);
         let _ = kernel_pool::free(record, None);
@@ -228,13 +253,16 @@ pub fn perform_fallible<R: Outcome, E>(operation: &Operation<R>, action: impl Fn
         return Ok(action());
     }
     eligible.sort_by(|left, right| compare_altitude(&right.1, &left.1));
-    // REG_POST_OPERATION_INFORMATION (56 bytes) e o frame de três argumentos.
+    // REG_POST_OPERATION_INFORMATION e o frame de três argumentos.
     let workspace = guest::alloc_bytes(80);
     if workspace == 0 {
         return Ok(Ok(R::from_status(0xC000_009A)));
     }
     let post_information = workspace;
-    let call_context = operation.info + operation.call_offset;
+    // SAFETY: o início do workspace próprio guarda a REG_POST_OPERATION_INFORMATION.
+    let post = unsafe { RegPostOperationInformation::at(post_information) };
+    // CallContext da notificação REG_*_INFORMATION (offset do layout da classe).
+    let call_context: &Field<u64> = out::<u64>(operation.info + operation.call_offset);
     let mut posts: Vec<(u64, Record, u64)> = Vec::new();
     let mut result: Option<R> = None;
     critical_region::enter_critical()?;
@@ -248,7 +276,7 @@ pub fn perform_fallible<R: Outcome, E>(operation: &Operation<R>, action: impl Fn
         }) else {
             continue;
         };
-        guest::write64(call_context, 0);
+        call_context.set(0);
         let status = invoke(cookie, &record, operation.pre, operation.info);
         if !operation.unblockable && (status == CALLBACK_BYPASS || status & 0x8000_0000 != 0) {
             with(|callbacks| {
@@ -266,7 +294,7 @@ pub fn perform_fallible<R: Outcome, E>(operation: &Operation<R>, action: impl Fn
             });
             break;
         }
-        posts.push((cookie, record, guest::read64(call_context)));
+        posts.push((cookie, record, call_context.get()));
     }
     let mut result = match result {
         Some(result) => result,
@@ -284,19 +312,19 @@ pub fn perform_fallible<R: Outcome, E>(operation: &Operation<R>, action: impl Fn
     for (cookie, record, context) in posts.iter().rev() {
         // CallContext desta inscrição; Status e ReturnStatus começam com o
         // resultado efetivo da operação.
-        guest::write64(call_context, *context);
+        call_context.set(*context);
         let object = if result.status() == 0 { if result.object() != 0 { result.object() } else { operation.object } } else { 0 };
-        guest::write64(post_information, object);
-        guest::write32(post_information + 8, result.status());
-        guest::write64(post_information + 16, operation.info);
-        guest::write32(post_information + 24, result.status());
-        guest::write64(post_information + 32, *context);
-        guest::write64(post_information + 40, 0);
-        guest::write64(post_information + 48, 0);
+        post.object.set(object);
+        post.status.set(result.status() as i32);
+        post.pre_information.set(operation.info);
+        post.return_status.set(result.status() as i32);
+        post.call_context.set(*context);
+        post.object_context.set(0);
+        post.reserved.set(0);
         let status = invoke(*cookie, record, operation.post, post_information);
         if !operation.unblockable && status == CALLBACK_BYPASS {
-            result.set_status(guest::read32(post_information + 24));
-            result.set_object(guest::read64(post_information));
+            result.set_status(post.return_status.get() as u32);
+            result.set_object(post.object.get());
         }
     }
     release_posts(&posts);

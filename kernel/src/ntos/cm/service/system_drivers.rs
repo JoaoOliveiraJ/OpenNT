@@ -12,8 +12,7 @@ use crate::drivers::bus::pci;
 use crate::hal::amd64::native_call;
 use crate::ntos::io::{io_manager, small::boot_drivers_state};
 use crate::ntos::ob::object_manager::{self, NodeId};
-use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::{driver_extension, driver_object};
+use crate::ntos::inc::types::{DriverExtension, DriverObject, NtStruct};
 use crate::ntos::io::lifecycle;
 
 /// Raiz das chaves instaladas.
@@ -48,8 +47,8 @@ fn match_plug_and_play_device(service: &str, driver_node: NodeId) {
     };
     let Some(pdo_node) = object_manager::lookup(&format!("\\Device\\{}", matched.pdo_name)) else { return };
     let driver = object_manager::node(driver_node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
-    let extension = guest::read64(driver + driver_object::DRIVER_EXTENSION);
-    let add_device = guest::read64(extension + driver_extension::ADD_DEVICE);
+    // SAFETY: DRIVER_OBJECT nativo do serviço e a sua extensão.
+    let add_device = unsafe { DriverExtension::at(DriverObject::at(driver).driver_extension.get()) }.add_device.get();
     if add_device == 0 {
         return;
     }

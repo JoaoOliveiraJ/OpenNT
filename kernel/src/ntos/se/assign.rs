@@ -9,6 +9,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{GenericMapping, NtStruct, SecuritySubjectContext};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
 use crate::ntos::se::inherit_descriptor::{self, Captured};
@@ -43,7 +44,9 @@ fn read_mapping(map: u64) -> [u32; 4] {
     if map == 0 {
         return [0, 0, 0, 0xFFFF_FFFF];
     }
-    [guest::read32(map), guest::read32(map + 4), guest::read32(map + 8), guest::read32(map + 12)]
+    // SAFETY: PGENERIC_MAPPING do chamador de SeAssignSecurity.
+    let mapping = unsafe { GenericMapping::at(map) };
+    [mapping.generic_read.get(), mapping.generic_write.get(), mapping.generic_execute.get(), mapping.generic_all.get()]
 }
 
 /// Lê um SECURITY_DESCRIPTOR (absoluto ou self-relative) do convidado para um
@@ -63,8 +66,10 @@ fn captured_from(pointer: u64) -> Option<Captured> {
 fn subject_owner_group(subject: u64) -> (Vec<u8>, Vec<u8>) {
     let mut token = 0;
     if subject != 0 {
-        let primary = guest::read64(subject + 0x10);
-        token = if primary != 0 { primary } else { guest::read64(subject) };
+        // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador.
+        let context = unsafe { SecuritySubjectContext::at(subject) };
+        let primary = context.primary_token.get();
+        token = if primary != 0 { primary } else { context.client_token.get() };
     }
     if token == 0 {
         token = process::get_primary_token(process::get_current_process()).unwrap_or(0);
@@ -116,7 +121,7 @@ fn publish(descriptor: &Captured, out: u64) {
     let bytes = serialize_relative(descriptor);
     let pointer = guest::alloc_bytes(bytes.len() as u64);
     guest::write_bytes(pointer, &bytes);
-    guest::write64(out, pointer);
+    super::out::<u64>(out).set(pointer);
 }
 
 /// Núcleo comum de SeAssignSecurity/SeAssignSecurityEx: monta o `creator`
@@ -150,11 +155,12 @@ pub fn assign(parent_ptr: u64, explicit_ptr: u64, out: u64, container: bool, aut
 
 /// SeDeassignSecurity: libera `*descriptor_pointer` e zera o ponteiro.
 pub fn deassign(descriptor_pointer: u64) {
-    let pointer = guest::read64(descriptor_pointer);
+    let descriptor = super::out::<u64>(descriptor_pointer);
+    let pointer = descriptor.get();
     if pointer != 0 {
         guest::free_bytes(pointer);
     }
-    guest::write64(descriptor_pointer, 0);
+    descriptor.set(0);
 }
 
 /// SeSetSecurityDescriptorInfo(Object, *Information, Modification, *ObjectSd,
@@ -162,8 +168,9 @@ pub fn deassign(descriptor_pointer: u64) {
 /// atual, pooleia um novo SD self-relative e troca `*ObjectSd` (liberando o
 /// antigo). Parcial: owner/group/DACL e troca inteira de SACL/label.
 pub fn set_info(information_pointer: u64, modification: u64, object_sd_pointer: u64, map: u64) -> u32 {
-    let information = guest::read32(information_pointer);
-    let current = captured_from(guest::read64(object_sd_pointer));
+    let information = super::out::<u32>(information_pointer).get();
+    let object_sd = super::out::<u64>(object_sd_pointer);
+    let current = captured_from(object_sd.get());
     let modification = captured_from(modification);
     let mapping = read_mapping(map);
     // Cada componente vem da Modification se o seu bit estiver em Information,
@@ -188,7 +195,7 @@ pub fn set_info(information_pointer: u64, modification: u64, object_sd_pointer: 
         | (((sacl_source.map_or(0, |captured| captured.control) & SACL_AUTO_INHERITED != 0) as u32) << 1);
     match inherit_descriptor::assign(None, &merged, &mapping, flags, false) {
         Ok(Ok(result)) => {
-            let old = guest::read64(object_sd_pointer);
+            let old = object_sd.get();
             publish(&result, object_sd_pointer);
             if old != 0 {
                 guest::free_bytes(old);

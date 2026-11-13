@@ -5,7 +5,9 @@
 //! `tokens`.
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
+use crate::ntos::inc::types::TokenStatistics;
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
 
@@ -15,22 +17,24 @@ pub fn fields(token: u64) -> Result<Vec<(u64, u8, u64)>, KernelError> {
         return Err(KernelError::new("Statistics requested for an unowned token"));
     };
     let (charged, available) = tokens::accounting(token)?;
+    let at = |offset: usize| offset as u64;
     Ok(alloc::vec![
-        (0, 8, record.id),
-        (8, 8, record.authentication_id),
-        (16, 8, record.expiration_time),
-        (24, 4, record.kind as u64),
-        (28, 4, record.impersonation_level as u64),
-        (32, 4, charged),
-        (36, 4, available),
-        (40, 4, record.groups.len() as u64),
-        (44, 4, record.privileges.len() as u64),
-        (48, 8, record.modified_id),
+        (at(offset_of!(TokenStatistics, token_id)), 8, record.id),
+        (at(offset_of!(TokenStatistics, authentication_id)), 8, record.authentication_id),
+        (at(offset_of!(TokenStatistics, expiration_time)), 8, record.expiration_time),
+        (at(offset_of!(TokenStatistics, token_type)), 4, record.kind as u64),
+        (at(offset_of!(TokenStatistics, impersonation_level)), 4, record.impersonation_level as u64),
+        (at(offset_of!(TokenStatistics, dynamic_charged)), 4, charged),
+        (at(offset_of!(TokenStatistics, dynamic_available)), 4, available),
+        (at(offset_of!(TokenStatistics, group_count)), 4, record.groups.len() as u64),
+        (at(offset_of!(TokenStatistics, privilege_count)), 4, record.privileges.len() as u64),
+        (at(offset_of!(TokenStatistics, modified_id)), 8, record.modified_id),
     ])
 }
 
 /// Os 56 bytes do caminho de usuário, da mesma fotografia.
 pub fn encode(token: u64) -> Result<[u8; 56], KernelError> {
+    const _: () = assert!(core::mem::size_of::<TokenStatistics>() == 56);
     let mut bytes = [0u8; 56];
     for (offset, width, value) in fields(token)? {
         let offset = offset as usize;

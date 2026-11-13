@@ -11,6 +11,8 @@ use super::registry;
 use crate::hal::amd64::native_call;
 use crate::rtl::KernelError;
 use crate::ntos::{mm::guest_memory as guest, rtl::guest_strings};
+use crate::ntos::inc::types::{KeyValueFullInformation, NtStruct, UnicodeString};
+use core::mem::offset_of;
 
 pub const HARDWARE_DESCRIPTION_PATH: &str = "\\Registry\\Machine\\Hardware\\Description\\System";
 pub const DEVICE_MAP_PATH: &str = "\\Registry\\Machine\\Hardware\\DeviceMap";
@@ -30,21 +32,22 @@ fn peripheral_type_name(value: u32) -> Option<&'static str> {
 /// (BusType, nome do adaptador).
 const BUS_TYPE_ADAPTERS: [(u32, &str); 1] = [(1, "MultifunctionAdapter")];
 
-/// Registro legado de valor: cabeçalho de 16 bytes, nome UTF-16 com
-/// terminador e dados alinhados a quatro bytes (sem o NameLength do
-/// KEY_VALUE_FULL_INFORMATION completo).
+/// KEY_VALUE_FULL_INFORMATION de um valor, como o ZwQueryValueKey
+/// (KeyValueFullInformation) que o NT usa aqui: NameLength em bytes, nome
+/// sem terminador e DataOffset alinhado a ULONG.
 fn build_value_information(value_type: u32, name: &str, data: &[u8]) -> u64 {
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let data_offset = 0x10 + (units.len() as u64 + 1) * 2;
-    let aligned = (data_offset + 3) & !3;
+    let name_bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let name_offset = offset_of!(KeyValueFullInformation, name) as u64;
+    let aligned = (name_offset + name_bytes.len() as u64 + 3) & !3;
     let pointer = guest::alloc_bytes(aligned + data.len() as u64);
-    guest::write32(pointer, 0);
-    guest::write32(pointer + 4, value_type);
-    guest::write32(pointer + 8, aligned as u32);
-    guest::write32(pointer + 0xC, data.len() as u32);
-    for (index, unit) in units.iter().enumerate() {
-        guest::write16(pointer + 0x10 + index as u64 * 2, *unit);
-    }
+    // SAFETY: bloco próprio recém-alocado com cabeçalho, nome e dados.
+    let information = unsafe { KeyValueFullInformation::at(pointer) };
+    information.title_index.set(0);
+    information.type_.set(value_type);
+    information.data_offset.set(aligned as u32);
+    information.data_length.set(data.len() as u32);
+    information.name_length.set(name_bytes.len() as u32);
+    guest::write_bytes(pointer + name_offset, &name_bytes);
     guest::write_bytes(pointer + aligned, data);
     pointer
 }
@@ -52,9 +55,11 @@ fn build_value_information(value_type: u32, name: &str, data: &[u8]) -> u64 {
 /// Identifier, Configuration Data e Component Information do nível.
 fn build_information_pointer_array(identifier: u64, configuration: u64, component: u64) -> u64 {
     let pointer = guest::alloc_bytes(3 * 8);
-    guest::write64(pointer, identifier);
-    guest::write64(pointer + 8, configuration);
-    guest::write64(pointer + 0x10, component);
+    // SAFETY: vetor próprio de três PKEY_VALUE_FULL_INFORMATION.
+    let slots = unsafe { crate::ntos::inc::types::Field::<u64>::array_at(pointer, 3) };
+    slots[0].set(identifier);
+    slots[1].set(configuration);
+    slots[2].set(component);
     pointer
 }
 
@@ -151,15 +156,17 @@ fn make_unicode_string(text: &str) -> u64 {
     let length = text.encode_utf16().count() as u64 * 2;
     let buffer = guest::alloc_bytes(length + 2);
     guest_strings::write_wide_string(buffer, text);
-    let structure = guest::alloc_bytes(16);
-    guest::write16(structure, length as u16);
-    guest::write16(structure + 2, length as u16 + 2);
-    guest::write64(structure + 8, buffer);
+    let structure = guest::alloc_bytes(UnicodeString::SIZE);
+    // SAFETY: descritor próprio recém-alocado.
+    let descriptor = unsafe { UnicodeString::at(structure) };
+    descriptor.length.set(length as u16);
+    descriptor.maximum_length.set(length as u16 + 2);
+    descriptor.buffer.set(buffer);
     structure
 }
 
 fn optional_enumeration(pointer: u64) -> Option<u32> {
-    (pointer != 0).then(|| guest::read32(pointer))
+    (pointer != 0).then(|| super::out::<u32>(pointer).get())
 }
 
 /// IoQueryDeviceDescription: até quatro barramentos, controladores e

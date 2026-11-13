@@ -13,7 +13,7 @@ use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks, OpenOptions
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::kthread;
+use crate::ntos::inc::types::{Ethread, NtStruct};
 
 /// OBJ_KERNEL_HANDLE canônico -> identificador interno do Object Manager.
 static KERNEL_HANDLES: SpinLock<BTreeMap<u64, u32>> = SpinLock::new(BTreeMap::new());
@@ -221,7 +221,8 @@ pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool,
             private_token = Some(duplicate);
             token = duplicate;
             // O token privado também precisa admitir a identidade primária do servidor.
-            let owner_process = guest::read64(target + kthread::PROCESS);
+            // SAFETY: thread alvo resolvida e referenciada acima (ETHREAD).
+            let owner_process = unsafe { Ethread::at(target) }.tcb.process.get();
             let Some(primary) = process::get_primary_token(owner_process).and_then(tokens::get) else {
                 return Err(KernelError::new("impersonating thread has no owning process token"));
             };
@@ -240,7 +241,7 @@ pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool,
             if let Some(private) = private_token {
                 thread_tokens::assign(target, Some(private), state.level, false, state.effective_only)?;
             }
-            guest::try_write64(output, new_handle)
+            guest::try_write::<u64>(output, new_handle)
         })();
         if let Err(error) = finish {
             if close_native(new_handle).is_none() {

@@ -1,17 +1,42 @@
 //! SIDs nativos.
 //!
-//! Layout: revisão, contagem, seis bytes de autoridade e subautoridades
-//! ULONG. A aritmética de ponteiros preserva os endereços canônicos de kernel.
+//! Layout `_SID`: revisão, contagem, seis bytes de autoridade e
+//! subautoridades ULONG. A aritmética de ponteiros preserva os endereços
+//! canônicos de kernel.
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
+use crate::ntos::inc::types::{Field, NtStruct, Sid, SidIdentifierAuthority};
 use crate::ntos::mm::guest_memory as guest;
 
 const MAXIMUM_SUB_AUTHORITIES: u8 = 15;
 
+/// O SID no endereço (o PSID do NT).
+pub(crate) fn at(pointer: u64) -> &'static Sid {
+    // SAFETY: as rotinas Rtl*Sid recebem um PSID vivo, como no NT.
+    unsafe { Sid::at(pointer) }
+}
+
+/// SubAuthority[0..count]: o vetor do NT é declarado com um elemento.
+pub(crate) fn sub_authorities(sid: &Sid, count: usize) -> &'static [Field<u32>] {
+    // SAFETY: o SID ocupa 8 + 4 * count bytes a partir do seu endereço.
+    unsafe { Field::<u32>::array_at(sid.sub_authority[0].address(), count) }
+}
+
+/// Grava os seis bytes de IdentifierAuthority a partir de um
+/// PSID_IDENTIFIER_AUTHORITY.
+fn copy_authority(sid: &Sid, authority: u64) {
+    // SAFETY: o chamador passa um SID_IDENTIFIER_AUTHORITY vivo (alinhamento 1).
+    let authority = unsafe { SidIdentifierAuthority::at(authority) };
+    for (target, source) in sid.identifier_authority.value.iter().zip(&authority.value) {
+        target.set(source.get());
+    }
+}
+
 /// Oito bytes de cabeçalho mais quatro por subautoridade (RtlLengthSid).
 pub fn length(pointer: u64) -> u32 {
-    8 + guest::read8(pointer.wrapping_add(1)) as u32 * 4
+    8 + at(pointer).sub_authority_count.get() as u32 * 4
 }
 
 /// RtlValidSid do kernel: endereços de usuário são rejeitados antes da
@@ -20,15 +45,18 @@ pub fn valid(pointer: u64) -> bool {
     if pointer <= 0x7FFF_FFFF_0000 {
         return false;
     }
-    guest::read8(pointer) & 15 == 1 && guest::read8(pointer.wrapping_add(1)) <= MAXIMUM_SUB_AUTHORITIES
+    let sid = at(pointer);
+    sid.revision.get() & 15 == 1 && sid.sub_authority_count.get() <= MAXIMUM_SUB_AUTHORITIES
 }
 
 /// RtlEqualSid: revisão e contagem, depois autoridade e subautoridades.
 pub fn equal(first: u64, second: u64) -> bool {
-    if guest::read8(first) != guest::read8(second) || guest::read8(first.wrapping_add(1)) != guest::read8(second.wrapping_add(1)) {
+    let (left, right) = (at(first), at(second));
+    if left.revision.get() != right.revision.get() || left.sub_authority_count.get() != right.sub_authority_count.get() {
         return false;
     }
-    (2..length(first) as u64).all(|offset| guest::read8(first.wrapping_add(offset)) == guest::read8(second.wrapping_add(offset)))
+    let length = length(first) as usize;
+    guest::read_bytes(first.wrapping_add(2), length - 2) == guest::read_bytes(second.wrapping_add(2), length - 2)
 }
 
 /// RtlCopySid: usa a contagem da origem sem validar; a cópia temporária
@@ -38,25 +66,22 @@ pub fn copy(capacity: u32, destination: u64, source: u64) -> u32 {
     if capacity < count {
         return 0xC000_0023;
     }
-    let bytes: Vec<u8> = (0..count as u64).map(|offset| guest::read8(source.wrapping_add(offset))).collect();
-    for (offset, &byte) in bytes.iter().enumerate() {
-        guest::write8(destination.wrapping_add(offset as u64), byte);
-    }
+    guest::write_bytes(destination, &guest::read_bytes(source, count as usize));
     0
 }
 
 /// RtlInitializeSidEx: a contagem é um UCHAR; só o byte baixo é validado.
-pub fn initialize_ex(pointer: u64, authority: u64, sub_authority_count: u32, sub_authorities: &[u32]) -> u32 {
+pub fn initialize_ex(pointer: u64, authority: u64, sub_authority_count: u32, sub_authorities_values: &[u32]) -> u32 {
     let count = (sub_authority_count & 255) as u8;
     if count > MAXIMUM_SUB_AUTHORITIES {
         return 0xC000_000D;
     }
-    guest::write8(pointer.wrapping_add(1), count);
-    guest::write8(pointer, 1);
-    guest::write32(pointer.wrapping_add(2), guest::read32(authority));
-    guest::write16(pointer.wrapping_add(6), guest::read16(authority.wrapping_add(4)));
-    for index in 0..count as usize {
-        guest::write32(pointer.wrapping_add(8 + index as u64 * 4), sub_authorities.get(index).copied().unwrap_or(0));
+    let sid = at(pointer);
+    sid.sub_authority_count.set(count);
+    sid.revision.set(1);
+    copy_authority(sid, authority);
+    for (index, cell) in sub_authorities(sid, count as usize).iter().enumerate() {
+        cell.set(sub_authorities_values.get(index).copied().unwrap_or(0));
     }
     0
 }
@@ -74,17 +99,17 @@ pub fn initialize(pointer: u64, authority: u64, count: u32) -> u32 {
     if count > MAXIMUM_SUB_AUTHORITIES as u32 {
         return 0xC000_000D;
     }
-    guest::write8(pointer.wrapping_add(1), count as u8);
-    guest::write8(pointer, 1);
-    guest::write32(pointer.wrapping_add(2), guest::read32(authority));
-    guest::write16(pointer.wrapping_add(6), guest::read16(authority.wrapping_add(4)));
+    let sid = at(pointer);
+    sid.sub_authority_count.set(count as u8);
+    sid.revision.set(1);
+    copy_authority(sid, authority);
     0
 }
 
 /// RtlSubAuthoritySid: ponteiro para a subautoridade de índice `index` (sem
-/// verificação de limite, como o NT).
+/// verificação de limite nem leitura, como o NT).
 pub fn sub_authority(pointer: u64, index: u64) -> u64 {
-    pointer.wrapping_add(8 + index * 4)
+    pointer.wrapping_add(offset_of!(Sid, sub_authority) as u64 + index * 4)
 }
 
 /// RtlLengthRequiredSid: bytes para um SID com `count` subautoridades.

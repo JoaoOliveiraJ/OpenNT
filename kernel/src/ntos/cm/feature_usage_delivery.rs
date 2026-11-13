@@ -5,6 +5,7 @@
 
 use crate::ntos::ex::wnf::state_data as wnf_state_data;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{NtStruct, RtlFeatureUsageReport};
 
 const NOT_FOUND: u32 = 0xC000_0225;
 
@@ -20,6 +21,7 @@ pub struct Subscription {
 /// Consulta o estado num workspace de 4096 bytes, procura o par e o
 /// acrescenta se houver espaço; conflitos de versão repetem a operação.
 pub fn send_target(report: u64, target: u64) -> u32 {
+    let report = report_at(report);
     let workspace = guest::alloc_bytes(4096);
     if workspace == 0 {
         return 0xC000_0017;
@@ -34,16 +36,22 @@ pub fn send_target(report: u64, target: u64) -> u32 {
         }
         // Sequência de entradas de oito bytes; tamanho fora do múltiplo
         // reinicia a sequência.
-        let mut used = if queried.size & 7 != 0 { 0 } else { queried.size as u64 };
-        let feature = guest::read32(report);
-        let kind = guest::read16(report + 4);
-        let present = (0..used).step_by(8).any(|offset| guest::read32(workspace + offset) == feature && guest::read16(workspace + offset + 4) == kind);
-        if !present && used + 8 <= 4096 {
-            guest::write32(workspace + used, feature);
-            guest::write16(workspace + used + 4, kind);
+        let entry_size = RtlFeatureUsageReport::SIZE;
+        let mut used = if queried.size as u64 % entry_size != 0 { 0 } else { queried.size as u64 };
+        let (feature, kind) = (report.feature_id.get(), report.reporting_kind.get());
+        // As entradas do estado têm a forma de um RTL_FEATURE_USAGE_REPORT
+        // (o último USHORT é reservado).
+        // SAFETY: `used` bytes de entradas no workspace próprio de 4096 bytes.
+        let entries = unsafe { RtlFeatureUsageReport::array_at(workspace, (used / entry_size) as usize) };
+        let present = entries.iter().any(|entry| entry.feature_id.get() == feature && entry.reporting_kind.get() == kind);
+        if !present && used + entry_size <= 4096 {
+            // SAFETY: a entrada nova cabe no workspace.
+            let entry = unsafe { RtlFeatureUsageReport::at(workspace + used) };
+            entry.feature_id.set(feature);
+            entry.reporting_kind.set(kind);
             // Os dois bytes finais da entrada são reservados e conservam o
             // conteúdo do workspace, como na referência.
-            used += 8;
+            used += entry_size;
         }
         let delivered = wnf_state_data::update(target, workspace, used as u32, queried.stamp, true);
         if delivered != 0xC000_0001 {
@@ -54,13 +62,19 @@ pub fn send_target(report: u64, target: u64) -> u32 {
     status
 }
 
+fn report_at(report: u64) -> &'static RtlFeatureUsageReport {
+    // SAFETY: relato copiado no banco (ou do chamador), vivo durante a entrega.
+    unsafe { RtlFeatureUsageReport::at(report) }
+}
+
 /// Filtra por recurso, tipo e opção exigida; uma entrega bem-sucedida já
 /// obtida prevalece sobre falhas de destinos posteriores.
 pub fn send(report: u64, subscriptions: &[Subscription]) -> u32 {
     let mut status = NOT_FOUND;
-    let feature = guest::read32(report);
-    let kind = guest::read16(report + 4);
-    let options = guest::read16(report + 6);
+    let entry = report_at(report);
+    let feature = entry.feature_id.get();
+    let kind = entry.reporting_kind.get();
+    let options = entry.reporting_options.get();
     for subscription in subscriptions {
         if subscription.feature_id != feature || subscription.reporting_kind != kind {
             continue;

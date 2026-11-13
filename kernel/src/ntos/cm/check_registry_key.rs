@@ -13,6 +13,7 @@ use crate::ntos::ps::{previous_mode, process};
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 use crate::rtl::KernelError;
 use crate::ntos::{mm::guest_memory as guest, rtl::guest_strings};
+use crate::ntos::inc::types::{NtStruct, ObjectAttributes, UnicodeString};
 
 const ALLOCATION_TAG: u32 = 0x6B43_6C52;
 const PATH_CAPACITY: usize = 0x20C;
@@ -116,20 +117,23 @@ pub fn check(relative_to: u32, path_pointer: u64) -> Result<u32, KernelError> {
             path.extend_from_slice(&suffix);
         }
         let buffer = frame + FRAME_SIZE;
-        for (index, unit) in path.iter().enumerate() {
-            guest::write16(buffer + index as u64 * 2, *unit);
-        }
-        guest::write32(frame, 48);
-        guest::write64(frame + 16, frame + 48);
-        guest::write32(frame + 24, 0x240);
-        guest::write16(frame + 48, path.len() as u16 * 2);
-        guest::write16(frame + 50, PATH_CAPACITY as u16);
-        guest::write64(frame + 56, buffer);
-        let status = previous_mode::with_kernel(|| key_services::open(frame + 64, 0x8200_0000, frame, false, 0))??;
+        guest::write_bytes(buffer, &path.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        // Locais da rotina nativa no frame privado: OBJECT_ATTRIBUTES, o
+        // UNICODE_STRING do caminho e o HANDLE de saída.
+        // SAFETY: frame próprio recém-alocado e zerado.
+        let (attributes, name) = unsafe { (ObjectAttributes::at(frame), UnicodeString::at(frame + ObjectAttributes::SIZE)) };
+        let handle = super::out::<u64>(name.address() + UnicodeString::SIZE);
+        attributes.length.set(ObjectAttributes::SIZE as u32);
+        attributes.object_name.set(name.address());
+        attributes.attributes.set(0x240);
+        name.length.set(path.len() as u16 * 2);
+        name.maximum_length.set(PATH_CAPACITY as u16);
+        name.buffer.set(buffer);
+        let status = previous_mode::with_kernel(|| key_services::open(handle.address(), 0x8200_0000, frame, false, 0))??;
         if status & 0x8000_0000 != 0 {
             return Ok(Err(status));
         }
-        Ok(Ok(guest::read64(frame + 64)))
+        Ok(Ok(handle.get()))
     })();
     let _ = kernel_pool::free(frame, Some(ALLOCATION_TAG));
     let handle = match opened? {

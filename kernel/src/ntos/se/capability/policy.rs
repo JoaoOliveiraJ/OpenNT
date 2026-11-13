@@ -8,7 +8,8 @@ use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::silo::query as silo_query;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::nt_abi::ejob;
+use crate::ntos::inc::types::{Ejob, EserversiloGlobals, KuserSharedData, NtStruct, SiloUserSharedData, UnicodeString};
+use crate::ntos::mm::shared_user_data::SHARED_USER_DATA_VA;
 
 const PREFIX: &str = "Security-System-Capability-";
 const STRING_TAG: u32 = 0x6772_7453;
@@ -21,20 +22,29 @@ const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub fn is_multi_session() -> u32 {
     let silo = silo_query::current_server_silo();
     if silo == 0 {
-        return (guest::read32(0xFFFF_F780_0000_02F0) >> 8) & 1;
+        // SAFETY: KUSER_SHARED_DATA mapeada pelo kernel no endereço fixo.
+        return unsafe { KuserSharedData::at(SHARED_USER_DATA_VA) }.dbg_multi_session_sku();
     }
-    let globals = guest::read64(silo + ejob::SERVER_SILO_GLOBALS);
-    let shared = guest::read64(globals + 0x468);
-    guest::read8(shared + 0x1C) as u32
+    // SAFETY: server silo vivo (EJOB) com os globais e o SILO_USER_SHARED_DATA publicados.
+    unsafe {
+        let globals = Ejob::at(silo).server_silo_globals.get();
+        let shared = EserversiloGlobals::at(globals).user_shared_data.get();
+        SiloUserSharedData::at(shared).is_multi_session_sku.get() as u32
+    }
+}
+
+fn string_at(descriptor: u64) -> &'static UnicodeString {
+    // SAFETY: PUNICODE_STRING vivo do chamador (ou do frame privado).
+    unsafe { UnicodeString::at(descriptor) }
 }
 
 fn clear_descriptor(pointer: u64) {
-    guest::write_bytes(pointer, &[0u8; 16]);
+    guest::write_bytes(pointer, &[0u8; UnicodeString::SIZE as usize]);
 }
 
 /// RtlFreeUnicodeString: só zera o descritor quando havia buffer.
 pub fn release_string(descriptor: u64) {
-    let buffer = guest::read64(descriptor + 8);
+    let buffer = string_at(descriptor).buffer.get();
     if buffer != 0 {
         let _ = kernel_pool::free(buffer, None);
         clear_descriptor(descriptor);
@@ -52,7 +62,8 @@ pub fn query_system_policy(name: u64, output: u64) -> Result<u32, KernelError> {
         if name == 0 || output == 0 {
             return Ok(0xC000_000D);
         }
-        let name_bytes = guest::read16(name) as u32;
+        let name_string = string_at(name);
+        let name_bytes = name_string.length.get() as u32;
         let capacity = (name_bytes + 56) & 0xFFFF;
         prefix_buffer = pool_allocation::allocate_tagged(1, capacity as u64, STRING_TAG).unwrap_or(0);
         if prefix_buffer == 0 {
@@ -64,10 +75,8 @@ pub fn query_system_policy(name: u64, output: u64) -> Result<u32, KernelError> {
         if prefix_bytes > capacity || prefix_bytes + name_bytes > capacity {
             return Ok(STATUS_BUFFER_TOO_SMALL);
         }
-        for (index, unit) in PREFIX.encode_utf16().enumerate() {
-            guest::write16(prefix_buffer + index as u64 * 2, unit);
-        }
-        let source = guest::read64(name + 8);
+        guest::write_bytes(prefix_buffer, &PREFIX.encode_utf16().flat_map(u16::to_le_bytes).collect::<alloc::vec::Vec<u8>>());
+        let source = name_string.buffer.get();
         guest::write_bytes(prefix_buffer + prefix_bytes as u64, &guest::read_bytes(source, name_bytes as usize));
         guest::write16(prefix_buffer + ((prefix_bytes + name_bytes) >> 1) as u64 * 2, 0);
         // Armazenamento privado dos escalares e da UNICODE_STRING da pilha.
@@ -75,9 +84,10 @@ pub fn query_system_policy(name: u64, output: u64) -> Result<u32, KernelError> {
         if frame == 0 {
             return Ok(STATUS_NO_MEMORY);
         }
-        guest::write16(frame, (prefix_bytes + name_bytes) as u16);
-        guest::write16(frame + 2, capacity as u16);
-        guest::write64(frame + 8, prefix_buffer);
+        let value_name = string_at(frame);
+        value_name.length.set((prefix_bytes + name_bytes) as u16);
+        value_name.maximum_length.set(capacity as u16);
+        value_name.buffer.set(prefix_buffer);
         let status = license_values::query(frame, frame + 16, 0, 0, frame + 20)?;
         if status != STATUS_BUFFER_TOO_SMALL {
             return Ok(status);
@@ -104,9 +114,10 @@ pub fn query_system_policy(name: u64, output: u64) -> Result<u32, KernelError> {
         if characters == 0x7FFF {
             return Ok(0xC000_000D);
         }
-        guest::write64(output + 8, result_buffer);
-        guest::write16(output, characters as u16 * 2);
-        guest::write16(output + 2, characters as u16 * 2 + 2);
+        let result = string_at(output);
+        result.buffer.set(result_buffer);
+        result.length.set(characters as u16 * 2);
+        result.maximum_length.set(characters as u16 * 2 + 2);
         result_buffer = 0; // propriedade transferida ao descritor do chamador
         Ok(0)
     })();

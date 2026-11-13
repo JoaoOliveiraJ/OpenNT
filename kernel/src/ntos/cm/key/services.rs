@@ -29,6 +29,15 @@ use crate::ntos::ps::{process, user_probe};
 use crate::ntos::se::query_descriptor::QueryResult;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::guest_memory::GuestScalar;
+use crate::ntos::cm::out;
+use crate::ntos::inc::types::extra_se_cm::{
+    RegCreateKeyInformationV1, RegDeleteKeyInformation, RegDeleteValueKeyInformation, RegEnumerateKeyInformation,
+    RegQueryKeyInformation, RegQueryKeySecurityInformation, RegQueryValueKeyInformation, RegSetInformationKeyInformation,
+    RegSetValueKeyInformation,
+};
+use crate::ntos::inc::types::{KeyHandleTagsInformation, KeyValuePartialInformation, NtStruct, ObjectAttributes, UnicodeString};
+use core::mem::offset_of;
 
 /// Campos nomeados de uma estrutura REG_* (ou argumentos de uma operação).
 pub type Fields = BTreeMap<&'static str, u64>;
@@ -142,17 +151,26 @@ fn probe(pointer: u64, length: u64, previous_mode: bool, write: bool) -> Flow<u6
 /// UNICODE_STRING de 16 bytes; comprimento ímpar recusado; exatamente
 /// Length bytes, sem depender de terminador.
 fn read_unicode_string(pointer: u64, previous_mode: bool) -> Flow<String> {
-    let pointer = probe(pointer, 16, previous_mode, false)?;
-    let length = guest::read16(pointer) as u64;
-    let buffer = guest::read64(pointer + 8);
+    let pointer = probe(pointer, UnicodeString::SIZE, previous_mode, false)?;
+    let length = captured::<u16>(pointer, offset_of!(UnicodeString, length))? as u64;
+    let buffer: u64 = captured(pointer, offset_of!(UnicodeString, buffer))?;
     if length & 1 != 0 {
         return status(0xC000_0033);
     }
     if length != 0 {
         probe(buffer, length, previous_mode, false)?;
     }
-    let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(buffer + index * 2)).collect();
+    let Ok(bytes) = guest::try_read_bytes(buffer, length as usize) else { return status(0xC000_0005) };
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
     Ok(String::from_utf16_lossy(&units))
+}
+
+/// Campo de uma estrutura do chamador (UNICODE_STRING, OBJECT_ATTRIBUTES,
+/// buffers de informação) pelo offset do layout. Com PreviousMode usuário o
+/// intervalo já passou por `probe`, mas a leitura continua sondada (a página
+/// pode sumir entre a sonda e o uso): falha = STATUS_ACCESS_VIOLATION.
+fn captured<T: GuestScalar>(base: u64, offset: usize) -> Flow<T> {
+    guest::try_read(base + offset as u64).or_else(|_| status(0xC000_0005))
 }
 
 /// Dono dos buffers e corpos temporários da solicitação: corpos retidos são
@@ -175,13 +193,14 @@ impl Request {
     /// Estrutura e texto na mesma alocação: cabeçalho, UTF-16 e terminador.
     fn create_unicode_string(&self, name: &str) -> Flow<u64> {
         let units: Vec<u16> = name.encode_utf16().collect();
-        let pointer = self.allocate(18 + units.len() as u64 * 2)?;
-        guest::write16(pointer, units.len() as u16 * 2);
-        guest::write16(pointer + 2, units.len() as u16 * 2 + 2);
-        guest::write64(pointer + 8, pointer + 16);
-        for (index, unit) in units.iter().enumerate() {
-            guest::write16(pointer + 16 + index as u64 * 2, *unit);
-        }
+        let pointer = self.allocate(UnicodeString::SIZE + 2 + units.len() as u64 * 2)?;
+        // SAFETY: bloco próprio recém-alocado (descritor seguido do texto).
+        let descriptor = unsafe { UnicodeString::at(pointer) };
+        let text = pointer + UnicodeString::SIZE;
+        descriptor.length.set(units.len() as u16 * 2);
+        descriptor.maximum_length.set(units.len() as u16 * 2 + 2);
+        descriptor.buffer.set(text);
+        guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
         Ok(pointer)
     }
 
@@ -219,15 +238,27 @@ fn with_request(body: impl FnOnce(&Request) -> Flow<u32>) -> Result<u32, KernelE
     }
 }
 
+/// Campos de uma notificação REG_*_INFORMATION: (nome, offset no layout
+/// tipado, largura em bits). A notificação é polimórfica (uma estrutura por
+/// classe REG_NOTIFY_CLASS), então os campos vão de/para o mapa de valores
+/// pelos offsets de `extra_se_cm`.
 type Layout = &'static [(&'static str, u64, u8)];
+
+/// Offset de um campo do layout, em `u64` para a tabela.
+macro_rules! at {
+    ($type:ty, $field:ident) => {
+        offset_of!($type, $field) as u64
+    };
+}
 
 fn write_fields(pointer: u64, layout: Layout, values: &Fields) {
     for &(name, offset, width) in layout {
         let value = values.get(name).copied().unwrap_or(0);
+        let field = pointer + offset;
         match width {
-            8 => guest::write8(pointer + offset, value as u8),
-            32 => guest::write32(pointer + offset, value as u32),
-            _ => guest::write64(pointer + offset, value),
+            8 => out::<u8>(field).set(value as u8),
+            32 => out::<u32>(field).set(value as u32),
+            _ => out::<u64>(field).set(value),
         }
     }
 }
@@ -235,10 +266,11 @@ fn write_fields(pointer: u64, layout: Layout, values: &Fields) {
 fn read_fields(pointer: u64, layout: Layout, initial: &Fields) -> Fields {
     let mut result = initial.clone();
     for &(name, offset, width) in layout {
+        let field = pointer + offset;
         let value = match width {
-            8 => guest::read8(pointer + offset) as u64,
-            32 => guest::read32(pointer + offset) as u64,
-            _ => guest::read64(pointer + offset),
+            8 => out::<u8>(field).get() as u64,
+            32 => out::<u32>(field).get() as u64,
+            _ => out::<u64>(field).get(),
         };
         result.insert(name, value);
     }
@@ -348,7 +380,7 @@ fn publish_key_handle(output: u64, khandle: u32, attributes: u32, granted: u32, 
             }),
         )?;
     }
-    if let Err(error) = guest::try_write64(output, handle) {
+    if let Err(error) = guest::try_write::<u64>(output, handle) {
         if previous_mode {
             if let Some(provider) = with(|state| state.user) {
                 (provider.close)(handle);
@@ -381,23 +413,24 @@ fn strip_registry(path: &str) -> &str {
     }
 }
 
+/// REG_CREATE_KEY_INFORMATION_V1 (o de abertura tem o mesmo layout).
 const CREATE_LAYOUT: Layout = &[
-    ("name", 0, 64),
-    ("root", 8, 64),
-    ("type", 16, 64),
-    ("options", 24, 32),
-    ("className", 32, 64),
-    ("sd", 40, 64),
-    ("qos", 48, 64),
-    ("desired", 56, 32),
-    ("granted", 60, 32),
-    ("disposition", 64, 64),
-    ("resultObject", 72, 64),
-    ("version", 104, 64),
-    ("remaining", 112, 64),
-    ("wow64", 120, 32),
-    ("flags", 124, 32),
-    ("mode", 128, 8),
+    ("name", at!(RegCreateKeyInformationV1, complete_name), 64),
+    ("root", at!(RegCreateKeyInformationV1, root_object), 64),
+    ("type", at!(RegCreateKeyInformationV1, object_type), 64),
+    ("options", at!(RegCreateKeyInformationV1, options), 32),
+    ("className", at!(RegCreateKeyInformationV1, class), 64),
+    ("sd", at!(RegCreateKeyInformationV1, security_descriptor), 64),
+    ("qos", at!(RegCreateKeyInformationV1, security_quality_of_service), 64),
+    ("desired", at!(RegCreateKeyInformationV1, desired_access), 32),
+    ("granted", at!(RegCreateKeyInformationV1, granted_access), 32),
+    ("disposition", at!(RegCreateKeyInformationV1, disposition), 64),
+    ("resultObject", at!(RegCreateKeyInformationV1, result_object), 64),
+    ("version", at!(RegCreateKeyInformationV1, version), 64),
+    ("remaining", at!(RegCreateKeyInformationV1, remaining_name), 64),
+    ("wow64", at!(RegCreateKeyInformationV1, wow64_flags), 32),
+    ("flags", at!(RegCreateKeyInformationV1, attributes), 32),
+    ("mode", at!(RegCreateKeyInformationV1, check_access_mode), 8),
 ];
 
 /// Captura OBJECT_ATTRIBUTES e o nome, valida raiz e opções, notifica os
@@ -408,8 +441,8 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
     install_hooks();
     with_request(|request| {
         let output = probe(output, 8, previous_mode, true)?;
-        let attributes_pointer = probe(attributes_pointer, 48, previous_mode, false)?;
-        if guest::read32(attributes_pointer) != 48 {
+        let attributes_pointer = probe(attributes_pointer, ObjectAttributes::SIZE, previous_mode, false)?;
+        if captured::<u32>(attributes_pointer, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
             return Ok(0xC000_000D);
         }
         if options & !(if create { 1 } else { 12 }) != 0 {
@@ -419,13 +452,13 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
             return Ok(0xC000_00BB);
         }
         let output_disposition = if output_disposition != 0 { probe(output_disposition, 4, previous_mode, true)? } else { 0 };
-        let mut attribute_flags = guest::read32(attributes_pointer + 24);
+        let mut attribute_flags: u32 = captured(attributes_pointer, offset_of!(ObjectAttributes, attributes))?;
         if previous_mode {
             attribute_flags &= !0x200;
         }
-        let name_pointer = guest::read64(attributes_pointer + 16);
+        let name_pointer: u64 = captured(attributes_pointer, offset_of!(ObjectAttributes, object_name))?;
         let mut key_name = read_unicode_string(name_pointer, previous_mode)?;
-        let root_handle = guest::read64(attributes_pointer + 8);
+        let root_handle: u64 = captured(attributes_pointer, offset_of!(ObjectAttributes, root_directory))?;
         let parent = if root_handle != 0 { Some(resolve_key_handle(root_handle, previous_mode, 0)?) } else { None };
         if (parent.is_some() && key_name.starts_with('\\')) || (parent.is_none() && !starts_with_registry(&key_name)) {
             return Ok(0xC000_003B);
@@ -440,8 +473,8 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
         };
         // Descritor e QoS capturados de OBJECT_ATTRIBUTES; o descritor é
         // sondado para usuário e capturado ao criar a política do nó.
-        let descriptor = guest::read64(attributes_pointer + 32);
-        let qos = guest::read64(attributes_pointer + 40);
+        let descriptor: u64 = captured(attributes_pointer, offset_of!(ObjectAttributes, security_descriptor))?;
+        let qos: u64 = captured(attributes_pointer, offset_of!(ObjectAttributes, security_quality_of_service))?;
         if previous_mode && descriptor != 0 && !create_section::descriptor_probe(descriptor) {
             return Ok(0xC000_0005);
         }
@@ -482,17 +515,19 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
         let mut created_disposition = 0u32;
         let bypass = |fields: &Fields| Outcome {
             status: 0,
-            object: if fields["resultObject"] != 0 { guest::read64(fields["resultObject"]) } else { 0 },
+            // *ResultObject / *Disposition: células apontadas pela notificação
+            // (as próprias desta chamada, salvo se um filtro trocou o ponteiro).
+            object: if fields["resultObject"] != 0 { out::<u64>(fields["resultObject"]).get() } else { 0 },
             granted: Some(fields["granted"] as u32),
             flags: Some(fields["flags"] as u32),
-            disposition: Some(if fields["disposition"] != 0 { guest::read32(fields["disposition"]) } else { 0 }),
+            disposition: Some(if fields["disposition"] != 0 { out::<u32>(fields["disposition"]).get() } else { 0 }),
         };
         let result = notify_and_perform(
             request,
             if create { 26 } else { 28 },
             if create { 27 } else { 29 },
-            144,
-            80,
+            RegCreateKeyInformationV1::SIZE,
+            at!(RegCreateKeyInformationV1, call_context),
             &initial,
             CREATE_LAYOUT,
             |operation: &Fields| -> Flow<Outcome> {
@@ -551,10 +586,10 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                 created_disposition = if existed { 2 } else { 1 };
                 let body = if callbacks::has() { request.retain_key_body(key_objects::for_handle(opened))? } else { 0 };
                 if operation["resultObject"] != 0 {
-                    guest::write64(operation["resultObject"], body);
+                    out::<u64>(operation["resultObject"]).set(body);
                 }
                 if operation["disposition"] != 0 {
-                    guest::write32(operation["disposition"], created_disposition);
+                    out::<u32>(operation["disposition"]).set(created_disposition);
                 }
                 Ok(Outcome { status: 0, object: body, granted: Some(granted), flags: Some(operation["flags"] as u32), disposition: None })
             },
@@ -569,7 +604,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
             if callbacks::has() {
                 // Um BYPASS de abertura precisa fornecer identidade viva; um
                 // sucesso isolado não cria objeto nem handle.
-                let object = if result.object != 0 { result.object } else { guest::read64(output_object) };
+                let object = if result.object != 0 { result.object } else { out::<u64>(output_object).get() };
                 let Some(body) = key_objects::get(object) else { return Ok(0xC000_0008) };
                 if opened == 0 || key_objects::for_handle(opened) != Some(body.pointer) {
                     if opened != 0 {
@@ -582,7 +617,10 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
             }
             publish_key_handle(output, opened, result.flags.unwrap_or(attribute_flags), result.granted.unwrap_or(access), previous_mode)?;
             if output_disposition != 0 {
-                guest::write32(output_disposition, result.disposition.unwrap_or(created_disposition));
+                // PULONG Disposition do chamador (sondado acima quando de usuário).
+                if guest::try_write::<u32>(output_disposition, result.disposition.unwrap_or(created_disposition)).is_err() {
+                    return status(0xC000_0005);
+                }
             }
             opened = 0;
             Ok(0)
@@ -609,15 +647,80 @@ pub enum Kind {
 
 /// (classe pré, classe pós, tamanho, offset do CallContext, campos).
 fn notification_layout(kind: Kind) -> (u32, u32, u64, u64, Layout) {
+    type Delete = RegDeleteKeyInformation;
+    type DeleteValue = RegDeleteValueKeyInformation;
+    type Set = RegSetValueKeyInformation;
+    type SetInfo = RegSetInformationKeyInformation;
+    type Query = RegQueryKeyInformation;
+    type QueryValue = RegQueryValueKeyInformation;
+    // Enumeração de chave e de valor compartilham o layout.
+    type Enumerate = RegEnumerateKeyInformation;
+    const ENUMERATE: Layout = &[
+        ("object", at!(Enumerate, object), 64),
+        ("index", at!(Enumerate, index), 32),
+        ("klass", at!(Enumerate, key_information_class), 32),
+        ("out", at!(Enumerate, key_information), 64),
+        ("length", at!(Enumerate, length), 32),
+        ("returned", at!(Enumerate, result_length), 64),
+    ];
     match kind {
-        Kind::DeleteKey => (0, 15, 32, 8, &[("object", 0, 64)]),
-        Kind::DeleteValue => (2, 17, 40, 16, &[("object", 0, 64), ("name", 8, 64)]),
-        Kind::Set => (1, 16, 64, 40, &[("object", 0, 64), ("name", 8, 64), ("title", 16, 32), ("type", 20, 32), ("data", 24, 64), ("length", 32, 32)]),
-        Kind::SetInfo => (3, 18, 56, 32, &[("object", 0, 64), ("klass", 8, 32), ("data", 16, 64), ("length", 24, 32)]),
-        Kind::QueryKey => (7, 22, 64, 40, &[("object", 0, 64), ("klass", 8, 32), ("out", 16, 64), ("length", 24, 32), ("returned", 32, 64)]),
-        Kind::QueryValue => (8, 23, 72, 48, &[("object", 0, 64), ("name", 8, 64), ("klass", 16, 32), ("out", 24, 64), ("length", 32, 32), ("returned", 40, 64)]),
-        Kind::EnumerateKey => (5, 20, 64, 40, &[("object", 0, 64), ("index", 8, 32), ("klass", 12, 32), ("out", 16, 64), ("length", 24, 32), ("returned", 32, 64)]),
-        Kind::EnumerateValue => (6, 21, 64, 40, &[("object", 0, 64), ("index", 8, 32), ("klass", 12, 32), ("out", 16, 64), ("length", 24, 32), ("returned", 32, 64)]),
+        Kind::DeleteKey => (0, 15, Delete::SIZE, at!(Delete, call_context), &[("object", at!(Delete, object), 64)]),
+        Kind::DeleteValue => (2, 17, DeleteValue::SIZE, at!(DeleteValue, call_context), &[("object", at!(DeleteValue, object), 64), ("name", at!(DeleteValue, value_name), 64)]),
+        Kind::Set => (
+            1,
+            16,
+            Set::SIZE,
+            at!(Set, call_context),
+            &[
+                ("object", at!(Set, object), 64),
+                ("name", at!(Set, value_name), 64),
+                ("title", at!(Set, title_index), 32),
+                ("type", at!(Set, type_), 32),
+                ("data", at!(Set, data), 64),
+                ("length", at!(Set, data_size), 32),
+            ],
+        ),
+        Kind::SetInfo => (
+            3,
+            18,
+            SetInfo::SIZE,
+            at!(SetInfo, call_context),
+            &[
+                ("object", at!(SetInfo, object), 64),
+                ("klass", at!(SetInfo, key_set_information_class), 32),
+                ("data", at!(SetInfo, key_set_information), 64),
+                ("length", at!(SetInfo, key_set_information_length), 32),
+            ],
+        ),
+        Kind::QueryKey => (
+            7,
+            22,
+            Query::SIZE,
+            at!(Query, call_context),
+            &[
+                ("object", at!(Query, object), 64),
+                ("klass", at!(Query, key_information_class), 32),
+                ("out", at!(Query, key_information), 64),
+                ("length", at!(Query, length), 32),
+                ("returned", at!(Query, result_length), 64),
+            ],
+        ),
+        Kind::QueryValue => (
+            8,
+            23,
+            QueryValue::SIZE,
+            at!(QueryValue, call_context),
+            &[
+                ("object", at!(QueryValue, object), 64),
+                ("name", at!(QueryValue, value_name), 64),
+                ("klass", at!(QueryValue, key_value_information_class), 32),
+                ("out", at!(QueryValue, key_value_information), 64),
+                ("length", at!(QueryValue, length), 32),
+                ("returned", at!(QueryValue, result_length), 64),
+            ],
+        ),
+        Kind::EnumerateKey => (5, 20, Enumerate::SIZE, at!(Enumerate, call_context), ENUMERATE),
+        Kind::EnumerateValue => (6, 21, Enumerate::SIZE, at!(Enumerate, call_context), ENUMERATE),
     }
 }
 
@@ -666,9 +769,10 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                 probe(data, length, previous_mode, false)?;
             }
             if callbacks::has() && length != 0 {
-                let captured = request.allocate(length)?;
-                guest::write_bytes(captured, &guest::read_bytes(data, length as usize));
-                operation.insert("data", captured);
+                let copy = request.allocate(length)?;
+                let Ok(bytes) = guest::try_read_bytes(data, length as usize) else { return status(0xC000_0005) };
+                guest::write_bytes(copy, &bytes);
+                operation.insert("data", copy);
             }
         }
         if let Some(&out) = arguments.get("out") {
@@ -705,7 +809,8 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         if length > 0x10_0000 {
                             return Ok(Outcome::from_status(0xC000_009A));
                         }
-                        let bytes = guest::read_bytes(field("data"), length as usize);
+                        // Buffer do chamador (sondado) ou a cópia privada.
+                        let Ok(bytes) = guest::try_read_bytes(field("data"), length as usize) else { return status(0xC000_0005) };
                         let name = read_unicode_string(field("name"), false)?;
                         if registry::set_node_value(node, &path, &name, field("type") as u32, bytes) { 0 } else { 0xC000_017C }
                     }
@@ -722,7 +827,7 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         } else if field("length") != 4 {
                             0xC000_0004
                         } else {
-                            let tags = guest::read32(field("data"));
+                            let tags: u32 = captured(field("data"), offset_of!(KeyHandleTagsInformation, handle_tags))?;
                             with(|state| match resolved.entry {
                                 Entry::Native(handle) => {
                                     if let Some(record) = state.records.get_mut(&handle) {
@@ -804,10 +909,11 @@ pub fn close(handle: u32, action: fn(u32) -> bool) -> bool {
                 request,
                 14,
                 25,
-                32,
-                8,
+                // REG_KEY_HANDLE_CLOSE_INFORMATION: mesmo layout de REG_DELETE_KEY_INFORMATION.
+                RegDeleteKeyInformation::SIZE,
+                at!(RegDeleteKeyInformation, call_context),
                 &fields(&[("object", body)]),
-                &[("object", 0, 64)],
+                &[("object", at!(RegDeleteKeyInformation, object), 64)],
                 |_| {
                     attempted = true;
                     closed = action(handle);
@@ -866,14 +972,16 @@ pub fn zw_record(handle: u32) -> Option<close::ZwRecord> {
 pub fn open_path(path: &str, create: bool) -> Result<(u32, u64), KernelError> {
     let mut handle = 0;
     let status = with_request(|request| {
-        let attributes = request.allocate(48)?;
+        let attributes = request.allocate(ObjectAttributes::SIZE)?;
         let output = request.allocate(8)?;
-        guest::write32(attributes, 48);
-        guest::write64(attributes + 16, request.create_unicode_string(path)?);
-        guest::write32(attributes + 24, 0x240);
+        // SAFETY: bloco próprio recém-alocado e zerado.
+        let object = unsafe { ObjectAttributes::at(attributes) };
+        object.length.set(ObjectAttributes::SIZE as u32);
+        object.object_name.set(request.create_unicode_string(path)?);
+        object.attributes.set(0x240);
         let status = open_or_create_key(create, output, 0xF003F, attributes, 0, 0, 0, 0, false)?;
         if status == 0 {
-            handle = guest::read64(output);
+            handle = out::<u64>(output).get();
         }
         Ok(status)
     })?;
@@ -899,17 +1007,20 @@ pub fn named_value(kind: Kind, handle: u64, name: &str, value_type: u32, bytes: 
         if status != 0xC000_0023 {
             return Ok(status);
         }
-        let length = guest::read32(returned) as u64;
+        let length = out::<u32>(returned).get() as u64;
         let buffer = request.allocate(length)?;
         let status = key_operation(Kind::QueryValue, handle, &fields(&[("name", name_pointer), ("klass", 2), ("out", buffer), ("length", length), ("returned", returned)]), false)?;
         if status != 0 {
             return Ok(status);
         }
-        let data_length = guest::read32(buffer + 8) as u64;
-        if data_length > length.saturating_sub(12) {
+        // SAFETY: resposta KeyValuePartialInformation no bloco próprio.
+        let partial = unsafe { KeyValuePartialInformation::at(buffer) };
+        let header = offset_of!(KeyValuePartialInformation, data) as u64;
+        let data_length = partial.data_length.get() as u64;
+        if data_length > length.saturating_sub(header) {
             return Ok(0xC000_0023);
         }
-        value = Some(Value { name: String::from(name), value_type: guest::read32(buffer + 4), data: guest::read_bytes(buffer + 12, data_length as usize) });
+        value = Some(Value { name: String::from(name), value_type: partial.type_.get(), data: guest::read_bytes(buffer + header, data_length as usize) });
         Ok(0)
     })?;
     Ok((status, value))
@@ -927,22 +1038,31 @@ pub fn query_security(body: u64, information: u32, buffer: u64, capacity: u32) -
         let mut selected = information;
         let mut needed = capacity;
         let status = with_request(|request| {
+            // SECURITY_INFORMATION e ULONG Length desta chamada, apontados
+            // pela notificação (filtros podem editá-los).
             let information_pointer = request.allocate(8)?;
             let length_pointer = information_pointer + 4;
-            guest::write32(information_pointer, selected);
-            guest::write32(length_pointer, needed);
+            let (information_cell, length_cell) = (out::<u32>(information_pointer), out::<u32>(length_pointer));
+            information_cell.set(selected);
+            length_cell.set(needed);
+            type Security = RegQueryKeySecurityInformation;
             let result = notify_and_perform(
                 request,
                 36,
                 37,
-                56,
-                32,
+                Security::SIZE,
+                at!(Security, call_context),
                 &fields(&[("object", body), ("information", information_pointer), ("buffer", buffer), ("length", length_pointer)]),
-                &[("object", 0, 64), ("information", 8, 64), ("buffer", 16, 64), ("length", 24, 64)],
+                &[
+                    ("object", at!(Security, object), 64),
+                    ("information", at!(Security, security_information), 64),
+                    ("buffer", at!(Security, security_descriptor), 64),
+                    ("length", at!(Security, length), 64),
+                ],
                 |_| {
-                    let queried = key_security::query(body, guest::read32(information_pointer), buffer, guest::read32(length_pointer))?;
-                    guest::write32(information_pointer, queried.information);
-                    guest::write32(length_pointer, queried.needed as u32);
+                    let queried = key_security::query(body, information_cell.get(), buffer, length_cell.get())?;
+                    information_cell.set(queried.information);
+                    length_cell.set(queried.needed as u32);
                     Ok(Outcome { status: queried.status, object: body, ..Default::default() })
                 },
                 false,
@@ -950,8 +1070,8 @@ pub fn query_security(body: u64, information: u32, buffer: u64, capacity: u32) -
             );
             // O pós ainda pode mudar o tamanho pelo ponteiro original; só
             // depois dele o serviço publica LengthNeeded.
-            selected = guest::read32(information_pointer);
-            needed = guest::read32(length_pointer);
+            selected = information_cell.get();
+            needed = length_cell.get();
             Ok(result?.status)
         })?;
         Ok(QueryResult { status, needed: needed as usize, information: selected })
