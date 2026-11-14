@@ -10,7 +10,15 @@
 //!
 //! Estado por CPU, como no NT: a pilha do usuário na entrada de syscall é a
 //! KPCR.UserRsp (gs:[10h]) e o topo da pilha de kernel é a KPRCB.RspBase
-//! (gs:[1A8h]), os campos do KiSystemCall64; o resto do estado de uma
+//! (gs:[1A8h]), os campos do KiSystemCall64. Como no KiSwapContext, cada
+//! despacho para o anel 3 grava em KPRCB.RspBase e TSS.RSP0 a InitialStack
+//! da thread despachada (a KTHREAD corrente, gs:[188h]): syscalls, IRQs e
+//! exceções do anel 3 caem na pilha de kernel da própria thread. Uma thread
+//! sem pilha própria (a que roda na pilha de boot, como o anel 3 cru dos
+//! autotestes) usa a pilha reserva da CPU. A TSS também leva a IST1, a pilha
+//! da falta dupla (vetor 8): um estouro de pilha de kernel falta na guarda, a
+//! entrega da falta não cabe na pilha estourada e a falta dupla roda numa
+//! pilha boa, que imprime o diagnóstico. O resto do estado de uma
 //! execução no anel 3 fica no `UserExecutionBlock` da CPU, na cauda da
 //! reserva da KPCR. Os stubs endereçam tudo por `gs:` (ou pela VA da KPCR,
 //! gs:[KPCR.Self], quando precisam de um ponteiro); o Rust usa [`block`] e
@@ -24,7 +32,7 @@ use core::mem::{offset_of, size_of};
 use crate::hal::cpu;
 use crate::ntos::ex::system_services;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::KthreadView1;
+use crate::ntos::inc::types::{Kthread, KthreadView1};
 use crate::ntos::ke::pcr::{self, layout};
 use crate::rtl::SpinLock;
 
@@ -576,7 +584,8 @@ fn service_lookup(number: u64, shadow: u64, stack_count: &mut u64) -> u64 {
 }
 
 struct Execution {
-    syscall_stack_top: u64,
+    /// Topo da pilha reserva da CPU (thread sem pilha de kernel própria).
+    fallback_stack: u64,
     ready: bool,
     running: bool,
     /// CONTEXT salvo pela syscall em curso (`g_userFrameContext`).
@@ -584,7 +593,7 @@ struct Execution {
     service_frame: u64,
 }
 
-static STATE: SpinLock<Execution> = SpinLock::new(Execution { syscall_stack_top: 0, ready: false, running: false, frame_context: 0, service_frame: 0 });
+static STATE: SpinLock<Execution> = SpinLock::new(Execution { fallback_stack: 0, ready: false, running: false, frame_context: 0, service_frame: 0 });
 /// Faixas do CONTEXT escritas pelo kernel durante a syscall, preservadas
 /// sobre o salvamento do retorno.
 static CONTEXT_KEEP: SpinLock<([bool; CONTEXT_SIZE], [u8; CONTEXT_SIZE])> = SpinLock::new(([false; CONTEXT_SIZE], [0; CONTEXT_SIZE]));
@@ -607,14 +616,22 @@ fn write32(address: u64, value: u32) {
     unsafe { core::ptr::write_volatile(address as *mut u32, value) }
 }
 
-/// GDT com os segmentos de usuário e a TSS (RSP0 = pilha de syscall),
-/// LGDT/LTR, EFER.SCE e STAR/LSTAR/SFMASK. A KPCR continua no GS do kernel; o
+/// Deslocamentos da TSS de 64 bits: RSP0 e IST1.
+const TSS_RSP0: usize = 4;
+const TSS_IST1: usize = 0x24;
+/// Vetor da falta dupla e a entrada da IST que ele usa.
+const DOUBLE_FAULT_VECTOR: u8 = 8;
+const DOUBLE_FAULT_IST: u8 = 1;
+
+/// GDT com os segmentos de usuário e a TSS (RSP0 = pilha reserva da CPU,
+/// IST1 = pilha da falta dupla), LGDT/LTR, o portão do vetor 8 na IST1,
+/// EFER.SCE e STAR/LSTAR/SFMASK. A KPCR continua no GS do kernel; o
 /// KernelGSbase do usuário vai a zero.
-pub fn user_mode_init(stack_top: u64) -> Result<u64, crate::rtl::KernelError> {
+pub fn user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, crate::rtl::KernelError> {
     if STATE.lock().ready {
         return Err(crate::rtl::KernelError::new("userModeInit: ja inicializado"));
     }
-    if stack_top == 0 || stack_top & 0xF != 0 {
+    if stack_top == 0 || stack_top & 0xF != 0 || double_fault_stack == 0 || double_fault_stack & 0xF != 0 {
         return Err(crate::rtl::KernelError::new("userModeInit: pilha invalida"));
     }
     #[repr(C, packed)]
@@ -636,7 +653,8 @@ pub fn user_mode_init(stack_top: u64) -> Result<u64, crate::rtl::KernelError> {
         *gdt.add((SEL_USER_DATA / 8) as usize) = 0x0000_F200_0000_0000;
         *gdt.add((SEL_USER_CODE / 8) as usize) = 0x0020_FA00_0000_0000;
         core::ptr::write_bytes(tss, 0, TSS_LIMIT as usize);
-        core::ptr::write_unaligned(tss.add(4) as *mut u64, stack_top);
+        core::ptr::write_unaligned(tss.add(TSS_RSP0) as *mut u64, stack_top);
+        core::ptr::write_unaligned(tss.add(TSS_IST1) as *mut u64, double_fault_stack);
         core::ptr::write_unaligned(tss.add(102) as *mut u16, TSS_LIMIT as u16);
         let base = tss as u64;
         *gdt.add((SEL_TSS / 8) as usize) = (TSS_LIMIT - 1) | ((base & 0xFF_FFFF) << 16) | (0x89 << 40) | (((base >> 24) & 0xFF) << 56);
@@ -645,6 +663,8 @@ pub fn user_mode_init(stack_top: u64) -> Result<u64, crate::rtl::KernelError> {
         asm!("lgdt [{}]", in(reg) &register, options(readonly, nostack));
         asm!("mov ax, {selector}", "ltr ax", selector = const SEL_TSS, out("ax") _, options(nostack));
     }
+    // Só com a TSS carregada o portão pode apontar a IST.
+    crate::nano::interrupts::set_interrupt_stack(DOUBLE_FAULT_VECTOR, DOUBLE_FAULT_IST);
     // A entrada de syscall desta CPU carrega a mesma pilha da TSS.RSP0.
     let kpcr = pcr::current();
     kpcr.prcb.rsp_base.set(stack_top);
@@ -656,9 +676,38 @@ pub fn user_mode_init(stack_top: u64) -> Result<u64, crate::rtl::KernelError> {
     cpu::write_msr(MSR_SFMASK, SFMASK_VALUE);
     cpu::write_msr(MSR_KERNEL_GS_BASE, 0);
     let mut state = STATE.lock();
-    state.syscall_stack_top = stack_top;
+    state.fallback_stack = stack_top;
     state.ready = true;
     Ok(gdt as u64)
+}
+
+/// RSP0 e IST1 da TSS desta CPU.
+pub fn tss_stacks() -> (u64, u64) {
+    let tss = core::ptr::addr_of!(user_tss_storage) as *const u8;
+    // SAFETY: a TSS é uma variável estática da imagem.
+    unsafe { (core::ptr::read_unaligned(tss.add(TSS_RSP0) as *const u64), core::ptr::read_unaligned(tss.add(TSS_IST1) as *const u64)) }
+}
+
+/// O topo da pilha de kernel do despacho: a InitialStack da KTHREAD
+/// corrente quando ela tem pilha própria; senão (a thread roda na pilha de
+/// boot) a pilha reserva da CPU.
+fn dispatch_stack(fallback: u64) -> u64 {
+    let thread = pcr::current().prcb.current_thread.get();
+    // SAFETY: a KTHREAD corrente está viva enquanto é despachada.
+    let initial = if thread != 0 { unsafe { Kthread::at(thread) }.initial_stack.get() } else { 0 };
+    if crate::ntos::mm::memory_map::is_kernel_stack(initial) { initial } else { fallback }
+}
+
+/// O KiSwapContext do despacho: a pilha de kernel da thread vira a da
+/// entrada de syscall (KPRCB.RspBase) e a das IRQs e exceções do anel 3
+/// (TSS.RSP0). No fim do intervalo as duas voltam à pilha reserva da CPU:
+/// nenhuma aponta para a pilha de uma thread que o ceifador pode devolver.
+fn load_kernel_stack(top: u64) {
+    pcr::current().prcb.rsp_base.set(top);
+    let tss = core::ptr::addr_of_mut!(user_tss_storage) as *mut u8;
+    // SAFETY: a TSS é uma variável estática da imagem; a CPU só lê o RSP0
+    // numa entrada vinda do anel 3, e aqui ela está no anel 0.
+    unsafe { core::ptr::write_unaligned(tss.add(TSS_RSP0) as *mut u64, top) };
 }
 
 /// O anel 3 foi armado.
@@ -666,8 +715,8 @@ pub fn ready() -> bool {
     STATE.lock().ready
 }
 
-/// No M0 só o BSP executa o anel 3: só ele tem a TSS, o LSTAR e a pilha de
-/// syscall armados.
+/// No M0 só o BSP executa o anel 3: só ele tem a TSS, o LSTAR e a pilha
+/// reserva armados.
 fn assert_boot_processor() {
     assert!(pcr::current().prcb.number.get() == 0, "anel 3 fora do processador de boot");
 }
@@ -676,18 +725,21 @@ fn assert_boot_processor() {
 /// KernelGSbase = KPCR em anel 3; o stub faz o SWAPGS antes do IRETQ, e a
 /// entrada de syscall ou de interrupção o desfaz).
 pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflags: u64, argument2: u64) -> u64 {
-    let stack = {
+    let fallback = {
         let mut state = STATE.lock();
         assert!(state.ready, "execUserMode: userModeInit nao rodou");
         assert!(!state.running, "execUserMode: ja ha processo em ring 3");
         state.running = true;
-        state.syscall_stack_top
+        state.fallback_stack
     };
     assert_boot_processor();
+    let stack = dispatch_stack(fallback);
+    load_kernel_stack(stack);
     let previous_swap = cpu::read_msr(MSR_KERNEL_GS_BASE);
     reset_fault_state();
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     let exit_code = unsafe { user_exec_ring3(entry, user_rsp, stack, argument1, rflags, argument2) };
+    load_kernel_stack(fallback);
     cpu::write_msr(MSR_KERNEL_GS_BASE, previous_swap);
     STATE.lock().running = false;
     exit_code
@@ -696,15 +748,17 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
 /// Um intervalo de escalonamento. A HAL só move o estado dos registradores; o
 /// kernel escolhe a thread.
 pub fn exec_user_context(context: u64, teb: u64) -> u32 {
-    let stack = {
+    let fallback = {
         let mut state = STATE.lock();
         assert!(state.ready && !state.running, "execUserContext: invalid execution state");
         assert!(context & 15 == 0, "execUserContext: unaligned CONTEXT");
         state.running = true;
         state.frame_context = 0;
-        state.syscall_stack_top
+        state.fallback_stack
     };
     assert_boot_processor();
+    let stack = dispatch_stack(fallback);
+    load_kernel_stack(stack);
     let block = block();
     if block.capture_state.get() == 1 {
         let dr7 = read64(context + 0x70);
@@ -716,6 +770,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     block.continue_flag.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     let result = unsafe { user_exec_context(context, stack) };
+    load_kernel_stack(fallback);
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     let mut state = STATE.lock();

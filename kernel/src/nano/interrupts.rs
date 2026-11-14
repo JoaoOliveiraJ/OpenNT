@@ -72,6 +72,19 @@ fn set_gate(vector: u16, handler_address: u64) {
     physical::write32(base + 12, 0);
 }
 
+/// Liga o portão de `vector` à entrada `ist` (1-7) da IST da TSS: a CPU troca
+/// para aquela pilha na entrega, qualquer que seja a pilha interrompida. Só
+/// vale depois do LTR de uma TSS com a entrada preenchida.
+pub fn set_interrupt_stack(vector: u8, ist: u8) {
+    assert!((1..=7).contains(&ist), "IST fora de 1..7");
+    physical::write8(IDT_PHYSICAL_ADDRESS + vector as u64 * 16 + 4, ist);
+}
+
+/// A entrada da IST do portão de `vector` (0 = a pilha corrente).
+pub fn interrupt_stack(vector: u8) -> u8 {
+    physical::read8(IDT_PHYSICAL_ADDRESS + vector as u64 * 16 + 4) & 7
+}
+
 // ---- detecção de plataforma (CPUID, só para log) ----
 fn hypervisor_vendor() -> String {
     let registers = cpu::cpuid(0x4000_0000);

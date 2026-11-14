@@ -17,7 +17,10 @@
 //! `int 0x2D` não podem voltar com IRET cego: no anel 3 o processo morre com o
 //! NTSTATUS da exceção (CONTEXT salvo, saída tipo 3, longjmp ao chamador) e o
 //! kernel continua; no anel 0 vão para [`rs_kernel_exception`], que imprime o
-//! diagnóstico e para a CPU. Antes disso, uma falta de página do anel 0 passa
+//! diagnóstico e para a CPU. A falta dupla (vetor 8) entra pela IST1 da TSS
+//! (`usermode::user_mode_init`), numa pilha própria: um estouro de pilha de
+//! kernel, que falta na guarda e não cabe na pilha estourada, vira
+//! diagnóstico em vez de falta tripla. Antes disso, uma falta de página do anel 0 passa
 //! pelos provedores de residência ([`rs_kernel_page_fault`]): página paginável
 //! despejada ou cópia na escrita resolvida repete a instrução. O timer
 //! encerra intervalos de usuário (tipo 2) e
@@ -679,6 +682,22 @@ extern "sysv64" fn rs_kernel_trap_dispatch(vector: u32, registers: u64, fx: u64)
     handled as u32
 }
 
+/// Uma falta numa reserva de pilha de kernel (ou na guarda da pilha de boot)
+/// é estouro ou uso de pilha liberada: o diagnóstico diz qual, sem trava (a
+/// geometria das reservas é aritmética). Um estouro chega aqui como falta
+/// dupla, na pilha da IST1: a entrega da falta de página na guarda não cabe
+/// na pilha estourada.
+fn describe_stack_fault(address: u64) {
+    use crate::ntos::mm::{kernel_stack, memory_map as map};
+    let thread = crate::ntos::ke::pcr::current().prcb.current_thread.get();
+    if let Some(fault) = kernel_stack::classify_fault(address) {
+        let what = if fault.overflow { "ESTOURO DA PILHA DE KERNEL" } else { "ACESSO A PILHA DE KERNEL JA LIBERADA" };
+        write_args(format_args!("*** {}: acesso em {:#x}, pilha com StackBase={:#x} (KTHREAD corrente {:#x})\n", what, address, fault.base, thread));
+    } else if (map::BOOT_STACK_LIMIT - kernel_stack::KERNEL_STACK_GUARD..map::BOOT_STACK_LIMIT).contains(&address) {
+        write_args(format_args!("*** ESTOURO DA PILHA DE BOOT: acesso em {:#x}, na guarda abaixo de {:#x} (KTHREAD corrente {:#x})\n", address, map::BOOT_STACK_LIMIT, thread));
+    }
+}
+
 /// Diagnóstico de exceção de kernel. Não aloca nem adquire locks.
 #[no_mangle]
 extern "C" fn rs_kernel_exception(frame: &TrapFrame) -> ! {
@@ -695,8 +714,12 @@ extern "C" fn rs_kernel_exception(frame: &TrapFrame) -> ! {
         write_args(format_args!(" erro={:#x}", code));
     }
     write_args(format_args!("\n    RIP={:#018x} CS={:#06x} RFLAGS={:#x} RSP={:#018x}\n", rip, cs, rflags, rsp));
-    if vector == 14 {
-        write_args(format_args!("    CR2={:#018x}\n", cpu::read_cr2()));
+    if vector == 14 || vector == 8 {
+        // Na falta dupla, o CR2 é o da falta de página cuja entrega não coube
+        // na pilha.
+        let address = cpu::read_cr2();
+        write_args(format_args!("    CR2={:#018x}\n", address));
+        describe_stack_fault(address);
     }
     write_args(format_args!(
         "    RAX={:#018x} RBX={:#018x} RCX={:#018x} RDX={:#018x}\n",

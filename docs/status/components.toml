@@ -230,10 +230,10 @@ categoria = "Núcleo do kernel"
 icone = "threads"
 descricao = "Alterna a CPU entre os processos do kernel e mantém as estruturas de processo e thread do NT (EPROCESS e KTHREAD)."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/ps/scheduler.rs", "kernel/src/ntos/ps/process.rs"]
-testes = ["selftest", "fase3"]
+caminhos = ["kernel/src/ntos/ps/scheduler.rs", "kernel/src/ntos/ps/process.rs", "kernel/src/ntos/mm/kernel_stack.rs"]
+testes = ["selftest", "fase3", "fase7"]
 fase = "3"
-notas = "O escalonador veio na fase 1; as estruturas reais de processo e thread, na fase 3. Os processos do kernel são tarefas cooperativas: cada passo roda até a tarefa ceder a CPU, e o timer de 100 Hz só dispara o passo seguinte."
+notas = "O escalonador veio na fase 1; as estruturas reais de processo e thread, na fase 3. Os processos do kernel são tarefas cooperativas: cada passo roda até a tarefa ceder a CPU, e o timer de 100 Hz só dispara o passo seguinte. Como no Windows, cada thread que executa (de usuário ou de sistema) tem a sua pilha de kernel, na metade de sistema e com uma página de guarda, descrita nos campos da KTHREAD (StackBase, StackLimit, InitialStack e KernelStack): as chamadas de sistema, as interrupções e as exceções vindas do modo usuário rodam na pilha da própria thread, que volta à memória quando a thread termina. Um estouro de pilha de kernel cai na guarda e vira um diagnóstico com o endereço e a pilha, numa pilha reservada para a falta dupla, em vez de reiniciar a máquina. IoGetStackLimits devolve os limites reais da pilha da thread corrente."
 
 [[componente]]
 nome = "Sincronização e despacho"

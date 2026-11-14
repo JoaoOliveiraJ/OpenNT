@@ -21,7 +21,7 @@ use crate::hal::{bundle, kmalloc};
 use crate::hal::amd64::usermode;
 use crate::ntos::cm::service::database::{self as service_database, CommandLine, ServiceError, ServiceResult};
 use crate::drivers::fs::volume_files::{self, VolumeFile};
-use crate::ntos::mm::{paging, pfn};
+use crate::ntos::mm::{kernel_stack, paging, pfn};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions};
@@ -119,8 +119,9 @@ fn initial_stack() -> Result<(u64, u64, u64), KernelError> {
     Ok((base, top, top - 8))
 }
 
-fn syscall_stack() -> Option<u64> {
-    Some(state::with(|state| state.syscall_stack_top)).filter(|&top| top != 0)
+/// A KTHREAD da primeira thread, com pilha de kernel própria.
+fn create_main_thread(process_pointer: u64, thread_id: u64) -> Result<u64, KernelError> {
+    process::create_kernel_thread(process_pointer, thread_id, true, 1, Some(kernel_stack::create(false)?))
 }
 
 /// EPROCESS/KTHREAD reais: o processo entra em PsActiveProcessHead e vira o
@@ -139,7 +140,7 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
         initial_stack()
     })
     .and_then(|stack| stack);
-    let thread = stack.and_then(|(_, _, stack_top)| process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| (thread, stack_top))));
+    let thread = stack.and_then(|(_, _, stack_top)| create_main_thread(process_pointer, cid::ALLOCATE).and_then(|thread| process::notify_thread_created(thread).map(|_| (thread, stack_top))));
     let (thread_pointer, stack_top) = match thread {
         Ok(thread) => thread,
         Err(error) => {
@@ -271,7 +272,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
         .and_then(|built| built)
         .inspect_err(|_| cid::release(thread_id, 0))
     });
-    let created = built.and_then(|(thread_id, teb, stack_top, context)| process::create_kernel_thread(process_pointer, thread_id, true, 1, syscall_stack()).map(|thread| (thread_id, teb, thread, stack_top, context)).inspect_err(|_| cid::release(thread_id, 0)));
+    let created = built.and_then(|(thread_id, teb, stack_top, context)| create_main_thread(process_pointer, thread_id).map(|thread| (thread_id, teb, thread, stack_top, context)).inspect_err(|_| cid::release(thread_id, 0)));
     let (thread_id, teb, thread_pointer, stack_top, context) = match created {
         Ok(created) => created,
         Err(error) => {

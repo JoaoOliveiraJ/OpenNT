@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::ex::{push_lock, rundown};
 use crate::ntos::ke::{clock, context_switch, critical_region, pcr};
+use crate::ntos::mm::kernel_stack::{self, KernelStack};
 use crate::ntos::mm::{kernel_data, memory_map, process_address_space};
 use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::{object_access, object_types};
@@ -122,6 +123,9 @@ pub struct ThreadRecord {
     pub runtime: Option<u32>,
     /// O contexto terminou (done/killed).
     pub runtime_dead: bool,
+    /// A pilha de kernel própria (`mm/kernel_stack`), até o ceifador
+    /// devolvê-la; `None` para quem roda na pilha de boot.
+    pub kernel_stack: Option<KernelStack>,
 }
 
 struct State {
@@ -408,31 +412,66 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     Ok(process)
 }
 
+/// Os campos de pilha da KTHREAD (os do KeInitThread): StackBase,
+/// StackLimit, InitialStack (o KERNEL_STACK_CONTROL) e KernelStack (o RSP
+/// salvo, que numa thread nova é o próprio InitialStack). Sem pilha própria,
+/// a thread descreve a pilha de boot, onde rodam o kmain, o System e os
+/// contextos de kernel do escalonador.
+fn publish_kernel_stack(tcb: &Kthread, stack: Option<KernelStack>) {
+    let (base, initial, limit) = stack.map_or((memory_map::BOOT_STACK_TOP, memory_map::BOOT_STACK_TOP, memory_map::BOOT_STACK_LIMIT), |stack| (stack.base, stack.initial, stack.limit));
+    tcb.stack_base.set(base);
+    tcb.stack_limit.set(limit);
+    tcb.initial_stack.set(initial);
+    tcb.kernel_stack.set(initial);
+}
+
+/// O ceifador da thread devolve a pilha de kernel própria (adiada se a CPU
+/// ainda está nela); a KTHREAD, que pode seguir referenciada, deixa de
+/// descrevê-la.
+pub fn release_kernel_stack(thread: u64) {
+    let Some(stack) = STATE.lock().threads.get_mut(&thread).and_then(|record| record.kernel_stack.take()) else { return };
+    let tcb = &ethread(thread).tcb;
+    for field in [&tcb.stack_base, &tcb.stack_limit, &tcb.initial_stack, &tcb.kernel_stack] {
+        field.set(0);
+    }
+    kernel_stack::delete(stack);
+}
+
 /// Cria um KTHREAD real ligado ao processo (ApcState.Process + Cid).
 /// `thread_id` é o TID pedido, um id já reservado por `cid::allocate` ou
-/// `cid::ALLOCATE`; o TID fica com o ETHREAD até ele ser recolhido.
-pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, previous_mode: u8, initial_stack: Option<u64>) -> Result<u64, KernelError> {
+/// `cid::ALLOCATE`; o TID fica com o ETHREAD até ele ser recolhido. A thread
+/// fica dona de `stack` (inclusive nas falhas); `None` = a pilha de boot.
+pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, previous_mode: u8, stack: Option<KernelStack>) -> Result<u64, KernelError> {
+    let refuse = |error: KernelError| {
+        if let Some(stack) = stack {
+            kernel_stack::delete(stack);
+        }
+        Err(error)
+    };
     if previous_mode > 1 {
-        return Err(KernelError::new("invalid initial thread mode"));
+        return refuse(KernelError::new("invalid initial thread mode"));
     }
     let thread_type = object_types::thread_type();
-    let thread_id = cid::claim(thread_id, cid::Kind::Thread)?;
+    let thread_id = match cid::claim(thread_id, cid::Kind::Thread) {
+        Ok(thread_id) => thread_id,
+        Err(error) => return refuse(error),
+    };
     let thread = guest::alloc_bytes(Ethread::SIZE);
     if thread == 0 {
         cid::release(thread_id, 0);
-        return Err(KernelError::new("ETHREAD allocation failed"));
+        return refuse(KernelError::new("ETHREAD allocation failed"));
     }
     if let Err(error) = cid::bind(thread_id, cid::Kind::Thread, thread) {
         cid::release(thread_id, 0);
         guest::free_bytes(thread);
-        return Err(error);
+        return refuse(error);
     }
     let owner = eprocess(process);
     let process_id = owner.unique_process_id.get();
     let object = ethread(thread);
     let tcb = &object.tcb;
     tcb.header.type_.set(THREAD_OBJECT);
-    tcb.initial_stack.set(initial_stack.unwrap_or(memory_map::BOOT_STACK_TOP));
+    publish_kernel_stack(tcb, stack);
     tcb.thread_lock.set(0);
     // Initialized não entra em fila antes de receber contexto executável.
     tcb.state.set(THREAD_INITIALIZED);
@@ -488,6 +527,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
             security,
             runtime: None,
             runtime_dead: false,
+            kernel_stack: stack,
         },
     );
     // ThreadInserted e prioridade de página normal na criação.
@@ -498,6 +538,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         if linked {
             release_thread(thread)?;
         } else {
+            release_kernel_stack(thread);
             STATE.lock().threads.remove(&thread);
             cid::release(thread_id, thread);
             object_types::account(&thread_type.name, -1, 0)?;
@@ -791,6 +832,8 @@ pub fn forget_thread(thread: u64) -> Result<(), KernelError> {
         return Err(error);
     }
     thread_tokens::release(thread)?;
+    // Uma pilha que o ceifador ainda não devolveu vai com o objeto.
+    release_kernel_stack(thread);
     let removed = STATE.lock().threads.remove(&thread);
     // Fora do registro, o TID volta à tabela de ids de cliente.
     if let Some(record) = &removed {

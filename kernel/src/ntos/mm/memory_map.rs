@@ -51,7 +51,8 @@
 //!   0xFFFF8000_00000000  (256) tabelas de páginas (mapeamento recursivo)
 //!   0xFFFF8080_00000000  (257) banco de PFNs nativo
 //!   0xFFFFA000_00000000  (320) pool executivo, dump, contígua, independente,
-//!                              visões de sistema, VirtualAlloc de kernel
+//!                              visões de sistema, VirtualAlloc de kernel,
+//!                              pilhas de kernel das threads (0xFFFFA007_...)
 //!   0xFFFFB000_00000000  (352) mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
 //!   0xFFFFC000_C0000000  (384) janela do heap do kernel e da arena dos convidados
 //!   0xFFFFF780_00000000  (495) KUSER_SHARED_DATA (visão do kernel)
@@ -206,6 +207,18 @@ pub const KERNEL_SECTION_TOP: u64 = 0xFFFF_A006_0000_0000;
 /// em PTEs de supervisor, fora da metade de usuário.
 pub const KERNEL_VIRTUAL_ALLOC_BASE: u64 = 0xFFFF_A006_0000_0000;
 pub const KERNEL_VIRTUAL_ALLOC_TOP: u64 = 0xFFFF_A006_1000_0000;
+/// Janela das pilhas de kernel das threads (`mm/kernel_stack.rs`, o
+/// MmCreateKernelStack): uma reserva fixa por pilha, com a pilha no topo e a
+/// página de guarda sem PTE logo abaixo do StackLimit.
+pub const KERNEL_STACK_BASE: u64 = 0xFFFF_A007_0000_0000;
+pub const KERNEL_STACK_TOP: u64 = 0xFFFF_A008_0000_0000;
+
+/// A VA pertence à janela das pilhas de kernel das threads.
+pub const fn is_kernel_stack(address: u64) -> bool {
+    address >= KERNEL_STACK_BASE && address < KERNEL_STACK_TOP
+}
+
+const _: () = assert!(KERNEL_VIRTUAL_ALLOC_TOP <= KERNEL_STACK_BASE && (KERNEL_STACK_BASE >> 39) & 511 == (KERNEL_POOL_BASE >> 39) & 511 && (KERNEL_STACK_TOP - 1) >> 39 == KERNEL_STACK_BASE >> 39);
 
 /// Primeira janela da metade supervisora: as tabelas reais (mapeamento
 /// recursivo), sem alocações comuns.

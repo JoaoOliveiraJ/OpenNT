@@ -262,10 +262,13 @@ pub mod thread_queries {
 
     /// [Start, Start+Size] dentro da pilha corrente: [StackLimit, StackBase] da
     /// thread e, a partir de InitialStack, os segmentos anteriores do
-    /// KERNEL_STACK_CONTROL de pilhas expandidas. O OpenNT ainda não preenche
-    /// KTHREAD.StackBase/StackLimit (só InitialStack): sem limites publicados
-    /// a região não pode ser provada na pilha e a resposta é FALSE. O ramo da
-    /// pilha de DPC (Prcb.DpcStack) também não existe no OpenNT.
+    /// KERNEL_STACK_CONTROL de pilhas expandidas. Toda KTHREAD publica
+    /// StackBase/StackLimit (`ps::process::create_kernel_thread`); sem limites
+    /// publicados (a pilha já devolvida pelo ceifador) a região não pode ser
+    /// provada na pilha e a resposta é FALSE. O controle só é seguido quando
+    /// cabe dentro do segmento, como no NT; a thread que descreve a pilha de
+    /// boot tem InitialStack no topo, sem controle. O ramo da pilha de DPC
+    /// (Prcb.DpcStack) não existe no OpenNT.
     pub fn within_stack_limits(start: u64, size: u64) -> bool {
         let address = process::get_current_thread();
         if address == 0 {
@@ -283,10 +286,11 @@ pub mod thread_queries {
             if start >= low && end <= high {
                 return true;
             }
-            if control == 0 {
+            if control < low || control > high.saturating_sub(KernelStackControl::SIZE) {
                 return false;
             }
-            // SAFETY: com limites publicados, InitialStack aponta o KERNEL_STACK_CONTROL.
+            // SAFETY: o KERNEL_STACK_CONTROL cabe no segmento publicado, que
+            // está mapeado.
             let previous = &unsafe { KernelStackControl::at(control) }.previous;
             if previous.stack_base.get() == 0 {
                 return false;

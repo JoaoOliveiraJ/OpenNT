@@ -46,8 +46,6 @@ use crate::ntos::inc::types::{Eprocess, Field, IoStatusBlock, NtStruct, UnicodeS
 /// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
-/// 64 KiB de pilha de kernel para o ring 3.
-pub const SYSCALL_STACK_PAGES: u64 = 16;
 /// Pilha de usuário da primeira thread (VA escolhida pelo alocador).
 pub const USER_STACK_SIZE: u64 = 0x10_0000;
 /// O endereço real de usuário da KUSER_SHARED_DATA.
@@ -153,8 +151,6 @@ pub struct State {
     pub section_kernel_views: alloc::vec::Vec<Region>,
     /// SSN → nome (preenchido pelo loader a partir dos stubs reais).
     pub name_by_number: BTreeMap<u32, String>,
-    /// Topo da pilha de syscall (o frame fica no topo).
-    pub syscall_stack_top: u64,
     /// Diagnóstico: primeiras ocorrências.
     pub seen_syscalls: BTreeSet<String>,
     /// Exports da ntdll mapeada (nome → VA de usuário).
@@ -195,7 +191,6 @@ impl State {
             shared_user_regions: alloc::vec::Vec::new(),
             section_kernel_views: alloc::vec::Vec::new(),
             name_by_number: BTreeMap::new(),
-            syscall_stack_top: 0,
             seen_syscalls: BTreeSet::new(),
             ntdll_exports: None,
             ntdll_image_base: 0,
@@ -451,8 +446,9 @@ pub fn probe_syscall_stack(rsp: u64, bytes: u64) -> bool {
 }
 
 /// Frame que o stub de syscall da HAL de modo usuário salva no topo da pilha
-/// de syscall (layout do OpenNT, não do NT): os registradores devolvidos ao
-/// anel 3 no retorno; R10/RDX/R8/R9 são também os quatro primeiros argumentos.
+/// de kernel da thread (layout do OpenNT, não do NT): os registradores
+/// devolvidos ao anel 3 no retorno; R10/RDX/R8/R9 são também os quatro
+/// primeiros argumentos.
 #[repr(C)]
 pub struct SyscallFrame {
     pub rax: Field<u64>,
@@ -477,10 +473,13 @@ unsafe impl NtStruct for SyscallFrame {}
 
 const _: () = assert!(core::mem::size_of::<SyscallFrame>() == 0x78);
 
-/// O frame do syscall corrente, logo abaixo do topo da pilha de syscall.
+/// O frame do syscall corrente, logo abaixo da KPRCB.RspBase da CPU: o topo
+/// da pilha de kernel que a entrada de syscall carregou (a InitialStack da
+/// thread despachada).
 pub fn syscall_frame() -> &'static SyscallFrame {
-    let top = S.lock().syscall_stack_top;
-    // SAFETY: a pilha de syscall é do kernel e o stub sempre salva o frame.
+    let top = crate::ntos::ke::pcr::current().prcb.rsp_base.get();
+    // SAFETY: a pilha de kernel da thread despachada fica viva durante a
+    // syscall, e o stub sempre salva o frame no topo dela.
     unsafe { SyscallFrame::at(top - SyscallFrame::SIZE) }
 }
 

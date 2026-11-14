@@ -2008,7 +2008,10 @@ fn user_syscalls_core(assert: Assert) {
     context_record.context_flags.set(0x10_0001);
     assert(call("NtContinue", context, 0, 0, 0) == 0xC000_000D, "usercore: NtContinue sem CONTROL|INTEGER");
     let frame_block = guest::alloc_bytes(0x1000);
-    let saved = state::with(|state| core::mem::replace(&mut state.syscall_stack_top, frame_block + 0x1000));
+    // O frame do syscall fica logo abaixo da KPRCB.RspBase da CPU.
+    let rsp_base = &crate::ntos::ke::pcr::current().prcb.rsp_base;
+    let saved = rsp_base.get();
+    rsp_base.set(frame_block + 0x1000);
     let saved_rsp = crate::ntos::ke::pcr::current().user_rsp.get();
     context_record.context_flags.set(0x10_0003);
     context_record.seg_cs.set(0x33);
@@ -2021,7 +2024,7 @@ fn user_syscalls_core(assert: Assert) {
     let frame = frame_block + 0x1000 - 0x78;
     assert(continued == 0x5566_7788 && guest::read64(frame) == 0x1122_3344_5566_7788 && guest::read64(frame + 8) == 0x1_4000_1000 && guest::read64(frame + 0x40) == 0x21_0DD5 | 0x200 && crate::ntos::ke::pcr::current().user_rsp.get() == 0x7FF0_0000, "usercore: NtContinue reescreve o frame com RFLAGS filtrado");
     crate::ntos::ke::pcr::current().user_rsp.set(saved_rsp);
-    state::with(|state| state.syscall_stack_top = saved);
+    rsp_base.set(saved);
     guest::free_bytes(frame_block);
     for handle in [first, second, directory] {
         let _ = call("NtClose", handle, 0, 0, 0);
@@ -2036,7 +2039,7 @@ fn user_index(assert: Assert) {
     use crate::ntos::mm::kernel_address;
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::{index, memory};
-    assert(crate::hal::amd64::usermode::ready() && state::with(|state| state.syscall_stack_top != 0) && crate::ntos::mm::paging::translate(state::KUSER_SHARED_DATA_USER_VA) != 0, "userindex: anel 3 armado no boot com a KUSER_SHARED_DATA de usuario");
+    assert(crate::hal::amd64::usermode::ready() && crate::hal::amd64::usermode::tss_stacks().0 != 0 && crate::ntos::ke::pcr::current().prcb.rsp_base.get() != 0 && crate::ntos::mm::paging::translate(state::KUSER_SHARED_DATA_USER_VA) != 0, "userindex: anel 3 armado no boot com a KUSER_SHARED_DATA de usuario");
     let Ok(block) = memory::map_user_region(0x1000) else {
         assert(false, "userindex: memoria de usuario");
         return;
@@ -4897,6 +4900,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::vad::run(assert);
     crate::ntos::test::multiprocess::identity::run(assert);
     crate::ntos::test::multiprocess::attach_cr3::run(assert);
+    crate::ntos::test::multiprocess::kernel_stacks::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

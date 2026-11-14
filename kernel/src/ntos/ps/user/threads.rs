@@ -22,6 +22,7 @@ use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_infor
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_stack;
 use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
 use core::mem::offset_of;
 
@@ -424,6 +425,8 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
                     release_execution_resources(&finished);
                 }
             }
+            // Fora de qualquer pilha de thread: as liberações adiadas.
+            kernel_stack::reap();
         }
     })();
     set_running(false, None);
@@ -574,6 +577,12 @@ pub fn release_process() {
 /// identidade e a memória de execução ainda vivas.
 pub fn release_execution_resources(thread: &Arc<UserThread>) {
     rundown_apcs(thread);
+    // O ceifador devolve a pilha de kernel da thread morta (adiada se a CPU
+    // ainda está nela).
+    let pointer = thread.pointer();
+    if pointer != 0 {
+        process::release_kernel_stack(pointer);
+    }
     // A TEB principal divide a região com a PEB do processo.
     let Some(regions) = thread.with(|thread| thread.regions.take()) else { return };
     system_process_information::sample();
@@ -819,9 +828,9 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
     }
     // A PEB e o PID são do processo corrente (o EPROCESS).
     let (peb, process_id) = (state::current_peb(), state::current_process_id());
-    let (stack_top, exports, ntdll_base) = state::with(|state| {
+    let (exports, ntdll_base) = state::with(|state| {
         let exports = state.ntdll_exports.as_ref().map(|exports| (exports.get("RtlUserThreadStart").copied().unwrap_or(0), exports.get("LdrInitializeThunk").copied().unwrap_or(0)));
-        (state.syscall_stack_top, exports.unwrap_or((0, 0)), state.ntdll_image_base)
+        (exports.unwrap_or((0, 0)), state.ntdll_image_base)
     });
     // SizeOfStackReserve da imagem: a PEB e os cabeçalhos estão em memória
     // de usuário, então cada passo é sondado.
@@ -866,8 +875,10 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             return Err(0xC000_0017);
         }
         let process_pointer = process::get_current_process();
-        // O TID sai da tabela de ids de cliente, a mesma dos PIDs.
-        thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, Some(stack_top).filter(|&top| top != 0)).map_err(|_| 0xC000_0017u32)?;
+        // O TID sai da tabela de ids de cliente, a mesma dos PIDs; a pilha de
+        // kernel própria vai com a KTHREAD (que a libera nas falhas).
+        let own_stack = kernel_stack::create(false).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0017 })?;
+        thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, Some(own_stack)).map_err(|_| 0xC000_0017u32)?;
         if thread_pointer == 0 {
             return Err(0xC000_0017);
         }

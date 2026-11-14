@@ -1,22 +1,22 @@
 //! Subsistema de modo usuário.
 //!
-//! `init` arma o anel 3 (pilha de syscall, GDT/TSS da HAL, KUSER_SHARED_DATA
-//! no endereço de usuário, registro semeado); `invoke_service` é a ponte que
-//! o gateway nativo escolhido pelo descritor usa para chegar ao handler
-//! registrado por nome. Os módulos de área registram seus handlers no init
-//! do ntoskrnl.
+//! `init` arma o anel 3 (pilhas reserva e de falta dupla, GDT/TSS da HAL,
+//! KUSER_SHARED_DATA no endereço de usuário, registro semeado);
+//! `invoke_service` é a ponte que o gateway nativo escolhido pelo descritor
+//! usa para chegar ao handler registrado por nome. Os módulos de área
+//! registram seus handlers no init do ntoskrnl.
 
-use crate::hal::physical;
 use crate::ntos::ex::system_services;
 use crate::ntos::ke::clock;
-use crate::ntos::mm::{paging, pfn, shared_user_data};
+use crate::ntos::mm::{kernel_stack, paging, shared_user_data};
 use crate::ntos::ps::{process, system_process_information};
 use crate::ntos::ps::user::registry;
-use crate::ntos::ps::user::state::{self, STATUS_NOT_IMPLEMENTED, SYSCALL_STACK_PAGES};
+use crate::ntos::ps::user::state::{self, STATUS_NOT_IMPLEMENTED};
 use crate::rtl::{KernelError, SpinLock};
 
-/// `user_mode_init(stack_top)` da HAL de modo usuário: devolve a GDT.
-static USER_MODE_INIT: SpinLock<Option<fn(u64) -> Result<u64, KernelError>>> = SpinLock::new(None);
+/// `user_mode_init(fallback_stack, double_fault_stack)` da HAL de modo
+/// usuário: devolve a GDT.
+static USER_MODE_INIT: SpinLock<Option<fn(u64, u64) -> Result<u64, KernelError>>> = SpinLock::new(None);
 /// Inicializações que dependem de módulos posteriores (CSR, `cm::service::rpc`,
 /// ksecdd), nesta ordem.
 static LATE_INITIALIZERS: SpinLock<[Option<fn() -> Result<(), KernelError>>; 3]> = SpinLock::new([None; 3]);
@@ -29,7 +29,7 @@ pub mod late {
     pub const KSECDD: usize = 2;
 }
 
-pub fn set_user_mode_init(init: fn(u64) -> Result<u64, KernelError>) {
+pub fn set_user_mode_init(init: fn(u64, u64) -> Result<u64, KernelError>) {
     *USER_MODE_INIT.lock() = Some(init);
 }
 
@@ -51,25 +51,15 @@ pub fn consume_capture() {
 /// CPU pronta para o anel 3.
 pub fn init() -> Result<(), KernelError> {
     let Some(user_mode_init) = *USER_MODE_INIT.lock() else { return Err(KernelError::new("HAL de modo usuario indisponivel")) };
-    // Pilha de kernel dedicada (syscalls e IRQs em anel 3): frames PFN
-    // fisicamente contíguos, endereçados pela VA do mapa direto; o topo vai
-    // para TSS.RSP0 e para a célula que o stub de syscall usa.
-    let mut base = 0u64;
-    for index in 0..SYSCALL_STACK_PAGES {
-        let frame = pfn::alloc_page();
-        if frame == 0 {
-            return Err(KernelError::new("PFN esgotado na pilha de syscall"));
-        }
-        if index == 0 {
-            base = frame;
-        } else if frame != base + index * 0x1000 {
-            return Err(KernelError::new("pilha de syscall nao contigua"));
-        }
-        physical::zero(frame, 0x1000);
-    }
-    let top = physical::to_virtual(base) + SYSCALL_STACK_PAGES * 0x1000;
-    let gdt = user_mode_init(top)?;
-    state::with(|state| state.syscall_stack_top = top);
+    // Cada thread despachada traz a sua pilha de kernel (KPRCB.RspBase e
+    // TSS.RSP0 vêm da InitialStack dela). A CPU ganha duas pilhas próprias,
+    // permanentes: a reserva, para o anel 3 cru de uma thread que roda na
+    // pilha de boot, e a da IST da falta dupla, onde um estouro de pilha de
+    // kernel vira diagnóstico em vez de falta tripla.
+    let fallback = kernel_stack::create(false)?;
+    let double_fault = kernel_stack::create(false)?;
+    let gdt = user_mode_init(fallback.initial, double_fault.initial)?;
+    let top = fallback.initial;
     // KUSER_SHARED_DATA no endereço de usuário real (só leitura para o anel
     // 3), o mesmo frame da visão de kernel, como em todo espaço de
     // endereçamento.
@@ -79,7 +69,7 @@ pub fn init() -> Result<(), KernelError> {
     if !shared_user_data::map_user_view_in(paging::current_root()) {
         return Err(KernelError::new("mapPage falhou p/ KUSER_SHARED_DATA de usuario"));
     }
-    crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha de syscall ate {:#x}, KUSER user em 0x7FFE0000", gdt, top);
+    crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha reserva ate {:#x}, IST da falta dupla ate {:#x}, KUSER user em 0x7FFE0000", gdt, top, double_fault.initial);
     registry::seed_registry_for_user_mode()?;
     let initializers = *LATE_INITIALIZERS.lock();
     for initializer in initializers.into_iter().flatten() {

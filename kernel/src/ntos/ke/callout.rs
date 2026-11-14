@@ -2,8 +2,8 @@
 //! KeExpandKernelStackAndCalloutEx, KeIpiGenericCall e KeGenericCallDpc
 //! (com KeSignalCallDpcDone e KeSignalCallDpcSynchronize).
 //!
-//! A pilha do kernel já garante os bytes pedidos, então o callout é chamado
-//! de verdade. Os drivers rodam no processador de boot: o broadcast do
+//! O callout é chamado de verdade, na pilha corrente (o OpenNT não troca
+//! para um segmento novo de pilha). Os drivers rodam no processador de boot: o broadcast do
 //! KeIpiGenericCall é local, e a rotina do KeGenericCallDpc roda como DPC
 //! (DISPATCH_LEVEL) nesse processador, com SystemArgument1 apontando a
 //! contagem de pendentes (KeSignalCallDpcDone) e SystemArgument2 a barreira
@@ -122,13 +122,15 @@ pub fn signal_call_dpc_synchronize(barrier: u64) -> bool {
 // MAXIMUM_EXPANSION_SIZE -> STATUS_INVALID_PARAMETER_3; IRQL acima de
 // DISPATCH_LEVEL -> KeBugCheckEx(0xA, 2, irql, 0, 0); quando a pilha corrente
 // basta, o callout roda no lugar com KTHREAD.MiscFlags.CalloutActive ligado
-// e o IRQL tem de voltar igual (senão KeBugCheckEx(0xC8, ...)). A pilha de
-// kernel do OpenNT já cobre o tamanho máximo, então é sempre esse caminho.
-// Não há MmCreateKernelStack: os contextos de KeAllocateCalloutStackEx têm o
-// layout real, mas as entradas de pilha ficam NULL (os callouts usam a pilha
-// corrente, como o KeExpandKernelStackAndCalloutEx acima).
+// e o IRQL tem de voltar igual (senão KeBugCheckEx(0xC8, ...)). O OpenNT
+// sempre segue esse caminho (sem troca para um segmento novo de pilha). Os
+// contextos de KeAllocateCalloutStackEx têm o layout real e uma pilha de
+// kernel real por nível (`mm/kernel_stack`, o MmCreateKernelStack, grande no
+// tipo 1), guardada pelo StackBase; os callouts ainda usam a pilha corrente,
+// como o KeExpandKernelStackAndCalloutEx acima.
 
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
 const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
 const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
@@ -215,8 +217,8 @@ pub fn set_kernel_stack_swap_enable(thread: &crate::ntos::inc::types::Kthread, e
 
 /// KeAllocateCalloutStackEx(Type, Depth, Reserved): o contexto ou o NTSTATUS
 /// de falha. Tipo 0/1 (1 = pilha grande), profundidade != 0, reservado 0;
-/// bloco NonPagedPoolNx de 0x40 + 8*Depth com 'Stak', Large, Depth e um
-/// KMUTEX inicializado.
+/// bloco NonPagedPoolNx de 0x40 + 8*Depth com 'Stak', Large, Depth, um
+/// KMUTEX inicializado e o StackBase de uma pilha de kernel por nível.
 pub fn allocate_callout_stack_context(kind: u32, depth: u8, reserved: u64) -> Result<Result<&'static CalloutStackContext, u32>, KernelError> {
     let large = match kind {
         0 => false,
@@ -242,6 +244,15 @@ pub fn allocate_callout_stack_context(kind: u32, depth: u8, reserved: u64) -> Re
     context.recursion_depth.set(depth);
     context.reserved.set(0);
     crate::ntos::ke::dispatcher::initialize_mutex(context.mutex.address(), 0);
+    for slot in context.stacks() {
+        match crate::ntos::mm::kernel_stack::create(large) {
+            Ok(stack) => slot.set(stack.base),
+            Err(_) => {
+                free_callout_stack(context)?;
+                return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+            }
+        }
+    }
     Ok(Ok(context))
 }
 
@@ -261,11 +272,15 @@ pub fn allocate_callout_stack(large: bool) -> Result<u64, KernelError> {
     Ok(allocate_callout_stack_context(large as u32, 1, 0)?.map_or(0, |context| context.address()))
 }
 
-/// KeFreeCalloutStack: as pilhas (NULL no OpenNT) e o bloco voltam ao pool
-/// (ExFreePool).
+/// KeFreeCalloutStack: as pilhas voltam ao Mm (MmDeleteKernelStack) e o
+/// bloco ao pool (ExFreePool).
 pub fn free_callout_stack(context: &CalloutStackContext) -> Result<(), KernelError> {
-    for stack in context.stacks() {
-        stack.set(0);
+    use crate::ntos::mm::kernel_stack;
+    for slot in context.stacks() {
+        if let Some(stack) = kernel_stack::find(slot.get()) {
+            kernel_stack::delete(stack);
+        }
+        slot.set(0);
     }
     crate::ntos::ex::pool_allocation::free(context.address(), 0)
 }

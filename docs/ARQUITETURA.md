@@ -205,7 +205,7 @@ pertence só aos processos:
 | --- | --- | --- |
 | 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
-| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel |
+| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
 | 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
@@ -281,9 +281,46 @@ callback de instrumentação) é o `UserExecutionBlock` da CPU
 KPCR de 0xB080 bytes: os stubs o endereçam por `gs:` e o Rust por
 `usermode::block()` e `pcr::current()`. No M0 só o BSP executa o anel 3
 (assert em `exec_user_mode`/`exec_user_context`); os APs têm KPCR e bloco,
-mas não têm TSS, LSTAR nem pilha de syscall. O autoteste
+mas não têm TSS, LSTAR nem pilha reserva. O autoteste
 `ntos/test/multiprocess/per_cpu.rs` confere os blocos distintos de cada CPU
 e uma syscall de teste que devolve gs:[10h] igual ao RSP do usuário.
+
+**Pilhas de kernel por thread.** Toda thread que executa tem pilha de kernel
+própria, do `mm/kernel_stack.rs` (o MmCreateKernelStack/MmDeleteKernelStack):
+uma reserva fixa de 256 KB de VA na janela `KERNEL_STACK_BASE..TOP`, com a
+pilha no topo (64 KB; 128 KB na grande) em frames do PFN não contíguos, PTEs
+de supervisor RW e NX, e a página logo abaixo do StackLimit sem PTE (a
+guarda). `ps::process::create_kernel_thread(.., Some(pilha))` fica dono dela e
+preenche os campos reais da KTHREAD do 19041: StackBase (o topo), StackLimit,
+InitialStack = StackBase - 0x30 (o KERNEL_STACK_CONTROL, com CurrentStackBase
+e ActualLimit) e KernelStack = InitialStack; com `None` a KTHREAD descreve a
+pilha de boot (o kmain, o System e os contextos de kernel do escalonador
+rodam nela). Usam pilha própria as threads de usuário (a primeira de
+`run_windows_process`/`load_process` e as de NtCreateThreadEx), as threads de
+sistema nativas (PsCreateSystemThread, que antes tiravam a pilha da arena) e
+os níveis dos contextos de KeAllocateCalloutStackEx. Como no KiSwapContext, o
+despacho para o anel 3 (`usermode::exec_user_context`/`exec_user_mode`) grava
+em KPRCB.RspBase e TSS.RSP0 a InitialStack da KTHREAD corrente: syscalls,
+IRQs e exceções do anel 3 caem na pilha da própria thread, e o frame da
+syscall fica logo abaixo da RspBase (`state::syscall_frame`). Fora do
+intervalo as duas voltam à pilha reserva da CPU, que também serve a uma
+thread sem pilha própria (o anel 3 cru dos autotestes). O ceifador devolve a
+pilha: `threads::release_execution_resources` para a thread de usuário morta,
+o fim do contexto no escalonador para a nativa, e o fim da ETHREAD para o que
+sobrar; quem libera a pilha em que a CPU ainda está a deixa para o
+`kernel_stack::reap`, fora dela. A TSS do BSP leva na IST1 uma pilha própria
+para a falta dupla (vetor 8): um estouro falta na guarda, a entrega da falta
+não cabe na pilha estourada, e a falta dupla roda na IST e imprime
+`*** ESTOURO DA PILHA DE KERNEL` com o endereço e o StackBase (a geometria
+das reservas é aritmética, sem trava). IoGetStackLimits devolve StackLimit e
+StackBase da thread corrente, e IoWithinStackLimits só segue o
+KERNEL_STACK_CONTROL quando ele cabe no segmento. O autoteste
+`ntos/test/multiprocess/kernel_stacks.rs` confere os campos e a guarda, uma
+syscall de teste cujo RSP fica entre o StackLimit e o InitialStack da thread
+(distinto entre duas threads, com RspBase e RSP0 iguais à InitialStack
+durante a syscall), o IoGetStackLimits de uma thread nativa, o PFN estável
+depois de criar e destruir 8 threads, a IST1 da falta dupla e as pilhas de
+callout.
 
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:

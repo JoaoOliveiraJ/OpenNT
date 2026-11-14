@@ -12,6 +12,7 @@ pub mod kernel_address;
 pub mod kernel_data;
 pub mod kernel_data_layout;
 pub mod kernel_pool;
+pub mod kernel_stack;
 pub mod loaded_images;
 pub mod mdl;
 pub mod memory;

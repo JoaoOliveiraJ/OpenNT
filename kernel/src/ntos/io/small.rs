@@ -80,12 +80,27 @@ pub mod initial_stack {
         unsafe { Kthread::at(process::get_current_thread()) }.initial_stack.get()
     }
 
-    /// IoGetStackLimits: limites da pilha do kernel do mapa de memória do boot.
+    /// A pilha de kernel da thread corrente: (StackLimit, StackBase) da
+    /// KTHREAD (a pilha própria da thread, ou a de boot de quem roda nela).
+    pub fn current_limits() -> (u64, u64) {
+        let thread = process::get_current_thread();
+        if thread == 0 {
+            return (0, 0);
+        }
+        // SAFETY: a thread corrente.
+        let thread = unsafe { Kthread::at(thread) };
+        (thread.stack_limit.get(), thread.stack_base.get())
+    }
+
+    /// IoGetStackLimits: LowLimit = StackLimit e HighLimit = StackBase da
+    /// pilha de kernel da thread corrente. (O OpenNT não tem pilhas de DPC
+    /// nem de ISR separadas: DPCs e ISRs rodam na pilha de quem as despacha.)
     pub fn limits(low_output: u64, high_output: u64) {
+        let (low, high) = current_limits();
         // SAFETY: PULONG_PTR LowLimit/HighLimit do chamador de modo kernel.
         unsafe {
-            Field::<u64>::at(low_output).set(0x20_0000);
-            Field::<u64>::at(high_output).set(0x30_0000);
+            Field::<u64>::at(low_output).set(low);
+            Field::<u64>::at(high_output).set(high);
         }
     }
 }

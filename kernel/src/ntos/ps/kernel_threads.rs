@@ -33,13 +33,13 @@ use crate::ntos::rtl::run_once;
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_stack;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{ClientId, Ethread, ObjectAttributes};
 use crate::ntos::init::export_names as abi_names;
 use crate::ntos::io::file::zw as zw_files;
 
 const CONTEXT_SIZE: u64 = 0x400;
-const STACK_SIZE: u64 = 0x10000;
 const RAW: u64 = 0x300;
 const ARGUMENT_REGISTERS: [u64; 4] = [8, 16, 0x40, 0x48];
 /// KOBJECTS: ThreadObject.
@@ -83,6 +83,7 @@ struct Frame {
 struct Thread {
     id: u64,
     pointer: u64,
+    /// StackLimit da pilha de kernel própria (a KTHREAD é dona dela).
     stack: u64,
     node: NodeId,
     context: u64,
@@ -725,8 +726,9 @@ pub struct HandleOptions {
     pub attributes: u32,
 }
 
-/// PsCreateSystemThread: KTHREAD do System, pilha de 64 KiB, contexto com
-/// a rotina inicial e a continuação de retorno; devolve o handle publicado.
+/// PsCreateSystemThread: KTHREAD do System com pilha de kernel própria
+/// (`mm/kernel_stack`, com guarda, devolvida pelo ceifador), contexto com a
+/// rotina inicial e a continuação de retorno; devolve o handle publicado.
 pub fn create_system_thread(output_handle: u64, start_routine: u64, context_pointer: u64, access: u32, client_id: u64, handle_options: Option<HandleOptions>) -> Result<u64, KernelError> {
     // O TID é reservado na tabela de ids de cliente antes do KTHREAD, que o
     // recebe na criação.
@@ -740,18 +742,15 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
             return Err(KernelError::new("no thread context"));
         }
         allocated.push(context);
-        let stack = guest::alloc_bytes(STACK_SIZE);
-        if stack == 0 {
-            return Err(KernelError::new("no kernel stack"));
-        }
-        allocated.push(stack);
+        // A pilha própria vai com a KTHREAD: o ceifador a devolve.
+        let stack = kernel_stack::create(false)?;
         let system = process::get_system_process();
-        let pointer = process::create_kernel_thread(system, id, true, 0, Some(stack + STACK_SIZE))?;
+        let pointer = process::create_kernel_thread(system, id, true, 0, Some(stack))?;
         if pointer == 0 {
             return Err(KernelError::new("no thread object"));
         }
         allocated.push(pointer);
-        let rsp = stack + STACK_SIZE - 40;
+        let rsp = stack.initial - 40;
         guest::write64(context + 8, context_pointer);
         guest::write64(context + 0x20, rsp);
         guest::write64(context + 0x80, start_routine);
@@ -778,7 +777,7 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
         let thread = Arc::new(SpinLock::new(Thread {
             id,
             pointer,
-            stack,
+            stack: stack.limit,
             node,
             context,
             handle: 0,
@@ -817,7 +816,8 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
                 thread.context
             };
             ethread(pointer).tcb.header.signal_state.set(1);
-            guest::free_bytes(stack);
+            // O ceifador roda no escalonador, fora da pilha da thread.
+            process::release_kernel_stack(pointer);
             guest::free_bytes(context);
             collect(pointer);
         })))?;
