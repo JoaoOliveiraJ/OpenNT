@@ -52,7 +52,10 @@ kernel/src/
 │   │                  hosts de extensão (ExRegisterHost/ExRegisterExtension)
 │   │   ├── wnf/       Windows Notification Facility
 │   │   └── license/   licenciamento
-│   ├── cm/            Registry
+│   ├── cm/            Registry: namespace (registry), hives de arquivo (hive_list,
+│   │   │              hive_file, hive_services), tabelas da hive SYSTEM (seed)
+│   │   ├── hive/      formato regf: bloco base, bins e células, listas de
+│   │   │              subchaves, 'sk', 'nk'/'vk'/'db', logs e descarga
 │   │   ├── key/       chaves e serviços Nt/Zw de chave
 │   │   └── service/   serviços e drivers (base, canal, RPC)
 │   ├── rtl/           a Rtl do NT: strings, Unicode, páginas de código, AVL, bitmap,
@@ -1372,11 +1375,13 @@ discos. Sem a opção nada disso roda.
   pelo caminho único com PS_PROTECTION WinTcb-Light (0x61) e
   BreakOnTermination, com a ntdll real. O build põe no volume os binários da
   cadeia (smss, csrss, csrsrv, basesrv, winsrv, sxssrv, npfs.sys, msfs.sys e
-  as DLLs que eles importam), e o kernel semeia o Registro que eles leem: a
+  as DLLs que eles importam), e a hive SYSTEM desse build (ou a semente em
+  memória, sem o arquivo) leva o Registro que eles leem: a
   chave Session Manager (`cm/session_manager.rs`: SubSystems com a linha do
   csrss, KnownDLLs, DOS Devices, Environment; sem Kmode, BootExecute nem
-  arquivos de paginação), a árvore `IniFileMapping` que o basesrv lê
-  (`cm/ini_file_mapping.rs`), os serviços Npfs e Msfs e o
+  arquivos de paginação) e os serviços Npfs e Msfs; em memória ficam a
+  árvore `IniFileMapping` da hive SOFTWARE que o basesrv lê
+  (`cm/ini_file_mapping.rs`) e, na hive de hardware, o
   `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID
   (`cm/hw_description.rs`). Nesse boot ficam desligados a imitação do csrss
   (`ps/user/csr.rs`), o `\KnownDlls` montado pelo kernel, o provisionamento
@@ -1455,11 +1460,32 @@ discos. Sem a opção nada disso roda.
     `ntos/test/console_driver.rs` abre o servidor, a referência e a conexão
     de um console e troca as mensagens CONNECT e DISCONNECT pelos IOCTLs do
     condrv (`CONDRV_OK`).
-- O `xtask` lê três fontes do kernel por `#[path]`:
+- O `xtask` lê fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
-  PE). O `kernel/build.rs` inclui `ntos/ke/services.rs` para gerar a ntdll de
+  PE) e as tabelas da hive SYSTEM (`ntos/cm/seed.rs`,
+  `ntos/cm/session_manager.rs`, `ntos/cm/service/boot_services.rs` e
+  `ntos/cm/service/inbox_drivers.rs`, na mesma árvore `cm`/`cm::service`
+  de módulos), com que `xtask/src/hive_image.rs` grava o arquivo da hive.
+  Esses arquivos de tabela são dados puros: não usam nada do kernel. O
+  `kernel/build.rs` inclui `ntos/ke/services.rs` para gerar a ntdll de
   bring-up.
+- **Hives do Registro** (`ntos/cm/hive/`, `hive_list.rs`): a arena de
+  `cm/registry.rs` é o namespace (o papel dos KCBs com cache completo); um
+  nó de uma hive de arquivo guarda a célula 'nk' dele, e cada mudança no nó
+  (chave criada ou excluída, valor gravado ou removido) vai na mesma hora,
+  sob a mesma trava, para as células da hive (`hive/key_cells.rs`,
+  `hive/index.rs`, `hive/security_cells.rs`), marcando os setores de 512
+  bytes sujos. O NtFlushKey grava o log incremental (.LOG1/.LOG2
+  alternados) e as faixas sujas no primário, entre o bloco base
+  invalidado e o validado (`hive/sync.rs`); a carga de um primário
+  invalidado aplica os logs (`hive/log.rs`). A hive SYSTEM vem de
+  `\SystemRoot\System32\config\SYSTEM`, gravado pelo build: a fase 1 a
+  carrega logo depois de montar o NTFS (antes dela, nada escreve em
+  `\Registry\Machine\System`); sem o arquivo, as mesmas chaves de
+  `cm/seed.rs` são semeadas em memória. Não há escritor preguiçoso: as
+  hives vão para o arquivo no NtFlushKey, no NtUnloadKey e no
+  NtRestoreKey. As chaves voláteis não ganham célula.
 
 ## 5. Testes
 

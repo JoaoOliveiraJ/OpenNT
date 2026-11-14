@@ -136,7 +136,7 @@ id = "fase5"
 titulo = "Autoteste de Registro e serviços"
 marcador = "PHASE5_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE5_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
-descricao = "Hive em memória, chaves e valores, callbacks do Registro, banco de serviços, WNF, licenciamento e capacidades."
+descricao = "Chaves e valores, hives de arquivo no formato regf (a hive SYSTEM carregada do volume, cópia por NtSaveKey e carga por NtLoadKey, descarga com log e recuperação, restauração, privilégios), callbacks do Registro, banco de serviços, WNF, licenciamento e capacidades."
 
 [[teste]]
 id = "fase6"
@@ -361,10 +361,10 @@ categoria = "Núcleo do kernel"
 icone = "database"
 descricao = "O banco de configuração do sistema (hives, chaves e valores), de onde vêm, entre outras coisas, os serviços e drivers a carregar."
 estado = "em desenvolvimento"
-caminhos = ["kernel/src/ntos/cm/registry.rs", "kernel/src/ntos/cm/key"]
+caminhos = ["kernel/src/ntos/cm/registry.rs", "kernel/src/ntos/cm/key", "kernel/src/ntos/cm/hive", "kernel/src/ntos/cm/hive_list.rs", "kernel/src/ntos/cm/hive_services.rs", "kernel/src/ntos/cm/seed.rs", "xtask/src/hive_image.rs"]
 testes = ["fase5"]
 fase = "5"
-notas = "Hive em memória com chaves, valores, callbacks e o banco de serviços."
+notas = "Hives de arquivo no formato regf do Windows: bloco base com soma e sequências, bins, células nk/vk/sk/lf/lh/li/ri/db com dados grandes, células livres reaproveitadas e unidas, células de segurança compartilhadas com contagem de referências. A hive SYSTEM vem de \\SystemRoot\\System32\\config\\SYSTEM, que o build grava com as mesmas tabelas que o kernel semeava (serviços de driver, parâmetros, classes de dispositivo e, no boot do smss, o Session Manager), e é carregada na fase 1 logo depois da montagem do NTFS; sem o arquivo, as chaves são semeadas em memória como antes. Cada mudança numa chave de hive vai na hora para as células (setores sujos); o NtFlushKey grava o log incremental (.LOG1/.LOG2, entradas HvLE com Marvin32) e o primário entre o bloco base invalidado e o validado, e a carga de um primário invalidado aplica os logs. Serviços NtLoadKey/NtLoadKey2/NtLoadKeyEx, NtUnloadKey/2/Ex (com a descarga adiada até o último handle), NtSaveKey/NtSaveKeyEx (versões 1.3 e 1.5), NtRestoreKey, NtFlushKey, NtCompressKey e NtCompactKeys, com SeRestorePrivilege/SeBackupPrivilege, e os Zw exportados; a carga num ponto de montagem de hive de máquina dispara o CmRegisterMachineHiveLoadedNotification. Ainda faltam a hive de aplicativo (REG_APP_HIVE), o handle da raiz na carga, as restaurações REG_WHOLE_HIVE_VOLATILE e REG_REFRESH_HIVE, o escritor preguiçoso, as notificações de filtro dos serviços de hive, as hives SOFTWARE/SAM/SECURITY/usuário em arquivo e o CurrentControlSet como link simbólico. A arena de chaves continua sendo o namespace (o papel dos KCBs com cache completo)."
 
 [[componente]]
 nome = "Carregador de PE e exports do kernel"

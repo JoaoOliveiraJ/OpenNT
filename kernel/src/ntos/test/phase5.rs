@@ -1,6 +1,6 @@
 //! Self-test da fase 5 — Registro e serviços.
 //!
-//! Exercita a hive em memória, os objetos de chave, a serialização das
+//! Exercita o namespace do Registro, as hives de arquivo (`registry_hive`), os objetos de chave, a serialização das
 //! classes KEY_* e os provedores e serviços construídos sobre o registro.
 
 use alloc::sync::Arc;
@@ -1367,5 +1367,6 @@ pub fn run(assert: Assert) {
     license_service_queries(assert);
     license_boot_values_and_anonymous(assert);
     capability_policy_and_check(assert);
+    super::registry_hive::run(assert);
     debug_print!("PHASE5_SELFTEST_OK");
 }
