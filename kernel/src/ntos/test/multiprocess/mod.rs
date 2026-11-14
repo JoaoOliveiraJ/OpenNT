@@ -27,3 +27,4 @@ pub mod current_thread;
 pub mod queue_wait;
 pub mod process_tables;
 pub mod heap_nx;
+pub mod pipes;

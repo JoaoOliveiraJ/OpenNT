@@ -1370,6 +1370,50 @@ discos. Sem a opção nada disso roda.
     IRP_MJ_CLOSE chega dentro do NtfsDeleteInternalAttributeStream (no
     Windows ele vem depois, do lazy writer) e o NtfsMountVolume usa o SCB
     já liberado.
+- **Pipes nomeados e mailslots pelos npfs.sys e msfs.sys reais**
+  (`cm/service/inbox_drivers.rs`, `io/file/pipe_mailslot.rs`,
+  `io/file/irp_service.rs`, a abertura de `ps/user/files.rs`):
+  - As chaves Npfs e Msfs são as da instalação (Type 2, Start 1, Group
+    "File system", sem ImagePath; o Npfs com a subchave Aliases) e os dois
+    binários estão no volume em todo boot, então o laço dos drivers de
+    sistema (Start <= 1) os carrega no boot comum e no do smss. O DriverEntry
+    deles cria `\Device\NamedPipe` e `\Device\Mailslot` (nenhum dos dois se
+    registra como file system montável). Os dispositivos DOS `\??\PIPE` e
+    `\??\MAILSLOT` vêm do `DOS Devices` do Session Manager: o smss os cria no
+    boot dele, e no boot comum, sem smss, a fase 0 cria os mesmos links.
+  - NtCreateNamedPipeFile e NtCreateMailslotFile capturam o
+    NAMED_PIPE_CREATE_PARAMETERS/MAILSLOT_CREATE_PARAMETERS (timeout opcional
+    com TimeoutSpecified; o mailslot com FILE_SHARE_READ | FILE_SHARE_WRITE e
+    FILE_CREATE) e validam como o IopCreateFile valida um chamador de modo
+    usuário; a abertura manda IRP_MJ_CREATE_NAMED_PIPE ou
+    IRP_MJ_CREATE_MAILSLOT com os parâmetros na stack location. Toda
+    abertura de modo usuário leva RequestorMode = UserMode e a thread que
+    pede no IRP (o npfs.sys guarda o PID do cliente por ela).
+  - NtReadFile/NtWriteFile de um arquivo de driver de neither I/O,
+    NtFsControlFile (o IopXxxControlFile com IRP_MN_USER_FS_REQUEST,
+    METHOD_BUFFERED e METHOD_NEITHER, acesso do código conferido) e
+    NtQueryInformationFile/NtSetInformationFile de qualquer arquivo de
+    driver montam o IRP como o I/O Manager: Tail.Overlay.Thread,
+    OriginalFileObject, UserMode, UserIosb, UserEvent, UserBuffer, o
+    SystemBuffer do método e a IrpList da thread. A cauda síncrona espera
+    FileObject->Event pelo KeWaitForSingleObject (a thread deixa a CPU) e
+    devolve FileObject->FinalStatus; as consultas e mudanças num arquivo
+    assíncrono esperam um evento e um IO_STATUS_BLOCK locais. A conclusão
+    (IopCompleteRequest) roda na thread que pediu — na hora, se o driver
+    conclui nela em PASSIVE_LEVEL, ou como APC especial de kernel entregue
+    onde ela estiver —, copia o SystemBuffer para o UserBuffer
+    (IRP_INPUT_OPERATION; o npfs.sys e o msfs.sys põem assim os dados de uma
+    leitura que estava pendente), grava o IOSB, sinaliza o evento ou
+    FileObject->Event, libera o IRP e solta o arquivo (a última referência,
+    em PASSIVE_LEVEL). O IofCompleteRequest mantém Irp->PendingReturned como
+    o NT, pelo SL_PENDING_RETURNED de cada slot. A saída de uma thread
+    cancela as IRPs dela. As classes de acesso, modo, alinhamento e posição
+    o próprio I/O Manager responde.
+  - Teste: `ntos/test/multiprocess/pipes.rs` (fase 7): um servidor e um
+    cliente reais em anel 3 com LISTEN, WAIT, PEEK, TRANSCEIVE, leitura e
+    escrita em modo mensagem e byte (síncronas e assíncronas com evento), o
+    PID do cliente, as classes de pipe, o mailslot e o DISCONNECT, com as
+    esperas entre processos bloqueando de verdade.
 - **Cadeia smss -> csrss real** (`--initial-process=smss`,
   `init/boot_config.rs::SMSS_BOOT`): o primeiro processo de usuário é o
   `\SystemRoot\System32\smss.exe` real (`init/initial_process.rs`), criado
@@ -1530,7 +1574,9 @@ discos. Sem a opção nada disso roda.
   IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
-  NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,
+  NtCreateUserProcess de um processo pai real, na fase 7), `PIPES_OK` (o
+  servidor e o cliente de pipes e mailslot pelos npfs.sys e msfs.sys reais,
+  na fase 7, depois do `MULTIPROCESS_OK`), `KBDTEST_OK`,
   `[shell] pronto`, `FILE_SYSTEM_MOUNT_OK name=<serviço>` (um arquivo do
   volume aberto e lido pelo file system real iniciado com `--start-driver`),
   `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
