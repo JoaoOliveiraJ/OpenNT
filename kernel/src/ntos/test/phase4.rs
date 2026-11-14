@@ -588,6 +588,11 @@ fn ntfs_writer(assert: Assert) {
         return;
     };
     let names = |volume: &ntfs::Ntfs, path: &str| volume.list(path).ok().flatten().unwrap_or_default();
+    // O índice da raiz do volume gerado pelo xtask é empacotado de outro jeito
+    // que o do escritor do kernel (blocos INDX mais cheios); uma criação e
+    // remoção prévias deixam o índice no empacotamento do escritor, e a conta
+    // de clusters livres parte daí.
+    assert(volume.create("/NORMAL.TMP", false, 0, 0).is_ok() && volume.remove("/NORMAL.TMP").is_ok(), "ntfswrite: indice da raiz no empacotamento do escritor");
     let initial = volume.space().map(|space| space.free_clusters).unwrap_or(0);
     assert(volume.space().is_ok_and(|space| space.clusters == volume.geometry.total_sectors && space.free_clusters > 60_000 && space.cluster_size == 512), "ntfswrite: espaco pelo $Bitmap");
     // Criação e escrita residente: o primeiro registro livre vem depois do
