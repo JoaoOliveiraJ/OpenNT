@@ -3,346 +3,379 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Ob · Exports do ntoskrnl · OpenNT</title>
 <meta name="description" content="Os exports Ob do ntoskrnl.exe do Windows 10 e quais o kernel do OpenNT também exporta.">
 <script>document.documentElement.classList.add('js')</script>
 <style>
-:root{color-scheme:light;--page:#f5f6fa;--surface:#ffffff;--raised:#ffffff;--ink:#0b0b10;--ink2:#474852;--muted:#62636d;
---grid:#e4e5ec;--border:rgba(20,22,40,.09);--accent:#2a78d6;--accent2:#6250d6;--accent-ink:#1c5cab;--accent-soft:#eaf2fc;
---track:#e6e7ee;--good:#0ca30c;--good-ink:#006300;--warning:#fab219;--neutral:#a3a3ad;--code:#eef0f5;--warn-ink:#c22f2f;
---hero:linear-gradient(135deg,#1c5cab 0%,#2a78d6 46%,#6250d6 100%);
---shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);--shadow-hover:0 16px 36px -16px rgba(28,92,171,.5)}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0b0c10;--surface:#14151b;
---raised:#181a21;--ink:#f0f0f3;--ink2:#c5c6cf;--muted:#9a9ba6;--grid:#262832;--border:rgba(255,255,255,.08);--accent:#3987e5;
---accent2:#9085e9;--accent-ink:#86b6ef;--accent-soft:#16233a;--track:#272a35;--good-ink:#3ccf3c;--neutral:#6b6c78;
---code:#20222b;--warn-ink:#ff8a8a;--hero:linear-gradient(135deg,#0f2f5c 0%,#1a4f96 48%,#40349a 100%);--shadow:none;
---shadow-hover:0 16px 36px -16px rgba(0,0,0,.85)}}
-:root[data-theme="dark"]{color-scheme:dark;--page:#0b0c10;--surface:#14151b;--raised:#181a21;--ink:#f0f0f3;--ink2:#c5c6cf;
---muted:#9a9ba6;--grid:#262832;--border:rgba(255,255,255,.08);--accent:#3987e5;--accent2:#9085e9;--accent-ink:#86b6ef;
---accent-soft:#16233a;--track:#272a35;--good-ink:#3ccf3c;--neutral:#6b6c78;--code:#20222b;--warn-ink:#ff8a8a;
---hero:linear-gradient(135deg,#0f2f5c 0%,#1a4f96 48%,#40349a 100%);--shadow:none;--shadow-hover:0 16px 36px -16px rgba(0,0,0,.85)}
-*{box-sizing:border-box}
+:root{--sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+--mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,"Liberation Mono",monospace;
+--fs-xs:12px;--fs-sm:14px;--fs-md:18px;--fs-lg:21px;--fs-xl:25px;--fs-2xl:clamp(30px,4.6vw,40px);
+--sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:24px;--sp-6:32px;--sp-7:56px;
+--r-sm:6px;--r:10px;--r-lg:14px;--head-h:57px;
+color-scheme:light;--bg:#f6f7f9;--surface:#fff;--surface-2:#f0f2f5;--hover:#f6f8fb;--border:#dde1e7;--border-strong:#c4cad3;
+--text:#16181d;--text-2:#434a56;--muted:#5b6371;--accent:#1d5fc2;--accent-soft:#e8f0fc;--focus:#1d5fc2;
+--brand:linear-gradient(135deg,#1c5cab,#6250d6);--ok:#0ca30c;--ok-text:#106b21;--ok-soft:#e5f4e8;--warn:#f2a50c;
+--warn-text:#87570a;--warn-soft:#fdf3d8;--neutral:#7d8592;--neutral-soft:#edf0f3;--bad-text:#b42318;--bad-soft:#fdecea;
+--bar:#2a78d6;--track:#e3e7ec}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0e1015;--surface:#161a21;--surface-2:#1e232c;
+--hover:#1b2029;--border:#2b313c;--border-strong:#3c4451;--text:#eceef2;--text-2:#c3c8d1;--muted:#9aa2af;--accent:#7db2ff;
+--accent-soft:#18263b;--focus:#7db2ff;--brand:linear-gradient(135deg,#2a6fd0,#7a6cf0);--ok:#2fbf4a;--ok-text:#6bd685;
+--ok-soft:#14281b;--warn:#f5b52e;--warn-text:#f2c766;--warn-soft:#2c2412;--neutral:#7a8392;--neutral-soft:#232933;
+--bad-text:#ff8f85;--bad-soft:#3a1d1b;--bar:#3d8bea;--track:#29303b}}
+*,*::before,*::after{box-sizing:border-box}
 [hidden]{display:none!important}
-html{-webkit-text-size-adjust:100%}
+html{-webkit-text-size-adjust:100%;scroll-padding-top:12px}
 html:not(.js) .js-only{display:none!important}
 html.js .no-js{display:none!important}
-[id]{scroll-margin-top:84px}
-body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-a{color:var(--accent-ink);text-underline-offset:2px}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 var(--sans)}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:4px}
+main:focus{outline:none}
+.sr-only{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.skip{position:absolute;left:8px;top:-60px;z-index:30;background:var(--surface);color:var(--text);padding:8px 14px;
+border:2px solid var(--focus);border-radius:var(--r)}
+.skip:focus{top:8px}
 .wrap{max-width:1120px;margin:0 auto;padding:0 16px}
-header.top{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--surface) 88%,transparent);
-backdrop-filter:saturate(1.4) blur(10px);-webkit-backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--grid)}
-header.top .wrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px 28px;padding-top:10px;padding-bottom:10px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
-.brand small{font-weight:500;font-size:14px;color:var(--muted)}
-.logo{width:28px;height:28px;border-radius:8px;background:var(--hero);display:grid;place-items:center;box-shadow:0 4px 12px -4px rgba(42,120,214,.6)}
-.logo svg{width:16px;height:16px}
-nav.main{display:flex;flex-wrap:wrap;gap:4px 6px}
-nav.main a{color:var(--ink2);text-decoration:none;padding:6px 12px;border-radius:999px;font-size:15px;transition:background .15s}
-nav.main a:hover{background:var(--accent-soft)}
-nav.main a[aria-current]{background:var(--accent-soft);color:var(--accent-ink);font-weight:650}
-main{padding-bottom:56px}
-.hero{position:relative;overflow:hidden;isolation:isolate;margin:22px 0 8px;padding:36px 32px 30px;border-radius:26px;
-background:var(--hero);color:#fff;box-shadow:0 24px 60px -30px rgba(42,80,200,.7)}
-.hero::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(rgba(255,255,255,.18) 1px,transparent 1.4px);
-background-size:20px 20px;-webkit-mask-image:linear-gradient(115deg,#000 5%,transparent 70%);mask-image:linear-gradient(115deg,#000 5%,transparent 70%)}
-.hero::after{content:"";position:absolute;z-index:-1;width:520px;height:520px;right:-160px;top:-220px;border-radius:50%;
-background:radial-gradient(circle,rgba(255,255,255,.26),transparent 64%)}
-.hero .eyebrow{color:rgba(255,255,255,.82)}
-.hero h1{font-size:clamp(34px,6vw,58px);font-weight:800;letter-spacing:-.03em;line-height:1.04;margin:6px 0 12px}
-.hero .tagline{font-size:clamp(18px,2.5vw,22px);font-weight:550;max-width:44ch;margin:0 0 10px;line-height:1.35}
-.hero .sub{color:rgba(255,255,255,.88);max-width:70ch;margin:0}
-.hero code{background:rgba(255,255,255,.16);color:#fff}
-.hero a{color:#fff}
-.hero-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:14px;margin-top:26px}
-.glass{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.24);border-radius:18px;padding:16px 18px;
-backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;gap:16px;min-width:0}
-.glass .label{font-size:14px;font-weight:650;color:#fff;line-height:1.35}
-.glass .big{font-size:clamp(28px,4vw,36px);font-weight:800;line-height:1.05;letter-spacing:-.02em;margin:2px 0}
-.glass .sub2{font-size:13px;color:rgba(255,255,255,.84);line-height:1.4}
-.ring{width:88px;height:88px;flex:none}
-.ring circle{fill:none;stroke-width:10}
-.ring-track{stroke:rgba(255,255,255,.24)}
-.ring-bar{stroke:#fff;stroke-linecap:round;stroke-dasharray:100;animation:ring 1.6s cubic-bezier(.2,.8,.2,1) both}
-.ring text{fill:#fff;font:800 19px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:-.02em}
-@keyframes ring{from{stroke-dashoffset:100}}
-.pagehead{margin:26px 0 8px}
-.pagehead h1{font-size:clamp(30px,5vw,44px);line-height:1.1;letter-spacing:-.02em;margin:4px 0 10px}
-.crumbs{font-size:14px;color:var(--muted);margin:0 0 4px}
+header.site{background:var(--surface);border-bottom:1px solid var(--border)}
+header.site .bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 24px;padding-top:10px;padding-bottom:10px}
+.brand{display:inline-flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;font-weight:700;font-size:17px}
+.brand .tag{font-weight:500;font-size:12px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:0 8px}
+.logo{width:26px;height:26px;border-radius:7px;background:var(--brand);display:grid;place-items:center;flex:none}
+.logo svg{width:15px;height:15px}
+.nav ul{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:2px}
+.nav a{display:block;padding:6px 10px;border-radius:var(--r-sm);color:var(--text-2);text-decoration:none;font-size:15px}
+.nav a:hover{background:var(--surface-2);color:var(--text)}
+.nav a[aria-current]{background:var(--accent-soft);color:var(--text);font-weight:650}
+.nav .long{display:none}
+@media (min-width:720px){html{scroll-padding-top:calc(var(--head-h) + 12px)}.wrap{padding:0 24px}
+header.site{position:sticky;top:0;z-index:20}header.site .bar{height:56px;padding-top:0;padding-bottom:0;flex-wrap:nowrap}
+.nav{margin-left:auto}}
+@media (min-width:1080px){.nav .long{display:inline}}
+main{padding-bottom:var(--sp-7)}
+.crumbs{margin:var(--sp-5) 0 0;font-size:var(--fs-sm);color:var(--muted)}
+.crumbs ol{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:2px 6px}
+.crumbs li+li::before{content:"/";margin-right:6px;color:var(--border-strong)}
 .crumbs a{color:var(--muted)}
-.eyebrow{text-transform:uppercase;letter-spacing:.09em;font-size:12px;font-weight:750;color:var(--accent-ink);margin:0 0 4px}
-section.block{margin-top:48px}
-h2{font-size:clamp(23px,3vw,28px);line-height:1.2;margin:0 0 10px;letter-spacing:-.015em}
-h3{font-size:18px;margin:24px 0 8px}
-p{margin:0 0 12px;max-width:76ch}
-.lead{font-size:17px;color:var(--ink2);max-width:76ch}
+.crumbs [aria-current]{color:var(--text-2)}
+.page-head{padding:var(--sp-3) 0 0}
+.page-head h1{font-size:var(--fs-2xl);line-height:1.12;letter-spacing:-.02em;margin:var(--sp-2) 0 var(--sp-3)}
+.page-head h1 .muted{font-weight:500}
+.lead{font-size:var(--fs-md);line-height:1.45;color:var(--text);max-width:62ch;margin:0 0 var(--sp-3)}
+.page-head .sub{color:var(--text-2);max-width:76ch}
+.home-head{padding-top:var(--sp-6)}
+.home-head h1{font-size:clamp(36px,6vw,52px);margin-top:0}
+.home-head .lead{font-size:23px;font-weight:550;letter-spacing:-.01em}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 var(--sp-3);padding:0;list-style:none}
+.pills li{font-size:var(--fs-xs);font-weight:600;color:var(--text-2);background:var(--surface);border:1px solid var(--border);
+border-radius:999px;padding:2px 10px}
+h2{font-size:var(--fs-xl);line-height:1.25;letter-spacing:-.01em;margin:0 0 var(--sp-2)}
+h3{font-size:var(--fs-md);line-height:1.3;margin:var(--sp-5) 0 var(--sp-2)}
+h4{font-size:16px;line-height:1.35;margin:0}
+p{margin:0 0 var(--sp-3);max-width:76ch}
+.block{margin-top:var(--sp-7)}
+.intro{color:var(--text-2);max-width:72ch}
 .muted{color:var(--muted)}
-.small{font-size:14px}
-code{font:.86em ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;background:var(--code);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
-pre{background:var(--code);padding:12px 14px;border-radius:12px;overflow-x:auto;margin:0 0 12px}
-pre code{background:none;padding:0}
-.card{background:var(--raised);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:var(--shadow);min-width:0}
-.lift{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
-.lift:hover{transform:translateY(-3px);box-shadow:var(--shadow-hover);border-color:color-mix(in srgb,var(--accent) 45%,var(--border))}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:14px;margin:16px 0}
-.grid.tight{grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr))}
-.grid.three{grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr))}
-.ico{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ico-tile{width:44px;height:44px;border-radius:13px;flex:none;display:grid;place-items:center;color:var(--accent-ink);
-background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 17%,transparent),color-mix(in srgb,var(--accent2) 19%,transparent))}
-.ico-tile.good{color:var(--good-ink);background:linear-gradient(135deg,color-mix(in srgb,var(--good) 16%,transparent),color-mix(in srgb,var(--accent) 12%,transparent))}
-.ico-tile.dim{color:var(--muted);background:var(--track)}
-.ico-tile.sm{width:34px;height:34px;border-radius:10px}
-.ico-tile.sm .ico{width:18px;height:18px}
-.meter{height:10px;border-radius:5px;background:var(--track);overflow:hidden;display:flex;gap:2px;margin:8px 0 4px}
-.meter span{display:block;height:100%;min-width:4px;border-radius:5px;background:linear-gradient(90deg,var(--accent),var(--accent2));
-transform-origin:left center;animation:grow 1.3s cubic-bezier(.2,.8,.2,1) both}
-.meter span.partial{background:var(--warning)}
-@keyframes grow{from{transform:scaleX(0)}}
-.explain{background:linear-gradient(135deg,var(--accent-soft),color-mix(in srgb,var(--accent2) 9%,var(--accent-soft)));border-radius:18px;padding:20px 22px}
-.explain h3{margin-top:0}
-.explain p:last-child,.explain ul:last-child{margin-bottom:0}
-.glossary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:14px;margin:16px 0}
-.glossary div{background:var(--raised);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
-.glossary dt{font-weight:750;display:flex;gap:8px;align-items:center}
-.glossary dd{margin:4px 0 0;font-size:15px;color:var(--ink2)}
-.steps{margin:8px 0 12px;padding-left:22px}
-.steps li{margin:4px 0}
-.highlight{display:flex;gap:14px;align-items:flex-start}
-.highlight h3{margin:0 0 4px;font-size:16px;line-height:1.3}
-.highlight h3 a{color:inherit;text-decoration:none}
-.highlight h3 a:hover{text-decoration:underline}
-.highlight p{margin:0;font-size:14px;color:var(--ink2)}
-.highlight .by{font-size:13px;color:var(--muted);margin-top:6px}
-.timeline{list-style:none;margin:22px 0 8px;padding:0;display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
-.timeline li{position:relative;text-align:center;padding:0 6px}
-.timeline li:not(:first-child)::before{content:"";position:absolute;top:19px;right:50%;width:100%;height:4px;border-radius:2px;background:var(--track)}
-.timeline li.reached:not(:first-child)::before{background:linear-gradient(90deg,var(--good),var(--accent))}
-.node{position:relative;z-index:1;width:42px;height:42px;margin:0 auto 10px;border-radius:50%;display:grid;place-items:center;
-font-weight:800;background:var(--raised);border:3px solid var(--track);color:var(--muted)}
-.node svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
-.node.done{background:var(--good);border-color:var(--good)}
-.node.current{border-color:var(--warning);color:var(--ink)}
-.node.current::after{content:"";position:absolute;inset:-9px;border-radius:50%;border:3px solid var(--warning);animation:pulse 2.2s ease-out infinite}
-@keyframes pulse{from{transform:scale(.75);opacity:.7}to{transform:scale(1.3);opacity:0}}
-.timeline .num{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
-.timeline .name{font-weight:700;font-size:15px;line-height:1.3;margin:2px 0 6px}
-@media (max-width:860px){.timeline{grid-template-columns:1fr}
-.timeline li{display:grid;grid-template-columns:42px 1fr;column-gap:14px;text-align:left;padding:0 0 18px}
-.timeline li .node{margin:0;grid-row:span 3}
-.timeline li:not(:first-child)::before{display:none}
-.timeline li:not(:last-child)::after{content:"";position:absolute;left:19px;top:42px;bottom:0;width:4px;border-radius:2px;background:var(--track)}
-.timeline li.link:not(:last-child)::after{background:linear-gradient(180deg,var(--good),var(--accent))}}
-.prefixes{display:grid;gap:10px;margin:14px 0}
-.prefix{display:grid;grid-template-columns:auto minmax(0,1fr) 250px;gap:6px 16px;align-items:start}
-.prefix .pill{font-weight:800;font-size:16px}
-.prefix .examples{font-size:13px;color:var(--muted);margin-top:4px}
-.prefix .examples code{font-size:12px}
-.prefix .nums{font-size:14px;color:var(--ink2);font-variant-numeric:tabular-nums}
-.prefix .nums strong{color:var(--ink);font-size:16px}
-@media (max-width:760px){.prefix{grid-template-columns:auto minmax(0,1fr)}.prefix .nums{grid-column:1 / -1}}
-.chart{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:8px;overflow-x:auto}
-.chart svg{display:block;width:100%;height:auto;min-width:680px}
-figure{margin:18px 0}
-figcaption{font-size:14px;color:var(--muted);margin-top:10px}
-.controls{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;margin:14px 0;padding:12px 14px;background:var(--surface);
-border:1px solid var(--border);border-radius:14px}
-.controls label{display:flex;gap:8px;align-items:center;font-size:15px}
-.controls input,.controls select{font:inherit;color:var(--ink);background:var(--raised);border:1px solid var(--grid);border-radius:10px;padding:7px 11px}
-.controls input{width:min(300px,100%)}
-.controls .count{margin-left:auto}
-details{background:var(--raised);border:1px solid var(--border);border-radius:14px;margin:10px 0}
-details>summary{cursor:pointer;padding:12px 16px;font-weight:650}
-details>summary .muted{font-weight:400}
-details .inner{padding:0 16px 14px}
-.card details{border:0;background:none;margin:10px 0 0}
-.card details>summary{padding:2px 0;font-size:14px;color:var(--ink2)}
-.card details .inner{padding:4px 0 0}
-.scroll{overflow-x:auto}
-table{border-collapse:collapse;width:100%}
-th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
-th{font-size:13px;font-weight:650;color:var(--ink2)}
-tbody tr:last-child td{border-bottom:0}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.table-card{background:var(--raised);border:1px solid var(--border);border-radius:16px;padding:6px 10px;margin:14px 0}
-.yes{color:var(--good-ink);font-weight:650}
-.no{color:var(--muted)}
-.ic{width:16px;height:16px;flex:none;display:block}
-.f-good{fill:var(--good)}.f-warning{fill:var(--warning)}.f-accent{fill:var(--accent)}
+.small{font-size:var(--fs-sm)}
+.count-badge{font-size:var(--fs-sm);font-weight:600;color:var(--muted);margin-left:6px}
+code{font-family:var(--mono);font-size:.86em;background:var(--surface-2);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
+pre{font:13px/1.5 var(--mono);background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;
+overflow-x:auto;margin:0 0 var(--sp-3);white-space:pre}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.path{overflow-wrap:normal}
+.grid{display:grid;gap:var(--sp-3);grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));margin:var(--sp-4) 0}
+.grid.two{grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr))}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-4) 18px;min-width:0}
+.card>:last-child{margin-bottom:0}
+.card h3{margin-top:0}
+.callout{background:var(--surface-2);border-radius:var(--r-lg);padding:var(--sp-4) 18px}
+.callout>:last-child{margin-bottom:0}
+.callout h3{margin-top:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:var(--sp-3);margin:var(--sp-5) 0 0}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-4);display:flex;
+flex-direction:column;gap:6px;min-width:0;color:inherit;text-decoration:none}
+a.stat:hover{border-color:var(--border-strong);background:var(--hover)}
+a.stat:hover .stat-label{color:var(--accent);text-decoration:underline}
+.stat-label{margin:0;font-size:var(--fs-sm);font-weight:600;color:var(--text-2)}
+.stat-value{margin:0;font-size:30px;font-weight:700;line-height:1.1;letter-spacing:-.02em}
+.stat-value .of{font-size:17px;font-weight:500;color:var(--muted);letter-spacing:0}
+.stat-note{margin:0;font-size:13px;line-height:1.4;color:var(--muted)}
+.meter{display:flex;gap:2px;height:8px;border-radius:999px;background:var(--track);overflow:hidden;min-width:48px}
+.meter>span{display:block;height:100%;min-width:3px;border-radius:999px;background:var(--bar)}
+.meter>.ok{background:var(--ok)}.meter>.part{background:var(--warn)}.meter>.phase-now{background:var(--warn)}
+.meter.sm{height:6px}
+.meter.steps{gap:3px;background:none}.meter.steps>span{flex:1;min-width:0;background:var(--track)}
+.meter.steps>.ok{background:var(--ok)}.meter.steps>.part{background:var(--warn)}
+.ic{width:15px;height:15px;flex:none;display:block}
+.f-good{fill:var(--ok)}.f-warning{fill:var(--warn)}
 .k-white{fill:none;stroke:#fff;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.k-warning{fill:none;stroke:var(--warning);stroke-width:1.6}
+.k-warning{fill:none;stroke:var(--warn);stroke-width:1.6}
 .k-neutral{fill:none;stroke:var(--neutral);stroke-width:1.6}
 .dash{stroke-dasharray:2.2 2.2}
-.state{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:650;white-space:nowrap;
-padding:3px 10px 3px 6px;border-radius:999px;background:var(--surface);border:1px solid var(--border)}
-.small-state{font-size:12px;padding:2px 8px 2px 5px}
-.ms{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:650;white-space:nowrap}
-.ms::before{content:"";width:12px;height:12px;border-radius:50%;flex:none;box-sizing:border-box}
-.ms.codigo::before{background:var(--accent)}
-.ms.parcial::before{border:1.6px solid var(--warning);background:linear-gradient(90deg,transparent 50%,var(--warning) 50%)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;line-height:1.3;white-space:nowrap;
+padding:2px 10px 2px 6px;border-radius:999px;background:var(--neutral-soft);color:var(--text)}
+.chip.ok{background:var(--ok-soft)}.chip.part{background:var(--warn-soft)}
+.chip.bad{background:var(--bad-soft);color:var(--bad-text)}
+.chip.next{background:var(--accent-soft)}
+.ico{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ico-tile{width:36px;height:36px;border-radius:var(--r);flex:none;display:grid;place-items:center;color:var(--accent);
+background:var(--accent-soft)}
+.ico-tile.good{color:var(--ok-text);background:var(--ok-soft)}
+.ico-tile.dim{color:var(--muted);background:var(--neutral-soft)}
+.ico-tile.sm{width:30px;height:30px;border-radius:8px}.ico-tile.sm .ico{width:17px;height:17px}
+.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:var(--sp-3) var(--sp-5);margin:var(--sp-3) 0}
+.legend>div{font-size:var(--fs-sm);color:var(--text-2)}
+.legend .chip,.legend .ms{margin-bottom:4px}
+.legend p{margin:0}
+.steps-list{margin:var(--sp-2) 0 var(--sp-3);padding-left:22px}
+.steps-list li{margin:4px 0}
+.levels{list-style:none;margin:var(--sp-3) 0 0;padding:0;display:grid;gap:var(--sp-3);
+grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));counter-reset:lvl}
+.levels li{position:relative;padding:var(--sp-3) var(--sp-4) var(--sp-3) 46px;background:var(--surface);border:1px solid var(--border);
+border-radius:var(--r);font-size:var(--fs-sm);color:var(--text-2);counter-increment:lvl}
+.levels li::before{content:counter(lvl);position:absolute;left:14px;top:12px;width:22px;height:22px;border-radius:50%;
+background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:13px;display:grid;place-items:center}
+.levels strong{display:block;color:var(--text);font-size:15px}
+.items{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;margin:var(--sp-3) 0 0}
+.item{display:grid;grid-template-columns:36px minmax(0,1fr);column-gap:14px;padding:var(--sp-4) 18px;border-top:1px solid var(--border);
+margin-top:-1px}
+.item>.ico-tile{grid-row:1 / span 6}
+.item>:not(.ico-tile){grid-column:2}
+.item-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
+.item-head h3,.item-head h4{margin:0;font-size:16.5px;line-height:1.35}
+.item-desc{margin:4px 0 0;color:var(--text-2);max-width:80ch}
+.meta{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 14px;margin:10px 0 0;font-size:var(--fs-sm)}
+.meta dt{color:var(--muted)}
+.meta dd{margin:0;min-width:0}
+.meta dd code{display:inline-block;margin:0 4px 3px 0}
+.meta pre{margin:0;font-size:12.5px}
+.verified{color:var(--ok-text);font-weight:600}
+.unverified{color:var(--muted)}
+.warn{color:var(--bad-text);font-size:13px}
+.notes{margin:10px 0 0;font-size:var(--fs-sm);color:var(--text-2);max-width:88ch}
+details.notes>summary{cursor:pointer;list-style:none}
+details.notes>summary::-webkit-details-marker{display:none}
+details.notes>summary:hover .toggle{text-decoration:underline}
+details.notes p{margin:6px 0 0;max-width:88ch}
+.toggle{color:var(--accent);font-weight:600;white-space:nowrap}
+.toggle .less,details[open]>summary .toggle .more,details[open]>summary .ell{display:none}
+details[open]>summary .toggle .less{display:inline}
+.refs{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:4px 6px}
+.refs a{display:inline-flex;align-items:center;gap:5px;font-size:13px;padding:1px 9px 1px 5px;border-radius:999px;
+background:var(--surface-2);text-decoration:none;color:var(--text)}
+.refs a:hover{background:var(--accent-soft)}
+.refs .ic{width:13px;height:13px}
+.table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);margin:var(--sp-3) 0}
+table{border-collapse:separate;border-spacing:0;width:100%;font-size:var(--fs-sm)}
+caption{text-align:left}
+th,td{padding:9px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
+thead th{font-size:var(--fs-xs);font-weight:650;color:var(--muted);background:var(--surface-2);white-space:nowrap}
+thead th:first-child{border-top-left-radius:var(--r-lg)}thead th:last-child{border-top-right-radius:var(--r-lg)}
+tbody tr:last-child>*{border-bottom:0}
+tbody tr:hover>*{background:var(--hover)}
+tbody th{font-weight:600}
+tfoot th,tfoot td{border-top:1px solid var(--border-strong);border-bottom:0;font-weight:650}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.bar{width:22%;min-width:100px;vertical-align:middle}
+td.wrap-code code{overflow-wrap:break-word}
+.rowgroup th{background:var(--surface-2);font-size:13px;color:var(--text-2)}
+@media (min-width:720px){.table-wrap.sticky{overflow:visible}
+.table-wrap.sticky thead th{position:sticky;top:var(--head-h);z-index:2}}
+.yes{color:var(--ok-text);font-weight:600}
+.no{color:var(--muted)}
+.mark{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.mark::before{content:"";width:9px;height:9px;border-radius:50%;flex:none;box-sizing:border-box}
+.mark.yes::before{background:var(--ok)}.mark.no::before{border:1.5px solid var(--neutral)}
+.ms{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;white-space:nowrap}
+.ms::before{content:"";width:11px;height:11px;border-radius:50%;flex:none;box-sizing:border-box}
+.ms.codigo::before{background:var(--bar)}
+.ms.parcial::before{border:1.6px solid var(--warn);background:linear-gradient(90deg,transparent 50%,var(--warn) 50%)}
 .ms.pendente::before{border:1.6px solid var(--neutral)}
 .ms.fora::before{border:1.6px dashed var(--neutral)}
-.small-state .ic{width:13px;height:13px}
-.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:10px 18px;margin:12px 0}
-.legend div{display:flex;gap:10px;align-items:baseline;font-size:14px;color:var(--ink2)}
-.legend .state{flex:none}
-.category-head{display:flex;gap:14px;align-items:flex-start}
-.category-head h2{margin-bottom:4px}
-.category-head .counts{font-size:14px;color:var(--muted);margin:0}
-.component{display:flex;flex-direction:column;gap:10px}
-.component .head{display:flex;gap:12px;align-items:flex-start}
-.component .head .title{flex:1;min-width:0}
-.component h3{margin:2px 0 4px;font-size:17px;line-height:1.3}
-.component p{margin:0;font-size:15px}
-.facts{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;margin:0;font-size:14px}
-.facts dt{color:var(--muted)}
-.facts dd{margin:0;min-width:0}
-.facts dd code{display:inline-block;margin:0 4px 3px 0}
-.path{overflow-wrap:normal}
-.verified{color:var(--good-ink);font-weight:650}
-.unverified{color:var(--muted)}
-.note{font-size:13px;color:var(--muted)}
-.covers{margin:0;padding-left:20px;font-size:14px}
-details.subsys{margin:8px 0}
-details.subsys>summary{list-style:none;display:grid;grid-template-columns:34px minmax(0,1fr) minmax(90px,200px) 8.5em 14px;
-gap:6px 14px;align-items:center;padding:10px 14px}
-details.subsys>summary::-webkit-details-marker{display:none}
-details.subsys .sname{font-weight:700;line-height:1.3}
-details.subsys .sname code{font-weight:400;font-size:12px;margin-left:6px}
-details.subsys .sdesc{font-weight:400;font-size:13px;color:var(--muted);line-height:1.35}
-details.subsys .snums{font-weight:400;font-size:14px;color:var(--ink2);text-align:right;font-variant-numeric:tabular-nums}
-details.subsys .meter{margin:0}
-details.subsys .meter span{animation:none}
+.note{display:block;font-size:13px;color:var(--muted);margin-top:2px}
+.filters{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin:var(--sp-4) 0 var(--sp-3)}
+.search{position:relative;flex:1 1 260px;max-width:440px}
+.search .ico{position:absolute;left:11px;top:50%;transform:translateY(-50%);width:18px;height:18px;color:var(--muted);pointer-events:none}
+.search input{width:100%;font:inherit;font-size:15px;color:var(--text);background:var(--surface);border:1px solid var(--border-strong);
+border-radius:var(--r);padding:8px 12px 8px 38px}
+.search input:focus{outline:2px solid var(--focus);outline-offset:1px}
+.toggles{display:inline-flex;flex-wrap:wrap;gap:3px;padding:3px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r)}
+.toggles button{font:inherit;font-size:var(--fs-sm);display:inline-flex;align-items:center;gap:6px;border:0;background:none;
+color:var(--text-2);padding:5px 10px;border-radius:7px;cursor:pointer}
+.toggles button:hover{color:var(--text)}
+.toggles button[aria-pressed="true"]{background:var(--surface);color:var(--text);font-weight:600;box-shadow:0 0 0 1px var(--border-strong)}
+.toggles .n{font-size:var(--fs-xs);color:var(--muted);font-variant-numeric:tabular-nums}
+.count{margin:0 0 0 auto;font-size:var(--fs-sm);color:var(--muted)}
+.empty{padding:var(--sp-4);border:1px dashed var(--border-strong);border-radius:var(--r-lg);color:var(--muted)}
+.linkish{font:inherit;color:var(--accent);background:none;border:0;padding:0;text-decoration:underline;cursor:pointer}
+.category{margin-top:var(--sp-6)}
+.category-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px}
+.searchbox .hint{margin:10px 0 0}
+.category-head h3{margin:0;font-size:var(--fs-lg)}
+.category-head .counts{font-size:var(--fs-sm);color:var(--muted);margin:0}
+.category>.intro{margin:6px 0 0;font-size:15px}
+.jump{display:flex;flex-wrap:wrap;gap:6px;margin:var(--sp-3) 0 0;padding:0;list-style:none}
+.jump a{display:inline-flex;gap:6px;align-items:baseline;font-size:var(--fs-sm);padding:4px 11px;border-radius:999px;
+background:var(--surface);border:1px solid var(--border);text-decoration:none;color:var(--text)}
+.jump a:hover{border-color:var(--border-strong);background:var(--hover)}
+.jump a[aria-current]{background:var(--accent-soft);border-color:transparent;font-weight:650}
+.jump .n{font-size:var(--fs-xs);color:var(--muted);font-variant-numeric:tabular-nums}
+.milestone{display:grid;gap:10px;margin:var(--sp-5) 0 0;padding:var(--sp-4) 18px;background:var(--surface);border:1px solid var(--border);
+border-left:4px solid var(--warn);border-radius:var(--r-lg)}
+.now-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
+.now-label{flex:none;min-width:5.5em;font-size:var(--fs-xs);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.now-row ul{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:4px 18px}
+.phases{list-style:none;margin:var(--sp-4) 0 0;padding:0}
+.phase{position:relative;display:grid;grid-template-columns:32px minmax(0,1fr);column-gap:14px;padding-bottom:var(--sp-4)}
+.phase:not(:last-child)::before{content:"";position:absolute;left:15px;top:34px;bottom:2px;width:2px;border-radius:1px;background:var(--border)}
+.phase.done:not(:last-child)::before{background:var(--ok)}
+.phase-dot{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:14px;
+background:var(--surface);border:2px solid var(--border-strong);color:var(--muted)}
+.phase-dot svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.phase.done .phase-dot{background:var(--ok);border-color:var(--ok)}
+.phase.now .phase-dot{border-color:var(--warn);color:var(--text);box-shadow:0 0 0 4px var(--warn-soft)}
+.phase-body{min-width:0;padding-top:4px}
+.phase.now .phase-body{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:var(--sp-3) var(--sp-4);margin-top:-6px}
+.phase-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
+.phase-num{font-size:var(--fs-xs);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.phase-name{font-weight:650}
+.phase-scope{margin:4px 0 0;font-size:15px;color:var(--text-2)}
+.phase-comp{margin:4px 0 0;font-size:13px;color:var(--muted)}
+.minis{display:grid;gap:var(--sp-3);grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr));margin:var(--sp-3) 0 0}
+.mini{display:flex;gap:var(--sp-3);align-items:flex-start;background:var(--surface);border:1px solid var(--border);
+border-radius:var(--r-lg);padding:14px var(--sp-4);min-width:0}
+.mini h4 a{color:var(--text);text-decoration:none}
+.mini h4 a:hover{color:var(--accent);text-decoration:underline}
+.mini p{margin:2px 0 0;font-size:var(--fs-sm);color:var(--text-2)}
+.mini .by{margin-top:6px;font-size:13px;color:var(--muted)}
+.mini>div{min-width:0}
+.links{display:grid;gap:var(--sp-3);grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));margin:var(--sp-4) 0}
+.links a{display:flex;flex-direction:column;gap:6px;padding:var(--sp-4);background:var(--surface);border:1px solid var(--border);
+border-radius:var(--r-lg);text-decoration:none;color:var(--text)}
+.links a:hover{border-color:var(--border-strong);background:var(--hover)}
+.links .t{display:flex;align-items:center;gap:10px;font-weight:650;font-size:17px}
+.links a:hover .t span:last-child{color:var(--accent);text-decoration:underline}
+.links .big{font-size:22px;font-weight:700;letter-spacing:-.01em}
+.links .big small{font-size:14px;font-weight:500;color:var(--muted)}
+.links p{margin:0;font-size:var(--fs-sm);color:var(--text-2)}
+.glossary{display:grid;gap:var(--sp-3);grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));margin:var(--sp-4) 0}
+.glossary>div{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:14px var(--sp-4)}
+.glossary dt{font-weight:650;display:flex;gap:10px;align-items:center}
+.glossary dd{margin:6px 0 0;font-size:15px;color:var(--text-2)}
+.badges{display:flex;flex-wrap:wrap;gap:8px;margin:var(--sp-3) 0}
+.badges svg{display:block;max-width:100%;height:auto}
+details.sub{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);margin:var(--sp-2) 0}
+details.sub>summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(90px,180px) 9em 14px;
+gap:6px 14px;align-items:center;padding:12px var(--sp-4);border-radius:var(--r-lg)}
+details.sub>summary::-webkit-details-marker{display:none}
+details.sub>summary:hover{background:var(--hover)}
+details.sub[open]>summary{border-bottom:1px solid var(--border);border-radius:var(--r-lg) var(--r-lg) 0 0}
+.sname{font-weight:650;line-height:1.3}
+.sname code{font-weight:400;font-size:12px;margin-left:6px}
+.sdesc{font-size:13px;color:var(--muted);line-height:1.35}
+.snums{font-size:var(--fs-sm);color:var(--text-2);text-align:right;font-variant-numeric:tabular-nums}
+details.sub .inner{padding:var(--sp-3) var(--sp-4) var(--sp-4)}
+details.sub .table-wrap{margin-bottom:0}
 .chev{width:14px;height:14px;fill:none;stroke:var(--muted);stroke-width:2.2;transition:transform .15s}
 details[open]>summary .chev{transform:rotate(90deg)}
-@media (max-width:700px){details.subsys>summary{grid-template-columns:34px minmax(0,1fr) 14px}
-details.subsys>summary .meter,details.subsys>summary .snums{grid-column:2 / 3}
-details.subsys>summary .snums{text-align:left}details.subsys>summary .chev{grid-row:1;grid-column:3}}
-.area{margin-top:28px}
-.area>h3{display:flex;gap:10px;align-items:baseline}
-.area>h3 .muted{font-size:14px;font-weight:400}
-.links a.card{text-decoration:none;color:var(--ink);display:flex;gap:14px;align-items:flex-start}
-.links h3{margin:0 0 4px}
-.links p{margin:0}
-.badges{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0}
-.badges svg{display:block}
-.warn{color:var(--warn-ink);font-size:13px}
-.pager{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 4px}
-.pager button{font:inherit;font-size:14px;min-width:38px;padding:5px 11px;border-radius:10px;border:1px solid var(--grid);
-background:var(--raised);color:var(--ink);cursor:pointer}
-.pager button:hover:not(:disabled){border-color:var(--accent)}
-.pager button[aria-current]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
-.pager button:disabled{opacity:.45;cursor:default}
-.pager .gap{color:var(--muted);padding:0 2px}
-.pager .range{font-size:13px;color:var(--muted);margin-left:6px}
-.empty{padding:14px 16px;border:1px dashed var(--grid);border-radius:14px;color:var(--muted)}
-.groupnav{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;margin:18px 0}
-.groupnav a{text-decoration:none;padding:8px 14px;border:1px solid var(--border);border-radius:12px;background:var(--raised)}
-.results{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
-.results li{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;padding:8px 12px;background:var(--raised);
-border:1px solid var(--border);border-radius:12px;font-size:14px}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.chips a{font-size:13px;text-decoration:none;padding:3px 10px;border-radius:999px;background:var(--accent-soft)}
-.chips a[aria-current]{background:var(--accent);color:#fff;font-weight:700}
-footer{border-top:1px solid var(--grid);background:var(--surface)}
-footer .wrap{padding-top:16px;padding-bottom:28px;color:var(--muted);font-size:14px}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.lift:hover{transform:none}}
+@media (max-width:700px){details.sub>summary{grid-template-columns:30px minmax(0,1fr) 14px}
+details.sub>summary .meter,details.sub>summary .snums{grid-column:2 / 3}
+details.sub>summary .snums{text-align:left}details.sub>summary .chev{grid-row:1;grid-column:3}}
+.area{margin-top:var(--sp-6)}
+.area>h3{margin:0 0 4px;font-size:var(--fs-lg)}
+.area>h3 .muted{font-size:var(--fs-sm);font-weight:500}
+.area>p{font-size:var(--fs-sm);color:var(--muted)}
+.prefix-cards{display:grid;gap:var(--sp-3);grid-template-columns:repeat(auto-fill,minmax(min(330px,100%),1fr));margin:var(--sp-4) 0}
+.prefix-card{display:flex;flex-direction:column;gap:8px}
+.prefix-card .top{display:flex;align-items:center;gap:var(--sp-3)}
+.prefix-card .top h3{margin:0;font-size:17px}
+.prefix-card .top h3 a{text-decoration:none}
+.prefix-card .top .short{display:block;font-size:13px;color:var(--muted)}
+.prefix-card p{margin:0;font-size:var(--fs-sm);color:var(--text-2)}
+.prefix-card .nums{font-size:var(--fs-sm);color:var(--text-2);font-variant-numeric:tabular-nums;margin-top:auto}
+.examples{font-size:13px;color:var(--muted)}
+.examples code{font-size:12px}
+.group-nav{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;margin:var(--sp-5) 0}
+.group-nav a{text-decoration:none;padding:8px 14px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface)}
+.group-nav a:hover{border-color:var(--border-strong);background:var(--hover)}
+.searchbox{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-4) 18px;margin:var(--sp-3) 0}
+.searchbox .filters{margin:0}
+.results{list-style:none;margin:var(--sp-3) 0 0;padding:0;border-top:1px solid var(--border)}
+.results:empty{display:none}
+.results li{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;padding:8px 2px;border-bottom:1px solid var(--border);font-size:var(--fs-sm)}
+.results li a{font-weight:600}
+.results .grow{flex:1}
+.extra-names{line-height:2}
+footer.site{border-top:1px solid var(--border);background:var(--surface)}
+footer.site .wrap{padding-top:var(--sp-5);padding-bottom:var(--sp-6);color:var(--muted);font-size:var(--fs-sm)}
+footer.site nav ul{list-style:none;margin:0 0 var(--sp-3);padding:0;display:flex;flex-wrap:wrap;gap:4px 18px}
+footer.site p{margin:0}
+@media (max-width:560px){.item{grid-template-columns:minmax(0,1fr)}.item>.ico-tile{display:none}.item>:not(.ico-tile){grid-column:1}
+.meta{grid-template-columns:minmax(0,1fr);gap:0}.meta dd{margin-bottom:8px}.count{margin-left:0;width:100%}
+.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{padding:12px}.stat-value{font-size:24px}
+.stat-value .of{font-size:15px}.home-head .lead{font-size:19px}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}}
+@media print{header.site,.filters,.skip{display:none}body{background:#fff}}
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap"><a class="brand" href="index.html"><span class="logo"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1" fill="#fff"/><rect x="9" y="2" width="5" height="5" rx="1" fill="#fff" opacity=".75"/><rect x="2" y="9" width="5" height="5" rx="1" fill="#fff" opacity=".75"/><rect x="9" y="9" width="5" height="5" rx="1" fill="#fff" opacity=".5"/></svg></span>OpenNT <small>status</small></a><nav class="main" aria-label="Páginas"><a href="index.html">Visão geral</a><a href="componentes.html">Componentes e drivers</a><a href="testes.html">Testes</a><a href="modulos.html">Módulos do kernel</a><a href="ntoskrnl.html" aria-current="page">Exports do ntoskrnl</a></nav></div></header>
-<main class="wrap">
-<div class="pagehead"><p class="crumbs"><a href="ntoskrnl.html">Exports do ntoskrnl</a> › grupo 4 de 18</p><h1>Ob <span class="muted">· gerenciador de objetos</span></h1><p class="lead">Object Manager: tudo no kernel é um objeto com nome, contagem de referências e handles (processos, arquivos, eventos, dispositivos). Ob cuida de referenciar, nomear e proteger esses objetos.</p><div class="card prefix"><span class="ico-tile "><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12L4 7.5M12 12v9"/></svg></span><div><strong>45</strong> de 49 nomes deste grupo o OpenNT também exporta · faltam 4<div class="meter" role="img" aria-label="91,8%"><span style="width:91.84%"></span></div><span class="muted small">49 funções no Windows; 45 funções no OpenNT</span><div class="examples">Exemplos: <code>ObReferenceObjectByHandle</code> <code>ObfDereferenceObject</code> <code>ObRegisterCallbacks</code></div></div><div class="nums"><strong>91,8%</strong></div></div></div><div class="chips" aria-label="Outros grupos"><a href="ntoskrnl-ke.html">Ke</a><a href="ntoskrnl-ke-irql.html">Ke*Irql</a><a href="ntoskrnl-mm.html">Mm</a><a href="ntoskrnl-ob.html" aria-current="page">Ob</a><a href="ntoskrnl-ps.html">Ps</a><a href="ntoskrnl-io.html">Io</a><a href="ntoskrnl-ex.html">Ex</a><a href="ntoskrnl-rtl.html">Rtl</a><a href="ntoskrnl-se.html">Se</a><a href="ntoskrnl-zw-nt.html">Zw/Nt</a><a href="ntoskrnl-cm.html">Cm</a><a href="ntoskrnl-po.html">Po</a><a href="ntoskrnl-hal.html">Hal</a><a href="ntoskrnl-wmi-etw.html">Wmi/Etw</a><a href="ntoskrnl-fs-fsrtl.html">Fs/FsRtl</a><a href="ntoskrnl-kd.html">Kd</a><a href="ntoskrnl-inbv.html">Inbv</a><a href="ntoskrnl-outros.html">outros</a></div><nav class="groupnav" aria-label="Grupos"><a href="ntoskrnl-mm.html" rel="prev">&larr; Mm</a><a href="ntoskrnl-ps.html" rel="next">Ps &rarr;</a></nav><section class="block" id="lista"><p class="eyebrow">Lista</p><h2>Os 49 exports do grupo Ob</h2><p class="lead"><em>Função</em> é uma rotina que o driver chama; <em>variável</em> é um dado global exportado. <em>Exporta</em> quer dizer que o nome está na tabela de exports do kernel do OpenNT.</p><div class="controls js-only" role="search"><label>Buscar <input id="filtro" type="search" placeholder="parte do nome" autocomplete="off"></label><label>Mostrar <select id="estado"><option value="">todos</option><option value="sim">que o OpenNT exporta</option><option value="nao">que faltam no OpenNT</option></select></label><span id="contagem" class="count muted small" data-one="export" data-many="exports" aria-live="polite">49 exports</span></div><p id="vazio" class="empty" hidden>Nada corresponde ao filtro.</p><div class="table-card scroll" data-paginate="100"><table><thead><tr><th>Nome</th><th>Tipo</th><th>No OpenNT</th></tr></thead><tbody><tr id="e-ObAssignSecurity" data-item data-state="sim" data-text="obassignsecurity"><td><code>ObAssignSecurity</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCheckCreateObjectAccess" data-item data-state="sim" data-text="obcheckcreateobjectaccess"><td><code>ObCheckCreateObjectAccess</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCheckObjectAccess" data-item data-state="sim" data-text="obcheckobjectaccess"><td><code>ObCheckObjectAccess</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCloseHandle" data-item data-state="sim" data-text="obclosehandle"><td><code>ObCloseHandle</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCreateObject" data-item data-state="sim" data-text="obcreateobject"><td><code>ObCreateObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCreateObjectType" data-item data-state="sim" data-text="obcreateobjecttype"><td><code>ObCreateObjectType</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObCreateObjectTypeEx" data-item data-state="sim" data-text="obcreateobjecttypeex"><td><code>ObCreateObjectTypeEx</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDeleteCapturedInsertInfo" data-item data-state="sim" data-text="obdeletecapturedinsertinfo"><td><code>ObDeleteCapturedInsertInfo</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDereferenceObject" data-item data-state="sim" data-text="obdereferenceobject"><td><code>ObDereferenceObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDereferenceObjectDeferDelete" data-item data-state="sim" data-text="obdereferenceobjectdeferdelete"><td><code>ObDereferenceObjectDeferDelete</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDereferenceObjectDeferDeleteWithTag" data-item data-state="sim" data-text="obdereferenceobjectdeferdeletewithtag"><td><code>ObDereferenceObjectDeferDeleteWithTag</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDereferenceSecurityDescriptor" data-item data-state="sim" data-text="obdereferencesecuritydescriptor"><td><code>ObDereferenceSecurityDescriptor</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObDuplicateObject" data-item data-state="sim" data-text="obduplicateobject"><td><code>ObDuplicateObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObFindHandleForObject" data-item data-state="sim" data-text="obfindhandleforobject"><td><code>ObFindHandleForObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObGetFilterVersion" data-item data-state="nao" data-text="obgetfilterversion"><td><code>ObGetFilterVersion</code></td><td>função</td><td><span class="no">falta</span></td></tr><tr id="e-ObGetObjectSecurity" data-item data-state="sim" data-text="obgetobjectsecurity"><td><code>ObGetObjectSecurity</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObGetObjectType" data-item data-state="sim" data-text="obgetobjecttype"><td><code>ObGetObjectType</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObInsertObject" data-item data-state="sim" data-text="obinsertobject"><td><code>ObInsertObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObIsDosDeviceLocallyMapped" data-item data-state="sim" data-text="obisdosdevicelocallymapped"><td><code>ObIsDosDeviceLocallyMapped</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObIsKernelHandle" data-item data-state="sim" data-text="obiskernelhandle"><td><code>ObIsKernelHandle</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObLogSecurityDescriptor" data-item data-state="sim" data-text="oblogsecuritydescriptor"><td><code>ObLogSecurityDescriptor</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObMakeTemporaryObject" data-item data-state="sim" data-text="obmaketemporaryobject"><td><code>ObMakeTemporaryObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObOpenObjectByName" data-item data-state="sim" data-text="obopenobjectbyname"><td><code>ObOpenObjectByName</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObOpenObjectByNameEx" data-item data-state="nao" data-text="obopenobjectbynameex"><td><code>ObOpenObjectByNameEx</code></td><td>função</td><td><span class="no">falta</span></td></tr><tr id="e-ObOpenObjectByPointer" data-item data-state="sim" data-text="obopenobjectbypointer"><td><code>ObOpenObjectByPointer</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObOpenObjectByPointerWithTag" data-item data-state="nao" data-text="obopenobjectbypointerwithtag"><td><code>ObOpenObjectByPointerWithTag</code></td><td>função</td><td><span class="no">falta</span></td></tr><tr id="e-ObQueryNameInfo" data-item data-state="sim" data-text="obquerynameinfo"><td><code>ObQueryNameInfo</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObQueryNameString" data-item data-state="sim" data-text="obquerynamestring"><td><code>ObQueryNameString</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObQueryObjectAuditingByHandle" data-item data-state="sim" data-text="obqueryobjectauditingbyhandle"><td><code>ObQueryObjectAuditingByHandle</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByHandle" data-item data-state="sim" data-text="obreferenceobjectbyhandle"><td><code>ObReferenceObjectByHandle</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByHandleWithTag" data-item data-state="sim" data-text="obreferenceobjectbyhandlewithtag"><td><code>ObReferenceObjectByHandleWithTag</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByName" data-item data-state="sim" data-text="obreferenceobjectbyname"><td><code>ObReferenceObjectByName</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByPointer" data-item data-state="sim" data-text="obreferenceobjectbypointer"><td><code>ObReferenceObjectByPointer</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByPointerWithTag" data-item data-state="nao" data-text="obreferenceobjectbypointerwithtag"><td><code>ObReferenceObjectByPointerWithTag</code></td><td>função</td><td><span class="no">falta</span></td></tr><tr id="e-ObReferenceObjectSafe" data-item data-state="sim" data-text="obreferenceobjectsafe"><td><code>ObReferenceObjectSafe</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceObjectSafeWithTag" data-item data-state="sim" data-text="obreferenceobjectsafewithtag"><td><code>ObReferenceObjectSafeWithTag</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReferenceSecurityDescriptor" data-item data-state="sim" data-text="obreferencesecuritydescriptor"><td><code>ObReferenceSecurityDescriptor</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObRegisterCallbacks" data-item data-state="sim" data-text="obregistercallbacks"><td><code>ObRegisterCallbacks</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObReleaseObjectSecurity" data-item data-state="sim" data-text="obreleaseobjectsecurity"><td><code>ObReleaseObjectSecurity</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObSetHandleAttributes" data-item data-state="sim" data-text="obsethandleattributes"><td><code>ObSetHandleAttributes</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObSetSecurityDescriptorInfo" data-item data-state="sim" data-text="obsetsecuritydescriptorinfo"><td><code>ObSetSecurityDescriptorInfo</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObSetSecurityObjectByPointer" data-item data-state="sim" data-text="obsetsecurityobjectbypointer"><td><code>ObSetSecurityObjectByPointer</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObUnRegisterCallbacks" data-item data-state="sim" data-text="obunregistercallbacks"><td><code>ObUnRegisterCallbacks</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObWaitForMultipleObjects" data-item data-state="sim" data-text="obwaitformultipleobjects"><td><code>ObWaitForMultipleObjects</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObWaitForSingleObject" data-item data-state="sim" data-text="obwaitforsingleobject"><td><code>ObWaitForSingleObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObfDereferenceObject" data-item data-state="sim" data-text="obfdereferenceobject"><td><code>ObfDereferenceObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObfDereferenceObjectWithTag" data-item data-state="sim" data-text="obfdereferenceobjectwithtag"><td><code>ObfDereferenceObjectWithTag</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObfReferenceObject" data-item data-state="sim" data-text="obfreferenceobject"><td><code>ObfReferenceObject</code></td><td>função</td><td><span class="yes">exporta</span></td></tr><tr id="e-ObfReferenceObjectWithTag" data-item data-state="sim" data-text="obfreferenceobjectwithtag"><td><code>ObfReferenceObjectWithTag</code></td><td>função</td><td><span class="yes">exporta</span></td></tr></tbody></table></div></section><nav class="groupnav" aria-label="Grupos"><a href="ntoskrnl-mm.html" rel="prev">&larr; Mm</a><a href="ntoskrnl-ps.html" rel="next">Ps &rarr;</a></nav>
+<a class="skip" href="#conteudo">Pular para o conteúdo</a>
+<header class="site"><div class="wrap bar"><a class="brand" href="index.html"><span class="logo"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1" fill="#fff"/><rect x="9" y="2" width="5" height="5" rx="1" fill="#fff" opacity=".75"/><rect x="2" y="9" width="5" height="5" rx="1" fill="#fff" opacity=".75"/><rect x="9" y="9" width="5" height="5" rx="1" fill="#fff" opacity=".5"/></svg></span>OpenNT<span class="tag">status</span></a><nav class="nav" aria-label="Páginas do site"><ul><li><a href="index.html">Visão geral</a></li><li><a href="componentes.html">Componentes<span class="long"> e drivers</span></a></li><li><a href="testes.html">Testes</a></li><li><a href="ntoskrnl.html" aria-current="page">Exports<span class="long"> do ntoskrnl</span></a></li><li><a href="modulos.html">Módulos<span class="long"> do kernel</span></a></li></ul></nav></div></header>
+<main id="conteudo" class="wrap" tabindex="-1">
+<nav class="crumbs" aria-label="Você está em"><ol><li><a href="index.html">Visão geral</a></li><li><a href="ntoskrnl.html">Exports do ntoskrnl</a></li><li><span aria-current="page">Ob <span class="muted">(grupo 4 de 18)</span></span></li></ol></nav><header class="page-head"><h1>Ob <span class="muted">· gerenciador de objetos</span></h1><p class="lead">Object Manager: tudo no kernel é um objeto com nome, contagem de referências e handles (processos, arquivos, eventos, dispositivos). Ob cuida de referenciar, nomear e proteger esses objetos.</p><p class="examples">Exemplos: <code>ObReferenceObjectByHandle</code> <code>ObfDereferenceObject</code> <code>ObRegisterCallbacks</code></p><div class="stats"><div class="stat"><p class="stat-label">Também no OpenNT</p><p class="stat-value">45 <span class="of">de 49</span></p><div class="meter" role="img" aria-label="45 de 49 exportados (91,8%)"><span style="width:91.84%"></span></div><p class="stat-note">45 de 49 nomes deste grupo o OpenNT também exporta · 91,8%</p></div><div class="stat"><p class="stat-label">No Windows</p><p class="stat-value">49</p><p class="stat-note">49 funções</p></div><div class="stat"><p class="stat-label">No OpenNT</p><p class="stat-value">45</p><p class="stat-note">45 funções</p></div><div class="stat"><p class="stat-label">Faltam</p><p class="stat-value">4</p><p class="stat-note">nomes do Windows que o OpenNT ainda não exporta</p></div></div></header><nav aria-label="Outros grupos"><ul class="jump"><li><a href="ntoskrnl-ke.html">Ke <span class="n">60,3%</span></a></li><li><a href="ntoskrnl-ke-irql.html">Ke*Irql <span class="n">50,0%</span></a></li><li><a href="ntoskrnl-mm.html">Mm <span class="n">62,7%</span></a></li><li><a href="ntoskrnl-ob.html" aria-current="page">Ob <span class="n">91,8%</span></a></li><li><a href="ntoskrnl-ps.html">Ps <span class="n">79,6%</span></a></li><li><a href="ntoskrnl-io.html">Io <span class="n">68,7%</span></a></li><li><a href="ntoskrnl-ex.html">Ex <span class="n">69,3%</span></a></li><li><a href="ntoskrnl-rtl.html">Rtl <span class="n">63,9%</span></a></li><li><a href="ntoskrnl-se.html">Se <span class="n">66,1%</span></a></li><li><a href="ntoskrnl-zw-nt.html">Zw/Nt <span class="n">36,6%</span></a></li><li><a href="ntoskrnl-cm.html">Cm <span class="n">33,3%</span></a></li><li><a href="ntoskrnl-po.html">Po <span class="n">61,3%</span></a></li><li><a href="ntoskrnl-hal.html">Hal <span class="n">9,1%</span></a></li><li><a href="ntoskrnl-wmi-etw.html">Wmi/Etw <span class="n">72,7%</span></a></li><li><a href="ntoskrnl-fs-fsrtl.html">Fs/FsRtl <span class="n">78,2%</span></a></li><li><a href="ntoskrnl-kd.html">Kd <span class="n">57,1%</span></a></li><li><a href="ntoskrnl-inbv.html">Inbv <span class="n">14,3%</span></a></li><li><a href="ntoskrnl-outros.html">outros <span class="n">50,9%</span></a></li></ul></nav><section class="block" id="lista" aria-labelledby="lista-t"><h2 id="lista-t">Os 49 exports do grupo Ob</h2><p class="intro"><em>Função</em> é uma rotina que o driver chama; <em>variável</em> é um dado global exportado. <em>Exporta</em> quer dizer que o nome está na tabela de exports do kernel do OpenNT.</p><div class="filters js-only" role="search" aria-label="Filtrar exports" data-filter="lista"><div class="search"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><label class="sr-only" for="filtro">Buscar</label><input id="filtro" type="search" placeholder="Buscar parte do nome" autocomplete="off" spellcheck="false"></div><div class="toggles" role="group" aria-label="Mostrar"><button type="button" data-value="" aria-pressed="true">Todos <span class="n">49</span></button><button type="button" data-value="sim" aria-pressed="false"><span class="mark yes" aria-hidden="true"></span>O OpenNT exporta <span class="n">45</span></button><button type="button" data-value="nao" aria-pressed="false"><span class="mark no" aria-hidden="true"></span>Falta no OpenNT <span class="n">4</span></button></div><p class="count" aria-live="polite" data-one="export" data-many="exports">49 exports</p></div><p id="vazio" class="empty" hidden>Nada corresponde ao filtro. <button type="button" class="linkish" data-clear>Limpar o filtro</button></p><div class="table-wrap sticky"><table><caption class="sr-only">Exports do grupo Ob</caption><thead><tr><th scope="col">Nome</th><th scope="col">Tipo</th><th scope="col">No OpenNT</th></tr></thead><tbody><tr id="e-ObAssignSecurity" data-item data-state="sim" data-text="obassignsecurity"><td class="wrap-code"><code>Ob<wbr>Assign<wbr>Security</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCheckCreateObjectAccess" data-item data-state="sim" data-text="obcheckcreateobjectaccess"><td class="wrap-code"><code>Ob<wbr>Check<wbr>Create<wbr>Object<wbr>Access</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCheckObjectAccess" data-item data-state="sim" data-text="obcheckobjectaccess"><td class="wrap-code"><code>Ob<wbr>Check<wbr>Object<wbr>Access</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCloseHandle" data-item data-state="sim" data-text="obclosehandle"><td class="wrap-code"><code>Ob<wbr>Close<wbr>Handle</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCreateObject" data-item data-state="sim" data-text="obcreateobject"><td class="wrap-code"><code>Ob<wbr>Create<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCreateObjectType" data-item data-state="sim" data-text="obcreateobjecttype"><td class="wrap-code"><code>Ob<wbr>Create<wbr>Object<wbr>Type</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObCreateObjectTypeEx" data-item data-state="sim" data-text="obcreateobjecttypeex"><td class="wrap-code"><code>Ob<wbr>Create<wbr>Object<wbr>Type<wbr>Ex</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDeleteCapturedInsertInfo" data-item data-state="sim" data-text="obdeletecapturedinsertinfo"><td class="wrap-code"><code>Ob<wbr>Delete<wbr>Captured<wbr>Insert<wbr>Info</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDereferenceObject" data-item data-state="sim" data-text="obdereferenceobject"><td class="wrap-code"><code>Ob<wbr>Dereference<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDereferenceObjectDeferDelete" data-item data-state="sim" data-text="obdereferenceobjectdeferdelete"><td class="wrap-code"><code>Ob<wbr>Dereference<wbr>Object<wbr>Defer<wbr>Delete</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDereferenceObjectDeferDeleteWithTag" data-item data-state="sim" data-text="obdereferenceobjectdeferdeletewithtag"><td class="wrap-code"><code>Ob<wbr>Dereference<wbr>Object<wbr>Defer<wbr>Delete<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDereferenceSecurityDescriptor" data-item data-state="sim" data-text="obdereferencesecuritydescriptor"><td class="wrap-code"><code>Ob<wbr>Dereference<wbr>Security<wbr>Descriptor</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObDuplicateObject" data-item data-state="sim" data-text="obduplicateobject"><td class="wrap-code"><code>Ob<wbr>Duplicate<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObFindHandleForObject" data-item data-state="sim" data-text="obfindhandleforobject"><td class="wrap-code"><code>Ob<wbr>Find<wbr>Handle<wbr>For<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObGetFilterVersion" data-item data-state="nao" data-text="obgetfilterversion"><td class="wrap-code"><code>Ob<wbr>Get<wbr>Filter<wbr>Version</code></td><td>função</td><td><span class="mark no">falta</span></td></tr><tr id="e-ObGetObjectSecurity" data-item data-state="sim" data-text="obgetobjectsecurity"><td class="wrap-code"><code>Ob<wbr>Get<wbr>Object<wbr>Security</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObGetObjectType" data-item data-state="sim" data-text="obgetobjecttype"><td class="wrap-code"><code>Ob<wbr>Get<wbr>Object<wbr>Type</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObInsertObject" data-item data-state="sim" data-text="obinsertobject"><td class="wrap-code"><code>Ob<wbr>Insert<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObIsDosDeviceLocallyMapped" data-item data-state="sim" data-text="obisdosdevicelocallymapped"><td class="wrap-code"><code>Ob<wbr>Is<wbr>Dos<wbr>Device<wbr>Locally<wbr>Mapped</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObIsKernelHandle" data-item data-state="sim" data-text="obiskernelhandle"><td class="wrap-code"><code>Ob<wbr>Is<wbr>Kernel<wbr>Handle</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObLogSecurityDescriptor" data-item data-state="sim" data-text="oblogsecuritydescriptor"><td class="wrap-code"><code>Ob<wbr>Log<wbr>Security<wbr>Descriptor</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObMakeTemporaryObject" data-item data-state="sim" data-text="obmaketemporaryobject"><td class="wrap-code"><code>Ob<wbr>Make<wbr>Temporary<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObOpenObjectByName" data-item data-state="sim" data-text="obopenobjectbyname"><td class="wrap-code"><code>Ob<wbr>Open<wbr>Object<wbr>By<wbr>Name</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObOpenObjectByNameEx" data-item data-state="nao" data-text="obopenobjectbynameex"><td class="wrap-code"><code>Ob<wbr>Open<wbr>Object<wbr>By<wbr>Name<wbr>Ex</code></td><td>função</td><td><span class="mark no">falta</span></td></tr><tr id="e-ObOpenObjectByPointer" data-item data-state="sim" data-text="obopenobjectbypointer"><td class="wrap-code"><code>Ob<wbr>Open<wbr>Object<wbr>By<wbr>Pointer</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObOpenObjectByPointerWithTag" data-item data-state="nao" data-text="obopenobjectbypointerwithtag"><td class="wrap-code"><code>Ob<wbr>Open<wbr>Object<wbr>By<wbr>Pointer<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark no">falta</span></td></tr><tr id="e-ObQueryNameInfo" data-item data-state="sim" data-text="obquerynameinfo"><td class="wrap-code"><code>Ob<wbr>Query<wbr>Name<wbr>Info</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObQueryNameString" data-item data-state="sim" data-text="obquerynamestring"><td class="wrap-code"><code>Ob<wbr>Query<wbr>Name<wbr>String</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObQueryObjectAuditingByHandle" data-item data-state="sim" data-text="obqueryobjectauditingbyhandle"><td class="wrap-code"><code>Ob<wbr>Query<wbr>Object<wbr>Auditing<wbr>By<wbr>Handle</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByHandle" data-item data-state="sim" data-text="obreferenceobjectbyhandle"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>By<wbr>Handle</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByHandleWithTag" data-item data-state="sim" data-text="obreferenceobjectbyhandlewithtag"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>By<wbr>Handle<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByName" data-item data-state="sim" data-text="obreferenceobjectbyname"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>By<wbr>Name</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByPointer" data-item data-state="sim" data-text="obreferenceobjectbypointer"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>By<wbr>Pointer</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectByPointerWithTag" data-item data-state="nao" data-text="obreferenceobjectbypointerwithtag"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>By<wbr>Pointer<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark no">falta</span></td></tr><tr id="e-ObReferenceObjectSafe" data-item data-state="sim" data-text="obreferenceobjectsafe"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>Safe</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceObjectSafeWithTag" data-item data-state="sim" data-text="obreferenceobjectsafewithtag"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Object<wbr>Safe<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReferenceSecurityDescriptor" data-item data-state="sim" data-text="obreferencesecuritydescriptor"><td class="wrap-code"><code>Ob<wbr>Reference<wbr>Security<wbr>Descriptor</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObRegisterCallbacks" data-item data-state="sim" data-text="obregistercallbacks"><td class="wrap-code"><code>Ob<wbr>Register<wbr>Callbacks</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObReleaseObjectSecurity" data-item data-state="sim" data-text="obreleaseobjectsecurity"><td class="wrap-code"><code>Ob<wbr>Release<wbr>Object<wbr>Security</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObSetHandleAttributes" data-item data-state="sim" data-text="obsethandleattributes"><td class="wrap-code"><code>Ob<wbr>Set<wbr>Handle<wbr>Attributes</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObSetSecurityDescriptorInfo" data-item data-state="sim" data-text="obsetsecuritydescriptorinfo"><td class="wrap-code"><code>Ob<wbr>Set<wbr>Security<wbr>Descriptor<wbr>Info</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObSetSecurityObjectByPointer" data-item data-state="sim" data-text="obsetsecurityobjectbypointer"><td class="wrap-code"><code>Ob<wbr>Set<wbr>Security<wbr>Object<wbr>By<wbr>Pointer</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObUnRegisterCallbacks" data-item data-state="sim" data-text="obunregistercallbacks"><td class="wrap-code"><code>Ob<wbr>Un<wbr>Register<wbr>Callbacks</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObWaitForMultipleObjects" data-item data-state="sim" data-text="obwaitformultipleobjects"><td class="wrap-code"><code>Ob<wbr>Wait<wbr>For<wbr>Multiple<wbr>Objects</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObWaitForSingleObject" data-item data-state="sim" data-text="obwaitforsingleobject"><td class="wrap-code"><code>Ob<wbr>Wait<wbr>For<wbr>Single<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObfDereferenceObject" data-item data-state="sim" data-text="obfdereferenceobject"><td class="wrap-code"><code>Obf<wbr>Dereference<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObfDereferenceObjectWithTag" data-item data-state="sim" data-text="obfdereferenceobjectwithtag"><td class="wrap-code"><code>Obf<wbr>Dereference<wbr>Object<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObfReferenceObject" data-item data-state="sim" data-text="obfreferenceobject"><td class="wrap-code"><code>Obf<wbr>Reference<wbr>Object</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr><tr id="e-ObfReferenceObjectWithTag" data-item data-state="sim" data-text="obfreferenceobjectwithtag"><td class="wrap-code"><code>Obf<wbr>Reference<wbr>Object<wbr>With<wbr>Tag</code></td><td>função</td><td><span class="mark yes">exporta</span></td></tr></tbody></table></div></section><nav class="group-nav" aria-label="Grupo anterior e próximo"><a href="ntoskrnl-mm.html" rel="prev">&larr; Mm</a><a href="ntoskrnl-ps.html" rel="next">Ps &rarr;</a></nav>
 </main>
-<footer><div class="wrap">Gerado por <code>cargo xtask status</code> a partir do código do repositório, de <code>docs/status/components.toml</code> e da lista de exports do <code>ntoskrnl.exe</code>. Não edite estas páginas à mão: edite os dados e gere de novo.</div></footer>
+<footer class="site"><div class="wrap"><nav aria-label="Páginas do site (rodapé)"><ul><li><a href="index.html">Visão geral</a></li><li><a href="componentes.html">Componentes e drivers</a></li><li><a href="testes.html">Testes</a></li><li><a href="ntoskrnl.html">Exports do ntoskrnl</a></li><li><a href="modulos.html">Módulos do kernel</a></li></ul></nav><p>Gerado por <code>cargo xtask status</code> a partir do código do repositório, de <code>docs/status/components.toml</code> e da lista de exports do <code>ntoskrnl.exe</code>. Não edite estas páginas à mão: edite os dados e gere de novo.</p></div></footer>
 <script>
 (function(){
   var d=document;
   function all(s,r){return Array.prototype.slice.call((r||d).querySelectorAll(s));}
   function fold(s){s=(s||'').toLowerCase();return s.normalize?s.normalize('NFD').replace(/[̀-ͯ]/g,''):s;}
-  var text=d.getElementById('filtro'),state=d.getElementById('estado'),count=d.getElementById('contagem'),empty=d.getElementById('vazio');
-  var lists=all('[data-paginate]');
-  function query(){return text?fold(text.value.trim()):'';}
-  function filtering(){return !!(query()||(state&&state.value));}
-  function ok(item){
-    if(state&&state.value&&item.getAttribute('data-state')!==state.value)return false;
-    var q=query();
-    return !q||fold(item.getAttribute('data-text')||item.textContent).indexOf(q)>=0;
-  }
-  function button(label,page,disabled,current,name){
-    return '<button type="button" data-p="'+page+'"'+(disabled?' disabled':'')+(current?' aria-current="page"':'')+
-      ' aria-label="'+name+'">'+label+'</button>';
-  }
-  function numbers(current,total){
-    var out=[],i;
-    for(i=0;i<total;i++){
-      if(i===0||i===total-1||Math.abs(i-current)<=1)out.push(i);
-      else if(out[out.length-1]!==-1)out.push(-1);
-    }
-    return out;
-  }
-  function render(list){
-    var items=all('[data-item]',list),shown=items.filter(ok),size=list.size;
-    var pages=Math.max(1,Math.ceil(shown.length/size));
-    if(list.page>=pages)list.page=pages-1;
-    var start=list.page*size;
-    items.forEach(function(item){item.hidden=true;});
-    shown.forEach(function(item,n){item.hidden=n<start||n>=start+size;});
-    var html='';
-    if(pages>1){
-      html+=button('&lsaquo; Anterior',list.page-1,list.page===0,false,'Página anterior');
-      numbers(list.page,pages).forEach(function(p){
-        html+=p<0?'<span class="gap">&hellip;</span>':button(String(p+1),p,false,p===list.page,'Página '+(p+1));
-      });
-      html+=button('Próxima &rsaquo;',list.page+1,list.page===pages-1,false,'Próxima página');
-      html+='<span class="range">'+(start+1)+'&ndash;'+Math.min(start+size,shown.length)+' de '+shown.length+'</span>';
-    }
-    list.pager.innerHTML=html;
-    list.pager.hidden=pages<2;
-    var section=list.closest('[data-section]');
-    if(section)section.hidden=filtering()&&shown.length===0;
-    var details=list.closest('details');
-    if(details&&filtering()&&shown.length>0&&query())details.open=true;
-    return shown.length;
-  }
-  function update(reset){
-    var total=0;
-    lists.forEach(function(list){if(reset)list.page=0;total+=render(list);});
-    all('[data-group]').forEach(function(group){
-      group.hidden=filtering()&&all('[data-section]',group).every(function(section){return section.hidden;});
+  var bar=d.querySelector('[data-filter]'),scope=bar&&d.getElementById(bar.getAttribute('data-filter'));
+  var input,buttons=[],count,empty,items=[],sections=[],groups=[],state='';
+  function apply(){
+    var q=fold(input.value.trim()),active=!!(q||state),shown=0,hits=0,per={};
+    items.forEach(function(item){
+      var hit=!q||item._t.indexOf(q)>=0,s=item.getAttribute('data-state')||'';
+      if(hit){hits++;per[s]=(per[s]||0)+1;}
+      var show=hit&&(!state||s===state);
+      item.hidden=!show;if(show)shown++;
     });
-    if(count){count.textContent=total+' '+(total===1?count.getAttribute('data-one'):count.getAttribute('data-many'));}
-    if(empty)empty.hidden=total>0;
-  }
-  lists.forEach(function(list){
-    list.page=0;list.size=parseInt(list.getAttribute('data-paginate'),10)||10;
-    var nav=d.createElement('nav');nav.className='pager';nav.setAttribute('aria-label','Paginação');
-    list.parentNode.insertBefore(nav,list.nextSibling);list.pager=nav;
-    nav.addEventListener('click',function(event){
-      var target=event.target.closest('button');
-      if(!target||target.disabled)return;
-      list.page=parseInt(target.getAttribute('data-p'),10);render(list);
-      var top=list.getBoundingClientRect().top;
-      if(top<0)list.scrollIntoView({block:'start'});
+    buttons.forEach(function(b){var v=b.getAttribute('data-value'),n=b.querySelector('.n');if(n)n.textContent=v?(per[v]||0):hits;});
+    sections.forEach(function(s){
+      var any=all('[data-item]',s).some(function(i){return !i.hidden;});
+      s.hidden=active&&!any;
+      if(q&&any&&s.tagName==='DETAILS')s.open=true;
     });
-  });
-  if(text)text.addEventListener('input',function(){update(true);});
-  if(state)state.addEventListener('change',function(){update(true);});
+    groups.forEach(function(g){g.hidden=active&&all('[data-section]',g).every(function(s){return s.hidden;});});
+    if(count)count.textContent=shown+' '+(shown===1?count.getAttribute('data-one'):count.getAttribute('data-many'));
+    if(empty)empty.hidden=shown>0;
+  }
+  function choose(value){
+    state=value;
+    buttons.forEach(function(b){b.setAttribute('aria-pressed',b.getAttribute('data-value')===value?'true':'false');});
+    apply();
+  }
+  if(scope){
+    input=bar.querySelector('input');buttons=all('button[data-value]',bar);count=bar.querySelector('.count');
+    empty=d.getElementById('vazio');items=all('[data-item]',scope);sections=all('[data-section]',scope);groups=all('[data-group]',scope);
+    items.forEach(function(item){item._t=fold(item.getAttribute('data-text')||item.textContent);});
+    input.addEventListener('input',apply);
+    buttons.forEach(function(b){b.addEventListener('click',function(){choose(b.getAttribute('data-value'));});});
+    all('[data-clear]').forEach(function(b){b.addEventListener('click',function(){input.value='';choose('');input.focus();});});
+    var params=window.URLSearchParams?new URLSearchParams(location.search):null,wanted=params&&params.get('estado');
+    if(params&&params.get('q'))input.value=params.get('q');
+    if(wanted&&buttons.some(function(b){return b.getAttribute('data-value')===wanted;}))choose(wanted);else apply();
+  }
   function reveal(){
     var id=decodeURIComponent(location.hash.slice(1)),target=id&&d.getElementById(id);
     if(!target)return;
-    var item=target.closest('[data-item]'),list=item&&item.closest('[data-paginate]');
-    if(list){
-      if(!ok(item)){if(text)text.value='';if(state)state.value='';update(true);}
-      var n=all('[data-item]',list).filter(ok).indexOf(item);
-      if(n>=0){list.page=Math.floor(n/list.size);render(list);}
-    }
-    var details=target.closest('details');
-    if(details)details.open=true;
+    var item=target.closest('[data-item]');
+    if(item&&item.hidden&&input){input.value='';choose('');}
+    for(var node=target;node;node=node.parentElement){if(node.tagName==='DETAILS')node.open=true;}
     target.scrollIntoView({block:'start'});
   }
-  update(true);
-  reveal();
+  if(location.hash)reveal();
   window.addEventListener('hashchange',reveal);
 })();
 </script>
