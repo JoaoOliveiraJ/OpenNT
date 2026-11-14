@@ -331,6 +331,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("zw-virtual-memory-information", 1680, 1),
     ("zw-event", 1681, 4),
     ("ex-wnf-subscription", 1685, 2),
+    ("io-device-eject", 1687, 2),
 ];
 
 /// Os 1114 exports de função, na ordem da ABI.
@@ -2022,4 +2023,6 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwClearEvent",
     "ExSubscribeWnfStateChange",
     "ExUnsubscribeWnfStateChange",
+    "IoRequestDeviceEject",
+    "IoRequestDeviceEjectEx",
 ];

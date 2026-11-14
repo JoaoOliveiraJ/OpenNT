@@ -138,6 +138,22 @@ pub fn queue_kernel_work_item(item: u64, routine: KernelWorkRoutine, context: u6
     }
 }
 
+/// Variante interna do ExQueueWorkItem: um WORK_QUEUE_ITEM do kernel
+/// (embutido num bloco próprio) cuja rotina é Rust e recebe o Parameter.
+pub fn queue_kernel_ex_work_item(item: u64, routine: KernelWorkRoutine, parameter: u64) {
+    let mut queue = QUEUE.lock();
+    if queue.entries.iter().any(|&(queued, _)| queued == item) {
+        return;
+    }
+    let queue_item = queue_item_at(item);
+    queue_item.list.flink.set(0);
+    queue_item.list.blink.set(0);
+    queue_item.worker_routine.set(0);
+    queue_item.parameter.set(parameter);
+    queue.entries.push((item, Kind::Ex));
+    queue.kernel_routines.insert(item, routine);
+}
+
 /// Cancela um item; a rotina e o predicado internos também são soltos.
 pub fn unqueue(item: u64) {
     let mut queue = QUEUE.lock();

@@ -1887,3 +1887,22 @@ pub mod zw_cancel_io {
 
     pub static GROUP: Group = Group { name: "zw-cancel-io", names: &["ZwCancelIoFile"], handlers: &[cancel_io_file], data_exports: &[] };
 }
+
+pub mod io_device_eject {
+    //! IoRequestDeviceEject e IoRequestDeviceEjectEx; a lógica mora em
+    //! `io/device_removal.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::device_removal;
+    use crate::rtl::KernelError;
+
+    /// IoRequestDeviceEject(Pdo): o Ex sem callback (o status fica em RAX).
+    fn request_device_eject(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_removal::request_device_eject(call.arg(1), 0, 0, 0)))
+    }
+    fn request_device_eject_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_removal::request_device_eject(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    pub static GROUP: Group = Group { name: "io-device-eject", names: &["IoRequestDeviceEject", "IoRequestDeviceEjectEx"], handlers: &[request_device_eject, request_device_eject_ex], data_exports: &[] };
+}
