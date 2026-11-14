@@ -323,8 +323,12 @@ em KPRCB.RspBase e TSS.RSP0 a InitialStack da KTHREAD corrente: syscalls,
 IRQs e exceções do anel 3 caem na pilha da própria thread, e o frame da
 syscall fica logo abaixo da RspBase (`state::syscall_frame`). Fora do
 intervalo as duas voltam à pilha reserva da CPU, que também serve a uma
-thread sem pilha própria (o anel 3 cru dos autotestes). O ceifador devolve a
-pilha: `threads::release_execution_resources` para a thread de usuário morta,
+thread sem pilha própria (o anel 3 cru dos autotestes). A pilha própria é
+contada em ETHREAD.KernelStackReference, que a criação põe em 1: o ceifador
+solta essa referência (`ps::process::release_kernel_stack`) e a pilha só volta
+quando a última cai, depois dos PsReferenceKernelStack que a retêm
+(PsDereferenceKernelStack). O ceifador roda em
+`threads::release_execution_resources` para a thread de usuário morta,
 o fim do contexto no escalonador para a nativa, e o fim da ETHREAD para o que
 sobrar; quem libera a pilha em que a CPU ainda está a deixa para o
 `kernel_stack::reap`, fora dela. A TSS do BSP leva na IST1 uma pilha própria
@@ -434,6 +438,33 @@ KUSER, enquanto o matador termina as voltas e sai com o próprio código. Por
 fim, com uma segunda thread viva, a principal chama
 NtTerminateProcess(NULL), recebe sucesso e sai depois com o próprio código;
 a segunda morreu com o status pedido.
+
+**Callbacks de modo usuário.** Um serviço do kernel (o win32k, dentro de
+uma syscall da thread) chama uma rotina de usuário pelo KeUserModeCallback
+(`ke/user_callback.rs`), como o KiCallUserMode do NT: confere o contexto
+(IRQL, anexação, APCs; os bugchecks do NT), conta o aninhamento em
+KTHREAD.CallbackNestingLevel, cria uma pilha de kernel nova com o
+KERNEL_STACK_CONTROL preenchido (o segmento anterior e, em
+Previous.KernelStack, o quadro do callout), monta o UCALLOUT_FRAME e a cópia
+da entrada abaixo do RSP da syscall (o CONTEXT do intervalo faz o papel do
+KTRAP_FRAME) e troca a KTHREAD para a pilha nova. O intervalo do callback é
+aninhado no serviço: `usermode::exec_user_callback` guarda o estado por CPU
+do serviço de fora (o quadro do despachante, o CONTEXT e o quadro da
+syscall, RspBase/RSP0, GS e IF) e entra num CONTEXT próprio em
+ntdll!KiUserCallbackDispatcher (o KeUserCallbackDispatcher, publicado quando a
+DLL de sistema é mapeada), com os registradores do KiCallUserMode; as
+syscalls do callback caem na pilha nova, abaixo dos quadros do serviço de
+fora. `threads::run_callback` despacha esses intervalos até o
+NtCallbackReturn, que acha o quadro do callout pelo KERNEL_STACK_CONTROL da
+InitialStack corrente e grava a saída e o status: syscalls e timer seguem, a
+espera PENDING de um serviço aninhado é sondada no lugar (dentro de um
+callback a thread não bloqueia: `can_block` recusa com aninhamento), APCs e
+exceções são entregues no CONTEXT do callback e uma thread terminada encerra
+o laço. Na volta, a KTHREAD retoma a pilha anterior e a do callback volta ao
+Mm. O autoteste `ntos/test/multiprocess/user_callback.rs` roda callbacks
+simples, aninhados, a volta pelo NtCallbackReturn do KiUserCallbackDispatcher
+real, a entrada que não cabe na pilha e o NtCallbackReturn fora de um
+callback.
 
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:
