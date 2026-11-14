@@ -7,14 +7,29 @@
 //! Tabelas e entradas são endereçadas pelo endereço FÍSICO (o "entry
 //! address" de [`PageQuery`] e das funções públicas); cada leitura e escrita
 //! passa pelo mapa direto da metade de sistema (`hal::physical`).
+//!
+//! **Raiz explícita.** Toda operação existe na forma `*_in(root, ...)`, que
+//! anda a partir da PML4 de endereço físico `root`, e na forma sem raiz, que
+//! usa a raiz corrente (o CR3, [`current_root`]). Assim o Mm monta e edita as
+//! tabelas de outro espaço de endereçamento sem carregá-lo.
+//!
+//! **Metade de sistema congelada.** [`freeze_kernel_half`] roda uma vez no
+//! boot e deixa as 256 entradas de sistema da PML4 do boot presentes e
+//! permanentes: [256] é a auto-referência (`recursive_mapping`) e [257..512)
+//! apontam para PDPTs de supervisor que nunca voltam ao PFN. Daí em diante
+//! nenhuma entrada de sistema da PML4 é criada, trocada ou liberada: o que o
+//! kernel mapeia depois muda só os níveis de baixo, em tabelas que toda raiz
+//! compartilha, e uma raiz nova que copia essas entradas uma vez fica
+//! coerente para sempre (`process_address_space::create_root`). Por isso a
+//! metade de sistema não aceita folha de usuário.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{frame_mapping_tracker as tracker, memory_map as map, native_frame_descriptors as descriptors, pfn};
+use super::{frame_mapping_tracker as tracker, memory_map as map, native_frame_descriptors as descriptors, pfn, recursive_mapping};
 use crate::hal::{cpu, physical};
-use crate::rtl::SpinLock;
+use crate::rtl::{KernelError, SpinLock};
 
 pub const PAGE_PRESENT: u64 = 0x01;
 pub const PAGE_RW: u64 = 0x02;
@@ -25,23 +40,93 @@ pub const PAGE_PCD: u64 = 0x10;
 /// Bit 7 na PD = página de 2MB.
 pub const PAGE_PS: u64 = 0x80;
 
+/// A PML4 do boot (a raiz do System).
 const PML4: u64 = map::PML4_PHYS;
 const NX_BIT: u64 = 1 << 63;
 /// Bits que `read_entry` conserva: endereço + flags baixas, sem NX nem 52..62.
 const ENTRY_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
+/// Bits do CR3 que formam o endereço físico da PML4.
+const ROOT_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 struct PagingState {
     /// Só tabelas alocadas aqui voltam ao PFN (entrada pai -> frame filho).
     owned_tables: BTreeMap<u64, u64>,
     /// Lembra uma célula não vazia, sem presumir que continua igual.
     nonempty_table_hints: BTreeMap<u64, u64>,
+    /// Tabelas que nunca voltam ao PFN, mesmo vazias: as PDPTs da metade de
+    /// sistema, compartilhadas por todas as raízes.
+    permanent: BTreeSet<u64>,
 }
 
 static STATE: SpinLock<PagingState> =
-    SpinLock::new(PagingState { owned_tables: BTreeMap::new(), nonempty_table_hints: BTreeMap::new() });
+    SpinLock::new(PagingState { owned_tables: BTreeMap::new(), nonempty_table_hints: BTreeMap::new(), permanent: BTreeSet::new() });
 
 /// Rastreador de mapeamentos instalado (existe o banco nativo de PFNs).
 static OBSERVED: AtomicBool = AtomicBool::new(false);
+
+/// PML4[256..512) congeladas por [`freeze_kernel_half`].
+static KERNEL_HALF_FROZEN: AtomicBool = AtomicBool::new(false);
+
+/// A raiz (PML4) que esta CPU está usando: o CR3 sem os bits de controle.
+pub fn current_root() -> u64 {
+    cpu::read_cr3() & ROOT_MASK
+}
+
+/// A VA cai numa entrada de sistema da PML4 (índice >= 256).
+fn in_kernel_half(va: u64) -> bool {
+    pml4_index(va) >= map::USER_PML4_ENTRIES
+}
+
+pub fn kernel_half_frozen() -> bool {
+    KERNEL_HALF_FROZEN.load(Ordering::Acquire)
+}
+
+/// O frame é uma tabela que nunca volta ao PFN.
+pub fn is_permanent_table(frame: u64) -> bool {
+    STATE.lock().permanent.contains(&frame)
+}
+
+/// Pré-aloca as PDPTs de todas as entradas de sistema da PML4 do boot que
+/// ainda faltam e congela a metade de sistema. Roda uma vez na fase 0,
+/// depois do PFN e do mapeamento recursivo e antes do banco nativo de PFNs
+/// (que já encontra as PDPTs prontas). Devolve quantas PDPTs alocou.
+pub fn freeze_kernel_half() -> Result<u64, KernelError> {
+    if kernel_half_frozen() {
+        return Err(KernelError::new("kernel half already frozen"));
+    }
+    let recursive = map::PAGE_TABLE_RECURSIVE_INDEX;
+    if read_entry_exact(PML4 + recursive * 8) != recursive_mapping::self_reference(PML4) {
+        return Err(KernelError::new("kernel half needs the recursive self-reference first"));
+    }
+    let mut allocated = 0;
+    for index in map::USER_PML4_ENTRIES..512 {
+        if index == recursive {
+            continue;
+        }
+        let at = PML4 + index * 8;
+        let entry = read_entry(at);
+        if entry & PAGE_PRESENT != 0 {
+            if entry & (PAGE_USER | PAGE_PS) != 0 {
+                return Err(KernelError::new("kernel PML4 entry is not a supervisor directory pointer"));
+            }
+            let mut state = STATE.lock();
+            state.owned_tables.remove(&at);
+            state.permanent.insert(table_of(entry));
+            continue;
+        }
+        let frame = pfn::alloc_page();
+        if frame == 0 {
+            return Err(KernelError::new("no frame for a kernel directory pointer table"));
+        }
+        zero_frame(frame);
+        write_entry(at, frame | PAGE_PRESENT | PAGE_RW, false);
+        STATE.lock().permanent.insert(frame);
+        allocated += 1;
+    }
+    KERNEL_HALF_FROZEN.store(true, Ordering::Release);
+    cpu::reload_cr3();
+    Ok(allocated)
+}
 
 pub fn set_observed(installed: bool) {
     OBSERVED.store(installed, Ordering::Release);
@@ -177,16 +262,21 @@ fn record_owned(parent_entry: u64, frame: u64) {
     STATE.lock().owned_tables.insert(parent_entry, frame);
 }
 
-/// Anda PML4->PDPT->PD até a entrada da PD que contém `va`. `create` cria
-/// os níveis que faltam; `user` liga U/S nos níveis intermediários.
-fn pd_entry_address(va: u64, create: bool, user: bool) -> u64 {
+/// Anda PML4->PDPT->PD, a partir de `root`, até a entrada da PD que contém
+/// `va`. `create` cria os níveis que faltam; `user` liga U/S nos níveis
+/// intermediários. Com a metade de sistema congelada, uma entrada de sistema
+/// da PML4 nunca é criada nem alterada aqui.
+fn pd_entry_address(root: u64, va: u64, create: bool, user: bool) -> u64 {
     let middle_flags = PAGE_PRESENT | PAGE_RW | if user { PAGE_USER } else { 0 };
-    let pml4_entry_address = PML4 + pml4_index(va) * 8;
+    let pml4_entry_address = root + pml4_index(va) * 8;
     let entry = read_entry(pml4_entry_address);
+    let frozen = in_kernel_half(va) && kernel_half_frozen();
+    assert!(!(frozen && user), "user mapping requested in the frozen kernel half");
     if entry & PAGE_PRESENT == 0 {
         if !create {
             return 0;
         }
+        assert!(!frozen, "kernel PML4 entry missing after the kernel half was frozen");
         let pdpt_frame = pfn::alloc_page();
         if pdpt_frame == 0 {
             return 0;
@@ -220,7 +310,7 @@ fn pd_entry_address(va: u64, create: bool, user: bool) -> u64 {
 }
 
 /// Resultado de [`query_page`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageQuery {
     pub physical_address: u64,
     pub page_size: u64,
@@ -231,9 +321,14 @@ pub struct PageQuery {
     pub entry_address: u64,
 }
 
-/// Traduz VA -> PA andando pelas tabelas.
+/// Traduz VA -> PA andando pelas tabelas da raiz corrente.
 pub fn query_page(va: u64, include_non_present: bool) -> Option<PageQuery> {
-    let mut table = PML4;
+    query_page_in(current_root(), va, include_non_present)
+}
+
+/// [`query_page`] nas tabelas da raiz `root`.
+pub fn query_page_in(root: u64, va: u64, include_non_present: bool) -> Option<PageQuery> {
+    let mut table = root;
     let mut access = PAGE_PRESENT | PAGE_RW | PAGE_USER;
     let mut nx = false;
     let shifts = [39u32, 30, 21, 12];
@@ -262,9 +357,15 @@ pub fn query_page(va: u64, include_non_present: bool) -> Option<PageQuery> {
     None
 }
 
-/// VA -> PA pelos bits PRESENT e PFN vivos (0 = sem mapeamento).
+/// VA -> PA pelos bits PRESENT e PFN vivos (0 = sem mapeamento), na raiz
+/// corrente.
 pub fn translate(va: u64) -> u64 {
-    let mut entry = read_entry(PML4 + pml4_index(va) * 8);
+    translate_in(current_root(), va)
+}
+
+/// [`translate`] nas tabelas da raiz `root`.
+pub fn translate_in(root: u64, va: u64) -> u64 {
+    let mut entry = read_entry(root + pml4_index(va) * 8);
     if entry & PAGE_PRESENT == 0 {
         return 0;
     }
@@ -289,11 +390,16 @@ pub fn translate(va: u64) -> u64 {
 /// Acha uma folha ocupada sem varrer cada 4KB de uma faixa esparsa. Folhas
 /// não presentes com backing (NOACCESS/guarda) também contam.
 pub fn find_mapping(base: u64, size: u64) -> Option<(u64, u64)> {
+    find_mapping_in(current_root(), base, size)
+}
+
+/// [`find_mapping`] nas tabelas da raiz `root`.
+pub fn find_mapping_in(root: u64, base: u64, size: u64) -> Option<(u64, u64)> {
     let end = base.wrapping_add(size);
     let shifts = [39u32, 30, 21, 12];
     let mut address = base;
     while address < end {
-        let mut table = PML4;
+        let mut table = root;
         let mut advanced = false;
         for (level, &shift) in shifts.iter().enumerate() {
             let span = 1u64 << shift;
@@ -319,9 +425,14 @@ pub fn find_mapping(base: u64, size: u64) -> Option<(u64, u64)> {
     None
 }
 
-/// Permissões efetivas: interseção de todos os níveis.
+/// Permissões efetivas: interseção de todos os níveis, na raiz corrente.
 pub fn access_flags(va: u64) -> u64 {
-    let mut table = PML4;
+    access_flags_in(current_root(), va)
+}
+
+/// [`access_flags`] nas tabelas da raiz `root`.
+pub fn access_flags_in(root: u64, va: u64) -> u64 {
+    let mut table = root;
     let mut access = PAGE_PRESENT | PAGE_RW | PAGE_USER;
     let indices = [pml4_index(va), pdpt_index(va), pd_index(va), pt_index(va)];
     for (level, &index) in indices.iter().enumerate() {
@@ -341,10 +452,15 @@ pub fn access_flags(va: u64) -> u64 {
 /// Divide a página de 2MB que contém `va` numa PT de 512 páginas de 4KB,
 /// preservando o mapeamento. `user` só liga U/S na entrada da PD.
 pub fn split_large_page(va: u64, user: bool) -> bool {
+    split_large_page_in(current_root(), va, user)
+}
+
+/// [`split_large_page`] nas tabelas da raiz `root`.
+pub fn split_large_page_in(root: u64, va: u64, user: bool) -> bool {
     if is_recursive_mapping_address(va) {
         return false;
     }
-    let pd_entry_address = pd_entry_address(va, false, false);
+    let pd_entry_address = pd_entry_address(root, va, false, false);
     if pd_entry_address == 0 {
         return false;
     }
@@ -377,8 +493,8 @@ pub fn split_large_page(va: u64, user: bool) -> bool {
 }
 
 /// Endereço físico da PT que contém `va` (cria/divide se preciso).
-fn ensure_page_table(va: u64, user: bool) -> u64 {
-    let pd_entry_address = pd_entry_address(va, true, user);
+fn ensure_page_table(root: u64, va: u64, user: bool) -> u64 {
+    let pd_entry_address = pd_entry_address(root, va, true, user);
     if pd_entry_address == 0 {
         return 0;
     }
@@ -394,7 +510,7 @@ fn ensure_page_table(va: u64, user: bool) -> u64 {
         return pt_frame;
     }
     if pd_entry & PAGE_PS != 0 {
-        if !split_large_page(va, user) {
+        if !split_large_page_in(root, va, user) {
             return 0;
         }
         return table_of(read_entry(pd_entry_address));
@@ -405,12 +521,12 @@ fn ensure_page_table(va: u64, user: bool) -> u64 {
     table_of(read_entry(pd_entry_address))
 }
 
-/// Libera tabelas vazias do caminho de `va`. Com `deferred`, as tabelas
-/// retiradas ficam com o chamador até todas as CPUs confirmarem a
-/// invalidação.
-fn reclaim_empty_tables(va: u64, deferred: Option<&mut Vec<u64>>) {
+/// Libera tabelas vazias do caminho de `va` na raiz `root`; as permanentes
+/// ficam. Com `deferred`, as tabelas retiradas ficam com o chamador até todas
+/// as CPUs confirmarem a invalidação.
+fn reclaim_empty_tables(root: u64, va: u64, deferred: Option<&mut Vec<u64>>) {
     let mut path = Vec::new();
-    let mut table = PML4;
+    let mut table = root;
     for index in [pml4_index(va), pdpt_index(va), pd_index(va)] {
         let at = table + index * 8;
         let entry = read_entry(at);
@@ -424,7 +540,7 @@ fn reclaim_empty_tables(va: u64, deferred: Option<&mut Vec<u64>>) {
     for &(at, frame) in path.iter().rev() {
         let first_offset = {
             let state = STATE.lock();
-            if state.owned_tables.get(&at) != Some(&frame) {
+            if state.permanent.contains(&frame) || state.owned_tables.get(&at) != Some(&frame) {
                 break;
             }
             state.nonempty_table_hints.get(&frame).copied().unwrap_or(0)
@@ -475,10 +591,22 @@ pub struct MapOptions<'a> {
     pub deferred_tables: Option<&'a mut Vec<u64>>,
 }
 
-/// Mapeia uma página de 4KB: va -> pa com flags. PAGE_USER propaga U/S.
+/// Mapeia uma página de 4KB na raiz corrente: va -> pa com flags. PAGE_USER
+/// propaga U/S.
 pub fn map_page(va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
+    map_page_in(current_root(), va, pa, flags, options)
+}
+
+/// [`map_page`] nas tabelas da raiz `root`. O INVLPG vale para a raiz
+/// corrente: a metade de sistema é a mesma em todas, e numa VA de usuário de
+/// outra raiz ele só é redundante. Trocar a proteção de uma página é mapear
+/// o mesmo frame de novo com as flags novas.
+pub fn map_page_in(root: u64, va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
     if is_recursive_mapping_address(va) || pa >= 0x10_0000_0000_0000 || pa % 4096 != 0 {
         return false;
+    }
+    if flags & PAGE_USER != 0 && in_kernel_half(va) {
+        return false; // a metade de sistema não tem página de usuário
     }
     // A identidade e o mapa direto são acesso físico do kernel, não donos do
     // frame. As demais folhas, inclusive NOACCESS com backing, exigem RAM
@@ -486,9 +614,9 @@ pub fn map_page(va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
     if observed() && !physical_alias(va, pa) && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 4096) {
         return false;
     }
-    let pt_address = ensure_page_table(va, flags & PAGE_USER != 0);
+    let pt_address = ensure_page_table(root, va, flags & PAGE_USER != 0);
     if pt_address == 0 {
-        reclaim_empty_tables(va, None);
+        reclaim_empty_tables(root, va, None);
         return false;
     }
     write_entry(pt_address + pt_index(va) * 8, pa + (flags & 0xFFF), options.nx);
@@ -498,18 +626,25 @@ pub fn map_page(va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
     true
 }
 
+/// Desfaz a folha de 4KB de `va` na raiz corrente e libera as tabelas que
+/// ficarem vazias.
 pub fn unmap_page(va: u64, options: MapOptions<'_>) -> bool {
+    unmap_page_in(current_root(), va, options)
+}
+
+/// [`unmap_page`] nas tabelas da raiz `root`.
+pub fn unmap_page_in(root: u64, va: u64, options: MapOptions<'_>) -> bool {
     if is_recursive_mapping_address(va) {
         return false;
     }
-    let pd_entry_address = pd_entry_address(va, false, false);
+    let pd_entry_address = pd_entry_address(root, va, false, false);
     let mut entry = if pd_entry_address != 0 { read_entry(pd_entry_address) } else { 0 };
     if entry & PAGE_PRESENT == 0 {
-        reclaim_empty_tables(va, options.deferred_tables);
+        reclaim_empty_tables(root, va, options.deferred_tables);
         return true;
     }
     if entry & PAGE_PS != 0 {
-        if !split_large_page(va, false) {
+        if !split_large_page_in(root, va, false) {
             return false;
         }
         entry = read_entry(pd_entry_address);
@@ -519,20 +654,29 @@ pub fn unmap_page(va: u64, options: MapOptions<'_>) -> bool {
     if !options.skip_invalidate {
         cpu::invalidate_page(va);
     }
-    reclaim_empty_tables(va, options.deferred_tables);
+    reclaim_empty_tables(root, va, options.deferred_tables);
     true
 }
 
+/// Mapeia uma página de 2MB na raiz corrente.
 pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
+    map_large_page_in(current_root(), va, pa, flags, nx)
+}
+
+/// [`map_large_page`] nas tabelas da raiz `root`.
+pub fn map_large_page_in(root: u64, va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     if is_recursive_mapping_address(va) || offset_at(va, 0x20_0000) != 0 || pa >= 0x10_0000_0000_0000 || pa % 0x20_0000 != 0 {
+        return false;
+    }
+    if flags & PAGE_USER != 0 && in_kernel_half(va) {
         return false;
     }
     if observed() && !physical_alias(va, pa) && (pa != 0 || flags & PAGE_PRESENT != 0) && !descriptors::can_map_range(pa, 0x20_0000) {
         return false;
     }
-    let at = pd_entry_address(va, true, flags & PAGE_USER != 0);
+    let at = pd_entry_address(root, va, true, flags & PAGE_USER != 0);
     if at == 0 {
-        reclaim_empty_tables(va, None);
+        reclaim_empty_tables(root, va, None);
         return false;
     }
     let prior = read_entry(at);
@@ -545,11 +689,17 @@ pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     true
 }
 
+/// Desfaz a página de 2MB de `va` na raiz corrente.
 pub fn unmap_large_page(va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool {
+    unmap_large_page_in(current_root(), va, deferred_tables)
+}
+
+/// [`unmap_large_page`] nas tabelas da raiz `root`.
+pub fn unmap_large_page_in(root: u64, va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool {
     if is_recursive_mapping_address(va) || offset_at(va, 0x20_0000) != 0 {
         return false;
     }
-    let at = pd_entry_address(va, false, false);
+    let at = pd_entry_address(root, va, false, false);
     if at != 0 && read_entry(at) != 0 {
         if read_entry(at) & PAGE_PS == 0 {
             return false;
@@ -557,6 +707,6 @@ pub fn unmap_large_page(va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool
         write_entry(at, 0, false);
         cpu::invalidate_page(va);
     }
-    reclaim_empty_tables(va, deferred_tables);
+    reclaim_empty_tables(root, va, deferred_tables);
     true
 }

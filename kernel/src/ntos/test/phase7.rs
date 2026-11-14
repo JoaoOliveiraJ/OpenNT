@@ -4925,6 +4925,7 @@ fn usermode_syscalls_exports(assert: Assert) {
 
 pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::process_state::run(assert);
+    crate::ntos::test::multiprocess::page_table_root::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

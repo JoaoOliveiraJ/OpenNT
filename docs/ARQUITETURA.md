@@ -339,6 +339,40 @@ truncado para 32 bits falta. O teste
 o pool, IRPs, MDLs e os DRIVER_OBJECTs/DEVICE_OBJECTs vivos, inclusive os dos
 drivers reais.
 
+**Raízes e metade de sistema congelada.** Como no NT, a metade de sistema é
+a mesma em todo espaço de endereçamento, e é compartilhada pelas entradas da
+PML4:
+
+- Na fase 0, logo depois do PFN e do mapeamento recursivo,
+  `mm/process_address_space.rs::prepare_system_space` pré-aloca a PDPT de
+  toda entrada de sistema da PML4 do boot que ainda falta e congela a metade
+  (`paging::freeze_kernel_half`). [256] é a auto-referência e [257..512)
+  apontam para PDPTs de supervisor (cerca de 1 MB do PFN).
+- As PDPTs entram no conjunto `permanent` de `paging.rs`: nunca voltam ao
+  PFN, nem quando a última página do slot é desfeita.
+- Depois do congelamento, criar ou alterar uma entrada de sistema da PML4 é
+  erro fatal (assert em `pd_entry_address`), e `map_page`/`map_large_page`
+  recusam página de usuário na metade de sistema. O que o kernel mapeia
+  depois só muda os níveis de baixo, em tabelas compartilhadas.
+- Por isso uma raiz nova (`process_address_space::create_root`) copia
+  PML4[257..512) uma única vez e fica coerente para sempre. Ela ganha a
+  própria auto-referência em [256] e começa com a metade de usuário vazia.
+  `delete_root` só a devolve ao PFN depois de desfeita a metade de usuário.
+- Toda operação de `paging.rs` (query, translate, find, access, map, unmap,
+  split, páginas de 2 MB) tem a forma `*_in(root, ...)`, que anda a partir
+  da PML4 de endereço físico `root`. A forma sem raiz usa a raiz corrente,
+  `paging::current_root()` (o CR3). Trocar a proteção de uma página é
+  mapear o mesmo frame de novo com as flags novas, também por raiz.
+- Ainda há um só espaço em uso: todo EPROCESS recebe a PML4 do boot como
+  DirectoryTableBase e o CR3 não muda. O rastreador de frames só acompanha
+  as tabelas alcançadas pela PML4 do boot.
+
+O autoteste `ntos/test/multiprocess/page_table_root.rs` (fase 7) confere as
+256 entradas presentes e permanentes, a PDPT de um slot vazio sobrevivendo a
+um mapear/desfazer, a raiz do boot e a corrente dando a mesma resposta em
+amostras das duas metades, e uma raiz nova com os mesmos frames de kernel,
+sem páginas de usuário, que isola uma página mapeada nela.
+
 **Imagens.**
 
 - **Imagens de kernel** (drivers .sys, hal.dll, ci.dll, bibliotecas de export

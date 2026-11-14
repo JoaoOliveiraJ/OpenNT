@@ -28,7 +28,9 @@
 //!   arena na janela do heap 0xFFFFC000..., não pagináveis; imagens de
 //!   kernel na janela de sistema 0xFFFFF801..., pool executivo
 //!   0xFFFFA000..., PCR 0xFFFFF800..., banco de PFNs, visões de sistema,
-//!   memória contígua/independente): tudo nas mesmas tabelas de páginas.
+//!   memória contígua/independente): tudo nas mesmas tabelas de páginas,
+//!   com as entradas de sistema da PML4 pré-alocadas e congeladas no boot
+//!   (`paging::freeze_kernel_half`).
 //! - **Páginas pagináveis** (imagens de drivers, pool paginado, visões de
 //!   seção de sistema, cópia na escrita de seções) têm PTE ausente quando
 //!   despejadas. Os provedores ficam em `page_residency`; `fault` recusa IRQL

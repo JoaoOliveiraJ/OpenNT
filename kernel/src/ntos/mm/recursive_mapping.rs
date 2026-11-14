@@ -41,6 +41,12 @@ fn owns_root_mapping(entry: u64) -> bool {
         && entry & NO_EXECUTE != 0
 }
 
+/// A entrada [256] de uma PML4 de endereço físico `root`: ela mesma, de
+/// supervisor, RW e NX. Toda raiz tem a sua auto-referência.
+pub fn self_reference(root: u64) -> u64 {
+    root | PRESENT_WRITABLE | NO_EXECUTE
+}
+
 /// A base só é entregue quando existe a entrada válida nas tabelas.
 pub fn layout() -> Option<RecursiveLayout> {
     let layout = reserved_layout();
@@ -59,7 +65,7 @@ pub fn initialize() -> Result<RecursiveLayout, KernelError> {
         return Err(KernelError::new("recursive page-table reservation already occupied"));
     }
     let entry_address = map::PML4_PHYS + reserved.table_index * 8;
-    let entry = map::PML4_PHYS | PRESENT_WRITABLE | NO_EXECUTE;
+    let entry = self_reference(map::PML4_PHYS);
     physical::write32(entry_address + 4, (entry >> 32) as u32);
     physical::write32(entry_address, entry as u32);
     cpu::reload_cr3();

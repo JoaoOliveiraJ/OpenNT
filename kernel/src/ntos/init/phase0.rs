@@ -2,7 +2,8 @@
 //!
 //! Em ordem: política da hive, licenças, firmware e identidade
 //! do boot, relógio e interrupções, memória (PFN, mapeamento recursivo,
-//! descritores nativos, imagens carregadas, células de dado), KPCR, SMP,
+//! metade de sistema congelada, descritores nativos, imagens carregadas,
+//! células de dado), KPCR, SMP,
 //! pool, escalonador com o EPROCESS do System, os tipos de objeto e as suas
 //! células, WNF, o sistema de arquivos em memória com as apps embutidas, o
 //! namespace NT (com a partição e os eventos `\KernelObjects`), a hive de
@@ -16,7 +17,7 @@ use crate::drivers::fs::memory_file_system;
 use crate::ntos::ke::clock;
 use crate::ntos::cm::state_separation;
 use crate::ntos::ke::{critical_region, pcr, smp};
-use crate::ntos::mm::{dump_mdl, kernel_data, kernel_pool, loaded_images, memory_map, native_pfn_database, pfn, pool_lock, recursive_mapping, shared_user_data};
+use crate::ntos::mm::{dump_mdl, kernel_data, kernel_pool, loaded_images, memory_map, native_pfn_database, pfn, pool_lock, process_address_space, recursive_mapping, shared_user_data};
 use crate::ntos::ob::object_manager;
 use crate::ntos::ps::scheduler;
 use crate::rtl::text::latin1_to_string;
@@ -34,6 +35,8 @@ pub fn init() {
     // (antes dos APs) e descritores nativos ligados ao PFN e às PTEs
     pfn::init().unwrap_or_else(|error| panic!("PFN: {error}"));
     recursive_mapping::initialize().unwrap_or_else(|error| panic!("mapeamento recursivo: {error}"));
+    // PML4[256..512) presentes e permanentes: toda raiz futura copia a metade de sistema
+    process_address_space::prepare_system_space().unwrap_or_else(|error| panic!("metade de sistema: {error}"));
     native_pfn_database::initialize().unwrap_or_else(|error| panic!("PFN nativo: {error}"));
     // registra o ntoskrnl na sua ImageBase e publica os limites de usuário
     loaded_images::init_kernel().unwrap_or_else(|error| panic!("imagem do kernel: {error}"));

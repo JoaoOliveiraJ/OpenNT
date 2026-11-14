@@ -25,6 +25,7 @@ pub mod paging_volume;
 pub mod pfn;
 pub mod physical_layout;
 pub mod pool_lock;
+pub mod process_address_space;
 pub mod recursive_mapping;
 pub mod section;
 pub mod shared_user_data;
