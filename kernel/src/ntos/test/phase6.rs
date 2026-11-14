@@ -1557,6 +1557,13 @@ fn ntoskrnl_driver_lifecycle(assert: Assert) {
     let failed = lifecycle::load_driver("/opennt-lc-b.sys", &options);
     assert(failed.as_ref().is_err_and(|error| error.win32_error == 31 && error.ntstatus == Some(0xC000_0001)) && object_manager::lookup("\\Driver\\opennt-lc-b").is_none() && loaded_images::find(base + 0x1000).is_none(), "lifecycle: DriverEntry com erro desfaz o driver e a imagem");
     assert(lifecycle::load_driver("/opennt-nao-existe.sys", &options).is_err_and(|error| error.win32_error == 2) && lifecycle::call_add_device("opennt-nao-existe", 0) == 0xFFFF_FFFF_C000_0034 && !lifecycle::unload_driver("opennt-nao-existe"), "lifecycle: driver inexistente");
+    // O NTSTATUS de uma carga recusada (a recusa da CI) segue até o SCM, com o
+    // Win32 da tabela do RtlNtStatusToDosError quando ela o conhece.
+    let refused = lifecycle::LoadError::from(crate::rtl::KernelError::with_status("CI rejected", 0xC000_0428));
+    let unmapped = lifecycle::LoadError::from(crate::rtl::KernelError::with_status("sem mapa", 0xC0DE_0001));
+    // Sem status informado, o KernelError leva STATUS_UNSUCCESSFUL (31).
+    let plain = lifecycle::LoadError::from(crate::rtl::KernelError::new("sem status"));
+    assert(refused.win32_error == 577 && refused.ntstatus == Some(0xC000_0428) && unmapped.win32_error == 0 && unmapped.ntstatus == Some(0xC0DE_0001) && plain.win32_error == 31 && plain.ntstatus == Some(0xC000_0001), "lifecycle: status da carga recusada chega ao SCM");
     guest::free_bytes(counter);
 }
 
@@ -1757,7 +1764,19 @@ fn zw_kernel_files(assert: Assert) {
     assert(zw_files::file_backing(file).is_some_and(|(_, path)| path == "/opennt-zw.txt") && zw_files::query_file_handle(handle, false).is_some_and(|entry| entry.is_ok_and(|(pointer, _, options)| pointer == file && options == 0x20)), "zwfile: backing do FILE_OBJECT e consulta do handle");
     let again = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 3, 2, 0x20);
     let second = guest::read64(output);
-    assert(again.is_ok_and(|status| status == 0) && iosb.information.get() == 4 && close::close(second, Some(0)).is_ok_and(|status| status == 0), "zwfile: FILE_CREATE de arquivo existente informa FILE_EXISTS");
+    let exists = again.is_ok_and(|status| status == 0) && iosb.information.get() == 4;
+    // FILE_OBJECT.SectionObjectPointer: o bloco do arquivo (o do FCB),
+    // dividido pelas aberturas do mesmo arquivo, próprio de cada arquivo e
+    // zerado (sem CONTROL_AREA nem mapa de cache publicados).
+    let pointers_of = |handle: u64| at::<nt::FileObject>(zw_files::file_object_of_handle(handle)).section_object_pointer.get();
+    let pointers = pointers_of(handle);
+    let other_attributes = object_attributes_for(block, "\\FS\\opennt-zw2.txt", 0x240);
+    let other_created = zw_files::create_kernel_file(output, 0x12019F, other_attributes, io_status, 3, 2, 0x20);
+    let other = guest::read64(output);
+    let empty = pointers != 0 && { let fcb = at::<nt::SectionObjectPointers>(pointers); fcb.data_section_object.get() == 0 && fcb.shared_cache_map.get() == 0 && fcb.image_section_object.get() == 0 };
+    assert(empty && pointers_of(second) == pointers && other_created.is_ok_and(|status| status == 0) && pointers_of(other) != 0 && pointers_of(other) != pointers && close::close(other, Some(0)).is_ok_and(|status| status == 0), "zwfile: SectionObjectPointer do arquivo, dividido pelas aberturas e proprio de cada arquivo");
+    let _ = memory_file_system::remove("/opennt-zw2.txt");
+    assert(exists && close::close(second, Some(0)).is_ok_and(|status| status == 0), "zwfile: FILE_CREATE de arquivo existente informa FILE_EXISTS");
     assert(close::close(handle, Some(0)).is_ok_and(|status| status == 0) && close::close(handle, Some(0)).is_ok_and(|status| status == 0xC000_0008) && zw_files::file_object_of_handle(handle) == 0, "zwfile: ZwClose fecha o handle de arquivo uma vez");
     let missing = object_attributes_for(block, "\\FS\\opennt-nao-existe.txt", 0x240);
     assert(zw_files::create_kernel_file(output, 0x120089, missing, io_status, 1, 1, 0).is_ok_and(|status| status == 0xC000_0034) && iosb.status.get() as u32 == 0xC000_0034, "zwfile: FILE_OPEN de arquivo inexistente");
@@ -1769,7 +1788,8 @@ fn zw_kernel_files(assert: Assert) {
     let created = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 0, 3, 0x20);
     let handle = guest::read64(output);
     let on_ntfs = ntfs::mounted().is_some_and(|volume| FileSystem::exists(volume.as_ref(), "/opennt-zw.bin"));
-    assert(created.is_ok_and(|status| status == 0) && iosb.information.get() == 2 && on_ntfs && close::close(handle, Some(0)).is_ok_and(|status| status == 0), "zwfile: ZwCreateFile pelo link \\DosDevices\\D: cria no NTFS");
+    let ntfs_pointers = at::<nt::FileObject>(zw_files::file_object_of_handle(handle)).section_object_pointer.get();
+    assert(created.is_ok_and(|status| status == 0) && iosb.information.get() == 2 && on_ntfs && ntfs_pointers != 0 && close::close(handle, Some(0)).is_ok_and(|status| status == 0), "zwfile: ZwCreateFile pelo link \\DosDevices\\D: cria no NTFS, com SectionObjectPointer");
     if let Some(volume) = ntfs::mounted() {
         let _ = FileSystem::remove(volume.as_ref(), "/opennt-zw.bin");
     }
@@ -2890,7 +2910,7 @@ fn rtl_group_exports(assert: Assert) {
     assert(call("RtlVerifyVersionInfo", &[info, 1, 1]) == 0, "rtl: RtlVerifyVersionInfo aceita a versao igual");
     version.dw_major_version.set(11);
     assert(call("RtlVerifyVersionInfo", &[info, 1, 1]) as u32 == 0xC000_0428 && call("VerSetConditionMask", &[0, 2, 3]) == 192, "rtl: RtlVerifyVersionInfo recusa e VerSetConditionMask desloca 3 bits por tipo");
-    assert(call("RtlNtStatusToDosError", &[0xC000_0034]) == 2 && call("RtlNtStatusToDosErrorNoTeb", &[0xC0DE_0001]) == 317 && call("RtlUpcaseUnicodeChar", &[0xE9]) == 0xC9 && call("RtlUpcaseUnicodeChar", &[0xF7]) == 0xF7, "rtl: NTSTATUS para Win32 e RtlUpcaseUnicodeChar");
+    assert(call("RtlNtStatusToDosError", &[0xC000_0034]) == 2 && call("RtlNtStatusToDosError", &[0xC000_0428]) == 577 && call("RtlNtStatusToDosError", &[0xC000_0020]) == 193 && call("RtlNtStatusToDosErrorNoTeb", &[0xC0DE_0001]) == 317 && call("RtlUpcaseUnicodeChar", &[0xE9]) == 0xC9 && call("RtlUpcaseUnicodeChar", &[0xF7]) == 0xF7, "rtl: NTSTATUS para Win32 e RtlUpcaseUnicodeChar");
     // Bitmap de 64 bits.
     let (header, bits) = (block + 0x540, block + 0x560);
     call("RtlInitializeBitMap", &[header, bits, 64]);

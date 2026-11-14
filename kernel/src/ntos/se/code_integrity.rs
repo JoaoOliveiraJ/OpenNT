@@ -19,7 +19,7 @@ use crate::ntos::ps::user::sections::{self, Section, SectionFile, View};
 use crate::ntos::se::code_integrity_information;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{Field, IoStatusBlock, NtStruct, ObjectAttributes, Reserved, UnicodeString};
+use crate::ntos::inc::types::{Field, FileObject, IoStatusBlock, NtStruct, ObjectAttributes, Reserved, UnicodeString};
 use core::mem::offset_of;
 
 /// Tabela SeCiCallbacks que o CiInitialize preenche (0xE8 bytes no 19041).
@@ -308,6 +308,13 @@ fn validate_kernel_image(source: &Arc<dyn ImageSource>, options: &LoadOptions) -
         outputs.validation_mode.set(2);
         outputs.signing_level.set(1);
         let image_file_object = section.state.lock().image_file_object;
+        // A ci.dll lê FileObject->SectionObjectPointer->ImageSectionObject
+        // (ao registrar uma recusa) sem conferir: como o MmCreateSection, um
+        // arquivo sem SECTION_OBJECT_POINTERS não serve de imagem.
+        // SAFETY: o FILE_OBJECT da SECTION, retido por ela até o release.
+        if image_file_object == 0 || unsafe { FileObject::at(image_file_object) }.section_object_pointer.get() == 0 {
+            return Err(failure("CI image file without SectionObjectPointer", 0xC000_0020));
+        }
         let arguments = [
             image_file_object,
             view.base,

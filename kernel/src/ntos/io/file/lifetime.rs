@@ -3,6 +3,15 @@
 //! Descrições de arquivo do kernel, handles de usuário e SECTIONs dividem o
 //! SHARE_ACCESS e a remoção pendente. CLEANUP encerra o compartilhamento; uma
 //! referência de SECTION pode conservar os bytes depois da retirada do nome.
+//!
+//! O estado de um arquivo faz o papel do FCB dos file systems do NT: ele
+//! guarda o SECTION_OBJECT_POINTERS do arquivo, e todo FILE_OBJECT ligado a
+//! ele publica esse bloco em FILE_OBJECT.SectionObjectPointer, como o
+//! IRP_MJ_CREATE de um file system faz. Aberturas do mesmo arquivo dividem o
+//! bloco; ele vive enquanto houver descrição ou SECTION no arquivo. As
+//! seções do OpenNT não publicam CONTROL_AREA nele (os três ponteiros ficam
+//! NULL), mas quem lê FileObject->SectionObjectPointer->ImageSectionObject
+//! — a ci.dll ao registrar uma validação recusada — encontra memória válida.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -11,9 +20,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::drivers::fs::ntfs::Ntfs;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::objects::file::{self as file_objects, FileCallbacks};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::inc::types::{FileObject, NtStruct};
+use crate::ntos::inc::types::{FileObject, NtStruct, SectionObjectPointers};
 
 /// Metadados que o tempo de vida consulta no volume.
 #[derive(Clone, Copy, Debug, Default)]
@@ -123,6 +133,8 @@ struct State {
     pending: bool,
     removed: bool,
     orphan_bytes: Option<Vec<u8>>,
+    /// O SECTION_OBJECT_POINTERS do arquivo (0 até a primeira descrição).
+    section_object_pointers: u64,
 }
 
 struct Section {
@@ -172,23 +184,28 @@ fn state_for(file_system: &Arc<dyn LifetimeFileSystem>, path: &str) -> u64 {
         registry.next += 1;
         let id = registry.next;
         registry.keys.insert(key.clone(), id);
-        registry.states.insert(id, State { file_system: file_system.clone(), key, path: String::from(path), descriptions: Vec::new(), sections: Vec::new(), pending: false, removed: false, orphan_bytes: None });
+        registry.states.insert(id, State { file_system: file_system.clone(), key, path: String::from(path), descriptions: Vec::new(), sections: Vec::new(), pending: false, removed: false, orphan_bytes: None, section_object_pointers: 0 });
         id
     })
 }
 
-/// Consultas sem descrições vivas não acumulam entradas.
+/// Consultas sem descrições vivas não acumulam entradas; o
+/// SECTION_OBJECT_POINTERS vai com o estado.
 fn collect(state: u64) {
-    with(|registry| {
-        let Some(found) = registry.states.get(&state) else { return };
-        if found.descriptions.is_empty() && found.sections.is_empty() && !found.pending {
-            let key = found.key.clone();
-            if registry.keys.get(&key) == Some(&state) {
-                registry.keys.remove(&key);
-            }
-            registry.states.remove(&state);
+    let pointers = with(|registry| {
+        let found = registry.states.get(&state)?;
+        if !found.descriptions.is_empty() || !found.sections.is_empty() || found.pending {
+            return None;
         }
+        let key = found.key.clone();
+        if registry.keys.get(&key) == Some(&state) {
+            registry.keys.remove(&key);
+        }
+        registry.states.remove(&state).map(|removed| removed.section_object_pointers)
     });
+    if let Some(pointers) = pointers.filter(|&pointers| pointers != 0) {
+        guest::free_bytes(pointers);
+    }
 }
 
 fn needed_sharing(access: u32) -> u32 {
@@ -296,7 +313,8 @@ fn remove_when_closed(state: u64) -> Result<(), KernelError> {
 }
 
 /// Encadeia as rotinas existentes do FILE_OBJECT, sem substituir nenhuma
-/// retenção do Object Manager, do volume ou do processo.
+/// retenção do Object Manager, do volume ou do processo, e publica no
+/// FILE_OBJECT o SECTION_OBJECT_POINTERS do arquivo.
 pub fn bind(entry: Entry, file_system: &Arc<dyn LifetimeFileSystem>, path: &str) -> Result<(), KernelError> {
     let pointer = entry.file_object;
     let existing = file_objects::callbacks(pointer);
@@ -304,15 +322,30 @@ pub fn bind(entry: Entry, file_system: &Arc<dyn LifetimeFileSystem>, path: &str)
         return Err(KernelError::new("invalid file lifetime binding"));
     }
     let existing = existing.unwrap_or_default();
+    // O bloco do arquivo, se esta for a primeira descrição dele (zerado: sem
+    // seção de dados, mapa de cache nem seção de imagem).
+    let candidate = guest::alloc_bytes(SectionObjectPointers::SIZE);
+    if candidate == 0 {
+        return Err(KernelError::with_status("SECTION_OBJECT_POINTERS allocation failed", 0xC000_009A));
+    }
     let state = state_for(file_system, path);
-    let description = with(|registry| {
+    let (description, section_object_pointers) = with(|registry| {
         registry.next += 1;
         let id = registry.next;
         registry.descriptions.insert(id, Description { state, entry, cleaned: false });
         registry.bound.insert(pointer, id);
-        registry.states.get_mut(&state).expect("estado registrado").descriptions.push(id);
-        id
+        let found = registry.states.get_mut(&state).expect("estado registrado");
+        found.descriptions.push(id);
+        if found.section_object_pointers == 0 {
+            found.section_object_pointers = candidate;
+        }
+        (id, found.section_object_pointers)
     });
+    if section_object_pointers != candidate {
+        guest::free_bytes(candidate);
+    }
+    // SAFETY: FILE_OBJECT vivo do chamador, agora descrito pelo estado.
+    unsafe { FileObject::at(pointer) }.section_object_pointer.set(section_object_pointers);
     let cleanup = existing.cleanup.clone();
     let destroy = existing.destroy.clone();
     file_objects::set_callbacks(pointer, FileCallbacks {

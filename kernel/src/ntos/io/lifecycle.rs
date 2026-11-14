@@ -57,8 +57,17 @@ pub struct LoadError {
 }
 
 impl From<KernelError> for LoadError {
+    /// O NTSTATUS da falha segue para quem pediu a carga (o IopLoadDriver
+    /// devolve o status da imagem: uma recusa da CI chega como
+    /// STATUS_INVALID_IMAGE_HASH, 577 no Win32), com o código Win32 da tabela
+    /// do RtlNtStatusToDosError quando ela o conhece.
     fn from(error: KernelError) -> Self {
-        Self { error, win32_error: 0, ntstatus: None }
+        let status = error.status;
+        let win32_error = match crate::ntos::rtl::error::status_to_dos_error(status) {
+            317 => 0,
+            code => code,
+        };
+        Self { error, win32_error, ntstatus: (status != 0).then_some(status) }
     }
 }
 
