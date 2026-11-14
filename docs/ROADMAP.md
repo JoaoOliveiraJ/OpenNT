@@ -42,7 +42,7 @@ Banco de páginas físicas, mapeamento recursivo, pool do kernel, variáveis exp
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Gerência de memória | Funciona | Autoteste do kernel |
-| Multiprocessador (SMP) | Funciona | Autoteste do kernel |
+| Multiprocessador (SMP) | Funciona | Autoteste do kernel, Autoteste do modo usuário |
 
 ## Fase 3 — objetos e executive (concluída)
 
@@ -50,7 +50,7 @@ Object Manager (tipos, handles, namespace, callbacks), biblioteca de runtime, Ex
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Processos e threads | Funciona | Autoteste do kernel, Autoteste de objetos e executive |
+| Processos e threads | Funciona | Autoteste do kernel, Autoteste de objetos e executive, Autoteste do modo usuário |
 | Sincronização e despacho | Funciona | Autoteste de objetos e executive, Autoteste do kernel |
 | Gerenciador de objetos e namespace | Parcial | Autoteste de objetos e executive |
 | Segurança e tokens | Parcial | Autoteste de objetos e executive |
