@@ -309,6 +309,11 @@ fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alerta
     Ok(status)
 }
 
+/// NtSerializeBoot(): `io/pnp::serialize_boot`, de modo usuário.
+fn nt_serialize_boot(_: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::io::pnp::serialize_boot(1))
+}
+
 /// NtQuerySystemInformation(class, buffer, length, returnLength*).
 fn nt_query_system_information(class: u64, buffer: u64, length: u64, returned: u64, _rsp: u64) -> Result<u32, KernelError> {
     query_system_information(class as u32, buffer, length as u32 as u64, returned)
@@ -319,6 +324,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         90 => return boot_environment_information::query(buffer, length, returned, true),
         103 => return code_integrity_information::query(buffer, length, returned, true),
         143 => return secure_boot_information::query(buffer, length, returned, true),
+        157 => return crate::ntos::ex::manufacturing_information::query(buffer, length, returned, true),
         1 | 63 => return Ok(processor_information::query(buffer, length as u32, returned, true, class == 63)),
         5 => return system_process_information::query(buffer, length, returned, true),
         _ => {}
@@ -414,6 +420,10 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     let returned = stack_arg(rsp, 6);
     let class = class as u32;
     crate::debug_print!("[usermode] NtQuerySystemInformationEx classe {}", class);
+    // SystemSupportedProcessorArchitectures: a entrada é o HANDLE do processo.
+    if class == 181 {
+        return crate::ntos::ex::supported_architectures::query(input, input_length, buffer, length, returned, queried_process);
+    }
     if class != 107 {
         return query_system_information(class, buffer, length, returned);
     }
@@ -534,7 +544,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     let returned = stack_arg(rsp, 5);
     let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
     // As classes locais sondam o ReturnLength antes de qualquer escrita.
-    let local = matches!(class, 0 | 27 | 31 | 36);
+    let local = matches!(class, 0 | 24 | 27 | 31 | 36);
     if local && returned != 0 && !probe_user_write(returned, 4) {
         if class == 0 {
             if let Err(status) = queried_process(handle) {
@@ -608,6 +618,23 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             state::try_write_user_wide(buffer + UnicodeString::SIZE, &path)?;
             state::try_write_unicode_string(buffer, buffer + UnicodeString::SIZE, &path)?;
             set_returned(need as u32)?;
+            Ok(STATUS_SUCCESS)
+        }
+        // ProcessSessionInformation (PROCESS_SESSION_INFORMATION, um ULONG):
+        // a sessão do processo do handle (PsGetProcessSessionId).
+        24 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !probe_user_write(buffer, 4) {
+                return Ok(0xC000_0005);
+            }
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            guest::try_write::<u32>(buffer, crate::ntos::ps::session::query(target))?;
+            set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
         // ProcessDebugFlags (ULONG): 1 = sem depurador.
@@ -696,6 +723,16 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     if let Some(setter) = setter {
         return setter(handle, buffer, length);
     }
+    // ProcessBreakOnTermination.
+    if class as u32 == 29 {
+        return crate::ntos::ps::set_process_information::break_on_termination(buffer, length as u32, |access| {
+            if handle as u32 == u32::MAX {
+                Ok(crate::ntos::ps::process::get_current_process())
+            } else {
+                super::handles::process_pointer(handle, access)
+            }
+        });
+    }
     crate::debug_print!("[usermode] NtSetInformationProcess classe {}", class as u32);
     Ok(STATUS_INVALID_INFO_CLASS)
 }
@@ -717,6 +754,43 @@ fn nt_query_symbolic_link_object(handle: u64, out: u64, returned: u64, _a4: u64,
 
 fn nt_open_directory_object(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     Ok(namespace_handles::open(out, access as u32, attributes, "Directory", true, false))
+}
+
+/// NtCreateDirectoryObject(DirectoryHandle*, DesiredAccess, ObjectAttributes).
+fn nt_create_directory_object(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(namespace_handles::open(out, access as u32, attributes, "Directory", true, true))
+}
+
+/// NtCreateDirectoryObjectEx(DirectoryHandle*, DesiredAccess,
+/// ObjectAttributes, ShadowDirectoryHandle, Flags): sem diretório sombra
+/// nem flags, é o NtCreateDirectoryObject.
+fn nt_create_directory_object_ex(out: u64, access: u64, attributes: u64, shadow: u64, rsp: u64) -> Result<u32, KernelError> {
+    let flags = state::stack_arg32(rsp, 5);
+    if shadow != 0 || flags != 0 {
+        crate::debug_print!("[usermode] NtCreateDirectoryObjectEx com sombra {:#x} e flags {:#x} sem suporte", shadow, flags);
+        return Ok(0xC000_00BB);
+    }
+    Ok(namespace_handles::open(out, access as u32, attributes, "Directory", true, true))
+}
+
+/// NtCreateSymbolicLinkObject(LinkHandle*, DesiredAccess, ObjectAttributes,
+/// LinkTarget): o destino capturado da UNICODE_STRING do chamador.
+fn nt_create_symbolic_link_object(out: u64, access: u64, attributes: u64, target: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if !probe_user_read(target, UnicodeString::SIZE) {
+        return Ok(0xC000_0005);
+    }
+    let text = state::user_struct::<UnicodeString>(target).and_then(|target| Ok((target.length.probe_get()? as u64, target.maximum_length.probe_get()? as u64, target.buffer.probe_get()?)));
+    let Ok((length, maximum, buffer)) = text else { return Ok(0xC000_0005) };
+    if length % 2 != 0 || length > maximum || (length != 0 && !probe_user_read(buffer, length)) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let Ok(target_text) = state::try_read_user_wide_string(buffer, length / 2) else { return Ok(0xC000_0005) };
+    Ok(namespace_handles::create_link(out, access as u32, attributes, &target_text, true))
+}
+
+/// NtSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor).
+fn nt_set_security_object(handle: u64, information: u64, descriptor: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ob::object_security::set_security_object_from_user(handle, information as u32, descriptor)
 }
 
 /// NtQuerySecurityObject(handle, flags, out, length, returned*).
@@ -762,7 +836,7 @@ fn nt_create_partition(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Res
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 23] = [
+    let handlers: [(&'static str, state::SyscallHandler); 28] = [
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),
         ("NtDisplayString", nt_display_string),
@@ -774,6 +848,7 @@ pub fn init() {
         ("NtWaitForMultipleObjects", nt_wait_for_multiple_objects),
         ("NtQuerySystemInformation", nt_query_system_information),
         ("NtQuerySystemInformationEx", nt_query_system_information_ex),
+        ("NtSerializeBoot", nt_serialize_boot),
         ("NtTraceEvent", nt_trace_event),
         ("NtRaiseHardError", nt_raise_hard_error),
         ("NtFlushInstructionCache", nt_flush_instruction_cache),
@@ -783,7 +858,11 @@ pub fn init() {
         ("NtOpenSymbolicLinkObject", nt_open_symbolic_link_object),
         ("NtQuerySymbolicLinkObject", nt_query_symbolic_link_object),
         ("NtOpenDirectoryObject", nt_open_directory_object),
+        ("NtCreateDirectoryObject", nt_create_directory_object),
+        ("NtCreateDirectoryObjectEx", nt_create_directory_object_ex),
+        ("NtCreateSymbolicLinkObject", nt_create_symbolic_link_object),
         ("NtQuerySecurityObject", nt_query_security_object),
+        ("NtSetSecurityObject", nt_set_security_object),
         ("NtOpenPartition", nt_open_partition),
         ("NtCreatePartition", nt_create_partition),
     ];

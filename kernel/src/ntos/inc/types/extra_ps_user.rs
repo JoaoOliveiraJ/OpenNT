@@ -7,6 +7,24 @@
 
 use super::*;
 
+/// `_SYSTEM_MANUFACTURING_INFORMATION` (NtQuerySystemInformation
+/// (SystemManufacturingInformation, classe 157); 0x18 bytes): Options e o
+/// nome do perfil, cujo texto vem logo depois da estrutura.
+#[repr(C)]
+pub struct SystemManufacturingInformation {
+    pub options: Field<u32>,
+    pub _padding: Field<u32>,
+    pub profile_name: UnicodeString,
+}
+
+unsafe impl NtStruct for SystemManufacturingInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemManufacturingInformation>() == 0x18);
+    assert!(core::mem::offset_of!(SystemManufacturingInformation, options) == 0x0);
+    assert!(core::mem::offset_of!(SystemManufacturingInformation, profile_name) == 0x8);
+};
+
 /// `_SYSTEM_MEMORY_LIST_INFORMATION` (NtQuerySystemInformation
 /// (SystemMemoryListInformation, classe 80); 0xB0 bytes).
 #[repr(C)]

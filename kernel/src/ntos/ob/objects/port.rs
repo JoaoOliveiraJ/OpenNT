@@ -398,6 +398,13 @@ pub fn publish(port: &Arc<Port>, output: u64, attributes: u32) -> Result<u32, Ke
     dispatcher_objects::publish(port.pointer, output, 0x1F_0001, attributes, 0, false, Some(port.clone()))
 }
 
+/// O handle de quem acabou de criar a porta (NtAlpcCreatePort e
+/// NtAlpcAcceptConnectPort): como no ObInsertObject, o criador recebe os
+/// direitos do tipo sem a checagem pela DACL do descritor que ele deu.
+pub fn publish_created(port: &Arc<Port>, output: u64, attributes: u32) -> Result<u32, KernelError> {
+    dispatcher_objects::publish(port.pointer, output, 0x1F_0001, attributes, 0, true, Some(port.clone()))
+}
+
 /// Exige um handle de usuário do tipo pedido e devolve a conexão.
 pub fn resolve(handle: u64, kind: &str) -> Option<(Arc<state::UserHandle>, Arc<Port>)> {
     let entry = state::get_user_handle(handle)?;

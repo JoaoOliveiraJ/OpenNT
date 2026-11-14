@@ -225,7 +225,12 @@ fn request(port: &Arc<Port>, data: &mut [u8]) -> u32 {
     0
 }
 
-/// A sessão é criada depois do anel 3 armado (inicialização tardia).
+/// A sessão é criada depois do anel 3 armado (inicialização tardia). No boot
+/// do processo inicial real (`--initial-process=smss`) ela não existe: as
+/// portas, a seção e os nomes do CSR pertencem ao csrss.exe real.
 pub fn init() {
+    if crate::ntos::init::boot_config::SMSS_BOOT {
+        return;
+    }
     index::set_late_initializer(late::CSR, initialize);
 }

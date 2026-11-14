@@ -1586,3 +1586,25 @@ pub mod ps_partition_commit {
         data_exports: &[("PsPartitionType", partition_type)],
     };
 }
+
+pub mod ps_paged_pool_quota {
+    //! PsChargeProcessPagedPoolQuota / PsReturnProcessPagedPoolQuota: a lógica
+    //! mora em `ps/pool_quota`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::pool_quota;
+    use crate::rtl::KernelError;
+
+    /// PsChargeProcessPagedPoolQuota(Process, Amount) -> NTSTATUS.
+    fn charge(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(pool_quota::charge_process_paged_pool_quota(call.arg(1), call.arg(2))?))
+    }
+
+    /// PsReturnProcessPagedPoolQuota(Process, Amount).
+    fn give_back(call: &Call) -> Result<u64, KernelError> {
+        pool_quota::return_process_paged_pool_quota(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-paged-pool-quota", names: &["PsChargeProcessPagedPoolQuota", "PsReturnProcessPagedPoolQuota"], handlers: &[charge, give_back], data_exports: &[] };
+}

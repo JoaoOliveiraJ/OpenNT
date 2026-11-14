@@ -2936,6 +2936,75 @@ const _: () = {
     assert!(core::mem::offset_of!(PortView, view_remote_base) == 0x28);
 };
 
+/// `_IO_SECURITY_CONTEXT` (wdm.h; 0x18 bytes): o
+/// Parameters.Create.SecurityContext do IRP_MJ_CREATE.
+#[repr(C)]
+pub struct IoSecurityContext {
+    /// -> `_SECURITY_QUALITY_OF_SERVICE`
+    pub security_qos: Field<u64>,
+    /// -> `_ACCESS_STATE`
+    pub access_state: Field<u64>,
+    pub desired_access: Field<u32>,
+    pub full_create_options: Field<u32>,
+}
+
+unsafe impl NtStruct for IoSecurityContext {}
+
+const _: () = {
+    assert!(core::mem::size_of::<IoSecurityContext>() == 0x18);
+    assert!(core::mem::offset_of!(IoSecurityContext, access_state) == 0x8);
+    assert!(core::mem::offset_of!(IoSecurityContext, desired_access) == 0x10);
+    assert!(core::mem::offset_of!(IoSecurityContext, full_create_options) == 0x14);
+};
+
+/// `_UNICODE_PREFIX_TABLE` (ntifs.h; 0x18 bytes): a tabela de prefixos do
+/// RtlInitializeUnicodePrefix, na memória de quem chama.
+#[repr(C)]
+pub struct UnicodePrefixTable {
+    pub node_type_code: Field<i16>,
+    pub name_length: Field<i16>,
+    _pad_4: Reserved<0x4>,
+    /// -> `_UNICODE_PREFIX_TABLE_ENTRY`
+    pub next_prefix_tree: Field<u64>,
+    /// -> `_UNICODE_PREFIX_TABLE_ENTRY`
+    pub last_next_entry: Field<u64>,
+}
+
+unsafe impl NtStruct for UnicodePrefixTable {}
+
+const _: () = {
+    assert!(core::mem::size_of::<UnicodePrefixTable>() == 0x18);
+    assert!(core::mem::offset_of!(UnicodePrefixTable, name_length) == 0x2);
+    assert!(core::mem::offset_of!(UnicodePrefixTable, next_prefix_tree) == 0x8);
+    assert!(core::mem::offset_of!(UnicodePrefixTable, last_next_entry) == 0x10);
+};
+
+/// `_UNICODE_PREFIX_TABLE_ENTRY` (ntifs.h; 0x38 bytes): a entrada que quem
+/// chama embute na própria estrutura e passa ao RtlInsertUnicodePrefix.
+#[repr(C)]
+pub struct UnicodePrefixTableEntry {
+    pub node_type_code: Field<i16>,
+    pub name_length: Field<i16>,
+    _pad_4: Reserved<0x4>,
+    /// -> `_UNICODE_PREFIX_TABLE_ENTRY`
+    pub next_prefix_tree: Field<u64>,
+    /// -> `_UNICODE_PREFIX_TABLE_ENTRY`
+    pub case_match: Field<u64>,
+    pub links: RtlSplayLinks,
+    /// -> `_UNICODE_STRING`
+    pub prefix: Field<u64>,
+}
+
+unsafe impl NtStruct for UnicodePrefixTableEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<UnicodePrefixTableEntry>() == 0x38);
+    assert!(core::mem::offset_of!(UnicodePrefixTableEntry, next_prefix_tree) == 0x8);
+    assert!(core::mem::offset_of!(UnicodePrefixTableEntry, case_match) == 0x10);
+    assert!(core::mem::offset_of!(UnicodePrefixTableEntry, links) == 0x18);
+    assert!(core::mem::offset_of!(UnicodePrefixTableEntry, prefix) == 0x30);
+};
+
 /// `_ALPC_CONTEXT_ATTR` (NtAlpc* (atributo de contexto); 0x20 bytes).
 #[repr(C)]
 pub struct AlpcContextAttr {

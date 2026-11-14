@@ -99,6 +99,9 @@ pub struct Selected {
 
 /// Handle nativo (Object Manager) ou de arquivo do kernel.
 pub fn resolve(handle: u64, user: bool) -> Result<Selected, u32> {
+    // Os dois bits baixos são marcas do chamador (OBJ_HANDLE_TAGBITS),
+    // ignoradas como no ExMapHandleToPointer.
+    let handle = handle & !3;
     if let Some(resolved) = open_pointer::resolve(handle, user) {
         let resolved = resolved?;
         if resolved.item.object_type.name != "File" {
@@ -108,6 +111,14 @@ pub fn resolve(handle: u64, user: bool) -> Result<Selected, u32> {
     }
     if handle > 0x7FFF_FFFF && handle & 0xFFFF_FFFF_8000_0000 != 0xFFFF_FFFF_8000_0000 {
         return Err(HANDLE);
+    }
+    // Um handle da tabela de usuário do processo corrente (o NtOpenFile de
+    // modo usuário): o FILE_OBJECT publicado pelo handle, com o acesso dele.
+    if user {
+        if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(handle) {
+            let Some(body) = entry.object.native_body().filter(|body| body.type_name == crate::ntos::ob::object_types::file_type().name) else { return Err(0xC000_0024) };
+            return Ok(Selected { pointer: body.pointer, access: entry.access(), options: None });
+        }
     }
     match zw_files::query_file_handle(handle, user) {
         Some(Ok((pointer, access, options))) => Ok(Selected { pointer, access, options: Some(options) }),

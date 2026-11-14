@@ -18,6 +18,8 @@ pub mod service_table;
 pub mod license;
 pub mod wnf;
 pub mod boot_environment_information;
+pub mod manufacturing_information;
+pub mod supported_architectures;
 pub mod boot_environment;
 pub mod service_abi;
 pub mod win32;

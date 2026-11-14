@@ -8,6 +8,12 @@
 //! e a lista de revogação), os arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
+//!
+//! Com `--initial-process=smss`, o volume leva também os programas de modo
+//! usuário que o smss.exe real e o csrss.exe real carregam, na raiz (o
+//! `C:\Windows\System32` que o modo usuário vê): os dois executáveis, as
+//! DLLs de servidor do csrss e o fecho dos imports delas (estáticos e pelos
+//! API sets do apisetschema.dll desta máquina).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +80,35 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ("Windows/System32/drivers/fltmgr.sys", "System32/drivers/fltmgr.sys"),
 ];
 
+/// Os programas de modo usuário do caminho do smss (`--initial-process=smss`):
+/// smss.exe, csrss.exe, as DLLs de servidor (csrsrv, basesrv, winsrv com o
+/// winsrvext, sxssrv) e o fecho dos imports delas, incluindo a ntdll; e os
+/// file systems de pipes e mailslots (npfs.sys e msfs.sys, serviços de
+/// System32\Drivers que o boot carrega antes do smss).
+const SMSS_PROGRAMS: &[&str] = &[
+    "drivers/npfs.sys",
+    "drivers/msfs.sys",
+    "smss.exe",
+    "csrss.exe",
+    "csrsrv.dll",
+    "basesrv.dll",
+    "winsrv.dll",
+    "winsrvext.dll",
+    "sxssrv.dll",
+    "ntdll.dll",
+    "kernel32.dll",
+    "kernelbase.dll",
+    "user32.dll",
+    "win32u.dll",
+    "gdi32.dll",
+    "gdi32full.dll",
+    "msvcp_win.dll",
+    "ucrtbase.dll",
+    "combase.dll",
+    "rpcrt4.dll",
+    "cfgmgr32.dll",
+];
+
 fn windows_directory() -> PathBuf {
     std::env::var("SystemRoot").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Windows"))
 }
@@ -110,8 +145,9 @@ fn vgk_source(root: &Path) -> Option<PathBuf> {
 }
 
 /// Arquivos do volume NTFS que existem nesta máquina, mais o PE do kernel
-/// gerado (`NTOSKRNL.EXE` e o caminho canônico em System32).
-pub fn ntfs_files(root: &Path, kernel_pe: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// gerado (`NTOSKRNL.EXE` e o caminho canônico em System32) e, com
+/// `initial_process == "smss"`, os programas de [`SMSS_PROGRAMS`].
+pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
     let windows = windows_directory();
     let mut files = Vec::new();
     let mut present = 0;
@@ -157,6 +193,21 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8]) -> Result<Vec<(String, Vec<u8>)
         }
     }
     println!("tabelas NLS no volume NTFS: {nls}");
+    if initial_process == "smss" {
+        let mut staged = 0;
+        for name in SMSS_PROGRAMS {
+            let source = system32.join(name);
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    // Na raiz, como o resto de System32 (e de System32\Drivers).
+                    files.push((name.rsplit('/').next().unwrap_or(name).to_uppercase(), bytes));
+                    staged += 1;
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+        }
+        println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", SMSS_PROGRAMS.len());
+    }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
     Ok(files)

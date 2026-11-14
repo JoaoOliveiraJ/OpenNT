@@ -195,11 +195,10 @@ pub fn set_info(information_pointer: u64, modification: u64, object_sd_pointer: 
         | (((sacl_source.map_or(0, |captured| captured.control) & SACL_AUTO_INHERITED != 0) as u32) << 1);
     match inherit_descriptor::assign(None, &merged, &mapping, flags, false) {
         Ok(Ok(result)) => {
-            let old = object_sd.get();
+            // O descritor anterior continua de quem chama (que o libera ou o
+            // devolve ao cache do Ob, como o npfs faz com
+            // ObDereferenceSecurityDescriptor): só o ponteiro é trocado.
             publish(&result, object_sd_pointer);
-            if old != 0 {
-                guest::free_bytes(old);
-            }
             0
         }
         Ok(Err(status)) => status,

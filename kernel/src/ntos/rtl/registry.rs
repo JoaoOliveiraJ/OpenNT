@@ -47,6 +47,8 @@ fn guest_registry_path(relative_to: u32, path: u64) -> String {
 /// RTL_REGISTRY_HANDLE (wdm.h): o Path é o HANDLE de uma chave aberta, não
 /// um texto.
 const REGISTRY_HANDLE: u32 = 0x4000_0000;
+/// RTL_REGISTRY_OPTIONAL (wdm.h): a chave pode não existir.
+const REGISTRY_OPTIONAL: u32 = 0x8000_0000;
 
 /// Flags da RTL_QUERY_REGISTRY_TABLE (wdm.h).
 const QUERY_REGISTRY_REQUIRED: u32 = 0x04;
@@ -64,12 +66,18 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         debug_print!("[rtl] QueryRegistry handle=0x{:x} table=0x{:x}", path, table);
         (0, path)
     } else {
-        let key_path = guest_strings::read_wide_string(path);
+        // O Path é relativo à raiz do RelativeTo (RTL_REGISTRY_SERVICES,
+        // _CONTROL...), como no RtlpQueryRegistryValues.
+        let key_path = guest_registry_path(relative_to, path);
         debug_print!("[rtl] QueryRegistry path=\"{}\" table=0x{:x}", key_path, table);
         key_services::open_path(&key_path, false)?
     };
     if open_status != 0 && open_status != 0xC000_0034 {
         return Ok(open_status as u64);
+    }
+    // RTL_REGISTRY_OPTIONAL: a chave ausente é sucesso, sem consultar nada.
+    if open_status == 0xC000_0034 && relative_to & REGISTRY_OPTIONAL != 0 {
+        return Ok(0);
     }
     let mut cursor = table;
     let mut status = 0u64;

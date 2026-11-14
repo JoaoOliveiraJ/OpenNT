@@ -300,7 +300,25 @@ fn nt_query_security_attributes_token(handle: u64, attributes: u64, count: u64, 
     Ok(write_result(security_attributes::encode(&selected, out), out, length, returned))
 }
 
+/// NtAdjustPrivilegesToken(TokenHandle, DisableAllPrivileges, NewState,
+/// BufferLength, PreviousState, ReturnLength): o handle com
+/// TOKEN_ADJUST_PRIVILEGES (e TOKEN_QUERY quando há PreviousState); o resto
+/// em `se/token/adjust`.
+fn nt_adjust_privileges_token(handle: u64, disable_all: u64, new_state: u64, buffer_length: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 16) {
+        return Ok(0xC000_0005);
+    }
+    let (previous_state, return_length) = (stack_arg(rsp, 5), stack_arg(rsp, 6));
+    let access = 0x20 | if previous_state != 0 { 8 } else { 0 };
+    let token = match lookup(token_argument(1, handle), access) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    crate::ntos::se::token::adjust::adjust_privileges(token, disable_all as u8 != 0, new_state, buffer_length as u32, previous_state, return_length)
+}
+
 pub fn init() {
+    state::register_handler("NtAdjustPrivilegesToken", nt_adjust_privileges_token);
     state::register_handler("NtOpenProcessToken", nt_open_process_token);
     state::register_handler("NtOpenProcessTokenEx", nt_open_process_token_ex);
     state::register_handler("NtImpersonateAnonymousToken", nt_impersonate_anonymous_token);

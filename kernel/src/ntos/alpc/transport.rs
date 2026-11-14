@@ -150,6 +150,12 @@ pub fn register(path: &str, service: Arc<dyn Service>) -> Result<Arc<Listener>, 
     let parent = if split == 0 { "\\" } else { &path[..split] };
     object_manager::create_directory(parent)?;
     let node = object_manager::create_object(parent, &path[split + 1..], "AlpcPort", None)?;
+    Ok(attach(node, service))
+}
+
+/// Associa o serviço ao nó AlpcPort já criado, com a identidade de quem
+/// chama (a porta de conexão de um servidor de modo usuário).
+pub fn attach(node: NodeId, service: Arc<dyn Service>) -> Arc<Listener> {
     let listener = Arc::new(Listener {
         node,
         process: process::get_current_process(),
@@ -160,7 +166,7 @@ pub fn register(path: &str, service: Arc<dyn Service>) -> Result<Arc<Listener>, 
         service,
     });
     LISTENERS.lock().insert(node, listener.clone());
-    Ok(listener)
+    listener
 }
 
 pub fn listener_of(node: NodeId) -> Option<Arc<Listener>> {

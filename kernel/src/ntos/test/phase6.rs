@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1831 && abi_names::GROUP_LAYOUT.len() == 398 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1831 exports em 398 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1839 && abi_names::GROUP_LAYOUT.len() == 401 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1839 exports em 401 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -394,6 +394,82 @@ fn ntoskrnl_exports(assert: Assert) {
     assert(firmware.is_err() || firmware.is_ok_and(|kind| kind != 1) || native_call::call(iat(4), &[0, 0, 0, 0, 0]) == 0xC000_0002, "ntoskrnl: Zw com cinco argumentos (BIOS legado)");
     assert(image.release().is_ok(), "ntoskrnl: driver de teste liberado");
     assert(loader::load(ntoskrnl_importer(b"NaoExisteNoKernel\0"), &options).is_err_and(|error| error.message.contains("NaoExisteNoKernel")), "ntoskrnl: import sem provedor recusa a carga");
+}
+
+/// Uma UNICODE_STRING de kernel com o texto (o buffer logo depois dela).
+fn kernel_unicode(text: &str) -> u64 {
+    let units: alloc::vec::Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let string = guest::alloc_bytes(16 + units.len() as u64 + 2);
+    guest::write_bytes(string + 16, &units);
+    crate::ntos::rtl::guest_strings::write_string_fields(string, units.len() as u16, units.len() as u16 + 2, string + 16);
+    string
+}
+
+fn rtl_unicode_prefix_exports(assert: Assert) {
+    // A tabela com "\", "\pipe" e "\pipe\a": o prefixo mais longo numa
+    // fronteira de componente, sem caixa depois do índice pedido.
+    let table = guest::alloc_bytes(nt::UnicodePrefixTable::SIZE);
+    let entries: alloc::vec::Vec<u64> = (0..4).map(|_| guest::alloc_bytes(nt::UnicodePrefixTableEntry::SIZE)).collect();
+    let (root, pipe, nested, again) = (kernel_unicode("\\"), kernel_unicode("\\pipe"), kernel_unicode("\\pipe\\a"), kernel_unicode("\\PIPE"));
+    call_export("RtlInitializeUnicodePrefix", &[table]);
+    let inserted = [call_export("RtlInsertUnicodePrefix", &[table, pipe, entries[1]]), call_export("RtlInsertUnicodePrefix", &[table, root, entries[0]]), call_export("RtlInsertUnicodePrefix", &[table, nested, entries[2]])];
+    let duplicate = call_export("RtlInsertUnicodePrefix", &[table, again, entries[3]]);
+    let find = |name: &str, index: u64| call_export("RtlFindUnicodePrefix", &[table, kernel_unicode(name), index]);
+    let found = [find("\\pipe\\a\\b", 0), find("\\Pipe\\x", 0), find("\\pipex", 0), find("\\Pipe\\x", 2), find("\\pipe", 0)];
+    call_export("RtlRemoveUnicodePrefix", &[table, entries[1]]);
+    let after = find("\\pipe\\x", 0);
+    assert(
+        inserted == [Some(1), Some(1), Some(1)] && duplicate == Some(0) && found == [Some(entries[2]), Some(entries[1]), Some(entries[0]), Some(entries[0]), Some(entries[1])] && after == Some(entries[0]),
+        "rtl-unicode-prefix: insercao, duplicata recusada, prefixo mais longo por componente, caixa e remocao",
+    );
+}
+
+fn rtl_app_container_exports(assert: Assert) {
+    // S-1-15-2-1..7 (pai, 8 subautoridades) e S-1-15-2-1..11 (filho, 12).
+    let sid = |count: u8| -> u64 {
+        let pointer = guest::alloc_bytes(8 + 4 * count as u64);
+        let mut bytes = alloc::vec![1u8, count, 0, 0, 0, 0, 0, 15];
+        for index in 0..count as u32 {
+            bytes.extend_from_slice(&(if index == 0 { 2 } else { index }).to_le_bytes());
+        }
+        guest::write_bytes(pointer, &bytes);
+        pointer
+    };
+    let (parent_sid, child_sid, odd_sid) = (sid(8), sid(12), sid(9));
+    let kind = guest::alloc_bytes(8);
+    let mut types = [0u64; 3];
+    let mut statuses = [None; 3];
+    for (index, candidate) in [parent_sid, child_sid, odd_sid].into_iter().enumerate() {
+        statuses[index] = call_export("RtlGetAppContainerSidType", &[candidate, kind]);
+        types[index] = guest::read32(kind) as u64;
+    }
+    let out = guest::alloc_bytes(8);
+    let derived = call_export("RtlGetAppContainerParent", &[child_sid, out]);
+    let parent = guest::read64(out);
+    let same = parent != 0 && guest::read_bytes(parent, 40) == guest::read_bytes(parent_sid, 40);
+    let refused = call_export("RtlGetAppContainerParent", &[parent_sid, out]);
+    assert(
+        statuses == [Some(0), Some(0), Some(0xFFFF_FFFF_C000_A200)] && types == [2, 1, 3] && derived == Some(0) && same && refused == Some(0xFFFF_FFFF_C000_000D) && guest::read64(out) == 0,
+        "rtl-app-container: tipos de SID de pacote e o pai de um filho",
+    );
+    if parent != 0 {
+        let _ = crate::ntos::mm::kernel_pool::free(parent, None);
+    }
+}
+
+fn ps_paged_pool_quota_exports(assert: Assert) {
+    // O System não é cobrado; um processo de teste é cobrado e devolvido.
+    let system = crate::ntos::ps::process::get_system_process();
+    let charged_system = call_export("PsChargeProcessPagedPoolQuota", &[system, 0x1000]);
+    let measured = super::multiprocess::identity::with_test_process("cota-paginavel.exe", None, |test| {
+        let process = test.process;
+        let before = at::<nt::Eprocess>(process).process_quota_usage[1].get();
+        let charged = call_export("PsChargeProcessPagedPoolQuota", &[process, 0x3000]);
+        let usage = at::<nt::Eprocess>(process).process_quota_usage[1].get() - before;
+        call_export("PsReturnProcessPagedPoolQuota", &[process, 0x3000]);
+        (charged, usage, at::<nt::Eprocess>(process).process_quota_usage[1].get() - before)
+    });
+    assert(charged_system == Some(0) && measured == Some((Some(0), 0x3000, 0)), "ps-paged-pool-quota: cobranca e devolucao paginavel do processo");
 }
 
 /// Chama um export pelo seu trampolim (como um driver chamaria pela IAT).
@@ -1379,7 +1455,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1831 && exports::export_names().len() == 1831, "ntoskrnl: 398 grupos com os 1831 exports implementados");
+    assert(exports::implemented() == 1839 && exports::export_names().len() == 1839, "ntoskrnl: 401 grupos com os 1839 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -3315,10 +3391,17 @@ fn se_token_info_exports(assert: Assert) {
     assert(user != 0 && at::<nt::TokenUser>(user).user.sid.get() == user + 16 && at::<nt::Sid>(user + 16).revision.get() == 1, "se-token-info: TOKEN_USER aponta para o corpo do SID");
     guest::free_bytes(user);
 
-    // TOKEN_PRIVILEGES (classe 3): o token do Sistema não tem privilégios inventados.
+    // TOKEN_PRIVILEGES (classe 3): os 31 privilégios do token do Sistema (o
+    // conjunto do SeMakeSystemToken), com SeTcbPrivilege ligado.
     assert(call_export("SeQueryInformationToken", &[primary, 3, out]) == Some(0) && guest::read64(out) != 0, "se-token-info: SeQueryInformationToken classe TokenPrivileges aloca");
     let privileges = guest::read64(out);
-    assert(privileges != 0 && at::<nt::TokenPrivileges>(privileges).privilege_count.get() == 0, "se-token-info: TOKEN_PRIVILEGES do Sistema vazio");
+    let count = if privileges != 0 { at::<nt::TokenPrivileges>(privileges).privilege_count.get() } else { 0 };
+    let entries = privileges + core::mem::offset_of!(nt::TokenPrivileges, privileges) as u64;
+    let tcb_enabled = (0..count as u64).any(|index| {
+        let entry = at::<nt::LuidAndAttributes>(entries + index * nt::LuidAndAttributes::SIZE);
+        entry.luid.low_part.get() == 7 && entry.attributes.get() & 2 != 0
+    });
+    assert(privileges != 0 && count == 31 && Some(count as usize) == tokens::with(primary, |token| token.privileges.len()) && tcb_enabled, "se-token-info: TOKEN_PRIVILEGES do Sistema com os privilegios do SeMakeSystemToken");
     guest::free_bytes(privileges);
 
     // TOKEN_STATISTICS (classe 10): 56 bytes, Id do token no início.
@@ -12933,6 +13016,9 @@ pub fn run(assert: Assert) {
     io_error_log_and_ecp_exports(assert);
     mm_file_sections_exports(assert);
     se_filter_token_exports(assert);
+    rtl_unicode_prefix_exports(assert);
+    rtl_app_container_exports(assert);
+    ps_paged_pool_quota_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

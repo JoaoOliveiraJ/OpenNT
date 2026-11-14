@@ -2,7 +2,9 @@
 //!
 //! Abre a SECTION existente conservando a identidade nativa e o backing. A
 //! ordem de validação segue o NtOpenSection/Ob do NT de referência; as
-//! entradas de `\KnownDlls` são provisionadas do volume na primeira busca.
+//! entradas de `\KnownDlls` são provisionadas do volume na primeira busca,
+//! exceto no boot do processo inicial real (`--initial-process=smss`), em que
+//! o smss cria o diretório e as seções.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -261,7 +263,7 @@ pub fn open(output: u64, desired: u32, attributes: u64, mode: u8) -> Result<u32,
         let mut found = lookup(&info, mode);
         // Política de KnownDlls: provisiona o PE real do volume na primeira
         // busca e segue pelas mesmas permissões e caminho de handle do Ob.
-        if found.status == 0xC000_0034 && found.parent.and_then(object_manager::path_of).is_some_and(|path| path.to_lowercase() == "\\knowndlls") {
+        if !crate::ntos::init::boot_config::SMSS_BOOT && found.status == 0xC000_0034 && found.parent.and_then(object_manager::path_of).is_some_and(|path| path.to_lowercase() == "\\knowndlls") {
             if let Some(file) = crate::drivers::fs::volume_files::lookup_volume_file(&found.leaf) {
                 let image: alloc::sync::Arc<dyn crate::ntos::ps::user::sections::SectionFile> = file;
                 let section = match crate::ntos::ps::user::sections::create_image(image, Some(alloc::format!("\\KnownDlls\\{}", found.leaf)), 0x40, false)? {

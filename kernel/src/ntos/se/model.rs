@@ -56,6 +56,33 @@ pub fn equal_sids(left: &[u8], right: &[u8]) -> bool {
     left == right
 }
 
+/// A SACL (os bytes da ACL) pede SeSecurityPrivilege a quem a define: só as
+/// ACEs de auditoria e alarme pedem. As de rótulo e de política
+/// (SYSTEM_MANDATORY_LABEL 0x11, SYSTEM_RESOURCE_ATTRIBUTE 0x12,
+/// SYSTEM_SCOPED_POLICY_ID 0x13, SYSTEM_PROCESS_TRUST_LABEL 0x14,
+/// SYSTEM_ACCESS_FILTER 0x15) não: o rótulo de integridade e o de confiança
+/// de um processo protegido seguem regras próprias. Uma ACL malformada pede.
+pub fn sacl_requires_security_privilege(sacl: &[u8]) -> bool {
+    // ACL: AclRevision, Sbz1, AclSize (u16), AceCount (u16), Sbz2; depois as
+    // ACEs, cada uma com AceType, AceFlags e AceSize (u16).
+    if sacl.len() < 8 {
+        return !sacl.is_empty();
+    }
+    let count = u16::from_le_bytes([sacl[4], sacl[5]]) as usize;
+    let mut offset = 8;
+    for _ in 0..count {
+        if offset + 4 > sacl.len() {
+            return true;
+        }
+        let (kind, size) = (sacl[offset], u16::from_le_bytes([sacl[offset + 2], sacl[offset + 3]]) as usize);
+        if !(0x11..=0x15).contains(&kind) || size < 4 {
+            return true;
+        }
+        offset += size;
+    }
+    false
+}
+
 /// Serializa a autoridade em seis bytes big-endian e as subautoridades ULONG
 /// em little-endian.
 pub fn sid(authority: u64, sub_authorities: &[u32]) -> Sid {

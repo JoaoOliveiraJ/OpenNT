@@ -518,6 +518,11 @@ pub fn resolve(handle: u64, from_user_mode: bool) -> Option<Result<Resolved, u32
     let owner = entry.options.owner_process.unwrap_or(0);
     let mismatch = if kernel_handle { !entry.options.kernel_handle || from_user_mode } else { entry.options.kernel_handle || owner != process::get_current_process() };
     if mismatch {
+        // Um handle herdado mora na tabela de usuário do filho com o mesmo
+        // valor da linha do pai: nessa tabela ele é desconhecido aqui.
+        if !kernel_handle && crate::ntos::ps::user::state::get_user_handle(value).is_some() {
+            return None;
+        }
         return Some(Err(0xC000_0008));
     }
     let item = describe(entry.pointer)?;

@@ -16,9 +16,11 @@
 //!   PROCESS_CREATE_PROCESS; o pai declarado vai para as notificações e para
 //!   InheritedFromUniqueProcessId), PriorityClass e as saídas ClientId,
 //!   TebAddress e ImageInfo (o SECTION_IMAGE_INFORMATION da imagem na base
-//!   real); recusa com STATUS_NOT_SUPPORTED o que mudaria o processo sem
-//!   suporte aqui (DebugObject, Token, ProtectionLevel, SecureProcess,
-//!   JobList, UmsThread); aceita sem efeito, com registro no log, os demais
+//!   real) e ProtectionLevel (o PS_PROTECTION, com
+//!   PROCESS_CREATE_FLAGS_PROTECTED_PROCESS); recusa com
+//!   STATUS_NOT_SUPPORTED o que mudaria o processo sem suporte aqui
+//!   (DebugObject, Token, SecureProcess, JobList, UmsThread); aceita sem
+//!   efeito, com registro no log, os demais
 //!   que o kernel32 passa (StdHandleInfo, HandleList, ErrorMode, afinidade,
 //!   mitigações e políticas); um número desconhecido, um atributo repetido,
 //!   um tamanho errado ou os bits de thread/entrada trocados num atributo
@@ -27,9 +29,15 @@
 //!   (`process_parameters::capture`);
 //! - os OBJECT_ATTRIBUTES de processo e thread (sem nome; OBJ_INHERIT vai
 //!   para o handle) e as flags: PROCESS_CREATE_FLAGS_* conhecidas são
-//!   aceitas, as que pedem um processo diferente (suspenso inteiro,
-//!   protegido, mínimo, sessão nova, espaço de outro) dão
-//!   STATUS_NOT_SUPPORTED; com INHERIT_HANDLES o processo novo recebe, com
+//!   aceitas, as que pedem um processo diferente (suspenso inteiro, mínimo,
+//!   sessão nova, espaço de outro) dão STATUS_NOT_SUPPORTED;
+//!   PROTECTED_PROCESS cria o processo com o PS_PROTECTION do atributo
+//!   ProtectionLevel (sem ele, STATUS_NOT_SUPPORTED: o processo protegido
+//!   legado não existe aqui): quem cria (o pai declarado ou quem chama)
+//!   precisa ser protegido (senão STATUS_ACCESS_DENIED, como no
+//!   NtCreateUserProcess 19041) e dominar o pedido, com tipo e signatário
+//!   pelo menos iguais (a regra do RtlTestProtectedAccess; senão
+//!   STATUS_INVALID_PARAMETER); com INHERIT_HANDLES o processo novo recebe, com
 //!   os mesmos valores, os handles OBJ_INHERIT do pai declarado
 //!   (ParentProcess) ou, sem ele, de quem chama;
 //!   THREAD_CREATE_FLAGS_CREATE_SUSPENDED cria a thread principal suspensa.
@@ -64,6 +72,7 @@ use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::KernelError;
 
 const STATUS_SUCCESS: u32 = 0;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
@@ -83,10 +92,18 @@ const OBJ_INHERIT: u32 = 2;
 /// AUXILIARY_PROCESS, CREATE_STORE e USE_PROTECTED_ENVIRONMENT.
 const PROCESS_FLAGS_KNOWN: u32 = 0x0006_FFFF;
 /// As que pedem um processo diferente, sem suporte aqui:
-/// OVERRIDE_ADDRESS_SPACE, PROTECTED_PROCESS, CREATE_SESSION, SUSPENDED,
-/// MINIMAL_PROCESS, CLONE_MINIMAL, CLONE_MINIMAL_REDUCED_COMMIT,
-/// AUXILIARY_PROCESS e CREATE_STORE.
-const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_EAC8;
+/// OVERRIDE_ADDRESS_SPACE, SUSPENDED, MINIMAL_PROCESS, CLONE_MINIMAL,
+/// CLONE_MINIMAL_REDUCED_COMMIT, AUXILIARY_PROCESS e CREATE_STORE.
+const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_EA08;
+/// PROCESS_CREATE_FLAGS_CREATE_SESSION: o processo novo abre uma sessão
+/// (o bit que o MiMapProcessExecutable do NT testa para o MiSessionCreate).
+const PROCESS_CREATE_SESSION: u32 = 0x80;
+/// PROCESS_CREATE_FLAGS_PROTECTED_PROCESS.
+const PROCESS_PROTECTED: u32 = 0x40;
+/// PS_PROTECTION: o maior tipo (PsProtectedTypeProtected) e o maior
+/// signatário (PsProtectedSignerApp).
+const PROTECTION_TYPE_MAX: u8 = 2;
+const PROTECTION_SIGNER_MAX: u8 = 8;
 /// PROCESS_CREATE_FLAGS_INHERIT_HANDLES.
 const PROCESS_INHERIT_HANDLES: u32 = 0x4;
 /// THREAD_CREATE_FLAGS_* aceitas (as mesmas do NtCreateThreadEx).
@@ -152,6 +169,8 @@ struct Attributes {
     client_id: Option<Output>,
     teb_address: Option<Output>,
     image_info: Option<Output>,
+    /// PS_PROTECTION pedido (PsAttributeProtectionLevel).
+    protection: Option<u8>,
 }
 
 /// O NTSTATUS de um erro de sonda ou de criação.
@@ -303,7 +322,16 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 }
                 captured.image_info = Some(output(inline, return_length, SectionImageInformation::SIZE)?);
             }
-            attribute::DEBUG_OBJECT | attribute::TOKEN | attribute::UMS_THREAD | attribute::PROTECTION_LEVEL | attribute::SECURE_PROCESS | attribute::JOB_LIST => {
+            attribute::PROTECTION_LEVEL => {
+                expect(attribute::INPUT)?;
+                // PS_PROTECTION por valor: Type nos bits 0..=2, Signer em 4..=7.
+                let level = inline as u8;
+                if size != 1 || inline > 0xFF || level & 7 > PROTECTION_TYPE_MAX || level >> 4 > PROTECTION_SIGNER_MAX {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                captured.protection = Some(level);
+            }
+            attribute::DEBUG_OBJECT | attribute::TOKEN | attribute::UMS_THREAD | attribute::SECURE_PROCESS | attribute::JOB_LIST => {
                 crate::debug_print!("[ps] NtCreateUserProcess: atributo {:#x} sem suporte", value);
                 return Err(STATUS_NOT_SUPPORTED);
             }
@@ -311,6 +339,32 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
         }
     }
     Ok(captured)
+}
+
+/// O PS_PROTECTION do processo novo: com PROCESS_CREATE_FLAGS_PROTECTED_PROCESS,
+/// o do atributo ProtectionLevel, validado contra quem cria (`creator`);
+/// sem a flag, nenhum (o atributo sozinho não protege).
+fn requested_protection(process_flags: u32, requested: Option<u8>, creator: u64) -> Result<u8, u32> {
+    if process_flags & PROCESS_PROTECTED == 0 {
+        if requested.is_some() {
+            crate::debug_print!("[ps] NtCreateUserProcess: ProtectionLevel sem PROCESS_CREATE_FLAGS_PROTECTED_PROCESS ignorado");
+        }
+        return Ok(0);
+    }
+    let Some(level) = requested else {
+        crate::debug_print!("[ps] NtCreateUserProcess: processo protegido legado (sem ProtectionLevel) sem suporte");
+        return Err(STATUS_NOT_SUPPORTED);
+    };
+    // SAFETY: quem cria está retido pela própria chamada (o corrente ou o
+    // pai declarado, referenciado pelo handle).
+    let own = unsafe { Eprocess::at(creator) }.protection.level.get();
+    if own & 7 == 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    if own & 7 < level & 7 || own >> 4 < level >> 4 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(level)
 }
 
 /// O acesso de um handle que o criador recebe: os direitos genéricos
@@ -405,6 +459,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     if parameters.image_path_name.is_empty() {
         parameters.image_path_name = dos_path.clone();
     }
+    let protection = requested_protection(request.process_flags, attributes.protection, attributes.parent.unwrap_or_else(process::get_current_process))?;
     let process_access = creator_access(request.process_access, &object_types::process_type())?;
     let thread_access = creator_access(request.thread_access, &object_types::thread_type())?;
     // INHERIT_HANDLES: os handles herdáveis do pai declarado ou, sem ele, de
@@ -413,7 +468,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
 
     // A criação: daqui em diante só a memória do kernel e o processo novo.
     let short_name = String::from(dos_path.rsplit('\\').next().unwrap_or(&dos_path));
-    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: None, inherit_handles_from };
+    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: None, inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0 };
     let created = match create::create_user_process(&create_request) {
         Ok(created) => created,
         Err(failure) => {
@@ -459,6 +514,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         }
     };
     crate::debug_print!("[ps] NtCreateUserProcess: {} pid={:#x} tid={:#x} handles {:#x}/{:#x}{}", short_name, summary.process_id, summary.thread_id, process_handle, thread_handle, if request.thread_flags & create::THREAD_CREATE_SUSPENDED != 0 { " (suspensa)" } else { "" });
+    crate::ntos::init::initial_process::record_creation(process::get_current_process(), process);
     // As VAs foram sondadas; uma falha tardia devolve o status com o
     // processo e os handles já criados, como no NT.
     write_outputs(request, &attributes, &summary, (process_handle, thread_handle)).map_err(|error| status_of(&error))?;

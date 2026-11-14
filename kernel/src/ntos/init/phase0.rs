@@ -119,8 +119,12 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     crate::ntos::se::se_exports::init()?; // SE_EXPORTS na reserva permanente da imagem
     object_manager::create_directory("\\Device")?;
     object_manager::create_directory("\\Driver")?;
-    object_manager::create_directory("\\KnownDlls")?;
-    object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
+    // O \KnownDlls é do smss: no boot do processo inicial real
+    // (`--initial-process=smss`) o kernel não o cria.
+    if !crate::ntos::init::boot_config::SMSS_BOOT {
+        object_manager::create_directory("\\KnownDlls")?;
+        object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
+    }
     // Destino NT até o diretório instalado no volume de boot (montado na fase 1).
     object_manager::create_symlink("\\SystemRoot", "\\NTFS\\Windows")?;
     // CmpInitializeDriverStores: o diretório e o alias do sistema.
@@ -149,8 +153,13 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
 /// Serviço de driver: tipo kernel, Start e o caminho em
 /// `\SystemRoot\System32\Drivers`; os de Start <= 1 sobem na fase 1.
 fn seed_service(name: &str, driver_file: &str, start: u32) -> Result<(), crate::rtl::KernelError> {
+    seed_driver_service(name, driver_file, start, 1)
+}
+
+/// Serviço de driver de um tipo dado (1 kernel, 2 file system).
+fn seed_driver_service(name: &str, driver_file: &str, start: u32, service_type: u32) -> Result<(), crate::rtl::KernelError> {
     use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};
-    let input = ConfigurationInput { name: alloc::string::String::from(name), service_type: Some(1), start: Some(start), image_path: Some(alloc::format!("\\SystemRoot\\System32\\Drivers\\{driver_file}")), ..ConfigurationInput::default() };
+    let input = ConfigurationInput { name: alloc::string::String::from(name), service_type: Some(service_type), start: Some(start), image_path: Some(alloc::format!("\\SystemRoot\\System32\\Drivers\\{driver_file}")), ..ConfigurationInput::default() };
     match service_database::install(&input, false) {
         Ok(_) => Ok(()),
         Err(ServiceError::Win32(code, message)) => Err(crate::rtl::KernelError::new(alloc::format!("{name}: {message} ({code})"))),
@@ -210,6 +219,14 @@ fn seed_services() -> Result<(), crate::rtl::KernelError> {
     seed_service("watchdog", "watchdog.sys", 3)?;
     // Console, segurança do kernel e pilha de rede: chaves da instalação.
     crate::ntos::cm::service::inbox_drivers::seed()?;
+    // Os file systems de pipes nomeados e mailslots (npfs.sys e msfs.sys,
+    // SYSTEM_START, grupo "File system"), que o smss abre para criar os
+    // prefixos protegidos: no boot do processo inicial real
+    // (`--initial-process=smss`), com os binários reais no volume.
+    if crate::ntos::init::boot_config::SMSS_BOOT {
+        seed_driver_service("Npfs", "npfs.sys", 1, 2)?;
+        seed_driver_service("Msfs", "msfs.sys", 1, 2)?;
+    }
     seed_service_parameters("i8042prt", &[("KeyboardDataQueueSize", 0x64), ("MouseDataQueueSize", 0x64), ("PollStatusIterations", 0x2000), ("PollingIterations", 0x1900), ("ResendIterations", 3), ("OverrideKeyboardType", 0), ("CrashOnCtrlScroll", 0)])?;
     seed_device_class("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"])?;
     seed_device_class("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])?;

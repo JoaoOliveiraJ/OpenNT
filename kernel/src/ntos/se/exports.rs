@@ -9,8 +9,9 @@ use crate::ntos::se::token::information as token_information;
 use crate::ntos::se::{audit, privilege, subject_context};
 use crate::rtl::KernelError;
 
+/// SeSinglePrivilegeCheck(PrivilegeValue (LUID por valor), PreviousMode).
 fn single_privilege_check(call: &Call) -> Result<u64, KernelError> {
-    Ok(privilege::single_privilege_check(call.arg(2) as u32) as u64)
+    Ok(privilege::single_privilege_check(call.arg(1), call.arg(2) as u32) as u64)
 }
 
 fn capture_subject_context(call: &Call) -> Result<u64, KernelError> {

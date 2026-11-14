@@ -1208,7 +1208,12 @@ fn user_handle_operations(assert: Assert) {
     assert(status == 0 && copy != source && source_entry.as_ref().zip(copy_entry.as_ref()).is_some_and(|(left, right)| state::same_object(left, right) && right.access() == left.access()), "userhandles: DUPLICATE_SAME_ACCESS sobre a mesma descricao");
     drop(source_entry);
     drop(copy_entry);
-    assert(duplicate(u64::MAX, source, u64::MAX, 0x1F_01FF, 0, 0).0 == 0xC000_0022 && duplicate(u64::MAX, source, u64::MAX, 0, 0, 8).0 == 0xC000_000D && duplicate(u64::MAX, 0x7FF0, u64::MAX, 0, 0, 2).0 == 0xC000_0008, "userhandles: direitos alem da origem, opcoes invalidas e handle ausente");
+    assert(duplicate(u64::MAX, source, u64::MAX, 0x1F_01FF, 0, 0).0 == 0xC000_0022 && duplicate(u64::MAX, 0x7FF0, u64::MAX, 0, 0, 2).0 == 0xC000_0008, "userhandles: direitos alem da origem e handle ausente");
+    // DUPLICATE_NO_RIGHTS_UPGRADE (8), como o smss usa na seção compartilhada:
+    // a cópia sai com o acesso pedido, e uma cópia dela não ganha direitos.
+    let (status, restricted) = duplicate(u64::MAX, source, u64::MAX, 0x0010_0000, 0, 8);
+    assert(status == 0 && state::get_user_handle(restricted).is_some_and(|entry| entry.access() == 0x0010_0000) && duplicate(u64::MAX, restricted, u64::MAX, 0x8010_0000, 0, 0).0 == 0xC000_0022, "userhandles: DUPLICATE_NO_RIGHTS_UPGRADE");
+    let _ = state::close_user_handle(restricted, true, false);
     // DUPLICATE_CLOSE_SOURCE, inclusive com destino nulo.
     let (status, moved) = duplicate(u64::MAX, source, u64::MAX, 0, 0, 3);
     assert(status == 0 && state::get_user_handle(source).is_none() && state::get_user_handle(moved).is_some(), "userhandles: DUPLICATE_CLOSE_SOURCE fecha a origem");
@@ -3738,7 +3743,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1831, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1839, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }

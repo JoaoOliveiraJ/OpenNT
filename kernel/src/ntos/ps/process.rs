@@ -778,7 +778,9 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     if let (Some(image), Some(provider)) = (&record.image, provider) {
         (provider.destroy)(image);
     }
-    // O papel do PspProcessDelete: a raiz própria do processo, se houver.
+    // O papel do PspProcessDelete: a saída da sessão e a raiz própria do
+    // processo, se houver.
+    crate::ntos::mm::session::leave(process);
     if process_address_space::root_of(process).is_some() {
         if let Err(error) = process_address_space::delete(process) {
             debug_print!("[ps] espaco de enderecamento do processo {:#x} nao liberado: {}", process, error);

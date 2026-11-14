@@ -20,6 +20,7 @@ pub mod alert_thread;
 pub mod process_image;
 pub mod query_thread;
 pub mod query_process;
+pub mod set_process_information;
 pub mod set_thread_information;
 pub mod system_process_information;
 pub mod kernel_threads;

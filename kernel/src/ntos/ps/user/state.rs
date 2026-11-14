@@ -816,9 +816,12 @@ pub fn get_user_handle(value: u64) -> Option<Arc<UserHandle>> {
 }
 
 /// [`get_user_handle`] na tabela de `table` (o processo de origem de uma
-/// duplicação entre processos).
+/// duplicação entre processos). Os dois bits baixos do valor são marcas do
+/// chamador (OBJ_HANDLE_TAGBITS), ignoradas como no ExMapHandleToPointer: o
+/// LdrVerifyImageMatchesChecksumEx, por exemplo, recebe o handle do arquivo
+/// com o bit 0 ligado e o repassa ao NtCreateSection.
 pub fn get_user_handle_in(table: &ProcessState, value: u64) -> Option<Arc<UserHandle>> {
-    table.handles.lock().entries.get(&(value as u32)).cloned()
+    table.handles.lock().entries.get(&((value as u32) & !3)).cloned()
 }
 
 /// O rundown da tabela de um processo que terminou: fecha o que a drenagem
@@ -917,6 +920,18 @@ pub fn inherit_user_handles(parent: &ProcessState, child: &ProcessState) -> Resu
         inherited.push(value);
     }
     Ok(inherited.len())
+}
+
+/// A herança de um handle do Object Manager do pai: uma linha nova na
+/// tabela do filho, com o valor, o acesso e os atributos da linha do pai,
+/// sobre `object` (o corpo nativo). Devolve o valor.
+pub fn inherit_native_handle(child: &ProcessState, value: u32, object: Arc<dyn UserObject>, access: u32, attributes: u32) -> Result<u32, KernelError> {
+    let entry = Arc::new(UserHandle {
+        object,
+        group: Arc::new(SpinLock::new(Group { handles: 1, references: 1 })),
+        local: SpinLock::new(Local { access, attributes, wait_references: 0, on_references_released: None }),
+    });
+    insert_user_handle(child, &entry, Some(value))
 }
 
 /// Fecha o handle do processo corrente; `release` libera o objeto na última

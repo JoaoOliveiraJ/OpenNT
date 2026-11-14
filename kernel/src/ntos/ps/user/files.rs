@@ -17,7 +17,7 @@ use super::state::{self, NativeBody, UserObject, STATUS_INVALID_HANDLE, STATUS_I
 use crate::ntos::io::io_manager::{self, IoParams, IoResult, RequestContext};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::section::{create as create_section, map_view, open as open_section, unmap_view};
-use crate::ntos::ob::{close, object_manager, object_types};
+use crate::ntos::ob::{close, object_types};
 use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
@@ -135,16 +135,21 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
         Err(error) => return Ok(error.status),
     };
     let device_path = device_path_of(&parsed.path);
-    if let Some(device_path) = device_path.as_ref().filter(|path| object_manager::lookup(path).is_some()) {
-        debug_print!("[usermode] abre device: {}", device_path);
-        let opened = match io_manager::open_device(device_path, true) {
+    // O dispositivo e o resto do nome (um arquivo no sistema de arquivos do
+    // dispositivo, como `\Device\NamedPipe\ProtectedPrefix`), com o
+    // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
+    if let Some((device_path, rest)) = device_path.as_deref().and_then(io_manager::split_device_path) {
+        debug_print!("[usermode] abre device: {}{}", device_path, rest);
+        let create = io_manager::CreateParameters { access: request.access, share: request.share, disposition, options: request.options, file_attributes: request.attributes, case_sensitive: object_flags & 0x40 == 0 };
+        let opened = match io_manager::open_device_file(&device_path, &rest, Some(create), true) {
             Ok(opened) => opened,
             Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
             Err(error) => return Err(error),
         };
         if opened.status != 0 {
-            return Ok(fail_iosb(iosb, opened.status as u32));
+            return Ok(fail_iosb(iosb, if opened.status == io_manager::status::NOT_FOUND { 0xC000_0034 } else { opened.status as u32 }));
         }
+        let information = if opened.information != 0 { opened.information } else { 1 };
         let object = Arc::new(UserDevice { device_path: device_path.clone(), options: request.options, device_handle: opened.handle, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
         let access = file_objects::access(request.access);
         return match state::alloc_user_handle(object, access, object_flags & 2) {
@@ -153,8 +158,9 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
                     close::close_user(handle as u64, true);
                     return Ok(0xC000_0005);
                 }
-                // FILE_OPENED.
-                Ok(if state::set_user_iosb(iosb, 0, 1).is_err() { 0xC000_0005 } else { 0 })
+                // O Information do IRP_MJ_CREATE (FILE_OPENED quando o
+                // driver não informa).
+                Ok(if state::set_user_iosb(iosb, 0, information).is_err() { 0xC000_0005 } else { 0 })
             }
             Err(error) => {
                 let _ = io_manager::close_device(opened.handle);
@@ -276,7 +282,13 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
 
 /// NtClose: o objeto sai da tabela e do kernel.
 fn nt_close(handle: u64, force: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(close::close_user(handle, force == 1))
+    let status = close::close_user(handle, force == 1);
+    if status != STATUS_INVALID_HANDLE {
+        return Ok(status);
+    }
+    // Os handles nativos do processo (diretórios e links do namespace,
+    // objetos abertos por ponteiro) ficam fora da tabela de usuário.
+    close::close(handle, Some(1))
 }
 
 /// NtCreateSection(handle*, access, oa?, maxSize*, pageProt, secProt, file).

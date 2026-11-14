@@ -97,6 +97,73 @@ impl UserObject for UserProcess {
     }
 }
 
+/// Um handle do Object Manager herdado pelo processo novo (o ObInitProcess
+/// copia as linhas OBJ_INHERIT da tabela do pai com os mesmos valores): na
+/// tabela de usuário do filho, sobre o mesmo corpo nativo (seção, evento,
+/// diretório...), retido e contado por handle.
+pub struct InheritedObject {
+    pointer: u64,
+    type_name: alloc::string::String,
+}
+
+impl InheritedObject {
+    pub fn new(pointer: u64) -> Option<Self> {
+        let body = open_pointer::describe(pointer)?;
+        Some(Self { pointer, type_name: body.object_type.name.clone() })
+    }
+}
+
+impl UserObject for InheritedObject {
+    fn kind(&self) -> &'static str {
+        match self.type_name.as_str() {
+            "Section" => "section",
+            _ => "inherited",
+        }
+    }
+    fn wait_pointer(&self) -> Option<u64> {
+        Some(self.pointer)
+    }
+    fn section(&self) -> Option<Arc<crate::ntos::ps::user::sections::Section>> {
+        crate::ntos::ps::user::sections::by_pointer(self.pointer)
+    }
+    fn native_body(&self) -> Option<NativeBody> {
+        let pointer = self.pointer;
+        Some(NativeBody {
+            pointer,
+            type_name: self.type_name.clone(),
+            record: pointer,
+            reference: Arc::new(move || {
+                if let Some(body) = open_pointer::describe(pointer) {
+                    body.reference();
+                }
+            }),
+            dereference: Arc::new(move || {
+                if let Some(body) = open_pointer::describe(pointer) {
+                    body.dereference();
+                }
+            }),
+        })
+    }
+    fn callback_data(&self) -> ObjectData {
+        ObjectData { native_pointer: self.pointer, ..ObjectData::default() }
+    }
+    fn on_each_handle_open(&self) -> Result<bool, KernelError> {
+        let body = open_pointer::describe(self.pointer).ok_or_else(|| KernelError::with_status("inherited body", BAD_HANDLE))?;
+        body.reference();
+        object_types::account(&self.type_name, 0, 1)?;
+        Ok(true)
+    }
+    fn on_each_handle_close(&self) {
+        let _ = object_types::account(&self.type_name, 0, -1);
+        if let Some(body) = open_pointer::describe(self.pointer) {
+            body.dereference();
+        }
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// O EPROCESS de um handle de processo da tabela do processo corrente (o
 /// pseudo-handle é o próprio corrente), com PROCESS_DUP_HANDLE, e a tabela
 /// de handles dele: o processo de origem ou de destino de uma duplicação.
@@ -129,10 +196,11 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
     }
     // Os argumentos de pilha moram na memória de quem chama: lidos antes de
     // qualquer attach.
+    // Options não é validado (o ObDuplicateObject só olha os bits que
+    // conhece). DUPLICATE_NO_RIGHTS_UPGRADE (8) proíbe que cópias da cópia
+    // ganhem direitos novos; aqui uma duplicação nunca acrescenta direitos
+    // (abaixo), então a marca não muda nada.
     let (requested_access, requested_attributes, options) = (state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg32(rsp, 7));
-    if options & !7 != 0 {
-        return Ok(INVALID);
-    }
     let (source, source_table) = match duplication_process(source_process) {
         Ok(found) => found,
         Err(status) => return Ok(status),
@@ -140,6 +208,9 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
     let pseudo_process = is_pseudo_process(source_handle);
     let pseudo_thread = is_pseudo_thread(source_handle);
     let entry = state::get_user_handle_in(&source_table, source_handle);
+    if entry.is_none() && !pseudo_process && !pseudo_thread {
+        return duplicate_object_manager_handle(source, source_handle, target_process, out, requested_access, requested_attributes, options);
+    }
     if entry.is_none() && !pseudo_process {
         // O pseudo-handle de thread entra com `ps/user/threads`.
         return Ok(BAD_HANDLE);
@@ -202,9 +273,101 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
     result
 }
 
-/// NtSetInformationObject(ObjectHandleFlagInformation): Inherit e
-/// ProtectFromClose do handle.
+/// A duplicação de um handle da tabela do Object Manager (seções, diretórios,
+/// links e os demais corpos que o Ob publica pelo ObInsertObject e pelo
+/// ObOpenObjectByPointer): o corpo é resolvido na tabela do processo de
+/// origem, anexado a ele, e a cópia entra na tabela do destino com o acesso
+/// da origem (DUPLICATE_SAME_ACCESS) ou o pedido, com os genéricos mapeados
+/// pelo tipo; direitos além dos da origem são recusados, como na tabela de
+/// usuário. DUPLICATE_CLOSE_SOURCE fecha a origem mesmo quando a cópia falha.
+fn duplicate_object_manager_handle(source: u64, source_handle: u64, target_process: u64, out: u64, requested_access: u32, requested_attributes: u32, options: u32) -> Result<u32, KernelError> {
+    let resolved = match attached(source, || open_pointer::resolve(source_handle, true))? {
+        Some(Ok(resolved)) => resolved,
+        Some(Err(status)) => return Ok(status),
+        None => return Ok(BAD_HANDLE),
+    };
+    let result = (|| -> Result<u32, KernelError> {
+        if target_process == 0 {
+            return Ok(if options & 1 != 0 { 0 } else { INVALID });
+        }
+        let (target, _) = match duplication_process(target_process) {
+            Ok(found) => found,
+            Err(status) => return Ok(status),
+        };
+        if out != 0 && !state::probe_user_write(out, 8) {
+            return Ok(AV);
+        }
+        let attributes = if options & 4 != 0 { resolved.attributes } else { requested_attributes };
+        if attributes & !3 != 0 {
+            return Ok(INVALID);
+        }
+        let object_type = &resolved.item.object_type;
+        let access = if options & 2 != 0 {
+            resolved.access
+        } else {
+            let mut access = requested_access & 0x0FFF_FFFF;
+            for (bit, mapped) in [(0x8000_0000u32, object_type.mapping[0]), (0x4000_0000, object_type.mapping[1]), (0x2000_0000, object_type.mapping[2]), (0x1000_0000, object_type.mapping[3])] {
+                if requested_access & bit != 0 {
+                    access |= mapped;
+                }
+            }
+            access & (object_type.valid_access | 0x0100_0000)
+        };
+        if access & !resolved.access != 0 {
+            return Ok(0xC000_0022);
+        }
+        let inserted = open_pointer::insert(&resolved.item, access, attributes & 2, target)?;
+        if out != 0 {
+            if let Err(error) = guest::try_write::<u64>(out, inserted as u64) {
+                let _ = attached(target, || open_pointer::close(inserted as u64));
+                return Err(error);
+            }
+        }
+        Ok(0)
+    })();
+    let result = match result {
+        Err(error) if error.status != 0 => Ok(error.status),
+        other => other,
+    };
+    if options & 1 != 0 {
+        let _ = attached(source, || open_pointer::close(source_handle));
+    }
+    result
+}
+
+/// O tipo do corpo de um handle do processo corrente, na tabela do Object
+/// Manager ou na de usuário.
+fn handle_type_name(handle: u64) -> Result<alloc::string::String, u32> {
+    match open_pointer::resolve(handle, true) {
+        Some(Ok(resolved)) => Ok(resolved.item.object_type.name.clone()),
+        Some(Err(status)) => Err(status),
+        None => state::get_user_handle(handle).and_then(|entry| entry.object.native_body()).map(|body| body.type_name).ok_or(BAD_HANDLE),
+    }
+}
+
+/// NtSetInformationObject(ObjectSessionObjectInformation, 6): com
+/// SeTcbPrivilege, liga um diretório ao objeto Session da sessão de quem
+/// chama (o MmGetSessionObjectById). Os espaços de sessão daqui ainda não
+/// têm o objeto Session do MiSessionObjectCreate: como no NT quando a
+/// sessão não tem objeto, STATUS_OBJECTID_EXISTS, que o csrss aceita.
+fn set_session_object_information(handle: u64) -> Result<u32, KernelError> {
+    // SeTcbPrivilege.
+    if !crate::ntos::se::privilege::single_privilege_check(7, 1) {
+        return Ok(0xC000_0061);
+    }
+    match handle_type_name(handle) {
+        Ok(name) if name == "Directory" => Ok(0xC000_0455),
+        Ok(_) => Ok(0xC000_0024),
+        Err(status) => Ok(status),
+    }
+}
+
+/// NtSetInformationObject: ObjectHandleFlagInformation (Inherit e
+/// ProtectFromClose do handle) e ObjectSessionObjectInformation.
 fn nt_set_information_object(handle: u64, class: u64, input: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if class as u32 == 6 {
+        return set_session_object_information(handle);
+    }
     if class as u32 != 4 {
         return Ok(0xC000_0003);
     }
@@ -369,12 +532,12 @@ fn process_policy(pointer: u64) -> SecurityPolicy {
 }
 
 /// Direitos de um novo handle de processo.
-fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
+pub(crate) fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
     open_access(&object_types::process_type(), &process_policy(pointer), requested)
 }
 
 /// Direitos de um novo handle de thread: o descritor é o do processo dela.
-fn thread_access(thread: &threads::UserThread, requested: u32) -> Result<u32, u32> {
+pub(crate) fn thread_access(thread: &threads::UserThread, requested: u32) -> Result<u32, u32> {
     let owner = thread.with(|thread| thread.process_pointer);
     open_access(&object_types::thread_type(), &process_policy(owner), requested)
 }
@@ -424,7 +587,7 @@ fn capture_open(out: u64, attributes: u64, client_id: u64) -> Result<OpenByClien
 }
 
 /// Publica o handle de usuário do EPROCESS (callbacks de objeto incluídos).
-fn open_process_handle(pointer: u64, access: u32, attributes: u32) -> Result<Result<u32, u32>, KernelError> {
+pub(crate) fn open_process_handle(pointer: u64, access: u32, attributes: u32) -> Result<Result<u32, u32>, KernelError> {
     let object = Arc::new(UserProcess { pointer, process_id: eprocess(pointer).unique_process_id.get() });
     match state::alloc_user_handle(object, access, attributes & OBJ_INHERIT) {
         Ok(handle) => Ok(Ok(handle)),

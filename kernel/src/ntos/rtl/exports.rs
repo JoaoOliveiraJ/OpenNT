@@ -2552,3 +2552,60 @@ pub mod rtl_crt_snwprintf_s {
 
     pub static GROUP: Group = Group { name: "rtl-crt-snwprintf-s", names: &["_snwprintf_s"], handlers: &[snwprintf_s], data_exports: &[] };
 }
+
+pub mod rtl_unicode_prefix {
+    //! Tabelas de prefixos Unicode: a lógica mora em `rtl/unicode_prefix`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::unicode_prefix;
+    use crate::rtl::KernelError;
+
+    /// RtlInitializeUnicodePrefix(PrefixTable).
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        unicode_prefix::initialize(call.arg(1));
+        Ok(0)
+    }
+
+    /// RtlInsertUnicodePrefix(PrefixTable, Prefix, PrefixTableEntry) -> BOOLEAN.
+    fn insert(call: &Call) -> Result<u64, KernelError> {
+        Ok(unicode_prefix::insert(call.arg(1), call.arg(2), call.arg(3))? as u64)
+    }
+
+    /// RtlRemoveUnicodePrefix(PrefixTable, PrefixTableEntry).
+    fn remove(call: &Call) -> Result<u64, KernelError> {
+        unicode_prefix::remove(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    /// RtlFindUnicodePrefix(PrefixTable, FullName, CaseInsensitiveIndex) -> PUNICODE_PREFIX_TABLE_ENTRY.
+    fn find(call: &Call) -> Result<u64, KernelError> {
+        unicode_prefix::find(call.arg(1), call.arg(2), call.arg(3) as u32)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-unicode-prefix",
+        names: &["RtlInitializeUnicodePrefix", "RtlInsertUnicodePrefix", "RtlRemoveUnicodePrefix", "RtlFindUnicodePrefix"],
+        handlers: &[initialize, insert, remove, find],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_app_container {
+    //! SIDs de pacote (AppContainer): a lógica mora em `rtl/security`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::security;
+    use crate::rtl::KernelError;
+
+    /// RtlGetAppContainerSidType(Sid, SidType*) -> NTSTATUS.
+    fn sid_type(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::get_app_container_sid_type(call.arg(1), call.arg(2))))
+    }
+
+    /// RtlGetAppContainerParent(AppContainerSid, AppContainerSidParent*) -> NTSTATUS.
+    fn parent(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::get_app_container_parent(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-app-container", names: &["RtlGetAppContainerSidType", "RtlGetAppContainerParent"], handlers: &[sid_type, parent], data_exports: &[] };
+}

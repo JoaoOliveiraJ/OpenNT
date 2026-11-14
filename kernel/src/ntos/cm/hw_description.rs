@@ -129,7 +129,56 @@ pub fn seed_hardware_description() -> Result<(), KernelError> {
     // publicam nela os seus dispositivos (RtlWriteRegistryValue com
     // RTL_REGISTRY_DEVICEMAP, como KeyboardClass e PointerClass).
     registry::close_handle(registry::open_or_create(DEVICE_MAP_PATH, None)?);
-    debug_print!("[hwdesc] arvore de hardware descrita (8042 ISA) semeada");
+    seed_central_processors()?;
+    debug_print!("[hwdesc] arvore de hardware descrita (8042 ISA, processadores) semeada");
+    Ok(())
+}
+
+/// O texto de registradores CPUID (EBX/EDX/ECX do leaf 0, ou EAX..EDX das
+/// marcas 0x80000002..4), sem os NULs do fim.
+fn cpuid_text(words: &[u32]) -> String {
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).take_while(|&byte| byte != 0).collect();
+    String::from(String::from_utf8_lossy(&bytes).trim())
+}
+
+/// `CentralProcessor\<n>` de cada processador, com os valores que o
+/// CmpInitializeMachineDependentConfiguration do NT grava a partir do CPUID:
+/// Identifier ("AMD64/Intel64/VIA64 Family F Model M Stepping S", com a
+/// família e o modelo estendidos), VendorIdentifier, ProcessorNameString,
+/// ~MHz (a frequência medida do TSC) e FeatureSet. O smss lê esta chave para
+/// o ambiente (PROCESSOR_IDENTIFIER, PROCESSOR_LEVEL...).
+fn seed_central_processors() -> Result<(), KernelError> {
+    use crate::hal::cpu::cpuid;
+    let vendor_words = cpuid(0);
+    let vendor = cpuid_text(&[vendor_words[1], vendor_words[3], vendor_words[2]]);
+    let signature = cpuid(1)[0];
+    let base_family = (signature >> 8) & 0xF;
+    let family = if base_family == 0xF { base_family + ((signature >> 20) & 0xFF) } else { base_family };
+    let model = ((signature >> 4) & 0xF) | if base_family == 0x6 || base_family == 0xF { ((signature >> 16) & 0xF) << 4 } else { 0 };
+    let stepping = signature & 0xF;
+    let architecture = match vendor.as_str() {
+        "AuthenticAMD" => "AMD64",
+        "CentaurHauls" => "VIA64",
+        _ => "Intel64",
+    };
+    let identifier = alloc::format!("{architecture} Family {family} Model {model} Stepping {stepping}");
+    let name = if cpuid(0x8000_0000)[0] >= 0x8000_0004 {
+        let words: Vec<u32> = (0x8000_0002..=0x8000_0004u32).flat_map(cpuid).collect();
+        cpuid_text(&words)
+    } else {
+        String::new()
+    };
+    let megahertz = (crate::ntos::ke::clock::tsc_frequency_hz() / 1_000_000) as u32;
+    for index in 0..crate::ntos::ke::smp::online_cpu_count() {
+        let handle = registry::open_or_create(&alloc::format!("{HARDWARE_DESCRIPTION_PATH}\\CentralProcessor\\{index}"), None)?;
+        registry::set_value(handle, "Identifier", 1, registry::encode_wide(&identifier));
+        registry::set_value(handle, "VendorIdentifier", 1, registry::encode_wide(&vendor));
+        registry::set_value(handle, "ProcessorNameString", 1, registry::encode_wide(&name));
+        registry::set_value(handle, "~MHz", 4, megahertz.to_le_bytes().to_vec());
+        registry::set_value(handle, "FeatureSet", 4, 0u32.to_le_bytes().to_vec());
+        registry::set_value(handle, "Component Information", 3, alloc::vec![0; 16]);
+        registry::close_handle(handle);
+    }
     Ok(())
 }
 

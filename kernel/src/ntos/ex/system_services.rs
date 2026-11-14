@@ -175,6 +175,7 @@ pub fn dispatch(id: u64, args: &[u64; 14], return_address: u64, frame: u64, cont
         return exports::handle(32 + kernel as u64, args, return_address, frame, context);
     }
     if !binding.user {
+        crate::debug_print!("[usermode] syscall {} sem implementacao de modo usuario", binding.name);
         return Ok(0xC000_0002);
     }
     let Some(invoker) = *USER_INVOKER.lock() else { return Ok(0xC000_0002) };

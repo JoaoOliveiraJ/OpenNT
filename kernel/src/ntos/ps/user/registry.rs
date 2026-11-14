@@ -57,9 +57,14 @@ pub fn parse_user_object_attributes(attributes: u64) -> Option<Parsed> {
     let mut path = name.clone();
     if root_directory != 0 {
         // Raiz de registro (chave) ou de objetos (diretório, inclusive aberto
-        // como arquivo).
-        let root = state::get_user_handle(root_directory)?;
-        let root_path = root.object.object_path()?;
+        // como arquivo, ou o handle nativo de um diretório do namespace).
+        let root_path = match state::get_user_handle(root_directory) {
+            Some(root) => root.object.object_path()?,
+            None => {
+                let opened = crate::ntos::ob::handles::namespace::resolve(root_directory, true).ok().filter(|opened| opened.directory)?;
+                crate::ntos::ob::object_manager::path_of(opened.node)?
+            }
+        };
         path = alloc::format!("{}{}{}", root_path, if root_path.ends_with('\\') { "" } else { "\\" }, name);
     }
     Some(Parsed { path, root_directory })
@@ -95,17 +100,24 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     set_sz(code_page, "OEMHAL", "vgaoem.fon");
     let session_manager = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager", None)?;
     set_dword(session_manager, "SafeMode", 0);
-    // KnownDlls: a lista real das DLLs conhecidas e o diretório delas.
-    let known = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\KnownDlls", None)?;
-    set_sz(known, "DllDirectory", "C:\\Windows\\System32");
-    set_multi_sz(
-        known,
-        "KnownDlls",
-        &[
-            "ntdll.dll", "kernel32.dll", "KERNELBASE.dll", "advapi32.dll", "rpcrt4.dll", "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "bcrypt.dll", "bcryptprimitives.dll", "crypt32.dll", "wintrust.dll", "user32.dll", "win32u.dll", "gdi32.dll", "imm32.dll", "ole32.dll", "combase.dll", "shell32.dll", "shlwapi.dll", "ws2_32.dll", "wldap32.dll", "wtsapi32.dll", "userenv.dll", "profapi.dll", "iphlpapi.dll", "version.dll", "imagehlp.dll", "psapi.dll", "msvcp_win.dll", "cryptbase.dll", "sspicli.dll", "nsi.dll", "dhcpcsvc.dll", "winnsi.dll", "normaliz.dll", "clbcatq.dll",
-            "kernel.appcore.dll", "cfgmgr32.dll", "apisetschema.dll",
-        ],
-    );
+    if crate::ntos::init::boot_config::SMSS_BOOT {
+        // O smss real lê a configuração do Session Manager e cria ele mesmo
+        // o \KnownDlls.
+        crate::ntos::cm::session_manager::initialize()?;
+    } else {
+        // KnownDlls: a lista das DLLs conhecidas que o kernel provisiona e o
+        // diretório delas.
+        let known = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\KnownDlls", None)?;
+        set_sz(known, "DllDirectory", "C:\\Windows\\System32");
+        set_multi_sz(
+            known,
+            "KnownDlls",
+            &[
+                "ntdll.dll", "kernel32.dll", "KERNELBASE.dll", "advapi32.dll", "rpcrt4.dll", "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "bcrypt.dll", "bcryptprimitives.dll", "crypt32.dll", "wintrust.dll", "user32.dll", "win32u.dll", "gdi32.dll", "imm32.dll", "ole32.dll", "combase.dll", "shell32.dll", "shlwapi.dll", "ws2_32.dll", "wldap32.dll", "wtsapi32.dll", "userenv.dll", "profapi.dll", "iphlpapi.dll", "version.dll", "imagehlp.dll", "psapi.dll", "msvcp_win.dll", "cryptbase.dll", "sspicli.dll", "nsi.dll", "dhcpcsvc.dll", "winnsi.dll", "normaliz.dll", "clbcatq.dll",
+                "kernel.appcore.dll", "cfgmgr32.dll", "apisetschema.dll",
+            ],
+        );
+    }
     // Segment Heap desligado: o loader toma o caminho do heap NT clássico.
     let segment_heap = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\Segment Heap", None)?;
     set_dword(segment_heap, "Enabled", 0);

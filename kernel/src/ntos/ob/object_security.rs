@@ -332,6 +332,80 @@ fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, 
     Ok(status)
 }
 
+/// O acesso que o handle precisa para alterar as partes pedidas
+/// (SeSetSecurityAccessMask): dono, grupo e rótulo pedem WRITE_OWNER, a DACL
+/// WRITE_DAC e a SACL ACCESS_SYSTEM_SECURITY.
+fn set_security_access_mask(information: u32) -> u32 {
+    let mut mask = 0;
+    if information & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | 0x10) != 0 {
+        mask |= 0x8_0000;
+    }
+    if information & 4 != 0 {
+        mask |= 0x4_0000;
+    }
+    if information & 8 != 0 {
+        mask |= 0x100_0000;
+    }
+    mask
+}
+
+/// NtSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor) de
+/// modo usuário: o handle da tabela do processo (ou o handle nativo de um
+/// objeto do namespace) com o acesso que as partes pedem, o descritor
+/// capturado em UserMode e aplicado como no ZwSetSecurityObject (um arquivo
+/// recebe o IRP_MJ_SET_SECURITY no driver dele).
+pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+    if descriptor == 0 {
+        return Ok(SET_SECURITY_STATUS_ACCESS_VIOLATION);
+    }
+    let desired = set_security_access_mask(information);
+    // NtCurrentProcess/NtCurrentThread: o corpo corrente, com o acesso total
+    // que os pseudo-handles têm.
+    let (pointer, type_name, access) = if handle == u64::MAX {
+        (crate::ntos::ps::process::get_current_process(), object_types::process_type().name, 0x1F_FFFF)
+    } else if handle == u64::MAX - 1 {
+        (crate::ntos::ps::process::get_current_thread(), object_types::thread_type().name, 0x1F_FFFF)
+    } else if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(handle) {
+        let Some(body) = entry.object.native_body() else { return Ok(STATUS_OBJECT_TYPE_MISMATCH) };
+        (body.pointer, body.type_name, entry.access())
+    } else {
+        match crate::ntos::ob::open_pointer::resolve(handle, true) {
+            Some(Ok(resolved)) => (resolved.item.pointer, resolved.item.object_type.name.clone(), resolved.access),
+            Some(Err(status)) => return Ok(status),
+            None => return Ok(STATUS_INVALID_HANDLE),
+        }
+    };
+    if access & desired != desired {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    let output = guest::alloc_bytes(8);
+    let captured_status = crate::ntos::init::exports::invoke_handler("SeCaptureSecurityDescriptor", &[descriptor, 1, 1, 1, output])? as u32;
+    // SAFETY: PSECURITY_DESCRIPTOR* alocado acima.
+    let captured = unsafe { Field::<u64>::at(output) }.get();
+    guest::free_bytes(output);
+    if captured_status != 0 {
+        return Ok(captured_status);
+    }
+    let control = crate::ntos::se::descriptor::control(captured);
+    if information & OWNER_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 0) == 0 {
+        guest::free_bytes(captured);
+        return Ok(SET_SECURITY_STATUS_INVALID_OWNER);
+    }
+    if information & GROUP_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 1) == 0 {
+        guest::free_bytes(captured);
+        return Ok(SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP);
+    }
+    if type_name == object_types::file_type().name {
+        let status = set_file_security(pointer, information, captured);
+        guest::free_bytes(captured);
+        return status;
+    }
+    Ok(set_security_object_by_pointer(pointer, captured))
+}
+
 /// ZwSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor).
 pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
     if descriptor == 0 {

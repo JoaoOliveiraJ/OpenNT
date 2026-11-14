@@ -197,9 +197,18 @@ pub fn by_id(process_id: u64) -> Option<Arc<ProcessState>> {
 /// mesmos valores (`state::inherit_user_handles`). Um pai que já terminou
 /// não tem tabela: STATUS_PROCESS_IS_TERMINATING. Devolve quantos.
 pub fn inherit_handles(parent: u64, child: u64) -> Result<usize, KernelError> {
-    let parent = get(parent).ok_or_else(|| KernelError::with_status("pai sem tabela de handles", 0xC000_010A))?;
-    let child = get(child).ok_or_else(|| KernelError::new("processo novo sem estado"))?;
-    state::inherit_user_handles(&parent, &child)
+    let parent_state = get(parent).ok_or_else(|| KernelError::with_status("pai sem tabela de handles", 0xC000_010A))?;
+    let child_state = get(child).ok_or_else(|| KernelError::new("processo novo sem estado"))?;
+    let mut inherited = state::inherit_user_handles(&parent_state, &child_state)?;
+    // As linhas OBJ_INHERIT do pai na tabela do Object Manager (seções,
+    // eventos, diretórios...) entram na tabela do filho com os mesmos
+    // valores, sobre o mesmo corpo.
+    for (value, pointer, access, attributes) in crate::ntos::ob::object_manager::inheritable_handles(parent) {
+        let Some(object) = super::handles::InheritedObject::new(pointer) else { continue };
+        state::inherit_native_handle(&child_state, value, Arc::new(object), access, attributes)?;
+        inherited += 1;
+    }
+    Ok(inherited)
 }
 
 /// O estado do processo corrente (o anexado, quando há attach). `None`

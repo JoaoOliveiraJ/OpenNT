@@ -99,7 +99,7 @@ pub fn run(assert: Assert) {
     normalized_parameters(assert);
     let mut parameters = ProcessParameters::for_image(IMAGE_PATH);
     parameters.command_line = String::from(COMMAND_LINE);
-    let request = CreateProcessRequest { image: ImageOrigin::Bytes(program()), image_name: IMAGE_NAME, parameters, parent: None, thread_flags: THREAD_CREATE_SUSPENDED, inherit_handles_from: None, on_created: None };
+    let request = CreateProcessRequest { image: ImageOrigin::Bytes(program()), image_name: IMAGE_NAME, parameters, parent: None, thread_flags: THREAD_CREATE_SUSPENDED, inherit_handles_from: None, on_created: None, protection: 0, create_session: false };
     let created = match create::create_user_process(&request) {
         Ok(created) => created,
         Err(failure) => {

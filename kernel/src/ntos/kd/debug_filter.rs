@@ -50,7 +50,8 @@ fn level_mask(level: u32) -> u32 {
 /// NtSetDebugFilterState / DbgSetDebugFilterState.
 pub fn set_filter_state(component: u32, level: u32, state: bool) -> u32 {
     let mode = previous_mode::get().unwrap_or(0);
-    if mode != 0 && !privilege::single_privilege_check(mode as u32) {
+    // SeDebugPrivilege.
+    if mode != 0 && !privilege::single_privilege_check(20, mode as u32) {
         return STATUS_ACCESS_DENIED;
     }
     let mask = level_mask(level);

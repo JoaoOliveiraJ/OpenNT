@@ -16,6 +16,7 @@ pub mod sort;
 pub mod strings;
 pub mod unicode;
 pub mod unicode_case;
+pub mod unicode_prefix;
 pub mod utf8;
 pub mod resource;
 pub mod unwind;

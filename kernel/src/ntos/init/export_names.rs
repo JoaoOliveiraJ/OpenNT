@@ -404,6 +404,9 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("se-filter-token", 1828, 1),
     ("query-security-attributes", 1829, 1),
     ("ob-object-type-ex", 1830, 1),
+    ("rtl-unicode-prefix", 1831, 4),
+    ("rtl-app-container", 1835, 2),
+    ("ps-paged-pool-quota", 1837, 2),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2239,4 +2242,12 @@ pub static EXPORT_NAMES: &[&str] = &[
     "SeFilterToken",
     "ZwQuerySecurityAttributesToken",
     "ObCreateObjectTypeEx",
+    "RtlInitializeUnicodePrefix",
+    "RtlInsertUnicodePrefix",
+    "RtlRemoveUnicodePrefix",
+    "RtlFindUnicodePrefix",
+    "RtlGetAppContainerSidType",
+    "RtlGetAppContainerParent",
+    "PsChargeProcessPagedPoolQuota",
+    "PsReturnProcessPagedPoolQuota",
 ];

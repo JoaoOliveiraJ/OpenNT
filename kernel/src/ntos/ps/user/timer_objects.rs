@@ -52,10 +52,12 @@ fn dispose(pointer: u64) {
     guest::free_bytes(pointer);
 }
 
-fn publish(timer: &Arc<TimerObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
+/// `creating`: o handle de quem cria um objeto novo recebe o acesso pedido
+/// sem a checagem da DACL (o ObInsertObject do NT); abrir confere a DACL.
+fn publish(timer: &Arc<TimerObject>, out: u64, access: u32, attributes: u64, success: u32, creating: bool) -> Result<u32, KernelError> {
     state::guarded(|| {
         let flags = user_object_attributes(attributes)?;
-        dispatcher_objects::publish(timer.pointer, out, access, flags, success, false, Some(timer.clone()))
+        dispatcher_objects::publish(timer.pointer, out, access, flags, success, creating, Some(timer.clone()))
     })
 }
 
@@ -111,7 +113,7 @@ fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, r
                 Err(error) => return Ok(error.status),
             }
             let Some(timer) = timer_of_node(node) else { return Ok(0xC000_0024) };
-            return publish(&timer, out, access, attributes, 0x4000_0000);
+            return publish(&timer, out, access, attributes, 0x4000_0000, false);
         }
         if object_manager::lookup(&parent).and_then(object_manager::node).is_none_or(|node| node.type_name != "Directory") {
             return Ok(0xC000_003A);
@@ -139,7 +141,7 @@ fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, r
             }
         }
     }
-    publish(&timer, out, access, attributes, 0)
+    publish(&timer, out, access, attributes, 0, true)
 }
 
 /// NtSetTimer2(handle, due*, period*, parameters*): prazo relativo

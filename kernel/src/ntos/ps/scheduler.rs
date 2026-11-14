@@ -324,6 +324,11 @@ pub fn tick(minimum_priority: i32) {
     let budget = STATE.lock().processes.len();
     let (mut steps, mut slices) = (0, 0);
     let user_slices = |slices: usize| minimum_priority < 0 && slices < USER_SLICES_PER_TICK && user_threads::can_dispatch();
+    // As threads de usuário paradas cuja espera já concluiu entram na fila
+    // antes da seleção, mesmo quando nenhuma delas está pronta.
+    if minimum_priority < 0 {
+        user_threads::refresh_waiting();
+    }
     while steps < budget || user_slices(slices) {
         let selected = refresh_waiting_threads().and_then(|_| thread_dispatch::peek());
         let (thread, owner) = match selected {

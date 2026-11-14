@@ -9,7 +9,7 @@
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
-//! `--start-driver=NOME`, `--trace-driver-api`.
+//! `--start-driver=NOME`, `--trace-driver-api`, `--initial-process=smss`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
@@ -35,7 +35,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status> [opcoes]
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME
-                   --trace-driver-api
+                   --trace-driver-api --initial-process=smss
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)";
 
@@ -62,6 +62,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             console_mirror: false,
             start_driver: String::new(),
             trace_driver_api: false,
+            initial_process: String::new(),
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4 },
         positional: Vec::new(),
@@ -86,6 +87,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--kernel-test-scope" => parsed.build.kernel_test_scope = required()?,
             "--start-driver" => parsed.build.start_driver = required()?,
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
+            "--initial-process" => parsed.build.initial_process = required()?,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -97,6 +99,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             _ if name.starts_with("--") => return Err(format!("opcao desconhecida: {name}\n{USAGE}")),
             _ => parsed.positional.push(argument),
         }
+    }
+    if !matches!(parsed.build.initial_process.as_str(), "" | "smss") {
+        return Err(format!("--initial-process aceita apenas smss ({} recebido)", parsed.build.initial_process));
     }
     if parsed.machine.memory_mb < 128 {
         return Err("--memory-mb deve cobrir o heap do kernel (minimo 128)".into());

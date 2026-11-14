@@ -629,6 +629,21 @@ pub fn close(handle: u32) -> Result<bool, KernelError> {
     Ok(true)
 }
 
+/// Os handles de `process` marcados OBJ_INHERIT, para a herança do
+/// ObInitProcess: (valor, corpo nativo, acesso, atributos). Os de kernel e os
+/// sem corpo nativo ficam de fora.
+pub fn inheritable_handles(process: u64) -> Vec<(u32, u64, u32, u32)> {
+    let handles: Vec<u32> = with_state(|state| state.handles.keys().copied().collect());
+    handles
+        .into_iter()
+        .filter_map(|handle| {
+            let record = handle_record(handle)?;
+            let inheritable = record.options.owner_process == Some(process) && !record.options.kernel_handle && record.attributes & 2 != 0 && record.pointer != 0;
+            inheritable.then_some((handle, record.pointer, record.access, record.attributes))
+        })
+        .collect()
+}
+
 /// Fecha os handles do processo, preservando os de kernel.
 pub fn close_process_native_handles(process: u64) {
     let handles: Vec<u32> = with_state(|state| state.handles.keys().copied().collect());

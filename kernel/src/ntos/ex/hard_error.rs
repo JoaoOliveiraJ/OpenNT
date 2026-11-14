@@ -37,7 +37,8 @@ pub fn raise_hard_error(error_status: u32, count: u32, string_mask: u32, paramet
         return STATUS_INVALID_PARAMETER_2;
     }
     let mode = previous_mode::get().unwrap_or(0);
-    if options == OPTION_SHUTDOWN_SYSTEM && !privilege::single_privilege_check(mode as u32) {
+    // OptionShutdownSystem exige SeShutdownPrivilege.
+    if options == OPTION_SHUTDOWN_SYSTEM && !privilege::single_privilege_check(19, mode as u32) {
         return STATUS_PRIVILEGE_NOT_HELD;
     }
     let described: Vec<String> = (0..count as u64)

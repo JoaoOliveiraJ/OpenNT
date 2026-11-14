@@ -28,6 +28,7 @@ pub mod persisted_state;
 pub mod physical_memory_resources;
 pub mod primitive_provider;
 pub mod registry;
+pub mod session_manager;
 pub mod state_separation;
 pub mod value_information;
 pub mod wnf_defaults;

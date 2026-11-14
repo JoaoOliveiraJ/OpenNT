@@ -2,7 +2,8 @@
 //! de privilégios usados de um ACCESS_STATE.
 //!
 //! Todo código aqui roda em modo kernel: o contexto kernel tem todos os
-//! privilégios habilitados, e KernelMode passa direto.
+//! privilégios habilitados, e KernelMode passa direto; UserMode confere o
+//! token efetivo da thread corrente.
 
 use crate::ntos::inc::types::{AccessState, AuxAccessData, LuidAndAttributes, NtStruct, PrivilegeSet, SecurityImpersonationLevel, SecuritySubjectContext};
 use crate::ntos::mm::guest_memory as guest;
@@ -41,10 +42,16 @@ fn copy_entry(destination: &LuidAndAttributes, source: &LuidAndAttributes) {
     destination.attributes.set(source.attributes.get());
 }
 
-/// SeSinglePrivilegeCheck: o contexto kernel tem todos os privilégios; só
-/// o PreviousMode KernelMode (0) passa.
-pub fn single_privilege_check(previous_mode: u32) -> bool {
-    previous_mode == 0
+/// SeSinglePrivilegeCheck(PrivilegeValue, PreviousMode): KernelMode (0)
+/// passa direto; UserMode exige o privilégio habilitado no token efetivo da
+/// thread corrente (o de personificação, quando há, senão o primário), como
+/// o SeCaptureSubjectContext + SePrivilegeCheck do NT.
+pub fn single_privilege_check(privilege: u64, previous_mode: u32) -> bool {
+    if previous_mode == 0 {
+        return true;
+    }
+    let Some(token) = crate::ntos::ob::object_access::subject() else { return false };
+    tokens::with(token, |token| token.privileges.iter().any(|held| held.id == privilege && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
 }
 
 /// SePrivilegeCheck(RequiredPrivileges, Subj, Mode): KernelMode → TRUE

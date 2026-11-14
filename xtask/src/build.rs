@@ -27,6 +27,9 @@ pub struct BuildOptions {
     pub start_driver: String,
     /// `--trace-driver-api`: rastreia as APIs chamadas durante esse início.
     pub trace_driver_api: bool,
+    /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
+    /// primeiro processo de usuário (vazio = o boot comum).
+    pub initial_process: String,
 }
 
 pub struct BuildOutput {
@@ -85,7 +88,8 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
     command
         .env("OPENNT_USER_PROGRAM", &options.user_program)
         .env("OPENNT_KERNEL_TEST_SCOPE", &options.kernel_test_scope)
-        .env("OPENNT_START_DRIVER", &options.start_driver);
+        .env("OPENNT_START_DRIVER", &options.start_driver)
+        .env("OPENNT_INITIAL_PROCESS", &options.initial_process);
     if options.trace_driver_api {
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {
@@ -163,7 +167,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     fs::write(&image_path, &image).map_err(|error| format!("{}: {error}", image_path.display()))?;
     // Segundo disco IDE (mestre-escravo primário): o volume NTFS de dados.
     let ntfs_path = build_dir.join("ntfs.img");
-    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &crate::windows_binaries::ntfs_files(&root, &kernel_pe)?, 32, 256)?;
+    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &crate::windows_binaries::ntfs_files(&root, &kernel_pe, &options.initial_process)?, 32, 256)?;
 
     println!(
         "OK: {}  (kernel {}b/{} setores, NTFS {}MB, programa {}, testes {})",

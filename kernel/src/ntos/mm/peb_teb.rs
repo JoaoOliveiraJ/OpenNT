@@ -83,6 +83,13 @@ pub fn create_peb(process: u64, image_base: u64) -> Result<u64, KernelError> {
     block.image_subsystem_major_version.set(major);
     block.image_subsystem_minor_version.set(minor);
     block.session_id.set(session::query(process));
+    // As marcas do PspAllocateProcess no INITIAL_PEB: IsProtectedProcess
+    // (PsIsProtectedProcess: Protection.Type != 0) e IsProtectedProcessLight
+    // (Type == PsProtectedTypeProtectedLight).
+    // SAFETY: o EPROCESS em montagem, retido pelo chamador.
+    let protection = unsafe { Eprocess::at(process) }.protection.type_();
+    block.set_is_protected_process(u8::from(protection != 0));
+    block.set_is_protected_process_light(u8::from(protection == 1));
     // SAFETY: o EPROCESS em montagem, retido pelo chamador.
     unsafe { Eprocess::at(process) }.peb.set(peb);
     Ok(peb)

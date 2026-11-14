@@ -63,10 +63,12 @@ pub fn create(pointer: u64, name: &str, event_type: u32, signaled: bool, attribu
     Ok(object)
 }
 
-fn publish(object: &Arc<EventObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
+/// `creating`: o handle de quem cria um objeto novo recebe o acesso pedido
+/// sem a checagem da DACL (o ObInsertObject do NT); abrir confere a DACL.
+fn publish(object: &Arc<EventObject>, out: u64, access: u32, attributes: u64, success: u32, creating: bool) -> Result<u32, KernelError> {
     state::guarded(|| {
         let flags = user_object_attributes(attributes)?;
-        dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+        dispatcher_objects::publish(object.pointer, out, access, flags, success, creating, Some(object.clone()))
     })
 }
 
@@ -122,7 +124,7 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
                 Err(error) => return Ok(error.status),
             }
             let Some(object) = event_of_node(existing) else { return Ok(0xC000_0024) };
-            return publish(&object, out, access as u32, attributes, 0x4000_0000);
+            return publish(&object, out, access as u32, attributes, 0x4000_0000, false);
         }
         let (parent, _) = split_name(&name);
         if object_manager::lookup(&parent).and_then(object_manager::node).is_none_or(|node| node.type_name != "Directory") {
@@ -135,7 +137,7 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
     }
     let signaled = state::stack_arg32(rsp, 5) & 255 != 0;
     match create(pointer, &name, event_type, signaled, attributes, true) {
-        Ok(object) => publish(&object, out, access as u32, attributes, 0),
+        Ok(object) => publish(&object, out, access as u32, attributes, 0, true),
         Err(error) if error.status != 0 => Ok(error.status),
         Err(error) => Err(error),
     }
@@ -152,7 +154,7 @@ fn nt_open_event(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) ->
         return Ok(0xC000_0024);
     }
     let Some(object) = event_of_node(node) else { return Ok(0xC000_0024) };
-    publish(&object, out, access as u32, attributes, 0)
+    publish(&object, out, access as u32, attributes, 0, false)
 }
 
 /// Set/Reset/Clear com EVENT_MODIFY_STATE; o estado anterior é opcional.

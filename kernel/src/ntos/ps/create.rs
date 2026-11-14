@@ -113,6 +113,12 @@ pub struct CreateProcessRequest<'a> {
     /// marcados OBJ_INHERIT o processo novo recebe, com os mesmos valores.
     /// `None`: a tabela do processo novo nasce vazia.
     pub inherit_handles_from: Option<u64>,
+    /// PS_PROTECTION do processo novo (0: sem proteção), gravado no EPROCESS
+    /// antes da PEB, que recebe IsProtectedProcess/IsProtectedProcessLight.
+    pub protection: u8,
+    /// PROCESS_CREATE_FLAGS_CREATE_SESSION: o processo abre uma sessão nova
+    /// (`mm::session::create`); sem ele, entra na sessão do pai.
+    pub create_session: bool,
 }
 
 /// Por que a criação falhou (os estados de falha do PS_CREATE_INFO).
@@ -409,6 +415,10 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     if let Some(parent) = request.parent {
         process::set_parent(process_pointer, parent);
     }
+    // EPROCESS.Protection, como no PspAllocateProcess: antes da PEB, que
+    // herda dele as marcas de processo protegido.
+    // SAFETY: EPROCESS recém-criado, retido até o término.
+    unsafe { Eprocess::at(process_pointer) }.protection.level.set(request.protection);
     // Daqui em diante toda saída passa pelo término, que libera o que o
     // processo possui.
     let fail = |error: KernelError| -> CreateFailure {
@@ -422,12 +432,22 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     if let Some(parent) = request.inherit_handles_from {
         process_state::inherit_handles(parent, process_pointer).map_err(fail)?;
     }
+    // A sessão, antes da PEB (que recebe o SessionId): uma nova com
+    // PROCESS_CREATE_FLAGS_CREATE_SESSION (o MiSessionCreate do
+    // MiMapProcessExecutable), senão a do pai declarado ou de quem cria.
+    if request.create_session {
+        crate::ntos::mm::session::create(process_pointer).map_err(fail)?;
+    } else {
+        crate::ntos::mm::session::join(process_pointer, request.parent.unwrap_or_else(process::get_current_process));
+    }
     // O espaço do processo novo, anexado: as cópias de sistema, o exe na
-    // raiz dele (a ntdll real faz o binding e a relocação), a ntdll e o exe
-    // no VAD, a pilha da primeira thread, a PEB, os parâmetros, a TEB e o
-    // CONTEXT inicial. O TID da primeira thread sai da mesma tabela dos PIDs,
-    // reservado antes porque a TEB o recebe antes de a thread existir.
-    let load_options = LoadOptions { user_space: true, skip_imports: true, skip_relocations: true, notify_image: false, ..LoadOptions::default() };
+    // raiz dele (a ntdll real faz o binding, a relocação e o cookie de
+    // segurança: o LdrInitSecurityCookie recusa um cookie que não seja o do
+    // link), a ntdll e o exe no VAD, a pilha da primeira thread, a PEB, os
+    // parâmetros, a TEB e o CONTEXT inicial. O TID da primeira thread sai da
+    // mesma tabela dos PIDs, reservado antes porque a TEB o recebe antes de a
+    // thread existir.
+    let load_options = LoadOptions { user_space: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, ..LoadOptions::default() };
     let built = cid::allocate(cid::Kind::Thread).and_then(|thread_id| {
         process_context::with_process(process_pointer, || -> Result<Built, KernelError> {
             loader::map_system_images()?;
@@ -456,6 +476,11 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         create_main_thread(process_pointer, thread_id).map(|thread| (built, thread)).inspect_err(|_| cid::release(thread_id, 0))
     });
     let (built, thread_pointer) = created.map_err(fail)?;
+    // A seção de imagem do processo guarda o SECTION_IMAGE_INFORMATION da
+    // imagem principal (a ProcessImageInformation).
+    if let Some(section) = process::image_section(process_pointer) {
+        section_objects::set_image_information(section, built.image_information.to_vec());
+    }
     // A thread principal entra na lista do processo (e no índice global),
     // suspensa se o pedido manda: o registro no despacho respeita a contagem.
     let main = UserThread::new(built.thread_id, thread_pointer, built.teb, built.entry_point);

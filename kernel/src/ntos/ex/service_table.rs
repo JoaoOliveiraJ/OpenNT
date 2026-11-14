@@ -200,6 +200,9 @@ pub fn out_of_range(service_number: u32) -> Result<Result<(u64, u32), u32>, Kern
             return Ok(Ok((target, arguments)));
         }
     }
+    // O portão do processo inicial real observa o primeiro pedido ao win32k
+    // que não está carregado.
+    crate::ntos::init::initial_process::win32k_requested(service_number);
     Ok(Err(win32_failure_status(&addresses, service_number)))
 }
 

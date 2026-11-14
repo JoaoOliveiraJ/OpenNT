@@ -31,6 +31,9 @@ pub struct SectionState {
     pub exclusive_process: u64,
     /// Atributos capturados pelo MmCreateSection para o ObInsertObject.
     pub creation_attributes: Option<CreationAttributes>,
+    /// O SECTION_IMAGE_INFORMATION de uma seção de imagem (o da imagem
+    /// principal de um processo, capturado ao mapeá-la).
+    pub image_information: Option<alloc::vec::Vec<u8>>,
 }
 
 /// Nome e flags capturados antes da inserção (sem publicar no namespace).
@@ -175,6 +178,11 @@ pub fn update(pointer: u64, body: impl FnOnce(&mut SectionState)) -> Option<()> 
 
 pub fn state(pointer: u64) -> Option<SectionState> {
     SECTIONS.lock().get(&pointer).map(|record| record.state.clone())
+}
+
+/// O SECTION_IMAGE_INFORMATION da seção de imagem `pointer`.
+pub fn set_image_information(pointer: u64, information: alloc::vec::Vec<u8>) -> Option<()> {
+    SECTIONS.lock().get_mut(&pointer).map(|record| record.state.image_information = Some(information))
 }
 
 /// Segurança definida pelo criador (descritor capturado ou padrão).

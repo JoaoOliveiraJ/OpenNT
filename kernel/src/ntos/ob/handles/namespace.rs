@@ -1,6 +1,6 @@
 //! Handles de diretórios e links do namespace.
 //!
-//! NtOpen/NtCreateDirectoryObject, NtOpenSymbolicLinkObject,
+//! NtOpen/NtCreateDirectoryObject, NtOpen/NtCreateSymbolicLinkObject,
 //! NtQuerySymbolicLinkObject, NtQueryDirectoryObject e NtMakeTemporaryObject.
 //! Os handles de usuário do processo corrente entram com a fase 7.
 
@@ -136,7 +136,21 @@ pub fn open(output_handle: u64, access: u32, attributes: u64, kind: &str, from_u
         return STATUS_ACCESS_VIOLATION;
     }
     let mut created: Option<NodeId> = None;
-    let status = open_inner(output_handle, access, attributes, kind, from_user_mode, create, &mut created);
+    let status = open_inner(output_handle, access, attributes, kind, from_user_mode, create, None, &mut created);
+    if let Some(node) = created {
+        object_manager::remove_named(node);
+    }
+    status
+}
+
+/// NtCreateSymbolicLinkObject: cria o link com o destino `target` (já
+/// capturado) e publica o handle, como a criação de diretório.
+pub fn create_link(output_handle: u64, access: u32, attributes: u64, target: &str, from_user_mode: bool) -> u32 {
+    if from_user_mode && !user_probe::probe_user_write(output_handle, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let mut created: Option<NodeId> = None;
+    let status = open_inner(output_handle, access, attributes, "SymbolicLink", from_user_mode, true, Some(target), &mut created);
     if let Some(node) = created {
         object_manager::remove_named(node);
     }
@@ -144,7 +158,7 @@ pub fn open(output_handle: u64, access: u32, attributes: u64, kind: &str, from_u
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from_user_mode: bool, create: bool, created: &mut Option<NodeId>) -> u32 {
+fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from_user_mode: bool, create: bool, link_target: Option<&str>, created: &mut Option<NodeId>) -> u32 {
     let input = match capture(attributes, from_user_mode) {
         Ok(input) => input,
         Err(status) => return status,
@@ -164,7 +178,8 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
             let (parent, parent_rest) = object_manager::resolve_from(&parts.join("\\"), 0, input.case_insensitive, false, input.start);
             let parent = parent.filter(|&parent| object_manager::node(parent).is_some_and(|node| node.type_name == "Directory") && parent_rest.is_none());
             let Some(parent) = parent else { return 0xC000_003A };
-            let Some(inserted) = object_manager::insert_named(parent, name, "Directory", None, input.case_insensitive) else {
+            let data = link_target.map(object_manager::ObjectData::symlink);
+            let Some(inserted) = object_manager::insert_named(parent, name, kind, data, input.case_insensitive) else {
                 return 0xC000_0035;
             };
             *created = Some(inserted);

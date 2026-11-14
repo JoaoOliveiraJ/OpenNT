@@ -44,10 +44,12 @@ fn busy(pointer: u64) -> bool {
     mutant(pointer).owner_thread.get() != 0
 }
 
-fn publish(object: &Arc<MutantObject>, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
+/// `creating`: o handle de quem cria um objeto novo recebe o acesso pedido
+/// sem a checagem da DACL (o ObInsertObject do NT); abrir confere a DACL.
+fn publish(object: &Arc<MutantObject>, out: u64, access: u32, attributes: u64, success: u32, creating: bool) -> Result<u32, KernelError> {
     state::guarded(|| {
         let flags = user_object_attributes(attributes)?;
-        dispatcher_objects::publish(object.pointer, out, access, flags, success, false, Some(object.clone()))
+        dispatcher_objects::publish(object.pointer, out, access, flags, success, creating, Some(object.clone()))
     })
 }
 
@@ -94,7 +96,7 @@ fn nt_create_mutant(out: u64, access: u64, attributes: u64, initial_owner: u64, 
                 Err(error) => return Ok(error.status),
             }
             let Some(object) = mutant_of_node(node) else { return Ok(0xC000_0024) };
-            return publish(&object, out, access as u32, attributes, 0x4000_0000);
+            return publish(&object, out, access as u32, attributes, 0x4000_0000, false);
         }
         if object_manager::lookup(&parent).and_then(object_manager::node).is_none_or(|node| node.type_name != "Directory") {
             debug_print!("[usermode] NtCreateMutant missing directory: {}", name);
@@ -129,7 +131,7 @@ fn nt_create_mutant(out: u64, access: u64, attributes: u64, initial_owner: u64, 
             }
         }
     }
-    let status = publish(&object, out, access as u32, attributes, 0)?;
+    let status = publish(&object, out, access as u32, attributes, 0, true)?;
     if status != 0 {
         rollback(pointer);
     }
@@ -146,7 +148,7 @@ fn nt_open_mutant(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -
         return Ok(0xC000_0024);
     }
     let Some(object) = mutant_of_node(node) else { return Ok(0xC000_0024) };
-    publish(&object, out, access as u32, attributes, 0)
+    publish(&object, out, access as u32, attributes, 0, false)
 }
 
 /// NtReleaseMutant: exige a posse; devolve o estado anterior.

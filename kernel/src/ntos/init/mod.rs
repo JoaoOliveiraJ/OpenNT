@@ -8,6 +8,7 @@ pub mod boot_config;
 pub mod main;
 pub mod phase0;
 pub mod phase1;
+pub mod initial_process;
 pub mod exports;
 pub mod export_names;
 pub mod native_export_layout;

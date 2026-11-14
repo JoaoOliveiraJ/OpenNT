@@ -1182,6 +1182,11 @@ fn send_receive(handle: u64, flags: u64, input: u64, send_attributes: u64, rsp: 
         }
         let receive = ReceiveArguments { output: state::stack_arg(rsp, 5), length: state::stack_arg(rsp, 6), receive_attributes: state::stack_arg(rsp, 7), timeout: state::stack_arg(rsp, 8) };
         port.run(|| {
+            // O lado servidor de uma conexão de usuário (porta de conexão ou
+            // de comunicação) tem a fila e as respostas próprias.
+            if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
+                return crate::ntos::alpc::server::exchange(&port, flags as u32, input, receive);
+            }
             if port.kind == "alpc" {
                 return Ok(match exchange_messages(&port, flags as u32, input, send_attributes, receive, 1)? {
                     Exchange::Status(status) => status,
@@ -1250,6 +1255,40 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attribute
     Ok(status)
 }
 
+/// NtAlpcCreatePort(PortHandle*, ObjectAttributes, PortAttributes).
+fn nt_alpc_create_port(out: u64, attributes: u64, port_attributes: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    state::guarded(|| crate::ntos::alpc::server::create_port(out, attributes, port_attributes))
+}
+
+/// NtAlpcAcceptConnectPort(PortHandle*, ConnectionPortHandle, Flags,
+/// ObjectAttributes, PortAttributes, PortContext, ConnectionRequest,
+/// ConnectionMessageAttributes, AcceptConnection).
+fn nt_alpc_accept_connect_port(out: u64, connection: u64, _flags: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 5 * 8) {
+        return Ok(AV);
+    }
+    let (port_context, request, accept) = (state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg32(rsp, 9) as u8 != 0);
+    state::guarded(|| crate::ntos::alpc::server::accept_connect_port(out, connection, attributes, port_context, request, accept))
+}
+
+/// NtAlpcOpenSenderProcess(ProcessHandle*, PortHandle, PortMessage, Flags,
+/// DesiredAccess, ObjectAttributes).
+fn nt_alpc_open_sender_process(out: u64, port: u64, message: u64, _flags: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 2 * 8) {
+        return Ok(AV);
+    }
+    state::guarded(|| crate::ntos::alpc::server::open_sender(out, port, message, state::stack_arg32(rsp, 5), state::stack_arg(rsp, 6), false))
+}
+
+/// NtAlpcOpenSenderThread(ThreadHandle*, PortHandle, PortMessage, Flags,
+/// DesiredAccess, ObjectAttributes).
+fn nt_alpc_open_sender_thread(out: u64, port: u64, message: u64, _flags: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 2 * 8) {
+        return Ok(AV);
+    }
+    state::guarded(|| crate::ntos::alpc::server::open_sender(out, port, message, state::stack_arg32(rsp, 5), state::stack_arg(rsp, 6), true))
+}
+
 fn nt_alpc_cancel_message(port: u64, flags: u64, context: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
     cancel_message::cancel(port, flags as u32, context, 1, cancel_message)
 }
@@ -1311,6 +1350,10 @@ pub fn init() {
     // continuam no seu emissor.
     *LPC_SEND_RECEIVE.lock() = state::handler("NtAlpcSendWaitReceivePort");
     state::register_handler("NtAlpcConnectPort", nt_alpc_connect_port);
+    state::register_handler("NtAlpcCreatePort", nt_alpc_create_port);
+    state::register_handler("NtAlpcAcceptConnectPort", nt_alpc_accept_connect_port);
+    state::register_handler("NtAlpcOpenSenderProcess", nt_alpc_open_sender_process);
+    state::register_handler("NtAlpcOpenSenderThread", nt_alpc_open_sender_thread);
     state::register_handler("NtAlpcSendWaitReceivePort", nt_alpc_send_wait_receive_port);
     state::register_handler("NtAlpcCancelMessage", nt_alpc_cancel_message);
     state::register_handler("NtAlpcCreateSecurityContext", nt_alpc_create_security_context);

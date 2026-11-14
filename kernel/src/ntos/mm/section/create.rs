@@ -168,6 +168,13 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
                     return Err(0xC000_0024);
                 }
                 directory = entry.object.namespace_node();
+            } else if let Ok(opened) = crate::ntos::ob::handles::namespace::resolve(root, true) {
+                // O handle nativo de um diretório criado pelo processo
+                // (NtCreateDirectoryObject).
+                if !opened.directory {
+                    return Err(0xC000_0024);
+                }
+                directory = Some(opened.node);
             }
         }
         let Some(directory) = directory else { return Err(0xC000_0008) };
@@ -270,7 +277,7 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
         let status = open_and_publish(pointer, info.flags, access, mode, output)?;
         return Ok(if status != 0 { status } else { 0x4000_0000 });
     }
-    if info.flags & 0x10 != 0 && !privilege(13, mode) {
+    if info.flags & 0x10 != 0 && !privilege(16, mode) {
         return Ok(0xC000_0061);
     }
     if let Some(parent) = info.parent.filter(|_| mode != 0 || info.flags & 0x400 != 0) {
@@ -287,7 +294,7 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
     } else {
         object_access::capture(object_access::subject())
     };
-    if mode != 0 && security.sacl.is_some() && !privilege(8, mode) {
+    if mode != 0 && security.sacl.as_deref().is_some_and(crate::ntos::se::model::sacl_requires_security_privilege) && !privilege(8, mode) {
         return Ok(0xC000_0061);
     }
     let mut file: Option<Arc<CapturedFile>> = None;
@@ -407,7 +414,10 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
             }
             section_objects::update(pointer, |state| state.name = path.unwrap_or_default());
         }
-        let status = open_and_publish(pointer, info.flags, access, mode, output)?;
+        // Como no ObInsertObject, quem cria a seção recebe o acesso pedido
+        // sem a checagem pela DACL do descritor que ele mesmo deu (o handle
+        // continua na tabela do processo de quem chama).
+        let status = open_and_publish(pointer, info.flags, access, 0, output)?;
         if status != 0 {
             return Ok(status);
         }

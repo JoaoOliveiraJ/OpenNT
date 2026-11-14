@@ -338,12 +338,12 @@ fn io_manager_devices(assert: Assert) {
     assert(iom::device_control(path, 0x22_0000, IoParams::default()).is_ok_and(|request| request.status == status::NOT_SUPPORTED) && iom::read("\\Device\\Phase4Missing").is_ok_and(|request| request.status == status::NOT_FOUND), "iomdev: major sem rotina e dispositivo ausente");
     assert(matches!(iom::query_device_id(path, 1), Ok(Some(id)) if id == "ECHO\\ID1") && matches!(iom::pnp_start_device(device), Ok(0)) && iom::device(device).is_some_and(|entry| entry.pnp_started), "iomdev: QUERY_ID e START_DEVICE");
     // Abertura com FILE_OBJECT: CREATE, I/O no handle, CLEANUP e CLOSE.
-    let opened = iom::open_device(path, false).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0 });
+    let opened = iom::open_device(path, false).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0, information: 0 });
     assert(opened.status == 0 && opened.handle != 0 && ECHO_EVENTS.load(core::sync::atomic::Ordering::SeqCst) == 1 && iom::device(device).is_some_and(|entry| entry.open_count == 1) && file_objects::state(opened.file_object).is_some_and(|state| state.0 == 1), "iomdev: IRP_MJ_CREATE publica o handle");
     assert(iom::read_handle(opened.handle, IoParams::default()).is_ok_and(|request| request.result == IoResult::Text("eco".into())) && iom::write_handle(opened.handle, b"xy").is_ok_and(|request| request.info == 2), "iomdev: I/O no handle aberto");
     assert(matches!(iom::cleanup_device(opened.handle), Ok(0)) && ECHO_EVENTS.load(core::sync::atomic::Ordering::SeqCst) == 0x11, "iomdev: IRP_MJ_CLEANUP");
     assert(matches!(iom::close_device(opened.handle), Ok(0)) && ECHO_EVENTS.load(core::sync::atomic::Ordering::SeqCst) == 0x111 && iom::device(device).is_some_and(|entry| entry.open_count == 0) && !file_objects::is_file(opened.file_object) && matches!(iom::close_device(opened.handle), Ok(status::NOT_FOUND)), "iomdev: IRP_MJ_CLOSE libera o FILE_OBJECT");
-    let external = iom::open_device(path, true).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0 });
+    let external = iom::open_device(path, true).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0, information: 0 });
     assert(external.status == 0 && file_objects::state(external.file_object).is_some_and(|state| state.0 == 0 && state.1) && matches!(iom::close_device(external.handle), Ok(0)) && !file_objects::is_file(external.file_object), "iomdev: handles externos retem so a referencia do CREATE");
     // Pilha nativa: IRP real entregue ao DEVICE_OBJECT.
     let native_driver = guest::alloc_bytes(0x160);

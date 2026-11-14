@@ -372,10 +372,26 @@ pub enum IoResult {
     Bytes(Vec<u8>),
 }
 
+/// Os parâmetros do IRP_MJ_CREATE de uma abertura por nome (o
+/// IopParseDevice): o acesso pedido vai num IO_SECURITY_CONTEXT com um
+/// ACCESS_STATE do sujeito corrente, as opções levam a disposição nos bits
+/// altos, e os atributos e o compartilhamento vão como vieram.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateParameters {
+    pub access: u32,
+    pub share: u32,
+    pub disposition: u32,
+    pub options: u32,
+    pub file_attributes: u32,
+    pub case_sensitive: bool,
+}
+
 /// Parâmetros de um pedido do I/O Manager.
 #[derive(Clone, Default)]
 pub struct IoParams {
     pub minor: u8,
+    /// IRP_MJ_CREATE por nome: o contexto de segurança e as opções.
+    pub create: Option<CreateParameters>,
     /// Dados de escrita/entrada; `binary` escolhe bytes ou texto no resultado.
     pub data: Option<Vec<u8>>,
     pub binary: bool,
@@ -668,7 +684,14 @@ fn call_native_driver(device: &DeviceEntry, request: &mut IoRequest) -> Result<(
         ioctl: control,
         ..Default::default()
     });
+    let security = match (major, request.params.create) {
+        (irp_mj::CREATE, Some(create)) => Some(prepare_create(packet, stack_count, &create)?),
+        _ => None,
+    };
     let guest_status = iof_call_driver(device_pointer, packet);
+    if let Some(security) = security {
+        release_create(security);
+    }
     let (io_status, information) = builder::read_io_status(packet);
     request.status = io_status;
     if request.status == 0 && guest_status != 0 {
@@ -700,6 +723,98 @@ fn call_native_driver(device: &DeviceEntry, request: &mut IoRequest) -> Result<(
         let _ = file_objects::dereference(file_object);
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// O IO_SECURITY_CONTEXT e o ACCESS_STATE de um IRP_MJ_CREATE.
+struct CreateSecurity {
+    context: u64,
+    access_state: u64,
+    aux: u64,
+}
+
+/// SL_CASE_SENSITIVE (IO_STACK_LOCATION.Flags do IRP_MJ_CREATE).
+const SL_CASE_SENSITIVE: u8 = 0x80;
+/// IRP_CREATE_OPERATION | IRP_SYNCHRONOUS_API.
+const IRP_CREATE_FLAGS: u32 = 0x80 | 0x4;
+
+/// Preenche a stack location do IRP_MJ_CREATE em `packet`: o contexto de
+/// segurança (ACCESS_STATE do SeCreateAccessState sobre a thread e o
+/// processo correntes, com o mapeamento genérico do tipo File), as opções
+/// (disposição << 24 | opções de criação), os atributos e o
+/// compartilhamento.
+fn prepare_create(packet: u64, stack_count: u32, create: &CreateParameters) -> Result<CreateSecurity, KernelError> {
+    use crate::ntos::inc::types::{AccessState, AuxAccessData, GenericMapping, IoSecurityContext};
+    let context = guest::alloc_bytes(IoSecurityContext::SIZE);
+    let access_state = guest::alloc_bytes(AccessState::SIZE);
+    let aux = guest::alloc_bytes(AuxAccessData::SIZE);
+    let mapping = guest::alloc_bytes(GenericMapping::SIZE);
+    if context == 0 || access_state == 0 || aux == 0 || mapping == 0 {
+        for block in [context, access_state, aux, mapping] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return Err(KernelError::with_status("IRP_MJ_CREATE sem memoria", 0xC000_009A));
+    }
+    let file_type = crate::ntos::ob::object_types::file_type();
+    // SAFETY: blocos recém-alocados com os tamanhos dos tipos.
+    let (generic, state, aux_data, security) = unsafe { (GenericMapping::at(mapping), AccessState::at(access_state), AuxAccessData::at(aux), IoSecurityContext::at(context)) };
+    generic.generic_read.set(file_type.mapping[0]);
+    generic.generic_write.set(file_type.mapping[1]);
+    generic.generic_execute.set(file_type.mapping[2]);
+    generic.generic_all.set(file_type.mapping[3]);
+    let created = crate::ntos::se::access_state::create(process::get_current_thread(), process::get_current_process(), state, aux_data, create.access, Some(generic));
+    guest::free_bytes(mapping);
+    if let Err(error) = created {
+        for block in [context, access_state, aux] {
+            guest::free_bytes(block);
+        }
+        return Err(error);
+    }
+    security.security_qos.set(0);
+    security.access_state.set(access_state);
+    security.desired_access.set(state.remaining_desired_access.get() | state.previously_granted_access.get());
+    security.full_create_options.set(create.options);
+    let location = location_at(builder::first_stack_location(packet, stack_count));
+    let parameters = &location.parameters.create;
+    parameters.security_context.set(context);
+    parameters.options.set((create.disposition << 24) | (create.options & 0x00FF_FFFF));
+    parameters.file_attributes.set(create.file_attributes as u16);
+    parameters.share_access.set(create.share as u16);
+    parameters.ea_length.set(0);
+    location.flags.set(if create.case_sensitive { SL_CASE_SENSITIVE } else { 0 });
+    // SAFETY: o IRP recém-montado por `builder::build`.
+    let irp = unsafe { Irp::at(packet) };
+    irp.flags.set(irp.flags.get() | IRP_CREATE_FLAGS);
+    Ok(CreateSecurity { context, access_state, aux })
+}
+
+/// Desfaz o ACCESS_STATE e libera os blocos do contexto de segurança.
+fn release_create(security: CreateSecurity) {
+    // SAFETY: o ACCESS_STATE criado por `prepare_create`.
+    let _ = crate::ntos::se::access_state::delete(unsafe { crate::ntos::inc::types::AccessState::at(security.access_state) });
+    for block in [security.context, security.access_state, security.aux] {
+        guest::free_bytes(block);
+    }
+}
+
+/// O dispositivo e o resto do nome de um caminho de abertura: o prefixo mais
+/// longo que resolve (com os links do namespace) para um objeto Device, e o
+/// que sobra, com a barra inicial (um caminho que termina na barra abre a
+/// raiz do sistema de arquivos do dispositivo: o resto é `\`).
+pub fn split_device_path(path: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
+    for count in (1..=parts.len()).rev() {
+        let prefix = alloc::format!("\\{}", parts[..count].join("\\"));
+        let Some(node) = lookup_device(&prefix) else { continue };
+        let device = device_path(node);
+        let mut rest: String = parts[count..].iter().map(|part| alloc::format!("\\{part}")).collect();
+        if rest.is_empty() && path.ends_with('\\') {
+            rest.push('\\');
+        }
+        return Some((device, rest));
+    }
+    None
 }
 
 /// IoCallDriver por caminho: driver do kernel, ou a pilha nativa anexada ao
@@ -750,25 +865,73 @@ pub struct Opened {
     pub status: i32,
     pub handle: u64,
     pub file_object: u64,
+    /// O IoStatus.Information do IRP_MJ_CREATE.
+    pub information: u64,
 }
 
 /// IRP_MJ_CREATE no topo da pilha: um handle é um FILE_OBJECT vivo. O handle
 /// referencia o dispositivo (ObReferenceObject), protegendo o driver de
 /// unload; CLEANUP e CLOSE vão ao driver pelas rotinas do FILE_OBJECT.
 pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelError> {
+    open_device_file(path, "", None, external_handles)
+}
+
+/// FILE_OBJECT.Flags de uma abertura por nome, como o IopParseDevice os
+/// deriva das opções de criação: FO_SYNCHRONOUS_IO (com FO_ALERTABLE_IO na
+/// variante alertável), FO_NO_INTERMEDIATE_BUFFERING, FO_WRITE_THROUGH,
+/// FO_SEQUENTIAL_ONLY, FO_RANDOM_ACCESS e FO_OPENED_CASE_SENSITIVE.
+fn file_object_flags(create: &CreateParameters) -> u32 {
+    let options = create.options;
+    let mut flags = 0;
+    if options & 0x30 != 0 {
+        flags |= 0x2;
+    }
+    if options & 0x10 != 0 {
+        flags |= 0x4;
+    }
+    if options & 0x8 != 0 {
+        flags |= 0x8;
+    }
+    if options & 0x2 != 0 {
+        flags |= 0x10;
+    }
+    if options & 0x4 != 0 {
+        flags |= 0x20;
+    }
+    if options & 0x800 != 0 {
+        flags |= 0x0010_0000;
+    }
+    if create.case_sensitive {
+        flags |= 0x0002_0000;
+    }
+    flags
+}
+
+/// A abertura de `name` (o resto do caminho depois do dispositivo, vazio
+/// para o próprio dispositivo) no dispositivo `path`: o FILE_OBJECT com o
+/// nome e, com `create`, o IRP_MJ_CREATE com o contexto de segurança e as
+/// opções (o IopParseDevice). O Information do IRP (FILE_OPENED,
+/// FILE_CREATED...) volta em `Opened::information`.
+pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
     let Some(node) = lookup_device(path) else {
-        return Ok(Opened { status: status::NOT_FOUND, handle: 0, file_object: 0 });
+        return Ok(Opened { status: status::NOT_FOUND, handle: 0, file_object: 0, information: 0 });
     };
     let entry = device(node).unwrap_or_default();
     let top = if entry.stack_top != 0 { entry.stack_top } else { entry.native_device };
-    let file_object = file_objects::create(top, "")?;
-    let mut request = make_io_request(irp_mj::CREATE, IoParams::default());
+    let file_object = file_objects::create(top, name)?;
+    if let Some(create) = &create {
+        // SAFETY: o FILE_OBJECT recém-criado.
+        let object = unsafe { crate::ntos::inc::types::FileObject::at(file_object) };
+        object.flags.set(object.flags.get() | file_object_flags(create));
+    }
+    let mut request = make_io_request(irp_mj::CREATE, IoParams { create, ..IoParams::default() });
     request.file_object = file_object;
     call_driver(path, &mut request)?;
     if request.status != status::SUCCESS {
         let _ = file_objects::dereference(file_object);
-        return Ok(Opened { status: request.status, handle: 0, file_object: 0 });
+        return Ok(Opened { status: request.status, handle: 0, file_object: 0, information: request.info });
     }
+    let information = request.info;
     if top != 0 {
         // InterlockedIncrement do DEVICE_OBJECT.ReferenceCount, como o parse.
         device_at(top).reference_count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -810,7 +973,7 @@ pub fn open_device(path: &str, external_handles: bool) -> Result<Opened, KernelE
         file_objects::dereference(file_object)?;
     }
     OPEN_HANDLES.lock().insert(handle, OpenHandle { device: node, file_object, external: external_handles });
-    Ok(Opened { status: status::SUCCESS, handle, file_object })
+    Ok(Opened { status: status::SUCCESS, handle, file_object, information })
 }
 
 pub fn cleanup_device(handle: u64) -> Result<i32, KernelError> {

@@ -275,6 +275,71 @@ fn app_container_sid_type(sid: &[u8]) -> Option<u32> {
     }
 }
 
+/// STATUS_NOT_APPCONTAINER.
+const STATUS_NOT_APPCONTAINER: u32 = 0xC000_A200;
+
+/// RtlGetAppContainerSidType(Sid, *SidType) -> NTSTATUS, como no ntoskrnl
+/// 19041: um SID S-1-15-2-... com 8 subautoridades é o pacote pai
+/// (ParentAppContainerSidType 2), com 12 o filho (ChildAppContainerSidType
+/// 1); outro número de subautoridades dá InvalidAppContainerSidType (3) e um
+/// SID que não é de pacote (revisão, autoridade, primeira subautoridade ou
+/// menos de duas) dá NotAppContainerSidType (0), os dois com
+/// STATUS_NOT_APPCONTAINER.
+pub fn get_app_container_sid_type(sid: u64, sid_type: u64) -> u32 {
+    let (status, kind) = app_container_type_at(sid);
+    out::<u32>(sid_type).set(kind);
+    status
+}
+
+/// O (NTSTATUS, APPCONTAINER_SID_TYPE) do SID em `sid`.
+fn app_container_type_at(sid: u64) -> (u32, u32) {
+    // SAFETY: o SID do chamador de kernel.
+    let header = unsafe { Sid::at(sid) };
+    let authority: alloc::vec::Vec<u8> = header.identifier_authority.value.iter().map(Field::get).collect();
+    let count = header.sub_authority_count.get();
+    if count < 2 || header.revision.get() != 1 || authority != [0, 0, 0, 0, 0, 15] || header.sub_authority[0].get() != 2 {
+        return (STATUS_NOT_APPCONTAINER, 0);
+    }
+    match count {
+        8 => (0, 2),
+        12 => (0, 1),
+        _ => (STATUS_NOT_APPCONTAINER, 3),
+    }
+}
+
+/// RtlGetAppContainerParent(AppContainerSid, *AppContainerSidParent) ->
+/// NTSTATUS: para um SID de pacote filho, um SID novo do pool paginável
+/// (tag 'RtPb', liberado por quem chama com ExFreePool) com as oito
+/// primeiras subautoridades; para outro SID, STATUS_INVALID_PARAMETER.
+pub fn get_app_container_parent(sid: u64, parent_out: u64) -> Result<u32, crate::rtl::KernelError> {
+    use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+    out::<u64>(parent_out).set(0);
+    if app_container_type_at(sid) != (0, 1) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let parent = kernel_pool::allocate(0x28, AllocateOptions { paged: true, tag: u32::from_le_bytes(*b"RtPb"), ..AllocateOptions::default() })?;
+    if parent == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    // SAFETY: o SID filho validado acima e o bloco novo de 0x28 bytes (o SID
+    // de oito subautoridades).
+    let (source, target) = unsafe { (Sid::at(sid), Sid::at(parent)) };
+    target.revision.set(1);
+    target.sub_authority_count.set(8);
+    for (index, byte) in target.identifier_authority.value.iter().enumerate() {
+        byte.set(if index == 5 { 15 } else { 0 });
+    }
+    // SAFETY: os dois SIDs têm ao menos oito subautoridades.
+    let (from, to) = unsafe { (Field::<u32>::array_at(source.sub_authority[0].address(), 8), Field::<u32>::array_at(target.sub_authority[0].address(), 8)) };
+    for (destination, value) in to.iter().zip(from) {
+        destination.set(value.get());
+    }
+    out::<u64>(parent_out).set(parent);
+    Ok(0)
+}
+
 /// RtlIsParentOfChildAppContainer: pai de 8 e filho de 12 subautoridades com
 /// as subautoridades 1..7 iguais.
 pub fn is_parent_of_child_app_container(parent: &[u8], child: &[u8]) -> bool {

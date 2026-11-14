@@ -206,6 +206,50 @@ pub fn accounting(token_pointer: u64) -> Result<(u64, u64), KernelError> {
 
 // ---- tokens ---------------------------------------------------------------
 
+/// SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED.
+const PRIVILEGE_ENABLED: u32 = 3;
+
+/// Os privilégios do token do System, na ordem e com os atributos do
+/// SeMakeSystemToken do ntoskrnl 19041: (LUID do privilégio, habilitado).
+const SYSTEM_PRIVILEGES: [(u64, bool); 31] = [
+    (7, true),   // SeTcbPrivilege
+    (2, false),  // SeCreateTokenPrivilege
+    (9, false),  // SeTakeOwnershipPrivilege
+    (15, true),  // SeCreatePagefilePrivilege
+    (4, true),   // SeLockMemoryPrivilege
+    (3, false),  // SeAssignPrimaryTokenPrivilege
+    (5, false),  // SeIncreaseQuotaPrivilege
+    (14, true),  // SeIncreaseBasePriorityPrivilege
+    (16, true),  // SeCreatePermanentPrivilege
+    (20, true),  // SeDebugPrivilege
+    (21, true),  // SeAuditPrivilege
+    (8, false),  // SeSecurityPrivilege
+    (22, false), // SeSystemEnvironmentPrivilege
+    (23, true),  // SeChangeNotifyPrivilege
+    (17, false), // SeBackupPrivilege
+    (18, false), // SeRestorePrivilege
+    (19, false), // SeShutdownPrivilege
+    (10, false), // SeLoadDriverPrivilege
+    (13, true),  // SeProfileSingleProcessPrivilege
+    (12, false), // SeSystemtimePrivilege
+    (25, false), // SeUndockPrivilege
+    (28, false), // SeManageVolumePrivilege
+    (29, true),  // SeImpersonatePrivilege
+    (30, true),  // SeCreateGlobalPrivilege
+    (31, false), // SeTrustedCredManAccessPrivilege
+    (32, false), // SeRelabelPrivilege
+    (33, true),  // SeIncreaseWorkingSetPrivilege
+    (34, true),  // SeTimeZonePrivilege
+    (35, true),  // SeCreateSymbolicLinkPrivilege
+    (11, true),  // SeSystemProfilePrivilege
+    (36, true),  // SeDelegateSessionUserImpersonatePrivilege
+];
+
+/// Os privilégios do token do System (SeMakeSystemToken).
+fn system_privileges() -> Vec<Privilege> {
+    SYSTEM_PRIVILEGES.iter().map(|&(id, enabled)| Privilege { id, attributes: if enabled { PRIVILEGE_ENABLED } else { 0 } }).collect()
+}
+
 /// Cria um token primário, copiando o estado herdável do pai. O registro só
 /// fica acessível depois de publicar os campos nativos e a referência inicial.
 pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> Result<u64, KernelError> {
@@ -246,8 +290,9 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
             },
             |parent| parent.groups.clone(),
         ),
-        // Sem privilégios de usuário inventados para serviços não implementados.
-        privileges: parent.as_ref().map_or_else(Vec::new, |parent| parent.privileges.clone()),
+        // O token sem pai é o do System, com os privilégios do
+        // SeMakeSystemToken; os demais herdam os do pai.
+        privileges: parent.as_ref().map_or_else(system_privileges, |parent| parent.privileges.clone()),
         restricted_sids: parent.as_ref().map_or_else(Vec::new, |parent| parent.restricted_sids.clone()),
         write_restricted: parent.as_ref().is_some_and(|parent| parent.write_restricted),
         security_attributes: parent

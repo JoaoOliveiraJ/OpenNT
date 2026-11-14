@@ -40,6 +40,36 @@ pub const CLASS_GUID_BY_ID: &[(&str, &str)] = &[("PNP0303", "{4D36E96B-E325-11CE
 
 /// Filhos enumerados: DEVICE_OBJECT → nó `\Device\<pai>_PDOn`.
 static CREATED_CHILD_NODES: SpinLock<BTreeMap<u64, NodeId>> = SpinLock::new(BTreeMap::new());
+
+/// PnPBootDriversInitialized. O boot daqui roda os drivers de boot e a
+/// enumeração dos dispositivos do sistema de uma vez (`init::phase1`): a
+/// marca cobre também o fim da enumeração (o evento
+/// PnpSystemDeviceEnumerationComplete do NT).
+static BOOT_DRIVERS_INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Os drivers de boot rodaram e os dispositivos do sistema foram enumerados.
+pub fn mark_boot_drivers_initialized() {
+    BOOT_DRIVERS_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// NtSerializeBoot: só de modo usuário (senão STATUS_ACCESS_DENIED), com
+/// SeTcbPrivilege (senão STATUS_PRIVILEGE_NOT_HELD); o PnpSerializeBoot
+/// devolve STATUS_UNSUCCESSFUL antes dos drivers de boot e, depois, espera o
+/// fim da enumeração dos dispositivos do sistema, que aqui já terminou com
+/// eles.
+pub fn serialize_boot(previous_mode: u8) -> u32 {
+    if previous_mode != 1 {
+        return 0xC000_0022;
+    }
+    // SeTcbPrivilege.
+    if !crate::ntos::se::privilege::single_privilege_check(7, previous_mode as u32) {
+        return 0xC000_0061;
+    }
+    if !BOOT_DRIVERS_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+        return 0xC000_0001;
+    }
+    0
+}
 static NEXT_CHILD_PDO_INDEX: SpinLock<u32> = SpinLock::new(0);
 
 fn name_of(node: NodeId) -> String {

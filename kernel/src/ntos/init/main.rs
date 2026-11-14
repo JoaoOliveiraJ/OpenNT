@@ -161,10 +161,15 @@ pub fn kmain() -> ! {
         }
     }
 
-    // processos: serviço de teclado (IPC) + shell
+    // processos: serviço de teclado (IPC) + shell; no boot do processo
+    // inicial real, o smss.exe no lugar do shell
     message_channels::create_channel("kbd");
     scheduler::spawn("kbd-service", keyboard_service());
-    if boot_config::USER_PROGRAM == "shell" {
+    if boot_config::SMSS_BOOT {
+        if let Err(error) = crate::ntos::init::initial_process::start() {
+            debug_print!("[init] processo inicial nao criado: {}", error);
+        }
+    } else if boot_config::USER_PROGRAM == "shell" {
         scheduler::spawn("shell", crate::shell::main());
     } else {
         debug_print!("[boot] programa de usuario desconhecido: {}", boot_config::USER_PROGRAM);

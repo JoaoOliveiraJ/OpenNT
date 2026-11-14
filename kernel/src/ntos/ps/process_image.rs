@@ -36,7 +36,7 @@ pub fn create(executable: &Executable) -> Result<ProcessImage, KernelError> {
         return Err(KernelError::new("invalid full image name"));
     }
     let file = file_objects::create_source(executable.source.clone())?;
-    let state = section_objects::SectionState { size: executable.image_size, image_file_object: file, ..section_objects::SectionState::default() };
+    let state = section_objects::SectionState { size: executable.image_size, image_file_object: file, image_information: executable.image_information.clone(), ..section_objects::SectionState::default() };
     let section = match section_objects::register(state, release_image_file) {
         Ok(0) | Err(_) => {
             let _ = file_objects::dereference(file);
@@ -70,9 +70,18 @@ fn provider_destroy(image: &ProcessImage) {
 
 static PROVIDER: ImageProvider = ImageProvider { create, release_section: provider_release_section, destroy: provider_destroy };
 
-/// Instala a criação de imagens em `ps/process`.
+/// O SECTION_IMAGE_INFORMATION de uma seção para a ProcessImageInformation:
+/// `None` para uma seção desconhecida, `Some(None)` para uma que não é de
+/// imagem.
+fn section_image(section: u64) -> Option<Option<alloc::vec::Vec<u8>>> {
+    section_objects::state(section).map(|state| state.image_information)
+}
+
+/// Instala a criação de imagens em `ps/process` e a fonte da
+/// ProcessImageInformation.
 pub fn init() {
     process::set_image_provider(&PROVIDER);
+    super::image_information::set_section_image(section_image);
 }
 
 /// Libera a referência da seção uma única vez (o chamador marca a imagem).

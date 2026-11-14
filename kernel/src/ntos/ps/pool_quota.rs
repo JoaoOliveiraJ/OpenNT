@@ -74,6 +74,39 @@ fn release(process_pointer: u64, paged: bool, bytes: u64) {
     }
 }
 
+/// PsChargeProcessPagedPoolQuota(Process, Amount) -> NTSTATUS: a cobrança
+/// paginável que o próprio chamador devolve com
+/// [`return_process_paged_pool_quota`] (sem bloco de pool associado), contra
+/// o limite do processo; o System não é cobrado.
+pub fn charge_process_paged_pool_quota(process: u64, amount: u64) -> Result<u32, KernelError> {
+    if process == process::get_system_process() {
+        return Ok(0);
+    }
+    let Some(limits) = process::with_record(process, |record| record.pool_quota_limits) else {
+        return Err(KernelError::new("pool quota owner is absent"));
+    };
+    let limit = limits.map_or(MAXIMUM_QUOTA, |limits| limits[1]);
+    match usage(process, true).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_add(amount).filter(|&next| next <= limit)) {
+        Ok(previous) => {
+            raise_peak(peak(process, true), previous + amount);
+            Ok(0)
+        }
+        Err(_) => Ok(QUOTA_EXCEEDED),
+    }
+}
+
+/// PsReturnProcessPagedPoolQuota(Process, Amount): devolve o que
+/// [`charge_process_paged_pool_quota`] cobrou; o System não é cobrado.
+pub fn return_process_paged_pool_quota(process: u64, amount: u64) {
+    if process == process::get_system_process() {
+        return;
+    }
+    let returned = usage(process, true).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_sub(amount));
+    if returned.is_err() {
+        panic!("pool quota underflow");
+    }
+}
+
 /// Reserva bytes com uma referência real ao EPROCESS; a devolução vai com o
 /// bloco de pool e sobrevive ao término do processo. O System não é cobrado.
 pub fn charge(process: u64, paged: bool, bytes: u64) -> Result<Result<Option<PoolQuota>, u32>, KernelError> {

@@ -117,7 +117,7 @@ pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -
         return Err(status(0xC000_0005));
     }
     let policy = if descriptor != 0 { callback_security::capture(descriptor).map_err(status)? } else { object_access::capture(subject) };
-    if from_user_mode && policy.sacl.is_some() {
+    if from_user_mode && policy.sacl.as_deref().is_some_and(crate::ntos::se::model::sacl_requires_security_privilege) {
         let privileged = subject.and_then(|token| tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0))).unwrap_or(false);
         if !privileged {
             return Err(status(0xC000_0061));

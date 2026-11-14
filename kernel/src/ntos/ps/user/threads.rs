@@ -560,6 +560,23 @@ pub fn dispatch_one() -> Result<Dispatched, KernelError> {
     result
 }
 
+/// Sonda as esperas das threads de usuário paradas e põe na fila de
+/// despacho as que concluíram, sem dar intervalo a ninguém. O tick chama a
+/// cada volta: quando todas as threads de usuário esperam, nenhuma está na
+/// fila para o [`dispatch_one`] sondar as outras, e a condição que uma delas
+/// espera pode ter sido produzida por quem acabou de parar (um pedido ALPC
+/// posto na IOCP do servidor por um cliente que em seguida espera a
+/// resposta). Mesmas condições do despacho; um despacho em curso já sonda.
+pub fn refresh_waiting() {
+    if !can_dispatch() || RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let caller = process::get_current_thread();
+    refresh_ready_user_threads();
+    process::set_current_thread(caller);
+    RUNNING.store(false, Ordering::Release);
+}
+
 /// O corpo de [`dispatch_one`], com o despacho já marcado como em curso.
 fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatched, KernelError> {
     refresh_ready_user_threads();
