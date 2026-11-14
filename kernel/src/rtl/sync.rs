@@ -3,12 +3,68 @@
 //! atrás de um destes. Para estado lido muito e mudado em operações longas
 //! (o volume de um sistema de arquivos), [`SharedLock`] faz o papel do
 //! ERESOURCE: donos compartilhados ou um dono exclusivo.
+//!
+//! Cada CPU conta as posses que tem de cada um ([`spin_locks_held`],
+//! [`shared_locks_held`]), em células da sua reserva de KPCR endereçadas
+//! pelo GS: uma thread que bloqueia deixa a CPU para outra, e nenhuma das
+//! duas posses atravessa essa troca (a de um SpinLock é um erro, como
+//! esperar com um KSPIN_LOCK; a de um SharedLock é contada por processador e
+//! passaria a valer para a outra thread).
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::cpu;
+
+/// Deslocamentos, a partir da base do GS, dos contadores de posse da CPU
+/// (SpinLock, SharedLock). Zero até o Ke publicá-los, quando toda CPU que
+/// executa o kernel tem o GS na própria KPCR; antes disso nada é contado.
+static SPIN_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SHARED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Publica as células dos contadores (`ke::pcr::init`, logo depois de o GS
+/// do BSP apontar a KPCR; os APs carregam o GS antes de executar o kernel).
+pub fn publish_lock_counters(spin: u64, shared: u64) {
+    SHARED_COUNTER.store(shared, Ordering::Release);
+    SPIN_COUNTER.store(spin, Ordering::Release);
+}
+
+/// Soma `delta` à célula da CPU corrente; `false` se os contadores ainda
+/// não existem.
+#[inline]
+fn count(counter: &AtomicU64, delta: i32) -> bool {
+    let offset = counter.load(Ordering::Relaxed);
+    if offset == 0 {
+        return false;
+    }
+    // SAFETY: a célula fica na reserva da KPCR desta CPU, mapeada por toda a
+    // vida do sistema; só esta CPU a altera, e as posses que ela conta
+    // começam e terminam nela.
+    unsafe { core::arch::asm!("add dword ptr gs:[{}], {:e}", in(reg) offset, in(reg) delta, options(nostack)) };
+    true
+}
+
+fn read(counter: &AtomicU64) -> u32 {
+    let offset = counter.load(Ordering::Acquire);
+    if offset == 0 {
+        return 0;
+    }
+    let value: u32;
+    // SAFETY: como em `count`.
+    unsafe { core::arch::asm!("mov {:e}, dword ptr gs:[{}]", out(reg) value, in(reg) offset, options(nostack, readonly, preserves_flags)) };
+    value
+}
+
+/// SpinLocks que a CPU corrente possui.
+pub fn spin_locks_held() -> u32 {
+    read(&SPIN_COUNTER)
+}
+
+/// Posses de SharedLock da CPU corrente.
+pub fn shared_locks_held() -> u32 {
+    read(&SHARED_COUNTER)
+}
 
 pub struct SpinLock<T> {
     locked: AtomicBool,
@@ -37,7 +93,7 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
             }
         }
-        SpinLockGuard { lock: self, flags }
+        SpinLockGuard { lock: self, flags, counted: count(&SPIN_COUNTER, 1) }
     }
 
     /// Tenta adquirir sem esperar: `None` se o lock já tem dono (no BSP,
@@ -45,7 +101,7 @@ impl<T> SpinLock<T> {
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         let flags = cpu::save_and_disable_interrupts();
         if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            Some(SpinLockGuard { lock: self, flags })
+            Some(SpinLockGuard { lock: self, flags, counted: count(&SPIN_COUNTER, 1) })
         } else {
             cpu::restore_interrupts(flags);
             None
@@ -56,6 +112,8 @@ impl<T> SpinLock<T> {
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
     flags: u64,
+    /// A posse entrou no contador da CPU (adquirida depois da publicação).
+    counted: bool,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -74,6 +132,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        if self.counted {
+            count(&SPIN_COUNTER, -1);
+        }
         cpu::restore_interrupts(self.flags);
     }
 }
@@ -120,7 +181,7 @@ impl SharedLock {
         let processor = current_processor();
         if self.depth[processor].load(Ordering::Relaxed) != 0 {
             self.depth[processor].fetch_add(1, Ordering::Relaxed);
-            return SharedLockGuard { lock: self, processor, release: Release::Nested };
+            return SharedLockGuard { lock: self, processor, release: Release::Nested, counted: count(&SHARED_COUNTER, 1) };
         }
         loop {
             let state = self.state.load(Ordering::Relaxed);
@@ -130,7 +191,7 @@ impl SharedLock {
             core::hint::spin_loop();
         }
         self.depth[processor].store(1, Ordering::Relaxed);
-        SharedLockGuard { lock: self, processor, release: Release::Shared }
+        SharedLockGuard { lock: self, processor, release: Release::Shared, counted: count(&SHARED_COUNTER, 1) }
     }
 
     /// ExAcquireResourceExclusiveLite com espera.
@@ -139,7 +200,7 @@ impl SharedLock {
         if self.depth[processor].load(Ordering::Relaxed) != 0 {
             assert!(self.owner.load(Ordering::Relaxed) == processor as u32 + 1, "SharedLock: posse exclusiva pedida com a compartilhada");
             self.depth[processor].fetch_add(1, Ordering::Relaxed);
-            return SharedLockGuard { lock: self, processor, release: Release::Nested };
+            return SharedLockGuard { lock: self, processor, release: Release::Nested, counted: count(&SHARED_COUNTER, 1) };
         }
         self.state.fetch_add(EXCLUSIVE_WAITER, Ordering::Relaxed);
         loop {
@@ -151,7 +212,7 @@ impl SharedLock {
         }
         self.owner.store(processor as u32 + 1, Ordering::Relaxed);
         self.depth[processor].store(1, Ordering::Relaxed);
-        SharedLockGuard { lock: self, processor, release: Release::Exclusive }
+        SharedLockGuard { lock: self, processor, release: Release::Exclusive, counted: count(&SHARED_COUNTER, 1) }
     }
 }
 
@@ -174,10 +235,15 @@ pub struct SharedLockGuard<'a> {
     lock: &'a SharedLock,
     processor: usize,
     release: Release,
+    /// A posse entrou no contador da CPU.
+    counted: bool,
 }
 
 impl Drop for SharedLockGuard<'_> {
     fn drop(&mut self) {
+        if self.counted {
+            count(&SHARED_COUNTER, -1);
+        }
         let depth = &self.lock.depth[self.processor];
         match self.release {
             Release::Nested => {

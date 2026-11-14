@@ -3,7 +3,9 @@
 //! A HAL só oferece as primitivas de CPU: GDT/TSS/MSRs, entrada em anel 3,
 //! a entrada de syscall (o KiSystemCall64 deste kernel, alvo do LSTAR) e o
 //! "longjmp" de volta ao chamador no término do processo ou ao fim de um
-//! intervalo de execução. Despacho, loader e números NT ficam no kernel.
+//! intervalo de execução — inclusive quando a thread bloqueia dentro de um
+//! serviço e é retomada depois na própria pilha (`context_switch`).
+//! Despacho, loader e números NT ficam no kernel.
 //!
 //! A saída de syscall é por IRETQ: sob WHPX o SYSRETQ não entrega RIP=RCX,
 //! e o IRETQ é o caminho que o próprio NT usa em KiSystemServiceExit.
@@ -29,6 +31,7 @@
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of};
 
+use crate::hal::amd64::{context_switch, native_call};
 use crate::hal::cpu;
 use crate::ntos::ex::system_services;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
@@ -746,7 +749,9 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
 }
 
 /// Um intervalo de escalonamento. A HAL só move o estado dos registradores; o
-/// kernel escolhe a thread.
+/// kernel escolhe a thread. O intervalo também termina quando a thread
+/// bloqueia dentro de um serviço (tipo de saída `EXIT_BLOCKED`): o estado do
+/// despachante volta ao de antes da entrada.
 pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     let fallback = {
         let mut state = STATE.lock();
@@ -765,6 +770,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
         assert!((0..4).any(|slot| dr7 & (3 << (slot * 2)) == 0), "user call capture: all four debug slots are in use");
     }
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
+    let native_owned = native_call::sync_active();
     block.context.set(context);
     block.exit_kind.set(0);
     block.continue_flag.set(0);
@@ -773,8 +779,109 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     load_kernel_stack(fallback);
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
+    native_call::set_sync_active(native_owned);
     let mut state = STATE.lock();
     state.frame_context = 0;
+    state.running = false;
+    result as u32
+}
+
+/// Uma syscall despachada está em curso nesta CPU: o intervalo de uma thread
+/// com CONTEXT (o anel 3 cru dos autotestes não tem). Só nela uma espera
+/// pode deixar a CPU.
+pub fn in_service() -> bool {
+    STATE.lock().running && block().context.get() != 0
+}
+
+/// O estado por CPU do serviço em curso que uma thread bloqueada leva
+/// consigo, na própria pilha, e recoloca ao ser retomada: o CONTEXT do
+/// intervalo, o quadro da syscall, as faixas preservadas do CONTEXT, a pilha
+/// do usuário (KPCR.UserRsp), o NtContinue e a posse de execução nativa. O
+/// callback de instrumentação é do processo e não viaja com a thread.
+struct SuspendedService {
+    context: u64,
+    frame_context: u64,
+    service_frame: u64,
+    keep: ([bool; CONTEXT_SIZE], [u8; CONTEXT_SIZE]),
+    user_rsp: u64,
+    continue_flag: u32,
+    continue_rcx: u64,
+    continue_r11: u64,
+    native_owned: u64,
+}
+
+/// A thread corrente bloqueia dentro do serviço em curso (o lado de saída do
+/// KiSwapContext): leva o estado do serviço, salva o quadro de troca, grava
+/// o RSP em `kernel_stack` (KTHREAD.KernelStack) e devolve a CPU ao
+/// despachante, cujo intervalo termina com `EXIT_BLOCKED`. Retorna quando o
+/// despachante a retoma ([`resume_kernel_context`]), com o estado de volta.
+pub fn block_in_service(kernel_stack: &Field<u64>) {
+    assert!(in_service(), "bloqueio fora de um servico despachado");
+    let block = block();
+    let (frame_context, service_frame) = {
+        let mut state = STATE.lock();
+        (core::mem::replace(&mut state.frame_context, 0), core::mem::replace(&mut state.service_frame, 0))
+    };
+    let saved = SuspendedService {
+        context: block.context.get(),
+        frame_context,
+        service_frame,
+        keep: *CONTEXT_KEEP.lock(),
+        user_rsp: pcr::current().user_rsp.get(),
+        continue_flag: block.continue_flag.get(),
+        continue_rcx: block.continue_rcx.get(),
+        continue_r11: block.continue_r11.get(),
+        native_owned: native_call::sync_active(),
+    };
+    // SAFETY: dentro de um intervalo despachado, na pilha de kernel da
+    // própria thread (`ke::context_switch::can_block`), que o ceifador não
+    // devolve enquanto ela está bloqueada; a célula é o KernelStack da
+    // KTHREAD corrente.
+    unsafe { context_switch::block(kernel_stack.address() as *mut u64) };
+    let block = self::block();
+    block.context.set(saved.context);
+    block.continue_flag.set(saved.continue_flag);
+    block.continue_rcx.set(saved.continue_rcx);
+    block.continue_r11.set(saved.continue_r11);
+    pcr::current().user_rsp.set(saved.user_rsp);
+    *CONTEXT_KEEP.lock() = saved.keep;
+    native_call::set_sync_active(saved.native_owned);
+    let mut state = STATE.lock();
+    state.frame_context = saved.frame_context;
+    state.service_frame = saved.service_frame;
+}
+
+/// O lado de entrada do KiSwapContext: retoma a thread corrente, bloqueada
+/// num serviço com o quadro de troca em `saved_rsp`, na pilha dela, com
+/// KPRCB.RspBase e TSS.RSP0 na InitialStack dela e o GS do usuário (`teb`)
+/// no KernelGSbase, como num intervalo. Volta quando o intervalo termina (o
+/// serviço concluído ou outro bloqueio) e devolve o resultado dele, como
+/// [`exec_user_context`].
+pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
+    let fallback = {
+        let mut state = STATE.lock();
+        assert!(state.ready && !state.running, "resumeKernelContext: invalid execution state");
+        state.running = true;
+        state.fallback_stack
+    };
+    assert_boot_processor();
+    let stack = dispatch_stack(fallback);
+    load_kernel_stack(stack);
+    let block = block();
+    let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
+    let native_owned = native_call::sync_active();
+    block.exit_kind.set(0);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    // SAFETY: `saved_rsp` é o KernelStack que `block_in_service` gravou na
+    // pilha viva da thread corrente, ainda não retomado.
+    let result = unsafe { context_switch::resume(saved_rsp) };
+    load_kernel_stack(fallback);
+    block.context.set(0);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
+    native_call::set_sync_active(native_owned);
+    let mut state = STATE.lock();
+    state.frame_context = 0;
+    state.service_frame = 0;
     state.running = false;
     result as u32
 }

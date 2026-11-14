@@ -250,13 +250,11 @@ pub fn begin(pointer: u64, cache_aware: bool) -> Result<RundownRequest, KernelEr
     Ok(request)
 }
 
-/// ExWaitForRundownProtectionRelease: avança o dispatcher entre consultas.
+/// ExWaitForRundownProtectionRelease: numa syscall a thread bloqueia até a
+/// última liberação; fora dela o dispatcher avança entre consultas.
 pub fn wait_ex(pointer: u64, cache_aware: bool) -> Result<(), KernelError> {
     let mut request = begin(pointer, cache_aware)?;
-    while !request.poll() {
-        dispatcher::pump_kernel();
-    }
-    Ok(())
+    crate::ntos::ke::context_switch::acquire_until(|| Ok(request.poll().then_some(())), dispatcher::pump_kernel)
 }
 
 pub fn wait(pointer: u64) -> Result<(), KernelError> {

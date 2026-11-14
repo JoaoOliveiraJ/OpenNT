@@ -143,8 +143,30 @@ fn delay_pump() {
     scheduler::tick(-1);
 }
 
-/// KeDelayExecutionThread cooperativo: o prazo relativo usa o uptime, o
-/// absoluto acompanha a hora do sistema.
+/// O pump do atraso não alertável: o escalonador no máximo a cada 2 ms.
+fn throttled_delay_pump() {
+    super::interrupt_object::service_during_wait();
+    check_timers();
+    let _ = dpc::run_queue();
+    // Trabalho pendente pode produzir a condição de outra operação.
+    work_items::run_queue();
+    let now = clock::uptime_ms();
+    let tick = {
+        let mut last = LAST_DELAY_TICK.lock();
+        let due = now - *last >= 2;
+        if due {
+            *last = now;
+        }
+        due
+    };
+    if tick {
+        scheduler::tick(-1);
+    }
+}
+
+/// KeDelayExecutionThread: o prazo relativo usa o uptime, o absoluto
+/// acompanha a hora do sistema. Numa syscall a thread bloqueia até o prazo
+/// (`context_switch::wait_until`); fora dela a espera gira o pump.
 pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: bool) -> Result<u32, KernelError> {
     // Interval pode vir do modo usuário (NtDelayExecution): leitura sondada.
     let interval = guest::try_read::<i64>(interval_pointer)?;
@@ -156,28 +178,10 @@ pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: b
     if alertable {
         return Ok(thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut || expired().then_some(0), delay_pump));
     }
-    loop {
-        super::interrupt_object::service_during_wait();
-        check_timers();
-        let _ = dpc::run_queue();
-        // Trabalho pendente pode produzir a condição de outra operação.
-        work_items::run_queue();
-        let now = clock::uptime_ms();
-        let tick = {
-            let mut last = LAST_DELAY_TICK.lock();
-            let due = now - *last >= 2;
-            if due {
-                *last = now;
-            }
-            due
-        };
-        if tick {
-            scheduler::tick(-1);
-        }
-        if expired() {
-            return Ok(0);
-        }
-    }
+    // Uma volta do pump antes da primeira consulta: um atraso nulo ainda
+    // entrega o trabalho pendente.
+    throttled_delay_pump();
+    Ok(super::context_switch::wait_until(&mut || expired().then_some(0), throttled_delay_pump))
 }
 
 pub fn pending_count() -> usize {

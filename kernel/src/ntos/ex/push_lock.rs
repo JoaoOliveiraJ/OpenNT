@@ -250,12 +250,11 @@ impl PushLockRequest {
     }
 }
 
+/// Numa syscall a thread bloqueia até a posse; fora dela o dispatcher avança
+/// entre consultas.
 fn acquire(pointer: u64, shared: bool, flags: u32) -> Result<(), KernelError> {
     let mut request = begin(pointer, shared, flags)?;
-    while request.poll()?.is_none() {
-        dispatcher::pump_kernel();
-    }
-    Ok(())
+    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel).map(|_| ())
 }
 
 /// O último leitor acompanha a contagem do bloco antigo e assume o despertar.

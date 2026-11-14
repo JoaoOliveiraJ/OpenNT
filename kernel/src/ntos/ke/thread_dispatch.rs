@@ -478,6 +478,11 @@ pub fn owner(thread: u64) -> Option<Owner> {
     STATE.lock().owners.get(&thread).copied()
 }
 
+/// A thread da execução em curso (o topo da pilha de execuções), se há uma.
+pub fn active_thread() -> Option<u64> {
+    STATE.lock().active.as_ref().map(|active| active.pointer)
+}
+
 // ---- ciclos de thread e cessão do processador -----------------------------
 //
 // (append de `ke-processors` ao ke/thread_dispatch.rs. Usa o que o arquivo

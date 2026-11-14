@@ -241,10 +241,10 @@ categoria = "Núcleo do kernel"
 icone = "clock"
 descricao = "Os objetos de espera do NT (eventos, timers, APCs e DPCs), que drivers e o kernel usam para esperar e sinalizar."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/ke/dispatcher.rs", "kernel/src/ntos/ke/apc.rs", "kernel/src/ntos/ke/timer.rs", "kernel/src/ntos/ke/dpc.rs"]
-testes = ["fase3", "selftest"]
+caminhos = ["kernel/src/ntos/ke/dispatcher.rs", "kernel/src/ntos/ke/apc.rs", "kernel/src/ntos/ke/timer.rs", "kernel/src/ntos/ke/dpc.rs", "kernel/src/ntos/ke/context_switch.rs", "kernel/src/hal/amd64/context_switch.rs"]
+testes = ["fase3", "fase7", "selftest"]
 fase = "3"
-notas = "Interlocked*, spin locks, push locks, rundown e contagens de referência usam instruções atômicas de verdade (lock cmpxchg/xadd), como no NT, seguras com várias CPUs."
+notas = "Interlocked*, spin locks, push locks, rundown e contagens de referência usam instruções atômicas de verdade (lock cmpxchg/xadd), como no NT, seguras com várias CPUs. Como no Windows, uma thread de programa que espera dentro de uma chamada de sistema (um evento, um mutex, um recurso, um atraso) sai da CPU: o kernel guarda os registradores dela na própria pilha de kernel e roda outra thread, e quando a espera termina a retoma exatamente de onde parou. Esperar com um spin lock retido, ou em nível de interrupção alto com prazo, para o sistema com um diagnóstico, como no NT."
 
 [[componente]]
 nome = "Gerenciador de objetos e namespace"

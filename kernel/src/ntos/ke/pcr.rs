@@ -57,10 +57,15 @@ pub mod layout {
     pub const PRCB_RSP_BASE: u64 = PRCB + offset_of!(Kprcb, rsp_base) as u64;
     /// Bloco de execução de usuário da CPU, alinhado a 64 depois da KPCR.
     pub const USER_EXECUTION: u64 = (size_of::<Kpcr>() as u64 + 63) & !63;
+    /// Contadores de posse de SpinLock e de SharedLock da CPU
+    /// (`rtl::sync`), logo depois do bloco de execução de usuário.
+    pub const SPIN_LOCKS_HELD: u64 = (USER_EXECUTION + size_of::<UserExecutionBlock>() as u64 + 15) & !15;
+    pub const SHARED_LOCKS_HELD: u64 = SPIN_LOCKS_HELD + 4;
     pub const SIZE: u64 = 0xC000;
 
     const _: () = assert!(size_of::<Kpcr>() as u64 <= SIZE);
     const _: () = assert!(USER_EXECUTION + size_of::<UserExecutionBlock>() as u64 <= SIZE);
+    const _: () = assert!(SHARED_LOCKS_HELD + 4 <= SIZE);
     const _: () = assert!(USER_RSP == 0x10 && PRCB_CURRENT_THREAD == 0x188 && PRCB_RSP_BASE == 0x1A8);
 }
 
@@ -197,6 +202,9 @@ pub fn init() -> Result<(), KernelError> {
     // Só depois de materializar os campos ativa a PCR como base de GS.
     cpu::write_msr(GS_BASE_MSR, base);
     ADDRESS.store(base, Ordering::Release);
+    // Daqui em diante toda CPU que executa o kernel tem o GS na sua KPCR (os
+    // APs o carregam na entrada): as posses de lock passam a ser contadas.
+    crate::rtl::sync::publish_lock_counters(layout::SPIN_LOCKS_HELD, layout::SHARED_LOCKS_HELD);
     debug_print!("[pcr] KPCR em {:#x} — GS base ativa (IA32_GS_BASE)", base);
     Ok(())
 }

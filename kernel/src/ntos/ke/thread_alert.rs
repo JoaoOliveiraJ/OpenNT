@@ -7,7 +7,7 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{thread_dispatch, thread_lock};
+use super::{context_switch, thread_dispatch, thread_lock};
 use crate::ntos::inc::types::{Kthread, NtStruct};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -237,18 +237,28 @@ impl AlertWait {
     }
 }
 
-/// Espera cooperativa: `poll` devolve `Some(status)` quando pronta; `pump`
-/// entrega as demais threads entre tentativas.
+/// Espera alertável: `poll` devolve `Some(status)` quando pronta; um alerta
+/// ou uma APC de usuário a interrompe. Dentro de uma syscall a thread
+/// bloqueia (`context_switch::block_current`) com a espera armada; fora
+/// dela `pump` entrega as demais threads entre tentativas.
 pub fn cooperate(thread: u64, wait_mode: u8, alertable: bool, poll: &mut dyn FnMut() -> Option<u32>, pump: fn()) -> u32 {
     let Ok(mut alerts) = wait(thread, wait_mode, alertable, true) else { return 0xC000_000D };
     let mut result = 0xC000_0120;
+    let mut first = true;
     loop {
         let ready = alerts.pending().or_else(&mut *poll);
         if let Some(status) = ready {
             result = status;
             break;
         }
+        if core::mem::take(&mut first) {
+            context_switch::assert_wait_allowed();
+        }
         if alerts.arm().is_err() {
+            break;
+        }
+        if context_switch::can_block() {
+            result = context_switch::block_current(&mut || alerts.pending().or_else(&mut *poll));
             break;
         }
         pump();

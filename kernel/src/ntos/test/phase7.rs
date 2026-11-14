@@ -4912,6 +4912,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::identity::run(assert);
     crate::ntos::test::multiprocess::attach_cr3::run(assert);
     crate::ntos::test::multiprocess::kernel_stacks::run(assert);
+    crate::ntos::test::multiprocess::blocking_wait::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

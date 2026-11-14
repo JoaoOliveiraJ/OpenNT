@@ -84,11 +84,9 @@ impl UnblockRequest {
     }
 }
 
-/// Conduz a operação até concluir, deixando o dispatcher progredir.
+/// Conduz a operação até concluir: numa syscall a thread bloqueia; fora
+/// dela o dispatcher progride entre consultas.
 pub fn unblock(pointer: u64, wait_block: u64) -> Result<(), KernelError> {
     let mut request = begin(pointer, wait_block);
-    while request.poll()?.is_none() {
-        dispatcher::pump_kernel();
-    }
-    Ok(())
+    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
 }

@@ -445,14 +445,11 @@ impl Request {
     }
 }
 
+/// Numa syscall a thread bloqueia até a posse; fora dela o dispatcher avança
+/// entre consultas.
 fn acquire(resource: u64, mode: Mode, wait: bool, enter_critical: bool) -> Result<u64, KernelError> {
     let mut request = begin(resource, mode, wait, enter_critical)?;
-    loop {
-        if let Some(result) = request.poll()? {
-            return Ok(result);
-        }
-        dispatcher::pump_kernel();
-    }
+    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
 }
 
 pub fn acquire_exclusive(resource: u64, wait: bool) -> Result<u64, KernelError> {

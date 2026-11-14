@@ -10,6 +10,13 @@
 //! ([`release_process`]). A execução do contexto (`exec_user_context`) é instalada pela HAL de modo
 //! usuário; os pumps de ALPC, `device_io`, worker factories, timers e pacotes
 //! de espera ocupam slots fixos do laço.
+//!
+//! Uma thread também pode bloquear dentro de uma syscall
+//! (`ke::context_switch::block_current`): o serviço fica suspenso na pilha de
+//! kernel dela ([`KernelState::Blocked`]), o intervalo termina e o laço roda
+//! as outras. A espera dela é sondada como as demais; quando conclui, o
+//! laço a retoma na própria pilha em vez de entrar no anel 3, e o serviço
+//! termina o intervalo como qualquer syscall.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -21,7 +28,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::memory;
 use super::process_state;
 use super::state::{self, probe_user_read, probe_user_write, NativeBody, Region, UserHandle, UserObject};
-use crate::ntos::ke::{apc, clock, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_priority};
+use crate::hal::amd64::context_switch::EXIT_BLOCKED;
+use crate::ntos::ke::{apc, clock, context_switch, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
 use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_information, system_process_information};
 use crate::ntos::se::token::thread as thread_tokens;
@@ -64,6 +72,19 @@ pub struct Wait {
     pub worker_factory: u64,
 }
 
+/// Onde está o fluxo de kernel da thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KernelState {
+    /// Nenhum serviço suspenso: o próximo intervalo retoma o CONTEXT de
+    /// usuário.
+    #[default]
+    User,
+    /// Bloqueada dentro de um serviço, com o quadro de troca salvo em
+    /// KTHREAD.KernelStack; `status` é o resultado da espera, publicado
+    /// quando ela conclui (a thread fica pronta para ser retomada).
+    Blocked { status: Option<u32> },
+}
+
 pub struct ThreadMut {
     pub thread_pointer: u64,
     pub process_pointer: u64,
@@ -91,6 +112,8 @@ pub struct ThreadMut {
     wait: Option<Wait>,
     /// Há uma espera instalada (mesmo enquanto é sondada fora da trava).
     waiting: bool,
+    /// Serviço suspenso na pilha de kernel da thread.
+    kernel: KernelState,
 }
 
 pub struct UserThread {
@@ -129,6 +152,7 @@ impl UserThread {
                 termination_rsp: 0,
                 wait: None,
                 waiting: false,
+                kernel: KernelState::User,
             }),
         })
     }
@@ -147,6 +171,16 @@ impl UserThread {
 
     pub fn waiting(&self) -> bool {
         self.m.lock().waiting
+    }
+
+    /// Onde está o fluxo de kernel da thread.
+    pub fn kernel_state(&self) -> KernelState {
+        self.m.lock().kernel
+    }
+
+    /// A thread tem um serviço suspenso na própria pilha de kernel.
+    pub fn blocked_in_kernel(&self) -> bool {
+        matches!(self.m.lock().kernel, KernelState::Blocked { .. })
     }
 
     /// Fábrica marcada na espera instalada (0 sem espera de worker).
@@ -278,8 +312,13 @@ pub fn drain_kernel_apcs() {
     let previous = process::get_current_thread();
     DRAINING_APCS.store(true, Ordering::Release);
     for thread in all() {
-        let (dead, context, pointer) = thread.with(|thread| (thread.dead, thread.context, thread.thread_pointer));
+        let (dead, context, pointer, blocked) = thread.with(|thread| (thread.dead, thread.context, thread.thread_pointer, matches!(thread.kernel, KernelState::Blocked { .. })));
         if dead || context == 0 || !apc::has_pending(pointer) {
+            continue;
+        }
+        // Bloqueada no kernel acima de PASSIVE_LEVEL (um fast mutex em
+        // APC_LEVEL): as APCs de kernel esperam a retomada.
+        if blocked && kernel_thread(pointer).wait_irql.get() != irql::PASSIVE_LEVEL {
             continue;
         }
         // Quem espera em APC_LEVEL não suprime as APCs especiais de outro
@@ -351,8 +390,10 @@ fn prepare_main(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntd
     attach_scheduling(thread)
 }
 
-/// Prioridades são vistas dos campos nativos (sem cópia divergente).
-fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
+/// Registra a thread no despacho (USER_RUNTIME | TID), suspensa se o
+/// `suspend_count` pede. Prioridades são vistas dos campos nativos (sem
+/// cópia divergente).
+pub fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
     let pointer = thread.pointer();
     thread_dispatch::register(pointer, thread_dispatch::USER_RUNTIME | thread.thread_id)?;
     let suspended = thread.with(|thread| {
@@ -365,8 +406,15 @@ fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Sonda as esperas das threads de `process` e põe na fila as prontas. Uma
+/// thread bloqueada no kernel é sondada mesmo suspensa ou terminada: o
+/// serviço precisa concluir (a suspensão vale na volta ao anel 3; a
+/// terminada é retomada por [`resume_terminated`]).
 fn refresh_ready_user_threads(process: u64) {
-    let mut candidates: Vec<Arc<UserThread>> = of_process(process).into_iter().filter(|thread| thread.with(|thread| !thread.dead && thread.suspend_count == 0)).collect();
+    let mut candidates: Vec<Arc<UserThread>> = of_process(process)
+        .into_iter()
+        .filter(|thread| thread.with(|thread| (!thread.dead && thread.suspend_count == 0) || matches!(thread.kernel, KernelState::Blocked { .. })))
+        .collect();
     candidates.sort_by_key(|thread| core::cmp::Reverse(thread_priority::query_priority(thread.pointer())));
     for candidate in candidates {
         let pointer = candidate.pointer();
@@ -412,6 +460,9 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
                 routine();
             }
             refresh_ready_user_threads(process_pointer);
+            if let Some(status) = resume_terminated(process_pointer, executor)? {
+                return Ok(status);
+            }
             let Some((pointer, owner)) = thread_dispatch::peek()? else {
                 if of_process(process_pointer).iter().all(|thread| thread.dead()) {
                     // SAFETY: o EPROCESS é referenciado durante o laço.
@@ -424,51 +475,49 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
                 continue;
             }
             let Some(next) = find_by_pointer(pointer) else { continue };
+            let kernel = next.kernel_state();
+            // Bloqueada no kernel com a espera ainda pendente (um alerta a
+            // pôs na fila antes da sondagem): volta a esperar.
+            if kernel == (KernelState::Blocked { status: None }) {
+                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+                continue;
+            }
             *CURRENT.lock() = Some(next.clone());
             process::set_current_thread(pointer);
             process::dispatch_thread(pointer);
             // Retorno ao modo usuário (o KiInitiateUserApc do
             // KiSystemServiceExit/KiExceptionExit): com UserApcPending ou
             // SpecialUserApcPending, o frame do KiUserApcDispatcher é
-            // montado antes de retomar o CONTEXT salvo.
-            let undeliverable = super::user_apc::deliver(&next);
-            if undeliverable != 0 {
-                return Ok(undeliverable);
-            }
-            let kernel_before = process::thread_kernel_time(pointer);
-            let started = clock::uptime_ms();
-            thread_dispatch::begin_execution(pointer)?;
-            let (context, teb) = next.with(|thread| (thread.context, thread.teb_va));
-            let status = executor(context, teb);
-            let new_state = next.with(|thread| {
-                if thread.dead {
-                    thread_dispatch::state::TERMINATED
-                } else if thread.waiting || thread.suspend_count != 0 {
-                    thread_dispatch::state::WAITING
-                } else {
-                    thread_dispatch::state::READY
+            // montado antes de retomar o CONTEXT salvo. Uma thread retomada
+            // no kernel ainda está no serviço: as APCs de usuário esperam a
+            // volta ao anel 3.
+            if kernel == KernelState::User {
+                let undeliverable = super::user_apc::deliver(&next);
+                if undeliverable != 0 {
+                    return Ok(undeliverable);
                 }
-            });
-            thread_dispatch::end_execution(pointer, new_state)?;
-            let elapsed = (clock::uptime_ms() - started) * 10_000;
-            let kernel = process::thread_kernel_time(pointer).saturating_sub(kernel_before);
-            process::account_thread(pointer, false, elapsed.saturating_sub(kernel));
-            let kind = crate::hal::amd64::usermode::block().exit_kind.get();
+            }
+            let (status, kind) = execute(&next, executor)?;
             if kind == 0 {
                 return Ok(status);
             }
-            // Captura de chamada e exceções (#DB próprio do usuário ou pendente).
-            let handler = *EXIT_HANDLER.lock();
-            let failed = match handler {
-                Some(handler) => handler(&next, kind, status),
-                None if kind == 3 => status,
-                None => 0,
-            };
-            if failed != 0 {
-                return Ok(failed);
+            // Captura de chamada e exceções (#DB próprio do usuário ou
+            // pendente); um bloqueio não é saída do serviço.
+            if kind != EXIT_BLOCKED {
+                let handler = *EXIT_HANDLER.lock();
+                let failed = match handler {
+                    Some(handler) => handler(&next, kind, status),
+                    None if kind == 3 => status,
+                    None => 0,
+                };
+                if failed != 0 {
+                    return Ok(failed);
+                }
             }
+            // A pilha de uma thread bloqueada no kernel só é devolvida
+            // depois que o serviço dela é desfeito.
             for finished in of_process(process_pointer) {
-                if finished.dead() {
+                if finished.dead() && !finished.blocked_in_kernel() {
                     release_execution_resources(&finished);
                 }
             }
@@ -476,6 +525,7 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             kernel_stack::reap();
         }
     })();
+    unwind_blocked(process_pointer, executor, caller);
     if let Some(state) = process_state::get(process_pointer) {
         state.started.store(false, Ordering::Release);
     }
@@ -483,6 +533,99 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
     process::set_current_thread(caller);
     let _ = process::dereference(process_pointer);
     result
+}
+
+/// Um intervalo da thread corrente `thread`: entra no anel 3 pelo CONTEXT
+/// salvo ou, se ela está bloqueada no kernel com a espera concluída, retoma o
+/// serviço na pilha dela (`context_switch::switch_to`). Devolve o resultado
+/// e o tipo da saída.
+fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u32, u32), KernelError> {
+    let pointer = thread.pointer();
+    let kernel_before = process::thread_kernel_time(pointer);
+    let started = clock::uptime_ms();
+    thread_dispatch::begin_execution(pointer)?;
+    let status = if thread.blocked_in_kernel() {
+        context_switch::switch_to(thread)
+    } else {
+        let (context, teb) = thread.with(|thread| (thread.context, thread.teb_va));
+        executor(context, teb)
+    };
+    let new_state = thread.with(|thread| {
+        if thread.dead {
+            thread_dispatch::state::TERMINATED
+        } else if thread.waiting || thread.suspend_count != 0 {
+            thread_dispatch::state::WAITING
+        } else {
+            thread_dispatch::state::READY
+        }
+    });
+    thread_dispatch::end_execution(pointer, new_state)?;
+    let elapsed = (clock::uptime_ms() - started) * 10_000;
+    let kernel = process::thread_kernel_time(pointer).saturating_sub(kernel_before);
+    process::account_thread(pointer, false, elapsed.saturating_sub(kernel));
+    Ok((status, crate::hal::amd64::usermode::block().exit_kind.get()))
+}
+
+/// Threads de `process` terminadas enquanto bloqueadas no kernel, com a
+/// espera concluída (o término a conclui com THREAD_IS_TERMINATING): voltam
+/// à própria pilha para desfazer o serviço, fora da fila de prontas. `Some`
+/// se uma delas encerrou o processo.
+fn resume_terminated(process: u64, executor: fn(u64, u64) -> u32) -> Result<Option<u32>, KernelError> {
+    for thread in of_process(process) {
+        if !thread.with(|thread| thread.dead && matches!(thread.kernel, KernelState::Blocked { status: Some(_) })) {
+            continue;
+        }
+        *CURRENT.lock() = Some(thread.clone());
+        process::set_current_thread(thread.pointer());
+        let (status, kind) = execute(&thread, executor)?;
+        if kind == 0 {
+            return Ok(Some(status));
+        }
+    }
+    Ok(None)
+}
+
+/// Voltas do desfazimento do fim do laço.
+const UNWIND_ROUNDS: usize = 64;
+
+/// No fim do laço de `process` nenhum serviço dele fica suspenso numa pilha
+/// de kernel: cada thread dele bloqueada no kernel é terminada (na primeira
+/// volta a espera conclui com THREAD_IS_TERMINATING) e retomada até deixar o
+/// kernel. Uma aquisição que volta a esperar (um mutex que outra bloqueada
+/// possui) é sondada nas voltas seguintes, enquanto as outras soltam o que
+/// tinham.
+fn unwind_blocked(process: u64, executor: fn(u64, u64) -> u32, caller: u64) {
+    let blocked_threads = || -> Vec<Arc<UserThread>> { of_process(process).into_iter().filter(|thread| thread.blocked_in_kernel()).collect() };
+    for round in 0..UNWIND_ROUNDS {
+        let blocked = blocked_threads();
+        if blocked.is_empty() {
+            return;
+        }
+        for thread in blocked {
+            thread.with(|thread| thread.dead = true);
+            process::set_current_thread(thread.pointer());
+            if let Some(mut wait) = thread.take_wait() {
+                match poll_wait(&mut wait) {
+                    Some(status) => finish_wait(&thread, wait, status),
+                    None if round == 0 => finish_wait(&thread, wait, THREAD_IS_TERMINATING),
+                    None => {
+                        thread.restore_wait(wait);
+                        continue;
+                    }
+                }
+            }
+            *CURRENT.lock() = Some(thread.clone());
+            if let Err(error) = execute(&thread, executor) {
+                crate::debug_print!("[thread] tid={} nao desfez o servico bloqueado: {}", thread.thread_id, error);
+            }
+        }
+        process::set_current_thread(caller);
+        dispatcher::pump_kernel();
+    }
+    let left = blocked_threads().len();
+    if left != 0 {
+        crate::debug_print!("[thread] {} thread(s) ainda bloqueada(s) no kernel no fim do processo", left);
+    }
 }
 
 fn finish_wait(thread: &UserThread, mut wait: Wait, status: u32) {
@@ -495,13 +638,19 @@ fn finish_wait(thread: &UserThread, mut wait: Wait, status: u32) {
     for entry in wait.entries.iter().flatten() {
         let _ = state::release_user_handle_reference(entry);
     }
-    let (pointer, context) = thread.with(|thread| {
+    let (pointer, context, blocked) = thread.with(|thread| {
         thread.wait = None;
         thread.waiting = false;
-        (thread.thread_pointer, thread.context)
+        // Um serviço bloqueado recebe o status na retomada; o CONTEXT de
+        // usuário recebe o resultado da syscall quando ela termina.
+        let blocked = matches!(thread.kernel, KernelState::Blocked { .. });
+        if blocked {
+            thread.kernel = KernelState::Blocked { status: Some(status) };
+        }
+        (thread.thread_pointer, thread.context, blocked)
     });
     completion_objects::activate(pointer);
-    if context != 0 {
+    if context != 0 && !blocked {
         // SAFETY: CONTEXT salvo da thread (memória do kernel).
         unsafe { Context::at(context) }.rax.set(status as u64);
     }
@@ -550,6 +699,25 @@ fn block_current(mut wait: Wait) {
         thread.wait = Some(wait);
         thread.waiting = true;
     });
+}
+
+/// Bloqueio dentro de uma syscall (`ke::context_switch::block_current`):
+/// instala a espera da thread corrente `thread` e a marca bloqueada no
+/// kernel. O laço a sonda como as demais e, quando ela conclui, publica o
+/// status e retoma o serviço na pilha da thread.
+pub fn block_in_kernel(thread: &UserThread, wait: Wait) {
+    thread.with(|thread| thread.kernel = KernelState::Blocked { status: None });
+    block_current(wait);
+}
+
+/// O status da espera de uma thread que o laço retomou no kernel; o
+/// serviço deixa de estar suspenso.
+pub fn take_kernel_wait_status(thread: &UserThread) -> u32 {
+    let state = thread.with(|thread| core::mem::take(&mut thread.kernel));
+    match state {
+        KernelState::Blocked { status: Some(status) } => status,
+        other => panic!("thread retomada no kernel sem espera concluida ({:?})", other),
+    }
 }
 
 fn conclude(wait: &mut Wait, status: u32) {
@@ -612,7 +780,10 @@ pub fn release_process(process: u64) {
         if let Some(wait) = thread.take_wait() {
             finish_wait(&thread, wait, THREAD_IS_TERMINATING);
         }
-        if in_slice != 0 && thread.with(|thread| thread.context) == in_slice {
+        // A do intervalo em curso e as bloqueadas no kernel (a espera acabou
+        // de concluir com THREAD_IS_TERMINATING) ainda têm o serviço na
+        // pilha: só morrem, e o laço as desfaz antes da próxima liberação.
+        if (in_slice != 0 && thread.with(|thread| thread.context) == in_slice) || thread.blocked_in_kernel() {
             thread.with(|thread| thread.dead = true);
             continue;
         }

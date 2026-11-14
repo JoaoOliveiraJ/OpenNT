@@ -99,6 +99,12 @@ extern "C" {
     static mut opennt_kernel_sync_active: u64;
 }
 
+/// A posse de execução nativa síncrona da CPU agora.
+pub fn sync_active() -> u64 {
+    // SAFETY: célula estática da imagem, só lida.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(opennt_kernel_sync_active)) }
+}
+
 /// Troca a posse de execução nativa síncrona e devolve a anterior: só
 /// faltas numa execução nativa possuída entram no SEH de kernel.
 pub fn set_sync_active(value: u64) -> u64 {

@@ -134,13 +134,11 @@ impl Request {
     }
 }
 
-/// Avança o dispatcher enquanto o evento não permite retomar.
+/// Espera o evento permitir retomar: numa syscall a thread bloqueia; fora
+/// dela o dispatcher avança entre consultas.
 fn acquire_with(pointer: u64, caller_controls_irql: bool, requires_guarded_region: bool) -> Result<u32, KernelError> {
     let mut request = begin(pointer, caller_controls_irql, requires_guarded_region)?;
-    while request.poll()?.is_none() {
-        dispatcher::pump_kernel();
-    }
-    Ok(0)
+    super::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
 }
 
 /// Tenta sem publicar espera; a falha restaura o IRQL elevado.

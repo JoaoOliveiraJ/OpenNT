@@ -340,6 +340,49 @@ durante a syscall), o IoGetStackLimits de uma thread nativa, o PFN estável
 depois de criar e destruir 8 threads, a IST1 da falta dupla e as pilhas de
 callout.
 
+**Esperas que bloqueiam.** Uma thread de usuário que espera dentro de uma
+syscall deixa a CPU, como no KiSwapContext do NT, em vez de girar o
+`pump_kernel` com o despachante parado. A decisão fica em
+`ke/context_switch.rs`: `can_block` exige a thread de usuário da syscall
+despachada nesta CPU (o BSP, no M0), rodando na própria pilha de kernel e
+sendo a execução em curso do `thread_dispatch` (nada aninhado: um passo do
+escalonador, uma APC drenada em nome de outra thread), IRQL abaixo de
+DISPATCH_LEVEL e nenhum SpinLock nem SharedLock retido — cada CPU conta as
+posses dos dois (`rtl/sync.rs`) em células da sua reserva de KPCR, pelo GS.
+`block_current` instala na `UserThread` uma espera cuja sondagem é a da
+própria espera (emprestada da pilha da thread), marca o serviço suspenso
+(`KernelState::Blocked`), guarda a IRQL em KTHREAD.WaitIrql e chama a
+primitiva de `hal/amd64/context_switch.rs`: o quadro de troca (rbx, rbp,
+rdi, rsi, r12-r15, RFLAGS, xmm6-xmm15, MXCSR e a palavra de controle x87, a
+união das convenções do kernel e MS x64) fica na pilha da thread, o RSP vai
+para KTHREAD.KernelStack, e a CPU sai pelo fim do intervalo
+(`user_terminate_current`) com o tipo de saída 4; a thread leva na pilha o
+estado por CPU do serviço (CONTEXT do intervalo, quadro e faixas preservadas
+da syscall, KPCR.UserRsp, NtContinue, posse de execução nativa). O laço de
+`ps/user/threads.rs` segue com as outras threads, sonda a espera no contexto
+da bloqueada (thread corrente e CR3 dela) e, quando ela conclui, retoma o
+serviço na pilha dela (`switch_to` → `usermode::resume_kernel_context`, que
+monta um quadro de despachante novo e entra no quadro salvo) em vez de entrar
+no anel 3; a syscall termina o intervalo como qualquer outra. Passam por aí
+KeWaitForSingleObject/Multiple (alertáveis ou não), KeDelayExecutionThread,
+fast/guarded mutex, ERESOURCE, push locks e rundown
+(`context_switch::wait_until`/`acquire_until`); fora de uma syscall (boot,
+threads de sistema, APCs e conclusões drenadas pelo despachante) a espera
+continua girando o pump. Como no NT, esperar de fato com prazo não nulo em
+DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema (assert).
+Uma thread terminada enquanto bloqueada tem a espera concluída com
+STATUS_THREAD_IS_TERMINATING e é retomada para desfazer o serviço antes de a
+pilha voltar ao Mm (uma aquisição continua até concluir, como a espera de um
+mutex no NT); no fim do laço nenhuma fica bloqueada. Os serviços Nt* que
+esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
+PENDING + espera sondada, sem pilha suspensa. O autoteste
+`ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
+real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
+a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
+dentro da pilha dela) e sinaliza o evento; a 1 volta na própria pilha com
+STATUS_SUCCESS e devolve 0 ao anel 3. Um segundo cenário termina a thread
+bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha).
+
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:
 
@@ -580,9 +623,10 @@ carregado é recusado.
   instrumentação, mutantes, threads, canais de `cm::service::rpc` e picos de
   `system_process_information` do processo; depois `process_state::destroy`
   fecha os handles, devolve o VAD e as imagens dos módulos. Uma thread nunca
-  é recolhida enquanto é a corrente ou está no meio de um intervalo de
-  usuário: `threads::release_process` deixa o KTHREAD dela para quando o
-  chamador trocar de volta e chamar de novo. Toda falha depois da criação
+  é recolhida enquanto é a corrente, está no meio de um intervalo de
+  usuário ou está bloqueada no kernel com o serviço na pilha:
+  `threads::release_process` deixa o KTHREAD dela para quando o chamador
+  trocar de volta (e o laço desfizer o serviço) e chamar de novo. Toda falha depois da criação
   de um processo também passa pelo término. Teste:
   `ntos/test/multiprocess/lifecycle.rs`.
 - **Memória de usuário de outro processo**: o kernel só toca a memória de

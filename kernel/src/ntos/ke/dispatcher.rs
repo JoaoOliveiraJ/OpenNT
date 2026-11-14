@@ -1,6 +1,7 @@
 //! Objetos de espera do dispatcher.
 //!
-//! Eventos, semáforos, mutants, timers e threads sinalizadas. As esperas são
+//! Eventos, semáforos, mutants, timers e threads sinalizadas. Uma espera
+//! dentro de uma syscall bloqueia a thread (`context_switch`); as outras são
 //! cooperativas: drenam timers, DPCs, work items e o escalonador enquanto
 //! aguardam o estado ou o prazo.
 
@@ -8,7 +9,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::{clock, dpc, thread_alert, timer};
+use super::{clock, context_switch, dpc, thread_alert, timer};
 use crate::ntos::inc::types::{DispatcherHeader, Field, Kevent, Kmutant, Ksemaphore, LargeInteger, ListEntry, NtStruct};
 use crate::ntos::io::work_items;
 use crate::ntos::ps::{process, scheduler};
@@ -322,30 +323,21 @@ fn deadline(timeout_pointer: u64) -> (Option<u64>, Option<u64>) {
     (timeout, timeout.map(|timeout| clock::uptime_100ns() + timeout))
 }
 
-/// KeWaitForSingleObject cooperativo.
+/// O prazo da espera venceu (zero vence de imediato).
+fn expired(timeout: Option<u64>, deadline: Option<u64>) -> bool {
+    timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline)
+}
+
+/// KeWaitForSingleObject. Numa syscall a thread bloqueia até o objeto ser
+/// sinalizado ou o prazo vencer (`context_switch::wait_until`); fora dela a
+/// espera gira o `pump_kernel`.
 pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
     let (timeout, deadline) = deadline(timeout_pointer);
+    let mut poll = || acquire_status(object, true).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     if alertable {
-        return thread_alert::cooperate(
-            process::get_current_thread(),
-            wait_mode,
-            true,
-            &mut || {
-                acquire_status(object, true)
-                    .or_else(|| deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline).then_some(STATUS_TIMEOUT))
-            },
-            pump_kernel,
-        );
+        return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
-    loop {
-        if let Some(status) = acquire_status(object, true) {
-            return status;
-        }
-        if timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline) {
-            return STATUS_TIMEOUT;
-        }
-        pump_kernel();
-    }
+    context_switch::wait_until(&mut poll, pump_kernel)
 }
 
 /// Tentativa sem espera. WaitAny (1) devolve o primeiro índice satisfeito;
@@ -384,25 +376,9 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
         return 0xC000_000D;
     }
     let (timeout, deadline) = deadline(timeout_pointer);
+    let mut poll = || try_wait_objects(&objects, wait_type).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     if alertable {
-        return thread_alert::cooperate(
-            process::get_current_thread(),
-            wait_mode,
-            true,
-            &mut || {
-                try_wait_objects(&objects, wait_type)
-                    .or_else(|| deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline).then_some(STATUS_TIMEOUT))
-            },
-            pump_kernel,
-        );
+        return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
-    loop {
-        if let Some(status) = try_wait_objects(&objects, wait_type) {
-            return status;
-        }
-        if timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline) {
-            return STATUS_TIMEOUT;
-        }
-        pump_kernel();
-    }
+    context_switch::wait_until(&mut poll, pump_kernel)
 }
