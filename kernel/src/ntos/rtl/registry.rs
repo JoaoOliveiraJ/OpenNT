@@ -54,6 +54,95 @@ const REGISTRY_OPTIONAL: u32 = 0x8000_0000;
 const QUERY_REGISTRY_REQUIRED: u32 = 0x04;
 const QUERY_REGISTRY_DIRECT: u32 = 0x20;
 const QUERY_REGISTRY_TYPECHECK: u32 = 0x100;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const REG_MULTI_SZ: u32 = 7;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+const STATUS_DATA_OVERRUN: u32 = 0xC000_003C;
+const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+/// 'Strg', o pool do ExpAllocateStringRoutine.
+const STRING_POOL_TAG: u32 = 0x6772_7453;
+
+/// O default de uma entrada sem valor, como no RtlpCallQueryRegistryRoutine
+/// do ntoskrnl 19041 (0x6b9d10): REG_NONE = nada (só o REQUIRED falha);
+/// DefaultLength 0 numa string mede o DefaultData até o terminador (o duplo
+/// no REG_MULTI_SZ), e DefaultData NULL aí é STATUS_DATA_OVERRUN.
+fn default_value(default_type: u32, data: u64, length: u32) -> Result<Option<alloc::vec::Vec<u8>>, u32> {
+    if default_type == 0 {
+        return Ok(None);
+    }
+    if length != 0 {
+        return Ok(Some(guest::read_bytes(data, length as usize)));
+    }
+    let measured = match default_type {
+        REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ if data == 0 => return Err(STATUS_DATA_OVERRUN),
+        REG_SZ | REG_EXPAND_SZ => (guest_strings::read_wide_string(data).encode_utf16().count() as u64 + 1) * 2,
+        REG_MULTI_SZ => {
+            let mut cursor = data;
+            if guest::read16(cursor) != 0 {
+                loop {
+                    while guest::read16(cursor) != 0 {
+                        cursor += 2;
+                    }
+                    cursor += 2;
+                    if guest::read16(cursor) == 0 {
+                        break;
+                    }
+                }
+            }
+            cursor - data + 2
+        }
+        _ => 0,
+    };
+    Ok(Some(guest::read_bytes(data, measured as usize)))
+}
+
+/// RtlpQueryRegistryDirect (0x6b79f0): strings vão para o UNICODE_STRING de
+/// EntryContext (Buffer NULL = alocado com o tamanho do valor, até 0xFFFE;
+/// senão precisa caber em MaximumLength; Length sem o terminador); os outros
+/// tipos até 4 bytes são copiados direto; maiores, o primeiro LONG negativo
+/// dá o tamanho do buffer, e um não negativo pede o cabeçalho
+/// (tamanho, tipo) antes dos dados.
+fn query_direct(value_type: u32, bytes: &[u8], entry_context: u64) -> u32 {
+    if matches!(value_type, REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ) {
+        let length = bytes.len().min(0xFFFE);
+        // SAFETY: o UNICODE_STRING de EntryContext do chamador de modo kernel.
+        let string = unsafe { UnicodeString::at(entry_context) };
+        if string.buffer.get() == 0 {
+            let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, length.max(2) as u64, STRING_POOL_TAG).unwrap_or(0);
+            if buffer == 0 {
+                return STATUS_NO_MEMORY;
+            }
+            string.buffer.set(buffer);
+            string.maximum_length.set(length as u16);
+        } else if length > string.maximum_length.get() as usize {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        guest::write_bytes(string.buffer.get(), &bytes[..length]);
+        string.length.set(length.saturating_sub(2) as u16);
+        return 0;
+    }
+    if bytes.len() <= 4 {
+        guest::write_bytes(entry_context, bytes);
+        return 0;
+    }
+    let head = guest::read32(entry_context) as i32;
+    if head < 0 {
+        if head.unsigned_abs() as usize >= bytes.len() {
+            guest::write_bytes(entry_context, bytes);
+            return 0;
+        }
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if head as usize >= bytes.len() + 8 {
+        guest::write32(entry_context, bytes.len() as u32);
+        guest::write32(entry_context + 4, value_type);
+        guest::write_bytes(entry_context + 8, bytes);
+        return 0;
+    }
+    STATUS_BUFFER_TOO_SMALL
+}
 
 /// RtlQueryRegistryValues[Ex]: cada entrada é processada mesmo com a chave
 /// ausente (o driver recebe o default); DIRECT escreve em EntryContext; com
@@ -92,6 +181,7 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         // RTL_QUERY_REGISTRY_TYPECHECK: o byte alto de DefaultType é o tipo
         // esperado, e o default é só o resto (REG_NONE = sem default).
         let default_type = if flags & QUERY_REGISTRY_TYPECHECK != 0 { entry.default_type.get() & 0x00FF_FFFF } else { entry.default_type.get() };
+        let expected_type = entry.default_type.get() >> 24;
         let default_data = entry.default_data.get();
         let default_length = entry.default_length.get();
         if routine == 0 && name_pointer == 0 {
@@ -108,68 +198,31 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         }
         let entry = queried.and_then(|(_, value)| value);
         let (value_type, value_bytes) = match &entry {
-            Some(value) => (value.value_type, Some(value.data.clone())),
-            None if default_type != 0 => {
-                // DefaultLength 0 num default de texto: o tamanho vem do
-                // próprio texto com o NUL (o NUL duplo num REG_MULTI_SZ). Sem
-                // texto (DefaultData NULL), o RtlpCallQueryRegistryRoutine
-                // devolve STATUS_DATA_OVERRUN e a consulta para ali.
-                if matches!(default_type, 1 | 2 | 7) && default_length == 0 && default_data == 0 {
-                    status = 0xC000_003Cu32 as i32 as i64 as u64;
+            Some(value) => (value.value_type, Ok(Some(value.data.clone()))),
+            None => (default_type & 0xFF, default_value(default_type & 0xFF, default_data, default_length)),
+        };
+        debug_print!("[rtl]   [{}] \"{}\" flags=0x{:x} routine=0x{:x} -> {}", index, value_name, flags, routine, if entry.is_some() { "valor" } else if matches!(value_bytes, Ok(Some(_))) { "default" } else { "ausente" });
+        let bytes = match value_bytes {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                if flags & QUERY_REGISTRY_REQUIRED != 0 {
+                    status = 0xC000_0034u32 as i32 as i64 as u64;
                     break;
                 }
-                let length = match default_type {
-                    1 | 2 if default_length == 0 && default_data != 0 => (guest_strings::read_wide_string(default_data).encode_utf16().count() + 1) * 2,
-                    7 if default_length == 0 && default_data != 0 => {
-                        let mut cursor = default_data;
-                        loop {
-                            let units = guest_strings::read_wide_string(cursor).encode_utf16().count() as u64;
-                            cursor += (units + 1) * 2;
-                            if units == 0 {
-                                break;
-                            }
-                        }
-                        (cursor - default_data) as usize
-                    }
-                    _ => default_length as usize,
-                };
-                (default_type, Some(guest::read_bytes(default_data, length)))
-            }
-            None => (0, None),
-        };
-        debug_print!("[rtl]   [{}] \"{}\" flags=0x{:x} routine=0x{:x} -> {}", index, value_name, flags, routine, if entry.is_some() { "valor" } else if value_bytes.is_some() { "default" } else { "ausente" });
-        let Some(bytes) = value_bytes else {
-            if flags & QUERY_REGISTRY_REQUIRED != 0 {
-                status = 0xC000_0034u32 as i32 as i64 as u64;
-                break;
-            }
-            continue;
-        };
-        if flags & QUERY_REGISTRY_DIRECT != 0 {
-            // REG_SZ, REG_EXPAND_SZ e REG_MULTI_SZ vão para o UNICODE_STRING
-            // de EntryContext (RtlpQueryRegistryDirect: Buffer NULL = pool
-            // paginado 'Strg' do ExpAllocateStringRoutine, que o driver libera
-            // com ExFreePool); os demais tipos são copiados como dado cru.
-            if matches!(value_type, 1 | 2 | 7) {
-                // SAFETY: EntryContext de uma entrada DIRECT de string é um UNICODE_STRING do driver.
-                let string = unsafe { crate::ntos::inc::types::UnicodeString::at(entry_context) };
-                if string.buffer.get() == 0 {
-                    let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, bytes.len().max(2) as u64, 0x6772_7453).unwrap_or(0);
-                    if buffer == 0 {
-                        status = 0xC000_009Au32 as i32 as i64 as u64;
-                        break;
-                    }
-                    string.buffer.set(buffer);
-                    string.maximum_length.set(bytes.len() as u16);
-                } else if bytes.len() > string.maximum_length.get() as usize {
-                    status = 0xC000_0023u32 as i32 as i64 as u64;
-                    break;
-                }
-                guest::write_bytes(string.buffer.get(), &bytes);
-                string.length.set(bytes.len().saturating_sub(2) as u16);
                 continue;
             }
-            guest::write_bytes(entry_context, &bytes);
+            Err(failure) => {
+                status = failure as i32 as i64 as u64;
+                break;
+            }
+        };
+        if flags & QUERY_REGISTRY_DIRECT != 0 {
+            // RTL_QUERY_REGISTRY_TYPECHECK: o tipo esperado no byte alto do DefaultType.
+            let direct = if flags & QUERY_REGISTRY_TYPECHECK != 0 && expected_type != value_type { STATUS_OBJECT_TYPE_MISMATCH } else { query_direct(value_type, &bytes, entry_context) };
+            if direct != 0 {
+                status = direct as i32 as i64 as u64;
+                break;
+            }
             continue;
         }
         if routine != 0 {

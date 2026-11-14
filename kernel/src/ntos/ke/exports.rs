@@ -233,7 +233,7 @@ fn bug_check(call: &Call) -> Result<u64, KernelError> {
     bugcheck::raise_bug_check(call.arg(1) as u32, 0, 0, 0, 0)
 }
 fn expand_kernel_stack_and_callout_ex(call: &Call) -> Result<u64, KernelError> {
-    Ok(callout::expand_kernel_stack_and_callout(call.arg(1), call.arg(2), call.arg(5)) as i64 as u64)
+    Ok(signed_status(callout::expand_kernel_stack_and_callout(call.arg(1), call.arg(2), call.arg(3))))
 }
 /// Em x86-64 a coerência de DMA é do hardware.
 fn flush_io_buffers(_: &Call) -> Result<u64, KernelError> {

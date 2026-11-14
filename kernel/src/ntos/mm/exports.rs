@@ -957,3 +957,18 @@ pub mod mm_prefetch_pages {
 
     pub static GROUP: Group = Group { name: "mm-prefetch-pages", names: &["MmPrefetchPages"], handlers: &[prefetch_pages], data_exports: &[] };
 }
+
+pub mod mm_change_image_protection {
+    //! MmChangeImageProtection; a lógica mora em `mm/sysload.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::sysload;
+    use crate::rtl::KernelError;
+
+    /// MmChangeImageProtection(Mdl, Address, Size, Mode) -> NTSTATUS.
+    fn change_image_protection(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sysload::change_image_protection(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-change-image-protection", names: &["MmChangeImageProtection"], handlers: &[change_image_protection], data_exports: &[] };
+}

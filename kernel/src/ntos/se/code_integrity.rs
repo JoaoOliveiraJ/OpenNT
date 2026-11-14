@@ -40,7 +40,10 @@ struct CiCallbacks {
     _reserved_68: Reserved<0x8>,
     /// Nível de assinatura exigido: precisa ficar NULL neste contrato.
     required_signing_level: Field<u64>,
-    _reserved_78: Reserved<0x68>,
+    _reserved_78: Reserved<0x18>,
+    /// CiValidateDynamicCodePages (o MmChangeImageProtection a chama).
+    validate_dynamic_code_pages: Field<u64>,
+    _reserved_98: Reserved<0x48>,
     /// Versão/flags do contrato, informados pelo kernel.
     kernel_version: Field<u64>,
 }
@@ -99,6 +102,7 @@ const _: () = {
     assert!(offset_of!(CiCallbacks, validate_image_header) == 0x20);
     assert!(offset_of!(CiCallbacks, initialize_policy) == 0x60);
     assert!(offset_of!(CiCallbacks, required_signing_level) == 0x70);
+    assert!(offset_of!(CiCallbacks, validate_dynamic_code_pages) == 0x90);
     assert!(offset_of!(CiCallbacks, kernel_version) == 0xE0);
     assert!(core::mem::size_of::<CiPrivateCallbacks>() == 0x40);
     assert!(offset_of!(CiPrivateCallbacks, set_runtime_signing_level) == 0x20);
@@ -398,6 +402,20 @@ fn query_information(buffer: u64, length: u32, returned: u64) -> Result<u32, Ker
         guest::try_write::<u32>(returned, written)?;
     }
     Ok(status)
+}
+
+/// SeCiCallbacks->CiValidateDynamicCodePages(Contexto, Mdl, Endereço, Tamanho,
+/// Deslocamento na imagem), como o MmChangeImageProtection do ntoskrnl
+/// 19041 a chama: `None` quando a CI não publicou o callback (o kernel
+/// devolve então STATUS_NOT_IMPLEMENTED).
+pub fn validate_dynamic_code_pages(context: u64, mdl: u64, address: u64, size: u64, offset: u64) -> Option<u32> {
+    let routine = callback(|table| &table.validate_dynamic_code_pages).ok()?;
+    Some(invoke(routine, &[context, mdl, address, size, offset]))
+}
+
+/// A CI publicou o CiValidateDynamicCodePages.
+pub fn dynamic_code_validator_present() -> bool {
+    callback(|table| &table.validate_dynamic_code_pages).is_ok()
 }
 
 /// Carrega a ci.dll, chama o CiInitialize com os provedores privados reais,

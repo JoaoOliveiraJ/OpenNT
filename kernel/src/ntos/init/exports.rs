@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 416] {
+fn groups() -> [&'static Group; 422] {
     [
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
         &crate::ntos::alpc::exports::lpc::GROUP,
@@ -469,10 +469,15 @@ fn groups() -> [&'static Group; 416] {
         &crate::ntos::rtl::exports::rtl_self_relative_sd2::GROUP,
         &crate::ntos::fsrtl::exports::fsrtl_ecp_initialize::GROUP,
         &crate::ntos::kd::exports::kd_break_point::GROUP,
-
         &crate::ntos::ke::exports::ke_device_queue::GROUP,
         &crate::ntos::io::exports::io_start_packet_by_key::GROUP,
         &crate::ntos::ob::exports::zw_set_information_object::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_towupper::GROUP,
+        &crate::hal::exports::hvi_enlightenment::GROUP,
+        &crate::ntos::io::exports::io_interface_property_data::GROUP,
+        &crate::ntos::io::exports::zw_query_ea_file::GROUP,
+        &crate::ntos::mm::exports::mm_change_image_protection::GROUP,
+        &crate::ntos::ex::exports::ex_update_license_data::GROUP,
     ]
 }
 

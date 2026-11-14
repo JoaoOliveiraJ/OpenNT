@@ -2624,3 +2624,19 @@ pub mod rtl_self_relative_sd2 {
 
     pub static GROUP: Group = Group { name: "rtl-self-relative-sd2", names: &["RtlSelfRelativeToAbsoluteSD2"], handlers: &[self_relative_to_absolute_sd2], data_exports: &[] };
 }
+
+pub mod rtl_crt_towupper {
+    //! towupper: no ntoskrnl 19041 (0x3d36d0) é só a chamada ao
+    //! RtlUpcaseUnicodeChar, cuja lógica mora em `rtl/nls_translation.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::nls_translation;
+    use crate::rtl::KernelError;
+
+    /// towupper(c) -> wint_t em ax.
+    fn towupper(call: &Call) -> Result<u64, KernelError> {
+        Ok(nls_translation::upcase_unicode_char(call.arg(1) as u16) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-crt-towupper", names: &["towupper"], handlers: &[towupper], data_exports: &[] };
+}

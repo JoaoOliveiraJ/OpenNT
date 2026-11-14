@@ -1,10 +1,12 @@
 //! Contextos de licenciamento do boot.
 //!
 //! A política capturada passa para uma SECTION real antes de o índice ser
-//! publicado. Este dono só faz a primeira publicação; não há serviço de
-//! atualização ou ativação de ProductPolicy em execução. As operações de
+//! publicado (`publish_boot`); a mesma rotina (`update`, o
+//! SLUpdateLicenseDataInternal) atende o ExUpdateLicenseData em execução,
+//! trocando a seção publicada e gravando o ProductPolicy. As operações de
 //! seção (ZwCreateSection, referência do handle, MmMapViewInSystemSpace)
-//! entram por [`set_section_backend`] com as seções da fase 7.
+//! são os exports do próprio kernel; um teste pode trocá-las por
+//! [`set_section_backend`].
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -28,6 +30,11 @@ const VALUE_TAG: u32 = 0x2053_4C53;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_DATA_ERROR: u32 = 0xC000_003E;
+const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
+const STATUS_SOME_NOT_MAPPED: u32 = 0x0000_0107;
+const REG_BINARY: u32 = 3;
+/// Chave do valor ProductPolicy.
+const PRODUCT_OPTIONS: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\ProductOptions";
 
 /// Operações de seção usadas pela publicação.
 #[derive(Clone, Copy)]
@@ -44,10 +51,61 @@ pub struct SectionBackend {
     pub dereference_section: fn(u64),
 }
 
-static BACKEND: SpinLock<Option<SectionBackend>> = SpinLock::new(None);
+/// As operações de seção do próprio kernel (os exports do Mm e do Ob), o
+/// padrão; um teste pode trocá-las ou retirá-las.
+static BACKEND: SpinLock<Option<SectionBackend>> = SpinLock::new(Some(KERNEL_BACKEND));
+
+const KERNEL_BACKEND: SectionBackend = SectionBackend {
+    create_section: kernel_create_section,
+    reference_handle: kernel_reference_handle,
+    close_handle: kernel_close_handle,
+    map_system_view: kernel_map_system_view,
+    unmap_system_view: kernel_unmap_system_view,
+    reference_section: kernel_reference_section,
+    dereference_section: kernel_dereference_section,
+};
+
+fn kernel_call(name: &str, arguments: &[u64]) -> u32 {
+    crate::ntos::init::exports::invoke_handler(name, arguments).map_or(STATUS_NO_MEMORY, |status| status as u32)
+}
+
+fn kernel_create_section(handle: u64, access: u32, attributes: u64, size: u64, protect: u32, flags: u32, file: u64) -> u32 {
+    kernel_call("ZwCreateSection", &[handle, access as u64, attributes, size, protect as u64, flags as u64, file])
+}
+
+/// ObReferenceObjectByHandle(Handle, 0, NULL, KernelMode, &Section, NULL).
+fn kernel_reference_handle(handle: u64, object: u64) -> Option<u32> {
+    Some(kernel_call("ObReferenceObjectByHandle", &[handle, 0, 0, 0, object, 0]))
+}
+
+fn kernel_close_handle(handle: u64) {
+    kernel_call("ZwClose", &[handle]);
+}
+
+/// MmMapViewInSystemSpace(Section, &MappedBase, &ViewSize).
+fn kernel_map_system_view(section: u64, base: u64, size: u64, _offset: u64, _unused: u64) -> u32 {
+    kernel_call("MmMapViewInSystemSpace", &[section, base, size])
+}
+
+fn kernel_unmap_system_view(view: u64) {
+    kernel_call("MmUnmapViewInSystemSpace", &[view]);
+}
+
+fn kernel_reference_section(section: u64) {
+    kernel_call("ObfReferenceObject", &[section]);
+}
+
+fn kernel_dereference_section(section: u64) {
+    kernel_call("ObfDereferenceObject", &[section]);
+}
 
 pub fn set_section_backend(backend: Option<SectionBackend>) {
     *BACKEND.lock() = backend;
+}
+
+/// Volta às operações de seção do kernel.
+pub fn restore_kernel_section_backend() {
+    *BACKEND.lock() = Some(KERNEL_BACKEND);
 }
 
 fn backend() -> Result<SectionBackend, KernelError> {
@@ -160,6 +218,97 @@ pub fn publish_boot(context: u64, blob: u64, size: u32) -> Result<u32, KernelErr
     if state.primary.get() != blob || state.view.get() != 0 || state.section.get() != 0 {
         return Err(KernelError::new("license boot publication requires a new context with its primary blob"));
     }
+    update(context, blob, size)
+}
+
+/// A política em `blob` é a mesma já publicada: cabeçalho, valores e
+/// rodapé iguais byte a byte.
+fn same_policy(view: u64, blob: u64) -> bool {
+    let (published, candidate) = (header_at(view), header_at(blob));
+    let fields = |header: &layout::PolicyHeader| [header.total_size.get(), header.values_size.get(), header.end_marker_size.get(), header.flags.get(), header.version.get()];
+    if fields(published) != fields(candidate) {
+        return false;
+    }
+    let header_size = layout::PolicyHeader::SIZE;
+    let values = candidate.values_size.get() as usize;
+    let footer = candidate.end_marker_size.get() as usize;
+    guest::read_bytes(view + header_size, values) == guest::read_bytes(blob + header_size, values) && guest::read_bytes(view + header_size + values as u64, footer) == guest::read_bytes(blob + header_size + values as u64, footer)
+}
+
+/// Algum valor marcado com o flag 2 entrou ou mudou de dados entre o índice
+/// publicado e o novo (`descriptors`, ordenado); valores que saem não contam.
+fn flagged_values_changed(state: &ExpLicenseState, descriptors: u64, count: u32) -> bool {
+    const FLAGGED: u32 = 2;
+    let (mut new, mut old) = (0u32, 0u32);
+    let published = state.descriptor_count.get();
+    while new < count {
+        let candidate = descriptors + new as u64 * layout::Descriptor::SIZE;
+        let candidate_entry = layout::descriptor_at(candidate).entry.get();
+        let flagged = layout::entry_at(candidate_entry).flags.get() & FLAGGED != 0;
+        if old >= published {
+            if flagged {
+                return true;
+            }
+            new += 1;
+            continue;
+        }
+        let current = state.descriptor_array() + old as u64 * layout::Descriptor::SIZE;
+        let order = license_index::compare(candidate, current);
+        if order < 0 {
+            if flagged {
+                return true;
+            }
+            new += 1;
+        } else if order > 0 {
+            old += 1;
+        } else {
+            if flagged {
+                let current_entry = layout::descriptor_at(current).entry.get();
+                let (left, right) = (layout::entry_at(candidate_entry), layout::entry_at(current_entry));
+                let data = |entry: u64, header: &layout::PolicyEntry| guest::read_bytes(entry + layout::PolicyEntry::SIZE + header.name_size.get() as u64, header.data_size.get() as usize);
+                if left.data_size.get() != right.data_size.get() || data(candidate_entry, left) != data(current_entry, right) {
+                    return true;
+                }
+            }
+            new += 1;
+            old += 1;
+        }
+    }
+    false
+}
+
+/// ExpPutLicenseDataIntoRegistry (0x94DBFC): a política publicada volta ao
+/// valor REG_BINARY ProductPolicy de Control\ProductOptions, sob o push lock
+/// da política.
+fn put_into_registry(context: u64) -> Result<u32, KernelError> {
+    let state = context_at(context);
+    locked(context, false, || {
+        let view = state.view.get();
+        if view == 0 {
+            return Ok(0);
+        }
+        let handle = crate::ntos::cm::registry::open_or_create(PRODUCT_OPTIONS, None)?;
+        let bytes = guest::read_bytes(view, header_at(view).total_size.get() as usize);
+        crate::ntos::cm::registry::set_value(handle, "ProductPolicy", REG_BINARY, bytes);
+        crate::ntos::cm::registry::close_handle(handle);
+        Ok(0)
+    })
+}
+
+/// SLUpdateLicenseDataInternal (0x94E200), a publicação de uma política no
+/// contexto: a do boot (o buffer primário do contexto novo) e a atualização
+/// em execução (ExUpdateLicenseData, contexto sem buffer primário). Depois da
+/// validação, uma atualização com a mesma política publicada só renova o
+/// registro de estado (STATUS_OBJECT_NAME_EXISTS); senão a política vai para
+/// uma SECTION nova mapeada no espaço do sistema, o índice é refeito e
+/// trocado sob o push lock, a seção e a visão antigas são soltas, e a
+/// atualização em execução grava a política no Registry e avisa os
+/// interessados. Um valor marcado (flag 2) que entra ou muda devolve
+/// STATUS_SOME_NOT_MAPPED. Os erros de formato marcam um estado local zero
+/// como violado (5). O modo de licença reduzida (modo seguro ou WinPE) não
+/// existe no OpenNT.
+pub fn update(context: u64, blob: u64, size: u32) -> Result<u32, KernelError> {
+    let state = context_at(context);
     let mut status = validate_publication(blob, size);
     let mut frame = 0u64;
     let mut section = 0u64;
@@ -168,15 +317,44 @@ pub fn publish_boot(context: u64, blob: u64, size: u32) -> Result<u32, KernelErr
     let mut published = false;
     let mut publication_reference = false;
     let mut sections: Option<SectionBackend> = None;
+    // [rsp+0x44]: atualização sem buffer primário ou política com o flag 1.
+    let mut reset_grace = false;
+    let mut released: (u64, u64) = (0, 0);
     let result = (|| -> Result<u32, KernelError> {
         if status != 0 {
             return Ok(status);
         }
+        state.subscription_cached.set(0);
+        let mut primary = 0u64;
+        let mut identical = false;
+        locked(context, false, || {
+            primary = state.primary.get();
+            reset_grace = primary == 0;
+            if primary == 0 && header_at(blob).flags.get() & 1 != 0 {
+                status = STATUS_INVALID_PARAMETER;
+            } else if primary == 0 && state.view.get() != 0 && state.corrupt.get() == 0 {
+                identical = same_policy(state.view.get(), blob);
+            }
+            Ok(())
+        })?;
+        if status != 0 {
+            return Ok(status);
+        }
+        if identical {
+            let mut tampered = false;
+            locked(context, true, || {
+                tampered = license_special::read_local_state(context)? != 0;
+                license_state::update_snapshot(context, &initial_state(), 7, 1)?;
+                Ok(())
+            })?;
+            if tampered {
+                notify_change(context);
+            }
+            status = STATUS_OBJECT_NAME_EXISTS;
+            return Ok(status);
+        }
         let backend = backend()?;
         sections = Some(backend);
-        state.subscription_cached.set(0);
-        // O contexto ainda não é público; os locks seguem a ordem dos leitores.
-        locked(context, false, || Ok(state.primary.get()))?;
         frame = kernel_pool::allocate(SectionFrame::SIZE, AllocateOptions { zero: true, paged: true, tag: OWNER_TAG, ..Default::default() }).unwrap_or(0);
         if frame == 0 {
             status = STATUS_NO_MEMORY;
@@ -241,15 +419,21 @@ pub fn publish_boot(context: u64, blob: u64, size: u32) -> Result<u32, KernelErr
             }
             return Ok(status);
         }
-        locked(context, false, || Ok(state.primary.get()))?;
         let count = section_frame.descriptor_count.get();
+        let mut flagged_changed = false;
+        locked(context, false, || {
+            if primary == 0 {
+                flagged_changed = flagged_values_changed(state, descriptors, if descriptors != 0 { count } else { 0 });
+            }
+            Ok(())
+        })?;
         (backend.reference_section)(section);
         publication_reference = true;
         let mut changed = false;
-        let mut disable_grace = false;
         locked(context, true, || {
             // Os bits 0..2 atualizam checksum, estado e timestamp.
             license_state::update_snapshot(context, &initial_state(), 7, 1)?;
+            released = (state.section.get(), state.view.get());
             state.section.set(section);
             state.view.set(view);
             state.primary.set(0);
@@ -264,22 +448,28 @@ pub fn publish_boot(context: u64, blob: u64, size: u32) -> Result<u32, KernelErr
             state.index_built.set(1);
             let previous_state = license_special::read_local_state(context)?;
             let new_state = (header_at(view).flags.get() & 1) * 2;
-            disable_grace = new_state != 0;
+            reset_grace |= new_state != 0;
             license_state::set_context_state(context, new_state)?;
             let current_state = license_special::read_local_state(context)?;
             changed = previous_state != current_state && (previous_state == 0 || current_state == 0);
             published = true;
             Ok(())
         })?;
-        if changed {
+        if primary == 0 {
+            status = put_into_registry(context)?;
+            if status & 0x8000_0000 != 0 {
+                return Ok(status);
+            }
+        }
+        if changed || primary == 0 {
             notify_change(context);
         }
-        if disable_grace {
-            locked(context, true, || license_state::update_snapshot(context, &[0u8; 48], 32, 0).map(|_| ()))?;
-        }
-        status = 0;
-        Ok(0)
+        status = if flagged_changed { STATUS_SOME_NOT_MAPPED } else { 0 };
+        Ok(status)
     })();
+    if reset_grace {
+        locked(context, true, || license_state::update_snapshot(context, &[0u8; 48], 32, 0).map(|_| ()))?;
+    }
     if let Some(backend) = sections {
         if section != 0 {
             (backend.dereference_section)(section);
@@ -289,6 +479,13 @@ pub fn publish_boot(context: u64, blob: u64, size: u32) -> Result<u32, KernelErr
         }
         if !published && view != 0 {
             (backend.unmap_system_view)(view);
+        }
+        let (old_section, old_view) = released;
+        if old_section != 0 {
+            (backend.dereference_section)(old_section);
+        }
+        if old_view != 0 {
+            (backend.unmap_system_view)(old_view);
         }
     }
     if descriptors != 0 {

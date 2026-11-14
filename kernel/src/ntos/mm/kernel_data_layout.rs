@@ -93,7 +93,9 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     KernelDataEntry { name: "SeExports", size: 8, storage_size: 1064, alignment: 8, initial: ZERO8 },
     KernelDataEntry { name: "HalPrivateDispatchTable", size: 0x4B0, storage_size: 0x4B0, alignment: 8, initial: &HAL_PRIVATE_DISPATCH_INITIAL },
     KernelDataEntry { name: "HalDispatchTable", size: 0xC0, storage_size: 0xC0, alignment: 8, initial: &HAL_DISPATCH_INITIAL },
-    KernelDataEntry { name: "FsRtlLegalAnsiCharacterArray", size: 256, storage_size: 256, alignment: 16, initial: &FSRTL_LEGAL_ANSI_CHARACTER_ARRAY },
+    // PUCHAR FsRtlLegalAnsiCharacterArray: o ponteiro exportado (como no
+    // ntoskrnl, que aponta a tabela do RVA 0x11b20) e a tabela logo depois.
+    KernelDataEntry { name: "FsRtlLegalAnsiCharacterArray", size: 8, storage_size: 8 + 256, alignment: 16, initial: ZERO8 },
     // BOOLEAN; o MiMemoryLicense do x64 grava 1 incondicionalmente.
     KernelDataEntry { name: "Mm64BitPhysicalAddress", size: 1, storage_size: 1, alignment: 1, initial: &[1] },
     KernelDataEntry { name: "MmSystemRangeStart", size: 8, storage_size: 8, alignment: 8, initial: &MM_SYSTEM_RANGE_START_INITIAL },

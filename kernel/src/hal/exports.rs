@@ -193,6 +193,27 @@ pub mod hvi_hardware {
     };
 }
 
+pub mod hvi_enlightenment {
+    //! HviGetEnlightenmentInformation; a lógica mora em `hal/hypervisor.rs`.
+
+    use crate::hal::hypervisor;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ULONGs do HV_X64_ENLIGHTENMENT_INFORMATION (EAX..EDX da leaf 0x40000004).
+    const ENLIGHTENMENT_REGISTERS: usize = 4;
+
+    /// HviGetEnlightenmentInformation(*HV_X64_ENLIGHTENMENT_INFORMATION) -> VOID.
+    fn get_enlightenment_information(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: estrutura de saída de 16 bytes do chamador de modo kernel.
+        hypervisor::get_enlightenment_information(unsafe { Field::<u32>::array_at(call.arg(1), ENLIGHTENMENT_REGISTERS) });
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "hvi-enlightenment", names: &["HviGetEnlightenmentInformation"], handlers: &[get_enlightenment_information], data_exports: &[] };
+}
+
 pub mod vsl_secure_pci {
     use crate::hal::hypervisor;
     use crate::ntos::init::exports::{signed_status, Call, Group};

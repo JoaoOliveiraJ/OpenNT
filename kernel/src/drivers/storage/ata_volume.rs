@@ -3,8 +3,9 @@
 //!
 //! Suporte de boot do driver ATA do kernel, não um substituto do disk.sys: o
 //! disco inteiro é um volume (o NTFS que o xtask gera começa no setor 0), num
-//! DEVICE_OBJECT nativo sem DRIVER_OBJECT, como os PDOs que o barramento do
-//! kernel responde (`io_manager::register_pdo_native_answerer`). O
+//! DEVICE_OBJECT nativo respondido pelo próprio kernel: o DRIVER_OBJECT dele
+//! (`\Driver\AtaVolume`) tem em cada IRP_MJ_* a rotina `dispatch`, a mesma
+//! resposta do IofCallDriver (`io_manager::register_pdo_native_answerer`). O
 //! dispositivo nasce como o IoCreateDevice faz com um FILE_DEVICE_DISK: VPB
 //! (IopCreateVpb), DeviceLock sinalizado, SectorSize 512, DO_DIRECT_IO e
 //! alinhamento de palavra, e é montado pelo caminho do NT
@@ -27,7 +28,7 @@ use alloc::vec::Vec;
 
 use crate::drivers::storage::ata_pio;
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{DeviceObject, IoStackLocation, Irp, Mdl};
+use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, IoStackLocation, Irp, Mdl};
 use crate::ntos::io::{file_system, io_manager};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
@@ -40,6 +41,7 @@ pub const DEVICE_NAME: &str = "AtaVolume1";
 
 const SECTOR: u64 = 512;
 const IO_TYPE_DEVICE: i16 = 3;
+const IO_TYPE_DRIVER: i16 = 4;
 const FILE_DEVICE_DISK: u32 = 0x07;
 const DO_DIRECT_IO: u32 = 0x10;
 const FILE_WORD_ALIGNMENT: u32 = 1;
@@ -51,6 +53,7 @@ const CHUNK_SECTORS: u64 = 256;
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -73,6 +76,8 @@ const IOCTL_DISK_GET_PARTITION_INFO_EX: u32 = 0x0007_0048;
 const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
 const IOCTL_DISK_CHECK_VERIFY: u32 = 0x0007_4800;
+const IOCTL_DISK_MEDIA_REMOVAL: u32 = 0x0007_4804;
+const IOCTL_STORAGE_MEDIA_REMOVAL: u32 = 0x002D_4804;
 const IOCTL_STORAGE_CHECK_VERIFY: u32 = 0x002D_4800;
 const IOCTL_STORAGE_CHECK_VERIFY2: u32 = 0x002D_0800;
 const IOCTL_STORAGE_GET_HOTPLUG_INFO: u32 = 0x002D_0C14;
@@ -80,6 +85,7 @@ const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
 const IOCTL_MOUNTDEV_QUERY_UNIQUE_ID: u32 = 0x004D_0000;
 const IOCTL_MOUNTDEV_QUERY_DEVICE_NAME: u32 = 0x004D_0008;
+const IOCTL_MOUNTDEV_QUERY_STABLE_GUID: u32 = 0x004D_0018;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
 
 /// STORAGE_PROPERTY_ID e STORAGE_QUERY_TYPE (ntddstor.h).
@@ -134,6 +140,7 @@ pub fn create(drive: u8) -> Result<u64, KernelError> {
     object.flags.set(DO_DIRECT_IO);
     object.alignment_requirement.set(FILE_WORD_ALIGNMENT);
     object.sector_size.set(SECTOR as u16);
+    object.driver_object.set(driver_object(address)?);
     dispatcher::initialize_event(object.device_lock.address(), 1, true);
     if file_system::create_vpb(object)? != STATUS_SUCCESS {
         guest::free_bytes(address);
@@ -146,6 +153,42 @@ pub fn create(drive: u8) -> Result<u64, KernelError> {
     io_manager::register_pdo_native_answerer(answer);
     debug_print!("[atavol] \\Device\\{} criado sobre o drive {} ({} setores, escrita em memoria)", DEVICE_NAME, drive, sectors);
     Ok(address)
+}
+
+/// O DRIVER_OBJECT do volume (`\Driver\AtaVolume`, como o de um driver de
+/// disco): todas as rotinas IRP_MJ_* apontam para `dispatch`, que o próprio
+/// kernel responde. Um file system pode chamar a rotina do dispositivo alvo
+/// sem o IofCallDriver (o NtfsFlushDiskCache do ntfs.sys monta o
+/// IRP_MJ_FLUSH_BUFFERS e chama o MajorFunction direto).
+fn driver_object(device: u64) -> Result<u64, KernelError> {
+    let name: Vec<u16> = "\\Driver\\AtaVolume".encode_utf16().collect();
+    let block = guest::alloc_bytes(DriverObject::SIZE + DriverExtension::SIZE + (name.len() as u64 + 1) * 2);
+    if block == 0 {
+        return Err(KernelError::new("volume ATA: DRIVER_OBJECT sem memoria"));
+    }
+    let entry: extern "win64" fn(u64, u64) -> i32 = dispatch;
+    let routine = crate::ntos::mm::kernel_address::image_address(entry as usize as u64)?;
+    // SAFETY: bloco recém-alocado: o DRIVER_OBJECT, a extensão e o nome.
+    let (driver, extension) = unsafe { (DriverObject::at(block), DriverExtension::at(block + DriverObject::SIZE)) };
+    driver.type_.set(IO_TYPE_DRIVER);
+    driver.size.set(DriverObject::SIZE as i16);
+    driver.device_object.set(device);
+    driver.driver_extension.set(extension.address());
+    extension.driver_object.set(block);
+    let text = block + DriverObject::SIZE + DriverExtension::SIZE;
+    guest::write_bytes(text, &name.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    driver.driver_name.length.set(name.len() as u16 * 2);
+    driver.driver_name.maximum_length.set(name.len() as u16 * 2 + 2);
+    driver.driver_name.buffer.set(text);
+    for routine_cell in &driver.major_function {
+        routine_cell.set(routine);
+    }
+    Ok(block)
+}
+
+/// A rotina de despacho do DRIVER_OBJECT do volume.
+extern "win64" fn dispatch(device: u64, packet: u64) -> i32 {
+    answer(device, packet).unwrap_or(STATUS_INVALID_DEVICE_REQUEST as i32)
 }
 
 /// IRP do volume: responde e completa; outros dispositivos seguem adiante.
@@ -354,6 +397,16 @@ fn device_control(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, 
             bytes.extend_from_slice(&[0, 0, 0, 0]);
             reply(irp, output_length, &bytes)
         }
+        // PREVENT_MEDIA_REMOVAL num disco fixo: o ClassDeviceControl do
+        // classpnp traduz o IOCTL de disco para o de armazenamento e o
+        // ClasspEjectionControl só conta a trava (sem mídia removível não há
+        // comando ao dispositivo); a entrada menor que o BOOLEAN é recusada.
+        IOCTL_DISK_MEDIA_REMOVAL | IOCTL_STORAGE_MEDIA_REMOVAL => {
+            if input_length < 1 {
+                return (STATUS_INFO_LENGTH_MISMATCH, 0);
+            }
+            (STATUS_SUCCESS, 0)
+        }
         IOCTL_STORAGE_GET_DEVICE_NUMBER => {
             let mut bytes = Vec::new();
             le32(&mut bytes, FILE_DEVICE_DISK);
@@ -400,6 +453,7 @@ fn device_control(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, 
             mount_reply(irp, output_length, &name)
         }
         IOCTL_MOUNTDEV_QUERY_UNIQUE_ID => mount_reply(irp, output_length, DEVICE_NAME.as_bytes()),
+        IOCTL_MOUNTDEV_QUERY_STABLE_GUID => reply(irp, output_length, &stable_guid(volume)),
         IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS => {
             let mut bytes = Vec::new();
             le32(&mut bytes, 1);
@@ -417,6 +471,19 @@ fn device_control(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, 
             (STATUS_INVALID_DEVICE_REQUEST, 0)
         }
     }
+}
+
+/// MOUNTDEV_STABLE_GUID: o GUID estável do volume, que o gerenciador de
+/// volumes devolve para o FsRtlVolumeDeviceToCorrelationId dos file systems.
+/// Aqui ele sai do próprio disco: "OPEN" e "AT" em Data1/Data2, o drive em
+/// Data3 e a capacidade em setores em Data4, o mesmo a cada boot.
+fn stable_guid(volume: &Volume) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    le32(&mut bytes, u32::from_be_bytes(*b"OPEN"));
+    bytes.extend_from_slice(&u16::from_be_bytes(*b"AT").to_le_bytes());
+    bytes.extend_from_slice(&(0x4100 | volume.drive as u16).to_le_bytes());
+    le64(&mut bytes, volume.sectors);
+    bytes
 }
 
 /// MOUNTDEV_NAME/MOUNTDEV_UNIQUE_ID: comprimento (USHORT) e os bytes; sem

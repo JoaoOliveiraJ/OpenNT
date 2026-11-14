@@ -27,14 +27,21 @@ const WC_BACKSLASH: u16 = 0x5C;
 
 // ---- FsRtlLegalAnsiCharacterArray (data export) -----------------------------
 
-/// Endereço da célula `.kdata` com o bitmap de classes (mesmos bytes que o
-/// `ntoskrnl` real referencia em VA 0x140011b20). O armazenamento de 256
-/// bytes e os valores iniciais ficam em `mm::kernel_data_layout`
-/// (ver REGISTRATION) — aqui só devolvemos o endereço público, como a HAL
-/// faz com `HalPrivateDispatchTable`.
+/// Endereço do export de dados `PUCHAR FsRtlLegalAnsiCharacterArray`: como
+/// no ntoskrnl (o export no RVA 0x9a60 guarda o ponteiro para a tabela de
+/// 128 bytes do RVA 0x11b20), a célula `.kdata` é um ponteiro e o driver lê
+/// `(*FsRtlLegalAnsiCharacterArray)[c]`. A tabela fica logo depois da
+/// célula (`mm::kernel_data_layout`), preenchida na primeira resolução do
+/// import, antes de qualquer driver ler.
 pub fn legal_ansi_character_array_address() -> u64 {
-    kernel_data::address("FsRtlLegalAnsiCharacterArray")
-        .unwrap_or_else(|error| panic!("FsRtlLegalAnsiCharacterArray: {error}"))
+    let (address, _) = kernel_data::region("FsRtlLegalAnsiCharacterArray").unwrap_or_else(|error| panic!("FsRtlLegalAnsiCharacterArray: {error}"));
+    // SAFETY: a célula PUCHAR da região de dados do kernel.
+    let pointer = unsafe { crate::ntos::inc::field::Field::<u64>::at(address) };
+    if pointer.get() == 0 {
+        guest::write_bytes(address + 8, &FSRTL_LEGAL_ANSI_CHARACTER_ARRAY);
+        let _ = pointer.atomic().compare_exchange(0, address + 8, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
+    }
+    address
 }
 
 // ---- Name helpers (§2.1) ----------------------------------------------------

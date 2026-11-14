@@ -155,11 +155,13 @@ fn database() -> Result<&'static DatabaseBlock, KernelError> {
     Ok(unsafe { DatabaseBlock::at(*slot) })
 }
 
+#[track_caller]
 fn list(address: u64) -> &'static ListEntry {
     // SAFETY: elos das filas do banco (cabeças do bloco ou Queue.ListEntry de CDOs registrados).
     unsafe { ListEntry::at(address) }
 }
 
+#[track_caller]
 fn device_object(address: u64) -> &'static DeviceObject {
     // SAFETY: DEVICE_OBJECTs vivos passados por drivers ou guardados nas filas.
     unsafe { DeviceObject::at(address) }

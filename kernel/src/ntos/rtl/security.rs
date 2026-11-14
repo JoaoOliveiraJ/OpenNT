@@ -109,7 +109,10 @@ pub fn add_ace(acl: u64, ace_revision: u32, start_index: u32, ace_list: u64, ace
 
 /// RtlGetSaclSecurityDescriptor(PSD, PBOOLEAN Present, PACL*, PBOOLEAN Defaulted).
 pub fn get_sacl(sd: u64, present: u64, acl_out: u64, defaulted: u64) -> u32 {
-    if descriptor_at(sd).revision.get() != 1 {
+    // Revision pelo cabeçalho comum aos dois formatos: um descritor
+    // self-relative só tem alinhamento de ULONG (o $SDS do NTFS os guarda
+    // depois de um cabeçalho de 20 bytes).
+    if relative_at(sd).revision.get() != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
     let control = descriptor::control(sd);
@@ -123,7 +126,7 @@ pub fn get_sacl(sd: u64, present: u64, acl_out: u64, defaulted: u64) -> u32 {
 
 /// RtlGetGroupSecurityDescriptor(PSD, PSID* Group, PBOOLEAN Defaulted).
 pub fn get_group(sd: u64, group_out: u64, defaulted: u64) -> u32 {
-    if descriptor_at(sd).revision.get() != 1 {
+    if relative_at(sd).revision.get() != 1 {
         return STATUS_UNKNOWN_REVISION;
     }
     let control = descriptor::control(sd);

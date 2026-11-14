@@ -422,9 +422,15 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("zw-reserve-object", 1862, 1),
     ("zw-alpc-server", 1863, 2),
     ("lpc", 1865, 3),
+    ("rtl-crt-towupper", 1868, 1),
+    ("hvi-enlightenment", 1869, 1),
+    ("io-interface-property-data", 1870, 1),
+    ("zw-query-ea-file", 1871, 1),
+    ("mm-change-image-protection", 1872, 1),
+    ("ex-update-license-data", 1873, 1),
 ];
 
-/// Os 1776 exports de função, na ordem da ABI.
+/// Os 1874 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2294,4 +2300,10 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwSecureConnectPort",
     "LpcRequestPort",
     "LpcSendWaitReceivePort",
+    "towupper",
+    "HviGetEnlightenmentInformation",
+    "IoGetDeviceInterfacePropertyData",
+    "ZwQueryEaFile",
+    "MmChangeImageProtection",
+    "ExUpdateLicenseData",
 ];

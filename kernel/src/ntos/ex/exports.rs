@@ -1468,3 +1468,18 @@ pub mod ex_try_queue_work_item {
 
     pub static GROUP: Group = Group { name: "ex-try-queue-work-item", names: &["ExTryQueueWorkItem"], handlers: &[try_queue_work_item], data_exports: &[] };
 }
+
+pub mod ex_update_license_data {
+    //! ExUpdateLicenseData; a lógica mora em `ex/license/update.rs`.
+
+    use crate::ntos::ex::license::update;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExUpdateLicenseData(Size, Buffer) -> NTSTATUS.
+    fn update_license_data(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(update::update_license_data(call.arg(1) as u32, call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ex-update-license-data", names: &["ExUpdateLicenseData"], handlers: &[update_license_data], data_exports: &[] };
+}

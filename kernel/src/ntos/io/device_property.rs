@@ -325,6 +325,18 @@ pub fn query_device_property_data(pdo: u64, key: &Devpropkey, lcid: u32, _flags:
     }
     let stored = PROPERTIES.lock().get(&read_key(Owner::Device(pdo), key, lcid)).cloned();
     let found = stored.or_else(|| crate::ntos::io::pnp::devnode::get(pdo).and_then(|node| standard_device_property(&node, key)));
+    answer_property(found, size, data, required, type_output)
+}
+
+/// Leitura do armazenamento: a propriedade guardada pela chave.
+fn read_property(key: &PropertyKey, size: u32, data: u64, required: &Field<u32>, type_output: &Field<u32>) -> u32 {
+    let found = PROPERTIES.lock().get(key).cloned();
+    answer_property(found, size, data, required, type_output)
+}
+
+/// Resposta comum: ausente = STATUS_OBJECT_NAME_NOT_FOUND; buffer pequeno =
+/// STATUS_BUFFER_TOO_SMALL com RequiredSize e Type preenchidos.
+fn answer_property(found: Option<(u32, alloc::vec::Vec<u8>)>, size: u32, data: u64, required: &Field<u32>, type_output: &Field<u32>) -> u32 {
     let Some((property_type, bytes)) = found else { return PROPERTY_STATUS_OBJECT_NAME_NOT_FOUND };
     required.set(bytes.len() as u32);
     type_output.set(property_type);
@@ -333,4 +345,27 @@ pub fn query_device_property_data(pdo: u64, key: &Devpropkey, lcid: u32, _flags:
     }
     guest::write_bytes(data, &bytes);
     PROPERTY_STATUS_SUCCESS
+}
+
+/// IoGetDeviceInterfacePropertyData(SymbolicLinkName, PropertyKey, Lcid,
+/// Flags, Size, Data, RequiredSize*, Type*): no ntoskrnl 19041 (0x89e320 ->
+/// PnpGetDeviceInterfacePropertyData 0x8a28d0) o link NULL, sem buffer ou
+/// vazio dá STATUS_INVALID_PARAMETER antes de tudo, Flags não é lido e o
+/// STATUS_NOT_FOUND do armazenamento (interface ou propriedade ausente) vira
+/// STATUS_OBJECT_NAME_NOT_FOUND; o resto é a leitura comum.
+#[allow(clippy::too_many_arguments)]
+pub fn query_interface_property_data(link: u64, key: &Devpropkey, lcid: u32, _flags: u32, size: u32, data: u64, required: &Field<u32>, type_output: &Field<u32>) -> u32 {
+    if link == 0 {
+        return PROPERTY_STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: PUNICODE_STRING de um chamador de modo kernel.
+    let string = unsafe { crate::ntos::inc::types::UnicodeString::at(link) };
+    if string.buffer.get() == 0 || string.length.get() == 0 {
+        return PROPERTY_STATUS_INVALID_PARAMETER;
+    }
+    let name = crate::ntos::rtl::guest_strings::read_unicode_string(link);
+    if crate::ntos::io::device_interface::interface_enabled(&name).is_none() {
+        return PROPERTY_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    read_property(&read_key(Owner::Interface(name), key, lcid), size, data, required, type_output)
 }

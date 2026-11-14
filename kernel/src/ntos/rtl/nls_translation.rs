@@ -67,9 +67,11 @@ pub fn ansi_char_to_unicode_char(pointer_field: u64) -> u16 {
     }
 }
 
-/// RtlUpcaseUnicodeChar: ASCII e Latin-1 (exceto ÷).
+/// RtlUpcaseUnicodeChar (ntoskrnl 19041, 0x601d90, também o towupper): o
+/// NLS_UPCASE, com 'a'..'z' direto e a tabela de maiúsculas
+/// (Nls844UnicodeUpcaseTable) de U+00C0 para cima.
 pub fn upcase_unicode_char(code: u16) -> u16 {
-    if (0x61..=0x7A).contains(&code) || ((0xE0..=0xFE).contains(&code) && code != 0xF7) { code - 0x20 } else { code }
+    crate::ntos::rtl::unicode_case::nls_upcase(code)
 }
 
 // ---- RtlUnicodeToMultiByteN / RtlUnicodeToMultiByteSize (rtl-strings) -----

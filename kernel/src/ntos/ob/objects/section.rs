@@ -78,6 +78,11 @@ impl ObjectOwner for SectionOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         SECTIONS.lock().get(&pointer).map(|record| record.security.clone()).unwrap_or_default()
     }
+    /// O processo que criou a seção com OBJ_EXCLUSIVE (0 = compartilhada),
+    /// como o OBJECT_HEADER_PROCESS_INFO do NT.
+    fn exclusive_process(&self, pointer: u64) -> u64 {
+        SECTIONS.lock().get(&pointer).map_or(0, |record| record.state.exclusive_process)
+    }
     fn query_record(&self, pointer: u64) -> crate::ntos::ob::open_pointer::QueryRecord {
         let Some((state, references)) = SECTIONS.lock().get(&pointer).map(|record| (record.state.clone(), record.references)) else { return crate::ntos::ob::open_pointer::QueryRecord::default() };
         // O nome vale só enquanto o namespace ainda aponta para esta seção.

@@ -11,3 +11,4 @@ pub mod index;
 pub mod special;
 pub mod service;
 pub mod boot;
+pub mod update;

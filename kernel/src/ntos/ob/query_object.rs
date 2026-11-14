@@ -371,12 +371,22 @@ fn write_name_information(name: Option<&str>, output: u64, size: u32, returned: 
     }
     guest::write_bytes(output, &[0u8; ObjectNameInformation::SIZE as usize]);
     if name.is_some() {
-        // SAFETY: buffer de saída do chamador, com `needed` bytes.
-        let information = unsafe { ObjectNameInformation::at(output) };
+        // O buffer do chamador pode ter só o alinhamento de WCHAR (o FltMgr
+        // passa o Buffer de um UNICODE_STRING): a estrutura é montada num
+        // bloco alinhado e copiada byte a byte, como o NT a grava sem exigir
+        // alinhamento.
+        let scratch = guest::alloc_bytes(ObjectNameInformation::SIZE);
+        if scratch == 0 {
+            return 0xC000_009A;
+        }
+        // SAFETY: bloco próprio recém-alocado e alinhado.
+        let information = unsafe { ObjectNameInformation::at(scratch) };
         let text = output + ObjectNameInformation::SIZE;
         information.name.length.set(units.len() as u16 * 2);
         information.name.maximum_length.set(units.len() as u16 * 2 + 2);
         information.name.buffer.set(text);
+        guest::write_bytes(output, &guest::read_bytes(scratch, ObjectNameInformation::SIZE as usize));
+        guest::free_bytes(scratch);
         guest_strings::write_wide_string(text, name.unwrap_or_default());
     }
     0

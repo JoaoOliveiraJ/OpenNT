@@ -48,10 +48,14 @@ const _: () = {
     assert!(core::mem::offset_of!(CallDpcBlock, barrier) == 8);
 };
 
-/// KeExpandKernelStackAndCalloutEx: chama `callout(parameter, context)` na
-/// pilha atual e devolve o resultado em 32 bits.
-pub fn expand_kernel_stack_and_callout(callout: u64, parameter: u64, context: u64) -> i32 {
-    native_call::call(callout, &[parameter, context]) as i32
+/// KeExpandKernelStackAndCalloutEx(Callout, Parameter, Size, Wait, Context):
+/// no ntoskrnl 19041 (0x2aa650) é o KeExpandKernelStackAndCalloutInternal
+/// com Wait virando 2 ou 0 e o contexto de pilhas do chamador; o callout é
+/// `VOID Callout(Parameter)` e o resultado é o NTSTATUS da expansão, não o
+/// que o callout deixa em RAX. Sem troca de pilha no OpenNT, Wait e o
+/// contexto não mudam nada: é o mesmo caminho do KeExpandKernelStackAndCallout.
+pub fn expand_kernel_stack_and_callout(callout: u64, parameter: u64, size: u64) -> u32 {
+    expand_kernel_stack_and_callout_internal(callout, parameter, size)
 }
 
 /// KeIpiGenericCall: a rotina roda uma vez, no processador corrente.

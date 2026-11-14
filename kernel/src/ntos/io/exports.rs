@@ -2091,3 +2091,40 @@ pub mod io_start_packet_by_key {
 
     pub static GROUP: Group = Group { name: "io-start-packet-by-key", names: &["IoStartNextPacketByKey"], handlers: &[start_next_packet_by_key], data_exports: &[] };
 }
+
+pub mod io_interface_property_data {
+    //! IoGetDeviceInterfacePropertyData; a lógica mora em `io/device_property.rs`.
+
+    use crate::ntos::inc::types::{Devpropkey, Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::device_property;
+    use crate::rtl::KernelError;
+
+    /// IoGetDeviceInterfacePropertyData(SymbolicLinkName, PropertyKey, Lcid,
+    /// Flags, Size, Data, RequiredSize*, Type*) -> NTSTATUS.
+    fn get_device_interface_property_data(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DEVPROPKEY e as saídas PULONG/DEVPROPTYPE de um chamador de modo kernel.
+        let (key, required, kind) = unsafe { (Devpropkey::at(call.arg(2)), Field::<u32>::at(call.arg(7)), Field::<u32>::at(call.arg(8))) };
+        Ok(signed_status(device_property::query_interface_property_data(call.arg(1), key, call.arg(3) as u32, call.arg(4) as u32, call.arg(5) as u32, call.arg(6), required, kind)))
+    }
+
+    pub static GROUP: Group = Group { name: "io-interface-property-data", names: &["IoGetDeviceInterfacePropertyData"], handlers: &[get_device_interface_property_data], data_exports: &[] };
+}
+
+pub mod zw_query_ea_file {
+    //! ZwQueryEaFile; a lógica mora em `io/file/ea.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::file::ea::{self, QueryEa};
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    /// ZwQueryEaFile(FileHandle, IoStatusBlock, Buffer, Length,
+    /// ReturnSingleEntry, EaList, EaListLength, EaIndex, RestartScan) -> NTSTATUS.
+    fn query_ea_file(call: &Call) -> Result<u64, KernelError> {
+        let request = QueryEa { handle: call.arg(1), io_status: call.arg(2), buffer: call.arg(3), length: call.arg(4) as u32, single: call.arg(5) as u8 != 0, ea_list: call.arg(6), ea_list_length: call.arg(7) as u32, ea_index: call.arg(8), restart: call.arg(9) as u8 != 0 };
+        Ok(signed_status(previous_mode::with_kernel(|| ea::query_ea_file(&request))??))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-query-ea-file", names: &["ZwQueryEaFile"], handlers: &[query_ea_file], data_exports: &[] };
+}

@@ -796,6 +796,140 @@ pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
+// ---- MmChangeImageProtection (mm-change-image-protection) -------------------
+//
+// ntoskrnl 19041 (0x6fe5c0): MmChangeImageProtection(Mdl, Address, Size,
+// Mode), a troca de proteção do código de uma imagem de sistema que o
+// próprio driver reescreve (o clipsp.sys, com as seções PAGEwx):
+// - Mode fora de {1, 2}, MDL sem exatamente MDL_PAGES_LOCKED entre os três
+//   bits baixos (travado, sem mapeamento de sistema, fora do pool), com
+//   ByteOffset ou ByteCount fora de página: STATUS_INVALID_PARAMETER;
+// - sob o PsLoadedModuleResource, a entrada do loader do StartVa do MDL
+//   (MiLookupDataTableEntry; ausente = STATUS_NOT_FOUND); o MDL e a faixa
+//   [Address, Address + Size) precisam caber na imagem, com Size não nulo
+//   (STATUS_CONFLICTING_ADDRESSES); Flags & 0x80000 marca uma troca em
+//   andamento (STATUS_SHARING_VIOLATION), senão é ligado e o LoadCount
+//   referencia a imagem até o fim;
+// - imagem num mapeamento grande (MI_IS_PHYSICAL_ADDRESS) e páginas de PFN
+//   protótipo = STATUS_CONFLICTING_ADDRESSES; páginas com o privilégio 0x40
+//   do MiGetPagePrivilege = STATUS_INVALID_PAGE_PROTECTION;
+// - MiSetImageProtection(MDL, MM_READONLY): as PTEs do MDL ficam somente
+//   leitura e sem execução (no OpenNT só sem execução: ver
+//   `set_image_protection`);
+// - Mode 1: o SeCiCallbacks->CiValidateDynamicCodePages(contexto de
+//   assinatura da seção da imagem, Mdl, Address, Size, Address - DllBase)
+//   aprova o código novo (callback ausente = STATUS_NOT_IMPLEMENTED; a falha
+//   volta com as páginas somente leitura) e o MiSetImageProtection devolve
+//   MM_EXECUTE_READ;
+// - Mode 2: as páginas ficam somente leitura (o MiClearPfnImageVerified só
+//   existe com a CFG do kernel ligada);
+// - desliga o 0x80000 e solta a referência (MiUnloadSystemImage).
+// No OpenNT as imagens de kernel não têm SECTION nem contexto de assinatura
+// por imagem (a CI devolve signatureContext 0), então o contexto é NULL; não
+// há PFNs protótipo nem privilégios de página (VTL), e a CFG do kernel fica
+// desligada (sem a variante 0x13 do MM_EXECUTE_READ).
+
+const CHANGE_PROTECTION_INVALID_PARAMETER: u32 = 0xC000_000D;
+const CHANGE_PROTECTION_NOT_FOUND: u32 = 0xC000_0225;
+const CHANGE_PROTECTION_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+const CHANGE_PROTECTION_SHARING_VIOLATION: u32 = 0xC000_0043;
+const CHANGE_PROTECTION_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+/// KLDR_DATA_TABLE_ENTRY.Flags: troca de proteção em andamento.
+const IMAGE_PROTECTION_CHANGING: u32 = 0x0008_0000;
+/// MDL_MAPPED_TO_SYSTEM_VA | MDL_PAGES_LOCKED | MDL_SOURCE_IS_NONPAGED_POOL e
+/// o único valor aceito entre eles.
+const MDL_LOW_FLAGS: i16 = 7;
+const MDL_PAGES_LOCKED: i16 = 2;
+/// Proteções do MiSetImageProtection (MM_*).
+pub const MM_READONLY: u32 = 1;
+pub const MM_EXECUTE_READ: u32 = 3;
+pub const MM_EXECUTE_READWRITE: u32 = 6;
+
+/// MiSetImageProtection/MiSetSystemCodeProtection: reescreve as PTEs de 4 KB
+/// de [address, address + length) com a proteção MM_* dada. A execução segue
+/// a proteção (MM_READONLY tira, MM_EXECUTE_READ e MM_EXECUTE_READWRITE
+/// dão); a escrita fica como o carregador a mapeou, porque no OpenNT o
+/// MmMapLockedPagesSpecifyCache de um MDL devolve a própria VA da imagem (não
+/// um alias), e é por ela que o driver reescreve o código.
+pub fn set_image_protection(address: u64, length: u64, protection: u32) -> Result<(), KernelError> {
+    const NX: u64 = 1 << 63;
+    let base = address & !0xFFF;
+    let count = (address + length - base).div_ceil(0x1000);
+    let mut pages = Vec::new();
+    for index in 0..count {
+        let va = base + index * 0x1000;
+        let page = crate::ntos::mm::paging::query_page(va, false).ok_or_else(|| KernelError::new("MiSetImageProtection: image page not mapped"))?;
+        if page.page_size != 0x1000 {
+            return Err(KernelError::new("MiSetImageProtection: image page is not a 4 KB leaf"));
+        }
+        pages.push((va, page.entry_address));
+    }
+    let previous = crate::ntos::ke::irql::raise_irql(2);
+    for &(va, entry) in &pages {
+        loop {
+            let before = crate::hal::physical::read64(entry);
+            let after = if protection == MM_READONLY { before | NX } else { before & !NX };
+            if crate::hal::physical::compare_exchange64(entry, before, after) == before {
+                break;
+            }
+        }
+        crate::hal::cpu::invalidate_page(va);
+    }
+    let flushed = if pages.is_empty() { Ok(()) } else { crate::ntos::ke::smp::flush_remote_tlb(false) };
+    crate::ntos::ke::irql::lower_irql(previous as u64);
+    flushed
+}
+
+/// MmChangeImageProtection(Mdl, Address, Size, Mode) -> NTSTATUS.
+pub fn change_image_protection(mdl: u64, address: u64, size: u64, mode: u32) -> Result<u32, KernelError> {
+    if !(1..=2).contains(&mode) {
+        return Ok(CHANGE_PROTECTION_INVALID_PARAMETER);
+    }
+    // SAFETY: o PMDL travado do driver.
+    let descriptor = unsafe { crate::ntos::inc::types::Mdl::at(mdl) };
+    let byte_count = descriptor.byte_count.get() as u64;
+    if descriptor.mdl_flags.get() & MDL_LOW_FLAGS != MDL_PAGES_LOCKED || descriptor.byte_offset.get() != 0 || byte_count & 0xFFF != 0 {
+        return Ok(CHANGE_PROTECTION_INVALID_PARAMETER);
+    }
+    let start = descriptor.start_va.get();
+    let (_, entries) = crate::ntos::mm::loaded_images::native_list()?;
+    let Some(entry) = entries.into_iter().find(|(image, _)| start >= image.image_base && start < image.image_base + image.size_of_image).map(|(_, entry)| entry) else {
+        return Ok(CHANGE_PROTECTION_NOT_FOUND);
+    };
+    // SAFETY: a entrada nativa do loader da imagem, viva enquanto listada.
+    let loader = unsafe { KldrDataTableEntry::at(entry) };
+    let base = loader.dll_base.get();
+    let end = base + loader.size_of_image.get() as u64;
+    let last = address.wrapping_add(size);
+    if start + byte_count > end || address < base || last > end || last.wrapping_sub(1) < address {
+        return Ok(CHANGE_PROTECTION_CONFLICTING_ADDRESSES);
+    }
+    if loader.flags.get() & IMAGE_PROTECTION_CHANGING != 0 {
+        return Ok(CHANGE_PROTECTION_SHARING_VIOLATION);
+    }
+    loader.flags.set(loader.flags.get() | IMAGE_PROTECTION_CHANGING);
+    loader.load_count.set(loader.load_count.get().wrapping_add(1));
+    let result = (|| -> Result<u32, KernelError> {
+        if crate::ntos::mm::paging::query_page(base, false).is_some_and(|page| page.page_size != 0x1000) {
+            return Ok(CHANGE_PROTECTION_CONFLICTING_ADDRESSES);
+        }
+        set_image_protection(start, byte_count, MM_READONLY)?;
+        if mode == 1 {
+            let Some(status) = crate::ntos::se::code_integrity::validate_dynamic_code_pages(0, mdl, address, size, address - base) else {
+                return Ok(CHANGE_PROTECTION_NOT_IMPLEMENTED);
+            };
+            if status & 0x8000_0000 != 0 {
+                return Ok(status);
+            }
+            set_image_protection(start, byte_count, MM_EXECUTE_READ)?;
+        }
+        Ok(0)
+    })();
+    loader.flags.set(loader.flags.get() & !IMAGE_PROTECTION_CHANGING);
+    loader.load_count.set(loader.load_count.get().wrapping_sub(1));
+    result
+}
+
 // ---- MiCompactServiceTable e a carga que estende as tabelas de serviço ------
 //
 // (append de `ke-service-tables` ao mm/sysload.rs. Usa o que o arquivo já

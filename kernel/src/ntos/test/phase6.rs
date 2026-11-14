@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1868 && abi_names::GROUP_LAYOUT.len() == 416 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1868 exports em 416 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1874 && abi_names::GROUP_LAYOUT.len() == 422 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1874 exports em 422 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1051,6 +1051,22 @@ fn file_information_group(assert: Assert) {
     let query = call_export("FsRtlQueryKernelEaFile", &[file, output, dirty(8), dirty(0x100), 0, dirty(0), 0, dirty(0x100), returned]);
     let set = call_export("FsRtlSetKernelEaFile", &[file, input, dirty(8)]);
     assert(query == Some(0) && guest::read32(returned) == 4 && set == Some(0), "fsinfo: EA de kernel pelos IRPs nativos");
+    // ZwQueryEaFile por um handle do Ob para o FILE_OBJECT (FILE_READ_EA,
+    // OBJ_KERNEL_HANDLE): IRP_MJ_QUERY_EA com o SystemBuffer do DO_BUFFERED_IO
+    // copiado de volta e o IO_STATUS_BLOCK do chamador.
+    let file_type = guest::read64(crate::ntos::mm::kernel_data::address("IoFileObjectType").unwrap_or(0));
+    let by_pointer = call_export("ObOpenObjectByPointer", &[file, 0x200, 0, 0x8, file_type, 0, kernel + 0x470]) == Some(0);
+    let ea_handle = guest::read64(kernel + 0x470);
+    device_flags.set(device_flags.get() | 0x4);
+    guest::write64(output, 0);
+    guest::write64(kernel + 0x480, u64::MAX);
+    let zw_query = call_export("ZwQueryEaFile", &[ea_handle, kernel + 0x480, output, dirty(8), 0, 0, 0, 0, 1]);
+    device_flags.set(device_flags.get() & !0x4);
+    let zw_ok = by_pointer && zw_query == Some(0) && guest::read32(kernel + 0x480) == 0 && guest::read64(kernel + 0x488) == 4 && guest::read32(output) == 0x4443_4241;
+    let closed = call_export("ZwClose", &[ea_handle]) == Some(0);
+    guest::write64(kernel + 0x480, u64::MAX);
+    let zw_bad = call_export("ZwQueryEaFile", &[0x7FF0, kernel + 0x480, output, dirty(8), 0, 0, 0, 0, 1]) == Some(crate::ntos::init::exports::signed_status(0xC000_0008)) && guest::read64(kernel + 0x480) == u64::MAX;
+    assert(zw_ok && closed && zw_bad, "fsinfo: ZwQueryEaFile pelo IRP do NtQueryEaFile e handle invalido");
     let _ = close::close(opened.handle, Some(0));
     // Arquivo real do NTFS: tamanho, volume, FSCTL do volume e EAs persistentes.
     let block = guest::alloc_bytes(0x400);
@@ -1079,6 +1095,12 @@ fn file_information_group(assert: Assert) {
     let length = guest::read32(returned) as usize;
     let parsed = ea::parse(&guest::read_bytes(kernel + 0x600, length), false, false).map(|entries| entries.len());
     let short = call_export("FsRtlQueryKernelEaFile", &[ntfs_file, kernel + 0x600, dirty(2), dirty(0), 0, dirty(0), 0, dirty(1), returned]);
+    let zw_listed = call_export("ZwQueryEaFile", &[handle, kernel + 0x480, kernel + 0x600, dirty(256), 0, 0, 0, 0, 1]);
+    let zw_length = guest::read64(kernel + 0x488) as usize;
+    let zw_entries = ea::parse(&guest::read_bytes(kernel + 0x600, zw_length), false, false).map(|entries| entries.len());
+    let zw_single = call_export("ZwQueryEaFile", &[handle, kernel + 0x480, kernel + 0x600, dirty(256), 1, 0, 0, 0, 1]);
+    let zw_single_entries = ea::parse(&guest::read_bytes(kernel + 0x600, guest::read64(kernel + 0x488) as usize), false, false).map(|entries| entries.len());
+    assert(zw_listed == Some(0) && zw_length == length && zw_entries.is_ok_and(|count| count == 2) && zw_single == Some(0) && zw_single_entries.is_ok_and(|count| count == 1), "fsinfo: ZwQueryEaFile lista os EAs do NTFS e devolve uma entrada com ReturnSingleEntry");
     assert(empty == Some(0xC000_0052) && stored == Some(0) && listed == Some(0) && parsed.is_ok_and(|count| count == 2) && short == Some(0xC000_0023) && guest::read32(returned) == 0, "fsinfo: EAs persistentes no NTFS, lista vazia e saida curta");
     let _ = close::close(handle, Some(0));
     let _ = FileSystem::remove(volume.as_ref(), "/OPENNT-EA.DAT");
@@ -1903,7 +1925,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1868 && exports::export_names().len() == 1868, "ntoskrnl: 416 grupos com os 1868 exports implementados");
+    assert(exports::implemented() == 1874 && exports::export_names().len() == 1874, "ntoskrnl: 422 grupos com os 1874 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -13949,6 +13971,7 @@ pub fn run(assert: Assert) {
     zw_reserve_object_exports(assert);
     zw_wnf_name_information_exports(assert);
     zw_alpc_server_and_lpc_exports(assert);
+    super::fs_driver_imports::run(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

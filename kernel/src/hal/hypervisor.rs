@@ -127,6 +127,36 @@ pub fn get_hardware_features(output: &[crate::ntos::inc::field::Field<u32>]) {
     }
 }
 
+// ---- HviGetEnlightenmentInformation (hvi-enlightenment) ----------------------
+//
+// ntoskrnl 19041: HviGetEnlightenmentInformation (0x3a8fe0) pergunta ao
+// HviIsHypervisorMicrosoftCompatible (0x3a9060), que compara com "Hv#1" o
+// EAX da interface devolvida pelo HviGetHypervisorInterface (0x3a90b0: a
+// leaf 0x40000001 quando o HviIsAnyHypervisorPresent diz que há hipervisor,
+// zeros sem ele). Compatível: EAX..EDX da leaf 0x40000004 nos quatro ULONGs
+// do HV_X64_ENLIGHTENMENT_INFORMATION; senão os 16 bytes zerados.
+
+const LEAF_ENLIGHTENMENT_INFORMATION: u32 = 0x4000_0004;
+/// Interface "Hv#1" (EAX da leaf 0x40000001).
+const INTERFACE_HV1: u32 = 0x3123_7648;
+
+/// HviIsHypervisorMicrosoftCompatible exato: interface "Hv#1".
+pub fn microsoft_compatible_interface() -> bool {
+    any_hypervisor_interface_present() && cpu::cpuid(LEAF_INTERFACE)[0] == INTERFACE_HV1
+}
+
+/// EAX..EDX da leaf 0x40000004, ou zeros sem interface compatível.
+pub fn enlightenment_information() -> [u32; 4] {
+    if microsoft_compatible_interface() { cpu::cpuid(LEAF_ENLIGHTENMENT_INFORMATION) } else { [0; 4] }
+}
+
+/// HviGetEnlightenmentInformation(*HV_X64_ENLIGHTENMENT_INFORMATION).
+pub fn get_enlightenment_information(output: &[crate::ntos::inc::field::Field<u32>]) {
+    for (cell, value) in output.iter().zip(enlightenment_information()) {
+        cell.set(value);
+    }
+}
+
 // ---- VslGetSecurePciEnabled / VslQuerySecureDevice /
 //      VslGetSecurePciDeviceAlternateFunctionNumberForVtl0Dma ------------------
 //

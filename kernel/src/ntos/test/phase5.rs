@@ -1309,7 +1309,7 @@ fn license_boot_values_and_anonymous(assert: Assert) {
     let (invalid_context, invalid_diagnostics) = match invalid { Ok(Ok(created)) => created, _ => (0, boot::Diagnostics::default()) };
     assert(invalid_context != 0 && invalid_diagnostics.publication_status == Some(0xC000_003F) && guest::read32(invalid_context + 0xB78C) == 5 && SECTION_VIEWS.load(Ordering::SeqCst) == 0, "licenseboot: rodape invalido recusado e vista desfeita");
     let _ = boot::destroy(invalid_context);
-    boot::set_section_backend(None);
+    boot::restore_kernel_section_backend();
     // Contexto do boot real: sem ProductPolicy na hive, cabeçalho recusado.
     let host = values::host_context();
     assert(host != 0 && matches!(values::current_context(), Ok(context) if context == host) && guest::read8(host + 0xB790) == 1, "licensevalues: contexto do boot sem politica marcado corrompido");

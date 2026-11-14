@@ -111,7 +111,11 @@ pub fn create_device(driver: u64, extension_size: u32, name_pointer: u64, device
     }
     let device = device_at(page);
     device.type_.set(IO_TYPE_DEVICE);
-    device.size.set(DeviceObject::SIZE as u16);
+    // Size = sizeof(DEVICE_OBJECT) + DeviceExtensionSize (sem o
+    // arredondamento), como o IoCreateDevice do ntoskrnl 19041 grava: o
+    // ntfs.sys distingue o seu CDO (sem extensão) dos dispositivos de volume
+    // por esse campo.
+    device.size.set((DeviceObject::SIZE as u32).wrapping_add(extension_size) as u16);
     device.reference_count.set(1);
     device.driver_object.set(driver);
     device.device_type.set(device_type);
