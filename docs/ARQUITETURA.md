@@ -61,6 +61,8 @@ kernel/src/
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── po/ etw/ kd/ dbgk/ fsrtl/
 │   ├── bgk/           console do vídeo de boot (Bgk*)
+│   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
+│   ├── ttm/           Terminal Topology Manager (notificações de dispositivo)
 │   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs;
 │                      multiprocess/, um módulo por assunto, chamado pela fase 7)
 ├── drivers/           drivers internos
@@ -954,7 +956,10 @@ dereference e o PFN livre volta ao de antes.
   memória desse processo (alocados dentro do corpo de `with_test_process`,
   ou anexado a ele): o modo estrito de posse recusa a memória de outro.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
-  `--trace-driver-api` mostra cada export chamado (veja o README).
+  `--trace-driver-api` mostra cada export chamado (veja o README). Os testes
+  `watchdog` e `dxgkrnl` do `components.toml` iniciam assim o watchdog.sys e
+  o núcleo gráfico (serviço `DXGKrnl`, com os valores da chave do Windows) e
+  esperam `DRIVER_START_COMPLETED name=<serviço> state=4 win32=0`.
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,

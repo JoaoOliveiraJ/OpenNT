@@ -50,6 +50,8 @@ que fala a mesma ABI binária que os drivers do Windows esperam.
     **mouse:** `mouclass`; **criptografia:** `cng.sys`.
   - **Bibliotecas de export** importadas por esses drivers: `wmilib.sys` e
     `WppRecorder.sys`.
+  - **Vídeo:** o núcleo gráfico `dxgkrnl.sys` (com o `watchdog.sys`) inicia e
+    cria `\Device\DxgKrnl`, o primeiro passo da pilha gráfica real.
 - **Mais de 900 símbolos** que o `ntoskrnl.exe` do Windows 10 22H2 exporta aos
   drivers já são oferecidos pelo OpenNT (de ~3.070 no total), implementados com
   a semântica real de cada função.
@@ -160,6 +162,11 @@ cargo xtask test-boot SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=buil
 
 # Digita no shell pelo monitor do QEMU e confere a saída.
 cargo xtask test-boot KERNEL_RS_OK 120000 "--keys=run hello\nps\n" "--expect== 42"
+
+# Inicia drivers reais do Windows pelo gerenciador de serviços (watchdog.sys e o
+# núcleo gráfico dxgkrnl.sys).
+cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 "--expect=name=watchdog state=4 win32=0"
+cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=DXGKrnl --build-dir=build/dxgkrnl --smp=1 "--expect=name=DXGKrnl state=4 win32=0"
 
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status

@@ -31,6 +31,8 @@ const BUNDLED: &[&str] = &[
 /// Arquivos do volume NTFS: (caminho no volume, origem no Windows).
 const NTFS_FILES: &[(&str, &str)] = &[
     ("CNG.SYS", "System32/drivers/cng.sys"),
+    // O núcleo gráfico (DXGKrnl), iniciado por `--start-driver=DXGKrnl`.
+    ("DXGKRNL.SYS", "System32/drivers/dxgkrnl.sys"),
     // A CI original e a sua dependência, carregadas do volume.
     ("CI.DLL", "System32/ci.dll"),
     ("MSRPC.SYS", "System32/drivers/msrpc.sys"),

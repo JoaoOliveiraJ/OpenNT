@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 346] {
+fn groups() -> [&'static Group; 356] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -401,6 +401,16 @@ fn groups() -> [&'static Group; 346] {
         &crate::ntos::ob::exports::ob_nt_duplicate_object::GROUP,
         &crate::ntos::bgk::exports::bgk_console::GROUP,
         &crate::ntos::rtl::exports::rtl_capability_sids::GROUP,
+        &crate::ntos::etw::exports::etw_stack_walk::GROUP,
+        &crate::ntos::inbv::exports::inbv_display_ownership::GROUP,
+        &crate::ntos::io::exports::io_root_device::GROUP,
+        &crate::ntos::mm::exports::physical_view::GROUP,
+        &crate::ntos::mm::exports::query_section::GROUP,
+        &crate::ntos::po::exports::po_shutdown::GROUP,
+        &crate::ntos::po::exports::po_vsync::GROUP,
+        &crate::ntos::ttm::exports::ttm_device_notifications::GROUP,
+        &crate::ntos::ob::exports::zw_wait_multiple::GROUP,
+        &crate::ntos::ke::exports::zw_yield_execution::GROUP,
     ]
 }
 

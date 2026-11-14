@@ -165,3 +165,29 @@ pub mod etw_coverage {
 
     pub static GROUP: Group = Group { name: "etw-coverage", names: &["EtwTelemetryCoverageReport"], handlers: &[report], data_exports: &[] };
 }
+
+pub mod etw_stack_walk {
+    //! EtwpDisableStackWalkApc e EtwpReenableStackWalkApc; a lógica mora em
+    //! `etw/stack_walk`.
+
+    use crate::ntos::etw::stack_walk;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn disable_stack_walk_apc(_: &Call) -> Result<u64, KernelError> {
+        Ok(stack_walk::disable_stack_walk_apc() as u64)
+    }
+
+    /// EtwpReenableStackWalkApc(PreviousValue).
+    fn reenable_stack_walk_apc(call: &Call) -> Result<u64, KernelError> {
+        stack_walk::reenable_stack_walk_apc(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "etw-stack-walk",
+        names: &["EtwpDisableStackWalkApc", "EtwpReenableStackWalkApc"],
+        handlers: &[disable_stack_walk_apc, reenable_stack_walk_apc],
+        data_exports: &[],
+    };
+}

@@ -1,7 +1,9 @@
 //! Driver VGA modo texto 80x25.
 //!
 //! Escreve direto na memória de vídeo 0xB8000 e move o cursor de hardware
-//! pelas portas 0x3D4/0x3D5.
+//! pelas portas 0x3D4/0x3D5. É o driver de vídeo de boot do Inbv
+//! (`ntos/inbv/display`): quando o vídeo passa a um driver de vídeo, a posse
+//! sai daqui e as escritas param de tocar o hardware até a posse voltar.
 
 use crate::hal::{physical, port};
 use crate::rtl::SpinLock;
@@ -14,9 +16,11 @@ struct Screen {
     cx: usize,
     cy: usize,
     attribute: u8, // cinza claro / preto
+    /// O vídeo de texto é do kernel (o VidCleanUp do Inbv o solta).
+    owned: bool,
 }
 
-static SCREEN: SpinLock<Screen> = SpinLock::new(Screen { cx: 0, cy: 0, attribute: 0x07 });
+static SCREEN: SpinLock<Screen> = SpinLock::new(Screen { cx: 0, cy: 0, attribute: 0x07, owned: true });
 
 fn cell(x: usize, y: usize) -> u64 {
     MEMORY + ((y * WIDTH + x) * 2) as u64
@@ -91,6 +95,9 @@ impl Screen {
 
 pub fn write(text: &str) {
     let mut screen = SCREEN.lock();
+    if !screen.owned {
+        return;
+    }
     for character in text.chars() {
         screen.putc(character);
     }
@@ -98,11 +105,17 @@ pub fn write(text: &str) {
 }
 
 pub fn putc(character: char) {
-    SCREEN.lock().putc(character);
+    let mut screen = SCREEN.lock();
+    if screen.owned {
+        screen.putc(character);
+    }
 }
 
 pub fn clear() {
     let mut screen = SCREEN.lock();
+    if !screen.owned {
+        return;
+    }
     for y in 0..HEIGHT {
         screen.clear_line(y);
     }
@@ -113,4 +126,14 @@ pub fn clear() {
 
 pub fn set_attribute(attribute: u8) {
     SCREEN.lock().attribute = attribute;
+}
+
+/// Posse do vídeo de texto: `false` quando um driver de vídeo assume o
+/// hardware (o VidCleanUp do Inbv), `true` quando ela volta ao kernel.
+pub fn set_owned(owned: bool) {
+    SCREEN.lock().owned = owned;
+}
+
+pub fn owned() -> bool {
+    SCREEN.lock().owned
 }

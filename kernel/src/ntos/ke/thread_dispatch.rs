@@ -455,6 +455,15 @@ pub fn request_yield(thread: u64) -> Result<bool, KernelError> {
     Ok(true)
 }
 
+/// ZwYieldExecution fora de uma thread de sistema (o KeYieldExecution(0)):
+/// a thread corrente cede a CPU quando outra pronta tem prioridade igual ou
+/// maior (STATUS_SUCCESS); senão STATUS_NO_YIELD_PERFORMED. As threads de
+/// sistema nativas passam pela interceptação de `ps/kernel_threads`.
+pub fn yield_execution() -> Result<u32, KernelError> {
+    let thread = crate::ntos::ps::process::get_current_thread();
+    Ok(if request_yield(thread)? { 0 } else { 0x4000_0024 })
+}
+
 pub fn register_priority_change_observer(observer: fn()) -> Result<(), KernelError> {
     let mut dispatch = STATE.lock();
     if dispatch.priority_observer.is_some() {

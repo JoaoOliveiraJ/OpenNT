@@ -151,7 +151,7 @@ pub fn of_handle(handle: u64) -> Option<u64> {
 }
 
 /// Espera do despachante (KeWait*, KeDelayExecutionThread,
-/// ZwWaitForSingleObject) com alertas e prazo.
+/// ZwWaitForSingleObject, ZwWaitForMultipleObjects) com alertas e prazo.
 struct DispatcherWait {
     objects: Vec<u64>,
     wait_type: u32,
@@ -198,6 +198,37 @@ impl KernelWait for DispatcherWait {
 
 /// Resultado imediato (argumentos recusados antes da espera).
 struct Immediate(u64);
+
+/// ZwYieldExecution numa thread de sistema (o KeYieldExecution): com outra
+/// thread de sistema pronta, a thread cede uma rodada do escalonador e volta
+/// com STATUS_SUCCESS; sem nenhuma, STATUS_NO_YIELD_PERFORMED na hora.
+struct YieldExecution {
+    contested: bool,
+    yielded: bool,
+}
+
+impl KernelWait for YieldExecution {
+    fn poll(&mut self) -> Result<WaitPoll, KernelError> {
+        if !self.contested {
+            return Ok(WaitPoll::Done(0x4000_0024));
+        }
+        if !self.yielded {
+            self.yielded = true;
+            return Ok(WaitPoll::Pending);
+        }
+        Ok(WaitPoll::Done(0))
+    }
+}
+
+/// Outra thread de sistema viva e sem espera pendente.
+fn other_ready() -> bool {
+    let current = CURRENT.lock().clone();
+    let threads: Vec<Shared> = BY_POINTER.lock().values().cloned().collect();
+    threads.iter().any(|thread| current.as_ref().is_none_or(|current| !Arc::ptr_eq(current, thread)) && {
+        let thread = thread.lock();
+        !thread.terminated && thread.wait.is_none()
+    })
+}
 
 impl KernelWait for Immediate {
     fn poll(&mut self) -> Result<WaitPoll, KernelError> {
@@ -433,6 +464,12 @@ fn begin_wait(name: &str, args: &[u64; 14]) -> Result<Option<Wait>, KernelError>
             }
             (alloc::vec![pointer], 1, args[2], false, 0, args[1])
         }
+        // ZwWaitForMultipleObjects(Count, Handles, WaitType, Alertable, Timeout).
+        "ZwWaitForMultipleObjects" => match crate::ntos::ob::wait::wait_objects_of_handles(args[0] as u32, args[1], args[2] as u32) {
+            Ok(objects) => (objects, args[2] as u32, args[4], false, 0, args[3]),
+            Err(status) => return boxed(Box::new(Immediate(status as u64))),
+        },
+        "ZwYieldExecution" => return boxed(Box::new(YieldExecution { contested: other_ready(), yielded: false })),
         _ => return Ok(None),
     };
     let deadline = dispatcher::timeout_pointer_to_ms(timeout).map(|milliseconds| clock::uptime_ms() + milliseconds);

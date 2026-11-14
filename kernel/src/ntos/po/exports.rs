@@ -247,3 +247,33 @@ pub mod po_system_state {
         data_exports: &[],
     };
 }
+
+pub mod po_shutdown {
+    //! NtShutdownSystem; a lógica mora em `po/shutdown`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::shutdown;
+    use crate::rtl::KernelError;
+
+    fn shutdown_system(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(shutdown::shutdown_system(call.arg(1) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "po-shutdown", names: &["NtShutdownSystem"], handlers: &[shutdown_system], data_exports: &[] };
+}
+
+pub mod po_vsync {
+    //! PoNotifyVSyncChange; a lógica mora em `po/latency`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::po::latency;
+    use crate::rtl::KernelError;
+
+    /// PoNotifyVSyncChange(BOOLEAN Enabled).
+    fn notify_vsync_change(call: &Call) -> Result<u64, KernelError> {
+        latency::notify_vsync_change(call.arg(1) & 0xFF != 0);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "po-vsync", names: &["PoNotifyVSyncChange"], handlers: &[notify_vsync_change], data_exports: &[] };
+}

@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1715 && abi_names::GROUP_LAYOUT.len() == 346 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1715 exports em 346 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1729 && abi_names::GROUP_LAYOUT.len() == 356 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1729 exports em 356 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1379,7 +1379,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1715 && exports::export_names().len() == 1715, "ntoskrnl: 346 grupos com os 1715 exports implementados");
+    assert(exports::implemented() == 1729 && exports::export_names().len() == 1729, "ntoskrnl: 356 grupos com os 1729 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11734,6 +11734,248 @@ fn bgk_console_exports(assert: Assert) {
 }
 
 
+/// EtwpDisableStackWalkApc/EtwpReenableStackWalkApc no byte
+/// EtwStackTraceApcInserted da KTHREAD corrente.
+fn etw_stack_walk_exports(assert: Assert) {
+    let thread = at::<nt::Kthread>(crate::ntos::ps::process::get_current_thread());
+    let original = thread.thread_flags.get() as u32;
+    let byte = original >> 24;
+    let previous = call_export("EtwpDisableStackWalkApc", &[]).map(|value| value as u32);
+    let disabled = thread.thread_flags.get() as u32;
+    let again = call_export("EtwpDisableStackWalkApc", &[]).map(|value| value as u32);
+    let _ = call_export("EtwpReenableStackWalkApc", &[byte as u64]);
+    let restored = thread.thread_flags.get() as u32;
+    assert(previous == Some(byte) && disabled >> 24 == 0xFF && disabled & 0xFF_FFFF == original & 0xFF_FFFF && again == Some(0xFF) && restored == original, "etw-stack-walk: desliga com 0xFF, devolve o byte anterior e religa sem tocar nos outros bits");
+}
+
+/// InbvNotifyDisplayOwnershipChange/InbvSetVirtualFrameBuffer sobre o vídeo
+/// de texto (tabela Bvga, sem BGFX).
+fn inbv_display_ownership_exports(assert: Assert) {
+    use crate::drivers::video::vga;
+    use crate::ntos::inbv::display;
+    use crate::ntos::init::exports::signed_status;
+    assert(display::display_state() == display::DISPLAY_STATE_OWNED && vga::owned(), "inbv-display-ownership: o vídeo de boot começa com o kernel");
+    let lost = call_export("InbvNotifyDisplayOwnershipChange", &[0, 0]);
+    let lost_state = (display::display_state(), vga::owned());
+    let again = call_export("InbvNotifyDisplayOwnershipChange", &[0, 0]);
+    let reacquired = call_export("InbvNotifyDisplayOwnershipChange", &[1, 0]);
+    assert(lost == Some(0) && lost_state == (display::DISPLAY_STATE_LOST, false) && again == Some(0) && reacquired == Some(0) && display::display_state() == display::DISPLAY_STATE_OWNED && vga::owned(), "inbv-display-ownership: ceder perde o vídeo (VidCleanUp) e reaver devolve ao kernel");
+    assert(call_export("InbvSetVirtualFrameBuffer", &[0, 0]) == Some(signed_status(0xC000_0002)), "inbv-display-ownership: sem BGFX, InbvSetVirtualFrameBuffer = STATUS_NOT_IMPLEMENTED");
+}
+
+/// IoReportRootDevice: a instância ROOT\<serviço>\0000 sob Enum.
+fn io_root_device_exports(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::root_device;
+    let block = guest::alloc_bytes(0x800);
+    let driver = block;
+    let extension = block + 0x200;
+    let text = block + 0x400;
+    at::<nt::DriverObject>(driver).driver_extension.set(extension);
+    let set_name = |name: &str| {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let key = &at::<nt::DriverExtension>(extension).service_key_name;
+        key.length.set(units.len() as u16 * 2);
+        key.maximum_length.set(units.len() as u16 * 2);
+        key.buffer.set(text);
+    };
+    set_name("OpenNTRootTest");
+    let path = alloc::format!("{}\\{}", root_device::ENUM_PATH, root_device::instance_path("OpenNTRootTest"));
+    let reported = call_export("IoReportRootDevice", &[driver]);
+    let hardware = registry::read_value_by_path(&path, "HardwareID").map(|value| value.data);
+    let mut expected: Vec<u8> = "ROOT\\OpenNTRootTest".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    expected.extend([0, 0, 0, 0]);
+    let config = registry::read_value_by_path(&path, "ConfigFlags").map(|value| value.data);
+    let service = registry::read_value_by_path(&path, "Service").map(|value| value.data);
+    let mut service_expected: Vec<u8> = "OpenNTRootTest".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    service_expected.extend([0, 0]);
+    assert(reported == Some(0) && hardware == Some(expected) && config == Some(alloc::vec![0x20, 0, 0, 0]) && service == Some(service_expected), "io-root-device: instancia ROOT\\<servico>\\0000 com HardwareID, ConfigFlags e Service");
+    // Uma instância existente não muda.
+    if let Ok(handle) = registry::open(&path) {
+        registry::set_value(handle, "ConfigFlags", 4, alloc::vec![0x99, 0, 0, 0]);
+        registry::close_handle(handle);
+    }
+    let again = call_export("IoReportRootDevice", &[driver]);
+    assert(again == Some(0) && registry::read_value_by_path(&path, "ConfigFlags").map(|value| value.data) == Some(alloc::vec![0x99, 0, 0, 0]), "io-root-device: instancia existente preservada");
+    if let Ok(handle) = registry::open(&path) {
+        registry::delete_key(handle);
+        registry::close_handle(handle);
+    }
+    // "ROOT\" + 195 caracteres + NUL passa dos 0x190 bytes.
+    set_name(&"A".repeat(195));
+    assert(call_export("IoReportRootDevice", &[driver]) == Some(signed_status(0xC000_0033)), "io-root-device: nome alem do buffer de 0x190 bytes = STATUS_OBJECT_NAME_INVALID");
+    guest::free_bytes(block);
+}
+
+/// MmRotatePhysicalView: validação na ordem do NT e as recusas do VAD.
+fn physical_view_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ps::user::memory;
+    let bytes = guest::alloc_bytes(8);
+    let rotate = |address: u64, size: u64, direction: u64| {
+        guest::write64(bytes, size);
+        let status = call_export("MmRotatePhysicalView", &[address, bytes, 0, direction, 0, 0]);
+        (status, guest::read64(bytes))
+    };
+    assert(rotate(0x10_0001, 0x1000, 0) == (Some(signed_status(0xC000_00EF)), 0), "physical-view: endereco desalinhado = STATUS_INVALID_PARAMETER_1 e zero bytes");
+    assert(rotate(0x10_0000, 0x1001, 0).0 == Some(signed_status(0xC000_00F0)) && rotate(0x10_0000, 0, 0).0 == Some(signed_status(0xC000_00F0)), "physical-view: tamanho desalinhado ou zero = STATUS_INVALID_PARAMETER_2");
+    assert(rotate(0x10_0000, 0x1000, 4).0 == Some(signed_status(0xC000_00F1)), "physical-view: direcao 4 = STATUS_INVALID_PARAMETER_3");
+    assert(rotate(0x7FF0_0000_0000, 0x1000, 0) == (Some(signed_status(0xC000_0005)), 0), "physical-view: faixa sem VAD = STATUS_ACCESS_VIOLATION");
+    match memory::map_user_region(0x2000) {
+        Ok(region) => assert(rotate(region, 0x1000, 2) == (Some(signed_status(0xC000_0018)), 0), "physical-view: VAD que nao e de vista giratoria = STATUS_CONFLICTING_ADDRESSES"),
+        Err(_) => assert(false, "physical-view: regiao de usuario"),
+    }
+    guest::free_bytes(bytes);
+}
+
+/// ZwQuerySection(SectionBasicInformation) de uma seção do pagefile.
+fn query_section_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let block = guest::alloc_bytes(0x200);
+    let attributes = at::<nt::ObjectAttributes>(block);
+    attributes.length.set(48);
+    attributes.attributes.set(0x200);
+    let size = block + 0x40;
+    let handle = block + 0x48;
+    let output = block + 0x80;
+    let returned = block + 0x50;
+    guest::write64(size, 0x3000);
+    let created = call_export("ZwCreateSection", &[handle, 0xF001F, block, size, 4, 0x0800_0000, 0]);
+    let section = guest::read64(handle);
+    guest::write64(returned, 0);
+    let basic = call_export("ZwQuerySection", &[section, 0, output, 0x18, returned]);
+    let information = at::<nt::SectionBasicInformation>(output);
+    assert(created == Some(0) && basic == Some(0) && information.base_address.get() == 0 && information.allocation_attributes.get() & 0x0800_0000 != 0 && information.maximum_size.quad_part.get() == 0x3000 && guest::read64(returned) == 0x18, "query-section: SectionBasicInformation com SEC_COMMIT, tamanho maximo e ResultLength");
+    assert(call_export("ZwQuerySection", &[section, 0, output, 0x10, 0]) == Some(signed_status(0xC000_0004)) && call_export("ZwQuerySection", &[section, 7, output, 0x40, 0]) == Some(signed_status(0xC000_0003)) && call_export("ZwQuerySection", &[section, 1, output, 0x40, 0]) == Some(signed_status(0xC000_0049)), "query-section: buffer curto, classe invalida e classe de imagem numa secao comum");
+    assert(call_export("ZwQuerySection", &[0xFFFF_FFFF_8000_7FF0, 0, output, 0x18, 0]) == Some(signed_status(0xC000_0008)), "query-section: handle invalido = STATUS_INVALID_HANDLE");
+    assert(call_export("ZwClose", &[section]) == Some(0), "query-section: ZwClose da secao");
+    guest::free_bytes(block);
+}
+
+/// NtShutdownSystem: ações inválidas recusadas e a tradução das válidas
+/// (que não voltam); o SLP_TYPa do \_S5_ do desligamento ACPI.
+fn po_shutdown_exports(assert: Assert) {
+    use crate::hal::firmware_return;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::po::shutdown::{self, Request};
+    assert(call_export("NtShutdownSystem", &[4]) == Some(signed_status(0xC000_000D)) && call_export("NtShutdownSystem", &[0xFFFF_FFFF]) == Some(signed_status(0xC000_000D)), "po-shutdown: acao fora de 0..3 = STATUS_INVALID_PARAMETER");
+    assert(shutdown::translate(0) == Some(Request::PowerAction(4)) && shutdown::translate(1) == Some(Request::PowerAction(5)) && shutdown::translate(2) == Some(Request::PowerAction(6)) && shutdown::translate(3) == Some(Request::RebootForRecovery) && shutdown::translate(4).is_none(), "po-shutdown: ShutdownNoReboot/Reboot/PowerOff viram PowerActionShutdown/Reset/Off e 3 o reinicio para recuperacao");
+    let package = |first: &[u8]| {
+        let mut bytes = alloc::vec![0x10, 0x08];
+        bytes.extend_from_slice(b"_S5_");
+        bytes.extend_from_slice(&[0x12, 0x08, 0x04]);
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(&[0x0A, 0x05, 0x00, 0x00]);
+        bytes
+    };
+    let real = crate::hal::acpi::get_table("DSDT", 0, false).and_then(|table| firmware_return::s5_sleep_type(&table.bytes));
+    assert(firmware_return::s5_sleep_type(&package(&[0x0A, 0x07])) == Some(7) && firmware_return::s5_sleep_type(&package(&[0x00])) == Some(0) && firmware_return::s5_sleep_type(&package(&[0x01])) == Some(1) && firmware_return::s5_sleep_type(b"_S5_\x11").is_none() && real.is_some(), "po-shutdown: SLP_TYPa do pacote \\_S5_ (BytePrefix, ZeroOp, OneOp) e o da DSDT do QEMU");
+}
+
+/// PoNotifyVSyncChange: o limite de latência do sistema segue o VSync.
+fn po_vsync_exports(assert: Assert) {
+    use crate::ntos::po::latency;
+    let _ = call_export("PoNotifyVSyncChange", &[0]);
+    let off = latency::system_latency();
+    let _ = call_export("PoNotifyVSyncChange", &[1]);
+    let on = latency::system_latency();
+    let _ = call_export("PoNotifyVSyncChange", &[0x101]);
+    assert(off == (false, latency::LATENCY_TOLERANCE_LIMIT, latency::LATENCY_TOLERANCE_LIMIT) && on == (true, latency::VSYNC_LATENCY_LIMIT, latency::VSYNC_LATENCY_LIMIT) && latency::system_latency() == on, "po-vsync: VSync desligado usa o PpmLatencyToleranceLimit (100000) e ligado o limite do quadro (13001); so o byte baixo conta");
+}
+
+/// TtmNotifyDeviceArrival/Departure/Input: validação e a sessão de TTM.
+fn ttm_device_notifications_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ttm::device;
+    let block = guest::alloc_bytes(0x400);
+    let properties = block;
+    let name = block + 0x40;
+    let text = block + 0x80;
+    let arrival = |properties: u64, name: u64| call_export("TtmNotifyDeviceArrival", &[1, 0x1234, properties, 0, name]);
+    assert(arrival(0, 0) == Some(signed_status(0xC000_000D)) && arrival(properties, 0) == Some(signed_status(0xC000_000D)), "ttm-device-notifications: Properties ausente ou com o primeiro ponteiro nulo");
+    guest::write64(properties, 0x1111);
+    guest::write64(properties + 0x10, 0x2222);
+    guest::write64(properties + 0x18, 0x3333);
+    assert(arrival(properties, 0) == Some(signed_status(0xC000_000D)), "ttm-device-notifications: ponteiros +0x10 e +0x18 juntos recusados");
+    guest::write64(properties + 0x18, 0);
+    guest::write_bytes(text, &[0x41; 0x300]);
+    guest::write64(name + 8, text);
+    assert(arrival(properties, name) == Some(signed_status(0xC000_000D)), "ttm-device-notifications: nome sem NUL em 260 caracteres");
+    guest::write16(text + 10, 0);
+    // O System não tem sessão: a sessão de TTM não existe.
+    assert(!device::enabled() && arrival(properties, name) == Some(signed_status(0xC000_0455)) && device::session_status() == 0xC000_0455, "ttm-device-notifications: o System nao tem sessao de TTM");
+    assert(call_export("TtmNotifyDeviceDeparture", &[1, 0x1234]).is_some() && call_export("TtmNotifyDeviceInput", &[1, 0x1234, 1]).is_some(), "ttm-device-notifications: saida e entrada sem sessao nao fazem nada");
+    guest::free_bytes(block);
+}
+
+/// ZwWaitForMultipleObjects: WaitAny com índice, WaitAll, prazo zero e as
+/// validações do ObWaitForMultipleObjects.
+fn zw_wait_multiple_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let block = guest::alloc_bytes(0x200);
+    let attributes = at::<nt::ObjectAttributes>(block);
+    attributes.length.set(48);
+    attributes.attributes.set(0x200);
+    let handles = block + 0x40;
+    let timeout = block + 0x80;
+    guest::write64(timeout, 0);
+    // Notificação não sinalizada e sincronização sinalizada.
+    let first = call_export("ZwCreateEvent", &[handles, 0x1F0003, block, 0, 0]);
+    let second = call_export("ZwCreateEvent", &[handles + 8, 0x1F0003, block, 1, 1]);
+    let (one, two) = (guest::read64(handles), guest::read64(handles + 8));
+    let wait = |count: u64, array: u64, wait_type: u64| call_export("ZwWaitForMultipleObjects", &[count, array, wait_type, 0, timeout]);
+    let any = wait(2, handles, 1);
+    let drained = wait(2, handles, 1);
+    assert(first == Some(0) && second == Some(0) && any == Some(1) && drained == Some(0x102), "zw-wait-multiple: WaitAny devolve o indice do sinalizado e consome o evento de sincronizacao");
+    let _ = call_export("ZwSetEvent", &[one, 0]);
+    let partial = wait(2, handles, 0);
+    let _ = call_export("ZwSetEvent", &[two, 0]);
+    let all = wait(2, handles, 0);
+    assert(partial == Some(0x102) && all == Some(0) && wait(1, handles + 8, 1) == Some(0x102) && wait(1, handles, 1) == Some(0), "zw-wait-multiple: WaitAll so com todos sinalizados; consome o de sincronizacao e mantem o de notificacao");
+    guest::write64(handles + 0x10, one);
+    guest::write64(handles + 0x18, one);
+    guest::write64(handles + 0x20, 0xFFFF_FFFF_8000_7FF0);
+    assert(wait(0, handles, 1) == Some(signed_status(0xC000_00EF)) && wait(65, handles, 1) == Some(signed_status(0xC000_00EF)) && wait(2, handles, 2) == Some(signed_status(0xC000_00F1)) && wait(2, handles + 0x10, 0) == Some(signed_status(0xC000_0030)) && wait(2, handles + 0x18, 1) == Some(signed_status(0xC000_0008)), "zw-wait-multiple: Count, WaitType, objeto repetido no WaitAll e handle invalido recusados");
+    assert(call_export("ZwClose", &[one]) == Some(0) && call_export("ZwClose", &[two]) == Some(0), "zw-wait-multiple: ZwClose dos eventos");
+    guest::free_bytes(block);
+}
+
+/// ZwYieldExecution fora de uma thread de sistema: sem outra pronta para
+/// esta thread, STATUS_NO_YIELD_PERFORMED.
+fn zw_yield_execution_exports(assert: Assert) {
+    assert(call_export("ZwYieldExecution", &[]) == Some(0x4000_0024), "zw-yield-execution: a thread do boot nao cede (STATUS_NO_YIELD_PERFORMED)");
+}
+
+/// O que o DriverEntry do núcleo gráfico encontra no kernel: o
+/// POWER_PLATFORM_INFORMATION do ZwPowerInformation, as chaves
+/// Control\GraphicsDrivers/Video/Class da instalação e o
+/// ObOpenObjectByPointer de um DEVICE_OBJECT (a segurança aplicada pela
+/// wdmsec).
+fn graphics_stack_support(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ob::{object_manager, object_types};
+    let block = guest::alloc_bytes(0x100);
+    guest::write8(block, 0xAA);
+    assert(call_export("ZwPowerInformation", &[66, 0, 0, block, 1]) == Some(0) && guest::read8(block) == 0 && call_export("ZwPowerInformation", &[66, block + 8, 1, block, 1]) == Some(signed_status(0xC000_000D)) && call_export("ZwPowerInformation", &[66, 0, 0, block, 0]) == Some(signed_status(0xC000_000D)), "graphics-stack: PlatformInformation sem AoAc, sem entrada e com saida");
+    let control = "\\Registry\\Machine\\System\\CurrentControlSet\\Control";
+    let dword = |path: &str, name: &str| registry::read_value_by_path(path, name).map(|value| value.data);
+    let graphics = alloc::format!("{control}\\GraphicsDrivers");
+    assert(dword(&graphics, "DxgKrnlVersion") == Some(alloc::vec![0x04, 0xC0, 0, 0]) && dword(&graphics, "MinDxgKrnlVersion") == Some(alloc::vec![0x13, 0x50, 0, 0]) && dword(&graphics, "PlatformSupportMiracast") == Some(alloc::vec![1, 0, 0, 0]) && registry::node_by_path(&alloc::format!("{control}\\Video")).is_some() && registry::node_by_path(&alloc::format!("{control}\\Class")).is_some(), "graphics-stack: Control\\GraphicsDrivers com os valores da instalacao, Video e Class");
+    // \Device\CNG: um DEVICE_OBJECT do IoCreateDevice aberto por ponteiro.
+    let device = object_manager::lookup("\\Device\\CNG").and_then(object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+    let handle = block + 0x10;
+    let object = block + 0x18;
+    let opened = call_export("ObOpenObjectByPointer", &[device, 0x200, 0, 0x40000, object_types::device_type().pointer, 0, handle]);
+    let referenced = call_export("ObReferenceObjectByHandle", &[guest::read64(handle), 0, object_types::device_type().pointer, 0, object, 0]);
+    assert(device != 0 && opened == Some(0) && guest::read64(handle) & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000 && referenced == Some(0) && guest::read64(object) == device, "graphics-stack: ObOpenObjectByPointer de um DEVICE_OBJECT e a referencia pelo handle");
+    let _ = call_export("ObfDereferenceObject", &[device]);
+    assert(call_export("ZwClose", &[guest::read64(handle)]) == Some(0), "graphics-stack: ZwClose do handle do dispositivo");
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -11950,6 +12192,17 @@ pub fn run(assert: Assert) {
     bgk_console_exports(assert);
     rtl_capability_sids_exports(assert);
     se_sddl_exports(assert);
+    etw_stack_walk_exports(assert);
+    inbv_display_ownership_exports(assert);
+    io_root_device_exports(assert);
+    physical_view_exports(assert);
+    query_section_exports(assert);
+    po_shutdown_exports(assert);
+    po_vsync_exports(assert);
+    ttm_device_notifications_exports(assert);
+    zw_wait_multiple_exports(assert);
+    zw_yield_execution_exports(assert);
+    graphics_stack_support(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

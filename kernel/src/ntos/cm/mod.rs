@@ -20,6 +20,7 @@ pub mod crypto_defaults;
 pub mod feature_usage;
 pub mod feature_usage_buffer;
 pub mod feature_usage_delivery;
+pub mod graphics_defaults;
 pub mod hw_description;
 pub mod key;
 pub mod service;

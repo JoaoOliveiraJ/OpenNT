@@ -538,3 +538,18 @@ pub mod ob_nt_duplicate_object {
 
     pub static GROUP: Group = Group { name: "ob-nt-duplicate-object", names: &["NtDuplicateObject"], handlers: &[nt_duplicate_object], data_exports: &[] };
 }
+
+pub mod zw_wait_multiple {
+    //! ZwWaitForMultipleObjects em KernelMode; a lógica mora em `ob/wait`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ob::wait;
+    use crate::rtl::KernelError;
+
+    /// ZwWaitForMultipleObjects(Count, Handles, WaitType, Alertable, Timeout).
+    fn wait_for_multiple_objects(call: &Call) -> Result<u64, KernelError> {
+        wait::wait_for_multiple_objects(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4) & 0xFF != 0, call.arg(5))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-wait-multiple", names: &["ZwWaitForMultipleObjects"], handlers: &[wait_for_multiple_objects], data_exports: &[] };
+}

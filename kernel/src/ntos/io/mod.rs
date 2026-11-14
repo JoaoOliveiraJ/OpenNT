@@ -51,3 +51,4 @@ pub mod share_access;
 pub mod arc_name;
 pub mod shutdown;
 pub mod device_removal;
+pub mod root_device;

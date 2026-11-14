@@ -804,3 +804,34 @@ pub mod mm_advance_mdl {
 
     pub static GROUP: Group = Group { name: "mm-advance-mdl", names: &["MmAdvanceMdl"], handlers: &[advance_mdl], data_exports: &[] };
 }
+
+pub mod physical_view {
+    //! MmRotatePhysicalView; a lógica mora em `mm/physical_view`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::physical_view;
+    use crate::rtl::KernelError;
+
+    /// MmRotatePhysicalView(VirtualAddress, NumberOfBytes, NewMdl, Direction,
+    /// CopyFunction, Context).
+    fn rotate_physical_view(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(physical_view::rotate_physical_view(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6))))
+    }
+
+    pub static GROUP: Group = Group { name: "physical-view", names: &["MmRotatePhysicalView"], handlers: &[rotate_physical_view], data_exports: &[] };
+}
+
+pub mod query_section {
+    //! ZwQuerySection em KernelMode; a lógica mora em `mm/section/query`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::section::query;
+    use crate::rtl::KernelError;
+
+    /// ZwQuerySection(SectionHandle, Class, Information, Length, ResultLength).
+    fn query_section(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(query::query(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "query-section", names: &["ZwQuerySection"], handlers: &[query_section], data_exports: &[] };
+}

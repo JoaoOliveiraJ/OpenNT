@@ -1,7 +1,8 @@
 //! Chaves de serviço de drivers inbox do Windows que o OpenNT inicia sob
 //! demanda (`--start-driver` ou `sc start`): o provedor dos contadores de
 //! desempenho (pcw), o console (condrv), o driver de segurança do kernel
-//! (KSecDD) e a pilha de rede (NDIS, Tcpip, AFD).
+//! (KSecDD), a pilha de rede (NDIS, Tcpip, AFD) e o núcleo gráfico (DXGKrnl,
+//! de sistema (1) na instalação).
 //!
 //! Os valores são os da instalação do Windows 10 19041 (Type, ErrorControl,
 //! Group, ImagePath, Tag, DisplayName e as versões de NDIS do Tcpip), com
@@ -52,6 +53,7 @@ const DRIVERS: &[InboxDriver] = &[
         tag: Some(3),
         dwords: &[("BootFlags", 1), ("NdisMajorVersion", 6), ("NdisMinorVersion", 40), ("DriverMajorVersion", 0), ("DriverMinorVersion", 0)],
     },
+    InboxDriver { name: "DXGKrnl", display_name: Some("LDDM Graphics Subsystem"), image_path: "\\SystemRoot\\System32\\drivers\\dxgkrnl.sys", start: SERVICE_DEMAND_START, error_control: 0, group: "Video Init", tag: Some(1), dwords: &[] },
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), image_path: "\\SystemRoot\\system32\\drivers\\afd.sys", start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
 ];
 

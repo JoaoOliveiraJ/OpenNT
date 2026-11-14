@@ -10,3 +10,5 @@ pub mod exports;
 pub mod coalescing;
 pub mod device_wake;
 pub mod system_state;
+pub mod latency;
+pub mod shutdown;

@@ -8,8 +8,12 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
 
+use crate::ntos::ob::object_manager::ObjectData;
 use crate::ntos::ob::objects::driver as driver_objects;
-use crate::ntos::ob::object_types;
+use crate::ntos::ob::object_types::{self, ObjectType};
+use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
+use crate::ntos::ob::object_access;
+use crate::ntos::se::model::SecurityPolicy;
 use crate::hal::cpu;
 use crate::ntos::ke::{irql, pcr};
 use crate::rtl::{KernelError, SpinLock};
@@ -42,6 +46,32 @@ struct Record {
     unlinked: bool,
     driver: u64,
     held: bool,
+    /// Segurança capturada na criação, a do ObOpenObjectByPointer.
+    security: SecurityPolicy,
+}
+
+/// O dono dos DEVICE_OBJECTs para o ObOpenObjectByPointer e o
+/// ObReferenceObjectByHandle (`ob/open_pointer`).
+struct DeviceOwner;
+
+static OWNER: DeviceOwner = DeviceOwner;
+
+impl ObjectOwner for DeviceOwner {
+    fn object_type(&self, _pointer: u64) -> ObjectType {
+        object_types::device_type()
+    }
+    fn reference(&self, pointer: u64) {
+        let _ = reference(pointer);
+    }
+    fn dereference(&self, pointer: u64) {
+        let _ = dereference(pointer);
+    }
+    fn security(&self, pointer: u64) -> SecurityPolicy {
+        DEVICES.lock().get(&pointer).map(|record| record.security.clone()).unwrap_or_default()
+    }
+    fn data(&self, pointer: u64) -> ObjectData {
+        ObjectData::pointer(pointer)
+    }
 }
 
 static DEVICES: SpinLock<BTreeMap<u64, Record>> = SpinLock::new(BTreeMap::new());
@@ -98,8 +128,10 @@ pub fn register(pointer: u64, destroy: Option<fn(u64)>, unlink: Option<fn(u64)>)
     device(pointer).device_object_extension.set(extension);
     let driver = device(pointer).driver_object.get();
     let held = driver != 0 && driver_objects::reference(driver).is_some();
-    DEVICES.lock().insert(pointer, Record { extension, references: 1, retired: false, destroy, unlink, unlinked: false, driver, held });
+    let security = object_access::capture(object_access::subject());
+    DEVICES.lock().insert(pointer, Record { extension, references: 1, retired: false, destroy, unlink, unlinked: false, driver, held, security });
     object_types::device_type();
+    open_pointer::register_owner(Slot::Device, is_device, &OWNER);
     object_types::bind_native(pointer, "Device")?;
     Ok(pointer)
 }

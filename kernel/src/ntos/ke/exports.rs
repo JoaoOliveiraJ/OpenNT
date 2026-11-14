@@ -949,3 +949,18 @@ pub mod ke_user_callback {
 
     pub static GROUP: Group = Group { name: "ke-user-callback", names: &["KeUserModeCallback"], handlers: &[user_mode_callback], data_exports: &[] };
 }
+
+pub mod zw_yield_execution {
+    //! ZwYieldExecution; a lógica mora em `ke/thread_dispatch` (as threads de
+    //! sistema nativas cedem pela interceptação de `ps/kernel_threads`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ke::thread_dispatch;
+    use crate::rtl::KernelError;
+
+    fn yield_execution(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(thread_dispatch::yield_execution()?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-yield-execution", names: &["ZwYieldExecution"], handlers: &[yield_execution], data_exports: &[] };
+}

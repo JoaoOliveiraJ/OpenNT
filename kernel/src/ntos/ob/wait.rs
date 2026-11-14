@@ -1,13 +1,17 @@
 //! Espera por handle em modo kernel (ZwWaitForSingleObject,
-//! ObWaitForSingleObject e ObWaitForMultipleObjects).
+//! ZwWaitForMultipleObjects, ObWaitForSingleObject e ObWaitForMultipleObjects).
 //!
 //! O handle é resolvido na ordem: a tabela nativa (abertos por ponteiro),
 //! threads de sistema, os eventos abertos pelo núcleo de handles de kernel do
 //! I/O e, para os Ob*, a tabela de handles de usuário do processo corrente;
-//! a espera em si é a do dispatcher do Ke.
+//! a espera em si é a do dispatcher do Ke. O objeto de espera de um arquivo é
+//! o FILE_OBJECT.Event (o DefaultObject do tipo File).
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::FileObject;
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::ke::dispatcher;
@@ -46,6 +50,9 @@ pub fn wait_for_single_object(handle: u64, alertable: bool, timeout: u64) -> u64
 }
 
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 /// O direito que o ObReferenceObjectByHandle das esperas pede.
 const SYNCHRONIZE: u32 = 0x10_0000;
@@ -87,7 +94,13 @@ fn wait_object(handle: u64, previous_mode: u8) -> Result<(Option<u64>, Held), u3
                 return Err(STATUS_ACCESS_DENIED);
             }
             opened.item.reference();
-            let pointer = DISPATCHER_TYPES.contains(&opened.item.object_type.name.as_str()).then_some(opened.item.pointer);
+            let name = opened.item.object_type.name.as_str();
+            let pointer = if name == "File" {
+                // SAFETY: FILE_OBJECT vivo, retido acima.
+                Some(unsafe { FileObject::at(opened.item.pointer) }.event.address())
+            } else {
+                DISPATCHER_TYPES.contains(&name).then_some(opened.item.pointer)
+            };
             return Ok((pointer, Held::Native(opened)));
         }
         None => {}
@@ -146,6 +159,13 @@ pub fn ob_wait_for_multiple_objects(count: u32, handles: u64, previous_mode: u8,
             }
         }
     }
+    // WaitAll com o mesmo objeto duas vezes: STATUS_INVALID_PARAMETER_MIX
+    // (a ordenação do ObWaitForMultipleObjects acha o repetido).
+    let real: Vec<u64> = objects.iter().flatten().copied().collect();
+    if wait_type == 0 && count > 1 && real.iter().collect::<BTreeSet<_>>().len() != real.len() {
+        held.into_iter().for_each(Held::release);
+        return Ok(STATUS_INVALID_PARAMETER_MIX);
+    }
     // Um objeto padrão (sempre sinalizado) satisfaz WaitAny no índice dele;
     // em WaitAll só os de verdade contam.
     let default = objects.iter().position(Option::is_none);
@@ -166,3 +186,48 @@ pub fn ob_wait_for_multiple_objects(count: u32, handles: u64, previous_mode: u8,
     Ok(status)
 }
 
+/// ZwWaitForMultipleObjects(Count, Handles, WaitType, Alertable, Timeout): o
+/// NtWaitForMultipleObjects em KernelMode. Count fora de 1..=64 dá
+/// STATUS_INVALID_PARAMETER_1 e WaitType além de WaitAny
+/// STATUS_INVALID_PARAMETER_3 antes de olhar os handles; depois o
+/// ObWaitForMultipleObjects. Devolve o valor nativo do export (NTSTATUS com
+/// sinal ou o índice do WaitAny).
+pub fn wait_for_multiple_objects(count: u32, handles: u64, wait_type: u32, alertable: bool, timeout: u64) -> Result<u64, KernelError> {
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS {
+        return Ok(signed_status(STATUS_INVALID_PARAMETER_1));
+    }
+    if wait_type > 1 {
+        return Ok(signed_status(STATUS_INVALID_PARAMETER_3));
+    }
+    Ok(signed_status(ob_wait_for_multiple_objects(count, handles, 0, wait_type, 0, alertable, timeout)?))
+}
+
+/// Os objetos de espera dos handles para uma thread de sistema nativa, que
+/// espera sondada (`ps/kernel_threads`): as validações do
+/// NtWaitForMultipleObjects e do ObWaitForMultipleObjects, sem reter os
+/// corpos (como a espera única dessas threads). `Err` = o status imediato:
+/// a falha, ou o índice de um objeto padrão (sempre sinalizado) num WaitAny.
+pub fn wait_objects_of_handles(count: u32, handles: u64, wait_type: u32) -> Result<Vec<u64>, u32> {
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS {
+        return Err(STATUS_INVALID_PARAMETER_1);
+    }
+    if wait_type > 1 {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    let mut objects = Vec::new();
+    for index in 0..count as u64 {
+        let (pointer, held) = wait_object(guest::read64(handles + index * 8), 0)?;
+        held.release();
+        objects.push(pointer);
+    }
+    if wait_type == 1 {
+        if let Some(index) = objects.iter().position(Option::is_none) {
+            return Err(index as u32);
+        }
+    }
+    let real: Vec<u64> = objects.into_iter().flatten().collect();
+    if wait_type == 0 && count > 1 && real.iter().collect::<BTreeSet<_>>().len() != real.len() {
+        return Err(STATUS_INVALID_PARAMETER_MIX);
+    }
+    Ok(real)
+}

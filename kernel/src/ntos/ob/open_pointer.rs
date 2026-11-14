@@ -2,7 +2,8 @@
 //!
 //! `describe` identifica o dono do corpo, nesta ordem (processo,
 //! thread, token, callback, driver, seção, arquivo, dispatcher, namespace,
-//! silo), e entrega suas operações reais de retenção, liberação e handle.
+//! silo, dispositivo), e entrega suas operações reais de retenção, liberação
+//! e handle.
 //! Os donos de módulos posteriores registram seu slot quando chegam.
 //!
 //! O caminho da tabela de handles de usuário (`ps/user/state`) entra na
@@ -133,11 +134,12 @@ pub enum Slot {
     Dispatcher,
     Namespace,
     Silo,
+    Device,
 }
 
 type Recognizer = fn(u64) -> bool;
 
-static OWNERS: SpinLock<[Option<(Recognizer, &'static dyn ObjectOwner)>; 10]> = SpinLock::new([None; 10]);
+static OWNERS: SpinLock<[Option<(Recognizer, &'static dyn ObjectOwner)>; 11]> = SpinLock::new([None; 11]);
 
 /// Registra o dono de um slot (os módulos de objetos, ao inicializar).
 pub fn register_owner(slot: Slot, recognizes: Recognizer, owner: &'static dyn ObjectOwner) {

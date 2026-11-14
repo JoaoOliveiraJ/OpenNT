@@ -377,9 +377,20 @@ impl SendRequest {
     }
 }
 
-/// SystemCodeIntegrityInformation pela consulta da própria CI.
+/// SystemCodeIntegrityInformation pela consulta da própria CI. Como o
+/// ExpQuerySystemInformation, o SeCodeIntegrityQueryInformation recebe o
+/// ReturnLength numa variável local do kernel (a CI grava nele sem conferir
+/// o ponteiro), copiada depois para o do chamador, que pode ser NULL.
 fn query_information(buffer: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
-    Ok(invoke(INFORMATION.load(Ordering::SeqCst), &[buffer, length as u64, 0, returned]))
+    let local = allocate(8)?;
+    let status = invoke(INFORMATION.load(Ordering::SeqCst), &[buffer, length as u64, 0, local]);
+    // SAFETY: a célula ULONG própria, recém-alocada.
+    let written = unsafe { Field::<u32>::at(local) }.get();
+    guest::free_bytes(local);
+    if returned != 0 {
+        guest::try_write::<u32>(returned, written)?;
+    }
+    Ok(status)
 }
 
 /// Carrega a ci.dll, chama o CiInitialize com os provedores privados reais,

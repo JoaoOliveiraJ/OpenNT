@@ -28,6 +28,7 @@ pub mod acpi_native;
 pub mod pci_config;
 pub mod pci_native;
 pub mod firmware_environment;
+pub mod firmware_return;
 pub mod private_dispatch;
 pub mod public_dispatch;
 pub mod hypervisor;

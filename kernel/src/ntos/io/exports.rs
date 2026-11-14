@@ -1950,3 +1950,17 @@ pub mod io_device_eject {
 
     pub static GROUP: Group = Group { name: "io-device-eject", names: &["IoRequestDeviceEject", "IoRequestDeviceEjectEx"], handlers: &[request_device_eject, request_device_eject_ex], data_exports: &[] };
 }
+
+pub mod io_root_device {
+    //! IoReportRootDevice; a lógica mora em `io/root_device`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::root_device;
+    use crate::rtl::KernelError;
+
+    fn report_root_device(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(root_device::report_root_device(call.arg(1))?))
+    }
+
+    pub static GROUP: Group = Group { name: "io-root-device", names: &["IoReportRootDevice"], handlers: &[report_root_device], data_exports: &[] };
+}

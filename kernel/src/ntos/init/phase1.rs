@@ -64,6 +64,8 @@ pub fn init() {
     // Catálogo CNG publicado antes de qualquer processo de usuário. O cng.sys
     // é o binário real do Windows no volume: o OpenNT não o distribui.
     crate::ntos::cm::cng_defaults::initialize().unwrap_or_else(|error| panic!("CNG: {error}"));
+    // Control\GraphicsDrivers da instalação, que o dxgkrnl.sys abre no DriverEntry.
+    crate::ntos::cm::graphics_defaults::initialize().unwrap_or_else(|error| panic!("GraphicsDrivers: {error}"));
     // O cng.sys real do volume, antes de qualquer processo de usuário: imagem,
     // imports e DriverEntry completos, publicando \Device\CNG.
     match crate::ntos::mm::sysload::load("cng.sys") {
