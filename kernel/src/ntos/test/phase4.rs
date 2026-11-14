@@ -107,7 +107,8 @@ fn power_manager(assert: Assert) {
     po::mark_power_request_done(device);
     // PoCallDriver é o IofCallDriver (ntoskrnl 19041): o IRP desce para o
     // dispositivo pedido, que passa a ser o da posição corrente. Um driver
-    // sem MajorFunction[IRP_MJ_POWER] conclui com STATUS_INVALID_DEVICE_REQUEST.
+    // sem MajorFunction[IRP_MJ_POWER] recebe o status interno NOT_SUPPORTED
+    // do IofCallDriver do OpenNT, sem conclusão.
     let driver = guest::alloc_bytes(DriverObject::SIZE);
     unsafe { DeviceObject::at(device) }.driver_object.set(driver);
     unsafe { DeviceObject::at(device) }.stack_size.set(1);
@@ -116,7 +117,7 @@ fn power_manager(assert: Assert) {
     let status = po::call_driver_down_the_stack(device, packet);
     // O slot de cima é o do primeiro driver (o IofCallDriver gravou o dispositivo nele).
     let location = unsafe { IoStackLocation::at(crate::ntos::io::irp_builder::first_stack_location(packet, 2)) };
-    assert(status == 0xC000_0010 && irp.io_status.status.get() == 0xC000_0010u32 as i32 && location.device_object.get() == device, "power: PoCallDriver desce pelo IofCallDriver");
+    assert(status == crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32 && irp.current_location.get() == 2 && location.device_object.get() == device, "power: PoCallDriver desce pelo IofCallDriver");
     guest::free_bytes(packet);
     guest::free_bytes(driver);
     unsafe { DeviceObject::at(device) }.driver_object.set(0);

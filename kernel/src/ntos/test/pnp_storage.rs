@@ -24,11 +24,12 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::drivers::bus::{pci, pci_interface};
 use crate::hal::amd64::{native_call, routine_stubs};
 use crate::ntos::inc::types::extra_storage::{BusInterfaceStandard, DeviceDescription, DmaAdapter, DmaOperations, PnpBusInformation};
-use crate::ntos::inc::types::{DeviceCapabilities, DeviceObject, IoResourceDescriptor, IoResourceRequirementsList, Irp, NtStruct};
+use crate::ntos::inc::types::{DeviceCapabilities, DeviceObject, IoResourceDescriptor, IoResourceRequirementsList, IoStackLocation, Irp, NtStruct};
 use crate::ntos::io::irp_builder::{self as builder, BuildOptions};
 use crate::ntos::io::pnp::{self, devnode, install, resources, tree};
 use crate::ntos::mm::guest_memory as guest;
@@ -37,14 +38,14 @@ use crate::ntos::rtl::guest_strings;
 type Assert = fn(bool, &str);
 
 /// Um IRP_MJ_PNP montado à mão no PDO: (status, Information).
-fn pnp_irp(pdo: u64, minor: u8, fill: impl FnOnce(&crate::ntos::inc::types::IoStackLocation)) -> (i32, u64) {
+fn pnp_irp(pdo: u64, minor: u8, fill: impl FnOnce(&IoStackLocation)) -> (i32, u64) {
     let packet = guest::alloc_bytes(builder::size_for(1));
     builder::build(packet, &BuildOptions { major: 0x1B, minor, device_object: pdo, ..Default::default() });
     // SAFETY: IRP recém-montado.
     let irp = unsafe { Irp::at(packet) };
     irp.io_status.status.set(0xC000_00BBu32 as i32);
     // SAFETY: a posição do topo do IRP de uma posição.
-    let location = unsafe { crate::ntos::inc::types::IoStackLocation::at(builder::first_stack_location(packet, 1)) };
+    let location = unsafe { IoStackLocation::at(builder::first_stack_location(packet, 1)) };
     fill(location);
     let status = crate::ntos::io::io_manager::iof_call_driver(pdo, packet);
     let information = irp.io_status.information.get();
@@ -307,6 +308,23 @@ fn io_attribution(assert: Assert) {
     guest::free_bytes(output);
 }
 
+/// DeviceObject da posição corrente e MinorFunction do último IRP de
+/// energia visto pelo driver de teste.
+static POWER_SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// IRP_MJ_POWER de teste: anota o pedido e o conclui com sucesso.
+extern "win64" fn test_power_complete(_device: u64, packet: u64) -> u64 {
+    // SAFETY: IRP vivo entregue pelo IofCallDriver.
+    let irp = unsafe { Irp::at(packet) };
+    // SAFETY: a posição corrente que o IofCallDriver acabou de ajustar.
+    let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    POWER_SEEN[0].store(location.device_object.get(), Ordering::SeqCst);
+    POWER_SEEN[1].store(location.minor_function.get() as u64, Ordering::SeqCst);
+    irp.io_status.status.set(0);
+    crate::ntos::io::io_manager::iof_complete_request(packet);
+    0
+}
+
 /// O suporte de I/O que a pilha de disco usa: VPB do IoCreateDevice, nome
 /// em colisão, MDL do IoBuildSynchronousFsdRequest e chave com separador no
 /// fim.
@@ -347,13 +365,17 @@ fn io_support(assert: Assert) {
     let second = super::phase6::call_export("IoCreateSymbolicLink", &[link, target]).unwrap_or(1) as u32;
     assert(first == 0 && second == 0xC000_0035, "pnp-storage: IoCreateSymbolicLink em colisao devolve STATUS_OBJECT_NAME_COLLISION");
     let _ = super::phase6::call_export("IoDeleteSymbolicLink", &[link]);
-    // PoRequestPowerIrp: o IRP desce pelo IofCallDriver ao topo da pilha (um
-    // driver sem MajorFunction[IRP_MJ_POWER] o conclui com
-    // STATUS_INVALID_DEVICE_REQUEST) e o Po o libera na conclusão; devolve
-    // STATUS_PENDING e o IRP em *Irp.
+    // PoRequestPowerIrp: o IRP desce pelo IofCallDriver ao topo da pilha (o
+    // MajorFunction[IRP_MJ_POWER] do driver o conclui) e o Po o libera na
+    // conclusão; devolve STATUS_PENDING e o IRP em *Irp.
+    // SAFETY: DRIVER_OBJECT de teste, vivo até o fim da função.
+    unsafe { DriverObject::at(driver) }.major_function[0x16].set(test_power_complete as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    POWER_SEEN[0].store(0, Ordering::SeqCst);
     let irp_out = guest::alloc_bytes(8);
     let power = super::phase6::call_export("PoRequestPowerIrp", &[device, 2, 1, 0, 0, irp_out]).unwrap_or(0) as u32;
-    assert(power == 0x103 && guest::read64(irp_out) != 0, "pnp-storage: PoRequestPowerIrp pelo IofCallDriver");
+    // MinorFunction IRP_MN_SET_POWER (2) e o DeviceObject no slot do driver.
+    let seen = (POWER_SEEN[0].load(Ordering::SeqCst), POWER_SEEN[1].load(Ordering::SeqCst));
+    assert(power == 0x103 && guest::read64(irp_out) != 0 && seen == (device, 2), "pnp-storage: PoRequestPowerIrp pelo IofCallDriver");
     guest::free_bytes(irp_out);
     let _ = super::phase6::call_export("IoDeleteDevice", &[device]);
     // Chave criada com separador no fim do nome (o "Target0\" do ataport).

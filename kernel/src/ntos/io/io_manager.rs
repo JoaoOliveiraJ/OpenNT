@@ -80,7 +80,6 @@ const IRP_DEALLOCATE_BUFFER: u32 = 0x20;
 const SL_INVOKE_ON_SUCCESS: u8 = 0x40;
 const SL_INVOKE_ON_ERROR: u8 = 0x80;
 const STATUS_MORE_PROCESSING_REQUIRED: i32 = 0xC000_0016u32 as i32;
-const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 
 /// IRP vivo do chamador (o PIRP dos exports e dos construtores daqui).
 fn irp_at(packet: u64) -> &'static Irp {
@@ -177,13 +176,7 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
     // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
     let handler = unsafe { DriverObject::at(driver) }.major_function.get(major as usize).map_or(0, Field::get);
     if handler == 0 {
-        // O NT preenche o MajorFunction que o driver não definiu com o
-        // IopInvalidDeviceRequest: o IRP volta concluído com
-        // STATUS_INVALID_DEVICE_REQUEST.
-        irp.io_status.status.set(STATUS_INVALID_DEVICE_REQUEST);
-        irp.io_status.information.set(0);
-        iof_complete_request(packet);
-        return STATUS_INVALID_DEVICE_REQUEST;
+        return status::NOT_SUPPORTED;
     }
     native_call::call(handler, &[device, packet]) as i32
 }
