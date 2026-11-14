@@ -3,7 +3,8 @@
 //! usado como um programa usaria, e o resultado vai à serial.
 //!
 //! - null.sys: um processo de teste abre \Device\Null pelo NtCreateFile; a
-//!   leitura devolve STATUS_END_OF_FILE sem tocar no buffer e a escrita
+//!   leitura devolve STATUS_END_OF_FILE sem tocar no buffer nem no IOSB (uma
+//!   falha síncrona, sem STATUS_PENDING, não o regrava) e a escrita
 //!   conclui com o tamanho inteiro (o despacho do driver, por IRPs neither).
 //! - beep.sys: o processo abre \Device\Beep, deixa pendente o IOCTL de
 //!   redirecionamento da sessão (0x10004) e manda IOCTL_BEEP_SET: o pedido
@@ -144,6 +145,9 @@ fn null_device() {
     let outcome = with_test_process("null-teste.exe", None, |_| {
         let user = UserCalls::new()?;
         let (opened, handle) = user.open("\\Device\\Null");
+        // O IOSB da abertura: uma falha síncrona sem STATUS_PENDING (a
+        // leitura no fim) não o regrava, como no IopCompleteRequest.
+        let opened_iosb = user.iosb(UserCalls::IOSB);
         let data = user.at(UserCalls::DATA);
         guest::write_bytes(data, &[0x5A; 0x100]);
         user.stack(&[user.at(UserCalls::IOSB), data, 64, 0, 0]);
@@ -154,15 +158,15 @@ fn null_device() {
         let written = user.call("NtWriteFile", [handle, 0, 0, 0]);
         let write_iosb = user.iosb(UserCalls::IOSB);
         let closed = user.close(handle);
-        Some((opened, read, read_iosb, untouched, written, write_iosb, closed))
+        Some((opened, read, read_iosb == opened_iosb, read_iosb, untouched, written, write_iosb, closed))
     })
     .flatten();
-    let Some((opened, read, read_iosb, untouched, written, write_iosb, closed)) = outcome else {
+    let Some((opened, read, iosb_kept, read_iosb, untouched, written, write_iosb, closed)) = outcome else {
         debug_print!("[null] processo de teste nao montado");
         return;
     };
     debug_print!("[null] \\Device\\Null: abertura={:#x} leitura={:#x} (iosb {:#x}, {} bytes, buffer intacto={}) escrita={:#x} (iosb {:#x}, {} bytes) fechamento={:#x}", opened, read, read_iosb.0, read_iosb.1, untouched, written, write_iosb.0, write_iosb.1, closed);
-    if opened == 0 && read == STATUS_END_OF_FILE && read_iosb.1 == 0 && untouched && written == 0 && write_iosb == (0, 77) && closed == 0 {
+    if opened == 0 && read == STATUS_END_OF_FILE && iosb_kept && untouched && written == 0 && write_iosb == (0, 77) && closed == 0 {
         debug_print!("NULL_DEVICE_OK leitura=EOF escrita=77");
     }
 }
