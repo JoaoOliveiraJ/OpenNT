@@ -13,6 +13,7 @@ use core::mem::offset_of;
 
 use super::threads::{self, UserThread};
 use super::{index, state, syscalls_core};
+use crate::hal::amd64::usermode;
 use crate::ntos::inc::types::{Context, ContextEx, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
 use crate::ntos::mm::page_residency;
 use crate::ntos::ps::context::registers::{self, INTEGER};
@@ -27,10 +28,6 @@ const CONTEXT_EX_OFFSET: u64 = CONTEXT_SIZE;
 const RECORD_OFFSET: u64 = 0x4F0;
 const MACHINE_OFFSET: u64 = 0x590;
 const FRAME_SIZE: u64 = 0x5C0;
-/// Células da HAL na saída de exceção: vetor, código de erro e CR2.
-const FAULT_VECTOR: u64 = crate::hal::amd64::usermode::FAULT_VECTOR_CELL;
-const ERROR_CODE: u64 = crate::hal::amd64::usermode::ERROR_CODE_CELL;
-const FAULT_CR2: u64 = crate::hal::amd64::usermode::FAULT_CR2_CELL;
 
 const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MACHINE_OFFSET + MachineFrame::SIZE <= FRAME_SIZE);
 
@@ -124,7 +121,10 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
 
 /// Exceção de hardware salva pela HAL nesta transição.
 pub fn hardware(thread: &UserThread, status: u32) -> u32 {
-    let vector = guest::read32(FAULT_VECTOR);
+    // A falta salva pela HAL no bloco de execução da CPU: vetor, código de
+    // erro e CR2.
+    let block = usermode::block();
+    let vector = block.fault_vector.get();
     let live = live_context(thread);
     // A HAL capturou o banco de depuração real do usuário: fica disponível
     // ao VEH/SEH e ao NtContinue seguinte (CONTEXT da própria thread).
@@ -139,15 +139,15 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
     put(offset_of!(ExceptionRecord, exception_code), &status.to_le_bytes());
     put(offset_of!(ExceptionRecord, exception_address), &address.to_le_bytes());
     if vector == 14 {
-        let error = guest::read32(ERROR_CODE);
-        if page_residency::fault(guest::read64(FAULT_CR2), error) {
+        let error = block.error_code.get() as u32;
+        if page_residency::fault(block.fault_cr2.get(), error) {
             return 0;
         }
         let information = offset_of!(ExceptionRecord, exception_information);
         put(offset_of!(ExceptionRecord, number_parameters), &2u32.to_le_bytes());
         let access: u64 = if error & 16 != 0 { 8 } else if error & 2 != 0 { 1 } else { 0 };
         put(information, &access.to_le_bytes());
-        put(information + 8, &guest::read64(FAULT_CR2).to_le_bytes());
+        put(information + 8, &block.fault_cr2.get().to_le_bytes());
     }
     deliver(thread, &record)
 }
@@ -173,7 +173,7 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
             let rsp = state::user_struct::<Context>(context)?.rsp.probe_get()?;
             state::with(|state| state.termination_rsp = rsp);
             crate::debug_print!("[exception] unhandled 0x{:x} @0x{:x}", code, u64_at(&captured, offset_of!(ExceptionRecord, exception_address)));
-            guest::write32(state::EXIT_CODE_CELL, code);
+            usermode::block().exit_code.set(code);
             return Ok(state::TERMINATE_MAGIC);
         }
         let Some(thread) = threads::current() else { return Ok(0xC000_00BB) };

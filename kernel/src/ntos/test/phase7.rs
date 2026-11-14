@@ -1948,9 +1948,9 @@ fn user_syscalls_core(assert: Assert) {
     state::write_unicode_string(string, string + 0x10, "OpenNT usuario\r\n");
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
     assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::tsc_frequency_hz() && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia");
-    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
-    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && guest::read32(state::EXIT_CODE_CELL) == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
-    guest::write32(state::EXIT_CODE_CELL, exit_cell);
+    let exit_cell = crate::hal::amd64::usermode::block().exit_code.get();
+    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
+    crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
     assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
@@ -2009,7 +2009,7 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtContinue", context, 0, 0, 0) == 0xC000_000D, "usercore: NtContinue sem CONTROL|INTEGER");
     let frame_block = guest::alloc_bytes(0x1000);
     let saved = state::with(|state| core::mem::replace(&mut state.syscall_stack_top, frame_block + 0x1000));
-    let saved_rsp = guest::read64(state::USER_RSP_CELL_ADDR);
+    let saved_rsp = crate::ntos::ke::pcr::current().user_rsp.get();
     context_record.context_flags.set(0x10_0003);
     context_record.seg_cs.set(0x33);
     context_record.seg_ss.set(0x2B);
@@ -2019,8 +2019,8 @@ fn user_syscalls_core(assert: Assert) {
     context_record.rip.set(0x1_4000_1000);
     let continued = call("NtContinue", context, 0, 0, 0);
     let frame = frame_block + 0x1000 - 0x78;
-    assert(continued == 0x5566_7788 && guest::read64(frame) == 0x1122_3344_5566_7788 && guest::read64(frame + 8) == 0x1_4000_1000 && guest::read64(frame + 0x40) == 0x21_0DD5 | 0x200 && guest::read64(state::USER_RSP_CELL_ADDR) == 0x7FF0_0000, "usercore: NtContinue reescreve o frame com RFLAGS filtrado");
-    guest::write64(state::USER_RSP_CELL_ADDR, saved_rsp);
+    assert(continued == 0x5566_7788 && guest::read64(frame) == 0x1122_3344_5566_7788 && guest::read64(frame + 8) == 0x1_4000_1000 && guest::read64(frame + 0x40) == 0x21_0DD5 | 0x200 && crate::ntos::ke::pcr::current().user_rsp.get() == 0x7FF0_0000, "usercore: NtContinue reescreve o frame com RFLAGS filtrado");
+    crate::ntos::ke::pcr::current().user_rsp.set(saved_rsp);
     state::with(|state| state.syscall_stack_top = saved);
     guest::free_bytes(frame_block);
     for handle in [first, second, directory] {
@@ -2044,11 +2044,11 @@ fn user_index(assert: Assert) {
     let string = block;
     state::write_user_wide(string + 0x10, "ponte de servico\r\n");
     state::write_unicode_string(string, string + 0x10, "ponte de servico\r\n");
-    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
+    let exit_cell = crate::hal::amd64::usermode::block().exit_code.get();
     assert(index::handle_service(Some("NtNaoExisteOpenNt"), [0; 4], 0, 0, 0).ok() == Some(0xC000_0002) && index::handle_service(None, [0; 4], 0, 0, 0x99).ok() == Some(0xC000_0002), "userindex: servico sem implementacao");
     assert(index::invoke_service("NtDisplayString", [string, 0, 0, 0], 0x1_4000_1000, block + 0x800).ok() == Some(0) && state::with(|state| state.seen_syscalls.contains("NtDisplayString")), "userindex: invokeService chega ao handler por nome");
     if state::with(|state| state.name_by_number.get(&0x2C).is_some()) {
-        assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && guest::read32(state::EXIT_CODE_CELL) == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
+        assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && crate::hal::amd64::usermode::block().exit_code.get() == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
         // Caminho completo em UserMode: gateway, trampolim, despacho e ponte.
         let gateways = kernel_address::image_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
         let previous = process::get_current_thread();
@@ -2059,12 +2059,12 @@ fn user_index(assert: Assert) {
             let restored = state::with(|state| state.service_raw_arguments == 0 && state.service_stack.is_none());
             process::set_current_thread(previous);
             let _ = process::release_thread(thread);
-            assert(displayed == 0 && terminated as u32 == state::TERMINATE_MAGIC && guest::read32(state::EXIT_CODE_CELL) == 0x55 && restored, "userindex: syscall de UserMode pelo descritor ate o handler, com o contexto restaurado");
+            assert(displayed == 0 && terminated as u32 == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x55 && restored, "userindex: syscall de UserMode pelo descritor ate o handler, com o contexto restaurado");
         } else {
             assert(false, "userindex: thread de UserMode");
         }
     }
-    guest::write32(state::EXIT_CODE_CELL, exit_cell);
+    crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -2103,7 +2103,7 @@ fn user_ring3(assert: Assert) {
         return;
     };
     process::set_current_thread(thread);
-    let exit_cell = guest::read32(state::EXIT_CODE_CELL);
+    let exit_cell = usermode::block().exit_code.get();
     let terminate: &[u8] = &[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE];
     // 1. NtTerminateProcess(-1, 0x42) direto do anel 3.
     let mut program: alloc::vec::Vec<u8> = alloc::vec![0xBA, 0x42, 0x00, 0x00, 0x00];
@@ -2129,7 +2129,7 @@ fn user_ring3(assert: Assert) {
     // 3. ud2: o processo morre com STATUS_ILLEGAL_INSTRUCTION e o kernel segue.
     guest::write_bytes(code, &[0x0F, 0x0B]);
     let faulted = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
-    assert(faulted == 0xC000_001D && guest::read32(usermode::FAULT_VECTOR_CELL) == 6 && guest::read64(usermode::FAULT_RIP_CELL) == code, "userring3: excecao de usuario termina o processo com o NTSTATUS");
+    assert(faulted == 0xC000_001D && usermode::block().fault_vector.get() == 6 && usermode::block().fault_rip.get() == code, "userring3: excecao de usuario termina o processo com o NTSTATUS");
     // 4. Um intervalo de escalonamento termina na syscall com o CONTEXT salvo.
     let mut program: alloc::vec::Vec<u8> = alloc::vec![0x48, 0xB9];
     program.extend_from_slice(&string.to_le_bytes());
@@ -2142,14 +2142,14 @@ fn user_ring3(assert: Assert) {
     let mut rounds = 0;
     while kind == 2 && rounds < 64 {
         let _ = usermode::exec_user_context(context, 0);
-        kind = guest::read32(usermode::USER_EXIT_KIND);
+        kind = usermode::block().exit_kind.get();
         rounds += 1;
     }
     let after_syscall = code + 10 + 10;
     assert(kind == 1 && { let saved = unsafe { nt::Context::at(context) }; saved.rax.get() == 0 && saved.rip.get() == after_syscall && saved.rsp.get() == stack_top }, "userring3: intervalo encerrado pela syscall com RAX, RIP e RSP no CONTEXT");
     process::set_current_thread(previous);
     let _ = process::release_thread(thread);
-    guest::write32(state::EXIT_CODE_CELL, exit_cell);
+    usermode::block().exit_code.set(exit_cell);
     guest::free_bytes(raw_context);
     guest::free_bytes(scratch);
     for base in [code, stack] {
@@ -2255,9 +2255,9 @@ fn user_address_floor(assert: Assert) {
         let previous = process::get_current_thread();
         if let Ok(thread) = process::create_kernel_thread(process::get_current_process(), 0x7F14, true, 1, None) {
             process::set_current_thread(thread);
-            let exit_cell = guest::read32(state::EXIT_CODE_CELL);
+            let exit_cell = usermode::block().exit_code.get();
             let exited = usermode::exec_user_mode(code, stack + 0x4000 - 0x28, 0, 0, 0, 0);
-            guest::write32(state::EXIT_CODE_CELL, exit_cell);
+            usermode::block().exit_code.set(exit_cell);
             process::set_current_thread(previous);
             let _ = process::release_thread(thread);
             assert(exited == 0x2345 && guest::read32(target) == 0x2345 && code < 0x1_0000_0000 && stack < 0x1_0000_0000, "userfloor: o anel 3 le e escreve a memoria abaixo de 4 GB, com codigo e pilha tambem abaixo de 4 GB");
@@ -3987,10 +3987,10 @@ fn user_exceptions(assert: Assert) {
     guest::write_bytes(record, &[0u8; nt::ExceptionRecord::SIZE as usize]);
     exception.exception_code.set(0xC000_0096u32 as i32);
     exception.exception_address.set(block + 0x900);
-    let saved_exit = guest::read32(crate::ntos::ps::user::state::EXIT_CODE_CELL);
+    let saved_exit = crate::hal::amd64::usermode::block().exit_code.get();
     let second = exceptions::raise(record, context, 0).ok();
-    let exit_code = guest::read32(crate::ntos::ps::user::state::EXIT_CODE_CELL);
-    guest::write32(crate::ntos::ps::user::state::EXIT_CODE_CELL, saved_exit);
+    let exit_code = crate::hal::amd64::usermode::block().exit_code.get();
+    crate::hal::amd64::usermode::block().exit_code.set(saved_exit);
     exception.number_parameters.set(16);
     let parameters = exceptions::raise(record, context, 1).ok();
     exception.number_parameters.set(0);
@@ -4005,11 +4005,11 @@ fn user_exceptions(assert: Assert) {
     let missing = { fill(live, block + 0x900, block + 0x3F00); exceptions::deliver(&thread, &[0u8; 0x98]) };
     state::with(|state| state.ntdll_exports = Some([(alloc::string::String::from("KiUserExceptionDispatcher"), dispatcher)].into_iter().collect()));
     // Breakpoint de hardware: RIP recua para o INT3.
-    let saved_vector = guest::read32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL);
-    guest::write32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL, 3);
+    let saved_vector = crate::hal::amd64::usermode::block().fault_vector.get();
+    crate::hal::amd64::usermode::block().fault_vector.set(3);
     fill(live, block + 0x901, block + 0x3F00);
     let delivered = exceptions::hardware(&thread, 0x8000_0003);
-    guest::write32(crate::hal::amd64::usermode::FAULT_VECTOR_CELL, saved_vector);
+    crate::hal::amd64::usermode::block().fault_vector.set(saved_vector);
     let stack = live_context.rsp.get();
     let (dispatch_context, dispatch_context_ex, dispatch_record, machine_frame) = unsafe { (nt::Context::at(stack), nt::ContextEx::at(stack + nt::Context::SIZE), nt::ExceptionRecord::at(stack + record_offset), nt::MachineFrame::at(stack + machine_offset)) };
     let frame_ok = stack == (block + 0x3F00 - 0x5C0) & !15 && live_context.rip.get() == dispatcher && live_context.rcx.get() == stack + record_offset && live_context.rdx.get() == stack;
@@ -4058,7 +4058,7 @@ fn user_process_information_hooks(assert: Assert) {
     instrumentation.reserved.set(0);
     instrumentation.callback.set(block + 0x200);
     let set = call("NtSetInformationProcess", u64::MAX, 40, input, 16);
-    let cell = guest::read64(usermode::INSTRUMENTATION_CALLBACK);
+    let cell = usermode::block().instrumentation.get();
     instrumentation.reserved.set(1);
     let reserved = call("NtSetInformationProcess", u64::MAX, 40, input, 16);
     let other = call("NtSetInformationProcess", 0x10, 40, input, 16);
@@ -4066,7 +4066,7 @@ fn user_process_information_hooks(assert: Assert) {
     instrumentation.version.set(0);
     instrumentation.reserved.set(0);
     let cleared = call("NtSetInformationProcess", u64::MAX, 40, input, 8);
-    let cleared_cell = guest::read64(usermode::INSTRUMENTATION_CALLBACK);
+    let cleared_cell = usermode::block().instrumentation.get();
     instrumentation::release_process();
     assert(set == Some(0) && cell == block + 0x200 && reserved == Some(0xC000_000D) && other == Some(0xC000_0008) && length == Some(0xC000_0004) && cleared == Some(0) && cleared_cell == 0, "userinfo: callback de instrumentacao publicado na celula da HAL");
     // ProcessTlsInformation (35) sobre uma thread de usuário com TLS.
@@ -4140,15 +4140,16 @@ fn user_process_information_hooks(assert: Assert) {
     call_capture::reset();
     let exports: alloc::collections::BTreeMap<alloc::string::String, u64> = [(alloc::string::String::from("NtTesteCaptura"), block + 0x600)].into_iter().collect();
     call_capture::arm("kernel32.dll", &exports);
-    let other_dll = guest::read32(usermode::CAPTURE_STATE);
+    let execution = usermode::block();
+    let other_dll = execution.capture_state.get();
     call_capture::arm("NTDLL.DLL", &exports);
-    let armed = (guest::read32(usermode::CAPTURE_STATE), guest::read64(usermode::CAPTURE_ADDRESS));
-    guest::write32(usermode::CAPTURE_STATE, 2);
-    guest::write64(usermode::CAPTURE_ARGUMENTS_CELL, 0x11);
+    let armed = (execution.capture_state.get(), execution.capture_address.get());
+    execution.capture_state.set(2);
+    execution.capture_arguments[0].set(0x11);
     call_capture::consume();
-    let consumed = guest::read32(usermode::CAPTURE_STATE);
+    let consumed = execution.capture_state.get();
     call_capture::finish();
-    let finished = (guest::read32(usermode::CAPTURE_STATE), guest::read64(usermode::CAPTURE_ADDRESS));
+    let finished = (execution.capture_state.get(), execution.capture_address.get());
     state::with(|state| state.capture_export = saved_export);
     assert(other_dll == 0 && armed == (1, block + 0x600) && consumed == 3 && finished == (0, 0) && usermode::arm_user_call_capture(0x100).is_err(), "userinfo: captura de chamada armada, consumida e limpa");
     if let Some(region) = memory::find_region(block) {
@@ -4927,6 +4928,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::process_state::run(assert);
     crate::ntos::test::multiprocess::page_table_root::run(assert);
     crate::ntos::test::multiprocess::handles::run(assert);
+    crate::ntos::test::multiprocess::per_cpu::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

@@ -6,8 +6,9 @@
 //! pelo LAPIC. O AP entra em modo real (CS=0x900), sobe para 64 bits com o
 //! MESMO CR3 do BSP e salta para `ap_kernel_entry`, na imagem do kernel (VA
 //! de sistema): dali em diante nada do AP depende da página baixa. Na imagem
-//! ele troca para a GDT e a IDT do kernel, marca seu slot online e entra no
-//! laço de jobs nativos:
+//! ele troca para a GDT e a IDT do kernel, publica em IA32_GS_BASE a KPCR
+//! própria que o BSP montou (mailbox +0x38), marca seu slot online e entra
+//! no laço de jobs nativos:
 //! SLOT_JOB_FUNC != 0 -> func(args 1..4) MS ABI -> SLOT_JOB_RES, SLOT_JOB_DONE=1.
 //!
 //! Os bytes do trampolim ficam na imagem do kernel; todo endereço absoluto
@@ -148,6 +149,12 @@ ap_kernel_entry:
     cmp ebx, 15
     jae ap_park
     mov rsp, qword ptr [rsi + 0x10]                 # pilha (VA do mapa direto)
+    mov r8d, eax                                    # APIC id
+    mov eax, dword ptr [rsi + 0x38]                 # KPCR deste AP
+    mov edx, dword ptr [rsi + 0x3C]
+    mov ecx, 0xC0000101                             # IA32_GS_BASE
+    wrmsr
+    mov eax, r8d
     mov dword ptr [rsi + 0x28], 0x64
     shl rbx, 6                                      # * 64 (tamanho do slot)
     lea r15, [rsi + rbx + 0x100]

@@ -263,6 +263,28 @@ páginas de usuário: imagens, pilhas, TEB/PEB, seções e a visão somente
 leitura da KUSER_SHARED_DATA em 0x7FFE0000 (a do kernel fica em
 0xFFFFF780_00000000).
 
+**Bloco por CPU.** Cada processador tem a sua KPCR (`ke/pcr.rs`), uma
+reserva de 0xC000 bytes em `PCR_VIRTUAL_BASE + número * 0xC000`, publicada no
+IA32_GS_BASE da própria CPU: o BSP a carrega em `pcr::init`, e cada AP na
+entrada (`ap_kernel_entry`), com a KPCR que o BSP montou antes do SIPI (o
+número é 1 + a posição do AP entre os online, o mesmo bit de
+`active_mask`). No anel 0 o GS é sempre a KPCR; o GS do usuário (a TEB) fica
+no KernelGSbase, e o SWAPGS troca os dois logo depois da entrada (syscall ou
+interrupção vinda do anel 3) e logo antes do IRETQ. A entrada de syscall é a
+do KiSystemCall64: `swapgs; mov gs:[10h], rsp; mov rsp, gs:[1A8h]`, a pilha
+do usuário na KPCR.UserRsp e a de kernel da KPRCB.RspBase (o mesmo valor da
+TSS.RSP0), e a KTHREAD corrente em gs:[188h]. O resto do estado de uma
+execução no anel 3 (RSP do despachante, CONTEXT do intervalo, tipo e código
+da saída, NtContinue, falta, captura de chamada, os bancos de depuração e o
+callback de instrumentação) é o `UserExecutionBlock` da CPU
+(`hal/amd64/usermode.rs`, campos `Field<T>`), na cauda da reserva, depois da
+KPCR de 0xB080 bytes: os stubs o endereçam por `gs:` e o Rust por
+`usermode::block()` e `pcr::current()`. No M0 só o BSP executa o anel 3
+(assert em `exec_user_mode`/`exec_user_context`); os APs têm KPCR e bloco,
+mas não têm TSS, LSTAR nem pilha de syscall. O autoteste
+`ntos/test/multiprocess/per_cpu.rs` confere os blocos distintos de cada CPU
+e uma syscall de teste que devolve gs:[10h] igual ao RSP do usuário.
+
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:
 
@@ -303,15 +325,15 @@ em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
   física (uma VA, por exemplo). Isso vale para PTEs e tabelas (`paging.rs`),
   descritores de PFN, frames do PFN, MMIO (LAPIC, texto VGA), tabelas ACPI,
   o handoff do stage2 (E820, flags, firmware), as células fixas de baixo
-  nível (0x81000, a IDT em 0x82000, a página de controle do anel 3 em
-  0x8F000) e os dados do trampolim dos APs. A IDT, a GDT do boot e as pilhas dos APs são carregadas
+  nível (0x81000 e a IDT em 0x82000) e os dados do trampolim dos APs. A
+  IDT, a GDT do boot e as pilhas dos APs são carregadas
   pela VA do mapa direto; MmMapIoSpace e os mapeamentos físicos da HAL
   devolvem VAs dele.
 - **Endereço virtual** é acessado por `mm/guest_memory.rs` (memória confiável
   ou sondada) ou pelos MOVs de `hal::volatile`.
-- **Stubs em assembly** carregam a VA da página de células num registrador
-  (`movabs`) e endereçam por deslocamento; a entrada de syscall troca a pilha
-  por `MOV moffs64`, sem registrador livre.
+- **Stubs em assembly** carregam a VA da página de IRQ num registrador
+  (`movabs`) e endereçam por deslocamento; o estado da execução de usuário é
+  por CPU e vem pelo `gs:` (o bloco por CPU, acima).
 - O rastreador de frames não conta referências do mapa direto nem da janela
   do heap (nem da identidade temporária do trampolim).
 - **Prova:** não existe identidade baixa para cair por engano: um endereço

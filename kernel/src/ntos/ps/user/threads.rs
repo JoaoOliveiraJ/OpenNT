@@ -29,9 +29,6 @@ pub const CONTEXT_SIZE: u64 = Context::SIZE;
 const PENDING: u32 = 0x103;
 const NOT_SUPPORTED: u32 = 0xC000_00BB;
 const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
-/// Células da HAL de modo usuário: tipo da saída e estado zerado por execução.
-const EXIT_KIND_CELL: u64 = crate::hal::amd64::usermode::USER_EXIT_KIND;
-const RESET_CELLS: [u64; 5] = crate::hal::amd64::usermode::FAULT_CELLS;
 
 /// Slots dos pumps do laço, em ordem fixa.
 pub mod pump {
@@ -352,9 +349,7 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
     let caller = process::get_current_thread();
     process::reference(process_pointer);
     set_running(true, None);
-    for cell in RESET_CELLS {
-        guest::write64(cell, 0);
-    }
+    crate::hal::amd64::usermode::reset_fault_state();
     let result = (|| -> Result<u32, KernelError> {
         loop {
             refresh_ready_user_threads();
@@ -406,7 +401,7 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             let elapsed = (clock::uptime_ms() - started) * 10_000;
             let kernel = process::thread_kernel_time(pointer).saturating_sub(kernel_before);
             process::account_thread(pointer, false, elapsed.saturating_sub(kernel));
-            let kind = guest::read32(EXIT_KIND_CELL);
+            let kind = crate::hal::amd64::usermode::block().exit_kind.get();
             if kind == 0 {
                 return Ok(status);
             }

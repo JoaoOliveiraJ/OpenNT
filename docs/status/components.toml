@@ -219,10 +219,10 @@ categoria = "Núcleo do kernel"
 icone = "cpu"
 descricao = "Acorda os outros núcleos do processador para que o kernel use mais de uma CPU."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/ke/smp.rs", "kernel/src/hal/amd64/aptrampoline.rs"]
-testes = ["selftest"]
+caminhos = ["kernel/src/ntos/ke/smp.rs", "kernel/src/hal/amd64/aptrampoline.rs", "kernel/src/ntos/ke/pcr.rs"]
+testes = ["selftest", "fase7"]
 fase = "2"
-notas = "Verificado com 4 CPUs no QEMU."
+notas = "Verificado com 4 CPUs no QEMU. Como no Windows, cada processador tem a sua KPCR, publicada no próprio registrador GS (os secundários a recebem antes de partir), e nela o estado das chamadas de sistema e da execução em modo usuário: a pilha do usuário na entrada de uma syscall fica na KPCR da CPU que a executou, e não numa área compartilhada. Programas de usuário ainda rodam só no processador de boot."
 
 [[componente]]
 nome = "Processos e threads"

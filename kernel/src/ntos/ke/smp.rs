@@ -4,6 +4,9 @@
 //! direcionado via xAPIC. O trampolim faz a troca de modos e salta para a
 //! imagem do kernel, onde o AP consome trabalhos nativos numa mailbox física
 //! compartilhada, que o BSP lê e grava pelo mapa direto (`hal::physical`).
+//! Cada AP recebe antes do SIPI uma KPCR própria (`pcr::init_processor`),
+//! com o número de processador que vai ocupar (1 + sua posição entre os
+//! online), e a publica no próprio GS.
 //! A página do trampolim só fica mapeada em identidade enquanto os APs
 //! partem; depois a metade de usuário volta a não ter nada do kernel. Os
 //! offsets devem coincidir com `hal::amd64::aptrampoline`.
@@ -13,7 +16,7 @@ use alloc::vec::Vec;
 use crate::hal::amd64::aptrampoline;
 use crate::hal::{cpu, lapic, physical};
 use crate::hal::acpi;
-use crate::ntos::ke::clock;
+use crate::ntos::ke::{clock, pcr};
 use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
@@ -28,6 +31,8 @@ const MAILBOX_BOOT_SLOT: u64 = 0x0C;
 const MAILBOX_BOOT_STACK: u64 = 0x10;
 const MAILBOX_PAGE_TABLE: u64 = 0x18;
 const MAILBOX_EXPECTED_IDENTIFIER: u64 = 0x2C;
+/// KPCR do AP em partida (VA), carregada em IA32_GS_BASE por `ap_kernel_entry`.
+const MAILBOX_BOOT_PCR: u64 = 0x38;
 const MAILBOX_SLOTS: u64 = 0x100;
 
 const SLOT_SIZE: u64 = 64;
@@ -243,9 +248,6 @@ pub fn init() -> Result<(), KernelError> {
         STATE.lock().initialized = true;
         return Ok(());
     }
-    install_trampoline()?;
-    lapic::write(LAPIC_SPURIOUS, lapic::read(LAPIC_SPURIOUS) | 0x100);
-
     let mut identifiers: Vec<u32> = Vec::new();
     for identifier in discovered {
         if identifier != bootstrap && !identifiers.contains(&identifier) {
@@ -253,10 +255,29 @@ pub fn init() -> Result<(), KernelError> {
         }
     }
     identifiers.truncate(map::MAX_CPUS - 1);
+    // As KPCRs saem antes das interrupções desligadas: a de número N vai para
+    // o AP que ficar online em N-ésimo lugar; as que sobrarem voltam no fim.
+    let mut processor_blocks = Vec::new();
+    for number in 1..=identifiers.len() as u32 {
+        match pcr::init_processor(number) {
+            Ok(block) => processor_blocks.push(block),
+            Err(error) => {
+                (1..number).for_each(pcr::release_processor);
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = install_trampoline() {
+        (1..=identifiers.len() as u32).for_each(pcr::release_processor);
+        return Err(error);
+    }
+    lapic::write(LAPIC_SPURIOUS, lapic::read(LAPIC_SPURIOUS) | 0x100);
+
     let flags = cpu::save_and_disable_interrupts();
     let mut online = Vec::new();
     let mut failure = None;
     for (slot, &identifier) in identifiers.iter().enumerate() {
+        physical::write64(MAILBOX + MAILBOX_BOOT_PCR, processor_blocks[online.len()]);
         match start_application_processor(slot, identifier) {
             Ok(true) => {
                 let reported = physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER);
@@ -277,6 +298,9 @@ pub fn init() -> Result<(), KernelError> {
         }
     }
     cpu::restore_interrupts(flags);
+    for number in online.len() as u32 + 1..=identifiers.len() as u32 {
+        pcr::release_processor(number);
+    }
     {
         let mut state = STATE.lock();
         state.online_slots = online;

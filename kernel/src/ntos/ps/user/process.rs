@@ -344,10 +344,11 @@ fn post_mortem() {
             offset += 8;
         }
     }
-    let fault_rsp = guest::read64(usermode::FAULT_RSP_CELL);
-    let fault_cr2 = guest::read64(usermode::FAULT_CR2_CELL);
-    if guest::read32(usermode::FAULT_VECTOR_CELL) == 0x29 {
-        crate::debug_print!("[usermode] FAST_FAIL codigo={} rip={:#x}", guest::read32(usermode::FAULT_RCX_CELL), guest::read64(usermode::FAULT_RIP_CELL).wrapping_sub(2));
+    let block = usermode::block();
+    let fault_rsp = block.fault_rsp.get();
+    let fault_cr2 = block.fault_cr2.get();
+    if block.fault_vector.get() == 0x29 {
+        crate::debug_print!("[usermode] FAST_FAIL codigo={} rip={:#x}", block.fault_rcx.get() as u32, block.fault_rip.get().wrapping_sub(2));
     }
     if fault_cr2 != 0 {
         crate::debug_print!("[usermode] CR2={:#x} -> pagina traduz p/ {:#x}", fault_cr2, paging::translate(fault_cr2 & !0xFFF));

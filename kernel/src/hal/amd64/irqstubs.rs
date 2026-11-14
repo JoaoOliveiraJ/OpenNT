@@ -6,8 +6,7 @@
 //! teclado, faz EOI e volta com IRETQ — sem chamar Rust.
 //!
 //! Página física compartilhada (frame 0x81000), acessada pelo mapa direto
-//! da metade de sistema; os stubs mantêm a VA da página em R9 e a da página
-//! de controle do anel 3 em R8:
+//! da metade de sistema; os stubs mantêm a VA da página em R9:
 //!   +0x000: u32 irq_count[256]       (contagem de interrupções por vetor)
 //!   +0x400: ring buffer do teclado   (head u32 @+0x400, tail u32 @+0x404,
 //!                                     dados 256B @+0x408)
@@ -23,10 +22,14 @@
 //! despejada ou cópia na escrita resolvida repete a instrução. O timer
 //! encerra intervalos de usuário (tipo 2) e
 //! as entradas/saídas do anel 3 trocam o GS (SWAPGS) e o banco de depuração.
+//! O estado da execução de usuário (CONTEXT do intervalo, tipo da saída e a
+//! falta) é o bloco da CPU (`usermode::UserExecutionBlock`), endereçado por
+//! `gs:` só na vinda do anel 3, depois do SWAPGS.
 
 use core::arch::global_asm;
+use core::mem::offset_of;
 
-use crate::hal::amd64::usermode::{cell, CONTROL_PAGE};
+use crate::hal::amd64::usermode::{gs_offset, UserExecutionBlock};
 use crate::hal::{cpu, serial};
 use crate::ntos::mm::memory_map;
 use crate::rtl::print::write_args;
@@ -98,9 +101,7 @@ irq_entry_cs:
     call user_debug_leave
 irq_gs_ready:
     movzx edi, byte ptr [rsp + 72]  # vetor (push imm8 estende o sinal: so o byte)
-    # Celulas pelo mapa direto: R8 = pagina de controle, R9 = pagina de IRQ
-    # (os dois ja estao salvos no quadro).
-    movabs r8, {control_page}
+    # R9 = pagina de IRQ pelo mapa direto (ja salvo no quadro).
     movabs r9, {irq_page}
 
     # irq_count[vetor]++
@@ -120,7 +121,7 @@ irq_gs_ready:
     jne irq_context_saved
     cmp word ptr [rsp + 88], 0x33
     jne irq_context_saved
-    mov rax, [r8 + {context_cell}]
+    mov rax, gs:[{context}]
     test rax, rax
     jz irq_context_saved
     fxsave64 [rax + 0x100]
@@ -195,9 +196,9 @@ irq_restore:
     jne irq_restore_registers
     cmp word ptr [rsp + 88], 0x33
     jne irq_restore_registers
-    cmp qword ptr [r8 + {context_cell}], 0
+    cmp qword ptr gs:[{context}], 0
     je irq_restore_registers
-    mov dword ptr [r8 + {exit_kind}], 2
+    mov dword ptr gs:[{exit_kind}], 2
     xor edi, edi
     jmp user_terminate_current
 irq_restore_registers:
@@ -230,7 +231,7 @@ irq_exception:
     jne irq_kernel_exception
     cmp r10d, 0x29
     je irq_user_context_saved
-    mov rax, [r8 + {context_cell}]
+    mov rax, gs:[{context}]
     test rax, rax
     jz irq_user_context_saved
     fxsave64 [rax + 0x100]
@@ -271,14 +272,14 @@ irq_exception:
     jne irq_user_error_saved
     mov rdx, [rsp + 80]
 irq_user_error_saved:
-    mov [r8 + {error_code}], rdx    # codigo de erro do hardware (acesso do #PF)
-    mov dword ptr [r8 + {exit_kind}], 3  # excecao, despachada pelo kernel
+    mov gs:[{error_code}], rdx      # codigo de erro do hardware (acesso do #PF)
+    mov dword ptr gs:[{exit_kind}], 3  # excecao, despachada pelo kernel
 irq_user_context_saved:
-    mov [r8 + {fault_vector}], r10d
+    mov gs:[{fault_vector}], r10d
     mov rax, [rsp + 56]             # RCX original, inclusive __fastfail(codigo)
-    mov [r8 + {fault_rcx}], rax
+    mov gs:[{fault_rcx}], rax
     mov rax, [rsp + r11 - 8]
-    mov [r8 + {fault_rip}], rax
+    mov gs:[{fault_rip}], rax
     # vetor -> NTSTATUS (o que o KiDispatchException relataria)
     mov edi, 0xC0000005
     cmp r10d, 0x29
@@ -309,9 +310,9 @@ irq_user_fastfail:
 irq_user_terminate:
     # Publica a pilha do usuario e o CR2, e os imprime antes de encerrar.
     mov rax, [rsp + r11 + 16]
-    mov [r8 + {fault_rsp}], rax
+    mov gs:[{fault_rsp}], rax
     mov rax, cr2
-    mov [r8 + {fault_cr2}], rax
+    mov gs:[{fault_cr2}], rax
     mov dx, 0x3F8
     mov al, 0x20
     out dx, al
@@ -510,7 +511,6 @@ irq_exception_halt:
 
 .popsection
 "#,
-    control_page = const CONTROL_PAGE,
     irq_page = const memory_map::direct_map(IRQ_PAGE_PHYS),
     lapic_eoi = const LAPIC_EOI,
     irq_count = const IRQ_COUNT_BASE - IRQ_PAGE_PHYS,
@@ -518,14 +518,14 @@ irq_exception_halt:
     kbd_head = const KEYBOARD_HEAD - IRQ_PAGE_PHYS,
     kbd_tail = const KEYBOARD_TAIL - IRQ_PAGE_PHYS,
     kbd_data = const KEYBOARD_DATA - IRQ_PAGE_PHYS,
-    context_cell = const cell::USER_CONTEXT,
-    exit_kind = const cell::EXIT_KIND,
-    error_code = const cell::ERROR_CODE,
-    fault_vector = const cell::FAULT_VECTOR,
-    fault_rcx = const cell::FAULT_RCX,
-    fault_rip = const cell::FAULT_RIP,
-    fault_rsp = const cell::FAULT_RSP,
-    fault_cr2 = const cell::FAULT_CR2,
+    context = const gs_offset(offset_of!(UserExecutionBlock, context)),
+    exit_kind = const gs_offset(offset_of!(UserExecutionBlock, exit_kind)),
+    error_code = const gs_offset(offset_of!(UserExecutionBlock, error_code)),
+    fault_vector = const gs_offset(offset_of!(UserExecutionBlock, fault_vector)),
+    fault_rcx = const gs_offset(offset_of!(UserExecutionBlock, fault_rcx)),
+    fault_rip = const gs_offset(offset_of!(UserExecutionBlock, fault_rip)),
+    fault_rsp = const gs_offset(offset_of!(UserExecutionBlock, fault_rsp)),
+    fault_cr2 = const gs_offset(offset_of!(UserExecutionBlock, fault_cr2)),
 );
 
 extern "C" {

@@ -2,10 +2,11 @@
 //!
 //! O retorno de syscall transfere o controle no anel 3, com o PC anterior
 //! em R10 e o resultado original em RAX; o callback cuida da contabilidade
-//! no TEB e da recursão. A célula é consumida pela HAL de modo usuário.
+//! no TEB e da recursão. O campo do bloco de execução da CPU é consumido
+//! pela HAL de modo usuário.
 
 use super::{state, syscalls_core};
-use crate::hal::amd64::usermode::INSTRUMENTATION_CALLBACK;
+use crate::hal::amd64::usermode;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::ProcessInstrumentationCallbackInformation;
@@ -43,14 +44,14 @@ fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelE
         state.instrumentation_callback = callback;
         state.current_process_id
     });
-    guest::write64(INSTRUMENTATION_CALLBACK, callback);
+    usermode::block().instrumentation.set(callback);
     crate::debug_print!("[instrumentation] pid={} callback=0x{:x}", process_id, callback);
     Ok(0)
 }
 
 pub fn release_process() {
     state::with(|state| state.instrumentation_callback = 0);
-    guest::write64(INSTRUMENTATION_CALLBACK, 0);
+    usermode::block().instrumentation.set(0);
 }
 
 pub fn init() {

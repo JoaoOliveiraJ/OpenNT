@@ -15,7 +15,6 @@
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
 //!   0x083000-0x08CFFF    tabelas da imagem do kernel e da pilha de boot
-//!   0x08F000-0x08FFFF    página de controle do anel 3 (células da HAL)
 //!   0x100000-0xDFFFFF    frames da imagem do kernel (cap de build: 13MB)
 //!   0xE01000-0xF7FFFF    frames da pilha de boot
 //!   0x1000000-0x1FFFFFF  sem uso
@@ -56,7 +55,7 @@
 //!   0xFFFFB000_00000000  (352) mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
 //!   0xFFFFC000_C0000000  (384) janela do heap do kernel e da arena dos convidados
 //!   0xFFFFF780_00000000  (495) KUSER_SHARED_DATA (visão do kernel)
-//!   0xFFFFF800_00000000  (496) KPCR e pool de dados
+//!   0xFFFFF800_00000000  (496) KPCRs (0xC000 bytes por CPU) e pool de dados
 //!   0xFFFFF800_40000000  (496) imagem do kernel (ImageBase do ntoskrnl)
 //!   0xFFFFF800_41081000  (496) pilha de boot (até 0xFFFFF800_41200000)
 //!   0xFFFFF801_00000000  (496) janela de imagens de sistema (drivers, hal.dll...)
@@ -190,6 +189,7 @@ pub const SYSTEM_IMAGE_ALIGN: u64 = 0x1_0000;
 
 // ---- fim das imagens de sistema ----------------------------------------------
 
+/// KPCR do processador N em PCR_VIRTUAL_BASE + N * `pcr::layout::SIZE`.
 pub const PCR_VIRTUAL_BASE: u64 = 0xFFFF_F800_0000_0000;
 pub const KERNEL_DATA_POOL_BASE: u64 = 0xFFFF_F800_1000_0000;
 pub const KERNEL_DATA_POOL_TOP: u64 = 0xFFFF_F800_2000_0000;
