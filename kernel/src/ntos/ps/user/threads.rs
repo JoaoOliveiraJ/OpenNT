@@ -35,7 +35,7 @@ use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_infor
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::mm::kernel_stack;
+use crate::ntos::mm::{kernel_stack, peb_teb};
 use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
 use core::mem::offset_of;
 
@@ -817,7 +817,8 @@ pub fn release_execution_resources(thread: &Arc<UserThread>) {
     if pointer != 0 {
         process::release_kernel_stack(pointer);
     }
-    // A TEB principal divide a região com a PEB do processo.
+    // A pilha e a TEB da thread principal são do VAD do processo e voltam no
+    // término dele.
     let Some(regions) = thread.with(|thread| thread.regions.take()) else { return };
     system_process_information::sample();
     for region in &regions {
@@ -1134,15 +1135,10 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             thread.suspend_count = request.flags & 1;
             thread.hidden = request.flags & 4 != 0;
         });
+        // O MmCreateTeb sobre a TEB recém-comprometida.
+        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack + stack_size, stack_limit: stack });
         // SAFETY: TEB recém-comprometida; a thread ainda não roda.
         let block = unsafe { Teb::at(teb) };
-        block.nt_tib.stack_base.set(stack + stack_size);
-        block.nt_tib.stack_limit.set(stack);
-        block.nt_tib.self_.set(teb);
-        block.client_id.unique_process.set(process_id);
-        block.client_id.unique_thread.set(id);
-        block.process_environment_block.set(peb);
-        block.deallocation_stack.set(stack);
         // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.
         block.same_teb_flags.set((if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
         initialize_context(startup, exports.0, stack + stack_size - 8, request.start, 0);

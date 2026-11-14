@@ -1,6 +1,6 @@
 //! Executive (Ex).
 
-mod list_entry;
+pub mod list_entry;
 pub mod syscalls;
 pub mod push_lock;
 pub mod rundown;

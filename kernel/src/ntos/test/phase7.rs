@@ -1713,7 +1713,7 @@ fn user_system_services(assert: Assert) {
     use crate::hal::amd64::native_call;
     use crate::ntos::ex::{service_table, system_services};
     use crate::ntos::mm::kernel_address;
-    use crate::ntos::ps::user::{memory, structures, syscall_scan};
+    use crate::ntos::ps::user::{memory, syscall_scan};
     // Varredura da imagem e recusas de cabeçalho.
     let image = bring_up_ntdll();
     let scanned = syscall_scan::scan_syscall_image(&image);
@@ -1753,26 +1753,43 @@ fn user_system_services(assert: Assert) {
         }
     }
     guest::free_bytes(destination);
-    // Estruturas de processo para o loader da ntdll, num processo real: a
-    // PEB vai para o EPROCESS e a PEB_LDR_DATA para o estado do processo.
+    // PEB (MmCreatePeb), TEB (MmCreateTeb), parâmetros e a PEB_LDR_DATA do
+    // loader do kernel num processo real, o corrente: a PEB vai para o
+    // EPROCESS e a PEB_LDR_DATA para o estado do processo.
     let built = with_test_process("estruturas.exe", None, |test| {
+        use crate::ntos::ex::list_entry;
+        use crate::ntos::mm::peb_teb;
+        use crate::ntos::ps::process_parameters::ProcessParameters;
+        use crate::ntos::ps::user::loader;
         let regions_before = memory::Space::current().regions().len();
-        let built = structures::build_process_structures(&structures::ProcessDescription { process_id: test.process_id, thread_id: test.thread_id, process_pointer: test.process, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44, stack_base: 0x20_0000, stack_top: 0x30_0000 });
-        if let Ok(teb) = built {
-            let peb = unsafe { nt::Eprocess::at(test.process) }.peb.get();
-            let ldr = crate::ntos::ps::user::process_state::get(test.process).map_or(0, |identity| identity.ldr());
-            let (teb_view, peb_view, ldr_data) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr)) };
-            let rupp = peb_view.process_parameters.get();
-            let parameters = unsafe { nt::RtlUserProcessParameters::at(rupp) };
-            assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == test.thread_id && teb_view.client_id.unique_process.get() == test.process_id && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && peb != test.peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada e o CLIENT_ID do processo) e PEB publicada no EPROCESS");
-            assert(ldr != 0 && peb_view.image_base_address.get() == 0x1_4000_0000 && peb_view.ldr.get() == ldr && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2 e PEB_LDR_DATA no estado do processo");
+        // Os cabeçalhos de uma imagem de console (subsistema 3, versão 6.0)
+        // numa região do processo: a PEB lê o subsistema deles.
+        let Ok(image_base) = memory::map_user_region(0x1000) else {
+            assert(false, "userservices: cabecalhos da imagem");
+            return;
+        };
+        guest::write_bytes(image_base, &single_section_image(0x1_4000_0000, 0x0022, b".text", 0x6000_0020, 0x1000, &[0xC3])[..0x400]);
+        let peb = peb_teb::create_peb(test.process, image_base);
+        let ldr = loader::create_kernel_ldr();
+        let mut request = ProcessParameters::for_image("C:\\teste.exe");
+        request.standard_output = 0x44;
+        let rupp = request.write();
+        let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000 }).ok());
+        if let (Ok(peb), Ok(ldr), Ok(rupp), Some(teb)) = (peb, ldr, rupp, teb) {
+            let (teb_view, peb_view, ldr_data, parameters) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr), nt::RtlUserProcessParameters::at(rupp)) };
+            let separate = teb + 0x2000 <= peb || peb + 0x1000 <= teb;
+            assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == test.thread_id && teb_view.client_id.unique_process.get() == test.process_id && teb_view.process_environment_block.get() == peb && separate && unsafe { nt::Eprocess::at(test.process) }.peb.get() == peb && peb != test.peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada e o CLIENT_ID do processo) fora da regiao da PEB, e PEB publicada no EPROCESS");
+            let identity_ldr = crate::ntos::ps::user::process_state::get(test.process).map_or(0, |identity| identity.ldr());
+            assert(identity_ldr == ldr && peb_view.image_base_address.get() == image_base && peb_view.ldr.get() == 0 && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32 && peb_view.image_subsystem.get() == 3 && peb_view.image_subsystem_major_version.get() == 6 && peb_view.image_subsystem_minor_version.get() == 0, "userservices: campos do PEB 24H2, subsistema da imagem, PEB.Ldr para a ntdll e PEB_LDR_DATA do kernel no estado do processo");
             assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
             let image_path = parameters.image_path_name.buffer.get();
-            assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && parameters.environment.get() > rupp, "userservices: parametros auto-relativos com ambiente absoluto");
+            let environment = parameters.environment.get();
+            assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && environment > rupp && parameters.environment_size.get() != 0 && guest::read16(environment) == b'S' as u16 && parameters.length.get() <= parameters.maximum_length.get(), "userservices: parametros auto-relativos com ambiente absoluto");
             let entry = guest::alloc_bytes(nt::LdrDataTableEntry::SIZE);
-            structures::insert_list_tail(ldr, core::mem::offset_of!(nt::PebLdrData, in_load_order_module_list) as u64, entry, core::mem::offset_of!(nt::LdrDataTableEntry, in_load_order_links) as u64);
-            assert(ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == entry && unsafe { nt::LdrDataTableEntry::at(entry) }.in_load_order_links.flink.get() == ldr_data.in_load_order_module_list.address(), "userservices: insercao no fim da lista LDR");
-            structures::write_list_head(ldr_data.in_load_order_module_list.address());
+            let links = unsafe { nt::LdrDataTableEntry::at(entry) };
+            list_entry::insert_tail(&ldr_data.in_load_order_module_list, &links.in_load_order_links);
+            assert(ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == entry && links.in_load_order_links.flink.get() == ldr_data.in_load_order_module_list.address(), "userservices: insercao no fim da lista LDR");
+            list_entry::initialize(&ldr_data.in_load_order_module_list);
             guest::free_bytes(entry);
         } else {
             assert(false, "userservices: estruturas de processo");
@@ -1782,11 +1799,11 @@ fn user_system_services(assert: Assert) {
             memory::release_private_region(region);
         }
     });
-    // Sem estado de processo não há onde publicar a PEB_LDR_DATA.
+    // A PEB só nasce no processo em montagem, o corrente.
     let orphan = guest::alloc_bytes(nt::Eprocess::SIZE);
-    let refused = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, thread_id: 0x6F4, process_pointer: orphan, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0, stack_base: 0x20_0000, stack_top: 0x30_0000 }).is_err();
+    let refused = crate::ntos::mm::peb_teb::create_peb(orphan, 0x1_4000_0000).is_err();
     guest::free_bytes(orphan);
-    assert(built.is_some() && refused, "userservices: estruturas so para um processo real");
+    assert(built.is_some() && refused, "userservices: PEB so para o processo corrente");
 }
 
 /// Executável mínimo que importa NtTerminateProcess da ntdll pelo nome.
@@ -1865,7 +1882,7 @@ fn user_loader(assert: Assert) {
         let Ok(ldr) = memory::map_user_region(0x1000) else { return };
         let ldr_data = unsafe { nt::PebLdrData::at(ldr) };
         for head in [&ldr_data.in_load_order_module_list, &ldr_data.in_memory_order_module_list, &ldr_data.in_initialization_order_module_list] {
-            crate::ntos::ps::user::structures::write_list_head(head.address());
+            crate::ntos::ex::list_entry::initialize(head);
         }
         if let Some(identity) = crate::ntos::ps::user::process_state::get(test.process) {
             identity.set_ldr(ldr);
@@ -2350,8 +2367,8 @@ fn user_windows_process(assert: Assert) {
     let entry: &[u8] = &[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0xBA, 0x5A, 0x00, 0x00, 0x00, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE];
     let exe = single_section_image(0x1_4000_0000, 0x0022, b".text", 0x6000_0020, 0x1000, entry);
     // Onde o processo ficou: a imagem principal, a PEB (do EPROCESS) e a
-    // base da pilha da primeira thread (StackLimit da TEB, logo abaixo da
-    // PEB, lida anexado: a TEB está na raiz própria do processo). Com o
+    // base da pilha da primeira thread (StackLimit da TEB do KTHREAD.Teb,
+    // lida anexado: a TEB está na raiz própria do processo). Com o
     // processo vivo, também o caminho da imagem no estado do processo, os ids
     // da primeira thread e a lista de threads do processo; o EPROCESS fica
     // retido pelo teste para as asserções depois da saída.
@@ -2370,7 +2387,8 @@ fn user_windows_process(assert: Assert) {
         listed_threads.set(crate::ntos::ps::user::threads::of_process(pointer).len());
         let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
         let peb = if pointer != 0 { unsafe { nt::Eprocess::at(pointer) }.peb.get() } else { 0 };
-        let teb = (peb != 0).then(|| crate::ntos::ps::process_context::with_process(pointer, || { let teb = unsafe { nt::Teb::at(peb - 0x2000) }; (teb.nt_tib.stack_limit.get(), teb.client_id.unique_thread.get(), teb.client_id.unique_process.get()) }).ok()).flatten();
+        let teb_va = active.as_ref().and_then(|entry| entry.threads.first().copied()).map_or(0, |thread| unsafe { nt::Kthread::at(thread) }.teb.get());
+        let teb = (peb != 0 && teb_va != 0).then(|| crate::ntos::ps::process_context::with_process(pointer, || { let teb = unsafe { nt::Teb::at(teb_va) }; (teb.nt_tib.stack_limit.get(), teb.client_id.unique_thread.get(), teb.client_id.unique_process.get()) }).ok()).flatten();
         let stack = teb.map_or(0, |(stack, _, _)| stack);
         placed.set((exe_base, peb, stack));
         let image = crate::ntos::ps::user::process_state::get(pointer).map(|identity| identity.image_path()).unwrap_or_default();
@@ -4977,6 +4995,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::lifecycle::run(assert);
     crate::ntos::test::multiprocess::ownership::run(assert);
     crate::ntos::test::multiprocess::own_root::run(assert);
+    crate::ntos::test::multiprocess::create_path::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

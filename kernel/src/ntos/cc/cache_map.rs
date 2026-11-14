@@ -27,10 +27,10 @@ use super::{flush, vacb};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_cc::{CacheUninitializeEvent, CcFileSizes, PrivateCacheMap, SharedCacheMap};
 use crate::ntos::inc::types::{FileObject, ListEntry, SectionObjectPointers};
+use crate::ntos::ex::list_entry;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::objects::file as file_objects;
-use crate::ntos::ps::user::structures::{initialize_list_head, insert_tail_list};
 use crate::rtl::{KernelError, SpinLock};
 
 /// Uma vista de 256 KB do arquivo (o VACB do NT) com o estado por página.
@@ -230,7 +230,7 @@ pub fn new_native_bcb(map: &MapState, offset: u64, length: u32, index: u64, buff
     bcb.vacb.set(map.views.get(&index).map_or(0, |view| view.vacb));
     bcb.shared_cache_map.set(map.native);
     bcb.base_address.set(buffer);
-    insert_tail_list(&map.native().bcb_list, &bcb.bcb_links);
+    list_entry::insert_tail(&map.native().bcb_list, &bcb.bcb_links);
     address
 }
 
@@ -260,10 +260,10 @@ fn new_native_map(file: u64, pin_access: bool, callbacks: u64, context: u64) -> 
     let native = native_map(base);
     native.node_type_code.set(layout::NTC_SHARED_CACHE_MAP);
     native.node_byte_size.set(SharedCacheMap::SIZE as i16);
-    initialize_list_head(&native.bcb_list);
-    initialize_list_head(&native.logged_stream_links);
-    initialize_list_head(&native.shared_cache_map_links);
-    initialize_list_head(&native.private_list);
+    list_entry::initialize(&native.bcb_list);
+    list_entry::initialize(&native.logged_stream_links);
+    list_entry::initialize(&native.shared_cache_map_links);
+    list_entry::initialize(&native.private_list);
     // EX_FAST_REF sem referências em cache nos 4 bits baixos.
     native.file_object_fast_ref.object.set(file & !0xF);
     native.callbacks.set(callbacks);
@@ -342,7 +342,7 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
         private.node_type_code.set(layout::NTC_PRIVATE_CACHE_MAP);
         private.read_ahead_mask.set(layout::PAGE_SIZE as u32 - 1);
         private.file_object.set(file);
-        insert_tail_list(&map.native().private_list, &private.private_links);
+        list_entry::insert_tail(&map.native().private_list, &private.private_links);
         owner.private_cache_map.set(address);
         map.private_maps.push((file, address));
         map.open_count += 1;

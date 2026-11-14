@@ -1,5 +1,8 @@
 //! LIST_ENTRY duplamente encadeada: InitializeListHead, InsertTailList e
-//! RemoveEntryList sobre a memória do próprio objeto.
+//! RemoveEntryList sobre a memória do próprio objeto. Valem para as listas de
+//! estruturas do kernel e para as que o kernel monta na memória de usuário de
+//! um processo (a PEB_LDR_DATA do loader do kernel), escritas no processo
+//! corrente.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::ListEntry;
@@ -11,7 +14,7 @@ pub(super) fn at(address: u64) -> &'static ListEntry {
 }
 
 /// InitializeListHead.
-pub(super) fn initialize(head: &ListEntry) {
+pub fn initialize(head: &ListEntry) {
     head.flink.set(head.address());
     head.blink.set(head.address());
 }
@@ -22,7 +25,7 @@ pub(super) fn tail_consistent(head: &ListEntry) -> bool {
 }
 
 /// InsertTailList (sem checagem; ver [`tail_consistent`]).
-pub(super) fn insert_tail(head: &ListEntry, entry: &ListEntry) {
+pub fn insert_tail(head: &ListEntry, entry: &ListEntry) {
     let last = at(head.blink.get());
     entry.flink.set(head.address());
     entry.blink.set(last.address());

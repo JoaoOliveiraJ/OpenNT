@@ -30,7 +30,6 @@ pub mod instrumentation;
 pub mod tls;
 pub mod process_debug;
 pub mod call_capture;
-pub mod structures;
 pub mod syscall_scan;
 pub mod loader;
 pub mod nls;

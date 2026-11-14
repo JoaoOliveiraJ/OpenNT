@@ -29,10 +29,9 @@ use super::memory::{self, Space, TemplatePage};
 use super::process_state;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::ps::{process, process_context};
-use super::structures::insert_tail_list;
 use super::syscall_scan;
 use crate::hal::bundle;
-use crate::ntos::ex::system_services;
+use crate::ntos::ex::{list_entry, system_services};
 use crate::drivers::fs::ntfs::{self, Ntfs};
 use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::rtl::{KernelError, SpinLock};
@@ -411,6 +410,25 @@ pub fn place_user_string(text: &str) -> Result<u64, KernelError> {
     Ok(va)
 }
 
+/// A PEB_LDR_DATA do loader do kernel no processo corrente (o processo em
+/// montagem, anexado): nasce vazia, com as três listas circulares, e fica no
+/// estado do processo, onde [`create_ldr_entry`] insere os módulos que o
+/// loader do kernel carrega. A PEB.Ldr é a da ntdll, publicada por ela.
+pub fn create_kernel_ldr() -> Result<u64, KernelError> {
+    let Some(identity) = process_state::current() else { return Err(KernelError::new("PEB_LDR_DATA sem estado do processo")) };
+    let ldr = memory::map_user_region(PebLdrData::SIZE)?;
+    // SAFETY: região recém-comprometida no processo corrente; nenhum código
+    // de usuário roda nele ainda.
+    let data = unsafe { PebLdrData::at(ldr) };
+    data.length.set(PebLdrData::SIZE as u32);
+    data.initialized.set(1);
+    for head in [&data.in_load_order_module_list, &data.in_memory_order_module_list, &data.in_initialization_order_module_list] {
+        list_entry::initialize(head);
+    }
+    identity.set_ldr(ldr);
+    Ok(ldr)
+}
+
 /// A mesma entrada para o exe, a ntdll e as DLLs carregadas; a ordem de
 /// inicialização é a de carga (dependências primeiro).
 pub fn create_ldr_entry(module: &Module) -> Result<u64, KernelError> {
@@ -436,9 +454,9 @@ pub fn create_ldr_entry(module: &Module) -> Result<u64, KernelError> {
     record.obsolete_load_count.set(0xFFFF);
     // SAFETY: o PEB_LDR_DATA do processo corrente, montado pelo kernel.
     let ldr = unsafe { PebLdrData::at(ldr) };
-    insert_tail_list(&ldr.in_load_order_module_list, &record.in_load_order_links);
-    insert_tail_list(&ldr.in_memory_order_module_list, &record.in_memory_order_links);
-    insert_tail_list(&ldr.in_initialization_order_module_list, &record.in_initialization_order_links);
+    list_entry::insert_tail(&ldr.in_load_order_module_list, &record.in_load_order_links);
+    list_entry::insert_tail(&ldr.in_memory_order_module_list, &record.in_memory_order_links);
+    list_entry::insert_tail(&ldr.in_initialization_order_module_list, &record.in_initialization_order_links);
     Ok(entry)
 }
 

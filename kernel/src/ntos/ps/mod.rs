@@ -11,6 +11,8 @@ pub mod previous_mode;
 pub mod lookup_thread;
 pub mod pool_quota;
 pub mod process_context;
+pub mod create;
+pub mod process_parameters;
 pub mod session;
 pub mod enum_process_threads;
 pub mod alert_thread;

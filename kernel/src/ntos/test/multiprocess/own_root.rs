@@ -2,7 +2,7 @@
 //! páginas (`ps::process::create_process` dá a raiz com o processo).
 //!
 //! - Dois processos de usuário montados ao mesmo tempo pelo caminho real
-//!   (`create_windows_process`), de executáveis com ImageBase diferentes,
+//!   (`ps::create::create_user_process`), de executáveis com ImageBase diferentes,
 //!   ganham raízes próprias, distintas e diferentes da do System, gravadas no
 //!   KPROCESS; o CR3 de quem os montou continua na raiz dele.
 //! - A PEB e a pilha da primeira thread ficam na MESMA VA nos dois, com
@@ -27,8 +27,9 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::process_address_space::{self as address_space, SYSTEM_ROOT};
 use crate::ntos::mm::shared_user_data::MM_SHARED_USER_DATA_VA;
 use crate::ntos::mm::{kernel_stack, memory_map as map, paging, pfn};
+use crate::ntos::ps::create::{self, CreatedProcess, ImageOrigin};
 use crate::ntos::ps::{process, process_context};
-use crate::ntos::ps::user::process::{self as user_process, CreatedProcess, RunOptions};
+use crate::ntos::ps::user::process::{self as user_process, RunOptions};
 use crate::ntos::ps::user::file_io::{self, OpenRequest};
 use crate::ntos::ps::user::{loader, memory, process_state, state};
 use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput};
@@ -51,20 +52,17 @@ fn program(image_base: u64, exit_code: u32) -> alloc::vec::Vec<u8> {
     crate::ntos::test::phase7::single_section_image(image_base, 0x0022, b".text", 0x6000_0020, 0x1000, entry)
 }
 
-/// Monta, sem rodar, um processo do programa; o EPROCESS fica retido pelo
-/// teste até o fim.
+/// Cria, sem rodar, um processo do programa pelo caminho único; o EPROCESS
+/// fica retido pelo teste até o fim.
 fn create(name: &str, (image_base, exit_code): (u64, u32)) -> Option<CreatedProcess> {
-    match user_process::create_windows_process(Some(program(image_base, exit_code)), name, &format!("C:\\{name}"), None, &RunOptions::default()) {
-        Ok(Ok(created)) => {
+    let request = user_process::windows_process_request(ImageOrigin::Bytes(program(image_base, exit_code)), name, &format!("C:\\{name}"), &RunOptions::default());
+    match create::create_user_process(&request) {
+        Ok(created) => {
             process::reference(created.process_pointer);
             Some(created)
         }
-        Ok(Err(status)) => {
-            crate::debug_print!("[raiz] {} terminou na montagem: {:#x}", name, status);
-            None
-        }
-        Err(error) => {
-            crate::debug_print!("[raiz] {} nao montado: {}", name, error);
+        Err(failure) => {
+            crate::debug_print!("[raiz] {} nao criado: {}", name, failure);
             None
         }
     }

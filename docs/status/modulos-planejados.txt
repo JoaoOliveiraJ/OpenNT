@@ -235,6 +235,7 @@ ntos/mm/page_fault_failure
 ntos/mm/page_residency
 ntos/mm/paging
 ntos/mm/partition
+ntos/mm/peb_teb
 ntos/mm/pfn
 ntos/mm/physical_layout
 ntos/mm/physical_ranges
@@ -292,6 +293,7 @@ ntos/po/black_box_recorder
 ntos/po/power_manager
 ntos/ps/alert_thread
 ntos/ps/context_apc
+ntos/ps/create
 ntos/ps/debug_state
 ntos/ps/enum_process_threads
 ntos/ps/image_information
@@ -304,6 +306,7 @@ ntos/ps/previous_mode
 ntos/ps/process_context
 ntos/ps/process_image
 ntos/ps/process_notify
+ntos/ps/process_parameters
 ntos/ps/process
 ntos/ps/query_thread
 ntos/ps/scheduler
@@ -346,7 +349,6 @@ ntos/ps/user/sections
 ntos/ps/user/semaphore
 ntos/ps/user/set_thread_context
 ntos/ps/user/state
-ntos/ps/user/structures
 ntos/ps/user/syscall_scan
 ntos/ps/user/syscalls_core
 ntos/ps/user/threads

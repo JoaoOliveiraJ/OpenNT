@@ -313,8 +313,8 @@ preenche os campos reais da KTHREAD do 19041: StackBase (o topo), StackLimit,
 InitialStack = StackBase - 0x30 (o KERNEL_STACK_CONTROL, com CurrentStackBase
 e ActualLimit) e KernelStack = InitialStack; com `None` a KTHREAD descreve a
 pilha de boot (o kmain, o System e os contextos de kernel do escalonador
-rodam nela). Usam pilha própria as threads de usuário (a primeira de
-`run_windows_process`/`load_process` e as de NtCreateThreadEx), as threads de
+rodam nela). Usam pilha própria as threads de usuário (a primeira, da
+criação em `ps/create.rs`, e as de NtCreateThreadEx), as threads de
 sistema nativas (PsCreateSystemThread, que antes tiravam a pilha da arena) e
 os níveis dos contextos de KeAllocateCalloutStackEx. Como no KiSwapContext, o
 despacho para o anel 3 (`usermode::exec_user_context`/`exec_user_mode`) grava
@@ -585,7 +585,7 @@ que um attach aninhado e o KeAttachProcess restauram cada raiz, que a thread
 corrente de outro espaço carrega a raiz dele e que o delete de um espaço
 carregado é recusado. `ntos/test/multiprocess/own_root.rs` (fase 7) monta
 dois processos de usuário ao mesmo tempo pelo caminho real
-(`create_windows_process`): raízes próprias e distintas; a PEB e a pilha na
+(`ps::create::create_user_process`): raízes próprias e distintas; a PEB e a pilha na
 mesma VA nos dois, com conteúdo diferente lido anexado a cada um e frames
 que a raiz do System não vê; a ntdll em cópias privadas na mesma VA. Depois
 os dois rodam em sequência (`run_created`) com os próprios códigos de
@@ -674,6 +674,31 @@ dereference e o PFN livre volta ao de antes.
   trocar de volta (e o laço desfizer o serviço) e chamar de novo. Toda falha depois da criação
   de um processo também passa pelo término. Teste:
   `ntos/test/multiprocess/lifecycle.rs`.
+- **Criação de processos**: um caminho só, `ps/create.rs::
+  create_user_process` (o papel do PspCreateProcess/PspAllocateProcess com
+  o PspAllocateThread e o PspInsertProcess/PspInsertThread). Todo processo
+  de usuário nasce ali: o `run_windows_process` e o `run_service`
+  (`ps/user/process.rs`, que só monta o pedido e executa o processo
+  criado, `run_created`) e os autotestes. O pedido traz a imagem (caminho
+  NT de um arquivo do volume, arquivo do volume ou bytes), o nome curto e
+  os parâmetros. A ordem: abrir a imagem e ler o layout (uma falha não cria
+  nada: `CreateFailure::FileOpen`/`ExeFormat`); `create_process` (EPROCESS,
+  PID, raiz própria, `ProcessState`, seção de imagem); anexado ao processo
+  novo, as cópias de sistema, o executável, a pilha, a PEB
+  (`mm/peb_teb.rs`, o MmCreatePeb: imagem, ApiSetMap +0x68, NLS, heap,
+  versão, subsistema da imagem; PEB.Ldr NULL para a ntdll), a PEB_LDR_DATA
+  do loader do kernel (`loader::create_kernel_ldr`), os parâmetros
+  (`ps/process_parameters.rs`, o RtlCreateProcessParametersEx: bloco
+  auto-relativo com ImagePathName, CommandLine, diretório corrente, DLLs,
+  título, desktop, shell, runtime, ambiente com EnvironmentSize, console e
+  handles padrão), a TEB (`peb_teb::create_teb`, o MmCreateTeb, também
+  usado pelo NtCreateThreadEx) e o CONTEXT inicial do LdrInitializeThunk; a
+  KTHREAD com pilha de kernel própria; as notificações de thread no
+  contexto de quem cria e as de carga de imagem anexadas ao processo novo.
+  O processo sai parado (`CreatedProcess`); descartado sem rodar, termina
+  com STATUS_CANCELLED, e toda falha depois do `create_process` passa pelo
+  término (`create::end_process`). Teste:
+  `ntos/test/multiprocess/create_path.rs`.
 - **Memória de usuário de outro processo**: o kernel só toca a memória de
   usuário do processo corrente; para a de outro, anexa ao dono antes, como
   o KeStackAttachProcess do NT. O escopo é `ps/process_context.rs::
@@ -684,11 +709,12 @@ dereference e o PFN livre volta ao de antes.
   IofCompleteRequest de um IRP de modo usuário (IOSB e buffer vão para o
   processo de Irp->Tail.Overlay.Thread, como a APC de conclusão do NT; um
   processo que já saiu não recebe a cópia), o post-mortem do
-  `run_windows_process` (o laço devolveu a thread do chamador), a montagem
-  do processo (já era) e a criação de workers de fábrica (já era). A PEB e
-  o CONTEXT inicial do processo novo são escritos com a thread dele já
-  corrente, e a notificação de carga de imagem do loader do kernel vem
-  depois de a imagem entrar no VAD do processo, onde os callbacks a leem.
+  `run_windows_process` (o laço devolveu a thread do chamador), a criação
+  do processo (`ps/create.rs`: imagem, PEB, parâmetros, TEB e o CONTEXT
+  inicial, e as notificações de carga de imagem do executável e da ntdll,
+  com o PID dele) e a criação de workers de fábrica (já era). A
+  notificação de carga de imagem do loader do kernel vem depois de a imagem
+  entrar no VAD do processo, onde os callbacks a leem.
   As entregas que a thread recebe numa espera sondada (pacotes de conclusão,
   mensagens ALPC, workers de fábrica) rodam como a própria thread
   (`refresh_ready_user_threads` a torna a corrente), e as APCs de kernel
