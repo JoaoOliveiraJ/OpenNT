@@ -111,7 +111,7 @@ Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bib
 | Modo usuário | Parcial | Autoteste do modo usuário |
 | ntdll.dll, KERNEL32 e KERNELBASE | Planejado | — |
 | Executáveis .exe (comando exec) | Planejado | — |
-| csrss.exe | Planejado | — |
+| csrss.exe | Parcial | — |
 
 ## Fase 8 — vídeo, arquivos e rede (planejada)
 
