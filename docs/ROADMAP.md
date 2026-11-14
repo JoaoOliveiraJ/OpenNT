@@ -51,7 +51,7 @@ Object Manager (tipos, handles, namespace, callbacks), biblioteca de runtime, Ex
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Processos e threads | Funciona | Autoteste do kernel, Autoteste de objetos e executive, Autoteste do modo usuário |
-| Sincronização e despacho | Funciona | Autoteste de objetos e executive, Autoteste do kernel |
+| Sincronização e despacho | Funciona | Autoteste de objetos e executive, Autoteste do modo usuário, Autoteste do kernel |
 | Gerenciador de objetos e namespace | Parcial | Autoteste de objetos e executive |
 | Segurança e tokens | Parcial | Autoteste de objetos e executive |
 
