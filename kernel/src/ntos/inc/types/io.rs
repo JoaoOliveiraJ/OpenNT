@@ -4618,3 +4618,24 @@ impl GuestScalar for DmaSpeed {
         self.0 as u32 as u64
     }
 }
+
+/// `_IO_SECURITY_CONTEXT` (0x18 bytes).
+#[repr(C)]
+pub struct IoSecurityContext {
+    /// -> `_SECURITY_QUALITY_OF_SERVICE`
+    pub security_qos: Field<u64>,
+    /// -> `_ACCESS_STATE`
+    pub access_state: Field<u64>,
+    pub desired_access: Field<u32>,
+    pub full_create_options: Field<u32>,
+}
+
+unsafe impl NtStruct for IoSecurityContext {}
+
+const _: () = {
+    assert!(core::mem::size_of::<IoSecurityContext>() == 0x18);
+    assert!(core::mem::offset_of!(IoSecurityContext, security_qos) == 0x0);
+    assert!(core::mem::offset_of!(IoSecurityContext, access_state) == 0x8);
+    assert!(core::mem::offset_of!(IoSecurityContext, desired_access) == 0x10);
+    assert!(core::mem::offset_of!(IoSecurityContext, full_create_options) == 0x14);
+};

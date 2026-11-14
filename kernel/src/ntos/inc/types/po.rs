@@ -1125,3 +1125,95 @@ impl GuestScalar for PopPepNotifyDeviceDstateReason {
         self.0 as u32 as u64
     }
 }
+
+/// `SYSTEM_POWER_CAPABILITIES` (0x4c bytes).
+#[repr(C)]
+pub struct SystemPowerCapabilities {
+    pub power_button_present: Field<u8>,
+    pub sleep_button_present: Field<u8>,
+    pub lid_present: Field<u8>,
+    pub system_s1: Field<u8>,
+    pub system_s2: Field<u8>,
+    pub system_s3: Field<u8>,
+    pub system_s4: Field<u8>,
+    pub system_s5: Field<u8>,
+    pub hiber_file_present: Field<u8>,
+    pub full_wake: Field<u8>,
+    pub video_dim_present: Field<u8>,
+    pub apm_present: Field<u8>,
+    pub ups_present: Field<u8>,
+    pub thermal_control: Field<u8>,
+    pub processor_throttle: Field<u8>,
+    pub processor_min_throttle: Field<u8>,
+    pub processor_max_throttle: Field<u8>,
+    pub fast_system_s4: Field<u8>,
+    pub hiberboot: Field<u8>,
+    pub wake_alarm_present: Field<u8>,
+    pub ao_ac: Field<u8>,
+    pub disk_spin_down: Field<u8>,
+    pub hiber_file_type: Field<u8>,
+    pub ao_ac_connectivity_supported: Field<u8>,
+    pub spare3: [Field<u8>; 6],
+    pub system_batteries_present: Field<u8>,
+    pub batteries_are_short_term: Field<u8>,
+    pub battery_scale: [BatteryReportingScale; 3],
+    pub ac_on_line_wake: Field<SystemPowerState>,
+    pub soft_lid_wake: Field<SystemPowerState>,
+    pub rtc_wake: Field<SystemPowerState>,
+    pub min_device_wake_state: Field<SystemPowerState>,
+    pub default_low_latency_wake: Field<SystemPowerState>,
+}
+
+unsafe impl NtStruct for SystemPowerCapabilities {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemPowerCapabilities>() == 0x4c);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, power_button_present) == 0x0);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, sleep_button_present) == 0x1);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, lid_present) == 0x2);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_s1) == 0x3);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_s2) == 0x4);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_s3) == 0x5);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_s4) == 0x6);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_s5) == 0x7);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, hiber_file_present) == 0x8);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, full_wake) == 0x9);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, video_dim_present) == 0xa);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, apm_present) == 0xb);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, ups_present) == 0xc);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, thermal_control) == 0xd);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, processor_throttle) == 0xe);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, processor_min_throttle) == 0xf);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, processor_max_throttle) == 0x10);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, fast_system_s4) == 0x11);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, hiberboot) == 0x12);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, wake_alarm_present) == 0x13);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, ao_ac) == 0x14);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, disk_spin_down) == 0x15);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, hiber_file_type) == 0x16);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, ao_ac_connectivity_supported) == 0x17);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, spare3) == 0x18);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, system_batteries_present) == 0x1e);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, batteries_are_short_term) == 0x1f);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, battery_scale) == 0x20);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, ac_on_line_wake) == 0x38);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, soft_lid_wake) == 0x3c);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, rtc_wake) == 0x40);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, min_device_wake_state) == 0x44);
+    assert!(core::mem::offset_of!(SystemPowerCapabilities, default_low_latency_wake) == 0x48);
+};
+
+/// `BATTERY_REPORTING_SCALE` (0x8 bytes).
+#[repr(C)]
+pub struct BatteryReportingScale {
+    pub granularity: Field<u32>,
+    pub capacity: Field<u32>,
+}
+
+unsafe impl NtStruct for BatteryReportingScale {}
+
+const _: () = {
+    assert!(core::mem::size_of::<BatteryReportingScale>() == 0x8);
+    assert!(core::mem::offset_of!(BatteryReportingScale, granularity) == 0x0);
+    assert!(core::mem::offset_of!(BatteryReportingScale, capacity) == 0x4);
+};

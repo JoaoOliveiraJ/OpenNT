@@ -73,7 +73,8 @@ raizes = [
   # pilha de armazenamento: PnP, Po e WHEA
   "_INTERFACE", "_DEVICE_DESCRIPTION", "_POP_IRP_DATA", "_WHEA_TIMESTAMP",
   "_WHEA_ERROR_RECORD_HEADER", "_WHEA_ERROR_PACKET_V2", "_WHEA_DEVICE_DRIVER_DESCRIPTOR",
-  "_WHEA_ERROR_SOURCE_DESCRIPTOR",
+  "_WHEA_ERROR_SOURCE_DESCRIPTOR", "_IO_SECURITY_CONTEXT", "SYSTEM_POWER_CAPABILITIES",
+  "BATTERY_REPORTING_SCALE",
 ]
 
 # O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS
@@ -185,6 +186,7 @@ prefixos = [
 [[familia]]
 nome = "po"
 doc = "Po: estado de energia e gerenciamento de processador."
+nomes = ["BATTERY_REPORTING_SCALE"]
 prefixos = [
   "PO_", "POP_", "POWER_", "PPM_", "PROC_", "PEP_", "SYSTEM_POWER", "DEVICE_POWER",
   "PROCESSOR_IDLE", "PROCESSOR_PERF", "PERF_", "PROCESSOR_POWER",
