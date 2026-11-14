@@ -396,15 +396,39 @@ PML4:
   da PML4 de endereço físico `root`. A forma sem raiz usa a raiz corrente,
   `paging::current_root()` (o CR3). Trocar a proteção de uma página é
   mapear o mesmo frame de novo com as flags novas, também por raiz.
-- Ainda há um só espaço em uso: todo EPROCESS recebe a PML4 do boot como
-  DirectoryTableBase e o CR3 não muda. O rastreador de frames só acompanha
-  as tabelas alcançadas pela PML4 do boot.
+- **Espaço de um processo.** `process_address_space::create(eprocess)`, o
+  MmCreateProcessAddressSpace, dá ao processo uma raiz nova com a visão de
+  usuário da KUSER_SHARED_DATA em 0x7FFE0000 (MM_SHARED_USER_DATA_VA): o
+  mesmo frame da visão de kernel, U/S, somente leitura e sem execução,
+  mapeado por `shared_user_data::map_user_view_in(root)`, o mesmo caminho
+  que monta a visão na raiz do boot. A raiz vai para
+  KPROCESS.DirectoryTableBase (UserDirectoryTableBase 0, sem KVA shadow) e
+  para `ProcessState.directory_table_base`; o Mm guarda EPROCESS -> raiz.
+- `process_address_space::delete(eprocess)`, o MmDeleteProcessAddressSpace,
+  roda no último dereference do EPROCESS (`ps::process::collect_process`, o
+  papel do PspProcessDelete). `paging::release_user_half_in` percorre a
+  metade de usuário inteira e devolve ao PFN toda tabela dela, vazia ou não,
+  e depois a raiz; o processo volta a apontar para a raiz do System. Uma
+  página de usuário ainda mapeada fora da visão da KUSER faz o delete
+  recusar sem mudar nada (o VAD tem de ter sido desfeito antes), e uma raiz
+  carregada também é recusada.
+- Ainda só a raiz do boot é carregada: os processos que o Ps cria recebem a
+  PML4 do boot como DirectoryTableBase, ninguém troca o CR3 para uma raiz de
+  `create`, e o attach recusa um processo que tenha uma. O rastreador de
+  frames só acompanha as tabelas alcançadas pela PML4 do boot; as tabelas de
+  usuário das outras raízes ficam fora dele.
 
 O autoteste `ntos/test/multiprocess/page_table_root.rs` (fase 7) confere as
 256 entradas presentes e permanentes, a PDPT de um slot vazio sobrevivendo a
 um mapear/desfazer, a raiz do boot e a corrente dando a mesma resposta em
 amostras das duas metades, e uma raiz nova com os mesmos frames de kernel,
 sem páginas de usuário, que isola uma página mapeada nela.
+`ntos/test/multiprocess/address_space.rs` (fase 7) cria os espaços de dois
+processos: a raiz fica no KPROCESS e no `ProcessState`, a KUSER de usuário
+está presente e somente leitura nos dois, a mesma VA de usuário cai em
+frames diferentes e as VAs de kernel nos mesmos, o delete recusa com página
+mapeada e depois devolve tudo (a contagem livre do PFN volta à de antes), e
+o último dereference de um processo com espaço próprio o libera.
 
 **Imagens.**
 

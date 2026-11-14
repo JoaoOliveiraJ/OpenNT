@@ -8,15 +8,31 @@
 //! recursivo mostra sempre as tabelas da raiz carregada. A metade de
 //! usuário, PML4[0..256), começa vazia e é só do espaço.
 //!
-//! Ainda há um só espaço em uso: todo EPROCESS recebe a PML4 do boot como
-//! DirectoryTableBase e o CR3 não muda.
+//! [`create`] (MmCreateProcessAddressSpace) dá a um EPROCESS uma raiz
+//! própria com a visão de usuário da KUSER_SHARED_DATA e a grava em
+//! KPROCESS.DirectoryTableBase e no `ProcessState`; [`delete`]
+//! (MmDeleteProcessAddressSpace) devolve ao PFN todas as tabelas da metade
+//! de usuário e a raiz, no último dereference do EPROCESS
+//! (`ps::process::collect_process`), o papel do PspProcessDelete.
+//!
+//! Ainda só a raiz do boot é carregada: os processos que o Ps cria recebem a
+//! PML4 do boot como DirectoryTableBase, ninguém troca o CR3 para uma raiz de
+//! [`create`] e o attach recusa um processo que tenha uma.
 
-use super::{memory_map as map, paging, pfn, recursive_mapping};
+use alloc::collections::BTreeMap;
+use core::sync::atomic::Ordering;
+
+use super::{memory_map as map, paging, pfn, recursive_mapping, shared_user_data};
 use crate::hal::physical;
-use crate::rtl::KernelError;
+use crate::ntos::inc::types::{Kprocess, NtStruct};
+use crate::ntos::ps::user::process_state;
+use crate::rtl::{KernelError, SpinLock};
 
 /// Raiz do System: a PML4 do boot.
 pub const SYSTEM_ROOT: u64 = map::PML4_PHYS;
+
+/// EPROCESS -> a raiz própria que [`create`] lhe deu.
+static SPACES: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
 
 /// Fase 0, depois do PFN e do mapeamento recursivo e antes do banco nativo
 /// de PFNs e de qualquer outro mapeamento de sistema: pré-aloca as PDPTs da
@@ -66,5 +82,82 @@ pub fn delete_root(root: u64) -> Result<(), KernelError> {
     }
     physical::zero(root, map::PAGE_SIZE as usize);
     pfn::free_page(root);
+    Ok(())
+}
+
+/// A raiz própria do EPROCESS `process`, se ele tiver uma.
+pub fn root_of(process: u64) -> Option<u64> {
+    SPACES.lock().get(&process).copied()
+}
+
+/// Grava a raiz em KPROCESS.DirectoryTableBase (sem KVA shadow, a
+/// UserDirectoryTableBase fica 0) e no `ProcessState`, se o processo ainda
+/// tiver um.
+fn publish(process: u64, root: u64) {
+    // SAFETY: EPROCESS vivo, criado pelo Ps e retido pelo chamador.
+    let pcb = unsafe { Kprocess::at(process) };
+    pcb.directory_table_base.set(root);
+    pcb.user_directory_table_base.set(0);
+    if let Some(state) = process_state::get(process) {
+        state.directory_table_base.store(root, Ordering::Release);
+    }
+}
+
+/// MmCreateProcessAddressSpace: uma raiz nova ([`create_root`]) com a
+/// visão de usuário da KUSER_SHARED_DATA em 0x7FFE0000, o mesmo frame da
+/// visão de kernel, somente leitura. A raiz vai para
+/// KPROCESS.DirectoryTableBase e para o `ProcessState` do processo; devolve
+/// a raiz. Um processo que já tem raiz própria é recusado.
+pub fn create(process: u64) -> Result<u64, KernelError> {
+    if process == 0 {
+        return Err(KernelError::new("address space without an EPROCESS"));
+    }
+    if root_of(process).is_some() {
+        return Err(KernelError::new("process already has an address space"));
+    }
+    let root = create_root()?;
+    if !shared_user_data::map_user_view_in(root) {
+        discard(root);
+        return Err(KernelError::new("no user view of KUSER_SHARED_DATA in the new address space"));
+    }
+    let inserted = {
+        let mut spaces = SPACES.lock();
+        let free = !spaces.contains_key(&process);
+        if free {
+            spaces.insert(process, root);
+        }
+        free
+    };
+    if !inserted {
+        discard(root);
+        return Err(KernelError::new("process already has an address space"));
+    }
+    publish(process, root);
+    Ok(root)
+}
+
+/// Desfaz uma raiz de [`create`] que nunca foi publicada.
+fn discard(root: u64) {
+    if let Err(error) = paging::release_user_half_in(root, &[shared_user_data::MM_SHARED_USER_DATA_VA]).and_then(|_| delete_root(root)) {
+        debug_print!("[mm] raiz {:#x} descartada com erro: {}", root, error);
+    }
+}
+
+/// MmDeleteProcessAddressSpace: devolve ao PFN todas as tabelas da metade de
+/// usuário da raiz própria de `process` (a visão da KUSER cai junto) e a
+/// própria raiz; o processo volta a apontar para a raiz do System. A raiz
+/// não pode estar carregada, e uma página de usuário ainda mapeada fora da
+/// visão da KUSER faz a chamada recusar sem mudar nada: o VAD do processo
+/// tem de ter sido desfeito antes.
+pub fn delete(process: u64) -> Result<(), KernelError> {
+    let Some(root) = SPACES.lock().remove(&process) else {
+        return Err(KernelError::new("process has no address space of its own"));
+    };
+    let released = paging::release_user_half_in(root, &[shared_user_data::MM_SHARED_USER_DATA_VA]).and_then(|_| delete_root(root));
+    if let Err(error) = released {
+        SPACES.lock().insert(process, root);
+        return Err(error);
+    }
+    publish(process, SYSTEM_ROOT);
     Ok(())
 }

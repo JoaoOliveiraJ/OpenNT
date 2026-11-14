@@ -22,7 +22,9 @@
 //! `vad` de um estado.
 //!
 //! Já mora aqui a tabela de handles de usuário (`handles`, operada por
-//! `state.rs`); o resto do estado global de `state.rs` continua valendo para o
+//! `state.rs`) e a raiz das tabelas de páginas (`directory_table_base`,
+//! gravada por `mm::process_address_space`); o resto do estado global de
+//! `state.rs` continua valendo para o
 //! processo de usuário em execução, e os campos entram aqui à medida que saem
 //! de lá.
 
@@ -30,8 +32,10 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicU64;
 
 use super::memory::{self, Vad};
+use crate::ntos::mm::process_address_space;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
 use crate::rtl::{KernelError, SpinLock};
@@ -46,6 +50,10 @@ pub struct ProcessState {
     pub handles: SpinLock<UserHandleTable>,
     /// As regiões de usuário do processo (o papel do EPROCESS.VadRoot).
     pub vad: SpinLock<Vad>,
+    /// A raiz das tabelas de páginas, a mesma de KPROCESS.DirectoryTableBase:
+    /// a do System até `mm::process_address_space::create` dar ao processo
+    /// uma própria.
+    pub directory_table_base: AtomicU64,
 }
 
 static PROCESSES: SpinLock<BTreeMap<u64, Arc<ProcessState>>> = SpinLock::new(BTreeMap::new());
@@ -56,7 +64,13 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
     if process == 0 {
         return Err(KernelError::new("estado de processo sem EPROCESS"));
     }
-    let state = Arc::new(ProcessState { process, process_id, handles: SpinLock::new(UserHandleTable::new()), vad: SpinLock::new(Vad::default()) });
+    let state = Arc::new(ProcessState {
+        process,
+        process_id,
+        handles: SpinLock::new(UserHandleTable::new()),
+        vad: SpinLock::new(Vad::default()),
+        directory_table_base: AtomicU64::new(process_address_space::SYSTEM_ROOT),
+    });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {
         return Err(KernelError::new(format!("EPROCESS {process:#x} ja tem estado")));

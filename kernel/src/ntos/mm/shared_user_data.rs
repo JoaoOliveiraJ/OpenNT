@@ -3,6 +3,9 @@
 //! O Windows mapeia 0xFFFFF78000000000 em todo espaço de endereço; o kernel
 //! atualiza SystemTime, InterruptTime e TickCount. Drivers do WDK
 //! leem ali direto (KeQuerySystemTime/KeQueryTickCount são macros inline).
+//! O modo usuário lê o mesmo frame pela visão de usuário em 0x7FFE0000
+//! (MM_SHARED_USER_DATA_VA), somente leitura e sem execução, que cada espaço
+//! de endereçamento recebe por [`map_user_view_in`].
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +20,9 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{KsystemTime, KuserSharedData, NtProductType};
 
 pub const SHARED_USER_DATA_VA: u64 = 0xFFFF_F780_0000_0000;
+/// MM_SHARED_USER_DATA_VA: a visão de usuário da página, na mesma VA em todo
+/// espaço de endereçamento.
+pub const MM_SHARED_USER_DATA_VA: u64 = 0x7FFE_0000;
 /// Célula lida pela atualização preemptiva no caminho nativo do timer.
 const SHARED_FRAME_CELL: u64 = 0x81530;
 /// SharedDataFlags.DbgStateSeparationEnabled.
@@ -39,6 +45,15 @@ fn shared(frame: u64) -> &'static KuserSharedData {
 pub fn data() -> Option<&'static KuserSharedData> {
     let frame = frame();
     (frame != 0).then(|| shared(frame))
+}
+
+/// Mapeia a visão de usuário na raiz `root`: o frame da visão de kernel em
+/// [`MM_SHARED_USER_DATA_VA`], acessível ao anel 3, somente leitura e sem
+/// execução. A folha é do espaço de endereçamento, não de uma região do VAD.
+pub fn map_user_view_in(root: u64) -> bool {
+    let frame = frame();
+    frame != 0
+        && paging::map_page_in(root, MM_SHARED_USER_DATA_VA, frame, paging::PAGE_PRESENT | paging::PAGE_USER, MapOptions { nx: true, ..MapOptions::default() })
 }
 
 /// Protocolo do KSYSTEM_TIME: High2Time, LowPart e por último High1Time;

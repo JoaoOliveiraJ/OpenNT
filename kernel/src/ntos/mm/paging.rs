@@ -582,6 +582,76 @@ fn reclaim_empty_tables(root: u64, va: u64, deferred: Option<&mut Vec<u64>>) {
     }
 }
 
+/// Desmonta a metade de usuário da raiz `root`, que não pode ser a do boot
+/// nem estar carregada (o espaço já não roda em CPU nenhuma): devolve ao PFN
+/// todas as tabelas de PML4[0..256), sem depender de terem ficado vazias, e
+/// zera essas entradas. As folhas de 4 KB nas VAs de `discarded` são do
+/// próprio espaço e caem junto com as tabelas. Qualquer outra folha
+/// (presente, com backing ou de página grande) faz a chamada recusar sem
+/// mudar nada: quem a mapeou ainda não a desfez. Devolve quantas tabelas
+/// liberou.
+pub fn release_user_half_in(root: u64, discarded: &[u64]) -> Result<u64, KernelError> {
+    if root == PML4 || root == current_root() {
+        return Err(KernelError::new("page-table root still in use"));
+    }
+    // A varredura inteira vem antes de qualquer escrita.
+    let mut tables = Vec::new();
+    if let Some(va) = collect_user_tables(root, 4, 0, discarded, &mut tables) {
+        return Err(KernelError::new(alloc::format!("user page still mapped at {va:#x}")));
+    }
+    // Filhos antes dos pais: cada tabela sai da entrada que a aponta e é
+    // zerada antes de voltar ao PFN.
+    for &(at, frame) in &tables {
+        write_entry(at, 0, false);
+        physical::zero(frame, 4096);
+    }
+    {
+        let mut state = STATE.lock();
+        for &(at, frame) in &tables {
+            state.owned_tables.remove(&at);
+            state.nonempty_table_hints.remove(&frame);
+        }
+    }
+    let mut released = 0;
+    for &(_, frame) in &tables {
+        if pfn::free_page(frame) {
+            released += 1;
+        }
+    }
+    Ok(released)
+}
+
+/// Junta em `tables`, em pós-ordem, as tabelas abaixo de `table` (nível 4 =
+/// PML4, só a metade de usuário) como (entrada pai, frame). Devolve a VA da
+/// primeira folha fora de `discarded`.
+fn collect_user_tables(table: u64, level: u32, prefix: u64, discarded: &[u64], tables: &mut Vec<(u64, u64)>) -> Option<u64> {
+    let entries = if level == 4 { map::USER_PML4_ENTRIES } else { 512 };
+    let shift = 12 + (level - 1) * 9;
+    for index in 0..entries {
+        let at = table + index * 8;
+        let entry = read_entry(at);
+        if entry == 0 {
+            continue;
+        }
+        let va = prefix | (index << shift);
+        if level == 1 {
+            if !discarded.contains(&va) {
+                return Some(va);
+            }
+            continue;
+        }
+        if entry & PAGE_PRESENT == 0 || entry & PAGE_PS != 0 {
+            return Some(va);
+        }
+        let child = table_of(entry);
+        if let Some(va) = collect_user_tables(child, level - 1, va, discarded, tables) {
+            return Some(va);
+        }
+        tables.push((at, child));
+    }
+    None
+}
+
 /// Opções de [`map_page`]/[`unmap_page`].
 #[derive(Default)]
 pub struct MapOptions<'a> {

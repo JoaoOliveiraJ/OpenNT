@@ -12,7 +12,7 @@ use crate::ntos::ke::clock;
 use crate::ntos::mm::{paging, pfn, shared_user_data};
 use crate::ntos::ps::{process, system_process_information};
 use crate::ntos::ps::user::registry;
-use crate::ntos::ps::user::state::{self, KUSER_SHARED_DATA_USER_VA, STATUS_NOT_IMPLEMENTED, SYSCALL_STACK_PAGES};
+use crate::ntos::ps::user::state::{self, STATUS_NOT_IMPLEMENTED, SYSCALL_STACK_PAGES};
 use crate::rtl::{KernelError, SpinLock};
 
 /// `user_mode_init(stack_top)` da HAL de modo usuário: devolve a GDT.
@@ -71,12 +71,12 @@ pub fn init() -> Result<(), KernelError> {
     let gdt = user_mode_init(top)?;
     state::with(|state| state.syscall_stack_top = top);
     // KUSER_SHARED_DATA no endereço de usuário real (só leitura para o anel
-    // 3), o mesmo frame da visão de kernel.
-    let shared = shared_user_data::frame();
-    if shared == 0 {
+    // 3), o mesmo frame da visão de kernel, como em todo espaço de
+    // endereçamento.
+    if shared_user_data::frame() == 0 {
         return Err(KernelError::new("KUSER_SHARED_DATA sem frame (init do mm faltou?)"));
     }
-    if !paging::map_page(KUSER_SHARED_DATA_USER_VA, shared, paging::PAGE_PRESENT | paging::PAGE_USER, paging::MapOptions::default()) {
+    if !shared_user_data::map_user_view_in(paging::current_root()) {
         return Err(KernelError::new("mapPage falhou p/ KUSER_SHARED_DATA de usuario"));
     }
     crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha de syscall ate {:#x}, KUSER user em 0x7FFE0000", gdt, top);

@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::ex::{push_lock, rundown};
 use crate::ntos::ke::{clock, critical_region, pcr};
-use crate::ntos::mm::{kernel_data, memory_map};
+use crate::ntos::mm::{kernel_data, memory_map, process_address_space};
 use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::{object_access, object_types};
 use crate::ntos::ob::handles::process as process_handles;
@@ -667,6 +667,12 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     }
     if let (Some(image), Some(provider)) = (&record.image, provider) {
         (provider.destroy)(image);
+    }
+    // O papel do PspProcessDelete: a raiz própria do processo, se houver.
+    if process_address_space::root_of(process).is_some() {
+        if let Err(error) = process_address_space::delete(process) {
+            debug_print!("[ps] espaco de enderecamento do processo {:#x} nao liberado: {}", process, error);
+        }
     }
     object_types::account("Process", -1, 0)?;
     guest::free_bytes(process);

@@ -46,7 +46,7 @@ pub const SYSCALL_STACK_PAGES: u64 = 16;
 /// Pilha de usuário da primeira thread (VA escolhida pelo alocador).
 pub const USER_STACK_SIZE: u64 = 0x10_0000;
 /// O endereço real de usuário da KUSER_SHARED_DATA.
-pub const KUSER_SHARED_DATA_USER_VA: u64 = 0x7FFE_0000;
+pub const KUSER_SHARED_DATA_USER_VA: u64 = crate::ntos::mm::shared_user_data::MM_SHARED_USER_DATA_VA;
 
 /// Contrato com o retorno ao modo usuário: NtTerminateProcess devolve este
 /// valor e grava o código de saída no bloco de execução da CPU; o retorno faz

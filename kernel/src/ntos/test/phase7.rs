@@ -4930,6 +4930,7 @@ fn usermode_syscalls_exports(assert: Assert) {
 pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::process_state::run(assert);
     crate::ntos::test::multiprocess::page_table_root::run(assert);
+    crate::ntos::test::multiprocess::address_space::run(assert);
     crate::ntos::test::multiprocess::handles::run(assert);
     crate::ntos::test::multiprocess::per_cpu::run(assert);
     crate::ntos::test::multiprocess::vad::run(assert);
