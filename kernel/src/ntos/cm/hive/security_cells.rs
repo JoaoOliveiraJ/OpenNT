@@ -11,7 +11,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ntos::inc::types::extra_cm_hive::CmKeySecurity;
+use crate::ntos::inc::types::CmKeySecurity;
 use crate::ntos::inc::types::NtStruct;
 use crate::ntos::se::inherit_descriptor::Captured;
 

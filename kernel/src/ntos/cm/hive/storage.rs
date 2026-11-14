@@ -21,7 +21,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ntos::inc::types::extra_cm_hive::{HbaseBlock, Hbin};
+use crate::ntos::inc::types::{HbaseBlock, Hbin};
 use crate::ntos::inc::types::NtStruct;
 
 pub const HBLOCK_SIZE: u32 = 0x1000;
@@ -90,7 +90,7 @@ impl Storage {
         base.signature.set(HBASE_SIGNATURE);
         base.sequence1.set(1);
         base.sequence2.set(1);
-        base.time_stamp.set(time);
+        base.time_stamp.quad_part.set(time as i64);
         base.major.set(1);
         base.minor.set(minor);
         base.type_.set(0);
@@ -239,7 +239,7 @@ impl Storage {
         }
         if offset == 0 {
             // SAFETY: cabeçalho do bin recém-criado.
-            unsafe { Hbin::at(bin.address()) }.time_stamp.set(self.base_block().time_stamp.get());
+            unsafe { Hbin::at(bin.address()) }.time_stamp.quad_part.set(self.base_block().time_stamp.quad_part.get());
         }
         let cell = offset + HBIN_HEADER;
         let free = size - HBIN_HEADER;

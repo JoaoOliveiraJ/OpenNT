@@ -22,7 +22,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ntos::cm::registry::Value;
-use crate::ntos::inc::types::extra_cm_hive::{CmBigData, CmKeyNode, CmKeyValue};
+use crate::ntos::inc::types::{CmBigData, CmKeyNode, CmKeyValue};
 use crate::ntos::inc::types::NtStruct;
 use crate::ntos::inc::field::Field;
 use crate::ntos::se::inherit_descriptor::Captured;
@@ -129,11 +129,11 @@ pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Cap
         flags |= KEY_HIVE_ENTRY | KEY_NO_DELETE;
     }
     key.flags.set(flags);
-    key.last_write_time.set(time);
+    key.last_write_time.quad_part.set(time as i64);
     key.parent.set(parent);
     key.sub_key_lists[0].set(HCELL_NIL);
     key.sub_key_lists[1].set(HCELL_NIL);
-    key.value_list.set(HCELL_NIL);
+    key.value_list.list.set(HCELL_NIL);
     key.security.set(HCELL_NIL);
     key.class.set(HCELL_NIL);
     key.name_length.set(stored.len() as u16);
@@ -148,8 +148,10 @@ pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Cap
         let parent_node = node(storage, parent)?;
         parent_node.sub_key_lists[0].set(new_list);
         parent_node.sub_key_counts[0].set(parent_node.sub_key_counts[0].get() + 1);
-        raise(&parent_node.max_name_len, name_units.len() as u32 * 2);
-        parent_node.last_write_time.set(time);
+        if name_units.len() as u32 * 2 > parent_node.max_name_len() {
+            parent_node.set_max_name_len(name_units.len() as u32 * 2);
+        }
+        parent_node.last_write_time.quad_part.set(time as i64);
         storage.mark_cell_dirty(parent);
     }
     storage.mark_cell_dirty(cell);
@@ -264,11 +266,11 @@ fn store_value_data(storage: &mut Storage, cell: u32, value_type: u32, data: &[u
 
 /// As células 'vk' de uma chave, em ordem.
 fn value_cells(storage: &Storage, key: &CmKeyNode) -> Option<Vec<u32>> {
-    let count = key.value_count.get();
+    let count = key.value_list.count.get();
     if count == 0 {
         return Some(Vec::new());
     }
-    let bytes = storage.read_cell(key.value_list.get(), count * 4)?;
+    let bytes = storage.read_cell(key.value_list.list.get(), count * 4)?;
     Some(bytes.chunks_exact(4).map(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]])).collect())
 }
 
@@ -298,21 +300,21 @@ pub fn set_value(storage: &mut Storage, key_cell: u32, name: &str, value_type: u
             value.flags.set(if compressed { VALUE_COMP_NAME } else { 0 });
             store_value_data(storage, cell, value_type, data)?;
             let key = node(storage, key_cell)?;
-            let count = key.value_count.get();
-            let list = key.value_list.get();
+            let count = key.value_list.count.get();
+            let list = key.value_list.list.get();
             let entries = count + 1;
             let capacity = if entries < 100 { entries } else { entries.div_ceil(100) * 100 };
             let list = if list == HCELL_NIL { storage.allocate(capacity * 4)? } else { storage.reallocate(list, capacity * 4)? };
             storage.write_cell(list, count * 4, &cell.to_le_bytes());
             let key = node(storage, key_cell)?;
-            key.value_list.set(list);
-            key.value_count.set(entries);
+            key.value_list.list.set(list);
+            key.value_list.count.set(entries);
         }
     }
     let key = node(storage, key_cell)?;
     raise(&key.max_value_name_len, name_units.len() as u32 * 2);
     raise(&key.max_value_data_len, data.len() as u32);
-    key.last_write_time.set(time);
+    key.last_write_time.quad_part.set(time as i64);
     storage.mark_cell_dirty(key_cell);
     Some(())
 }
@@ -328,19 +330,19 @@ pub fn delete_value(storage: &mut Storage, key_cell: u32, name: &str, time: u64)
     let (length, field) = (value.data_length.get(), value.data.get());
     free_data(storage, length, field);
     storage.free(cell);
-    let list = key.value_list.get();
+    let list = key.value_list.list.get();
     if cells.is_empty() {
         storage.free(list);
         let key = node(storage, key_cell)?;
-        key.value_list.set(HCELL_NIL);
-        key.value_count.set(0);
+        key.value_list.list.set(HCELL_NIL);
+        key.value_list.count.set(0);
     } else {
         let bytes: Vec<u8> = cells.iter().flat_map(|cell| cell.to_le_bytes()).collect();
         storage.write_cell(list, 0, &bytes);
-        key.value_count.set(cells.len() as u32);
+        key.value_list.count.set(cells.len() as u32);
     }
     let key = node(storage, key_cell)?;
-    key.last_write_time.set(time);
+    key.last_write_time.quad_part.set(time as i64);
     storage.mark_cell_dirty(key_cell);
     Some(())
 }
@@ -359,7 +361,7 @@ pub fn delete_key(storage: &mut Storage, key_cell: u32, time: u64) -> Option<()>
     let parent_node = node(storage, parent)?;
     parent_node.sub_key_lists[0].set(new_list);
     parent_node.sub_key_counts[0].set(parent_node.sub_key_counts[0].get().saturating_sub(1));
-    parent_node.last_write_time.set(time);
+    parent_node.last_write_time.quad_part.set(time as i64);
     storage.mark_cell_dirty(parent);
     let key = node(storage, key_cell)?;
     for cell in value_cells(storage, key)? {
@@ -370,7 +372,7 @@ pub fn delete_key(storage: &mut Storage, key_cell: u32, time: u64) -> Option<()>
         storage.free(cell);
     }
     let key = node(storage, key_cell)?;
-    let (values, class, security) = (key.value_list.get(), key.class.get(), key.security.get());
+    let (values, class, security) = (key.value_list.list.get(), key.class.get(), key.security.get());
     if values != HCELL_NIL {
         storage.free(values);
     }
@@ -385,7 +387,7 @@ pub fn delete_key(storage: &mut Storage, key_cell: u32, time: u64) -> Option<()>
 /// LastWriteTime de uma chave.
 pub fn set_last_write_time(storage: &mut Storage, key_cell: u32, time: u64) {
     if let Some(key) = node(storage, key_cell) {
-        key.last_write_time.set(time);
+        key.last_write_time.quad_part.set(time as i64);
         storage.mark_cell_dirty(key_cell);
     }
 }
@@ -416,7 +418,7 @@ pub fn read_key(storage: &Storage, cell: u32) -> Result<KeyRecord, u32> {
         let value_name = value_name(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
         values.push(Value { name: String::from_utf16_lossy(&value_name), value_type: value.type_.get(), data: read_data(storage, value)? });
     }
-    Ok(KeyRecord { name: String::from_utf16_lossy(&name), last_write_time: key.last_write_time.get(), security, values, children, flags: key.flags.get() })
+    Ok(KeyRecord { name: String::from_utf16_lossy(&name), last_write_time: key.last_write_time.quad_part.get() as u64, security, values, children, flags: key.flags.get() })
 }
 
 /// A célula de uma subchave pelo nome (para os testes de conferência).

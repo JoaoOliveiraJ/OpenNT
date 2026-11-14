@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-use crate::ntos::inc::types::extra_cm_hive::{CmIndex, CmKeyFastIndex, CmKeyIndex};
+use crate::ntos::inc::types::{CmIndex, CmKeyIndex};
 use crate::ntos::inc::types::NtStruct;
 use crate::ntos::inc::field::Field;
 use crate::ntos::rtl::unicode_case;
@@ -116,7 +116,7 @@ fn write_leaf(storage: &mut Storage, signature: u16, entries: &[Entry]) -> Optio
             // SAFETY: idem, entrada de 8 bytes.
             let slot = unsafe { CmIndex::at(address + 4 + index as u64 * 8) };
             slot.cell.set(entry.cell);
-            slot.hash_key.set(if signature == LH { hash(entry.name) } else { hint(entry.name) });
+            slot.hash_key.hash.set(if signature == LH { hash(entry.name) } else { hint(entry.name) });
         }
     }
     Some(cell)
@@ -194,7 +194,7 @@ pub fn add(storage: &mut Storage, list: u32, cell: u32, name: &[u16], names: &dy
                 // SAFETY: idem, entrada de 8 bytes.
                 let slot = unsafe { CmIndex::at(address + 4 + position as u64 * 8) };
                 slot.cell.set(cell);
-                slot.hash_key.set(if signature == LH { hash(name) } else { hint(name) });
+                slot.hash_key.hash.set(if signature == LH { hash(name) } else { hint(name) });
             }
             index_at(address).count.set(count as u16 + 1);
             storage.mark_cell_dirty(leaf);
@@ -241,12 +241,4 @@ pub fn remove(storage: &mut Storage, list: u32, cell: u32, names: &dyn Fn(&Stora
 /// Assinatura de uma lista (para conferência nos testes).
 pub fn signature(storage: &Storage, list: u32) -> Option<u16> {
     storage.cell(list, 4).map(|address| index_at(address).signature.get())
-}
-
-/// A folha 'lf'/'lh' de uma lista de folha única, para conferência.
-pub fn fast_leaf(storage: &Storage, list: u32) -> Option<&'static CmKeyFastIndex> {
-    let address = storage.cell(list, 4)?;
-    // SAFETY: folha rápida de uma célula alocada.
-    let leaf = unsafe { CmKeyFastIndex::at(address) };
-    (leaf.signature.get() == LF || leaf.signature.get() == LH).then_some(leaf)
 }

@@ -30,7 +30,7 @@ use crate::ntos::cm::key::{policy, services as key_services};
 use crate::ntos::cm::registry::{self, NodeId};
 use crate::ntos::cm::{hive_list, seed};
 use crate::ntos::inc::field::Field;
-use crate::ntos::inc::types::extra_cm_hive::HbaseBlock;
+use crate::ntos::inc::types::HbaseBlock;
 use crate::ntos::inc::types::{IoStatusBlock, NtStruct, ObjectAttributes, UnicodeString};
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::mm::guest_memory as guest;
@@ -137,7 +137,7 @@ fn format_vectors(assert: Assert) {
     block.signature.set(0x6667_6572);
     block.sequence1.set(7);
     block.sequence2.set(7);
-    block.time_stamp.set(0x01DB_0000_0000_0000);
+    block.time_stamp.quad_part.set(0x01DB_0000_0000_0000);
     let filled = base_block::checksum(block);
     guest::free_bytes(page);
     assert(zero == 1 && ones == 0xFFFF_FFFE && filled == 0x67BC_6572, "hive: HvpHeaderCheckSum (0 vira 1, 0xFFFFFFFF vira 0xFFFFFFFE, bloco com regf e sequencias)");

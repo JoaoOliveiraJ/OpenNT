@@ -77,6 +77,9 @@ raizes = [
   "BATTERY_REPORTING_SCALE",
   # adaptador de DMA da HAL
   "_DMA_ADAPTER", "_DMA_OPERATIONS", "_SCATTER_GATHER_LIST", "_SCATTER_GATHER_ELEMENT",
+  # Cm: o formato de hive (regf)
+  "_HBASE_BLOCK", "_HBIN", "_CM_KEY_NODE", "_CM_KEY_VALUE", "_CM_KEY_SECURITY", "_CM_KEY_INDEX",
+  "_CM_INDEX", "_CM_BIG_DATA",
 ]
 
 # O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS
@@ -138,7 +141,8 @@ nomes = [
 [[familia]]
 nome = "cm"
 doc = "Cm: listas de recursos e estruturas do registro."
-prefixos = ["CM_", "KEY_", "HHIVE", "HBASE", "HMAP", "DUAL", "HCELL", "CELL_", "REG_", "HIVE"]
+nomes = ["CHILD_LIST"]
+prefixos = ["CM_", "KEY_", "HHIVE", "HBASE", "HBIN", "HMAP", "DUAL", "HCELL", "CELL_", "REG_", "HIVE"]
 
 [[familia]]
 nome = "ob"

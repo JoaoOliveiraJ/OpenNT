@@ -8,7 +8,7 @@
 //! a soma batendo.
 
 use crate::ntos::inc::field::Field;
-use crate::ntos::inc::types::extra_cm_hive::HbaseBlock;
+use crate::ntos::inc::types::HbaseBlock;
 use crate::ntos::inc::types::NtStruct;
 
 use super::storage::{HBASE_SIGNATURE, STATUS_REGISTRY_CORRUPT};
@@ -59,7 +59,9 @@ pub fn validate_primary(base: &HbaseBlock, file_length: u64) -> Result<(), u32> 
 pub fn fill_file_name(base: &HbaseBlock, name: &str) {
     let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
     let start = units.len().saturating_sub(31);
+    // FileName são 64 bytes de UTF-16LE.
     for (index, slot) in base.file_name.iter().enumerate() {
-        slot.set(units.get(start + index).copied().unwrap_or(0));
+        let unit = units.get(start + index / 2).copied().unwrap_or(0);
+        slot.set(unit.to_le_bytes()[index % 2]);
     }
 }
