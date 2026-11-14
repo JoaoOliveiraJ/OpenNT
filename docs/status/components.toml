@@ -748,7 +748,7 @@ icone = "layers"
 descricao = "As bibliotecas de sistema reais do Windows, pelas quais os programas falam com o kernel."
 estado = "planejado"
 fase = "7"
-notas = "Com --initial-process=smss, o smss.exe real já roda com a ntdll.dll real (LdrInitializeThunk, thread pool, ALPC e o carregador). No boot comum, nenhum processo carrega as DLLs reais ainda. A ntdll.dll real vai para o volume só porque o vgk.sys a abre pelo caminho; o kernel procura a ntdll na raiz do volume (D:\\NTDLL.DLL), onde o build não a põe, e no boot comum registra “ntdll.dll ausente”. Os testes do modo usuário usam uma ntdll de bring-up que o build gera, só com os stubs das chamadas de sistema."
+notas = "Com --initial-process=smss, o smss.exe real já roda com a ntdll.dll real (LdrInitializeThunk, thread pool, ALPC e o carregador), e o csrss.exe carrega e inicializa o kernelbase.dll e o kernel32.dll reais, puxados pelo user32.dll que o winsrvext.dll importa. No boot comum, nenhum processo carrega as DLLs reais ainda. A ntdll.dll real vai para o volume só porque o vgk.sys a abre pelo caminho; o kernel procura a ntdll na raiz do volume (D:\\NTDLL.DLL), onde o build não a põe, e no boot comum registra “ntdll.dll ausente”. Os testes do modo usuário usam uma ntdll de bring-up que o build gera, só com os stubs das chamadas de sistema."
 
 [[componente]]
 nome = "Executáveis .exe (comando exec)"
@@ -764,9 +764,9 @@ nome = "csrss.exe"
 categoria = "Programas do Windows"
 icone = "message"
 descricao = "O processo do subsistema Windows (Client/Server Runtime), que os programas Win32 contatam ao iniciar."
-estado = "planejado"
+estado = "em desenvolvimento"
 fase = "7"
-notas = "Com --initial-process=smss, o smss.exe real roda como primeiro processo e cria o smss da sessão, que cria o csrss.exe real; o teste smss-csrss confere o csrss até o primeiro serviço do win32k. Hoje o csrss cria o diretório da sessão, o \\Windows\\ApiPort e a seção compartilhada, carrega o basesrv.dll e para na inicialização dele, que pede a SystemTimeOfDayInformation, ainda sem resposta no kernel; o marcador ainda não sai. No boot comum, o kernel mantém uma imitação provisória do lado servidor do csrss (ps/user/csr.rs), descrita em Modo usuário, desligada no boot com o smss."
+notas = "Com --initial-process=smss, o smss.exe real roda como primeiro processo e cria o smss da sessão, que cria o csrss.exe real; o teste smss-csrss confere o csrss até o primeiro serviço do win32k. O csrss cria o diretório da sessão, o \\Windows\\ApiPort e a seção compartilhada e carrega os servidores reais: o basesrv.dll (hora do sistema, \\BaseNamedObjects, links da sessão e o mapeamento de arquivos .ini do Registro), o winsrv.dll e o winsrvext.dll, que importa o user32.dll real. A inicialização do user32 dentro do csrss, com o kernelbase, o kernel32, o gdi32 e o gdi32full reais, chega ao NtGdiInit, o primeiro serviço do win32k.sys, e o marcador sai ali: o win32k.sys ainda não é carregado (o Kmode fica fora do SubSystems), que é o próximo marco. No boot comum, o kernel mantém uma imitação provisória do lado servidor do csrss (ps/user/csr.rs), descrita em Modo usuário, desligada no boot com o smss."
 
 # ---- subsistemas do kernel ----------------------------------------------------
 # `pasta` é a pasta dos módulos em modulos-planejados.txt.

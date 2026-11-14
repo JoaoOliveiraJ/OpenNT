@@ -1212,7 +1212,8 @@ dereference e o PFN livre volta ao de antes.
   as DLLs que eles importam), e o kernel semeia o Registro que eles leem: a
   chave Session Manager (`cm/session_manager.rs`: SubSystems com a linha do
   csrss, KnownDLLs, DOS Devices, Environment; sem Kmode, BootExecute nem
-  arquivos de paginação), os serviços Npfs e Msfs e o
+  arquivos de paginação), a árvore `IniFileMapping` que o basesrv lê
+  (`cm/ini_file_mapping.rs`), os serviços Npfs e Msfs e o
   `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID
   (`cm/hw_description.rs`). Nesse boot ficam desligados a imitação do csrss
   (`ps/user/csr.rs`), o `\KnownDlls` montado pelo kernel, o provisionamento
@@ -1236,14 +1237,25 @@ dereference e o PFN livre volta ao de antes.
   ProcessSessionInformation, a SystemManufacturingInformation e a
   SystemSupportedProcessorArchitectures (`ex/`), NtCreateDirectoryObject,
   NtCreateSymbolicLinkObject, NtSetSecurityObject (também sobre os
-  pseudo-handles de processo e thread), a ObjectSessionObjectInformation
-  do NtSetInformationObject e a duplicação de handles do Object Manager
-  (com DUPLICATE_NO_RIGHTS_UPGRADE). O marcador `SMSS_CSRSS_OK` sai quando o csrss.exe criado
-  por um smss pede o primeiro serviço do win32k
+  pseudo-handles de processo e thread), a ObjectSessionInformation (o
+  SessionId do diretório, `ob/objects/namespace.rs`) e a
+  ObjectSessionObjectInformation do NtSetInformationObject, a duplicação
+  de handles do Object Manager (com DUPLICATE_NO_RIGHTS_UPGRADE), a
+  SystemTimeOfDayInformation (`ex/time_of_day_information.rs`, com o
+  KeQueryBootTimeValues de `ke/clock.rs`), a ProcessLUIDDeviceMapsEnabled,
+  o NtSetInformationVirtualMemory de modo usuário (as validações do serviço
+  e a pré-busca, `mm/prefetch.rs`; a VmImageHotPatchInformation que a ntdll
+  pede a cada DLL é STATUS_NOT_SUPPORTED, sem reserva de hot patch) e o
+  MEM_RELEASE com a faixa da região inteira. O marcador `SMSS_CSRSS_OK` sai
+  quando o csrss.exe criado por um smss pede o primeiro serviço do win32k
   (`ex/service_table.rs::out_of_range` -> `initial_process::win32k_requested`)
-  com o smss inicial e o csrss vivos. Hoje o csrss vai até carregar o
-  basesrv.dll e para na inicialização dele (a SystemTimeOfDayInformation
-  ainda não tem resposta), antes do winsrv e do win32k.
+  com o smss inicial e o csrss vivos: o csrss carrega o basesrv (diretórios
+  `\BaseNamedObjects`, links e o mapeamento de .ini), o winsrv e o
+  winsrvext, que importa o user32 real; a inicialização do user32 (com o
+  kernelbase, o kernel32, o gdi32 e o gdi32full reais) chega ao NtGdiInit
+  (serviço 0x12e3), o primeiro do win32k, que ainda não está carregado.
+  Com `OPENNT_TRACE_SYSCALLS`, as linhas `[sys]` dos serviços que abrem ou
+  criam objetos por nome mostram o nome do OBJECT_ATTRIBUTES.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
