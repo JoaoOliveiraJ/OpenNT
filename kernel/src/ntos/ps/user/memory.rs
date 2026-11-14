@@ -487,11 +487,11 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         requested_base & !(PAGE - 1)
     };
     let size = if fixed { (requested_base + requested).div_ceil(PAGE) * PAGE - base } else { requested.div_ceil(PAGE) * PAGE };
+    let commit_only = !reserve && allocation_type & MEM_COMMIT != 0;
     if fixed {
         if let Some(existing) = space.find(base) {
             // COMMIT sem RESERVE dentro de uma região já reservada: comita a
             // subfaixa (só em regiões próprias; imagens nunca).
-            let commit_only = !reserve && allocation_type & MEM_COMMIT != 0;
             let view = view_of(&existing);
             let ours = private(&existing).is_some() || view.is_some();
             if commit_only && ours && base >= existing.base() && base + size <= existing.base() + existing.size() {
@@ -508,6 +508,14 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                 return Ok(0);
             }
             debug_print!("[usermode] alloc CONFLITO: base 0x{:x} size 0x{:x} tipo 0x{:x} - regiao em 0x{:x}", base, size, allocation_type, existing.base());
+            return Ok(STATUS_CONFLICTING_ADDRESSES);
+        }
+        // COMMIT sem RESERVE só comita o que já está reservado: sem VAD na
+        // base, STATUS_CONFLICTING_ADDRESSES, como no MiAllocateVirtualMemory
+        // do 19041 (o STATUS_MEMORY_NOT_ALLOCATED do MiObtainReferencedVadEx
+        // vira CONFLICTING_ADDRESSES). Sem base, o commit reserva uma faixa
+        // nova (abaixo).
+        if commit_only {
             return Ok(STATUS_CONFLICTING_ADDRESSES);
         }
         // Os primeiros 64 KB nunca são mapeáveis (MiIsVaRangeAvailable).

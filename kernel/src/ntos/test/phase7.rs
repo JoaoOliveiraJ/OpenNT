@@ -701,6 +701,11 @@ fn user_virtual_memory(assert: Assert) {
     let reserved_status = allocate(0, 0x4000, 0x2000, 4);
     let reserved = guest::read64(base_pointer);
     assert(reserved_status == 0 && paging::translate(reserved) == 0 && allocate(reserved + 0x1000, 0x1000, 0x1000, 4) == 0 && paging::translate(reserved + 0x1000) != 0 && paging::translate(reserved) == 0, "usermemory: commit sobre a reserva confirma so a subfaixa");
+    // MEM_COMMIT sem MEM_RESERVE fora de uma reserva (o resto do grânulo de
+    // 64 KB da reserva de 16 KB é livre) e além do fim dela:
+    // STATUS_CONFLICTING_ADDRESSES, sem região nem página nova.
+    let unreserved = reserved + 0x8000;
+    assert(allocate(unreserved, 0x1000, 0x1000, 4) == 0xC000_0018 && memory::find_region(unreserved).is_none() && paging::translate(unreserved) == 0 && allocate(reserved + 0x3000, 0x2000, 0x1000, 4) == 0xC000_0018 && paging::translate(reserved + 0x4000) == 0, "usermemory: MEM_COMMIT sem reserva na base recusado com STATUS_CONFLICTING_ADDRESSES");
     assert(allocate(reserved, 0x1000, 0x2000, 4) == 0xC000_0018 && allocate(0, 0x1000, 0x3000, 3) == 0xC000_0045 && allocate(0, 0x1000, 0x3000, 0x104) == 0xC000_00BB && allocate(0, 0, 0x3000, 4) == 0xC000_000D, "usermemory: conflito, protecao invalida, modificador e tamanho zero");
     let context = Context::current();
     assert(memory_query::describe(reserved, &context).state == 0x2000 && memory_query::describe(reserved + 0x1000, &context).state == 0x1000 && memory_query::describe(data, &context).size == 0x3000, "usermemory: regioes privadas descritas com reserva e commit");
