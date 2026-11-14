@@ -2,13 +2,13 @@
 //!
 //! `init` arma o anel 3 (pilhas reserva e de falta dupla, GDT/TSS da HAL,
 //! KUSER_SHARED_DATA no endereço de usuário, modo estrito de posse da
-//! memória de usuário, registro semeado);
+//! memória de usuário, assert de CR3, registro semeado);
 //! `invoke_service` é a ponte que o gateway nativo escolhido pelo descritor
 //! usa para chegar ao handler registrado por nome. Os módulos de área
 //! registram seus handlers no init do ntoskrnl.
 
 use crate::ntos::ex::system_services;
-use crate::ntos::ke::clock;
+use crate::ntos::ke::{clock, context_switch};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, paging, shared_user_data};
 use crate::ntos::ps::{process, system_process_information};
@@ -75,6 +75,9 @@ pub fn init() -> Result<(), KernelError> {
     // Modo estrito de posse: daqui em diante toda sonda de VA de usuário
     // exige o processo dono corrente (ou anexado) ou uma faixa de sistema.
     guest::set_ownership_check(Some(memory::check_user_access));
+    // Assert de CR3: toda VA de usuário que o kernel toca, confiável ou
+    // sondada, cai na raiz do processo corrente.
+    guest::set_root_check(Some(context_switch::check_loaded_root));
     registry::seed_registry_for_user_mode()?;
     let initializers = *LATE_INITIALIZERS.lock();
     for initializer in initializers.into_iter().flatten() {

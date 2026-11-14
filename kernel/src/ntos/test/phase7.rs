@@ -2194,7 +2194,7 @@ fn user_address_floor(assert: Assert) {
     };
     // Uma faixa está livre se nenhuma região, vista ou PTE a ocupa.
     let free = |base: u64, size: u64| {
-        let occupied = memory::occupied();
+        let occupied = memory::occupied(memory::Space::current());
         !occupied.iter().any(|region| base < region.base + region.size && base + size > region.base) && paging::find_mapping(base, size).is_none()
     };
     // Varredura independente do alocador, de 64 KB em 64 KB.
@@ -2351,9 +2351,10 @@ fn user_windows_process(assert: Assert) {
     let exe = single_section_image(0x1_4000_0000, 0x0022, b".text", 0x6000_0020, 0x1000, entry);
     // Onde o processo ficou: a imagem principal, a PEB (do EPROCESS) e a
     // base da pilha da primeira thread (StackLimit da TEB, logo abaixo da
-    // PEB). Com o processo vivo, também o caminho da imagem no estado do
-    // processo, os ids da primeira thread e a lista de threads do processo;
-    // o EPROCESS fica retido pelo teste para as asserções depois da saída.
+    // PEB, lida anexado: a TEB está na raiz própria do processo). Com o
+    // processo vivo, também o caminho da imagem no estado do processo, os ids
+    // da primeira thread e a lista de threads do processo; o EPROCESS fica
+    // retido pelo teste para as asserções depois da saída.
     let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
     let owner = core::cell::Cell::new(0u64);
     let listed_threads = core::cell::Cell::new(0usize);
@@ -2369,13 +2370,13 @@ fn user_windows_process(assert: Assert) {
         listed_threads.set(crate::ntos::ps::user::threads::of_process(pointer).len());
         let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
         let peb = if pointer != 0 { unsafe { nt::Eprocess::at(pointer) }.peb.get() } else { 0 };
-        let teb = (peb != 0).then(|| unsafe { nt::Teb::at(peb - 0x2000) });
-        let stack = teb.map_or(0, |teb| teb.nt_tib.stack_limit.get());
+        let teb = (peb != 0).then(|| crate::ntos::ps::process_context::with_process(pointer, || { let teb = unsafe { nt::Teb::at(peb - 0x2000) }; (teb.nt_tib.stack_limit.get(), teb.client_id.unique_thread.get(), teb.client_id.unique_process.get()) }).ok()).flatten();
+        let stack = teb.map_or(0, |(stack, _, _)| stack);
         placed.set((exe_base, peb, stack));
         let image = crate::ntos::ps::user::process_state::get(pointer).map(|identity| identity.image_path()).unwrap_or_default();
         // A primeira thread tem TID próprio, o mesmo na TEB e no ETHREAD.
         let thread_ids: Vec<u64> = active.map(|entry| entry.threads.iter().filter_map(|&thread| crate::ntos::ps::process::thread_record(thread).map(|record| record.id)).collect()).unwrap_or_default();
-        let distinct = thread_ids.len() == 1 && thread_ids[0] != process_id && teb.is_some_and(|teb| teb.client_id.unique_thread.get() == thread_ids[0] && teb.client_id.unique_process.get() == process_id);
+        let distinct = thread_ids.len() == 1 && thread_ids[0] != process_id && teb.is_some_and(|(_, thread, process)| thread == thread_ids[0] && process == process_id);
         *identity.borrow_mut() = (image, distinct);
         Ok(())
     };
@@ -2395,13 +2396,17 @@ fn user_windows_process(assert: Assert) {
     let leftover_threads = crate::ntos::ps::user::threads::all().iter().any(|thread| thread.with(|thread| thread.process_pointer) == retained);
     assert(retained != 0 && exit_status == 0x5A && !leftover_threads, "userprocess: o EPROCESS retido guarda o codigo de saida e nenhuma thread do processo sobra no indice");
     assert(retained != 0 && crate::ntos::ps::user::process_state::get(retained).is_none() && memory::Space::of(retained).regions().is_empty() && memory::Space::system().regions().len() == system_regions, "userprocess: o VAD do processo volta no termino e nada dele foi para o System");
+    // A raiz própria do processo vive enquanto o EPROCESS está retido, já sem
+    // a imagem e a pilha; o último dereference a devolve.
+    let (exe_base, peb, stack) = placed.get();
+    let own_root = crate::ntos::mm::process_address_space::root_of(retained).unwrap_or(0);
+    let undone = own_root != 0 && crate::ntos::mm::paging::find_mapping_in(own_root, exe_base, 0x2000).is_none() && crate::ntos::mm::paging::translate_in(own_root, stack) == 0 && crate::ntos::mm::paging::translate_in(own_root, peb) == 0;
     if retained != 0 {
         let _ = crate::ntos::ps::process::dereference(retained);
     }
-    let (exe_base, peb, stack) = placed.get();
     let user = |address: u64| crate::ntos::mm::memory_map::is_user_range(address, 0x1000);
     assert(exe_base == 0x1_4000_0000 && user(peb) && peb % 0x1000 == 0 && user(stack) && stack % 0x10000 == 0 && stack < 0x1_0000_0000, "userprocess: exe na ImageBase, PEB e pilha escolhidas pelo alocador (pilha de baixo para cima, abaixo de 4 GB)");
-    assert(crate::ntos::mm::paging::find_mapping(exe_base, 0x2000).is_none() && crate::ntos::mm::paging::translate(stack) == 0, "userprocess: imagem principal e pilha desfeitas na saida");
+    assert(undone && crate::ntos::mm::process_address_space::root_of(retained).is_none() && crate::ntos::mm::paging::find_mapping(exe_base, 0x2000).is_none(), "userprocess: imagem principal e pilha desfeitas na raiz do processo, e a raiz devolvida no ultimo dereference");
     // Remove a instalação mínima do volume.
     for (name, _) in &files {
         let Ok(block) = memory::map_user_region(0x1000) else { continue };
@@ -4971,6 +4976,7 @@ pub fn run(assert: Assert) {
     // Depois dele: a ntdll, o apiset e o NLS do processo de usuário já estão prontos.
     crate::ntos::test::multiprocess::lifecycle::run(assert);
     crate::ntos::test::multiprocess::ownership::run(assert);
+    crate::ntos::test::multiprocess::own_root::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

@@ -170,10 +170,13 @@ fn live_process_keeps_its_own(assert: Assert) {
     };
     assert(holds(a, &owned, &module) && state::is_user_process(a), "vida: o processo vivo tem regiao, handle, thread e modulo proprios");
 
-    // B nasce, roda e termina; vivo, ele não vê nada de A.
+    // B nasce, roda e termina; vivo, ele não vê nada de A. B tem raiz
+    // própria: na VA da região de A ele pode ter uma região dele, nunca a
+    // de A.
     let isolated = Cell::new(false);
+    let region_of_a = memory::Space::of(a).find(owned.region);
     let inspect = |b: u64| {
-        let foreign = process_context::with_process(b, || memory::find_region(owned.region).is_none() && state::get_user_handle(owned.handle).is_none() && loader::loaded_module("vida-a.dll").is_none());
+        let foreign = process_context::with_process(b, || memory::find_region(owned.region).is_none_or(|found| region_of_a.as_ref().is_none_or(|mine| !state::same_region(&found, mine))) && state::get_user_handle(owned.handle).is_none() && loader::loaded_module("vida-a.dll").is_none());
         isolated.set(foreign.unwrap_or(false) && !threads::of_process(b).iter().any(|thread| Arc::ptr_eq(thread, &owned.thread)));
     };
     let (result, b) = run_once("vida-b.exe", &inspect);

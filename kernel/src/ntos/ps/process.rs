@@ -273,7 +273,10 @@ fn unlink_thread(thread: u64) -> Result<(), KernelError> {
 /// EPROCESS completo para o kernel 19041 correspondente. `process_id` é o
 /// PID pedido (o System, autotestes) ou `cid::ALLOCATE`, o próximo id livre
 /// da tabela de ids de cliente; o PID fica com o EPROCESS até ele ser
-/// recolhido.
+/// recolhido. Um processo de usuário (com `executable`) ganha a própria raiz
+/// de tabelas de páginas (o MmCreateProcessAddressSpace do
+/// PspAllocateProcess), devolvida no último dereference; o System e os
+/// processos de kernel ficam na raiz do System.
 pub fn create_process(process_id: u64, image_name: &str, image_base: u64, executable: Option<&Executable>) -> Result<u64, KernelError> {
     let process_type = object_types::process_type();
     let process_id = cid::claim(process_id, cid::Kind::Process)?;
@@ -316,11 +319,21 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
         None => None,
     };
     let security = object_access::capture(Some(primary_token));
-    // O estado por processo nasce com a ObjectTable, antes da lista ativa.
+    // O estado por processo nasce com a ObjectTable, antes da lista ativa, e
+    // o processo de usuário com o espaço de endereçamento próprio.
     let tables = process_state::create(process, process_id).and_then(|_| {
-        process_handles::create(process, process_id).inspect_err(|_| {
-            process_state::destroy(process);
-        })
+        process_handles::create(process, process_id)
+            .and_then(|_| {
+                if executable.is_none() {
+                    return Ok(());
+                }
+                process_address_space::create(process).map(|_| ()).inspect_err(|_| {
+                    let _ = process_handles::destroy(process);
+                })
+            })
+            .inspect_err(|_| {
+                process_state::destroy(process);
+            })
     });
     if let Err(error) = tables {
         if let (Some(image), Some(provider)) = (&image, provider) {
@@ -397,10 +410,10 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     object.flags3.set(if process_id == SYSTEM_PROCESS_ID { Eprocess::SYSTEM_PROCESS_MASK } else { 0 });
     object.flags.set(0);
     // KPROCESS embutido: tipo (o DWORD do cabeçalho inteiro) + DirectoryTableBase
-    // (CR3 real do sistema).
+    // (a raiz própria do processo de usuário ou a do System).
     object.pcb.header.lock.set(PROCESS_OBJECT as i32);
     object.pcb.base_priority.set(8);
-    object.pcb.directory_table_base.set(memory_map::PML4_PHYS);
+    object.pcb.directory_table_base.set(process_address_space::root_of(process).unwrap_or(memory_map::PML4_PHYS));
     object.unique_process_id.set(process_id);
     write_time(&object.create_time, create_time);
     object.active_threads.set(1);

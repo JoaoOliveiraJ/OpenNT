@@ -7,6 +7,12 @@
 //! lida e só gravam de volta as diferenças. Vistas copy-on-write recebem
 //! páginas privadas pela falta de escrita.
 //!
+//! Raiz: cada vista guarda a raiz em que está mapeada (`View::root`, a do
+//! processo dono ou a do System no espaço de sistema). Confirmar páginas
+//! publica o alias em todas as vistas da control area, cada uma na sua raiz;
+//! a escolha de VA e a falta copy-on-write olham só as vistas da raiz do
+//! espaço, então duas vistas na mesma VA em processos diferentes coexistem.
+//!
 //! Modelo Rust: a seção, a control area e a vista são `Arc` com o estado
 //! mutável sob `SpinLock`; nenhum lock atravessa leituras de arquivo,
 //! paginação ou a coleta do objeto.
@@ -30,6 +36,7 @@ use crate::ntos::mm::section::secured_views;
 use crate::ntos::mm::section::views::{self as section_views, OwnedView};
 use crate::ntos::mm::system_image_pages::{self, ImageRange};
 use crate::ntos::mm::pfn;
+use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::section::{address as section_address, cache as section_cache};
 use crate::ntos::ob::object_manager::{self, NodeId, ObjectData};
 use crate::ntos::ob::objects::section::{self as section_objects, SectionState};
@@ -244,6 +251,10 @@ pub struct View {
     pub system_space: bool,
     pub large: bool,
     pub owner_process: Option<u64>,
+    /// A raiz em que a vista está mapeada: a do processo dono (cada processo
+    /// de usuário tem a sua) ou a do System numa vista do espaço de sistema.
+    /// Toda edição das PTEs da vista vai a ela, esteja carregada ou não.
+    pub root: u64,
     pub inherit: u32,
     pub name: Option<String>,
     pub state: SpinLock<ViewMut>,
@@ -348,14 +359,14 @@ fn attach_page(view: &View, page: u64) -> bool {
     let protect = protect_override.unwrap_or_else(|| if view.section.is_image { system_image_pages::protection(&view.section, page) } else { view.protect });
     let Some(frame) = frame else {
         // Proteção de uma página paginada altera a reserva; nunca publica PFN zero.
-        return system_paging && committed && paging::map_page(view_address(view, index * PAGE), 0, 0x200, MapOptions { nx: !executable(protect), ..MapOptions::default() });
+        return system_paging && committed && paging::map_page_in(view.root, view_address(view, index * PAGE), 0, 0x200, MapOptions { nx: !executable(protect), ..MapOptions::default() });
     };
     if view.large && index % 512 != 0 {
         return true;
     }
     let address = view_address(view, index * PAGE);
     let page_flags = flags(view, protect, private.is_some());
-    let mapped = if view.large { paging::map_large_page(address, frame, page_flags, !executable(protect)) } else { paging::map_page(address, frame, page_flags, MapOptions { nx: !executable(protect), ..MapOptions::default() }) };
+    let mapped = if view.large { paging::map_large_page_in(view.root, address, frame, page_flags, !executable(protect)) } else { paging::map_page_in(view.root, address, frame, page_flags, MapOptions { nx: !executable(protect), ..MapOptions::default() }) };
     if !mapped {
         return false;
     }
@@ -512,10 +523,10 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
                 let index = page - first_page;
                 if view.large {
                     if index % 512 == 0 {
-                        paging::unmap_large_page(view_address(view, index * PAGE), None);
+                        paging::unmap_large_page_in(view.root, view_address(view, index * PAGE), None);
                     }
                 } else {
-                    paging::unmap_page(view_address(view, index * PAGE), MapOptions::default());
+                    paging::unmap_page_in(view.root, view_address(view, index * PAGE), MapOptions::default());
                 }
                 let mut state = view.state.lock();
                 state.committed_pages.remove(&index);
@@ -810,11 +821,11 @@ pub struct MapRequest {
 /// Vista mapeada ou o NTSTATUS da recusa.
 pub type Mapped = Result<Arc<View>, u32>;
 
-/// O que já ocupa a faixa onde a vista vai: a metade de usuário inteira
-/// (`memory::occupied`) ou as vistas do espaço de sistema.
-fn occupied_regions(system_space: bool) -> Vec<section_address::Region> {
+/// O que já ocupa a faixa onde a vista vai: a metade de usuário do espaço
+/// dono (`memory::occupied`, por raiz) ou as vistas do espaço de sistema.
+fn occupied_regions(system_space: bool, space: super::memory::Space) -> Vec<section_address::Region> {
     if !system_space {
-        return super::memory::occupied();
+        return super::memory::occupied(space);
     }
     let mut regions: Vec<section_address::Region> = state::with(|state| state.section_kernel_views.iter().map(|region| section_address::Region { base: region.base(), size: region.size() }).collect());
     regions.extend(VIEWS.lock().iter().map(|view| section_address::Region { base: view.base, size: view.size }));
@@ -864,9 +875,13 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     } else if base != 0 && (base > MAX_SAFE_INTEGER || base % alignment != 0) {
         return Ok(Err(0xC000_0220));
     }
+    // O espaço dono (o processo corrente, sem dono explícito) e a raiz em que
+    // a vista vai: a dele, ou a do System no espaço de sistema.
+    let space = super::memory::Space::of(options.owner_process.unwrap_or_else(crate::ntos::ps::process::get_current_process));
+    let root = if options.system_space { SYSTEM_ROOT } else { space.root() };
     // Primeira faixa livre (de baixo para cima, ou de cima no MEM_TOP_DOWN).
-    let find = section_address::FindOptions { system_space: options.system_space, size, alignment, base, top_down: options.top_down, upper: options.upper, minimum: options.minimum };
-    let base = match section_address::find(&find, &occupied_regions(options.system_space)) {
+    let find = section_address::FindOptions { system_space: options.system_space, size, alignment, base, top_down: options.top_down, upper: options.upper, minimum: options.minimum, root };
+    let base = match section_address::find(&find, &occupied_regions(options.system_space, space)) {
         Ok(base) => base,
         Err(status) => return Ok(Err(status)),
     };
@@ -887,6 +902,7 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
         system_space: options.system_space,
         large: large_view,
         owner_process: options.owner_process,
+        root,
         inherit: if options.inherit != 0 { options.inherit } else { 2 },
         name: section.file.as_ref().and_then(|file| file.nt_path()),
         state: SpinLock::new(ViewMut { regions: options.regions, frames: BTreeMap::new(), private_frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), retirement: None, unmapped: false, secured_reads: Vec::new(), system_paging: false, in_page_exceptions: false, release_process_view: None }),
@@ -906,10 +922,10 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
             for index in committed {
                 if view.large {
                     if index % 512 == 0 {
-                        paging::unmap_large_page(view_address(&view, index * PAGE), None);
+                        paging::unmap_large_page_in(view.root, view_address(&view, index * PAGE), None);
                     }
                 } else {
-                    paging::unmap_page(view_address(&view, index * PAGE), MapOptions::default());
+                    paging::unmap_page_in(view.root, view_address(&view, index * PAGE), MapOptions::default());
                 }
             }
             return Ok(Err(0xC000_0017));
@@ -931,7 +947,6 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     // ou nas vistas de sistema.
     let region: Region = view.clone();
     let kind = options.regions.unwrap_or(if view.supervisor { RegionKind::KernelViews } else { RegionKind::User });
-    let space = super::memory::Space::of(options.owner_process.unwrap_or_else(crate::ntos::ps::process::get_current_process));
     super::memory::insert_region(space, kind, region);
     Ok(Ok(view))
 }
@@ -959,7 +974,7 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
     let result = (|| -> Result<(), KernelError> {
         while retirement.next < retirement.pages.len() {
             let address = view_address(view, retirement.pages[retirement.next] * PAGE);
-            let removed = if view.large { paging::unmap_large_page(address, Some(&mut retirement.tables)) } else { paging::unmap_page(address, MapOptions { deferred_tables: Some(&mut retirement.tables), ..MapOptions::default() }) };
+            let removed = if view.large { paging::unmap_large_page_in(view.root, address, Some(&mut retirement.tables)) } else { paging::unmap_page_in(view.root, address, MapOptions { deferred_tables: Some(&mut retirement.tables), ..MapOptions::default() }) };
             if !removed {
                 return Err(KernelError::new("section view page removal failed"));
             }
@@ -1054,14 +1069,17 @@ pub fn flush(section: &Section) -> Result<(), KernelError> {
 }
 
 /// Falta de escrita presente numa página copy-on-write: copia para um PFN
-/// privado com o atributo de cache da seção e republica a página.
+/// privado com o atributo de cache da seção e republica a página. Só as
+/// vistas mapeadas na raiz carregada (a do processo que faltou) ou no espaço
+/// de sistema: outro processo pode ter uma vista na mesma VA.
 pub fn fault(address: u64, error: u32) -> bool {
     if error & 27 != 3 {
         return false;
     }
+    let root = paging::current_root();
     let views = VIEWS.lock().clone();
     for view in views {
-        if view.retiring() || address < view.base || address >= view.base + view.size {
+        if view.retiring() || address < view.base || address >= view.base + view.size || (!view.system_space && view.root != root) {
             continue;
         }
         if error & 4 != 0 && view.supervisor {

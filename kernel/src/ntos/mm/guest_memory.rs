@@ -13,10 +13,12 @@
 //!
 //! - **O espaço do processo corrente.** O CR3 de cada CPU é a raiz do
 //!   processo corrente da thread corrente (o anexado, durante um attach;
-//!   `ke::context_switch`). Os processos que o Ps cria ainda usam a PML4 do
-//!   boot (`PML4_PHYS`), e os APs também. Quando o kernel toca um buffer de
-//!   modo usuário, a VA é desreferenciável direto no espaço carregado; quem
-//!   precisa do espaço de outro processo anexa a ele.
+//!   `ke::context_switch`). Cada processo de usuário tem a própria raiz; o
+//!   System, os processos de kernel e os APs usam a PML4 do boot
+//!   (`PML4_PHYS`). Quando o kernel toca um buffer de modo usuário, a VA é
+//!   desreferenciável direto no espaço carregado, e só nele: a mesma VA de
+//!   outro processo é outra página, ou nenhuma. Quem precisa do espaço de
+//!   outro processo anexa a ele.
 //! - **Proteção.** CR0.WP=1 em todas as CPUs (escritas de supervisor
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
 //! - **Metade de usuário** (PML4[0..256)): só páginas de usuário (imagens,
@@ -82,12 +84,24 @@
 //! espaço próprio). Os autotestes capturam as violações de uma thread
 //! ([`capture_ownership_violations`]): a sonda recusa com ACCESS_VIOLATION e
 //! a violação fica registrada, em vez de parar o sistema.
+//!
+//! # Assert de CR3
+//!
+//! Os acessos confiáveis (`read`/`write`, os atômicos e o `NtStruct::at` dos
+//! campos `Field`) não passam pela posse; com o verificador ligado
+//! (`set_root_check`, no armar do anel 3, em todo boot), uma VA de usuário
+//! tocada pelo kernel, confiável ou sondada, exige que a raiz carregada nesta
+//! CPU seja a do processo corrente da thread corrente dela
+//! ([`check_loaded_root`]): a VA cai no espaço desse processo, nunca no de
+//! outro. A divergência (uma troca de contexto que não carregou a raiz, ou
+//! outra CPU tocando memória de usuário) para o sistema com a VA, as duas
+//! raízes e a linha do chamador.
 
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::vec::Vec;
 use core::panic::Location;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::hal::{host, volatile};
 use crate::ntos::mm::memory_map as map;
@@ -210,6 +224,41 @@ fn check_ownership(address: u64, write: bool) -> Result<(), KernelError> {
     report_violation(&violation)
 }
 
+// ---- assert de CR3 ----------------------------------------------------------
+
+/// O verificador do assert de CR3: recebe a VA de usuário e o chamador, e
+/// para o sistema se a raiz carregada não é a do processo corrente.
+pub type RootCheck = fn(u64, &'static Location<'static>);
+
+/// O [`RootCheck`] instalado, como endereço (0 = desligado): lido em todo
+/// acesso a VA de usuário, sem trava.
+static ROOT_CHECK: AtomicUsize = AtomicUsize::new(0);
+
+/// Liga (ou desliga, com `None`) o assert de CR3.
+pub fn set_root_check(check: Option<RootCheck>) {
+    ROOT_CHECK.store(check.map_or(0, |check| check as usize), Ordering::Release);
+}
+
+/// O assert de CR3 de um acesso do kernel a `address`: nada numa VA de
+/// sistema; numa VA de usuário, o verificador instalado.
+#[inline(always)]
+#[track_caller]
+pub fn check_loaded_root(address: u64) {
+    if address < USER_HALF_END {
+        check_loaded_root_of(address, Location::caller());
+    }
+}
+
+#[inline(never)]
+fn check_loaded_root_of(address: u64, caller: &'static Location<'static>) {
+    let check = ROOT_CHECK.load(Ordering::Acquire);
+    if check != 0 {
+        // SAFETY: só `set_root_check` grava a célula, sempre com um RootCheck.
+        let check = unsafe { core::mem::transmute::<usize, RootCheck>(check) };
+        check(address, caller);
+    }
+}
+
 /// O diagnóstico de um acesso entre processos: para o sistema.
 fn report_violation(violation: &OwnershipViolation) -> ! {
     let OwnershipViolation { address, write, fault, caller } = *violation;
@@ -275,15 +324,21 @@ fn store<T: GuestScalar>(address: u64, value: T) {
     }
 }
 
-/// Leitura confiável: um MOV no endereço virtual, sem tradução.
+/// Leitura confiável: um MOV no endereço virtual, sem tradução (numa VA de
+/// usuário, depois do assert de CR3).
 #[inline]
+#[track_caller]
 pub fn read<T: GuestScalar>(address: u64) -> T {
+    check_loaded_root(address);
     load(address)
 }
 
-/// Escrita confiável: um MOV no endereço virtual, sem tradução.
+/// Escrita confiável: um MOV no endereço virtual, sem tradução (numa VA de
+/// usuário, depois do assert de CR3).
 #[inline]
+#[track_caller]
 pub fn write<T: GuestScalar>(address: u64, value: T) {
+    check_loaded_root(address);
     store(address, value)
 }
 
@@ -311,6 +366,7 @@ fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
     if let Some(resolver) = resolver {
         resolver(address)?;
     }
+    check_loaded_root(address);
     check_ownership(address, write)?;
     let page = address & !0xFFF;
     let writable = |mapping: &paging::PageQuery| !write || mapping.access & paging::PAGE_RW != 0;
@@ -448,41 +504,50 @@ pub fn try_write64(address: u64, value: u64) -> Result<(), KernelError> {
 }
 
 #[inline]
+#[track_caller]
 pub fn read8(address: u64) -> u8 {
     read(address)
 }
 #[inline]
+#[track_caller]
 pub fn read16(address: u64) -> u16 {
     read(address)
 }
 #[inline]
+#[track_caller]
 pub fn read32(address: u64) -> u32 {
     read(address)
 }
 /// Uma carga de qword.
 #[inline]
+#[track_caller]
 pub fn read64(address: u64) -> u64 {
     read(address)
 }
 /// Mesmo que [`read64`]: toda leitura de qword já é uma carga única.
 #[inline]
+#[track_caller]
 pub fn read64_single(address: u64) -> u64 {
     read(address)
 }
 #[inline]
+#[track_caller]
 pub fn write8(address: u64, value: u8) {
     write(address, value)
 }
 #[inline]
+#[track_caller]
 pub fn write16(address: u64, value: u16) {
     write(address, value)
 }
 #[inline]
+#[track_caller]
 pub fn write32(address: u64, value: u32) {
     write(address, value)
 }
 /// Um store de qword.
 #[inline]
+#[track_caller]
 pub fn write64(address: u64, value: u64) {
     write(address, value)
 }
@@ -505,17 +570,23 @@ pub fn read_bytes(address: u64, length: usize) -> Vec<u8> {
 // ---- operações atômicas ----------------------------------------------------
 
 /// A célula de 32 bits do convidado como atômico (memória confiável, sem
-/// sonda). Exige alinhamento natural, como as operações interlocked.
+/// sonda; numa VA de usuário, depois do assert de CR3). Exige alinhamento
+/// natural, como as operações interlocked.
 #[inline]
+#[track_caller]
 pub fn atomic_u32(address: u64) -> &'static AtomicU32 {
     debug_assert!(address & 3 == 0, "AtomicU32 desalinhado em {address:#x}");
+    check_loaded_root(address);
     unsafe { AtomicU32::from_ptr(address as *mut u32) }
 }
 
-/// A célula de 64 bits do convidado como atômico (memória confiável).
+/// A célula de 64 bits do convidado como atômico (memória confiável; numa
+/// VA de usuário, depois do assert de CR3).
 #[inline]
+#[track_caller]
 pub fn atomic_u64(address: u64) -> &'static AtomicU64 {
     debug_assert!(address & 7 == 0, "AtomicU64 desalinhado em {address:#x}");
+    check_loaded_root(address);
     unsafe { AtomicU64::from_ptr(address as *mut u64) }
 }
 

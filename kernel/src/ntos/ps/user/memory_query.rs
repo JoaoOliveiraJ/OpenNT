@@ -17,11 +17,14 @@ use crate::ntos::inc::types::{MemoryBasicInformation, MemoryImageInformation, Me
 
 const PAGE: u64 = 0x1000;
 
-/// Regiões consultadas: o VAD de um processo (o padrão é o corrente).
+/// Regiões consultadas: o VAD de um processo (o padrão é o corrente) e a
+/// raiz das tabelas dele, onde as PTEs são lidas.
 #[derive(Clone, Default)]
 pub struct Context {
     pub user_regions: Vec<Region>,
     pub process_images: Vec<Region>,
+    /// A raiz do processo consultado; 0 = a carregada.
+    pub root: u64,
 }
 
 impl Context {
@@ -30,7 +33,12 @@ impl Context {
     }
 
     pub fn of(space: Space) -> Self {
-        Self { user_regions: space.regions(), process_images: space.images() }
+        Self { user_regions: space.regions(), process_images: space.images(), root: space.root() }
+    }
+
+    /// VA -> PA na raiz do processo consultado.
+    pub fn translate(&self, va: u64) -> u64 {
+        if self.root != 0 { paging::translate_in(self.root, va) } else { paging::translate(va) }
     }
 
     fn is_image(&self, region: &Region) -> bool {
@@ -88,7 +96,7 @@ pub fn describe(va: u64, context: &Context) -> Info {
     let pages = region.committed_pages();
     let committed = match &pages {
         Some(pages) => pages.contains(&index),
-        None => image.is_some() || region.committed() || paging::translate(base) != 0,
+        None => image.is_some() || region.committed() || context.translate(base) != 0,
     };
     let mut end = region.base() + region.size();
     let protection = page_protection(&region, index, context);
@@ -237,7 +245,7 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
                 let entry = state::user_struct::<MemoryWorkingSetExInformation>(buffer_va + offset)?;
                 let va = entry.virtual_address.probe_get()?;
                 let page = describe(va, &context);
-                let valid = va < MAX_USER && paging::translate(va) != 0;
+                let valid = va < MAX_USER && context.translate(va) != 0;
                 // VirtualAttributes: Valid e Win32Protection.
                 entry.virtual_attributes.probe_set(if valid { 1 + page.protect as u64 * 16 } else { 0 })?;
                 offset += MemoryWorkingSetExInformation::SIZE;

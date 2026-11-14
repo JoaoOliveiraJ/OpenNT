@@ -17,9 +17,15 @@
 //!
 //! Quem carrega uma raiz no CR3 é a troca de `ke::context_switch`: o attach
 //! carrega a do processo destino, e a troca de thread corrente a do processo
-//! da thread. Uma raiz carregada em alguma CPU não é devolvida. Os processos
-//! que o Ps cria ainda recebem a PML4 do boot como DirectoryTableBase; só
-//! quem chama [`create`] ganha uma raiz própria.
+//! da thread. Uma raiz carregada em alguma CPU não é devolvida. Todo processo
+//! de usuário (criado com imagem por `ps::process::create_process`, o papel
+//! do PspAllocateProcess) ganha uma raiz própria na criação e roda nela; o
+//! System e os processos de kernel ficam na PML4 do boot.
+//!
+//! O término desfaz, antes do último dereference, toda folha de usuário do
+//! processo na raiz dele (VAD, módulos, imagem principal e cópias de
+//! sistema: `process_state::destroy`); o [`delete`] confere que só sobrou a
+//! visão da KUSER_SHARED_DATA e recusa, sem liberar nada, se achar outra.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;

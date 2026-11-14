@@ -20,8 +20,15 @@
 //! partida dos APs na raiz do System) recarregam a mesma.
 //!
 //! Sem PCID nem páginas globais, cada troca esvazia a TLB não global da CPU.
-//! Os processos de usuário vivos ainda usam a raiz do System, e para eles a
-//! troca de thread não muda o CR3.
+//! Cada processo de usuário tem a própria raiz (`ps::process::create_process`
+//! a cria com o processo); o System, os processos de kernel e os APs ficam
+//! na raiz do System, e só o BSP carrega a raiz de um processo de usuário
+//! para rodar o anel 3 dele.
+//!
+//! O assert do invariante ([`check_loaded_root`], instalado em
+//! `guest_memory` no armar do anel 3) confere, a cada VA de usuário que o
+//! kernel toca, que a raiz carregada é a do processo corrente da thread
+//! corrente desta CPU.
 //!
 //! Aqui também mora a decisão do KiSwapContext (a troca de pilha em si é
 //! `hal::amd64::context_switch`): uma thread de usuário que espera dentro de
@@ -37,6 +44,7 @@
 //! DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema.
 
 use alloc::boxed::Box;
+use core::panic::Location;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{irql, pcr, thread_dispatch};
@@ -91,6 +99,24 @@ pub fn require_loadable(process: u64) -> Result<u64, KernelError> {
 /// A raiz carregada nesta CPU.
 pub fn loaded_root() -> u64 {
     LOADED[processor()].load(Ordering::Acquire)
+}
+
+/// O assert do invariante (`guest_memory::set_root_check`): a raiz no CR3
+/// desta CPU é a do processo corrente da thread corrente dela
+/// (KPRCB.CurrentThread pelo GS, e dela KTHREAD.ApcState.Process, o anexado
+/// quando há attach; sem KPCR ou sem thread, o System). Uma VA de usuário que
+/// o kernel toca cai, então, no espaço desse processo. A divergência (uma
+/// troca que não carregou a raiz, ou memória de usuário tocada por outra
+/// CPU) para o sistema com a VA, as raízes, o processo e a linha do chamador.
+pub fn check_loaded_root(va: u64, caller: &'static Location<'static>) {
+    let loaded = cpu::read_cr3() & ROOT_MASK;
+    let thread = current_pcr().map_or(0, |kpcr| kpcr.prcb.current_thread.get());
+    // SAFETY: a thread corrente desta CPU está viva enquanto é a corrente.
+    let process = if thread != 0 { unsafe { Kthread::at(thread) }.apc_state.process.get() } else { process::get_system_process() };
+    let expected = directory_table_base(process);
+    if loaded != expected {
+        panic!("assert de CR3: VA de usuario {va:#x} tocada com a raiz {loaded:#x} carregada na CPU {}, mas o processo corrente {process:#x} (thread {thread:#x}) usa a raiz {expected:#x}; chamado de {caller}", processor());
+    }
 }
 
 /// Alguma CPU está com `root` carregada.

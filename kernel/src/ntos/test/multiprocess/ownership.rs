@@ -146,7 +146,7 @@ fn shared_ranges(assert: Assert, a: u64) {
 /// Página presente fora de todo VAD: recusada sem dono. VA sem página: só
 /// ACCESS_VIOLATION.
 fn unowned(assert: Assert, a: u64) {
-    let Ok(va) = memory::find_free(0x1000, 0x1_0000, false) else {
+    let Ok(va) = memory::find_free(memory::Space::current(), 0x1000, 0x1_0000, false) else {
         assert(false, "posse: VA livre para a pagina sem dono");
         return;
     };

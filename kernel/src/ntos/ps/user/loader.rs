@@ -7,16 +7,28 @@
 //! processo são dele (`ProcessState`, com a imagem, desfeita no término do
 //! processo); a ntdll é do sistema (`NTDLL_MODULE`) e vale em todo processo;
 //! o schema parseado fica em `API_SET`.
+//!
+//! Cópias de sistema: a ntdll, o apiset e o NLS são mapeados uma vez, na
+//! raiz do System (anexado a ele, venha o pedido de onde vier), nas VAs que
+//! todo processo reserva para eles; logo depois as páginas são fotografadas
+//! (`TEMPLATES`). Cada processo com raiz própria recebe cópias privadas
+//! dessas páginas nas mesmas VAs ([`map_system_images`], o PspMapSystemDll
+//! do NT), devolvidas no término dele: nada de frame de usuário dividido
+//! entre processos, e a ntdll de cada um começa com os dados intactos. Os
+//! exports e o mapa SSN → nome continuam globais (a base é a mesma em
+//! todos).
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
 use super::state::{self, write_unicode_string, write_user_bytes, write_user_wide, RegionKind, UserRegion};
-use super::memory::{self, Space};
+use super::memory::{self, Space, TemplatePage};
 use super::process_state;
+use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
+use crate::ntos::ps::{process, process_context};
 use super::structures::insert_tail_list;
 use super::syscall_scan;
 use crate::hal::bundle;
@@ -139,12 +151,57 @@ static API_SET: SpinLock<Option<Arc<Schema>>> = SpinLock::new(None);
 static NTDLL_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
 /// A imagem do apiset schema (base, tamanho), mapeada uma vez.
 static API_SET_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+/// As páginas das cópias de sistema (ntdll, apiset e cada tabela NLS)
+/// fotografadas logo depois do mapeamento na raiz do System, por nome: a
+/// origem das cópias privadas de cada processo com raiz própria.
+static TEMPLATES: SpinLock<BTreeMap<&'static str, Arc<Vec<TemplatePage>>>> = SpinLock::new(BTreeMap::new());
 
-/// A VA cai numa imagem de sistema mapeada uma vez e vista por todo processo
-/// na mesma VA (a ntdll e o apiset schema).
+/// A VA cai numa imagem de sistema vista por todo processo na mesma VA (a
+/// ntdll e o apiset schema: a cópia de sistema ou a privada do processo).
 pub fn system_image(va: u64) -> bool {
-    let images = [*NTDLL_IMAGE.lock(), *API_SET_IMAGE.lock()];
-    images.iter().any(|&(base, size)| size != 0 && va >= base && va - base < size)
+    system_image_ranges().iter().any(|&(base, size)| va >= base && va - base < size)
+}
+
+/// As faixas da ntdll e do apiset (base, tamanho), reservadas em todo espaço.
+pub fn system_image_ranges() -> Vec<(u64, u64)> {
+    [*NTDLL_IMAGE.lock(), *API_SET_IMAGE.lock()].into_iter().filter(|&(_, size)| size != 0).collect()
+}
+
+/// As cópias de sistema moram na raiz do System: o mapeamento (o loader de
+/// PE e o alocador usam a raiz carregada) roda anexado a ele.
+fn in_system<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
+    process_context::with_process(process::get_system_process(), body).and_then(|result| result)
+}
+
+/// Fotografa `[base, base + size)` da raiz do System como a cópia `name`;
+/// uma fotografia anterior do mesmo nome (a ntdll mapeada de novo) volta ao
+/// PFN.
+fn record_template(name: &'static str, base: u64, size: u64) -> Result<(), KernelError> {
+    let pages = memory::snapshot_system_range(base, size)?;
+    let previous = TEMPLATES.lock().insert(name, Arc::new(pages));
+    if let Some(pages) = previous.and_then(|previous| Arc::try_unwrap(previous).ok()) {
+        memory::release_template(pages);
+    }
+    Ok(())
+}
+
+/// O PspMapSystemDll e as vistas de sistema do processo em montagem (o
+/// corrente, anexado): com raiz própria, ele recebe cópias privadas da
+/// ntdll, do apiset e do NLS nas VAs de sistema, com as permissões das
+/// originais, e as devolve no término. Na raiz do System nada muda: ele já
+/// vê as cópias de sistema.
+pub fn map_system_images() -> Result<(), KernelError> {
+    let root = Space::current().root();
+    if root == SYSTEM_ROOT {
+        return Ok(());
+    }
+    let Some(owner) = process_state::current() else { return Err(KernelError::new("copias de sistema sem estado do processo")) };
+    let templates: Vec<Arc<Vec<TemplatePage>>> = TEMPLATES.lock().values().cloned().collect();
+    let mut mapped = Vec::new();
+    let result = templates.iter().try_for_each(|pages| memory::map_private_copies(root, pages, &mut mapped));
+    // O que foi mapeado é do processo, mesmo numa falha no meio.
+    owner.adopt_system_pages(mapped);
+    result
 }
 
 pub fn ntfs_volume() -> Option<Arc<Ntfs>> {
@@ -182,8 +239,10 @@ pub fn register_module(module: Arc<Module>, image: Option<PeImage>) -> Result<()
     Ok(())
 }
 
-/// A ntdll é mapeada uma vez por espaço de endereços e resolve os imports
-/// por nome: a real do volume ou, sem ela, a de bring-up do bundle.
+/// A ntdll de sistema é mapeada uma vez, na raiz do System, e resolve os
+/// imports por nome: a real do volume ou, sem ela, a de bring-up do bundle.
+/// Cada processo com raiz própria recebe a cópia dele
+/// ([`map_system_images`]).
 pub fn ensure_ntdll() -> Result<(), KernelError> {
     if state::with(|state| state.ntdll_exports.is_some()) {
         return Ok(());
@@ -208,9 +267,16 @@ fn ntdll_resolver(_dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
     Some(ResolvedImport::Address { address, dependencies: Vec::new() })
 }
 
+/// Mapeia a ntdll na raiz do System (anexado a ele) e a fotografa para as
+/// cópias de cada processo.
 pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
+    in_system(|| map_system_ntdll(bytes, origin))
+}
+
+fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
     let source_name = if origin == "real (NTFS)" { "\\NTFS\\NTDLL.DLL" } else { "\\BootBundle\\apps\\ntdll.dll" };
     let image = pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?;
+    record_template("ntdll", image.image_base, image.size_of_image)?;
     let exports = image.exports.exports.clone();
     state::with(|state| {
         state.ntdll_exports = Some(exports.clone());
@@ -247,15 +313,21 @@ fn require_volume(purpose: &str) -> Result<Arc<Ntfs>, KernelError> {
 }
 
 /// O schema mora na seção .apiset; o ApiSetMap aponta para o
-/// API_SET_NAMESPACE no início dela, mapeada como imagem.
+/// API_SET_NAMESPACE no início dela, mapeada como imagem na raiz do System
+/// e fotografada para as cópias de cada processo.
 pub fn ensure_api_set_schema() -> Result<(), KernelError> {
     if state::with(|state| state.api_set_map_va != 0) {
         return Ok(());
     }
+    in_system(map_system_api_set_schema)
+}
+
+fn map_system_api_set_schema() -> Result<(), KernelError> {
     let volume = require_volume("apisetschema")?;
     let bytes = volume.read_bytes("/APISETSCHEMA.DLL")?.ok_or_else(|| KernelError::new("APISETSCHEMA.DLL ausente no volume"))?;
     let image = pe_loader::load_user(bytes, &LoadOptions { skip_imports: true, no_execute: true, notify_image: false, ..LoadOptions::default() })?;
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
+    record_template("apiset", image.image_base, image.size_of_image)?;
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
     *API_SET_IMAGE.lock() = (image.image_base, image.size_of_image);
@@ -264,18 +336,25 @@ pub fn ensure_api_set_schema() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Dados NLS reais (C_1252/C_437/l_intl.nls), compartilhados entre
-/// processos: o RtlInitNlsTables da ntdll os lê pelo PEB.
+/// Dados NLS reais (C_1252/C_437/l_intl.nls), nas mesmas VAs em todo
+/// processo: o RtlInitNlsTables da ntdll os lê pelo PEB. Mapeados na raiz
+/// do System e fotografados para as cópias de cada processo.
 pub fn ensure_nls_data() -> Result<state::NlsVas, KernelError> {
     if let Some(vas) = state::with(|state| state.nls_vas) {
         return Ok(vas);
     }
+    in_system(map_system_nls_data)
+}
+
+fn map_system_nls_data() -> Result<state::NlsVas, KernelError> {
     let volume = require_volume("dados NLS")?;
     state::with(|state| state.nls_vas = Some(state::NlsVas::default()));
-    for (path, key) in [("/C_1252.NLS", 0), ("/C_437.NLS", 1), ("/L_INTL.NLS", 2)] {
+    for (path, key, name) in [("/C_1252.NLS", 0, "nls-ansi"), ("/C_437.NLS", 1, "nls-oem"), ("/L_INTL.NLS", 2, "nls-unicode")] {
         let bytes = volume.read_bytes(path)?.ok_or_else(|| KernelError::new(alloc::format!("{path} ausente no volume")))?;
-        let va = memory::map_shared_user_region((bytes.len() as u64).div_ceil(0x1000) * 0x1000)?;
+        let size = (bytes.len() as u64).div_ceil(0x1000) * 0x1000;
+        let va = memory::map_shared_user_region(size)?;
         write_user_bytes(va, &bytes)?;
+        record_template(name, va, size)?;
         state::with(|state| {
             if let Some(vas) = state.nls_vas.as_mut() {
                 match key {
@@ -290,11 +369,16 @@ pub fn ensure_nls_data() -> Result<state::NlsVas, KernelError> {
     Ok(state::with(|state| state.nls_vas.unwrap_or_default()))
 }
 
-/// Schema v6 parseado uma vez do mapeamento real.
+/// Schema v6 parseado uma vez do mapeamento real (a cópia de sistema, lida
+/// anexado ao System).
 pub fn parse_api_set_schema() -> Result<(), KernelError> {
     if API_SET.lock().is_some() {
         return Ok(());
     }
+    in_system(parse_system_api_set_schema)
+}
+
+fn parse_system_api_set_schema() -> Result<(), KernelError> {
     let base = state::with(|state| state.api_set_map_va);
     // SAFETY: a seção .apiset mapeada pelo próprio loader do kernel.
     let size = unsafe { ApiSetNamespace::at(base) }.size.get() as usize;

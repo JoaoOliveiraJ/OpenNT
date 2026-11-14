@@ -86,7 +86,8 @@ fn regions(process: u64) -> Context {
     for region in space.images().into_iter().chain(owned_images) {
         push_unique(&mut process_images, region);
     }
-    Context { user_regions, process_images }
+    // As PTEs são as da raiz do processo consultado, não as do chamador.
+    Context { user_regions, process_images, root: space.root() }
 }
 
 /// Buffer de kernel ou de usuário presente e gravável (resolve antes um
@@ -198,7 +199,7 @@ fn format_into(class: u32, info: &Info, context: &Context, buffer: u64, length: 
         while entry < buffer + length {
             let va: u64 = guest::try_read(entry + core::mem::offset_of!(MemoryWorkingSetExInformation, virtual_address) as u64)?;
             let page = (va < LIMIT).then(|| memory_query::describe(va, context));
-            let pte = page.as_ref().filter(|page| page.region.is_some()).and_then(|_| paging::query_page(va, false));
+            let pte = page.as_ref().filter(|page| page.region.is_some()).and_then(|_| paging::query_page_in(context.root, va, false));
             let mut flags = 0u64;
             if let (Some(pte), Some(page)) = (pte, &page) {
                 if pte.access & 4 != 0 {

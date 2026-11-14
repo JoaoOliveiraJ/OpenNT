@@ -1,8 +1,9 @@
 //! Posse de vistas de seção por processo.
 //!
-//! O bootstrap ainda compartilha o CR3: a posse é rastreada, mas espaços de
-//! endereçamento independentes não são declarados. Conflitos de VA físicos
-//! continuam globais até existir isolamento por CR3.
+//! Cada vista tem o processo dono e a raiz em que está mapeada (a do dono:
+//! cada processo de usuário tem a sua). A mesma VA pode estar em vistas de
+//! processos diferentes; a escolha de endereço e as buscas olham a raiz do
+//! espaço (`OwnedView::root`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -34,6 +35,8 @@ pub struct ImageView {
     pub name: Option<alloc::string::String>,
     /// PAGE_READONLY nas seções sem execução, senão a proteção pedida.
     pub allocation_protect: u32,
+    /// A raiz do processo em que a vista foi mapeada.
+    pub root: u64,
 }
 
 impl UserRegion for ImageView {
@@ -95,6 +98,14 @@ impl OwnedView {
         match self {
             OwnedView::Data(view) => view.size,
             OwnedView::Image(view) => view.size,
+        }
+    }
+
+    /// A raiz em que a vista está mapeada.
+    pub fn root(&self) -> u64 {
+        match self {
+            OwnedView::Data(view) => view.root,
+            OwnedView::Image(view) => view.root,
         }
     }
 
@@ -161,7 +172,7 @@ pub fn unmap(view: &OwnedView) -> Result<(), KernelError> {
         None => {
             let mut offset = 0;
             while offset < image.size {
-                paging::unmap_page(image.base + offset, MapOptions::default());
+                paging::unmap_page_in(image.root, image.base + offset, MapOptions::default());
                 if let Some(&frame) = image.pages.get((offset / 4096) as usize) {
                     pfn::free_page(frame);
                 }

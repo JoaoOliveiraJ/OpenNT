@@ -1,8 +1,10 @@
 //! Vista de seção de imagem pelo loader.
 //!
 //! A imagem é preparada pelo loader de PE com a vista parcial pedida, sem
-//! imports nem relocações (a ntdll real faz o binding). A vista entra nas
-//! listas do processo e da seção e dispara a notificação de imagem.
+//! imports nem relocações (a ntdll real faz o binding), anexado ao processo
+//! alvo: as páginas vão para a raiz dele, como no MiMapViewOfImageSection.
+//! A vista entra nas listas do processo e da seção e dispara a notificação
+//! de imagem.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -82,8 +84,10 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let Some(preferred) = preferred else { return Ok(Err(0xC000_0185)) };
     let (offset, size) = (request.offset, request.size);
     let top_down = request.allocation & 0x10_0000 != 0;
-    let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, ..FindOptions::default() };
-    let occupied = user_memory::occupied();
+    let space = user_memory::Space::of(process);
+    let root = space.root();
+    let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, root, ..FindOptions::default() };
+    let occupied = user_memory::occupied(space);
     // Sem base pedida: a ImageBase do cabeçalho quando está livre, senão a
     // primeira faixa livre (STATUS_IMAGE_NOT_AT_BASE).
     let mut found = None;
@@ -101,7 +105,9 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let name = file.nt_path().or_else(|| section.name()).unwrap_or_default();
     let source = Arc::new(SectionSource { name: name.clone(), file: file.clone() });
     let load = LoadOptions { user_space: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, no_execute: section.no_execute, user_view: Some(UserView { base, offset, size }), ..LoadOptions::default() };
-    let image = match pe_loader::load_from_source(source.clone(), &load) {
+    // O loader mapeia na raiz carregada: anexado ao alvo.
+    let loaded = process_context::with_process(process, || pe_loader::load_from_source(source.clone(), &load)).and_then(|loaded| loaded);
+    let image = match loaded {
         Ok(image) => image,
         Err(error) if error.status != crate::ntos::inc::status::STATUS_UNSUCCESSFUL => return Ok(Err(error.status)),
         Err(error) => {
@@ -126,13 +132,14 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
         protected_frames: SpinLock::new(alloc::collections::BTreeMap::new()),
         name: Some(name.clone()),
         allocation_protect: if section.no_execute { 2 } else { request.protect },
+        root,
     });
     let owned = OwnedView::Image(view.clone());
     section.state.lock().views.push(owned.clone());
     section_objects::update(section.pointer(), |state| state.views += 1);
     // A vista entra no VAD do processo alvo.
     let region: Region = view.clone();
-    user_memory::insert_region(user_memory::Space::of(process), regions, region);
+    user_memory::insert_region(space, regions, region);
     section_views::register(owned.clone(), process, true);
     let finish = || -> Result<(), KernelError> {
         let dll_name = file.base_name().unwrap_or_else(|| String::from(&name[name.rfind(['\\', '/']).map_or(0, |at| at + 1)..]));

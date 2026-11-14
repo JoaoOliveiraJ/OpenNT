@@ -18,16 +18,32 @@
 //! serviços agem sobre um `Space`: os Nt* de usuário sobre o processo
 //! corrente (o anexado, quando há attach), os Zw* sobre o processo do handle;
 //! o System guarda o que o kernel aloca no próprio contexto (DriverEntry,
-//! threads de sistema) e as imagens de sistema mapeadas uma vez (ntdll,
-//! apiset). Consultas, liberações e trocas de proteção só enxergam o VAD do
+//! threads de sistema) e as cópias de sistema da ntdll, do apiset e do NLS.
+//! Consultas, liberações e trocas de proteção só enxergam o VAD do
 //! espaço; o término do processo devolve o VAD inteiro (`release_vad`), como
 //! o MmCleanProcessAddressSpace. O VAD também decide a posse no modo
 //! estrito de `guest_memory` (`check_user_access`): uma sonda só alcança
 //! páginas do processo corrente ou das faixas de sistema compartilhadas.
 //!
-//! Escolha de endereço: a tabela de páginas ainda é uma só, então a faixa
-//! nova evita o que qualquer processo ocupa (`occupied`, a união dos VADs,
-//! das regiões compartilhadas e das vistas de sistema).
+//! Raiz: as páginas de um espaço vivem na raiz dele (`Space::root`, o
+//! KPROCESS.DirectoryTableBase): a própria de cada processo de usuário, ou a
+//! do System para ele e para os processos que ficam nela. Mapear, desfazer e
+//! reproteger editam essa raiz explicitamente (`paging::*_in`), esteja ela
+//! carregada ou não: um Zw* sobre outro processo e o término (que roda no
+//! contexto de quem termina) mexem nas tabelas do dono, nunca nas do CR3.
+//!
+//! Escolha de endereço: por raiz (`occupied`). A faixa nova evita o VAD dos
+//! processos que dividem a raiz do espaço (só ele, quando a raiz é própria),
+//! as vistas mapeadas nessa raiz, as PTEs dela e as faixas de sistema que
+//! todo processo vê na mesma VA (a KUSER_SHARED_DATA, a ntdll, o apiset e o
+//! NLS). Dois processos com raiz própria podem usar a mesma VA.
+//!
+//! Cópias de sistema: a ntdll, o apiset e o NLS são mapeados uma vez na raiz
+//! do System; logo depois o loader fotografa as páginas
+//! (`snapshot_system_range`), e cada processo com raiz própria recebe cópias
+//! privadas delas nas mesmas VAs (`map_private_copies`), devolvidas no
+//! término dele. Nenhum frame de usuário com escrita é dividido entre
+//! processos.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -42,7 +58,9 @@ use crate::hal::physical;
 use crate::ntos::mm::memory_map::{self as map, USER_ADDRESS_LIMIT};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
+use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::section::{address as section_address, views as section_views};
+use crate::ntos::ke::context_switch;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -205,6 +223,12 @@ impl Space {
         }
     }
 
+    /// A raiz das tabelas de páginas do espaço (KPROCESS.DirectoryTableBase):
+    /// a própria do processo, ou a do System.
+    pub fn root(self) -> u64 {
+        context_switch::directory_table_base(self.process())
+    }
+
     /// O estado do processo; `None` depois do término.
     fn state(self) -> Option<Arc<ProcessState>> {
         process_state::get(self.process())
@@ -269,28 +293,37 @@ pub fn remove_region(kind: RegionKind, region: &Region) {
     }
 }
 
-/// Tudo o que ocupa VA de usuário na tabela de páginas única: os VADs de
-/// todos os processos, as regiões compartilhadas, as vistas de seção de
-/// qualquer dono (inclusive reservas ainda sem página) e as vistas de
-/// sistema. O que só existe nas PTEs (a KUSER_SHARED_DATA, imagens mapeadas
-/// sem região) o `mm/section/address` acha pela própria árvore de páginas.
-pub fn occupied() -> Vec<section_address::Region> {
+/// Tudo o que ocupa VA de usuário na raiz do espaço: as faixas de sistema
+/// que todo processo vê na mesma VA (a KUSER_SHARED_DATA, a ntdll, o apiset,
+/// o NLS e as vistas de sistema), os VADs dos processos que usam essa raiz
+/// (só o do processo, quando a raiz é própria) e as vistas de seção
+/// mapeadas nela (inclusive reservas ainda sem página). O que só existe nas
+/// PTEs o `mm/section/address` acha pela árvore da mesma raiz
+/// (`FindOptions::root`).
+pub fn occupied(space: Space) -> Vec<section_address::Region> {
+    let root = space.root();
     let span = |region: &Region| section_address::Region { base: region.base(), size: region.size() };
     let mut occupied: Vec<section_address::Region> = state::with(|state| state.shared_user_regions.iter().chain(state.section_kernel_views.iter()).map(span).collect());
+    occupied.push(section_address::Region { base: state::KUSER_SHARED_DATA_USER_VA, size: PAGE });
+    occupied.extend(super::loader::system_image_ranges().into_iter().map(|(base, size)| section_address::Region { base, size }));
     for state in process_state::all() {
+        if state.directory_table_base.load(core::sync::atomic::Ordering::Acquire) != root {
+            continue;
+        }
         let vad = state.vad.lock();
         occupied.extend(vad.regions.iter().chain(vad.images.iter()).map(span));
     }
-    occupied.extend(sections::views().iter().map(|view| section_address::Region { base: view.base, size: view.size }));
-    occupied.extend(section_views::all().iter().map(|view| section_address::Region { base: view.base(), size: view.size() }));
+    occupied.extend(sections::views().iter().filter(|view| view.root == root).map(|view| section_address::Region { base: view.base, size: view.size }));
+    occupied.extend(section_views::all().iter().filter(|view| view.root() == root).map(|view| section_address::Region { base: view.base(), size: view.size() }));
     occupied.retain(|region| region.base < USER_ADDRESS_LIMIT);
     occupied
 }
 
-/// A primeira faixa livre de `size` bytes na metade de usuário, de baixo
-/// para cima ou (`top_down`) de cima para baixo, alinhada a `alignment`.
-pub fn find_free(size: u64, alignment: u64, top_down: bool) -> Result<u64, u32> {
-    section_address::find(&section_address::FindOptions { size, alignment, top_down, ..section_address::FindOptions::default() }, &occupied())
+/// A primeira faixa livre de `size` bytes na metade de usuário do espaço, de
+/// baixo para cima ou (`top_down`) de cima para baixo, alinhada a
+/// `alignment`.
+pub fn find_free(space: Space, size: u64, alignment: u64, top_down: bool) -> Result<u64, u32> {
+    section_address::find(&section_address::FindOptions { size, alignment, top_down, root: space.root(), ..section_address::FindOptions::default() }, &occupied(space))
 }
 
 /// Região de usuário ou imagem do processo corrente que contém o endereço.
@@ -335,14 +368,14 @@ fn view_of(region: &Region) -> Option<Arc<View>> {
     })
 }
 
-/// Mapeia uma faixa com frames do PFN (commit inicial e commit sobre
-/// reserva); qualquer falha desfaz as páginas desta chamada.
-pub fn map_user_page_range(base: u64, size: u64, region: Option<&PrivateRegion>, protect: u32) -> bool {
+/// Mapeia uma faixa com frames do PFN na raiz `root` (commit inicial e
+/// commit sobre reserva); qualquer falha desfaz as páginas desta chamada.
+pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&PrivateRegion>, protect: u32) -> bool {
     let protect = if protect != 0 { protect } else { region.map_or(4, |region| if region.protect != 0 { region.protect } else { 4 }) };
     let mut added: Vec<(u64, u64, u64)> = Vec::new();
     let rollback = |added: &[(u64, u64, u64)]| {
         for &(va, frame, index) in added {
-            paging::unmap_page(va, MapOptions::default());
+            paging::unmap_page_in(root, va, MapOptions::default());
             pfn::free_page(frame);
             if let Some(region) = region {
                 let mut state = region.state.lock();
@@ -371,7 +404,7 @@ pub fn map_user_page_range(base: u64, size: u64, region: Option<&PrivateRegion>,
         physical::zero(frame, PAGE as usize);
         let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
         let flags = paging::PAGE_USER | if protect != 1 { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 };
-        if !paging::map_page(base + offset, frame, flags, MapOptions::default()) {
+        if !paging::map_page_in(root, base + offset, frame, flags, MapOptions::default()) {
             pfn::free_page(frame);
             return rollback(&added);
         }
@@ -387,8 +420,8 @@ pub fn map_user_page_range(base: u64, size: u64, region: Option<&PrivateRegion>,
     true
 }
 
-pub fn map_region_pages(region: &PrivateRegion) -> bool {
-    map_user_page_range(region.base, region.size, Some(region), 0)
+pub fn map_region_pages(root: u64, region: &PrivateRegion) -> bool {
+    map_user_page_range(root, region.base, region.size, Some(region), 0)
 }
 
 /// O alocador de VA: commit sobre reserva própria, base fixa ou escolha
@@ -450,7 +483,7 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                     if status != 0 {
                         return Ok(status);
                     }
-                } else if !map_user_page_range(base, size, private(&existing), protect) {
+                } else if !map_user_page_range(space.root(), base, size, private(&existing), protect) {
                     return Ok(0xC000_0017);
                 }
                 guest::try_write::<u64>(base_pointer, base)?;
@@ -466,19 +499,19 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         }
     }
     let top_down = allocation_type & MEM_TOP_DOWN != 0;
-    let find = section_address::FindOptions { base, size, minimum: Some(lowest), upper: Some(highest - 1), alignment: align, top_down, ..section_address::FindOptions::default() };
-    let base = match section_address::find(&find, &occupied()) {
+    let find = section_address::FindOptions { base, size, minimum: Some(lowest), upper: Some(highest - 1), alignment: align, top_down, root: space.root(), ..section_address::FindOptions::default() };
+    let base = match section_address::find(&find, &occupied(space)) {
         Ok(base) => base,
         Err(status) => return Ok(status),
     };
     let region = PrivateRegion::new(base, size, protect, allocation_type);
-    if allocation_type & MEM_COMMIT != 0 && !map_region_pages(&region) {
+    if allocation_type & MEM_COMMIT != 0 && !map_region_pages(space.root(), &region) {
         return Ok(0xC000_0017);
     }
     let entry: Region = region.clone();
     if !space.insert(RegionKind::User, entry) {
         // O processo saiu no meio da alocação: as páginas voltam ao PFN.
-        free_region_pages(&region);
+        free_region_pages(space.root(), &region);
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
     guest::try_write::<u64>(base_pointer, base)?;
@@ -496,14 +529,14 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
     if space.state().is_none() {
         return Err(KernelError::with_status("regiao de usuario num processo sem VAD", STATUS_PROCESS_IS_TERMINATING));
     }
-    let base = find_free(size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
+    let base = find_free(space, size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
     let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE);
-    if !map_region_pages(&region) {
+    if !map_region_pages(space.root(), &region) {
         return Err(KernelError::new("PFN esgotado na regiao de usuario"));
     }
     let entry: Region = region.clone();
     if !space.insert(RegionKind::User, entry) {
-        free_region_pages(&region);
+        free_region_pages(space.root(), &region);
         return Err(KernelError::with_status("processo saiu durante a regiao de usuario", STATUS_PROCESS_IS_TERMINATING));
     }
     Ok(region)
@@ -524,13 +557,15 @@ pub fn map_user_region(size: u64) -> Result<u64, KernelError> {
     Ok(register_user_region(Space::current(), size, PAGE, true)?.base)
 }
 
-/// Igual, na área compartilhada (NLS etc.), que sobrevive entre processos.
+/// Igual, numa faixa de sistema (a cópia de sistema do NLS) mapeada na raiz
+/// do System, na mesma VA que todo processo reserva; cada processo com raiz
+/// própria recebe uma cópia privada dela (`map_private_copies`).
 pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
     let rounded = size.div_ceil(PAGE) * PAGE;
     if rounded == 0 {
         return Err(KernelError::new("Regiao compartilhada vazia"));
     }
-    let va = find_free(rounded, PAGE, true).map_err(|status| KernelError::with_status("sem VA livre para a regiao compartilhada", status))?;
+    let va = find_free(Space::system(), rounded, PAGE, true).map_err(|status| KernelError::with_status("sem VA livre para a regiao compartilhada", status))?;
     // A faixa entra na lista antes das páginas: nenhuma escolha de VA no
     // meio do mapeamento a reutiliza.
     let entry: Region = Arc::new(SharedRegion { base: va, size: rounded });
@@ -542,12 +577,84 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
             return Err(KernelError::new("PFN esgotado nas regioes compartilhadas"));
         }
         physical::zero(frame, PAGE as usize);
-        if !paging::map_page(va + offset, frame, paging::PAGE_PRESENT | paging::PAGE_RW | paging::PAGE_USER, MapOptions::default()) {
+        if !paging::map_page_in(SYSTEM_ROOT, va + offset, frame, paging::PAGE_PRESENT | paging::PAGE_RW | paging::PAGE_USER, MapOptions::default()) {
             return Err(KernelError::new("mapPage falhou nas regioes compartilhadas"));
         }
         offset += PAGE;
     }
     Ok(va)
+}
+
+/// Uma página de uma faixa de sistema fotografada logo depois do mapeamento
+/// na raiz do System: a VA, o frame com a cópia (do Mm, fora de toda tabela
+/// de páginas) e as permissões da PTE de origem.
+pub struct TemplatePage {
+    pub va: u64,
+    pub frame: u64,
+    pub flags: u64,
+    pub nx: bool,
+}
+
+/// Bits da PTE de origem que a cópia repete.
+const TEMPLATE_FLAGS: u64 = paging::PAGE_PRESENT | paging::PAGE_RW | paging::PAGE_USER | paging::PAGE_PWT | paging::PAGE_PCD;
+
+/// Fotografa em frames próprios as páginas presentes de `[base, base +
+/// size)` na raiz do System: a origem das cópias por processo, que não muda
+/// com o que rodar depois na raiz do System. Uma falha devolve os frames já
+/// tirados.
+pub fn snapshot_system_range(base: u64, size: u64) -> Result<Vec<TemplatePage>, KernelError> {
+    let mut pages = Vec::new();
+    let mut va = base & !(PAGE - 1);
+    while va < base + size {
+        if let Some(page) = paging::query_page_in(SYSTEM_ROOT, va, false).filter(|page| page.page_size == PAGE) {
+            let frame = pfn::alloc_page();
+            if frame == 0 {
+                release_template(pages);
+                return Err(KernelError::new("PFN esgotado na fotografia de uma faixa de sistema"));
+            }
+            physical::write_bytes(frame, &physical::read_bytes(page.physical_address & !(PAGE - 1), PAGE as usize));
+            pages.push(TemplatePage { va, frame, flags: page.flags & TEMPLATE_FLAGS, nx: page.nx });
+        }
+        va += PAGE;
+    }
+    Ok(pages)
+}
+
+/// Devolve ao PFN os frames de uma fotografia.
+pub fn release_template(pages: Vec<TemplatePage>) {
+    for page in pages {
+        pfn::free_page(page.frame);
+    }
+}
+
+/// Cópias privadas das páginas fotografadas na raiz `root`, nas mesmas VAs
+/// e com as mesmas permissões (o PspMapSystemDll e as vistas de sistema de
+/// um processo novo, sem frame dividido). Cada página mapeada entra em
+/// `mapped` (VA, frame) na hora: o dono a devolve no término, mesmo depois
+/// de uma falha no meio.
+pub fn map_private_copies(root: u64, pages: &[TemplatePage], mapped: &mut Vec<(u64, u64)>) -> Result<(), KernelError> {
+    for page in pages {
+        let frame = pfn::alloc_page();
+        if frame == 0 {
+            return Err(KernelError::with_status("PFN esgotado na copia de sistema do processo", 0xC000_0017));
+        }
+        physical::write_bytes(frame, &physical::read_bytes(page.frame, PAGE as usize));
+        if !paging::map_page_in(root, page.va, frame, page.flags, MapOptions { nx: page.nx, ..MapOptions::default() }) {
+            pfn::free_page(frame);
+            return Err(KernelError::new(alloc::format!("mapPage falhou na copia de sistema em {:#x}", page.va)));
+        }
+        mapped.push((page.va, frame));
+    }
+    Ok(())
+}
+
+/// Desfaz na raiz `root` as cópias privadas de [`map_private_copies`] e
+/// devolve os frames.
+pub fn release_private_copies(root: u64, pages: Vec<(u64, u64)>) {
+    for (va, frame) in pages {
+        paging::unmap_page_in(root, va, MapOptions::default());
+        pfn::free_page(frame);
+    }
 }
 
 /// NtAllocateVirtualMemory(process, base*, zeroBits, size*, type, protect).
@@ -671,7 +778,7 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
             }
         };
         if let Some(frame) = frame {
-            paging::unmap_page(va, MapOptions::default());
+            paging::unmap_page_in(space.root(), va, MapOptions::default());
             pfn::free_page(frame);
         }
         va += PAGE;
@@ -744,12 +851,13 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
             return Ok(0);
         }
     }
+    let root = space.root();
     let committed = region.committed_pages();
     let mut changes = Vec::new();
     let mut va = base;
     while va < end {
         let index = (va - region.base()) / PAGE;
-        let physical = region.frame(index).unwrap_or_else(|| paging::translate(va));
+        let physical = region.frame(index).unwrap_or_else(|| paging::translate_in(root, va));
         if committed.as_ref().is_some_and(|pages| !pages.contains(&index)) || physical == 0 {
             return Ok(0xC000_002D);
         }
@@ -760,7 +868,7 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
     for (va, index, physical) in changes {
         let flags = paging::PAGE_USER | if protect != 1 { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 };
-        paging::map_page(va, physical, flags, MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });
+        paging::map_page_in(root, va, physical, flags, MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });
         region.record_protect(index, protect, physical);
     }
     guest::try_write::<u32>(old_pointer, old)?;
@@ -842,14 +950,15 @@ pub fn nt_write_virtual_memory(process: u64, address: u64, buffer: u64, size: u6
 /// têm PFN; páginas NOACCESS ainda são donas do frame.
 pub fn release_private_region(region: &Region) {
     let Some(owner) = private(region) else { return };
-    let owned = process_state::all().into_iter().any(|state| state.vad.lock().remove(RegionKind::User, region));
-    if owned {
-        free_region_pages(owner);
+    let holder = process_state::all().into_iter().find(|state| state.vad.lock().remove(RegionKind::User, region));
+    if let Some(holder) = holder {
+        free_region_pages(holder.directory_table_base.load(core::sync::atomic::Ordering::Acquire), owner);
     }
 }
 
-/// Desmapeia e devolve ao PFN as páginas comitadas de uma região privada.
-fn free_region_pages(owner: &PrivateRegion) {
+/// Desmapeia da raiz `root` e devolve ao PFN as páginas comitadas de uma
+/// região privada.
+fn free_region_pages(root: u64, owner: &PrivateRegion) {
     let pages: Vec<(u64, u64)> = {
         let mut state = owner.state.lock();
         let pages = state.committed_pages.iter().filter_map(|&index| state.frames.get(&index).map(|&frame| (index, frame))).collect();
@@ -858,16 +967,19 @@ fn free_region_pages(owner: &PrivateRegion) {
         pages
     };
     for (index, frame) in pages {
-        paging::unmap_page(owner.base + index * PAGE, MapOptions::default());
+        paging::unmap_page_in(root, owner.base + index * PAGE, MapOptions::default());
         pfn::free_page(frame);
     }
 }
 
 /// Devolve o VAD inteiro do processo (o MmCleanProcessAddressSpace do
 /// término): as listas saem do VAD primeiro, então nada mais as encontra; as
-/// vistas de dados e de imagem voltam ao Mm e as páginas privadas ao PFN. As
-/// imagens do loader não têm páginas próprias (são do `pe_loader`).
+/// vistas de dados e de imagem voltam ao Mm e as páginas privadas ao PFN,
+/// todas desfeitas na raiz do processo (o término roda no contexto de quem
+/// termina). As imagens do loader não têm páginas próprias (são do
+/// `pe_loader`, que as desfaz na raiz em que as mapeou).
 pub fn release_vad(state: &ProcessState) {
+    let root = state.directory_table_base.load(core::sync::atomic::Ordering::Acquire);
     let (regions, images) = {
         let mut vad = state.vad.lock();
         vad.ldr_strings = (0, 0);
@@ -875,7 +987,7 @@ pub fn release_vad(state: &ProcessState) {
     };
     for region in &regions {
         if let Some(owner) = private(region) {
-            free_region_pages(owner);
+            free_region_pages(root, owner);
         } else if let Some(view) = view_of(region) {
             if let Err(error) = sections::unmap(&view, None) {
                 debug_print!("[usermode] vista em 0x{:x} retida no termino do processo: {}", view.base, error);

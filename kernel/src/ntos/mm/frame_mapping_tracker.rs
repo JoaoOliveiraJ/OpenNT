@@ -8,6 +8,21 @@
 //! partem) e os slots inteiros do mapa direto (`DIRECT_MAP_PML4_INDEX`) e da
 //! janela do heap (`KERNEL_HEAP_PML4_INDEX`), cujas tabelas nem são
 //! acompanhadas.
+//!
+//! **Só a árvore da PML4 do boot.** O rastreador parte da raiz do System
+//! (`PML4_PHYS`) e segue o que ela alcança: a metade de sistema inteira (as
+//! PDPTs congeladas e tudo abaixo delas, compartilhadas por todas as raízes,
+//! então toda folha de sistema é vista uma vez, venha a escrita de qualquer
+//! raiz) e a metade de usuário do System (o VAD dele e dos processos que
+//! ficam na raiz do System). Fica de fora, no M0, o que só uma raiz de
+//! processo (`process_address_space::create`) alcança: o frame da própria
+//! PML4 do processo, as PDPTs, PDs e PTs da metade de usuário dela e as
+//! folhas de usuário dessas tabelas. Essas escritas não são notificadas
+//! (`tracks_entry` é falso para as tabelas delas), e os frames de usuário de
+//! um processo com raiz própria não ganham PteAddress no banco nativo de
+//! PFNs. A PteAddress publicada é o alias recursivo, válido para uma folha
+//! de sistema em qualquer raiz carregada e para uma folha de usuário do
+//! System só com a raiz do System carregada.
 
 use alloc::collections::BTreeMap;
 

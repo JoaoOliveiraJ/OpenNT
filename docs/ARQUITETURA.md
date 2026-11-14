@@ -407,8 +407,12 @@ além da KUSER_SHARED_DATA:
   primeira thread é uma alocação de baixo para cima (fica abaixo de 4 GB
   num processo novo); PEB, TEB, parâmetros, entradas do Ldr e as regiões
   compartilhadas de NLS são páginas comitadas de cima para baixo, como o
-  MiCreatePebOrTeb. Como a tabela de páginas ainda é uma só, a escolha vê o
-  que todos os processos ocupam (`memory::occupied`) e as PTEs reais.
+  MiCreatePebOrTeb. A escolha é por raiz (`memory::occupied(space)`): o VAD
+  dos processos que usam a raiz do espaço (só o do processo, quando a raiz é
+  própria), as vistas mapeadas nela, as PTEs dela
+  (`section_address::FindOptions::root`) e as faixas de sistema que todo
+  processo vê na mesma VA (a KUSER_SHARED_DATA, a ntdll, o apiset e o NLS).
+  Dois processos com raiz própria usam a mesma VA sem conflito.
 - **VAD por processo** (`memory::Vad`, no `ProcessState` de cada EPROCESS):
   as alocações privadas, as vistas de seção e as imagens são do processo que
   as criou. Os serviços agem sobre um `memory::Space`: os Nt* de usuário sobre
@@ -416,15 +420,33 @@ além da KUSER_SHARED_DATA:
   do handle, o NtMapViewOfSection sobre o processo alvo. NtQueryVirtualMemory,
   NtFreeVirtualMemory e NtProtectVirtualMemory só enxergam o VAD do próprio
   processo; o System guarda o que o kernel aloca no próprio contexto e as
-  imagens de sistema mapeadas uma vez (ntdll, apiset). O término do processo
+  cópias de sistema da ntdll, do apiset e do NLS. O término do processo
   devolve o VAD inteiro (`memory::release_vad`, o MmCleanProcessAddressSpace),
   e a montagem de um processo novo roda anexada a ele, como o MmCreatePeb.
-  Só a escolha de endereço ainda olha todos os VADs.
+  Mapear, desfazer e reproteger editam a raiz do espaço explicitamente
+  (`Space::root`, `paging::*_in`), carregada ou não: um Zw* sobre outro
+  processo e o término (que roda no contexto de quem termina) mexem nas
+  tabelas do dono, nunca nas do CR3. As vistas de seção guardam a raiz em
+  que estão (`View::root`, `ImageView::root`); confirmar páginas publica o
+  alias em cada vista na raiz dela, e a falta copy-on-write só procura as
+  vistas da raiz carregada.
 - **Imagens de usuário** carregam na ImageBase do cabeçalho quando a faixa
-  está livre (um .exe em 0x1_4000_0000) e, se não estiver, na primeira faixa
-  livre, relocadas (STATUS_IMAGE_NOT_AT_BASE nas vistas de imagem). A imagem
-  principal de um processo é desfeita quando ele termina, e a VA volta ao
-  livre para o próximo.
+  está livre no espaço do processo (um .exe em 0x1_4000_0000) e, se não
+  estiver, na primeira faixa livre, relocadas (STATUS_IMAGE_NOT_AT_BASE nas
+  vistas de imagem). O `pe_loader` mapeia sempre no processo corrente, na
+  raiz carregada (a vista de imagem anexa ao processo alvo), e desfaz na
+  mesma raiz. A imagem principal é do processo (`ProcessState`) e é desfeita
+  no término dele.
+- **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
+  tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
+  anexado ao System, venha o pedido de onde vier), e fotografados logo
+  depois em frames próprios (`memory::snapshot_system_range`). Cada processo
+  com raiz própria recebe na montagem cópias privadas dessas páginas nas
+  mesmas VAs e permissões (`loader::map_system_images`, o PspMapSystemDll),
+  devolvidas no término. Nenhum frame de usuário com escrita é dividido
+  entre processos, e a ntdll de cada processo começa com os dados intactos;
+  os exports e o mapa SSN → nome continuam globais (a base é a mesma em
+  todos).
 
 O stage2 monta o mapa direto (páginas de 2 MB de supervisor, RW e NX; tabelas
 em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
@@ -495,7 +517,10 @@ PML4:
   `paging::current_root()` (o CR3). Trocar a proteção de uma página é
   mapear o mesmo frame de novo com as flags novas, também por raiz.
 - **Espaço de um processo.** `process_address_space::create(eprocess)`, o
-  MmCreateProcessAddressSpace, dá ao processo uma raiz nova com a visão de
+  MmCreateProcessAddressSpace, chamado por `ps::process::create_process`
+  para todo processo com imagem (o PspAllocateProcess: todo processo de
+  usuário nasce com a raiz dele e roda nela; o System e os processos de
+  kernel ficam na raiz do boot), dá ao processo uma raiz nova com a visão de
   usuário da KUSER_SHARED_DATA em 0x7FFE0000 (MM_SHARED_USER_DATA_VA): o
   mesmo frame da visão de kernel, U/S, somente leitura e sem execução,
   mapeado por `shared_user_data::map_user_view_in(root)`, o mesmo caminho
@@ -508,8 +533,10 @@ PML4:
   metade de usuário inteira e devolve ao PFN toda tabela dela, vazia ou não,
   e depois a raiz; o processo volta a apontar para a raiz do System. Uma
   página de usuário ainda mapeada fora da visão da KUSER faz o delete
-  recusar sem mudar nada (o VAD tem de ter sido desfeito antes), e uma raiz
-  carregada em alguma CPU também é recusada.
+  recusar sem mudar nada, e uma raiz carregada em alguma CPU também é
+  recusada. O término desfaz antes toda folha de usuário do processo na raiz
+  dele (`process_state::destroy`: VAD, módulos do loader, imagem principal e
+  cópias de sistema), então o último dereference devolve a raiz inteira.
 - **Troca de CR3** (`ke/context_switch.rs`, o KiSwapProcess). Fora da troca,
   o CR3 de cada CPU é o KPROCESS.DirectoryTableBase de
   `KTHREAD.ApcState.Process` da thread corrente. KeStackAttachProcess,
@@ -524,10 +551,21 @@ PML4:
   a raiz do processo corrente da nova thread; ele não mexe em
   ActiveProcessors, porque a thread que sai pode já ter sido liberada.
   `context_switch` registra a raiz carregada em cada CPU (`is_root_loaded`),
-  e é por esse registro que o delete recusa uma raiz em uso. Os processos que
-  o Ps cria ainda recebem a PML4 do boot, então para eles a troca de thread
-  não muda o CR3. O rastreador de frames só acompanha as tabelas alcançadas
-  pela PML4 do boot; as tabelas de usuário das outras raízes ficam fora dele.
+  e é por esse registro que o delete recusa uma raiz em uso. Só o BSP roda o
+  anel 3 (assert na entrada) e carrega a raiz de um processo de usuário; os
+  APs ficam na raiz do System. O rastreador de frames só acompanha as tabelas
+  alcançadas pela PML4 do boot (a metade de sistema inteira e a metade de
+  usuário do System): a PML4 de um processo, as tabelas de usuário dela e as
+  folhas dessas tabelas ficam fora dele, sem notificação e sem PteAddress no
+  banco nativo de PFNs. O mapeamento recursivo confere a auto-referência da
+  raiz carregada, não a da PML4 do boot.
+- **Assert de CR3** (`ke/context_switch.rs::check_loaded_root`, instalado em
+  `guest_memory::set_root_check` no armar do anel 3, em todo boot): toda VA
+  de usuário que o kernel toca, por acesso confiável (`guest::read/write`,
+  os atômicos, `NtStruct::at` dos campos `Field`) ou sondado, exige que a
+  raiz no CR3 desta CPU seja a do processo corrente da thread corrente dela
+  (KPRCB.CurrentThread pelo GS, e dela `ApcState.Process`). A divergência
+  para o sistema com a VA, as raízes e a linha do chamador.
 
 O autoteste `ntos/test/multiprocess/page_table_root.rs` (fase 7) confere as
 256 entradas presentes e permanentes, a PDPT de um slot vazio sobrevivendo a
@@ -545,7 +583,14 @@ espaço próprio e lê e grava pela VA de usuário a página mapeada só nele;
 desanexado, a mesma VA dá STATUS_ACCESS_VIOLATION na sonda. Também confere
 que um attach aninhado e o KeAttachProcess restauram cada raiz, que a thread
 corrente de outro espaço carrega a raiz dele e que o delete de um espaço
-carregado é recusado.
+carregado é recusado. `ntos/test/multiprocess/own_root.rs` (fase 7) monta
+dois processos de usuário ao mesmo tempo pelo caminho real
+(`create_windows_process`): raízes próprias e distintas; a PEB e a pilha na
+mesma VA nos dois, com conteúdo diferente lido anexado a cada um e frames
+que a raiz do System não vê; a ntdll em cópias privadas na mesma VA. Depois
+os dois rodam em sequência (`run_created`) com os próprios códigos de
+saída, e no fim as raízes ficam só com a KUSER, voltam no último
+dereference e o PFN livre volta ao de antes.
 
 **Imagens.**
 

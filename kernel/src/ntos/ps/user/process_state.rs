@@ -24,18 +24,22 @@
 //! Moram aqui a tabela de handles de usuário (`handles`, operada por
 //! `state.rs`), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
 //! gravada por `mm::process_address_space`), as threads de usuário e o
-//! início do laço (`threads`, `started`), os módulos do loader do kernel e a
-//! parte da identidade do processo de usuário que não cabe no EPROCESS
-//! (caminho da imagem, PEB_LDR_DATA do kernel, exports das imagens
-//! mapeadas); PID, PEB e cookie são do próprio EPROCESS. O resto do estado
-//! global de `state.rs` entra aqui à medida que sai de lá.
+//! início do laço (`threads`, `started`), os módulos do loader do kernel, a
+//! imagem principal e as cópias privadas da ntdll, do apiset e do NLS na
+//! raiz própria, e a parte da identidade do processo de usuário que não cabe
+//! no EPROCESS (caminho da imagem, PEB_LDR_DATA do kernel, exports das
+//! imagens mapeadas); PID, PEB e cookie são do próprio EPROCESS. O resto do
+//! estado global de `state.rs` entra aqui à medida que sai de lá.
 //!
 //! Ciclo de vida: o que o processo possui volta quando ELE termina, nunca
 //! num reinício global entre processos. O término (`ps::process::
 //! terminate_process`) chama primeiro as rotinas de saída de processo (a de
 //! `files::release_user_resources` libera threads, E/S pendente, fábricas de
 //! workers, mutantes, instrumentação e canais RPC do processo) e, fora da
-//! lista ativa, `destroy`: handles, VAD e módulos, nesta ordem.
+//! lista ativa, `destroy`: handles, VAD, módulos, imagens e cópias de
+//! sistema, nesta ordem. Daí em diante a metade de usuário da raiz própria
+//! só tem a visão da KUSER_SHARED_DATA, e o último dereference do EPROCESS
+//! devolve a raiz (`mm::process_address_space::delete`).
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -47,6 +51,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::loader::LoadedModule;
 use super::memory::{self, Vad};
 use super::threads::UserThread;
+use crate::ntos::ke::smp;
+use crate::ntos::mm::pe_loader::PeImage;
 use crate::ntos::mm::process_address_space;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
@@ -88,6 +94,13 @@ pub struct ProcessState {
     /// → módulo e imagem); a ntdll é do sistema e vale em todos sem entrar
     /// aqui.
     modules: SpinLock<BTreeMap<String, LoadedModule>>,
+    /// Imagens de usuário que o processo possui fora do loader do kernel e
+    /// das seções: a imagem principal (o papel da vista da seção de imagem
+    /// no VAD do NT), desfeita na raiz dele no término.
+    images: SpinLock<Vec<PeImage>>,
+    /// As cópias privadas das faixas de sistema (ntdll, apiset, NLS) na raiz
+    /// própria do processo, (VA, frame); vazio na raiz do System.
+    system_pages: SpinLock<Vec<(u64, u64)>>,
 }
 
 impl ProcessState {
@@ -118,6 +131,21 @@ impl ProcessState {
     pub fn with_modules<R>(&self, body: impl FnOnce(&mut BTreeMap<String, LoadedModule>) -> R) -> R {
         body(&mut self.modules.lock())
     }
+
+    /// O processo passa a possuir a imagem (mapeada na raiz dele).
+    pub fn adopt_image(&self, image: PeImage) {
+        self.images.lock().push(image);
+    }
+
+    /// O processo passa a possuir as cópias privadas de sistema.
+    pub fn adopt_system_pages(&self, pages: Vec<(u64, u64)>) {
+        self.system_pages.lock().extend(pages);
+    }
+
+    /// Quantas páginas de cópia de sistema o processo tem.
+    pub fn system_page_count(&self) -> usize {
+        self.system_pages.lock().len()
+    }
 }
 
 static PROCESSES: SpinLock<BTreeMap<u64, Arc<ProcessState>>> = SpinLock::new(BTreeMap::new());
@@ -140,6 +168,8 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         threads: SpinLock::new(Vec::new()),
         started: AtomicBool::new(false),
         modules: SpinLock::new(BTreeMap::new()),
+        images: SpinLock::new(Vec::new()),
+        system_pages: SpinLock::new(Vec::new()),
     });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {
@@ -175,10 +205,11 @@ pub fn all() -> Vec<Arc<ProcessState>> {
 /// nada. Devolve se havia estado. Fora da trava, na ordem do término do NT
 /// (rundown de handles antes do espaço de endereçamento): os handles de
 /// usuário que restarem na tabela são fechados, o VAD volta inteiro (as
-/// regiões do processo, só as dele) e depois as imagens dos módulos do
-/// loader. A lista de threads se desfaz; uma thread ainda retida (handle em
-/// outro processo, ou a que encerrou o processo de dentro de um serviço)
-/// continua no índice global até a liberação dela.
+/// regiões do processo, só as dele), depois as imagens dos módulos do
+/// loader, a imagem principal e as cópias privadas de sistema, todas
+/// desfeitas na raiz do processo. A lista de threads se desfaz; uma thread
+/// ainda retida (handle em outro processo, ou a que encerrou o processo de
+/// dentro de um serviço) continua no índice global até a liberação dela.
 pub fn destroy(process: u64) -> bool {
     let removed = PROCESSES.lock().remove(&process);
     if let Some(removed) = &removed {
@@ -187,6 +218,20 @@ pub fn destroy(process: u64) -> bool {
         memory::release_vad(removed);
         let modules = core::mem::take(&mut *removed.modules.lock());
         drop(modules);
+        let images = core::mem::take(&mut *removed.images.lock());
+        let released = !images.is_empty();
+        for mut image in images {
+            if let Err(error) = image.release() {
+                crate::debug_print!("[usermode] imagem em {:#x} retida no termino do processo: {}", image.image_base, error);
+            }
+        }
+        if released {
+            if let Err(error) = smp::flush_remote_tlb(false) {
+                crate::debug_print!("[usermode] TLB das imagens do processo: {}", error);
+            }
+        }
+        let root = removed.directory_table_base.load(Ordering::Acquire);
+        memory::release_private_copies(root, core::mem::take(&mut *removed.system_pages.lock()));
         let threads = core::mem::take(&mut *removed.threads.lock());
         drop(threads);
     }

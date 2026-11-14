@@ -9,9 +9,11 @@
 //! Imagem de kernel (driver, hal.dll, biblioteca de export): como no
 //! MiLoadSystemImage do NT, a VA vem do espaço de sistema (a janela
 //! `memory_map::SYSTEM_IMAGE_BASE..TOP`), nunca da ImageBase do cabeçalho, e
-//! a imagem é relocada pela diferença. Imagem de usuário: a base preferida do
-//! cabeçalho quando a faixa está livre na metade de usuário, senão a
-//! primeira faixa livre a partir de 64 KB (relocada).
+//! a imagem é relocada pela diferença. Imagem de usuário: sempre do processo
+//! corrente (o anexado, quando há attach), mapeada na raiz carregada; a base
+//! preferida do cabeçalho quando a faixa está livre no espaço dele (o VAD,
+//! as faixas de sistema e as PTEs da raiz), senão a primeira faixa livre a
+//! partir de 64 KB (relocada). A liberação desfaz as PTEs na mesma raiz.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -25,7 +27,7 @@ use crate::ntos::rtl::image::pe_metadata_reader::MetadataReader;
 use crate::hal::{cpu, physical};
 use crate::ntos::ke::smp;
 use crate::ntos::mm::section::address as section_address;
-use crate::ntos::mm::{kernel_address, loaded_images, memory_map, paging, pfn};
+use crate::ntos::mm::{kernel_address, loaded_images, memory_map, paging, pfn, process_address_space};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ps::notify::image as image_notify;
 use crate::rtl::{KernelError, SpinLock};
@@ -46,9 +48,10 @@ struct Arenas {
     /// Faixas devolvidas da janela de sistema (base, tamanho), ordenadas e
     /// coalescidas, todas abaixo de `next_system`.
     free_system: Vec<(u64, u64)>,
-    /// Faixas ocupadas pelas imagens de usuário (base, fim). As de kernel
-    /// ficam só na janela de sistema e nunca entram aqui.
-    preferred_ranges: Vec<(u64, u64)>,
+    /// Faixas ocupadas pelas imagens de usuário (raiz, base, fim), por raiz:
+    /// a mesma VA pode estar em uso em dois espaços. As de kernel ficam só na
+    /// janela de sistema e nunca entram aqui.
+    preferred_ranges: Vec<(u64, u64, u64)>,
 }
 
 static ARENAS: SpinLock<Arenas> = SpinLock::new(Arenas {
@@ -108,8 +111,27 @@ fn release_system_image_range((base, top): (u64, u64)) {
     }
 }
 
-fn preferred_range_is_free(ranges: &[(u64, u64)], base: u64, size: u64) -> bool {
-    ranges.iter().all(|&(used_base, used_top)| !(base < used_top && base + size > used_base))
+fn preferred_range_is_free(ranges: &[(u64, u64, u64)], root: u64, base: u64, size: u64) -> bool {
+    ranges.iter().filter(|&&(owner, _, _)| owner == root).all(|&(_, used_base, used_top)| !(base < used_top && base + size > used_base))
+}
+
+/// ImageBase preferida e SizeOfImage do cabeçalho, sem mapear nada (o Ps
+/// cria o processo, e o espaço dele, antes de a imagem ser mapeada nele).
+pub fn image_layout(source: &dyn ImageSource) -> Result<(u64, u64), KernelError> {
+    let metadata = MetadataReader::new(source);
+    if metadata.read_u16(0)? != 0x5A4D {
+        return Err(KernelError::new("MZ ausente (nao e PE)"));
+    }
+    let pe_header = metadata.read_u32(0x3C)? as u64;
+    if metadata.read_u32(pe_header)? != 0x4550 {
+        return Err(KernelError::new("assinatura PE ausente"));
+    }
+    let optional = pe_header + 24;
+    if metadata.read_u16(optional)? != 0x20B {
+        return Err(KernelError::new("nao e PE32+"));
+    }
+    let preferred_base = metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32;
+    Ok((preferred_base, metadata.read_u32(optional + 56)? as u64))
 }
 
 /// Dependência retida por um import nativo (outro módulo carregado).
@@ -245,7 +267,11 @@ struct Owned {
     /// Faixa da janela de imagens de sistema (imagem de kernel).
     system_range: Option<(u64, u64)>,
     /// Faixa em `preferred_ranges` (imagem de usuário).
-    range: Option<(u64, u64)>,
+    range: Option<(u64, u64, u64)>,
+    /// A raiz em que as páginas de uma imagem de usuário foram mapeadas (a
+    /// do processo dono); 0 numa imagem de kernel (metade de sistema, a
+    /// mesma em toda raiz).
+    root: u64,
     mapped: Vec<u64>,
     dependencies: Vec<Arc<dyn ImageDependency>>,
     registered: Option<u64>,
@@ -267,8 +293,16 @@ impl Owned {
         if let Some(base) = self.native_base.take() {
             NATIVE_IMAGES.lock().remove(&base);
         }
+        let root = if self.root != 0 { self.root } else { paging::current_root() };
+        // A imagem de um processo volta antes do espaço dele (o término
+        // devolve o VAD e as imagens antes do MmDeleteProcessAddressSpace);
+        // uma raiz que já não existe não é editada.
+        if self.root != 0 && !self.mapped.is_empty() && !process_address_space::is_root(root) {
+            debug_print!("[pe] imagem de usuario em {:#x}: a raiz {:#x} ja foi devolvida", self.mapped[0], root);
+            self.mapped.clear();
+        }
         for &address in &self.mapped {
-            paging::unmap_page(address, paging::MapOptions::default());
+            paging::unmap_page_in(root, address, paging::MapOptions::default());
         }
         let mut failure = None;
         // Outra CPU pode guardar a tradução antiga: a VA de sistema e os
@@ -284,6 +318,7 @@ impl Owned {
         self.mapped.clear();
         if let Some(range) = self.range.take() {
             let mut arenas = ARENAS.lock();
+            // A faixa é por raiz: só a desta imagem sai.
             if let Some(index) = arenas.preferred_ranges.iter().position(|&candidate| candidate == range) {
                 arenas.preferred_ranges.remove(index);
             }
@@ -504,9 +539,11 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             return Err(KernelError::new("PE: invalid partial view"));
         }
     }
-    // A escolha da VA de uma imagem de usuário sem vista vê tudo o que já
-    // ocupa a metade de usuário (lido antes da trava das faixas de imagem).
-    let occupied_user = if user_space && user_view.is_none() { crate::ntos::ps::user::memory::occupied() } else { Vec::new() };
+    // Uma imagem de usuário é do processo corrente, na raiz carregada. A
+    // escolha da VA sem vista vê tudo o que já ocupa o espaço dele (lido
+    // antes da trava das faixas de imagem).
+    let user_root = if user_space { paging::current_root() } else { 0 };
+    let occupied_user = if user_space && user_view.is_none() { crate::ntos::ps::user::memory::occupied(crate::ntos::ps::user::memory::Space::current()) } else { Vec::new() };
     if size_of_image == 0 || size_of_headers > size_of_image {
         return Err(KernelError::new("PE: SizeOfImage invalido"));
     }
@@ -519,7 +556,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             let mut arenas = ARENAS.lock();
             let target = match user_view {
                 Some(view) => {
-                    if !preferred_range_is_free(&arenas.preferred_ranges, view.base, view_size) {
+                    if !preferred_range_is_free(&arenas.preferred_ranges, user_root, view.base, view_size) {
                         return Err(KernelError::new("PE: requested view conflicts"));
                     }
                     view.base - view_offset
@@ -529,8 +566,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 // livre da metade de usuário, e a imagem é relocada.
                 None => {
                     let mut occupied = occupied_user;
-                    occupied.extend(arenas.preferred_ranges.iter().map(|&(base, top)| section_address::Region { base, size: top - base }));
-                    let at = |base: u64| section_address::find(&section_address::FindOptions { base, size: size_of_image, ..section_address::FindOptions::default() }, &occupied);
+                    occupied.extend(arenas.preferred_ranges.iter().filter(|&&(root, _, _)| root == user_root).map(|&(_, base, top)| section_address::Region { base, size: top - base }));
+                    let at = |base: u64| section_address::find(&section_address::FindOptions { base, size: size_of_image, root: user_root, ..section_address::FindOptions::default() }, &occupied);
                     let preferred = (preferred_base % memory_map::ALLOCATION_GRANULARITY == 0 && memory_map::is_user_range(preferred_base, size_of_image)).then(|| at(preferred_base).ok()).flatten();
                     match preferred {
                         Some(base) => base,
@@ -538,10 +575,11 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     }
                 }
             };
-            let range = (target + view_offset, target + view_offset + view_size);
+            let range = (user_root, target + view_offset, target + view_offset + view_size);
             arenas.preferred_ranges.push(range);
             drop(arenas);
             owned.range = Some(range);
+            owned.root = user_root;
             image_base = target;
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
             if relocation_delta != 0 && reloc_rva == 0 {
@@ -672,7 +710,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     page_protects.resize(index + 1, 0);
                 }
                 page_protects[index] = if !present { 1 } else if nx { if writable { 4 } else { 2 } } else if writable { 0x40 } else { 0x20 };
-                if !paging::map_page(image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) {
+                let mapped = if user_space { paging::map_page_in(user_root, image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) } else { paging::map_page(image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) };
+                if !mapped {
                     return Err(KernelError::new(alloc::format!("mapPage falhou p/ imagem em {image_base:#x}")));
                 }
                 owned.mapped.push(image_base + page);
@@ -682,7 +721,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             // Verificação real: a página do entry point traduz de volta.
             let entry_page = entry_rva & !0xFFF;
             let expected = owned.frames.get((entry_page / 0x1000) as usize).copied().unwrap_or(0);
-            let probe = paging::translate(image_base + entry_page);
+            let probe = if user_space { paging::translate_in(user_root, image_base + entry_page) } else { paging::translate(image_base + entry_page) };
             if entry_page >= view_offset && entry_page < view_offset + view_size && probe != expected {
                 return Err(KernelError::new(alloc::format!("mapeamento VA quebrado: entry traduz p/ {probe:#x} (esperado {expected:#x})")));
             }

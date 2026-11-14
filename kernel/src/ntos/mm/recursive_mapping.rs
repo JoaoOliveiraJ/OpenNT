@@ -1,6 +1,11 @@
 //! Janela supervisora para as tabelas que a CPU realmente usa.
 //! O frame da PML4 reaparece nos
 //! quatro níveis; não há cópias de PTEs.
+//!
+//! Toda raiz tem a própria auto-referência em [256] (a do boot, instalada
+//! por [`initialize`], e cada raiz de `process_address_space`): a janela
+//! mostra sempre as tabelas da raiz carregada nesta CPU. As conferências
+//! comparam a entrada com a raiz corrente, não com a PML4 do boot.
 
 use super::memory_map as map;
 use crate::hal::{cpu, physical};
@@ -30,12 +35,20 @@ fn reserved_layout() -> RecursiveLayout {
     RecursiveLayout { table_index: index, page_table_base, page_directory_base, directory_pointer_base, root_table_address }
 }
 
-fn root_entry(layout: &RecursiveLayout) -> u64 {
-    physical::read64(map::PML4_PHYS + layout.table_index * 8)
+/// A raiz carregada nesta CPU (o CR3 sem os bits de controle).
+fn current_root() -> u64 {
+    cpu::read_cr3() & PHYSICAL_FRAME_MASK
 }
 
-fn owns_root_mapping(entry: u64) -> bool {
-    entry & PHYSICAL_FRAME_MASK == map::PML4_PHYS
+/// A entrada [256] da raiz `root`.
+fn root_entry(root: u64, layout: &RecursiveLayout) -> u64 {
+    physical::read64(root + layout.table_index * 8)
+}
+
+/// A entrada é a auto-referência da raiz `root`: ela mesma, de supervisor,
+/// RW e NX.
+fn owns_root_mapping(root: u64, entry: u64) -> bool {
+    entry & PHYSICAL_FRAME_MASK == root
         && entry & PRESENT_WRITABLE == PRESENT_WRITABLE
         && entry & USER_OR_LARGE_PAGE == 0
         && entry & NO_EXECUTE != 0
@@ -47,25 +60,28 @@ pub fn self_reference(root: u64) -> u64 {
     root | PRESENT_WRITABLE | NO_EXECUTE
 }
 
-/// A base só é entregue quando existe a entrada válida nas tabelas.
+/// A base só é entregue quando a raiz carregada tem a auto-referência
+/// válida.
 pub fn layout() -> Option<RecursiveLayout> {
     let layout = reserved_layout();
-    owns_root_mapping(root_entry(&layout)).then_some(layout)
+    let root = current_root();
+    owns_root_mapping(root, root_entry(root, &layout)).then_some(layout)
 }
 
-/// Fase 0, antes dos APs e de imagens nativas. Uma entrada ocupada pertence
-/// a outro mapeamento: falha sem sobrescrevê-la.
+/// Fase 0, antes dos APs e de imagens nativas, na PML4 do boot. Uma entrada
+/// ocupada pertence a outro mapeamento: falha sem sobrescrevê-la.
 pub fn initialize() -> Result<RecursiveLayout, KernelError> {
     let reserved = reserved_layout();
-    let previous = root_entry(&reserved);
-    if owns_root_mapping(previous) {
+    let root = map::PML4_PHYS;
+    let previous = root_entry(root, &reserved);
+    if owns_root_mapping(root, previous) {
         return Ok(reserved);
     }
     if previous != 0 {
         return Err(KernelError::new("recursive page-table reservation already occupied"));
     }
-    let entry_address = map::PML4_PHYS + reserved.table_index * 8;
-    let entry = self_reference(map::PML4_PHYS);
+    let entry_address = root + reserved.table_index * 8;
+    let entry = self_reference(root);
     physical::write32(entry_address + 4, (entry >> 32) as u32);
     physical::write32(entry_address, entry as u32);
     cpu::reload_cr3();

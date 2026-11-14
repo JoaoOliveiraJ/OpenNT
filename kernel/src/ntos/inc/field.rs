@@ -299,14 +299,18 @@ pub unsafe trait NtStruct: Sized + Sync {
     /// `sizeof` do tipo no NT.
     const SIZE: u64 = size_of::<Self>() as u64;
 
-    /// O objeto em `address`, como o C faz com um `PIRP`.
+    /// O objeto em `address`, como o C faz com um `PIRP`. Numa VA de usuário,
+    /// o assert de CR3 (`guest_memory::check_loaded_root`): o objeto está no
+    /// espaço do processo corrente, a raiz carregada.
     ///
     /// # Safety
     /// `address` aponta para um objeto vivo deste tipo, alinhado, em memória
     /// mapeada para o kernel (memória do próprio kernel ou de drivers).
     #[inline(always)]
+    #[track_caller]
     unsafe fn at(address: u64) -> &'static Self {
         debug_assert!(address != 0 && address % align_of::<Self>() as u64 == 0);
+        guest::check_loaded_root(address);
         // SAFETY: garantido pelo chamador.
         unsafe { &*(address as *const Self) }
     }
@@ -316,8 +320,10 @@ pub unsafe trait NtStruct: Sized + Sync {
     /// # Safety
     /// Como em [`NtStruct::at`], para o vetor inteiro.
     #[inline(always)]
+    #[track_caller]
     unsafe fn array_at(address: u64, count: usize) -> &'static [Self] {
         debug_assert!(address != 0 && address % align_of::<Self>() as u64 == 0);
+        guest::check_loaded_root(address);
         // SAFETY: garantido pelo chamador.
         unsafe { core::slice::from_raw_parts(address as *const Self, count) }
     }

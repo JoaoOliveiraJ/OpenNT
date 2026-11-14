@@ -1,7 +1,8 @@
 //! Escolha de endereço para vistas de seção e alocações de usuário.
 //!
 //! Exclui as faixas ocupadas que o chamador passa (VADs, imagens, vistas) e
-//! os mapeamentos reais da árvore de páginas. Na metade de usuário a busca
+//! os mapeamentos reais da árvore de páginas do espaço alvo (`root`; cada
+//! processo de usuário tem a sua). Na metade de usuário a busca
 //! é a do MiFindEmptyAddressRange do NT: primeira faixa livre de baixo para
 //! cima a partir de MM_LOWEST_USER_ADDRESS (64 KB), ou de cima para baixo a
 //! partir de MM_HIGHEST_VAD_ADDRESS no MEM_TOP_DOWN, sem cursor: uma faixa
@@ -30,14 +31,18 @@ pub struct FindOptions {
     pub upper: Option<u64>,
     /// Piso pedido; nunca abaixo de MM_LOWEST_USER_ADDRESS.
     pub minimum: Option<u64>,
+    /// A raiz cujas PTEs também contam como ocupadas (o espaço do processo
+    /// alvo); 0 = a raiz carregada.
+    pub root: u64,
 }
 
-fn collision(regions: &[Region], base: u128, size: u128) -> Option<(u128, u128)> {
+fn collision(root: u64, regions: &[Region], base: u128, size: u128) -> Option<(u128, u128)> {
+    let root = if root != 0 { root } else { paging::current_root() };
     regions
         .iter()
         .find(|region| base < region.base as u128 + region.size as u128 && base + size > region.base as u128)
         .map(|region| (region.base as u128, region.size as u128))
-        .or_else(|| paging::find_mapping(base as u64, size as u64).map(|(found, length)| (found as u128, length as u128)))
+        .or_else(|| paging::find_mapping_in(root, base as u64, size as u64).map(|(found, length)| (found as u128, length as u128)))
 }
 
 /// Faixa global de seções do sistema.
@@ -48,7 +53,7 @@ fn find_system(options: &FindOptions, regions: &[Region]) -> Result<u64, u32> {
     let align = |address: u128| address.div_ceil(alignment) * alignment;
     let mut base = align(if fixed { options.base as u128 } else { map::KERNEL_SECTION_BASE as u128 });
     while base >= map::KERNEL_SECTION_BASE as u128 && base + size <= map::KERNEL_SECTION_TOP as u128 {
-        match collision(regions, base, size) {
+        match collision(options.root, regions, base, size) {
             None => return Ok(base as u64),
             Some(_) if fixed => return Err(0xC000_0018),
             Some((found, length)) => base = align(found + length),
@@ -85,7 +90,7 @@ pub fn find(options: &FindOptions, regions: &[Region]) -> Result<u64, u32> {
         ceil_to(minimum)
     };
     while base >= minimum && base + size <= upper {
-        match collision(regions, base as u128, size as u128) {
+        match collision(options.root, regions, base as u128, size as u128) {
             None => return Ok(base as u64),
             Some(_) if fixed => return Err(0xC000_0018),
             Some((found, length)) => {
