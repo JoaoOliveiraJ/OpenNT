@@ -1,10 +1,11 @@
 //! Raiz explícita das tabelas de páginas e metade de sistema congelada
 //! (`mm/paging.rs`, `mm/process_address_space.rs`):
 //!
-//! - as 256 entradas de sistema da PML4 do boot estão presentes e são
+//! - as entradas de sistema da PML4 do boot estão presentes e são
 //!   permanentes: [256] é a auto-referência e [257..512) apontam para PDPTs
 //!   de supervisor que nunca voltam ao PFN, nem quando a última página de um
-//!   slot vazio é desfeita;
+//!   slot vazio é desfeita; a exceção é o slot de sessão, vazio na raiz do
+//!   System (cada sessão liga a própria tabela de topo);
 //! - andar pela raiz do boot dá o mesmo que andar pela raiz corrente, em
 //!   amostras das duas metades;
 //! - uma raiz nova copia a metade de sistema: as VAs de kernel caem nos
@@ -48,8 +49,9 @@ fn kernel_entries(assert: Assert) {
     assert(entry(SYSTEM_ROOT, recursive) == recursive_mapping::self_reference(SYSTEM_ROOT), "raiz: PML4[256] e a auto-referencia");
     let mut absent = Vec::new();
     let mut transient = Vec::new();
+    assert(entry(SYSTEM_ROOT, map::SESSION_SPACE_PML4_INDEX) == 0, "raiz: o slot de sessao esta vazio na raiz do System");
     for index in map::USER_PML4_ENTRIES..512 {
-        if index == recursive {
+        if index == recursive || index == map::SESSION_SPACE_PML4_INDEX {
             continue;
         }
         let value = entry(SYSTEM_ROOT, index);
@@ -65,14 +67,14 @@ fn kernel_entries(assert: Assert) {
     if let (Some(first), count) = (transient.first(), transient.len()) {
         debug_print!("[raiz] {} PDPTs de sistema sem marca permanente, a primeira em {}", count, first);
     }
-    assert(absent.is_empty(), "raiz: as 255 PML4E de sistema abaixo da auto-referencia estao presentes, de supervisor e RW");
+    assert(absent.is_empty(), "raiz: as 254 PML4E de sistema fora da auto-referencia e do slot de sessao estao presentes, de supervisor e RW");
     assert(transient.is_empty(), "raiz: toda PDPT da metade de sistema e permanente");
 }
 
 /// Mapear e desfazer a única página de um slot de sistema vazio não cria nem
 /// libera a entrada da PML4: a PDPT fica, vazia.
 fn empty_slot_keeps_its_table(assert: Assert) {
-    let Some(index) = (map::USER_PML4_ENTRIES + 2..512).find(|&index| paging::find_mapping(slot_base(index), SLOT_SIZE).is_none()) else {
+    let Some(index) = (map::USER_PML4_ENTRIES + 2..512).find(|&index| index != map::SESSION_SPACE_PML4_INDEX && paging::find_mapping(slot_base(index), SLOT_SIZE).is_none()) else {
         assert(false, "raiz: algum slot de sistema sem mapeamento");
         return;
     };

@@ -52,6 +52,7 @@
 //!   0xFFFF8080_00000000  (257) banco de PFNs nativo
 //!   0xFFFFA000_00000000  (320) pool executivo, dump, contígua, independente,
 //!                              visões de sistema, VirtualAlloc de kernel,
+//!                              VAs globais das sessões (0xFFFFA006_8...),
 //!                              pilhas de kernel das threads (0xFFFFA007_...)
 //!   0xFFFFB000_00000000  (352) mapa direto de [0, 4GB): DIRECT_MAP_BASE + PA
 //!   0xFFFFC000_C0000000  (384) janela do heap do kernel e da arena dos convidados
@@ -60,6 +61,8 @@
 //!   0xFFFFF800_40000000  (496) imagem do kernel (ImageBase do ntoskrnl)
 //!   0xFFFFF800_41081000  (496) pilha de boot (até 0xFFFFF800_41200000)
 //!   0xFFFFF801_00000000  (496) janela de imagens de sistema (drivers, hal.dll...)
+//!   0xFFFFF900_00000000  (498) espaço de sessão: tabela de topo própria de
+//!                              cada sessão, vazio fora delas
 //! ```
 #![allow(dead_code)]
 
@@ -189,6 +192,64 @@ pub const SYSTEM_IMAGE_TOP: u64 = 0xFFFF_F802_0000_0000;
 pub const SYSTEM_IMAGE_ALIGN: u64 = 0x1_0000;
 
 // ---- fim das imagens de sistema ----------------------------------------------
+
+// ---- Espaço de sessão ---------------------------------------------------------
+//
+// Como no Windows 10 19041 x64, o espaço de sessão é um slot inteiro da PML4
+// (512 GB) que NÃO é compartilhado entre as raízes: cada sessão tem a própria
+// tabela de topo (a PDPT do slot, o MM_SESSION_SPACE.PageDirectory), e a PML4
+// de cada processo da sessão aponta para ela; a raiz do System e a dos
+// processos sem sessão deixam o slot vazio (MmIsSessionAddress olha o tipo do
+// slot, MiVaSessionSpace). O 19041 sorteia o slot e, dentro dele, as quatro
+// faixas de 1 GB de granularidade do MiAssignSessionRanges; o OpenNT fixa o
+// slot no MM_SESSION_SPACE_DEFAULT clássico (0xFFFFF900_00000000, o slot em
+// que a ImageBase do win32k.sys cai) e as faixas nas mesmas medidas:
+//
+// ```text
+//   +0 GB    SessionCore (0x47000 bytes): o MM_SESSION_SPACE (5 páginas) em +0
+//   +1 GB    VA dinâmica (128 GB): o pool paginado de sessão
+//   +129 GB  imagens de sessão (128 GB): win32k*.sys, cdd.dll...
+//   +257 GB  lista do working set da sessão (64 GB, sem uso no OpenNT)
+// ```
+//
+// A primeira página do MM_SESSION_SPACE de cada sessão também aparece numa
+// VA global de sistema (o MiReservePtes do MiSessionCreateInternal), que é o
+// EPROCESS.Session: os campos dela são lidos de qualquer contexto.
+
+pub const SESSION_SPACE_PML4_INDEX: u64 = 498;
+pub const SESSION_SPACE_BASE: u64 = 0xFFFF_F900_0000_0000;
+pub const SESSION_SPACE_TOP: u64 = 0xFFFF_F980_0000_0000;
+/// MiState.Sessions.SessionCore: o MM_SESSION_SPACE de cada sessão, na mesma
+/// VA em todas.
+pub const SESSION_CORE_BASE: u64 = SESSION_SPACE_BASE;
+pub const SESSION_CORE_SIZE: u64 = 0x4_7000;
+/// MiState.Sessions.DynamicVaStart: o pool paginado de sessão.
+pub const SESSION_DYNAMIC_VA_BASE: u64 = SESSION_SPACE_BASE + 0x4000_0000;
+pub const SESSION_DYNAMIC_VA_TOP: u64 = SESSION_DYNAMIC_VA_BASE + 0x20_0000_0000;
+/// MiState.Sessions.ImageVaStart: as imagens de sessão, na mesma VA em todas
+/// as sessões que as carregam.
+pub const SESSION_IMAGE_BASE: u64 = SESSION_DYNAMIC_VA_TOP;
+pub const SESSION_IMAGE_TOP: u64 = SESSION_IMAGE_BASE + 0x20_0000_0000;
+/// A lista do working set da sessão (reservada).
+pub const SESSION_WORKING_SET_BASE: u64 = SESSION_IMAGE_TOP;
+pub const SESSION_WORKING_SET_TOP: u64 = SESSION_WORKING_SET_BASE + 0x10_0000_0000;
+/// Janela das VAs globais da primeira página de cada MM_SESSION_SPACE (uma
+/// página por sessão viva), no slot do pool executivo.
+pub const SESSION_GLOBAL_BASE: u64 = 0xFFFF_A006_8000_0000;
+pub const SESSION_GLOBAL_TOP: u64 = 0xFFFF_A006_8100_0000;
+
+/// A VA está no slot de sessão (o MmIsSessionAddress do 19041: VA de sistema
+/// cujo slot da PML4 é do tipo MiVaSessionSpace).
+pub const fn is_session_address(address: u64) -> bool {
+    address >= 0xFFFF_8000_0000_0000 && (address >> 39) & 511 == SESSION_SPACE_PML4_INDEX
+}
+
+const _: () = assert!((SESSION_SPACE_BASE >> 39) & 511 == SESSION_SPACE_PML4_INDEX && SESSION_SPACE_TOP - SESSION_SPACE_BASE == 1 << 39);
+const _: () = assert!(SESSION_WORKING_SET_TOP <= SESSION_SPACE_TOP && SESSION_CORE_SIZE <= 0x4000_0000);
+const _: () = assert!(SESSION_SPACE_PML4_INDEX != KERNEL_PML4_INDEX && SESSION_SPACE_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 && SESSION_SPACE_PML4_INDEX != DIRECT_MAP_PML4_INDEX && SESSION_SPACE_PML4_INDEX != KERNEL_HEAP_PML4_INDEX);
+const _: () = assert!(KERNEL_VIRTUAL_ALLOC_TOP <= SESSION_GLOBAL_BASE && SESSION_GLOBAL_TOP <= KERNEL_STACK_BASE);
+
+// ---- fim do espaço de sessão ----------------------------------------------------
 
 /// KPCR do processador N em PCR_VIRTUAL_BASE + N * `pcr::layout::SIZE`.
 pub const PCR_VIRTUAL_BASE: u64 = 0xFFFF_F800_0000_0000;

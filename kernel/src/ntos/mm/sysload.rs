@@ -664,12 +664,20 @@ pub mod kernel_api_set {
 //   entrada da própria imagem NÃO é chamado.
 // - MmUnloadSystemImage(ImageHandle): MiUnloadSystemImage; sempre sucesso.
 //
+// - Carga de sessão (MM_LOAD_IMAGE_IN_SESSION): o processo corrente precisa
+//   de EPROCESS.Flags.ProcessInSession, senão STATUS_NO_MEMORY. A imagem nova
+//   vai para a faixa de imagens de sessão e entra na sessão corrente
+//   (`mm::session_image`); uma imagem de sessão já carregada por outra sessão
+//   entra nesta na mesma VA (MiSessionInsertImage, LoadCount + 1), com as
+//   páginas graváveis próprias, e a que esta sessão já tem devolve sucesso.
+//   MmUnloadSystemImage de uma imagem de sessão a tira da sessão corrente; a
+//   última sessão a descarrega. As dependências seguem o resolvedor global
+//   (o MiLoadImportDll do NT as carregaria na sessão quando ainda não estão
+//   carregadas no sistema).
+//
 // O OpenNT guarda as imagens de kernel do System32 na raiz do volume de boot,
-// então a busca usa só o nome do arquivo (a mesma fonte do sysload). Lacunas:
-// a exigência de ProcessInSession das cargas de sessão (STATUS_NO_MEMORY) não
-// é aplicada porque o ps ainda não liga esse bit; uma imagem de sessão é
-// mapeada uma vez (sistema de sessão única). Arquivo ausente =
-// STATUS_OBJECT_NAME_NOT_FOUND, o resultado do ZwOpenFile do
+// então a busca usa só o nome do arquivo (a mesma fonte do sysload). Arquivo
+// ausente = STATUS_OBJECT_NAME_NOT_FOUND, o resultado do ZwOpenFile do
 // MiObtainSectionForDriver.
 
 const SYSTEM_IMAGE_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
@@ -712,6 +720,10 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
     if session && flags & MM_LOAD_IMAGE_AND_LOCKDOWN != 0 {
         return Ok(SYSTEM_IMAGE_INVALID_PARAMETER_4);
     }
+    // SAFETY: o EPROCESS corrente (PsGetCurrentProcess).
+    if session && unsafe { crate::ntos::inc::types::Eprocess::at(crate::ntos::ps::process::get_current_process()) }.process_in_session() == 0 {
+        return Ok(crate::ntos::mm::session_image::STATUS_NO_MEMORY);
+    }
     let path = guest_strings::read_unicode_string(file_name);
     let file = String::from(system_image_file_name(&path));
     let mut base_name = if loaded_base_name != 0 { guest_strings::read_unicode_string(loaded_base_name) } else { file.clone() };
@@ -727,11 +739,21 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
         if unsafe { KldrDataTableEntry::at(entry) }.flags.get() & SYSTEM_IMAGE_LOADED_AS_DLL != 0 {
             return Ok(SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL);
         }
+        if session && crate::ntos::mm::session_image::is_session_image(image_base) {
+            return Ok(match crate::ntos::mm::session_image::load_into_current(image_base) {
+                Ok(_) => 0,
+                Err(error) => {
+                    debug_print!("[mm] MmLoadSystemImage {} na sessao: {}", path, error);
+                    base_out.set(0);
+                    if error.status & 0x8000_0000 != 0 { error.status } else { 0xC000_009A }
+                }
+            });
+        }
         return Ok(if session { 0 } else { SYSTEM_IMAGE_ALREADY_LOADED });
     }
 
     let Ok(source) = kernel_image_source::source_for(&file) else { return Ok(SYSTEM_IMAGE_NAME_NOT_FOUND) };
-    let mut image = match pe_loader::load_from_source(source, &LoadOptions { image_name: Some(full_name), ..LoadOptions::default() }) {
+    let mut image = match pe_loader::load_from_source(source, &LoadOptions { image_name: Some(full_name), session, ..LoadOptions::default() }) {
         Ok(image) => image,
         Err(error) => {
             debug_print!("[mm] MmLoadSystemImage {}: {}", path, error);
@@ -743,12 +765,19 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
         None => None,
     };
     let Some(entry) = entry else {
+        if session {
+            crate::ntos::mm::session_image::discard_new(&image);
+        }
         image.release()?;
         return Err(KernelError::new("MmLoadSystemImage: kernel image without loader entry"));
     };
     handle_out.set(entry);
     base_out.set(image.image_base);
-    SYSTEM_IMAGES.lock().insert(entry, image);
+    if session {
+        crate::ntos::mm::session_image::register(entry, image);
+    } else {
+        SYSTEM_IMAGES.lock().insert(entry, image);
+    }
     Ok(0)
 }
 
@@ -757,6 +786,12 @@ pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
     let image = SYSTEM_IMAGES.lock().remove(&handle);
     if let Some(mut image) = image {
         image.release()?;
+        return Ok(());
+    }
+    // SAFETY: a KLDR_DATA_TABLE_ENTRY do ImageHandle.
+    let base = if handle != 0 { unsafe { KldrDataTableEntry::at(handle) }.dll_base.get() } else { 0 };
+    if base != 0 && crate::ntos::mm::session_image::entry_of(base) == Some(handle) {
+        crate::ntos::mm::session_image::unload_from_current(base)?;
     }
     Ok(())
 }

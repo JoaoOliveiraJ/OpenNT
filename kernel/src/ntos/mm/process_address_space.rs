@@ -6,7 +6,8 @@
 //! uma raiz nova ([`create_root`]) copia PML4[257..512) dela uma única vez e
 //! ganha a própria auto-referência em [256], de modo que o mapeamento
 //! recursivo mostra sempre as tabelas da raiz carregada. A metade de
-//! usuário, PML4[0..256), começa vazia e é só do espaço.
+//! usuário, PML4[0..256), começa vazia e é só do espaço, e o slot de sessão
+//! também (a sessão do processo liga a tabela de topo dela, `mm::session`).
 //!
 //! [`create`] (MmCreateProcessAddressSpace) dá a um EPROCESS uma raiz
 //! própria com a visão de usuário da KUSER_SHARED_DATA e a grava em
@@ -69,6 +70,9 @@ pub fn create_root() -> Result<u64, KernelError> {
     for index in map::USER_PML4_ENTRIES..512 {
         let entry = if index == map::PAGE_TABLE_RECURSIVE_INDEX {
             recursive_mapping::self_reference(root)
+        } else if index == map::SESSION_SPACE_PML4_INDEX {
+            // A sessão liga a própria tabela de topo (`mm::session`).
+            0
         } else {
             paging::read_entry_exact(SYSTEM_ROOT + index * 8)
         };

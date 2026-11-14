@@ -21,7 +21,10 @@
 //! kernel mapeia depois muda só os níveis de baixo, em tabelas que toda raiz
 //! compartilha, e uma raiz nova que copia essas entradas uma vez fica
 //! coerente para sempre (`process_address_space::create_root`). Por isso a
-//! metade de sistema não aceita folha de usuário.
+//! metade de sistema não aceita folha de usuário. A exceção é o slot de
+//! sessão (`memory_map::SESSION_SPACE_PML4_INDEX`): cada sessão tem a própria
+//! tabela de topo, ligada na raiz de cada processo dela por
+//! [`set_session_top_level`], e as raízes fora de sessão o deixam vazio.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -100,7 +103,9 @@ pub fn freeze_kernel_half() -> Result<u64, KernelError> {
     }
     let mut allocated = 0;
     for index in map::USER_PML4_ENTRIES..512 {
-        if index == recursive {
+        // O slot de sessão não é compartilhado: cada sessão tem a própria
+        // tabela de topo, e a raiz do System o deixa vazio.
+        if index == recursive || index == map::SESSION_SPACE_PML4_INDEX {
             continue;
         }
         let at = PML4 + index * 8;
@@ -126,6 +131,23 @@ pub fn freeze_kernel_half() -> Result<u64, KernelError> {
     KERNEL_HALF_FROZEN.store(true, Ordering::Release);
     cpu::reload_cr3();
     Ok(allocated)
+}
+
+/// A entrada do slot de sessão da PML4 `root` (0 fora de uma sessão).
+pub fn session_top_level(root: u64) -> u64 {
+    read_entry_exact(root + map::SESSION_SPACE_PML4_INDEX * 8)
+}
+
+/// Liga (ou, com 0, desliga) na raiz `root` a tabela de topo de uma sessão:
+/// o MiSessionAddProcess/MiAttachSession grava o MM_SESSION_SPACE.PageDirectory
+/// na PML4 do processo, e o MiDeleteTopLevelSessionMapping a apaga. A tabela
+/// é da sessão: nenhuma raiz é dona dela, e o reaproveitamento de tabelas
+/// vazias nunca a devolve.
+pub fn set_session_top_level(root: u64, entry: u64) {
+    write_entry(root + map::SESSION_SPACE_PML4_INDEX * 8, entry, false);
+    if root == current_root() {
+        cpu::reload_cr3();
+    }
 }
 
 pub fn set_observed(installed: bool) {
@@ -275,7 +297,10 @@ fn pd_entry_address(root: u64, va: u64, create: bool, user: bool) -> u64 {
     let frozen = in_kernel_half(va) && kernel_half_frozen();
     assert!(!(frozen && user), "user mapping requested in the frozen kernel half");
     if entry & PAGE_PRESENT == 0 {
-        if !create {
+        // Uma raiz fora de qualquer sessão não tem o espaço de sessão: a
+        // tabela de topo é da sessão (`set_session_top_level`), nunca criada
+        // aqui.
+        if !create || pml4_index(va) == map::SESSION_SPACE_PML4_INDEX {
             return 0;
         }
         assert!(!frozen, "kernel PML4 entry missing after the kernel half was frozen");

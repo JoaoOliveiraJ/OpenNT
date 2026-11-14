@@ -4407,10 +4407,12 @@ fn mm_system_image_exports(assert: Assert) {
     guest::write64(handle, 0);
     let again = call_export("MmLoadSystemImage", &[name, 0, 0, 0, handle, base]);
     assert(again == Some(0xFFFF_FFFF_C000_010E) && guest::read64(handle) == entry && guest::read64(base) == image_base, "mm-system-image: segunda carga = STATUS_IMAGE_ALREADY_LOADED com a entrada existente");
-    assert(call_export("MmLoadSystemImage", &[name, 0, 0, 1, handle, base]) == Some(0) && guest::read64(base) == image_base, "mm-system-image: carga de sessao de imagem presente = sucesso");
 
     // Flags: o wrapper recusa antes de zerar a base; o Ex zera e recusa sessão+lockdown.
     assert(call_export("MmLoadSystemImage", &[name, 0, 0, 4, handle, base]) == Some(0xFFFF_FFFF_C000_00F2) && guest::read64(base) == image_base, "mm-system-image: flag fora da mascara = INVALID_PARAMETER_4 sem tocar a saida");
+    // Carga de sessão de um processo fora de sessão (o System): STATUS_NO_MEMORY
+    // antes de procurar a imagem, com a base zerada.
+    assert(call_export("MmLoadSystemImage", &[name, 0, 0, 1, handle, base]) == Some(0xFFFF_FFFF_C000_0017) && guest::read64(base) == 0, "mm-system-image: carga de sessao fora de uma sessao = STATUS_NO_MEMORY");
     assert(call_export("MmLoadSystemImage", &[name, 0, 0, 3, handle, base]) == Some(0xFFFF_FFFF_C000_00F2) && guest::read64(base) == 0, "mm-system-image: sessao com lockdown = INVALID_PARAMETER_4 com a base zerada");
     assert(call_export("MmLoadSystemImage", &[missing, 0, 0, 0, handle, base]) == Some(0xFFFF_FFFF_C000_0034) && guest::read64(base) == 0, "mm-system-image: imagem ausente = OBJECT_NAME_NOT_FOUND");
 

@@ -1103,6 +1103,32 @@ const _: () = {
     assert!(core::mem::offset_of!(ExceptionPointers, context_record) == 0x8);
 };
 
+/// `_POOL_TRACKER_TABLE` (0x38 bytes).
+#[repr(C)]
+pub struct PoolTrackerTable {
+    pub key: Field<i32>,
+    _pad_4: Reserved<0x4>,
+    pub non_paged_bytes: Field<u64>,
+    pub non_paged_allocs: Field<u64>,
+    pub non_paged_frees: Field<u64>,
+    pub paged_bytes: Field<u64>,
+    pub paged_allocs: Field<u64>,
+    pub paged_frees: Field<u64>,
+}
+
+unsafe impl NtStruct for PoolTrackerTable {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PoolTrackerTable>() == 0x38);
+    assert!(core::mem::offset_of!(PoolTrackerTable, key) == 0x0);
+    assert!(core::mem::offset_of!(PoolTrackerTable, non_paged_bytes) == 0x8);
+    assert!(core::mem::offset_of!(PoolTrackerTable, non_paged_allocs) == 0x10);
+    assert!(core::mem::offset_of!(PoolTrackerTable, non_paged_frees) == 0x18);
+    assert!(core::mem::offset_of!(PoolTrackerTable, paged_bytes) == 0x20);
+    assert!(core::mem::offset_of!(PoolTrackerTable, paged_allocs) == 0x28);
+    assert!(core::mem::offset_of!(PoolTrackerTable, paged_frees) == 0x30);
+};
+
 /// `_EX_RUNDOWN_REF_CACHE_AWARE` (0x18 bytes).
 #[repr(C)]
 pub struct ExRundownRefCacheAware {

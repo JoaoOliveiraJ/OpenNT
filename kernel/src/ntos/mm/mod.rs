@@ -34,6 +34,8 @@ pub mod peb_teb;
 pub mod recursive_mapping;
 pub mod section;
 pub mod session;
+pub mod session_image;
+pub mod session_pool;
 pub mod shared_user_data;
 pub mod small;
 pub mod user_half;

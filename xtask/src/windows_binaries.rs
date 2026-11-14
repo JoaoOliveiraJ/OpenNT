@@ -63,6 +63,10 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ("NULL.SYS", "System32/drivers/null.sys"),
     ("BEEP.SYS", "System32/drivers/beep.sys"),
     ("FS_REC.SYS", "System32/drivers/fs_rec.sys"),
+    // Imagem real carregada em duas sessões pelo autoteste do espaço de
+    // sessão (MmLoadSystemImage com MM_LOAD_IMAGE_IN_SESSION): só importa do
+    // ntoskrnl e tem uma seção .data gravável.
+    ("BOOTVID.DLL", "System32/BOOTVID.DLL"),
     // Esquema de API sets: os imports ext-ms-* das imagens de kernel.
     ("APISETSCHEMA.DLL", "System32/apisetschema.dll"),
     // A CI lê a lista de revogação pelo caminho completo.

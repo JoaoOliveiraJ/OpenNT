@@ -14,6 +14,13 @@
 //! preferida do cabeçalho quando a faixa está livre no espaço dele (o VAD,
 //! as faixas de sistema e as PTEs da raiz), senão a primeira faixa livre a
 //! partir de 64 KB (relocada). A liberação desfaz as PTEs na mesma raiz.
+//!
+//! Imagem de sessão (`LoadOptions::session`, o MM_LOAD_IMAGE_IN_SESSION):
+//! a VA vem da faixa de imagens de sessão (a mesma em todas as sessões), os
+//! frames da carga ficam como a cópia mestra (relocada, com a IAT e o cookie)
+//! e nada é mapeado no sistema: a imagem pronta entra na sessão corrente
+//! pelo `mm::session_image`, com o código nos frames mestres e cópias
+//! privadas das páginas graváveis.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -48,6 +55,10 @@ struct Arenas {
     /// Faixas devolvidas da janela de sistema (base, tamanho), ordenadas e
     /// coalescidas, todas abaixo de `next_system`.
     free_system: Vec<(u64, u64)>,
+    /// Primeira VA nunca usada e faixas devolvidas da faixa de imagens de
+    /// sessão.
+    next_session: u64,
+    free_session: Vec<(u64, u64)>,
     /// Faixas ocupadas pelas imagens de usuário (raiz, base, fim), por raiz:
     /// a mesma VA pode estar em uso em dois espaços. As de kernel ficam só na
     /// janela de sistema e nunca entram aqui.
@@ -57,32 +68,37 @@ struct Arenas {
 static ARENAS: SpinLock<Arenas> = SpinLock::new(Arenas {
     next_system: memory_map::SYSTEM_IMAGE_BASE,
     free_system: Vec::new(),
+    next_session: memory_map::SESSION_IMAGE_BASE,
+    free_session: Vec::new(),
     preferred_ranges: Vec::new(),
 });
 
 /// Reserva a faixa de uma imagem de kernel na janela de sistema: a primeira
 /// que couber a partir da base, em múltiplos de `SYSTEM_IMAGE_ALIGN` (o papel
 /// da reserva de PTEs de sistema do MiLoadSystemImage).
-fn reserve_system_image_range(size: u64) -> Result<(u64, u64), KernelError> {
+/// Com `session`, a reserva vem da faixa de imagens de sessão.
+fn reserve_image_range(size: u64, session: bool) -> Result<(u64, u64), KernelError> {
     let length = size.div_ceil(memory_map::SYSTEM_IMAGE_ALIGN) * memory_map::SYSTEM_IMAGE_ALIGN;
     if length == 0 {
         return Err(KernelError::new("PE: SizeOfImage nulo"));
     }
     let mut arenas = ARENAS.lock();
-    if let Some(index) = arenas.free_system.iter().position(|&(_, available)| available >= length) {
-        let base = arenas.free_system[index].0;
-        arenas.free_system[index].0 += length;
-        arenas.free_system[index].1 -= length;
-        if arenas.free_system[index].1 == 0 {
-            arenas.free_system.remove(index);
+    let arenas = &mut *arenas;
+    let (next, free, top) = if session { (&mut arenas.next_session, &mut arenas.free_session, memory_map::SESSION_IMAGE_TOP) } else { (&mut arenas.next_system, &mut arenas.free_system, memory_map::SYSTEM_IMAGE_TOP) };
+    if let Some(index) = free.iter().position(|&(_, available)| available >= length) {
+        let base = free[index].0;
+        free[index].0 += length;
+        free[index].1 -= length;
+        if free[index].1 == 0 {
+            free.remove(index);
         }
         return Ok((base, base + length));
     }
-    let base = arenas.next_system;
-    if memory_map::SYSTEM_IMAGE_TOP - base < length {
+    let base = *next;
+    if top - base < length {
         return Err(KernelError::with_status("janela de imagens de sistema esgotada", STATUS_INSUFFICIENT_RESOURCES));
     }
-    arenas.next_system = base + length;
+    *next = base + length;
     Ok((base, base + length))
 }
 
@@ -91,7 +107,8 @@ fn reserve_system_image_range(size: u64) -> Result<(u64, u64), KernelError> {
 fn release_system_image_range((base, top): (u64, u64)) {
     let mut arenas = ARENAS.lock();
     let arenas = &mut *arenas;
-    let free = &mut arenas.free_system;
+    let session = memory_map::is_session_address(base);
+    let (next, free) = if session { (&mut arenas.next_session, &mut arenas.free_session) } else { (&mut arenas.next_system, &mut arenas.free_system) };
     free.push((base, top - base));
     free.sort_unstable();
     let mut index = 0;
@@ -104,8 +121,8 @@ fn release_system_image_range((base, top): (u64, u64)) {
         }
     }
     if let Some(&(last, length)) = free.last() {
-        if last + length == arenas.next_system {
-            arenas.next_system = last;
+        if last + length == *next {
+            *next = last;
             free.pop();
         }
     }
@@ -236,11 +253,14 @@ pub struct LoadOptions {
     pub skip_security_cookie: bool,
     pub image_name: Option<String>,
     pub notify_image: bool,
+    /// Imagem de sessão (MM_LOAD_IMAGE_IN_SESSION): VA de sessão, frames
+    /// mestres, mapeada na sessão corrente por `mm::session_image`.
+    pub session: bool,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { user_space: false, skip_imports: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true }
+        Self { user_space: false, skip_imports: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true, session: false }
     }
 }
 
@@ -348,7 +368,8 @@ pub struct PeImage {
     /// Frame da primeira página (as demais não são contíguas).
     pub physical_base: u64,
     pub preferred_base: u64,
-    /// Frames de uma imagem de usuário (vazio na de kernel).
+    /// Frames de uma imagem de usuário ou os frames mestres de uma imagem de
+    /// sessão (vazio na de kernel).
     pub pages: Vec<u64>,
     pub page_protects: Vec<u32>,
     pub sections: Vec<SectionInfo>,
@@ -532,6 +553,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         sections.push(SectionInfo { name, virtual_size: metadata.read_u32(header + 8)?, va: metadata.read_u32(header + 12)?, raw_size: metadata.read_u32(header + 16)?, characteristics: metadata.read_u32(header + 36)? });
     }
     let user_space = options.user_space;
+    let session = options.session && !user_space;
     let user_view = if user_space { options.user_view } else { None };
     let (view_offset, view_size) = user_view.map_or((0, size_of_image), |view| (view.offset, view.size));
     if let Some(view) = user_view {
@@ -591,7 +613,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             if reloc_rva == 0 && characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
                 return Err(KernelError::with_status("PE: imagem de kernel sem relocacoes", STATUS_CONFLICTING_ADDRESSES));
             }
-            let range = reserve_system_image_range(size_of_image)?;
+            let range = reserve_image_range(size_of_image, session)?;
             owned.system_range = Some(range);
             image_base = range.0;
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
@@ -685,8 +707,9 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         }
         let mut page_protects = Vec::new();
         // Mapeia a VA escolhida sobre os frames (PTEs de 4 KB; supervisor na
-        // imagem de kernel).
-        {
+        // imagem de kernel). A imagem de sessão só entra na sessão depois de
+        // pronta (`mm::session_image`).
+        if !session {
             let mut page = view_offset;
             while page < view_offset + view_size {
                 let backing = owned.frames[(page / 0x1000) as usize];
@@ -917,7 +940,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             exports,
             physical_base,
             preferred_base,
-            pages: if user_space { owned.frames.clone() } else { Vec::new() },
+            pages: if user_space || session { owned.frames.clone() } else { Vec::new() },
             page_protects,
             sections: sections.clone(),
             resolved_imports,
@@ -934,16 +957,31 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         Ok(mut image) => {
             image.owned = owned;
             let name = options.image_name.clone().unwrap_or_else(|| source.name().to_string());
+            // A imagem de sessão entra na sessão corrente antes do registro e
+            // das notificações, que a leem pela VA.
+            if session {
+                if let Err(error) = crate::ntos::mm::session_image::map_new(&image) {
+                    let _ = image.release();
+                    return Err(error);
+                }
+            }
             if !user_space {
-                let registered = loaded_images::register(loaded_images::ImageDescription { image_base: image.image_base, size_of_image, entry_point: image.entry_point, checksum: image.checksum, time_date_stamp: image.time_date_stamp, loader_flags: image.loader_flags, release_paging: Some(crate::ntos::mm::image_paging::release_image) }, &name);
+                // A residência das imagens de drivers (`image_paging`) é da
+                // janela de sistema; a imagem de sessão fica de fora.
+                let registered = loaded_images::register(loaded_images::ImageDescription { image_base: image.image_base, size_of_image, entry_point: image.entry_point, checksum: image.checksum, time_date_stamp: image.time_date_stamp, loader_flags: image.loader_flags, release_paging: if session { None } else { Some(crate::ntos::mm::image_paging::release_image) } }, &name);
                 match registered {
                     Ok(loaded) => {
-                        NATIVE_IMAGES.lock().insert(image.image_base, (size_of_image, image.sections.clone()));
-                        image.owned.native_base = Some(image.image_base);
+                        if !session {
+                            NATIVE_IMAGES.lock().insert(image.image_base, (size_of_image, image.sections.clone()));
+                            image.owned.native_base = Some(image.image_base);
+                        }
                         image.owned.registered = Some(loaded.id);
                         image.loaded_image = Some(loaded);
                     }
                     Err(error) => {
+                        if session {
+                            crate::ntos::mm::session_image::discard_new(&image);
+                        }
                         let _ = image.release();
                         return Err(error);
                     }
@@ -951,6 +989,9 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             }
             if options.notify_image {
                 if let Err(error) = notify_loaded(image.image_base, size_of_image, &name, source.clone(), !user_space, options.no_execute) {
+                    if session {
+                        crate::ntos::mm::session_image::discard_new(&image);
+                    }
                     let _ = image.release();
                     return Err(error);
                 }

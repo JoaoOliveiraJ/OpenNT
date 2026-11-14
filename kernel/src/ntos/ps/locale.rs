@@ -25,6 +25,11 @@ fn locale_cell(user_profile: bool) -> &'static AtomicU32 {
     if user_profile { &USER_LOCALE } else { &SYSTEM_LOCALE }
 }
 
+/// PsDefaultSystemLocaleId (o LocaleId de uma sessão nova).
+pub fn default_system_locale() -> u32 {
+    SYSTEM_LOCALE.load(Ordering::Acquire)
+}
+
 /// ZwQueryDefaultLocale(UserProfile, DefaultLocaleId*).
 pub fn query_default_locale(user_profile: bool, out: u64) -> u32 {
     // SAFETY: o PLCID de saída do chamador de kernel.

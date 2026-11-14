@@ -12,11 +12,18 @@
 //! executáveis e NX); o NonPagedPoolNx (0x200), o NonPagedPoolNxCacheAligned
 //! (0x204), o PagedPool e o resto ficam sem execução, no pool executivo NX
 //! ou na arena da janela do heap.
+//!
+//! Os tipos de sessão (`mm/session_pool.rs`): PagedPoolSession sai do heap
+//! da sessão corrente, em VA de sessão; NonPagedPoolSession, do pool não
+//! paginado global com a contabilidade da sessão; fora de uma sessão o
+//! pedido é recusado como os demais inválidos. Liberar uma VA de sessão que
+//! a sessão corrente não alocou para com BAD_POOL_CALLER (0, 0, endereço, 0).
 
 use crate::ntos::ke::{bugcheck, irql};
 use crate::ntos::mm::data_pool;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
+use crate::ntos::mm::{session, session_pool};
 use crate::rtl::KernelError;
 
 const RAISE_ON_ALLOCATION_FAILURE: u32 = 0x10;
@@ -34,9 +41,14 @@ fn reject(message: &str, pool_type: u32, bytes: u64, tag: u32) -> ! {
 /// (prefixo, sufixo, alinhamento) substitui as opções derivadas do tipo.
 pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, layout: Option<(u64, u64, u64)>) -> u64 {
     let base = pool_type & !(RAISE_ON_ALLOCATION_FAILURE | COLD_ALLOCATION | ZERO_ALLOCATION);
-    // Tipos reservados, de sessão e MustSucceed não são pools comuns.
-    if ![0, 1, 4, 5, 512, 516].contains(&base) {
+    // Tipos reservados e MustSucceed não são pools comuns; os de sessão são
+    // os comuns com SessionPoolMask.
+    let session_type = session_pool::is_session_type(base);
+    if ![0, 1, 4, 5, 512, 516].contains(&(base & !session_pool::SESSION_POOL_MASK)) {
         reject("unsupported or reserved POOL_TYPE", pool_type, bytes, tag);
+    }
+    if session_type && session::current() == 0 {
+        reject("session pool requested outside a session", pool_type, bytes, tag);
     }
     if tag == 0 {
         reject("pool tag must be nonzero", pool_type, bytes, tag);
@@ -49,6 +61,16 @@ pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, lay
         reject("pool allocation at invalid IRQL", pool_type, bytes, tag);
     }
     let (prefix_bytes, suffix_bytes, alignment) = layout.unwrap_or((0, 0, if base & 4 != 0 { 64 } else { 16 }));
+    if session_pool::is_paged_session_type(base) {
+        return match session_pool::allocate_paged(bytes, tag, alignment, pool_type & ZERO_ALLOCATION != 0) {
+            Some(Ok(pointer)) => pointer,
+            Some(Err(error)) => {
+                debug_print!("[pool] PagedPoolSession: {}", error);
+                0
+            }
+            None => reject("session pool requested outside a session", pool_type, bytes, tag),
+        };
+    }
     let options = AllocateOptions {
         paged: pageable,
         nx: pageable || base & 512 != 0,
@@ -61,7 +83,12 @@ pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, lay
         suffix_bytes,
     };
     match kernel_pool::allocate(bytes, options) {
-        Ok(pointer) => pointer,
+        Ok(pointer) => {
+            if session_type && pointer != 0 && !session_pool::track_nonpaged(pointer, bytes, tag) {
+                reject("session pool requested outside a session", pool_type, bytes, tag);
+            }
+            pointer
+        }
         Err(error) => reject(&alloc::format!("pool invariant failure: {error}"), pool_type, bytes, tag),
     }
 }
@@ -136,6 +163,14 @@ pub fn allocate_typed(pool_type: u32, bytes: u64, tag: u32, zero: bool) -> Resul
 /// executivo); a tag opcional só é conferida pelo pool que guarda o
 /// metadado.
 pub fn free(pointer: u64, tag: u64) -> Result<(), KernelError> {
+    if session::is_session_address(pointer) {
+        if let Err((code, [first, second, third, fourth])) = session_pool::free_paged(pointer) {
+            debug_print!("[pool] VA de sessao {:#x} liberada fora do heap da sessao corrente", pointer);
+            bugcheck::bug_check_ex(code, first, second, third, fourth);
+        }
+        return Ok(());
+    }
+    session_pool::untrack_nonpaged(pointer);
     if guest::in_arena(pointer) {
         guest::free_bytes(pointer);
     } else if data_pool::owns(pointer) {
