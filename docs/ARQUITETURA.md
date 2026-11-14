@@ -466,11 +466,12 @@ além da KUSER_SHARED_DATA:
   Dois processos com raiz própria usam a mesma VA sem conflito.
 - **VAD por processo** (`memory::Vad`, no `ProcessState` de cada EPROCESS):
   as alocações privadas, as vistas de seção e as imagens são do processo que
-  as criou. Os serviços agem sobre um `memory::Space`: os Nt* de usuário sobre
-  o processo corrente (o anexado, quando há attach), os Zw* sobre o processo
-  do handle, o NtMapViewOfSection sobre o processo alvo. NtQueryVirtualMemory,
-  NtFreeVirtualMemory e NtProtectVirtualMemory só enxergam o VAD do próprio
-  processo; o System guarda o que o kernel aloca no próprio contexto e as
+  as criou. Os serviços agem sobre um `memory::Space`, o do processo do
+  handle (o pseudo-handle é o corrente, o anexado quando há attach): os Nt*
+  de usuário, os Zw* e o NtMapViewOfSection (seção 4, memória entre
+  processos). NtQueryVirtualMemory, NtFreeVirtualMemory e
+  NtProtectVirtualMemory só enxergam o VAD do processo do handle; o System
+  guarda o que o kernel aloca no próprio contexto e as
   cópias de sistema da ntdll, do apiset e do NLS. O término do processo
   devolve o VAD inteiro (`memory::release_vad`, o MmCleanProcessAddressSpace),
   e a montagem de um processo novo roda anexada a ele, como o MmCreatePeb.
@@ -729,6 +730,30 @@ dereference e o PFN livre volta ao de antes.
     caminho da imagem do `ProcessState`; NtQueryInformationThread já lia a
     thread do handle (TEB e CLIENT_ID da ETHREAD).
   - Teste: `ntos/test/multiprocess/cross_handles.rs`.
+- **Memória entre processos** (`ps/user/memory.rs`, `mm/copy_virtual.rs`):
+  - NtAllocateVirtualMemory(Ex), NtFreeVirtualMemory e
+    NtProtectVirtualMemory (PROCESS_VM_OPERATION) e NtQueryVirtualMemory
+    (PROCESS_QUERY_INFORMATION) agem sobre o processo do handle
+    (`memory::with_process_handle`, o ObReferenceObjectByHandle em UserMode:
+    pseudo-handle, tabela de quem chama, direito ausente →
+    STATUS_ACCESS_DENIED, processo retido durante a operação). Os ponteiros
+    de quem chama (base, tamanho, proteção anterior, a saída da consulta) são
+    lidos e escritos no contexto dele, e o espaço alvo é editado pela raiz
+    dele (`Space::root`), sem anexar: o efeito do "captura, anexa, opera,
+    desanexa" do NT. NtMapViewOfSection e NtUnmapViewOfSection fazem o mesmo
+    (PROCESS_VM_OPERATION; a vista entra no VAD e na raiz do alvo).
+  - NtReadVirtualMemory/NtWriteVirtualMemory (PROCESS_VM_READ/
+    PROCESS_VM_WRITE) e o export MmCopyVirtualMemory passam por
+    `copy_virtual::copy_virtual_memory`: blocos de até 64 KB por um buffer de
+    kernel, anexado à origem para ler e ao destino para gravar
+    (`process_context::with_process`). Cada lado obedece às PTEs e ao modo
+    estrito do espaço anexado; a primeira página inacessível, de qualquer
+    lado, encerra com STATUS_PARTIAL_COPY e a contagem exata do que chegou ao
+    destino (o prefixo legível do bloco é gravado antes). Tamanho zero é
+    sucesso sem olhar o handle; em UserMode, faixas fora da metade de
+    usuário dão STATUS_ACCESS_VIOLATION; um processo terminado ou saindo dá
+    STATUS_PROCESS_IS_TERMINATING. Os blocos andam para a frente, como no NT.
+  - Teste: `ntos/test/multiprocess/cross_memory.rs`.
 - **Identidade do processo**: PID, PEB e cookie são os campos do EPROCESS
   corrente (`state::current_process_id`, `state::current_peb`, o
   `EPROCESS.Cookie`); o caminho da imagem, a PEB_LDR_DATA do kernel e os
@@ -836,7 +861,9 @@ dereference e o PFN livre volta ao de antes.
   processo (`create::finish_exit`, de qualquer contexto), a criação
   do processo (`ps/create.rs`: imagem, PEB, parâmetros, TEB e o CONTEXT
   inicial, e as notificações de carga de imagem do executável e da ntdll,
-  com o PID dele) e a criação de workers de fábrica (já era). A
+  com o PID dele), a criação de workers de fábrica (já era) e cada lado da
+  cópia do MmCopyVirtualMemory (a leitura anexada à origem, a gravação ao
+  destino). A
   notificação de carga de imagem do loader do kernel vem depois de a imagem
   entrar no VAD do processo, onde os callbacks a leem.
   As entregas que a thread recebe numa espera sondada (pacotes de conclusão,

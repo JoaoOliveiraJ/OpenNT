@@ -147,8 +147,10 @@ pub fn committed_bytes(info: &Info) -> u64 {
     }
 }
 
-/// O syscall de usuário NtQueryVirtualMemory (processo corrente).
-pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer_va: u64, user_rsp: u64) -> Result<u32, KernelError> {
+/// O syscall de usuário NtQueryVirtualMemory, sobre o VAD e a raiz do
+/// processo do handle (PROCESS_QUERY_INFORMATION); as saídas vão para o
+/// chamador.
+pub fn query_virtual_memory(process: u64, base_va: u64, info_class: u64, buffer_va: u64, user_rsp: u64) -> Result<u32, KernelError> {
     let class = info_class as u32;
     let length = state::stack_arg(user_rsp, 5);
     let return_length = state::stack_arg(user_rsp, 6);
@@ -174,8 +176,15 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
         }
         0
     };
-    let context = Context::current();
-    let info = describe(base_va, &context);
+    super::memory::with_process_handle(process, super::memory::PROCESS_QUERY_INFORMATION, |target| {
+        let context = Context::of(Space::of(target));
+        let info = describe(base_va, &context);
+        format(class, &info, &context, buffer_va, length, &prepare)
+    })
+}
+
+/// Grava a resposta da classe na memória do chamador.
+fn format(class: u32, info: &Info, context: &Context, buffer_va: u64, length: u64, prepare: &dyn Fn(u64) -> u32) -> Result<u32, KernelError> {
     state::guarded(|| match class {
         0 => {
             let status = prepare(0x30);
@@ -224,7 +233,7 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
             information.allocation_protect.probe_set(info.allocation_protect)?;
             information.region_type.probe_set(kind)?;
             information.region_size.probe_set(region.size())?;
-            information.commit_size.probe_set(committed_bytes(&info))?;
+            information.commit_size.probe_set(committed_bytes(info))?;
             if need == MemoryRegionInformation::SIZE {
                 information.partition_id.probe_set(0)?;
                 information.node_preference.probe_set(0)?;
@@ -244,7 +253,7 @@ pub fn query_virtual_memory(_process: u64, base_va: u64, info_class: u64, buffer
             while offset < length {
                 let entry = state::user_struct::<MemoryWorkingSetExInformation>(buffer_va + offset)?;
                 let va = entry.virtual_address.probe_get()?;
-                let page = describe(va, &context);
+                let page = describe(va, context);
                 let valid = va < MAX_USER && context.translate(va) != 0;
                 // VirtualAttributes: Valid e Win32Protection.
                 entry.virtual_attributes.probe_set(if valid { 1 + page.protect as u64 * 16 } else { 0 })?;

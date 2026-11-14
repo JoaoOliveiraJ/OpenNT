@@ -15,10 +15,17 @@
 //!
 //! Posse: cada EPROCESS tem o seu VAD (`Vad`, no `ProcessState` dele), com as
 //! alocações privadas, as vistas de seção e as imagens que ele mapeou. Os
-//! serviços agem sobre um `Space`: os Nt* de usuário sobre o processo
-//! corrente (o anexado, quando há attach), os Zw* sobre o processo do handle;
-//! o System guarda o que o kernel aloca no próprio contexto (DriverEntry,
-//! threads de sistema) e as cópias de sistema da ntdll, do apiset e do NLS.
+//! serviços agem sobre um `Space`: os Nt* de usuário e os Zw* sobre o
+//! processo do handle (o pseudo-handle é o corrente, o anexado quando há
+//! attach), com o acesso que o NT exige do handle de usuário
+//! (`with_process_handle`: PROCESS_VM_OPERATION para alocar, liberar e
+//! reproteger, PROCESS_QUERY_INFORMATION para consultar, PROCESS_VM_READ e
+//! PROCESS_VM_WRITE para as cópias de `mm/copy_virtual`); o System guarda o
+//! que o kernel aloca no próprio contexto (DriverEntry, threads de sistema) e
+//! as cópias de sistema da ntdll, do apiset e do NLS. Sobre outro processo,
+//! os ponteiros do chamador (base, tamanho, proteção anterior) são lidos e
+//! escritos no contexto dele, e o espaço alvo é editado pela raiz dele, sem
+//! anexar: o efeito do "captura, anexa, opera, desanexa" do NT.
 //! Consultas, liberações e trocas de proteção só enxergam o VAD do
 //! espaço; o término do processo devolve o VAD inteiro (`release_vad`), como
 //! o MmCleanProcessAddressSpace. O VAD também decide a posse no modo
@@ -58,7 +65,9 @@ use crate::hal::physical;
 use crate::ntos::mm::memory_map::{self as map, USER_ADDRESS_LIMIT};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
+use crate::ntos::mm::copy_virtual;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
+use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::ntos::ke::context_switch;
 use crate::ntos::ps::process;
@@ -73,6 +82,14 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_TOP_DOWN: u32 = 0x10_0000;
 /// O processo do espaço já passou pelo término (sem VAD).
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// Direitos de acesso do handle de processo que os serviços exigem.
+const PROCESS_VM_OPERATION: u32 = 0x8;
+const PROCESS_VM_READ: u32 = 0x10;
+const PROCESS_VM_WRITE: u32 = 0x20;
+pub const PROCESS_QUERY_INFORMATION: u32 = 0x400;
+/// PreviousMode dos serviços de usuário.
+const USER_MODE: u8 = 1;
 /// Limite exclusivo das alocações de usuário (MM_HIGHEST_VAD_ADDRESS + 1).
 pub const USER_ALLOCATION_TOP: u64 = map::HIGHEST_VAD_ADDRESS + 1;
 
@@ -657,18 +674,35 @@ pub fn release_private_copies(root: u64, pages: Vec<(u64, u64)>) {
     }
 }
 
-/// NtAllocateVirtualMemory(process, base*, zeroBits, size*, type, protect).
-pub fn nt_allocate_virtual_memory(_process: u64, base_pointer: u64, _zero_bits: u64, size_pointer: u64, user_rsp: u64) -> Result<u32, KernelError> {
+/// O processo do handle de um serviço de usuário com o acesso pedido (o
+/// ObReferenceObjectByHandle(PsProcessType) em UserMode: o pseudo-handle é o
+/// processo corrente, um handle precisa ser da tabela do corrente e ter
+/// `desired`, senão STATUS_ACCESS_DENIED), retido enquanto `body` age sobre
+/// ele. Um processo terminado ou saindo dá STATUS_PROCESS_IS_TERMINATING.
+pub fn with_process_handle(handle: u64, desired: u32, body: impl FnOnce(u64) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
+    let process = match section_handles::reference(handle, Kind::Process, desired, USER_MODE) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    let result = if process.process_terminating() { Ok(STATUS_PROCESS_IS_TERMINATING) } else { body(process.pointer) };
+    process.release()?;
+    result
+}
+
+/// NtAllocateVirtualMemory(process, base*, zeroBits, size*, type, protect),
+/// no processo do handle (PROCESS_VM_OPERATION).
+pub fn nt_allocate_virtual_memory(process: u64, base_pointer: u64, _zero_bits: u64, size_pointer: u64, user_rsp: u64) -> Result<u32, KernelError> {
     let allocation_type = state::stack_arg32(user_rsp, 5);
     let protect = state::stack_arg32(user_rsp, 6);
     // Os ponteiros de saída são acessados por cópias sondadas.
-    state::guarded(|| do_user_allocate(base_pointer, size_pointer, allocation_type, protect, 0, 0, map::ALLOCATION_GRANULARITY))
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| allocate_in(Space::of(target), base_pointer, size_pointer, allocation_type, protect, 0, 0, map::ALLOCATION_GRANULARITY)))
 }
 
 /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*,
-/// count): sem ZeroBits; MEM_ADDRESS_REQUIREMENTS honrado; PartitionHandle
-/// recusado pelo syscall nativo mesmo válido.
-pub fn nt_allocate_virtual_memory_ex(_process: u64, base_pointer: u64, size_pointer: u64, allocation_type: u64, user_rsp: u64) -> Result<u32, KernelError> {
+/// count), no processo do handle (PROCESS_VM_OPERATION): sem ZeroBits;
+/// MEM_ADDRESS_REQUIREMENTS honrado; PartitionHandle recusado pelo syscall
+/// nativo mesmo válido.
+pub fn nt_allocate_virtual_memory_ex(process: u64, base_pointer: u64, size_pointer: u64, allocation_type: u64, user_rsp: u64) -> Result<u32, KernelError> {
     let (parameters, count) = (state::stack_arg(user_rsp, 6), state::stack_arg32(user_rsp, 7) as u64);
     // BaseAddress, RegionSize e o vetor de MEM_EXTENDED_PARAMETER são
     // acessados por cópias sondadas.
@@ -676,7 +710,8 @@ pub fn nt_allocate_virtual_memory_ex(_process: u64, base_pointer: u64, size_poin
         // Diagnóstico: endereços de retorno na pilha de usuário.
         debug_print!("[usermode] allocEx tamanho zero chamado de 0x{:x} caller2=0x{:x} sizePtr=0x{:x}", guest::try_read::<u64>(user_rsp).unwrap_or(0), guest::try_read::<u64>(user_rsp + 0x90).unwrap_or(0), size_pointer);
     }
-    state::guarded(|| allocate_ex_in(Space::current(), base_pointer, size_pointer, allocation_type as u32, state::stack_arg32(user_rsp, 5), parameters, count))
+    let protect = state::stack_arg32(user_rsp, 5);
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| allocate_ex_in(Space::of(target), base_pointer, size_pointer, allocation_type as u32, protect, parameters, count)))
 }
 
 /// NtAllocateVirtualMemoryEx no espaço dado: MEM_ADDRESS_REQUIREMENTS
@@ -712,11 +747,11 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
     allocate_in(space, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
 }
 
-/// NtFreeVirtualMemory: MEM_DECOMMIT desmapeia a subfaixa (a região fica
-/// reservada); MEM_RELEASE libera a região privada inteira; seções usam
-/// UnmapView.
-pub fn nt_free_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, free_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| free_in(Space::current(), base_pointer, size_pointer, free_type as u32))
+/// NtFreeVirtualMemory, no processo do handle (PROCESS_VM_OPERATION):
+/// MEM_DECOMMIT desmapeia a subfaixa (a região fica reservada); MEM_RELEASE
+/// libera a região privada inteira; seções usam UnmapView.
+pub fn nt_free_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, free_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| free_in(Space::of(target), base_pointer, size_pointer, free_type as u32)))
 }
 
 /// MEM_RESET: a faixa (arredondada a páginas) tem de estar comitada numa
@@ -791,12 +826,14 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
     Ok(0)
 }
 
-/// NtProtectVirtualMemory(process, base*, size*, newProtect, oldProtect*):
-/// cobre qualquer VA de usuário mapeada (a ntdll protege as próprias seções
-/// da imagem); falha de política devolve PAGE_NOACCESS no OldProtect sem
-/// tocar base, tamanho ou PTEs.
-pub fn nt_protect_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, new_protect: u64, user_rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| protect_in(Space::current(), base_pointer, size_pointer, new_protect as u32, state::stack_arg(user_rsp, 5), true))
+/// NtProtectVirtualMemory(process, base*, size*, newProtect, oldProtect*),
+/// no processo do handle (PROCESS_VM_OPERATION): cobre qualquer VA de
+/// usuário mapeada (a ntdll protege as próprias seções da imagem); falha de
+/// política devolve PAGE_NOACCESS no OldProtect sem tocar base, tamanho ou
+/// PTEs.
+pub fn nt_protect_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, new_protect: u64, user_rsp: u64) -> Result<u32, KernelError> {
+    let old_pointer = state::stack_arg(user_rsp, 5);
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| protect_in(Space::of(target), base_pointer, size_pointer, new_protect as u32, old_pointer, true)))
 }
 
 /// Troca a proteção no espaço dado; ponteiros de modo usuário são sondados.
@@ -877,63 +914,47 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     Ok(0)
 }
 
-/// Transferências nativas obedecem às PTEs de usuário: nenhuma identidade de
-/// supervisor contorna uma página inacessível; cópia por blocos que não
-/// cruzam páginas, preservando faixas sobrepostas.
+/// NtReadVirtualMemory/NtWriteVirtualMemory(process, address, buffer, size,
+/// transferred*): a cópia entre `address` no processo do handle
+/// (PROCESS_VM_READ na leitura, PROCESS_VM_WRITE na gravação) e `buffer` no
+/// processo corrente, por `mm/copy_virtual` em UserMode. As duas faixas
+/// precisam caber até MmHighestUserAddress, sem dar a volta
+/// (STATUS_ACCESS_VIOLATION); tamanho zero devolve sucesso sem olhar o
+/// handle, como no NT. O buffer do chamador é sondado inteiro antes, no
+/// espaço dele; as páginas do alvo obedecem às PTEs dele, e a primeira
+/// inacessível dá STATUS_PARTIAL_COPY com a contagem exata. A contagem vai
+/// para `transferred` mesmo na falha; uma saída que falha não muda o status.
 fn transfer_virtual_memory(process: u64, address: u64, buffer: u64, size: u64, rsp: u64, write: bool) -> Result<u32, KernelError> {
     if !state::probe_syscall_stack(rsp, 8) {
-        return Ok(0xC000_0005);
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let fits = |start: u64| start.checked_add(size).is_some_and(|end| end <= map::HIGHEST_USER_ADDRESS);
+    if !fits(address) || !fits(buffer) {
+        return Ok(STATUS_ACCESS_VIOLATION);
     }
     let transferred = state::stack_arg(rsp, 5);
     if transferred != 0 && !state::probe_user_write(transferred, 8) {
-        return Ok(0xC000_0005);
+        return Ok(STATUS_ACCESS_VIOLATION);
     }
-    if size > MAX_SAFE || address > MAX_SAFE || address + size > USER_ADDRESS_LIMIT || buffer > MAX_SAFE || buffer + size > USER_ADDRESS_LIMIT {
-        return Ok(0xC000_0005);
-    }
-    if process != u64::MAX {
-        let Some(entry) = state::get_user_handle(process) else { return Ok(0xC000_0008) };
-        if entry.kind() != "process" {
-            return Ok(0xC000_0024);
-        }
-        if entry.access() & if write { 0x20 } else { 0x10 } == 0 {
-            return Ok(0xC000_0022);
-        }
-        if entry.object.callback_data().process_id != Some(state::current_process_id()) {
-            return Ok(0xC000_00BB);
-        }
-    }
-    if !(if write { state::probe_user_read(buffer, size) } else { state::probe_user_write(buffer, size) }) {
-        return Ok(0xC000_0005);
-    }
-    let (source, target) = if write { (buffer, address) } else { (address, buffer) };
-    let mut accessible = 0u64;
-    while accessible < size {
-        let at = address + accessible;
-        let count = (size - accessible).min(PAGE - at % PAGE);
-        if !(if write { state::probe_user_write(at, count) } else { state::probe_user_read(at, count) }) {
-            break;
-        }
-        accessible += count;
-    }
-    let backwards = target > source && target < source + accessible;
-    let mut done = 0u64;
-    while done < accessible {
-        let source_edge = source + if backwards { accessible - done } else { done };
-        let target_edge = target + if backwards { accessible - done } else { done };
-        let source_span = if backwards { match source_edge % PAGE { 0 => PAGE, rest => rest } } else { PAGE - source_edge % PAGE };
-        let target_span = if backwards { match target_edge % PAGE { 0 => PAGE, rest => rest } } else { PAGE - target_edge % PAGE };
-        let count = (accessible - done).min(source_span).min(target_span);
-        let offset = if backwards { accessible - done - count } else { done };
-        let block = physical::read_bytes(paging::translate(source + offset), count as usize);
-        physical::write_bytes(paging::translate(target + offset), &block);
-        done += count;
-    }
+    let mut copied = 0;
+    let status = if size == 0 {
+        0
+    } else {
+        with_process_handle(process, if write { PROCESS_VM_WRITE } else { PROCESS_VM_READ }, |target| {
+            if !(if write { state::probe_user_read(buffer, size) } else { state::probe_user_write(buffer, size) }) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            let current = process::get_current_process();
+            let (status, bytes) = if write { copy_virtual::copy_virtual_memory(current, buffer, target, address, size, USER_MODE)? } else { copy_virtual::copy_virtual_memory(target, address, current, buffer, size, USER_MODE)? };
+            copied = bytes;
+            Ok(status)
+        })?
+    };
     // SIZE_T *NumberOfBytesTransferred (sondado acima).
-    if transferred != 0 && guest::try_write::<u64>(transferred, done).is_err() {
-        return Ok(0xC000_0005);
+    if transferred != 0 {
+        let _ = guest::try_write::<u64>(transferred, copied);
     }
-    Ok(if done == size { 0 } else { 0x8000_000D })
+    Ok(status)
 }
 
 pub fn nt_read_virtual_memory(process: u64, address: u64, buffer: u64, size: u64, rsp: u64) -> Result<u32, KernelError> {

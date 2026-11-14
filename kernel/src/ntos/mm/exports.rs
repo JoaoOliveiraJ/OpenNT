@@ -721,3 +721,23 @@ pub mod vf_device_verification {
         data_exports: &[],
     };
 }
+
+pub mod copy_virtual {
+    //! MmCopyVirtualMemory; a lógica mora em `mm/copy_virtual`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::mm::copy_virtual;
+    use crate::rtl::KernelError;
+
+    /// MmCopyVirtualMemory(FromProcess, FromAddress, ToProcess, ToAddress,
+    /// BufferSize, PreviousMode, NumberOfBytesCopied*).
+    fn copy_virtual_memory(call: &Call) -> Result<u64, KernelError> {
+        let (status, copied) = copy_virtual::copy_virtual_memory(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u8)?;
+        // SAFETY: o SIZE_T de saída do chamador de kernel.
+        unsafe { Field::<u64>::at(call.arg(7)) }.set(copied);
+        Ok(signed_status(status))
+    }
+
+    pub static GROUP: Group = Group { name: "copy-virtual", names: &["MmCopyVirtualMemory"], handlers: &[copy_virtual_memory], data_exports: &[] };
+}

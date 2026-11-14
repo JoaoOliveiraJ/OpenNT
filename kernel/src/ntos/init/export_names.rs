@@ -296,6 +296,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("vf-device-verification", 1594, 3),
     ("vsl-secure-pci", 1597, 3),
     ("whea-error-source", 1600, 10),
+    ("copy-virtual", 1610, 1),
 ];
 
 /// Os 1114 exports de função, na ordem da ABI.
@@ -1910,4 +1911,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "WheaReportHwError",
     "WheaReportHwErrorDeviceDriverEx",
     "WheaUnconfigureErrorSource",
+    "MmCopyVirtualMemory",
 ];
