@@ -987,9 +987,10 @@ dereference e o PFN livre volta ao de antes.
   chamador antes de agir: o PS_CREATE_INFO (`inc/types/wdk.rs::PsCreateInfo`,
   0x58 bytes do 19041, com as vistas por estado), a PS_ATTRIBUTE_LIST copiada
   uma vez (honra ImageName, ParentProcess com PROCESS_CREATE_PROCESS,
-  PriorityClass e as saídas ClientId, TebAddress e ImageInfo; recusa com
-  STATUS_NOT_SUPPORTED DebugObject, Token, ProtectionLevel, SecureProcess,
-  JobList e UmsThread; aceita sem efeito, no log, os demais que o kernel32
+  PriorityClass, ProtectionLevel (o processo novo recebe o PS_PROTECTION
+  pedido se quem cria for protegido e o dominar) e as saídas ClientId,
+  TebAddress e ImageInfo; recusa com STATUS_NOT_SUPPORTED DebugObject,
+  Token, SecureProcess, JobList e UmsThread; aceita sem efeito, no log, os demais que o kernel32
   passa; número desconhecido, repetido ou tamanho errado dão
   STATUS_INVALID_PARAMETER), o RTL_USER_PROCESS_PARAMETERS normalizado ou não
   (`process_parameters::capture`: a estrutura copiada até o Length, cada
@@ -998,7 +999,11 @@ dereference e o PFN livre volta ao de antes.
   OBJECT_ATTRIBUTES (sem nome; OBJ_INHERIT vai para o handle) e as flags
   (as PROCESS_CREATE_FLAGS_* que pedem outro tipo de processo dão
   STATUS_NOT_SUPPORTED; INHERIT_HANDLES vira o `inherit_handles_from` do
-  pedido: o pai declarado no ParentProcess ou, sem ele, quem chama). Depois o
+  pedido: o pai declarado no ParentProcess ou, sem ele, quem chama; a
+  herança copia as linhas OBJ_INHERIT das duas tabelas do pai, a de usuário
+  e a do Object Manager, com os mesmos valores; CREATE_SESSION abre uma
+  sessão nova, `mm/session.rs`, e sem ela o processo entra na sessão do
+  pai). Depois o
   caminho único cria o processo, `start_created` o põe no despachante, os
   handles do processo e da thread entram na tabela de quem chamou com o
   acesso pedido (genéricos mapeados, MAXIMUM_ALLOWED como o total do tipo) e
@@ -1066,6 +1071,47 @@ dereference e o PFN livre volta ao de antes.
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois
     file systems sintéticos.
+- **Cadeia smss -> csrss real** (`--initial-process=smss`,
+  `init/boot_config.rs::SMSS_BOOT`): o primeiro processo de usuário é o
+  `\SystemRoot\System32\smss.exe` real (`init/initial_process.rs`), criado
+  pelo caminho único com PS_PROTECTION WinTcb-Light (0x61) e
+  BreakOnTermination, com a ntdll real. O build põe no volume os binários da
+  cadeia (smss, csrss, csrsrv, basesrv, winsrv, sxssrv, npfs.sys, msfs.sys e
+  as DLLs que eles importam), e o kernel semeia o Registro que eles leem: a
+  chave Session Manager (`cm/session_manager.rs`: SubSystems com a linha do
+  csrss, KnownDLLs, DOS Devices, Environment; sem Kmode, BootExecute nem
+  arquivos de paginação), os serviços Npfs e Msfs e o
+  `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID
+  (`cm/hw_description.rs`). Nesse boot ficam desligados a imitação do csrss
+  (`ps/user/csr.rs`), o `\KnownDlls` montado pelo kernel, o provisionamento
+  de KnownDlls de `mm/section/open.rs` e o multi-sz de KnownDLLs que o
+  kernel semeava: o próprio smss monta o `\KnownDlls`, os DosDevices,
+  `\Sessions` e os prefixos protegidos dos pipes e mailslots. O smss é
+  servidor ALPC: `alpc/server.rs` é o lado servidor das portas de usuário
+  (NtAlpcCreatePort com nome, a conexão que espera a decisão do servidor no
+  NtAlpcAcceptConnectPort, pedidos e respostas pelo MessageId,
+  NtAlpcOpenSenderProcess/Thread), com o aviso na IOCP associada, que o
+  thread pool da ntdll consome; o tick sonda as esperas de usuário paradas
+  mesmo quando nenhuma thread de usuário está pronta
+  (`ps/user/threads.rs::refresh_waiting`), porque o cliente que põe o pedido
+  na fila do servidor para logo em seguida. O smss da sessão nasce por
+  NtCreateUserProcess numa sessão nova, herda as seções do pai pelos
+  mesmos valores, conecta-se ao `\SmApiPort` e cria o csrss.exe
+  (protegido e crítico, ProcessBreakOnTermination em
+  `ps/set_process_information.rs`). Serviços que essa cadeia pede e que
+  moram no componente de cada um: NtAdjustPrivilegesToken
+  (`se/token/adjust.rs`), NtSerializeBoot (`io/pnp.rs`), a
+  ProcessSessionInformation, a SystemManufacturingInformation e a
+  SystemSupportedProcessorArchitectures (`ex/`), NtCreateDirectoryObject,
+  NtCreateSymbolicLinkObject, NtSetSecurityObject (também sobre os
+  pseudo-handles de processo e thread), a ObjectSessionObjectInformation
+  do NtSetInformationObject e a duplicação de handles do Object Manager
+  (com DUPLICATE_NO_RIGHTS_UPGRADE). O marcador `SMSS_CSRSS_OK` sai quando o csrss.exe criado
+  por um smss pede o primeiro serviço do win32k
+  (`ex/service_table.rs::out_of_range` -> `initial_process::win32k_requested`)
+  com o smss inicial e o csrss vivos. Hoje o csrss vai até carregar o
+  basesrv.dll e para na inicialização dele (a SystemTimeOfDayInformation
+  ainda não tem resposta), antes do winsrv e do win32k.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
@@ -1100,6 +1146,9 @@ dereference e o PFN livre volta ao de antes.
   NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,
   `[shell] pronto`, `FILE_SYSTEM_MOUNT_OK name=<serviço>` (um arquivo do
   volume aberto e lido pelo file system real iniciado com `--start-driver`);
+  `[shell] pronto`, `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
+  csrss.exe real criado pelo smss.exe real chega ao win32k;
+  `cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1`);
   os de falha são `*** PANIC`, `*** EXCECAO` e `SELFTEST FALHOU`.
 
 ## 6. Documentação e status

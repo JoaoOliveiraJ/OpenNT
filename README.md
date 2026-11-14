@@ -168,6 +168,9 @@ cargo xtask test-boot KERNEL_RS_OK 120000 "--keys=run hello\nps\n" "--expect== 4
 cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 "--expect=name=watchdog state=4 win32=0"
 cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=DXGKrnl --build-dir=build/dxgkrnl --smp=1 "--expect=name=DXGKrnl state=4 win32=0"
 
+# O smss.exe real como primeiro processo, até o csrss.exe que ele cria.
+cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1
+
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
 ```
@@ -179,7 +182,10 @@ do caminho de escrita do disco, com leitores em outras CPUs, e imprime
 integridade de código ativa, e imprime `DRIVER_START_COMPLETED`),
 `--trace-driver-api` (mostra cada chamada de API do driver enquanto ele inicia:
 objetos abertos, rotinas pedidas ao `MmGetSystemRoutineAddress`, valores do
-Registro e texto formatado).
+Registro e texto formatado), `--initial-process=smss` (o primeiro processo de
+usuário passa a ser o smss.exe real, que monta a sessão e cria o csrss.exe; o
+build põe no volume os binários dessa cadeia e o kernel deixa de montar o
+`\KnownDlls` e de imitar o csrss).
 Opções de máquina: `--accel=tcg|whpx`,
 `--memory-mb=N` (padrão 4096), `--smp=N` (padrão 4). Em `--keys`, `\n` digita
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar
