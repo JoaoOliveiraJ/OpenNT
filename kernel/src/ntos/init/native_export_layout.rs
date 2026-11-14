@@ -4,11 +4,12 @@
 //! têm corpo real fora da tabela fixa de despachantes de dez bytes.
 
 /// (export, símbolo, primitiva que devolve a entrada, índice).
-pub const NATIVE_EXPORTS: [(&str, &str, &str, u32); 4] = [
+pub const NATIVE_EXPORTS: [(&str, &str, &str, u32); 5] = [
     ("__chkstk", "probe_kernel_stack", "getKernelStackProbeEntry", 0),
     ("DbgPrompt", "dbg_prompt", "getDebugPromptEntry", 0),
     ("PsSetContextThread", "ps_set_context_thread", "getContextOperationEntry", 2),
     ("ObFindHandleForObject", "ob_find_handle_for_object", "getFindHandleEntry", 0),
+    ("sqrtf", "crt_sqrtf", "getCrtSqrtfEntry", 0),
 ];
 
 pub fn lookup(name: &str) -> Option<(&'static str, &'static str, u32)> {

@@ -107,6 +107,18 @@ pub fn debug_print_with_prefix(prefix: u64, format: u64, va_list: u64) -> Result
     Ok(())
 }
 
+/// vDbgPrintEx(ComponentId, Level, Format, arglist): o DbgPrintEx com a
+/// va_list (no NT, vDbgPrintExWithPrefixInternal com prefixo vazio); o
+/// componente vai no prefixo, como no DbgPrintEx, e o nível ainda não
+/// filtra. Devolve STATUS_SUCCESS.
+pub fn debug_print_ex_va(component_id: u32, format: u64, va_list: u64) -> Result<u32, KernelError> {
+    let mut arguments = guest_strings::guest_format_arguments(va_list);
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut arguments, false)?;
+    let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(&text);
+    debug_print!("[driver:{}] {}", component_id, text);
+    Ok(0)
+}
+
 // ---- sprintf_s e vsprintf_s (crt-formatting) -------------------------------
 //
 // Contrato do original (vsprintf_s -> soutput_s -> output_s): Buffer,

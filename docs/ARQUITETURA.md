@@ -54,8 +54,9 @@ kernel/src/
 │   ├── cm/            Registry
 │   │   ├── key/       chaves e serviços Nt/Zw de chave
 │   │   └── service/   serviços e drivers (base, canal, RPC)
-│   ├── rtl/           a Rtl do NT: strings, Unicode, AVL, bitmap, exceções, imagens PE
-│   │   └── resource/  recursos de imagens (ldrrsrc)
+│   ├── rtl/           a Rtl do NT: strings, Unicode, páginas de código, AVL, bitmap,
+│   │   │              exceções, imagens PE, tabelas de átomos (atom), heap (heap)
+│   │   └── resource/  recursos de imagens (ldrrsrc) e tabelas de mensagens
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── po/ etw/ kd/ dbgk/ fsrtl/
 │   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs;
@@ -677,6 +678,20 @@ dereference e o PFN livre volta ao de antes.
   mudado em operações longas, como um volume NTFS, fica atrás de
   `SharedLock`, o papel do ERESOURCE: leituras compartilhadas, mutações
   exclusivas, readquirível por quem já o possui.
+- **Átomos e heap do Rtl** (`rtl/atom.rs`, `rtl/heap.rs`): a tabela de
+  átomos é a `_RTL_ATOM_TABLE` real em pool (assinatura, push lock, baldes,
+  entradas com contagem e fixação); só o índice de handle de cada átomo de
+  string (0xC000 | índice) mora num registro do OpenNT por tabela, no lugar
+  da tabela de handles. O heap segue os dois caminhos de criação do
+  RtlCreateHeap: o heap fixo (HEAP_CREATE_SEGMENT_HEAP, o desktop heap do
+  win32k) sobre a memória do chamador, com cada página nova confirmada pela
+  CommitRoutine de RTL_HEAP_PARAMETERS, e o heap NT (memória do processo
+  corrente ou do chamador, Lock, segmentos novos do HEAP_GROWABLE, exceção
+  STATUS_NO_MEMORY com HEAP_GENERATE_EXCEPTIONS). O handle é o HeapBase,
+  com o cabeçalho e as assinaturas reais; a contabilidade dos blocos (16 em
+  16 bytes, alinhados a 16) fica fora da memória do heap, num registro do
+  OpenNT, e a CommitRoutine é chamada sem nenhuma trava do Rust retida.
+  Teste: `ntos/test/rtl_atom_heap_nls.rs`.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por

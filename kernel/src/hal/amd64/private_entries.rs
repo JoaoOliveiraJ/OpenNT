@@ -258,6 +258,16 @@ opennt_dbg_prompt_interrupt:
     int3
     ret
 
+# sqrtf público (CRT): argumento e resultado em XMM0. O sqrtf do ntoskrnl
+# 19041 desvia NaN e negativos para o tratamento de erro da CRT, que com as
+# exceções de ponto flutuante mascaradas devolve o mesmo valor que o SQRTSS
+# (NaN silenciado; 0xFFC00000 para negativo); o resto é o próprio SQRTSS.
+.balign 16
+.global opennt_crt_sqrtf
+opennt_crt_sqrtf:
+    sqrtss xmm0, xmm0
+    ret
+
 .popsection
 "#
 );
@@ -271,6 +281,7 @@ extern "C" {
     static opennt_ob_find_handle_filter: u8;
     static opennt_ob_find_handle_for_object: u8;
     static opennt_dbg_prompt: u8;
+    static opennt_crt_sqrtf: u8;
     static opennt_probe_kernel_stack: u8;
     static opennt_mm_get_image_file_signature_information: u8;
     static opennt_iop_csq_cancel_routine: u8;
@@ -304,6 +315,7 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "ObpFindHandleForObject" => core::ptr::addr_of!(opennt_ob_find_handle_filter),
             "ob_find_handle_for_object" => core::ptr::addr_of!(opennt_ob_find_handle_for_object),
             "dbg_prompt" => core::ptr::addr_of!(opennt_dbg_prompt),
+            "crt_sqrtf" => core::ptr::addr_of!(opennt_crt_sqrtf),
             "probe_kernel_stack" => core::ptr::addr_of!(opennt_probe_kernel_stack),
             "MmGetImageFileSignatureInformation" => core::ptr::addr_of!(opennt_mm_get_image_file_signature_information),
             "IopCsqCancelRoutine" => core::ptr::addr_of!(opennt_iop_csq_cancel_routine),

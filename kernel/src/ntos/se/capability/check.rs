@@ -197,3 +197,18 @@ pub fn check(handle: u64, name: u64, output: u64) -> Result<u32, KernelError> {
     telemetry?;
     Ok(status)
 }
+
+/// RtlCapabilityCheckForSingleSessionSku(TokenHandle, CapabilityName,
+/// &HasCapability) no ntoskrnl 19041 (0x9136a0): HasCapability NULL =
+/// STATUS_INVALID_PARAMETER; num SKU multissessão (RtlIsMultiSessionSku) a
+/// resposta é FALSE sem consultar nada; senão é o RtlCapabilityCheck.
+pub fn check_for_single_session_sku(handle: u64, name: u64, output: u64) -> Result<u32, KernelError> {
+    if output == 0 {
+        return Ok(0xC000_000D);
+    }
+    if policy::is_multi_session() != 0 {
+        out::<u8>(output).set(0);
+        return Ok(0);
+    }
+    check(handle, name, output)
+}

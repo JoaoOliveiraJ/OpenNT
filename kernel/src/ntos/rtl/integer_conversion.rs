@@ -243,3 +243,36 @@ pub fn integer_to_unicode(value: u32, base: u32, length: i32, output: u64) -> u3
     guest::write_bytes(output, &digits);
     0
 }
+
+/// RtlIntegerToChar(Value, Base, OutputLength, String) no ntoskrnl 19041
+/// (0x6f6fe0): a versão de bytes do RtlIntegerToUnicode, com os dígitos de
+/// RtlpIntegerChars ("0123456789ABCDEF"). OutputLength negativo preenche
+/// com '0' até |OutputLength| (o preenchimento é gravado antes da checagem
+/// de espaço) e não termina; positivo termina com NUL quando sobra espaço;
+/// dígitos além do limite = STATUS_BUFFER_OVERFLOW; base fora de 0/2/8/10/16
+/// = STATUS_INVALID_PARAMETER.
+pub fn integer_to_char(value: u32, base: u32, length: i32, output: u64) -> u32 {
+    let Some(text) = integer_text(value, base) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let count = text.len() as i32;
+    let mut output = output;
+    let mut limit = length;
+    if length < 0 {
+        limit = length.wrapping_neg();
+        if count < limit {
+            guest::write_bytes(output, &alloc::vec![b'0'; (limit - count) as usize]);
+            output += (limit - count) as u64;
+            limit = count;
+        }
+    }
+    if count > limit {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    let mut digits = text.into_bytes();
+    if count < limit {
+        digits.push(0);
+    }
+    guest::write_bytes(output, &digits);
+    0
+}

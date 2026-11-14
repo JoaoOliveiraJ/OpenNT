@@ -523,7 +523,7 @@ icone = "window"
 descricao = "O subsistema de janelas e gráficos do Windows no kernel (USER e GDI), carregado como imagem de sistema."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda. Sem eles, a tabela 1 do KeServiceDescriptorTableShadow fica vazia, como no Windows: uma syscall gráfica tenta converter a thread em GUI pelo PsConvertToGuiThread, que falha sem os callouts, e devolve STATUS_INVALID_SYSTEM_SERVICE. A KeAddSystemServiceTable, a PsEstablishWin32Callouts/PsInvokeWin32Callout e a conversão da W32pServiceTable na carga pela classe 38 do ZwSetSystemInformation já existem, testadas sem o win32k: o PsConvertToGuiThread invoca de fato os callouts de processo e de thread. Dos imports do ntoskrnl, ainda faltam 65 ao win32kbase.sys, 58 ao win32kfull.sys e um (ZwQueryInformationJobObject) ao win32k.sys."
+notas = "Alvo de carga dos binários reais, com o kernel dando só o suporte (MmLoadSystemImage, tabela de serviços e callouts de processo e thread). A imitação desse papel que existia dentro do kernel foi removida; nenhum dos três carrega ainda. Sem eles, a tabela 1 do KeServiceDescriptorTableShadow fica vazia, como no Windows: uma syscall gráfica tenta converter a thread em GUI pelo PsConvertToGuiThread, que falha sem os callouts, e devolve STATUS_INVALID_SYSTEM_SERVICE. A KeAddSystemServiceTable, a PsEstablishWin32Callouts/PsInvokeWin32Callout e a conversão da W32pServiceTable na carga pela classe 38 do ZwSetSystemInformation já existem, testadas sem o win32k: o PsConvertToGuiThread invoca de fato os callouts de processo e de thread. O suporte Rtl que a família importa já existe: tabelas de átomos, o heap de modo kernel (inclusive o heap fixo do desktop heap, com a CommitRoutine), as páginas de código (NlsAnsiCodePage, CPTABLEINFO, RtlUpcaseUnicodeToMultiByteN...), RtlFindMessage, RtlRaiseException, sqrtf e as rotinas de KUSER_SHARED_DATA. Dos imports do ntoskrnl, ainda faltam 39 ao win32kbase.sys, 40 ao win32kfull.sys e um (ZwQueryInformationJobObject) ao win32k.sys."
 
 [[componente]]
 nome = "dxgkrnl.sys e BasicDisplay.sys"
@@ -779,7 +779,7 @@ fase = "1 e 3"
 pasta = "ntos/rtl"
 nome = "Runtime library (Rtl)"
 icone = "book"
-descricao = "Strings, árvores, bitmaps, ordenação, imagens PE e Unicode."
+descricao = "Strings, árvores, bitmaps, ordenação, imagens PE, Unicode e páginas de código, tabelas de átomos e heap."
 fase = "3 e 6"
 
 [[subsistema]]

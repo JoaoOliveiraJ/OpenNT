@@ -155,3 +155,70 @@ fn installed_ansi_char(byte: u8) -> u16 {
         .and_then(|code_page| code_page.multi_byte_to_unicode(byte as u16).ok())
         .unwrap_or(byte as u16)
 }
+
+// ---- RtlUpcaseUnicodeToMultiByteN / RtlMultiByteToUnicodeSize -------------
+//
+// Pela página ANSI instalada, como no ntoskrnl 19041 (o ramo de processo
+// UTF-8 também não existe aqui, pelo mesmo motivo de acima).
+
+/// RtlUpcaseUnicodeToMultiByteN(MbString, MaxBytes, BytesWritten*, Unicode,
+/// UnicodeBytes): cada WCHAR passa pela página (o caractere de melhor
+/// encaixe), volta a Unicode, sobe com NLS_UPCASE e é convertido de novo.
+/// SBCS grava min(MaxBytes, WCHARs) bytes; DBCS para quando um par não
+/// cabe. STATUS_BUFFER_OVERFLOW quando sobram WCHARs.
+pub fn upcase_unicode_to_multi_byte_n(output: u64, maximum: u32, written: u64, source: u64, source_bytes: u32) -> Result<u32, KernelError> {
+    let code_page = crate::ntos::rtl::ansi_code_page::current()?;
+    let upcase = |unit: u16| -> Result<u16, KernelError> {
+        let code = code_page.unicode_to_multi_byte(unit)?;
+        code_page.unicode_to_multi_byte(crate::ntos::rtl::unicode_case::nls_upcase(code_page.multi_byte_to_unicode(code)?))
+    };
+    let units = source_bytes >> 1;
+    if !code_page.double_byte {
+        let count = units.min(maximum);
+        if written != 0 {
+            out::<u32>(written).set(count);
+        }
+        let mut bytes = alloc::vec::Vec::with_capacity(count as usize);
+        for index in 0..count as u64 {
+            bytes.push(upcase(guest::read16(source + index * 2))? as u8);
+        }
+        guest::write_bytes(output, &bytes);
+        return Ok(if units > maximum { 0x8000_0005 } else { 0 });
+    }
+    let (mut cursor, mut remaining, mut left, mut unit_pointer) = (output, maximum, units, source);
+    while left != 0 && remaining != 0 {
+        let code = upcase(guest::read16(unit_pointer))?;
+        unit_pointer += 2;
+        let lead = (code >> 8) as u8;
+        if lead != 0 {
+            let available = remaining;
+            remaining -= 1;
+            if available < 2 {
+                break;
+            }
+            guest::write8(cursor, lead);
+            cursor += 1;
+        }
+        guest::write8(cursor, code as u8);
+        remaining = remaining.wrapping_sub(1);
+        cursor += 1;
+        left -= 1;
+    }
+    if written != 0 {
+        out::<u32>(written).set((cursor - output) as u32);
+    }
+    Ok(if remaining < left { 0x8000_0005 } else { 0 })
+}
+
+/// RtlMultiByteToUnicodeSize(BytesInUnicode*, MultiByte, BytesInMultiByte):
+/// SBCS = 2 por byte; DBCS conta um WCHAR por inicial com o seu segundo byte
+/// (inicial isolado no fim conta um). Sempre STATUS_SUCCESS.
+pub fn multi_byte_to_unicode_size(output: u64, source: u64, length: u32) -> Result<u32, KernelError> {
+    let code_page = crate::ntos::rtl::ansi_code_page::current()?;
+    if !code_page.double_byte {
+        out::<u32>(output).set(length.wrapping_mul(2));
+        return Ok(0);
+    }
+    out::<u32>(output).set(code_page.unicode_byte_length(source, length as u64) as u32);
+    Ok(0)
+}

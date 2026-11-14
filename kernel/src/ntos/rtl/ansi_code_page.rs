@@ -200,3 +200,38 @@ impl CodePage {
         }
     }
 }
+
+// ---- NlsAnsiCodePage / NlsOemCodePage / NlsMbCodePageTag ------------------
+//
+// Os dados exportados que descrevem as páginas instaladas: USHORT 1252
+// (nls_configuration::ANSI_CODE_PAGE), USHORT 437 (oem_code_page::
+// OEM_CODE_PAGE) e o BOOLEAN NlsMbCodePageTag (FALSE: a 1252 é SBCS). Os
+// valores iniciais moram em `mm/kernel_data_layout`.
+
+fn data_cell(name: &str) -> u64 {
+    crate::ntos::mm::kernel_data::address(name).unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
+/// Célula de NlsAnsiCodePage.
+pub fn ansi_code_page_address() -> u64 {
+    data_cell("NlsAnsiCodePage")
+}
+
+/// Célula de NlsOemCodePage.
+pub fn oem_code_page_address() -> u64 {
+    data_cell("NlsOemCodePage")
+}
+
+/// Célula de NlsMbCodePageTag.
+pub fn mb_code_page_tag_address() -> u64 {
+    data_cell("NlsMbCodePageTag")
+}
+
+/// RtlGetDefaultCodePage(AnsiCodePage, OemCodePage): as duas células.
+pub fn get_default_code_page(ansi: &crate::ntos::inc::field::Field<u16>, oem: &crate::ntos::inc::field::Field<u16>) {
+    use crate::ntos::inc::field::Field;
+    // SAFETY: as células USHORT da região de dados do kernel.
+    let (ansi_cell, oem_cell) = unsafe { (Field::<u16>::at(ansi_code_page_address()), Field::<u16>::at(oem_code_page_address())) };
+    ansi.set(ansi_cell.get());
+    oem.set(oem_cell.get());
+}

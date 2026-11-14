@@ -128,12 +128,18 @@ pub fn is_prefetching() -> bool {
 /// PspInitializeSiloStructures zera (só +0x18 recebe -1): a sessão de serviço
 /// do host é 0, a mesma que PsIsServiceSession(0) aceita sem consulta.
 pub fn service_session_id(silo: u64) -> u32 {
+    user_shared_data(silo).map_or(0, |data| data.service_session_id.get())
+}
+
+/// SILO_USER_SHARED_DATA de um silo de servidor
+/// (ESERVERSILO_GLOBALS.UserSharedData); o host (NULL) não tem.
+pub fn user_shared_data(silo: u64) -> Option<&'static crate::ntos::inc::types::SiloUserSharedData> {
     use crate::ntos::inc::types::{EserversiloGlobals, SiloUserSharedData};
     if silo == HOST_SILO {
-        return 0;
+        return None;
     }
     // SAFETY: um silo de servidor tem ESERVERSILO_GLOBALS e o seu
     // SILO_USER_SHARED_DATA vivos enquanto o job vive.
     let globals = unsafe { EserversiloGlobals::at(ejob(silo).server_silo_globals.get()) };
-    unsafe { SiloUserSharedData::at(globals.user_shared_data.get()) }.service_session_id.get()
+    Some(unsafe { SiloUserSharedData::at(globals.user_shared_data.get()) })
 }

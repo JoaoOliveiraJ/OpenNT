@@ -684,3 +684,15 @@ fn integrity_rid(sid: &[u8]) -> u32 {
     }
     u32::from_le_bytes([sid[at], sid[at + 1], sid[at + 2], sid[at + 3]])
 }
+
+/// RtlAreAllAccessesGranted(GrantedAccess, DesiredAccess): nenhum bit
+/// pedido fora do concedido (ntoskrnl 19041, 0x6774e0).
+pub fn are_all_accesses_granted(granted: u32, desired: u32) -> bool {
+    desired & !granted == 0
+}
+
+/// RtlAreAnyAccessesGranted(GrantedAccess, DesiredAccess): algum bit em
+/// comum (0x6a5bf0).
+pub fn are_any_accesses_granted(granted: u32, desired: u32) -> bool {
+    desired & granted != 0
+}

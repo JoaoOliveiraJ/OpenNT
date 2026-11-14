@@ -14,3 +14,4 @@ pub mod system_images;
 pub mod user_half;
 pub mod resource_search_fixtures;
 pub mod cc_fixture;
+pub mod rtl_atom_heap_nls;

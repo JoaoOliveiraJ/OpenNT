@@ -292,6 +292,44 @@ fn raise_status_core(status: u32, linked: u64, source: u64, maximum_irql: u8) ->
     })
 }
 
+/// RtlRaiseException(ExceptionRecord) no ntoskrnl 19041 (0x33d230): o
+/// CONTEXT é o de quem chamou (o retorno da chamada), o ExceptionAddress do
+/// registro recebe esse RIP e o despacho segue com o registro do chamador.
+/// Um handler que continua a exceção volta ao chamador com RAX =
+/// `return_value` (o RtlAllocateHeap que levanta STATUS_NO_MEMORY e é
+/// continuado devolve NULL); sem handler, o sistema para, como a segunda
+/// chance do ZwRaiseException em modo kernel.
+pub fn raise_exception(record: u64, return_value: u64) -> Result<u64, KernelError> {
+    run_nonreturning_operation(
+        || {
+            with_workspace(0x600, |workspace| {
+                let context = workspace + 0x100;
+                native_context::copy(context, native_context::current()?, native_context::SIZE);
+                context_at(context).rax.set(return_value);
+                record_at(record).exception_address.set(context_at(context).rip.get());
+                search_exception_handlers(record, context, irql::HIGH_LEVEL)
+            })
+        },
+        record_at(record).exception_code.get() as u32,
+    )
+}
+
+/// Levanta uma exceção continuável de software com o código e os
+/// parâmetros dados (o EXCEPTION_RECORD montado como o
+/// RtlpAllocateHeapRaiseException: ExceptionRecord nulo e NumberParameters
+/// = parâmetros), pelo mesmo caminho de [`raise_exception`].
+pub fn raise_software_exception(code: u32, parameters: &[u64], return_value: u64) -> Result<u64, KernelError> {
+    with_workspace(0x100, |record| {
+        build_record(record, code, 0, 0, 0);
+        let fields = record_at(record);
+        fields.number_parameters.set(parameters.len() as u32);
+        for (slot, &value) in fields.exception_information.iter().zip(parameters) {
+            slot.set(value);
+        }
+        raise_exception(record, return_value)
+    })
+}
+
 /// RtlUnwindEx (a tabela de histórico não é usada).
 pub fn unwind_ex(frame: u64, target: u64, record: u64, value: u64, context: u64, _history: u64) -> Result<u64, KernelError> {
     run_nonreturning_operation(|| unwind_ex_core(frame, target, record, value, context), STATUS_UNWIND)

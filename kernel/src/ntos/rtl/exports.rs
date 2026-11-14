@@ -1910,3 +1910,279 @@ pub mod rtl_crt_rand {
 
     pub static GROUP: Group = Group { name: "rtl-crt-rand", names: &["rand"], handlers: &[rand], data_exports: &[] };
 }
+
+pub mod rtl_atom_tables {
+    //! Tabelas de átomos; a lógica mora em `rtl/atom.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::rtl::atom;
+    use crate::rtl::KernelError;
+
+    // Os ponteiros opcionais (NULL = sem saída) são as saídas do chamador
+    // de kernel; o PVOID* AtomTableHandle é obrigatório, como no NT.
+    fn create_atom_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::create_table(call.arg(1) as u32, 0, unsafe { Field::<u64>::at(call.arg(2)) })))
+    }
+    fn create_atom_table_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::create_table(call.arg(1) as u32, call.arg(2) as u32, unsafe { Field::<u64>::at(call.arg(3)) })))
+    }
+    fn add_atom(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::add(call.arg(1), call.arg(2), (call.arg(3) != 0).then(|| unsafe { Field::<u16>::at(call.arg(3)) }), 0)?))
+    }
+    fn add_atom_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::add(call.arg(1), call.arg(2), (call.arg(3) != 0).then(|| unsafe { Field::<u16>::at(call.arg(3)) }), call.arg(4) as u32)?))
+    }
+    fn delete_atom(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::delete(call.arg(1), call.arg(2) as u16)?))
+    }
+    fn destroy_atom_table(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::destroy_table(call.arg(1))?))
+    }
+    fn lookup_atom(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::lookup(call.arg(1), call.arg(2), (call.arg(3) != 0).then(|| unsafe { Field::<u16>::at(call.arg(3)) }))?))
+    }
+    fn pin_atom(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(atom::pin(call.arg(1), call.arg(2) as u16)?))
+    }
+    fn query_atom(call: &Call) -> Result<u64, KernelError> {
+        let outputs = atom::QueryOutputs { reference_count: (call.arg(3) != 0).then(|| unsafe { Field::<u32>::at(call.arg(3)) }), pin_count: (call.arg(4) != 0).then(|| unsafe { Field::<u32>::at(call.arg(4)) }), name: call.arg(5), name_length: (call.arg(6) != 0).then(|| unsafe { Field::<u32>::at(call.arg(6)) }) };
+        Ok(signed_status(atom::query(call.arg(1), call.arg(2) as u16, &outputs)?))
+    }
+    fn get_integer_atom(call: &Call) -> Result<u64, KernelError> {
+        Ok(atom::integer_atom(call.arg(1), (call.arg(2) != 0).then(|| unsafe { Field::<u16>::at(call.arg(2)) })) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-atom-tables",
+        names: &["RtlCreateAtomTable", "RtlCreateAtomTableEx", "RtlAddAtomToAtomTable", "RtlAddAtomToAtomTableEx", "RtlDeleteAtomFromAtomTable", "RtlDestroyAtomTable", "RtlLookupAtomInAtomTable", "RtlPinAtomInAtomTable", "RtlQueryAtomInAtomTable", "RtlGetIntegerAtom"],
+        handlers: &[create_atom_table, create_atom_table_ex, add_atom, add_atom_ex, delete_atom, destroy_atom_table, lookup_atom, pin_atom, query_atom, get_integer_atom],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_heap {
+    //! RtlCreateHeap/RtlAllocateHeap/RtlFreeHeap/RtlDestroyHeap; a lógica
+    //! mora em `rtl/heap.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::heap;
+    use crate::rtl::KernelError;
+
+    fn create_heap(call: &Call) -> Result<u64, KernelError> {
+        heap::create(call.arg(1) as u32, call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6))
+    }
+    fn allocate_heap(call: &Call) -> Result<u64, KernelError> {
+        heap::allocate(call.arg(1), call.arg(2) as u32, call.arg(3))
+    }
+    fn free_heap(call: &Call) -> Result<u64, KernelError> {
+        Ok(heap::free(call.arg(1), call.arg(2) as u32, call.arg(3))? as u64)
+    }
+    fn destroy_heap(call: &Call) -> Result<u64, KernelError> {
+        heap::destroy(call.arg(1))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-heap",
+        names: &["RtlCreateHeap", "RtlAllocateHeap", "RtlFreeHeap", "RtlDestroyHeap"],
+        handlers: &[create_heap, allocate_heap, free_heap, destroy_heap],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_code_pages {
+    //! Páginas de código: a instalada (`rtl/ansi_code_page.rs`,
+    //! `rtl/nls_translation.rs`) e as do chamador (`rtl/code_page_table.rs`),
+    //! com os dados NlsAnsiCodePage, NlsOemCodePage e NlsMbCodePageTag.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::rtl::{ansi_code_page, code_page_table, nls_translation};
+    use crate::rtl::KernelError;
+
+    fn get_default_code_page(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os PUSHORT de saída do chamador.
+        let (ansi, oem) = unsafe { (Field::<u16>::at(call.arg(1)), Field::<u16>::at(call.arg(2))) };
+        ansi_code_page::get_default_code_page(ansi, oem);
+        Ok(0)
+    }
+    fn upcase_unicode_to_multi_byte_n(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(nls_translation::upcase_unicode_to_multi_byte_n(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u32)?))
+    }
+    fn custom_cp_to_unicode_n(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(code_page_table::custom_cp_to_unicode_n(code_page_table::info_at(call.arg(1)), call.arg(2), call.arg(3) as u32, (call.arg(4) != 0).then(|| unsafe { Field::<u32>::at(call.arg(4)) }), call.arg(5), call.arg(6) as u32)?))
+    }
+    fn unicode_to_custom_cp_n(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(code_page_table::unicode_to_custom_cp_n(code_page_table::info_at(call.arg(1)), call.arg(2), call.arg(3) as u32, (call.arg(4) != 0).then(|| unsafe { Field::<u32>::at(call.arg(4)) }), call.arg(5), call.arg(6) as u32)?))
+    }
+    fn init_code_page_table(call: &Call) -> Result<u64, KernelError> {
+        code_page_table::init_code_page_table(call.arg(1), code_page_table::info_at(call.arg(2)));
+        Ok(0)
+    }
+    fn multi_byte_to_unicode_size(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(nls_translation::multi_byte_to_unicode_size(call.arg(1), call.arg(2), call.arg(3) as u32)?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-code-pages",
+        names: &["RtlGetDefaultCodePage", "RtlUpcaseUnicodeToMultiByteN", "RtlCustomCPToUnicodeN", "RtlUnicodeToCustomCPN", "RtlInitCodePageTable", "RtlMultiByteToUnicodeSize"],
+        handlers: &[get_default_code_page, upcase_unicode_to_multi_byte_n, custom_cp_to_unicode_n, unicode_to_custom_cp_n, init_code_page_table, multi_byte_to_unicode_size],
+        data_exports: &[("NlsAnsiCodePage", ansi_code_page::ansi_code_page_address), ("NlsOemCodePage", ansi_code_page::oem_code_page_address), ("NlsMbCodePageTag", ansi_code_page::mb_code_page_tag_address)],
+    };
+}
+
+pub mod rtl_resource_messages {
+    //! LdrResFindResourceDirectory, RtlFindMessage e RtlGetThreadLangIdByIndex;
+    //! a lógica mora em `rtl/resource/{find,message,languages}.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::rtl::resource::{find, languages, message};
+    use crate::rtl::KernelError;
+
+    fn find_resource_directory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(find::find_directory(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6), call.arg(7))?))
+    }
+    fn find_message(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PMESSAGE_RESOURCE_ENTRY* de saída do chamador.
+        let entry = unsafe { Field::<u64>::at(call.arg(5)) };
+        Ok(signed_status(message::find_message(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32, entry)?))
+    }
+    fn get_thread_lang_id_by_index(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(languages::thread_lang_id_by_index(call.arg(1) as u32, call.arg(2) as u32, call.arg(3), call.arg(4))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-resource-messages",
+        names: &["LdrResFindResourceDirectory", "RtlFindMessage", "RtlGetThreadLangIdByIndex"],
+        handlers: &[find_resource_directory, find_message, get_thread_lang_id_by_index],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_integer_to_char {
+    //! RtlIntegerToChar; a lógica mora em `rtl/integer_conversion.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::integer_conversion;
+    use crate::rtl::KernelError;
+
+    fn integer_to_char(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(integer_conversion::integer_to_char(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) as i32, call.arg(4))))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-integer-to-char", names: &["RtlIntegerToChar"], handlers: &[integer_to_char], data_exports: &[] };
+}
+
+pub mod rtl_system_state {
+    //! NtGlobalFlag, flags de elevação, console ativo e sessão de serviço;
+    //! a lógica mora em `rtl/shared_data.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::rtl::shared_data;
+    use crate::rtl::KernelError;
+
+    fn get_nt_global_flags(_: &Call) -> Result<u64, KernelError> {
+        Ok(shared_data::nt_global_flag() as u64)
+    }
+    fn query_elevation_flags(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PRTL_ELEVATION_FLAGS (ULONG) de saída do chamador.
+        Ok(shared_data::query_elevation_flags(unsafe { Field::<u32>::at(call.arg(1)) }) as u64)
+    }
+    fn set_active_console_id(call: &Call) -> Result<u64, KernelError> {
+        shared_data::set_active_console_id(call.arg(1) as u32)?;
+        Ok(0)
+    }
+    fn set_console_session_foreground_process_id(call: &Call) -> Result<u64, KernelError> {
+        shared_data::set_console_session_foreground_process_id(call.arg(1))?;
+        Ok(0)
+    }
+    fn get_current_service_session_id(_: &Call) -> Result<u64, KernelError> {
+        Ok(shared_data::current_service_session_id() as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-system-state",
+        names: &["RtlGetNtGlobalFlags", "RtlQueryElevationFlags", "RtlSetActiveConsoleId", "RtlSetConsoleSessionForegroundProcessId", "RtlGetCurrentServiceSessionId"],
+        handlers: &[get_nt_global_flags, query_elevation_flags, set_active_console_id, set_console_session_foreground_process_id, get_current_service_session_id],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_access_masks {
+    //! RtlAreAllAccessesGranted/RtlAreAnyAccessesGranted; a lógica mora em
+    //! `rtl/security.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::security;
+    use crate::rtl::KernelError;
+
+    fn are_all_accesses_granted(call: &Call) -> Result<u64, KernelError> {
+        Ok(security::are_all_accesses_granted(call.arg(1) as u32, call.arg(2) as u32) as u64)
+    }
+    fn are_any_accesses_granted(call: &Call) -> Result<u64, KernelError> {
+        Ok(security::are_any_accesses_granted(call.arg(1) as u32, call.arg(2) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-access-masks", names: &["RtlAreAllAccessesGranted", "RtlAreAnyAccessesGranted"], handlers: &[are_all_accesses_granted, are_any_accesses_granted], data_exports: &[] };
+}
+
+pub mod rtl_capability_single_session {
+    //! RtlCapabilityCheckForSingleSessionSku; a lógica mora em
+    //! `se/capability/check.rs`.
+
+    use crate::ntos::init::exports::{fatal_unless_transfer, signed_status, Call, Group};
+    use crate::ntos::se::capability::check as capability_check;
+    use crate::rtl::KernelError;
+
+    fn check(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fatal_unless_transfer("capability-single-session", capability_check::check_for_single_session_sku(call.arg(1), call.arg(2), call.arg(3)))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-capability-single-session", names: &["RtlCapabilityCheckForSingleSessionSku"], handlers: &[check], data_exports: &[] };
+}
+
+pub mod rtl_raise_exception {
+    //! RtlRaiseException; a lógica mora em `rtl/exceptions.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::exceptions;
+    use crate::rtl::KernelError;
+
+    fn raise_exception(call: &Call) -> Result<u64, KernelError> {
+        exceptions::raise_exception(call.arg(1), 0)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-raise-exception", names: &["RtlRaiseException"], handlers: &[raise_exception], data_exports: &[] };
+}
+
+pub mod crt_sqrtf {
+    //! sqrtf: o export público é o corpo nativo; pela tabela, o slot XMM0 do
+    //! CONTEXT (`rtl/math.rs`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::math;
+    use crate::rtl::KernelError;
+
+    fn sqrtf(call: &Call) -> Result<u64, KernelError> {
+        math::sqrtf_in_context(call.context);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "crt-sqrtf", names: &["sqrtf"], handlers: &[sqrtf], data_exports: &[] };
+}
+
+pub mod rtl_debug_print_va {
+    //! vDbgPrintEx; a lógica mora em `rtl/printf.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::printf;
+    use crate::rtl::KernelError;
+
+    fn v_dbg_print_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(printf::debug_print_ex_va(call.arg(1) as u32, call.arg(3), call.arg(4))? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-debug-print-va", names: &["vDbgPrintEx"], handlers: &[v_dbg_print_ex], data_exports: &[] };
+}

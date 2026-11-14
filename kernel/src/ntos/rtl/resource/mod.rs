@@ -3,6 +3,7 @@
 
 pub mod find;
 pub mod languages;
+pub mod message;
 pub mod memory;
 pub mod search;
 pub mod file;

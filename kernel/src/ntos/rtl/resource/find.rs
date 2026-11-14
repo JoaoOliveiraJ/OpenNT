@@ -64,3 +64,28 @@ pub fn find(image_base: u64, resource_type: u64, resource_name: u64, language: u
 pub fn search(image_base: u64, resource_path: u64, count: u64, flags: u64, buffer_output: u64, size_output: u64, culture_output: u64, culture_length_output: u64) -> Result<u32, KernelError> {
     execute(resource_lookup::prepare_search(image_base, resource_path, count, flags, buffer_output, size_output, culture_output, culture_length_output))
 }
+
+/// LdrResFindResourceDirectory(DllHandle, Type, Name, ResourceDirectory,
+/// CultureName, CultureNameLength, Flags) no ntoskrnl 19041 (0x78dd80):
+/// Flags com 0x400/0x800 dá STATUS_INVALID_PARAMETER; senão é o
+/// LdrResSearchResource do caminho [Type, Name] com Flags |
+/// LDR_FIND_RESOURCE_DIRECTORY (2), contando só até a última chave dada
+/// (Name sem Type ainda conta duas; a chave de tipo ausente, que o original
+/// deixa sem inicializar, vai como 0).
+#[allow(clippy::too_many_arguments)]
+pub fn find_directory(image_base: u64, resource_type: u64, resource_name: u64, directory_output: u64, culture_output: u64, culture_length_output: u64, flags: u64) -> Result<u32, KernelError> {
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    if flags as u32 & 0xC00 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let count = if resource_name != 0 { 2 } else { (resource_type != 0) as u64 };
+    let path = guest::alloc_bytes(16);
+    if path == 0 {
+        return Ok(0xC000_009A);
+    }
+    guest::write64(path, resource_type);
+    guest::write64(path + 8, resource_name);
+    let result = search(image_base, path, count, (flags as u32 | 2) as u64, directory_output, 0, culture_output, culture_length_output);
+    guest::free_bytes(path);
+    result
+}

@@ -107,6 +107,11 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // aponta para os 512 bytes zerados guardados logo depois da célula.
     KernelDataEntry { name: "NlsMbOemCodePageTag", size: 1, storage_size: 1, alignment: 1, initial: &[0] },
     KernelDataEntry { name: "NlsOemLeadByteInfo", size: 8, storage_size: 8 + 512, alignment: 8, initial: ZERO8 },
+    // As páginas instaladas: USHORT NlsAnsiCodePage = 1252, USHORT
+    // NlsOemCodePage = 437 e BOOLEAN NlsMbCodePageTag = FALSE (1252 é SBCS).
+    KernelDataEntry { name: "NlsAnsiCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xE4, 0x04] },
+    KernelDataEntry { name: "NlsOemCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xB5, 0x01] },
+    KernelDataEntry { name: "NlsMbCodePageTag", size: 1, storage_size: 1, alignment: 1, initial: &[0] },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

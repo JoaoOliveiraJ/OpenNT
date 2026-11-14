@@ -65,3 +65,15 @@ pub fn upcase(text: &str) -> Result<String, KernelError> {
 pub fn upcase_units(units: &[u16]) -> Result<Vec<u16>, KernelError> {
     units.iter().map(|&unit| upcase_char(unit)).collect()
 }
+
+/// NLS_UPCASE do ntoskrnl 19041 (0x206ab0): 'a'..'z' perdem 0x20, o resto
+/// abaixo de U+00C0 fica como está e só daí para cima vale a tabela de
+/// maiúsculas (Nls844UnicodeUpcaseTable, a mesma do l_intl.nls); sem tabela,
+/// o caractere volta inalterado.
+pub fn nls_upcase(unit: u16) -> u16 {
+    match unit {
+        0x61..=0x7A => unit - 0x20,
+        0..=0xBF => unit,
+        _ => upcase_char(unit).unwrap_or(unit),
+    }
+}

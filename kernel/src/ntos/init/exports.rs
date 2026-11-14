@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 291] {
+fn groups() -> [&'static Group; 302] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -346,6 +346,17 @@ fn groups() -> [&'static Group; 291] {
         &crate::hal::exports::vsl_secure_pci::GROUP,
         &crate::ntos::whea::exports::whea_error_source::GROUP,
         &crate::ntos::mm::exports::copy_virtual::GROUP,
+        &crate::ntos::rtl::exports::rtl_atom_tables::GROUP,
+        &crate::ntos::rtl::exports::rtl_heap::GROUP,
+        &crate::ntos::rtl::exports::rtl_code_pages::GROUP,
+        &crate::ntos::rtl::exports::rtl_resource_messages::GROUP,
+        &crate::ntos::rtl::exports::rtl_integer_to_char::GROUP,
+        &crate::ntos::rtl::exports::rtl_system_state::GROUP,
+        &crate::ntos::rtl::exports::rtl_access_masks::GROUP,
+        &crate::ntos::rtl::exports::rtl_capability_single_session::GROUP,
+        &crate::ntos::rtl::exports::rtl_raise_exception::GROUP,
+        &crate::ntos::rtl::exports::crt_sqrtf::GROUP,
+        &crate::ntos::rtl::exports::rtl_debug_print_va::GROUP,
     ]
 }
 
