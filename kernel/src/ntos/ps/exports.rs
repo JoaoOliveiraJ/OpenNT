@@ -1560,3 +1560,29 @@ pub mod ps_command_line {
 
     pub static GROUP: Group = Group { name: "ps-command-line", names: &["PsQueryProcessCommandLine"], handlers: &[query_command_line], data_exports: &[] };
 }
+
+pub mod ps_partition_commit {
+    //! PsIsProcessCommitRelinquished (lógica em `ps/process_accessors.rs`) e o
+    //! dado PsPartitionType, a célula com o OBJECT_TYPE das partições de
+    //! memória (preenchida por `mm/partition.rs`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ob::object_types;
+    use crate::ntos::ps::process_accessors;
+    use crate::rtl::KernelError;
+
+    fn is_process_commit_relinquished(call: &Call) -> Result<u64, KernelError> {
+        Ok(process_accessors::commit_relinquished(call.arg(1)) as u64)
+    }
+
+    fn partition_type() -> u64 {
+        object_types::exported_cell("PsPartitionType")
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-partition-commit",
+        names: &["PsIsProcessCommitRelinquished"],
+        handlers: &[is_process_commit_relinquished],
+        data_exports: &[("PsPartitionType", partition_type)],
+    };
+}

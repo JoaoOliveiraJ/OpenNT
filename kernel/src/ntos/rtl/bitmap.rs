@@ -358,10 +358,11 @@ fn set_bits_ex(words: u64, first: u64, mut count: u64) {
     }
 }
 
-/// Primeiro run de `count` bits livres que começa em [lo, last - count + 1]:
-/// o original recusa quando `last - lo + 1 < count` (sem sinal) e, varrendo
-/// palavra a palavra, aceita o menor início cujo run cabe até `last`.
-fn find_clear_run_ex(words: u64, lo: u64, last: u64, count: u64) -> u64 {
+/// Primeiro run de `count` bits livres (ou ligados, com `set`) que começa
+/// em [lo, last - count + 1]: o original recusa quando `last - lo + 1 <
+/// count` (sem sinal) e, varrendo palavra a palavra, aceita o menor início
+/// cujo run cabe até `last`.
+fn find_run_ex(words: u64, lo: u64, last: u64, count: u64, set: bool) -> u64 {
     if last.wrapping_sub(lo).wrapping_add(1) < count {
         return NO_MATCH_EX;
     }
@@ -370,7 +371,8 @@ fn find_clear_run_ex(words: u64, lo: u64, last: u64, count: u64) -> u64 {
     while current <= last {
         let offset = current & 63;
         let chunk = (64 - offset).min(last - current + 1);
-        let blocking = word_ex(words, current >> 6).get() >> offset;
+        let stored = word_ex(words, current >> 6).get();
+        let blocking = (if set { !stored } else { stored }) >> offset;
         let available = if blocking != 0 { chunk.min(blocking.trailing_zeros() as u64) } else { chunk };
         run += available;
         if run >= count {
@@ -396,16 +398,139 @@ pub fn find_clear_bits_and_set_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx,
     if count == 0 {
         return start & !7;
     }
-    let words = bitmap.buffer.get();
-    let mut found = find_clear_run_ex(words, start, size.wrapping_sub(1), count);
-    if found == NO_MATCH_EX && start != 0 {
-        let last = count.wrapping_add(hint).min(size).wrapping_sub(1);
-        found = find_clear_run_ex(words, 0, last, count);
-    }
+    let found = find_run_with_hint_ex(bitmap, count, hint, start, false);
     if found != NO_MATCH_EX {
-        set_bits_ex(words, found, count);
+        set_bits_ex(bitmap.buffer.get(), found, count);
     }
     found
+}
+
+/// As duas passadas comuns às buscas Ex com dica (`start` já é a dica
+/// dentro do mapa, ou 0).
+fn find_run_with_hint_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, count: u64, hint: u64, start: u64, set: bool) -> u64 {
+    let size = bitmap.size_of_bit_map.get();
+    let words = bitmap.buffer.get();
+    let mut found = find_run_ex(words, start, size.wrapping_sub(1), count, set);
+    if found == NO_MATCH_EX && start != 0 {
+        let last = count.wrapping_add(hint).min(size).wrapping_sub(1);
+        found = find_run_ex(words, 0, last, count, set);
+    }
+    found
+}
+
+/// RtlFindSetBitsEx(BitMapHeader, NumberToFind, HintIndex): as mesmas regras
+/// do RtlFindClearBitsAndSetEx (dica fora do mapa vira 0, NumberToFind == 0
+/// devolve a dica arredondada a 8, segunda passada em [0, min(Number + Hint,
+/// Size) - 1]) procurando bits ligados, sem alterar o mapa (ntoskrnl 19041
+/// 0x2288d0).
+pub fn find_set_bits_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, count: u64, hint: u64) -> u64 {
+    let size = bitmap.size_of_bit_map.get();
+    let start = if hint < size { hint } else { 0 };
+    if count == 0 {
+        return start & !7;
+    }
+    find_run_with_hint_ex(bitmap, count, hint, start, true)
+}
+
+/// RtlAreBitsClearEx(BitMapHeader, StartingIndex, Length) (0x2c9680): FALSE
+/// para início fora do mapa, Length 0 ou faixa que passa do fim; Length 1 é
+/// o `bt` do bit; senão TRUE se nenhum bit de [início, início + Length)
+/// estiver ligado.
+pub fn are_bits_clear_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, start: u64, length: u64) -> bool {
+    let size = bitmap.size_of_bit_map.get();
+    if start >= size {
+        return false;
+    }
+    if length <= 1 {
+        return length == 1 && !test_bit_ex(bitmap, start);
+    }
+    if size - start < length {
+        return false;
+    }
+    let words = bitmap.buffer.get();
+    let last = start + length - 1;
+    let (first_word, last_word) = (start >> 6, last >> 6);
+    for index in first_word..=last_word {
+        let low = if index == first_word { start & 63 } else { 0 };
+        let high = if index == last_word { last & 63 } else { 63 };
+        let mask = (u64::MAX >> (63 - high)) & (u64::MAX << low);
+        if word_ex(words, index).get() & mask != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// RtlClearAllBitsEx (0x31ad10): o memset do original zera ceil(Size / 32)
+/// ULONGs, não ULONG64s (a metade alta da última palavra fica intacta
+/// quando Size mod 64 cabe em 32 bits).
+pub fn clear_all_bits_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx) {
+    let size = bitmap.size_of_bit_map.get();
+    let bytes = ((size >> 5) + (size & 31 != 0) as u64) * 4;
+    crate::ntos::rtl::memory::fill(bitmap.buffer.get(), bytes, 0);
+}
+
+/// `count` (<= 64) bits de `snapshot` a partir do bit `position`.
+fn snapshot_bits(snapshot: &[u64], position: u64, count: u64) -> u64 {
+    let index = (position >> 6) as usize;
+    let offset = position & 63;
+    let mut value = snapshot[index] >> offset;
+    if offset != 0 && offset + count > 64 {
+        value |= snapshot[index + 1] << (64 - offset);
+    }
+    if count == 64 { value } else { value & ((1u64 << count) - 1) }
+}
+
+/// Grava os `count` bits baixos de `value` em [first, first + count), que
+/// cabem numa palavra; os demais bits da palavra ficam.
+fn write_bits_ex(words: u64, first: u64, count: u64, value: u64) {
+    let offset = first & 63;
+    let mask = (u64::MAX >> (64 - count)) << offset;
+    let cell = word_ex(words, first >> 6);
+    cell.set((cell.get() & !mask) | ((value << offset) & mask));
+}
+
+/// RtlCopyBitMapEx(Source, Destination, TargetBit) (0x2fa2a0): copia
+/// min(Source.Size, Destination.Size - TargetBit) bits do início da origem
+/// para o destino a partir de TargetBit, preservando os demais bits do
+/// destino. Com os buffers sobrepostos o original copia da cauda para a
+/// cabeça (RtlpCopyBitMapTailToHeadEx): o resultado é o da origem lida
+/// antes da gravação, que é o que a cópia do instantâneo faz.
+pub fn copy_bitmap_ex(source: &crate::ntos::inc::types::RtlBitmapEx, destination: &crate::ntos::inc::types::RtlBitmapEx, target: u64) {
+    let count = source.size_of_bit_map.get().min(destination.size_of_bit_map.get().wrapping_sub(target));
+    if count == 0 {
+        return;
+    }
+    let source_words = source.buffer.get();
+    let snapshot: alloc::vec::Vec<u64> = (0..count.div_ceil(64)).map(|index| word_ex(source_words, index).get()).collect();
+    let words = destination.buffer.get();
+    let mut done = 0;
+    while done < count {
+        let chunk = (count - done).min(64 - ((target + done) & 63));
+        write_bits_ex(words, target + done, chunk, snapshot_bits(&snapshot, done, chunk));
+        done += chunk;
+    }
+}
+
+/// RtlIntersectBitMapsEx(Target, Source) (0x304ca0): Target &= Source nos
+/// min(Target.Size, Source.Size) primeiros bits, palavra a palavra; os bits
+/// do alvo além desse limite ficam.
+pub fn intersect_bitmaps_ex(target: &crate::ntos::inc::types::RtlBitmapEx, source: &crate::ntos::inc::types::RtlBitmapEx) {
+    let mut remaining = target.size_of_bit_map.get().min(source.size_of_bit_map.get());
+    let (target_words, source_words) = (target.buffer.get(), source.buffer.get());
+    let mut index = 0;
+    while remaining != 0 {
+        let cell = word_ex(target_words, index);
+        let other = word_ex(source_words, index).get();
+        if remaining >= 64 {
+            cell.set(cell.get() & other);
+            remaining -= 64;
+        } else {
+            cell.set(cell.get() & (other | !((1u64 << remaining) - 1)));
+            remaining = 0;
+        }
+        index += 1;
+    }
 }
 
 // ---- Faixas e runs livres (RtlNumberOf{Set,Clear}BitsInRange, RtlExtractBitMap,

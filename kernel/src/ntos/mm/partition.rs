@@ -8,7 +8,7 @@
 use alloc::string::String;
 use alloc::vec;
 
-use super::pfn;
+use super::{kernel_data, pfn};
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ob::{object_access, object_manager, object_types, open_pointer};
@@ -100,6 +100,10 @@ pub fn init() -> Result<u64, KernelError> {
         return Err(error);
     }
     *BODY.lock() = pointer;
+    // PsPartitionType: o OBJECT_TYPE "Partition" que a criação acima publicou.
+    if let Some(partition_type) = object_types::user_type("partition") {
+        kernel_data::write("PsPartitionType", partition_type.pointer);
+    }
     Ok(pointer)
 }
 
@@ -256,6 +260,220 @@ pub fn resolve(handle: u64, access: u32, mode: u8) -> Result<u64, u32> {
         return Err(0xC000_0022);
     }
     Ok(body)
+}
+
+// ---- NtManagePartition / ZwManagePartition -----------------------------------
+//
+// Contrato do ntoskrnl 19041 (NtManagePartition 0x6762c0):
+// - Classe >= 9 -> STATUS_INVALID_INFO_CLASS; Length diferente do tamanho da
+//   classe em PspPartitionInfoDetails -> STATUS_INFO_LENGTH_MISMATCH.
+// - Flags da classe: 1 = a entrada é copiada para um buffer local (em
+//   UserMode, sondada com o alinhamento da classe), 2 = o buffer volta ao
+//   chamador depois do sucesso, 4 = exige a partição de origem.
+// - O alvo é referenciado com o acesso da classe (PsReferencePartitionByHandle:
+//   -1 = a partição do processo corrente, -2 = a do sistema, senão um handle de
+//   Partition); com a flag 4 a origem também, e origem igual ao alvo dá
+//   STATUS_INVALID_PARAMETER; sem a flag 4, uma origem não nula dá
+//   STATUS_INVALID_PARAMETER_2.
+// - Classe 0 (MmManagePartitionMemoryInformation), 6 (atributos) e as demais
+//   (mover memória, arquivo de paginação, combinar páginas, memória inicial,
+//   eventos de memória, informação de nó, páginas grandes).
+//
+// O OpenNT tem só a partição do sistema: a classe 1 sempre termina na
+// recusa de origem igual ao alvo, a 6 é a regra da partição do sistema e a
+// 0 descreve o alocador físico. As classes 2, 3, 4, 5, 7 e 8 dependem de
+// partições filhas, de combinação de páginas, de páginas grandes ou de
+// arquivo de paginação por partição, que o Mm do OpenNT não tem:
+// STATUS_NOT_SUPPORTED.
+
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// Entrada de PspPartitionInfoDetails: acesso pedido ao alvo, tamanho exato
+/// do buffer e flags (1 entrada, 2 saída, 4 origem).
+struct ClassDetails {
+    access: u32,
+    size: u32,
+    flags: u8,
+}
+
+/// PspPartitionInfoDetails do ntoskrnl 19041 (o alinhamento é 8 em todas).
+const CLASS_DETAILS: [ClassDetails; 9] = [
+    ClassDetails { access: 1, size: 0xF0, flags: 0xB },
+    ClassDetails { access: 2, size: 0x10, flags: 0x5 },
+    ClassDetails { access: 2, size: 0x28, flags: 0x1 },
+    ClassDetails { access: 2, size: 0x18, flags: 0x3 },
+    ClassDetails { access: 2, size: 0x20, flags: 0x3 },
+    ClassDetails { access: 1, size: 0x28, flags: 0xB },
+    ClassDetails { access: 2, size: 0x8, flags: 0x1 },
+    ClassDetails { access: 1, size: 0x10, flags: 0xB },
+    ClassDetails { access: 2, size: 0x20, flags: 0x3 },
+];
+
+/// O buffer da classe 0 (MEMORY_PARTITION_CONFIGURATION_INFORMATION do
+/// 19041, 0xF0 bytes): os offsets são os que o
+/// MmManagePartitionMemoryInformation grava.
+#[repr(C)]
+struct MemoryPartitionConfiguration {
+    flags: Field<u32>,
+    numa_node: Field<u32>,
+    channel: Field<u32>,
+    number_of_numa_nodes: Field<u32>,
+    resident_available_pages: Field<u64>,
+    committed_pages: Field<u64>,
+    commit_limit: Field<u64>,
+    peak_commitment: Field<u64>,
+    total_number_of_pages: Field<u64>,
+    available_pages: Field<u64>,
+    zero_pages: Field<u64>,
+    free_pages: Field<u64>,
+    standby_pages: Field<u64>,
+    standby_page_count_by_priority: [Field<u64>; 8],
+    repurposed_pages_by_priority: [Field<u64>; 8],
+    maximum_commit_limit: Field<u64>,
+    /// +0xE0: só a partição do sistema o preenche, de um contador do MiState
+    /// ligado às outras partições; com partição única fica 0.
+    system_partition_count: Field<u64>,
+    partition_id: Field<u32>,
+    _pad_ec: Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for MemoryPartitionConfiguration {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MemoryPartitionConfiguration>() == 0xF0);
+    assert!(core::mem::offset_of!(MemoryPartitionConfiguration, total_number_of_pages) == 0x30);
+    assert!(core::mem::offset_of!(MemoryPartitionConfiguration, standby_page_count_by_priority) == 0x58);
+    assert!(core::mem::offset_of!(MemoryPartitionConfiguration, repurposed_pages_by_priority) == 0x98);
+    assert!(core::mem::offset_of!(MemoryPartitionConfiguration, maximum_commit_limit) == 0xD8);
+    assert!(core::mem::offset_of!(MemoryPartitionConfiguration, partition_id) == 0xE8);
+};
+
+/// KeNumberNodes no OpenNT (um nó, `ke/processor_topology`).
+const NUMBER_OF_NODES: u32 = 1;
+
+/// Maior uso de páginas já informado (o PeakCommitment da partição).
+static PEAK_COMMITMENT: SpinLock<u64> = SpinLock::new(0);
+
+/// PsReferencePartitionByHandle em KernelMode: -1 (processo corrente) e -2
+/// (sistema) são a partição do sistema; um handle precisa ser de Partition.
+fn reference_partition(handle: u64, access: u32) -> Result<u64, u32> {
+    if handle as i64 == -1 || handle as i64 == -2 {
+        return get().ok_or(STATUS_INVALID_HANDLE);
+    }
+    resolve(handle, access, 0)
+}
+
+/// MmManagePartitionMemoryInformation sobre a partição do sistema: Flags 0,
+/// NumaNode -1 (todos) ou um nó existente e Channel -1, senão
+/// STATUS_INVALID_PARAMETER. O alocador físico do OpenNT tem só a lista
+/// livre (sem páginas zeradas nem standby) e não contabiliza commit: as
+/// páginas em uso são o commit, o limite é a RAM gerida e o pico é o maior
+/// uso já informado. Com um nó pedido, os totais do sistema ficam 0 e
+/// sobram as listas daquele nó.
+fn memory_information(information: &MemoryPartitionConfiguration) -> u32 {
+    let node = information.numa_node.get();
+    if information.flags.get() != 0 || (node != u32::MAX && node >= NUMBER_OF_NODES) || information.channel.get() != u32::MAX {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (total, free) = (pfn::total_count(), pfn::free_count());
+    for index in 0..8 {
+        information.standby_page_count_by_priority[index].set(0);
+        information.repurposed_pages_by_priority[index].set(0);
+    }
+    if node == u32::MAX {
+        let committed = total - free.min(total);
+        let peak = {
+            let mut peak = PEAK_COMMITMENT.lock();
+            *peak = (*peak).max(committed);
+            *peak
+        };
+        information.number_of_numa_nodes.set(NUMBER_OF_NODES);
+        information.resident_available_pages.set(free);
+        information.committed_pages.set(committed);
+        information.commit_limit.set(total);
+        information.peak_commitment.set(peak);
+        information.maximum_commit_limit.set(total);
+    } else {
+        information.number_of_numa_nodes.set(0);
+        information.resident_available_pages.set(0);
+        information.committed_pages.set(0);
+        information.commit_limit.set(0);
+        information.peak_commitment.set(0);
+        information.maximum_commit_limit.set(0);
+    }
+    information.system_partition_count.set(0);
+    information.total_number_of_pages.set(total);
+    information.zero_pages.set(0);
+    information.free_pages.set(free);
+    information.standby_pages.set(0);
+    information.available_pages.set(free);
+    // A partição do sistema é a de id 0.
+    information.partition_id.set(0);
+    0
+}
+
+/// SystemMemoryPartitionSetAttributes: 0 é aceito sem efeito; bits fora de
+/// 0..1 ou a partição do sistema são recusados.
+fn set_attributes(attributes: u64) -> u32 {
+    if attributes == 0 { 0 } else { STATUS_INVALID_PARAMETER }
+}
+
+/// ZwManagePartition(TargetHandle, SourceHandle, Class, Information, Length)
+/// em KernelMode: os ponteiros do chamador não são sondados.
+pub fn manage(target: u64, source: u64, class: u32, information: u64, length: u32) -> Result<u32, KernelError> {
+    let Some(details) = CLASS_DETAILS.get(class as usize) else { return Ok(STATUS_INVALID_INFO_CLASS) };
+    if length != details.size {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let buffer = guest::alloc_bytes(MemoryPartitionConfiguration::SIZE);
+    if buffer == 0 {
+        return Err(KernelError::new("ZwManagePartition: sem memoria para o buffer local"));
+    }
+    let result = (|| -> u32 {
+        guest::write_bytes(buffer, &[0; MemoryPartitionConfiguration::SIZE as usize]);
+        if details.flags & 1 != 0 {
+            guest::write_bytes(buffer, &guest::read_bytes(information, length as usize));
+        }
+        let target_body = match reference_partition(target, details.access) {
+            Ok(body) => body,
+            Err(status) => return status,
+        };
+        if details.flags & 4 != 0 {
+            match reference_partition(source, details.access) {
+                Ok(body) if body == target_body => return STATUS_INVALID_PARAMETER,
+                Ok(_) => {}
+                Err(status) => return status,
+            }
+        } else if source != 0 {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+        let status = match class {
+            0 => memory_information(MemoryPartitionConfiguration::of(buffer)),
+            // SAFETY: buffer local de 0xF0 bytes; a classe 6 usa o primeiro ULONG64.
+            6 => set_attributes(unsafe { Field::<u64>::at(buffer) }.get()),
+            _ => STATUS_NOT_SUPPORTED,
+        };
+        if status & 0x8000_0000 == 0 && details.flags & 2 != 0 {
+            guest::write_bytes(information, &guest::read_bytes(buffer, length as usize));
+        }
+        status
+    })();
+    guest::free_bytes(buffer);
+    Ok(result)
+}
+
+impl MemoryPartitionConfiguration {
+    /// O buffer local de `manage`.
+    fn of(pointer: u64) -> &'static MemoryPartitionConfiguration {
+        // SAFETY: bloco de 0xF0 bytes alocado por `manage`, vivo durante a classe.
+        unsafe { MemoryPartitionConfiguration::at(pointer) }
+    }
 }
 
 /// Liga o NtOpenPartition de usuário.

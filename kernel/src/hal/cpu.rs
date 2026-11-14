@@ -128,6 +128,12 @@ pub fn flush_caches() {
     unsafe { asm!("wbinvd", options(nostack)) }
 }
 
+/// CLFLUSH: grava de volta e invalida, em todo o domínio de coerência, a
+/// linha de cache que contém o endereço virtual (mapeado) dado.
+pub fn flush_cache_line(address: u64) {
+    unsafe { asm!("clflush [{}]", in(reg) address, options(nostack, preserves_flags)) }
+}
+
 /// FXSAVE64: grava o estado x87/SSE em `address` (alinhado a 16).
 pub fn fxsave(address: u64) {
     unsafe { asm!("fxsave64 [{}]", in(reg) address, options(nostack)) }

@@ -2232,3 +2232,66 @@ pub mod rtl_capability_sids {
 
     pub static GROUP: Group = Group { name: "rtl-capability-sids", names: &["RtlDeriveCapabilitySidsFromName"], handlers: &[derive_capability_sids_from_name], data_exports: &[] };
 }
+
+pub mod rtl_bitmap_ex_ranges {
+    //! RtlAreBitsClearEx, RtlClearAllBitsEx, RtlCopyBitMapEx, RtlFindSetBitsEx
+    //! e RtlIntersectBitMapsEx sobre RTL_BITMAP_EX; a lógica mora em
+    //! `rtl/bitmap.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{NtStruct, RtlBitmapEx};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    /// PRTL_BITMAP_EX do chamador.
+    fn header(address: u64) -> &'static RtlBitmapEx {
+        // SAFETY: o export recebe um RTL_BITMAP_EX vivo e alinhado, como no NT.
+        unsafe { RtlBitmapEx::at(address) }
+    }
+
+    fn are_bits_clear_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::are_bits_clear_ex(header(call.arg(1)), call.arg(2), call.arg(3)) as u64)
+    }
+
+    fn clear_all_bits_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::clear_all_bits_ex(header(call.arg(1)));
+        Ok(0)
+    }
+
+    fn copy_bitmap_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::copy_bitmap_ex(header(call.arg(1)), header(call.arg(2)), call.arg(3));
+        Ok(0)
+    }
+
+    fn find_set_bits_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_set_bits_ex(header(call.arg(1)), call.arg(2), call.arg(3)))
+    }
+
+    fn intersect_bitmaps_ex(call: &Call) -> Result<u64, KernelError> {
+        bitmap::intersect_bitmaps_ex(header(call.arg(1)), header(call.arg(2)));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-bitmap-ex-ranges",
+        names: &["RtlAreBitsClearEx", "RtlClearAllBitsEx", "RtlCopyBitMapEx", "RtlFindSetBitsEx", "RtlIntersectBitMapsEx"],
+        handlers: &[are_bits_clear_ex, clear_all_bits_ex, copy_bitmap_ex, find_set_bits_ex, intersect_bitmaps_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_copy_non_temporal {
+    //! RtlCopyMemoryNonTemporal; a lógica mora em `rtl/memory.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::memory;
+    use crate::rtl::KernelError;
+
+    /// (Destination, Source, Length).
+    fn copy_memory_non_temporal(call: &Call) -> Result<u64, KernelError> {
+        memory::copy_memory_non_temporal(call.arg(1), call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-copy-non-temporal", names: &["RtlCopyMemoryNonTemporal"], handlers: &[copy_memory_non_temporal], data_exports: &[] };
+}

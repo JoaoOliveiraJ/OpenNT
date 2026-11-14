@@ -56,6 +56,20 @@ pub fn write64(address: u64, value: u64) {
     unsafe { asm!("mov qword ptr [{0}], {1}", in(reg) address, in(reg) value, options(nostack, preserves_flags)) }
 }
 
+/// MOVNTI: grava 64 bits sem alocar a linha no cache (store não temporal,
+/// fracamente ordenado; [`store_fence`] o ordena).
+#[inline]
+pub fn write64_non_temporal(address: u64, value: u64) {
+    unsafe { asm!("movnti qword ptr [{0}], {1}", in(reg) address, in(reg) value, options(nostack, preserves_flags)) }
+}
+
+/// SFENCE: os stores anteriores (inclusive os não temporais) ficam visíveis
+/// antes dos seguintes.
+#[inline]
+pub fn store_fence() {
+    unsafe { asm!("sfence", options(nostack, preserves_flags)) }
+}
+
 pub fn read_bytes(address: u64, length: usize) -> alloc::vec::Vec<u8> {
     (0..length as u64).map(|offset| read8(address + offset)).collect()
 }

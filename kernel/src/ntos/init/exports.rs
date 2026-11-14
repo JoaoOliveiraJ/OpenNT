@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 356] {
+fn groups() -> [&'static Group; 367] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -411,6 +411,17 @@ fn groups() -> [&'static Group; 356] {
         &crate::ntos::ttm::exports::ttm_device_notifications::GROUP,
         &crate::ntos::ob::exports::zw_wait_multiple::GROUP,
         &crate::ntos::ke::exports::zw_yield_execution::GROUP,
+        &crate::ntos::rtl::exports::rtl_bitmap_ex_ranges::GROUP,
+        &crate::ntos::rtl::exports::rtl_copy_non_temporal::GROUP,
+        &crate::ntos::ke::exports::ke_cache_flush::GROUP,
+        &crate::ntos::ke::exports::ke_semaphore_state::GROUP,
+        &crate::ntos::ex::exports::ex_processor_feature::GROUP,
+        &crate::ntos::ex::exports::pcw_instances::GROUP,
+        &crate::ntos::ps::exports::ps_partition_commit::GROUP,
+        &crate::ntos::mm::exports::physical_ranges_ex::GROUP,
+        &crate::ntos::mm::exports::io_space_activity::GROUP,
+        &crate::ntos::mm::exports::partition_services::GROUP,
+        &crate::ntos::mm::exports::virtual_memory_lock::GROUP,
     ]
 }
 

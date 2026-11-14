@@ -128,6 +128,9 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // ULONG_PTR KiBugCheckData[5]: código e os quatro parâmetros do STOP,
     // gravados pelo KeBugCheckEx (`ke/bugcheck`).
     KernelDataEntry { name: "KiBugCheckData", size: 8, storage_size: 5 * 8, alignment: 8, initial: ZERO8 },
+    // POBJECT_TYPE das partições de memória (ALMOSTRO), gravado quando a
+    // partição do sistema é publicada.
+    pointer("PsPartitionType"),
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

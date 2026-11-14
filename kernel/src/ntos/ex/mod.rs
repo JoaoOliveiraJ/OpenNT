@@ -35,4 +35,5 @@ pub mod exports;
 pub mod interlocked;
 pub mod processor_usage;
 pub mod pcw;
+pub mod processor_feature;
 pub mod auto_expand_push_lock;

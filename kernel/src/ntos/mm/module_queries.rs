@@ -111,6 +111,20 @@ pub fn query_physical_ranges() -> Result<u64, KernelError> {
     Ok(pointer)
 }
 
+/// MmGetPhysicalMemoryRangesEx(PartitionObject) (ntoskrnl 19041 0x7d55b0, o
+/// MmGetPhysicalMemoryRangesEx2 com Flags 0): o MiPartitionObjectToPartition
+/// aceita NULL (a partição do sistema), -1 (a do processo corrente, que no
+/// OpenNT é sempre a do sistema) ou o corpo de um objeto Partition; qualquer
+/// outro ponteiro falha na assinatura do MI_PARTITION e para o sistema com
+/// MEMORY_MANAGEMENT (0x1A, 0x41001). A partição do sistema descreve toda a
+/// RAM, como o MmGetPhysicalMemoryRanges.
+pub fn query_physical_ranges_ex(partition_object: u64) -> Result<u64, KernelError> {
+    if partition_object != 0 && partition_object != u64::MAX && Some(partition_object) != super::partition::get() {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x1A, 0x41001, partition_object, 0, 0);
+    }
+    query_physical_ranges()
+}
+
 // ---- MmProtectMdlSystemAddress ---------------------------------------------
 // Muda mapeamentos supervisores reais. Uma folha não presente retém PFN e
 // cache; o bit de software 11 marca o NOACCESS deste gerenciador.

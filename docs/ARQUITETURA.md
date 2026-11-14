@@ -547,7 +547,10 @@ em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
   nível (0x81000 e a IDT em 0x82000) e os dados do trampolim dos APs. A
   IDT, a GDT do boot e as pilhas dos APs são carregadas
   pela VA do mapa direto; MmMapIoSpace e os mapeamentos físicos da HAL
-  devolvem VAs dele.
+  devolvem VAs dele. Como o MiReferenceIoPages do NT, MmMapIoSpace(Ex)
+  conta uma referência em cada página de I/O (não RAM) mapeada e o
+  MmUnmapIoSpace a tira (`mm/io_space.rs`); o MmIsIoSpaceActive consulta
+  essas referências.
 - **Endereço virtual** é acessado por `mm/guest_memory.rs` (memória confiável
   ou sondada) ou pelos MOVs de `hal::volatile`.
 - **Stubs em assembly** carregam a VA da página de IRQ num registrador

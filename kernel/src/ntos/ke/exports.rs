@@ -964,3 +964,42 @@ pub mod zw_yield_execution {
 
     pub static GROUP: Group = Group { name: "zw-yield-execution", names: &["ZwYieldExecution"], handlers: &[yield_execution], data_exports: &[] };
 }
+
+pub mod ke_cache_flush {
+    //! KeInvalidateAllCaches e KeInvalidateRangeAllCaches; a lógica mora em
+    //! `ke/cache_flush.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::cache_flush;
+    use crate::rtl::KernelError;
+
+    fn invalidate_all_caches(_: &Call) -> Result<u64, KernelError> {
+        Ok(cache_flush::invalidate_all_caches() as u64)
+    }
+
+    /// (BaseAddress, ULONG Length).
+    fn invalidate_range_all_caches(call: &Call) -> Result<u64, KernelError> {
+        Ok(cache_flush::invalidate_range_all_caches(call.arg(1), call.arg(2) as u32))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-cache-flush",
+        names: &["KeInvalidateAllCaches", "KeInvalidateRangeAllCaches"],
+        handlers: &[invalidate_all_caches, invalidate_range_all_caches],
+        data_exports: &[],
+    };
+}
+
+pub mod ke_semaphore_state {
+    //! KeReadStateSemaphore: o SignalState do cabeçalho (`ke/dispatcher.rs`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::dispatcher;
+    use crate::rtl::KernelError;
+
+    fn read_state_semaphore(call: &Call) -> Result<u64, KernelError> {
+        Ok(dispatcher::read_state(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-semaphore-state", names: &["KeReadStateSemaphore"], handlers: &[read_state_semaphore], data_exports: &[] };
+}

@@ -76,6 +76,12 @@ pub fn is_protected_light(process: u64) -> bool {
     protection(process) & 7 == 1
 }
 
+/// PsIsProcessCommitRelinquished (ntoskrnl 19041 0x6a2d20): o bit
+/// RelinquishedCommit (8) de EPROCESS.Flags3.
+pub fn commit_relinquished(process: u64) -> bool {
+    eprocess(process).relinquished_commit() != 0
+}
+
 /// PsGetProcessSignatureLevel: escreve o nível da seção (se houver saída)
 /// antes de ler o da imagem, preservando o resultado quando a saída aponta
 /// para um dos campos.

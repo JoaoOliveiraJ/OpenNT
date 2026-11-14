@@ -17,7 +17,7 @@ fn map_io_space(call: &Call) -> Result<u64, KernelError> {
     Ok(io_space::map(call.arg(1), call.arg(2)))
 }
 fn unmap_io_space(call: &Call) -> Result<u64, KernelError> {
-    io_space::unmap(call.arg(1));
+    io_space::unmap(call.arg(1), call.arg(2));
     Ok(0)
 }
 /// Anda as tabelas de página de verdade.
@@ -834,4 +834,71 @@ pub mod query_section {
     }
 
     pub static GROUP: Group = Group { name: "query-section", names: &["ZwQuerySection"], handlers: &[query_section], data_exports: &[] };
+}
+
+pub mod physical_ranges_ex {
+    //! MmGetPhysicalMemoryRangesEx; a lógica mora em `mm/module_queries`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::module_queries;
+    use crate::rtl::KernelError;
+
+    /// (PartitionObject).
+    fn get_physical_memory_ranges_ex(call: &Call) -> Result<u64, KernelError> {
+        module_queries::query_physical_ranges_ex(call.arg(1))
+    }
+
+    pub static GROUP: Group = Group { name: "physical-ranges-ex", names: &["MmGetPhysicalMemoryRangesEx"], handlers: &[get_physical_memory_ranges_ex], data_exports: &[] };
+}
+
+pub mod io_space_activity {
+    //! MmIsIoSpaceActive; a lógica mora em `mm/io_space`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::io_space;
+    use crate::rtl::KernelError;
+
+    /// (PHYSICAL_ADDRESS StartAddress, SIZE_T NumberOfBytes).
+    fn is_io_space_active(call: &Call) -> Result<u64, KernelError> {
+        Ok(io_space::is_active(call.arg(1), call.arg(2)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "io-space-activity", names: &["MmIsIoSpaceActive"], handlers: &[is_io_space_active], data_exports: &[] };
+}
+
+pub mod partition_services {
+    //! ZwOpenPartition e ZwManagePartition em KernelMode; a lógica mora em
+    //! `mm/partition`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::partition;
+    use crate::rtl::KernelError;
+
+    /// (PartitionHandle*, DesiredAccess, ObjectAttributes).
+    fn open_partition(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(partition::open(call.arg(1), call.arg(2) as u32, call.arg(3), false)?))
+    }
+
+    /// (TargetHandle, SourceHandle, Class, Information, Length).
+    fn manage_partition(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(partition::manage(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "partition-services", names: &["ZwOpenPartition", "ZwManagePartition"], handlers: &[open_partition, manage_partition], data_exports: &[] };
+}
+
+pub mod virtual_memory_lock {
+    //! ZwUnlockVirtualMemory em KernelMode; a lógica mora em
+    //! `mm/virtual_memory_services`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::virtual_memory_services;
+    use crate::rtl::KernelError;
+
+    /// (ProcessHandle, BaseAddress*, RegionSize*, MapType).
+    fn unlock(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(virtual_memory_services::unlock(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "virtual-memory-lock", names: &["ZwUnlockVirtualMemory"], handlers: &[unlock], data_exports: &[] };
 }

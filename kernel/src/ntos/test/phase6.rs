@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1729 && abi_names::GROUP_LAYOUT.len() == 356 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1729 exports em 356 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1747 && abi_names::GROUP_LAYOUT.len() == 367 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1747 exports em 367 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1379,7 +1379,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1729 && exports::export_names().len() == 1729, "ntoskrnl: 356 grupos com os 1729 exports implementados");
+    assert(exports::implemented() == 1747 && exports::export_names().len() == 1747, "ntoskrnl: 367 grupos com os 1747 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11976,6 +11976,278 @@ fn graphics_stack_support(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// RTL_BITMAP_EX de teste: cabeçalho e palavras ULONG64 num bloco.
+fn bitmap_ex(size: u64, words: &[u64]) -> (u64, u64) {
+    let header = guest::alloc_bytes(nt::RtlBitmapEx::SIZE);
+    let buffer = guest::alloc_bytes(words.len() as u64 * 8);
+    for (index, &word) in words.iter().enumerate() {
+        guest::write64(buffer + index as u64 * 8, word);
+    }
+    let bitmap = at::<nt::RtlBitmapEx>(header);
+    bitmap.size_of_bit_map.set(size);
+    bitmap.buffer.set(buffer);
+    (header, buffer)
+}
+
+fn bitmap_ex_words(buffer: u64, count: u64) -> Vec<u64> {
+    (0..count).map(|index| guest::read64(buffer + index * 8)).collect()
+}
+
+fn rtl_bitmap_ex_ranges_exports(assert: Assert) {
+    // Vetores do ntoskrnl 19041 emulado (RtlAreBitsClearEx, RtlFindSetBitsEx,
+    // RtlClearAllBitsEx, RtlCopyBitMapEx, RtlIntersectBitMapsEx).
+    let words = [0xF0F0_0000_0000_00FF, 0x0000_0000_FFFF_0000, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0001];
+    let (header, _) = bitmap_ex(250, &words);
+    let clear = [(8, 44, 1), (8, 45, 0), (250, 1, 0), (5, 0, 0), (10, 1, 1), (0, 1, 0), (200, 60, 0), (60, 80, 0), (64, 80, 0), (112, 16, 1), (100, 30, 0), (192, 63, 0)];
+    assert(clear.iter().all(|&(start, length, expected)| call_export("RtlAreBitsClearEx", &[header, start, length]).map(|value| value & 0xFF) == Some(expected)), "rtl-bitmap-ex-ranges: RtlAreBitsClearEx (bit unico, faixa entre palavras, limites)");
+    let found = [(0, 13, 8), (0, 300, 0), (1, 0, 0), (1, 9, 0x34), (8, 0, 0), (16, 0, 0x50), (16, 90, 0x80), (64, 0, 0x80), (70, 0, u64::MAX), (65, 130, 0x80), (3, 249, 0), (4, 200, 0), (2, 255, 0), (12, 70, 0x50)];
+    assert(found.iter().all(|&(count, hint, expected)| call_export("RtlFindSetBitsEx", &[header, count, hint]) == Some(expected)) && bitmap_ex_words(at::<nt::RtlBitmapEx>(header).buffer.get(), 4) == words, "rtl-bitmap-ex-ranges: RtlFindSetBitsEx com dica, segunda passada e sem alterar o mapa");
+    let cleared = [(100, [0, 0, u64::MAX]), (65, [0, 0xFFFF_FFFF_0000_0000, u64::MAX]), (32, [0xFFFF_FFFF_0000_0000, u64::MAX, u64::MAX]), (1, [0xFFFF_FFFF_0000_0000, u64::MAX, u64::MAX])];
+    assert(
+        cleared.iter().all(|&(size, expected)| {
+            let (header, buffer) = bitmap_ex(size, &[u64::MAX; 3]);
+            call_export("RtlClearAllBitsEx", &[header]).is_some() && bitmap_ex_words(buffer, 3) == expected
+        }),
+        "rtl-bitmap-ex-ranges: RtlClearAllBitsEx zera ULONGs inteiros",
+    );
+    let destination_words = [0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555, 0xFFFF_0000_FFFF_0000, 0x1111_2222_3333_4444];
+    let copies = [
+        (70, 200, 13, [0x68AC_F135_79BD_EAAA, 0x5555_5555_5556_A024, 0xFFFF_0000_FFFF_0000, 0x1111_2222_3333_4444]),
+        (70, 200, 0, [0x0123_4567_89AB_CDEF, 0x5555_5555_5555_5575, 0xFFFF_0000_FFFF_0000, 0x1111_2222_3333_4444]),
+        (70, 100, 64, [0xAAAA_AAAA_AAAA_AAAA, 0x5555_5557_89AB_CDEF, 0xFFFF_0000_FFFF_0000, 0x1111_2222_3333_4444]),
+        (70, 40, 8, [0xAAAA_AA89_ABCD_EFAA, 0x5555_5555_5555_5555, 0xFFFF_0000_FFFF_0000, 0x1111_2222_3333_4444]),
+        (64, 256, 130, [0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555, 0x048D_159E_26AF_37BC, 0x1111_2222_3333_4444]),
+    ];
+    assert(
+        copies.iter().all(|&(source_size, destination_size, target, expected)| {
+            let (source, _) = bitmap_ex(source_size, &[0x0123_4567_89AB_CDEF, 0x35]);
+            let (destination, buffer) = bitmap_ex(destination_size, &destination_words);
+            call_export("RtlCopyBitMapEx", &[source, destination, target]).is_some() && bitmap_ex_words(buffer, 4) == expected
+        }),
+        "rtl-bitmap-ex-ranges: RtlCopyBitMapEx limitado ao destino e preservando os demais bits",
+    );
+    let intersections = [(130, 100, [0x0F0F_0F0F_0F0F_0F0F, 0xFFFF_FFF3_3333_3333, u64::MAX]), (100, 130, [0x0F0F_0F0F_0F0F_0F0F, 0xFFFF_FFF3_3333_3333, u64::MAX]), (64, 200, [0x0F0F_0F0F_0F0F_0F0F, u64::MAX, u64::MAX]), (3, 3, [u64::MAX, u64::MAX, u64::MAX])];
+    assert(
+        intersections.iter().all(|&(target_size, source_size, expected)| {
+            let (target, buffer) = bitmap_ex(target_size, &[u64::MAX; 3]);
+            let (source, _) = bitmap_ex(source_size, &[0x0F0F_0F0F_0F0F_0F0F, 0x3333_3333_3333_3333, 0x5555_5555_5555_5555]);
+            call_export("RtlIntersectBitMapsEx", &[target, source]).is_some() && bitmap_ex_words(buffer, 3) == expected
+        }),
+        "rtl-bitmap-ex-ranges: RtlIntersectBitMapsEx nos bits comuns",
+    );
+}
+
+fn rtl_copy_non_temporal_exports(assert: Assert) {
+    // Vetores do ntoskrnl 19041 emulado: o destino alinhado a 16 mais o
+    // deslocamento; as cópias sobrepostas mostram a ordem dos acessos.
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2).map(|index| u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).unwrap_or(0)).collect()
+    }
+    let pattern: Vec<u8> = (0..0x200u32).map(|index| (index * 7 + 3) as u8).collect();
+    let run = |source: u64, destination: u64, length: u64, window: (u64, u64)| -> Vec<u8> {
+        let base = guest::alloc_bytes(0x200);
+        guest::write_bytes(base, &pattern);
+        let _ = call_export("RtlCopyMemoryNonTemporal", &[base + destination, base + source, length]);
+        let bytes = guest::read_bytes(base + window.0, (window.1 - window.0) as usize);
+        guest::free_bytes(base);
+        bytes
+    };
+    assert(run(0, 0x103, 0x95, (0x103, 0x198)) == pattern[..0x95], "rtl-copy-non-temporal: copia sem sobreposicao com destino desalinhado");
+    assert(run(0x20, 0x21, 5, (0x20, 0x26)) == hex("e3e3e3e3e3e3"), "rtl-copy-non-temporal: menos de 8 bytes vao byte a byte");
+    assert(run(0x10, 0x14, 12, (0x10, 0x20)) == hex("737a8188737a8188737a81888f969da4"), "rtl-copy-non-temporal: palavras e a ultima palavra que termina no fim");
+    let long = "c3cad1d8dfe6edf4fb020910171e252c333a41484fc3cad1d8dfe6edf4fb020910171e252c333a41484fc3cad1d8dfe6edf4fb020910171e252cc6cdd4dbe2e9cad1d8dfe6edf4fb020910171e252cc6cdd4dbe2e9838a91989fa6adb4bbc2c9171e252cc6cdd4dbe2e9838a91989fa6adb4bbc2c9";
+    assert(run(0x40, 0x55, 0x60, (0x40, 0xB5)) == hex(long), "rtl-copy-non-temporal: alinhamento a 16 e blocos de 64 bytes na ordem do original");
+    let backward = "535a617d84767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c6e757c";
+    assert(run(0x30, 0x2D, 0x50, (0x2D, 0x80)) == hex(backward), "rtl-copy-non-temporal: destino antes da origem");
+}
+
+fn ke_cache_flush_exports(assert: Assert) {
+    use crate::ntos::ke::{cache_flush, processor_topology};
+    let block = guest::alloc_bytes(0x100);
+    guest::write64(block + 0x40, 0x0123_4567_89AB_CDEF);
+    let line = cache_flush::cache_flush_line_size();
+    let expected_line = ((crate::hal::cpu::cpuid(1)[1] >> 8) & 0xFF) as u64 * 8;
+    assert(line == expected_line && processor_topology::largest_cache_size() >= 0x10000, "ke-cache-flush: CFlushSize do CPUID e KiLargestCacheSize >= 64 KB");
+    assert(call_export("KeInvalidateAllCaches", &[]).map(|value| value & 0xFF) == Some(1) && guest::read64(block + 0x40) == 0x0123_4567_89AB_CDEF, "ke-cache-flush: KeInvalidateAllCaches devolve TRUE e preserva a memoria");
+    assert(call_export("KeInvalidateRangeAllCaches", &[block + 3, 0x80]) == Some(0) && guest::read64(block + 0x40) == 0x0123_4567_89AB_CDEF, "ke-cache-flush: faixa pequena varrida por CLFLUSH");
+    let whole = processor_topology::largest_cache_size() as u64;
+    assert(call_export("KeInvalidateRangeAllCaches", &[block, whole]).map(|value| value & 0xFF) == Some(1), "ke-cache-flush: faixa do tamanho do maior cache vira o flush total");
+    guest::free_bytes(block);
+}
+
+fn ke_semaphore_state_exports(assert: Assert) {
+    let semaphore = guest::alloc_bytes(nt::Ksemaphore::SIZE);
+    let _ = call_export("KeInitializeSemaphore", &[semaphore, 3, 5]);
+    let initial = call_export("KeReadStateSemaphore", &[semaphore]);
+    let _ = call_export("KeReleaseSemaphore", &[semaphore, 0, 1, 0]);
+    assert(initial.map(|value| value as u32) == Some(3) && call_export("KeReadStateSemaphore", &[semaphore]).map(|value| value as u32) == Some(4), "ke-semaphore-state: KeReadStateSemaphore = SignalState");
+    guest::free_bytes(semaphore);
+}
+
+fn ex_processor_feature_exports(assert: Assert) {
+    let data = crate::ntos::mm::shared_user_data::data();
+    let agrees = (0..64u64).all(|feature| call_export("ExIsProcessorFeaturePresent", &[feature]).map(|value| value as u8) == data.map(|data| data.processor_features[feature as usize].get()));
+    // PF_XMMI64_INSTRUCTIONS_AVAILABLE (10): SSE2 existe em todo x64.
+    assert(data.is_some() && agrees && call_export("ExIsProcessorFeaturePresent", &[10]).map(|value| value as u8) == Some(1), "ex-processor-feature: o vetor ProcessorFeatures da KUSER_SHARED_DATA");
+    assert(call_export("ExIsProcessorFeaturePresent", &[64]).map(|value| value as u8) == Some(0) && call_export("ExIsProcessorFeaturePresent", &[0x1_0000_000A]).map(|value| value as u8) == Some(1), "ex-processor-feature: Feature >= 64 = FALSE (ULONG)");
+}
+
+fn pcw_instances_exports(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::ex::pcw;
+    const KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\pcw";
+    let out = guest::alloc_bytes(8);
+    let instance = at::<nt::Field<u64>>(out);
+    let preexisting = registry::node_by_path(KEY).is_some();
+    let handle = registry::open_or_create(KEY, None).unwrap_or(0);
+    let saved = registry::get_value(handle, "Start");
+    registry::set_value(handle, "Start", 4, 4u32.to_le_bytes().to_vec());
+    pcw::reset_enable_state_for_test();
+    instance.set(0xDEAD);
+    assert(call_export("PcwCreateInstance", &[out, 0x1234, 0, 1, 0]) == Some(0) && instance.get() == 0 && call_export("PcwCloseInstance", &[0]) == Some(0), "pcw-instances: pcw desligado = sucesso com instancia NULL");
+    registry::set_value(handle, "Start", 4, 0u32.to_le_bytes().to_vec());
+    pcw::reset_enable_state_for_test();
+    instance.set(0xDEAD);
+    assert(call_export("PcwCreateInstance", &[out, 0x1234, 0, 1, 0]) == Some(0xFFFF_FFFF_C000_0002) && instance.get() == 0, "pcw-instances: boot sem pcw.sys = STATUS_NOT_IMPLEMENTED e instancia NULL");
+    match saved {
+        Some(value) => {
+            registry::set_value(handle, "Start", value.value_type, value.data);
+        }
+        None => {
+            registry::delete_value(handle, "Start");
+        }
+    }
+    if !preexisting {
+        registry::delete_key(handle);
+    }
+    registry::close_handle(handle);
+    pcw::reset_enable_state_for_test();
+    guest::free_bytes(out);
+}
+
+fn ps_partition_commit_exports(assert: Assert) {
+    use crate::ntos::init::exports;
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+    let process = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let eprocess = at::<nt::Eprocess>(process);
+    eprocess.flags3.set(0xFFFF_FEFF);
+    let without = call_export("PsIsProcessCommitRelinquished", &[process]).map(|value| value as u8);
+    eprocess.set_relinquished_commit(1);
+    let with = call_export("PsIsProcessCommitRelinquished", &[process]).map(|value| value as u8);
+    assert(without == Some(0) && with == Some(1), "ps-partition-commit: bit RelinquishedCommit de Flags3");
+    guest::free_bytes(process);
+    let cell = match exports::lookup("ntoskrnl.exe", "PsPartitionType") {
+        Some(ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    let partition_type = crate::ntos::ob::object_types::user_type("partition").map_or(0, |object_type| object_type.pointer);
+    assert(cell != 0 && partition_type != 0 && guest::read64(cell) == partition_type && exports::export_module().is_ok_and(|module| module.exports.exports.get("PsPartitionType") == Some(&cell)), "ps-partition-commit: PsPartitionType aponta o OBJECT_TYPE Partition, tambem na EAT");
+}
+
+fn physical_ranges_ex_exports(assert: Assert) {
+    use crate::ntos::mm::{kernel_pool, physical_layout};
+    let ranges = physical_layout::ranges();
+    let system = crate::ntos::mm::partition::get().unwrap_or(0);
+    let matches = |vector: u64| {
+        vector != 0
+            && ranges.iter().enumerate().all(|(index, &(base, top))| {
+                let entry = at::<nt::PhysicalMemoryRange>(vector + index as u64 * 16);
+                entry.base_address.quad_part.get() as u64 == base && entry.number_of_bytes.quad_part.get() as u64 == top - base
+            })
+            && at::<nt::PhysicalMemoryRange>(vector + ranges.len() as u64 * 16).number_of_bytes.quad_part.get() == 0
+    };
+    let all = [0, u64::MAX, system].iter().all(|&partition| {
+        let vector = call_export("MmGetPhysicalMemoryRangesEx", &[partition]).unwrap_or(0);
+        let ok = matches(vector);
+        if vector != 0 {
+            let _ = kernel_pool::free(vector, None);
+        }
+        ok
+    });
+    assert(system != 0 && all, "physical-ranges-ex: NULL, -1 e a particao do sistema descrevem toda a RAM");
+}
+
+fn io_space_activity_exports(assert: Assert) {
+    use crate::ntos::mm::physical_layout;
+    // Uma página de I/O sem RAM, abaixo do limite do mapa direto.
+    let io = 0xFEB0_0000u64;
+    let active = |address: u64, size: u64| call_export("MmIsIoSpaceActive", &[address, size]).map(|value| value as u8);
+    assert(!physical_layout::contains_ram_range(io, 0x1000) && active(io, 0x1000) == Some(0) && active(0, 0) == Some(0), "io-space-activity: pagina de I/O sem mapeamento inativa");
+    let first = call_export("MmMapIoSpace", &[io + 0x10, 0x20, 0]).unwrap_or(0);
+    let second = call_export("MmMapIoSpaceEx", &[io, 0x2000, 4]).unwrap_or(0);
+    assert(first != 0 && second != 0 && active(io, 0x1000) == Some(1) && active(io + 0x1FFF, 1) == Some(1) && active(io + 0x10, 0) == Some(1) && active(0, 0xFFFF_FFFF) == Some(1), "io-space-activity: MmMapIoSpace(Ex) referenciam as paginas de I/O");
+    let _ = call_export("MmUnmapIoSpace", &[second, 0x2000]);
+    assert(active(io, 0x1000) == Some(1) && active(io + 0x1000, 0x1000) == Some(0), "io-space-activity: o unmap tira so as referencias do mapeamento");
+    let _ = call_export("MmUnmapIoSpace", &[first, 0x20]);
+    assert(active(io, 0x2000) == Some(0), "io-space-activity: sem mapeamentos a faixa volta a inativa");
+    // Páginas de RAM nunca contam.
+    let ram = physical_layout::ranges().first().map_or(0, |&(base, _)| base + 0x1000);
+    let mapped = call_export("MmMapIoSpace", &[ram, 0x1000, 0]).unwrap_or(0);
+    assert(mapped != 0 && active(ram, 0x1000) == Some(0), "io-space-activity: RAM mapeada nao e I/O space ativo");
+    let _ = call_export("MmUnmapIoSpace", &[mapped, 0x1000]);
+}
+
+fn partition_services_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::mm::pfn;
+    let block = guest::alloc_bytes(0x400);
+    let information = block + 0x200;
+    let output = block + 0x3F0;
+    let attributes = object_attributes_for(block, "\\KernelObjects\\MemoryPartition0", 0x240);
+    let opened = call_export("ZwOpenPartition", &[output, 1, attributes]);
+    let handle = guest::read64(output);
+    assert(opened == Some(0) && handle != 0, "partition-services: ZwOpenPartition da MemoryPartition0");
+    // Classe 0 (MEMORY_PARTITION_CONFIGURATION_INFORMATION, 0xF0 bytes).
+    let query = |target: u64, node: u32| {
+        guest::write_bytes(information, &[0; 0xF0]);
+        guest::write32(information + 4, node);
+        guest::write32(information + 8, u32::MAX);
+        call_export("ZwManagePartition", &[target, 0, 0, information, 0xF0])
+    };
+    let field = |offset: u64| guest::read64(information + offset);
+    for target in [u64::MAX, u64::MAX - 1, handle] {
+        let status = query(target, u32::MAX);
+        let (committed, resident, total, available) = (field(0x18), field(0x10), field(0x30), field(0x38));
+        assert(
+            status == Some(0) && guest::read32(information + 0xC) == 1 && total == pfn::total_count() && committed + resident == total && field(0x20) == total && field(0x28) >= committed && field(0xD8) == total && available == field(0x48) && field(0x40) == 0 && field(0x50) == 0 && available <= total && guest::read32(information + 0xE8) == 0,
+            "partition-services: classe 0 descreve o alocador fisico (-1, -2 e o handle)",
+        );
+    }
+    assert(query(u64::MAX, 0) == Some(0) && guest::read32(information + 0xC) == 0 && field(0x18) == 0 && field(0x30) == pfn::total_count() && field(0x38) == field(0x48), "partition-services: classe 0 de um no traz so as listas do no");
+    assert(query(u64::MAX, 1) == Some(signed_status(0xC000_000D)), "partition-services: no inexistente = STATUS_INVALID_PARAMETER");
+    guest::write32(information, 1);
+    assert(call_export("ZwManagePartition", &[u64::MAX, 0, 0, information, 0xF0]) == Some(signed_status(0xC000_000D)), "partition-services: Flags != 0 = STATUS_INVALID_PARAMETER");
+    assert(call_export("ZwManagePartition", &[u64::MAX, 0, 9, information, 0xF0]) == Some(signed_status(0xC000_0003)) && call_export("ZwManagePartition", &[u64::MAX, 0, 0, information, 0xE8]) == Some(signed_status(0xC000_0004)), "partition-services: classe invalida e tamanho errado");
+    assert(call_export("ZwManagePartition", &[u64::MAX, handle, 0, information, 0xF0]) == Some(signed_status(0xC000_00F0)), "partition-services: origem sem a flag da classe = STATUS_INVALID_PARAMETER_2");
+    assert(call_export("ZwManagePartition", &[handle, u64::MAX - 1, 1, information, 0x10]) == Some(signed_status(0xC000_000D)), "partition-services: mover memoria para a mesma particao = STATUS_INVALID_PARAMETER");
+    guest::write64(information, 0);
+    let unchanged = call_export("ZwManagePartition", &[u64::MAX, 0, 6, information, 8]);
+    guest::write64(information, 1);
+    assert(unchanged == Some(0) && call_export("ZwManagePartition", &[u64::MAX, 0, 6, information, 8]) == Some(signed_status(0xC000_000D)), "partition-services: atributos 0 aceitos, outros recusados na particao do sistema");
+    assert(call_export("ZwManagePartition", &[0x7FF0, 0, 0, information, 0xF0]) != Some(0), "partition-services: handle invalido recusado");
+    assert(call_export("ZwClose", &[handle]) == Some(0), "partition-services: ZwClose da particao");
+    guest::free_bytes(block);
+}
+
+fn virtual_memory_lock_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let block = guest::alloc_bytes(0x20);
+    let (base, size) = (block, block + 8);
+    let unlock = |process: u64, address: u64, length: u64, map_type: u64| {
+        guest::write64(base, address);
+        guest::write64(size, length);
+        call_export("ZwUnlockVirtualMemory", &[process, base, size, map_type])
+    };
+    let invalid = Some(signed_status(0xC000_000D));
+    assert(unlock(u64::MAX, 0x1_0000, 0x1000, 0) == invalid && unlock(u64::MAX, 0x1_0000, 0x1000, 4) == invalid && unlock(u64::MAX, 0x1_0000, 0, 1) == invalid, "virtual-memory-lock: MapType e tamanho zero validados");
+    assert(unlock(u64::MAX, 0x7FFF_FFFF_0000, 0x1000, 1) == invalid && unlock(u64::MAX, 0x7FFF_FFFE_0000, 0x2_0000, 1) == invalid, "virtual-memory-lock: faixa alem de MM_USER_PROBE_ADDRESS");
+    assert(unlock(u64::MAX - 1, 0x1_0000, 0x1000, 1) == Some(signed_status(0xC000_0024)), "virtual-memory-lock: handle de thread = STATUS_OBJECT_TYPE_MISMATCH");
+    let process_unlock = unlock(u64::MAX, 0x1_0010, 0x1000, 1);
+    let untouched = guest::read64(base) == 0x1_0010 && guest::read64(size) == 0x1000;
+    assert(process_unlock == Some(signed_status(0xC000_002A)) && untouched && unlock(u64::MAX, 0x1_0000, 0x3000, 2) == Some(signed_status(0xC000_002A)), "virtual-memory-lock: nada travado = STATUS_NOT_LOCKED sem gravar a faixa");
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -12203,6 +12475,17 @@ pub fn run(assert: Assert) {
     zw_wait_multiple_exports(assert);
     zw_yield_execution_exports(assert);
     graphics_stack_support(assert);
+    rtl_bitmap_ex_ranges_exports(assert);
+    rtl_copy_non_temporal_exports(assert);
+    ke_cache_flush_exports(assert);
+    ke_semaphore_state_exports(assert);
+    ex_processor_feature_exports(assert);
+    pcw_instances_exports(assert);
+    ps_partition_commit_exports(assert);
+    physical_ranges_ex_exports(assert);
+    io_space_activity_exports(assert);
+    partition_services_exports(assert);
+    virtual_memory_lock_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

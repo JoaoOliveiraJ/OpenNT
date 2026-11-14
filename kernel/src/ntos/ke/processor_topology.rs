@@ -74,6 +74,9 @@ struct Cache {
 }
 
 static LARGEST_CACHE_LINE: AtomicU32 = AtomicU32::new(0);
+/// Valor inicial de KiLargestCacheSize no .data do ntoskrnl.
+const DEFAULT_LARGEST_CACHE_SIZE: u32 = 0x10000;
+static LARGEST_CACHE_SIZE: AtomicU32 = AtomicU32::new(0);
 
 fn is_amd(vendor: &str) -> bool {
     matches!(vendor, "AuthenticAMD" | "HygonGenuine")
@@ -299,6 +302,26 @@ impl Topology {
     fn active_mask(&self) -> u64 {
         if self.apic.len() >= 64 { u64::MAX } else { (1u64 << self.apic.len()) - 1 }
     }
+}
+
+/// KiLargestCacheSize: 64 KB (o valor inicial no .data do ntoskrnl), ou o
+/// maior Size dos caches L2+ unificados ou de dados (KiSetCacheInformation),
+/// calculado uma vez.
+pub fn largest_cache_size() -> u32 {
+    let size = LARGEST_CACHE_SIZE.load(Ordering::Acquire);
+    if size != 0 {
+        return size;
+    }
+    let caches = match processor_information::snapshot() {
+        Ok(snapshot) => cache_descriptors(is_amd(&snapshot.vendor), snapshot.level),
+        Err(_) => Vec::new(),
+    };
+    let size = caches
+        .iter()
+        .filter(|cache| cache.level >= 2 && (cache.kind == cache_type::UNIFIED || cache.kind == cache_type::DATA))
+        .fold(DEFAULT_LARGEST_CACHE_SIZE, |largest, cache| largest.max(cache.size));
+    LARGEST_CACHE_SIZE.store(size, Ordering::Release);
+    size
 }
 
 /// KeGetRecommendedSharedDataAlignment: KeLargestCacheLine, calculado uma vez.

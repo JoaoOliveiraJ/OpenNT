@@ -1357,3 +1357,41 @@ pub mod ex_wnf_subscription {
         data_exports: &[],
     };
 }
+
+pub mod ex_processor_feature {
+    //! ExIsProcessorFeaturePresent; a lógica mora em `ex/processor_feature.rs`.
+
+    use crate::ntos::ex::processor_feature;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn is_processor_feature_present(call: &Call) -> Result<u64, KernelError> {
+        Ok(processor_feature::is_present(call.arg(1) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-processor-feature", names: &["ExIsProcessorFeaturePresent"], handlers: &[is_processor_feature_present], data_exports: &[] };
+}
+
+pub mod pcw_instances {
+    //! PcwCreateInstance/PcwCloseInstance (lógica em `ex/pcw.rs`: o ramo do
+    //! ntoskrnl sem a extensão do pcw.sys).
+
+    use crate::ntos::ex::pcw;
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// (PPCW_INSTANCE *Instance, Registration, Name, Count, Data).
+    fn create_instance(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: ponteiro de saída vivo do driver, como no NT.
+        let instance = unsafe { Field::<u64>::at(call.arg(1)) };
+        Ok(signed_status(pcw::create_instance(instance, call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5))))
+    }
+
+    fn close_instance(call: &Call) -> Result<u64, KernelError> {
+        pcw::close_instance(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "pcw-instances", names: &["PcwCreateInstance", "PcwCloseInstance"], handlers: &[create_instance, close_instance], data_exports: &[] };
+}

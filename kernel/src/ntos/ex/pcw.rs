@@ -1,6 +1,7 @@
 //! Contadores de desempenho (PCW) vistos do ntoskrnl — PcwRegister 0x781700,
-//! PcwUnregister 0x956d00, PcwAddInstance 0x667bc0, ExpPcwDisabledStatus
-//! 0x956c28 (ntoskrnl 19041).
+//! PcwUnregister 0x956d00, PcwAddInstance 0x667bc0, PcwCreateInstance
+//! 0x666980, PcwCloseInstance 0x666940, ExpPcwDisabledStatus 0x956c28
+//! (ntoskrnl 19041).
 //!
 //! No Windows 10 a implementação dos conjuntos de contadores não mora no
 //! ntoskrnl: ela é o pcw.sys (driver de boot, grupo "System Reserved"), que
@@ -138,6 +139,18 @@ pub fn unregister(registration: u64) {
 pub fn add_instance(buffer: u64, name: u64, id: u32, count: u32, data: u64) -> u32 {
     with_extension(ADD_INSTANCE, |routine| native_call::call(routine, &[buffer, name, id as u64, count as u64, data]) as u32).unwrap_or_else(disabled_status)
 }
+
+/// PcwCreateInstance(Instance*, Registration, Name, Count, Data) (0x666980):
+/// sem tabela de extensão, *Instance = NULL e o status de
+/// ExpPcwDisabledStatus.
+pub fn create_instance(instance: &Field<u64>, _registration: u64, _name: u64, _count: u32, _data: u64) -> u32 {
+    instance.set(0);
+    disabled_status()
+}
+
+/// PcwCloseInstance(Instance) (0x666940): sem tabela de extensão, nada a
+/// fechar (o argumento não é lido).
+pub fn close_instance(_instance: u64) {}
 
 /// Esquece o estado calculado (o teste de fase 6 reconsulta o Registro).
 pub fn reset_enable_state_for_test() {
