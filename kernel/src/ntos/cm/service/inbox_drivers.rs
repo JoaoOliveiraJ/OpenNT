@@ -40,6 +40,11 @@
 //! Type, Start, ErrorControl e DisplayName (quando há), sem ImagePath, como
 //! na instalação.
 //!
+//! O CLFS (clfs.sys, Start 0 e Group "Filter" na instalação) fica sob
+//! demanda como os outros: ele sobe como dependência de import do ntfs.sys,
+//! e o DriverEntry dele lê Parameters (EventLogLevel, FlushThreshold e
+//! MasterFilePath) pelo RtlQueryRegistryValuesEx, que falha sem a chave.
+//!
 //! Os file systems de pipes nomeados (Npfs) e de mailslots (Msfs) também
 //! entram como na instalação, sem diferença: Type 2, Start 1
 //! (SERVICE_SYSTEM_START, carregados pelo boot com os outros drivers de
@@ -102,6 +107,7 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "Null", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(1), dwords: &[] },
     InboxDriver { name: "Beep", display_name: Some("Beep"), service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(2), dwords: &[] },
     InboxDriver { name: "Fs_Rec", display_name: None, service_type: SERVICE_RECOGNIZER_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 0, group: "File System", tag: None, dwords: &[] },
+    InboxDriver { name: "CLFS", display_name: Some("@%SystemRoot%\\system32\\drivers\\clfs.sys,-100"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\CLFS.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Filter", tag: Some(1), dwords: &[] },
     InboxDriver { name: "Npfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
     InboxDriver { name: "Msfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
@@ -120,6 +126,9 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMajorVersion", Installed::Dword(1)),
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMinorVersion", Installed::Dword(0xF)),
     ("Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions\\1", "Service", Installed::String("Wdf01000")),
+    ("Services\\CLFS\\Parameters", "EventLogLevel", Installed::Dword(2)),
+    ("Services\\CLFS\\Parameters", "FlushThreshold", Installed::Dword(0x9C40)),
+    ("Services\\CLFS\\Parameters", "MasterFilePath", Installed::String("\\SystemRoot\\System32\\config")),
 ];
 
 /// As chaves dos drivers inbox, dos file systems e os valores do KMDF.

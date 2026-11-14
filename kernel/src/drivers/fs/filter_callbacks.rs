@@ -43,10 +43,18 @@ pub fn current_callbacks() -> u64 {
 
 /// FsRtlGetFileNameInformation: slot 0x18 da tabela com os quatro
 /// argumentos; sem Filter Manager devolve STATUS_NOT_SUPPORTED sem tocar
-/// nos buffers do chamador.
+/// nos buffers do chamador. Um FILE_OBJECT sem DeviceObject é um arquivo do
+/// volume de boot do próprio kernel (o leitor interno, sem pilha de
+/// dispositivos, de onde vêm as imagens que a CI valida): nenhum filtro tem
+/// instância nele, e o Filter Manager, que parte do
+/// IoGetBaseFileSystemDeviceObject, não é chamado.
 pub fn get_file_name_information(file_object: u64, name_options: u32, file_name: u64, information: u64) -> u32 {
     let table = current_callbacks();
     if table == 0 {
+        return 0xC000_00BB;
+    }
+    // SAFETY: PFILE_OBJECT vivo do chamador de modo kernel.
+    if file_object != 0 && unsafe { crate::ntos::inc::types::FileObject::at(file_object) }.device_object.get() == 0 {
         return 0xC000_00BB;
     }
     let callback = callbacks_at(table).get_file_name_information.get();

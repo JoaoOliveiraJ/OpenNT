@@ -78,6 +78,20 @@ fn current_user_path() -> Result<Result<String, u32>, KernelError> {
     Ok(result)
 }
 
+/// O prefixo de um RelativeTo no RtlpGetRegistryHandle (a tabela
+/// RtlpRegistryPaths): RTL_REGISTRY_USER é a chave do SID do token efetivo,
+/// ou `.Default` se ele não puder ser obtido. `None` = índice inválido ou
+/// RTL_REGISTRY_ABSOLUTE.
+pub fn root_path(root: usize) -> Option<String> {
+    let base = ROOT_PATHS.get(root).filter(|base| !base.is_empty())?;
+    if root == 5 {
+        if let Ok(Ok(text)) = current_user_path() {
+            return Some(text);
+        }
+    }
+    Some(String::from(*base))
+}
+
 /// RtlCheckRegistryKey(RelativeTo, Path).
 pub fn check(relative_to: u32, path_pointer: u64) -> Result<u32, KernelError> {
     // RTL_REGISTRY_HANDLE devolve sucesso sem validar nem fechar o handle,

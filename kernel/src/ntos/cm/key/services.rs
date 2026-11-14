@@ -576,7 +576,11 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                     if let Err(value) = key_security::access(&parent_security, 4, enforce) {
                         return Ok(Outcome::from_status(value));
                     }
-                    match key_security::create(&parent_security, operation["sd"], enforce)? {
+                    // O dono e a SACL explícitos só são validados com o
+                    // PreviousMode da thread em UserMode (o
+                    // RtlpNewSecurityObject do SeAssignSecurity); o
+                    // OBJ_FORCE_ACCESS_CHECK só pesa no acesso ao pai.
+                    match key_security::create(&parent_security, operation["sd"], previous_mode)? {
                         Ok(descriptor) => assigned = Some(descriptor),
                         Err(value) => return Ok(Outcome::from_status(value)),
                     }

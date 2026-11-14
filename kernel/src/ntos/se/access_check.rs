@@ -424,15 +424,19 @@ fn token_from_access_information(information: &TokenAccessInformation, token: &c
 }
 
 /// SeTokenFromAccessInformation(Info, Token, Length, RequiredLength):
-/// Length < sizeof(TOKEN) grava o tamanho e devolve STATUS_BUFFER_TOO_SMALL.
-pub fn token_from_access_information_checked(information: &TokenAccessInformation, token: u64, length: u32, required: &crate::ntos::inc::types::Field<u32>) -> u32 {
+/// Length < sizeof(TOKEN) grava o tamanho e devolve STATUS_BUFFER_TOO_SMALL
+/// sem ler Info nem Token (o netio.sys pergunta o tamanho com os dois nulos).
+pub fn token_from_access_information_checked(information: u64, token: u64, length: u32, required: u64) -> u32 {
     let size = crate::ntos::inc::types::Token::SIZE as u32;
     if length < size {
-        required.set(size);
+        // SAFETY: PULONG RequiredLength do chamador de modo kernel.
+        unsafe { crate::ntos::inc::types::Field::<u32>::at(required) }.set(size);
         return STATUS_BUFFER_TOO_SMALL_TOKEN;
     }
-    // SAFETY: o chamador deu um buffer de pelo menos sizeof(TOKEN) bytes.
-    token_from_access_information(information, unsafe { crate::ntos::inc::types::Token::at(token) });
+    // SAFETY: TOKEN_ACCESS_INFORMATION do chamador e um buffer de pelo menos
+    // sizeof(TOKEN) bytes.
+    let (information, token) = unsafe { (TokenAccessInformation::at(information), crate::ntos::inc::types::Token::at(token)) };
+    token_from_access_information(information, token);
     0
 }
 

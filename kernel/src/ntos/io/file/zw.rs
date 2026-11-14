@@ -403,6 +403,20 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
     publish_file_handle(entry, output, io_status, information)
 }
 
+/// NtCreateFile pelo export do kernel. O modo do chamador é o PreviousMode
+/// da thread, como no NtCreateFile do NT: KernelMode (DriverEntry, thread de
+/// sistema) abre como o ZwCreateFile; UserMode (um driver no contexto de um
+/// serviço do modo usuário) trata os ponteiros como do modo usuário, com as
+/// sondagens e a captura do serviço NtCreateFile.
+#[allow(clippy::too_many_arguments)]
+pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_status: u64, allocation: u64, file_attributes: u32, share_access: u32, disposition: u32, options: u32, ea_length: u32) -> Result<u32, KernelError> {
+    if crate::ntos::ps::previous_mode::get()? == 0 {
+        return create_kernel_file(handle, desired_access, attributes, io_status, share_access, disposition, options);
+    }
+    let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_length, handle_attributes: 0 };
+    crate::ntos::ps::user::files::open_nt_file(handle, attributes, io_status, disposition, &request)
+}
+
 /// ZwOpenFile = ZwCreateFile com FILE_OPEN (compartilhamento e opções não
 /// são repassados).
 pub fn open_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64) -> Result<u32, KernelError> {

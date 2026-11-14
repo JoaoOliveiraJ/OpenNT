@@ -359,7 +359,10 @@ fn registry_defaults(assert: Assert) {
     guest::write32(context, (-8i32) as u32);
     let sized = query(DIRECT, 11, block + 0x598, 8) == Some(0) && guest::read64(context) == 0x8877_6655_4433_2211;
     guest::write_bytes(context, &[0u8; 0x20]);
-    let too_small = query(DIRECT, 11, block + 0x598, 8) == Some(signed_status(0xC000_0023));
+    // Sem espaço para o cabeçalho, o RtlpQueryRegistryDirect devolve
+    // STATUS_BUFFER_TOO_SMALL sem gravar, e o RtlpCallQueryRegistryRoutine o
+    // troca por sucesso (cmp eax, 0xC0000023; cmovne em 0x6b9e4f).
+    let too_small = query(DIRECT, 11, block + 0x598, 8) == Some(0) && guest::read_bytes(context, 0x10) == [0u8; 0x10];
     assert(overrun && measured && dword && none && sized && too_small, "fs-imports: RtlQueryRegistryValues com os defaults e o DIRECT do RtlpQueryRegistryDirect");
     guest::free_bytes(block);
 }

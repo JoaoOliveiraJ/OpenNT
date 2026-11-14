@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1882 && abi_names::GROUP_LAYOUT.len() == 423 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1882 exports em 423 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1884 && abi_names::GROUP_LAYOUT.len() == 425 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1884 exports em 425 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1925,7 +1925,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1882 && exports::export_names().len() == 1882, "ntoskrnl: 423 grupos com os 1882 exports implementados");
+    assert(exports::implemented() == 1884 && exports::export_names().len() == 1884, "ntoskrnl: 425 grupos com os 1884 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -2645,6 +2645,8 @@ fn io_group_exports(assert: Assert) {
     let driver = driver_node.and_then(object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
     let base = if driver != 0 { at::<nt::DriverObject>(driver).driver_start.get() } else { 0 };
     assert(loaded.is_ok() && driver != 0, "io: driver de teste carregado");
+    let service_key = if driver != 0 { crate::ntos::rtl::guest_strings::read_unicode_string(at::<nt::DriverExtension>(at::<nt::DriverObject>(driver).driver_extension.get()).service_key_name.address()) } else { String::new() };
+    assert(service_key == "opennt-io", "io: DriverExtension->ServiceKeyName com o nome do servico (IopLoadDriver)");
     let block = guest::alloc_bytes(0x1000);
     let output = block + 0xF00;
     // IoCreateDevice: DEVICE_OBJECT com extensão, no namespace e na lista do driver.
@@ -2785,7 +2787,19 @@ fn ob_group_exports(assert: Assert) {
     assert(status(call_export("ObReferenceObjectByPointer", &[current, 0, object_types::process_type().pointer, 1])) == 0 && status(call_export("ObReferenceObjectByPointer", &[current, 0, object_types::thread_type().pointer, 1])) == 0xC000_0024 && status(call_export("ObReferenceObjectByPointer", &[0, 0, 0, 0])) == 0xC000_000D, "ob: ObReferenceObjectByPointer confere o tipo em modo usuario");
     call_export("ObDereferenceObject", &[current]);
     // Segurança, device maps e histórico de referências.
-    assert(status(call_export("ObSetSecurityObjectByPointer", &[device, 0x5000, 4])) == 0 && object_security::security_descriptor(device) == Some(0x5000) && call_export("ObIsDosDeviceLocallyMapped", &[0]) == Some(0), "ob: descritor de seguranca e device maps");
+    // ObSetSecurityObjectByPointer(Object, DACL_SECURITY_INFORMATION, Sd):
+    // a DACL nova entra numa cópia mesclada com o descritor do dispositivo
+    // (o do IoCreateDevice); o descritor do chamador não fica retido.
+    let security = guest::alloc_bytes(0x100);
+    let (new_descriptor, new_acl, world) = (security, security + 0x40, security + 0xC0);
+    guest::write_bytes(world, &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+    let built = status(call_export("RtlCreateSecurityDescriptor", &[new_descriptor, 1])) == 0 && status(call_export("RtlCreateAcl", &[new_acl, 0x40, 2])) == 0 && status(call_export("RtlAddAccessAllowedAce", &[new_acl, 2, 0x0012_0089, world])) == 0 && status(call_export("RtlSetDaclSecurityDescriptor", &[new_descriptor, 1, new_acl, 0])) == 0;
+    let original = object_security::security_descriptor(device);
+    let merged = status(call_export("ObSetSecurityObjectByPointer", &[device, 4, new_descriptor]));
+    let current = object_security::security_descriptor(device);
+    let current_dacl = current.and_then(crate::ntos::se::query_descriptor::read_descriptor).and_then(|descriptor| descriptor.dacl);
+    assert(built && original.is_some() && merged == 0 && current.is_some_and(|current| current != new_descriptor && Some(current) != original) && current_dacl.is_some_and(|acl| acl.len() >= 28 && acl[4..6] == [1, 0] && acl[16..28] == [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]) && call_export("ObIsDosDeviceLocallyMapped", &[0]) == Some(0), "ob: ObSetSecurityObjectByPointer mescla a DACL numa copia e device maps");
+    guest::free_bytes(security);
     reference_trace::clear();
     reference_trace::set_enabled(true);
     let _ = ob::reference_with_tag(device, 0x4142_4344, false);
@@ -3507,7 +3521,63 @@ fn rtl_group_exports(assert: Assert) {
     for buffer in [text_name, text_data, string, text_table] {
         guest::free_bytes(buffer);
     }
+    // RtlpQueryRegistryValues: a chave precisa abrir (o netio.sys consulta
+    // Services\NETIO, que não existe, e conta com a falha da abertura), com
+    // ou sem RTL_REGISTRY_OPTIONAL.
+    let absent = block + 0xB00;
+    guest_strings::write_wide_string(absent, "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\OpenNtRtlAusente");
+    default_entry.flags.set(0x20);
+    default_entry.default_type.set(4);
+    guest::write32(defaulted, 0);
+    assert(call("RtlQueryRegistryValues", &[0, absent, table, 0, 0]) as u32 == 0xC000_0034 && call("RtlQueryRegistryValuesEx", &[0x8000_0000, absent, table, 0, 0]) as u32 == 0xC000_0034 && guest::read32(defaulted) == 0, "rtl: RtlQueryRegistryValues com a chave ausente devolve a falha da abertura sem defaults");
+    // DIRECT de REG_SZ numa UNICODE_STRING de Buffer nulo: alocada com o
+    // tamanho do dado, Length sem o terminador; com Buffer curto,
+    // STATUS_BUFFER_TOO_SMALL vira sucesso sem gravar.
+    let (text_name, text) = (block + 0xBA0, block + 0xBC0);
+    guest_strings::write_wide_string(text_name, "Texto");
+    guest_strings::write_wide_string(text, "rede");
+    assert(call("RtlWriteRegistryValue", &[1, relative, text_name, 1, text, 10]) == 0, "rtl: RtlWriteRegistryValue REG_SZ");
+    let string_entry = at::<nt::RtlQueryRegistryTable>(table + nt::RtlQueryRegistryTable::SIZE);
+    let unicode = at::<nt::UnicodeString>(block + 0xBE0);
+    unicode.length.set(0);
+    unicode.maximum_length.set(0);
+    unicode.buffer.set(0);
+    string_entry.name.set(text_name);
+    string_entry.entry_context.set(unicode.address());
+    string_entry.default_type.set(0);
+    query_entry.flags.set(0x20);
+    let queried = call("RtlQueryRegistryValues", &[0, path, table, 0, 0]);
+    let copied = unicode.buffer.get() != 0 && unicode.length.get() == 8 && unicode.maximum_length.get() == 10 && guest_strings::read_wide_string(unicode.buffer.get()) == "rede";
+    assert(queried == 0 && copied, "rtl: RtlQueryRegistryValues DIRECT REG_SZ aloca a UNICODE_STRING");
+    let _ = call("RtlFreeUnicodeString", &[unicode.address()]);
+    let short = block + 0xC40;
+    unicode.length.set(0);
+    unicode.maximum_length.set(4);
+    unicode.buffer.set(short);
+    guest::write32(short, 0xABCD);
+    assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) == 0 && guest::read32(short) == 0xABCD && unicode.length.get() == 0, "rtl: RtlQueryRegistryValues DIRECT REG_SZ em buffer curto (BUFFER_TOO_SMALL engolido)");
+    // Default REG_SZ sem dado nem tamanho: STATUS_DATA_OVERRUN; REG_EXPAND_SZ
+    // com '%' (sem NOEXPAND) não é expandido no kernel: STATUS_INVALID_PARAMETER.
+    string_entry.name.set(missing_name);
+    string_entry.default_type.set(1);
+    string_entry.default_data.set(0);
+    string_entry.default_length.set(0);
+    assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) as u32 == 0xC000_003C, "rtl: RtlQueryRegistryValues default REG_SZ nulo -> STATUS_DATA_OVERRUN");
+    guest_strings::write_wide_string(text, "%SystemRoot%");
+    assert(call("RtlWriteRegistryValue", &[1, relative, text_name, 2, text, 26]) == 0, "rtl: RtlWriteRegistryValue REG_EXPAND_SZ");
+    string_entry.name.set(text_name);
+    string_entry.default_type.set(0);
+    unicode.maximum_length.set(64);
+    assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) as u32 == 0xC000_000D, "rtl: RtlQueryRegistryValues REG_EXPAND_SZ com '%' sem NOEXPAND -> STATUS_INVALID_PARAMETER");
+    string_entry.flags.set(0x30);
+    unicode.buffer.set(block + 0xC80);
+    assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) == 0 && unicode.length.get() == 24 && guest_strings::read_wide_string(block + 0xC80) == "%SystemRoot%", "rtl: RtlQueryRegistryValues REG_EXPAND_SZ com NOEXPAND copia o texto cru");
+    assert(call("RtlDeleteRegistryValue", &[1, relative, text_name]) == 0, "rtl: RtlDeleteRegistryValue do texto");
     assert(call("RtlDeleteRegistryValue", &[1, relative, value_name]) == 0 && call("RtlDeleteRegistryValue", &[1, relative, value_name]) as u32 == 0xC000_0034, "rtl: RtlDeleteRegistryValue remove o valor");
+    // RTL_REGISTRY_CONTROL: o prefixo do RtlpRegistryPaths é CurrentControlSet\Control.
+    guest::write32(data, 0x1234);
+    let control = call("RtlWriteRegistryValue", &[2, relative, value_name, 4, data, 4]) == 0 && crate::ntos::cm::registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\OpenNtRtlTest", "Valor").is_some_and(|value| value.data == [0x34, 0x12, 0, 0]);
+    assert(control && call("RtlDeleteRegistryValue", &[2, relative, value_name]) == 0, "rtl: RTL_REGISTRY_CONTROL relativo a CurrentControlSet\\Control");
     // SID S-1-5-32-544.
     let (sid, authority, copy) = (block + 0xA00, block + 0xA40, block + 0xA60);
     guest::write_bytes(authority, &[0, 0, 0, 0, 0, 5]);
@@ -6492,6 +6562,8 @@ fn se_access_from_state_exports(assert: Assert) {
     let required = guest::alloc_bytes(4);
     let required_cell = at::<nt::Field<u32>>(required);
     assert(call_export("SeTokenFromAccessInformation", &[information, token, 0x100, required]) == Some(0xFFFF_FFFF_C000_0023) && required_cell.get() == 0x498, "se-access-from-state: buffer menor que TOKEN = STATUS_BUFFER_TOO_SMALL com 0x498");
+    required_cell.set(0);
+    assert(call_export("SeTokenFromAccessInformation", &[0, 0, 0, required]) == Some(0xFFFF_FFFF_C000_0023) && required_cell.get() == 0x498, "se-access-from-state: consulta do tamanho com Info e Token nulos");
     required_cell.set(0);
     assert(call_export("SeTokenFromAccessInformation", &[information, token, 0x498, required]) == Some(0) && required_cell.get() == 0, "se-access-from-state: SeTokenFromAccessInformation monta o TOKEN");
     let built = at::<nt::Token>(token);
@@ -12076,6 +12148,203 @@ fn fsrtl_ecp_initialize_exports(assert: Assert) {
     }
 }
 
+/// ZwCreateKey de modo kernel com OBJ_FORCE_ACCESS_CHECK e um descritor cujo
+/// dono e grupo são a SID nula (o NsipEnsureKeyExistsWithSecurityDescriptor
+/// do netio.sys em Control\Nsi): o SeAssignSecurity só valida o dono com o
+/// PreviousMode em UserMode, então a chave é criada (REG_CREATED_NEW_KEY).
+fn cm_kernel_create_explicit_owner(assert: Assert) {
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let block = guest::alloc_bytes(0x400);
+    let (descriptor, null_sid, output, disposition) = (block + 0x200, block + 0x280, block + 0x300, block + 0x308);
+    guest::write_bytes(null_sid, &[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let built = status(call_export("RtlCreateSecurityDescriptor", &[descriptor, 1])) == 0 && status(call_export("RtlSetOwnerSecurityDescriptor", &[descriptor, null_sid, 0])) == 0 && status(call_export("RtlSetGroupSecurityDescriptor", &[descriptor, null_sid, 0])) == 0;
+    let attributes = object_attributes_for(block, "\\Registry\\Machine\\Software\\OpenNT-dono-nulo", 0x640);
+    at::<nt::ObjectAttributes>(attributes).security_descriptor.set(descriptor);
+    let created = status(call_export("ZwCreateKey", &[output, 0x5_0000, attributes, 0, 0, 0, disposition]));
+    assert(built && created == 0 && guest::read32(disposition) == 1, "cm: ZwCreateKey de modo kernel aceita o dono explicito (SID nula) com OBJ_FORCE_ACCESS_CHECK");
+    if created == 0 {
+        let key = guest::read64(output);
+        // ObReferenceObjectByHandle do handle de chave (o NsiSetObjectSecurity
+        // do netio.sys): o corpo da chave, do tipo Key, retido até o
+        // ObDereferenceObject.
+        let body_out = block + 0x310;
+        let referenced = status(call_export("ObReferenceObjectByHandle", &[key, 0, 0, 0, body_out, 0]));
+        let body = guest::read64(body_out);
+        let typed = status(call_export("ObReferenceObjectByHandle", &[key, 0, crate::ntos::ob::object_types::key_type().pointer, 0, body_out + 8, 0]));
+        let mismatch = status(call_export("ObReferenceObjectByHandle", &[key, 0, crate::ntos::ob::object_types::event_type().pointer, 0, body_out + 8, 0]));
+        let held = crate::ntos::cm::key::objects::get(body).map_or(0, |key_body| key_body.references);
+        let _ = call_export("ObDereferenceObject", &[body]);
+        let _ = call_export("ObDereferenceObject", &[body]);
+        let released = crate::ntos::cm::key::objects::get(body).map_or(0, |key_body| key_body.references);
+        assert(referenced == 0 && typed == 0 && guest::read64(body_out + 8) == body && mismatch == 0xC000_0024 && held >= 2 && released + 2 == held, "ob: ObReferenceObjectByHandle de um handle de chave devolve o corpo Key retido");
+        let _ = call_export("ZwDeleteKey", &[key]);
+        let _ = call_export("ZwClose", &[key]);
+    }
+    guest::free_bytes(block);
+}
+
+/// Descritores dos DEVICE_OBJECTs e DRIVER_OBJECTs (IoCreateDevice +
+/// ObInsertObject): o modelo do IopCreateDefaultDeviceSecurityDescriptor
+/// pelo DeviceType, o descritor final pelo ObGetObjectSecurity (owner do
+/// token, DACL presente com os direitos genéricos mapeados pelo tipo
+/// Device) e a liberação na destruição.
+fn io_device_security_descriptors(assert: Assert) {
+    use crate::ntos::io::device_security;
+    use crate::ntos::se::query_descriptor;
+    let aces = |acl: &Option<Vec<u8>>| -> Vec<(u8, u32, Vec<u8>)> {
+        let Some(acl) = acl else { return Vec::new() };
+        let count = u16::from_le_bytes([acl[4], acl[5]]) as usize;
+        let mut offset = 8;
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            let size = u16::from_le_bytes([acl[offset + 2], acl[offset + 3]]) as usize;
+            entries.push((acl[offset], u32::from_le_bytes([acl[offset + 4], acl[offset + 5], acl[offset + 6], acl[offset + 7]]), acl[offset + 8..offset + size].to_vec()));
+            offset += size;
+        }
+        entries
+    };
+    let world = alloc::vec![1u8, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let network = device_security::default_descriptor(0x12, 0);
+    let network_aces = aces(&network.dacl);
+    assert(network.control & 4 != 0 && network.sacl.is_none() && network_aces.len() == 4 && network_aces[0] == (0, 0x2000_0000, world.clone()) && network_aces[1].1 == 0x1000_0000 && network_aces[2].1 == 0x1000_0000 && network_aces[3].1 == 0x2000_0000, "io-device-security: FILE_DEVICE_NETWORK usa a SePublicDefaultUnrestrictedDacl");
+    let unknown = device_security::default_descriptor(0x22, 0);
+    let unknown_aces = aces(&unknown.dacl);
+    assert(unknown_aces.len() == 4 && unknown_aces[0].1 == 0xE000_0000 && unknown_aces[3].1 == 0xA000_0000 && unknown.sacl.as_ref().is_some_and(|sacl| sacl[8] == 17 && sacl[24..28] == 0x1000u32.to_le_bytes()), "io-device-security: FILE_DEVICE_UNKNOWN usa a SePublicOpenUnrestrictedDacl com o rotulo Low");
+    let cdrom = aces(&device_security::default_descriptor(2, 0).dacl);
+    assert(cdrom.len() == 5 && cdrom[4] == (0, 0xC001_0000, alloc::vec![1, 1, 0, 0, 0, 0, 0, 5, 4, 0, 0, 0]), "io-device-security: CD-ROM ganha a ACE de INTERACTIVE");
+    // O descritor atribuído a um dispositivo, pelo ObGetObjectSecurity.
+    let object = guest::alloc_bytes(0x40);
+    let outputs = guest::alloc_bytes(0x10);
+    device_security::assign_device(object, 0x12, 0);
+    let got = call_export("ObGetObjectSecurity", &[object, outputs, outputs + 8]).map(|value| value as u32);
+    let descriptor = guest::read64(outputs);
+    let read = query_descriptor::read_descriptor(descriptor);
+    let mapped = read.as_ref().map(|descriptor| aces(&descriptor.dacl)).unwrap_or_default();
+    let owner = read.as_ref().and_then(|descriptor| descriptor.owner.clone()).unwrap_or_default();
+    assert(got == Some(0) && descriptor != 0 && !owner.is_empty() && mapped.len() == 4 && mapped[0].1 == 0x1200A0 && mapped[1].1 == 0x1F01FF, "io-device-security: o dispositivo tem descritor com owner e a DACL mapeada pelo tipo Device");
+    device_security::release(object);
+    let _ = call_export("ObGetObjectSecurity", &[object, outputs, outputs + 8]);
+    assert(guest::read64(outputs) == 0, "io-device-security: a destruicao do dispositivo retira o descritor");
+    // DRIVER_OBJECT: a DACL padrão do token de quem carrega.
+    device_security::assign_driver(object);
+    let _ = call_export("ObGetObjectSecurity", &[object, outputs, outputs + 8]);
+    let driver_descriptor = query_descriptor::read_descriptor(guest::read64(outputs));
+    assert(driver_descriptor.as_ref().is_some_and(|descriptor| descriptor.control & 4 != 0 && descriptor.owner.is_some()), "io-device-security: o DRIVER_OBJECT tem descritor com a DACL padrao do token");
+    device_security::release(object);
+    guest::free_bytes(outputs);
+    guest::free_bytes(object);
+    // Um DEVICE_OBJECT registrado fora do IoCreateDevice (os PDOs dos
+    // barramentos e do IoReportDetectedDevice) também recebe o descritor, e o
+    // ObSetSecurityObjectByPointer troca a DACL dele (o volmgr.sys faz isso no
+    // PDO relatado); a destruição tira o descritor da tabela.
+    fn free_test_pdo(pointer: u64) {
+        guest::free_bytes(pointer);
+    }
+    let pdo = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    let body = at::<nt::DeviceObject>(pdo);
+    body.type_.set(3);
+    body.size.set(nt::DeviceObject::SIZE as u16);
+    body.reference_count.set(1);
+    body.device_type.set(4);
+    let registered = crate::ntos::ob::objects::device::register(pdo, Some(free_test_pdo), None).is_ok();
+    let had_descriptor = crate::ntos::ob::object_security::security_descriptor(pdo).is_some();
+    let replacement = guest::alloc_bytes(0x40);
+    let built = call_export("RtlCreateSecurityDescriptor", &[replacement, 1]) == Some(0) && call_export("RtlSetDaclSecurityDescriptor", &[replacement, 1, 0, 0]) == Some(0);
+    let replaced = call_export("ObSetSecurityObjectByPointer", &[pdo, 4, replacement]) == Some(0);
+    let retired = matches!(crate::ntos::ob::objects::device::retire(pdo), Ok(true));
+    let forgotten = crate::ntos::ob::object_security::security_descriptor(pdo).is_none();
+    guest::free_bytes(replacement);
+    assert(registered && had_descriptor && built && replaced && retired && forgotten, "io-device-security: PDO registrado fora do IoCreateDevice tem descritor que o ObSetSecurityObjectByPointer troca");
+}
+
+/// Os eventos de memória do MiInitializeMemoryEvents em \KernelObjects: os
+/// onze nomes da MiMemoryEventNames existem, e o ZwOpenEvent do
+/// LowPagedPoolCondition (o do tcpip.sys) abre um evento não sinalizado,
+/// com o HighPagedPoolCondition sinalizado (pool folgado).
+fn mm_memory_events(assert: Assert) {
+    use crate::ntos::ob::object_manager;
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let names = ["LowPagedPoolCondition", "HighPagedPoolCondition", "LowNonPagedPoolCondition", "HighNonPagedPoolCondition", "LowMemoryCondition", "HighMemoryCondition", "LowCommitCondition", "HighCommitCondition", "MaximumCommitCondition", "MemoryErrors", "PhysicalMemoryChange"];
+    assert(names.iter().all(|name| object_manager::lookup(&alloc::format!("\\KernelObjects\\{name}")).is_some()), "mm-memory-events: os onze eventos de memoria em \\KernelObjects");
+    let block = guest::alloc_bytes(0x200);
+    let state = |name: &str| -> Option<u64> {
+        let attributes = object_attributes_for(block, &alloc::format!("\\KernelObjects\\{name}"), 0x240);
+        if status(call_export("ZwOpenEvent", &[block + 0x100, 0x0010_0001, attributes])) != 0 {
+            return None;
+        }
+        let handle = guest::read64(block + 0x100);
+        let referenced = status(call_export("ObReferenceObjectByHandle", &[handle, 0x0010_0001, 0, 0, block + 0x110, 0]));
+        let object = guest::read64(block + 0x110);
+        let signaled = if referenced == 0 { call_export("KeReadStateEvent", &[object]) } else { None };
+        if referenced == 0 {
+            let _ = call_export("ObDereferenceObject", &[object]);
+        }
+        let _ = call_export("ZwClose", &[handle]);
+        signaled
+    };
+    assert(state("LowPagedPoolCondition") == Some(0) && state("HighPagedPoolCondition") == Some(1), "mm-memory-events: ZwOpenEvent do LowPagedPoolCondition (nao sinalizado) e o HighPagedPoolCondition sinalizado");
+    guest::free_bytes(block);
+}
+
+/// O repositório persistente do NSI: as chaves dos módulos em Control\Nsi
+/// existem.
+fn cm_network_defaults(assert: Assert) {
+    use crate::ntos::cm::registry;
+    let root = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nsi";
+    let modules = ["{eb004a00-9b1a-11d4-9123-0050047759bc}", "{eb004a03-9b1a-11d4-9123-0050047759bc}", "{eb004a1c-9b1a-11d4-9123-0050047759bc}"];
+    let present = modules.iter().all(|module| {
+        let handle = registry::open(&alloc::format!("{root}\\{module}")).unwrap_or(0);
+        if handle != 0 {
+            registry::close_handle(handle);
+        }
+        handle != 0
+    });
+    assert(present, "cm-network-defaults: chaves dos modulos do NSI em Control\\Nsi");
+}
+
+/// HalTranslateBusAddress: no Isa (1) e no PCIBus (5) o endereço traduzido
+/// é o de barramento, o resultado é TRUE e o AddressSpace não muda (o
+/// HalTranslateBusAddress e o HalpTranslateBusAddress do ntoskrnl 19041).
+fn hal_translate_bus_address_exports(assert: Assert) {
+    let block = guest::alloc_bytes(0x20);
+    let (space, translated) = (block, block + 8);
+    let mut results = Vec::new();
+    for (interface, address, space_value) in [(1u64, 0x000A_0000u64, 0u32), (5, 0xFEBC_0000, 0), (5, 0xC000, 1)] {
+        guest::write32(space, space_value);
+        guest::write64(translated, 0xDEAD_BEEF);
+        let result = call_export("HalTranslateBusAddress", &[interface, 0, address, space, translated]).map(|value| value as u8);
+        results.push(result == Some(1) && guest::read64(translated) == address && guest::read32(space) == space_value);
+    }
+    assert(results.iter().all(|&ok| ok), "hal-bus-translation: HalTranslateBusAddress devolve TRUE com o endereco de barramento e o AddressSpace intacto");
+    guest::free_bytes(block);
+}
+
+/// NtCreateFile pelo export, chamado de modo kernel (PreviousMode =
+/// KernelMode na thread do teste): cria o arquivo como o ZwCreateFile, com o
+/// handle e o IO_STATUS_BLOCK (FILE_CREATED); FILE_OPEN do mesmo nome dá
+/// FILE_OPENED e um nome ausente com FILE_OPEN, STATUS_OBJECT_NAME_NOT_FOUND.
+fn nt_create_file_exports(assert: Assert) {
+    use crate::drivers::fs::memory_file_system;
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let block = guest::alloc_bytes(0x400);
+    let (output, io_status, buffer) = (block + 0x300, block + 0x310, block + 0x340);
+    assert(crate::ntos::ps::previous_mode::get().is_ok_and(|mode| mode == 0), "nt-create-file: thread do teste em KernelMode");
+    let attributes = object_attributes_for(block, "\\FS\\opennt-nt-create.txt", 0x240);
+    guest::write64(io_status + 8, 0xFFFF);
+    let created = call_export("NtCreateFile", &[output, 0x12019F, attributes, io_status, 0, 0x80, 3, 2, 0x20, 0, 0]);
+    let file = guest::read64(output);
+    assert(status(created) == 0 && file != 0 && guest::read64(io_status + 8) == 2 && memory_file_system::exists("/opennt-nt-create.txt"), "nt-create-file: FILE_CREATE de modo kernel cria o arquivo (FILE_CREATED)");
+    guest::write_bytes(buffer, b"NtCreateFile");
+    let written = call_export("ZwWriteFile", &[file, 0, 0, 0, io_status, buffer, 12, 0, 0]);
+    assert(status(written) == 0 && status(call_export("ZwClose", &[file])) == 0 && memory_file_system::read_bytes("/opennt-nt-create.txt").is_some_and(|bytes| bytes == b"NtCreateFile"), "nt-create-file: o handle escreve e fecha");
+    let reopened = call_export("NtCreateFile", &[output, 0x120089, attributes, io_status, 0, 0, 1, 1, 0x20, 0, 0]);
+    assert(status(reopened) == 0 && guest::read64(io_status + 8) == 1 && status(call_export("ZwClose", &[guest::read64(output)])) == 0, "nt-create-file: FILE_OPEN do arquivo existente (FILE_OPENED)");
+    let missing = object_attributes_for(block, "\\FS\\opennt-nt-ausente.txt", 0x240);
+    assert(status(call_export("NtCreateFile", &[output, 0x120089, missing, io_status, 0, 0, 1, 1, 0x20, 0, 0])) == 0xC000_0034, "nt-create-file: FILE_OPEN de um nome ausente -> STATUS_OBJECT_NAME_NOT_FOUND");
+    memory_file_system::remove("/opennt-nt-create.txt");
+    guest::free_bytes(block);
+}
+
 /// ZwAdjustPrivilegesToken sobre um token Medium próprio (handle de kernel):
 /// as duas passadas do SepAdjustPrivileges, o PreviousState, as recusas de
 /// integridade, DisableAll e SE_PRIVILEGE_REMOVED (vetores do modelo).
@@ -13705,6 +13974,7 @@ fn se_filter_token_exports(assert: Assert) {
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
+    super::import_cycle::run(assert);
     ntoskrnl_exports(assert);
     ntoskrnl_small_groups(assert);
     native_context_execution(assert);
@@ -13972,6 +14242,12 @@ pub fn run(assert: Assert) {
     zw_wnf_name_information_exports(assert);
     zw_alpc_server_and_lpc_exports(assert);
     super::fs_driver_imports::run(assert);
+    nt_create_file_exports(assert);
+    hal_translate_bus_address_exports(assert);
+    cm_kernel_create_explicit_owner(assert);
+    io_device_security_descriptors(assert);
+    mm_memory_events(assert);
+    cm_network_defaults(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

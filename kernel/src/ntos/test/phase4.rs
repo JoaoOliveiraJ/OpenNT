@@ -684,10 +684,19 @@ fn fs_volume_queries(assert: Assert) {
     guest::write64(table + 0x18, test_get_file_name as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64);
     guest::write64(table + 0x20, test_release_file_name as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64);
     let previous = filters::exchange_callbacks(table);
-    let status = filters::get_file_name_information(0xF11E, 0x101, 0xAA, 0xBB);
+    // FILE_OBJECT com DeviceObject (um arquivo de uma pilha de dispositivos).
+    let file_object = guest::alloc_bytes(crate::ntos::inc::types::FileObject::SIZE);
+    guest::write64(file_object + core::mem::offset_of!(crate::ntos::inc::types::FileObject, device_object) as u64, 0xD0D0);
+    let status = filters::get_file_name_information(file_object, 0x101, 0xAA, 0xBB);
     let seen: alloc::vec::Vec<u64> = FILTER_SEEN.iter().take(4).map(|slot| slot.load(core::sync::atomic::Ordering::SeqCst)).collect();
     filters::release_file_name_information(0xBB);
-    assert(previous == 0 && status == 0x1234 && seen == alloc::vec![0xF11E, 0x101, 0xAA, 0xBB] && FILTER_SEEN[4].load(core::sync::atomic::Ordering::SeqCst) == 0xBB, "filter: callbacks dos slots 0x18 e 0x20");
+    assert(previous == 0 && status == 0x1234 && seen == alloc::vec![file_object, 0x101, 0xAA, 0xBB] && FILTER_SEEN[4].load(core::sync::atomic::Ordering::SeqCst) == 0xBB, "filter: callbacks dos slots 0x18 e 0x20");
+    // Arquivo do volume de boot do kernel (sem DeviceObject): o Filter
+    // Manager não é chamado.
+    FILTER_SEEN[0].store(0, core::sync::atomic::Ordering::SeqCst);
+    guest::write64(file_object + core::mem::offset_of!(crate::ntos::inc::types::FileObject, device_object) as u64, 0);
+    assert(filters::get_file_name_information(file_object, 0x101, 0xAA, 0xBB) == 0xC000_00BB && FILTER_SEEN[0].load(core::sync::atomic::Ordering::SeqCst) == 0, "filter: FILE_OBJECT sem pilha de dispositivos nao vai ao Filter Manager");
+    guest::free_bytes(file_object);
     assert(filters::exchange_callbacks(previous) == table && filters::current_callbacks() == 0, "filter: dono restaurado");
     guest::free_bytes(table);
 }

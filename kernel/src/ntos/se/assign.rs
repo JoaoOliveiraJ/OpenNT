@@ -61,9 +61,9 @@ fn captured_from(pointer: u64) -> Option<Captured> {
     })
 }
 
-/// Owner/group padrão para CREATOR OWNER/GROUP: do token primário do subject
-/// context, com recuo ao token corrente e, em último caso, ao SYSTEM.
-fn subject_owner_group(subject: u64) -> (Vec<u8>, Vec<u8>) {
+/// Token do subject context: o primário, com recuo ao cliente e ao token
+/// do processo corrente.
+fn subject_token(subject: u64) -> u64 {
     let mut token = 0;
     if subject != 0 {
         // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador.
@@ -74,10 +74,24 @@ fn subject_owner_group(subject: u64) -> (Vec<u8>, Vec<u8>) {
     if token == 0 {
         token = process::get_primary_token(process::get_current_process()).unwrap_or(0);
     }
+    token
+}
+
+/// Owner/group padrão para CREATOR OWNER/GROUP: do token do subject
+/// context e, em último caso, o SYSTEM.
+fn subject_owner_group(subject: u64) -> (Vec<u8>, Vec<u8>) {
     let default = || sid(5, &[18]);
-    tokens::with(token, |token| (token.owner.clone(), token.primary_group.clone()))
+    tokens::with(subject_token(subject), |token| (token.owner.clone(), token.primary_group.clone()))
         .map(|(owner, group)| (if owner.is_empty() { default() } else { owner }, if group.is_empty() { default() } else { group }))
         .unwrap_or_else(|| (default(), default()))
+}
+
+/// A DACL padrão do token do subject context, codificada (`None` = o token
+/// não tem DACL padrão).
+fn subject_default_dacl(subject: u64) -> Option<Vec<u8>> {
+    let token = subject_token(subject);
+    tokens::with(token, |_| ())?;
+    crate::ntos::se::policy_descriptor::capture(&crate::ntos::ob::object_access::capture(Some(token))).ok()?.dacl
 }
 
 /// Captured -> SECURITY_DESCRIPTOR_RELATIVE. Ordem de campos indiferente; os
@@ -118,10 +132,7 @@ fn serialize_relative(descriptor: &Captured) -> Vec<u8> {
 
 /// Serializa e publica `*out` com uma cópia pooled self-relative do descritor.
 fn publish(descriptor: &Captured, out: u64) {
-    let bytes = serialize_relative(descriptor);
-    let pointer = guest::alloc_bytes(bytes.len() as u64);
-    guest::write_bytes(pointer, &bytes);
-    super::out::<u64>(out).set(pointer);
+    super::out::<u64>(out).set(publish_descriptor(descriptor));
 }
 
 /// Núcleo comum de SeAssignSecurity/SeAssignSecurityEx: monta o `creator`
@@ -133,24 +144,46 @@ pub fn assign(parent_ptr: u64, explicit_ptr: u64, out: u64, container: bool, aut
         return STATUS_INVALID_PARAMETER;
     }
     let mapping = read_mapping(map);
-    let parent = captured_from(parent_ptr);
-    let explicit = captured_from(explicit_ptr);
-    let (owner_default, group_default) = subject_owner_group(subject);
-    let creator = Captured {
-        control: explicit.as_ref().map_or(0, |captured| captured.control),
-        owner: explicit.as_ref().filter(|captured| !captured.owner.is_empty()).map_or(owner_default, |captured| captured.owner.clone()),
-        group: explicit.as_ref().filter(|captured| !captured.group.is_empty()).map_or(group_default, |captured| captured.group.clone()),
-        dacl: explicit.as_ref().and_then(|captured| captured.dacl.clone()),
-        sacl: explicit.as_ref().and_then(|captured| captured.sacl.clone()),
-    };
-    match inherit_descriptor::assign(parent.as_ref(), &creator, &mapping, auto_flags & 3, container) {
-        Ok(Ok(result)) => {
+    match assign_components(captured_from(parent_ptr).as_ref(), captured_from(explicit_ptr).as_ref(), &mapping, container, auto_flags, subject) {
+        Ok(result) => {
             publish(&result, out);
             0
         }
-        Ok(Err(status)) => status,
-        Err(_) => STATUS_INVALID_SECURITY_DESCR,
+        Err(status) => status,
     }
+}
+
+/// O descritor de um objeto novo a partir dos componentes já lidos, como o
+/// RtlpNewSecurityObject: sem DACL explícita, a DACL padrão do token entra
+/// com DACL_DEFAULTED (a herança do pai prevalece sobre ela).
+pub fn assign_components(parent: Option<&Captured>, explicit: Option<&Captured>, mapping: &[u32; 4], container: bool, auto_flags: u32, subject: u64) -> Result<Captured, u32> {
+    let (owner_default, group_default) = subject_owner_group(subject);
+    let mut creator = Captured {
+        control: explicit.map_or(0, |captured| captured.control),
+        owner: explicit.filter(|captured| !captured.owner.is_empty()).map_or(owner_default, |captured| captured.owner.clone()),
+        group: explicit.filter(|captured| !captured.group.is_empty()).map_or(group_default, |captured| captured.group.clone()),
+        dacl: explicit.and_then(|captured| captured.dacl.clone()),
+        sacl: explicit.and_then(|captured| captured.sacl.clone()),
+    };
+    if creator.control & DACL_PRESENT == 0 {
+        if let Some(dacl) = subject_default_dacl(subject) {
+            creator.control |= DACL_PRESENT | DACL_DEFAULTED;
+            creator.dacl = Some(dacl);
+        }
+    }
+    match inherit_descriptor::assign(parent, &creator, mapping, auto_flags & 3, container) {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(status)) => Err(status),
+        Err(_) => Err(STATUS_INVALID_SECURITY_DESCR),
+    }
+}
+
+/// Publica `descriptor` como uma cópia self-relative no convidado.
+pub fn publish_descriptor(descriptor: &Captured) -> u64 {
+    let bytes = serialize_relative(descriptor);
+    let pointer = guest::alloc_bytes(bytes.len() as u64);
+    guest::write_bytes(pointer, &bytes);
+    pointer
 }
 
 /// SeDeassignSecurity: libera `*descriptor_pointer` e zera o ponteiro.

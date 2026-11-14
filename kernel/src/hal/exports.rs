@@ -93,6 +93,20 @@ pub mod hal_platform {
     };
 }
 
+pub mod hal_bus_translation {
+    //! HalTranslateBusAddress — adaptador de `hal::pci_native`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::hal::pci_native;
+    use crate::rtl::KernelError;
+
+    fn translate_bus_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(pci_native::translate_bus_address(call.arg(1) as u32, call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "hal-bus-translation", names: &["HalTranslateBusAddress"], handlers: &[translate_bus_address], data_exports: &[] };
+}
+
 pub mod hvi {
     //! Interface de hypervisor (Hvi*, Sk*, Vsl*).
     //!

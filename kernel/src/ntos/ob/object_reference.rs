@@ -14,6 +14,7 @@
 use alloc::format;
 use core::sync::atomic::Ordering;
 
+use crate::ntos::cm::key::{objects as key_objects, services as key_services};
 use crate::ntos::ex::callbacks as executive_callbacks;
 use crate::ntos::inc::types::{DeviceObject, Field, NtStruct, ObjectHandleInformation};
 use crate::ntos::init::exports::signed_status;
@@ -98,6 +99,10 @@ pub fn reference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -> 
     if object_header::is_object(pointer) {
         return Ok(object_header::reference(pointer, 1) as u64);
     }
+    if key_objects::get(pointer).is_some() {
+        key_objects::hold(pointer);
+        return Ok(key_objects::get(pointer).map_or(0, |body| body.references as u64));
+    }
     if namespace_objects::get(pointer).is_some() {
         return namespace_objects::reference(pointer);
     }
@@ -140,6 +145,10 @@ pub fn dereference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -
     require_owner(pointer, allow_legacy_device, "ObfDereferenceObjectWithTag")?;
     if object_header::is_object(pointer) {
         return Ok(object_header::dereference(pointer, false) as u64);
+    }
+    if key_objects::get(pointer).is_some() {
+        key_objects::release(pointer)?;
+        return Ok(key_objects::get(pointer).map_or(0, |body| body.references as u64));
     }
     if namespace_objects::get(pointer).is_some() {
         return namespace_objects::dereference(pointer);
@@ -201,6 +210,34 @@ pub fn dereference_defer_delete(pointer: u64, tag: u32) -> Result<(), KernelErro
 
 pub(crate) fn type_differs(requested: u64, expected: u64) -> bool {
     requested != 0 && requested != expected
+}
+
+/// Handle de chave do registro (ZwCreateKey/ZwOpenKey): o corpo da chave
+/// (tipo Key), retido pelo dono como o ObReferenceObjectByHandle faz com o
+/// CM_KEY_BODY; o ObDereferenceObject do chamador devolve a retenção. `None`
+/// = o handle não é de chave.
+fn reference_key_handle(handle: u64, access: u32, object_type: u64, mode: u8, output: u64, information: u64) -> Result<Option<u64>, KernelError> {
+    if (handle as i64) < 0 || key_services::close_record((handle & 0x7FFF_FFFC) as u32).is_none() {
+        return Ok(None);
+    }
+    let mut retained = match crate::ntos::ob::handles::security::reference_kernel_handle(handle)? {
+        Ok(retained) => retained,
+        Err(status) => return Ok(Some(signed_status(status))),
+    };
+    let key_type = object_types::key_type();
+    if retained.object_type.name != key_type.name || type_differs(object_type, key_type.pointer) {
+        retained.release()?;
+        return Ok(Some(signed_status(TYPE_MISMATCH)));
+    }
+    if mode != 0 && access & !retained.access != 0 {
+        retained.release()?;
+        return Ok(Some(signed_status(ACCESS_DENIED)));
+    }
+    out::<u64>(output).set(retained.pointer);
+    write_information(information, retained.attributes, retained.access);
+    // A retenção passa ao chamador.
+    core::mem::forget(retained);
+    Ok(Some(0))
 }
 
 fn write_information(information: u64, attributes: u32, access: u32) {
@@ -275,6 +312,9 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
 
 /// ObReferenceObjectByHandle(handle, access, type, mode, out, info).
 pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8, output: u64, information: u64) -> Result<u64, KernelError> {
+    if let Some(status) = reference_key_handle(handle, access, object_type, mode, output, information)? {
+        return Ok(status);
+    }
     if let Some(status) = open_pointer::reference_handle(handle, access, object_type, mode, output, information)? {
         return Ok(status as u64);
     }

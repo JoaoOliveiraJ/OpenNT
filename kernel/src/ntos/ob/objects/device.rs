@@ -137,6 +137,9 @@ pub fn register(pointer: u64, destroy: Option<fn(u64)>, unlink: Option<fn(u64)>)
     object_types::device_type();
     open_pointer::register_owner(Slot::Device, is_device, &OWNER);
     object_types::bind_native(pointer, "Device")?;
+    // O descritor padrão do IoCreateDevice, pelo DeviceType e pelas
+    // Characteristics já gravados.
+    crate::ntos::io::device_security::assign_device(pointer, device(pointer).device_type.get(), device(pointer).characteristics.get());
     Ok(pointer)
 }
 
@@ -185,6 +188,7 @@ fn collect(pointer: u64) {
     };
     let Some(record) = removed else { return };
     object_types::unbind_native(pointer);
+    crate::ntos::io::device_security::release(pointer);
     if let Some(destroy) = record.destroy {
         destroy(pointer);
     }

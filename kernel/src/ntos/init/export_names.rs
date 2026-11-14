@@ -429,9 +429,11 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("mm-change-image-protection", 1872, 1),
     ("ex-update-license-data", 1873, 1),
     ("cm-hive", 1874, 8),
+    ("nt-create-file", 1882, 1),
+    ("hal-bus-translation", 1883, 1),
 ];
 
-/// Os 1882 exports de função, na ordem da ABI.
+/// Os 1884 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2315,4 +2317,6 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwSaveKey",
     "ZwSaveKeyEx",
     "ZwRestoreKey",
+    "NtCreateFile",
+    "HalTranslateBusAddress",
 ];

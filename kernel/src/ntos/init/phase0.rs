@@ -146,9 +146,27 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     object_manager::create_directory("\\KernelObjects")?;
     crate::ntos::mm::partition::init()?;
     crate::ntos::mm::partition::install();
-    // Eventos de pressão de memória e de commit abertos pelo mountmgr.
-    for name in ["HighMemoryCondition", "LowMemoryCondition", "HighCommitCondition", "LowCommitCondition", "MaximumCommitCondition"] {
-        crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, false)?;
+    // Os eventos de memória do MiInitializeMemoryEvents (a tabela
+    // MiMemoryEventNames, na ordem dela): pool paginável e não paginável,
+    // memória, commit, erros de memória e mudança da memória física. Com o
+    // pool folgado, o MiInitializePagedPoolEvents e o
+    // MiSignalNonPagedPoolWatchers deixam os High*PoolCondition sinalizados
+    // e os Low* não (o mountmgr abre os de memória e de commit; o tcpip.sys
+    // abre o LowPagedPoolCondition).
+    for (name, signaled) in [
+        ("LowPagedPoolCondition", false),
+        ("HighPagedPoolCondition", true),
+        ("LowNonPagedPoolCondition", false),
+        ("HighNonPagedPoolCondition", true),
+        ("LowMemoryCondition", false),
+        ("HighMemoryCondition", false),
+        ("LowCommitCondition", false),
+        ("HighCommitCondition", false),
+        ("MaximumCommitCondition", false),
+        ("MemoryErrors", false),
+        ("PhysicalMemoryChange", false),
+    ] {
+        crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, signaled)?;
     }
     object_manager::mount("\\FS", &memory_file_system::VOLUME)?;
     object_manager::create_symlink("\\DosDevices\\C:", "\\FS")?;

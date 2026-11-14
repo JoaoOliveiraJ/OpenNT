@@ -469,16 +469,13 @@ pub mod se_access_from_state {
     //! Adaptadores de SeTokenFromAccessInformation e SeAccessCheckFromStateEx
     //! (lógica em `se/access_check.rs`).
 
-    use crate::ntos::inc::types::{Field, NtStruct, TokenAccessInformation};
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::ntos::se::access_check;
     use crate::rtl::KernelError;
 
     /// (PTOKEN_ACCESS_INFORMATION, PVOID Token, ULONG Length, PULONG RequiredLength).
     fn token_from_access_information(call: &Call) -> Result<u64, KernelError> {
-        // SAFETY: TOKEN_ACCESS_INFORMATION capturado e PULONG de saída do chamador.
-        let (information, required) = unsafe { (TokenAccessInformation::at(call.arg(1)), Field::<u32>::at(call.arg(4))) };
-        Ok(signed_status(access_check::token_from_access_information_checked(information, call.arg(2), call.arg(3) as u32, required)))
+        Ok(signed_status(access_check::token_from_access_information_checked(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4))))
     }
 
     /// (Sd, PrimaryToken, ClientToken, Desired, PrevGranted, Privileges,

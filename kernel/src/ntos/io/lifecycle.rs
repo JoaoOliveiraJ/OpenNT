@@ -143,6 +143,7 @@ fn destroy_driver(driver: u64) {
         }
     }
     guest::free_bytes(entry.name_buffer);
+    super::device_security::release(driver);
     guest::free_bytes(driver);
 }
 
@@ -172,6 +173,11 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
     object.driver_extension.set(extension);
     driver_extension.driver_object.set(driver);
     driver_extension.add_device.set(0);
+    // ServiceKeyName: o nome do serviço, como o IopLoadDriver o publica (o
+    // IoOpenDriverRegistryKey abre Services\<ServiceKeyName>).
+    driver_extension.service_key_name.length.set(name_units.len() as u16 * 2);
+    driver_extension.service_key_name.maximum_length.set(name_units.len() as u16 * 2 + 2);
+    driver_extension.service_key_name.buffer.set(name_buffer);
     let node = match io_manager::create_native_driver(name, driver) {
         Ok(node) => node,
         Err(error) => {
@@ -192,6 +198,7 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
         guest::free_bytes(driver);
         return Err(error);
     }
+    super::device_security::assign_driver(driver);
     Ok(driver)
 }
 

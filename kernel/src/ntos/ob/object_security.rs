@@ -37,6 +37,11 @@ pub fn security_descriptor(object: u64) -> Option<u64> {
     SECURITY_DESCRIPTORS.lock().get(&object).copied()
 }
 
+/// Retira o descritor da tabela lateral (destruição do objeto).
+pub fn forget_security(object: u64) -> Option<u64> {
+    SECURITY_DESCRIPTORS.lock().remove(&object)
+}
+
 /// ObSetSecurityObjectByPointer: o descritor fica na tabela lateral (o
 /// slot do OBJECT_HEADER no NT).
 pub fn set_security_object_by_pointer(object: u64, descriptor: u64) -> u32 {
@@ -45,6 +50,29 @@ pub fn set_security_object_by_pointer(object: u64, descriptor: u64) -> u32 {
     }
     SECURITY_DESCRIPTORS.lock().insert(object, descriptor);
     STATUS_SUCCESS
+}
+
+/// ObSetSecurityObjectByPointer(Object, SecurityInformation,
+/// SecurityDescriptor): como o procedimento de segurança do tipo com
+/// SetSecurityDescriptor, o descritor corrente do objeto mescla os
+/// componentes pedidos (SeSetSecurityDescriptorInfo, com o mapeamento
+/// genérico do tipo) e a cópia nova passa a ser a do objeto; o descritor do
+/// chamador não fica retido (o ndis.sys libera o seu logo depois).
+pub fn set_security_object_by_pointer_merged(object: u64, information: u32, descriptor: u64) -> u32 {
+    if object == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let object_type = object_header::object_type_info(object).or_else(|| object_types::bound(object)).or_else(|| object_create::created_type(object));
+    let mapping = object_type.as_ref().map_or(0, mapping_block);
+    let block = guest::alloc_bytes(16);
+    out::<u32>(block).set(information);
+    out::<u64>(block + 8).set(0);
+    let status = set_security_descriptor_info(object, block, descriptor, block + 8, mapping);
+    guest::free_bytes(block);
+    if mapping != 0 {
+        guest::free_bytes(mapping);
+    }
+    status
 }
 
 // --- ObCheckObjectAccess --------------------------------------------------

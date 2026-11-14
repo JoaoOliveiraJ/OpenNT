@@ -46,8 +46,9 @@ fn is_dos_device_locally_mapped(_: &Call) -> Result<u64, KernelError> {
     Ok(object_manager::is_dos_device_locally_mapped() as u64)
 }
 
+/// ObSetSecurityObjectByPointer(Object, SecurityInformation, SecurityDescriptor).
 fn set_security_object_by_pointer(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(object_security::set_security_object_by_pointer(call.arg(1), call.arg(2))))
+    Ok(signed_status(object_security::set_security_object_by_pointer_merged(call.arg(1), call.arg(2) as u32, call.arg(3))))
 }
 
 pub static GROUP: Group = Group {

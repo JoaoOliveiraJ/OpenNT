@@ -58,7 +58,10 @@ pub fn access_policy(descriptor: &Captured) -> SecurityPolicy {
 }
 
 /// A captura valida antes de ler os componentes. Owner e group ausentes vêm
-/// do sujeito; a DACL padrão dele perde para a herança do pai.
+/// do sujeito; a DACL padrão dele perde para a herança do pai. Com o
+/// requisitante em UserMode (`enforce_access_check`), o dono explícito precisa
+/// ser o usuário ou um grupo dono do token (ou SeRestorePrivilege) e a SACL
+/// exige SeSecurityPrivilege; em KernelMode o RtlpNewSecurityObject não valida.
 pub fn create(parent: &Captured, source: u64, enforce_access_check: bool) -> Result<Result<Captured, u32>, KernelError> {
     let Some(token) = object_access::subject() else { return Ok(Err(0xC000_007C)) };
     if source != 0 && !descriptor::valid(source) {

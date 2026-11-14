@@ -122,3 +122,16 @@ pub fn kd_get_pci_data_by_offset(bus: u32, slot: u32, buffer: u64, offset: u32, 
 pub fn kd_set_pci_data_by_offset(bus: u32, slot: u32, buffer: u64, offset: u32, length: u32) -> Result<u32, KernelError> {
     kd_transfer(bus, slot, buffer, offset, length, true)
 }
+
+/// HalTranslateBusAddress(InterfaceType, BusNumber, BusAddress,
+/// AddressSpace, TranslatedAddress) -> BOOLEAN, como no ntoskrnl 19041: fora
+/// do PCIBus (5) o endereço traduzido é o próprio endereço de barramento; no
+/// PCIBus a chamada vai ao tradutor que o HalpInitNonBusHandler instala
+/// (HalpTranslateBusAddress), que faz o mesmo. Nos dois casos o resultado é
+/// TRUE e o AddressSpace fica como veio (espaços de memória e de I/O são
+/// identidade nesta plataforma).
+pub fn translate_bus_address(_interface_type: u32, _bus_number: u32, bus_address: u64, _address_space: u64, translated_address: u64) -> bool {
+    // SAFETY: PHYSICAL_ADDRESS* de saída do chamador de modo kernel.
+    unsafe { <crate::ntos::inc::field::Field<u64> as crate::ntos::inc::field::NtStruct>::at(translated_address) }.set(bus_address);
+    true
+}
