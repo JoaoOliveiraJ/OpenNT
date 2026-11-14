@@ -242,6 +242,11 @@ pub fn iof_complete_request(packet: u64) -> i32 {
             if result == STATUS_MORE_PROCESSING_REQUIRED {
                 return result;
             }
+        } else if control & SL_PENDING_RETURNED != 0 && current_location <= stack_count {
+            // Sem rotina, o pending sobe para o slot que ficou corrente (o
+            // IoMarkIrpPending que o IopfCompleteRequest faz no lugar dela).
+            let next = location_at(current_stack);
+            next.control.set(next.control.get() | SL_PENDING_RETURNED);
         }
         reviewed += IoStackLocation::SIZE;
         current_location += 1;

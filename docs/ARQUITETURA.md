@@ -1406,7 +1406,9 @@ discos. Sem a opção nada disso roda.
     leitura que estava pendente), grava o IOSB, sinaliza o evento ou
     FileObject->Event, libera o IRP e solta o arquivo (a última referência,
     em PASSIVE_LEVEL). O IofCompleteRequest mantém Irp->PendingReturned como
-    o NT, pelo SL_PENDING_RETURNED de cada slot. A saída de uma thread
+    o NT, pelo SL_PENDING_RETURNED de cada slot, e num slot sem rotina de
+    conclusão passa o SL_PENDING_RETURNED ao slot de cima (o IoMarkIrpPending
+    que o IopfCompleteRequest faz no lugar da rotina). A saída de uma thread
     cancela as IRPs dela. As classes de acesso, modo, alinhamento e posição
     o próprio I/O Manager responde.
   - Teste: `ntos/test/multiprocess/pipes.rs` (fase 7): um servidor e um
