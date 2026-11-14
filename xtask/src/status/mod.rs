@@ -15,8 +15,9 @@
 //! - `docs/status/*.svg`: selos e gráfico por prefixo, também usados no README;
 //! - `docs/ROADMAP.md`: as fases e o estado de cada componente.
 //!
-//! As listas que crescem (componentes, módulos, exports) são paginadas por
-//! um script inline pequeno; sem JavaScript, tudo aparece numa página só.
+//! As listas que crescem (componentes, módulos, exports) aparecem inteiras,
+//! com busca e filtro por um script inline pequeno (sem JavaScript, só a
+//! busca some).
 //!
 //! Entradas: o PE de referência (em cache em `docs/status/ntoskrnl-exports.def`),
 //! a lista de módulos planejados (`docs/status/modulos-planejados.txt`), a

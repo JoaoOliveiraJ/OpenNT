@@ -1,14 +1,12 @@
 //! `modulos.html`: o plano de módulos do kernel, por subsistema, com o que
 //! já tem código.
 
-use super::super::{ModuleRow, Report, SubsystemRow, MODULE_STATES};
+use super::super::{ModuleRow, ModuleState, Report, SubsystemRow, MODULE_STATES};
+use super::assets::FILTER_SCRIPT;
 use super::common::{
-    anchor, big_stat, code, escape, filter_bar, hero, html_page, icon_tile, int, meter, module_badge, module_key,
-    module_label, module_meaning, module_tag, percent, phase_label, plural, ring_stat, section, CHEVRON, PAGER_SCRIPT,
+    anchor, code, escape, filter_bar, html_page, icon_tile, int, meter, module_badge, module_key, module_label,
+    module_meaning, module_tag, page_head, page_name, percent, phase_label, plural, section, stat, Toggle, CHEVRON,
 };
-
-/// Linhas por página na tabela de módulos de cada subsistema.
-const MODULES_PER_PAGE: usize = 20;
 
 /// Áreas da página, na ordem: (título, descrição).
 const AREAS: &[(&str, &str)] = &[
@@ -44,18 +42,18 @@ const RUST_ROOT: &str = "kernel/src/";
 /// vem sem a pasta do subsistema, o estado é um marcador só de CSS e a busca
 /// usa o texto da própria linha.
 fn module_row(module: &ModuleRow, folder: &str, tests_column: bool) -> String {
-    let note = if module.note.is_empty() { String::new() } else { format!("<div class=\"note\">{}</div>", escape(&module.note)) };
+    let note = if module.note.is_empty() { String::new() } else { format!(" <span class=\"note\">{}</span>", escape(&module.note)) };
     let rust = match &module.rust {
         Some(path) => code(path.strip_prefix(RUST_ROOT).unwrap_or(path)),
         None => "<span class=\"muted\">—</span>".to_string(),
     };
     let tested = match (tests_column, module.tested) {
         (false, _) => "",
-        (true, true) => "<td class=\"yes\">sim</td>",
+        (true, true) => "<td><span class=\"mark yes\">sim</span></td>",
         (true, false) => "<td class=\"no\">—</td>",
     };
     format!(
-        "<tr data-item data-state=\"{key}\"><td><code>{name}</code>{note}</td><td>{tag}</td><td>{rust}</td>{tested}</tr>",
+        "<tr data-item data-state=\"{key}\"><td><code>{name}</code>{note}</td><td>{tag}</td><td class=\"wrap-code\">{rust}</td>{tested}</tr>",
         key = module_key(module.state),
         name = escape(module.name.strip_prefix(folder).and_then(|rest| rest.strip_prefix('/')).unwrap_or(&module.name)),
         tag = module_tag(module.state),
@@ -89,28 +87,28 @@ fn subsystem_block(row: &SubsystemRow, report: &Report) -> String {
         facts.push(format!("{} fora da conta", int(row.out_of_scope())));
     }
     let phase = if row.phase.is_empty() { String::new() } else { format!("{} · ", phase_label(&row.phase, &report.phases)) };
-    let notes = if row.notes.is_empty() { String::new() } else { format!("<p class=\"note\">{}</p>", escape(&row.notes)) };
+    let notes = if row.notes.is_empty() { String::new() } else { format!("<p class=\"notes\">{}</p>", escape(&row.notes)) };
     let tests_column = !row.is_tests;
     let header = format!(
-        "<th>{} (em {})</th><th>Estado</th><th>Arquivo Rust (em {})</th>{}",
+        "<th scope=\"col\">{} (em {})</th><th scope=\"col\">Estado</th><th scope=\"col\">Arquivo Rust (em {})</th>{}",
         if tests_column { "Módulo planejado" } else { "Suíte planejada" },
         code(&format!("{}/", row.folder)),
         code(RUST_ROOT),
-        if tests_column { "<th>Autoteste</th>" } else { "" }
+        if tests_column { "<th scope=\"col\">Autoteste</th>" } else { "" }
     );
     let rows: String = row.modules.iter().map(|module| module_row(module, &row.folder, tests_column)).collect();
     format!(
-        "<details class=\"subsys\" id=\"s-{id}\" data-section><summary>{tile}<div><div class=\"sname\">{name}{folder}</div>\
+        "<details class=\"sub\" id=\"s-{id}\" data-section><summary>{tile}<div><div class=\"sname\">{name} {folder}</div>\
          <div class=\"sdesc\">{description}</div></div>{meter}<div class=\"snums\">{short}</div>{CHEVRON}</summary>\
-         <div class=\"inner\"><p class=\"small\">{phase}{facts}</p>{notes}<div class=\"scroll\" \
-         data-paginate=\"{MODULES_PER_PAGE}\"><table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></div>\
-         </div></details>",
+         <div class=\"inner\"><p class=\"small\">{phase}{facts}</p>{notes}<div class=\"table-wrap\"><table>\
+         <caption class=\"sr-only\">Módulos planejados de {name}</caption><thead><tr>{header}</tr></thead><tbody>{rows}</tbody>\
+         </table></div></div></details>",
         id = anchor(&row.folder),
         tile = icon_tile(&row.icon, if row.covered() == 0 { "dim sm" } else { "sm" }),
         name = escape(&row.name),
         folder = code(&row.folder),
         description = escape(&row.description),
-        meter = meter(row.done, row.partial, row.planned, &percent(row.covered(), row.planned)),
+        meter = meter(&[(row.done, ""), (row.partial, "part")], row.planned, None),
         facts = facts.join(" · "),
     )
 }
@@ -120,53 +118,87 @@ pub fn page(report: &Report) -> String {
     let pending = planned - done - partial;
     let suites = report.subsystems.iter().filter(|row| row.is_tests).map(|row| row.planned).sum::<usize>();
     let out: usize = report.subsystems.iter().map(SubsystemRow::out_of_scope).sum();
-    let mut body = hero(
-        "Plano do kernel",
+    let mut body = page_head(
+        &[],
+        "Módulos do kernel",
         "Módulos do kernel",
         "Quanto do plano de código do kernel já foi escrito, subsistema por subsistema.",
-        "Um <strong>módulo</strong> é uma unidade planejada de código do kernel, com nome no formato \
+        "<p class=\"sub\">Um <strong>módulo</strong> é uma unidade planejada de código do kernel, com nome no formato \
          <code>pasta/nome</code>: por exemplo, <code>ntos/ob/handle_table</code> é a tabela de handles do \
          gerenciador de objetos. Um módulo conta quando o arquivo Rust dele existe. Isso mede quanto código já foi \
          escrito, <strong>não</strong> se ele funciona; para isso, veja os <a href=\"testes.html\">testes</a> e os \
-         <a href=\"componentes.html\">componentes</a>.",
+         <a href=\"componentes.html\">componentes</a>.</p>",
         &format!(
             "{}{}{}{}",
-            ring_stat(
-                done + partial,
-                planned,
+            stat(
                 "Módulos com código",
-                &format!("{} de {} planejados ({} completos e {} parciais)", int(done + partial), int(planned), int(done), int(partial))
+                &int(done + partial),
+                &format!("de {}", int(planned)),
+                &meter(
+                    &[(done, ""), (partial, "part")],
+                    planned,
+                    Some(&format!("{} de {} módulos com código, {} parciais", int(done + partial), int(planned), int(partial)))
+                ),
+                &format!(
+                    "{} de {} planejados ({} completos e {} parciais) · {}",
+                    int(done + partial),
+                    int(planned),
+                    int(done),
+                    int(partial),
+                    percent(done + partial, planned)
+                )
             ),
-            big_stat(&int(pending), "Pendentes", "ainda sem arquivo Rust"),
-            big_stat(&int(report.modules_tested()), "Usados por autotestes", "importados diretamente por uma suíte de teste"),
-            big_stat(&int(suites), "Suítes de autoteste", "planejadas; entram no total de módulos"),
+            stat("Pendentes", &int(pending), "", "", "ainda sem arquivo Rust"),
+            stat("Usados por autotestes", &int(report.modules_tested()), "", "", "importados diretamente por uma suíte de teste"),
+            stat("Suítes de autoteste", &int(suites), "", "", "planejadas; entram no total de módulos"),
         ),
     );
 
-    let mut legend = String::from("<div class=\"explain\"><div class=\"legend\">");
+    let mut legend = String::from("<div class=\"legend\">");
     for state in MODULE_STATES {
-        legend.push_str(&format!("<div>{}<span>{}</span></div>", module_badge(*state), module_meaning(*state)));
+        legend.push_str(&format!("<div>{}<p>{}</p></div>", module_badge(*state), module_meaning(*state)));
     }
     legend.push_str(&format!(
         "</div><p class=\"small\"><strong>Autoteste: sim</strong> quer dizer que uma suíte de \
          <code>kernel/src/ntos/test/</code> importa o arquivo do módulo diretamente. Os demais podem ser exercitados \
          de forma indireta pelos <a href=\"testes.html\">testes de boot</a>. A barra de cada subsistema mostra os \
          módulos com código em azul e os parciais em amarelo. {} ficam fora de todas as contas.</p>\
-         <p class=\"small\">De onde vêm os dados: a lista de módulos é <code>docs/status/modulos-planejados.txt</code>; \
+         <p class=\"small muted\">De onde vêm os dados: a lista de módulos é <code>docs/status/modulos-planejados.txt</code>; \
          o gerador procura um arquivo Rust de mesma pasta e mesmo nome em <code>kernel/src</code>, ou o arquivo \
          declarado em <code>[correspondencias]</code> no <code>components.toml</code>. Parciais e fora da conta são \
-         declarados nas tabelas <code>[parciais]</code> e <code>[fora_do_escopo]</code>.</p></div>",
+         declarados nas tabelas <code>[parciais]</code> e <code>[fora_do_escopo]</code>.</p>",
         plural(out, "módulo descartado", "módulos descartados")
     ));
-    body.push_str(&section("legenda", "Como ler", "O que significa cada estado", "", &legend));
+    body.push_str(&section("legenda", "O que significa cada estado", "", &format!("<div class=\"callout\">{legend}</div>")));
 
-    let states: Vec<(&str, &str)> = MODULE_STATES.iter().map(|state| (module_key(*state), module_label(*state))).collect();
+    let count = |state: ModuleState| report.subsystems.iter().flat_map(|row| &row.modules).filter(|module| module.state == state).count();
+    let dots: Vec<String> =
+        MODULE_STATES.iter().map(|state| format!("<span class=\"ms {}\" aria-hidden=\"true\"></span>", module_key(*state))).collect();
+    let toggles: Vec<Toggle> = MODULE_STATES
+        .iter()
+        .zip(&dots)
+        .map(|(state, dot)| (module_key(*state), module_label(*state), count(*state), dot.as_str()))
+        .filter(|toggle| toggle.2 > 0)
+        .collect();
     let total_modules: usize = report.subsystems.iter().map(|row| row.modules.len()).sum();
-    let mut list = filter_bar("módulo ou arquivo, ex.: handle_table", &states, total_modules, ("módulo listado", "módulos listados"));
-    list.push_str(
-        "<p class=\"small muted\">Clique num subsistema para ver os módulos. A busca abre os subsistemas que têm \
-         resultados.</p>",
+    let mut list = filter_bar(
+        "subsistemas",
+        "Filtrar módulos",
+        "Buscar módulo ou arquivo, ex.: handle_table",
+        &toggles,
+        total_modules,
+        ("módulo listado", "módulos listados"),
     );
+    let jump: String = AREAS
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| report.subsystems.iter().any(|row| area_of(&row.folder) == *index))
+        .map(|(_, (title, _))| format!("<li><a href=\"#area-{}\">{}</a></li>", anchor(title), escape(title)))
+        .collect();
+    list.push_str(&format!(
+        "<nav aria-label=\"Áreas\"><ul class=\"jump\">{jump}</ul></nav><p class=\"small muted\">Clique num subsistema para \
+         ver os módulos. A busca abre os subsistemas que têm resultados.</p>"
+    ));
     for (index, (title, description)) in AREAS.iter().enumerate() {
         let rows: Vec<&SubsystemRow> = report.subsystems.iter().filter(|row| area_of(&row.folder) == index).collect();
         if rows.is_empty() {
@@ -177,7 +209,7 @@ pub fn page(report: &Report) -> String {
         let blocks: String = rows.iter().map(|row| subsystem_block(row, report)).collect();
         list.push_str(&format!(
             "<div class=\"area\" id=\"area-{}\" data-group><h3>{} <span class=\"muted\">{} · {} de {} com \
-             código</span></h3><p class=\"small muted\">{}</p>{blocks}</div>",
+             código</span></h3><p>{}</p>{blocks}</div>",
             anchor(title),
             escape(title),
             plural(rows.len(), "subsistema", "subsistemas"),
@@ -186,12 +218,12 @@ pub fn page(report: &Report) -> String {
             escape(description),
         ));
     }
-    body.push_str(&section("subsistemas", "Por dentro", "Subsistemas", "", &list));
+    body.push_str(&section("subsistemas", "Subsistemas", "", &list));
     html_page(
         "modulos.html",
-        "Módulos do kernel · OpenNT",
+        &format!("{} · OpenNT", page_name("modulos.html")),
         "O plano de módulos do kernel do OpenNT, por subsistema, e quais já têm código.",
         &body,
-        &[PAGER_SCRIPT],
+        &[FILTER_SCRIPT],
     )
 }

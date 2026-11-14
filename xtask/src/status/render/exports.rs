@@ -1,18 +1,17 @@
-//! `ntoskrnl.html` (resumo dos exports, gráfico, glossário e busca) e uma
-//! página por grupo de prefixo (`ntoskrnl-<grupo>.html`) com a lista
-//! paginada dos nomes.
+//! `ntoskrnl.html` (resumo dos exports, busca por nome, tabela por prefixo e
+//! o que é cada grupo) e uma página por grupo de prefixo
+//! (`ntoskrnl-<grupo>.html`) com a lista completa dos nomes, filtrável.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::{ExportReport, Report, State, Tally};
+use super::assets::{FILTER_SCRIPT, SEARCH_SCRIPT};
 use super::common::{
-    anchor, big_stat, code, component_anchor, escape, filter_bar, hero, icon_tile, int, meter, html_page, percent, plural,
-    ring_stat, section, PAGER_SCRIPT,
+    anchor, code, component_anchor, escape, filter_bar, html_page, icon, icon_tile, int, meter, page_head, page_name,
+    percent, plural, section, stat, Toggle,
 };
 use super::components::WINDOWS_DRIVERS;
 
-/// Linhas por página nas listas de cada grupo.
-const EXPORTS_PER_PAGE: usize = 100;
 /// Resultados mostrados pela busca da página principal.
 const SEARCH_RESULTS: usize = 40;
 
@@ -241,35 +240,8 @@ fn examples(name: &str, names: &BTreeSet<&str>) -> String {
     if found.is_empty() {
         String::new()
     } else {
-        format!("<div class=\"examples\">Exemplos: {}</div>", found.join(" "))
+        format!("<p class=\"examples\">Exemplos: {}</p>", found.join(" "))
     }
-}
-
-fn prefix_row(name: &str, tally: &Tally, names: &BTreeSet<&str>, exports: &ExportReport) -> String {
-    let info = prefix_info(name);
-    let mut description = format!(
-        "<a class=\"pill\" href=\"{}\">{}</a> · {}",
-        group_file(name),
-        escape(name),
-        escape(info.long)
-    );
-    if name == "outros" {
-        description.push_str(&format!("<div class=\"examples\">Maiores subgrupos: {}</div>", other_prefixes(exports)));
-    }
-    description.push_str(&examples(name, names));
-    format!(
-        "<div class=\"card lift prefix\" id=\"g-{id}\">{icon}<div>{description}</div><div class=\"nums\"><strong>{covered}\
-         </strong> de {reference} no OpenNT · faltam {missing}{bar}<span class=\"muted\">{pct} · \
-         <a href=\"{file}\">ver a lista</a></span></div></div>",
-        id = anchor(name),
-        icon = icon_tile(prefix_icon(name), ""),
-        covered = int(tally.opennt),
-        reference = int(tally.reference),
-        missing = int(tally.missing()),
-        bar = meter(tally.opennt, 0, tally.reference, &percent(tally.opennt, tally.reference)),
-        pct = escape(&percent(tally.opennt, tally.reference)),
-        file = group_file(name),
-    )
 }
 
 /// Os dados da busca: um token por export, `<tipo><grupo><nome>`, onde o
@@ -296,70 +268,178 @@ fn search_data(exports: &ExportReport) -> (String, String) {
     (tokens.join(" "), format!("[{}]", labels.join(",")))
 }
 
-const SEARCH_SCRIPT: &str = r#"
-(function(){
-  var input=document.getElementById('busca'),out=document.getElementById('resultados'),info=document.getElementById('busca-info');
-  var E=EXPORTS.split(' ');
-  function rank(token,q){var l=token.slice(2).toLowerCase();return l===q?0:(l.indexOf(q)===0?1:2);}
-  input.addEventListener('input',function(){
-    var q=input.value.trim().toLowerCase(),hits=[],html='';
-    if(!q){out.innerHTML='';info.textContent='';return;}
-    E.forEach(function(token){if(token.slice(2).toLowerCase().indexOf(q)>=0)hits.push(token);});
-    hits.sort(function(a,b){return rank(a,q)-rank(b,q)||(a.slice(2)<b.slice(2)?-1:1);});
-    hits.slice(0,LIMIT).forEach(function(token){
-      var kind=token.charAt(0),group=GROUPS[token.charCodeAt(1)-97],name=token.slice(2),yes=kind==='a'||kind==='c';
-      html+='<li><a href="ntoskrnl-'+group[0]+'.html#e-'+name+'"><code>'+name+'</code></a><span class="muted">'+
-        (kind<'c'?'função':'variável')+' · grupo '+group[1]+'</span>'+
-        (yes?'<span class="yes">o OpenNT exporta</span>':'<span class="no">falta no OpenNT</span>')+'</li>';
-    });
-    out.innerHTML=html;
-    info.textContent=hits.length===0?'Nenhum export do ntoskrnl.exe contém esse texto.':
-      (hits.length>LIMIT?'Mostrando '+LIMIT+' de '+hits.length+' resultados; continue digitando para refinar.':
-      hits.length+(hits.length===1?' resultado.':' resultados.'));
-  });
-})();
-"#;
+
+/// O nome do export em `<code>`, com pontos de quebra (`<wbr>`) entre as
+/// palavras do nome (`Io<wbr>Create<wbr>Device`), para não quebrar no meio
+/// de uma palavra em telas estreitas.
+fn export_name(name: &str) -> String {
+    let mut output = String::from("<code>");
+    let mut previous: Option<char> = None;
+    for character in name.chars() {
+        if previous.is_some_and(|previous| previous.is_ascii_lowercase() && character.is_ascii_uppercase()) {
+            output.push_str("<wbr>");
+        }
+        output.push_str(&escape(&character.to_string()));
+        if character == '_' {
+            output.push_str("<wbr>");
+        }
+        previous = Some(character);
+    }
+    output.push_str("</code>");
+    output
+}
+
+/// Barra de um grupo: azul o que o OpenNT exporta, sobre os nomes do Windows.
+fn export_meter(tally: &Tally, label: bool) -> String {
+    let text = format!("{} de {} exportados ({})", int(tally.opennt), int(tally.reference), percent(tally.opennt, tally.reference));
+    meter(&[(tally.opennt, "")], tally.reference, label.then_some(text.as_str()))
+}
+
+/// A tabela de cobertura por prefixo, com a linha de total.
+fn prefix_table(exports: &ExportReport) -> String {
+    let mut rows = String::new();
+    for (name, tally) in groups(exports) {
+        rows.push_str(&format!(
+            "<tr><th scope=\"row\"><a href=\"{file}\">{name}</a></th><td>{short}</td><td class=\"num\"><strong>{opennt}</strong></td>\
+             <td class=\"num\">{reference}</td><td class=\"num\">{missing}</td><td class=\"num\">{pct}</td><td class=\"bar\">{bar}</td></tr>",
+            file = group_file(name),
+            name = escape(name),
+            short = escape(prefix_info(name).short),
+            opennt = int(tally.opennt),
+            reference = int(tally.reference),
+            missing = int(tally.missing()),
+            pct = escape(&percent(tally.opennt, tally.reference)),
+            bar = export_meter(tally, false),
+        ));
+    }
+    let total = &exports.total;
+    format!(
+        "<div class=\"table-wrap\"><table><caption class=\"sr-only\">Exports do ntoskrnl.exe por prefixo: quantos o OpenNT \
+         também exporta</caption><thead><tr><th scope=\"col\">Prefixo</th><th scope=\"col\">Área do kernel</th>\
+         <th scope=\"col\" class=\"num\">No OpenNT</th><th scope=\"col\" class=\"num\">No Windows</th>\
+         <th scope=\"col\" class=\"num\">Faltam</th><th scope=\"col\" class=\"num\">%</th><th scope=\"col\">Cobertura</th></tr>\
+         </thead><tbody>{rows}</tbody><tfoot><tr><th scope=\"row\">Total</th><td></td><th class=\"num\">{}</th>\
+         <th class=\"num\">{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th><td class=\"bar\">{}</td></tr></tfoot></table></div>",
+        int(total.opennt),
+        int(total.reference),
+        int(total.missing()),
+        escape(&percent(total.opennt, total.reference)),
+        export_meter(total, false)
+    )
+}
+
+fn prefix_card(name: &str, tally: &Tally, names: &BTreeSet<&str>, exports: &ExportReport) -> String {
+    let info = prefix_info(name);
+    let subgroups = if name == "outros" {
+        format!("<p class=\"examples\">Maiores subgrupos: {}</p>", other_prefixes(exports))
+    } else {
+        String::new()
+    };
+    format!(
+        "<article class=\"card prefix-card\" id=\"g-{id}\"><div class=\"top\">{tile}<h3><a href=\"{file}\">{name}</a> \
+         <span class=\"short\">{short}</span></h3></div><p>{long}</p>{subgroups}{examples}<div class=\"nums\">\
+         <strong>{covered}</strong> de {reference} no OpenNT · faltam {missing} · {pct}{bar}<a href=\"{file}\">ver a lista</a>\
+         </div></article>",
+        id = anchor(name),
+        tile = icon_tile(prefix_icon(name), "sm"),
+        file = group_file(name),
+        name = escape(name),
+        short = escape(info.short),
+        long = escape(info.long),
+        examples = examples(name, names),
+        covered = int(tally.opennt),
+        reference = int(tally.reference),
+        missing = int(tally.missing()),
+        pct = escape(&percent(tally.opennt, tally.reference)),
+        bar = export_meter(tally, false),
+    )
+}
 
 fn search_block(exports: &ExportReport) -> String {
     format!(
-        "<div class=\"js-only\"><div class=\"controls\" role=\"search\"><label>Nome <input id=\"busca\" type=\"search\" \
-         placeholder=\"ex.: IoCreateDevice\" autocomplete=\"off\"></label><span id=\"busca-info\" class=\"count muted \
-         small\" aria-live=\"polite\"></span></div><ul id=\"resultados\" class=\"results\"></ul></div>\
+        "<div class=\"searchbox\"><div class=\"js-only\"><div class=\"filters\" role=\"search\" aria-label=\"Buscar export \
+         por nome\"><div class=\"search\">{}<label class=\"sr-only\" for=\"busca\">Nome do export</label><input id=\"busca\" \
+         type=\"search\" placeholder=\"Nome do export, ex.: IoCreateDevice\" autocomplete=\"off\" spellcheck=\"false\"></div>\
+         <p id=\"busca-info\" class=\"count\" aria-live=\"polite\"></p></div><ul id=\"resultados\" class=\"results\"></ul></div>\
          <p class=\"no-js small muted\">A busca precisa de JavaScript. Sem ele, abra a lista do grupo pelo prefixo do \
-         nome (abaixo) e use a busca do navegador.</p><p class=\"small muted\">A busca procura entre os {} nomes do \
-         <code>ntoskrnl.exe</code> do Windows; o link leva à lista do grupo.</p>",
+         nome (abaixo) e use a busca do navegador.</p><p class=\"small muted hint\">A busca procura \
+         entre os {} nomes do <code>ntoskrnl.exe</code> do Windows; o link leva à lista do grupo.</p></div>",
+        icon("search"),
         int(exports.total.reference)
     )
 }
 
-pub fn page(report: &Report, chart: &str) -> String {
+pub fn page(report: &Report) -> String {
     let exports = &report.exports;
     let total = &exports.total;
     let data = total.reference - total.functions;
     let data_opennt = total.opennt - total.functions_opennt;
     let opennt_all = total.opennt + exports.opennt_extra.len();
-    let mut body = hero(
-        "Compatibilidade com o Windows 10",
+    let mut body = page_head(
+        &[],
+        "Exports do ntoskrnl",
         "Exports do ntoskrnl",
         &format!(
             "Dos {} nomes que o ntoskrnl.exe do Windows 10 exporta para os drivers, quantos o kernel do OpenNT também \
              exporta.",
             int(total.reference)
         ),
-        "<strong>O que é contado:</strong> um nome da lista do Windows conta quando aparece na tabela de exports do \
-         kernel do OpenNT. Cada nome exportado tem uma rotina ou variável do OpenNT por trás, mas ter o nome não \
-         garante que ela trate todos os casos que o Windows trata. Referência: <code>ntoskrnl.exe</code> do Windows \
-         10 22H2 (build 19045).",
+        "<p class=\"sub\"><strong>O que é contado:</strong> um nome da lista do Windows conta quando aparece na tabela de \
+         exports do kernel do OpenNT. Cada nome exportado tem uma rotina ou variável do OpenNT por trás, mas ter o nome \
+         não garante que ela trate todos os casos que o Windows trata. Referência: <code>ntoskrnl.exe</code> do Windows \
+         10 22H2 (build 19045).</p>",
         &format!(
             "{}{}{}{}",
-            ring_stat(total.opennt, total.reference, "Exportados pelo OpenNT", &format!("{} dos {} nomes da lista do Windows", int(total.opennt), int(total.reference))),
-            big_stat(&int(total.reference), "Exports do Windows", &kinds(total.functions, data)),
-            big_stat(&int(total.opennt), "Também no OpenNT", &kinds(total.functions_opennt, data_opennt)),
-            big_stat(&int(total.missing()), "Faltam no OpenNT", &kinds(total.functions - total.functions_opennt, data - data_opennt)),
+            stat(
+                "Exportados pelo OpenNT",
+                &int(total.opennt),
+                &format!("de {}", int(total.reference)),
+                &export_meter(total, true),
+                &format!(
+                    "{} dos {} nomes da lista do Windows ({})",
+                    int(total.opennt),
+                    int(total.reference),
+                    percent(total.opennt, total.reference)
+                )
+            ),
+            stat("Exports do Windows", &int(total.reference), "", "", &kinds(total.functions, data)),
+            stat("Também no OpenNT", &int(total.opennt), "", "", &kinds(total.functions_opennt, data_opennt)),
+            stat(
+                "Faltam no OpenNT",
+                &int(total.missing()),
+                "",
+                "",
+                &kinds(total.functions - total.functions_opennt, data - data_opennt)
+            ),
         ),
     );
 
-    body.push_str(&section("consulta", "Consulta", "O OpenNT exporta este nome?", "", &search_block(exports)));
+    body.push_str(&section("consulta", "O OpenNT exporta este nome?", "", &search_block(exports)));
+
+    body.push_str(&section(
+        "grupos",
+        "Exports por prefixo",
+        "O nome de cada export começa com um prefixo que indica a parte do kernel a que ele pertence. Cada grupo tem uma \
+         página com a lista completa dos nomes.",
+        &format!(
+            "{}<p class=\"small muted\">Regra de agrupamento: um nome pertence a um prefixo quando começa por ele \
+             seguido de maiúscula, ou de <code>f</code>, <code>i</code>, <code>p</code> ou <code>x</code> e maiúscula (a \
+             convenção do NT para rotinas rápidas, internas e privadas, como <code>ObfReferenceObject</code> e \
+             <code>IofCallDriver</code>). Ke reúne Ke, Kf, Ki e Kx; Ke*Irql são os desses com <code>Irql</code> no nome; \
+             Wmi/Etw inclui Wpp.</p><p class=\"small muted\">A mesma conta em gráfico, usado no README: \
+             <a href=\"../status/ntoskrnl-por-prefixo.svg\"><code>docs/status/ntoskrnl-por-prefixo.svg</code></a>.</p>",
+            prefix_table(exports)
+        ),
+    ));
+
+    let names: BTreeSet<&str> = exports.rows.iter().map(|row| row.name.as_str()).collect();
+    let cards: String = groups(exports).into_iter().map(|(name, tally)| prefix_card(name, tally, &names, exports)).collect();
+    body.push_str(&section(
+        "significados",
+        "O que é cada grupo",
+        "O que cada prefixo significa, exemplos de nomes e quanto dele o OpenNT exporta.",
+        &format!("<div class=\"prefix-cards\">{cards}</div>"),
+    ));
 
     let working: Vec<String> = report
         .components
@@ -374,17 +454,16 @@ pub fn page(report: &Report, chart: &str) -> String {
     };
     body.push_str(&section(
         "o-que-sao",
-        "Para começar",
         "O que são exports e o que este número diz",
         "",
         &format!(
-            "<div class=\"grid\"><div class=\"explain\"><h3>O que é um export?</h3>\
+            "<div class=\"grid two\"><div class=\"card\"><h3>O que é um export?</h3>\
              <p>O <code>ntoskrnl.exe</code> é o kernel do Windows. Um driver (<code>.sys</code>) não traz o kernel \
              junto: na sua tabela de importação ele lista, pelo nome, as rotinas do kernel que vai chamar, como \
              <code>IoCreateDevice</code> para criar um dispositivo ou <code>ExAllocatePoolWithTag</code> para alocar \
              memória. Essas rotinas, e algumas variáveis globais como <code>PsInitialSystemProcess</code>, são os \
              <em>exports</em> do kernel.</p></div>\
-             <div class=\"explain\"><h3>O que o número diz, e o que não diz</h3>\
+             <div class=\"card\"><h3>O que o número diz, e o que não diz</h3>\
              <p><strong>Diz</strong> quantos nomes da lista do Windows o kernel do OpenNT também exporta. Ao carregar \
              um driver, o kernel procura cada nome importado; se um único nome faltar, o driver não carrega.</p>\
              <p><strong>Não diz</strong> se cada rotina se comporta exatamente como a do Windows. Isso é verificado \
@@ -392,46 +471,10 @@ pub fn page(report: &Report, chart: &str) -> String {
         ),
     ));
 
-    body.push_str(&section(
-        "grafico",
-        "Visão por área",
-        "Exports por prefixo",
-        "O nome de cada export começa com um prefixo que indica a parte do kernel a que ele pertence.",
-        &format!(
-            "<figure><div class=\"chart\">{}</div><figcaption><strong>Como ler:</strong> cada barra é um prefixo. A \
-             barra inteira é o número de exports do Windows com aquele prefixo (a mais longa é o maior grupo); a parte \
-             azul é o que o OpenNT também exporta e a parte cinza, o que falta. À direita, a mesma conta em \
-             números.</figcaption></figure>",
-            chart.trim()
-        ),
-    ));
-
-    let names: BTreeSet<&str> = exports.rows.iter().map(|row| row.name.as_str()).collect();
-    let mut prefixes = String::from("<div class=\"prefixes\">");
-    for (name, tally) in groups(exports) {
-        prefixes.push_str(&prefix_row(name, tally, &names, exports));
-    }
-    prefixes.push_str(
-        "</div><p class=\"small muted\">Regra de agrupamento: um nome pertence a um prefixo quando começa por ele \
-         seguido de maiúscula, ou de <code>f</code>, <code>i</code>, <code>p</code> ou <code>x</code> e maiúscula (a \
-         convenção do NT para rotinas rápidas, internas e privadas, como <code>ObfReferenceObject</code> e \
-         <code>IofCallDriver</code>). Ke reúne Ke, Kf, Ki e Kx; Ke*Irql são os desses com <code>Irql</code> no nome; \
-         Wmi/Etw inclui Wpp.</p>",
-    );
-    body.push_str(&section(
-        "grupos",
-        "Glossário e listas",
-        "Os grupos de prefixo",
-        "O que cada prefixo significa e quanto dele o OpenNT exporta. Cada grupo tem uma página com a lista completa \
-         dos nomes, dividida em páginas de 100.",
-        &prefixes,
-    ));
-
     if !exports.opennt_extra.is_empty() {
         let names: Vec<String> = exports.opennt_extra.iter().map(|name| code(name)).collect();
         body.push_str(&section(
             "extras",
-            "Além da lista",
             "Nomes extras do OpenNT",
             &format!(
                 "No total, o kernel do OpenNT exporta {} nomes: os {} acima e mais {} que não estão na tabela do \
@@ -442,7 +485,7 @@ pub fn page(report: &Report, chart: &str) -> String {
                 int(exports.opennt_extra.len())
             ),
             &format!(
-                "<details><summary>Ver os {} nomes extras</summary><div class=\"inner\"><p class=\"small\">{}</p></div>\
+                "<details class=\"card\"><summary>Ver os {} nomes extras</summary><p class=\"small extra-names\">{}</p>\
                  </details>",
                 int(exports.opennt_extra.len()),
                 names.join(" ")
@@ -452,7 +495,6 @@ pub fn page(report: &Report, chart: &str) -> String {
 
     body.push_str(&section(
         "fontes",
-        "Fontes",
         "De onde vêm os números",
         "",
         &format!(
@@ -476,7 +518,7 @@ pub fn page(report: &Report, chart: &str) -> String {
     let search = format!("var EXPORTS=\"{tokens}\",GROUPS={labels},LIMIT={SEARCH_RESULTS};{SEARCH_SCRIPT}");
     html_page(
         "ntoskrnl.html",
-        "Exports do ntoskrnl · OpenNT",
+        &format!("{} · OpenNT", page_name("ntoskrnl.html")),
         "Quantos dos exports do ntoskrnl.exe do Windows 10 o kernel do OpenNT também exporta, por área do kernel.",
         &body,
         &[&search],
@@ -492,7 +534,7 @@ fn group_nav(groups: &[(&'static str, &Tally)], index: usize) -> String {
         Some((name, _)) => format!("<a href=\"{}\" rel=\"next\">{} &rarr;</a>", group_file(name), escape(name)),
         None => "<a href=\"ntoskrnl.html#grupos\">Todos os grupos &rarr;</a>".to_string(),
     };
-    format!("<nav class=\"groupnav\" aria-label=\"Grupos\">{previous}{next}</nav>")
+    format!("<nav class=\"group-nav\" aria-label=\"Grupo anterior e próximo\">{previous}{next}</nav>")
 }
 
 fn group_page(report: &Report, groups: &[(&'static str, &Tally)], index: usize) -> String {
@@ -504,64 +546,73 @@ fn group_page(report: &Report, groups: &[(&'static str, &Tally)], index: usize) 
     let variables_opennt = tally.opennt - tally.functions_opennt;
     let mut extra = examples(name, &names);
     if name == "outros" {
-        extra.push_str(&format!("<div class=\"examples\">Maiores subgrupos: {}</div>", other_prefixes(exports)));
+        extra.push_str(&format!("<p class=\"examples\">Maiores subgrupos: {}</p>", other_prefixes(exports)));
     }
+    let mut body = page_head(
+        &[("ntoskrnl.html", "Exports do ntoskrnl")],
+        &format!("{} <span class=\"muted\">(grupo {} de {})</span>", escape(name), int(index + 1), int(groups.len())),
+        &format!("{} <span class=\"muted\">· {}</span>", escape(name), escape(info.short)),
+        &escape(info.long),
+        &extra,
+        &format!(
+            "{}{}{}{}",
+            stat(
+                "Também no OpenNT",
+                &int(tally.opennt),
+                &format!("de {}", int(tally.reference)),
+                &export_meter(tally, true),
+                &format!(
+                    "{} de {} nomes deste grupo o OpenNT também exporta · {}",
+                    int(tally.opennt),
+                    int(tally.reference),
+                    percent(tally.opennt, tally.reference)
+                )
+            ),
+            stat("No Windows", &int(tally.reference), "", "", &kinds(tally.functions, variables)),
+            stat("No OpenNT", &int(tally.opennt), "", "", &kinds(tally.functions_opennt, variables_opennt)),
+            stat("Faltam", &int(tally.missing()), "", "", "nomes do Windows que o OpenNT ainda não exporta"),
+        ),
+    );
     let chips: String = groups
         .iter()
-        .map(|(other, _)| {
+        .map(|(other, other_tally)| {
             let mark = if *other == name { " aria-current=\"page\"" } else { "" };
-            format!("<a href=\"{}\"{mark}>{}</a>", group_file(other), escape(other))
+            format!(
+                "<li><a href=\"{}\"{mark}>{} <span class=\"n\">{}</span></a></li>",
+                group_file(other),
+                escape(other),
+                escape(&percent(other_tally.opennt, other_tally.reference))
+            )
         })
         .collect();
-    let mut body = format!(
-        "<div class=\"pagehead\"><p class=\"crumbs\"><a href=\"ntoskrnl.html\">Exports do ntoskrnl</a> › grupo {} de {}</p>\
-         <h1>{} <span class=\"muted\">· {}</span></h1><p class=\"lead\">{}</p><div class=\"card prefix\">{}<div>\
-         <strong>{}</strong> de {} nomes deste grupo o OpenNT também exporta · faltam {}{}<span class=\"muted small\">{} \
-         no Windows; {} no OpenNT</span>{}</div><div class=\"nums\"><strong>{}</strong></div></div></div>",
-        int(index + 1),
-        int(groups.len()),
-        escape(name),
-        escape(info.short),
-        escape(info.long),
-        icon_tile(prefix_icon(name), ""),
-        int(tally.opennt),
-        int(tally.reference),
-        int(tally.missing()),
-        meter(tally.opennt, 0, tally.reference, &percent(tally.opennt, tally.reference)),
-        kinds(tally.functions, variables),
-        kinds(tally.functions_opennt, variables_opennt),
-        extra,
-        escape(&percent(tally.opennt, tally.reference)),
-    );
-    body.push_str(&format!("<div class=\"chips\" aria-label=\"Outros grupos\">{chips}</div>"));
-    body.push_str(&group_nav(groups, index));
+    body.push_str(&format!("<nav aria-label=\"Outros grupos\"><ul class=\"jump\">{chips}</ul></nav>"));
 
     let mut rows = String::new();
     for row in exports.rows.iter().filter(|row| row.bucket == name) {
         rows.push_str(&format!(
-            "<tr id=\"e-{name}\" data-item data-state=\"{state}\" data-text=\"{text}\"><td>{code}</td><td>{kind}</td>\
-             <td>{opennt}</td></tr>",
+            "<tr id=\"e-{name}\" data-item data-state=\"{state}\" data-text=\"{text}\"><td class=\"wrap-code\">{code}</td>\
+             <td>{kind}</td><td>{opennt}</td></tr>",
             name = escape(&row.name),
             state = if row.opennt { "sim" } else { "nao" },
             text = escape(&row.name.to_lowercase()),
-            code = code(&row.name),
+            code = export_name(&row.name),
             kind = if row.data { "variável" } else { "função" },
-            opennt = if row.opennt { "<span class=\"yes\">exporta</span>" } else { "<span class=\"no\">falta</span>" },
+            opennt = if row.opennt { "<span class=\"mark yes\">exporta</span>" } else { "<span class=\"mark no\">falta</span>" },
         ));
     }
+    let toggles: [Toggle; 2] = [
+        ("sim", "O OpenNT exporta", tally.opennt, "<span class=\"mark yes\" aria-hidden=\"true\"></span>"),
+        ("nao", "Falta no OpenNT", tally.missing(), "<span class=\"mark no\" aria-hidden=\"true\"></span>"),
+    ];
     let list = format!(
-        "{}<div class=\"table-card scroll\" data-paginate=\"{EXPORTS_PER_PAGE}\"><table><thead><tr><th>Nome</th>\
-         <th>Tipo</th><th>No OpenNT</th></tr></thead><tbody>{rows}</tbody></table></div>",
-        filter_bar(
-            "parte do nome",
-            &[("sim", "que o OpenNT exporta"), ("nao", "que faltam no OpenNT")],
-            tally.reference,
-            ("export", "exports")
-        )
+        "{}<div class=\"table-wrap sticky\"><table><caption class=\"sr-only\">Exports do grupo {}</caption><thead><tr>\
+         <th scope=\"col\">Nome</th><th scope=\"col\">Tipo</th><th scope=\"col\">No OpenNT</th></tr></thead><tbody>{rows}</tbody>\
+         </table></div>",
+        filter_bar("lista", "Filtrar exports", "Buscar parte do nome", &toggles, tally.reference, ("export", "exports")),
+        escape(name)
     );
     body.push_str(&section(
         "lista",
-        "Lista",
         &format!("Os {} exports do grupo {}", int(tally.reference), escape(name)),
         "<em>Função</em> é uma rotina que o driver chama; <em>variável</em> é um dado global exportado. \
          <em>Exporta</em> quer dizer que o nome está na tabela de exports do kernel do OpenNT.",
@@ -573,7 +624,7 @@ fn group_page(report: &Report, groups: &[(&'static str, &Tally)], index: usize) 
         &format!("{name} · Exports do ntoskrnl · OpenNT"),
         &format!("Os exports {name} do ntoskrnl.exe do Windows 10 e quais o kernel do OpenNT também exporta."),
         &body,
-        &[PAGER_SCRIPT],
+        &[FILTER_SCRIPT],
     )
 }
 

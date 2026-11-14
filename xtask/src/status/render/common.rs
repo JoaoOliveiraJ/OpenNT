@@ -1,7 +1,9 @@
-//! Peças comuns das páginas: formatação, ícones, estados, CSS, a moldura da
-//! página e o script de paginação.
+//! Peças comuns das páginas: formatação, medidores, ícones, estados, a
+//! moldura da página (cabeçalho, trilha e rodapé), as seções, a barra de
+//! filtros e as notas longas. O CSS e os scripts ficam em `assets.rs`.
 
 use super::super::{ComponentRow, ModuleState, PhaseRow, Report, State};
+use super::assets::CSS;
 
 // ---- formatação ----------------------------------------------------------------
 
@@ -96,33 +98,42 @@ pub fn search_text(parts: &[&str]) -> String {
     escape(&parts.join(" ").to_lowercase())
 }
 
+
 // ---- medidores -----------------------------------------------------------------
 
-/// Barra de progresso; `partial` desenha um segundo trecho amarelo.
-pub fn meter(done: usize, partial: usize, whole: usize, label: &str) -> String {
-    let mut bar = format!("<div class=\"meter\" role=\"img\" aria-label=\"{}\">", escape(label));
-    if done > 0 {
-        bar.push_str(&format!("<span style=\"width:{}\"></span>", css_width(done, whole)));
-    }
-    if partial > 0 {
-        bar.push_str(&format!("<span class=\"partial\" style=\"width:{}\"></span>", css_width(partial, whole)));
+/// Barra fina de progresso: cada trecho é (valor, classe CSS) sobre um
+/// trilho que vale `whole`. Com `label`, a barra tem nome acessível; sem
+/// ele, é decorativa, porque os números já estão escritos ao lado.
+pub fn meter(segments: &[(usize, &str)], whole: usize, label: Option<&str>) -> String {
+    let role = match label {
+        Some(label) => format!(" role=\"img\" aria-label=\"{}\"", escape(label)),
+        None => " aria-hidden=\"true\"".to_string(),
+    };
+    let mut bar = format!("<div class=\"meter\"{role}>");
+    for (value, class) in segments {
+        if *value > 0 {
+            let class = if class.is_empty() { String::new() } else { format!(" class=\"{class}\"") };
+            bar.push_str(&format!("<span{class} style=\"width:{}\"></span>", css_width(*value, whole)));
+        }
     }
     bar.push_str("</div>");
     bar
 }
 
-/// Anel de progresso animado (o comprimento do traço vai de 0 ao valor).
-pub fn ring(part: usize, whole: usize) -> String {
-    let value = ratio(part, whole) * 100.0;
-    let shown = if part > 0 { value.max(0.6) } else { 0.0 };
-    format!(
-        "<svg class=\"ring\" viewBox=\"0 0 100 100\" role=\"img\" aria-label=\"{pct}\"><circle class=\"ring-track\" \
-         cx=\"50\" cy=\"50\" r=\"42\"/><circle class=\"ring-bar\" cx=\"50\" cy=\"50\" r=\"42\" pathLength=\"100\" \
-         transform=\"rotate(-90 50 50)\" style=\"stroke-dashoffset:{offset:.2}\"/><text x=\"50\" y=\"56\" \
-         text-anchor=\"middle\">{pct}</text></svg>",
-        pct = escape(&percent(part, whole)),
-        offset = 100.0 - shown
-    )
+fn stat_inner(label: &str, value: &str, of: &str, bar: &str, note: &str) -> String {
+    let of = if of.is_empty() { String::new() } else { format!(" <span class=\"of\">{of}</span>") };
+    let note = if note.is_empty() { String::new() } else { format!("<p class=\"stat-note\">{note}</p>") };
+    format!("<p class=\"stat-label\">{label}</p><p class=\"stat-value\">{value}{of}</p>{bar}{note}")
+}
+
+/// Número de destaque: rótulo, valor (com "de N" opcional), barra e nota.
+pub fn stat(label: &str, value: &str, of: &str, bar: &str, note: &str) -> String {
+    format!("<div class=\"stat\">{}</div>", stat_inner(label, value, of, bar, note))
+}
+
+/// O mesmo número, como link para a página que o detalha.
+pub fn stat_link(href: &str, label: &str, value: &str, of: &str, bar: &str, note: &str) -> String {
+    format!("<a class=\"stat\" href=\"{href}\">{}</a>", stat_inner(label, value, of, bar, note))
 }
 
 // ---- ícones (24x24, traço) --------------------------------------------------------
@@ -229,20 +240,33 @@ pub fn state_meaning(state: State) -> &'static str {
     }
 }
 
+/// Classe CSS do selo de estado (a cor de fundo).
+fn state_class(state: State) -> &'static str {
+    match state {
+        State::Works => "ok",
+        State::InDevelopment => "part",
+        State::Planned => "plan",
+        State::OutOfScope => "out",
+    }
+}
+
+/// Selo de estado: ícone (forma diferente para cada estado, para não
+/// depender só da cor) e rótulo, com a explicação no `title`.
 pub fn state_badge(state: State) -> String {
     format!(
-        "<span class=\"state\" title=\"{}\">{}{}</span>",
+        "<span class=\"chip {}\" title=\"{}\">{}{}</span>",
+        state_class(state),
         escape(state_meaning(state)),
         state_icon(state),
         state_label(state)
     )
 }
 
-/// Legenda dos estados de componente, em lista de definição.
+/// Legenda dos estados de componente: o selo e o que ele quer dizer.
 pub fn state_legend() -> String {
     let mut legend = String::from("<div class=\"legend\">");
     for state in super::super::STATES {
-        legend.push_str(&format!("<div>{}<span>{}</span></div>", state_badge(*state), state_meaning(*state)));
+        legend.push_str(&format!("<div>{}<p>{}</p></div>", state_badge(*state), state_meaning(*state)));
     }
     legend.push_str("</div>");
     legend
@@ -339,263 +363,89 @@ pub fn component_anchor(row: &ComponentRow) -> String {
     format!("c-{}", anchor(&row.name))
 }
 
-// ---- moldura da página -----------------------------------------------------------
 
-pub const CSS: &str = r#"
-:root{color-scheme:light;--page:#f5f6fa;--surface:#ffffff;--raised:#ffffff;--ink:#0b0b10;--ink2:#474852;--muted:#62636d;
---grid:#e4e5ec;--border:rgba(20,22,40,.09);--accent:#2a78d6;--accent2:#6250d6;--accent-ink:#1c5cab;--accent-soft:#eaf2fc;
---track:#e6e7ee;--good:#0ca30c;--good-ink:#006300;--warning:#fab219;--neutral:#a3a3ad;--code:#eef0f5;--warn-ink:#c22f2f;
---hero:linear-gradient(135deg,#1c5cab 0%,#2a78d6 46%,#6250d6 100%);
---shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);--shadow-hover:0 16px 36px -16px rgba(28,92,171,.5)}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0b0c10;--surface:#14151b;
---raised:#181a21;--ink:#f0f0f3;--ink2:#c5c6cf;--muted:#9a9ba6;--grid:#262832;--border:rgba(255,255,255,.08);--accent:#3987e5;
---accent2:#9085e9;--accent-ink:#86b6ef;--accent-soft:#16233a;--track:#272a35;--good-ink:#3ccf3c;--neutral:#6b6c78;
---code:#20222b;--warn-ink:#ff8a8a;--hero:linear-gradient(135deg,#0f2f5c 0%,#1a4f96 48%,#40349a 100%);--shadow:none;
---shadow-hover:0 16px 36px -16px rgba(0,0,0,.85)}}
-:root[data-theme="dark"]{color-scheme:dark;--page:#0b0c10;--surface:#14151b;--raised:#181a21;--ink:#f0f0f3;--ink2:#c5c6cf;
---muted:#9a9ba6;--grid:#262832;--border:rgba(255,255,255,.08);--accent:#3987e5;--accent2:#9085e9;--accent-ink:#86b6ef;
---accent-soft:#16233a;--track:#272a35;--good-ink:#3ccf3c;--neutral:#6b6c78;--code:#20222b;--warn-ink:#ff8a8a;
---hero:linear-gradient(135deg,#0f2f5c 0%,#1a4f96 48%,#40349a 100%);--shadow:none;--shadow-hover:0 16px 36px -16px rgba(0,0,0,.85)}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-html{-webkit-text-size-adjust:100%}
-html:not(.js) .js-only{display:none!important}
-html.js .no-js{display:none!important}
-[id]{scroll-margin-top:84px}
-body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-a{color:var(--accent-ink);text-underline-offset:2px}
-.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
-header.top{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--surface) 88%,transparent);
-backdrop-filter:saturate(1.4) blur(10px);-webkit-backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--grid)}
-header.top .wrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px 28px;padding-top:10px;padding-bottom:10px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
-.brand small{font-weight:500;font-size:14px;color:var(--muted)}
-.logo{width:28px;height:28px;border-radius:8px;background:var(--hero);display:grid;place-items:center;box-shadow:0 4px 12px -4px rgba(42,120,214,.6)}
-.logo svg{width:16px;height:16px}
-nav.main{display:flex;flex-wrap:wrap;gap:4px 6px}
-nav.main a{color:var(--ink2);text-decoration:none;padding:6px 12px;border-radius:999px;font-size:15px;transition:background .15s}
-nav.main a:hover{background:var(--accent-soft)}
-nav.main a[aria-current]{background:var(--accent-soft);color:var(--accent-ink);font-weight:650}
-main{padding-bottom:56px}
-.hero{position:relative;overflow:hidden;isolation:isolate;margin:22px 0 8px;padding:36px 32px 30px;border-radius:26px;
-background:var(--hero);color:#fff;box-shadow:0 24px 60px -30px rgba(42,80,200,.7)}
-.hero::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(rgba(255,255,255,.18) 1px,transparent 1.4px);
-background-size:20px 20px;-webkit-mask-image:linear-gradient(115deg,#000 5%,transparent 70%);mask-image:linear-gradient(115deg,#000 5%,transparent 70%)}
-.hero::after{content:"";position:absolute;z-index:-1;width:520px;height:520px;right:-160px;top:-220px;border-radius:50%;
-background:radial-gradient(circle,rgba(255,255,255,.26),transparent 64%)}
-.hero .eyebrow{color:rgba(255,255,255,.82)}
-.hero h1{font-size:clamp(34px,6vw,58px);font-weight:800;letter-spacing:-.03em;line-height:1.04;margin:6px 0 12px}
-.hero .tagline{font-size:clamp(18px,2.5vw,22px);font-weight:550;max-width:44ch;margin:0 0 10px;line-height:1.35}
-.hero .sub{color:rgba(255,255,255,.88);max-width:70ch;margin:0}
-.hero code{background:rgba(255,255,255,.16);color:#fff}
-.hero a{color:#fff}
-.hero-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:14px;margin-top:26px}
-.glass{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.24);border-radius:18px;padding:16px 18px;
-backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;gap:16px;min-width:0}
-.glass .label{font-size:14px;font-weight:650;color:#fff;line-height:1.35}
-.glass .big{font-size:clamp(28px,4vw,36px);font-weight:800;line-height:1.05;letter-spacing:-.02em;margin:2px 0}
-.glass .sub2{font-size:13px;color:rgba(255,255,255,.84);line-height:1.4}
-.ring{width:88px;height:88px;flex:none}
-.ring circle{fill:none;stroke-width:10}
-.ring-track{stroke:rgba(255,255,255,.24)}
-.ring-bar{stroke:#fff;stroke-linecap:round;stroke-dasharray:100;animation:ring 1.6s cubic-bezier(.2,.8,.2,1) both}
-.ring text{fill:#fff;font:800 19px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:-.02em}
-@keyframes ring{from{stroke-dashoffset:100}}
-.pagehead{margin:26px 0 8px}
-.pagehead h1{font-size:clamp(30px,5vw,44px);line-height:1.1;letter-spacing:-.02em;margin:4px 0 10px}
-.crumbs{font-size:14px;color:var(--muted);margin:0 0 4px}
-.crumbs a{color:var(--muted)}
-.eyebrow{text-transform:uppercase;letter-spacing:.09em;font-size:12px;font-weight:750;color:var(--accent-ink);margin:0 0 4px}
-section.block{margin-top:48px}
-h2{font-size:clamp(23px,3vw,28px);line-height:1.2;margin:0 0 10px;letter-spacing:-.015em}
-h3{font-size:18px;margin:24px 0 8px}
-p{margin:0 0 12px;max-width:76ch}
-.lead{font-size:17px;color:var(--ink2);max-width:76ch}
-.muted{color:var(--muted)}
-.small{font-size:14px}
-code{font:.86em ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;background:var(--code);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
-pre{background:var(--code);padding:12px 14px;border-radius:12px;overflow-x:auto;margin:0 0 12px}
-pre code{background:none;padding:0}
-.card{background:var(--raised);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:var(--shadow);min-width:0}
-.lift{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
-.lift:hover{transform:translateY(-3px);box-shadow:var(--shadow-hover);border-color:color-mix(in srgb,var(--accent) 45%,var(--border))}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:14px;margin:16px 0}
-.grid.tight{grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr))}
-.grid.three{grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr))}
-.ico{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ico-tile{width:44px;height:44px;border-radius:13px;flex:none;display:grid;place-items:center;color:var(--accent-ink);
-background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 17%,transparent),color-mix(in srgb,var(--accent2) 19%,transparent))}
-.ico-tile.good{color:var(--good-ink);background:linear-gradient(135deg,color-mix(in srgb,var(--good) 16%,transparent),color-mix(in srgb,var(--accent) 12%,transparent))}
-.ico-tile.dim{color:var(--muted);background:var(--track)}
-.ico-tile.sm{width:34px;height:34px;border-radius:10px}
-.ico-tile.sm .ico{width:18px;height:18px}
-.meter{height:10px;border-radius:5px;background:var(--track);overflow:hidden;display:flex;gap:2px;margin:8px 0 4px}
-.meter span{display:block;height:100%;min-width:4px;border-radius:5px;background:linear-gradient(90deg,var(--accent),var(--accent2));
-transform-origin:left center;animation:grow 1.3s cubic-bezier(.2,.8,.2,1) both}
-.meter span.partial{background:var(--warning)}
-@keyframes grow{from{transform:scaleX(0)}}
-.explain{background:linear-gradient(135deg,var(--accent-soft),color-mix(in srgb,var(--accent2) 9%,var(--accent-soft)));border-radius:18px;padding:20px 22px}
-.explain h3{margin-top:0}
-.explain p:last-child,.explain ul:last-child{margin-bottom:0}
-.glossary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:14px;margin:16px 0}
-.glossary div{background:var(--raised);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
-.glossary dt{font-weight:750;display:flex;gap:8px;align-items:center}
-.glossary dd{margin:4px 0 0;font-size:15px;color:var(--ink2)}
-.steps{margin:8px 0 12px;padding-left:22px}
-.steps li{margin:4px 0}
-.highlight{display:flex;gap:14px;align-items:flex-start}
-.highlight h3{margin:0 0 4px;font-size:16px;line-height:1.3}
-.highlight h3 a{color:inherit;text-decoration:none}
-.highlight h3 a:hover{text-decoration:underline}
-.highlight p{margin:0;font-size:14px;color:var(--ink2)}
-.highlight .by{font-size:13px;color:var(--muted);margin-top:6px}
-.timeline{list-style:none;margin:22px 0 8px;padding:0;display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
-.timeline li{position:relative;text-align:center;padding:0 6px}
-.timeline li:not(:first-child)::before{content:"";position:absolute;top:19px;right:50%;width:100%;height:4px;border-radius:2px;background:var(--track)}
-.timeline li.reached:not(:first-child)::before{background:linear-gradient(90deg,var(--good),var(--accent))}
-.node{position:relative;z-index:1;width:42px;height:42px;margin:0 auto 10px;border-radius:50%;display:grid;place-items:center;
-font-weight:800;background:var(--raised);border:3px solid var(--track);color:var(--muted)}
-.node svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
-.node.done{background:var(--good);border-color:var(--good)}
-.node.current{border-color:var(--warning);color:var(--ink)}
-.node.current::after{content:"";position:absolute;inset:-9px;border-radius:50%;border:3px solid var(--warning);animation:pulse 2.2s ease-out infinite}
-@keyframes pulse{from{transform:scale(.75);opacity:.7}to{transform:scale(1.3);opacity:0}}
-.timeline .num{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
-.timeline .name{font-weight:700;font-size:15px;line-height:1.3;margin:2px 0 6px}
-@media (max-width:860px){.timeline{grid-template-columns:1fr}
-.timeline li{display:grid;grid-template-columns:42px 1fr;column-gap:14px;text-align:left;padding:0 0 18px}
-.timeline li .node{margin:0;grid-row:span 3}
-.timeline li:not(:first-child)::before{display:none}
-.timeline li:not(:last-child)::after{content:"";position:absolute;left:19px;top:42px;bottom:0;width:4px;border-radius:2px;background:var(--track)}
-.timeline li.link:not(:last-child)::after{background:linear-gradient(180deg,var(--good),var(--accent))}}
-.prefixes{display:grid;gap:10px;margin:14px 0}
-.prefix{display:grid;grid-template-columns:auto minmax(0,1fr) 250px;gap:6px 16px;align-items:start}
-.prefix .pill{font-weight:800;font-size:16px}
-.prefix .examples{font-size:13px;color:var(--muted);margin-top:4px}
-.prefix .examples code{font-size:12px}
-.prefix .nums{font-size:14px;color:var(--ink2);font-variant-numeric:tabular-nums}
-.prefix .nums strong{color:var(--ink);font-size:16px}
-@media (max-width:760px){.prefix{grid-template-columns:auto minmax(0,1fr)}.prefix .nums{grid-column:1 / -1}}
-.chart{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:8px;overflow-x:auto}
-.chart svg{display:block;width:100%;height:auto;min-width:680px}
-figure{margin:18px 0}
-figcaption{font-size:14px;color:var(--muted);margin-top:10px}
-.controls{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;margin:14px 0;padding:12px 14px;background:var(--surface);
-border:1px solid var(--border);border-radius:14px}
-.controls label{display:flex;gap:8px;align-items:center;font-size:15px}
-.controls input,.controls select{font:inherit;color:var(--ink);background:var(--raised);border:1px solid var(--grid);border-radius:10px;padding:7px 11px}
-.controls input{width:min(300px,100%)}
-.controls .count{margin-left:auto}
-details{background:var(--raised);border:1px solid var(--border);border-radius:14px;margin:10px 0}
-details>summary{cursor:pointer;padding:12px 16px;font-weight:650}
-details>summary .muted{font-weight:400}
-details .inner{padding:0 16px 14px}
-.card details{border:0;background:none;margin:10px 0 0}
-.card details>summary{padding:2px 0;font-size:14px;color:var(--ink2)}
-.card details .inner{padding:4px 0 0}
-.scroll{overflow-x:auto}
-table{border-collapse:collapse;width:100%}
-th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
-th{font-size:13px;font-weight:650;color:var(--ink2)}
-tbody tr:last-child td{border-bottom:0}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.table-card{background:var(--raised);border:1px solid var(--border);border-radius:16px;padding:6px 10px;margin:14px 0}
-.yes{color:var(--good-ink);font-weight:650}
-.no{color:var(--muted)}
-.ic{width:16px;height:16px;flex:none;display:block}
-.f-good{fill:var(--good)}.f-warning{fill:var(--warning)}.f-accent{fill:var(--accent)}
-.k-white{fill:none;stroke:#fff;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.k-warning{fill:none;stroke:var(--warning);stroke-width:1.6}
-.k-neutral{fill:none;stroke:var(--neutral);stroke-width:1.6}
-.dash{stroke-dasharray:2.2 2.2}
-.state{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:650;white-space:nowrap;
-padding:3px 10px 3px 6px;border-radius:999px;background:var(--surface);border:1px solid var(--border)}
-.small-state{font-size:12px;padding:2px 8px 2px 5px}
-.ms{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:650;white-space:nowrap}
-.ms::before{content:"";width:12px;height:12px;border-radius:50%;flex:none;box-sizing:border-box}
-.ms.codigo::before{background:var(--accent)}
-.ms.parcial::before{border:1.6px solid var(--warning);background:linear-gradient(90deg,transparent 50%,var(--warning) 50%)}
-.ms.pendente::before{border:1.6px solid var(--neutral)}
-.ms.fora::before{border:1.6px dashed var(--neutral)}
-.small-state .ic{width:13px;height:13px}
-.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:10px 18px;margin:12px 0}
-.legend div{display:flex;gap:10px;align-items:baseline;font-size:14px;color:var(--ink2)}
-.legend .state{flex:none}
-.category-head{display:flex;gap:14px;align-items:flex-start}
-.category-head h2{margin-bottom:4px}
-.category-head .counts{font-size:14px;color:var(--muted);margin:0}
-.component{display:flex;flex-direction:column;gap:10px}
-.component .head{display:flex;gap:12px;align-items:flex-start}
-.component .head .title{flex:1;min-width:0}
-.component h3{margin:2px 0 4px;font-size:17px;line-height:1.3}
-.component p{margin:0;font-size:15px}
-.facts{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;margin:0;font-size:14px}
-.facts dt{color:var(--muted)}
-.facts dd{margin:0;min-width:0}
-.facts dd code{display:inline-block;margin:0 4px 3px 0}
-.path{overflow-wrap:normal}
-.verified{color:var(--good-ink);font-weight:650}
-.unverified{color:var(--muted)}
-.note{font-size:13px;color:var(--muted)}
-.covers{margin:0;padding-left:20px;font-size:14px}
-details.subsys{margin:8px 0}
-details.subsys>summary{list-style:none;display:grid;grid-template-columns:34px minmax(0,1fr) minmax(90px,200px) 8.5em 14px;
-gap:6px 14px;align-items:center;padding:10px 14px}
-details.subsys>summary::-webkit-details-marker{display:none}
-details.subsys .sname{font-weight:700;line-height:1.3}
-details.subsys .sname code{font-weight:400;font-size:12px;margin-left:6px}
-details.subsys .sdesc{font-weight:400;font-size:13px;color:var(--muted);line-height:1.35}
-details.subsys .snums{font-weight:400;font-size:14px;color:var(--ink2);text-align:right;font-variant-numeric:tabular-nums}
-details.subsys .meter{margin:0}
-details.subsys .meter span{animation:none}
-.chev{width:14px;height:14px;fill:none;stroke:var(--muted);stroke-width:2.2;transition:transform .15s}
-details[open]>summary .chev{transform:rotate(90deg)}
-@media (max-width:700px){details.subsys>summary{grid-template-columns:34px minmax(0,1fr) 14px}
-details.subsys>summary .meter,details.subsys>summary .snums{grid-column:2 / 3}
-details.subsys>summary .snums{text-align:left}details.subsys>summary .chev{grid-row:1;grid-column:3}}
-.area{margin-top:28px}
-.area>h3{display:flex;gap:10px;align-items:baseline}
-.area>h3 .muted{font-size:14px;font-weight:400}
-.links a.card{text-decoration:none;color:var(--ink);display:flex;gap:14px;align-items:flex-start}
-.links h3{margin:0 0 4px}
-.links p{margin:0}
-.badges{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0}
-.badges svg{display:block}
-.warn{color:var(--warn-ink);font-size:13px}
-.pager{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 4px}
-.pager button{font:inherit;font-size:14px;min-width:38px;padding:5px 11px;border-radius:10px;border:1px solid var(--grid);
-background:var(--raised);color:var(--ink);cursor:pointer}
-.pager button:hover:not(:disabled){border-color:var(--accent)}
-.pager button[aria-current]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
-.pager button:disabled{opacity:.45;cursor:default}
-.pager .gap{color:var(--muted);padding:0 2px}
-.pager .range{font-size:13px;color:var(--muted);margin-left:6px}
-.empty{padding:14px 16px;border:1px dashed var(--grid);border-radius:14px;color:var(--muted)}
-.groupnav{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;margin:18px 0}
-.groupnav a{text-decoration:none;padding:8px 14px;border:1px solid var(--border);border-radius:12px;background:var(--raised)}
-.results{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
-.results li{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;padding:8px 12px;background:var(--raised);
-border:1px solid var(--border);border-radius:12px;font-size:14px}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.chips a{font-size:13px;text-decoration:none;padding:3px 10px;border-radius:999px;background:var(--accent-soft)}
-.chips a[aria-current]{background:var(--accent);color:#fff;font-weight:700}
-footer{border-top:1px solid var(--grid);background:var(--surface)}
-footer .wrap{padding-top:16px;padding-bottom:28px;color:var(--muted);font-size:14px}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.lift:hover{transform:none}}
-"#;
+// ---- notas longas ----------------------------------------------------------------
+
+/// Notas até este tamanho (em caracteres) aparecem inteiras.
+const NOTES_INLINE: usize = 360;
+
+/// (abertura, resto, cortou no meio de uma frase). A abertura é a primeira
+/// frase, se ela terminar até `NOTES_INLINE`; senão, o texto até o último
+/// espaço antes de 280 caracteres.
+fn split_notes(text: &str) -> Option<(&str, &str, bool)> {
+    if text.chars().count() <= NOTES_INLINE {
+        return None;
+    }
+    let mut boundary = None;
+    for (index, _) in text.match_indices(". ") {
+        let before = text[..index].chars().count();
+        if before < 40 {
+            continue;
+        }
+        if before > NOTES_INLINE {
+            break;
+        }
+        if text[index + 2..].chars().next().is_some_and(|next| next.is_uppercase() || next.is_ascii_digit()) {
+            boundary = Some(index + 1);
+            break;
+        }
+    }
+    let (lede, rest, cut) = match boundary {
+        Some(end) => (&text[..end], text[end..].trim_start(), false),
+        None => {
+            let limit = text.char_indices().nth(280).map(|(index, _)| index).unwrap_or(text.len());
+            let end = text[..limit].rfind(' ').unwrap_or(limit);
+            (&text[..end], text[end..].trim_start(), true)
+        }
+    };
+    if rest.chars().count() < 60 {
+        return None;
+    }
+    Some((lede, rest, cut))
+}
+
+/// Notas de um item: as curtas aparecem inteiras; as longas mostram a
+/// abertura e guardam o resto num `<details>` (que a busca do navegador
+/// também encontra).
+pub fn notes(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    match split_notes(text) {
+        None => format!("<p class=\"notes\">{}</p>", escape(text)),
+        Some((lede, rest, cut)) => format!(
+            "<details class=\"notes\"><summary>{}{} <span class=\"toggle\"><span class=\"more\">ler mais</span>\
+             <span class=\"less\">mostrar menos</span></span></summary><p>{}</p></details>",
+            escape(lede),
+            if cut { "<span class=\"ell\">…</span>" } else { "" },
+            escape(rest)
+        ),
+    }
+}
+
+// ---- moldura da página -----------------------------------------------------------
 
 const LOGO: &str = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><rect x=\"2\" y=\"2\" width=\"5\" height=\"5\" rx=\"1\" fill=\"#fff\"/>\
 <rect x=\"9\" y=\"2\" width=\"5\" height=\"5\" rx=\"1\" fill=\"#fff\" opacity=\".75\"/><rect x=\"2\" y=\"9\" width=\"5\" height=\"5\" rx=\"1\" \
 fill=\"#fff\" opacity=\".75\"/><rect x=\"9\" y=\"9\" width=\"5\" height=\"5\" rx=\"1\" fill=\"#fff\" opacity=\".5\"/></svg>";
 
-/// As páginas principais, na ordem do menu.
-pub const NAV: &[(&str, &str)] = &[
-    ("index.html", "Visão geral"),
-    ("componentes.html", "Componentes e drivers"),
-    ("testes.html", "Testes"),
-    ("modulos.html", "Módulos do kernel"),
-    ("ntoskrnl.html", "Exports do ntoskrnl"),
+/// As páginas principais, na ordem do menu: (arquivo, rótulo curto,
+/// complemento que só aparece em telas largas).
+pub const NAV: &[(&str, &str, &str)] = &[
+    ("index.html", "Visão geral", ""),
+    ("componentes.html", "Componentes", " e drivers"),
+    ("testes.html", "Testes", ""),
+    ("ntoskrnl.html", "Exports", " do ntoskrnl"),
+    ("modulos.html", "Módulos", " do kernel"),
 ];
+
+/// Nome completo de uma página do menu ("Componentes e drivers").
+pub fn page_name(file: &str) -> String {
+    NAV.iter()
+        .find(|(target, _, _)| *target == file)
+        .map(|(_, short, long)| format!("{short}{long}"))
+        .unwrap_or_default()
+}
 
 pub const CHEVRON: &str =
     "<svg class=\"chev\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M6 3.5L10.5 8 6 12.5\"/></svg>";
@@ -604,172 +454,89 @@ pub const CHEVRON: &str =
 pub fn html_page(current: &str, title: &str, description: &str, body: &str, scripts: &[&str]) -> String {
     let nav: String = NAV
         .iter()
-        .map(|(target, label)| {
+        .map(|(target, short, long)| {
             let mark = if *target == current { " aria-current=\"page\"" } else { "" };
-            format!("<a href=\"{target}\"{mark}>{label}</a>")
+            let long = if long.is_empty() { String::new() } else { format!("<span class=\"long\">{long}</span>") };
+            format!("<li><a href=\"{target}\"{mark}>{short}{long}</a></li>")
         })
+        .collect();
+    let footer_nav: String = NAV
+        .iter()
+        .map(|(target, short, long)| format!("<li><a href=\"{target}\">{short}{long}</a></li>"))
         .collect();
     let scripts: String = scripts.iter().map(|script| format!("<script>{script}</script>\n")).collect();
     format!(
         "<!doctype html>\n<html lang=\"pt-BR\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n\
+         <meta name=\"color-scheme\" content=\"light dark\">\n\
          <title>{title}</title>\n<meta name=\"description\" content=\"{description}\">\n\
          <script>document.documentElement.classList.add('js')</script>\n<style>{CSS}</style>\n</head>\n<body>\n\
-         <header class=\"top\"><div class=\"wrap\"><a class=\"brand\" href=\"index.html\"><span class=\"logo\">{LOGO}</span>\
-         OpenNT <small>status</small></a><nav class=\"main\" aria-label=\"Páginas\">{nav}</nav></div></header>\n\
-         <main class=\"wrap\">\n{body}\n</main>\n<footer><div class=\"wrap\">Gerado por <code>cargo xtask status</code> a \
-         partir do código do repositório, de <code>docs/status/components.toml</code> e da lista de exports do \
-         <code>ntoskrnl.exe</code>. Não edite estas páginas à mão: edite os dados e gere de novo.</div></footer>\n\
+         <a class=\"skip\" href=\"#conteudo\">Pular para o conteúdo</a>\n\
+         <header class=\"site\"><div class=\"wrap bar\"><a class=\"brand\" href=\"index.html\"><span class=\"logo\">{LOGO}</span>\
+         OpenNT<span class=\"tag\">status</span></a><nav class=\"nav\" aria-label=\"Páginas do site\"><ul>{nav}</ul></nav>\
+         </div></header>\n<main id=\"conteudo\" class=\"wrap\" tabindex=\"-1\">\n{body}\n</main>\n\
+         <footer class=\"site\"><div class=\"wrap\"><nav aria-label=\"Páginas do site (rodapé)\"><ul>{footer_nav}</ul></nav>\
+         <p>Gerado por <code>cargo xtask status</code> a partir do código do repositório, de \
+         <code>docs/status/components.toml</code> e da lista de exports do <code>ntoskrnl.exe</code>. Não edite estas \
+         páginas à mão: edite os dados e gere de novo.</p></div></footer>\n\
          {scripts}</body>\n</html>\n",
         title = escape(title),
         description = escape(description),
     )
 }
 
-pub fn hero(eyebrow: &str, title: &str, tagline: &str, sub: &str, stats: &str) -> String {
-    format!(
-        "<section class=\"hero\"><p class=\"eyebrow\">{eyebrow}</p><h1>{title}</h1><p class=\"tagline\">{tagline}</p>\
-         <p class=\"sub\">{sub}</p><div class=\"hero-stats\">{stats}</div></section>"
-    )
+/// A trilha (Visão geral / ... / página atual) e o cabeçalho da página:
+/// título, frase de abertura, explicação (HTML pronto, em geral um
+/// `<p class="sub">`) e números de destaque. `trail` são os níveis
+/// intermediários (link, rótulo); sem `current`, não há trilha.
+pub fn page_head(trail: &[(&str, &str)], current: &str, title: &str, lead: &str, sub: &str, stats: &str) -> String {
+    let mut head = String::new();
+    if !current.is_empty() {
+        let mut items = String::from("<li><a href=\"index.html\">Visão geral</a></li>");
+        for (href, label) in trail {
+            items.push_str(&format!("<li><a href=\"{href}\">{label}</a></li>"));
+        }
+        items.push_str(&format!("<li><span aria-current=\"page\">{current}</span></li>"));
+        head.push_str(&format!("<nav class=\"crumbs\" aria-label=\"Você está em\"><ol>{items}</ol></nav>"));
+    }
+    let stats = if stats.is_empty() { String::new() } else { format!("<div class=\"stats\">{stats}</div>") };
+    head.push_str(&format!("<header class=\"page-head\"><h1>{title}</h1><p class=\"lead\">{lead}</p>{sub}{stats}</header>"));
+    head
 }
 
-pub fn ring_stat(part: usize, whole: usize, label: &str, sub: &str) -> String {
-    format!(
-        "<div class=\"glass\">{}<div><div class=\"label\">{label}</div><div class=\"sub2\">{sub}</div></div></div>",
-        ring(part, whole)
-    )
+/// Uma seção da página com título `<h2>` e, se houver, um parágrafo de abertura.
+pub fn section(id: &str, title: &str, intro: &str, body: &str) -> String {
+    let intro = if intro.is_empty() { String::new() } else { format!("<p class=\"intro\">{intro}</p>") };
+    format!("<section class=\"block\" id=\"{id}\" aria-labelledby=\"{id}-t\"><h2 id=\"{id}-t\">{title}</h2>{intro}{body}</section>")
 }
 
-pub fn big_stat(value: &str, label: &str, sub: &str) -> String {
-    format!(
-        "<div class=\"glass\"><div><div class=\"label\">{label}</div><div class=\"big\">{value}</div>\
-         <div class=\"sub2\">{sub}</div></div></div>"
-    )
-}
+/// Um botão do filtro de estado: (valor de `data-state`, rótulo, quantos
+/// itens têm esse estado, ícone).
+pub type Toggle<'a> = (&'a str, &'a str, usize, &'a str);
 
-pub fn section(id: &str, eyebrow: &str, title: &str, intro: &str, body: &str) -> String {
-    let intro = if intro.is_empty() { String::new() } else { format!("<p class=\"lead\">{intro}</p>") };
-    let id = if id.is_empty() { String::new() } else { format!(" id=\"{id}\"") };
-    format!("<section class=\"block\"{id}><p class=\"eyebrow\">{eyebrow}</p><h2>{title}</h2>{intro}{body}</section>")
-}
-
-/// Barra de filtros (só aparece com JavaScript). `states` são pares
-/// (valor de `data-state`, rótulo); `unit` é (singular, plural).
-pub fn filter_bar(placeholder: &str, states: &[(&str, &str)], total: usize, unit: (&str, &str)) -> String {
-    let mut options = String::from("<option value=\"\">todos</option>");
-    for (value, label) in states {
-        options.push_str(&format!("<option value=\"{value}\">{}</option>", escape(label)));
+/// Barra de busca e filtro (só aparece com JavaScript) para os
+/// `[data-item]` dentro de `#target`. `unit` é (singular, plural).
+pub fn filter_bar(target: &str, label: &str, placeholder: &str, toggles: &[Toggle], total: usize, unit: (&str, &str)) -> String {
+    let mut buttons = format!("<button type=\"button\" data-value=\"\" aria-pressed=\"true\">Todos <span class=\"n\">{}</span></button>", int(total));
+    for (value, text, count, icon) in toggles {
+        buttons.push_str(&format!(
+            "<button type=\"button\" data-value=\"{value}\" aria-pressed=\"false\">{icon}{} <span class=\"n\">{}</span></button>",
+            escape(text),
+            int(*count)
+        ));
     }
     format!(
-        "<div class=\"controls js-only\" role=\"search\"><label>Buscar <input id=\"filtro\" type=\"search\" \
-         placeholder=\"{}\" autocomplete=\"off\"></label><label>Mostrar <select id=\"estado\">{options}</select></label>\
-         <span id=\"contagem\" class=\"count muted small\" data-one=\"{one}\" data-many=\"{many}\" aria-live=\"polite\">\
-         {}</span></div><p id=\"vazio\" class=\"empty\" hidden>Nada corresponde ao filtro.</p>",
+        "<div class=\"filters js-only\" role=\"search\" aria-label=\"{label}\" data-filter=\"{target}\"><div class=\"search\">{}\
+         <label class=\"sr-only\" for=\"filtro\">Buscar</label><input id=\"filtro\" type=\"search\" placeholder=\"{}\" \
+         autocomplete=\"off\" spellcheck=\"false\"></div><div class=\"toggles\" role=\"group\" aria-label=\"Mostrar\">{buttons}</div>\
+         <p class=\"count\" aria-live=\"polite\" data-one=\"{one}\" data-many=\"{many}\">{}</p></div>\
+         <p id=\"vazio\" class=\"empty\" hidden>Nada corresponde ao filtro. <button type=\"button\" class=\"linkish\" \
+         data-clear>Limpar o filtro</button></p>",
+        icon("search"),
         escape(placeholder),
         plural(total, unit.0, unit.1),
+        label = escape(label),
         one = escape(unit.0),
         many = escape(unit.1),
     )
 }
-
-/// Paginação e filtros, em JavaScript puro e sem dependências.
-///
-/// - `[data-paginate=N]` marca uma lista; os itens são os `[data-item]`
-///   dentro dela. Sem JavaScript, todos os itens aparecem.
-/// - `#filtro` (texto) e `#estado` (compara com `data-state`) filtram todas
-///   as listas da página; `#contagem` mostra quantos itens sobraram.
-/// - `[data-section]` some quando a sua lista fica vazia pelo filtro, e um
-///   `[data-group]` some quando todas as suas seções sumiram; um
-///   `<details>` com resultados abre sozinho enquanto há busca por texto.
-/// - Um link `#id` para um item de outra página da lista mostra essa página.
-pub const PAGER_SCRIPT: &str = r#"
-(function(){
-  var d=document;
-  function all(s,r){return Array.prototype.slice.call((r||d).querySelectorAll(s));}
-  function fold(s){s=(s||'').toLowerCase();return s.normalize?s.normalize('NFD').replace(/[̀-ͯ]/g,''):s;}
-  var text=d.getElementById('filtro'),state=d.getElementById('estado'),count=d.getElementById('contagem'),empty=d.getElementById('vazio');
-  var lists=all('[data-paginate]');
-  function query(){return text?fold(text.value.trim()):'';}
-  function filtering(){return !!(query()||(state&&state.value));}
-  function ok(item){
-    if(state&&state.value&&item.getAttribute('data-state')!==state.value)return false;
-    var q=query();
-    return !q||fold(item.getAttribute('data-text')||item.textContent).indexOf(q)>=0;
-  }
-  function button(label,page,disabled,current,name){
-    return '<button type="button" data-p="'+page+'"'+(disabled?' disabled':'')+(current?' aria-current="page"':'')+
-      ' aria-label="'+name+'">'+label+'</button>';
-  }
-  function numbers(current,total){
-    var out=[],i;
-    for(i=0;i<total;i++){
-      if(i===0||i===total-1||Math.abs(i-current)<=1)out.push(i);
-      else if(out[out.length-1]!==-1)out.push(-1);
-    }
-    return out;
-  }
-  function render(list){
-    var items=all('[data-item]',list),shown=items.filter(ok),size=list.size;
-    var pages=Math.max(1,Math.ceil(shown.length/size));
-    if(list.page>=pages)list.page=pages-1;
-    var start=list.page*size;
-    items.forEach(function(item){item.hidden=true;});
-    shown.forEach(function(item,n){item.hidden=n<start||n>=start+size;});
-    var html='';
-    if(pages>1){
-      html+=button('&lsaquo; Anterior',list.page-1,list.page===0,false,'Página anterior');
-      numbers(list.page,pages).forEach(function(p){
-        html+=p<0?'<span class="gap">&hellip;</span>':button(String(p+1),p,false,p===list.page,'Página '+(p+1));
-      });
-      html+=button('Próxima &rsaquo;',list.page+1,list.page===pages-1,false,'Próxima página');
-      html+='<span class="range">'+(start+1)+'&ndash;'+Math.min(start+size,shown.length)+' de '+shown.length+'</span>';
-    }
-    list.pager.innerHTML=html;
-    list.pager.hidden=pages<2;
-    var section=list.closest('[data-section]');
-    if(section)section.hidden=filtering()&&shown.length===0;
-    var details=list.closest('details');
-    if(details&&filtering()&&shown.length>0&&query())details.open=true;
-    return shown.length;
-  }
-  function update(reset){
-    var total=0;
-    lists.forEach(function(list){if(reset)list.page=0;total+=render(list);});
-    all('[data-group]').forEach(function(group){
-      group.hidden=filtering()&&all('[data-section]',group).every(function(section){return section.hidden;});
-    });
-    if(count){count.textContent=total+' '+(total===1?count.getAttribute('data-one'):count.getAttribute('data-many'));}
-    if(empty)empty.hidden=total>0;
-  }
-  lists.forEach(function(list){
-    list.page=0;list.size=parseInt(list.getAttribute('data-paginate'),10)||10;
-    var nav=d.createElement('nav');nav.className='pager';nav.setAttribute('aria-label','Paginação');
-    list.parentNode.insertBefore(nav,list.nextSibling);list.pager=nav;
-    nav.addEventListener('click',function(event){
-      var target=event.target.closest('button');
-      if(!target||target.disabled)return;
-      list.page=parseInt(target.getAttribute('data-p'),10);render(list);
-      var top=list.getBoundingClientRect().top;
-      if(top<0)list.scrollIntoView({block:'start'});
-    });
-  });
-  if(text)text.addEventListener('input',function(){update(true);});
-  if(state)state.addEventListener('change',function(){update(true);});
-  function reveal(){
-    var id=decodeURIComponent(location.hash.slice(1)),target=id&&d.getElementById(id);
-    if(!target)return;
-    var item=target.closest('[data-item]'),list=item&&item.closest('[data-paginate]');
-    if(list){
-      if(!ok(item)){if(text)text.value='';if(state)state.value='';update(true);}
-      var n=all('[data-item]',list).filter(ok).indexOf(item);
-      if(n>=0){list.page=Math.floor(n/list.size);render(list);}
-    }
-    var details=target.closest('details');
-    if(details)details.open=true;
-    target.scrollIntoView({block:'start'});
-  }
-  update(true);
-  reveal();
-  window.addEventListener('hashchange',reveal);
-})();
-"#;
