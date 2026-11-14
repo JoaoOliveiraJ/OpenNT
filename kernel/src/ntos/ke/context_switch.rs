@@ -241,7 +241,8 @@ fn current_rsp() -> u64 {
 /// Uma espera pode deixar a CPU: a thread corrente é a thread de usuário de
 /// uma syscall despachada nesta CPU (o BSP, no M0), roda na própria pilha de
 /// kernel e é a execução em curso (nada de contexto aninhado: um passo do
-/// escalonador, uma APC drenada em nome de outra thread), abaixo de
+/// escalonador, uma APC drenada em nome de outra thread, um callback de
+/// modo usuário), abaixo de
 /// DISPATCH_LEVEL e sem SpinLock nem SharedLock retidos.
 pub fn can_block() -> bool {
     let Some(thread) = threads::current() else { return false };
@@ -257,6 +258,11 @@ pub fn can_block() -> bool {
     }
     // SAFETY: a KTHREAD da thread corrente está viva enquanto ela executa.
     let kthread = unsafe { Kthread::at(pointer) };
+    // Dentro de um callback de modo usuário o intervalo é aninhado: quem o
+    // conclui é o laço do KeUserModeCallback, não o despachante.
+    if kthread.callback_nesting_level.get() != 0 {
+        return false;
+    }
     let (initial, limit, rsp) = (kthread.initial_stack.get(), kthread.stack_limit.get(), current_rsp());
     map::is_kernel_stack(initial) && rsp > limit && rsp < initial
 }

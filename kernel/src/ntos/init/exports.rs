@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 302] {
+fn groups() -> [&'static Group; 303] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -357,6 +357,7 @@ fn groups() -> [&'static Group; 302] {
         &crate::ntos::rtl::exports::rtl_raise_exception::GROUP,
         &crate::ntos::rtl::exports::crt_sqrtf::GROUP,
         &crate::ntos::rtl::exports::rtl_debug_print_va::GROUP,
+        &crate::ntos::ke::exports::ke_user_callback::GROUP,
     ]
 }
 
@@ -498,6 +499,7 @@ pub fn init() {
     crate::ntos::ps::user::threads::init();
     crate::ntos::ps::user::process::init();
     crate::ntos::ps::user::user_apc::init();
+    crate::ntos::ke::user_callback::init();
     crate::ntos::ps::win32::init();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();

@@ -1621,8 +1621,9 @@ fn user_wait_packets(assert: Assert) {
     }
 }
 
-/// A ntdll de bring-up do build: stubs canônicos de NtDisplayString (0x27) e
-/// NtTerminateProcess (0x2C), um stub não canônico e o alias Zw.
+/// A ntdll de bring-up do build: stubs canônicos de NtCallbackReturn (0x05),
+/// NtDisplayString (0x27) e NtTerminateProcess (0x2C), um stub não canônico e
+/// o alias Zw.
 fn bring_up_ntdll() -> alloc::vec::Vec<u8> {
     let mut image = alloc::vec![0u8; 0x700];
     let put16 = |image: &mut [u8], at: usize, value: u16| image[at..at + 2].copy_from_slice(&value.to_le_bytes());
@@ -1656,7 +1657,7 @@ fn bring_up_ntdll() -> alloc::vec::Vec<u8> {
     put32(&mut image, section + 36, 0x6000_0020);
     // Código em 0x1000: dois stubs canônicos, um não canônico e o DllMain.
     let raw = |rva: usize| rva - 0x1000 + 0x400;
-    for (rva, number) in [(0x1000usize, 0x27u32), (0x1010, 0x2C)] {
+    for (rva, number) in [(0x1000usize, 0x27u32), (0x1010, 0x2C), (0x1070, 0x05)] {
         image[raw(rva)..raw(rva) + 4].copy_from_slice(&[0x4C, 0x8B, 0xD1, 0xB8]);
         put32(&mut image, raw(rva) + 4, number);
         image[raw(rva) + 8..raw(rva) + 11].copy_from_slice(&[0x0F, 0x05, 0xC3]);
@@ -1668,13 +1669,13 @@ fn bring_up_ntdll() -> alloc::vec::Vec<u8> {
     image[raw(0x1040)..raw(0x1040) + 19].copy_from_slice(&[0x48, 0x8B, 0x91, 0x88, 0, 0, 0, 0x48, 0x8B, 0x81, 0x80, 0, 0, 0, 0x48, 0x89, 0xD1, 0xFF, 0xE0]);
     image[raw(0x1060)..raw(0x1060) + 2].copy_from_slice(&[0x0F, 0x0B]);
     // Diretório de exports em 0x1100 com nomes ordenados.
-    let names = ["LdrInitializeThunk", "NtDisplayString", "NtFake", "NtTerminateProcess", "RtlUserThreadStart", "ZwTerminateProcess"];
-    let functions = [0x1040u32, 0x1000, 0x1020, 0x1010, 0x1060, 0x1010];
+    let names = ["LdrInitializeThunk", "NtCallbackReturn", "NtDisplayString", "NtFake", "NtTerminateProcess", "RtlUserThreadStart", "ZwTerminateProcess"];
+    let functions = [0x1040u32, 0x1070, 0x1000, 0x1020, 0x1010, 0x1060, 0x1010];
     let directory = raw(0x1100);
     put32(&mut image, directory + 12, 0x1210);
     put32(&mut image, directory + 16, 1);
-    put32(&mut image, directory + 20, 6);
-    put32(&mut image, directory + 24, 6);
+    put32(&mut image, directory + 20, 7);
+    put32(&mut image, directory + 24, 7);
     put32(&mut image, directory + 28, 0x1140);
     put32(&mut image, directory + 32, 0x1160);
     put32(&mut image, directory + 36, 0x1180);
@@ -1705,7 +1706,7 @@ fn bundled_bring_up_ntdll(assert: Assert) {
     let pe = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
     let entry = u32::from_le_bytes([bytes[pe + 40], bytes[pe + 41], bytes[pe + 42], bytes[pe + 43]]);
     let characteristics = u16::from_le_bytes([bytes[pe + 22], bytes[pe + 23]]);
-    assert(scanned.as_ref().is_ok_and(|map| *map == expected) && expected.len() == 2 && entry == 0x1000 && bytes[0x400..0x406] == [0xB8, 1, 0, 0, 0, 0xC3] && characteristics & 0x2000 != 0, "bring-up: DLL gerada com DllMain e os stubs da tabela unica");
+    assert(scanned.as_ref().is_ok_and(|map| *map == expected) && expected.len() == 3 && entry == 0x1000 && bytes[0x400..0x406] == [0xB8, 1, 0, 0, 0, 0xC3] && characteristics & 0x2000 != 0, "bring-up: DLL gerada com DllMain e os stubs da tabela unica");
     let copied = memory_file_system::read_bytes("/ntdll.dll").is_some_and(|copy| copy == bytes);
     let registered = state::with(|state| expected.iter().all(|(number, name)| state.name_by_number.get(number) == Some(name)));
     assert(copied && registered, "bring-up: copiada para o VFS e tabela nativa registrada no boot");
@@ -1719,7 +1720,7 @@ fn user_system_services(assert: Assert) {
     // Varredura da imagem e recusas de cabeçalho.
     let image = bring_up_ntdll();
     let scanned = syscall_scan::scan_syscall_image(&image);
-    let expected: alloc::collections::BTreeMap<u32, alloc::string::String> = [(0x27u32, alloc::string::String::from("NtDisplayString")), (0x2C, alloc::string::String::from("NtTerminateProcess"))].into_iter().collect();
+    let expected: alloc::collections::BTreeMap<u32, alloc::string::String> = [(0x05u32, alloc::string::String::from("NtCallbackReturn")), (0x27, alloc::string::String::from("NtDisplayString")), (0x2C, alloc::string::String::from("NtTerminateProcess"))].into_iter().collect();
     assert(scanned.as_ref().is_ok_and(|map| *map == expected), "userservices: stubs canonicos da ntdll de bring-up");
     let mut foreign = image.clone();
     foreign[0x44] = 0x4C;
@@ -3737,7 +3738,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1646, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1647, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -5007,6 +5008,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::create_user_process::run(assert);
     crate::ntos::test::multiprocess::cross_memory::run(assert);
     crate::ntos::test::rtl_atom_heap_nls::run_phase7(assert);
+    crate::ntos::test::multiprocess::user_callback::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

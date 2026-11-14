@@ -29,6 +29,7 @@ pub mod spin_lock;
 pub mod processor_group;
 pub mod affinity;
 pub mod callout;
+pub mod user_callback;
 pub mod debug_print;
 pub mod xstate;
 pub mod version;

@@ -892,6 +892,78 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     result as u32
 }
 
+/// O lado do anel 3 do KiCallUserMode: um intervalo aninhado dentro do
+/// serviço em curso da thread corrente (um KeUserModeCallback, que continua
+/// esperando na pilha dele). O estado por CPU do serviço de fora — o quadro
+/// do despachante (`dispatcher_rsp`, o mesmo que o fim do intervalo
+/// consome), o CONTEXT do intervalo e o quadro da syscall, as faixas
+/// preservadas do CONTEXT, a pilha do usuário (KPCR.UserRsp), o NtContinue,
+/// o tipo de saída, a posse de execução nativa, KPRCB.RspBase/TSS.RSP0, o GS
+/// do usuário e o IF — é guardado aqui e volta no fim. O intervalo aninhado
+/// entra no CONTEXT `context` com a pilha de kernel da KTHREAD corrente (a
+/// pilha do callback, que o Ke instalou em InitialStack antes), então as
+/// syscalls e interrupções dele caem nela, abaixo dos quadros do serviço de
+/// fora. Termina como qualquer intervalo (syscall, timer, exceção ou
+/// término) e devolve o resultado e o tipo de saída dele.
+pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
+    assert!(in_service(), "callback de usuario fora de um servico despachado");
+    assert!(context & 15 == 0, "execUserCallback: unaligned CONTEXT");
+    assert_boot_processor();
+    let block = block();
+    let kpcr = pcr::current();
+    let (fallback, frame_context, service_frame) = {
+        let mut state = STATE.lock();
+        (state.fallback_stack, core::mem::replace(&mut state.frame_context, 0), core::mem::replace(&mut state.service_frame, 0))
+    };
+    let saved = SuspendedService {
+        context: block.context.get(),
+        frame_context,
+        service_frame,
+        keep: *CONTEXT_KEEP.lock(),
+        user_rsp: kpcr.user_rsp.get(),
+        continue_flag: block.continue_flag.get(),
+        continue_rcx: block.continue_rcx.get(),
+        continue_r11: block.continue_r11.get(),
+        native_owned: native_call::sync_active(),
+    };
+    let dispatcher_rsp = block.dispatcher_rsp.get();
+    let exit_kind = block.exit_kind.get();
+    let outer_stack = kpcr.prcb.rsp_base.get();
+    let flags = cpu::save_and_disable_interrupts();
+    let stack = dispatch_stack(fallback);
+    load_kernel_stack(stack);
+    let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
+    block.context.set(context);
+    block.exit_kind.set(0);
+    block.continue_flag.set(0);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    // SAFETY: dentro de um serviço despachado nesta CPU, com a pilha de
+    // kernel do intervalo aninhado carregada; o fim dele volta a este quadro
+    // pelo `dispatcher_rsp` que o stub grava.
+    let result = unsafe { user_exec_context(context, stack) };
+    // O fim do intervalo voltou com STI: o IF do serviço de fora volta.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    let nested_kind = block.exit_kind.get();
+    load_kernel_stack(outer_stack);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
+    block.dispatcher_rsp.set(dispatcher_rsp);
+    block.exit_kind.set(exit_kind);
+    block.context.set(saved.context);
+    block.continue_flag.set(saved.continue_flag);
+    block.continue_rcx.set(saved.continue_rcx);
+    block.continue_r11.set(saved.continue_r11);
+    kpcr.user_rsp.set(saved.user_rsp);
+    *CONTEXT_KEEP.lock() = saved.keep;
+    native_call::set_sync_active(saved.native_owned);
+    {
+        let mut state = STATE.lock();
+        state.frame_context = saved.frame_context;
+        state.service_frame = saved.service_frame;
+    }
+    cpu::restore_interrupts(flags);
+    (result as u32, nested_kind)
+}
+
 /// O banco preparado entra no intervalo de usuário pausado.
 pub fn set_user_debug_registers(bank: u64) {
     let frame_context = {

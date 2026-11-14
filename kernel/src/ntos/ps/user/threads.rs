@@ -1008,6 +1008,71 @@ pub fn block_in_kernel(thread: &UserThread, wait: Wait) {
     block_current(wait);
 }
 
+/// O despacho dos intervalos de um callback de modo usuário (o
+/// KeUserModeCallback de `ke/user_callback.rs`): a thread corrente
+/// `thread`, dentro de um serviço, roda aninhado nele o CONTEXT `context`
+/// (`usermode::exec_user_callback`) até `returned()` valer (o
+/// NtCallbackReturn dela). Enquanto isso o CONTEXT do callback é o da
+/// thread: a espera de um serviço aninhado conclui nele, e as APCs de
+/// usuário e as exceções são entregues nele. Cada saída é tratada como o
+/// despachante trataria: syscall e timer seguem; a espera PENDING de um
+/// serviço aninhado é sondada no lugar, girando os pumps (dentro do
+/// callback a thread não deixa a CPU, como `context_switch::can_block`
+/// garante); exceções e capturas passam pelo tratador de saída. Uma thread
+/// terminada (por outra, ou o fim do processo pedido de dentro do callback,
+/// que fica com o despachante) encerra o laço com STATUS_THREAD_IS_TERMINATING.
+/// Devolve 0 quando o callback retornou.
+pub fn run_callback(thread: &Arc<UserThread>, context: u64, returned: &dyn Fn() -> bool) -> u32 {
+    let (outer, teb, process_pointer) = thread.with(|thread| (core::mem::replace(&mut thread.context, context), thread.teb_va, thread.process_pointer));
+    let status = loop {
+        if thread.dead() {
+            break THREAD_IS_TERMINATING;
+        }
+        if let Some(mut wait) = thread.take_wait() {
+            let status = loop {
+                if let Some(status) = poll_wait(&mut wait) {
+                    break status;
+                }
+                dispatcher::pump_kernel();
+                let pumps = *PUMPS.lock();
+                for routine in pumps.into_iter().flatten() {
+                    routine();
+                }
+            };
+            finish_wait(thread, wait, status);
+            continue;
+        }
+        let undeliverable = super::user_apc::deliver(thread);
+        if undeliverable != 0 {
+            crate::ntos::ps::create::exit_process(process_pointer, undeliverable);
+            continue;
+        }
+        let (status, exit_kind) = crate::hal::amd64::usermode::exec_user_callback(context, teb);
+        let failed = match exit_kind {
+            // NtTerminateProcess de dentro do callback: o fim do processo.
+            0 => Some(status),
+            1 | 2 => None,
+            _ => {
+                let handler = *EXIT_HANDLER.lock();
+                match handler {
+                    Some(handler) => Some(handler(thread, exit_kind, status)).filter(|&failed| failed != 0),
+                    None if exit_kind == 3 => Some(status),
+                    None => None,
+                }
+            }
+        };
+        if let Some(failed) = failed {
+            crate::ntos::ps::create::exit_process(process_pointer, failed);
+            continue;
+        }
+        if returned() {
+            break 0;
+        }
+    };
+    thread.with(|thread| thread.context = outer);
+    status
+}
+
 /// O status da espera de uma thread que o laço retomou no kernel; o
 /// serviço deixa de estar suspenso.
 pub fn take_kernel_wait_status(thread: &UserThread) -> u32 {

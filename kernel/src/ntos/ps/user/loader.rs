@@ -282,6 +282,7 @@ fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
         state.ntdll_image_base = image.image_base;
     });
     *NTDLL_IMAGE.lock() = (image.image_base, image.size_of_image);
+    crate::ntos::ke::user_callback::set_dispatcher(exports.get("KiUserCallbackDispatcher").copied().unwrap_or(0));
     push_image(Space::system(), image.image_base, image.size_of_image, String::from(source_name), None);
     let module = Arc::new(Module {
         name: String::from("ntdll.dll"),

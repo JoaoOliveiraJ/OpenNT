@@ -5,6 +5,8 @@
 // implementação. Números do Windows 10 22H2 (build 19045); só entram
 // serviços com implementação real no kernel.
 pub const SYSCALLS: &[(&str, u32)] = &[
+    // Volta de um callback de modo usuário (KeUserModeCallback).
+    ("NtCallbackReturn", 0x05),
     // Imprime uma UNICODE_STRING no console de boot.
     ("NtDisplayString", 0x27),
     // Sai do processo (handle -1 = processo corrente), código no segundo argumento.

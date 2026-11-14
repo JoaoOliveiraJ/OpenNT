@@ -933,3 +933,19 @@ pub mod ke_queues {
         data_exports: &[],
     };
 }
+
+pub mod ke_user_callback {
+    //! KeUserModeCallback; a lógica mora em `ke/user_callback`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ke::user_callback;
+    use crate::rtl::KernelError;
+
+    /// KeUserModeCallback(ApiNumber, InputBuffer, InputLength, OutputBuffer*,
+    /// OutputLength*).
+    fn user_mode_callback(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(user_callback::user_mode_callback(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ke-user-callback", names: &["KeUserModeCallback"], handlers: &[user_mode_callback], data_exports: &[] };
+}

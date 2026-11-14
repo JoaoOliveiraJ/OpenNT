@@ -308,6 +308,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("rtl-raise-exception", 1643, 1),
     ("crt-sqrtf", 1644, 1),
     ("rtl-debug-print-va", 1645, 1),
+    ("ke-user-callback", 1646, 1),
 ];
 
 /// Os 1114 exports de função, na ordem da ABI.
@@ -1958,4 +1959,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "RtlRaiseException",
     "sqrtf",
     "vDbgPrintEx",
+    "KeUserModeCallback",
 ];
