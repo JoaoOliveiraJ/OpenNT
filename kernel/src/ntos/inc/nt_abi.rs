@@ -501,7 +501,7 @@ pub mod cm_partial_resource_descriptor {
     pub const TYPE_MEMORY: u8 = 3;
 }
 
-// ---- Prova contra os símbolos do ntoskrnl (gerado por gen_nt_types.py) ----
+// ---- Prova contra os símbolos do ntoskrnl (gerado por `cargo xtask nt-types`) ----
 //
 // Cada constante de offset acima que corresponde a um campo do layout real
 // é conferida em compilação contra `inc::types` (gerado dos símbolos).

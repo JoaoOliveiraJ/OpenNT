@@ -27,7 +27,7 @@
 mod pe;
 mod render;
 mod sources;
-mod toml;
+pub mod toml;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

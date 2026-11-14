@@ -1,0 +1,499 @@
+# Estruturas do NT geradas por `cargo xtask nt-types` a partir dos símbolos
+# do ntoskrnl (o PDB de [pdb]). Cada raiz entra com o fecho transitivo dos
+# tipos que ela contém por valor (structs, uniões e enums aninhados);
+# ponteiros não puxam o tipo apontado, que só aparece no comentário
+# `/// -> ...`. Depois de mudar este arquivo, rode `cargo xtask nt-types`;
+# `cargo xtask nt-types --check` falha se os arquivos gerados estiverem
+# desatualizados.
+#
+# Uma estrutura que os símbolos não têm fica à mão num `extra_*.rs` (ou em
+# `wdk.rs`), no mesmo estilo, citando o cabeçalho público de origem.
+
+raizes = [
+  # nt_abi.rs
+  "_DRIVER_OBJECT", "_DRIVER_EXTENSION", "_DEVICE_OBJECT", "_DEVOBJ_EXTENSION", "_VPB", "_IRP",
+  "_IO_STACK_LOCATION", "_FILE_OBJECT", "_IO_STATUS_BLOCK", "_POWER_STATE_TYPE",
+  "_DEVICE_POWER_STATE", "_OBJECT_ATTRIBUTES", "_UNICODE_STRING", "_DISPATCHER_HEADER", "_KEVENT",
+  "_KMUTANT", "_FAST_MUTEX", "_KDPC", "_KTIMER", "_IO_WORKITEM", "_MDL", "_GENERAL_LOOKASIDE",
+  "_KTHREAD", "_ETHREAD", "_KPROCESS", "_EPROCESS", "_EJOB", "_KINTERRUPT", "_KDEVICE_QUEUE",
+  "_CONTROLLER_OBJECT", "_CM_RESOURCE_LIST", "_CM_FULL_RESOURCE_DESCRIPTOR",
+  "_CM_PARTIAL_RESOURCE_LIST", "_CM_PARTIAL_RESOURCE_DESCRIPTOR",
+  # bases dos offsets numéricos espalhados pelo kernel
+  "_KPCR", "_KPRCB", "_OBJECT_HEADER", "_OBJECT_TYPE", "_OBJECT_TYPE_INITIALIZER",
+  "_OBJECT_HEADER_NAME_INFO", "_OBJECT_DIRECTORY", "_KAPC", "_KAPC_STATE", "_KSEMAPHORE",
+  "_KQUEUE", "_KWAIT_BLOCK", "_LIST_ENTRY", "_SINGLE_LIST_ENTRY", "_STRING", "_LARGE_INTEGER",
+  "_ULARGE_INTEGER", "_ERESOURCE", "_EX_PUSH_LOCK", "_EX_FAST_REF", "_EX_RUNDOWN_REF",
+  "_RTL_RUN_ONCE", "_WORK_QUEUE_ITEM", "_NPAGED_LOOKASIDE_LIST", "_PAGED_LOOKASIDE_LIST",
+  "_LOOKASIDE_LIST_EX", "_KDEVICE_QUEUE_ENTRY", "_SECTION_OBJECT_POINTERS",
+  "_KLDR_DATA_TABLE_ENTRY", "_LDR_DATA_TABLE_ENTRY", "_PEB_LDR_DATA", "_PEB", "_TEB",
+  "_RTL_USER_PROCESS_PARAMETERS", "_CLIENT_ID", "_TOKEN", "_SECURITY_DESCRIPTOR",
+  "_SECURITY_DESCRIPTOR_RELATIVE", "_SID", "_ACL", "_ACCESS_STATE", "_AUX_ACCESS_DATA",
+  "_INITIAL_PRIVILEGE_SET", "_PRIVILEGE_SET", "_SECURITY_QUALITY_OF_SERVICE",
+  "_SECURITY_SUBJECT_CONTEXT", "_GENERIC_MAPPING", "_CONTEXT", "_EXCEPTION_RECORD", "_KTRAP_FRAME",
+  "_KEXCEPTION_FRAME", "_HANDLE_TABLE", "_HANDLE_TABLE_ENTRY", "_OBJECT_HANDLE_INFORMATION",
+  "_IO_COMPLETION_CONTEXT", "_IO_TIMER", "_KSPIN_LOCK_QUEUE", "_KLOCK_QUEUE_HANDLE",
+  "_KSYSTEM_TIME", "_KUSER_SHARED_DATA", "_NT_TIB", "_FILE_BASIC_INFORMATION",
+  "_FILE_STANDARD_INFORMATION", "_IMAGE_DOS_HEADER", "_IMAGE_NT_HEADERS64",
+  "_IMAGE_SECTION_HEADER", "_SECTION", "_CONTROL_AREA", "_SEGMENT",
+  # bases achadas pelo mapeamento dos acessos
+  "_GUID", "_LUID", "_LUID_AND_ATTRIBUTES", "_RTL_DYNAMIC_HASH_TABLE", "_PORT_MESSAGE",
+  "_OBJECT_NAME_INFORMATION", "_RTL_DYNAMIC_HASH_TABLE_ENUMERATOR", "_RTL_AVL_TABLE",
+  "_RTL_QUERY_REGISTRY_TABLE", "_WNF_NAME_INSTANCE", "_DEVICE_CAPABILITIES",
+  "_RTL_DYNAMIC_HASH_TABLE_CONTEXT", "_ALPC_MESSAGE_ATTRIBUTES", "_RTL_FEATURE_USAGE_REPORT",
+  "_TRACE_ENABLE_INFO", "_ETW_REG_ENTRY", "_ETW_GUID_ENTRY", "_ALPC_PORT_ATTRIBUTES",
+  "_IO_MINI_COMPLETION_PACKET_USER", "_WNF_SUBSCRIPTION", "_IO_RESOURCE_DESCRIPTOR",
+  "_EVENT_DESCRIPTOR", "_RTL_BALANCED_LINKS", "_FILE_NETWORK_OPEN_INFORMATION",
+  "_IO_RESOURCE_REQUIREMENTS_LIST", "_IO_REMOVE_LOCK", "_IMAGE_RUNTIME_FUNCTION_ENTRY",
+  "_FAST_IO_DISPATCH", "_HAL_UNMASKED_INTERRUPT_INFORMATION", "_EVENT_DATA_DESCRIPTOR",
+  "_TIME_FIELDS", "_WNF_SCOPE_INSTANCE", "_HAL_CLOCK_TIMER_CONFIGURATION", "_RTL_SPLAY_LINKS",
+  "_SID_AND_ATTRIBUTES", "_WNF_PROCESS_CONTEXT", "_IOP_FILE_OBJECT_EXTENSION",
+  "_WHEA_ERROR_RECORD_SECTION_DESCRIPTOR", "_WHEA_PROCESSOR_GENERIC_ERROR_SECTION",
+  "_RTL_DYNAMIC_HASH_TABLE_ENTRY", "_IO_RESOURCE_LIST", "_HV_X64_HYPERVISOR_FEATURES",
+  "_XSTATE_SAVE", "_ESERVERSILO_GLOBALS", "_REMOTE_PORT_VIEW", "_TOKEN_ACCESS_INFORMATION",
+  "_INTERRUPT_VECTOR_DATA", "_EWOW64PROCESS", "_ALPC_WORK_ON_BEHALF_TICKET", "_EXCEPTION_POINTERS",
+  "_SILO_USER_SHARED_DATA", "_CM_KEY_BODY", "_HAL_INTEL_ENLIGHTENMENT_INFORMATION",
+  "_HAL_IOMMU_DISPATCH", "_SECTION_IMAGE_INFORMATION", "_MM_SESSION_SPACE",
+  "_EX_RUNDOWN_REF_CACHE_AWARE", "_WNF_STATE_DATA", "_EXCEPTION_RECORD64", "_TOKEN_PRIVILEGES",
+  "_POP_FX_DEVICE", "_MMPFN", "_WNF_SCOPE_MAP", "_DEVPROPKEY", "_SLIST_ENTRY",
+  "_FS_FILTER_CALLBACKS", "_DEVICE_RELATIONS", "_EXT_SET_PARAMETERS_V0", "HAL_PRIVATE_DISPATCH",
+]
+
+# O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS
+# do PE). Ausente em `arquivo`, é baixado do servidor público de símbolos.
+[pdb]
+arquivo = "build/symbols/ntkrnlmp.pdb"
+nome = "ntkrnlmp.pdb"
+guid = "F57E740B088E5056E8AF0772F1CC5BEB"
+idade = 1
+servidor = "https://msdl.microsoft.com/download/symbols"
+
+# Os `.rs` do diretório que não são de família são mantidos à mão: os de
+# `reexportados` entram no `mod.rs` com `pub use x::*`; os demais (os
+# `extra_*.rs`) como `pub mod x`.
+[saida]
+diretorio = "kernel/src/ntos/inc/types"
+nt_abi = "kernel/src/ntos/inc/nt_abi.rs"
+reexportados = ["wdk"]
+
+# Famílias: um arquivo por componente do NT. Um tipo vai para a família que
+# o cita em `nomes` (nome sem o `_` inicial, em maiúsculas) ou, senão, para a
+# primeira, na ordem abaixo, com um prefixo que case (`NOME$` exige o nome
+# inteiro). Tipos anônimos ficam com a família do tipo que os contém.
+
+[[familia]]
+nome = "rtl"
+doc = "Rtl: listas, strings, inteiros grandes e estruturas de runtime."
+nomes = ["TIME_FIELDS"]
+prefixos = [
+  "LIST_ENTRY", "SINGLE_LIST_ENTRY", "SLIST_", "UNICODE_STRING", "STRING$", "LARGE_INTEGER",
+  "ULARGE_INTEGER", "GUID", "RTL_", "EXCEPTION_RECORD", "BALANCED", "LUID$", "QUAD$", "M128A",
+  "NT_TIB", "STRING32", "STRING64", "LIST_ENTRY32", "LIST_ENTRY64", "CURDIR", "RTL_DRIVE",
+]
+
+[[familia]]
+nome = "io"
+doc = "Io: IRPs, pilhas de I/O, objetos de driver/dispositivo/arquivo."
+nomes = ["DIRECTORY_NOTIFY_INFORMATION_CLASS", "FSINFOCLASS", "DEVPROPKEY"]
+prefixos = [
+  "IRP", "IO_", "DEVICE_", "DEVOBJ_", "DRIVER_", "FILE_", "VPB", "FAST_IO",
+  "SECTION_OBJECT_POINTERS", "CONTROLLER_OBJECT", "WAIT_CONTEXT_BLOCK", "NAMED_PIPE", "MAILSLOT",
+  "FS_FILTER", "INTERFACE", "DEVICE", "VOLUME", "SCSI", "COMPLETION", "IOP_", "INTERFACE_TYPE",
+  "IRQ", "BUS_", "STORAGE", "PNP", "ARBITER", "DEVICE_RELATION", "POWER_SEQUENCE", "DMA",
+  "ADAPTER", "SYSTEM_POWER_STATE_CONTEXT", "FSRTL", "TARGET_DEVICE", "PLUGPLAY",
+]
+
+[[familia]]
+nome = "cm"
+doc = "Cm: listas de recursos e estruturas do registro."
+prefixos = ["CM_", "KEY_", "HHIVE", "HBASE", "HMAP", "DUAL", "HCELL", "CELL_", "REG_", "HIVE"]
+
+[[familia]]
+nome = "ob"
+doc = "Ob: cabeçalhos de objeto, tipos, diretórios e tabelas de handles."
+prefixos = ["OBJECT_", "OB_", "HANDLE_TABLE", "OBP_", "DEVICE_MAP", "QUAD"]
+
+[[familia]]
+nome = "se"
+doc = "Se: tokens, SIDs, ACLs, descritores de segurança e estado de acesso."
+nomes = ["ACCESS_REASONS"]
+prefixos = [
+  "TOKEN", "SID", "ACL", "ACE", "SECURITY_", "SEP_", "SE_", "LUID_AND", "PRIVILEGE_SET",
+  "ACCESS_STATE", "AUX_ACCESS_DATA", "INITIAL_PRIVILEGE_SET", "GENERIC_MAPPING", "AUTHZ",
+  "PROXY_CLASS", "SECURITY", "TOKEN_", "SID_",
+]
+
+[[familia]]
+nome = "ex"
+doc = "Ex: recursos, push locks, rundown, work items e lookasides."
+prefixos = [
+  "ERESOURCE", "OWNER_ENTRY", "EX_", "FAST_MUTEX", "WORK_QUEUE_ITEM", "GENERAL_LOOKASIDE",
+  "NPAGED_LOOKASIDE", "PAGED_LOOKASIDE", "LOOKASIDE", "CALLBACK", "WNF_", "EX", "PP_LOOKASIDE",
+  "POOL_", "ENODE", "ETIMER", "TIMER_DELAY", "HEAP", "WORKER",
+]
+
+[[familia]]
+nome = "alpc"
+doc = "Alpc: mensagens e atributos de portas (LPC/ALPC)."
+prefixos = ["ALPC_", "PORT_MESSAGE", "REMOTE_PORT_VIEW", "PORT_VIEW", "LPCP_"]
+
+[[familia]]
+nome = "ps"
+doc = "Ps: processos, threads, jobs, PEB/TEB e parâmetros de processo."
+nomes = ["DBGK_SILOSTATE", "SERVERSILO_STATE", "EWOW64PROCESS", "SYSTEM_DLL_TYPE"]
+prefixos = [
+  "EPROCESS", "ETHREAD", "EJOB", "PS_", "PEB", "TEB", "RTL_USER_PROCESS", "CLIENT_ID", "JOB",
+  "W32", "WOW64", "SILO", "ESERVERSILO", "PROCESS_", "THREAD_", "GDI_TEB", "ACTIVATION_CONTEXT",
+  "TEB_", "LEAP_SECOND", "PSP_", "EPROCESS_", "ALPC_PROCESS", "PO_PROCESS", "PAGEFAULT",
+  "SYSTEM_PROCESS", "MMSUPPORT_SHARED", "INVERTED_FUNCTION",
+]
+
+[[familia]]
+nome = "mm"
+doc = "Mm: MDLs, seções, entradas do loader e cabeçalhos PE."
+prefixos = [
+  "MM", "MI_", "MDL", "SECTION", "SEGMENT", "CONTROL_AREA", "SUBSECTION", "KLDR_", "LDR",
+  "IMAGE_", "PHYSICAL_MEMORY", "MIPFN", "PFN", "POOL", "RTL_AVL", "VAD", "ALPC_MEM",
+]
+
+[[familia]]
+nome = "po"
+doc = "Po: estado de energia e gerenciamento de processador."
+prefixos = [
+  "PO_", "POP_", "POWER_", "PPM_", "PROC_", "PEP_", "SYSTEM_POWER", "DEVICE_POWER",
+  "PROCESSOR_IDLE", "PROCESSOR_PERF", "PERF_", "PROCESSOR_POWER",
+]
+
+[[familia]]
+nome = "hal"
+doc = "Hal: estruturas do HAL e do WHEA."
+nomes = ["INTERRUPT_CONNECTION_TYPE"]
+prefixos = ["HAL_", "WHEA_", "ACPI", "MCA", "MCE", "INTERRUPT_"]
+
+[[familia]]
+nome = "etw"
+doc = "Etw: estruturas de rastreamento."
+prefixos = ["ETW_", "WMI_", "PERFINFO", "EVENT_", "TRACE_"]
+
+[[familia]]
+nome = "ke"
+doc = "Ke: objetos de despacho, threads/processos do kernel, PCR/PRCB e contexto."
+nomes = ["KAFFINITY_EX", "ISRDPCSTATS", "ISRDPCSTATS_SEQUENCE", "NT_PRODUCT_TYPE", "ALTERNATIVE_ARCHITECTURE_TYPE"]
+prefixos = [
+  "K", "DISPATCHER_HEADER", "CONTEXT", "XSAVE", "XSTATE", "GROUP_AFFINITY", "PROCESSOR_NUMBER",
+  "CACHE_", "FLOATING_SAVE", "SINGLE_LIST", "M128", "REQUEST_MAILBOX", "SYNCH_COUNTERS",
+  "FILESYSTEM_DISK_COUNTERS", "CPU_INFO", "AMD64", "IOP_IRP_STACK_PROFILER", "HV_", "DEBUG_",
+  "TIMER_", "SCHEDULER", "MACHINE_", "PROCESSOR_", "FX", "XMM", "EXCEPTION_", "JOB_",
+]
+
+[[familia]]
+nome = "misc"
+doc = "Demais estruturas alcançadas pelo fecho transitivo."
+
+# Provas de nt_abi.rs: cada constante `pub const X: u64` de `pub mod m` que
+# corresponde a um campo vira uma asserção contra o layout gerado.
+# `Campo.Sub` (na `estrutura`), `_TIPO:Campo`, `sizeof`, `sizeof(_TIPO)` ou
+# `rust Tipo.campo 0xN` (struct mantida à mão em wdk.rs, com o valor esperado).
+
+[[prova]]
+modulo = "driver_object"
+estrutura = "_DRIVER_OBJECT"
+campos = [
+  "TYPE = Type", "SIZE = Size", "DEVICE_OBJECT = DeviceObject", "FLAGS = Flags",
+  "DRIVER_START = DriverStart", "DRIVER_SIZE = DriverSize", "DRIVER_SECTION = DriverSection",
+  "DRIVER_EXTENSION = DriverExtension", "DRIVER_NAME = DriverName",
+  "HARDWARE_DATABASE = HardwareDatabase", "FAST_IO_DISPATCH = FastIoDispatch",
+  "DRIVER_INIT = DriverInit", "DRIVER_START_IO = DriverStartIo", "DRIVER_UNLOAD = DriverUnload",
+  "MAJOR_FUNCTION = MajorFunction", "STRUCT_SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "driver_extension"
+estrutura = "_DRIVER_EXTENSION"
+campos = [
+  "DRIVER_OBJECT = DriverObject", "ADD_DEVICE = AddDevice", "COUNT = Count",
+  "SERVICE_KEY_NAME = ServiceKeyName", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "device_object"
+estrutura = "_DEVICE_OBJECT"
+campos = [
+  "TYPE = Type", "SIZE = Size", "REFERENCE_COUNT = ReferenceCount", "DRIVER_OBJECT = DriverObject",
+  "NEXT_DEVICE = NextDevice", "ATTACHED_DEVICE = AttachedDevice", "CURRENT_IRP = CurrentIrp",
+  "TIMER = Timer", "FLAGS = Flags", "CHARACTERISTICS = Characteristics", "VPB = Vpb",
+  "DEVICE_EXTENSION = DeviceExtension", "DEVICE_TYPE = DeviceType", "STACK_SIZE = StackSize",
+  "QUEUE_LIST = Queue", "DEVICE_QUEUE = DeviceQueue", "DPC = Dpc",
+  "DEVICE_OBJECT_EXTENSION = DeviceObjectExtension", "STRUCT_SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "devobj_extension"
+estrutura = "_DEVOBJ_EXTENSION"
+campos = ["STRUCT_SIZE = sizeof", "DEVICE_OBJECT = DeviceObject", "VPB = Vpb"]
+
+[[prova]]
+modulo = "vpb"
+estrutura = "_VPB"
+campos = [
+  "TYPE = Type", "SIZE = Size", "FLAGS = Flags", "VOLUME_LABEL_LENGTH = VolumeLabelLength",
+  "DEVICE_OBJECT = DeviceObject", "REAL_DEVICE = RealDevice", "SERIAL_NUMBER = SerialNumber",
+  "REFERENCE_COUNT = ReferenceCount", "VOLUME_LABEL = VolumeLabel", "STRUCT_SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "irp"
+estrutura = "_IRP"
+campos = [
+  "TYPE = Type", "SIZE_FIELD = Size", "MDL_ADDRESS = MdlAddress", "FLAGS = Flags",
+  "SYSTEM_BUFFER = AssociatedIrp.SystemBuffer", "IO_STATUS = IoStatus",
+  "IO_STATUS_INFORMATION = IoStatus.Information", "REQUESTOR_MODE = RequestorMode",
+  "STACK_COUNT = StackCount", "CURRENT_LOCATION = CurrentLocation", "CANCEL = Cancel",
+  "CANCEL_IRQL = CancelIrql", "CANCEL_ROUTINE = CancelRoutine", "USER_IOSB = UserIosb",
+  "USER_EVENT = UserEvent", "USER_BUFFER = UserBuffer", "THREAD = Tail.Overlay.Thread",
+  "ORIGINAL_FILE_OBJECT = Tail.Overlay.OriginalFileObject",
+  "CURRENT_STACK_LOCATION = Tail.Overlay.CurrentStackLocation", "STRUCT_SIZE = sizeof",
+  "STACK_LOCATION_SIZE = sizeof(_IO_STACK_LOCATION)",
+]
+
+[[prova]]
+modulo = "io_stack_location"
+estrutura = "_IO_STACK_LOCATION"
+campos = [
+  "MAJOR = MajorFunction", "MINOR = MinorFunction", "FLAGS = Flags", "CONTROL = Control",
+  "READ_LENGTH = Parameters.Read.Length", "READ_KEY = Parameters.Read.Key",
+  "READ_OFFSET = Parameters.Read.ByteOffset",
+  "IOCTL_OUT_LENGTH = Parameters.DeviceIoControl.OutputBufferLength",
+  "IOCTL_IN_LENGTH = Parameters.DeviceIoControl.InputBufferLength",
+  "IOCTL_CODE = Parameters.DeviceIoControl.IoControlCode",
+  "IOCTL_TYPE3_BUFFER = Parameters.DeviceIoControl.Type3InputBuffer",
+  "POWER_SYSTEM_CONTEXT = Parameters.Power.SystemContext", "POWER_TYPE = Parameters.Power.Type",
+  "POWER_STATE = Parameters.Power.State", "POWER_SHUTDOWN_TYPE = Parameters.Power.ShutdownType",
+  "PNP_ALLOCATED_RESOURCES = Parameters.StartDevice.AllocatedResources",
+  "PNP_ALLOCATED_RESOURCES_TRANSLATED = Parameters.StartDevice.AllocatedResourcesTranslated",
+  "DEVICE_OBJECT = DeviceObject", "FILE_OBJECT = FileObject",
+  "COMPLETION_ROUTINE = CompletionRoutine", "CONTEXT = Context", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "file_object"
+estrutura = "_FILE_OBJECT"
+campos = [
+  "TYPE = Type", "SIZE = Size", "DEVICE_OBJECT = DeviceObject", "FLAGS = Flags",
+  "FILE_NAME = FileName", "CURRENT_BYTE_OFFSET = CurrentByteOffset", "LOCK = Lock",
+  "EVENT = Event", "IRP_LIST = IrpList", "STRUCT_SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "io_status_block"
+estrutura = "_IO_STATUS_BLOCK"
+campos = ["STATUS = Status", "INFORMATION = Information", "SIZE = sizeof"]
+
+[[prova]]
+modulo = "object_attributes"
+estrutura = "_OBJECT_ATTRIBUTES"
+campos = [
+  "LENGTH = Length", "ROOT_DIRECTORY = RootDirectory", "OBJECT_NAME = ObjectName",
+  "ATTRIBUTES = Attributes", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "unicode_string"
+estrutura = "_UNICODE_STRING"
+campos = ["LENGTH = Length", "MAXIMUM_LENGTH = MaximumLength", "BUFFER = Buffer", "SIZE = sizeof"]
+
+[[prova]]
+modulo = "dispatcher_header"
+estrutura = "_DISPATCHER_HEADER"
+campos = [
+  "TYPE = Type", "SIGNAL_STATE = SignalState", "WAIT_LIST_HEAD = WaitListHead", "SIZE = sizeof",
+  "MUTEX_OWNER = _KMUTANT:OwnerThread",
+]
+
+[[prova]]
+modulo = "kevent"
+estrutura = "_KEVENT"
+campos = ["SIZE = sizeof"]
+
+[[prova]]
+modulo = "kmutex"
+estrutura = "_KMUTANT"
+campos = ["SIZE = sizeof"]
+
+[[prova]]
+modulo = "fast_mutex"
+estrutura = "_FAST_MUTEX"
+campos = [
+  "COUNT = Count", "OWNER = Owner", "CONTENTION = Contention", "EVENT = Event",
+  "OLD_IRQL = OldIrql", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "kdpc"
+estrutura = "_KDPC"
+campos = [
+  "TYPE = Type", "IMPORTANCE = Importance", "NUMBER = Number", "DPC_LIST_ENTRY = DpcListEntry",
+  "PROCESSOR_HISTORY = ProcessorHistory", "ROUTINE = DeferredRoutine", "CONTEXT = DeferredContext",
+  "SYSARG1 = SystemArgument1", "SYSARG2 = SystemArgument2", "DPC_DATA = DpcData", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "ktimer"
+estrutura = "_KTIMER"
+campos = [
+  "TYPE = Header.Type", "SIGNAL_STATE = Header.SignalState", "DUE_TIME = DueTime",
+  "TIMER_LIST_ENTRY = TimerListEntry", "DPC = Dpc", "PERIOD = Period", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "io_workitem"
+estrutura = "_IO_WORKITEM"
+campos = [
+  "LIST_FLINK = WorkItem.List.Flink", "LIST_BLINK = WorkItem.List.Blink",
+  "FUNCTION = WorkItem.WorkerRoutine", "CONTEXT = WorkItem.Parameter", "DEVICE_OBJECT = IoObject",
+  "TYPE = Type", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "mdl"
+estrutura = "_MDL"
+campos = [
+  "NEXT = Next", "SIZE = Size", "MDL_FLAGS = MdlFlags", "PROCESS = Process",
+  "MAPPED_SYSTEM_VA = MappedSystemVa", "START_VA = StartVa", "BYTE_COUNT = ByteCount",
+  "BYTE_OFFSET = ByteOffset", "PFN_ARRAY = sizeof",
+]
+
+[[prova]]
+modulo = "lookaside_list"
+estrutura = "_GENERAL_LOOKASIDE"
+campos = [
+  "DEPTH = Depth", "MAXIMUM_DEPTH = MaximumDepth", "ALLOC_COUNT = TotalAllocates",
+  "ALLOC_MISSES = AllocateMisses", "FREE_COUNT = TotalFrees", "FREE_MISSES = FreeMisses",
+  "POOL_TYPE = Type", "TAG = Tag", "BLOCK_SIZE = Size", "ALLOCATE_CALLBACK = Allocate",
+  "FREE_CALLBACK = Free", "REGISTRY_ENTRY = ListEntry", "LAST_ALLOC_COUNT = LastTotalAllocates",
+  "LAST_ALLOC_MISSES = LastAllocateMisses", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "kthread"
+estrutura = "_KTHREAD"
+campos = [
+  "QUANTUM_TARGET = QuantumTarget", "INITIAL_STACK = InitialStack", "STACK_LIMIT = StackLimit",
+  "STACK_BASE = StackBase", "TEB = Teb", "WIN32_THREAD = Win32Thread",
+  "CREATE_TIME = _ETHREAD:CreateTime", "THREAD_LOCK = ThreadLock", "CYCLE_TIME = CycleTime",
+  "WAIT_REGISTER = WaitRegister", "RUNNING = Running", "ALERTED = Alerted",
+  "MISC_FLAGS = MiscFlags", "THREAD_FLAGS = ThreadFlags", "READY_TIME = ReadyTime",
+  "TRAP_FRAME = TrapFrame", "APC_STATE = ApcState", "APC_STATE_PROCESS = ApcState.Process",
+  "PRIORITY = Priority", "WAIT_STATUS = WaitStatus", "WAIT_LIST_ENTRY = WaitListEntry",
+  "STATE = State", "WAIT_MODE = WaitMode", "WAIT_TIME = WaitTime",
+  "KERNEL_APC_DISABLE = KernelApcDisable", "SPECIAL_APC_DISABLE = SpecialApcDisable",
+  "PROCESS = Process", "PREVIOUS_MODE = PreviousMode", "BASE_PRIORITY = BasePriority",
+  "PRIORITY_DECREMENT = PriorityDecrement", "SATURATION = Saturation",
+  "QUANTUM_RESET = QuantumReset", "PRIORITY_FLOOR_SUMMARY = PriorityFloorSummary",
+  "FOREGROUND_LOSS_TIME = ForegroundLossTime", "OTHER_OPERATION_COUNT = OtherOperationCount",
+  "CID = _ETHREAD:Cid", "CID_UNIQUE_PROCESS = _ETHREAD:Cid.UniqueProcess",
+  "CID_UNIQUE_THREAD = _ETHREAD:Cid.UniqueThread", "IRP_LIST_HEAD = _ETHREAD:IrpList",
+  "THREAD_LIST_ENTRY = _ETHREAD:ThreadListEntry", "RUNDOWN_PROTECT = _ETHREAD:RundownProtect",
+  "INSERTION_LOCK = _ETHREAD:ThreadLock", "CROSS_THREAD_FLAGS = _ETHREAD:CrossThreadFlags",
+  "SAME_THREAD_APC_FLAGS = _ETHREAD:SameThreadApcFlags", "EXIT_STATUS = _ETHREAD:ExitStatus",
+  "IRP_LIST_LOCK = _ETHREAD:IrpListLock", "ACTIVITY_ID = _ETHREAD:ActivityId",
+  "SILO = _ETHREAD:Silo", "EXPECTED_RUN_TIME = _ETHREAD:LastExpectedRunTime",
+  "SIZE = sizeof(_ETHREAD)",
+]
+
+[[prova]]
+modulo = "eprocess"
+estrutura = "_EPROCESS"
+campos = [
+  "DIRECTORY_TABLE_BASE = Pcb.DirectoryTableBase", "BASE_PRIORITY = Pcb.BasePriority",
+  "PROCESS_LOCK = ProcessLock", "UNIQUE_PROCESS_ID = UniqueProcessId",
+  "ACTIVE_PROCESS_LINKS = ActiveProcessLinks", "RUNDOWN_PROTECT = RundownProtect", "FLAGS = Flags",
+  "CREATE_TIME = CreateTime", "WIN32_WINDOW_STATION = Win32WindowStation",
+  "INHERITED_FROM_UNIQUE_PROCESS_ID = InheritedFromUniqueProcessId",
+  "PRIORITY_CLASS = PriorityClass", "SECURITY_PORT = SecurityPort",
+  "SEQUENCE_NUMBER = SequenceNumber", "DXG_PROCESS = DxgProcess",
+  "POOL_QUOTA_USAGE = ProcessQuotaUsage", "POOL_QUOTA_PEAK = ProcessQuotaPeak", "TOKEN = Token",
+  "WIN32_PROCESS = Win32Process", "JOB = Job", "SECTION_OBJECT = SectionObject",
+  "SECTION_BASE_ADDRESS = SectionBaseAddress", "PEB = Peb", "SESSION = Session",
+  "OBJECT_TABLE = ObjectTable", "DEBUG_PORT = DebugPort", "WOW64_PROCESS = WoW64Process",
+  "IMAGE_FILE_POINTER = ImageFilePointer", "IMAGE_FILE_NAME = ImageFileName",
+  "AUDIT_IMAGE_NAME = SeAuditProcessCreationInfo", "THREAD_LIST_HEAD = ThreadListHead",
+  "ACTIVE_THREADS = ActiveThreads", "EXIT_STATUS = ExitStatus", "EXIT_TIME = ExitTime",
+  "SERVER_SILO = ServerSilo", "SIGNATURE_LEVEL = SignatureLevel",
+  "SECTION_SIGNATURE_LEVEL = SectionSignatureLevel", "PROTECTION = Protection", "FLAGS3 = Flags3",
+  "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "ejob"
+estrutura = "_EJOB"
+campos = [
+  "PARENT = ParentJob", "SERVER_SILO_GLOBALS = ServerSiloGlobals", "SILO_CONTEXT = Storage",
+  "FLAGS = JobFlags", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "kinterrupt"
+estrutura = "_KINTERRUPT"
+campos = [
+  "TYPE = Type", "SIZE_FIELD = Size", "LIST_ENTRY = InterruptListEntry",
+  "SERVICE_ROUTINE = ServiceRoutine", "SERVICE_CONTEXT = ServiceContext", "SPIN_LOCK = SpinLock",
+  "TICK_COUNT = TickCount", "ACTUAL_LOCK = ActualLock", "VECTOR = Vector", "IRQL = Irql",
+  "SYNCHRONIZE_IRQL = SynchronizeIrql", "FLOATING_SAVE = FloatingSave", "CONNECTED = Connected",
+  "NUMBER = Number", "SHARE_VECTOR = ShareVector", "MODE = Mode", "SHARE_DISPOSITION = Polarity",
+  "DISPATCH_ADDRESS = DispatchAddress", "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "kdevice_queue"
+estrutura = "_KDEVICE_QUEUE"
+campos = [
+  "TYPE = Type", "SIZE_FIELD = Size", "LOCK = Lock", "BUSY = Busy", "ENTRY = DeviceListHead",
+  "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "key_value_partial"
+estrutura = "_KEY_VALUE_PARTIAL_INFORMATION"
+campos = [
+  "TITLE_INDEX = rust KeyValuePartialInformation.title_index 0x0",
+  "TYPE = rust KeyValuePartialInformation.type_ 0x4",
+  "DATA_LENGTH = rust KeyValuePartialInformation.data_length 0x8",
+  "DATA = rust KeyValuePartialInformation.data 0xc",
+]
+
+[[prova]]
+modulo = "controller_object"
+estrutura = "_CONTROLLER_OBJECT"
+campos = [
+  "TYPE = Type", "SIZE_FIELD = Size", "CONTROLLER_EXTENSION = ControllerExtension",
+  "SIZE = sizeof",
+]
+
+[[prova]]
+modulo = "cm_resource_list"
+estrutura = "_CM_RESOURCE_LIST"
+campos = ["COUNT = Count", "FULL_DESCRIPTOR = List"]
+
+[[prova]]
+modulo = "cm_full_resource_descriptor"
+estrutura = "_CM_FULL_RESOURCE_DESCRIPTOR"
+campos = [
+  "INTERFACE_TYPE = InterfaceType", "BUS_NUMBER = BusNumber", "PARTIAL_LIST = PartialResourceList",
+]
+
+[[prova]]
+modulo = "cm_partial_resource_list"
+estrutura = "_CM_PARTIAL_RESOURCE_LIST"
+campos = [
+  "VERSION = Version", "REVISION = Revision", "COUNT = Count", "DESCRIPTORS = PartialDescriptors",
+]
+
+[[prova]]
+modulo = "cm_partial_resource_descriptor"
+estrutura = "_CM_PARTIAL_RESOURCE_DESCRIPTOR"
+campos = [
+  "TYPE = Type", "SHARE_DISPOSITION = ShareDisposition", "FLAGS = Flags",
+  "PORT_START = u.Port.Start", "PORT_LENGTH = u.Port.Length",
+  "INTERRUPT_LEVEL = u.Interrupt.Level", "INTERRUPT_VECTOR = u.Interrupt.Vector",
+  "INTERRUPT_AFFINITY = u.Interrupt.Affinity", "SIZE = sizeof",
+]
