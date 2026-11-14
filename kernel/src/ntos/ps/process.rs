@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::ex::{push_lock, rundown};
-use crate::ntos::ke::{clock, critical_region, pcr};
+use crate::ntos::ke::{clock, context_switch, critical_region, pcr};
 use crate::ntos::mm::{kernel_data, memory_map, process_address_space};
 use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::{object_access, object_types};
@@ -973,10 +973,13 @@ pub fn remove_thread(process: u64) {
 }
 
 /// A troca de thread corrente atualiza a PCR (gs:0x188 =
-/// Prcb.CurrentThread), lida direto por drivers nativos.
+/// Prcb.CurrentThread), lida direto por drivers nativos, e carrega a raiz
+/// do processo corrente da nova thread (`KTHREAD.ApcState.Process`, o
+/// anexado quando ela está anexada) quando ela difere da carregada.
 pub fn set_current_thread(thread: u64) {
     CURRENT_THREAD.store(thread, Ordering::Relaxed);
     pcr::set_current_thread(thread);
+    context_switch::load_process(get_current_process());
 }
 
 pub fn get_current_thread() -> u64 {

@@ -11,11 +11,12 @@
 //!
 //! # O mapa de memória que o acesso pressupõe (conferido no código)
 //!
-//! - **Um só espaço de endereços.** Há uma PML4 (`PML4_PHYS`, 0x70000): os
-//!   APs carregam o CR3 do BSP e a anexação de processo recusa qualquer
-//!   DirectoryTableBase diferente e só recarrega o mesmo CR3. Quando o
-//!   kernel toca um buffer de modo usuário, o CR3 ativo é sempre esse: a
-//!   VA de usuário é desreferenciável direto.
+//! - **O espaço do processo corrente.** O CR3 de cada CPU é a raiz do
+//!   processo corrente da thread corrente (o anexado, durante um attach;
+//!   `ke::context_switch`). Os processos que o Ps cria ainda usam a PML4 do
+//!   boot (`PML4_PHYS`), e os APs também. Quando o kernel toca um buffer de
+//!   modo usuário, a VA é desreferenciável direto no espaço carregado; quem
+//!   precisa do espaço de outro processo anexa a ele.
 //! - **Proteção.** CR0.WP=1 em todas as CPUs (escritas de supervisor
 //!   respeitam PTEs somente leitura), EFER.NXE=1, CR4 sem SMEP/SMAP.
 //! - **Metade de usuário** (PML4[0..256)): só páginas de usuário (imagens,

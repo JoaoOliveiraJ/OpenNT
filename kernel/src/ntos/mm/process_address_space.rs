@@ -15,9 +15,11 @@
 //! de usuário e a raiz, no último dereference do EPROCESS
 //! (`ps::process::collect_process`), o papel do PspProcessDelete.
 //!
-//! Ainda só a raiz do boot é carregada: os processos que o Ps cria recebem a
-//! PML4 do boot como DirectoryTableBase, ninguém troca o CR3 para uma raiz de
-//! [`create`] e o attach recusa um processo que tenha uma.
+//! Quem carrega uma raiz no CR3 é a troca de `ke::context_switch`: o attach
+//! carrega a do processo destino, e a troca de thread corrente a do processo
+//! da thread. Uma raiz carregada em alguma CPU não é devolvida. Os processos
+//! que o Ps cria ainda recebem a PML4 do boot como DirectoryTableBase; só
+//! quem chama [`create`] ganha uma raiz própria.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
@@ -25,6 +27,7 @@ use core::sync::atomic::Ordering;
 use super::{memory_map as map, paging, pfn, recursive_mapping, shared_user_data};
 use crate::hal::physical;
 use crate::ntos::inc::types::{Kprocess, NtStruct};
+use crate::ntos::ke::context_switch;
 use crate::ntos::ps::user::process_state;
 use crate::rtl::{KernelError, SpinLock};
 
@@ -71,10 +74,10 @@ pub fn create_root() -> Result<u64, KernelError> {
 /// entrada de usuário ainda presente, recusa sem liberar nada. As da metade
 /// de sistema são compartilhadas e ficam.
 pub fn delete_root(root: u64) -> Result<(), KernelError> {
-    if root == SYSTEM_ROOT || root == paging::current_root() {
+    if root == SYSTEM_ROOT || root == paging::current_root() || context_switch::is_root_loaded(root) {
         return Err(KernelError::new("page-table root still in use"));
     }
-    if root % map::PAGE_SIZE != 0 || root >= map::PHYSICAL_MEMORY_LIMIT || paging::read_entry_exact(root + map::PAGE_TABLE_RECURSIVE_INDEX * 8) != recursive_mapping::self_reference(root) {
+    if !is_root(root) {
         return Err(KernelError::new("not an address-space root"));
     }
     if (0..map::USER_PML4_ENTRIES).any(|index| paging::read_entry_exact(root + index * 8) != 0) {
@@ -83,6 +86,17 @@ pub fn delete_root(root: u64) -> Result<(), KernelError> {
     physical::zero(root, map::PAGE_SIZE as usize);
     pfn::free_page(root);
     Ok(())
+}
+
+/// `root` é uma raiz de espaço de endereçamento: a do System ou um frame
+/// de página com a própria auto-referência em [256], como toda raiz de
+/// [`create_root`] (uma raiz devolvida é zerada e deixa de passar).
+pub fn is_root(root: u64) -> bool {
+    root == SYSTEM_ROOT
+        || (root != 0
+            && root % map::PAGE_SIZE == 0
+            && root < map::PHYSICAL_MEMORY_LIMIT
+            && paging::read_entry_exact(root + map::PAGE_TABLE_RECURSIVE_INDEX * 8) == recursive_mapping::self_reference(root))
 }
 
 /// A raiz própria do EPROCESS `process`, se ele tiver uma.
@@ -145,14 +159,19 @@ fn discard(root: u64) {
 
 /// MmDeleteProcessAddressSpace: devolve ao PFN todas as tabelas da metade de
 /// usuário da raiz própria de `process` (a visão da KUSER cai junto) e a
-/// própria raiz; o processo volta a apontar para a raiz do System. A raiz
-/// não pode estar carregada, e uma página de usuário ainda mapeada fora da
-/// visão da KUSER faz a chamada recusar sem mudar nada: o VAD do processo
-/// tem de ter sido desfeito antes.
+/// própria raiz; o processo volta a apontar para a raiz do System. Uma raiz
+/// carregada em alguma CPU (uma thread anexada ao processo ou rodando nele)
+/// e uma página de usuário ainda mapeada fora da visão da KUSER fazem a
+/// chamada recusar sem mudar nada: o VAD do processo tem de ter sido
+/// desfeito antes.
 pub fn delete(process: u64) -> Result<(), KernelError> {
     let Some(root) = SPACES.lock().remove(&process) else {
         return Err(KernelError::new("process has no address space of its own"));
     };
+    if root == paging::current_root() || context_switch::is_root_loaded(root) {
+        SPACES.lock().insert(process, root);
+        return Err(KernelError::new("address space is loaded on a processor"));
+    }
     let released = paging::release_user_half_in(root, &[shared_user_data::MM_SHARED_USER_DATA_VA]).and_then(|_| delete_root(root));
     if let Err(error) = released {
         SPACES.lock().insert(process, root);

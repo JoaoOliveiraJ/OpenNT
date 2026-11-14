@@ -7,3 +7,4 @@ pub mod address_space;
 pub mod handles;
 pub mod vad;
 pub mod identity;
+pub mod attach_cr3;

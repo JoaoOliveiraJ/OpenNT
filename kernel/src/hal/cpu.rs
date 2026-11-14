@@ -61,6 +61,12 @@ pub fn reload_cr3() {
     unsafe { asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) }
 }
 
+/// Carrega CR3: outra raiz de tabelas de páginas (esvazia a TLB não global).
+/// Sem `nomem`: os acessos à memória não atravessam a troca.
+pub fn write_cr3(value: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) }
+}
+
 /// Invalida a página de `address` na TLB (INVLPG).
 pub fn invalidate_page(address: u64) {
     unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack)) }

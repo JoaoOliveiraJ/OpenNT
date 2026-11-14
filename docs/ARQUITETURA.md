@@ -411,12 +411,24 @@ PML4:
   e depois a raiz; o processo volta a apontar para a raiz do System. Uma
   página de usuário ainda mapeada fora da visão da KUSER faz o delete
   recusar sem mudar nada (o VAD tem de ter sido desfeito antes), e uma raiz
-  carregada também é recusada.
-- Ainda só a raiz do boot é carregada: os processos que o Ps cria recebem a
-  PML4 do boot como DirectoryTableBase, ninguém troca o CR3 para uma raiz de
-  `create`, e o attach recusa um processo que tenha uma. O rastreador de
-  frames só acompanha as tabelas alcançadas pela PML4 do boot; as tabelas de
-  usuário das outras raízes ficam fora dele.
+  carregada em alguma CPU também é recusada.
+- **Troca de CR3** (`ke/context_switch.rs`, o KiSwapProcess). Fora da troca,
+  o CR3 de cada CPU é o KPROCESS.DirectoryTableBase de
+  `KTHREAD.ApcState.Process` da thread corrente. KeStackAttachProcess e
+  KeAttachProcess carregam a raiz do destino quando ela difere da carregada;
+  KeUnstackDetachProcess e KeDetachProcess, a do processo que o KAPC_STATE
+  salvo devolve, então o aninhamento é o dos KAPC_STATE, como no NT. A
+  CPU também passa de um KPROCESS.ActiveProcessors para o outro. O attach
+  recusa, antes de mexer no KAPC_STATE, um processo cuja raiz não é a do
+  System nem uma raiz do Mm (`process_address_space::is_root`).
+  `ps::process::set_current_thread`, o ponto único de troca de thread, carrega
+  a raiz do processo corrente da nova thread; ele não mexe em
+  ActiveProcessors, porque a thread que sai pode já ter sido liberada.
+  `context_switch` registra a raiz carregada em cada CPU (`is_root_loaded`),
+  e é por esse registro que o delete recusa uma raiz em uso. Os processos que
+  o Ps cria ainda recebem a PML4 do boot, então para eles a troca de thread
+  não muda o CR3. O rastreador de frames só acompanha as tabelas alcançadas
+  pela PML4 do boot; as tabelas de usuário das outras raízes ficam fora dele.
 
 O autoteste `ntos/test/multiprocess/page_table_root.rs` (fase 7) confere as
 256 entradas presentes e permanentes, a PDPT de um slot vazio sobrevivendo a
@@ -429,6 +441,12 @@ está presente e somente leitura nos dois, a mesma VA de usuário cai em
 frames diferentes e as VAs de kernel nos mesmos, o delete recusa com página
 mapeada e depois devolve tudo (a contagem livre do PFN volta à de antes), e
 o último dereference de um processo com espaço próprio o libera.
+`ntos/test/multiprocess/attach_cr3.rs` (fase 7) anexa a um processo com
+espaço próprio e lê e grava pela VA de usuário a página mapeada só nele;
+desanexado, a mesma VA dá STATUS_ACCESS_VIOLATION na sonda. Também confere
+que um attach aninhado e o KeAttachProcess restauram cada raiz, que a thread
+corrente de outro espaço carrega a raiz dele e que o delete de um espaço
+carregado é recusado.
 
 **Imagens.**
 

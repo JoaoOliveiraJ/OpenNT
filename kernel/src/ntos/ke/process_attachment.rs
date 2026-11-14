@@ -1,17 +1,18 @@
 //! KeStackAttachProcess/KeUnstackDetachProcess.
 //!
-//! Anexação da thread corrente com KAPC_STATE x64 de 48 bytes. O MM atual
-//! compartilha uma PML4 entre processos: a identidade APC e as filas mudam
-//! de verdade, mas não há um espaço de endereços independente.
+//! Anexação da thread corrente com KAPC_STATE x64 de 48 bytes: a identidade
+//! APC, as filas e o espaço de endereçamento mudam de verdade. O attach
+//! carrega no CR3 a raiz (KPROCESS.DirectoryTableBase) do destino quando ela
+//! difere da carregada, e o detach a do processo que o KAPC_STATE salvo
+//! devolve; o aninhamento é o dos KAPC_STATE, como no NT
+//! (`context_switch::swap_process`, o KiSwapProcess).
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
 
-use super::{apc, irql, pcr};
-use crate::hal::cpu;
-use crate::ntos::mm::memory_map;
+use super::{apc, context_switch, irql, pcr};
 use crate::ntos::ps::process;
-use crate::ntos::inc::types::{KapcState, Kpcr, Kprocess, Kthread, NtStruct};
+use crate::ntos::inc::types::{KapcState, Kprocess, Kthread, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::{KernelError, SpinLock};
 
@@ -56,12 +57,10 @@ fn require_attach_level() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Recusa uma raiz que o MM atual não sabe selecionar.
-fn require_supported_address_space(process: u64) -> Result<(), KernelError> {
-    if kprocess(process).directory_table_base.get() != memory_map::PML4_PHYS {
-        return Err(KernelError::new("process attachment requires an address space managed by the shared-PML4 MM"));
-    }
-    Ok(())
+/// Recusa, antes de mexer no KAPC_STATE, um processo cuja raiz não pode ser
+/// carregada: a troca dentro da transição não falha no meio.
+fn require_loadable_address_space(process: u64) -> Result<(), KernelError> {
+    context_switch::require_loadable(process).map(|_| ())
 }
 
 /// StackCount: estado nos três bits baixos e a quantidade de pilhas nos
@@ -81,26 +80,10 @@ fn change_stack_count(process: u64, difference: i64) -> Result<(), KernelError> 
     }
 }
 
-/// Publica a CPU (grupo e número da PRCB) na afinidade ativa do destino e a
-/// retira da origem, recarregando a raiz compartilhada.
+/// A CPU passa de `previous_process` para `next_process`: a raiz do destino
+/// no CR3 e o bit da CPU em KPROCESS.ActiveProcessors.
 fn publish_address_space(previous_process: u64, next_process: u64) -> Result<(), KernelError> {
-    // SAFETY: a KPCR está mapeada desde `pcr::init`.
-    let prcb = &unsafe { Kpcr::at(pcr::get_pcr_address()) }.prcb;
-    let group = prcb.group.get() as usize;
-    let bit = 1u64 << prcb.group_index.get();
-    for (process, active) in [(next_process, true), (previous_process, false)] {
-        // KPROCESS.ActiveProcessors.Bitmap[grupo]: LOCK OR / LOCK AND.
-        let mask = kprocess(process).active_processors.bitmap[group].atomic();
-        if active {
-            mask.fetch_or(bit, Ordering::SeqCst);
-        } else {
-            mask.fetch_and(!bit, Ordering::SeqCst);
-        }
-        if active {
-            cpu::reload_cr3();
-        }
-    }
-    Ok(())
+    context_switch::swap_process(previous_process, next_process)
 }
 
 /// Liberação da retenção do processo anexado (chamada pelas APCs).
@@ -127,8 +110,8 @@ pub fn attach(target_process: u64, caller_state: u64) -> Result<u32, KernelError
         apc_state(caller_state).process.set(1);
         return Ok(0);
     }
-    require_supported_address_space(previous_process)?;
-    require_supported_address_space(target_process)?;
+    require_loadable_address_space(previous_process)?;
+    require_loadable_address_space(target_process)?;
     let previous_index = current.apc_state_index.get();
     let saved_state = if previous_index != 0 { caller_state } else { current.saved_apc_state.address() };
     let count = kprocess(target_process).stack_count.value.get() as u32;
@@ -197,7 +180,7 @@ pub fn detach(caller_state: u64) -> Result<u32, KernelError> {
         return Err(KernelError::new("detaching process with active or pending APCs"));
     }
     let restored_process = apc_state(saved_state).process.get();
-    require_supported_address_space(restored_process)?;
+    require_loadable_address_space(restored_process)?;
     let mut failure = None;
     let mut transition = || {
         if frame.previous_index == 0 {
