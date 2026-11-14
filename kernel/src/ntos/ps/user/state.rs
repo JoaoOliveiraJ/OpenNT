@@ -9,7 +9,10 @@
 //! Modelo: cada objeto de usuário é um `Arc<dyn UserObject>` (tipo, corpo
 //! nativo, ganchos e estado próprio recuperado por downcast) e cada handle um
 //! `Arc<UserHandle>` com acesso, atributos e referências de espera próprios;
-//! as duplicatas compartilham o resto do objeto. Os campos do estado que
+//! as duplicatas compartilham o resto do objeto. A tabela de handles é por
+//! processo (`ProcessState.handles`) e as operações sem processo explícito
+//! agem sobre a do processo corrente, o anexado quando há attach, como o
+//! ObReferenceObjectByHandle do NT. Os campos do estado que
 //! pertencem a módulos ainda não implementados (regiões, threads, imagens e
 //! módulos carregados) entram junto com eles.
 
@@ -24,16 +27,16 @@ use core::cell::Cell;
 use crate::hal::physical;
 use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
 use crate::ntos::mm::paging;
-use crate::ntos::ob::close::{self, UserHandleTable};
+use crate::ntos::ob::close;
 use crate::ntos::ob::handle_table::HandleDescription;
 use crate::ntos::ob::object_manager::ObjectData;
 use crate::ntos::ob::handles::process::{self as process_handles, Binding};
 use crate::ntos::ob::{callbacks, handle_ids};
-use crate::ntos::ps::process;
+use crate::ntos::ps::user::process_state::{self, ProcessState};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::status::STATUS_ACCESS_VIOLATION;
-use crate::ntos::inc::types::{Eprocess, Field, IoStatusBlock, NtStruct, UnicodeString};
+use crate::ntos::inc::types::{Field, IoStatusBlock, NtStruct, UnicodeString};
 
 /// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
@@ -176,7 +179,6 @@ pub struct State {
     pub instrumentation_callback: u64,
     /// Instantâneo diagnóstico da saída explícita do processo.
     pub termination_rsp: u64,
-    pub next_user_handle: u32,
     /// Área de strings das entradas LDR (bump próprio).
     pub next_ldr_string_va: u64,
     pub ldr_string_region_end: u64,
@@ -236,7 +238,6 @@ impl State {
             capture_limit: 1,
             instrumentation_callback: 0,
             termination_rsp: 0,
-            next_user_handle: 0x100,
             next_ldr_string_va: 0,
             ldr_string_region_end: 0,
             api_set_map_va: 0,
@@ -613,21 +614,43 @@ impl UserHandle {
     }
 }
 
-static HANDLES: SpinLock<BTreeMap<u32, Arc<UserHandle>>> = SpinLock::new(BTreeMap::new());
-static NATIVE_BINDINGS: SpinLock<BTreeMap<u32, Binding>> = SpinLock::new(BTreeMap::new());
+/// A tabela de handles de usuário de um processo (`ProcessState.handles`),
+/// o papel da ObjectTable do NT para os objetos do runtime: o handle, o
+/// vínculo com a linha publicada na HANDLE_TABLE nativa do mesmo processo e o
+/// piso dos valores novos. Os valores vêm do espaço global de `handle_ids`,
+/// então um valor nunca existe em duas tabelas.
+pub struct UserHandleTable {
+    entries: BTreeMap<u32, Arc<UserHandle>>,
+    bindings: BTreeMap<u32, Binding>,
+    floor: u32,
+}
 
-/// Abre um handle; processos e threads sem abertura nativa passam pelos
-/// callbacks de objeto.
+impl UserHandleTable {
+    pub const fn new() -> Self {
+        Self { entries: BTreeMap::new(), bindings: BTreeMap::new(), floor: 0x100 }
+    }
+}
+
+/// STATUS_PROCESS_IS_TERMINATING: o processo corrente já passou pelo
+/// término e não tem mais tabela.
+fn table_closed() -> KernelError {
+    KernelError::with_status("process handle table is closing", 0xC000_010A)
+}
+
+/// Abre um handle na tabela do processo corrente (o anexado, quando há
+/// attach); processos e threads sem abertura nativa passam pelos callbacks
+/// de objeto.
 pub fn alloc_user_handle(object: Arc<dyn UserObject>, access: u32, attributes: u32) -> Result<u32, KernelError> {
+    let table = process_state::current().ok_or_else(table_closed)?;
     let entry = Arc::new(UserHandle {
         object,
         group: Arc::new(SpinLock::new(Group { handles: 1, references: 1 })),
         local: SpinLock::new(Local { access, attributes, wait_references: 0, on_references_released: None }),
     });
-    alloc_entry(entry, false)
+    alloc_entry(&table, entry, false)
 }
 
-fn alloc_entry(entry: Arc<UserHandle>, duplicate: bool) -> Result<u32, KernelError> {
+fn alloc_entry(table: &ProcessState, entry: Arc<UserHandle>, duplicate: bool) -> Result<u32, KernelError> {
     let kind = entry.object.kind();
     if (kind == "process" || kind == "thread") && (!entry.object.opened_natively() || duplicate) {
         let mut data = entry.object.callback_data();
@@ -635,52 +658,59 @@ fn alloc_entry(entry: Arc<UserHandle>, duplicate: bool) -> Result<u32, KernelErr
         let route_kind = if kind == "process" { "Process" } else { "Thread" };
         return callbacks::route(route_kind, &data, if duplicate { 2 } else { 1 }, true, &mut |access| {
             entry.set_access(access);
-            insert_user_handle(&entry)
+            insert_user_handle(table, &entry)
         });
     }
-    insert_user_handle(&entry)
+    insert_user_handle(table, &entry)
 }
 
-/// Fechamento pedido pela HANDLE_TABLE do processo.
-fn close_from_table(_process: u64, handle: u32) {
-    close::close_user(handle as u64, true);
+/// Fechamento pedido pela HANDLE_TABLE do processo dono, que pode não ser o
+/// corrente (o rundown de handles no término).
+fn close_from_table(process: u64, handle: u32) {
+    if let Some(table) = process_state::get(process) {
+        let _ = close_user_handle_in(&table, handle as u64, true, true);
+    }
 }
 
 /// Provedores de kernel e de usuário podem habitar a mesma tabela do
 /// EPROCESS: os ids são únicos ali, incluindo o slot reservado de cada folha.
-fn insert_user_handle(entry: &Arc<UserHandle>) -> Result<u32, KernelError> {
-    let minimum = S.lock().next_user_handle;
+/// A linha nativa vai para a HANDLE_TABLE do processo dono da tabela.
+fn insert_user_handle(table: &ProcessState, entry: &Arc<UserHandle>) -> Result<u32, KernelError> {
+    let minimum = table.handles.lock().floor;
     let handle = handle_ids::allocate(minimum)?;
-    S.lock().next_user_handle = handle + 4;
+    table.handles.lock().floor = handle + 4;
     let retained = match entry.object.on_each_handle_open() {
         Ok(retained) => retained,
         Err(error) => return Err(error),
     };
     let published = match entry.object.native_body() {
         Some(body) => {
-            let owner = entry.object.owner_process().unwrap_or_else(process::get_current_process);
             let description = HandleDescription { pointer: body.pointer, type_name: body.type_name.clone(), identity: body.record, native_body: body.record, attributes: entry.attributes(), access: entry.access() };
             process_handles::publish(
-                owner,
+                table.process,
                 handle as u64,
                 &description,
                 close_from_table,
                 Some(&mut |binding: &Binding| {
-                    NATIVE_BINDINGS.lock().insert(handle, *binding);
-                    HANDLES.lock().insert(handle, entry.clone());
+                    let mut handles = table.handles.lock();
+                    handles.bindings.insert(handle, *binding);
+                    handles.entries.insert(handle, entry.clone());
                     Ok(())
                 }),
             )
             .map(|_| ())
         }
         None => {
-            HANDLES.lock().insert(handle, entry.clone());
+            table.handles.lock().entries.insert(handle, entry.clone());
             Ok(())
         }
     };
     if let Err(error) = published {
-        NATIVE_BINDINGS.lock().remove(&handle);
-        HANDLES.lock().remove(&handle);
+        {
+            let mut handles = table.handles.lock();
+            handles.bindings.remove(&handle);
+            handles.entries.remove(&handle);
+        }
         if retained {
             entry.object.on_each_handle_close();
         }
@@ -689,20 +719,33 @@ fn insert_user_handle(entry: &Arc<UserHandle>) -> Result<u32, KernelError> {
     Ok(handle)
 }
 
-/// Os valores de todos os handles do processo.
-/// Reinício da tabela por processo (os handles já foram fechados pela
-/// liberação dos recursos).
-pub fn clear_user_handles() {
-    HANDLES.lock().clear();
-}
-
+/// Os valores de todos os handles do processo corrente.
 pub fn user_handle_values() -> alloc::vec::Vec<u32> {
-    HANDLES.lock().keys().copied().collect()
+    process_state::current().map(|table| table.handles.lock().entries.keys().copied().collect()).unwrap_or_default()
 }
 
-/// HANDLEs do processo são baixos.
+/// Os handles de usuário de todos os processos (a contagem de handles de um
+/// objeto é global, como o HandleCount do OBJECT_HEADER).
+pub fn all_user_handles() -> alloc::vec::Vec<Arc<UserHandle>> {
+    process_state::all().iter().flat_map(|table| table.handles.lock().entries.values().cloned().collect::<alloc::vec::Vec<_>>()).collect()
+}
+
+/// HANDLEs do processo corrente são baixos.
 pub fn get_user_handle(value: u64) -> Option<Arc<UserHandle>> {
-    HANDLES.lock().get(&(value as u32)).cloned()
+    process_state::current().and_then(|table| table.handles.lock().entries.get(&(value as u32)).cloned())
+}
+
+/// O rundown da tabela de um processo que terminou: fecha o que a drenagem
+/// da HANDLE_TABLE nativa não fechou (handles sem linha nativa), como o
+/// ExSweepHandleTable do ObKillProcess.
+pub fn sweep_user_handles(table: &ProcessState) {
+    loop {
+        let next = table.handles.lock().entries.keys().next().copied();
+        let Some(handle) = next else { break };
+        if !matches!(close_user_handle_in(table, handle as u64, true, true), Ok(0)) {
+            table.handles.lock().entries.remove(&handle);
+        }
+    }
 }
 
 /// A descrição aberta compartilhada.
@@ -729,26 +772,38 @@ pub fn duplicate_user_handle(entry: &UserHandle, access: u32, attributes: u32) -
         group: entry.group.clone(),
         local: SpinLock::new(Local { access, attributes, wait_references: 0, on_references_released: None }),
     });
-    alloc_entry(duplicate, true).inspect_err(|_| {
+    let target = process_state::current().ok_or_else(table_closed);
+    target.and_then(|table| alloc_entry(&table, duplicate, true)).inspect_err(|_| {
         let mut group = entry.group.lock();
         group.handles -= 1;
         group.references -= 1;
     })
 }
 
-/// Fecha o handle; `release` libera o objeto na última referência,
-/// `force` ignora a proteção individual.
+/// Fecha o handle do processo corrente; `release` libera o objeto na última
+/// referência, `force` ignora a proteção individual.
 pub fn close_user_handle(value: u64, release: bool, force: bool) -> Result<u32, KernelError> {
+    match process_state::current() {
+        Some(table) => close_user_handle_in(&table, value, release, force),
+        None => Ok(STATUS_INVALID_HANDLE),
+    }
+}
+
+/// [`close_user_handle`] na tabela de `table`.
+pub fn close_user_handle_in(table: &ProcessState, value: u64, release: bool, force: bool) -> Result<u32, KernelError> {
     let handle = value as u32;
-    let Some(entry) = HANDLES.lock().get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };
+    let Some(entry) = table.handles.lock().entries.get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };
     if !force && entry.attributes() & 1 != 0 {
         return Ok(STATUS_HANDLE_NOT_CLOSABLE);
     }
-    let binding = NATIVE_BINDINGS.lock().get(&handle).copied();
+    let binding = table.handles.lock().bindings.get(&handle).copied();
     let last = Cell::new(false);
     let mut detach = || {
-        HANDLES.lock().remove(&handle);
-        NATIVE_BINDINGS.lock().remove(&handle);
+        {
+            let mut handles = table.handles.lock();
+            handles.entries.remove(&handle);
+            handles.bindings.remove(&handle);
+        }
         let mut group = entry.group.lock();
         group.handles -= 1;
         last.set(group.handles == 0);
@@ -788,9 +843,11 @@ pub fn close_user_handle(value: u64, release: bool, force: bool) -> Result<u32, 
 
 pub fn change_user_handle_attributes(handle: u64, attributes: u32) -> Result<u32, KernelError> {
     let handle = handle as u32;
-    let Some(entry) = HANDLES.lock().get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };
+    let Some(table) = process_state::current() else { return Ok(STATUS_INVALID_HANDLE) };
+    let Some(entry) = table.handles.lock().entries.get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };
     let mut commit = || entry.local.lock().attributes = attributes;
-    match NATIVE_BINDINGS.lock().get(&handle).copied() {
+    let binding = table.handles.lock().bindings.get(&handle).copied();
+    match binding {
         Some(binding) => {
             if !process_handles::change(&binding, attributes, entry.access(), Some(&mut commit))? {
                 return Ok(STATUS_INVALID_HANDLE);
@@ -834,10 +891,9 @@ pub fn release_user_handle_reference(entry: &UserHandle) -> Result<(), KernelErr
 
 // ---- provedor do NtClose -------------------------------------------------
 
-/// O processo corrente é o processo de usuário em execução.
+/// Todo processo vivo (o System inclusive) tem a sua tabela.
 fn owns(process: u64) -> bool {
-    // SAFETY: EPROCESS vivo da tabela de handles.
-    S.lock().current_process_id == unsafe { Eprocess::at(process) }.unique_process_id.get()
+    process_state::get(process).is_some()
 }
 
 fn handle_attributes(handle: u64) -> Option<u32> {
@@ -851,5 +907,5 @@ fn table_close(handle: u64, force: bool) -> u32 {
 
 /// Instala a tabela de usuário como dona dos handles baixos no NtClose.
 pub fn init() {
-    close::set_user_handle_table(UserHandleTable { owns, attributes: handle_attributes, close: table_close });
+    close::set_user_handle_table(close::UserHandleTable { owns, attributes: handle_attributes, close: table_close });
 }

@@ -90,8 +90,9 @@ impl UserObject for UserProcess {
     }
 }
 
-/// O processo de destino/origem precisa ser o processo corrente (este
-/// escalonador hospeda um processo nativo por vez).
+/// O processo de destino/origem precisa ser o processo corrente, o anexado
+/// quando há attach (as operações entre processos ainda não existem). O
+/// handle é procurado na tabela desse mesmo processo.
 pub fn current_process(handle: u64, access: u32) -> u32 {
     if is_pseudo_process(handle) {
         return 0;
@@ -103,7 +104,7 @@ pub fn current_process(handle: u64, access: u32) -> u32 {
     if entry.access() & access != access {
         return 0xC000_0022;
     }
-    if entry.object.callback_data().process_id == Some(state::with(|state| state.current_process_id)) {
+    if entry.object.callback_data().native_pointer == process::get_current_process() {
         0
     } else {
         0xC000_00BB

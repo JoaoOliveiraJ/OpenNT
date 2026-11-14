@@ -503,13 +503,9 @@ pub fn reference_handle(handle: u64, desired_access: u32, object_type: u64, acce
     Ok(Some(0))
 }
 
-/// Só quando o PID do runtime de usuário é o do processo corrente.
+/// Na tabela de usuário do processo corrente (o anexado, quando há attach).
 fn user_handle_body(handle: u64) -> Option<(Described, u32, u32)> {
     if handle > 0x7FFF_FFFF {
-        return None;
-    }
-    let current = crate::ntos::ps::user::state::with(|state| state.current_process_id);
-    if current != process_id(process::get_current_process()) {
         return None;
     }
     let entry = crate::ntos::ps::user::state::get_user_handle(handle)?;

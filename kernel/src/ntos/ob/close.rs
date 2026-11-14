@@ -18,14 +18,18 @@ use crate::rtl::{KernelError, SpinLock};
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
 
-/// Tabela de handles de usuário do processo corrente (`ps/user/state`).
+/// Tabelas de handles de usuário por processo (`ps/user/state`). Atributos
+/// e fechamento agem na tabela do processo corrente, o anexado quando há
+/// attach, como o ObReferenceObjectByHandle do NT.
 #[derive(Clone, Copy)]
 pub struct UserHandleTable {
-    /// O processo tem estado de modo usuário.
+    /// O processo tem tabela de handles de usuário (todo processo vivo, o
+    /// System inclusive).
     pub owns: fn(u64) -> bool,
-    /// Atributos do handle de usuário, se existir.
+    /// Atributos do handle de usuário do processo corrente, se existir.
     pub attributes: fn(u64) -> Option<u32>,
-    /// Fecha o handle (`force` ignora a proteção individual).
+    /// Fecha o handle do processo corrente (`force` ignora a proteção
+    /// individual).
     pub close: fn(u64, bool) -> u32,
 }
 
@@ -81,7 +85,8 @@ fn reject_protected_close(handle: u64, from_user_mode: bool) -> u32 {
     bugcheck::bug_check_ex(0x93, handle, 0, 0, 0)
 }
 
-/// Fecha um handle de usuário; pseudohandles de -1 a -6 são aceitos.
+/// Fecha um handle de usuário do processo corrente; pseudohandles de -1 a
+/// -6 são aceitos.
 pub fn close_user(handle: u64, force: bool) -> u32 {
     let signed = handle as i64;
     if (-6..=-1).contains(&signed) {
@@ -98,6 +103,9 @@ pub fn close_user(handle: u64, force: bool) -> u32 {
 
 /// NtClose: seleciona o dono pelo handle e pelo modo; nada é fechado antes
 /// de validar propriedade e proteção. `None` usa o PreviousMode da thread.
+/// Um handle sem o prefixo de kernel é procurado na tabela do processo
+/// corrente (o anexado); os de kernel ficam na tabela do System e valem em
+/// qualquer processo.
 pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
         return Err(KernelError::new("NtClose requires PASSIVE_LEVEL"));
@@ -120,7 +128,7 @@ pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError>
     let value = handle & !3;
     let current = process::get_current_process();
     let user = PROVIDERS.lock().user;
-    if let Some(table) = user.filter(|table| !kernel_handle && current != process::get_system_process() && (table.owns)(current)) {
+    if let Some(table) = user.filter(|table| !kernel_handle && (table.owns)(current)) {
         if let Some(attributes) = (table.attributes)(value) {
             if attributes & 1 != 0 {
                 return Ok(reject_protected_close(reported, from_user_mode));
@@ -184,7 +192,7 @@ pub fn handle_attributes(handle: u64, from_user_mode: bool) -> Option<u32> {
     let value = handle & !3;
     let current = process::get_current_process();
     let user = PROVIDERS.lock().user;
-    if let Some(table) = user.filter(|table| !kernel_handle && current != process::get_system_process() && (table.owns)(current)) {
+    if let Some(table) = user.filter(|table| !kernel_handle && (table.owns)(current)) {
         if let Some(attributes) = (table.attributes)(value) {
             return Some(attributes);
         }

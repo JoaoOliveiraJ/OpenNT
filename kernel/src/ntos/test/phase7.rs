@@ -2439,15 +2439,7 @@ fn user_query_object(assert: Assert) {
         guest::write64(rsp + 0x28, returned);
         call("NtQueryObject", handle, class, buffer, length)
     };
-    // Evento nomeado do processo.
-    state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
-    state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
-    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
-    guest::write64(rsp + 0x28, 0);
-    let created = call("NtCreateEvent", out, 0x1F_0003, attributes, 0);
-    let event = guest::read64(out);
-    assert(created == 0, "userquery: evento nomeado");
-    // A tabela de usuário só é consultada no contexto de um processo de usuário.
+    // O handle é aberto e consultado na tabela do processo de usuário.
     let previous = crate::ntos::ps::process::get_current_thread();
     let saved_pid = state::with(|state| state.current_process_id);
     let Ok(owner) = crate::ntos::ps::process::create_process(0x7F20, "consulta.exe", 0, None) else {
@@ -2460,6 +2452,14 @@ fn user_query_object(assert: Assert) {
     };
     crate::ntos::ps::process::set_current_thread(thread);
     state::with(|state| state.current_process_id = 0x7F20);
+    // Evento nomeado do processo.
+    state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
+    state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
+    guest::write64(rsp + 0x28, 0);
+    let created = call("NtCreateEvent", out, 0x1F_0003, attributes, 0);
+    let event = guest::read64(out);
+    assert(created == 0, "userquery: evento nomeado");
     assert(query(event, 0, 56) == 0 && { let basic = unsafe { nt::ObjectBasicInformation::at(buffer) }; basic.granted_access.get() == 0x1F_0003 && basic.handle_count.get() == 1 && basic.pointer_count.get() >= 1 }, "userquery: OBJECT_BASIC_INFORMATION com acesso e handles");
     let named = query(event, 1, 0x100);
     let name_info = unsafe { nt::ObjectNameInformation::at(buffer) };
@@ -2478,11 +2478,11 @@ fn user_query_object(assert: Assert) {
     let kernel = guest::alloc_bytes(0x100);
     assert(query_object::query(u64::MAX, 0, kernel, 56, 0).ok() == Some(0) && unsafe { nt::ObjectBasicInformation::at(kernel) }.granted_access.get() == crate::ntos::ob::object_types::process_type().valid_access, "userquery: ZwQueryObject do processo corrente em KernelMode");
     guest::free_bytes(kernel);
+    let _ = call("NtClose", event, 0, 0, 0);
     crate::ntos::ps::process::set_current_thread(previous);
     state::with(|state| state.current_process_id = saved_pid);
     let _ = crate::ntos::ps::process::release_thread(thread);
     let _ = crate::ntos::ps::process::terminate_process(owner, 0);
-    let _ = call("NtClose", event, 0, 0, 0);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -4926,6 +4926,7 @@ fn usermode_syscalls_exports(assert: Assert) {
 pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::process_state::run(assert);
     crate::ntos::test::multiprocess::page_table_root::run(assert);
+    crate::ntos::test::multiprocess::handles::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

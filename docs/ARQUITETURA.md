@@ -408,6 +408,19 @@ sem páginas de usuário, que isola uma página mapeada nela.
   `ps::process::create_process` antes da lista ativa e destruído por
   `terminate_process` depois dela. Estado novo de processo entra ali, não num
   global de `ps/user/state.rs`.
+- **Handles por processo**: a tabela de handles de usuário mora no
+  `ProcessState` (`handles`), e a linha nativa de cada handle vai para a
+  HANDLE_TABLE do mesmo processo (EPROCESS.ObjectTable). As operações de
+  `state.rs` sem processo explícito (`alloc_user_handle`, `get_user_handle`,
+  `close_user_handle`...) e a resolução do NtClose, do
+  ObReferenceObjectByHandle e do NtQueryObject agem sobre a tabela do
+  processo corrente, `KTHREAD.ApcState.Process`, que segue o attach como no
+  NT. Handles de kernel (OBJ_KERNEL_HANDLE, prefixo 0xFFFFFFFF8...) ficam na
+  tabela do System e valem em qualquer processo, só em KernelMode. Os valores
+  vêm do espaço global de `ob/handle_ids.rs`, então nunca colidem entre
+  tabelas. No término, a drenagem da HANDLE_TABLE nativa fecha cada handle
+  pela tabela do processo dono, e `process_state::destroy` fecha o que sobrou
+  (handles sem linha nativa). Teste: `ntos/test/multiprocess/handles.rs`.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do

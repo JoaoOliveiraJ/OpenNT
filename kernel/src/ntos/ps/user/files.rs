@@ -339,19 +339,18 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
     })
 }
 
-/// Fim do processo de usuário: fecha os handles, desmonta as vistas de
-/// seção e de imagem e libera as regiões privadas. As liberações de
-/// `device_io`, `worker_factory`, instrumentação, mutantes, threads, win32k,
-/// `cm::service::rpc` e `system_process_information`, nesta ordem.
+/// Fim do processo de usuário: desmonta as vistas de seção e de imagem e
+/// libera as regiões privadas. As liberações de `device_io`,
+/// `worker_factory`, instrumentação, mutantes, threads, win32k,
+/// `cm::service::rpc` e `system_process_information`, nesta ordem. Os
+/// handles não passam por aqui: a tabela é do processo e o término dele a
+/// esvazia (`process_state::destroy`).
 pub fn release_user_resources() {
     super::device_io::release_process(state::with(|state| state.current_process_id));
     super::worker_factory::release_process();
     super::instrumentation::release_process();
     super::mutants::release_process();
     super::threads::release_process();
-    for handle in state::user_handle_values() {
-        let _ = close::close_user(handle as u64, true);
-    }
     crate::ntos::cm::service::rpc::release_process(state::with(|state| state.current_process_id));
     crate::ntos::ps::system_process_information::release_process(state::with(|state| state.current_process_id));
     let regions = state::with(|state| state.user_regions.clone());

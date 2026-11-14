@@ -190,12 +190,10 @@ pub struct RunOptions<'a> {
 /// Estado por processo (um processo de usuário por vez nesta camada).
 fn reset_process_state() {
     files::release_user_resources();
-    state::clear_user_handles();
     threads::clear();
     state::with(|state| {
         state.user_regions.clear();
         state.process_images.clear();
-        state.next_user_handle = 0x100;
         state.next_ldr_string_va = 0;
         state.ldr_string_region_end = 0;
         state.mapped_image_exports.clear();

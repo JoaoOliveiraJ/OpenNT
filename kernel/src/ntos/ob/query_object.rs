@@ -28,7 +28,7 @@ use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::handles as token_handles;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::inc::types::{Eprocess, Field, NtStruct, ObjectNameInformation};
+use crate::ntos::inc::types::{Field, NtStruct, ObjectNameInformation};
 use crate::ntos::mm::guest_memory as guest;
 
 /// PULONG ReturnLength de um chamador de kernel (ObQueryNameString).
@@ -66,7 +66,7 @@ fn user_pointer(entry: &UserHandle) -> u64 {
 /// Handles vivos do mesmo corpo nas descrições de kernel e de usuário.
 fn handle_count(pointer: u64) -> u32 {
     let kernel = object_manager::handle_entries().into_iter().filter(|(_, node)| object_manager::node(*node).and_then(|node| node.data).is_some_and(|data| data.native_pointer == pointer)).count();
-    let user = state::user_handle_values().into_iter().filter_map(|value| state::get_user_handle(value as u64)).filter(|entry| user_pointer(entry) == pointer).count();
+    let user = state::all_user_handles().into_iter().filter(|entry| user_pointer(entry) == pointer).count();
     (kernel + user) as u32
 }
 
@@ -131,14 +131,11 @@ pub fn resolve(handle: u64) -> Result<Collected, u32> {
             None => Err(STATUS_INVALID_HANDLE),
         };
     }
-    let current = process::get_current_process();
-    // SAFETY: EPROCESS do processo corrente.
-    if current != process::get_system_process() && state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() {
-        if let Some(entry) = state::get_user_handle(handle) {
-            return resolve_user(entry);
-        }
+    // A tabela de usuário do processo corrente (o anexado).
+    if let Some(entry) = state::get_user_handle(handle) {
+        return resolve_user(entry);
     }
-    resolve_kernel_record(handle as u32, current)
+    resolve_kernel_record(handle as u32, process::get_current_process())
 }
 
 fn resolve_user(entry: Arc<UserHandle>) -> Result<Collected, u32> {
@@ -148,7 +145,7 @@ fn resolve_user(entry: Arc<UserHandle>) -> Result<Collected, u32> {
     }
     let Some(object_type) = object_types::user_type(entry.kind()) else { return Err(0xC000_00BB) };
     // A identidade é o objeto compartilhado pelas duplicações do handle.
-    let same: Vec<Arc<UserHandle>> = state::user_handle_values().into_iter().filter_map(|value| state::get_user_handle(value as u64)).filter(|candidate| Arc::ptr_eq(&candidate.object, &entry.object)).collect();
+    let same: Vec<Arc<UserHandle>> = state::all_user_handles().into_iter().filter(|candidate| Arc::ptr_eq(&candidate.object, &entry.object)).collect();
     let name = entry.object.object_path().unwrap_or_default();
     state::retain_user_handle_reference(&entry);
     let references = same.len() as u32 + same.iter().map(|candidate| candidate.wait_references()).sum::<u32>();
@@ -204,8 +201,7 @@ pub fn types() -> Vec<ObjectType> {
     let keys = registry::object_stats();
     publish_statistics(&object_types::key_type(), keys.objects as u32, keys.handles as u32, keys.peak_objects as u32, keys.peak_handles as u32);
     let mut current: BTreeMap<String, (Vec<usize>, u32)> = BTreeMap::new();
-    for value in state::user_handle_values() {
-        let Some(entry) = state::get_user_handle(value as u64) else { continue };
+    for entry in state::all_user_handles() {
         let Some(object_type) = object_types::user_type(entry.kind()) else { continue };
         // Estes provedores já contam seus corpos e handles.
         if entry.object.opened_natively() || entry.object.native_body().is_some() || user_pointer(&entry) != 0 || ["process", "thread", "key", "section", "directory", "symlink"].contains(&entry.kind()) {
