@@ -20,6 +20,16 @@
 //! instalação: Type 2 (SERVICE_FILE_SYSTEM_DRIVER), Start 3, ErrorControl 1
 //! e Group "Boot File System", sem ImagePath (o padrão do I/O Manager,
 //! `\SystemRoot\System32\Drivers\<serviço>.sys`).
+//!
+//! O KMDF também fica sob demanda: o runtime Wdf01000 (Start 0 na
+//! instalação), que a WdfLdr.sys carrega pela chave no primeiro
+//! WdfVersionBind de um cliente, e o msisadrv (Start 0), um cliente KMDF.
+//! Ficam os valores que a
+//! instalação grava para o framework: a versão do KMDF com que o cliente foi
+//! compilado (Parameters\Wdf) e o serviço da biblioteca da versão maior 1
+//! (Control\Wdf\Kmdf\KmdfLibrary\Versions\1), que a WdfLdr procura antes do
+//! nome padrão. O Parameters do Wdf01000 o próprio runtime grava no
+//! DriverEntry; a WdfLdr e a SleepStudyHelper não têm chave.
 
 use crate::ntos::cm::registry;
 use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};
@@ -63,6 +73,21 @@ const DRIVERS: &[InboxDriver] = &[
     },
     InboxDriver { name: "DXGKrnl", display_name: Some("LDDM Graphics Subsystem"), image_path: "\\SystemRoot\\System32\\drivers\\dxgkrnl.sys", start: SERVICE_DEMAND_START, error_control: 0, group: "Video Init", tag: Some(1), dwords: &[] },
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), image_path: "\\SystemRoot\\system32\\drivers\\afd.sys", start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
+    InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), image_path: "system32\\drivers\\Wdf01000.sys", start: SERVICE_DEMAND_START, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
+    InboxDriver { name: "msisadrv", display_name: None, image_path: "System32\\drivers\\msisadrv.sys", start: SERVICE_DEMAND_START, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
+];
+
+/// Dado de um valor que a instalação grava fora da chave do serviço.
+enum Installed {
+    Dword(u32),
+    String(&'static str),
+}
+
+/// (chave abaixo de \Registry\Machine\System\CurrentControlSet, valor, dado).
+const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
+    ("Services\\msisadrv\\Parameters\\Wdf", "WdfMajorVersion", Installed::Dword(1)),
+    ("Services\\msisadrv\\Parameters\\Wdf", "WdfMinorVersion", Installed::Dword(0xF)),
+    ("Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions\\1", "Service", Installed::String("Wdf01000")),
 ];
 
 /// Instala as chaves (uma chave já instalada fica como está).
@@ -98,6 +123,14 @@ pub fn seed() -> Result<(), KernelError> {
             registry::set_value(handle, value_name, REG_DWORD, value.to_le_bytes().to_vec());
         }
         registry::set_value(handle, "Group", REG_SZ, registry::encode_wide("Boot File System"));
+        registry::close_handle(handle);
+    }
+    for (key, name, data) in INSTALLED_VALUES {
+        let handle = registry::open_or_create(&alloc::format!("\\Registry\\Machine\\System\\CurrentControlSet\\{key}"), None)?;
+        match data {
+            Installed::Dword(value) => registry::set_value(handle, name, REG_DWORD, value.to_le_bytes().to_vec()),
+            Installed::String(text) => registry::set_value(handle, name, REG_SZ, registry::encode_wide(text)),
+        };
         registry::close_handle(handle);
     }
     Ok(())

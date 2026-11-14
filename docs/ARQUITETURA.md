@@ -701,6 +701,15 @@ dereference e o PFN livre volta ao de antes.
   de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de
   usuário; o ntoskrnl não passa pelo loader (o stage2 já o mapeia na sua
   ImageBase) e é listado ali.
+- **Drivers carregados por outro driver** (o KMDF): a WdfLdr.sys é um driver
+  de export, carregado pelo `mm/sysload.rs` como biblioteca de import do
+  cliente KMDF; o WdfVersionBind do cliente pede o ZwLoadDriver do serviço
+  do runtime (Wdf01000), que sobe pelo mesmo ciclo de vida do SCM
+  (`cm/service/driver.rs` → `io/lifecycle.rs`) aninhado no DriverEntry do
+  cliente: `lifecycle::load_driver` guarda e devolve o driver corrente. O
+  ImagePath de um serviço pode ser relativo, e então é relativo ao
+  \SystemRoot (`system32\drivers\Wdf01000.sys`); System32\Drivers fica na
+  raiz do volume.
 - As imagens de usuário ficam na ImageBase do cabeçalho quando a faixa está
   livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
   relocadas), também sobre frames do PFN.

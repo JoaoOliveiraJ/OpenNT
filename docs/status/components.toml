@@ -80,7 +80,7 @@ escopo = "Configuration Manager (hives, chaves e valores) e o controle de servi�
 numero = "6"
 nome = "loader PE e ntoskrnl"
 estado = "em andamento"
-escopo = "Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys) e o ksecdd.sys."
+escopo = "Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys), o runtime KMDF (WdfLdr.sys e Wdf01000.sys) e o ksecdd.sys."
 
 [[fase]]
 numero = "7"
@@ -207,6 +207,13 @@ titulo = "Driver ntfs.sys real"
 marcador = "FILE_SYSTEM_MOUNT_OK"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ntfs --build-dir=build/ntfs --smp=1 \"--expect=name=ntfs state=4 win32=0\" \"--expect=FILE_SYSTEM_MOUNT_OK name=ntfs\""
 descricao = "O gerenciador de serviços inicia o ntfs.sys da Microsoft (o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports e o DriverEntry registra o file system) e o kernel abre HELLO.TXT em \\Device\\AtaVolume1: o IopMountVolume manda o IRP_MN_MOUNT_VOLUME ao ntfs.sys, o IRP_MJ_CREATE e o IRP_MJ_READ vão ao volume montado e a leitura passa pelo Cache Manager. Ainda falha na carga: faltam os módulos clfs.sys e clipsp.sys que o ntfs.sys importa."
+
+[[teste]]
+id = "kmdf"
+titulo = "Runtime KMDF real com o msisadrv.sys"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=msisadrv --build-dir=build/kmdf --smp=1 \"--expect=name=msisadrv state=4 win32=0\""
+descricao = "O gerenciador de serviços inicia o msisadrv.sys, um driver KMDF da Microsoft: o loader carrega a WdfLdr.sys como biblioteca de import, o WdfVersionBind do driver faz a WdfLdr carregar o runtime Wdf01000.sys pela chave do serviço (ZwLoadDriver), o runtime se registra e devolve a tabela de funções, o WdfDriverCreate do driver tem sucesso e o serviço fica em execução (state=4). Todas as imagens passam pelo Code Integrity, validadas pelos catálogos da Microsoft."
 
 # ---- componentes e drivers ------------------------------------------------------
 
@@ -534,6 +541,17 @@ caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/io/file/zw.
 testes = ["watchdog"]
 fase = "6"
 notas = "Carrega e roda com `--start-driver=watchdog`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Diferente do vgk (assinado embutido), ele é assinado por catálogo: o Code Integrity valida o hash da imagem contra o `.cat` da Microsoft que a própria ci.dll enumera em `CatRoot`. O DriverEntry executa e retorna sucesso. No boot comum ele não é iniciado (Start=3, sob demanda)."
+
+[[componente]]
+nome = "KMDF (WdfLdr.sys e Wdf01000.sys)"
+categoria = "Drivers do Windows"
+icone = "chip"
+descricao = "O Kernel-Mode Driver Framework da Microsoft: a WdfLdr.sys liga cada driver KMDF ao runtime Wdf01000.sys, que implementa o framework. Cerca de 65 drivers KMDF desta instalação (msisadrv, cdrom, ucx01000, winusb, hidi2c, sercx, spbcx, acpidev...) já têm todos os imports do ntoskrnl atendidos e dependem dele para carregar."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/cm/service/driver.rs", "kernel/src/ntos/cm/service/inbox_drivers.rs", "xtask/src/windows_binaries.rs"]
+testes = ["kmdf"]
+fase = "6"
+notas = "Roda com `--start-driver=msisadrv`: DRIVER_START_COMPLETED name=msisadrv state=4 win32=0 ntstatus=0x0. Os binários reais vão para o volume NTFS com os catálogos da Microsoft que os assinam, e as chaves de serviço do Wdf01000 e do msisadrv têm os valores desta instalação (só o Start fica 3, para o boot comum não subir o framework). O Code Integrity valida o msisadrv.sys; a WdfLdr.sys carrega como biblioteca de import (DllInitialize); o WdfVersionBind do driver acha o serviço da biblioteca em Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions e chama o ZwLoadDriver do Wdf01000, cujo ImagePath relativo (system32\\drivers\\Wdf01000.sys) o kernel resolve sob o \\SystemRoot. O Wdf01000.sys e a SleepStudyHelper.sys que ele importa (com a WppRecorder.sys) passam pelo Code Integrity e todos os imports resolvem no ntoskrnl; o DriverEntry do runtime cria \\Device\\KMDF0, se registra na WdfLdr (que o abre pelo IoGetDeviceObjectPointer, com o IRP_MJ_CREATE atendido pelo próprio runtime), lê as configurações, registra os provedores ETW/WPP, o WMI e os callbacks de bugcheck e grava a versão no Registro. O bind registra o cliente e devolve a tabela de funções, e o WdfDriverCreate do msisadrv tem sucesso (extensão do DRIVER_OBJECT, Parameters\\Wdf lido). O AddDevice e o início dos dispositivos pelo PnP ainda não são exercitados. O VfIsRuleClassEnabled, que o runtime procura pelo MmGetSystemRoutineAddress, ainda não existe; sem ele o runtime segue com o verificador desligado."
 
 [[componente]]
 nome = "ksecdd.sys"

@@ -5,7 +5,9 @@
 //! de export que elas importam (wmilib.sys e WppRecorder.sys) entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em
 //! memória). O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
-//! e a lista de revogação), os arquivos que o vgk.sys abre pelo caminho
+//! e a lista de revogação), o runtime do KMDF com um cliente (WdfLdr.sys,
+//! Wdf01000.sys, SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os
+//! assinam, os arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
 //!
@@ -70,9 +72,23 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ),
     // O ntfs.sys real (`--start-driver=ntfs`) e o catálogo que o cobre.
     ("NTFS.SYS", "System32/drivers/ntfs.sys"),
+    // KMDF: a WdfLdr.sys (biblioteca de import dos clientes), o runtime
+    // Wdf01000.sys (carregado pela WdfLdr pela chave do serviço) e a
+    // SleepStudyHelper.sys que ele importa; o msisadrv.sys é um cliente KMDF.
+    // Os catálogos da Microsoft que os assinam: o 0516 (o mesmo do ntfs.sys)
+    // assina a WdfLdr, o Wdf01000, a SleepStudyHelper e a WppRecorder; o
+    // 0110, o msisadrv.
+    ("WDFLDR.SYS", "System32/drivers/WdfLdr.sys"),
+    ("WDF01000.SYS", "System32/drivers/Wdf01000.sys"),
+    ("SLEEPSTUDYHELPER.SYS", "System32/drivers/SleepStudyHelper.sys"),
+    ("MSISADRV.SYS", "System32/drivers/msisadrv.sys"),
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),
