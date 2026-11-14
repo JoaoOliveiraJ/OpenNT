@@ -72,6 +72,145 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
     system_process_information::query(output, length as u64, returned, false)
 }
 
+// ---- NtQuerySystemInformationEx / ZwQuerySystemInformationEx (modo kernel) --
+//
+// O NtQuerySystemInformationEx do 19041 recusa entrada nula ou de tamanho 0
+// (STATUS_INVALID_PARAMETER) e aceita só as classes que têm entrada (o resto
+// é STATUS_INVALID_INFO_CLASS); com PreviousMode UserMode sonda a entrada
+// com o alinhamento da classe. O ExpQuerySystemInformation lê a entrada da
+// classe e despacha; o ReturnLength recebe o tamanho que a folha deixou na
+// célula local (zerada no começo), inclusive nas falhas da folha.
+
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// SystemLogicalProcessorAndGroupInformation: entrada LOGICAL_PROCESSOR_RELATIONSHIP.
+const SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION: u32 = 107;
+/// SystemNodeDistanceInformation: entrada USHORT do nó.
+const SYSTEM_NODE_DISTANCE_INFORMATION: u32 = 121;
+/// SystemInterruptSteeringInformation: SYSTEM_INTERRUPT_STEERING_INFORMATION_INPUT.
+const SYSTEM_INTERRUPT_STEERING_INFORMATION: u32 = 180;
+/// Classes que o NtQuerySystemInformationEx aceita (as com entrada).
+const EX_CLASSES: [u32; 21] = [8, 23, 42, 61, 72, 73, 83, 100, 107, 108, 121, 141, 160, 165, 175, 178, 180, 181, 209, 210, 211];
+
+/// SYSTEM_INTERRUPT_STEERING_INFORMATION_INPUT (ntexapi): Gsiv, os três
+/// BOOLEANs e o GROUP_AFFINITY alvo.
+#[repr(C)]
+struct InterruptSteeringInput {
+    gsiv: Field<u32>,
+    controller_interrupt: Field<u8>,
+    edge_interrupt: Field<u8>,
+    is_primary_interrupt: Field<u8>,
+    _pad_07: crate::ntos::inc::field::Reserved<1>,
+    target_affinity: crate::ntos::inc::types::GroupAffinity,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for InterruptSteeringInput {}
+
+const _: () = assert!(core::mem::size_of::<InterruptSteeringInput>() == 0x18);
+
+/// NtQuerySystemInformationEx/ZwQuerySystemInformationEx chamados por um
+/// driver (PreviousMode KernelMode: entrada e saída sem sonda).
+pub fn query_ex(class: u32, input: u64, input_length: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
+    debug_print!("[zw] QuerySystemInformationEx classe {} entrada={} buf={}", class, input_length, length);
+    if input == 0 || input_length == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    if !EX_CLASSES.contains(&class) {
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    // A célula de tamanho do ExpQuerySystemInformation.
+    let mut reported = 0u32;
+    let status = match class {
+        SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION => {
+            if input_length < 4 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            // SAFETY: entrada de modo kernel com 4 bytes conferidos.
+            let relationship = unsafe { Field::<u32>::at(input) }.get();
+            let cell = guest::alloc_bytes(4);
+            if cell == 0 {
+                return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+            }
+            // SAFETY: a célula ULONG recém-alocada.
+            let length_cell = unsafe { Field::<u32>::at(cell) };
+            length_cell.set(length);
+            let status = crate::ntos::ke::processor_topology::query_logical_processor_relationship(None, relationship, output, cell);
+            reported = length_cell.get();
+            guest::free_bytes(cell);
+            status?
+        }
+        SYSTEM_NODE_DISTANCE_INFORMATION => {
+            use crate::ntos::ke::processor_group;
+            if input_length < 2 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            // SAFETY: entrada de modo kernel com 2 bytes conferidos.
+            let node = unsafe { Field::<u16>::at(input) }.get();
+            let nodes = processor_group::number_nodes();
+            if node >= nodes {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            reported = nodes as u32 * 4;
+            if length < reported {
+                STATUS_INFO_LENGTH_MISMATCH
+            } else {
+                // KeNodeDistance[node * KeNumberNodes + destino], um ULONG por destino.
+                for destination in 0..nodes {
+                    let distance = processor_group::node_distance(node, destination).unwrap_or(0);
+                    // SAFETY: saída de modo kernel com KeNumberNodes ULONGs conferidos.
+                    unsafe { Field::<u32>::at(output + destination as u64 * 4) }.set(distance);
+                }
+                0
+            }
+        }
+        SYSTEM_INTERRUPT_STEERING_INFORMATION => query_interrupt_steering(input, input_length, output, length, &mut reported),
+        _ => {
+            debug_print!("[zw] QuerySystemInformationEx classe {} (sem suporte)", class);
+            return Ok(STATUS_INVALID_INFO_CLASS);
+        }
+    };
+    if returned != 0 {
+        // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+        unsafe { Field::<u32>::at(returned) }.set(reported);
+    }
+    Ok(status)
+}
+
+/// ExpQueryInterruptSteeringInformation em modo kernel (em UserMode o NT
+/// devolve STATUS_ACCESS_DENIED): entrada de exatamente 0x18 bytes e saída
+/// de um ULONG, senão STATUS_INFO_LENGTH_MISMATCH (o tamanho 4 só vai ao
+/// ReturnLength quando falta saída). A saída zera e liga o bit Enabled: para
+/// a interrupção do próprio controlador (ControllerInterrupt com Gsiv -1),
+/// se o steering está ligado; para outra, se ela tem modo de steering. No
+/// sucesso o ReturnLength fica 0, como no NT.
+fn query_interrupt_steering(input: u64, input_length: u32, output: u64, length: u32, reported: &mut u32) -> u32 {
+    use crate::ntos::ke::interrupt_object;
+    if input_length != 0x18 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    // SAFETY: entrada de modo kernel com 0x18 bytes conferidos.
+    let request = unsafe { InterruptSteeringInput::at(input) };
+    let gsiv = request.gsiv.get();
+    if length < 4 {
+        *reported = 4;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    // SAFETY: saída de modo kernel com um ULONG conferido.
+    let enabled = unsafe { Field::<u32>::at(output) };
+    enabled.set(0);
+    let on = if request.controller_interrupt.get() != 0 && gsiv == u32::MAX {
+        interrupt_object::interrupt_steering_enabled()
+    } else {
+        interrupt_object::interrupt_steering_mode(gsiv, request.edge_interrupt.get() != 0, request.is_primary_interrupt.get() != 0, &request.target_affinity) != 0
+    };
+    if on {
+        enabled.set(1);
+    }
+    0
+}
+
 /// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador;
 /// classes desconhecidas = STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {

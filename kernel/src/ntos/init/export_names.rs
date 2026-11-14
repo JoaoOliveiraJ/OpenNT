@@ -414,6 +414,8 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("ke-device-queue", 1844, 7),
     ("io-start-packet-by-key", 1851, 1),
     ("zw-set-information-object", 1852, 1),
+    ("system-information-ex", 1853, 2),
+    ("ps-pool-quota", 1855, 2),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2271,4 +2273,8 @@ pub static EXPORT_NAMES: &[&str] = &[
     "KeRemoveEntryDeviceQueue",
     "IoStartNextPacketByKey",
     "ZwSetInformationObject",
+    "NtQuerySystemInformationEx",
+    "ZwQuerySystemInformationEx",
+    "PsChargeProcessPoolQuota",
+    "PsReturnPoolQuota",
 ];

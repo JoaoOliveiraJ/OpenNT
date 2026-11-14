@@ -1608,3 +1608,25 @@ pub mod ps_paged_pool_quota {
 
     pub static GROUP: Group = Group { name: "ps-paged-pool-quota", names: &["PsChargeProcessPagedPoolQuota", "PsReturnProcessPagedPoolQuota"], handlers: &[charge, give_back], data_exports: &[] };
 }
+
+pub mod ps_pool_quota {
+    //! PsChargeProcessPoolQuota / PsReturnPoolQuota: a lógica mora em
+    //! `ps/pool_quota`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::pool_quota;
+    use crate::rtl::KernelError;
+
+    /// PsChargeProcessPoolQuota(Process, PoolType, Amount) -> NTSTATUS.
+    fn charge(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(pool_quota::charge_process_pool_quota(call.arg(1), call.arg(2) as u32, call.arg(3))?))
+    }
+
+    /// PsReturnPoolQuota(Process, PoolType, Amount).
+    fn give_back(call: &Call) -> Result<u64, KernelError> {
+        pool_quota::return_pool_quota(call.arg(1), call.arg(2) as u32, call.arg(3));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-pool-quota", names: &["PsChargeProcessPoolQuota", "PsReturnPoolQuota"], handlers: &[charge, give_back], data_exports: &[] };
+}

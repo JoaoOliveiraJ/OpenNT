@@ -330,6 +330,23 @@ fn report_object_active(object: u64, active: bool) {
     set_legacy_line_masked(vector, all_inactive);
 }
 
+/// KeIntSteerIsSteeringEnabled: o KiIntSteerEnabled do NT, que só o
+/// KiIntSteerInit liga quando a HAL anuncia um controlador capaz de
+/// redirecionar interrupções entre processadores e a política o pede. O
+/// OpenNT entrega cada interrupção no vetor em que foi conectada, sem
+/// redirecionamento: desligado.
+pub fn interrupt_steering_enabled() -> bool {
+    false
+}
+
+/// KeIntSteerGetSteeringMode(Gsiv, Edge, Primary, TargetAffinity): o NT
+/// devolve 0 (não redirecionada) logo no começo quando o KiIntSteerEnabled
+/// está desligado, que é sempre o caso aqui; os parâmetros só importam com o
+/// steering ligado.
+pub fn interrupt_steering_mode(_gsiv: u32, _edge: bool, _primary: bool, _target_affinity: &crate::ntos::inc::types::GroupAffinity) -> u32 {
+    0
+}
+
 /// Objeto reportado inativo (IoReportInterruptInactive sem Active posterior).
 pub fn interrupt_reported_inactive(object: u64) -> bool {
     INACTIVE_INTERRUPTS.lock().contains(&object)

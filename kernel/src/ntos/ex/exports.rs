@@ -799,6 +799,20 @@ pub mod zw {
         handlers: &[display_string],
         data_exports: &[],
     };
+
+    // ---- Nt/ZwQuerySystemInformationEx (grupo "system-information-ex") ----
+
+    /// (Class, InputBuffer, InputBufferLength, SystemInformation, Length, ReturnLength*).
+    fn query_system_information_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(system_information::query_ex(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6))?))
+    }
+
+    pub static SYSTEM_INFORMATION_EX_GROUP: Group = Group {
+        name: "system-information-ex",
+        names: &["NtQuerySystemInformationEx", "ZwQuerySystemInformationEx"],
+        handlers: &[query_system_information_ex, query_system_information_ex],
+        data_exports: &[],
+    };
 }
 
 pub mod ex_lookaside_wnf {

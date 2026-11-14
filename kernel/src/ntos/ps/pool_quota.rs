@@ -13,6 +13,8 @@ use crate::ntos::inc::types::Eprocess;
 
 pub const MAXIMUM_QUOTA: u64 = u64::MAX;
 const QUOTA_EXCEEDED: u32 = 0xC000_0044;
+/// POOL_TYPE PagedPool.
+const PAGED_POOL: u32 = 1;
 
 fn eprocess(process: u64) -> &'static Eprocess {
     // SAFETY: EPROCESS vivo (o registro do processo existe) ou retido pela cobrança.
@@ -74,34 +76,60 @@ fn release(process_pointer: u64, paged: bool, bytes: u64) {
     }
 }
 
+/// PsChargeProcessPoolQuota(Process, PoolType, Amount) -> NTSTATUS: a
+/// cobrança que o próprio chamador devolve com [`return_pool_quota`] (sem
+/// bloco de pool associado), contra o limite do processo. Como o
+/// PspChargeQuota do NT, só PoolType == PagedPool (1) vai para o contador
+/// paginável; qualquer outro valor (NonPagedPool, NonPagedPoolNx, os
+/// alinhados) é não paginável. O System não é cobrado.
+pub fn charge_process_pool_quota(process: u64, pool_type: u32, amount: u64) -> Result<u32, KernelError> {
+    charge_counter(process, pool_type == PAGED_POOL, amount)
+}
+
+/// PsReturnPoolQuota(Process, PoolType, Amount): devolve o que
+/// [`charge_process_pool_quota`] cobrou, pelo mesmo critério de tipo.
+pub fn return_pool_quota(process: u64, pool_type: u32, amount: u64) {
+    return_counter(process, pool_type == PAGED_POOL, amount);
+}
+
 /// PsChargeProcessPagedPoolQuota(Process, Amount) -> NTSTATUS: a cobrança
 /// paginável que o próprio chamador devolve com
-/// [`return_process_paged_pool_quota`] (sem bloco de pool associado), contra
-/// o limite do processo; o System não é cobrado.
+/// [`return_process_paged_pool_quota`]; o System não é cobrado.
 pub fn charge_process_paged_pool_quota(process: u64, amount: u64) -> Result<u32, KernelError> {
+    charge_counter(process, true, amount)
+}
+
+/// PsReturnProcessPagedPoolQuota(Process, Amount): devolve o que
+/// [`charge_process_paged_pool_quota`] cobrou; o System não é cobrado.
+pub fn return_process_paged_pool_quota(process: u64, amount: u64) {
+    return_counter(process, true, amount);
+}
+
+/// PspChargeQuota sobre o EPROCESS: soma ao contador do pool contra o
+/// limite (STATUS_QUOTA_EXCEEDED sem mudar nada) e sobe o pico.
+fn charge_counter(process: u64, paged: bool, amount: u64) -> Result<u32, KernelError> {
     if process == process::get_system_process() {
         return Ok(0);
     }
     let Some(limits) = process::with_record(process, |record| record.pool_quota_limits) else {
         return Err(KernelError::new("pool quota owner is absent"));
     };
-    let limit = limits.map_or(MAXIMUM_QUOTA, |limits| limits[1]);
-    match usage(process, true).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_add(amount).filter(|&next| next <= limit)) {
+    let limit = limits.map_or(MAXIMUM_QUOTA, |limits| limits[paged as usize]);
+    match usage(process, paged).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_add(amount).filter(|&next| next <= limit)) {
         Ok(previous) => {
-            raise_peak(peak(process, true), previous + amount);
+            raise_peak(peak(process, paged), previous + amount);
             Ok(0)
         }
         Err(_) => Ok(QUOTA_EXCEEDED),
     }
 }
 
-/// PsReturnProcessPagedPoolQuota(Process, Amount): devolve o que
-/// [`charge_process_paged_pool_quota`] cobrou; o System não é cobrado.
-pub fn return_process_paged_pool_quota(process: u64, amount: u64) {
+/// PspReturnQuota: devolver mais do que foi cobrado é corrupção do chamador.
+fn return_counter(process: u64, paged: bool, amount: u64) {
     if process == process::get_system_process() {
         return;
     }
-    let returned = usage(process, true).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_sub(amount));
+    let returned = usage(process, paged).atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |current| current.checked_sub(amount));
     if returned.is_err() {
         panic!("pool quota underflow");
     }

@@ -156,6 +156,19 @@ pub fn node_number() -> u64 {
     0
 }
 
+/// KeNumberNodes: sem SRAT o KeNumaInitialize não troca as rotinas NUMA da
+/// HAL e a máquina tem um nó.
+pub fn number_nodes() -> u16 {
+    1
+}
+
+/// KiNonNumaQueryNodeDistance (a rotina que o KiPerformGroupConfiguration
+/// chama para preencher KeNodeDistance sem SRAT): a distância do nó 0 a ele
+/// mesmo é 0; qualquer outro par dá STATUS_NOT_FOUND.
+pub fn node_distance(from: u16, to: u16) -> Result<u32, u32> {
+    if from == 0 && to == 0 { Ok(0) } else { Err(0xC000_0225) }
+}
+
 /// KeQueryNodeActiveAffinity: nó 0 com todos os processadores ativos; outro
 /// nó volta vazio. As duas saídas são opcionais.
 pub fn query_node_active_affinity(node: u16, affinity: u64, count: u64) {

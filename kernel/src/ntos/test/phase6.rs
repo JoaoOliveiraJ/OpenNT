@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1853 && abi_names::GROUP_LAYOUT.len() == 408 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1853 exports em 408 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1857 && abi_names::GROUP_LAYOUT.len() == 410 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1857 exports em 410 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -470,6 +470,102 @@ fn ps_paged_pool_quota_exports(assert: Assert) {
         (charged, usage, at::<nt::Eprocess>(process).process_quota_usage[1].get() - before)
     });
     assert(charged_system == Some(0) && measured == Some((Some(0), 0x3000, 0)), "ps-paged-pool-quota: cobranca e devolucao paginavel do processo");
+}
+
+fn ps_pool_quota_exports(assert: Assert) {
+    // PspChargeQuota: só PoolType == PagedPool (1) cai no contador paginável;
+    // NonPagedPool (0), NonPagedPoolNx (0x200) e PagedPoolCacheAligned (5)
+    // vão ao não paginável. Acima do limite: STATUS_QUOTA_EXCEEDED sem cobrar.
+    let system = crate::ntos::ps::process::get_system_process();
+    let charged_system = call_export("PsChargeProcessPoolQuota", &[system, 0, 0x1000]);
+    let measured = super::multiprocess::identity::with_test_process("cota-pool.exe", None, |test| {
+        let process = test.process;
+        let usage = |index: usize| at::<nt::Eprocess>(process).process_quota_usage[index].get();
+        let (non_paged, paged) = (usage(0), usage(1));
+        let charged = [(0u64, 0x2000u64), (1, 0x3000), (0x200, 0x400), (5, 0x100)].map(|(pool_type, amount)| call_export("PsChargeProcessPoolQuota", &[process, pool_type, amount]));
+        let charged_delta = (usage(0) - non_paged, usage(1) - paged);
+        let limited = crate::ntos::ps::pool_quota::set_limits(process, usage(0) + 0x1000, u64::MAX).is_ok();
+        let exceeded = call_export("PsChargeProcessPoolQuota", &[process, 0, 0x2000]);
+        let after_exceeded = usage(0) - non_paged;
+        for (pool_type, amount) in [(0u64, 0x2000u64), (1, 0x3000), (0x200, 0x400), (5, 0x100)] {
+            call_export("PsReturnPoolQuota", &[process, pool_type, amount]);
+        }
+        (charged, charged_delta, limited, exceeded, after_exceeded, (usage(0) - non_paged, usage(1) - paged))
+    });
+    assert(
+        charged_system == Some(0) && measured == Some(([Some(0); 4], (0x2500, 0x3000), true, Some(0xFFFF_FFFF_C000_0044), 0x2500, (0, 0))),
+        "ps-pool-quota: tipo de pool decide o contador, limite e devolucao",
+    );
+}
+
+fn system_information_ex_exports(assert: Assert) {
+    let (input, output, returned) = (guest::alloc_bytes(0x20), guest::alloc_bytes(0x400), guest::alloc_bytes(8));
+    let query = |name: &str, class: u64, input_length: u64, length: u64| {
+        guest::write32(returned, 0x5555_5555);
+        call_export(name, &[class, input, input_length, output, length, returned])
+    };
+    // Entrada obrigatória e só as classes com entrada.
+    let null_input = call_export("ZwQuerySystemInformationEx", &[107, 0, 4, output, 0x400, returned]);
+    guest::write32(input, 4);
+    let validation = [null_input, query("ZwQuerySystemInformationEx", 107, 0, 0x400), query("NtQuerySystemInformationEx", 5, 4, 0x400)];
+    assert(validation == [Some(0xFFFF_FFFF_C000_000D), Some(0xFFFF_FFFF_C000_000D), Some(0xFFFF_FFFF_C000_0003)], "system-information-ex: entrada nula ou vazia e classe sem entrada");
+
+    // 107 = KeQueryLogicalProcessorRelationship(NULL, relação): RelationGroup
+    // pede (0x30 + 0x27) & ~7 = 0x50 bytes; o pci.sys pergunta RelationNumaNode
+    // com buffer nulo e recebe o tamanho com STATUS_INFO_LENGTH_MISMATCH.
+    let small = query("NtQuerySystemInformationEx", 107, 4, 0);
+    let small_length = guest::read32(returned);
+    let group = query("ZwQuerySystemInformationEx", 107, 4, 0x400);
+    let information = at::<nt::SystemLogicalProcessorInformationEx>(output);
+    let group_ok = group == Some(0) && guest::read32(returned) == 0x50 && information.relationship.get() == 4 && information.size.get() == 0x50 && information.group.active_group_count.get() == 1 && information.group.group_info[0].active_processor_count.get() == crate::ntos::ke::smp::online_cpu_count() as u8;
+    guest::write32(input, 1);
+    let numa_probe = call_export("NtQuerySystemInformationEx", &[107, input, 4, 0, 0, returned]);
+    let numa_length = guest::read32(returned);
+    let direct = guest::alloc_bytes(8);
+    guest::write32(direct, 0);
+    let expected = call_export("KeQueryLogicalProcessorRelationship", &[0, 1, 0, direct]);
+    assert(
+        small == Some(0xFFFF_FFFF_C000_0004) && small_length == 0x50 && group_ok && numa_probe == Some(0xFFFF_FFFF_C000_0004) && expected == numa_probe && numa_length == guest::read32(direct) && numa_length != 0,
+        "system-information-ex: classe 107 pelo KeQueryLogicalProcessorRelationship (grupo e no NUMA)",
+    );
+    guest::free_bytes(direct);
+
+    // 121 = KeNodeDistance[nó]: um ULONG por nó (um nó, distância 0 do
+    // KiNonNumaQueryNodeDistance); nó inexistente ou entrada curta recusados.
+    guest::write16(input, 0);
+    guest::write32(output, 0xAAAA_AAAA);
+    let distance = query("NtQuerySystemInformationEx", 121, 2, 4);
+    let distance_ok = distance == Some(0) && guest::read32(output) == 0 && guest::read32(returned) == 4;
+    let short_output = query("NtQuerySystemInformationEx", 121, 2, 3);
+    let short_length = guest::read32(returned);
+    let short_input = query("NtQuerySystemInformationEx", 121, 1, 4);
+    guest::write16(input, 1);
+    let other_node = query("NtQuerySystemInformationEx", 121, 2, 4);
+    assert(
+        distance_ok && short_output == Some(0xFFFF_FFFF_C000_0004) && short_length == 4 && short_input == Some(0xFFFF_FFFF_C000_000D) && other_node == Some(0xFFFF_FFFF_C000_000D),
+        "system-information-ex: classe 121 com a distancia do no 0",
+    );
+
+    // 180 = ExpQueryInterruptSteeringInformation: a pergunta do pci/acpi
+    // (Gsiv -1, ControllerInterrupt) com o steering desligado zera a saída e
+    // deixa ReturnLength 0; entrada fora de 0x18 ou saída curta dão
+    // STATUS_INFO_LENGTH_MISMATCH (4 no ReturnLength só no segundo caso).
+    guest::write_bytes(input, &[0u8; 0x18]);
+    guest::write32(input, 0xFFFF_FFFF);
+    guest::write8(input + 4, 1);
+    guest::write32(output, 0xFFFF_FFFF);
+    let steering = query("ZwQuerySystemInformationEx", 180, 0x18, 4);
+    let steering_ok = steering == Some(0) && guest::read32(output) == 0 && guest::read32(returned) == 0;
+    let bad_input = query("ZwQuerySystemInformationEx", 180, 0x10, 4);
+    let bad_input_length = guest::read32(returned);
+    let bad_output = query("ZwQuerySystemInformationEx", 180, 0x18, 2);
+    assert(
+        steering_ok && bad_input == Some(0xFFFF_FFFF_C000_0004) && bad_input_length == 0 && bad_output == Some(0xFFFF_FFFF_C000_0004) && guest::read32(returned) == 4,
+        "system-information-ex: classe 180 sem steering de interrupcoes",
+    );
+    for block in [input, output, returned] {
+        guest::free_bytes(block);
+    }
 }
 
 /// Chama um export pelo seu trampolim (como um driver chamaria pela IAT).
@@ -1461,7 +1557,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1853 && exports::export_names().len() == 1853, "ntoskrnl: 408 grupos com os 1853 exports implementados");
+    assert(exports::implemented() == 1857 && exports::export_names().len() == 1857, "ntoskrnl: 410 grupos com os 1857 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -13500,6 +13596,8 @@ pub fn run(assert: Assert) {
     rtl_self_relative_sd2_exports(assert);
     fsrtl_ecp_initialize_exports(assert);
     zw_adjust_privileges_token_exports(assert);
+    ps_pool_quota_exports(assert);
+    system_information_ex_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);
