@@ -767,7 +767,7 @@ fase = "6"
 pasta = "ntos/inc"
 nome = "Cabeçalhos do NT (inc)"
 icone = "book"
-descricao = "As estruturas do NT geradas dos símbolos do próprio ntoskrnl pelo cargo xtask nt-types (569 tipos, a partir da lista em types/nt_types.toml, com tamanho e offsets conferidos na compilação; --check acusa arquivos desatualizados), as do WDK e as privadas que os símbolos não trazem e os NTSTATUS; acesso tipado por campo, como o C do NT."
+descricao = "As estruturas do NT geradas dos símbolos do próprio ntoskrnl pelo cargo xtask nt-types (572 tipos, a partir da lista em types/nt_types.toml, com tamanho e offsets conferidos na compilação; --check acusa arquivos desatualizados), as do WDK e as privadas que os símbolos não trazem e os NTSTATUS; acesso tipado por campo, como o C do NT."
 fase = "2"
 
 [[subsistema]]
