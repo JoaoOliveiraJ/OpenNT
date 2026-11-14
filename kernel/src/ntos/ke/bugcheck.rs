@@ -65,6 +65,13 @@ pub fn bug_check_data() -> u64 {
     kernel_data::required_address("KiBugCheckData")
 }
 
+/// O papel do KiBugCheckActive: um bugcheck já gravou o código em
+/// KiBugCheckData (o código do bugcheck nunca é 0).
+pub fn is_active() -> bool {
+    // SAFETY: a célula própria de KiBugCheckData.
+    unsafe { Field::<u64>::at(bug_check_data()) }.get() != 0
+}
+
 /// Parada fatal comum (KeBugCheckEx): grava KiBugCheckData, roda os
 /// callbacks registrados, publica os dados secundários e o black box e para
 /// a máquina.

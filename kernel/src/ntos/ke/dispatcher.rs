@@ -28,6 +28,8 @@ mod object_type {
     pub const THREAD: u8 = 6;
     pub const TIMER_NOTIFICATION: u8 = 8;
     pub const TIMER_SYNCHRONIZATION: u8 = 9;
+    pub const TIMER2_NOTIFICATION: u8 = 0x18;
+    pub const TIMER2_SYNCHRONIZATION: u8 = 0x19;
 }
 
 /// LIST_ENTRY vazia (aponta para si mesma).
@@ -225,9 +227,9 @@ pub fn acquire_status(object: u64, consume: bool) -> Option<u32> {
         }
         // Eventos de notificação, timers de notificação e threads e processos
         // terminados.
-        object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::THREAD | object_type::PROCESS => (state.get() != 0).then_some(0),
+        object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::TIMER2_NOTIFICATION | object_type::THREAD | object_type::PROCESS => (state.get() != 0).then_some(0),
         // Eventos e timers de sincronização consomem o sinal.
-        object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION => {
+        object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION => {
             let signalled = if consume { state.atomic().swap(0, Ordering::SeqCst) } else { state.get() };
             (signalled != 0).then_some(0)
         }

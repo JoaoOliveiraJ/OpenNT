@@ -1395,3 +1395,18 @@ pub mod pcw_instances {
 
     pub static GROUP: Group = Group { name: "pcw-instances", names: &["PcwCreateInstance", "PcwCloseInstance"], handlers: &[create_instance, close_instance], data_exports: &[] };
 }
+
+pub mod ex_try_queue_work_item {
+    //! ExTryQueueWorkItem; a lógica mora em `io/work_items.rs`, com a fila
+    //! do ExQueueWorkItem.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::work_items;
+    use crate::rtl::KernelError;
+
+    fn try_queue_work_item(call: &Call) -> Result<u64, KernelError> {
+        Ok(work_items::try_queue_ex_work_item(call.arg(1), call.arg(2) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-try-queue-work-item", names: &["ExTryQueueWorkItem"], handlers: &[try_queue_work_item], data_exports: &[] };
+}

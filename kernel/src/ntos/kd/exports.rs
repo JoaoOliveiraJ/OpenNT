@@ -57,6 +57,50 @@ pub mod debug_prompt {
     };
 }
 
+pub mod kd_power {
+    //! Trava do depurador, energia do transporte KD, KdDisableDebugger e
+    //! DbgCommandString; a lógica mora em `kd/power.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::kd::power;
+    use crate::rtl::KernelError;
+
+    fn acquire_debugger_lock(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PKIRQL de saída do chamador.
+        power::acquire_debugger_lock(unsafe { Field::<u8>::at(call.arg(1)) });
+        Ok(0)
+    }
+    fn release_debugger_lock(call: &Call) -> Result<u64, KernelError> {
+        power::release_debugger_lock(call.arg(1) as u8);
+        Ok(0)
+    }
+    fn register_power_handler(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PVOID* Handle de saída do chamador.
+        Ok(signed_status(power::register_power_handler(call.arg(1), call.arg(2), unsafe { Field::<u64>::at(call.arg(3)) })))
+    }
+    fn deregister_power_handler(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power::deregister_power_handler(call.arg(1))))
+    }
+    fn power_transition_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power::power_transition(call.arg(1) as u32, call.arg(2) as u8 != 0)))
+    }
+    fn disable_debugger(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power::disable_debugger()))
+    }
+    fn command_string(call: &Call) -> Result<u64, KernelError> {
+        power::command_string(call.arg(1), call.arg(2))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "kd-power",
+        names: &["KdAcquireDebuggerLock", "KdReleaseDebuggerLock", "KdRegisterPowerHandler", "KdDeregisterPowerHandler", "KdPowerTransitionEx", "KdDisableDebugger", "DbgCommandString"],
+        handlers: &[acquire_debugger_lock, release_debugger_lock, register_power_handler, deregister_power_handler, power_transition_ex, disable_debugger, command_string],
+        data_exports: &[],
+    };
+}
+
 pub mod kd_debug_filter {
     //! Adaptador de DbgSetDebugFilterState (lógica em `kd/debug_filter.rs`).
 

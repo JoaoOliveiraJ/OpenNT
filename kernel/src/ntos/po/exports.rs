@@ -277,3 +277,86 @@ pub mod po_vsync {
 
     pub static GROUP: Group = Group { name: "po-vsync", names: &["PoNotifyVSyncChange"], handlers: &[notify_vsync_change], data_exports: &[] };
 }
+
+pub mod po_thermal_requests {
+    //! Pedidos térmicos; a lógica mora em `po/thermal.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::po::thermal::{self, CreateRequest, ThermalRequest};
+    use crate::rtl::KernelError;
+
+    fn request(address: u64) -> &'static ThermalRequest {
+        // SAFETY: o pedido térmico criado por PoCreateThermalRequest.
+        unsafe { ThermalRequest::at(address) }
+    }
+
+    fn create_thermal_request(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PVOID* de saída do chamador.
+        let output = unsafe { Field::<u64>::at(call.arg(1)) };
+        let arguments = CreateRequest { target: call.arg(2), policy: call.arg(3), context: call.arg(4), flags: call.arg(5) as u32 };
+        Ok(signed_status(thermal::create(output, &arguments)))
+    }
+    fn delete_thermal_request(call: &Call) -> Result<u64, KernelError> {
+        thermal::delete(request(call.arg(1)));
+        Ok(0)
+    }
+    fn get_thermal_request_support(call: &Call) -> Result<u64, KernelError> {
+        Ok(thermal::support(request(call.arg(1)), call.arg(2) as u32) as u64)
+    }
+    fn set_thermal_active_cooling(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(thermal::set_active_cooling(request(call.arg(1)), call.arg(2) as u8 != 0)))
+    }
+    fn set_thermal_passive_cooling(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(thermal::set_passive_cooling(request(call.arg(1)), call.arg(2) as u8)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-thermal-requests",
+        names: &["PoCreateThermalRequest", "PoDeleteThermalRequest", "PoGetThermalRequestSupport", "PoSetThermalActiveCooling", "PoSetThermalPassiveCooling"],
+        handlers: &[create_thermal_request, delete_thermal_request, get_thermal_request_support, set_thermal_active_cooling, set_thermal_passive_cooling],
+        data_exports: &[],
+    };
+}
+
+pub mod po_power_actions {
+    //! ZwInitiatePowerAction, PoShutdownBugCheck e PoSetHiberRange; a
+    //! lógica mora em `po/power_action.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::power_action;
+    use crate::rtl::KernelError;
+
+    fn initiate_power_action(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power_action::initiate(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u8 != 0)))
+    }
+    fn shutdown_bug_check(call: &Call) -> Result<u64, KernelError> {
+        power_action::shutdown_bug_check(call.arg(1) as u8 != 0, call.arg(2) as u32, [call.arg(3), call.arg(4), call.arg(5), call.arg(6)])
+    }
+    fn set_hiber_range(call: &Call) -> Result<u64, KernelError> {
+        power_action::set_hiber_range(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-power-actions",
+        names: &["ZwInitiatePowerAction", "PoShutdownBugCheck", "PoSetHiberRange"],
+        handlers: &[initiate_power_action, shutdown_bug_check, set_hiber_range],
+        data_exports: &[],
+    };
+}
+
+pub mod po_fx_drips_watchdog {
+    //! PoFxRegisterDripsWatchdogCallback; a lógica mora em `po/fx.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::po::fx;
+    use crate::rtl::KernelError;
+
+    fn register_drips_watchdog_callback(call: &Call) -> Result<u64, KernelError> {
+        fx::register_drips_watchdog_callback(call.arg(1), call.arg(2), call.arg(3) as u8 != 0, call.arg(4));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "po-fx-drips-watchdog", names: &["PoFxRegisterDripsWatchdogCallback"], handlers: &[register_drips_watchdog_callback], data_exports: &[] };
+}

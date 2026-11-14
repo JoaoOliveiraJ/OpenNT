@@ -63,6 +63,7 @@ kernel/src/
 │   ├── bgk/           console do vídeo de boot (Bgk*)
 │   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
 │   ├── ttm/           Terminal Topology Manager (notificações de dispositivo)
+│   ├── em/            Errata Manager (provedores e regras do INF de errata)
 │   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs;
 │                      multiprocess/, um módulo por assunto, chamado pela fase 7)
 ├── drivers/           drivers internos
@@ -739,6 +740,63 @@ dereference e o PFN livre volta ao de antes.
   16 bytes, alinhados a 16) fica fora da memória do heap, num registro do
   OpenNT, e a CommitRoutine é chamada sem nenhuma trava do Rust retida.
   Teste: `ntos/test/rtl_atom_heap_nls.rs`.
+- **Listas de faixas e descritores de recursos** (`rtl/range_list.rs`,
+  `rtl/resource_encoding.rs`): a RTL_RANGE_LIST é a real (entradas
+  `_RTLP_RANGE_LIST_ENTRY` de 0x38 bytes em pool paginado 'RRle'), com a
+  lista de topo ordenada e sem sobreposição e as faixas fundidas
+  (sublista ordenada por início) do ntoskrnl; os iteradores entregam o
+  RTL_RANGE da entrada e conferem o carimbo da lista. A codificação dos
+  descritores de memória grandes (CmResourceTypeMemoryLarge, formas de 40,
+  48 e 64 bits) segue as Rtl*MemIoResource. Teste:
+  `ntos/test/rtl_ranges_resources.rs`, com os valores calculados
+  executando o código do ntoskrnl num emulador.
+- **KTIMER2** (`ke/timer2.rs`): o `_KTIMER2` do chamador com Callback e
+  contextos codificados pelos segredos do boot, TypeFlags e
+  CollectionIndex da KiTimer2Combinations e o byte de bandeiras do Header
+  (Inserted, Running, Disabled). Os inseridos ficam numa fila do módulo
+  (o papel das coleções de árvores do NT) que o pump dos timers expira:
+  SignalState 1 (Timer2Notification/Synchronization nas esperas de
+  `ke/dispatcher.rs`), periódico de volta para agora + Period e o callback
+  em DISPATCH_LEVEL.
+- **Errata Manager** (`em/`): provedores e avaliação de regras sobre o
+  banco do INF de errata. O carregador do OpenNT não entrega o INF, então
+  o banco é vazio como no ntoskrnl sem ele: só o provedor sem entradas nem
+  callbacks é registrado, e as regras não existem (STATUS_NOT_FOUND com
+  STATE_UNKNOWN).
+- **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
+  DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o
+  KdPitchDebugger de um boot sem /DEBUG, KdPowerTransitionEx sem efeito e
+  KdDisableDebugger com STATUS_DEBUGGER_INACTIVE; DbgCommandString é o
+  serviço 5 do `int 0x2D` num corpo nativo.
+- **Pedidos térmicos** (`po/thermal.rs`, `po/reason_context.rs`): a
+  extensão de resfriamento de cada alvo recebe a
+  GUID_THERMAL_COOLING_INTERFACE por um IRP_MN_QUERY_INTERFACE síncrono ao
+  alvo; o agregado dos pedidos (menor percentual, OU dos ativos) chama
+  PassiveCooling/ActiveCooling do driver só quando muda, sem trava, e o
+  último pedido devolve a interface. A extensão fica num registro por
+  dispositivo (no NT, na DOPE do alvo).
+- **Ações de energia** (`po/power_action.rs`): ZwInitiatePowerAction valida
+  como o NtInitiatePowerAction; sem a política de energia
+  (PopExecutePowerAction) as ações reais devolvem STATUS_NOT_SUPPORTED, e
+  o PoShutdownBugCheck cai no bugcheck pedido. PoSetHiberRange só aceita
+  um mapa fechado: o OpenNT não hiberna.
+- **Dependências entre dispositivos** (`io/dependency.rs`): o grafo das
+  Pip* (nós 'PnpS' em DEVOBJ_EXTENSION.DependencyNode, arestas com os
+  pedidos por dispositivo ou por nome de ligação, ids de ligação). Ficam de
+  fora a ancestralidade dos devnodes na validação de uma aresta, a fila de
+  relações de energia, a liberação do início dos dependentes e a
+  notificação de propriedade, que dependem do PnP.
+- **Ejeção, remoção para reset e recursos legados**
+  (`io/device_removal.rs`, `io/legacy_resources.rs`): as validações, os
+  blocos de contexto e o worker do IoRequestDeviceEject(Ex) e do
+  IoRequestDeviceRemovalForReset são os do ntoskrnl; o PnP do OpenNT ainda
+  não processa eventos de remoção ou ejeção de dispositivo-alvo, e o
+  pedido conclui com STATUS_TOO_LATE (a recusa do PnpSetTargetDeviceRemove
+  quando a máquina de eventos não aceita o evento). O IoAssignResources
+  libera e valida como o original, mas sem árbitros de recursos nenhuma
+  configuração existe: STATUS_RETRY.
+  Testes: `ntos/test/rtl_ranges_resources.rs`, `ntos/test/platform_support.rs`,
+  `ntos/test/power_io_support.rs` e `ntos/test/device_removal.rs`.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por

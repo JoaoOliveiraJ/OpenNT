@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 371] {
+fn groups() -> [&'static Group; 381] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -426,6 +426,16 @@ fn groups() -> [&'static Group; 371] {
         &crate::ntos::rtl::exports::rtl_resource_encoding::GROUP,
         &crate::ntos::rtl::exports::rtl_bitmap_copy::GROUP,
         &crate::ntos::rtl::exports::crt_string_conversion::GROUP,
+        &crate::ntos::ke::exports::ke_timer2::GROUP,
+        &crate::ntos::ke::exports::ke_processor_support::GROUP,
+        &crate::ntos::kd::exports::kd_power::GROUP,
+        &crate::ntos::em::exports::em_errata::GROUP,
+        &crate::ntos::ex::exports::ex_try_queue_work_item::GROUP,
+        &crate::ntos::po::exports::po_thermal_requests::GROUP,
+        &crate::ntos::po::exports::po_power_actions::GROUP,
+        &crate::ntos::po::exports::po_fx_drips_watchdog::GROUP,
+        &crate::ntos::io::exports::io_dependencies::GROUP,
+        &crate::ntos::io::exports::io_device_reset_resources::GROUP,
     ]
 }
 

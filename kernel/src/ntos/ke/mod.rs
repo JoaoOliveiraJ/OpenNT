@@ -39,6 +39,7 @@ pub mod processor_topology;
 pub mod service_tables;
 pub mod queue;
 pub mod cache_flush;
+pub mod timer2;
 
 /// O kernel drena timers, DPCs, work items e IoTimers no laço ocioso, como o
 /// NT ao cair de DISPATCH_LEVEL.

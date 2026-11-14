@@ -268,6 +268,39 @@ opennt_crt_sqrtf:
     sqrtss xmm0, xmm0
     ret
 
+# DbgCommandString(Name, Command): os STRING (Length, 0, Buffer) do nome
+# (rsp+0x30) e do comando (rsp+0x20) e o serviço de depuração 5
+# (BREAKPOINT_COMMAND_STRING) com rcx = &nome e rdx = &comando, como o
+# DebugService2; sem KD, o serviço volta depois do int3 que o segue.
+.balign 16
+.global opennt_dbg_command_string
+opennt_dbg_command_string:
+    sub rsp, 0x48
+    xor eax, eax
+    mov qword ptr [rsp + 0x30], rax
+    mov qword ptr [rsp + 0x38], rcx
+    mov qword ptr [rsp + 0x20], rax
+    mov qword ptr [rsp + 0x28], rdx
+    or r8, -1
+2:
+    inc r8
+    cmp byte ptr [rcx + r8], 0
+    jne 2b
+    mov word ptr [rsp + 0x30], r8w
+    or rax, -1
+3:
+    inc rax
+    cmp byte ptr [rdx + rax], 0
+    jne 3b
+    mov word ptr [rsp + 0x20], ax
+    lea rcx, [rsp + 0x30]
+    lea rdx, [rsp + 0x20]
+    mov eax, 5
+    int 0x2d
+    int3
+    add rsp, 0x48
+    ret
+
 .popsection
 "#
 );
@@ -282,6 +315,7 @@ extern "C" {
     static opennt_ob_find_handle_for_object: u8;
     static opennt_dbg_prompt: u8;
     static opennt_crt_sqrtf: u8;
+    static opennt_dbg_command_string: u8;
     static opennt_probe_kernel_stack: u8;
     static opennt_mm_get_image_file_signature_information: u8;
     static opennt_iop_csq_cancel_routine: u8;
@@ -316,6 +350,7 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "ob_find_handle_for_object" => core::ptr::addr_of!(opennt_ob_find_handle_for_object),
             "dbg_prompt" => core::ptr::addr_of!(opennt_dbg_prompt),
             "crt_sqrtf" => core::ptr::addr_of!(opennt_crt_sqrtf),
+            "dbg_command_string" => core::ptr::addr_of!(opennt_dbg_command_string),
             "probe_kernel_stack" => core::ptr::addr_of!(opennt_probe_kernel_stack),
             "MmGetImageFileSignatureInformation" => core::ptr::addr_of!(opennt_mm_get_image_file_signature_information),
             "IopCsqCancelRoutine" => core::ptr::addr_of!(opennt_iop_csq_cancel_routine),

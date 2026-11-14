@@ -1003,3 +1003,66 @@ pub mod ke_semaphore_state {
 
     pub static GROUP: Group = Group { name: "ke-semaphore-state", names: &["KeReadStateSemaphore"], handlers: &[read_state_semaphore], data_exports: &[] };
 }
+
+pub mod ke_timer2 {
+    //! KTIMER2; a lógica mora em `ke/timer2.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::extra_ke_misc::Ktimer2;
+    use crate::ntos::ke::timer2;
+    use crate::rtl::KernelError;
+
+    fn timer(address: u64) -> &'static Ktimer2 {
+        // SAFETY: o KTIMER2 do chamador.
+        unsafe { Ktimer2::at(address) }
+    }
+
+    fn initialize_timer2(call: &Call) -> Result<u64, KernelError> {
+        timer2::initialize(timer(call.arg(1)), call.arg(2), call.arg(3), call.arg(4) as u32);
+        Ok(0)
+    }
+    fn set_timer2(call: &Call) -> Result<u64, KernelError> {
+        Ok(timer2::set(timer(call.arg(1)), call.arg(2) as i64, call.arg(3) as i64, call.arg(4)) as u64)
+    }
+    fn cancel_timer2(call: &Call) -> Result<u64, KernelError> {
+        Ok(timer2::cancel(timer(call.arg(1))) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-timer2",
+        names: &["KeInitializeTimer2", "KeSetTimer2", "KeCancelTimer2"],
+        handlers: &[initialize_timer2, set_timer2, cancel_timer2],
+        data_exports: &[],
+    };
+}
+
+pub mod ke_processor_support {
+    //! Afinidade de grupo, coerência de cache e processadores dinâmicos; a
+    //! lógica mora em `ke/processor_group.rs` e `ke/smp.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{GroupAffinity, NtStruct};
+    use crate::ntos::ke::{processor_group, smp};
+    use crate::rtl::KernelError;
+
+    fn processor_group_affinity(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o GROUP_AFFINITY de saída do chamador.
+        processor_group::processor_group_affinity(unsafe { GroupAffinity::at(call.arg(1)) }, call.arg(2) as u32);
+        Ok(0)
+    }
+    fn report_cache_incoherent_device(_: &Call) -> Result<u64, KernelError> {
+        smp::report_cache_incoherent_device();
+        Ok(0)
+    }
+    fn start_dynamic_processor(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(smp::start_dynamic_processor()))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-processor-support",
+        names: &["KeProcessorGroupAffinity", "KeReportCacheIncoherentDevice", "KeStartDynamicProcessor"],
+        handlers: &[processor_group_affinity, report_cache_incoherent_device, start_dynamic_processor],
+        data_exports: &[],
+    };
+}

@@ -290,7 +290,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
 testes = ["fase4", "teclado"]
 fase = "4"
-notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows). Para file systems e armazenamento: IRPs associados (com a devolução ao mestre na conclusão), I/O de paginação (IoPageRead/IoSynchronousPageWrite), extensões de FILE_OBJECT e de IRP, registro de file systems e suas notificações, stream file objects, share access, IoReportDetectedDevice, propriedades de dispositivo e IoGetDmaAdapter (que devolve NULL enquanto o PDO PCI não responde QUERY_INTERFACE)."
+notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows). Para file systems e armazenamento: IRPs associados (com a devolução ao mestre na conclusão), I/O de paginação (IoPageRead/IoSynchronousPageWrite), extensões de FILE_OBJECT e de IRP, registro de file systems e suas notificações, stream file objects, share access, IoReportDetectedDevice, propriedades de dispositivo e IoGetDmaAdapter (que devolve NULL enquanto o PDO PCI não responde QUERY_INTERFACE). O grafo de dependências entre dispositivos (IoSetDependency, IoReserveDependency, IoResolveDependency, IoDuplicateDependency, IoTestDependency) existe sobre DEVOBJ_EXTENSION.DependencyNode, sem a ordem de energia nem a liberação do início dos dependentes; IoRequestDeviceEject(Ex) e IoRequestDeviceRemovalForReset validam e enfileiram como o Windows, mas o PnP ainda não processa eventos de remoção ou ejeção de dispositivo-alvo (o pedido conclui com STATUS_TOO_LATE); IoAssignResources libera e valida, mas sem árbitros de recursos nenhum pedido é atendido (STATUS_RETRY)."
 
 [[componente]]
 nome = "Registro"
@@ -367,7 +367,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/bus/pci.rs", "kernel/src/hal/pci_config.rs"]
 testes = ["fase4"]
 fase = "4"
-notas = "Suporte de boot do próprio kernel: faz a enumeração que no Windows é do pci.sys, que não é carregado, e cria um PDO por função com os recursos dela. O PDO responde só START_DEVICE, REMOVE_DEVICE e QUERY_ID (sempre com o HardwareID, qualquer que seja o tipo de id pedido); os outros pedidos PnP, como QUERY_INTERFACE, voltam STATUS_NOT_SUPPORTED."
+notas = "Suporte de boot do próprio kernel: faz a enumeração que no Windows é do pci.sys, que não é carregado, e cria um PDO por função com os recursos dela. O PDO responde só START_DEVICE, REMOVE_DEVICE e QUERY_ID (sempre com o HardwareID, qualquer que seja o tipo de id pedido); os outros pedidos PnP, como QUERY_INTERFACE, voltam STATUS_NOT_SUPPORTED. Para trocar este papel pelo pci.sys real, o suporte que ele importa do ntoskrnl já existe (listas de faixas RtlAddRange/RtlFindRange e afins, codificação de descritores de memória grandes, RtlCopyBitMap, Errata Manager, trava e energia do KD, PoFxRegisterDripsWatchdogCallback, PoSetHiberRange, IoAssignResources e IoRequestDeviceEjectEx); faltam 5 imports, de outras etapas: NtQuerySystemInformationEx, ZwQuerySystemInformationEx, RtlFindFirstRunClear, RtlFindLastBackwardRunClear e RtlFindLongestRunClear. O pci.sys não é carregado ainda."
 
 [[componente]]
 nome = "Dispositivos da placa-mãe"
@@ -378,7 +378,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/bus/motherboard.rs"]
 testes = ["fase4"]
 fase = "4"
-notas = "Suporte de boot do próprio kernel: cria os PDOs do teclado (PNP0303) e do mouse (PNP0F13) PS/2 com as portas e as IRQs, papel que no Windows é do ACPI.sys. É sobre eles que o PnP monta a pilha do i8042prt.sys."
+notas = "Suporte de boot do próprio kernel: cria os PDOs do teclado (PNP0303) e do mouse (PNP0F13) PS/2 com as portas e as IRQs, papel que no Windows é do ACPI.sys. É sobre eles que o PnP monta a pilha do i8042prt.sys. Do suporte que o acpi.sys real importa do ntoskrnl (listas de faixas, codificação de recursos, KTIMER2, pedidos térmicos, dependências entre dispositivos, ejeção e remoção para reset, Errata Manager, ZwInitiatePowerAction, PoShutdownBugCheck, _strtoui64, strtok_s e o resto), só falta ZwQuerySystemInformationEx; o acpi.sys não é carregado ainda."
 
 [[componente]]
 nome = "Disco ATA (interno)"

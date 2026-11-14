@@ -56,6 +56,20 @@ pub fn write_group_affinity(pointer: u64, mask: u64) {
     }
 }
 
+/// KeProcessorGroupAffinity(Affinity, ProcessorIndex): o GROUP_AFFINITY do
+/// processador pelo KiProcessorIndexToNumberMappingTable (grupo = número
+/// / 64, máscara = 1 << número % 64, Reserved zerado), sem conferir o
+/// índice. No OpenNT o número de um processador online é o próprio índice
+/// (grupo 0); as posições da tabela que nenhum processador ocupou valem 0.
+pub fn processor_group_affinity(affinity: &GroupAffinity, index: u32) {
+    let number = if (index as usize) < smp::online_cpu_count() { index } else { 0 };
+    for reserved in &affinity.reserved {
+        reserved.set(0);
+    }
+    affinity.group.set((number >> 6) as u16);
+    affinity.mask.set(1u64 << (number & 0x3F));
+}
+
 /// KeGetCurrentProcessorNumber: todo código de driver roda no BSP.
 pub fn current_processor_number() -> u32 {
     0

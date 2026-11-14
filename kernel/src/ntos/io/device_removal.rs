@@ -1,5 +1,5 @@
-//! Pedidos de ejeção de dispositivo: IoRequestDeviceEject e
-//! IoRequestDeviceEjectEx.
+//! Pedidos de ejeção e de remoção de dispositivo: IoRequestDeviceEject,
+//! IoRequestDeviceEjectEx e IoRequestDeviceRemovalForReset.
 //!
 //! Como no ntoskrnl 19041 (rva 0x50c8f0): um PDO nulo ou sem devnode do PnP
 //! (o caso legado também) é PNP_DETECTED_FATAL_ERROR (0xCA, 2, Pdo); senão
@@ -20,6 +20,14 @@
 //! com que o PnpSetTargetDeviceRemove do NT recusa um evento que a máquina
 //! de eventos do PnP não pode receber; um dispositivo que perdeu o devnode
 //! conclui com STATUS_NO_SUCH_DEVICE, como no original.
+//!
+//! IoRequestDeviceRemovalForReset(Pdo, Flags) (rva 0x8a0520) monta o
+//! contexto de 0xE0 bytes ('PnpE': KTIMER, KDPC e WORK_QUEUE_ITEM das
+//! novas tentativas, o PDO referenciado com 'PnpR', o nome de veto de
+//! 0x202 bytes 'Ppsu' e as Flags, que o 19041 não interpreta) e enfileira o
+//! evento GUID_DEVICE_QUERY_AND_REMOVE de reset; a recusa do evento devolve
+//! o contexto e o status ao chamador, que no OpenNT é o mesmo
+//! STATUS_TOO_LATE.
 
 use crate::hal::amd64::native_call;
 use crate::ntos::ex::pool_allocation;
@@ -37,6 +45,13 @@ const PNP_DETECTED_FATAL_ERROR: u32 = 0xCA;
 const NON_PAGED_POOL_NX: u32 = 0x200;
 const EJECT_TAG: u32 = u32::from_le_bytes(*b"PnpF");
 const DRIVER_REFERENCE_TAG: u32 = u32::from_le_bytes(*b"PnpE");
+const RESET_TAG: u32 = u32::from_le_bytes(*b"PnpE");
+const RESET_DEVICE_TAG: u32 = u32::from_le_bytes(*b"PnpR");
+const VETO_NAME_TAG: u32 = u32::from_le_bytes(*b"Ppsu");
+const PAGED_POOL: u32 = 1;
+/// Tamanho do contexto de remoção para reset e do nome de veto.
+const RESET_CONTEXT_SIZE: u64 = 0xE0;
+const VETO_NAME_SIZE: u64 = 0x202;
 
 /// O bloco do pedido de ejeção (0x5D8 bytes, layout do ntoskrnl até o
 /// WORK_QUEUE_ITEM; em +0x40 o NT guarda o caminho de instância).
@@ -101,7 +116,7 @@ fn eject_worker(_device: u64, block: u64) {
     // SAFETY: o bloco do pedido, dono deste work item.
     let request = unsafe { EjectRequest::at(block) };
     let device = request.device.get();
-    let status = if has_device_node(device) { STATUS_TOO_LATE } else { STATUS_NO_SUCH_DEVICE };
+    let status = if has_device_node(device) { queue_target_device_remove(device) } else { STATUS_NO_SUCH_DEVICE };
     request.result.set(status);
     let callback = request.callback.get();
     if callback != 0 {
@@ -113,4 +128,40 @@ fn eject_worker(_device: u64, block: u64) {
     }
     let _ = object_reference::dereference_with_tag(device, reference_trace::DEFAULT_TAG, true);
     let _ = pool_allocation::free(block, 0);
+}
+
+/// PnpSetTargetDeviceRemove: o evento de remoção ou ejeção do dispositivo
+/// alvo na fila de eventos do PnP. O PnP do OpenNT não tem essa fila.
+fn queue_target_device_remove(_device: u64) -> u32 {
+    STATUS_TOO_LATE
+}
+
+/// IoRequestDeviceRemovalForReset(Pdo, Flags).
+pub fn request_removal_for_reset(pdo: u64, flags: u32) -> u32 {
+    let context = pool_allocation::allocate_tagged(NON_PAGED_POOL_NX, RESET_CONTEXT_SIZE, RESET_TAG).unwrap_or(0);
+    if context == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    crate::ntos::mm::guest_memory::write_bytes(context, &[0u8; RESET_CONTEXT_SIZE as usize]);
+    crate::ntos::ke::timer::initialize_notification_timer(context);
+    let _ = object_reference::reference_with_tag(pdo, RESET_DEVICE_TAG, true);
+    crate::ntos::mm::guest_memory::write64(context + 0xB8, pdo);
+    crate::ntos::mm::guest_memory::write32(context + 0xD8, flags);
+    let veto_name = pool_allocation::allocate_tagged(PAGED_POOL, VETO_NAME_SIZE, VETO_NAME_TAG).unwrap_or(0);
+    let status = if veto_name == 0 {
+        STATUS_INSUFFICIENT_RESOURCES
+    } else {
+        crate::ntos::mm::guest_memory::write16(context + 0xCA, VETO_NAME_SIZE as u16);
+        crate::ntos::mm::guest_memory::write64(context + 0xD0, veto_name);
+        queue_target_device_remove(pdo)
+    };
+    if (status as i32) < 0 {
+        // IopFreeResetRemovalContext.
+        let _ = object_reference::dereference_with_tag(pdo, RESET_DEVICE_TAG, true);
+        if veto_name != 0 {
+            let _ = pool_allocation::free(veto_name, 0);
+        }
+        let _ = pool_allocation::free(context, 0);
+    }
+    status
 }

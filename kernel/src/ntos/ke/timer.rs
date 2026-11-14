@@ -133,6 +133,7 @@ pub fn check_timers() {
             dpc::insert_queue_dpc(dpc_pointer, 0, 0);
         }
     }
+    super::timer2::expire_due();
 }
 
 fn delay_pump() {

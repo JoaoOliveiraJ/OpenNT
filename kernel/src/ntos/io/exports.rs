@@ -1964,3 +1964,71 @@ pub mod io_root_device {
 
     pub static GROUP: Group = Group { name: "io-root-device", names: &["IoReportRootDevice"], handlers: &[report_root_device], data_exports: &[] };
 }
+
+pub mod io_dependencies {
+    //! O grafo de dependências entre dispositivos; a lógica mora em
+    //! `io/dependency.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::io::dependency;
+    use crate::rtl::KernelError;
+
+    fn set_dependency(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(dependency::set(call.arg(1), call.arg(2), call.arg(3) as u32)))
+    }
+    fn reserve_dependency(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(dependency::reserve(call.arg(1), call.arg(2), call.arg(3) as u32)))
+    }
+    fn resolve_dependency(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(dependency::resolve_dependency(call.arg(1), call.arg(2))))
+    }
+    fn duplicate_dependency(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(dependency::duplicate(call.arg(1), call.arg(2))))
+    }
+    fn test_dependency(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os PULONG de saída do chamador.
+        let (path, flags) = unsafe { (Field::<u32>::at(call.arg(3)), Field::<u32>::at(call.arg(4))) };
+        Ok(signed_status(dependency::test(call.arg(1), call.arg(2), path, flags)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-dependencies",
+        names: &["IoSetDependency", "IoReserveDependency", "IoResolveDependency", "IoDuplicateDependency", "IoTestDependency"],
+        handlers: &[set_dependency, reserve_dependency, resolve_dependency, duplicate_dependency, test_dependency],
+        data_exports: &[],
+    };
+}
+
+pub mod io_device_reset_resources {
+    //! IoRequestDeviceRemovalForReset, IoAssignResources e
+    //! IoWMIExecuteMethod; a lógica mora em `io/device_removal.rs`,
+    //! `io/legacy_resources.rs` e `io/wmi_data_block.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::io::{device_removal, legacy_resources, wmi_data_block};
+    use crate::rtl::KernelError;
+
+    fn request_removal_for_reset(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_removal::request_removal_for_reset(call.arg(1), call.arg(2) as u32)))
+    }
+    fn assign_resources(call: &Call) -> Result<u64, KernelError> {
+        let request = legacy_resources::AssignRequest { driver_object: call.arg(3), device_object: call.arg(4), requirements: call.arg(5) };
+        // SAFETY: o PCM_RESOURCE_LIST* opcional do chamador.
+        let allocated = (call.arg(6) != 0).then(|| unsafe { Field::<u64>::at(call.arg(6)) });
+        Ok(signed_status(legacy_resources::assign(&request, allocated)))
+    }
+    fn wmi_execute_method(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PULONG OutBufferSize do chamador.
+        let out_size = unsafe { Field::<u32>::at(call.arg(5)) }.get();
+        Ok(signed_status(wmi_data_block::execute_method(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, out_size, call.arg(6))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-device-reset-resources",
+        names: &["IoRequestDeviceRemovalForReset", "IoAssignResources", "IoWMIExecuteMethod"],
+        handlers: &[request_removal_for_reset, assign_resources, wmi_execute_method],
+        data_exports: &[],
+    };
+}

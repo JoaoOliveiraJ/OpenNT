@@ -381,6 +381,30 @@ pub fn ap_slot_count() -> usize {
     STATE.lock().online_slots.len()
 }
 
+/// KeStartDynamicProcessor(.., ProcessorNumber*): o ntoskrnl recusa com
+/// STATUS_UNSUCCESSFUL, sem tocar na saída, fora do processo System ou sem
+/// KeDynamicPartitioningSupported. O OpenNT não acrescenta processadores
+/// depois do boot (só os da MADT partem no SMP), então a partição dinâmica
+/// nunca está disponível e a resposta é sempre essa.
+pub fn start_dynamic_processor() -> u32 {
+    0xC000_0001
+}
+
+/// KiSystemFullyCoherent: começa 1 e cai para 0 no primeiro
+/// KeReportCacheIncoherentDevice.
+static SYSTEM_FULLY_COHERENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// KeReportCacheIncoherentDevice: um dispositivo de DMA sem coerência de
+/// cache existe no sistema.
+pub fn report_cache_incoherent_device() {
+    SYSTEM_FULLY_COHERENT.store(0, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// O KiSystemFullyCoherent corrente.
+pub fn system_fully_coherent() -> bool {
+    SYSTEM_FULLY_COHERENT.load(core::sync::atomic::Ordering::SeqCst) != 0
+}
+
 pub fn ap_slot(index: usize) -> Option<usize> {
     STATE.lock().online_slots.get(index).copied()
 }

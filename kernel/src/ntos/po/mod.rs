@@ -12,3 +12,6 @@ pub mod device_wake;
 pub mod system_state;
 pub mod latency;
 pub mod shutdown;
+pub mod reason_context;
+pub mod thermal;
+pub mod power_action;

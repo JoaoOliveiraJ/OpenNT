@@ -223,6 +223,35 @@ pub fn queue_ex_work_item(item: u64, _queue_type: u32) {
     queue.entries.push((item, Kind::Ex));
 }
 
+/// WORKER_INVALID.
+const WORKER_INVALID: u32 = 0xE4;
+
+/// ExpValidateWorkItem: List.Flink nulo (item fora de fila), QueueType
+/// fora de 7..=31 e abaixo de 64, WorkerRoutine no espaço de sistema; senão
+/// WORKER_INVALID (1, 6 ou 7).
+fn validate_ex_work_item(item: u64, queue_type: u32) {
+    let queue_item = queue_item_at(item);
+    if queue_item.list.flink.get() != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(WORKER_INVALID, 1, item, queue_type as i32 as i64 as u64, 0);
+    }
+    if queue_type.wrapping_sub(7) <= 0x18 || queue_type as i32 >= 0x40 {
+        crate::ntos::ke::bugcheck::bug_check_ex(WORKER_INVALID, 6, item, queue_type as i32 as i64 as u64, 0);
+    }
+    if queue_item.worker_routine.get() <= crate::ntos::mm::memory_map::USER_PROBE_ADDRESS {
+        crate::ntos::ke::bugcheck::bug_check_ex(WORKER_INVALID, 7, item, 0, 0);
+    }
+}
+
+/// ExTryQueueWorkItem(WorkItem, QueueType): valida o item como o
+/// ExQueueWorkItem e o põe na fila se o pool de workers está pronto,
+/// devolvendo TRUE. A fila do OpenNT é drenada pelos pumps do kernel, que
+/// sempre a aceitam (o ExpIsPoolReadyForWork nunca recusa).
+pub fn try_queue_ex_work_item(item: u64, queue_type: u32) -> bool {
+    validate_ex_work_item(item, queue_type);
+    queue_ex_work_item(item, queue_type);
+    true
+}
+
 pub fn pending() -> usize {
     QUEUE.lock().entries.len()
 }

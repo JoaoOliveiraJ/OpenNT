@@ -180,6 +180,33 @@ pub fn unregister_device(handle: u64) {
     }
 }
 
+/// INTERNAL_POWER_ERROR e o subcódigo do PopFxBugCheck de um segundo
+/// registro do vigia de DRIPS.
+const INTERNAL_POWER_ERROR: u32 = 0xA0;
+const DRIPS_WATCHDOG_ALREADY_REGISTERED: u64 = 0x622;
+/// POP_FX_DEVICE.Flags: o vigia inclui os dispositivos filhos.
+const DRIPS_WATCHDOG_INCLUDE_CHILDREN: u32 = 0x8;
+
+/// PoFxRegisterDripsWatchdogCallback(Handle, Callback, IncludeChildDevices,
+/// MatchingDriverObject) (ntoskrnl 19041 rva 0x3cae50): sob a trava do
+/// dispositivo, um segundo registro é INTERNAL_POWER_ERROR (0x622, Handle);
+/// IncludeChildDevices liga o bit 3 de POP_FX_DEVICE.Flags, e o driver e o
+/// callback vão para DripsWatchdogDriverObject e
+/// Callbacks.DripsWatchdogCallback. O motor inerte nunca dispara o vigia.
+pub fn register_drips_watchdog_callback(handle: u64, callback: u64, include_children: bool, driver_object: u64) {
+    let _devices = DEVICES.lock();
+    // SAFETY: o POHANDLE devolvido por `register_device`.
+    let body = unsafe { PopFxDevice::at(handle) };
+    if body.callbacks.drips_watchdog_callback.get() != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(INTERNAL_POWER_ERROR, DRIPS_WATCHDOG_ALREADY_REGISTERED, handle, 0, 0);
+    }
+    if include_children {
+        body.flags.atomic().fetch_or(DRIPS_WATCHDOG_INCLUDE_CHILDREN, core::sync::atomic::Ordering::SeqCst);
+    }
+    body.drips_watchdog_driver_object.set(driver_object);
+    body.callbacks.drips_watchdog_callback.set(callback);
+}
+
 /// PoFxPowerControl(POHANDLE, LPCGUID, In, InSz, Out, OutSz, PSIZE_T): with no
 /// PEP to service the control code, Windows returns STATUS_NOT_IMPLEMENTED.
 pub fn power_control() -> u32 {
