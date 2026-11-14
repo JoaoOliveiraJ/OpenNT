@@ -550,7 +550,7 @@ icone = "plug"
 descricao = "A pilha de rede do Windows (NDIS e TCP/IP) com o miniport Intel PRO/1000 da Microsoft, que atende a placa e1000 emulada pelo QEMU (PCI 8086:100E)."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda. Dos imports do ntoskrnl, faltam 2 ao ndis.sys (ExSubscribeWnfStateChange e NtQuerySystemInformationEx) e 13 ao tcpip.sys; os do netio.sys já estão todos atendidos."
+notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda. Dos imports do ntoskrnl, falta 1 ao ndis.sys (NtQuerySystemInformationEx) e 13 ao tcpip.sys; os do netio.sys já estão todos atendidos."
 
 [[componente]]
 nome = "Arquivos em memória"

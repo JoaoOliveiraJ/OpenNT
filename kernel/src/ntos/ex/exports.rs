@@ -797,7 +797,8 @@ pub mod ex_lookaside_wnf {
     //! ExInitializeLookasideListEx / ExDeleteLookasideListEx e
     //! ExQueryWnfStateData. O lookaside reusa `ex/lookaside.rs`; a consulta WNF
     //! reusa `ex/wnf/service::query`. A inscrição/desinscrição de kernel
-    //! (ExSubscribe/ExUnsubscribeWnfStateChange) entra num grupo próprio quando
+    //! (ExSubscribe/ExUnsubscribeWnfStateChange) fica no grupo
+    //! `ex-wnf-subscription`, depois que
     //! o motor WNF tiver remoção de assinatura.
 
     use crate::ntos::ex::lookaside;
@@ -1231,5 +1232,61 @@ pub mod ex_hard_error {
             ("ExActivationObjectType", activation_type),
             ("ExTimerObjectType", timer_type),
         ],
+    };
+}
+
+pub mod zw_event {
+    //! ZwCreateEvent, ZwSetEvent, ZwResetEvent e ZwClearEvent em KernelMode;
+    //! a lógica mora em `ex/event`.
+
+    use crate::ntos::ex::event;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ZwCreateEvent(EventHandle, DesiredAccess, ObjectAttributes, EventType, InitialState).
+    fn create_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(event::create(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5) & 0xFF != 0)?))
+    }
+    fn set_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(event::set(call.arg(1), call.arg(2))?))
+    }
+    fn reset_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(event::reset(call.arg(1), call.arg(2))?))
+    }
+    fn clear_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(event::clear(call.arg(1))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "zw-event",
+        names: &["ZwCreateEvent", "ZwSetEvent", "ZwResetEvent", "ZwClearEvent"],
+        handlers: &[create_event, set_event, reset_event, clear_event],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_wnf_subscription {
+    //! ExSubscribeWnfStateChange e ExUnsubscribeWnfStateChange: as inscrições
+    //! de kernel do motor WNF (`ex/wnf/service`).
+
+    use crate::ntos::ex::wnf::service as wnf_service;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExSubscribeWnfStateChange(Subscription, StateName, DeliveryOption,
+    /// CurrentChangeStamp, Callback, CallbackContext).
+    fn subscribe(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wnf_service::subscribe_kernel(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, call.arg(5), call.arg(6))?))
+    }
+    fn unsubscribe(call: &Call) -> Result<u64, KernelError> {
+        wnf_service::unsubscribe_kernel(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-wnf-subscription",
+        names: &["ExSubscribeWnfStateChange", "ExUnsubscribeWnfStateChange"],
+        handlers: &[subscribe, unsubscribe],
+        data_exports: &[],
     };
 }

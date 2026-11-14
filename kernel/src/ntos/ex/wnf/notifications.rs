@@ -358,68 +358,88 @@ pub fn detach_name(name: u64) -> Result<(), KernelError> {
     }
 }
 
+/// O que a remoção de um assinante deixa para anunciar depois dos locks.
+struct Removed {
+    name: u64,
+    last_data_subscriber: bool,
+    delivery_completed: bool,
+}
+
+/// Tira a inscrição das listas do nome, do processo e da fila de entrega
+/// (o miolo do ExpWnfDeleteSubscription); exige o lock das inscrições do
+/// processo. O nome volta com uma referência de rundown.
+fn unlink_subscription(pointer: u64, process: u64, context: u64) -> Result<Removed, KernelError> {
+    let system = process::get_system_process();
+    let name = subscription_at(pointer).name_instance.get();
+    let mut removed = Removed { name, last_data_subscriber: false, delivery_completed: false };
+    let mut remove = || -> Result<(), KernelError> {
+        if name != 0 {
+            if !rundown::acquire(name_at(name).run_ref.address())? {
+                return Err(KernelError::new("WNF subscriber references a closing name"));
+            }
+            unlink(subscription_at(pointer).state_subscription_list_entry.address())?;
+            subscription_at(pointer).name_instance.set(0);
+            if subscription_at(pointer).subscribed_event_set.get() & 1 != 0 {
+                removed.last_data_subscriber = change_counter(&name_at(name).data_subscribers_count, -1)? == 0;
+            }
+        }
+        unlink(subscription_at(pointer).process_subscription_list_entry.address())?;
+        locked(process_context_at(context).delivery_pending_list_lock.address(), true, || {
+            let state = subscription_at(pointer).subscription_state.get().0;
+            if state == 1 || (process != system && state != 0) {
+                unlink(subscription_at(pointer).pending_subscription_list_entry.address())?;
+                if name != 0 && subscription_at(pointer).subscribed_event_set.get() & 1 != 0 && (subscription_at(pointer).signaled_event_set.get() | subscription_at(pointer).in_delivery_event_set.get()) & 1 != 0 {
+                    removed.delivery_completed = change_counter(&name_at(name).current_delivery_count, -1)? == 0;
+                }
+            }
+            subscription_at(pointer).process.set(0);
+            Ok(())
+        })
+    };
+    if name != 0 { locked(name_at(name).state_subscription_list_lock.address(), true, remove)? } else { remove()? };
+    Ok(removed)
+}
+
+/// Anuncia as transições da remoção, solta a referência do nome e devolve o
+/// corpo ao pool quando callbacks e consultas devolvem o rundown.
+fn finish_removal(subscription: u64, process: u64, removed: Removed) -> Result<(), KernelError> {
+    let inline = process != process::get_system_process();
+    let name = removed.name;
+    let notified = (|| -> Result<(), KernelError> {
+        if removed.delivery_completed {
+            notify_name(name, 8, true, inline)?;
+        }
+        if removed.last_data_subscriber {
+            notify_name(name, 4, true, inline)?;
+        }
+        Ok(())
+    })();
+    if name != 0 {
+        rundown::release(name_at(name).run_ref.address())?;
+    }
+    notified?;
+    rundown::wait(subscription_at(subscription).run_ref.address())?;
+    let _ = kernel_pool::free(subscription, Some(STATE_TAG));
+    Ok(())
+}
+
 /// Remove o assinante de todas as listas na desmontagem do processo; o
 /// corpo só sai do pool quando callbacks e consultas devolvem o rundown.
 pub fn delete_process_subscriptions(process: u64, context: u64) -> Result<(), KernelError> {
     let head = process_context_at(context).process_subscription_list_head.address();
-    let system = process::get_system_process();
     loop {
-        let mut name = 0u64;
-        let mut last_data_subscriber = false;
-        let mut delivery_completed = false;
+        let mut removed = None;
         let subscription = locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
             let entry = list_entry::at(head).flink.get();
             if entry == head {
                 return Ok(0);
             }
             let pointer = entry - offset_of!(WnfSubscription, process_subscription_list_entry) as u64;
-            name = subscription_at(pointer).name_instance.get();
-            let mut remove = || -> Result<u64, KernelError> {
-                if name != 0 {
-                    if !rundown::acquire(name_at(name).run_ref.address())? {
-                        return Err(KernelError::new("WNF subscriber references a closing name"));
-                    }
-                    unlink(subscription_at(pointer).state_subscription_list_entry.address())?;
-                    subscription_at(pointer).name_instance.set(0);
-                    if subscription_at(pointer).subscribed_event_set.get() & 1 != 0 {
-                        last_data_subscriber = change_counter(&name_at(name).data_subscribers_count, -1)? == 0;
-                    }
-                }
-                unlink(subscription_at(pointer).process_subscription_list_entry.address())?;
-                locked(process_context_at(context).delivery_pending_list_lock.address(), true, || {
-                    let state = subscription_at(pointer).subscription_state.get().0;
-                    if state == 1 || (process != system && state != 0) {
-                        unlink(subscription_at(pointer).pending_subscription_list_entry.address())?;
-                        if name != 0 && subscription_at(pointer).subscribed_event_set.get() & 1 != 0 && (subscription_at(pointer).signaled_event_set.get() | subscription_at(pointer).in_delivery_event_set.get()) & 1 != 0 {
-                            delivery_completed = change_counter(&name_at(name).current_delivery_count, -1)? == 0;
-                        }
-                    }
-                    subscription_at(pointer).process.set(0);
-                    Ok(())
-                })?;
-                Ok(pointer)
-            };
-            if name != 0 { locked(name_at(name).state_subscription_list_lock.address(), true, remove) } else { remove() }
+            removed = Some(unlink_subscription(pointer, process, context)?);
+            Ok(pointer)
         })?;
-        if subscription == 0 {
-            break;
-        }
-        let inline = process != system;
-        let notified = (|| -> Result<(), KernelError> {
-            if delivery_completed {
-                notify_name(name, 8, true, inline)?;
-            }
-            if last_data_subscriber {
-                notify_name(name, 4, true, inline)?;
-            }
-            Ok(())
-        })();
-        if name != 0 {
-            rundown::release(name_at(name).run_ref.address())?;
-        }
-        notified?;
-        rundown::wait(subscription_at(subscription).run_ref.address())?;
-        let _ = kernel_pool::free(subscription, Some(STATE_TAG));
+        let Some(removed) = removed.filter(|_| subscription != 0) else { break };
+        finish_removal(subscription, process, removed)?;
     }
     let event = process_context_at(context).notification_event.get();
     if event != 0 {
@@ -429,6 +449,30 @@ pub fn delete_process_subscriptions(process: u64, context: u64) -> Result<(), Ke
         process_context_at(context).notification_event.set(0);
     }
     Ok(())
+}
+
+/// ExUnsubscribeWnfStateChange: ExpWnfDeleteSubscription de uma inscrição de
+/// kernel (dona: o System). Solta a referência de rundown do ponteiro
+/// devolvido pelo ExSubscribeWnfStateChange e espera os callbacks em curso
+/// antes de liberar o bloco. Uma inscrição já desligada do processo só
+/// devolve a referência.
+pub fn delete_kernel_subscription(subscription: u64) -> Result<(), KernelError> {
+    let process = process::get_system_process();
+    let context = process_at(process).wnf_context.get();
+    let mut removed = None;
+    if context != 0 {
+        locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
+            if subscription_at(subscription).process.get() != 0 {
+                removed = Some(unlink_subscription(subscription, process, context)?);
+            }
+            Ok(())
+        })?;
+    }
+    rundown::release(subscription_at(subscription).run_ref.address())?;
+    match removed {
+        Some(removed) => finish_removal(subscription, process, removed),
+        None => Ok(()),
+    }
 }
 
 /// Versões para o ciclo de vida do namespace (`fn` sem resultado).

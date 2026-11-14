@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1681 && abi_names::GROUP_LAYOUT.len() == 323 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1681 exports em 323 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1687 && abi_names::GROUP_LAYOUT.len() == 325 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1687 exports em 325 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1373,7 +1373,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1681 && exports::export_names().len() == 1681, "ntoskrnl: 323 grupos com os 1681 exports implementados");
+    assert(exports::implemented() == 1687 && exports::export_names().len() == 1687, "ntoskrnl: 325 grupos com os 1687 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11083,6 +11083,127 @@ fn whea_error_source_exports(assert: Assert) {
 }
 
 
+/// ZwCreateEvent/ZwSetEvent/ZwResetEvent/ZwClearEvent em KernelMode e os
+/// exports de dados ExEventObjectType e KiBugCheckData na `.kdata`.
+fn zw_event_exports(assert: Assert) {
+    use crate::ntos::init::exports::{self, signed_status};
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+    use crate::ntos::ob::object_types;
+    let block = guest::alloc_bytes(0x400);
+    let handle = block + 0x300;
+    let object = block + 0x308;
+    let previous = block + 0x310;
+    let second = block + 0x318;
+    let unnamed = at::<nt::ObjectAttributes>(block + 0x340);
+    unnamed.length.set(48);
+    unnamed.attributes.set(0x200);
+    // A célula pública aponta para o OBJECT_TYPE "Event" do Object Manager.
+    let cell = match exports::lookup("ntoskrnl.exe", "ExEventObjectType") {
+        Some(ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    let eat = exports::export_module().ok().and_then(|module| module.exports.exports.get("ExEventObjectType").copied());
+    assert(cell != 0 && eat == Some(cell) && guest::read64(cell) == object_types::event_type().pointer, "zw-event: ExEventObjectType na EAT com o tipo Event real");
+    let bug_check = match exports::lookup("ntoskrnl.exe", "KiBugCheckData") {
+        Some(ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    let bug_check_eat = exports::export_module().ok().and_then(|module| module.exports.exports.get("KiBugCheckData").copied());
+    assert(bug_check != 0 && bug_check_eat == Some(bug_check) && crate::ntos::mm::kernel_data::region("KiBugCheckData").is_ok_and(|(address, size)| address == bug_check && size == 40) && guest::read_bytes(bug_check, 40).iter().all(|&byte| byte == 0), "zw-event: KiBugCheckData[5] na .kdata e na EAT, zerado sem bugcheck");
+    // Evento de notificação sem nome, handle de kernel.
+    let created = call_export("ZwCreateEvent", &[handle, 0x1F0003, block + 0x340, 0, 0]);
+    let event_handle = guest::read64(handle);
+    let referenced = call_export("ObReferenceObjectByHandle", &[event_handle, 2, guest::read64(cell), 0, object, 0]);
+    let event = guest::read64(object);
+    assert(created == Some(0) && event_handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000 && referenced == Some(0) && event != 0 && call_export("KeReadStateEvent", &[event]) == Some(0), "zw-event: ZwCreateEvent cria o KEVENT nao sinalizado com handle de kernel");
+    guest::write32(previous, 0xFFFF);
+    let set = call_export("ZwSetEvent", &[event_handle, previous]);
+    assert(set == Some(0) && guest::read32(previous) == 0 && call_export("KeReadStateEvent", &[event]) == Some(1), "zw-event: ZwSetEvent sinaliza e devolve o estado anterior 0");
+    let again = call_export("ZwSetEvent", &[event_handle, previous]);
+    assert(again == Some(0) && guest::read32(previous) == 1, "zw-event: segundo ZwSetEvent devolve 1");
+    let reset = call_export("ZwResetEvent", &[event_handle, previous]);
+    assert(reset == Some(0) && guest::read32(previous) == 1 && call_export("KeReadStateEvent", &[event]) == Some(0), "zw-event: ZwResetEvent zera e devolve 1");
+    let _ = call_export("ZwSetEvent", &[event_handle, 0]);
+    let cleared = call_export("ZwClearEvent", &[event_handle]);
+    assert(cleared == Some(0) && call_export("KeReadStateEvent", &[event]) == Some(0), "zw-event: ZwClearEvent zera o evento");
+    assert(call_export("ZwSetEvent", &[0xFFFF_FFFF_8000_7FF0, 0]) == Some(signed_status(0xC000_0008)) && call_export("ZwClearEvent", &[0xFFFF_FFFF_8000_7FF0]) == Some(signed_status(0xC000_0008)), "zw-event: handle invalido = STATUS_INVALID_HANDLE");
+    assert(call_export("ZwCreateEvent", &[second, 0x1F0003, block + 0x340, 2, 0]) == Some(signed_status(0xC000_000D)), "zw-event: tipo 2 = STATUS_INVALID_PARAMETER");
+    let _ = call_export("ObfDereferenceObject", &[event]);
+    assert(call_export("ZwClose", &[event_handle]) == Some(0), "zw-event: ZwClose do evento sem nome");
+    // Evento nomeado de sincronização, sinalizado; OBJ_OPENIF reabre o mesmo.
+    let named = object_attributes_for(block, "\\KernelObjects\\OpenNTZwCreateEvent", 0x200);
+    let first = call_export("ZwCreateEvent", &[handle, 0x1F0003, named, 1, 1]);
+    let first_handle = guest::read64(handle);
+    let collision = call_export("ZwCreateEvent", &[second, 0x1F0003, named, 1, 0]);
+    at::<nt::ObjectAttributes>(named).attributes.set(0x280);
+    let reopened = call_export("ZwCreateEvent", &[second, 0x1F0003, named, 1, 0]);
+    let second_handle = guest::read64(second);
+    let first_object = call_export("ObReferenceObjectByHandle", &[first_handle, 0, 0, 0, object, 0]).map(|_| guest::read64(object)).unwrap_or(0);
+    let second_object = call_export("ObReferenceObjectByHandle", &[second_handle, 0, 0, 0, previous, 0]).map(|_| guest::read64(previous)).unwrap_or(1);
+    assert(first == Some(0) && collision == Some(signed_status(0xC000_0035)) && reopened == Some(0x4000_0000) && first_object == second_object && call_export("KeReadStateEvent", &[first_object]) == Some(1), "zw-event: nome existente colide sem OBJ_OPENIF e reabre o mesmo KEVENT com ele");
+    let _ = call_export("ObfDereferenceObject", &[first_object]);
+    let _ = call_export("ObfDereferenceObject", &[second_object]);
+    assert(call_export("ZwClose", &[second_handle]) == Some(0) && call_export("ZwClose", &[first_handle]) == Some(0) && crate::ntos::ob::object_manager::lookup("\\KernelObjects\\OpenNTZwCreateEvent").is_none(), "zw-event: fechar os handles libera o evento e o nome");
+    guest::free_bytes(block);
+}
+
+static EX_WNF_CALLBACK: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// PWNF_CALLBACK(Subscription, StateName, DeliveredEvents, ChangeStamp, TypeId, Context).
+extern "win64" fn ex_wnf_test_callback(subscription: u64, _name: u64, mask: u64, stamp: u64, _type_identifier: u64, context: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    EX_WNF_CALLBACK[0].fetch_add(1, Ordering::SeqCst);
+    EX_WNF_CALLBACK[1].store(mask, Ordering::SeqCst);
+    EX_WNF_CALLBACK[2].store(stamp, Ordering::SeqCst);
+    EX_WNF_CALLBACK[3].store(subscription ^ context, Ordering::SeqCst);
+    0
+}
+
+/// ExSubscribeWnfStateChange/ExUnsubscribeWnfStateChange: inscrição de
+/// kernel com callback pelo work item, entrega das atualizações e remoção.
+fn ex_wnf_subscription_exports(assert: Assert) {
+    use core::sync::atomic::Ordering;
+    use crate::ntos::ex::wnf::service as wnf_service;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::work_items;
+    for slot in &EX_WNF_CALLBACK {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let storage = guest::alloc_bytes(0x100);
+    let name = storage;
+    let guid = storage + 0x10;
+    let data = storage + 0x20;
+    let output = storage + 0x30;
+    let invalid = storage + 0x38;
+    // Nome bem conhecido com TypeId (o mesmo da fase 5): uma versão publicada.
+    guest::write64(name, 0x0280_032E_A3BC_0875);
+    guest::write64(invalid, 0x0280_032E_A3BC_0876);
+    guest::write_bytes(guid, &[0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E]);
+    guest::write32(data, 0x0BAD_CAFE);
+    let published = wnf_service::update(name, data, 4, guid, 0, 0, false);
+    let callback = ex_wnf_test_callback as extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    guest::write64(output, 0x5555);
+    assert(call_export("ExSubscribeWnfStateChange", &[output, name, 0x20, 0, callback, 0]) == Some(signed_status(0xC000_000D)) && call_export("ExSubscribeWnfStateChange", &[output, invalid, 1, 0, callback, 0]) == Some(signed_status(0xC000_000D)) && guest::read64(output) == 0x5555, "ex-wnf-subscription: mascara alem de 0x1F e versao de nome invalida recusadas sem gravar a saida");
+    let subscribed = call_export("ExSubscribeWnfStateChange", &[output, name, 1, 0, callback, 0xC0DE]);
+    let subscription = guest::read64(output);
+    let block = at::<nt::WnfSubscription>(subscription);
+    assert(matches!(published, Ok(0)) && subscribed == Some(0) && subscription != 0x5555 && block.subscription_id.get() == subscription && block.callback_routine.get() == callback && block.callback_context.get() == 0xC0DE && block.process.get() == crate::ntos::ps::process::get_system_process() && block.subscribed_event_set.get() == 1, "ex-wnf-subscription: inscricao do System com callback, contexto e id igual ao ponteiro");
+    // Carimbo 0 com dados publicados: a notificação inicial entrega os dados.
+    work_items::run_queue();
+    let stamp = EX_WNF_CALLBACK[2].load(Ordering::SeqCst);
+    assert(EX_WNF_CALLBACK[0].load(Ordering::SeqCst) == 1 && EX_WNF_CALLBACK[1].load(Ordering::SeqCst) == 1 && EX_WNF_CALLBACK[3].load(Ordering::SeqCst) == subscription ^ 0xC0DE && block.current_change_stamp.get() as u64 == stamp && stamp != 0, "ex-wnf-subscription: dados iniciais entregues pelo work item");
+    let updated = wnf_service::update(name, data, 4, guid, 0, 0, false);
+    work_items::run_queue();
+    assert(matches!(updated, Ok(0)) && EX_WNF_CALLBACK[0].load(Ordering::SeqCst) == 2 && EX_WNF_CALLBACK[2].load(Ordering::SeqCst) == stamp + 1, "ex-wnf-subscription: atualizacao entregue com o carimbo novo");
+    assert(call_export("ExUnsubscribeWnfStateChange", &[subscription]).is_some(), "ex-wnf-subscription: ExUnsubscribeWnfStateChange");
+    let after = wnf_service::update(name, data, 4, guid, 0, 0, false);
+    work_items::run_queue();
+    assert(matches!(after, Ok(0)) && EX_WNF_CALLBACK[0].load(Ordering::SeqCst) == 2, "ex-wnf-subscription: sem entrega depois da remocao");
+    // As fases seguintes partem do nome sem instância, como a fase 5 deixa.
+    assert(wnf_service::shutdown().is_ok() && !wnf_service::exists(), "ex-wnf-subscription: servico WNF encerrado sem inscricoes pendentes");
+    guest::free_bytes(storage);
+}
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -11278,6 +11399,8 @@ pub fn run(assert: Assert) {
     vf_device_verification_exports(assert);
     vsl_secure_pci_exports(assert);
     whea_error_source_exports(assert);
+    zw_event_exports(assert);
+    ex_wnf_subscription_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

@@ -173,6 +173,49 @@ pub fn subscribe_user(state_name: u64, change_stamp: u32, event_mask: u32, ident
     crate::ntos::ex::wnf::user::subscribe(state_name, change_stamp, event_mask, identifier, ensure_service)
 }
 
+/// ExSubscribeWnfStateChange(Subscription, StateName, DeliveryOption,
+/// CurrentChangeStamp, Callback, CallbackContext): a inscrição de kernel do
+/// System, dentro de uma região crítica. O nome é capturado e validado antes
+/// da máscara (só os bits 0..4); o PWNF_SUBSCRIPTION só é gravado no sucesso.
+pub fn subscribe_kernel(subscription_output: u64, state_name: u64, delivery_option: u32, change_stamp: u32, callback: u64, context: u64) -> Result<u32, KernelError> {
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        // SAFETY: PCWNF_STATE_NAME de um chamador de modo kernel.
+        let name = wnf_name::decode(unsafe { Field::<u64>::at(state_name) }.get());
+        if name.status != 0 {
+            return Ok(name.status);
+        }
+        if delivery_option & !0x1F != 0 {
+            return Ok(0xC000_000D);
+        }
+        if !ensure_service()? {
+            return Ok(0xC000_009A);
+        }
+        match crate::ntos::ex::wnf::subscriptions::subscribe_kernel(&name, change_stamp, delivery_option, callback, context)? {
+            Ok(subscription) => {
+                // SAFETY: PWNF_SUBSCRIPTION* de saída do chamador de modo kernel.
+                unsafe { Field::<u64>::at(subscription_output) }.set(subscription);
+                Ok(0)
+            }
+            Err(status) => Ok(status),
+        }
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
+/// ExUnsubscribeWnfStateChange(Subscription): remove a inscrição de kernel e
+/// libera o bloco depois dos callbacks em curso.
+pub fn unsubscribe_kernel(subscription: u64) -> Result<(), KernelError> {
+    critical_region::enter_critical()?;
+    let result = notifications::delete_kernel_subscription(subscription);
+    let left = critical_region::leave_critical();
+    result?;
+    left
+}
+
 /// Encerra o serviço (os chamadores já devolveram seus empréstimos).
 pub fn shutdown() -> Result<(), KernelError> {
     let mut service = SERVICE.lock();

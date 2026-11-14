@@ -201,6 +201,127 @@ pub fn subscribe_name(name: u64, process: u64, change_stamp: u32, event_mask: u3
     }
 }
 
+/// Inscrição de kernel no nome (o ramo KernelMode do
+/// ExpWnfSubscribeNameInstance): sempre um bloco novo do System, com o
+/// callback e o contexto, identificador igual ao próprio ponteiro e uma
+/// segunda referência de rundown que pertence ao PWNF_SUBSCRIPTION devolvido
+/// (solta pelo ExUnsubscribeWnfStateChange).
+fn subscribe_kernel_name(name: u64, change_stamp: u32, event_mask: u32, callback: u64, context: u64) -> Result<Result<Subscribed, u32>, KernelError> {
+    let process = process::get_system_process();
+    let process_context = process_at(process).wnf_context.get();
+    if process_context == 0 {
+        return Err(KernelError::new("System sem contexto WNF apos resolucao do escopo"));
+    }
+    let Ok(candidate) = pool_allocation::allocate_tagged(1, SUBSCRIPTION_SIZE, SUBSCRIPTION_TAG) else { return Ok(Err(STATUS_INSUFFICIENT_RESOURCES)) };
+    guest::write_bytes(candidate, &[0u8; SUBSCRIPTION_SIZE as usize]);
+    let subscription = subscription_at(candidate);
+    subscription.header.node_type_code.set(0x905);
+    subscription.header.node_byte_size.set(SUBSCRIPTION_SIZE as u16);
+    subscription.callback_routine.set(callback);
+    subscription.callback_context.set(context);
+    subscription.current_change_stamp.set(change_stamp);
+    subscription.subscribed_event_set.set(event_mask);
+    subscription.state_name.bitfield_0.set(name_at(name).state_name.bitfield_0.get());
+    let result = locked(process_context_at(process_context).process_subscription_list_lock.address(), true, || {
+        locked(name_at(name).state_subscription_list_lock.address(), true, || {
+            if name_at(name).scope_instance.get() == 0 {
+                return Ok(Err(STATUS_NOT_FOUND));
+            }
+            subscription.process.set(process);
+            subscription.name_instance.set(name);
+            subscription.subscription_id.set(candidate);
+            // A referência da operação e a do ponteiro devolvido.
+            if !rundown::acquire(subscription.run_ref.address())? || !rundown::acquire(subscription.run_ref.address())? {
+                return Err(KernelError::new("rundown inicial WNF invalido"));
+            }
+            append(process_context_at(process_context).process_subscription_list_head.address(), subscription.process_subscription_list_entry.address())?;
+            append(name_at(name).state_subscription_list_head.address(), subscription.state_subscription_list_entry.address())?;
+            let reader_transition = if event_mask & 1 != 0 && change_counter(&name_at(name).data_subscribers_count, 1)? == 1 { 1 } else { 0 };
+            Ok(Ok(Subscribed { pointer: candidate, identifier: candidate, reader_transition, pending_data_removed: false, notification_performed: false }))
+        })
+    });
+    match result {
+        Ok(Ok(subscribed)) => {
+            // As transições dos contadores vão pelo work item (não inline).
+            if subscribed.reader_transition > 0 {
+                notifications::notify_name(name, 2, true, false)?;
+                return Ok(Ok(Subscribed { notification_performed: true, ..subscribed }));
+            }
+            Ok(Ok(subscribed))
+        }
+        other => {
+            let _ = kernel_pool::free(candidate, Some(SUBSCRIPTION_TAG));
+            other
+        }
+    }
+}
+
+/// ExSubscribeWnfStateChange com o nome já decodificado
+/// (ExpWnfSubscribeWnfStateChange em KernelMode): escopo do System, nome
+/// criado pela definição permanente se preciso, sem verificação de acesso;
+/// a notificação inicial descreve o estado real e vai pelo work item. Devolve
+/// o PWNF_SUBSCRIPTION.
+pub fn subscribe_kernel(name: &DecodedName, change_stamp: u32, event_mask: u32, callback: u64, context: u64) -> Result<Result<u64, u32>, KernelError> {
+    let process = process::get_system_process();
+    let scope = match namespace::resolve_kernel_scope(process, name.scope, 0)? {
+        Ok(scope) => scope,
+        Err(status) => return Ok(Err(status)),
+    };
+    if namespace::ensure_process_context(process)? == 0 {
+        namespace::release_scope(scope)?;
+        return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+    }
+    let mut state = None;
+    let mut subscription = 0u64;
+    let result = (|| -> Result<Result<u64, u32>, KernelError> {
+        let current = match namespace::lookup_name(scope, name.decoded_name)? {
+            Err(STATUS_NOT_FOUND) => {
+                if name.lifetime == 3 {
+                    return Ok(Err(STATUS_NOT_FOUND));
+                }
+                let definition = match namespace::lookup_definition(name.decoded_name)? {
+                    Ok(definition) => definition,
+                    Err(status) => return Ok(Err(status)),
+                };
+                let created = namespace::create_name(scope, name.decoded_name, NameDefinition::from(&definition), process)?;
+                definition.release();
+                match created {
+                    Ok(created) => created,
+                    Err(status) => return Ok(Err(status)),
+                }
+            }
+            Err(status) => return Ok(Err(status)),
+            Ok(found) => found,
+        };
+        state = Some(current);
+        let subscribed = match subscribe_kernel_name(current.pointer, change_stamp, event_mask, callback, context)? {
+            Ok(subscribed) => subscribed,
+            Err(status) => return Ok(Err(status)),
+        };
+        subscription = subscribed.pointer;
+        let mut initial = if change_stamp != current.change_stamp() && current.data_pointer() != 0 { 1 } else { 0 };
+        if name_at(current.pointer).current_delivery_count.get() == 0 {
+            initial |= 8;
+        }
+        if !subscribed.notification_performed {
+            initial |= if name_at(current.pointer).data_subscribers_count.get() != 0 { 2 } else { 4 };
+        }
+        initial &= event_mask;
+        if initial != 0 {
+            notifications::notify_subscription(current.pointer, subscription, initial, false)?;
+        }
+        Ok(Ok(subscribed.pointer))
+    })();
+    if subscription != 0 {
+        rundown::release(subscription_at(subscription).run_ref.address())?;
+    }
+    if let Some(state) = state {
+        namespace::release_name(&state)?;
+    }
+    namespace::release_scope(scope)?;
+    result
+}
+
 /// NtSubscribeWnfStateChange com o nome já capturado: resolve o escopo do
 /// usuário, cria o nome pela definição se preciso, confere o acesso e
 /// publica a notificação inicial que descreve o estado real.

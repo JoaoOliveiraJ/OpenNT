@@ -7,14 +7,14 @@
 //! código STOP e os quatro parâmetros e para a CPU.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::bugcheck_reason;
 use crate::hal::amd64::native_call;
 use crate::hal::cpu;
 use crate::ntos::inc::types::extra_ke_misc::KbugcheckCallbackRecord;
 use crate::ntos::inc::types::{Field, NtStruct};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_data;
 use crate::ntos::po::black_box;
 use crate::rtl::SpinLock;
 
@@ -37,9 +37,6 @@ fn callback_record(record: u64) -> &'static KbugcheckCallbackRecord {
     // SAFETY: o registro pertence ao driver enquanto estiver inserido.
     unsafe { KbugcheckCallbackRecord::at(record) }
 }
-/// KiBugCheckData: código e quatro parâmetros do último bugcheck.
-static BUG_CHECK_DATA: AtomicU64 = AtomicU64::new(0);
-
 /// Instalado por [`init`].
 pub fn set_handler(handler: fn(u32, u64, u64, u64, u64) -> !) {
     HANDLER.store(handler as usize, Ordering::Release);
@@ -62,20 +59,10 @@ pub fn bug_check_ex(code: u32, first: u64, second: u64, third: u64, fourth: u64)
     cpu::halt_forever()
 }
 
-/// KiBugCheckData: célula de 5 × 8 bytes alocada no primeiro acesso.
+/// KiBugCheckData: o export de dados da `.kdata`, ULONG_PTR[5] (o EAT e a
+/// IAT dos drivers recebem o mesmo endereço).
 pub fn bug_check_data() -> u64 {
-    let current = BUG_CHECK_DATA.load(Ordering::Acquire);
-    if current != 0 {
-        return current;
-    }
-    let pointer = guest::alloc_bytes((BUG_CHECK_DATA_COUNT * 8) as u64);
-    match BUG_CHECK_DATA.compare_exchange(0, pointer, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => pointer,
-        Err(existing) => {
-            guest::free_bytes(pointer);
-            existing
-        }
-    }
+    kernel_data::required_address("KiBugCheckData")
 }
 
 /// Parada fatal comum (KeBugCheckEx): grava KiBugCheckData, roda os
@@ -137,7 +124,7 @@ pub fn deregister_callback(record: u64) -> bool {
     true
 }
 
-/// Aloca KiBugCheckData e liga o bugcheck interno do kernel a
+/// Confere a célula de KiBugCheckData e liga o bugcheck interno do kernel a
 /// [`raise_bug_check`].
 pub fn init() {
     bug_check_data();

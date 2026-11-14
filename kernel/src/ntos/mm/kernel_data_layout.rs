@@ -122,6 +122,12 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     pointer("ExActivationObjectType"),
     pointer("ExTimerObjectType"),
     pointer("PsJobType"),
+    // POBJECT_TYPE do evento; a célula recebe o tipo "Event" do Object
+    // Manager na primeira resolução (`ex/event`).
+    pointer("ExEventObjectType"),
+    // ULONG_PTR KiBugCheckData[5]: código e os quatro parâmetros do STOP,
+    // gravados pelo KeBugCheckEx (`ke/bugcheck`).
+    KernelDataEntry { name: "KiBugCheckData", size: 8, storage_size: 5 * 8, alignment: 8, initial: ZERO8 },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.
