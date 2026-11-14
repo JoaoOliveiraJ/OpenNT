@@ -522,7 +522,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs", "kernel/src/ntos/mm/sysload.rs"]
 testes = ["drivers"]
 fase = "6"
-notas = "Carregam no boot (o classpnp.sys como biblioteca de import do disk.sys, com DllInitialize) e o DriverEntry do disk.sys retorna sucesso: sc query disk mostra RUNNING. Com --storage=real (teste storage) o PnP instala os dois discos IDE pelo disk.inf (GenDisk) com o filtro de classe partmgr.sys do c_diskdrive.inf; o disk.sys cria \\Device\\Harddisk0\\DR0 e \\Device\\Harddisk1\\DR1 e as leituras do teste passam por ele, pelo classpnp.sys e pelo ataport.sys até o disco."
+notas = "Carregam no boot (o classpnp.sys como biblioteca de import do disk.sys, com DllInitialize) e o DriverEntry do disk.sys retorna sucesso: sc query disk mostra RUNNING. Com --storage=real (teste storage) o PnP instala os dois discos IDE pelo disk.inf (GenDisk) com o filtro de classe partmgr.sys do c_diskdrive.inf; o disk.sys cria \\Device\\Harddisk0\\DR0 e \\Device\\Harddisk1\\DR1, os dois discos terminam o START (o partmgr.sys lê o setor 0 e grava a assinatura de disco MBR num disco que não tem nenhuma) e as leituras do teste passam pelo disk.sys, pelo classpnp.sys e pelo ataport.sys até o disco. Os volumes (\\Device\\HarddiskVolumeN do volmgr.sys) ainda não aparecem."
 
 [[componente]]
 nome = "mountmgr.sys"
@@ -533,7 +533,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/cm/service/system_drivers.rs"]
 testes = ["drivers"]
 fase = "6"
-notas = "Carrega no boot e o DriverEntry retorna sucesso (lê NoAutoMount do Registro; sc query mountmgr mostra RUNNING). Nenhum volume chega a ele: as letras C: e D: são links que o próprio kernel cria para os seus sistemas de arquivos."
+notas = "Carrega no boot e o DriverEntry retorna sucesso (lê NoAutoMount do Registro; sc query mountmgr mostra RUNNING). Nenhum volume chega a ele: as letras C: e D: são links que o próprio kernel cria para os seus sistemas de arquivos. Com --storage=real o volmgr.sys carrega e relata o próprio dispositivo raiz (ROOT\\VOLMGR\\0000), mas ainda não cria volumes para o mountmgr."
 
 [[componente]]
 nome = "cng.sys"

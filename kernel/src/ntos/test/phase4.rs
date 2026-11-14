@@ -114,7 +114,8 @@ fn power_manager(assert: Assert) {
     let packet = crate::ntos::io::irp_builder::allocate_irp(2);
     let irp = unsafe { Irp::at(packet) };
     let status = po::call_driver_down_the_stack(device, packet);
-    let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    // O slot de cima é o do primeiro driver (o IofCallDriver gravou o dispositivo nele).
+    let location = unsafe { IoStackLocation::at(crate::ntos::io::irp_builder::first_stack_location(packet, 2)) };
     assert(status == 0xC000_0010 && irp.io_status.status.get() == 0xC000_0010u32 as i32 && location.device_object.get() == device, "power: PoCallDriver desce pelo IofCallDriver");
     guest::free_bytes(packet);
     guest::free_bytes(driver);

@@ -3015,6 +3015,19 @@ fn rtl_group_exports(assert: Assert) {
     let queried = call("RtlQueryRegistryValues", &[1, relative, text_table, 0, 0]);
     let unicode = at::<nt::UnicodeString>(string);
     assert(written == 0 && queried == 0 && unicode.length.get() == 6 && unicode.maximum_length.get() == 8 && unicode.buffer.get() != 0 && guest_strings::read_unicode_string(string) == "abc", "rtl: RtlQueryRegistryValues DIRECT de REG_SZ relativo a Services");
+    // Default REG_SZ com DefaultLength 0 (o KeyboardDeviceBaseName do
+    // kbdclass.sys): o tamanho vem do texto, no buffer do próprio driver.
+    let own = guest::alloc_bytes(0x20);
+    unicode.buffer.set(own);
+    unicode.length.set(0);
+    unicode.maximum_length.set(0x20);
+    text_entry.name.set(missing_name);
+    text_entry.default_type.set(1);
+    text_entry.default_data.set(text_data);
+    text_entry.default_length.set(0);
+    let defaulted_text = call("RtlQueryRegistryValues", &[1, relative, text_table, 0, 0]);
+    assert(defaulted_text == 0 && unicode.buffer.get() == own && unicode.length.get() == 6 && guest_strings::read_unicode_string(string) == "abc", "rtl: RtlQueryRegistryValues default REG_SZ com DefaultLength 0");
+    guest::free_bytes(own);
     for buffer in [text_name, text_data, string, text_table] {
         guest::free_bytes(buffer);
     }

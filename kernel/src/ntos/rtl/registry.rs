@@ -109,7 +109,26 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         let entry = queried.and_then(|(_, value)| value);
         let (value_type, value_bytes) = match &entry {
             Some(value) => (value.value_type, Some(value.data.clone())),
-            None if default_type != 0 => (default_type, Some(guest::read_bytes(default_data, default_length as usize))),
+            None if default_type != 0 => {
+                // DefaultLength 0 num default de texto: o tamanho vem do
+                // próprio texto com o NUL (o NUL duplo num REG_MULTI_SZ).
+                let length = match default_type {
+                    1 | 2 if default_length == 0 && default_data != 0 => (guest_strings::read_wide_string(default_data).encode_utf16().count() + 1) * 2,
+                    7 if default_length == 0 && default_data != 0 => {
+                        let mut cursor = default_data;
+                        loop {
+                            let units = guest_strings::read_wide_string(cursor).encode_utf16().count() as u64;
+                            cursor += (units + 1) * 2;
+                            if units == 0 {
+                                break;
+                            }
+                        }
+                        (cursor - default_data) as usize
+                    }
+                    _ => default_length as usize,
+                };
+                (default_type, Some(guest::read_bytes(default_data, length)))
+            }
             None => (0, None),
         };
         debug_print!("[rtl]   [{}] \"{}\" flags=0x{:x} routine=0x{:x} -> {}", index, value_name, flags, routine, if entry.is_some() { "valor" } else if value_bytes.is_some() { "default" } else { "ausente" });
