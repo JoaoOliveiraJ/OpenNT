@@ -23,6 +23,9 @@ use crate::ntos::rtl::guest_strings;
 use crate::ntos::inc::field::Field;
 use crate::ntos::inc::types::{DeviceObject, DevobjExtension, DriverObject, NtStruct};
 
+const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+
 /// FDO → PDO registrado no attach (IoGetDeviceProperty acha o PDO de hardware).
 /// IO_TYPE_DEVICE e IO_TYPE_DEVICE_OBJECT_EXTENSION.
 const IO_TYPE_DEVICE: i16 = 3;
@@ -147,7 +150,22 @@ pub fn create_device(driver: u64, extension_size: u32, name_pointer: u64, device
     let driver_node = lifecycle::node_by_driver_object(driver).or_else(|| lifecycle::current_driver().and_then(lifecycle::node_by_driver_object));
     if let Some(driver_node) = driver_node {
         let parts: Vec<&str> = short_name.split('\\').collect();
-        let created = if parts.len() == 1 {
+        let created = if let Some(rest) = short_name.strip_prefix('\\') {
+            // Caminho absoluto fora de \Device (os reconhecedores em
+            // \FileSystem): o diretório pai precisa existir, como no
+            // ObInsertObject do IoCreateDevice.
+            let (directory, leaf) = match rest.rfind('\\') {
+                Some(split) => (format!("\\{}", &rest[..split]), &rest[split + 1..]),
+                None => (String::from("\\"), rest),
+            };
+            if leaf.is_empty() {
+                Err(KernelError::with_status("device name without a leaf", STATUS_OBJECT_NAME_INVALID))
+            } else if object_manager::lookup(&directory).is_none() {
+                Err(KernelError::with_status("device directory absent", STATUS_OBJECT_PATH_NOT_FOUND))
+            } else {
+                object_manager::create_object(&directory, leaf, "Device", Some(object_manager::ObjectData::pointer(page)))
+            }
+        } else if parts.len() == 1 {
             object_manager::create_object("\\Device", &short_name, "Device", Some(object_manager::ObjectData::pointer(page)))
         } else {
             let directory = format!("\\Device\\{}", parts[..parts.len() - 1].join("\\"));
@@ -196,7 +214,9 @@ fn unlink_device(device: u64) {
 /// Devolve o armazenamento depois que o dono autoriza a destruição.
 fn destroy_device(device: u64) {
     if let Some(node) = find_device_node_by_pointer(device) {
-        object_manager::unlink(&format!("\\Device\\{}", device_name(node)));
+        if let Some(path) = object_manager::path_of(node) {
+            object_manager::unlink(&path);
+        }
         io_manager::unregister_device(node);
     }
     PHYSICAL_BY_ATTACHED.lock().remove(&device);

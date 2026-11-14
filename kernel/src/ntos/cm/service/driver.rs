@@ -128,10 +128,11 @@ fn current_status(configuration: &Configuration) -> ServiceStatus {
     result
 }
 
-/// Serviço instalado do tipo kernel driver ou file-system driver.
+/// Serviço instalado do tipo kernel driver, file-system driver ou
+/// reconhecedor de file system.
 fn require_driver_configuration(name: &str) -> Result<Configuration, DriverServiceError> {
     let Some(configuration) = service_database::read(name)? else { return fail(1060, "driver service absent") };
-    if ![1, 2].contains(&configuration.service_type) {
+    if !service_database::DRIVER_TYPES.contains(&configuration.service_type) {
         return fail(50, "service is not a kernel driver");
     }
     Ok(configuration)

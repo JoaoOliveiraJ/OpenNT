@@ -133,9 +133,13 @@ pub fn forget_completion(irp: u64) {
     COMPLETION_OBSERVERS.lock().remove(&irp);
 }
 
-/// Cria `\Driver` e registra o despacho de power IRPs no Power Manager.
+/// Cria `\Driver`, `\FileSystem` e `\FileSystem\Filters` (os diretórios
+/// raiz do IopCreateRootDirectories) e registra o despacho de power IRPs no
+/// Power Manager.
 pub fn init() -> Result<(), KernelError> {
     object_manager::create_directory("\\Driver")?;
+    object_manager::create_directory("\\FileSystem")?;
+    object_manager::create_directory("\\FileSystem\\Filters")?;
     power_manager::register_power_irp_dispatcher(dispatch_native_power_irp);
     // IoTimers vencidos no laço ocioso.
     dispatcher::register_completion_pump(super::threads::io_timer::check_io_timers);

@@ -149,6 +149,11 @@ pub fn kmain() -> ! {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
 
+    // O driver iniciado, usado por um processo de teste (null, beep, fs_rec).
+    if !boot_config::START_DRIVER.is_empty() {
+        crate::ntos::test::boot_drivers::after_start(boot_config::START_DRIVER);
+    }
+
     if boot_config::KERNEL_TEST_SCOPE != "none" {
         crate::ntos::test::self_test::run();
     }

@@ -16,6 +16,9 @@ pub const ROOT: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services
 pub const STOPPED: u32 = 1;
 pub const START_PENDING: u32 = 2;
 pub const RUNNING: u32 = 4;
+/// SERVICE_KERNEL_DRIVER, SERVICE_FILE_SYSTEM_DRIVER e
+/// SERVICE_RECOGNIZER_DRIVER (o tipo do Fs_Rec).
+pub const DRIVER_TYPES: [u32; 3] = [1, 2, 8];
 
 /// Falha com o código Win32 do gerenciador, ou erro do kernel.
 #[derive(Debug)]
@@ -150,7 +153,7 @@ fn decode_integer_value(value: Option<&Value>) -> ServiceResult<u32> {
 /// LocalSystem é admitida.
 fn validate(configuration: Configuration) -> ServiceResult<Configuration> {
     service_key_path(&configuration.name)?;
-    if ![1, 2, 16, 32].contains(&configuration.service_type) || configuration.start > 4 || configuration.error_control > 3 || (configuration.service_type >= 16 && configuration.start < 2) {
+    if !(DRIVER_TYPES.contains(&configuration.service_type) || [16, 32].contains(&configuration.service_type)) || configuration.start > 4 || configuration.error_control > 3 || (configuration.service_type >= 16 && configuration.start < 2) {
         return fail(87, "invalid service configuration");
     }
     if configuration.image_path.is_empty() || configuration.image_path.contains('\0') || configuration.display_name.encode_utf16().count() > 256 || configuration.display_name.contains('\0') {
@@ -192,10 +195,10 @@ pub fn read(name: &str) -> ServiceResult<Option<Configuration>> {
         };
         let service_type = decode_integer_value(value("Type").as_ref())?;
         let image = value("ImagePath");
-        // Driver sem ImagePath: o I/O Manager carrega
-        // \SystemRoot\System32\Drivers\<serviço>.sys (o caso do Ntfs).
+        // Driver sem ImagePath (Ntfs, fastfat, Null, Beep, Fs_Rec): o I/O Manager carrega
+        // \SystemRoot\System32\Drivers\<serviço>.sys, como o IopLoadDriver.
         let image_path = match image {
-            None if [1, 2].contains(&service_type) => alloc::format!("\\SystemRoot\\System32\\Drivers\\{name}.sys"),
+            None if DRIVER_TYPES.contains(&service_type) => alloc::format!("\\SystemRoot\\System32\\Drivers\\{name}.sys"),
             _ => decode_string_value(image.as_ref())?,
         };
         validate(Configuration {

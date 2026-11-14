@@ -1,7 +1,10 @@
-//! READ/WRITE bufferizados de dispositivos.
+//! READ/WRITE de dispositivos: bufferizados (DO_BUFFERED_IO) e, sem
+//! DO_BUFFERED_IO nem DO_DIRECT_IO, "neither" (o IRP leva o buffer de
+//! usuário em Irp->UserBuffer, sem SystemBuffer, como o NtReadFile/
+//! NtWriteFile do NT; o driver o usa no contexto de quem pediu).
 //!
-//! IRPs nativos reais, conclusão e posse: a conclusão do driver nunca
-//! escreve direto num buffer de usuário não fixado.
+//! IRPs nativos reais, conclusão e posse: no caminho bufferizado a conclusão
+//! do driver nunca escreve direto num buffer de usuário não fixado.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -47,6 +50,13 @@ struct Request {
 
 static PENDING: SpinLock<Vec<Arc<Request>>> = SpinLock::new(Vec::new());
 
+/// DEVICE_OBJECT.Flags.
+const DO_BUFFERED_IO: u32 = 0x4;
+const DO_DIRECT_IO: u32 = 0x10;
+/// IRP.Flags.
+const IRP_BUFFERED_IO: u32 = 0x10;
+const IRP_INPUT_OPERATION: u32 = 0x40;
+
 fn device(entry: &UserHandle) -> Option<&UserDevice> {
     entry.downcast::<UserDevice>()
 }
@@ -85,7 +95,9 @@ fn finish(request: &Arc<Request>) {
     PENDING.lock().retain(|candidate| !Arc::ptr_eq(candidate, request));
     io_manager::forget_completion(request.irp);
     guest::free_bytes(request.irp);
-    guest::free_bytes(request.buffer);
+    if request.buffer != 0 {
+        guest::free_bytes(request.buffer);
+    }
     if let Some(event) = &request.event {
         events::release(event);
     }
@@ -101,7 +113,7 @@ fn copy_out(request: &Request, status: u32, count: u64) -> (u32, u64) {
     if !state::probe_user_write(request.iosb, 16) || (!request.write && count != 0 && !state::probe_user_write(request.user_buffer, count)) {
         return (0xC000_0005, 0);
     }
-    if !request.write && count != 0 && status >> 30 != 3 {
+    if !request.write && count != 0 && status >> 30 != 3 && request.buffer != 0 {
         // SystemBuffer (pool do kernel) para o buffer de usuário sondado.
         let bytes = guest::read_bytes(request.buffer, count as usize);
         let _ = state::write_user_bytes(request.user_buffer, &bytes);
@@ -119,8 +131,9 @@ pub fn pump() {
     }
 }
 
-/// NtReadFile/NtWriteFile de um handle `device`: IRP bufferizado síncrono
-/// ou pendente (STATUS_PENDING no assíncrono).
+/// NtReadFile/NtWriteFile de um handle `device`: IRP bufferizado ou neither,
+/// síncrono ou pendente (STATUS_PENDING no assíncrono). DO_DIRECT_IO (MDL
+/// fixada) ainda não é suportado.
 pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buffer: u64, length: u64, offset_pointer: u64, write: bool) -> Result<u32, KernelError> {
     if entry.access() & if write { 2 } else { 1 } == 0 {
         return Ok(0xC000_0022);
@@ -132,8 +145,9 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     let Some((_, top)) = io_manager::device_route(&device.device_path) else { return Ok(0xC000_0008) };
     // SAFETY: o topo da rota é um DEVICE_OBJECT vivo do I/O manager.
     let top_device = (top != 0).then(|| unsafe { DeviceObject::at(top) });
-    // DO_BUFFERED_IO.
-    let Some(top_device) = top_device.filter(|device| device.flags.get() & 4 != 0) else { return Ok(0xC000_00BB) };
+    // DO_BUFFERED_IO, ou neither (nem DO_BUFFERED_IO nem DO_DIRECT_IO).
+    let Some(top_device) = top_device.filter(|device| device.flags.get() & DO_BUFFERED_IO != 0 || device.flags.get() & DO_DIRECT_IO == 0) else { return Ok(0xC000_00BB) };
+    let buffered = top_device.flags.get() & DO_BUFFERED_IO != 0;
     let mut offset = *device.position.lock();
     if offset_pointer != 0 {
         // ByteOffset (LARGE_INTEGER, sondado pelo chamador): uma leitura.
@@ -155,8 +169,8 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     } else {
         None
     };
-    // Dados de uma escrita, capturados do buffer de usuário (sondado pelo chamador).
-    let data = if write {
+    // Dados de uma escrita bufferizada, capturados do buffer de usuário (sondado pelo chamador).
+    let data = if write && buffered {
         match guest::try_read_bytes(user_buffer, length as usize) {
             Ok(data) => Some(data),
             Err(_) => {
@@ -174,8 +188,8 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
         count => count as u32,
     };
     let packet = guest::alloc_bytes(irp_builder::size_for(count));
-    let buffer = guest::alloc_bytes(length.max(1));
-    if packet == 0 || buffer == 0 {
+    let buffer = if buffered { guest::alloc_bytes(length.max(1)) } else { 0 };
+    if packet == 0 || (buffered && buffer == 0) {
         for pointer in [packet, buffer] {
             if pointer != 0 {
                 guest::free_bytes(pointer);
@@ -195,9 +209,11 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
     if let Some(thread) = &thread {
         threads::retain_thread(thread);
     }
-    irp_builder::build(packet, &BuildOptions { major: if write { 4 } else { 3 }, minor: 0, buffer, buffer_length: length as u32, byte_offset: offset, device_object: top, stack_count: count, file_object: device.file_object, requestor_mode: 1, thread: thread.as_ref().map_or(0, |thread| thread.pointer()), ..BuildOptions::default() });
-    // SAFETY: IRP recém-montado acima.
-    unsafe { Irp::at(packet) }.flags.set(0x10 | if write { 0 } else { 0x40 }); // BUFFERED_IO, INPUT_OPERATION
+    irp_builder::build(packet, &BuildOptions { major: if write { 4 } else { 3 }, minor: 0, buffer, buffer_length: length as u32, byte_offset: offset, device_object: top, stack_count: count, file_object: device.file_object, requestor_mode: 1, thread: thread.as_ref().map_or(0, |thread| thread.pointer()), user_buffer: if buffered { 0 } else { user_buffer }, ..BuildOptions::default() });
+    if buffered {
+        // SAFETY: IRP recém-montado acima.
+        unsafe { Irp::at(packet) }.flags.set(IRP_BUFFERED_IO | if write { 0 } else { IRP_INPUT_OPERATION });
+    }
     let observer = request.clone();
     io_manager::observe_completion(
         packet,

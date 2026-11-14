@@ -261,14 +261,16 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
     if packet == 0 {
         return Ok(0xC000_009A);
     }
+    // O IOSB fica STATUS_PENDING até a conclusão copiar o IoStatus para ele:
+    // um driver que conclui e devolve STATUS_PENDING (IoStartPacket) vale
+    // pelo IoStatus; sem conclusão, vale o retorno do despacho.
+    let _ = state::set_user_iosb(iosb, 0x103, 0);
     let guest_status = io_manager::iof_call_driver(top, packet) as u32;
-    // A conclusão já copiou o IoStatus para o IOSB do usuário; o retorno do
-    // dispatch vale quando o IoStatus ficou zerado.
     let mut status = match state::user_struct::<IoStatusBlock>(iosb).and_then(|block| block.status.probe_get()) {
         Ok(value) => value as u32,
         Err(error) => error.status,
     };
-    if status == 0 && guest_status != 0 {
+    if status == 0x103 && guest_status != 0x103 {
         status = guest_status;
         if state::set_user_iosb(iosb, status, 0).is_err() {
             status = 0xC000_0005;

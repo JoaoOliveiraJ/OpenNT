@@ -909,14 +909,20 @@ fn user_device_io(assert: Assert) {
     let written = call("NtWriteFile", handle, 0, 0, 0);
     let write_ok = written == Some(0) && io_status.information.get() == 4 && guest::read64(buffer) == 0x1111_2222_3333_4444;
     assert(read_ok && write_ok, "devio: NtReadFile/NtWriteFile pelo IRP bufferizado nativo");
-    // Sem DO_BUFFERED_IO o caminho não é suportado; cancelamentos sem pendência.
+    // Neither (nem DO_BUFFERED_IO nem DO_DIRECT_IO): o IRP leva o buffer de
+    // usuário, sem SystemBuffer (o despacho não grava nada); DO_DIRECT_IO
+    // ainda não é suportado; cancelamentos sem pendência.
     device_flags.set(device_flags.get() & !4);
+    guest::write64(buffer, 0x5555_6666_7777_8888);
+    let neither = call("NtReadFile", handle, 0, 0, 0);
+    let neither_ok = neither == Some(0) && io_status.status.get() == 0 && io_status.information.get() == 4 && guest::read64(buffer) == 0x5555_6666_7777_8888;
+    device_flags.set(device_flags.get() | 0x10);
     let unbuffered = call("NtReadFile", handle, 0, 0, 0);
-    device_flags.set(device_flags.get() | 4);
+    device_flags.set((device_flags.get() & !0x10) | 4);
     let cancel_thread = call("NtCancelIoFile", handle, iosb, 0, 0);
     let cancel_any = call("NtCancelIoFileEx", handle, 0, iosb, 0);
     let cancel_bad = call("NtCancelIoFile", 0x7FF0, iosb, 0, 0);
-    assert(unbuffered == Some(0xC000_00BB) && cancel_thread == Some(0) && cancel_any == Some(0xC000_0225) && cancel_bad == Some(0xC000_0008), "devio: dispositivo sem I/O bufferizado e cancelamentos");
+    assert(neither_ok && unbuffered == Some(0xC000_00BB) && cancel_thread == Some(0) && cancel_any == Some(0xC000_0225) && cancel_bad == Some(0xC000_0008), "devio: leitura neither com o buffer de usuario, DO_DIRECT_IO recusado e cancelamentos");
     let _ = call("NtClose", handle, 0, 0, 0);
     guest::free_bytes(kernel);
     if let Some(region) = memory::find_region(block) {
@@ -2186,6 +2192,14 @@ fn io_group_exports(assert: Assert) {
     let unnamed = call_export("IoCreateDevice", &[driver, 0, 0, 0x22, 0, 0, output]);
     let second = guest::read64(output);
     assert(status(unnamed) == 0 && second != 0 && at::<nt::DriverObject>(driver).device_object.get() == second && at::<nt::DeviceObject>(second).next_device.get() == first, "io: dispositivo sem nome entra na cabeca da lista");
+    // Nome absoluto fora de \Device (o de um reconhecedor de file system):
+    // o objeto fica no diretório dado, \FileSystem, criado no boot.
+    let recognizer_name = unicode_at(block + 0x200, "\\FileSystem\\OpenNtIoRecognizer");
+    let recognizer = status(call_export("IoCreateDevice", &[driver, 0, recognizer_name, 8, 0, 0, block + 0xF20]));
+    let recognizer_device = guest::read64(block + 0xF20);
+    let placed = object_manager::lookup("\\FileSystem\\OpenNtIoRecognizer").and_then(io_manager::device).is_some_and(|entry| entry.native_device == recognizer_device) && object_manager::lookup("\\Device\\FileSystem").is_none() && object_manager::lookup("\\FileSystem\\Filters").is_some();
+    let removed = status(call_export("IoDeleteDevice", &[recognizer_device]));
+    assert(recognizer == 0 && placed && removed == 0 && at::<nt::DriverObject>(driver).device_object.get() == second, "io: IoCreateDevice com nome em \\FileSystem");
     // Pilha: attach, topo, referência do topo, propriedade do PDO e detach.
     let lower = call_export("IoAttachDeviceToDeviceStack", &[second, first]);
     assert(lower == Some(first) && at::<nt::DeviceObject>(first).attached_device.get() == second && node.and_then(io_manager::device).is_some_and(|entry| entry.stack_top == second), "io: IoAttachDeviceToDeviceStack empilha e atualiza a rota de despacho");
@@ -11279,6 +11293,35 @@ fn whea_error_source_exports(assert: Assert) {
     assert(call_export("WheaReportHwError", &[packet]) == Some(signed_status(0xC000_000D)), "whea-error-source: pacote sem 'ErPt' recusado");
 }
 
+/// ZwQueryDirectoryFile com vários registros (os catálogos do CatRoot, que a
+/// ci.dll varre): cada um começa num limite de 8 bytes e o Information é o
+/// fim do último, sem enchimento.
+fn zw_query_directory_alignment(assert: Assert) {
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let block = guest::alloc_bytes(0x2000);
+    let (output, io_status, buffer) = (block + 0x400, block + 0x410, block + 0x1000);
+    let attributes = object_attributes_for(block, "\\SystemRoot\\System32\\CatRoot\\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}", 0x40);
+    let opened = status(call_export("ZwOpenFile", &[output, 0x10_0001, attributes, io_status, 7, 0x21]));
+    let directory = guest::read64(output);
+    let queried = status(call_export("ZwQueryDirectoryFile", &[directory, 0, 0, 0, io_status, buffer, 0x1000, 1, 0, 0, 1]));
+    let mut offsets = Vec::new();
+    let mut entry = buffer;
+    loop {
+        let record = at::<nt::FileDirectoryInformation>(entry);
+        offsets.push(entry - buffer);
+        let next = record.next_entry_offset.get() as u64;
+        if next == 0 || offsets.len() > 16 {
+            break;
+        }
+        entry += next;
+    }
+    let last = *offsets.last().unwrap_or(&0);
+    let end = last + core::mem::offset_of!(nt::FileDirectoryInformation, file_name) as u64 + at::<nt::FileDirectoryInformation>(buffer + last).file_name_length.get() as u64;
+    assert(opened == 0 && queried == 0 && offsets.len() >= 2 && offsets.iter().all(|offset| offset % 8 == 0) && guest::read64(io_status + 8) == end, "zw: ZwQueryDirectoryFile alinha os registros em 8 bytes");
+    let _ = call_export("ZwClose", &[directory]);
+    guest::free_bytes(block);
+}
+
 /// A família KDEVICE_QUEUE pelos exports, com os vetores do modelo da
 /// desmontagem do ntoskrnl (ordem por chave, o Hint do
 /// KeRemoveByKeyDeviceQueue, a retirada por entrada e o Busy).
@@ -13398,6 +13441,7 @@ pub fn run(assert: Assert) {
     rtl_unicode_prefix_exports(assert);
     rtl_app_container_exports(assert);
     ps_paged_pool_quota_exports(assert);
+    zw_query_directory_alignment(assert);
     ke_device_queue_exports(assert);
     io_start_packet_by_key_exports(assert);
     rtl_self_relative_sd2_exports(assert);

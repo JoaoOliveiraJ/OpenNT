@@ -587,14 +587,17 @@ fn ntfs_writer(assert: Assert) {
     expected.push(String::from("/NOVO.TXT"));
     expected.sort_by_key(|name| name.to_uppercase());
     assert(names(&volume, "/") == expected, "ntfswrite: indice da raiz em ordem");
+    // Os clusters dos dados contam a partir daqui: a inserção no índice da
+    // raiz pode ter alocado um bloco INDX, conforme os arquivos do build.
+    let created_free = volume.space().map(|space| space.free_clusters).unwrap_or(0);
     assert(matches!(volume.write("/NOVO.TXT", 0, b"abc"), Ok(3)) && matches!(volume.read("/NOVO.TXT"), Ok(Some(text)) if text == "abc"), "ntfswrite: escrita residente");
     // Escrita não residente e leitura depois de remontar.
     let pattern: alloc::vec::Vec<u8> = (0..20_000u32).map(|index| (index % 251) as u8).collect();
     assert(matches!(volume.write("/NOVO.TXT", 0, &pattern), Ok(20_000)) && volume.stat("/NOVO.TXT").is_ok_and(|stat| stat.is_some_and(|stat| stat.size == 20_000 && stat.allocated == 20_480)), "ntfswrite: escrita nao residente");
-    assert(volume.space().is_ok_and(|space| space.free_clusters == initial - 40), "ntfswrite: clusters alocados no $Bitmap");
+    assert(volume.space().is_ok_and(|space| space.free_clusters == created_free - 40) && created_free <= initial, "ntfswrite: clusters alocados no $Bitmap");
     let remounted = ntfs::mount(1);
     assert(remounted.as_ref().is_ok_and(|fresh| matches!(fresh.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes == pattern)), "ntfswrite: dados persistidos no disco");
-    assert(matches!(volume.resize("/NOVO.TXT", 100), Ok(100)) && matches!(volume.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes[..] == pattern[..100]) && volume.space().is_ok_and(|space| space.free_clusters == initial - 1), "ntfswrite: reducao libera clusters");
+    assert(matches!(volume.resize("/NOVO.TXT", 100), Ok(100)) && matches!(volume.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes[..] == pattern[..100]) && volume.space().is_ok_and(|space| space.free_clusters == created_free - 1), "ntfswrite: reducao libera clusters");
     // Renomeação, diretórios e EAs.
     assert(volume.rename("/NOVO.TXT", "/RENOMEADO.TXT", false).is_ok() && matches!(volume.exists("/RENOMEADO.TXT"), Ok(true)) && matches!(volume.exists("/NOVO.TXT"), Ok(false)), "ntfswrite: renomeacao");
     assert(volume.create("/DIR", true, 0, 0).is_ok_and(|stat| stat.is_some_and(|stat| stat.directory)) && volume.create("/DIR/A.TXT", false, 0, 0).is_ok() && names(&volume, "/DIR") == alloc::vec![String::from("/DIR/A.TXT")], "ntfswrite: diretorio com filho");

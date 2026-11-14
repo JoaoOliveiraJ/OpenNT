@@ -215,6 +215,34 @@ marcador = "DRIVER_START_COMPLETED"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=msisadrv --build-dir=build/kmdf --smp=1 \"--expect=name=msisadrv state=4 win32=0\""
 descricao = "O gerenciador de serviços inicia o msisadrv.sys, um driver KMDF da Microsoft: o loader carrega a WdfLdr.sys como biblioteca de import, o WdfVersionBind do driver faz a WdfLdr carregar o runtime Wdf01000.sys pela chave do serviço (ZwLoadDriver), o runtime se registra e devolve a tabela de funções, o WdfDriverCreate do driver tem sucesso e o serviço fica em execução (state=4). Todas as imagens passam pelo Code Integrity, validadas pelos catálogos da Microsoft."
 
+[[teste]]
+id = "null"
+titulo = "Driver null.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=null --build-dir=build/null --smp=1 \"--expect=name=null state=4 win32=0\" \"--expect=NULL_DEVICE_OK\""
+descricao = "O gerenciador de serviços inicia o null.sys da Microsoft pela chave Null da instalação (sem ImagePath: o padrão \\SystemRoot\\System32\\Drivers\\Null.sys), validado pelo catálogo, e o DriverEntry publica o \\Device\\Null. Um processo de teste abre o dispositivo pelo NtCreateFile: a leitura devolve STATUS_END_OF_FILE sem tocar no buffer e a escrita de 77 bytes conclui com os 77, pelo despacho do próprio driver (IRPs neither, com o buffer de usuário)."
+
+[[teste]]
+id = "beep"
+titulo = "Driver beep.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=beep --build-dir=build/beep --smp=1 \"--expect=name=beep state=4 win32=0\" \"--expect=BEEP_DEVICE_OK\""
+descricao = "O beep.sys da Microsoft sobe pela chave Beep da instalação e publica o \\Device\\Beep. Um processo de teste deixa pendente o IOCTL com que a sessão recebe os tons e manda IOCTL_BEEP_SET: o pedido passa pelo IoStartPacket, pela DeviceQueue do dispositivo (KeInsertDeviceQueue) e pelo StartIo do driver, que entrega 440 Hz e 100 ms ao pedido pendente e chama o IoStartNextPacket (adiado, DOE_SIO_DEFERRED), deixando a fila livre; sem pedido pendente o StartIo conclui com STATUS_NOT_FOUND, e um tom sem duração conclui sem a fila."
+
+[[teste]]
+id = "fs_rec"
+titulo = "Driver fs_rec.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=fs_rec --build-dir=build/fs_rec --smp=1 \"--expect=name=fs_rec state=4 win32=0\" \"--expect=FS_REC_OK\""
+descricao = "O fs_rec.sys da Microsoft sobe pela chave Fs_Rec da instalação (SERVICE_RECOGNIZER_DRIVER, sem ImagePath) e registra os reconhecedores de file system (IoRegisterFileSystem) nas filas de disco e de CD-ROM. Cada reconhecedor de disco recebe um IRP_MN_MOUNT_VOLUME sobre o volume NTFS do segundo disco e responde como no Windows, lendo o setor de boot e a geometria pelo dispositivo de volume, sem montar nada."
+
+[[teste]]
+id = "ksecpkg"
+titulo = "Driver ksecpkg.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ksecpkg --build-dir=build/ksecpkg --smp=1 \"--expect=name=ksecpkg state=4 win32=0\""
+descricao = "O ksecpkg.sys da Microsoft (o pacote de segurança do KSecDD) sobe pela chave KSecPkg da instalação, validado pelo catálogo, com os imports resolvidos no ntoskrnl, no cng.sys e no ksecdd.sys, e o DriverEntry retorna sucesso (state=4)."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -311,7 +339,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/io_manager.rs", "kernel/src/ntos/io/irp_builder.rs", "kernel/src/ntos/io/pnp.rs", "kernel/src/ntos/io/work_items.rs"]
 testes = ["fase4", "teclado"]
 fase = "4"
-notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows). Para file systems e armazenamento: IRPs associados (com a devolução ao mestre na conclusão), I/O de paginação (IoPageRead/IoSynchronousPageWrite), extensões de FILE_OBJECT e de IRP, registro de file systems e suas notificações, montagem de volumes pelo caminho do NT (IopMountVolume com IRP_MN_MOUNT_VOLUME a cada file system da fila, IopCheckVpbMounted e o ramo de arquivo do IopParseDevice, que manda o IRP_MJ_CREATE ao dispositivo de volume; o IoCreateDevice dá VPB e DeviceLock aos dispositivos montáveis; sem o RAW), stream file objects, share access, IoReportDetectedDevice, propriedades de dispositivo e IoGetDmaAdapter (que devolve NULL enquanto o PDO PCI não responde QUERY_INTERFACE). O grafo de dependências entre dispositivos (IoSetDependency, IoReserveDependency, IoResolveDependency, IoDuplicateDependency, IoTestDependency) existe sobre DEVOBJ_EXTENSION.DependencyNode, sem a ordem de energia nem a liberação do início dos dependentes; IoRequestDeviceEject(Ex) e IoRequestDeviceRemovalForReset validam e enfileiram como o Windows, mas o PnP ainda não processa eventos de remoção ou ejeção de dispositivo-alvo (o pedido conclui com STATUS_TOO_LATE); IoAssignResources libera e valida, mas sem árbitros de recursos nenhum pedido é atendido (STATUS_RETRY)."
+notas = "A pilha de teclado e mouse do Windows (i8042prt.sys, kbdclass.sys e mouclass.sys) já roda sobre ele; a de disco ainda não (veja atapi.sys). A ligação entre dispositivo e driver vem de uma tabela fixa no kernel (o papel dos INFs), que o boot hoje só percorre para os dispositivos PS/2. Inclui filas de IRP canceláveis (IoCsq*), IRPs síncronos e assíncronos de FSD, IoCreateDriver, interfaces de dispositivo, eventos nomeados de I/O e as consultas WMI (sem WMI, com o status do Windows). Para file systems e armazenamento: IRPs associados (com a devolução ao mestre na conclusão), I/O de paginação (IoPageRead/IoSynchronousPageWrite), extensões de FILE_OBJECT e de IRP, registro de file systems e suas notificações, montagem de volumes pelo caminho do NT (IopMountVolume com IRP_MN_MOUNT_VOLUME a cada file system da fila, IopCheckVpbMounted e o ramo de arquivo do IopParseDevice, que manda o IRP_MJ_CREATE ao dispositivo de volume; o IoCreateDevice dá VPB e DeviceLock aos dispositivos montáveis; sem o RAW), stream file objects, share access, IoReportDetectedDevice, propriedades de dispositivo e IoGetDmaAdapter (que devolve NULL enquanto o PDO PCI não responde QUERY_INTERFACE). O grafo de dependências entre dispositivos (IoSetDependency, IoReserveDependency, IoResolveDependency, IoDuplicateDependency, IoTestDependency) existe sobre DEVOBJ_EXTENSION.DependencyNode, sem a ordem de energia nem a liberação do início dos dependentes; IoRequestDeviceEject(Ex) e IoRequestDeviceRemovalForReset validam e enfileiram como o Windows, mas o PnP ainda não processa eventos de remoção ou ejeção de dispositivo-alvo (o pedido conclui com STATUS_TOO_LATE); IoAssignResources libera e valida, mas sem árbitros de recursos nenhum pedido é atendido (STATUS_RETRY). O I/O empacotado do StartIo é o do NT: a KDEVICE_QUEUE do Ke (os sete KeInsert*/KeRemove*DeviceQueue, com o Hint da retirada por chave) e o IoStartPacket/IoStartNextPacket/IoStartNextPacketByKey com o spin lock de cancelamento, DOE_SIO_NO_CANCEL e o modo adiado de DOE_SIO_DEFERRED (o beep.sys real usa). NtReadFile/NtWriteFile de dispositivo aceitam I/O bufferizado e neither (o null.sys real); DO_DIRECT_IO ainda não. Os diretórios \\FileSystem e \\FileSystem\\Filters existem desde o boot, e o IoCreateDevice aceita um nome absoluto fora de \\Device (os reconhecedores do fs_rec.sys real)."
 
 [[componente]]
 nome = "Registro"
@@ -333,7 +361,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Como no NT, toda imagem de kernel (drivers, hal.dll, ci.dll, bibliotecas de export) é mapeada no espaço de sistema, na janela que começa em 0xFFFFF80100000000, sobre frames do PFN, e relocada para lá; nenhuma fica na metade de usuário nem abaixo de 4 GB. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys, nsiproxy.sys, fwpkclnt.sys e pcw.sys já têm export; nenhum deles é carregado pelos testes ainda. O ksecdd.sys carrega e roda (teste ksecdd)."
+notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Como no NT, toda imagem de kernel (drivers, hal.dll, ci.dll, bibliotecas de export) é mapeada no espaço de sistema, na janela que começa em 0xFFFFF80100000000, sobre frames do PFN, e relocada para lá; nenhuma fica na metade de usuário nem abaixo de 4 GB. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys, nsiproxy.sys, fwpkclnt.sys e pcw.sys já têm export; nenhum deles é carregado pelos testes ainda. O ksecdd.sys carrega e roda (teste ksecdd), e também o null.sys, o beep.sys, o fs_rec.sys e o ksecpkg.sys (testes null, beep, fs_rec e ksecpkg). Ao clfs.sys faltam só os quatro Rtl*UnicodePrefix."
 
 [[componente]]
 nome = "Cache Manager"
@@ -563,6 +591,50 @@ caminhos = ["kernel/src/ntos/ex/extension_host.rs", "kernel/src/ntos/se/extensio
 testes = ["ksecdd"]
 fase = "6"
 notas = "Carrega e roda com `--start-driver=ksecdd`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Tem assinatura embutida, validada pelo Code Integrity real, e importa do ntoskrnl, da hal.dll e do msrpc.sys. O DriverEntry liga a extensão de autorização ao host do kernel (ExRegisterExtension, id 2, um dos hosts de extensão que o kernel registra na fase 1, como no Windows), registra a notificação de criação de processos (PsSetCreateProcessNotifyRoutineEx2), conversa com o cng.sys real por IOCTLs do \\Device\\CNG, cria o monitor de silos e registra os contadores de desempenho (PcwRegister). Os contadores são do pcw.sys, que tem a chave de serviço sob demanda e ainda não completa o DriverEntry (o wdmlib dele abre o próprio DEVICE_OBJECT por ObOpenObjectByPointer, que o Object Manager do OpenNT ainda não faz para dispositivos); com o pcw fora do boot, os Pcw* devolvem sucesso com handle nulo, como num Windows com o pcw desligado. No boot comum ele não é iniciado (sob demanda; no Windows é de boot)."
+
+[[componente]]
+nome = "null.sys"
+categoria = "Drivers do Windows"
+icone = "io"
+descricao = "O driver do \\Device\\Null do Windows: leituras terminam em fim de arquivo e escritas são aceitas inteiras."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/cm/service/inbox_drivers.rs", "kernel/src/ntos/ps/user/device_io.rs", "kernel/src/ntos/test/boot_drivers.rs"]
+testes = ["null"]
+fase = "6"
+notas = "Carrega e roda com `--start-driver=null`: DRIVER_START_COMPLETED state=4 win32=0, validado pelo catálogo da Microsoft. A chave Null tem os valores da instalação (Type 1, ErrorControl 1, Group Base, Tag 1, sem ImagePath, carregado de \\SystemRoot\\System32\\Drivers\\Null.sys como no IopLoadDriver), com Start 3 em vez de 1. O \\Device\\Null é aberto por um processo de teste: a leitura dá STATUS_END_OF_FILE e a escrita conclui com o tamanho pedido, pelo despacho do driver; o dispositivo não tem DO_BUFFERED_IO nem DO_DIRECT_IO, então o NtReadFile/NtWriteFile manda IRPs neither, com o buffer de usuário em Irp->UserBuffer. O caminho rápido (Fast I/O) que o driver oferece para handles síncronos ainda não é usado pelo NtReadFile."
+
+[[componente]]
+nome = "beep.sys"
+categoria = "Drivers do Windows"
+icone = "play"
+descricao = "O driver do \\Device\\Beep do Windows, que entrega os tons pedidos por IOCTL_BEEP_SET ao componente de som da sessão."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ke/device_queue.rs", "kernel/src/ntos/io/controller.rs", "kernel/src/ntos/test/boot_drivers.rs"]
+testes = ["beep"]
+fase = "6"
+notas = "Carrega e roda com `--start-driver=beep`: DRIVER_START_COMPLETED state=4 win32=0. A chave Beep tem os valores da instalação (Type 1, ErrorControl 1, Group Base, Tag 2, DisplayName Beep, sem ImagePath), com Start 3 em vez de 1. O IOCTL_BEEP_SET passa pelo IoStartPacket, pela KDEVICE_QUEUE do dispositivo e pelo StartIo do driver, que repassa a frequência e a duração ao pedido pendente da sessão (a CSQ do driver) e chama o IoStartNextPacket no modo adiado (DOE_SIO_DEFERRED); o beep.sys do Windows 10 não toca o alto-falante do PC, quem toca é a sessão. Os KeRemoveDeviceQueue/KeRemoveEntryDeviceQueue de que ele precisava agora existem, com o resto da família KDEVICE_QUEUE."
+
+[[componente]]
+nome = "fs_rec.sys"
+categoria = "Drivers do Windows"
+icone = "search"
+descricao = "Os reconhecedores de file system do Windows: identificam o formato de um volume e pedem a carga do file system dele."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/io/file_system.rs", "kernel/src/ntos/cm/service/database.rs", "kernel/src/ntos/test/boot_drivers.rs"]
+testes = ["fs_rec"]
+fase = "6"
+notas = "Carrega e roda com `--start-driver=fs_rec`: DRIVER_START_COMPLETED state=4 win32=0. A chave Fs_Rec tem os valores da instalação (Type 8, SERVICE_RECOGNIZER_DRIVER, ErrorControl 0, Group File System, sem ImagePath), com Start 3 em vez de 0. O DriverEntry cria e registra os reconhecedores de disco e de CD-ROM nas filas do IoRegisterFileSystem; cada reconhecedor de disco (FAT, exFAT, ReFS, ReFSv1 e UDFS) responde a um IRP_MN_MOUNT_VOLUME sobre o volume NTFS do segundo disco com STATUS_UNRECOGNIZED_VOLUME, lendo o setor de boot e a geometria. O reconhecedor de NTFS não é criado: o DriverEntry só o cria quando ZwCreateFile(\\Ntfs) dá STATUS_OBJECT_NAME_NOT_FOUND, e no OpenNT \\NTFS é a montagem do volume lido pelo kernel, como num Windows com o ntfs.sys carregado. O dispositivo de volume do teste é servido pelo próprio teste (o segundo disco pelo driver ATA do kernel), até o volume do disco existir como DEVICE_OBJECT do kernel; o DRIVER_OBJECT fica em \\Driver\\Fs_Rec, não em \\FileSystem\\Fs_Rec como no Windows."
+
+[[componente]]
+nome = "ksecpkg.sys"
+categoria = "Drivers do Windows"
+icone = "lock"
+descricao = "O pacote de segurança de modo kernel do Windows (NTLM e SSL do kernel), carregado sobre o ksecdd.sys e o cng.sys."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ob/handle_attributes.rs", "kernel/src/ntos/cm/service/inbox_drivers.rs"]
+testes = ["ksecpkg"]
+fase = "6"
+notas = "Carrega e roda com `--start-driver=ksecpkg`: DRIVER_START_COMPLETED state=4 win32=0, validado pelo catálogo. A chave KSecPkg tem os valores da instalação (Type 1, ErrorControl 3, Group Cryptography, Tag 2, ImagePath System32\\Drivers\\ksecpkg.sys), com Start 3 em vez de 0. O último import que faltava era o ZwSetInformationObject (ObjectHandleFlagInformation), com que ele protege os handles do contexto NTLM contra fechamento."
 
 [[componente]]
 nome = "win32k.sys, win32kbase.sys e win32kfull.sys"

@@ -832,6 +832,15 @@ dereference e o PFN livre volta ao de antes.
   despacha os Pcw* para ele), a autorização (id 2, o ksecdd.sys) e o BCrypt
   (id 3, o cng.sys) do Se (`se/extension_hosts.rs`) e o controle de taxa de
   rede (id 4, o tcpip.sys) do Ps (`ps/net_rate_control.rs`).
+- **Filas de dispositivo e StartIo**: a KDEVICE_QUEUE é do Ke
+  (`ke/device_queue.rs`, os sete KeInsert*/KeRemove*DeviceQueue com o
+  layout x64 do NT, inclusive o Hint do KeRemoveByKeyDeviceQueue no qword
+  do Busy), e o I/O Manager só a usa (`io/controller.rs`): o
+  IoAllocate/FreeController na DeviceWaitQueue do CONTROLLER_OBJECT e o
+  IoStartPacket/IoStartNextPacket(ByKey) na DeviceQueue do DEVICE_OBJECT,
+  com o spin lock de cancelamento, DOE_SIO_NO_CANCEL e o laço adiado de
+  DOE_SIO_DEFERRED (StartIoCount/StartIoFlags/StartIoKey da
+  DEVOBJ_EXTENSION), como o IopStartNextPacketByKeyEx.
 - Estado global fica atrás de `SpinLock` (`rtl::sync`). Estado lido muito e
   mudado em operações longas, como um volume NTFS, fica atrás de
   `SharedLock`, o papel do ERESOURCE: leituras compartilhadas, mutações
@@ -1270,6 +1279,16 @@ dereference e o PFN livre volta ao de antes.
   30 s sem falha na serial. Uma imagem recusada pela CI falha com o status
   real: o NTSTATUS da carga (STATUS_INVALID_IMAGE_HASH) segue até o SCM,
   que mostra o 577 do Windows.
+  As chaves
+  de serviço dos drivers inbox iniciados assim ficam em
+  `cm/service/inbox_drivers.rs`, com os valores da instalação (um driver sem
+  ImagePath carrega `\SystemRoot\System32\Drivers\<serviço>.sys`, como no
+  IopLoadDriver). Depois do `DRIVER_START_COMPLETED`, com o anel 3 armado,
+  `ntos/test/boot_drivers.rs` usa o que o driver publicou: um processo de
+  teste lê e grava o `\Device\Null` do null.sys (`NULL_DEVICE_OK`) e manda
+  IOCTL_BEEP_SET ao `\Device\Beep` do beep.sys pelo StartIo dele
+  (`BEEP_DEVICE_OK`), e os reconhecedores do fs_rec.sys respondem a um
+  IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,

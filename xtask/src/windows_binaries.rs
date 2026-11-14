@@ -57,6 +57,12 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ("FWPKCLNT.SYS", "System32/drivers/fwpkclnt.sys"),
     ("TDI.SYS", "System32/drivers/tdi.sys"),
     ("FLTMGR.SYS", "System32/drivers/fltmgr.sys"),
+    // O pacote de segurança do KSecDD, o \Device\Null, o \Device\Beep e os
+    // reconhecedores de file system, iniciados sob demanda (`--start-driver`).
+    ("KSECPKG.SYS", "System32/drivers/ksecpkg.sys"),
+    ("NULL.SYS", "System32/drivers/null.sys"),
+    ("BEEP.SYS", "System32/drivers/beep.sys"),
+    ("FS_REC.SYS", "System32/drivers/fs_rec.sys"),
     // Esquema de API sets: os imports ext-ms-* das imagens de kernel.
     ("APISETSCHEMA.DLL", "System32/apisetschema.dll"),
     // A CI lê a lista de revogação pelo caminho completo.
@@ -70,7 +76,8 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
-    // O ntfs.sys real (`--start-driver=ntfs`) e o catálogo que o cobre.
+    // O ntfs.sys real (`--start-driver=ntfs`) e o catálogo que o cobre, o
+    // mesmo do null.sys, do fs_rec.sys e do ksecpkg.sys.
     ("NTFS.SYS", "System32/drivers/ntfs.sys"),
     // KMDF: a WdfLdr.sys (biblioteca de import dos clientes), o runtime
     // Wdf01000.sys (carregado pela WdfLdr pela chave do serviço) e a
@@ -85,6 +92,11 @@ const NTFS_FILES: &[(&str, &str)] = &[
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    // Catálogo que cobre o beep.sys.
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0517~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0517~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
