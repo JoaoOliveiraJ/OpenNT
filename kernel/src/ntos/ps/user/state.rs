@@ -671,8 +671,10 @@ impl UserHandle {
 /// A tabela de handles de usuário de um processo (`ProcessState.handles`),
 /// o papel da ObjectTable do NT para os objetos do runtime: o handle, o
 /// vínculo com a linha publicada na HANDLE_TABLE nativa do mesmo processo e o
-/// piso dos valores novos. Os valores vêm do espaço global de `handle_ids`,
-/// então um valor nunca existe em duas tabelas.
+/// piso dos valores novos. Os valores novos vêm do espaço global de
+/// `handle_ids`, então um handle aberto ou duplicado nunca repete um valor de
+/// outra tabela; só a herança ([`inherit_user_handles`]) põe o mesmo valor
+/// na tabela do filho, como o NT.
 pub struct UserHandleTable {
     entries: BTreeMap<u32, Arc<UserHandle>>,
     bindings: BTreeMap<u32, Binding>,
@@ -696,26 +698,38 @@ fn table_closed() -> KernelError {
 /// de objeto.
 pub fn alloc_user_handle(object: Arc<dyn UserObject>, access: u32, attributes: u32) -> Result<u32, KernelError> {
     let table = process_state::current().ok_or_else(table_closed)?;
+    alloc_user_handle_in(&table, object, access, attributes, None)
+}
+
+/// [`alloc_user_handle`] na tabela de `table`; `duplicate_from` (o
+/// processo de origem) faz do handle uma duplicata para os callbacks de
+/// objeto, como a do pseudo-handle de processo no NtDuplicateObject.
+pub fn alloc_user_handle_in(table: &ProcessState, object: Arc<dyn UserObject>, access: u32, attributes: u32, duplicate_from: Option<u64>) -> Result<u32, KernelError> {
     let entry = Arc::new(UserHandle {
         object,
         group: Arc::new(SpinLock::new(Group { handles: 1, references: 1 })),
         local: SpinLock::new(Local { access, attributes, wait_references: 0, on_references_released: None }),
     });
-    alloc_entry(&table, entry, false)
+    alloc_entry(table, entry, duplicate_from)
 }
 
-fn alloc_entry(table: &ProcessState, entry: Arc<UserHandle>, duplicate: bool) -> Result<u32, KernelError> {
+/// Insere `entry` na tabela de `table`. Processos e threads sem abertura
+/// nativa, e toda duplicata deles, passam pelos callbacks de objeto; uma
+/// duplicata (`duplicate_from`, o processo da tabela de origem) informa
+/// origem e destino, como o OB_PRE_DUPLICATE_HANDLE_INFORMATION.
+fn alloc_entry(table: &ProcessState, entry: Arc<UserHandle>, duplicate_from: Option<u64>) -> Result<u32, KernelError> {
     let kind = entry.object.kind();
-    if (kind == "process" || kind == "thread") && (!entry.object.opened_natively() || duplicate) {
+    if (kind == "process" || kind == "thread") && (!entry.object.opened_natively() || duplicate_from.is_some()) {
         let mut data = entry.object.callback_data();
         data.access = Some(entry.access());
         let route_kind = if kind == "process" { "Process" } else { "Thread" };
-        return callbacks::route(route_kind, &data, if duplicate { 2 } else { 1 }, true, &mut |access| {
+        let (operation, source) = duplicate_from.map_or((1, table.process), |source| (2, source));
+        return callbacks::route_between(route_kind, &data, operation, true, source, table.process, &mut |access| {
             entry.set_access(access);
-            insert_user_handle(table, &entry)
+            insert_user_handle(table, &entry, None)
         });
     }
-    insert_user_handle(table, &entry)
+    insert_user_handle(table, &entry, None)
 }
 
 /// Fechamento pedido pela HANDLE_TABLE do processo dono, que pode não ser o
@@ -728,11 +742,23 @@ fn close_from_table(process: u64, handle: u32) {
 
 /// Provedores de kernel e de usuário podem habitar a mesma tabela do
 /// EPROCESS: os ids são únicos ali, incluindo o slot reservado de cada folha.
-/// A linha nativa vai para a HANDLE_TABLE do processo dono da tabela.
-fn insert_user_handle(table: &ProcessState, entry: &Arc<UserHandle>) -> Result<u32, KernelError> {
-    let minimum = table.handles.lock().floor;
-    let handle = handle_ids::allocate(minimum)?;
-    table.handles.lock().floor = handle + 4;
+/// A linha nativa vai para a HANDLE_TABLE do processo dono da tabela. Sem
+/// `value`, o valor sai do espaço global; com ele (a herança), é o do pai.
+fn insert_user_handle(table: &ProcessState, entry: &Arc<UserHandle>, value: Option<u32>) -> Result<u32, KernelError> {
+    let handle = match value {
+        Some(value) => {
+            if table.handles.lock().entries.contains_key(&value) {
+                return Err(KernelError::new(format!("handle {value:#x} ja existe na tabela do processo")));
+            }
+            value
+        }
+        None => {
+            let minimum = table.handles.lock().floor;
+            let handle = handle_ids::allocate(minimum)?;
+            table.handles.lock().floor = handle + 4;
+            handle
+        }
+    };
     let retained = match entry.object.on_each_handle_open() {
         Ok(retained) => retained,
         Err(error) => return Err(error),
@@ -786,7 +812,13 @@ pub fn all_user_handles() -> alloc::vec::Vec<Arc<UserHandle>> {
 
 /// HANDLEs do processo corrente são baixos.
 pub fn get_user_handle(value: u64) -> Option<Arc<UserHandle>> {
-    process_state::current().and_then(|table| table.handles.lock().entries.get(&(value as u32)).cloned())
+    process_state::current().and_then(|table| get_user_handle_in(&table, value))
+}
+
+/// [`get_user_handle`] na tabela de `table` (o processo de origem de uma
+/// duplicação entre processos).
+pub fn get_user_handle_in(table: &ProcessState, value: u64) -> Option<Arc<UserHandle>> {
+    table.handles.lock().entries.get(&(value as u32)).cloned()
 }
 
 /// O rundown da tabela de um processo que terminou: fecha o que a drenagem
@@ -816,22 +848,75 @@ pub fn same_object(left: &UserHandle, right: &UserHandle) -> bool {
 /// objeto continuam compartilhados. Esperas de kernel podem sobreviver ao
 /// último handle.
 pub fn duplicate_user_handle(entry: &UserHandle, access: u32, attributes: u32) -> Result<u32, KernelError> {
+    let table = process_state::current().ok_or_else(table_closed)?;
+    duplicate_user_handle_in(entry, table.process, &table, access, attributes)
+}
+
+/// [`duplicate_user_handle`] entre processos (o ObDuplicateObject): o
+/// handle `entry` da tabela do processo `source` ganha uma cópia na tabela
+/// de `target`, com acesso e atributos próprios, sobre a mesma descrição
+/// aberta.
+pub fn duplicate_user_handle_in(entry: &UserHandle, source: u64, target: &ProcessState, access: u32, attributes: u32) -> Result<u32, KernelError> {
+    let duplicate = share_user_handle(entry, access, attributes);
+    alloc_entry(target, duplicate, Some(source)).inspect_err(|_| unshare_user_handle(entry))
+}
+
+/// Um handle novo da descrição aberta de `entry` (ainda fora de tabela).
+fn share_user_handle(entry: &UserHandle, access: u32, attributes: u32) -> Arc<UserHandle> {
     {
         let mut group = entry.group.lock();
         group.handles += 1;
         group.references += 1;
     }
-    let duplicate = Arc::new(UserHandle {
+    Arc::new(UserHandle {
         object: entry.object.clone(),
         group: entry.group.clone(),
         local: SpinLock::new(Local { access, attributes, wait_references: 0, on_references_released: None }),
-    });
-    let target = process_state::current().ok_or_else(table_closed);
-    target.and_then(|table| alloc_entry(&table, duplicate, true)).inspect_err(|_| {
-        let mut group = entry.group.lock();
-        group.handles -= 1;
-        group.references -= 1;
     })
+}
+
+/// Desfaz [`share_user_handle`] de um handle que não entrou em tabela.
+fn unshare_user_handle(entry: &UserHandle) {
+    let mut group = entry.group.lock();
+    group.handles -= 1;
+    group.references -= 1;
+}
+
+/// OBJ_INHERIT, o atributo de herança do handle.
+const OBJ_INHERIT: u32 = 2;
+
+/// A herança de handles na criação de um processo (o ObInitProcess com
+/// PROCESS_CREATE_FLAGS_INHERIT_HANDLES, que duplica a ObjectTable do pai
+/// pelo ExDupHandleTable): cada handle de `parent` marcado OBJ_INHERIT
+/// entra na tabela de `child` com o MESMO valor, o mesmo acesso e os mesmos
+/// atributos (OBJ_INHERIT inclusive), sobre a mesma descrição aberta, e a
+/// linha nativa vai para a ObjectTable do filho. Como no NT, a herança conta
+/// o handle no objeto (`on_each_handle_open`) sem passar pelos callbacks de
+/// objeto. Os outros handles do pai ficam só nele. Uma falha desfaz o que
+/// entrou no filho e devolve o erro (a criação falha). Devolve quantos
+/// handles o filho herdou.
+pub fn inherit_user_handles(parent: &ProcessState, child: &ProcessState) -> Result<usize, KernelError> {
+    let entries: alloc::vec::Vec<(u32, Arc<UserHandle>)> = parent.handles.lock().entries.iter().map(|(&value, entry)| (value, entry.clone())).collect();
+    let mut inherited: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    for (value, entry) in entries {
+        let (access, attributes) = {
+            let local = entry.local.lock();
+            (local.access, local.attributes)
+        };
+        if attributes & OBJ_INHERIT == 0 {
+            continue;
+        }
+        let copy = share_user_handle(&entry, access, attributes);
+        if let Err(error) = insert_user_handle(child, &copy, Some(value)) {
+            unshare_user_handle(&entry);
+            for value in inherited {
+                let _ = close_user_handle_in(child, value as u64, true, true);
+            }
+            return Err(error);
+        }
+        inherited.push(value);
+    }
+    Ok(inherited.len())
 }
 
 /// Fecha o handle do processo corrente; `release` libera o objeto na última

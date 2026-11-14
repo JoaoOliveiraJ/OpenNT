@@ -691,10 +691,44 @@ dereference e o PFN livre volta ao de antes.
   processo corrente, `KTHREAD.ApcState.Process`, que segue o attach como no
   NT. Handles de kernel (OBJ_KERNEL_HANDLE, prefixo 0xFFFFFFFF8...) ficam na
   tabela do System e valem em qualquer processo, só em KernelMode. Os valores
-  vêm do espaço global de `ob/handle_ids.rs`, então nunca colidem entre
-  tabelas. No término, a drenagem da HANDLE_TABLE nativa fecha cada handle
-  pela tabela do processo dono, e `process_state::destroy` fecha o que sobrou
-  (handles sem linha nativa). Teste: `ntos/test/multiprocess/handles.rs`.
+  novos vêm do espaço global de `ob/handle_ids.rs`, então um handle aberto ou
+  duplicado nunca repete o valor de outra tabela; só a herança põe o mesmo
+  valor no filho, como no NT. No término, a drenagem da HANDLE_TABLE nativa
+  fecha cada handle pela tabela do processo dono, e `process_state::destroy`
+  fecha o que sobrou (handles sem linha nativa). Teste:
+  `ntos/test/multiprocess/handles.rs`.
+- **Handles e informações entre processos** (`ps/user/handles.rs`):
+  - NtDuplicateObject é o ObDuplicateObject: os handles do processo de
+    origem e do de destino saem da tabela de quem chama e pedem
+    PROCESS_DUP_HANDLE; o handle de origem é procurado na tabela do processo
+    de origem (o pseudo-handle de processo é o próprio processo de origem);
+    a cópia entra na tabela do destino anexado a ele
+    (`state::duplicate_user_handle_in`), com o acesso (DUPLICATE_SAME_ACCESS
+    ou um subconjunto do da origem; direitos a mais são negados) e os
+    atributos (OBJ_INHERIT, OBJ_PROTECT_CLOSE ou DUPLICATE_SAME_ATTRIBUTES)
+    pedidos, e os callbacks de objeto recebem os dois processos;
+    DUPLICATE_CLOSE_SOURCE fecha a origem no processo de origem, anexado a
+    ele, também quando a duplicação falha ou o destino é nulo.
+  - Herança: com `CreateProcessRequest.inherit_handles_from` (o
+    PROCESS_CREATE_FLAGS_INHERIT_HANDLES), `create_user_process` chama
+    `process_state::inherit_handles` logo depois do `create_process`, como o
+    ObInitProcess: cada handle do pai com OBJ_INHERIT entra no filho com o
+    MESMO valor, acesso e atributos, sobre a mesma descrição aberta e com a
+    linha na ObjectTable do filho, sem callbacks de objeto (só a contagem por
+    handle). Os handles que outros provedores publicam na ObjectTable do pai
+    (aberturas Zw de modo kernel sem OBJ_KERNEL_HANDLE) não são herdados.
+  - NtOpenProcess e NtOpenThread por CLIENT_ID: a mesma captura do NT
+    (OBJECT_ATTRIBUTES obrigatório, nome ou CLIENT_ID ausente →
+    STATUS_INVALID_PARAMETER_MIX, STATUS_INVALID_CID), de qualquer processo;
+    o acesso é concedido pelo SeDebugPrivilege do token efetivo ou pela DACL.
+    O descritor de uma thread é o do processo dela (os dois vêm do DACL
+    padrão do token primário do processo), e NtGetNextThread usa o mesmo.
+  - NtQueryInformationProcess(ProcessBasicInformation, ProcessImageFileName)
+    lê o EPROCESS do handle (PROCESS_QUERY_LIMITED_INFORMATION): PEB, PID,
+    InheritedFromUniqueProcessId, prioridade base e código de saída, ou o
+    caminho da imagem do `ProcessState`; NtQueryInformationThread já lia a
+    thread do handle (TEB e CLIENT_ID da ETHREAD).
+  - Teste: `ntos/test/multiprocess/cross_handles.rs`.
 - **Identidade do processo**: PID, PEB e cookie são os campos do EPROCESS
   corrente (`state::current_process_id`, `state::current_peb`, o
   `EPROCESS.Cookie`); o caminho da imagem, a PEB_LDR_DATA do kernel e os
@@ -737,9 +771,11 @@ dereference e o PFN livre volta ao de antes.
   criado, `run_created` = `start_created` + `wait_started`) e os
   autotestes. O pedido traz a imagem (caminho
   NT de um arquivo do volume, arquivo do volume ou bytes), o nome curto e
-  os parâmetros. A ordem: abrir a imagem e ler o layout (uma falha não cria
+  os parâmetros, e opcionalmente o pai de quem herdar os handles. A ordem:
+  abrir a imagem e ler o layout (uma falha não cria
   nada: `CreateFailure::FileOpen`/`ExeFormat`); `create_process` (EPROCESS,
-  PID, raiz própria, `ProcessState`, seção de imagem); anexado ao processo
+  PID, raiz própria, `ProcessState`, seção de imagem); a herança de handles
+  do pai, se pedida; anexado ao processo
   novo, as cópias de sistema, o executável, a pilha, a PEB
   (`mm/peb_teb.rs`, o MmCreatePeb: imagem, ApiSetMap +0x68, NLS, heap,
   versão, subsistema da imagem; PEB.Ldr NULL para a ntdll), a PEB_LDR_DATA

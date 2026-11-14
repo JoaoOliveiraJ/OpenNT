@@ -22,7 +22,6 @@ type Assert = fn(bool, &str);
 
 const INVALID_HANDLE: u32 = 0xC000_0008;
 const ACCESS_DENIED: u32 = 0xC000_0022;
-const NOT_SUPPORTED: u32 = 0xC000_00BB;
 /// PROCESS_QUERY_LIMITED_INFORMATION e PROCESS_ALL_ACCESS.
 const LIMITED: u32 = 0x1000;
 const ALL_ACCESS: u32 = 0x1F_FFFF;
@@ -143,15 +142,16 @@ pub fn run(assert: Assert) {
     assert(from_a == Some((Some(0), (0, target), ACCESS_DENIED)), "handles: em A o handle resolve com o acesso de A");
     assert(attached(b, || reference(in_b, ALL_ACCESS, 1)) == Some((0, target)), "handles: em B o mesmo objeto resolve com o acesso de B");
 
-    // O processo de um handle é comparado com o processo corrente (o
-    // anexado), e o handle é procurado na tabela dele.
-    let duplicate_checks = attached(a, || {
+    // O EPROCESS de um handle de processo sai da tabela do processo corrente
+    // (o anexado), com o acesso do handle; o processo nomeado pode ser outro
+    // (as operações entre processos).
+    let process_checks = attached(a, || {
         let own = open_process(a, a_id, ALL_ACCESS).unwrap_or(0);
-        let checks = (user_handles::current_process(own, 0x40), user_handles::current_process(in_a, 0));
+        let checks = (user_handles::process_pointer(own, 0x40), user_handles::process_pointer(in_a, 0), user_handles::process_pointer(in_a, 0x40));
         let _ = close::close(own, Some(1));
         checks
     });
-    assert(duplicate_checks == Some((0, NOT_SUPPORTED)) && attached(b, || user_handles::current_process(in_a, 0)) == Some(INVALID_HANDLE), "handles: o processo do handle confere com o processo anexado");
+    assert(process_checks == Some((Ok(a), Ok(target), Err(ACCESS_DENIED))) && attached(b, || user_handles::process_pointer(in_a, 0)) == Some(Err(INVALID_HANDLE)), "handles: o processo do handle sai da tabela do processo anexado, com o acesso do handle");
 
     // Fechar em A não afeta B.
     let closed = attached(a, || (close::close(in_a, Some(1)).ok(), state::get_user_handle(in_a).is_none(), close::close(in_a, Some(1)).ok()));

@@ -1506,12 +1506,14 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     teb_view.tls_slots[5].set(0x55);
     guest::write32(info, 5);
     assert(call("NtSetInformationThread", handle, 10, info, 4) == 0 && teb_view.tls_slots[5].get() == 0, "userthreads: ThreadZeroTlsCell zera o indice nas TEBs");
-    // Abertura por CLIENT_ID.
+    // Abertura por CLIENT_ID (o OBJECT_ATTRIBUTES é obrigatório).
+    let oa = block + 0x240;
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(oa) }, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
     client_id.unique_process.set(0);
-    assert(call("NtOpenThread", out, 0x40, 0, cid) == 0, "userthreads: NtOpenThread pelo id");
+    assert(call("NtOpenThread", out, 0x40, oa, cid) == 0 && call("NtOpenThread", out, 0x40, 0, cid) == 0xC000_0005, "userthreads: NtOpenThread pelo id, OBJECT_ATTRIBUTES obrigatorio");
     let opened = guest::read64(out);
     client_id.unique_process.set(0x7777_0000);
-    assert(call("NtOpenThread", out, 0x40, 0, cid) == 0xC000_000B && call("NtSuspendThread", opened, 0, 0, 0) == 0xC000_0022, "userthreads: processo alheio e acesso insuficiente");
+    assert(call("NtOpenThread", out, 0x40, oa, cid) == 0xC000_000B && call("NtSuspendThread", opened, 0, 0, 0) == 0xC000_0022, "userthreads: processo alheio e acesso insuficiente");
     // Alertas por id e esperas, com a thread retomada como corrente (laço real).
     let previous_thread = process::get_current_thread();
     let _ = call("NtResumeThread", handle, 0, 0, 0);
@@ -5001,6 +5003,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::own_root::run(assert);
     crate::ntos::test::multiprocess::create_path::run(assert);
     crate::ntos::test::multiprocess::all_processes::run(assert);
+    crate::ntos::test::multiprocess::cross_handles::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

@@ -514,6 +514,19 @@ fn nt_flush_instruction_cache(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64)
     Ok(STATUS_SUCCESS)
 }
 
+/// PROCESS_QUERY_LIMITED_INFORMATION, o que ProcessBasicInformation e
+/// ProcessImageFileName pedem do handle.
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// O EPROCESS consultado: o do handle (de qualquer processo, procurado na
+/// tabela de quem chama) ou o corrente pelo pseudo-handle.
+fn queried_process(handle: u64) -> Result<u64, u32> {
+    if handle as u32 == u32::MAX {
+        return Ok(crate::ntos::ps::process::get_current_process());
+    }
+    super::handles::process_pointer(handle, PROCESS_QUERY_LIMITED_INFORMATION)
+}
+
 /// NtQueryInformationProcess(handle, class, buffer, length, retLen*).
 fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     let class = class as u32;
@@ -523,23 +536,21 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     // As classes locais sondam o ReturnLength antes de qualquer escrita.
     let local = matches!(class, 0 | 27 | 31 | 36);
     if local && returned != 0 && !probe_user_write(returned, 4) {
-        if class == 0 && handle as i64 != -1 && handle as u32 != u32::MAX {
-            let status = super::handles::current_process(handle, 0x1000);
-            if status != 0 {
+        if class == 0 {
+            if let Err(status) = queried_process(handle) {
                 return Ok(status);
             }
         }
         return Ok(0xC000_0005);
     }
     state::guarded(|| match class {
-        // ProcessBasicInformation (ou a estendida com Size e Flags).
+        // ProcessBasicInformation (ou a estendida com Size e Flags), do
+        // EPROCESS do handle: o processo consultado pode ser outro.
         0 => {
-            if handle as i64 != -1 && handle as u32 != u32::MAX {
-                let status = super::handles::current_process(handle, 0x1000);
-                if status != 0 {
-                    return Ok(status);
-                }
-            }
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
             let extended = length >= ProcessExtendedBasicInformation::SIZE;
             let size = if extended { ProcessExtendedBasicInformation::SIZE } else { ProcessBasicInformation::SIZE };
             if length != ProcessBasicInformation::SIZE && !extended {
@@ -557,13 +568,16 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             } else {
                 state::user_struct::<ProcessBasicInformation>(buffer)?
             };
-            let (peb, process_id) = (state::current_peb(), state::current_process_id());
-            basic.exit_status.probe_set(0x103)?; // processo vivo: STATUS_PENDING
-            basic.peb_base_address.probe_set(peb)?;
+            // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+            let process = unsafe { Eprocess::at(target) };
+            // STATUS_PENDING enquanto vivo; o código de saída depois do
+            // término.
+            basic.exit_status.probe_set(process.exit_status.get())?;
+            basic.peb_base_address.probe_set(process.peb.get())?;
             basic.affinity_mask.probe_set(1)?; // o escalonador de usuário roda no BSP
-            basic.base_priority.probe_set(8)?;
-            basic.unique_process_id.probe_set(process_id)?;
-            basic.inherited_from_unique_process_id.probe_set(4)?; // criado pelo processo System
+            basic.base_priority.probe_set(process.pcb.base_priority.get() as i32)?;
+            basic.unique_process_id.probe_set(process.unique_process_id.get())?;
+            basic.inherited_from_unique_process_id.probe_set(process.inherited_from_unique_process_id.get())?;
             set_returned(size as u32)?;
             Ok(STATUS_SUCCESS)
         }
@@ -574,9 +588,14 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         },
         // ProcessImageInformation: dados da seção da imagem do alvo.
         37 => query_image_information(rsp),
-        // ProcessImageFileName: UNICODE_STRING seguido do texto.
+        // ProcessImageFileName: UNICODE_STRING seguido do texto, do processo
+        // do handle.
         27 => {
-            let path = super::process_state::current().map(|identity| identity.image_path()).unwrap_or_default();
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            let path = super::process_state::get(target).map(|identity| identity.image_path()).unwrap_or_default();
             let path = if path.is_empty() { String::from("C:\\usertest.exe") } else { path };
             let need = UnicodeString::SIZE + (path.encode_utf16().count() as u64 + 1) * 2;
             if length < need {

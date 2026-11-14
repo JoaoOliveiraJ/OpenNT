@@ -22,7 +22,8 @@
 //! `vad` de um estado.
 //!
 //! Moram aqui a tabela de handles de usuário (`handles`, operada por
-//! `state.rs`), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
+//! `state.rs`; um processo novo pode herdar os handles inherit do pai,
+//! [`inherit_handles`]), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
 //! gravada por `mm::process_address_space`), as threads de usuário e o
 //! início do laço (`threads`, `started`), os módulos do loader do kernel, a
 //! imagem principal e as cópias privadas da ntdll, do apiset e do NLS na
@@ -188,6 +189,17 @@ pub fn get(process: u64) -> Option<Arc<ProcessState>> {
 /// tabela de ids de cliente).
 pub fn by_id(process_id: u64) -> Option<Arc<ProcessState>> {
     PROCESSES.lock().values().find(|state| state.process_id == process_id).cloned()
+}
+
+/// A herança de handles de um processo novo (o ObInitProcess do
+/// PspAllocateProcess com PROCESS_CREATE_FLAGS_INHERIT_HANDLES): os handles
+/// de `parent` marcados OBJ_INHERIT entram na tabela de `child` com os
+/// mesmos valores (`state::inherit_user_handles`). Um pai que já terminou
+/// não tem tabela: STATUS_PROCESS_IS_TERMINATING. Devolve quantos.
+pub fn inherit_handles(parent: u64, child: u64) -> Result<usize, KernelError> {
+    let parent = get(parent).ok_or_else(|| KernelError::with_status("pai sem tabela de handles", 0xC000_010A))?;
+    let child = get(child).ok_or_else(|| KernelError::new("processo novo sem estado"))?;
+    state::inherit_user_handles(&parent, &child)
 }
 
 /// O estado do processo corrente (o anexado, quando há attach). `None`

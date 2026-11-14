@@ -57,7 +57,7 @@ pub fn windows_process_request<'a>(image: ImageOrigin, image_name: &'a str, dos_
     }
     parameters.standard_output = options.standard_output;
     parameters.standard_error = options.standard_output;
-    CreateProcessRequest { image, image_name, parameters, on_created: options.on_process_created }
+    CreateProcessRequest { image, image_name, parameters, on_created: options.on_process_created, inherit_handles_from: None }
 }
 
 /// Um processo posto no despachante por [`start_created`]: anda com os

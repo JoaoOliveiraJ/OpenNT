@@ -468,6 +468,14 @@ pub fn perform(item: &Described, desired_access: u32, options: &PerformOptions, 
 /// Encaminha aberturas e duplicações de processos ou threads aos callbacks
 /// registrados; os demais tipos executam a ação diretamente.
 pub fn route(kind: &str, data: &ObjectData, operation: u32, from_user_mode: bool, action: &mut dyn FnMut(u32) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
+    let current = process::get_current_process();
+    route_between(kind, data, operation, from_user_mode, current, current, action)
+}
+
+/// [`route`] com os processos de origem e destino de uma duplicação entre
+/// processos (os do OB_PRE_DUPLICATE_HANDLE_INFORMATION); numa abertura os
+/// dois são o processo que recebe o handle.
+pub fn route_between(kind: &str, data: &ObjectData, operation: u32, from_user_mode: bool, source_process: u64, target_process: u64, action: &mut dyn FnMut(u32) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
     let access = data.access.unwrap_or(0);
     if registration_count() == 0 || (kind != "Process" && kind != "Thread") {
         return action(access);
@@ -489,8 +497,8 @@ pub fn route(kind: &str, data: &ObjectData, operation: u32, from_user_mode: bool
         operation,
         enforce: from_user_mode,
         kernel_handle: data.open_attributes.unwrap_or(0) & 0x200 != 0,
-        source_process: process::get_current_process(),
-        target_process: process::get_current_process(),
+        source_process,
+        target_process,
     };
     let desired = data.access.unwrap_or(object_type.valid_access);
     let outcome = perform(&item, desired, &options, &mut |granted| match action(granted) {

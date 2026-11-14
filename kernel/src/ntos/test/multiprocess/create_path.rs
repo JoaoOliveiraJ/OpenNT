@@ -115,7 +115,7 @@ pub fn run(assert: Assert) {
 
     let mut parameters = ProcessParameters::for_image(IMAGE_PATH);
     parameters.command_line = String::from(COMMAND_LINE);
-    let request = CreateProcessRequest { image: ImageOrigin::Bytes(program()), image_name: IMAGE_NAME, parameters, on_created: None };
+    let request = CreateProcessRequest { image: ImageOrigin::Bytes(program()), image_name: IMAGE_NAME, parameters, on_created: None, inherit_handles_from: None };
     match create::create_user_process(&request) {
         Ok(created) => {
             let (process_pointer, process_id) = (created.process_pointer, created.process_id);
@@ -155,7 +155,7 @@ pub fn run(assert: Assert) {
 
     // Imagem inexistente: nada é criado.
     let before = process::list_active_processes().len();
-    let missing = create::create_user_process(&CreateProcessRequest { image: ImageOrigin::NtPath(String::from(MISSING_IMAGE)), image_name: "naoexiste.exe", parameters: ProcessParameters::for_image("C:\\OpenNT\\naoexiste.exe"), on_created: None });
+    let missing = create::create_user_process(&CreateProcessRequest { image: ImageOrigin::NtPath(String::from(MISSING_IMAGE)), image_name: "naoexiste.exe", parameters: ProcessParameters::for_image("C:\\OpenNT\\naoexiste.exe"), on_created: None, inherit_handles_from: None });
     let refused = matches!(&missing, Err(CreateFailure::FileOpen(STATUS_OBJECT_NAME_NOT_FOUND)));
     assert(refused && missing.as_ref().err().is_some_and(|failure| failure.status() == STATUS_OBJECT_NAME_NOT_FOUND) && process::list_active_processes().len() == before, "criacao: imagem inexistente por caminho NT falha ao abrir, sem criar processo");
     drop(missing);

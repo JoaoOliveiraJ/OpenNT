@@ -1471,24 +1471,6 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
     result
 }
 
-fn nt_open_thread(out: u64, access: u64, attributes: u64, cid: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if !probe_user_write(out, 8) || !probe_user_read(cid, 16) || (attributes != 0 && !probe_user_read(attributes, 48)) {
-        return Ok(0xC000_0005);
-    }
-    let client = match state::user_struct::<ClientId>(cid).and_then(|client| Ok((client.unique_process.probe_get()?, client.unique_thread.probe_get()?))) {
-        Ok(client) => client,
-        Err(error) => return Ok(error.status),
-    };
-    let (pid, tid) = client;
-    let thread = all().into_iter().find(|thread| thread.thread_id == tid && thread.with(|thread| !thread.dead || thread.handles != 0));
-    let Some(thread) = thread.filter(|thread| pid == 0 || pid == owner_process_id(thread)) else { return Ok(0xC000_000B) };
-    // PHANDLE de saída (sondado acima).
-    if guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?).is_err() {
-        return Ok(0xC000_0005);
-    }
-    Ok(0)
-}
-
 fn change_suspend(handle: u64, out: u64, delta: i32) -> u32 {
     let thread = match resolve(handle, 2) {
         Ok(thread) => thread,
@@ -1595,7 +1577,7 @@ fn terminate_thread(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelE
 
 /// O PID do CLIENT_ID da thread (ETHREAD.Cid); uma thread já recolhida
 /// pertencia ao processo corrente, dono do handle por onde foi achada.
-fn owner_process_id(thread: &UserThread) -> u64 {
+pub fn owner_process_id(thread: &UserThread) -> u64 {
     match thread.pointer() {
         0 => state::current_process_id(),
         // SAFETY: ETHREAD vivo, retido pela thread de usuário.
@@ -1828,7 +1810,6 @@ pub fn init() {
     completion_objects::set_thread_eligibility(eligible);
     set_pump(pump::TIMERS, super::timer_objects::pump);
     state::register_handler("NtCreateThreadEx", nt_create_thread_ex);
-    state::register_handler("NtOpenThread", nt_open_thread);
     state::register_handler("NtSuspendThread", nt_suspend_thread);
     state::register_handler("NtResumeThread", nt_resume_thread);
     state::register_handler("NtTerminateThread", nt_terminate_thread);

@@ -11,7 +11,9 @@
 //!    aqui não cria nada;
 //! 2. PspAllocateProcess: `process::create_process` dá o EPROCESS, o PID da
 //!    tabela de ids de cliente, a raiz própria, o `ProcessState` e a seção de
-//!    imagem; o estado guarda o caminho da imagem;
+//!    imagem; o estado guarda o caminho da imagem; com
+//!    `inherit_handles_from` (PROCESS_CREATE_FLAGS_INHERIT_HANDLES), o
+//!    ObInitProcess copia os handles inherit do pai com os mesmos valores;
 //! 3. anexado ao processo novo (MmInitializeProcessAddressSpace e
 //!    MmCreatePeb): as cópias de sistema (ntdll, apiset e NLS), o executável
 //!    na raiz dele, a pilha da primeira thread, a PEB (`mm/peb_teb.rs`), a
@@ -91,6 +93,10 @@ pub struct CreateProcessRequest<'a> {
     /// Chamado com o PID quando o processo já está inteiro e ainda parado;
     /// uma falha termina o processo.
     pub on_created: Option<&'a dyn Fn(u64) -> Result<(), KernelError>>,
+    /// PROCESS_CREATE_FLAGS_INHERIT_HANDLES: o EPROCESS do pai cujos handles
+    /// marcados OBJ_INHERIT o processo novo recebe, com os mesmos valores.
+    /// `None`: a tabela do processo novo nasce vazia.
+    pub inherit_handles_from: Option<u64>,
 }
 
 /// Por que a criação falhou (os estados de falha do PS_CREATE_INFO).
@@ -386,6 +392,11 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         exit_process(process_pointer, status);
         CreateFailure::Terminated(status)
     };
+    // ObInitProcess: a herança de handles do pai, antes de o processo novo
+    // ter qualquer thread.
+    if let Some(parent) = request.inherit_handles_from {
+        process_state::inherit_handles(parent, process_pointer).map_err(fail)?;
+    }
     // O espaço do processo novo, anexado: as cópias de sistema, o exe na
     // raiz dele (a ntdll real faz o binding e a relocação), a ntdll e o exe
     // no VAD, a pilha da primeira thread, a PEB, os parâmetros, a TEB e o

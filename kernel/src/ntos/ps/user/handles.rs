@@ -2,17 +2,20 @@
 //!
 //! Duplicatas referem-se à mesma descrição aberta; acesso, herança e
 //! proteção contra fechamento pertencem a cada handle. Implementado:
-//! NtDuplicateObject e NtSetInformationObject. Pendente: NtQueryObject (com
+//! NtDuplicateObject (também entre dois processos quaisquer),
+//! NtSetInformationObject, NtOpenProcess e NtOpenThread por CLIENT_ID,
+//! NtGetNextProcess e NtGetNextThread. Pendente: NtQueryObject (com
 //! `ob/query_object`) e a duplicação do pseudo-handle de thread (com
 //! `ps/user/threads`).
 
 use alloc::sync::Arc;
 use core::any::Any;
 
+use super::process_state::{self, ProcessState};
 use super::state::{self, NativeBody, UserObject};
 use crate::ntos::ob::object_manager::ObjectData;
-use crate::ntos::ob::{close, object_types, open_pointer};
-use crate::ntos::ps::process;
+use crate::ntos::ob::{object_types, open_pointer};
+use crate::ntos::ps::{process, process_context};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::ObjectHandleFlagInformation;
@@ -20,6 +23,10 @@ use crate::ntos::inc::types::ObjectHandleFlagInformation;
 const INVALID: u32 = 0xC000_000D;
 const BAD_HANDLE: u32 = 0xC000_0008;
 const AV: u32 = 0xC000_0005;
+/// PROCESS_DUP_HANDLE, exigido dos dois processos de uma duplicação.
+const PROCESS_DUP_HANDLE: u32 = 0x40;
+/// STATUS_PROCESS_IS_TERMINATING: o processo já não tem tabela de handles.
+const PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
 fn is_pseudo_process(handle: u64) -> bool {
     handle == u64::MAX || handle == 0xFFFF_FFFF
@@ -90,89 +97,94 @@ impl UserObject for UserProcess {
     }
 }
 
-/// O processo de destino/origem precisa ser o processo corrente, o anexado
-/// quando há attach (as operações entre processos ainda não existem). O
-/// handle é procurado na tabela desse mesmo processo.
-pub fn current_process(handle: u64, access: u32) -> u32 {
-    if is_pseudo_process(handle) {
-        return 0;
+/// O EPROCESS de um handle de processo da tabela do processo corrente (o
+/// pseudo-handle é o próprio corrente), com PROCESS_DUP_HANDLE, e a tabela
+/// de handles dele: o processo de origem ou de destino de uma duplicação.
+fn duplication_process(handle: u64) -> Result<(u64, Arc<ProcessState>), u32> {
+    let pointer = process_pointer(handle, PROCESS_DUP_HANDLE)?;
+    let table = process_state::get(pointer).ok_or(PROCESS_IS_TERMINATING)?;
+    Ok((pointer, table))
+}
+
+/// Roda `body` anexado a `process`, o KeStackAttachProcess do
+/// ObDuplicateObject; no processo corrente, sem attach.
+fn attached<T>(process: u64, body: impl FnOnce() -> T) -> Result<T, KernelError> {
+    if process == process::get_current_process() {
+        return Ok(body());
     }
-    let Some(entry) = state::get_user_handle(handle) else { return BAD_HANDLE };
-    if entry.kind() != "process" {
-        return 0xC000_0024;
-    }
-    if entry.access() & access != access {
-        return 0xC000_0022;
-    }
-    if entry.object.callback_data().native_pointer == process::get_current_process() {
-        0
-    } else {
-        0xC000_00BB
-    }
+    process_context::with_process(process, body)
 }
 
 /// NtDuplicateObject(sourceProcess, sourceHandle, targetProcess, target*,
-/// access, attributes, options).
+/// access, attributes, options), o ObDuplicateObject: os dois handles de
+/// processo são da tabela de quem chama e pedem PROCESS_DUP_HANDLE; o handle
+/// de origem é procurado na tabela do processo de origem (o pseudo-handle de
+/// processo é o próprio processo de origem); a cópia entra na tabela do
+/// processo de destino, anexado a ele, e o valor volta a quem chamou.
+/// DUPLICATE_CLOSE_SOURCE fecha a origem no processo de origem, anexado a
+/// ele, mesmo quando a duplicação falha.
 fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: u64, out: u64, rsp: u64) -> Result<u32, KernelError> {
     if !state::probe_syscall_stack(rsp, 24) {
         return Ok(AV);
     }
-    let options = state::stack_arg32(rsp, 7);
+    // Os argumentos de pilha moram na memória de quem chama: lidos antes de
+    // qualquer attach.
+    let (requested_access, requested_attributes, options) = (state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg32(rsp, 7));
     if options & !7 != 0 {
         return Ok(INVALID);
     }
-    let status = current_process(source_process, 0x40);
-    if status != 0 {
-        return Ok(status);
-    }
+    let (source, source_table) = match duplication_process(source_process) {
+        Ok(found) => found,
+        Err(status) => return Ok(status),
+    };
     let pseudo_process = is_pseudo_process(source_handle);
     let pseudo_thread = is_pseudo_thread(source_handle);
-    let entry = state::get_user_handle(source_handle);
+    let entry = state::get_user_handle_in(&source_table, source_handle);
     if entry.is_none() && !pseudo_process {
         // O pseudo-handle de thread entra com `ps/user/threads`.
         return Ok(BAD_HANDLE);
     }
     let (source_access, source_attributes) = entry.as_ref().map_or((0x1F_FFFF, 0), |entry| (entry.access(), entry.attributes()));
-    let mut new_handle: Option<u32> = None;
+    let mut new_handle: Option<(u32, u64, Arc<ProcessState>)> = None;
     let result = (|| -> Result<u32, KernelError> {
         if target_process == 0 {
             return Ok(if options & 1 != 0 { 0 } else { INVALID });
         }
-        let status = current_process(target_process, 0x40);
-        if status != 0 {
-            return Ok(status);
-        }
+        let (target, target_table) = match duplication_process(target_process) {
+            Ok(found) => found,
+            Err(status) => return Ok(status),
+        };
         if out != 0 && !state::probe_user_write(out, 8) {
             return Ok(AV);
         }
-        let attributes = if options & 4 != 0 { source_attributes } else { state::stack_arg32(rsp, 6) };
+        let attributes = if options & 4 != 0 { source_attributes } else { requested_attributes };
         if attributes & !3 != 0 {
             return Ok(INVALID);
         }
-        let access = if options & 2 != 0 { source_access } else { state::stack_arg32(rsp, 5) };
+        let access = if options & 2 != 0 { source_access } else { requested_access };
         // Direitos ausentes na origem exigem nova checagem de segurança:
         // nunca são concedidos em silêncio pela duplicação.
         if access & !source_access != 0 {
             return Ok(0xC000_0022);
         }
-        let handle = match (&entry, pseudo_process) {
-            (Some(entry), false) => state::duplicate_user_handle(entry, access, attributes)?,
+        let inserted = attached(target, || match (&entry, pseudo_process) {
+            (Some(entry), false) => state::duplicate_user_handle_in(entry, source, &target_table, access, attributes),
             _ => {
-                let current = process::get_current_process();
-                state::alloc_user_handle(Arc::new(UserProcess { pointer: current, process_id: state::current_process_id() }), access, attributes)?
+                let process_id = eprocess(source).unique_process_id.get();
+                state::alloc_user_handle_in(&target_table, Arc::new(UserProcess { pointer: source, process_id }), access, attributes, Some(source))
             }
-        };
-        new_handle = Some(handle);
+        })??;
+        new_handle = Some((inserted, target, target_table));
         if out != 0 {
-            // PHANDLE de saída (sondado acima).
-            guest::try_write::<u64>(out, handle as u64)?;
+            // PHANDLE de saída (sondado acima), na memória de quem chama.
+            guest::try_write::<u64>(out, inserted as u64)?;
         }
         Ok(0)
     })();
     let result = match result {
         Err(error) => {
-            if let Some(handle) = new_handle {
-                close::close_user(handle as u64, true);
+            if let Some((handle, target, table)) = new_handle {
+                let _ = attached(target, || state::close_user_handle_in(&table, handle as u64, true, true));
             }
             if error.status != 0 {
                 Ok(error.status)
@@ -185,7 +197,7 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
     // O Windows preserva uma origem protegida mesmo quando a duplicata é
     // produzida: a tentativa de fechar não sobrepõe a proteção.
     if options & 1 != 0 && !pseudo_process && !pseudo_thread {
-        close::close_user(source_handle, false);
+        let _ = attached(source, || state::close_user_handle_in(&source_table, source_handle & !3, true, false));
     }
     result
 }
@@ -240,11 +252,12 @@ pub fn init() {
     state::register_handler("NtDuplicateObject", nt_duplicate_object);
     state::register_handler("NtSetInformationObject", nt_set_information_object);
     state::register_handler("NtOpenProcess", nt_open_process);
+    state::register_handler("NtOpenThread", nt_open_thread);
     state::register_handler("NtGetNextProcess", nt_get_next_process);
     state::register_handler("NtGetNextThread", nt_get_next_thread);
 }
 
-// ---- NtOpenProcess / NtGetNextProcess / NtGetNextThread ----
+// ---- NtOpenProcess / NtOpenThread / NtGetNextProcess / NtGetNextThread ----
 //
 // Medidos no ntoskrnl 19045:
 //   NtOpenProcess -> PsOpenProcess(..., UserMode): o PHANDLE é sondado
@@ -256,6 +269,12 @@ pub fn init() {
 //   PsLookupProcessByProcessId; com SeDebugPrivilege o pedido é concedido
 //   (MAXIMUM_ALLOWED vira PROCESS_ALL_ACCESS); senão ObOpenObjectByPointer
 //   em UserMode decide pela DACL do EPROCESS.
+//   NtOpenThread -> PsOpenThread(..., UserMode): a mesma captura (PHANDLE,
+//   OBJECT_ATTRIBUTES obrigatório, CLIENT_ID, nome ou CLIENT_ID ausente ->
+//   STATUS_INVALID_PARAMETER_MIX); com UniqueProcess,
+//   PsLookupProcessThreadByCid (a thread precisa ser do processo dado), senão
+//   PsLookupThreadByThreadId; STATUS_INVALID_CID quando não acha; o
+//   SeDebugPrivilege e a DACL da thread decidem o acesso, como no processo.
 //   NtGetNextProcess(process, access, attributes, flags, out*): atributos &
 //   0x1DF2; a saída é sondada e zerada; Flags só aceita o bit 0 (para trás)
 //   -> senão STATUS_INVALID_PARAMETER; abre o próximo da PsActiveProcessHead,
@@ -264,10 +283,12 @@ pub fn init() {
 //   saída é sondada e zerada; Flags != 0 -> STATUS_INVALID_PARAMETER;
 //   PROCESS_QUERY_INFORMATION no processo; a thread dada precisa ser dele
 //   (senão STATUS_INVALID_PARAMETER); abre a próxima thread do processo.
-// Só o processo hospedado tem threads com handle de usuário (threads de
-// kernel não têm objeto de usuário): nos demais, NtGetNextThread não abre
-// nenhuma (STATUS_NO_MORE_ENTRIES). As threads seguem a política sem DACL do
-// NtOpenThread deste kernel (direitos genéricos mapeados).
+// Só as threads de usuário têm objeto de handle (threads de kernel não têm):
+// NtOpenThread não as acha (STATUS_INVALID_CID) e NtGetNextThread não as abre
+// (STATUS_NO_MORE_ENTRIES num processo sem threads de usuário). O descritor
+// de segurança de uma thread é o do processo dela: os dois vêm do DACL
+// padrão do token primário do processo na criação, como os objetos que o NT
+// cria sem descritor explícito.
 
 use alloc::vec::Vec;
 use core::mem::offset_of;
@@ -275,6 +296,7 @@ use core::mem::offset_of;
 use super::threads;
 use crate::ntos::inc::types::{ClientId, Eprocess, Kthread, NtStruct, ObjectAttributes};
 use crate::ntos::ob::object_access;
+use crate::ntos::ob::object_types::ObjectType;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::tokens;
 
@@ -323,22 +345,82 @@ pub fn process_pointer(handle: u64, access: u32) -> Result<u64, u32> {
     entry.downcast::<UserProcess>().map(|object| object.pointer).ok_or(BAD_HANDLE)
 }
 
-/// Direitos de um novo handle de processo (PsOpenProcess/NtGetNextProcess +
-/// ObOpenObjectByPointer em UserMode).
-fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
-    let process_type = object_types::process_type();
+/// Direitos de um novo handle de processo ou thread (PsOpenProcess/
+/// PsOpenThread + ObOpenObjectByPointer em UserMode): com SeDebugPrivilege
+/// habilitado no token efetivo o pedido é concedido; senão a DACL decide.
+fn open_access(object_type: &ObjectType, policy: &SecurityPolicy, requested: u32) -> Result<u32, u32> {
     let token = object_access::subject();
     let debug = token.and_then(tokens::get).is_some_and(|token| token.privileges.iter().any(|privilege| privilege.id == DEBUG_PRIVILEGE && privilege.attributes & PRIVILEGE_ENABLED != 0));
     if debug {
-        let mask = object_access::map_generic_access(requested, &process_type);
+        let mask = object_access::map_generic_access(requested, object_type);
         let explicit = mask & !MAXIMUM_ALLOWED;
-        if explicit & !(process_type.valid_access | 0x0100_0000) != 0 {
+        if explicit & !(object_type.valid_access | 0x0100_0000) != 0 {
             return Err(DENIED);
         }
-        return Ok(explicit | if mask & MAXIMUM_ALLOWED != 0 { process_type.valid_access } else { 0 });
+        return Ok(explicit | if mask & MAXIMUM_ALLOWED != 0 { object_type.valid_access } else { 0 });
     }
-    let policy = process::with_record(pointer, |record| record.security.clone()).unwrap_or_default();
-    object_access::check(&policy, token, requested, &process_type, false)
+    object_access::check(policy, token, requested, object_type, false)
+}
+
+/// O descritor de segurança do EPROCESS (o de um processo que já saiu é o
+/// padrão).
+fn process_policy(pointer: u64) -> SecurityPolicy {
+    process::with_record(pointer, |record| record.security.clone()).unwrap_or_default()
+}
+
+/// Direitos de um novo handle de processo.
+fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
+    open_access(&object_types::process_type(), &process_policy(pointer), requested)
+}
+
+/// Direitos de um novo handle de thread: o descritor é o do processo dela.
+fn thread_access(thread: &threads::UserThread, requested: u32) -> Result<u32, u32> {
+    let owner = thread.with(|thread| thread.process_pointer);
+    open_access(&object_types::thread_type(), &process_policy(owner), requested)
+}
+
+/// O que PsOpenProcess/PsOpenThread capturam de UserMode: os atributos do
+/// handle (OBJECT_ATTRIBUTES.Attributes & 0x1DF2) e o CLIENT_ID.
+struct OpenByClientId {
+    attributes: u32,
+    process_id: u64,
+    thread_id: u64,
+}
+
+/// A captura comum de NtOpenProcess e NtOpenThread, na ordem do NT: o
+/// PHANDLE sondado, o OBJECT_ATTRIBUTES obrigatório (alinhado a 4), o
+/// CLIENT_ID (alinhado a 4); um nome ou a falta do CLIENT_ID é
+/// STATUS_INVALID_PARAMETER_MIX.
+fn capture_open(out: u64, attributes: u64, client_id: u64) -> Result<OpenByClientId, u32> {
+    if !state::probe_user_write(out, 8) {
+        return Err(AV);
+    }
+    if attributes & 3 != 0 {
+        return Err(MISALIGNED);
+    }
+    // O NT só exige alinhamento 4: leituras sondadas pelos offsets do tipo,
+    // sem uma referência ao OBJECT_ATTRIBUTES (alinhamento 8).
+    let name_offset = offset_of!(ObjectAttributes, object_name) as u64;
+    let attributes_offset = offset_of!(ObjectAttributes, attributes) as u64;
+    if !state::probe_user_read(attributes, attributes_offset + 4) {
+        return Err(AV);
+    }
+    let (named, object_attributes) = guest::try_read::<u64>(attributes + name_offset).and_then(|name| Ok((name != 0, guest::try_read::<u32>(attributes + attributes_offset)? & USER_ATTRIBUTES))).map_err(|error| error.status)?;
+    let mut ids = None;
+    if client_id != 0 {
+        if client_id & 3 != 0 {
+            return Err(MISALIGNED);
+        }
+        if !state::probe_user_read(client_id, ClientId::SIZE) {
+            return Err(AV);
+        }
+        let process_offset = offset_of!(ClientId, unique_process) as u64;
+        let thread_offset = offset_of!(ClientId, unique_thread) as u64;
+        let read = guest::try_read::<u64>(client_id + process_offset).and_then(|process_id| Ok((process_id, guest::try_read::<u64>(client_id + thread_offset)?))).map_err(|error| error.status)?;
+        ids = Some(read);
+    }
+    let (process_id, thread_id) = ids.filter(|_| !named).ok_or(PARAMETER_MIX)?;
+    Ok(OpenByClientId { attributes: object_attributes, process_id, thread_id })
 }
 
 /// Publica o handle de usuário do EPROCESS (callbacks de objeto incluídos).
@@ -353,39 +435,10 @@ fn open_process_handle(pointer: u64, access: u32, attributes: u32) -> Result<Res
 
 /// NtOpenProcess(out, access, attributes, clientId).
 fn nt_open_process(out: u64, access: u64, attributes: u64, client_id: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) {
-        return Ok(AV);
-    }
-    if attributes & 3 != 0 {
-        return Ok(MISALIGNED);
-    }
-    // O NT só exige alinhamento 4: leituras sondadas pelos offsets do tipo,
-    // sem uma referência ao OBJECT_ATTRIBUTES (alinhamento 8).
-    let name_offset = offset_of!(ObjectAttributes, object_name) as u64;
-    let attributes_offset = offset_of!(ObjectAttributes, attributes) as u64;
-    if !state::probe_user_read(attributes, attributes_offset + 4) {
-        return Ok(AV);
-    }
-    let (named, object_attributes) = match guest::try_read::<u64>(attributes + name_offset).and_then(|name| Ok((name != 0, guest::try_read::<u32>(attributes + attributes_offset)? & USER_ATTRIBUTES))) {
-        Ok(read) => read,
-        Err(error) => return Ok(error.status),
+    let OpenByClientId { attributes: object_attributes, process_id, thread_id } = match capture_open(out, attributes, client_id) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
     };
-    let mut ids = None;
-    if client_id != 0 {
-        if client_id & 3 != 0 {
-            return Ok(MISALIGNED);
-        }
-        if !state::probe_user_read(client_id, ClientId::SIZE) {
-            return Ok(AV);
-        }
-        let process_offset = offset_of!(ClientId, unique_process) as u64;
-        let thread_offset = offset_of!(ClientId, unique_thread) as u64;
-        match guest::try_read::<u64>(client_id + process_offset).and_then(|process_id| Ok((process_id, guest::try_read::<u64>(client_id + thread_offset)?))) {
-            Ok(read) => ids = Some(read),
-            Err(error) => return Ok(error.status),
-        }
-    }
-    let Some((process_id, thread_id)) = ids.filter(|_| !named) else { return Ok(PARAMETER_MIX) };
     let target = if thread_id != 0 {
         let thread = process::reference_thread_by_id(thread_id);
         if thread == 0 {
@@ -414,6 +467,30 @@ fn nt_open_process(out: u64, access: u64, attributes: u64, client_id: u64, _rsp:
         // PHANDLE de saída (sondado acima).
         Ok(handle) => Ok(guest::try_write::<u64>(out, handle as u64).map_or(AV, |()| 0)),
         Err(status) => Ok(status),
+    }
+}
+
+/// NtOpenThread(out, access, attributes, clientId): a thread de usuário viva
+/// (ou ainda com handle) do CLIENT_ID, de qualquer processo.
+fn nt_open_thread(out: u64, access: u64, attributes: u64, client_id: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let OpenByClientId { attributes: object_attributes, process_id, thread_id } = match capture_open(out, attributes, client_id) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
+    };
+    let found = threads::all().into_iter().find(|thread| thread.thread_id == thread_id && thread.with(|thread| !thread.dead || thread.handles != 0));
+    let Some(thread) = found.filter(|thread| process_id == 0 || threads::owner_process_id(thread) == process_id) else { return Ok(INVALID_CID) };
+    if object_attributes & OBJ_EXCLUSIVE != 0 {
+        return Ok(INVALID);
+    }
+    let granted = match thread_access(&thread, access as u32) {
+        Ok(granted) => granted,
+        Err(status) => return Ok(status),
+    };
+    match threads::thread_handle(&thread, granted, object_attributes & OBJ_INHERIT) {
+        // PHANDLE de saída (sondado acima).
+        Ok(handle) => Ok(guest::try_write::<u64>(out, handle).map_or(AV, |()| 0)),
+        Err(error) if error.status != 0 => Ok(error.status),
+        Err(error) => Err(error),
     }
 }
 
@@ -494,7 +571,6 @@ fn nt_get_next_thread(process_handle: u64, thread_handle: u64, access: u64, attr
         }
         all.iter().position(|candidate| Arc::ptr_eq(candidate, &previous)).map_or(all.len(), |index| index + 1)
     };
-    let thread_type = object_types::thread_type();
     for candidate in &all[start..] {
         let pointer = candidate.pointer();
         if pointer == 0 || kthread(pointer).process.get() != target {
@@ -503,7 +579,7 @@ fn nt_get_next_thread(process_handle: u64, thread_handle: u64, access: u64, attr
         if attributes & OBJ_EXCLUSIVE != 0 {
             return Ok(INVALID);
         }
-        let granted = match object_access::check(&SecurityPolicy::default(), None, access as u32, &thread_type, true) {
+        let granted = match thread_access(candidate, access as u32) {
             Ok(granted) => granted,
             Err(DENIED) => continue,
             Err(status) => return Ok(status),
