@@ -144,3 +144,103 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
     };
     if user.is_some() { execute() } else { previous_mode::with_kernel(execute)? }
 }
+
+// ---- ZwQueryWnfStateNameInformation ---------------------------------------
+//
+// NtQueryWnfStateNameInformation do 19041 em KernelMode: o nome é capturado
+// e decodificado, o escopo explícito capturado, e só então a classe (acima
+// de WnfInfoIsQuiescent = STATUS_INVALID_INFO_CLASS) e o tamanho (menos de
+// um ULONG = STATUS_INVALID_PARAMETER) são conferidos. O escopo resolve
+// pelo System; a instância do nome é procurada na árvore do escopo e, se não
+// há instância de um nome não temporário, a definição permanente responde
+// por ele. KernelMode dispensa o ExpWnfCheckCallerAccess. O ULONG de saída:
+// - WnfInfoStateNameExist (0): 1 com instância ou definição; um nome sem
+//   nenhuma das duas dá 0 com STATUS_SUCCESS;
+// - WnfInfoSubscribersPresent (1): DataSubscribersCount != 0 (0 sem
+//   instância);
+// - WnfInfoIsQuiescent (2): CurrentDeliveryCount == 0 (1 sem instância).
+// Nas classes 1 e 2 um nome sem instância nem definição devolve
+// STATUS_OBJECT_NAME_NOT_FOUND sem gravar a saída.
+
+/// WNF_STATE_NAME_INFORMATION.
+const WNF_INFO_STATE_NAME_EXIST: u32 = 0;
+const WNF_INFO_SUBSCRIBERS_PRESENT: u32 = 1;
+const WNF_INFO_IS_QUIESCENT: u32 = 2;
+
+/// A resposta de uma classe para a instância (ou só a definição) achada.
+fn name_information(class: u32, instance: Option<&state_data::NameState>) -> u32 {
+    match (class, instance) {
+        (WNF_INFO_SUBSCRIBERS_PRESENT, Some(state)) => (state.data_subscribers_count() != 0) as u32,
+        (WNF_INFO_SUBSCRIBERS_PRESENT, None) => 0,
+        (WNF_INFO_IS_QUIESCENT, Some(state)) => (state.current_delivery_count() == 0) as u32,
+        _ => 1,
+    }
+}
+
+fn query_name_information_captured(name: &DecodedName, class: u32, captured: &Captured) -> Result<Result<u32, u32>, KernelError> {
+    let scope = match namespace::resolve_kernel_scope(process::get_system_process(), name.scope, captured.identity)? {
+        Ok(scope) => scope,
+        Err(status) => return Ok(Err(status)),
+    };
+    let result = (|| -> Result<Result<u32, u32>, KernelError> {
+        match namespace::lookup_name(scope, name.decoded_name)? {
+            Ok(found) => {
+                let value = name_information(class, Some(&found));
+                namespace::release_name(&found)?;
+                Ok(Ok(value))
+            }
+            Err(0xC000_0034) if name.lifetime != 3 => match namespace::lookup_definition(name.decoded_name)? {
+                Ok(definition) => {
+                    definition.release();
+                    Ok(Ok(name_information(class, None)))
+                }
+                Err(status) => Ok(Err(status)),
+            },
+            Err(status) => Ok(Err(status)),
+        }
+    })();
+    namespace::release_scope(scope)?;
+    result
+}
+
+/// ZwQueryWnfStateNameInformation(StateName, NameInfoClass, ExplicitScope,
+/// InfoBuffer, InfoBufferLength). Devolve o NTSTATUS.
+pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    let execute = || -> Result<u32, KernelError> {
+        critical_region::enter_critical()?;
+        let mut captured = None;
+        let result = (|| -> Result<u32, KernelError> {
+            // SAFETY: PCWNF_STATE_NAME de um chamador de modo kernel.
+            let name = wnf_name::decode(unsafe { Field::<u64>::at(state_name) }.get());
+            if name.status != 0 {
+                return Ok(name.status);
+            }
+            let capture = match scope_capture::capture_kernel(name.scope, explicit_scope)? {
+                Ok(capture) => captured.insert(capture),
+                Err(status) => return Ok(status),
+            };
+            if class > WNF_INFO_IS_QUIESCENT {
+                return Ok(0xC000_0003);
+            }
+            if length < 4 {
+                return Ok(0xC000_000D);
+            }
+            let value = match query_name_information_captured(&name, class, capture)? {
+                Ok(value) => value,
+                Err(0xC000_0034) if class == WNF_INFO_STATE_NAME_EXIST => 0,
+                Err(status) => return Ok(status),
+            };
+            // SAFETY: o PULONG InfoBuffer de um chamador de modo kernel.
+            unsafe { Field::<u32>::at(buffer) }.set(value);
+            Ok(0)
+        })();
+        let left = critical_region::leave_critical();
+        if let Some(captured) = captured {
+            captured.release()?;
+        }
+        let result = result?;
+        left?;
+        Ok(result)
+    };
+    previous_mode::with_kernel(execute)?
+}

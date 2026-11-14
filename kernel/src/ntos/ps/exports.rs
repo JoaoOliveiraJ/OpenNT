@@ -1630,3 +1630,34 @@ pub mod ps_pool_quota {
 
     pub static GROUP: Group = Group { name: "ps-pool-quota", names: &["PsChargeProcessPoolQuota", "PsReturnPoolQuota"], handlers: &[charge, give_back], data_exports: &[] };
 }
+
+pub mod zw_set_information_process {
+    //! ZwSetInformationProcess: o NtSetInformationProcess em KernelMode, com a
+    //! lógica em `ps/set_process_information`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::set_process_information;
+    use crate::rtl::KernelError;
+
+    /// ZwSetInformationProcess(ProcessHandle, Class, Information, Length).
+    fn set_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(set_process_information::set_information_kernel(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-set-information-process", names: &["ZwSetInformationProcess"], handlers: &[set_information], data_exports: &[] };
+}
+
+pub mod zw_reserve_object {
+    //! ZwAllocateReserveObject; a lógica mora em `ps/memory_reserve`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::memory_reserve;
+    use crate::rtl::KernelError;
+
+    /// ZwAllocateReserveObject(MemoryReserveHandle, ObjectAttributes, Type).
+    fn allocate(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(memory_reserve::allocate_kernel(call.arg(1), call.arg(2), call.arg(3) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-reserve-object", names: &["ZwAllocateReserveObject"], handlers: &[allocate], data_exports: &[] };
+}

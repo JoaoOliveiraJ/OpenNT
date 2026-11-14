@@ -27,6 +27,7 @@ pub mod win32;
 pub mod hard_error;
 pub mod system_services;
 pub mod timer;
+pub mod timer_object;
 pub mod uuid;
 pub mod event;
 pub mod extension_host;

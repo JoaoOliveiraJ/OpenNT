@@ -742,9 +742,10 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     if let Some(setter) = setter {
         return setter(handle, buffer, length);
     }
-    // ProcessBreakOnTermination.
-    if class as u32 == 29 {
-        return crate::ntos::ps::set_process_information::break_on_termination(buffer, length as u32, |access| {
+    // ProcessBreakOnTermination e ProcessDebugFlags.
+    use crate::ntos::ps::set_process_information::{self as set_process, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS};
+    if matches!(class as u32, PROCESS_BREAK_ON_TERMINATION | PROCESS_DEBUG_FLAGS) {
+        return set_process::set_information(1, class as u32, buffer, length as u32, |access| {
             if handle as u32 == u32::MAX {
                 Ok(crate::ntos::ps::process::get_current_process())
             } else {

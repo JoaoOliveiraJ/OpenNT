@@ -74,27 +74,49 @@ pub fn pending_count() -> usize {
 /// KeyContext, ApcContext, IoStatus, IoStatusInformation): o pacote vai para
 /// a IOCP do handle, como o NtSetIoCompletionEx — um handle da tabela do
 /// processo corrente (com IO_COMPLETION_MODIFY_STATE) ou da tabela nativa
-/// (a IOCP criada em modo kernel). O pacote de reserva (um
-/// IoCompletionReserve do NtAllocateReserveObject) ainda não existe no
-/// OpenNT: um handle de reserva não nulo dá STATUS_INVALID_HANDLE.
+/// (a IOCP criada em modo kernel). Com IoCompletionPacketHandle, o pacote é
+/// o embutido no IoCompletionReserve do NtAllocateReserveObject: a reserva
+/// é tomada (InUse) depois da IOCP e o pacote vai pelo IoSetIoCompletionEx;
+/// uma falha devolve a reserva.
 pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, status: u32, information: u64) -> u32 {
-    if reserve != 0 {
-        return 0xC000_0008;
-    }
-    let port = match crate::ntos::ps::user::io_completion::resolve(handle, 2) {
-        Ok((_, port)) => port,
-        Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, false) {
-            Some(Ok(opened)) if opened.item.object_type.name == "IoCompletion" => match completion_objects::port_of(opened.item.pointer) {
-                Some(port) if opened.access & 2 != 0 => port,
-                Some(_) => return 0xC000_0022,
-                None => return 0xC000_0008,
-            },
-            Some(Ok(_)) => return 0xC000_0024,
-            Some(Err(status)) => return status,
-            None => return 0xC000_0008,
-        },
+    let port = match resolve_port(handle) {
+        Ok(port) => port,
         Err(status) => return status,
     };
-    completion_objects::enqueue(&port, Packet { key, context, status, information, ..Packet::default() });
-    0
+    if reserve == 0 {
+        completion_objects::enqueue(&port, Packet { key, context, status, information, ..Packet::default() });
+        return 0;
+    }
+    // ZwSetIoCompletionEx: o handle da reserva é referenciado em KernelMode.
+    let packet = match crate::ntos::ps::memory_reserve::take_completion_reserve(reserve, 0) {
+        Ok(Ok(packet)) => packet,
+        Ok(Err(status)) => return status,
+        Err(_) => return 0xC000_0001,
+    };
+    match post(port.pointer, key, context, status, information, 0, packet) {
+        Ok(0) => 0,
+        result => {
+            let _ = crate::ntos::ps::memory_reserve::abandon_completion_reserve(packet);
+            result.unwrap_or(0xC000_0001)
+        }
+    }
+}
+
+/// A IOCP do handle (IO_COMPLETION_MODIFY_STATE): a tabela do processo
+/// corrente ou a nativa.
+fn resolve_port(handle: u64) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
+    match crate::ntos::ps::user::io_completion::resolve(handle, 2) {
+        Ok((_, port)) => Ok(port),
+        Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, false) {
+            Some(Ok(opened)) if opened.item.object_type.name == "IoCompletion" => match completion_objects::port_of(opened.item.pointer) {
+                Some(port) if opened.access & 2 != 0 => Ok(port),
+                Some(_) => Err(0xC000_0022),
+                None => Err(0xC000_0008),
+            },
+            Some(Ok(_)) => Err(0xC000_0024),
+            Some(Err(status)) => Err(status),
+            None => Err(0xC000_0008),
+        },
+        Err(status) => Err(status),
+    }
 }

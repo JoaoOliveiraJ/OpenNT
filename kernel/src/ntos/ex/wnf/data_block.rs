@@ -88,6 +88,14 @@ impl NameState {
     pub fn set_change_stamp(&self, value: u32) {
         name_at(self.pointer).current_change_stamp.set(value);
     }
+    /// DataSubscribersCount: inscrições que pedem os dados.
+    pub fn data_subscribers_count(&self) -> i32 {
+        name_at(self.pointer).data_subscribers_count.get()
+    }
+    /// CurrentDeliveryCount: entregas ainda não consumidas.
+    pub fn current_delivery_count(&self) -> i32 {
+        name_at(self.pointer).current_delivery_count.get()
+    }
     pub fn description(&self) -> wnf_name::Description {
         wnf_name::Description { security_descriptor: self.security_descriptor(), type_identifier: self.type_identifier(), maximum_size: self.maximum_size() }
     }

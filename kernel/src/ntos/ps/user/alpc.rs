@@ -1212,6 +1212,13 @@ fn begin_kernel_exchange(arguments: &[u64; 8]) -> Result<Box<dyn Pending>, Kerne
     };
     let port = reference.port.clone();
     let receive = ReceiveArguments { output: arguments[4], length: arguments[5], receive_attributes: arguments[6], timeout: arguments[7] };
+    // O lado servidor de uma conexão (porta de conexão ou de comunicação de
+    // um servidor de kernel) tem a fila e as respostas próprias.
+    if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
+        let pending = port.run(|| crate::ntos::alpc::server::begin_kernel_exchange(&port, arguments[1] as u32, arguments[2], receive));
+        let _ = reference.release();
+        return pending;
+    }
     let result = port.run(|| exchange_messages(&port, arguments[1] as u32, arguments[2], arguments[3], receive, 0));
     let _ = reference.release();
     Ok(match result? {
@@ -1257,7 +1264,7 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attribute
 
 /// NtAlpcCreatePort(PortHandle*, ObjectAttributes, PortAttributes).
 fn nt_alpc_create_port(out: u64, attributes: u64, port_attributes: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| crate::ntos::alpc::server::create_port(out, attributes, port_attributes))
+    state::guarded(|| crate::ntos::alpc::server::create_port(out, attributes, port_attributes, 1))
 }
 
 /// NtAlpcAcceptConnectPort(PortHandle*, ConnectionPortHandle, Flags,
@@ -1268,7 +1275,7 @@ fn nt_alpc_accept_connect_port(out: u64, connection: u64, _flags: u64, attribute
         return Ok(AV);
     }
     let (port_context, request, accept) = (state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg32(rsp, 9) as u8 != 0);
-    state::guarded(|| crate::ntos::alpc::server::accept_connect_port(out, connection, attributes, port_context, request, accept))
+    state::guarded(|| crate::ntos::alpc::server::accept_connect_port(out, connection, attributes, port_context, request, accept, 1))
 }
 
 /// NtAlpcOpenSenderProcess(ProcessHandle*, PortHandle, PortMessage, Flags,

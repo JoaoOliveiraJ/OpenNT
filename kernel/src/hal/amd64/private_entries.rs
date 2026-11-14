@@ -120,6 +120,26 @@ opennt_iop_unload_safe_completion:
     mov eax, 0x8000000B
     jmp opennt_win32_common
 
+# Callback do pacote embutido numa reserva de conclusão de E/S.
+.balign 16
+.global opennt_psp_io_mini_packet_callback_routine
+opennt_psp_io_mini_packet_callback_routine:
+    mov eax, 0x8000000C
+    jmp opennt_win32_common
+
+# KernelRoutine da APC de um objeto Timer e DeleteProcedure do tipo Timer.
+.balign 16
+.global opennt_exp_timer_apc_routine
+opennt_exp_timer_apc_routine:
+    mov eax, 0x8000000D
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_exp_delete_timer
+opennt_exp_delete_timer:
+    mov eax, 0x8000000E
+    jmp opennt_win32_common
+
 .balign 16
 .global opennt_psp_context_operation_apc
 opennt_psp_context_operation_apc:
@@ -329,6 +349,9 @@ extern "C" {
     static opennt_mm_get_image_file_signature_information: u8;
     static opennt_iop_csq_cancel_routine: u8;
     static opennt_iop_unload_safe_completion: u8;
+    static opennt_psp_io_mini_packet_callback_routine: u8;
+    static opennt_exp_timer_apc_routine: u8;
+    static opennt_exp_delete_timer: u8;
     static opennt_hal_private_stubs: u8;
     static opennt_hal_default_zero: u8;
     static opennt_hal_default_not_supported: u8;
@@ -365,6 +388,9 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "MmGetImageFileSignatureInformation" => core::ptr::addr_of!(opennt_mm_get_image_file_signature_information),
             "IopCsqCancelRoutine" => core::ptr::addr_of!(opennt_iop_csq_cancel_routine),
             "IopUnloadSafeCompletion" => core::ptr::addr_of!(opennt_iop_unload_safe_completion),
+            "PspIoMiniPacketCallbackRoutine" => core::ptr::addr_of!(opennt_psp_io_mini_packet_callback_routine),
+            "ExpTimerApcRoutine" => core::ptr::addr_of!(opennt_exp_timer_apc_routine),
+            "ExpDeleteTimer" => core::ptr::addr_of!(opennt_exp_delete_timer),
             "hal_private_stubs" => core::ptr::addr_of!(opennt_hal_private_stubs),
             "hal_default_zero" => core::ptr::addr_of!(opennt_hal_default_zero),
             "hal_default_not_supported" => core::ptr::addr_of!(opennt_hal_default_not_supported),

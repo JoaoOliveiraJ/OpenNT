@@ -83,7 +83,7 @@ pub fn begin_connection_ex(arguments: &[u64; 11]) -> Result<Box<dyn Pending>, Ke
 
 /// Bombeia a operação retomável até concluir; o cancelamento final é
 /// inócuo depois da conclusão.
-fn drive(mut operation: Box<dyn Pending>) -> u32 {
+pub fn drive(mut operation: Box<dyn Pending>) -> u32 {
     let status = loop {
         if let Some(status) = operation.poll() {
             break status;

@@ -98,5 +98,10 @@ const TIMER_TYPE: TypeTemplate = TypeTemplate {
 
 /// Cria o tipo Timer (uma vez) e publica ExTimerObjectType.
 pub fn initialize_type() {
-    kernel_data::write("ExTimerObjectType", object_types::ensure(&TIMER_TYPE).pointer);
+    kernel_data::write("ExTimerObjectType", timer_type_pointer());
+}
+
+/// O OBJECT_TYPE "Timer" (o mesmo de ExTimerObjectType).
+pub fn timer_type_pointer() -> u64 {
+    object_types::ensure(&TIMER_TYPE).pointer
 }

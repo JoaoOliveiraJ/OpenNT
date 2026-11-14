@@ -53,8 +53,14 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 410] {
+fn groups() -> [&'static Group; 416] {
     [
+        &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
+        &crate::ntos::alpc::exports::lpc::GROUP,
+        &crate::ntos::ex::exports::zw_timer::GROUP,
+        &crate::ntos::ex::exports::zw_wnf_name_information::GROUP,
+        &crate::ntos::ps::exports::zw_reserve_object::GROUP,
+        &crate::ntos::ps::exports::zw_set_information_process::GROUP,
         &crate::ntos::ex::exports::zw::SYSTEM_INFORMATION_EX_GROUP,
         &crate::ntos::ps::exports::ps_pool_quota::GROUP,
         &crate::ntos::rtl::exports::rtl_unicode_prefix::GROUP,
@@ -613,6 +619,8 @@ pub fn init() {
     crate::ntos::ex::win32::initialize();
     crate::ntos::ex::timer::initialize_type();
     crate::ntos::ps::job::initialize_type();
+    crate::ntos::ps::memory_reserve::initialize_types();
+    crate::ntos::ex::timer_object::initialize();
     crate::ntos::ps::win32::init();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();
@@ -886,6 +894,9 @@ pub mod private_routines {
     pub const IMAGE_FILE_SIGNATURE_ID: u64 = ID + 9;
     pub const CSQ_CANCEL_ID: u64 = ID + 10;
     pub const UNLOAD_SAFE_COMPLETION_ID: u64 = ID + 11;
+    pub const RESERVE_PACKET_CALLBACK_ID: u64 = ID + 12;
+    pub const TIMER_APC_ID: u64 = ID + 13;
+    pub const DELETE_TIMER_ID: u64 = ID + 14;
 
     pub fn name(id: u64) -> Option<&'static str> {
         use crate::hal::private_dispatch;
@@ -908,6 +919,9 @@ pub mod private_routines {
             IMAGE_FILE_SIGNATURE_ID => "MmGetImageFileSignatureInformation",
             CSQ_CANCEL_ID => "IopCsqCancelRoutine",
             UNLOAD_SAFE_COMPLETION_ID => "IopUnloadSafeCompletion",
+            RESERVE_PACKET_CALLBACK_ID => "PspIoMiniPacketCallbackRoutine",
+            TIMER_APC_ID => "ExpTimerApcRoutine",
+            DELETE_TIMER_ID => "ExpDeleteTimer",
             _ => return None,
         })
     }
@@ -937,6 +951,9 @@ pub mod private_routines {
             SET_CONTEXT_ID => crate::ntos::ps::context::set::execute(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(4) as u8, call.arg(5) as u32).map(|status| status as i32 as i64 as u64),
             CSQ_CANCEL_ID => crate::ntos::io::csq::cancel_routine(call.arg(1), call.arg(2)).map(|()| 0),
             UNLOAD_SAFE_COMPLETION_ID => crate::ntos::io::irp_request::unload_safe_completion(call.arg(1), call.arg(2), call.arg(3)).map(|status| status as i32 as i64 as u64),
+            RESERVE_PACKET_CALLBACK_ID => crate::ntos::ps::memory_reserve::completion_packet_returned(call.arg(1), call.arg(2)),
+            TIMER_APC_ID => crate::ntos::ex::timer_object::timer_apc_routine(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5)).map(|()| 0),
+            DELETE_TIMER_ID => crate::ntos::ex::timer_object::delete_timer(call.arg(1)).map(|()| 0),
             _ => Err(KernelError::new(alloc::format!("private routine {} enters with its module", name(id).unwrap_or("?")))),
         }
     }

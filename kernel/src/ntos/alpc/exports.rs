@@ -148,3 +148,57 @@ pub mod alpc_message_attributes {
         data_exports: &[],
     };
 }
+
+pub mod zw_alpc_server {
+    //! ZwAlpcCreatePort e ZwAlpcAcceptConnectPort: o lado servidor de modo
+    //! kernel, com a lógica em `alpc/server`.
+
+    use crate::ntos::alpc::server;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    /// ZwAlpcCreatePort(PortHandle, ObjectAttributes, PortAttributes).
+    fn create_port(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| server::create_port(call.arg(1), call.arg(2), call.arg(3), 0))??))
+    }
+
+    /// ZwAlpcAcceptConnectPort(PortHandle, ConnectionPortHandle, Flags,
+    /// ObjectAttributes, PortAttributes, PortContext, ConnectionRequest,
+    /// ConnectionMessageAttributes, AcceptConnection).
+    fn accept_connect_port(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| server::accept_connect_port(call.arg(1), call.arg(2), call.arg(4), call.arg(6), call.arg(7), call.arg(9) & 0xFF != 0, 0))??))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-alpc-server", names: &["ZwAlpcCreatePort", "ZwAlpcAcceptConnectPort"], handlers: &[create_port, accept_connect_port], data_exports: &[] };
+}
+
+pub mod lpc {
+    //! ZwSecureConnectPort, LpcRequestPort e LpcSendWaitReceivePort: o LPC
+    //! de modo kernel sobre o ALPC, com a lógica em `alpc/lpc`.
+
+    use crate::ntos::alpc::lpc;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    /// ZwSecureConnectPort(PortHandle, PortName, SecurityQos, ClientView,
+    /// RequiredServerSid, ServerView, MaxMessageLength,
+    /// ConnectionInformation, ConnectionInformationLength).
+    fn secure_connect_port(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| lpc::secure_connect_port(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9)))??))
+    }
+
+    /// LpcRequestPort(PortAddress, RequestMessage).
+    fn request_port(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(lpc::request_port(call.arg(1), call.arg(2))?))
+    }
+
+    /// LpcSendWaitReceivePort(PortAddress, Flags, SendMessage,
+    /// ReceiveMessage, BufferLength, Timeout).
+    fn send_wait_receive_port(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(lpc::send_wait_receive_port(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6))?))
+    }
+
+    pub static GROUP: Group = Group { name: "lpc", names: &["ZwSecureConnectPort", "LpcRequestPort", "LpcSendWaitReceivePort"], handlers: &[secure_connect_port, request_port, send_wait_receive_port], data_exports: &[] };
+}

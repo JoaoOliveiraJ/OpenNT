@@ -15,6 +15,7 @@ pub mod resource;
 pub mod kernel_entry;
 pub mod kernel_wait;
 pub mod legacy_service;
+pub mod lpc;
 pub mod port_reference;
 pub mod port_sections;
 pub mod query_information;

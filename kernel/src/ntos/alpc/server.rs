@@ -1,7 +1,11 @@
-//! Portas ALPC de servidor em modo usuário.
+//! Portas ALPC de servidor, de modo usuário e de modo kernel.
 //!
 //! O lado servidor do ALPC para processos de usuário (o smss com o
-//! `\SmApiPort`, o csrss com o `\Windows\ApiPort`):
+//! `\SmApiPort`, o csrss com o `\Windows\ApiPort`) e para os drivers
+//! (o win32kbase pelo ZwAlpcCreatePort e o ZwAlpcAcceptConnectPort, com
+//! PreviousMode KernelMode: buffers do chamador sem sonda, handles de kernel
+//! com OBJ_KERNEL_HANDLE e a espera de recepção pela continuação de kernel do
+//! ZwAlpcSendWaitReceivePort):
 //!
 //! - NtAlpcCreatePort ([`create_port`]): a porta de conexão, com nome no
 //!   namespace (o nó AlpcPort, ao qual o servidor [`UserServer`] fica
@@ -83,6 +87,7 @@ const CONTEXT_ATTRIBUTE: u32 = 0x2000_0000;
 const MAXIMUM_MESSAGE_LENGTH: u64 = 0xFFFF;
 /// OBJ_INHERIT e OBJ_KERNEL_HANDLE não valem para um handle de usuário.
 const OBJ_INHERIT: u32 = 2;
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
 
 /// Uma mensagem na fila do servidor, ainda não recebida.
 struct Delivery {
@@ -332,8 +337,8 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64) -> Option<
 }
 
 /// O envio do servidor: a resposta ao pedido do MessageId da mensagem.
-fn send_reply(server: &UserServer, input: u64) -> u32 {
-    let captured = match message_buffer::capture_message(input, server.listener.maximum().max(PortMessage::SIZE as u32), 1) {
+fn send_reply(server: &UserServer, input: u64, mode: u8) -> u32 {
+    let captured = match message_buffer::capture_message(input, server.listener.maximum().max(PortMessage::SIZE as u32), mode) {
         Ok(captured) => captured,
         Err(status) => return status,
     };
@@ -366,7 +371,7 @@ pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::
         return Ok(STATUS_NOT_SUPPORTED);
     }
     if input != 0 {
-        let status = send_reply(&server, input);
+        let status = send_reply(&server, input, 1);
         if status != 0 {
             return Ok(status);
         }
@@ -404,8 +409,43 @@ pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::
 /// Como no ObInsertObject, quem cria a porta recebe o acesso total ao
 /// objeto que acabou de criar, sem passar pela DACL do descritor que ele
 /// mesmo deu no OBJECT_ATTRIBUTES.
-fn creator_options() -> port_objects::CreateOptions {
-    port_objects::CreateOptions { grant_on_create: true, ..port_objects::CreateOptions::default() }
+fn creator_options(mode: u8, object_flags: u32) -> port_objects::CreateOptions {
+    if mode != 0 {
+        return port_objects::CreateOptions { grant_on_create: true, ..port_objects::CreateOptions::default() };
+    }
+    // Uma porta de kernel com OBJ_KERNEL_HANDLE pertence ao System.
+    let owner = if object_flags & OBJ_KERNEL_HANDLE != 0 { process::get_system_process() } else { process::get_current_process() };
+    port_objects::CreateOptions { owner_process: Some(owner), kernel_mode: true, grant_on_create: true }
+}
+
+/// OBJECT_ATTRIBUTES.Attributes (0 sem OBJECT_ATTRIBUTES); o de modo
+/// usuário já foi sondado pelo chamador.
+fn object_flags(attributes: u64) -> Result<u32, KernelError> {
+    Ok(if attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.attributes.probe_get()? } else { 0 })
+}
+
+/// O handle de quem criou a porta: um handle de usuário (só OBJ_INHERIT
+/// vale), ou, em KernelMode, o ObOpenObjectByPointer com os atributos do
+/// chamador (OBJ_KERNEL_HANDLE põe o handle na tabela do System).
+fn publish_created(port: &Arc<Port>, out: u64, object_flags: u32, mode: u8) -> Result<u32, KernelError> {
+    if mode != 0 {
+        return port_objects::publish_created(port, out, object_flags & OBJ_INHERIT);
+    }
+    let type_pointer = crate::ntos::ob::object_types::user_type("alpc").map_or(0, |object_type| object_type.pointer);
+    Ok(crate::ntos::ob::open_pointer::open(port.pointer, object_flags & 0x222, 0, 0x1F_0001, type_pointer, 0, out)? as u32)
+}
+
+/// O nome do OBJECT_ATTRIBUTES de kernel de uma porta: `None` sem nome.
+fn kernel_port_name(attributes: u64) -> Result<Option<String>, u32> {
+    if attributes == 0 {
+        return Ok(None);
+    }
+    // SAFETY: OBJECT_ATTRIBUTES de um chamador de modo kernel.
+    if unsafe { ObjectAttributes::at(attributes) }.object_name.get() == 0 {
+        return Ok(None);
+    }
+    let path = crate::ntos::io::file::zw::file_path_from_object_attributes(attributes)?;
+    Ok(if path.is_empty() { None } else { Some(path) })
 }
 
 /// O nome do OBJECT_ATTRIBUTES de uma porta: `None` sem nome.
@@ -425,11 +465,11 @@ fn port_name(attributes: u64) -> Result<Option<String>, u32> {
 
 /// NtAlpcCreatePort(PortHandle*, ObjectAttributes, PortAttributes): a porta
 /// de conexão de um servidor de usuário.
-pub fn create_port(out: u64, attributes: u64, port_attributes: u64) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, ObjectAttributes::SIZE)) || (port_attributes != 0 && !state::probe_user_read(port_attributes, AlpcPortAttributes::SIZE)) {
+pub fn create_port(out: u64, attributes: u64, port_attributes: u64, mode: u8) -> Result<u32, KernelError> {
+    if mode != 0 && (!state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, ObjectAttributes::SIZE)) || (port_attributes != 0 && !state::probe_user_read(port_attributes, AlpcPortAttributes::SIZE))) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
-    let name = match port_name(attributes) {
+    let name = match if mode != 0 { port_name(attributes) } else { kernel_port_name(attributes) } {
         Ok(name) => name,
         Err(status) => return Ok(status),
     };
@@ -458,11 +498,12 @@ pub fn create_port(out: u64, attributes: u64, port_attributes: u64) -> Result<u3
         None => (String::new(), String::new()),
     };
     let initial = PortState { role: Role::Listener, port_flags, maximum_view_size, duplicate_object_types, ..PortState::default() };
+    let object_flags = object_flags(attributes)?;
     let port = match port_objects::create("alpc", initial, maximum as u32, 1, attributes, Box::new(|listener: &Arc<Port>| {
         if let Some(server) = SERVERS.lock().remove(&listener.pointer) {
             server.close();
         }
-    }), creator_options()) {
+    }), creator_options(mode, object_flags)) {
         Ok(port) => port,
         Err(error) if error.status != 0 => return Ok(error.status),
         Err(error) => return Err(error),
@@ -477,13 +518,12 @@ pub fn create_port(out: u64, attributes: u64, port_attributes: u64) -> Result<u3
             };
             *server.endpoint.lock() = Some(transport::attach(node, server.clone()));
         }
-        let object_flags = if attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.attributes.probe_get()? } else { 0 };
-        let status = port_objects::publish_created(&port, out, object_flags & OBJ_INHERIT)?;
+        let status = publish_created(&port, out, object_flags, mode)?;
         if status != 0 {
             return Ok(status);
         }
         port.set_started(true);
-        crate::debug_print!("[alpc] porta de servidor {} criada pelo pid {}", name.as_deref().unwrap_or("(sem nome)"), port.process_id());
+        crate::debug_print!("[alpc] porta de servidor {} criada pelo pid {} (modo {})", name.as_deref().unwrap_or("(sem nome)"), port.process_id(), mode);
         Ok(STATUS_SUCCESS)
     });
     if !matches!(result, Ok(STATUS_SUCCESS)) {
@@ -498,15 +538,16 @@ pub fn create_port(out: u64, attributes: u64, port_attributes: u64) -> Result<u3
 /// NtAlpcAcceptConnectPort(PortHandle*, ConnectionPortHandle, Flags,
 /// ObjectAttributes, PortAttributes, PortContext, ConnectionRequest,
 /// ConnectionMessageAttributes, AcceptConnection).
-pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_context: u64, request: u64, accept: bool) -> Result<u32, KernelError> {
-    let mut reference = match port_reference::reference(connection, 0, 1)? {
+#[allow(clippy::too_many_arguments)]
+pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_context: u64, request: u64, accept: bool, mode: u8) -> Result<u32, KernelError> {
+    let mut reference = match port_reference::reference(connection, 0, mode)? {
         Ok(reference) => reference,
         Err(status) => return Ok(status),
     };
     let listener = reference.port.clone();
     let result = (|| -> Result<u32, KernelError> {
         let Some(server) = SERVERS.lock().get(&listener.pointer).cloned() else { return Ok(STATUS_INVALID_PORT_HANDLE) };
-        let captured = match message_buffer::capture_message(request, listener.maximum(), 1) {
+        let captured = match message_buffer::capture_message(request, listener.maximum(), mode) {
             Ok(captured) => captured,
             Err(status) => return Ok(status),
         };
@@ -517,23 +558,23 @@ pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_cont
             *pending.decision.lock() = Some((STATUS_PORT_CONNECTION_REFUSED, Vec::new()));
             return Ok(STATUS_SUCCESS);
         }
-        if !state::probe_user_write(out, 8) {
+        if mode != 0 && !state::probe_user_write(out, 8) {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
+        let object_flags = object_flags(attributes)?;
         let initial = PortState { role: Role::Server, port_context, ..PortState::default() };
         let disconnecting = server.clone();
         let client_pointer = pending.client.pointer;
         let communication = match port_objects::create("alpc", initial, listener.maximum(), 1, attributes, Box::new(move |port: &Arc<Port>| {
             COMMUNICATION.lock().remove(&port.pointer);
             disconnecting.state.lock().links.remove(&client_pointer);
-        }), creator_options()) {
+        }), creator_options(mode, object_flags)) {
             Ok(port) => port,
             Err(error) if error.status != 0 => return Ok(error.status),
             Err(error) => return Err(error),
         };
         let outcome = communication.run(|| -> Result<u32, KernelError> {
-            let object_flags = if attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.attributes.probe_get()? } else { 0 };
-            let status = port_objects::publish_created(&communication, out, object_flags & OBJ_INHERIT)?;
+            let status = publish_created(&communication, out, object_flags, mode)?;
             if status != 0 {
                 return Ok(status);
             }
@@ -595,4 +636,47 @@ pub fn open_sender(out: u64, port_handle: u64, message: u64, access: u32, attrib
     })();
     let _ = reference.release();
     result
+}
+
+/// ZwAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
+/// servidor de kernel: a resposta e a recepção como em [`exchange`], com os
+/// buffers do chamador sem sonda e a espera pela continuação de kernel (o
+/// prazo e o modo de espera do ZwAlpcSendWaitReceivePort).
+pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Box<dyn crate::ntos::alpc::kernel_entry::Pending>, KernelError> {
+    use crate::ntos::alpc::kernel_entry::Completed;
+    use crate::ntos::alpc::kernel_wait;
+    let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
+    if flags & 0x2_0000 != 0 {
+        crate::debug_print!("[alpc] servidor de kernel: pedido sincrono do servidor sem suporte");
+        return Ok(Box::new(Completed(STATUS_NOT_SUPPORTED)));
+    }
+    if input != 0 {
+        let status = send_reply(&server, input, 0);
+        if status != 0 {
+            return Ok(Box::new(Completed(status)));
+        }
+    }
+    if receive.output == 0 {
+        return Ok(Box::new(Completed(STATUS_SUCCESS)));
+    }
+    let status = crate::ntos::ps::user::alpc::attributes(receive.receive_attributes, false, 0);
+    if status != 0 {
+        return Ok(Box::new(Completed(status)));
+    }
+    let buffer = match message_buffer::capture_length(receive.output, receive.length, 0) {
+        Ok(buffer) => buffer,
+        Err(status) => return Ok(Box::new(Completed(status))),
+    };
+    let timeout = match kernel_wait::capture_timeout(receive.timeout, 0) {
+        Ok(timeout) => timeout,
+        Err(status) => return Ok(Box::new(Completed(status))),
+    };
+    if let Some(status) = receive_one(&server, &buffer, receive.receive_attributes) {
+        return Ok(Box::new(Completed(status)));
+    }
+    let attributes = receive.receive_attributes;
+    let waiting = server.clone();
+    let operation = kernel_wait::Operation { poll: Box::new(move || receive_one(&waiting, &buffer, attributes)), cleanup: Box::new(|_| {}) };
+    let request = kernel_wait::begin(operation, timeout, kernel_wait::select_mode(flags, 0), flags & 0x20_0000 != 0)?;
+    Ok(Box::new(request))
 }

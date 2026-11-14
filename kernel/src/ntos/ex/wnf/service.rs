@@ -151,6 +151,15 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
     wnf_query::query(state_name, type_identifier, explicit_scope, change_stamp, buffer, returned_length, None)
 }
 
+/// ZwQueryWnfStateNameInformation: o serviço WNF existe antes da consulta,
+/// como nas outras entradas.
+pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if !ensure_service()? {
+        return Ok(0xC000_009A);
+    }
+    wnf_query::query_name_information(state_name, class, explicit_scope, buffer, length)
+}
+
 /// NtQueryWnfStateData: a captura de usuário com o mesmo fluxo da consulta Zw.
 pub fn query_user(state_name: u64, type_identifier: u64, explicit_scope: u64, change_stamp: u64, buffer: u64, returned_length: u64) -> Result<u32, KernelError> {
     if !ensure_service()? {

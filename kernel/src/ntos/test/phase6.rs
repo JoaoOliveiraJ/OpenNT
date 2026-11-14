@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1857 && abi_names::GROUP_LAYOUT.len() == 410 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1857 exports em 410 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1868 && abi_names::GROUP_LAYOUT.len() == 416 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1868 exports em 416 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -496,6 +496,352 @@ fn ps_pool_quota_exports(assert: Assert) {
         charged_system == Some(0) && measured == Some(([Some(0); 4], (0x2500, 0x3000), true, Some(0xFFFF_FFFF_C000_0044), 0x2500, (0, 0))),
         "ps-pool-quota: tipo de pool decide o contador, limite e devolucao",
     );
+}
+
+fn zw_set_information_process_exports(assert: Assert) {
+    // No processo de teste (NtCurrentProcess): ProcessBreakOnTermination
+    // liga e desliga o Flags.BreakOnTermination sem SeDebugPrivilege (o modo
+    // anterior é KernelMode); ProcessDebugFlags aceita só
+    // PROCESS_DEBUG_INHERIT e inverte o NoDebugInherit, que o
+    // ZwQueryInformationProcess(31) devolve; tamanho errado e classe
+    // desconhecida são recusados.
+    let measured = super::multiprocess::identity::with_test_process("info-processo.exe", None, |test| {
+        let eprocess = at::<nt::Eprocess>(test.process);
+        let (value, returned) = (guest::alloc_bytes(8), guest::alloc_bytes(8));
+        let set = |class: u64, data: u32, length: u64| {
+            guest::write32(value, data);
+            call_export("ZwSetInformationProcess", &[u64::MAX, class, value, length])
+        };
+        let query_flags = || {
+            guest::write32(value, 0xAAAA_AAAA);
+            guest::write32(returned, 0);
+            (call_export("ZwQueryInformationProcess", &[u64::MAX, 31, value, 4, returned]), guest::read32(value), guest::read32(returned))
+        };
+        let critical = (set(29, 1, 4), eprocess.break_on_termination(), set(29, 0, 4), eprocess.break_on_termination(), set(29, 1, 8));
+        let initial = query_flags();
+        let cleared = (set(31, 0, 4), eprocess.no_debug_inherit(), query_flags());
+        let restored = (set(31, 1, 4), eprocess.no_debug_inherit(), query_flags());
+        let refused = (set(31, 2, 4), set(31, 1, 2), set(0x7F, 0, 4), eprocess.no_debug_inherit());
+        guest::free_bytes(value);
+        guest::free_bytes(returned);
+        (critical, initial, cleared, restored, refused)
+    });
+    let ok = |status: u32| Some(status as i32 as i64 as u64);
+    assert(
+        measured
+            == Some((
+                (ok(0), 1, ok(0), 0, ok(0xC000_0004)),
+                (ok(0), 1, 4),
+                (ok(0), 1, (ok(0), 0, 4)),
+                (ok(0), 0, (ok(0), 1, 4)),
+                (ok(0xC000_000D), ok(0xC000_0004), ok(0xC000_0003), 0),
+            )),
+        "zw-set-information-process: BreakOnTermination e DebugFlags em KernelMode",
+    );
+}
+
+/// Entregas da TimerApcRoutine de teste: chamadas, contexto e a hora.
+static TIMER_APC_CALLS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+extern "win64" fn timer_test_apc(context: u64, low: u64, high: u64) {
+    use core::sync::atomic::Ordering;
+    TIMER_APC_CALLS[0].fetch_add(1, Ordering::SeqCst);
+    TIMER_APC_CALLS[1].store(context, Ordering::SeqCst);
+    TIMER_APC_CALLS[2].store((high << 32) | (low & 0xFFFF_FFFF), Ordering::SeqCst);
+}
+
+/// Um OBJECT_ATTRIBUTES sem nome com OBJ_KERNEL_HANDLE.
+fn kernel_handle_attributes() -> u64 {
+    let attributes = guest::alloc_bytes(nt::ObjectAttributes::SIZE);
+    guest::write_bytes(attributes, &[0; nt::ObjectAttributes::SIZE as usize]);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.attributes.set(0x200);
+    attributes
+}
+
+fn zw_timer_exports(assert: Assert) {
+    use core::sync::atomic::Ordering;
+    use crate::ntos::init::exports::signed_status;
+    for slot in &TIMER_APC_CALLS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let attributes = kernel_handle_attributes();
+    let block = guest::alloc_bytes(0x40);
+    guest::write_bytes(block, &[0; 0x40]);
+    let (handle_out, object_out, due, previous) = (block, block + 8, block + 0x10, block + 0x18);
+    // Tipo acima de SynchronizationTimer; depois um timer de sincronização
+    // (KTIMER TimerSynchronizationObject = 9) com handle de kernel.
+    let refused = call_export("ZwCreateTimer", &[handle_out, 0x1F_0003, attributes, 2]);
+    let created = call_export("ZwCreateTimer", &[handle_out, 0x1F_0003, attributes, 1]);
+    let handle = guest::read64(handle_out);
+    let referenced = call_export("ObReferenceObjectByHandle", &[handle, 0, crate::ntos::ex::timer::timer_type_pointer(), 0, object_out, 0]);
+    let timer = guest::read64(object_out);
+    let header_type = if timer != 0 { at::<nt::Ktimer>(timer).header.type_.get() } else { 0 };
+    assert(refused == Some(signed_status(0xC000_00F2)) && created == Some(0) && handle & 0xFFFF_FFFF_8000_0000 != 0 && referenced == Some(0) && header_type == 9, "zw-timer: ZwCreateTimer com tipo invalido recusado e timer de sincronizacao com handle de kernel");
+    // Sem APC: 1 ms relativo, a espera no handle volta com o timer e o
+    // sinal é consumido; período negativo é STATUS_INVALID_PARAMETER_6.
+    guest::write64(due, (-10_000i64) as u64);
+    guest::write8(previous, 0x55);
+    let set = call_export("ZwSetTimer", &[handle, due, 0, 0, 0, 0, previous]);
+    let waited = call_export("ZwWaitForSingleObject", &[handle, 0, 0]);
+    let consumed = at::<nt::Ktimer>(timer).header.signal_state.get();
+    let negative = call_export("ZwSetTimer", &[handle, due, 0, 0, 0, (-1i32) as u32 as u64, 0]);
+    assert(set == Some(0) && guest::read8(previous) == 0 && waited == Some(0) && consumed == 0 && negative == Some(signed_status(0xC000_00F4)), "zw-timer: ZwSetTimer sem APC sinaliza o KTIMER e a espera consome o sinal");
+    // Com APC: a KAPC vai para a thread que armou e a NormalRoutine recebe o
+    // contexto e a hora do sistema; o timer de um disparo desliga a
+    // associação (TimerFlags.ApcAssociated, +0x130) na entrega. Os
+    // autotestes rodam numa região crítica (KernelApcDisable != 0, quando a
+    // APC normal de kernel espera), então a parte da entrega roda na thread
+    // de um processo de teste, com as APCs de kernel liberadas.
+    let routine = timer_test_apc as extern "win64" fn(u64, u64, u64) as usize as u64;
+    let associated = |pointer: u64| guest::read8(pointer + 0x130) & 1;
+    let delivered = super::multiprocess::identity::with_test_process("timer-apc.exe", None, |test| {
+        let enabled = at::<nt::Kthread>(test.thread).kernel_apc_disable.get() == 0;
+        let set_apc = call_export("ZwSetTimer", &[handle, due, routine, 0xC0DE, 0, 0, 0]);
+        let associated_before = associated(timer);
+        let owner = guest::read64(timer + 0x48 + core::mem::offset_of!(nt::Kapc, thread) as u64);
+        let waited_apc = call_export("ZwWaitForSingleObject", &[handle, 0, 0]);
+        // O DPC do timer roda antes de a thread voltar a PASSIVE_LEVEL; a APC
+        // de kernel é entregue nesse retorno.
+        let _ = crate::ntos::ke::dpc::run_queue();
+        let _ = crate::ntos::ke::apc::deliver_all_queued();
+        let now = crate::ntos::ke::clock::system_time_100ns();
+        let stamp = TIMER_APC_CALLS[2].load(Ordering::SeqCst);
+        let ok = enabled && set_apc == Some(0) && associated_before == 1 && owner == test.thread && waited_apc == Some(0) && TIMER_APC_CALLS[0].load(Ordering::SeqCst) == 1 && TIMER_APC_CALLS[1].load(Ordering::SeqCst) == 0xC0DE && stamp != 0 && stamp <= now && associated(timer) == 0;
+        if !ok {
+            debug_print!("[zw-timer] apc: liberadas={} set={:?} associada={} dona={} espera={:?} chamadas={} contexto={:#x} hora={:#x} agora={:#x} depois={}", enabled, set_apc, associated_before, owner == test.thread, waited_apc, TIMER_APC_CALLS[0].load(Ordering::SeqCst), TIMER_APC_CALLS[1].load(Ordering::SeqCst), stamp, now, associated(timer));
+        }
+        ok
+    });
+    assert(delivered == Some(true), "zw-timer: TimerApcRoutine entregue na thread que armou com contexto e hora, associacao desfeita");
+    // Cancelamento: um prazo de 10 s cancelado não sinaliza; CurrentState
+    // é o SignalState; a associação de uma APC pendente sai com as
+    // referências dela.
+    let pointer_count = || crate::ntos::ob::object_header::header(timer).map_or(0, |header| header.pointer_count.get());
+    let baseline = pointer_count();
+    guest::write64(due, (-100_000_000i64) as u64);
+    let long_apc = call_export("ZwSetTimer", &[handle, due, routine, 0xBEEF, 0, 0, 0]);
+    let held = pointer_count();
+    guest::write8(previous, 0x55);
+    let cancelled = call_export("ZwCancelTimer", &[handle, previous]);
+    let after_cancel = (pointer_count(), associated(timer), guest::read8(previous));
+    let timed_out = call_export("ZwWaitForSingleObject", &[handle, 0, block + 0x20]);
+    assert(long_apc == Some(0) && held == baseline + 1 && cancelled == Some(0) && after_cancel == (baseline, 0, 0) && timed_out == Some(0x102) && TIMER_APC_CALLS[0].load(Ordering::SeqCst) == 1, "zw-timer: ZwCancelTimer tira o timer da fila e solta a referencia da APC");
+    let _ = call_export("ObfDereferenceObject", &[timer]);
+    assert(call_export("ZwClose", &[handle]) == Some(0), "zw-timer: ZwClose do timer");
+    guest::free_bytes(block);
+    guest::free_bytes(attributes);
+}
+
+fn zw_reserve_object_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    let attributes = kernel_handle_attributes();
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (reserve_out, apc_out, port_out, object_out, removed, timeout, information) = (block, block + 8, block + 0x10, block + 0x18, block + 0x20, block + 0x28, block + 0x40);
+    // Tipo inválido; reserva de conclusão (o pacote embutido em +8: tipo 4,
+    // rotina PspIoMiniPacketCallbackRoutine, contexto = o objeto) e de APC.
+    let refused = call_export("ZwAllocateReserveObject", &[reserve_out, attributes, 2]);
+    let completion = call_export("ZwAllocateReserveObject", &[reserve_out, attributes, 1]);
+    let user_apc = call_export("ZwAllocateReserveObject", &[apc_out, attributes, 0]);
+    let reserve = guest::read64(reserve_out);
+    let referenced = call_export("ObReferenceObjectByHandle", &[reserve, 2, crate::ntos::ps::memory_reserve::completion_reserve_type(), 0, object_out, 0]);
+    let object = guest::read64(object_out);
+    let callback = crate::ntos::init::exports::private_routines::address("PspIoMiniPacketCallbackRoutine");
+    let packet_ok = object != 0 && guest::read32(object) == 0 && guest::read32(object + 0x18) == 4 && guest::read64(object + 0x40) == callback && guest::read64(object + 0x48) == object && guest::read8(object + 0x50) == 0;
+    assert(refused == Some(signed_status(0xC000_000D)) && completion == Some(0) && user_apc == Some(0) && reserve != 0 && referenced == Some(0) && callback != 0 && packet_ok, "zw-reserve-object: reservas de conclusao e de APC com o pacote embutido montado");
+    // ZwSetIoCompletionEx com a reserva: InUse liga; a mesma reserva de novo
+    // é STATUS_INVALID_PARAMETER_2; a retirada devolve a reserva.
+    let created = call_export("ZwCreateIoCompletion", &[port_out, 0x001F_0003, attributes, 0]);
+    let port = guest::read64(port_out);
+    let posted = call_export("ZwSetIoCompletionEx", &[port, reserve, 0x11, 0x22, 0, 0x33]);
+    let in_use = guest::read32(object);
+    let again = call_export("ZwSetIoCompletionEx", &[port, reserve, 0x44, 0x55, 0, 0x66]);
+    guest::write_bytes(information, &[0; 0x20]);
+    let taken = call_export("ZwRemoveIoCompletionEx", &[port, information, 1, removed, timeout, 0]);
+    let values = (guest::read64(removed), guest::read64(information), guest::read64(information + 8), guest::read64(information + 0x18));
+    let returned = guest::read32(object);
+    let reposted = call_export("ZwSetIoCompletionEx", &[port, reserve, 1, 2, 0, 3]);
+    guest::write_bytes(information, &[0; 0x20]);
+    let retaken = call_export("ZwRemoveIoCompletionEx", &[port, information, 1, removed, timeout, 0]);
+    assert(
+        created == Some(0) && posted == Some(0) && in_use == 1 && again == Some(signed_status(0xC000_00F0)) && taken == Some(0) && values == (1, 0x11, 0x22, 0x33) && returned == 0 && reposted == Some(0) && retaken == Some(0) && guest::read32(object) == 0,
+        "zw-reserve-object: ZwSetIoCompletionEx publica o pacote da reserva e a retirada a devolve",
+    );
+    let _ = call_export("ObfDereferenceObject", &[object]);
+    for handle in [reserve, guest::read64(apc_out), port] {
+        let _ = call_export("ZwClose", &[handle]);
+    }
+    guest::free_bytes(block);
+    guest::free_bytes(attributes);
+}
+
+fn zw_wnf_name_information_exports(assert: Assert) {
+    use crate::ntos::ex::wnf::service as wnf_service;
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::work_items;
+    let storage = guest::alloc_bytes(0x100);
+    let (name, guid, data, output, value, temporary, invalid) = (storage, storage + 0x10, storage + 0x20, storage + 0x30, storage + 0x40, storage + 0x48, storage + 0x50);
+    // O nome bem conhecido com TypeId da fase 5, um temporário inexistente
+    // (tempo de vida 3, escopo de máquina) e uma versão inválida.
+    guest::write64(name, 0x0280_032E_A3BC_0875);
+    let temporary_name: u64 = 1 | (3 << 4) | (4 << 6) | (0x5A5A << 11);
+    guest::write64(temporary, temporary_name ^ crate::ntos::ex::wnf::name::NAME_MASK);
+    guest::write64(invalid, 0x0280_032E_A3BC_0876);
+    guest::write_bytes(guid, &[0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E]);
+    guest::write32(data, 0x1234_5678);
+    let query = |state: u64, class: u64, length: u64| {
+        guest::write32(value, 0xAAAA_AAAA);
+        (call_export("ZwQueryWnfStateNameInformation", &[state, class, 0, value, length]), guest::read32(value))
+    };
+    let validation = [query(invalid, 0, 4).0, query(name, 3, 4).0, query(name, 0, 2).0];
+    assert(validation == [Some(signed_status(0xC000_000D)), Some(signed_status(0xC000_0003)), Some(signed_status(0xC000_000D))], "zw-wnf-name-information: nome invalido, classe acima de 2 e saida curta");
+    let missing = (query(temporary, 0, 4), query(temporary, 1, 4).0);
+    assert(missing == ((Some(0), 0), Some(signed_status(0xC000_0034))), "zw-wnf-name-information: nome temporario inexistente nao existe e nao tem inscritos");
+    // Com instância publicada e sem inscritos; com a inscrição de kernel; e
+    // a quietude com uma entrega pendente e depois do work item.
+    let published = wnf_service::update(name, data, 4, guid, 0, 0, false);
+    let without = (query(name, 0, 4).1, query(name, 1, 4).1, query(name, 2, 4).1);
+    let callback = ex_wnf_test_callback as extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let subscribed = call_export("ExSubscribeWnfStateChange", &[output, name, 1, 0, callback, 0]);
+    work_items::run_queue();
+    let with_subscriber = (query(name, 1, 4).1, query(name, 2, 4).1);
+    let updated = wnf_service::update(name, data, 4, guid, 0, 0, false);
+    let pending = query(name, 2, 4).1;
+    work_items::run_queue();
+    let delivered = query(name, 2, 4).1;
+    let _ = call_export("ExUnsubscribeWnfStateChange", &[guest::read64(output)]);
+    let unsubscribed = query(name, 1, 4).1;
+    assert(
+        matches!(published, Ok(0)) && without == (1, 0, 1) && subscribed == Some(0) && with_subscriber == (1, 1) && matches!(updated, Ok(0)) && pending == 0 && delivered == 1 && unsubscribed == 0,
+        "zw-wnf-name-information: existencia, inscritos e quietude da instancia",
+    );
+    assert(wnf_service::shutdown().is_ok(), "zw-wnf-name-information: servico WNF encerrado");
+    guest::free_bytes(storage);
+}
+
+/// Um PORT_MESSAGE com quatro bytes de dados em `address`.
+fn port_message_with(address: u64, data: &[u8; 4]) {
+    guest::write_bytes(address, &[0u8; 0x28]);
+    let message = at::<nt::PortMessage>(address);
+    message.u1.s1.data_length.set(4);
+    message.u1.s1.total_length.set(0x2C);
+    guest::write_bytes(address + 0x28, data);
+}
+
+/// O que o serviço de teste do LPC recebeu: a informação de conexão e os
+/// dados do último datagrama.
+static LPC_TEST_SEEN: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Serviço hospedado no kernel para o LPC de modo kernel: aceita a conexão
+/// respondendo "SRVR", guarda o datagrama e responde ao pedido com os
+/// bytes invertidos.
+struct LpcTestService;
+
+impl crate::ntos::alpc::transport::Service for LpcTestService {
+    fn max_message_length(&self) -> u32 {
+        0x200
+    }
+    fn max_connection_info(&self) -> u32 {
+        0x100
+    }
+    fn connect(&self, _port: &alloc::sync::Arc<crate::ntos::ob::objects::port::Port>, data: &[u8], _request: Option<&[u8]>) -> crate::ntos::alpc::transport::Reply {
+        let word = data.get(..4).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        LPC_TEST_SEEN[0].store(word as u64, core::sync::atomic::Ordering::SeqCst);
+        crate::ntos::alpc::transport::Reply::Now(crate::ntos::alpc::transport::JobResult { status: 0, data: alloc::vec::Vec::from(&b"SRVR"[..]), sender: None })
+    }
+    fn exchange(&self, _port: &alloc::sync::Arc<crate::ntos::ob::objects::port::Port>, data: &[u8], request: &alloc::sync::Arc<crate::ntos::alpc::transport::Request>) -> crate::ntos::alpc::transport::Reply {
+        if request.state.lock().datagram {
+            let word = data.get(..4).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            LPC_TEST_SEEN[1].store(word as u64, core::sync::atomic::Ordering::SeqCst);
+        }
+        let reversed: alloc::vec::Vec<u8> = data.iter().rev().copied().collect();
+        crate::ntos::alpc::transport::Reply::Now(crate::ntos::alpc::transport::JobResult { status: 0, data: reversed, sender: None })
+    }
+}
+
+fn zw_alpc_server_and_lpc_exports(assert: Assert) {
+    use core::sync::atomic::Ordering;
+    use crate::ntos::alpc::transport;
+    use crate::ntos::init::exports::signed_status;
+    for slot in &LPC_TEST_SEEN {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let block = guest::alloc_bytes(0x800);
+    guest::write_bytes(block, &[0; 0x800]);
+    let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
+    // ZwAlpcCreatePort: a porta de conexão com nome e handle de kernel; o
+    // mesmo nome de novo colide. Sem mensagem na fila, a recepção do
+    // servidor de kernel com prazo zero devolve STATUS_TIMEOUT, e aceitar uma
+    // conexão que não existe é STATUS_REPLY_MESSAGE_MISMATCH.
+    let (server_out, again_out, communication_out, length, timeout, received, port_attributes) = (block, block + 8, block + 0x10, block + 0x18, block + 0x20, block + 0x100, block + 0x40);
+    let attributes = object_attributes_for(block + 0x200, "\\OpenNtAlpcKernel", 0x200);
+    at::<nt::AlpcPortAttributes>(port_attributes).max_message_length.set(0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, attributes, port_attributes]);
+    let server = guest::read64(server_out);
+    let named = crate::ntos::ob::object_manager::lookup("\\OpenNtAlpcKernel").is_some();
+    let collided = call_export("ZwAlpcCreatePort", &[again_out, attributes, port_attributes]);
+    guest::write64(length, 0x400);
+    let empty = call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, received, length, 0, timeout]);
+    port_message_with(received, b"CONN");
+    at::<nt::PortMessage>(received).message_id.set(0x7777);
+    let unnamed = kernel_handle_attributes();
+    let mismatch = call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, unnamed, 0, 0xC0DE, received, 0, 1]);
+    assert(
+        created == Some(0) && server & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000 && named && collided == Some(signed_status(0xC000_0035)) && empty == Some(0x102) && mismatch == Some(signed_status(0xC000_021F)) && guest::read64(communication_out) == 0,
+        "zw-alpc-server: porta de servidor de kernel com nome, recepcao vazia e aceite sem conexao pendente",
+    );
+    let closed = call_export("ZwClose", &[server]);
+    assert(closed == Some(0) && crate::ntos::ob::object_manager::lookup("\\OpenNtAlpcKernel").is_none(), "zw-alpc-server: o fechamento do servidor retira o nome");
+    // LPC de modo kernel contra um serviço hospedado no kernel.
+    let path = "\\RPC Control\\OpenNtLpcKernel";
+    let Ok(listener) = transport::register(path, alloc::sync::Arc::new(LpcTestService)) else {
+        assert(false, "lpc: servico de teste registrado");
+        return;
+    };
+    let name = unicode_string_for(path);
+    let (handle, secure, maximum, information, information_length, quality, pointer) = (block + 0x300, block + 0x308, block + 0x310, block + 0x320, block + 0x330, block + 0x338, block + 0x348);
+    let (connect, datagram, request) = (block + 0x400, block + 0x480, block + 0x500);
+    port_message_with(connect, b"CONN");
+    guest::write64(length, 0x80);
+    let connected = call_export("ZwAlpcConnectPort", &[handle, name, 0, 0, 0x2_0000, 0, connect, length, 0, 0, 0]);
+    let port_type = crate::ntos::mm::kernel_data::read("LpcPortObjectType");
+    let referenced = call_export("ObReferenceObjectByHandle", &[guest::read64(handle), 0, port_type, 0, pointer, 0]);
+    let port = guest::read64(pointer);
+    port_message_with(datagram, b"DGRM");
+    let requested = call_export("LpcRequestPort", &[port, datagram]);
+    port_message_with(request, b"RQST");
+    guest::write64(length, 0x80);
+    let replied = call_export("LpcSendWaitReceivePort", &[port, 0x2_0000, request, request, length, 0]);
+    let reply = guest::read32(request + 0x28) as u64;
+    let invalid = call_export("LpcRequestPort", &[block, datagram]);
+    assert(
+        connected == Some(0) && referenced == Some(0) && requested == Some(0) && LPC_TEST_SEEN[1].load(Ordering::SeqCst) == word(b"DGRM") && replied == Some(0) && reply == word(b"TSQR") && invalid == Some(signed_status(0xC000_0042)),
+        "lpc: LpcRequestPort entrega o datagrama e LpcSendWaitReceivePort recebe a resposta na porta referenciada",
+    );
+    // ZwSecureConnectPort: a informação de conexão vai ao serviço e a
+    // resposta volta nela, com o comprimento máximo da porta; vistas de
+    // seção ainda são recusadas.
+    guest::write32(quality, 12);
+    guest::write32(quality + 4, 2);
+    guest::write_bytes(information, b"INFO");
+    guest::write32(information_length, 4);
+    let secured = call_export("ZwSecureConnectPort", &[secure, name, quality, 0, 0, 0, maximum, information, information_length]);
+    let views = call_export("ZwSecureConnectPort", &[secure + 0x100, name, quality, block + 0x700, 0, 0, 0, 0, 0]);
+    let limit = guest::read32(maximum);
+    assert(
+        secured == Some(0) && LPC_TEST_SEEN[0].load(Ordering::SeqCst) == word(b"INFO") && guest::read_bytes(information, 4) == b"SRVR" && guest::read32(information_length) == 4 && limit != 0 && limit <= 0x200 && views == Some(signed_status(0xC000_00BB)),
+        "lpc: ZwSecureConnectPort leva a informacao de conexao e devolve a resposta e o comprimento maximo",
+    );
+    let _ = call_export("ObfDereferenceObject", &[port]);
+    for opened in [guest::read64(secure), guest::read64(handle)] {
+        let _ = call_export("ZwClose", &[opened]);
+    }
+    transport::unregister(&listener);
+    guest::free_bytes(name);
+    guest::free_bytes(unnamed);
+    guest::free_bytes(block);
 }
 
 fn system_information_ex_exports(assert: Assert) {
@@ -1557,7 +1903,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1857 && exports::export_names().len() == 1857, "ntoskrnl: 410 grupos com os 1857 exports implementados");
+    assert(exports::implemented() == 1868 && exports::export_names().len() == 1868, "ntoskrnl: 416 grupos com os 1868 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -13598,6 +13944,11 @@ pub fn run(assert: Assert) {
     zw_adjust_privileges_token_exports(assert);
     ps_pool_quota_exports(assert);
     system_information_ex_exports(assert);
+    zw_set_information_process_exports(assert);
+    zw_timer_exports(assert);
+    zw_reserve_object_exports(assert);
+    zw_wnf_name_information_exports(assert);
+    zw_alpc_server_and_lpc_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

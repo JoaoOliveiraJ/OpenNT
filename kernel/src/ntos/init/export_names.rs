@@ -416,6 +416,12 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("zw-set-information-object", 1852, 1),
     ("system-information-ex", 1853, 2),
     ("ps-pool-quota", 1855, 2),
+    ("zw-set-information-process", 1857, 1),
+    ("zw-timer", 1858, 3),
+    ("zw-wnf-name-information", 1861, 1),
+    ("zw-reserve-object", 1862, 1),
+    ("zw-alpc-server", 1863, 2),
+    ("lpc", 1865, 3),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2277,4 +2283,15 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwQuerySystemInformationEx",
     "PsChargeProcessPoolQuota",
     "PsReturnPoolQuota",
+    "ZwSetInformationProcess",
+    "ZwCreateTimer",
+    "ZwSetTimer",
+    "ZwCancelTimer",
+    "ZwQueryWnfStateNameInformation",
+    "ZwAllocateReserveObject",
+    "ZwAlpcCreatePort",
+    "ZwAlpcAcceptConnectPort",
+    "ZwSecureConnectPort",
+    "LpcRequestPort",
+    "LpcSendWaitReceivePort",
 ];

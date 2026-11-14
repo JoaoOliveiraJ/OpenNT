@@ -3,22 +3,77 @@
 //!
 //! ProcessImageInformation (37) vem de `image_information`;
 //! ProcessBasicInformation (0) é montado do EPROCESS achado pelo pid do
-//! handle. As demais classes devolvem STATUS_INVALID_PARAMETER.
+//! handle; ProcessDebugFlags (31) é o PROCESS_DEBUG_INHERIT do
+//! NoDebugInherit, com o handle referenciado com PROCESS_QUERY_INFORMATION.
+//! As demais classes devolvem STATUS_INVALID_PARAMETER.
 
 use super::{image_information, process};
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{Eprocess, ProcessBasicInformation};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::ob::{object_reference, object_types, reference_trace};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+/// PROCESS_QUERY_INFORMATION.
+const PROCESS_QUERY_INFORMATION: u32 = 0x400;
 
-/// ZwQueryInformationProcess: ProcessImageInformation (37) e
-/// ProcessBasicInformation (0). Devolve o NTSTATUS.
+/// ObReferenceObjectByHandle(handle, access, PsProcessType, KernelMode):
+/// `Ok(Ok(EPROCESS))` com uma referência que [`release_process`] solta, ou o
+/// NTSTATUS da recusa.
+pub fn reference_process(handle: u64, access: u32) -> Result<Result<u64, u32>, KernelError> {
+    let slot = guest::alloc_bytes(8);
+    if slot == 0 {
+        return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+    }
+    let result = object_reference::reference_by_handle(handle, access, object_types::process_type().pointer, 0, slot, 0);
+    // SAFETY: célula PVOID recém-alocada.
+    let pointer = unsafe { Field::<u64>::at(slot) }.get();
+    guest::free_bytes(slot);
+    Ok(match result? {
+        0 => Ok(pointer),
+        status => Err(status as u32),
+    })
+}
+
+/// Solta a referência de [`reference_process`].
+pub fn release_process(process: u64) -> Result<(), KernelError> {
+    object_reference::dereference_with_tag(process, reference_trace::DEFAULT_TAG, false).map(|_| ())
+}
+
+/// ProcessDebugFlags: um ULONG (outro tamanho dá
+/// STATUS_INFO_LENGTH_MISMATCH), 1 quando o processo passa o depurador
+/// adiante (NoDebugInherit desligado); ReturnLength recebe 4.
+fn query_debug_flags(handle: u64, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(0xC000_0004);
+    }
+    let process = match reference_process(handle, PROCESS_QUERY_INFORMATION)? {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pela referência acima.
+    let inherit = unsafe { Eprocess::at(process) }.no_debug_inherit() ^ 1;
+    // SAFETY: PULONG de saída e ReturnLength opcional do chamador de kernel.
+    unsafe { Field::<u32>::at(output) }.set(inherit);
+    if returned != 0 {
+        // SAFETY: idem.
+        unsafe { Field::<u32>::at(returned) }.set(4);
+    }
+    release_process(process)?;
+    Ok(0)
+}
+
+/// ZwQueryInformationProcess: ProcessImageInformation (37),
+/// ProcessDebugFlags (31) e ProcessBasicInformation (0). Devolve o NTSTATUS.
 pub fn query_information(handle: u64, class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
     if class == 37 {
         return image_information::query(handle, output, length, returned, 0, None);
+    }
+    if class == 31 {
+        return query_debug_flags(handle, output, length, returned);
     }
     if class != 0 {
         return Ok(0xC000_000D);

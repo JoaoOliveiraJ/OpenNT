@@ -260,13 +260,22 @@ fn option_flags(options: u32) -> u32 {
 /// ZwCreateFile/ZwOpenFile/IoCreateFile do kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64, share_access: u32, disposition: u32, options: u32) -> Result<u32, KernelError> {
+    let open_flags = if attributes_pointer != 0 { object_attributes_at(attributes_pointer).attributes.get() } else { 0 };
+    let owner_process = if open_flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
+    let access = file_objects::access(desired_access);
+    let create = io_manager::CreateParameters { access: desired_access, share: share_access, disposition, options, file_attributes: 0, case_sensitive: open_flags & 0x40 == 0 };
+    // Abertura relativa a um handle de arquivo de dispositivo (o IopParseFile):
+    // o FILE_OBJECT novo aponta o da raiz e o nome vai como veio.
+    if let Some((device_path, related)) = device_root(attributes_pointer) {
+        let name_pointer = object_attributes_at(attributes_pointer).object_name.get();
+        let name = if name_pointer != 0 { guest_strings::read_unicode_string(name_pointer) } else { String::new() };
+        let opened = io_manager::open_related_device_file(&device_path, &name, related, Some(create), true)?;
+        return publish_device_open(opened, device_path, output, io_status, access, share_access, options, owner_process, open_flags);
+    }
     let object_name = match file_path_from_object_attributes(attributes_pointer) {
         Ok(path) => path,
         Err(status) => return Ok(status),
     };
-    let open_flags = object_attributes_at(attributes_pointer).attributes.get();
-    let owner_process = if open_flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
-    let access = file_objects::access(desired_access);
     // Dispositivo: CREATE IRP pelo I/O Manager.
     if let Some(node) = object_manager::lookup(&object_name).filter(|&node| object_manager::node(node).is_some_and(|node| node.type_name == "Device")) {
         let _ = node;
@@ -279,6 +288,14 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         unsafe { FileObject::at(opened.file_object) }.flags.atomic().fetch_or(option_flags(options), core::sync::atomic::Ordering::SeqCst);
         let entry = FileEntry { backing: Backing::Device { path: object_name, handle: opened.handle }, file_object: opened.file_object, access, share: share_access, options, owner_process, attributes: open_flags & 2, kernel_handle: open_flags & 0x200 != 0, binding: None, closed: false, scan_index: None };
         return publish_file_handle(entry, output, io_status, FILE_OPENED);
+    }
+    // Um nome dentro de um dispositivo sem volume (`\Device\ConDrv\Server`):
+    // o IRP_MJ_CREATE completo ao dispositivo com o resto do nome.
+    if crate::ntos::io::parse::split_volume_path(&object_name).is_none() && resolve_mounted_file(&object_name).is_none() {
+        if let Some((device_path, rest)) = io_manager::split_device_path(&object_name).filter(|(_, rest)| !rest.is_empty()) {
+            let opened = io_manager::open_related_device_file(&device_path, &rest, 0, Some(create), true)?;
+            return publish_device_open(opened, device_path, output, io_status, access, share_access, options, owner_process, open_flags);
+        }
     }
     let Some((volume, path)) = resolve_mounted_file(&object_name) else {
         // Arquivo de um volume com VPB: o IopParseDevice monta e abre pelo
@@ -932,4 +949,37 @@ pub fn query_information_by_name(attributes: u64, io_status: u64, buffer: u64, l
     };
     guest::free_bytes(scratch);
     result
+}
+
+/// O dispositivo e o FILE_OBJECT de um RootDirectory que é um handle de
+/// arquivo de dispositivo do kernel.
+fn device_root(attributes: u64) -> Option<(String, u64)> {
+    if attributes == 0 {
+        return None;
+    }
+    let root = object_attributes_at(attributes).root_directory.get();
+    if root == 0 {
+        return None;
+    }
+    let entry = FILE_HANDLES.lock().get(&((root as u32) & !3)).cloned()?;
+    match entry.backing {
+        Backing::Device { path, .. } => Some((path, entry.file_object)),
+        _ => None,
+    }
+}
+
+/// Publica o handle de uma abertura de dispositivo por nome, ou devolve a
+/// falha do IRP_MJ_CREATE no IO_STATUS_BLOCK.
+#[allow(clippy::too_many_arguments)]
+fn publish_device_open(opened: io_manager::Opened, device_path: String, output: u64, io_status: u64, access: u32, share_access: u32, options: u32, owner_process: u64, open_flags: u32) -> Result<u32, KernelError> {
+    if opened.status != 0 {
+        let status = if opened.status == io_manager::status::NOT_FOUND { STATUS_OBJECT_NAME_NOT_FOUND } else { opened.status as u32 };
+        write_io_status(io_status, status, opened.information);
+        return Ok(status);
+    }
+    // SAFETY: FILE_OBJECT vivo devolvido pela abertura.
+    unsafe { FileObject::at(opened.file_object) }.flags.atomic().fetch_or(option_flags(options), core::sync::atomic::Ordering::SeqCst);
+    let information = if opened.information != 0 { opened.information } else { FILE_OPENED };
+    let entry = FileEntry { backing: Backing::Device { path: device_path, handle: opened.handle }, file_object: opened.file_object, access, share: share_access, options, owner_process, attributes: open_flags & 2, kernel_handle: open_flags & 0x200 != 0, binding: None, closed: false, scan_index: None };
+    publish_file_handle(entry, output, io_status, information)
 }

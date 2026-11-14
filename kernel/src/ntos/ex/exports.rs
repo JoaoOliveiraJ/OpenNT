@@ -1349,6 +1349,47 @@ pub mod zw_event {
     };
 }
 
+pub mod zw_timer {
+    //! ZwCreateTimer, ZwSetTimer e ZwCancelTimer em KernelMode; a lógica do
+    //! objeto Timer mora em `ex/timer_object`.
+
+    use crate::ntos::ex::timer_object;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ZwCreateTimer(TimerHandle, DesiredAccess, ObjectAttributes, TimerType).
+    fn create_timer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(timer_object::create_kernel(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32)?))
+    }
+    /// ZwSetTimer(TimerHandle, DueTime, TimerApcRoutine, TimerContext,
+    /// ResumeTimer, Period, PreviousState).
+    fn set_timer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(timer_object::set_kernel(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) & 0xFF != 0, call.arg(6) as i32, call.arg(7))?))
+    }
+    /// ZwCancelTimer(TimerHandle, CurrentState).
+    fn cancel_timer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(timer_object::cancel_kernel(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-timer", names: &["ZwCreateTimer", "ZwSetTimer", "ZwCancelTimer"], handlers: &[create_timer, set_timer, cancel_timer], data_exports: &[] };
+}
+
+pub mod zw_wnf_name_information {
+    //! ZwQueryWnfStateNameInformation; a lógica mora em `ex/wnf/query`.
+
+    use crate::ntos::ex::wnf::service;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ZwQueryWnfStateNameInformation(StateName, NameInfoClass,
+    /// ExplicitScope, InfoBuffer, InfoBufferLength).
+    fn query_name_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(service::query_name_information(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-wnf-name-information", names: &["ZwQueryWnfStateNameInformation"], handlers: &[query_name_information], data_exports: &[] };
+}
+
 pub mod ex_wnf_subscription {
     //! ExSubscribeWnfStateChange e ExUnsubscribeWnfStateChange: as inscrições
     //! de kernel do motor WNF (`ex/wnf/service`).

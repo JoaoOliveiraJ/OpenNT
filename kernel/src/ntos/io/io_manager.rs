@@ -927,20 +927,53 @@ fn file_object_flags(create: &CreateParameters) -> u32 {
 /// opções (o IopParseDevice). O Information do IRP (FILE_OPENED,
 /// FILE_CREATED...) volta em `Opened::information`.
 pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
+    open_file_object(path, name, 0, create, external_handles, false)
+}
+
+/// A abertura por nome do ZwCreateFile de modo kernel, como o
+/// IopParseDevice/IopParseFile: o FILE_OBJECT relacionado de uma abertura
+/// relativa a um handle de arquivo (RelatedFileObject aponta o arquivo da
+/// raiz e o nome vai como veio), o IRP_MJ_CREATE com a thread que abre
+/// (Tail.Overlay.Thread) e a espera de um STATUS_PENDING do driver até a
+/// conclusão do IRP.
+pub fn open_related_device_file(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
+    open_file_object(path, name, related_file_object, create, external_handles, true)
+}
+
+fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool, parse: bool) -> Result<Opened, KernelError> {
     let Some(node) = lookup_device(path) else {
         return Ok(Opened { status: status::NOT_FOUND, handle: 0, file_object: 0, information: 0 });
     };
     let entry = device(node).unwrap_or_default();
     let top = if entry.stack_top != 0 { entry.stack_top } else { entry.native_device };
     let file_object = file_objects::create(top, name)?;
+    // SAFETY: o FILE_OBJECT recém-criado.
+    let object = unsafe { crate::ntos::inc::types::FileObject::at(file_object) };
+    object.related_file_object.set(related_file_object);
     if let Some(create) = &create {
-        // SAFETY: o FILE_OBJECT recém-criado.
-        let object = unsafe { crate::ntos::inc::types::FileObject::at(file_object) };
         object.flags.set(object.flags.get() | file_object_flags(create));
     }
-    let mut request = make_io_request(irp_mj::CREATE, IoParams { create, ..IoParams::default() });
+    let event = if parse { guest::alloc_bytes(0x18) } else { 0 };
+    if parse && event == 0 {
+        let _ = file_objects::dereference(file_object);
+        return Err(KernelError::with_status("IRP_MJ_CREATE sem memoria para o evento", 0xC000_009A));
+    }
+    let mut parameters = IoParams { create, ..IoParams::default() };
+    if parse {
+        dispatcher::initialize_event(event, 0, false);
+        parameters.thread = process::get_current_thread();
+        parameters.user_event = event;
+    }
+    let mut request = make_io_request(irp_mj::CREATE, parameters);
     request.file_object = file_object;
-    call_driver(path, &mut request)?;
+    let called = call_driver(path, &mut request);
+    if parse && called.is_ok() && request.status == status::PENDING && request.pending_irp != 0 {
+        wait_pending_io_request(&mut request, 0);
+    }
+    if event != 0 {
+        guest::free_bytes(event);
+    }
+    called?;
     if request.status != status::SUCCESS {
         let _ = file_objects::dereference(file_object);
         return Ok(Opened { status: request.status, handle: 0, file_object: 0, information: request.info });

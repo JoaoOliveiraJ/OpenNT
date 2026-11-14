@@ -524,7 +524,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         alerted.set(0);
     }
     tcb.misc_flags.set(if previous_mode == 0 { Kthread::SYSTEM_THREAD_MASK as i32 } else { 0 });
-    for head in [&tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list] {
+    for head in [&tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list, &object.active_timer_list_head] {
         head.flink.set(head.address());
         head.blink.set(head.address());
     }
