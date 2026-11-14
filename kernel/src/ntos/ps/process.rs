@@ -754,6 +754,9 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     }
     object_types::account("Process", -1, 0)?;
     cid::release(eprocess(process).unique_process_id.get(), process);
+    // Nenhuma CPU fica registrada no EPROCESS que volta ao pool (a troca
+    // tiraria o bit de ActiveProcessors de memória livre).
+    context_switch::forget_process(process);
     guest::free_bytes(process);
     Ok(())
 }
@@ -1031,7 +1034,10 @@ pub fn remove_thread(process: u64) {
 /// A troca de thread corrente atualiza a PCR (gs:0x188 =
 /// Prcb.CurrentThread), lida direto por drivers nativos, e carrega a raiz
 /// do processo corrente da nova thread (`KTHREAD.ApcState.Process`, o
-/// anexado quando ela está anexada) quando ela difere da carregada.
+/// anexado quando ela está anexada) quando ela difere da carregada,
+/// movendo a CPU em KPROCESS.ActiveProcessors do processo em que ela estava
+/// (registrado pela troca: a thread que sai pode já ter sido liberada) para
+/// esse.
 pub fn set_current_thread(thread: u64) {
     CURRENT_THREAD.store(thread, Ordering::Relaxed);
     pcr::set_current_thread(thread);

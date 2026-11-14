@@ -2293,9 +2293,13 @@ fn user_address_floor(assert: Assert) {
     guest::free_bytes(block);
 }
 
-/// PE x64 mínimo de uma seção (código ou dados) com o conteúdo dado em 0x1000.
+/// PE x64 mínimo de uma seção (código ou dados) com o conteúdo dado em 0x1000
+/// (até 0x1000 bytes; a seção tem 0x200 bytes ou o múltiplo de 0x200 que o
+/// conteúdo pedir).
 pub(crate) fn single_section_image(image_base: u64, characteristics: u16, section_name: &[u8], section_flags: u32, entry: u32, content: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut image = alloc::vec![0u8; 0x600];
+    assert!(content.len() <= 0x1000, "conteudo maior que a secao");
+    let raw = content.len().div_ceil(0x200).max(1) * 0x200;
+    let mut image = alloc::vec![0u8; 0x400 + raw];
     let put16 = |image: &mut [u8], at: usize, value: u16| image[at..at + 2].copy_from_slice(&value.to_le_bytes());
     let put32 = |image: &mut [u8], at: usize, value: u32| image[at..at + 4].copy_from_slice(&value.to_le_bytes());
     put16(&mut image, 0, 0x5A4D);
@@ -2318,9 +2322,9 @@ pub(crate) fn single_section_image(image_base: u64, characteristics: u16, sectio
     put32(&mut image, optional + 108, 16);
     let section = optional + 240;
     image[section..section + section_name.len()].copy_from_slice(section_name);
-    put32(&mut image, section + 8, 0x200);
+    put32(&mut image, section + 8, raw as u32);
     put32(&mut image, section + 12, 0x1000);
-    put32(&mut image, section + 16, 0x200);
+    put32(&mut image, section + 16, raw as u32);
     put32(&mut image, section + 20, 0x400);
     put32(&mut image, section + 36, section_flags);
     image[0x400..0x400 + content.len()].copy_from_slice(content);
@@ -4996,6 +5000,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::ownership::run(assert);
     crate::ntos::test::multiprocess::own_root::run(assert);
     crate::ntos::test::multiprocess::create_path::run(assert);
+    crate::ntos::test::multiprocess::all_processes::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

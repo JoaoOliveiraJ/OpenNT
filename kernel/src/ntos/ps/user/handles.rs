@@ -307,8 +307,9 @@ fn kthread(pointer: u64) -> &'static Kthread {
     unsafe { Kthread::at(pointer) }
 }
 
-/// EPROCESS de um handle (o pseudo-handle incluído) com o acesso pedido.
-fn process_pointer(handle: u64, access: u32) -> Result<u64, u32> {
+/// EPROCESS de um handle (o pseudo-handle incluído) com o acesso pedido,
+/// procurado na tabela do processo corrente.
+pub fn process_pointer(handle: u64, access: u32) -> Result<u64, u32> {
     if is_pseudo_process(handle) {
         return Ok(process::get_current_process());
     }

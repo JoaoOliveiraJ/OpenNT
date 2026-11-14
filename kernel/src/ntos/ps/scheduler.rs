@@ -9,6 +9,14 @@
 //! Cada processo tem um EPROCESS + KTHREAD reais (`ps/process`); o tick
 //! ajusta a thread corrente (o gs:[0x188] do NT) durante o passo de cada um
 //! e a seleção segue as filas de prioridade do `ke/thread_dispatch`.
+//!
+//! As threads de usuário estão nas mesmas filas: quando a mais prioritária
+//! é uma delas, o tick dá intervalos pelo despachante de todos os processos
+//! (`ps::user::threads::dispatch_one`), de qualquer processo, até
+//! [`USER_SLICES_PER_TICK`] — se a CPU pode despachar usuário (o BSP, em
+//! PASSIVE_LEVEL, sem trava retida, fora de outro despacho). Assim os
+//! processos de usuário andam mesmo sem ninguém esperá-los, e o timer, que
+//! encerra o intervalo de quem não cede a CPU, alterna entre eles.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -18,6 +26,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use super::{cid, process};
+use super::user::threads::{self as user_threads, Dispatched};
 use crate::ntos::ke::{clock, thread_dispatch};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::inc::field::NtStruct;
@@ -302,13 +311,20 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
     result
 }
 
+/// Intervalos de usuário que um tick dá, no máximo.
+pub const USER_SLICES_PER_TICK: usize = 16;
+
 /// Um tick tem orçamento limitado de passos; cada seleção consulta as filas
 /// vivas. Uma thread de prioridade menor não ganha CPU só porque a maior já
-/// rodou neste tick.
+/// rodou neste tick. Uma thread de usuário selecionada ganha um intervalo
+/// pelo despachante de todos os processos (só no tick comum, sem piso de
+/// prioridade, e quando a CPU pode despachar usuário).
 pub fn tick(minimum_priority: i32) {
     reap();
     let budget = STATE.lock().processes.len();
-    for _ in 0..budget {
+    let (mut steps, mut slices) = (0, 0);
+    let user_slices = |slices: usize| minimum_priority < 0 && slices < USER_SLICES_PER_TICK && user_threads::can_dispatch();
+    while steps < budget || user_slices(slices) {
         let selected = refresh_waiting_threads().and_then(|_| thread_dispatch::peek());
         let (thread, owner) = match selected {
             Ok(Some(selected)) => selected,
@@ -318,9 +334,24 @@ pub fn tick(minimum_priority: i32) {
                 break;
             }
         };
-        if owner.runtime & thread_dispatch::USER_RUNTIME != 0 || thread_dispatch::priority(thread) as i32 <= minimum_priority {
+        if owner.runtime & thread_dispatch::USER_RUNTIME != 0 {
+            if !user_slices(slices) {
+                break;
+            }
+            slices += 1;
+            match user_threads::dispatch_one() {
+                Ok(Dispatched::Ran { .. }) => continue,
+                Ok(Dispatched::Idle) => break,
+                Err(error) => {
+                    debug_print!("[sched] despacho de usuario falhou: {}", error);
+                    break;
+                }
+            }
+        }
+        if steps >= budget || thread_dispatch::priority(thread) as i32 <= minimum_priority {
             break;
         }
+        steps += 1;
         let pid = owner.runtime as u32;
         if let Err(error) = run_step(pid, thread) {
             debug_print!("[sched] processo {} morreu: {}", pid, error);

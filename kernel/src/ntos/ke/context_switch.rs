@@ -11,13 +11,21 @@
 //!   NT), e move a CPU em KPROCESS.ActiveProcessors;
 //! - a troca de thread corrente ([`load_process`], chamada por
 //!   `ps::process::set_current_thread`): carrega a raiz do processo da nova
-//!   thread quando ela difere da carregada.
+//!   thread quando ela difere da carregada e move a CPU em
+//!   KPROCESS.ActiveProcessors.
 //!
 //! Cada CPU registra aqui a raiz que carregou ([`loaded_root`],
 //! [`is_root_loaded`]): o Mm não devolve ao PFN uma raiz que alguma CPU
 //! esteja usando (`process_address_space::delete`). Só esta troca carrega
 //! uma raiz diferente; os outros escritores do CR3 (`cpu::reload_cr3`, a
 //! partida dos APs na raiz do System) recarregam a mesma.
+//!
+//! Cada CPU também registra o processo em cujo KPROCESS.ActiveProcessors
+//! ela tem o bit ([`active_process`]): a troca tira o bit do processo
+//! registrado, não do processo da thread que sai — que pode já ter sido
+//! liberada (a thread de um processo que acabou de terminar). O último
+//! dereference de um processo o tira do registro ([`forget_process`]) antes
+//! de o EPROCESS voltar ao pool.
 //!
 //! Sem PCID nem páginas globais, cada troca esvazia a TLB não global da CPU.
 //! Cada processo de usuário tem a própria raiz (`ps::process::create_process`
@@ -64,6 +72,9 @@ const ROOT_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// começa na raiz do System (o BSP desde o boot; os APs recebem a mesma na
 /// partida).
 static LOADED: [AtomicU64; map::MAX_CPUS] = [const { AtomicU64::new(SYSTEM_ROOT) }; map::MAX_CPUS];
+/// O processo em que cada CPU está (o bit dela em KPROCESS.ActiveProcessors),
+/// pelo número do processador; 0 antes da primeira troca.
+static ACTIVE: [AtomicU64; map::MAX_CPUS] = [const { AtomicU64::new(0) }; map::MAX_CPUS];
 
 /// A KPCR desta CPU (gs:[KPCR.Self]); nenhuma antes da do BSP.
 fn current_pcr() -> Option<&'static Kpcr> {
@@ -71,7 +82,7 @@ fn current_pcr() -> Option<&'static Kpcr> {
 }
 
 /// O número desta CPU (KPRCB.Number); 0 antes da KPCR do BSP.
-fn processor() -> usize {
+pub fn processor() -> usize {
     current_pcr().map_or(0, |kpcr| (kpcr.prcb.number.get() as usize).min(map::MAX_CPUS - 1))
 }
 
@@ -147,39 +158,69 @@ pub fn load_root(root: u64) -> Result<(), KernelError> {
     result
 }
 
+/// O processo em que esta CPU está (o bit dela em
+/// KPROCESS.ActiveProcessors); 0 antes da primeira troca.
+pub fn active_process() -> u64 {
+    ACTIVE[processor()].load(Ordering::Acquire)
+}
+
+/// Esta CPU passa a estar em `next`: o bit dela (grupo e número da KPRCB)
+/// sai de KPROCESS.ActiveProcessors do processo registrado e entra no de
+/// `next`. O processo que sai é o registrado, nunca lido da thread que sai.
+/// Interrupções desligadas: uma troca aninhada não intercala o registro.
+fn enter_process(next: u64) {
+    let Some(kpcr) = current_pcr() else { return };
+    let flags = cpu::save_and_disable_interrupts();
+    let slot = &ACTIVE[processor()];
+    let previous = slot.load(Ordering::Acquire);
+    if previous != next {
+        let group = kpcr.prcb.group.get() as usize;
+        let bit = 1u64 << kpcr.prcb.group_index.get();
+        if previous != 0 {
+            // SAFETY: o processo registrado está vivo: o último dereference
+            // o tira do registro antes de liberar o EPROCESS.
+            unsafe { Kprocess::at(previous) }.active_processors.bitmap[group].atomic().fetch_and(!bit, Ordering::SeqCst);
+        }
+        if next != 0 {
+            // SAFETY: o processo da nova thread corrente (ou o alvo de uma
+            // anexação), retido por ela ou pelo chamador.
+            unsafe { Kprocess::at(next) }.active_processors.bitmap[group].atomic().fetch_or(bit, Ordering::SeqCst);
+        }
+        slot.store(next, Ordering::Release);
+    }
+    cpu::restore_interrupts(flags);
+}
+
+/// O EPROCESS `process` vai ser liberado (o último dereference): nenhuma
+/// CPU fica com ele registrado. Como no NT, um processo só é liberado
+/// depois que nenhuma thread dele roda e ninguém está anexado a ele.
+pub fn forget_process(process: u64) {
+    for slot in &ACTIVE {
+        let _ = slot.compare_exchange(process, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 /// A troca de thread corrente: carrega a raiz de `process`, o
-/// `ApcState.Process` da nova thread. Uma raiz que não é de espaço de
-/// endereçamento (EPROCESS corrompido) não é carregada: a CPU fica na raiz
-/// do System, que não tem página de usuário de nenhum espaço próprio.
+/// `ApcState.Process` da nova thread, e move a CPU em
+/// KPROCESS.ActiveProcessors. Uma raiz que não é de espaço de endereçamento
+/// (EPROCESS corrompido) não é carregada: a CPU fica na raiz do System, que
+/// não tem página de usuário de nenhum espaço próprio.
 pub fn load_process(process: u64) {
     let root = directory_table_base(process);
     if let Err(error) = load_root(root) {
         debug_print!("[ke] raiz {:#x} do processo {:#x} nao carregada: {}", root, process, error);
         let _ = load_root(SYSTEM_ROOT);
     }
+    enter_process(process);
 }
 
-/// KiSwapProcess: esta CPU sai de `previous` e entra em `next`. Carrega a
-/// raiz de `next` quando ela difere da carregada e move o bit da CPU (grupo
-/// e número da KPRCB) de KPROCESS.ActiveProcessors de `previous` para
-/// `next`. Os dois processos estão retidos pelo chamador.
-pub fn swap_process(previous: u64, next: u64) -> Result<(), KernelError> {
+/// KiSwapProcess: esta CPU sai do processo registrado (`previous`, para o
+/// chamador, é o mesmo) e entra em `next`. Carrega a raiz de `next` quando
+/// ela difere da carregada e move o bit da CPU de
+/// KPROCESS.ActiveProcessors. Os dois processos estão retidos pelo chamador.
+pub fn swap_process(_previous: u64, next: u64) -> Result<(), KernelError> {
     load_root(directory_table_base(next))?;
-    let Some(kpcr) = current_pcr() else { return Ok(()) };
-    let group = kpcr.prcb.group.get() as usize;
-    let bit = 1u64 << kpcr.prcb.group_index.get();
-    for (process, active) in [(next, true), (previous, false)] {
-        if process == 0 {
-            continue;
-        }
-        // SAFETY: processo retido pelo chamador.
-        let mask = unsafe { Kprocess::at(process) }.active_processors.bitmap[group].atomic();
-        if active {
-            mask.fetch_or(bit, Ordering::SeqCst);
-        } else {
-            mask.fetch_and(!bit, Ordering::SeqCst);
-        }
-    }
+    enter_process(next);
     Ok(())
 }
 

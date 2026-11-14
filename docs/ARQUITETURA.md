@@ -358,9 +358,10 @@ união das convenções do kernel e MS x64) fica na pilha da thread, o RSP vai
 para KTHREAD.KernelStack, e a CPU sai pelo fim do intervalo
 (`user_terminate_current`) com o tipo de saída 4; a thread leva na pilha o
 estado por CPU do serviço (CONTEXT do intervalo, quadro e faixas preservadas
-da syscall, KPCR.UserRsp, NtContinue, posse de execução nativa). O laço de
-`ps/user/threads.rs` segue com as outras threads, sonda a espera no contexto
-da bloqueada (thread corrente e CR3 dela) e, quando ela conclui, retoma o
+da syscall, KPCR.UserRsp, NtContinue, posse de execução nativa). O
+despachante de `ps/user/threads.rs` segue com as outras threads, sonda a
+espera no contexto da bloqueada (thread corrente e CR3 dela) e, quando ela
+conclui, retoma o
 serviço na pilha dela (`switch_to` → `usermode::resume_kernel_context`, que
 monta um quadro de despachante novo e entra no quadro salvo) em vez de entrar
 no anel 3; a syscall termina o intervalo como qualquer outra. Passam por aí
@@ -373,7 +374,8 @@ DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema (assert).
 Uma thread terminada enquanto bloqueada tem a espera concluída com
 STATUS_THREAD_IS_TERMINATING e é retomada para desfazer o serviço antes de a
 pilha voltar ao Mm (uma aquisição continua até concluir, como a espera de um
-mutex no NT); no fim do laço nenhuma fica bloqueada. Os serviços Nt* que
+mutex no NT); o término de um processo espera as threads dele desfazerem os
+serviços. Os serviços Nt* que
 esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
 PENDING + espera sondada, sem pilha suspensa. O autoteste
 `ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
@@ -382,6 +384,55 @@ a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
 dentro da pilha dela) e sinaliza o evento; a 1 volta na própria pilha com
 STATUS_SUCCESS e devolve 0 ao anel 3. Um segundo cenário termina a thread
 bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha).
+
+**Despachante de todos os processos.** Um despachante só serve as threads
+de usuário de todos os processos vivos (`ps/user/threads.rs`):
+`dispatch_one` sonda as esperas de todas as threads dos processos que
+entraram nele (`ProcessState.started`), roda o `pump_kernel` e os pumps de
+ALPC, `device_io`, fábricas, timers e pacotes de espera, retoma as threads
+terminadas que precisam desfazer um serviço bloqueado, conclui os términos
+adiados e dá um intervalo à thread de usuário pronta mais prioritária da
+fila do `thread_dispatch`, de qualquer processo; a troca de thread corrente
+carrega a raiz do processo dela. Um despacho aninhado (um pump dentro do
+despacho) devolve `Idle`, e só o BSP despacha usuário (assert). Um processo
+entra no despachante por `ps/user/process.rs::start_created` (o CONTEXT do
+LdrInitializeThunk e o registro da thread principal) e anda com os outros,
+esperado ou não; `wait_started`/`threads::wait_for_process` bloqueia quem
+precisa do fim dele despachando todos enquanto espera (`run_created` é os
+dois juntos). O `scheduler::tick` também despacha: quando a thread mais
+prioritária das filas é de usuário, dá até `USER_SLICES_PER_TICK`
+intervalos, se a CPU pode despachar usuário (`threads::can_dispatch`: o
+BSP, PASSIVE_LEVEL, nenhuma trava retida, nada de usuário em curso), então
+processos em segundo plano andam pelo laço do kmain e pelos pumps das
+esperas, e o timer, que encerra o intervalo de quem não cede a CPU, alterna
+entre eles. O fim de um processo tem um caminho só,
+`ps/create.rs::exit_process` (o PspExitProcess): a falha na criação, o
+descarte, o NtTerminateProcess dele mesmo (o intervalo termina de vez e o
+despachante pede o fim), uma exceção fatal, uma falha de despacho e o
+NtTerminateProcess por handle de outro processo (PROCESS_TERMINATE), que
+termina o alvo sem tocar em quem chamou. As threads do processo morrem na
+hora (`threads::begin_exit`: esperas com THREAD_IS_TERMINATING, fora da fila
+de prontas); o término (`finish_exit`: o post-mortem de um processo que
+rodou, o `terminate_process` com as notificações no contexto de uma thread
+dele e as rotinas de saída, e a liberação das threads) roda já ou, se uma
+thread dele tem serviço suspenso no kernel ou o intervalo em curso é dele,
+fica com o despachante, que o conclui depois de desfazer os serviços. O
+NtTerminateProcess(NULL) termina as outras threads do processo corrente e
+quem chamou segue, como o primeiro passo do RtlExitUserProcess. A troca de
+thread corrente move a CPU em KPROCESS.ActiveProcessors do processo
+registrado para o da nova thread (veja a troca de CR3). O autoteste
+`ntos/test/multiprocess/all_processes.rs` (fase 7) põe dois processos no
+despachante antes de qualquer espera: cada um abre uma seção nomeada, espera
+a chegada do outro e, N vezes, incrementa o contador dela, anota o valor e
+cede a CPU; os diários mostram os dois avançando antes de qualquer um sair,
+e eles saem com códigos distintos. Depois, movidos só pelo tick, um processo
+que gira no anel 3 sem syscall é terminado por handle por outro, que abre o
+alvo pelo CLIENT_ID e segue vivo: logo depois do término a vítima não tem
+estado, threads, vista nem pilha de kernel, e a raiz dela fica só com a
+KUSER, enquanto o matador termina as voltas e sai com o próprio código. Por
+fim, com uma segunda thread viva, a principal chama
+NtTerminateProcess(NULL), recebe sucesso e sai depois com o próprio código;
+a segunda morreu com o status pedido.
 
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:
@@ -548,8 +599,12 @@ PML4:
   recusa, antes de mexer no KAPC_STATE, um processo cuja raiz não é a do
   System nem uma raiz do Mm (`process_address_space::is_root`).
   `ps::process::set_current_thread`, o ponto único de troca de thread, carrega
-  a raiz do processo corrente da nova thread; ele não mexe em
-  ActiveProcessors, porque a thread que sai pode já ter sido liberada.
+  a raiz do processo corrente da nova thread e move a CPU em
+  ActiveProcessors. Cada CPU registra o processo em que está
+  (`context_switch::active_process`): a troca tira o bit dela do processo
+  registrado, nunca do processo da thread que sai, que pode já ter sido
+  liberada, e o último dereference de um processo o tira do registro
+  (`forget_process`) antes de o EPROCESS voltar ao pool.
   `context_switch` registra a raiz carregada em cada CPU (`is_root_loaded`),
   e é por esse registro que o delete recusa uma raiz em uso. Só o BSP roda o
   anel 3 (assert na entrada) e carrega a raiz de um processo de usuário; os
@@ -588,7 +643,7 @@ dois processos de usuário ao mesmo tempo pelo caminho real
 (`ps::create::create_user_process`): raízes próprias e distintas; a PEB e a pilha na
 mesma VA nos dois, com conteúdo diferente lido anexado a cada um e frames
 que a raiz do System não vê; a ntdll em cópias privadas na mesma VA. Depois
-os dois rodam em sequência (`run_created`) com os próprios códigos de
+os dois rodam um depois do outro (`run_created`) com os próprios códigos de
 saída, e no fim as raízes ficam só com a KUSER, voltam no último
 dereference e o PFN livre volta ao de antes.
 
@@ -658,7 +713,7 @@ dereference e o PFN livre volta ao de antes.
 - **Ciclo de vida por processo**: o que um processo possui volta quando ele
   termina, e só o dele; não há reinício global entre um processo e o
   próximo. As threads de usuário ficam na lista do processo
-  (`ProcessState.threads`, com `started` marcando o laço iniciado) e no
+  (`ProcessState.threads`, com `started` marcando a entrada no despachante) e no
   índice global de `ps/user/threads.rs` (despachante, APCs, busca por id de
   cliente) até serem liberadas; os módulos do loader do kernel, com as
   imagens, ficam em `ProcessState` (a ntdll é do sistema e vale em todos).
@@ -671,7 +726,7 @@ dereference e o PFN livre volta ao de antes.
   é recolhida enquanto é a corrente, está no meio de um intervalo de
   usuário ou está bloqueada no kernel com o serviço na pilha:
   `threads::release_process` deixa o KTHREAD dela para quando o chamador
-  trocar de volta (e o laço desfizer o serviço) e chamar de novo. Toda falha depois da criação
+  trocar de volta (e o despachante desfizer o serviço) e chamar de novo. Toda falha depois da criação
   de um processo também passa pelo término. Teste:
   `ntos/test/multiprocess/lifecycle.rs`.
 - **Criação de processos**: um caminho só, `ps/create.rs::
@@ -679,7 +734,8 @@ dereference e o PFN livre volta ao de antes.
   o PspAllocateThread e o PspInsertProcess/PspInsertThread). Todo processo
   de usuário nasce ali: o `run_windows_process` e o `run_service`
   (`ps/user/process.rs`, que só monta o pedido e executa o processo
-  criado, `run_created`) e os autotestes. O pedido traz a imagem (caminho
+  criado, `run_created` = `start_created` + `wait_started`) e os
+  autotestes. O pedido traz a imagem (caminho
   NT de um arquivo do volume, arquivo do volume ou bytes), o nome curto e
   os parâmetros. A ordem: abrir a imagem e ler o layout (uma falha não cria
   nada: `CreateFailure::FileOpen`/`ExeFormat`); `create_process` (EPROCESS,
@@ -697,7 +753,7 @@ dereference e o PFN livre volta ao de antes.
   contexto de quem cria e as de carga de imagem anexadas ao processo novo.
   O processo sai parado (`CreatedProcess`); descartado sem rodar, termina
   com STATUS_CANCELLED, e toda falha depois do `create_process` passa pelo
-  término (`create::end_process`). Teste:
+  fim do processo (`create::exit_process`). Teste:
   `ntos/test/multiprocess/create_path.rs`.
 - **Memória de usuário de outro processo**: o kernel só toca a memória de
   usuário do processo corrente; para a de outro, anexa ao dono antes, como
@@ -705,11 +761,11 @@ dereference e o PFN livre volta ao de antes.
   with_process`, que troca o KAPC_STATE e carrega a raiz do alvo como o
   attach (`ke/context_switch.rs`), voltando à do processo restaurado. Rodam
   anexados: a cópia de conclusão de `device_io` (SystemBuffer e IOSB, que o
-  pump do laço conclui no contexto de quem o chamou), a cópia final do
+  pump do despachante conclui no contexto de quem o chamou), a cópia final do
   IofCompleteRequest de um IRP de modo usuário (IOSB e buffer vão para o
   processo de Irp->Tail.Overlay.Thread, como a APC de conclusão do NT; um
-  processo que já saiu não recebe a cópia), o post-mortem do
-  `run_windows_process` (o laço devolveu a thread do chamador), a criação
+  processo que já saiu não recebe a cópia), o post-mortem no fim do
+  processo (`create::finish_exit`, de qualquer contexto), a criação
   do processo (`ps/create.rs`: imagem, PEB, parâmetros, TEB e o CONTEXT
   inicial, e as notificações de carga de imagem do executável e da ntdll,
   com o PID dele) e a criação de workers de fábrica (já era). A

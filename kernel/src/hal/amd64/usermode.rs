@@ -718,6 +718,12 @@ pub fn ready() -> bool {
     STATE.lock().ready
 }
 
+/// Uma execução de usuário (intervalo, retomada no kernel ou o anel 3 cru
+/// dos autotestes) está em curso nesta CPU.
+pub fn executing() -> bool {
+    STATE.lock().running
+}
+
 /// No M0 só o BSP executa o anel 3: só ele tem a TSS, o LSTAR e a pilha
 /// reserva armados.
 fn assert_boot_processor() {

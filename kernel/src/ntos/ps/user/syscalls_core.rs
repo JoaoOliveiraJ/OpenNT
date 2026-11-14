@@ -111,8 +111,32 @@ fn nt_display_string(string: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Re
     })
 }
 
-/// NtTerminateProcess(handle, exitCode): a HAL faz o longjmp de volta.
-fn nt_terminate_process(_handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+/// PROCESS_TERMINATE.
+const PROCESS_TERMINATE: u32 = 0x0001;
+/// STATUS_PROCESS_IS_TERMINATING.
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+
+/// NtTerminateProcess(handle, exitCode). Com NULL, as outras threads do
+/// processo corrente terminam e quem chamou segue (o primeiro passo do
+/// RtlExitUserProcess, antes do LdrShutdownProcess). Com um handle de outro
+/// processo (PROCESS_TERMINATE), o fim dele (`ps::create::exit_process`), sem
+/// tocar em quem chamou. Com o do próprio processo (o pseudo-handle ou um
+/// handle real para ele), o código vai para a HAL, que encerra o intervalo
+/// de vez (longjmp), e o despachante pede o fim do processo.
+fn nt_terminate_process(handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let status = exit_code as u32;
+    if handle == 0 {
+        crate::debug_print!("[usermode] NtTerminateProcess(NULL, exit={:#x}): as outras threads terminam", status);
+        return threads::terminate_other_threads(status);
+    }
+    let target = match super::handles::process_pointer(handle, PROCESS_TERMINATE) {
+        Ok(target) => target,
+        Err(status) => return Ok(status),
+    };
+    if target != crate::ntos::ps::process::get_current_process() {
+        crate::debug_print!("[usermode] NtTerminateProcess(processo {:#x}, exit={:#x})", target, status);
+        return Ok(if crate::ntos::ps::create::exit_process(target, status) { STATUS_SUCCESS } else { STATUS_PROCESS_IS_TERMINATING });
+    }
     if let Some(thread) = threads::current() {
         let rsp = pcr::current().user_rsp.get();
         thread.with(|thread| thread.termination_rsp = rsp);

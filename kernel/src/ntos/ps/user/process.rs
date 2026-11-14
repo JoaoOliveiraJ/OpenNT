@@ -4,12 +4,15 @@
 //! único de criação: EPROCESS com raiz própria, a seção de imagem da fonte
 //! exata, PEB, parâmetros, TEB e o CONTEXT inicial); aqui ele roda: o
 //! LdrInitializeThunk da ntdll em anel 3 inicializa heap, imports e TLS
-//! antes do entry, e o despachante executa as threads dele até o fim. Inclui
-//! o post-mortem (candidatos de retorno na pilha da saída, Ldr e pilha da
-//! falha).
+//! antes do entry. [`start_created`] põe a thread principal no despachante
+//! de todos os processos (o processo anda com os outros, sem ninguém
+//! esperá-lo) e [`wait_started`] espera o fim dele, despachando todos
+//! enquanto isso. Inclui o post-mortem (candidatos de retorno na pilha da
+//! saída, Ldr e pilha da falha), que o fim do processo chama.
 //!
-//! Todo processo que roda aqui acaba em `ps::process::terminate_process`,
-//! inclusive nas falhas, e o término libera tudo o que ele possui
+//! Todo processo que roda aqui acaba em `ps::process::terminate_process`
+//! (pelo `ps::create::exit_process`, pedido de onde for), inclusive nas
+//! falhas, e o término libera tudo o que ele possui
 //! (`files::release_user_resources` e `process_state::destroy`): não há
 //! reinício global entre um processo e o próximo. Criar
 //! (`create_user_process`) e executar ([`run_created`]) são passos
@@ -31,7 +34,6 @@ use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::ntos::mm::{paging, pfn};
 use crate::ntos::ps::create::{self, CreateFailure, CreateProcessRequest, CreatedProcess, ImageOrigin};
 use crate::ntos::ps::process;
-use crate::ntos::ps::process_context;
 use crate::ntos::ps::process_parameters::ProcessParameters;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -58,20 +60,33 @@ pub fn windows_process_request<'a>(image: ImageOrigin, image_name: &'a str, dos_
     CreateProcessRequest { image, image_name, parameters, on_created: options.on_process_created }
 }
 
-/// Executa um processo criado até o fim: o LdrInitializeThunk da ntdll em
-/// anel 3 (heap, imports e TLS antes do entry), o despachante das threads
-/// dele e o término. Devolve o código de saída.
-pub fn run_created(mut created: CreatedProcess) -> Result<u32, KernelError> {
+/// Um processo posto no despachante por [`start_created`]: anda com os
+/// outros até acabar, esperado ou não. O EPROCESS fica retido até
+/// [`wait_started`] (ou o descarte, que não interrompe o processo).
+pub struct StartedProcess {
+    pub process_pointer: u64,
+    pub process_id: u64,
+    image_name: String,
+    capturing: bool,
+    /// Ainda retém o EPROCESS.
+    retained: bool,
+}
+
+impl Drop for StartedProcess {
+    fn drop(&mut self) {
+        if core::mem::take(&mut self.retained) {
+            let _ = process::dereference(self.process_pointer);
+        }
+    }
+}
+
+/// Põe um processo criado para rodar, sem esperar: a thread principal entra
+/// no despachante de todos os processos pelo LdrInitializeThunk da ntdll em
+/// anel 3 (heap, imports e TLS antes do entry). Daí em diante o fim do
+/// processo, pedido de onde for, passa por `ps::create::exit_process`.
+pub fn start_created(mut created: CreatedProcess) -> Result<StartedProcess, KernelError> {
     created.begin_run();
     let process_pointer = created.process_pointer;
-    let previous = process::get_current_thread();
-    let fail = |error: KernelError| -> KernelError {
-        create::end_process(process_pointer, create::failure_status(&error), previous);
-        error
-    };
-    // Daqui em diante a thread do processo é a corrente: as notificações de
-    // saída rodam no contexto dele.
-    process::set_current_thread(created.thread_pointer);
     // A captura de chamada arma o breakpoint no export pedido da ntdll.
     let capturing = state::with(|state| !state.capture_export.is_empty());
     if capturing {
@@ -81,22 +96,52 @@ pub fn run_created(mut created: CreatedProcess) -> Result<u32, KernelError> {
         }
     }
     crate::debug_print!("[usermode] {}: LdrInitializeThunk em {:#x} (exe entry {:#x}, teb {:#x})", created.image_name, created.initialize, created.entry_point, created.teb);
-    let result = threads::run(&created.thread, created.initialize, created.stack_top, created.context, created.ntdll_base);
-    if capturing {
+    // A partida roda como a thread do processo: o CONTEXT inicial e o PID
+    // são dele.
+    let previous = process::get_current_thread();
+    process::set_current_thread(created.thread_pointer);
+    let started = threads::start(&created.thread, created.initialize, created.stack_top, created.context, created.ntdll_base);
+    process::set_current_thread(previous);
+    if let Err(error) = started {
+        create::exit_process(process_pointer, create::failure_status(&error));
+        if capturing {
+            super::call_capture::finish();
+        }
+        return Err(error);
+    }
+    process::reference(process_pointer);
+    Ok(StartedProcess { process_pointer, process_id: created.process_id, image_name: created.image_name.clone(), capturing, retained: true })
+}
+
+/// Espera o fim de um processo posto para rodar, despachando enquanto isso
+/// as threads de todos os processos. O fim (`ps::create::exit_process`) já
+/// fez o post-mortem e o término; aqui sai o que restou (o KTHREAD que era o
+/// corrente quando a última thread saiu dentro do intervalo). Devolve o
+/// código de saída.
+pub fn wait_started(started: StartedProcess) -> Result<u32, KernelError> {
+    let process_pointer = started.process_pointer;
+    let result = threads::wait_for_process(process_pointer);
+    if started.capturing {
         super::call_capture::finish();
     }
-    let exit_code = result.map_err(fail)?;
-    // O post-mortem lê a pilha, as imagens e o Ldr antes de o término
-    // devolver o VAD, anexado ao processo: o laço devolveu a thread de quem
-    // o chamou.
-    if exit_code != 0x42 && exit_code != 0 {
-        let _ = process_context::with_process(process_pointer, || post_mortem(process_pointer));
-    }
-    create::end_process(process_pointer, exit_code, previous);
-    crate::debug_print!("[usermode] {} saiu: codigo {:#x}", created.image_name, exit_code);
+    let exit_code = match result {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            create::exit_process(process_pointer, create::failure_status(&error));
+            return Err(error);
+        }
+    };
+    threads::release_process(process_pointer);
+    crate::debug_print!("[usermode] {} saiu: codigo {:#x}", started.image_name, exit_code);
     let (heap_total, heap_used) = kmalloc::info();
     crate::debug_print!("[mm] process exit: PFN used={}/{}, kernel heap={}/{}", pfn::total_count() - pfn::free_count(), pfn::total_count(), heap_used, heap_total);
     Ok(exit_code)
+}
+
+/// Executa um processo criado até o fim ([`start_created`] e
+/// [`wait_started`]). Devolve o código de saída.
+pub fn run_created(created: CreatedProcess) -> Result<u32, KernelError> {
+    wait_started(start_created(created)?)
 }
 
 /// Cria (`ps::create::create_user_process`) e executa ([`run_created`]) um
@@ -118,7 +163,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha
 /// publicada pela HAL e o Ldr real do processo, que é o corrente (anexado).
-fn post_mortem(process_pointer: u64) {
+pub(crate) fn post_mortem(process_pointer: u64) {
     // A pilha da thread que encerrou o processo.
     let termination = threads::of_process(process_pointer).iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);
     let images: Vec<(u64, u64, String)> = Space::of(process_pointer).images().iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect();

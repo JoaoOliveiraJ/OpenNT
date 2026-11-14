@@ -30,6 +30,14 @@
 //! entrou no despachante. Toda falha depois do passo 2 passa pelo término,
 //! que libera o que o processo já possui, e um processo criado que é
 //! descartado sem rodar termina com STATUS_CANCELLED.
+//!
+//! Aqui também mora o fim de um processo de usuário ([`exit_process`], o
+//! PspExitProcess), o único caminho até o término: a falha na criação, o
+//! descarte, o NtTerminateProcess dele mesmo (no fim do intervalo), o de
+//! outro processo por handle, uma exceção fatal. As threads dele morrem na
+//! hora; o término roda quando nenhuma delas tem mais serviço suspenso no
+//! kernel (o despachante de `ps/user/threads.rs` desfaz os serviços e o
+//! conclui depois do intervalo, [`finish_exit`]).
 
 use alloc::format;
 use alloc::string::String;
@@ -166,20 +174,53 @@ impl Drop for CreatedProcess {
     fn drop(&mut self) {
         if self.pending {
             self.pending = false;
-            end_process(self.process_pointer, STATUS_CANCELLED, process::get_current_thread());
+            exit_process(self.process_pointer, STATUS_CANCELLED);
         }
     }
 }
 
-/// O término de um processo criado aqui (uma falha na criação, o descarte
-/// ou o fim da execução). Roda com a thread corrente de quem o chama (a do
-/// processo, numa falha depois de ela virar a corrente: as notificações de
-/// saída no contexto do processo, como no NT); o KTHREAD que era o corrente
-/// só é recolhido depois da troca de volta para `previous`.
-pub fn end_process(process_pointer: u64, status: u32, previous: u64) {
+/// O fim de um processo de usuário (o PspExitProcess), pedido de qualquer
+/// contexto: uma falha na criação, o descarte, o NtTerminateProcess dele
+/// mesmo (no fim do intervalo), o de outro processo por handle, uma exceção
+/// fatal ou uma falha de despacho. As threads dele morrem na hora
+/// (`threads::begin_exit`); o término roda já se nenhuma delas tem serviço
+/// suspenso no kernel e o intervalo em curso nesta CPU não é de uma delas,
+/// ou fica para o despachante, que o conclui ([`finish_exit`]) depois de
+/// desfazer os serviços. Só o processo `process_pointer` perde alguma coisa.
+/// Devolve `false` se o fim já tinha sido pedido ou o processo já terminou.
+pub fn exit_process(process_pointer: u64, status: u32) -> bool {
+    if !threads::begin_exit(process_pointer, status) {
+        return false;
+    }
+    crate::debug_print!("[ps] fim do processo {:#x} pedido: codigo {:#x}", process_pointer, status);
+    if threads::exit_ready(process_pointer) {
+        finish_exit(process_pointer);
+    }
+    true
+}
+
+/// O término de um processo com o fim pedido ([`exit_process`]): o
+/// post-mortem de um processo que rodou (anexado, antes de o VAD voltar), o
+/// `ps::process::terminate_process` — notificações, as rotinas de saída
+/// (`files::release_user_resources`: threads, E/S pendente, fábricas,
+/// mutantes, instrumentação e canais RPC do processo), handles, VAD e
+/// imagens — e a liberação das threads. As notificações rodam no contexto do
+/// processo, como as da última thread no NT; o KTHREAD que era o corrente só
+/// é recolhido depois da troca de volta para a thread de quem chama.
+pub fn finish_exit(process_pointer: u64) {
+    let Some(status) = threads::claim_exit(process_pointer) else { return };
+    let ran = process_state::get(process_pointer).is_some_and(|state| state.started.load(core::sync::atomic::Ordering::Acquire));
+    if ran && status != 0x42 && status != 0 {
+        let _ = process_context::with_process(process_pointer, || crate::ntos::ps::user::process::post_mortem(process_pointer));
+    }
+    let previous = process::get_current_thread();
+    if let Some(own) = threads::of_process(process_pointer).iter().map(|thread| thread.pointer()).find(|&pointer| pointer != 0) {
+        process::set_current_thread(own);
+    }
     let _ = process::terminate_process(process_pointer, status);
     process::set_current_thread(previous);
     threads::release_process(process_pointer);
+    threads::end_exit(process_pointer);
 }
 
 /// O status de saída de um processo que falhou depois de criado.
@@ -339,11 +380,10 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     }
     // Daqui em diante toda saída passa pelo término, que libera o que o
     // processo possui.
-    let previous = process::get_current_thread();
     let fail = |error: KernelError| -> CreateFailure {
         let status = failure_status(&error);
         crate::debug_print!("[ps] criacao de {} falhou: {}", request.image_name, error);
-        end_process(process_pointer, status, previous);
+        exit_process(process_pointer, status);
         CreateFailure::Terminated(status)
     };
     // O espaço do processo novo, anexado: as cópias de sistema, o exe na
