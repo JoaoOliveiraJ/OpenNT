@@ -618,8 +618,22 @@ em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
 **Heap do kernel e arena dos convidados.** Os frames de 32 MB a 96 MB (fora
 do PFN) aparecem só na janela do heap, `KERNEL_HEAP_BASE + (PA - 32 MB)`, o
 papel do pool não paginado inicial do NT: páginas de 2 MB de supervisor, RW e
-executáveis (o pool não paginado comum do NT executa, e a arena guarda
-pequenas rotinas de conclusão geradas em tempo de execução).
+sem execução (NX), como o NonPagedPoolNx; os remapeamentos de páginas da
+janela (o mapeamento reservado das MDLs) também ficam NX. Nada executa do
+heap nem da arena: as rotinas que o kernel entrega aos caminhos nativos (a
+rotina de kernel e de rundown das APCs de conclusão, o
+KeSpecialUserApcKernelRoutine, a rotina de conclusão dos IRPs retidos) são
+funções da imagem do kernel, chamadas pela ABI MS x64; o NonPagedPool
+executável dos drivers vem do pool executivo (`kernel_pool`), e o código
+que os autotestes geram (rotinas de drivers de teste, callbacks, corpos de
+threads nativas) fica numa imagem carregada ou numa alocação executável da
+janela de sistema, MmAllocateContiguousNodeMemory com PAGE_EXECUTE_READWRITE
+(`ntos/test/executable_code.rs`). O autoteste `ntos/test/multiprocess/heap_nx.rs`
+confere as páginas da janela sem execução e chama, de uma imagem de teste
+numa execução nativa possuída, um endereço da arena com código: a busca da
+instrução falta e vira STATUS_ACCESS_VIOLATION de execução
+(ExceptionInformation[0] = 8), tratada pelo SEH da imagem; o mesmo código
+numa alocação executável roda.
 `paging::map_kernel_heap_window` monta a janela no boot, antes da primeira
 alocação, com a PDPT e a PD fixas em 0x7B000-0x7CFFF. O `kmalloc` (e com ele
 todo `Box`/`Vec` do kernel) e a arena de 16 MB reservada dele devolvem VAs

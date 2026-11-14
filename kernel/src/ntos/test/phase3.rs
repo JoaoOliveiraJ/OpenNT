@@ -432,8 +432,11 @@ fn object_callbacks(assert: Assert) {
     assert(callbacks::compare_altitude("320000", "0320000.000") == AltitudeOrder::Equal, "ob callbacks: altitude normalizada");
     assert(callbacks::compare_altitude("1.5", "1.45") == AltitudeOrder::Greater && callbacks::compare_altitude("99", "100") == AltitudeOrder::Less, "ob callbacks: ordem decimal textual");
     // Imagem verificada mínima: pré-callback conta e remove PROCESS_TERMINATE;
-    // pós-callback conta.
-    let page = guest::alloc_page();
+    // pós-callback conta. O código fica numa alocação executável da janela de
+    // sistema (MmAllocateContiguousNodeMemory com PAGE_EXECUTE_READWRITE), não
+    // no heap nem na arena, que não executam.
+    let page = crate::ntos::mm::contiguous_memory::allocate_node(0x1000, 0, u64::MAX, 0, 0x40, 0).unwrap_or(0);
+    assert(page != 0 && crate::ntos::mm::paging::query_page(page, false).is_some_and(|mapping| !mapping.nx), "ob callbacks: pagina executavel para o codigo da imagem");
     let code: [u8; 16] = [
         0xFF, 0x01, // inc dword [rcx]
         0x48, 0x8B, 0x42, 0x20, // mov rax, [rdx+0x20]  (Parameters)
@@ -494,7 +497,7 @@ fn object_callbacks(assert: Assert) {
     let _ = process::release_thread(thread);
     assert(matches!(loaded_images::unregister(image.id), Ok(true)), "ob callbacks: imagem descarregada");
     guest::free_bytes(scratch);
-    guest::free_bytes(page);
+    assert(crate::ntos::mm::contiguous_memory::free(page).is_ok(), "ob callbacks: pagina executavel devolvida");
 }
 
 fn open_by_pointer(assert: Assert) {

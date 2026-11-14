@@ -501,7 +501,6 @@ pub fn current_attachment_state(thread: u64) -> Option<u64> {
 // ao pool.
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// UserApcPendingAll: SpecialUserApcPending (bit 0) e UserApcPending (bit 1).
 const SPECIAL_USER_APC_PENDING: u8 = 1;
@@ -510,8 +509,6 @@ const USER_APC_PENDING: u8 = 2;
 pub const USER_APC_TEST_ALERT: u32 = 1;
 pub const USER_APC_SPECIAL: u32 = 2;
 pub const USER_APC_CALLBACK_DATA: u32 = 4;
-
-static SPECIAL_USER_APC_ROUTINE: AtomicU64 = AtomicU64::new(0);
 
 /// APC de usuário retirada da fila, pronta para o KiInitializeUserApc.
 pub struct UserApc {
@@ -522,32 +519,24 @@ pub struct UserApc {
     pub flags: u32,
 }
 
-/// KeSpecialUserApcKernelRoutine: `mov rax, rotina; jmp rax` para a rotina
-/// de liberação comum das APCs de conclusão (ExFreePoolWithTag(apc, 0)).
+/// KeSpecialUserApcKernelRoutine: a rotina de kernel das APCs de usuário
+/// especiais, que devolve o KAPC ao pool como a rotina comum das APCs de
+/// conclusão. Uma função própria da imagem do kernel: o endereço dela é o
+/// que distingue a APC especial na fila.
+extern "win64" fn special_user_apc_kernel_routine(apc: u64) {
+    if let Err(error) = crate::ntos::ex::pool_allocation::free(apc, 0) {
+        panic!("[apc] KAPC de usuario especial {apc:#x} nao voltou ao pool: {error}");
+    }
+}
+
+/// O endereço de [`special_user_apc_kernel_routine`], distinto do da rotina
+/// comum das APCs de conclusão.
 pub fn special_user_apc_routine() -> Result<u64, KernelError> {
-    let current = SPECIAL_USER_APC_ROUTINE.load(Ordering::Acquire);
-    if current != 0 {
-        return Ok(current);
+    let special = special_user_apc_kernel_routine as extern "win64" fn(u64) as usize as u64;
+    if special == crate::ntos::io::file::request::free_routine()? {
+        return Err(KernelError::new("KeSpecialUserApcKernelRoutine folded into the common APC free routine"));
     }
-    let free = crate::ntos::io::file::request::free_routine()?;
-    if free == 0 {
-        return Ok(0);
-    }
-    let code = guest::alloc_bytes(16);
-    if code == 0 {
-        return Ok(0);
-    }
-    let mut bytes = alloc::vec![0x48, 0xB8];
-    bytes.extend_from_slice(&free.to_le_bytes());
-    bytes.extend_from_slice(&[0xFF, 0xE0]);
-    guest::write_bytes(code, &bytes);
-    match SPECIAL_USER_APC_ROUTINE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(code),
-        Err(existing) => {
-            guest::free_bytes(code);
-            Ok(existing)
-        }
-    }
+    Ok(special)
 }
 
 fn is_special_user(packet: &Kapc, special: u64) -> bool {

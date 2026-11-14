@@ -338,7 +338,7 @@ fn pe_loader_kernel_images(assert: Assert) {
 }
 
 /// Imagem que importa do `ntoskrnl.exe` (nomes e um ordinal da ABI).
-pub(super) fn ntoskrnl_importer(first_import: &[u8]) -> Vec<u8> {
+pub(crate) fn ntoskrnl_importer(first_import: &[u8]) -> Vec<u8> {
     let mut image = loadable_pe();
     put32(&mut image, 0x4000, 0x4100);
     put32(&mut image, 0x400C, 0x4300);
@@ -4889,10 +4889,9 @@ fn crt_formatting_exports(assert: Assert) {
 
 
 fn io_csq_exports(assert: Assert) {
+    // Rotinas de teste numa alocação executável (o heap não executa).
     fn code(bytes: &[u8]) -> u64 {
-        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
-        guest::write_bytes(pointer, bytes);
-        pointer
+        super::executable_code::place(bytes)
     }
     // mov rax, cell; mov [rax], rdx; ret
     fn store_rdx(cell: u64) -> Vec<u8> {
@@ -4994,7 +4993,10 @@ fn io_csq_exports(assert: Assert) {
         refused == Some(0xC000_0120) && packet.cancel_routine.get() == 0 && slot.control.get() & 1 == 0,
         "io-csq: IoCsqInsertIrpEx devolve a recusa do CsqInsertIrpEx sem marcar pendente",
     );
-    for pointer in [cells, acquire, release, insert, remove, peek, complete, insert_ex, csq, csq_ex, context, irp] {
+    for pointer in [acquire, release, insert, remove, peek, complete, insert_ex] {
+        super::executable_code::release(pointer);
+    }
+    for pointer in [cells, csq, csq_ex, context, irp] {
         guest::free_bytes(pointer);
     }
 }
@@ -5002,10 +5004,9 @@ fn io_csq_exports(assert: Assert) {
 
 fn io_irp_request_exports(assert: Assert) {
     use crate::ntos::ps::process;
+    // Rotinas de teste numa alocação executável (o heap não executa).
     fn code(bytes: &[u8]) -> u64 {
-        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
-        guest::write_bytes(pointer, bytes);
-        pointer
+        super::executable_code::place(bytes)
     }
     let complete_request = crate::ntos::init::exports::export_module().ok().and_then(|module| module.exports.exports.get("IofCompleteRequest").copied()).unwrap_or(0);
     // Despacho que grava IoStatus.Status, chama IofCompleteRequest(Irp, 0) e devolve `result`.
@@ -5188,7 +5189,10 @@ fn io_irp_request_exports(assert: Assert) {
     guest::free_bytes(extension);
     guest::free_bytes(initiator);
 
-    for pointer in [completed_now, completed_later, driver, device, buffer, offset, iosb, buffered, neither, cells, routine, file, probe] {
+    for pointer in [completed_now, completed_later, routine] {
+        super::executable_code::release(pointer);
+    }
+    for pointer in [driver, device, buffer, offset, iosb, buffered, neither, cells, file, probe] {
         guest::free_bytes(pointer);
     }
 }
@@ -5250,10 +5254,9 @@ fn io_pnp_interface_exports(assert: Assert) {
 fn io_builtin_driver_exports(assert: Assert) {
     use crate::ntos::io::lifecycle;
     use crate::ntos::ob::object_manager;
+    // Rotinas de teste numa alocação executável (o heap não executa).
     fn code(bytes: &[u8]) -> u64 {
-        let pointer = guest::alloc_bytes(bytes.len() as u64 + 16);
-        guest::write_bytes(pointer, bytes);
-        pointer
+        super::executable_code::place(bytes)
     }
     let previous = lifecycle::current_driver();
     let cells = guest::alloc_bytes(0x20);
@@ -5290,7 +5293,10 @@ fn io_builtin_driver_exports(assert: Assert) {
     assert(unnamed == Some(0) && unnamed_name.len() == 8 && unnamed_name.bytes().all(|byte| byte.is_ascii_digit()), "io-builtin-driver: IoCreateDriver sem nome gera \\Driver\\%08u");
     assert(lifecycle::current_driver() == previous, "io-builtin-driver: contexto de driver ambiente restaurado");
     assert(lifecycle::unload_driver("OpenNtBuiltinTest") && lifecycle::unload_driver(&unnamed_name), "io-builtin-driver: drivers embutidos de teste descarregados");
-    for pointer in [cells, init, failing, block] {
+    for pointer in [init, failing] {
+        super::executable_code::release(pointer);
+    }
+    for pointer in [cells, block] {
         guest::free_bytes(pointer);
     }
 }
@@ -5343,15 +5349,15 @@ fn io_work_item_queue_exports(assert: Assert) {
     let mut routine_bytes = alloc::vec![0x48, 0xB8];
     routine_bytes.extend_from_slice(&cells.to_le_bytes());
     routine_bytes.extend_from_slice(&[0x48, 0x89, 0x08, 0x48, 0x89, 0x50, 0x08, 0x4C, 0x89, 0x40, 0x10, 0xC3]);
-    let routine = guest::alloc_bytes(routine_bytes.len() as u64 + 16);
-    guest::write_bytes(routine, &routine_bytes);
+    let routine = super::executable_code::place(&routine_bytes);
     let device = guest::alloc_bytes(0x150);
     let item = call_export("IoAllocateWorkItem", &[device]).unwrap_or(0);
     assert(item != 0 && call_export("IoTryQueueWorkItem", &[item, routine, 1, 0x77]) == Some(1), "io-work-item-queue: IoTryQueueWorkItem aceita o item");
     crate::ntos::io::work_items::run_queue();
     assert(guest::read64(cells) == device && guest::read64(cells + 8) == 0x77 && guest::read64(cells + 0x10) == item, "io-work-item-queue: a rotina Ex recebe (IoObject, Context, IoWorkItem)");
     call_export("IoFreeWorkItem", &[item]);
-    for pointer in [cells, routine, device] {
+    super::executable_code::release(routine);
+    for pointer in [cells, device] {
         guest::free_bytes(pointer);
     }
 }
@@ -10844,8 +10850,7 @@ fn io_driver_notification_exports(assert: Assert) {
     driver.driver_extension.set(extension_address);
     extension.driver_object.set(driver_address);
     // Rotina: mov [rdx], rcx; mov [rdx+8], r8; ret — grava (Driver, Count) no contexto.
-    let routine = guest::alloc_bytes(16);
-    guest::write_bytes(routine, &[0x48, 0x89, 0x0A, 0x4C, 0x89, 0x42, 0x08, 0xC3]);
+    let routine = super::executable_code::place(&[0x48, 0x89, 0x0A, 0x4C, 0x89, 0x42, 0x08, 0xC3]);
     let context = guest::alloc_bytes(0x10);
     let recorded_driver = at::<nt::Field<u64>>(context);
     let recorded_count = at::<nt::Field<u32>>(context + 8);
@@ -11115,8 +11120,7 @@ fn ob_set_security_exports(assert: Assert) {
 fn po_coalescing_exports(assert: Assert) {
     use crate::ntos::po::coalescing::{self, CoalescingRegistration};
     let handle = guest::alloc_bytes(8);
-    let callback = guest::alloc_bytes(16);
-    guest::write_bytes(callback, &[0xC3]);
+    let callback = super::executable_code::place(&[0xC3]);
     assert(call_export("PoRegisterCoalescingCallback", &[callback, 1, handle, 0x5150]) == Some(0), "po-coalescing: registro aceito");
     let address = at::<nt::Field<u64>>(handle).get();
     let registration = at::<CoalescingRegistration>(address);
@@ -11191,10 +11195,8 @@ fn whea_error_source_exports(assert: Assert) {
     use crate::ntos::init::exports::signed_status;
     // Fonte de dispositivo V1: Initialize grava (Context, ErrorSourceId) em [Context].
     // Initialize: mov [rcx], rcx; mov [rcx+8], edx; ret. Uninitialize: mov dword [rcx+0x10], 1; ret.
-    let initialize = guest::alloc_bytes(16);
-    guest::write_bytes(initialize, &[0x48, 0x89, 0x09, 0x89, 0x51, 0x08, 0xC3]);
-    let uninitialize = guest::alloc_bytes(16);
-    guest::write_bytes(uninitialize, &[0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+    let initialize = super::executable_code::place(&[0x48, 0x89, 0x09, 0x89, 0x51, 0x08, 0xC3]);
+    let uninitialize = super::executable_code::place(&[0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xC3]);
     let context = guest::alloc_bytes(0x20);
     let recorded_context = at::<nt::Field<u64>>(context);
     let recorded_id = at::<nt::Field<u32>>(context + 8);

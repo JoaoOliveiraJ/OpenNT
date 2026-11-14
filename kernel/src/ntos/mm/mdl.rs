@@ -177,8 +177,8 @@ pub fn build_for_non_paged_pool(descriptor: u64) {
 }
 
 /// MmAllocateMappingAddress — VA reservada em páginas inteiras da arena
-/// (janela do heap), alinhada à página e fora do alcance de outras
-/// alocações; 0 sem memória.
+/// (janela do heap, sem execução), alinhada à página e fora do alcance de
+/// outras alocações; 0 sem memória.
 pub fn allocate_mapping_address(size: u64, tag: u32) -> u64 {
     let bytes = (size as u32 as u64).div_ceil(0x1000) * 0x1000;
     let address = guest::alloc_aligned(bytes, 0x1000, true);
@@ -197,7 +197,7 @@ pub fn free_mapping_address(address: u64) {
         for page in (address..address + bytes).step_by(0x1000) {
             let frame = memory_map::kernel_heap_physical(page);
             if memory_map::is_kernel_heap(page) && paging::translate(page) != frame {
-                paging::map_page(page, frame, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default());
+                paging::map_page(page, frame, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions { nx: true, ..paging::MapOptions::default() });
             }
         }
     }
@@ -216,7 +216,7 @@ pub fn map_locked_pages_with_reserved_mapping(address: u64, descriptor: u64) -> 
         return 0;
     }
     for (index, frame) in pfn_array(descriptor, (offset + count).div_ceil(0x1000)).iter().enumerate() {
-        if !paging::map_page(address + index as u64 * 0x1000, frame.get() * 0x1000, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions::default()) {
+        if !paging::map_page(address + index as u64 * 0x1000, frame.get() * 0x1000, paging::PAGE_PRESENT | paging::PAGE_RW, paging::MapOptions { nx: true, ..paging::MapOptions::default() }) {
             return 0;
         }
     }

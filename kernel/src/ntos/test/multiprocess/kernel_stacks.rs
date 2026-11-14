@@ -201,7 +201,8 @@ fn native_thread_limits(assert: Assert) {
     let thunk = export_thunk("IoGetStackLimits");
     // [0] LowLimit, [8] HighLimit, [0x10] RSP do código nativo, [0x18] marcador.
     let block = guest::alloc_bytes(0x20);
-    let code = guest::alloc_bytes(0x40);
+    // O corpo nativo numa alocação executável (o heap não executa).
+    let code = crate::ntos::test::executable_code::reserve(0x40);
     if thunk == 0 || block == 0 || code == 0 {
         assert(false, "pilhas: trampolim de IoGetStackLimits e memoria do teste");
         return;
@@ -220,7 +221,7 @@ fn native_thread_limits(assert: Assert) {
     if pointer == 0 {
         assert(false, "pilhas: thread de sistema nativa criada");
         guest::free_bytes(block);
-        guest::free_bytes(code);
+        crate::ntos::test::executable_code::release(code);
         return;
     }
     let (base, initial, limit, _) = stack_fields(pointer);
@@ -231,7 +232,7 @@ fn native_thread_limits(assert: Assert) {
     assert(guest::read32(block + 0x18) == 0x77 && low == limit && high == base && rsp > low && rsp < initial, "pilhas: IoGetStackLimits de uma thread nativa devolve a faixa real, que contem o RSP do codigo nativo");
     assert(finished, "pilhas: o ceifador da thread nativa devolve a pilha");
     guest::free_bytes(block);
-    guest::free_bytes(code);
+    crate::ntos::test::executable_code::release(code);
 }
 
 /// Criar e destruir 8 threads com pilha própria deixa o PFN como estava.

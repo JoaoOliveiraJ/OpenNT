@@ -8,7 +8,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::{apc, context_switch, dispatcher, irql, thread_alert};
@@ -86,7 +85,6 @@ pub struct Request {
 pub type Shared = Arc<SpinLock<Request>>;
 
 static REQUESTS: SpinLock<Vec<Shared>> = SpinLock::new(Vec::new());
-static FREE_ROUTINE: AtomicU64 = AtomicU64::new(0);
 
 #[allow(clippy::too_many_arguments)]
 pub fn new(file: u64, thread: u64, process: Option<u64>, mode: u8, io_status: u64, output: u64, output_length: u32, apc_routine: u64, apc_context: u64, synchronous: bool) -> Shared {
@@ -131,29 +129,20 @@ pub fn is_tracked(request: &Shared) -> bool {
     REQUESTS.lock().iter().any(|tracked| Arc::ptr_eq(tracked, request))
 }
 
-/// Rotina nativa de kernel/rundown da APC de conclusão: devolve o KAPC ao
-/// pool (ExFreePoolWithTag(apc, 0)).
+/// A rotina de kernel e de rundown das APCs de conclusão (o IopDeallocateApc
+/// do NT): devolve o KAPC ao pool, ExFreePoolWithTag(Apc, 0). É uma função da
+/// imagem do kernel, chamada pela ABI MS x64 como as rotinas dos drivers; os
+/// outros argumentos da rotina de kernel não são usados.
+extern "win64" fn deallocate_apc(apc: u64) {
+    if let Err(error) = crate::ntos::ex::pool_allocation::free(apc, 0) {
+        panic!("[file-request] KAPC de conclusao {apc:#x} nao voltou ao pool: {error}");
+    }
+}
+
+/// O endereço de [`deallocate_apc`], a rotina de kernel/rundown das APCs de
+/// conclusão.
 pub fn free_routine() -> Result<u64, KernelError> {
-    let current = FREE_ROUTINE.load(Ordering::Acquire);
-    if current != 0 {
-        return Ok(current);
-    }
-    let code = guest::alloc_bytes(32);
-    if code == 0 {
-        return Ok(0);
-    }
-    let free = crate::ntos::init::exports::export_module()?.exports.exports.get("ExFreePoolWithTag").copied().ok_or_else(|| KernelError::new("ExFreePoolWithTag unavailable"))?;
-    let mut bytes = alloc::vec![0x48, 0x83, 0xEC, 0x28, 0x31, 0xD2, 0x48, 0xB8];
-    bytes.extend_from_slice(&free.to_le_bytes());
-    bytes.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
-    guest::write_bytes(code, &bytes);
-    match FREE_ROUTINE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(code),
-        Err(existing) => {
-            guest::free_bytes(code);
-            Ok(existing)
-        }
-    }
+    Ok(deallocate_apc as extern "win64" fn(u64) as usize as u64)
 }
 
 /// Evento de um handle de kernel; em modo usuário exige EVENT_MODIFY_STATE.

@@ -207,8 +207,10 @@ pub fn remove_boot_identity() {
 }
 
 /// Monta a janela do heap do kernel (`KERNEL_HEAP_BASE..TOP`): os frames do
-/// heap em páginas de 2 MB de supervisor, RW e executáveis, com a PDPT e a
-/// PD fixas de `memory_map`. Roda uma vez no boot, antes da primeira
+/// heap em páginas de 2 MB de supervisor, RW e sem execução (NX), com a PDPT
+/// e a PD fixas de `memory_map`. Nada executa do heap nem da arena: código
+/// gerado ou carregado vive numa imagem ou numa alocação executável da
+/// janela de sistema (MmAllocateContiguousNodeMemory com PAGE_EXECUTE_*). Roda uma vez no boot, antes da primeira
 /// alocação (o heap ainda não existe e o rastreador de frames não foi
 /// instalado); a entrada da PML4 é a mesma para todas as CPUs.
 pub fn map_kernel_heap_window() {
@@ -218,7 +220,7 @@ pub fn map_kernel_heap_window() {
     let pages = (map::KERNEL_HEAP_PHYS_TOP - map::KERNEL_HEAP_PHYS_BASE) / map::LARGE_PAGE_SIZE;
     for index in 0..pages {
         let frame = map::KERNEL_HEAP_PHYS_BASE + index * map::LARGE_PAGE_SIZE;
-        write_entry(pd + (pd_index(map::KERNEL_HEAP_BASE) + index) * 8, frame | PAGE_PRESENT | PAGE_RW | PAGE_PS, false);
+        write_entry(pd + (pd_index(map::KERNEL_HEAP_BASE) + index) * 8, frame | PAGE_PRESENT | PAGE_RW | PAGE_PS, true);
     }
     write_entry(pdpt + pdpt_index(map::KERNEL_HEAP_BASE) * 8, pd | PAGE_PRESENT | PAGE_RW, false);
     write_entry(PML4 + map::KERNEL_HEAP_PML4_INDEX * 8, pdpt | PAGE_PRESENT | PAGE_RW, false);
