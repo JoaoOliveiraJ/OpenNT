@@ -638,6 +638,7 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
         None => names,
     };
     let mut cursor = buffer;
+    let mut end = buffer;
     let mut previous = 0u64;
     let mut emitted = 0;
     while index < matched.len() {
@@ -668,7 +669,10 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
             unsafe { FileDirectoryInformation::at(previous) }.next_entry_offset.set((cursor - previous) as u32);
         }
         previous = cursor;
-        cursor += record;
+        end = cursor + record;
+        // Cada registro começa alinhado a 8 bytes (NextEntryOffset de um
+        // LONGLONG), como os file systems do NT montam a lista.
+        cursor += (record + 7) & !7;
         index += 1;
         emitted += 1;
         if single {
@@ -683,7 +687,7 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
         unsafe { FileDirectoryInformation::at(previous) }.next_entry_offset.set(0);
     }
     let status = if emitted != 0 { 0 } else { 0x8000_0006 };
-    write_io_status(io_status, status, cursor - buffer);
+    write_io_status(io_status, status, end.saturating_sub(buffer));
     status
 }
 

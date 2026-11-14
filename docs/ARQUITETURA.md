@@ -1057,7 +1057,8 @@ dereference e o PFN livre volta ao de antes.
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,
-  `[shell] pronto`;
+  `[shell] pronto`, `FILE_SYSTEM_MOUNT_OK name=<serviço>` (um arquivo do
+  volume aberto e lido pelo file system real iniciado com `--start-driver`);
   os de falha são `*** PANIC`, `*** EXCECAO` e `SELFTEST FALHOU`.
 
 ## 6. Documentação e status

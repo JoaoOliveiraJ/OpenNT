@@ -279,7 +279,43 @@ fn open(block: u64, name: &str) -> (u32, u64, u64) {
     (status, guest::read64(handle), guest::read64(iosb + 8))
 }
 
+/// ZwQueryDirectoryFile (FileIdFullDirectoryInformation, como a ci.dll varre
+/// o CatRoot) em `D:\Windows\System32` do volume NTFS do kernel: cada registro
+/// começa alinhado a 8 bytes e Information termina no fim do último nome.
+fn directory_records(assert: Assert) {
+    let block = guest::alloc_bytes(0x400);
+    let buffer = guest::alloc_bytes(0x2000);
+    let attributes = object_attributes(block, "\\??\\D:\\Windows\\System32");
+    let (handle, iosb) = (block + 0x300, block + 0x310);
+    // FILE_LIST_DIRECTORY | SYNCHRONIZE, FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT.
+    let opened = call_export("ZwCreateFile", &[handle, 0x0010_0001, attributes, iosb, 0, 0, 7, FILE_OPEN, 0x21, 0, 0]).unwrap_or(u64::MAX) as u32;
+    let directory = guest::read64(handle);
+    let queried = if opened == 0 { call_export("ZwQueryDirectoryFile", &[directory, 0, 0, 0, iosb, buffer, 0x2000, 38, 0, 0, 1]).unwrap_or(u64::MAX) as u32 } else { u32::MAX };
+    let information = guest::read64(iosb + 8);
+    let (mut offset, mut records, mut aligned, mut end) = (0u64, 0, true, 0u64);
+    while queried == 0 && records < 64 {
+        let record = buffer + offset;
+        let next = guest::read32(record) as u64;
+        let name_length = guest::read32(record + 0x3C) as u64;
+        aligned &= record % 8 == 0;
+        end = offset + 0x50 + name_length;
+        records += 1;
+        if next == 0 {
+            break;
+        }
+        offset += next;
+    }
+    if opened == 0 {
+        call_export("ZwClose", &[directory]);
+    }
+    debug_print!("[fs-mount] ZwQueryDirectoryFile: abertura {:#x}, consulta {:#x}, {} registros, alinhados {}, Information {} / {}", opened, queried, records, aligned, information, end);
+    assert(opened == 0 && queried == 0 && records >= 2 && aligned && information == end, "fs-mount: ZwQueryDirectoryFile alinha cada registro a 8 bytes");
+    guest::free_bytes(buffer);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
+    directory_records(assert);
     // IoCreateDevice: VPB, DeviceLock e SectorSize de um FILE_DEVICE_DISK.
     let creator = synthetic_driver(0);
     let output = guest::alloc_bytes(8);

@@ -194,6 +194,13 @@ marcador = "DRIVER_START_COMPLETED"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=DXGKrnl --build-dir=build/dxgkrnl --smp=1 \"--expect=name=DXGKrnl state=4 win32=0\""
 descricao = "O gerenciador de serviços inicia o núcleo gráfico da Microsoft (DXGKrnl, com os valores da chave do serviço do Windows): o Code Integrity valida o dxgkrnl.sys pelo catálogo, o loader resolve os imports no ntoskrnl, no watchdog.sys e na WMILIB.SYS e o DriverEntry retorna sucesso, criando \\Device\\DxgKrnl, com o serviço em execução (state=4)."
 
+[[teste]]
+id = "ntfs"
+titulo = "Driver ntfs.sys real"
+marcador = "FILE_SYSTEM_MOUNT_OK"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ntfs --build-dir=build/ntfs --smp=1 \"--expect=name=ntfs state=4 win32=0\" \"--expect=FILE_SYSTEM_MOUNT_OK name=ntfs\""
+descricao = "O gerenciador de serviços inicia o ntfs.sys da Microsoft (o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports e o DriverEntry registra o file system) e o kernel abre HELLO.TXT em \\Device\\AtaVolume1: o IopMountVolume manda o IRP_MN_MOUNT_VOLUME ao ntfs.sys, o IRP_MJ_CREATE e o IRP_MJ_READ vão ao volume montado e a leitura passa pelo Cache Manager. Ainda falha na carga: faltam os módulos clfs.sys e clipsp.sys que o ntfs.sys importa."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -323,7 +330,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/cc"]
 testes = ["fase6"]
 fase = "8"
-notas = "51 das 69 rotinas Cc* do ntoskrnl: SHARED_CACHE_MAP e PRIVATE_CACHE_MAP nativos pendurados no SECTION_OBJECT_POINTERS, vistas de 256 KB lidas por IRPs de paginação à pilha do próprio arquivo, cópias, map/pin com BCBs, MDLs, flush, purge e as rotinas de LSN e log do NTFS. Modelo síncrono, sem a thread do lazy writer: as páginas sujas vão ao disco no CcFlushCache e no último CcUninitializeCacheMap. Os autotestes usam um dispositivo sintético; nenhum file system real o usa ainda, porque o ntfs.sys e o fastfat.sys ainda não carregam."
+notas = "51 das 69 rotinas Cc* do ntoskrnl: SHARED_CACHE_MAP e PRIVATE_CACHE_MAP nativos pendurados no SECTION_OBJECT_POINTERS, vistas de 256 KB lidas por IRPs de paginação à pilha do próprio arquivo, cópias, map/pin com BCBs, MDLs, flush, purge e as rotinas de LSN e log do NTFS. Modelo síncrono, sem a thread do lazy writer: as páginas sujas vão ao disco no CcFlushCache e no último CcUninitializeCacheMap. Os autotestes usam um dispositivo sintético; nenhum file system real o usa ainda, porque o ntfs.sys e o fastfat.sys ainda não carregam (faltam os módulos clfs.sys e clipsp.sys que eles importam). O FsRtlCopyRead/CopyWrite e o MDL genérico do FsRtl já chegam a ele."
 
 [[componente]]
 nome = "Vídeo VGA em modo texto"
@@ -557,9 +564,11 @@ nome = "ntfs.sys, fastfat.sys e fltmgr.sys"
 categoria = "Drivers do Windows"
 icone = "folder"
 descricao = "Os drivers de sistema de arquivos do Windows (NTFS e FAT) e o Filter Manager, base dos filtros de sistema de arquivos."
-estado = "planejado"
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/ntos/io/file_system.rs", "kernel/src/ntos/io/parse.rs", "kernel/src/drivers/storage/ata_volume.rs", "kernel/src/ntos/test/file_system_mount.rs"]
+testes = ["ntfs"]
 fase = "8"
-notas = "Alvo de carga dos binários reais. O Cache Manager e o suporte FsRtl/Io de file system já existem, mas dos imports do ntoskrnl ainda faltam 23 ao ntfs.sys e 19 ao fastfat.sys (entre eles FsRtlCopyRead, FsRtlNotifyVolumeEvent e MmFlushImageSection); o fltmgr.sys já tem todos os seus. Nenhum dos três carrega ainda. Hoje o volume NTFS é lido pelo leitor do próprio kernel; o fltmgr.sys só vai para o volume como arquivo, porque o vgk.sys o abre pelo caminho."
+notas = "Os imports do ntoskrnl que eram só destes drivers já têm export (o Fast I/O genérico em cache, os eventos de volume, a notificação Lite, as consultas de setor, os runs do bitmap, nomes 8.3, RtlFormatMessage, _snwprintf_s, SeFilterToken, as consultas de seção de arquivo do Mm e outros); nenhum import do ntoskrnl falta mais a eles. O serviço Ntfs tem a chave desta máquina (Type 2, Start 3, sem ImagePath) e o ntfs.sys real vai para o volume com o catálogo que o cobre: `--start-driver=ntfs` passa pelo Code Integrity (CI_KERNEL_IMAGE_RESULT status 0, signingLevel 12) e para na resolução dos imports, no primeiro import do ext-ms-win-fs-clfs (o host clfs.sys não carrega). A carga ainda depende de dois módulos que eles importam e que o OpenNT não carrega: clfs.sys (pelo ext-ms-win-fs-clfs, só o ntfs.sys) e clipsp.sys (pelo ext-ms-win-ntos-clipsp, que importa o fltmgr.sys), aos quais faltam 14 exports do ntoskrnl (as rotinas de prefixo Unicode, FsRtlInitializeExtraCreateParameter(List), RtlSelfRelativeToAbsoluteSD2, ZwAdjustPrivilegesToken, ExUpdateLicenseData, MmChangeImageProtection e outros); o ksecdd.sys, que os dois também importam, já carrega. O caminho de montagem do NT já existe e está testado com file systems sintéticos: IopMountVolume, IopCheckVpbMounted, o IRP_MJ_CREATE do IopParseDevice e o volume \\Device\\AtaVolume1 do segundo disco; depois do início de um file system pelo `--start-driver`, o kernel abre e lê HELLO.TXT por ele (FILE_SYSTEM_MOUNT_OK). O fltmgr.sys já tem todos os seus imports e só vai para o volume como arquivo."
 
 [[componente]]
 nome = "ndis.sys, tcpip.sys e E1G6032E.sys"
