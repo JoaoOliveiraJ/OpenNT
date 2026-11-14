@@ -86,7 +86,7 @@ fn duplicate_namespace_handle(source_handle: u64, target: u64, target_handle: u6
     let kernel_source = value & KERNEL_HANDLE_BITS == KERNEL_HANDLE_BITS;
     let record = if kernel_source || value <= 0x7FFF_FFFF { object_manager::handle_record((value & 0x7FFF_FFFF) as u32) } else { None };
     let Some(record) = record.filter(|record| record.options.kernel_handle == kernel_source && (kernel_source || record.options.owner_process.unwrap_or(0) == process::get_current_process())) else {
-        return crate::ntos::ob::handles::inserted::duplicate(source_handle, target, target_handle, desired, attributes, options);
+        return crate::ntos::ob::handles::inserted::duplicate(process::get_current_process(), source_handle, target, target_handle, desired, attributes, options, 0);
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { record.access } else { desired };
     let handle_attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { record.attributes } else { attributes & HANDLE_ATTRIBUTE_MASK };
@@ -162,7 +162,7 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
     let kernel = attributes & OBJ_KERNEL_HANDLE != 0 && target == process::get_system_process();
     let owner = if kernel { process::get_system_process() } else { target };
     let open_attributes = handle_attributes | if kernel { OBJ_KERNEL_HANDLE } else { 0 };
-    let identifier = open_pointer::insert(&resolved.item, access, open_attributes, owner)?;
+    let identifier = open_pointer::insert_with(&resolved.item, access, open_attributes, owner, crate::ntos::ob::object_header::OpenReason::Duplicate, 0)?;
     let handle = if kernel { KERNEL_HANDLE_BITS | identifier as u64 } else { identifier as u64 };
     if target_handle != 0 {
         write_handle(target_handle, handle);

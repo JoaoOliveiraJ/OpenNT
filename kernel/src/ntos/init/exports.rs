@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 397] {
+fn groups() -> [&'static Group; 398] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -452,6 +452,7 @@ fn groups() -> [&'static Group; 397] {
         &crate::ntos::mm::exports::mm_prefetch_pages::GROUP,
         &crate::ntos::se::exports::se_filter_token::GROUP,
         &crate::ntos::se::exports::query_security_attributes::GROUP,
+        &crate::ntos::ob::exports::ob_object_type_ex::GROUP,
     ]
 }
 

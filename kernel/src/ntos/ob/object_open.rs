@@ -97,6 +97,13 @@ pub fn open_by_name(attributes_pointer: u64, object_type: u64, mode: u8, access:
         out::<u64>(output).set(handle);
         return Ok(0);
     }
+    // Um objeto com OBJECT_HEADER abre pelo ObOpenObjectByPointer (ObOpenHandle).
+    if crate::ntos::ob::object_header::is_object(pointer) {
+        if type_differs(object_type, crate::ntos::ob::object_header::object_type(pointer).unwrap_or(0)) {
+            return Ok(signed_status(TYPE_MISMATCH));
+        }
+        return Ok(signed_status(crate::ntos::ob::open_pointer::open(pointer, attributes, 0, access, object_type, mode, output)?));
+    }
     reference_device(pointer)?;
     let handle = object_manager::open(&name)?;
     out::<u64>(output).set(handle as u64);

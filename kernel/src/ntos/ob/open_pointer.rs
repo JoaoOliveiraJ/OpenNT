@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use super::callbacks::{self, Outcome, PerformOptions};
 use super::object_manager::{self, NativeOpen, ObjectData, ObjectHooks};
 use super::object_types::{self, ObjectType};
+pub use super::object_header::{HandleOpen, OpenReason};
 use crate::ntos::ob::objects::namespace as namespace_objects;
 use super::object_access;
 use crate::ntos::ke::irql;
@@ -77,6 +78,16 @@ pub trait ObjectOwner: Send + Sync {
     fn close_handle(&self, _pointer: u64) -> Option<Result<(), KernelError>> {
         None
     }
+    /// Abertura com a razão, o processo da tabela, o modo e o acesso (que o
+    /// dono pode ajustar), antes de o handle existir; `None` segue pelo
+    /// `open_handle`. Um dono que a implementa conta o handle e retém o
+    /// corpo, e o fechamento volta por `close_handle_from`.
+    fn open_handle_for(&self, _pointer: u64, _open: &mut HandleOpen) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// O fechamento de um handle aberto por `open_handle_for`, no processo
+    /// dono da tabela.
+    fn close_handle_from(&self, _pointer: u64, _process: u64) {}
     /// Segurança capturada na criação do corpo.
     fn security(&self, pointer: u64) -> SecurityPolicy;
     /// Processo dono de um objeto exclusivo (0 = compartilhado).
@@ -135,11 +146,13 @@ pub enum Slot {
     Namespace,
     Silo,
     Device,
+    /// Objetos criados pelo ObCreateObject, com o OBJECT_HEADER do NT.
+    Created,
 }
 
 type Recognizer = fn(u64) -> bool;
 
-static OWNERS: SpinLock<[Option<(Recognizer, &'static dyn ObjectOwner)>; 11]> = SpinLock::new([None; 11]);
+static OWNERS: SpinLock<[Option<(Recognizer, &'static dyn ObjectOwner)>; 12]> = SpinLock::new([None; 12]);
 
 /// Registra o dono de um slot (os módulos de objetos, ao inicializar).
 pub fn register_owner(slot: Slot, recognizes: Recognizer, owner: &'static dyn ObjectOwner) {
@@ -270,6 +283,10 @@ fn built_in(slot: usize, pointer: u64) -> Option<&'static dyn ObjectOwner> {
 
 /// Identifica o dono do corpo; `None` quando nenhum dono conhece o endereço.
 pub fn describe(pointer: u64) -> Option<Described> {
+    if super::object_header::is_object(pointer) {
+        let owner: &'static dyn ObjectOwner = &super::objects::created::OWNER;
+        return Some(Described { pointer, object_type: owner.object_type(pointer), owner });
+    }
     let owners = *OWNERS.lock();
     for (slot, registered) in owners.iter().enumerate() {
         let owner = built_in(slot, pointer).or_else(|| registered.filter(|(recognizes, _)| recognizes(pointer)).map(|(_, owner)| owner));
@@ -286,6 +303,12 @@ struct HandleBodies {
     granted: u32,
     flags: u32,
     bodies: SpinLock<Vec<u64>>,
+    /// Processo dono da tabela do handle.
+    owner: u64,
+    /// O dono já contou o handle (`open_handle_for`) antes do nó existir.
+    counted: bool,
+    /// O fechamento do handle contado já passou pelo dono.
+    closed: core::sync::atomic::AtomicBool,
 }
 
 impl ObjectHooks for HandleBodies {
@@ -295,6 +318,7 @@ impl ObjectHooks for HandleBodies {
             return Err(KernelError::with_status("object handle allocation failed", 0xC000_009A));
         }
         let opened = match self.item.owner.open_handle(self.item.pointer) {
+            _ if self.counted => Ok(()),
             Some(result) => result,
             None => {
                 self.item.reference();
@@ -316,6 +340,13 @@ impl ObjectHooks for HandleBodies {
 
     fn on_handle_close(&self) {
         let Some(body) = self.bodies.lock().pop() else { return };
+        if self.counted {
+            if !self.closed.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                self.item.owner.close_handle_from(self.item.pointer, self.owner);
+            }
+            guest::free_bytes(body);
+            return;
+        }
         match self.item.owner.close_handle(self.item.pointer) {
             Some(result) => {
                 let _ = result;
@@ -387,14 +418,30 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
         Err(status) => return Ok(status),
     };
     let options = PerformOptions { operation: 1, enforce, kernel_handle: attributes & 0x200 != 0, source_process: 0, target_process: 0 };
-    let outcome = callbacks::perform(&item, rights | previously_granted, &options, &mut |granted| create(&item, attributes, granted, access_state, remaining, output_handle))?;
+    let outcome = callbacks::perform(&item, rights | previously_granted, &options, &mut |granted| create(&item, attributes, granted, access_state, remaining, output_handle, access_mode))?;
     Ok(outcome.status)
 }
 
 /// Publica `item` na tabela de `owner` com os direitos concedidos; o bit
 /// 0x200 dos atributos marca um handle de kernel. Cada handle conserva a
-/// própria retenção do corpo.
+/// própria retenção do corpo. A razão é a abertura (ObOpenHandle) em
+/// KernelMode.
 pub fn insert(item: &Described, granted: u32, attributes: u32, owner: u64) -> Result<u32, KernelError> {
+    insert_with(item, granted, attributes, owner, OpenReason::Open, 0)
+}
+
+/// [`insert`] com a razão do OB_OPEN_REASON e o modo de acesso: um dono
+/// que conta o próprio handle (`open_handle_for`, os objetos com
+/// OBJECT_HEADER) o faz antes de o nó existir, com o acesso que ele pode
+/// ajustar; uma falha depois disso desfaz pelo fechamento do dono.
+pub fn insert_with(item: &Described, granted: u32, attributes: u32, owner: u64, reason: OpenReason, access_mode: u8) -> Result<u32, KernelError> {
+    let mut open = HandleOpen { reason, access_mode, process: owner, granted, attributes };
+    let counted = match item.owner.open_handle_for(item.pointer, &mut open) {
+        Some(Ok(())) => true,
+        Some(Err(error)) => return Err(error),
+        None => false,
+    };
+    let granted = open.granted;
     let handle_flags = attributes & 2; // OB_HANDLE_FLAG_INHERIT
     let mut data = item.data();
     data.native_pointer = item.pointer;
@@ -403,15 +450,20 @@ pub fn insert(item: &Described, granted: u32, attributes: u32, owner: u64) -> Re
     data.owner_process = Some(owner);
     data.attributes = handle_flags;
     data.open_attributes = Some(attributes);
-    data.hooks = Some(Arc::new(HandleBodies { item: item.clone(), granted, flags: handle_flags, bodies: SpinLock::new(Vec::new()) }));
+    let hooks = Arc::new(HandleBodies { item: item.clone(), granted, flags: handle_flags, bodies: SpinLock::new(Vec::new()), owner, counted, closed: core::sync::atomic::AtomicBool::new(false) });
+    data.hooks = Some(hooks.clone());
     let node = object_manager::new_node("", &item.object_type.name, Some(data));
-    object_manager::open_object(node, None)
+    let result = object_manager::open_object(node, None);
+    if result.is_err() && counted && !hooks.closed.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        item.owner.close_handle_from(item.pointer, owner);
+    }
+    result
 }
 
-fn create(item: &Described, attributes: u32, granted: u32, access_state: u64, remaining: u32, output_handle: u64) -> Outcome {
+fn create(item: &Described, attributes: u32, granted: u32, access_state: u64, remaining: u32, output_handle: u64, access_mode: u8) -> Outcome {
     let failure = |error: KernelError| Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: Some(error) };
     let owner = if attributes & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
-    let identifier = match insert(item, granted, attributes, owner) {
+    let identifier = match insert_with(item, granted, attributes, owner, OpenReason::Open, access_mode) {
         Ok(identifier) => identifier,
         Err(error) => return failure(error),
     };

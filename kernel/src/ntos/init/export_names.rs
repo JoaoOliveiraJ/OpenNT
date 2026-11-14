@@ -403,6 +403,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("mm-prefetch-pages", 1827, 1),
     ("se-filter-token", 1828, 1),
     ("query-security-attributes", 1829, 1),
+    ("ob-object-type-ex", 1830, 1),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2237,4 +2238,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "MmPrefetchPages",
     "SeFilterToken",
     "ZwQuerySecurityAttributesToken",
+    "ObCreateObjectTypeEx",
 ];

@@ -63,6 +63,7 @@ pub use rtl::*;
 pub use se::*;
 pub use wdk::*;
 pub mod extra_ob_alpc;
+pub mod extra_ob_header;
 pub mod extra_usermode;
 pub mod extra_cc;
 pub mod extra_obpsse;

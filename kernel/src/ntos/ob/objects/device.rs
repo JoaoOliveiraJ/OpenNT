@@ -11,7 +11,7 @@ use core::sync::atomic::Ordering;
 use crate::ntos::ob::object_manager::ObjectData;
 use crate::ntos::ob::objects::driver as driver_objects;
 use crate::ntos::ob::object_types::{self, ObjectType};
-use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
+use crate::ntos::ob::open_pointer::{self, ObjectOwner, QueryRecord, Slot};
 use crate::ntos::ob::object_access;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::hal::cpu;
@@ -71,6 +71,10 @@ impl ObjectOwner for DeviceOwner {
     }
     fn data(&self, pointer: u64) -> ObjectData {
         ObjectData::pointer(pointer)
+    }
+    fn query_record(&self, pointer: u64) -> QueryRecord {
+        let references = DEVICES.lock().get(&pointer).map_or(0, |record| record.references);
+        QueryRecord { handles: None, references, permanent: false, name: open_pointer::namespace_path_of(pointer).unwrap_or_default() }
     }
 }
 

@@ -19,10 +19,10 @@ use crate::ntos::inc::types::{DeviceObject, Field, NtStruct, ObjectHandleInforma
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::io::io_manager;
-use crate::ntos::ob::handles::inserted;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::objects::{device as device_objects, dispatcher as dispatcher_objects, driver as driver_objects, file as file_objects, namespace as namespace_objects, section as section_objects};
-use crate::ntos::ob::{object_types, open_pointer, reference_trace};
+use crate::ntos::ob::{object_header, object_types, open_pointer, reference_trace};
 use crate::ntos::ps::silo::contexts as silo_contexts;
 use crate::ntos::ps::{kernel_threads, process};
 use crate::ntos::rtl::guest_strings;
@@ -74,6 +74,7 @@ pub(crate) fn native_pointer_of_node(node: Option<NodeId>) -> u64 {
     match snapshot.type_name.as_str() {
         "Device" => io_manager::device(snapshot.id).map(|entry| if entry.stack_top != 0 { entry.stack_top } else { entry.native_device }).unwrap_or(data.native_pointer),
         "Driver" | "Section" | "Callback" => data.native_pointer,
+        _ if object_header::is_object(data.native_pointer) => data.native_pointer,
         _ => 0,
     }
 }
@@ -94,6 +95,9 @@ fn require_owner(pointer: u64, allow_legacy_device: bool, name: &str) -> Result<
 pub fn reference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -> Result<u64, KernelError> {
     reference_trace::record(pointer, tag, 1);
     require_owner(pointer, allow_legacy_device, "ObfReferenceObjectWithTag")?;
+    if object_header::is_object(pointer) {
+        return Ok(object_header::reference(pointer, 1) as u64);
+    }
     if namespace_objects::get(pointer).is_some() {
         return namespace_objects::reference(pointer);
     }
@@ -134,6 +138,9 @@ pub fn reference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -> 
 pub fn dereference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -> Result<u64, KernelError> {
     reference_trace::record(pointer, tag, -1);
     require_owner(pointer, allow_legacy_device, "ObfDereferenceObjectWithTag")?;
+    if object_header::is_object(pointer) {
+        return Ok(object_header::dereference(pointer, false) as u64);
+    }
     if namespace_objects::get(pointer).is_some() {
         return namespace_objects::dereference(pointer);
     }
@@ -168,6 +175,28 @@ pub fn dereference_with_tag(pointer: u64, tag: u32, allow_legacy_device: bool) -
         return Ok(count as u64);
     }
     dereference_device(pointer)
+}
+
+/// ObReferenceObjectSafe(WithTag): TRUE se a referência foi adquirida; num
+/// objeto com OBJECT_HEADER, só enquanto o PointerCount não chegou a zero.
+pub fn reference_safe(pointer: u64, tag: u32) -> bool {
+    if object_header::is_object(pointer) {
+        reference_trace::record(pointer, tag, 1);
+        return object_header::reference_safe(pointer);
+    }
+    reference_with_tag(pointer, tag, true).is_ok()
+}
+
+/// ObDereferenceObjectDeferDelete(WithTag): num objeto com OBJECT_HEADER a
+/// remoção do último dereference vai sempre para a fila do trabalhador; os
+/// demais donos já recolhem fora da linha de quem chama.
+pub fn dereference_defer_delete(pointer: u64, tag: u32) -> Result<(), KernelError> {
+    if object_header::is_object(pointer) {
+        reference_trace::record(pointer, tag, -1);
+        object_header::dereference(pointer, true);
+        return Ok(());
+    }
+    dereference_with_tag(pointer, tag, true).map(|_| ())
 }
 
 pub(crate) fn type_differs(requested: u64, expected: u64) -> bool {
@@ -214,6 +243,14 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
             return Ok(signed_status(ACCESS_DENIED));
         }
         section_objects::reference(pointer);
+        out::<u64>(output).set(pointer);
+        return Ok(0);
+    }
+    if object_header::is_object(pointer) {
+        if type_differs(object_type, object_header::object_type(pointer).unwrap_or(0)) {
+            return Ok(signed_status(TYPE_MISMATCH));
+        }
+        object_header::reference(pointer, 1);
         out::<u64>(output).set(pointer);
         return Ok(0);
     }
@@ -414,15 +451,15 @@ pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8,
 }
 
 /// ObReferenceObjectByHandleWithTag(handle, access, type, mode, tag, out,
-/// info): a tag só alimenta o histórico. Os handles de objetos inseridos por
-/// ObInsertObject resolvem na tabela deles; os demais seguem pelo núcleo de
+/// info): a tag só alimenta o histórico; o resto é o núcleo de
 /// ObReferenceObjectByHandle (o export real só reordena a tag e chama a
 /// rotina compartilhada).
 pub fn reference_by_handle_with_tag(handle: u64, access: u32, object_type: u64, mode: u8, tag: u32, output: u64, information: u64) -> Result<u64, KernelError> {
-    if let Some(status) = inserted::reference(handle, access, object_type, mode, tag, output, information) {
-        return Ok(signed_status(status));
+    let result = reference_by_handle(handle, access, object_type, mode, output, information)?;
+    if result == 0 {
+        reference_trace::record(guest::read::<u64>(output), tag, 1);
     }
-    reference_by_handle(handle, access, object_type, mode, output, information)
+    Ok(result)
 }
 
 /// ObReferenceObjectByPointer(object, access, type, mode): em modo usuário
@@ -432,6 +469,13 @@ pub fn reference_by_pointer(pointer: u64, object_type: u64, mode: u8) -> Result<
         return Ok(signed_status(0xC000_000D));
     }
     let mismatch = |expected: u64| mode != 0 && (object_type == 0 || object_type != expected);
+    if object_header::is_object(pointer) {
+        if mismatch(object_header::object_type(pointer).unwrap_or(0)) {
+            return Ok(signed_status(TYPE_MISMATCH));
+        }
+        object_header::reference(pointer, 1);
+        return Ok(0);
+    }
     if namespace_objects::get(pointer).is_some() || dispatcher_objects::get(pointer).is_some() {
         if mismatch(described_type(pointer)) {
             return Ok(TYPE_MISMATCH as u64);

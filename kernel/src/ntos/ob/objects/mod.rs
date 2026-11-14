@@ -1,5 +1,6 @@
 //! Tipos de objeto do Object Manager: driver, dispositivo, arquivo, seção,
-//! porta, conclusão, trabalho, despachante e namespace.
+//! porta, conclusão, trabalho, despachante, namespace e os criados pelo
+//! ObCreateObject.
 
 pub mod driver;
 pub mod namespace;
@@ -10,3 +11,4 @@ pub mod device;
 pub mod work;
 pub mod dispatcher;
 pub mod port;
+pub mod created;

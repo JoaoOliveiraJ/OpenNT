@@ -677,25 +677,24 @@ pub mod driver_helpers {
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::ntos::io::object_types;
     use crate::ntos::io::small::portable_operating_system;
-    use crate::ntos::ob::object_reference::{dereference_with_tag, reference_with_tag};
+    use crate::ntos::ob::object_reference::{dereference_defer_delete, reference_safe};
     use crate::ntos::ob::reference_trace::DEFAULT_TAG;
     use crate::rtl::KernelError;
 
     /// ObReferenceObjectSafe: TRUE se a referência foi adquirida (objeto vivo).
     fn reference_object_safe(call: &Call) -> Result<u64, KernelError> {
-        Ok(reference_with_tag(call.arg(1), DEFAULT_TAG, true).is_ok() as u64)
+        Ok(reference_safe(call.arg(1), DEFAULT_TAG) as u64)
     }
     fn reference_object_safe_with_tag(call: &Call) -> Result<u64, KernelError> {
-        Ok(reference_with_tag(call.arg(1), call.arg(2) as u32, true).is_ok() as u64)
+        Ok(reference_safe(call.arg(1), call.arg(2) as u32) as u64)
     }
-    /// ObDereferenceObjectDeferDelete: a coleta do OpenNT já é feita fora da
-    /// linha do chamador, então o "defer" não muda nada.
+    /// ObDereferenceObjectDeferDelete: `ob/object_reference`.
     fn dereference_object_defer_delete(call: &Call) -> Result<u64, KernelError> {
-        dereference_with_tag(call.arg(1), DEFAULT_TAG, true)?;
+        dereference_defer_delete(call.arg(1), DEFAULT_TAG)?;
         Ok(0)
     }
     fn dereference_object_defer_delete_with_tag(call: &Call) -> Result<u64, KernelError> {
-        dereference_with_tag(call.arg(1), call.arg(2) as u32, true)?;
+        dereference_defer_delete(call.arg(1), call.arg(2) as u32)?;
         Ok(0)
     }
 

@@ -7,6 +7,7 @@ pub mod handles;
 pub mod objects;
 pub mod object_access;
 pub mod object_manager;
+pub mod object_header;
 pub mod object_types;
 pub mod open_pointer;
 pub mod close;

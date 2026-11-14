@@ -226,20 +226,21 @@ pub mod ob_object_lifecycle {
     use crate::ntos::ob::{object_create, object_reference, object_security, object_types};
     use crate::rtl::KernelError;
 
-    /// ObCreateObjectType(Name, Initializer, Sd, Type).
+    /// ObCreateObjectType(Name, Initializer, Sd, Type): o
+    /// ObCreateObjectTypeEx com DefaultObject NULL.
     fn create_object_type(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(object_types::create_from_initializer(call.arg(1), call.arg(2), call.arg(4))))
+        Ok(signed_status(object_types::create_type_ex(call.arg(1), call.arg(2), 0, call.arg(4))))
     }
 
     /// ObCreateObject(ProbeMode, Type, Attr, OwnerMode, Reserved, BodySize,
     /// PagedCharge, NonPagedCharge, Object).
     fn create_object(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(object_create::create(call.arg(2), call.arg(3), call.arg(6) as u32, call.arg(9))))
+        Ok(signed_status(object_create::create(call.arg(1) as u8, call.arg(2), call.arg(3), call.arg(4) as u8, call.arg(6) as u32, call.arg(7) as u32, call.arg(8) as u32, call.arg(9))))
     }
 
     /// ObInsertObject(Object, AccessState, DesiredAccess, Bias, NewObject, Handle).
     fn insert_object(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(object_create::insert(call.arg(1), call.arg(3) as u32, call.arg(5), call.arg(6))?))
+        Ok(signed_status(object_create::insert(call.arg(1), call.arg(3) as u32, call.arg(4) as u32, call.arg(5), call.arg(6))?))
     }
 
     fn delete_captured_insert_info(call: &Call) -> Result<u64, KernelError> {
@@ -269,7 +270,7 @@ pub mod ob_object_lifecycle {
     /// ObDuplicateObject(Source, SourceHandle, Target, TargetHandle,
     /// DesiredAccess, HandleAttributes, Options, Mode).
     fn duplicate_object(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(inserted::duplicate(call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32)?))
+        Ok(signed_status(inserted::duplicate(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32, call.arg(8) as u8)?))
     }
 
     fn is_kernel_handle(call: &Call) -> Result<u64, KernelError> {
@@ -398,7 +399,11 @@ pub mod ob_temporary_object {
     use crate::rtl::KernelError;
 
     fn make_temporary(call: &Call) -> Result<u64, KernelError> {
-        namespace::make_temporary_by_pointer(call.arg(1));
+        if crate::ntos::ob::object_header::is_object(call.arg(1)) {
+            crate::ntos::ob::object_header::make_temporary(call.arg(1));
+        } else {
+            namespace::make_temporary_by_pointer(call.arg(1));
+        }
         Ok(0)
     }
 
@@ -552,4 +557,19 @@ pub mod zw_wait_multiple {
     }
 
     pub static GROUP: Group = Group { name: "zw-wait-multiple", names: &["ZwWaitForMultipleObjects"], handlers: &[wait_for_multiple_objects], data_exports: &[] };
+}
+
+pub mod ob_object_type_ex {
+    //! ObCreateObjectTypeEx; a lógica mora em `ob/object_types`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::object_types;
+    use crate::rtl::KernelError;
+
+    /// ObCreateObjectTypeEx(TypeName, Initializer, Sd, DefaultObject, Type).
+    fn create_object_type_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(object_types::create_type_ex(call.arg(1), call.arg(2), call.arg(4), call.arg(5))))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-object-type-ex", names: &["ObCreateObjectTypeEx"], handlers: &[create_object_type_ex], data_exports: &[] };
 }
