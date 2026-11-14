@@ -173,6 +173,12 @@ cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=bu
 
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
+
+# Estruturas do NT (kernel/src/ntos/inc/types) geradas dos símbolos do
+# ntoskrnl, com a lista em types/nt_types.toml; o PDB vai para build/symbols
+# (baixado do servidor público de símbolos na primeira vez). --check só confere.
+cargo xtask nt-types
+cargo xtask nt-types --check
 ```
 
 Opções de build: `--release`, `--build-dir=DIR`,

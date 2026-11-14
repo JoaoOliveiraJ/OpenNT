@@ -151,19 +151,28 @@ No NT, kernel e drivers dividem o espaço de endereçamento e o C usa as
 estruturas direto: `Irp->IoStatus.Status = STATUS_SUCCESS;` é um `mov`, com o
 layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
 
-- **As estruturas vêm de `ntos/inc/types`**, geradas a partir dos símbolos do
-  ntoskrnl (`build/symbols/ntkrnlmp.pdb`, Windows 10 19041): o mesmo layout com
+- **As estruturas vêm de `ntos/inc/types`**, geradas pelo `cargo xtask
+  nt-types` a partir dos símbolos do ntoskrnl (`build/symbols/ntkrnlmp.pdb`,
+  Windows 10 19041; ausente, o xtask o baixa do servidor público de símbolos
+  pelo GUID/idade registrados e confere a identidade): o mesmo layout com
   que o kernel real foi compilado, `#[repr(C)]`, com `size_of`/`offset_of!`
   conferidos em compilação. Os nomes são os do NT em snake_case (`IoStatus` ->
   `io_status`, `Tail.Overlay.CurrentStackLocation` ->
   `tail.overlay.current_stack_location`; palavras reservadas ganham `_`, como
   `type_`). Membros que o C sobrepõe (uniões anônimas) ficam em vistas
   encadeadas por `Deref`, então o nome resolve direto (`thread.state`,
-  `iosb.pointer`). O diretório é gerado e não se edita à mão, com uma
-  exceção: `types/wdk.rs`, mantido à mão no mesmo estilo, com as estruturas
-  públicas do WDK/SDK que não constam dos símbolos (OB_CALLBACK_*, classes de
-  informação dos Nt*, atributos ALPC...), cada uma citando o cabeçalho de
-  origem.
+  `iosb.pointer`). O diretório é gerado e não se edita à mão: os tipos
+  pedidos (raízes, que entram com o fecho do que contêm por valor; famílias;
+  as provas de `nt_abi.rs`) ficam em `types/nt_types.toml`, e
+  `cargo xtask nt-types --check` falha se algum arquivo gerado estiver
+  desatualizado. Uma estrutura que consta dos símbolos entra como raiz no
+  `nt_types.toml`, nunca à mão. As exceções são `types/wdk.rs` e os
+  `types/extra_*.rs`, mantidos à mão no mesmo estilo só com o que os
+  símbolos não têm (estruturas públicas do WDK/SDK, como OB_CALLBACK_*,
+  classes de informação dos Nt* e atributos ALPC, e privadas lidas na
+  desmontagem), cada uma citando a origem; os `extra_*.rs` também
+  reexportam, nos caminhos já usados, as estruturas que passaram a ser
+  geradas.
 - **Estruturas próprias do OpenNT** (corpos de objeto, registros internos que
   não são layouts do NT) ficam privadas no componente dono, com a mesma
   receita: `#[repr(C)]` de `Field<T>`/`Reserved<N>`/structs do NT,
@@ -1263,6 +1272,7 @@ dereference e o PFN livre volta ao de antes.
 | `docs/status/modulos-planejados.txt` | módulos planejados por subsistema |
 | `docs/status/ntoskrnl-exports.def` | cache dos nomes exportados pelo `ntoskrnl.exe` 19045 |
 | `docs/status/*.svg`, `docs/site/` | gerados por `cargo xtask status`; não editar |
+| `kernel/src/ntos/inc/types/nt_types.toml` | estruturas do NT que o `cargo xtask nt-types` gera do PDB do ntoskrnl |
 
 O `cargo xtask status` acha o arquivo Rust de cada módulo planejado pela pasta
 e pelo nome (`ntos/ob/object_manager` → `.../ob/object_manager.rs`), por um
