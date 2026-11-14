@@ -757,3 +757,17 @@ pub mod mm_prefetch {
 
     pub static GROUP: Group = Group { name: "mm-prefetch", names: &["MmPrefetchVirtualAddresses"], handlers: &[prefetch_virtual_addresses], data_exports: &[] };
 }
+
+pub mod zw_virtual_memory_information {
+    //! ZwSetInformationVirtualMemory; a lógica mora em `mm/prefetch`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::prefetch;
+    use crate::rtl::KernelError;
+
+    fn set_information_virtual_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(prefetch::set_information_virtual_memory(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-virtual-memory-information", names: &["ZwSetInformationVirtualMemory"], handlers: &[set_information_virtual_memory], data_exports: &[] };
+}

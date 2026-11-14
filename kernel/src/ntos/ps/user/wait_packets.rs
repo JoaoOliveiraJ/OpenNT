@@ -71,7 +71,13 @@ fn nt_create_wait_completion_packet(out: u64, access: u64, attributes: u64, _a4:
             Err(error) => return Ok(error.status),
         }
     }
-    let result = work_objects::packet(attributes, detach).and_then(|packet| work_objects::publish(packet.pointer, out, access as u32, attributes, packet.clone()));
+    create(out, access as u32, attributes)
+}
+
+/// O núcleo do NtCreateWaitCompletionPacket (e do Zw, em modo kernel): o
+/// pacote novo e o handle dele, na tabela do processo corrente, em `out`.
+pub fn create(out: u64, access: u32, attributes: u64) -> Result<u32, KernelError> {
+    let result = work_objects::packet(attributes, detach).and_then(|packet| work_objects::publish(packet.pointer, out, access, attributes, packet.clone()));
     match result {
         Ok(status) => Ok(status),
         Err(error) if error.status != 0 => Ok(error.status),
@@ -120,24 +126,6 @@ fn poll(packet: &Arc<WaitPacket>) -> bool {
 /// NtAssociateWaitCompletionPacket(packet, port, target, key, context,
 /// status, information, alreadySignaled*).
 fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_handle: u64, _key: u64, rsp: u64) -> Result<u32, KernelError> {
-    let packet = match resolve(handle) {
-        Ok(packet) => packet,
-        Err(status) => return Ok(status),
-    };
-    if packet.association().is_some() || packet.queued().is_some() {
-        return Ok(0xC000_000D);
-    }
-    let (port_entry, port) = match io_completion::resolve(port_handle, 2) {
-        Ok(resolved) => resolved,
-        Err(status) => return Ok(status),
-    };
-    let Some(target) = state::get_user_handle(target_handle) else { return Ok(0xC000_0008) };
-    if !["event", "timer", "semaphore", "thread"].contains(&target.kind()) {
-        return Ok(0xC000_0024);
-    }
-    if target.access() & 0x10_0000 == 0 {
-        return Ok(0xC000_0022);
-    }
     if !state::probe_syscall_stack(rsp, 32) {
         return Ok(0xC000_0005);
     }
@@ -145,14 +133,11 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
     if already != 0 && !probe_user_write(already, 1) {
         return Ok(0xC000_0005);
     }
-    packet.set_completion(state::syscall_arg_words(rsp, 4), state::syscall_arg_words(rsp, 5), state::stack_arg32(rsp, 6), state::syscall_arg_words(rsp, 7));
-    let target_pointer = target.object.native_body().map_or(0, |body| body.pointer);
-    state::retain_user_handle_reference(&port_entry);
-    state::retain_user_handle_reference(&target);
-    let _ = dispatcher_objects::reference(packet.pointer);
-    packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
-    PENDING.lock().push(packet.clone());
-    let signaled = poll(&packet);
+    let completion = (state::syscall_arg_words(rsp, 4), state::syscall_arg_words(rsp, 5), state::stack_arg32(rsp, 6), state::syscall_arg_words(rsp, 7));
+    let signaled = match associate(handle, port_handle, target_handle, completion) {
+        Ok(signaled) => signaled,
+        Err(status) => return Ok(status),
+    };
     // BOOLEAN *AlreadySignaled (sondado acima).
     if already != 0 && guest::try_write::<u8>(already, signaled as u8).is_err() {
         return Ok(0xC000_0005);
@@ -160,11 +145,43 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
     Ok(0)
 }
 
-fn nt_cancel_wait_completion_packet(handle: u64, remove: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(match resolve(handle) {
-        Ok(packet) => detach(&packet, remove & 0xFF != 0),
+/// O núcleo do NtAssociateWaitCompletionPacket (e do Zw): associa o pacote
+/// ao objeto esperável e à IOCP, com a conclusão (chave, contexto, status e
+/// informação) que vai para a fila quando o objeto sinaliza. Devolve se ele
+/// já estava sinalizado (o pacote foi para a fila na hora).
+pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: ([u32; 2], [u32; 2], u32, [u32; 2])) -> Result<bool, u32> {
+    let packet = resolve(handle)?;
+    if packet.association().is_some() || packet.queued().is_some() {
+        return Err(0xC000_000D);
+    }
+    let (port_entry, port) = io_completion::resolve(port_handle, 2)?;
+    let Some(target) = state::get_user_handle(target_handle) else { return Err(0xC000_0008) };
+    if !["event", "timer", "semaphore", "thread"].contains(&target.kind()) {
+        return Err(0xC000_0024);
+    }
+    if target.access() & 0x10_0000 == 0 {
+        return Err(0xC000_0022);
+    }
+    packet.set_completion(completion.0, completion.1, completion.2, completion.3);
+    let target_pointer = target.object.native_body().map_or(0, |body| body.pointer);
+    state::retain_user_handle_reference(&port_entry);
+    state::retain_user_handle_reference(&target);
+    let _ = dispatcher_objects::reference(packet.pointer);
+    packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
+    PENDING.lock().push(packet.clone());
+    Ok(poll(&packet))
+}
+
+/// O núcleo do NtCancelWaitCompletionPacket (e do Zw).
+pub fn cancel(handle: u64, remove_signaled: bool) -> u32 {
+    match resolve(handle) {
+        Ok(packet) => detach(&packet, remove_signaled),
         Err(status) => status,
-    })
+    }
+}
+
+fn nt_cancel_wait_completion_packet(handle: u64, remove: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(cancel(handle, remove & 0xFF != 0))
 }
 
 pub fn pump() {

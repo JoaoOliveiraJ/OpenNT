@@ -198,6 +198,21 @@ pub mod thread_requests {
         })
     }
 
+    /// As IRPs da IrpList da thread, da cabeça para o fim (com a trava).
+    pub fn of_thread(thread: u64) -> Result<alloc::vec::Vec<u64>, KernelError> {
+        let head = &thread_at(thread).irp_list;
+        let offset = core::mem::offset_of!(Irp, thread_list_entry) as u64;
+        with_lock(thread, || {
+            let mut requests = alloc::vec::Vec::new();
+            let mut link = head.flink.get();
+            while link != 0 && link != head.address() && requests.len() < 4096 {
+                requests.push(link - offset);
+                link = link_at(link).flink.get();
+            }
+            Ok(requests)
+        })
+    }
+
     /// A conclusão retira só o pedido que possui, fora de ordem inclusive.
     pub fn remove(request: u64, thread: u64) -> Result<(), KernelError> {
         let entry = entry_of(request);

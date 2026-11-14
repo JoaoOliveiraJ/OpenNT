@@ -324,6 +324,11 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("se-privilege-audit", 1667, 1),
     ("etw-coverage", 1668, 1),
     ("dbgk-live-dump", 1669, 1),
+    ("zw-locale", 1670, 4),
+    ("zw-job-query", 1674, 1),
+    ("zw-wait-completion-packets", 1675, 4),
+    ("zw-cancel-io", 1679, 1),
+    ("zw-virtual-memory-information", 1680, 1),
 ];
 
 /// Os 1114 exports de função, na ordem da ABI.
@@ -1998,4 +2003,15 @@ pub static EXPORT_NAMES: &[&str] = &[
     "SePrivilegeObjectAuditAlarm",
     "EtwTelemetryCoverageReport",
     "DbgkLkmdRegisterCallback",
+    "ZwQueryDefaultUILanguage",
+    "ZwSetDefaultUILanguage",
+    "ZwQueryDefaultLocale",
+    "ZwSetDefaultLocale",
+    "ZwQueryInformationJobObject",
+    "ZwAssociateWaitCompletionPacket",
+    "ZwCreateWaitCompletionPacket",
+    "ZwCancelWaitCompletionPacket",
+    "ZwSetIoCompletionEx",
+    "ZwCancelIoFile",
+    "ZwSetInformationVirtualMemory",
 ];

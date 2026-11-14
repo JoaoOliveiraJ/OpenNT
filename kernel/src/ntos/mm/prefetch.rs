@@ -73,3 +73,51 @@ pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64
         Ok((0, touched))
     })?
 }
+
+/// VIRTUAL_MEMORY_INFORMATION_CLASS.VmPrefetchInformation.
+const VM_PREFETCH_INFORMATION: u32 = 0;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// ZwSetInformationVirtualMemory(Process, VmInformationClass,
+/// NumberOfEntries, VirtualAddresses, VmInformation, VmInformationLength):
+/// VmPrefetchInformation (o ULONG de flags, que precisa ser 0) pré-busca as
+/// faixas no processo, como o MmPrefetchVirtualAddresses; as classes de
+/// prioridade de página e de alvos de CFG ainda não existem no OpenNT
+/// (STATUS_NOT_SUPPORTED); classe desconhecida, STATUS_INVALID_PARAMETER_2.
+/// O processo é o NtCurrentProcess ou um handle de processo da tabela
+/// nativa; outro handle dá STATUS_INVALID_HANDLE.
+pub fn set_information_virtual_memory(process_handle: u64, class: u32, count: u64, entries: u64, information: u64, length: u32) -> Result<u32, KernelError> {
+    let process = if process_handle == u64::MAX {
+        crate::ntos::ps::process::get_current_process()
+    } else {
+        match crate::ntos::ob::open_pointer::resolve(process_handle, false) {
+            Some(Ok(opened)) if opened.item.object_type.name == "Process" => opened.item.pointer,
+            _ => return Ok(0xC000_0008),
+        }
+    };
+    match class {
+        VM_PREFETCH_INFORMATION => {
+            if length != 4 || information == 0 {
+                return Ok(STATUS_INVALID_PARAMETER_5);
+            }
+            // SAFETY: o ULONG de flags do chamador de kernel.
+            if unsafe { Field::<u32>::at(information) }.get() != 0 {
+                return Ok(STATUS_INVALID_PARAMETER_5);
+            }
+            let request = guest::alloc_bytes(PrefetchRequest::SIZE);
+            // SAFETY: bloco recém-alocado do tamanho do pedido.
+            let prefetch = unsafe { PrefetchRequest::at(request) };
+            prefetch.version.set(1);
+            prefetch.process.set(process);
+            prefetch.number_of_entries.set(count);
+            prefetch.virtual_addresses.set(entries);
+            let result = prefetch_virtual_addresses(prefetch);
+            guest::free_bytes(request);
+            Ok(result?.0)
+        }
+        1..=4 => Ok(STATUS_NOT_SUPPORTED),
+        _ => Ok(STATUS_INVALID_PARAMETER_2),
+    }
+}

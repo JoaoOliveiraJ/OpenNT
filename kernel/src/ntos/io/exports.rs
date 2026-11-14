@@ -1818,3 +1818,72 @@ pub mod nt_device_control {
 
     pub static GROUP: Group = Group { name: "nt-device-control", names: &["NtDeviceIoControlFile"], handlers: &[control], data_exports: &[] };
 }
+
+pub mod zw_wait_completion_packets {
+    //! ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket,
+    //! ZwCancelWaitCompletionPacket e ZwSetIoCompletionEx, em modo kernel;
+    //! a lógica mora em `ps/user/wait_packets` e `io/completion/set`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::io::completion::set;
+    use crate::ntos::ps::user::wait_packets;
+    use crate::rtl::KernelError;
+
+    fn words(value: u64) -> [u32; 2] {
+        [value as u32, (value >> 32) as u32]
+    }
+
+    /// ZwCreateWaitCompletionPacket(Handle*, DesiredAccess, ObjectAttributes).
+    fn create(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wait_packets::create(call.arg(1), call.arg(2) as u32, call.arg(3))?))
+    }
+
+    /// ZwAssociateWaitCompletionPacket(Packet, IoCompletion, Target, Key,
+    /// ApcContext, IoStatus, IoStatusInformation, AlreadySignaled*).
+    fn associate(call: &Call) -> Result<u64, KernelError> {
+        let completion = (words(call.arg(4)), words(call.arg(5)), call.arg(6) as u32, words(call.arg(7)));
+        Ok(signed_status(match wait_packets::associate(call.arg(1), call.arg(2), call.arg(3), completion) {
+            Ok(signaled) => {
+                if call.arg(8) != 0 {
+                    // SAFETY: o BOOLEAN* opcional do chamador de kernel.
+                    unsafe { Field::<u8>::at(call.arg(8)) }.set(signaled as u8);
+                }
+                0
+            }
+            Err(status) => status,
+        }))
+    }
+
+    /// ZwCancelWaitCompletionPacket(Packet, RemoveSignaledPacket).
+    fn cancel(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wait_packets::cancel(call.arg(1), call.arg(2) as u8 != 0)))
+    }
+
+    /// ZwSetIoCompletionEx(IoCompletion, Reserve, Key, ApcContext, IoStatus,
+    /// IoStatusInformation).
+    fn set_io_completion_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(set::set_io_completion_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "zw-wait-completion-packets",
+        names: &["ZwAssociateWaitCompletionPacket", "ZwCreateWaitCompletionPacket", "ZwCancelWaitCompletionPacket", "ZwSetIoCompletionEx"],
+        handlers: &[associate, create, cancel, set_io_completion_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod zw_cancel_io {
+    //! ZwCancelIoFile; a lógica mora em `io/cancel`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::cancel;
+    use crate::rtl::KernelError;
+
+    fn cancel_io_file(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(cancel::cancel_io_file(call.arg(1), call.arg(2))?.0))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-cancel-io", names: &["ZwCancelIoFile"], handlers: &[cancel_io_file], data_exports: &[] };
+}

@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 318] {
+fn groups() -> [&'static Group; 323] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -373,6 +373,11 @@ fn groups() -> [&'static Group; 318] {
         &crate::ntos::se::exports::se_privilege_audit::GROUP,
         &crate::ntos::etw::exports::etw_coverage::GROUP,
         &crate::ntos::dbgk::exports::dbgk_live_dump::GROUP,
+        &crate::ntos::ps::exports::zw_locale::GROUP,
+        &crate::ntos::ps::exports::zw_job_query::GROUP,
+        &crate::ntos::io::exports::zw_wait_completion_packets::GROUP,
+        &crate::ntos::io::exports::zw_cancel_io::GROUP,
+        &crate::ntos::mm::exports::zw_virtual_memory_information::GROUP,
     ]
 }
 

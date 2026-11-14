@@ -69,3 +69,32 @@ pub fn post(port_pointer: u64, key: u64, context: u64, status: u32, information:
 pub fn pending_count() -> usize {
     IN_FLIGHT.lock().len()
 }
+
+/// ZwSetIoCompletionEx(IoCompletionHandle, IoCompletionPacketHandle,
+/// KeyContext, ApcContext, IoStatus, IoStatusInformation): o pacote vai para
+/// a IOCP do handle, como o NtSetIoCompletionEx — um handle da tabela do
+/// processo corrente (com IO_COMPLETION_MODIFY_STATE) ou da tabela nativa
+/// (a IOCP criada em modo kernel). O pacote de reserva (um
+/// IoCompletionReserve do NtAllocateReserveObject) ainda não existe no
+/// OpenNT: um handle de reserva não nulo dá STATUS_INVALID_HANDLE.
+pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, status: u32, information: u64) -> u32 {
+    if reserve != 0 {
+        return 0xC000_0008;
+    }
+    let port = match crate::ntos::ps::user::io_completion::resolve(handle, 2) {
+        Ok((_, port)) => port,
+        Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, false) {
+            Some(Ok(opened)) if opened.item.object_type.name == "IoCompletion" => match completion_objects::port_of(opened.item.pointer) {
+                Some(port) if opened.access & 2 != 0 => port,
+                Some(_) => return 0xC000_0022,
+                None => return 0xC000_0008,
+            },
+            Some(Ok(_)) => return 0xC000_0024,
+            Some(Err(status)) => return status,
+            None => return 0xC000_0008,
+        },
+        Err(status) => return status,
+    };
+    completion_objects::enqueue(&port, Packet { key, context, status, information, ..Packet::default() });
+    0
+}

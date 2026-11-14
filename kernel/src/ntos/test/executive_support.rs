@@ -306,11 +306,46 @@ fn executive_support(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// Os Zw em modo kernel: localidade e idioma, consulta de job, cancelamento
+/// de E/S e informação de memória virtual.
+fn zw_support(assert: Assert) {
+    let block = guest::alloc_bytes(0x200);
+    let query_locale = |user: u64| {
+        guest::write32(block, 0);
+        (status(call_export("ZwQueryDefaultLocale", &[user, block])), guest::read32(block))
+    };
+    let initial = query_locale(1);
+    let set = status(call_export("ZwSetDefaultLocale", &[1, 0x416]));
+    let changed = query_locale(1);
+    let system = query_locale(0);
+    let refused = status(call_export("ZwSetDefaultLocale", &[0, 0]));
+    let _ = call_export("ZwSetDefaultLocale", &[1, initial.1 as u64]);
+    assert(initial == (0, 0x409) && set == 0 && changed == (0, 0x416) && system == (0, 0x409) && refused == 0xC000_000D, "zw: ZwQueryDefaultLocale/ZwSetDefaultLocale com o LCID do usuario e o do sistema separados, LCID 0 recusado");
+    guest::write16(block, 0);
+    let ui = status(call_export("ZwQueryDefaultUILanguage", &[block])) == 0 && guest::read16(block) == 0x409;
+    let ui_set = status(call_export("ZwSetDefaultUILanguage", &[0x416])) == 0 && status(call_export("ZwQueryDefaultUILanguage", &[block])) == 0 && guest::read16(block) == 0x416;
+    let ui_refused = status(call_export("ZwSetDefaultUILanguage", &[0])) == 0xC000_000D;
+    let _ = call_export("ZwSetDefaultUILanguage", &[0x409]);
+    assert(ui && ui_set && ui_refused, "zw: ZwQueryDefaultUILanguage/ZwSetDefaultUILanguage trocam o idioma de interface");
+    let job = |handle: u64, class: u64| status(call_export("ZwQueryInformationJobObject", &[handle, class, block, 0x40, 0]));
+    assert(job(0, 2) == 0xC000_0022 && job(0, 0x1F) == 0xC000_00BB && job(0x7FF0, 2) == 0xC000_0008, "zw: ZwQueryInformationJobObject sem job (ACCESS_DENIED fora das classes de silo) e handle invalido");
+    guest::write64(block + 0x100, 0x5555);
+    assert(status(call_export("ZwCancelIoFile", &[0x7FF0, block + 0x100])) == 0xC000_0008 && guest::read64(block + 0x100) == 0x5555, "zw: ZwCancelIoFile recusa o handle que nao e de arquivo sem tocar no IOSB");
+    let flags = block + 0x140;
+    let vm = |process: u64, class: u64, value: u32| {
+        guest::write32(flags, value);
+        status(call_export("ZwSetInformationVirtualMemory", &[process, class, 0, 0, flags, 4]))
+    };
+    assert(vm(u64::MAX, 0, 0) == 0 && vm(u64::MAX, 0, 1) == 0xC000_00F3 && vm(u64::MAX, 9, 0) == 0xC000_00F0 && vm(0x7FF0, 0, 0) == 0xC000_0008, "zw: ZwSetInformationVirtualMemory pre-busca no processo corrente e confere flags, classe e handle");
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     boot_object_types(assert);
     ob_object_support(assert);
     ps_support(assert);
     executive_support(assert);
+    zw_support(assert);
 }
 
 /// ObSetHandleAttributes e ObWaitFor*Object sobre handles de usuário de um
@@ -343,22 +378,42 @@ pub fn run_user(assert: Assert) {
         let any = status(call_export("ObWaitForMultipleObjects", &[2, handles, 1, 1, 0, 0, zero]));
         let all = status(call_export("ObWaitForMultipleObjects", &[2, handles, 1, 0, 0, 0, zero]));
         let invalid = status(call_export("ObWaitForMultipleObjects", &[0, handles, 1, 1, 0, 0, zero]));
-        for handle in [signaled, waiting] {
+        // Pacotes de espera e a IOCP pelos Zw, com saídas na memória do kernel.
+        let kernel = guest::alloc_bytes(0x40);
+        // A IOCP de usuário (tabela do processo) e uma criada em modo kernel
+        // (tabela nativa).
+        let port_created = crate::ntos::io::completion::create::create(page + 0x100, 0x1F_0003, 0, 0, 1).unwrap_or(1) == 0 && crate::ntos::io::completion::create::create(kernel + 0x18, 0x1F_0003, 0, 0, 0).unwrap_or(1) == 0;
+        let (port, native_port) = (guest::read64(page + 0x100), guest::read64(kernel + 0x18));
+        let packet_created = status(call_export("ZwCreateWaitCompletionPacket", &[kernel + 8, 1, 0])) == 0;
+        let packet = guest::read64(kernel + 8);
+        guest::write8(kernel + 0x10, 0xFF);
+        let associated = status(call_export("ZwAssociateWaitCompletionPacket", &[packet, port, signaled, 0x11, 0x22, 0x33, 0x44, kernel + 0x10])) == 0 && guest::read8(kernel + 0x10) == 1;
+        let posted = status(call_export("ZwSetIoCompletionEx", &[port, 0, 0x55, 0x66, 0x77, 0x88])) == 0 && status(call_export("ZwSetIoCompletionEx", &[port, 0x1234, 0x55, 0x66, 0x77, 0x88])) == 0xC000_0008;
+        let depth = |port: u64| crate::ntos::ps::user::io_completion::resolve(port, 0).map_or(usize::MAX, |(_, port)| port.with(|state| state.packets.len()));
+        let native_posted = status(call_export("ZwSetIoCompletionEx", &[native_port, 0, 0x99, 0, 0, 0])) == 0 && crate::ntos::ob::open_pointer::resolve(native_port, false).and_then(|opened| opened.ok()).and_then(|opened| crate::ntos::ob::objects::completion::port_of(opened.item.pointer)).is_some_and(|port| port.with(|state| state.packets.len()) == 1);
+        let queued = depth(port) == 2 && native_posted;
+        let _ = call_export("ZwClose", &[native_port]);
+        let cancelled = status(call_export("ZwCancelWaitCompletionPacket", &[packet, 1])) == 0 && depth(port) == 1;
+        let packets = port_created && packet_created && associated && posted && queued && cancelled;
+        crate::debug_print!("[suporte-zw] iocp={} pacote={} associado={} postado={} fila={} cancelado={}", port_created, packet_created, associated, posted, queued, cancelled);
+        for handle in [signaled, waiting, port, packet] {
             let _ = state::close_user_handle(handle, true, false);
         }
+        guest::free_bytes(kernel);
         for block in [flags, zero, handles] {
             guest::free_bytes(block);
         }
         if let Some(region) = memory::find_region(page) {
             memory::release_private_region(&region);
         }
-        Some((created, attributes, refused, single, any, all, invalid))
+        Some((created, attributes, refused, single, any, all, invalid, packets))
     })
     .flatten();
-    let Some((created, attributes, refused, single, any, all, invalid)) = outcome else {
+    let Some((created, attributes, refused, single, any, all, invalid, packets)) = outcome else {
         assert(false, "ob: processo de teste com eventos de usuario");
         return;
     };
     assert(created && attributes && refused, "ob: ObSetHandleAttributes troca Inherit e ProtectFromClose do handle e recusa handle ausente e de kernel em UserMode");
     assert(single && any == 1 && all == 0x102 && invalid == 0xC000_000D, "ob: ObWaitForSingleObject e ObWaitForMultipleObjects (WaitAny no indice sinalizado, WaitAll com prazo zero) sobre handles de usuario");
+    assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado), ZwSetIoCompletionEx (reserva recusada) e ZwCancelWaitCompletionPacket tirando o pacote da fila");
 }

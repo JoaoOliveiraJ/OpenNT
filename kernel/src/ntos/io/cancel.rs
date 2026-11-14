@@ -68,3 +68,28 @@ pub fn set_cancel_routine(pointer: u64, routine: u64) -> u64 {
     // SAFETY: IRP vivo do chamador.
     unsafe { Irp::at(pointer) }.cancel_routine.atomic().swap(routine, Ordering::SeqCst)
 }
+
+/// ZwCancelIoFile(FileHandle, IoStatusBlock): cancela os pedidos de E/S da
+/// thread corrente para o arquivo do handle — as IRPs da IrpList dela cujo
+/// OriginalFileObject é o FILE_OBJECT do handle, pelo IoCancelIrp — e grava
+/// STATUS_SUCCESS no IOSB, como o NtCancelIoFile. Handle de arquivo
+/// desconhecido dá STATUS_INVALID_HANDLE. Devolve o NTSTATUS e quantas IRPs
+/// foram canceladas.
+pub fn cancel_io_file(handle: u64, io_status: u64) -> Result<(u32, usize), KernelError> {
+    use crate::ntos::inc::types::{Irp, NtStruct};
+    let file = crate::ntos::io::file::zw::file_object_of_handle(handle);
+    if file == 0 {
+        return Ok((0xC000_0008, 0));
+    }
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let mut cancelled = 0;
+    for request in crate::ntos::io::threads::thread_requests::of_thread(thread)? {
+        // SAFETY: IRP viva da lista da thread corrente.
+        if unsafe { Irp::at(request) }.tail.overlay.original_file_object.get() == file {
+            irp(request)?;
+            cancelled += 1;
+        }
+    }
+    crate::ntos::io::file::zw::write_io_status(io_status, 0, 0);
+    Ok((0, cancelled))
+}

@@ -1435,3 +1435,46 @@ pub mod ps_process_state {
 
     pub static GROUP: Group = Group { name: "ps-process-state", names: &["PsSetProcessFaultInformation", "PsSetProcessPriorityByClass"], handlers: &[set_fault_information, set_priority_by_class], data_exports: &[] };
 }
+
+pub mod zw_locale {
+    //! ZwQueryDefaultLocale, ZwSetDefaultLocale, ZwQueryDefaultUILanguage e
+    //! ZwSetDefaultUILanguage; a lógica mora em `ps/locale`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::locale;
+    use crate::rtl::KernelError;
+
+    fn query_default_locale(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(locale::query_default_locale(call.arg(1) as u8 != 0, call.arg(2))))
+    }
+    fn set_default_locale(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(locale::set_default_locale(call.arg(1) as u8 != 0, call.arg(2) as u32)))
+    }
+    fn query_default_ui_language(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(locale::query_default_ui_language(call.arg(1))))
+    }
+    fn set_default_ui_language(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(locale::set_default_ui_language(call.arg(1) as u16)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "zw-locale",
+        names: &["ZwQueryDefaultUILanguage", "ZwSetDefaultUILanguage", "ZwQueryDefaultLocale", "ZwSetDefaultLocale"],
+        handlers: &[query_default_ui_language, set_default_ui_language, query_default_locale, set_default_locale],
+        data_exports: &[],
+    };
+}
+
+pub mod zw_job_query {
+    //! ZwQueryInformationJobObject; a lógica mora em `ps/job`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::job;
+    use crate::rtl::KernelError;
+
+    fn query_information_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(job::query_information_job_object(call.arg(1), call.arg(2) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-job-query", names: &["ZwQueryInformationJobObject"], handlers: &[query_information_job_object], data_exports: &[] };
+}

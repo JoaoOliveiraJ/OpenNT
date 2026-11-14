@@ -66,3 +66,28 @@ pub fn process_common_job(first: &Eprocess, second: &Eprocess) -> u64 {
     let root = first_job.root_job.get();
     if root == second_job.root_job.get() { root } else { 0 }
 }
+
+/// ZwQueryInformationJobObject(JobHandle, JobObjectInformationClass,
+/// JobObjectInformation, Length, ReturnLength*): sem handle, o job do
+/// processo corrente — fora de um job, como no NT, só as classes 0x1F e
+/// 0x27 seguem e as demais dão STATUS_ACCESS_DENIED; com handle, o objeto
+/// precisa ser um Job (JOB_OBJECT_QUERY). O OpenNT não cria jobs: um handle
+/// válido de outro tipo dá STATUS_OBJECT_TYPE_MISMATCH, um inexistente
+/// STATUS_INVALID_HANDLE, e as classes de silo sem job, que o NT responde
+/// pelo silo hospedeiro, STATUS_NOT_SUPPORTED.
+pub fn query_information_job_object(handle: u64, class: u32) -> u32 {
+    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+    if handle == 0 {
+        // SAFETY: o EPROCESS corrente.
+        let job = unsafe { Eprocess::at(crate::ntos::ps::process::get_current_process()) }.job.get();
+        if job == 0 {
+            return if class.wrapping_sub(0x1F) & !8 == 0 { STATUS_NOT_SUPPORTED } else { STATUS_ACCESS_DENIED };
+        }
+        return STATUS_NOT_SUPPORTED;
+    }
+    let known = matches!(crate::ntos::ob::open_pointer::resolve(handle, false), Some(Ok(_))) || crate::ntos::ps::user::state::get_user_handle(handle).is_some() || crate::ntos::io::file::zw::file_object_of_handle(handle) != 0;
+    if known { STATUS_OBJECT_TYPE_MISMATCH } else { STATUS_INVALID_HANDLE }
+}
