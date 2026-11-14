@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **19 de 44** componentes funcionam; **552 de 774** módulos do plano têm código (538 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.838 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (59,9%).
+Hoje: **20 de 45** componentes funcionam; **552 de 774** módulos do plano têm código (538 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.844 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (60,1%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -79,7 +79,7 @@ Configuration Manager (hives, chaves e valores) e o controle de serviços e driv
 
 ## Fase 6 — loader PE e ntoskrnl (em andamento)
 
-Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys) e o ksecdd.sys.
+Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll), carga dos drivers reais do Windows (i8042prt, kbdclass, mouclass, cng.sys, watchdog.sys), o runtime KMDF (WdfLdr.sys e Wdf01000.sys) e o ksecdd.sys.
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
@@ -95,6 +95,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | cng.sys | Funciona | Drivers do Windows no boot comum |
 | ci.dll (Code Integrity) | Funciona | Driver watchdog.sys real |
 | watchdog.sys | Funciona | Driver watchdog.sys real |
+| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | Runtime KMDF real com o msisadrv.sys |
 | ksecdd.sys | Funciona | Driver ksecdd.sys real |
 
 ## Fase 7 — modo usuário (em andamento)
