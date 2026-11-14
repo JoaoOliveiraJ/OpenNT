@@ -258,6 +258,14 @@ opennt_dbg_prompt_interrupt:
     int3
     ret
 
+# DbgBreakPoint público: o corpo do ntoskrnl 19041 (`int 3; ret`). Folha sem
+# registro de unwind; o despacho de exceções acha o chamador por [RSP].
+.balign 16
+.global opennt_dbg_break_point
+opennt_dbg_break_point:
+    int3
+    ret
+
 # sqrtf público (CRT): argumento e resultado em XMM0. O sqrtf do ntoskrnl
 # 19041 desvia NaN e negativos para o tratamento de erro da CRT, que com as
 # exceções de ponto flutuante mascaradas devolve o mesmo valor que o SQRTSS
@@ -314,6 +322,7 @@ extern "C" {
     static opennt_ob_find_handle_filter: u8;
     static opennt_ob_find_handle_for_object: u8;
     static opennt_dbg_prompt: u8;
+    static opennt_dbg_break_point: u8;
     static opennt_crt_sqrtf: u8;
     static opennt_dbg_command_string: u8;
     static opennt_probe_kernel_stack: u8;
@@ -349,6 +358,7 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "ObpFindHandleForObject" => core::ptr::addr_of!(opennt_ob_find_handle_filter),
             "ob_find_handle_for_object" => core::ptr::addr_of!(opennt_ob_find_handle_for_object),
             "dbg_prompt" => core::ptr::addr_of!(opennt_dbg_prompt),
+            "dbg_break_point" => core::ptr::addr_of!(opennt_dbg_break_point),
             "crt_sqrtf" => core::ptr::addr_of!(opennt_crt_sqrtf),
             "dbg_command_string" => core::ptr::addr_of!(opennt_dbg_command_string),
             "probe_kernel_stack" => core::ptr::addr_of!(opennt_probe_kernel_stack),

@@ -224,6 +224,7 @@ pub fn init() -> Result<(), KernelError> {
     if STATE.lock().initialized {
         return Ok(());
     }
+    super::processor_group::initialize_boot_processor_count();
     let mut discovered = discover_processors();
     let bootstrap = (lapic::read(0x20) >> 24) & 0xFF;
     if discovered.is_empty() {
@@ -283,6 +284,7 @@ pub fn init() -> Result<(), KernelError> {
                 let reported = physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER);
                 debug_print!("[smp] CPU {} online (apicId={})", slot + 1, reported);
                 online.push(slot);
+                super::processor_group::update_processor_count();
             }
             Ok(false) => debug_print!(
                 "[smp] AP apicId={} NAO respondeu ao SIPI (marcadores 16/32/64: {}/{}/{})",

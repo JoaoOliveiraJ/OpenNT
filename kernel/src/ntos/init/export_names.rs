@@ -410,6 +410,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("zw-adjust-privileges-token", 1839, 1),
     ("rtl-self-relative-sd2", 1840, 1),
     ("fsrtl-ecp-initialize", 1841, 2),
+    ("kd-break-point", 1843, 1),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2257,4 +2258,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "RtlSelfRelativeToAbsoluteSD2",
     "FsRtlInitializeExtraCreateParameterList",
     "FsRtlInitializeExtraCreateParameter",
+    "DbgBreakPoint",
 ];

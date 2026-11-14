@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1843 && abi_names::GROUP_LAYOUT.len() == 404 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1843 exports em 404 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1844 && abi_names::GROUP_LAYOUT.len() == 405 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1844 exports em 405 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1455,7 +1455,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1843 && exports::export_names().len() == 1843, "ntoskrnl: 404 grupos com os 1843 exports implementados");
+    assert(exports::implemented() == 1844 && exports::export_names().len() == 1844, "ntoskrnl: 405 grupos com os 1844 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -2680,6 +2680,67 @@ fn kernel_seh_raise_and_unwind(assert: Assert) {
     assert(added.is_ok_and(|added| added == 1) && result.as_ref().is_ok_and(|value| *value as u32 == 0xC000_1234), "seh: ExRaiseStatus despacha ao handler e o RtlUnwindEx transfere ao bloco de tratamento");
     let _ = unwind::delete_function_table(base + 0x1500);
     let _ = image.release();
+}
+
+/// DbgBreakPoint (o corpo `int 3; ret` do ntoskrnl, publicado no EAT) e a
+/// célula ULONG KeNumberProcessors da `.kdata`.
+fn kd_break_point_and_processor_count(assert: Assert) {
+    use crate::ntos::init::exports;
+    use crate::ntos::ke::smp;
+    use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
+    use crate::ntos::mm::{kernel_address, kernel_data, memory_map};
+    use crate::ntos::rtl::{native_context, unwind};
+    let name = guest::alloc_bytes(0x40);
+    let eat = |text: &[u8]| {
+        guest::write_bytes(name, text);
+        call_export("RtlFindExportedRoutineByName", &[memory_map::KERNEL_VIRTUAL_BASE, name]).unwrap_or(0)
+    };
+    let entry = crate::hal::amd64::private_entries::entry("dbg_break_point").and_then(|entry| kernel_address::image_address(entry).ok()).unwrap_or(0);
+    let resolved = matches!(exports::lookup("ntoskrnl.exe", "DbgBreakPoint"), Some(ResolvedImport::Address { address, .. }) if address == entry);
+    assert(entry != 0 && resolved && eat(b"DbgBreakPoint\0") == entry && crate::hal::volatile::read_bytes(entry, 2) == [0xCC, 0xC3], "kd: DbgBreakPoint publica o corpo nativo int 3; ret no EAT e no resolvedor");
+    // F (0x1300): sub rsp,28h; call [DbgBreakPoint]; add rsp,28h; xor eax,eax;
+    // ret. Bloco de tratamento (0x1311): add rsp,28h; ret. O handler de
+    // linguagem (0x1330) desenrola até o bloco com o ExceptionCode em RAX.
+    let mut bytes = ntoskrnl_importer(b"DbgBreakPoint\0");
+    for byte in &mut bytes[0x4442..0x4480] {
+        *byte = 0;
+    }
+    bytes[0x4442..0x444E].copy_from_slice(b"RtlUnwindEx\0");
+    let rel = |from_next: usize, to: usize| ((to as i64 - from_next as i64) as i32).to_le_bytes();
+    let mut f = alloc::vec![0x48, 0x83, 0xEC, 0x28, 0xFF, 0x15];
+    f.extend_from_slice(&rel(0x130A, 0x4200));
+    f.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x31, 0xC0, 0xC3, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+    bytes[0x1300..0x1300 + f.len()].copy_from_slice(&f);
+    let mut handler = alloc::vec![0x48, 0x83, 0xEC, 0x38, 0x48, 0x89, 0xC8, 0x48, 0x89, 0xD1, 0x48, 0x8D, 0x15];
+    handler.extend_from_slice(&rel(0x1341, 0x1311));
+    handler.extend_from_slice(&[0x49, 0x89, 0xC0, 0x44, 0x8B, 0x08, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0, 0xFF, 0x15]);
+    handler.extend_from_slice(&rel(0x135F, 0x4210));
+    handler.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+    bytes[0x1330..0x1330 + handler.len()].copy_from_slice(&handler);
+    bytes[0x1400..0x1404].copy_from_slice(&[0x09, 0x04, 0x01, 0x00]);
+    bytes[0x1404..0x1406].copy_from_slice(&(4u16 | (2 << 8) | (4 << 12)).to_le_bytes());
+    bytes[0x1408..0x140C].copy_from_slice(&0x1330u32.to_le_bytes());
+    bytes[0x1500..0x1504].copy_from_slice(&0x1300u32.to_le_bytes());
+    bytes[0x1504..0x1508].copy_from_slice(&0x1320u32.to_le_bytes());
+    bytes[0x1508..0x150C].copy_from_slice(&0x1400u32.to_le_bytes());
+    match loader::load(bytes, &LoadOptions { image_name: Some(String::from("opennt-break-point.sys")), ..Default::default() }) {
+        Ok(mut image) => {
+            let base = image.image_base;
+            let added = unwind::add_function_table(base + 0x1500, 1, base);
+            let result = native_context::call(base + 0x1300, &[], 0);
+            assert(added.is_ok_and(|added| added == 1) && result.as_ref().is_ok_and(|value| *value as u32 == 0x8000_0003), "kd: DbgBreakPoint levanta STATUS_BREAKPOINT para o handler do chamador");
+            let _ = unwind::delete_function_table(base + 0x1500);
+            let _ = image.release();
+        }
+        Err(_) => assert(false, "kd: imagem do DbgBreakPoint carregada"),
+    }
+    // KeNumberProcessors: a célula da .kdata, a mesma no EAT e no resolvedor,
+    // com 1 pelo BSP mais 1 por AP que subiu; o byte baixo é o CCHAR legado.
+    let cell = kernel_data::address("KeNumberProcessors").unwrap_or(0);
+    let resolved = matches!(exports::lookup("ntoskrnl.exe", "KeNumberProcessors"), Some(ResolvedImport::Address { address, .. }) if address == cell);
+    let count = smp::online_cpu_count() as u64;
+    assert(cell != 0 && resolved && eat(b"KeNumberProcessors\0") == cell && kernel_data::read("KeNumberProcessors") == count && guest::read8(cell) as u64 == count, "ke: KeNumberProcessors e a celula ULONG da .kdata publicada no EAT");
+    guest::free_bytes(name);
 }
 
 fn rtl_support_modules(assert: Assert) {
@@ -12939,6 +13000,7 @@ pub fn run(assert: Assert) {
     image_verification_callbacks(assert);
     rtl_unwind_dynamic_table(assert);
     kernel_seh_raise_and_unwind(assert);
+    kd_break_point_and_processor_count(assert);
     rtl_support_modules(assert);
     rtl_group_exports(assert);
     ntoskrnl_spin_lock_family(assert);

@@ -131,6 +131,11 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // POBJECT_TYPE das partições de memória (ALMOSTRO), gravado quando a
     // partição do sistema é publicada.
     pointer("PsPartitionType"),
+    // KeNumberProcessors: o ntoskrnl 19041 guarda um ULONG (o
+    // KiInitializeBootStructures do BSP grava 1 e o KiUpdateProcessorCount
+    // soma 1 por processador que sobe); o export legado é lido como CCHAR, o
+    // byte baixo.
+    KernelDataEntry { name: "KeNumberProcessors", size: 4, storage_size: 4, alignment: 4, initial: &[0; 4] },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

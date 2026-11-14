@@ -35,6 +35,23 @@ pub static GROUP: Group = Group {
     data_exports: &[("KdDebuggerEnabled", debugger::debugger_enabled_address), ("KdDebuggerNotPresent", debugger::debugger_not_present_address), ("KdEnteredDebugger", debugger::entered_debugger_address)],
 };
 
+pub mod kd_break_point {
+    //! DbgBreakPoint.
+    //!
+    //! A resolução de exports publica o corpo nativo com `int 3`; a chamada
+    //! pela tabela entra nesse mesmo corpo (`ntos::kd::debugger::break_point`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::kd::debugger;
+    use crate::rtl::KernelError;
+
+    fn break_point(_: &Call) -> Result<u64, KernelError> {
+        debugger::break_point().map(|_| 0)
+    }
+
+    pub static GROUP: Group = Group { name: "kd-break-point", names: &["DbgBreakPoint"], handlers: &[break_point], data_exports: &[] };
+}
+
 pub mod debug_prompt {
     //! DbgPrompt.
     //!

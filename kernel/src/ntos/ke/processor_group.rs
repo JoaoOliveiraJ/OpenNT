@@ -2,38 +2,37 @@
 //!
 //! O código dos drivers roda no processador de boot (KeGetCurrentProcessorNumber
 //! é 0). Os processadores ativos são os da MADT que subiram, todos no grupo 0
-//! e no nó NUMA 0 (sem SRAT). KeNumberProcessors é uma célula u32 gravada no
-//! primeiro acesso, depois do SMP.
+//! e no nó NUMA 0 (sem SRAT). KeNumberProcessors é a célula ULONG real da
+//! imagem: 1 pelo processador de boot e mais 1 por processador que sobe.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use super::smp;
 use crate::ntos::inc::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use crate::ntos::inc::types::{Field, GroupAffinity, NtStruct, ProcessorNumber};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_data;
 
 /// ALL_PROCESSOR_GROUPS.
 const ALL_PROCESSOR_GROUPS: u32 = 0xFFFF;
 
-/// KeNumberProcessors: célula u32 gravada no primeiro acesso (depois do SMP).
-static NUMBER_PROCESSORS: AtomicU64 = AtomicU64::new(0);
-
-/// KeNumberProcessors: endereço da célula do export de dados.
+/// KeNumberProcessors: a célula ULONG da imagem do kernel (`.kdata`), a mesma
+/// que a tabela de exports publica.
 pub fn number_processors_cell() -> u64 {
-    let current = NUMBER_PROCESSORS.load(Ordering::Acquire);
-    if current != 0 {
-        return current;
-    }
-    let pointer = guest::alloc_bytes(4);
-    // SAFETY: célula recém-alocada do export de dados.
-    unsafe { Field::<u32>::at(pointer) }.set(smp::online_cpu_count() as u32);
-    match NUMBER_PROCESSORS.compare_exchange(0, pointer, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => pointer,
-        Err(existing) => {
-            guest::free_bytes(pointer);
-            existing
-        }
-    }
+    kernel_data::required_address("KeNumberProcessors")
+}
+
+/// O processador de boot conta como o primeiro, como o
+/// KiInitializeBootStructures do processador 0 (KeNumberProcessors = 1).
+pub fn initialize_boot_processor_count() {
+    // SAFETY: célula ULONG da imagem do kernel.
+    unsafe { Field::<u32>::at(number_processors_cell()) }.set(1);
+}
+
+/// Um processador de aplicação subiu: soma 1, como o KiUpdateProcessorCount.
+pub fn update_processor_count() {
+    // SAFETY: célula ULONG da imagem do kernel; outras CPUs só a leem.
+    unsafe { Field::<u32>::at(number_processors_cell()) }.atomic().fetch_add(1, Ordering::SeqCst);
 }
 
 /// Bit N = processador N ativo (o BSP sempre).

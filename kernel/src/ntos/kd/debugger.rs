@@ -4,7 +4,8 @@
 //! /DEBUG (KdDebuggerEnabled=FALSE, KdEnableDebugger=ACCESS_DENIED,
 //! KdChangeOption=DEBUGGER_INACTIVE). KdDebuggerEnabled, KdDebuggerNotPresent
 //! e KdEnteredDebugger são as células reais da imagem do kernel. O DbgPrompt
-//! entra no corpo nativo com `int 0x2D` e no tratamento real de exceções.
+//! entra no corpo nativo com `int 0x2D` e o DbgBreakPoint no `int 3`, os dois
+//! no tratamento real de exceções.
 
 use crate::hal::amd64::{native_call, private_entries};
 use crate::ntos::mm::{kernel_address, kernel_data};
@@ -54,6 +55,16 @@ pub fn debugger_not_present_address() -> u64 {
 /// Célula do export de dados KdEnteredDebugger.
 pub fn entered_debugger_address() -> u64 {
     data_address("KdEnteredDebugger")
+}
+
+/// DbgBreakPoint: o corpo nativo é o do ntoskrnl 19041 (`int 3; ret`). Sem
+/// KD, a exceção STATUS_BREAKPOINT segue pelo despacho de exceções de kernel:
+/// um handler do chamador a trata; sem handler, KMODE_EXCEPTION_NOT_HANDLED.
+pub fn break_point() -> Result<(), KernelError> {
+    let entry = private_entries::entry("dbg_break_point").ok_or_else(|| KernelError::new("DbgBreakPoint native body is missing"))?;
+    let address = kernel_address::image_address(entry)?;
+    native_call::call(address, &[]);
+    Ok(())
 }
 
 /// DbgPrompt(Prompt, Response, Length): os três argumentos vão ao corpo
