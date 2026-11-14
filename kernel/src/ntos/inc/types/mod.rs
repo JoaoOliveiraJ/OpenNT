@@ -76,6 +76,7 @@ pub mod extra_ob_alpc;
 pub mod extra_ob_header;
 pub mod extra_obpsse;
 pub mod extra_ps_user;
+pub mod extra_cm_hive;
 pub mod extra_rtl;
 pub mod extra_se_cm;
 pub mod extra_storage;

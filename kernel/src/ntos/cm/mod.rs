@@ -1,6 +1,7 @@
 //! Configuration Manager (Cm).
 //!
-//! Hive em memória, objetos de chave, serviços e provedores de boot.
+//! O namespace do Registro, as hives de arquivo (formato regf), os objetos
+//! de chave, os serviços e os provedores de boot.
 
 use crate::ntos::inc::types::{Field, NtStruct};
 
@@ -21,6 +22,7 @@ pub mod feature_usage;
 pub mod feature_usage_buffer;
 pub mod feature_usage_delivery;
 pub mod graphics_defaults;
+pub mod hive;
 pub mod hw_description;
 pub mod key;
 pub mod service;
