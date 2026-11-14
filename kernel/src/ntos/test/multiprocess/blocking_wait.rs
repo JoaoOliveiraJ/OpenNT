@@ -38,13 +38,13 @@ type Assert = fn(bool, &str);
 /// Os serviços de teste: índices 0-3 da tabela 1.
 const WAIT_SERVICE: u32 = 0x1000;
 const SIGNAL_SERVICE: u32 = 0x1001;
-const EXIT_SERVICE: u32 = 0x1002;
+pub(super) const EXIT_SERVICE: u32 = 0x1002;
 const TERMINATE_SERVICE: u32 = 0x1003;
 /// O resultado da espera antes de o serviço publicá-lo.
 const UNSET: u32 = 0xFFFF_FFFF;
 /// Onde a thread 1 guarda, no anel 3, o RAX devolvido pela syscall de espera.
 const RESULT_OFFSET: u64 = 0x800;
-const KTHREAD_WAITING: u8 = 5;
+pub(super) const KTHREAD_WAITING: u8 = 5;
 
 /// A tabela compactada dos serviços, na imagem do kernel (a entrada é
 /// relativa à tabela e só alcança ±128 MB).
@@ -116,7 +116,7 @@ extern "win64" fn signal_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
 }
 
 /// NtTerminateThread da thread corrente.
-extern "win64" fn exit_service(code: u64, _: u64, _: u64, _: u64) -> u64 {
+pub(super) extern "win64" fn exit_service(code: u64, _: u64, _: u64, _: u64) -> u64 {
     state::handler("NtTerminateThread").map_or(0xC000_0001, |handler| handler(0, code, 0, 0, 0).unwrap_or(0xC000_0001)) as u64
 }
 
@@ -137,7 +137,7 @@ fn syscall(program: &mut Vec<u8>, service: u32) {
 
 /// Uma syscall, opcionalmente `mov [rip+..], eax` para a célula de resultado
 /// (o programa começa em `code + start`), a syscall de saída e `jmp $`.
-fn program(service: u32, start: u64, store_result: bool) -> Vec<u8> {
+pub(super) fn program(service: u32, start: u64, store_result: bool) -> Vec<u8> {
     let mut program = Vec::new();
     syscall(&mut program, service);
     if store_result {
@@ -152,7 +152,7 @@ fn program(service: u32, start: u64, store_result: bool) -> Vec<u8> {
 
 /// Uma thread de usuário GUI do processo corrente, com pilha de kernel
 /// própria, contada no EPROCESS (o término a desconta).
-fn user_thread(process_pointer: u64, start: u64) -> Option<Arc<UserThread>> {
+pub(super) fn user_thread(process_pointer: u64, start: u64) -> Option<Arc<UserThread>> {
     let stack = kernel_stack::create(false).ok()?;
     let pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, Some(stack)).ok()?;
     // SAFETY: ETHREAD recém-criada, retida pela thread de usuário.
@@ -167,7 +167,7 @@ fn user_thread(process_pointer: u64, start: u64) -> Option<Arc<UserThread>> {
 
 /// A parceira: CONTEXT próprio, registrada no despacho e suspensa até a
 /// thread 1 entrar no serviço de espera.
-fn prepare_partner(thread: &Arc<UserThread>, start: u64, stack_top: u64) -> bool {
+pub(super) fn prepare_partner(thread: &Arc<UserThread>, start: u64, stack_top: u64) -> bool {
     let context = guest::alloc_bytes(threads::CONTEXT_SIZE);
     if context == 0 {
         return false;
@@ -198,7 +198,7 @@ struct Outcome {
 }
 
 /// Memória de usuário do processo corrente (`protect`: 0x40 RWX, 4 RW).
-fn allocate(size: u64, protect: u32) -> u64 {
+pub(super) fn allocate(size: u64, protect: u32) -> u64 {
     let scratch = guest::alloc_bytes(16);
     if scratch == 0 {
         return 0;

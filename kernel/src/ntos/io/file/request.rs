@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::io::{cancel, io_manager};
-use crate::ntos::ke::{apc, dispatcher, irql};
+use crate::ntos::ke::{apc, context_switch, dispatcher, irql, thread_alert};
 use crate::ntos::mm::io_pins::{self, Pin};
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::objects::file as file_objects;
@@ -20,7 +20,7 @@ use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::Field;
-use crate::ntos::inc::types::{FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
+use crate::ntos::inc::types::{Ethread, FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
 
 /// MDL_PAGES_LOCKED | MDL_MAPPED_TO_SYSTEM_VA.
 const MDL_PAGES_LOCKED_AND_MAPPED: i16 = 0x0002 | 0x0001;
@@ -290,6 +290,58 @@ pub fn pump() {
     }
 }
 
+/// FO_ALERTABLE_IO: o arquivo foi aberto para E/S síncrona alertável.
+pub const FO_ALERTABLE_IO: u32 = 0x04;
+
+/// A ETHREAD `thread` foi terminada (CrossThreadFlags.Terminated).
+fn terminated(thread: u64) -> bool {
+    // SAFETY: a thread dona da requisição, retida por ela.
+    thread != 0 && unsafe { Ethread::at(thread) }.terminated() != 0
+}
+
+/// A espera de uma requisição síncrona pendente, como a do evento do
+/// FILE_OBJECT no IopSynchronousServiceTail: a thread `thread` (a corrente)
+/// espera a conclusão — dentro de uma syscall ela bloqueia e sai da fila de
+/// prontas até o despachante ver a requisição concluída
+/// (`context_switch::wait_until`); fora dela gira o `pump_kernel`, com as
+/// interrupções de dispositivo. Com `alertable` (FO_ALERTABLE_IO) a espera
+/// é alertável no modo `mode`: um alerta ou uma APC de usuário a interrompe.
+/// Interrompida (alerta, APC de usuário ou término da thread), a requisição é
+/// cancelada e a espera continua, não alertável, até a conclusão (o
+/// IopCancelAlertedRequest e o IoCancelThreadIo do NT).
+pub fn wait_finished(request: &Shared, thread: u64, alertable: bool, mode: u8) {
+    let finished = || request.lock().finished;
+    let mut poll = || {
+        pump();
+        if finished() {
+            Some(0)
+        } else {
+            terminated(thread).then_some(context_switch::STATUS_THREAD_IS_TERMINATING)
+        }
+    };
+    if alertable {
+        thread_alert::cooperate(thread, mode, true, &mut poll, dispatcher::pump_kernel);
+    } else {
+        context_switch::wait_until(&mut poll, dispatcher::pump_kernel);
+    }
+    if finished() {
+        return;
+    }
+    let irp = request.lock().irp;
+    if irp != 0 {
+        let _ = cancel::irp(irp);
+    }
+    while !finished() {
+        context_switch::wait_until(
+            &mut || {
+                pump();
+                finished().then_some(0)
+            },
+            dispatcher::pump_kernel,
+        );
+    }
+}
+
 /// MDL das páginas fixadas do buffer de saída (METHOD_*_DIRECT).
 pub fn fill_mdl(request: &Shared, write: bool) -> Result<bool, KernelError> {
     let mut r = request.lock();
@@ -372,14 +424,17 @@ pub fn rundown(thread: u64) {
             let _ = cancel::irp(irp);
         }
     }
-    while owned.iter().any(|request| !request.lock().finished) {
-        for request in &owned {
-            let _ = finish(request);
-        }
-        if owned.iter().any(|request| !request.lock().finished) {
-            dispatcher::pump_kernel();
-        }
-    }
+    // Espera as conclusões (o IoCancelThreadIo): bloqueia numa syscall,
+    // gira o pump fora dela.
+    context_switch::wait_until(
+        &mut || {
+            for request in &owned {
+                let _ = finish(request);
+            }
+            owned.iter().all(|request| request.lock().finished).then_some(0)
+        },
+        dispatcher::pump_kernel,
+    );
 }
 
 pub fn init() {

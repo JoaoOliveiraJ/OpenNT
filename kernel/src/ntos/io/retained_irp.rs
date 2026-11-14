@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{cancel, io_manager};
-use crate::ntos::ke::dispatcher;
+use crate::ntos::ke::{context_switch, dispatcher};
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -56,15 +56,16 @@ pub fn dispatch(device: u64, irp: u64, stack: u64, event: u64, routine: u64) -> 
         return Ok(Some(if status & 0x8000_0000 != 0 { status } else { 0xC000_0010 }));
     }
     if status == 0x103 {
+        // A espera do evento da conclusão: bloqueia numa syscall, gira o pump
+        // fora dela. A thread terminada no meio cancela o IRP e espera a
+        // conclusão do cancelamento.
         let thread = process::get_current_thread();
-        while dispatcher::try_wait_objects(&[event], 1).is_none() {
-            // SAFETY: a thread corrente.
-            if unsafe { Ethread::at(thread) }.terminated() != 0 {
-                cancel::irp(irp)?;
-                dispatcher::wait_for_single_object(event, 0, 0, false);
-                break;
-            }
-            dispatcher::pump_kernel();
+        // SAFETY: a thread corrente.
+        let terminated = || unsafe { Ethread::at(thread) }.terminated() != 0;
+        let mut poll = || dispatcher::try_wait_objects(&[event], 1).or_else(|| terminated().then_some(context_switch::STATUS_THREAD_IS_TERMINATING));
+        if context_switch::wait_until(&mut poll, dispatcher::pump_kernel) == context_switch::STATUS_THREAD_IS_TERMINATING {
+            cancel::irp(irp)?;
+            dispatcher::wait_for_single_object(event, 0, 0, false);
         }
     }
     Ok(None)

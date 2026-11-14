@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 
 use crate::ntos::io::file::request::{self as file_request, Shared};
 use crate::ntos::io::file::read::probe;
-use crate::ntos::io::{cancel, io_manager};
+use crate::ntos::io::io_manager;
 use crate::ntos::io::file::{information as file_information, query as query_file};
 use crate::hal::amd64::native_call;
 use crate::ntos::ke::{dispatcher, irql};
@@ -19,7 +19,7 @@ use crate::ntos::ps::{previous_mode, process};
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{DeviceObject, DriverObject, Ethread, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, IopFileObjectExtension, Irp, Kthread, LargeInteger, NtStruct};
+use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, IopFileObjectExtension, Irp, Kthread, LargeInteger, NtStruct};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 use crate::ntos::io::file::zw as zw_files;
 
@@ -336,20 +336,7 @@ pub fn write(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_sta
             dispatch(&request, device, offset, key, flags)?
         };
         if status == 0x103 && synchronous {
-            loop {
-                file_request::pump();
-                if request.lock().finished {
-                    break;
-                }
-                // SAFETY: a thread corrente.
-                if unsafe { Ethread::at(thread) }.terminated() != 0 {
-                    let irp = request.lock().irp;
-                    if irp != 0 {
-                        let _ = cancel::irp(irp);
-                    }
-                }
-                dispatcher::pump_kernel();
-            }
+            file_request::wait_finished(&request, thread, flags & file_request::FO_ALERTABLE_IO != 0, mode);
             return Ok(request.lock().status);
         }
         let r = request.lock();

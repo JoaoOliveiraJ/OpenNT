@@ -407,7 +407,19 @@ monta um quadro de despachante novo e entra no quadro salvo) em vez de entrar
 no anel 3; a syscall termina o intervalo como qualquer outra. Passam por aí
 KeWaitForSingleObject/Multiple (alertáveis ou não), KeDelayExecutionThread,
 fast/guarded mutex, ERESOURCE, push locks e rundown
-(`context_switch::wait_until`/`acquire_until`); fora de uma syscall (boot,
+(`context_switch::wait_until`/`acquire_until`), KeRemoveQueue/
+KeRemoveQueueEx (`ke/queue.rs`: a entrada disponível vence o alerta; prazo,
+alerta e APC de usuário na alertável devolvem o status e a thread volta a
+ocupar a vaga) e as esperas de conclusão de E/S: a E/S síncrona de
+NtReadFile, NtWriteFile e ZwDeviceIoControlFile (`io/file/request.rs::
+wait_finished`, o evento do FILE_OBJECT do IopSynchronousServiceTail,
+alertável com FO_ALERTABLE_IO; interrompida por alerta, APC de usuário ou
+término da thread, cancela o IRP e espera a conclusão sem alerta), o IRP
+retido com evento de conclusão, a saída de thread com E/S pendente e o
+ZwRemoveIoCompletionEx. O despachante sonda a espera da bloqueada no
+contexto dela e roda o `pump_kernel`, com as interrupções de dispositivo
+abaixo de DISPATCH_LEVEL (`interrupt_object::service_during_wait`), a cada
+volta; fora de uma syscall (boot,
 threads de sistema, APCs e conclusões drenadas pelo despachante) a espera
 continua girando o pump. Como no NT, esperar de fato com prazo não nulo em
 DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema (assert).
@@ -423,7 +435,13 @@ real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
 dentro da pilha dela) e sinaliza o evento; a 1 volta na própria pilha com
 STATUS_SUCCESS e devolve 0 ao anel 3. Um segundo cenário termina a thread
-bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha).
+bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha). O autoteste
+`ntos/test/multiprocess/queue_wait.rs` faz o mesmo com o KeRemoveQueue: a
+thread que espera na fila fica parada (CycleTime constante) enquanto a
+outra gira 50 ms e insere, e volta com a entrada; com prazo de 100 ms e
+ninguém inserindo, volta com STATUS_TIMEOUT sem gastar a espera em ciclos;
+no KeRemoveQueueEx alertável em UserMode, o NtAlertThread da outra a
+interrompe com STATUS_ALERTED; nos três a vaga da fila volta.
 
 **Despachante de todos os processos.** Um despachante só serve as threads
 de usuário de todos os processos vivos (`ps/user/threads.rs`):

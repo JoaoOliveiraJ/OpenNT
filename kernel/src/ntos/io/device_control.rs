@@ -7,7 +7,7 @@
 use alloc::boxed::Box;
 
 use crate::ntos::io::file::request::{self as file_request, Shared};
-use super::{cancel, io_manager};
+use super::io_manager;
 use crate::ntos::io::file::{information as file_information, query as query_file};
 use crate::hal::amd64::native_call;
 use crate::ntos::ke::{apc, dispatcher, irql};
@@ -16,7 +16,7 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{DeviceObject, DriverObject, Ethread, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, Irp, Kthread, NtStruct};
+use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, Irp, Kthread, NtStruct};
 use crate::ntos::io::irp_builder::{self, BuildOptions, DeviceControl};
 
 const TAG: u32 = 0x7443_6F49;
@@ -231,20 +231,8 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
             return Ok(status);
         }
         if status == 0x103 && synchronous {
-            loop {
-                file_request::pump();
-                if request.lock().finished {
-                    break;
-                }
-                // SAFETY: a thread corrente.
-                if unsafe { Ethread::at(thread) }.terminated() != 0 {
-                    let packet = request.lock().irp;
-                    if packet != 0 {
-                        let _ = cancel::irp(packet);
-                    }
-                }
-                dispatcher::pump_kernel();
-            }
+            // ZwDeviceIoControlFile: a espera síncrona de KernelMode.
+            file_request::wait_finished(&request, thread, file_at(file).flags.get() & file_request::FO_ALERTABLE_IO != 0, 0);
             return Ok(request.lock().status);
         }
         let r = request.lock();

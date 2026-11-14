@@ -23,3 +23,4 @@ pub mod user_callback;
 pub mod process_queries;
 pub mod ipi_stall;
 pub mod current_thread;
+pub mod queue_wait;

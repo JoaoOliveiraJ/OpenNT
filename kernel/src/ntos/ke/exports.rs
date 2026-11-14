@@ -908,11 +908,11 @@ pub mod ke_queues {
     }
     /// KeRemoveQueue(Queue, WaitMode, Timeout).
     fn remove_queue(call: &Call) -> Result<u64, KernelError> {
-        queue::remove(kqueue(call.arg(1)), call.arg(3))
+        queue::remove(kqueue(call.arg(1)), call.arg(2) as u8, call.arg(3))
     }
     /// KeRemoveQueueEx(Queue, WaitMode, Alertable, Timeout, Array, Count).
     fn remove_queue_ex(call: &Call) -> Result<u64, KernelError> {
-        Ok(queue::remove_ex(kqueue(call.arg(1)), call.arg(4), call.arg(5), call.arg(6) as u32)? as u64)
+        Ok(queue::remove_ex(kqueue(call.arg(1)), call.arg(2) as u8, call.arg(3) & 0xFF != 0, call.arg(4), call.arg(5), call.arg(6) as u32)? as u64)
     }
     fn rundown_queue(call: &Call) -> Result<u64, KernelError> {
         Ok(queue::rundown(kqueue(call.arg(1))))

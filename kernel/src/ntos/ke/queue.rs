@@ -21,17 +21,24 @@
 //!   (`lock bts` no bit 8 do cabeçalho) e desassocia as threads
 //!   (CurrentCount 0).
 //!
-//! A espera é a cooperativa do `dispatcher` (o mesmo laço do
-//! KeWaitForSingleObject). Limites: alertas e APCs de usuário não encerram
-//! a espera; uma thread associada que espera outro objeto não libera a vaga
-//! (o KiActivateWaiterQueue do NT depende de ganchos do escalonador);
+//! A espera é a do KeWaitForSingleObject (`context_switch::wait_until`, ou
+//! `thread_alert::cooperate` na alertável): dentro de uma syscall a thread
+//! sai da fila de prontas e deixa a CPU (o KiSwapContext do OpenNT) até o
+//! despachante, que sonda a fila no contexto dela, achar a entrada inserida
+//! por um KeInsertQueue, o prazo vencer ou um alerta chegar; fora de uma
+//! syscall a espera gira o `pump_kernel` (interrupções de dispositivo abaixo
+//! de DISPATCH_LEVEL, timers, DPCs, work items). Como no NT, uma entrada
+//! disponível vence o alerta; a espera alertável termina com STATUS_ALERTED
+//! (ou STATUS_USER_APC em UserMode) e a thread volta a ocupar a vaga. Limites:
+//! uma thread associada que espera outro objeto não libera a vaga (o
+//! KiActivateWaiterQueue do NT depende de ganchos do escalonador);
 //! KeWaitForSingleObject direto numa KQUEUE não está no
 //! `dispatcher::acquire_status`.
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::{bugcheck, clock, dispatcher, smp};
+use super::{bugcheck, clock, context_switch, dispatcher, smp, thread_alert};
 use crate::ntos::inc::types::{Kqueue, Kthread, ListEntry, NtStruct};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
@@ -39,8 +46,8 @@ use crate::rtl::{KernelError, SpinLock};
 /// QueueObject e o Size (0x40 / 4) do KeInitializeQueue.
 const QUEUE_OBJECT: u8 = 4;
 const QUEUE_SIZE_DWORDS: u8 = 0x10;
-const STATUS_ABANDONED: u64 = 0x80;
-const STATUS_TIMEOUT: u64 = 0x102;
+const STATUS_ABANDONED: u32 = 0x80;
+const STATUS_TIMEOUT: u32 = 0x102;
 /// KERNEL_SECURITY_CHECK_FAILURE / FAST_FAIL_CORRUPT_LIST_ENTRY.
 const KERNEL_SECURITY_CHECK_FAILURE: u32 = 0x139;
 const FAST_FAIL_CORRUPT_LIST_ENTRY: u64 = 3;
@@ -144,8 +151,9 @@ pub fn insert_entry(queue: &Kqueue, entry: &ListEntry, at_head: bool) -> i32 {
     previous
 }
 
-/// Corpo de KeRemoveQueueEx: as entradas retiradas, ou [status].
-pub fn remove_entries(queue: &Kqueue, timeout_pointer: u64, count: u32) -> Result<Vec<u64>, KernelError> {
+/// Corpo de KeRemoveQueueEx: as entradas retiradas, ou [status]. `wait_mode`
+/// e `alertable` são os do KeRemoveQueueEx (KeRemoveQueue: não alertável).
+pub fn remove_entries(queue: &Kqueue, timeout_pointer: u64, count: u32, wait_mode: u8, alertable: bool) -> Result<Vec<u64>, KernelError> {
     let address = process::get_current_thread();
     if address == 0 {
         return Err(KernelError::new("KeRemoveQueue requires a current KTHREAD"));
@@ -175,36 +183,57 @@ pub fn remove_entries(queue: &Kqueue, timeout_pointer: u64, count: u32) -> Resul
             insert(&queue.thread_list_head, &thread.queue_list_entry, false);
         }
     }
-    loop {
-        {
-            let _lock = OBJECT_LOCK.lock();
-            if queue.header.abandoned() != 0 {
-                return Ok(alloc::vec![STATUS_ABANDONED]);
-            }
-            if available(queue) && queue.current_count.get() < queue.maximum_count.get() {
-                adjust_current(queue, 1);
-                return Ok(take(queue, count));
-            }
-            if timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline) {
-                // A thread volta a ficar ativa na fila ao retomar.
-                adjust_current(queue, 1);
-                return Ok(alloc::vec![STATUS_TIMEOUT]);
+    // Uma tentativa: fila desmontada, entrada com vaga livre (a vaga é
+    // ocupada) ou, com `check_timeout`, prazo vencido.
+    let mut taken = None;
+    let mut attempt = |check_timeout: bool| -> Option<u32> {
+        let _lock = OBJECT_LOCK.lock();
+        if queue.header.abandoned() != 0 {
+            return Some(STATUS_ABANDONED);
+        }
+        if available(queue) && queue.current_count.get() < queue.maximum_count.get() {
+            adjust_current(queue, 1);
+            taken = Some(take(queue, count));
+            return Some(0);
+        }
+        let expired = timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline);
+        (check_timeout && expired).then_some(STATUS_TIMEOUT)
+    };
+    // Uma entrada disponível vence o alerta; senão a espera do NT: o alerta
+    // (na alertável) e então a fila e o prazo.
+    let status = match attempt(false) {
+        Some(status) => status,
+        None => {
+            let mut poll = || attempt(true);
+            if alertable {
+                thread_alert::cooperate(address, wait_mode, true, &mut poll, dispatcher::pump_kernel)
+            } else {
+                context_switch::wait_until(&mut poll, dispatcher::pump_kernel)
             }
         }
-        dispatcher::pump_kernel();
+    };
+    if let Some(entries) = taken {
+        return Ok(entries);
     }
+    // Prazo, alerta, APC de usuário ou término: a thread volta a ficar ativa
+    // na fila (a desmontada já a desassociou).
+    if status != STATUS_ABANDONED {
+        let _lock = OBJECT_LOCK.lock();
+        adjust_current(queue, 1);
+    }
+    Ok(alloc::vec![status as u64])
 }
 
 /// KeRemoveQueue(Queue, WaitMode, Timeout): a entrada, ou o status como
-/// ponteiro.
-pub fn remove(queue: &Kqueue, timeout_pointer: u64) -> Result<u64, KernelError> {
-    Ok(remove_entries(queue, timeout_pointer, 1)?.first().copied().unwrap_or(0))
+/// ponteiro. Não alertável.
+pub fn remove(queue: &Kqueue, wait_mode: u8, timeout_pointer: u64) -> Result<u64, KernelError> {
+    Ok(remove_entries(queue, timeout_pointer, 1, wait_mode, false)?.first().copied().unwrap_or(0))
 }
 
 /// KeRemoveQueueEx(Queue, WaitMode, Alertable, Timeout, Array, Count):
 /// grava as entradas (ou o status) no vetor e devolve quantas.
-pub fn remove_ex(queue: &Kqueue, timeout_pointer: u64, array: u64, count: u32) -> Result<u32, KernelError> {
-    let entries = remove_entries(queue, timeout_pointer, count)?;
+pub fn remove_ex(queue: &Kqueue, wait_mode: u8, alertable: bool, timeout_pointer: u64, array: u64, count: u32) -> Result<u32, KernelError> {
+    let entries = remove_entries(queue, timeout_pointer, count, wait_mode, alertable)?;
     // SAFETY: PLIST_ENTRY EntryArray[Count] do chamador (modo kernel); no
     // máximo `count` posições são gravadas.
     let slots = unsafe { crate::ntos::inc::types::Field::<u64>::array_at(array, entries.len()) };
