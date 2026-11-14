@@ -18,6 +18,8 @@ use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ob::object_manager;
 use crate::ntos::po::power_manager;
+use crate::ntos::ps::user::process_state;
+use crate::ntos::ps::{process, process_context};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::Field;
@@ -175,6 +177,29 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
     native_call::call(handler, &[device, packet]) as i32
 }
 
+/// O IOSB e o buffer de um pedido de modo usuário são memória do processo
+/// da thread que pediu (Irp->Tail.Overlay.Thread): a cópia final roda nele,
+/// como a APC de conclusão do NT, anexada quando a conclusão chega em outro
+/// contexto (um pump, uma DPC). Um processo que já saiu não recebe a cópia
+/// (a VA pode ser de outro); endereços da metade de sistema não dependem do
+/// processo.
+fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce()) {
+    let user = addresses.iter().any(|&address| address != 0 && address < guest::USER_HALF_END);
+    let thread = irp.tail.overlay.thread.get();
+    let requester = if user && thread != 0 { process::thread_record(thread).map(|record| record.process) } else { None };
+    match requester {
+        Some(owner) if owner != process::get_current_process() => {
+            if process_state::get(owner).is_none() {
+                return;
+            }
+            if let Err(error) = process_context::with_process(owner, copy_back) {
+                debug_print!("[iom] conclusao sem anexar ao processo {:#x}: {}", owner, error);
+            }
+        }
+        _ => copy_back(),
+    }
+}
+
 /// IofCompleteRequest (NT/ReactOS): do slot atual ao topo, chama as rotinas
 /// de conclusão marcadas para o resultado com o DeviceObject do slot acima;
 /// o IRP sobe um nível antes de cada chamada e MORE_PROCESSING_REQUIRED
@@ -227,18 +252,20 @@ pub fn iof_complete_request(packet: u64) -> i32 {
         return 0;
     }
     let user_iosb = irp.user_iosb.get();
-    if user_iosb != 0 {
-        // SAFETY: UserIosb de um IRP de modo kernel (os pedidos de modo
-        // usuário são concluídos pelas conclusões gerenciadas acima).
-        let iosb = unsafe { IoStatusBlock::at(user_iosb) };
-        iosb.status.set(final_status);
-        iosb.information.set(irp.io_status.information.get());
-    }
     let user_buffer = irp.user_buffer.get();
     let system_buffer = irp.associated_irp.system_buffer.get();
-    if user_buffer != 0 && system_buffer != 0 && (final_status as u32) >> 30 != 3 && information > 0 {
-        guest::write_bytes(user_buffer, &guest::read_bytes(system_buffer, information as usize));
-    }
+    let copy_back = || {
+        if user_iosb != 0 {
+            // SAFETY: UserIosb do IRP, no processo de quem pediu (o corrente).
+            let iosb = unsafe { IoStatusBlock::at(user_iosb) };
+            iosb.status.set(final_status);
+            iosb.information.set(irp.io_status.information.get());
+        }
+        if user_buffer != 0 && system_buffer != 0 && (final_status as u32) >> 30 != 3 && information > 0 {
+            guest::write_bytes(user_buffer, &guest::read_bytes(system_buffer, information as usize));
+        }
+    };
+    complete_in_requester(irp, [user_iosb, user_buffer], copy_back);
     let user_event = irp.user_event.get();
     if user_event != 0 {
         dispatcher::set_event(user_event);

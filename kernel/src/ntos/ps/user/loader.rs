@@ -137,6 +137,15 @@ static NTDLL_MODULE: SpinLock<Option<Arc<Module>>> = SpinLock::new(None);
 static API_SET: SpinLock<Option<Arc<Schema>>> = SpinLock::new(None);
 /// A ntdll mapeada, registrada para as entradas LDR dos processos.
 static NTDLL_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+/// A imagem do apiset schema (base, tamanho), mapeada uma vez.
+static API_SET_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+
+/// A VA cai numa imagem de sistema mapeada uma vez e vista por todo processo
+/// na mesma VA (a ntdll e o apiset schema).
+pub fn system_image(va: u64) -> bool {
+    let images = [*NTDLL_IMAGE.lock(), *API_SET_IMAGE.lock()];
+    images.iter().any(|&(base, size)| size != 0 && va >= base && va - base < size)
+}
 
 pub fn ntfs_volume() -> Option<Arc<Ntfs>> {
     let cached = NTFS_VOLUME.lock().clone();
@@ -249,6 +258,7 @@ pub fn ensure_api_set_schema() -> Result<(), KernelError> {
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
+    *API_SET_IMAGE.lock() = (image.image_base, image.size_of_image);
     push_image(Space::system(), image.image_base, image.size_of_image, String::from("\\NTFS\\APISETSCHEMA.DLL"), None);
     crate::debug_print!("[usermode] apiset schema em {:#x} ({} bytes)", map, section.virtual_size);
     Ok(())
@@ -446,7 +456,9 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
         .ok_or_else(|| KernelError::new(alloc::format!("DLL ausente no volume: {file_name}")))?;
     let image_name = alloc::format!("\\NTFS{}", file.volume_path().replace('/', "\\"));
     let source: Arc<dyn ImageSource> = Arc::new(VolumeImageSource { name: image_name.clone(), file: file.clone() });
-    let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, skip_imports: true, image_name: Some(image_name), ..LoadOptions::default() })?;
+    // A notificação de imagem vem depois de a imagem entrar no VAD do
+    // processo corrente, onde os callbacks a leem.
+    let image = pe_loader::load_from_source(source.clone(), &LoadOptions { user_space: true, skip_imports: true, image_name: Some(image_name.clone()), notify_image: false, ..LoadOptions::default() })?;
     let (image_base, size_of_image) = (image.image_base, image.size_of_image);
     let module = Arc::new(Module {
         name: file_name.clone(),
@@ -461,6 +473,7 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
     // A imagem é do processo corrente e volta no término dele.
     register_module(module.clone(), Some(image))?;
     push_image(Space::current(), image_base, size_of_image, file.nt_path(), Some(file));
+    pe_loader::notify_user_image(image_base, size_of_image, &image_name, source)?;
     bind_imports(image_base, depth + 1)?;
     // Dependências inicializadas antes do importador.
     create_ldr_entry(&module)?;

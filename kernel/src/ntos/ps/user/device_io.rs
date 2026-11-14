@@ -14,6 +14,7 @@ use super::state::{self, UserHandle};
 use super::threads::{self, UserThread, Wait};
 use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::dispatcher;
+use crate::ntos::ps::{process, process_context};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{DeviceObject, Irp, NtStruct};
@@ -39,6 +40,8 @@ struct Request {
     irp: u64,
     buffer: u64,
     pid: u64,
+    /// O EPROCESS da requisição: dono do IOSB e do buffer de usuário.
+    process: u64,
     state: SpinLock<RequestState>,
 }
 
@@ -61,23 +64,12 @@ fn finish(request: &Arc<Request>) {
         count = 0;
     }
     let abandoned = request.state.lock().abandoned;
-    // A conclusão roda no contexto de quem bombeia: a cópia para o usuário
-    // exige o processo da requisição ainda vivo.
+    // A conclusão roda no contexto de quem a observa (o pump do laço, a
+    // espera da thread ou a própria chamada): a cópia para o usuário exige o
+    // processo da requisição ainda vivo e roda anexada a ele, como a APC de
+    // conclusão do NT roda no contexto da thread que pediu.
     if !abandoned && process_state::by_id(request.pid).is_some() {
-        if !state::probe_user_write(request.iosb, 16) || (!request.write && count != 0 && !state::probe_user_write(request.user_buffer, count)) {
-            status = 0xC000_0005;
-            count = 0;
-        } else {
-            if !request.write && count != 0 && status >> 30 != 3 {
-                // SystemBuffer (pool do kernel) para o buffer de usuário sondado.
-                let bytes = guest::read_bytes(request.buffer, count as usize);
-                let _ = state::write_user_bytes(request.user_buffer, &bytes);
-            }
-            if state::set_user_iosb(request.iosb, status, count).is_err() {
-                status = 0xC000_0005;
-                count = 0;
-            }
-        }
+        (status, count) = process_context::with_process(request.process, || copy_out(request, status, count)).unwrap_or((0xC000_0005, 0));
         if let Some(device) = device(&request.entry).filter(|device| status == 0 && device.options & 0x30 != 0) {
             *device.position.lock() = request.offset + count;
         }
@@ -101,6 +93,23 @@ fn finish(request: &Arc<Request>) {
     if let Some(thread) = &request.thread {
         threads::release_thread(thread);
     }
+}
+
+/// SystemBuffer e IOSB para o processo da requisição (o corrente): devolve
+/// o status e a contagem finais.
+fn copy_out(request: &Request, status: u32, count: u64) -> (u32, u64) {
+    if !state::probe_user_write(request.iosb, 16) || (!request.write && count != 0 && !state::probe_user_write(request.user_buffer, count)) {
+        return (0xC000_0005, 0);
+    }
+    if !request.write && count != 0 && status >> 30 != 3 {
+        // SystemBuffer (pool do kernel) para o buffer de usuário sondado.
+        let bytes = guest::read_bytes(request.buffer, count as usize);
+        let _ = state::write_user_bytes(request.user_buffer, &bytes);
+    }
+    if state::set_user_iosb(request.iosb, status, count).is_err() {
+        return (0xC000_0005, 0);
+    }
+    (status, count)
 }
 
 pub fn pump() {
@@ -181,7 +190,7 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
         guest::write_bytes(buffer, data);
     }
     let thread = threads::current();
-    let request = Arc::new(Request { entry: entry.clone(), event: event.clone(), thread: thread.clone(), iosb, user_buffer, length, offset, write, irp: packet, buffer, pid: state::current_process_id(), state: SpinLock::new(RequestState { done: false, finished: false, abandoned: false, status: 0x103, count: 0 }) });
+    let request = Arc::new(Request { entry: entry.clone(), event: event.clone(), thread: thread.clone(), iosb, user_buffer, length, offset, write, irp: packet, buffer, pid: state::current_process_id(), process: process::get_current_process(), state: SpinLock::new(RequestState { done: false, finished: false, abandoned: false, status: 0x103, count: 0 }) });
     state::retain_user_handle_reference(entry);
     if let Some(thread) = &thread {
         threads::retain_thread(thread);

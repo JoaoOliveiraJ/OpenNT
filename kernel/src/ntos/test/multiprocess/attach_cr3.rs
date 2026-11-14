@@ -2,7 +2,8 @@
 //!
 //! - anexado (KeStackAttachProcess) a um processo com espaço próprio
 //!   (`process_address_space::create`), o CR3 é a raiz dele, e uma página
-//!   mapeada só nessa raiz é lida e escrita pela VA de usuário, por sonda;
+//!   mapeada só nessa raiz (e registrada no VAD dele, como as sondas do modo
+//!   estrito de posse exigem) é lida e escrita pela VA de usuário, por sonda;
 //! - desanexado, o CR3 volta à raiz do System e a mesma VA dá
 //!   STATUS_ACCESS_VIOLATION na sonda;
 //! - um attach aninhado (A, depois B; detach, detach) restaura cada raiz, e
@@ -11,6 +12,9 @@
 //!   a restauração volta à do System;
 //! - o delete de um espaço carregado é recusado sem mudar nada e passa
 //!   depois do detach.
+
+use alloc::sync::Arc;
+use core::any::Any;
 
 use crate::hal::physical;
 use crate::ntos::inc::types::{KapcState, Kprocess, NtStruct};
@@ -21,6 +25,8 @@ use crate::ntos::mm::process_address_space::{self as address_space, SYSTEM_ROOT}
 use crate::ntos::mm::shared_user_data::{self, MM_SHARED_USER_DATA_VA};
 use crate::ntos::mm::pfn;
 use crate::ntos::ps::process;
+use crate::ntos::ps::user::memory::{self, Space};
+use crate::ntos::ps::user::state::{RegionKind, UserRegion};
 
 type Assert = fn(bool, &str);
 
@@ -32,6 +38,22 @@ const C_ID: u64 = 0x7EF0;
 const USER_VA: u64 = 0x0000_3A40_0000_0000;
 const A_VALUE: u64 = 0xA4A4_0000_0000_00A4;
 const B_VALUE: u64 = 0xB4B4_0000_0000_00B4;
+
+/// A página de teste no VAD do processo: mapeada à mão na raiz dele, sem
+/// página do PFN de região (o teste a desfaz antes do término).
+struct TestPage;
+
+impl UserRegion for TestPage {
+    fn base(&self) -> u64 {
+        USER_VA
+    }
+    fn size(&self) -> u64 {
+        0x1000
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 fn directory_table_base(process: u64) -> u64 {
     // SAFETY: EPROCESS vivo criado pelo teste.
@@ -70,9 +92,10 @@ pub fn run(assert: Assert) {
     if let Some(([a_root, b_root, c_root], [a_frame, b_frame])) = ready {
         assert(paging::translate_in(SYSTEM_ROOT, USER_VA) == 0 && loaded(SYSTEM_ROOT), "attach-cr3: a raiz do System carregada e sem a VA de teste");
         let mut mapped = true;
-        for (root, frame, value) in [(a_root, a_frame, A_VALUE), (b_root, b_frame, B_VALUE)] {
+        for (process, root, frame, value) in [(a, a_root, a_frame, A_VALUE), (b, b_root, b_frame, B_VALUE)] {
             physical::write64(frame, value);
             mapped &= paging::map_page_in(root, USER_VA, frame, PAGE_PRESENT | PAGE_RW | PAGE_USER, MapOptions { nx: true, ..MapOptions::default() });
+            mapped &= memory::insert_region(Space::of(process), RegionKind::User, Arc::new(TestPage));
         }
         assert(mapped, "attach-cr3: pagina de usuario mapeada nos espacos de A e B");
         if mapped {

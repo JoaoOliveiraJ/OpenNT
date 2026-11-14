@@ -334,6 +334,7 @@ pub fn write_user_bytes(va: u64, bytes: &[u8]) -> Result<(), KernelError> {
 
 /// `count` WCHARs de um buffer de usuário (já sondado pelo chamador), numa
 /// cópia sondada: uma página desmapeada no meio devolve ACCESS_VIOLATION.
+#[track_caller]
 pub fn try_read_user_wide_string(buffer_va: u64, count: u64) -> Result<String, KernelError> {
     let bytes = guest::try_read_bytes(buffer_va, (count * 2) as usize)?;
     let units: alloc::vec::Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
@@ -341,6 +342,7 @@ pub fn try_read_user_wide_string(buffer_va: u64, count: u64) -> Result<String, K
 }
 
 /// Como [`try_read_user_wide_string`]; uma falha de sonda devolve o texto vazio.
+#[track_caller]
 pub fn read_user_wide_string(buffer_va: u64, count: u64) -> String {
     try_read_user_wide_string(buffer_va, count).unwrap_or_default()
 }
@@ -351,6 +353,7 @@ fn wide_with_nul(text: &str) -> alloc::vec::Vec<u8> {
 
 /// Grava o texto com NUL numa estrutura de usuário montada pelo kernel;
 /// devolve o comprimento em bytes sem o NUL.
+#[track_caller]
 pub fn write_user_wide(va: u64, text: &str) -> u64 {
     let bytes = wide_with_nul(text);
     guest::write_bytes(va, &bytes);
@@ -358,6 +361,7 @@ pub fn write_user_wide(va: u64, text: &str) -> u64 {
 }
 
 /// [`write_user_wide`] num buffer de usuário (cópia sondada).
+#[track_caller]
 pub fn try_write_user_wide(va: u64, text: &str) -> Result<u64, KernelError> {
     let bytes = wide_with_nul(text);
     guest::try_write_bytes(va, &bytes)?;
@@ -376,6 +380,7 @@ pub fn write_unicode_string(struct_va: u64, buffer_va: u64, text: &str) {
 }
 
 /// [`write_unicode_string`] num buffer de usuário (escritas sondadas).
+#[track_caller]
 pub fn try_write_unicode_string(struct_va: u64, buffer_va: u64, text: &str) -> Result<(), KernelError> {
     let bytes = text.encode_utf16().count() as u16 * 2;
     let string = UnicodeString::try_at(struct_va)?;
@@ -386,6 +391,7 @@ pub fn try_write_unicode_string(struct_va: u64, buffer_va: u64, text: &str) -> R
 
 /// IO_STATUS_BLOCK de modo usuário: Status estendido aos 64 bits do slot
 /// (Status/Pointer), como a cópia da estrutura na conclusão, e Information.
+#[track_caller]
 pub fn set_user_iosb(iosb: u64, status: u32, information: u64) -> Result<(), KernelError> {
     let block = IoStatusBlock::try_at(iosb)?;
     block.pointer.probe_set(status as u64)?;
@@ -427,10 +433,12 @@ pub fn guarded(body: impl FnOnce() -> Result<u32, KernelError>) -> Result<u32, K
 /// não ajusta a pilha; o chamador pôs o arg5 em [rsp+0x20] e o `call`
 /// empurrou o retorno. O despachante sonda a área de argumentos; uma pilha
 /// desmapeada lê zero, nunca uma falha de kernel.
+#[track_caller]
 pub fn stack_arg(user_rsp: u64, index: u64) -> u64 {
     guest::try_read::<u64>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
 }
 
+#[track_caller]
 pub fn stack_arg32(user_rsp: u64, index: u64) -> u32 {
     guest::try_read::<u32>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
 }

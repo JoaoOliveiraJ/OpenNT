@@ -21,7 +21,9 @@
 //! threads de sistema) e as imagens de sistema mapeadas uma vez (ntdll,
 //! apiset). Consultas, liberações e trocas de proteção só enxergam o VAD do
 //! espaço; o término do processo devolve o VAD inteiro (`release_vad`), como
-//! o MmCleanProcessAddressSpace.
+//! o MmCleanProcessAddressSpace. O VAD também decide a posse no modo
+//! estrito de `guest_memory` (`check_user_access`): uma sonda só alcança
+//! páginas do processo corrente ou das faixas de sistema compartilhadas.
 //!
 //! Escolha de endereço: a tabela de páginas ainda é uma só, então a faixa
 //! nova evita o que qualquer processo ocupa (`occupied`, a união dos VADs,
@@ -294,6 +296,31 @@ pub fn find_free(size: u64, alignment: u64, top_down: bool) -> Result<u64, u32> 
 /// Região de usuário ou imagem do processo corrente que contém o endereço.
 pub fn find_region(va: u64) -> Option<Region> {
     Space::current().find(va)
+}
+
+/// A VA cai numa faixa de sistema que todo processo vê na mesma VA: a visão
+/// de usuário da KUSER_SHARED_DATA, as regiões compartilhadas (NLS), as
+/// vistas de sistema e as imagens de sistema mapeadas uma vez (ntdll e
+/// apiset).
+pub fn shared_system_range(va: u64) -> bool {
+    va & !(PAGE - 1) == state::KUSER_SHARED_DATA_USER_VA
+        || super::loader::system_image(va)
+        || state::with(|state| state.shared_user_regions.iter().chain(state.section_kernel_views.iter()).any(|region| contains(region, va)))
+}
+
+/// O verificador do modo estrito de posse (`guest_memory::set_ownership_check`):
+/// uma página de usuário presente no espaço carregado tem de estar no VAD do
+/// processo corrente (o anexado, quando há attach) ou numa faixa de sistema
+/// compartilhada. A recusa nomeia o processo cujo VAD a contém (0 se
+/// nenhum). Sem página, nada a recusar: a sonda devolve ACCESS_VIOLATION,
+/// que é o que a VA de outro processo dá num espaço próprio.
+pub fn check_user_access(va: u64) -> Result<(), guest::OwnershipFault> {
+    let current = process::get_current_process();
+    if Space::of(current).find(va).is_some() || shared_system_range(va) || paging::query_page(va & !(PAGE - 1), false).is_none() {
+        return Ok(());
+    }
+    let owner = process_state::all().iter().find(|state| state.process != current && state.vad.lock().find(va).is_some()).map_or(0, |state| state.process);
+    Err(guest::OwnershipFault { owner, current, thread: process::get_current_thread() })
 }
 
 fn private(region: &Region) -> Option<&PrivateRegion> {

@@ -352,6 +352,20 @@ impl FileSource for NotifySource {
     }
 }
 
+/// A notificação de carga de imagem (PsSetLoadImageNotifyRoutine) de uma
+/// imagem já mapeada: de sistema, ou de usuário no processo corrente.
+fn notify_loaded(image_base: u64, size_of_image: u64, name: &str, source: Arc<dyn ImageSource>, system: bool, no_execute: bool) -> Result<(), KernelError> {
+    let notify = image_notify::NotifyOptions { system, name: Some(String::from(name)), no_execute, source: Some(Arc::new(NotifySource { name: String::from(name), source })), ..Default::default() };
+    image_notify::notify(image_notify::Image { image_base, size_of_image }, &notify)
+}
+
+/// A notificação de uma imagem de usuário carregada com `notify_image:
+/// false`, depois de o chamador a pôr no VAD do processo corrente: os
+/// callbacks leem a imagem no processo dono.
+pub fn notify_user_image(image_base: u64, size_of_image: u64, name: &str, source: Arc<dyn ImageSource>) -> Result<(), KernelError> {
+    notify_loaded(image_base, size_of_image, name, source, false, false)
+}
+
 /// Imagem em memória (bundle/VFS).
 pub fn load(bytes: Vec<u8>, options: &LoadOptions) -> Result<PeImage, KernelError> {
     load_from_source(Arc::new(MemorySource { name: String::new(), bytes }), options)
@@ -897,8 +911,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 }
             }
             if options.notify_image {
-                let notify = image_notify::NotifyOptions { system: !user_space, name: Some(name.clone()), no_execute: options.no_execute, source: Some(Arc::new(NotifySource { name, source: source.clone() })), ..Default::default() };
-                if let Err(error) = image_notify::notify(image_notify::Image { image_base: image.image_base, size_of_image }, &notify) {
+                if let Err(error) = notify_loaded(image.image_base, size_of_image, &name, source.clone(), !user_space, options.no_execute) {
                     let _ = image.release();
                     return Err(error);
                 }

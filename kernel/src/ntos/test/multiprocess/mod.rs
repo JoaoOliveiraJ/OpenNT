@@ -10,3 +10,4 @@ pub mod identity;
 pub mod attach_cr3;
 pub mod kernel_stacks;
 pub mod lifecycle;
+pub mod ownership;

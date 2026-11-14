@@ -62,13 +62,35 @@
 //!
 //! Nenhum acesso do kernel passa mais pelo alias de identidade do frame: uma
 //! escrita confiável numa página somente leitura falta, como no NT.
+//!
+//! # Posse da metade de usuário (modo estrito)
+//!
+//! Com o verificador ligado (`set_ownership_check`, pelo Ps de modo usuário
+//! no armar do anel 3, em todo boot), a sonda de uma VA de usuário confere a
+//! posse antes do acesso: uma página presente tem de estar no VAD do
+//! processo corrente (KTHREAD.ApcState.Process, o anexado durante um attach)
+//! ou numa faixa de sistema compartilhada (a visão de usuário da
+//! KUSER_SHARED_DATA, o NLS, a ntdll e o apiset). Uma página do VAD de outro
+//! processo, ou presente e sem dono, é um acesso entre processos: o kernel
+//! tocou a memória de usuário de alguém sem anexar ao dono, como o
+//! KeStackAttachProcess do NT exige, e isso deixa de funcionar quando cada
+//! processo tiver a própria raiz. O diagnóstico para o sistema (`*** PANIC`,
+//! que derruba o test-boot) com a VA, o dono, o processo e a thread
+//! correntes e a linha do chamador (as rotinas de sonda propagam a posição
+//! com `#[track_caller]`). Uma VA sem página segue para a sonda, que devolve
+//! ACCESS_VIOLATION como sempre (é o que a VA de outro processo dá num
+//! espaço próprio). Os autotestes capturam as violações de uma thread
+//! ([`capture_ownership_violations`]): a sonda recusa com ACCESS_VIOLATION e
+//! a violação fica registrada, em vez de parar o sistema.
 
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::vec::Vec;
+use core::panic::Location;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::{host, volatile};
+use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::{page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -108,6 +130,94 @@ pub fn set_pageable_resolver(resolver: Option<PageableResolver>) {
 
 pub fn set_pool_lock(lock: Option<(fn() -> u64, fn(u64))>) {
     *POOL_LOCK.lock() = lock;
+}
+
+// ---- posse da metade de usuário --------------------------------------------------
+
+/// Fim exclusivo da metade de usuário (PML4[0..256)).
+pub const USER_HALF_END: u64 = map::USER_PML4_ENTRIES << 39;
+
+/// Recusa do verificador de posse: quem possui a VA (0 = ninguém) e o
+/// contexto que tentou o acesso.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnershipFault {
+    /// EPROCESS cujo VAD contém a VA; 0 para uma página presente sem dono.
+    pub owner: u64,
+    /// O processo corrente (KTHREAD.ApcState.Process) no acesso.
+    pub current: u64,
+    /// A thread corrente no acesso.
+    pub thread: u64,
+}
+
+/// O verificador: `Ok` se a VA de usuário pode ser tocada no contexto
+/// corrente (do processo corrente, de uma faixa compartilhada, ou sem
+/// página, quando a própria sonda recusa).
+pub type OwnershipCheck = fn(u64) -> Result<(), OwnershipFault>;
+
+/// Um acesso entre processos detectado pela sonda.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnershipViolation {
+    pub address: u64,
+    pub write: bool,
+    pub fault: OwnershipFault,
+    /// A rotina que pediu o acesso (a primeira fora das sondas).
+    pub caller: &'static Location<'static>,
+}
+
+static OWNERSHIP_CHECK: SpinLock<Option<OwnershipCheck>> = SpinLock::new(None);
+
+/// Violações capturadas por um autoteste: a thread e o que ela provocou.
+static CAPTURE: SpinLock<Option<(u64, Vec<OwnershipViolation>)>> = SpinLock::new(None);
+
+/// Liga (ou desliga, com `None`) o modo estrito de posse.
+pub fn set_ownership_check(check: Option<OwnershipCheck>) {
+    *OWNERSHIP_CHECK.lock() = check;
+}
+
+/// O modo estrito está ligado.
+pub fn ownership_check_enabled() -> bool {
+    OWNERSHIP_CHECK.lock().is_some()
+}
+
+/// Roda `body` capturando as violações de posse da thread `thread`: nelas a
+/// sonda recusa com ACCESS_VIOLATION e a violação volta ao chamador em vez
+/// de parar o sistema. As das outras threads continuam fatais.
+pub fn capture_ownership_violations<R>(thread: u64, body: impl FnOnce() -> R) -> (R, Vec<OwnershipViolation>) {
+    let outer = CAPTURE.lock().replace((thread, Vec::new()));
+    let result = body();
+    let captured = core::mem::replace(&mut *CAPTURE.lock(), outer).map_or_else(Vec::new, |(_, violations)| violations);
+    (result, captured)
+}
+
+/// A posse de uma VA de usuário antes da sonda dela. Sem verificador, ou
+/// numa VA da metade de sistema, nada a conferir.
+#[track_caller]
+fn check_ownership(address: u64, write: bool) -> Result<(), KernelError> {
+    if address >= USER_HALF_END {
+        return Ok(());
+    }
+    let check = *OWNERSHIP_CHECK.lock();
+    let Some(check) = check else { return Ok(()) };
+    let Err(fault) = check(address) else { return Ok(()) };
+    let violation = OwnershipViolation { address, write, fault, caller: Location::caller() };
+    {
+        let mut capture = CAPTURE.lock();
+        if let Some((_, violations)) = capture.as_mut().filter(|(thread, _)| *thread == fault.thread) {
+            violations.push(violation);
+            return Err(address_fault(address));
+        }
+    }
+    report_violation(&violation)
+}
+
+/// O diagnóstico de um acesso entre processos: para o sistema.
+fn report_violation(violation: &OwnershipViolation) -> ! {
+    let OwnershipViolation { address, write, fault, caller } = *violation;
+    let access = if write { "escrita" } else { "leitura" };
+    if fault.owner == 0 {
+        panic!("acesso a memoria de usuario sem dono: {access} da VA {address:#x} (pagina presente fora de todo VAD e das faixas de sistema) no processo {:#x}, thread {:#x}, chamado de {caller}", fault.current, fault.thread)
+    }
+    panic!("acesso entre processos: {access} da VA {address:#x} do processo {:#x} no contexto do processo {:#x}, thread {:#x}, sem anexar ao dono; chamado de {caller}", fault.owner, fault.current, fault.thread)
 }
 
 // ---- escalares ---------------------------------------------------------------
@@ -188,9 +298,11 @@ fn crosses_page(address: u64, width: u64) -> bool {
 }
 
 /// Sonda da página de `address`: o resolvedor traz páginas pagináveis de
-/// volta (em qualquer IRQL que o provedor aceite); depois a PTE precisa estar
-/// presente e, numa escrita, gravável — uma página copy-on-write ganha uma
-/// chance no tratador de faltas. Devolve o endereço físico da página.
+/// volta (em qualquer IRQL que o provedor aceite); no modo estrito, a posse
+/// de uma VA de usuário; depois a PTE precisa estar presente e, numa
+/// escrita, gravável — uma página copy-on-write ganha uma chance no tratador
+/// de faltas. Devolve o endereço físico da página.
+#[track_caller]
 fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
     if !canonical(address) {
         return Err(address_fault(address));
@@ -199,6 +311,7 @@ fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
     if let Some(resolver) = resolver {
         resolver(address)?;
     }
+    check_ownership(address, write)?;
     let page = address & !0xFFF;
     let writable = |mapping: &paging::PageQuery| !write || mapping.access & paging::PAGE_RW != 0;
     let mut mapping = paging::query_page(page, false);
@@ -212,6 +325,7 @@ fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
 }
 
 /// Sonda as páginas tocadas por `width` bytes em `address`.
+#[track_caller]
 fn probe_range(address: u64, width: u64, write: bool) -> Result<(), KernelError> {
     probe(address, write)?;
     if crosses_page(address, width) {
@@ -222,6 +336,7 @@ fn probe_range(address: u64, width: u64, write: bool) -> Result<(), KernelError>
 
 /// Leitura de ponteiro não confiável: sonda e UM acesso; só um acesso que
 /// cruza página vira bytes em ordem crescente.
+#[track_caller]
 pub fn try_read<T: GuestScalar>(address: u64) -> Result<T, KernelError> {
     probe_range(address, T::SIZE, false)?;
     if !crosses_page(address, T::SIZE) {
@@ -236,6 +351,7 @@ pub fn try_read<T: GuestScalar>(address: u64) -> Result<T, KernelError> {
 
 /// Escrita em ponteiro não confiável: sonda e UM acesso (bytes só quando
 /// cruza página).
+#[track_caller]
 pub fn try_write<T: GuestScalar>(address: u64, value: T) -> Result<(), KernelError> {
     probe_range(address, T::SIZE, true)?;
     if !crosses_page(address, T::SIZE) {
@@ -252,6 +368,7 @@ pub fn try_write<T: GuestScalar>(address: u64, value: T) -> Result<(), KernelErr
 /// Copia bytes sem presumir continuidade entre páginas virtuais. RAM
 /// admitida recebe cópia em bloco; MMIO e reservas conservam a largura e a
 /// ordem de cada acesso.
+#[track_caller]
 pub fn try_write_bytes(address: u64, bytes: &[u8]) -> Result<(), KernelError> {
     let mut copied = 0usize;
     while copied < bytes.len() {
@@ -272,6 +389,7 @@ pub fn try_write_bytes(address: u64, bytes: &[u8]) -> Result<(), KernelError> {
     Ok(())
 }
 
+#[track_caller]
 pub fn try_read_bytes(address: u64, length: usize) -> Result<Vec<u8>, KernelError> {
     let mut bytes: Vec<u8> = Vec::with_capacity(length);
     while bytes.len() < length {
@@ -294,29 +412,37 @@ pub fn try_read_bytes(address: u64, length: usize) -> Result<Vec<u8>, KernelErro
 
 // ---- nomes por largura (as chamadas existentes) --------------------------------
 
+#[track_caller]
 pub fn try_read8(address: u64) -> Result<u8, KernelError> {
     try_read(address)
 }
+#[track_caller]
 pub fn try_read16(address: u64) -> Result<u16, KernelError> {
     try_read(address)
 }
+#[track_caller]
 pub fn try_read32(address: u64) -> Result<u32, KernelError> {
     try_read(address)
 }
 /// Uma carga de qword (64 bits alinhados nunca são observados pela metade).
+#[track_caller]
 pub fn try_read64(address: u64) -> Result<u64, KernelError> {
     try_read(address)
 }
+#[track_caller]
 pub fn try_write8(address: u64, value: u8) -> Result<(), KernelError> {
     try_write(address, value)
 }
+#[track_caller]
 pub fn try_write16(address: u64, value: u16) -> Result<(), KernelError> {
     try_write(address, value)
 }
+#[track_caller]
 pub fn try_write32(address: u64, value: u32) -> Result<(), KernelError> {
     try_write(address, value)
 }
 /// Um store de qword.
+#[track_caller]
 pub fn try_write64(address: u64, value: u64) -> Result<(), KernelError> {
     try_write(address, value)
 }
@@ -367,9 +493,11 @@ fn kernel_fault(error: KernelError) -> ! {
 
 /// Cópia de memória do kernel: a sonda por página escolhe entre bloco (RAM)
 /// e bytes (MMIO); a falha para o sistema.
+#[track_caller]
 pub fn write_bytes(address: u64, bytes: &[u8]) {
     try_write_bytes(address, bytes).unwrap_or_else(|error| kernel_fault(error))
 }
+#[track_caller]
 pub fn read_bytes(address: u64, length: usize) -> Vec<u8> {
     try_read_bytes(address, length).unwrap_or_else(|error| kernel_fault(error))
 }
@@ -392,6 +520,7 @@ pub fn atomic_u64(address: u64) -> &'static AtomicU64 {
 }
 
 /// Sonda de escrita e alinhamento natural de uma célula interlocked.
+#[track_caller]
 fn probe_atomic(address: u64, width: u64) -> Result<(), KernelError> {
     if address & (width - 1) != 0 {
         return Err(KernelError::with_status(format!("misaligned interlocked guest VA {address:#x}"), STATUS_DATATYPE_MISALIGNMENT));
@@ -400,18 +529,21 @@ fn probe_atomic(address: u64, width: u64) -> Result<(), KernelError> {
 }
 
 /// [`atomic_u32`] de um ponteiro não confiável.
+#[track_caller]
 pub fn try_atomic_u32(address: u64) -> Result<&'static AtomicU32, KernelError> {
     probe_atomic(address, 4)?;
     Ok(atomic_u32(address))
 }
 
 /// [`atomic_u64`] de um ponteiro não confiável.
+#[track_caller]
 pub fn try_atomic_u64(address: u64) -> Result<&'static AtomicU64, KernelError> {
     probe_atomic(address, 8)?;
     Ok(atomic_u64(address))
 }
 
 /// LOCK CMPXCHG: devolve o valor anterior.
+#[track_caller]
 pub fn compare_exchange32(address: u64, expected: u32, replacement: u32) -> Result<u32, KernelError> {
     let cell = try_atomic_u32(address)?;
     Ok(match cell.compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
@@ -420,6 +552,7 @@ pub fn compare_exchange32(address: u64, expected: u32, replacement: u32) -> Resu
 }
 
 /// LOCK CMPXCHG de 64 bits: devolve o valor anterior.
+#[track_caller]
 pub fn compare_exchange64(address: u64, expected: u64, replacement: u64) -> Result<u64, KernelError> {
     let cell = try_atomic_u64(address)?;
     Ok(match cell.compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst) {
@@ -429,6 +562,7 @@ pub fn compare_exchange64(address: u64, expected: u64, replacement: u64) -> Resu
 
 /// Cabeçalho SLIST alinhado: compara as duas palavras numa instrução.
 /// Devolve o valor anterior (baixo, alto).
+#[track_caller]
 pub fn compare_exchange128(
     address: u64,
     expected: (u64, u64),

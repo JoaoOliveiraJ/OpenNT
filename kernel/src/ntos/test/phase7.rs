@@ -2459,18 +2459,19 @@ fn user_tokens(assert: Assert) {
 fn user_query_object(assert: Assert) {
     use crate::ntos::ob::query_object;
     use crate::ntos::ps::user::memory;
-    let Ok(block) = memory::map_user_region(0x3000) else {
-        assert(false, "userquery: memoria de usuario");
-        return;
-    };
-    let (out, returned, buffer, attributes, rsp) = (block, block + 0x10, block + 0x400, block + 0x200, block + 0x2000);
-    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
-    let query = |handle: u64, class: u64, length: u64| {
-        guest::write64(rsp + 0x28, returned);
-        call("NtQueryObject", handle, class, buffer, length)
-    };
-    // O handle é aberto e consultado na tabela de um processo de usuário real.
+    // O handle é aberto e consultado na tabela de um processo de usuário
+    // real, com os buffers no espaço dele (o término os devolve).
     let ran = with_test_process("consulta.exe", None, |_| {
+        let Ok(block) = memory::map_user_region(0x3000) else {
+            assert(false, "userquery: memoria de usuario");
+            return;
+        };
+        let (out, returned, buffer, attributes, rsp) = (block, block + 0x10, block + 0x400, block + 0x200, block + 0x2000);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+        let query = |handle: u64, class: u64, length: u64| {
+            guest::write64(rsp + 0x28, returned);
+            call("NtQueryObject", handle, class, buffer, length)
+        };
         // Evento nomeado do processo.
         state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
         state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
@@ -2500,9 +2501,6 @@ fn user_query_object(assert: Assert) {
         let _ = call("NtClose", event, 0, 0, 0);
     });
     assert(ran.is_some(), "userquery: processo de usuario");
-    if let Some(region) = memory::find_region(block) {
-        memory::release_private_region(&region);
-    }
 }
 
 fn user_remove_completion(assert: Assert) {
@@ -3822,7 +3820,7 @@ fn user_wnf(assert: Assert) {
     };
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
     let (name, guid, data, stamp, length, output) = (block, block + 0x10, block + 0x20, block + 0x40, block + 0x48, block + 0x60);
-    let (state_name, invalid_name) = unsafe { (nt::WnfStateName::at(name), nt::WnfStateName::at(name + nt::WnfStateName::SIZE)) };
+    let state_name = unsafe { nt::WnfStateName::at(name) };
     state_name.data[0].set(0xA3BC_0875);
     state_name.data[1].set(0x0280_032E);
     let type_id = unsafe { nt::Guid::at(guid) };
@@ -3850,8 +3848,19 @@ fn user_wnf(assert: Assert) {
     // Inscrição e evento pertencem a um processo de usuário: um assinante do
     // System seria despachado como inscrição de kernel (callback em +0x50).
     let ran = with_test_process("wnf.exe", None, |_| {
+        // Os ponteiros dos serviços ficam no espaço do processo de usuário
+        // (o término os devolve).
+        let Ok(own) = memory::map_user_region(0x1000) else {
+            assert(false, "userwnf: memoria do processo de usuario");
+            return;
+        };
+        let own_rsp = own + 0x800;
+        let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, own_rsp)).and_then(|result| result.ok());
+        let (name, identifier, event_out) = (own, own + 0x100, own + 0x108);
+        let (state_name, invalid_name) = unsafe { (nt::WnfStateName::at(name), nt::WnfStateName::at(name + nt::WnfStateName::SIZE)) };
+        state_name.data[0].set(0xA3BC_0875);
+        state_name.data[1].set(0x0280_032E);
         // NtSubscribeWnfStateChange.
-        let identifier = block + 0x100;
         guest::write64(identifier, 0x1234);
         let subscribed = call("NtSubscribeWnfStateChange", name, 0, 1, identifier);
         let subscription = guest::read64(identifier);
@@ -3864,9 +3873,9 @@ fn user_wnf(assert: Assert) {
         let bad_pointer = call("NtSubscribeWnfStateChange", 0x10, 0, 1, 0);
         assert(subscribed == Some(0) && subscription != 0 && mask == Some(0xC000_000D) && bad_name == Some(0xC000_000D) && zeroed == 0 && bad_pointer == Some(0xC000_0005), "userwnf: NtSubscribeWnfStateChange e recusas");
         // NtSetWnfProcessNotificationEvent: uma única inscrição por processo.
-        guest::write64(rsp + 0x28, 0);
-        let created = call("NtCreateEvent", block + 0x108, 0x1F_0003, 0, 0);
-        let event = guest::read64(block + 0x108);
+        guest::write64(own_rsp + 0x28, 0);
+        let created = call("NtCreateEvent", event_out, 0x1F_0003, 0, 0);
+        let event = guest::read64(event_out);
         let registered = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
         let again = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
         let invalid = call("NtSetWnfProcessNotificationEvent", 0x7FFF_0000, 0, 0, 0);
@@ -4231,19 +4240,20 @@ fn memory_partition(assert: Assert) {
     let allocated = guest::read64(body + 24);
     let released = pfn::free_page(one) && (0..3).all(|index| pfn::free_page(run + index * 4096));
     assert(one != 0 && run != 0 && allocated == free - 4 && released && guest::read64(body + 24) == free, "partition: alocacoes simples e contiguas contadas no corpo");
-    // NtOpenPartition num processo de usuário.
-    let Ok(block) = memory::map_user_region(0x1000) else {
-        assert(false, "partition: memoria de usuario");
-        return;
-    };
-    let (attributes, unicode, text, result, maximum, rsp) = (block, block + 48, block + 64, block + 256, block + 272, block + 0x400);
-    let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
-    let set_name = |name: &str, flags: u32, root: u64| {
-        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, root, unicode, flags);
-        let length = write_wide(text, name);
-        set_unicode(unsafe { nt::UnicodeString::at(unicode) }, length, length + 2, text);
-    };
+    // NtOpenPartition num processo de usuário, com os buffers no espaço dele
+    // (o término os devolve).
     let ran = with_test_process("partition.exe", None, |_| {
+        let Ok(block) = memory::map_user_region(0x1000) else {
+            assert(false, "partition: memoria de usuario");
+            return;
+        };
+        let (attributes, unicode, text, result, maximum, rsp) = (block, block + 48, block + 64, block + 256, block + 272, block + 0x400);
+        let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
+        let set_name = |name: &str, flags: u32, root: u64| {
+            set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, root, unicode, flags);
+            let length = write_wide(text, name);
+            set_unicode(unsafe { nt::UnicodeString::at(unicode) }, length, length + 2, text);
+        };
         set_name("\\KernelObjects\\MemoryPartition0", 0x42, 0);
         let opened = call("NtOpenPartition", result, 3, attributes, 0);
         let handle = guest::read64(result);
@@ -4284,9 +4294,6 @@ fn memory_partition(assert: Assert) {
     // nativa; a seção destruída solta a referência da partição.
     let restored = (guest::read64(body), guest::read32(body + 8)) == (base_refs, base_handles);
     assert(restored && partition::get() == Some(body), "partition: o fim do processo fecha particao e secao e o alocador fica");
-    if let Some(region) = memory::find_region(block) {
-        memory::release_private_region(&region);
-    }
 }
 
 fn service_dispatcher_channel(assert: Assert) {
@@ -4684,20 +4691,21 @@ fn usermode_syscalls_exports(assert: Assert) {
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::handles::UserProcess;
     use crate::ntos::ps::user::{memory, threads, user_apc};
-    let Ok(block) = memory::map_user_region(0x4000) else {
-        assert(false, "userapc: memoria de usuario");
-        return;
-    };
-    let rsp = block + 0x3800;
-    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
-    // Argumentos de pilha 5.. (ULONG_PTR em [rsp+0x28]...).
-    let stack = |index: u64, value: u64| unsafe { nt::Field::<u64>::at(rsp + 0x28 + (index - 5) * 8) }.set(value);
-    let (dispatcher, routine, routine2, oa, cid, out, timeout, name, getbuf, uctx) = (block + 0x100, block + 0x180, block + 0x1C0, block + 0x500, block + 0x540, block + 0x580, block + 0x5C0, block + 0x5D0, block + 0x1000, block + 0x1800);
     // Processo e threads de usuário (não de sistema) num processo real; a
-    // thread do processo de teste é a corrente.
+    // thread do processo de teste é a corrente, e os buffers dos serviços
+    // ficam no espaço dele (o término os devolve).
     let saved_exports = state::with(|state| state.ntdll_exports.clone());
     let previous_current = threads::current();
     let ran = with_test_process("apc.exe", None, |test| {
+        let Ok(block) = memory::map_user_region(0x4000) else {
+            assert(false, "userapc: memoria de usuario");
+            return;
+        };
+        let rsp = block + 0x3800;
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+        // Argumentos de pilha 5.. (ULONG_PTR em [rsp+0x28]...).
+        let stack = |index: u64, value: u64| unsafe { nt::Field::<u64>::at(rsp + 0x28 + (index - 5) * 8) }.set(value);
+        let (dispatcher, routine, routine2, oa, cid, out, timeout, name, getbuf, uctx) = (block + 0x100, block + 0x180, block + 0x1C0, block + 0x500, block + 0x540, block + 0x580, block + 0x5C0, block + 0x5D0, block + 0x1000, block + 0x1800);
         let (owner, process_id, first, first_id) = (test.process, test.process_id, test.thread, test.thread_id);
         let Ok(second) = process::create_kernel_thread(owner, crate::ntos::ps::cid::ALLOCATE, true, 1, None) else {
             assert(false, "userapc: threads do processo");
@@ -4892,9 +4900,6 @@ fn usermode_syscalls_exports(assert: Assert) {
         let _ = process::release_thread(second);
     });
     assert(ran.is_some(), "userapc: processo de usuario");
-    if let Some(region) = memory::find_region(block) {
-        memory::release_private_region(&region);
-    }
 }
 
 pub fn run(assert: Assert) {
@@ -4964,6 +4969,7 @@ pub fn run(assert: Assert) {
     user_windows_process(assert);
     // Depois dele: a ntdll, o apiset e o NLS do processo de usuário já estão prontos.
     crate::ntos::test::multiprocess::lifecycle::run(assert);
+    crate::ntos::test::multiprocess::ownership::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

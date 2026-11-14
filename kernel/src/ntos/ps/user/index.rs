@@ -1,16 +1,18 @@
 //! Subsistema de modo usuário.
 //!
 //! `init` arma o anel 3 (pilhas reserva e de falta dupla, GDT/TSS da HAL,
-//! KUSER_SHARED_DATA no endereço de usuário, registro semeado);
+//! KUSER_SHARED_DATA no endereço de usuário, modo estrito de posse da
+//! memória de usuário, registro semeado);
 //! `invoke_service` é a ponte que o gateway nativo escolhido pelo descritor
 //! usa para chegar ao handler registrado por nome. Os módulos de área
 //! registram seus handlers no init do ntoskrnl.
 
 use crate::ntos::ex::system_services;
 use crate::ntos::ke::clock;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, paging, shared_user_data};
 use crate::ntos::ps::{process, system_process_information};
-use crate::ntos::ps::user::registry;
+use crate::ntos::ps::user::{memory, registry};
 use crate::ntos::ps::user::state::{self, STATUS_NOT_IMPLEMENTED};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -70,6 +72,9 @@ pub fn init() -> Result<(), KernelError> {
         return Err(KernelError::new("mapPage falhou p/ KUSER_SHARED_DATA de usuario"));
     }
     crate::debug_print!("[usermode] ring 3 armado: GDT em {:#x}, pilha reserva ate {:#x}, IST da falta dupla ate {:#x}, KUSER user em 0x7FFE0000", gdt, top, double_fault.initial);
+    // Modo estrito de posse: daqui em diante toda sonda de VA de usuário
+    // exige o processo dono corrente (ou anexado) ou uma faixa de sistema.
+    guest::set_ownership_check(Some(memory::check_user_access));
     registry::seed_registry_for_user_mode()?;
     let initializers = *LATE_INITIALIZERS.lock();
     for initializer in initializers.into_iter().flatten() {

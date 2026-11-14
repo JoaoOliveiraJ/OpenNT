@@ -300,6 +300,9 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     if let Some(created) = options.on_process_created {
         created(process_id).map_err(fail)?;
     }
+    // Daqui em diante a thread do processo é a corrente: a PEB e o CONTEXT
+    // inicial são memória de usuário dele.
+    process::set_current_thread(thread_pointer);
     // A ntdll inicializa PEB.Ldr e carrega as dependências; o heap e o
     // runtime vêm antes dos DllMain.
     // SAFETY: o EPROCESS do processo em montagem.
@@ -327,7 +330,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     initial.rdx.set(peb);
     initial.rsp.set(stack_top);
     initial.rip.set(start);
-    process::set_current_thread(thread_pointer);
     notify_initial_images(process_pointer, Image { image_base: image.image_base, size_of_image: image.size_of_image }, &source).map_err(fail)?;
     crate::debug_print!("[usermode] {}: LdrInitializeThunk em {:#x} (exe entry {:#x}, teb {:#x})", image_name, initialize, image.entry_point, teb);
     let result = threads::run(&main, initialize, stack_top, context, ntdll.image_base);
@@ -336,9 +338,10 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     }
     let exit_code = result.map_err(fail)?;
     // O post-mortem lê a pilha, as imagens e o Ldr antes de o término
-    // devolver o VAD.
+    // devolver o VAD, anexado ao processo: o laço devolveu a thread de quem
+    // o chamou.
     if exit_code != 0x42 && exit_code != 0 {
-        post_mortem(process_pointer);
+        let _ = process_context::with_process(process_pointer, || post_mortem(process_pointer));
     }
     end(exit_code);
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
@@ -348,7 +351,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
 }
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha
-/// publicada pela HAL e o Ldr real do processo.
+/// publicada pela HAL e o Ldr real do processo, que é o corrente (anexado).
 fn post_mortem(process_pointer: u64) {
     // A pilha da thread que encerrou o processo.
     let termination = threads::of_process(process_pointer).iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);

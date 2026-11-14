@@ -189,6 +189,24 @@ layout dos cabeçalhos e checagem de tipo. O OpenNT faz o mesmo:
   `probe_get`/`probe_set` fazem cada acesso por `try_read`/`try_write` de
   `mm/guest_memory.rs`, que devolvem `STATUS_ACCESS_VIOLATION` — o equivalente
   do `__try/__except`. Memória do kernel e de drivers não é sondada.
+- **Posse da memória de usuário (modo estrito)**: ligado em todo boot (a
+  suíte e o boot normal) quando o anel 3 é armado
+  (`ps/user/index.rs::init`). Toda sonda de uma VA de usuário
+  (`try_read`/`try_write`/`*_bytes`, `read_bytes`/`write_bytes`, os atômicos,
+  `probe_get`/`probe_set` e `try_at`) confere, antes do acesso, que a página
+  presente é do VAD do processo corrente (`KTHREAD.ApcState.Process`, o
+  anexado durante um attach) ou de uma faixa de sistema que todo processo
+  vê na mesma VA: a visão de usuário da KUSER_SHARED_DATA, as regiões
+  compartilhadas (NLS), as vistas de sistema e as imagens mapeadas uma vez
+  (ntdll e apiset). O verificador é `ps/user/memory.rs::check_user_access`,
+  instalado em `guest_memory::set_ownership_check`. Uma página do VAD de
+  outro processo, ou presente e sem dono, para o sistema com `*** PANIC`
+  (VA, dono, processo e thread correntes e a linha do chamador, propagada
+  por `#[track_caller]` nas rotinas de sonda); uma VA sem página só dá
+  ACCESS_VIOLATION, como num espaço próprio. Quem toca a memória de outro
+  processo anexa ao dono antes (seção 4). Os acessos confiáveis
+  (`get`/`set` e `guest::read`/`write`) não passam pela sonda e não são
+  conferidos.
 - **Código novo não escreve offsets à mão** (`base + 0x30`, `guest::read32(x +
   CONSTANTE)`). As constantes de `nt_abi.rs` continuam enquanto as chamadas
   antigas migram; cada uma que corresponde a um campo real é conferida em
@@ -451,8 +469,9 @@ PML4:
   carregada em alguma CPU também é recusada.
 - **Troca de CR3** (`ke/context_switch.rs`, o KiSwapProcess). Fora da troca,
   o CR3 de cada CPU é o KPROCESS.DirectoryTableBase de
-  `KTHREAD.ApcState.Process` da thread corrente. KeStackAttachProcess e
-  KeAttachProcess carregam a raiz do destino quando ela difere da carregada;
+  `KTHREAD.ApcState.Process` da thread corrente. KeStackAttachProcess,
+  KeAttachProcess e o escopo `ps/process_context.rs::with_process` carregam
+  a raiz do destino quando ela difere da carregada;
   KeUnstackDetachProcess e KeDetachProcess, a do processo que o KAPC_STATE
   salvo devolve, então o aninhamento é o dos KAPC_STATE, como no NT. A
   CPU também passa de um KPROCESS.ActiveProcessors para o outro. O attach
@@ -566,6 +585,27 @@ carregado é recusado.
   chamador trocar de volta e chamar de novo. Toda falha depois da criação
   de um processo também passa pelo término. Teste:
   `ntos/test/multiprocess/lifecycle.rs`.
+- **Memória de usuário de outro processo**: o kernel só toca a memória de
+  usuário do processo corrente; para a de outro, anexa ao dono antes, como
+  o KeStackAttachProcess do NT. O escopo é `ps/process_context.rs::
+  with_process`, que troca o KAPC_STATE e carrega a raiz do alvo como o
+  attach (`ke/context_switch.rs`), voltando à do processo restaurado. Rodam
+  anexados: a cópia de conclusão de `device_io` (SystemBuffer e IOSB, que o
+  pump do laço conclui no contexto de quem o chamou), a cópia final do
+  IofCompleteRequest de um IRP de modo usuário (IOSB e buffer vão para o
+  processo de Irp->Tail.Overlay.Thread, como a APC de conclusão do NT; um
+  processo que já saiu não recebe a cópia), o post-mortem do
+  `run_windows_process` (o laço devolveu a thread do chamador), a montagem
+  do processo (já era) e a criação de workers de fábrica (já era). A PEB e
+  o CONTEXT inicial do processo novo são escritos com a thread dele já
+  corrente, e a notificação de carga de imagem do loader do kernel vem
+  depois de a imagem entrar no VAD do processo, onde os callbacks a leem.
+  As entregas que a thread recebe numa espera sondada (pacotes de conclusão,
+  mensagens ALPC, workers de fábrica) rodam como a própria thread
+  (`refresh_ready_user_threads` a torna a corrente), e as APCs de kernel
+  drenadas também (`drain_kernel_apcs`); os pumps de ALPC, de pacotes de
+  espera e de timers só mexem em memória do kernel. O modo estrito de posse
+  (seção 3.3) confere tudo isso. Teste: `ntos/test/multiprocess/ownership.rs`.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
@@ -585,6 +625,9 @@ carregado é recusado.
   threads dos testes multiprocesso pegam ids com `cid::ALLOCATE`, para que
   um objeto vazado por um teste não quebre outro; as asserções sobre um
   processo que já saiu leem o EPROCESS retido pelo teste, não estado global.
+  Os buffers que um teste passa aos serviços de um processo de teste são
+  memória desse processo (alocados dentro do corpo de `with_test_process`,
+  ou anexado a ele): o modo estrito de posse recusa a memória de outro.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
   `--trace-driver-api` mostra cada export chamado (veja o README).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,

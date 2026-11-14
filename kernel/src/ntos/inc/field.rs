@@ -146,11 +146,13 @@ impl<T: Copy> Field<T> {
 impl<T: GuestScalar> Field<T> {
     /// Leitura sondada (ponteiro não confiável): `guest_memory::try_read`,
     /// ACCESS_VIOLATION se a página não estiver mapeada, senão um acesso.
+    #[track_caller]
     pub fn probe_get(&self) -> Result<T, KernelError> {
         guest::try_read(self.address())
     }
 
     /// Escrita sondada (ponteiro não confiável): `guest_memory::try_write`.
+    #[track_caller]
     pub fn probe_set(&self, value: T) -> Result<(), KernelError> {
         guest::try_write(self.address(), value)
     }
@@ -265,10 +267,12 @@ impl<T: Copy> UnalignedField<T> {
 }
 
 impl<T: GuestScalar> UnalignedField<T> {
+    #[track_caller]
     pub fn probe_get(&self) -> Result<T, KernelError> {
         guest::try_read(self.address())
     }
 
+    #[track_caller]
     pub fn probe_set(&self, value: T) -> Result<(), KernelError> {
         guest::try_write(self.address(), value)
     }
@@ -322,6 +326,7 @@ pub unsafe trait NtStruct: Sized + Sync {
     /// alinhamento e cada página) antes de criar a referência — o
     /// `ProbeForRead` do NT. Os acessos seguintes a um objeto de modo usuário
     /// devem continuar usando `probe_get`/`probe_set`.
+    #[track_caller]
     fn try_at(address: u64) -> Result<&'static Self, KernelError> {
         probe_range(address, size_of::<Self>() as u64, align_of::<Self>() as u64)?;
         // SAFETY: o intervalo inteiro está mapeado e alinhado.
@@ -342,6 +347,7 @@ unsafe impl<T: Copy> NtStruct for Field<T> {}
 
 // ---- sondas -------------------------------------------------------------------
 
+#[track_caller]
 fn probe_range(address: u64, length: u64, alignment: u64) -> Result<(), KernelError> {
     if address == 0 {
         return Err(guest::address_fault(address));
