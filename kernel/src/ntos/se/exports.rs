@@ -926,3 +926,19 @@ pub mod query_security_attributes {
 
     pub static GROUP: Group = Group { name: "query-security-attributes", names: &["ZwQuerySecurityAttributesToken"], handlers: &[query], data_exports: &[] };
 }
+
+pub mod zw_adjust_privileges_token {
+    //! ZwAdjustPrivilegesToken; a lógica mora em `se/token/adjust`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::token::adjust;
+    use crate::rtl::KernelError;
+
+    /// ZwAdjustPrivilegesToken(TokenHandle, DisableAllPrivileges, NewState,
+    /// BufferLength, PreviousState, ReturnLength).
+    fn adjust_privileges_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(adjust::adjust_privileges_token(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6))?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-adjust-privileges-token", names: &["ZwAdjustPrivilegesToken"], handlers: &[adjust_privileges_token], data_exports: &[] };
+}

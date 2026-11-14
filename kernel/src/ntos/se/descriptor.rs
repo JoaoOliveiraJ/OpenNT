@@ -457,3 +457,67 @@ pub fn self_relative_to_absolute(relative: u64, out: &AbsoluteBuffers) -> u32 {
     }
     0
 }
+
+// ---- Self-relative -> absoluto no mesmo buffer (RtlSelfRelativeToAbsoluteSD2)
+
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+
+/// RtlSelfRelativeToAbsoluteSD2(SelfRelativeSecurityDescriptor, BufferSize*):
+/// converte no próprio buffer. Os componentes (pelo
+/// RtlpQuerySecurityDescriptor) andam 0x14 bytes para dar lugar ao
+/// cabeçalho absoluto de 0x28: o tamanho necessário é 0x28 mais o trecho do
+/// fim do cabeçalho relativo até o fim do último componente, arredondado a
+/// 8 (o fim é o do maior entre dono e grupo, trocado pelo da DACL e depois
+/// pelo da SACL quando eles começam depois). Sem espaço, grava o necessário
+/// em *BufferSize e devolve STATUS_BUFFER_TOO_SMALL; buffer menor que o
+/// cabeçalho relativo é STATUS_INVALID_PARAMETER; SD sem SE_SELF_RELATIVE é
+/// STATUS_BAD_DESCRIPTOR_FORMAT. No sucesso SE_SELF_RELATIVE sai do Control
+/// e os quatro ponteiros apontam os componentes deslocados (*BufferSize não
+/// muda).
+pub fn self_relative_to_absolute_in_place(descriptor: u64, buffer_size: u64) -> u32 {
+    if descriptor == 0 {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    if buffer_size == 0 {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    // SAFETY: o PULONG BufferSize do chamador de kernel.
+    let size = unsafe { crate::ntos::inc::types::Field::<u32>::at(buffer_size) };
+    let available = size.get();
+    if available < RELATIVE_HEADER {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let flags = control(descriptor);
+    if flags & SELF_RELATIVE == 0 {
+        return STATUS_BAD_DESCRIPTOR_FORMAT;
+    }
+    let (owner, group, sacl, dacl) = (component(descriptor, flags, 0), component(descriptor, flags, 1), component(descriptor, flags, 2), component(descriptor, flags, 3));
+    let mut end = if owner > group { owner + sid_query_length(owner) as u64 } else { group + sid_query_length(group) as u64 };
+    if end <= dacl {
+        end = dacl + acl_query_length(dacl) as u64;
+    }
+    if end <= sacl {
+        end = sacl + acl_query_length(sacl) as u64;
+    }
+    let absolute_size = SecurityDescriptor::SIZE as u32;
+    let needed = if end == 0 { absolute_size } else { ((end.wrapping_sub(descriptor) as u32).wrapping_sub(RELATIVE_HEADER - 7) & !7).wrapping_add(absolute_size) };
+    if needed > available {
+        size.set(needed);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if end != 0 {
+        // Sobreposto (o memcpy do kernel é memmove).
+        copy_component(descriptor + absolute_size as u64, descriptor + RELATIVE_HEADER as u64, needed - absolute_size);
+    }
+    // SAFETY: o mesmo buffer, agora com o layout absoluto de 0x28 bytes.
+    let absolute = unsafe { SecurityDescriptor::at(descriptor) };
+    absolute.control.set(absolute.control.get() & !SELF_RELATIVE);
+    let moved = |pointer: u64| if pointer != 0 { pointer + RELATIVE_HEADER as u64 } else { 0 };
+    absolute.owner.set(moved(owner));
+    absolute.group.set(moved(group));
+    absolute.sacl.set(moved(sacl));
+    absolute.dacl.set(moved(dacl));
+    0
+}

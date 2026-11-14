@@ -407,6 +407,9 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("rtl-unicode-prefix", 1831, 4),
     ("rtl-app-container", 1835, 2),
     ("ps-paged-pool-quota", 1837, 2),
+    ("zw-adjust-privileges-token", 1839, 1),
+    ("rtl-self-relative-sd2", 1840, 1),
+    ("fsrtl-ecp-initialize", 1841, 2),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2250,4 +2253,8 @@ pub static EXPORT_NAMES: &[&str] = &[
     "RtlGetAppContainerParent",
     "PsChargeProcessPagedPoolQuota",
     "PsReturnProcessPagedPoolQuota",
+    "ZwAdjustPrivilegesToken",
+    "RtlSelfRelativeToAbsoluteSD2",
+    "FsRtlInitializeExtraCreateParameterList",
+    "FsRtlInitializeExtraCreateParameter",
 ];

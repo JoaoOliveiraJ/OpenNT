@@ -201,6 +201,40 @@ pub fn allocate_list(flags: u32, list_out: &Field<u64>) -> Result<u32, KernelErr
     Ok(STATUS_SUCCESS)
 }
 
+/// FsRtlInitializeExtraCreateParameterList(EcpList): uma _ECP_LIST que o
+/// chamador alocou ('EcpL', Flags 0, lista vazia); NULL é
+/// STATUS_INVALID_PARAMETER.
+pub fn initialize_list(list: u64) -> u32 {
+    if list == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: a _ECP_LIST do chamador de kernel.
+    let list = unsafe { EcpList::at(list) };
+    list.flags.set(0);
+    list.ecp_list.blink.set(list.ecp_list.address());
+    list.ecp_list.flink.set(list.ecp_list.address());
+    list.signature.set(ECP_LIST_SIGNATURE);
+    STATUS_SUCCESS
+}
+
+/// FsRtlInitializeExtraCreateParameter(Ecp, EcpFlags, CleanupCallback,
+/// TotalSize, EcpType, ListAllocatedFrom): o cabeçalho de uma ECP que o
+/// chamador alocou — 'EcpH' com o dword seguinte zerado, fora de lista, o
+/// GUID, a rotina de limpeza, as flags e o tamanho dados, a lookaside de
+/// origem e sem contexto do FltMgr.
+pub fn initialize(header: &EcpHeader, flags: u32, cleanup_callback: u64, total_size: u32, ecp_type: &Guid, list_allocated_from: u64) {
+    header.signature.set(ECP_HEADER_SIGNATURE);
+    header._reserved_4.set(0);
+    header.list_entry.blink.set(0);
+    header.list_entry.flink.set(0);
+    guest::write_bytes(header.ecp_type.address(), &guest::read_bytes(ecp_type.address(), Guid::SIZE as usize));
+    header.cleanup_callback.set(cleanup_callback);
+    header.flags.set(flags);
+    header.total_size.set(total_size);
+    header.lookaside.set(list_allocated_from);
+    header.flt_context.set(0);
+}
+
 /// FsRtlFreeExtraCreateParameter(EcpContext): CleanupCallback(P, &EcpType)
 /// e devolve o bloco à lookaside dona ou ao pool.
 pub fn free(context: u64) -> Result<(), KernelError> {

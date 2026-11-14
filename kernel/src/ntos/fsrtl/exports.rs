@@ -1743,3 +1743,35 @@ pub mod fsrtl_dbcs_expression {
 
     pub static GROUP: Group = Group { name: "fsrtl-dbcs-expression", names: &["FsRtlIsDbcsInExpression"], handlers: &[is_dbcs_in_expression], data_exports: &[] };
 }
+
+pub mod fsrtl_ecp_initialize {
+    //! FsRtlInitializeExtraCreateParameterList e
+    //! FsRtlInitializeExtraCreateParameter; a lógica mora em `fsrtl::ecp`.
+
+    use crate::ntos::fsrtl::ecp::{self, EcpHeader};
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::Guid;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlInitializeExtraCreateParameterList(EcpList).
+    fn initialize_list(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(ecp::initialize_list(call.arg(1))))
+    }
+
+    /// FsRtlInitializeExtraCreateParameter(Ecp, EcpFlags, CleanupCallback,
+    /// TotalSize, EcpType, ListAllocatedFrom).
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o ECP_HEADER e o GUID do chamador de kernel.
+        let (header, ecp_type) = unsafe { (EcpHeader::at(call.arg(1)), Guid::at(call.arg(5))) };
+        ecp::initialize(header, call.arg(2) as u32, call.arg(3), call.arg(4) as u32, ecp_type, call.arg(6));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-ecp-initialize",
+        names: &["FsRtlInitializeExtraCreateParameterList", "FsRtlInitializeExtraCreateParameter"],
+        handlers: &[initialize_list, initialize],
+        data_exports: &[],
+    };
+}

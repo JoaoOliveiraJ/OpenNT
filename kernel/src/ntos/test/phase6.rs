@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1839 && abi_names::GROUP_LAYOUT.len() == 401 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1839 exports em 401 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1843 && abi_names::GROUP_LAYOUT.len() == 404 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1843 exports em 404 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1455,7 +1455,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1839 && exports::export_names().len() == 1839, "ntoskrnl: 401 grupos com os 1839 exports implementados");
+    assert(exports::implemented() == 1843 && exports::export_names().len() == 1843, "ntoskrnl: 404 grupos com os 1843 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11196,6 +11196,139 @@ fn whea_error_source_exports(assert: Assert) {
     assert(call_export("WheaReportHwError", &[packet]) == Some(signed_status(0xC000_000D)), "whea-error-source: pacote sem 'ErPt' recusado");
 }
 
+/// RtlSelfRelativeToAbsoluteSD2: conversão no próprio buffer (vetores do
+/// modelo da desmontagem) e as recusas de parâmetro.
+fn rtl_self_relative_sd2_exports(assert: Assert) {
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let buffer = guest::alloc_bytes(0x80);
+    let size = guest::alloc_bytes(8);
+    let build = || {
+        guest::write_bytes(buffer, &[0xAA; 0x80]);
+        // Cabeçalho relativo: SE_SELF_RELATIVE | SE_DACL_PRESENT, dono 0x14, grupo 0x20, DACL 0x30.
+        guest::write_bytes(buffer, &[1, 0, 0x04, 0x80, 0x14, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0x30, 0, 0, 0]);
+        // S-1-5-18 e S-1-5-32-544.
+        guest::write_bytes(buffer + 0x14, &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+        guest::write_bytes(buffer + 0x20, &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0]);
+        // ACL de 0x1C com um ACCESS_ALLOWED para S-1-1-0.
+        guest::write_bytes(buffer + 0x30, &[2, 0, 0x1C, 0, 1, 0, 0, 0, 0, 0, 0x14, 0, 0, 0, 0, 0x10, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+    };
+    build();
+    guest::write32(size, 0x4C);
+    let small = status(call_export("RtlSelfRelativeToAbsoluteSD2", &[buffer, size]));
+    let needed = guest::read32(size);
+    assert(small == 0xC000_0023 && needed == 0x60 && guest::read16(buffer + 2) == 0x8004, "rtl-self-relative-sd2: buffer pequeno informa 0x60");
+    let converted = status(call_export("RtlSelfRelativeToAbsoluteSD2", &[buffer, size]));
+    let sd = at::<nt::SecurityDescriptor>(buffer);
+    assert(
+        converted == 0
+            && guest::read32(size) == 0x60
+            && sd.control.get() == 0x0004
+            && sd.owner.get() == buffer + 0x28
+            && sd.group.get() == buffer + 0x34
+            && sd.sacl.get() == 0
+            && sd.dacl.get() == buffer + 0x44
+            && guest::read_bytes(buffer + 0x28, 12) == [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]
+            && guest::read_bytes(buffer + 0x40, 4) == [0x20, 2, 0, 0]
+            && guest::read16(buffer + 0x46) == 0x1C,
+        "rtl-self-relative-sd2: componentes deslocados 0x14 bytes e ponteiros absolutos",
+    );
+    let again = status(call_export("RtlSelfRelativeToAbsoluteSD2", &[buffer, size]));
+    guest::write32(size, 0x13);
+    build();
+    let tiny = status(call_export("RtlSelfRelativeToAbsoluteSD2", &[buffer, size]));
+    let nulls = (status(call_export("RtlSelfRelativeToAbsoluteSD2", &[0, size])), status(call_export("RtlSelfRelativeToAbsoluteSD2", &[buffer, 0])));
+    assert(again == 0xC000_00E7 && tiny == 0xC000_000D && nulls == (0xC000_00EF, 0xC000_00F0), "rtl-self-relative-sd2: absoluto, buffer menor que o cabeçalho e ponteiros nulos");
+    guest::free_bytes(buffer);
+    guest::free_bytes(size);
+}
+
+/// FsRtlInitializeExtraCreateParameterList/FsRtlInitializeExtraCreateParameter
+/// em memória do chamador, usáveis pelo resto do motor de ECP.
+fn fsrtl_ecp_initialize_exports(assert: Assert) {
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let list = guest::alloc_bytes(0x18);
+    guest::write_bytes(list, &[0xCC; 0x18]);
+    let header = guest::alloc_bytes(0x58);
+    guest::write_bytes(header, &[0xCC; 0x58]);
+    let guid = guest::alloc_bytes(0x20);
+    guest::write_bytes(guid, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F]);
+    let outputs = guid + 0x10;
+    let listed = status(call_export("FsRtlInitializeExtraCreateParameterList", &[list]));
+    let ecp_list = at::<nt::extra_fsrtl::EcpList>(list);
+    assert(listed == 0 && ecp_list.signature.get() == 0x4C70_6345 && ecp_list.flags.get() == 0 && ecp_list.ecp_list.flink.get() == list + 8 && ecp_list.ecp_list.blink.get() == list + 8 && status(call_export("FsRtlInitializeExtraCreateParameterList", &[0])) == 0xC000_000D, "fsrtl-ecp-initialize: lista 'EcpL' vazia e NULL recusado");
+    let _ = call_export("FsRtlInitializeExtraCreateParameter", &[header, 0x40, 0x1234, 0x58, guid, 0x5678]);
+    assert(
+        guest::read64(header) == 0x4870_6345 && guest::read64(header + 8) == 0 && guest::read64(header + 0x10) == 0 && guest::read_bytes(header + 0x18, 16) == guest::read_bytes(guid, 16) && guest::read64(header + 0x28) == 0x1234 && guest::read32(header + 0x30) == 0x40 && guest::read32(header + 0x34) == 0x58 && guest::read64(header + 0x38) == 0x5678 && guest::read64(header + 0x40) == 0,
+        "fsrtl-ecp-initialize: cabeçalho 'EcpH' com GUID, limpeza, flags, tamanho e origem",
+    );
+    let inserted = status(call_export("FsRtlInsertExtraCreateParameter", &[list, header + 0x48]));
+    let found = status(call_export("FsRtlFindExtraCreateParameter", &[list, guid, outputs, outputs + 8]));
+    assert(inserted == 0 && found == 0 && guest::read64(outputs) == header + 0x48 && guest::read32(outputs + 8) == 0x10, "fsrtl-ecp-initialize: a ECP inicializada entra na lista e é achada pelo GUID");
+    let _ = call_export("FsRtlRemoveExtraCreateParameter", &[list, guid, outputs, 0]);
+    for pointer in [list, header, guid] {
+        guest::free_bytes(pointer);
+    }
+}
+
+/// ZwAdjustPrivilegesToken sobre um token Medium próprio (handle de kernel):
+/// as duas passadas do SepAdjustPrivileges, o PreviousState, as recusas de
+/// integridade, DisableAll e SE_PRIVILEGE_REMOVED (vetores do modelo).
+fn zw_adjust_privileges_token_exports(assert: Assert) {
+    use crate::ntos::ob::close;
+    use crate::ntos::se::model::Privilege;
+    use crate::ntos::se::token::{handles as token_handles, tokens};
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let initialize = |token: &mut tokens::Token| {
+        token.integrity = alloc::vec![1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
+        token.privileges = [(2, 0), (19, 0), (23, 3), (25, 0), (20, 0)].iter().map(|&(id, attributes)| Privilege { id, attributes }).collect();
+    };
+    let Ok(token) = tokens::create(None, Some(&initialize)) else {
+        assert(false, "zw-adjust-privileges-token: token de teste");
+        return;
+    };
+    let handle = token_handles::create(token, 0x28, 0x200, false).unwrap_or(0);
+    let block = guest::alloc_bytes(0x100);
+    let (new_state, previous, returned) = (block, block + 0x40, block + 0xF0);
+    let write_state = |entries: &[(u32, u32)]| {
+        guest::write32(new_state, entries.len() as u32);
+        for (index, &(luid, attributes)) in entries.iter().enumerate() {
+            let at_entry = new_state + 4 + index as u64 * 12;
+            guest::write32(at_entry, luid);
+            guest::write32(at_entry + 4, 0);
+            guest::write32(at_entry + 8, attributes);
+        }
+    };
+    let privileges = || tokens::with(token, |record| record.privileges.iter().map(|privilege| (privilege.id, privilege.attributes)).collect::<Vec<_>>()).unwrap_or_default();
+    let modified = || tokens::with(token, |record| record.modified_id).unwrap_or(0);
+    let before = modified();
+    // Habilita 19, desabilita 23, pede 8 (ausente): STATUS_NOT_ALL_ASSIGNED com duas mudanças.
+    write_state(&[(19, 2), (23, 0), (8, 2)]);
+    guest::write_bytes(previous, &[0xEE; 0x40]);
+    let first = status(call_export("ZwAdjustPrivilegesToken", &[handle, 0, new_state, 0x40, previous, returned]));
+    let recorded = (guest::read32(previous), guest::read32(previous + 4), guest::read32(previous + 12), guest::read32(previous + 16), guest::read32(previous + 24));
+    assert(first == 0x106 && guest::read32(returned) == 0x1C && recorded == (2, 19, 0, 23, 3) && privileges() == [(2, 0), (19, 2), (23, 1), (25, 0), (20, 0)] && modified() != before, "zw-adjust-privileges-token: habilita, desabilita, PreviousState e ModifiedId; ausente não atribui");
+    // PreviousState sem espaço: STATUS_BUFFER_TOO_SMALL com 16 bytes e nada muda.
+    write_state(&[(25, 2)]);
+    let small = status(call_export("ZwAdjustPrivilegesToken", &[handle, 0, new_state, 8, previous, returned]));
+    assert(small == 0xC000_0023 && guest::read32(returned) == 16 && privileges()[3] == (25, 0), "zw-adjust-privileges-token: buffer pequeno informa o tamanho");
+    // SeDebugPrivilege (20) num token Medium: conta, mas não habilita.
+    write_state(&[(20, 2)]);
+    let denied = status(call_export("ZwAdjustPrivilegesToken", &[handle, 0, new_state, 0, 0, 0]));
+    assert(denied == 0x106 && privileges()[4] == (20, 0), "zw-adjust-privileges-token: integridade Medium recusa SeDebugPrivilege");
+    // DisableAllPrivileges: só o 19 estava habilitado.
+    let disabled = status(call_export("ZwAdjustPrivilegesToken", &[handle, 1, 0, 0x40, previous, returned]));
+    assert(disabled == 0 && guest::read32(previous) == 1 && guest::read32(previous + 4) == 19 && guest::read32(previous + 12) == 2 && privileges() == [(2, 0), (19, 0), (23, 1), (25, 0), (20, 0)], "zw-adjust-privileges-token: DisableAllPrivileges");
+    // SE_PRIVILEGE_REMOVED tira o 25 e marca TokenFlags.
+    write_state(&[(25, 4)]);
+    let removed = status(call_export("ZwAdjustPrivilegesToken", &[handle, 0, new_state, 0, 0, 0]));
+    assert(removed == 0 && privileges() == [(2, 0), (19, 0), (23, 1), (20, 0)] && tokens::body(token).token_flags.get() & 0x800 != 0, "zw-adjust-privileges-token: SE_PRIVILEGE_REMOVED");
+    let refused = (status(call_export("ZwAdjustPrivilegesToken", &[handle, 0, 0, 0, 0, 0])), status(call_export("ZwAdjustPrivilegesToken", &[0xFFFF_FFFF_8000_7FF0, 0, new_state, 0, 0, 0])));
+    assert(refused == (0xC000_000D, 0xC000_0008), "zw-adjust-privileges-token: NewState nulo e handle inválido");
+    let _ = close::close(handle, Some(0));
+    let _ = tokens::release(token);
+    guest::free_bytes(block);
+}
+
 
 /// ZwCreateEvent/ZwSetEvent/ZwResetEvent/ZwClearEvent em KernelMode e os
 /// exports de dados ExEventObjectType e KiBugCheckData na `.kdata`.
@@ -13019,6 +13152,9 @@ pub fn run(assert: Assert) {
     rtl_unicode_prefix_exports(assert);
     rtl_app_container_exports(assert);
     ps_paged_pool_quota_exports(assert);
+    rtl_self_relative_sd2_exports(assert);
+    fsrtl_ecp_initialize_exports(assert);
+    zw_adjust_privileges_token_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

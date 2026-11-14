@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 401] {
+fn groups() -> [&'static Group; 404] {
     [
         &crate::ntos::rtl::exports::rtl_unicode_prefix::GROUP,
         &crate::ntos::rtl::exports::rtl_app_container::GROUP,
@@ -456,6 +456,10 @@ fn groups() -> [&'static Group; 401] {
         &crate::ntos::se::exports::se_filter_token::GROUP,
         &crate::ntos::se::exports::query_security_attributes::GROUP,
         &crate::ntos::ob::exports::ob_object_type_ex::GROUP,
+
+        &crate::ntos::se::exports::zw_adjust_privileges_token::GROUP,
+        &crate::ntos::rtl::exports::rtl_self_relative_sd2::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_ecp_initialize::GROUP,
     ]
 }
 

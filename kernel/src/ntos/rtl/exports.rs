@@ -2609,3 +2609,18 @@ pub mod rtl_app_container {
 
     pub static GROUP: Group = Group { name: "rtl-app-container", names: &["RtlGetAppContainerSidType", "RtlGetAppContainerParent"], handlers: &[sid_type, parent], data_exports: &[] };
 }
+
+pub mod rtl_self_relative_sd2 {
+    //! RtlSelfRelativeToAbsoluteSD2; a lógica mora em `se/descriptor`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::descriptor;
+    use crate::rtl::KernelError;
+
+    /// RtlSelfRelativeToAbsoluteSD2(SelfRelativeSecurityDescriptor, BufferSize*).
+    fn self_relative_to_absolute_sd2(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(descriptor::self_relative_to_absolute_in_place(call.arg(1), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-self-relative-sd2", names: &["RtlSelfRelativeToAbsoluteSD2"], handlers: &[self_relative_to_absolute_sd2], data_exports: &[] };
+}
