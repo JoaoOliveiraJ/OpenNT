@@ -24,14 +24,17 @@ fn free_pool_export(call: &Call) -> Result<u64, KernelError> {
 fn free_pool_with_tag(call: &Call) -> Result<u64, KernelError> {
     ok(pool_allocation::free(call.arg(1), 0))
 }
+/// ExAllocatePool2(Flags, NumberOfBytes, Tag).
 fn allocate_pool2(call: &Call) -> Result<u64, KernelError> {
-    Ok(pool_allocation::allocate_zeroed(call.arg(2)))
+    pool_allocation::allocate_pool2(call.arg(1), call.arg(2), call.arg(3) as u32)
 }
+/// ExAllocatePoolZero(PoolType, NumberOfBytes, Tag).
 fn allocate_pool_zero(call: &Call) -> Result<u64, KernelError> {
-    Ok(pool_allocation::allocate_zeroed(call.arg(2)))
+    pool_allocation::allocate_typed(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, true)
 }
+/// ExAllocatePoolUninitialized(PoolType, NumberOfBytes, Tag).
 fn allocate_pool_uninitialized(call: &Call) -> Result<u64, KernelError> {
-    Ok(pool_allocation::allocate_uninitialized(call.arg(2)))
+    pool_allocation::allocate_typed(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, false)
 }
 fn free_pool2(call: &Call) -> Result<u64, KernelError> {
     ok(pool_allocation::free(call.arg(1), call.arg(2)))

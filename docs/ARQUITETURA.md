@@ -623,8 +623,15 @@ janela (o mapeamento reservado das MDLs) também ficam NX. Nada executa do
 heap nem da arena: as rotinas que o kernel entrega aos caminhos nativos (a
 rotina de kernel e de rundown das APCs de conclusão, o
 KeSpecialUserApcKernelRoutine, a rotina de conclusão dos IRPs retidos) são
-funções da imagem do kernel, chamadas pela ABI MS x64; o NonPagedPool
-executável dos drivers vem do pool executivo (`kernel_pool`), e o código
+funções da imagem do kernel, chamadas pela ABI MS x64. Os tipos de pool
+seguem o Windows 10 19041 (`ex/pool_allocation.rs`): o NonPagedPool (tipo 0,
+o NonPagedPoolExecute) e o NonPagedPoolCacheAligned, pelo
+ExAllocatePoolWithTag(Priority), ExAllocatePoolZero/Uninitialized e pelas
+listas lookaside, e o ExAllocatePool2 com POOL_FLAG_NON_PAGED_EXECUTE saem de
+regiões executáveis do pool executivo (`kernel_pool`, que nunca mistura
+páginas executáveis e NX numa região); o NonPagedPoolNx (0x200), o
+NonPagedPoolNxCacheAligned, o PagedPool e o ExAllocatePool2 com
+POOL_FLAG_NON_PAGED ou POOL_FLAG_PAGED ficam NX. O código
 que os autotestes geram (rotinas de drivers de teste, callbacks, corpos de
 threads nativas) fica numa imagem carregada ou numa alocação executável da
 janela de sistema, MmAllocateContiguousNodeMemory com PAGE_EXECUTE_READWRITE
@@ -633,7 +640,10 @@ confere as páginas da janela sem execução e chama, de uma imagem de teste
 numa execução nativa possuída, um endereço da arena com código: a busca da
 instrução falta e vira STATUS_ACCESS_VIOLATION de execução
 (ExceptionInformation[0] = 8), tratada pelo SEH da imagem; o mesmo código
-numa alocação executável roda.
+numa alocação executável roda, assim como num bloco do
+ExAllocatePoolWithTag/ExAllocatePoolZero(NonPagedPool) e do ExAllocatePool2
+com POOL_FLAG_NON_PAGED_EXECUTE, e num bloco do NonPagedPoolNx ou do
+ExAllocatePool2 com POOL_FLAG_NON_PAGED falta da mesma forma.
 `paging::map_kernel_heap_window` monta a janela no boot, antes da primeira
 alocação, com a PDPT e a PD fixas em 0x7B000-0x7CFFF. O `kmalloc` (e com ele
 todo `Box`/`Vec` do kernel) e a arena de 16 MB reservada dele devolvem VAs

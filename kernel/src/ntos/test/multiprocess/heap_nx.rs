@@ -15,6 +15,14 @@
 //!   com PAGE_EXECUTE_READWRITE) roda e devolve 0x1234 pela mesma função: o
 //!   código que precisa executar tem onde ficar (o fixture dos callbacks de
 //!   objeto da fase 3 usa a mesma alocação).
+//! - Os tipos de pool seguem o Windows 10 19041 (`ex/pool_allocation.rs`):
+//!   o código copiado num bloco do ExAllocatePoolWithTag(NonPagedPool), do
+//!   ExAllocatePoolZero(NonPagedPool) e do ExAllocatePool2 com
+//!   POOL_FLAG_NON_PAGED_EXECUTE roda pela mesma função e devolve 0x1234; o
+//!   de um bloco do ExAllocatePoolWithTag(NonPagedPoolNx) e do
+//!   ExAllocatePool2 com POOL_FLAG_NON_PAGED falta com o STATUS_ACCESS_VIOLATION
+//!   de execução, tratado pelo SEH da imagem. As páginas dos blocos
+//!   executáveis estão sem NX e as dos NX com NX nas tabelas.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -33,6 +41,15 @@ const CODE: [u8; 6] = [0xB8, 0x34, 0x12, 0x00, 0x00, 0xC3];
 /// STATUS_ACCESS_VIOLATION com ExceptionInformation[0] = 8 (execução) na
 /// parte alta.
 const EXECUTE_FAULT: u64 = 8 << 32 | 0xC000_0005;
+
+/// Tag dos blocos de pool do teste.
+const TAG: u64 = u32::from_le_bytes(*b"HpNx") as u64;
+/// NonPagedPool (o NonPagedPoolExecute) e NonPagedPoolNx.
+const NON_PAGED_POOL: u64 = 0;
+const NON_PAGED_POOL_NX: u64 = 0x200;
+/// POOL_FLAG_NON_PAGED (NX) e POOL_FLAG_NON_PAGED_EXECUTE.
+const POOL_FLAG_NON_PAGED: u64 = 0x40;
+const POOL_FLAG_NON_PAGED_EXECUTE: u64 = 0x80;
 
 /// A janela do heap não executa em `va`.
 fn no_execute(va: u64) -> bool {
@@ -104,8 +121,42 @@ pub fn run(assert: Assert) {
     if executable != 0 {
         assert(contiguous_memory::free(executable).is_ok(), "heap nx: alocacao executavel devolvida");
     }
+    pool_types(assert, base);
     let _ = unwind::delete_function_table(base + 0x1500);
     let _ = image.release();
     guest::free_bytes(arena);
     drop(boxed);
+}
+
+/// Copia o código num bloco de pool pedido por `export(arguments)` e o chama
+/// pela função F da imagem em `base`: (bloco, sem NX nas tabelas, resultado).
+fn run_from_pool(base: u64, export: &str, arguments: &[u64]) -> (u64, bool, Option<u64>) {
+    let call_export = crate::ntos::test::phase6::call_export;
+    let block = call_export(export, arguments).unwrap_or(0);
+    if block == 0 {
+        return (0, false, None);
+    }
+    guest::write_bytes(block, &CODE);
+    let executable = !no_execute(block);
+    let result = native_context::call(base + 0x1300, &[block], 0).ok();
+    call_export("ExFreePoolWithTag", &[block, TAG]);
+    (block, executable, result)
+}
+
+/// Os tipos de pool executáveis rodam o código; os NX faltam (o SEH trata).
+fn pool_types(assert: Assert, base: u64) {
+    let executes = |(block, executable, result): (u64, bool, Option<u64>)| block != 0 && executable && result == Some(0x1234);
+    let faults = |(block, executable, result): (u64, bool, Option<u64>)| block != 0 && !executable && result == Some(EXECUTE_FAULT);
+    let tagged = run_from_pool(base, "ExAllocatePoolWithTag", &[NON_PAGED_POOL, 64, TAG]);
+    let zeroed = run_from_pool(base, "ExAllocatePoolZero", &[NON_PAGED_POOL, 64, TAG]);
+    let pool2 = run_from_pool(base, "ExAllocatePool2", &[POOL_FLAG_NON_PAGED_EXECUTE, 64, TAG]);
+    let tagged_nx = run_from_pool(base, "ExAllocatePoolWithTag", &[NON_PAGED_POOL_NX, 64, TAG]);
+    let pool2_nx = run_from_pool(base, "ExAllocatePool2", &[POOL_FLAG_NON_PAGED, 64, TAG]);
+    if !(executes(tagged) && executes(zeroed) && executes(pool2) && faults(tagged_nx) && faults(pool2_nx)) {
+        crate::debug_print!("[heap-nx] pool: NonPagedPool {:x?} Zero {:x?} Pool2 exec {:x?} NonPagedPoolNx {:x?} Pool2 NX {:x?}", tagged, zeroed, pool2, tagged_nx, pool2_nx);
+    }
+    assert(executes(tagged) && executes(zeroed), "heap nx: codigo num bloco do ExAllocatePoolWithTag/ExAllocatePoolZero(NonPagedPool) roda (o NonPagedPool executa)");
+    assert(executes(pool2), "heap nx: codigo num bloco do ExAllocatePool2 com POOL_FLAG_NON_PAGED_EXECUTE roda");
+    assert(faults(tagged_nx), "heap nx: codigo num bloco do ExAllocatePoolWithTag(NonPagedPoolNx) falta e o SEH da imagem trata");
+    assert(faults(pool2_nx), "heap nx: codigo num bloco do ExAllocatePool2 com POOL_FLAG_NON_PAGED (NX) falta e o SEH da imagem trata");
 }

@@ -4,6 +4,14 @@
 //! pedidos inválidos provocam bugcheck 0xC2 e a falha com RAISE levanta
 //! STATUS_INSUFFICIENT_RESOURCES. Também as variantes ExAllocatePool2/Zero/
 //! Uninitialized e a liberação (ExFreePool*), que encaminha ao pool dono.
+//!
+//! Execução, como no Windows 10 19041: o NonPagedPool (tipo 0, o
+//! NonPagedPoolExecute) e o NonPagedPoolCacheAligned (4), e o
+//! ExAllocatePool2 com POOL_FLAG_NON_PAGED_EXECUTE, saem de regiões
+//! executáveis do pool executivo (`kernel_pool`, que não mistura páginas
+//! executáveis e NX); o NonPagedPoolNx (0x200), o NonPagedPoolNxCacheAligned
+//! (0x204), o PagedPool e o resto ficam sem execução, no pool executivo NX
+//! ou na arena da janela do heap.
 
 use crate::ntos::ke::{bugcheck, irql};
 use crate::ntos::mm::data_pool;
@@ -72,15 +80,55 @@ pub fn allocate_tagged(pool_type: u32, bytes: u64, tag: u32) -> Result<u64, Kern
     allocate_priority(pool_type, bytes, tag, 32)
 }
 
-/// ExAllocatePool2/ExAllocatePoolZero: POOL_FLAGS só escolhe paginado/não
-/// paginado; o pool do convidado é único e a memória sai zerada.
-pub fn allocate_zeroed(bytes: u64) -> u64 {
-    guest::alloc_bytes(bytes)
+/// POOL_FLAGS do ExAllocatePool2 (wdm.h).
+const POOL_FLAG_UNINITIALIZED: u64 = 0x2;
+const POOL_FLAG_CACHE_ALIGNED: u64 = 0x8;
+const POOL_FLAG_RAISE_ON_FAILURE: u64 = 0x20;
+const POOL_FLAG_NON_PAGED_EXECUTE: u64 = 0x80;
+
+/// O tipo (sem os modificadores de RAISE, frio e zero) é de pool não
+/// paginado executável: NonPagedPool/NonPagedPoolExecute (0) ou
+/// NonPagedPoolCacheAligned (4).
+pub fn executable_pool_type(pool_type: u32) -> bool {
+    matches!(pool_type & !(RAISE_ON_ALLOCATION_FAILURE | COLD_ALLOCATION | ZERO_ALLOCATION), 0 | 4)
 }
 
-/// ExAllocatePoolUninitialized: o mesmo pool, sem zerar.
-pub fn allocate_uninitialized(bytes: u64) -> u64 {
-    guest::alloc_raw(bytes)
+/// ExAllocatePool2(Flags, NumberOfBytes, Tag). Com POOL_FLAG_NON_PAGED_EXECUTE
+/// o bloco sai de uma região executável do pool executivo (zerado, salvo
+/// POOL_FLAG_UNINITIALIZED; alinhado à linha de cache com
+/// POOL_FLAG_CACHE_ALIGNED); a falta com POOL_FLAG_RAISE_ON_FAILURE levanta
+/// STATUS_INSUFFICIENT_RESOURCES. Os outros pedidos (POOL_FLAG_NON_PAGED, o
+/// NX, e POOL_FLAG_PAGED) saem zerados da arena, que não executa.
+pub fn allocate_pool2(flags: u64, bytes: u64, tag: u32) -> Result<u64, KernelError> {
+    if flags & POOL_FLAG_NON_PAGED_EXECUTE == 0 {
+        return Ok(guest::alloc_bytes(bytes));
+    }
+    let options = AllocateOptions {
+        paged: false,
+        nx: false,
+        alignment: if flags & POOL_FLAG_CACHE_ALIGNED != 0 { 64 } else { 16 },
+        tag,
+        priority: 32,
+        zero: flags & POOL_FLAG_UNINITIALIZED == 0,
+        ..AllocateOptions::default()
+    };
+    let pointer = kernel_pool::allocate(bytes, options)?;
+    if pointer == 0 && flags & POOL_FLAG_RAISE_ON_FAILURE != 0 {
+        return Err(KernelError::with_status("ExAllocatePool2 raised STATUS_INSUFFICIENT_RESOURCES", 0xC000_009A));
+    }
+    Ok(pointer)
+}
+
+/// ExAllocatePoolZero/ExAllocatePoolUninitialized(PoolType, NumberOfBytes,
+/// Tag): os tipos executáveis passam pelo ExAllocatePoolWithTag (com
+/// POOL_ZERO_ALLOCATION quando `zero`), numa região executável do pool
+/// executivo; os NX e os paginados saem da arena, zerada quando `zero`.
+pub fn allocate_typed(pool_type: u32, bytes: u64, tag: u32, zero: bool) -> Result<u64, KernelError> {
+    if executable_pool_type(pool_type) {
+        let typed = if zero { pool_type | ZERO_ALLOCATION } else { pool_type & !ZERO_ALLOCATION };
+        return allocate_tagged(typed, bytes, tag);
+    }
+    Ok(if zero { guest::alloc_bytes(bytes) } else { guest::alloc_raw(bytes) })
 }
 
 /// ExFreePool/ExFreePoolWithTag/ExFreePool2. Encaminha ao alocador dono
