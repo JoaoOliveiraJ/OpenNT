@@ -359,9 +359,12 @@ fn map_transfer(call: &Call) -> Result<u64, KernelError> {
     Ok(physical)
 }
 
+/// Deslocamento de Elements[0] na SCATTER_GATHER_LIST.
+const LIST_ELEMENTS: u64 = core::mem::offset_of!(ScatterGatherList, elements) as u64;
+
 /// Bytes de uma SCATTER_GATHER_LIST com `elements` elementos.
 fn list_size(elements: usize) -> u64 {
-    ScatterGatherList::ELEMENTS + elements as u64 * ScatterGatherElement::SIZE
+    LIST_ELEMENTS + elements as u64 * ScatterGatherElement::SIZE
 }
 
 /// Escreve a lista em `buffer`.
@@ -372,8 +375,8 @@ fn write_list(buffer: u64, runs: &[(u64, u32)]) {
     list.reserved.set(0);
     for (index, &(physical, size)) in runs.iter().enumerate() {
         // SAFETY: elemento dentro do mesmo buffer.
-        let element = unsafe { ScatterGatherElement::at(buffer + ScatterGatherList::ELEMENTS + index as u64 * ScatterGatherElement::SIZE) };
-        element.address.set(physical);
+        let element = unsafe { ScatterGatherElement::at(buffer + LIST_ELEMENTS + index as u64 * ScatterGatherElement::SIZE) };
+        element.address.quad_part.set(physical as i64);
         element.length.set(size);
         element.reserved.set(0);
     }

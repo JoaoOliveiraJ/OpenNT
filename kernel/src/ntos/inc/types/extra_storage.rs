@@ -12,10 +12,6 @@
 //!   LOADER_PARTITION_INFORMATION_EX / BOOTDISK_INFORMATION_LITE (ntddk.h), 0x1C / 0x20
 //! - `WheaErrorSourceConfigurationDeviceDriverV1` / `WheaErrorSourceConfigurationDeviceDriver` —
 //!   WHEA_ERROR_SOURCE_CONFIGURATION_DEVICE_DRIVER_V1 / _DEVICE_DRIVER (ntddk.h), 0x2C / 0x54
-//! - `DmaAdapter` — DMA_ADAPTER (wdm.h; PDB), 0x10
-//! - `DmaOperations` — DMA_OPERATIONS (wdm.h; PDB 19041, 38 rotinas), 0x138
-//! - `ScatterGatherElement` / `ScatterGatherList` — SCATTER_GATHER_ELEMENT /
-//!   SCATTER_GATHER_LIST (wdm.h; PDB), 0x18 / 0x10 (cabeçalho; os elementos seguem)
 //! - `PciBusInterfaceStandard` — PCI_BUS_INTERFACE_STANDARD (wdm.h, versão 1), 0x40
 //! - `PnpBusInformation` — PNP_BUS_INFORMATION (wdm.h), 0x18
 //!
@@ -26,16 +22,18 @@
 //! `_INTERFACE`, `_DEVICE_DESCRIPTION`, `_POP_IRP_DATA` (o bloco do Power
 //! Manager no Context da última posição de pilha de um IRP de energia) e
 //! `_WHEA_TIMESTAMP`, `_WHEA_ERROR_RECORD_HEADER`, `_WHEA_ERROR_PACKET_V2`,
-//! `_WHEA_DEVICE_DRIVER_DESCRIPTOR` e `_WHEA_ERROR_SOURCE_DESCRIPTOR`
-//! constam dos símbolos e são geradas (`types/io.rs`, `po.rs`, `hal.rs`);
+//! `_WHEA_DEVICE_DRIVER_DESCRIPTOR`, `_WHEA_ERROR_SOURCE_DESCRIPTOR`,
+//! `_DMA_ADAPTER`, `_DMA_OPERATIONS`, `_SCATTER_GATHER_LIST` e
+//! `_SCATTER_GATHER_ELEMENT` constam dos símbolos e são geradas
+//! (`types/io.rs`, `po.rs`, `hal.rs`);
 //! ficam reexportadas aqui.
 
 use crate::ntos::inc::field::{Field, NtStruct, Reserved, UnalignedField};
-use crate::ntos::inc::types::Guid;
+use crate::ntos::inc::types::{Guid, InterfaceType};
 
 pub use super::{
-    DeviceDescription, Interface, PopIrpData, WheaDeviceDriverDescriptor, WheaErrorPacketV2, WheaErrorRecordHeader,
-    WheaErrorSourceDescriptor, WheaTimestamp,
+    DeviceDescription, DmaAdapter, DmaOperations, Interface, PopIrpData, ScatterGatherElement, ScatterGatherList,
+    WheaDeviceDriverDescriptor, WheaErrorPacketV2, WheaErrorRecordHeader, WheaErrorSourceDescriptor, WheaTimestamp,
 };
 
 /// BUS_INTERFACE_STANDARD (wdm.h).
@@ -196,123 +194,6 @@ const _: () = {
     assert!(core::mem::offset_of!(WheaErrorSourceConfigurationDeviceDriver, max_sections_per_report) == 0x30);
     assert!(core::mem::offset_of!(WheaErrorSourceConfigurationDeviceDriver, creator_id) == 0x34);
     assert!(core::mem::offset_of!(WheaErrorSourceConfigurationDeviceDriver, partition_id) == 0x44);
-};
-
-/// DMA_ADAPTER (wdm.h; PDB): o objeto que a HAL devolve ao IoGetDmaAdapter.
-/// O resto do adaptador é privado da HAL.
-#[repr(C)]
-pub struct DmaAdapter {
-    pub version: Field<u16>,
-    pub size: Field<u16>,
-    _pad_4: Reserved<0x4>,
-    /// -> `PDMA_OPERATIONS`
-    pub dma_operations: Field<u64>,
-}
-
-unsafe impl NtStruct for DmaAdapter {}
-
-const _: () = {
-    assert!(core::mem::size_of::<DmaAdapter>() == 0x10);
-    assert!(core::mem::offset_of!(DmaAdapter, dma_operations) == 0x8);
-};
-
-/// DMA_OPERATIONS (wdm.h; PDB 19041): Size e as rotinas do adaptador, na
-/// ordem do cabeçalho.
-#[repr(C)]
-pub struct DmaOperations {
-    pub size: Field<u32>,
-    _pad_4: Reserved<0x4>,
-    pub put_dma_adapter: Field<u64>,
-    pub allocate_common_buffer: Field<u64>,
-    pub free_common_buffer: Field<u64>,
-    pub allocate_adapter_channel: Field<u64>,
-    pub flush_adapter_buffers: Field<u64>,
-    pub free_adapter_channel: Field<u64>,
-    pub free_map_registers: Field<u64>,
-    pub map_transfer: Field<u64>,
-    pub get_dma_alignment: Field<u64>,
-    pub read_dma_counter: Field<u64>,
-    pub get_scatter_gather_list: Field<u64>,
-    pub put_scatter_gather_list: Field<u64>,
-    pub calculate_scatter_gather_list: Field<u64>,
-    pub build_scatter_gather_list: Field<u64>,
-    pub build_mdl_from_scatter_gather_list: Field<u64>,
-    pub get_dma_adapter_info: Field<u64>,
-    pub get_dma_transfer_info: Field<u64>,
-    pub initialize_dma_transfer_context: Field<u64>,
-    pub allocate_common_buffer_ex: Field<u64>,
-    pub allocate_adapter_channel_ex: Field<u64>,
-    pub configure_adapter_channel: Field<u64>,
-    pub cancel_adapter_channel: Field<u64>,
-    pub map_transfer_ex: Field<u64>,
-    pub get_scatter_gather_list_ex: Field<u64>,
-    pub build_scatter_gather_list_ex: Field<u64>,
-    pub flush_adapter_buffers_ex: Field<u64>,
-    pub free_adapter_object: Field<u64>,
-    pub cancel_mapped_transfer: Field<u64>,
-    pub allocate_domain_common_buffer: Field<u64>,
-    pub flush_dma_buffer: Field<u64>,
-    pub join_dma_domain: Field<u64>,
-    pub leave_dma_domain: Field<u64>,
-    pub get_dma_domain: Field<u64>,
-    pub allocate_common_buffer_with_bounds: Field<u64>,
-    pub allocate_common_buffer_vector: Field<u64>,
-    pub get_common_buffer_from_vector_by_index: Field<u64>,
-    pub free_common_buffer_from_vector: Field<u64>,
-    pub free_common_buffer_vector: Field<u64>,
-}
-
-unsafe impl NtStruct for DmaOperations {}
-
-const _: () = {
-    assert!(core::mem::size_of::<DmaOperations>() == 0x138);
-    assert!(core::mem::offset_of!(DmaOperations, put_dma_adapter) == 0x8);
-    assert!(core::mem::offset_of!(DmaOperations, map_transfer) == 0x40);
-    assert!(core::mem::offset_of!(DmaOperations, get_scatter_gather_list) == 0x58);
-    assert!(core::mem::offset_of!(DmaOperations, get_dma_adapter_info) == 0x80);
-    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer_ex) == 0x98);
-    assert!(core::mem::offset_of!(DmaOperations, free_adapter_object) == 0xD8);
-    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer_with_bounds) == 0x110);
-    assert!(core::mem::offset_of!(DmaOperations, free_common_buffer_vector) == 0x130);
-};
-
-/// SCATTER_GATHER_ELEMENT (wdm.h; PDB).
-#[repr(C)]
-pub struct ScatterGatherElement {
-    /// PHYSICAL_ADDRESS (QuadPart).
-    pub address: Field<u64>,
-    pub length: Field<u32>,
-    _pad_c: Reserved<0x4>,
-    pub reserved: Field<u64>,
-}
-
-unsafe impl NtStruct for ScatterGatherElement {}
-
-const _: () = {
-    assert!(core::mem::size_of::<ScatterGatherElement>() == 0x18);
-    assert!(core::mem::offset_of!(ScatterGatherElement, length) == 0x8);
-    assert!(core::mem::offset_of!(ScatterGatherElement, reserved) == 0x10);
-};
-
-/// SCATTER_GATHER_LIST (wdm.h; PDB): o cabeçalho; `Elements[]` começa em
-/// +0x10 (`ScatterGatherList::ELEMENTS`).
-#[repr(C)]
-pub struct ScatterGatherList {
-    pub number_of_elements: Field<u32>,
-    _pad_4: Reserved<0x4>,
-    pub reserved: Field<u64>,
-}
-
-unsafe impl NtStruct for ScatterGatherList {}
-
-impl ScatterGatherList {
-    /// Deslocamento de Elements[0].
-    pub const ELEMENTS: u64 = 0x10;
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<ScatterGatherList>() == 0x10);
-    assert!(core::mem::offset_of!(ScatterGatherList, reserved) == 0x8);
 };
 
 /// PCI_BUS_INTERFACE_STANDARD (wdm.h), versão 1: INTERFACE e as rotinas

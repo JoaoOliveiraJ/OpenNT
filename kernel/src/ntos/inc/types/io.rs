@@ -4639,3 +4639,186 @@ const _: () = {
     assert!(core::mem::offset_of!(IoSecurityContext, desired_access) == 0x10);
     assert!(core::mem::offset_of!(IoSecurityContext, full_create_options) == 0x14);
 };
+
+/// `_DMA_ADAPTER` (0x10 bytes).
+#[repr(C)]
+pub struct DmaAdapter {
+    pub version: Field<u16>,
+    pub size: Field<u16>,
+    _pad_4: Reserved<0x4>,
+    /// -> `_DMA_OPERATIONS`
+    pub dma_operations: Field<u64>,
+}
+
+unsafe impl NtStruct for DmaAdapter {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DmaAdapter>() == 0x10);
+    assert!(core::mem::offset_of!(DmaAdapter, version) == 0x0);
+    assert!(core::mem::offset_of!(DmaAdapter, size) == 0x2);
+    assert!(core::mem::offset_of!(DmaAdapter, dma_operations) == 0x8);
+};
+
+/// `_DMA_OPERATIONS` (0x138 bytes).
+#[repr(C)]
+pub struct DmaOperations {
+    pub size: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    /// -> `fn`
+    pub put_dma_adapter: Field<u64>,
+    /// -> `fn`
+    pub allocate_common_buffer: Field<u64>,
+    /// -> `fn`
+    pub free_common_buffer: Field<u64>,
+    /// -> `fn`
+    pub allocate_adapter_channel: Field<u64>,
+    /// -> `fn`
+    pub flush_adapter_buffers: Field<u64>,
+    /// -> `fn`
+    pub free_adapter_channel: Field<u64>,
+    /// -> `fn`
+    pub free_map_registers: Field<u64>,
+    /// -> `fn`
+    pub map_transfer: Field<u64>,
+    /// -> `fn`
+    pub get_dma_alignment: Field<u64>,
+    /// -> `fn`
+    pub read_dma_counter: Field<u64>,
+    /// -> `fn`
+    pub get_scatter_gather_list: Field<u64>,
+    /// -> `fn`
+    pub put_scatter_gather_list: Field<u64>,
+    /// -> `fn`
+    pub calculate_scatter_gather_list: Field<u64>,
+    /// -> `fn`
+    pub build_scatter_gather_list: Field<u64>,
+    /// -> `fn`
+    pub build_mdl_from_scatter_gather_list: Field<u64>,
+    /// -> `fn`
+    pub get_dma_adapter_info: Field<u64>,
+    /// -> `fn`
+    pub get_dma_transfer_info: Field<u64>,
+    /// -> `fn`
+    pub initialize_dma_transfer_context: Field<u64>,
+    /// -> `fn`
+    pub allocate_common_buffer_ex: Field<u64>,
+    /// -> `fn`
+    pub allocate_adapter_channel_ex: Field<u64>,
+    /// -> `fn`
+    pub configure_adapter_channel: Field<u64>,
+    /// -> `fn`
+    pub cancel_adapter_channel: Field<u64>,
+    /// -> `fn`
+    pub map_transfer_ex: Field<u64>,
+    /// -> `fn`
+    pub get_scatter_gather_list_ex: Field<u64>,
+    /// -> `fn`
+    pub build_scatter_gather_list_ex: Field<u64>,
+    /// -> `fn`
+    pub flush_adapter_buffers_ex: Field<u64>,
+    /// -> `fn`
+    pub free_adapter_object: Field<u64>,
+    /// -> `fn`
+    pub cancel_mapped_transfer: Field<u64>,
+    /// -> `fn`
+    pub allocate_domain_common_buffer: Field<u64>,
+    /// -> `fn`
+    pub flush_dma_buffer: Field<u64>,
+    /// -> `fn`
+    pub join_dma_domain: Field<u64>,
+    /// -> `fn`
+    pub leave_dma_domain: Field<u64>,
+    /// -> `fn`
+    pub get_dma_domain: Field<u64>,
+    /// -> `fn`
+    pub allocate_common_buffer_with_bounds: Field<u64>,
+    /// -> `fn`
+    pub allocate_common_buffer_vector: Field<u64>,
+    /// -> `fn`
+    pub get_common_buffer_from_vector_by_index: Field<u64>,
+    /// -> `fn`
+    pub free_common_buffer_from_vector: Field<u64>,
+    /// -> `fn`
+    pub free_common_buffer_vector: Field<u64>,
+}
+
+unsafe impl NtStruct for DmaOperations {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DmaOperations>() == 0x138);
+    assert!(core::mem::offset_of!(DmaOperations, size) == 0x0);
+    assert!(core::mem::offset_of!(DmaOperations, put_dma_adapter) == 0x8);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer) == 0x10);
+    assert!(core::mem::offset_of!(DmaOperations, free_common_buffer) == 0x18);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_adapter_channel) == 0x20);
+    assert!(core::mem::offset_of!(DmaOperations, flush_adapter_buffers) == 0x28);
+    assert!(core::mem::offset_of!(DmaOperations, free_adapter_channel) == 0x30);
+    assert!(core::mem::offset_of!(DmaOperations, free_map_registers) == 0x38);
+    assert!(core::mem::offset_of!(DmaOperations, map_transfer) == 0x40);
+    assert!(core::mem::offset_of!(DmaOperations, get_dma_alignment) == 0x48);
+    assert!(core::mem::offset_of!(DmaOperations, read_dma_counter) == 0x50);
+    assert!(core::mem::offset_of!(DmaOperations, get_scatter_gather_list) == 0x58);
+    assert!(core::mem::offset_of!(DmaOperations, put_scatter_gather_list) == 0x60);
+    assert!(core::mem::offset_of!(DmaOperations, calculate_scatter_gather_list) == 0x68);
+    assert!(core::mem::offset_of!(DmaOperations, build_scatter_gather_list) == 0x70);
+    assert!(core::mem::offset_of!(DmaOperations, build_mdl_from_scatter_gather_list) == 0x78);
+    assert!(core::mem::offset_of!(DmaOperations, get_dma_adapter_info) == 0x80);
+    assert!(core::mem::offset_of!(DmaOperations, get_dma_transfer_info) == 0x88);
+    assert!(core::mem::offset_of!(DmaOperations, initialize_dma_transfer_context) == 0x90);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer_ex) == 0x98);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_adapter_channel_ex) == 0xa0);
+    assert!(core::mem::offset_of!(DmaOperations, configure_adapter_channel) == 0xa8);
+    assert!(core::mem::offset_of!(DmaOperations, cancel_adapter_channel) == 0xb0);
+    assert!(core::mem::offset_of!(DmaOperations, map_transfer_ex) == 0xb8);
+    assert!(core::mem::offset_of!(DmaOperations, get_scatter_gather_list_ex) == 0xc0);
+    assert!(core::mem::offset_of!(DmaOperations, build_scatter_gather_list_ex) == 0xc8);
+    assert!(core::mem::offset_of!(DmaOperations, flush_adapter_buffers_ex) == 0xd0);
+    assert!(core::mem::offset_of!(DmaOperations, free_adapter_object) == 0xd8);
+    assert!(core::mem::offset_of!(DmaOperations, cancel_mapped_transfer) == 0xe0);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_domain_common_buffer) == 0xe8);
+    assert!(core::mem::offset_of!(DmaOperations, flush_dma_buffer) == 0xf0);
+    assert!(core::mem::offset_of!(DmaOperations, join_dma_domain) == 0xf8);
+    assert!(core::mem::offset_of!(DmaOperations, leave_dma_domain) == 0x100);
+    assert!(core::mem::offset_of!(DmaOperations, get_dma_domain) == 0x108);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer_with_bounds) == 0x110);
+    assert!(core::mem::offset_of!(DmaOperations, allocate_common_buffer_vector) == 0x118);
+    assert!(core::mem::offset_of!(DmaOperations, get_common_buffer_from_vector_by_index) == 0x120);
+    assert!(core::mem::offset_of!(DmaOperations, free_common_buffer_from_vector) == 0x128);
+    assert!(core::mem::offset_of!(DmaOperations, free_common_buffer_vector) == 0x130);
+};
+
+/// `_SCATTER_GATHER_LIST` (0x10 bytes).
+#[repr(C)]
+pub struct ScatterGatherList {
+    pub number_of_elements: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    pub reserved: Field<u64>,
+    pub elements: [ScatterGatherElement; 0],
+}
+
+unsafe impl NtStruct for ScatterGatherList {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ScatterGatherList>() == 0x10);
+    assert!(core::mem::offset_of!(ScatterGatherList, number_of_elements) == 0x0);
+    assert!(core::mem::offset_of!(ScatterGatherList, reserved) == 0x8);
+    assert!(core::mem::offset_of!(ScatterGatherList, elements) == 0x10);
+};
+
+/// `_SCATTER_GATHER_ELEMENT` (0x18 bytes).
+#[repr(C)]
+pub struct ScatterGatherElement {
+    pub address: LargeInteger,
+    pub length: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for ScatterGatherElement {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ScatterGatherElement>() == 0x18);
+    assert!(core::mem::offset_of!(ScatterGatherElement, address) == 0x0);
+    assert!(core::mem::offset_of!(ScatterGatherElement, length) == 0x8);
+    assert!(core::mem::offset_of!(ScatterGatherElement, reserved) == 0x10);
+};
