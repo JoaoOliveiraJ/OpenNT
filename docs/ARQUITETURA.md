@@ -892,6 +892,26 @@ dentro dele) que não é compartilhado entre as raízes:
   ImagePath de um serviço pode ser relativo, e então é relativo ao
   \SystemRoot (`system32\drivers\Wdf01000.sys`); System32\Drivers fica na
   raiz do volume.
+- **Imports entre imagens de kernel** (`mm/pe_loader.rs`, `mm/sysload.rs`),
+  como no MmLoadSystemImageEx: a entrada da imagem entra na lista de imagens
+  carregadas (a PsLoadedModuleList) depois da relocação e antes dos imports,
+  com o bit LOAD_IN_PROGRESS (0x1000) das Flags ligado enquanto a IAT é
+  resolvida. Um import que volta a uma imagem em carga (o netio.sys e o
+  ndis.sys importam um do outro) acha essa entrada pelo BaseDllName e usa os
+  exports dela, sem reter referência (o LoadCount não sobe). Uma DLL carregada
+  pelo import ganha DRIVER_DEPENDENT_DLL (0x04000000) e o DllInitialize logo
+  depois da própria carga, antes de o importador seguir para o import
+  seguinte (MiLoadImportDll -> MmCallDllInitialize), com o caminho
+  `...\Services\<BaseDllName até o primeiro ponto>`. Um `.sys` importado com
+  ponto de entrada e sem DllInitialize sobe como driver pelo lifecycle
+  (mapeado uma vez); o tipo da imagem é decidido pelos exports lidos do
+  arquivo. O FullDllName é o caminho NT da imagem, não o da fonte dos bytes:
+  o ImagePath do serviço (relativo a `\SystemRoot`) para um driver iniciado
+  pelo SCM, `\SystemRoot\System32\drivers\<nome>` para um `.sys` carregado
+  pelo import e `\SystemRoot\System32\<nome>` para uma DLL de kernel; a CI
+  abre o arquivo pelo nome da fonte. Um encaminhamento de export de kernel
+  não traz a extensão ("NDIS.NdisMatchPdoWithPacket"): como no MiSnapThunk,
+  vale a imagem carregada cujo BaseDllName começa com "<módulo>.".
 - As imagens de usuário ficam na ImageBase do cabeçalho quando a faixa está
   livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
   relocadas), também sobre frames do PFN.
