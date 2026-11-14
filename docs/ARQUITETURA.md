@@ -309,6 +309,21 @@ mas não têm TSS, LSTAR nem pilha reserva. O autoteste
 `ntos/test/multiprocess/per_cpu.rs` confere os blocos distintos de cada CPU
 e uma syscall de teste que devolve gs:[10h] igual ao RSP do usuário.
 
+**Thread corrente por CPU.** Como no NT, a thread corrente é a
+KPRCB.CurrentThread da KPCR de cada processador: `ps::process::
+get_current_thread` (o KeGetCurrentThread, e por ele PsGetCurrentThread,
+PsGetCurrentProcess e os demais que partem da thread corrente) lê gs:[188h]
+da CPU que executa, e `set_current_thread`, o ponto único de troca de
+thread, grava só a célula da própria CPU (`pcr::set_current_thread`, pelo
+GS) antes de carregar a raiz do processo dela. Não há célula global: uma
+troca num AP não muda o que o BSP vê, e um AP que nunca trocou de thread
+tem 0 (o contexto do System, como o BSP antes do escalonador). O autoteste
+`ntos/test/multiprocess/current_thread.rs` põe cada CPU online, ao mesmo
+tempo, numa thread de um processo de kernel só dela (os APs por um job,
+entre duas barreiras): cada uma vê em gs:[188h] a própria thread, e dela o
+próprio processo e TID, e o PsGetCurrentThread do BSP no meio da janela
+devolve a dele.
+
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
 TLB) passa por `smp::stall_on_targets`, que compara o TSC (o contador do

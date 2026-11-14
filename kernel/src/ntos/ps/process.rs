@@ -154,9 +154,6 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 });
 
 static SYSTEM_PROCESS: AtomicU64 = AtomicU64::new(0);
-/// A célula PsJobType, publicada no primeiro acesso.
-/// O "gs:[0x188]" do kernel.
-static CURRENT_THREAD: AtomicU64 = AtomicU64::new(0);
 
 fn timestamp() -> u64 {
     clock::now_ms() * 10_000 + 116_444_736_000_000_000
@@ -1077,21 +1074,22 @@ pub fn remove_thread(process: u64) {
     let _ = eprocess(process).active_threads.atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |active| active.checked_sub(1));
 }
 
-/// A troca de thread corrente atualiza a PCR (gs:0x188 =
-/// Prcb.CurrentThread), lida direto por drivers nativos, e carrega a raiz
-/// do processo corrente da nova thread (`KTHREAD.ApcState.Process`, o
-/// anexado quando ela está anexada) quando ela difere da carregada,
-/// movendo a CPU em KPROCESS.ActiveProcessors do processo em que ela estava
-/// (registrado pela troca: a thread que sai pode já ter sido liberada) para
-/// esse.
+/// A troca de thread corrente desta CPU: grava KPRCB.CurrentThread na KPCR
+/// dela (gs:[188h], lida direto por drivers nativos; cada CPU tem a sua) e
+/// carrega a raiz do processo corrente da nova thread
+/// (`KTHREAD.ApcState.Process`, o anexado quando ela está anexada) quando
+/// ela difere da carregada nesta CPU, movendo a CPU em
+/// KPROCESS.ActiveProcessors do processo em que ela estava (registrado pela
+/// troca: a thread que sai pode já ter sido liberada) para esse.
 pub fn set_current_thread(thread: u64) {
-    CURRENT_THREAD.store(thread, Ordering::Relaxed);
     pcr::set_current_thread(thread);
     context_switch::load_process(get_current_process());
 }
 
+/// KeGetCurrentThread/PsGetCurrentThread: a thread corrente da CPU que
+/// executa (KPRCB.CurrentThread por gs:[188h]); 0 antes da primeira troca.
 pub fn get_current_thread() -> u64 {
-    CURRENT_THREAD.load(Ordering::Relaxed)
+    pcr::current_thread()
 }
 
 /// IoGetCurrentProcess/PsGetCurrentProcess: o mesmo algoritmo do NT.

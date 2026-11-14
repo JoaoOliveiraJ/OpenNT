@@ -6,7 +6,8 @@
 //! BSP a carrega em `init`, e cada AP na entrada (`ap_kernel_entry`), com a
 //! KPCR que `init_processor` montou antes do SIPI. Os campos são os da `Kpcr`
 //! gerada dos símbolos (a KPRCB embutida em +0x180, a LockQueue dentro dela);
-//! o CurrentThread da do BSP acompanha as trocas de thread do runtime. Na
+//! o CurrentThread de cada uma é a thread corrente daquela CPU (gs:[188h]),
+//! gravado pela troca de thread que roda nela. Na
 //! cauda da reserva, depois da KPCR, fica o bloco de execução de usuário da
 //! CPU (`hal::amd64::usermode::UserExecutionBlock`), endereçado pelos stubs
 //! por `gs:`.
@@ -261,9 +262,27 @@ pub fn current() -> &'static Kpcr {
     unsafe { Kpcr::at(current_address()) }
 }
 
+/// KeGetCurrentThread: KPRCB.CurrentThread da CPU que executa, gs:[188h]
+/// (o mesmo `mov rax, gs:[188h]` que os drivers fazem inline); 0 antes da
+/// KPCR do BSP. Cada CPU tem a sua: threads em CPUs diferentes ao mesmo
+/// tempo veem cada uma a si mesma.
+pub fn current_thread() -> u64 {
+    if ADDRESS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let thread: u64;
+    // SAFETY: leitura de um campo da KPCR desta CPU (o GS do anel 0 é sempre
+    // a KPCR, publicada antes de qualquer código do kernel nesta CPU).
+    unsafe { core::arch::asm!("mov {}, gs:[{}]", out(reg) thread, const layout::PRCB_CURRENT_THREAD, options(nostack, readonly, preserves_flags)) };
+    thread
+}
+
+/// A troca de thread corrente desta CPU grava KPRCB.CurrentThread na KPCR
+/// dela (pelo GS), nunca na de outra CPU. Antes da KPCR do BSP não há onde
+/// gravar.
 pub fn set_current_thread(thread: u64) {
-    if let Some(kpcr) = kpcr() {
-        kpcr.prcb.current_thread.set(thread);
+    if ADDRESS.load(Ordering::Acquire) != 0 {
+        current().prcb.current_thread.set(thread);
     }
 }
 
