@@ -428,3 +428,95 @@ pub mod ob_set_security {
 
     pub static GROUP: Group = Group { name: "ob-set-security", names: &["ZwSetSecurityObject"], handlers: &[set_security_object], data_exports: &[] };
 }
+
+pub mod ob_name_info {
+    //! ObQueryNameInfo; a lógica mora em `ob/name_info`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ob::name_info;
+    use crate::rtl::KernelError;
+
+    fn query_name_info(call: &Call) -> Result<u64, KernelError> {
+        Ok(name_info::query(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-name-info", names: &["ObQueryNameInfo"], handlers: &[query_name_info], data_exports: &[] };
+}
+
+pub mod ob_handle_attributes {
+    //! ObSetHandleAttributes; a lógica mora em `ob/handle_attributes`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{NtStruct, ObjectHandleFlagInformation};
+    use crate::ntos::ob::handle_attributes;
+    use crate::rtl::KernelError;
+
+    /// ObSetHandleAttributes(Handle, HandleFlags, PreviousMode).
+    fn set_handle_attributes(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o OBJECT_HANDLE_FLAG_INFORMATION do chamador de kernel.
+        let flags = unsafe { ObjectHandleFlagInformation::at(call.arg(2)) };
+        Ok(signed_status(handle_attributes::set_handle_attributes(call.arg(1), flags, call.arg(3) as u8)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-handle-attributes", names: &["ObSetHandleAttributes"], handlers: &[set_handle_attributes], data_exports: &[] };
+}
+
+pub mod ob_assign_security {
+    //! ObAssignSecurity, ObSetSecurityDescriptorInfo e
+    //! ObCheckCreateObjectAccess; a lógica mora em `ob/object_security`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{AccessState, NtStruct};
+    use crate::ntos::ob::object_security;
+    use crate::rtl::KernelError;
+
+    /// ObAssignSecurity(AccessState, ParentDescriptor, Object, ObjectType).
+    fn assign_security(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PACCESS_STATE do chamador de kernel.
+        let access_state = unsafe { AccessState::at(call.arg(1)) };
+        Ok(signed_status(object_security::assign_security(access_state, call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    /// ObSetSecurityDescriptorInfo(Object, SecurityInformation*,
+    /// SecurityDescriptor, ObjectsSecurityDescriptor*, PoolType,
+    /// GenericMapping).
+    fn set_security_descriptor_info(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(object_security::set_security_descriptor_info(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(6))))
+    }
+
+    /// ObCheckCreateObjectAccess(DirectoryObject, CreateAccess, AccessState,
+    /// ComponentName, LockHeld, AccessMode, AccessStatus*).
+    fn check_create_object_access(call: &Call) -> Result<u64, KernelError> {
+        Ok(object_security::check_create_object_access(call.arg(1), call.arg(2) as u32, call.arg(6) as u8, call.arg(7)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ob-assign-security",
+        names: &["ObAssignSecurity", "ObSetSecurityDescriptorInfo", "ObCheckCreateObjectAccess"],
+        handlers: &[assign_security, set_security_descriptor_info, check_create_object_access],
+        data_exports: &[],
+    };
+}
+
+pub mod ob_wait {
+    //! ObWaitForSingleObject e ObWaitForMultipleObjects; a lógica mora em
+    //! `ob/wait`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::wait;
+    use crate::rtl::KernelError;
+
+    /// ObWaitForSingleObject(Handle, PreviousMode, WaitMode, Alertable,
+    /// Timeout).
+    fn wait_for_single_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wait::ob_wait_for_single_object(call.arg(1), call.arg(2) as u8, call.arg(3) as u8, call.arg(4) as u8 != 0, call.arg(5))))
+    }
+
+    /// ObWaitForMultipleObjects(Count, Handles, PreviousMode, WaitType,
+    /// WaitMode, Alertable, Timeout).
+    fn wait_for_multiple_objects(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wait::ob_wait_for_multiple_objects(call.arg(1) as u32, call.arg(2), call.arg(3) as u8, call.arg(4) as u32, call.arg(5) as u8, call.arg(6) as u8 != 0, call.arg(7))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-wait", names: &["ObWaitForSingleObject", "ObWaitForMultipleObjects"], handlers: &[wait_for_single_object, wait_for_multiple_objects], data_exports: &[] };
+}

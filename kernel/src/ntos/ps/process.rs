@@ -123,9 +123,12 @@ pub struct ThreadRecord {
     pub runtime: Option<u32>,
     /// O contexto terminou (done/killed).
     pub runtime_dead: bool,
-    /// A pilha de kernel própria (`mm/kernel_stack`), até o ceifador
-    /// devolvê-la; `None` para quem roda na pilha de boot.
+    /// A pilha de kernel própria (`mm/kernel_stack`), até a última
+    /// referência dela (ETHREAD.KernelStackReference) cair; `None` para quem
+    /// roda na pilha de boot.
     pub kernel_stack: Option<KernelStack>,
+    /// O ceifador já soltou a referência da thread à pilha.
+    pub stack_reaped: bool,
 }
 
 struct State {
@@ -152,7 +155,6 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 
 static SYSTEM_PROCESS: AtomicU64 = AtomicU64::new(0);
 /// A célula PsJobType, publicada no primeiro acesso.
-static JOB_TYPE: AtomicU64 = AtomicU64::new(0);
 /// O "gs:[0x188]" do kernel.
 static CURRENT_THREAD: AtomicU64 = AtomicU64::new(0);
 
@@ -439,16 +441,39 @@ fn publish_kernel_stack(tcb: &Kthread, stack: Option<KernelStack>) {
     tcb.kernel_stack.set(initial);
 }
 
-/// O ceifador da thread devolve a pilha de kernel própria (adiada se a CPU
-/// ainda está nela); a KTHREAD, que pode seguir referenciada, deixa de
-/// descrevê-la.
-pub fn release_kernel_stack(thread: u64) {
+/// Devolve a pilha de kernel própria da thread (adiada se a CPU ainda está
+/// nela); a KTHREAD, que pode seguir referenciada, deixa de descrevê-la.
+fn free_kernel_stack(thread: u64) {
     let Some(stack) = STATE.lock().threads.get_mut(&thread).and_then(|record| record.kernel_stack.take()) else { return };
     let tcb = &ethread(thread).tcb;
     for field in [&tcb.stack_base, &tcb.stack_limit, &tcb.initial_stack, &tcb.kernel_stack] {
         field.set(0);
     }
     kernel_stack::delete(stack);
+}
+
+/// O ceifador da thread (o PspReaper) solta a referência dela à pilha de
+/// kernel própria, uma vez: a pilha volta quando nenhum
+/// PsReferenceKernelStack a retém mais.
+pub fn release_kernel_stack(thread: u64) {
+    let first = STATE.lock().threads.get_mut(&thread).is_some_and(|record| record.kernel_stack.is_some() && !core::mem::replace(&mut record.stack_reaped, true));
+    if first {
+        dereference_kernel_stack(thread);
+    }
+}
+
+/// PsReferenceKernelStack: mais uma referência à pilha de kernel da thread
+/// (ETHREAD.KernelStackReference, que a criação põe em 1).
+pub fn reference_kernel_stack(thread: u64) {
+    ethread(thread).kernel_stack_reference.atomic().fetch_add(1, Ordering::SeqCst);
+}
+
+/// PsDereferenceKernelStack: a última referência devolve a pilha (o
+/// KeEnumerateKernelStackSegments com PspDeleteKernelStack do NT).
+pub fn dereference_kernel_stack(thread: u64) {
+    if ethread(thread).kernel_stack_reference.atomic().fetch_sub(1, Ordering::SeqCst) == 1 {
+        free_kernel_stack(thread);
+    }
 }
 
 /// Cria um KTHREAD real ligado ao processo (ApcState.Process + Cid).
@@ -486,6 +511,8 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
     let tcb = &object.tcb;
     tcb.header.type_.set(THREAD_OBJECT);
     publish_kernel_stack(tcb, stack);
+    // A referência da própria thread à pilha (o ceifador a solta).
+    object.kernel_stack_reference.set(if stack.is_some() { 1 } else { 0 });
     tcb.thread_lock.set(0);
     // Initialized não entra em fila antes de receber contexto executável.
     tcb.state.set(THREAD_INITIALIZED);
@@ -542,6 +569,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
             runtime: None,
             runtime_dead: false,
             kernel_stack: stack,
+            stack_reaped: false,
         },
     );
     // ThreadInserted e prioridade de página normal na criação.
@@ -552,7 +580,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         if linked {
             release_thread(thread)?;
         } else {
-            release_kernel_stack(thread);
+            free_kernel_stack(thread);
             STATE.lock().threads.remove(&thread);
             cid::release(thread_id, thread);
             object_types::account(&thread_type.name, -1, 0)?;
@@ -863,8 +891,9 @@ pub fn forget_thread(thread: u64) -> Result<(), KernelError> {
         return Err(error);
     }
     thread_tokens::release(thread)?;
-    // Uma pilha que o ceifador ainda não devolveu vai com o objeto.
-    release_kernel_stack(thread);
+    // Uma pilha que ainda não voltou (o ceifador não rodou, ou uma
+    // referência ficou) vai com o objeto.
+    free_kernel_stack(thread);
     let removed = STATE.lock().threads.remove(&thread);
     // Fora do registro, o TID volta à tabela de ids de cliente.
     if let Some(record) = &removed {
@@ -1195,22 +1224,7 @@ pub fn thread_type_cell() -> u64 {
 /// Célula exportada PsJobType, publicada no primeiro acesso: o corpo do
 /// tipo Job e a célula que aponta para ele têm alocações distintas.
 pub fn job_type_cell() -> u64 {
-    let current = JOB_TYPE.load(Ordering::Acquire);
-    if current != 0 {
-        return current;
-    }
-    let body = guest::alloc_bytes(0x40);
-    let cell = guest::alloc_bytes(8);
-    // SAFETY: a célula de 8 bytes acabou de ser alocada.
-    unsafe { Field::<u64>::at(cell) }.set(body);
-    match JOB_TYPE.compare_exchange(0, cell, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => cell,
-        Err(existing) => {
-            guest::free_bytes(cell);
-            guest::free_bytes(body);
-            existing
-        }
-    }
+    kernel_data::address("PsJobType").unwrap_or(0)
 }
 
 pub fn init() -> Result<(), KernelError> {

@@ -2,4 +2,5 @@
 //! Windows Error Reporting).
 
 pub mod wer;
+pub mod live_dump;
 pub mod exports;

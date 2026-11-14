@@ -1783,3 +1783,38 @@ pub mod io_work_item {
 
     pub static GROUP: Group = Group { name: "io-work-item", names: &["IoUninitializeWorkItem"], handlers: &[uninitialize_work_item], data_exports: &[] };
 }
+
+pub mod io_thread_irp {
+    //! IoQueueThreadIrp; a lógica mora em `io/threads` (thread_requests).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{Irp, NtStruct};
+    use crate::ntos::io::threads::thread_requests;
+    use crate::rtl::KernelError;
+
+    /// IoQueueThreadIrp(Irp): a IRP entra na lista da thread dela
+    /// (Irp->Tail.Overlay.Thread).
+    fn queue_thread_irp(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PIRP do chamador de kernel.
+        let thread = unsafe { Irp::at(call.arg(1)) }.tail.overlay.thread.get();
+        thread_requests::insert(call.arg(1), thread)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-thread-irp", names: &["IoQueueThreadIrp"], handlers: &[queue_thread_irp], data_exports: &[] };
+}
+
+pub mod nt_device_control {
+    //! NtDeviceIoControlFile — `ntos/io/device_control`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::device_control;
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    fn control(call: &Call) -> Result<u64, KernelError> {
+        Ok(device_control::nt_control(previous_mode::get()?, call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7), call.arg(8) as u32, call.arg(9), call.arg(10) as u32)? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "nt-device-control", names: &["NtDeviceIoControlFile"], handlers: &[control], data_exports: &[] };
+}

@@ -3738,7 +3738,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1647, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 1670, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -5009,6 +5009,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::cross_memory::run(assert);
     crate::ntos::test::rtl_atom_heap_nls::run_phase7(assert);
     crate::ntos::test::multiprocess::user_callback::run(assert);
+    crate::ntos::test::executive_support::run_user(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

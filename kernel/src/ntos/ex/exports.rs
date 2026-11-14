@@ -1179,3 +1179,57 @@ pub mod ex_legacy_support {
         data_exports: &[],
     };
 }
+
+pub mod ex_hard_error {
+    //! ExRaiseHardError (`ex/hard_error`) e as células dos tipos que o
+    //! executive cria no boot: os do subsistema Win32 (`ex/win32`) e o Timer
+    //! (`ex/timer`).
+
+    use crate::ntos::ex::{hard_error, win32};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExRaiseHardError(ErrorStatus, NumberOfParameters,
+    /// UnicodeStringParameterMask, Parameters, ValidResponseOptions,
+    /// Response*).
+    fn raise_hard_error(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hard_error::raise_hard_error(call.arg(1) as u32, call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6))))
+    }
+
+    fn window_station_type() -> u64 {
+        win32::cell("ExWindowStationObjectType")
+    }
+    fn desktop_type() -> u64 {
+        win32::cell("ExDesktopObjectType")
+    }
+    fn composition_type() -> u64 {
+        win32::cell("ExCompositionObjectType")
+    }
+    fn raw_input_manager_type() -> u64 {
+        win32::cell("ExRawInputManagerObjectType")
+    }
+    fn core_messaging_type() -> u64 {
+        win32::cell("ExCoreMessagingObjectType")
+    }
+    fn activation_type() -> u64 {
+        win32::cell("ExActivationObjectType")
+    }
+    fn timer_type() -> u64 {
+        win32::cell("ExTimerObjectType")
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-hard-error",
+        names: &["ExRaiseHardError"],
+        handlers: &[raise_hard_error],
+        data_exports: &[
+            ("ExWindowStationObjectType", window_station_type),
+            ("ExDesktopObjectType", desktop_type),
+            ("ExCompositionObjectType", composition_type),
+            ("ExRawInputManagerObjectType", raw_input_manager_type),
+            ("ExCoreMessagingObjectType", core_messaging_type),
+            ("ExActivationObjectType", activation_type),
+            ("ExTimerObjectType", timer_type),
+        ],
+    };
+}

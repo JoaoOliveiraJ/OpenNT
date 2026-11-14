@@ -164,6 +164,38 @@ pub fn callback_type() -> ObjectType {
     get_or_create("Callback", [0x20000, 0x20001, 0x120000, 0x1F0001], 0x1F0001, 0)
 }
 
+/// O OBJECT_TYPE_INITIALIZER com que o executive cria um tipo no boot
+/// (os campos que o OpenNT guarda no TypeInfo).
+pub struct TypeTemplate {
+    pub name: &'static str,
+    pub mapping: [u32; 4],
+    pub valid_access: u32,
+    pub flags: u16,
+    pub object_type_code: u32,
+    pub invalid_attributes: u32,
+    pub pool_type: u32,
+    pub paged_charge: u32,
+    pub non_paged_charge: u32,
+}
+
+/// O tipo do modelo, criado na primeira chamada (as seguintes devolvem o
+/// mesmo; um tipo criado antes sob demanda com o mesmo nome é completado)
+/// com o TypeInfo preenchido como o ObCreateObjectType do NT.
+pub fn ensure(template: &TypeTemplate) -> ObjectType {
+    let existing = TYPES.lock().by_name.get(template.name).map(|record| record.info.clone());
+    let info = match existing {
+        Some(info) => info,
+        None => create(template.name, template.mapping, template.valid_access, template.flags).unwrap_or_else(|error| panic!("{error}")),
+    };
+    let type_info = &native(info.pointer).type_info;
+    type_info.object_type_code.set(template.object_type_code);
+    type_info.invalid_attributes.set(template.invalid_attributes);
+    type_info.pool_type.set(PoolType(template.pool_type as i32));
+    type_info.default_paged_pool_charge.set(template.paged_charge);
+    type_info.default_non_paged_pool_charge.set(template.non_paged_charge);
+    info
+}
+
 /// Cria um tipo de objeto arbitrário — a forma pública do `create`, usada por
 /// ObCreateObjectType quando um driver registra tipos próprios.
 pub fn define(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Result<ObjectType, KernelError> {

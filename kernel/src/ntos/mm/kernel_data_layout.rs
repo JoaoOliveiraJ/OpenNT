@@ -112,6 +112,16 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     KernelDataEntry { name: "NlsAnsiCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xE4, 0x04] },
     KernelDataEntry { name: "NlsOemCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xB5, 0x01] },
     KernelDataEntry { name: "NlsMbCodePageTag", size: 1, storage_size: 1, alignment: 1, initial: &[0] },
+    // POBJECT_TYPE que o executive cria no boot: os do subsistema Win32 (o
+    // ExpWin32Initialization), o Timer e o Job.
+    pointer("ExWindowStationObjectType"),
+    pointer("ExDesktopObjectType"),
+    pointer("ExCompositionObjectType"),
+    pointer("ExRawInputManagerObjectType"),
+    pointer("ExCoreMessagingObjectType"),
+    pointer("ExActivationObjectType"),
+    pointer("ExTimerObjectType"),
+    pointer("PsJobType"),
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

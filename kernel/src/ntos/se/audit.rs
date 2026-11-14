@@ -367,3 +367,24 @@ pub fn open_object_for_delete_audit_alarm(type_name: u64, object: u64, object_na
         record_audit_event("OpenObjectForDelete", format!("event=4656 type={} name={} granted={} transaction={}", name_of(type_name), name_of(object_name), granted, guid_of(transaction)));
     }
 }
+
+/// SePrivilegeObjectAuditAlarm(Handle, SubjectSecurityContext,
+/// DesiredAccess, Privileges, AccessGranted, AccessMode): como no NT, só um
+/// pedido vindo do modo usuário gera o evento (o
+/// SepAdtPrivilegeObjectAuditAlarm com o subsistema "Security"): o handle, o
+/// acesso pedido, a quantidade de privilégios usados e se foi concedido.
+/// Devolve se o evento foi gerado.
+pub fn privilege_object_audit_alarm(handle: u64, desired_access: u32, privileges: u64, granted: bool, mode: u8) -> bool {
+    if mode == 0 {
+        return false;
+    }
+    let count = if privileges != 0 {
+        // SAFETY: o PPRIVILEGE_SET do chamador de kernel.
+        unsafe { PrivilegeSet::at(privileges) }.privilege_count.get()
+    } else {
+        0
+    };
+    record_audit_event("privileged object operation", format!("handle={handle:#x} access={desired_access:#x} privileges={count} granted={granted}"));
+    true
+}
+

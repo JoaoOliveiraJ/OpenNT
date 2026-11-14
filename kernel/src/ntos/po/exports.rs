@@ -217,3 +217,33 @@ pub mod po_device_wake {
         data_exports: &[],
     };
 }
+
+pub mod po_system_state {
+    //! PoLatencySensitivityHint, PoSetUserPresent e PoRequestShutdownEvent;
+    //! a lógica mora em `po/system_state`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::system_state;
+    use crate::rtl::KernelError;
+
+    fn latency_sensitivity_hint(call: &Call) -> Result<u64, KernelError> {
+        system_state::latency_sensitivity_hint(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    fn set_user_present(call: &Call) -> Result<u64, KernelError> {
+        system_state::set_user_present(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    fn request_shutdown_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(system_state::request_shutdown_event(call.arg(1))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-system-state",
+        names: &["PoLatencySensitivityHint", "PoSetUserPresent", "PoRequestShutdownEvent"],
+        handlers: &[latency_sensitivity_hint, set_user_present, request_shutdown_event],
+        data_exports: &[],
+    };
+}

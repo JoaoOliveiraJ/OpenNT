@@ -5,10 +5,34 @@
 //! PsGetProcessCommonJob 0x36c530).
 //!
 //! O OpenNT não cria jobs (EPROCESS.Job fica NULL): os chamadores só chegam
-//! aqui com corpos que eles mesmos obtiveram; nada é fabricado.
+//! aqui com corpos que eles mesmos obtiveram; nada é fabricado. O tipo de
+//! objeto Job existe desde o boot, publicado em PsJobType, como o
+//! PspInitPhase0 o cria: PspJobMapping {0x20004, 0x2000B, 0x120000,
+//! 0x1F003F}, ValidAccessMask 0x1F003F, SecurityRequired, ObjectTypeCode
+//! 0x800, NonPagedPoolNx com 0x640 de cobrança não paginável.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Ejob, Eprocess};
+use crate::ntos::mm::kernel_data;
+use crate::ntos::ob::object_types::{self, TypeTemplate};
+
+/// O OBJECT_TYPE_INITIALIZER do tipo Job.
+const JOB_TYPE: TypeTemplate = TypeTemplate {
+    name: "Job",
+    mapping: [0x2_0004, 0x2_000B, 0x12_0000, 0x1F_003F],
+    valid_access: 0x1F_003F,
+    flags: 0x08,
+    object_type_code: 0x800,
+    invalid_attributes: 0,
+    pool_type: 0x200,
+    paged_charge: 0,
+    non_paged_charge: 0x640,
+};
+
+/// Cria o tipo Job (uma vez) e publica PsJobType.
+pub fn initialize_type() {
+    kernel_data::write("PsJobType", object_types::ensure(&JOB_TYPE).pointer);
+}
 
 /// PsGetJobSessionId: os marcadores -2/-1 (acima de 0xFFFFFFFD) saem -1.
 const LAST_VALID_SESSION_ID: u32 = 0xFFFF_FFFD;

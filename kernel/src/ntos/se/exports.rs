@@ -819,3 +819,20 @@ pub mod se_set_security {
         data_exports: &[],
     };
 }
+
+pub mod se_privilege_audit {
+    //! SePrivilegeObjectAuditAlarm; a lógica mora em `se/audit`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::audit;
+    use crate::rtl::KernelError;
+
+    /// SePrivilegeObjectAuditAlarm(Handle, SubjectSecurityContext,
+    /// DesiredAccess, Privileges, AccessGranted, AccessMode).
+    fn privilege_object_audit_alarm(call: &Call) -> Result<u64, KernelError> {
+        audit::privilege_object_audit_alarm(call.arg(1), call.arg(3) as u32, call.arg(4), call.arg(5) as u8 != 0, call.arg(6) as u8);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "se-privilege-audit", names: &["SePrivilegeObjectAuditAlarm"], handlers: &[privilege_object_audit_alarm], data_exports: &[] };
+}

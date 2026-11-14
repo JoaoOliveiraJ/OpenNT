@@ -2,6 +2,7 @@
 
 pub mod contiguous_memory;
 pub mod copy_virtual;
+pub mod prefetch;
 pub mod data_pool;
 pub mod dump_mdl;
 pub mod frame_mapping_tracker;

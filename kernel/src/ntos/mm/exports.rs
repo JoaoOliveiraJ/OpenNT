@@ -741,3 +741,19 @@ pub mod copy_virtual {
 
     pub static GROUP: Group = Group { name: "copy-virtual", names: &["MmCopyVirtualMemory"], handlers: &[copy_virtual_memory], data_exports: &[] };
 }
+
+pub mod mm_prefetch {
+    //! MmPrefetchVirtualAddresses; a lógica mora em `mm/prefetch`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::mm::prefetch::{self, PrefetchRequest};
+    use crate::rtl::KernelError;
+
+    fn prefetch_virtual_addresses(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o pedido de pré-busca do chamador de kernel.
+        Ok(signed_status(prefetch::prefetch_virtual_addresses(unsafe { PrefetchRequest::at(call.arg(1)) })?.0))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-prefetch", names: &["MmPrefetchVirtualAddresses"], handlers: &[prefetch_virtual_addresses], data_exports: &[] };
+}

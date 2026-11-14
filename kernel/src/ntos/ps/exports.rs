@@ -1363,3 +1363,75 @@ pub mod ps_disk_counters {
 
     pub static GROUP: Group = Group { name: "ps-disk-counters", names: &["PsIsDiskCountersEnabled", "PsUpdateDiskCounters"], handlers: &[enabled, update], data_exports: &[] };
 }
+
+pub mod ps_wake_counters {
+    //! PsChargeProcessWakeCounter e PsReleaseProcessWakeCounter; a lógica
+    //! mora em `ps/wake_counter`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{Eprocess, NtStruct};
+    use crate::ntos::ps::wake_counter;
+    use crate::rtl::KernelError;
+
+    /// PsChargeProcessWakeCounter(Process, Flags, Index, Tag).
+    fn charge(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PEPROCESS do chamador de kernel.
+        wake_counter::charge_process(unsafe { Eprocess::at(call.arg(1)) }, call.arg(2) as u32, call.arg(3) as u32)?;
+        Ok(0)
+    }
+
+    /// PsReleaseProcessWakeCounter(TaggedProcess, Tag).
+    fn release(call: &Call) -> Result<u64, KernelError> {
+        wake_counter::release_process(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-wake-counters", names: &["PsReleaseProcessWakeCounter", "PsChargeProcessWakeCounter"], handlers: &[release, charge], data_exports: &[] };
+}
+
+pub mod ps_kernel_stack {
+    //! PsReferenceKernelStack e PsDereferenceKernelStack; a lógica mora em
+    //! `ps/process`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::process;
+    use crate::rtl::KernelError;
+
+    fn reference(call: &Call) -> Result<u64, KernelError> {
+        process::reference_kernel_stack(call.arg(1));
+        Ok(0)
+    }
+
+    fn dereference(call: &Call) -> Result<u64, KernelError> {
+        process::dereference_kernel_stack(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-kernel-stack", names: &["PsReferenceKernelStack", "PsDereferenceKernelStack"], handlers: &[reference, dereference], data_exports: &[] };
+}
+
+pub mod ps_process_state {
+    //! PsSetProcessFaultInformation e PsSetProcessPriorityByClass; a lógica
+    //! mora em `ps/fault_information` e `ps/process_accessors`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::Eprocess;
+    use crate::ntos::ps::{fault_information, process_accessors};
+    use crate::rtl::KernelError;
+
+    /// PsSetProcessFaultInformation(Process, FaultFlags*).
+    fn set_fault_information(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PEPROCESS e o PULONG do chamador de kernel.
+        let (process, flags) = unsafe { (Eprocess::at(call.arg(1)), Field::<u32>::at(call.arg(2)).get()) };
+        Ok(signed_status(fault_information::set_fault_information(process, flags)?))
+    }
+
+    /// PsSetProcessPriorityByClass(Process, PriorityMode).
+    fn set_priority_by_class(call: &Call) -> Result<u64, KernelError> {
+        process_accessors::set_priority_by_class(call.arg(1), call.arg(2) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-process-state", names: &["PsSetProcessFaultInformation", "PsSetProcessPriorityByClass"], handlers: &[set_fault_information, set_priority_by_class], data_exports: &[] };
+}

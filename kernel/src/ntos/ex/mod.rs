@@ -20,6 +20,8 @@ pub mod wnf;
 pub mod boot_environment_information;
 pub mod boot_environment;
 pub mod service_abi;
+pub mod win32;
+pub mod hard_error;
 pub mod system_services;
 pub mod timer;
 pub mod uuid;

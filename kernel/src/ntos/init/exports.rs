@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 303] {
+fn groups() -> [&'static Group; 318] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -358,6 +358,21 @@ fn groups() -> [&'static Group; 303] {
         &crate::ntos::rtl::exports::crt_sqrtf::GROUP,
         &crate::ntos::rtl::exports::rtl_debug_print_va::GROUP,
         &crate::ntos::ke::exports::ke_user_callback::GROUP,
+        &crate::ntos::ob::exports::ob_name_info::GROUP,
+        &crate::ntos::ob::exports::ob_handle_attributes::GROUP,
+        &crate::ntos::ob::exports::ob_assign_security::GROUP,
+        &crate::ntos::ob::exports::ob_wait::GROUP,
+        &crate::ntos::ps::exports::ps_wake_counters::GROUP,
+        &crate::ntos::ps::exports::ps_kernel_stack::GROUP,
+        &crate::ntos::ps::exports::ps_process_state::GROUP,
+        &crate::ntos::ex::exports::ex_hard_error::GROUP,
+        &crate::ntos::io::exports::io_thread_irp::GROUP,
+        &crate::ntos::io::exports::nt_device_control::GROUP,
+        &crate::ntos::mm::exports::mm_prefetch::GROUP,
+        &crate::ntos::po::exports::po_system_state::GROUP,
+        &crate::ntos::se::exports::se_privilege_audit::GROUP,
+        &crate::ntos::etw::exports::etw_coverage::GROUP,
+        &crate::ntos::dbgk::exports::dbgk_live_dump::GROUP,
     ]
 }
 
@@ -500,6 +515,10 @@ pub fn init() {
     crate::ntos::ps::user::process::init();
     crate::ntos::ps::user::user_apc::init();
     crate::ntos::ke::user_callback::init();
+    // Os tipos de objeto que o executive cria no boot (idempotente).
+    crate::ntos::ex::win32::initialize();
+    crate::ntos::ex::timer::initialize_type();
+    crate::ntos::ps::job::initialize_type();
     crate::ntos::ps::win32::init();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();

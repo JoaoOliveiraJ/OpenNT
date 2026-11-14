@@ -13,7 +13,7 @@ use crate::ntos::inc::types::{Field, NtStruct, ObjectAttributes};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::inserted;
 use crate::ntos::ob::object_manager::{self, ObjectData};
-use crate::ntos::ob::object_types;
+use crate::ntos::ob::{name_info, object_types};
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::{KernelError, SpinLock};
 
@@ -104,7 +104,12 @@ pub fn insert(object: u64, desired: u32, new_object_out: u64, handle_out: u64) -
         let (parent, leaf) = trimmed.rsplit_once('\\').unwrap_or(("", trimmed));
         if !leaf.is_empty() {
             let parent_path = alloc::format!("\\{parent}");
-            let _ = object_manager::create_object(&parent_path, leaf, &cap.type_name, Some(ObjectData::pointer(object)));
+            if let Ok(node) = object_manager::create_object(&parent_path, leaf, &cap.type_name, Some(ObjectData::pointer(object))) {
+                // O cabeçalho de nome (ObQueryNameInfo), com o diretório pai.
+                if let Some(directory) = object_manager::lookup(&parent_path) {
+                    name_info::record(object, directory, node, leaf);
+                }
+            }
         }
     }
 

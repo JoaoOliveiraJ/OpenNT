@@ -261,3 +261,30 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
         other => other,
     }
 }
+
+/// O bloco de argumentos de pilha de uma syscall (o 5º em +0x28).
+const SERVICE_STACK_ARGUMENTS: u64 = 0x28;
+
+/// NtDeviceIoControlFile chamado por código de kernel: com PreviousMode
+/// KernelMode é o ZwDeviceIoControlFile; com UserMode é o serviço do
+/// sistema sobre os argumentos de quem chama (o handle da tabela do
+/// processo e os buffers de usuário sondados), pelo mesmo bloco de
+/// argumentos de pilha que a entrada de syscall entrega ao serviço.
+#[allow(clippy::too_many_arguments)]
+pub fn nt_control(previous_mode: u8, handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
+    if previous_mode == 0 {
+        return control(handle, event, apc_routine, apc_context, io_status, code, input, input_length, output, output_length);
+    }
+    let Some(service) = crate::ntos::ps::user::state::handler("NtDeviceIoControlFile") else { return Ok(0xC000_0002) };
+    let block = guest::alloc_bytes(SERVICE_STACK_ARGUMENTS + 6 * 8);
+    if block == 0 {
+        return Ok(0xC000_009A);
+    }
+    for (index, value) in [io_status, code as u64, input, input_length as u64, output, output_length as u64].into_iter().enumerate() {
+        guest::write64(block + SERVICE_STACK_ARGUMENTS + index as u64 * 8, value);
+    }
+    let result = service(handle, event, apc_routine, apc_context, block);
+    guest::free_bytes(block);
+    result
+}
+

@@ -149,3 +149,19 @@ pub mod etw_wmi_clock {
         data_exports: &[],
     };
 }
+
+pub mod etw_coverage {
+    //! EtwTelemetryCoverageReport; a lógica mora em `etw/coverage`.
+
+    use crate::ntos::etw::coverage::{self, TelemetryCoveragePoint};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::NtStruct;
+    use crate::rtl::KernelError;
+
+    fn report(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o ponto de cobertura do chamador de kernel.
+        Ok(signed_status(coverage::report(unsafe { TelemetryCoveragePoint::at(call.arg(1)) })))
+    }
+
+    pub static GROUP: Group = Group { name: "etw-coverage", names: &["EtwTelemetryCoverageReport"], handlers: &[report], data_exports: &[] };
+}

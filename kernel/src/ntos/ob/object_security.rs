@@ -8,13 +8,14 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::ntos::inc::types::{Field, NtStruct};
+use crate::ntos::inc::types::{AccessState, Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::{object_access, object_create, object_types, open_pointer};
 use crate::rtl::SpinLock;
 
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
 /// Saída escalar (`PVOID*`, `PHANDLE`, `PULONG`...) de um chamador de kernel.
 fn out<T: Copy>(address: u64) -> &'static Field<T> {
@@ -354,4 +355,80 @@ pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Re
     })();
     reference.release()?;
     result
+}
+
+// ---- Atribuição e troca do descritor de um objeto ---------------------------
+
+/// O mapeamento genérico de um tipo, como o GENERIC_MAPPING que o NT passa
+/// por ponteiro (bloco do kernel; o chamador libera).
+fn mapping_block(object_type: &object_types::ObjectType) -> u64 {
+    let block = guest::alloc_bytes(16);
+    for (index, &value) in object_type.mapping.iter().enumerate() {
+        out::<u32>(block + index as u64 * 4).set(value);
+    }
+    block
+}
+
+/// O tipo de `object` (o vínculo registrado, a descrição do dono ou o
+/// ObCreateObject ainda não inserido).
+fn type_of(object: u64) -> Option<object_types::ObjectType> {
+    object_types::bound(object).or_else(|| open_pointer::describe(object).map(|described| described.object_type)).or_else(|| object_create::created_type(object))
+}
+
+// --- ObAssignSecurity -----------------------------------------------------
+// NTSTATUS ObAssignSecurity(PACCESS_STATE AccessState, PSECURITY_DESCRIPTOR
+//   ParentDescriptor, PVOID Object, POBJECT_TYPE ObjectType): o
+// ObpAssignSecurity — o SeAssignSecurity do descritor pedido no AccessState
+// sobre o do pai (contêiner se o tipo é Directory), com o contexto do
+// sujeito capturado e o mapeamento do tipo, e o resultado vira o descritor
+// do objeto (a tabela lateral, o slot do OBJECT_HEADER no NT).
+pub fn assign_security(access_state: &AccessState, parent: u64, object: u64, object_type: u64) -> u32 {
+    let Some(object_type) = object_types::find(object_type) else { return STATUS_INVALID_PARAMETER };
+    let mapping = mapping_block(&object_type);
+    let slot = guest::alloc_bytes(8);
+    let container = object_type.name == "Directory";
+    let status = crate::ntos::se::assign::assign(parent, access_state.security_descriptor.get(), slot, container, 0, access_state.subject_security_context.address(), mapping);
+    if status == STATUS_SUCCESS {
+        set_security_object_by_pointer(object, out::<u64>(slot).get());
+    }
+    guest::free_bytes(slot);
+    guest::free_bytes(mapping);
+    status
+}
+
+// --- ObSetSecurityDescriptorInfo ------------------------------------------
+// NTSTATUS ObSetSecurityDescriptorInfo(PVOID Object, PSECURITY_INFORMATION,
+//   PSECURITY_DESCRIPTOR SecurityDescriptor, PSECURITY_DESCRIPTOR
+//   *ObjectsSecurityDescriptor, POOL_TYPE, PGENERIC_MAPPING): como no NT, o
+// descritor corrente é o do objeto (não o que o chamador passa); o
+// SeSetSecurityDescriptorInfo mescla os componentes pedidos e o novo
+// descritor vira o do objeto e vai para *ObjectsSecurityDescriptor.
+pub fn set_security_descriptor_info(object: u64, information: u64, descriptor: u64, objects_descriptor: u64, mapping: u64) -> u32 {
+    let current = security_descriptor(object).unwrap_or_else(|| out::<u64>(objects_descriptor).get());
+    let slot = guest::alloc_bytes(8);
+    out::<u64>(slot).set(current);
+    let status = crate::ntos::se::set_security::set_security_descriptor_info(information, descriptor, slot, 0, mapping);
+    if status == STATUS_SUCCESS {
+        let new = out::<u64>(slot).get();
+        set_security_object_by_pointer(object, new);
+        out::<u64>(objects_descriptor).set(new);
+    }
+    guest::free_bytes(slot);
+    status
+}
+
+// --- ObCheckCreateObjectAccess --------------------------------------------
+// BOOLEAN ObCheckCreateObjectAccess(PVOID DirectoryObject, ACCESS_MASK
+//   CreateAccess, PACCESS_STATE, PUNICODE_STRING ComponentName, BOOLEAN
+//   LockHeld, KPROCESSOR_MODE AccessMode, PNTSTATUS AccessStatus): o acesso
+// de criação no diretório pela política dele e o sujeito corrente; em
+// KernelMode tudo é concedido. FALSE com o status da recusa.
+pub fn check_create_object_access(directory: u64, create_access: u32, mode: u8, status_out: u64) -> bool {
+    let object_type = type_of(directory).unwrap_or_else(object_types::directory_type);
+    let policy = open_pointer::describe(directory).map_or_else(|| object_access::capture(None), |described| described.owner.security(directory));
+    let result = object_access::check(&policy, object_access::subject(), create_access, &object_type, mode == 0);
+    if status_out != 0 {
+        out::<u32>(status_out).set(result.err().unwrap_or(STATUS_SUCCESS));
+    }
+    result.is_ok()
 }

@@ -5,6 +5,8 @@
 //! contexto; o DPC repassa (exTimer, context) ao PEXT_CALLBACK do driver.
 
 use crate::hal::amd64::native_call;
+use crate::ntos::mm::kernel_data;
+use crate::ntos::ob::object_types::{self, TypeTemplate};
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::{Kdpc, Ktimer};
 use crate::ntos::ke::{dpc, timer};
@@ -76,4 +78,25 @@ pub fn delete(timer_pointer: u64, cancel: bool) -> bool {
     let was_queued = cancel && timer::cancel_timer(ex_timer(timer_pointer).timer.address());
     guest::free_bytes(timer_pointer);
     was_queued
+}
+
+/// O OBJECT_TYPE_INITIALIZER do tipo Timer (o ExpTimerInitialization do
+/// ntoskrnl 19041): ExpTimerMapping {0x20001, 0x20002, 0x120000, 0x1F0003},
+/// ValidAccessMask 0x1F0003, InvalidAttributes OBJ_OPENLINK, NonPagedPoolNx
+/// com 0x148 de cobrança não paginável.
+const TIMER_TYPE: TypeTemplate = TypeTemplate {
+    name: "Timer",
+    mapping: [0x2_0001, 0x2_0002, 0x12_0000, 0x1F_0003],
+    valid_access: 0x1F_0003,
+    flags: 0,
+    object_type_code: 0,
+    invalid_attributes: 0x100,
+    pool_type: 0x200,
+    paged_charge: 0,
+    non_paged_charge: 0x148,
+};
+
+/// Cria o tipo Timer (uma vez) e publica ExTimerObjectType.
+pub fn initialize_type() {
+    kernel_data::write("ExTimerObjectType", object_types::ensure(&TIMER_TYPE).pointer);
 }

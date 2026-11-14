@@ -200,6 +200,32 @@ pub fn set_priority_class(process: u64, priority_class: u8) {
     eprocess(process).priority_class.set(priority_class);
 }
 
+/// PspPriorityTable: a prioridade base de cada PROCESS_PRIORITY_CLASS
+/// (Unknown, Idle, Normal, High, RealTime, BelowNormal, AboveNormal).
+const PRIORITY_TABLE: [i8; 7] = [8, 4, 8, 13, 24, 6, 10];
+/// PSPROCESSPRIORITYMODE.
+const PRIORITY_FOREGROUND: u32 = 1;
+const PRIORITY_SPINNING: u32 = 2;
+/// A prioridade de memória de um processo em primeiro plano.
+const MEMORY_PRIORITY_FOREGROUND: u8 = 2;
+
+/// PsSetProcessPriorityByClass(Process, PriorityMode): o
+/// PspComputeQuantumAndPriority — a prioridade base vem da PspPriorityTable
+/// pela classe do processo e vai para KPROCESS.BasePriority; fora do modo
+/// Spinning, a prioridade de memória (EPROCESS.Vm, MMSUPPORT_FLAGS) fica em
+/// 2 no primeiro plano e 0 no fundo, como o MmSetMemoryPriorityProcess. O
+/// OpenNT não tem quantum por processo nem a fila de pedidos de primeiro
+/// plano do NT: o efeito é o da prioridade.
+pub fn set_priority_by_class(process: u64, mode: u32) {
+    let object = eprocess(process);
+    if mode != PRIORITY_SPINNING {
+        let memory = if mode == PRIORITY_FOREGROUND { MEMORY_PRIORITY_FOREGROUND } else { 0 };
+        object.vm.instance.flags.memory_priority.set(memory);
+    }
+    let class = object.priority_class.get() as usize;
+    object.pcb.base_priority.set(PRIORITY_TABLE.get(class).copied().unwrap_or(PRIORITY_TABLE[2]));
+}
+
 // ---- Contadores de disco do processo (ps-disk-counters) -----------------------------
 //
 // ntoskrnl 10.0.19045: PsIsDiskCountersEnabled 0x3ca4b0 = (PsDisableDiskCounters

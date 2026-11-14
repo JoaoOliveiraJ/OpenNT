@@ -5,4 +5,5 @@ pub mod provider_state;
 pub mod activity;
 pub mod logger;
 pub mod wmi;
+pub mod coverage;
 pub mod exports;
