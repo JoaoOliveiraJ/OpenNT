@@ -25,7 +25,8 @@ fn set_information(process: u64, buffer: u64, length: u64) -> Result<u32, Kernel
 }
 
 /// PROCESS_TLS_INFORMATION de usuário (sondado): troca o vetor ou um slot
-/// de cada thread viva e devolve os antigos em ThreadData.
+/// de cada thread viva do processo corrente e devolve os antigos em
+/// ThreadData.
 fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
     let information = state::user_struct::<ProcessTlsInformation>(buffer)?;
     let flags = information.flags.probe_get()?;
@@ -48,7 +49,7 @@ fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
         }
     }
     let mut entry_index = 0u64;
-    for thread in threads::all() {
+    for thread in threads::of_process(crate::ntos::ps::process::get_current_process()) {
         let (dead, teb) = thread.with(|thread| (thread.dead, thread.teb_va));
         if dead || teb == 0 {
             continue;

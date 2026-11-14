@@ -4,6 +4,11 @@
 //! imagem da fonte exata) e o LdrInitializeThunk da ntdll em anel 3: a ntdll
 //! inicializa heap, imports e TLS antes do entry. Inclui o post-mortem
 //! (candidatos de retorno na pilha da saída, Ldr e pilha da falha).
+//!
+//! Todo processo criado aqui acaba em `ps::process::terminate_process`,
+//! inclusive nas falhas depois da criação, e o término libera tudo o que ele
+//! possui (`files::release_user_resources` e `process_state::destroy`): não
+//! há reinício global entre um processo e o próximo.
 
 use alloc::format;
 use alloc::string::String;
@@ -16,7 +21,7 @@ use super::memory::{self, Space};
 use super::process_state;
 use super::state::{self, RegionKind};
 use super::structures::{self, ProcessDescription};
-use super::{files, threads};
+use super::threads;
 use crate::hal::{bundle, kmalloc};
 use crate::hal::amd64::usermode;
 use crate::ntos::cm::service::database::{self as service_database, CommandLine, ServiceError, ServiceResult};
@@ -133,7 +138,6 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
     let source: Arc<dyn FileSource> = Arc::new(BytesSource { name: format!("\\BootBundle\\apps\\{image_name}"), bytes: Arc::new(bytes) });
     let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: Some(image.0.image_information.to_vec()), command_line: None };
     let process_pointer = process::create_process(cid::ALLOCATE, image_name, image_base, Some(&executable))?;
-    let process_id = process_id_of(process_pointer);
     // A imagem e a pilha entram no VAD do processo novo, anexado.
     let stack = process_context::with_process(process_pointer, || {
         push_image(image_base, size_of_image, source.name());
@@ -144,8 +148,8 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
     let (thread_pointer, stack_top) = match thread {
         Ok(thread) => thread,
         Err(error) => {
-            let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
-            files::release_user_resources(process_id);
+            // O término libera o que o processo já possui.
+            let _ = process::terminate_process(process_pointer, failure_status(&error));
             return Err(error);
         }
     };
@@ -170,29 +174,29 @@ fn process_id_of(process: u64) -> u64 {
     unsafe { Eprocess::at(process) }.unique_process_id.get()
 }
 
-/// Recursos que um processo anterior deixou nas tabelas globais. Um
-/// processo de usuário que saiu por erro antes do término ainda tem PEB e
-/// estado: os recursos com dono saem pelo PID dele.
-fn release_leftovers() {
-    let leftover = process::list_active_processes().into_iter().find(|entry| state::is_user_process(entry.address)).map_or(0, |entry| entry.pid);
-    files::release_user_resources(leftover);
+/// O status de saída de um processo que falhou depois de criado.
+fn failure_status(error: &KernelError) -> u32 {
+    if error.status != 0 { error.status } else { 0xC000_0001 }
 }
 
-/// Entrada direta em anel 3 (sem TEB): volta no NtTerminateProcess.
+/// Entrada direta em anel 3 (sem TEB): volta no NtTerminateProcess. O
+/// término libera o que o processo possui.
 pub fn run_process(bytes: Vec<u8>, image_name: &str) -> Result<u32, KernelError> {
-    release_leftovers();
     let loaded = load_process(bytes, image_name)?;
-    let process_id = process_id_of(loaded.process_pointer);
     let previous = process::get_current_thread();
     process::set_current_thread(loaded.thread_pointer);
-    notify_initial_images(loaded.process_pointer, Image { image_base: loaded.image_base, size_of_image: loaded.size_of_image }, &loaded.source)?;
+    if let Err(error) = notify_initial_images(loaded.process_pointer, Image { image_base: loaded.image_base, size_of_image: loaded.size_of_image }, &loaded.source) {
+        let _ = process::terminate_process(loaded.process_pointer, failure_status(&error));
+        process::set_current_thread(previous);
+        let _ = process::release_thread(loaded.thread_pointer);
+        return Err(error);
+    }
     crate::debug_print!("[usermode] entrando em ring 3: {} entry {:#x} pilha {:#x}", image_name, loaded.entry_point, loaded.stack_top);
     let exit_code = usermode::exec_user_mode(loaded.entry_point, loaded.stack_top, 0, 0, 0, 0) as u32;
     let _ = process::terminate_process(loaded.process_pointer, exit_code);
     process::set_current_thread(previous);
     let _ = process::release_thread(loaded.thread_pointer);
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
-    files::release_user_resources(process_id);
     Ok(exit_code)
 }
 
@@ -205,14 +209,6 @@ pub struct RunOptions<'a> {
     pub on_process_created: Option<&'a dyn Fn(u64) -> Result<(), KernelError>>,
 }
 
-/// Estado por processo (um processo de usuário por vez nesta camada). As
-/// regiões são do VAD de cada processo e voltam no término dele.
-fn reset_process_state() {
-    release_leftovers();
-    threads::clear();
-    loader::reset_loaded_modules();
-}
-
 /// O kernel entrega exe, ntdll, PEB/TEB e o CONTEXT inicial; o loader
 /// nativo carrega as dependências pelas syscalls de arquivo e seção.
 pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &str, reader: Option<Arc<VolumeFile>>, options: RunOptions<'_>) -> Result<u32, KernelError> {
@@ -220,7 +216,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     if capturing {
         super::call_capture::reset();
     }
-    reset_process_state();
     loader::ensure_ntdll()?;
     let ntdll: Arc<Module> = loader::ntdll_module().ok_or_else(|| KernelError::new("ntdll ausente"))?;
     if capturing {
@@ -256,6 +251,20 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     if let Some(identity) = process_state::get(process_pointer) {
         identity.set_image_path(dos_path);
     }
+    // Daqui em diante toda saída passa pelo término, que libera o que o
+    // processo possui; ele roda com a thread do processo ainda corrente (as
+    // notificações de saída no contexto do processo, como no NT) e o KTHREAD
+    // que era o corrente só é recolhido depois da troca de volta.
+    let previous = process::get_current_thread();
+    let end = |status: u32| {
+        let _ = process::terminate_process(process_pointer, status);
+        process::set_current_thread(previous);
+        threads::release_process(process_pointer);
+    };
+    let fail = |error: KernelError| -> KernelError {
+        end(failure_status(&error));
+        error
+    };
     // O espaço do processo novo, anexado (como o MmCreatePeb): a ntdll e o
     // exe no VAD dele, a pilha da primeira thread, a PEB real (antes das
     // notificações da primeira thread) e a região do CONTEXT inicial. O TID
@@ -276,20 +285,20 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     let (thread_id, teb, thread_pointer, stack_top, context) = match created {
         Ok(created) => created,
         Err(error) => {
-            let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
-            files::release_user_resources(process_id);
+            let error = fail(error);
             if error.status != 0 {
                 return Ok(error.status);
             }
             return Err(error);
         }
     };
+    // A thread principal entra na lista do processo (e no índice global).
     let main = threads::UserThread::new(thread_id, thread_pointer, teb, image.entry_point);
     threads::push(main.clone());
     process::set_thread_start(thread_pointer, image.entry_point);
-    process::notify_thread_created(thread_pointer)?;
+    process::notify_thread_created(thread_pointer).map_err(fail)?;
     if let Some(created) = options.on_process_created {
-        created(process_id)?;
+        created(process_id).map_err(fail)?;
     }
     // A ntdll inicializa PEB.Ldr e carrega as dependências; o heap e o
     // runtime vêm antes dos DllMain.
@@ -302,7 +311,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
         (exports.and_then(|exports| exports.get("RtlUserThreadStart").copied()).unwrap_or(0), exports.and_then(|exports| exports.get("LdrInitializeThunk").copied()).unwrap_or(0))
     });
     if initialize == 0 || start == 0 {
-        return Err(KernelError::new("ntdll sem inicializacao de processo"));
+        return Err(fail(KernelError::new("ntdll sem inicializacao de processo")));
     }
     // CONTEXT inicial do LdrInitializeThunk, numa região recém-comprometida.
     // SAFETY: a região acabou de ser mapeada pelo kernel.
@@ -318,33 +327,23 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     initial.rdx.set(peb);
     initial.rsp.set(stack_top);
     initial.rip.set(start);
-    let previous = process::get_current_thread();
     process::set_current_thread(thread_pointer);
-    notify_initial_images(process_pointer, Image { image_base: image.image_base, size_of_image: image.size_of_image }, &source)?;
+    notify_initial_images(process_pointer, Image { image_base: image.image_base, size_of_image: image.size_of_image }, &source).map_err(fail)?;
     crate::debug_print!("[usermode] {}: LdrInitializeThunk em {:#x} (exe entry {:#x}, teb {:#x})", image_name, initialize, image.entry_point, teb);
     let result = threads::run(&main, initialize, stack_top, context, ntdll.image_base);
     if capturing {
         super::call_capture::finish();
     }
-    let exit_code = match result {
-        Ok(code) => code,
-        Err(error) => {
-            process::set_current_thread(previous);
-            files::release_user_resources(process_id);
-            return Err(error);
-        }
-    };
+    let exit_code = result.map_err(fail)?;
     // O post-mortem lê a pilha, as imagens e o Ldr antes de o término
     // devolver o VAD.
     if exit_code != 0x42 && exit_code != 0 {
         post_mortem(process_pointer);
     }
-    let _ = process::terminate_process(process_pointer, exit_code);
-    process::set_current_thread(previous);
+    end(exit_code);
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
     let (heap_total, heap_used) = kmalloc::info();
     crate::debug_print!("[mm] process exit: PFN used={}/{}, kernel heap={}/{}", pfn::total_count() - pfn::free_count(), pfn::total_count(), heap_used, heap_total);
-    files::release_user_resources(process_id);
     Ok(exit_code)
 }
 
@@ -352,7 +351,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
 /// publicada pela HAL e o Ldr real do processo.
 fn post_mortem(process_pointer: u64) {
     // A pilha da thread que encerrou o processo.
-    let termination = threads::all().iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);
+    let termination = threads::of_process(process_pointer).iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);
     let images: Vec<(u64, u64, String)> = Space::of(process_pointer).images().iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect();
     if termination != 0 {
         let mut matches = 0;

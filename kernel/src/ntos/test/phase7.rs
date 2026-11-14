@@ -1451,7 +1451,6 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     unsafe { nt::Peb::at(peb) }.image_base_address.set(image);
     unsafe { nt::ImageDosHeader::at(image) }.e_lfanew.set(0x80);
     unsafe { nt::ImageNtHeaders64::at(image + 0x80) }.optional_header.size_of_stack_reserve.set(0x20000);
-    let known = threads::all().len();
     let process_pointer = test.process;
     let baseline = unsafe { nt::Eprocess::at(process_pointer) }.active_threads.get();
     if baseline == 0 {
@@ -1550,10 +1549,8 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
         let _ = call("NtClose", value, 0, 0, 0);
     }
     threads::release_execution_resources(&thread);
-    assert(thread.pointer() == 0 && thread.with(|thread| thread.regions.is_none() && thread.context == 0) && memory::find_region(stack).is_none(), "userthreads: recursos e ETHREAD liberados sem handles");
-    if known == 0 {
-        threads::clear();
-    }
+    let listed = threads::all().iter().chain(threads::of_process(process_pointer).iter()).any(|candidate| alloc::sync::Arc::ptr_eq(candidate, &thread));
+    assert(thread.pointer() == 0 && thread.with(|thread| thread.regions.is_none() && thread.context == 0) && memory::find_region(stack).is_none() && !listed, "userthreads: recursos e ETHREAD liberados sem handles, fora do processo e do indice");
     if baseline == 0 {
         process::remove_thread(process_pointer);
     }
@@ -2280,7 +2277,7 @@ fn user_address_floor(assert: Assert) {
 }
 
 /// PE x64 mínimo de uma seção (código ou dados) com o conteúdo dado em 0x1000.
-fn single_section_image(image_base: u64, characteristics: u16, section_name: &[u8], section_flags: u32, entry: u32, content: &[u8]) -> alloc::vec::Vec<u8> {
+pub(crate) fn single_section_image(image_base: u64, characteristics: u16, section_name: &[u8], section_flags: u32, entry: u32, content: &[u8]) -> alloc::vec::Vec<u8> {
     let mut image = alloc::vec![0u8; 0x600];
     let put16 = |image: &mut [u8], at: usize, value: u16| image[at..at + 2].copy_from_slice(&value.to_le_bytes());
     let put32 = |image: &mut [u8], at: usize, value: u32| image[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -2355,15 +2352,21 @@ fn user_windows_process(assert: Assert) {
     // Onde o processo ficou: a imagem principal, a PEB (do EPROCESS) e a
     // base da pilha da primeira thread (StackLimit da TEB, logo abaixo da
     // PEB). Com o processo vivo, também o caminho da imagem no estado do
-    // processo e os ids da primeira thread.
+    // processo, os ids da primeira thread e a lista de threads do processo;
+    // o EPROCESS fica retido pelo teste para as asserções depois da saída.
     let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
     let owner = core::cell::Cell::new(0u64);
+    let listed_threads = core::cell::Cell::new(0usize);
     let system_regions = memory::Space::system().regions().len();
     let identity = core::cell::RefCell::new((alloc::string::String::new(), false));
     let created = |process_id: u64| -> Result<(), KernelError> {
         let active = crate::ntos::ps::process::list_active_processes().into_iter().find(|entry| entry.pid == process_id);
         let pointer = active.as_ref().map_or(0, |entry| entry.address);
+        if pointer != 0 {
+            crate::ntos::ps::process::reference(pointer);
+        }
         owner.set(pointer);
+        listed_threads.set(crate::ntos::ps::user::threads::of_process(pointer).len());
         let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
         let peb = if pointer != 0 { unsafe { nt::Eprocess::at(pointer) }.peb.get() } else { 0 };
         let teb = (peb != 0).then(|| unsafe { nt::Teb::at(peb - 0x2000) });
@@ -2383,9 +2386,18 @@ fn user_windows_process(assert: Assert) {
     }
     assert(ran, "userprocess: runWindowsProcess passa por LdrInitializeThunk, entra no exe e sai com o codigo");
     let (image_path, distinct_ids) = identity.borrow().clone();
-    assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0)) && image_path == "C:\\opennt-teste.exe" && crate::ntos::ps::user::threads::all().len() == 1, "userprocess: apiset, NLS, caminho da imagem e thread principal do processo");
+    assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0)) && image_path == "C:\\opennt-teste.exe" && listed_threads.get() == 1, "userprocess: apiset, NLS, caminho da imagem e a thread principal na lista do processo");
     assert(distinct_ids, "userprocess: PID e TID da thread principal distintos, o mesmo TID na TEB e no ETHREAD");
-    assert(owner.get() != 0 && crate::ntos::ps::user::process_state::get(owner.get()).is_none() && memory::Space::of(owner.get()).regions().is_empty() && memory::Space::system().regions().len() == system_regions, "userprocess: o VAD do processo volta no termino e nada dele foi para o System");
+    // O EPROCESS retido depois da saída: o código de saída e nada do processo
+    // nas tabelas (estado, VAD, threads no índice).
+    let retained = owner.get();
+    let exit_status = if retained != 0 { unsafe { nt::Eprocess::at(retained) }.exit_status.get() as u32 } else { 0 };
+    let leftover_threads = crate::ntos::ps::user::threads::all().iter().any(|thread| thread.with(|thread| thread.process_pointer) == retained);
+    assert(retained != 0 && exit_status == 0x5A && !leftover_threads, "userprocess: o EPROCESS retido guarda o codigo de saida e nenhuma thread do processo sobra no indice");
+    assert(retained != 0 && crate::ntos::ps::user::process_state::get(retained).is_none() && memory::Space::of(retained).regions().is_empty() && memory::Space::system().regions().len() == system_regions, "userprocess: o VAD do processo volta no termino e nada dele foi para o System");
+    if retained != 0 {
+        let _ = crate::ntos::ps::process::dereference(retained);
+    }
     let (exe_base, peb, stack) = placed.get();
     let user = |address: u64| crate::ntos::mm::memory_map::is_user_range(address, 0x1000);
     assert(exe_base == 0x1_4000_0000 && user(peb) && peb % 0x1000 == 0 && user(stack) && stack % 0x10000 == 0 && stack < 0x1_0000_0000, "userprocess: exe na ImageBase, PEB e pilha escolhidas pelo alocador (pilha de baixo para cima, abaixo de 4 GB)");
@@ -4057,11 +4069,10 @@ fn user_process_information_hooks(assert: Assert) {
     instrumentation.reserved.set(0);
     let cleared = call("NtSetInformationProcess", u64::MAX, 40, input, 8);
     let cleared_cell = usermode::block().instrumentation.get();
-    instrumentation::release_process();
+    instrumentation::release_process(process::get_current_process());
     assert(set == Some(0) && cell == block + 0x200 && reserved == Some(0xC000_000D) && other == Some(0xC000_0008) && length == Some(0xC000_0004) && cleared == Some(0) && cleared_cell == 0, "userinfo: callback de instrumentacao publicado na celula da HAL");
-    // ProcessTlsInformation (35) sobre uma thread de usuário com TLS.
-    let snapshot = threads::all();
-    threads::clear();
+    // ProcessTlsInformation (35) sobre uma thread de usuário com TLS, na
+    // lista do processo corrente.
     let teb = block + 0x1000;
     let vector = block + 0x1800;
     let thread = threads::UserThread::new(0x7F60, process::get_current_thread(), teb, 0);
@@ -4093,10 +4104,7 @@ fn user_process_information_hooks(assert: Assert) {
     tls_information.flags.set(1);
     let wow64 = call("NtSetInformationProcess", u64::MAX, 35, tls, 40);
     let tls_refusals = (call("NtSetInformationProcess", 0x10, 35, tls, 40), call("NtSetInformationProcess", u64::MAX, 35, tls, 30), wow64);
-    threads::clear();
-    for previous in snapshot {
-        threads::push(previous);
-    }
+    threads::remove(&thread);
     assert(slot_ok && swap_ok && tls_refusals == (Some(0xC000_000D), Some(0xC000_0004), Some(0xC000_000D)), "userinfo: troca de slot e de vetor TLS das threads");
     // ProcessDebugPort (7) pelos argumentos brutos da syscall.
     let raw = guest::alloc_bytes(0x40);
@@ -4688,7 +4696,6 @@ fn usermode_syscalls_exports(assert: Assert) {
     // Processo e threads de usuário (não de sistema) num processo real; a
     // thread do processo de teste é a corrente.
     let saved_exports = state::with(|state| state.ntdll_exports.clone());
-    let snapshot = threads::all();
     let previous_current = threads::current();
     let ran = with_test_process("apc.exe", None, |test| {
         let (owner, process_id, first, first_id) = (test.process, test.process_id, test.thread, test.thread_id);
@@ -4701,7 +4708,7 @@ fn usermode_syscalls_exports(assert: Assert) {
         let other = threads::UserThread::new(second_id, second, 0, 0);
         let live = guest::alloc_aligned(nt::Context::SIZE, 16, true);
         thread.with(|state| state.context = live);
-        threads::clear();
+        // As duas entram na lista do processo de teste (e no índice).
         threads::push(thread.clone());
         threads::push(other.clone());
         threads::set_running(true, Some(thread.clone()));
@@ -4877,10 +4884,9 @@ fn usermode_syscalls_exports(assert: Assert) {
         }
         let _ = apc::rundown(first);
         threads::set_running(false, previous_current);
-        threads::clear();
-        for saved_thread in snapshot {
-            threads::push(saved_thread);
-        }
+        // Os KTHREADs são do teste: as threads de usuário saem sem soltá-los.
+        threads::remove(&thread);
+        threads::remove(&other);
         state::with(|state| state.ntdll_exports = saved_exports);
         guest::free_bytes(live);
         let _ = process::release_thread(second);
@@ -4956,6 +4962,8 @@ pub fn run(assert: Assert) {
     shell_service_control(assert);
     boot_services_hive(assert);
     user_windows_process(assert);
+    // Depois dele: a ntdll, o apiset e o NLS do processo de usuário já estão prontos.
+    crate::ntos::test::multiprocess::lifecycle::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

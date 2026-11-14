@@ -226,10 +226,14 @@ pub fn release_thread(thread: u64) {
     }
 }
 
-/// Abandona os mutantes de todas as threads do processo.
-pub fn release_process() {
-    for thread in super::threads::all() {
-        release_thread(thread.pointer());
+/// Abandona os mutantes das threads do processo `process`, que terminou (e
+/// só as dele).
+pub fn release_process(process: u64) {
+    for thread in super::threads::of_process(process) {
+        let pointer = thread.pointer();
+        if pointer != 0 {
+            release_thread(pointer);
+        }
     }
 }
 

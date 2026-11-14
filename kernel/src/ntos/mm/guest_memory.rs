@@ -683,6 +683,14 @@ pub fn owns_allocation(pointer: u64) -> bool {
     HEAP.lock().allocations.contains(&pointer)
 }
 
+/// Uso da arena: as alocações vivas e os bytes dos blocos delas (sem os
+/// cabeçalhos).
+pub fn usage() -> (usize, u64) {
+    let heap = HEAP.lock();
+    let bytes = heap.allocations.iter().map(|&pointer| heap.size(pointer - BLOCK_HEADER_SIZE)).sum();
+    (heap.allocations.len(), bytes)
+}
+
 /// A VA cai dentro da arena dos convidados (alocada ou não).
 pub fn in_arena(address: u64) -> bool {
     HEAP.lock().contains(address)

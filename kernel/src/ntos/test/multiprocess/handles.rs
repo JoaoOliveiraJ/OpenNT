@@ -9,20 +9,16 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::KapcState;
+use crate::ntos::inc::types::{Eprocess, KapcState};
 use crate::ntos::ke::process_attachment;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::ob::{close, handle_table, object_reference, object_types, open_pointer};
-use crate::ntos::ps::process;
+use crate::ntos::ps::{cid, process};
 use crate::ntos::ps::user::handles::{self as user_handles, UserProcess};
 use crate::ntos::ps::user::state::{self, UserObject};
 
 type Assert = fn(bool, &str);
-
-const A_ID: u64 = 0x7EA0;
-const B_ID: u64 = 0x7EB0;
-const TARGET_ID: u64 = 0x7EC0;
 
 const INVALID_HANDLE: u32 = 0xC000_0008;
 const ACCESS_DENIED: u32 = 0xC000_0022;
@@ -71,6 +67,12 @@ fn attached<T>(process: u64, body: impl FnOnce() -> T) -> Option<T> {
     result
 }
 
+/// EPROCESS.UniqueProcessId (os processos do teste pegam o próximo id livre).
+fn process_id(process: u64) -> u64 {
+    // SAFETY: EPROCESS vivo criado pelo teste.
+    unsafe { Eprocess::at(process) }.unique_process_id.get()
+}
+
 /// Abre um handle de usuário para o EPROCESS `target` no processo corrente.
 fn open_process(target: u64, process_id: u64, access: u32) -> Option<u64> {
     state::alloc_user_handle(Arc::new(UserProcess { pointer: target, process_id }), access, 0).ok().map(u64::from)
@@ -110,7 +112,7 @@ pub fn run(assert: Assert) {
         return;
     }
     let system = process::get_system_process();
-    let created = (process::create_process(A_ID, "handles-a.exe", 0, None), process::create_process(B_ID, "handles-b.exe", 0, None), process::create_process(TARGET_ID, "handles-alvo.exe", 0, None));
+    let created = (process::create_process(cid::ALLOCATE, "handles-a.exe", 0, None), process::create_process(cid::ALLOCATE, "handles-b.exe", 0, None), process::create_process(cid::ALLOCATE, "handles-alvo.exe", 0, None));
     let (Ok(a), Ok(b), Ok(target)) = created else {
         for process in [created.0, created.1, created.2].into_iter().flatten() {
             let _ = process::terminate_process(process, 0);
@@ -119,10 +121,11 @@ pub fn run(assert: Assert) {
         return;
     };
     let baseline = references(target);
+    let (a_id, target_id) = (process_id(a), process_id(target));
 
     // O mesmo objeto aberto em A e em B, com acessos distintos.
-    let in_a = attached(a, || open_process(target, TARGET_ID, LIMITED)).flatten().unwrap_or(0);
-    let in_b = attached(b, || open_process(target, TARGET_ID, ALL_ACCESS)).flatten().unwrap_or(0);
+    let in_a = attached(a, || open_process(target, target_id, LIMITED)).flatten().unwrap_or(0);
+    let in_b = attached(b, || open_process(target, target_id, ALL_ACCESS)).flatten().unwrap_or(0);
     assert(in_a != 0 && in_b != 0 && in_a != in_b, "handles: o mesmo processo aberto em A e em B");
     let seen_by_a = attached(a, || (state::get_user_handle(in_a).map(|entry| entry.access()), state::get_user_handle(in_b).is_none()));
     let seen_by_b = attached(b, || (state::get_user_handle(in_b).map(|entry| entry.access()), state::get_user_handle(in_a).is_none()));
@@ -143,7 +146,7 @@ pub fn run(assert: Assert) {
     // O processo de um handle é comparado com o processo corrente (o
     // anexado), e o handle é procurado na tabela dele.
     let duplicate_checks = attached(a, || {
-        let own = open_process(a, A_ID, ALL_ACCESS).unwrap_or(0);
+        let own = open_process(a, a_id, ALL_ACCESS).unwrap_or(0);
         let checks = (user_handles::current_process(own, 0x40), user_handles::current_process(in_a, 0));
         let _ = close::close(own, Some(1));
         checks
@@ -175,7 +178,7 @@ pub fn run(assert: Assert) {
     let plain = Arc::new(Plain { closes: AtomicU32::new(0), released: AtomicU32::new(0) });
     let plain_object: Arc<dyn UserObject> = plain.clone();
     let plain_handle = attached(b, || state::alloc_user_handle(plain_object, ALL_ACCESS, 0).ok()).flatten().map_or(0, u64::from);
-    let kept = attached(a, || open_process(target, TARGET_ID, LIMITED)).flatten().unwrap_or(0);
+    let kept = attached(a, || open_process(target, target_id, LIMITED)).flatten().unwrap_or(0);
     assert(plain_handle != 0 && kept != 0 && row(b, plain_handle).is_none(), "handles: handle sem linha nativa em B e outro em A");
     assert(process::terminate_process(b, 0).is_ok() && references(target) == baseline + 1, "handles: o termino de B fecha o handle com linha nativa");
     assert(plain.closes.load(Ordering::Relaxed) == 1 && plain.released.load(Ordering::Relaxed) == 1, "handles: o termino de B fecha o handle sem linha nativa");

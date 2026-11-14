@@ -9,15 +9,13 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::MemoryBasicInformation;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{paging, query_virtual};
-use crate::ntos::ps::process;
+use crate::ntos::ps::{cid, process};
 use crate::ntos::ps::process_context;
 use crate::ntos::ps::user::memory::{self, Space};
 use crate::ntos::ps::user::{memory_query, process_state};
 
 type Assert = fn(bool, &str);
 
-const FIRST_ID: u64 = 0x7E60;
-const SECOND_ID: u64 = 0x7E70;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_FREE: u32 = 0x1_0000;
 const MEM_RELEASE: u64 = 0x8000;
@@ -80,11 +78,11 @@ pub fn run(assert: Assert) {
     let kernel_info = guest::alloc_bytes(MemoryBasicInformation::SIZE);
     let scratch = Scratch(block);
     let system_regions = Space::system().regions().len();
-    let Ok(first) = process::create_process(FIRST_ID, "vad-a.exe", 0, None) else {
+    let Ok(first) = process::create_process(cid::ALLOCATE, "vad-a.exe", 0, None) else {
         assert(false, "vad: processo A criado");
         return;
     };
-    let Ok(second) = process::create_process(SECOND_ID, "vad-b.exe", 0, None) else {
+    let Ok(second) = process::create_process(cid::ALLOCATE, "vad-b.exe", 0, None) else {
         let _ = process::terminate_process(first, 0);
         assert(false, "vad: processo B criado");
         return;

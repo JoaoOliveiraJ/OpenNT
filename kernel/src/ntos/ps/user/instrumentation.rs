@@ -51,10 +51,16 @@ fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelE
     Ok(0)
 }
 
-/// O callback do processo encerrado sai do bloco de execução da CPU (o
-/// KPROCESS some com ele).
-pub fn release_process() {
-    usermode::block().instrumentation.set(0);
+/// O callback do processo `process`, que terminou, sai do bloco de execução
+/// da CPU quando é a cópia que está lá (o KPROCESS some com o processo); o
+/// de outro processo fica.
+pub fn release_process(process: u64) {
+    // SAFETY: o EPROCESS do processo em término, ainda não recolhido.
+    let callback = unsafe { Eprocess::at(process) }.pcb.instrumentation_callback.get();
+    let block = usermode::block();
+    if callback != 0 && block.instrumentation.get() == callback {
+        block.instrumentation.set(0);
+    }
 }
 
 pub fn init() {

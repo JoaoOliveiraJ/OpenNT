@@ -865,14 +865,6 @@ pub fn release_vad(state: &ProcessState) {
     }
 }
 
-/// O processo do runtime de usuário sai: o VAD dele volta inteiro, se o
-/// término ainda não o devolveu.
-pub fn release_space(space: Space) {
-    if let Some(state) = space.state() {
-        release_vad(&state);
-    }
-}
-
 fn query(process: u64, base: u64, class: u64, buffer: u64, rsp: u64) -> Result<u32, KernelError> {
     memory_query::query_virtual_memory(process, base, class, buffer, rsp)
 }

@@ -548,6 +548,24 @@ carregado é recusado.
   sondada de um serviço de usuário são da thread que o executa
   (`state::SyscallRecord`, por KTHREAD), gravados por
   `ex/system_services.rs` e lidos por `state::service_raw_arguments`.
+- **Ciclo de vida por processo**: o que um processo possui volta quando ele
+  termina, e só o dele; não há reinício global entre um processo e o
+  próximo. As threads de usuário ficam na lista do processo
+  (`ProcessState.threads`, com `started` marcando o laço iniciado) e no
+  índice global de `ps/user/threads.rs` (despachante, APCs, busca por id de
+  cliente) até serem liberadas; os módulos do loader do kernel, com as
+  imagens, ficam em `ProcessState` (a ntdll é do sistema e vale em todos).
+  O término (`terminate_process`) chama as rotinas de saída de processo, e a
+  de `ps/user/files.rs::release_user_resources(process)` libera E/S pendente
+  de `device_io`, fábricas de workers, a cópia do callback de
+  instrumentação, mutantes, threads, canais de `cm::service::rpc` e picos de
+  `system_process_information` do processo; depois `process_state::destroy`
+  fecha os handles, devolve o VAD e as imagens dos módulos. Uma thread nunca
+  é recolhida enquanto é a corrente ou está no meio de um intervalo de
+  usuário: `threads::release_process` deixa o KTHREAD dela para quando o
+  chamador trocar de volta e chamar de novo. Toda falha depois da criação
+  de um processo também passa pelo término. Teste:
+  `ntos/test/multiprocess/lifecycle.rs`.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
@@ -563,7 +581,10 @@ carregado é recusado.
   processo de usuário usa `with_test_process`
   (`ntos/test/multiprocess/identity.rs`), que cria um EPROCESS real com
   estado, PEB e uma thread corrente dele e o termina no fim. Identidade
-  forjada (PID ou PEB escritos à mão num global) não existe.
+  forjada (PID ou PEB escritos à mão num global) não existe. Os processos e
+  threads dos testes multiprocesso pegam ids com `cid::ALLOCATE`, para que
+  um objeto vazado por um teste não quebre outro; as asserções sobre um
+  processo que já saiu leem o EPROCESS retido pelo teste, não estado global.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
   `--trace-driver-api` mostra cada export chamado (veja o README).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,

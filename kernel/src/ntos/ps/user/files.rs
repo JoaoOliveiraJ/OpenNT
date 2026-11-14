@@ -22,7 +22,7 @@ use crate::ntos::ob::objects::file as file_objects;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{IoStatusBlock, NtStruct, SectionBasicInformation};
+use crate::ntos::inc::types::{Eprocess, IoStatusBlock, NtStruct, SectionBasicInformation};
 
 /// Handle `device` do processo: o caminho, o handle do I/O manager e o
 /// FILE_OBJECT aberto pelo IRP_MJ_CREATE.
@@ -339,32 +339,32 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
     })
 }
 
-/// Fim do processo de usuário `process_id`: devolve o VAD do processo
-/// (vistas de seção e de imagem e regiões privadas), se o término ainda não o
-/// devolveu. As liberações de `device_io`, `worker_factory`, instrumentação,
-/// mutantes, threads, win32k, `cm::service::rpc` e
-/// `system_process_information`, nesta ordem; as com dono são as do processo
-/// `process_id`, que em geral já saiu e não é o corrente. Os handles não
-/// passam por aqui: a tabela é do processo e o término dele a esvazia
-/// (`process_state::destroy`).
-pub fn release_user_resources(process_id: u64) {
+/// Fim do processo `process` (EPROCESS): a rotina de saída de processo do
+/// término (`ps::process::terminate_process`), chamada depois da saída das
+/// threads nativas e das notificações e antes do rundown de handles e do
+/// VAD. Libera o que o processo possui, e só o dele: as requisições de
+/// `device_io`, as fábricas de workers, a cópia do callback de
+/// instrumentação, os mutantes e as threads de usuário, os canais de
+/// `cm::service::rpc` e os picos de `system_process_information`, nesta
+/// ordem. Os handles, o VAD e os módulos do loader saem logo depois, em
+/// `process_state::destroy`. Nada é reiniciado entre processos: um processo
+/// vivo não perde nada quando outro termina.
+pub fn release_user_resources(process: u64) {
+    // SAFETY: o EPROCESS em término, retido pelo próprio término.
+    let process_id = unsafe { Eprocess::at(process) }.unique_process_id.get();
     super::device_io::release_process(process_id);
     super::worker_factory::release_process(process_id);
-    super::instrumentation::release_process();
-    super::mutants::release_process();
-    super::threads::release_process();
+    super::instrumentation::release_process(process);
+    super::mutants::release_process(process);
+    super::threads::release_process(process);
     crate::ntos::cm::service::rpc::release_process(process_id);
     crate::ntos::ps::system_process_information::release_process(process_id);
-    // O processo do runtime ainda vivo (saída sem término): o System nunca
-    // entra aqui.
-    let runtime = process::list_active_processes().into_iter().find(|entry| entry.pid == process_id && entry.pid != process::SYSTEM_PROCESS_ID);
-    if let Some(entry) = runtime {
-        super::memory::release_space(super::memory::Space::of(entry.address));
-    }
 }
 
-/// Registra os handlers de arquivos, dispositivos e seções.
+/// Registra os handlers de arquivos, dispositivos e seções, e a liberação
+/// por processo no término.
 pub fn init() {
+    process::register_process_exit_routine(release_user_resources);
     state::register_handler("NtOpenFile", nt_open_file);
     state::register_handler("NtCreateFile", nt_create_file);
     state::register_handler("NtDeviceIoControlFile", nt_device_io_control_file);

@@ -7,14 +7,18 @@ use alloc::sync::Arc;
 
 use crate::ntos::ke::process_attachment;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::{Eprocess, NtStruct};
+use crate::ntos::ps::cid;
 use crate::ntos::ps::process::{self, SYSTEM_PROCESS_ID};
 use crate::ntos::ps::user::process_state::{self, ProcessState};
 
 type Assert = fn(bool, &str);
 
-const FIRST_ID: u64 = 0x7E40;
-const FIRST_THREAD_ID: u64 = 0x7E44;
-const SECOND_ID: u64 = 0x7E50;
+/// EPROCESS.UniqueProcessId (os processos do teste pegam o próximo id livre).
+fn process_id(process: u64) -> u64 {
+    // SAFETY: EPROCESS vivo criado pelo teste.
+    unsafe { Eprocess::at(process) }.unique_process_id.get()
+}
 
 fn same(left: &Option<Arc<ProcessState>>, right: &Option<Arc<ProcessState>>) -> bool {
     matches!((left, right), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
@@ -27,24 +31,25 @@ pub fn run(assert: Assert) {
     assert(process::list_active_processes().iter().all(|entry| process_state::get(entry.address).is_some_and(|state| state.process_id == entry.pid)), "estado: todo processo ativo tem estado");
     assert(same(&process_state::current(), &process_state::get(process::get_current_process())), "estado: corrente vem do ApcState.Process");
 
-    let Ok(first) = process::create_process(FIRST_ID, "estado-a.exe", 0, None) else {
+    let Ok(first) = process::create_process(cid::ALLOCATE, "estado-a.exe", 0, None) else {
         assert(false, "estado: primeiro processo criado");
         return;
     };
-    let Ok(second) = process::create_process(SECOND_ID, "estado-b.exe", 0, None) else {
+    let Ok(second) = process::create_process(cid::ALLOCATE, "estado-b.exe", 0, None) else {
         let _ = process::terminate_process(first, 0);
         assert(false, "estado: segundo processo criado");
         return;
     };
     let first_state = process_state::get(first);
     let second_state = process_state::get(second);
-    assert(first_state.as_ref().is_some_and(|state| state.process == first && state.process_id == FIRST_ID), "estado: primeiro processo ganha estado");
-    assert(second_state.as_ref().is_some_and(|state| state.process == second && state.process_id == SECOND_ID), "estado: segundo processo ganha estado");
+    let (first_id, second_id) = (process_id(first), process_id(second));
+    assert(first_state.as_ref().is_some_and(|state| state.process == first && state.process_id == first_id), "estado: primeiro processo ganha estado");
+    assert(second_state.as_ref().is_some_and(|state| state.process == second && state.process_id == second_id), "estado: segundo processo ganha estado");
     assert(!same(&first_state, &second_state) && !same(&first_state, &system_state), "estado: estados distintos");
-    assert(process_state::create(first, FIRST_ID).is_err() && same(&process_state::get(first), &first_state), "estado: segundo estado do mesmo EPROCESS recusado");
+    assert(process_state::create(first, first_id).is_err() && same(&process_state::get(first), &first_state), "estado: segundo estado do mesmo EPROCESS recusado");
 
     // A thread corrente decide o processo corrente.
-    let thread = process::create_kernel_thread(first, FIRST_THREAD_ID, false, 0, None);
+    let thread = process::create_kernel_thread(first, cid::ALLOCATE, false, 0, None);
     assert(thread.is_ok(), "estado: thread do primeiro processo");
     if let Ok(thread) = thread {
         let previous = process::get_current_thread();

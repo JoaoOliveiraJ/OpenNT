@@ -20,13 +20,12 @@ use crate::ntos::ke::pcr::{self, layout};
 use crate::ntos::ke::smp;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::memory_map as map;
-use crate::ntos::ps::process;
+use crate::ntos::ps::{cid, process};
 use crate::ntos::ps::user::{memory, state};
 
 type Assert = fn(bool, &str);
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
-const TEST_THREAD_ID: u64 = 0x7E60;
 /// Primeiro serviço da tabela 1 (o índice 0 da tabela gráfica).
 const TEST_SERVICE: u32 = 0x1000;
 
@@ -121,7 +120,7 @@ fn syscall_user_rsp(assert: Assert) {
     };
     let (code, stack) = (allocate(0x1000, 0x40), allocate(0x4000, 4));
     let previous = process::get_current_thread();
-    let thread = process::create_kernel_thread(process::get_current_process(), TEST_THREAD_ID, true, 1, None);
+    let thread = process::create_kernel_thread(process::get_current_process(), cid::ALLOCATE, true, 1, None);
     if code != 0 && stack != 0 && service_table::publish_shadow_second_table(table, 1, SERVICE_ARGUMENTS.as_ptr() as u64).is_ok() {
         if let Ok(thread) = thread {
             let stack_top = stack + 0x4000 - 0x28;

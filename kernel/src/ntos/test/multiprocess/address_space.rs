@@ -23,14 +23,11 @@ use crate::ntos::mm::paging::{self, MapOptions, PAGE_PRESENT, PAGE_RW, PAGE_USER
 use crate::ntos::mm::process_address_space::{self as address_space, SYSTEM_ROOT};
 use crate::ntos::mm::shared_user_data::{self, MM_SHARED_USER_DATA_VA, SHARED_USER_DATA_VA};
 use crate::ntos::mm::{memory_map as map, pfn};
-use crate::ntos::ps::process;
+use crate::ntos::ps::{cid, process};
 use crate::ntos::ps::user::process_state;
 
 type Assert = fn(bool, &str);
 
-const FIRST_ID: u64 = 0x7E60;
-const SECOND_ID: u64 = 0x7E70;
-const THIRD_ID: u64 = 0x7E80;
 /// Uma VA no mesmo slot da PML4 (e na mesma PDPT) da visão da KUSER.
 const LOW_USER_VA: u64 = 0x1_4000_0000;
 /// Uma VA no último slot de usuário da PML4.
@@ -46,11 +43,11 @@ fn state_root(process: u64) -> Option<u64> {
 }
 
 pub fn run(assert: Assert) {
-    let Ok(first) = process::create_process(FIRST_ID, "espaco-a.exe", 0, None) else {
+    let Ok(first) = process::create_process(cid::ALLOCATE, "espaco-a.exe", 0, None) else {
         assert(false, "espaco: primeiro processo criado");
         return;
     };
-    let Ok(second) = process::create_process(SECOND_ID, "espaco-b.exe", 0, None) else {
+    let Ok(second) = process::create_process(cid::ALLOCATE, "espaco-b.exe", 0, None) else {
         let _ = process::terminate_process(first, 0);
         assert(false, "espaco: segundo processo criado");
         return;
@@ -172,7 +169,7 @@ fn exercise(assert: Assert, first: u64, second: u64, first_root: u64, second_roo
 /// PspProcessDelete) devolve a raiz e as tabelas.
 fn last_dereference(assert: Assert) {
     let free_before = pfn::free_count();
-    let Ok(third) = process::create_process(THIRD_ID, "espaco-c.exe", 0, None) else {
+    let Ok(third) = process::create_process(cid::ALLOCATE, "espaco-c.exe", 0, None) else {
         assert(false, "espaco: terceiro processo criado");
         return;
     };

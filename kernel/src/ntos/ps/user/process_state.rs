@@ -23,20 +23,30 @@
 //!
 //! Moram aqui a tabela de handles de usuário (`handles`, operada por
 //! `state.rs`), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
-//! gravada por `mm::process_address_space`) e a parte da identidade do
-//! processo de usuário que não cabe no EPROCESS (caminho da imagem,
-//! PEB_LDR_DATA do kernel, exports das imagens mapeadas); PID, PEB e cookie
-//! são do próprio EPROCESS. O resto do estado global de `state.rs` entra aqui
-//! à medida que sai de lá.
+//! gravada por `mm::process_address_space`), as threads de usuário e o
+//! início do laço (`threads`, `started`), os módulos do loader do kernel e a
+//! parte da identidade do processo de usuário que não cabe no EPROCESS
+//! (caminho da imagem, PEB_LDR_DATA do kernel, exports das imagens
+//! mapeadas); PID, PEB e cookie são do próprio EPROCESS. O resto do estado
+//! global de `state.rs` entra aqui à medida que sai de lá.
+//!
+//! Ciclo de vida: o que o processo possui volta quando ELE termina, nunca
+//! num reinício global entre processos. O término (`ps::process::
+//! terminate_process`) chama primeiro as rotinas de saída de processo (a de
+//! `files::release_user_resources` libera threads, E/S pendente, fábricas de
+//! workers, mutantes, instrumentação e canais RPC do processo) e, fora da
+//! lista ativa, `destroy`: handles, VAD e módulos, nesta ordem.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::loader::LoadedModule;
 use super::memory::{self, Vad};
+use super::threads::UserThread;
 use crate::ntos::mm::process_address_space;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
@@ -67,6 +77,17 @@ pub struct ProcessState {
     /// Imagens nativas mapeadas no processo por NtMapViewOfSection (nome
     /// minúsculo → exports), registradas pela vista de imagem.
     mapped_image_exports: SpinLock<BTreeMap<String, Exports>>,
+    /// As threads de usuário do processo, na ordem de criação. O índice
+    /// global de `threads.rs` também as tem (despachante e busca por id de
+    /// cliente) até cada uma ser liberada.
+    pub threads: SpinLock<Vec<Arc<UserThread>>>,
+    /// O laço de execução do processo começou: só então ele aceita threads
+    /// novas (NtCreateThreadEx, workers de fábrica).
+    pub started: AtomicBool,
+    /// Módulos que o loader do kernel carregou no processo (nome minúsculo
+    /// → módulo e imagem); a ntdll é do sistema e vale em todos sem entrar
+    /// aqui.
+    modules: SpinLock<BTreeMap<String, LoadedModule>>,
 }
 
 impl ProcessState {
@@ -91,6 +112,12 @@ impl ProcessState {
     pub fn with_mapped_image_exports<R>(&self, body: impl FnOnce(&mut BTreeMap<String, Exports>) -> R) -> R {
         body(&mut self.mapped_image_exports.lock())
     }
+
+    /// Acesso aos módulos do loader do kernel; a trava não atravessa
+    /// chamadas que voltem ao estado.
+    pub fn with_modules<R>(&self, body: impl FnOnce(&mut BTreeMap<String, LoadedModule>) -> R) -> R {
+        body(&mut self.modules.lock())
+    }
 }
 
 static PROCESSES: SpinLock<BTreeMap<u64, Arc<ProcessState>>> = SpinLock::new(BTreeMap::new());
@@ -110,6 +137,9 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         image_path: SpinLock::new(String::new()),
         ldr: AtomicU64::new(0),
         mapped_image_exports: SpinLock::new(BTreeMap::new()),
+        threads: SpinLock::new(Vec::new()),
+        started: AtomicBool::new(false),
+        modules: SpinLock::new(BTreeMap::new()),
     });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {
@@ -144,13 +174,21 @@ pub fn all() -> Vec<Arc<ProcessState>> {
 /// Destrói o estado do EPROCESS `process`; um segundo término não acha
 /// nada. Devolve se havia estado. Fora da trava, na ordem do término do NT
 /// (rundown de handles antes do espaço de endereçamento): os handles de
-/// usuário que restarem na tabela são fechados e o VAD volta inteiro (as
-/// regiões do processo, só as dele).
+/// usuário que restarem na tabela são fechados, o VAD volta inteiro (as
+/// regiões do processo, só as dele) e depois as imagens dos módulos do
+/// loader. A lista de threads se desfaz; uma thread ainda retida (handle em
+/// outro processo, ou a que encerrou o processo de dentro de um serviço)
+/// continua no índice global até a liberação dela.
 pub fn destroy(process: u64) -> bool {
     let removed = PROCESSES.lock().remove(&process);
     if let Some(removed) = &removed {
+        removed.started.store(false, Ordering::Release);
         state::sweep_user_handles(removed);
         memory::release_vad(removed);
+        let modules = core::mem::take(&mut *removed.modules.lock());
+        drop(modules);
+        let threads = core::mem::take(&mut *removed.threads.lock());
+        drop(threads);
     }
     // O último Arc cai aqui, fora da trava.
     removed.is_some()

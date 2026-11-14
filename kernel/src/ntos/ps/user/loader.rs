@@ -3,11 +3,13 @@
 //! A parte do kernel do que o NT faz com ZwCreateUserProcess: a ntdll real
 //! do volume (com o mapa SSN → nome), o apiset schema real, os dados NLS,
 //! as entradas LDR_DATA_TABLE_ENTRY e o binding de imports contra as
-//! tabelas de exports reais das DLLs. Os módulos carregados e a ntdll
-//! vivem em `LOADED_MODULES`/`NTDLL_MODULE`; o schema parseado, em `API_SET`.
+//! tabelas de exports reais das DLLs. Os módulos que o loader carrega num
+//! processo são dele (`ProcessState`, com a imagem, desfeita no término do
+//! processo); a ntdll é do sistema (`NTDLL_MODULE`) e vale em todo processo;
+//! o schema parseado fica em `API_SET`.
 
-use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::{String, ToString};
+use alloc::collections::BTreeSet;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -33,7 +35,7 @@ const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::rtl::image::pe_exports::Exports;
-use crate::ntos::mm::pe_loader::{self, ImportSymbol, LoadOptions, ResolvedImport};
+use crate::ntos::mm::pe_loader::{self, ImportSymbol, LoadOptions, PeImage, ResolvedImport};
 use crate::ntos::mm::sysload::pe_resolver::{self, ExportedModule, Symbol};
 
 /// A ABI única de syscalls do bring-up, a mesma tabela que o build usa para
@@ -55,6 +57,27 @@ pub struct Module {
 impl Module {
     fn exported(&self) -> Arc<ExportedModule> {
         Arc::new(ExportedModule { name: self.name.clone(), exports: self.exports.clone() })
+    }
+}
+
+/// Um módulo carregado num processo pelo loader do kernel: o módulo e a
+/// imagem que o loader mapeou para o processo. Mora no `ProcessState` e a
+/// imagem volta quando o processo termina (o estado se desfaz).
+pub struct LoadedModule {
+    pub module: Arc<Module>,
+    image: Option<PeImage>,
+}
+
+impl Drop for LoadedModule {
+    fn drop(&mut self) {
+        let Some(image) = self.image.as_mut() else { return };
+        if let Err(error) = image.release() {
+            crate::debug_print!("[usermode] imagem de {} retida: {}", self.module.name, error);
+            return;
+        }
+        if let Err(error) = crate::ntos::ke::smp::flush_remote_tlb(false) {
+            crate::debug_print!("[usermode] TLB da imagem de {}: {}", self.module.name, error);
+        }
     }
 }
 
@@ -110,7 +133,6 @@ fn push_image(space: Space, base: u64, size: u64, name: String, file: Option<Arc
 
 /// O volume de onde vêm a ntdll, o schema e o NLS.
 static NTFS_VOLUME: SpinLock<Option<Arc<Ntfs>>> = SpinLock::new(None);
-static LOADED_MODULES: SpinLock<BTreeMap<String, Arc<Module>>> = SpinLock::new(BTreeMap::new());
 static NTDLL_MODULE: SpinLock<Option<Arc<Module>>> = SpinLock::new(None);
 static API_SET: SpinLock<Option<Arc<Schema>>> = SpinLock::new(None);
 /// A ntdll mapeada, registrada para as entradas LDR dos processos.
@@ -127,22 +149,28 @@ pub fn ntfs_volume() -> Option<Arc<Ntfs>> {
     volume
 }
 
+/// O módulo `name` (minúsculo) do processo corrente; a ntdll vale em todo
+/// processo.
 pub fn loaded_module(name: &str) -> Option<Arc<Module>> {
-    LOADED_MODULES.lock().get(name).cloned()
+    let own = process_state::current().and_then(|state| state.with_modules(|modules| modules.get(name).map(|loaded| loaded.module.clone())));
+    own.or_else(|| ntdll_module().filter(|_| name == "ntdll.dll"))
 }
 
 pub fn ntdll_module() -> Option<Arc<Module>> {
     NTDLL_MODULE.lock().clone()
 }
 
-/// Reinício por processo: a ntdll sobrevive ao reset.
-pub fn reset_loaded_modules() {
-    let ntdll = ntdll_module();
-    let mut modules = LOADED_MODULES.lock();
-    modules.clear();
-    if let Some(ntdll) = ntdll {
-        modules.insert(String::from("ntdll.dll"), ntdll);
-    }
+/// Registra o módulo no processo corrente, com a imagem que o loader mapeou
+/// para ele (desfeita quando o processo termina). Sem estado de processo, a
+/// imagem volta na hora e o registro é recusado.
+pub fn register_module(module: Arc<Module>, image: Option<PeImage>) -> Result<(), KernelError> {
+    let loaded = LoadedModule { module, image };
+    let Some(state) = process_state::current() else { return Err(KernelError::new(alloc::format!("modulo {} sem processo", loaded.module.name))) };
+    let name = loaded.module.name.to_lowercase();
+    // Um registro repetido do mesmo nome desfaz o anterior fora da trava.
+    let previous = state.with_modules(|modules| modules.insert(name, loaded));
+    drop(previous);
+    Ok(())
 }
 
 /// A ntdll é mapeada uma vez por espaço de endereços e resolve os imports
@@ -191,7 +219,6 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
         is_exe: false,
         notification_source: Some(Arc::new(BytesSource { name: String::from(source_name), bytes: Arc::new(bytes) })),
     });
-    LOADED_MODULES.lock().insert(String::from("ntdll.dll"), module.clone());
     *NTDLL_MODULE.lock() = Some(module);
     system_services::register(&syscall_scan::scan_syscall_stubs(&exports))?;
     pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("ntdll.dll"), Arc::new(ntdll_resolver));
@@ -420,6 +447,7 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
     let image_name = alloc::format!("\\NTFS{}", file.volume_path().replace('/', "\\"));
     let source: Arc<dyn ImageSource> = Arc::new(VolumeImageSource { name: image_name.clone(), file: file.clone() });
     let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, skip_imports: true, image_name: Some(image_name), ..LoadOptions::default() })?;
+    let (image_base, size_of_image) = (image.image_base, image.size_of_image);
     let module = Arc::new(Module {
         name: file_name.clone(),
         full_name: alloc::format!("C:\\Windows\\System32\\{file_name}"),
@@ -430,9 +458,10 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
         is_exe: false,
         notification_source: None,
     });
-    LOADED_MODULES.lock().insert(file_name.to_string(), module.clone());
-    push_image(Space::current(), image.image_base, image.size_of_image, file.nt_path(), Some(file));
-    bind_imports(image.image_base, depth + 1)?;
+    // A imagem é do processo corrente e volta no término dele.
+    register_module(module.clone(), Some(image))?;
+    push_image(Space::current(), image_base, size_of_image, file.nt_path(), Some(file));
+    bind_imports(image_base, depth + 1)?;
     // Dependências inicializadas antes do importador.
     create_ldr_entry(&module)?;
     Ok(module)

@@ -2,8 +2,12 @@
 //!
 //! As threads executam código nativo em anel 3; a HAL salva CONTEXTs x64
 //! completos nas saídas de syscall/timer e este módulo cuida do
-//! escalonamento e do ciclo de vida. As threads vivem em `THREADS`.
-//! A execução do contexto (`exec_user_context`) é instalada pela HAL de modo
+//! escalonamento e do ciclo de vida. Cada processo tem a lista das próprias
+//! threads (`ProcessState.threads`) e o início do laço (`started`); `THREADS`
+//! é o índice global (despachante, APCs e busca por id de cliente), onde a
+//! thread fica até ser liberada, mesmo depois do término do processo dela.
+//! O fim de um processo libera as threads dele, e só as dele
+//! ([`release_process`]). A execução do contexto (`exec_user_context`) é instalada pela HAL de modo
 //! usuário; os pumps de ALPC, `device_io`, worker factories, timers e pacotes
 //! de espera ocupam slots fixos do laço.
 
@@ -15,6 +19,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::memory;
+use super::process_state;
 use super::state::{self, probe_user_read, probe_user_write, NativeBody, Region, UserHandle, UserObject};
 use crate::ntos::ke::{apc, clock, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
@@ -166,6 +171,7 @@ impl UserThread {
 }
 
 static THREADS: SpinLock<Vec<Arc<UserThread>>> = SpinLock::new(Vec::new());
+/// O laço de execução está ativo (só o BSP despacha usuário).
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CURRENT: SpinLock<Option<Arc<UserThread>>> = SpinLock::new(None);
 static APC_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -189,17 +195,47 @@ pub fn set_pump(slot: usize, routine: fn()) {
     PUMPS.lock()[slot] = Some(routine);
 }
 
+/// O índice global: as threads de todos os processos ainda não liberadas.
 pub fn all() -> Vec<Arc<UserThread>> {
     THREADS.lock().clone()
 }
 
+/// As threads do processo `process`: a lista do `ProcessState` enquanto ele
+/// vive; depois do término, as que ainda estão no índice.
+pub fn of_process(process: u64) -> Vec<Arc<UserThread>> {
+    match process_state::get(process) {
+        Some(state) => state.threads.lock().clone(),
+        None => THREADS.lock().iter().filter(|thread| thread.with(|thread| thread.process_pointer) == process).cloned().collect(),
+    }
+}
+
+/// Publica a thread no processo dono (o do KTHREAD, ou o corrente) e no
+/// índice global.
 pub fn push(thread: Arc<UserThread>) {
+    let owner = thread.with(|thread| {
+        if thread.process_pointer == 0 {
+            thread.process_pointer = if thread.thread_pointer != 0 { kernel_thread(thread.thread_pointer).process.get() } else { process::get_current_process() };
+        }
+        thread.process_pointer
+    });
+    if let Some(state) = process_state::get(owner) {
+        state.threads.lock().push(thread.clone());
+    }
     THREADS.lock().push(thread);
 }
 
-/// Esvazia a lista de threads de usuário.
-pub fn clear() {
-    THREADS.lock().clear();
+/// Retira a thread do índice e da lista do processo dono, sem liberar nada.
+pub fn remove(thread: &Arc<UserThread>) {
+    THREADS.lock().retain(|candidate| !Arc::ptr_eq(candidate, thread));
+    let owner = thread.with(|thread| thread.process_pointer);
+    if let Some(state) = process_state::get(owner) {
+        state.threads.lock().retain(|candidate| !Arc::ptr_eq(candidate, thread));
+    }
+}
+
+/// O processo corrente já começou o laço (aceita threads novas).
+fn current_process_started() -> bool {
+    process_state::current().is_some_and(|state| state.started.load(Ordering::Acquire))
 }
 
 pub fn find_by_id(id: u64) -> Option<Arc<UserThread>> {
@@ -218,8 +254,16 @@ pub fn active() -> bool {
     RUNNING.load(Ordering::Acquire) && CURRENT.lock().is_some()
 }
 
-/// Estado do laço de execução (`running`); os autotestes o simulam.
+/// Estado do laço de execução (`running`) e o início do processo corrente;
+/// os autotestes o simulam.
 pub fn set_running(running: bool, current: Option<Arc<UserThread>>) {
+    if let Some(state) = process_state::current() {
+        state.started.store(running, Ordering::Release);
+    }
+    set_dispatching(running, current);
+}
+
+fn set_dispatching(running: bool, current: Option<Arc<UserThread>>) {
     RUNNING.store(running, Ordering::Release);
     *CURRENT.lock() = current;
 }
@@ -321,8 +365,8 @@ fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn refresh_ready_user_threads() {
-    let mut candidates: Vec<Arc<UserThread>> = all().into_iter().filter(|thread| thread.with(|thread| !thread.dead && thread.suspend_count == 0)).collect();
+fn refresh_ready_user_threads(process: u64) {
+    let mut candidates: Vec<Arc<UserThread>> = of_process(process).into_iter().filter(|thread| thread.with(|thread| !thread.dead && thread.suspend_count == 0)).collect();
     candidates.sort_by_key(|thread| core::cmp::Reverse(thread_priority::query_priority(thread.pointer())));
     for candidate in candidates {
         let pointer = candidate.pointer();
@@ -353,20 +397,23 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
     let process_pointer = thread.with(|thread| thread.process_pointer);
     let caller = process::get_current_thread();
     process::reference(process_pointer);
-    set_running(true, None);
+    if let Some(state) = process_state::get(process_pointer) {
+        state.started.store(true, Ordering::Release);
+    }
+    set_dispatching(true, None);
     crate::hal::amd64::usermode::reset_fault_state();
     let result = (|| -> Result<u32, KernelError> {
         loop {
-            refresh_ready_user_threads();
+            refresh_ready_user_threads(process_pointer);
             process::set_current_thread(caller);
             dispatcher::pump_kernel();
             let pumps = *PUMPS.lock();
             for routine in pumps.into_iter().flatten() {
                 routine();
             }
-            refresh_ready_user_threads();
+            refresh_ready_user_threads(process_pointer);
             let Some((pointer, owner)) = thread_dispatch::peek()? else {
-                if all().iter().all(|thread| thread.dead()) {
+                if of_process(process_pointer).iter().all(|thread| thread.dead()) {
                     // SAFETY: o EPROCESS é referenciado durante o laço.
                     return Ok(unsafe { Eprocess::at(process_pointer) }.exit_status.get() as u32);
                 }
@@ -420,7 +467,7 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             if failed != 0 {
                 return Ok(failed);
             }
-            for finished in all() {
+            for finished in of_process(process_pointer) {
                 if finished.dead() {
                     release_execution_resources(&finished);
                 }
@@ -429,7 +476,10 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
             kernel_stack::reap();
         }
     })();
-    set_running(false, None);
+    if let Some(state) = process_state::get(process_pointer) {
+        state.started.store(false, Ordering::Release);
+    }
+    set_dispatching(false, None);
     process::set_current_thread(caller);
     let _ = process::dereference(process_pointer);
     result
@@ -548,10 +598,23 @@ pub fn wait_objects(entries: Vec<Arc<UserHandle>>, objects: Vec<u64>, wait_type:
     PENDING
 }
 
-pub fn release_process() {
-    for thread in all() {
+/// Fim do processo `process`: as threads dele (e só as dele) morrem, as
+/// esperas acabam com THREAD_IS_TERMINATING e os recursos de execução, o
+/// registro no escalonador e o KTHREAD voltam. A thread do intervalo em curso
+/// (o processo terminou de dentro de um serviço dela) só morre: o resto fica
+/// para depois do intervalo, e o KTHREAD da thread corrente fica para quando
+/// ela deixar de ser a corrente (como o NT, que só recolhe uma thread
+/// terminada depois da troca). Chamar de novo conclui o que ficou.
+pub fn release_process(process: u64) {
+    let in_slice = crate::hal::amd64::usermode::block().context.get();
+    let owned: Vec<Arc<UserThread>> = all().into_iter().filter(|thread| thread.with(|thread| thread.process_pointer) == process).collect();
+    for thread in owned {
         if let Some(wait) = thread.take_wait() {
             finish_wait(&thread, wait, THREAD_IS_TERMINATING);
+        }
+        if in_slice != 0 && thread.with(|thread| thread.context) == in_slice {
+            thread.with(|thread| thread.dead = true);
+            continue;
         }
         let (pointer, registered) = thread.with(|thread| {
             thread.dead = true;
@@ -613,19 +676,26 @@ fn rundown_apcs(thread: &UserThread) {
     process::set_current_thread(previous);
 }
 
-fn destroy_thread_if_unused(thread: &UserThread) {
+/// Uma thread morta, sem handles nem regiões, sai do índice e do processo e
+/// solta o KTHREAD, exceto o da thread corrente (fica para a próxima
+/// liberação, quando ela já não for a corrente).
+fn destroy_thread_if_unused(thread: &Arc<UserThread>) {
+    let current = process::get_current_thread();
     let Some((pointer, registered)) = thread.with(|thread| {
-        if !thread.dead || thread.handles != 0 || thread.regions.is_some() || thread.thread_pointer == 0 {
+        if !thread.dead || thread.handles != 0 || thread.regions.is_some() || (thread.thread_pointer != 0 && thread.thread_pointer == current) {
             return None;
         }
         Some((core::mem::replace(&mut thread.thread_pointer, 0), core::mem::replace(&mut thread.scheduling_registered, false)))
     }) else {
         return;
     };
+    remove(thread);
     if registered {
         let _ = thread_dispatch::unregister(pointer);
     }
-    let _ = process::release_thread(pointer);
+    if pointer != 0 {
+        let _ = process::release_thread(pointer);
+    }
 }
 
 fn allocate_private(size: u64, highest: u64) -> Result<(u64, Region), u32> {
@@ -748,7 +818,7 @@ fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<
     let commit = state::stack_arg(rsp, 9);
     let reserve = state::stack_arg(rsp, 10);
     let list = state::stack_arg(rsp, 11);
-    if !RUNNING.load(Ordering::Acquire) || !probe_user_read(start, 1) {
+    if !current_process_started() || !probe_user_read(start, 1) {
         return Ok(0xC000_0005);
     }
     if flags & !0x77 != 0 || zero_bits > 32 {
@@ -823,7 +893,7 @@ fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<
 /// Pilha com compromisso antecipado (política deste kernel: todas as
 /// páginas reservadas têm PFN); qualquer falha desfaz a thread inteira.
 pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u32> {
-    if !RUNNING.load(Ordering::Acquire) || !probe_user_read(request.start, 1) {
+    if !current_process_started() || !probe_user_read(request.start, 1) {
         return Err(0xC000_0005);
     }
     // A PEB e o PID são do processo corrente (o EPROCESS).
@@ -914,7 +984,7 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         process::set_thread_start(thread_pointer, request.start);
         push(thread.clone());
         if attach_scheduling(&thread).is_err() {
-            THREADS.lock().retain(|candidate| !Arc::ptr_eq(candidate, &thread));
+            remove(&thread);
             process::remove_thread(process_pointer);
             regions = thread.with(|thread| thread.regions.take().unwrap_or_default());
             return Err(0xC000_0017);
@@ -1099,8 +1169,8 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
             9 => guest::try_write::<u64>(out, start)?,
             // ThreadHideFromDebugger (BOOLEAN).
             17 => guest::try_write::<u8>(out, hidden as u8)?,
-            // ThreadAmILastThread (ULONG).
-            _ => guest::try_write::<u32>(out, (all().iter().filter(|thread| !thread.dead()).count() == 1) as u32)?,
+            // ThreadAmILastThread (ULONG): as threads do processo corrente.
+            _ => guest::try_write::<u32>(out, (of_process(process::get_current_process()).iter().filter(|thread| !thread.dead()).count() == 1) as u32)?,
         }
         Ok(0)
     })
@@ -1175,7 +1245,7 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
                 return Ok(0xC000_000D);
             }
             let mut slots = Vec::new();
-            for target in all() {
+            for target in of_process(process::get_current_process()) {
                 let (dead, teb) = target.with(|thread| (thread.dead, thread.teb_va));
                 if dead || teb == 0 {
                     continue;
@@ -1254,7 +1324,7 @@ pub fn retain_thread(thread: &UserThread) {
     thread.with(|thread| thread.handles += 1);
 }
 
-pub fn release_thread(thread: &UserThread) {
+pub fn release_thread(thread: &Arc<UserThread>) {
     thread.with(|thread| thread.handles = thread.handles.saturating_sub(1));
     destroy_thread_if_unused(thread);
 }
