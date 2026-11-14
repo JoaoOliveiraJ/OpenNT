@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::{object_manager, open_pointer};
+use super::{object_header, object_manager, open_pointer, type_procedures};
 use crate::ntos::ke::{bugcheck, irql};
 use crate::ntos::ps::{previous_mode, process};
 use crate::rtl::{KernelError, SpinLock};
@@ -140,6 +140,13 @@ pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError>
     match open_pointer::resolve(value, from_user_mode) {
         Some(Err(status)) => return Ok(status),
         Some(Ok(opened)) => {
+            // A OkayToCloseProcedure do tipo vem antes da proteção (o
+            // ObCloseHandleTableEntry), no processo dono do handle.
+            if let Some(object_type) = object_header::object_type(opened.item.pointer) {
+                if !type_procedures::okay_to_close(object_type, opened.owner_process, opened.item.pointer, reported, from_user_mode as u8) {
+                    return Ok(STATUS_HANDLE_NOT_CLOSABLE);
+                }
+            }
             if opened.attributes & 1 != 0 {
                 return Ok(reject_protected_close(reported, from_user_mode));
             }

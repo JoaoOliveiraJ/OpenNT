@@ -441,7 +441,17 @@ pub fn insert_with(item: &Described, granted: u32, attributes: u32, owner: u64, 
         Some(Err(error)) => return Err(error),
         None => false,
     };
-    let granted = open.granted;
+    publish_handle(item, open.granted, attributes, owner, counted)
+}
+
+/// A linha de um handle que o dono já contou (`open_handle_for`, chamado
+/// por quem publica, como o ObpCreateHandle antes do nome); uma falha
+/// desfaz pelo fechamento do dono.
+pub fn insert_counted(item: &Described, granted: u32, attributes: u32, owner: u64) -> Result<u32, KernelError> {
+    publish_handle(item, granted, attributes, owner, true)
+}
+
+fn publish_handle(item: &Described, granted: u32, attributes: u32, owner: u64, counted: bool) -> Result<u32, KernelError> {
     let handle_flags = attributes & 2; // OB_HANDLE_FLAG_INHERIT
     let mut data = item.data();
     data.native_pointer = item.pointer;

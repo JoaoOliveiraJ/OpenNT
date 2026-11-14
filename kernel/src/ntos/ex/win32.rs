@@ -18,8 +18,9 @@
 //! UseDefaultObject (0x1E) no ActivationObject; o Composition leva
 //! ObjectTypeCode 0x400. No NT as rotinas Open/Close/Delete/OkayToClose (e
 //! Parse, da WindowStation) dos seis despacham aos callouts do win32k
-//! (PsInvokeWin32Callout); o Ob do OpenNT ainda não chama rotinas de tipo,
-//! então elas ficam nulas.
+//! (PsInvokeWin32Callout). O Ob já chama as rotinas de tipo
+//! (`ob/type_procedures.rs`), mas as ExpWin32* que despacham aos callouts
+//! ainda não existem, então elas ficam nulas.
 
 use crate::ntos::mm::kernel_data;
 use crate::ntos::ob::object_types::{self, TypeTemplate};

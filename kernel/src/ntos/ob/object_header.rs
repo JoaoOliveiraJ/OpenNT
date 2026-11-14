@@ -33,6 +33,7 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::PoolQuota;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::object_types;
+use crate::ntos::ob::type_procedures::{self, SecurityOperation};
 use crate::ntos::ps::{pool_quota, process};
 use crate::ntos::se::descriptor;
 use crate::rtl::SpinLock;
@@ -578,15 +579,29 @@ pub fn deferred_pending() -> bool {
 }
 
 // --- ObpRemoveObjectRoutine ---------------------------------------------------
-// Um objeto de tipo nunca é removido (KeBugCheckEx 0xF4); o bloco volta pelo
+// Como no ntoskrnl 19041 (rva 0x63db60): um objeto de tipo nunca é removido
+// (KeBugCheckEx 0xF4); com descritor no cabeçalho, o SecurityProcedure
+// recebe DeleteSecurityDescriptor; a DeleteProcedure do tipo roda (fora do
+// trabalhador, com DeletedInline no cabeçalho) e o bloco volta pelo
 // ObpFreeObject.
-fn remove_object(header: u64, _on_worker: bool) {
+fn remove_object(header: u64, on_worker: bool) {
     let object_type = type_of_header(header);
+    let body = header + BODY_OFFSET;
     if object_types::find(object_type).is_some_and(|info| info.name == "Type") {
-        bugcheck::bug_check_ex(BUGCHECK_TYPE_OBJECT_DELETE, object_type, header + BODY_OFFSET, 0, 0);
+        bugcheck::bug_check_ex(BUGCHECK_TYPE_OBJECT_DELETE, object_type, body, 0, 0);
     }
     if let Some(node) = LIVE.lock().get_mut(&header).and_then(|record| record.node.take()) {
         object_manager::remove_named(node);
+    }
+    let object = header_at(header);
+    if object.security_descriptor.get() != 0 {
+        type_procedures::security(object_type, body, SecurityOperation::Delete, 0, 0, 0, object.security_descriptor.address(), 0, 0);
+    }
+    if native_type(object_type).type_info.delete_procedure.get() != 0 {
+        if !on_worker {
+            object.flags.set(object.flags.get() | FLAG_DELETED_INLINE);
+        }
+        type_procedures::delete(object_type, body);
     }
     free(header);
 }
@@ -840,6 +855,14 @@ pub fn increment_handle_count(body: u64, open: &mut HandleOpen, descriptor_charg
             return Err(status);
         }
     }
+    // A OpenProcedure com o HandleCount já contado e a entrada do processo
+    // travada (HandleCount + LockCount); uma falha desfaz a abertura sem
+    // CloseProcedure e passa pelo ObpDeleteNameCheck.
+    if let Err(status) = type_procedures::open(object_type, body, open, handle_entry.map_or(0, |(_, count)| count)) {
+        undo_increment(header, handle_entry.map(|(entry, _)| entry));
+        delete_name_check(body);
+        return Err(status);
+    }
     if let Some((entry, _)) = handle_entry {
         let _guard = HANDLE_COUNTS.lock();
         unlock_handle_entry(entry, true);
@@ -898,6 +921,7 @@ pub fn decrement_handle_count(body: u64, owner: u64) -> (u32, u64) {
         }
         (process_count, system_count)
     };
+    type_procedures::close(object_type, owner, body, process_count, system_count);
     if system_count == 1 {
         delete_name_check(body);
     }
@@ -966,6 +990,20 @@ pub fn delete_name_check(body: u64) {
     if object.flags.get() & FLAG_PERMANENT_OBJECT != 0 || object.handle_count.get() != 0 {
         return;
     }
+    let Some(node) = LIVE.lock().get_mut(&header).and_then(|record| record.node.take()) else { return };
+    object_manager::remove_named(node);
+    let name = info(header, INFO_NAME);
+    if name != 0 {
+        // SAFETY: NameInfo do cabeçalho.
+        unsafe { ObjectHeaderNameInfo::at(name) }.directory.set(0);
+    }
+    dereference(body, false);
+}
+
+/// Tira o nome do namespace sem olhar permanência nem handles (o
+/// ObpDeleteDirectoryEntry da falha de uma inserção com nome).
+pub fn detach_name(body: u64) {
+    let header = body - BODY_OFFSET;
     let Some(node) = LIVE.lock().get_mut(&header).and_then(|record| record.node.take()) else { return };
     object_manager::remove_named(node);
     let name = info(header, INFO_NAME);

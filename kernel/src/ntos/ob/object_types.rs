@@ -173,6 +173,9 @@ fn create(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Resul
     generic.generic_execute.set(mapping[2]);
     generic.generic_all.set(mapping[3]);
     info.valid_access_mask.set(valid_access);
+    // O SecurityProcedure padrão (SeDefaultObjectMethod), como o
+    // ObCreateObjectTypeEx põe em todo tipo que não traz um.
+    info.security_procedure.set(crate::ntos::ob::object_security::default_object_method_address());
     body.callback_list.flink.set(body.callback_list.address());
     body.callback_list.blink.set(body.callback_list.address());
     let info = ObjectType { name: String::from(name), pointer, mapping, valid_access };
@@ -306,7 +309,8 @@ const SYNCHRONIZE: u32 = 0x10_0000;
 // a violação com DbgPrintEx e int3; aqui é STATUS_INVALID_PARAMETER); nome
 // repetido é STATUS_OBJECT_NAME_COLLISION. O TypeInfo é a cópia inteira do
 // inicializador (procedimentos inclusive); a cobrança padrão do pool do tipo
-// ganha 0x58 (mais 0x10 com MaintainHandleCount); com UseDefaultObject o ValidAccessMask ganha
+// ganha 0x58 (mais 0x10 com MaintainHandleCount); SecurityProcedure nulo vira
+// o SeDefaultObjectMethod; com UseDefaultObject o ValidAccessMask ganha
 // SYNCHRONIZE e DefaultObject aponta o ObpDefaultObject, senão é o
 // DefaultObject pedido. Key é a tag de pool do nome e Index o índice livre
 // da ObTypeIndexTable.
@@ -350,6 +354,9 @@ pub fn create_type_ex(name_pointer: u64, init: u64, default_object_offset: u64, 
         type_info.default_paged_pool_charge.set(type_info.default_paged_pool_charge.get().wrapping_add(charge));
     } else {
         type_info.default_non_paged_pool_charge.set(type_info.default_non_paged_pool_charge.get().wrapping_add(charge));
+    }
+    if type_info.security_procedure.get() == 0 {
+        type_info.security_procedure.set(crate::ntos::ob::object_security::default_object_method_address());
     }
     let mut valid = type_info.valid_access_mask.get();
     if use_default_object {

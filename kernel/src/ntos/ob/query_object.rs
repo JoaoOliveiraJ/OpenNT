@@ -334,6 +334,17 @@ fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
 /// Name.Buffer logo depois da estrutura, e ReturnLength conta a estrutura,
 /// o texto e o terminador.
 pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) -> u32 {
+    // Um objeto com OBJECT_HEADER: a QueryNameProcedure do tipo (com
+    // HasObjectName pelo NameInfo, em KernelMode), ou o nome do namespace
+    // (vazio sem nome).
+    if let Some(object_type) = crate::ntos::ob::object_header::object_type(pointer) {
+        let has_name = crate::ntos::ob::object_header::name(pointer).is_some_and(|name| !name.is_empty());
+        if let Some(status) = crate::ntos::ob::type_procedures::query_name(object_type, pointer, has_name, output, size, returned, 0) {
+            return status;
+        }
+        let path = crate::ntos::ob::object_header::name_node(pointer).and_then(crate::ntos::ob::object_manager::path_of);
+        return write_name_information(path.as_deref(), output, size, returned);
+    }
     if callbacks::exists(pointer) {
         return write_name_information(callbacks::name(pointer).as_deref(), output, size, returned);
     }

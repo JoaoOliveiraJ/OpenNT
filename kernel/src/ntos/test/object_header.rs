@@ -1,7 +1,8 @@
 //! Autotestes do OBJECT_HEADER do NT (`ob/object_header.rs`): o layout que o
 //! ObCreateObject monta na frente do corpo, a vida do objeto pelo
 //! PointerCount e pelo HandleCount do cabeçalho, o nome do NameInfo no
-//! namespace e o ObCreateObjectTypeEx. Na fase 6 (contexto do System) e
+//! namespace, o ObCreateObjectTypeEx e as rotinas do tipo (Open, Close,
+//! OkayToClose, Delete, Security e QueryName, com a remoção adiada). Na fase 6 (contexto do System) e
 //! num processo de usuário de teste (fase 7, com QuotaInfo e a cota cobrada
 //! do processo). Os valores esperados seguem o ObpAllocateObject, o
 //! ObpFreeObject e o ObInsertObjectEx do ntoskrnl 19041.
@@ -221,6 +222,234 @@ fn device_objects(assert: Assert, block: u64) {
     assert(registered && opened && by_handle && closed && by_pointer && call_export("ObGetObjectType", &[address]) == Some(device_type), "ob: DEVICE_OBJECT abre pelo ObOpenObjectByPointer, resolve pelo ObReferenceObjectByHandle e retem pelo ObReferenceObjectByPointer");
 }
 
+// ---- Rotinas de tipo ------------------------------------------------------------
+
+/// Uma chamada registrada por uma rotina do tipo de teste.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    /// (razão, modo, processo, objeto, acesso, contagem do processo)
+    Open(u32, u8, u64, u64, u32, u32),
+    /// (processo, objeto, contagem do processo, contagem do sistema)
+    Close(u64, u64, u64, u64),
+    /// (processo, objeto, handle, modo)
+    OkayToClose(u64, u64, u64, u8),
+    /// (objeto, IRQL, DeletedInline)
+    Delete(u64, u8, bool),
+    /// (objeto, operação)
+    Security(u64, u32),
+    /// (objeto, HasObjectName)
+    QueryName(u64, bool),
+}
+
+static CALLS: crate::rtl::SpinLock<Vec<Call>> = crate::rtl::SpinLock::new(Vec::new());
+static REFUSE_CLOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FAIL_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn record(call: Call) {
+    CALLS.lock().push(call);
+}
+
+/// As chamadas registradas sobre `object`, na ordem, esvaziando o registro
+/// delas.
+fn take_calls(object: u64) -> Vec<Call> {
+    let mut calls = CALLS.lock();
+    let mine: Vec<Call> = calls.iter().copied().filter(|call| match *call {
+        Call::Open(_, _, _, target, _, _) | Call::Close(_, target, _, _) | Call::OkayToClose(_, target, _, _) | Call::Delete(target, _, _) | Call::Security(target, _) | Call::QueryName(target, _) => target == object,
+    }).collect();
+    calls.retain(|call| !mine.contains(call));
+    mine
+}
+
+extern "win64" fn open_procedure(reason: u32, mode: u8, process: u64, object: u64, granted: u64, handle_count: u32) -> u32 {
+    record(Call::Open(reason, mode, process, object, guest::read32(granted), handle_count));
+    if FAIL_OPEN.load(core::sync::atomic::Ordering::SeqCst) { 0xC000_0022 } else { 0 }
+}
+
+extern "win64" fn close_procedure(process: u64, object: u64, process_count: u64, system_count: u64) {
+    record(Call::Close(process, object, process_count, system_count));
+}
+
+extern "win64" fn okay_to_close_procedure(process: u64, object: u64, handle: u64, mode: u8) -> u8 {
+    record(Call::OkayToClose(process, object, handle, mode));
+    !REFUSE_CLOSE.load(core::sync::atomic::Ordering::SeqCst) as u8
+}
+
+extern "win64" fn delete_procedure(object: u64) {
+    let inline = guest::read8(object - 0x30 + 0x1B) & 0x80 != 0;
+    record(Call::Delete(object, crate::ntos::ke::irql::get_irql(), inline));
+}
+
+/// O SecurityProcedure de teste guarda o descritor atribuído no cabeçalho e
+/// o libera na remoção.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn security_procedure(object: u64, operation: u32, _information: u64, descriptor: u64, _length: u64, objects: u64, _pool: u32, _mapping: u64, _mode: u8) -> u32 {
+    record(Call::Security(object, operation));
+    match operation {
+        3 => guest::write64(object - 0x30 + 0x28, descriptor),
+        2 => {
+            let current = guest::read64(objects);
+            guest::write64(objects, 0);
+            if current != 0 {
+                guest::free_bytes(current);
+            }
+        }
+        _ => {}
+    }
+    0
+}
+
+extern "win64" fn query_name_procedure(object: u64, has_name: u8, buffer: u64, _length: u32, returned: u64, _mode: u8) -> u32 {
+    record(Call::QueryName(object, has_name != 0));
+    let name = at::<nt::ObjectNameInformation>(buffer);
+    let text = buffer + nt::ObjectNameInformation::SIZE;
+    guest::write_bytes(text, &[b'\\', 0, b'R', 0]);
+    name.name.length.set(4);
+    name.name.maximum_length.set(4);
+    name.name.buffer.set(text);
+    if returned != 0 {
+        guest::write32(returned, nt::ObjectNameInformation::SIZE as u32 + 4);
+    }
+    0
+}
+
+/// O tipo com as seis rotinas, MaintainHandleCount e SecurityRequired.
+fn procedure_type(block: u64) -> u64 {
+    let init = initializer(block + 0x200, 0x18, 0x200, 0);
+    let info = at::<nt::ObjectTypeInitializer>(init);
+    info.open_procedure.set(open_procedure as extern "win64" fn(u32, u8, u64, u64, u64, u32) -> u32 as usize as u64);
+    info.close_procedure.set(close_procedure as extern "win64" fn(u64, u64, u64, u64) as usize as u64);
+    info.okay_to_close_procedure.set(okay_to_close_procedure as extern "win64" fn(u64, u64, u64, u8) -> u8 as usize as u64);
+    info.delete_procedure.set(delete_procedure as extern "win64" fn(u64) as usize as u64);
+    info.security_procedure.set(security_procedure as extern "win64" fn(u64, u32, u64, u64, u64, u64, u32, u64, u8) -> u32 as usize as u64);
+    info.query_name_procedure.set(query_name_procedure as extern "win64" fn(u64, u8, u64, u32, u64, u8) -> u32 as usize as u64);
+    create_type(block, "OpenNTTesteRotinas", init).1
+}
+
+/// Criação, abertura, duplicação, OkayToClose recusando e aceitando,
+/// fechamentos com as contagens, QueryNameProcedure e a remoção em
+/// PASSIVE_LEVEL (com o DeleteSecurityDescriptor antes do DeleteProcedure).
+fn type_procedures(assert: Assert, block: u64) {
+    let object_type = procedure_type(block);
+    let system = process::get_system_process();
+    let output = block + 0x380;
+    let named = attributes(block + 0x400, Some("\\OpenNTTesteRotinas"), 0x240);
+    let created = status(call_export("ObCreateObject", &[0, object_type, named, 0, 0, 0x40, 0, 0, output])) == 0;
+    let body = guest::read64(output);
+    let first = block + 0x388;
+    let inserted = status(call_export("ObInsertObject", &[body, 0, 0x1F_0007, 0, 0, first])) == 0;
+    let calls = take_calls(body);
+    let create_calls = created && inserted && calls == [Call::Open(0, 0, system, body, 0x1F_0007, 1), Call::Security(body, 3)];
+    assert(create_calls, "ob: ObInsertObject com nome chama a OpenProcedure (ObCreateHandle, KernelMode, o System, o acesso e a contagem 1) e, com o nome no diretorio, o SecurityProcedure (AssignSecurityDescriptor)");
+
+    let second = block + 0x390;
+    let opened = status(call_export("ObOpenObjectByPointer", &[body, 0x200, 0, 0x2_0001, object_type, 0, second])) == 0;
+    let third = block + 0x398;
+    let duplicated = status(call_export("ZwDuplicateObject", &[u64::MAX, guest::read64(second), u64::MAX, third, 0, 0x200, 2])) == 0;
+    let calls = take_calls(body);
+    assert(opened && duplicated && calls == [Call::Open(1, 0, system, body, 0x2_0001, 2), Call::Open(2, 0, system, body, 0x2_0001, 3)], "ob: ObOpenObjectByPointer e ZwDuplicateObject chamam a OpenProcedure com ObOpenHandle e ObDuplicateHandle e a contagem do processo");
+
+    let handle = guest::read64(third);
+    REFUSE_CLOSE.store(true, core::sync::atomic::Ordering::SeqCst);
+    let refused = status(call_export("ZwClose", &[handle])) == 0xC000_0235 && header_of(body).handle_count.get() == 3;
+    REFUSE_CLOSE.store(false, core::sync::atomic::Ordering::SeqCst);
+    let stripped = handle ^ 0xFFFF_FFFF_8000_0000;
+    let refused_calls = take_calls(body) == [Call::OkayToClose(system, body, stripped, 0)];
+    let closed = status(call_export("ZwClose", &[handle])) == 0;
+    let close_calls = take_calls(body) == [Call::OkayToClose(system, body, stripped, 0), Call::Close(system, body, 3, 3)];
+    assert(refused && refused_calls, "ob: a OkayToCloseProcedure que devolve FALSE recusa o ZwClose com STATUS_HANDLE_NOT_CLOSABLE e o handle continua aberto");
+    assert(closed && close_calls, "ob: o ZwClose passa pela OkayToCloseProcedure e chama a CloseProcedure com as contagens anteriores (processo e sistema)");
+
+    let name_buffer = block + 0x600;
+    let returned = block + 0x3A0;
+    let queried = status(call_export("ObQueryNameString", &[body, name_buffer, 0x100, returned])) == 0 && take_calls(body) == [Call::QueryName(body, true)];
+    assert(queried && crate::ntos::rtl::guest_strings::read_unicode_string(name_buffer) == "\\R", "ob: ObQueryNameString chama a QueryNameProcedure do tipo");
+
+    let _ = call_export("ZwClose", &[guest::read64(second)]);
+    let _ = call_export("ZwClose", &[guest::read64(first)]);
+    let calls = take_calls(body);
+    let removed = calls == [Call::OkayToClose(system, body, guest::read64(second) ^ 0xFFFF_FFFF_8000_0000, 0), Call::Close(system, body, 2, 2), Call::OkayToClose(system, body, guest::read64(first) ^ 0xFFFF_FFFF_8000_0000, 0), Call::Close(system, body, 1, 1), Call::Security(body, 2), Call::Delete(body, 0, true)];
+    assert(removed && !object_header::is_object(body), "ob: o ultimo fechamento remove o objeto em PASSIVE_LEVEL: DeleteSecurityDescriptor e DeleteProcedure (DeletedInline)");
+
+    // Remoção adiada: o último dereference em DISPATCH_LEVEL vai para a fila.
+    let created = status(call_export("ObCreateObject", &[0, object_type, 0, 0, 0, 0x20, 0, 0, output])) == 0;
+    let body = guest::read64(output);
+    let _ = call_export("ObDeleteCapturedInsertInfo", &[body]);
+    let previous = crate::ntos::ke::irql::raise_irql(2);
+    let _ = call_export("ObfDereferenceObject", &[body]);
+    let pending = take_calls(body).is_empty();
+    crate::ntos::ke::irql::lower_irql(previous as u64);
+    crate::ntos::io::work_items::run_queue();
+    let deferred = take_calls(body) == [Call::Delete(body, 0, false)] && !object_header::is_object(body);
+    assert(created && pending && deferred, "ob: o ultimo dereference em DISPATCH_LEVEL adia a remocao; o trabalhador chama a DeleteProcedure em PASSIVE_LEVEL");
+    let created = status(call_export("ObCreateObject", &[0, object_type, 0, 0, 0, 0x20, 0, 0, output])) == 0;
+    let body = guest::read64(output);
+    let _ = call_export("ObDeleteCapturedInsertInfo", &[body]);
+    let _ = call_export("ObDereferenceObjectDeferDelete", &[body]);
+    let queued = take_calls(body).is_empty();
+    crate::ntos::io::work_items::run_queue();
+    assert(created && queued && take_calls(body) == [Call::Delete(body, 0, false)], "ob: ObDereferenceObjectDeferDelete sempre adia a remocao para o trabalhador");
+
+    // A OpenProcedure que falha desfaz a abertura sem CloseProcedure.
+    let created = status(call_export("ObCreateObject", &[0, object_type, 0, 0, 0, 0x20, 0, 0, output])) == 0;
+    let body = guest::read64(output);
+    FAIL_OPEN.store(true, core::sync::atomic::Ordering::SeqCst);
+    let failed = status(call_export("ObInsertObject", &[body, 0, 0x1F_0007, 0, 0, first])) == 0xC000_0022;
+    FAIL_OPEN.store(false, core::sync::atomic::Ordering::SeqCst);
+    let calls = take_calls(body);
+    assert(created && failed && calls == [Call::Security(body, 3), Call::Open(0, 0, system, body, 0x1F_0007, 1), Call::Security(body, 2), Call::Delete(body, 0, true)] && !object_header::is_object(body), "ob: OpenProcedure com falha faz o ObInsertObject devolver o status, sem CloseProcedure, e o objeto sai");
+}
+
+/// As rotinas num processo de usuário de teste: a OpenProcedure com o
+/// processo e o modo da thread, a duplicata para a tabela do System
+/// (ObDuplicateHandle, contagem por processo), a OkayToCloseProcedure que
+/// recusa o NtClose de UserMode e a CloseProcedure no fechamento e no fim do
+/// processo, com as contagens por processo e do sistema.
+fn user_procedures(assert: Assert, block: u64) {
+    use crate::ntos::ob::close;
+    use crate::ntos::test::multiprocess::identity::with_test_process;
+    let object_type = object_types::all().into_iter().find(|info| info.name == "OpenNTTesteRotinas").map_or(0, |info| info.pointer);
+    if object_type == 0 {
+        assert(false, "ob: tipo com rotinas criado na fase 6");
+        return;
+    }
+    let system = process::get_system_process();
+    let outcome = with_test_process("rotinas-ob.exe", None, |test| {
+        let mode = at::<nt::Kthread>(test.thread).previous_mode.get() as u8;
+        let output = block + 0x380;
+        let created = status(call_export("ObCreateObject", &[0, object_type, 0, mode as u64, 0, 0x40, 0, 0, output])) == 0;
+        let body = guest::read64(output);
+        let handle = block + 0x388;
+        let inserted = status(call_export("ObInsertObject", &[body, 0, 0x2_0001, 0, 0, handle])) == 0;
+        let user_handle = guest::read64(handle);
+        let create_calls = take_calls(body) == [Call::Security(body, 3), Call::Open(0, mode, test.process, body, 0x2_0001, 1)];
+        let kernel = block + 0x390;
+        let duplicated = status(call_export("ObDuplicateObject", &[test.process, user_handle, system, kernel, 0, 0x200, 2, 0])) == 0;
+        let duplicate_calls = take_calls(body) == [Call::Open(2, 0, system, body, 0x2_0001, 1)];
+        REFUSE_CLOSE.store(true, core::sync::atomic::Ordering::SeqCst);
+        let refused = close::close(user_handle, Some(1)).ok() == Some(0xC000_0235);
+        REFUSE_CLOSE.store(false, core::sync::atomic::Ordering::SeqCst);
+        let refused_calls = take_calls(body) == [Call::OkayToClose(test.process, body, user_handle, 1)];
+        let closed = close::close(user_handle, Some(1)).ok() == Some(0);
+        let close_calls = take_calls(body) == [Call::OkayToClose(test.process, body, user_handle, 1), Call::Close(test.process, body, 1, 2)];
+        let reopened = block + 0x398;
+        let opened = status(call_export("ObOpenObjectByPointer", &[body, 0, 0, 0x2_0001, object_type, 0, reopened])) == 0 && take_calls(body) == [Call::Open(1, 0, test.process, body, 0x2_0001, 1)];
+        Some((body, guest::read64(kernel), [created && inserted && create_calls, duplicated && duplicate_calls, refused && refused_calls, closed && close_calls, opened]))
+    })
+    .flatten();
+    let Some((body, kernel_handle, checks)) = outcome else {
+        assert(false, "ob: processo de teste das rotinas");
+        return;
+    };
+    let rundown = take_calls(body).iter().any(|call| matches!(call, Call::Close(_, target, 1, 2) if *target == body));
+    let _ = call_export("ZwClose", &[kernel_handle]);
+    let final_calls = take_calls(body) == [Call::OkayToClose(system, body, kernel_handle ^ 0xFFFF_FFFF_8000_0000, 0), Call::Close(system, body, 1, 1), Call::Security(body, 2), Call::Delete(body, 0, true)];
+    assert(checks[0], "ob: num processo de usuario o ObInsertObject chama o SecurityProcedure e a OpenProcedure com o processo, o modo da thread e a contagem do processo");
+    assert(checks[1], "ob: ObDuplicateObject para a tabela do System chama a OpenProcedure com ObDuplicateHandle e a contagem do System");
+    assert(checks[2] && checks[3], "ob: a OkayToCloseProcedure recebe o processo, o handle e UserMode e recusa o NtClose; aceito, a CloseProcedure recebe as contagens do processo e do sistema");
+    assert(checks[4] && rundown, "ob: o handle deixado aberto fecha no fim do processo com a CloseProcedure do processo");
+    assert(final_calls, "ob: o ultimo handle (o do System) fecha com OkayToClose e CloseProcedure e o objeto sai com DeleteSecurityDescriptor e DeleteProcedure");
+}
+
 pub fn run(assert: Assert) {
     let block = guest::alloc_bytes(0x1000);
     let object_type = object_type_ex(assert, block);
@@ -229,6 +458,7 @@ pub fn run(assert: Assert) {
         unnamed_objects(assert, block, object_type);
     }
     device_objects(assert, block);
+    type_procedures(assert, block);
     guest::free_bytes(block);
 }
 
@@ -275,4 +505,7 @@ pub fn run_user(assert: Assert) {
     assert(laid_out, "ob: num processo de usuario o cabecalho leva QuotaInfo (cobrancas pedidas) e ProcessInfo (OBJ_EXCLUSIVE), Flags NewObject|ExclusiveObject");
     assert(inserted, "ob: o handle de criacao cobra a cota do processo, prende o ExclusiveProcess e entra na tabela do processo");
     assert(closed, "ob: o NtClose de UserMode fecha o ultimo handle, o objeto sai e a cota volta ao processo");
+    let block = guest::alloc_bytes(0x1000);
+    user_procedures(assert, block);
+    guest::free_bytes(block);
 }

@@ -10,7 +10,8 @@ use alloc::collections::BTreeMap;
 
 use crate::ntos::inc::types::{AccessState, Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ob::{object_access, object_create, object_types, open_pointer};
+use crate::ntos::ob::type_procedures::{self, SecurityOperation};
+use crate::ntos::ob::{object_access, object_create, object_header, object_types, open_pointer};
 use crate::rtl::SpinLock;
 
 const STATUS_SUCCESS: u32 = 0;
@@ -26,7 +27,13 @@ fn out<T: Copy>(address: u64) -> &'static Field<T> {
 /// Descritor escrito por ObSetSecurityObjectByPointer, por objeto.
 static SECURITY_DESCRIPTORS: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
 
+/// O descritor do objeto: o do OBJECT_HEADER (sem as referências do
+/// EX_FAST_REF) para os objetos com cabeçalho, senão o da tabela lateral.
 pub fn security_descriptor(object: u64) -> Option<u64> {
+    if object_header::is_object(object) {
+        let descriptor = header_descriptor(object);
+        return (descriptor != 0).then_some(descriptor);
+    }
     SECURITY_DESCRIPTORS.lock().get(&object).copied()
 }
 
@@ -84,6 +91,9 @@ pub fn check_object_access(object: u64, mode: u8, granted_out: u64, status_out: 
 //   PBOOLEAN MemoryAllocated). Returns the side-table SD; nothing is
 //   allocated, so MemoryAllocated is FALSE (pairs with ObReleaseObjectSecurity).
 pub fn get_object_security(object: u64, sd_out: u64, allocated_out: u64) -> u32 {
+    if let Some(object_type) = object_header::object_type(object) {
+        return get_header_security(object, object_type, sd_out, allocated_out);
+    }
     let sd = security_descriptor(object).unwrap_or(0);
     if sd_out != 0 {
         out::<u64>(sd_out).set(sd);
@@ -96,9 +106,13 @@ pub fn get_object_security(object: u64, sd_out: u64, allocated_out: u64) -> u32 
 
 // --- ObReleaseObjectSecurity ----------------------------------------------
 // VOID ObReleaseObjectSecurity(PSECURITY_DESCRIPTOR Sd, BOOLEAN MemoryAllocated).
+/// Com MemoryAllocated a cópia volta ao pool; sem ela, um descritor do
+/// cache perde a referência que o ObGetObjectSecurity tomou.
 pub fn release_object_security(sd: u64, allocated: bool) {
     if allocated && sd != 0 {
-        guest::free_bytes(sd);
+        let _ = crate::ntos::ex::pool_allocation::free(sd, 0);
+    } else if sd != 0 && cached_descriptor_state(sd).is_some() {
+        let _ = dereference_security_descriptor(sd, 1);
     }
 }
 
@@ -383,6 +397,9 @@ fn type_of(object: u64) -> Option<object_types::ObjectType> {
 // sujeito capturado e o mapeamento do tipo, e o resultado vira o descritor
 // do objeto (a tabela lateral, o slot do OBJECT_HEADER no NT).
 pub fn assign_security(access_state: &AccessState, parent: u64, object: u64, object_type: u64) -> u32 {
+    if object_header::is_object(object) {
+        return assign_object_security(object, parent, access_state.security_descriptor.get(), access_state.subject_security_context.address(), 0);
+    }
     let Some(object_type) = object_types::find(object_type) else { return STATUS_INVALID_PARAMETER };
     let mapping = mapping_block(&object_type);
     let slot = guest::alloc_bytes(8);
@@ -410,8 +427,28 @@ pub fn set_security_descriptor_info(object: u64, information: u64, descriptor: u
     let status = crate::ntos::se::set_security::set_security_descriptor_info(information, descriptor, slot, 0, mapping);
     if status == STATUS_SUCCESS {
         let new = out::<u64>(slot).get();
-        set_security_object_by_pointer(object, new);
-        out::<u64>(objects_descriptor).set(new);
+        match object_header::header(object) {
+            // Num objeto com cabeçalho a mescla vira uma entrada do cache no
+            // EX_FAST_REF do OBJECT_HEADER.
+            Some(header) => {
+                let logged = log_with_fast_ref(new);
+                guest::free_bytes(new);
+                match logged {
+                    Ok(cached) => {
+                        replace_fast_ref(&header.security_descriptor, cached);
+                        out::<u64>(objects_descriptor).set(cached);
+                    }
+                    Err(failed) => {
+                        guest::free_bytes(slot);
+                        return failed;
+                    }
+                }
+            }
+            None => {
+                set_security_object_by_pointer(object, new);
+                out::<u64>(objects_descriptor).set(new);
+            }
+        }
     }
     guest::free_bytes(slot);
     status
@@ -431,4 +468,208 @@ pub fn check_create_object_access(directory: u64, create_access: u32, mode: u8, 
         out::<u32>(status_out).set(result.err().unwrap_or(STATUS_SUCCESS));
     }
     result.is_ok()
+}
+
+// ---- SeDefaultObjectMethod e o descritor no OBJECT_HEADER --------------------
+//
+// O SecurityProcedure padrão (o ObCreateObjectTypeEx o põe nos tipos que não
+// trazem um), como no ntoskrnl 19041 (rva 0x6d8930), para os objetos com
+// OBJECT_HEADER: o descritor do objeto é uma entrada do cache
+// (ObLogSecurityDescriptor) guardada em OBJECT_HEADER.SecurityDescriptor como
+// EX_FAST_REF (os 4 bits baixos são referências pré-cobradas).
+//   AssignSecurityDescriptor: registra no cache com 16 referências, guarda
+//     entrada | 0xF no cabeçalho e libera o descritor recebido;
+//   DeleteSecurityDescriptor: zera *ObjectsSecurityDescriptor e devolve as
+//     referências (bits + 1);
+//   QuerySecurityDescriptor: o SeQuerySecurityDescriptorInfo sobre o
+//     descritor do objeto;
+//   SetSecurityDescriptor: o ObSetSecurityDescriptorInfo sobre
+//     *ObjectsSecurityDescriptor (a mescla vira uma entrada nova do cache).
+
+const FAST_REF_MASK: u64 = 0xF;
+const STATUS_NO_SECURITY_ON_OBJECT: u32 = 0xC000_00D7;
+
+/// O descritor (entrada do cache) de um objeto com OBJECT_HEADER, ou 0.
+pub fn header_descriptor(object: u64) -> u64 {
+    crate::ntos::ob::object_header::header(object).map_or(0, |header| header.security_descriptor.get() & !FAST_REF_MASK)
+}
+
+/// Troca o EX_FAST_REF `slot` por `cached` (com 15 referências pré-cobradas)
+/// e devolve as do anterior.
+fn replace_fast_ref(slot: &Field<u64>, cached: u64) {
+    let old = slot.get();
+    slot.set(if cached != 0 { cached | FAST_REF_MASK } else { 0 });
+    if old & !FAST_REF_MASK != 0 {
+        let _ = dereference_security_descriptor(old & !FAST_REF_MASK, (old & FAST_REF_MASK) as u32 + 1);
+    }
+}
+
+/// O descritor registrado no cache com as 16 referências do EX_FAST_REF.
+fn log_with_fast_ref(descriptor: u64) -> Result<u64, u32> {
+    let output = guest::alloc_bytes(8);
+    if output == 0 {
+        return Err(0xC000_009A);
+    }
+    let status = log_security_descriptor(descriptor, out::<u64>(output), 16).unwrap_or(0xC000_0001);
+    let cached = out::<u64>(output).get();
+    guest::free_bytes(output);
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+    Ok(cached)
+}
+
+/// SeDefaultObjectMethod(Object, OperationCode, SecurityInformation,
+/// SecurityDescriptor, CapturedLength, ObjectsSecurityDescriptor, PoolType,
+/// GenericMapping, Mode).
+#[allow(clippy::too_many_arguments)]
+pub extern "win64" fn default_object_method(object: u64, operation: u32, information: u64, descriptor: u64, captured_length: u64, objects_descriptor: u64, _pool_type: u32, mapping: u64, _mode: u8) -> u32 {
+    match operation {
+        // SetSecurityDescriptor: ObSetSecurityDescriptorInfo.
+        0 => {
+            let slot = out::<u64>(objects_descriptor);
+            let current = slot.get() & !FAST_REF_MASK;
+            if current == 0 {
+                return STATUS_NO_SECURITY_ON_OBJECT;
+            }
+            let working = guest::alloc_bytes(8);
+            out::<u64>(working).set(current);
+            let status = crate::ntos::se::set_security::set_security_descriptor_info(information, descriptor, working, 0, mapping);
+            let merged = out::<u64>(working).get();
+            guest::free_bytes(working);
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+            let logged = log_with_fast_ref(merged);
+            guest::free_bytes(merged);
+            match logged {
+                Ok(cached) => {
+                    replace_fast_ref(slot, cached);
+                    STATUS_SUCCESS
+                }
+                Err(status) => status,
+            }
+        }
+        // QuerySecurityDescriptor: SeQuerySecurityDescriptorInfo.
+        1 => {
+            let cell = guest::alloc_bytes(8);
+            out::<u64>(cell).set(out::<u64>(objects_descriptor).get() & !FAST_REF_MASK);
+            let status = crate::ntos::se::query_descriptor::query_info(information, descriptor, captured_length, cell);
+            guest::free_bytes(cell);
+            status
+        }
+        // DeleteSecurityDescriptor.
+        2 => {
+            replace_fast_ref(out::<u64>(objects_descriptor), 0);
+            STATUS_SUCCESS
+        }
+        // AssignSecurityDescriptor: o descritor novo vai para o cabeçalho.
+        3 => {
+            let Some(header) = crate::ntos::ob::object_header::header(object) else { return STATUS_INVALID_PARAMETER };
+            if descriptor == 0 {
+                header.security_descriptor.set(0);
+                return STATUS_SUCCESS;
+            }
+            match log_with_fast_ref(descriptor) {
+                Ok(cached) => {
+                    let _ = crate::ntos::ex::pool_allocation::free(descriptor, 0);
+                    header.security_descriptor.set(cached | FAST_REF_MASK);
+                    STATUS_SUCCESS
+                }
+                Err(status) => status,
+            }
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// O endereço do SeDefaultObjectMethod (o SecurityProcedure padrão).
+pub fn default_object_method_address() -> u64 {
+    default_object_method as extern "win64" fn(u64, u32, u64, u64, u64, u64, u32, u64, u8) -> u32 as usize as u64
+}
+
+/// ObGetObjectSecurity de um objeto com cabeçalho (o ObpGetObjectSecurity,
+/// rva 0x6d84e0): com o SeDefaultObjectMethod, o descritor do cabeçalho com
+/// uma referência a mais e MemoryAllocated FALSE; com outro
+/// SecurityProcedure, QuerySecurityDescriptor num buffer do pool paginável
+/// (refeito com o tamanho pedido em STATUS_BUFFER_TOO_SMALL) e
+/// MemoryAllocated TRUE.
+fn get_header_security(object: u64, object_type: u64, sd_out: u64, allocated_out: u64) -> u32 {
+    let procedure = object_types::type_object(object_type).map_or(0, |native| native.type_info.security_procedure.get());
+    if procedure == default_object_method_address() || procedure == 0 {
+        let descriptor = header_descriptor(object);
+        if descriptor != 0 {
+            let _ = reference_security_descriptor(descriptor, 1);
+        }
+        out::<u64>(sd_out).set(descriptor);
+        out::<u8>(allocated_out).set(0);
+        return STATUS_SUCCESS;
+    }
+    let Some(header) = object_header::header(object) else { return STATUS_INVALID_PARAMETER };
+    let information = guest::alloc_bytes(8);
+    out::<u32>(information).set(0x1BF);
+    let length = information + 4;
+    let mut size = 0x100u32;
+    let status = loop {
+        let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, size as u64, 0x7153_624F).unwrap_or(0);
+        if buffer == 0 {
+            break 0xC000_009A;
+        }
+        out::<u32>(length).set(size);
+        let status = type_procedures::security(object_type, object, SecurityOperation::Query, information, buffer, length, header.security_descriptor.address(), 1, 0);
+        if status == 0xC000_0023 && out::<u32>(length).get() > size {
+            let _ = crate::ntos::ex::pool_allocation::free(buffer, 0);
+            size = out::<u32>(length).get();
+            continue;
+        }
+        if status as i32 >= 0 {
+            out::<u64>(sd_out).set(buffer);
+            out::<u8>(allocated_out).set(1);
+        } else {
+            let _ = crate::ntos::ex::pool_allocation::free(buffer, 0);
+            out::<u64>(sd_out).set(0);
+            out::<u8>(allocated_out).set(0);
+        }
+        break status;
+    };
+    guest::free_bytes(information);
+    status
+}
+
+// --- ObpAssignSecurity ----------------------------------------------------------
+// Como no ntoskrnl 19041 (rva 0x6dbcbc): SeAssignSecurity do descritor
+// pedido sobre o do pai (contêiner num Directory), com o contexto do sujeito
+// (o dado, ou o capturado da thread) e o mapeamento do tipo, e o
+// SecurityProcedure recebe AssignSecurityDescriptor com o descritor novo; na
+// falha o descritor é desfeito (SeDeassignSecurity).
+pub fn assign_object_security(object: u64, parent: u64, explicit: u64, subject_context: u64, mode: u8) -> u32 {
+    use crate::ntos::inc::types::SecuritySubjectContext;
+    let Some(object_type) = object_header::object_type(object) else { return STATUS_INVALID_PARAMETER };
+    let Some(info) = object_types::find(object_type) else { return STATUS_INVALID_PARAMETER };
+    let captured = if subject_context == 0 {
+        let context = guest::alloc_bytes(SecuritySubjectContext::SIZE);
+        let _ = crate::ntos::init::exports::invoke_handler("SeCaptureSubjectContext", &[context]);
+        context
+    } else {
+        0
+    };
+    let context = if subject_context != 0 { subject_context } else { captured };
+    let mapping = mapping_block(&info);
+    let slot = guest::alloc_bytes(8);
+    let mut status = crate::ntos::se::assign::assign(parent, explicit, slot, info.name == "Directory", 0, context, mapping);
+    if status == STATUS_SUCCESS {
+        status = type_procedures::security(object_type, object, SecurityOperation::Assign, 0, out::<u64>(slot).get(), 0, 0, 1, mode);
+        if status as i32 >= 0 {
+            status = STATUS_SUCCESS;
+        } else {
+            crate::ntos::se::assign::deassign(slot);
+        }
+    }
+    guest::free_bytes(slot);
+    guest::free_bytes(mapping);
+    if captured != 0 {
+        let _ = crate::ntos::init::exports::invoke_handler("SeReleaseSubjectContext", &[captured]);
+        guest::free_bytes(captured);
+    }
+    status
 }

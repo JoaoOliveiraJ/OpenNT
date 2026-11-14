@@ -15,9 +15,10 @@ use crate::ntos::inc::types::extra_ob_header::ObjectCreateInformation;
 use crate::ntos::inc::types::{Field, Kthread, NtStruct, ObjectAttributes, ObjectHeaderNameInfo};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::namespace;
-use crate::ntos::ob::object_header::{self, OpenReason};
+use crate::ntos::ob::object_header::{self, HandleOpen, OpenReason};
+use crate::ntos::ob::objects::created;
 use crate::ntos::ob::object_manager::{self, ObjectData};
-use crate::ntos::ob::{callbacks, object_types, open_pointer};
+use crate::ntos::ob::{callbacks, object_security, object_types, open_pointer};
 use crate::ntos::ps::process;
 use crate::ntos::se::{descriptor, privilege};
 use crate::rtl::KernelError;
@@ -365,12 +366,17 @@ fn insert_name(object: u64, root: u64, attributes: u32, from_user_mode: bool) ->
     }
 }
 
-/// O ObpCreateHandle de um objeto novo: MAXIMUM_ALLOWED vira GENERIC_ALL e
-/// os genéricos passam pelo mapeamento do tipo; o handle (ObCreateHandle)
-/// entra na tabela do System (OBJ_KERNEL_HANDLE) ou do processo corrente
-/// depois do nome, passando pelos callbacks de objeto do tipo. Devolve o
-/// status e o handle.
-fn create_handle(object: u64, desired: u32, attributes: u32, mode: u8, root: u64, named: bool) -> Result<(u32, u64), u32> {
+/// O ObpCreateHandle de um objeto novo, na ordem do ntoskrnl 19041 (rva
+/// 0x643c70): MAXIMUM_ALLOWED vira GENERIC_ALL e os genéricos passam pelo
+/// mapeamento do tipo; o handle conta no cabeçalho (ObpIncrementHandleCountEx
+/// com ObCreateHandle e a OpenProcedure) antes do nome; o nome entra no
+/// diretório com o descritor atribuído (ObpInsertOrLocateNamedObject e
+/// ObpAssignSecurity; o namespace do OpenNT não guarda descritor de
+/// diretório para herdar) e uma colisão desfaz a contagem
+/// (ObpDecrementHandleCount, com a CloseProcedure); depois os callbacks de
+/// objeto do tipo e a linha na tabela do System (OBJ_KERNEL_HANDLE) ou do
+/// processo corrente. Devolve o status e o handle.
+fn create_handle(object: u64, desired: u32, attributes: u32, mode: u8, root: u64, named: bool, descriptor: u64) -> Result<(u32, u64), u32> {
     let object_type = object_header::object_type_info(object).ok_or(STATUS_INVALID_PARAMETER)?;
     let mut access = desired;
     if access & MAXIMUM_ALLOWED != 0 {
@@ -379,30 +385,49 @@ fn create_handle(object: u64, desired: u32, attributes: u32, mode: u8, root: u64
     let access = crate::ntos::ob::object_access::map_generic_access(access, &object_type);
     let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
     let owner = if kernel { process::get_system_process() } else { process::get_current_process() };
+    let handle_attributes = attributes & !0x0001_0000;
+    let mut open = HandleOpen { reason: OpenReason::Create, access_mode: mode, process: owner, granted: access, attributes: handle_attributes };
+    created::open_handle(object, &mut open).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 })?;
     let mut target = object;
     let mut status = STATUS_SUCCESS;
     if named {
         match insert_name(object, root, attributes, mode != 0) {
-            Ok(None) => {}
+            Ok(None) => {
+                let assigned = object_security::assign_object_security(object, 0, descriptor, 0, mode);
+                if assigned != STATUS_SUCCESS {
+                    object_header::detach_name(object);
+                    created::close_handle(object, owner);
+                    return Err(assigned);
+                }
+            }
             Ok(Some(existing)) => {
+                created::close_handle(object, owner);
                 target = existing;
                 status = STATUS_OBJECT_NAME_EXISTS;
             }
-            Err(status) => return Err(status),
+            Err(failed) => {
+                created::close_handle(object, owner);
+                return Err(failed);
+            }
         }
     }
     let Some(item) = open_pointer::describe(target) else { return Err(STATUS_INVALID_PARAMETER) };
-    let reason = if target == object { OpenReason::Create } else { OpenReason::Open };
+    let granted = open.granted;
+    let mut published = false;
     let options = callbacks::PerformOptions { operation: 1, enforce: mode != 0, kernel_handle: kernel, source_process: 0, target_process: 0 };
-    let outcome = callbacks::perform(&item, access, &options, &mut |granted| match open_pointer::insert_with(&item, granted, attributes & !0x0001_0000, owner, reason, mode) {
-        Ok(identifier) => callbacks::Outcome { status: 0, granted: Some(granted), value: identifier, error: None },
-        Err(error) => callbacks::Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: Some(error) },
-    })
-    .map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 })?;
-    if outcome.status != 0 {
-        if target == object {
-            object_header::delete_name_check(object);
+    let outcome = callbacks::perform(&item, granted, &options, &mut |granted| {
+        published = true;
+        let inserted = if target == object { open_pointer::insert_counted(&item, granted, handle_attributes, owner) } else { open_pointer::insert_with(&item, granted, handle_attributes, owner, OpenReason::Open, mode) };
+        match inserted {
+            Ok(identifier) => callbacks::Outcome { status: 0, granted: Some(granted), value: identifier, error: None },
+            Err(error) => callbacks::Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: Some(error) },
         }
+    });
+    if !published && target == object {
+        created::close_handle(object, owner);
+    }
+    let outcome = outcome.map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 })?;
+    if outcome.status != 0 {
         return Err(outcome.status);
     }
     let handle = if kernel { 0xFFFF_FFFF_8000_0000 | outcome.value as u64 } else { outcome.value as u64 };
@@ -434,12 +459,22 @@ pub fn insert(object: u64, desired: u32, bias: u32, new_object_out: u64, handle_
     let named = object_header::name_info(object) != 0;
     let mode = thread_previous_mode();
     let security_required = object_header::object_type(object).and_then(object_types::type_object).is_some_and(|object_type| object_type.type_info.bitfield_2.get() & TYPE_SECURITY_REQUIRED != 0);
-    let fast = !security_required && !named && create.security_descriptor.get() == 0;
+    let descriptor = create.security_descriptor.get();
+    let fast = !security_required && !named && descriptor == 0;
+    // Sem nome, a segurança obrigatória (ou pedida) é atribuída antes do
+    // handle: SeAssignSecurity e o SecurityProcedure (AssignSecurityDescriptor).
+    if !fast && !named {
+        let assigned = object_security::assign_object_security(object, 0, descriptor, 0, mode);
+        if assigned != STATUS_SUCCESS {
+            object_header::dereference(object, false);
+            return Ok(assigned);
+        }
+    }
     header.object_create_info.set(0);
     let mut status = STATUS_SUCCESS;
     if handle_out != 0 {
         out::<u64>(handle_out).set(0);
-        match create_handle(object, desired, attributes, mode, root, named) {
+        match create_handle(object, desired, attributes, mode, root, named, descriptor) {
             Ok((created, handle)) => {
                 let target = if created == STATUS_OBJECT_NAME_EXISTS { open_pointer::resolve(handle, false).and_then(|resolved| resolved.ok()).map_or(object, |resolved| resolved.item.pointer) } else { object };
                 if let Some(item) = open_pointer::describe(target) {

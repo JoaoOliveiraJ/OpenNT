@@ -818,6 +818,47 @@ dereference e o PFN livre volta ao de antes.
   fecha cada handle pela tabela do processo dono, e `process_state::destroy`
   fecha o que sobrou (handles sem linha nativa). Teste:
   `ntos/test/multiprocess/handles.rs`.
+- **OBJECT_HEADER e rotinas de tipo** (`ob/object_header.rs`,
+  `ob/object_create.rs`, `ob/type_procedures.rs`, `ob/objects/created.rs`):
+  - ObCreateObject captura os OBJECT_ATTRIBUTES num
+    OBJECT_CREATE_INFORMATION e aloca, no pool do tipo (TypeInfo.PoolType,
+    tag = OBJECT_TYPE.Key), os cabeçalhos opcionais na ordem do NT
+    (preenchimento 0x80, EXTENDED 0x40, AUDIT 0x20, PROCESS 0x10, QUOTA 0x08,
+    HANDLE 0x04, NAME 0x02, CREATOR 0x01), o `_OBJECT_HEADER` e o corpo. O
+    TypeIndex é `Type->Index ^ ObHeaderCookie ^ (byte 1 do cabeçalho)` sobre
+    a ObTypeIndexTable (`object_types`: Type é o índice 2), e
+    ObGetObjectType, ObQueryNameInfo (ObpInfoMaskToOffset) e
+    OBJECT_TO_OBJECT_HEADER leem o cabeçalho. O registro `LIVE` distingue os
+    corpos com cabeçalho; só eles são lidos ali.
+  - A vida é a do cabeçalho: PointerCount (ObfReferenceObject,
+    ObfDereferenceObject; o último dereference em PASSIVE_LEVEL sem região
+    guardada remove na hora, senão vai para a fila do ObpDeferObjectDeletion,
+    drenada por um work item em PASSIVE_LEVEL), HandleCount com a contagem
+    por processo do HandleInfo (entrada única ou banco 'ObHd'), a cobrança
+    de cota no primeiro handle (QuotaInfo ou as cobranças padrão do tipo, no
+    ProcessQuotaUsage do EPROCESS) e o nome do NameInfo, que o ObInsertObject
+    publica no namespace (a entrada retém o objeto e o NameInfo aponta o
+    diretório; o último handle de um objeto temporário o retira).
+  - Os handles desses objetos são linhas do Object Manager
+    (`open_pointer::insert_with`, com a razão do OB_OPEN_REASON); o dono
+    `objects/created.rs` conta cada abertura e fechamento no cabeçalho.
+  - As rotinas do OBJECT_TYPE_INITIALIZER são chamadas nos pontos do NT:
+    OpenProcedure na abertura de cada handle (Create, Open, Duplicate),
+    CloseProcedure em cada fechamento com as contagens anteriores,
+    OkayToCloseProcedure antes do NtClose (FALSE dá
+    STATUS_HANDLE_NOT_CLOSABLE), DeleteProcedure na remoção em PASSIVE_LEVEL,
+    SecurityProcedure (o SeDefaultObjectMethod quando o tipo não traz uma) e
+    QueryNameProcedure no ObQueryNameString. Open e Close rodam anexados ao
+    processo do handle. A ParseProcedure pertence à busca de nomes do
+    namespace (`ob/handles/namespace.rs`) e ainda não é chamada.
+  - Ficam fora do modelo de cabeçalho (com donos próprios e contagens no
+    registro do dono): processos, threads, tokens, arquivos, dispositivos,
+    drivers, seções, chaves, eventos e objetos do despachante, diretórios e
+    links do namespace, callbacks e contextos de silo. Dispositivos e
+    drivers abrem pelo ObOpenObjectByPointer pelos donos de
+    `objects/device.rs` e `objects/driver.rs`.
+  - Teste: `ntos/test/object_header.rs` (fase 6 e um processo de teste na
+    fase 7).
 - **Handles e informações entre processos** (`ps/user/handles.rs`):
   - NtDuplicateObject é o ObDuplicateObject: os handles do processo de
     origem e do de destino saem da tabela de quem chama e pedem
