@@ -505,7 +505,10 @@ além da KUSER_SHARED_DATA:
   64 KB (o commit sobre uma reserva fica em páginas); uma base abaixo de
   64 KB ou acima do último VAD falha com STATUS_CONFLICTING_ADDRESSES (como o
   MiIsVaRangeAvailable), e uma base além de MmHighestUserAddress com
-  STATUS_INVALID_PARAMETER. Vistas de seção usam a mesma escolha.
+  STATUS_INVALID_PARAMETER. MEM_COMMIT sem MEM_RESERVE só confirma o que já
+  está reservado: com base fora de uma reserva (ou passando do fim dela),
+  STATUS_CONFLICTING_ADDRESSES, como o MiAllocateVirtualMemory do 19041;
+  sem base, reserva uma faixa nova. Vistas de seção usam a mesma escolha.
 - **O que o kernel monta para o processo** também sai do alocador: a pilha da
   primeira thread é uma alocação de baixo para cima (fica abaixo de 4 GB
   num processo novo); PEB, TEB, parâmetros, entradas do Ldr e as regiões
