@@ -1238,7 +1238,8 @@ dereference e o PFN livre volta ao de antes.
   SystemSupportedProcessorArchitectures (`ex/`), NtCreateDirectoryObject,
   NtCreateSymbolicLinkObject, NtSetSecurityObject (também sobre os
   pseudo-handles de processo e thread), a ObjectSessionInformation (o
-  SessionId do diretório, `ob/objects/namespace.rs`) e a
+  SessionId do diretório, `ob/handle_attributes.rs`, também pelo
+  ZwSetInformationObject) e a
   ObjectSessionObjectInformation do NtSetInformationObject, a duplicação
   de handles do Object Manager (com DUPLICATE_NO_RIGHTS_UPGRADE), a
   SystemTimeOfDayInformation (`ex/time_of_day_information.rs`, com o

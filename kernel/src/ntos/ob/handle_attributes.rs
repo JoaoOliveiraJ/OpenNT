@@ -1,7 +1,8 @@
 //! ObSetHandleAttributes: troca o Inherit e o ProtectFromClose de um handle
 //! (o OBJECT_HANDLE_FLAG_INFORMATION de um chamador de kernel), e o
 //! NtSetInformationObject desse caminho (ObjectHandleFlagInformation), que o
-//! ZwSetInformationObject chama com PreviousMode KernelMode.
+//! ZwSetInformationObject chama com PreviousMode KernelMode; e a
+//! ObjectSessionInformation (o SessionId de um diretório), dos dois modos.
 //!
 //! Como no NT, um handle de kernel (prefixo OBJ_KERNEL_HANDLE) só vale com
 //! PreviousMode KernelMode e é procurado na tabela do System; os demais, na
@@ -22,10 +23,16 @@ const OBJ_PROTECT_CLOSE: u32 = 1;
 const OBJ_INHERIT: u32 = 2;
 /// OBJECT_INFORMATION_CLASS.ObjectHandleFlagInformation.
 const OBJECT_HANDLE_FLAG_INFORMATION: u32 = 4;
+/// OBJECT_INFORMATION_CLASS.ObjectSessionInformation.
+const OBJECT_SESSION_INFORMATION: u32 = 5;
+/// SE_TCB_PRIVILEGE.
+const SE_TCB_PRIVILEGE: u64 = 7;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 
 /// Os atributos na tabela corrente: ExSetHandleAttributes com a máscara
 /// OBJ_INHERIT | OBJ_PROTECT_CLOSE.
@@ -50,13 +57,42 @@ pub fn set_handle_attributes(handle: u64, flags: &ObjectHandleFlagInformation, p
     apply(handle, inherit, protect_from_close)
 }
 
+/// NtSetInformationObject(ObjectSessionInformation, 5), o ramo do
+/// NtSetInformationObject 19041: com SeTcbPrivilege (STATUS_PRIVILEGE_NOT_HELD
+/// sem ele; KernelMode sempre o tem), o diretório do handle, referenciado
+/// sem acesso pedido pelo tipo Directory, passa a ser da sessão de quem
+/// chama (OBJECT_DIRECTORY.SessionId, no corpo do diretório). Nem buffer nem
+/// comprimento são lidos. Um handle de outro tipo é
+/// STATUS_OBJECT_TYPE_MISMATCH. No NT esse SessionId faz a criação de seções
+/// e links no diretório por outra sessão exigir SeCreateGlobalPrivilege
+/// (ObpLookupObjectName); o OpenNT ainda não aplica essa restrição.
+pub fn set_session_information(handle: u64, previous_mode: u8) -> Result<u32, KernelError> {
+    if !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, previous_mode as u32) {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    let opened = match crate::ntos::ob::handles::namespace::resolve(handle, previous_mode != 0) {
+        Ok(opened) => opened,
+        // A tabela de usuário só tem objetos que não são diretórios.
+        Err(STATUS_INVALID_HANDLE) if state::get_user_handle(handle).is_some() => return Ok(STATUS_OBJECT_TYPE_MISMATCH),
+        Err(status) => return Ok(status),
+    };
+    if !opened.directory {
+        return Ok(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    crate::ntos::ob::objects::namespace::set_session_id(opened.body, crate::ntos::ps::session::current_process_session_id())?;
+    Ok(0)
+}
+
 /// NtSetInformationObject em KernelMode (o ZwSetInformationObject):
 /// ObjectHandleFlagInformation com exatamente os 2 bytes do
-/// OBJECT_HANDLE_FLAG_INFORMATION vai ao ObSetHandleAttributes. As classes
-/// de sessão de diretório (5 e 6) não existem no OpenNT, cujos diretórios
-/// de objetos não têm sessão; elas e as demais dão
-/// STATUS_INVALID_INFO_CLASS.
+/// OBJECT_HANDLE_FLAG_INFORMATION vai ao ObSetHandleAttributes e
+/// ObjectSessionInformation a [`set_session_information`]. A
+/// ObjectSessionObjectInformation (6) pede o objeto Session da sessão, que
+/// o OpenNT ainda não tem; ela e as demais dão STATUS_INVALID_INFO_CLASS.
 pub fn set_information_object(handle: u64, class: u32, information: &ObjectHandleFlagInformation, length: u32) -> Result<u32, KernelError> {
+    if class == OBJECT_SESSION_INFORMATION {
+        return set_session_information(handle, 0);
+    }
     if class != OBJECT_HANDLE_FLAG_INFORMATION {
         return Ok(STATUS_INVALID_INFO_CLASS);
     }

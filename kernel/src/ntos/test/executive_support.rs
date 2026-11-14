@@ -377,8 +377,20 @@ pub fn run_user(assert: Assert) {
             status(call_export("ZwSetInformationObject", &[handle, class, flags, length]))
         };
         let held = |handle: u64| state::get_user_handle(handle).map_or(u32::MAX, |entry| entry.attributes() & 3);
-        let zw_set = zw(signaled, 4, 0, 1, 2) == 0 && held(signaled) == 1 && zw(signaled, 4, 1, 0, 2) == 0 && held(signaled) == 2 && zw(signaled, 4, 1, 1, 3) == 0xC000_0004 && zw(signaled, 5, 1, 1, 2) == 0xC000_0003 && zw(0x7FF0, 4, 0, 1, 2) == 0xC000_0022 && held(signaled) == 2 && zw(signaled, 4, 0, 0, 2) == 0 && held(signaled) == 0;
-        let refused = refused && zw_set;
+        let zw_set = zw(signaled, 4, 0, 1, 2) == 0 && held(signaled) == 1 && zw(signaled, 4, 1, 0, 2) == 0 && held(signaled) == 2 && zw(signaled, 4, 1, 1, 3) == 0xC000_0004 && zw(signaled, 5, 1, 1, 2) == 0xC000_0024 && zw(signaled, 6, 1, 1, 2) == 0xC000_0003 && zw(0x7FF0, 4, 0, 1, 2) == 0xC000_0022 && held(signaled) == 2 && zw(signaled, 4, 0, 0, 2) == 0 && held(signaled) == 0;
+        // ObjectSessionInformation: o diretório (SessionId -1 na criação)
+        // passa a ser da sessão de quem chama.
+        let names = guest::alloc_bytes(0x200);
+        let named = object_attributes(names, "\\OpenNtSessaoDiretorio", 0x200);
+        guest::write64(names + 0x1F0, 0);
+        let made = status(call_export("ZwCreateDirectoryObject", &[names + 0x1F0, 0xF_000F, named])) == 0;
+        let directory = guest::read64(names + 0x1F0);
+        let body = crate::ntos::ob::handles::namespace::resolve(directory, false).map_or(0, |opened| opened.body);
+        let fresh = crate::ntos::ob::objects::namespace::session_id(body).ok() == Some(u32::MAX);
+        let session = zw(directory, 5, 0, 0, 0) == 0 && crate::ntos::ob::objects::namespace::session_id(body).ok() == Some(crate::ntos::ps::session::current_process_session_id());
+        let _ = call_export("ZwClose", &[directory]);
+        guest::free_bytes(names);
+        let refused = refused && zw_set && made && body != 0 && fresh && session;
         let zero = guest::alloc_bytes(8);
         guest::write64(zero, 0);
         let single = status(call_export("ObWaitForSingleObject", &[signaled, 1, 0, 0, zero])) == 0 && status(call_export("ObWaitForSingleObject", &[waiting, 1, 0, 0, zero])) == 0x102 && status(call_export("ObWaitForSingleObject", &[0x7FF0, 1, 0, 0, zero])) == 0xC000_0008;
@@ -423,7 +435,7 @@ pub fn run_user(assert: Assert) {
         assert(false, "ob: processo de teste com eventos de usuario");
         return;
     };
-    assert(created && attributes && refused, "ob: ObSetHandleAttributes e ZwSetInformationObject trocam Inherit e ProtectFromClose do handle e recusam handle ausente, de kernel em UserMode, classe e tamanho errados");
+    assert(created && attributes && refused, "ob: ObSetHandleAttributes e ZwSetInformationObject trocam Inherit e ProtectFromClose do handle e recusam handle ausente, de kernel em UserMode, classe e tamanho errados, e a ObjectSessionInformation grava a sessao no diretorio");
     assert(single && any == 1 && all == 0x102 && invalid == 0xC000_000D, "ob: ObWaitForSingleObject e ObWaitForMultipleObjects (WaitAny no indice sinalizado, WaitAll com prazo zero) sobre handles de usuario");
     assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado), ZwSetIoCompletionEx (reserva recusada) e ZwCancelWaitCompletionPacket tirando o pacote da fila");
 }

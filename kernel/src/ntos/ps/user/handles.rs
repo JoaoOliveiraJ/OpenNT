@@ -362,37 +362,15 @@ fn set_session_object_information(handle: u64) -> Result<u32, KernelError> {
     }
 }
 
-/// NtSetInformationObject(ObjectSessionInformation, 5): com SeTcbPrivilege,
-/// o diretório do handle (qualquer acesso) passa a ser da sessão de quem
-/// chama (OBJECT_DIRECTORY.SessionId, gravado no corpo do diretório). No NT
-/// esse SessionId faz a criação de seções e links no diretório por outra
-/// sessão exigir SeCreateGlobalPrivilege (ObpLookupObjectName); o OpenNT
-/// ainda não aplica essa restrição. Nem buffer nem comprimento são lidos.
-fn set_session_information(handle: u64) -> Result<u32, KernelError> {
-    // SeTcbPrivilege.
-    if !crate::ntos::se::privilege::single_privilege_check(7, 1) {
-        return Ok(0xC000_0061);
-    }
-    let opened = match crate::ntos::ob::handles::namespace::resolve(handle, true) {
-        Ok(opened) => opened,
-        Err(status) => return Ok(status),
-    };
-    if !opened.directory {
-        return Ok(0xC000_0024);
-    }
-    crate::ntos::ob::objects::namespace::set_session_id(opened.body, crate::ntos::ps::session::current_process_session_id())?;
-    Ok(0)
-}
-
 /// NtSetInformationObject: ObjectHandleFlagInformation (Inherit e
-/// ProtectFromClose do handle), ObjectSessionInformation e
-/// ObjectSessionObjectInformation.
+/// ProtectFromClose do handle), ObjectSessionInformation (a lógica mora em
+/// `ob/handle_attributes`) e ObjectSessionObjectInformation.
 fn nt_set_information_object(handle: u64, class: u64, input: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
     if class as u32 == 6 {
         return set_session_object_information(handle);
     }
     if class as u32 == 5 {
-        return set_session_information(handle);
+        return crate::ntos::ob::handle_attributes::set_session_information(handle, 1);
     }
     if class as u32 != 4 {
         return Ok(0xC000_0003);
