@@ -240,6 +240,10 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
             {
                 let text = output.lock().unwrap();
                 if let Some(failure) = FAILURE_MARKERS.iter().find(|marker| text[from.min(text.len())..].contains(*marker)) {
+                    // O relatório que segue o marcador (registradores, pilha)
+                    // ainda está chegando: um instante para ele entrar no log.
+                    drop(text);
+                    thread::sleep(Duration::from_millis(1500));
                     return Err(format!("falha detectada na serial: {failure}"));
                 }
                 if let Some(position) = text[from.min(text.len())..].find(needle) {

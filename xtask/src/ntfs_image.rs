@@ -1,16 +1,48 @@
-//! Gera `ntfs.img`: um NTFS válido para o leitor do kernel (`drivers/fs/ntfs`).
+//! Gera `ntfs.img`: um volume NTFS 3.1 que o leitor do kernel
+//! (`drivers/fs/ntfs`) lê como D: e que o ntfs.sys real monta.
 //!
-//! Layout: setor = cluster = 512 B, MFT no LCN 4, registros de 16 KB.
+//! Layout: setor = cluster = 512 B, registros de arquivo de 4 KB (o "large
+//! FRS" do NTFS) e blocos de índice de 4 KB. Clusters: 0..16 = $Boot (o setor
+//! de boot e o resto zerado), a MFT no LCN 16, o espelho dos quatro
+//! primeiros registros, o $LogFile, o $AttrDef, o $UpCase, o $SDS do $Secure,
+//! os arquivos extras, os blocos INDX dos diretórios grandes, o $Bitmap e o
+//! espaço livre. O último setor da imagem é a cópia do setor de boot, fora
+//! dos clusters do volume (NumberSectors não o conta).
+//!
 //! Registros: 0=$MFT 1=$MFTMirr 2=$LogFile 3=$Volume 4=$AttrDef 5='.' (raiz)
-//! 6=$Bitmap, 16=HELLO.TXT, 17..=arquivos extras. Reserva registros na MFT
-//! e espaço livre; os bitmaps são a autoridade de alocação. Imagem de
-//! desenvolvimento: sem journal nem ACLs do Windows.
+//! 6=$Bitmap 7=$Boot 8=$BadClus 9=$Secure 10=$UpCase 11=$Extend, 12..15
+//! reservados (em uso, vazios), 16=HELLO.TXT, 17.. os arquivos extras, os
+//! diretórios intermediários e por fim os arquivos do $Extend ($Quota,
+//! $ObjId, $Reparse): o NTFS só aceita uma entrada de índice que aponte um
+//! registro abaixo de 16 no diretório raiz. Os registros do sistema têm o
+//! número de sequência igual ao número do registro (o $MFT, 1), como o NTFS
+//! os abre; os demais, 1.
+//!
+//! O formato segue o NTFS 3.1 do Windows 10, conferido com o ntfs.sys
+//! 10.0.19041 desta máquina:
+//! - NtfsIsBootSectorNtfs: OEM "NTFS    ", 512 bytes por setor, campos de FAT
+//!   zerados, NumberSectors dentro do disco, MFT e espelho dentro do volume,
+//!   ClustersPerFileRecordSegment e ClustersPerIndexBuffer válidos;
+//! - NtfsCheckFileRecord: USA de (4096 / 512) + 1 entradas, em uso, tamanho
+//!   alocado 4096, primeiro atributo alinhado depois da USA e o número do
+//!   segmento no cabeçalho (0x2A/0x2C); cada atributo com tipo da tabela de
+//!   definições (índice tipo / 0x10 - 1);
+//! - a tabela de definições de atributo é a do NtfsAttributeDefinitions do
+//!   ntfs.sys (17 entradas, com o lugar vazio do 0xF0);
+//! - LfsReadRestart: um $LogFile cujas páginas começam com 0xFFFFFFFF é um
+//!   log novo, que o LFS inicializa na primeira montagem; o LFS exige pelo
+//!   menos 0x50 páginas de 4 KB além das duas de reinício;
+//! - NtfsHashSecurityDescriptor: o hash do $SDS/$SDH é `rol(hash, 3) + dword`
+//!   sobre o descritor;
+//! - o $UpCase é o RtlUpcaseUnicodeChar de cada unidade (a tabela de
+//!   maiúsculas do l_intl.nls desta máquina acima de U+00BF, 'a'..'z' abaixo).
 //!
 //! Cada arquivo extra vira um registro com $DATA não residente numa run
-//! contígua depois da zona da MFT, o que permite embutir arquivos grandes
-//! sem runlist fragmentada. Nomes com `/` (`Windows/System32/x.sys`) criam
-//! os diretórios intermediários, registrados depois dos arquivos, cada um com
-//! o seu $INDEX_ROOT residente.
+//! contígua, o que permite embutir arquivos grandes sem runlist fragmentada.
+//! Nomes com `/` (`Windows/System32/x.sys`) criam os diretórios
+//! intermediários, registrados depois dos arquivos. O índice $I30 de cada
+//! diretório é residente enquanto cabe no registro; senão os nomes vão para
+//! blocos INDX e o $INDEX_ROOT guarda os separadores da B-tree.
 
 use std::collections::BTreeMap;
 
@@ -19,13 +51,58 @@ use std::path::Path;
 
 const SECTOR: usize = 512;
 const CLUSTER: usize = 512;
-const MFT_LCN: usize = 4;
-/// O $INDEX_ROOT da raiz é residente: com dezenas de arquivos 1 KB não cabe.
-const RECORD_SIZE: usize = 16384;
+/// $Boot: 8 KB no início do volume.
+const BOOT_CLUSTERS: usize = 16;
+const MFT_LCN: usize = 16;
+const RECORD_SIZE: usize = 4096;
 const SECTORS_PER_RECORD: usize = RECORD_SIZE / SECTOR;
+const INDEX_BLOCK: usize = 4096;
+/// Registros copiados no $MFTMirr.
+const MIRROR_RECORDS: usize = 4;
+/// $LogFile de 2 MB (o mínimo do LFS é 2 + 0x50 páginas de 4 KB).
+const LOG_FILE_BYTES: usize = 2 * 1_048_576;
+/// SECURITY_DESCRIPTOR_HEADER do $SDS e a cópia de cada bloco de 256 KB.
+const SDS_MIRROR: usize = 0x40000;
+/// SecurityId de todos os arquivos: o primeiro do $Secure.
+const SECURITY_ID: u32 = 0x100;
 const VOLUME_LABEL: &str = "OPENNT";
 const HELLO_NAME: &str = "HELLO.TXT";
 const HELLO_DATA: &[u8] = b"Ola do NTFS no OpenNT!\r\n";
+const HELLO_RECORD: u64 = 16;
+const ROOT: u64 = 5;
+const EXTEND: u64 = 11;
+/// Atributos de arquivo: oculto | sistema e o diretório das informações
+/// duplicadas (DUP_FILE_NAME_INDEX_PRESENT).
+const HIDDEN_SYSTEM: u32 = 0x06;
+const DIRECTORY_DUPLICATE: u32 = 0x1000_0000;
+const FILE_ARCHIVE: u32 = 0x20;
+/// Flags do registro: em uso, diretório ($I30) e índice de visão.
+const IN_USE: u16 = 1;
+const DIRECTORY: u16 = 3;
+const VIEW_INDEX: u16 = 9;
+
+/// Tabela de definições de atributo (nome, tipo, flags, mínimo, máximo), a
+/// mesma do NtfsAttributeDefinitions do ntfs.sys 10.0.19041; a entrada vazia
+/// ocupa o lugar do tipo 0xF0, e a tabela termina numa entrada zerada.
+const ATTRIBUTE_DEFINITIONS: &[(&str, u32, u32, i64, i64)] = &[
+    ("$STANDARD_INFORMATION", 0x10, 0x40, 0x30, 0x48),
+    ("$ATTRIBUTE_LIST", 0x20, 0x80, 0, -1),
+    ("$FILE_NAME", 0x30, 0x42, 0x44, 0x242),
+    ("$OBJECT_ID", 0x40, 0x40, 0, 0x100),
+    ("$SECURITY_DESCRIPTOR", 0x50, 0x80, 0, -1),
+    ("$VOLUME_NAME", 0x60, 0x40, 2, 0x100),
+    ("$VOLUME_INFORMATION", 0x70, 0x40, 0xC, 0x18),
+    ("$DATA", 0x80, 0x00, 0, -1),
+    ("$INDEX_ROOT", 0x90, 0x40, 0, -1),
+    ("$INDEX_ALLOCATION", 0xA0, 0x80, 0, -1),
+    ("$BITMAP", 0xB0, 0x80, 0, -1),
+    ("$REPARSE_POINT", 0xC0, 0x80, 0, 0x4000),
+    ("$EA_INFORMATION", 0xD0, 0x40, 8, 8),
+    ("$EA", 0xE0, 0x80, 0, 0x10000),
+    ("", 0, 0, 0, 0),
+    ("$LOGGED_UTILITY_STREAM", 0x100, 0x80, 0, 0x10000),
+    ("", 0, 0, 0, 0),
+];
 
 fn put16(buffer: &mut [u8], offset: usize, value: u16) {
     buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -39,6 +116,10 @@ fn put64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+fn align8(value: usize) -> usize {
+    (value + 7) & !7
+}
+
 fn bit_length(value: u64) -> u32 {
     64 - value.leading_zeros()
 }
@@ -47,113 +128,257 @@ fn utf16(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
-/// Registro FILE com USA/fixup: USN=1 no fim de todos os setores e os
-/// originais na USA.
-fn make_record(number: u32, flags: u16, attributes: &[Vec<u8>]) -> Result<Vec<u8>, String> {
-    let mut record = vec![0u8; RECORD_SIZE];
-    record[0..4].copy_from_slice(b"FILE");
-    let usa_count = SECTORS_PER_RECORD + 1;
-    let attributes_offset = (48 + usa_count * 2 + 7) & !7;
-    put16(&mut record, 4, 48);
-    put16(&mut record, 6, usa_count as u16);
-    put16(&mut record, 16, 1); // sequence
-    put16(&mut record, 18, 1); // link count
-    put16(&mut record, 20, attributes_offset as u16);
-    put16(&mut record, 22, flags); // 1 = em uso | 2 = diretório
-    put32(&mut record, 28, RECORD_SIZE as u32);
-    put32(&mut record, 44, number);
-    let mut offset = attributes_offset;
-    for blob in attributes {
-        if offset + blob.len() + 8 > RECORD_SIZE {
-            return Err(format!("MFT record {number}: attributes exceed {RECORD_SIZE} bytes"));
-        }
-        record[offset..offset + blob.len()].copy_from_slice(blob);
-        offset += blob.len();
+/// Número de sequência do registro: o do sistema é o próprio número.
+fn sequence(record: u64) -> u16 {
+    match record {
+        0 => 1,
+        1..=15 => record as u16,
+        _ => 1,
     }
-    put32(&mut record, offset, 0xFFFF_FFFF); // fim dos atributos
-    put32(&mut record, 24, (offset + 8) as u32); // tamanho usado
-    put16(&mut record, 48, 1);
-    for index in 1..usa_count {
-        let tail = index * SECTOR - 2;
-        let original = u16::from_le_bytes([record[tail], record[tail + 1]]);
-        put16(&mut record, 48 + index * 2, original);
-        put16(&mut record, tail, 1);
-    }
-    Ok(record)
 }
 
-fn attribute_resident(attribute_type: u32, value: &[u8], attribute_id: u16) -> Vec<u8> {
-    let total = (24 + value.len() + 7) & !7;
-    let mut attribute = vec![0u8; total];
-    put32(&mut attribute, 0, attribute_type);
-    put32(&mut attribute, 4, total as u32);
-    attribute[8] = 0; // residente
-    put16(&mut attribute, 14, attribute_id);
-    put32(&mut attribute, 16, value.len() as u32);
-    put16(&mut attribute, 20, 24);
-    attribute[24..24 + value.len()].copy_from_slice(value);
-    attribute
+/// FILE_REFERENCE com o número de sequência.
+fn reference(record: u64) -> u64 {
+    record | (sequence(record) as u64) << 48
 }
 
-/// Runlist NTFS (deltas com sinal), terminada em zero.
-fn runlist_bytes(runs: &[(i64, u64)]) -> Vec<u8> {
+/// Corpo de um atributo.
+enum Body {
+    /// Valor residente; `true` = indexado (o $FILE_NAME).
+    Resident(Vec<u8>, bool),
+    /// Runs (LCN ou `None` para buraco, clusters) e o tamanho real.
+    NonResident(Vec<(Option<u64>, u64)>, u64),
+}
+
+struct Attribute {
+    kind: u32,
+    name: &'static str,
+    body: Body,
+}
+
+fn resident(kind: u32, name: &'static str, value: Vec<u8>) -> Attribute {
+    Attribute { kind, name, body: Body::Resident(value, false) }
+}
+
+fn nonresident(kind: u32, name: &'static str, runs: Vec<(Option<u64>, u64)>, real_size: u64) -> Attribute {
+    Attribute { kind, name, body: Body::NonResident(runs, real_size) }
+}
+
+/// Runlist NTFS: contagem e delta de LCN com sinal; buraco sem LCN.
+fn runlist_bytes(runs: &[(Option<u64>, u64)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut previous = 0i64;
     for &(lcn, count) in runs {
-        let delta = lcn - previous;
         let count_length = bit_length(count).div_ceil(8).max(1) as usize;
         let count_bytes = &count.to_le_bytes()[..count_length];
-        // Menor quantidade de bytes com sinal que representa o delta.
-        let magnitude = if delta >= 0 { delta as u64 } else { delta.unsigned_abs() };
-        let delta_length = ((bit_length(magnitude) + 8) / 8).max(1) as usize;
-        let delta_bytes = &delta.to_le_bytes()[..delta_length];
-        out.push(((delta_length as u8) << 4) | count_length as u8);
-        out.extend_from_slice(count_bytes);
-        out.extend_from_slice(delta_bytes);
-        previous = lcn;
+        match lcn {
+            None => {
+                out.push(count_length as u8);
+                out.extend_from_slice(count_bytes);
+            }
+            Some(lcn) => {
+                let delta = lcn as i64 - previous;
+                let magnitude = if delta >= 0 { delta as u64 } else { delta.unsigned_abs() };
+                let delta_length = ((bit_length(magnitude) + 8) / 8).max(1) as usize;
+                out.push(((delta_length as u8) << 4) | count_length as u8);
+                out.extend_from_slice(count_bytes);
+                out.extend_from_slice(&delta.to_le_bytes()[..delta_length]);
+                previous = lcn as i64;
+            }
+        }
     }
     out.push(0);
     out
 }
 
-fn attribute_nonresident(attribute_type: u32, runs: &[u8], real_size: u64, attribute_id: u16) -> Vec<u8> {
-    let total = (64 + runs.len() + 7) & !7;
-    let mut attribute = vec![0u8; total];
-    let clusters = real_size.div_ceil(CLUSTER as u64);
-    put32(&mut attribute, 0, attribute_type);
-    put32(&mut attribute, 4, total as u32);
-    attribute[8] = 1; // não residente
-    put16(&mut attribute, 14, attribute_id);
-    put64(&mut attribute, 16, 0); // lowest VCN
-    put64(&mut attribute, 24, clusters.wrapping_sub(1)); // highest VCN
-    put16(&mut attribute, 32, 64); // offset do runlist
-    put64(&mut attribute, 40, clusters * CLUSTER as u64);
-    put64(&mut attribute, 48, real_size);
-    put64(&mut attribute, 56, real_size);
-    attribute[64..64 + runs.len()].copy_from_slice(runs);
-    attribute
+/// O registro de atributo com a instância dada.
+fn encode_attribute(attribute: &Attribute, instance: u16) -> Vec<u8> {
+    let name = utf16(attribute.name);
+    let name_length = attribute.name.encode_utf16().count() as u8;
+    match &attribute.body {
+        Body::Resident(value, indexed) => {
+            let value_offset = align8(0x18 + name.len());
+            let total = align8(value_offset + value.len());
+            let mut bytes = vec![0u8; total];
+            put32(&mut bytes, 0, attribute.kind);
+            put32(&mut bytes, 4, total as u32);
+            bytes[9] = name_length;
+            put16(&mut bytes, 10, 0x18);
+            put16(&mut bytes, 14, instance);
+            put32(&mut bytes, 16, value.len() as u32);
+            put16(&mut bytes, 20, value_offset as u16);
+            bytes[22] = *indexed as u8;
+            bytes[0x18..0x18 + name.len()].copy_from_slice(&name);
+            bytes[value_offset..value_offset + value.len()].copy_from_slice(value);
+            bytes
+        }
+        Body::NonResident(runs, real_size) => {
+            let mapping = runlist_bytes(runs);
+            let clusters: u64 = runs.iter().map(|&(_, count)| count).sum();
+            let mapping_offset = align8(0x40 + name.len());
+            let total = align8(mapping_offset + mapping.len());
+            let mut bytes = vec![0u8; total];
+            put32(&mut bytes, 0, attribute.kind);
+            put32(&mut bytes, 4, total as u32);
+            bytes[8] = 1;
+            bytes[9] = name_length;
+            put16(&mut bytes, 10, 0x40);
+            put16(&mut bytes, 14, instance);
+            put64(&mut bytes, 16, 0);
+            put64(&mut bytes, 24, clusters.wrapping_sub(1));
+            put16(&mut bytes, 32, mapping_offset as u16);
+            put64(&mut bytes, 40, clusters * CLUSTER as u64);
+            put64(&mut bytes, 48, *real_size);
+            put64(&mut bytes, 56, *real_size);
+            bytes[0x40..0x40 + name.len()].copy_from_slice(&name);
+            bytes[mapping_offset..mapping_offset + mapping.len()].copy_from_slice(&mapping);
+            bytes
+        }
+    }
+}
+
+/// Primeiro atributo depois do cabeçalho de 0x30 e da USA.
+fn first_attribute_offset() -> usize {
+    align8(0x30 + (SECTORS_PER_RECORD + 1) * 2)
+}
+
+/// Bytes que os atributos ocupam num registro.
+fn attributes_size(attributes: &[Attribute]) -> usize {
+    attributes.iter().map(|attribute| encode_attribute(attribute, 0).len()).sum()
+}
+
+/// Registro FILE com a USA (USN 1 no fim de cada setor, os originais na
+/// USA), o número do segmento e as instâncias dos atributos em ordem.
+fn make_record(number: u64, flags: u16, attributes: &[Attribute]) -> Result<Vec<u8>, String> {
+    let mut record = vec![0u8; RECORD_SIZE];
+    record[0..4].copy_from_slice(b"FILE");
+    let usa_count = SECTORS_PER_RECORD + 1;
+    let first = first_attribute_offset();
+    put16(&mut record, 4, 0x30);
+    put16(&mut record, 6, usa_count as u16);
+    put16(&mut record, 16, sequence(number));
+    let links = attributes.iter().filter(|attribute| attribute.kind == 0x30).count() as u16;
+    put16(&mut record, 18, links);
+    put16(&mut record, 20, first as u16);
+    put16(&mut record, 22, flags);
+    put32(&mut record, 28, RECORD_SIZE as u32);
+    put16(&mut record, 40, attributes.len() as u16);
+    put16(&mut record, 42, (number >> 32) as u16);
+    put32(&mut record, 44, number as u32);
+    let mut offset = first;
+    for (instance, attribute) in attributes.iter().enumerate() {
+        let blob = encode_attribute(attribute, instance as u16);
+        if offset + blob.len() + 8 > RECORD_SIZE {
+            return Err(format!("MFT record {number}: attributes exceed {RECORD_SIZE} bytes"));
+        }
+        record[offset..offset + blob.len()].copy_from_slice(&blob);
+        offset += blob.len();
+    }
+    put32(&mut record, offset, 0xFFFF_FFFF);
+    put32(&mut record, 24, (offset + 8) as u32);
+    apply_usa(&mut record, 0x30, usa_count);
+    Ok(record)
+}
+
+/// USN 1 no fim de cada setor e os bytes originais na USA.
+fn apply_usa(block: &mut [u8], usa_offset: usize, usa_count: usize) {
+    put16(block, usa_offset, 1);
+    for index in 1..usa_count {
+        let tail = index * SECTOR - 2;
+        let original = u16::from_le_bytes([block[tail], block[tail + 1]]);
+        put16(block, usa_offset + index * 2, original);
+        put16(block, tail, 1);
+    }
+}
+
+/// $STANDARD_INFORMATION do NTFS 3.x (72 bytes) com o SecurityId comum.
+fn standard_information(file_attributes: u32) -> Attribute {
+    let mut value = vec![0u8; 72];
+    put32(&mut value, 32, file_attributes);
+    put32(&mut value, 52, SECURITY_ID);
+    resident(0x10, "", value)
 }
 
 /// Valor de $FILE_NAME (sem o cabeçalho do atributo).
-fn file_name_value(parent: u64, name: &str, directory: bool, real_size: u64) -> Result<Vec<u8>, String> {
+fn file_name_value(parent: u64, name: &str, file_attributes: u32, allocated: u64, real_size: u64, namespace: u8) -> Result<Vec<u8>, String> {
     let units = utf16(name);
     let characters = units.len() / 2;
     if !(1..=255).contains(&characters) || name.contains(['\\', '/', ':']) {
         return Err(format!("nome NTFS invalido: {name:?}"));
     }
     let mut value = vec![0u8; 66 + units.len()];
-    put64(&mut value, 0, parent);
-    put64(&mut value, 40, real_size);
+    put64(&mut value, 0, reference(parent));
+    put64(&mut value, 40, allocated);
     put64(&mut value, 48, real_size);
-    put32(&mut value, 56, if directory { 0x10 } else { 0x20 });
+    put32(&mut value, 56, file_attributes);
     value[64] = characters as u8;
-    value[65] = if name == "." { 3 } else { 1 }; // namespace
+    value[65] = namespace;
     value[66..].copy_from_slice(&units);
     Ok(value)
 }
 
-fn file_name_attribute(parent: u64, name: &str, directory: bool, real_size: u64) -> Result<Vec<u8>, String> {
-    Ok(attribute_resident(0x30, &file_name_value(parent, name, directory, real_size)?, 0))
+fn file_name_attribute(value: Vec<u8>) -> Attribute {
+    Attribute { kind: 0x30, name: "", body: Body::Resident(value, true) }
+}
+
+/// Entrada de um índice de arquivos ($I30): referência, chave (o
+/// $FILE_NAME) e o VCN do filho no fim.
+fn index_entry(reference: u64, key: &[u8], child: Option<u64>) -> Vec<u8> {
+    let size = align8(16 + key.len()) + if child.is_some() { 8 } else { 0 };
+    let mut entry = vec![0u8; size];
+    put64(&mut entry, 0, reference);
+    put16(&mut entry, 8, size as u16);
+    put16(&mut entry, 10, key.len() as u16);
+    put16(&mut entry, 12, child.is_some() as u16);
+    entry[16..16 + key.len()].copy_from_slice(key);
+    if let Some(child) = child {
+        put64(&mut entry, size - 8, child);
+    }
+    entry
+}
+
+/// Entrada final de um nó (com o VCN do filho à esquerda, se houver).
+fn end_entry(child: Option<u64>) -> Vec<u8> {
+    let size = 16 + if child.is_some() { 8 } else { 0 };
+    let mut entry = vec![0u8; size];
+    put16(&mut entry, 8, size as u16);
+    put16(&mut entry, 12, 2 | child.is_some() as u16);
+    if let Some(child) = child {
+        put64(&mut entry, 16, child);
+    }
+    entry
+}
+
+/// Entrada de um índice de visão: deslocamento e tamanho dos dados, chave e
+/// dados (alinhada a 8, com o preenchimento dado no fim).
+fn view_entry(key: &[u8], data: &[u8], padding: &[u8]) -> Vec<u8> {
+    let data_offset = 16 + key.len();
+    let size = align8(data_offset + data.len() + padding.len());
+    let mut entry = vec![0u8; size];
+    put16(&mut entry, 0, data_offset as u16);
+    put16(&mut entry, 2, data.len() as u16);
+    put16(&mut entry, 8, size as u16);
+    put16(&mut entry, 10, key.len() as u16);
+    entry[16..16 + key.len()].copy_from_slice(key);
+    entry[data_offset..data_offset + data.len()].copy_from_slice(data);
+    entry[data_offset + data.len()..data_offset + data.len() + padding.len()].copy_from_slice(padding);
+    entry
+}
+
+/// Valor do $INDEX_ROOT: tipo indexado, colação, tamanho do bloco e o
+/// INDEX_HEADER com as entradas (LARGE_INDEX quando há blocos).
+fn index_root_value(indexed_type: u32, collation: u32, entries: &[u8], large: bool) -> Vec<u8> {
+    let mut value = vec![0u8; 32 + entries.len()];
+    put32(&mut value, 0, indexed_type);
+    put32(&mut value, 4, collation);
+    put32(&mut value, 8, INDEX_BLOCK as u32);
+    value[12] = (INDEX_BLOCK / CLUSTER) as u8;
+    put32(&mut value, 16, 16);
+    put32(&mut value, 20, (16 + entries.len()) as u32);
+    put32(&mut value, 24, (16 + entries.len()) as u32);
+    value[28] = large as u8;
+    value[32..].copy_from_slice(entries);
+    value
 }
 
 /// Inteiro com os `count` bits baixos ligados, em `length` bytes.
@@ -163,6 +388,168 @@ fn low_bits(count: usize, length: usize) -> Vec<u8> {
         bytes[bit / 8] |= 1 << (bit % 8);
     }
     bytes
+}
+
+/// Alocação sequencial de clusters, com os bytes de cada faixa.
+struct Clusters {
+    next: usize,
+    writes: Vec<(usize, Vec<u8>)>,
+}
+
+impl Clusters {
+    fn allocate(&mut self, bytes: Vec<u8>) -> (u64, u64) {
+        let count = bytes.len().div_ceil(CLUSTER).max(1);
+        let lcn = self.next;
+        self.next += count;
+        self.writes.push((lcn, bytes));
+        (lcn as u64, count as u64)
+    }
+}
+
+/// O índice $I30 de um diretório: o $INDEX_ROOT residente e, se não couber
+/// em `room` bytes, os blocos INDX ($INDEX_ALLOCATION e $BITMAP).
+fn directory_index(children: &[(u64, Vec<u8>)], room: usize, clusters: &mut Clusters) -> Result<Vec<Attribute>, String> {
+    let entries: Vec<Vec<u8>> = children.iter().map(|(record, key)| index_entry(reference(*record), key, None)).collect();
+    let all: usize = entries.iter().map(Vec::len).sum::<usize>() + 16;
+    let root_overhead = encode_attribute(&resident(0x90, "$I30", index_root_value(0x30, 1, &[], false)), 0).len();
+    if all + root_overhead <= room {
+        let flat = [entries.concat(), end_entry(None)].concat();
+        return Ok(vec![resident(0x90, "$I30", index_root_value(0x30, 1, &flat, false))]);
+    }
+    // B-tree de dois níveis: cada separador sai da folha anterior e vai para
+    // o $INDEX_ROOT com o VCN do filho.
+    let usable = INDEX_BLOCK - 0x40 - 24;
+    let mut groups: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+    let mut group = Vec::new();
+    let mut used = 0;
+    for (child, entry) in children.iter().zip(&entries) {
+        if used + entry.len() > usable && !group.is_empty() {
+            groups.push(std::mem::take(&mut group));
+            used = 0;
+        }
+        used += entry.len();
+        group.push(child.clone());
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    let group_count = groups.len();
+    let mut root_entries = Vec::new();
+    let mut blocks = Vec::new();
+    for (number, mut group) in groups.into_iter().enumerate() {
+        let vcn = (number * (INDEX_BLOCK / CLUSTER)) as u64;
+        if number + 1 < group_count {
+            let (record, key) = group.pop().ok_or("grupo de indice vazio")?;
+            root_entries.push(index_entry(reference(record), &key, Some(vcn)));
+        } else {
+            root_entries.push(end_entry(Some(vcn)));
+        }
+        let leaf = [group.iter().map(|(record, key)| index_entry(reference(*record), key, None)).collect::<Vec<_>>().concat(), end_entry(None)].concat();
+        let mut block = vec![0u8; INDEX_BLOCK];
+        block[..4].copy_from_slice(b"INDX");
+        put16(&mut block, 4, 0x28);
+        put16(&mut block, 6, (INDEX_BLOCK / SECTOR + 1) as u16);
+        put64(&mut block, 16, vcn);
+        put32(&mut block, 24, 0x28);
+        put32(&mut block, 28, (0x28 + leaf.len()) as u32);
+        put32(&mut block, 32, (INDEX_BLOCK - 24) as u32);
+        block[0x40..0x40 + leaf.len()].copy_from_slice(&leaf);
+        apply_usa(&mut block, 0x28, INDEX_BLOCK / SECTOR + 1);
+        blocks.push(block);
+    }
+    let root = root_entries.concat();
+    if root.len() + root_overhead > room {
+        return Err("indice NTFS grande demais para dois niveis".into());
+    }
+    let count = blocks.len();
+    let length = (count * INDEX_BLOCK) as u64;
+    let (lcn, run) = clusters.allocate(blocks.concat());
+    Ok(vec![
+        resident(0x90, "$I30", index_root_value(0x30, 1, &root, true)),
+        nonresident(0xA0, "$I30", vec![(Some(lcn), run)], length),
+        resident(0xB0, "$I30", low_bits(count, count.div_ceil(64) * 8)),
+    ])
+}
+
+/// Descritor de segurança autorrelativo do $Secure: dono e grupo
+/// Administradores (S-1-5-32-544) e uma DACL com Todos (S-1-1-0) com
+/// FILE_ALL_ACCESS.
+fn security_descriptor() -> Vec<u8> {
+    let everyone: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let administrators: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0];
+    let mut ace = vec![0u8, 0, 20, 0];
+    ace.extend_from_slice(&0x001F_01FFu32.to_le_bytes());
+    ace.extend_from_slice(&everyone);
+    let mut dacl = vec![2u8, 0, 0, 0, 1, 0, 0, 0];
+    put16(&mut dacl, 2, (8 + ace.len()) as u16);
+    dacl.extend_from_slice(&ace);
+    let mut descriptor = vec![0u8; 20];
+    descriptor[0] = 1;
+    put16(&mut descriptor, 2, 0x8004);
+    let dacl_offset = 20;
+    let owner_offset = dacl_offset + dacl.len();
+    let group_offset = owner_offset + administrators.len();
+    put32(&mut descriptor, 4, owner_offset as u32);
+    put32(&mut descriptor, 8, group_offset as u32);
+    put32(&mut descriptor, 16, dacl_offset as u32);
+    descriptor.extend_from_slice(&dacl);
+    descriptor.extend_from_slice(&administrators);
+    descriptor.extend_from_slice(&administrators);
+    descriptor
+}
+
+/// NtfsHashSecurityDescriptor: `rol(hash, 3) + dword` sobre o descritor.
+fn security_hash(descriptor: &[u8]) -> u32 {
+    descriptor.chunks_exact(4).fold(0u32, |hash, word| hash.rotate_left(3).wrapping_add(u32::from_le_bytes([word[0], word[1], word[2], word[3]])))
+}
+
+/// Tabela de maiúsculas do l_intl.nls (o trie de três níveis da seção de
+/// maiúsculas), como o kernel a lê.
+fn upcase_table() -> Result<Vec<u8>, String> {
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:/Windows"));
+    let path = Path::new(&windows).join("System32/l_intl.nls");
+    let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    if bytes.len() < 516 || word(0) != 1 {
+        return Err(format!("{}: cabecalho de maiusculas invalido", path.display()));
+    }
+    let end = 2 + word(2) as usize * 2;
+    if end < 516 || end > bytes.len() {
+        return Err(format!("{}: tamanho de maiusculas invalido", path.display()));
+    }
+    let trie: Vec<u16> = (4..end).step_by(2).map(word).collect();
+    let read = |index: usize| trie.get(index).copied().ok_or_else(|| format!("{}: trie de maiusculas invalido", path.display()));
+    let mut table = Vec::with_capacity(131_072);
+    for unit in 0..=u16::MAX {
+        // RtlUpcaseUnicodeChar: 'a'..'z' direto, o resto abaixo de U+00C0
+        // inalterado e a tabela daí para cima.
+        let upper = match unit {
+            0x61..=0x7A => unit - 0x20,
+            0..=0xBF => unit,
+            _ => {
+                let first = read((unit >> 8) as usize)? as usize;
+                let second = read(first + ((unit >> 4) & 15) as usize)? as usize;
+                unit.wrapping_add(read(second + (unit & 15) as usize)?)
+            }
+        };
+        table.extend_from_slice(&upper.to_le_bytes());
+    }
+    Ok(table)
+}
+
+/// Bytes do $AttrDef.
+fn attribute_definitions() -> Vec<u8> {
+    let mut table = vec![0u8; ATTRIBUTE_DEFINITIONS.len() * 0xA0];
+    for (index, &(name, kind, flags, minimum, maximum)) in ATTRIBUTE_DEFINITIONS.iter().enumerate() {
+        let entry = &mut table[index * 0xA0..(index + 1) * 0xA0];
+        let units = utf16(name);
+        entry[..units.len()].copy_from_slice(&units);
+        put32(entry, 0x80, kind);
+        put32(entry, 0x8C, flags);
+        put64(entry, 0x90, minimum as u64);
+        put64(entry, 0x98, maximum as u64);
+    }
+    table
 }
 
 /// Monta a imagem com os arquivos extras `(nome no volume, bytes)`.
@@ -181,11 +568,12 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
             }
         }
     }
+    let first_extra = HELLO_RECORD + 1;
     let directory_record = |path: &str| -> u64 {
         if path.is_empty() {
-            5
+            ROOT
         } else {
-            (17 + extras.len() + directories.iter().position(|known| known.eq_ignore_ascii_case(path)).unwrap_or(0)) as u64
+            first_extra + extras.len() as u64 + directories.iter().position(|known| known.eq_ignore_ascii_case(path)).unwrap_or(0) as u64
         }
     };
     let split = |path: &str| -> (String, String) {
@@ -194,230 +582,230 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
             None => (String::new(), path.to_string()),
         }
     };
-    let record_count = 17 + extras.len() + directories.len();
+    // Os arquivos do $Extend vêm depois dos de usuário
+    // (NtfsCheckIndexEntryFileReference: registro < 16 só na raiz).
+    let quota = first_extra + (extras.len() + directories.len()) as u64;
+    let (object_id, reparse) = (quota + 1, quota + 2);
+    let record_count = reparse as usize + 1;
     let mft_capacity = 512usize.max(1usize << bit_length((record_count + extra_records - 1) as u64));
     let mft_clusters = mft_capacity * RECORD_SIZE / CLUSTER;
-    let mirror_lcn = MFT_LCN + mft_clusters;
-    let data_start_lcn = mirror_lcn + 4 * SECTORS_PER_RECORD;
-    let mut data_lcn = data_start_lcn;
+    let mut clusters = Clusters { next: MFT_LCN + mft_clusters, writes: Vec::new() };
+    // ---- dados dos arquivos do sistema
+    // O $BITMAP do $MFT é sempre não residente: o NTFS pré-carrega a
+    // alocação dele na montagem.
+    let mft_bitmap = low_bits(record_count, mft_capacity.div_ceil(64) * 8);
+    let mft_bitmap_length = mft_bitmap.len() as u64;
+    let (mft_bitmap_lcn, mft_bitmap_count) = clusters.allocate(mft_bitmap);
+    let (mirror_lcn, mirror_count) = clusters.allocate(vec![0u8; MIRROR_RECORDS * RECORD_SIZE]);
+    let (log_lcn, log_count) = clusters.allocate(vec![0xFFu8; LOG_FILE_BYTES]);
+    let attribute_table = attribute_definitions();
+    let attribute_table_length = attribute_table.len() as u64;
+    let (attrdef_lcn, attrdef_count) = clusters.allocate(attribute_table);
+    let upcase = upcase_table()?;
+    let upcase_length = upcase.len() as u64;
+    let (upcase_lcn, upcase_count) = clusters.allocate(upcase);
+    // $SDS: o descritor no primeiro bloco de 256 KB e a cópia no seguinte.
+    let descriptor = security_descriptor();
+    let hash = security_hash(&descriptor);
+    let mut header = vec![0u8; 20];
+    put32(&mut header, 0, hash);
+    put32(&mut header, 4, SECURITY_ID);
+    put64(&mut header, 8, 0);
+    put32(&mut header, 16, (20 + descriptor.len()) as u32);
+    let sds_entry = [header.clone(), descriptor.clone()].concat();
+    let sds_length = SDS_MIRROR + sds_entry.len();
+    let mut sds = vec![0u8; sds_length];
+    sds[..sds_entry.len()].copy_from_slice(&sds_entry);
+    sds[SDS_MIRROR..].copy_from_slice(&sds_entry);
+    let (sds_lcn, sds_count) = clusters.allocate(sds);
+    // ---- dados dos arquivos extras
     let mut file_runs = Vec::new();
     for (_, blob) in extras {
-        let clusters = blob.len().div_ceil(CLUSTER);
-        file_runs.push((data_lcn, clusters));
-        data_lcn += clusters;
+        file_runs.push(if blob.is_empty() { None } else { Some(clusters.allocate(blob.clone())) });
     }
-    let index_lcn = data_lcn;
-    // Pior caso de folha (255 caracteres UTF-16 por nome).
-    let root_entries = 1 + extras.iter().filter(|(name, _)| !name.contains('/')).count() + directories.iter().filter(|directory| !directory.contains('/')).count();
-    let index_reserve = (root_entries * 608).div_ceil(4096) * 8 + 8;
-    let bitmap_lcn = data_lcn + index_reserve;
-    // Resolve o tamanho do próprio bitmap; o último setor é o boot de reserva.
-    let free_sectors = free_space_mib * 1_048_576 / SECTOR;
-    let mut total_sectors = bitmap_lcn + free_sectors + 1;
+    // ---- registros
+    let mut records: Vec<(u64, u16, Vec<Attribute>)> = Vec::new();
+    // Filhos de cada diretório: (registro, chave $FILE_NAME).
+    let mut children: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    let system_file = |records: &mut Vec<(u64, u16, Vec<Attribute>)>, children: &mut BTreeMap<u64, Vec<(u64, Vec<u8>)>>, number: u64, parent: u64, name: &str, flags: u16, file_attributes: u32, data: (u64, u64), mut attributes: Vec<Attribute>| -> Result<(), String> {
+        let value = file_name_value(parent, name, file_attributes, data.0, data.1, 3)?;
+        children.entry(parent).or_default().push((number, value.clone()));
+        let mut list = vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(value)];
+        list.append(&mut attributes);
+        records.push((number, flags, list));
+        Ok(())
+    };
+    let bytes_of = |count: u64| count * CLUSTER as u64;
+    system_file(&mut records, &mut children, 1, ROOT, "$MFTMirr", IN_USE, HIDDEN_SYSTEM, (bytes_of(mirror_count), (MIRROR_RECORDS * RECORD_SIZE) as u64), vec![nonresident(0x80, "", vec![(Some(mirror_lcn), mirror_count)], (MIRROR_RECORDS * RECORD_SIZE) as u64)])?;
+    system_file(&mut records, &mut children, 2, ROOT, "$LogFile", IN_USE, HIDDEN_SYSTEM, (bytes_of(log_count), LOG_FILE_BYTES as u64), vec![nonresident(0x80, "", vec![(Some(log_lcn), log_count)], LOG_FILE_BYTES as u64)])?;
+    let mut volume_information = vec![0u8; 12];
+    volume_information[8] = 3;
+    volume_information[9] = 1;
+    system_file(&mut records, &mut children, 3, ROOT, "$Volume", IN_USE, HIDDEN_SYSTEM, (0, 0), vec![resident(0x60, "", utf16(VOLUME_LABEL)), resident(0x70, "", volume_information)])?;
+    system_file(&mut records, &mut children, 4, ROOT, "$AttrDef", IN_USE, HIDDEN_SYSTEM, (bytes_of(attrdef_count), attribute_table_length), vec![nonresident(0x80, "", vec![(Some(attrdef_lcn), attrdef_count)], attribute_table_length)])?;
+    system_file(&mut records, &mut children, 7, ROOT, "$Boot", IN_USE, HIDDEN_SYSTEM, (bytes_of(BOOT_CLUSTERS as u64), (BOOT_CLUSTERS * CLUSTER) as u64), vec![nonresident(0x80, "", vec![(Some(0), BOOT_CLUSTERS as u64)], (BOOT_CLUSTERS * CLUSTER) as u64)])?;
+    system_file(&mut records, &mut children, 10, ROOT, "$UpCase", IN_USE, HIDDEN_SYSTEM, (bytes_of(upcase_count), upcase_length), vec![nonresident(0x80, "", vec![(Some(upcase_lcn), upcase_count)], upcase_length)])?;
+    let sii = view_entry(&SECURITY_ID.to_le_bytes(), &header, &[]);
+    let sdh_key = [hash.to_le_bytes(), SECURITY_ID.to_le_bytes()].concat();
+    let sdh = view_entry(&sdh_key, &header, &[b'I', 0, b'I', 0]);
+    system_file(&mut records, &mut children, 9, ROOT, "$Secure", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![
+        nonresident(0x80, "$SDS", vec![(Some(sds_lcn), sds_count)], sds_length as u64),
+        resident(0x90, "$SDH", index_root_value(0, 0x12, &[sdh, end_entry(None)].concat(), false)),
+        resident(0x90, "$SII", index_root_value(0, 0x10, &[sii, end_entry(None)].concat(), false)),
+    ])?;
+    // Arquivos do $Extend: índices de visão vazios.
+    system_file(&mut records, &mut children, quota, EXTEND, "$Quota", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x11, &end_entry(None), false)), resident(0x90, "$Q", index_root_value(0, 0x10, &end_entry(None), false))])?;
+    system_file(&mut records, &mut children, object_id, EXTEND, "$ObjId", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x13, &end_entry(None), false))])?;
+    system_file(&mut records, &mut children, reparse, EXTEND, "$Reparse", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$R", index_root_value(0, 0x13, &end_entry(None), false))])?;
+    // Registros 12..15: reservados, em uso.
+    for number in 12..16 {
+        records.push((number, IN_USE, vec![standard_information(HIDDEN_SYSTEM), resident(0x80, "", Vec::new())]));
+    }
+    // HELLO.TXT e os arquivos extras.
+    let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, 1)?;
+    children.entry(ROOT).or_default().push((HELLO_RECORD, hello.clone()));
+    records.push((HELLO_RECORD, IN_USE, vec![standard_information(0), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
+    for (index, (name, blob)) in extras.iter().enumerate() {
+        let number = first_extra + index as u64;
+        let (parent_path, leaf) = split(name);
+        let parent = directory_record(&parent_path);
+        let (data, allocated) = match file_runs[index] {
+            Some((lcn, count)) => (nonresident(0x80, "", vec![(Some(lcn), count)], blob.len() as u64), count * CLUSTER as u64),
+            None => (resident(0x80, "", Vec::new()), 0),
+        };
+        let value = file_name_value(parent, &leaf, FILE_ARCHIVE, allocated, blob.len() as u64, 1)?;
+        children.entry(parent).or_default().push((number, value.clone()));
+        records.push((number, IN_USE, vec![standard_information(0), file_name_attribute(value), data]));
+    }
+    // Diretórios: o $FILE_NAME de cada um no pai; os índices depois.
+    let mut directory_names = Vec::new();
+    for directory in &directories {
+        let (parent_path, leaf) = split(directory);
+        let value = file_name_value(directory_record(&parent_path), &leaf, DIRECTORY_DUPLICATE, 0, 0, 1)?;
+        children.entry(directory_record(&parent_path)).or_default().push((directory_record(directory), value.clone()));
+        directory_names.push((directory_record(directory), value));
+    }
+    let root_name = file_name_value(ROOT, ".", DIRECTORY_DUPLICATE | HIDDEN_SYSTEM, 0, 0, 3)?;
+    let extend_name = file_name_value(ROOT, "$Extend", DIRECTORY_DUPLICATE | HIDDEN_SYSTEM, 0, 0, 3)?;
+    let mft_bytes = (mft_capacity * RECORD_SIZE) as u64;
+    let mft_name = file_name_value(ROOT, "$MFT", HIDDEN_SYSTEM, mft_bytes, mft_bytes, 3)?;
+    let badclus_name = file_name_value(ROOT, "$BadClus", HIDDEN_SYSTEM, 0, 0, 3)?;
+    // O $Bitmap entra na raiz com tamanhos provisórios: o comprimento da
+    // chave não depende deles, então o índice da raiz ocupa o mesmo espaço
+    // antes e depois de o volume ser dimensionado.
+    let bitmap_name = |allocated: u64, size: u64| file_name_value(ROOT, "$Bitmap", HIDDEN_SYSTEM, allocated, size, 3);
+    for (number, value) in [(ROOT, root_name.clone()), (EXTEND, extend_name.clone()), (0, mft_name.clone()), (6, bitmap_name(0, 0)?), (8, badclus_name.clone())] {
+        children.entry(ROOT).or_default().push((number, value));
+    }
+    // Entradas de índice em ordem de colação (maiúsculas, como o NT).
+    let sorted = |parent: u64, children: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>| -> Vec<(u64, Vec<u8>)> {
+        let mut listed = children.get(&parent).cloned().unwrap_or_default();
+        listed.sort_by_key(|(_, value)| {
+            let length = value[64] as usize;
+            String::from_utf16_lossy(&value[66..66 + length * 2].chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>()).to_uppercase()
+        });
+        listed
+    };
+    // ---- índices dos diretórios (residentes ou em blocos)
+    let index_room = |attributes: &[Attribute]| RECORD_SIZE - first_attribute_offset() - 8 - attributes_size(attributes) - 256;
+    let mut directory_records = Vec::new();
+    for (number, value) in &directory_names {
+        let base = vec![standard_information(0), file_name_attribute(value.clone())];
+        let index = directory_index(&sorted(*number, &children), index_room(&base), &mut clusters)?;
+        directory_records.push((*number, base, index));
+    }
+    let extend_base = vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(extend_name)];
+    let extend_index = directory_index(&sorted(EXTEND, &children), index_room(&extend_base), &mut clusters)?;
+    let root_base = vec![standard_information(0), file_name_attribute(root_name)];
+    let root_room = index_room(&root_base);
+    let index_start = clusters.next;
+    let provisional = directory_index(&sorted(ROOT, &children), root_room, &mut Clusters { next: index_start, writes: Vec::new() })?;
+    let index_end = index_start + provisional.iter().map(|attribute| match &attribute.body {
+        Body::NonResident(runs, _) => runs.iter().map(|&(_, count)| count as usize).sum(),
+        Body::Resident(..) => 0,
+    }).sum::<usize>();
+    // ---- tamanho do volume e do $Bitmap
+    let bitmap_lcn = index_end;
+    let free_clusters = free_space_mib * 1_048_576 / CLUSTER;
+    let mut volume_clusters = bitmap_lcn + free_clusters;
     let (bitmap_bytes, bitmap_clusters) = loop {
-        let bitmap_bytes = total_sectors.div_ceil(8);
+        let bitmap_bytes = volume_clusters.div_ceil(64) * 8;
         let bitmap_clusters = bitmap_bytes.div_ceil(CLUSTER);
-        let total = bitmap_lcn + bitmap_clusters + free_sectors + 1;
-        if total == total_sectors {
+        let total = bitmap_lcn + bitmap_clusters + free_clusters;
+        if total == volume_clusters {
             break (bitmap_bytes, bitmap_clusters);
         }
-        total_sectors = total;
+        volume_clusters = total;
     };
+    let bitmap_value = bitmap_name((bitmap_clusters * CLUSTER) as u64, bitmap_bytes as u64)?;
+    if let Some(entry) = children.get_mut(&ROOT).and_then(|listed| listed.iter_mut().find(|(number, _)| *number == 6)) {
+        entry.1 = bitmap_value.clone();
+    }
+    let root_index = directory_index(&sorted(ROOT, &children), root_room, &mut clusters)?;
+    if clusters.next != index_end {
+        return Err("indice da raiz mudou de tamanho".into());
+    }
+    let volume_bytes = (volume_clusters * CLUSTER) as u64;
+    let total_sectors = volume_clusters + 1;
+    // ---- registros que dependem do tamanho do volume
+    records.push((0, IN_USE, vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(mft_name), nonresident(0x80, "", vec![(Some(MFT_LCN as u64), mft_clusters as u64)], mft_bytes), nonresident(0xB0, "", vec![(Some(mft_bitmap_lcn), mft_bitmap_count)], mft_bitmap_length)]));
+    records.push((6, IN_USE, vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(bitmap_value), nonresident(0x80, "", vec![(Some(bitmap_lcn as u64), bitmap_clusters as u64)], bitmap_bytes as u64)]));
+    records.push((8, IN_USE, vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(badclus_name), resident(0x80, "", Vec::new()), nonresident(0x80, "$Bad", vec![(None, volume_clusters as u64)], volume_bytes)]));
+    let mut root_attributes = root_base;
+    root_attributes.extend(root_index);
+    records.push((ROOT, DIRECTORY, root_attributes));
+    let mut extend_attributes = extend_base;
+    extend_attributes.extend(extend_index);
+    records.push((EXTEND, DIRECTORY, extend_attributes));
+    for (number, mut base, index) in directory_records {
+        base.extend(index);
+        records.push((number, DIRECTORY, base));
+    }
+    // ---- imagem
     let mut image = vec![0u8; total_sectors * SECTOR];
-    // ---- setor de boot
     let mut boot = vec![0u8; SECTOR];
     boot[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
     boot[3..11].copy_from_slice(b"NTFS    ");
     put16(&mut boot, 11, SECTOR as u16);
-    boot[13] = 1; // setores por cluster
-    put64(&mut boot, 40, total_sectors as u64);
-    put64(&mut boot, 48, MFT_LCN as u64);
-    put64(&mut boot, 56, mirror_lcn as u64);
-    boot[64] = (-14i8) as u8; // registro = 2^14
-    boot[68] = (-12i8) as u8; // bloco de índice = 4096
-    put64(&mut boot, 72, u64::from_le_bytes(*b"OPENNT!!")); // número de série
+    boot[13] = (CLUSTER / SECTOR) as u8;
+    boot[0x15] = 0xF8; // disco fixo
+    put16(&mut boot, 0x18, 63);
+    put16(&mut boot, 0x1A, 255);
+    put32(&mut boot, 0x24, 0x0080_0080);
+    put64(&mut boot, 0x28, volume_clusters as u64 * (CLUSTER / SECTOR) as u64);
+    put64(&mut boot, 0x30, MFT_LCN as u64);
+    put64(&mut boot, 0x38, mirror_lcn);
+    boot[0x40] = (-12i8) as u8; // registro = 2^12
+    boot[0x44] = (INDEX_BLOCK / CLUSTER) as u8;
+    put64(&mut boot, 0x48, u64::from_le_bytes(*b"OPENNT!!"));
     boot[510] = 0x55;
     boot[511] = 0xAA;
-    image[0..SECTOR].copy_from_slice(&boot);
+    image[..SECTOR].copy_from_slice(&boot);
     let last = image.len() - SECTOR;
     image[last..].copy_from_slice(&boot);
-    let standard_information = attribute_resident(0x10, &[0; 72], 0);
-    // ---- $MFT (registro 0)
-    let mft_runlist = runlist_bytes(&[(MFT_LCN as i64, mft_clusters as u64)]);
-    let mft_self = make_record(0, 1, &[
-        standard_information.clone(),
-        file_name_attribute(5, "$MFT", false, 0)?,
-        attribute_nonresident(0x80, &mft_runlist, (mft_capacity * RECORD_SIZE) as u64, 0),
-        attribute_resident(0xB0, &low_bits(record_count, mft_capacity.div_ceil(8)), 0),
-    ])?;
-    let mft_offset = MFT_LCN * CLUSTER;
-    image[mft_offset..mft_offset + RECORD_SIZE].copy_from_slice(&mft_self);
-    // (número, flags, atributos): 1 = em uso, 3 = em uso e diretório.
-    let mut records: Vec<(u32, u16, Vec<Vec<u8>>)> = vec![
-        (1, 1, vec![standard_information.clone(), file_name_attribute(5, "$MFTMirr", false, 0)?, attribute_nonresident(0x80, &runlist_bytes(&[(mirror_lcn as i64, (4 * SECTORS_PER_RECORD) as u64)]), (4 * RECORD_SIZE) as u64, 0)]),
-        (2, 1, vec![standard_information.clone(), file_name_attribute(5, "$LogFile", false, 0)?]),
-        (3, 1, vec![standard_information.clone(), file_name_attribute(5, "$Volume", false, 0)?, attribute_resident(0x60, &utf16(VOLUME_LABEL), 0), attribute_resident(0x70, &[0; 12], 0)]),
-        (4, 1, vec![standard_information.clone(), file_name_attribute(5, "$AttrDef", false, 0)?]),
-        (16, 1, vec![standard_information.clone(), file_name_attribute(5, HELLO_NAME, false, HELLO_DATA.len() as u64)?, attribute_resident(0x80, HELLO_DATA, 0)]),
-    ];
-    // Filhos de cada diretório: (registro, nome, tamanho, diretório).
-    let mut children: BTreeMap<u64, Vec<(u64, String, u64, bool)>> = BTreeMap::new();
-    children.entry(5).or_default().push((16, HELLO_NAME.to_string(), HELLO_DATA.len() as u64, false));
-    for (index, (name, blob)) in extras.iter().enumerate() {
-        let number = (17 + index) as u32;
-        let (lcn, count) = file_runs[index];
-        let (parent_path, leaf) = split(name);
-        let parent = directory_record(&parent_path);
-        let data = if blob.is_empty() { attribute_resident(0x80, &[], 0) } else { attribute_nonresident(0x80, &runlist_bytes(&[(lcn as i64, count as u64)]), blob.len() as u64, 0) };
-        records.push((number, 1, vec![standard_information.clone(), file_name_attribute(parent, &leaf, false, blob.len() as u64)?, data]));
-        image[lcn * CLUSTER..lcn * CLUSTER + blob.len()].copy_from_slice(blob);
-        children.entry(parent).or_default().push((number as u64, leaf, blob.len() as u64, false));
+    for (lcn, bytes) in &clusters.writes {
+        image[lcn * CLUSTER..lcn * CLUSTER + bytes.len()].copy_from_slice(bytes);
     }
-    for directory in &directories {
-        let (parent_path, leaf) = split(directory);
-        children.entry(directory_record(&parent_path)).or_default().push((directory_record(directory), leaf, 0, true));
-    }
-    // Entradas de índice de um diretório em ordem alfabética (como o NT).
-    let index_keys_of = |parent: u64| -> Result<Vec<Vec<u8>>, String> {
-        let mut listed = children.get(&parent).cloned().unwrap_or_default();
-        listed.sort_by_key(|(_, name, _, _)| name.to_uppercase());
-        let mut keys = Vec::new();
-        for (number, name, size, directory) in &listed {
-            let value = file_name_value(parent, name, *directory, *size)?;
-            let entry_size = (16 + value.len() + 7) & !7;
-            let mut entry = vec![0u8; entry_size];
-            put64(&mut entry, 0, *number);
-            put16(&mut entry, 8, entry_size as u16);
-            put16(&mut entry, 10, value.len() as u16);
-            entry[16..16 + value.len()].copy_from_slice(&value);
-            keys.push(entry);
-        }
-        Ok(keys)
-    };
-    let mut last_entry = vec![0u8; 16];
-    put16(&mut last_entry, 8, 16);
-    put16(&mut last_entry, 12, 2); // última
-    let resident_index_root = |entries: &[u8], large: bool| -> Vec<u8> {
-        let mut index_root = vec![0u8; 32 + entries.len()];
-        put32(&mut index_root, 0, 0x30); // indexa $FILE_NAME
-        put32(&mut index_root, 4, 1); // collation FILENAME
-        put32(&mut index_root, 8, 4096);
-        index_root[12] = (4096 / CLUSTER) as u8;
-        put32(&mut index_root, 16, 16);
-        put32(&mut index_root, 20, (16 + entries.len()) as u32);
-        put32(&mut index_root, 24, (16 + entries.len()) as u32);
-        put32(&mut index_root, 28, large as u32);
-        index_root[32..].copy_from_slice(entries);
-        index_root
-    };
-    // ---- subdiretórios: índice residente
-    for directory in &directories {
-        let number = directory_record(directory);
-        let (parent_path, leaf) = split(directory);
-        let entries = [index_keys_of(number)?.concat(), last_entry.clone()].concat();
-        if entries.len() + 512 > RECORD_SIZE {
-            return Err(format!("diretorio NTFS grande demais para indice residente: {directory}"));
-        }
-        records.push((number as u32, 3, vec![standard_information.clone(), file_name_attribute(directory_record(&parent_path), &leaf, true, 0)?, attribute_resident(0x90, &resident_index_root(&entries, false), 0)]));
-    }
-    // ---- $INDEX_ROOT da raiz
-    let index_keys = index_keys_of(5)?;
-    let index_entries = index_keys.concat();
-    let mut entries = [index_entries, last_entry.clone()].concat();
-    let mut index_attributes = Vec::new();
-    let large_index = entries.len() + 512 > RECORD_SIZE;
-    let mut allocation_length = 0;
-    if large_index {
-        // B-tree de dois níveis: cada separador sai da folha anterior e vai
-        // para o INDEX_ROOT com o VCN do filho.
-        let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
-        let mut group = Vec::new();
-        let mut used = 0;
-        for key in index_keys {
-            if used + key.len() + 16 > 4096 - 64 {
-                groups.push(std::mem::take(&mut group));
-                used = 0;
-            }
-            used += key.len();
-            group.push(key);
-        }
-        if !group.is_empty() {
-            groups.push(group);
-        }
-        let group_count = groups.len();
-        let mut root_keys = Vec::new();
-        let mut blocks = Vec::new();
-        for (number, mut group) in groups.into_iter().enumerate() {
-            let vcn = (number * (4096 / CLUSTER)) as u64;
-            let separator = if number + 1 < group_count {
-                let mut separator = group.pop().unwrap_or_default();
-                separator.extend_from_slice(&vcn.to_le_bytes());
-                let length = separator.len() as u16;
-                put16(&mut separator, 8, length);
-                put16(&mut separator, 12, 1);
-                separator
-            } else {
-                let mut separator = vec![0u8; 24];
-                put16(&mut separator, 8, 24);
-                put16(&mut separator, 12, 3);
-                put64(&mut separator, 16, vcn);
-                separator
-            };
-            root_keys.push(separator);
-            let leaf = [group.concat(), last_entry.clone()].concat();
-            let mut block = vec![0u8; 4096];
-            block[..4].copy_from_slice(b"INDX");
-            put16(&mut block, 4, 40);
-            put16(&mut block, 6, 9);
-            put64(&mut block, 16, vcn);
-            put32(&mut block, 24, 40);
-            put32(&mut block, 28, (40 + leaf.len()) as u32);
-            put32(&mut block, 32, (4096 - 24) as u32);
-            block[64..64 + leaf.len()].copy_from_slice(&leaf);
-            put16(&mut block, 40, 1);
-            for sector in 1..9 {
-                let tail = sector * 512 - 2;
-                let original = [block[tail], block[tail + 1]];
-                block[40 + sector * 2..42 + sector * 2].copy_from_slice(&original);
-                put16(&mut block, tail, 1);
-            }
-            blocks.push(block);
-        }
-        let allocation = blocks.concat();
-        if allocation.len() > index_reserve * CLUSTER {
-            return Err("reserva do indice excedida".into());
-        }
-        allocation_length = allocation.len();
-        image[index_lcn * CLUSTER..index_lcn * CLUSTER + allocation.len()].copy_from_slice(&allocation);
-        index_attributes.push(attribute_nonresident(0xA0, &runlist_bytes(&[(index_lcn as i64, (allocation.len() / CLUSTER) as u64)]), allocation.len() as u64, 3));
-        index_attributes.push(attribute_resident(0xB0, &low_bits(blocks.len(), blocks.len().div_ceil(8)), 4));
-        entries = root_keys.concat();
-    }
-    let index_root = resident_index_root(&entries, large_index);
-    let mut root = vec![standard_information.clone(), file_name_attribute(5, ".", true, 0)?, attribute_resident(0x90, &index_root, 0)];
-    root.extend(index_attributes);
-    records.push((5, 3, root));
-    // ---- $Bitmap
+    // $Bitmap: todo o espaço até o fim dos índices, o próprio bitmap e os
+    // bits além do último cluster.
     let mut bitmap = vec![0u8; bitmap_bytes];
     let mut mark_used = |start: usize, count: usize| {
         for cluster in start..start + count {
             bitmap[cluster / 8] |= 1 << (cluster % 8);
         }
     };
-    mark_used(0, index_lcn); // boot, MFT, espelho e arquivos embutidos
-    if large_index {
-        mark_used(index_lcn, allocation_length / CLUSTER);
-    }
+    mark_used(0, index_end);
     mark_used(bitmap_lcn, bitmap_clusters);
-    mark_used(total_sectors - 1, bitmap_bytes * 8 - total_sectors + 1);
-    records.push((6, 1, vec![standard_information.clone(), file_name_attribute(5, "$Bitmap", false, bitmap_bytes as u64)?, attribute_nonresident(0x80, &runlist_bytes(&[(bitmap_lcn as i64, bitmap_clusters as u64)]), bitmap_bytes as u64, 0)]));
+    mark_used(volume_clusters, bitmap_bytes * 8 - volume_clusters);
     image[bitmap_lcn * CLUSTER..bitmap_lcn * CLUSTER + bitmap.len()].copy_from_slice(&bitmap);
+    let mft_offset = MFT_LCN * CLUSTER;
     for (number, flags, attributes) in &records {
         let at = mft_offset + *number as usize * RECORD_SIZE;
         image[at..at + RECORD_SIZE].copy_from_slice(&make_record(*number, *flags, attributes)?);
     }
-    let mirror = image[mft_offset..mft_offset + 4 * RECORD_SIZE].to_vec();
-    image[mirror_lcn * CLUSTER..mirror_lcn * CLUSTER + mirror.len()].copy_from_slice(&mirror);
+    let mirror = image[mft_offset..mft_offset + MIRROR_RECORDS * RECORD_SIZE].to_vec();
+    let mirror_offset = mirror_lcn as usize * CLUSTER;
+    image[mirror_offset..mirror_offset + mirror.len()].copy_from_slice(&mirror);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }

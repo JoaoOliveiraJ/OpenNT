@@ -85,8 +85,9 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
-    // O ntfs.sys real (`--start-driver=ntfs`) e o catálogo que o cobre, o
-    // mesmo do null.sys, do fs_rec.sys e do ksecpkg.sys.
+    // O ntfs.sys real (`--start-driver=ntfs`); o catálogo 0516 abaixo o
+    // cobre, e também o null.sys, o fs_rec.sys, o ksecpkg.sys, o clfs.sys e
+    // o fltmgr.sys.
     ("NTFS.SYS", "System32/drivers/ntfs.sys"),
     // KMDF: a WdfLdr.sys (biblioteca de import dos clientes), o runtime
     // Wdf01000.sys (carregado pela WdfLdr pela chave do serviço) e a
@@ -118,6 +119,21 @@ const NTFS_FILES: &[(&str, &str)] = &[
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0511~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0511~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    // Os módulos que os file systems importam: o clfs.sys (pelo
+    // ext-ms-win-fs-clfs, só o ntfs.sys) e o clipsp.sys (pelo
+    // ext-ms-win-ntos-clipsp), com o catálogo próprio do clipsp.sys.
+    ("CLFS.SYS", "System32/drivers/clfs.sys"),
+    ("CLIPSP.SYS", "System32/drivers/clipsp.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Shared-814DB60DB621E2916AD769AF5F228BED19224212D92876A292990439227807A6~31bf3856ad364e35~amd64~~10.0.19041.7664.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Shared-814DB60DB621E2916AD769AF5F228BED19224212D92876A292990439227807A6~31bf3856ad364e35~amd64~~10.0.19041.7664.cat",
+    ),
+    // O fastfat.sys real (`--start-driver=fastfat`) e o catálogo que o cobre.
+    ("FASTFAT.SYS", "System32/drivers/fastfat.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),

@@ -68,7 +68,12 @@ pub fn after_driver_start(name: &str) {
     if service_type(name) != 2 {
         return;
     }
-    match mount_and_read() {
+    // Com `--trace-driver-api`, as APIs que o file system chama na montagem
+    // também vão para a serial.
+    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::TRACE_DRIVER_API);
+    let result = mount_and_read();
+    crate::ntos::init::exports::set_api_trace(false);
+    match result {
         Ok(()) => debug_print!("FILE_SYSTEM_MOUNT_OK name={}", name),
         Err(message) => debug_print!("FILE_SYSTEM_MOUNT_FALHOU name={}: {}", name, message),
     }

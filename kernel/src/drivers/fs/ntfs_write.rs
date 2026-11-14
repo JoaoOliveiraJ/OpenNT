@@ -18,6 +18,9 @@ use crate::rtl::{KernelError, SpinLock};
 struct Allocation {
     bits: Vec<u8>,
     records: Vec<u8>,
+    /// Runs do $BITMAP do $MFT quando não residente (como o NTFS o grava);
+    /// `None` = residente no registro 0.
+    record_runs: Option<Vec<Run>>,
     capacity: u64,
     clusters: u64,
     bitmap_runs: Vec<Run>,
@@ -288,12 +291,17 @@ impl Tx<'_> {
         let (Some(data), Some(mft_bitmap), Some(bitmap_data)) = (data, mft_bitmap, bitmap_data) else {
             return fail(0xC000_00A2, "volume sem metadados de alocacao gravaveis");
         };
-        if !data.non_resident || mft_bitmap.non_resident || !bitmap_data.non_resident || geometry.total_sectors == 0 || geometry.mirror_lcn == 0 {
+        if !data.non_resident || !bitmap_data.non_resident || geometry.total_sectors == 0 || geometry.mirror_lcn == 0 {
             return fail(0xC000_00A2, "volume sem metadados de alocacao gravaveis");
         }
+        let (records, record_runs) = if mft_bitmap.non_resident {
+            (self.volume.read_data(&mft, 0xB0)?, Some(parse_runs(&mft, mft_bitmap.run_offset)?))
+        } else {
+            (mft_bitmap.value, None)
+        };
         let runs = parse_runs(&mft, data.run_offset)?;
         let capacity = data.real_size / geometry.record_size;
-        if runs.len() != 1 || runs[0].lcn as u64 != geometry.mft_lcn || data.real_size % geometry.record_size != 0 || capacity > mft_bitmap.value.len() as u64 * 8 {
+        if runs.len() != 1 || runs[0].lcn as u64 != geometry.mft_lcn || data.real_size % geometry.record_size != 0 || capacity > records.len() as u64 * 8 {
             return fail(0xC000_00BB, "MFT fragmentada ou bitmap invalido");
         }
         let bits = self.volume.read_data(&bitmap_record, 0x80)?;
@@ -301,7 +309,7 @@ impl Tx<'_> {
         if (bits.len() as u64) * 8 < clusters {
             return fail(0xC000_0032, "$Bitmap incompleto");
         }
-        self.state.allocation = Some(Allocation { bits, records: mft_bitmap.value, capacity, clusters, bitmap_runs: parse_runs(&bitmap_record, bitmap_data.run_offset)? });
+        self.state.allocation = Some(Allocation { bits, records, record_runs, capacity, clusters, bitmap_runs: parse_runs(&bitmap_record, bitmap_data.run_offset)? });
         self.state.allocation_generation = Some(self.volume.generation());
         Ok(())
     }
@@ -424,10 +432,14 @@ impl Tx<'_> {
             let tx = self.state.tx.clone().expect("transacao ativa");
             self.persist_bitmap(&allocation.bits, &tx.bits, &tx.bitmap_runs)?;
             if tx.records != allocation.records {
-                let mft = self.volume.read_record(0)?;
-                let mut list = attributes(&mft)?;
-                replace(&mut list, 0xB0, Some(resident(0xB0, &tx.records, "")));
-                self.record(0, &list, 1, Some(&mft), 1)?;
+                if let Some(runs) = &tx.record_runs {
+                    self.persist_bitmap(&allocation.records, &tx.records, runs)?;
+                } else {
+                    let mft = self.volume.read_record(0)?;
+                    let mut list = attributes(&mft)?;
+                    replace(&mut list, 0xB0, Some(resident(0xB0, &tx.records, "")));
+                    self.record(0, &list, 1, Some(&mft), 1)?;
+                }
             }
             committing = true;
             let pending = core::mem::take(&mut *self.volume.pending.lock());

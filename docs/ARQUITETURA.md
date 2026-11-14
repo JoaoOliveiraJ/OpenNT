@@ -1325,13 +1325,47 @@ discos. Sem a opção nada disso roda.
     exposto pelo driver ATA do kernel como `\Device\AtaVolume1` (DEVICE_OBJECT
     nativo respondido pelo próprio kernel, com VPB, DO_DIRECT_IO, geometria
     do IDENTIFY DEVICE e os IOCTLs de disco, armazenamento e mount manager
-    da montagem). O leitor NTFS do kernel continua dono do disco como D:,
+    da montagem; o DRIVER_OBJECT `\Driver\AtaVolume` tem a mesma rotina em
+    cada IRP_MJ_*, porque um file system pode chamar o MajorFunction do
+    dispositivo alvo sem o IofCallDriver). O leitor NTFS do kernel continua dono do disco como D:,
     então as escritas do file system ficam numa sobreposição em memória por
     página de 4 KB, que as leituras do volume aplicam; o disco não muda.
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois
-    file systems sintéticos.
+    file systems sintéticos. Com `--trace-driver-api`, as APIs chamadas na
+    montagem também vão para a serial.
+  - O volume é um NTFS 3.1 completo (`xtask/src/ntfs_image.rs`): registros
+    de arquivo de 4 KB, os arquivos de metadados 0..11 com o número de
+    sequência do NTFS ($MFT com o $BITMAP não residente, que a montagem
+    pré-carrega, $MFTMirr, $LogFile de 2 MB com as páginas em
+    0xFF — um log novo, que o LFS inicializa —, $Volume 3.1, $AttrDef com a
+    tabela do ntfs.sys, $Bitmap, $Boot, $BadClus com o $Bad esparso,
+    $Secure com um descritor no $SDS e os índices $SDH/$SII, $UpCase pelo
+    RtlUpcaseUnicodeChar, $Extend; 12..15 reservados), $Quota, $ObjId e
+    $Reparse depois dos registros de usuário (o NTFS só aceita uma entrada de
+    índice que aponte um registro abaixo de 16 na raiz), os índices $I30 nomeados e em B-tree quando não cabem no
+    registro, e a cópia do setor de boot no último setor, fora do volume.
+    O leitor do kernel lê o mesmo volume; a listagem dele esconde os
+    registros abaixo de 16, como a enumeração do NTFS.
+  - O ntfs.sys importa o clfs.sys (pelo ext-ms-win-fs-clfs) e o clipsp.sys
+    (pelo ext-ms-win-ntos-clipsp, que importa o fltmgr.sys): o carregador os
+    resolve como dependências, do volume e validados pelo Code Integrity
+    com os catálogos achados pelo hash da imagem no CatRoot. O clfs.sys e o
+    fltmgr.sys sobem pelo DriverEntry (drivers de boot no Windows) e o
+    clipsp.sys pelo DllInitialize. O volume ATA responde o
+    IOCTL_MOUNTDEV_QUERY_STABLE_GUID, que o FsRtlVolumeDeviceToCorrelationId
+    pede na montagem.
+  - O CDO do ntfs.sys é \Ntfs, na raiz do namespace; como o volume do
+    kernel está montado em \NTFS (nomes sem diferença de caixa), o
+    IoCreateDevice do DriverEntry hoje devolve STATUS_OBJECT_NAME_COLLISION.
+    Com o CDO criado, a montagem pelo ntfs.sys real percorre o NtfsMountVolume inteiro
+    (reinício do LFS, checkpoint, $Secure, $Extend, $UpCase) e para na
+    limpeza final: sem o lazy writer, o último CcUninitializeCacheMap apaga
+    o cache map na hora e solta a referência do stream file, então o
+    IRP_MJ_CLOSE chega dentro do NtfsDeleteInternalAttributeStream (no
+    Windows ele vem depois, do lazy writer) e o NtfsMountVolume usa o SCB
+    já liberado.
 - **Cadeia smss -> csrss real** (`--initial-process=smss`,
   `init/boot_config.rs::SMSS_BOOT`): o primeiro processo de usuário é o
   `\SystemRoot\System32\smss.exe` real (`init/initial_process.rs`), criado

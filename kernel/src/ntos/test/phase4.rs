@@ -509,7 +509,7 @@ fn ntfs_reader(assert: Assert) {
         return;
     };
     let geometry = volume.geometry;
-    assert(geometry.sector_size == 512 && geometry.sectors_per_cluster == 1 && geometry.mft_lcn == 4 && geometry.record_size == 16384 && geometry.total_sectors * 512 >= 42_030_080, "ntfs: geometria do boot sector (o volume vazio ocupa 42030080 bytes; os arquivos extras do build aumentam)");
+    assert(geometry.sector_size == 512 && geometry.sectors_per_cluster == 1 && geometry.mft_lcn == 16 && geometry.record_size == 4096 && geometry.total_sectors * 512 >= 38_179_840, "ntfs: geometria do boot sector (o volume vazio ocupa 38179840 bytes; os arquivos extras do build aumentam)");
     assert(volume.volume_information().is_ok_and(|info| info.label == "OPENNT" && info.serial == u32::from_le_bytes(*b"OPEN") && info.file_system == "NTFS" && info.maximum_component_length == 255), "ntfs: $Volume com rotulo e numero de serie");
     assert(matches!(volume.list("/"), Ok(Some(names)) if boot_root(&names)), "ntfs: indice da raiz (HELLO.TXT e os binarios extras do build)");
     assert(matches!(volume.exists("/hello.txt"), Ok(true)) && matches!(volume.exists("/NADA.TXT"), Ok(false)) && volume.find("/../HELLO.TXT").is_err(), "ntfs: busca sem diferenca de caixa e caminho nao canonico recusado");
@@ -519,10 +519,15 @@ fn ntfs_reader(assert: Assert) {
     // Registros de sistema não residentes ($MFT e $Bitmap).
     let mft = volume.read_record(0).unwrap_or_default();
     let runs = ntfs::find_attribute(&mft, 0x80).ok().flatten().and_then(|data| ntfs::parse_runs(&mft, data.run_offset).ok());
-    assert(runs == Some(alloc::vec![ntfs::Run { lcn: 4, count: 16384 }]), "ntfs: runlist da $MFT");
+    // 512 registros de 4 KB no LCN 16; o $BITMAP do $MFT não residente.
+    assert(runs == Some(alloc::vec![ntfs::Run { lcn: 16, count: 4096 }]), "ntfs: runlist da $MFT");
+    let records = volume.read_data(&mft, 0xB0).unwrap_or_default();
+    assert(ntfs::find_attribute(&mft, 0xB0).ok().flatten().is_some_and(|attribute| attribute.non_resident) && records.len() == 64 && records[0] == 0xFF && records[1] == 0xFF, "ntfs: $BITMAP do $MFT nao residente com os registros do sistema em uso");
     let bitmap_record = volume.read_record(6).unwrap_or_default();
     let bitmap = volume.read_data(&bitmap_record, 0x80).unwrap_or_default();
-    assert(bitmap.len() as u64 == geometry.total_sectors.div_ceil(8) && bitmap[0] == 0xFF && bitmap[bitmap.len() - 1] & 0x80 != 0, "ntfs: $Bitmap nao residente lido pela runlist");
+    // Múltiplo de 8 bytes, com os bits além do último cluster em uso.
+    let padding_used = (geometry.total_sectors..bitmap.len() as u64 * 8).all(|cluster| bitmap[(cluster / 8) as usize] & (1 << (cluster % 8)) != 0);
+    assert(bitmap.len() as u64 == geometry.total_sectors.div_ceil(64) * 8 && bitmap[0] == 0xFF && padding_used, "ntfs: $Bitmap nao residente lido pela runlist");
     assert(volume.root_index(16).is_err_and(|error| error.status == 0xC000_0103), "ntfs: arquivo nao e diretorio");
     // Escritas pendentes sobrepostas às leituras.
     volume.pending.lock().push(PendingWrite { lba: 0, count: 1, bytes: None });
@@ -596,9 +601,10 @@ fn ntfs_writer(assert: Assert) {
     let initial = volume.space().map(|space| space.free_clusters).unwrap_or(0);
     assert(volume.space().is_ok_and(|space| space.clusters == volume.geometry.total_sectors && space.free_clusters > 60_000 && space.cluster_size == 512), "ntfswrite: espaco pelo $Bitmap");
     // Criação e escrita residente: o primeiro registro livre vem depois do
-    // HELLO.TXT (16) e de cada arquivo e diretório extra do build.
+    // HELLO.TXT (16), de cada arquivo e diretório extra do build e dos três
+    // arquivos do $Extend.
     let before = names(&volume, "/");
-    let first_free = 16 + tree_entries(&volume, "/");
+    let first_free = 16 + tree_entries(&volume, "/") + 3;
     let created = volume.create("/NOVO.TXT", false, 0, 0);
     assert(matches!(&created, Ok(Some(stat)) if stat.reference == first_free && stat.size == 0 && !stat.directory), "ntfswrite: arquivo criado no primeiro registro livre");
     let mut expected = before.clone();
@@ -657,7 +663,7 @@ fn fs_volume_queries(assert: Assert) {
     let data = control(0x9_0064, 96);
     let field = |at: usize, count: usize| data.bytes[at..at + count].iter().rev().fold(0u64, |value, &byte| value << 8 | byte as u64);
     let geometry = volume.geometry;
-    assert(data.status == 0 && data.information == 96 && field(0, 8) == geometry.serial && field(8, 8) == geometry.total_sectors && field(16, 8) == geometry.total_sectors && field(40, 4) == 512 && field(48, 4) == 16384 && field(52, 4) == 32 && field(64, 8) == 4 && field(72, 8) == geometry.mirror_lcn && field(88, 8) == 4 + 16384, "ntfsctl: NTFS_VOLUME_DATA_BUFFER");
+    assert(data.status == 0 && data.information == 96 && field(0, 8) == geometry.serial && field(8, 8) == geometry.total_sectors && field(16, 8) == geometry.total_sectors && field(40, 4) == 512 && field(48, 4) == 4096 && field(52, 4) == 8 && field(64, 8) == 16 && field(72, 8) == geometry.mirror_lcn && field(88, 8) == 16 + 4096, "ntfsctl: NTFS_VOLUME_DATA_BUFFER");
     assert(control(0x9_0064, 100).information == 100 && control(0x9_0064, 104).information == 104 && control(0x9_0064, 95).status == 0xC000_0023, "ntfsctl: extensao NTFS_EXTENDED_VOLUME_DATA e buffer curto");
     // FileFsXxxInformation.
     let query = |class: u32, length: u32| info::query(Some(&*volume as &dyn info::VolumeQuery), class, length).unwrap_or(info::QueryResult { status: 1, information: 0, bytes: alloc::vec::Vec::new() });

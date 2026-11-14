@@ -21,6 +21,8 @@ use crate::hal::physical;
 use crate::rtl::{KernelError, SharedLock, SpinLock};
 
 const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+/// Primeiro registro de arquivo de usuário (os anteriores são do sistema).
+const FIRST_USER_RECORD: u64 = 16;
 
 pub fn u16_at(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -632,7 +634,9 @@ impl Ntfs {
         let _shared = self.resource().acquire_shared();
         let Some(entry) = self.find(path)? else { return Ok(None) };
         let prefix = path.trim_end_matches('/');
-        Ok(Some(self.root_index(entry.reference)?.into_iter().map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
+        // Como na enumeração do NTFS, os arquivos de metadados (registros
+        // abaixo de 16: $MFT, '.', $Extend...) não aparecem na listagem.
+        Ok(Some(self.root_index(entry.reference)?.into_iter().filter(|child| child.reference >= FIRST_USER_RECORD).map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
     }
 
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, KernelError> {
