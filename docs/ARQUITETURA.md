@@ -238,11 +238,12 @@ pertence só aos processos:
 | --- | --- | --- |
 | 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
-| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
+| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, VAs globais das sessões (0xFFFFA006_80000000), pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
 | 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
 | 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, a **imagem do kernel** (0xFFFFF800_40000000), a pilha de boot (topo em 0xFFFFF800_41200000) e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
+| 0xFFFFF900_00000000 | 498 | **espaço de sessão**: tabela de topo própria de cada sessão (vazio na raiz do System e dos processos sem sessão); SessionCore, VA dinâmica (pool de sessão) e imagens de sessão |
 
 **Imagem do kernel.** O ntoskrnl é ligado na sua VA de sistema, como no NT:
 a ImageBase do PE é `KERNEL_VIRTUAL_BASE` = 0xFFFFF800_40000000 (cabeçalhos
@@ -676,7 +677,8 @@ PML4:
   `mm/process_address_space.rs::prepare_system_space` pré-aloca a PDPT de
   toda entrada de sistema da PML4 do boot que ainda falta e congela a metade
   (`paging::freeze_kernel_half`). [256] é a auto-referência e [257..512)
-  apontam para PDPTs de supervisor (cerca de 1 MB do PFN).
+  apontam para PDPTs de supervisor (cerca de 1 MB do PFN), menos o slot de
+  sessão [498], que fica vazio (veja o espaço de sessão).
 - As PDPTs entram no conjunto `permanent` de `paging.rs`: nunca voltam ao
   PFN, nem quando a última página do slot é desfeita.
 - Depois do congelamento, criar ou alterar uma entrada de sistema da PML4 é
@@ -685,7 +687,8 @@ PML4:
   depois só muda os níveis de baixo, em tabelas compartilhadas.
 - Por isso uma raiz nova (`process_address_space::create_root`) copia
   PML4[257..512) uma única vez e fica coerente para sempre. Ela ganha a
-  própria auto-referência em [256] e começa com a metade de usuário vazia.
+  própria auto-referência em [256] e começa com a metade de usuário e o slot
+  de sessão vazios.
   `delete_root` só a devolve ao PFN depois de desfeita a metade de usuário.
 - Toda operação de `paging.rs` (query, translate, find, access, map, unmap,
   split, páginas de 2 MB) tem a forma `*_in(root, ...)`, que anda a partir
@@ -788,6 +791,80 @@ que a raiz do System não vê; a ntdll em cópias privadas na mesma VA. Depois
 os dois rodam um depois do outro (`run_created`) com os próprios códigos de
 saída, e no fim as raízes ficam só com a KUSER, voltam no último
 dereference e o PFN livre volta ao de antes.
+
+**Espaço de sessão** (`mm/session.rs`, `mm/session_pool.rs`,
+`mm/session_image.rs`). Como no Windows 10 19041 x64, o espaço de sessão é
+um slot inteiro da PML4 (512 GB, `memory_map::SESSION_SPACE_PML4_INDEX` =
+498, o MM_SESSION_SPACE_DEFAULT clássico; o 19041 sorteia o slot e as faixas
+dentro dele) que não é compartilhado entre as raízes:
+
+- **Por sessão.** Cada sessão tem a própria tabela de topo (a PDPT do slot:
+  MM_SESSION_SPACE.SessionPageDirectoryIndex é o PFN dela e PageDirectory é
+  a entrada da PML4 que a aponta). A raiz de cada processo da sessão recebe
+  essa entrada (`paging::set_session_top_level`, o MiSessionAddProcess) e a
+  perde quando o processo sai (o MiDeleteTopLevelSessionMapping); a raiz do
+  System e a de quem não tem sessão deixam o slot vazio. Como a PML4 é por
+  processo, a troca de raiz na troca de thread e no attach já troca o
+  espaço de sessão, sem passo a mais no `context_switch`; uma VA de sessão
+  tocada fora de uma sessão (ou num AP, que fica na raiz do System) falta,
+  como no NT. MmIsSessionAddress é o tipo do slot (MiVaSessionSpace). O
+  rastreador de frames segue de cada raiz de processo só a metade de
+  usuário e a auto-referência, então as tabelas e folhas de sessão ficam
+  fora dele (sem PteAddress no banco nativo de PFNs).
+- **Faixas** (`memory_map.rs`): SessionCore em +0 (o MM_SESSION_SPACE, 5
+  páginas, na mesma VA em toda sessão), a VA dinâmica em +1 GB (128 GB: o
+  pool paginado de sessão), as imagens de sessão em +129 GB (128 GB) e a
+  lista do working set em +257 GB (reservada). A primeira página do
+  MM_SESSION_SPACE também aparece numa VA global de sistema
+  (`SESSION_GLOBAL_BASE..TOP`, o MiReservePtes de uma PTE do
+  MiSessionCreateInternal), que é o EPROCESS.Session: id, contagens,
+  ProcessList e flags são lidos de qualquer contexto; o PoolTags (+0x1000)
+  só dentro da sessão.
+- **Criação e fim.** PROCESS_CREATE_FLAGS_CREATE_SESSION cria a sessão
+  (`session::create`, o MiSessionCreate: menor id livre, tabela de topo, as
+  páginas do SessionCore, a VA global, NonPagablePages = CommittedPages = 8,
+  LocaleId, CreateTime; o criador é o mestre, Vm.Flags.SessionMaster); os
+  outros processos entram na sessão de quem os cria (`session::join`, o
+  MiJoinSession), todos com EPROCESS.Flags.ProcessInSession. No
+  PspProcessDelete o processo sai (`session::leave`); a última referência
+  (MiDereferenceSessionFinal) descarrega as imagens de sessão, devolve o
+  pool de sessão, desfaz o SessionCore e as tabelas e devolve a VA global e
+  o id. As páginas de sessão são editadas por uma raiz de edição da sessão
+  (uma PML4 com a metade de sistema e só esta sessão no slot, nunca
+  carregada): as tabelas abaixo da de topo são as mesmas em toda raiz da
+  sessão, então a edição vale em todos os processos dela sem anexar a
+  ninguém; desfazer uma página de sessão invalida a TLB em todas as CPUs
+  antes de o frame voltar ao PFN.
+- **Attach.** `session::attach`/`detach` (MmAttachSession/MmDetachSession)
+  contam AttachCount (sessão com DeletePending: STATUS_PROCESS_IS_TERMINATING)
+  e fazem o KiStackAttachProcess num processo da sessão (quem já está nela
+  anexa a si mesmo); `session::by_id` (MmGetSessionById) devolve um processo
+  referenciado da sessão que não é o mestre, só depois de o driver de sessão
+  registrar o DriverUnload (MmSessionSetUnloadAddress). MmGetSessionId(Ex) e
+  MiGetSessionIdForVa também moram ali.
+- **Pool de sessão** (`session_pool.rs`, chamado por `ex/pool_allocation.rs`):
+  PagedPoolSession (33, 37) sai do heap da sessão do processo corrente, na
+  VA dinâmica dela, residente; NonPagedPoolSession (32, 36, 544, 548) sai do
+  pool não paginado global. Os dois contam na tabela de tags da sessão
+  corrente (o PoolTags do MM_SESSION_SPACE, 0x100 POOL_TRACKER_TABLE com o
+  hash e os bytes do ExAllocateHeapPool). Fora de uma sessão o pedido é
+  recusado; liberar uma VA de sessão que a sessão corrente não alocou para
+  com BAD_POOL_CALLER (0, 0, VA, 0), o do ExFreeHeapPool quando o heap da
+  sessão não acha o segmento. O fim da sessão leva o heap inteiro.
+- **Imagens de sessão** (`session_image.rs`, MmLoadSystemImage com
+  MM_LOAD_IMAGE_IN_SESSION, que exige ProcessInSession, senão
+  STATUS_NO_MEMORY): o `pe_loader` carrega a imagem uma vez na faixa de
+  imagens de sessão, e os frames dela (relocados, com a IAT e o cookie) são a
+  cópia mestra; cada sessão que a carrega mapeia o código e as páginas
+  somente leitura sobre os frames mestres, sem escrita, e as graváveis sobre
+  cópias privadas feitas na carga (o copy-on-write dos protótipos por sessão
+  já resolvido, como o NT faz com as seções NOT_PAGED, que são todas as
+  graváveis do win32k*.sys e do cdd.dll). A segunda sessão recebe a mesma VA
+  e a mesma entrada do loader (LoadCount + 1); MmUnloadSystemImage tira a
+  imagem só da sessão corrente e a última sessão a descarrega. As
+  dependências seguem o resolvedor global. As imagens de sistema não mudam.
+- Teste: `ntos/test/multiprocess/session_space.rs` (fase 7), duas sessões
+  criadas pelo caminho real e o BOOTVID.DLL real carregado nas duas.
 
 **Imagens.**
 
