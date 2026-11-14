@@ -907,6 +907,19 @@ dereference e o PFN livre volta ao de antes.
   configuração existe: STATUS_RETRY.
   Testes: `ntos/test/rtl_ranges_resources.rs`, `ntos/test/platform_support.rs`,
   `ntos/test/power_io_support.rs` e `ntos/test/device_removal.rs`.
+- **Arquivos dos volumes do kernel** (`io/file/lifetime.rs`): os volumes
+  internos (o disco em memória `\FS` e o NTFS) não têm driver de file
+  system, então o registro de vida faz o papel do FCB: um estado por arquivo
+  com o SHARE_ACCESS, a exclusão pendente e o SECTION_OBJECT_POINTERS do
+  arquivo. Todo FILE_OBJECT aberto num desses volumes (ZwCreateFile do
+  kernel ou NtCreateFile de usuário) publica esse bloco em
+  FILE_OBJECT.SectionObjectPointer, como o IRP_MJ_CREATE de um file system;
+  as aberturas do mesmo arquivo dividem o bloco, que vive enquanto houver
+  FILE_OBJECT ou SECTION no arquivo. As seções do OpenNT ainda não publicam
+  CONTROL_AREA nele (os três ponteiros ficam NULL), mas código que lê
+  FileObject->SectionObjectPointer->ImageSectionObject sem conferir, como a
+  ci.dll ao registrar uma validação recusada, encontra memória válida.
+  Teste: `zw_kernel_files` na fase 6.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por
@@ -1250,16 +1263,24 @@ dereference e o PFN livre volta ao de antes.
   `--trace-driver-api` mostra cada export chamado (veja o README). Os testes
   `watchdog` e `dxgkrnl` do `components.toml` iniciam assim o watchdog.sys e
   o núcleo gráfico (serviço `DXGKrnl`, com os valores da chave do Windows) e
-  esperam `DRIVER_START_COMPLETED name=<serviço> state=4 win32=0`.
+  esperam `DRIVER_START_COMPLETED name=<serviço> state=4 win32=0`; depois,
+  com a CI ainda ativa, a pilha PS/2 passa pela validação
+  (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`), o serviço de
+  teclado lê do i8042prt.sys e o `--hold=30000` mantém o sistema rodando
+  30 s sem falha na serial. Uma imagem recusada pela CI falha com o status
+  real: o NTSTATUS da carga (STATUS_INVALID_IMAGE_HASH) segue até o SCM,
+  que mostra o 577 do Windows.
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,
   `[shell] pronto`, `FILE_SYSTEM_MOUNT_OK name=<serviço>` (um arquivo do
-  volume aberto e lido pelo file system real iniciado com `--start-driver`);
-  `[shell] pronto`, `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
+  volume aberto e lido pelo file system real iniciado com `--start-driver`),
+  `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
   csrss.exe real criado pelo smss.exe real chega ao win32k;
   `cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1`);
-  os de falha são `*** PANIC`, `*** EXCECAO` e `SELFTEST FALHOU`.
+  os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
+  (a parada do KeBugCheckEx). O `test-boot` procura falhas desde o boot até
+  a última saída esperada e, com `--hold=MS`, por mais MS milissegundos.
 
 ## 6. Documentação e status
 

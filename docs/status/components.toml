@@ -184,8 +184,8 @@ descricao = "Com --initial-process=smss, o primeiro processo de usuário é o sm
 id = "watchdog"
 titulo = "Driver watchdog.sys real"
 marcador = "DRIVER_START_COMPLETED"
-comando = "cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 \"--expect=name=watchdog state=4 win32=0\""
-descricao = "O gerenciador de serviços inicia o watchdog.sys da Microsoft: o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports no ntoskrnl e o DriverEntry retorna sucesso, com o serviço em execução (state=4)."
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 \"--expect=name=watchdog state=4 win32=0\" \"--expect=i8042prt.sys status=0x0\" \"--expect=[kbd] lendo teclas do driver real\" --hold=30000"
+descricao = "O gerenciador de serviços inicia o watchdog.sys da Microsoft: o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports no ntoskrnl e o DriverEntry retorna sucesso, com o serviço em execução (state=4). Depois, com a CI ainda ativa, a pilha PS/2 (kbdclass.sys, i8042prt.sys e mouclass.sys) passa pela validação pelo catálogo, o serviço de teclado lê do i8042prt.sys e o sistema segue rodando 30 s sem falha na serial (--hold)."
 
 [[teste]]
 id = "ksecdd"
@@ -198,8 +198,8 @@ descricao = "O gerenciador de serviços inicia o ksecdd.sys da Microsoft (o driv
 id = "dxgkrnl"
 titulo = "Driver dxgkrnl.sys real"
 marcador = "DRIVER_START_COMPLETED"
-comando = "cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=DXGKrnl --build-dir=build/dxgkrnl --smp=1 \"--expect=name=DXGKrnl state=4 win32=0\""
-descricao = "O gerenciador de serviços inicia o núcleo gráfico da Microsoft (DXGKrnl, com os valores da chave do serviço do Windows): o Code Integrity valida o dxgkrnl.sys pelo catálogo, o loader resolve os imports no ntoskrnl, no watchdog.sys e na WMILIB.SYS e o DriverEntry retorna sucesso, criando \\Device\\DxgKrnl, com o serviço em execução (state=4)."
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=DXGKrnl --build-dir=build/dxgkrnl --smp=1 \"--expect=name=DXGKrnl state=4 win32=0\" \"--expect=i8042prt.sys status=0x0\" \"--expect=[kbd] lendo teclas do driver real\" --hold=30000"
+descricao = "O gerenciador de serviços inicia o núcleo gráfico da Microsoft (DXGKrnl, com os valores da chave do serviço do Windows): o Code Integrity valida o dxgkrnl.sys pelo catálogo, o loader resolve os imports no ntoskrnl, no watchdog.sys e na WMILIB.SYS e o DriverEntry retorna sucesso, criando \\Device\\DxgKrnl, com o serviço em execução (state=4). Depois a pilha PS/2 passa pela CI e o sistema segue rodando 30 s sem falha na serial (--hold)."
 
 [[teste]]
 id = "ntfs"
@@ -517,10 +517,10 @@ categoria = "Drivers do Windows"
 icone = "shield"
 descricao = "A integridade de código do Windows: confere a assinatura de cada imagem de kernel antes de ela rodar."
 estado = "implementado"
-caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/se/code_integrity_information.rs", "kernel/src/ntos/io/file/zw.rs"]
+caminhos = ["kernel/src/ntos/se/code_integrity.rs", "kernel/src/ntos/se/code_integrity_information.rs", "kernel/src/ntos/io/file/zw.rs", "kernel/src/ntos/io/file/lifetime.rs"]
 testes = ["watchdog"]
 fase = "6"
-notas = "A ci.dll real e o msrpc.sys, de que ela depende, carregam do volume NTFS; a CI inicializa, lê a política e valida cada imagem nova, pela assinatura embutida (vgk.sys) ou pelo catálogo da Microsoft que ela mesma procura em System32\\CatRoot (watchdog.sys); com ela ativa, os drivers carregados depois, como o kbdclass.sys, também passam pela validação. Só é ativada no boot com --start-driver; no boot comum, os drivers do bundle carregam sem essa verificação."
+notas = "A ci.dll real e o msrpc.sys, de que ela depende, carregam do volume NTFS; a CI inicializa, lê a política e valida cada imagem nova, pela assinatura embutida (vgk.sys) ou pelo catálogo da Microsoft que ela mesma procura em System32\\CatRoot (watchdog.sys); com ela ativa, os drivers carregados depois, como a pilha PS/2 (kbdclass.sys, i8042prt.sys e mouclass.sys, cujo catálogo também vai para o volume), também passam pela validação. Uma imagem sem catálogo é recusada com STATUS_INVALID_IMAGE_HASH, que chega ao SCM como o erro 577. Ao registrar uma recusa, a ci.dll lê FileObject->SectionObjectPointer->ImageSectionObject sem conferir: os arquivos dos volumes do kernel publicam o SECTION_OBJECT_POINTERS do arquivo, como um file system do NT, e o kernel recusa com STATUS_INVALID_FILE_FOR_SECTION uma imagem sem ele em vez de entregá-la à ci.dll. Só é ativada no boot com --start-driver; no boot comum, os drivers do bundle carregam sem essa verificação."
 
 [[componente]]
 nome = "vgk.sys"
