@@ -105,9 +105,20 @@ fn power_manager(assert: Assert) {
     po::start_next_power_request(device);
     assert(*POWER_CALLS.lock() == alloc::vec![(device, 0x1000), (device, 0x2000)], "power: PoStartNextPowerIrp em ordem FIFO");
     po::mark_power_request_done(device);
-    assert(po::call_driver_down_the_stack(device, 0x3000) == 0, "power: fundo da pilha conclui sem despachar");
-    unsafe { DeviceObject::at(device) }.attached_device.set(0x5000);
-    assert(po::call_driver_down_the_stack(device, 0x3000) == 0x42 && POWER_CALLS.lock().last() == Some(&(0x5000, 0x3000)), "power: PoCallDriver desce para o dispositivo anexado");
+    // PoCallDriver é o IofCallDriver (ntoskrnl 19041): o IRP desce para o
+    // dispositivo pedido, que passa a ser o da posição corrente. Um driver
+    // sem MajorFunction[IRP_MJ_POWER] conclui com STATUS_INVALID_DEVICE_REQUEST.
+    let driver = guest::alloc_bytes(DriverObject::SIZE);
+    unsafe { DeviceObject::at(device) }.driver_object.set(driver);
+    unsafe { DeviceObject::at(device) }.stack_size.set(1);
+    let packet = crate::ntos::io::irp_builder::allocate_irp(2);
+    let irp = unsafe { Irp::at(packet) };
+    let status = po::call_driver_down_the_stack(device, packet);
+    let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    assert(status == 0xC000_0010 && irp.io_status.status.get() == 0xC000_0010u32 as i32 && location.device_object.get() == device, "power: PoCallDriver desce pelo IofCallDriver");
+    guest::free_bytes(packet);
+    guest::free_bytes(driver);
+    unsafe { DeviceObject::at(device) }.driver_object.set(0);
     po::forget_device(device);
     assert(po::get_device_power_state(device) == d::D0, "power: dispositivo esquecido volta a D0");
     po::set_power_irp_dispatcher(previous);
@@ -397,16 +408,16 @@ fn pci_bus_driver(assert: Assert) {
     let pdo = unsafe { DeviceObject::at(ide.pdo_pointer) };
     assert(pdo.type_.get() == 3 && pdo.reference_count.get() == 1 && pdo.stack_size.get() == 1, "pcibus: DEVICE_OBJECT do PDO");
     // QUERY_ID pelo despacho do bus driver e pela pilha nativa.
-    assert(matches!(iom::query_device_id(&path, 1), Ok(Some(id)) if id == "PCI\\VEN_8086&DEV_7010"), "pcibus: QUERY_ID pelo bus driver");
+    assert(matches!(iom::query_device_id(&path, 1), Ok(Some(id)) if id == "PCI\\VEN_8086&DEV_7010&SUBSYS_11001AF4&REV_00"), "pcibus: QUERY_ID pelo bus driver");
     let packet = guest::alloc_bytes(builder::size_for(1));
     builder::build(packet, &BuildOptions { major: 0x1B, minor: 0x13, device_object: ide.pdo_pointer, ..Default::default() });
     let irp = unsafe { Irp::at(packet) };
     assert(iom::iof_call_driver(ide.pdo_pointer, packet) == 0 && irp.io_status.status.get() == 0, "pcibus: PDO sem driver nativo respondido pelo bus");
     let information = irp.io_status.information.get();
-    assert(information != 0 && crate::ntos::rtl::guest_strings::read_wide_string(information) == "PCI\\VEN_8086&DEV_7010", "pcibus: id UTF-16 em pool no Information");
+    assert(information != 0 && crate::ntos::rtl::guest_strings::read_wide_string(information) == "PCI\\VEN_8086&DEV_7010&SUBSYS_11001AF4&REV_00", "pcibus: DeviceID UTF-16 em pool no Information");
     guest::free_bytes(information);
     builder::build(packet, &BuildOptions { major: 0x1B, minor: 0x09, device_object: ide.pdo_pointer, ..Default::default() });
-    assert(iom::iof_call_driver(ide.pdo_pointer, packet) == 0xC000_00BBu32 as i32, "pcibus: minor sem resposta nao completa o IRP");
+    assert(iom::iof_call_driver(ide.pdo_pointer, packet) == 0xC000_0010u32 as i32 && irp.current_location.get() == 2, "pcibus: QUERY_CAPABILITIES sem buffer recusado e completado");
     assert(pci::answer_native_pnp_irp(0x1234_0000, packet).is_none(), "pcibus: dispositivo de outro bus");
     guest::free_bytes(packet);
     // IoConnectInterruptEx LINE_BASED: interrupções consumidas em ordem.
@@ -1144,5 +1155,6 @@ pub fn run(assert: Assert) {
     io_handles_and_volumes(assert);
     io_packets_and_transfer(assert);
     etw_firmware_and_telemetry(assert);
+    super::pnp_storage::run(assert);
     debug_print!("PHASE4_SELFTEST_OK");
 }

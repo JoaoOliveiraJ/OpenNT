@@ -1,8 +1,11 @@
 //! Propriedades e chave de registro de um dispositivo — IoGetDeviceProperty
-//! (PhysicalDeviceObjectName e HardwareID do PDO PCI), IoGetDevicePropertyData
-//! e IoOpenDeviceRegistryKey (a chave de serviço do driver dono).
+//! (as propriedades do devnode num PDO da árvore do PnP; nos outros,
+//! PhysicalDeviceObjectName e HardwareID do PDO PCI), IoGetDevicePropertyData
+//! e IoOpenDeviceRegistryKey (as chaves de hardware e de driver do devnode;
+//! nos outros, a chave de serviço do driver dono).
 
 use alloc::format;
+use alloc::string::String;
 
 use crate::drivers::bus::pci;
 use crate::ntos::cm::key::services as key_services;
@@ -26,9 +29,71 @@ fn result_length(returned: u64) -> &'static Field<u32> {
     unsafe { Field::<u32>::at(returned) }
 }
 
+/// Propriedade de um devnode da árvore do PnP, em bytes (None = ausente).
+/// DEVICE_REGISTRY_PROPERTY (wdm.h): textos com o NUL final, listas com o
+/// NUL duplo, números de 32 bits, GUIDs de 16 bytes e listas de recursos.
+fn devnode_property(node: &crate::ntos::io::pnp::devnode::DeviceNode, property: u32) -> Option<alloc::vec::Vec<u8>> {
+    use crate::ntos::io::pnp::{devnode::capability, install};
+    let key = format!("{}\\Enum\\{}", install::CONTROL_SET, node.instance_path);
+    let text = |value: &str| -> alloc::vec::Vec<u8> {
+        let mut bytes: alloc::vec::Vec<u8> = value.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    };
+    // "@inf,%chave%;texto": o texto depois do ';'.
+    let display = |value: String| -> String { if value.starts_with('@') { value.rsplit_once(';').map(|(_, text)| String::from(text)).unwrap_or(value) } else { value } };
+    let resource_bytes = |list: u64| -> Option<alloc::vec::Vec<u8>> {
+        let parsed = crate::ntos::io::pnp::resources::CmList::read(list)?;
+        Some(guest::read_bytes(list, 20 + parsed.resources.len() * 20))
+    };
+    let number = |value: u32| Some(value.to_le_bytes().to_vec());
+    match property {
+        0x0 => install::read_text(&key, "DeviceDesc").map(display).or_else(|| node.description.clone()).map(|value| text(&value)),
+        0x1 => (!node.hardware_ids.is_empty()).then(|| install::multi_sz_owned(&node.hardware_ids)),
+        0x2 => (!node.compatible_ids.is_empty()).then(|| install::multi_sz_owned(&node.compatible_ids)),
+        0x3 => resource_bytes(node.boot_resources),
+        0x4 => resource_bytes(node.boot_resources),
+        0x5 => install::read_text(&key, "Class").map(|value| text(&value)),
+        0x6 => install::read_text(&key, "ClassGUID").map(|value| text(&value)),
+        0x7 => install::read_text(&key, "Driver").map(|value| text(&value)),
+        0x8 => install::read_text(&key, "Mfg").map(display).map(|value| text(&value)),
+        0x9 => install::read_text(&key, "FriendlyName").map(|value| text(&value)),
+        0xA => node.location.as_deref().map(text),
+        0xB => {
+            let name = crate::ntos::io::device::find_device_node_by_pointer(node.pdo).and_then(object_manager::path_of)?;
+            Some(text(&name))
+        }
+        0xC => node.bus_information.map(|(guid, _, _)| guid.to_vec()),
+        0xD => node.bus_information.and_then(|(_, legacy, _)| number(legacy as u32)),
+        0xE => node.bus_information.and_then(|(_, _, bus)| number(bus)),
+        0xF => node.instance_path.split('\\').next().map(text),
+        0x10 => Some(node.capability_word(capability::ADDRESS)).filter(|&value| value != 0xFFFF_FFFF).and_then(number),
+        0x11 => Some(node.capability_word(capability::UI_NUMBER)).filter(|&value| value != 0xFFFF_FFFF).and_then(number),
+        // InstallStateInstalled (0) com serviço; InstallStateFailedInstall (2) sem.
+        0x12 => number(if node.service.is_some() || node.internal_driver { 0 } else { 2 }),
+        // RemovalPolicyExpectSurpriseRemoval (3) se Removable; senão ExpectNoRemoval (1).
+        0x13 => number(if node.capability_bit(capability::REMOVABLE) { 3 } else { 1 }),
+        0x15 => resource_bytes(node.resources_translated),
+        _ => None,
+    }
+}
+
 /// IoGetDeviceProperty(dev, property, bufferLength, buffer, resultLength):
+/// para um PDO da árvore do PnP, as propriedades do devnode; nos demais,
 /// PhysicalDeviceObjectName (0xB) e HardwareID (1) do PDO PCI.
 pub fn get_device_property(device: u64, property: u32, size: u32, output: u64, returned: u64) -> u32 {
+    if let Some(node) = crate::ntos::io::pnp::devnode::of_device(device) {
+        let Some(bytes) = devnode_property(&node, property) else {
+            result_length(returned).set(0);
+            return 0xC000_0034;
+        };
+        result_length(returned).set(bytes.len() as u32);
+        if (size as usize) < bytes.len() {
+            return 0xC000_0023;
+        }
+        guest::write_bytes(output, &bytes);
+        return 0;
+    }
     let (text, needed) = if property == 0xB {
         let Some(node) = device::walk_physical(device, device::find_device_node_by_pointer) else { return 0xC000_0034 };
         let name = format!("\\Device\\{}", device::device_name(node));
@@ -57,10 +122,34 @@ pub fn get_device_property(device: u64, property: u32, size: u32, output: u64, r
     0
 }
 
-/// IoOpenDeviceRegistryKey: a chave de serviço do driver dono. Devolve o
-/// valor do export: dispositivo desconhecido com sinal, o status da
-/// abertura da chave sem sinal.
-pub fn open_device_registry_key(device: u64, output: u64) -> Result<u64, KernelError> {
+/// IoOpenDeviceRegistryKey(Device, DevInstKeyType, DesiredAccess, Key*).
+/// Num PDO da árvore do PnP: PLUGPLAY_REGKEY_DEVICE (1) é
+/// `Enum\<instância>\Device Parameters`, PLUGPLAY_REGKEY_DRIVER (2) é
+/// `Control\Class\<valor Driver>`, e PLUGPLAY_REGKEY_CURRENT_HWPROFILE (4)
+/// põe a chave sob `Hardware Profiles\Current\System\CurrentControlSet`;
+/// as chaves são criadas se ainda não existem. Nos demais dispositivos, a
+/// chave de serviço do driver dono. Devolve o valor do export: dispositivo
+/// desconhecido com sinal, o status da abertura da chave sem sinal.
+pub fn open_device_registry_key(device: u64, key_type: u32, output: u64) -> Result<u64, KernelError> {
+    use crate::ntos::io::pnp::{devnode, install};
+    if let Some(node) = devnode::get(device) {
+        let base = if key_type & 4 != 0 { format!("{}\\Hardware Profiles\\Current\\System\\CurrentControlSet", install::CONTROL_SET) } else { String::from(install::CONTROL_SET) };
+        let path = match key_type & 3 {
+            1 => format!("{base}\\Enum\\{}\\Device Parameters", node.instance_path),
+            2 => {
+                let Some(driver) = install::read_text(&format!("{}\\Enum\\{}", install::CONTROL_SET, node.instance_path), "Driver") else { return Ok(signed_status(0xC000_0034)) };
+                format!("{base}\\Control\\Class\\{driver}")
+            }
+            _ => return Ok(signed_status(0xC000_000D)),
+        };
+        let (status, handle) = key_services::open_path(&path, true)?;
+        if status != 0 {
+            return Ok(status as u64);
+        }
+        // SAFETY: PHANDLE do chamador de modo kernel.
+        unsafe { Field::<u64>::at(output) }.set(handle);
+        return Ok(0);
+    }
     let driver_node = io_manager::devices().into_iter().filter(|(_, entry)| entry.native_device == device).filter_map(|(_, entry)| entry.driver).last();
     let Some(driver_node) = driver_node else { return Ok(signed_status(0xC000_0034)) };
     let name = object_manager::node(driver_node).map(|node| node.name).unwrap_or_default();
@@ -126,9 +215,10 @@ fn read_key(owner: Owner, key: &Devpropkey, lcid: u32) -> PropertyKey {
     (owner, fmtid, key.pid.get(), lcid)
 }
 
-/// PDO do PnP do OpenNT: filho enumerado, PDO de barramento ou relatado.
+/// PDO do PnP do OpenNT: devnode da árvore, filho enumerado, PDO de
+/// barramento ou relatado.
 fn is_pnp_device(pdo: u64) -> bool {
-    io_manager::devices().into_iter().any(|(_, entry)| entry.native_device == pdo && (entry.pdo || entry.extra.is_some()))
+    crate::ntos::io::pnp::devnode::exists(pdo) || io_manager::devices().into_iter().any(|(_, entry)| entry.native_device == pdo && (entry.pdo || entry.extra.is_some()))
 }
 
 fn store(key: PropertyKey, property_type: u32, size: u32, data: u64) -> u32 {
@@ -171,6 +261,58 @@ pub fn set_interface_property(link: u64, key: &Devpropkey, lcid: u32, _flags: u3
     store(read_key(Owner::Interface(name), key, lcid), property_type, size, data)
 }
 
+/// DEVPKEY_Device_* {a45c254e-df1c-4efd-8020-67d146a850e0} (devpkey.h).
+const DEVPKEY_DEVICE: [u8; 16] = [0x4E, 0x25, 0x5C, 0xA4, 0x1C, 0xDF, 0xFD, 0x4E, 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0];
+/// DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING_LIST e DEVPROP_TYPE_GUID.
+const DEVPROP_TYPE_STRING: u32 = 0x12;
+const DEVPROP_TYPE_STRING_LIST: u32 = 0x2012;
+const DEVPROP_TYPE_GUID: u32 = 0x0D;
+
+/// GUID binário de um texto "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}".
+fn parse_guid(text: &str) -> Option<[u8; 16]> {
+    let hex: alloc::vec::Vec<u8> = text.chars().filter(|character| character.is_ascii_hexdigit()).map(|character| character.to_digit(16).unwrap_or(0) as u8).collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let byte = |index: usize| hex[index * 2] << 4 | hex[index * 2 + 1];
+    let mut guid = [0u8; 16];
+    // Data1, Data2 e Data3 little-endian; Data4 na ordem do texto.
+    for (target, source) in [(0, 3), (1, 2), (2, 1), (3, 0), (4, 5), (5, 4), (6, 7), (7, 6)] {
+        guid[target] = byte(source);
+    }
+    for index in 8..16 {
+        guid[index] = byte(index);
+    }
+    Some(guid)
+}
+
+/// As propriedades DEVPKEY_Device_* que o PnP manager guarda no devnode e
+/// na chave da instância: DeviceDesc (2), HardwareIds (3), CompatibleIds
+/// (4), Service (6), Class (9), ClassGuid (10), Driver (11), Manufacturer
+/// (13), LocationInfo (15) e PDOName (16).
+fn standard_device_property(node: &crate::ntos::io::pnp::devnode::DeviceNode, key: &Devpropkey) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    use crate::ntos::io::pnp::install;
+    if guest::read_bytes(key.fmtid.address(), 16) != DEVPKEY_DEVICE {
+        return None;
+    }
+    let instance = format!("{}\\Enum\\{}", install::CONTROL_SET, node.instance_path);
+    let text = |value: String| -> (u32, alloc::vec::Vec<u8>) { (DEVPROP_TYPE_STRING, crate::ntos::cm::registry::encode_wide(&value)) };
+    let display = |value: String| -> String { if value.starts_with('@') { value.rsplit_once(';').map(|(_, text)| String::from(text)).unwrap_or(value) } else { value } };
+    match key.pid.get() {
+        2 => install::read_text(&instance, "DeviceDesc").map(display).map(text),
+        3 => (!node.hardware_ids.is_empty()).then(|| (DEVPROP_TYPE_STRING_LIST, install::multi_sz_owned(&node.hardware_ids))),
+        4 => (!node.compatible_ids.is_empty()).then(|| (DEVPROP_TYPE_STRING_LIST, install::multi_sz_owned(&node.compatible_ids))),
+        6 => node.service.clone().map(text),
+        9 => install::read_text(&instance, "Class").map(text),
+        10 => install::read_text(&instance, "ClassGUID").and_then(|guid| parse_guid(&guid)).map(|guid| (DEVPROP_TYPE_GUID, guid.to_vec())),
+        11 => install::read_text(&instance, "Driver").map(text),
+        13 => install::read_text(&instance, "Mfg").map(display).map(text),
+        15 => node.location.clone().map(text),
+        16 => device::find_device_node_by_pointer(node.pdo).and_then(object_manager::path_of).map(text),
+        _ => None,
+    }
+}
+
 /// IoGetDevicePropertyData(Pdo, PropertyKey, Lcid, Flags, Size, Data,
 /// RequiredSize*, Type*).
 #[allow(clippy::too_many_arguments)]
@@ -181,7 +323,8 @@ pub fn query_device_property_data(pdo: u64, key: &Devpropkey, lcid: u32, _flags:
     if !is_pnp_device(pdo) {
         return PROPERTY_STATUS_INVALID_DEVICE_REQUEST;
     }
-    let found = PROPERTIES.lock().get(&read_key(Owner::Device(pdo), key, lcid)).cloned();
+    let stored = PROPERTIES.lock().get(&read_key(Owner::Device(pdo), key, lcid)).cloned();
+    let found = stored.or_else(|| crate::ntos::io::pnp::devnode::get(pdo).and_then(|node| standard_device_property(&node, key)));
     let Some((property_type, bytes)) = found else { return PROPERTY_STATUS_OBJECT_NAME_NOT_FOUND };
     required.set(bytes.len() as u32);
     type_output.set(property_type);

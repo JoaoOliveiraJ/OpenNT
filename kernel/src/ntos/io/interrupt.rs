@@ -30,6 +30,26 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     let output = fully.interrupt_object.get();
     if version == CONNECT_LINE_BASED {
         let physical = parameters.line_based.physical_device_object.get();
+        // PDO da árvore do PnP: as interrupções de linha da lista traduzida
+        // do devnode, como o IopConnectInterruptExLineBased.
+        if let Some(node) = crate::ntos::io::pnp::devnode::get(physical) {
+            let list = crate::ntos::io::pnp::resources::CmList::read(node.resources_translated).unwrap_or_default();
+            let interrupts: alloc::vec::Vec<_> = list.resources.iter().filter(|resource| resource.resource_type == crate::ntos::io::pnp::resources::resource_type::INTERRUPT).copied().collect();
+            let Some(first) = interrupts.first() else {
+                debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} sem interrupcao atribuida", node.instance_path);
+                return Ok(signed_status(0xC000_000D));
+            };
+            if interrupts.len() > 1 {
+                debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} tem {} interrupcoes; conecta a primeira", node.instance_path, interrupts.len());
+            }
+            // CM_RESOURCE_INTERRUPT_LATCHED (bit 0) -> Latched; senão LevelSensitive.
+            let mode = if first.flags & 1 != 0 { 1 } else { 0 };
+            let share = first.share == crate::ntos::io::pnp::resources::SHARE_SHARED;
+            let level = first.start as u8;
+            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, first.length, level, level, mode, share)?;
+            debug_print!("[io] interrupt LINE_BASED {}: vetor 0x{:x} irql {} -> ISR 0x{:x}", node.instance_path, first.length, level, service_routine);
+            return Ok(status as u64);
+        }
         let Some(resource) = device_resources::consume_next_interrupt(physical) else {
             debug_print!("[io] IoConnectInterruptEx LINE_BASED: PDO 0x{:x} sem IRQ restante", physical);
             return Ok(signed_status(0xC000_009A));

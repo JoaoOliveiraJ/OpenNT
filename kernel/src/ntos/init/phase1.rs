@@ -76,4 +76,8 @@ pub fn init() {
     }
     // Rotinas de IoRegisterDriverReinitialization, como no NT.
     crate::ntos::io::lifecycle::run_reinitialization_routines();
+    // `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
+    if crate::drivers::storage::storage_stack::ENABLED {
+        crate::drivers::storage::storage_stack::initialize();
+    }
 }

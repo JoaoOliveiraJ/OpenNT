@@ -30,6 +30,8 @@ pub struct BuildOptions {
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).
     pub initial_process: String,
+    /// `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
+    pub storage: String,
 }
 
 pub struct BuildOutput {
@@ -89,7 +91,8 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         .env("OPENNT_USER_PROGRAM", &options.user_program)
         .env("OPENNT_KERNEL_TEST_SCOPE", &options.kernel_test_scope)
         .env("OPENNT_START_DRIVER", &options.start_driver)
-        .env("OPENNT_INITIAL_PROCESS", &options.initial_process);
+        .env("OPENNT_INITIAL_PROCESS", &options.initial_process)
+        .env("OPENNT_STORAGE", &options.storage);
     if options.trace_driver_api {
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {

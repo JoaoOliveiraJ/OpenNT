@@ -5,6 +5,7 @@
 pub mod self_test;
 pub mod phase3;
 pub mod phase4;
+pub mod pnp_storage;
 pub mod phase5;
 pub mod phase6;
 pub mod executive_support;

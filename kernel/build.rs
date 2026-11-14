@@ -138,7 +138,7 @@ fn main() {
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=../apps");
     println!("cargo:rerun-if-changed=src/ntos/ke/services.rs");
-    for variable in ["OPENNT_USER_PROGRAM", "OPENNT_KERNEL_TEST_SCOPE", "OPENNT_CONSOLE_MIRROR"] {
+    for variable in ["OPENNT_USER_PROGRAM", "OPENNT_KERNEL_TEST_SCOPE", "OPENNT_CONSOLE_MIRROR", "OPENNT_STORAGE"] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     // Binários reais do Windows copiados pelo xtask (hal.dll e as pilhas de

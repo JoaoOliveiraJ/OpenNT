@@ -32,4 +32,5 @@ pub mod firmware_return;
 pub mod private_dispatch;
 pub mod public_dispatch;
 pub mod hypervisor;
+pub mod dma;
 pub mod exports;

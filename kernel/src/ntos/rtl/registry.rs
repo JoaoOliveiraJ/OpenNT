@@ -53,6 +53,7 @@ const REGISTRY_OPTIONAL: u32 = 0x8000_0000;
 /// Flags da RTL_QUERY_REGISTRY_TABLE (wdm.h).
 const QUERY_REGISTRY_REQUIRED: u32 = 0x04;
 const QUERY_REGISTRY_DIRECT: u32 = 0x20;
+const QUERY_REGISTRY_TYPECHECK: u32 = 0x100;
 
 /// RtlQueryRegistryValues[Ex]: cada entrada é processada mesmo com a chave
 /// ausente (o driver recebe o default); DIRECT escreve em EntryContext; com
@@ -88,7 +89,9 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         let flags = entry.flags.get();
         let name_pointer = entry.name.get();
         let entry_context = entry.entry_context.get();
-        let default_type = entry.default_type.get();
+        // RTL_QUERY_REGISTRY_TYPECHECK: o byte alto de DefaultType é o tipo
+        // esperado, e o default é só o resto (REG_NONE = sem default).
+        let default_type = if flags & QUERY_REGISTRY_TYPECHECK != 0 { entry.default_type.get() & 0x00FF_FFFF } else { entry.default_type.get() };
         let default_data = entry.default_data.get();
         let default_length = entry.default_length.get();
         if routine == 0 && name_pointer == 0 {
@@ -118,6 +121,23 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
             continue;
         };
         if flags & QUERY_REGISTRY_DIRECT != 0 {
+            // REG_SZ, REG_EXPAND_SZ e REG_MULTI_SZ vão para o UNICODE_STRING
+            // de EntryContext (Buffer NULL = alocado do pool, como o NT);
+            // os demais tipos são copiados como dado cru.
+            if matches!(value_type, 1 | 2 | 7) {
+                // SAFETY: EntryContext de uma entrada DIRECT de string é um UNICODE_STRING do driver.
+                let string = unsafe { crate::ntos::inc::types::UnicodeString::at(entry_context) };
+                if string.buffer.get() == 0 {
+                    string.buffer.set(guest::alloc_bytes(bytes.len().max(2) as u64));
+                    string.maximum_length.set(bytes.len() as u16);
+                } else if bytes.len() > string.maximum_length.get() as usize {
+                    status = 0xC000_0023u32 as i32 as i64 as u64;
+                    break;
+                }
+                guest::write_bytes(string.buffer.get(), &bytes);
+                string.length.set(bytes.len().saturating_sub(2) as u16);
+                continue;
+            }
             guest::write_bytes(entry_context, &bytes);
             continue;
         }
@@ -140,15 +160,19 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
 }
 
 /// RtlWriteRegistryValue pelo serviço de chaves (com as notificações de filtro).
+/// Com RTL_REGISTRY_HANDLE o Path é a chave aberta do chamador, que continua
+/// dono do handle.
 pub fn write_value(relative_to: u32, path: u64, value_name: u64, value_type: u32, data: u64, length: u32) -> Result<u32, KernelError> {
-    let path = guest_registry_path(relative_to, path);
-    let (status, handle) = key_services::open_path(&path, true)?;
+    let by_handle = relative_to & REGISTRY_HANDLE != 0;
+    let (status, handle) = if by_handle { (0, path) } else { key_services::open_path(&guest_registry_path(relative_to, path), true)? };
     if status != 0 {
         return Ok(status);
     }
     let data = guest::read_bytes(data, length as usize);
     let result = key_services::named_value(key_services::Kind::Set, handle, &guest_strings::read_wide_string(value_name), value_type, &data);
-    cm_registry::close_handle(handle as u32);
+    if !by_handle {
+        cm_registry::close_handle(handle as u32);
+    }
     Ok(result?.0)
 }
 

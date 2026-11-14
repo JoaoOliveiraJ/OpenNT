@@ -41,6 +41,8 @@ const IRP_EXTENSION_TAG: u32 = 0x5870_7249; // 'IrpX'
 pub const IRP_EXTENSION_GENERIC: u32 = 2;
 pub const IRP_EXTENSION_ZEROING_OFFSET: u32 = 4;
 pub const IRP_EXTENSION_TRACK_OFFSET: u32 = 5;
+/// Tipo 6: DiskIoAttributionHandle (o bit 0x40 do byte baixo de TypesAllocated).
+pub const IRP_EXTENSION_DISK_IO_ATTRIBUTION: u32 = 6;
 pub const IRP_EXTENSION_COPY_INFORMATION: u32 = 9;
 /// Tipos que dividem a união em +0x28 (1, 4, 5, 7).
 const UNION_TYPES: u16 = 0xB2;
@@ -145,6 +147,29 @@ fn extension_at(extension: u64) -> &'static IopIrpExtension {
 fn zeroing_offset(extension: &IopIrpExtension) -> &'static Field<u32> {
     // SAFETY: os 4 bytes baixos da célula de 8 bytes da união, na mesma extensão.
     unsafe { Field::<u32>::at(extension.fs_track_offset_blob.address()) }
+}
+
+/// IoGetIoAttributionHandle (RVA 0x2f3dd0): só um IRP com IOP_IRP_EXTENSION
+/// alocada (AllocationFlags sem o bit 7) e o tipo 6 (atribuição de I/O de
+/// disco) em TypesAllocated tem o handle; senão STATUS_NOT_FOUND.
+pub fn io_attribution_handle(irp: u64, output: &Field<u64>) -> u32 {
+    let packet = irp_at(irp);
+    let extension = packet.irp_extension().get();
+    if (packet.allocation_flags.get() as i8) < 0 || extension == 0 || extension_at(extension).types_allocated.get() & (1 << IRP_EXTENSION_DISK_IO_ATTRIBUTION) == 0 {
+        return 0xC000_0225;
+    }
+    output.set(extension_at(extension).disk_io_attribution_handle.get());
+    0
+}
+
+/// IoRecordIoAttribution (RVA 0x2e0580): versão 1 da estrutura; o handle
+/// precisa ser de uma atribuição de disco viva (IopFindDiskIoAttribution).
+/// O OpenNT não cria atribuições de I/O de disco: STATUS_INVALID_HANDLE.
+pub fn record_io_attribution(_handle: u64, version: u32) -> u32 {
+    if version != 1 {
+        return 0xC000_0059;
+    }
+    0xC000_0008
 }
 
 /// IopIrpHasExtensionType (RVA 0x2e6690).

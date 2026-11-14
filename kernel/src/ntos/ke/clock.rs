@@ -173,10 +173,16 @@ pub fn unbiased_interrupt_time() -> u64 {
     uptime_ms() * 10_000
 }
 
-/// KeQueryUnbiasedInterruptTimePrecise: o tempo vai para o ponteiro.
-pub fn query_unbiased_interrupt_time_precise(time: u64) {
-    // SAFETY: PULONG64 do driver.
-    unsafe { Field::<u64>::at(time) }.set(uptime_ms() * 10_000);
+/// KeQueryUnbiasedInterruptTimePrecise(PULONG64 QpcTimeStamp), como o do
+/// ntoskrnl 19041 (rva 0x2e09e0): devolve o tempo de interrupção sem
+/// suspensão (100 ns) e grava no ponteiro o contador de desempenho lido
+/// junto (QPC == TSC, como KeQueryPerformanceCounter).
+pub fn query_unbiased_interrupt_time_precise(qpc_time_stamp: u64) -> u64 {
+    if qpc_time_stamp != 0 {
+        // SAFETY: PULONG64 do driver.
+        unsafe { Field::<u64>::at(qpc_time_stamp) }.set(cpu::rdtsc());
+    }
+    uptime_100ns()
 }
 
 /// KeQueryInterruptTimePrecise(PULONGLONG QpcValue): devolve o tempo de

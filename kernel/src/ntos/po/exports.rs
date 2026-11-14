@@ -24,8 +24,7 @@ fn call_driver(call: &Call) -> Result<u64, KernelError> {
 
 /// PoRequestPowerIrp(device, minor, state, completion, context, &irp).
 fn request_power_irp(call: &Call) -> Result<u64, KernelError> {
-    power_manager::request_power_irp(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5), call.arg(6));
-    Ok(0)
+    Ok(signed_status(power_manager::request_power_irp(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5), call.arg(6))))
 }
 
 fn register_power_setting_callback(call: &Call) -> Result<u64, KernelError> {

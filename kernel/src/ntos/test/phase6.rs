@@ -1483,7 +1483,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     mdl_header.start_va.set(buffer);
     mdl_header.byte_offset.set(0x10);
     mdl_header.byte_count.set(0x1800);
-    assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 6, "mm: MmBuildMdlForNonPagedPool com PFNs reais");
+    assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 6 && mdl_header.mapped_system_va.get() == mdl_header.start_va.get() + mdl_header.byte_offset.get() as u64, "mm: MmBuildMdlForNonPagedPool com PFNs reais e MappedSystemVa do pool");
     assert(call_export("MmMapLockedPagesSpecifyCache", &[descriptor, 0, 1, 0, 0, 16]) == Some(buffer + 0x10) && mdl_header.mdl_flags.get() & 1 == 1 && call_export("MmUnmapLockedPages", &[buffer + 0x10, descriptor]) == Some(0) && mdl_header.mdl_flags.get() & 1 == 0, "mm: mapeamento do MDL marcado e desfeito");
     assert(call_export("MmGetPhysicalAddress", &[buffer]) == Some(paging::translate(buffer)) && call_export("MmMapLockedPagesWithReservedMapping", &[buffer, 0, descriptor, 1]) == Some(0), "mm: endereco fisico e VA nao reservada recusada");
     let pages = call_export("MmAllocatePagesForMdl", &[0, u64::MAX, 0, 0x2000]).unwrap_or(0);
@@ -2985,6 +2985,11 @@ fn rtl_group_exports(assert: Assert) {
     let handle = opened.as_ref().map_or(0, |&(status, handle)| if status == 0 { handle } else { 0 });
     let by_handle = handle != 0 && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0 && guest::read32(direct) == 0x1234;
     let still_open = handle != 0 && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0;
+    // RtlWriteRegistryValue com RTL_REGISTRY_HANDLE grava na chave do handle.
+    guest::write32(data, 0x4321);
+    let written_by_handle = handle != 0 && call("RtlWriteRegistryValue", &[0x4000_0000, handle, value_name, 4, data, 4]) == 0;
+    guest::write32(direct, 0);
+    assert(written_by_handle && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0 && guest::read32(direct) == 0x4321, "rtl: RtlWriteRegistryValue com RTL_REGISTRY_HANDLE");
     if handle != 0 {
         crate::ntos::cm::registry::close_handle(handle as u32);
     }
@@ -2992,6 +2997,27 @@ fn rtl_group_exports(assert: Assert) {
     default_entry.flags.set(0x24);
     default_entry.default_type.set(0);
     assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) as u32 == 0xC000_0034, "rtl: RtlQueryRegistryValues REQUIRED sem valor nem default");
+    // RTL_QUERY_REGISTRY_TYPECHECK: o byte alto de DefaultType é o tipo
+    // esperado (REG_SZ << 24) e o resto, REG_NONE, não é default.
+    default_entry.flags.set(0x124);
+    default_entry.default_type.set(1 << 24);
+    assert(call("RtlQueryRegistryValues", &[0, path, table, 0, 0]) as u32 == 0xC000_0034, "rtl: RtlQueryRegistryValues TYPECHECK sem default");
+    // DIRECT de REG_SZ, relativo a RTL_REGISTRY_SERVICES: o UNICODE_STRING de
+    // EntryContext recebe o texto (Buffer NULL = alocado).
+    let (text_name, text_data, string, text_table) = (guest::alloc_bytes(0x20), guest::alloc_bytes(0x10), guest::alloc_bytes(0x10), guest::alloc_bytes(nt::RtlQueryRegistryTable::SIZE * 2));
+    guest_strings::write_wide_string(text_name, "Texto");
+    guest_strings::write_wide_string(text_data, "abc");
+    let text_entry = at::<nt::RtlQueryRegistryTable>(text_table);
+    text_entry.flags.set(0x20);
+    text_entry.name.set(text_name);
+    text_entry.entry_context.set(string);
+    let written = call("RtlWriteRegistryValue", &[1, relative, text_name, 1, text_data, 8]);
+    let queried = call("RtlQueryRegistryValues", &[1, relative, text_table, 0, 0]);
+    let unicode = at::<nt::UnicodeString>(string);
+    assert(written == 0 && queried == 0 && unicode.length.get() == 6 && unicode.maximum_length.get() == 8 && unicode.buffer.get() != 0 && guest_strings::read_unicode_string(string) == "abc", "rtl: RtlQueryRegistryValues DIRECT de REG_SZ relativo a Services");
+    for buffer in [text_name, text_data, string, text_table] {
+        guest::free_bytes(buffer);
+    }
     assert(call("RtlDeleteRegistryValue", &[1, relative, value_name]) == 0 && call("RtlDeleteRegistryValue", &[1, relative, value_name]) as u32 == 0xC000_0034, "rtl: RtlDeleteRegistryValue remove o valor");
     // SID S-1-5-32-544.
     let (sid, authority, copy) = (block + 0xA00, block + 0xA40, block + 0xA60);

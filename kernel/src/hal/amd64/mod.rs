@@ -11,3 +11,4 @@ pub mod native_call;
 pub mod private_entries;
 pub mod service_table;
 pub mod runtime_signing_policy;
+pub mod routine_stubs;

@@ -364,11 +364,15 @@ pub fn create_object(parent_path: &str, name: &str, type_name: &str, data: Optio
     let native = data.as_ref().map_or(0, |data| data.native_pointer);
     let id = with_state(|state| {
         let Some(parent) = parent.filter(|parent| state.nodes.get(parent).is_some_and(|node| node.children.is_some())) else {
-            return Err(KernelError::new(alloc::format!("dir inexistente: {parent_path}")));
+            // STATUS_OBJECT_PATH_NOT_FOUND, como o ObInsertObject de um nome
+            // com diretório ausente.
+            return Err(KernelError::with_status(alloc::format!("dir inexistente: {parent_path}"), 0xC000_003A));
         };
         let collision = state.nodes[&parent].children.as_ref().unwrap().values().any(|child| state.nodes.get(child).is_some_and(|child| child.name.to_lowercase() == key));
         if collision {
-            return Err(KernelError::new(alloc::format!("objeto ja existe: {parent_path}\\{name}")));
+            // STATUS_OBJECT_NAME_COLLISION: quem cria pelo nome (IoCreateDevice,
+            // IoCreateSymbolicLink) recebe o status e tenta outro nome.
+            return Err(KernelError::with_status(alloc::format!("objeto ja existe: {parent_path}\\{name}"), 0xC000_0035));
         }
         let id = state.next_node;
         state.next_node += 1;

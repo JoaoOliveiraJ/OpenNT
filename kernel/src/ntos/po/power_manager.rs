@@ -90,16 +90,11 @@ pub fn start_next_power_request(device: u64) {
     }
 }
 
-/// PoCallDriver: no fundo da pilha (sem dispositivo anexado) o IRP fica com
-/// o status que já tem. AttachedDevice é lido como DWORD.
+/// PoCallDriver: no ntoskrnl 19041 (rva 0x39a1f0) é o IofCallDriver — o
+/// IRP de energia desce para `device` (a próxima posição de pilha passa a
+/// ser a corrente) e vai ao MajorFunction[IRP_MJ_POWER] do driver dele.
 pub fn call_driver_down_the_stack(device: u64, irp: u64) -> u32 {
-    // SAFETY: DEVICE_OBJECT do chamador. AttachedDevice é um ponteiro inteiro.
-    let attached = unsafe { DeviceObject::at(device) }.attached_device.get();
-    if attached == 0 {
-        return 0;
-    }
-    let dispatcher = STATE.lock().dispatcher;
-    dispatcher.map_or(0, |dispatcher| dispatcher(attached, irp))
+    io_manager::iof_call_driver(device, irp) as u32
 }
 
 /// Dispositivo dono do IRP: CurrentStackLocation->DeviceObject.
@@ -120,25 +115,47 @@ pub fn start_next_power_irp(packet: u64) {
 /// constrói e despacha um IRP de energia real (QUERY/SET) e chama a
 /// conclusão com a assinatura do wdm.h (device, minor, state, contexto,
 /// IO_STATUS_BLOCK).
-pub fn request_power_irp(device: u64, minor: u32, state: u32, completion: u64, context: u64, irp_out: u64) {
-    // SAFETY: DEVICE_OBJECT do chamador.
-    let stack_count = match unsafe { DeviceObject::at(device) }.stack_size.get() as u8 {
+///
+/// Como o PopRequestPowerIrp do ntoskrnl 19041: o IRP vai ao topo da pilha
+/// do dispositivo (IoGetAttachedDeviceReference) com o tamanho de pilha
+/// dele, IoStatus = STATUS_NOT_SUPPORTED, e desce pelo IofCallDriver; a
+/// conclusão do Po chama o PREQUEST_POWER_COMPLETE (o POWER_STATE por
+/// valor) e libera o IRP. Devolve STATUS_PENDING.
+pub fn request_power_irp(device: u64, minor: u32, state: u32, completion: u64, context: u64, irp_out: u64) -> u32 {
+    let top = crate::ntos::ob::objects::device::top(device);
+    let top = if top != 0 { top } else { device };
+    // SAFETY: DEVICE_OBJECT do topo da pilha.
+    let stack_count = match unsafe { DeviceObject::at(top) }.stack_size.get() as u8 {
         0 => 1,
         count => count as u32,
     };
     let packet = guest::alloc_bytes(irp_builder::size_for(stack_count));
-    irp_builder::build(packet, &BuildOptions { major: 0x16, minor: minor as u8, device_object: device, stack_count, power: Some(Power { power_state_type: 1, device_state: state }), ..Default::default() });
+    if packet == 0 {
+        return 0xC000_009A;
+    }
+    irp_builder::build(packet, &BuildOptions { major: 0x16, minor: minor as u8, device_object: top, stack_count, power: Some(Power { power_state_type: 1, device_state: state }), ..Default::default() });
+    // O IofCallDriver abaixo desce uma posição: a posição do primeiro driver
+    // é a de cima, a que o build preencheu.
+    // SAFETY: o IRP recém-construído.
+    let irp = unsafe { Irp::at(packet) };
+    irp.io_status.status.set(0xC000_00BBu32 as i32);
     if irp_out != 0 {
         // SAFETY: PIRP* opcional do chamador.
         unsafe { Field::<u64>::at(irp_out) }.set(packet);
     }
-    io_manager::dispatch_native_power_irp(device, packet);
-    if completion != 0 {
-        // SAFETY: o IRP recém-construído.
-        let io_status = unsafe { Irp::at(packet) }.io_status.address();
-        native_call::call(completion, &[device, minor as u64, state as u64, context, io_status]);
-    }
-    guest::free_bytes(packet);
+    io_manager::manage_completion(
+        packet,
+        alloc::boxed::Box::new(move |_, _| {
+            if completion != 0 {
+                // SAFETY: o IRP continua vivo até o fim desta conclusão.
+                let io_status = unsafe { Irp::at(packet) }.io_status.address();
+                native_call::call(completion, &[device, minor as u64, state as u64, context, io_status]);
+            }
+            guest::free_bytes(packet);
+        }),
+    );
+    io_manager::iof_call_driver(top, packet);
+    0x103
 }
 
 /// PoQueryWatchdogTime(Pdo, &seconds): nenhum watchdog armado, *seconds = 0

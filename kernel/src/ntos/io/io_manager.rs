@@ -80,6 +80,7 @@ const IRP_DEALLOCATE_BUFFER: u32 = 0x20;
 const SL_INVOKE_ON_SUCCESS: u8 = 0x40;
 const SL_INVOKE_ON_ERROR: u8 = 0x80;
 const STATUS_MORE_PROCESSING_REQUIRED: i32 = 0xC000_0016u32 as i32;
+const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 
 /// IRP vivo do chamador (o PIRP dos exports e dos construtores daqui).
 fn irp_at(packet: u64) -> &'static Irp {
@@ -176,7 +177,13 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
     // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
     let handler = unsafe { DriverObject::at(driver) }.major_function.get(major as usize).map_or(0, Field::get);
     if handler == 0 {
-        return status::NOT_SUPPORTED;
+        // O NT preenche o MajorFunction que o driver não definiu com o
+        // IopInvalidDeviceRequest: o IRP volta concluído com
+        // STATUS_INVALID_DEVICE_REQUEST.
+        irp.io_status.status.set(STATUS_INVALID_DEVICE_REQUEST);
+        irp.io_status.information.set(0);
+        iof_complete_request(packet);
+        return STATUS_INVALID_DEVICE_REQUEST;
     }
     native_call::call(handler, &[device, packet]) as i32
 }
@@ -294,9 +301,19 @@ pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length
     // SAFETY: StartingOffset (PLARGE_INTEGER) do chamador de modo kernel.
     let byte_offset = if byte_offset_pointer != 0 { unsafe { LargeInteger::at(byte_offset_pointer) }.quad_part.get() as u64 } else { 0 };
     let address = guest::alloc_bytes(builder::size_for(stack_count));
-    builder::build(address, &BuildOptions { major, buffer, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, ..Default::default() });
+    // DO_DIRECT_IO: leitura e escrita levam o buffer num MDL (o
+    // IoAllocateMdl + MmProbeAndLockPages do IopBuildAsynchronousFsdRequest),
+    // não no SystemBuffer.
+    let direct = matches!(major, irp_mj::READ | irp_mj::WRITE) && buffer != 0 && device_at(device).flags.get() & DO_DIRECT_IO != 0;
+    builder::build(address, &BuildOptions { major, buffer: if direct { 0 } else { buffer }, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, ..Default::default() });
+    if direct {
+        irp_at(address).mdl_address.set(super::mdl::allocate_mdl(buffer, length));
+    }
     address
 }
+
+/// DEVICE_OBJECT.Flags DO_DIRECT_IO.
+const DO_DIRECT_IO: u32 = 0x10;
 
 /// Contexto opcional do pedido (FILE_OBJECT, modo e thread).
 #[derive(Clone, Copy, Default)]

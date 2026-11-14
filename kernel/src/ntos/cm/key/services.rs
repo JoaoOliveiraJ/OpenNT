@@ -552,7 +552,10 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                 };
                 let existing = registry::node_by_path(&absolute_path);
                 let existed = existing.is_some();
-                let parent_node = registry::node_by_path(&absolute_path[..absolute_path.rfind('\\').unwrap_or(0)]);
+                // Separadores no fim do nome (o "Target0\" do ataport) não abrem um
+                // componente vazio: o pai é o do último componente de verdade.
+                let trimmed = absolute_path.trim_end_matches('\\');
+                let parent_node = registry::node_by_path(&trimmed[..trimmed.rfind('\\').unwrap_or(0)]);
                 if create && !existed && parent_node.is_none() {
                     return Ok(Outcome::from_status(0xC000_003A));
                 }

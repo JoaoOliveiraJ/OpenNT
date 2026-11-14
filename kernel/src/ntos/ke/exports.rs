@@ -252,8 +252,7 @@ fn query_unbiased_interrupt_time(_: &Call) -> Result<u64, KernelError> {
     Ok(clock::unbiased_interrupt_time())
 }
 fn query_unbiased_interrupt_time_precise(call: &Call) -> Result<u64, KernelError> {
-    clock::query_unbiased_interrupt_time_precise(call.arg(1));
-    Ok(0)
+    Ok(clock::query_unbiased_interrupt_time_precise(call.arg(1)))
 }
 /// A tolerância é otimização de energia: agenda como um timer normal.
 fn set_coalescable_timer(call: &Call) -> Result<u64, KernelError> {

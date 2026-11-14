@@ -890,6 +890,9 @@ pub mod private_routines {
         if (private_dispatch::BASE..private_dispatch::BASE + private_dispatch::SLOT_COUNT as u64).contains(&id) {
             return private_dispatch::routine_name((id - private_dispatch::BASE) as usize);
         }
+        if crate::hal::amd64::routine_stubs::owns(id) {
+            return crate::hal::amd64::routine_stubs::name(id);
+        }
         Some(match id {
             ID => "MmAllocateIndependentPages",
             FREE_ID => "MmFreeIndependentPages",
@@ -912,6 +915,9 @@ pub mod private_routines {
         use crate::hal::private_dispatch;
         if (private_dispatch::BASE..private_dispatch::BASE + private_dispatch::SLOT_COUNT as u64).contains(&id) {
             return private_dispatch::dispatch((id - private_dispatch::BASE) as usize, call);
+        }
+        if crate::hal::amd64::routine_stubs::owns(id) {
+            return crate::hal::amd64::routine_stubs::dispatch(id, call);
         }
         match id {
             ID => independent_pages::allocate(call.arg(1), call.arg(2) as u32),
