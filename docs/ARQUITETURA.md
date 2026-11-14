@@ -892,6 +892,58 @@ dentro dele) que não é compartilhado entre as raízes:
   livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
   relocadas), também sobre frames do PFN.
 
+### 3.5 Plug and Play e a pilha de armazenamento real
+
+A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
+
+- `devnode.rs`: um DEVICE_NODE por PDO (ids, caminho da instância em
+  `Enum`, capacidades, barramento, configuração de boot, requisitos,
+  recursos brutos e traduzidos, serviço, estado e o CM_PROB_* que parou o
+  nó). A raiz é `HTREE\ROOT\0`, sobre um PDO do PnpManager.
+- `irp.rs`: o IopSynchronousCall. Todo pedido vai ao topo da pilha com
+  IoStatus.Status = STATUS_NOT_SUPPORTED e Information inicial (a lista no
+  FILTER_RESOURCE_REQUIREMENTS); o pool que o driver devolve volta pelo
+  ExFreePool.
+- `tree.rs`: o PipProcessDevNodeTree. Para cada PDO novo das BusRelations:
+  QUERY_ID (DeviceID), QUERY_CAPABILITIES, InstanceID (sem UniqueID, com o
+  ParentIdPrefix `nível&hash&n` do PipMakeGloballyUniqueId; o hash confere
+  com o `3&267a616a&0` de um Windows nesta VM), HardwareIDs, CompatibleIDs,
+  textos, QUERY_BUS_INFORMATION, QUERY_RESOURCES e
+  QUERY_RESOURCE_REQUIREMENTS; a chave da instância; a instalação; os
+  AddDevice (LowerFilters da instância e da classe, serviço, UpperFilters);
+  FILTER_RESOURCE_REQUIREMENTS, arbitragem e tradução; START_DEVICE com as
+  duas listas; QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE; enumeração. O
+  IoInvalidateDeviceRelations de um nó da árvore enfileira a reenumeração.
+- `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
+  hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf), com o
+  serviço, a classe e os AddReg de cada seção. O posto segue o instalador
+  (HardwareIDs antes de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o
+  intelide.sys antes do pciide.sys de PCI\CC_0101.
+- `resources.rs`: as listas do NT, os árbitros (primeira opção livre,
+  alternativas, compartilhamento) e o tradutor da HAL (IRQ de linha `n` →
+  vetor `0x20 + n`, IRQL `n`).
+- `root.rs`: o barramento raiz; o barramento PCI interno
+  (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Um
+  IoReportDetectedDevice com a árvore montada vira um devnode
+  `ROOT\<serviço>\NNNN` já iniciado.
+
+Os PDOs do barramento PCI respondem como o pci.sys (`drivers/bus/pci_pnp.rs`
+e `pci_interface.rs`): ids, capacidades, requisitos dos BARs (sem os do canal
+IDE legado), BUS_INTERFACE_STANDARD e PCI_BUS_INTERFACE_STANDARD,
+READ/WRITE_CONFIG. As rotinas que um driver recebe por ponteiro (interfaces
+de barramento, DMA_OPERATIONS) são stubs nativos de `hal/amd64/
+routine_stubs.rs` (ids privados 0x80000400+). O adaptador de DMA é o da HAL
+(`hal/dma.rs`, o HalGetAdapterV2 com a tabela V2 de operações), alcançado pelo
+IoGetDmaAdapter através da interface do barramento. IoGetDeviceProperty,
+IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
+`\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
+devnode.
+
+Com `--storage=real` (`drivers/storage/storage_stack.rs`), o fim da fase 1
+monta a árvore e sobe a pilha IDE real: intelide.sys/pciidex.sys na
+controladora, atapi.sys/ataport.sys nos canais, disk.sys/classpnp.sys nos
+discos. Sem a opção nada disso roda.
+
 ## 4. Dependências
 
 - Os componentes do executive se chamam entre si, como no NT (`ke` ↔ `ps`,
