@@ -23,7 +23,7 @@
 //!   só FILE_WRITE_THROUGH e as opções síncronas. Qualquer falha é
 //!   STATUS_INVALID_PARAMETER.
 
-use crate::ntos::inc::types::extra_pipes::{MailslotCreateParameters, NamedPipeCreateParameters};
+use crate::ntos::inc::types::{MailslotCreateParameters, NamedPipeCreateParameters};
 use crate::ntos::inc::types::NtStruct;
 use crate::ntos::mm::guest_memory as guest;
 

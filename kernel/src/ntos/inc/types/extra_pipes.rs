@@ -1,62 +1,14 @@
-//! Estruturas públicas dos pipes nomeados e dos mailslots (ntifs.h) que não
-//! constam dos símbolos do ntoskrnl 19041: os parâmetros de criação que o
-//! NtCreateNamedPipeFile e o NtCreateMailslotFile passam ao file system na
-//! stack location do IRP_MJ_CREATE_NAMED_PIPE/IRP_MJ_CREATE_MAILSLOT, as
-//! classes de informação de pipe (FilePipeInformation,
-//! FilePipeLocalInformation) e os buffers dos FSCTLs de pipe
-//! (FSCTL_PIPE_PEEK, FSCTL_PIPE_WAIT, FSCTL_PIPE_QUERY_CLIENT_PROCESS).
-//! Layout x64 do cabeçalho, conferido em compilação.
+//! Estruturas públicas dos pipes nomeados (ntifs.h) que não constam dos
+//! símbolos do ntoskrnl 19041: as classes de informação de pipe
+//! (FilePipeInformation, FilePipeLocalInformation) e os buffers dos FSCTLs
+//! de pipe (FSCTL_PIPE_PEEK, FSCTL_PIPE_WAIT,
+//! FSCTL_PIPE_QUERY_CLIENT_PROCESS). Os parâmetros de criação
+//! (NAMED_PIPE_CREATE_PARAMETERS e MAILSLOT_CREATE_PARAMETERS) constam e
+//! são gerados com os outros tipos do Io. Layout x64 do cabeçalho,
+//! conferido em compilação.
 
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::LargeInteger;
-
-/// `_NAMED_PIPE_CREATE_PARAMETERS` (ntifs.h; 0x28 bytes).
-#[repr(C)]
-pub struct NamedPipeCreateParameters {
-    pub named_pipe_type: Field<u32>,
-    pub read_mode: Field<u32>,
-    pub completion_mode: Field<u32>,
-    pub maximum_instances: Field<u32>,
-    pub inbound_quota: Field<u32>,
-    pub outbound_quota: Field<u32>,
-    pub default_timeout: LargeInteger,
-    pub timeout_specified: Field<u8>,
-    _pad_21: Reserved<0x7>,
-}
-
-unsafe impl NtStruct for NamedPipeCreateParameters {}
-
-const _: () = {
-    assert!(core::mem::size_of::<NamedPipeCreateParameters>() == 0x28);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, named_pipe_type) == 0x0);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, read_mode) == 0x4);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, completion_mode) == 0x8);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, maximum_instances) == 0xC);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, inbound_quota) == 0x10);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, outbound_quota) == 0x14);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, default_timeout) == 0x18);
-    assert!(core::mem::offset_of!(NamedPipeCreateParameters, timeout_specified) == 0x20);
-};
-
-/// `_MAILSLOT_CREATE_PARAMETERS` (ntifs.h; 0x18 bytes).
-#[repr(C)]
-pub struct MailslotCreateParameters {
-    pub mailslot_quota: Field<u32>,
-    pub maximum_message_size: Field<u32>,
-    pub read_timeout: LargeInteger,
-    pub timeout_specified: Field<u8>,
-    _pad_11: Reserved<0x7>,
-}
-
-unsafe impl NtStruct for MailslotCreateParameters {}
-
-const _: () = {
-    assert!(core::mem::size_of::<MailslotCreateParameters>() == 0x18);
-    assert!(core::mem::offset_of!(MailslotCreateParameters, mailslot_quota) == 0x0);
-    assert!(core::mem::offset_of!(MailslotCreateParameters, maximum_message_size) == 0x4);
-    assert!(core::mem::offset_of!(MailslotCreateParameters, read_timeout) == 0x8);
-    assert!(core::mem::offset_of!(MailslotCreateParameters, timeout_specified) == 0x10);
-};
 
 /// `_FILE_PIPE_INFORMATION` (ntifs.h; FilePipeInformation, 8 bytes).
 #[repr(C)]

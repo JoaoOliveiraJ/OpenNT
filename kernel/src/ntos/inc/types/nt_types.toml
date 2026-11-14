@@ -80,6 +80,8 @@ raizes = [
   # Cm: o formato de hive (regf)
   "_HBASE_BLOCK", "_HBIN", "_CM_KEY_NODE", "_CM_KEY_VALUE", "_CM_KEY_SECURITY", "_CM_KEY_INDEX",
   "_CM_INDEX", "_CM_BIG_DATA",
+  # pipes nomeados e mailslots
+  "_NAMED_PIPE_CREATE_PARAMETERS", "_MAILSLOT_CREATE_PARAMETERS",
 ]
 
 # O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS
