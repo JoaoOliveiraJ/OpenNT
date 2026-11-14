@@ -11514,11 +11514,10 @@ fn ex_wnf_subscription_exports(assert: Assert) {
     guest::free_bytes(storage);
 }
 
-/// Código nativo de teste numa alocação da arena (executável).
+/// Código nativo de teste numa alocação executável da janela de sistema.
 fn native_stub(code: &[u8]) -> u64 {
-    let stub = guest::alloc_bytes(0x40);
-    guest::write_bytes(stub, code);
-    stub
+    // Numa alocação executável: o heap do kernel não executa.
+    super::executable_code::place(code)
 }
 
 /// UNICODE_STRING com o texto logo depois, numa alocação nova.

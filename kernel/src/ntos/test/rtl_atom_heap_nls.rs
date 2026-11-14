@@ -167,13 +167,12 @@ fn atom_tables(assert: Assert) {
 /// CommitRoutine de teste (MS x64): conta as chamadas e guarda o último
 /// pedido (endereço e tamanho) em `record`; devolve STATUS_SUCCESS.
 fn commit_routine(record: u64) -> u64 {
-    let code = guest::alloc_bytes(64);
     let mut bytes = alloc::vec![0x48, 0xB8];
     bytes.extend_from_slice(&record.to_le_bytes());
     // lock inc qword [rax]; mov r9,[rdx]; mov [rax+8],r9; mov r9,[r8]; mov [rax+16],r9; xor eax,eax; ret
     bytes.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x00, 0x4C, 0x8B, 0x0A, 0x4C, 0x89, 0x48, 0x08, 0x4D, 0x8B, 0x08, 0x4C, 0x89, 0x48, 0x10, 0x31, 0xC0, 0xC3]);
-    guest::write_bytes(code, &bytes);
-    code
+    // Numa alocação executável: o heap do kernel não executa.
+    super::executable_code::place(&bytes)
 }
 
 /// RTL_HEAP_PARAMETERS com InitialCommit/InitialReserve/CommitRoutine.
@@ -226,15 +225,16 @@ fn fixed_heap(assert: Assert) {
     let after = call_export("RtlAllocateHeap", &[handle, 0, 16]);
     assert(destroyed == 0 && after == Some(0) && guest::read32(region + 0x10) == 0xCCDD_CCDD, "heap: RtlDestroyHeap do heap fixo devolve NULL e nao toca a memoria do chamador");
     // CommitRoutine que falha: a alocação devolve NULL.
-    let failing = guest::alloc_bytes(16);
-    guest::write_bytes(failing, &[0xB8, 0x17, 0x00, 0x00, 0xC0, 0xC3]);
+    let failing = super::executable_code::place(&[0xB8, 0x17, 0x00, 0x00, 0xC0, 0xC3]);
     let failing_parameters = heap_parameters(0x1000, 0x8000, failing);
     let second_region = guest::alloc_aligned(0x8000, 0x1000, true);
     let failing_heap = call_export("RtlCreateHeap", &[0x309, second_region, 0x8000, 0x1000, 0, failing_parameters]).unwrap_or(0);
     let refused = call_export("RtlAllocateHeap", &[failing_heap, 0, 32]);
     assert(failing_heap == second_region && refused == Some(0), "heap: sem pagina confirmada pela CommitRoutine a alocacao devolve NULL");
     let _ = status("RtlDestroyHeap", &[failing_heap]);
-    for block in [record, routine, region, parameters, inverted, failing, failing_parameters, second_region] {
+    super::executable_code::release(routine);
+    super::executable_code::release(failing);
+    for block in [record, region, parameters, inverted, failing_parameters, second_region] {
         guest::free_bytes(block);
     }
 }
@@ -284,7 +284,8 @@ fn nt_heap(assert: Assert) {
     let growable_based = call_export("RtlCreateHeap", &[0x2, region, 0, 0, 0, parameters]);
     assert(growable_based == Some(0) && status("RtlDestroyHeap", &[based]) == 0, "heap: HEAP_GROWABLE com CommitRoutine e recusado");
     let _ = crate::ntos::ex::resource::delete(lock);
-    for block in [lock, record, routine, region, parameters] {
+    super::executable_code::release(routine);
+    for block in [lock, record, region, parameters] {
         guest::free_bytes(block);
     }
 }
@@ -547,8 +548,7 @@ fn crt_sqrtf(assert: Assert) {
         return;
     };
     // movd xmm0, ecx; call rdx; movd eax, xmm0; ret
-    let caller = guest::alloc_bytes(16);
-    guest::write_bytes(caller, &[0x66, 0x0F, 0x6E, 0xC1, 0xFF, 0xD2, 0x66, 0x0F, 0x7E, 0xC0, 0xC3]);
+    let caller = super::executable_code::place(&[0x66, 0x0F, 0x6E, 0xC1, 0xFF, 0xD2, 0x66, 0x0F, 0x7E, 0xC0, 0xC3]);
     let native = |bits: u32| native_call::call(caller, &[bits as u64, address]) as u32;
     let fixed = native(0x4080_0000) == 0x4000_0000 && native(0x4000_0000) == 0x3FB5_04F3 && native(0xBF80_0000) == 0xFFC0_0000 && native(0x8000_0000) == 0x8000_0000 && native(0x7F80_0000) == 0x7F80_0000;
     // A rotina soft-float confere com o SQRTSS em uma amostra ampla.
@@ -559,7 +559,7 @@ fn crt_sqrtf(assert: Assert) {
         value = value.wrapping_mul(0x9E37_79B9).wrapping_add(0x7F4A_7C15);
     }
     assert(fixed && matches, "sqrtf: o corpo nativo e a rotina soft-float dao o resultado do SQRTSS");
-    guest::free_bytes(caller);
+    super::executable_code::release(caller);
 }
 
 /// Tabela de mensagens na fixture MAPPED (RT_MESSAGETABLE, 1, 0x409).
