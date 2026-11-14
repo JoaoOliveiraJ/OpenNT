@@ -111,7 +111,13 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
             Some(value) => (value.value_type, Some(value.data.clone())),
             None if default_type != 0 => {
                 // DefaultLength 0 num default de texto: o tamanho vem do
-                // próprio texto com o NUL (o NUL duplo num REG_MULTI_SZ).
+                // próprio texto com o NUL (o NUL duplo num REG_MULTI_SZ). Sem
+                // texto (DefaultData NULL), o RtlpCallQueryRegistryRoutine
+                // devolve STATUS_DATA_OVERRUN e a consulta para ali.
+                if matches!(default_type, 1 | 2 | 7) && default_length == 0 && default_data == 0 {
+                    status = 0xC000_003Cu32 as i32 as i64 as u64;
+                    break;
+                }
                 let length = match default_type {
                     1 | 2 if default_length == 0 && default_data != 0 => (guest_strings::read_wide_string(default_data).encode_utf16().count() + 1) * 2,
                     7 if default_length == 0 && default_data != 0 => {
