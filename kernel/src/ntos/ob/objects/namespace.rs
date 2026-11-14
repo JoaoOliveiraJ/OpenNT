@@ -2,8 +2,9 @@
 //!
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
 //! ponteiro. O corpo privado (64 bytes) guarda referências (+0), handles
-//! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10) e o
-//! número de filhos (+0x20). As contagens vivem só na memória do corpo e
+//! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10), o
+//! número de filhos (+0x20) e, num diretório, o SessionId do
+//! OBJECT_DIRECTORY (+0x28). As contagens vivem só na memória do corpo e
 //! mudam por operações atômicas, como o PointerCount/HandleCount do NT.
 
 use alloc::collections::BTreeMap;
@@ -30,7 +31,11 @@ struct NamespaceBody {
     permanent: Field<u32>,
     link_target: UnicodeString,
     children: Field<u64>,
-    _reserved: Reserved<0x18>,
+    /// OBJECT_DIRECTORY.SessionId: -1 (sem sessão) na criação, como o
+    /// ObpCreateDirectoryObject; o NtSetInformationObject
+    /// (ObjectSessionInformation) grava a sessão de quem chama.
+    session_id: Field<u32>,
+    _reserved: Reserved<0x14>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -40,7 +45,11 @@ const _: () = {
     assert!(core::mem::size_of::<NamespaceBody>() == 0x40);
     assert!(core::mem::offset_of!(NamespaceBody, link_target) == 0x10);
     assert!(core::mem::offset_of!(NamespaceBody, children) == 0x20);
+    assert!(core::mem::offset_of!(NamespaceBody, session_id) == 0x28);
 };
+
+/// SessionId de diretório sem sessão.
+pub const NO_SESSION: u32 = u32::MAX;
 
 pub const SIZE: u64 = NamespaceBody::SIZE;
 
@@ -106,6 +115,7 @@ pub fn ensure(node: NodeId) -> Result<Option<u64>, KernelError> {
     fresh.references.set(attached as u64);
     fresh.permanent.set(if snapshot.permanent == Some(false) { 0 } else { 1 });
     fresh.children.set(snapshot.children.as_ref().map_or(0, |children| children.len() as u64));
+    fresh.session_id.set(NO_SESSION);
     let security = object_security::namespace(node, directory);
     BODIES.lock().insert(pointer, Body { node, directory, target_buffer, attached, security });
     object_manager::set_native_namespace(node, pointer);
@@ -163,6 +173,20 @@ pub fn permanent(pointer: u64) -> bool {
 
 pub fn set_permanent(pointer: u64, permanent: bool) {
     body(pointer).permanent.set(permanent as u32);
+}
+
+/// OBJECT_DIRECTORY.SessionId de um diretório vivo.
+pub fn session_id(pointer: u64) -> Result<u32, KernelError> {
+    assert_live(pointer)?;
+    Ok(body(pointer).session_id.get())
+}
+
+/// Grava o SessionId de um diretório vivo (o NT o faz com o diretório
+/// travado em exclusivo; aqui é um store único da célula).
+pub fn set_session_id(pointer: u64, session_id: u32) -> Result<(), KernelError> {
+    assert_live(pointer)?;
+    body(pointer).session_id.set(session_id);
+    Ok(())
 }
 
 fn reference_cell(pointer: u64) -> &'static AtomicU64 {

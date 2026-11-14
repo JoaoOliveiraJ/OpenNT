@@ -73,12 +73,23 @@ pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64
         return Ok((STATUS_INVALID_PARAMETER_1, 0));
     }
     let (process, count, entries) = (request.process.get(), request.number_of_entries.get(), request.virtual_addresses.get());
-    process_context::with_process(process, || {
-        let mut touched = 0;
-        for index in 0..count {
+    let ranges: alloc::vec::Vec<(u64, u64)> = (0..count)
+        .map(|index| {
             // SAFETY: o vetor de faixas do chamador de kernel.
             let entry = unsafe { MemoryRangeEntry::at(entries + index * MemoryRangeEntry::SIZE) };
-            let (start, length) = (entry.virtual_address.get(), entry.number_of_bytes.get());
+            (entry.virtual_address.get(), entry.number_of_bytes.get())
+        })
+        .collect();
+    Ok((0, prefetch_ranges(process, &ranges)?))
+}
+
+/// Traz cada página de usuário das faixas (VirtualAddress, NumberOfBytes)
+/// para a memória no espaço do processo (anexado a ele); devolve as páginas
+/// lidas. Página inacessível não é erro.
+pub fn prefetch_ranges(process: u64, ranges: &[(u64, u64)]) -> Result<u64, KernelError> {
+    process_context::with_process(process, || {
+        let mut touched = 0;
+        for &(start, length) in ranges {
             let Some(end) = start.checked_add(length) else { continue };
             let mut page = start & !(PAGE - 1);
             let mut pages = 0;
@@ -90,15 +101,65 @@ pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64
                 pages += 1;
             }
         }
-        Ok((0, touched))
+        Ok(touched)
     })?
 }
 
 /// VIRTUAL_MEMORY_INFORMATION_CLASS.VmPrefetchInformation.
-const VM_PREFETCH_INFORMATION: u32 = 0;
+pub const VM_PREFETCH_INFORMATION: u32 = 0;
+/// VmCfgCallTargetInformation: VmInformation é um
+/// CFG_CALL_TARGET_LIST_INFORMATION de 0x28 bytes.
+const VM_CFG_CALL_TARGET_INFORMATION: u32 = 2;
+/// VmImageHotPatchInformation.
+const VM_IMAGE_HOT_PATCH_INFORMATION: u32 = 4;
+/// A última classe que o serviço 19041 conhece.
+const VM_LAST_CLASS: u32 = 6;
 const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
-const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
-const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+pub const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+pub const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
+const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
+pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// As validações com que o NtSetInformationVirtualMemory 19041 abre, antes
+/// de tocar memória do chamador ou o handle: classe negativa ou acima de 6
+/// é STATUS_INVALID_PARAMETER_2; VmCfgCallTargetInformation exige
+/// VmInformationLength 0x28 e as outras um ULONG (VmInformation nulo é
+/// STATUS_INVALID_PARAMETER_5, comprimento errado STATUS_INVALID_PARAMETER_6);
+/// VmImageHotPatchInformation sem a reserva de hot patch de usuário
+/// (MiUserHotPatchReserveSize zero, o caso do OpenNT) é STATUS_NOT_SUPPORTED;
+/// NumberOfEntries zero ou de 2^60 em diante é STATUS_INVALID_PARAMETER_3.
+pub fn validate_information_request(class: u32, count: u64, information: u64, length: u32) -> Result<(), u32> {
+    if (class as i32) < 0 || class > VM_LAST_CLASS {
+        return Err(STATUS_INVALID_PARAMETER_2);
+    }
+    if class == VM_CFG_CALL_TARGET_INFORMATION {
+        if length != 0x28 {
+            return Err(STATUS_INVALID_PARAMETER_6);
+        }
+    } else {
+        if information == 0 {
+            return Err(STATUS_INVALID_PARAMETER_5);
+        }
+        if length != 4 {
+            return Err(STATUS_INVALID_PARAMETER_6);
+        }
+        if class == VM_IMAGE_HOT_PATCH_INFORMATION {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+    }
+    if count.wrapping_sub(1) > 0x0FFF_FFFF_FFFF_FFFE {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    Ok(())
+}
+
+/// MiValidateMemoryRangeEntries: cada faixa começa e termina abaixo de
+/// MM_HIGHEST_USER_ADDRESS (0x7FFFFFFEFFFF), tem tamanho e não dá a volta.
+pub fn valid_user_ranges(ranges: &[(u64, u64)]) -> bool {
+    const HIGHEST_USER_ADDRESS: u64 = 0x7FFF_FFFE_FFFF;
+    ranges.iter().all(|&(start, length)| start <= HIGHEST_USER_ADDRESS && length != 0 && start.checked_add(length).is_some_and(|end| end - 1 <= HIGHEST_USER_ADDRESS))
+}
 
 /// ZwSetInformationVirtualMemory(Process, VmInformationClass,
 /// NumberOfEntries, VirtualAddresses, VmInformation, VmInformationLength):

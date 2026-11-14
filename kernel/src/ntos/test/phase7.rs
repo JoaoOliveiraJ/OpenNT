@@ -735,7 +735,7 @@ fn user_virtual_memory(assert: Assert) {
         memory::nt_free_virtual_memory(u64::MAX, base_pointer, size_pointer, kind, 0).unwrap_or(1)
     };
     assert(free(reserved + 0x1000, 0x1000, 0x4000) == 0 && paging::translate(reserved + 0x1000) == 0 && memory::find_region(reserved).is_some(), "usermemory: MEM_DECOMMIT desmapeia e conserva a reserva");
-    assert(free(reserved, 0x1000, 0x8000) == 0xC000_000D && free(reserved, 0, 0x8000) == 0 && memory::find_region(reserved).is_none() && free(0x8000, 0, 0x8000) == 0xC000_000D, "usermemory: MEM_RELEASE exige base e tamanho zero e libera a regiao");
+    assert(free(reserved, 0x1000, 0x8000) == 0xC000_000D && free(reserved, 0, 0x8000) == 0 && memory::find_region(reserved).is_none() && free(0x8000, 0, 0x8000) == 0xC000_000D, "usermemory: MEM_RELEASE de parte da regiao recusado; base com tamanho zero libera a regiao");
     // Estruturas do processo e regiões compartilhadas.
     let structures = memory::map_user_region(0x1800);
     assert(structures.as_ref().is_ok_and(|&va| va % 0x1000 == 0 && va > data && va + 0x2000 <= memory::USER_ALLOCATION_TOP && paging::translate(va + 0x1000) != 0 && memory::find_region(va).is_some_and(|region| region.base() == va && region.size() == 0x2000)), "usermemory: regiao de estruturas de cima para baixo, pelo alocador");
@@ -747,7 +747,7 @@ fn user_virtual_memory(assert: Assert) {
         }
         assert(memory::find_region(va).is_none() && paging::translate(va) == 0, "usermemory: regiao de estruturas liberada");
     }
-    assert(free(data, 0, 0x8000) == 0 && memory::find_region(data).is_none(), "usermemory: regiao confirmada liberada");
+    assert(free(data + 0x10, 0x2FF0, 0x8000) == 0 && guest::read64(base_pointer) == data && guest::read64(size_pointer) == 0x3000 && memory::find_region(data).is_none(), "usermemory: MEM_RELEASE com a faixa da regiao inteira libera a regiao confirmada");
     assert(state::handler("NtAllocateVirtualMemory").is_some() && state::handler("NtQueryVirtualMemory").is_some(), "usermemory: handlers registrados");
     guest::free_bytes(block);
 }
@@ -1991,6 +1991,38 @@ fn user_syscalls_core(assert: Assert) {
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
     assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
+    // SystemTimeOfDayInformation: a estrutura inteira, um prefixo e o
+    // comprimento acima de 0x30.
+    guest::write_bytes(buffer, &[0xAA; 0x40]);
+    let boot = crate::ntos::ke::clock::boot_time();
+    let time_of_day = call("NtQuerySystemInformation", 3, buffer, 0x30, info) == 0 && guest::read32(info) == 0x30 && guest::read64(buffer) == boot && guest::read64(buffer + 8) >= boot && guest::read64(buffer + 0x10) as i64 == crate::ntos::ex::system_time::time_zone_bias() && guest::read32(buffer + 0x18) == 0 && guest::read32(buffer + 0x1C) == 0 && guest::read64(buffer + 0x20) == 0 && guest::read8(buffer + 0x30) == 0xAA;
+    guest::write_bytes(buffer, &[0xAA; 0x40]);
+    let prefix = call("NtQuerySystemInformation", 3, buffer, 8, info) == 0 && guest::read32(info) == 8 && guest::read64(buffer) == boot && guest::read8(buffer + 8) == 0xAA;
+    let long = call("NtQuerySystemInformation", 3, buffer, 0x31, info) == 0xC000_0004 && guest::read32(info) == 0x30 && call("NtQuerySystemInformation", 3, buffer + 1, 0x30, 0) == 0x8000_0002;
+    assert(time_of_day && prefix && long, "usercore: SystemTimeOfDayInformation copia ate o comprimento pedido e recusa mais que 0x30");
+    // NtSetInformationVirtualMemory: validações do serviço, VmImageHotPatch
+    // sem reserva e a pré-busca de uma faixa do processo.
+    let vm = |class: u64, count: u64, entries: u64, flags: u32, information: u64, length: u32| {
+        guest::write32(out, flags);
+        guest::write64(rsp + 0x28, information);
+        guest::write32(rsp + 0x30, length);
+        call("NtSetInformationVirtualMemory", u64::MAX, class, count, entries)
+    };
+    guest::write64(string, buffer);
+    guest::write64(string + 8, 0x100);
+    let validated = vm(7, 1, string, 0, out, 4) == 0xC000_00F0 && vm(0, 1, string, 0, 0, 4) == 0xC000_00F3 && vm(0, 1, string, 0, out, 8) == 0xC000_00F4 && vm(2, 1, string, 0, out, 4) == 0xC000_00F4 && vm(4, 1, string, 0, out, 4) == 0xC000_00BB && vm(0, 0, string, 0, out, 4) == 0xC000_00F1 && vm(0, 1, string + 2, 0, out, 4) == 0x8000_0002;
+    let prefetched = vm(0, 1, string, 0, out, 4) == 0 && vm(0, 1, string, 1, out, 4) == 0xC000_00F3 && vm(1, 1, string, 0, out, 4) == 0xC000_00BB;
+    guest::write64(string, 0xFFFF_8000_0000_0000);
+    let ranges = vm(0, 1, string, 0, out, 4) == 0xC000_00F2;
+    guest::write64(rsp + 0x28, 0);
+    guest::write64(rsp + 0x30, 0);
+    assert(validated && prefetched && ranges, "usercore: NtSetInformationVirtualMemory valida classe, VmInformation, comprimento e faixas e pre-busca no processo");
+    // ProcessLUIDDeviceMapsEnabled: a constante 1, com ReturnLength.
+    guest::write32(buffer, 0xAAAA_AAAA);
+    guest::write64(rsp + 0x28, info);
+    let luid = call("NtQueryInformationProcess", u64::MAX, 28, buffer, 4) == 0 && guest::read32(buffer) == 1 && guest::read32(info) == 4 && call("NtQueryInformationProcess", u64::MAX, 28, buffer, 8) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 28, buffer + 2, 4) == 0x8000_0002;
+    guest::write64(rsp + 0x28, 0);
+    assert(luid, "usercore: ProcessLUIDDeviceMapsEnabled responde 1 e confere comprimento e alinhamento");
     guest::write64(buffer, u64::MAX);
     assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
     guest::write32(rsp + 0x28, 80);

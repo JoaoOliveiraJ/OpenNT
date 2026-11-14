@@ -96,6 +96,24 @@ pub fn system_time_100ns() -> u64 {
     time::unix_milliseconds_to_nt_time(WALL_CLOCK_MS_AT_BOOT.load(Ordering::Relaxed)) + uptime_100ns()
 }
 
+/// KeBootTime: a hora do sistema no boot (100 ns desde 1601), a amostra do
+/// RTC que serve de origem ao relógio de parede.
+pub fn boot_time() -> u64 {
+    time::unix_milliseconds_to_nt_time(WALL_CLOCK_MS_AT_BOOT.load(Ordering::Relaxed))
+}
+
+/// KeQueryBootTimeValues (RVA 0x317088): (CurrentTime, BootTime,
+/// BootTimeBias) lidos juntos. CurrentTime é o KUSER_SHARED_DATA.SystemTime;
+/// KeBootTimeBias acumula os ajustes de hora feitos depois do boot, e o
+/// OpenNT não ajusta a hora (NtSetSystemTime não existe): zero.
+pub fn query_boot_time_values() -> (u64, u64, u64) {
+    let current = match crate::ntos::mm::shared_user_data::data() {
+        Some(shared) => crate::ntos::mm::shared_user_data::read_shared_time(&shared.system_time),
+        None => system_time_100ns(),
+    };
+    (current, boot_time(), 0)
+}
+
 /// Relógio de parede: amostra inicial do RTC + tempo transcorrido.
 pub fn now_ms() -> u64 {
     WALL_CLOCK_MS_AT_BOOT.load(Ordering::Relaxed) + uptime_ms()

@@ -7,6 +7,32 @@
 
 use super::*;
 
+/// `_SYSTEM_TIMEOFDAY_INFORMATION` (NtQuerySystemInformation
+/// (SystemTimeOfDayInformation, classe 3); 0x30 bytes).
+#[repr(C)]
+pub struct SystemTimeofdayInformation {
+    pub boot_time: Field<i64>,
+    pub current_time: Field<i64>,
+    pub time_zone_bias: Field<i64>,
+    pub time_zone_id: Field<u32>,
+    pub reserved: Field<u32>,
+    pub boot_time_bias: Field<u64>,
+    pub sleep_time_bias: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemTimeofdayInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemTimeofdayInformation>() == 0x30);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, boot_time) == 0x0);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, current_time) == 0x8);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, time_zone_bias) == 0x10);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, time_zone_id) == 0x18);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, reserved) == 0x1C);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, boot_time_bias) == 0x20);
+    assert!(core::mem::offset_of!(SystemTimeofdayInformation, sleep_time_bias) == 0x28);
+};
+
 /// `_SYSTEM_MANUFACTURING_INFORMATION` (NtQuerySystemInformation
 /// (SystemManufacturingInformation, classe 157); 0x18 bytes): Options e o
 /// nome do perfil, cujo texto vem logo depois da estrutura.

@@ -325,6 +325,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         103 => return code_integrity_information::query(buffer, length, returned, true),
         143 => return secure_boot_information::query(buffer, length, returned, true),
         157 => return crate::ntos::ex::manufacturing_information::query(buffer, length, returned, true),
+        3 => return crate::ntos::ex::time_of_day_information::query(buffer, length, returned, true),
         1 | 63 => return Ok(processor_information::query(buffer, length as u32, returned, true, class == 63)),
         5 => return system_process_information::query(buffer, length, returned, true),
         _ => {}
@@ -544,7 +545,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     let returned = stack_arg(rsp, 5);
     let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
     // As classes locais sondam o ReturnLength antes de qualquer escrita.
-    let local = matches!(class, 0 | 24 | 27 | 31 | 36);
+    let local = matches!(class, 0 | 24 | 27 | 28 | 31 | 36);
     if local && returned != 0 && !probe_user_write(returned, 4) {
         if class == 0 {
             if let Err(status) = queried_process(handle) {
@@ -634,6 +635,24 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
                 Err(status) => return Ok(status),
             };
             guest::try_write::<u32>(buffer, crate::ntos::ps::session::query(target))?;
+            set_returned(4)?;
+            Ok(STATUS_SUCCESS)
+        }
+        // ProcessLUIDDeviceMapsEnabled (ULONG): o NtQueryInformationProcess
+        // 19041 sonda o buffer (alinhamento 4) e responde a constante 1 sem
+        // consultar o handle; comprimento diferente de 4 é
+        // STATUS_INFO_LENGTH_MISMATCH.
+        28 => {
+            if length != 0 && buffer & 3 != 0 {
+                return Ok(0x8000_0002);
+            }
+            if length != 0 && !probe_user_write(buffer, length) {
+                return Ok(0xC000_0005);
+            }
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            guest::try_write::<u32>(buffer, 1)?;
             set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }

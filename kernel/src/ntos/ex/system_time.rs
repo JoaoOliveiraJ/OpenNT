@@ -24,6 +24,12 @@ pub fn time_zone_bias() -> i64 {
     0
 }
 
+/// ExpCurrentTimeZoneId dos globais do silo: sem fuso configurado,
+/// TIME_ZONE_ID_UNKNOWN (0).
+pub fn time_zone_id() -> u32 {
+    0
+}
+
 /// ExLocalTimeToSystemTime (RVA 0x30cc80): *SystemTime = *LocalTime + viés.
 pub fn local_time_to_system_time(local_time: &LargeInteger, system_time: &LargeInteger) {
     system_time.quad_part.set(local_time.quad_part.get().wrapping_add(time_zone_bias()));

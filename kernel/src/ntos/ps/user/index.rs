@@ -92,6 +92,24 @@ pub fn handle(number: u32, arguments: [u64; 4], rip: u64, user_rsp: u64) -> Resu
     handle_service(name.as_deref(), arguments, rip, user_rsp, number)
 }
 
+/// Rastreio de serviços (`OPENNT_TRACE_SYSCALLS`): o nome do OBJECT_ATTRIBUTES
+/// dos serviços que abrem ou criam objetos por nome, lido (sondado) antes da
+/// chamada. Nt{Open,Create}*(Handle*, Access, ObjectAttributes*, ...) têm o
+/// OA no terceiro argumento; os serviços de atributos de arquivo, no primeiro.
+fn traced_object_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string::String> {
+    let attributes = match name {
+        "NtQueryAttributesFile" | "NtQueryFullAttributesFile" | "NtDeleteFile" => arguments[0],
+        "NtAlpcCreatePort" => arguments[1],
+        "NtOpenProcessToken" | "NtOpenProcessTokenEx" | "NtOpenThreadToken" | "NtOpenThreadTokenEx" => return None,
+        _ if name.starts_with("NtOpen") || name.starts_with("NtCreate") => arguments[2],
+        _ => return None,
+    };
+    if attributes == 0 {
+        return None;
+    }
+    registry::parse_user_object_attributes(attributes).map(|parsed| parsed.path).filter(|path| !path.is_empty())
+}
+
 /// Despacha ao handler por nome; NOT_FOUND, TIMEOUT, BUFFER_TOO_SMALL e
 /// PORT_NOT_SET são respostas legítimas e não aparecem como falha.
 pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rsp: u64, number: u32) -> Result<u32, KernelError> {
@@ -108,9 +126,10 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
     if state::with(|state| state.seen_syscalls.insert(alloc::string::String::from(name))) {
         crate::debug_print!("[usermode] primeiro: {}", name);
     }
+    let traced_name = if crate::ntos::init::boot_config::TRACE_SYSCALLS { traced_object_name(name, &arguments) } else { None };
     let result = handler(arguments[0], arguments[1], arguments[2], arguments[3], user_rsp)?;
     if crate::ntos::init::boot_config::TRACE_SYSCALLS {
-        crate::debug_print!("[sys] {}:{} {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x} (rip {:#x})", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, arguments[0], arguments[1], arguments[2], arguments[3], result, rip);
+        crate::debug_print!("[sys] {}:{} {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x} (rip {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, arguments[0], arguments[1], arguments[2], arguments[3], result, rip, traced_name.map_or_else(alloc::string::String::new, |path| alloc::format!(" \"{path}\"")));
     }
     if result & 0x8000_0000 != 0 && ![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353, 0xC000_0002].contains(&result) {
         crate::debug_print!("[usermode] {} FALHOU com {:#x} (rip {:#x})", name, result, rip);

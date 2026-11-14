@@ -104,6 +104,7 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
         // O smss real lê a configuração do Session Manager e cria ele mesmo
         // o \KnownDlls.
         crate::ntos::cm::session_manager::initialize()?;
+        crate::ntos::cm::ini_file_mapping::initialize()?;
     } else {
         // KnownDlls: a lista das DLLs conhecidas que o kernel provisiona e o
         // diretório delas.

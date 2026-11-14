@@ -65,6 +65,18 @@ fn write_shared_time(time: &KsystemTime, value: u64) {
     time.high1_time.set(high);
 }
 
+/// Leitura do KSYSTEM_TIME: High1Time, LowPart, High2Time, repetida enquanto
+/// as duas metades altas diferem (atualização no meio).
+pub fn read_shared_time(time: &KsystemTime) -> u64 {
+    loop {
+        let high = time.high1_time.get();
+        let low = time.low_part.get();
+        if high == time.high2_time.get() {
+            return (high as u32 as u64) << 32 | low as u64;
+        }
+    }
+}
+
 pub fn init() -> bool {
     let frame = pfn::alloc_page();
     if frame == 0 {

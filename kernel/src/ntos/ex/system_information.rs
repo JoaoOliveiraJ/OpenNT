@@ -53,6 +53,7 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         103 => return code_integrity_information::query(output, length as u64, returned, false),
         143 => return secure_boot_information::query(output, length as u64, returned, false),
         157 => return crate::ntos::ex::manufacturing_information::query(output, length as u64, returned, false),
+        3 => return crate::ntos::ex::time_of_day_information::query(output, length as u64, returned, false),
         11 | 77 => return module_queries::query_system_modules(class, output, length as u64, returned),
         1 | 63 => return Ok(processor_information::query(output, length, returned, false, class == 63)),
         // SystemCodeIntegrityCertificateManagementInformation: nenhuma

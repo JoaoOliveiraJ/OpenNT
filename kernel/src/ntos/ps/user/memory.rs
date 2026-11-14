@@ -762,6 +762,59 @@ pub fn nt_free_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64
     with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| free_in(Space::of(target), base_pointer, size_pointer, free_type as u32)))
 }
 
+/// NtSetInformationVirtualMemory(process, class, NumberOfEntries,
+/// VirtualAddresses, VmInformation, VmInformationLength) do modo usuário:
+/// as validações iniciais do serviço (`mm/prefetch`), o ProbeForRead com
+/// alinhamento 4 do vetor de MEMORY_RANGE_ENTRY e do ULONG de VmInformation,
+/// o processo do handle com PROCESS_VM_OPERATION, as faixas capturadas e
+/// conferidas (STATUS_INVALID_PARAMETER_4) e a pré-busca da
+/// VmPrefetchInformation (flags diferentes de zero são
+/// STATUS_INVALID_PARAMETER_5). Prioridade de página, alvos de CFG e as
+/// classes de estado de página ainda não existem no OpenNT
+/// (STATUS_NOT_SUPPORTED). A ntdll pede VmImageHotPatchInformation a cada
+/// DLL inicializada e ignora o resultado.
+pub fn nt_set_information_virtual_memory(process: u64, class: u64, count: u64, entries: u64, user_rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::mm::prefetch;
+    let information = state::stack_arg(user_rsp, 5);
+    let length = state::stack_arg32(user_rsp, 6);
+    let class = class as u32;
+    if let Err(status) = prefetch::validate_information_request(class, count, information, length) {
+        return Ok(status);
+    }
+    let bytes = count * 16;
+    if entries & 3 != 0 || (class != 2 && information & 3 != 0) {
+        return Ok(0x8000_0002);
+    }
+    if !state::probe_user_read(entries, bytes) || (class != 2 && !state::probe_user_read(information, 4)) {
+        return Ok(0xC000_0005);
+    }
+    let flags = if class != 2 {
+        match guest::try_read::<u32>(information) {
+            Ok(flags) => flags,
+            Err(_) => return Ok(0xC000_0005),
+        }
+    } else {
+        0
+    };
+    let captured = match guest::try_read_bytes(entries, bytes as usize) {
+        Ok(captured) => captured,
+        Err(_) => return Ok(0xC000_0005),
+    };
+    let ranges: Vec<(u64, u64)> = captured.chunks_exact(16).map(|entry| (u64::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8])), u64::from_le_bytes(entry[8..].try_into().unwrap_or([0; 8])))).collect();
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| {
+        if !prefetch::valid_user_ranges(&ranges) {
+            return Ok(prefetch::STATUS_INVALID_PARAMETER_4);
+        }
+        if class != prefetch::VM_PREFETCH_INFORMATION {
+            return Ok(prefetch::STATUS_NOT_SUPPORTED);
+        }
+        if flags != 0 {
+            return Ok(prefetch::STATUS_INVALID_PARAMETER_5);
+        }
+        prefetch::prefetch_ranges(target, &ranges).map(|_| 0)
+    })
+}
+
 /// MEM_RESET: a faixa (arredondada a páginas) tem de estar comitada numa
 /// região privada do espaço; o conteúdo pode ser preservado.
 pub fn validate_committed(space: Space, base_pointer: u64, size_pointer: u64) -> Result<u32, KernelError> {
@@ -799,7 +852,12 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
     let Some(owner) = private(&region) else { return Ok(STATUS_INVALID_PARAMETER) };
     let release = free_type == 0x8000;
     let decommit = free_type == 0x4000;
-    if (!release && !decommit) || (release && (base != owner.base || size != 0)) {
+    // MEM_RELEASE com RegionSize: a faixa arredondada a páginas que cobre a
+    // região inteira a libera como RegionSize 0 (o RtlpAllocDeallocQueryBuffer
+    // da ntdll devolve assim o buffer que alocou, com o tamanho devolvido
+    // pela alocação).
+    let whole = size != 0 && base.checked_add(size).is_some_and(|end| base & !(PAGE - 1) == owner.base && end.div_ceil(PAGE) * PAGE == owner.base + owner.size);
+    if (!release && !decommit) || (release && !whole && (base != owner.base || size != 0)) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let first = if release || size == 0 { owner.base } else { base & !(PAGE - 1) };
@@ -1042,6 +1100,7 @@ pub fn init() {
     state::register_handler("NtAllocateVirtualMemory", nt_allocate_virtual_memory);
     state::register_handler("NtAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);
     state::register_handler("NtFreeVirtualMemory", nt_free_virtual_memory);
+    state::register_handler("NtSetInformationVirtualMemory", nt_set_information_virtual_memory);
     state::register_handler("NtProtectVirtualMemory", nt_protect_virtual_memory);
     state::register_handler("NtQueryVirtualMemory", query);
     state::register_handler("NtReadVirtualMemory", nt_read_virtual_memory);
