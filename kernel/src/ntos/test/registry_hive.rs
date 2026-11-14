@@ -173,6 +173,18 @@ fn system_hive_from_file(assert: Assert) {
         storage.minor() == 5 && list.and_then(|list| index::signature(storage, list)) == Some(index::LH) && !storage.broken
     });
     assert(layout == Some(true), "hive: SYSTEM na versao 1.5 com listas lh");
+    // ZwFlushKey numa chave da SYSTEM grava o arquivo do volume.
+    let key = open("\\Registry\\Machine\\System\\OpenNTHiveDescarga", true);
+    let written = key != 0 && registry::set_value(key as u32, "ValorDescarregado", 4, 0x0BAD_F00Du32.to_le_bytes().to_vec());
+    let flushed = status(call_export("ZwFlushKey", &[key]));
+    let file = read_volume("/Windows/System32/config/SYSTEM");
+    let contains = |needle: &[u8]| file.windows(needle.len()).any(|window| window == needle);
+    let valid = file.len() >= 0x1000 && u32_at(&file, 4) == u32_at(&file, 8) && u32_at(&file, 4) >= 2 && u32_at(&file, 0x1fc) == base_block::checksum_bytes(&file);
+    let logged = [read_volume("/Windows/System32/config/SYSTEM.LOG1"), read_volume("/Windows/System32/config/SYSTEM.LOG2")].iter().any(|log| log.len() >= 0x200 && u32_at(log, 0) == 0x6667_6572 && u32_at(log, 0x1c) == 6);
+    assert(written && flushed == 0 && valid && contains(b"OpenNTHiveDescarga") && contains(b"ValorDescarregado") && logged, "hive: ZwFlushKey de uma chave da SYSTEM grava o primario validado e o log no volume");
+    let deleted = registry::delete_key(key as u32);
+    registry::close_handle(key as u32);
+    assert(deleted, "hive: exclusao da chave de teste da SYSTEM");
 }
 
 /// Descritor próprio: owner e group SYSTEM, DACL com SYSTEM e Everyone de

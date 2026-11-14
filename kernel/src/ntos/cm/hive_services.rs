@@ -21,8 +21,10 @@
 //! - NtSaveKeyEx (rva 0x729730): SeBackupPrivilege; Format 1
 //!   (REG_STANDARD_FORMAT), 2 (REG_LATEST_FORMAT) ou 4
 //!   (REG_NO_COMPRESSION), senão STATUS_INVALID_PARAMETER; o handle de
-//!   arquivo de usuário precisa de FILE_WRITE_DATA. NtSaveKey é o Ex com 1;
-//! - NtRestoreKey (rva 0x8694a0): SeRestorePrivilege; o arquivo de usuário
+//!   arquivo de usuário precisa de FILE_WRITE_DATA. NtSaveKey é o Ex com 1.
+//!   O REG_NO_COMPRESSION (cópia da hive como está, o
+//!   CmpSaveKeyByFileCopy) ainda grava como o REG_LATEST_FORMAT;
+//! - NtRestoreKey (rva 0x869440): SeRestorePrivilege; o arquivo de usuário
 //!   precisa de FILE_READ_DATA; REG_REFRESH_HIVE com outro bit é
 //!   STATUS_INVALID_PARAMETER;
 //! - NtFlushKey (rva 0x696c00): qualquer acesso no handle;

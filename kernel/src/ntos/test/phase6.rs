@@ -3898,7 +3898,7 @@ fn driver_helper_exports(assert: Assert) {
     let out = guest::alloc_bytes(8);
     guest::write8(out, 0xFF);
     let portable = call_export("RtlCheckPortableOperatingSystem", &[out]);
-    assert(call_export("PoEnergyEstimationEnabled", &[]) == Some(0) && call_export("ExIsSoftBoot", &[]) == Some(0) && portable == Some(0) && guest::read8(out) == 0 && call_export("ZwFlushKey", &[0x1C8]) == Some(0xFFFF_FFFF_C000_0008), "misc: energia/soft-boot/portabilidade; ZwFlushKey de handle invalido = STATUS_INVALID_HANDLE");
+    assert(call_export("PoEnergyEstimationEnabled", &[]) == Some(0) && call_export("ExIsSoftBoot", &[]) == Some(0) && portable == Some(0) && guest::read8(out) == 0 && call_export("ZwFlushKey", &[0x7FFF_FFFC]) == Some(0xFFFF_FFFF_C000_0008), "misc: energia/soft-boot/portabilidade; ZwFlushKey de handle invalido = STATUS_INVALID_HANDLE");
     // ObReferenceObjectSafe/DeferDelete sobre o processo corrente (objeto vivo).
     let process = crate::ntos::ps::process::get_current_process();
     let before = crate::ntos::ps::process::reference_count(process).unwrap_or(0);

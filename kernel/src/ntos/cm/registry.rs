@@ -334,6 +334,9 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
                 key.deleted = true;
             }
             mirror(hive, node, |storage, cell, _| key_cells::delete_key(storage, cell, now()));
+            if let Some(key) = hive.nodes.get_mut(&node) {
+                key.cell = None;
+            }
         }
         removed
     });
