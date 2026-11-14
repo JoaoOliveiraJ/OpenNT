@@ -536,6 +536,19 @@ pub fn set_file_sizes(file: u64, sizes: u64) -> CcResult<u32> {
     Ok(status)
 }
 
+/// `SharedCacheMap->FileSize = size` de um FILE_OBJECT em cache: o campo que
+/// o CcGetFileSizePointer do ntifs.h expõe e que as escritas rápidas do
+/// FsRtl (FsRtlCopyWrite, FsRtlPrepareMdlWriteDev) gravam direto depois de
+/// estender o arquivo. Aqui o motor guarda o tamanho e espelha o campo.
+pub fn set_file_size_field(file: u64, size: u64) {
+    let Some(base) = map_of_file(file) else { return };
+    let mut cache = CACHE.lock();
+    if let Some(map) = cache.maps.get_mut(&base) {
+        map.file_size = size;
+        publish(map);
+    }
+}
+
 /// CcSetAdditionalCacheAttributes(FileObject, DisableReadAhead, DisableWriteBehind).
 pub fn set_additional_cache_attributes(file: u64, disable_read_ahead: bool, disable_write_behind: bool) -> CcResult<()> {
     let base = require_map(file)?;

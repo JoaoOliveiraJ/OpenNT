@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 381] {
+fn groups() -> [&'static Group; 386] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -436,6 +436,11 @@ fn groups() -> [&'static Group; 381] {
         &crate::ntos::po::exports::po_fx_drips_watchdog::GROUP,
         &crate::ntos::io::exports::io_dependencies::GROUP,
         &crate::ntos::io::exports::io_device_reset_resources::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_cached_fast_io::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_volume_event::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_device_queries::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_oplock_filter::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_notify_filter::GROUP,
     ]
 }
 

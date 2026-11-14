@@ -134,24 +134,49 @@ pub fn unregister(record: u64) -> u32 {
     0
 }
 
-/// Work item do IoReportTargetDeviceChangeAsynchronous: entrega a estrutura
-/// aos registros de EventCategoryTargetDeviceChange e chama o callback de
-/// conclusão do chamador.
-fn deliver_target_change(_device: u64, item: u64) {
-    let Some((notification, callback, context)) = TARGET_CHANGES.lock().remove(&item) else { return };
+/// Entrega uma TARGET_DEVICE_CUSTOM_NOTIFICATION aos registros de
+/// EventCategoryTargetDeviceChange.
+fn notify_target_change(notification: u64) {
     let registrations = PLUG_PLAY_REGISTRATIONS.lock().clone();
     for registration in registrations.iter().filter(|registration| registration.category == EVENT_CATEGORY_TARGET_DEVICE_CHANGE) {
         native_call::call(registration.callback, &[notification, registration.context]);
     }
+}
+
+/// Work item do IoReportTargetDeviceChangeAsynchronous: entrega a cópia da
+/// estrutura, chama o callback de conclusão do chamador e libera a cópia.
+fn deliver_target_change(_device: u64, item: u64) {
+    let Some((notification, callback, context)) = TARGET_CHANGES.lock().remove(&item) else { return };
+    notify_target_change(notification);
     if callback != 0 {
         native_call::call(callback, &[context, 0]);
     }
+    guest::free_bytes(notification);
+}
+
+/// TARGET_DEVICE_CUSTOM_NOTIFICATION.Size (USHORT em +2), com o mínimo do
+/// cabeçalho (até CustomDataBuffer, 0x24).
+fn notification_size(notification: u64) -> u64 {
+    // SAFETY: estrutura de notificação do chamador de modo kernel.
+    (unsafe { Field::<u16>::at(notification + 2) }.get() as u64).max(0x24)
 }
 
 /// IoReportTargetDeviceChangeAsynchronous(PhysicalDeviceObject,
-/// NotificationStructure, Callback, Context).
+/// NotificationStructure, Callback, Context). Como no NT (o evento PnP leva
+/// uma cópia de Size bytes), a estrutura do chamador pode morar na pilha
+/// dele: o work item entrega uma cópia.
 pub fn report_target_device_change_asynchronous(notification: u64, callback: u64, context: u64) {
+    let size = notification_size(notification);
+    let copy = guest::alloc_bytes(size);
+    guest::write_bytes(copy, &guest::read_bytes(notification, size as usize));
     let item = guest::alloc_bytes(work_items::work_item_size());
-    TARGET_CHANGES.lock().insert(item, (notification, callback, context));
+    TARGET_CHANGES.lock().insert(item, (copy, callback, context));
     work_items::queue_kernel_work_item(item, deliver_target_change, item, None);
+}
+
+/// IoReportTargetDeviceChange(PhysicalDeviceObject, NotificationStructure):
+/// a entrega síncrona aos registros antes de voltar.
+pub fn report_target_device_change(notification: u64) -> u32 {
+    notify_target_change(notification);
+    0
 }

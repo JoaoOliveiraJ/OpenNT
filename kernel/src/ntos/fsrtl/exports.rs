@@ -1375,6 +1375,7 @@ pub mod fsrtl_notify {
             filter_match: call.arg(7) as u32,
             action: call.arg(8) as u32,
             target_context: call.arg(9),
+            filter_context: 0,
         })
         .map(|_| 0)
     }
@@ -1511,4 +1512,216 @@ pub mod fsrtl_status {
     }
 
     pub static GROUP: Group = Group { name: "fsrtl-status", names: &["FsRtlIsTotalDeviceFailure"], handlers: &[is_total_device_failure], data_exports: &[] };
+}
+
+pub mod fsrtl_cached_fast_io {
+    //! O Fast I/O genérico em cache (FsRtlCopyRead/CopyWrite, MdlReadDev,
+    //! PrepareMdlWriteDev) e os repasses FsRtlMdlRead/MdlReadComplete: a
+    //! lógica mora em `fsrtl/fast_io.rs`.
+
+    use crate::ntos::fsrtl::fast_io;
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{DeviceObject, FileObject, IoStatusBlock, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    // SAFETY (todas): FILE_OBJECT, IO_STATUS_BLOCK, PMDL* e DEVICE_OBJECT
+    // vivos do file system (modo kernel).
+    fn file(address: u64) -> &'static FileObject {
+        unsafe { FileObject::at(address) }
+    }
+    fn io_status(address: u64) -> &'static IoStatusBlock {
+        unsafe { IoStatusBlock::at(address) }
+    }
+    fn device(address: u64) -> &'static DeviceObject {
+        unsafe { DeviceObject::at(address) }
+    }
+
+    /// FsRtlCopyRead(FileObject, FileOffset, Length, Wait, LockKey, Buffer, IoStatus, DeviceObject).
+    fn copy_read(call: &Call) -> Result<u64, KernelError> {
+        Ok(fast_io::copy_read(file(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) & 0xFF != 0, call.arg(5) as u32, call.arg(6), io_status(call.arg(7)), device(call.arg(8)))? as u64)
+    }
+
+    /// FsRtlCopyWrite(FileObject, FileOffset, Length, Wait, LockKey, Buffer, IoStatus, DeviceObject).
+    fn copy_write(call: &Call) -> Result<u64, KernelError> {
+        Ok(fast_io::copy_write(file(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) & 0xFF != 0, call.arg(5) as u32, call.arg(6), io_status(call.arg(7)), device(call.arg(8)))? as u64)
+    }
+
+    /// FsRtlMdlReadDev(FileObject, FileOffset, Length, LockKey, MdlChain, IoStatus, DeviceObject).
+    fn mdl_read_dev(call: &Call) -> Result<u64, KernelError> {
+        Ok(fast_io::mdl_read_dev(file(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, call.arg(5), io_status(call.arg(6)), device(call.arg(7)))? as u64)
+    }
+
+    /// FsRtlPrepareMdlWriteDev(FileObject, FileOffset, Length, LockKey, MdlChain, IoStatus, DeviceObject).
+    fn prepare_mdl_write_dev(call: &Call) -> Result<u64, KernelError> {
+        Ok(fast_io::prepare_mdl_write_dev(file(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, call.arg(5), io_status(call.arg(6)), device(call.arg(7)))? as u64)
+    }
+
+    /// FsRtlMdlRead(FileObject, FileOffset, Length, LockKey, MdlChain, IoStatus).
+    fn mdl_read(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PMDL* do chamador.
+        let chain = unsafe { Field::<u64>::at(call.arg(5)) };
+        Ok(fast_io::mdl_read(file(call.arg(1)), call.arg(2), call.arg(3) as u32, call.arg(4) as u32, chain, io_status(call.arg(6)))? as u64)
+    }
+
+    /// FsRtlMdlReadComplete(FileObject, MdlChain).
+    fn mdl_read_complete(call: &Call) -> Result<u64, KernelError> {
+        Ok(fast_io::mdl_read_complete(file(call.arg(1)), call.arg(2))? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-cached-fast-io",
+        names: &["FsRtlCopyRead", "FsRtlCopyWrite", "FsRtlMdlReadDev", "FsRtlPrepareMdlWriteDev", "FsRtlMdlRead", "FsRtlMdlReadComplete"],
+        handlers: &[copy_read, copy_write, mdl_read_dev, prepare_mdl_write_dev, mdl_read, mdl_read_complete],
+        data_exports: &[],
+    };
+}
+
+pub mod fsrtl_volume_event {
+    //! FsRtlNotifyVolumeEvent(Ex): a lógica mora em `fsrtl/volume_support.rs`.
+
+    use crate::ntos::fsrtl::volume_support;
+    use crate::ntos::inc::types::{FileObject, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlNotifyVolumeEvent(FileObject, EventCode).
+    fn notify_volume_event(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT do volume (modo kernel).
+        Ok(signed_status(volume_support::notify_volume_event(unsafe { FileObject::at(call.arg(1)) }, call.arg(2) as u32)?))
+    }
+
+    /// FsRtlNotifyVolumeEventEx(FileObject, EventCode, Event).
+    fn notify_volume_event_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: idem.
+        Ok(signed_status(volume_support::notify_volume_event_ex(unsafe { FileObject::at(call.arg(1)) }, call.arg(2) as u32, call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-volume-event", names: &["FsRtlNotifyVolumeEvent", "FsRtlNotifyVolumeEventEx"], handlers: &[notify_volume_event, notify_volume_event_ex], data_exports: &[] };
+}
+
+pub mod fsrtl_device_queries {
+    //! FsRtlBalanceReads e FsRtlGetSectorSizeInformation: a lógica mora em
+    //! `fsrtl/device_control.rs`.
+
+    use crate::ntos::fsrtl::device_control::{self, FileFsSectorSizeInformation};
+    use crate::ntos::inc::types::{DeviceObject, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlBalanceReads(TargetDevice).
+    fn balance_reads(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DEVICE_OBJECT alvo do file system.
+        Ok(signed_status(device_control::balance_reads(unsafe { DeviceObject::at(call.arg(1)) })))
+    }
+
+    /// FsRtlGetSectorSizeInformation(DeviceObject, SectorSizeInfo).
+    fn get_sector_size_information(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: DEVICE_OBJECT e FILE_FS_SECTOR_SIZE_INFORMATION do file system.
+        let (device, info) = unsafe { (DeviceObject::at(call.arg(1)), FileFsSectorSizeInformation::at(call.arg(2))) };
+        Ok(signed_status(device_control::get_sector_size_information(device, info)))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-device-queries", names: &["FsRtlBalanceReads", "FsRtlGetSectorSizeInformation"], handlers: &[balance_reads, get_sector_size_information], data_exports: &[] };
+}
+
+pub mod fsrtl_oplock_filter {
+    //! FsRtlCheckOplockForFsFilterCallback: a lógica mora em `fsrtl/oplock.rs`.
+
+    use crate::ntos::fsrtl::oplock::{self, FsFilterCallbackData};
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::NtStruct;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlCheckOplockForFsFilterCallback(Oplock, CallbackData, Flags).
+    fn check_oplock_for_fs_filter_callback(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: POPLOCK e FS_FILTER_CALLBACK_DATA do file system.
+        let (handle, data) = unsafe { (Field::<u64>::at(call.arg(1)), FsFilterCallbackData::at(call.arg(2))) };
+        Ok(signed_status(oplock::check_oplock_for_fs_filter_callback(handle, data, call.arg(3) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-oplock-filter", names: &["FsRtlCheckOplockForFsFilterCallback"], handlers: &[check_oplock_for_fs_filter_callback], data_exports: &[] };
+}
+
+pub mod fsrtl_notify_filter {
+    //! FsRtlNotifyFilterReportChange e a variante Lite: a lógica mora em
+    //! `fsrtl/notify.rs`.
+
+    use crate::ntos::fsrtl::notify::{self, ChangeDirectoryLite, ReportChange, ReportChangeLite};
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{Irp, ListEntry, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    // SAFETY (todas): PNOTIFY_SYNC (célula ou valor), NotifyList e IRP vivos do FS.
+    fn cell(address: u64) -> &'static Field<u64> {
+        unsafe { Field::<u64>::at(address) }
+    }
+    fn list(address: u64) -> &'static ListEntry {
+        unsafe { ListEntry::at(address) }
+    }
+
+    /// FsRtlNotifyFilterReportChange(NotifySync, NotifyList, FullTargetName,
+    /// TargetNameOffset, StreamName, NormalizedParentName, FilterMatch,
+    /// Action, TargetContext, FilterContext).
+    fn filter_report_change(call: &Call) -> Result<u64, KernelError> {
+        notify::full_report_change(&ReportChange {
+            notify_sync: call.arg(1),
+            notify_list: list(call.arg(2)),
+            full_target_name: call.arg(3),
+            target_name_offset: call.arg(4) as u16,
+            stream_name: call.arg(5),
+            normalized_parent_name: call.arg(6),
+            filter_match: call.arg(7) as u32,
+            action: call.arg(8) as u32,
+            target_context: call.arg(9),
+            filter_context: call.arg(10),
+        })
+        .map(|_| 0)
+    }
+
+    /// FsRtlNotifyFilterChangeDirectoryLite(NotifySync*, NotifyList,
+    /// FsContext, Flags, CompletionFilter, NotifyIrp, TraverseCallback,
+    /// SubjectContext, FilterCallback).
+    fn filter_change_directory_lite(call: &Call) -> Result<u64, KernelError> {
+        notify::filter_change_directory_lite(&ChangeDirectoryLite {
+            notify_sync: cell(call.arg(1)),
+            notify_list: list(call.arg(2)),
+            fs_context: call.arg(3),
+            flags: call.arg(4) as u32,
+            completion_filter: call.arg(5) as u32,
+            irp: (call.arg(6) != 0).then(|| unsafe { Irp::at(call.arg(6)) }),
+            traverse_callback: call.arg(7),
+            subject_context: call.arg(8),
+            filter_callback: call.arg(9),
+        })
+        .map(|_| 0)
+    }
+
+    /// FsRtlNotifyFilterReportChangeLiteEx(NotifySync*, NotifyList, Name,
+    /// StreamName, FilterMatch, Action, TargetContext, FilterContext, Flags,
+    /// ExtendedInformation).
+    fn filter_report_change_lite(call: &Call) -> Result<u64, KernelError> {
+        notify::filter_report_change_lite(&ReportChangeLite {
+            notify_sync: cell(call.arg(1)),
+            notify_list: list(call.arg(2)),
+            name: call.arg(3),
+            stream_name: call.arg(4),
+            filter_match: call.arg(5) as u32,
+            action: call.arg(6) as u32,
+            target_context: call.arg(7),
+            filter_context: call.arg(8),
+            flags: call.arg(9) as u32,
+            extended_information: call.arg(10),
+        })
+        .map(|_| 0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-notify-filter",
+        names: &["FsRtlNotifyFilterReportChange", "FsRtlNotifyFilterChangeDirectoryLite", "FsRtlNotifyFilterReportChangeLiteEx"],
+        handlers: &[filter_report_change, filter_change_directory_lite, filter_report_change_lite],
+        data_exports: &[],
+    };
 }

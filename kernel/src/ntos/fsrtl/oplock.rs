@@ -17,6 +17,8 @@
 //! * CheckOplock 0x2d54b0 / CheckOplockEx 0x2d6540 / BreakH 0x69b610 /
 //!   BreakToNone 0x4efed0: NULL -> STATUS_SUCCESS (inclusive no create).
 //! * BreakToNoneEx 0x4eff30: Flags & 0x10 -> STATUS_INVALID_PARAMETER.
+//! * CheckOplockForFsFilterCallback 0x5cd900: Flags além de 8 ->
+//!   STATUS_INVALID_PARAMETER; NULL -> STATUS_SUCCESS (seção própria).
 //! * FsctrlEx 0x68f3b0 -> FsRtlpOplockFsctrlInternal 0x5ea170: todo pedido
 //!   segue o caminho real "não pode conceder" (0x5ea702).
 //!
@@ -125,6 +127,89 @@ pub fn uninitialize_oplock(oplock: &Field<u64>) {
     if oplock.get() != 0 {
         oplock.set(0);
     }
+}
+
+// ---- FsRtlCheckOplockForFsFilterCallback ---------------------------------------------
+//
+// ntoskrnl 10.0.19041, RVA 0x5cd900: Flags com algo além de
+// OPLOCK_FLAG_IGNORE_OPLOCK_KEYS (8) -> STATUS_INVALID_PARAMETER; handle NULL
+// -> STATUS_SUCCESS. Com bloco interno: o FAST_MUTEX* em +0x98 é tomado
+// (ExAcquireFastMutexUnsafe); estado (+0x90) sem os níveis 0x7000 -> sucesso;
+// a FS_FILTER_CALLBACK_DATA só interessa se for
+// FS_FILTER_ACQUIRE_FOR_SECTION_SYNCHRONIZATION (Operation 0xFF) com SyncType
+// SyncTypeCreateSection (1) e PageProtection com PAGE_READWRITE ou
+// PAGE_EXECUTE_READWRITE (0x44); só então o NT quebra o oplock pelos níveis
+// de cache (FsRtlpOplockBreakByCacheFlags, alvo 0x5000). Neste modelo nenhum
+// oplock é concedido e o handle nunca deixa de ser NULL, então o caminho de
+// quebra não é alcançável; se for, a chamada falha alto.
+
+/// OPLOCK_FLAG_IGNORE_OPLOCK_KEYS, a única flag aceita.
+const OPLOCK_FLAG_IGNORE_OPLOCK_KEYS: u32 = 0x08;
+/// Níveis de cache concedidos (o que a criação de seção gravável quebraria).
+const OPLOCK_STATE_CACHE_LEVELS: u32 = 0x7000;
+const FS_FILTER_ACQUIRE_FOR_SECTION_SYNCHRONIZATION: u8 = 0xFF;
+const SYNC_TYPE_CREATE_SECTION: u32 = 1;
+const PAGE_WRITABLE_PROTECTIONS: u32 = 0x44;
+
+/// O bloco interno até o FAST_MUTEX* que protege o estado.
+#[repr(C)]
+struct OplockSyncPrefix {
+    _reserved: Reserved<0x90>,
+    oplock_state: Field<u32>,
+    _pad_94: Reserved<0x4>,
+    fast_mutex: Field<u64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for OplockSyncPrefix {}
+
+/// FS_FILTER_CALLBACK_DATA (ntifs.h) até os parâmetros de
+/// AcquireForSectionSynchronization.
+#[repr(C)]
+pub struct FsFilterCallbackData {
+    pub size_of_fs_filter_callback_data: Field<u32>,
+    pub operation: Field<u8>,
+    pub reserved: Field<u8>,
+    _pad_6: Reserved<0x2>,
+    pub device_object: Field<u64>,
+    pub file_object: Field<u64>,
+    pub sync_type: Field<u32>,
+    pub page_protection: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for FsFilterCallbackData {}
+
+const _: () = {
+    assert!(core::mem::offset_of!(OplockSyncPrefix, fast_mutex) == 0x98);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, operation) == 0x4);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, file_object) == 0x10);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, sync_type) == 0x18);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, page_protection) == 0x1C);
+};
+
+/// FsRtlCheckOplockForFsFilterCallback(Oplock, CallbackData, Flags) -> NTSTATUS.
+pub fn check_oplock_for_fs_filter_callback(oplock: &Field<u64>, callback_data: &FsFilterCallbackData, flags: u32) -> Result<u32, crate::rtl::KernelError> {
+    if flags & !OPLOCK_FLAG_IGNORE_OPLOCK_KEYS != 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let state = oplock.get();
+    if state == 0 {
+        return Ok(STATUS_SUCCESS);
+    }
+    // SAFETY: um handle não nulo aponta para o bloco interno do FsRtl.
+    let block = unsafe { OplockSyncPrefix::at(state) };
+    let mutex = block.fast_mutex.get();
+    crate::ntos::ke::fast_mutex::acquire_unsafe(mutex)?;
+    let needs_break = block.oplock_state.get() & OPLOCK_STATE_CACHE_LEVELS != 0
+        && callback_data.operation.get() == FS_FILTER_ACQUIRE_FOR_SECTION_SYNCHRONIZATION
+        && callback_data.sync_type.get() == SYNC_TYPE_CREATE_SECTION
+        && callback_data.page_protection.get() & PAGE_WRITABLE_PROTECTIONS != 0;
+    crate::ntos::ke::fast_mutex::release_unsafe(mutex)?;
+    if needs_break {
+        return Err(crate::rtl::KernelError::new("FsRtlCheckOplockForFsFilterCallback: oplock break without an oplock engine"));
+    }
+    Ok(STATUS_SUCCESS)
 }
 
 /// FsRtlCurrentOplock: sem bloco interno, FALSE.

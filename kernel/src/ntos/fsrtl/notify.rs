@@ -5,7 +5,9 @@
 //! FsRtlNotifyUninitializeSync 0x6a2c10, FsRtlNotifyFilterChangeDirectory 0x675020
 //! (FsRtlNotifyFullChangeDirectory 0x88d5e0 = ele sem FilterCallback),
 //! FsRtlNotifyFilterReportChange 0x6746f0 (FsRtlNotifyFullReportChange 0x88d650
-//! = ele sem FilterContext), FsRtlNotifyCleanup 0x675b00.
+//! = ele sem FilterContext), FsRtlNotifyCleanup 0x675b00 e a variante Lite
+//! (FsRtlNotifyFilterChangeDirectoryLite 0x675b90,
+//! FsRtlNotifyFilterReportChangeLiteEx 0x675380; seção no fim do arquivo).
 //!
 //! NOTIFY_CHANGE (0x98, PagedPool|RAISE, 'FSrN'; [`NotifyChange`]) ligado em
 //! NotifyList pelo seu LIST_ENTRY; os IRPs pendentes ficam na sua segunda
@@ -87,7 +89,8 @@ struct NotifyChange {
     completion_filter: Field<u32>,
     _pad_50: Reserved<0x10>,
     this_buffer_length: Field<u32>,
-    _pad_64: Reserved<0x4>,
+    /// Limite capturado com o primeiro registro pendente (Lite).
+    buffer_limit: Field<u32>,
     buffer: Field<u64>,
     reference_count: Field<u32>,
     _pad_74: Reserved<0x4>,
@@ -491,10 +494,10 @@ fn relative_name(notify: &NotifyChange, target: &[u16], offset: usize, parent: &
     Some(target[directory.len() + 1..].to_vec())
 }
 
+/// FILE_NOTIFY_INFORMATION sem preenchimento final (o DataLength do NT soma
+/// o registro inteiro; o alinhamento a 4 vem antes do próximo).
 fn notify_record(action: u32, name: &[u16]) -> Vec<u8> {
-    let length = 12 + name.len() * 2;
-    let padded = (length + 3) & !3;
-    let mut record = alloc::vec![0u8; padded];
+    let mut record = alloc::vec![0u8; 12 + name.len() * 2];
     record[4..8].copy_from_slice(&action.to_le_bytes());
     record[8..12].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
     for (index, unit) in name.iter().enumerate() {
@@ -503,10 +506,11 @@ fn notify_record(action: u32, name: &[u16]) -> Vec<u8> {
     record
 }
 
-/// Encadeia NextEntryOffset dos registros já no buffer e acrescenta o novo.
+/// Alinha o fim dos dados a 4 (zeros), encadeia o NextEntryOffset do último
+/// registro até ali e acrescenta o novo, como o FsRtlNotifyUpdateBuffer.
 fn append_record(buffer: &mut Vec<u8>, record: &[u8]) {
-    let mut cursor = 0;
     if !buffer.is_empty() {
+        let mut cursor = 0;
         loop {
             let next = u32::from_le_bytes([buffer[cursor], buffer[cursor + 1], buffer[cursor + 2], buffer[cursor + 3]]) as usize;
             if next == 0 {
@@ -514,14 +518,21 @@ fn append_record(buffer: &mut Vec<u8>, record: &[u8]) {
             }
             cursor += next;
         }
+        buffer.resize(aligned_length(buffer.len()), 0);
         let distance = (buffer.len() - cursor) as u32;
         buffer[cursor..cursor + 4].copy_from_slice(&distance.to_le_bytes());
     }
     buffer.extend_from_slice(record);
 }
 
-/// Parâmetros de FsRtlNotifyFullReportChange (os nomes são PSTRING opacos,
-/// lidos conforme o CharacterSize de cada NOTIFY_CHANGE).
+/// O DataLength arredondado para 4 (o início do próximo registro).
+fn aligned_length(length: usize) -> usize {
+    (length + 3) & !3
+}
+
+/// Parâmetros de FsRtlNotifyFilterReportChange (FsRtlNotifyFullReportChange
+/// é ele com FilterContext NULL). Os nomes são PSTRING opacos, lidos conforme
+/// o CharacterSize de cada NOTIFY_CHANGE.
 pub struct ReportChange<'a> {
     pub notify_sync: u64,
     pub notify_list: &'a ListEntry,
@@ -532,6 +543,7 @@ pub struct ReportChange<'a> {
     pub filter_match: u32,
     pub action: u32,
     pub target_context: u64,
+    pub filter_context: u64,
 }
 
 /// Sem espaço (IgnoreBuffer ou buffer cheio): o IRP pendente sai com
@@ -546,10 +558,57 @@ fn overflow(notify: &NotifyChange) {
     }
 }
 
-/// FsRtlNotifyFullReportChange: para cada NOTIFY_CHANGE do diretório (ou de
-/// um ancestral com WatchTree) cujo CompletionFilter casa, monta o
-/// FILE_NOTIFY_INFORMATION e conclui o IRP pendente ou acumula.
+/// O nome registrado para um NOTIFY_CHANGE com FullTargetName, ou `None` se a
+/// mudança não é dele (CompletionFilter, caminho, TraverseCallback ou
+/// FilterCallback recusam).
+fn matching_name(notify: &NotifyChange, report: &ReportChange) -> Option<Vec<u16>> {
+    if notify.completion_filter.get() & report.filter_match == 0 {
+        return None;
+    }
+    let character_size = notify.character_size.get().max(1);
+    let target = read_units(report.full_target_name, character_size);
+    let offset = (report.target_name_offset / character_size as u16) as usize;
+    if offset > target.len() {
+        return None;
+    }
+    let parent: Vec<u16> = if report.normalized_parent_name != 0 {
+        read_units(report.normalized_parent_name, character_size)
+    } else if offset <= 1 {
+        target[..offset.min(1)].to_vec()
+    } else {
+        target[..offset - 1].to_vec()
+    };
+    let mut name = relative_name(notify, &target, offset, &parent)?;
+    // Mudança numa subárvore: o TraverseCallback do FS (BOOLEAN) decide a
+    // visibilidade.
+    let traverse = notify.traverse_callback.get();
+    if traverse != 0 && name.len() != target.len() - offset && native_call::call(traverse, &[notify.fs_context.get(), report.target_context, notify.subject_context.get()]) & 0xFF == 0 {
+        return None;
+    }
+    // O FilterCallback só é consultado com FilterContext (o FullReportChange
+    // passa NULL e nunca o chama).
+    let filter = notify.filter_callback.get();
+    if filter != 0 && report.filter_context != 0 && native_call::call(filter, &[notify.fs_context.get(), report.filter_context]) & 0xFF == 0 {
+        return None;
+    }
+    let stream = read_units(report.stream_name, character_size);
+    if !stream.is_empty() {
+        name.push(b':' as u16);
+        name.extend_from_slice(&stream);
+    }
+    Some(name)
+}
+
+/// FsRtlNotifyFilterReportChange / FsRtlNotifyFullReportChange: para cada
+/// NOTIFY_CHANGE do diretório (ou de um ancestral com WatchTree) cujo
+/// CompletionFilter casa, monta o FILE_NOTIFY_INFORMATION e conclui o IRP
+/// pendente ou acumula. TargetNameOffset 0 com nome é ignorado. Sem
+/// FullTargetName, o NOTIFY_CHANGE é o de SubjectContext == TargetContext e o
+/// registro leva só o StreamName (sem filtro nem callbacks), como no NT.
 pub fn full_report_change(report: &ReportChange) -> Result<(), KernelError> {
+    if report.target_name_offset == 0 && report.full_target_name != 0 {
+        return Ok(());
+    }
     if report.notify_list.flink.get() == report.notify_list.address() {
         return Ok(());
     }
@@ -557,40 +616,18 @@ pub fn full_report_change(report: &ReportChange) -> Result<(), KernelError> {
         for links in list_entries(report.notify_list) {
             let notify = notify_at(links - NOTIFY_LINKS);
             let current = notify.flags.get();
-            if current & (CLEANUP_CALLED | DELETE_PENDING) != 0 || notify.completion_filter.get() & report.filter_match == 0 {
+            if current & (CLEANUP_CALLED | DELETE_PENDING) != 0 {
                 continue;
             }
-            let character_size = notify.character_size.get().max(1);
-            let target = read_units(report.full_target_name, character_size);
-            let offset = (report.target_name_offset / character_size as u16) as usize;
-            if offset > target.len() {
-                continue;
-            }
-            let parent: Vec<u16> = if report.normalized_parent_name != 0 {
-                read_units(report.normalized_parent_name, character_size)
-            } else if offset <= 1 {
-                target[..offset.min(1)].to_vec()
-            } else {
-                target[..offset - 1].to_vec()
-            };
-            let Some(mut name) = relative_name(notify, &target, offset, &parent) else { continue };
-            // Mudança numa subárvore: o TraverseCallback do FS decide a visibilidade.
-            let traverse = notify.traverse_callback.get();
-            if traverse != 0 && name.len() != target.len() - offset {
-                let status = native_call::call(traverse, &[notify.fs_context.get(), report.target_context, notify.subject_context.get()]) as u32;
-                if status & 0x8000_0000 != 0 {
+            let name = if report.full_target_name == 0 {
+                if notify.subject_context.get() != report.target_context {
                     continue;
                 }
-            }
-            let filter = notify.filter_callback.get();
-            if filter != 0 && native_call::call(filter, &[notify.fs_context.get(), 0]) & 0xFF == 0 {
-                continue;
-            }
-            let stream = read_units(report.stream_name, character_size);
-            if !stream.is_empty() {
-                name.push(b':' as u16);
-                name.extend_from_slice(&stream);
-            }
+                read_units(report.stream_name, notify.character_size.get().max(1))
+            } else {
+                let Some(name) = matching_name(notify, report) else { continue };
+                name
+            };
             if current & IGNORE_BUFFER != 0 {
                 overflow(notify);
                 continue;
@@ -626,6 +663,321 @@ pub fn cleanup(sync: u64, list: &ListEntry, fs_context: u64) -> Result<(), Kerne
         complete_all(notify, STATUS_NOTIFY_CLEANUP);
         remove_entry(&notify.notify_list);
         dereference(notify);
+        Ok(())
+    })
+}
+
+// ---- Variante Lite -----------------------------------------------------------------
+//
+// ntoskrnl 10.0.19041: FsRtlNotifyFilterChangeDirectoryLite 0x675b90 e
+// FsRtlNotifyFilterReportChangeLiteEx 0x675380 (com FsRtlCheckNotifyForDeleteLite
+// 0x88d404, FsRtlNotifyCompleteIrpList 0x6758e8 e FsRtlNotifyCompleteIrp
+// 0x675984). O NOTIFY_CHANGE Lite tem só os primeiros 0x80 bytes (sem nome de
+// diretório: a casa é pelo FsContext e pela flag "no próprio diretório" do
+// relato) e leva a flag 0x40. O PNOTIFY_SYNC vem por ponteiro e é criado na
+// primeira chamada (InterlockedCompareExchange; quem perde a corrida
+// libera o seu). Flags da criação: 1 WatchTree, 2 sem buffer (BufferLength
+// fica 0, todo relato vira STATUS_NOTIFY_ENUM_DIR), 4 registros estendidos
+// (FILE_NOTIFY_EXTENDED_INFORMATION, flag 0x80 no NOTIFY_CHANGE). No relato,
+// o bit 8 do NOTIFY_CHANGE segura a conclusão entre um
+// FILE_ACTION_RENAMED_OLD_NAME e o próximo registro. O NT escreve os
+// registros direto no buffer do IRP pendente ou num pool cobrado do processo
+// dono; aqui eles ficam na tabela de pendentes deste motor e vão ao IRP pelo
+// SystemBuffer na conclusão, como no resto do arquivo.
+
+const LITE: u16 = 0x40;
+const RENAME_HOLD: u16 = 0x08;
+const EXTENDED_RECORDS: u16 = 0x80;
+const LITE_NOTIFY_SIZE: u64 = 0x80;
+const LITE_WATCH_TREE: u32 = 0x01;
+const LITE_NO_BUFFER: u32 = 0x02;
+const LITE_EXTENDED: u32 = 0x04;
+/// No relato: a mudança é no próprio diretório observado (sem WatchTree nem
+/// TraverseCallback).
+const LITE_REPORT_IN_DIRECTORY: u32 = 0x01;
+const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
+/// FILE_NOTIFY_EXTENDED_INFORMATION até FileName.
+const EXTENDED_RECORD_HEADER: usize = 0x54;
+/// FILE_NOTIFY_INFORMATION até FileName.
+const RECORD_HEADER: usize = 0x0C;
+/// O bloco de informação estendida do relato tem pelo menos 0x50 bytes.
+const EXTENDED_INFORMATION_MINIMUM: u32 = 0x50;
+
+/// *NotifySync, criado na primeira chamada.
+fn lite_sync(pointer: &Field<u64>) -> Result<u64, KernelError> {
+    if pointer.get() == 0 {
+        let created = guest::alloc_bytes(8);
+        // SAFETY: célula de rascunho recém-alocada.
+        let cell = unsafe { Field::<u64>::at(created) };
+        let result = initialize_sync(cell).map(|()| cell.get());
+        guest::free_bytes(created);
+        let sync = result?;
+        if pointer.atomic().compare_exchange(0, sync, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            invoke_handler("ExFreePool", &[sync])?;
+        }
+    }
+    Ok(pointer.get())
+}
+
+/// Parâmetros de FsRtlNotifyFilterChangeDirectoryLite.
+pub struct ChangeDirectoryLite<'a> {
+    pub notify_sync: &'a Field<u64>,
+    pub notify_list: &'a ListEntry,
+    pub fs_context: u64,
+    pub flags: u32,
+    pub completion_filter: u32,
+    pub irp: Option<&'a Irp>,
+    pub traverse_callback: u64,
+    pub subject_context: u64,
+    pub filter_callback: u64,
+}
+
+/// FsRtlNotifyCompleteIrp com status 0: sem dados ou com mais dados que o
+/// buffer do pedido, STATUS_NOTIFY_ENUM_DIR; senão os registros.
+fn complete_lite(irp: &Irp, data: &[u8]) -> Result<(), KernelError> {
+    let length = current_stack(irp).parameters.notify_directory.length.get() as usize;
+    if data.is_empty() || data.len() > length {
+        complete(irp, STATUS_NOTIFY_ENUM_DIR, 0);
+        return Ok(());
+    }
+    complete_with_data(irp, data)
+}
+
+/// Retira os registros pendentes de um NOTIFY_CHANGE Lite (o limite
+/// capturado volta a zero).
+fn take_pending_lite(notify: &NotifyChange) -> Vec<u8> {
+    notify.buffer_limit.set(0);
+    take_pending(notify)
+}
+
+/// FsRtlNotifyCompleteIrpList(Notify, 0): ENUM_DIR sai, e o primeiro IRP
+/// pendente leva os registros (ou STATUS_NOTIFY_ENUM_DIR sem eles).
+fn complete_first_lite(notify: &NotifyChange) -> Result<(), KernelError> {
+    let data = take_pending_lite(notify);
+    set_flags(notify, 0, ENUM_DIR);
+    if let Some(irp) = first_irp(notify) {
+        complete_lite(irp, &data)?;
+        dereference(notify);
+    }
+    Ok(())
+}
+
+fn create_notify_lite(change: &ChangeDirectoryLite, irp: &Irp, stack: &IoStackLocation) -> Result<&'static NotifyChange, KernelError> {
+    let address = pool_allocation::allocate_tagged(0x11, LITE_NOTIFY_SIZE, NOTIFY_TAG)?;
+    guest::write_bytes(address, &[0u8; LITE_NOTIFY_SIZE as usize]);
+    let notify = notify_at(address);
+    let mut flags = LITE;
+    notify.notify_sync.set(change.notify_sync.get());
+    notify.fs_context.set(change.fs_context);
+    notify.traverse_callback.set(change.traverse_callback);
+    notify.subject_context.set(change.subject_context);
+    notify.filter_callback.set(change.filter_callback);
+    notify.notify_irps.flink.set(notify.notify_irps.address());
+    notify.notify_irps.blink.set(notify.notify_irps.address());
+    if change.flags & LITE_WATCH_TREE != 0 {
+        flags |= WATCH_TREE;
+    }
+    if change.flags & LITE_EXTENDED != 0 {
+        flags |= EXTENDED_RECORDS;
+    }
+    notify.completion_filter.set(change.completion_filter);
+    if change.flags & LITE_NO_BUFFER == 0 {
+        notify.this_buffer_length.set(stack.parameters.notify_directory.length.get());
+    }
+    notify.flags.set(flags);
+    let thread = irp.tail.overlay.thread.get();
+    // SAFETY: a thread do IRP (KTHREAD.Process = o processo dono).
+    notify.owning_process.set(if thread != 0 { unsafe { Kthread::at(thread) }.process.get() } else { 0 });
+    insert_tail(change.notify_list, &notify.notify_list)?;
+    notify.reference_count.set(1);
+    Ok(notify)
+}
+
+/// FsRtlCheckNotifyForDeleteLite: todo NOTIFY_CHANGE da lista fica
+/// DELETE_PENDING e os IRPs pendentes saem com STATUS_DELETE_PENDING.
+fn check_for_delete_lite(list: &ListEntry) {
+    for links in list_entries(list) {
+        let notify = notify_at(links - NOTIFY_LINKS);
+        set_flags(notify, DELETE_PENDING, 0);
+        complete_all(notify, STATUS_DELETE_PENDING);
+    }
+}
+
+/// FsRtlNotifyFilterChangeDirectoryLite.
+pub fn filter_change_directory_lite(change: &ChangeDirectoryLite) -> Result<(), KernelError> {
+    if change.irp.is_none() && change.notify_list.flink.get() == change.notify_list.address() {
+        return Ok(());
+    }
+    let sync = lite_sync(change.notify_sync)?;
+    let mut subject_taken = false;
+    let result = with_sync(sync, || {
+        let Some(irp) = change.irp else {
+            check_for_delete_lite(change.notify_list);
+            return Ok(());
+        };
+        irp.io_status.status.set(0);
+        irp.io_status.information.set(0);
+        let stack = current_stack(irp);
+        let file = stack.file_object.get();
+        // SAFETY: o FILE_OBJECT do diretório no slot corrente.
+        if file != 0 && unsafe { FileObject::at(file) }.flags.get() & FO_CLEANUP_COMPLETE != 0 {
+            complete(irp, STATUS_NOTIFY_CLEANUP, 0);
+            return Ok(());
+        }
+        let notify = match notify_on_list(change.notify_list, change.fs_context) {
+            Some(notify) => {
+                let current = notify.flags.get();
+                if current & CLEANUP_CALLED != 0 {
+                    complete(irp, STATUS_NOTIFY_CLEANUP, 0);
+                    return Ok(());
+                }
+                if current & DELETE_PENDING != 0 {
+                    complete(irp, STATUS_DELETE_PENDING, 0);
+                    return Ok(());
+                }
+                let held = current & RENAME_HOLD != 0;
+                if current & ENUM_DIR != 0 && !held {
+                    set_flags(notify, 0, ENUM_DIR);
+                    complete(irp, STATUS_NOTIFY_ENUM_DIR, 0);
+                    return Ok(());
+                }
+                if notify.buffer.get() != 0 && !held {
+                    let data = take_pending_lite(notify);
+                    return complete_lite(irp, &data);
+                }
+                notify
+            }
+            None => {
+                subject_taken = true;
+                create_notify_lite(change, irp, stack)?
+            }
+        };
+        queue_irp(notify, irp)
+    });
+    if !subject_taken && change.subject_context != 0 {
+        invoke_handler("SeReleaseSubjectContext", &[change.subject_context])?;
+        invoke_handler("ExFreePool", &[change.subject_context])?;
+    }
+    result
+}
+
+/// Parâmetros de FsRtlNotifyFilterReportChangeLiteEx. `name` e `stream_name`
+/// são PUNICODE_STRING; `extended_information` aponta os campos copiados para
+/// um FILE_NOTIFY_EXTENDED_INFORMATION (Size >= 0x50 no primeiro ULONG).
+pub struct ReportChangeLite<'a> {
+    pub notify_sync: &'a Field<u64>,
+    pub notify_list: &'a ListEntry,
+    pub name: u64,
+    pub stream_name: u64,
+    pub filter_match: u32,
+    pub action: u32,
+    pub target_context: u64,
+    pub filter_context: u64,
+    pub flags: u32,
+    pub extended_information: u64,
+}
+
+fn unicode_bytes(string: u64) -> Vec<u8> {
+    if string == 0 {
+        return Vec::new();
+    }
+    // SAFETY: PUNICODE_STRING do FS (mesmo layout de STRING).
+    let string = unsafe { AnsiString::at(string) };
+    guest::read_bytes(string.buffer.get(), string.length.get() as usize)
+}
+
+/// FILE_NOTIFY_INFORMATION ou FILE_NOTIFY_EXTENDED_INFORMATION com o nome e,
+/// havendo, ':' e o stream.
+fn lite_record(report: &ReportChangeLite, extended: bool) -> Vec<u8> {
+    let mut name = unicode_bytes(report.name);
+    if report.stream_name != 0 {
+        name.extend_from_slice(&(b':' as u16).to_le_bytes());
+        name.extend_from_slice(&unicode_bytes(report.stream_name));
+    }
+    let header = if extended { EXTENDED_RECORD_HEADER } else { RECORD_HEADER };
+    let mut record = alloc::vec![0u8; header];
+    record[4..8].copy_from_slice(&report.action.to_le_bytes());
+    if extended {
+        // CreationTime..ParentFileId: os bytes 8..0x50 do bloco do chamador.
+        record[8..0x50].copy_from_slice(&guest::read_bytes(report.extended_information + 8, 0x48));
+    }
+    record[header - 4..header].copy_from_slice(&(name.len() as u32).to_le_bytes());
+    record.extend_from_slice(&name);
+    record
+}
+
+/// O limite do buffer de um relato: o capturado com o primeiro registro
+/// pendente, senão o comprimento do primeiro IRP pendente, senão o
+/// BufferLength da criação.
+fn lite_limit(notify: &NotifyChange) -> u32 {
+    let captured = notify.buffer_limit.get();
+    if captured != 0 {
+        return captured;
+    }
+    match list_entries(&notify.notify_irps).first() {
+        Some(&entry) => current_stack(irp_at(entry - IRP_LIST_ENTRY)).parameters.notify_directory.length.get(),
+        None => notify.this_buffer_length.get(),
+    }
+}
+
+/// Acrescenta o registro ou, sem espaço, liga ENUM_DIR e descarta o pendente.
+fn record_lite(notify: &NotifyChange, report: &ReportChangeLite) {
+    let record = lite_record(report, notify.flags.get() & EXTENDED_RECORDS != 0);
+    let limit = lite_limit(notify) as usize;
+    let mut data = take_pending(notify);
+    if record.len() > limit || aligned_length(data.len()) + record.len() > limit {
+        set_flags(notify, ENUM_DIR, 0);
+        notify.buffer_limit.set(0);
+        return;
+    }
+    append_record(&mut data, &record);
+    notify.buffer_limit.set(limit as u32);
+    notify.buffer.set(1);
+    PENDING.lock().insert(notify.address(), data);
+}
+
+/// FsRtlNotifyFilterReportChangeLiteEx.
+pub fn filter_report_change_lite(report: &ReportChangeLite) -> Result<(), KernelError> {
+    if report.notify_list.flink.get() == report.notify_list.address() {
+        return Ok(());
+    }
+    // SAFETY: o bloco de informação estendida do FS (o primeiro ULONG é o tamanho).
+    if report.extended_information != 0 && unsafe { Field::<u32>::at(report.extended_information) }.get() < EXTENDED_INFORMATION_MINIMUM {
+        return Ok(());
+    }
+    let sync = lite_sync(report.notify_sync)?;
+    with_sync(sync, || {
+        for links in list_entries(report.notify_list) {
+            let notify = notify_at(links - NOTIFY_LINKS);
+            if notify.completion_filter.get() & report.filter_match == 0 {
+                continue;
+            }
+            let fs_context = notify.fs_context.get();
+            if report.flags & LITE_REPORT_IN_DIRECTORY == 0 {
+                if notify.flags.get() & WATCH_TREE == 0 {
+                    continue;
+                }
+                let traverse = notify.traverse_callback.get();
+                if traverse != 0 && native_call::call(traverse, &[fs_context, report.target_context, notify.subject_context.get()]) & 0xFF == 0 {
+                    continue;
+                }
+            }
+            let filter = notify.filter_callback.get();
+            if filter != 0 && report.filter_context != 0 && native_call::call(filter, &[fs_context, report.filter_context]) & 0xFF == 0 {
+                continue;
+            }
+            if notify.flags.get() & ENUM_DIR == 0 && notify.this_buffer_length.get() != 0 {
+                record_lite(notify, report);
+            }
+            if report.action == FILE_ACTION_RENAMED_OLD_NAME {
+                set_flags(notify, RENAME_HOLD, 0);
+                continue;
+            }
+            set_flags(notify, 0, RENAME_HOLD);
+            if notify.notify_irps.flink.get() != notify.notify_irps.address() {
+                complete_first_lite(notify)?;
+            }
+        }
         Ok(())
     })
 }

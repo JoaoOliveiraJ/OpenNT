@@ -387,9 +387,14 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("po-fx-drips-watchdog", 1792, 1),
     ("io-dependencies", 1793, 5),
     ("io-device-reset-resources", 1798, 3),
+    ("fsrtl-cached-fast-io", 1801, 6),
+    ("fsrtl-volume-event", 1807, 2),
+    ("fsrtl-device-queries", 1809, 2),
+    ("fsrtl-oplock-filter", 1811, 1),
+    ("fsrtl-notify-filter", 1812, 3),
 ];
 
-/// Os 1707 exports de função, na ordem da ABI.
+/// Os 1761 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2192,4 +2197,18 @@ pub static EXPORT_NAMES: &[&str] = &[
     "IoRequestDeviceRemovalForReset",
     "IoAssignResources",
     "IoWMIExecuteMethod",
+    "FsRtlCopyRead",
+    "FsRtlCopyWrite",
+    "FsRtlMdlReadDev",
+    "FsRtlPrepareMdlWriteDev",
+    "FsRtlMdlRead",
+    "FsRtlMdlReadComplete",
+    "FsRtlNotifyVolumeEvent",
+    "FsRtlNotifyVolumeEventEx",
+    "FsRtlBalanceReads",
+    "FsRtlGetSectorSizeInformation",
+    "FsRtlCheckOplockForFsFilterCallback",
+    "FsRtlNotifyFilterReportChange",
+    "FsRtlNotifyFilterChangeDirectoryLite",
+    "FsRtlNotifyFilterReportChangeLiteEx",
 ];

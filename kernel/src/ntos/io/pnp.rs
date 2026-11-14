@@ -338,6 +338,73 @@ fn has_device_node(pdo: u64) -> bool {
     pdo != 0 && io_manager::devices().into_iter().any(|(_, entry)| entry.native_device == pdo && (entry.pdo || entry.extra.is_some()))
 }
 
+// ---- IoGetRelatedTargetDevice -----------------------------------------------------
+//
+// ntoskrnl 19041: IoGetRelatedTargetDevice 0x71b7cc -> PnpGetRelatedTargetDevice
+// 0x360f2c: IoGetRelatedDeviceObject(FileObject) (NULL ->
+// STATUS_NO_SUCH_DEVICE); IRP_MJ_PNP/IRP_MN_QUERY_DEVICE_RELATIONS
+// (TargetDeviceRelation) síncrono a esse device, com o FILE_OBJECT na stack
+// location (PnpSendIrp); falha devolve o status; sem DEVICE_RELATIONS ou com
+// Count != 1, STATUS_NO_SUCH_DEVICE; a lista é liberada e o PDO precisa de
+// devnode (PDO->DeviceObjectExtension->DeviceNode), senão
+// STATUS_NO_SUCH_DEVICE. O PDO sai com a referência que a relação deu, e
+// quem chama a solta com ObDereferenceObject. O devnode do OpenNT é o PDO do
+// seu PnP (`has_device_node`), e o PDO devolvido é o DeviceNode->PhysicalDeviceObject.
+
+const PNP_STATUS_NO_SUCH_DEVICE_TARGET: u32 = 0xC000_000E;
+
+/// IoGetRelatedTargetDevice(FileObject, &DeviceObject): (NTSTATUS, PDO referenciado).
+pub fn related_target_device(file_object: u64) -> Result<(u32, u64), crate::rtl::KernelError> {
+    use crate::ntos::inc::types::{IoStackLocation, IoStatusBlock, Irp, Kevent};
+    let related = crate::ntos::init::exports::invoke_handler("IoGetRelatedDeviceObject", &[file_object])?;
+    if related == 0 {
+        return Ok((PNP_STATUS_NO_SUCH_DEVICE_TARGET, 0));
+    }
+    let event = guest::alloc_bytes(Kevent::SIZE);
+    let io_status = guest::alloc_bytes(IoStatusBlock::SIZE);
+    crate::ntos::ke::dispatcher::initialize_event(event, 0, false);
+    let packet = io_manager::build_synchronous_fsd_request(io_manager::irp_mj::PNP, related, 0, 0, 0, event, io_status);
+    let (status, information) = if packet == 0 {
+        (PNP_STATUS_INSUFFICIENT_RESOURCES, 0)
+    } else {
+        // SAFETY: IRP recém-montado pelo I/O Manager.
+        let irp = unsafe { Irp::at(packet) };
+        // SAFETY: o slot do primeiro driver, logo abaixo de CurrentStackLocation.
+        let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get() - IoStackLocation::SIZE) };
+        irp.io_status.status.set(PNP_STATUS_NOT_SUPPORTED as i32);
+        location.minor_function.set(irp_mn::QUERY_DEVICE_RELATIONS);
+        location.parameters.query_device_relations.type_.set(crate::ntos::inc::types::DeviceRelationType::TARGET_DEVICE_RELATION);
+        location.file_object.set(file_object);
+        let mut status = io_manager::iof_call_driver(related, packet) as u32;
+        let mut information = irp.io_status.information.get();
+        if status == PNP_STATUS_PENDING {
+            crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
+            // SAFETY: IO_STATUS_BLOCK alocado acima.
+            let block = unsafe { IoStatusBlock::at(io_status) };
+            status = block.status.get() as u32;
+            information = block.information.get();
+        }
+        guest::free_bytes(packet);
+        (status, information)
+    };
+    guest::free_bytes(event);
+    guest::free_bytes(io_status);
+    if (status as i32) < 0 {
+        return Ok((status, 0));
+    }
+    if information == 0 {
+        return Ok((PNP_STATUS_NO_SUCH_DEVICE_TARGET, 0));
+    }
+    // SAFETY: DEVICE_RELATIONS devolvido pelo driver em IoStatus.Information.
+    let relations = unsafe { DeviceRelations::at(information) };
+    let pdo = if relations.count.get() == 1 { relations.objects[0].get() } else { 0 };
+    guest::free_bytes(information);
+    if pdo == 0 || !has_device_node(pdo) {
+        return Ok((PNP_STATUS_NO_SUCH_DEVICE_TARGET, 0));
+    }
+    Ok((status, pdo))
+}
+
 /// IoGetDeviceNumaNode(Pdo, NodeNumber): `node` é o PUSHORT do chamador.
 pub fn device_numa_node(pdo: u64, node: &crate::ntos::inc::types::Field<u16>) -> u32 {
     if !has_device_node(pdo) {
