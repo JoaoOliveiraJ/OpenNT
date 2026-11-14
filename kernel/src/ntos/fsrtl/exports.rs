@@ -1725,3 +1725,21 @@ pub mod fsrtl_notify_filter {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_dbcs_expression {
+    //! FsRtlIsDbcsInExpression; a lógica mora em `fsrtl/name`.
+
+    use crate::ntos::fsrtl::name;
+    use crate::ntos::inc::types::{NtStruct, String as AnsiString};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlIsDbcsInExpression(Expression, Name) -> BOOLEAN.
+    fn is_dbcs_in_expression(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os dois ANSI_STRING do chamador.
+        let (expression, file_name) = unsafe { (AnsiString::at(call.arg(1)), AnsiString::at(call.arg(2))) };
+        Ok(name::is_dbcs_in_expression_strings(expression, file_name) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-dbcs-expression", names: &["FsRtlIsDbcsInExpression"], handlers: &[is_dbcs_in_expression], data_exports: &[] };
+}

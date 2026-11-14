@@ -146,7 +146,7 @@ fn io_release_remove_lock_and_wait(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn io_allocate_error_log_entry(call: &Call) -> Result<u64, KernelError> {
-    Ok(error_log::allocate_entry(call.arg(2) as u8))
+    Ok(error_log::allocate_entry(call.arg(1), call.arg(2) as u8))
 }
 fn io_write_error_log_entry(call: &Call) -> Result<u64, KernelError> {
     error_log::write_entry(call.arg(1));
@@ -2031,4 +2031,39 @@ pub mod io_device_reset_resources {
         handlers: &[request_removal_for_reset, assign_resources, wmi_execute_method],
         data_exports: &[],
     };
+}
+
+pub mod io_error_log_free {
+    //! IoFreeErrorLogEntry; a lógica mora em `io/small.rs` (`error_log`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::small::error_log;
+    use crate::rtl::KernelError;
+
+    /// IoFreeErrorLogEntry(ElementEntry).
+    fn free_error_log_entry(call: &Call) -> Result<u64, KernelError> {
+        error_log::free_entry(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-error-log-free", names: &["IoFreeErrorLogEntry"], handlers: &[free_error_log_entry], data_exports: &[] };
+}
+
+pub mod io_extra_create_parameter {
+    //! IoGetIrpExtraCreateParameter: no ntoskrnl é a mesma rotina do
+    //! FsRtlGetEcpListFromIrp (RVA 0x650610); a lógica mora em `fsrtl/ecp`.
+
+    use crate::ntos::fsrtl::ecp;
+    use crate::ntos::inc::types::{Field, Irp, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// IoGetIrpExtraCreateParameter(Irp, ExtraCreateParameter*) -> NTSTATUS.
+    fn get_irp_extra_create_parameter(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP vivo e PECP_LIST* do chamador.
+        let (irp, list) = unsafe { (Irp::at(call.arg(1)), Field::<u64>::at(call.arg(2))) };
+        Ok(signed_status(ecp::get_list_from_irp(irp, list)))
+    }
+
+    pub static GROUP: Group = Group { name: "io-extra-create-parameter", names: &["IoGetIrpExtraCreateParameter"], handlers: &[get_irp_extra_create_parameter], data_exports: &[] };
 }

@@ -153,20 +153,134 @@ pub mod configuration_information {
     }
 }
 
-/// IoAllocateErrorLogEntry / IoWriteErrorLogEntry: o código vai para o log
-/// do sistema (serial).
+/// IoAllocateErrorLogEntry / IoWriteErrorLogEntry / IoFreeErrorLogEntry.
+///
+/// ntoskrnl 10.0.19041: IoAllocateErrorLogEntry 0x37fd60 ->
+/// IopAllocateErrorLogEntry 0x37fd9c, IoWriteErrorLogEntry 0x380230,
+/// IoFreeErrorLogEntry 0x5056c0. O pacote do driver (IO_ERROR_LOG_PACKET)
+/// segue um ERROR_LOG_ENTRY de 0x30 bytes no mesmo bloco de pool
+/// NonPagedPoolNx 'IoEr': Type 0xB, Size total (pacote arredondado a 8 + o
+/// cabeçalho), o DEVICE_OBJECT e o DRIVER_OBJECT referenciados (tag 'Dflt') e
+/// o carimbo de tempo. IoObject é um DEVICE_OBJECT (o driver vem dele) ou um
+/// DRIVER_OBJECT; outro tipo, pacote fora de 0x30..=0xF0 ou mais de 0x64000
+/// bytes já alocados devolvem NULL. Sem o serviço de log de eventos, a
+/// escrita leva o código à serial e o bloco volta como no
+/// IoFreeErrorLogEntry: as duas referências e a conta de
+/// IopErrorLogAllocation.
 pub mod error_log {
-    use crate::ntos::mm::guest_memory as guest;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
-    pub fn allocate_entry(size: u8) -> u64 {
-        guest::alloc_bytes(size as u64)
+    use crate::ntos::ex::pool_allocation;
+    use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+    use crate::ntos::inc::types::{IoErrorLogPacket, ListEntry};
+    use crate::ntos::ob::object_reference;
+
+    /// ERROR_LOG_ENTRY: o cabeçalho privado do I/O Manager antes do pacote.
+    #[repr(C)]
+    pub struct ErrorLogEntry {
+        pub type_: Field<u16>,
+        pub size: Field<u16>,
+        _pad_4: Reserved<0x4>,
+        pub list_entry: ListEntry,
+        pub device_object: Field<u64>,
+        pub driver_object: Field<u64>,
+        pub time_stamp: Field<u64>,
     }
 
-    pub fn write_entry(entry: u64) {
+    // SAFETY: #[repr(C)] só de células.
+    unsafe impl NtStruct for ErrorLogEntry {}
+
+    const _: () = {
+        assert!(core::mem::size_of::<ErrorLogEntry>() == 0x30);
+        assert!(core::mem::offset_of!(ErrorLogEntry, list_entry) == 0x8);
+        assert!(core::mem::offset_of!(ErrorLogEntry, device_object) == 0x18);
+        assert!(core::mem::offset_of!(ErrorLogEntry, time_stamp) == 0x28);
+    };
+
+    const IO_TYPE_ERROR_LOG: u16 = 0xB;
+    const IO_TYPE_DEVICE: u16 = 3;
+    const IO_TYPE_DRIVER: u16 = 4;
+    const HEADER: u32 = 0x30;
+    /// IopErrorLogAllocation passa disso: nada de entradas novas.
+    const MAXIMUM_ALLOCATION: u32 = 0x64000;
+    const NON_PAGED_POOL_NX: u32 = 0x200;
+    /// 'IoEr'.
+    const POOL_TAG: u32 = 0x7245_6F49;
+    /// 'Dflt'.
+    const REFERENCE_TAG: u32 = 0x746C_6644;
+
+    /// IopErrorLogAllocation: bytes das entradas vivas.
+    static ALLOCATED: AtomicU32 = AtomicU32::new(0);
+
+    /// Bytes das entradas vivas (IopErrorLogAllocation).
+    pub fn allocated() -> u32 {
+        ALLOCATED.load(Ordering::SeqCst)
+    }
+
+    /// IoAllocateErrorLogEntry(IoObject, EntrySize) -> o pacote ou NULL.
+    pub fn allocate_entry(io_object: u64, size: u8) -> u64 {
+        if io_object == 0 {
+            return 0;
+        }
+        let kind = crate::ntos::mm::guest_memory::read16(io_object);
+        let (device, driver) = match kind {
+            IO_TYPE_DEVICE => (io_object, crate::ntos::mm::guest_memory::read64(io_object + 8)),
+            IO_TYPE_DRIVER => (0, io_object),
+            _ => return 0,
+        };
+        if size.wrapping_sub(HEADER as u8) > 0xC0 {
+            return 0;
+        }
+        let total = ((size as u32 + 7) & 0xF8) + HEADER;
+        if ALLOCATED.fetch_add(total, Ordering::SeqCst) > MAXIMUM_ALLOCATION {
+            ALLOCATED.fetch_sub(total, Ordering::SeqCst);
+            return 0;
+        }
+        let block = pool_allocation::allocate_tagged(NON_PAGED_POOL_NX, total as u64, POOL_TAG).unwrap_or(0);
+        if block == 0 {
+            ALLOCATED.fetch_sub(total, Ordering::SeqCst);
+            return 0;
+        }
+        for object in [device, driver] {
+            if object != 0 {
+                let _ = object_reference::reference_with_tag(object, REFERENCE_TAG, true);
+            }
+        }
+        crate::ntos::mm::guest_memory::write_bytes(block, &alloc::vec![0u8; total as usize]);
+        // SAFETY: bloco recém-alocado com o cabeçalho e o pacote.
+        let entry = unsafe { ErrorLogEntry::at(block) };
+        entry.size.set(total as u16);
+        entry.type_.set(IO_TYPE_ERROR_LOG);
+        entry.device_object.set(device);
+        entry.driver_object.set(driver);
+        block + HEADER as u64
+    }
+
+    /// IoFreeErrorLogEntry(ElementEntry): solta as referências, desconta a
+    /// alocação e devolve o bloco.
+    pub fn free_entry(packet: u64) {
+        let block = packet - HEADER as u64;
+        // SAFETY: o cabeçalho que IoAllocateErrorLogEntry pôs antes do pacote.
+        let entry = unsafe { ErrorLogEntry::at(block) };
+        for object in [entry.device_object.get(), entry.driver_object.get()] {
+            if object != 0 {
+                let _ = object_reference::dereference_with_tag(object, REFERENCE_TAG, true);
+            }
+        }
+        ALLOCATED.fetch_sub(entry.size.get() as u32, Ordering::SeqCst);
+        let _ = pool_allocation::free(block, 0);
+    }
+
+    /// IoWriteErrorLogEntry(ElementEntry): o código vai para a serial e a
+    /// entrada é consumida.
+    pub fn write_entry(packet: u64) {
         // SAFETY: IO_ERROR_LOG_PACKET alocado por allocate_entry e preenchido pelo driver.
-        let code = unsafe { <crate::ntos::inc::types::IoErrorLogPacket as crate::ntos::inc::types::NtStruct>::at(entry) }.error_code.get() as u32;
+        let code = unsafe { IoErrorLogPacket::at(packet) }.error_code.get() as u32;
+        // SAFETY: o cabeçalho antes do pacote.
+        let entry = unsafe { ErrorLogEntry::at(packet - HEADER as u64) };
+        entry.time_stamp.set(crate::ntos::mm::guest_memory::read64(0xFFFF_F780_0000_0014));
         debug_print!("[errorlog] codigo=0x{:x}", code);
-        guest::free_bytes(entry);
+        free_entry(packet);
     }
 }
 

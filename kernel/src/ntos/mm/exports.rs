@@ -902,3 +902,58 @@ pub mod virtual_memory_lock {
 
     pub static GROUP: Group = Group { name: "virtual-memory-lock", names: &["ZwUnlockVirtualMemory"], handlers: &[unlock], data_exports: &[] };
 }
+
+pub mod mm_file_sections {
+    //! MmCanFileBeTruncated, MmDoesFileHaveUserWritableReferences e
+    //! MmFlushImageSection; a lógica mora em `mm/section/object_pointers.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::SectionObjectPointers;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::mm::section::object_pointers;
+    use crate::rtl::KernelError;
+
+    fn pointers(address: u64) -> &'static SectionObjectPointers {
+        // SAFETY: SECTION_OBJECT_POINTERS do FCB do FS chamador.
+        unsafe { SectionObjectPointers::at(address) }
+    }
+
+    /// MmCanFileBeTruncated(SectionPointer, NewFileSize*) -> BOOLEAN.
+    fn can_file_be_truncated(call: &Call) -> Result<u64, KernelError> {
+        let size = (call.arg(2) != 0).then(|| guest::read64(call.arg(2)));
+        Ok(object_pointers::can_file_be_truncated(pointers(call.arg(1)), size)? as u64)
+    }
+
+    /// MmDoesFileHaveUserWritableReferences(SectionPointer) -> ULONG.
+    fn does_file_have_user_writable_references(call: &Call) -> Result<u64, KernelError> {
+        Ok(object_pointers::does_file_have_user_writable_references(pointers(call.arg(1)))? as u64)
+    }
+
+    /// MmFlushImageSection(SectionPointer, FlushType) -> BOOLEAN.
+    fn flush_image_section(call: &Call) -> Result<u64, KernelError> {
+        Ok(object_pointers::flush_image_section(pointers(call.arg(1)), call.arg(2) as u32)? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "mm-file-sections",
+        names: &["MmCanFileBeTruncated", "MmDoesFileHaveUserWritableReferences", "MmFlushImageSection"],
+        handlers: &[can_file_be_truncated, does_file_have_user_writable_references, flush_image_section],
+        data_exports: &[],
+    };
+}
+
+pub mod mm_prefetch_pages {
+    //! MmPrefetchPages; a lógica mora em `mm/prefetch.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::prefetch;
+    use crate::rtl::KernelError;
+
+    /// MmPrefetchPages(NumberOfLists, ReadLists) -> NTSTATUS.
+    fn prefetch_pages(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(prefetch::prefetch_pages(call.arg(1) as u32, call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-prefetch-pages", names: &["MmPrefetchPages"], handlers: &[prefetch_pages], data_exports: &[] };
+}

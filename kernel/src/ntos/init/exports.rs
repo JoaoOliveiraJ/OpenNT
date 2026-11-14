@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 386] {
+fn groups() -> [&'static Group; 397] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -441,6 +441,17 @@ fn groups() -> [&'static Group; 386] {
         &crate::ntos::fsrtl::exports::fsrtl_device_queries::GROUP,
         &crate::ntos::fsrtl::exports::fsrtl_oplock_filter::GROUP,
         &crate::ntos::fsrtl::exports::fsrtl_notify_filter::GROUP,
+        &crate::ntos::rtl::exports::rtl_bitmap_runs::GROUP,
+        &crate::ntos::rtl::exports::rtl_8dot3_generate::GROUP,
+        &crate::ntos::rtl::exports::rtl_format_message::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_snwprintf_s::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_dbcs_expression::GROUP,
+        &crate::ntos::io::exports::io_error_log_free::GROUP,
+        &crate::ntos::io::exports::io_extra_create_parameter::GROUP,
+        &crate::ntos::mm::exports::mm_file_sections::GROUP,
+        &crate::ntos::mm::exports::mm_prefetch_pages::GROUP,
+        &crate::ntos::se::exports::se_filter_token::GROUP,
+        &crate::ntos::se::exports::query_security_attributes::GROUP,
     ]
 }
 

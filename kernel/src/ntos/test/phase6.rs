@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1815 && abi_names::GROUP_LAYOUT.len() == 386 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1815 exports em 386 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1830 && abi_names::GROUP_LAYOUT.len() == 397 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1830 exports em 397 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1379,7 +1379,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1815 && exports::export_names().len() == 1815, "ntoskrnl: 386 grupos com os 1815 exports implementados");
+    assert(exports::implemented() == 1830 && exports::export_names().len() == 1830, "ntoskrnl: 397 grupos com os 1830 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -12250,6 +12250,437 @@ fn virtual_memory_lock_exports(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// Texto UTF-16 com NUL num bloco novo do convidado.
+fn fsx_wide(text: &str) -> u64 {
+    let bytes: Vec<u8> = text.encode_utf16().chain(core::iter::once(0)).flat_map(|unit| unit.to_le_bytes()).collect();
+    let address = guest::alloc_bytes(bytes.len() as u64);
+    guest::write_bytes(address, &bytes);
+    address
+}
+
+/// UNICODE_STRING sobre um texto UTF-16 novo.
+fn fsx_unicode(text: &str) -> u64 {
+    let buffer = fsx_wide(text);
+    let length = text.encode_utf16().count() as u16 * 2;
+    let string = guest::alloc_bytes(nt::UnicodeString::SIZE);
+    at::<nt::UnicodeString>(string).length.set(length);
+    at::<nt::UnicodeString>(string).maximum_length.set(length + 2);
+    at::<nt::UnicodeString>(string).buffer.set(buffer);
+    string
+}
+
+/// ANSI_STRING sobre bytes novos.
+fn fsx_ansi(bytes: &[u8]) -> u64 {
+    let buffer = guest::alloc_bytes(bytes.len() as u64 + 1);
+    guest::write_bytes(buffer, bytes);
+    let string = guest::alloc_bytes(nt::String::SIZE);
+    at::<nt::String>(string).length.set(bytes.len() as u16);
+    at::<nt::String>(string).maximum_length.set(bytes.len() as u16 + 1);
+    at::<nt::String>(string).buffer.set(buffer);
+    string
+}
+
+/// Texto UTF-16 de `count` WCHARs no convidado.
+fn fsx_read_wide(address: u64, count: usize) -> String {
+    let units: Vec<u16> = guest::read_bytes(address, count * 2).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn rtl_bitmap_runs_exports(assert: Assert) {
+    // Vetores do modelo das rotinas do ntoskrnl 19041 (palavra a palavra).
+    let bitmap = |bytes: &[u8], size: u32| {
+        let words = guest::alloc_bytes(16);
+        guest::write_bytes(words, bytes);
+        let header = guest::alloc_bytes(nt::RtlBitmap::SIZE);
+        at::<nt::RtlBitmap>(header).size_of_bit_map.set(size);
+        at::<nt::RtlBitmap>(header).buffer.set(words);
+        header
+    };
+    let start = guest::alloc_bytes(8);
+    let first = |header: u64| call_export("RtlFindFirstRunClear", &[header, start]).map(|length| (guest::read32(start), length as u32));
+    let back = |header: u64, from: u64| call_export("RtlFindLastBackwardRunClear", &[header, from, start]).map(|length| (guest::read32(start), length as u32));
+    let longest = |header: u64| call_export("RtlFindLongestRunClear", &[header, start]).map(|length| (guest::read32(start), length as u32));
+    // 60 bits: 00 81 18 ff 00 00 24 07.
+    let mixed = bitmap(&[0x00, 0x81, 0x18, 0xff, 0x00, 0x00, 0x24, 0x07], 60);
+    assert(first(mixed) == Some((0, 8)) && longest(mixed) == Some((32, 18)), "rtl-bitmap-runs: RtlFindFirstRunClear e RtlFindLongestRunClear");
+    assert(
+        back(mixed, 0) == Some((0, 1))
+            && back(mixed, 8) == Some((0, 8))
+            && back(mixed, 12) == Some((9, 4))
+            && back(mixed, 31) == Some((21, 3))
+            && back(mixed, 40) == Some((32, 9))
+            && back(mixed, 59) == Some((59, 1))
+            && back(mixed, 60) == Some((60, 0)),
+        "rtl-bitmap-runs: RtlFindLastBackwardRunClear desce aos runs livres",
+    );
+    // 96 bits: 36 ocupados, livres de 36 a 91, ocupados até o fim.
+    let wide = bitmap(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0, 0, 0, 0, 0xf0], 96);
+    assert(first(wide) == Some((36, 56)) && longest(wide) == Some((36, 56)) && back(wide, 90) == Some((36, 55)) && back(wide, 30) == Some((0, 0)), "rtl-bitmap-runs: palavras inteiras saltadas");
+    let full = bitmap(&[0xff; 8], 50);
+    let empty = bitmap(&[0; 8], 0);
+    assert(first(full) == Some((50, 0)) && longest(full) == Some((0, 0)) && back(full, 40) == Some((0, 0)) && first(empty) == Some((0, 0)), "rtl-bitmap-runs: mapa cheio e vazio");
+}
+
+fn rtl_8dot3_generate_exports(assert: Assert) {
+    use crate::ntos::rtl::gen8dot3::GenerateNameContext;
+    // Vetores do modelo do RtlGenerate8dot3Name com a c_437.nls real.
+    let context = guest::alloc_bytes(GenerateNameContext::SIZE);
+    let state = at::<GenerateNameContext>(context);
+    let output_buffer = guest::alloc_bytes(32);
+    let output = guest::alloc_bytes(nt::UnicodeString::SIZE);
+    at::<nt::UnicodeString>(output).maximum_length.set(24);
+    at::<nt::UnicodeString>(output).buffer.set(output_buffer);
+    let generate = |name: u64, allow: u64| {
+        let status = call_export("RtlGenerate8dot3Name", &[name, allow, context, output]).map(|status| status as u32).unwrap_or(u32::MAX);
+        (status, fsx_read_wide(output_buffer, (at::<nt::UnicodeString>(output).length.get() / 2) as usize))
+    };
+    let reset = || guest::write_bytes(context, &[0u8; 0x24]);
+    let expect = |pairs: &[(u32, &str)]| pairs.iter().map(|&(status, text)| (status, String::from(text))).collect::<Vec<_>>();
+    reset();
+    let long = fsx_unicode("Program Files.txt");
+    let names: Vec<(u32, String)> = (0..6).map(|_| generate(long, 0)).collect();
+    assert(
+        names == expect(&[(0, "PROGRA~1.TXT"), (0, "PROGRA~2.TXT"), (0, "PROGRA~3.TXT"), (0, "PROGRA~4.TXT"), (0, "PRBC50~1.TXT"), (0, "PRBC50~2.TXT")])
+            && state.checksum.get() == 0x5CB
+            && state.last_index_value.get() == 2,
+        "rtl-8dot3-generate: NOME~N e o checksum depois do quarto",
+    );
+    let single = |text: &str, allow: u64| {
+        reset();
+        generate(fsx_unicode(text), allow)
+    };
+    assert(single("a.b", 0) == (0, String::from("A498A~1.B")) && state.checksum.get() == 0xA894, "rtl-8dot3-generate: nome curto recebe o checksum");
+    assert(
+        single("my[file].longext", 0) == (0, String::from("MY_FIL~1.LO~")) && single(".profile", 0) == (0, String::from("PROFIL~1")) && single("trailing.", 0) == (0, String::from("TRAILI~1")),
+        "rtl-8dot3-generate: ilegais, extensão longa, ponto inicial e final",
+    );
+    assert(
+        single("caf\u{e9} \u{100}bc.\u{e9}xt", 1) == (0, String::from("CAF\u{c9}AB~1.\u{c9}XT")) && single("caf\u{e9} \u{100}bc.\u{e9}xt", 0) == (0, String::from("CAFBC~1.XT")) && single("x\u{4e00}y.doc", 1) == (0, String::from("XY6CA9~1.DOC")),
+        "rtl-8dot3-generate: caracteres estendidos pela página OEM",
+    );
+    // Índice só de noves: o nome encolhe; sem nome, STATUS_FILE_SYSTEM_LIMITATION.
+    reset();
+    for (index, unit) in "AB12CD".encode_utf16().enumerate() {
+        state.name_buffer[index].set(unit);
+    }
+    state.name_length.set(6);
+    state.checksum_inserted.set(1);
+    state.last_index_value.set(8);
+    let nine = generate(long, 0);
+    let shrunk = state.name_length.get();
+    reset();
+    state.name_buffer[0].set(b'Z' as u16);
+    state.name_length.set(1);
+    state.extension_buffer[0].set(b'.' as u16);
+    state.extension_buffer[1].set(b'T' as u16);
+    state.extension_length.set(2);
+    state.checksum_inserted.set(1);
+    state.last_index_value.set(98);
+    let limit = generate(long, 0);
+    assert(nine == (0, String::from("AB12CD~9")) && shrunk == 5 && limit == (0xC000_0427, String::from("Z~99.T")) && state.name_length.get() == 0, "rtl-8dot3-generate: noves encolhem o nome");
+}
+
+fn rtl_format_message_exports(assert: Assert) {
+    let buffer = guest::alloc_bytes(256);
+    let returned = guest::alloc_bytes(8);
+    let arguments = guest::alloc_bytes(64);
+    let format = |text: &str, width: u64, ignore: u64, ansi: u64, array: u64, args: u64, length: u64| {
+        guest::write_bytes(buffer, &[0xCC; 256]);
+        guest::write32(returned, 0xFFFF);
+        let status = call_export("RtlFormatMessage", &[fsx_wide(text), width, ignore, ansi, array, args, buffer, length, returned]).map(|status| status as u32).unwrap_or(u32::MAX);
+        (status, guest::read32(returned))
+    };
+    let text = |count: usize| fsx_read_wide(buffer, count);
+    let world = fsx_wide("World");
+    for (index, value) in [world, 0xBEEF, 6, 42].iter().enumerate() {
+        guest::write64(arguments + index as u64 * 8, *value);
+    }
+    let expected = "Hello World, value beef and     42";
+    let result = format("Hello %1, value %2!x! and %3!*d!%0ignored", 0, 0, 0, 1, arguments, 256);
+    assert(result == (0, (expected.len() as u32 + 1) * 2) && text(expected.len() + 1) == alloc::format!("{expected}\0"), "rtl-format-message: inserções, formatos, '*' e %0");
+    let escapes = "A\tB C%D.E\rF\r\nG";
+    assert(format("A%tB%bC%%D%.E%rF%nG", 0, 0, 0, 1, arguments, 256) == (0, 30) && text(14) == escapes, "rtl-format-message: escapes %t %b %% %r %n");
+    let ignored = "%1 and %2!d! and %3 %%";
+    assert(format("%1 and %2!d! and %3!s! %%", 0, 1, 0, 1, 0, 256).0 == 0 && text(ignored.len()) == ignored, "rtl-format-message: IgnoreInserts copia as inserções");
+    assert(format("aaaa bbbb cccc dddd", 10, 0, 0, 1, arguments, 256).0 == 0 && text(20) == "aaaa bbbb\r\ncccc dddd", "rtl-format-message: quebra no último espaço");
+    assert(format("abcdefghijkl", 5, 0, 0, 1, arguments, 256).0 == 0 && text(16) == "abcde\r\nfghij\r\nkl", "rtl-format-message: quebra sem espaço");
+    assert(
+        format("a\nb\r\nc\n\rd", 0, 0, 0, 1, arguments, 256).0 == 0 && text(10) == "a\r\nb\r\nc\r\nd" && format("a\nb\r\nc\n\rd", 0xFFFF_FFFF, 0, 0, 1, arguments, 256).0 == 0 && text(7) == "a b c d",
+        "rtl-format-message: CR/LF viram CR LF sem largura e espaço com largura",
+    );
+    assert(format("Hello", 0, 0, 0, 1, arguments, 10) == (0x8000_0005, 0xFFFF) && text(5) == "Hello", "rtl-format-message: sem lugar para o NUL");
+    assert(format("%1", 0, 0, 0, 1, arguments, 10).0 == 0x8000_0005 && text(5) == "Worl\0", "rtl-format-message: inserção truncada");
+    assert(
+        format("%1234", 0, 0, 0, 1, arguments, 256).0 == 0xC000_000D && format("%1", 0, 0, 0, 1, 0, 256).0 == 0xC000_000D && format("%1!abc", 0, 0, 0, 1, arguments, 256).0 == 0xC000_000D,
+        "rtl-format-message: inserção inválida",
+    );
+    // va_list: o cursor do chamador avança a cada argumento lido.
+    let list = guest::alloc_bytes(16);
+    guest::write64(list, fsx_wide("one"));
+    guest::write64(list + 8, 7);
+    let cursor = guest::alloc_bytes(8);
+    guest::write64(cursor, list);
+    assert(format("%1-%2!u!", 0, 0, 0, 0, cursor, 256).0 == 0 && text(5) == "one-7" && guest::read64(cursor) == list + 16, "rtl-format-message: va_list");
+    // Argumentos ANSI: %s vira %hs.
+    let narrow = guest::alloc_bytes(8);
+    guest::write_bytes(narrow, b"abc\0");
+    guest::write64(arguments, narrow);
+    assert(format("[%1]", 0, 0, 1, 1, arguments, 256).0 == 0 && text(5) == "[abc]", "rtl-format-message: ArgumentsAreAnsi");
+}
+
+fn rtl_crt_snwprintf_s_exports(assert: Assert) {
+    let buffer = guest::alloc_bytes(64);
+    let format = fsx_wide("%d-%s");
+    let word = fsx_wide("abcdef");
+    let print = |size: u64, count: u64| {
+        guest::write_bytes(buffer, &[0xCC; 64]);
+        call_export("_snwprintf_s", &[buffer, size, count, format, 12345, word]).map(|result| result as u32)
+    };
+    const TRUNCATE: u64 = u64::MAX;
+    assert(print(16, 20) == Some(12) && fsx_read_wide(buffer, 13) == "12345-abcdef\0", "crt: _snwprintf_s cabe");
+    assert(print(8, TRUNCATE) == Some(u32::MAX) && fsx_read_wide(buffer, 8) == "12345-a\0", "crt: _snwprintf_s _TRUNCATE mantém o texto truncado");
+    assert(print(8, 3) == Some(u32::MAX) && fsx_read_wide(buffer, 4) == "123\0", "crt: _snwprintf_s limitado por count");
+    assert(print(8, 10) == Some(u32::MAX) && guest::read16(buffer) == 0, "crt: _snwprintf_s estourado zera o buffer");
+    assert(
+        call_export("_snwprintf_s", &[buffer, 8, 3, 0]).map(|result| result as u32) == Some(u32::MAX) && call_export("_snwprintf_s", &[0, 0, 0, format]) == Some(0) && call_export("_snwprintf_s", &[0, 8, 3, format]).map(|result| result as u32) == Some(u32::MAX),
+        "crt: _snwprintf_s parâmetros inválidos",
+    );
+}
+
+fn fsrtl_dbcs_expression_exports(assert: Assert) {
+    // Vetores do modelo do autômato do ntoskrnl (página OEM 437, SBCS).
+    let matches = |expression: &[u8], name: &[u8]| call_export("FsRtlIsDbcsInExpression", &[fsx_ansi(expression), fsx_ansi(name)]).map(|result| result as u8 != 0);
+    assert(matches(b"*.TXT", b"FILE.TXT") == Some(true) && matches(b"*.TXT", b"FILE.txt") == Some(false) && matches(b"F?LE.*", b"FILE.TXT") == Some(true), "fsrtl-dbcs-expression: sufixo, caixa e '?'");
+    assert(
+        matches(b"<.TXT", b"A.B.TXT") == Some(true) && matches(b"FILE>>.TXT", b"FILE.TXT") == Some(true) && matches(b"A\"", b"A") == Some(true) && matches(b"A\"B", b"AB") == Some(false),
+        "fsrtl-dbcs-expression: curingas DOS",
+    );
+    assert(
+        matches(b"", b"") == Some(true) && matches(b"*", b"") == Some(false) && matches(b"\xe9*", b"\xe9T\xe9") == Some(true) && matches(b"*<.C", b"X.C") == Some(true) && matches(b"??", b"ABC") == Some(false) && matches(b"A*B*C", b"AXXBYC") == Some(true),
+        "fsrtl-dbcs-expression: vazios, bytes altos e retrocesso",
+    );
+}
+
+fn io_error_log_and_ecp_exports(assert: Assert) {
+    use crate::ntos::io::small::error_log::{self, ErrorLogEntry};
+    // IoGetIrpExtraCreateParameter: só IRPs de create, a lista em UserBuffer.
+    let irp = guest::alloc_bytes(nt::Irp::SIZE);
+    let list = guest::alloc_bytes(8);
+    at::<nt::Irp>(irp).user_buffer.set(0x1234_5678);
+    let rejected = call_export("IoGetIrpExtraCreateParameter", &[irp, list]).map(|status| status as u32);
+    at::<nt::Irp>(irp).flags.set(0x80);
+    let created = call_export("IoGetIrpExtraCreateParameter", &[irp, list]).map(|status| status as u32);
+    assert(rejected == Some(0xC000_000D) && created == Some(0) && guest::read64(list) == 0x1234_5678, "io-extra-create-parameter: IoGetIrpExtraCreateParameter");
+    // IoAllocateErrorLogEntry / IoFreeErrorLogEntry sobre um DEVICE_OBJECT.
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    at::<nt::DriverObject>(driver).type_.set(4);
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    at::<nt::DeviceObject>(device).type_.set(3);
+    at::<nt::DeviceObject>(device).driver_object.set(driver);
+    let before = error_log::allocated();
+    let packet = call_export("IoAllocateErrorLogEntry", &[device, 0x40]).unwrap_or(0);
+    let entry = at::<ErrorLogEntry>(packet.wrapping_sub(0x30));
+    let allocated_ok = packet != 0 && entry.type_.get() == 0xB && entry.size.get() == 0x70 && entry.device_object.get() == device && entry.driver_object.get() == driver && error_log::allocated() == before + 0x70;
+    let referenced = at::<nt::DeviceObject>(device).reference_count.get();
+    let _ = call_export("IoFreeErrorLogEntry", &[packet]);
+    assert(allocated_ok && referenced == 1 && at::<nt::DeviceObject>(device).reference_count.get() == 0 && error_log::allocated() == before, "io-error-log-free: IoFreeErrorLogEntry solta as referências e a alocação");
+    let unknown = guest::alloc_bytes(16);
+    guest::write16(unknown, 5);
+    assert(
+        call_export("IoAllocateErrorLogEntry", &[device, 0x2F]) == Some(0) && call_export("IoAllocateErrorLogEntry", &[device, 0xF1]) == Some(0) && call_export("IoAllocateErrorLogEntry", &[unknown, 0x40]) == Some(0),
+        "io-error-log-free: tamanho e tipo de objeto recusados",
+    );
+}
+
+fn mm_file_sections_exports(assert: Assert) {
+    let pointers = guest::alloc_bytes(nt::SectionObjectPointers::SIZE);
+    let sop = at::<nt::SectionObjectPointers>(pointers);
+    let size = guest::alloc_bytes(8);
+    let can = |new_size: Option<u64>| {
+        if let Some(value) = new_size {
+            guest::write64(size, value);
+        }
+        call_export("MmCanFileBeTruncated", &[pointers, if new_size.is_some() { size } else { 0 }]).map(|result| result as u8 != 0)
+    };
+    let writable = || call_export("MmDoesFileHaveUserWritableReferences", &[pointers]).map(|result| result as u32);
+    let flush = |kind: u64| call_export("MmFlushImageSection", &[pointers, kind]).map(|result| result as u8 != 0);
+    assert(can(None) == Some(true) && writable() == Some(0) && flush(0) == Some(true) && flush(1) == Some(true), "mm-file-sections: arquivo sem seção");
+    // CONTROL_AREA de dados com a primeira subseção logo depois (sem FilePointer).
+    let area = guest::alloc_bytes(0x200);
+    let control = at::<nt::ControlArea>(area);
+    sop.data_section_object.set(area);
+    let subsection = area + 0x80;
+    guest::write64(subsection, area);
+    guest::write32(subsection + 0x20, 0x123 << 20);
+    guest::write32(subsection + 0x28, 2);
+    control.number_of_user_references.set(1);
+    let busy = (flush(0), flush(1), can(None), can(Some(0x2123)), can(Some(0x2122)));
+    assert(busy == (Some(false), Some(true), Some(false), Some(true), Some(false)) && guest::read64(size) == 0x2122, "mm-file-sections: seção de dados em uso e o fim da última subseção");
+    // Pela árvore de subseções (FilePointer presente).
+    let tree = guest::alloc_bytes(0x80);
+    guest::write64(tree, area);
+    guest::write32(tree + 0x24, 1);
+    guest::write32(tree + 0x28, 1);
+    guest::write64(area + 0x110, tree + 0x38);
+    control.file_pointer.value.set(0x10);
+    let by_tree = (can(Some(0x2000)), can(Some(0x1FFF)));
+    control.file_pointer.value.set(0);
+    control.number_of_user_references.set(0);
+    control.u.long_flags.set(0x02);
+    let creating = can(Some(0));
+    control.u.long_flags.set(0);
+    control.locked_pages.set(2);
+    let locked = (can(Some(0)), writable(), flush(0));
+    control.locked_pages.set(0);
+    control.u2.e2.writable_user_references.set(1);
+    let user_writable = writable();
+    control.u2.e2.writable_user_references.set(0);
+    assert(
+        by_tree == (Some(true), Some(false)) && creating == Some(false) && locked == (Some(false), Some(1), Some(false)) && user_writable == Some(1) && writable() == Some(0) && can(Some(0)) == Some(true),
+        "mm-file-sections: árvore, BeingCreated, páginas travadas e WritableUserReferences",
+    );
+    // Seção de imagem publicada: o OpenNT não a apaga.
+    let image = guest::alloc_bytes(0x100);
+    sop.image_section_object.set(image);
+    assert(flush(1) == Some(false) && can(Some(0)) == Some(false), "mm-file-sections: seção de imagem não sai");
+    sop.image_section_object.set(0);
+    sop.data_section_object.set(0);
+
+    // MmPrefetchPages.
+    let file = guest::alloc_bytes(nt::FileObject::SIZE);
+    at::<nt::FileObject>(file).section_object_pointer.set(pointers);
+    let read_list = |first: u64, image: u32| {
+        let list = guest::alloc_bytes(0x20);
+        guest::write64(list, file);
+        guest::write32(list + 8, 1);
+        guest::write32(list + 0xC, image);
+        guest::write64(list + 0x10, first);
+        list
+    };
+    let lists = guest::alloc_bytes(16);
+    let prefetch = |count: u64| call_export("MmPrefetchPages", &[count, lists]).map(|status| status as u32);
+    let (plain, flagged) = (read_list(0x1000, 0), read_list(0x1180, 0));
+    guest::write64(lists, plain);
+    let without_section = prefetch(1);
+    guest::write64(lists, flagged);
+    guest::write64(lists + 8, plain);
+    let first_fails = prefetch(2);
+    sop.data_section_object.set(area);
+    guest::write64(lists, plain);
+    let no_file_pointer = prefetch(1);
+    control.file_pointer.value.set(0x10);
+    let resident = prefetch(1);
+    sop.data_section_object.set(0);
+    assert(
+        prefetch(0x2000_0000) == Some(0xC000_00EF) && without_section == Some(0) && first_fails == Some(0xC000_00EF) && no_file_pointer == Some(0xC000_00EF) && resident == Some(0),
+        "mm-prefetch: MmPrefetchPages valida as listas",
+    );
+}
+
+fn se_filter_token_exports(assert: Assert) {
+    use crate::ntos::se::model::{sid, Group, Privilege};
+    use crate::ntos::se::security_attributes::{self, AttributeValue, SecurityAttribute};
+    use crate::ntos::se::token::{handles as token_handles, tokens};
+    let everyone = sid(1, &[0]);
+    let administrators = sid(5, &[32, 544]);
+    let users = sid(5, &[32, 545]);
+    let source = tokens::create(None, Some(&|token: &mut tokens::Token| {
+        token.groups = alloc::vec![Group { sid: everyone.clone(), attributes: 7 }, Group { sid: administrators.clone(), attributes: 15 }, Group { sid: users.clone(), attributes: 7 }];
+        token.owner = administrators.clone();
+        token.privileges = [23u64, 20, 8, 3].iter().map(|&id| Privilege { id, attributes: 3 }).collect();
+        token.security_attributes = alloc::vec![SecurityAttribute { name: String::from("TESTE"), kind: 2, flags: 0, values: alloc::vec![AttributeValue::Integer(5)] }];
+    }))
+    .unwrap_or(0);
+    let put_sid = |identifier: &[u8]| {
+        let address = guest::alloc_bytes(identifier.len() as u64);
+        guest::write_bytes(address, identifier);
+        address
+    };
+    let token_groups = |entries: &[(&[u8], u32)]| {
+        let block = guest::alloc_bytes(8 + entries.len() as u64 * 16);
+        guest::write32(block, entries.len() as u32);
+        for (index, (identifier, attributes)) in entries.iter().enumerate() {
+            guest::write64(block + 8 + index as u64 * 16, put_sid(identifier));
+            guest::write32(block + 16 + index as u64 * 16, *attributes);
+        }
+        block
+    };
+    let delete = guest::alloc_bytes(16);
+    guest::write32(delete, 1);
+    guest::write32(delete + 4, 20);
+    let out = guest::alloc_bytes(8);
+    let filter = |token: u64, flags: u64, disable: u64, privileges: u64, restricted: u64| {
+        let status = call_export("SeFilterToken", &[token, flags, disable, privileges, restricted, out]).map(|status| status as u32);
+        (status, guest::read64(out))
+    };
+    let disable = token_groups(&[(&administrators, 0)]);
+    let restricted = token_groups(&[(&everyone, 0)]);
+    let (status, filtered) = filter(source, 0, disable, delete, restricted);
+    let record = tokens::get(filtered);
+    let source_record = tokens::get(source);
+    let shaped = record.as_ref().zip(source_record.as_ref()).is_some_and(|(record, origin)| {
+        record.groups.iter().map(|group| group.attributes).collect::<Vec<_>>() == [7, 0x10, 7]
+            && record.privileges.iter().map(|privilege| privilege.id).collect::<Vec<_>>() == [23, 8, 3]
+            && record.restricted_sids == [Group { sid: everyone.clone(), attributes: 7 }]
+            && record.owner == record.user
+            && record.modified_id < record.id
+            && record.id != origin.id
+            && record.kind == origin.kind
+            && record.security_attributes == origin.security_attributes
+    });
+    assert(status == Some(0) && filtered != 0 && shaped && tokens::body(filtered).token_flags.get() & 0x818 == 0x810, "se-filter-token: deny-only, privilégio removido e SIDs restritos");
+    // Filtrar o token restrito: precisa de SIDs restritos em comum.
+    let (again, _) = filter(filtered, 0, 0, 0, 0);
+    let (write_restricted, _) = filter(filtered, 8, 0, 0, 0);
+    let (intersection, narrowed) = filter(filtered, 0, 0, 0, token_groups(&[(&everyone, 0), (&users, 0)]));
+    let narrowed_ok = tokens::get(narrowed).is_some_and(|record| record.restricted_sids.len() == 1);
+    assert(again == Some(0xC000_000D) && write_restricted == Some(0xC000_000D) && intersection == Some(0) && narrowed_ok, "se-filter-token: origem restrita");
+    let (attributes_set, _) = filter(source, 0, 0, 0, token_groups(&[(&everyone, 4)]));
+    let (package, _) = filter(source, 0, 0, 0, token_groups(&[(&sid(15, &[2, 1]), 0)]));
+    assert(attributes_set == Some(0xC000_000D) && package == Some(0xC000_000D), "se-filter-token: SIDs restritos inválidos");
+    // DISABLE_MAX_PRIVILEGE e LUA_TOKEN.
+    let (maximum, minimal) = filter(source, 1, 0, 0, 0);
+    let (lua, limited) = filter(source, 4, 0, 0, 0);
+    let minimal_ok = tokens::get(minimal).is_some_and(|record| record.privileges.len() == 1 && record.privileges[0].id == 23) && tokens::body(minimal).token_flags.get() & 0x800 != 0;
+    let lua_ok = tokens::get(limited).is_some_and(|record| record.groups[1].attributes == 0x10 && record.privileges.iter().map(|privilege| privilege.id).collect::<Vec<_>>() == [23]);
+    let (write, write_token) = filter(source, 8, 0, 0, 0);
+    let write_ok = tokens::get(write_token).is_some_and(|record| record.write_restricted) && tokens::body(write_token).token_flags.get() & 0x18 == 0x18;
+    assert(maximum == Some(0) && minimal_ok && lua == Some(0) && lua_ok && write == Some(0) && write_ok, "se-filter-token: DISABLE_MAX_PRIVILEGE, LUA_TOKEN e WRITE_RESTRICTED");
+
+    // ZwQuerySecurityAttributesToken (modo kernel).
+    let handle = token_handles::create(source, 8, 0x200, false).unwrap_or(0);
+    let buffer = guest::alloc_bytes(0x200);
+    let returned = guest::alloc_bytes(8);
+    let query = |attributes: u64, count: u64, output: u64, length: u64| {
+        guest::write32(returned, 0xFFFF);
+        let status = call_export("ZwQuerySecurityAttributesToken", &[handle, attributes, count, output, length, returned]).map(|status| status as u32);
+        (status, guest::read32(returned))
+    };
+    let expected = source_record.as_ref().map(|record| security_attributes::encode(&record.security_attributes, buffer).unwrap_or_default()).unwrap_or_default();
+    let size_query = query(0, 0, 0, 0);
+    let short = query(0, 0, buffer, 4);
+    let full = query(0, 0, buffer, 0x200);
+    let copied = guest::read_bytes(buffer, expected.len()) == expected;
+    let names = guest::alloc_bytes(nt::UnicodeString::SIZE * 2);
+    guest::write_bytes(names, &guest::read_bytes(fsx_unicode("teste"), nt::UnicodeString::SIZE as usize));
+    guest::write_bytes(names + nt::UnicodeString::SIZE, &guest::read_bytes(fsx_unicode("OUTRO"), nt::UnicodeString::SIZE as usize));
+    let named = query(names, 1, buffer, 0x200);
+    let missing = query(names, 2, buffer, 0x200);
+    let length = expected.len() as u32;
+    assert(
+        !expected.is_empty() && size_query == (Some(0xC000_0023), length) && short == (Some(0xC000_0023), length) && full == (Some(0), length) && copied && named == (Some(0), length) && missing == (Some(0xC000_0225), 0),
+        "query-security-attributes: tamanho, buffer curto, cópia e nome ausente",
+    );
+    assert(
+        query(0, 0, buffer, 0).0 == Some(0xC000_000D) && query(0, 0, 0, 16).0 == Some(0xC000_000D) && query(0, 1, buffer, 0x200).0 == Some(0xC000_000D) && query(names, 0, buffer, 0x200).0 == Some(0xC000_000D),
+        "query-security-attributes: parâmetros inválidos",
+    );
+    let _ = call_export("ZwClose", &[handle]);
+    for token in [narrowed, minimal, limited, write_token, filtered, source] {
+        let _ = tokens::release(token);
+    }
+}
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -12493,6 +12924,14 @@ pub fn run(assert: Assert) {
     partition_services_exports(assert);
     virtual_memory_lock_exports(assert);
     super::fsrtl_fs_support::run(assert, call_export);
+    rtl_bitmap_runs_exports(assert);
+    rtl_8dot3_generate_exports(assert);
+    rtl_format_message_exports(assert);
+    rtl_crt_snwprintf_s_exports(assert);
+    fsrtl_dbcs_expression_exports(assert);
+    io_error_log_and_ecp_exports(assert);
+    mm_file_sections_exports(assert);
+    se_filter_token_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

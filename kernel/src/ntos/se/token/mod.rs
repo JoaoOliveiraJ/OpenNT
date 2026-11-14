@@ -17,3 +17,5 @@ pub mod information;
 pub mod open_process;
 pub mod impersonate_anonymous;
 pub mod impersonation;
+pub mod filter;
+pub mod attributes;

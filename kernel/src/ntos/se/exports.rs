@@ -890,3 +890,38 @@ pub mod se_srp_access_check {
 
     pub static GROUP: Group = Group { name: "se-srp-access-check", names: &["SeSrpAccessCheck"], handlers: &[srp_access_check], data_exports: &[] };
 }
+
+pub mod se_filter_token {
+    //! SeFilterToken; a lógica mora em `se/token/filter.rs`.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::token::filter;
+    use crate::rtl::KernelError;
+
+    /// SeFilterToken(ExistingToken, Flags, SidsToDisable, PrivilegesToDelete,
+    /// RestrictedSids, FilteredToken*) -> NTSTATUS.
+    fn filter_token(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PACCESS_TOKEN* de saída do chamador.
+        let filtered = unsafe { Field::<u64>::at(call.arg(6)) };
+        Ok(signed_status(filter::filter_token(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), filtered)?))
+    }
+
+    pub static GROUP: Group = Group { name: "se-filter-token", names: &["SeFilterToken"], handlers: &[filter_token], data_exports: &[] };
+}
+
+pub mod query_security_attributes {
+    //! ZwQuerySecurityAttributesToken; a lógica mora em `se/token/attributes.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::token::attributes;
+    use crate::rtl::KernelError;
+
+    /// ZwQuerySecurityAttributesToken(TokenHandle, Attributes,
+    /// NumberOfAttributes, Buffer, Length, ReturnLength) -> NTSTATUS.
+    fn query(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(attributes::query(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6))?))
+    }
+
+    pub static GROUP: Group = Group { name: "query-security-attributes", names: &["ZwQuerySecurityAttributesToken"], handlers: &[query], data_exports: &[] };
+}

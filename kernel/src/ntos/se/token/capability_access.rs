@@ -63,6 +63,12 @@ pub fn permits_membership(token: u64, identifier: Option<&[u8]>, flags: u32) -> 
     tokens::with(token, |record| permits_allowed_identifiers(record, &identifiers, false)).unwrap_or(false)
 }
 
+/// Um SeAccessCheck só de ACEs de permissão para `allowed`, sobre o token
+/// pelo ponteiro (o SeIsSystemContext pede o acesso 1, que não é escrita).
+pub fn permits_identifiers(token: u64, allowed: &[Sid], checks_write_access: bool) -> bool {
+    tokens::with(token, |record| permits_allowed_identifiers(record, allowed, checks_write_access)).unwrap_or(false)
+}
+
 /// Capability pede 0x10001 (inclui DELETE): WRITE_RESTRICTED também passa
 /// pelos SIDs restritos.
 pub fn permits_capability(token: u64, identifier: Option<&[u8]>) -> bool {

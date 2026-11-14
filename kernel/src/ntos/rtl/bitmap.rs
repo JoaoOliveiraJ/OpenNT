@@ -701,6 +701,19 @@ pub fn find_clear_runs(bitmap: &RtlBitmap, run_array: u64, capacity: u32, locate
     if capacity == 0 {
         return 0;
     }
+    let runs = clear_runs(bitmap, capacity, locate_longest);
+    // SAFETY: RTL_BITMAP_RUN RunArray[SizeOfRunArray] do chamador (não vazio).
+    let output = unsafe { RtlBitmapRun::array_at(run_array, capacity as usize) };
+    for (run, &(start, length)) in output.iter().zip(runs.iter()) {
+        run.starting_index.set(start);
+        run.number_of_bits.set(length);
+    }
+    runs.len() as u32
+}
+
+/// O laço do RtlFindClearRuns: até `capacity` (> 0) runs na ordem em que o
+/// original os grava no RunArray.
+fn clear_runs(bitmap: &RtlBitmap, capacity: u32, locate_longest: bool) -> alloc::vec::Vec<(u32, u32)> {
     let size = bitmap.size_of_bit_map.get();
     let byte_count = size.div_ceil(8) as usize;
     let bytes = if byte_count == 0 { alloc::vec::Vec::new() } else { storage_bytes(bitmap, 0, byte_count) };
@@ -748,11 +761,136 @@ pub fn find_clear_runs(bitmap: &RtlBitmap, run_array: u64, capacity: u32, locate
     if !state.stop() && run_length != 0 && !(state.full() && state.smallest() >= run_length) {
         state.insert(run_start, run_length);
     }
-    // SAFETY: RTL_BITMAP_RUN RunArray[SizeOfRunArray] do chamador (não vazio).
-    let output = unsafe { RtlBitmapRun::array_at(run_array, capacity as usize) };
-    for (run, &(start, length)) in output.iter().zip(state.runs.iter()) {
-        run.starting_index.set(start);
-        run.number_of_bits.set(length);
+    state.runs
+}
+
+// ---- RtlFindFirstRunClear, RtlFindLastBackwardRunClear,
+// ---- RtlFindLongestRunClear (rtl-bitmap-runs) --------------------------------
+//
+// ntoskrnl 10.0.19041: RtlFindFirstRunClear 0x3333b0, RtlFindLastBackward
+// RunClear 0x333650 e RtlFindLongestRunClear 0x587050 (RtlFindClearRuns com
+// um run, LocateLongestRuns). Os dois primeiros saltam palavras ULONG
+// inteiras (cheias, ou vazias depois do início do run) e terminam bit a bit;
+// a palavra final nunca é saltada inteira, então nada além de SizeOfBitMap
+// entra na conta.
+
+/// Bit `index` do armazenamento (o `bt` sobre o buffer).
+fn bit(words: u64, index: u32) -> bool {
+    (word(words, (index / 32) as u64).get() >> (index & 31)) & 1 != 0
+}
+
+/// RtlFindFirstRunClear(BitMap, StartingIndex*): o primeiro bit livre vai
+/// para *StartingIndex e o retorno é o comprimento do run livre que começa
+/// nele. Mapa vazio: *StartingIndex = 0, retorno 0; sem bit livre:
+/// *StartingIndex = SizeOfBitMap, retorno 0.
+pub fn find_first_run_clear(header: u64, start_out: u64) -> u32 {
+    let size = size(header);
+    // SAFETY: PULONG StartingIndex do chamador.
+    let start_out = unsafe { Field::<u32>::at(start_out) };
+    if size == 0 {
+        start_out.set(0);
+        return 0;
     }
-    state.runs.len() as u32
+    let words = buffer(header);
+    let last = ((size - 1) >> 5) as u64;
+    // Palavras inteiramente ocupadas antes da última.
+    let mut index = 0u64;
+    let mut start = 0u32;
+    while index < last && word(words, index).get() == u32::MAX {
+        index += 1;
+        start += 32;
+    }
+    while start < size && bit(words, start) {
+        start += 1;
+    }
+    // Resto livre da palavra do início e palavras vazias seguintes.
+    let mut length = 0u32;
+    if index < last && word(words, index).get() & !FILL_MASK[(start & 31) as usize] == 0 {
+        length = 32 - (start & 31);
+        index += 1;
+        while index < last && word(words, index).get() == 0 {
+            index += 1;
+            length += 32;
+        }
+    }
+    let mut end = start + length;
+    while end < size && !bit(words, end) && length < u32::MAX {
+        end += 1;
+        length += 1;
+    }
+    start_out.set(start);
+    length
+}
+
+/// FillMask do original (tabela 0x127b0): os `n` bits baixos ligados.
+const FILL_MASK: [u32; 33] = {
+    let mut table = [0u32; 33];
+    let mut index = 1;
+    while index < 33 {
+        table[index] = if index == 32 { u32::MAX } else { (1u32 << index) - 1 };
+        index += 1;
+    }
+    table
+};
+
+/// RtlFindLastBackwardRunClear(BitMap, FromIndex, StartingRunIndex*): desce
+/// de FromIndex pelos bits ocupados até o primeiro livre e devolve o run
+/// livre que termina nele (o início vai para *StartingRunIndex). FromIndex
+/// fora do mapa: *StartingRunIndex = FromIndex, retorno 0; nenhum livre até o
+/// bit 0: *StartingRunIndex = 0, retorno 0.
+pub fn find_last_backward_run_clear(header: u64, from: u32, start_out: u64) -> u32 {
+    let size = size(header);
+    // SAFETY: PULONG StartingRunIndex do chamador.
+    let start_out = unsafe { Field::<u32>::at(start_out) };
+    if size <= from {
+        start_out.set(from);
+        return 0;
+    }
+    let words = buffer(header);
+    let mut index = (from >> 5) as u64;
+    let mut end = from;
+    // Bits 0..=from da palavra todos ocupados: salta palavras cheias.
+    if index != 0 && (!FILL_MASK[((from & 31) + 1) as usize] | word(words, index).get()) == u32::MAX {
+        end = from - (from & 31) - 1;
+        index -= 1;
+        while index > 0 && word(words, index).get() == u32::MAX {
+            index -= 1;
+            end = end.wrapping_sub(32);
+        }
+    }
+    while end != u32::MAX && bit(words, end) {
+        end = end.wrapping_sub(1);
+    }
+    let mut cursor = end;
+    // Bits abaixo de `end` livres na palavra: salta palavras vazias.
+    if word(words, index).get() & FILL_MASK[(end & 31) as usize] == 0 {
+        cursor = (end & !31).wrapping_sub(1);
+        while index > 0 {
+            index -= 1;
+            if index == 0 || word(words, index).get() != 0 {
+                break;
+            }
+            cursor = cursor.wrapping_sub(32);
+        }
+    }
+    while cursor != u32::MAX && !bit(words, cursor) {
+        cursor = cursor.wrapping_sub(1);
+    }
+    start_out.set(cursor.wrapping_add(1));
+    end.wrapping_sub(cursor)
+}
+
+/// RtlFindLongestRunClear(BitMap, StartingIndex*): o run do RtlFindClearRuns
+/// com um elemento e LocateLongestRuns; sem run, *StartingIndex = 0 e 0.
+pub fn find_longest_run_clear(bitmap: &RtlBitmap, start_out: &Field<u32>) -> u32 {
+    match clear_runs(bitmap, 1, true).first() {
+        Some(&(start, length)) => {
+            start_out.set(start);
+            length
+        }
+        None => {
+            start_out.set(0);
+            0
+        }
+    }
 }

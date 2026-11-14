@@ -60,3 +60,4 @@ pub mod oem_code_page;
 pub mod gen8dot3;
 pub mod altitude;
 pub mod compression;
+pub mod format_message;

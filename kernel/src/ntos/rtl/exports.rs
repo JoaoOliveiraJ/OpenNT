@@ -2457,3 +2457,98 @@ pub mod crt_string_conversion {
 
     pub static GROUP: Group = Group { name: "crt-string-conversion", names: &["_strtoui64", "strtok_s"], handlers: &[strtoui64, strtok_s], data_exports: &[] };
 }
+
+pub mod rtl_bitmap_runs {
+    //! RtlFindFirstRunClear, RtlFindLastBackwardRunClear e
+    //! RtlFindLongestRunClear; a lógica mora em `rtl/bitmap`.
+
+    use crate::ntos::inc::types::{Field, NtStruct, RtlBitmap};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    /// RtlFindFirstRunClear(BitMap, StartingIndex*) -> ULONG.
+    fn find_first_run_clear(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_first_run_clear(call.arg(1), call.arg(2)) as u64)
+    }
+
+    /// RtlFindLastBackwardRunClear(BitMap, FromIndex, StartingRunIndex*) -> ULONG.
+    fn find_last_backward_run_clear(call: &Call) -> Result<u64, KernelError> {
+        Ok(bitmap::find_last_backward_run_clear(call.arg(1), call.arg(2) as u32, call.arg(3)) as u64)
+    }
+
+    /// RtlFindLongestRunClear(BitMap, StartingIndex*) -> ULONG.
+    fn find_longest_run_clear(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: RTL_BITMAP e PULONG do chamador.
+        let (header, start) = unsafe { (RtlBitmap::at(call.arg(1)), Field::<u32>::at(call.arg(2))) };
+        Ok(bitmap::find_longest_run_clear(header, start) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-bitmap-runs",
+        names: &["RtlFindFirstRunClear", "RtlFindLastBackwardRunClear", "RtlFindLongestRunClear"],
+        handlers: &[find_first_run_clear, find_last_backward_run_clear, find_longest_run_clear],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_8dot3_generate {
+    //! RtlGenerate8dot3Name; a lógica mora em `rtl/gen8dot3`.
+
+    use crate::ntos::inc::types::{NtStruct, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::gen8dot3::{self, GenerateNameContext};
+    use crate::rtl::KernelError;
+
+    /// RtlGenerate8dot3Name(Name, AllowExtendedCharacters, Context, Name8dot3) -> NTSTATUS.
+    fn generate_8dot3_name(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: as estruturas do chamador.
+        let (name, context, short_name) = unsafe { (UnicodeString::at(call.arg(1)), GenerateNameContext::at(call.arg(3)), UnicodeString::at(call.arg(4))) };
+        Ok(signed_status(gen8dot3::generate_8dot3_name(name, call.arg(2) as u8 != 0, context, short_name)?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-8dot3-generate", names: &["RtlGenerate8dot3Name"], handlers: &[generate_8dot3_name], data_exports: &[] };
+}
+
+pub mod rtl_format_message {
+    //! RtlFormatMessage; a lógica mora em `rtl/format_message`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::format_message::{self, Request};
+    use crate::rtl::KernelError;
+
+    /// RtlFormatMessage(MessageFormat, MaximumWidth, IgnoreInserts,
+    /// ArgumentsAreAnsi, ArgumentsAreAnArray, Arguments, Buffer, Length,
+    /// ReturnLength) -> NTSTATUS.
+    fn format(call: &Call) -> Result<u64, KernelError> {
+        let request = Request {
+            format: call.arg(1),
+            maximum_width: call.arg(2) as u32,
+            ignore_inserts: call.arg(3) as u8 != 0,
+            arguments_are_ansi: call.arg(4) as u8 != 0,
+            arguments_are_an_array: call.arg(5) as u8 != 0,
+            arguments: call.arg(6),
+            buffer: call.arg(7),
+            length: call.arg(8) as u32,
+            return_length: call.arg(9),
+        };
+        Ok(signed_status(format_message::format_message(&request)?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-format-message", names: &["RtlFormatMessage"], handlers: &[format], data_exports: &[] };
+}
+
+pub mod rtl_crt_snwprintf_s {
+    //! _snwprintf_s; a lógica mora em `rtl/printf`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::printf;
+    use crate::rtl::KernelError;
+
+    /// _snwprintf_s(buffer, sizeOfBuffer, count, format, ...) -> int.
+    fn snwprintf_s(call: &Call) -> Result<u64, KernelError> {
+        printf::snwprintf_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4), &[call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9), call.arg(10)])
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-crt-snwprintf-s", names: &["_snwprintf_s"], handlers: &[snwprintf_s], data_exports: &[] };
+}

@@ -551,3 +551,172 @@ pub fn is_fat_dbcs_legal(name: &[u8], wild_cards: bool, path: bool, leading_back
     }
     !matches!(last, b' ' | b'"' | b'.')
 }
+
+// ---- FsRtlIsDbcsInExpression (fsrtl-dbcs-expression) ----------------------------
+//
+// ntoskrnl 10.0.19041, RVA 0x88c580: o mesmo autômato do
+// RtlpIsNameInExpressionPrivate sobre ANSI_STRINGs OEM, sensível a caixa.
+// Cada caractere é um byte (com sinal estendido a 16 bits, como o `movsx`
+// do original) ou, numa página OEM multibyte, um par inicial+segundo byte
+// (segundo * 0x100 + inicial); um inicial isolado no fim da expressão vale
+// um byte. O estado é `offset_em_bytes * 2` (+1 depois de `*`/DOS_STAR).
+// Atalhos: vazios (TRUE só se ambos), `*` e `*literal` sem curingas (sufixo
+// por memcmp, começando numa fronteira de caractere).
+
+/// Um caractere da string OEM em `offset`: (valor, bytes). O segundo byte de
+/// um inicial no fim do nome é lido do buffer, como o original.
+fn dbcs_char(bytes: &[u8], buffer: u64, offset: usize, lone_lead_is_single: bool) -> (u16, usize) {
+    let lead = bytes[offset];
+    let widen = |byte: u8| byte as i8 as i16 as u16;
+    if lead >= 0x80 && is_lead_dbcs(lead) && !(lone_lead_is_single && offset + 1 == bytes.len()) {
+        let trail = bytes.get(offset + 1).copied().unwrap_or_else(|| guest::read8(buffer + offset as u64 + 1));
+        return (((widen(trail) as u32 * 0x100) as u16).wrapping_add(widen(lead)), 2);
+    }
+    (widen(lead), 1)
+}
+
+/// FsRtlIsDbcsInExpression(Expression, Name) -> BOOLEAN. `name_buffer` é o
+/// Buffer do nome (para o segundo byte além do Length).
+pub fn is_dbcs_in_expression(expression: &[u8], name: &[u8], name_buffer: u64) -> bool {
+    if name.is_empty() || expression.is_empty() {
+        return name.is_empty() && expression.is_empty();
+    }
+    if expression == b"*" {
+        return true;
+    }
+    if expression[0] == b'*' && !dbcs_contains_wild_cards(&expression[1..]) {
+        let tail = &expression[1..];
+        if name.len() < tail.len() {
+            return false;
+        }
+        let start = name.len() - tail.len();
+        let mut offset = 0;
+        while offset < start {
+            offset += if name[offset] >= 0x80 && is_lead_dbcs(name[offset]) { 2 } else { 1 };
+        }
+        return offset == start && &name[start..] == tail;
+    }
+    let expression_buffer = 0;
+    let length = expression.len() as u32;
+    let max_state = length * 2;
+    let mut previous: Vec<u32> = alloc::vec![0];
+    let mut current: Vec<u32> = Vec::new();
+    let mut name_offset = 0usize;
+    let mut name_finished = false;
+    let mut name_char = 0u16;
+    loop {
+        if name_offset < name.len() {
+            let (unit, width) = dbcs_char(name, name_buffer, name_offset, false);
+            name_char = unit;
+            name_offset += width;
+        } else {
+            name_finished = true;
+            if previous[previous.len() - 1] == max_state {
+                return true;
+            }
+        }
+        current.clear();
+        let mut source = 0usize;
+        let mut previous_dest = 0usize;
+        while source < previous.len() {
+            let mut offset = (previous[source] + 1) >> 1;
+            source += 1;
+            let mut width = 0u32;
+            loop {
+                if offset == length {
+                    break;
+                }
+                offset += width;
+                let mut state = offset * 2;
+                if offset == length {
+                    current.push(max_state);
+                    break;
+                }
+                let (unit, size) = dbcs_char(expression, expression_buffer, offset as usize, true);
+                width = size as u32;
+                if unit == WC_STAR {
+                    current.push(state);
+                    current.push(state + 1);
+                    continue;
+                }
+                if unit == WC_DOS_STAR {
+                    // Sobre um `.` sem outro ponto adiante, só o salto.
+                    let mut can_eat_dot = false;
+                    if !name_finished && name_char == WC_DOT {
+                        let mut scan = name_offset;
+                        while scan < name.len() {
+                            let (next, step) = dbcs_char(name, name_buffer, scan, false);
+                            if next == WC_DOT {
+                                can_eat_dot = true;
+                                break;
+                            }
+                            scan += step;
+                        }
+                    }
+                    if name_finished || name_char != WC_DOT || can_eat_dot {
+                        current.push(state);
+                    }
+                    current.push(state + 1);
+                    continue;
+                }
+                state += width * 2;
+                if unit == WC_DOS_QM {
+                    if name_finished || name_char == WC_DOT {
+                        continue;
+                    }
+                    current.push(state);
+                    break;
+                }
+                if unit == WC_DOS_DOT {
+                    if name_finished {
+                        continue;
+                    }
+                    if name_char == WC_DOT {
+                        current.push(state);
+                        break;
+                    }
+                } else {
+                    if name_finished {
+                        break;
+                    }
+                    if unit == WC_QM {
+                        current.push(state);
+                        break;
+                    }
+                }
+                if unit == name_char {
+                    current.push(state);
+                }
+                break;
+            }
+            // Poda: avança as origens já cobertas pelos destinos novos.
+            if source < previous.len() {
+                while previous_dest < current.len() {
+                    while source < previous.len() && previous[source] < current[previous_dest] {
+                        source += 1;
+                    }
+                    previous_dest += 1;
+                    if source >= previous.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        if current.is_empty() {
+            return false;
+        }
+        core::mem::swap(&mut previous, &mut current);
+        if name_finished {
+            return previous[previous.len() - 1] == max_state;
+        }
+    }
+}
+
+/// FsRtlIsDbcsInExpression sobre os dois ANSI_STRING do chamador.
+pub fn is_dbcs_in_expression_strings(expression: &crate::ntos::inc::types::String, name: &crate::ntos::inc::types::String) -> bool {
+    let read = |string: &crate::ntos::inc::types::String| {
+        let length = string.length.get() as usize;
+        if length == 0 { Vec::new() } else { guest::read_bytes(string.buffer.get(), length) }
+    };
+    is_dbcs_in_expression(&read(expression), &read(name), name.buffer.get())
+}

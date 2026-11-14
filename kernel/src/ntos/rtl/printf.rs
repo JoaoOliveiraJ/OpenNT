@@ -1,6 +1,6 @@
 //! Formatação estilo printf da CRT do kernel e da saída de depuração —
 //! sprintf, _snprintf, _snprintf_s, _vsnprintf, _vsnprintf_s, _snwprintf,
-//! _vsnwprintf, swprintf_s, vswprintf_s e vDbgPrintExWithPrefix.
+//! _vsnwprintf, _snwprintf_s, swprintf_s, vswprintf_s e vDbgPrintExWithPrefix.
 //!
 //! O texto sai do formatador comum (`guest_strings::format_guest_text`); as
 //! variantes variádicas recebem os argumentos já lidos, as `v*` leem a
@@ -67,6 +67,39 @@ pub fn vsnwprintf(buffer: u64, count: u64, format: u64, va_list: u64) -> Result<
 pub fn snwprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
     let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
     Ok(guest_strings::write_formatted_text(buffer, count, &text, true, true) as u64)
+}
+
+/// _snwprintf_s(buffer, sizeOfBuffer, count, format, ...) = _vsnwprintf_s
+/// (0x3d6b30): Format nulo, ou Buffer nulo/SizeOfBuffer zero fora do caso
+/// (NULL, 0, 0), devolvem -1. Com SizeOfBuffer > count, grava até `count`
+/// WCHARs e o NUL; mais texto que isso devolve -1 com o texto truncado. Senão
+/// grava até SizeOfBuffer - 1 e o NUL; truncar devolve -1, mantendo o texto
+/// só com count = _TRUNCATE (senão Buffer[0] = 0).
+pub fn snwprintf_s(buffer: u64, size: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
+    const FAILED: u64 = -1i64 as u64;
+    if format == 0 {
+        return Ok(FAILED);
+    }
+    if count == 0 && buffer == 0 && size == 0 {
+        return Ok(0);
+    }
+    if buffer == 0 || size == 0 {
+        return Ok(FAILED);
+    }
+    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
+    let units: Vec<u16> = text.encode_utf16().collect();
+    // O auxiliar da CRT grava até capacity - 1 WCHARs e o NUL.
+    let capacity = if size > count { count + 1 } else { size };
+    let written = (units.len() as u64).min(capacity - 1) as usize;
+    let output: Vec<u8> = units[..written].iter().copied().chain(core::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(buffer, &output);
+    if written == units.len() {
+        return Ok(written as u64);
+    }
+    if size <= count && count != u64::MAX {
+        guest::write16(buffer, 0);
+    }
+    Ok(FAILED)
 }
 
 /// Grava até `capacity - 1` WCHARs e o terminador; -1 quando truncou.
