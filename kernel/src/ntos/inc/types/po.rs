@@ -982,3 +982,146 @@ const _: () = {
     assert!(core::mem::offset_of!(PopFxDeviceDirectedTransitionState, completion_status) == 0x8);
     assert!(core::mem::offset_of!(PopFxDeviceDirectedTransitionState, bitfield_c) == 0xc);
 };
+
+/// `_POP_IRP_DATA` (0x100 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `PopIrpDataView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct PopIrpData {
+    pub link: ListEntry,
+    /// -> `_IRP`
+    pub irp: Field<u64>,
+    /// -> `_DEVICE_OBJECT`
+    pub pdo: Field<u64>,
+    /// -> `_DEVICE_OBJECT`
+    pub target_device: Field<u64>,
+    /// -> `_DEVICE_OBJECT`
+    pub current_device: Field<u64>,
+    pub watchdog_start: Field<u64>,
+    pub watchdog_timer: Ktimer,
+    pub watchdog_dpc: Kdpc,
+    pub minor_function: Field<u8>,
+    _pad_b9: Reserved<0x3>,
+    pub power_state_type: Field<PowerStateType>,
+    pub power_state: PowerState,
+    pub watchdog_enabled: Field<u8>,
+    _pad_c5: Reserved<0x3>,
+    /// -> `_POP_FX_DEVICE`
+    pub fx_device: Field<u64>,
+    pub system_transition: Field<u8>,
+    pub notify_pep: Field<u8>,
+    _pad_d2: Reserved<0x2>,
+    pub irp_sequence_id: Field<i32>,
+    pub device: PopIrpDataDevice,
+    pub d_state_reason: Field<PopPepNotifyDeviceDstateReason>,
+    _pad_fc: Reserved<0x4>,
+}
+
+/// Vista 1 de `_POP_IRP_DATA` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct PopIrpDataView1 {
+    _pad_0: Reserved<0xd8>,
+    pub system: PopIrpDataSystem,
+    _pad_e8: Reserved<0x18>,
+}
+
+impl core::ops::Deref for PopIrpData {
+    type Target = PopIrpDataView1;
+    #[inline(always)]
+    fn deref(&self) -> &PopIrpDataView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PopIrpDataView1>() }
+    }
+}
+
+unsafe impl NtStruct for PopIrpData {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PopIrpData>() == 0x100);
+    assert!(core::mem::offset_of!(PopIrpData, link) == 0x0);
+    assert!(core::mem::offset_of!(PopIrpData, irp) == 0x10);
+    assert!(core::mem::offset_of!(PopIrpData, pdo) == 0x18);
+    assert!(core::mem::offset_of!(PopIrpData, target_device) == 0x20);
+    assert!(core::mem::offset_of!(PopIrpData, current_device) == 0x28);
+    assert!(core::mem::offset_of!(PopIrpData, watchdog_start) == 0x30);
+    assert!(core::mem::offset_of!(PopIrpData, watchdog_timer) == 0x38);
+    assert!(core::mem::offset_of!(PopIrpData, watchdog_dpc) == 0x78);
+    assert!(core::mem::offset_of!(PopIrpData, minor_function) == 0xb8);
+    assert!(core::mem::offset_of!(PopIrpData, power_state_type) == 0xbc);
+    assert!(core::mem::offset_of!(PopIrpData, power_state) == 0xc0);
+    assert!(core::mem::offset_of!(PopIrpData, watchdog_enabled) == 0xc4);
+    assert!(core::mem::offset_of!(PopIrpData, fx_device) == 0xc8);
+    assert!(core::mem::offset_of!(PopIrpData, system_transition) == 0xd0);
+    assert!(core::mem::offset_of!(PopIrpData, notify_pep) == 0xd1);
+    assert!(core::mem::offset_of!(PopIrpData, irp_sequence_id) == 0xd4);
+    assert!(core::mem::offset_of!(PopIrpData, device) == 0xd8);
+    assert!(core::mem::offset_of!(PopIrpData, d_state_reason) == 0xf8);
+    assert!(core::mem::size_of::<PopIrpDataView1>() == 0x100);
+    assert!(core::mem::align_of::<PopIrpDataView1>() == core::mem::align_of::<PopIrpData>());
+    assert!(core::mem::offset_of!(PopIrpDataView1, system) == 0xd8);
+};
+
+/// `_POP_IRP_DATA::Device` (0x20 bytes).
+#[repr(C)]
+pub struct PopIrpDataDevice {
+    /// -> `fn`
+    pub caller_completion: Field<u64>,
+    /// -> `void`
+    pub caller_context: Field<u64>,
+    /// -> `_DEVICE_OBJECT`
+    pub caller_device: Field<u64>,
+    pub system_wake: Field<u8>,
+    _pad_19: Reserved<0x7>,
+}
+
+unsafe impl NtStruct for PopIrpDataDevice {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PopIrpDataDevice>() == 0x20);
+    assert!(core::mem::offset_of!(PopIrpDataDevice, caller_completion) == 0x0);
+    assert!(core::mem::offset_of!(PopIrpDataDevice, caller_context) == 0x8);
+    assert!(core::mem::offset_of!(PopIrpDataDevice, caller_device) == 0x10);
+    assert!(core::mem::offset_of!(PopIrpDataDevice, system_wake) == 0x18);
+};
+
+/// `_POP_IRP_DATA::System` (0x10 bytes).
+#[repr(C)]
+pub struct PopIrpDataSystem {
+    /// -> `_PO_DEVICE_NOTIFY`
+    pub notify_device: Field<u64>,
+    pub fx_device_activated: Field<u8>,
+    _pad_9: Reserved<0x7>,
+}
+
+unsafe impl NtStruct for PopIrpDataSystem {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PopIrpDataSystem>() == 0x10);
+    assert!(core::mem::offset_of!(PopIrpDataSystem, notify_device) == 0x0);
+    assert!(core::mem::offset_of!(PopIrpDataSystem, fx_device_activated) == 0x8);
+};
+
+/// `_POP_PEP_NOTIFY_DEVICE_DSTATE_REASON`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct PopPepNotifyDeviceDstateReason(pub i32);
+
+impl PopPepNotifyDeviceDstateReason {
+    pub const PEP_NOTIFY_DEVICE_D_STATE_REASON_NONE: Self = Self(0);
+    pub const PEP_NOTIFY_DEVICE_D_STATE_REASON_SYSTEM_TRANSITION: Self = Self(1);
+    pub const PEP_NOTIFY_DEVICE_D_STATE_REASON_DFX: Self = Self(2);
+    pub const PEP_NOTIFY_DEVICE_D_STATE_REASON_MAX: Self = Self(3);
+}
+
+impl GuestScalar for PopPepNotifyDeviceDstateReason {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}

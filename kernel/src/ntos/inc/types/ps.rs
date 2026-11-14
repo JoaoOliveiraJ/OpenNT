@@ -5450,3 +5450,524 @@ const _: () = {
     assert!(core::mem::offset_of!(SiloUserSharedData, time_zone_bias_effective_start) == 0x260);
     assert!(core::mem::offset_of!(SiloUserSharedData, time_zone_bias_effective_end) == 0x268);
 };
+
+/// `_TEB32` (0x1000 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `Teb32View1`..`Teb32View2`, alcançadas por `Deref`.
+#[repr(C)]
+pub struct Teb32 {
+    pub nt_tib: NtTib32,
+    pub environment_pointer: Field<u32>,
+    pub client_id: ClientId32,
+    pub active_rpc_handle: Field<u32>,
+    pub thread_local_storage_pointer: Field<u32>,
+    pub process_environment_block: Field<u32>,
+    pub last_error_value: Field<u32>,
+    pub count_of_owned_critical_sections: Field<u32>,
+    pub csr_client_thread: Field<u32>,
+    pub win32_thread_info: Field<u32>,
+    pub user32_reserved: [Field<u32>; 26],
+    pub user_reserved: [Field<u32>; 5],
+    pub wow32_reserved: Field<u32>,
+    pub current_locale: Field<u32>,
+    pub fp_software_status_register: Field<u32>,
+    pub reserved_for_debugger_instrumentation: [Field<u32>; 16],
+    pub system_reserved1: [Field<u32>; 26],
+    pub placeholder_compatibility_mode: Field<i8>,
+    pub placeholder_hydration_always_explicit: Field<u8>,
+    pub placeholder_reserved: [Field<i8>; 10],
+    pub proxied_process_id: Field<u32>,
+    pub activation_stack: ActivationContextStack32,
+    pub working_on_behalf_ticket: [Field<u8>; 8],
+    pub exception_code: Field<i32>,
+    pub activation_context_stack_pointer: Field<u32>,
+    pub instrumentation_callback_sp: Field<u32>,
+    pub instrumentation_callback_previous_pc: Field<u32>,
+    pub instrumentation_callback_previous_sp: Field<u32>,
+    pub instrumentation_callback_disabled: Field<u8>,
+    pub spare_bytes: [Field<u8>; 23],
+    pub tx_fs_context: Field<u32>,
+    pub gdi_teb_batch: GdiTebBatch32,
+    pub real_client_id: ClientId32,
+    pub gdi_cached_process_handle: Field<u32>,
+    pub gdi_client_pid: Field<u32>,
+    pub gdi_client_tid: Field<u32>,
+    pub gdi_thread_local_info: Field<u32>,
+    pub win32_client_info: [Field<u32>; 62],
+    pub gl_dispatch_table: [Field<u32>; 233],
+    pub gl_reserved1: [Field<u32>; 29],
+    pub gl_reserved2: Field<u32>,
+    pub gl_section_info: Field<u32>,
+    pub gl_section: Field<u32>,
+    pub gl_table: Field<u32>,
+    pub gl_current_rc: Field<u32>,
+    pub gl_context: Field<u32>,
+    pub last_status_value: Field<u32>,
+    pub static_unicode_string: String32,
+    pub static_unicode_buffer: [Field<u16>; 261],
+    _pad_e0a: Reserved<0x2>,
+    pub deallocation_stack: Field<u32>,
+    pub tls_slots: [Field<u32>; 64],
+    pub tls_links: ListEntry32,
+    pub vdm: Field<u32>,
+    pub reserved_for_nt_rpc: Field<u32>,
+    pub dbg_ss_reserved: [Field<u32>; 2],
+    pub hard_error_mode: Field<u32>,
+    pub instrumentation: [Field<u32>; 9],
+    pub activity_id: Guid,
+    pub sub_process_tag: Field<u32>,
+    pub perflib_data: Field<u32>,
+    pub etw_trace_data: Field<u32>,
+    pub win_sock_data: Field<u32>,
+    pub gdi_batch_count: Field<u32>,
+    pub current_ideal_processor: ProcessorNumber,
+    pub guaranteed_stack_bytes: Field<u32>,
+    pub reserved_for_perf: Field<u32>,
+    pub reserved_for_ole: Field<u32>,
+    pub waiting_on_loader_lock: Field<u32>,
+    pub saved_priority_state: Field<u32>,
+    pub reserved_for_code_coverage: Field<u32>,
+    pub thread_pool_data: Field<u32>,
+    pub tls_expansion_slots: Field<u32>,
+    pub mui_generation: Field<u32>,
+    pub is_impersonating: Field<u32>,
+    pub nls_cache: Field<u32>,
+    pub p_shim_data: Field<u32>,
+    pub heap_data: Field<u32>,
+    pub current_transaction_handle: Field<u32>,
+    pub active_frame: Field<u32>,
+    pub fls_data: Field<u32>,
+    pub preferred_languages: Field<u32>,
+    pub user_pref_languages: Field<u32>,
+    pub merged_pref_languages: Field<u32>,
+    pub mui_impersonation: Field<u32>,
+    pub cross_teb_flags: Field<u16>,
+    pub same_teb_flags: Field<u16>,
+    pub txn_scope_enter_callback: Field<u32>,
+    pub txn_scope_exit_callback: Field<u32>,
+    pub txn_scope_context: Field<u32>,
+    pub lock_count: Field<u32>,
+    pub wow_teb_offset: Field<i32>,
+    pub resource_ret_value: Field<u32>,
+    pub reserved_for_wdf: Field<u32>,
+    pub reserved_for_crt: Field<u64>,
+    pub effective_container_id: Guid,
+}
+
+/// Vista 1 de `_TEB32` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct Teb32View1 {
+    _align: [u64; 0],
+    _pad_0: Reserved<0xf74>,
+    pub ideal_processor_value: Field<u32>,
+    _pad_f78: Reserved<0x88>,
+}
+
+/// Vista 2 de `_TEB32` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct Teb32View2 {
+    _align: [u64; 0],
+    _pad_0: Reserved<0xf74>,
+    pub reserved_pad0: Field<u8>,
+    pub reserved_pad1: Field<u8>,
+    pub reserved_pad2: Field<u8>,
+    pub ideal_processor: Field<u8>,
+    _pad_f78: Reserved<0x88>,
+}
+
+impl core::ops::Deref for Teb32 {
+    type Target = Teb32View1;
+    #[inline(always)]
+    fn deref(&self) -> &Teb32View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<Teb32View1>() }
+    }
+}
+
+impl core::ops::Deref for Teb32View1 {
+    type Target = Teb32View2;
+    #[inline(always)]
+    fn deref(&self) -> &Teb32View2 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<Teb32View2>() }
+    }
+}
+
+unsafe impl NtStruct for Teb32 {}
+
+impl Teb32 {
+    /// `SpareCrossTebBits`: bits 0..=15 de `cross_teb_flags`.
+    pub const SPARE_CROSS_TEB_BITS_SHIFT: u32 = 0;
+    pub const SPARE_CROSS_TEB_BITS_MASK: u16 = 0xffff;
+    #[inline(always)]
+    pub fn spare_cross_teb_bits(&self) -> u16 {
+        self.cross_teb_flags.bits(0, 16) as u16
+    }
+    #[inline(always)]
+    pub fn set_spare_cross_teb_bits(&self, value: u16) {
+        self.cross_teb_flags.set_bits(0, 16, value as u64)
+    }
+    /// `SafeThunkCall`: bits 0..=0 de `same_teb_flags`.
+    pub const SAFE_THUNK_CALL_SHIFT: u32 = 0;
+    pub const SAFE_THUNK_CALL_MASK: u16 = 0x1;
+    #[inline(always)]
+    pub fn safe_thunk_call(&self) -> u16 {
+        self.same_teb_flags.bits(0, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_safe_thunk_call(&self, value: u16) {
+        self.same_teb_flags.set_bits(0, 1, value as u64)
+    }
+    /// `InDebugPrint`: bits 1..=1 de `same_teb_flags`.
+    pub const IN_DEBUG_PRINT_SHIFT: u32 = 1;
+    pub const IN_DEBUG_PRINT_MASK: u16 = 0x2;
+    #[inline(always)]
+    pub fn in_debug_print(&self) -> u16 {
+        self.same_teb_flags.bits(1, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_in_debug_print(&self, value: u16) {
+        self.same_teb_flags.set_bits(1, 1, value as u64)
+    }
+    /// `HasFiberData`: bits 2..=2 de `same_teb_flags`.
+    pub const HAS_FIBER_DATA_SHIFT: u32 = 2;
+    pub const HAS_FIBER_DATA_MASK: u16 = 0x4;
+    #[inline(always)]
+    pub fn has_fiber_data(&self) -> u16 {
+        self.same_teb_flags.bits(2, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_has_fiber_data(&self, value: u16) {
+        self.same_teb_flags.set_bits(2, 1, value as u64)
+    }
+    /// `SkipThreadAttach`: bits 3..=3 de `same_teb_flags`.
+    pub const SKIP_THREAD_ATTACH_SHIFT: u32 = 3;
+    pub const SKIP_THREAD_ATTACH_MASK: u16 = 0x8;
+    #[inline(always)]
+    pub fn skip_thread_attach(&self) -> u16 {
+        self.same_teb_flags.bits(3, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_skip_thread_attach(&self, value: u16) {
+        self.same_teb_flags.set_bits(3, 1, value as u64)
+    }
+    /// `WerInShipAssertCode`: bits 4..=4 de `same_teb_flags`.
+    pub const WER_IN_SHIP_ASSERT_CODE_SHIFT: u32 = 4;
+    pub const WER_IN_SHIP_ASSERT_CODE_MASK: u16 = 0x10;
+    #[inline(always)]
+    pub fn wer_in_ship_assert_code(&self) -> u16 {
+        self.same_teb_flags.bits(4, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_wer_in_ship_assert_code(&self, value: u16) {
+        self.same_teb_flags.set_bits(4, 1, value as u64)
+    }
+    /// `RanProcessInit`: bits 5..=5 de `same_teb_flags`.
+    pub const RAN_PROCESS_INIT_SHIFT: u32 = 5;
+    pub const RAN_PROCESS_INIT_MASK: u16 = 0x20;
+    #[inline(always)]
+    pub fn ran_process_init(&self) -> u16 {
+        self.same_teb_flags.bits(5, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_ran_process_init(&self, value: u16) {
+        self.same_teb_flags.set_bits(5, 1, value as u64)
+    }
+    /// `ClonedThread`: bits 6..=6 de `same_teb_flags`.
+    pub const CLONED_THREAD_SHIFT: u32 = 6;
+    pub const CLONED_THREAD_MASK: u16 = 0x40;
+    #[inline(always)]
+    pub fn cloned_thread(&self) -> u16 {
+        self.same_teb_flags.bits(6, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_cloned_thread(&self, value: u16) {
+        self.same_teb_flags.set_bits(6, 1, value as u64)
+    }
+    /// `SuppressDebugMsg`: bits 7..=7 de `same_teb_flags`.
+    pub const SUPPRESS_DEBUG_MSG_SHIFT: u32 = 7;
+    pub const SUPPRESS_DEBUG_MSG_MASK: u16 = 0x80;
+    #[inline(always)]
+    pub fn suppress_debug_msg(&self) -> u16 {
+        self.same_teb_flags.bits(7, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_suppress_debug_msg(&self, value: u16) {
+        self.same_teb_flags.set_bits(7, 1, value as u64)
+    }
+    /// `DisableUserStackWalk`: bits 8..=8 de `same_teb_flags`.
+    pub const DISABLE_USER_STACK_WALK_SHIFT: u32 = 8;
+    pub const DISABLE_USER_STACK_WALK_MASK: u16 = 0x100;
+    #[inline(always)]
+    pub fn disable_user_stack_walk(&self) -> u16 {
+        self.same_teb_flags.bits(8, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_disable_user_stack_walk(&self, value: u16) {
+        self.same_teb_flags.set_bits(8, 1, value as u64)
+    }
+    /// `RtlExceptionAttached`: bits 9..=9 de `same_teb_flags`.
+    pub const RTL_EXCEPTION_ATTACHED_SHIFT: u32 = 9;
+    pub const RTL_EXCEPTION_ATTACHED_MASK: u16 = 0x200;
+    #[inline(always)]
+    pub fn rtl_exception_attached(&self) -> u16 {
+        self.same_teb_flags.bits(9, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_rtl_exception_attached(&self, value: u16) {
+        self.same_teb_flags.set_bits(9, 1, value as u64)
+    }
+    /// `InitialThread`: bits 10..=10 de `same_teb_flags`.
+    pub const INITIAL_THREAD_SHIFT: u32 = 10;
+    pub const INITIAL_THREAD_MASK: u16 = 0x400;
+    #[inline(always)]
+    pub fn initial_thread(&self) -> u16 {
+        self.same_teb_flags.bits(10, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_initial_thread(&self, value: u16) {
+        self.same_teb_flags.set_bits(10, 1, value as u64)
+    }
+    /// `SessionAware`: bits 11..=11 de `same_teb_flags`.
+    pub const SESSION_AWARE_SHIFT: u32 = 11;
+    pub const SESSION_AWARE_MASK: u16 = 0x800;
+    #[inline(always)]
+    pub fn session_aware(&self) -> u16 {
+        self.same_teb_flags.bits(11, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_session_aware(&self, value: u16) {
+        self.same_teb_flags.set_bits(11, 1, value as u64)
+    }
+    /// `LoadOwner`: bits 12..=12 de `same_teb_flags`.
+    pub const LOAD_OWNER_SHIFT: u32 = 12;
+    pub const LOAD_OWNER_MASK: u16 = 0x1000;
+    #[inline(always)]
+    pub fn load_owner(&self) -> u16 {
+        self.same_teb_flags.bits(12, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_load_owner(&self, value: u16) {
+        self.same_teb_flags.set_bits(12, 1, value as u64)
+    }
+    /// `LoaderWorker`: bits 13..=13 de `same_teb_flags`.
+    pub const LOADER_WORKER_SHIFT: u32 = 13;
+    pub const LOADER_WORKER_MASK: u16 = 0x2000;
+    #[inline(always)]
+    pub fn loader_worker(&self) -> u16 {
+        self.same_teb_flags.bits(13, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_loader_worker(&self, value: u16) {
+        self.same_teb_flags.set_bits(13, 1, value as u64)
+    }
+    /// `SkipLoaderInit`: bits 14..=14 de `same_teb_flags`.
+    pub const SKIP_LOADER_INIT_SHIFT: u32 = 14;
+    pub const SKIP_LOADER_INIT_MASK: u16 = 0x4000;
+    #[inline(always)]
+    pub fn skip_loader_init(&self) -> u16 {
+        self.same_teb_flags.bits(14, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_skip_loader_init(&self, value: u16) {
+        self.same_teb_flags.set_bits(14, 1, value as u64)
+    }
+    /// `SpareSameTebBits`: bits 15..=15 de `same_teb_flags`.
+    pub const SPARE_SAME_TEB_BITS_SHIFT: u32 = 15;
+    pub const SPARE_SAME_TEB_BITS_MASK: u16 = 0x8000;
+    #[inline(always)]
+    pub fn spare_same_teb_bits(&self) -> u16 {
+        self.same_teb_flags.bits(15, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_spare_same_teb_bits(&self, value: u16) {
+        self.same_teb_flags.set_bits(15, 1, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Teb32>() == 0x1000);
+    assert!(core::mem::offset_of!(Teb32, nt_tib) == 0x0);
+    assert!(core::mem::offset_of!(Teb32, environment_pointer) == 0x1c);
+    assert!(core::mem::offset_of!(Teb32, client_id) == 0x20);
+    assert!(core::mem::offset_of!(Teb32, active_rpc_handle) == 0x28);
+    assert!(core::mem::offset_of!(Teb32, thread_local_storage_pointer) == 0x2c);
+    assert!(core::mem::offset_of!(Teb32, process_environment_block) == 0x30);
+    assert!(core::mem::offset_of!(Teb32, last_error_value) == 0x34);
+    assert!(core::mem::offset_of!(Teb32, count_of_owned_critical_sections) == 0x38);
+    assert!(core::mem::offset_of!(Teb32, csr_client_thread) == 0x3c);
+    assert!(core::mem::offset_of!(Teb32, win32_thread_info) == 0x40);
+    assert!(core::mem::offset_of!(Teb32, user32_reserved) == 0x44);
+    assert!(core::mem::offset_of!(Teb32, user_reserved) == 0xac);
+    assert!(core::mem::offset_of!(Teb32, wow32_reserved) == 0xc0);
+    assert!(core::mem::offset_of!(Teb32, current_locale) == 0xc4);
+    assert!(core::mem::offset_of!(Teb32, fp_software_status_register) == 0xc8);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_debugger_instrumentation) == 0xcc);
+    assert!(core::mem::offset_of!(Teb32, system_reserved1) == 0x10c);
+    assert!(core::mem::offset_of!(Teb32, placeholder_compatibility_mode) == 0x174);
+    assert!(core::mem::offset_of!(Teb32, placeholder_hydration_always_explicit) == 0x175);
+    assert!(core::mem::offset_of!(Teb32, placeholder_reserved) == 0x176);
+    assert!(core::mem::offset_of!(Teb32, proxied_process_id) == 0x180);
+    assert!(core::mem::offset_of!(Teb32, activation_stack) == 0x184);
+    assert!(core::mem::offset_of!(Teb32, working_on_behalf_ticket) == 0x19c);
+    assert!(core::mem::offset_of!(Teb32, exception_code) == 0x1a4);
+    assert!(core::mem::offset_of!(Teb32, activation_context_stack_pointer) == 0x1a8);
+    assert!(core::mem::offset_of!(Teb32, instrumentation_callback_sp) == 0x1ac);
+    assert!(core::mem::offset_of!(Teb32, instrumentation_callback_previous_pc) == 0x1b0);
+    assert!(core::mem::offset_of!(Teb32, instrumentation_callback_previous_sp) == 0x1b4);
+    assert!(core::mem::offset_of!(Teb32, instrumentation_callback_disabled) == 0x1b8);
+    assert!(core::mem::offset_of!(Teb32, spare_bytes) == 0x1b9);
+    assert!(core::mem::offset_of!(Teb32, tx_fs_context) == 0x1d0);
+    assert!(core::mem::offset_of!(Teb32, gdi_teb_batch) == 0x1d4);
+    assert!(core::mem::offset_of!(Teb32, real_client_id) == 0x6b4);
+    assert!(core::mem::offset_of!(Teb32, gdi_cached_process_handle) == 0x6bc);
+    assert!(core::mem::offset_of!(Teb32, gdi_client_pid) == 0x6c0);
+    assert!(core::mem::offset_of!(Teb32, gdi_client_tid) == 0x6c4);
+    assert!(core::mem::offset_of!(Teb32, gdi_thread_local_info) == 0x6c8);
+    assert!(core::mem::offset_of!(Teb32, win32_client_info) == 0x6cc);
+    assert!(core::mem::offset_of!(Teb32, gl_dispatch_table) == 0x7c4);
+    assert!(core::mem::offset_of!(Teb32, gl_reserved1) == 0xb68);
+    assert!(core::mem::offset_of!(Teb32, gl_reserved2) == 0xbdc);
+    assert!(core::mem::offset_of!(Teb32, gl_section_info) == 0xbe0);
+    assert!(core::mem::offset_of!(Teb32, gl_section) == 0xbe4);
+    assert!(core::mem::offset_of!(Teb32, gl_table) == 0xbe8);
+    assert!(core::mem::offset_of!(Teb32, gl_current_rc) == 0xbec);
+    assert!(core::mem::offset_of!(Teb32, gl_context) == 0xbf0);
+    assert!(core::mem::offset_of!(Teb32, last_status_value) == 0xbf4);
+    assert!(core::mem::offset_of!(Teb32, static_unicode_string) == 0xbf8);
+    assert!(core::mem::offset_of!(Teb32, static_unicode_buffer) == 0xc00);
+    assert!(core::mem::offset_of!(Teb32, deallocation_stack) == 0xe0c);
+    assert!(core::mem::offset_of!(Teb32, tls_slots) == 0xe10);
+    assert!(core::mem::offset_of!(Teb32, tls_links) == 0xf10);
+    assert!(core::mem::offset_of!(Teb32, vdm) == 0xf18);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_nt_rpc) == 0xf1c);
+    assert!(core::mem::offset_of!(Teb32, dbg_ss_reserved) == 0xf20);
+    assert!(core::mem::offset_of!(Teb32, hard_error_mode) == 0xf28);
+    assert!(core::mem::offset_of!(Teb32, instrumentation) == 0xf2c);
+    assert!(core::mem::offset_of!(Teb32, activity_id) == 0xf50);
+    assert!(core::mem::offset_of!(Teb32, sub_process_tag) == 0xf60);
+    assert!(core::mem::offset_of!(Teb32, perflib_data) == 0xf64);
+    assert!(core::mem::offset_of!(Teb32, etw_trace_data) == 0xf68);
+    assert!(core::mem::offset_of!(Teb32, win_sock_data) == 0xf6c);
+    assert!(core::mem::offset_of!(Teb32, gdi_batch_count) == 0xf70);
+    assert!(core::mem::offset_of!(Teb32, current_ideal_processor) == 0xf74);
+    assert!(core::mem::offset_of!(Teb32, guaranteed_stack_bytes) == 0xf78);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_perf) == 0xf7c);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_ole) == 0xf80);
+    assert!(core::mem::offset_of!(Teb32, waiting_on_loader_lock) == 0xf84);
+    assert!(core::mem::offset_of!(Teb32, saved_priority_state) == 0xf88);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_code_coverage) == 0xf8c);
+    assert!(core::mem::offset_of!(Teb32, thread_pool_data) == 0xf90);
+    assert!(core::mem::offset_of!(Teb32, tls_expansion_slots) == 0xf94);
+    assert!(core::mem::offset_of!(Teb32, mui_generation) == 0xf98);
+    assert!(core::mem::offset_of!(Teb32, is_impersonating) == 0xf9c);
+    assert!(core::mem::offset_of!(Teb32, nls_cache) == 0xfa0);
+    assert!(core::mem::offset_of!(Teb32, p_shim_data) == 0xfa4);
+    assert!(core::mem::offset_of!(Teb32, heap_data) == 0xfa8);
+    assert!(core::mem::offset_of!(Teb32, current_transaction_handle) == 0xfac);
+    assert!(core::mem::offset_of!(Teb32, active_frame) == 0xfb0);
+    assert!(core::mem::offset_of!(Teb32, fls_data) == 0xfb4);
+    assert!(core::mem::offset_of!(Teb32, preferred_languages) == 0xfb8);
+    assert!(core::mem::offset_of!(Teb32, user_pref_languages) == 0xfbc);
+    assert!(core::mem::offset_of!(Teb32, merged_pref_languages) == 0xfc0);
+    assert!(core::mem::offset_of!(Teb32, mui_impersonation) == 0xfc4);
+    assert!(core::mem::offset_of!(Teb32, cross_teb_flags) == 0xfc8);
+    assert!(core::mem::offset_of!(Teb32, same_teb_flags) == 0xfca);
+    assert!(core::mem::offset_of!(Teb32, txn_scope_enter_callback) == 0xfcc);
+    assert!(core::mem::offset_of!(Teb32, txn_scope_exit_callback) == 0xfd0);
+    assert!(core::mem::offset_of!(Teb32, txn_scope_context) == 0xfd4);
+    assert!(core::mem::offset_of!(Teb32, lock_count) == 0xfd8);
+    assert!(core::mem::offset_of!(Teb32, wow_teb_offset) == 0xfdc);
+    assert!(core::mem::offset_of!(Teb32, resource_ret_value) == 0xfe0);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_wdf) == 0xfe4);
+    assert!(core::mem::offset_of!(Teb32, reserved_for_crt) == 0xfe8);
+    assert!(core::mem::offset_of!(Teb32, effective_container_id) == 0xff0);
+    assert!(core::mem::size_of::<Teb32View1>() == 0x1000);
+    assert!(core::mem::align_of::<Teb32View1>() == core::mem::align_of::<Teb32>());
+    assert!(core::mem::offset_of!(Teb32View1, ideal_processor_value) == 0xf74);
+    assert!(core::mem::size_of::<Teb32View2>() == 0x1000);
+    assert!(core::mem::align_of::<Teb32View2>() == core::mem::align_of::<Teb32>());
+    assert!(core::mem::offset_of!(Teb32View2, reserved_pad0) == 0xf74);
+    assert!(core::mem::offset_of!(Teb32View2, reserved_pad1) == 0xf75);
+    assert!(core::mem::offset_of!(Teb32View2, reserved_pad2) == 0xf76);
+    assert!(core::mem::offset_of!(Teb32View2, ideal_processor) == 0xf77);
+};
+
+/// `_CLIENT_ID32` (0x8 bytes).
+#[repr(C)]
+pub struct ClientId32 {
+    pub unique_process: Field<u32>,
+    pub unique_thread: Field<u32>,
+}
+
+unsafe impl NtStruct for ClientId32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ClientId32>() == 0x8);
+    assert!(core::mem::offset_of!(ClientId32, unique_process) == 0x0);
+    assert!(core::mem::offset_of!(ClientId32, unique_thread) == 0x4);
+};
+
+/// `_ACTIVATION_CONTEXT_STACK32` (0x18 bytes).
+#[repr(C)]
+pub struct ActivationContextStack32 {
+    pub active_frame: Field<u32>,
+    pub frame_list_cache: ListEntry32,
+    pub flags: Field<u32>,
+    pub next_cookie_sequence_number: Field<u32>,
+    pub stack_id: Field<u32>,
+}
+
+unsafe impl NtStruct for ActivationContextStack32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ActivationContextStack32>() == 0x18);
+    assert!(core::mem::offset_of!(ActivationContextStack32, active_frame) == 0x0);
+    assert!(core::mem::offset_of!(ActivationContextStack32, frame_list_cache) == 0x4);
+    assert!(core::mem::offset_of!(ActivationContextStack32, flags) == 0xc);
+    assert!(core::mem::offset_of!(ActivationContextStack32, next_cookie_sequence_number) == 0x10);
+    assert!(core::mem::offset_of!(ActivationContextStack32, stack_id) == 0x14);
+};
+
+/// `_GDI_TEB_BATCH32` (0x4e0 bytes).
+#[repr(C)]
+pub struct GdiTebBatch32 {
+    pub bitfield_0: Field<u32>,
+    pub hdc: Field<u32>,
+    pub buffer: [Field<u32>; 310],
+}
+
+unsafe impl NtStruct for GdiTebBatch32 {}
+
+impl GdiTebBatch32 {
+    /// `Offset`: bits 0..=30 de `bitfield_0`.
+    pub const OFFSET_SHIFT: u32 = 0;
+    pub const OFFSET_MASK: u32 = 0x7fffffff;
+    #[inline(always)]
+    pub fn offset(&self) -> u32 {
+        self.bitfield_0.bits(0, 31) as u32
+    }
+    #[inline(always)]
+    pub fn set_offset(&self, value: u32) {
+        self.bitfield_0.set_bits(0, 31, value as u64)
+    }
+    /// `HasRenderingCommand`: bits 31..=31 de `bitfield_0`.
+    pub const HAS_RENDERING_COMMAND_SHIFT: u32 = 31;
+    pub const HAS_RENDERING_COMMAND_MASK: u32 = 0x80000000;
+    #[inline(always)]
+    pub fn has_rendering_command(&self) -> u32 {
+        self.bitfield_0.bits(31, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_has_rendering_command(&self, value: u32) {
+        self.bitfield_0.set_bits(31, 1, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<GdiTebBatch32>() == 0x4e0);
+    assert!(core::mem::offset_of!(GdiTebBatch32, bitfield_0) == 0x0);
+    assert!(core::mem::offset_of!(GdiTebBatch32, hdc) == 0x4);
+    assert!(core::mem::offset_of!(GdiTebBatch32, buffer) == 0x8);
+};

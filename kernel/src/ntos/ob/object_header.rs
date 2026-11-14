@@ -295,7 +295,7 @@ pub fn allocate(create_info: u64, owner_mode: u8, object_type: u64, name: (u16, 
         // SAFETY: idem.
         let handle_info = unsafe { ObjectHeaderHandleInfo::at(cursor) };
         handle_info.single_entry.process.set(0);
-        handle_info.single_entry.counts.set(0);
+        handle_info.single_entry.bitfield_8.set(0);
         cursor += ObjectHeaderHandleInfo::SIZE;
     }
     if mask & INFO_NAME != 0 {
@@ -652,9 +652,9 @@ fn grow_database(object: &ObjectHeader, handle_info: u64) -> Option<u64> {
     let slot = unsafe { Field::<u64>::at(handle_info) };
     let old: Vec<(u64, u32)> = if single {
         let entry = handle_entry(handle_info);
-        alloc::vec![(entry.process.get(), entry.counts.get())]
+        alloc::vec![(entry.process.get(), entry.bitfield_8.get())]
     } else {
-        database_entries(slot.get()).iter().map(|entry| (entry.process.get(), entry.counts.get())).collect()
+        database_entries(slot.get()).iter().map(|entry| (entry.process.get(), entry.bitfield_8.get())).collect()
     };
     let count = if single { 2 } else { old.len() + 4 };
     let size = core::mem::offset_of!(ObjectHandleCountDatabase, handle_count_entries) as u64 + count as u64 * ObjectHandleCountEntry::SIZE;
@@ -666,7 +666,7 @@ fn grow_database(object: &ObjectHeader, handle_info: u64) -> Option<u64> {
     unsafe { ObjectHandleCountDatabase::at(database) }.count_entries.set(count as u32);
     for (entry, (owner, counts)) in database_entries(database).iter().zip(old) {
         entry.process.set(owner);
-        entry.counts.set(counts);
+        entry.bitfield_8.set(counts);
     }
     if !single {
         let _ = pool_allocation::free(slot.get(), HANDLE_DATABASE_TAG as u64);
@@ -680,14 +680,14 @@ fn grow_database(object: &ObjectHeader, handle_info: u64) -> Option<u64> {
 /// com LockCount + 1; devolve a entrada e HandleCount + LockCount.
 fn lock_handle_entry(object: &ObjectHeader, handle_info: u64, owner: u64) -> Option<(u64, u32)> {
     let lock = |entry: &ObjectHandleCountEntry| {
-        entry.counts.set(entry.counts.get().wrapping_add(1 << 24));
+        entry.bitfield_8.set(entry.bitfield_8.get().wrapping_add(1 << 24));
         (entry.address(), entry.handle_count() + entry.lock_count())
     };
     if object.flags.get() & FLAG_SINGLE_HANDLE_ENTRY != 0 {
         let entry = handle_entry(handle_info);
         if entry.process.get() == 0 {
             entry.process.set(owner);
-            entry.counts.set(0);
+            entry.bitfield_8.set(0);
             return Some(lock(entry));
         }
         if entry.process.get() == owner {
@@ -708,7 +708,7 @@ fn lock_handle_entry(object: &ObjectHeader, handle_info: u64, owner: u64) -> Opt
         }
     };
     free_entry.process.set(owner);
-    free_entry.counts.set(0);
+    free_entry.bitfield_8.set(0);
     Some(lock(free_entry))
 }
 
@@ -716,11 +716,11 @@ fn lock_handle_entry(object: &ObjectHeader, handle_info: u64, owner: u64) -> Opt
 /// sem handles nem travas fica livre.
 fn unlock_handle_entry(entry: u64, opened: bool) {
     let entry = handle_entry(entry);
-    let mut counts = entry.counts.get().wrapping_sub(1 << 24);
+    let mut counts = entry.bitfield_8.get().wrapping_sub(1 << 24);
     if opened {
         counts = (counts & !ObjectHandleCountEntry::HANDLE_COUNT_MASK) | ((counts + 1) & ObjectHandleCountEntry::HANDLE_COUNT_MASK);
     }
-    entry.counts.set(counts);
+    entry.bitfield_8.set(counts);
     if counts == 0 {
         entry.process.set(0);
     }
@@ -914,7 +914,7 @@ pub fn decrement_handle_count(body: u64, owner: u64) -> (u32, u64) {
                 let entry = handle_entry(entry);
                 process_count = entry.handle_count();
                 entry.set_handle_count(process_count.saturating_sub(1));
-                if entry.counts.get() == 0 {
+                if entry.bitfield_8.get() == 0 {
                     entry.process.set(0);
                 }
             }

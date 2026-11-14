@@ -889,3 +889,239 @@ const _: () = {
     assert!(core::mem::offset_of!(ObjectNamespaceLookuptable, lock) == 0x250);
     assert!(core::mem::offset_of!(ObjectNamespaceLookuptable, number_of_private_spaces) == 0x258);
 };
+
+/// `_OBJECT_HEADER_CREATOR_INFO` (0x20 bytes).
+#[repr(C)]
+pub struct ObjectHeaderCreatorInfo {
+    pub type_list: ListEntry,
+    /// -> `void`
+    pub creator_unique_process: Field<u64>,
+    pub creator_back_trace_index: Field<u16>,
+    pub reserved1: Field<u16>,
+    pub reserved2: Field<u32>,
+}
+
+unsafe impl NtStruct for ObjectHeaderCreatorInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderCreatorInfo>() == 0x20);
+    assert!(core::mem::offset_of!(ObjectHeaderCreatorInfo, type_list) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHeaderCreatorInfo, creator_unique_process) == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderCreatorInfo, creator_back_trace_index) == 0x18);
+    assert!(core::mem::offset_of!(ObjectHeaderCreatorInfo, reserved1) == 0x1a);
+    assert!(core::mem::offset_of!(ObjectHeaderCreatorInfo, reserved2) == 0x1c);
+};
+
+/// `_OBJECT_HANDLE_COUNT_ENTRY` (0x10 bytes).
+#[repr(C)]
+pub struct ObjectHandleCountEntry {
+    /// -> `_EPROCESS`
+    pub process: Field<u64>,
+    pub bitfield_8: Field<u32>,
+    _pad_c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for ObjectHandleCountEntry {}
+
+impl ObjectHandleCountEntry {
+    /// `HandleCount`: bits 0..=23 de `bitfield_8`.
+    pub const HANDLE_COUNT_SHIFT: u32 = 0;
+    pub const HANDLE_COUNT_MASK: u32 = 0xffffff;
+    #[inline(always)]
+    pub fn handle_count(&self) -> u32 {
+        self.bitfield_8.bits(0, 24) as u32
+    }
+    #[inline(always)]
+    pub fn set_handle_count(&self, value: u32) {
+        self.bitfield_8.set_bits(0, 24, value as u64)
+    }
+    /// `LockCount`: bits 24..=31 de `bitfield_8`.
+    pub const LOCK_COUNT_SHIFT: u32 = 24;
+    pub const LOCK_COUNT_MASK: u32 = 0xff000000;
+    #[inline(always)]
+    pub fn lock_count(&self) -> u32 {
+        self.bitfield_8.bits(24, 8) as u32
+    }
+    #[inline(always)]
+    pub fn set_lock_count(&self, value: u32) {
+        self.bitfield_8.set_bits(24, 8, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHandleCountEntry>() == 0x10);
+    assert!(core::mem::offset_of!(ObjectHandleCountEntry, process) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHandleCountEntry, bitfield_8) == 0x8);
+};
+
+/// `_OBJECT_HANDLE_COUNT_DATABASE` (0x18 bytes).
+#[repr(C)]
+pub struct ObjectHandleCountDatabase {
+    pub count_entries: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    pub handle_count_entries: [ObjectHandleCountEntry; 1],
+}
+
+unsafe impl NtStruct for ObjectHandleCountDatabase {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHandleCountDatabase>() == 0x18);
+    assert!(core::mem::offset_of!(ObjectHandleCountDatabase, count_entries) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHandleCountDatabase, handle_count_entries) == 0x8);
+};
+
+/// `_OBJECT_HEADER_HANDLE_INFO` (0x10 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `ObjectHeaderHandleInfoView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct ObjectHeaderHandleInfo {
+    /// -> `_OBJECT_HANDLE_COUNT_DATABASE`
+    pub handle_count_data_base: Field<u64>,
+    _pad_8: Reserved<0x8>,
+}
+
+/// Vista 1 de `_OBJECT_HEADER_HANDLE_INFO` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ObjectHeaderHandleInfoView1 {
+    pub single_entry: ObjectHandleCountEntry,
+}
+
+impl core::ops::Deref for ObjectHeaderHandleInfo {
+    type Target = ObjectHeaderHandleInfoView1;
+    #[inline(always)]
+    fn deref(&self) -> &ObjectHeaderHandleInfoView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ObjectHeaderHandleInfoView1>() }
+    }
+}
+
+unsafe impl NtStruct for ObjectHeaderHandleInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderHandleInfo>() == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderHandleInfo, handle_count_data_base) == 0x0);
+    assert!(core::mem::size_of::<ObjectHeaderHandleInfoView1>() == 0x10);
+    assert!(core::mem::align_of::<ObjectHeaderHandleInfoView1>() == core::mem::align_of::<ObjectHeaderHandleInfo>());
+    assert!(core::mem::offset_of!(ObjectHeaderHandleInfoView1, single_entry) == 0x0);
+};
+
+/// `_OBJECT_HEADER_QUOTA_INFO` (0x20 bytes).
+#[repr(C)]
+pub struct ObjectHeaderQuotaInfo {
+    pub paged_pool_charge: Field<u32>,
+    pub non_paged_pool_charge: Field<u32>,
+    pub security_descriptor_charge: Field<u32>,
+    pub reserved1: Field<u32>,
+    /// -> `void`
+    pub security_descriptor_quota_block: Field<u64>,
+    pub reserved2: Field<u64>,
+}
+
+unsafe impl NtStruct for ObjectHeaderQuotaInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderQuotaInfo>() == 0x20);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, paged_pool_charge) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, non_paged_pool_charge) == 0x4);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, security_descriptor_charge) == 0x8);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, reserved1) == 0xc);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, security_descriptor_quota_block) == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderQuotaInfo, reserved2) == 0x18);
+};
+
+/// `_OBJECT_HEADER_PROCESS_INFO` (0x10 bytes).
+#[repr(C)]
+pub struct ObjectHeaderProcessInfo {
+    /// -> `_EPROCESS`
+    pub exclusive_process: Field<u64>,
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for ObjectHeaderProcessInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderProcessInfo>() == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderProcessInfo, exclusive_process) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHeaderProcessInfo, reserved) == 0x8);
+};
+
+/// `_OBJECT_HEADER_AUDIT_INFO` (0x10 bytes).
+#[repr(C)]
+pub struct ObjectHeaderAuditInfo {
+    /// -> `void`
+    pub security_descriptor: Field<u64>,
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for ObjectHeaderAuditInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderAuditInfo>() == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderAuditInfo, security_descriptor) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHeaderAuditInfo, reserved) == 0x8);
+};
+
+/// `_OBJECT_HEADER_EXTENDED_INFO` (0x10 bytes).
+#[repr(C)]
+pub struct ObjectHeaderExtendedInfo {
+    /// -> `_OBJECT_FOOTER`
+    pub footer: Field<u64>,
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for ObjectHeaderExtendedInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderExtendedInfo>() == 0x10);
+    assert!(core::mem::offset_of!(ObjectHeaderExtendedInfo, footer) == 0x0);
+    assert!(core::mem::offset_of!(ObjectHeaderExtendedInfo, reserved) == 0x8);
+};
+
+/// `_OBJECT_HEADER_PADDING_INFO` (0x4 bytes).
+#[repr(C)]
+pub struct ObjectHeaderPaddingInfo {
+    pub padding_amount: Field<u32>,
+}
+
+unsafe impl NtStruct for ObjectHeaderPaddingInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectHeaderPaddingInfo>() == 0x4);
+    assert!(core::mem::offset_of!(ObjectHeaderPaddingInfo, padding_amount) == 0x0);
+};
+
+/// `_OBJECT_CREATE_INFORMATION` (0x40 bytes).
+#[repr(C)]
+pub struct ObjectCreateInformation {
+    pub attributes: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    /// -> `void`
+    pub root_directory: Field<u64>,
+    pub probe_mode: Field<i8>,
+    _pad_11: Reserved<0x3>,
+    pub paged_pool_charge: Field<u32>,
+    pub non_paged_pool_charge: Field<u32>,
+    pub security_descriptor_charge: Field<u32>,
+    /// -> `void`
+    pub security_descriptor: Field<u64>,
+    /// -> `_SECURITY_QUALITY_OF_SERVICE`
+    pub security_qos: Field<u64>,
+    pub security_quality_of_service: SecurityQualityOfService,
+    _pad_3c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for ObjectCreateInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ObjectCreateInformation>() == 0x40);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, attributes) == 0x0);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, root_directory) == 0x8);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, probe_mode) == 0x10);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, paged_pool_charge) == 0x14);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, non_paged_pool_charge) == 0x18);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, security_descriptor_charge) == 0x1c);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, security_descriptor) == 0x20);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, security_qos) == 0x28);
+    assert!(core::mem::offset_of!(ObjectCreateInformation, security_quality_of_service) == 0x30);
+};

@@ -23,7 +23,7 @@ use core::mem::offset_of;
 use crate::ntos::ex::pool_allocation;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::extra_rtl::{RtlRangeList, RtlRangeListIterator, RtlpRangeListEntry};
-use crate::ntos::inc::types::ListEntry;
+use crate::ntos::inc::types::{ListEntry, RtlpRangeListEntryView1};
 use crate::ntos::ke::bugcheck;
 
 /// RtlAddRange: aceita a faixa mesmo em conflito (marcando os dois lados).
@@ -142,8 +142,8 @@ fn allocate_entry() -> Option<&'static RtlpRangeListEntry> {
 fn copy_fields(source: &RtlpRangeListEntry, target: &RtlpRangeListEntry) {
     target.start.set(source.start.get());
     target.end.set(source.end.get());
-    target.user_data.set(source.user_data.get());
-    target.owner.set(source.owner.get());
+    target.allocated.user_data.set(source.allocated.user_data.get());
+    target.allocated.owner.set(source.allocated.owner.get());
     target.attributes.set(source.attributes.get());
     target.public_flags.set(source.public_flags.get());
     target.private_flags.set(source.private_flags.get());
@@ -153,7 +153,7 @@ fn copy_fields(source: &RtlpRangeListEntry, target: &RtlpRangeListEntry) {
 
 fn reference_user_data(range: &RtlpRangeListEntry) {
     if range.public_flags.get() & RANGE_USER_DATA_COUNTED != 0 {
-        counter(range.user_data.get()).atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        counter(range.allocated.user_data.get()).atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -162,11 +162,11 @@ fn create_entry(start: u64, end: u64, attributes: u8, user_data: u64, owner: u64
     let range = allocate_entry()?;
     range.public_flags.set(0);
     range.private_flags.set(0);
-    range.owner.set(owner);
+    range.allocated.owner.set(owner);
     range.start.set(start);
     range.end.set(end);
     range.attributes.set(attributes);
-    range.user_data.set(user_data);
+    range.allocated.user_data.set(user_data);
     Some(range)
 }
 
@@ -176,9 +176,9 @@ fn copy_entry(source: &RtlpRangeListEntry) -> Option<&'static RtlpRangeListEntry
     copy_fields(source, copy);
     reference_user_data(copy);
     if is_merged(source) {
-        let head = copy.merged_list_head();
+        let head = &copy.merged.list_head;
         initialize_head(head);
-        let source_head = source.merged_list_head().address();
+        let source_head = source.merged.list_head.address();
         let mut current = link(source_head).flink.get();
         while current != source_head {
             let original = entry_of_link(current);
@@ -198,7 +198,7 @@ fn copy_entry(source: &RtlpRangeListEntry) -> Option<&'static RtlpRangeListEntry
 /// RtlpFreeRangeListEntry.
 fn free_entry(range: &RtlpRangeListEntry) {
     if !is_merged(range) && range.public_flags.get() & RANGE_USER_DATA_COUNTED != 0 {
-        let user_data = range.user_data.get();
+        let user_data = range.allocated.user_data.get();
         if counter(user_data).atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1 {
             let _ = pool_allocation::free(user_data, 0);
         }
@@ -209,7 +209,7 @@ fn free_entry(range: &RtlpRangeListEntry) {
 /// RtlpDeleteRangeListEntry: a entrada e, numa fundida, as da sublista.
 fn delete_entry(range: &RtlpRangeListEntry) {
     if is_merged(range) {
-        let head = range.merged_list_head().address();
+        let head = range.merged.list_head.address();
         let mut current = link(head).flink.get();
         while current != head {
             let sub = entry_of_link(current);
@@ -224,7 +224,7 @@ fn delete_entry(range: &RtlpRangeListEntry) {
 /// início; empates depois das existentes), conferindo conflitos.
 fn add_to_merged(merged: &RtlpRangeListEntry, range: &RtlpRangeListEntry, flags: u32) -> u32 {
     let range_shared = shared(range);
-    let head = merged.merged_list_head();
+    let head = &merged.merged.list_head;
     let mut previous = 0u64;
     let mut current = head.flink.get();
     while current != head.address() {
@@ -271,7 +271,7 @@ fn add_intersecting(list: &ListEntry, first: &RtlpRangeListEntry, range: &RtlpRa
                 break;
             }
             if is_merged(current) {
-                let sub_head = current.merged_list_head().address();
+                let sub_head = current.merged.list_head.address();
                 let mut sub_link = link(sub_head).flink.get();
                 while sub_link != sub_head {
                     let sub = entry_of_link(sub_link);
@@ -289,11 +289,11 @@ fn add_intersecting(list: &ListEntry, first: &RtlpRangeListEntry, range: &RtlpRa
     if !is_merged(first) {
         let Some(copy) = copy_entry(first) else { return STATUS_INSUFFICIENT_RESOURCES };
         if first.public_flags.get() & RANGE_USER_DATA_COUNTED != 0 {
-            counter(first.user_data.get()).atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+            counter(first.allocated.user_data.get()).atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
             first.public_flags.set(first.public_flags.get() & !RANGE_USER_DATA_COUNTED);
         }
         first.private_flags.set(RTLP_RANGE_LIST_ENTRY_MERGED);
-        let merged_head = first.merged_list_head();
+        let merged_head = &first.merged.list_head;
         copy.list_entry.flink.set(merged_head.address());
         copy.list_entry.blink.set(merged_head.address());
         merged_head.blink.set(copy.list_entry.address());
@@ -307,7 +307,7 @@ fn add_intersecting(list: &ListEntry, first: &RtlpRangeListEntry, range: &RtlpRa
             break;
         }
         if is_merged(next_range) {
-            let sub_head = next_range.merged_list_head().address();
+            let sub_head = next_range.merged.list_head.address();
             let mut sub_link = link(sub_head).flink.get();
             while sub_link != sub_head {
                 let sub = entry_of_link(sub_link);
@@ -436,7 +436,7 @@ fn delete_from_merged(range: &RtlpRangeListEntry, merged: &RtlpRangeListEntry) -
     let storage = UnsafeCell::new([0u64; 2]);
     let temporary = link(storage.get() as u64);
     initialize_head(temporary);
-    let merged_head = merged.merged_list_head();
+    let merged_head = &merged.merged.list_head;
     let mut status = STATUS_SUCCESS;
     let mut current = merged_head.flink.get();
     while current != merged_head.address() {
@@ -474,7 +474,7 @@ fn delete_from_merged(range: &RtlpRangeListEntry, merged: &RtlpRangeListEntry) -
 
 /// A faixa da sublista de `merged` com o predicado, se houver.
 fn find_sub(merged: &RtlpRangeListEntry, matches: impl Fn(&RtlpRangeListEntry) -> bool) -> Option<&'static RtlpRangeListEntry> {
-    let head = merged.merged_list_head().address();
+    let head = merged.merged.list_head.address();
     let mut current = link(head).flink.get();
     while current != head {
         let sub = entry_of_link(current);
@@ -505,9 +505,9 @@ pub fn delete(list: &RtlRangeList, start: u64, end: u64, owner: u64) -> u32 {
             if start < range.start.get() || end > range.end.get() {
                 continue;
             }
-            let Some(sub) = find_sub(range, |sub| sub.start.get() == start && sub.end.get() == end && sub.owner.get() == owner) else { continue };
+            let Some(sub) = find_sub(range, |sub| sub.start.get() == start && sub.end.get() == end && sub.allocated.owner.get() == owner) else { continue };
             delete_from_merged(sub, range)
-        } else if range.start.get() == start && range.end.get() == end && range.owner.get() == owner {
+        } else if range.start.get() == start && range.end.get() == end && range.allocated.owner.get() == owner {
             remove(&range.list_entry);
             free_entry(range);
             STATUS_SUCCESS
@@ -532,7 +532,7 @@ pub fn delete_owners(list: &RtlRangeList, owner: u64) -> u32 {
             let range = entry_of_link(current);
             current = range.list_entry.flink.get();
             if is_merged(range) {
-                if let Some(sub) = find_sub(range, |sub| sub.owner.get() == owner) {
+                if let Some(sub) = find_sub(range, |sub| sub.allocated.owner.get() == owner) {
                     status = delete_from_merged(sub, range);
                     if failed(status) {
                         return status;
@@ -540,7 +540,7 @@ pub fn delete_owners(list: &RtlRangeList, owner: u64) -> u32 {
                     note_removed(list);
                     continue 'restart;
                 }
-            } else if range.owner.get() == owner {
+            } else if range.allocated.owner.get() == owner {
                 remove(&range.list_entry);
                 free_entry(range);
                 note_removed(list);
@@ -570,7 +570,7 @@ fn get_edge(list: &RtlRangeList, iterator: &RtlRangeListIterator, range: &Field<
     }
     let mut target = entry_of_link(edge);
     if is_merged(target) {
-        let merged_head = target.merged_list_head();
+        let merged_head = &target.merged.list_head;
         iterator.merged_head.set(merged_head.address());
         target = entry_of_link(if forward { merged_head.flink.get() } else { merged_head.blink.get() });
     } else {
@@ -609,7 +609,7 @@ pub fn get_next(iterator: &RtlRangeListIterator, range: &Field<u64>, forward: bo
             return STATUS_SUCCESS;
         }
         // Fim da sublista: segue a lista de topo a partir da fundida.
-        let merged_entry = entry(merged - offset_of!(RtlpRangeListEntry, user_data) as u64);
+        let merged_entry = entry(merged - offset_of!(RtlpRangeListEntryView1, merged) as u64);
         next_link = step(&merged_entry.list_entry);
         iterator.merged_head.set(0);
     }
@@ -620,7 +620,7 @@ pub fn get_next(iterator: &RtlRangeListIterator, range: &Field<u64>, forward: bo
     }
     let mut target = entry_of_link(next_link);
     if is_merged(target) {
-        let merged_head = target.merged_list_head();
+        let merged_head = &target.merged.list_head;
         iterator.merged_head.set(merged_head.address());
         target = entry_of_link(step(merged_head));
     }
@@ -648,7 +648,7 @@ impl Availability {
     fn tolerates(&self, range: &RtlpRangeListEntry) -> bool {
         (self.shared_ok && shared(range))
             || range.attributes.get() & self.attribute_mask != 0
-            || (self.null_conflict_ok && range.owner.get() == 0)
+            || (self.null_conflict_ok && range.allocated.owner.get() == 0)
             || (self.callback != 0 && crate::hal::amd64::native_call::call(self.callback, &[self.context, range.address()]) as u8 != 0)
     }
 }

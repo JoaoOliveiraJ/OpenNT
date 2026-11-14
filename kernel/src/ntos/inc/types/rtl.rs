@@ -1204,3 +1204,255 @@ const _: () = {
     assert!(core::mem::size_of::<SlistEntry>() == 0x10);
     assert!(core::mem::offset_of!(SlistEntry, next) == 0x0);
 };
+
+/// `_NT_TIB32` (0x1c bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `NtTib32View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct NtTib32 {
+    pub exception_list: Field<u32>,
+    pub stack_base: Field<u32>,
+    pub stack_limit: Field<u32>,
+    pub sub_system_tib: Field<u32>,
+    pub fiber_data: Field<u32>,
+    pub arbitrary_user_pointer: Field<u32>,
+    pub self_: Field<u32>,
+}
+
+/// Vista 1 de `_NT_TIB32` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct NtTib32View1 {
+    _pad_0: Reserved<0x10>,
+    pub version: Field<u32>,
+    _pad_14: Reserved<0x8>,
+}
+
+impl core::ops::Deref for NtTib32 {
+    type Target = NtTib32View1;
+    #[inline(always)]
+    fn deref(&self) -> &NtTib32View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<NtTib32View1>() }
+    }
+}
+
+unsafe impl NtStruct for NtTib32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<NtTib32>() == 0x1c);
+    assert!(core::mem::offset_of!(NtTib32, exception_list) == 0x0);
+    assert!(core::mem::offset_of!(NtTib32, stack_base) == 0x4);
+    assert!(core::mem::offset_of!(NtTib32, stack_limit) == 0x8);
+    assert!(core::mem::offset_of!(NtTib32, sub_system_tib) == 0xc);
+    assert!(core::mem::offset_of!(NtTib32, fiber_data) == 0x10);
+    assert!(core::mem::offset_of!(NtTib32, arbitrary_user_pointer) == 0x14);
+    assert!(core::mem::offset_of!(NtTib32, self_) == 0x18);
+    assert!(core::mem::size_of::<NtTib32View1>() == 0x1c);
+    assert!(core::mem::align_of::<NtTib32View1>() == core::mem::align_of::<NtTib32>());
+    assert!(core::mem::offset_of!(NtTib32View1, version) == 0x10);
+};
+
+/// `LIST_ENTRY32` (0x8 bytes).
+#[repr(C)]
+pub struct ListEntry32 {
+    pub flink: Field<u32>,
+    pub blink: Field<u32>,
+}
+
+unsafe impl NtStruct for ListEntry32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ListEntry32>() == 0x8);
+    assert!(core::mem::offset_of!(ListEntry32, flink) == 0x0);
+    assert!(core::mem::offset_of!(ListEntry32, blink) == 0x4);
+};
+
+/// `_STRING32` (0x8 bytes).
+#[repr(C)]
+pub struct String32 {
+    pub length: Field<u16>,
+    pub maximum_length: Field<u16>,
+    pub buffer: Field<u32>,
+}
+
+unsafe impl NtStruct for String32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<String32>() == 0x8);
+    assert!(core::mem::offset_of!(String32, length) == 0x0);
+    assert!(core::mem::offset_of!(String32, maximum_length) == 0x2);
+    assert!(core::mem::offset_of!(String32, buffer) == 0x4);
+};
+
+/// `_RTL_ATOM_TABLE` (0x28 bytes).
+#[repr(C)]
+pub struct RtlAtomTable {
+    pub signature: Field<u32>,
+    pub reference_count: Field<i32>,
+    pub push_lock: ExPushLock,
+    /// -> `_HANDLE_TABLE`
+    pub ex_handle_table: Field<u64>,
+    pub flags: Field<u32>,
+    pub number_of_buckets: Field<u32>,
+    /// -> `_RTL_ATOM_TABLE_ENTRY`
+    pub buckets: [Field<u64>; 1],
+}
+
+unsafe impl NtStruct for RtlAtomTable {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlAtomTable>() == 0x28);
+    assert!(core::mem::offset_of!(RtlAtomTable, signature) == 0x0);
+    assert!(core::mem::offset_of!(RtlAtomTable, reference_count) == 0x4);
+    assert!(core::mem::offset_of!(RtlAtomTable, push_lock) == 0x8);
+    assert!(core::mem::offset_of!(RtlAtomTable, ex_handle_table) == 0x10);
+    assert!(core::mem::offset_of!(RtlAtomTable, flags) == 0x18);
+    assert!(core::mem::offset_of!(RtlAtomTable, number_of_buckets) == 0x1c);
+    assert!(core::mem::offset_of!(RtlAtomTable, buckets) == 0x20);
+};
+
+/// `_RTL_ATOM_TABLE_REFERENCE` (0x18 bytes).
+#[repr(C)]
+pub struct RtlAtomTableReference {
+    pub low_box_list: ListEntry,
+    pub low_box_id: Field<u32>,
+    pub reference_count: Field<u16>,
+    pub flags: Field<u16>,
+}
+
+unsafe impl NtStruct for RtlAtomTableReference {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlAtomTableReference>() == 0x18);
+    assert!(core::mem::offset_of!(RtlAtomTableReference, low_box_list) == 0x0);
+    assert!(core::mem::offset_of!(RtlAtomTableReference, low_box_id) == 0x10);
+    assert!(core::mem::offset_of!(RtlAtomTableReference, reference_count) == 0x14);
+    assert!(core::mem::offset_of!(RtlAtomTableReference, flags) == 0x16);
+};
+
+/// `_RTL_ATOM_TABLE_ENTRY` (0x30 bytes).
+#[repr(C)]
+pub struct RtlAtomTableEntry {
+    /// -> `_RTL_ATOM_TABLE_ENTRY`
+    pub hash_link: Field<u64>,
+    pub handle_index: Field<u16>,
+    pub atom: Field<u16>,
+    _pad_c: Reserved<0x4>,
+    pub reference: RtlAtomTableReference,
+    pub name_length: Field<u8>,
+    _pad_29: Reserved<0x1>,
+    pub name: [Field<u16>; 1],
+    _pad_2c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for RtlAtomTableEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlAtomTableEntry>() == 0x30);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, hash_link) == 0x0);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, handle_index) == 0x8);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, atom) == 0xa);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, reference) == 0x10);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, name_length) == 0x28);
+    assert!(core::mem::offset_of!(RtlAtomTableEntry, name) == 0x2a);
+};
+
+/// `_RTL_RANGE_LIST` (0x20 bytes).
+#[repr(C)]
+pub struct RtlRangeList {
+    pub list_head: ListEntry,
+    pub flags: Field<u32>,
+    pub count: Field<u32>,
+    pub stamp: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for RtlRangeList {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlRangeList>() == 0x20);
+    assert!(core::mem::offset_of!(RtlRangeList, list_head) == 0x0);
+    assert!(core::mem::offset_of!(RtlRangeList, flags) == 0x10);
+    assert!(core::mem::offset_of!(RtlRangeList, count) == 0x14);
+    assert!(core::mem::offset_of!(RtlRangeList, stamp) == 0x18);
+};
+
+/// `_RTLP_RANGE_LIST_ENTRY` (0x38 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `RtlpRangeListEntryView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct RtlpRangeListEntry {
+    pub start: Field<u64>,
+    pub end: Field<u64>,
+    pub allocated: RtlpRangeListEntryAllocated,
+    pub attributes: Field<u8>,
+    pub public_flags: Field<u8>,
+    pub private_flags: Field<u16>,
+    _pad_24: Reserved<0x4>,
+    pub list_entry: ListEntry,
+}
+
+/// Vista 1 de `_RTLP_RANGE_LIST_ENTRY` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct RtlpRangeListEntryView1 {
+    _pad_0: Reserved<0x10>,
+    pub merged: RtlpRangeListEntryMerged,
+    _pad_20: Reserved<0x18>,
+}
+
+impl core::ops::Deref for RtlpRangeListEntry {
+    type Target = RtlpRangeListEntryView1;
+    #[inline(always)]
+    fn deref(&self) -> &RtlpRangeListEntryView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<RtlpRangeListEntryView1>() }
+    }
+}
+
+unsafe impl NtStruct for RtlpRangeListEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlpRangeListEntry>() == 0x38);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, start) == 0x0);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, end) == 0x8);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, allocated) == 0x10);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, attributes) == 0x20);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, public_flags) == 0x21);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, private_flags) == 0x22);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, list_entry) == 0x28);
+    assert!(core::mem::size_of::<RtlpRangeListEntryView1>() == 0x38);
+    assert!(core::mem::align_of::<RtlpRangeListEntryView1>() == core::mem::align_of::<RtlpRangeListEntry>());
+    assert!(core::mem::offset_of!(RtlpRangeListEntryView1, merged) == 0x10);
+};
+
+/// `_RTLP_RANGE_LIST_ENTRY::Allocated` (0x10 bytes).
+#[repr(C)]
+pub struct RtlpRangeListEntryAllocated {
+    /// -> `void`
+    pub user_data: Field<u64>,
+    /// -> `void`
+    pub owner: Field<u64>,
+}
+
+unsafe impl NtStruct for RtlpRangeListEntryAllocated {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlpRangeListEntryAllocated>() == 0x10);
+    assert!(core::mem::offset_of!(RtlpRangeListEntryAllocated, user_data) == 0x0);
+    assert!(core::mem::offset_of!(RtlpRangeListEntryAllocated, owner) == 0x8);
+};
+
+/// `_RTLP_RANGE_LIST_ENTRY::Merged` (0x10 bytes).
+#[repr(C)]
+pub struct RtlpRangeListEntryMerged {
+    pub list_head: ListEntry,
+}
+
+unsafe impl NtStruct for RtlpRangeListEntryMerged {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlpRangeListEntryMerged>() == 0x10);
+    assert!(core::mem::offset_of!(RtlpRangeListEntryMerged, list_head) == 0x0);
+};

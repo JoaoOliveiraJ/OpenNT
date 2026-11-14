@@ -15,7 +15,7 @@ use crate::ntos::se::token::{statistics as token_statistics, tokens};
 use crate::rtl::KernelError;
 use crate::ntos::alpc::message::buffer::{read_field, write_block, write_field};
 use crate::ntos::inc::types::extra_ob_alpc::PortMessage32;
-use crate::ntos::inc::types::{AlpcMessageHandleInformation, NtStruct, PortMessage, PortMessageView1};
+use crate::ntos::inc::types::{AlpcMessageHandleInformation, NtStruct, PortMessage, PortMessage32View1, PortMessageView1};
 use core::mem::offset_of;
 
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -34,7 +34,7 @@ fn capture_selection(message: u64, mode: u8) -> Result<(u32, u32), u32> {
     }
     let compact = read_field::<u16>(message, type_offset)? & 0x1000 != 0;
     let (identifier, callback) = if compact {
-        (offset_of!(PortMessage32, message_id), offset_of!(PortMessage32, callback_id))
+        (offset_of!(PortMessage32, message_id), offset_of!(PortMessage32View1, callback_id))
     } else {
         (offset_of!(PortMessage, message_id), offset_of!(PortMessageView1, callback_id))
     };

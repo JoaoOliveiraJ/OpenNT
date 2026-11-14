@@ -54,7 +54,7 @@ fn check_flags(lock: &ExPushLockAutoExpand, flags: u32) {
 /// O caminho em leque (ExpAcquire/ReleaseFannedOutPushLock*) só existe com
 /// State.Expanded, que o OpenNT nunca liga.
 fn ensure_local(lock: &ExPushLockAutoExpand) -> Result<(), KernelError> {
-    if lock.expanded() != 0 {
+    if lock.state.expanded() != 0 {
         return Err(KernelError::new("EX_PUSH_LOCK_AUTO_EXPAND expandido sem tabela em leque"));
     }
     Ok(())
@@ -64,9 +64,9 @@ fn ensure_local(lock: &ExPushLockAutoExpand) -> Result<(), KernelError> {
 pub fn initialize(lock: &ExPushLockAutoExpand, flags: u32) {
     push_lock::initialize(lock.local_lock.address());
     lock.stats.set(0);
-    lock.state.set(0);
+    lock.state.value.set(0);
     if flags & NONPAGED == 0 {
-        lock.set_pageable(1);
+        lock.state.set_pageable(1);
     }
 }
 

@@ -1,21 +1,23 @@
-//! Estruturas públicas do FsRtl ausentes do conjunto gerado (`ntifs.h` /
-//! `winioctl.h` do WDK; `_ECP_LIST` e `_FSRTL_ADVANCED_FCB_HEADER` conferem
-//! com o `ntkrnlmp.pdb` 19041), no estilo de `inc/types`: `#[repr(C)]` de
-//! células, tamanhos e offsets conferidos em compilação.
+//! Estruturas públicas do FsRtl que os símbolos do ntoskrnl não têm
+//! (`ntifs.h` / `winioctl.h` do WDK), no estilo de `inc/types`: `#[repr(C)]`
+//! de células, tamanhos e offsets conferidos em compilação.
 //!
 //! - `FsrtlCommonFcbHeader` — FSRTL_COMMON_FCB_HEADER (ntifs.h), 0x30
-//! - `FsrtlAdvancedFcbHeader` — FSRTL_ADVANCED_FCB_HEADER (ntifs.h; PDB), 0x68
 //! - `FileLockInfo` — FILE_LOCK_INFO (ntifs.h), 0x30
 //! - `FileLock` — FILE_LOCK (ntifs.h), 0x60
-//! - `EcpList` — _ECP_LIST (PDB; opaco no ntifs.h), 0x18
 //! - `FsrtlPerStreamContext` — FSRTL_PER_STREAM_CONTEXT (ntifs.h), 0x28
 //! - `FsrtlPerFileContext` — FSRTL_PER_FILE_CONTEXT (ntifs.h), 0x28
 //! - `FsrtlPerFileobjectContext` — FSRTL_PER_FILEOBJECT_CONTEXT (ntifs.h), 0x20
 //! - `OplockKeyContext` — OPLOCK_KEY_CONTEXT (ntifs.h), 0x28
 //! - `RequestOplockInputBuffer` — REQUEST_OPLOCK_INPUT_BUFFER (winioctl.h), 0xC
+//!
+//! `_FSRTL_ADVANCED_FCB_HEADER` e `_ECP_LIST` constam dos símbolos e são
+//! geradas (`types/io.rs`); ficam reexportadas aqui.
 
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::{Guid, LargeInteger, ListEntry};
+
+pub use super::{EcpList, FsrtlAdvancedFcbHeader};
 
 /// FSRTL_COMMON_FCB_HEADER (ntifs.h).
 #[repr(C)]
@@ -60,66 +62,6 @@ const _: () = {
     assert!(core::mem::offset_of!(FsrtlCommonFcbHeader, allocation_size) == 0x18);
     assert!(core::mem::offset_of!(FsrtlCommonFcbHeader, file_size) == 0x20);
     assert!(core::mem::offset_of!(FsrtlCommonFcbHeader, valid_data_length) == 0x28);
-};
-
-/// FSRTL_ADVANCED_FCB_HEADER (ntifs.h): o cabeçalho comum e as extensões de
-/// filtros (PDB `_FSRTL_ADVANCED_FCB_HEADER`, 0x68, campos achatados).
-#[repr(C)]
-pub struct FsrtlAdvancedFcbHeader {
-    pub node_type_code: Field<i16>,
-    pub node_byte_size: Field<i16>,
-    pub flags: Field<u8>,
-    pub is_fast_io_possible: Field<u8>,
-    pub flags2: Field<u8>,
-    /// `Reserved : 4`, `Version : 4`.
-    pub bitfield_7: Field<u8>,
-    /// -> `_ERESOURCE`
-    pub resource: Field<u64>,
-    /// -> `_ERESOURCE`
-    pub paging_io_resource: Field<u64>,
-    pub allocation_size: LargeInteger,
-    pub file_size: LargeInteger,
-    pub valid_data_length: LargeInteger,
-    /// -> `_FAST_MUTEX`
-    pub fast_mutex: Field<u64>,
-    pub filter_contexts: ListEntry,
-    /// EX_PUSH_LOCK (acesso atômico).
-    pub push_lock: Field<u64>,
-    /// -> `PVOID` (o `PerFileContextPointer`)
-    pub file_context_support_pointer: Field<u64>,
-    /// `Oplock` / `ReservedForRemote` (união).
-    pub oplock: Field<u64>,
-    /// -> `void`
-    pub reserved_context: Field<u64>,
-}
-
-unsafe impl NtStruct for FsrtlAdvancedFcbHeader {}
-
-impl FsrtlAdvancedFcbHeader {
-    /// `Version`: bits 4..=7 de `bitfield_7`.
-    pub const VERSION_SHIFT: u32 = 4;
-    pub const VERSION_MASK: u32 = 0xF0;
-    #[inline(always)]
-    pub fn version(&self) -> u32 {
-        self.bitfield_7.bits(4, 4) as u32
-    }
-    #[inline(always)]
-    pub fn set_version(&self, value: u32) {
-        self.bitfield_7.set_bits(4, 4, value as u64)
-    }
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<FsrtlAdvancedFcbHeader>() == 0x68);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, flags2) == 0x6);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, bitfield_7) == 0x7);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, file_size) == 0x20);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, fast_mutex) == 0x30);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, filter_contexts) == 0x38);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, push_lock) == 0x48);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, file_context_support_pointer) == 0x50);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, oplock) == 0x58);
-    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, reserved_context) == 0x60);
 };
 
 /// FILE_LOCK_INFO (ntifs.h).
@@ -179,22 +121,6 @@ const _: () = {
     assert!(core::mem::offset_of!(FileLock, last_returned_lock_info) == 0x20);
     assert!(core::mem::offset_of!(FileLock, last_returned_lock) == 0x50);
     assert!(core::mem::offset_of!(FileLock, lock_requests_in_progress) == 0x58);
-};
-
-/// _ECP_LIST (PDB; o ECP_LIST é opaco no ntifs.h).
-#[repr(C)]
-pub struct EcpList {
-    pub signature: Field<u32>,
-    pub flags: Field<u32>,
-    pub ecp_list: ListEntry,
-}
-
-unsafe impl NtStruct for EcpList {}
-
-const _: () = {
-    assert!(core::mem::size_of::<EcpList>() == 0x18);
-    assert!(core::mem::offset_of!(EcpList, flags) == 0x4);
-    assert!(core::mem::offset_of!(EcpList, ecp_list) == 0x8);
 };
 
 /// FSRTL_PER_STREAM_CONTEXT (ntifs.h).

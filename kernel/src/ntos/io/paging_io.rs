@@ -162,7 +162,7 @@ pub fn page_read(request: &PagingRequest<'_>, file_tags: u64, descriptor_tags: u
         // SAFETY: IrpExtension aponta para as duas stack locations reservadas.
         let extension = unsafe { IopIrpExtension::at(irp.irp_extension().get()) };
         extension.types_allocated.set(extension.types_allocated.get() | DRIVER_FLAGS_TYPE);
-        extension.driver_flags.set(extension.driver_flags.get() | DRIVER_FLAGS_TAGGED_READ);
+        extension.driver_flags.value.set(extension.driver_flags.value.get() | DRIVER_FLAGS_TAGGED_READ);
     }
     request.io_status.information.set(packet);
     Ok(dispatch(device, packet))

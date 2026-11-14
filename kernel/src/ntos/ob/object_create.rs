@@ -181,7 +181,7 @@ fn capture(probe_mode: u8, owner_mode: u8, attributes: u64, create_info: u64) ->
     if attributes == 0 {
         return Ok(CapturedName::default());
     }
-    create.probe_mode.set(probe_mode);
+    create.probe_mode.set(probe_mode as i8);
     let probe = probe_mode != 0 && thread_previous_mode() != 0;
     if probe && (attributes & 7 != 0 || attributes >= USER_PROBE_LIMIT) {
         return Err(if attributes & 7 != 0 { STATUS_DATATYPE_MISALIGNMENT } else { STATUS_ACCESS_VIOLATION });

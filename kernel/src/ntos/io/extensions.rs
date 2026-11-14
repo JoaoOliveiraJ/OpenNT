@@ -177,7 +177,9 @@ pub fn allocate_irp_extension(irp: u64, kind: u32) -> Result<u64, KernelError> {
     if flags & IRP_EXTENSION_INLINE != 0 {
         // A genérica embutida (dword em +0xC8) migra para a extensão.
         types |= 1 << IRP_EXTENSION_GENERIC;
-        extension.generic_extension.set(current as u32);
+        for (cell, byte) in extension.generic_extension.iter().zip((current as u32).to_le_bytes()) {
+            cell.set(byte);
+        }
         packet.allocation_flags.set((flags & 0x3F) | IRP_EXTENSION_ALLOCATED);
     } else {
         packet.allocation_flags.set(flags | IRP_EXTENSION_ALLOCATED);
@@ -280,7 +282,7 @@ pub fn set_fs_track_offset_state(irp: u64, blob: u64, tracked_offset: u64) -> Re
     }
     let extension = extension_at(address);
     extension.fs_track_offset_blob.set(blob);
-    extension.fs_tracked_offset.set(tracked_offset);
+    extension.fs_tracked_offset.set(tracked_offset as i64);
     Ok(STATUS_SUCCESS)
 }
 
@@ -291,7 +293,7 @@ pub fn copy_information(irp: u64, output: u64) -> u32 {
         return STATUS_NOT_FOUND;
     }
     let source = &extension_at(irp_extension(irp)).copy_information;
-    guest::write_bytes(output, &guest::read_bytes(source[0].address(), 16));
+    guest::write_bytes(output, &guest::read_bytes(source.address(), 16));
     STATUS_SUCCESS
 }
 

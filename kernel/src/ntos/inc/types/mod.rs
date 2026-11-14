@@ -33,6 +33,7 @@ pub use crate::ntos::inc::field::{Field, NtStruct, Reserved, UnalignedField};
 use crate::ntos::mm::guest_memory::GuestScalar;
 
 mod alpc;
+mod cc;
 mod cm;
 mod etw;
 mod ex;
@@ -48,6 +49,7 @@ mod se;
 mod wdk;
 
 pub use alpc::*;
+pub use cc::*;
 pub use cm::*;
 pub use etw::*;
 pub use ex::*;

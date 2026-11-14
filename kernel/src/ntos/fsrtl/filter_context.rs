@@ -196,7 +196,7 @@ fn with_push_lock<T>(lock: &Field<u64>, shared: bool, body: impl FnOnce() -> T) 
 /// apontado (Version 0).
 fn with_header_lock<T>(header: &FsrtlAdvancedFcbHeader, shared: bool, body: impl FnOnce() -> T) -> Result<T, KernelError> {
     if header.version() >= 1 {
-        return with_push_lock(&header.push_lock, shared, body);
+        return with_push_lock(&header.push_lock.value, shared, body);
     }
     let mutex = header.fast_mutex.get();
     fast_mutex::acquire(mutex)?;

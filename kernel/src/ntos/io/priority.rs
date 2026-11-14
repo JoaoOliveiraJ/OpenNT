@@ -12,7 +12,7 @@ use core::sync::atomic::Ordering;
 
 use crate::ntos::init::exports::invoke_handler;
 use crate::ntos::inc::types::extra_fs_fat::IoPriorityInfo;
-use crate::ntos::inc::types::{Eprocess, Ethread, FileObject, Irp, NtStruct};
+use crate::ntos::inc::types::{Eprocess, Ethread, FileObject, IoPriorityHint, Irp, NtStruct};
 use crate::ntos::io::extensions;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
@@ -87,7 +87,7 @@ pub fn irp_priority_hint(irp: &Irp) -> u32 {
 
 /// IoRetrievePriorityInfo(Irp, FileObject, Thread, PriorityInfo) (RVA 0x256230).
 pub fn retrieve_priority_info(irp: Option<&Irp>, file: Option<&FileObject>, thread: Option<&Ethread>, info: &IoPriorityInfo) -> u32 {
-    info.io_priority.set(IO_PRIORITY_NORMAL);
+    info.io_priority.set(IoPriorityHint::IO_PRIORITY_NORMAL);
     let file_hint = file.map_or(0, extensions::file_object_priority_hint);
     let io_priority = match irp {
         Some(irp) if irp.flags.get() & IRP_PRIORITY_MASK != 0 => Some(irp_priority_hint(irp)),
@@ -95,7 +95,7 @@ pub fn retrieve_priority_info(irp: Option<&Irp>, file: Option<&FileObject>, thre
         _ => thread.map(thread_io_priority),
     };
     if let Some(priority) = io_priority {
-        info.io_priority.set(priority);
+        info.io_priority.set(IoPriorityHint(priority as i32));
     }
     let Some(thread) = thread else {
         info.thread_priority.set(u32::MAX);
@@ -119,7 +119,7 @@ pub fn apply_priority_info(input: &IoPriorityInfo, output: Option<&IoPriorityInf
     if thread_priority == 0xFFFF {
         return Ok(STATUS_INVALID_PARAMETER_1);
     }
-    let previous_io = set_thread_io_priority(thread, input.io_priority.get());
+    let previous_io = set_thread_io_priority(thread, input.io_priority.get().0 as u32);
     let page = input.page_priority.get();
     let previous_page = if page != u32::MAX { set_thread_page_priority(thread, page) } else { u32::MAX };
     let previous_thread = if thread_priority != u32::MAX {
@@ -133,7 +133,7 @@ pub fn apply_priority_info(input: &IoPriorityInfo, output: Option<&IoPriorityInf
         output.size.set(IoPriorityInfo::SIZE as u32);
         output.thread_priority.set(previous_thread);
         output.page_priority.set(previous_page);
-        output.io_priority.set(previous_io);
+        output.io_priority.set(IoPriorityHint(previous_io as i32));
     }
     Ok(STATUS_SUCCESS)
 }

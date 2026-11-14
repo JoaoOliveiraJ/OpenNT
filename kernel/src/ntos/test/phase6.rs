@@ -7260,7 +7260,7 @@ fn fsrtl_filter_contexts_exports(assert: Assert) {
     header.set_version(1);
     header.filter_contexts.flink.set(header.filter_contexts.address());
     header.filter_contexts.blink.set(header.filter_contexts.address());
-    header.push_lock.set(0);
+    header.push_lock.value.set(0);
     let (s1, s2) = (make(0xA, 1), make(0xB, 2));
     assert(
         call_export("FsRtlInsertPerStreamContext", &[header_address, s1]) == Some(0) && call_export("FsRtlInsertPerStreamContext", &[header_address, s2]) == Some(0),
@@ -8303,7 +8303,7 @@ fn fsrtl_volume_support_exports(assert: Assert) {
     context.free_callback.set(callback);
     call_export("FsRtlTeardownPerStreamContexts", &[header_address]);
     assert(
-        FREED.load(Ordering::SeqCst) == context_address && header.filter_contexts.flink.get() == head && header.push_lock.get() == 0,
+        FREED.load(Ordering::SeqCst) == context_address && header.filter_contexts.flink.get() == head && header.push_lock.value.get() == 0,
         "fsrtl-volume-support: FsRtlTeardownPerStreamContexts",
     );
     // CreateSectionForDataScan: proteção e atributos validados antes de tocar no arquivo.
@@ -8326,15 +8326,15 @@ fn ex_auto_expand_push_lock_exports(assert: Assert) {
     let lock = guest::alloc_bytes(ExPushLockAutoExpand::SIZE);
     let body = at::<ExPushLockAutoExpand>(lock);
     body.local_lock.value.set(0xDEAD);
-    body.state.set(0xFFFF_FFFF);
+    body.state.value.set(0xFFFF_FFFF);
     body.stats.set(0xFFFF_FFFF);
     call_export("ExInitializeAutoExpandPushLock", &[lock, 0]);
     assert(
-        body.local_lock.value.get() == 0 && body.state.get() == 4 && body.pageable() == 1 && body.stats.get() == 0,
+        body.local_lock.value.get() == 0 && body.state.value.get() == 4 && body.state.pageable() == 1 && body.stats.get() == 0,
         "ex-auto-expand: Initialize paginavel -> State = Pageable (4)",
     );
     call_export("ExInitializeAutoExpandPushLock", &[lock, 1]);
-    assert(body.state.get() == 0, "ex-auto-expand: Initialize NONPAGED -> State = 0");
+    assert(body.state.value.get() == 0, "ex-auto-expand: Initialize NONPAGED -> State = 0");
 
     // Compartilhado: token = Lock | 1 (LocalLock) | 2 (AutoBoost, sem o flag 2).
     let token = call_export("ExAcquireAutoExpandPushLockShared", &[lock, 0]);
@@ -8544,16 +8544,16 @@ fn io_priority_exports(assert: Assert) {
     thread.io_boost_count.set(0);
     call_export("IoRetrievePriorityInfo", &[0, 0, thread_address, info_address]);
     let base = thread.tcb.base_priority.get() as i32 as u32;
-    assert(info.io_priority.get() == 1 && info.thread_priority.get() == base && info.page_priority.get() == thread.thread_page_priority(), "io-priority: IoRetrievePriorityInfo da thread");
+    assert(info.io_priority.get().0 == 1 && info.thread_priority.get() == base && info.page_priority.get() == thread.thread_page_priority(), "io-priority: IoRetrievePriorityInfo da thread");
     // Sem IRP, arquivo nem thread: Normal e -1/-1.
     call_export("IoRetrievePriorityInfo", &[0, 0, 0, info_address]);
-    assert(info.io_priority.get() == 2 && info.thread_priority.get() == u32::MAX && info.page_priority.get() == u32::MAX, "io-priority: IoRetrievePriorityInfo vazio");
+    assert(info.io_priority.get().0 == 2 && info.thread_priority.get() == u32::MAX && info.page_priority.get() == u32::MAX, "io-priority: IoRetrievePriorityInfo vazio");
 
     // IRP com dica 3 (Flags bits 17..19 = 4) vence a thread.
     let irp_address = guest::alloc_bytes(nt::Irp::SIZE);
     at::<nt::Irp>(irp_address).flags.set(4 << 17);
     call_export("IoRetrievePriorityInfo", &[irp_address, 0, thread_address, info_address]);
-    assert(info.io_priority.get() == 3, "io-priority: dica do IRP");
+    assert(info.io_priority.get().0 == 3, "io-priority: dica do IRP");
 
     // Dica no FILE_OBJECT: extensão alocada, FoIoPriorityHint = dica + 1.
     let file_address = guest::alloc_bytes(nt::FileObject::SIZE);
@@ -8561,7 +8561,7 @@ fn io_priority_exports(assert: Assert) {
     let extension = at::<nt::FileObject>(file_address).file_object_extension.get();
     call_export("IoRetrievePriorityInfo", &[0, file_address, 0, info_address]);
     assert(
-        hinted == Some(0) && extension != 0 && at::<nt::IopFileObjectExtension>(extension).fo_io_priority_hint.get().0 == 5 && info.io_priority.get() == 4,
+        hinted == Some(0) && extension != 0 && at::<nt::IopFileObjectExtension>(extension).fo_io_priority_hint.get().0 == 5 && info.io_priority.get().0 == 4,
         "io-priority: dica no FILE_OBJECT",
     );
 
@@ -8569,10 +8569,10 @@ fn io_priority_exports(assert: Assert) {
     info.size.set(0x10);
     info.thread_priority.set(u32::MAX);
     info.page_priority.set(u32::MAX);
-    info.io_priority.set(2);
+    info.io_priority.set(nt::IoPriorityHint(2));
     let applied = call_export("IoApplyPriorityInfoThread", &[info_address, output_address, thread_address]);
     assert(
-        applied == Some(0) && output.size.get() == 0x10 && output.thread_priority.get() == u32::MAX && output.page_priority.get() == u32::MAX && output.io_priority.get() == 1 && thread.thread_io_priority() == 2,
+        applied == Some(0) && output.size.get() == 0x10 && output.thread_priority.get() == u32::MAX && output.page_priority.get() == u32::MAX && output.io_priority.get().0 == 1 && thread.thread_io_priority() == 2,
         "io-priority: IoApplyPriorityInfoThread",
     );
     info.thread_priority.set(0xFFFF);
@@ -11146,7 +11146,7 @@ fn po_device_wake_exports(assert: Assert) {
     let wake = || call_export("PoGetSystemWake", &[packet]).map(|value| value & 0xFF);
     assert(wake() == Some(0), "po-device-wake: IRP sem marca");
     let _ = call_export("PoSetSystemWake", &[packet]);
-    assert(block.device_system_wake.get() == 1 && wake() == Some(1), "po-device-wake: PoSetSystemWake marca o WAIT_WAKE");
+    assert(block.device.system_wake.get() == 1 && wake() == Some(1), "po-device-wake: PoSetSystemWake marca o WAIT_WAKE");
     block.minor_function.set(2); // IRP_MN_SET_POWER
     assert(wake() == Some(0), "po-device-wake: bloco de outro IRP de energia devolve FALSE");
     last.context.set(0);
@@ -11213,11 +11213,11 @@ fn whea_error_source_exports(assert: Assert) {
     let descriptor_address = call_export("WheaGetErrorSource", &[id as u64]).unwrap_or(0);
     let descriptor = at::<WheaErrorSourceDescriptor>(descriptor_address);
     assert(
-        descriptor_address != 0 && descriptor.type_.get() == 0x10 && descriptor.state.get() == 2 && descriptor.error_source_id.get() == id && descriptor.max_sections_per_record.get() == 3 && descriptor.max_raw_data_length.get() == 0x300,
+        descriptor_address != 0 && descriptor.type_.get().0 == 0x10 && descriptor.state.get().0 == 2 && descriptor.error_source_id.get() == id && descriptor.max_sections_per_record.get() == 3 && descriptor.max_raw_data_length.get() == 0x300,
         "whea-error-source: descritor DeviceDriver iniciado com o id",
     );
-    let info = &descriptor.device_driver;
-    assert(info.initialize.get() == initialize && info.uninitialize.get() == uninitialize && info.log_tag.get() == 0x5354 && info.max_section_data_length.get() == 0x100 && info.creator_id.data1.get() == 0x5721_7C8D, "whea-error-source: Info e o WHEA_DEVICE_DRIVER_DESCRIPTOR do NT");
+    let info = &descriptor.info.device_driver_descriptor;
+    assert(info.config.initialize.get() == initialize && info.config.uninitialize.get() == uninitialize && info.log_tag.get() == 0x5354 && info.max_section_data_length.get() == 0x100 && info.creator_id.data1.get() == 0x5721_7C8D, "whea-error-source: Info e o WHEA_DEVICE_DRIVER_DESCRIPTOR do NT");
     // Relatório corrigido aceito; fonte inexistente = STATUS_INSUFFICIENT_RESOURCES.
     let data = guest::alloc_bytes(16);
     let guid = guest::alloc_bytes(16);
@@ -11236,7 +11236,7 @@ fn whea_error_source_exports(assert: Assert) {
     let hest_address = guest::alloc_bytes(WheaErrorSourceDescriptor::SIZE);
     let hest = at::<WheaErrorSourceDescriptor>(hest_address);
     hest.length.set(WheaErrorSourceDescriptor::SIZE as u32);
-    hest.type_.set(6);
+    hest.type_.set(nt::WheaErrorSourceType(6));
     assert(call_export("WheaAddErrorSource", &[hest_address, 0]) == Some(signed_status(0xC000_00BB)), "whea-error-source: fonte HEST = STATUS_NOT_SUPPORTED");
     // Configuração por tipo.
     assert(call_export("WheaConfigureErrorSource", &[0x11, 0]) == Some(signed_status(0xC000_000D)), "whea-error-source: tipo invalido recusado");
@@ -11249,7 +11249,7 @@ fn whea_error_source_exports(assert: Assert) {
     let first = call_export("WheaInitializeRecordHeader", &[header_address]);
     let record = header.record_id.get();
     assert(
-        first == Some(0) && header.signature.get() == 0x5245_5043 && header.revision.get() == 0x210 && header.signature_end.get() == 0xFFFF_FFFF && header.severity.get() == 3 && header.valid_bits.get() == 2 && header.timestamp.precise.get() == 0 && header.flags.get() == 0 && header.creator_id.data1.get() == 0xCF07_C4BD,
+        first == Some(0) && header.signature.get() == 0x5245_5043 && header.revision.as_ushort.get() == 0x210 && header.signature_end.get() == 0xFFFF_FFFF && header.severity.get().0 == 3 && header.valid_bits.as_ulong.get() == 2 && header.timestamp.precise() == 0 && header.flags.as_ulong.get() == 0 && header.creator_id.data1.get() == 0xCF07_C4BD,
         "whea-error-source: cabecalho CPER 2.10 com timestamp",
     );
     let _ = call_export("WheaInitializeRecordHeader", &[header_address]);

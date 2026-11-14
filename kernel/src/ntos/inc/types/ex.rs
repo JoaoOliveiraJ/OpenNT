@@ -1199,3 +1199,69 @@ const _: () = {
     assert!(core::mem::offset_of!(ExtSetParametersV0, reserved) == 0x4);
     assert!(core::mem::offset_of!(ExtSetParametersV0, no_wake_tolerance) == 0x8);
 };
+
+/// `_EX_PUSH_LOCK_AUTO_EXPAND` (0x10 bytes).
+#[repr(C)]
+pub struct ExPushLockAutoExpand {
+    pub local_lock: ExPushLock,
+    pub state: ExPushLockAutoExpandState,
+    pub stats: Field<u32>,
+}
+
+unsafe impl NtStruct for ExPushLockAutoExpand {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ExPushLockAutoExpand>() == 0x10);
+    assert!(core::mem::offset_of!(ExPushLockAutoExpand, local_lock) == 0x0);
+    assert!(core::mem::offset_of!(ExPushLockAutoExpand, state) == 0x8);
+    assert!(core::mem::offset_of!(ExPushLockAutoExpand, stats) == 0xc);
+};
+
+/// `_EX_PUSH_LOCK_AUTO_EXPAND_STATE` (0x4 bytes).
+#[repr(C)]
+pub struct ExPushLockAutoExpandState {
+    pub value: Field<u32>,
+}
+
+unsafe impl NtStruct for ExPushLockAutoExpandState {}
+
+impl ExPushLockAutoExpandState {
+    /// `Expanded`: bits 0..=0 de `value`.
+    pub const EXPANDED_SHIFT: u32 = 0;
+    pub const EXPANDED_MASK: u32 = 0x1;
+    #[inline(always)]
+    pub fn expanded(&self) -> u32 {
+        self.value.bits(0, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_expanded(&self, value: u32) {
+        self.value.set_bits(0, 1, value as u64)
+    }
+    /// `Transitioning`: bits 1..=1 de `value`.
+    pub const TRANSITIONING_SHIFT: u32 = 1;
+    pub const TRANSITIONING_MASK: u32 = 0x2;
+    #[inline(always)]
+    pub fn transitioning(&self) -> u32 {
+        self.value.bits(1, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_transitioning(&self, value: u32) {
+        self.value.set_bits(1, 1, value as u64)
+    }
+    /// `Pageable`: bits 2..=2 de `value`.
+    pub const PAGEABLE_SHIFT: u32 = 2;
+    pub const PAGEABLE_MASK: u32 = 0x4;
+    #[inline(always)]
+    pub fn pageable(&self) -> u32 {
+        self.value.bits(2, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_pageable(&self, value: u32) {
+        self.value.set_bits(2, 1, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ExPushLockAutoExpandState>() == 0x4);
+    assert!(core::mem::offset_of!(ExPushLockAutoExpandState, value) == 0x0);
+};

@@ -1,13 +1,11 @@
-//! Estruturas usadas pelo suporte ao ntfs.sys / exfat.sys que não constam do
-//! conjunto gerado de `inc/types` nem de `wdk.rs`.
+//! Estruturas usadas pelo suporte ao ntfs.sys / exfat.sys que os símbolos
+//! do ntoskrnl não têm (nem `wdk.rs`).
 //!
 //! Mantido à mão no estilo de `wdk.rs`: `#[repr(C)]`, folhas `Field<T>`,
 //! ponteiros como `Field<u64>` com o tipo apontado no comentário, layout x64
 //! conferido em compilação. Origem de cada uma:
 //!
 //! - `BaseMcb` — BASE_MCB (ntifs.h), 0x18
-//! - `ExPushLockAutoExpand` — _EX_PUSH_LOCK_AUTO_EXPAND (ntkrnlmp.pdb, fora do
-//!   conjunto gerado), 0x10
 //! - `RtlBitmapRun` — RTL_BITMAP_RUN (wdm.h), 0x8
 //! - `RtlModuleBasicInfo` / `RtlModuleExtendedInfo` — RTL_MODULE_BASIC_INFO /
 //!   RTL_MODULE_EXTENDED_INFO (aux_klib.h), 0x8 / 0x110
@@ -16,16 +14,17 @@
 //! - `FileFullEaInformation` / `FileQuotaInformation` — FILE_FULL_EA_INFORMATION
 //!   (wdm.h) / FILE_QUOTA_INFORMATION (ntifs.h), 0xC / 0x38
 //! - `ShareAccess` / `LinkShareAccess` — SHARE_ACCESS / LINK_SHARE_ACCESS (wdm.h), 0x1C / 0xC
-//! - `IopIrpExtension` — _IOP_IRP_EXTENSION (ntkrnlmp.pdb, fora do conjunto
-//!   gerado), 0x50
 //! - `ReparseDataBuffer` (+ vistas) / `ReparseGuidDataBuffer` —
 //!   REPARSE_DATA_BUFFER / REPARSE_GUID_DATA_BUFFER (ntifs.h), 0x18 / 0x1C
 //!
-//! FSRTL_ADVANCED_FCB_HEADER e FSRTL_PER_FILE_CONTEXT vêm de `extra_fsrtl.rs`
-//! e TUNNEL de `extra_fs_fat.rs` (não duplicados aqui).
-// extra_fs_ntfs: gerado por merge_extra_fs_ntfs.py
+//! FSRTL_PER_FILE_CONTEXT vem de `extra_fsrtl.rs` e TUNNEL de
+//! `extra_fs_fat.rs` (não duplicados aqui). `_EX_PUSH_LOCK_AUTO_EXPAND` e
+//! `_IOP_IRP_EXTENSION` constam dos símbolos e são geradas (`types/ex.rs`,
+//! `io.rs`); ficam reexportadas aqui.
 
 use super::*;
+
+pub use super::{ExPushLockAutoExpand, IopIrpExtension};
 
 // ---- main ----
 
@@ -53,62 +52,6 @@ const _: () = {
     assert!(core::mem::offset_of!(BaseMcb, pool_type) == 0x8);
     assert!(core::mem::offset_of!(BaseMcb, flags) == 0xa);
     assert!(core::mem::offset_of!(BaseMcb, mapping) == 0x10);
-};
-
-/// `_EX_PUSH_LOCK_AUTO_EXPAND` (0x10 bytes; consta do ntkrnlmp.pdb mas fora
-/// do conjunto gerado). `State` é `_EX_PUSH_LOCK_AUTO_EXPAND_STATE`
-/// (Expanded:1, Transitioning:1, Pageable:1, o resto = ponteiro da tabela em
-/// leque & ~7).
-#[repr(C)]
-pub struct ExPushLockAutoExpand {
-    pub local_lock: ExPushLock,
-    pub state: Field<u32>,
-    pub stats: Field<u32>,
-}
-
-unsafe impl NtStruct for ExPushLockAutoExpand {}
-
-impl ExPushLockAutoExpand {
-    /// `State.Expanded`: bits 0..=0 de `state`.
-    pub const EXPANDED_SHIFT: u32 = 0;
-    pub const EXPANDED_MASK: u32 = 0x1;
-    #[inline(always)]
-    pub fn expanded(&self) -> u32 {
-        self.state.bits(0, 1) as u32
-    }
-    #[inline(always)]
-    pub fn set_expanded(&self, value: u32) {
-        self.state.set_bits(0, 1, value as u64)
-    }
-    /// `State.Transitioning`: bits 1..=1 de `state`.
-    pub const TRANSITIONING_SHIFT: u32 = 1;
-    pub const TRANSITIONING_MASK: u32 = 0x2;
-    #[inline(always)]
-    pub fn transitioning(&self) -> u32 {
-        self.state.bits(1, 1) as u32
-    }
-    #[inline(always)]
-    pub fn set_transitioning(&self, value: u32) {
-        self.state.set_bits(1, 1, value as u64)
-    }
-    /// `State.Pageable`: bits 2..=2 de `state`.
-    pub const PAGEABLE_SHIFT: u32 = 2;
-    pub const PAGEABLE_MASK: u32 = 0x4;
-    #[inline(always)]
-    pub fn pageable(&self) -> u32 {
-        self.state.bits(2, 1) as u32
-    }
-    #[inline(always)]
-    pub fn set_pageable(&self, value: u32) {
-        self.state.set_bits(2, 1, value as u64)
-    }
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<ExPushLockAutoExpand>() == 0x10);
-    assert!(core::mem::offset_of!(ExPushLockAutoExpand, local_lock) == 0x0);
-    assert!(core::mem::offset_of!(ExPushLockAutoExpand, state) == 0x8);
-    assert!(core::mem::offset_of!(ExPushLockAutoExpand, stats) == 0xc);
 };
 
 // ---- A ----
@@ -335,46 +278,6 @@ const _: () = {
     assert!(core::mem::size_of::<LinkShareAccess>() == 0xC);
     assert!(core::mem::offset_of!(LinkShareAccess, deleters) == 0x4);
     assert!(core::mem::offset_of!(LinkShareAccess, shared_deleters) == 0x8);
-};
-
-/// `_IOP_IRP_EXTENSION` (ntkrnlmp.pdb 19041, tipo privado do I/O Manager que
-/// o gerador não emitiu): o bloco apontado por `Irp->IrpExtension`
-/// (`extra_io::IrpExtensionField`). `TypesAllocated` é o bitmap dos tipos
-/// (1 Timestamp, 2 genérica, 4 ZeroingOffset, 5 FsTrackOffset, 6 atribuição de
-/// disco, 7 AdapterCryptoParameters, 8 DriverFlags, 9 CopyInformation).
-#[repr(C)]
-pub struct IopIrpExtension {
-    /// Bits: Allocated (0), PropagateId (1), SpareBits (2..15).
-    pub extension_flags: Field<u16>,
-    pub types_allocated: Field<u16>,
-    pub generic_extension: Field<u32>,
-    /// -> `void`
-    pub verifier_context: Field<u64>,
-    pub disk_io_attribution_handle: Field<u64>,
-    pub activity_id: Guid,
-    /// União em +0x28: `Timestamp` (LARGE_INTEGER), `ZeroingOffset` (ULONG),
-    /// `FsTrackOffsetBlob` (-> `IO_IRP_EXT_TRACK_OFFSET_HEADER`, este campo) e
-    /// o início de `AdapterCryptoParameters` (16 bytes).
-    pub fs_track_offset_blob: Field<u64>,
-    /// `FsTrackedOffset` (LONGLONG), parceiro do blob na mesma união.
-    pub fs_tracked_offset: Field<u64>,
-    pub driver_flags: Field<u64>,
-    /// `_COPY_INFORMATION` (16 bytes).
-    pub copy_information: [Field<u64>; 2],
-}
-
-unsafe impl NtStruct for IopIrpExtension {}
-
-const _: () = {
-    assert!(core::mem::size_of::<IopIrpExtension>() == 0x50);
-    assert!(core::mem::offset_of!(IopIrpExtension, types_allocated) == 0x2);
-    assert!(core::mem::offset_of!(IopIrpExtension, generic_extension) == 0x4);
-    assert!(core::mem::offset_of!(IopIrpExtension, verifier_context) == 0x8);
-    assert!(core::mem::offset_of!(IopIrpExtension, activity_id) == 0x18);
-    assert!(core::mem::offset_of!(IopIrpExtension, fs_track_offset_blob) == 0x28);
-    assert!(core::mem::offset_of!(IopIrpExtension, fs_tracked_offset) == 0x30);
-    assert!(core::mem::offset_of!(IopIrpExtension, driver_flags) == 0x38);
-    assert!(core::mem::offset_of!(IopIrpExtension, copy_information) == 0x40);
 };
 
 // ---- D ----

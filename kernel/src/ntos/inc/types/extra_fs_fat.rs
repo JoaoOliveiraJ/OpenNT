@@ -6,27 +6,15 @@
 //! (ntifs.h, mountmgr.h, mountdev.h) ou, para as privadas do kernel, o
 //! layout conferido na desmontagem do ntoskrnl 10.0.19045.
 //!
-//! SHARE_ACCESS, _IOP_IRP_EXTENSION e BASE_MCB são os de `extra_fs_ntfs`;
-//! FILE_LOCK, FILE_LOCK_INFO, FSRTL_ADVANCED_FCB_HEADER e
-//! FSRTL_PER_STREAM_CONTEXT os de `extra_fsrtl` (não duplicados aqui).
+//! SHARE_ACCESS e BASE_MCB são os de `extra_fs_ntfs`; FILE_LOCK,
+//! FILE_LOCK_INFO e FSRTL_PER_STREAM_CONTEXT os de `extra_fsrtl` (não
+//! duplicados aqui). `_IO_PRIORITY_INFO` e `_KERNEL_STACK_SEGMENT` constam
+//! dos símbolos e são geradas (`types/io.rs`, `ke.rs`); ficam reexportadas
+//! aqui.
 
 use super::*;
 
-/// `IO_PRIORITY_INFO` (ntifs.h; 0x10 bytes; IoPriority é um IO_PRIORITY_HINT).
-#[repr(C)]
-pub struct IoPriorityInfo {
-    pub size: Field<u32>,
-    pub thread_priority: Field<u32>,
-    pub page_priority: Field<u32>,
-    pub io_priority: Field<u32>,
-}
-
-unsafe impl NtStruct for IoPriorityInfo {}
-
-const _: () = {
-    assert!(core::mem::size_of::<IoPriorityInfo>() == 0x10);
-    assert!(core::mem::offset_of!(IoPriorityInfo, io_priority) == 0xC);
-};
+pub use super::{IoPriorityInfo, KernelStackSegment};
 
 /// `MOUNTMGR_MOUNT_POINT` (mountmgr.h; 0x18 bytes).
 #[repr(C)]
@@ -81,17 +69,6 @@ const _: () = {
     assert!(core::mem::offset_of!(MountdevName, name) == 0x2);
 };
 
-/// `_KERNEL_STACK_SEGMENT` (ntkrnlmp.pdb; 0x20 bytes).
-#[repr(C)]
-pub struct KernelStackSegment {
-    pub stack_base: Field<u64>,
-    pub stack_limit: Field<u64>,
-    pub kernel_stack: Field<u64>,
-    pub initial_stack: Field<u64>,
-}
-
-unsafe impl NtStruct for KernelStackSegment {}
-
 /// `_KERNEL_STACK_CONTROL` no InitialStack de uma thread (privada do Ke; o
 /// IoWithinStackLimits do 19041 lê Previous em +0x10: StackBase +0x10,
 /// StackLimit +0x18, InitialStack +0x28; 0x30 bytes).
@@ -105,7 +82,6 @@ pub struct KernelStackControl {
 unsafe impl NtStruct for KernelStackControl {}
 
 const _: () = {
-    assert!(core::mem::size_of::<KernelStackSegment>() == 0x20);
     assert!(core::mem::size_of::<KernelStackControl>() == 0x30);
     assert!(core::mem::offset_of!(KernelStackControl, previous) == 0x10);
 };

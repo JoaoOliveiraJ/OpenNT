@@ -142,7 +142,7 @@ pub fn set(timer: &Ktimer2, due_time: i64, period: i64, parameters: u64) -> bool
     timer.due_time[0].set(due);
     timer.due_time[1].set(latest);
     timer.header.signal_state.set(0);
-    timer.period.set(period as u64);
+    timer.period.set(period);
     timer.absolute_system_time.set(absolute as u8);
     insert_locked(&mut inserted, timer);
     was_set
@@ -184,7 +184,7 @@ pub fn expire_due() {
         for &address in &due {
             let timer = timer_at(address);
             remove_locked(&mut inserted, timer);
-            let period = timer.period.get();
+            let period = timer.period.get() as u64;
             if period != 0 {
                 let next = absolute_due(now, period);
                 let latest = timer.due_time[1].get();

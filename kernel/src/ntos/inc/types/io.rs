@@ -4113,3 +4113,508 @@ const _: () = {
     assert!(core::mem::offset_of!(DeviceRelations, count) == 0x0);
     assert!(core::mem::offset_of!(DeviceRelations, objects) == 0x8);
 };
+
+/// `_FSRTL_ADVANCED_FCB_HEADER` (0x68 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `FsrtlAdvancedFcbHeaderView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct FsrtlAdvancedFcbHeader {
+    pub node_type_code: Field<i16>,
+    pub node_byte_size: Field<i16>,
+    pub flags: Field<u8>,
+    pub is_fast_io_possible: Field<u8>,
+    pub flags2: Field<u8>,
+    pub bitfield_7: Field<u8>,
+    /// -> `_ERESOURCE`
+    pub resource: Field<u64>,
+    /// -> `_ERESOURCE`
+    pub paging_io_resource: Field<u64>,
+    pub allocation_size: LargeInteger,
+    pub file_size: LargeInteger,
+    pub valid_data_length: LargeInteger,
+    /// -> `_FAST_MUTEX`
+    pub fast_mutex: Field<u64>,
+    pub filter_contexts: ListEntry,
+    pub push_lock: ExPushLock,
+    /// -> `void*`
+    pub file_context_support_pointer: Field<u64>,
+    /// -> `void`
+    pub oplock: Field<u64>,
+    /// -> `void`
+    pub reserved_context: Field<u64>,
+}
+
+/// Vista 1 de `_FSRTL_ADVANCED_FCB_HEADER` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct FsrtlAdvancedFcbHeaderView1 {
+    _pad_0: Reserved<0x58>,
+    /// -> `void`
+    pub reserved_for_remote: Field<u64>,
+    _pad_60: Reserved<0x8>,
+}
+
+impl core::ops::Deref for FsrtlAdvancedFcbHeader {
+    type Target = FsrtlAdvancedFcbHeaderView1;
+    #[inline(always)]
+    fn deref(&self) -> &FsrtlAdvancedFcbHeaderView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<FsrtlAdvancedFcbHeaderView1>() }
+    }
+}
+
+unsafe impl NtStruct for FsrtlAdvancedFcbHeader {}
+
+impl FsrtlAdvancedFcbHeader {
+    /// `Reserved`: bits 0..=3 de `bitfield_7`.
+    pub const RESERVED_SHIFT: u32 = 0;
+    pub const RESERVED_MASK: u8 = 0xf;
+    #[inline(always)]
+    pub fn reserved(&self) -> u8 {
+        self.bitfield_7.bits(0, 4) as u8
+    }
+    #[inline(always)]
+    pub fn set_reserved(&self, value: u8) {
+        self.bitfield_7.set_bits(0, 4, value as u64)
+    }
+    /// `Version`: bits 4..=7 de `bitfield_7`.
+    pub const VERSION_SHIFT: u32 = 4;
+    pub const VERSION_MASK: u8 = 0xf0;
+    #[inline(always)]
+    pub fn version(&self) -> u8 {
+        self.bitfield_7.bits(4, 4) as u8
+    }
+    #[inline(always)]
+    pub fn set_version(&self, value: u8) {
+        self.bitfield_7.set_bits(4, 4, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsrtlAdvancedFcbHeader>() == 0x68);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, node_type_code) == 0x0);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, node_byte_size) == 0x2);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, flags) == 0x4);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, is_fast_io_possible) == 0x5);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, flags2) == 0x6);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, bitfield_7) == 0x7);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, resource) == 0x8);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, paging_io_resource) == 0x10);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, allocation_size) == 0x18);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, file_size) == 0x20);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, valid_data_length) == 0x28);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, fast_mutex) == 0x30);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, filter_contexts) == 0x38);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, push_lock) == 0x48);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, file_context_support_pointer) == 0x50);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, oplock) == 0x58);
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeader, reserved_context) == 0x60);
+    assert!(core::mem::size_of::<FsrtlAdvancedFcbHeaderView1>() == 0x68);
+    assert!(core::mem::align_of::<FsrtlAdvancedFcbHeaderView1>() == core::mem::align_of::<FsrtlAdvancedFcbHeader>());
+    assert!(core::mem::offset_of!(FsrtlAdvancedFcbHeaderView1, reserved_for_remote) == 0x58);
+};
+
+/// `_ECP_LIST` (0x18 bytes).
+#[repr(C)]
+pub struct EcpList {
+    pub signature: Field<u32>,
+    pub flags: Field<u32>,
+    pub ecp_list: ListEntry,
+}
+
+unsafe impl NtStruct for EcpList {}
+
+const _: () = {
+    assert!(core::mem::size_of::<EcpList>() == 0x18);
+    assert!(core::mem::offset_of!(EcpList, signature) == 0x0);
+    assert!(core::mem::offset_of!(EcpList, flags) == 0x4);
+    assert!(core::mem::offset_of!(EcpList, ecp_list) == 0x8);
+};
+
+/// `_IO_PRIORITY_INFO` (0x10 bytes).
+#[repr(C)]
+pub struct IoPriorityInfo {
+    pub size: Field<u32>,
+    pub thread_priority: Field<u32>,
+    pub page_priority: Field<u32>,
+    pub io_priority: Field<IoPriorityHint>,
+}
+
+unsafe impl NtStruct for IoPriorityInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<IoPriorityInfo>() == 0x10);
+    assert!(core::mem::offset_of!(IoPriorityInfo, size) == 0x0);
+    assert!(core::mem::offset_of!(IoPriorityInfo, thread_priority) == 0x4);
+    assert!(core::mem::offset_of!(IoPriorityInfo, page_priority) == 0x8);
+    assert!(core::mem::offset_of!(IoPriorityInfo, io_priority) == 0xc);
+};
+
+/// `_IO_PRIORITY_HINT`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct IoPriorityHint(pub i32);
+
+impl IoPriorityHint {
+    pub const IO_PRIORITY_VERY_LOW: Self = Self(0);
+    pub const IO_PRIORITY_LOW: Self = Self(1);
+    pub const IO_PRIORITY_NORMAL: Self = Self(2);
+    pub const IO_PRIORITY_HIGH: Self = Self(3);
+    pub const IO_PRIORITY_CRITICAL: Self = Self(4);
+    pub const MAX_IO_PRIORITY_TYPES: Self = Self(5);
+}
+
+impl GuestScalar for IoPriorityHint {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
+/// `_IOP_IRP_EXTENSION` (0x50 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `IopIrpExtensionView1`..`IopIrpExtensionView3`, alcançadas por `Deref`.
+#[repr(C)]
+pub struct IopIrpExtension {
+    pub extension_flags: Field<u16>,
+    pub types_allocated: Field<u16>,
+    pub generic_extension: [Field<u8>; 4],
+    /// -> `void`
+    pub verifier_context: Field<u64>,
+    pub disk_io_attribution_handle: Field<u64>,
+    pub activity_id: Guid,
+    pub timestamp: LargeInteger,
+    pub fs_tracked_offset: Field<i64>,
+    pub driver_flags: IopIrpExtensionDriverFlags,
+    pub copy_information: CopyInformation,
+}
+
+/// Vista 1 de `_IOP_IRP_EXTENSION` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct IopIrpExtensionView1 {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x28>,
+    pub zeroing_offset: Field<u32>,
+    _pad_2c: Reserved<0x24>,
+}
+
+/// Vista 2 de `_IOP_IRP_EXTENSION` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct IopIrpExtensionView2 {
+    _pad_0: Reserved<0x28>,
+    /// -> `_IO_IRP_EXT_TRACK_OFFSET_HEADER`
+    pub fs_track_offset_blob: Field<u64>,
+    _pad_30: Reserved<0x20>,
+}
+
+/// Vista 3 de `_IOP_IRP_EXTENSION` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct IopIrpExtensionView3 {
+    _pad_0: Reserved<0x28>,
+    pub adapter_crypto_parameters: IoAdapterCryptoParameters,
+    _pad_38: Reserved<0x18>,
+}
+
+impl core::ops::Deref for IopIrpExtension {
+    type Target = IopIrpExtensionView1;
+    #[inline(always)]
+    fn deref(&self) -> &IopIrpExtensionView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<IopIrpExtensionView1>() }
+    }
+}
+
+impl core::ops::Deref for IopIrpExtensionView1 {
+    type Target = IopIrpExtensionView2;
+    #[inline(always)]
+    fn deref(&self) -> &IopIrpExtensionView2 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<IopIrpExtensionView2>() }
+    }
+}
+
+impl core::ops::Deref for IopIrpExtensionView2 {
+    type Target = IopIrpExtensionView3;
+    #[inline(always)]
+    fn deref(&self) -> &IopIrpExtensionView3 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<IopIrpExtensionView3>() }
+    }
+}
+
+unsafe impl NtStruct for IopIrpExtension {}
+
+impl IopIrpExtension {
+    /// `Allocated`: bits 0..=0 de `extension_flags`.
+    pub const ALLOCATED_SHIFT: u32 = 0;
+    pub const ALLOCATED_MASK: u16 = 0x1;
+    #[inline(always)]
+    pub fn allocated(&self) -> u16 {
+        self.extension_flags.bits(0, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_allocated(&self, value: u16) {
+        self.extension_flags.set_bits(0, 1, value as u64)
+    }
+    /// `PropagateId`: bits 1..=1 de `extension_flags`.
+    pub const PROPAGATE_ID_SHIFT: u32 = 1;
+    pub const PROPAGATE_ID_MASK: u16 = 0x2;
+    #[inline(always)]
+    pub fn propagate_id(&self) -> u16 {
+        self.extension_flags.bits(1, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_propagate_id(&self, value: u16) {
+        self.extension_flags.set_bits(1, 1, value as u64)
+    }
+    /// `SpareBits`: bits 2..=15 de `extension_flags`.
+    pub const SPARE_BITS_SHIFT: u32 = 2;
+    pub const SPARE_BITS_MASK: u16 = 0xfffc;
+    #[inline(always)]
+    pub fn spare_bits(&self) -> u16 {
+        self.extension_flags.bits(2, 14) as u16
+    }
+    #[inline(always)]
+    pub fn set_spare_bits(&self, value: u16) {
+        self.extension_flags.set_bits(2, 14, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<IopIrpExtension>() == 0x50);
+    assert!(core::mem::offset_of!(IopIrpExtension, extension_flags) == 0x0);
+    assert!(core::mem::offset_of!(IopIrpExtension, types_allocated) == 0x2);
+    assert!(core::mem::offset_of!(IopIrpExtension, generic_extension) == 0x4);
+    assert!(core::mem::offset_of!(IopIrpExtension, verifier_context) == 0x8);
+    assert!(core::mem::offset_of!(IopIrpExtension, disk_io_attribution_handle) == 0x10);
+    assert!(core::mem::offset_of!(IopIrpExtension, activity_id) == 0x18);
+    assert!(core::mem::offset_of!(IopIrpExtension, timestamp) == 0x28);
+    assert!(core::mem::offset_of!(IopIrpExtension, fs_tracked_offset) == 0x30);
+    assert!(core::mem::offset_of!(IopIrpExtension, driver_flags) == 0x38);
+    assert!(core::mem::offset_of!(IopIrpExtension, copy_information) == 0x40);
+    assert!(core::mem::size_of::<IopIrpExtensionView1>() == 0x50);
+    assert!(core::mem::align_of::<IopIrpExtensionView1>() == core::mem::align_of::<IopIrpExtension>());
+    assert!(core::mem::offset_of!(IopIrpExtensionView1, zeroing_offset) == 0x28);
+    assert!(core::mem::size_of::<IopIrpExtensionView2>() == 0x50);
+    assert!(core::mem::align_of::<IopIrpExtensionView2>() == core::mem::align_of::<IopIrpExtension>());
+    assert!(core::mem::offset_of!(IopIrpExtensionView2, fs_track_offset_blob) == 0x28);
+    assert!(core::mem::size_of::<IopIrpExtensionView3>() == 0x50);
+    assert!(core::mem::align_of::<IopIrpExtensionView3>() == core::mem::align_of::<IopIrpExtension>());
+    assert!(core::mem::offset_of!(IopIrpExtensionView3, adapter_crypto_parameters) == 0x28);
+};
+
+/// `_IO_ADAPTER_CRYPTO_PARAMETERS` (0x10 bytes).
+#[repr(C)]
+pub struct IoAdapterCryptoParameters {
+    pub tweak: Field<u64>,
+    /// -> `_IO_ADAPTER_CRYPTO_KEY_DESCRIPTOR`
+    pub key_descriptor: Field<u64>,
+}
+
+unsafe impl NtStruct for IoAdapterCryptoParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<IoAdapterCryptoParameters>() == 0x10);
+    assert!(core::mem::offset_of!(IoAdapterCryptoParameters, tweak) == 0x0);
+    assert!(core::mem::offset_of!(IoAdapterCryptoParameters, key_descriptor) == 0x8);
+};
+
+/// `_IOP_IRP_EXTENSION::DriverFlags` (0x8 bytes).
+#[repr(C)]
+pub struct IopIrpExtensionDriverFlags {
+    pub value: Field<u64>,
+}
+
+unsafe impl NtStruct for IopIrpExtensionDriverFlags {}
+
+impl IopIrpExtensionDriverFlags {
+    /// `UserFlags`: bits 0..=31 de `value`.
+    pub const USER_FLAGS_SHIFT: u32 = 0;
+    pub const USER_FLAGS_MASK: u64 = 0xffffffff;
+    #[inline(always)]
+    pub fn user_flags(&self) -> u64 {
+        self.value.bits(0, 32) as u64
+    }
+    #[inline(always)]
+    pub fn set_user_flags(&self, value: u64) {
+        self.value.set_bits(0, 32, value as u64)
+    }
+    /// `SystemFlags`: bits 32..=47 de `value`.
+    pub const SYSTEM_FLAGS_SHIFT: u32 = 32;
+    pub const SYSTEM_FLAGS_MASK: u64 = 0xffff00000000;
+    #[inline(always)]
+    pub fn system_flags(&self) -> u64 {
+        self.value.bits(32, 16) as u64
+    }
+    #[inline(always)]
+    pub fn set_system_flags(&self, value: u64) {
+        self.value.set_bits(32, 16, value as u64)
+    }
+    /// `UserFlagsId`: bits 48..=63 de `value`.
+    pub const USER_FLAGS_ID_SHIFT: u32 = 48;
+    pub const USER_FLAGS_ID_MASK: u64 = 0xffff000000000000;
+    #[inline(always)]
+    pub fn user_flags_id(&self) -> u64 {
+        self.value.bits(48, 16) as u64
+    }
+    #[inline(always)]
+    pub fn set_user_flags_id(&self, value: u64) {
+        self.value.set_bits(48, 16, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<IopIrpExtensionDriverFlags>() == 0x8);
+    assert!(core::mem::offset_of!(IopIrpExtensionDriverFlags, value) == 0x0);
+};
+
+/// `_COPY_INFORMATION` (0x10 bytes).
+#[repr(C)]
+pub struct CopyInformation {
+    /// -> `_FILE_OBJECT`
+    pub source_file_object: Field<u64>,
+    pub source_file_offset: Field<i64>,
+}
+
+unsafe impl NtStruct for CopyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CopyInformation>() == 0x10);
+    assert!(core::mem::offset_of!(CopyInformation, source_file_object) == 0x0);
+    assert!(core::mem::offset_of!(CopyInformation, source_file_offset) == 0x8);
+};
+
+/// `_INTERFACE` (0x20 bytes).
+#[repr(C)]
+pub struct Interface {
+    pub size: Field<u16>,
+    pub version: Field<u16>,
+    _pad_4: Reserved<0x4>,
+    /// -> `void`
+    pub context: Field<u64>,
+    /// -> `fn`
+    pub interface_reference: Field<u64>,
+    /// -> `fn`
+    pub interface_dereference: Field<u64>,
+}
+
+unsafe impl NtStruct for Interface {}
+
+const _: () = {
+    assert!(core::mem::size_of::<Interface>() == 0x20);
+    assert!(core::mem::offset_of!(Interface, size) == 0x0);
+    assert!(core::mem::offset_of!(Interface, version) == 0x2);
+    assert!(core::mem::offset_of!(Interface, context) == 0x8);
+    assert!(core::mem::offset_of!(Interface, interface_reference) == 0x10);
+    assert!(core::mem::offset_of!(Interface, interface_dereference) == 0x18);
+};
+
+/// `_DEVICE_DESCRIPTION` (0x40 bytes).
+#[repr(C)]
+pub struct DeviceDescription {
+    pub version: Field<u32>,
+    pub master: Field<u8>,
+    pub scatter_gather: Field<u8>,
+    pub demand_mode: Field<u8>,
+    pub auto_initialize: Field<u8>,
+    pub dma32_bit_addresses: Field<u8>,
+    pub ignore_count: Field<u8>,
+    pub reserved1: Field<u8>,
+    pub dma64_bit_addresses: Field<u8>,
+    pub bus_number: Field<u32>,
+    pub dma_channel: Field<u32>,
+    pub interface_type: Field<InterfaceType>,
+    pub dma_width: Field<DmaWidth>,
+    pub dma_speed: Field<DmaSpeed>,
+    pub maximum_length: Field<u32>,
+    pub dma_port: Field<u32>,
+    pub dma_address_width: Field<u32>,
+    pub dma_controller_instance: Field<u32>,
+    pub dma_request_line: Field<u32>,
+    _pad_34: Reserved<0x4>,
+    pub device_address: LargeInteger,
+}
+
+unsafe impl NtStruct for DeviceDescription {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DeviceDescription>() == 0x40);
+    assert!(core::mem::offset_of!(DeviceDescription, version) == 0x0);
+    assert!(core::mem::offset_of!(DeviceDescription, master) == 0x4);
+    assert!(core::mem::offset_of!(DeviceDescription, scatter_gather) == 0x5);
+    assert!(core::mem::offset_of!(DeviceDescription, demand_mode) == 0x6);
+    assert!(core::mem::offset_of!(DeviceDescription, auto_initialize) == 0x7);
+    assert!(core::mem::offset_of!(DeviceDescription, dma32_bit_addresses) == 0x8);
+    assert!(core::mem::offset_of!(DeviceDescription, ignore_count) == 0x9);
+    assert!(core::mem::offset_of!(DeviceDescription, reserved1) == 0xa);
+    assert!(core::mem::offset_of!(DeviceDescription, dma64_bit_addresses) == 0xb);
+    assert!(core::mem::offset_of!(DeviceDescription, bus_number) == 0xc);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_channel) == 0x10);
+    assert!(core::mem::offset_of!(DeviceDescription, interface_type) == 0x14);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_width) == 0x18);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_speed) == 0x1c);
+    assert!(core::mem::offset_of!(DeviceDescription, maximum_length) == 0x20);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_port) == 0x24);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_address_width) == 0x28);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_controller_instance) == 0x2c);
+    assert!(core::mem::offset_of!(DeviceDescription, dma_request_line) == 0x30);
+    assert!(core::mem::offset_of!(DeviceDescription, device_address) == 0x38);
+};
+
+/// `_DMA_WIDTH`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct DmaWidth(pub i32);
+
+impl DmaWidth {
+    pub const WIDTH8_BITS: Self = Self(0);
+    pub const WIDTH16_BITS: Self = Self(1);
+    pub const WIDTH32_BITS: Self = Self(2);
+    pub const WIDTH64_BITS: Self = Self(3);
+    pub const WIDTH_NO_WRAP: Self = Self(4);
+    pub const MAXIMUM_DMA_WIDTH: Self = Self(5);
+}
+
+impl GuestScalar for DmaWidth {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
+/// `_DMA_SPEED`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct DmaSpeed(pub i32);
+
+impl DmaSpeed {
+    pub const COMPATIBLE: Self = Self(0);
+    pub const TYPE_A: Self = Self(1);
+    pub const TYPE_B: Self = Self(2);
+    pub const TYPE_C: Self = Self(3);
+    pub const TYPE_F: Self = Self(4);
+    pub const MAXIMUM_DMA_SPEED: Self = Self(5);
+}
+
+impl GuestScalar for DmaSpeed {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}

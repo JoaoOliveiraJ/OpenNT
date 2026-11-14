@@ -7242,3 +7242,152 @@ const _: () = {
     assert!(core::mem::offset_of!(XstateContext, area) == 0x10);
     assert!(core::mem::offset_of!(XstateContext, buffer) == 0x18);
 };
+
+/// `_KERNEL_STACK_SEGMENT` (0x20 bytes).
+#[repr(C)]
+pub struct KernelStackSegment {
+    pub stack_base: Field<u64>,
+    pub stack_limit: Field<u64>,
+    pub kernel_stack: Field<u64>,
+    pub initial_stack: Field<u64>,
+}
+
+unsafe impl NtStruct for KernelStackSegment {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KernelStackSegment>() == 0x20);
+    assert!(core::mem::offset_of!(KernelStackSegment, stack_base) == 0x0);
+    assert!(core::mem::offset_of!(KernelStackSegment, stack_limit) == 0x8);
+    assert!(core::mem::offset_of!(KernelStackSegment, kernel_stack) == 0x10);
+    assert!(core::mem::offset_of!(KernelStackSegment, initial_stack) == 0x18);
+};
+
+/// `_KTIMER2` (0x88 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `Ktimer2View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct Ktimer2 {
+    pub header: DispatcherHeader,
+    pub rb_nodes: [RtlBalancedNode; 2],
+    pub due_time: [Field<u64>; 2],
+    pub period: Field<i64>,
+    /// -> `fn`
+    pub callback: Field<u64>,
+    /// -> `void`
+    pub callback_context: Field<u64>,
+    /// -> `fn`
+    pub disable_callback: Field<u64>,
+    /// -> `void`
+    pub disable_context: Field<u64>,
+    pub absolute_system_time: Field<u8>,
+    pub type_flags: Field<u8>,
+    pub collection_index: [Field<u8>; 2],
+    _pad_84: Reserved<0x4>,
+}
+
+/// Vista 1 de `_KTIMER2` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct Ktimer2View1 {
+    _pad_0: Reserved<0x18>,
+    pub list_entry: ListEntry,
+    _pad_28: Reserved<0x60>,
+}
+
+impl core::ops::Deref for Ktimer2 {
+    type Target = Ktimer2View1;
+    #[inline(always)]
+    fn deref(&self) -> &Ktimer2View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<Ktimer2View1>() }
+    }
+}
+
+unsafe impl NtStruct for Ktimer2 {}
+
+impl Ktimer2 {
+    /// `Unused`: bits 0..=0 de `type_flags`.
+    pub const UNUSED_SHIFT: u32 = 0;
+    pub const UNUSED_MASK: u8 = 0x1;
+    #[inline(always)]
+    pub fn unused(&self) -> u8 {
+        self.type_flags.bits(0, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_unused(&self, value: u8) {
+        self.type_flags.set_bits(0, 1, value as u64)
+    }
+    /// `IdleResilient`: bits 1..=1 de `type_flags`.
+    pub const IDLE_RESILIENT_SHIFT: u32 = 1;
+    pub const IDLE_RESILIENT_MASK: u8 = 0x2;
+    #[inline(always)]
+    pub fn idle_resilient(&self) -> u8 {
+        self.type_flags.bits(1, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_idle_resilient(&self, value: u8) {
+        self.type_flags.set_bits(1, 1, value as u64)
+    }
+    /// `HighResolution`: bits 2..=2 de `type_flags`.
+    pub const HIGH_RESOLUTION_SHIFT: u32 = 2;
+    pub const HIGH_RESOLUTION_MASK: u8 = 0x4;
+    #[inline(always)]
+    pub fn high_resolution(&self) -> u8 {
+        self.type_flags.bits(2, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_high_resolution(&self, value: u8) {
+        self.type_flags.set_bits(2, 1, value as u64)
+    }
+    /// `NoWake`: bits 3..=3 de `type_flags`.
+    pub const NO_WAKE_SHIFT: u32 = 3;
+    pub const NO_WAKE_MASK: u8 = 0x8;
+    #[inline(always)]
+    pub fn no_wake(&self) -> u8 {
+        self.type_flags.bits(3, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_no_wake(&self, value: u8) {
+        self.type_flags.set_bits(3, 1, value as u64)
+    }
+    /// `PseudoHighRes`: bits 4..=4 de `type_flags`.
+    pub const PSEUDO_HIGH_RES_SHIFT: u32 = 4;
+    pub const PSEUDO_HIGH_RES_MASK: u8 = 0x10;
+    #[inline(always)]
+    pub fn pseudo_high_res(&self) -> u8 {
+        self.type_flags.bits(4, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_pseudo_high_res(&self, value: u8) {
+        self.type_flags.set_bits(4, 1, value as u64)
+    }
+    /// `Unused1`: bits 5..=7 de `type_flags`.
+    pub const UNUSED1_SHIFT: u32 = 5;
+    pub const UNUSED1_MASK: u8 = 0xe0;
+    #[inline(always)]
+    pub fn unused1(&self) -> u8 {
+        self.type_flags.bits(5, 3) as u8
+    }
+    #[inline(always)]
+    pub fn set_unused1(&self, value: u8) {
+        self.type_flags.set_bits(5, 3, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Ktimer2>() == 0x88);
+    assert!(core::mem::offset_of!(Ktimer2, header) == 0x0);
+    assert!(core::mem::offset_of!(Ktimer2, rb_nodes) == 0x18);
+    assert!(core::mem::offset_of!(Ktimer2, due_time) == 0x48);
+    assert!(core::mem::offset_of!(Ktimer2, period) == 0x58);
+    assert!(core::mem::offset_of!(Ktimer2, callback) == 0x60);
+    assert!(core::mem::offset_of!(Ktimer2, callback_context) == 0x68);
+    assert!(core::mem::offset_of!(Ktimer2, disable_callback) == 0x70);
+    assert!(core::mem::offset_of!(Ktimer2, disable_context) == 0x78);
+    assert!(core::mem::offset_of!(Ktimer2, absolute_system_time) == 0x80);
+    assert!(core::mem::offset_of!(Ktimer2, type_flags) == 0x81);
+    assert!(core::mem::offset_of!(Ktimer2, collection_index) == 0x82);
+    assert!(core::mem::size_of::<Ktimer2View1>() == 0x88);
+    assert!(core::mem::align_of::<Ktimer2View1>() == core::mem::align_of::<Ktimer2>());
+    assert!(core::mem::offset_of!(Ktimer2View1, list_entry) == 0x18);
+};

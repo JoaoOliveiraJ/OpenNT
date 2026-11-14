@@ -44,13 +44,13 @@ fn power_block(irp: &Irp) -> Option<&'static PopIrpData> {
 /// PoSetSystemWake(Irp).
 pub fn set_system_wake(irp: &Irp) {
     if let Some(block) = power_block(irp).filter(|block| block.minor_function.get() == IRP_MN_WAIT_WAKE) {
-        block.device_system_wake.set(1);
+        block.device.system_wake.set(1);
     }
 }
 
 /// PoGetSystemWake(Irp).
 pub fn get_system_wake(irp: &Irp) -> bool {
-    power_block(irp).is_some_and(|block| block.minor_function.get() == IRP_MN_WAIT_WAKE && block.device_system_wake.get() != 0)
+    power_block(irp).is_some_and(|block| block.minor_function.get() == IRP_MN_WAIT_WAKE && block.device.system_wake.get() != 0)
 }
 
 /// PoDirectedDripsSetDeviceFlags(PhysicalDeviceObject, Flags).

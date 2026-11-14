@@ -248,3 +248,50 @@ const _: () = {
     assert!(core::mem::offset_of!(AlpcWorkOnBehalfTicket, thread_id) == 0x0);
     assert!(core::mem::offset_of!(AlpcWorkOnBehalfTicket, thread_creation_time_low) == 0x4);
 };
+
+/// `_PORT_MESSAGE32` (0x18 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `PortMessage32View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct PortMessage32 {
+    _align: [u64; 0],
+    pub u1: PortMessageU1,
+    pub u2: PortMessageU2,
+    pub client_id: ClientId32,
+    pub message_id: Field<u32>,
+    pub client_view_size: Field<u32>,
+}
+
+/// Vista 1 de `_PORT_MESSAGE32` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct PortMessage32View1 {
+    _pad_0: Reserved<0x8>,
+    pub do_not_use_this_field: Field<f64>,
+    _pad_10: Reserved<0x4>,
+    pub callback_id: Field<u32>,
+}
+
+impl core::ops::Deref for PortMessage32 {
+    type Target = PortMessage32View1;
+    #[inline(always)]
+    fn deref(&self) -> &PortMessage32View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PortMessage32View1>() }
+    }
+}
+
+unsafe impl NtStruct for PortMessage32 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PortMessage32>() == 0x18);
+    assert!(core::mem::offset_of!(PortMessage32, u1) == 0x0);
+    assert!(core::mem::offset_of!(PortMessage32, u2) == 0x4);
+    assert!(core::mem::offset_of!(PortMessage32, client_id) == 0x8);
+    assert!(core::mem::offset_of!(PortMessage32, message_id) == 0x10);
+    assert!(core::mem::offset_of!(PortMessage32, client_view_size) == 0x14);
+    assert!(core::mem::size_of::<PortMessage32View1>() == 0x18);
+    assert!(core::mem::align_of::<PortMessage32View1>() == core::mem::align_of::<PortMessage32>());
+    assert!(core::mem::offset_of!(PortMessage32View1, do_not_use_this_field) == 0x8);
+    assert!(core::mem::offset_of!(PortMessage32View1, callback_id) == 0x14);
+};

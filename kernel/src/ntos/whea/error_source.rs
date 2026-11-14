@@ -43,7 +43,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::types::extra_storage::{WheaErrorPacketV2, WheaErrorRecordHeader, WheaErrorSourceConfigurationDeviceDriverV1, WheaErrorSourceDescriptor};
-use crate::ntos::inc::types::{Guid, LargeInteger, NtStruct, TimeFields};
+use crate::ntos::inc::types::{Guid, LargeInteger, NtStruct, TimeFields, WheaErrorSeverity, WheaErrorSourceState, WheaErrorSourceType};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -114,13 +114,13 @@ fn is_non_hest(source_type: u32) -> bool {
 /// Fonte iniciada com o ErrorSourceId dado (WheapGetErrorSource).
 fn started(source: &Source, id: u32) -> bool {
     let descriptor = descriptor_at(source.descriptor);
-    descriptor.error_source_id.get() == id && descriptor.state.get() == SOURCE_STATE_STARTED
+    descriptor.error_source_id.get() == id && descriptor.state.get().0 as u32 == SOURCE_STATE_STARTED
 }
 
 /// WheaAddErrorSource(ErrorSource, Context): cópia do descritor na tabela.
 /// Devolve o status e o ErrorSourceId atribuído.
 fn add_source(descriptor: &WheaErrorSourceDescriptor, context: u64, uninitialize: u64) -> (u32, u32) {
-    let source_type = descriptor.type_.get();
+    let source_type = descriptor.type_.get().0 as u32;
     if !is_non_hest(source_type) {
         return (STATUS_NOT_SUPPORTED, 0);
     }
@@ -135,7 +135,7 @@ fn add_source(descriptor: &WheaErrorSourceDescriptor, context: u64, uninitialize
     let copy = descriptor_at(copy_address);
     let id = NEXT_ERROR_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     copy.error_source_id.set(id);
-    copy.state.set(SOURCE_STATE_STARTED);
+    copy.state.set(WheaErrorSourceState(SOURCE_STATE_STARTED as i32));
     SOURCES.lock().push(Source { descriptor: copy_address, context, uninitialize });
     (STATUS_SUCCESS, id)
 }
@@ -165,16 +165,16 @@ pub fn add_device_driver_source_v1(context: u64, configuration: &WheaErrorSource
     let sections = V1_MAX_SECTIONS_PER_REPORT + DEVICE_DRIVER_EXTRA_SECTIONS;
     descriptor.length.set(WheaErrorSourceDescriptor::SIZE as u32);
     descriptor.version.set(DESCRIPTOR_VERSION_11);
-    descriptor.type_.set(SOURCE_TYPE_DEVICE_DRIVER);
-    descriptor.state.set(SOURCE_STATE_CONFIGURED);
+    descriptor.type_.set(WheaErrorSourceType(SOURCE_TYPE_DEVICE_DRIVER as i32));
+    descriptor.state.set(WheaErrorSourceState(SOURCE_STATE_CONFIGURED as i32));
     descriptor.max_raw_data_length.set(sections * max_data_length);
     descriptor.num_records_to_preallocate.set(buffers);
     descriptor.max_sections_per_record.set(sections);
-    let info = &descriptor.device_driver;
+    let info = &descriptor.info.device_driver_descriptor;
     guest::write_bytes(info.source_guid.address(), &guest::read_bytes(configuration.source_guid.address(), 16));
     info.log_tag.set(configuration.log_tag.get());
-    info.initialize.set(initialize);
-    info.uninitialize.set(uninitialize);
+    info.config.initialize.set(initialize);
+    info.config.uninitialize.set(uninitialize);
     set_guid(&info.creator_id, &DEFAULT_DEVICE_DRIVER_CREATOR_GUID);
     info.max_section_data_length.set(max_data_length);
     info.max_sections_per_record.set(sections);
@@ -196,7 +196,7 @@ pub fn remove_error_source(id: u32) {
     let removed = {
         let mut sources = SOURCES.lock();
         let Some(index) = sources.iter().position(|source| started(source, id)) else { return };
-        if !is_non_hest(descriptor_at(sources[index].descriptor).type_.get()) {
+        if !is_non_hest(descriptor_at(sources[index].descriptor).type_.get().0 as u32) {
             return;
         }
         sources.remove(index)
@@ -235,10 +235,10 @@ pub fn unconfigure_error_source(source_type: u32) -> u32 {
 pub fn initialize_record_header(header: &WheaErrorRecordHeader) -> u32 {
     guest::write_bytes(header.address(), &[0u8; WheaErrorRecordHeader::SIZE as usize]);
     header.signature.set(CPER_SIGNATURE);
-    header.revision.set(CPER_REVISION);
+    header.revision.as_ushort.set(CPER_REVISION);
     header.signature_end.set(CPER_SIGNATURE_END);
-    header.severity.set(SEVERITY_NONE);
-    header.valid_bits.set(VALID_BITS_TIMESTAMP);
+    header.severity.set(WheaErrorSeverity(SEVERITY_NONE as i32));
+    header.valid_bits.as_ulong.set(VALID_BITS_TIMESTAMP);
     set_guid(&header.creator_id, &WHEA_RECORD_CREATOR_GUID);
     // WheapGetTimestamp: TIME_FIELDS do SystemTime em WHEA_TIMESTAMP.
     let time_address = guest::alloc_bytes(LargeInteger::SIZE);
@@ -249,13 +249,13 @@ pub fn initialize_record_header(header: &WheaErrorRecordHeader) -> u32 {
     crate::ntos::rtl::time::time_to_time_fields(time_address, fields_address);
     let year = fields.year.get() as i32;
     let stamp = &header.timestamp;
-    stamp.seconds.set(fields.second.get() as u8);
-    stamp.minutes.set(fields.minute.get() as u8);
-    stamp.hours.set(fields.hour.get() as u8);
-    stamp.day.set(fields.day.get() as u8);
-    stamp.month.set(fields.month.get() as u8);
-    stamp.year.set((year % 100) as u8);
-    stamp.century.set((year / 100) as u8);
+    stamp.set_seconds(fields.second.get() as u64);
+    stamp.set_minutes(fields.minute.get() as u64);
+    stamp.set_hours(fields.hour.get() as u64);
+    stamp.set_day(fields.day.get() as u64);
+    stamp.set_month(fields.month.get() as u64);
+    stamp.set_year((year % 100) as u64);
+    stamp.set_century((year / 100) as u64);
     guest::free_bytes(time_address);
     guest::free_bytes(fields_address);
     header.record_id.set(ERROR_RECORD_ID.fetch_add(1, Ordering::AcqRel) + 1);
@@ -273,8 +273,8 @@ pub fn report_hw_error(packet: u64) -> u32 {
     if error.signature.get() != PACKET_SIGNATURE {
         return STATUS_INVALID_PARAMETER;
     }
-    if error.error_severity.get() == SEVERITY_FATAL {
-        crate::ntos::ke::bugcheck::bug_check_ex(WHEA_UNCORRECTABLE_ERROR, error.error_source_type.get() as u64, packet, 0, 0);
+    if error.error_severity.get().0 as u32 == SEVERITY_FATAL {
+        crate::ntos::ke::bugcheck::bug_check_ex(WHEA_UNCORRECTABLE_ERROR, error.error_source_type.get().0 as u64, packet, 0, 0);
     }
     STATUS_SUCCESS
 }
@@ -284,7 +284,7 @@ pub fn report_hw_error(packet: u64) -> u32 {
 /// ..., ErrorSeverity, DeviceFriendlyName).
 pub fn report_device_driver_error(source_id: u32, _device: u64, _data: u64, _length: u32, _section_type: u64, severity: u32, fatal: bool) -> u32 {
     let descriptor = get_error_source(source_id);
-    if descriptor == 0 || descriptor_at(descriptor).type_.get() != SOURCE_TYPE_DEVICE_DRIVER {
+    if descriptor == 0 || descriptor_at(descriptor).type_.get().0 as u32 != SOURCE_TYPE_DEVICE_DRIVER {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     if fatal || severity == SEVERITY_FATAL {
