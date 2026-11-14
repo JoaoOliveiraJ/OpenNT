@@ -10,7 +10,7 @@
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
-//! `--start-driver=NOME`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`.
+//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
@@ -41,7 +41,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status|nt-types> [opc
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
-                   --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME
+                   --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)

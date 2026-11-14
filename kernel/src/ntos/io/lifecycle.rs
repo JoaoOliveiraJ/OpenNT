@@ -218,6 +218,12 @@ fn service_name(file_path: &str, options: &DriverOptions) -> String {
     })
 }
 
+/// `\SystemRoot\System32\drivers\<arquivo>`: o caminho NT de uma imagem de
+/// driver da instalação.
+pub fn system_driver_path(file_path: &str) -> String {
+    format!("\\SystemRoot\\System32\\drivers\\{}", file_path.rsplit(['/', '\\']).next().unwrap_or(file_path))
+}
+
 /// Carrega um `.sys`: loader PE e DriverEntry nativo com o caminho de
 /// registro do serviço. Fonte: disco em memória (bundle) ou volume NTFS.
 pub fn load_driver(file_path: &str, options: &DriverOptions) -> Result<bool, LoadError> {
@@ -244,7 +250,13 @@ fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Re
     };
     // Como todo driver, vai para a janela de imagens de sistema, relocado.
     let mut load = options.load.clone().unwrap_or_default();
-    load.image_name = Some(source.name().to_string());
+    // FullDllName da entrada do loader: o caminho NT da imagem, como o
+    // IopLoadDriver o passa ao MmLoadSystemImage (o do serviço, quando o
+    // chamador o dá; senão \SystemRoot\System32\drivers\<arquivo>, onde as
+    // imagens de driver da instalação ficam).
+    if load.image_name.is_none() {
+        load.image_name = Some(system_driver_path(file_path));
+    }
     let image = pe_loader::load_from_source(source, &load)?;
     let (image_base, size_of_image, entry_point) = (image.image_base, image.size_of_image, image.entry_point);
     let exports = image.exports.exports.clone();

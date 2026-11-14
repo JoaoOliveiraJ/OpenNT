@@ -23,7 +23,8 @@ pub struct BuildOptions {
     pub user_program: String,
     pub kernel_test_scope: String,
     pub console_mirror: bool,
-    /// `--start-driver=NOME`: serviço iniciado pelo SCM antes do programa.
+    /// `--start-driver=NOME[,NOME...]`: serviços iniciados pelo SCM antes do
+    /// programa, na ordem dada.
     pub start_driver: String,
     /// `--trace-driver-api`: rastreia as APIs chamadas durante esse início.
     pub trace_driver_api: bool,

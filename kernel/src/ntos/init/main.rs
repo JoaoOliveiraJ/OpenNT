@@ -119,6 +119,7 @@ fn start_boot_driver(name: &str) {
     if state == 4 {
         crate::ntos::test::file_system_mount::after_driver_start(name);
         crate::ntos::test::console_driver::after_driver_start(name);
+        crate::ntos::test::import_cycle::after_driver_start(name);
     }
 }
 
@@ -137,11 +138,12 @@ pub fn kmain() -> ! {
         debug_print!("[services] tabela nativa nao registrada: {}", error);
     }
 
-    // Início opcional de um driver antes do programa de usuário, pelo mesmo
-    // ciclo de vida do SCM/CM. O marcador registra a conclusão, não o
-    // sucesso da carga.
-    if !boot_config::START_DRIVER.is_empty() {
-        start_boot_driver(boot_config::START_DRIVER);
+    // Início opcional de drivers antes do programa de usuário, pelo mesmo
+    // ciclo de vida do SCM/CM, na ordem da lista (a dos grupos de boot do
+    // Windows: NDIS antes do Tcpip, o Tcpip antes do AFD). O marcador de
+    // cada um registra a conclusão, não o sucesso da carga.
+    for name in boot_config::START_DRIVER.split(',').filter(|name| !name.is_empty()) {
+        start_boot_driver(name);
     }
 
     debug_print!("KERNEL_RS_OK"); // kernel Rust montado e executando
@@ -150,9 +152,9 @@ pub fn kmain() -> ! {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
 
-    // O driver iniciado, usado por um processo de teste (null, beep, fs_rec).
-    if !boot_config::START_DRIVER.is_empty() {
-        crate::ntos::test::boot_drivers::after_start(boot_config::START_DRIVER);
+    // Os drivers iniciados, usados por um processo de teste (null, beep, fs_rec).
+    for name in boot_config::START_DRIVER.split(',').filter(|name| !name.is_empty()) {
+        crate::ntos::test::boot_drivers::after_start(name);
     }
 
     if boot_config::KERNEL_TEST_SCOPE != "none" {

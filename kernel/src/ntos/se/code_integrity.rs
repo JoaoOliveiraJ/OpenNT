@@ -302,7 +302,10 @@ fn validate_kernel_image(source: &Arc<dyn ImageSource>, options: &LoadOptions) -
             return Err(failure("CI page-validation contract pending", 0xC000_00BB));
         }
     }
-    let name = options.image_name.clone().unwrap_or_else(|| String::from(source.name()));
+    // A CI abre o arquivo de onde os bytes vêm (o nome da fonte no namespace
+    // do OpenNT); o FullDllName da entrada do loader (\SystemRoot\...) é só
+    // o nome publicado.
+    let name = if source.name().starts_with('\\') { String::from(source.name()) } else { options.image_name.clone().unwrap_or_else(|| String::from(source.name())) };
     let mut request = open_image(&name)?;
     let outcome = (|| -> Result<(CodeIntegrity, Arc<dyn SectionFile>), KernelError> {
         let section = request.section.clone().ok_or_else(|| failure("CI section missing", 0xC000_0008))?;

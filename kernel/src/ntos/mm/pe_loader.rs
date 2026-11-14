@@ -9,7 +9,10 @@
 //! Imagem de kernel (driver, hal.dll, biblioteca de export): como no
 //! MiLoadSystemImage do NT, a VA vem do espaço de sistema (a janela
 //! `memory_map::SYSTEM_IMAGE_BASE..TOP`), nunca da ImageBase do cabeçalho, e
-//! a imagem é relocada pela diferença. Imagem de usuário: sempre do processo
+//! a imagem é relocada pela diferença; a entrada dela entra na lista de
+//! imagens carregadas antes dos imports, com LOAD_IN_PROGRESS ligado até a
+//! IAT estar resolvida (o MiConstructLoaderEntry antes do
+//! MiResolveImageImports). Imagem de usuário: sempre do processo
 //! corrente (o anexado, quando há attach), mapeada na raiz carregada; a base
 //! preferida do cabeçalho quando a faixa está livre no espaço dele (o VAD,
 //! as faixas de sistema e as PTEs da raiz), senão a primeira faixa livre a
@@ -185,6 +188,41 @@ static NATIVE_IMAGES: SpinLock<alloc::collections::BTreeMap<u64, (u64, Vec<Secti
 /// Tamanho e seções de um driver nativo carregado por este loader.
 pub fn native_image(image_base: u64) -> Option<(u64, Vec<SectionInfo>)> {
     NATIVE_IMAGES.lock().get(&image_base).cloned()
+}
+
+/// Exports das imagens de kernel cujos imports estão sendo resolvidos (as
+/// entradas com LOAD_IN_PROGRESS), pelo id da imagem carregada: lidos da
+/// imagem já mapeada e relocada, antes de qualquer import.
+static RESOLVING: SpinLock<alloc::collections::BTreeMap<u64, Exports>> = SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Exports de uma imagem em resolução de imports (`None` = a imagem já
+/// terminou a carga ou não é deste loader).
+pub fn resolving_exports(id: u64) -> Option<Exports> {
+    RESOLVING.lock().get(&id).cloned()
+}
+
+/// Ponto de entrada (RVA) e presença do export DllInitialize, lidos do
+/// arquivo sem mapear a imagem: o sysload decide por eles se um import é
+/// uma DLL (DllInitialize, ou sem ponto de entrada) ou um driver.
+pub fn file_entry_and_initialize(source: &dyn ImageSource) -> Result<(u64, bool), KernelError> {
+    let metadata = MetadataReader::new(source);
+    let pe_header = metadata.read_u32(0x3C)? as u64;
+    let coff = pe_header + 4;
+    let section_count = metadata.read_u16(coff + 2)? as u64;
+    let optional = coff + 20;
+    let section_table = optional + metadata.read_u16(coff + 16)? as u64;
+    let entry_rva = metadata.read_u32(optional + 16)? as u64;
+    let size_of_image = metadata.read_u32(optional + 56)? as u64;
+    let size_of_headers = metadata.read_u32(optional + 60)? as u64;
+    let (export_rva, export_size) = (metadata.read_u32(optional + 112)? as u64, metadata.read_u32(optional + 116)? as u64);
+    let read_rva = |rva: u64, length: u64| -> Result<Vec<u8>, KernelError> {
+        if rva.checked_add(length).is_none_or(|end| end > size_of_image) {
+            return Err(KernelError::new(alloc::format!("PE: RVA {rva:#x} fora da imagem")));
+        }
+        source.read_bytes(section_file_offset(&metadata, section_table, section_count, size_of_headers, rva)?, length)
+    };
+    let exports = pe_exports::read_exports(&read_rva, 0, size_of_image, export_rva, export_size)?;
+    Ok((entry_rva, exports.exports.contains_key("DllInitialize")))
 }
 
 static RESOLVERS: SpinLock<Vec<Resolver>> = SpinLock::new(Vec::new());
@@ -573,6 +611,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     let mut owned = Owned::default();
     let mut image_base = preferred_base;
     let mut relocation_delta: i64 = 0;
+    let image_name = options.image_name.clone().unwrap_or_else(|| source.name().to_string());
     let result = (|| -> Result<PeImage, KernelError> {
         if user_space {
             let mut arenas = ARENAS.lock();
@@ -627,33 +666,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         }
         let physical_base = owned.frames[0];
         let mapping = Mapping { frames: owned.frames.clone() };
-        let rva_to_file_offset = |rva: u64| -> Result<u64, KernelError> {
-            for index in 0..section_count {
-                let header = section_table + index * 40;
-                let virtual_size = metadata.read_u32(header + 8)? as u64;
-                let virtual_address = metadata.read_u32(header + 12)? as u64;
-                let raw_size = metadata.read_u32(header + 16)? as u64;
-                let raw_pointer = metadata.read_u32(header + 20)? as u64;
-                if rva >= virtual_address && rva < virtual_address + virtual_size.max(raw_size) {
-                    return Ok(raw_pointer + (rva - virtual_address));
-                }
-            }
-            if rva < size_of_headers {
-                return Ok(rva);
-            }
-            Err(KernelError::new(alloc::format!("RVA invalido: {rva:#x}")))
-        };
-        let read_c_string = |mut offset: u64| -> Result<String, KernelError> {
-            let mut text = String::new();
-            loop {
-                let byte = metadata.read_u8(offset)?;
-                if byte == 0 {
-                    return Ok(text);
-                }
-                text.push(byte as u8 as char);
-                offset += 1;
-            }
-        };
+        let rva_to_file_offset = |rva: u64| section_file_offset(&metadata, section_table, section_count, size_of_headers, rva);
         debug_print!("[pe] base={:#x} (fisico {:#x}) imagem={} bytes, {} secoes", image_base, physical_base, size_of_image, section_count);
         // Zera a imagem (BSS) e copia cabeçalhos e seções.
         for &frame in &owned.frames {
@@ -833,90 +846,6 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 debug_print!("[pe] security cookie semeado em {:#x}", cookie);
             }
         }
-        let mut resolved_imports = Vec::new();
-        if import_rva != 0 && !options.skip_imports {
-            let importer = options.image_name.clone().unwrap_or_else(|| source.name().to_string());
-            let mut descriptor = rva_to_file_offset(import_rva)?;
-            loop {
-                let ilt_rva = metadata.read_u32(descriptor)? as u64;
-                let name_rva = metadata.read_u32(descriptor + 12)? as u64;
-                let iat_rva = metadata.read_u32(descriptor + 16)? as u64;
-                if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
-                    break;
-                }
-                let dll = read_c_string(rva_to_file_offset(name_rva)?)?;
-                let lower = dll.to_lowercase();
-                let host = if lower.starts_with("api-") || lower.starts_with("ext-") { crate::ntos::mm::sysload::kernel_api_set::resolve(&dll, &importer)? } else { Some(dll.clone()) };
-                let Some(host) = host else { return Err(KernelError::new(alloc::format!("API set desconhecido: {dll}"))) };
-                debug_print!("[pe] imports de {}", dll);
-                let mut slot = 0u64;
-                loop {
-                    let entry = rva_to_file_offset(if ilt_rva != 0 { ilt_rva } else { iat_rva })? + slot * 8;
-                    let low = metadata.read_u32(entry)?;
-                    let high = metadata.read_u32(entry + 4)?;
-                    if low == 0 && high == 0 {
-                        break;
-                    }
-                    if iat_rva == 0 || iat_rva + slot * 8 > size_of_image - 8 {
-                        return Err(KernelError::new("PE: IAT fora da imagem"));
-                    }
-                    let iat = iat_rva + slot * 8;
-                    let symbol = if high & 0x8000_0000 != 0 {
-                        ImportSymbol::Ordinal(low & 0xFFFF)
-                    } else {
-                        if high != 0 {
-                            return Err(KernelError::new("PE: RVA de import invalido"));
-                        }
-                        ImportSymbol::Name(read_c_string(rva_to_file_offset(low as u64)? + 2)?)
-                    };
-                    let label = match &symbol {
-                        ImportSymbol::Ordinal(ordinal) => alloc::format!("ordinal #{ordinal}"),
-                        ImportSymbol::Name(name) => name.clone(),
-                    };
-                    if host.is_empty() {
-                        // Default opcional do linker no IAT (já relocado): o
-                        // ponteiro original precisa cair numa seção executável.
-                        let address = mapping.read64(iat);
-                        let rva = address.wrapping_sub(image_base);
-                        let executable = rva < size_of_image && sections.iter().any(|section| section.characteristics & 0x2000_0000 != 0 && rva >= section.va as u64 && rva < section.va as u64 + section.virtual_size.max(section.raw_size) as u64);
-                        if !executable {
-                            return Err(KernelError::new(alloc::format!("API set sem default nativo executavel: {dll}!{label}")));
-                        }
-                        resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: true });
-                        slot += 1;
-                        continue;
-                    }
-                    match resolve(&host, &symbol) {
-                        None => return Err(KernelError::new(alloc::format!("API nao suportada: {dll}!{label}"))),
-                        Some(ResolvedImport::Address { address, dependencies }) => {
-                            for dependency in dependencies {
-                                if !owned.dependencies.iter().any(|held| Arc::ptr_eq(held, &dependency)) {
-                                    dependency.retain();
-                                    owned.dependencies.push(dependency);
-                                }
-                            }
-                            mapping.write64(iat, address);
-                            resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: false });
-                        }
-                        Some(ResolvedImport::Thunk(id)) => {
-                            // Ring 3 não alcança trampolins supervisores.
-                            if user_space {
-                                return Err(KernelError::new(alloc::format!("API do kernel ({dll}!{label}) inalcancavel de ring 3")));
-                            }
-                            let Some((table, count)) = *THUNK_TABLE.lock() else { return Err(KernelError::new("tabela de trampolins indisponivel")) };
-                            if id >= count {
-                                return Err(KernelError::new(alloc::format!("apiId {id} alem da tabela de trampolins ({count})")));
-                            }
-                            let address = kernel_address::image_address(table + id as u64 * STUB_SIZE)?;
-                            mapping.write64(iat, address);
-                            resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: false });
-                        }
-                    }
-                    slot += 1;
-                }
-                descriptor += 20;
-            }
-        }
         let entry_point = if entry_rva != 0 { image_base.wrapping_add(entry_rva) } else { 0 };
         let read_rva = |rva: u64, length: u64| -> Result<Vec<u8>, KernelError> {
             if rva.checked_add(length).is_none_or(|end| end > size_of_image) {
@@ -925,13 +854,36 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             Ok(mapping.read_bytes(rva, length as usize))
         };
         let exports = pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)?;
-        debug_print!("[pe] entry point = {:#x}", entry_point);
         // O bit consumido por ObRegisterCallbacks é uma decisão da CI, não
         // uma promessa do cabeçalho: contrato integral aceito no modo 2.
         let loader_flags = match code_integrity {
             Some(ci) if ci.status == 0 && ci.validation_mode == 2 && ci.signature_context == 0 && (2..=15).contains(&ci.signing_level) => 0x20,
             _ => 0,
         };
+        let (checksum, time_date_stamp) = (metadata.read_u32(optional + 64)?, metadata.read_u32(coff + 4)?);
+        // Como no MmLoadSystemImageEx, a entrada da imagem de kernel entra na
+        // lista de imagens carregadas (MiConstructLoaderEntry) antes de os
+        // imports serem resolvidos, com LOAD_IN_PROGRESS ligado: um ciclo de
+        // imports (netio.sys <-> ndis.sys) acha esta entrada e se resolve
+        // pelos exports dela. A imagem de sessão só é registrada depois de
+        // entrar na sessão (o registro a lê pela VA).
+        let mut loaded_image = None;
+        if !user_space && !session {
+            let description = loaded_images::ImageDescription { image_base, size_of_image, entry_point, checksum, time_date_stamp, loader_flags: loader_flags | loaded_images::LOAD_IN_PROGRESS, release_paging: Some(crate::ntos::mm::image_paging::release_image) };
+            let loaded = loaded_images::register(description, &image_name)?;
+            owned.registered = Some(loaded.id);
+            NATIVE_IMAGES.lock().insert(image_base, (size_of_image, sections.clone()));
+            owned.native_base = Some(image_base);
+            RESOLVING.lock().insert(loaded.id, exports.clone());
+            loaded_image = Some(loaded.id);
+        }
+        let resolved = resolve_imports(&ImportContext { metadata: &metadata, mapping: &mapping, options, importer: &image_name, image_base, size_of_image, import_rva, sections: &sections, section_table, section_count, size_of_headers }, &mut owned);
+        let loaded_image = loaded_image.and_then(|id| {
+            RESOLVING.lock().remove(&id);
+            loaded_images::update_flags(id, 0, loaded_images::LOAD_IN_PROGRESS)
+        });
+        let resolved_imports = resolved?;
+        debug_print!("[pe] entry point = {:#x}", entry_point);
         let image_information = pe_image_information::capture(&metadata, source.size(), coff, optional, image_base)?;
         Ok(PeImage {
             entry_point,
@@ -944,51 +896,42 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             page_protects,
             sections: sections.clone(),
             resolved_imports,
-            checksum: metadata.read_u32(optional + 64)?,
-            time_date_stamp: metadata.read_u32(coff + 4)?,
+            checksum,
+            time_date_stamp,
             image_information,
             code_integrity,
             loader_flags,
-            loaded_image: None,
+            loaded_image,
             owned: Owned::default(),
         })
     })();
     match result {
         Ok(mut image) => {
             image.owned = owned;
-            let name = options.image_name.clone().unwrap_or_else(|| source.name().to_string());
             // A imagem de sessão entra na sessão corrente antes do registro e
-            // das notificações, que a leem pela VA.
+            // das notificações, que a leem pela VA; a residência das imagens
+            // de drivers (`image_paging`) é da janela de sistema, e a imagem
+            // de sessão fica de fora.
             if session {
                 if let Err(error) = crate::ntos::mm::session_image::map_new(&image) {
                     let _ = image.release();
                     return Err(error);
                 }
-            }
-            if !user_space {
-                // A residência das imagens de drivers (`image_paging`) é da
-                // janela de sistema; a imagem de sessão fica de fora.
-                let registered = loaded_images::register(loaded_images::ImageDescription { image_base: image.image_base, size_of_image, entry_point: image.entry_point, checksum: image.checksum, time_date_stamp: image.time_date_stamp, loader_flags: image.loader_flags, release_paging: if session { None } else { Some(crate::ntos::mm::image_paging::release_image) } }, &name);
+                let registered = loaded_images::register(loaded_images::ImageDescription { image_base: image.image_base, size_of_image, entry_point: image.entry_point, checksum: image.checksum, time_date_stamp: image.time_date_stamp, loader_flags: image.loader_flags, release_paging: None }, &image_name);
                 match registered {
                     Ok(loaded) => {
-                        if !session {
-                            NATIVE_IMAGES.lock().insert(image.image_base, (size_of_image, image.sections.clone()));
-                            image.owned.native_base = Some(image.image_base);
-                        }
                         image.owned.registered = Some(loaded.id);
                         image.loaded_image = Some(loaded);
                     }
                     Err(error) => {
-                        if session {
-                            crate::ntos::mm::session_image::discard_new(&image);
-                        }
+                        crate::ntos::mm::session_image::discard_new(&image);
                         let _ = image.release();
                         return Err(error);
                     }
                 }
             }
             if options.notify_image {
-                if let Err(error) = notify_loaded(image.image_base, size_of_image, &name, source.clone(), !user_space, options.no_execute) {
+                if let Err(error) = notify_loaded(image.image_base, size_of_image, &image_name, source.clone(), !user_space, options.no_execute) {
                     if session {
                         crate::ntos::mm::session_image::discard_new(&image);
                     }
@@ -1003,4 +946,144 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             Err(error)
         }
     }
+}
+
+/// O que a resolução de imports lê da imagem em carga.
+struct ImportContext<'a> {
+    metadata: &'a MetadataReader<'a>,
+    mapping: &'a Mapping,
+    options: &'a LoadOptions,
+    importer: &'a str,
+    image_base: u64,
+    size_of_image: u64,
+    import_rva: u64,
+    sections: &'a [SectionInfo],
+    section_table: u64,
+    section_count: u64,
+    size_of_headers: u64,
+}
+
+/// RVA -> offset no arquivo pela tabela de seções.
+fn section_file_offset(metadata: &MetadataReader, section_table: u64, section_count: u64, size_of_headers: u64, rva: u64) -> Result<u64, KernelError> {
+    for index in 0..section_count {
+        let header = section_table + index * 40;
+        let virtual_size = metadata.read_u32(header + 8)? as u64;
+        let virtual_address = metadata.read_u32(header + 12)? as u64;
+        let raw_size = metadata.read_u32(header + 16)? as u64;
+        let raw_pointer = metadata.read_u32(header + 20)? as u64;
+        if rva >= virtual_address && rva < virtual_address + virtual_size.max(raw_size) {
+            return Ok(raw_pointer + (rva - virtual_address));
+        }
+    }
+    if rva < size_of_headers {
+        return Ok(rva);
+    }
+    Err(KernelError::new(alloc::format!("RVA invalido: {rva:#x}")))
+}
+
+fn read_c_string(metadata: &MetadataReader, mut offset: u64) -> Result<String, KernelError> {
+    let mut text = String::new();
+    loop {
+        let byte = metadata.read_u8(offset)?;
+        if byte == 0 {
+            return Ok(text);
+        }
+        text.push(byte as u8 as char);
+        offset += 1;
+    }
+}
+
+/// Resolve a IAT pelos resolvedores registrados (o MiResolveImageReferences
+/// de uma imagem de kernel): as dependências nativas ficam em `owned`.
+fn resolve_imports(context: &ImportContext, owned: &mut Owned) -> Result<Vec<ResolvedImportRecord>, KernelError> {
+    let (metadata, mapping, options) = (context.metadata, context.mapping, context.options);
+    let (image_base, size_of_image, import_rva, sections) = (context.image_base, context.size_of_image, context.import_rva, context.sections);
+    let user_space = options.user_space;
+    let rva_to_file_offset = |rva: u64| section_file_offset(metadata, context.section_table, context.section_count, context.size_of_headers, rva);
+    let read_c_string = |offset: u64| read_c_string(metadata, offset);
+    let mut resolved_imports = Vec::new();
+    if import_rva != 0 && !options.skip_imports {
+        let importer = String::from(context.importer);
+        let mut descriptor = rva_to_file_offset(import_rva)?;
+        loop {
+            let ilt_rva = metadata.read_u32(descriptor)? as u64;
+            let name_rva = metadata.read_u32(descriptor + 12)? as u64;
+            let iat_rva = metadata.read_u32(descriptor + 16)? as u64;
+            if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
+                break;
+            }
+            let dll = read_c_string(rva_to_file_offset(name_rva)?)?;
+            let lower = dll.to_lowercase();
+            let host = if lower.starts_with("api-") || lower.starts_with("ext-") { crate::ntos::mm::sysload::kernel_api_set::resolve(&dll, &importer)? } else { Some(dll.clone()) };
+            let Some(host) = host else { return Err(KernelError::new(alloc::format!("API set desconhecido: {dll}"))) };
+            debug_print!("[pe] imports de {}", dll);
+            let mut slot = 0u64;
+            loop {
+                let entry = rva_to_file_offset(if ilt_rva != 0 { ilt_rva } else { iat_rva })? + slot * 8;
+                let low = metadata.read_u32(entry)?;
+                let high = metadata.read_u32(entry + 4)?;
+                if low == 0 && high == 0 {
+                    break;
+                }
+                if iat_rva == 0 || iat_rva + slot * 8 > size_of_image - 8 {
+                    return Err(KernelError::new("PE: IAT fora da imagem"));
+                }
+                let iat = iat_rva + slot * 8;
+                let symbol = if high & 0x8000_0000 != 0 {
+                    ImportSymbol::Ordinal(low & 0xFFFF)
+                } else {
+                    if high != 0 {
+                        return Err(KernelError::new("PE: RVA de import invalido"));
+                    }
+                    ImportSymbol::Name(read_c_string(rva_to_file_offset(low as u64)? + 2)?)
+                };
+                let label = match &symbol {
+                    ImportSymbol::Ordinal(ordinal) => alloc::format!("ordinal #{ordinal}"),
+                    ImportSymbol::Name(name) => name.clone(),
+                };
+                if host.is_empty() {
+                    // Default opcional do linker no IAT (já relocado): o
+                    // ponteiro original precisa cair numa seção executável.
+                    let address = mapping.read64(iat);
+                    let rva = address.wrapping_sub(image_base);
+                    let executable = rva < size_of_image && sections.iter().any(|section| section.characteristics & 0x2000_0000 != 0 && rva >= section.va as u64 && rva < section.va as u64 + section.virtual_size.max(section.raw_size) as u64);
+                    if !executable {
+                        return Err(KernelError::new(alloc::format!("API set sem default nativo executavel: {dll}!{label}")));
+                    }
+                    resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: true });
+                    slot += 1;
+                    continue;
+                }
+                match resolve(&host, &symbol) {
+                    None => return Err(KernelError::new(alloc::format!("API nao suportada: {dll}!{label}"))),
+                    Some(ResolvedImport::Address { address, dependencies }) => {
+                        for dependency in dependencies {
+                            if !owned.dependencies.iter().any(|held| Arc::ptr_eq(held, &dependency)) {
+                                dependency.retain();
+                                owned.dependencies.push(dependency);
+                            }
+                        }
+                        mapping.write64(iat, address);
+                        resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: false });
+                    }
+                    Some(ResolvedImport::Thunk(id)) => {
+                        // Ring 3 não alcança trampolins supervisores.
+                        if user_space {
+                            return Err(KernelError::new(alloc::format!("API do kernel ({dll}!{label}) inalcancavel de ring 3")));
+                        }
+                        let Some((table, count)) = *THUNK_TABLE.lock() else { return Err(KernelError::new("tabela de trampolins indisponivel")) };
+                        if id >= count {
+                            return Err(KernelError::new(alloc::format!("apiId {id} alem da tabela de trampolins ({count})")));
+                        }
+                        let address = kernel_address::image_address(table + id as u64 * STUB_SIZE)?;
+                        mapping.write64(iat, address);
+                        resolved_imports.push(ResolvedImportRecord { dll: dll.clone(), name: label, rva: iat, address, native_default: false });
+                    }
+                }
+                slot += 1;
+            }
+            descriptor += 20;
+        }
+    }
+    Ok(resolved_imports)
 }

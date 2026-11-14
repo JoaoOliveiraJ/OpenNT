@@ -14,8 +14,9 @@ pub const USER_PROGRAM: &str = or_default(option_env!("OPENNT_USER_PROGRAM"), "s
 /// `--kernel-test-scope`: `none` no build normal; `all` roda o self-test.
 pub const KERNEL_TEST_SCOPE: &str = or_default(option_env!("OPENNT_KERNEL_TEST_SCOPE"), "none");
 
-/// `--start-driver`: serviço de driver iniciado pelo SCM antes do programa
-/// de usuário, com a CI fiscalizando as cargas (vazio = nenhum).
+/// `--start-driver`: serviços de driver iniciados pelo SCM antes do programa
+/// de usuário, separados por vírgula e na ordem dada, com a CI fiscalizando
+/// as cargas (vazio = nenhum).
 pub const START_DRIVER: &str = or_default(option_env!("OPENNT_START_DRIVER"), "");
 
 /// `--trace-driver-api`: imprime cada chamada de API do driver de

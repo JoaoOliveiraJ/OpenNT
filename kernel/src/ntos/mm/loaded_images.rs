@@ -17,6 +17,17 @@ use crate::ntos::inc::types::{ImageDosHeader, ImageNtHeaders64, KldrDataTableEnt
 
 const ENTRY_BYTE_LENGTH: u64 = KldrDataTableEntry::SIZE;
 
+/// KLDR_DATA_TABLE_ENTRY.Flags, bit 12: os imports da imagem estão sendo
+/// resolvidos. O MiResolveImageImports liga o bit em volta do
+/// MiResolveImageReferences; um importador que acha na lista uma entrada com
+/// o bit (um ciclo de imports) usa a DllBase dela sem somar LoadCount.
+pub const LOAD_IN_PROGRESS: u32 = 0x1000;
+/// Flags, bit 26: imagem carregada como DLL de um importador. O
+/// MiLoadImportDll liga o bit antes do MmCallDllInitialize, e o
+/// MmLoadSystemImage de uma imagem já listada com ele devolve
+/// STATUS_IMAGE_ALREADY_LOADED_AS_DLL.
+pub const DRIVER_DEPENDENT_DLL: u32 = 0x0400_0000;
+
 fn list_entry(address: u64) -> &'static ListEntry {
     // SAFETY: cabeça e entradas da lista nativa mantidas por este módulo.
     unsafe { ListEntry::at(address) }
@@ -217,6 +228,32 @@ pub fn unregister(id: u64) -> Result<bool, KernelError> {
         observer(&image);
     }
     Ok(true)
+}
+
+/// Liga `set` e desliga `clear` nas Flags da imagem, no registro e na
+/// entrada nativa já materializada; devolve o registro atualizado.
+pub fn update_flags(id: u64, set: u32, clear: u32) -> Option<LoadedImage> {
+    let mut registry = REGISTRY.lock();
+    let flags = {
+        let (image, _) = registry.owned.get_mut(&id)?;
+        image.loader_flags = (image.loader_flags & !clear) | set;
+        image.loader_flags
+    };
+    if let Some(image) = registry.images.iter_mut().find(|image| image.id == id) {
+        image.loader_flags = flags;
+    }
+    if let Some(entry) = registry.native_entries.get(&id) {
+        // SAFETY: entrada nativa viva desta imagem.
+        unsafe { KldrDataTableEntry::at(entry.pointer) }.flags.set(flags);
+    }
+    registry.owned.get(&id).map(|(image, _)| image.clone())
+}
+
+/// A imagem listada cujo BaseDllName (o último componente do nome) é
+/// `base_name`, sem distinguir maiúsculas: a busca do
+/// MiResolveImageReferences na PsLoadedModuleList.
+pub fn find_by_base_name(base_name: &str) -> Option<LoadedImage> {
+    REGISTRY.lock().images.iter().find(|image| image.name.rsplit(['\\', '/']).next().is_some_and(|base| base.eq_ignore_ascii_case(base_name))).cloned()
 }
 
 /// Some da enumeração sem liberar o mapeamento (vistas de diagnóstico).

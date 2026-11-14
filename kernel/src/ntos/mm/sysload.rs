@@ -9,6 +9,12 @@
 //! seus encaminhamentos reais) só publicam exports; um .sys comum importado
 //! sobe como driver pelo lifecycle. Cada importador retém os módulos que
 //! fornecem os seus endereços nativos.
+//!
+//! Ciclos de imports (o netio.sys e o ndis.sys importam um do outro) seguem
+//! o MiResolveImageReferences: a imagem em carga já está na lista de imagens
+//! carregadas com LOAD_IN_PROGRESS, e o import que volta a ela usa os exports
+//! dessa entrada sem reter referência. A DLL nova de um import ganha
+//! DRIVER_DEPENDENT_DLL e o DllInitialize logo depois da própria carga.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -20,6 +26,7 @@ use self::kernel_image_source::ImageSource;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{DriverObject, KldrDataTableEntry, UnicodeString};
 use crate::ntos::{init::exports, io::lifecycle};
+use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::pe_loader::{self, ImageDependency, ImportSymbol, LoadOptions, PeImage, ResolvedImport};
 use self::pe_resolver::{ExportedModule, Symbol};
 use crate::hal::amd64::native_call;
@@ -101,9 +108,16 @@ fn call(address: u64, arguments: &[u64]) -> u32 {
     native_call::call(address, arguments) as u32
 }
 
-/// DllInitialize(RegistryPath) com o caminho do serviço do módulo.
-fn initialize(record: &mut Record) -> Result<(), KernelError> {
-    let service = record.name.trim_end_matches(".sys").trim_end_matches(".dll");
+/// MmCallDllInitialize: DllInitialize(RegistryPath) com o caminho do serviço
+/// do módulo (o BaseDllName até o primeiro ponto). A trava do registro não
+/// fica presa durante a chamada: a entrada já está publicada, e uma carga
+/// aninhada a acha como no NT.
+fn initialize(shared: &Shared) -> Result<(), KernelError> {
+    let (name, entry) = {
+        let record = shared.lock();
+        (record.name.clone(), record.module.exports.exports.get("DllInitialize").copied().unwrap_or(0))
+    };
+    let service = name.split('.').next().unwrap_or(&name);
     let path = alloc::format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{service}");
     let units: Vec<u16> = path.encode_utf16().collect();
     let buffer = guest::alloc_bytes((units.len() as u64 + 1) * 2);
@@ -122,14 +136,14 @@ fn initialize(record: &mut Record) -> Result<(), KernelError> {
     registry_path.length.set(units.len() as u16 * 2);
     registry_path.maximum_length.set((units.len() as u16 + 1) * 2);
     registry_path.buffer.set(buffer);
-    crate::debug_print!("[kernel-library] DllInitialize {}", record.name);
-    let entry = record.module.exports.exports.get("DllInitialize").copied().unwrap_or(0);
+    crate::debug_print!("[kernel-library] DllInitialize {}", name);
     let status = call(entry, &[string]);
     guest::free_bytes(string);
     guest::free_bytes(buffer);
-    record.initialize_status = Some(status);
+    shared.lock().initialize_status = Some(status);
+    crate::debug_print!("[kernel-library] DllInitialize {} -> {:#x}", name, status);
     if status & 0x8000_0000 != 0 {
-        return Err(KernelError::with_status(alloc::format!("DllInitialize {} returned 0x{status:x}", record.name), status));
+        return Err(KernelError::with_status(alloc::format!("DllInitialize {name} returned 0x{status:x}"), status));
     }
     Ok(())
 }
@@ -202,7 +216,22 @@ fn exported(name: &str, exports: BTreeMap<String, u64>) -> Arc<ExportedModule> {
     Arc::new(ExportedModule { name: String::from(name), exports: crate::ntos::rtl::image::pe_exports::Exports { exports, ..Default::default() } })
 }
 
-fn get(name: &str) -> Result<Shared, KernelError> {
+/// Módulo de uma imagem cujos imports estão sendo resolvidos (LOAD_IN_PROGRESS
+/// na lista de imagens carregadas): o fim de um ciclo de imports. Como no
+/// MiResolveImageReferences, o importador usa os exports da entrada em carga
+/// sem reter referência (o LoadCount não sobe).
+fn resolving_module(name: &str) -> Option<Arc<ExportedModule>> {
+    let image = loaded_images::find_by_base_name(name).filter(|image| image.loader_flags & loaded_images::LOAD_IN_PROGRESS != 0)?;
+    let exports = pe_loader::resolving_exports(image.id)?;
+    Some(Arc::new(ExportedModule { name: String::from(name), exports }))
+}
+
+/// O registro do módulo, carregando-o na primeira vez. `dependent` = carga
+/// pelo import de outra imagem (o MiLoadImportDll): a imagem nova ganha
+/// DRIVER_DEPENDENT_DLL. O DllInitialize de uma DLL nova roda logo depois da
+/// carga dela, com o registro já publicado, antes de o importador seguir para
+/// os imports seguintes (MiLoadImportDll -> MmCallDllInitialize).
+fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
     let name = normalize(name)?;
     if LOADING.lock().contains(&name) {
         return Err(KernelError::new(alloc::format!("circular kernel module import: {name}")));
@@ -224,40 +253,52 @@ fn get(name: &str) -> Result<Shared, KernelError> {
             let exports = lifecycle::driver_exports(&driver_name).unwrap_or_default();
             return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: true, driver, driver_node: Some(node), image: None, module: exported(&name, exports), initialize_status: None, unload_status: None });
         }
-        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { image_name: Some(String::from(source.name())), ..LoadOptions::default() })?;
-        let module = Arc::new(ExportedModule { name: name.clone(), exports: image.exports.clone() });
-        let mut record = Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Entryless, state: State::Ready, references: 0, pinned: false, driver: 0, driver_node: None, image: None, module, initialize_status: None, unload_status: None };
-        if image.exports.exports.contains_key("DllInitialize") {
-            record.kind = Kind::ExportDriver;
-            record.image = Some(image);
-            if let Err(error) = initialize(&mut record) {
-                if let Some(mut image) = record.image.take() {
-                    let _ = image.release();
-                }
-                return Err(error);
-            }
-        } else if image.entry_point == 0 {
-            record.image = Some(image);
-        } else if name.ends_with(".sys") {
+        let (entry_rva, has_initialize) = pe_loader::file_entry_and_initialize(source.as_ref())?;
+        if name.ends_with(".sys") && entry_rva != 0 && !has_initialize {
             // Driver comum importado: sobe pelo lifecycle, que é o dono da
-            // imagem e do DriverEntry.
-            let mut image = image;
-            image.release()?;
+            // imagem (mapeada uma vez) e do DriverEntry.
             lifecycle::load_driver(&alloc::format!("/{name}"), &lifecycle::DriverOptions::default()).map_err(|error| error.error)?;
-            record.kind = Kind::Driver;
-            record.driver = lifecycle::initialized_driver(&driver_name).unwrap_or(0);
-            record.driver_node = object_manager::lookup(&alloc::format!("\\Driver\\{driver_name}"));
-            record.module = exported(&name, lifecycle::driver_exports(&driver_name).unwrap_or_default());
-        } else {
-            let mut image = image;
-            let _ = image.release();
+            let driver = lifecycle::initialized_driver(&driver_name).unwrap_or(0);
+            let driver_node = object_manager::lookup(&alloc::format!("\\Driver\\{driver_name}"));
+            let module = exported(&name, lifecycle::driver_exports(&driver_name).unwrap_or_default());
+            return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: false, driver, driver_node, image: None, module, initialize_status: None, unload_status: None });
+        }
+        if !has_initialize && entry_rva != 0 {
             return Err(KernelError::new(alloc::format!("kernel DLL has no DllInitialize: {name}")));
         }
-        Ok(record)
+        // FullDllName de uma DLL carregada pelo import (o MiFormFullImageName
+        // junta o diretório do importador e o nome): os drivers e as suas
+        // bibliotecas ficam em System32\drivers, as DLLs de kernel em System32.
+        let full_name = if name.ends_with(".sys") { lifecycle::system_driver_path(&name) } else { alloc::format!("\\SystemRoot\\System32\\{name}") };
+        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { image_name: Some(full_name), ..LoadOptions::default() })?;
+        if dependent {
+            if let Some(loaded) = image.loaded_image.as_ref() {
+                loaded_images::update_flags(loaded.id, loaded_images::DRIVER_DEPENDENT_DLL, 0);
+            }
+        }
+        let module = Arc::new(ExportedModule { name: name.clone(), exports: image.exports.clone() });
+        let kind = if has_initialize { Kind::ExportDriver } else { Kind::Entryless };
+        Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind, state: State::Ready, references: 0, pinned: false, driver: 0, driver_node: None, image: Some(image), module, initialize_status: None, unload_status: None })
     })();
     LOADING.lock().remove(&name);
-    let shared = Arc::new(SpinLock::new(result?));
-    LOADED.lock().insert(name, shared.clone());
+    let record = result?;
+    let needs_initialize = record.kind == Kind::ExportDriver;
+    let shared = Arc::new(SpinLock::new(record));
+    LOADED.lock().insert(name.clone(), shared.clone());
+    if needs_initialize {
+        if let Err(error) = initialize(&shared) {
+            LOADED.lock().remove(&name);
+            let image = {
+                let mut record = shared.lock();
+                record.state = State::Unloaded;
+                record.image.take()
+            };
+            if let Some(mut image) = image {
+                let _ = image.release();
+            }
+            return Err(error);
+        }
+    }
     Ok(shared)
 }
 
@@ -267,7 +308,7 @@ pub fn load(name: &str) -> Result<Arc<ExportedModule>, KernelError> {
     if name == "ntoskrnl.exe" {
         return Ok(Arc::new(exports::export_module()?));
     }
-    let record = get(&name)?;
+    let record = get(&name, false)?;
     let mut state = record.lock();
     state.pinned = true;
     if state.driver != 0 {
@@ -329,7 +370,7 @@ impl Acquired {
 
 /// Carga com referência própria, devolvida pelo chamador (`acquire`).
 pub fn acquire(name: &str) -> Result<Acquired, KernelError> {
-    let record = get(&normalize(name)?)?;
+    let record = get(&normalize(name)?, false)?;
     let lease = Lease(record.clone());
     lease.retain();
     let state = record.lock();
@@ -337,17 +378,39 @@ pub fn acquire(name: &str) -> Result<Acquired, KernelError> {
     Ok(Acquired { lease: Some(lease), image_base, size_of_image, module: state.module.clone() })
 }
 
+/// O módulo de um encaminhamento de export de uma imagem de kernel. O
+/// texto do encaminhamento não traz a extensão ("NDIS.NdisMatchPdoWithPacket"):
+/// o MiSnapThunk procura na PsLoadedModuleList a imagem cujo BaseDllName
+/// começa com "<módulo>." (RtlPrefixString, sem distinguir maiúsculas), então
+/// "NDIS" casa com o NDIS.SYS carregado. Sem imagem carregada com esse
+/// prefixo, vale o nome como veio (uma DLL de kernel, `<módulo>.dll`).
+fn forwarder_module(target: &str) -> Result<String, KernelError> {
+    let stem = target.rsplit_once('.').map_or(target, |(stem, _)| stem);
+    let prefix = alloc::format!("{}.", stem.to_lowercase());
+    let found = loaded_images::list().into_iter().find_map(|image| {
+        let base = String::from(image.name.rsplit(['\\', '/']).next().unwrap_or(&image.name)).to_lowercase();
+        base.starts_with(&prefix).then_some(base)
+    });
+    match found {
+        Some(base) => normalize(&base),
+        None => normalize(target),
+    }
+}
+
 /// Resolve o export (com os encaminhamentos) e devolve os módulos que o
 /// importador passa a reter.
 pub fn lookup(name: &str, symbol: &ImportSymbol) -> Result<(u64, Vec<Arc<dyn ImageDependency>>), KernelError> {
     let mut dependencies: Vec<Shared> = Vec::new();
     let result = (|| {
-        let mut module = |target: &str, _from: &str| -> Result<Arc<ExportedModule>, KernelError> {
-            let target = normalize(target)?;
+        let mut module = |target: &str, from: &str| -> Result<Arc<ExportedModule>, KernelError> {
+            let target = if from.is_empty() { normalize(target)? } else { forwarder_module(target)? };
             if target == "ntoskrnl.exe" {
                 return Ok(Arc::new(exports::export_module()?));
             }
-            let record = get(&target)?;
+            if let Some(module) = resolving_module(&target) {
+                return Ok(module);
+            }
+            let record = get(&target, true)?;
             let module = record.lock().module.clone();
             if !dependencies.iter().any(|candidate| Arc::ptr_eq(candidate, &record)) {
                 dependencies.push(record);
@@ -687,8 +750,6 @@ const SYSTEM_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
 const SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL: u32 = 0xC000_019D;
 const MM_LOAD_IMAGE_IN_SESSION: u32 = 1;
 const MM_LOAD_IMAGE_AND_LOCKDOWN: u32 = 2;
-/// KLDR_DATA_TABLE_ENTRY.Flags e o bit testado no caminho "já carregada".
-const SYSTEM_IMAGE_LOADED_AS_DLL: u32 = 0x0400_0000;
 
 /// Imagens carregadas por MmLoadSystemImage, pela entrada do loader.
 static SYSTEM_IMAGES: SpinLock<BTreeMap<u64, PeImage>> = SpinLock::new(BTreeMap::new());
@@ -736,7 +797,7 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
         handle_out.set(entry);
         base_out.set(image_base);
         // SAFETY: a entrada nativa da imagem já listada.
-        if unsafe { KldrDataTableEntry::at(entry) }.flags.get() & SYSTEM_IMAGE_LOADED_AS_DLL != 0 {
+        if unsafe { KldrDataTableEntry::at(entry) }.flags.get() & loaded_images::DRIVER_DEPENDENT_DLL != 0 {
             return Ok(SYSTEM_IMAGE_ALREADY_LOADED_AS_DLL);
         }
         if session && crate::ntos::mm::session_image::is_session_image(image_base) {

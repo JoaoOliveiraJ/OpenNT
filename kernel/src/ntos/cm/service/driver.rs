@@ -172,7 +172,11 @@ fn start_with_chain(name: &str, chain: &mut BTreeSet<String>) -> Result<u32, Dri
         }
         // Publica a transição antes de executar código do driver.
         OPERATIONS.lock().insert(key.clone(), Operation { pending: 2, error: 0 });
-        let options = DriverOptions { service_name: Some(configuration.name.clone()), registry_path: Some(format!("{}\\{}", service_database::ROOT, configuration.name)), load: None };
+        // O IopLoadDriver passa ao MmLoadSystemImage o ImagePath do serviço
+        // (relativo é relativo a \SystemRoot): é o FullDllName da imagem.
+        let image_name = if configuration.image_path.starts_with('\\') { configuration.image_path.clone() } else { format!("\\SystemRoot\\{}", configuration.image_path) };
+        let load = crate::ntos::mm::pe_loader::LoadOptions { image_name: Some(image_name), ..Default::default() };
+        let options = DriverOptions { service_name: Some(configuration.name.clone()), registry_path: Some(format!("{}\\{}", service_database::ROOT, configuration.name)), load: Some(load) };
         lifecycle::load_driver(&driver_path, &options).map_err(|error| DriverServiceError { win32: error.win32_error, ntstatus: error.ntstatus, message: error.error.message })?;
         if initialized_driver(&configuration).is_none() {
             return fail(31, "driver initialization did not publish an initialized object");
