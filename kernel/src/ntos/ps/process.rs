@@ -412,6 +412,7 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     // KPROCESS embutido: tipo (o DWORD do cabeçalho inteiro) + DirectoryTableBase
     // (a raiz própria do processo de usuário ou a do System).
     object.pcb.header.lock.set(PROCESS_OBJECT as i32);
+    object.pcb.header.signal_state.set(0);
     object.pcb.base_priority.set(8);
     object.pcb.directory_table_base.set(process_address_space::root_of(process).unwrap_or(memory_map::PML4_PHYS));
     object.unique_process_id.set(process_id);
@@ -715,6 +716,9 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     }
     object.active_threads.set(0);
     write_time(&object.exit_time, timestamp());
+    // O KPROCESS é um objeto de espera: sinalizado no término, como o
+    // KeTerminateProcess faz; quem espera no handle do processo acorda.
+    object.pcb.header.signal_state.set(1);
     remove_from_active_list(object);
     // Fora da lista ativa, o estado por processo some e o VAD volta inteiro
     // (o MmCleanProcessAddressSpace); o EPROCESS pode continuar retido por
@@ -768,6 +772,17 @@ pub fn is_process(pointer: u64) -> bool {
 /// Consulta um registro de processo.
 pub fn with_record<T>(pointer: u64, body: impl FnOnce(&ProcessRecord) -> T) -> Option<T> {
     STATE.lock().processes.get(&pointer).map(body)
+}
+
+/// O pai declarado de um processo recém-criado (o PS_ATTRIBUTE_PARENT_PROCESS
+/// do NtCreateUserProcess), antes da primeira thread: o PID dele no registro
+/// (o das notificações de processo) e em EPROCESS.InheritedFromUniqueProcessId.
+pub fn set_parent(process: u64, parent: u64) {
+    let parent_id = eprocess(parent).unique_process_id.get();
+    if let Some(record) = STATE.lock().processes.get_mut(&process) {
+        record.parent_id = parent_id;
+    }
+    eprocess(process).inherited_from_unique_process_id.set(parent_id);
 }
 
 pub fn reference(pointer: u64) -> Option<u32> {

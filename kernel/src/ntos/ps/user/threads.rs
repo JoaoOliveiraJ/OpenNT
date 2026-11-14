@@ -404,9 +404,10 @@ fn prepare_main(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntd
     }
     initialize_context(context, rip, rsp, argument, ntdll_base);
     let process_pointer = process::get_current_process();
+    // A suspensão da criação (THREAD_CREATE_FLAGS_CREATE_SUSPENDED) fica: o
+    // registro no despacho a respeita.
     thread.with(|thread| {
         thread.context = context;
-        thread.suspend_count = 0;
         thread.exit_status = PENDING;
         thread.dead = false;
         thread.wait = None;

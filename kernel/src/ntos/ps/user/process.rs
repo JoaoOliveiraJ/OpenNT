@@ -10,6 +10,11 @@
 //! enquanto isso. Inclui o post-mortem (candidatos de retorno na pilha da
 //! saída, Ldr e pilha da falha), que o fim do processo chama.
 //!
+//! O NtCreateUserProcess também mora aqui, como adaptador fino: os onze
+//! argumentos vão para `ps::create_context::create`, que captura o pedido da
+//! memória do chamador, cria pelo mesmo caminho único, põe o processo no
+//! despachante e devolve os handles na tabela de quem chamou.
+//!
 //! Todo processo que roda aqui acaba em `ps::process::terminate_process`
 //! (pelo `ps::create::exit_process`, pedido de onde for), inclusive nas
 //! falhas, e o término libera tudo o que ele possui
@@ -33,6 +38,7 @@ use crate::ntos::cm::service::database::{self as service_database, CommandLine, 
 use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::ntos::mm::{paging, pfn};
 use crate::ntos::ps::create::{self, CreateFailure, CreateProcessRequest, CreatedProcess, ImageOrigin};
+use crate::ntos::ps::create_context::{self, UserCreateRequest};
 use crate::ntos::ps::process;
 use crate::ntos::ps::process_parameters::ProcessParameters;
 use crate::rtl::KernelError;
@@ -57,7 +63,7 @@ pub fn windows_process_request<'a>(image: ImageOrigin, image_name: &'a str, dos_
     }
     parameters.standard_output = options.standard_output;
     parameters.standard_error = options.standard_output;
-    CreateProcessRequest { image, image_name, parameters, on_created: options.on_process_created, inherit_handles_from: None }
+    CreateProcessRequest { image, image_name, parameters, parent: None, thread_flags: 0, inherit_handles_from: None, on_created: options.on_process_created }
 }
 
 /// Um processo posto no despachante por [`start_created`]: anda com os
@@ -159,6 +165,34 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
         Err(CreateFailure::ExeFormat(error) | CreateFailure::Other(error)) => Err(error),
         Err(failure @ CreateFailure::FileOpen(_)) => Err(KernelError::with_status(format!("{failure}"), failure.status())),
     }
+}
+
+/// NtCreateUserProcess(ProcessHandle*, ThreadHandle*, ProcessDesiredAccess,
+/// ThreadDesiredAccess, ProcessObjectAttributes, ThreadObjectAttributes,
+/// ProcessFlags, ThreadFlags, ProcessParameters, CreateInfo, AttributeList):
+/// os sete argumentos da pilha e o corpo de `ps::create_context`.
+fn nt_create_user_process(process_handle: u64, thread_handle: u64, process_access: u64, thread_access: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 7 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let request = UserCreateRequest {
+        process_handle,
+        thread_handle,
+        process_access: process_access as u32,
+        thread_access: thread_access as u32,
+        process_attributes: state::stack_arg(rsp, 5),
+        thread_attributes: state::stack_arg(rsp, 6),
+        process_flags: state::stack_arg32(rsp, 7),
+        thread_flags: state::stack_arg32(rsp, 8),
+        parameters: state::stack_arg(rsp, 9),
+        create_info: state::stack_arg(rsp, 10),
+        attribute_list: state::stack_arg(rsp, 11),
+    };
+    create_context::create(&request)
+}
+
+pub fn init() {
+    state::register_handler("NtCreateUserProcess", nt_create_user_process);
 }
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha

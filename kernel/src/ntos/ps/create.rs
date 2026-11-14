@@ -28,6 +28,11 @@
 //!    e da ntdll anexadas ao processo novo, com o PID dele (os drivers leem
 //!    os cabeçalhos em ImageBase).
 //!
+//! O pedido pode declarar outro pai (o PS_ATTRIBUTE_PARENT_PROCESS do
+//! NtCreateUserProcess, que `ps/create_context.rs` traduz) e criar a thread
+//! principal suspensa (THREAD_CREATE_FLAGS_CREATE_SUSPENDED): ela entra no
+//! despachante com a suspensão e só anda depois do NtResumeThread.
+//!
 //! O processo sai parado ([`CreatedProcess`]): a thread principal ainda não
 //! entrou no despachante. Toda falha depois do passo 2 passa pelo término,
 //! que libera o que o processo já possui, e um processo criado que é
@@ -64,6 +69,7 @@ use crate::ntos::ps::user::process_state;
 use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::ntos::ps::user::threads::{self, UserThread};
 use crate::ntos::ps::{cid, process_context};
+use crate::ntos::rtl::image::pe_image_information::INFORMATION_SIZE;
 use crate::rtl::KernelError;
 
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
@@ -72,6 +78,9 @@ const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
 const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
 /// Um processo criado que é descartado sem rodar.
 const STATUS_CANCELLED: u32 = 0xC000_0120;
+/// THREAD_CREATE_FLAGS_CREATE_SUSPENDED e THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER.
+pub const THREAD_CREATE_SUSPENDED: u32 = 0x1;
+pub const THREAD_HIDE_FROM_DEBUGGER: u32 = 0x4;
 
 /// De onde vem a imagem principal.
 pub enum ImageOrigin {
@@ -90,6 +99,13 @@ pub struct CreateProcessRequest<'a> {
     /// bytes, `\BootBundle\apps\<nome>`).
     pub image_name: &'a str,
     pub parameters: ProcessParameters,
+    /// O pai declarado (EPROCESS), quando não é quem cria: o PID dele vai para
+    /// as notificações de processo e para EPROCESS.InheritedFromUniqueProcessId.
+    pub parent: Option<u64>,
+    /// THREAD_CREATE_FLAGS_* da thread principal: [`THREAD_CREATE_SUSPENDED`]
+    /// e [`THREAD_HIDE_FROM_DEBUGGER`] valem; os outros bits não mudam nada
+    /// na thread inicial.
+    pub thread_flags: u32,
     /// Chamado com o PID quando o processo já está inteiro e ainda parado;
     /// uma falha termina o processo.
     pub on_created: Option<&'a dyn Fn(u64) -> Result<(), KernelError>>,
@@ -155,6 +171,9 @@ pub struct CreatedProcess {
     pub image_base: u64,
     pub entry_point: u64,
     pub size_of_image: u64,
+    /// O SECTION_IMAGE_INFORMATION da imagem principal, na base real (o
+    /// PS_ATTRIBUTE_IMAGE_INFO do NtCreateUserProcess).
+    pub image_information: [u8; INFORMATION_SIZE],
     /// O CONTEXT inicial que o LdrInitializeThunk recebe: o
     /// RtlUserThreadStart(entry, PEB) da primeira thread, numa região do
     /// processo.
@@ -305,16 +324,18 @@ fn push_image(base: u64, size: u64, name: &str) {
 /// A imagem principal no espaço do processo em montagem (o corrente,
 /// anexado): mapeada na raiz dele e possuída por ele até o término (como a
 /// vista da seção de imagem no VAD do NT), com EPROCESS.SectionBaseAddress
-/// na base real. Devolve (entry, base, tamanho).
-fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: &LoadOptions, name: &str) -> Result<(u64, u64, u64), KernelError> {
+/// na base real. Devolve (entry, base, tamanho) e o
+/// SECTION_IMAGE_INFORMATION.
+fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: &LoadOptions, name: &str) -> Result<((u64, u64, u64), [u8; INFORMATION_SIZE]), KernelError> {
     let Some(owner) = process_state::get(process_pointer) else { return Err(KernelError::new("imagem principal sem estado do processo")) };
     let image = pe_loader::load_from_source(source.clone(), options)?;
     let placed = (image.entry_point, image.image_base, image.size_of_image);
+    let information = image.image_information;
     owner.adopt_image(image);
     // SAFETY: o EPROCESS em montagem, retido pelo chamador.
     unsafe { Eprocess::at(process_pointer) }.section_base_address.set(placed.1);
     push_image(placed.1, placed.2, name);
-    Ok(placed)
+    Ok((placed, information))
 }
 
 /// A KTHREAD da primeira thread, com pilha de kernel própria.
@@ -343,6 +364,7 @@ struct Built {
     entry_point: u64,
     image_base: u64,
     size_of_image: u64,
+    image_information: [u8; INFORMATION_SIZE],
 }
 
 /// A ntdll de sistema (o PspSystemDll), o apiset e o NLS prontos, e as
@@ -384,6 +406,9 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     if let Some(identity) = process_state::get(process_pointer) {
         identity.set_image_path(&parameters.image_path_name);
     }
+    if let Some(parent) = request.parent {
+        process::set_parent(process_pointer, parent);
+    }
     // Daqui em diante toda saída passa pelo término, que libera o que o
     // processo possui.
     let fail = |error: KernelError| -> CreateFailure {
@@ -406,7 +431,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     let built = cid::allocate(cid::Kind::Thread).and_then(|thread_id| {
         process_context::with_process(process_pointer, || -> Result<Built, KernelError> {
             loader::map_system_images()?;
-            let (entry_point, image_base, size_of_image) = map_main_image(process_pointer, &image_source, &load_options, &parameters.image_path_name)?;
+            let ((entry_point, image_base, size_of_image), image_information) = map_main_image(process_pointer, &image_source, &load_options, &parameters.image_path_name)?;
             push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
             // A entrada vê o rsp "depois de um call" (8 mod 16) com endereço
             // de retorno 0, para falhar alto se o programa retornar.
@@ -420,7 +445,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit })?;
             let context = memory::map_user_region(threads::CONTEXT_SIZE)?;
             threads::initialize_context(context, start, stack_top, entry_point, peb);
-            Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image })
+            Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information })
         })
         .and_then(|built| built)
         .inspect_err(|_| cid::release(thread_id, 0))
@@ -431,8 +456,13 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         create_main_thread(process_pointer, thread_id).map(|thread| (built, thread)).inspect_err(|_| cid::release(thread_id, 0))
     });
     let (built, thread_pointer) = created.map_err(fail)?;
-    // A thread principal entra na lista do processo (e no índice global).
+    // A thread principal entra na lista do processo (e no índice global),
+    // suspensa se o pedido manda: o registro no despacho respeita a contagem.
     let main = UserThread::new(built.thread_id, thread_pointer, built.teb, built.entry_point);
+    main.with(|thread| {
+        thread.suspend_count = u32::from(request.thread_flags & THREAD_CREATE_SUSPENDED != 0);
+        thread.hidden = request.thread_flags & THREAD_HIDE_FROM_DEBUGGER != 0;
+    });
     threads::push(main.clone());
     process::set_thread_start(thread_pointer, built.entry_point);
     // PspInsertThread: a notificação de thread no contexto de quem cria (a
@@ -457,6 +487,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         image_base: built.image_base,
         entry_point: built.entry_point,
         size_of_image: built.size_of_image,
+        image_information: built.image_information,
         context: built.context,
         initialize,
         ntdll_base: ntdll.image_base,

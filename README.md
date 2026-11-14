@@ -156,7 +156,7 @@ cargo xtask run
 cargo xtask test-boot
 
 # Suíte completa de autotestes.
-cargo xtask test-boot SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests
+cargo xtask test-boot SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests --expect=MULTIPROCESS_OK
 
 # Digita no shell pelo monitor do QEMU e confere a saída.
 cargo xtask test-boot KERNEL_RS_OK 120000 "--keys=run hello\nps\n" "--expect== 42"

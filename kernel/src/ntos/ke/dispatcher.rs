@@ -1,9 +1,9 @@
 //! Objetos de espera do dispatcher.
 //!
-//! Eventos, semáforos, mutants, timers e threads sinalizadas. Uma espera
-//! dentro de uma syscall bloqueia a thread (`context_switch`); as outras são
-//! cooperativas: drenam timers, DPCs, work items e o escalonador enquanto
-//! aguardam o estado ou o prazo.
+//! Eventos, semáforos, mutants, timers e threads e processos sinalizados.
+//! Uma espera dentro de uma syscall bloqueia a thread (`context_switch`); as
+//! outras são cooperativas: drenam timers, DPCs, work items e o escalonador
+//! enquanto aguardam o estado ou o prazo.
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -23,6 +23,7 @@ mod object_type {
     pub const EVENT_NOTIFICATION: u8 = 0;
     pub const EVENT_SYNCHRONIZATION: u8 = 1;
     pub const MUTANT: u8 = 2;
+    pub const PROCESS: u8 = 3;
     pub const SEMAPHORE: u8 = 5;
     pub const THREAD: u8 = 6;
     pub const TIMER_NOTIFICATION: u8 = 8;
@@ -222,8 +223,9 @@ pub fn acquire_status(object: u64, consume: bool) -> Option<u32> {
                 }
             }
         }
-        // Eventos de notificação, timers de notificação e threads terminadas.
-        object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::THREAD => (state.get() != 0).then_some(0),
+        // Eventos de notificação, timers de notificação e threads e processos
+        // terminados.
+        object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::THREAD | object_type::PROCESS => (state.get() != 0).then_some(0),
         // Eventos e timers de sincronização consomem o sinal.
         object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION => {
             let signalled = if consume { state.atomic().swap(0, Ordering::SeqCst) } else { state.get() };

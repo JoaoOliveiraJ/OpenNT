@@ -2750,6 +2750,164 @@ const _: () = {
     assert!(core::mem::offset_of!(PsAttributeList, attributes) == 0x8);
 };
 
+/// `_PS_CREATE_INFO` (NtCreateUserProcess (CreateInfo, entrada e saída);
+/// 0x58 bytes, layout do Windows 10 19041).
+///
+/// Size e State seguidos de uma união escolhida pelo estado (`PS_CREATE_STATE`):
+/// a entrada `PsCreateInitialState` ([`PsCreateInfo::init_state`]), as falhas
+/// ([`PsCreateInfo::fail_section`], [`PsCreateInfo::exe_format`],
+/// [`PsCreateInfo::exe_name`]) e a saída `PsCreateSuccess`
+/// ([`PsCreateInfo::success_state`]); cada vista cobre o objeto inteiro.
+#[repr(C)]
+pub struct PsCreateInfo {
+    pub size: Field<u64>,
+    /// `PS_CREATE_STATE`.
+    pub state: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    _union_10: Reserved<0x48>,
+}
+
+/// Vista `InitState` de `_PS_CREATE_INFO` (PsCreateInitialState, entrada).
+#[repr(C)]
+pub struct PsCreateInfoInitState {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x10>,
+    /// WriteOutputOnExit (bit 0), DetectManifest (1), IFEOSkipDebugger (2),
+    /// IFEODoNotPropagateKeyState (3); ProhibitedImageCharacteristics nos 16
+    /// bits altos.
+    pub init_flags: Field<u32>,
+    pub additional_file_access: Field<u32>,
+    _pad_18: Reserved<0x40>,
+}
+
+/// Vista `FailSection` de `_PS_CREATE_INFO` (PsCreateFailOnSectionCreate).
+#[repr(C)]
+pub struct PsCreateInfoFailSection {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x10>,
+    /// -> `void`
+    pub file_handle: Field<u64>,
+    _pad_18: Reserved<0x40>,
+}
+
+/// Vista `ExeFormat` de `_PS_CREATE_INFO` (PsCreateFailExeFormat).
+#[repr(C)]
+pub struct PsCreateInfoExeFormat {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x10>,
+    pub dll_characteristics: Field<u16>,
+    _pad_12: Reserved<0x46>,
+}
+
+/// Vista `ExeName` de `_PS_CREATE_INFO` (PsCreateFailExeName).
+#[repr(C)]
+pub struct PsCreateInfoExeName {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x10>,
+    /// -> `void`
+    pub ifeo_key: Field<u64>,
+    _pad_18: Reserved<0x40>,
+}
+
+/// Vista `SuccessState` de `_PS_CREATE_INFO` (PsCreateSuccess, saída).
+#[repr(C)]
+pub struct PsCreateInfoSuccessState {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x10>,
+    /// ProtectedProcess (bit 0), AddressSpaceOverride (1),
+    /// DevOverrideEnabled (2), ManifestDetected (3), ProtectedProcessLight (4).
+    pub output_flags: Field<u32>,
+    _pad_14: Reserved<0x4>,
+    /// -> `void`
+    pub file_handle: Field<u64>,
+    /// -> `void`
+    pub section_handle: Field<u64>,
+    pub user_process_parameters_native: Field<u64>,
+    pub user_process_parameters_wow64: Field<u32>,
+    pub current_parameter_flags: Field<u32>,
+    pub peb_address_native: Field<u64>,
+    pub peb_address_wow64: Field<u32>,
+    _pad_44: Reserved<0x4>,
+    pub manifest_address: Field<u64>,
+    pub manifest_size: Field<u32>,
+    _pad_54: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for PsCreateInfo {}
+
+impl PsCreateInfo {
+    /// `PS_CREATE_STATE`.
+    pub const INITIAL_STATE: u32 = 0;
+    pub const FAIL_ON_FILE_OPEN: u32 = 1;
+    pub const FAIL_ON_SECTION_CREATE: u32 = 2;
+    pub const FAIL_EXE_FORMAT: u32 = 3;
+    pub const FAIL_MACHINE_MISMATCH: u32 = 4;
+    pub const FAIL_EXE_NAME: u32 = 5;
+    pub const SUCCESS: u32 = 6;
+
+    #[inline(always)]
+    pub fn init_state(&self) -> &PsCreateInfoInitState {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PsCreateInfoInitState>() }
+    }
+
+    #[inline(always)]
+    pub fn fail_section(&self) -> &PsCreateInfoFailSection {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PsCreateInfoFailSection>() }
+    }
+
+    #[inline(always)]
+    pub fn exe_format(&self) -> &PsCreateInfoExeFormat {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PsCreateInfoExeFormat>() }
+    }
+
+    #[inline(always)]
+    pub fn exe_name(&self) -> &PsCreateInfoExeName {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PsCreateInfoExeName>() }
+    }
+
+    #[inline(always)]
+    pub fn success_state(&self) -> &PsCreateInfoSuccessState {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<PsCreateInfoSuccessState>() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<PsCreateInfo>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfo>() == 8);
+    assert!(core::mem::offset_of!(PsCreateInfo, size) == 0x0);
+    assert!(core::mem::offset_of!(PsCreateInfo, state) == 0x8);
+    assert!(core::mem::size_of::<PsCreateInfoInitState>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfoInitState>() == core::mem::align_of::<PsCreateInfo>());
+    assert!(core::mem::offset_of!(PsCreateInfoInitState, init_flags) == 0x10);
+    assert!(core::mem::offset_of!(PsCreateInfoInitState, additional_file_access) == 0x14);
+    assert!(core::mem::size_of::<PsCreateInfoFailSection>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfoFailSection>() == core::mem::align_of::<PsCreateInfo>());
+    assert!(core::mem::offset_of!(PsCreateInfoFailSection, file_handle) == 0x10);
+    assert!(core::mem::size_of::<PsCreateInfoExeFormat>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfoExeFormat>() == core::mem::align_of::<PsCreateInfo>());
+    assert!(core::mem::offset_of!(PsCreateInfoExeFormat, dll_characteristics) == 0x10);
+    assert!(core::mem::size_of::<PsCreateInfoExeName>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfoExeName>() == core::mem::align_of::<PsCreateInfo>());
+    assert!(core::mem::offset_of!(PsCreateInfoExeName, ifeo_key) == 0x10);
+    assert!(core::mem::size_of::<PsCreateInfoSuccessState>() == 0x58);
+    assert!(core::mem::align_of::<PsCreateInfoSuccessState>() == core::mem::align_of::<PsCreateInfo>());
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, output_flags) == 0x10);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, file_handle) == 0x18);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, section_handle) == 0x20);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, user_process_parameters_native) == 0x28);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, user_process_parameters_wow64) == 0x30);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, current_parameter_flags) == 0x34);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, peb_address_native) == 0x38);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, peb_address_wow64) == 0x40);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, manifest_address) == 0x48);
+    assert!(core::mem::offset_of!(PsCreateInfoSuccessState, manifest_size) == 0x50);
+};
+
 /// `_PORT_VIEW` (NtConnectPort/NtAcceptConnectPort (LPC); 0x30 bytes).
 #[repr(C)]
 pub struct PortView {

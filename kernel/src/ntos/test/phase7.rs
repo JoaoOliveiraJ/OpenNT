@@ -5004,6 +5004,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::create_path::run(assert);
     crate::ntos::test::multiprocess::all_processes::run(assert);
     crate::ntos::test::multiprocess::cross_handles::run(assert);
+    crate::ntos::test::multiprocess::create_user_process::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

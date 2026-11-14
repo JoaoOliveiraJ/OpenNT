@@ -789,8 +789,40 @@ dereference e o PFN livre volta ao de antes.
   contexto de quem cria e as de carga de imagem anexadas ao processo novo.
   O processo sai parado (`CreatedProcess`); descartado sem rodar, termina
   com STATUS_CANCELLED, e toda falha depois do `create_process` passa pelo
-  fim do processo (`create::exit_process`). Teste:
-  `ntos/test/multiprocess/create_path.rs`.
+  fim do processo (`create::exit_process`). O pedido também pode declarar
+  outro pai (`process::set_parent`: o PID dele nas notificações e em
+  InheritedFromUniqueProcessId) e criar a thread principal suspensa
+  (THREAD_CREATE_FLAGS_CREATE_SUSPENDED; o registro no despacho respeita a
+  contagem). Teste: `ntos/test/multiprocess/create_path.rs`.
+- **NtCreateUserProcess**: o handler é o adaptador fino
+  `ps/user/process.rs::nt_create_user_process` (os onze argumentos), e o
+  corpo fica em `ps/create_context.rs` (o papel do
+  PspBuildCreateProcessContext). Tudo é sondado e capturado da memória do
+  chamador antes de agir: o PS_CREATE_INFO (`inc/types/wdk.rs::PsCreateInfo`,
+  0x58 bytes do 19041, com as vistas por estado), a PS_ATTRIBUTE_LIST copiada
+  uma vez (honra ImageName, ParentProcess com PROCESS_CREATE_PROCESS,
+  PriorityClass e as saídas ClientId, TebAddress e ImageInfo; recusa com
+  STATUS_NOT_SUPPORTED DebugObject, Token, ProtectionLevel, SecureProcess,
+  JobList e UmsThread; aceita sem efeito, no log, os demais que o kernel32
+  passa; número desconhecido, repetido ou tamanho errado dão
+  STATUS_INVALID_PARAMETER), o RTL_USER_PROCESS_PARAMETERS normalizado ou não
+  (`process_parameters::capture`: a estrutura copiada até o Length, cada
+  texto sondado com a capacidade pedida, RuntimeData como bytes, ambiente
+  por EnvironmentSize ou até o NUL duplo, os escalares do STARTUPINFO), os
+  OBJECT_ATTRIBUTES (sem nome; OBJ_INHERIT vai para o handle) e as flags
+  (as PROCESS_CREATE_FLAGS_* que pedem outro tipo de processo dão
+  STATUS_NOT_SUPPORTED; INHERIT_HANDLES vira o `inherit_handles_from` do
+  pedido: o pai declarado no ParentProcess ou, sem ele, quem chama). Depois o
+  caminho único cria o processo, `start_created` o põe no despachante, os
+  handles do processo e da thread entram na tabela de quem chamou com o
+  acesso pedido (genéricos mapeados, MAXIMUM_ALLOWED como o total do tipo) e
+  as saídas vão para as VAs sondadas: PsCreateSuccess com a PEB e o bloco de
+  parâmetros do filho (FileHandle e SectionHandle NULL), ou
+  PsCreateFailOnFileOpen/PsCreateFailExeFormat. O KPROCESS é sinalizado no
+  término (`terminate_process`), então a espera no handle do processo
+  acorda. Teste: `ntos/test/multiprocess/create_user_process.rs`, um pai
+  real no anel 3 que chama o handler com tudo na memória dele, imprime
+  `MULTIPROCESS_OK`.
 - **Memória de usuário de outro processo**: o kernel só toca a memória de
   usuário do processo corrente; para a de outro, anexa ao dono antes, como
   o KeStackAttachProcess do NT. O escopo é `ps/process_context.rs::
@@ -823,7 +855,9 @@ dereference e o PFN livre volta ao de antes.
 
 - **Autotestes no QEMU** ficam em `ntos/test/` e rodam conforme
   `--kernel-test-scope`. A suíte completa:
-  `cargo xtask test-boot PHASE3_SELFTEST_OK 240000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK ... --expect=KBDTEST_OK --expect=SELFTEST_OK`.
+  `cargo xtask test-boot PHASE3_SELFTEST_OK 240000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK ... --expect=PHASE6_SELFTEST_OK --expect=MULTIPROCESS_OK --expect=PHASE7_SELFTEST_OK --expect=KBDTEST_OK --expect=SELFTEST_OK`
+  (os `--expect` são procurados em ordem, cada um depois do anterior: o
+  `MULTIPROCESS_OK` sai dentro da fase 7, antes do `PHASE7_SELFTEST_OK`).
 - **Processo de usuário nos autotestes**: um teste que precisa rodar como
   processo de usuário usa `with_test_process`
   (`ntos/test/multiprocess/identity.rs`), que cria um EPROCESS real com
@@ -838,7 +872,9 @@ dereference e o PFN livre volta ao de antes.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
   `--trace-driver-api` mostra cada export chamado (veja o README).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
-  `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `KBDTEST_OK`, `[shell] pronto`;
+  `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
+  NtCreateUserProcess de um processo pai real, na fase 7), `KBDTEST_OK`,
+  `[shell] pronto`;
   os de falha são `*** PANIC`, `*** EXCECAO` e `SELFTEST FALHOU`.
 
 ## 6. Documentação e status
