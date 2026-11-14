@@ -10,14 +10,17 @@
 //! `Kmode` (a carga do win32k.sys pelo smss), o `BootExecute` (o autochk), os
 //! arquivos de paginação e as renomeações pendentes; do ambiente saem os
 //! caminhos de programas de terceiros. Só o boot do processo inicial real
-//! (`--initial-process=smss`) semeia esta configuração.
+//! (`--initial-process=smss`) leva esta configuração.
+//!
+//! Dados puros da hive SYSTEM (veja `cm/seed.rs`): o `xtask` grava estas
+//! chaves no arquivo da hive e o kernel só as semeia em memória quando o
+//! arquivo falta.
 
 use alloc::vec::Vec;
 
-use super::registry;
-use crate::rtl::KernelError;
+use super::seed::SeedKey;
 
-const SESSION_MANAGER: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager";
+const SESSION_MANAGER: &str = "CurrentControlSet\\Control\\Session Manager";
 
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
@@ -168,27 +171,19 @@ fn encode(value: &Value) -> (u32, Vec<u8>) {
     }
 }
 
-fn write_key(relative: &str, values: &[(&str, Value)]) -> Result<(), KernelError> {
+fn key(relative: &str, values: &[(&str, Value)]) -> SeedKey {
     let path = if relative.is_empty() { alloc::string::String::from(SESSION_MANAGER) } else { alloc::format!("{SESSION_MANAGER}\\{relative}") };
-    let handle = registry::open_or_create(&path, None)?;
+    let mut key = SeedKey::new(&path);
     for (name, value) in values {
         let (kind, data) = encode(value);
-        registry::set_value(handle, name, kind, data);
+        key.value(name, kind, data);
     }
-    registry::close_handle(handle);
-    Ok(())
+    key
 }
 
-/// Semeia a configuração do Session Manager que o smss.exe real lê.
-pub fn initialize() -> Result<(), KernelError> {
-    write_key("", ROOT)?;
-    write_key("SubSystems", SUBSYSTEMS)?;
+/// As chaves do Session Manager que o smss.exe real lê.
+pub fn seed_keys() -> Vec<SeedKey> {
     let known: Vec<(&str, Value)> = KNOWN_DLLS.iter().map(|&(name, dll)| (name, Value::Text(REG_SZ, dll))).collect();
-    write_key("KnownDLLs", &known)?;
     let devices: Vec<(&str, Value)> = DOS_DEVICES.iter().map(|&(name, target)| (name, Value::Text(REG_SZ, target))).collect();
-    write_key("DOS Devices", &devices)?;
-    write_key("Environment", ENVIRONMENT)?;
-    write_key("Memory Management", MEMORY_MANAGEMENT)?;
-    crate::debug_print!("[cm] Session Manager semeado: SubSystems, KnownDLLs ({}), DOS Devices, Environment, Memory Management", KNOWN_DLLS.len());
-    Ok(())
+    alloc::vec![key("", ROOT), key("SubSystems", SUBSYSTEMS), key("KnownDLLs", &known), key("DOS Devices", &devices), key("Environment", ENVIRONMENT), key("Memory Management", MEMORY_MANAGEMENT)]
 }

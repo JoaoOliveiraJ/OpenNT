@@ -14,8 +14,12 @@
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
+// As tabelas de semente do kernel (`hive_image`) usam `alloc::`.
+extern crate alloc;
+
 mod build;
 mod elf;
+mod hive_image;
 mod kernel_pe;
 mod nt_types;
 mod ntfs_image;

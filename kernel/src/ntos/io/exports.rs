@@ -726,9 +726,10 @@ pub mod driver_helpers {
         portable_operating_system::check(call.arg(1));
         Ok(0)
     }
-    /// ZwFlushKey: o Registry do OpenNT é em memória; nada a descarregar.
-    fn flush_key(_: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(0))
+    /// ZwFlushKey(KeyHandle): a lógica mora em `cm/hive_services` (o slot
+    /// fica neste grupo para não mudar a ABI).
+    fn flush_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(crate::ntos::cm::hive_services::flush_key(call.arg(1), false)))
     }
 
     pub static GROUP: Group = Group {

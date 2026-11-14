@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 422] {
+fn groups() -> [&'static Group; 423] {
     [
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
         &crate::ntos::alpc::exports::lpc::GROUP,
@@ -66,6 +66,7 @@ fn groups() -> [&'static Group; 422] {
         &crate::ntos::rtl::exports::rtl_unicode_prefix::GROUP,
         &crate::ntos::rtl::exports::rtl_app_container::GROUP,
         &crate::ntos::ps::exports::ps_paged_pool_quota::GROUP,
+        &crate::ntos::cm::exports::cm_hive::GROUP,
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
         &crate::ntos::ps::exports::GROUP,

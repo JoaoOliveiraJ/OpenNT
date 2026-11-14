@@ -36,12 +36,19 @@
 //!
 //! Null, Beep e Fs_Rec não têm ImagePath na instalação
 //! (o I/O Manager usa \SystemRoot\System32\Drivers\<serviço>.sys), e o
-//! Fs_Rec é do tipo SERVICE_RECOGNIZER_DRIVER (8): as chaves deles são
-//! gravadas valor a valor, sem ImagePath, como na instalação.
+//! Fs_Rec é do tipo SERVICE_RECOGNIZER_DRIVER (8): as chaves deles levam
+//! Type, Start, ErrorControl e DisplayName (quando há), sem ImagePath, como
+//! na instalação.
+//!
+//! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada driver com os
+//! valores que o banco de serviços grava numa instalação seguidos de Group,
+//! Tag e os DWORDs próprios.
 
-use crate::ntos::cm::registry;
-use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};
-use crate::rtl::KernelError;
+use alloc::format;
+use alloc::vec::Vec;
+
+use super::super::seed::{SeedKey, REG_SZ};
+use super::boot_services::service_key;
 
 const SERVICE_KERNEL_DRIVER: u32 = 1;
 const SERVICE_FILE_SYSTEM_DRIVER: u32 = 2;
@@ -49,8 +56,6 @@ const SERVICE_FILE_SYSTEM_DRIVER: u32 = 2;
 const FILE_SYSTEMS: &[&str] = &["Ntfs", "fastfat"];
 const SERVICE_RECOGNIZER_DRIVER: u32 = 8;
 const SERVICE_DEMAND_START: u32 = 3;
-const REG_SZ: u32 = 1;
-const REG_DWORD: u32 = 4;
 
 /// Uma chave de serviço de driver da instalação.
 struct InboxDriver {
@@ -75,7 +80,8 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver {
         name: "Tcpip",
         display_name: Some("@%SystemRoot%\\system32\\drivers\\tcpip.sys,-10001"),
-        service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\tcpip.sys"),
+        service_type: SERVICE_KERNEL_DRIVER,
+        image_path: Some("System32\\drivers\\tcpip.sys"),
         start: SERVICE_DEMAND_START,
         error_control: 1,
         group: "PNP_TDI",
@@ -98,74 +104,49 @@ enum Installed {
     String(&'static str),
 }
 
-/// (chave abaixo de \Registry\Machine\System\CurrentControlSet, valor, dado).
+/// (chave abaixo de CurrentControlSet, valor, dado).
 const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMajorVersion", Installed::Dword(1)),
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMinorVersion", Installed::Dword(0xF)),
     ("Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions\\1", "Service", Installed::String("Wdf01000")),
 ];
 
-/// Instala as chaves (uma chave já instalada fica como está).
-pub fn seed() -> Result<(), KernelError> {
+/// As chaves dos drivers inbox, dos file systems e os valores do KMDF.
+pub fn seed_keys() -> Vec<SeedKey> {
+    let mut keys = Vec::new();
     for driver in DRIVERS {
-        let path = alloc::format!("{}\\{}", service_database::ROOT, driver.name);
-        if let Some(image_path) = driver.image_path {
-            let input = ConfigurationInput {
-                name: alloc::string::String::from(driver.name),
-                display_name: driver.display_name.map(alloc::string::String::from),
-                image_path: Some(alloc::string::String::from(image_path)),
-                service_type: Some(driver.service_type),
-                start: Some(driver.start),
-                error_control: Some(driver.error_control),
-                ..ConfigurationInput::default()
-            };
-            match service_database::install(&input, true) {
-                Ok(_) => {}
-                Err(ServiceError::Win32(code, message)) => return Err(KernelError::new(alloc::format!("{}: {message} ({code})", driver.name))),
-                Err(ServiceError::Kernel(error)) => return Err(error),
+        let mut key = match driver.image_path {
+            Some(image_path) => service_key(driver.name, driver.service_type, driver.start, driver.error_control, image_path, driver.display_name.unwrap_or(driver.name)),
+            None => {
+                let mut key = SeedKey::new(&format!("CurrentControlSet\\Services\\{}", driver.name));
+                key.dword("Type", driver.service_type).dword("Start", driver.start).dword("ErrorControl", driver.error_control);
+                if let Some(display_name) = driver.display_name {
+                    key.text("DisplayName", REG_SZ, display_name);
+                }
+                key
             }
-        } else {
-            // Sem ImagePath: os valores da chave, um a um (uma chave já
-            // instalada fica como está).
-            let existing = registry::open(&path)?;
-            if existing != 0 {
-                registry::close_handle(existing);
-                continue;
-            }
-            let handle = registry::open_or_create(&path, None)?;
-            for (name, value) in [("Type", driver.service_type), ("Start", driver.start), ("ErrorControl", driver.error_control)] {
-                registry::set_value(handle, name, REG_DWORD, value.to_le_bytes().to_vec());
-            }
-            if let Some(display_name) = driver.display_name {
-                registry::set_value(handle, "DisplayName", REG_SZ, registry::encode_wide(display_name));
-            }
-            registry::close_handle(handle);
-        }
-        let handle = registry::open_or_create(&path, None)?;
-        registry::set_value(handle, "Group", REG_SZ, registry::encode_wide(driver.group));
+        };
+        key.text("Group", REG_SZ, driver.group);
         if let Some(tag) = driver.tag {
-            registry::set_value(handle, "Tag", REG_DWORD, tag.to_le_bytes().to_vec());
+            key.dword("Tag", tag);
         }
         for &(name, value) in driver.dwords {
-            registry::set_value(handle, name, REG_DWORD, value.to_le_bytes().to_vec());
+            key.dword(name, value);
         }
-        registry::close_handle(handle);
+        keys.push(key);
     }
     for name in FILE_SYSTEMS {
-        let handle = registry::open_or_create(&alloc::format!("{}\\{}", service_database::ROOT, name), None)?;
-        for (value_name, value) in [("Type", SERVICE_FILE_SYSTEM_DRIVER), ("Start", SERVICE_DEMAND_START), ("ErrorControl", 1)] {
-            registry::set_value(handle, value_name, REG_DWORD, value.to_le_bytes().to_vec());
-        }
-        registry::set_value(handle, "Group", REG_SZ, registry::encode_wide("Boot File System"));
-        registry::close_handle(handle);
+        let mut key = SeedKey::new(&format!("CurrentControlSet\\Services\\{name}"));
+        key.dword("Type", SERVICE_FILE_SYSTEM_DRIVER).dword("Start", SERVICE_DEMAND_START).dword("ErrorControl", 1).text("Group", REG_SZ, "Boot File System");
+        keys.push(key);
     }
-    for (key, name, data) in INSTALLED_VALUES {
-        let handle = registry::open_or_create(&alloc::format!("\\Registry\\Machine\\System\\CurrentControlSet\\{key}"), None)?;
+    for (path, name, data) in INSTALLED_VALUES {
+        let mut key = SeedKey::new(&format!("CurrentControlSet\\{path}"));
         match data {
-            Installed::Dword(value) => registry::set_value(handle, name, REG_DWORD, value.to_le_bytes().to_vec()),
-            Installed::String(text) => registry::set_value(handle, name, REG_SZ, registry::encode_wide(text)),
+            Installed::Dword(value) => key.dword(name, *value),
+            Installed::String(text) => key.text(name, REG_SZ, text),
         };
-        registry::close_handle(handle);
+        keys.push(key);
     }
-    Ok(())
+    keys
 }

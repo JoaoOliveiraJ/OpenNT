@@ -61,3 +61,60 @@ pub mod cm_machine_hive_notify {
         data_exports: &[],
     };
 }
+
+pub mod cm_hive {
+    //! Os serviços de hive pelo caminho Zw (PreviousMode de kernel); a lógica
+    //! mora em `cm/hive_services` e `cm/hive_list`.
+
+    use crate::ntos::cm::hive_services;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ZwLoadKey(TargetKey, SourceFile).
+    fn load_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::load_key(call.arg(1), call.arg(2), 0, 0, 0, 0, 0, false)))
+    }
+
+    /// ZwLoadKeyEx(TargetKey, SourceFile, Flags, TrustClassKey, Event,
+    /// DesiredAccess, RootHandle, Reserved).
+    fn load_key_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::load_key(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7), false)))
+    }
+
+    /// ZwUnloadKey(TargetKey).
+    fn unload_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, 0, false)))
+    }
+
+    /// ZwUnloadKey2(TargetKey, Flags).
+    fn unload_key2(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::unload_key(call.arg(1), call.arg(2) as u32, 0, false)))
+    }
+
+    /// ZwUnloadKeyEx(TargetKey, Event).
+    fn unload_key_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, call.arg(2), false)))
+    }
+
+    /// ZwSaveKey(KeyHandle, FileHandle).
+    fn save_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::save_key(call.arg(1), call.arg(2), 1, false)))
+    }
+
+    /// ZwSaveKeyEx(KeyHandle, FileHandle, Format).
+    fn save_key_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::save_key(call.arg(1), call.arg(2), call.arg(3) as u32, false)))
+    }
+
+    /// ZwRestoreKey(KeyHandle, FileHandle, Flags).
+    fn restore_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hive_services::restore_key(call.arg(1), call.arg(2), call.arg(3) as u32, false)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "cm-hive",
+        names: &["ZwLoadKey", "ZwLoadKeyEx", "ZwUnloadKey", "ZwUnloadKey2", "ZwUnloadKeyEx", "ZwSaveKey", "ZwSaveKeyEx", "ZwRestoreKey"],
+        handlers: &[load_key, load_key_ex, unload_key, unload_key2, unload_key_ex, save_key, save_key_ex, restore_key],
+        data_exports: &[],
+    };
+}

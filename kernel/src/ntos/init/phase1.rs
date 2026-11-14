@@ -1,7 +1,8 @@
 //! FASE 1 do boot (estilo NT).
 //!
 //! Sobe o I/O Manager e os exports do kernel, monta o NTFS do segundo disco
-//! IDE em `D:` (driver ata-pio), enumera o PCI, carrega os drivers de
+//! IDE em `D:` (driver ata-pio), carrega a hive SYSTEM do arquivo desse
+//! volume (ou semeia as chaves estáticas dela), enumera o PCI, carrega os drivers de
 //! serviço de boot lidos do Registry com IRP_MJ_PNP/START_DEVICE, publica o
 //! catálogo CNG e executa as rotinas de reinicialização dos drivers. Os
 //! binários da Microsoft (hal.dll, atapi, disk, mountmgr, i8042prt,
@@ -48,6 +49,13 @@ pub fn init() {
             Err(error) => debug_print!("[boot] NTFS falhou: {}", error),
         }
     }
+    // CmInitSystem1: a hive SYSTEM do arquivo do volume
+    // (\SystemRoot\System32\config\SYSTEM) em \Registry\Machine\SYSTEM, com
+    // as chaves de serviço; sem o arquivo, as mesmas chaves em memória.
+    crate::ntos::cm::hive_list::initialize_system_hive().unwrap_or_else(|error| panic!("hive SYSTEM: {error}"));
+    // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
+    // consultam; os dados só existem depois de publicação real.
+    crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));
     // Barramento PCI primeiro (como o pci.sys): hardware enumerado e PDOs
     // com recursos reais antes dos drivers funcionais.
     match crate::drivers::bus::pci::init() {

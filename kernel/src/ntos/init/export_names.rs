@@ -428,9 +428,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("zw-query-ea-file", 1871, 1),
     ("mm-change-image-protection", 1872, 1),
     ("ex-update-license-data", 1873, 1),
+    ("cm-hive", 1874, 8),
 ];
 
-/// Os 1874 exports de função, na ordem da ABI.
+/// Os 1882 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2306,4 +2307,12 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwQueryEaFile",
     "MmChangeImageProtection",
     "ExUpdateLicenseData",
+    "ZwLoadKey",
+    "ZwLoadKeyEx",
+    "ZwUnloadKey",
+    "ZwUnloadKey2",
+    "ZwUnloadKeyEx",
+    "ZwSaveKey",
+    "ZwSaveKeyEx",
+    "ZwRestoreKey",
 ];

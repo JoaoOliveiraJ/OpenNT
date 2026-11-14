@@ -41,7 +41,7 @@ pub struct EventReference {
 }
 
 impl EventReference {
-    fn release(&mut self) {
+    pub fn release(&mut self) {
         if let Some(release) = self.release.take() {
             release();
         }

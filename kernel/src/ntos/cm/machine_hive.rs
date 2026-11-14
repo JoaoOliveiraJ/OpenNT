@@ -14,10 +14,12 @@
 //! trava; a remoção espera um callback em curso e tira o registro da lista
 //! se ele ainda não foi chamado.
 //!
-//! No OpenNT as hives de máquina são subárvores do registro em memória: uma
-//! hive está carregada quando a chave do ponto de montagem existe. A
-//! criação posterior dessa chave (observada pelo `registry::watch`) faz o
-//! papel do CmpNotifyMachineHiveLoaded.
+//! Uma hive de máquina está carregada quando a chave do ponto de montagem
+//! existe: uma hive de arquivo ligada ali pelo CmLoadKey (`hive_list`, que
+//! chama [`notify_loaded`], o CmpNotifyMachineHiveLoaded) ou uma subárvore
+//! que o kernel mantém só em memória (HARDWARE, a SYSTEM semeada quando o
+//! arquivo falta). A criação posterior dessa chave, observada pelo
+//! `registry::watch`, também conta como carga.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -169,6 +171,23 @@ fn observe_mount_point(index: usize) {
     };
     if watch != 0 {
         registry::unwatch(watch);
+    }
+}
+
+/// CmpNotifyMachineHiveLoaded: uma hive de arquivo foi ligada em
+/// `mount_point`; se for um dos pontos de montagem das hives de máquina, as
+/// notificações pendentes dela rodam pelo work item.
+pub fn notify_loaded(mount_point: &str) {
+    if let Some(index) = find_hive(mount_point) {
+        observe_mount_point(index);
+    }
+}
+
+/// A hive de arquivo de um ponto de montagem de máquina foi descarregada:
+/// a próxima carga avisa de novo.
+pub fn notify_unloaded(mount_point: &str) {
+    if let Some(index) = find_hive(mount_point) {
+        HIVES.lock()[index].loaded = false;
     }
 }
 

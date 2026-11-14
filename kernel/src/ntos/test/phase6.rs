@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1874 && abi_names::GROUP_LAYOUT.len() == 422 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1874 exports em 422 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1882 && abi_names::GROUP_LAYOUT.len() == 423 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1882 exports em 423 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1925,7 +1925,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1874 && exports::export_names().len() == 1874, "ntoskrnl: 422 grupos com os 1874 exports implementados");
+    assert(exports::implemented() == 1882 && exports::export_names().len() == 1882, "ntoskrnl: 423 grupos com os 1882 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -3898,7 +3898,7 @@ fn driver_helper_exports(assert: Assert) {
     let out = guest::alloc_bytes(8);
     guest::write8(out, 0xFF);
     let portable = call_export("RtlCheckPortableOperatingSystem", &[out]);
-    assert(call_export("PoEnergyEstimationEnabled", &[]) == Some(0) && call_export("ExIsSoftBoot", &[]) == Some(0) && portable == Some(0) && guest::read8(out) == 0 && call_export("ZwFlushKey", &[0x1C8]) == Some(0), "misc: energia/soft-boot/portabilidade/flush");
+    assert(call_export("PoEnergyEstimationEnabled", &[]) == Some(0) && call_export("ExIsSoftBoot", &[]) == Some(0) && portable == Some(0) && guest::read8(out) == 0 && call_export("ZwFlushKey", &[0x1C8]) == Some(0xFFFF_FFFF_C000_0008), "misc: energia/soft-boot/portabilidade; ZwFlushKey de handle invalido = STATUS_INVALID_HANDLE");
     // ObReferenceObjectSafe/DeferDelete sobre o processo corrente (objeto vivo).
     let process = crate::ntos::ps::process::get_current_process();
     let before = crate::ntos::ps::process::reference_count(process).unwrap_or(0);

@@ -5,11 +5,12 @@
 //! metade de sistema congelada, descritores nativos, imagens carregadas,
 //! células de dado), KPCR, SMP,
 //! pool, escalonador com o EPROCESS do System, os tipos de objeto e as suas
-//! células, WNF, o sistema de arquivos em memória com as apps embutidas, o
-//! namespace NT (com a partição e os eventos `\KernelObjects`), a hive de
-//! serviços (pilhas de teclado/mouse e de armazenamento, parâmetros do
-//! i8042prt e classes de dispositivo) e a descrição de hardware. O serviço
-//! do vgk (ferramenta de diagnóstico) fica fora.
+//! células, o sistema de arquivos em memória com as apps embutidas, o
+//! namespace NT (com a partição e os eventos `\KernelObjects`) e a hive de
+//! hardware (a descrição e o mapa de memória). A hive SYSTEM, com os
+//! serviços e as definições WNF, só existe na fase 1, quando o volume que
+//! guarda o arquivo dela está montado: nada da fase 0 escreve em
+//! `\Registry\Machine\System`.
 
 use crate::hal::bundle;
 use crate::nano::interrupts;
@@ -85,8 +86,6 @@ pub fn init() {
     crate::ntos::se::secure_boot_policy::init(None).unwrap_or_else(|error| panic!("{error}"));
     // contexto de licenças próprio: estado, locks e (com política válida) a SECTION
     crate::ntos::ex::license::values::init_runtime(&crate::ntos::ex::license::boot::BootProviders::default()).unwrap_or_else(|error| panic!("{error}"));
-    // metadados WNF instalados; os dados só existem depois de publicação real
-    crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));
     memory_file_system::init(clock::now_ms());
 
     // apps embutidas viram arquivos do VFS ( /<basename> )
@@ -107,7 +106,6 @@ pub fn init() {
         }
     }
     namespace().unwrap_or_else(|error| panic!("namespace: {error}"));
-    seed_services().unwrap_or_else(|error| panic!("hive de servicos: {error}"));
     crate::ntos::cm::hw_description::seed_hardware_description().unwrap_or_else(|error| panic!("{error}"));
     // mapa real de RAM na hive de hardware, antes de iniciar os drivers
     crate::ntos::cm::physical_memory_resources::initialize().unwrap_or_else(|error| panic!("{error}"));
@@ -150,85 +148,3 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     Ok(())
 }
 
-/// Serviço de driver: tipo kernel, Start e o caminho em
-/// `\SystemRoot\System32\Drivers`; os de Start <= 1 sobem na fase 1.
-fn seed_service(name: &str, driver_file: &str, start: u32) -> Result<(), crate::rtl::KernelError> {
-    seed_driver_service(name, driver_file, start, 1)
-}
-
-/// Serviço de driver de um tipo dado (1 kernel, 2 file system).
-fn seed_driver_service(name: &str, driver_file: &str, start: u32, service_type: u32) -> Result<(), crate::rtl::KernelError> {
-    use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};
-    let input = ConfigurationInput { name: alloc::string::String::from(name), service_type: Some(service_type), start: Some(start), image_path: Some(alloc::format!("\\SystemRoot\\System32\\Drivers\\{driver_file}")), ..ConfigurationInput::default() };
-    match service_database::install(&input, false) {
-        Ok(_) => Ok(()),
-        Err(ServiceError::Win32(code, message)) => Err(crate::rtl::KernelError::new(alloc::format!("{name}: {message} ({code})"))),
-        Err(ServiceError::Kernel(error)) => Err(error),
-    }
-}
-
-/// Subchave Parameters de um serviço, como o INF criaria.
-fn seed_service_parameters(name: &str, entries: &[(&str, u32)]) -> Result<(), crate::rtl::KernelError> {
-    use crate::ntos::cm::registry;
-    let handle = registry::open_or_create(&alloc::format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{name}\\Parameters"), None)?;
-    for &(value_name, value) in entries {
-        registry::set_value(handle, value_name, 4, value.to_le_bytes().to_vec());
-    }
-    registry::close_handle(handle);
-    Ok(())
-}
-
-/// Classe de dispositivo com os seus UpperFilters (REG_MULTI_SZ), lidos pelo
-/// PnP para anexar os filtros de classe sobre o FDO funcional.
-fn seed_device_class(class_guid: &str, upper_filters: &[&str]) -> Result<(), crate::rtl::KernelError> {
-    use crate::ntos::cm::registry;
-    let handle = registry::open_or_create(&alloc::format!("\\Registry\\Machine\\System\\Control\\Class\\{class_guid}"), None)?;
-    let mut multi = alloc::vec::Vec::new();
-    for filter in upper_filters {
-        multi.extend(registry::encode_wide(filter));
-    }
-    multi.extend([0, 0]);
-    registry::set_value(handle, "UpperFilters", 7, multi);
-    registry::close_handle(handle);
-    Ok(())
-}
-
-/// Hive de serviços com driver .sys (como `\System\Services` no NT): a pilha
-/// de teclado/mouse sob demanda, a de armazenamento no boot (port -> class
-/// -> mount manager), os parâmetros do i8042prt e as classes de teclado e
-/// mouse, e o serviço do vgk (demand). Os drivers de integração da suíte de
-/// testes, compilados em C, ficam fora.
-fn seed_services() -> Result<(), crate::rtl::KernelError> {
-    // i8042prt: demand, inicializado pela pilha de teclado; lê os defaults
-    // da subchave Parameters no DriverEntry.
-    seed_service("i8042prt", "i8042prt.sys", 3)?;
-    // kbdclass/mouclass: filtros de classe carregados quando o PnP casa um
-    // devnode da classe Keyboard/Mouse.
-    seed_service("kbdclass", "kbdclass.sys", 3)?;
-    seed_service("mouclass", "mouclass.sys", 3)?;
-    // Armazenamento na ordem de boot do NT: miniport IDE (ataport carrega
-    // como dependência de import), classe de disco e Mount Manager.
-    seed_service("atapi", "atapi.sys", 0)?;
-    seed_service("disk", "disk.sys", 0)?;
-    seed_service("mountmgr", "mountmgr.sys", 0)?;
-    // vgk: binário real no volume NTFS (D:\VGK.SYS); o cng.sys carrega como
-    // módulo de import. Start=3: iniciado pelo SCM ou por `--start-driver=vgk`.
-    seed_service("vgk", "vgk.sys", 3)?;
-    // watchdog.sys: binário real da MS (WDM), dependência do stack de vídeo
-    // (dxgkrnl/BasicDisplay). Start=3: iniciado por `--start-driver=watchdog`.
-    seed_service("watchdog", "watchdog.sys", 3)?;
-    // Console, segurança do kernel e pilha de rede: chaves da instalação.
-    crate::ntos::cm::service::inbox_drivers::seed()?;
-    // Os file systems de pipes nomeados e mailslots (npfs.sys e msfs.sys,
-    // SYSTEM_START, grupo "File system"), que o smss abre para criar os
-    // prefixos protegidos: no boot do processo inicial real
-    // (`--initial-process=smss`), com os binários reais no volume.
-    if crate::ntos::init::boot_config::SMSS_BOOT {
-        seed_driver_service("Npfs", "npfs.sys", 1, 2)?;
-        seed_driver_service("Msfs", "msfs.sys", 1, 2)?;
-    }
-    seed_service_parameters("i8042prt", &[("KeyboardDataQueueSize", 0x64), ("MouseDataQueueSize", 0x64), ("PollStatusIterations", 0x2000), ("PollingIterations", 0x1900), ("ResendIterations", 3), ("OverrideKeyboardType", 0), ("CrashOnCtrlScroll", 0)])?;
-    seed_device_class("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"])?;
-    seed_device_class("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])?;
-    Ok(())
-}

@@ -352,6 +352,17 @@ fn resolve_key_handle(handle: u64, previous_mode: bool, required: u32) -> Flow<R
     Ok(Resolved { khandle, node, entry, path: registry::get_path(khandle).unwrap_or_default() })
 }
 
+/// CmObReferenceObjectByHandle para os serviços de hive: o nó e o caminho
+/// de um handle de chave, com o acesso pedido conferido no handle de
+/// usuário. `Err(NTSTATUS)`.
+pub fn reference_key(handle: u64, previous_mode: bool, required: u32) -> Result<(NodeId, String), u32> {
+    match resolve_key_handle(handle, previous_mode, required) {
+        Ok(resolved) => Ok((resolved.node, resolved.path)),
+        Err(Fail::Status(status)) => Err(status),
+        Err(Fail::Kernel(error)) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    }
+}
+
 fn close_from_table(_process: u64, handle: u32) {
     registry::close_handle(handle);
 }
@@ -582,7 +593,8 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                     Ok(granted) => granted,
                     Err(value) => return Ok(Outcome::from_status(value)),
                 };
-                opened = if create { registry::open_or_create(&absolute_path, assigned)? } else { registry::open(&absolute_path)? };
+                // REG_OPTION_VOLATILE: a chave nova não vai para a hive de arquivo.
+                opened = if create { registry::open_or_create_options(&absolute_path, assigned, options & 1 != 0)? } else { registry::open(&absolute_path)? };
                 if opened == 0 {
                     return Ok(Outcome::from_status(0xC000_0034));
                 }

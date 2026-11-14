@@ -14,7 +14,7 @@ use core::any::Any;
 
 use super::state::{self, NativeBody, UserObject};
 use crate::ntos::cm::key::services::{self as key_services, Kind, UserHandles, UserKeyRecord};
-use crate::ntos::cm::{computer_name, crypto_defaults, registry};
+use crate::ntos::cm::{computer_name, crypto_defaults, hive_services, registry};
 use crate::ntos::cm::key::objects as key_objects;
 use crate::ntos::ob::object_types;
 use crate::rtl::KernelError;
@@ -100,10 +100,11 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     set_sz(code_page, "OEMHAL", "vgaoem.fon");
     let session_manager = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager", None)?;
     set_dword(session_manager, "SafeMode", 0);
+    // No boot do processo inicial real, o smss lê a configuração do Session
+    // Manager da hive SYSTEM (`cm/session_manager.rs`) e cria ele mesmo o
+    // \KnownDlls; o IniFileMapping (hive SOFTWARE, em memória) é semeado
+    // aqui.
     if crate::ntos::init::boot_config::SMSS_BOOT {
-        // O smss real lê a configuração do Session Manager e cria ele mesmo
-        // o \KnownDlls.
-        crate::ntos::cm::session_manager::initialize()?;
         crate::ntos::cm::ini_file_mapping::initialize()?;
     } else {
         // KnownDlls: a lista das DLLs conhecidas que o kernel provisiona e o
@@ -233,8 +234,70 @@ fn nt_enumerate_value_key(handle: u64, index: u64, klass: u64, out: u64, rsp: u6
     key_services::key_operation(Kind::EnumerateValue, handle, &arguments(&[("index", index), ("klass", klass), ("out", out), ("length", state::stack_arg32(rsp, 5) as u64), ("returned", state::stack_arg(rsp, 6))]), true)
 }
 
+// Serviços de hive com PreviousMode de usuário (`cm/hive_services`).
+
+fn nt_load_key(target: u64, source: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::load_key(target, source, 0, 0, 0, 0, 0, true))
+}
+
+fn nt_load_key2(target: u64, source: u64, flags: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::load_key(target, source, flags as u32, 0, 0, 0, 0, true))
+}
+
+fn nt_load_key_ex(target: u64, source: u64, flags: u64, trust_class_key: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::load_key(target, source, flags as u32, trust_class_key, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), true))
+}
+
+fn nt_unload_key(target: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::unload_key(target, 0, 0, true))
+}
+
+fn nt_unload_key2(target: u64, flags: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::unload_key(target, flags as u32, 0, true))
+}
+
+fn nt_unload_key_ex(target: u64, event: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::unload_key(target, 0, event, true))
+}
+
+fn nt_save_key(key: u64, file: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::save_key(key, file, 1, true))
+}
+
+fn nt_save_key_ex(key: u64, file: u64, format: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::save_key(key, file, format as u32, true))
+}
+
+fn nt_restore_key(key: u64, file: u64, flags: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::restore_key(key, file, flags as u32, true))
+}
+
+fn nt_flush_key(key: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::flush_key(key, true))
+}
+
+fn nt_compact_keys(count: u64, array: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::compact_keys(count as u32, array, true))
+}
+
+fn nt_compress_key(key: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::compress_key(key, true))
+}
+
 /// Registra os handlers Nt*Key e a tabela de handles `key` do processo.
 pub fn init() {
+    state::register_handler("NtLoadKey", nt_load_key);
+    state::register_handler("NtLoadKey2", nt_load_key2);
+    state::register_handler("NtLoadKeyEx", nt_load_key_ex);
+    state::register_handler("NtUnloadKey", nt_unload_key);
+    state::register_handler("NtUnloadKey2", nt_unload_key2);
+    state::register_handler("NtUnloadKeyEx", nt_unload_key_ex);
+    state::register_handler("NtSaveKey", nt_save_key);
+    state::register_handler("NtSaveKeyEx", nt_save_key_ex);
+    state::register_handler("NtRestoreKey", nt_restore_key);
+    state::register_handler("NtFlushKey", nt_flush_key);
+    state::register_handler("NtCompactKeys", nt_compact_keys);
+    state::register_handler("NtCompressKey", nt_compress_key);
     key_services::set_user_handles(Some(UserHandles { get: user_key, allocate: allocate_user_key, close: close_user_key }));
     state::register_handler("NtOpenKey", nt_open_key);
     state::register_handler("NtOpenKeyEx", nt_open_key_ex);
