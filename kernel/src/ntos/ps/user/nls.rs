@@ -64,7 +64,7 @@ pub fn map_table(name: &str) -> Result<Result<(u64, u64), u32>, KernelError> {
             section
         }
     };
-    let existing = state::with(|state| state.user_regions.iter().find(|region| region.section().is_some_and(|candidate| Arc::ptr_eq(&candidate, &section))).map(|region| (region.base(), region.size())));
+    let existing = super::memory::Space::current().regions().iter().find(|region| region.section().is_some_and(|candidate| Arc::ptr_eq(&candidate, &section))).map(|region| (region.base(), region.size()));
     if let Some(view) = existing {
         return Ok(Ok(view));
     }

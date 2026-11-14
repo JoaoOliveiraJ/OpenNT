@@ -7,6 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::memory::Space;
 use super::state::{self, Region};
 use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT as MAX_USER;
 use crate::ntos::mm::paging;
@@ -16,7 +17,7 @@ use crate::ntos::inc::types::{MemoryBasicInformation, MemoryImageInformation, Me
 
 const PAGE: u64 = 0x1000;
 
-/// Regiões consultadas (o padrão é o `State` corrente).
+/// Regiões consultadas: o VAD de um processo (o padrão é o corrente).
 #[derive(Clone, Default)]
 pub struct Context {
     pub user_regions: Vec<Region>,
@@ -25,7 +26,11 @@ pub struct Context {
 
 impl Context {
     pub fn current() -> Self {
-        state::with(|state| Self { user_regions: state.user_regions.clone(), process_images: state.process_images.clone() })
+        Self::of(Space::current())
+    }
+
+    pub fn of(space: Space) -> Self {
+        Self { user_regions: space.regions(), process_images: space.images() }
     }
 
     fn is_image(&self, region: &Region) -> bool {

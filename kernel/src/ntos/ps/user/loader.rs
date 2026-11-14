@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use super::memory;
+use super::memory::{self, Space};
 use super::state::{self, write_unicode_string, write_user_bytes, write_user_wide, RegionKind, UserRegion};
 use super::structures::insert_tail_list;
 use super::syscall_scan;
@@ -101,8 +101,10 @@ impl UserRegion for ImageRegion {
     }
 }
 
-fn push_image(base: u64, size: u64, name: String, file: Option<Arc<VolumeFile>>) {
-    state::with(|state| state.regions(RegionKind::ProcessImages).push(Arc::new(ImageRegion { base, size, name, file })));
+/// A imagem entra no VAD do espaço: o processo que a carregou, ou o System
+/// para as imagens de sistema mapeadas uma vez (ntdll, apiset).
+fn push_image(space: Space, base: u64, size: u64, name: String, file: Option<Arc<VolumeFile>>) {
+    memory::insert_region(space, RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name, file }));
 }
 
 /// O volume de onde vêm a ntdll, o schema e o NLS.
@@ -177,7 +179,7 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
         state.ntdll_image_base = image.image_base;
     });
     *NTDLL_IMAGE.lock() = (image.image_base, image.size_of_image);
-    push_image(image.image_base, image.size_of_image, String::from(source_name), None);
+    push_image(Space::system(), image.image_base, image.size_of_image, String::from(source_name), None);
     let module = Arc::new(Module {
         name: String::from("ntdll.dll"),
         full_name: String::from("C:\\Windows\\System32\\ntdll.dll"),
@@ -219,7 +221,7 @@ pub fn ensure_api_set_schema() -> Result<(), KernelError> {
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
-    push_image(image.image_base, image.size_of_image, String::from("\\NTFS\\APISETSCHEMA.DLL"), None);
+    push_image(Space::system(), image.image_base, image.size_of_image, String::from("\\NTFS\\APISETSCHEMA.DLL"), None);
     crate::debug_print!("[usermode] apiset schema em {:#x} ({} bytes)", map, section.virtual_size);
     Ok(())
 }
@@ -265,22 +267,24 @@ pub fn parse_api_set_schema() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Área de strings das entradas LDR (bump próprio por processo).
+/// Área de strings das entradas LDR (bump próprio no VAD do processo
+/// corrente).
 pub fn place_user_string(text: &str) -> Result<u64, KernelError> {
     let need = (text.encode_utf16().count() as u64 + 1) * 2 + 8;
-    let (next, end) = state::with(|state| (state.next_ldr_string_va, state.ldr_string_region_end));
+    let space = Space::current();
+    let no_vad = || KernelError::with_status("strings LDR num processo sem VAD", 0xC000_010A);
+    let (next, end) = space.with_vad(|vad| vad.ldr_strings).ok_or_else(no_vad)?;
     if next == 0 || next + need > end {
         let region = memory::map_user_region(0x4000)?;
-        state::with(|state| {
-            state.next_ldr_string_va = region;
-            state.ldr_string_region_end = region + 0x4000;
-        });
+        space.with_vad(|vad| vad.ldr_strings = (region, region + 0x4000)).ok_or_else(no_vad)?;
     }
-    let va = state::with(|state| {
-        let va = state.next_ldr_string_va;
-        state.next_ldr_string_va += need;
-        va
-    });
+    let va = space
+        .with_vad(|vad| {
+            let va = vad.ldr_strings.0;
+            vad.ldr_strings.0 += need;
+            va
+        })
+        .ok_or_else(no_vad)?;
     write_user_wide(va, text);
     Ok(va)
 }
@@ -319,7 +323,7 @@ fn read_ascii(cursor: u64) -> String {
 /// Resolve cada import da imagem mapeada contra os exports reais das DLLs,
 /// carregadas recursivamente antes (a dependência precisa estar pronta).
 pub fn bind_imports(image_base: u64, depth: u32) -> Result<(), KernelError> {
-    let importer = state::with(|state| state.regions(RegionKind::ProcessImages).iter().find(|image| image.base() == image_base).and_then(|image| image.name())).unwrap_or_default();
+    let importer = Space::current().images().iter().find(|image| image.base() == image_base).and_then(|image| image.name()).unwrap_or_default();
     // SAFETY: imagem mapeada pelo loader do kernel (cabeçalhos validados na carga).
     let headers = unsafe { ImageNtHeaders64::at(image_base + ImageDosHeader::at(image_base).e_lfanew.get() as u64) };
     let directory = headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT].virtual_address.get() as u64;
@@ -421,7 +425,7 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
         notification_source: None,
     });
     LOADED_MODULES.lock().insert(file_name.to_string(), module.clone());
-    push_image(image.image_base, image.size_of_image, file.nt_path(), Some(file));
+    push_image(Space::current(), image.image_base, image.size_of_image, file.nt_path(), Some(file));
     bind_imports(image.image_base, depth + 1)?;
     // Dependências inicializadas antes do importador.
     create_ldr_entry(&module)?;

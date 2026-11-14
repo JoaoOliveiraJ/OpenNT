@@ -927,18 +927,12 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     if let Some(owner) = options.owner_process {
         section_views::register(OwnedView::Data(view.clone()), owner, false);
     }
+    // A vista entra no VAD do dono (o processo corrente, sem dono explícito)
+    // ou nas vistas de sistema.
     let region: Region = view.clone();
-    state::with(|state| {
-        if let Some(kind) = options.regions {
-            if kind != RegionKind::Detached {
-                state.regions(kind).push(region);
-            }
-        } else if view.supervisor {
-            state.section_kernel_views.push(region);
-        } else {
-            state.user_regions.push(region);
-        }
-    });
+    let kind = options.regions.unwrap_or(if view.supervisor { RegionKind::KernelViews } else { RegionKind::User });
+    let space = super::memory::Space::of(options.owner_process.unwrap_or_else(crate::ntos::ps::process::get_current_process));
+    super::memory::insert_region(space, kind, region);
     Ok(Ok(view))
 }
 
@@ -1021,7 +1015,7 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
     section_views::forget(&OwnedView::Data(view.clone()));
     let region: Region = view.clone();
     let kind = kind.unwrap_or(if view.supervisor { RegionKind::KernelViews } else { RegionKind::User });
-    state::with(|state| state.remove_region(kind, &region));
+    super::memory::remove_region(kind, &region);
     Ok(())
 }
 

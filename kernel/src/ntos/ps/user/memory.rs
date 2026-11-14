@@ -1,8 +1,8 @@
 //! Memória virtual do processo de usuário.
 //!
-//! O "VAD" (regiões de usuário e imagens do estado), o alocador de VA
-//! (reserva, commit e top-down), o mapeamento de pilha, estruturas e regiões
-//! compartilhadas (frames do PFN com U/S=1) e os handlers Nt*VirtualMemory.
+//! O VAD de cada processo, o alocador de VA (reserva, commit e top-down), o
+//! mapeamento de pilha, estruturas e regiões compartilhadas (frames do PFN
+//! com U/S=1) e os handlers Nt*VirtualMemory.
 //!
 //! A VA segue o NT (Windows 10 19041 x64): nada abaixo de
 //! MM_LOWEST_USER_ADDRESS (64 KB) e nada acima de MM_HIGHEST_VAD_ADDRESS; sem
@@ -13,11 +13,19 @@
 //! o kernel monta para o processo também saem do alocador: não há janela
 //! fixa na metade de usuário além da KUSER_SHARED_DATA em 0x7FFE0000.
 //!
-//! O processo de usuário ativo usa os VADs do runtime (`state`); os demais
-//! processos (o System, onde rodam os DriverEntry) têm as próprias regiões
-//! privadas aqui, alocadas por ZwAllocateVirtualMemory de kernel. Como a
-//! tabela de páginas é uma só, a escolha de endereço considera as regiões de
-//! todos os espaços (`occupied`).
+//! Posse: cada EPROCESS tem o seu VAD (`Vad`, no `ProcessState` dele), com as
+//! alocações privadas, as vistas de seção e as imagens que ele mapeou. Os
+//! serviços agem sobre um `Space`: os Nt* de usuário sobre o processo
+//! corrente (o anexado, quando há attach), os Zw* sobre o processo do handle;
+//! o System guarda o que o kernel aloca no próprio contexto (DriverEntry,
+//! threads de sistema) e as imagens de sistema mapeadas uma vez (ntdll,
+//! apiset). Consultas, liberações e trocas de proteção só enxergam o VAD do
+//! espaço; o término do processo devolve o VAD inteiro (`release_vad`), como
+//! o MmCleanProcessAddressSpace.
+//!
+//! Escolha de endereço: a tabela de páginas ainda é uma só, então a faixa
+//! nova evita o que qualquer processo ocupa (`occupied`, a união dos VADs,
+//! das regiões compartilhadas e das vistas de sistema).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -25,22 +33,26 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use super::memory_query::{self, Context};
+use super::process_state::{self, ProcessState};
 use super::sections::{self, View};
-use super::state::{self, Region, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER, USER_STACK_SIZE};
+use super::state::{self, Region, RegionKind, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER, USER_STACK_SIZE};
 use crate::hal::physical;
 use crate::ntos::mm::memory_map::{self as map, USER_ADDRESS_LIMIT};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
 use crate::ntos::mm::section::{address as section_address, views as section_views};
+use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{Eprocess, MemAddressRequirements, MemExtendedParameter, NtStruct};
+use crate::ntos::inc::types::{MemAddressRequirements, MemExtendedParameter, NtStruct};
 
 const PAGE: u64 = 0x1000;
 const MAX_SAFE: u64 = (1 << 53) - 1;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_TOP_DOWN: u32 = 0x10_0000;
+/// O processo do espaço já passou pelo término (sem VAD).
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 /// Limite exclusivo das alocações de usuário (MM_HIGHEST_VAD_ADDRESS + 1).
 pub const USER_ALLOCATION_TOP: u64 = map::HIGHEST_VAD_ADDRESS + 1;
 
@@ -124,83 +136,151 @@ fn contains(region: &Region, va: u64) -> bool {
     va >= region.base() && va < region.base() + region.size()
 }
 
-/// Regiões privadas dos processos sem runtime de usuário, por EPROCESS.
-static FOREIGN: SpinLock<BTreeMap<u64, Vec<Region>>> = SpinLock::new(BTreeMap::new());
+/// O VAD de um processo: o que ele possui na metade de usuário. No NT é a
+/// árvore de EPROCESS.VadRoot; aqui são listas (o EPROCESS.VadRoot fica
+/// vazio).
+#[derive(Default)]
+pub struct Vad {
+    /// Alocações privadas e vistas de seção de dados.
+    pub regions: Vec<Region>,
+    /// Imagens: o executável, a ntdll, as DLLs do loader e as vistas de
+    /// seção de imagem.
+    pub images: Vec<Region>,
+    /// Área de strings das entradas LDR montadas pelo kernel: (próxima VA,
+    /// fim da região).
+    pub ldr_strings: (u64, u64),
+}
 
-/// O espaço de endereçamento de usuário de um processo.
+impl Vad {
+    fn find(&self, va: u64) -> Option<Region> {
+        self.regions.iter().find(|region| contains(region, va)).or_else(|| self.images.iter().find(|region| contains(region, va))).cloned()
+    }
+
+    fn list(&mut self, kind: RegionKind) -> Option<&mut Vec<Region>> {
+        match kind {
+            RegionKind::User => Some(&mut self.regions),
+            RegionKind::ProcessImages => Some(&mut self.images),
+            _ => None,
+        }
+    }
+
+    /// Retira a região (pela identidade) da lista do tipo; devolve se estava lá.
+    fn remove(&mut self, kind: RegionKind, region: &Region) -> bool {
+        let Some(list) = self.list(kind) else { return false };
+        let Some(index) = list.iter().position(|candidate| state::same_region(candidate, region)) else { return false };
+        list.remove(index);
+        true
+    }
+}
+
+/// O espaço de endereçamento de usuário de um processo, pelo EPROCESS: o VAD
+/// do `ProcessState` dele.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Space {
-    /// O processo de usuário em execução (VADs do runtime).
-    Active,
-    /// Outro processo, pelo EPROCESS.
-    Foreign(u64),
+    Process(u64),
 }
 
 impl Space {
     pub fn of(process: u64) -> Space {
-        // SAFETY: EPROCESS vivo, referenciado pelo chamador.
-        if unsafe { Eprocess::at(process) }.unique_process_id.get() == state::with(|state| state.current_process_id) {
-            Space::Active
-        } else {
-            Space::Foreign(process)
-        }
+        Space::Process(process)
     }
 
-    fn find(self, va: u64) -> Option<Region> {
+    /// O processo corrente (KTHREAD.ApcState.Process: o anexado, quando há
+    /// attach).
+    pub fn current() -> Space {
+        Space::Process(process::get_current_process())
+    }
+
+    /// O System: o que o kernel aloca no próprio contexto e as imagens de
+    /// sistema mapeadas uma vez.
+    pub fn system() -> Space {
+        Space::Process(process::get_system_process())
+    }
+
+    pub fn process(self) -> u64 {
         match self {
-            Space::Active => find_region(va),
-            Space::Foreign(process) => FOREIGN.lock().get(&process).and_then(|regions| regions.iter().find(|region| contains(region, va)).cloned()),
+            Space::Process(process) => process,
         }
     }
 
-    fn insert(self, region: Region) {
-        match self {
-            Space::Active => state::with(|state| state.user_regions.push(region)),
-            Space::Foreign(process) => FOREIGN.lock().entry(process).or_default().push(region),
-        }
+    /// O estado do processo; `None` depois do término.
+    fn state(self) -> Option<Arc<ProcessState>> {
+        process_state::get(self.process())
     }
 
+    /// `body` sobre o VAD do processo; `None` se ele já saiu. A trava do VAD
+    /// não atravessa chamadas que voltem a um VAD.
+    pub fn with_vad<R>(self, body: impl FnOnce(&mut Vad) -> R) -> Option<R> {
+        self.state().map(|state| body(&mut state.vad.lock()))
+    }
+
+    /// Região privada, vista ou imagem do processo que contém o endereço.
+    pub fn find(self, va: u64) -> Option<Region> {
+        self.with_vad(|vad| vad.find(va)).flatten()
+    }
+
+    /// Alocações privadas e vistas de dados do processo.
+    pub fn regions(self) -> Vec<Region> {
+        self.with_vad(|vad| vad.regions.clone()).unwrap_or_default()
+    }
+
+    /// Imagens do processo.
+    pub fn images(self) -> Vec<Region> {
+        self.with_vad(|vad| vad.images.clone()).unwrap_or_default()
+    }
+
+    /// Registra a região no VAD; `false` se o processo já saiu.
+    fn insert(self, kind: RegionKind, region: Region) -> bool {
+        self.with_vad(|vad| vad.list(kind).map(|list| list.push(region)).is_some()).unwrap_or(false)
+    }
+
+    /// Retira uma alocação privada do VAD (pela identidade).
     fn remove(self, region: &Region) {
-        match self {
-            Space::Active => state::with(|state| state.remove_region(state::RegionKind::User, region)),
-            Space::Foreign(process) => {
-                if let Some(regions) = FOREIGN.lock().get_mut(&process) {
-                    regions.retain(|candidate| !state::same_region(candidate, region));
+        self.with_vad(|vad| vad.remove(RegionKind::User, region));
+    }
+}
+
+/// Registra a região na lista do tipo: `User`/`ProcessImages` no VAD do
+/// espaço, `Shared`/`KernelViews` nas listas de sistema, `Detached` em
+/// nenhuma. Devolve se a região entrou numa lista.
+pub fn insert_region(space: Space, kind: RegionKind, region: Region) -> bool {
+    match kind {
+        RegionKind::User | RegionKind::ProcessImages => space.insert(kind, region),
+        RegionKind::Shared | RegionKind::KernelViews => state::with(|state| state.regions(kind).map(|list| list.push(region)).is_some()),
+        RegionKind::Detached => false,
+    }
+}
+
+/// Retira a região da lista do tipo: das listas de sistema ou do VAD do
+/// processo que a possui (uma região está num VAD só).
+pub fn remove_region(kind: RegionKind, region: &Region) {
+    match kind {
+        RegionKind::User | RegionKind::ProcessImages => {
+            for state in process_state::all() {
+                if state.vad.lock().remove(kind, region) {
+                    return;
                 }
             }
         }
+        RegionKind::Shared | RegionKind::KernelViews => state::with(|state| state.remove_region(kind, region)),
+        RegionKind::Detached => {}
     }
 }
 
-/// As regiões privadas de um processo sem runtime de usuário.
-pub fn foreign_regions(process: u64) -> Vec<Region> {
-    FOREIGN.lock().get(&process).cloned().unwrap_or_default()
-}
-
-/// Libera as regiões privadas de um processo que saiu.
-pub fn release_foreign(process: u64) {
-    let regions = FOREIGN.lock().remove(&process).unwrap_or_default();
-    for region in regions {
-        if let Some(owner) = private(&region) {
-            free_region_pages(owner);
-        }
-    }
-}
-
-/// Tudo o que ocupa VA de usuário na tabela de páginas única: regiões e
-/// imagens do processo ativo, regiões compartilhadas, vistas de seção de
-/// qualquer dono (inclusive reservas ainda sem página) e as regiões
-/// privadas dos outros processos. O que só existe nas PTEs (a
-/// KUSER_SHARED_DATA, imagens mapeadas sem região) o `mm/section/address`
-/// acha pela própria árvore de páginas.
+/// Tudo o que ocupa VA de usuário na tabela de páginas única: os VADs de
+/// todos os processos, as regiões compartilhadas, as vistas de seção de
+/// qualquer dono (inclusive reservas ainda sem página) e as vistas de
+/// sistema. O que só existe nas PTEs (a KUSER_SHARED_DATA, imagens mapeadas
+/// sem região) o `mm/section/address` acha pela própria árvore de páginas.
 pub fn occupied() -> Vec<section_address::Region> {
     let span = |region: &Region| section_address::Region { base: region.base(), size: region.size() };
-    let mut occupied: Vec<section_address::Region> = state::with(|state| state.user_regions.iter().chain(state.process_images.iter()).chain(state.shared_user_regions.iter()).chain(state.section_kernel_views.iter()).map(span).collect());
+    let mut occupied: Vec<section_address::Region> = state::with(|state| state.shared_user_regions.iter().chain(state.section_kernel_views.iter()).map(span).collect());
+    for state in process_state::all() {
+        let vad = state.vad.lock();
+        occupied.extend(vad.regions.iter().chain(vad.images.iter()).map(span));
+    }
     occupied.extend(sections::views().iter().map(|view| section_address::Region { base: view.base, size: view.size }));
     occupied.extend(section_views::all().iter().map(|view| section_address::Region { base: view.base(), size: view.size() }));
-    for regions in FOREIGN.lock().values() {
-        occupied.extend(regions.iter().map(span));
-    }
     occupied.retain(|region| region.base < USER_ADDRESS_LIMIT);
     occupied
 }
@@ -211,9 +291,9 @@ pub fn find_free(size: u64, alignment: u64, top_down: bool) -> Result<u64, u32> 
     section_address::find(&section_address::FindOptions { size, alignment, top_down, ..section_address::FindOptions::default() }, &occupied())
 }
 
-/// Região de usuário ou imagem que contém o endereço.
+/// Região de usuário ou imagem do processo corrente que contém o endereço.
 pub fn find_region(va: u64) -> Option<Region> {
-    state::with(|state| state.user_regions.iter().find(|region| contains(region, va)).cloned().or_else(|| state.process_images.iter().find(|region| contains(region, va)).cloned()))
+    Space::current().find(va)
 }
 
 fn private(region: &Region) -> Option<&PrivateRegion> {
@@ -288,7 +368,7 @@ pub fn map_region_pages(region: &PrivateRegion) -> bool {
 /// pelo `mm/section/address` (primeira faixa livre; MEM_TOP_DOWN de cima).
 #[allow(clippy::too_many_arguments)]
 pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
-    allocate_in(Space::Active, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
+    allocate_in(Space::current(), base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
 }
 
 /// Reserva/commit no espaço dado. `lowest` é o piso pedido (nunca abaixo
@@ -296,6 +376,9 @@ pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u
 /// topo, = MM_HIGHEST_VAD_ADDRESS + 1).
 #[allow(clippy::too_many_arguments)]
 pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
+    if space.state().is_none() {
+        return Ok(STATUS_PROCESS_IS_TERMINATING);
+    }
     let highest = if highest == 0 { USER_ALLOCATION_TOP } else { highest.min(USER_ALLOCATION_TOP) };
     let lowest = lowest.max(map::LOWEST_USER_ADDRESS);
     // PVOID *BaseAddress e SIZE_T *RegionSize: de usuário (sondados pelo
@@ -365,18 +448,26 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     if allocation_type & MEM_COMMIT != 0 && !map_region_pages(&region) {
         return Ok(0xC000_0017);
     }
-    space.insert(region);
+    let entry: Region = region.clone();
+    if !space.insert(RegionKind::User, entry) {
+        // O processo saiu no meio da alocação: as páginas voltam ao PFN.
+        free_region_pages(&region);
+        return Ok(STATUS_PROCESS_IS_TERMINATING);
+    }
     guest::try_write::<u64>(base_pointer, base)?;
     guest::try_write::<u64>(size_pointer, size)?;
     Ok(0)
 }
 
-/// Região privada comitada que o kernel monta para o processo ativo, na
+/// Região privada comitada que o kernel monta para o processo do espaço, na
 /// primeira faixa livre (`top_down`: a primeira de cima para baixo).
-fn register_user_region(size: u64, alignment: u64, top_down: bool) -> Result<Arc<PrivateRegion>, KernelError> {
+fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool) -> Result<Arc<PrivateRegion>, KernelError> {
     let size = size.div_ceil(PAGE) * PAGE;
     if size == 0 {
         return Err(KernelError::new("Regiao de usuario vazia"));
+    }
+    if space.state().is_none() {
+        return Err(KernelError::with_status("regiao de usuario num processo sem VAD", STATUS_PROCESS_IS_TERMINATING));
     }
     let base = find_free(size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
     let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE);
@@ -384,23 +475,26 @@ fn register_user_region(size: u64, alignment: u64, top_down: bool) -> Result<Arc
         return Err(KernelError::new("PFN esgotado na regiao de usuario"));
     }
     let entry: Region = region.clone();
-    state::with(|state| state.user_regions.push(entry));
+    if !space.insert(RegionKind::User, entry) {
+        free_region_pages(&region);
+        return Err(KernelError::with_status("processo saiu durante a regiao de usuario", STATUS_PROCESS_IS_TERMINATING));
+    }
     Ok(region)
 }
 
-/// Pilha da primeira thread, uma alocação comum de baixo para cima (como a
-/// reserva da pilha inicial no NT): devolve a base (StackLimit e
-/// DeallocationStack) e o topo (StackBase) da pilha.
+/// Pilha da primeira thread do processo corrente, uma alocação comum de
+/// baixo para cima (como a reserva da pilha inicial no NT): devolve a base
+/// (StackLimit e DeallocationStack) e o topo (StackBase) da pilha.
 pub fn map_user_stack() -> Result<(u64, u64), KernelError> {
-    let region = register_user_region(USER_STACK_SIZE, map::ALLOCATION_GRANULARITY, false)?;
+    let region = register_user_region(Space::current(), USER_STACK_SIZE, map::ALLOCATION_GRANULARITY, false)?;
     Ok((region.base, region.base + region.size))
 }
 
-/// Estruturas que o kernel monta para o processo (PEB, TEB, parâmetros,
-/// entradas do Ldr): páginas comitadas de cima para baixo, como o
-/// MiCreatePebOrTeb, sem janela fixa.
+/// Estruturas que o kernel monta para o processo corrente (PEB, TEB,
+/// parâmetros, entradas do Ldr): páginas comitadas de cima para baixo, como
+/// o MiCreatePebOrTeb, sem janela fixa.
 pub fn map_user_region(size: u64) -> Result<u64, KernelError> {
-    Ok(register_user_region(size, PAGE, true)?.base)
+    Ok(register_user_region(Space::current(), size, PAGE, true)?.base)
 }
 
 /// Igual, na área compartilhada (NLS etc.), que sobrevive entre processos.
@@ -448,7 +542,7 @@ pub fn nt_allocate_virtual_memory_ex(_process: u64, base_pointer: u64, size_poin
         // Diagnóstico: endereços de retorno na pilha de usuário.
         debug_print!("[usermode] allocEx tamanho zero chamado de 0x{:x} caller2=0x{:x} sizePtr=0x{:x}", guest::try_read::<u64>(user_rsp).unwrap_or(0), guest::try_read::<u64>(user_rsp + 0x90).unwrap_or(0), size_pointer);
     }
-    state::guarded(|| allocate_ex_in(Space::Active, base_pointer, size_pointer, allocation_type as u32, state::stack_arg32(user_rsp, 5), parameters, count))
+    state::guarded(|| allocate_ex_in(Space::current(), base_pointer, size_pointer, allocation_type as u32, state::stack_arg32(user_rsp, 5), parameters, count))
 }
 
 /// NtAllocateVirtualMemoryEx no espaço dado: MEM_ADDRESS_REQUIREMENTS
@@ -488,7 +582,7 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
 /// reservada); MEM_RELEASE libera a região privada inteira; seções usam
 /// UnmapView.
 pub fn nt_free_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, free_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| free_in(Space::Active, base_pointer, size_pointer, free_type as u32))
+    state::guarded(|| free_in(Space::current(), base_pointer, size_pointer, free_type as u32))
 }
 
 /// MEM_RESET: a faixa (arredondada a páginas) tem de estar comitada numa
@@ -568,7 +662,7 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
 /// da imagem); falha de política devolve PAGE_NOACCESS no OldProtect sem
 /// tocar base, tamanho ou PTEs.
 pub fn nt_protect_virtual_memory(_process: u64, base_pointer: u64, size_pointer: u64, new_protect: u64, user_rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| protect_in(Space::Active, base_pointer, size_pointer, new_protect as u32, state::stack_arg(user_rsp, 5), true))
+    state::guarded(|| protect_in(Space::current(), base_pointer, size_pointer, new_protect as u32, state::stack_arg(user_rsp, 5), true))
 }
 
 /// Troca a proteção no espaço dado; ponteiros de modo usuário são sondados.
@@ -609,7 +703,7 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
             return Ok(0xC000_004E);
         }
     }
-    let context = Context::current();
+    let context = Context::of(space);
     if let (Some(section), Some(view)) = (&section, &view) {
         if !section.is_image {
             let old = memory_query::page_protection(&region, (base - region.base()) / PAGE, &context);
@@ -715,14 +809,16 @@ pub fn nt_write_virtual_memory(process: u64, address: u64, buffer: u64, size: u6
     transfer_virtual_memory(process, address, buffer, size, rsp, true)
 }
 
-/// Buracos reservados não têm PFN; páginas NOACCESS ainda são donas do frame.
+/// Libera uma região privada do VAD que a possui (a pilha e a TEB de uma
+/// thread, por exemplo); uma região que já saiu do VAD (liberada ou
+/// devolvida no término do processo) não é tocada. Buracos reservados não
+/// têm PFN; páginas NOACCESS ainda são donas do frame.
 pub fn release_private_region(region: &Region) {
     let Some(owner) = private(region) else { return };
-    if !state::with(|state| state.user_regions.iter().any(|candidate| state::same_region(candidate, region))) {
-        return;
+    let owned = process_state::all().into_iter().any(|state| state.vad.lock().remove(RegionKind::User, region));
+    if owned {
+        free_region_pages(owner);
     }
-    free_region_pages(owner);
-    state::with(|state| state.remove_region(state::RegionKind::User, region));
 }
 
 /// Desmapeia e devolve ao PFN as páginas comitadas de uma região privada.
@@ -740,10 +836,40 @@ fn free_region_pages(owner: &PrivateRegion) {
     }
 }
 
-pub fn release_private_regions() {
-    let regions = state::with(|state| state.user_regions.clone());
-    for region in regions {
-        release_private_region(&region);
+/// Devolve o VAD inteiro do processo (o MmCleanProcessAddressSpace do
+/// término): as listas saem do VAD primeiro, então nada mais as encontra; as
+/// vistas de dados e de imagem voltam ao Mm e as páginas privadas ao PFN. As
+/// imagens do loader não têm páginas próprias (são do `pe_loader`).
+pub fn release_vad(state: &ProcessState) {
+    let (regions, images) = {
+        let mut vad = state.vad.lock();
+        vad.ldr_strings = (0, 0);
+        (core::mem::take(&mut vad.regions), core::mem::take(&mut vad.images))
+    };
+    for region in &regions {
+        if let Some(owner) = private(region) {
+            free_region_pages(owner);
+        } else if let Some(view) = view_of(region) {
+            if let Err(error) = sections::unmap(&view, None) {
+                debug_print!("[usermode] vista em 0x{:x} retida no termino do processo: {}", view.base, error);
+            }
+        }
+    }
+    for image in &images {
+        let view = section_views::all().into_iter().find(|view| matches!(view, section_views::OwnedView::Image(registered) if registered.section.is_some()) && state::same_region(&view.region(), image));
+        if let Some(view) = view {
+            if let Err(error) = section_views::unmap(&view) {
+                debug_print!("[usermode] imagem em 0x{:x} retida no termino do processo: {}", image.base(), error);
+            }
+        }
+    }
+}
+
+/// O processo do runtime de usuário sai: o VAD dele volta inteiro, se o
+/// término ainda não o devolveu.
+pub fn release_space(space: Space) {
+    if let Some(state) = space.state() {
+        release_vad(&state);
     }
 }
 

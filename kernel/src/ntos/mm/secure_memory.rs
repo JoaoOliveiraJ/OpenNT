@@ -13,10 +13,9 @@
 //! - MmUnsecureVirtualMemory(Handle): a busca combina o processo corrente, então
 //!   um handle de outro contexto é ignorado; VOID.
 //!
-//! Os "VADs" são as regiões do `ps::user` (privadas do processo ativo ou de
-//! outros processos e as vistas de seção do processo), com os mesmos conjuntos
-//! de páginas confirmadas e proteções por página que o ZwQueryVirtualMemory
-//! relata.
+//! Os "VADs" são as regiões do VAD de cada processo (`ps::user::memory`:
+//! privadas, vistas de seção e imagens), com os mesmos conjuntos de páginas
+//! confirmadas e proteções por página que o ZwQueryVirtualMemory relata.
 //!
 //! Lacuna: a entrada é só registro. No NT uma faixa protegida faz
 //! NtFreeVirtualMemory/NtProtectVirtualMemory falharem enquanto existe; isso
@@ -27,7 +26,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::mm::section::views as section_views;
 use crate::ntos::ps::process;
-use crate::ntos::ps::user::memory::{self, Space};
+use crate::ntos::ps::user::memory::Space;
 use crate::ntos::ps::user::state::Region;
 use crate::rtl::SpinLock;
 
@@ -48,16 +47,13 @@ struct Secured {
 static SECURED: SpinLock<BTreeMap<u64, Secured>> = SpinLock::new(BTreeMap::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
-/// O "VAD" que contém o endereço: vista de seção do processo ou região
-/// privada do espaço dele.
+/// O "VAD" que contém o endereço: vista de seção do processo ou região do
+/// VAD dele.
 fn region_of(process: u64, address: u64) -> Option<Region> {
     if let Some(view) = section_views::find(process, address) {
         return Some(view.region());
     }
-    match Space::of(process) {
-        Space::Active => memory::find_region(address),
-        Space::Foreign(owner) => memory::foreign_regions(owner).into_iter().find(|region| address >= region.base() && address < region.base() + region.size()),
-    }
+    Space::of(process).find(address)
 }
 
 /// MiComparePteProtections: leitura aceita tudo que não seja NOACCESS ou

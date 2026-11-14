@@ -638,8 +638,9 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     object.active_threads.set(0);
     write_time(&object.exit_time, timestamp());
     remove_from_active_list(object);
-    // Fora da lista ativa, o estado por processo some; o EPROCESS pode
-    // continuar retido por referências.
+    // Fora da lista ativa, o estado por processo some e o VAD volta inteiro
+    // (o MmCleanProcessAddressSpace); o EPROCESS pode continuar retido por
+    // referências.
     process_state::destroy(process);
     if let Some(record) = STATE.lock().processes.get_mut(&process) {
         record.terminated = true;
@@ -667,8 +668,6 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     if let (Some(image), Some(provider)) = (&record.image, provider) {
         (provider.destroy)(image);
     }
-    // As regiões privadas criadas por ZwAllocateVirtualMemory de kernel.
-    crate::ntos::ps::user::memory::release_foreign(process);
     object_types::account("Process", -1, 0)?;
     guest::free_bytes(process);
     Ok(())

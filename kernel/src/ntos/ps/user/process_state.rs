@@ -18,7 +18,8 @@
 //!   get_current_process`), então `current` segue o processo anexado.
 //!
 //! Travas: `PROCESSES` nunca fica retida numa chamada que volte ao registro;
-//! um estado destruído é liberado fora dela.
+//! um estado destruído é liberado fora dela. Ordem: `PROCESSES` antes do
+//! `vad` de um estado.
 //!
 //! Já mora aqui a tabela de handles de usuário (`handles`, operada por
 //! `state.rs`); o resto do estado global de `state.rs` continua valendo para o
@@ -28,7 +29,9 @@
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
+use super::memory::{self, Vad};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
 use crate::rtl::{KernelError, SpinLock};
@@ -41,6 +44,8 @@ pub struct ProcessState {
     pub process_id: u64,
     /// A tabela de handles de usuário (o papel da ObjectTable).
     pub handles: SpinLock<UserHandleTable>,
+    /// As regiões de usuário do processo (o papel do EPROCESS.VadRoot).
+    pub vad: SpinLock<Vad>,
 }
 
 static PROCESSES: SpinLock<BTreeMap<u64, Arc<ProcessState>>> = SpinLock::new(BTreeMap::new());
@@ -51,7 +56,7 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
     if process == 0 {
         return Err(KernelError::new("estado de processo sem EPROCESS"));
     }
-    let state = Arc::new(ProcessState { process, process_id, handles: SpinLock::new(UserHandleTable::new()) });
+    let state = Arc::new(ProcessState { process, process_id, handles: SpinLock::new(UserHandleTable::new()), vad: SpinLock::new(Vad::default()) });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {
         return Err(KernelError::new(format!("EPROCESS {process:#x} ja tem estado")));
@@ -65,25 +70,28 @@ pub fn get(process: u64) -> Option<Arc<ProcessState>> {
     PROCESSES.lock().get(&process).cloned()
 }
 
-/// Os estados vivos, em ordem de EPROCESS.
-pub fn all() -> alloc::vec::Vec<Arc<ProcessState>> {
-    PROCESSES.lock().values().cloned().collect()
-}
-
 /// O estado do processo corrente (o anexado, quando há attach). `None`
 /// antes do Ps criar o System ou depois do término do processo corrente.
 pub fn current() -> Option<Arc<ProcessState>> {
     get(process::get_current_process())
 }
 
+/// Os estados vivos (o System inclusive), em ordem de EPROCESS.
+pub fn all() -> Vec<Arc<ProcessState>> {
+    PROCESSES.lock().values().cloned().collect()
+}
+
 /// Destrói o estado do EPROCESS `process`; um segundo término não acha
-/// nada. Devolve se havia estado. Os handles de usuário que restarem na
-/// tabela são fechados aqui.
+/// nada. Devolve se havia estado. Fora da trava, na ordem do término do NT
+/// (rundown de handles antes do espaço de endereçamento): os handles de
+/// usuário que restarem na tabela são fechados e o VAD volta inteiro (as
+/// regiões do processo, só as dele).
 pub fn destroy(process: u64) -> bool {
     let removed = PROCESSES.lock().remove(&process);
-    // O rundown da tabela e o último Arc caem aqui, fora da trava.
     if let Some(removed) = &removed {
         state::sweep_user_handles(removed);
+        memory::release_vad(removed);
     }
+    // O último Arc cai aqui, fora da trava.
     removed.is_some()
 }

@@ -339,39 +339,27 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
     })
 }
 
-/// Fim do processo de usuário: desmonta as vistas de seção e de imagem e
-/// libera as regiões privadas. As liberações de `device_io`,
-/// `worker_factory`, instrumentação, mutantes, threads, win32k,
-/// `cm::service::rpc` e `system_process_information`, nesta ordem. Os
-/// handles não passam por aqui: a tabela é do processo e o término dele a
-/// esvazia (`process_state::destroy`).
+/// Fim do processo de usuário: devolve o VAD do processo (vistas de seção e
+/// de imagem e regiões privadas), se o término ainda não o devolveu. As
+/// liberações de `device_io`, `worker_factory`, instrumentação, mutantes,
+/// threads, win32k, `cm::service::rpc` e `system_process_information`, nesta
+/// ordem. Os handles não passam por aqui: a tabela é do processo e o término
+/// dele a esvazia (`process_state::destroy`).
 pub fn release_user_resources() {
-    super::device_io::release_process(state::with(|state| state.current_process_id));
+    let process_id = state::with(|state| state.current_process_id);
+    super::device_io::release_process(process_id);
     super::worker_factory::release_process();
     super::instrumentation::release_process();
     super::mutants::release_process();
     super::threads::release_process();
-    crate::ntos::cm::service::rpc::release_process(state::with(|state| state.current_process_id));
-    crate::ntos::ps::system_process_information::release_process(state::with(|state| state.current_process_id));
-    let regions = state::with(|state| state.user_regions.clone());
-    for region in regions {
-        if region.section().is_some() {
-            if let Some(view) = crate::ntos::ps::user::sections::views().into_iter().find(|view| {
-                let candidate: state::Region = view.clone();
-                state::same_region(&candidate, &region)
-            }) {
-                let _ = crate::ntos::ps::user::sections::unmap(&view, None);
-            }
-        }
+    crate::ntos::cm::service::rpc::release_process(process_id);
+    crate::ntos::ps::system_process_information::release_process(process_id);
+    // O processo do runtime ainda vivo (saída sem término): o System nunca
+    // entra aqui.
+    let runtime = process::list_active_processes().into_iter().find(|entry| entry.pid == process_id && entry.pid != process::SYSTEM_PROCESS_ID);
+    if let Some(entry) = runtime {
+        super::memory::release_space(super::memory::Space::of(entry.address));
     }
-    let images: Vec<crate::ntos::mm::section::views::OwnedView> = crate::ntos::mm::section::views::all().into_iter().filter(|view| matches!(view, crate::ntos::mm::section::views::OwnedView::Image(image) if image.section.is_some() && state::with(|state| state.process_images.iter().any(|region| region.base() == image.base)))).collect();
-    for image in images {
-        if let crate::ntos::mm::section::views::OwnedView::Image(view) = &image {
-            *view.regions.lock() = Some(state::RegionKind::ProcessImages);
-        }
-        let _ = crate::ntos::mm::section::views::unmap(&image);
-    }
-    super::memory::release_private_regions();
 }
 
 /// Registra os handlers de arquivos, dispositivos e seções.

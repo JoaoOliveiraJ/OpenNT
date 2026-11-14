@@ -121,16 +121,17 @@ pub trait UserRegion: Send + Sync {
 
 pub type Region = Arc<dyn UserRegion>;
 
-/// Listas de regiões do estado (`user_regions`, `process_images`,
-/// `shared_user_regions`, `section_kernel_views`).
+/// Listas de regiões: `User` (alocações privadas e vistas de dados) e
+/// `ProcessImages` no VAD do processo (`memory::Vad`); `Shared` e
+/// `KernelViews` nas listas de sistema daqui (`shared_user_regions`,
+/// `section_kernel_views`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionKind {
     User,
     ProcessImages,
     Shared,
     KernelViews,
-    /// Lista temporária para processos fora de execução:
-    /// a região não entra em lista alguma do estado.
+    /// A região não entra em lista alguma (vista avulsa de teste).
     Detached,
 }
 
@@ -141,14 +142,10 @@ pub fn same_region(left: &Region, right: &Region) -> bool {
 
 /// Estado global de modo usuário.
 pub struct State {
-    /// Regiões do processo, imagens mapeadas, mapeamentos NLS/schema
-    /// permanentes e vistas de seção de kernel.
-    pub user_regions: alloc::vec::Vec<Region>,
-    pub process_images: alloc::vec::Vec<Region>,
+    /// Mapeamentos NLS permanentes e vistas de seção de kernel, os mesmos em
+    /// todo processo; as regiões de cada processo moram no VAD dele.
     pub shared_user_regions: alloc::vec::Vec<Region>,
     pub section_kernel_views: alloc::vec::Vec<Region>,
-    /// Sempre vazia (ver `RegionKind::Detached`).
-    detached_regions: alloc::vec::Vec<Region>,
     /// SSN → nome (preenchido pelo loader a partir dos stubs reais).
     pub name_by_number: BTreeMap<u32, String>,
     /// Topo da pilha de syscall (o frame fica no topo).
@@ -176,9 +173,6 @@ pub struct State {
     pub instrumentation_callback: u64,
     /// Instantâneo diagnóstico da saída explícita do processo.
     pub termination_rsp: u64,
-    /// Área de strings das entradas LDR (bump próprio).
-    pub next_ldr_string_va: u64,
-    pub ldr_string_region_end: u64,
     /// O apiset schema real, mapeado como dado.
     pub api_set_map_va: u64,
     /// contrato → DLL hospedeira (minúsculas).
@@ -190,22 +184,19 @@ pub struct State {
 }
 
 impl State {
-    pub fn regions(&mut self, kind: RegionKind) -> &mut alloc::vec::Vec<Region> {
+    /// A lista de sistema do tipo (`Shared`, `KernelViews`); as demais ficam
+    /// no VAD do processo (`memory::insert_region`).
+    pub fn regions(&mut self, kind: RegionKind) -> Option<&mut alloc::vec::Vec<Region>> {
         match kind {
-            RegionKind::User => &mut self.user_regions,
-            RegionKind::ProcessImages => &mut self.process_images,
-            RegionKind::Shared => &mut self.shared_user_regions,
-            RegionKind::KernelViews => &mut self.section_kernel_views,
-            RegionKind::Detached => &mut self.detached_regions,
+            RegionKind::Shared => Some(&mut self.shared_user_regions),
+            RegionKind::KernelViews => Some(&mut self.section_kernel_views),
+            RegionKind::User | RegionKind::ProcessImages | RegionKind::Detached => None,
         }
     }
 
-    /// Remove a região da lista, se estiver nela.
+    /// Remove a região da lista de sistema, se estiver nela.
     pub fn remove_region(&mut self, kind: RegionKind, region: &Region) {
-        if kind == RegionKind::Detached {
-            return;
-        }
-        let list = self.regions(kind);
+        let Some(list) = self.regions(kind) else { return };
         if let Some(index) = list.iter().position(|candidate| same_region(candidate, region)) {
             list.remove(index);
         }
@@ -213,11 +204,8 @@ impl State {
 
     const fn new() -> Self {
         Self {
-            user_regions: alloc::vec::Vec::new(),
-            process_images: alloc::vec::Vec::new(),
             shared_user_regions: alloc::vec::Vec::new(),
             section_kernel_views: alloc::vec::Vec::new(),
-            detached_regions: alloc::vec::Vec::new(),
             name_by_number: BTreeMap::new(),
             syscall_stack_top: 0,
             current_peb_va: 0,
@@ -235,8 +223,6 @@ impl State {
             capture_limit: 1,
             instrumentation_callback: 0,
             termination_rsp: 0,
-            next_ldr_string_va: 0,
-            ldr_string_region_end: 0,
             api_set_map_va: 0,
             api_set_hosts: None,
             current_ldr_va: 0,

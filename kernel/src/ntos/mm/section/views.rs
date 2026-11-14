@@ -13,7 +13,7 @@ use crate::ntos::mm::pfn;
 use crate::ntos::ke::smp;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::user::sections::{self, Section, View};
-use crate::ntos::ps::user::state::{self, Region, RegionKind, UserRegion};
+use crate::ntos::ps::user::state::{Region, RegionKind, UserRegion};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::pe_loader::PeImage;
 
@@ -173,7 +173,7 @@ pub fn unmap(view: &OwnedView) -> Result<(), KernelError> {
     let kind = *image.regions.lock();
     if let Some(kind) = kind {
         let region: Region = image.clone();
-        state::with(|state| state.remove_region(kind, &region));
+        crate::ntos::ps::user::memory::remove_region(kind, &region);
     }
     forget(view);
     if let Some(section) = &image.section {

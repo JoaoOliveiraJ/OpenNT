@@ -311,6 +311,17 @@ além da KUSER_SHARED_DATA:
   compartilhadas de NLS são páginas comitadas de cima para baixo, como o
   MiCreatePebOrTeb. Como a tabela de páginas ainda é uma só, a escolha vê o
   que todos os processos ocupam (`memory::occupied`) e as PTEs reais.
+- **VAD por processo** (`memory::Vad`, no `ProcessState` de cada EPROCESS):
+  as alocações privadas, as vistas de seção e as imagens são do processo que
+  as criou. Os serviços agem sobre um `memory::Space`: os Nt* de usuário sobre
+  o processo corrente (o anexado, quando há attach), os Zw* sobre o processo
+  do handle, o NtMapViewOfSection sobre o processo alvo. NtQueryVirtualMemory,
+  NtFreeVirtualMemory e NtProtectVirtualMemory só enxergam o VAD do próprio
+  processo; o System guarda o que o kernel aloca no próprio contexto e as
+  imagens de sistema mapeadas uma vez (ntdll, apiset). O término do processo
+  devolve o VAD inteiro (`memory::release_vad`, o MmCleanProcessAddressSpace),
+  e a montagem de um processo novo roda anexada a ele, como o MmCreatePeb.
+  Só a escolha de endereço ainda olha todos os VADs.
 - **Imagens de usuário** carregam na ImageBase do cabeçalho quando a faixa
   está livre (um .exe em 0x1_4000_0000) e, se não estiver, na primeira faixa
   livre, relocadas (STATUS_IMAGE_NOT_AT_BASE nas vistas de imagem). A imagem
@@ -428,8 +439,8 @@ sem páginas de usuário, que isola uma página mapeada nela.
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por
   `ps::process::create_process` antes da lista ativa e destruído por
-  `terminate_process` depois dela. Estado novo de processo entra ali, não num
-  global de `ps/user/state.rs`.
+  `terminate_process` depois dela. O VAD do processo já mora ali. Estado novo
+  de processo entra ali, não num global de `ps/user/state.rs`.
 - **Handles por processo**: a tabela de handles de usuário mora no
   `ProcessState` (`handles`), e a linha nativa de cada handle vai para a
   HANDLE_TABLE do mesmo processo (EPROCESS.ObjectTable). As operações de

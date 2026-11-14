@@ -4,3 +4,4 @@ pub mod per_cpu;
 pub mod process_state;
 pub mod page_table_root;
 pub mod handles;
+pub mod vad;

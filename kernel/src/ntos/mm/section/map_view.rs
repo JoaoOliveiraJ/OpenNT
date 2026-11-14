@@ -22,7 +22,6 @@ use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::Eprocess;
 use crate::ntos::init::exports::invoke_handler;
 use crate::ntos::ob::{object_types, open_pointer};
 use crate::ntos::ps::previous_mode;
@@ -87,16 +86,8 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
         if section.no_execute && protect != 2 {
             return Ok(0xC000_0045);
         }
-        // SAFETY: o processo alvo referenciado pelo handle.
-        let pid = unsafe { Eprocess::at(process.pointer) }.unique_process_id.get();
-        let active = pid == state::with(|state| state.current_process_id);
-        let regions = if !active {
-            RegionKind::Detached
-        } else if section.is_image {
-            RegionKind::ProcessImages
-        } else {
-            RegionKind::User
-        };
+        // A vista entra no VAD do processo alvo.
+        let regions = if section.is_image { RegionKind::ProcessImages } else { RegionKind::User };
         if section.is_image {
             let mapped = match crate::ntos::mm::section::image_view::map(&section, &request, process.pointer, regions)? {
                 Ok(mapped) => mapped,

@@ -2,9 +2,8 @@
 //! (ZwAllocateVirtualMemory(Ex), ZwFreeVirtualMemory, ZwProtectVirtualMemory).
 //!
 //! O processo alvo vem do handle (o pseudo-handle é o processo corrente,
-//! inclusive anexado) e é retido durante a operação; o processo de usuário
-//! ativo usa os VADs do runtime, os demais as regiões privadas do próprio
-//! espaço (`ps::user::memory::Space`). Cada serviço devolve o NTSTATUS.
+//! inclusive anexado) e é retido durante a operação; cada serviço age sobre
+//! o VAD dele (`ps::user::memory::Space`) e devolve o NTSTATUS.
 
 use crate::ntos::ke::irql;
 use crate::ntos::mm::query_virtual;

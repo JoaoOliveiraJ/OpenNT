@@ -321,7 +321,7 @@ fn data_sections(assert: Assert) {
         return;
     };
     assert(section.pointer() != 0 && section.size == 0x3000 && section.maximum_size == 0x2800 && section.frames().len() == 3, "sections: SEC_COMMIT arredonda e confirma as paginas");
-    let regions = state::with(|state| state.user_regions.len());
+    let regions = crate::ntos::ps::user::memory::Space::current().regions().len();
     let request = MapRequest { protect: 4, ..MapRequest::default() };
     let first = sections::map(&section, &request);
     let second = sections::map(&section, &request);
@@ -330,7 +330,7 @@ fn data_sections(assert: Assert) {
         return;
     };
     let frame = section.frame(0).unwrap_or(0);
-    assert(first.base != second.base && first.base % 0x1_0000 == 0 && paging::translate(first.base) == frame && paging::translate(second.base) == frame && paging::access_flags(first.base) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW && state::with(|state| state.user_regions.len()) == regions + 2, "sections: vistas sao aliases das mesmas paginas com USER e RW");
+    assert(first.base != second.base && first.base % 0x1_0000 == 0 && paging::translate(first.base) == frame && paging::translate(second.base) == frame && paging::access_flags(first.base) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW && crate::ntos::ps::user::memory::Space::current().regions().len() == regions + 2, "sections: vistas sao aliases das mesmas paginas com USER e RW");
     assert(sections::map(&section, &MapRequest { offset: 0x1000, ..request }).is_ok_and(|mapped| mapped.is_err_and(|status| status == 0xC000_0220)) && sections::map(&section, &MapRequest { protect: 0x40, ..request }).is_ok_and(|mapped| mapped.is_err_and(|status| status == 0xC000_004E)) && sections::map(&section, &MapRequest { size: 0x4000, ..request }).is_ok_and(|mapped| mapped.is_err_and(|status| status == 0xC000_001F)), "sections: alinhamento, protecao e extensao recusados");
     // Copy-on-write: a falta de escrita publica uma página privada.
     physical::write_bytes(frame, b"compartilhado");
@@ -366,7 +366,7 @@ fn data_sections(assert: Assert) {
     // Vistas restantes da primeira seção.
     let pointer = section.pointer();
     assert(sections::unmap(&first, None).is_ok() && paging::translate(first.base) == 0 && sections::by_pointer(pointer).is_some() && sections::unmap(&first, None).is_err(), "sections: desmontagem remove o alias e recusa repeticao");
-    assert(sections::unmap(&second, None).is_ok() && sections::by_pointer(pointer).is_none() && state::with(|state| state.user_regions.len()) == regions, "sections: a ultima vista libera a secao e as regioes");
+    assert(sections::unmap(&second, None).is_ok() && sections::by_pointer(pointer).is_none() && crate::ntos::ps::user::memory::Space::current().regions().len() == regions, "sections: a ultima vista libera a secao e as regioes");
 }
 
 fn file_and_named_sections(assert: Assert) {
@@ -1762,7 +1762,8 @@ fn user_system_services(assert: Assert) {
     // Estruturas de processo para o loader da ntdll.
     let process_pointer = guest::alloc_bytes(nt::Eprocess::SIZE);
     guest::write_bytes(process_pointer, &alloc::vec![0u8; nt::Eprocess::SIZE as usize]);
-    let (saved_peb, saved_ldr, regions_before) = state::with(|state| (state.current_peb_va, state.current_ldr_va, state.user_regions.len()));
+    let (saved_peb, saved_ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
+    let regions_before = memory::Space::current().regions().len();
     let built = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, process_pointer, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44, stack_base: 0x20_0000, stack_top: 0x30_0000 });
     if let Ok(teb) = built {
         let (peb, ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
@@ -1782,11 +1783,11 @@ fn user_system_services(assert: Assert) {
     } else {
         assert(false, "userservices: estruturas de processo");
     }
-    let added: alloc::vec::Vec<_> = state::with(|state| {
+    state::with(|state| {
         state.current_peb_va = saved_peb;
         state.current_ldr_va = saved_ldr;
-        state.user_regions[regions_before..].to_vec()
     });
+    let added: alloc::vec::Vec<_> = memory::Space::current().regions().split_off(regions_before);
     for region in &added {
         memory::release_private_region(region);
     }
@@ -1861,16 +1862,17 @@ fn user_loader(assert: Assert) {
         let _ = image.release();
     }
     // Entradas LDR numa PEB_LDR_DATA própria.
-    let (saved_ldr, saved_next, saved_end, regions_before) = state::with(|state| (state.current_ldr_va, state.next_ldr_string_va, state.ldr_string_region_end, state.user_regions.len()));
+    let space = memory::Space::current();
+    let saved_ldr = state::with(|state| state.current_ldr_va);
+    let saved_strings = space.with_vad(|vad| vad.ldr_strings).unwrap_or_default();
+    let regions_before = space.regions().len();
     if let Ok(ldr) = memory::map_user_region(0x1000) {
         let ldr_data = unsafe { nt::PebLdrData::at(ldr) };
         for head in [&ldr_data.in_load_order_module_list, &ldr_data.in_memory_order_module_list, &ldr_data.in_initialization_order_module_list] {
             crate::ntos::ps::user::structures::write_list_head(head.address());
         }
-        state::with(|state| {
-            state.current_ldr_va = ldr;
-            state.next_ldr_string_va = 0;
-        });
+        state::with(|state| state.current_ldr_va = ldr);
+        space.with_vad(|vad| vad.ldr_strings.0 = 0);
         let entry = loader::create_ldr_entry(&ntdll).unwrap_or(0);
         let exe = loader::Module { name: alloc::string::String::from("teste.exe"), full_name: alloc::string::String::from("C:\\teste.exe"), image_base: 0x1_4000_0000, size_of_image: 0x2000, entry_point: 0x1_4000_1000, exports: Default::default(), is_exe: true, notification_source: None };
         let second = loader::create_ldr_entry(&exe).unwrap_or(0);
@@ -1879,12 +1881,9 @@ fn user_loader(assert: Assert) {
         assert(entry != 0 && dll.dll_base.get() == ntdll.image_base && dll.entry_point.get() == ntdll.entry_point && dll.flags.get() == 0x4006 && dll.obsolete_load_count.get() == 0xFFFF && dll.full_dll_name.length.get() == 58 && guest::read16(full) == b'C' as u16, "userloader: entrada LDR da DLL com nomes e flags");
         assert(second != 0 && exe_entry.entry_point.get() == 0 && exe_entry.flags.get() == 0x4002 && ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == second && dll.in_load_order_links.flink.get() == second && ldr_data.in_initialization_order_module_list.flink.get() == dll.in_initialization_order_links.address(), "userloader: exe sem EntryPoint e listas na ordem de carga");
     }
-    let added: alloc::vec::Vec<_> = state::with(|state| {
-        state.current_ldr_va = saved_ldr;
-        state.next_ldr_string_va = saved_next;
-        state.ldr_string_region_end = saved_end;
-        state.user_regions[regions_before..].to_vec()
-    });
+    state::with(|state| state.current_ldr_va = saved_ldr);
+    space.with_vad(|vad| vad.ldr_strings = saved_strings);
+    let added: alloc::vec::Vec<_> = space.regions().split_off(regions_before);
     for region in &added {
         memory::release_private_region(region);
     }
@@ -1923,7 +1922,7 @@ fn user_nls(assert: Assert) {
         crate::debug_print!("[usernls] created={:#x} written={:#x} mapped={:#x} base={:#x} size={:#x}", created, written, mapped, base, guest::read32(size));
     }
     assert(table_ok, "usernls: tabela do volume mapeada com o conteudo");
-    assert(call("NtGetNlsSectionPtr", 11, 4242, 0, out) == 0 && guest::read64(out) == base && state::with(|state| state.user_regions.iter().filter(|region| region.section().is_some() && region.base() == base).count()) == 1, "usernls: a vista existente do processo e reaproveitada");
+    assert(call("NtGetNlsSectionPtr", 11, 4242, 0, out) == 0 && guest::read64(out) == base && memory::Space::current().regions().iter().filter(|region| region.section().is_some() && region.base() == base).count() == 1, "usernls: a vista existente do processo e reaproveitada");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -2352,8 +2351,13 @@ fn user_windows_process(assert: Assert) {
     // Onde o processo ficou: a imagem principal, a PEB e a base da pilha
     // da primeira thread (StackLimit da TEB, logo abaixo da PEB).
     let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
-    let created = |_process_id: u64| -> Result<(), KernelError> {
-        let (exe_base, peb) = state::with(|state| (state.process_images.iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base()), state.current_peb_va));
+    let owner = core::cell::Cell::new(0u64);
+    let system_regions = memory::Space::system().regions().len();
+    let created = |process_id: u64| -> Result<(), KernelError> {
+        let pointer = crate::ntos::ps::process::list_active_processes().into_iter().find(|entry| entry.pid == process_id).map_or(0, |entry| entry.address);
+        owner.set(pointer);
+        let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
+        let peb = state::with(|state| state.current_peb_va);
         let stack = if peb != 0 { unsafe { nt::Teb::at(peb - 0x2000) }.nt_tib.stack_limit.get() } else { 0 };
         placed.set((exe_base, peb, stack));
         Ok(())
@@ -2365,7 +2369,7 @@ fn user_windows_process(assert: Assert) {
     }
     assert(ran, "userprocess: runWindowsProcess passa por LdrInitializeThunk, entra no exe e sai com o codigo");
     assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0) && state.current_image_path == "C:\\opennt-teste.exe") && crate::ntos::ps::user::threads::all().len() == 1, "userprocess: apiset, NLS, caminho da imagem e thread principal do processo");
-    assert(state::with(|state| state.user_regions.is_empty()), "userprocess: recursos do processo liberados na saida");
+    assert(owner.get() != 0 && crate::ntos::ps::user::process_state::get(owner.get()).is_none() && memory::Space::of(owner.get()).regions().is_empty() && memory::Space::system().regions().len() == system_regions, "userprocess: o VAD do processo volta no termino e nada dele foi para o System");
     let (exe_base, peb, stack) = placed.get();
     let user = |address: u64| crate::ntos::mm::memory_map::is_user_range(address, 0x1000);
     assert(exe_base == 0x1_4000_0000 && user(peb) && peb % 0x1000 == 0 && user(stack) && stack % 0x10000 == 0 && stack < 0x1_0000_0000, "userprocess: exe na ImageBase, PEB e pilha escolhidas pelo alocador (pilha de baixo para cima, abaixo de 4 GB)");
@@ -4181,7 +4185,8 @@ fn section_image_views(assert: Assert) {
         return;
     };
     let code = paging::translate(first.view.base + 0x1000);
-    let listed = state::with(|state| state.process_images.iter().any(|region| region.base() == first.view.base && region.name().as_deref() == Some("\\Device\\HarddiskVolume1\\opennt-secao.bin") && region.allocation_protect() == 0x80));
+    let images = || crate::ntos::ps::user::memory::Space::of(owner).images();
+    let listed = images().iter().any(|region| region.base() == first.view.base && region.name().as_deref() == Some("\\Device\\HarddiskVolume1\\opennt-secao.bin") && region.allocation_protect() == 0x80);
     let exports = state::with(|state| state.mapped_image_exports.contains_key("opennt-secao.bin"));
     assert(first.view.base == preferred && first.status == 0 && code != 0 && physical::read8(code) == 0xC3 && listed && exports, "imageview: imagem inteira na base preferida, listada e com exports publicados");
     // A base preferida ocupada: a vista vai para outro endereço e o status
@@ -4204,10 +4209,8 @@ fn section_image_views(assert: Assert) {
     if let Ok(Ok(view)) = partial {
         released &= section_views::unmap(&OwnedView::Image(view.view)).is_ok();
     }
-    let unlisted = state::with(|state| {
-        state.mapped_image_exports.remove("opennt-secao.bin");
-        !state.process_images.iter().any(|region| region.base() == first.view.base || region.base() == second.view.base)
-    });
+    state::with(|state| state.mapped_image_exports.remove("opennt-secao.bin"));
+    let unlisted = !images().iter().any(|region| region.base() == first.view.base || region.base() == second.view.base);
     drop(section);
     assert(released && unlisted && sections::by_pointer(pointer).is_none(), "imageview: vistas soltas e secao destruida na ultima");
 }
@@ -4929,6 +4932,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::page_table_root::run(assert);
     crate::ntos::test::multiprocess::handles::run(assert);
     crate::ntos::test::multiprocess::per_cpu::run(assert);
+    crate::ntos::test::multiprocess::vad::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

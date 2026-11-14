@@ -12,9 +12,10 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use super::loader::{self, BytesSource, ImageRegion, Module};
+use super::memory::{self, Space};
 use super::state::{self, RegionKind};
 use super::structures::{self, ProcessDescription};
-use super::{files, memory, threads};
+use super::{files, threads};
 use crate::hal::{bundle, kmalloc};
 use crate::hal::amd64::usermode;
 use crate::ntos::cm::service::database::{self as service_database, CommandLine, ServiceError, ServiceResult};
@@ -24,6 +25,7 @@ use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions};
 use crate::ntos::ps::process::{self, Executable};
+use crate::ntos::ps::process_context;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{Context, LdrDataTableEntry, ListEntry, NtStruct, Peb, PebLdrData};
@@ -85,8 +87,9 @@ pub struct Loaded {
     _image: MainImage,
 }
 
+/// A imagem no VAD do processo corrente (o processo em montagem, anexado).
 fn push_image(base: u64, size: u64, name: &str) {
-    state::with(|state| state.regions(RegionKind::ProcessImages).push(Arc::new(ImageRegion { base, size, name: String::from(name), file: None })));
+    memory::insert_region(Space::current(), RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name: String::from(name), file: None }));
 }
 
 /// A imagem principal, desfeita quando o processo acaba (como a vista da
@@ -132,13 +135,18 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
     loader::ensure_ntdll()?;
     let image = MainImage(pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?);
     let (entry_point, image_base, size_of_image) = (image.0.entry_point, image.0.image_base, image.0.size_of_image);
-    let (_, _, stack_top) = initial_stack()?;
     let process_id = next_process_id();
     let source: Arc<dyn FileSource> = Arc::new(BytesSource { name: format!("\\BootBundle\\apps\\{image_name}"), bytes: Arc::new(bytes) });
     let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: Some(image.0.image_information.to_vec()), command_line: None };
     let process_pointer = process::create_process(process_id, image_name, image_base, Some(&executable))?;
-    push_image(image_base, size_of_image, source.name());
-    let thread_pointer = match process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| thread)) {
+    // A imagem e a pilha entram no VAD do processo novo, anexado.
+    let stack = process_context::with_process(process_pointer, || {
+        push_image(image_base, size_of_image, source.name());
+        initial_stack()
+    })
+    .and_then(|stack| stack);
+    let thread = stack.and_then(|(_, _, stack_top)| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| (thread, stack_top))));
+    let (thread_pointer, stack_top) = match thread {
         Ok(thread) => thread,
         Err(error) => {
             let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
@@ -187,15 +195,12 @@ pub struct RunOptions<'a> {
     pub on_process_created: Option<&'a dyn Fn(u64) -> Result<(), KernelError>>,
 }
 
-/// Estado por processo (um processo de usuário por vez nesta camada).
+/// Estado por processo (um processo de usuário por vez nesta camada). As
+/// regiões são do VAD de cada processo e voltam no término dele.
 fn reset_process_state() {
     files::release_user_resources();
     threads::clear();
     state::with(|state| {
-        state.user_regions.clear();
-        state.process_images.clear();
-        state.next_ldr_string_va = 0;
-        state.ldr_string_region_end = 0;
         state.mapped_image_exports.clear();
     });
     loader::reset_loaded_modules();
@@ -216,7 +221,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
             super::call_capture::arm("ntdll.dll", &exports);
         }
     }
-    push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
     loader::ensure_api_set_schema()?;
     loader::ensure_nls_data()?;
     loader::parse_api_set_schema()?;
@@ -237,8 +241,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     // Desfeita na saída desta função, depois do processo e dos recursos.
     let main_image = MainImage(main_image);
     let image = &main_image.0;
-    push_image(image.image_base, image.size_of_image, dos_path);
-    let (stack_base, stack_end, stack_top) = initial_stack()?;
     let process_id = next_process_id();
     state::with(|state| {
         state.current_process_id = process_id;
@@ -247,10 +249,19 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     });
     let executable = Executable { source: source.clone(), image_size: image.size_of_image, image_information: Some(image.image_information.to_vec()), command_line: Some(format!("\"{dos_path}\"")) };
     let process_pointer = process::create_process(process_id, image_name, image.image_base, Some(&executable))?;
-    // A PEB real sai antes das notificações da primeira thread.
-    let created = structures::build_process_structures(&ProcessDescription { process_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output, stack_base, stack_top: stack_end })
-        .and_then(|teb| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).map(|thread| (teb, thread)));
-    let (teb, thread_pointer) = match created {
+    // O espaço do processo novo, anexado (como o MmCreatePeb): a ntdll e o
+    // exe no VAD dele, a pilha da primeira thread, a PEB real (antes das
+    // notificações da primeira thread) e a região do CONTEXT inicial.
+    let built = process_context::with_process(process_pointer, || -> Result<(u64, u64, u64), KernelError> {
+        push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
+        push_image(image.image_base, image.size_of_image, dos_path);
+        let (stack_base, stack_end, stack_top) = initial_stack()?;
+        let teb = structures::build_process_structures(&ProcessDescription { process_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output, stack_base, stack_top: stack_end })?;
+        Ok((teb, stack_top, memory::map_user_region(0x1000)?))
+    })
+    .and_then(|built| built);
+    let created = built.and_then(|(teb, stack_top, context)| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).map(|thread| (teb, thread, stack_top, context)));
+    let (teb, thread_pointer, stack_top, context) = match created {
         Ok(created) => created,
         Err(error) => {
             let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
@@ -273,7 +284,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     let peb = state::with(|state| state.current_peb_va);
     // SAFETY: a PEB do processo em montagem, criada pelo kernel.
     unsafe { Peb::at(peb) }.ldr.set(0);
-    let context = memory::map_user_region(0x1000)?;
     let (start, initialize) = state::with(|state| {
         let exports = state.ntdll_exports.as_ref();
         (exports.and_then(|exports| exports.get("RtlUserThreadStart").copied()).unwrap_or(0), exports.and_then(|exports| exports.get("LdrInitializeThunk").copied()).unwrap_or(0))
@@ -312,22 +322,25 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
             return Err(error);
         }
     };
+    // O post-mortem lê a pilha, as imagens e o Ldr antes de o término
+    // devolver o VAD.
+    if exit_code != 0x42 && exit_code != 0 {
+        post_mortem(process_pointer);
+    }
     let _ = process::terminate_process(process_pointer, exit_code);
     process::set_current_thread(previous);
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
     let (heap_total, heap_used) = kmalloc::info();
     crate::debug_print!("[mm] process exit: PFN used={}/{}, kernel heap={}/{}", pfn::total_count() - pfn::free_count(), pfn::total_count(), heap_used, heap_total);
-    if exit_code != 0x42 && exit_code != 0 {
-        post_mortem();
-    }
     files::release_user_resources();
     Ok(exit_code)
 }
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha
 /// publicada pela HAL e o Ldr real do processo.
-fn post_mortem() {
-    let (termination, images): (u64, Vec<(u64, u64, String)>) = state::with(|state| (state.termination_rsp, state.process_images.iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect()));
+fn post_mortem(process_pointer: u64) {
+    let termination = state::with(|state| state.termination_rsp);
+    let images: Vec<(u64, u64, String)> = Space::of(process_pointer).images().iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect();
     if termination != 0 {
         let mut matches = 0;
         let mut offset = 0u64;

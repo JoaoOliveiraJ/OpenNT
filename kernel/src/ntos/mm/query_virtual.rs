@@ -12,6 +12,7 @@ use crate::ntos::mm::section::views as section_views;
 use crate::ntos::ke::irql;
 use crate::ntos::ob::{object_manager, open_pointer};
 use crate::ntos::ps::process;
+use crate::ntos::ps::user::memory::Space;
 use crate::ntos::ps::user::memory_query::{self, Context, Info};
 use crate::ntos::ps::user::state::{self, Region};
 use crate::rtl::KernelError;
@@ -69,25 +70,21 @@ fn push_unique(list: &mut Vec<Region>, region: Region) {
     }
 }
 
-/// O runtime hospeda um processo de usuário nativo; outros processos não
-/// têm VADs de usuário e nunca emprestam as regiões do processo ativo.
+/// As regiões do processo: o VAD dele e as vistas com posse registrada; as
+/// regiões compartilhadas de sistema (NLS) aparecem nos processos de usuário,
+/// os que têm PEB. Nenhum processo vê o VAD de outro.
 fn regions(process: u64) -> Context {
-    let pid = eprocess(process).unique_process_id.get();
     let owned = section_views::regions(process);
     let owned_user: Vec<Region> = owned.user_regions.iter().map(|view| view.region()).collect();
     let owned_images: Vec<Region> = owned.process_images.iter().map(|view| view.region()).collect();
-    if pid != state::with(|state| state.current_process_id) {
-        let mut user_regions = owned_user;
-        user_regions.extend(crate::ntos::ps::user::memory::foreign_regions(process));
-        return Context { user_regions, process_images: owned_images };
-    }
-    let (user, shared, images) = state::with(|state| (state.user_regions.clone(), state.shared_user_regions.clone(), state.process_images.clone()));
+    let space = Space::of(process);
+    let shared = if eprocess(process).peb.get() != 0 { state::with(|state| state.shared_user_regions.clone()) } else { Vec::new() };
     let mut user_regions = Vec::new();
-    for region in user.into_iter().chain(shared).chain(owned_user) {
+    for region in space.regions().into_iter().chain(shared).chain(owned_user) {
         push_unique(&mut user_regions, region);
     }
     let mut process_images = Vec::new();
-    for region in images.into_iter().chain(owned_images) {
+    for region in space.images().into_iter().chain(owned_images) {
         push_unique(&mut process_images, region);
     }
     Context { user_regions, process_images }
