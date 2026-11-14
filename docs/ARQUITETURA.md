@@ -1386,6 +1386,41 @@ discos. Sem a opção nada disso roda.
   (serviço 0x12e3), o primeiro do win32k, que ainda não está carregado.
   Com `OPENNT_TRACE_SYSCALLS`, as linhas `[sys]` dos serviços que abrem ou
   criam objetos por nome mostram o nome do OBJECT_ATTRIBUTES.
+- **Os últimos exports da família win32k e dos drivers de console, PCI,
+  ACPI e rede**, cada um no componente dono:
+  - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
+    NtSetTimer e NtCancelTimer com o modo anterior como parâmetro (os Zw*
+    em KernelMode), o corpo de 0x148 bytes do ObCreateObjectEx com
+    ExTimerObjectType, a TimerApcRoutine pela KAPC embutida (KernelRoutine
+    ExpTimerApcRoutine, entregue na thread que armou, com a hora do sistema),
+    o período refeito pelo DPC interno, a DeleteProcedure ExpDeleteTimer e o
+    ExTimerRundown na saída da thread (a ActiveTimerListHead do ETHREAD);
+    ExpTimerApcRoutine, ExpDeleteTimer e PspIoMiniPacketCallbackRoutine são
+    rotinas privadas (`init/exports.rs::private_routines`);
+  - os objetos de reserva em `ps/memory_reserve.rs` (UserApcReserve e
+    IoCompletionReserve, NtAllocateReserveObject), com o pacote embutido que
+    o ZwSetIoCompletionEx publica (`io/completion/set.rs`) e a retirada
+    devolve;
+  - NtQuerySystemInformationEx de modo kernel em `ex/system_information.rs`
+    (classes 107, 121 e 180, com o KeNodeDistance e o steering de
+    interrupções de `ke/`), PsChargeProcessPoolQuota/PsReturnPoolQuota em
+    `ps/pool_quota.rs`, ZwSetInformationProcess (ProcessBreakOnTermination e
+    ProcessDebugFlags, as mesmas rotinas do NtSetInformationProcess de
+    usuário) e a consulta de ProcessDebugFlags em `ps/`, e
+    ZwQueryWnfStateNameInformation em `ex/wnf/query.rs`;
+  - o lado servidor de modo kernel do ALPC (`alpc/server.rs`:
+    ZwAlpcCreatePort, ZwAlpcAcceptConnectPort e a recepção do
+    ZwAlpcSendWaitReceivePort pela continuação de kernel) e o LPC de modo
+    kernel sobre ele (`alpc/lpc.rs`: LpcRequestPort, LpcSendWaitReceivePort
+    e ZwSecureConnectPort, sem as vistas de seção do LPC);
+  - a abertura de kernel de um nome dentro de um dispositivo sem volume e a
+    abertura relativa a um handle de arquivo de dispositivo
+    (`io/file/zw.rs`, `io/io_manager.rs::open_related_device_file`), com a
+    thread que abre no IRP_MJ_CREATE e a espera de um CREATE pendente, como
+    o IopParseDevice. O `--start-driver=condrv` carrega o condrv.sys real e
+    `ntos/test/console_driver.rs` abre o servidor, a referência e a conexão
+    de um console e troca as mensagens CONNECT e DISCONNECT pelos IOCTLs do
+    condrv (`CONDRV_OK`).
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
