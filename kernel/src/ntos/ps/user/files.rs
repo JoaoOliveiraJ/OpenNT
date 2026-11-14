@@ -3,8 +3,12 @@
 //! NtOpenFile/NtCreateFile abrem um arquivo do volume (pelo `file_io`) ou um
 //! dispositivo do NT (`\Device\X`, `\DosDevices\X`, `\GLOBAL??\X`, `\\.\X`,
 //! `\??\X`): o dispositivo vai ao I/O manager de verdade e o IRP_MJ_CREATE
-//! chega ao driver. Também NtDeviceIoControlFile (driver gerenciado ou pilha
-//! nativa), NtClose e as syscalls de seção sobre os serviços do Mm.
+//! chega ao driver. NtCreateNamedPipeFile e NtCreateMailslotFile abrem pelo
+//! mesmo caminho, com IRP_MJ_CREATE_NAMED_PIPE/CREATE_MAILSLOT e os
+//! parâmetros capturados por `io/file/pipe_mailslot.rs`; NtFsControlFile é o
+//! do I/O Manager (`io/file/irp_service.rs`). Também NtDeviceIoControlFile
+//! (driver gerenciado ou pilha nativa), NtClose e as syscalls de seção sobre
+//! os serviços do Mm.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -14,6 +18,7 @@ use core::any::Any;
 use super::file_io::{self, OpenRequest};
 use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state::{self, NativeBody, UserObject, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER};
+use crate::ntos::io::file::{irp_service, pipe_mailslot};
 use crate::ntos::io::io_manager::{self, IoParams, IoResult, RequestContext};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::section::{create as create_section, map_view, open as open_section, unmap_view};
@@ -125,6 +130,12 @@ fn fail_iosb(iosb: u64, status: u32) -> u32 {
 /// NtOpenFile/NtCreateFile: dispositivo pelo I/O manager ou arquivo do
 /// volume pelo `file_io`.
 pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
+    open_file(handle_pointer, attributes, iosb, disposition, request, None)
+}
+
+/// A abertura do IoCreateFile, com o tipo de criação do file system
+/// (`special`: os parâmetros de pipe nomeado ou de mailslot capturados).
+fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, request: &OpenRequest, special: Option<&pipe_mailslot::Captured>) -> Result<u32, KernelError> {
     if !state::probe_user_write(handle_pointer, 8) || !state::probe_user_write(iosb, 16) || !state::probe_user_read(attributes, 48) {
         return Ok(0xC000_0005);
     }
@@ -140,7 +151,17 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
     // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
     if let Some((device_path, rest)) = device_path.as_deref().and_then(io_manager::split_device_path) {
         debug_print!("[usermode] abre device: {}{}", device_path, rest);
-        let create = io_manager::CreateParameters { access: request.access, share: request.share, disposition, options: request.options, file_attributes: request.attributes, case_sensitive: object_flags & 0x40 == 0 };
+        let create = io_manager::CreateParameters {
+            access: request.access,
+            share: request.share,
+            disposition,
+            options: request.options,
+            file_attributes: request.attributes,
+            case_sensitive: object_flags & 0x40 == 0,
+            file_type: special.map_or(0, |captured| captured.file_type()),
+            extra_parameters: special.map_or(0, |captured| captured.pointer()),
+            user_mode: true,
+        };
         let opened = match io_manager::open_device_file(&device_path, &rest, Some(create), true) {
             Ok(opened) => opened,
             Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
@@ -177,6 +198,11 @@ pub fn open_nt_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition
         debug_print!("[usermode] device NAO EXISTE: {}", device_path);
         return Ok(fail_iosb(iosb, 0xC000_0034));
     }
+    if special.is_some() {
+        // Pipe ou mailslot fora de um file system de dispositivo: o
+        // IRP_MJ_CREATE_NAMED_PIPE/CREATE_MAILSLOT não tem quem o atenda.
+        return Ok(fail_iosb(iosb, 0xC000_0010));
+    }
     file_io::open(handle_pointer, &parsed.path, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..*request })
 }
 
@@ -196,6 +222,60 @@ fn nt_create_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, 
         disposition,
         &OpenRequest { access: access as u32, allocation_pointer: state::stack_arg(rsp, 5), attributes: state::stack_arg32(rsp, 6), share: state::stack_arg32(rsp, 7), options: state::stack_arg32(rsp, 9), ea_length: state::stack_arg32(rsp, 11), handle_attributes: 0 },
     )
+}
+
+/// NtCreateNamedPipeFile(handle*, access, oa, ioStatus*, share, disposition,
+/// options, pipeType, readMode, completionMode, maxInstances, inboundQuota,
+/// outboundQuota, defaultTimeout*).
+fn nt_create_named_pipe_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, rsp: u64) -> Result<u32, KernelError> {
+    let create = pipe_mailslot::CreateArguments { desired_access: access as u32, share_access: state::stack_arg32(rsp, 5), disposition: state::stack_arg32(rsp, 6), create_options: state::stack_arg32(rsp, 7) };
+    let pipe = pipe_mailslot::NamedPipeArguments {
+        named_pipe_type: state::stack_arg32(rsp, 8),
+        read_mode: state::stack_arg32(rsp, 9),
+        completion_mode: state::stack_arg32(rsp, 10),
+        maximum_instances: state::stack_arg32(rsp, 11),
+        inbound_quota: state::stack_arg32(rsp, 12),
+        outbound_quota: state::stack_arg32(rsp, 13),
+        default_timeout: state::stack_arg(rsp, 14),
+    };
+    let captured = match pipe_mailslot::capture_named_pipe(&create, &pipe) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
+    };
+    open_file(handle_pointer, attributes, iosb, create.disposition, &OpenRequest { access: create.desired_access, share: create.share_access, options: create.create_options, ..OpenRequest::default() }, Some(&captured))
+}
+
+/// NtCreateMailslotFile(handle*, access, oa, ioStatus*, options, quota,
+/// maxMessageSize, readTimeout*).
+fn nt_create_mailslot_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, rsp: u64) -> Result<u32, KernelError> {
+    let mailslot = pipe_mailslot::MailslotArguments { create_options: state::stack_arg32(rsp, 5), mailslot_quota: state::stack_arg32(rsp, 6), maximum_message_size: state::stack_arg32(rsp, 7), read_timeout: state::stack_arg(rsp, 8) };
+    let create = pipe_mailslot::mailslot_create_arguments(access as u32, &mailslot);
+    let captured = match pipe_mailslot::capture_mailslot(&create, &mailslot) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
+    };
+    open_file(handle_pointer, attributes, iosb, create.disposition, &OpenRequest { access: create.desired_access, share: create.share_access, options: create.create_options, ..OpenRequest::default() }, Some(&captured))
+}
+
+/// NtFsControlFile(handle, event, apcRoutine, apcContext, ioStatus*, code,
+/// input*, inputLength, output*, outputLength): o IRP_MJ_FILE_SYSTEM_CONTROL
+/// do I/O Manager (`io/file/irp_service.rs`) ao driver do arquivo.
+fn nt_fs_control_file(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    if state::get_user_handle(handle).is_some_and(|entry| entry.kind() != "device") {
+        return Ok(0xC000_0010);
+    }
+    Ok(irp_service::fs_control(&irp_service::Control {
+        handle,
+        event,
+        apc_routine,
+        apc_context,
+        io_status: state::stack_arg(rsp, 5),
+        code: state::stack_arg32(rsp, 6),
+        input: state::stack_arg(rsp, 7),
+        input_length: state::stack_arg32(rsp, 8),
+        output: state::stack_arg(rsp, 9),
+        output_length: state::stack_arg32(rsp, 10),
+    }))
 }
 
 /// NtDeviceIoControlFile: IRP gerenciado (resultado copiado para a saída)
@@ -382,6 +462,9 @@ pub fn init() {
     state::register_handler("NtOpenFile", nt_open_file);
     state::register_handler("NtCreateFile", nt_create_file);
     state::register_handler("NtDeviceIoControlFile", nt_device_io_control_file);
+    state::register_handler("NtCreateNamedPipeFile", nt_create_named_pipe_file);
+    state::register_handler("NtCreateMailslotFile", nt_create_mailslot_file);
+    state::register_handler("NtFsControlFile", nt_fs_control_file);
     state::register_handler("NtClose", nt_close);
     state::register_handler("NtCreateSection", nt_create_section);
     state::register_handler("NtOpenSection", nt_open_section);

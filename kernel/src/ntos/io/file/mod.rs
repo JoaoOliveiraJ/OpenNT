@@ -1,6 +1,7 @@
 //! Operações de arquivo do I/O Manager: leitura, escrita, consulta, exclusão,
-//! informação, ciclo de vida, requisições, os serviços Zw de arquivo e a
-//! consulta de atributos estendidos (NtQueryEaFile).
+//! informação, ciclo de vida, requisições, os serviços Zw de arquivo, a
+//! consulta de atributos estendidos (NtQueryEaFile), os serviços de modo
+//! usuário sobre IRP e a criação de pipes e mailslots.
 
 pub mod read;
 pub mod write;
@@ -13,3 +14,5 @@ pub mod convert_handle;
 pub mod native_security;
 pub mod zw;
 pub mod ea;
+pub mod irp_service;
+pub mod pipe_mailslot;

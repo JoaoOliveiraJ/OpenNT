@@ -17,6 +17,7 @@ use super::registry::parse_user_object_attributes;
 use super::state::{self, UserHandle};
 use crate::drivers::fs::ntfs::Stat;
 use crate::drivers::fs::volume_files::{self, VolumeFile};
+use crate::ntos::io::file::irp_service;
 use crate::ntos::io::file::lifetime as file_lifetime;
 use crate::ntos::ke::dispatcher;
 use crate::rtl::KernelError;
@@ -342,8 +343,12 @@ fn nt_query_full_attributes_file(attributes: u64, out: u64, _a3: u64, _a4: u64, 
     query_attributes(attributes, out, 56)
 }
 
-/// NtQueryInformationFile das classes de arquivo do volume.
+/// NtQueryInformationFile das classes de arquivo do volume; num arquivo de
+/// driver, o IRP_MJ_QUERY_INFORMATION do I/O Manager.
 pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    if driver_file(handle) {
+        return Ok(irp_service::query_information(handle, iosb, out, length as u32, state::stack_arg32(rsp, 5)));
+    }
     run(iosb, || {
         let (entry, user_file) = object(handle)?;
         let file = &user_file.file;
@@ -514,11 +519,33 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
     })
 }
 
-fn nt_read_file(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
+/// Handle de um arquivo de driver: o I/O Manager monta o IRP
+/// (`io/file/irp_service.rs`).
+fn driver_file(handle: u64) -> bool {
+    state::get_user_handle(handle).is_some_and(|entry| entry.kind() == "device")
+}
+
+/// NtReadFile/NtWriteFile de um arquivo de driver de neither I/O (os
+/// arquivos de file system de pipes e mailslots) pelo IRP do I/O Manager.
+fn driver_transfer(handle: u64, event: u64, apc: u64, context: u64, rsp: u64, write: bool) -> Option<u32> {
+    if !driver_file(handle) || !irp_service::handles_transfer(handle) {
+        return None;
+    }
+    let arguments = irp_service::Transfer { handle, event, apc_routine: apc, apc_context: context, io_status: state::stack_arg(rsp, 5), buffer: state::stack_arg(rsp, 6), length: state::stack_arg32(rsp, 7), byte_offset: state::stack_arg(rsp, 8), key: state::stack_arg(rsp, 9) };
+    Some(irp_service::transfer(&arguments, write))
+}
+
+fn nt_read_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    if let Some(status) = driver_transfer(handle, event, apc, context, rsp, false) {
+        return Ok(status);
+    }
     file_transfer(handle, event, apc, rsp, false)
 }
 
-fn nt_write_file(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
+fn nt_write_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    if let Some(status) = driver_transfer(handle, event, apc, context, rsp, true) {
+        return Ok(status);
+    }
     file_transfer(handle, event, apc, rsp, true)
 }
 
@@ -542,6 +569,9 @@ fn volume_or_fail() -> Result<Arc<crate::drivers::fs::ntfs::Ntfs>, KernelError> 
 /// renomeação de descendentes), disposição de exclusão, posição, alocação e
 /// fim de arquivo.
 fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    if driver_file(handle) {
+        return Ok(irp_service::set_information(handle, iosb, buffer, length as u32, state::stack_arg32(rsp, 5)));
+    }
     run(iosb, || {
         let (entry, user_file) = object(handle)?;
         let file = user_file.file.clone();

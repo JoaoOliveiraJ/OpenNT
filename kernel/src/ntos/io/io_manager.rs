@@ -29,6 +29,7 @@ use crate::ntos::io::irp_builder::{self as builder, BuildOptions, DeviceControl,
 /// Major functions (subconjunto do NT).
 pub mod irp_mj {
     pub const CREATE: u8 = 0x00;
+    pub const CREATE_NAMED_PIPE: u8 = 0x01;
     pub const CLOSE: u8 = 0x02;
     pub const READ: u8 = 0x03;
     pub const WRITE: u8 = 0x04;
@@ -37,6 +38,7 @@ pub mod irp_mj {
     pub const INTERNAL_DEVICE_CONTROL: u8 = 0x0F;
     pub const SHUTDOWN: u8 = 0x10;
     pub const CLEANUP: u8 = 0x12;
+    pub const CREATE_MAILSLOT: u8 = 0x13;
     pub const POWER: u8 = 0x16;
     pub const PNP: u8 = 0x1B;
 }
@@ -77,6 +79,7 @@ pub mod status {
 const IRP_BUFFERED_IO: u32 = 0x10;
 const IRP_DEALLOCATE_BUFFER: u32 = 0x20;
 /// IO_STACK_LOCATION.Control.
+const SL_PENDING_RETURNED: u8 = 0x01;
 const SL_INVOKE_ON_SUCCESS: u8 = 0x40;
 const SL_INVOKE_ON_ERROR: u8 = 0x80;
 const STATUS_MORE_PROCESSING_REQUIRED: i32 = 0xC000_0016u32 as i32;
@@ -143,6 +146,9 @@ pub fn init() -> Result<(), KernelError> {
     power_manager::register_power_irp_dispatcher(dispatch_native_power_irp);
     // IoTimers vencidos no laço ocioso.
     dispatcher::register_completion_pump(super::threads::io_timer::check_io_timers);
+    // Os serviços de arquivo de modo usuário sobre IRP: a saída de threads
+    // (IoCancelThreadIo) e as referências de arquivo adiadas.
+    super::file::irp_service::init();
     Ok(())
 }
 
@@ -220,6 +226,9 @@ pub fn iof_complete_request(packet: u64) -> i32 {
     while current_location <= stack_count + 1 {
         let location = location_at(reviewed);
         let control = location.control.get();
+        // Irp->PendingReturned = SL_PENDING_RETURNED do slot revisto (o
+        // IoMarkIrpPending de quem devolveu STATUS_PENDING).
+        irp.pending_returned.set(control & SL_PENDING_RETURNED);
         let routine = location.completion_routine.get();
         let status = irp.io_status.status.get();
         let invoke = routine != 0 && ((status >= 0 && control & SL_INVOKE_ON_SUCCESS != 0) || (status < 0 && control & SL_INVOKE_ON_ERROR != 0));
@@ -389,7 +398,11 @@ pub enum IoResult {
 /// Os parâmetros do IRP_MJ_CREATE de uma abertura por nome (o
 /// IopParseDevice): o acesso pedido vai num IO_SECURITY_CONTEXT com um
 /// ACCESS_STATE do sujeito corrente, as opções levam a disposição nos bits
-/// altos, e os atributos e o compartilhamento vão como vieram.
+/// altos, e os atributos e o compartilhamento vão como vieram. O tipo do
+/// IoCreateFile escolhe a major function: IRP_MJ_CREATE (arquivo comum),
+/// IRP_MJ_CREATE_NAMED_PIPE ou IRP_MJ_CREATE_MAILSLOT, estes com os
+/// parâmetros do file system na stack location. Uma abertura de modo
+/// usuário leva RequestorMode = UserMode e a thread corrente no IRP.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CreateParameters {
     pub access: u32,
@@ -398,6 +411,22 @@ pub struct CreateParameters {
     pub options: u32,
     pub file_attributes: u32,
     pub case_sensitive: bool,
+    /// CreateFileType: 0 arquivo, 1 pipe nomeado, 2 mailslot.
+    pub file_type: u8,
+    /// NAMED_PIPE_CREATE_PARAMETERS ou MAILSLOT_CREATE_PARAMETERS.
+    pub extra_parameters: u64,
+    pub user_mode: bool,
+}
+
+impl CreateParameters {
+    /// A major function do IRP de criação.
+    fn major(&self) -> u8 {
+        match self.file_type {
+            1 => irp_mj::CREATE_NAMED_PIPE,
+            2 => irp_mj::CREATE_MAILSLOT,
+            _ => irp_mj::CREATE,
+        }
+    }
 }
 
 /// Parâmetros de um pedido do I/O Manager.
@@ -699,7 +728,7 @@ fn call_native_driver(device: &DeviceEntry, request: &mut IoRequest) -> Result<(
         ..Default::default()
     });
     let security = match (major, request.params.create) {
-        (irp_mj::CREATE, Some(create)) => Some(prepare_create(packet, stack_count, &create)?),
+        (irp_mj::CREATE | irp_mj::CREATE_NAMED_PIPE | irp_mj::CREATE_MAILSLOT, Some(create)) => Some(prepare_create(packet, stack_count, &create)?),
         _ => None,
     };
     let guest_status = iof_call_driver(device_pointer, packet);
@@ -790,12 +819,24 @@ fn prepare_create(packet: u64, stack_count: u32, create: &CreateParameters) -> R
     security.desired_access.set(state.remaining_desired_access.get() | state.previously_granted_access.get());
     security.full_create_options.set(create.options);
     let location = location_at(builder::first_stack_location(packet, stack_count));
-    let parameters = &location.parameters.create;
-    parameters.security_context.set(context);
-    parameters.options.set((create.disposition << 24) | (create.options & 0x00FF_FFFF));
-    parameters.file_attributes.set(create.file_attributes as u16);
-    parameters.share_access.set(create.share as u16);
-    parameters.ea_length.set(0);
+    if create.file_type == 0 {
+        let parameters = &location.parameters.create;
+        parameters.security_context.set(context);
+        parameters.options.set((create.disposition << 24) | (create.options & 0x00FF_FFFF));
+        parameters.file_attributes.set(create.file_attributes as u16);
+        parameters.share_access.set(create.share as u16);
+        parameters.ea_length.set(0);
+    } else {
+        // Parameters.CreatePipe/CreateMailslot: o mesmo contexto, as opções
+        // e o compartilhamento, Reserved zero e os parâmetros do file system
+        // no lugar do EaLength.
+        let parameters = &location.parameters.create_pipe;
+        parameters.security_context.set(context);
+        parameters.options.set((create.disposition << 24) | (create.options & 0x00FF_FFFF));
+        parameters.reserved.set(0);
+        parameters.share_access.set(create.share as u16);
+        parameters.parameters.set(create.extra_parameters);
+    }
     location.flags.set(if create.case_sensitive { SL_CASE_SENSITIVE } else { 0 });
     // SAFETY: o IRP recém-montado por `builder::build`.
     let irp = unsafe { Irp::at(packet) };
@@ -958,13 +999,17 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
         let _ = file_objects::dereference(file_object);
         return Err(KernelError::with_status("IRP_MJ_CREATE sem memoria para o evento", 0xC000_009A));
     }
-    let mut parameters = IoParams { create, ..IoParams::default() };
+    let major = create.as_ref().map_or(irp_mj::CREATE, CreateParameters::major);
+    let user_mode = create.as_ref().is_some_and(|create| create.user_mode);
+    let mut parameters = IoParams { create, requestor_mode: user_mode as u8, ..IoParams::default() };
+    if user_mode || parse {
+        parameters.thread = process::get_current_thread();
+    }
     if parse {
         dispatcher::initialize_event(event, 0, false);
-        parameters.thread = process::get_current_thread();
         parameters.user_event = event;
     }
-    let mut request = make_io_request(irp_mj::CREATE, parameters);
+    let mut request = make_io_request(major, parameters);
     request.file_object = file_object;
     let called = call_driver(path, &mut request);
     if parse && called.is_ok() && request.status == status::PENDING && request.pending_irp != 0 {

@@ -263,7 +263,7 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
     let open_flags = if attributes_pointer != 0 { object_attributes_at(attributes_pointer).attributes.get() } else { 0 };
     let owner_process = if open_flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
     let access = file_objects::access(desired_access);
-    let create = io_manager::CreateParameters { access: desired_access, share: share_access, disposition, options, file_attributes: 0, case_sensitive: open_flags & 0x40 == 0 };
+    let create = io_manager::CreateParameters { access: desired_access, share: share_access, disposition, options, file_attributes: 0, case_sensitive: open_flags & 0x40 == 0, ..Default::default() };
     // Abertura relativa a um handle de arquivo de dispositivo (o IopParseFile):
     // o FILE_OBJECT novo aponta o da raiz e o nome vai como veio.
     if let Some((device_path, related)) = device_root(attributes_pointer) {
