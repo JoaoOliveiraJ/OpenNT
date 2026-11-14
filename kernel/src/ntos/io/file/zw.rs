@@ -56,6 +56,8 @@ const FILE_EXISTS: u64 = 4;
 pub enum Backing {
     Volume { volume: &'static dyn FileSystem, path: String },
     Device { path: String, handle: u64 },
+    /// Arquivo de um volume montado por um file system real (`io/parse.rs`).
+    Mounted { path: String },
 }
 
 /// Registro de um handle de arquivo do kernel.
@@ -155,7 +157,7 @@ fn release_entry(entry: &FileEntry) {
         Backing::Device { handle, .. } => {
             let _ = io_manager::close_device(*handle);
         }
-        Backing::Volume { .. } => {
+        Backing::Volume { .. } | Backing::Mounted { .. } => {
             let _ = file_objects::close_handle(entry.file_object);
         }
     }
@@ -279,6 +281,20 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         return publish_file_handle(entry, output, io_status, FILE_OPENED);
     }
     let Some((volume, path)) = resolve_mounted_file(&object_name) else {
+        // Arquivo de um volume com VPB: o IopParseDevice monta e abre pelo
+        // file system dono (`io/parse.rs`).
+        if let Some((device, remaining)) = crate::ntos::io::parse::split_volume_path(&object_name) {
+            let request = crate::ntos::io::parse::OpenRequest { desired_access, file_attributes: 0, share_access, disposition, create_options: options, case_insensitive: open_flags & 0x40 != 0 };
+            let opened = crate::ntos::io::parse::open_file(device, &remaining, &request)?;
+            if opened.status & 0x8000_0000 != 0 {
+                write_io_status(io_status, opened.status, 0);
+                return Ok(opened.status);
+            }
+            file_objects::open_handle(opened.file_object)?;
+            file_objects::dereference(opened.file_object)?;
+            let entry = FileEntry { backing: Backing::Mounted { path: object_name }, file_object: opened.file_object, access, share: share_access, options, owner_process, attributes: open_flags & 2, kernel_handle: open_flags & 0x200 != 0, binding: None, closed: false, scan_index: None };
+            return publish_file_handle(entry, output, io_status, opened.information);
+        }
         write_io_status(io_status, STATUS_OBJECT_NAME_NOT_FOUND, 0);
         return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
     };
@@ -855,7 +871,7 @@ pub fn set_volume_information_file(handle: u64, io_status: u64, buffer: u64, len
     }
     let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };
     match &entry.backing {
-        Backing::Device { .. } => {
+        Backing::Device { .. } | Backing::Mounted { .. } => {
             let (status, information) = crate::ntos::io::file::information::set_volume_native(entry.file_object, class, length, buffer)?;
             if status != 0x103 {
                 write_io_status(io_status, status, information);

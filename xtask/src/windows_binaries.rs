@@ -62,6 +62,12 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0510~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // O ntfs.sys real (`--start-driver=ntfs`) e o catálogo que o cobre.
+    ("NTFS.SYS", "System32/drivers/ntfs.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),
     ("Windows/System32/win32k.sys", "System32/win32k.sys"),

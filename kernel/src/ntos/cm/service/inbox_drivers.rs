@@ -15,12 +15,20 @@
 //! subchaves com dados da máquina (Parameters, Linkage, interfaces) não são
 //! copiadas. O NetIO não tem chave: ele carrega como dependência de import
 //! do NDIS e do Tcpip.
+//!
+//! Os file systems Ntfs e fastfat entram com a chave como está na
+//! instalação: Type 2 (SERVICE_FILE_SYSTEM_DRIVER), Start 3, ErrorControl 1
+//! e Group "Boot File System", sem ImagePath (o padrão do I/O Manager,
+//! `\SystemRoot\System32\Drivers\<serviço>.sys`).
 
 use crate::ntos::cm::registry;
 use crate::ntos::cm::service::database::{self as service_database, ConfigurationInput, ServiceError};
 use crate::rtl::KernelError;
 
 const SERVICE_KERNEL_DRIVER: u32 = 1;
+const SERVICE_FILE_SYSTEM_DRIVER: u32 = 2;
+/// Os file systems da instalação (chaves sem ImagePath).
+const FILE_SYSTEMS: &[&str] = &["Ntfs", "fastfat"];
 const SERVICE_DEMAND_START: u32 = 3;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
@@ -82,6 +90,14 @@ pub fn seed() -> Result<(), KernelError> {
         for &(name, value) in driver.dwords {
             registry::set_value(handle, name, REG_DWORD, value.to_le_bytes().to_vec());
         }
+        registry::close_handle(handle);
+    }
+    for name in FILE_SYSTEMS {
+        let handle = registry::open_or_create(&alloc::format!("{}\\{}", service_database::ROOT, name), None)?;
+        for (value_name, value) in [("Type", SERVICE_FILE_SYSTEM_DRIVER), ("Start", SERVICE_DEMAND_START), ("ErrorControl", 1)] {
+            registry::set_value(handle, value_name, REG_DWORD, value.to_le_bytes().to_vec());
+        }
+        registry::set_value(handle, "Group", REG_SZ, registry::encode_wide("Boot File System"));
         registry::close_handle(handle);
     }
     Ok(())

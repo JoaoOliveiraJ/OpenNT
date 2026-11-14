@@ -39,6 +39,7 @@ const ATA_CMD_WRITE: u8 = 0x30;
 const ATA_CMD_READ_DMA: u8 = 0xC8;
 const ATA_CMD_WRITE_DMA: u8 = 0xCA;
 const ATA_CMD_FLUSH: u8 = 0xE7;
+const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const SR_BSY: u8 = 0x80;
 const SR_DRQ: u8 = 0x08;
 const SR_ERR: u8 = 0x01;
@@ -381,6 +382,23 @@ pub fn write_sectors_pio(lba: u64, bytes: &[u8], drive: u8) -> Result<(), Kernel
         done += chunk;
     }
     Ok(())
+}
+
+/// IDENTIFY DEVICE (0xEC) por PIO: as palavras 60-61 dão o total de setores
+/// endereçáveis em LBA28 (a capacidade que o disco informa).
+pub fn capacity_sectors(drive: u8) -> Result<u64, KernelError> {
+    validate_range(0, 0, drive)?;
+    let _channel = CHANNEL.lock();
+    select_drive(0, drive)?;
+    port::write8(ATA_CMD, ATA_CMD_IDENTIFY);
+    settle();
+    wait_data()?;
+    let mut words = [0u16; 256];
+    for word in words.iter_mut() {
+        *word = port::read16(ATA_DATA);
+    }
+    port::read8(ATA_STATUS);
+    Ok(words[60] as u64 | (words[61] as u64) << 16)
 }
 
 /// FLUSH CACHE.

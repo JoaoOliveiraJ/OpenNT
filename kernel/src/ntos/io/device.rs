@@ -41,6 +41,20 @@ fn driver_at(driver: u64) -> &'static DriverObject {
 static PHYSICAL_BY_ATTACHED: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
 static UNNAMED_DEVICES: SpinLock<u32> = SpinLock::new(0);
 
+/// FILE_DEVICE_CD_ROM (2), FILE_DEVICE_DISK (7), FILE_DEVICE_TAPE (0x1F) e
+/// FILE_DEVICE_VIRTUAL_DISK (0x24): a máscara 0x1080000084 do IoCreateDevice.
+const MOUNTABLE_DEVICE_TYPES: u64 = 0x10_8000_0084;
+
+/// SectorSize inicial do IoCreateDevice: 0x800 para o file system de CD-ROM,
+/// 0x200 para disco, file system de disco e disco virtual, 0 nos demais.
+fn default_sector_size(device_type: u32) -> u16 {
+    match device_type {
+        0x03 => 0x800,
+        0x07 | 0x08 | 0x24 => 0x200,
+        _ => 0,
+    }
+}
+
 /// Nome relativo a `\Device` (subdiretórios incluídos, como `Ide\IdePort0`).
 pub fn device_name(node: object_manager::NodeId) -> String {
     let path = object_manager::path_of(node).unwrap_or_default();
@@ -108,6 +122,18 @@ pub fn create_device(driver: u64, extension_size: u32, name_pointer: u64, device
     object_extension.size.set(DevobjExtension::SIZE as u16);
     object_extension.device_object.set(page);
     device.device_object_extension.set(extension_address);
+    device.sector_size.set(default_sector_size(device_type));
+    // Dispositivos montáveis (disco, CD-ROM, fita, disco virtual) nascem com
+    // VPB e com o DeviceLock (evento de sincronização sinalizado) que o
+    // IopMountVolume e o IoVerifyVolume esperam, como no IoCreateDevice.
+    if device_type <= 0x24 && (MOUNTABLE_DEVICE_TYPES >> device_type) & 1 != 0 {
+        let status = super::file_system::create_vpb(device)?;
+        if status != 0 {
+            guest::free_bytes(page);
+            return Ok(status);
+        }
+        crate::ntos::ke::dispatcher::initialize_event(device.device_lock.address(), 1, true);
+    }
     super::controller::start_io::queue_initialize(page);
     device_objects::register(page, Some(destroy_device), Some(unlink_device))?;
     device_objects::with_lock(|| {
@@ -174,6 +200,7 @@ fn destroy_device(device: u64) {
         io_manager::unregister_device(node);
     }
     PHYSICAL_BY_ATTACHED.lock().remove(&device);
+    super::file_system::free_unreferenced_vpb(device_at(device));
     guest::free_bytes(device);
     power_manager::forget_device(device);
     io_timer::forget_device(device);

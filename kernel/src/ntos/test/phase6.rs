@@ -8557,10 +8557,12 @@ fn io_file_system_exports(assert: Assert) {
     call_export("ObfDereferenceObject", &[stream]);
     assert(device(volume).reference_count.get() == references && at::<nt::Vpb>(vpb).reference_count.get() == 0, "io-file-system: CLOSE do stream solta dispositivo e VPB");
 
-    // VerifyVolume sem VPB montado: o remount precisa do IopMountVolume ausente.
+    // VerifyVolume sem VPB montado: VPB novo e IopMountVolume pela fila de
+    // disco: os file systems sintéticos não têm rotina de FSCTL, e o
+    // IofCallDriver devolve o status de "sem rotina" que a montagem repassa.
     device(volume).flags.set(2);
     let verified = call_export("IoVerifyVolume", &[volume, 0]).map(|status| status as u32);
-    assert(verified == Some(0xC000_014F) && device(volume).flags.get() & 2 == 0 && device(volume).vpb.get() != vpb, "io-file-system: IoVerifyVolume sem mount path");
+    assert(verified == Some(crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32) && device(volume).flags.get() & 2 == 0 && device(volume).vpb.get() != vpb, "io-file-system: IoVerifyVolume remonta pelo IopMountVolume");
     call_export("ExFreePool", &[device(volume).vpb.get()]);
 
     // Stack limits: um local da pilha só é provado com KTHREAD.StackBase/StackLimit publicados.
@@ -12399,6 +12401,7 @@ pub fn run(assert: Assert) {
     io_file_object_extensions_exports(assert);
     io_priority_exports(assert);
     io_file_system_exports(assert);
+    super::file_system_mount::run(assert);
     io_irp_support_exports(assert);
     io_file_system_support_exports(assert);
     io_paging_exports(assert);

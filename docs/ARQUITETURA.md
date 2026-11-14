@@ -992,6 +992,39 @@ dereference e o PFN livre volta ao de antes.
   drenadas também (`drain_kernel_apcs`); os pumps de ALPC, de pacotes de
   espera e de timers só mexem em memória do kernel. O modo estrito de posse
   (seção 3.3) confere tudo isso. Teste: `ntos/test/multiprocess/ownership.rs`.
+- **Montagem de volumes por um file system real** (`io/file_system.rs`,
+  `io/parse.rs`, `drivers/storage/ata_volume.rs`), como no NT:
+  - IoCreateDevice dá a todo dispositivo montável (disco, CD-ROM, fita,
+    disco virtual) um VPB (IopCreateVpb) e o DeviceLock sinalizado, e o
+    SectorSize inicial do tipo.
+  - A abertura de `\Device\<volume>\<resto>` (ZwCreateFile, `io/parse.rs`, o
+    ramo de arquivo do IopParseDevice) acha o DEVICE_OBJECT com VPB no
+    prefixo e chama `check_vpb_mounted` (IopCheckVpbMounted): sem volume
+    montado, `mount_volume` (IopMountVolume) percorre a fila de file systems
+    do tipo do dispositivo e manda IRP_MJ_FILE_SYSTEM_CONTROL/
+    IRP_MN_MOUNT_VOLUME (IRP_MOUNT_COMPLETION | IRP_SYNCHRONOUS_PAGING_IO,
+    com o VPB e o topo da pilha do dispositivo real) ao topo da pilha de cada
+    CDO, soltando o banco durante a chamada; o primeiro que aceita fica com
+    o volume e `mount_initialize_vpb` marca o VPB, acerta o StackSize do
+    dispositivo de volume e liga a DEVOBJ_EXTENSION. O FILE_OBJECT nasce com
+    DeviceObject = dispositivo real, Vpb e o nome restante, e o
+    IRP_MJ_CREATE vai ao dispositivo de volume com o IO_SECURITY_CONTEXT (o
+    ACCESS_STATE do SeCreateAccessState) e as opções do NT. A abertura retém
+    o VPB e o dispositivo até o IRP_MJ_CLOSE; leituras e escritas seguem o
+    caminho comum (IoGetRelatedDeviceObject pelo VPB). O IoVerifyVolume
+    remonta pelo mesmo caminho. Sem RAW nem reconhecedores; a abertura
+    direta de um dispositivo (sem nome restante) não monta.
+  - O volume que os file systems reais montam é o segundo disco IDE,
+    exposto pelo driver ATA do kernel como `\Device\AtaVolume1` (DEVICE_OBJECT
+    nativo respondido pelo próprio kernel, com VPB, DO_DIRECT_IO, geometria
+    do IDENTIFY DEVICE e os IOCTLs de disco, armazenamento e mount manager
+    da montagem). O leitor NTFS do kernel continua dono do disco como D:,
+    então as escritas do file system ficam numa sobreposição em memória por
+    página de 4 KB, que as leituras do volume aplicam; o disco não muda.
+  - O `--start-driver` de um driver de file system (Type 2) cria o volume e
+    abre e lê um arquivo conhecido pelos exports
+    (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois
+    file systems sintéticos.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do

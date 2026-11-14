@@ -43,6 +43,7 @@ pub mod driver_registry;
 pub mod extensions;
 pub mod priority;
 pub mod file_system;
+pub mod parse;
 pub mod irp_support;
 pub mod buffer_validation;
 pub mod redirection_trust;

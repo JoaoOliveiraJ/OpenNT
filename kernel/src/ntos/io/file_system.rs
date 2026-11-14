@@ -9,12 +9,16 @@
 //! DEVICE_OBJECT.Queue.ListEntry, sob um ERESOURCE de convidado (o
 //! IopDatabaseResource), recursivo para o dono como no NT.
 //!
-//! O que NÃO existe no OpenNT (e aqui não é fingido): o IopMountVolume — o
-//! caminho que, no IopParseDevice/IopCheckVpbMounted, percorre a fila do tipo
-//! do dispositivo e envia IRP_MJ_FILE_SYSTEM_CONTROL/IRP_MN_MOUNT_VOLUME a cada
-//! file system registrado. `registered_file_systems` entrega a fila a esse
-//! caminho quando ele entrar; até lá `verify_volume` devolve
-//! STATUS_UNRECOGNIZED_VOLUME no ramo que precisaria remontar.
+//! A montagem é a do NT: `mount_volume` (IopMountVolume) percorre a fila do
+//! tipo do dispositivo e envia IRP_MJ_FILE_SYSTEM_CONTROL/IRP_MN_MOUNT_VOLUME
+//! ao topo da pilha de cada file system registrado, com o VPB e o topo da
+//! pilha do dispositivo real; o primeiro que aceita fica com o volume
+//! (`mount_initialize_vpb`). `check_vpb_mounted` (IopCheckVpbMounted) é a
+//! entrada da abertura de um arquivo do volume (`io/parse.rs`) e o
+//! IoVerifyVolume remonta por ele. O OpenNT não tem o RAW nem os
+//! reconhecedores de file system (STATUS_FS_DRIVER_REQUIRED não carrega
+//! nada): sem file system que reconheça, o resultado é o do último
+//! recusado.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -45,6 +49,20 @@ pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub const STATUS_UNRECOGNIZED_VOLUME: u32 = 0xC000_014F;
 pub const STATUS_RETRY: u32 = 0xC000_022D;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+pub const STATUS_DEVICE_DOES_NOT_EXIST: u32 = 0xC000_00C0;
+pub const STATUS_FS_DRIVER_REQUIRED: u32 = 0xC000_019C;
+const STATUS_USER_APC: u32 = 0xC0;
+const STATUS_ALERTED: u32 = 0x101;
+const VPB_LOCKED: u16 = 0x02;
+const VPB_REMOVE_PENDING: u16 = 0x08;
+const VPB_RAW_MOUNT: u16 = 0x10;
+const VPB_DIRECT_WRITES_ALLOWED: u16 = 0x20;
+const FILE_DEVICE_CD_ROM: u32 = 0x02;
+const FILE_DEVICE_DISK: u32 = 0x07;
+const FILE_DEVICE_VIRTUAL_DISK: u32 = 0x24;
+const IRP_MN_MOUNT_VOLUME: u8 = 0x01;
 
 const DO_VERIFY_VOLUME: u32 = 0x02;
 const DO_DEVICE_INITIALIZING: u32 = 0x80;
@@ -547,11 +565,11 @@ pub fn verify_volume(device: &DeviceObject, allow_raw_mount: bool) -> Result<u32
                 return Ok(status);
             }
         }
-        // Volume ausente ou trocado: IopCreateVpb + IopMountVolume. O mount
-        // path não existe no OpenNT; o resultado é o de nenhum FS reconhecer.
+        // Volume ausente ou trocado: IopCreateVpb + IopMountVolume com o
+        // DeviceLock já retido.
         let mut status = create_vpb(device)?;
         if status == STATUS_SUCCESS {
-            status = STATUS_UNRECOGNIZED_VOLUME;
+            status = mount_volume(device, allow_raw_mount, true)?.0;
         }
         device.flags.atomic().fetch_and(!DO_VERIFY_VOLUME, Ordering::SeqCst);
         Ok(status)
@@ -559,6 +577,279 @@ pub fn verify_volume(device: &DeviceObject, allow_raw_mount: bool) -> Result<u32
     dispatcher::set_event(lock);
     critical_region::leave_critical()?;
     result
+}
+
+/// IopDeleteDevice: o VPB de um dispositivo que sai sem volume montado nem
+/// referências volta ao pool.
+pub fn free_unreferenced_vpb(device: &DeviceObject) {
+    let address = device.vpb.get();
+    if address == 0 {
+        return;
+    }
+    // SAFETY: DeviceObject->Vpb, criado pelo IopCreateVpb.
+    let vpb = unsafe { Vpb::at(address) };
+    if vpb.reference_count.get() == 0 && vpb.flags.get() & VPB_MOUNTED == 0 {
+        device.vpb.set(0);
+        let _ = pool_allocation::free(address, VPB_TAG as u64);
+    }
+}
+
+/// Topo da pilha anexada a um dispositivo e quantos níveis há acima dele.
+fn attached_top(device: &DeviceObject) -> (u64, u32) {
+    let (mut top, mut levels) = (device.address(), 0);
+    loop {
+        let next = device_object(top).attached_device.get();
+        if next == 0 || levels > 64 {
+            return (top, levels);
+        }
+        top = next;
+        levels += 1;
+    }
+}
+
+/// IopQueryVpbFlagsSafe: Vpb->Flags sob o LockQueueIoVpbLock (0 sem VPB).
+fn vpb_flags(device: &DeviceObject) -> Result<u16, KernelError> {
+    let address = device.vpb.get();
+    if address == 0 {
+        return Ok(0);
+    }
+    let irql = guest::alloc_bytes(8);
+    crate::ntos::ke::spin_lock::acquire_vpb_spin_lock(irql)?;
+    // SAFETY: DeviceObject->Vpb.
+    let flags = unsafe { Vpb::at(address) }.flags.get();
+    // SAFETY: a célula de IRQL que o acquire acabou de gravar.
+    crate::ntos::ke::spin_lock::release_vpb_spin_lock(unsafe { Field::<u8>::at(irql) }.get() as u64)?;
+    guest::free_bytes(irql);
+    Ok(flags)
+}
+
+/// IopMountInitializeVpb (RVA 0x2e6a90): sob o LockQueueIoVpbLock, o VPB fica
+/// VPB_MOUNTED (mais VPB_RAW_MOUNT quando a montagem foi só do RAW e
+/// VPB_DIRECT_WRITES_ALLOWED quando quem montou foi o RAW), o
+/// dispositivo de volume ganha StackSize = topo da pilha real + 1 e aponta de
+/// volta para o VPB na DEVOBJ_EXTENSION, e o VPB ganha uma referência.
+fn mount_initialize_vpb(device: &DeviceObject, attached: &DeviceObject, raw_mount: bool, mounted_by_raw: bool) -> Result<u64, KernelError> {
+    let irql = guest::alloc_bytes(8);
+    crate::ntos::ke::spin_lock::acquire_vpb_spin_lock(irql)?;
+    let address = device.vpb.get();
+    // SAFETY: DeviceObject->Vpb, preenchido pelo file system que montou.
+    let vpb = unsafe { Vpb::at(address) };
+    let mut flags = VPB_MOUNTED;
+    if raw_mount {
+        flags |= VPB_RAW_MOUNT;
+    }
+    if mounted_by_raw {
+        flags |= VPB_DIRECT_WRITES_ALLOWED;
+    }
+    vpb.flags.set(flags);
+    let volume = device_object(vpb.device_object.get());
+    volume.stack_size.set((attached.stack_size.get() as u8).wrapping_add(1) as i8);
+    let extension = volume.device_object_extension.get();
+    if extension != 0 {
+        // SAFETY: a DEVOBJ_EXTENSION do dispositivo de volume.
+        unsafe { crate::ntos::inc::types::DevobjExtension::at(extension) }.vpb.set(address);
+    }
+    vpb.reference_count.atomic().fetch_add(1, Ordering::SeqCst);
+    // SAFETY: a célula de IRQL que o acquire acabou de gravar.
+    crate::ntos::ke::spin_lock::release_vpb_spin_lock(unsafe { Field::<u8>::at(irql) }.get() as u64)?;
+    guest::free_bytes(irql);
+    Ok(address)
+}
+
+/// O CDO do RAW (\FileSystem\RAW, o file system de volumes crus que o NT
+/// registra no fim de cada fila local): o OpenNT não o tem.
+fn is_raw_file_system(_queue_link: u64) -> bool {
+    false
+}
+
+/// Status que interrompem a busca quando o file system marca Information = 1:
+/// mídia protegida/ausente/trocada, verificação pedida e timeout.
+fn stops_mount_search(status: u32) -> bool {
+    matches!(status, 0xC000_00A2 | 0xC000_00A3 | 0xC000_0012 | 0xC000_0013 | 0xC000_0014 | 0x8000_0016 | 0xC000_00B5)
+}
+
+/// IopMountVolume(DeviceObject, AllowRawMount, DeviceLockAlreadyHeld,
+/// Alertable, &Vpb) (RVA 0x65e0d0). Devolve o status e o VPB montado.
+///
+/// Com o DeviceLock e o IopDatabaseResource (compartilhado) retidos: um VPB
+/// já montado devolve sucesso (STATUS_DEVICE_DOES_NOT_EXIST com
+/// VPB_REMOVE_PENDING); senão DO_VERIFY_VOLUME é limpo e a fila do tipo do
+/// dispositivo (disco e disco virtual, CD-ROM, fita) é percorrida. Cada file
+/// system recebe, no topo da pilha anexada ao seu CDO, um IRP
+/// IRP_MOUNT_COMPLETION|IRP_SYNCHRONOUS_PAGING_IO com o VPB e o topo da pilha
+/// do dispositivo real; o banco é solto durante a chamada. Sucesso inicializa
+/// o VPB; STATUS_UNRECOGNIZED_VOLUME e as outras falhas passam ao próximo;
+/// uma falha total do dispositivo para a busca; uma mudança no banco durante
+/// a chamada recomeça a fila. O RAW (o último de cada fila local no NT) só
+/// é tentado com AllowRawMount ou quando é o único; com VPB_RAW_MOUNT só ele
+/// é tentado; como o OpenNT não tem o RAW, nenhum CDO da fila é pulado.
+pub fn mount_volume(device: &DeviceObject, allow_raw_mount: bool, lock_held: bool) -> Result<(u32, u64), KernelError> {
+    critical_region::enter_critical()?;
+    let lock = device_lock(device);
+    if !lock_held {
+        dispatcher::wait_for_single_object(lock, 0, 0, false);
+    }
+    let database = database()?;
+    let resource = database.resource.address();
+    resource::acquire_shared(resource, true)?;
+    let result = (|| -> Result<(u32, u64), KernelError> {
+        let flags = vpb_flags(device)?;
+        if flags & (VPB_MOUNTED | VPB_REMOVE_PENDING) != 0 {
+            return Ok((if flags & VPB_REMOVE_PENDING != 0 { STATUS_DEVICE_DOES_NOT_EXIST } else { STATUS_SUCCESS }, 0));
+        }
+        device.flags.atomic().fetch_and(!DO_VERIFY_VOLUME, Ordering::SeqCst);
+        let (attached_address, _) = attached_top(device);
+        let attached = device_object(attached_address);
+        let head = match device.device_type.get() {
+            FILE_DEVICE_DISK | FILE_DEVICE_VIRTUAL_DISK => &database.disk,
+            FILE_DEVICE_CD_ROM => &database.cd_rom,
+            _ => &database.tape,
+        };
+        // SAFETY: DeviceObject->Vpb (IopCreateVpb ou IoCreateDevice).
+        let raw_mount = device.vpb.get() != 0 && unsafe { Vpb::at(device.vpb.get()) }.flags.get() & VPB_RAW_MOUNT != 0;
+        let mut status = STATUS_UNSUCCESSFUL;
+        let mut cursor = head.flink.get();
+        while cursor != head.address() && (status as i32) < 0 {
+            let next = list(cursor).flink.get();
+            let raw = is_raw_file_system(cursor);
+            let only = cursor == head.flink.get() && next == head.address();
+            let attempt = if raw_mount { raw } else { !raw || allow_raw_mount || only };
+            if !attempt {
+                if raw && !allow_raw_mount && !only {
+                    break;
+                }
+                cursor = next;
+                continue;
+            }
+            let file_system = device_object(cursor - QUEUE_LINK);
+            let (top, levels) = attached_top(file_system);
+            let operations = REGISTRATION_OPS.load(Ordering::Acquire);
+            let vpb = device.vpb.get();
+            reference_device(file_system);
+            resource::release(resource)?;
+            let stack_count = (attached.stack_size.get() as u8 as u32) + levels + 1;
+            let (call_status, information) = send_mount_irp(device_object(top), stack_count, allow_raw_mount, vpb, attached_address)?;
+            resource::acquire_shared(resource, true)?;
+            dereference_device(file_system);
+            status = call_status;
+            if (status as i32) >= 0 {
+                let mounted = mount_initialize_vpb(device, attached, raw_mount, raw)?;
+                return Ok((status, mounted));
+            }
+            if stops_mount_search(status) && information == 1 {
+                break;
+            }
+            if operations != REGISTRATION_OPS.load(Ordering::Acquire) {
+                // A fila mudou durante a chamada: recomeça do início.
+                cursor = head.flink.get();
+                status = STATUS_UNRECOGNIZED_VOLUME;
+                continue;
+            }
+            if status != STATUS_UNRECOGNIZED_VOLUME && status != STATUS_FS_DRIVER_REQUIRED && invoke_handler("FsRtlIsTotalDeviceFailure", &[status as u64])? as u8 != 0 {
+                // Falha total com RAW permitido: só o RAW (o último da fila) ainda tenta.
+                let raw_entry = head.blink.get();
+                if !allow_raw_mount || raw || !is_raw_file_system(raw_entry) {
+                    break;
+                }
+                cursor = raw_entry;
+                continue;
+            }
+            cursor = next;
+        }
+        Ok((status, 0))
+    })();
+    resource::release(resource)?;
+    dispatcher::set_event(lock);
+    critical_region::leave_critical()?;
+    result
+}
+
+/// O IRP de montagem: IRP_MJ_FILE_SYSTEM_CONTROL/IRP_MN_MOUNT_VOLUME com o VPB
+/// e o dispositivo de onde ler. Devolve (status, Information).
+fn send_mount_irp(target: &DeviceObject, stack_count: u32, allow_raw_mount: bool, vpb: u64, real_top: u64) -> Result<(u32, u64), KernelError> {
+    let scratch = guest::alloc_bytes(0x30);
+    let packet = guest::alloc_bytes(irp_builder::size_for(stack_count));
+    if scratch == 0 || packet == 0 {
+        for block in [scratch, packet] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    let (event, io_status) = (scratch, scratch + 0x18);
+    dispatcher::initialize_event(event, 0, false);
+    let thread = process::get_current_thread();
+    irp_builder::build(packet, &BuildOptions { device_object: target.address(), stack_count, user_event: event, user_iosb: io_status, thread, requestor_mode: 0, ..Default::default() });
+    // SAFETY: o IRP e o slot acabaram de ser montados pelo irp_builder.
+    let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, stack_count))) };
+    irp.flags.set(IRP_MOUNT_COMPLETION | IRP_SYNCHRONOUS_PAGING_IO);
+    stack.major_function.set(IRP_MJ_FILE_SYSTEM_CONTROL);
+    stack.minor_function.set(IRP_MN_MOUNT_VOLUME);
+    stack.flags.set(allow_raw_mount as u8);
+    stack.parameters.mount_volume.vpb.set(vpb);
+    stack.parameters.mount_volume.device_object.set(real_top);
+    let queued = thread != 0 && thread_requests::insert(packet, thread).is_ok();
+    let mut status = io_manager::iof_call_driver(target.address(), packet) as u32;
+    // SAFETY: o IO_STATUS_BLOCK do scratch.
+    let iosb = unsafe { crate::ntos::inc::types::IoStatusBlock::at(io_status) };
+    let mut information = 0;
+    if status == STATUS_PENDING {
+        dispatcher::wait_for_single_object(event, 0, 0, false);
+        status = iosb.status.get() as u32;
+        information = iosb.information.get();
+    }
+    if queued && irp.thread_list_entry.flink.get() != 0 {
+        thread_requests::remove(packet, thread)?;
+    }
+    guest::free_bytes(packet);
+    guest::free_bytes(scratch);
+    Ok((status, information))
+}
+
+/// IopCheckVpbMounted(OpenPacket, DeviceObject, RemainingName, &Status)
+/// (RVA 0x2d40d0): o VPB montado do dispositivo, com uma referência a mais
+/// para a abertura; sem volume, monta (RAW só para a abertura do próprio
+/// volume, sem nome restante nem arquivo relacionado) e tenta de novo; o VPB
+/// que a própria montagem devolve já traz a referência do
+/// IopMountInitializeVpb. Um VPB travado (VPB_LOCKED) recusa com
+/// STATUS_ACCESS_DENIED; uma espera alertada vira STATUS_WRONG_VOLUME.
+pub fn check_vpb_mounted(device: &DeviceObject, remaining_empty: bool, related: bool) -> Result<Result<u64, u32>, KernelError> {
+    loop {
+        let address = device.vpb.get();
+        if address == 0 {
+            return Ok(Err(STATUS_UNRECOGNIZED_VOLUME));
+        }
+        // SAFETY: DeviceObject->Vpb.
+        let vpb = unsafe { Vpb::at(address) };
+        let flags = vpb_flags(device)?;
+        if flags & VPB_MOUNTED != 0 {
+            if flags & VPB_LOCKED != 0 {
+                return Ok(Err(STATUS_ACCESS_DENIED));
+            }
+            adjust_vpb_references(vpb, 1)?;
+            return Ok(Ok(address));
+        }
+        let (status, mounted) = mount_volume(device, remaining_empty && !related, false)?;
+        if (status as i32) < 0 {
+            return Ok(Err(status));
+        }
+        if status == STATUS_USER_APC || status == STATUS_ALERTED {
+            return Ok(Err(STATUS_WRONG_VOLUME));
+        }
+        if mounted != 0 {
+            return Ok(Ok(mounted));
+        }
+    }
+}
+
+/// IopDereferenceVpbAndFree: a referência da abertura volta ao VPB.
+pub fn dereference_vpb(vpb: u64) -> Result<(), KernelError> {
+    if vpb != 0 {
+        // SAFETY: o VPB referenciado pela abertura.
+        adjust_vpb_references(unsafe { Vpb::at(vpb) }, -1)?;
+    }
+    Ok(())
 }
 
 /// IRP_MJ_CLEANUP/IRP_MJ_CLOSE de um FILE_OBJECT (IRP_CLOSE_OPERATION|SYNCHRONOUS_API).

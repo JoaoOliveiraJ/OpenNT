@@ -190,11 +190,19 @@ pub fn read(name: &str) -> ServiceResult<Option<Configuration>> {
             Some(_) => decode_string_value(dependencies.as_ref())?,
             None => String::new(),
         };
+        let service_type = decode_integer_value(value("Type").as_ref())?;
+        let image = value("ImagePath");
+        // Driver sem ImagePath: o I/O Manager carrega
+        // \SystemRoot\System32\Drivers\<serviço>.sys (o caso do Ntfs).
+        let image_path = match image {
+            None if [1, 2].contains(&service_type) => alloc::format!("\\SystemRoot\\System32\\Drivers\\{name}.sys"),
+            _ => decode_string_value(image.as_ref())?,
+        };
         validate(Configuration {
             name: name.to_string(),
             display_name: if display.is_some() { decode_string_value(display.as_ref())? } else { name.to_string() },
-            image_path: decode_string_value(value("ImagePath").as_ref())?,
-            service_type: decode_integer_value(value("Type").as_ref())?,
+            image_path,
+            service_type,
             start: decode_integer_value(value("Start").as_ref())?,
             error_control: decode_integer_value(value("ErrorControl").as_ref())?,
             object_name: if object.is_some() { decode_string_value(object.as_ref())? } else { String::from("LocalSystem") },
