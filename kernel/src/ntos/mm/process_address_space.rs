@@ -30,7 +30,7 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
 
-use super::{memory_map as map, paging, pfn, recursive_mapping, shared_user_data};
+use super::{frame_mapping_tracker, memory_map as map, paging, pfn, recursive_mapping, shared_user_data};
 use crate::hal::physical;
 use crate::ntos::inc::types::{Kprocess, NtStruct};
 use crate::ntos::ke::context_switch;
@@ -53,8 +53,10 @@ pub fn prepare_system_space() -> Result<(), KernelError> {
 }
 
 /// Uma PML4 nova num frame do PFN: a metade de sistema copiada da raiz do
-/// System, a auto-referência própria e a metade de usuário vazia. Devolve o
-/// endereço físico (o DirectoryTableBase do espaço).
+/// System, a auto-referência própria e a metade de usuário vazia, seguida
+/// desde já pelo rastreador de frames (as tabelas de usuário dela ganham
+/// referências no banco nativo de PFNs). Devolve o endereço físico (o
+/// DirectoryTableBase do espaço).
 pub fn create_root() -> Result<u64, KernelError> {
     if !paging::kernel_half_frozen() {
         return Err(KernelError::new("address-space roots need the frozen kernel half"));
@@ -72,13 +74,20 @@ pub fn create_root() -> Result<u64, KernelError> {
         };
         physical::write64(root + index * 8, entry);
     }
+    if let Err(error) = frame_mapping_tracker::add_root(root) {
+        physical::zero(root, map::PAGE_SIZE as usize);
+        pfn::free_page(root);
+        return Err(error);
+    }
     Ok(root)
 }
 
 /// Devolve ao PFN uma raiz de [`create_root`]. As tabelas da metade de
 /// usuário pertencem ao espaço e já devem ter sido desfeitas: com alguma
-/// entrada de usuário ainda presente, recusa sem liberar nada. As da metade
-/// de sistema são compartilhadas e ficam.
+/// entrada de usuário ainda presente, ou alguma tabela da raiz ainda no
+/// rastreador de frames (vazada), recusa sem liberar nada. As da metade de
+/// sistema são compartilhadas e ficam. Uma raiz que o PFN não aceita de
+/// volta (ainda referenciada ou já livre) para o sistema.
 pub fn delete_root(root: u64) -> Result<(), KernelError> {
     if root == SYSTEM_ROOT || root == paging::current_root() || context_switch::is_root_loaded(root) {
         return Err(KernelError::new("page-table root still in use"));
@@ -89,8 +98,9 @@ pub fn delete_root(root: u64) -> Result<(), KernelError> {
     if (0..map::USER_PML4_ENTRIES).any(|index| paging::read_entry_exact(root + index * 8) != 0) {
         return Err(KernelError::new("user half of the root is still mapped"));
     }
+    frame_mapping_tracker::remove_root(root)?;
     physical::zero(root, map::PAGE_SIZE as usize);
-    pfn::free_page(root);
+    assert!(pfn::free_page(root), "raiz de tabelas de paginas {root:#x} nao voltou ao PFN (ainda referenciada ou ja livre)");
     Ok(())
 }
 

@@ -700,12 +700,29 @@ PML4:
   `context_switch` registra a raiz carregada em cada CPU (`is_root_loaded`),
   e é por esse registro que o delete recusa uma raiz em uso. Só o BSP roda o
   anel 3 (assert na entrada) e carrega a raiz de um processo de usuário; os
-  APs ficam na raiz do System. O rastreador de frames só acompanha as tabelas
-  alcançadas pela PML4 do boot (a metade de sistema inteira e a metade de
-  usuário do System): a PML4 de um processo, as tabelas de usuário dela e as
-  folhas dessas tabelas ficam fora dele, sem notificação e sem PteAddress no
-  banco nativo de PFNs. O mapeamento recursivo confere a auto-referência da
-  raiz carregada, não a da PML4 do boot.
+  APs ficam na raiz do System. O mapeamento recursivo confere a
+  auto-referência da raiz carregada, não a da PML4 do boot.
+- **Rastreador de frames por raiz** (`mm/frame_mapping_tracker.rs`): além da
+  árvore da PML4 do boot (a metade de sistema inteira e a metade de usuário
+  do System), segue a de cada raiz de processo. `create_root` a registra
+  (`add_root`: a auto-referência dela ganha a referência de tabela do frame
+  da raiz, e a metade de usuário é seguida dali em diante; a metade de
+  sistema, cópia da do boot, não é seguida de novo), e cada tabela sabe de
+  que raiz é. As PDPTs, PDs e PTs de usuário de um processo e as folhas
+  delas ganham referências no banco nativo de PFNs (ShareCount, PteAddress =
+  o alias recursivo, válido com a raiz carregada, e PteFrame), como as do
+  System. Uma tabela ou página ainda ligada não volta ao PFN, e um frame já
+  livre também não: `release_user_half_in` e `delete_root` param o sistema se
+  o PFN recusar uma tabela ou a raiz (ainda referenciada ou já livre), e
+  `delete_root` recusa, sem mudar nada, uma raiz que ainda tem tabelas no
+  rastreador (`remove_root`: uma desmontagem que esquecesse tabelas). O
+  autoteste `ntos/test/multiprocess/process_tables.rs` cria um processo pelo
+  caminho real e confere a raiz e as tabelas de usuário dele no rastreador,
+  todas referenciadas, e o MMPFN da página da PEB; depois de rodar e do
+  último dereference, nenhuma tabela dele sobra e as contagens de tabelas e
+  de frames livres voltam às de antes. Numa raiz avulsa, a PT ligada e a
+  página não podem voltar ao PFN, e o `delete_root` com a PML4E apagada por
+  fora recusa por causa das tabelas esquecidas.
 - **Assert de CR3** (`ke/context_switch.rs::check_loaded_root`, instalado em
   `guest_memory::set_root_check` no armar do anel 3, em todo boot): toda VA
   de usuário que o kernel toca, por acesso confiável (`guest::read/write`,

@@ -612,13 +612,13 @@ pub fn release_user_half_in(root: u64, discarded: &[u64]) -> Result<u64, KernelE
             state.nonempty_table_hints.remove(&frame);
         }
     }
-    let mut released = 0;
-    for &(_, frame) in &tables {
-        if pfn::free_page(frame) {
-            released += 1;
-        }
+    // Cada tabela saiu da entrada que a apontava (o rastreador tirou a
+    // referência): o PFN tem de aceitá-la de volta. Uma recusa é uma tabela
+    // ainda referenciada por outra entrada ou já livre.
+    for &(at, frame) in &tables {
+        assert!(pfn::free_page(frame), "tabela de paginas {frame:#x} (entrada {at:#x}) da raiz {root:#x} nao voltou ao PFN (ainda referenciada ou ja livre)");
     }
-    Ok(released)
+    Ok(tables.len() as u64)
 }
 
 /// Junta em `tables`, em pós-ordem, as tabelas abaixo de `table` (nível 4 =

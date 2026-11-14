@@ -274,6 +274,20 @@ pub fn allocated(physical_address: u64) {
     entry.u3.e1.bitfield_0.set(entry_byte(ACTIVE_PAGE, CACHED_MEMORY));
 }
 
+/// O que o MMPFN de um frame em uso diz da mapeação dele: ShareCount,
+/// PteAddress e o frame da tabela que contém a PTE primária (u4.PteFrame);
+/// `None` fora do banco ou com o frame livre (os campos são então os links
+/// da lista livre).
+pub fn mapping_of(physical_address: u64) -> Option<(u64, u64, u64)> {
+    let state = STATE.lock();
+    let address = state.existing_address(physical_address / 4096);
+    if address == 0 || page_location(address) != ACTIVE_PAGE {
+        return None;
+    }
+    let entry = pfn(address);
+    Some((entry.u2.entire_field.get(), entry.pte_address.get(), entry.u4.entire_field.get() & FRAME_NUMBER_MASK))
+}
+
 pub fn can_release(physical_address: u64) -> bool {
     STATE.lock().can_release(physical_address)
 }

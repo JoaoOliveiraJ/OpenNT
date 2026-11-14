@@ -9,20 +9,24 @@
 //! janela do heap (`KERNEL_HEAP_PML4_INDEX`), cujas tabelas nem são
 //! acompanhadas.
 //!
-//! **Só a árvore da PML4 do boot.** O rastreador parte da raiz do System
+//! **A árvore de cada raiz.** O rastreador parte da raiz do System
 //! (`PML4_PHYS`) e segue o que ela alcança: a metade de sistema inteira (as
 //! PDPTs congeladas e tudo abaixo delas, compartilhadas por todas as raízes,
 //! então toda folha de sistema é vista uma vez, venha a escrita de qualquer
-//! raiz) e a metade de usuário do System (o VAD dele e dos processos que
-//! ficam na raiz do System). Fica de fora, no M0, o que só uma raiz de
-//! processo (`process_address_space::create`) alcança: o frame da própria
-//! PML4 do processo, as PDPTs, PDs e PTs da metade de usuário dela e as
-//! folhas de usuário dessas tabelas. Essas escritas não são notificadas
-//! (`tracks_entry` é falso para as tabelas delas), e os frames de usuário de
-//! um processo com raiz própria não ganham PteAddress no banco nativo de
-//! PFNs. A PteAddress publicada é o alias recursivo, válido para uma folha
-//! de sistema em qualquer raiz carregada e para uma folha de usuário do
-//! System só com a raiz do System carregada.
+//! raiz) e a metade de usuário do System. Cada raiz de processo
+//! (`process_address_space::create_root`) entra com [`add_root`]: a
+//! auto-referência dela (a referência de tabela do frame da raiz) e a metade
+//! de usuário, PML4[0..256) — as PDPTs, PDs e PTs que só ela alcança e as
+//! folhas de usuário delas, com PteAddress no banco nativo de PFNs. A
+//! metade de sistema dela não é seguida de novo: as entradas são cópias das
+//! do boot. Cada tabela sabe de que raiz é (`space`). Uma tabela ainda
+//! ligada continua referenciada, e o PFN não a devolve (o frame não volta
+//! nem duas vezes nem enquanto está em uso); [`remove_root`], no
+//! `delete_root`, confere que nenhuma tabela da raiz sobrou no rastreador
+//! (uma tabela vazada) antes de tirar a auto-referência e a raiz. A
+//! PteAddress publicada é o alias recursivo: válido para uma folha de
+//! sistema em qualquer raiz carregada e para uma folha de usuário com a raiz
+//! dela carregada, como no NT.
 
 use alloc::collections::BTreeMap;
 
@@ -48,6 +52,9 @@ struct Table {
     primary_parent: u64,
     /// Entrada pai -> prefixo de VA por esse caminho.
     parents: BTreeMap<u64, u64>,
+    /// A raiz (PML4) da árvore desta tabela: `PML4_PHYS` ou a de um
+    /// processo.
+    space: u64,
 }
 
 struct Tracker {
@@ -108,9 +115,13 @@ impl Tracker {
     fn add_table(&mut self, parent_pa: u64, index: u64, entry: u64, prefix: u64) {
         let physical_address = entry & PHYSICAL_ADDRESS_MASK;
         let reference = self.reference_for(parent_pa, index, entry, true);
-        let parent_level = self.tables[&parent_pa].level;
+        let (parent_level, space) = {
+            let parent = &self.tables[&parent_pa];
+            (parent.level, parent.space)
+        };
         let table_index = self.layout.unwrap().table_index;
-        if parent_level == 4 && index == table_index && physical_address == map::PML4_PHYS {
+        // A auto-referência de uma raiz (a do boot ou a de um processo).
+        if parent_level == 4 && index == table_index && physical_address == parent_pa {
             descriptors::add_reference(physical_address / 4096, reference);
             return;
         }
@@ -128,6 +139,7 @@ impl Tracker {
             virtual_address: self.table_alias(level, prefix),
             primary_parent: reference.physical_address,
             parents: BTreeMap::from([(reference.physical_address, prefix)]),
+            space,
         };
         self.tables.insert(physical_address, table);
         descriptors::add_reference(physical_address / 4096, reference);
@@ -142,7 +154,7 @@ impl Tracker {
         let parent_address = parent_pa + index * 8;
         assert!(self.tables.contains_key(&physical_address), "removed page table was not tracked");
         descriptors::remove_reference(physical_address / 4096, parent_address);
-        if physical_address == map::PML4_PHYS {
+        if physical_address == parent_pa {
             return;
         }
         let table = self.tables.get_mut(&physical_address).unwrap();
@@ -163,11 +175,17 @@ impl Tracker {
     }
 
     fn update_entry(&mut self, table_pa: u64, index: u64, entry: u64, operation: Operation) {
-        let (level, table_prefix) = {
+        let (level, table_prefix, space) = {
             let table = &self.tables[&table_pa];
-            (table.level, table.prefix)
+            (table.level, table.prefix, table.space)
         };
         if level == 4 && (index == map::DIRECT_MAP_PML4_INDEX || index == map::KERNEL_HEAP_PML4_INDEX) {
+            return;
+        }
+        // A metade de sistema de uma raiz de processo é a do boot, já seguida
+        // por ela; só a auto-referência é da raiz.
+        let table_index = self.layout.unwrap().table_index;
+        if level == 4 && space != map::PML4_PHYS && index >= map::USER_PML4_ENTRIES && index != table_index {
             return;
         }
         let shift = 12 + (level - 1) * 9;
@@ -185,7 +203,7 @@ impl Tracker {
                     let physical_address = entry & PHYSICAL_ADDRESS_MASK;
                     let reference = self.reference_for(table_pa, index, entry, true);
                     descriptors::refresh_reference(physical_address / 4096, reference);
-                    let rebase = physical_address != map::PML4_PHYS
+                    let rebase = physical_address != table_pa
                         && self
                             .tables
                             .get(&physical_address)
@@ -206,7 +224,9 @@ impl Tracker {
         let physical_address = entry & PHYSICAL_ADDRESS_MASK & !(byte_length - 1);
         // VA canônica: estende o sinal do bit 47.
         let virtual_address = ((prefix << 16) as i64 >> 16) as u64;
-        if virtual_address == physical_address || virtual_address == map::direct_map(physical_address) {
+        // Os aliases físicos do kernel só existem na árvore do boot; numa raiz
+        // de processo toda folha é de usuário e dona do frame.
+        if space == map::PML4_PHYS && (virtual_address == physical_address || virtual_address == map::direct_map(physical_address)) {
             return;
         }
         let reference = self.reference_for(table_pa, index, entry, false);
@@ -238,12 +258,62 @@ pub fn initialize() -> Result<(), KernelError> {
         virtual_address: tracker.layout.unwrap().root_table_address,
         primary_parent: 0,
         parents: BTreeMap::new(),
+        space: map::PML4_PHYS,
     };
     tracker.tables.insert(map::PML4_PHYS, root);
     for index in 0..512 {
         tracker.update_entry(map::PML4_PHYS, index, read_entry(map::PML4_PHYS + index * 8), Operation::Add);
     }
     Ok(())
+}
+
+/// Uma raiz de processo nova (`process_address_space::create_root`, já com a
+/// metade de sistema copiada e a auto-referência): passa a ser seguida. A
+/// auto-referência ganha a referência de tabela do frame da raiz, e a metade
+/// de usuário (vazia na criação) é percorrida. Sem o rastreador instalado,
+/// nada a fazer.
+pub fn add_root(root: u64) -> Result<(), KernelError> {
+    let mut tracker = STATE.lock();
+    let Some(layout) = tracker.layout else { return Ok(()) };
+    if tracker.tables.contains_key(&root) {
+        return Err(KernelError::new("page-table root already tracked"));
+    }
+    let table = Table { physical_address: root, level: 4, prefix: 0, virtual_address: layout.root_table_address, primary_parent: 0, parents: BTreeMap::new(), space: root };
+    tracker.tables.insert(root, table);
+    for index in (0..map::USER_PML4_ENTRIES).chain(core::iter::once(layout.table_index)) {
+        tracker.update_entry(root, index, read_entry(root + index * 8), Operation::Add);
+    }
+    Ok(())
+}
+
+/// A raiz `root` vai voltar ao PFN (`process_address_space::delete_root`,
+/// com a metade de usuário já desfeita): recusa, sem mudar nada, se alguma
+/// tabela da árvore dela ainda está no rastreador (uma tabela vazada); senão
+/// tira a auto-referência e a raiz, que fica livre para o PFN.
+pub fn remove_root(root: u64) -> Result<(), KernelError> {
+    let mut tracker = STATE.lock();
+    let Some(layout) = tracker.layout else { return Ok(()) };
+    if root == map::PML4_PHYS || !tracker.tables.get(&root).is_some_and(|table| table.level == 4) {
+        return Err(KernelError::new("page-table root not tracked"));
+    }
+    let leaked = tracker.tables.values().filter(|table| table.space == root && table.physical_address != root).count();
+    if leaked != 0 {
+        return Err(KernelError::new(alloc::format!("{leaked} page table(s) of the root still tracked")));
+    }
+    tracker.update_entry(root, layout.table_index, read_entry(root + layout.table_index * 8), Operation::Remove);
+    tracker.tables.remove(&root);
+    Ok(())
+}
+
+/// Os frames das tabelas da árvore de `root` (a própria raiz inclusive) que
+/// o rastreador segue.
+pub fn tables_of(root: u64) -> alloc::vec::Vec<u64> {
+    STATE.lock().tables.values().filter(|table| table.space == root).map(|table| table.physical_address).collect()
+}
+
+/// Quantas tabelas o rastreador segue, de todas as raízes.
+pub fn table_count() -> usize {
+    STATE.lock().tables.len()
 }
 
 pub fn tracks_entry(address: u64) -> bool {
