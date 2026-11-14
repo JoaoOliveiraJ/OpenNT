@@ -21,3 +21,4 @@ pub mod cross_memory;
 pub mod user_callback;
 
 pub mod process_queries;
+pub mod ipi_stall;
