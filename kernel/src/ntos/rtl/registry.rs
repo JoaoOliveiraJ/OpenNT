@@ -147,13 +147,19 @@ pub fn query_registry_values(relative_to: u32, path: u64, table: u64, context: u
         };
         if flags & QUERY_REGISTRY_DIRECT != 0 {
             // REG_SZ, REG_EXPAND_SZ e REG_MULTI_SZ vão para o UNICODE_STRING
-            // de EntryContext (Buffer NULL = alocado do pool, como o NT);
-            // os demais tipos são copiados como dado cru.
+            // de EntryContext (RtlpQueryRegistryDirect: Buffer NULL = pool
+            // paginado 'Strg' do ExpAllocateStringRoutine, que o driver libera
+            // com ExFreePool); os demais tipos são copiados como dado cru.
             if matches!(value_type, 1 | 2 | 7) {
                 // SAFETY: EntryContext de uma entrada DIRECT de string é um UNICODE_STRING do driver.
                 let string = unsafe { crate::ntos::inc::types::UnicodeString::at(entry_context) };
                 if string.buffer.get() == 0 {
-                    string.buffer.set(guest::alloc_bytes(bytes.len().max(2) as u64));
+                    let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, bytes.len().max(2) as u64, 0x6772_7453).unwrap_or(0);
+                    if buffer == 0 {
+                        status = 0xC000_009Au32 as i32 as i64 as u64;
+                        break;
+                    }
+                    string.buffer.set(buffer);
                     string.maximum_length.set(bytes.len() as u16);
                 } else if bytes.len() > string.maximum_length.get() as usize {
                     status = 0xC000_0023u32 as i32 as i64 as u64;

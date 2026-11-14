@@ -3015,6 +3015,9 @@ fn rtl_group_exports(assert: Assert) {
     let queried = call("RtlQueryRegistryValues", &[1, relative, text_table, 0, 0]);
     let unicode = at::<nt::UnicodeString>(string);
     assert(written == 0 && queried == 0 && unicode.length.get() == 6 && unicode.maximum_length.get() == 8 && unicode.buffer.get() != 0 && guest_strings::read_unicode_string(string) == "abc", "rtl: RtlQueryRegistryValues DIRECT de REG_SZ relativo a Services");
+    // O buffer veio do pool 'Strg' (ExpAllocateStringRoutine): o driver o
+    // devolve com ExFreePoolWithTag.
+    assert(call_export("ExFreePoolWithTag", &[unicode.buffer.get(), 0x6772_7453]).is_some(), "rtl: buffer do DIRECT de REG_SZ volta ao pool");
     // Default REG_SZ com DefaultLength 0: o tamanho vem do texto, no buffer
     // do próprio driver.
     let own = guest::alloc_bytes(0x20);
