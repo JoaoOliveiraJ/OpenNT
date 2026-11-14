@@ -90,6 +90,14 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // O catálogo que cobre a pilha PS/2 do bundle (i8042prt.sys, kbdclass.sys
+    // e mouclass.sys, achado pelo hash da imagem no CatRoot desta máquina):
+    // num boot com a CI ativa (`--start-driver`), a pilha de teclado passa
+    // pela validação depois do driver iniciado.
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0511~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0511~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),
     ("Windows/System32/win32k.sys", "System32/win32k.sys"),

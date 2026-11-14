@@ -96,6 +96,9 @@ pub struct TestOptions {
     pub timeout: Duration,
     pub keys: Option<String>,
     pub expect: Vec<String>,
+    /// Depois da última saída esperada, o sistema segue rodando por este
+    /// tempo sem nenhuma falha na serial (`--hold=MS`).
+    pub hold: Duration,
 }
 
 /// Nome do `sendkey` do HMP para um caractere.
@@ -188,7 +191,9 @@ impl Drop for QemuProcess {
     }
 }
 
-const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU"];
+/// Falhas na serial: pânico do Rust, exceção de kernel, autoteste e a parada
+/// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina).
+const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP"];
 
 /// Boot sem tela: sucesso quando o marcador (e as saídas esperadas depois
 /// das teclas) aparecem na serial antes do prazo.
@@ -212,7 +217,7 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         .spawn()
         .map_err(|error| format!("{}: {error}", qemu.display()))?;
     let mut stdout = child.stdout.take().unwrap();
-    let process = QemuProcess(child);
+    let mut process = QemuProcess(child);
 
     let output = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&output);
@@ -257,6 +262,21 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         }
         for expected in &test.expect {
             cursor = wait_for(expected, cursor)?;
+        }
+        // O prazo do teste não vale durante a espera: ela tem duração própria.
+        let hold_end = Instant::now() + test.hold;
+        while Instant::now() < hold_end {
+            {
+                let text = output.lock().unwrap();
+                if let Some(failure) = FAILURE_MARKERS.iter().find(|marker| text[cursor.min(text.len())..].contains(*marker)) {
+                    return Err(format!("falha detectada na serial durante os {} ms de espera: {failure}", test.hold.as_millis()));
+                }
+            }
+            // Um triplo fault com -no-reboot encerra o QEMU sem marcador.
+            if let Ok(Some(status)) = process.0.try_wait() {
+                return Err(format!("QEMU terminou durante os {} ms de espera ({status})", test.hold.as_millis()));
+            }
+            thread::sleep(Duration::from_millis(50));
         }
         Ok(())
     })();

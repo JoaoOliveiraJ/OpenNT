@@ -3,7 +3,7 @@
 //! ```text
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
-//! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]...
+//! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -40,7 +40,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME
                    --trace-driver-api --initial-process=smss
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
-test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)";
+test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
+                   --hold=MS (segue rodando MS ms sem falha depois da ultima saida)";
 
 struct Arguments {
     command: String,
@@ -49,6 +50,7 @@ struct Arguments {
     positional: Vec<String>,
     keys: Option<String>,
     expect: Vec<String>,
+    hold_ms: u64,
     console_mirror_set: bool,
 }
 
@@ -71,6 +73,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         positional: Vec::new(),
         keys: None,
         expect: Vec::new(),
+        hold_ms: 0,
         console_mirror_set: false,
     };
     for argument in iterator {
@@ -98,6 +101,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--smp" => parsed.machine.smp = required()?.parse().map_err(|_| "--smp invalido")?,
             "--keys" => parsed.keys = Some(required()?.replace("\\n", "\n")),
             "--expect" => parsed.expect.push(required()?),
+            "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--help" | "-h" => return Err(USAGE.to_string()),
             _ if name.starts_with("--") => return Err(format!("opcao desconhecida: {name}\n{USAGE}")),
             _ => parsed.positional.push(argument),
@@ -140,6 +144,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     timeout: Duration::from_millis(timeout_ms),
                     keys: arguments.keys,
                     expect: arguments.expect,
+                    hold: Duration::from_millis(arguments.hold_ms),
                 },
                 &log,
             )
