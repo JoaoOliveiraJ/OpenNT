@@ -97,6 +97,40 @@ pub mod completion_packets {
         CACHED.lock().len()
     }
 
+    /// IoInitializeMiniCompletionPacket(Packet, Callback, Context) (ntoskrnl
+    /// 19041 rva 0x8943b0): o pacote de usuário (PacketType 4) do chamador,
+    /// com a rotina chamada na retirada (Packet, Context) e Allocated =
+    /// FALSE; os demais campos ficam como o chamador os deixou.
+    pub fn initialize_mini(packet: &IoMiniCompletionPacketUser, callback: u64, context: u64) {
+        packet.packet_type.set(PACKET_USER);
+        packet.mini_packet_callback.set(callback);
+        packet.context.set(context);
+        packet.allocated.set(0);
+    }
+
+    /// IoAllocateMiniCompletionPacket(Callback, Context) (ntoskrnl 19041 rva
+    /// 0x7023f0, sobre o IopAllocateMiniCompletionPacket do tipo 4): um
+    /// pacote de usuário de 0x50 bytes do NonPagedPoolNx ('Icp '), com a
+    /// rotina, o contexto e Allocated = TRUE; sem memória, NULL.
+    pub fn allocate_mini(callback: u64, context: u64) -> u64 {
+        let pointer = pool_allocation::allocate_priority(0x200, USER_PACKET_BYTE_LENGTH, PACKET_TAG, 0).unwrap_or(0);
+        if pointer != 0 {
+            let packet = packet_at(pointer);
+            packet.packet_type.set(PACKET_USER);
+            packet.mini_packet_callback.set(callback);
+            packet.context.set(context);
+            packet.allocated.set(1);
+        }
+        pointer
+    }
+
+    /// IoFreeMiniCompletionPacket(Packet) (rva 0x65cb10): sem a rotina, o
+    /// IopFreeMiniCompletionPacket devolve ao pool o pacote alocado.
+    pub fn free_mini(pointer: u64) -> Result<(), KernelError> {
+        packet_at(pointer).mini_packet_callback.set(0);
+        release(pointer)
+    }
+
     pub fn is_cached(pointer: u64) -> bool {
         CACHED.lock().contains(&pointer)
     }

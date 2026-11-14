@@ -117,6 +117,18 @@ pub fn free(process_handle: u64, base_pointer: u64, size_pointer: u64, free_type
     with_target(process_handle, |space| memory::free_in(space, base_pointer, size_pointer, free_type))
 }
 
+/// NtFreeVirtualMemory chamado por código de kernel (o export Nt*): segue o
+/// modo anterior da thread, como o serviço do NT. Em KernelMode é o mesmo
+/// serviço do ZwFreeVirtualMemory; em UserMode é o serviço de usuário
+/// (`ps/user/memory`): o handle da tabela do processo corrente com
+/// PROCESS_VM_OPERATION e os ponteiros sondados como memória de usuário.
+pub fn nt_free(process_handle: u64, base_pointer: u64, size_pointer: u64, free_type: u32) -> Result<u32, KernelError> {
+    if crate::ntos::ps::previous_mode::get()? == 0 {
+        return free(process_handle, base_pointer, size_pointer, free_type);
+    }
+    memory::nt_free_virtual_memory(process_handle, base_pointer, size_pointer, free_type as u64, 0)
+}
+
 /// ZwProtectVirtualMemory.
 pub fn protect(process_handle: u64, base_pointer: u64, size_pointer: u64, new_protect: u32, old_pointer: u64) -> Result<u32, KernelError> {
     with_target(process_handle, |space| memory::protect_in(space, base_pointer, size_pointer, new_protect, old_pointer, false))

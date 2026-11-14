@@ -84,6 +84,91 @@ pub fn unlock_pages(descriptor: u64) {
     set_flags(mdl(descriptor), 0, MDL_PAGES_LOCKED);
 }
 
+// ---- MmAdvanceMdl ------------------------------------------------------------
+//
+// Como no ntoskrnl 19041 (rva 0x531010): NumberOfBytes a partir de
+// ByteCount é STATUS_INVALID_PARAMETER_2. O início do MDL anda: dentro da
+// primeira página só ByteOffset/ByteCount (e MappedSystemVa, se mapeado)
+// mudam; cruzando páginas, StartVa avança as páginas inteiras e o vetor de
+// PFNs gira uma posição por página consumida — o PFN que sai vai para o fim,
+// marcado no bit 63, e o MDL ganha MDL_FREE_EXTRA_PTES (0x200); num MDL já
+// avançado, as entradas extras até a marcada também giram. Assim as páginas
+// consumidas continuam no vetor para o MmUnlockPages.
+
+const MDL_FREE_EXTRA_PTES: i16 = 0x0200;
+const PFN_EXTRA_END: u64 = 1 << 63;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+
+/// MmAdvanceMdl(Mdl, NumberOfBytes): devolve o NTSTATUS.
+pub fn advance(descriptor: &Mdl, bytes: u32) -> u32 {
+    let mut byte_count = descriptor.byte_count.get();
+    if bytes >= byte_count {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    let mut remaining = bytes;
+    let byte_offset = descriptor.byte_offset.get();
+    // ADDRESS_AND_SIZE_TO_SPAN_PAGES antes de andar.
+    let mut entries = ((((descriptor.start_va.get() as u32).wrapping_add(byte_offset) & 0xFFF) as u64) + byte_count as u64 + 0xFFF) >> 12;
+    let mut rotations = 0u64;
+    if byte_offset != 0 {
+        let mapped = descriptor.mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0;
+        let room = 0x1000 - byte_offset;
+        if remaining < room {
+            descriptor.byte_count.set(byte_count - remaining);
+            descriptor.byte_offset.set(byte_offset + remaining);
+            if mapped {
+                descriptor.mapped_system_va.set(descriptor.mapped_system_va.get().wrapping_add(remaining as u64));
+            }
+            return 0;
+        }
+        descriptor.start_va.set(descriptor.start_va.get() + 0x1000);
+        byte_count -= room;
+        remaining -= room;
+        descriptor.byte_offset.set(0);
+        descriptor.byte_count.set(byte_count);
+        if mapped {
+            descriptor.mapped_system_va.set(descriptor.mapped_system_va.get().wrapping_add(room as u64));
+        }
+        rotations = 1;
+    }
+    if remaining != 0 {
+        byte_count -= remaining;
+        descriptor.byte_count.set(byte_count);
+        descriptor.byte_offset.set(remaining & 0xFFF);
+        let pages = (remaining >> 12) as u64;
+        rotations += pages;
+        descriptor.start_va.set(descriptor.start_va.get() + (pages << 12));
+        if descriptor.mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0 {
+            descriptor.mapped_system_va.set(descriptor.mapped_system_va.get().wrapping_add(remaining as u64));
+        }
+    }
+    if rotations == 0 {
+        return 0;
+    }
+    let base = descriptor.address() + Mdl::SIZE;
+    // SAFETY: a entrada `index` do vetor de PFNs do MDL (dimensionado pelo
+    // dono para as páginas e as extras já giradas).
+    let entry = |index: u64| unsafe { Field::<u64>::at(base + index * 8) };
+    if descriptor.mdl_flags.get() & MDL_FREE_EXTRA_PTES != 0 {
+        loop {
+            let value = entry(entries).get();
+            entries += 1;
+            if value & PFN_EXTRA_END != 0 {
+                break;
+            }
+        }
+    }
+    for _ in 0..rotations {
+        let first = entry(0).get();
+        for index in 1..=entries {
+            let value = if index == entries { first | PFN_EXTRA_END } else { entry(index).get() & !PFN_EXTRA_END };
+            entry(index - 1).set(value);
+        }
+    }
+    set_flags(descriptor, MDL_FREE_EXTRA_PTES, 0);
+    0
+}
+
 /// MmBuildMdlForNonPagedPool.
 pub fn build_for_non_paged_pool(descriptor: u64) {
     let descriptor = mdl(descriptor);

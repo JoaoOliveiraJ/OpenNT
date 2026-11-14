@@ -551,7 +551,13 @@ fn service_database(assert: Assert) {
     // Instalação com os padrões do gerenciador.
     let installed = services::install(&input("OpenNTSvc", "\"C:\\Program Files\\svc.exe\" -x"), false);
     assert(installed.as_ref().is_ok_and(|configuration| configuration.service_type == 16 && configuration.start == 3 && configuration.error_control == 1 && configuration.display_name == "OpenNTSvc" && configuration.object_name == "LocalSystem" && configuration.dependencies.is_empty()), "services: instalacao com padroes");
-    assert(services::list().iter().any(|name| name == "OpenNTSvc") && !services::list().iter().any(|name| name == "Tcpip"), "services: lista so chaves com Type");
+    // Uma subchave de Services sem Type (configuração auxiliar) não é serviço.
+    let untyped = crate::ntos::cm::registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\OpenNTSemTipo\\Parameters", None);
+    assert(services::list().iter().any(|name| name == "OpenNTSvc") && !services::list().iter().any(|name| name == "OpenNTSemTipo"), "services: lista so chaves com Type");
+    for handle in [untyped, crate::ntos::cm::registry::open("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\OpenNTSemTipo")].into_iter().flatten().filter(|&handle| handle != 0) {
+        crate::ntos::cm::registry::delete_key(handle);
+        crate::ntos::cm::registry::close_handle(handle);
+    }
     assert(service_code(&services::install(&input("OpenNTSvc", "x.exe"), false)) == 1073 && services::install(&input("OpenNTSvc", "x.exe"), true).is_ok_and(|configuration| configuration.image_path.starts_with('"')), "services: duplicado recusado ou preservado");
     assert(service_code(&services::install(&input("a/b", "x.exe"), false)) == 123 && service_code(&services::install(&input("", "x.exe"), false)) == 123, "services: nome invalido");
     let mut account = input("OpenNTAccount", "x.exe");

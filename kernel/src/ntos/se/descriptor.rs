@@ -322,8 +322,6 @@ pub fn set_owner(descriptor: u64, owner: u64, defaulted: bool) -> u32 {
 
 // ---- captura (SeCapture/ReleaseSecurityDescriptor) --------------------------
 
-const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-
 /// SeCaptureSecurityDescriptor: devolve em `*output` uma cópia self-relative
 /// do descritor na arena do convidado (ou NULL se a entrada for NULL),
 /// validando antes de copiar. Devolve o NTSTATUS.
@@ -360,12 +358,6 @@ pub fn release_captured(captured: u64) {
     if captured != 0 {
         guest::free_bytes(captured);
     }
-}
-
-/// SeConvertStringSecurityDescriptorToSecurityDescriptor: sem parser SDDL
-/// nesta plataforma; devolve STATUS_NOT_IMPLEMENTED de forma honesta.
-pub fn convert_string_to_descriptor() -> u32 {
-    STATUS_NOT_IMPLEMENTED
 }
 
 // ---- Self-relative -> absoluto (RtlSelfRelativeToAbsoluteSD, ntoskrnl 19041

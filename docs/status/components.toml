@@ -180,6 +180,13 @@ marcador = "DRIVER_START_COMPLETED"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=watchdog --build-dir=build/watchdog --smp=1 \"--expect=name=watchdog state=4 win32=0\""
 descricao = "O gerenciador de serviços inicia o watchdog.sys da Microsoft: o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports no ntoskrnl e o DriverEntry retorna sucesso, com o serviço em execução (state=4)."
 
+[[teste]]
+id = "ksecdd"
+titulo = "Driver ksecdd.sys real"
+marcador = "DRIVER_START_COMPLETED"
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ksecdd --build-dir=build/ksecdd --smp=1 \"--expect=name=ksecdd state=4 win32=0\""
+descricao = "O gerenciador de serviços inicia o ksecdd.sys da Microsoft (o driver de segurança do kernel, \\Device\\KsecDD): o Code Integrity valida a assinatura embutida, o loader resolve os imports no ntoskrnl, na hal.dll e no msrpc.sys, e o DriverEntry retorna sucesso, com o serviço em execução (state=4). No caminho ele liga a sua extensão ao host de autorização do kernel, registra a notificação de processos, conversa com o \\Device\\CNG do cng.sys real, cria o monitor de silos e registra os contadores de desempenho."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -298,7 +305,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/mm/pe_loader.rs", "kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/init/exports.rs"]
 testes = ["fase6", "boot"]
 fase = "6"
-notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Como no NT, toda imagem de kernel (drivers, hal.dll, ci.dll, bibliotecas de export) é mapeada no espaço de sistema, na janela que começa em 0xFFFFF80100000000, sobre frames do PFN, e relocada para lá; nenhuma fica na metade de usuário nem abaixo de 4 GB. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys e nsiproxy.sys já têm export; nenhum deles é carregado pelos testes ainda."
+notas = "Os drivers do Windows que esta página dá como Funciona ou Parcial carregam por ele; um import sem export correspondente recusa a carga. Como no NT, toda imagem de kernel (drivers, hal.dll, ci.dll, bibliotecas de export) é mapeada no espaço de sistema, na janela que começa em 0xFFFFF80100000000, sobre frames do PFN, e relocada para lá; nenhuma fica na metade de usuário nem abaixo de 4 GB. Dos exports do ntoskrnl, parte ainda falta (veja a página Exports do ntoskrnl). MmLoadSystemImage carrega imagens de sistema sob demanda, o caminho previsto para o win32k.sys real, que ainda não carrega. A lógica de cada export mora no arquivo do assunto do componente e o exports.rs só adapta. Todos os imports do ntoskrnl do fltmgr.sys, storport.sys, partmgr.sys, volmgr.sys, volsnap.sys, pciidex.sys, netio.sys, nsiproxy.sys, fwpkclnt.sys e pcw.sys já têm export; nenhum deles é carregado pelos testes ainda. O ksecdd.sys carrega e roda (teste ksecdd)."
 
 [[componente]]
 nome = "Cache Manager"
@@ -331,7 +338,7 @@ estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/console/mod.rs"]
 testes = ["boot", "shell"]
 fase = "4"
-notas = "Tela e espelho serial funcionam desde a fase 1. O registro como dispositivo do I/O Manager (\\Device\\Console), previsto no módulo, ainda não existe."
+notas = "Tela e espelho serial funcionam desde a fase 1. O registro como dispositivo do I/O Manager (\\Device\\Console), previsto no módulo, ainda não existe. O console do Windows é o condrv.sys real (\\Device\\ConDrv), que já está no volume com a chave de serviço da instalação (sob demanda); ainda não carrega porque importa o ZwSetInformationProcess, de outro estágio. Os exports de console de boot que ele usa (BgkDisplayCharacter, BgkGetConsoleState, BgkSetCursor) e o PsResumeProcess já existem: sem biblioteca gráfica de boot, os Bgk* devolvem STATUS_UNSUCCESSFUL, como no Windows sem console gráfico de boot."
 
 [[componente]]
 nome = "Teclado PS/2"
@@ -512,9 +519,11 @@ nome = "ksecdd.sys"
 categoria = "Drivers do Windows"
 icone = "lock"
 descricao = "O driver de segurança do kernel do Windows (\\Device\\KsecDD), usado por outros drivers e pelos serviços de segurança."
-estado = "planejado"
+estado = "implementado"
+caminhos = ["kernel/src/ntos/ex/extension_host.rs", "kernel/src/ntos/se/extension_hosts.rs", "kernel/src/ntos/se/logon_session.rs"]
+testes = ["ksecdd"]
 fase = "6"
-notas = "Alvo de carga do binário real. Ele importa funções do msrpc.sys, que o OpenNT já carrega para a ci.dll; o ksecdd.sys em si ainda não é carregado."
+notas = "Carrega e roda com `--start-driver=ksecdd`: DRIVER_START_COMPLETED state=4 win32=0 ntstatus=0x0. Tem assinatura embutida, validada pelo Code Integrity real, e importa do ntoskrnl, da hal.dll e do msrpc.sys. O DriverEntry liga a extensão de autorização ao host do kernel (ExRegisterExtension, id 2, um dos hosts de extensão que o kernel registra na fase 1, como no Windows), registra a notificação de criação de processos (PsSetCreateProcessNotifyRoutineEx2), conversa com o cng.sys real por IOCTLs do \\Device\\CNG, cria o monitor de silos e registra os contadores de desempenho (PcwRegister). Os contadores são do pcw.sys, que tem a chave de serviço sob demanda e ainda não completa o DriverEntry (o wdmlib dele abre o próprio DEVICE_OBJECT por ObOpenObjectByPointer, que o Object Manager do OpenNT ainda não faz para dispositivos); com o pcw fora do boot, os Pcw* devolvem sucesso com handle nulo, como num Windows com o pcw desligado. No boot comum ele não é iniciado (sob demanda; no Windows é de boot)."
 
 [[componente]]
 nome = "win32k.sys, win32kbase.sys e win32kfull.sys"
@@ -550,7 +559,7 @@ icone = "plug"
 descricao = "A pilha de rede do Windows (NDIS e TCP/IP) com o miniport Intel PRO/1000 da Microsoft, que atende a placa e1000 emulada pelo QEMU (PCI 8086:100E)."
 estado = "planejado"
 fase = "8"
-notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos; nenhum dos três drivers carrega ainda. Dos imports do ntoskrnl, falta 1 ao ndis.sys (NtQuerySystemInformationEx) e 13 ao tcpip.sys; os do netio.sys já estão todos atendidos."
+notas = "Alvo de carga dos binários reais. O barramento PCI interno já enumera a placa e1000 com os seus recursos. O netio.sys, o ndis.sys, o tcpip.sys, o afd.sys e as bibliotecas que eles importam (fwpkclnt.sys, tdi.sys, fltmgr.sys) já estão no volume, e NDIS, Tcpip e AFD têm as chaves de serviço da instalação (sob demanda); nenhum carrega ainda. Dos imports do ntoskrnl, falta 1 ao ndis.sys (NtQuerySystemInformationEx), 1 ao tcpip.sys (ZwQuerySecurityAttributesToken), 6 ao afd.sys (FsRtlCopyRead, FsRtlMdlRead, FsRtlMdlReadComplete, IoFreeErrorLogEntry, PsChargeProcessPoolQuota e PsReturnPoolQuota) e o NtCreateFile ao tdi.sys; os do netio.sys e do fwpkclnt.sys já estão todos atendidos. O netio.sys e o ndis.sys importam um do outro, e o carregador ainda recusa imports circulares. O kernel já registra o host de extensão do controle de taxa de rede que o tcpip.sys usa (id 4)."
 
 [[componente]]
 nome = "Arquivos em memória"

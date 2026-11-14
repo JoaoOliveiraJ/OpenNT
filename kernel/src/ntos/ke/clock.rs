@@ -190,3 +190,76 @@ pub fn query_timer_resolution(maximum: &Field<u32>, minimum: &Field<u32>, curren
     minimum.set(CLOCK_TIME_INCREMENT);
     current.set(CLOCK_TIME_INCREMENT);
 }
+
+// ---- ExSetTimerResolution ---------------------------------------------------
+//
+// ExSetTimerResolution (ntoskrnl 19041 rva 0x5b22d0)(DesiredTime,
+// SetResolution) conta os pedidos de resolução do kernel sob
+// ExpKernelResolutionLock: o primeiro pedido (ou um mais fino que o vigente)
+// grava KeNonHrTimeIncrement e ExpKernelRequestedTimerResolution e chama o
+// ExpUpdateTimerResolution (0x35defc); o último cancelamento volta
+// KeNonHrTimeIncrement a KeMaximumIncrement e pede a resolução padrão; os
+// demais só devolvem KeTimeIncrement. O ExpUpdateTimerResolution limita o
+// pedido a [KeMinimumIncrement, KeMaximumIncrement] e só reprograma o
+// relógio quando o resultado difere de ExpLastRequestedTime; com o timer do
+// LAPIC fixo em 100 Hz os dois limites são o mesmo período, então o relógio
+// nunca muda e a resposta é sempre KeTimeIncrement.
+
+/// Estado dos pedidos de resolução do kernel (ExpKernelResolution*).
+struct KernelResolution {
+    /// ExpKernelResolutionCount.
+    count: u32,
+    /// ExpKernelRequestedTimerResolution.
+    requested: u32,
+    /// KeNonHrTimeIncrement.
+    non_hr_increment: u32,
+    /// ExpLastRequestedTime.
+    last_requested: u32,
+}
+
+static KERNEL_RESOLUTION: crate::rtl::SpinLock<KernelResolution> = crate::rtl::SpinLock::new(KernelResolution { count: 0, requested: 0, non_hr_increment: CLOCK_TIME_INCREMENT, last_requested: CLOCK_TIME_INCREMENT });
+
+/// ExpUpdateTimerResolution: limita o pedido ao intervalo do relógio e o
+/// registra; devolve o KeTimeIncrement resultante.
+fn update_timer_resolution(state: &mut KernelResolution, set: bool, desired: u32) -> u32 {
+    let wanted = if set { desired } else { CLOCK_TIME_INCREMENT };
+    if set && (wanted >= state.last_requested || wanted >= CLOCK_TIME_INCREMENT) {
+        return CLOCK_TIME_INCREMENT;
+    }
+    // cmovb KeMinimumIncrement: o mínimo do relógio é o próprio período.
+    state.last_requested = wanted.max(CLOCK_TIME_INCREMENT);
+    CLOCK_TIME_INCREMENT
+}
+
+/// ExSetTimerResolution(DesiredTime, SetResolution): a resolução do relógio
+/// em vigor, em 100 ns.
+pub fn set_timer_resolution(desired: u32, set: bool) -> u32 {
+    let mut state = KERNEL_RESOLUTION.lock();
+    if !set {
+        if state.count == 0 {
+            return CLOCK_TIME_INCREMENT;
+        }
+        state.count -= 1;
+        if state.count != 0 {
+            return CLOCK_TIME_INCREMENT;
+        }
+        state.non_hr_increment = CLOCK_TIME_INCREMENT;
+        state.requested = 0;
+        return update_timer_resolution(&mut state, false, 0);
+    }
+    state.count += 1;
+    if state.count != 1 && desired >= state.requested {
+        return CLOCK_TIME_INCREMENT;
+    }
+    state.non_hr_increment = desired;
+    state.requested = desired;
+    update_timer_resolution(&mut state, true, desired)
+}
+
+/// Pedidos de resolução do kernel em vigor, o último valor pedido e o
+/// KeNonHrTimeIncrement (ExpKernelResolutionCount,
+/// ExpKernelRequestedTimerResolution, KeNonHrTimeIncrement).
+pub fn kernel_resolution_requests() -> (u32, u32, u32) {
+    let state = KERNEL_RESOLUTION.lock();
+    (state.count, state.requested, state.non_hr_increment)
+}

@@ -1,6 +1,6 @@
 //! Formatação estilo printf da CRT do kernel e da saída de depuração —
-//! sprintf, _snprintf, _snprintf_s, _vsnprintf, _snwprintf, _vsnwprintf,
-//! swprintf_s, vswprintf_s e vDbgPrintExWithPrefix.
+//! sprintf, _snprintf, _snprintf_s, _vsnprintf, _vsnprintf_s, _snwprintf,
+//! _vsnwprintf, swprintf_s, vswprintf_s e vDbgPrintExWithPrefix.
 //!
 //! O texto sai do formatador comum (`guest_strings::format_guest_text`); as
 //! variantes variádicas recebem os argumentos já lidos, as `v*` leem a
@@ -164,4 +164,63 @@ pub fn sprintf_s(buffer: u64, size: u64, format: u64, arguments: &[u64]) -> Resu
 /// vsprintf_s(Buffer, SizeOfBuffer, Format, ArgList).
 pub fn vsprintf_s(buffer: u64, size: u64, format: u64, va_list: u64) -> Result<u64, KernelError> {
     print_secure(buffer, size, format, &mut guest_strings::guest_format_arguments(va_list))
+}
+
+// ---- _vsnprintf_s ------------------------------------------------------------
+//
+// Contrato do original (_vsnprintf_s, rva 0x3d6a20, sobre soutput_s, rva
+// 0x3d883c): Format nulo, Buffer nulo com Count ou SizeOfBuffer não nulos e
+// SizeOfBuffer zero são parâmetro inválido (-1, nada escrito), exceto
+// Buffer, SizeOfBuffer e Count todos zero, que devolvem 0. Com Count menor
+// que SizeOfBuffer a saída vai até Count caracteres e o NUL, e truncar
+// devolve -1; senão até SizeOfBuffer - 1 caracteres e o NUL: truncar com
+// _TRUNCATE (Count = SIZE_MAX) devolve -1 com o texto cortado, e com Count
+// explícito esvazia o buffer (Buffer[0] = 0) e devolve -1. O tratador de
+// parâmetro inválido do kernel é `ret`.
+
+/// soutput_s(Buffer, Size, ...): escreve até `size` caracteres (SIZE_MAX vale
+/// 0x7FFFFFFF) e o NUL em Buffer[Size - 1], sempre; cabendo texto e NUL,
+/// termina o texto e devolve o comprimento, senão -2. Size zero ou acima de
+/// 0x7FFFFFFF (exceto SIZE_MAX) é parâmetro inválido: -1, nada escrito.
+fn string_output_secure(buffer: u64, size: u64, bytes: &[u8]) -> i64 {
+    const MAXIMUM_COUNT: u64 = 0x7FFF_FFFF;
+    if size == 0 || (size > MAXIMUM_COUNT && size != u64::MAX) {
+        return -1;
+    }
+    let count = size.min(MAXIMUM_COUNT);
+    let length = bytes.len() as u64;
+    guest::write_bytes(buffer, &bytes[..length.min(count) as usize]);
+    guest::write8(buffer.wrapping_add(size).wrapping_sub(1), 0);
+    if length < count {
+        guest::write8(buffer + length, 0);
+        length as i64
+    } else {
+        -2
+    }
+}
+
+/// _vsnprintf_s(Buffer, SizeOfBuffer, Count, Format, ArgList): devolve o int
+/// da CRT estendido.
+pub fn vsnprintf_s(buffer: u64, size: u64, count: u64, format: u64, va_list: u64) -> Result<u64, KernelError> {
+    const FAILED: u64 = -1i64 as u64;
+    if format == 0 {
+        return Ok(FAILED);
+    }
+    if buffer == 0 {
+        return Ok(if count == 0 && size == 0 { 0 } else { FAILED });
+    }
+    if size == 0 {
+        return Ok(FAILED);
+    }
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut guest_strings::guest_format_arguments(va_list), false)?;
+    // Texto estreito: cada `char` é um byte (Latin-1).
+    let bytes: Vec<u8> = text.chars().map(|character| character as u32 as u8).collect();
+    let (written, truncate) = if size > count { (string_output_secure(buffer, count + 1, &bytes), true) } else { (string_output_secure(buffer, size, &bytes), count == u64::MAX) };
+    if written >= 0 {
+        return Ok(written as u64);
+    }
+    if !(written == -2 && truncate) {
+        guest::write8(buffer, 0);
+    }
+    Ok(FAILED)
 }

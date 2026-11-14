@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 326] {
+fn groups() -> [&'static Group; 346] {
     [
         &crate::ntos::rtl::exports::resource_lookup::GROUP,
         &crate::ntos::rtl::exports::resource_search::GROUP,
@@ -381,6 +381,26 @@ fn groups() -> [&'static Group; 326] {
         &crate::ntos::ex::exports::zw_event::GROUP,
         &crate::ntos::ex::exports::ex_wnf_subscription::GROUP,
         &crate::ntos::io::exports::io_device_eject::GROUP,
+        &crate::ntos::ex::exports::ex_push_lock_convert::GROUP,
+        &crate::ntos::ex::exports::ex_extension_unregister::GROUP,
+        &crate::ntos::ex::exports::ex_timer_resolution::GROUP,
+        &crate::ntos::rtl::exports::rtl_security_error::GROUP,
+        &crate::ntos::rtl::exports::rtl_crt_vsnprintf_s::GROUP,
+        &crate::ntos::ps::exports::ps_resume_process::GROUP,
+        &crate::ntos::ps::exports::ps_silo_identifier::GROUP,
+        &crate::ntos::ps::exports::ps_process_notify_ex2::GROUP,
+        &crate::ntos::ps::exports::ps_container_id::GROUP,
+        &crate::ntos::ps::exports::ps_command_line::GROUP,
+        &crate::ntos::se::exports::se_logon_session::GROUP,
+        &crate::ntos::se::exports::se_non_ob_audit::GROUP,
+        &crate::ntos::se::exports::se_srp_access_check::GROUP,
+        &crate::ntos::cm::exports::cm_machine_hive_notify::GROUP,
+        &crate::ntos::io::exports::io_mini_completion::GROUP,
+        &crate::ntos::mm::exports::mm_advance_mdl::GROUP,
+        &crate::ntos::mm::exports::mm_nt_free_virtual_memory::GROUP,
+        &crate::ntos::ob::exports::ob_nt_duplicate_object::GROUP,
+        &crate::ntos::bgk::exports::bgk_console::GROUP,
+        &crate::ntos::rtl::exports::rtl_capability_sids::GROUP,
     ]
 }
 

@@ -294,8 +294,13 @@ fn convert_push_lock_exclusive_to_shared(call: &Call) -> Result<u64, KernelError
     Ok(0)
 }
 
+/// ExRegisterExtension(Extension*, RegistrationVersion, RegistrationInfo).
 fn register_extension(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(extension_host::register(call.arg(1), call.arg(2) as u16, call.arg(3))))
+    use crate::ntos::inc::field::{Field, NtStruct};
+    // SAFETY: o PEX_EXTENSION de saída e o EX_EXTENSION_REGISTRATION_1 de um
+    // chamador de modo kernel.
+    let (extension, info) = unsafe { (Field::<u64>::at(call.arg(1)), extension_host::ExExtensionRegistration1::at(call.arg(3))) };
+    Ok(signed_status(extension_host::register_extension(extension, call.arg(2) as u32, info)?))
 }
 
 fn system_time_to_local_time(call: &Call) -> Result<u64, KernelError> {
@@ -1232,6 +1237,68 @@ pub mod ex_hard_error {
             ("ExActivationObjectType", activation_type),
             ("ExTimerObjectType", timer_type),
         ],
+    };
+}
+
+pub mod ex_push_lock_convert {
+    //! ExTryConvertPushLockSharedToExclusiveEx; a lógica mora em `ex/push_lock`.
+
+    use crate::ntos::ex::push_lock;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExTryConvertPushLockSharedToExclusiveEx(PushLock, Flags) -> BOOLEAN.
+    fn try_convert_shared_to_exclusive(call: &Call) -> Result<u64, KernelError> {
+        Ok(push_lock::try_convert_shared_to_exclusive(call.arg(1), call.arg(2) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-push-lock-convert",
+        names: &["ExTryConvertPushLockSharedToExclusiveEx"],
+        handlers: &[try_convert_shared_to_exclusive],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_extension_unregister {
+    //! ExUnregisterExtension; a lógica mora em `ex/extension_host`.
+
+    use crate::ntos::ex::extension_host;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExUnregisterExtension(Extension).
+    fn unregister_extension(call: &Call) -> Result<u64, KernelError> {
+        extension_host::unregister_extension(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-extension-unregister",
+        names: &["ExUnregisterExtension"],
+        handlers: &[unregister_extension],
+        data_exports: &[],
+    };
+}
+
+pub mod ex_timer_resolution {
+    //! ExSetTimerResolution; a lógica mora em `ke/clock`, junto do
+    //! ExQueryTimerResolution.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::clock;
+    use crate::rtl::KernelError;
+
+    /// ExSetTimerResolution(DesiredTime, SetResolution) -> ULONG.
+    fn set_timer_resolution(call: &Call) -> Result<u64, KernelError> {
+        Ok(clock::set_timer_resolution(call.arg(1) as u32, call.arg(2) as u8 != 0) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-timer-resolution",
+        names: &["ExSetTimerResolution"],
+        handlers: &[set_timer_resolution],
+        data_exports: &[],
     };
 }
 

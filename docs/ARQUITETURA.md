@@ -48,7 +48,8 @@ kernel/src/
 │   ├── se/            segurança: descritores, ACLs, SIDs, integridade de código
 │   │   ├── token/     tokens de acesso
 │   │   └── capability/ capacidades e AppContainer
-│   ├── ex/            executive: push locks, rundown, lookaside, callbacks, pool
+│   ├── ex/            executive: push locks, rundown, lookaside, callbacks, pool,
+│   │                  hosts de extensão (ExRegisterHost/ExRegisterExtension)
 │   │   ├── wnf/       Windows Notification Facility
 │   │   └── license/   licenciamento
 │   ├── cm/            Registry
@@ -59,6 +60,7 @@ kernel/src/
 │   │   └── resource/  recursos de imagens (ldrrsrc) e tabelas de mensagens
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── po/ etw/ kd/ dbgk/ fsrtl/
+│   ├── bgk/           console do vídeo de boot (Bgk*)
 │   └── test/          autotestes de boot (phase3.rs a phase7.rs, self_test.rs;
 │                      multiprocess/, um módulo por assunto, chamado pela fase 7)
 ├── drivers/           drivers internos
@@ -705,6 +707,15 @@ dereference e o PFN livre volta ao de antes.
   de cima, a camada de cima se registra: o NTFS registra o volume de paginação
   (`mm::paging_volume::register`), o Mm instala o tradutor de endereços da
   memória de convidado. O registro acontece em `ntos/init`, na ordem do boot.
+- **Hosts de extensão** (`ex/extension_host.rs`): como no NT, um
+  componente que delega parte do trabalho a um driver registra um host
+  (ExRegisterHost: id, versão, mínimo de funções) e o driver liga a tabela
+  dele com ExRegisterExtension; o componente a usa entre
+  ExGetExtensionTable/ExReleaseExtensionTable, sob o rundown do host. Os
+  hosts registrados na fase 1 são o PCW (id 1, o pcw.sys; `ex/pcw.rs`
+  despacha os Pcw* para ele), a autorização (id 2, o ksecdd.sys) e o BCrypt
+  (id 3, o cng.sys) do Se (`se/extension_hosts.rs`) e o controle de taxa de
+  rede (id 4, o tcpip.sys) do Ps (`ps/net_rate_control.rs`).
 - Estado global fica atrás de `SpinLock` (`rtl::sync`). Estado lido muito e
   mudado em operações longas, como um volume NTFS, fica atrás de
   `SharedLock`, o papel do ERESOURCE: leituras compartilhadas, mutações

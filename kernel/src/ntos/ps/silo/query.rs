@@ -143,3 +143,9 @@ pub fn user_shared_data(silo: u64) -> Option<&'static crate::ntos::inc::types::S
     let globals = unsafe { EserversiloGlobals::at(ejob(silo).server_silo_globals.get()) };
     Some(unsafe { SiloUserSharedData::at(globals.user_shared_data.get()) })
 }
+
+/// PsGetSiloIdentifier(Silo) (ntoskrnl 19041 rva 0x7d4ff0): o JobId do
+/// EJOB do silo; o silo hospedeiro (NULL) é 0.
+pub fn silo_identifier(silo: u64) -> u32 {
+    if silo == HOST_SILO { 0 } else { ejob(silo).job_id.get() }
+}

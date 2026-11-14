@@ -34,6 +34,19 @@ const NTFS_FILES: &[(&str, &str)] = &[
     // A CI original e a sua dependência, carregadas do volume.
     ("CI.DLL", "System32/ci.dll"),
     ("MSRPC.SYS", "System32/drivers/msrpc.sys"),
+    // Provedor dos contadores de desempenho (driver de boot) e o console, a
+    // segurança do kernel e a pilha de rede (com as bibliotecas de export
+    // que importam), iniciados sob demanda (`--start-driver`).
+    ("PCW.SYS", "System32/drivers/pcw.sys"),
+    ("CONDRV.SYS", "System32/drivers/condrv.sys"),
+    ("KSECDD.SYS", "System32/drivers/ksecdd.sys"),
+    ("NETIO.SYS", "System32/drivers/netio.sys"),
+    ("NDIS.SYS", "System32/drivers/ndis.sys"),
+    ("TCPIP.SYS", "System32/drivers/tcpip.sys"),
+    ("AFD.SYS", "System32/drivers/afd.sys"),
+    ("FWPKCLNT.SYS", "System32/drivers/fwpkclnt.sys"),
+    ("TDI.SYS", "System32/drivers/tdi.sys"),
+    ("FLTMGR.SYS", "System32/drivers/fltmgr.sys"),
     // Esquema de API sets: os imports ext-ms-* das imagens de kernel.
     ("APISETSCHEMA.DLL", "System32/apisetschema.dll"),
     // A CI lê a lista de revogação pelo caminho completo.

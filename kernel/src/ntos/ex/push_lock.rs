@@ -334,6 +334,18 @@ pub fn convert_exclusive_to_shared(pointer: u64) {
     cas(word(pointer), 1, 17);
 }
 
+/// ExTryConvertPushLockSharedToExclusiveEx(PushLock, Flags): flags além de
+/// 3 param o sistema (bugcheck 0x152, Flags, PushLock); senão um LOCK
+/// CMPXCHG de "um leitor" (LOCKED | um incremento compartilhado) para
+/// "exclusivo". Com outro leitor, aguardantes ou um escritor, nada muda.
+pub fn try_convert_shared_to_exclusive(pointer: u64, flags: u32) -> bool {
+    if flags & !3 != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x152, flags as u64, pointer, 0, 0);
+    }
+    let single_reader = LOCKED | SHARED_REFERENCE_INCREMENT;
+    cas(word(pointer), single_reader, LOCKED) == single_reader
+}
+
 pub fn try_exclusive(pointer: u64, flags: u32) -> Result<bool, KernelError> {
     validate(flags, 1)?;
     Ok(try_acquire(word(pointer), false))

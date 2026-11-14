@@ -1478,3 +1478,85 @@ pub mod zw_job_query {
 
     pub static GROUP: Group = Group { name: "zw-job-query", names: &["ZwQueryInformationJobObject"], handlers: &[query_information_job_object], data_exports: &[] };
 }
+
+pub mod ps_resume_process {
+    //! PsResumeProcess; a lógica mora em `ps/suspend_resume`.
+
+    use crate::ntos::inc::types::{Eprocess, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::suspend_resume;
+    use crate::rtl::KernelError;
+
+    /// PsResumeProcess(Process).
+    fn resume_process(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PEPROCESS referenciado pelo chamador de modo kernel.
+        Ok(signed_status(suspend_resume::resume_process(unsafe { Eprocess::at(call.arg(1)) })?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-resume-process", names: &["PsResumeProcess"], handlers: &[resume_process], data_exports: &[] };
+}
+
+pub mod ps_silo_identifier {
+    //! PsGetSiloIdentifier; a lógica mora em `ps/silo/query`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::silo::query;
+    use crate::rtl::KernelError;
+
+    /// PsGetSiloIdentifier(Silo) -> ULONG.
+    fn silo_identifier(call: &Call) -> Result<u64, KernelError> {
+        Ok(query::silo_identifier(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-silo-identifier", names: &["PsGetSiloIdentifier"], handlers: &[silo_identifier], data_exports: &[] };
+}
+
+pub mod ps_process_notify_ex2 {
+    //! PsSetCreateProcessNotifyRoutineEx2; a lógica mora em
+    //! `ps/notify/process`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::notify::process as process_notify;
+    use crate::rtl::KernelError;
+
+    /// PsSetCreateProcessNotifyRoutineEx2(NotifyType, NotifyInformation, Remove).
+    fn set_create_process_notify_routine_ex2(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(process_notify::set_ex2(call.arg(1) as u32, call.arg(2), call.arg(3) as u8)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-process-notify-ex2", names: &["PsSetCreateProcessNotifyRoutineEx2"], handlers: &[set_create_process_notify_routine_ex2], data_exports: &[] };
+}
+
+pub mod ps_container_id {
+    //! PsGetEffectiveContainerId; a lógica mora em `ps/job`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::job;
+    use crate::rtl::KernelError;
+
+    /// PsGetEffectiveContainerId(Level, Thread, ContainerId*).
+    fn effective_container_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(job::effective_container_id(call.arg(1) as u32 as i32, call.arg(2), call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-container-id", names: &["PsGetEffectiveContainerId"], handlers: &[effective_container_id], data_exports: &[] };
+}
+
+pub mod ps_command_line {
+    //! PsQueryProcessCommandLine; a lógica mora em `ps/query_process`.
+
+    use crate::ntos::inc::types::{Eprocess, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::query_process;
+    use crate::rtl::KernelError;
+
+    /// PsQueryProcessCommandLine(Process, CommandLine, BufferLength,
+    /// AccessMode, ReturnLength*).
+    fn query_command_line(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PEPROCESS referenciado pelo chamador de modo kernel.
+        let process = unsafe { Eprocess::at(call.arg(1)) };
+        Ok(signed_status(query_process::query_command_line(process, call.arg(2), call.arg(3) as u32, call.arg(4) as u8, call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-command-line", names: &["PsQueryProcessCommandLine"], handlers: &[query_command_line], data_exports: &[] };
+}

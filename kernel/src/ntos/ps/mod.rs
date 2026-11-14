@@ -37,3 +37,5 @@ pub mod wake_counter;
 pub mod locale;
 pub mod fault_information;
 pub mod io_boost;
+pub mod net_rate_control;
+pub mod suspend_resume;

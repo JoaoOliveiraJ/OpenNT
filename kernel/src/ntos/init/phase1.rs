@@ -14,6 +14,11 @@ pub fn init() {
     crate::ntos::io::io_manager::init().unwrap_or_else(|error| panic!("I/O Manager: {error}"));
     // Exports do kernel para drivers: resolvedor do loader e trampolins.
     crate::ntos::init::exports::init();
+    // Hosts de extensão que os drivers de boot preenchem (ExRegisterHost do
+    // SepInitializeAuthorizationCallbacks e do PspInitializeNetRateControl).
+    crate::ntos::se::extension_hosts::initialize_authorization_callbacks().unwrap_or_else(|error| panic!("hosts de extensao do Se: {error}"));
+    crate::ntos::ps::net_rate_control::initialize().unwrap_or_else(|error| panic!("host de controle de taxa de rede: {error}"));
+    crate::ntos::ex::pcw::initialize().unwrap_or_else(|error| panic!("host do PCW: {error}"));
     // hal.dll real da instalação: biblioteca sem entrada com os seus
     // encaminhamentos, carregada logo depois dos resolvedores do ntoskrnl,
     // de que os encaminhamentos dependem.

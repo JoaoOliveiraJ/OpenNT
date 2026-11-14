@@ -388,3 +388,29 @@ pub fn privilege_object_audit_alarm(handle: u64, desired_access: u32, privileges
     true
 }
 
+/// SeOpenObjectAuditAlarmForNonObObject(SubsystemName, HandleId,
+/// ObjectTypeName, ObjectName, Sd, SubjectContext, DesiredAccess,
+/// GrantedAccess, Privileges, AccessGranted, *GenerateOnClose): o alarme de
+/// abertura de um objeto que não é do Object Manager (uma reserva de portas
+/// do TCP/IP, por exemplo). Como no ntoskrnl 19041 (rva 0x7d2580): com a
+/// subcategoria de objeto do kernel aberta para o resultado, examina a SACL
+/// do descritor com os acessos pedidos e concedidos (a SACL global não
+/// existe no OpenNT); uma auditoria gerada grava o evento 4656 e liga
+/// *GenerateOnClose. Com o portão fechado, um acesso concedido com
+/// privilégios usados gera o alarme de uso de privilégio sobre o objeto
+/// (evento 4674), se essa auditoria estiver ligada.
+#[allow(clippy::too_many_arguments)]
+pub fn open_object_audit_alarm_for_non_ob_object(subsystem: u64, handle_id: u64, type_name: u64, object_name: u64, descriptor: u64, subject: &SecuritySubjectContext, desired: u32, granted_access: u32, privileges: u64, granted: bool, generate_on_close: u64) {
+    if audit_this_event(SUBCATEGORY_KERNEL_OBJECT, granted, !granted) {
+        let sacl = if descriptor != 0 { sacl_of(descriptor) } else { 0 };
+        let (generate_audit, _) = examine_sacl(sacl, subject_token(subject), desired | granted_access, granted);
+        if generate_audit {
+            record_audit_event("OpenObject", format!("event=4656 subsystem={} handle={:#x} type={} name={} desired={:#x} granted={}", name_of(subsystem), handle_id, name_of(type_name), name_of(object_name), desired, granted));
+            out::<u8>(generate_on_close).set(1);
+        }
+        return;
+    }
+    if privileges != 0 && granted && audit_privilege_use(true, false) {
+        record_audit_event("PrivilegeObject", format!("event=4674 subsystem={} handle={:#x} type={} name={} desired={:#x}", name_of(subsystem), handle_id, name_of(type_name), name_of(object_name), desired));
+    }
+}

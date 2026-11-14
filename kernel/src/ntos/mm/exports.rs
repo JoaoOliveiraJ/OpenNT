@@ -771,3 +771,36 @@ pub mod zw_virtual_memory_information {
 
     pub static GROUP: Group = Group { name: "zw-virtual-memory-information", names: &["ZwSetInformationVirtualMemory"], handlers: &[set_information_virtual_memory], data_exports: &[] };
 }
+
+pub mod mm_nt_free_virtual_memory {
+    //! NtFreeVirtualMemory como export do kernel; a lógica mora em
+    //! `mm/virtual_memory_services` (e no serviço de usuário, em UserMode).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::virtual_memory_services;
+    use crate::rtl::KernelError;
+
+    /// NtFreeVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*, FreeType).
+    fn nt_free(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(virtual_memory_services::nt_free(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-nt-free-virtual-memory", names: &["NtFreeVirtualMemory"], handlers: &[nt_free], data_exports: &[] };
+}
+
+pub mod mm_advance_mdl {
+    //! MmAdvanceMdl; a lógica mora em `mm/mdl`.
+
+    use crate::ntos::inc::types::{Mdl, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::mdl;
+    use crate::rtl::KernelError;
+
+    /// MmAdvanceMdl(Mdl, NumberOfBytes).
+    fn advance_mdl(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PMDL de um chamador de modo kernel.
+        Ok(signed_status(mdl::advance(unsafe { Mdl::at(call.arg(1)) }, call.arg(2) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-advance-mdl", names: &["MmAdvanceMdl"], handlers: &[advance_mdl], data_exports: &[] };
+}

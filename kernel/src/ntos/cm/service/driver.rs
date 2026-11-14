@@ -71,6 +71,10 @@ pub fn image_path(configuration: &Configuration) -> Result<String, DriverService
     if let Some(rest) = strip_prefix_ci(&path, "%SystemRoot%\\") {
         path = format!("\\SystemRoot\\{rest}");
     }
+    // ImagePath relativo é relativo a \SystemRoot, como no IopLoadDriver.
+    if strip_prefix_ci(&path, "System32\\").is_some() {
+        path = format!("\\SystemRoot\\{path}");
+    }
     // Drivers de System32\Drivers ficam na raiz do volume do convidado.
     let relative = if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\System32\\Drivers\\") {
         String::from(rest)

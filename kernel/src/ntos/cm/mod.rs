@@ -31,3 +31,4 @@ pub mod state_separation;
 pub mod value_information;
 pub mod wnf_defaults;
 pub mod exports;
+pub mod machine_hive;

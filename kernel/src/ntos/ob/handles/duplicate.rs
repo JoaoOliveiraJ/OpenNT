@@ -112,6 +112,25 @@ fn duplicate_namespace_handle(source_handle: u64, target: u64, target_handle: u6
     Ok(STATUS_SUCCESS)
 }
 
+/// NtDuplicateObject chamado por código de kernel (o export Nt*): segue o
+/// modo anterior da thread, como o serviço do NT. Em KernelMode é o
+/// ObDuplicateObject de modo kernel abaixo (o do ZwDuplicateObject); em
+/// UserMode é o serviço de usuário (`ps/user/handles`), que lê
+/// DesiredAccess, HandleAttributes e Options da pilha do chamador: o quadro
+/// da chamada (`frame`, o retorno em +0 e o quinto argumento em +0x28) é
+/// entregue como a pilha do serviço, como o despachante de serviços faz.
+#[allow(clippy::too_many_arguments)]
+pub fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: u64, target_handle: u64, desired: u32, attributes: u32, options: u32, frame: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::{index, state};
+    if crate::ntos::ps::previous_mode::get()? == 0 {
+        return duplicate_object(source_process, source_handle, target_process, target_handle, desired, attributes, options);
+    }
+    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 3 * 8 }) };
+    // SAFETY: o quadro da chamada nativa, na pilha de kernel do chamador.
+    let return_address = unsafe { Field::<u64>::at(frame) }.get();
+    state::with_syscall_record(record, || index::invoke_service("NtDuplicateObject", [source_process, source_handle, target_process, target_handle], return_address, frame))
+}
+
 /// ZwDuplicateObject(SourceProcessHandle, SourceHandle, TargetProcessHandle,
 /// TargetHandle*, DesiredAccess, HandleAttributes, Options).
 #[allow(clippy::too_many_arguments)]

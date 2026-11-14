@@ -390,7 +390,11 @@ fn begin_wait(name: &str, args: &[u64; 14]) -> Result<Option<Wait>, KernelError>
         _ => {}
     }
     if ((name == "PsSetCreateProcessNotifyRoutineEx" || name == "PsSetCreateProcessNotifyRoutine") && args[1] & 255 != 0) || name == "PsRemoveCreateProcessNotifyRoutine" {
-        return boxed(Box::new(process_notify::begin_remove(args[0], name == "PsSetCreateProcessNotifyRoutineEx")?));
+        let flags = if name == "PsSetCreateProcessNotifyRoutineEx" { process_notify::NOTIFY_EXTENDED } else { 0 };
+        return boxed(Box::new(process_notify::begin_remove(args[0], flags)?));
+    }
+    if name == "PsSetCreateProcessNotifyRoutineEx2" && args[0] as u32 == 0 && args[2] & 255 != 0 {
+        return boxed(Box::new(process_notify::begin_remove(args[1], process_notify::NOTIFY_EXTENDED | process_notify::NOTIFY_SUBSYSTEMS)?));
     }
     if let Some((mode, enter_critical)) = resource_mode(name) {
         // As variantes com região crítica têm um só argumento e sempre esperam

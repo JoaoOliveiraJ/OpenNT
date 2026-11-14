@@ -34,3 +34,30 @@ pub mod cm_key_notify {
 
     pub static GROUP: Group = Group { name: "cm-key-notify", names: &["ZwNotifyChangeKey"], handlers: &[notify_change_key], data_exports: &[] };
 }
+
+pub mod cm_machine_hive_notify {
+    //! Cm(Un)RegisterMachineHiveLoadedNotification; a lógica mora em
+    //! `cm/machine_hive`.
+
+    use crate::ntos::cm::machine_hive;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// CmRegisterMachineHiveLoadedNotification(Callback, Context, MountPoint, Handle*).
+    fn register(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(machine_hive::register(call.arg(1), call.arg(2), call.arg(3), call.arg(4))?))
+    }
+
+    /// CmUnregisterMachineHiveLoadedNotification(Handle).
+    fn unregister(call: &Call) -> Result<u64, KernelError> {
+        machine_hive::unregister(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "cm-machine-hive-notify",
+        names: &["CmRegisterMachineHiveLoadedNotification", "CmUnregisterMachineHiveLoadedNotification"],
+        handlers: &[register, unregister],
+        data_exports: &[],
+    };
+}

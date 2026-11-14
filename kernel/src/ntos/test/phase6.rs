@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1689 && abi_names::GROUP_LAYOUT.len() == 326 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1689 exports em 326 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1715 && abi_names::GROUP_LAYOUT.len() == 346 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1715 exports em 346 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1242,7 +1242,13 @@ fn ntoskrnl_ex_group(assert: Assert) {
     // UUID v4: versão nos 4 bits altos do Data3 (byte 7) e variante 10b no Data4[0].
     assert(call_export("ExUuidCreate", &[uuid]) == Some(0) && uuid_guid.data3.get() >> 12 == 4 && uuid_guid.data4[0].get() >> 6 == 2, "ex: ExUuidCreate versao 4");
     let output = block + 0x1B0;
-    assert(call_export("ExRegisterExtension", &[output, 1, 0xFFFF_F800_DEAD_0000]) == Some(0) && guest::read16(guest::read64(output)) == 1 && guest::read64(guest::read64(output) + 8) == 0xFFFF_F800_DEAD_0000, "ex: ExRegisterExtension");
+    // EX_EXTENSION_REGISTRATION_1 zerado: a versão de registro 1 (sem
+    // 0x10000) é recusada antes de olhar o registro (o resto do modelo de
+    // hosts fica em ex_extension_host_exports).
+    let registration = guest::alloc_bytes(0x20);
+    guest::write_bytes(registration, &[0; 0x20]);
+    guest::write64(output, 0);
+    assert(call_export("ExRegisterExtension", &[output, 1, registration]) == Some(0xFFFF_FFFF_C000_000D) && guest::read64(output) == 0, "ex: ExRegisterExtension recusa a versao de registro sem 0x10000");
     at::<nt::LargeInteger>(block + 0x1B8).quad_part.set(0x01DA_0000_1234_5678);
     assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_0225), "ex: hora local sem fuso e regra inexistente");
     // EX_TIMER e ExEventObjectType.
@@ -1373,7 +1379,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1689 && exports::export_names().len() == 1689, "ntoskrnl: 326 grupos com os 1689 exports implementados");
+    assert(exports::implemented() == 1715 && exports::export_names().len() == 1715, "ntoskrnl: 346 grupos com os 1715 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -1550,7 +1556,7 @@ fn process_information_and_driver_services(assert: Assert) {
     guest::free_bytes(returned);
     // Caminhos instalados de drivers.
     let configuration = |path: &str| service_database::Configuration { name: alloc::string::String::from("x"), display_name: alloc::string::String::new(), image_path: alloc::string::String::from(path), service_type: 1, start: 3, error_control: 1, object_name: alloc::string::String::new(), dependencies: alloc::vec::Vec::new() };
-    assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\Drivers\\a.sys")).is_ok_and(|path| path == "/a.sys") && driver_services::image_path(&configuration("\"C:\\Windows\\System32\\Drivers\\b.sys\"")).is_ok_and(|path| path == "/b.sys") && driver_services::image_path(&configuration("system32\\drivers\\c.sys")).is_ok_and(|path| path == "/system32/drivers/c.sys"), "drvsvc: caminhos de System32\\Drivers normalizados");
+    assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\Drivers\\a.sys")).is_ok_and(|path| path == "/a.sys") && driver_services::image_path(&configuration("\"C:\\Windows\\System32\\Drivers\\b.sys\"")).is_ok_and(|path| path == "/b.sys") && driver_services::image_path(&configuration("system32\\drivers\\c.sys")).is_ok_and(|path| path == "/c.sys"), "drvsvc: caminhos de System32\\Drivers normalizados (o relativo e relativo a \\SystemRoot)");
     assert(driver_services::image_path(&configuration("D:\\d.sys")).is_err_and(|error| error.win32 == 3) && driver_services::image_path(&configuration("a\\..\\b.sys")).is_err_and(|error| error.win32 == 123), "drvsvc: unidade indisponivel e travessia recusadas");
     // Serviço de driver real: start/stop e ZwLoadDriver/ZwUnloadDriver.
     let counter = guest::alloc_bytes(8);
@@ -5399,6 +5405,29 @@ fn pcw_counters_exports(assert: Assert) {
     const KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\pcw";
     let out = guest::alloc_bytes(8);
     let registration = at::<nt::Field<u64>>(out);
+    if pcw::extension_registered() {
+        // O pcw.sys real carregou no boot e registrou a extensão (id 1): os
+        // Pcw* vão para ele. PCW_REGISTRATION_INFORMATION versão 0x100 com um
+        // contador e uma rotina que devolve STATUS_SUCCESS.
+        let info = guest::alloc_bytes(0x40);
+        guest::write_bytes(info, &[0; 0x40]);
+        let descriptor = guest::alloc_bytes(8);
+        guest::write_bytes(descriptor, &[0, 0, 0, 0, 0, 0, 4, 0]);
+        guest::write32(info, 0x100);
+        guest::write64(info + 8, unicode_string_for("OpenNTContadores"));
+        guest::write32(info + 0x10, 1);
+        guest::write64(info + 0x18, descriptor);
+        guest::write64(info + 0x20, native_stub(&[0x31, 0xC0, 0xC3]));
+        registration.set(0);
+        let registered = call_export("PcwRegister", &[out, info]);
+        let handle = registration.get();
+        assert(pcw::host() != 0 && registered == Some(0) && handle != 0, "pcw-counters: com o pcw.sys carregado, PcwRegister registra o conjunto de contadores por ele");
+        let _ = call_export("PcwUnregister", &[handle]);
+        guest::write32(info, 0x200);
+        assert(call_export("PcwRegister", &[out, info]) == Some(0xFFFF_FFFF_C000_00F0), "pcw-counters: versao desconhecida recusada pelo pcw.sys (STATUS_INVALID_PARAMETER_2)");
+        guest::free_bytes(out);
+        return;
+    }
     let preexisting = registry::node_by_path(KEY).is_some();
     if !preexisting {
         pcw::reset_enable_state_for_test();
@@ -11204,6 +11233,507 @@ fn ex_wnf_subscription_exports(assert: Assert) {
     guest::free_bytes(storage);
 }
 
+/// Código nativo de teste numa alocação da arena (executável).
+fn native_stub(code: &[u8]) -> u64 {
+    let stub = guest::alloc_bytes(0x40);
+    guest::write_bytes(stub, code);
+    stub
+}
+
+/// UNICODE_STRING com o texto logo depois, numa alocação nova.
+fn unicode_string_for(text: &str) -> u64 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let block = guest::alloc_bytes(nt::UnicodeString::SIZE + units.len() as u64 * 2 + 2);
+    guest::write_bytes(block + nt::UnicodeString::SIZE, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    let string = at::<nt::UnicodeString>(block);
+    string.length.set(units.len() as u16 * 2);
+    string.maximum_length.set(units.len() as u16 * 2);
+    string.buffer.set(block + nt::UnicodeString::SIZE);
+    block
+}
+
+fn ex_push_lock_convert_exports(assert: Assert) {
+    let lock = guest::alloc_bytes(8);
+    let word = at::<nt::Field<u64>>(lock);
+    let convert = || call_export("ExTryConvertPushLockSharedToExclusiveEx", &[lock, 0]).map(|value| value & 0xFF);
+    word.set(0x11);
+    assert(convert() == Some(1) && word.get() == 1, "ex-push-lock-convert: um leitor vira exclusivo");
+    word.set(0x21);
+    assert(convert() == Some(0) && word.get() == 0x21, "ex-push-lock-convert: com outro leitor nada muda");
+    word.set(0x13);
+    assert(convert() == Some(0) && word.get() == 0x13, "ex-push-lock-convert: com aguardantes nada muda");
+    word.set(1);
+    assert(convert() == Some(0) && word.get() == 1, "ex-push-lock-convert: exclusivo de outro nada muda");
+    word.set(0);
+}
+
+fn ex_extension_host_exports(assert: Assert) {
+    use crate::ntos::ex::extension_host::{self, HostParameters};
+    // Notificação de teste: log[1 + log[0]++] = razão.
+    let notify = native_stub(&[0x48, 0x8B, 0x02, 0x48, 0x89, 0x4C, 0xC2, 0x08, 0x48, 0xFF, 0x02, 0xC3]);
+    let log = guest::alloc_bytes(0x40);
+    guest::write_bytes(log, &[0; 0x40]);
+    let entries = || (0..guest::read64(log)).map(|index| guest::read64(log + 8 + index * 8)).collect::<Vec<u64>>();
+    let parameters = HostParameters { extension_id: 0x7F01, extension_version: 1, function_count: 2, pool_type: 0x200, host_table: 0xFFFF_F800_1234_5000, notification_routine: notify, notification_context: log };
+    let host = match extension_host::register_host(&parameters) {
+        Ok(Ok(host)) => host,
+        _ => 0,
+    };
+    assert(host != 0 && matches!(extension_host::register_host(&parameters), Ok(Err(0xC000_0035))) && matches!(extension_host::get_extension_table(host), Ok(0)), "ex-extension: host registrado sem extensao; id/versao repetidos dao STATUS_OBJECT_NAME_COLLISION");
+    let table = guest::alloc_bytes(0x20);
+    guest::write64(table, 0xFFFF_F800_AAAA_0000);
+    guest::write64(table + 8, 0xFFFF_F800_BBBB_0000);
+    let registration = guest::alloc_bytes(0x20);
+    let interface = guest::alloc_bytes(8);
+    let output = guest::alloc_bytes(8);
+    let register = |id: u16, version: u16, count: u16, function_table: u64, registration_version: u64| {
+        guest::write_bytes(registration, &[0; 0x20]);
+        guest::write16(registration, id);
+        guest::write16(registration + 2, version);
+        guest::write16(registration + 4, count);
+        guest::write64(registration + 8, function_table);
+        guest::write64(registration + 0x10, interface);
+        guest::write64(output, 0);
+        guest::write64(interface, 0);
+        call_export("ExRegisterExtension", &[output, registration_version, registration]).map(|status| status as u32)
+    };
+    assert(register(0x7F01, 1, 2, table, 0x2_0000) == Some(0xC000_000D) && register(0x7F01, 1, 1, 0, 0x1_0000) == Some(0xC000_000D), "ex-extension: versao de registro errada ou contagem sem tabela = STATUS_INVALID_PARAMETER");
+    assert(register(0x7F02, 1, 2, table, 0x1_0000) == Some(0xC000_0225) && register(0x7F01, 2, 2, table, 0x1_0000) == Some(0xC000_0225), "ex-extension: host inexistente = STATUS_NOT_FOUND");
+    assert(register(0x7F01, 1, 1, table, 0x1_0000) == Some(0xC000_000D), "ex-extension: menos funcoes que o host pede = STATUS_INVALID_PARAMETER");
+    guest::write64(table + 8, 0);
+    assert(register(0x7F01, 1, 2, table, 0x1_0000) == Some(0xC000_0022) && entries().is_empty(), "ex-extension: funcao nula = STATUS_ACCESS_DENIED, sem notificar");
+    guest::write64(table + 8, 0xFFFF_F800_BBBB_0000);
+    assert(
+        register(0x7F01, 1, 2, table, 0x1_0005) == Some(0) && guest::read64(output) == host && guest::read64(interface) == 0xFFFF_F800_1234_5000 && entries() == [0, 1],
+        "ex-extension: extensao ligada; EX_EXTENSION = o host, HostInterface = a tabela do host, notificacoes 0 e 1",
+    );
+    let used = extension_host::get_extension_table(host);
+    let _ = extension_host::release_extension_table(host);
+    assert(matches!(used, Ok(address) if address == table) && register(0x7F01, 1, 2, table, 0x1_0000) == Some(0xC000_0035), "ex-extension: ExGetExtensionTable devolve a tabela; segunda extensao = STATUS_OBJECT_NAME_COLLISION");
+    let _ = call_export("ExUnregisterExtension", &[host]);
+    assert(entries() == [0, 1, 2, 3] && matches!(extension_host::get_extension_table(host), Ok(0)), "ex-extension: ExUnregisterExtension notifica 2 e 3 e desliga a tabela");
+    assert(register(0x7F01, 1, 2, table, 0x1_0000) == Some(0) && entries() == [0, 1, 2, 3, 0, 1], "ex-extension: o host aceita uma nova extensao depois da remocao");
+    let _ = call_export("ExUnregisterExtension", &[host]);
+    // Hosts do kernel: autorização (id 2, a do KSecDD) livre; BCrypt (id 3)
+    // já ocupado pelo cng.sys real quando ele carregou na fase 1.
+    let six = guest::alloc_bytes(0x30);
+    for index in 0..6 {
+        guest::write64(six + index * 8, 0xFFFF_F800_CCCC_0000 + index);
+    }
+    let authorization = register(2, 1, 6, six, 0x1_0000);
+    let installed = guest::read64(output);
+    assert(crate::ntos::se::extension_hosts::authorization_host() != 0 && authorization == Some(0) && installed == crate::ntos::se::extension_hosts::authorization_host() && crate::ntos::ps::net_rate_control::host() != 0, "ex-extension: hosts de autorizacao (id 2) e de taxa de rede (id 4) registrados na fase 1");
+    let _ = call_export("ExUnregisterExtension", &[installed]);
+    let cng = crate::ntos::ob::object_manager::lookup("\\Device\\CNG").is_some();
+    let bcrypt = guest::alloc_bytes(0x24 * 8);
+    for index in 0..0x24 {
+        guest::write64(bcrypt + index * 8, 0xFFFF_F800_DDDD_0000 + index);
+    }
+    let second = register(3, 1, 0x24, bcrypt, 0x1_0000);
+    assert(if cng { second == Some(0xC000_0035) } else { second == Some(0) }, "ex-extension: a extensao BCrypt (id 3) e a do cng.sys real");
+    if !cng {
+        let _ = call_export("ExUnregisterExtension", &[guest::read64(output)]);
+    }
+}
+
+fn ex_timer_resolution_exports(assert: Assert) {
+    use crate::ntos::ke::clock;
+    let set = |time: u64, enable: u64| call_export("ExSetTimerResolution", &[time, enable]);
+    let before = clock::kernel_resolution_requests();
+    assert(before.0 == 0 && set(5000, 1) == Some(100_000) && clock::kernel_resolution_requests() == (1, 5000, 5000), "ex-timer-resolution: primeiro pedido grava a resolucao pedida; o relogio de 100 Hz continua em 10 ms");
+    assert(set(200_000, 1) == Some(100_000) && clock::kernel_resolution_requests() == (2, 5000, 5000), "ex-timer-resolution: pedido mais grosso so conta");
+    assert(set(0, 0) == Some(100_000) && clock::kernel_resolution_requests().0 == 1 && set(0, 0) == Some(100_000) && clock::kernel_resolution_requests() == (0, 0, 100_000), "ex-timer-resolution: o ultimo cancelamento volta ao periodo padrao");
+    assert(set(0, 0) == Some(100_000) && clock::kernel_resolution_requests().0 == 0, "ex-timer-resolution: cancelamento sem pedido nao estoura a contagem");
+}
+
+fn rtl_security_error_exports(assert: Assert) {
+    let map = |error: u64| call_export("RtlMapSecurityErrorToNtStatus", &[error]).map(|status| status as u32);
+    // Tabela de saltos do original (0x80090300..0x80090311) e os casos isolados.
+    assert(map(0x8009_0300) == Some(0xC000_009A) && map(0x8009_0305) == Some(0xC000_00FE) && map(0x8009_0308) == Some(0xC000_000D) && map(0x8009_030C) == Some(0xC000_006D) && map(0x8009_030E) == Some(0xC000_005F) && map(0x8009_0311) == Some(0xC000_005E), "rtl-security-error: SEC_E_* da tabela");
+    assert(map(0x8009_0316) == Some(0xC000_00FE) && map(0x8009_0324) == Some(0xC000_0133) && map(0x8009_0331) == Some(0xC000_00BB) && map(0x8009_035D) == Some(0xC000_000D), "rtl-security-error: SEC_E_BAD_PKGID, TIME_SKEW, ALGORITHM_MISMATCH e INVALID_PARAMETER");
+    assert(map(0x8009_0312) == Some(0x8009_0312) && map(0) == Some(0) && map(0xC000_0001) == Some(0xC000_0001), "rtl-security-error: sem mapeamento volta igual");
+}
+
+fn rtl_crt_vsnprintf_s_exports(assert: Assert) {
+    // "%s-%d" com ("abc", 42); vetores do modelo do soutput_s do original.
+    let format = guest::alloc_bytes(16);
+    guest::write_bytes(format, b"%s-%d\0");
+    let text = guest::alloc_bytes(8);
+    guest::write_bytes(text, b"abc\0");
+    let va_list = guest::alloc_bytes(16);
+    guest::write64(va_list, text);
+    guest::write64(va_list + 8, 42);
+    let buffer = guest::alloc_bytes(16);
+    let print = |size: u64, count: u64| {
+        guest::write_bytes(buffer, &[0xAA; 16]);
+        let result = call_export("_vsnprintf_s", &[buffer, size, count, format, va_list]).map(|value| value as u32 as i32);
+        (result, guest::read_bytes(buffer, 8))
+    };
+    let truncate = u64::MAX;
+    assert(print(16, truncate) == (Some(6), alloc::vec![0x61, 0x62, 0x63, 0x2D, 0x34, 0x32, 0x00, 0xAA]), "vsnprintf_s: cabe com _TRUNCATE");
+    assert(print(4, truncate) == (Some(-1), alloc::vec![0x61, 0x62, 0x63, 0x00, 0xAA, 0xAA, 0xAA, 0xAA]), "vsnprintf_s: _TRUNCATE corta e devolve -1");
+    assert(print(16, 3) == (Some(-1), alloc::vec![0x61, 0x62, 0x63, 0x00, 0xAA, 0xAA, 0xAA, 0xAA]), "vsnprintf_s: Count menor que o buffer corta em Count");
+    assert(print(4, 10) == (Some(-1), alloc::vec![0x00, 0x62, 0x63, 0x00, 0xAA, 0xAA, 0xAA, 0xAA]), "vsnprintf_s: Count explicito sem espaco esvazia o buffer");
+    assert(print(16, 6) == (Some(6), alloc::vec![0x61, 0x62, 0x63, 0x2D, 0x34, 0x32, 0x00, 0xAA]) && print(6, 6) == (Some(-1), alloc::vec![0x00, 0x62, 0x63, 0x2D, 0x34, 0x00, 0xAA, 0xAA]), "vsnprintf_s: Count igual ao texto cabe so com espaco para o NUL");
+    let invalid = |arguments: &[u64]| call_export("_vsnprintf_s", arguments).map(|value| value as u32 as i32);
+    assert(invalid(&[0, 0, 0, format, va_list]) == Some(0) && invalid(&[0, 4, 0, format, va_list]) == Some(-1) && invalid(&[buffer, 4, 2, 0, va_list]) == Some(-1) && invalid(&[buffer, 0, 2, format, va_list]) == Some(-1), "vsnprintf_s: parametros invalidos devolvem -1; buffer, tamanho e Count nulos devolvem 0");
+}
+
+fn ps_silo_identifier_exports(assert: Assert) {
+    let job = guest::alloc_bytes(nt::Ejob::SIZE);
+    at::<nt::Ejob>(job).job_id.set(0x2A);
+    assert(call_export("PsGetSiloIdentifier", &[job]).map(|value| value as u32) == Some(0x2A) && call_export("PsGetSiloIdentifier", &[0]).map(|value| value as u32) == Some(0), "ps-silo-identifier: o JobId do silo; o hospedeiro e 0");
+}
+
+fn ps_process_notify_ex2_exports(assert: Assert) {
+    let routine = native_stub(&[0xC3]);
+    let set = |notify_type: u64, remove: u64| call_export("PsSetCreateProcessNotifyRoutineEx2", &[notify_type, routine, remove]).map(|status| status as u32);
+    assert(set(1, 0) == Some(0xC000_000D), "ps-process-notify-ex2: so PsCreateProcessNotifySubsystems (0)");
+    assert(set(0, 1) == Some(0xC000_007A), "ps-process-notify-ex2: remover rotina ausente = STATUS_PROCEDURE_NOT_FOUND");
+    assert(set(0, 0) == Some(0xC000_0022), "ps-process-notify-ex2: rotina fora de imagem com FORCE_INTEGRITY = STATUS_ACCESS_DENIED");
+}
+
+fn ps_container_id_exports(assert: Assert) {
+    let job = guest::alloc_bytes(nt::Ejob::SIZE);
+    let rate_job = guest::alloc_bytes(nt::Ejob::SIZE);
+    let guid = |job: u64, first: u8| guest::write_bytes(at::<nt::Ejob>(job).container_id.address(), &core::array::from_fn::<u8, 16, _>(|index| first + index as u8));
+    guid(job, 0x10);
+    guid(rate_job, 0x40);
+    at::<nt::Ejob>(job).effective_net_io_rate_limit_job.set(rate_job);
+    let process = guest::alloc_bytes(nt::Eprocess::SIZE);
+    at::<nt::Eprocess>(process).job.set(job);
+    let thread = guest::alloc_bytes(nt::Ethread::SIZE);
+    at::<nt::Ethread>(thread).tcb.process.set(process);
+    let output = guest::alloc_bytes(0x20);
+    let query = |level: u64, thread: u64| {
+        guest::write_bytes(output, &[0xFF; 0x20]);
+        (call_export("PsGetEffectiveContainerId", &[level, thread, output]).map(|status| status as u32), guest::read_bytes(output, 0x14), guest::read8(output + 0x14))
+    };
+    let expected = |first: u8| (Some(0), (0..20).map(|index| if index < 16 { first + index as u8 } else { 0 }).collect::<Vec<u8>>(), 0xFF);
+    let zero = (Some(0), alloc::vec![0u8; 20], 0xFF);
+    assert(query(0, thread) == expected(0x10) && query(4, thread) == expected(0x10), "ps-container-id: niveis 0 e 4 dao o ContainerId do job do processo");
+    assert(query(2, thread) == expected(0x40) && query(3, thread) == zero && query(1, thread) == zero, "ps-container-id: nivel 2 o do EffectiveNetIoRateLimitJob; 3 sem job efetivo e 1 ficam zerados");
+    assert(query(5, thread).0 == Some(0xC000_00EF) && query(0, 0).0 == Some(0xC000_00F0), "ps-container-id: nivel 5 e thread nula recusados");
+    at::<nt::Eprocess>(process).job.set(0);
+    assert(query(0, thread) == zero, "ps-container-id: processo sem job da GUID zerada");
+}
+
+fn se_logon_session_exports(assert: Assert) {
+    use crate::ntos::se::{logon_session, token::tokens};
+    assert(logon_session::exists(logon_session::SYSTEM_LUID, 0) && logon_session::exists(logon_session::ANONYMOUS_LUID, 0) && !logon_session::exists(0x3E5, 0), "se-logon-session: sessoes SYSTEM e ANONYMOUS de boot");
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (handle_out, duplicate_out, attributes) = (block, block + 8, block + 0x40);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.attributes.set(0x200);
+    let set = |handle: u64, session: u64| call_export("SeSetSessionIdTokenWithLinked", &[handle, session]).map(|status| status as u32);
+    let opened = call_export("ZwOpenProcessTokenEx", &[u64::MAX, 0xF01FF, 0x200, handle_out]);
+    let system_token = guest::read64(handle_out);
+    // O token do System é o primário de um processo: em uso.
+    assert(opened == Some(0) && set(system_token, 3) == Some(0xC000_012B), "se-logon-session: token primario em uso = STATUS_TOKEN_ALREADY_IN_USE");
+    let duplicated = call_export("ZwDuplicateToken", &[system_token, 0xF01FF, attributes, 0, 1, duplicate_out]);
+    let copy = guest::read64(duplicate_out);
+    let pointer = crate::ntos::se::token::reference::reference(copy, 0, 0, false).ok().and_then(|reference| reference.ok()).map(|mut reference| {
+        let token = reference.token;
+        let _ = reference.release();
+        token
+    }).unwrap_or(0);
+    let session = || tokens::with(pointer, |token| token.session_id);
+    let before = session();
+    // A sessão SYSTEM não tem token de sessão nem irmã: sucesso sem mudar o token do handle.
+    assert(duplicated == Some(0) && pointer != 0 && set(copy, 3) == Some(0) && session() == before, "se-logon-session: sessao do token achada; so os tokens ligados a sessao mudam");
+    let _ = tokens::update(pointer, |token| token.authentication_id = 0x7_0000_1234);
+    assert(set(copy, 3) == Some(0xC000_005F), "se-logon-session: token sem sessao de logon = STATUS_NO_SUCH_LOGON_SESSION");
+    assert(set(0x7FFF_FFF8, 3) == Some(0xC000_0008), "se-logon-session: handle invalido");
+    let _ = call_export("ZwClose", &[copy]);
+    let _ = call_export("ZwClose", &[system_token]);
+}
+
+fn se_non_ob_audit_exports(assert: Assert) {
+    let context = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    call_export("SeCaptureSubjectContext", &[context]);
+    let generate = guest::alloc_bytes(8);
+    guest::write8(generate, 0x5A);
+    let (subsystem, type_name, object_name) = (unicode_string_for("TCP/IP"), unicode_string_for("InternetPortReservation"), unicode_string_for("Ports 1-2"));
+    let privileges = guest::alloc_bytes(0x20);
+    let before = crate::ntos::se::audit::events().len();
+    let alarm = |granted: u64, privileges: u64| call_export("SeOpenObjectAuditAlarmForNonObObject", &[subsystem, 0, type_name, object_name, 0, context, 3, 3, privileges, granted, generate]);
+    assert(alarm(1, 0).is_some() && alarm(0, 0).is_some() && alarm(1, privileges).is_some() && guest::read8(generate) == 0x5A && crate::ntos::se::audit::events().len() == before, "se-non-ob-audit: politica de boot zerada nao gera evento nem toca GenerateOnClose");
+    call_export("SeReleaseSubjectContext", &[context]);
+}
+
+fn se_srp_access_check_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_fs_ntfs::{SeAccessReply, SeAccessRequest, SeSecurityDescriptor};
+    // SD self-relative: owner=SYSTEM@20, DACL@32 com ACCESS_ALLOWED(0x1FF, SYSTEM).
+    let system_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let mut bytes = alloc::vec![0u8; 60];
+    bytes[0] = 1;
+    bytes[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&32u32.to_le_bytes());
+    bytes[20..32].copy_from_slice(&system_sid);
+    bytes[32] = 2;
+    bytes[34..36].copy_from_slice(&28u16.to_le_bytes());
+    bytes[36..38].copy_from_slice(&1u16.to_le_bytes());
+    bytes[42..44].copy_from_slice(&20u16.to_le_bytes());
+    bytes[44..48].copy_from_slice(&0x1FFu32.to_le_bytes());
+    bytes[48..60].copy_from_slice(&system_sid);
+    let descriptor = guest::alloc_bytes(0x80);
+    guest::write_bytes(descriptor, &bytes);
+    let mapping = guest::alloc_bytes(nt::GenericMapping::SIZE);
+    at::<nt::GenericMapping>(mapping).generic_all.set(0x001F_01FF);
+    let context = guest::alloc_bytes(nt::SecuritySubjectContext::SIZE);
+    call_export("SeCaptureSubjectContext", &[context]);
+    let se_address = guest::alloc_bytes(SeSecurityDescriptor::SIZE);
+    let se_descriptor = at::<SeSecurityDescriptor>(se_address);
+    se_descriptor.size.set(SeSecurityDescriptor::SIZE as u32);
+    se_descriptor.security_descriptor.set(descriptor);
+    let request_address = guest::alloc_bytes(SeAccessRequest::SIZE);
+    let request = at::<SeAccessRequest>(request_address);
+    request.size.set(SeAccessRequest::SIZE as u32);
+    request.se_security_descriptor.set(se_address);
+    request.generic_mapping.set(mapping);
+    let (granted_address, status_address) = (guest::alloc_bytes(8), guest::alloc_bytes(8));
+    let (granted, status) = (at::<nt::Field<u32>>(granted_address), at::<nt::Field<u32>>(status_address));
+    let reply_address = guest::alloc_bytes(SeAccessReply::SIZE);
+    let reply = at::<SeAccessReply>(reply_address);
+    reply.size.set(SeAccessReply::SIZE as u32);
+    reply.result_list_count.set(1);
+    reply.granted_access.set(granted_address);
+    reply.access_status.set(status_address);
+    let check = |desired: u32, mode: u64| {
+        request.desired_access.set(desired);
+        call_export("SeSrpAccessCheck", &[context, 1, request_address, reply_address, 0, mode]).map(|value| value & 0xFF)
+    };
+    assert(check(1, 1) == Some(1) && status.get() == 0 && granted.get() & 1 != 0, "se-srp-access-check: UserMode concede o acesso da DACL");
+    assert(check(0x10000, 1) == Some(0) && status.get() == 0xC000_0022 && granted.get() == 0, "se-srp-access-check: UserMode nega DELETE ausente");
+    assert(check(0x10000, 0) == Some(1) && status.get() == 0 && granted.get() == 0x10000, "se-srp-access-check: KernelMode concede");
+    call_export("SeReleaseSubjectContext", &[context]);
+}
+
+fn cm_machine_hive_notify_exports(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::io::work_items;
+    // Callback de teste: (*Context)++.
+    let callback = native_stub(&[0x48, 0xFF, 0x01, 0xC3]);
+    let counters = guest::alloc_bytes(0x10);
+    guest::write_bytes(counters, &[0; 0x10]);
+    let handle = guest::alloc_bytes(8);
+    let register = |callback: u64, context: u64, mount: u64, handle: u64| call_export("CmRegisterMachineHiveLoadedNotification", &[callback, context, mount, handle]).map(|status| status as u32);
+    let software = unicode_string_for("\\Registry\\Machine\\Software");
+    assert(register(0, counters, software, handle) == Some(0xC000_00EF) && register(callback, counters, 0, handle) == Some(0xC000_00F1) && register(callback, counters, software, 0) == Some(0xC000_00F2), "cm-machine-hive: parametros nulos recusados por posicao");
+    assert(register(callback, counters, unicode_string_for("\\REGISTRY\\MACHINE\\NOPE"), handle) == Some(0xC000_003A), "cm-machine-hive: ponto de montagem fora das hives de maquina = STATUS_OBJECT_NAME_NOT_FOUND");
+    // SOFTWARE já está carregada: o work item chama o callback uma vez.
+    let registered = register(callback, counters, software, handle);
+    let first = guest::read64(handle);
+    work_items::run_queue();
+    let once = guest::read64(counters);
+    work_items::run_queue();
+    assert(registered == Some(0) && first != 0 && once == 1 && guest::read64(counters) == 1, "cm-machine-hive: hive carregada notifica pelo work item, uma vez");
+    let _ = call_export("CmUnregisterMachineHiveLoadedNotification", &[first]);
+    // OSDATA ainda não existe: a criação do ponto de montagem notifica.
+    let osdata = "\\Registry\\Machine\\OSDATA";
+    if registry::node_by_path(osdata).is_none() {
+        let pending = register(callback, counters + 8, unicode_string_for(osdata), handle);
+        let second = guest::read64(handle);
+        work_items::run_queue();
+        let before = guest::read64(counters + 8);
+        let key = registry::open_or_create(osdata, None);
+        work_items::run_queue();
+        assert(pending == Some(0) && before == 0 && key.is_ok() && guest::read64(counters + 8) == 1, "cm-machine-hive: hive ausente notifica quando o ponto de montagem aparece");
+        if let Ok(key) = key {
+            registry::delete_key(key);
+            registry::close_handle(key);
+        }
+        let _ = call_export("CmUnregisterMachineHiveLoadedNotification", &[second]);
+    }
+    // Remoção antes da notificação: o callback não roda.
+    let removed = register(callback, counters, software, handle);
+    let third = guest::read64(handle);
+    let _ = call_export("CmUnregisterMachineHiveLoadedNotification", &[third]);
+    work_items::run_queue();
+    assert(removed == Some(0) && guest::read64(counters) == 1 && call_export("CmUnregisterMachineHiveLoadedNotification", &[0]).is_some(), "cm-machine-hive: registro removido antes do work item nao e chamado; handle nulo e aceito");
+}
+
+fn io_mini_completion_exports(assert: Assert) {
+    let attributes = guest::alloc_bytes(nt::ObjectAttributes::SIZE);
+    guest::write_bytes(attributes, &[0; nt::ObjectAttributes::SIZE as usize]);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.attributes.set(0x200);
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (handle_out, object_out, removed, timeout, information) = (block, block + 8, block + 0x10, block + 0x18, block + 0x40);
+    let created = call_export("ZwCreateIoCompletion", &[handle_out, 0x001F_0003, attributes, 0]);
+    let handle = guest::read64(handle_out);
+    let referenced = call_export("ObReferenceObjectByHandle", &[handle, 0x001F_0003, 0, 0, object_out, 0]);
+    let port = guest::read64(object_out);
+    let remove = || {
+        guest::write_bytes(information, &[0; 0x20]);
+        guest::write64(removed, 0);
+        let status = call_export("ZwRemoveIoCompletionEx", &[handle, information, 1, removed, timeout, 0]);
+        (status, guest::read64(removed), guest::read64(information), guest::read64(information + 8), guest::read32(information + 0x10), guest::read64(information + 0x18))
+    };
+    assert(created == Some(0) && referenced == Some(0) && port != 0, "io-mini-completion: porta de conclusao de kernel referenciada");
+    assert(call_export("IoSetIoCompletion", &[port, 7, 8, 0, 9, 0]) == Some(0) && remove() == (Some(0), 1, 7, 8, 0, 9), "io-mini-completion: IoSetIoCompletion publica o pacote (chave, contexto, status e informacao)");
+    // Pacote de usuário com rotina de retirada: *Context = Packet.
+    let packet = guest::alloc_bytes(nt::IoMiniCompletionPacketUser::SIZE);
+    guest::write_bytes(packet, &[0xCC; 0x50]);
+    let callback = native_stub(&[0x48, 0x89, 0x0A, 0xC3]);
+    let context = guest::alloc_bytes(8);
+    guest::write64(context, 0);
+    let _ = call_export("IoInitializeMiniCompletionPacket", &[packet, callback, context]);
+    let body = at::<nt::IoMiniCompletionPacketUser>(packet);
+    assert(body.packet_type.get() == 4 && body.mini_packet_callback.get() == callback && body.context.get() == context && body.allocated.get() == 0, "io-mini-completion: IoInitializeMiniCompletionPacket monta o pacote de usuario (tipo 4, rotina, contexto, Allocated FALSE)");
+    let posted = call_export("IoSetIoCompletionEx", &[port, 1, 2, 0, 3, 0, packet]);
+    assert(posted == Some(0) && remove() == (Some(0), 1, 1, 2, 0, 3) && guest::read64(context) == packet, "io-mini-completion: a retirada entrega o pacote a rotina dele");
+    // Pacote alocado pelo Io: Allocated = TRUE; a rotina recebe a posse e o
+    // IoFreeMiniCompletionPacket o devolve ao pool.
+    guest::write64(context, 0);
+    let allocated = call_export("IoAllocateMiniCompletionPacket", &[callback, context]).unwrap_or(0);
+    let owned = at::<nt::IoMiniCompletionPacketUser>(allocated);
+    let pooled = crate::ntos::mm::kernel_pool::info(allocated).is_some_and(|allocation| !allocation.paged && allocation.bytes >= 0x50);
+    assert(allocated != 0 && pooled && owned.packet_type.get() == 4 && owned.mini_packet_callback.get() == callback && owned.context.get() == context && owned.allocated.get() == 1, "io-mini-completion: IoAllocateMiniCompletionPacket aloca o pacote de usuario no pool nao paginado com Allocated TRUE");
+    let posted = call_export("IoSetIoCompletionEx", &[port, 4, 5, 0, 6, 0, allocated]);
+    assert(posted == Some(0) && remove() == (Some(0), 1, 4, 5, 0, 6) && guest::read64(context) == allocated && crate::ntos::mm::kernel_pool::info(allocated).is_some(), "io-mini-completion: a rotina recebe o pacote alocado, que continua no pool");
+    let _ = call_export("IoFreeMiniCompletionPacket", &[allocated]);
+    assert(crate::ntos::mm::kernel_pool::info(allocated).is_none(), "io-mini-completion: IoFreeMiniCompletionPacket devolve o pacote ao pool");
+    let _ = call_export("ObfDereferenceObject", &[port]);
+    let _ = call_export("ZwClose", &[handle]);
+}
+
+/// Bytes de uma string hexadecimal (vetores gerados pelo conversor real).
+fn hex_bytes(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap_or(0)).collect()
+}
+
+fn se_sddl_exports(assert: Assert) {
+    // Vetores do ConvertStringSecurityDescriptorToSecurityDescriptorW desta
+    // máquina (o mesmo conversor LocalConvertStringSDToSD_Rev1 do kernel).
+    let cases: [(&str, &str); 3] = [
+        (
+            "D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GR;;;WD)(A;;GRGW;;;S-1-15-3-1024-1221526253-3924910130-1751405008-69508222-1499930412-38408379-3528704847-309525946)",
+            "01000490000000000000000000000000140000000200800004000000000014000000001001010000000000051200000000001800000000e001020000000000052000000020020000000014000000008001010000000000010000000000003800000000c0010a00000000000f0300000000040000ed02cf483260f1e9d05164687e9c24042c1f6759bb104a024fc353d2bafd7212",
+        ),
+        (
+            "O:BAG:SYD:AI(A;OICI;FA;;;WD)(D;;0x10000;;;AN)S:(AU;SAFA;RCSD;;;WD)",
+            "010014846000000070000000140000003000000002001c000100000002c0140000000300010100000000000100000000020030000200000000031400ff011f00010100000000000100000000010014000000010001010000000000050700000001020000000000052000000020020000010100000000000512000000",
+        ),
+        ("D:NO_ACCESS_CONTROL", "0100048000000000000000000000000000000000"),
+    ];
+    let output = guest::alloc_bytes(16);
+    for (text, expected) in cases {
+        let string = guest::alloc_bytes(text.len() as u64 * 2 + 2);
+        guest::write_bytes(string, &text.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        guest::write64(output, 0);
+        guest::write32(output + 8, 0);
+        let status = call_export("SeConvertStringSecurityDescriptorToSecurityDescriptor", &[string, 1, output, output + 8]);
+        let descriptor = guest::read64(output);
+        let size = guest::read32(output + 8);
+        let expected = hex_bytes(expected);
+        assert(status == Some(0) && descriptor != 0 && size as usize == expected.len() && guest::read_bytes(descriptor, expected.len()) == expected, &alloc::format!("se-sddl: {text} igual ao conversor real"));
+        if descriptor != 0 {
+            let _ = call_export("ExFreePool", &[descriptor]);
+        }
+        guest::free_bytes(string);
+    }
+    // Erros (códigos Win32 do conversor real, como 0xC007xxxx).
+    let convert = |text: &str, revision: u64| {
+        let string = guest::alloc_bytes(text.len() as u64 * 2 + 2);
+        guest::write_bytes(string, &text.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        let status = call_export("SeConvertStringSecurityDescriptorToSecurityDescriptor", &[string, revision, output, 0]).map(|status| status as u32);
+        guest::free_bytes(string);
+        status
+    };
+    assert(convert("D:(A;;GA;;;SY)", 2) == Some(0xC007_0519) && call_export("SeConvertStringSecurityDescriptorToSecurityDescriptor", &[0, 1, output, 0]).map(|status| status as u32) == Some(0xC007_0057), "se-sddl: revisao desconhecida e string nula");
+    assert(convert("D:(A;;QQ;;;SY)", 1) == Some(0xC007_0538) && convert("D:(A;;GA;;;SY", 1) == Some(0xC007_0538) && convert("D:(A;ZZ;GA;;;SY)", 1) == Some(0xC007_03EC) && convert("D:Q(A;;GA;;;SY)", 1) == Some(0xC007_070C), "se-sddl: direitos, fechamento, flags de ACE e flags de ACL invalidos");
+    assert(convert("D:(A;;GA;;;S-1-5-x)", 1) == Some(0xC007_0539) && convert("O:ZZ", 1) == Some(0xC007_0539) && convert("X:(A;;GA;;;SY)", 1) == Some(0xC007_0057) && convert("O:SYO:BA", 1) == Some(0xC007_0057) && convert("D:(A;;GA;;;SY;x)", 1) == Some(0xC007_0057), "se-sddl: SID invalido, componente desconhecido ou repetido e campos a mais");
+}
+
+fn rtl_capability_sids_exports(assert: Assert) {
+    use crate::ntos::se::model;
+    // internetClient: S-1-15-3-1 (nome legado); o de grupo é S-1-5-32-<SHA-256 do nome em maiúsculas>.
+    let name = unicode_string_for("internetClient");
+    let group = guest::alloc_bytes(0x40);
+    let capability = guest::alloc_bytes(0x40);
+    let derived = call_export("RtlDeriveCapabilitySidsFromName", &[name, group, capability]);
+    let upper: Vec<u8> = "INTERNETCLIENT".encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    let group_bytes = guest::read_bytes(group, 44);
+    assert(derived == Some(0) && guest::read_bytes(capability, 16) == model::sid(15, &[3, 1]), "rtl-capability-sids: S-1-15-3-1 para internetClient");
+    assert(group_bytes[1] == 9 && group_bytes[7] == 5 && group_bytes[8..12] == 32u32.to_le_bytes() && group_bytes[12..44] == crate::ntos::rtl::sha256::hash_bytes(&upper)[..], "rtl-capability-sids: SID de grupo S-1-5-32 pelo SHA-256 do nome em maiusculas");
+}
+
+fn mm_advance_mdl_exports(assert: Assert) {
+    // Vetores do modelo do MmAdvanceMdl do original (conferido no desmonte).
+    let mdl = guest::alloc_bytes(nt::Mdl::SIZE + 4 * 8);
+    let descriptor = at::<nt::Mdl>(mdl);
+    let reset = |mapped_va: u64| {
+        guest::write_bytes(mdl, &[0; 0x50]);
+        descriptor.start_va.set(0x7FF6_0000_0000);
+        descriptor.byte_offset.set(0x100);
+        descriptor.byte_count.set(0x2500);
+        descriptor.mdl_flags.set(1);
+        descriptor.mapped_system_va.set(mapped_va);
+        for (index, pfn) in [0x111u64, 0x222, 0x333, 0].iter().enumerate() {
+            guest::write64(mdl + nt::Mdl::SIZE + index as u64 * 8, *pfn);
+        }
+    };
+    let pfns = || (0..4).map(|index| guest::read64(mdl + nt::Mdl::SIZE + index * 8)).collect::<Vec<u64>>();
+    let state = || (descriptor.start_va.get(), descriptor.byte_offset.get(), descriptor.byte_count.get(), descriptor.mdl_flags.get() as u16, descriptor.mapped_system_va.get());
+    let advance = |bytes: u64| call_export("MmAdvanceMdl", &[mdl, bytes]).map(|status| status as u32);
+    reset(0xFFFF_C000_C010_0100);
+    assert(advance(0x1000) == Some(0) && state() == (0x7FF6_0000_1000, 0x100, 0x1500, 0x201, 0xFFFF_C000_C010_1100) && pfns() == [0x222, 0x333, 0x8000_0000_0000_0111, 0], "mm-advance-mdl: cruzar uma pagina gira o PFN para o fim, marcado, e liga MDL_FREE_EXTRA_PTES");
+    assert(advance(0x1000) == Some(0) && state() == (0x7FF6_0000_2000, 0x100, 0x500, 0x201, 0xFFFF_C000_C010_2100) && pfns() == [0x333, 0x111, 0x8000_0000_0000_0222, 0], "mm-advance-mdl: num MDL avancado as extras tambem giram");
+    assert(advance(0x500) == Some(0xC000_00F0) && state().2 == 0x500, "mm-advance-mdl: NumberOfBytes >= ByteCount = STATUS_INVALID_PARAMETER_2");
+    reset(0x5000_0100);
+    assert(advance(0x80) == Some(0) && state() == (0x7FF6_0000_0000, 0x180, 0x2480, 0x1, 0x5000_0180) && pfns() == [0x111, 0x222, 0x333, 0], "mm-advance-mdl: dentro da primeira pagina so o deslocamento anda");
+}
+
+fn nt_kernel_services_exports(assert: Assert) {
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ob::object_manager;
+    // NtFreeVirtualMemory em KernelMode, no processo corrente.
+    let block = guest::alloc_bytes(0x400);
+    guest::write_bytes(block, &[0; 0x400]);
+    let (base, size) = (block, block + 8);
+    guest::write64(size, 0x2000);
+    let allocated = call_export("ZwAllocateVirtualMemory", &[u64::MAX, base, 0, size, 0x3000, 4]);
+    let address = guest::read64(base);
+    guest::write64(size, 0);
+    let released = call_export("NtFreeVirtualMemory", &[u64::MAX, base, size, 0x8000]);
+    let again = call_export("NtFreeVirtualMemory", &[u64::MAX, base, size, 0x8000]);
+    assert(allocated == Some(0) && address != 0 && released == Some(0) && guest::read64(size) == 0x2000 && again.is_some_and(|status| status as u32 & 0x8000_0000 != 0), "nt-services: NtFreeVirtualMemory em KernelMode libera a regiao (e recusa a segunda vez)");
+    // NtDuplicateObject em KernelMode.
+    let output = block + 0x300;
+    let event = block + 0x380;
+    dispatcher::initialize_event(event, 0, false);
+    let _ = object_manager::create_object("\\KernelObjects", "OpenNTNtDupEvent", "Event", Some(object_manager::ObjectData::pointer(event)));
+    let attributes = object_attributes_for(block + 0x100, "\\KernelObjects\\OpenNTNtDupEvent", 0x200);
+    let opened = call_export("ZwOpenEvent", &[output, 0x1F0003, attributes]);
+    let source = guest::read64(output);
+    let duplicated = call_export("NtDuplicateObject", &[u64::MAX, source, u64::MAX, output, 0, 0x200, 2]);
+    let copy = guest::read64(output);
+    let timeout = block + 0x3F0;
+    guest::write64(timeout, 0);
+    dispatcher::set_event(event);
+    assert(opened == Some(0) && duplicated == Some(0) && copy != 0 && copy != source && call_export("ZwWaitForSingleObject", &[copy, 0, timeout]) == Some(0), "nt-services: NtDuplicateObject em KernelMode copia o handle para o mesmo evento");
+    assert(call_export("NtDuplicateObject", &[u64::MAX, source, u64::MAX, output, 0, 0, 8]).map(|status| status as u32) == Some(0xC000_000D), "nt-services: NtDuplicateObject recusa opcao invalida");
+    let _ = call_export("ZwClose", &[copy]);
+    let _ = call_export("ZwClose", &[source]);
+}
+
+fn bgk_console_exports(assert: Assert) {
+    let state = guest::alloc_bytes(0x20);
+    guest::write_bytes(state, &[0x77; 0x20]);
+    let unsuccessful = Some(0xFFFF_FFFF_C000_0001);
+    assert(
+        !crate::ntos::bgk::console::enabled() && call_export("BgkDisplayCharacter", &[b'A' as u64, 0, 0, 7, 0]) == unsuccessful && call_export("BgkGetConsoleState", &[state]) == unsuccessful && call_export("BgkSetCursor", &[1, 2, 1]) == unsuccessful && guest::read_bytes(state, 0x20) == [0x77; 0x20],
+        "bgk-console: sem console grafico de boot os tres exports devolvem STATUS_UNSUCCESSFUL",
+    );
+}
+
+
 pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
@@ -11402,6 +11932,24 @@ pub fn run(assert: Assert) {
     whea_error_source_exports(assert);
     zw_event_exports(assert);
     ex_wnf_subscription_exports(assert);
+    ex_push_lock_convert_exports(assert);
+    ex_extension_host_exports(assert);
+    ex_timer_resolution_exports(assert);
+    rtl_security_error_exports(assert);
+    rtl_crt_vsnprintf_s_exports(assert);
+    ps_silo_identifier_exports(assert);
+    ps_process_notify_ex2_exports(assert);
+    ps_container_id_exports(assert);
+    se_logon_session_exports(assert);
+    se_non_ob_audit_exports(assert);
+    se_srp_access_check_exports(assert);
+    cm_machine_hive_notify_exports(assert);
+    io_mini_completion_exports(assert);
+    mm_advance_mdl_exports(assert);
+    nt_kernel_services_exports(assert);
+    bgk_console_exports(assert);
+    rtl_capability_sids_exports(assert);
+    se_sddl_exports(assert);
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);

@@ -2186,3 +2186,49 @@ pub mod rtl_debug_print_va {
 
     pub static GROUP: Group = Group { name: "rtl-debug-print-va", names: &["vDbgPrintEx"], handlers: &[v_dbg_print_ex], data_exports: &[] };
 }
+
+pub mod rtl_security_error {
+    //! RtlMapSecurityErrorToNtStatus; a tabela mora em `rtl/error`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::error;
+    use crate::rtl::KernelError;
+
+    /// RtlMapSecurityErrorToNtStatus(SECURITY_STATUS) -> NTSTATUS.
+    fn map_security_error_to_status(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(error::map_security_error_to_status(call.arg(1) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-security-error", names: &["RtlMapSecurityErrorToNtStatus"], handlers: &[map_security_error_to_status], data_exports: &[] };
+}
+
+pub mod rtl_crt_vsnprintf_s {
+    //! _vsnprintf_s; a lógica mora em `rtl/printf`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::printf;
+    use crate::rtl::KernelError;
+
+    /// _vsnprintf_s(Buffer, SizeOfBuffer, Count, Format, ArgList) -> int.
+    fn vsnprintf_s(call: &Call) -> Result<u64, KernelError> {
+        printf::vsnprintf_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-crt-vsnprintf-s", names: &["_vsnprintf_s"], handlers: &[vsnprintf_s], data_exports: &[] };
+}
+
+pub mod rtl_capability_sids {
+    //! RtlDeriveCapabilitySidsFromName; a lógica mora em
+    //! `se/capability/identifiers` (a mesma derivação do RtlCapabilityCheck).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::capability::identifiers;
+    use crate::rtl::KernelError;
+
+    /// RtlDeriveCapabilitySidsFromName(CapabilityName, CapabilityGroupSid, CapabilitySid).
+    fn derive_capability_sids_from_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(identifiers::derive(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-capability-sids", names: &["RtlDeriveCapabilitySidsFromName"], handlers: &[derive_capability_sids_from_name], data_exports: &[] };
+}

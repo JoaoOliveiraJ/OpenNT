@@ -3,10 +3,11 @@
 //! 0x956c28 (ntoskrnl 19041).
 //!
 //! No Windows 10 a implementação dos conjuntos de contadores não mora no
-//! ntoskrnl: ela é o pcw.sys, que se registra no host de extensão
-//! ExpPcwExtensionHost (criado no ExpInitSystemPhase1 por ExRegisterHost com
-//! ExtensionId 1, ExtensionVersion 1, FunctionCount 5 e a notificação
-//! ExpPcwHostCallback). Cada export Pcw* é só um despachante:
+//! ntoskrnl: ela é o pcw.sys (driver de boot, grupo "System Reserved"), que
+//! se registra no host de extensão ExpPcwExtensionHost — criado no
+//! ExpInitSystemPhase1 por ExRegisterHost com ExtensionId 1, ExtensionVersion
+//! 1, FunctionCount 5, PagedPool, sem tabela do host e com a notificação
+//! ExpPcwHostCallback. Cada export Pcw* é só um despachante:
 //!     table = ExGetExtensionTable(ExpPcwExtensionHost)
 //!     table != NULL -> table[i](...) e ExReleaseExtensionTable
 //!     table == NULL -> ExpPcwDisabledStatus()
@@ -14,9 +15,11 @@
 //! 4 AddInstance. Sem extensão, PcwRegister/PcwCreateInstance zeram o handle
 //! de saída e PcwUnregister/PcwCloseInstance não fazem nada.
 //!
-//! O OpenNT não carrega pcw.sys nem tem hosts de extensão, então este assunto
-//! é exatamente o ramo "sem extensão" do Windows; reimplementar os conjuntos
-//! de contadores aqui seria reescrever o pcw.sys.
+//! O OpenNT registra o host e despacha para o pcw.sys real quando ele está
+//! carregado; reimplementar os conjuntos de contadores aqui seria reescrever
+//! o pcw.sys. Diferença: o ExpPcwHostCallback, que ao chegar a extensão
+//! registra os conjuntos de contadores do próprio kernel (sincronização,
+//! processador, ...), não existe ainda; o host fica sem notificação.
 //!
 //! ExpPcwDisabledStatus calcula uma vez ExpPcwEnableState a partir de
 //! HKLM\...\Services\pcw\Start (RtlQueryRegistryValues RTL_REGISTRY_SERVICES,
@@ -28,10 +31,14 @@
 //!                   devolvem STATUS_NOT_IMPLEMENTED.
 //! Um erro da consulta (tipo errado) volta sem gravar o estado.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::hal::amd64::native_call;
 use crate::ntos::cm::registry;
+use crate::ntos::ex::extension_host::{self, HostParameters};
 use crate::ntos::inc::types::Field;
+use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
@@ -72,20 +79,64 @@ pub fn disabled_status() -> u32 {
     if state == 1 { 0 } else { STATUS_NOT_IMPLEMENTED }
 }
 
-/// PcwRegister(Registration*, Info): sem tabela de extensão, *Registration
-/// = NULL e o status de ExpPcwDisabledStatus.
-pub fn register(registration: &Field<u64>, _info: u64) -> u32 {
+/// ExpPcwExtensionHost.
+static HOST: AtomicU64 = AtomicU64::new(0);
+
+const PCW_HOST: HostParameters = HostParameters { extension_id: 1, extension_version: 1, function_count: 5, pool_type: 1, host_table: 0, notification_routine: 0, notification_context: 0 };
+
+/// Posições da tabela de funções do pcw.sys.
+const REGISTER: u64 = 0;
+const UNREGISTER: u64 = 1;
+const ADD_INSTANCE: u64 = 4;
+
+/// O ExRegisterHost do ExpInitSystemPhase1; uma falha deixa o host nulo.
+pub fn initialize() -> Result<(), KernelError> {
+    HOST.store(extension_host::register_host(&PCW_HOST)?.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+/// O host do PCW (0 sem registro).
+pub fn host() -> u64 {
+    HOST.load(Ordering::Acquire)
+}
+
+/// A rotina `index` da extensão (o pcw.sys), chamada sob o rundown do host;
+/// `None` sem extensão.
+fn with_extension<T>(index: u64, body: impl FnOnce(u64) -> T) -> Option<T> {
+    let host = host();
+    let table = extension_host::get_extension_table(host).unwrap_or(0);
+    if table == 0 {
+        return None;
+    }
+    let result = body(guest::read64(table + index * 8));
+    let _ = extension_host::release_extension_table(host);
+    Some(result)
+}
+
+/// O pcw.sys registrou a extensão.
+pub fn extension_registered() -> bool {
+    with_extension(REGISTER, |_| ()).is_some()
+}
+
+/// PcwRegister(Registration*, Info): pelo pcw.sys; sem extensão,
+/// *Registration = NULL e o status de ExpPcwDisabledStatus.
+pub fn register(registration: &Field<u64>, info: u64) -> u32 {
+    if let Some(status) = with_extension(REGISTER, |routine| native_call::call(routine, &[registration.address(), info]) as u32) {
+        return status;
+    }
     registration.set(0);
     disabled_status()
 }
 
-/// PcwUnregister(Registration): sem tabela de extensão, nada a desfazer.
-pub fn unregister(_registration: u64) {}
+/// PcwUnregister(Registration): pelo pcw.sys; sem extensão, nada a desfazer.
+pub fn unregister(registration: u64) {
+    with_extension(UNREGISTER, |routine| native_call::call(routine, &[registration]));
+}
 
-/// PcwAddInstance(Buffer, Name, Id, Count, Data): sem tabela de extensão, o
-/// status de ExpPcwDisabledStatus (os argumentos não são lidos).
-pub fn add_instance(_buffer: u64, _name: u64, _id: u32, _count: u32, _data: u64) -> u32 {
-    disabled_status()
+/// PcwAddInstance(Buffer, Name, Id, Count, Data): pelo pcw.sys; sem
+/// extensão, o status de ExpPcwDisabledStatus (os argumentos não são lidos).
+pub fn add_instance(buffer: u64, name: u64, id: u32, count: u32, data: u64) -> u32 {
+    with_extension(ADD_INSTANCE, |routine| native_call::call(routine, &[buffer, name, id as u64, count as u64, data]) as u32).unwrap_or_else(disabled_status)
 }
 
 /// Esquece o estado calculado (o teste de fase 6 reconsulta o Registro).

@@ -661,6 +661,18 @@ pub fn access_check_ex(subject: u64, request: u64, reply: u64, audit_info: u64, 
     allowed
 }
 
+/// SeSrpAccessCheck(Subject, SubjectLocked, AccessRequest, AccessReply,
+/// AuditInfo, AccessMode) (ntoskrnl 19041 rva 0x595e80): o mesmo
+/// SepCommonAccessCheckEx do SeAccessCheckEx com o sétimo argumento ligado,
+/// que só muda a avaliação das ACEs de callback com expressão condicional
+/// (ACCESS_*_CALLBACK_ACE, avaliadas pelo AuthzBasepEvaluateAceCondition
+/// abaixo de DISPATCH_LEVEL). O avaliador do OpenNT ainda não interpreta
+/// expressões condicionais e ignora essas ACEs nos dois caminhos, então o
+/// resultado é o do SeAccessCheckEx.
+pub fn srp_access_check(subject: u64, request: u64, reply: u64, audit_info: u64, mode: u32) -> bool {
+    access_check_ex(subject, request, reply, audit_info, mode)
+}
+
 /// SeGetTrustLabelAce: primeira SYSTEM_PROCESS_TRUST_LABEL_ACE efetiva da
 /// SACL (endereço da ACE; o layout é o KNOWN_ACE de AccessAllowedAce). As
 /// ACEs podem ficar desalinhadas, então são lidas pelo offset do layout.

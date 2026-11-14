@@ -1556,14 +1556,34 @@ fn change_suspend(handle: u64, out: u64, delta: i32) -> u32 {
     if out != 0 && guest::try_write::<u32>(out, previous).is_err() {
         return 0xC000_0005;
     }
-    let (pointer, registered, suspended, waiting) = thread.with(|thread| {
+    adjust_suspend_count(&thread, delta);
+    0
+}
+
+/// Soma `delta` à contagem de suspensão (o par KeSuspendThread/
+/// KeResumeThread) e devolve a anterior: a thread que deixa de estar
+/// suspensa volta à fila de prontas; a que passa a estar sai dela.
+fn adjust_suspend_count(thread: &UserThread, delta: i32) -> u32 {
+    let (previous, pointer, registered, suspended, waiting) = thread.with(|thread| {
+        let previous = thread.suspend_count;
         thread.suspend_count = (previous as i32 + delta).max(0) as u32;
-        (thread.thread_pointer, thread.scheduling_registered, thread.suspend_count != 0, thread.waiting)
+        (previous, thread.thread_pointer, thread.scheduling_registered, thread.suspend_count != 0, thread.waiting)
     });
     if registered && thread_dispatch::thread_state(pointer) != thread_dispatch::state::RUNNING {
         let _ = if suspended || waiting { thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING) } else { thread_dispatch::make_ready(pointer) };
     }
-    0
+    previous
+}
+
+/// KeResumeThread(Thread): uma retomada na thread de usuário (a contagem de
+/// suspensão desce uma unidade, se não for zero); devolve a contagem
+/// anterior. Threads de sistema não têm contagem e devolvem 0.
+pub fn resume_thread(pointer: u64) -> u32 {
+    let Some(thread) = find_by_pointer(pointer) else { return 0 };
+    if thread.with(|thread| thread.suspend_count) == 0 {
+        return 0;
+    }
+    adjust_suspend_count(&thread, -1)
 }
 
 fn nt_suspend_thread(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {

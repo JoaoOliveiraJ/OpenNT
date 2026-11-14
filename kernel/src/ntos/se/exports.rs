@@ -294,8 +294,10 @@ pub mod se_descriptor {
         Ok(descriptor::valid_relative(call.arg(2), call.arg(1) as u32, 0) as u64)
     }
 
-    fn convert_string(_: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(descriptor::convert_string_to_descriptor()))
+    /// SeConvertStringSecurityDescriptorToSecurityDescriptor(String,
+    /// StringSDRevision, SecurityDescriptor*, SecurityDescriptorSize*).
+    fn convert_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(crate::ntos::se::sddl::convert_string_to_descriptor(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4))))
     }
 
     pub static GROUP: Group = Group {
@@ -835,4 +837,56 @@ pub mod se_privilege_audit {
     }
 
     pub static GROUP: Group = Group { name: "se-privilege-audit", names: &["SePrivilegeObjectAuditAlarm"], handlers: &[privilege_object_audit_alarm], data_exports: &[] };
+}
+
+pub mod se_logon_session {
+    //! SeSetSessionIdTokenWithLinked; a lógica mora em `se/logon_session`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::logon_session;
+    use crate::rtl::KernelError;
+
+    /// SeSetSessionIdTokenWithLinked(TokenHandle, SessionId).
+    fn set_session_id_token_with_linked(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logon_session::set_session_id_token_with_linked(call.arg(1), call.arg(2) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "se-logon-session", names: &["SeSetSessionIdTokenWithLinked"], handlers: &[set_session_id_token_with_linked], data_exports: &[] };
+}
+
+pub mod se_non_ob_audit {
+    //! SeOpenObjectAuditAlarmForNonObObject; a lógica mora em `se/audit`.
+
+    use crate::ntos::inc::types::{NtStruct, SecuritySubjectContext};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::audit;
+    use crate::rtl::KernelError;
+
+    /// SeOpenObjectAuditAlarmForNonObObject(SubsystemName, HandleId,
+    /// ObjectTypeName, ObjectName, Sd, SubjectContext, DesiredAccess,
+    /// GrantedAccess, Privileges, AccessGranted, *GenerateOnClose).
+    fn open_object_audit_alarm_for_non_ob_object(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o SECURITY_SUBJECT_CONTEXT capturado pelo chamador de modo kernel.
+        let subject = unsafe { SecuritySubjectContext::at(call.arg(6)) };
+        audit::open_object_audit_alarm_for_non_ob_object(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), subject, call.arg(7) as u32, call.arg(8) as u32, call.arg(9), call.arg(10) as u8 != 0, call.arg(11));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "se-non-ob-audit", names: &["SeOpenObjectAuditAlarmForNonObObject"], handlers: &[open_object_audit_alarm_for_non_ob_object], data_exports: &[] };
+}
+
+pub mod se_srp_access_check {
+    //! SeSrpAccessCheck; a lógica mora em `se/access_check`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::access_check;
+    use crate::rtl::KernelError;
+
+    /// SeSrpAccessCheck(Subject, SubjectLocked, AccessRequest, AccessReply,
+    /// AuditInfo, AccessMode) -> BOOLEAN.
+    fn srp_access_check(call: &Call) -> Result<u64, KernelError> {
+        Ok(access_check::srp_access_check(call.arg(1), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u8 as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "se-srp-access-check", names: &["SeSrpAccessCheck"], handlers: &[srp_access_check], data_exports: &[] };
 }

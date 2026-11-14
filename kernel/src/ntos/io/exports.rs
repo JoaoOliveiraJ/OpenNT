@@ -1888,6 +1888,50 @@ pub mod zw_cancel_io {
     pub static GROUP: Group = Group { name: "zw-cancel-io", names: &["ZwCancelIoFile"], handlers: &[cancel_io_file], data_exports: &[] };
 }
 
+pub mod io_mini_completion {
+    //! IoInitializeMiniCompletionPacket, IoAllocateMiniCompletionPacket,
+    //! IoFreeMiniCompletionPacket e IoSetIoCompletion; a lógica mora em
+    //! `io/transfer` (os pacotes) e `io/completion/set` (a publicação).
+
+    use crate::ntos::inc::types::{IoMiniCompletionPacketUser, NtStruct};
+    use crate::ntos::init::exports::{fatal_unless_transfer, signed_status, Call, Group};
+    use crate::ntos::io::completion::set as set_completion;
+    use crate::ntos::io::transfer::completion_packets;
+    use crate::rtl::KernelError;
+
+    /// IoInitializeMiniCompletionPacket(Packet, Callback, Context).
+    fn initialize_mini_completion_packet(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o IO_MINI_COMPLETION_PACKET_USER do chamador de modo kernel.
+        completion_packets::initialize_mini(unsafe { IoMiniCompletionPacketUser::at(call.arg(1)) }, call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    /// IoSetIoCompletion(IoCompletion, KeyContext, ApcContext, IoStatus,
+    /// IoStatusInformation, Quota): o IoSetIoCompletionEx sem pacote do
+    /// chamador.
+    fn set_io_completion(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fatal_unless_transfer("io-mini-completion", set_completion::post(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6), 0))?))
+    }
+
+    /// IoAllocateMiniCompletionPacket(Callback, Context) -> PIO_MINI_COMPLETION_PACKET_USER.
+    fn allocate_mini_completion_packet(call: &Call) -> Result<u64, KernelError> {
+        Ok(completion_packets::allocate_mini(call.arg(1), call.arg(2)))
+    }
+
+    /// IoFreeMiniCompletionPacket(Packet).
+    fn free_mini_completion_packet(call: &Call) -> Result<u64, KernelError> {
+        completion_packets::free_mini(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-mini-completion",
+        names: &["IoInitializeMiniCompletionPacket", "IoSetIoCompletion", "IoAllocateMiniCompletionPacket", "IoFreeMiniCompletionPacket"],
+        handlers: &[initialize_mini_completion_packet, set_io_completion, allocate_mini_completion_packet, free_mini_completion_packet],
+        data_exports: &[],
+    };
+}
+
 pub mod io_device_eject {
     //! IoRequestDeviceEject e IoRequestDeviceEjectEx; a lógica mora em
     //! `io/device_removal.rs`.

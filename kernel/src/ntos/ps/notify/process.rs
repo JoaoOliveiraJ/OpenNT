@@ -1,8 +1,14 @@
-//! PsSetCreateProcessNotifyRoutine(Ex).
+//! PsSetCreateProcessNotifyRoutine, PsSetCreateProcessNotifyRoutineEx e
+//! PsSetCreateProcessNotifyRoutineEx2.
 //!
 //! Os registros compartilham a tabela nativa de 64 slots. Um slot removido
 //! não recebe nova notificação; seu bloco vive até que toda invocação que o
-//! segura retorne.
+//! segura retorne. Como no PspSetCreateProcessNotifyRoutine do NT, cada
+//! registro guarda as flags (o contexto do bloco): 0 para a rotina simples,
+//! 2 (Ex) para a estendida e 6 (Ex | Ex2) para a de subsistemas; a remoção
+//! casa a rotina e as flags. A Ex2 também recebe os processos de outros
+//! subsistemas (pico), que o OpenNT não cria: para os processos Win32 ela
+//! é chamada como a Ex.
 
 use alloc::vec::Vec;
 
@@ -18,11 +24,19 @@ use super::CallbackBlock;
 
 const POOL_TAG: u32 = 0x6272_6243; // 'Cbrb'
 
+/// Flags do registro (PspSetCreateProcessNotifyRoutine): rotina estendida
+/// (PS_CREATE_NOTIFY_INFO) e de subsistemas (Ex2).
+pub const NOTIFY_EXTENDED: u32 = 2;
+pub const NOTIFY_SUBSYSTEMS: u32 = 4;
+/// PsCreateProcessNotifySubsystems, o único PSCREATEPROCESSNOTIFYTYPE.
+const NOTIFY_TYPE_SUBSYSTEMS: u32 = 0;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
 #[derive(Clone, Copy)]
 struct Registration {
     pointer: u64,
     callback: u64,
-    extended: bool,
+    flags: u32,
     active: u32,
     removed: bool,
     freed: bool,
@@ -43,10 +57,10 @@ fn passive() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Ex exige IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80) na imagem.
-fn verified(callback: u64, extended: bool) -> bool {
+/// Ex/Ex2 exigem IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80) na imagem.
+fn verified(callback: u64, flags: u32) -> bool {
     let Some(image) = loaded_images::find(callback) else { return false };
-    if !extended {
+    if flags & NOTIFY_EXTENDED == 0 {
         return true;
     }
     // SAFETY: cabeçalhos PE da imagem carregada que contém a rotina.
@@ -57,9 +71,9 @@ fn verified(callback: u64, extended: bool) -> bool {
     characteristics.get() & 0x80 != 0
 }
 
-fn register(callback: u64, extended: bool) -> Result<u32, KernelError> {
+fn register(callback: u64, flags: u32) -> Result<u32, KernelError> {
     passive()?;
-    if !verified(callback, extended) {
+    if !verified(callback, flags) {
         return Ok(0xC000_0022);
     }
     let pointer = kernel_pool::allocate(CallbackBlock::SIZE, kernel_pool::AllocateOptions { tag: POOL_TAG, zero: true, ..Default::default() })?;
@@ -76,8 +90,8 @@ fn register(callback: u64, extended: bool) -> Result<u32, KernelError> {
     // slot e é removido separadamente.
     let block = CallbackBlock::of(pointer);
     block.function.set(callback);
-    block.context.set(if extended { 2 } else { 0 });
-    state.records.push(Registration { pointer, callback, extended, active: 0, removed: false, freed: false });
+    block.context.set(flags as u64);
+    state.records.push(Registration { pointer, callback, flags, active: 0, removed: false, freed: false });
     let record = state.records.len() - 1;
     state.slots[index] = Some(record);
     Ok(0)
@@ -115,7 +129,7 @@ impl RemoveRequest {
     }
 }
 
-pub fn begin_remove(callback: u64, extended: bool) -> Result<RemoveRequest, KernelError> {
+pub fn begin_remove(callback: u64, flags: u32) -> Result<RemoveRequest, KernelError> {
     passive()?;
     if executing(process::get_current_thread()) {
         return Err(KernelError::new("process notify removal inside a notification"));
@@ -124,7 +138,7 @@ pub fn begin_remove(callback: u64, extended: bool) -> Result<RemoveRequest, Kern
         let mut state = STATE.lock();
         let found = state.slots.iter().position(|slot| slot.is_some_and(|record| {
             let entry = &state.records[record];
-            entry.callback == callback && entry.extended == extended
+            entry.callback == callback && entry.flags == flags
         }));
         let Some(index) = found else { return Ok(RemoveRequest { record: None }) };
         let record = state.slots[index].take().unwrap();
@@ -135,8 +149,8 @@ pub fn begin_remove(callback: u64, extended: bool) -> Result<RemoveRequest, Kern
     Ok(RemoveRequest { record: Some(record) })
 }
 
-fn remove(callback: u64, extended: bool) -> Result<u32, KernelError> {
-    let mut request = begin_remove(callback, extended)?;
+fn remove(callback: u64, flags: u32) -> Result<u32, KernelError> {
+    let mut request = begin_remove(callback, flags)?;
     loop {
         if let Some(status) = request.poll()? {
             return Ok(status);
@@ -147,7 +161,21 @@ fn remove(callback: u64, extended: bool) -> Result<u32, KernelError> {
 
 /// PsSetCreateProcessNotifyRoutine(Ex).
 pub fn set(callback: u64, remove_flag: u8, extended: bool) -> Result<u32, KernelError> {
-    if remove_flag != 0 { remove(callback, extended) } else { register(callback, extended) }
+    set_with_flags(callback, remove_flag, if extended { NOTIFY_EXTENDED } else { 0 })
+}
+
+fn set_with_flags(callback: u64, remove_flag: u8, flags: u32) -> Result<u32, KernelError> {
+    if remove_flag != 0 { remove(callback, flags) } else { register(callback, flags) }
+}
+
+/// PsSetCreateProcessNotifyRoutineEx2(NotifyType, NotifyInformation,
+/// Remove): só PsCreateProcessNotifySubsystems (0); a rotina é registrada
+/// como Ex | Ex2.
+pub fn set_ex2(notify_type: u32, callback: u64, remove_flag: u8) -> Result<u32, KernelError> {
+    if notify_type != NOTIFY_TYPE_SUBSYSTEMS {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    set_with_flags(callback, remove_flag, NOTIFY_EXTENDED | NOTIFY_SUBSYSTEMS)
 }
 
 /// Dados do processo usados pela notificação.
@@ -222,7 +250,7 @@ pub fn notify(pointer: u64, pid: u64, record: &NotifyRecord, created: bool) -> R
     // Ex cobre processos executáveis; tarefas do kernel não têm imagem.
     let any = {
         let state = STATE.lock();
-        state.slots.iter().flatten().any(|&index| !state.records[index].extended || record.image.is_some())
+        state.slots.iter().flatten().any(|&index| state.records[index].flags & NOTIFY_EXTENDED == 0 || record.image.is_some())
     };
     if !any {
         return Ok(0);
@@ -242,14 +270,14 @@ pub fn notify(pointer: u64, pid: u64, record: &NotifyRecord, created: bool) -> R
                 let mut state = STATE.lock();
                 let Some(record_index) = state.slots[index] else { continue };
                 let entry = &mut state.records[record_index];
-                if entry.extended && record.image.is_none() {
+                if entry.flags & NOTIFY_EXTENDED != 0 && record.image.is_none() {
                     continue;
                 }
                 entry.active += 1;
                 (record_index, *entry)
             };
             let (record_index, registration) = entry;
-            let arguments = if registration.extended { [pointer, pid, info] } else { [record.parent_id, pid, created as u64] };
+            let arguments = if registration.flags & NOTIFY_EXTENDED != 0 { [pointer, pid, info] } else { [record.parent_id, pid, created as u64] };
             native_call::call(registration.callback, &arguments);
             STATE.lock().records[record_index].active -= 1;
             if let Err(error) = collect(record_index) {

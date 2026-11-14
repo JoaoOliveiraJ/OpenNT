@@ -40,3 +40,6 @@ pub mod exports;
 pub mod client_security;
 pub mod access_state;
 pub mod set_security;
+pub mod extension_hosts;
+pub mod logon_session;
+pub mod sddl;

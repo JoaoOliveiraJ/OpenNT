@@ -19,3 +19,5 @@ pub mod cross_handles;
 pub mod create_user_process;
 pub mod cross_memory;
 pub mod user_callback;
+
+pub mod process_queries;

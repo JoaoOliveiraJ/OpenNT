@@ -520,3 +520,21 @@ pub mod ob_wait {
 
     pub static GROUP: Group = Group { name: "ob-wait", names: &["ObWaitForSingleObject", "ObWaitForMultipleObjects"], handlers: &[wait_for_single_object, wait_for_multiple_objects], data_exports: &[] };
 }
+
+pub mod ob_nt_duplicate_object {
+    //! NtDuplicateObject como export do kernel; a lógica mora em
+    //! `ob/handles/duplicate` (e no serviço de usuário, em UserMode).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::handles::duplicate;
+    use crate::rtl::KernelError;
+
+    /// NtDuplicateObject(SourceProcessHandle, SourceHandle,
+    /// TargetProcessHandle, TargetHandle*, DesiredAccess, HandleAttributes,
+    /// Options).
+    fn nt_duplicate_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(duplicate::nt_duplicate_object(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32, call.frame)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-nt-duplicate-object", names: &["NtDuplicateObject"], handlers: &[nt_duplicate_object], data_exports: &[] };
+}
