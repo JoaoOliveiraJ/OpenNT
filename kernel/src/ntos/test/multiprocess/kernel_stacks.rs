@@ -8,6 +8,12 @@
 //!   do KiSystemCall64) devolve o próprio RSP: ele fica entre o StackLimit e o
 //!   InitialStack da thread que a fez, difere entre duas threads, e durante a
 //!   syscall KPRCB.RspBase e TSS.RSP0 são a InitialStack dela;
+//! - um tick do timer que chega no anel 3 entra pela TSS.RSP0, com o quadro
+//!   de interrupção no topo da pilha de kernel da thread, e encerra o
+//!   intervalo (tipo 2); a thread segue do CONTEXT salvo, como no despacho.
+//!   O teste espera, com as interrupções desligadas, o tick ficar pendente
+//!   no IRR do LAPIC antes da entrada, para que ele chegue sempre antes da
+//!   primeira instrução de usuário;
 //! - IoGetStackLimits chamado por uma thread de sistema nativa devolve a
 //!   faixa real da pilha dela, que contém o RSP do código nativo, e o
 //!   ceifador devolve a pilha;
@@ -18,12 +24,13 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::hal::amd64::usermode;
+use crate::hal::{cpu, lapic};
 use crate::nano::interrupts;
 use crate::ntos::ex::service_table;
 use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
 use crate::ntos::inc::types::{Context, Ethread, Kthread, NtStruct};
 use crate::ntos::init::exports;
-use crate::ntos::ke::{callout, pcr};
+use crate::ntos::ke::{callout, clock, pcr};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_stack::{self, KERNEL_LARGE_STACK_SIZE, KERNEL_STACK_GUARD, KERNEL_STACK_SIZE};
 use crate::ntos::mm::pe_loader::ResolvedImport;
@@ -69,6 +76,13 @@ fn kthread(pointer: u64) -> &'static Kthread {
 fn stack_fields(pointer: u64) -> (u64, u64, u64, u64) {
     let thread = kthread(pointer);
     (thread.stack_base.get(), thread.initial_stack.get(), thread.stack_limit.get(), thread.kernel_stack.get())
+}
+
+/// O tick do LAPIC (vetor 0x40) pendente no IRR desta CPU (registradores de
+/// 32 bits a cada 16 bytes a partir de 0x200, um bit por vetor).
+fn timer_tick_pending() -> bool {
+    let vector = interrupts::VECTOR_LAPIC_TIMER as u32;
+    lapic::read(0x200 + (vector / 32) * 0x10) & (1 << (vector % 32)) != 0
 }
 
 /// Uma KTHREAD do processo corrente com pilha de kernel própria.
@@ -137,18 +151,51 @@ fn syscall_rsp(assert: Assert) {
         program.extend_from_slice(&TEST_SERVICE.to_le_bytes());
         program.extend_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0xEB, 0xFE]);
         guest::write_bytes(code, &program);
+        let user_rsp = stack + 0x4000 - 0x28;
         for (index, thread) in created.iter().flatten().enumerate() {
             let (_, initial, limit, _) = stack_fields(*thread);
             // A thread GUI busca no Shadow, cuja tabela 1 é a de teste.
             // SAFETY: a ETHREAD acabou de ser criada e é retida até o fim.
             let tcb = &unsafe { Ethread::at(*thread) }.tcb;
             tcb.set_gui_thread(1);
-            threads::initialize_context(context, code, stack + 0x4000 - 0x28, 0, 0);
+            threads::initialize_context(context, code, user_rsp, 0, 0);
             SEEN_RSP_BASE.store(0, Ordering::SeqCst);
             SEEN_RSP0.store(0, Ordering::SeqCst);
             process::set_current_thread(*thread);
-            let _ = usermode::exec_user_context(context, 0);
-            let kind = usermode::block().exit_kind.get();
+            if index == 0 {
+                // Com as interrupções desligadas, espera o tick do LAPIC
+                // ficar pendente no IRR: o IRETQ religa o IF e ele chega
+                // antes da primeira instrução de usuário. (Um prazo fixo não
+                // basta: num host carregado o tick do QEMU pode atrasar.)
+                let flags = cpu::save_and_disable_interrupts();
+                let deadline = clock::uptime_ms() + 2_000;
+                while !timer_tick_pending() && clock::uptime_ms() < deadline {
+                    cpu::pause();
+                }
+                let pending = timer_tick_pending();
+                let _ = usermode::exec_user_context(context, 0);
+                cpu::restore_interrupts(flags);
+                let kind = usermode::block().exit_kind.get();
+                // SAFETY: o CONTEXT do intervalo, memória do kernel.
+                let rip = unsafe { Context::at(context) }.rip.get();
+                // O quadro da IRQ no topo da pilha da thread (InitialStack,
+                // alinhada a 16): RIP, CS, RFLAGS, RSP e SS do anel 3.
+                let frame = [guest::read64(initial - 40), guest::read64(initial - 32), guest::read64(initial - 16), guest::read64(initial - 8)];
+                let preempted = pending && kind == 2 && rip == code && frame == [code, 0x33, user_rsp, 0x2B];
+                if !preempted {
+                    crate::debug_print!("[pilhas] tick pendente={} tipo={} rip={:#x} quadro={:x?}", pending, kind, rip, frame);
+                }
+                assert(preempted, "pilhas: o tick do timer no anel 3 entra pela TSS.RSP0, na pilha de kernel da thread, e encerra o intervalo");
+            }
+            // Um tick no anel 3 encerra o intervalo (tipo 2) e a thread segue
+            // do CONTEXT salvo até a syscall.
+            let mut kind = 2;
+            let mut rounds = 0;
+            while kind == 2 && rounds < 64 {
+                let _ = usermode::exec_user_context(context, 0);
+                kind = usermode::block().exit_kind.get();
+                rounds += 1;
+            }
             process::set_current_thread(previous);
             tcb.set_gui_thread(0);
             // SAFETY: o CONTEXT do intervalo, memória do kernel.

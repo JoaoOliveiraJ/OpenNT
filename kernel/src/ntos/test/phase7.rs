@@ -1343,8 +1343,20 @@ fn user_mutants_and_timers(assert: Assert) {
     let timer = guest::read64(out);
     assert(created == 0 && state::get_user_handle(timer).is_some_and(|entry| entry.kind() == "timer"), "usermutants: NtCreateTimer2");
     guest::write64(rsp + 0x28, 0);
+    // O tempo restante é o prazo menos o tempo que passou entre o set e a
+    // consulta, medido no mesmo relógio (um host carregado pode parar a CPU
+    // virtual por mais que o prazo inteiro): sem pump, o timer só sinaliza
+    // depois de vencer.
     due_time.quad_part.set(-1_000_000);
-    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtQueryTimer", timer, 0, info, 16) == 0 && timer_info.remaining_time.quad_part.get() > 0 && timer_info.remaining_time.quad_part.get() <= 1_000_000 && timer_info.timer_state.get() == 0, "usermutants: prazo relativo e tempo restante");
+    let before = crate::ntos::ke::clock::now_ms() as i64 * 10_000;
+    let relative_set = call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtQueryTimer", timer, 0, info, 16) == 0;
+    let elapsed = crate::ntos::ke::clock::now_ms() as i64 * 10_000 - before;
+    let remaining = timer_info.remaining_time.quad_part.get();
+    let relative_ok = relative_set && remaining <= 1_000_000 && remaining >= (1_000_000 - elapsed).max(0) && (remaining == 0 || timer_info.timer_state.get() == 0) && (elapsed >= 1_000_000 || remaining > 0);
+    if !relative_ok {
+        debug_print!("[usermutants] restante={} decorrido={} estado={}", remaining, elapsed, timer_info.timer_state.get());
+    }
+    assert(relative_ok, "usermutants: prazo relativo e tempo restante");
     due_time.quad_part.set(116_444_736_000_000_000);
     assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && { timer_objects::pump(); call("NtQueryTimer", timer, 0, info, 16) == 0 } && timer_info.timer_state.get() == 1 && timer_info.remaining_time.quad_part.get() == 0, "usermutants: prazo absoluto vencido sinaliza pelo pump");
     assert(call("NtCancelTimer2", timer, 0, 0, 0) == 0 && call("NtCancelTimer2", timer, due, 0, 0) == 0xC000_000D && call("NtQueryTimer", timer, 0, info, 8) == 0xC000_0004, "usermutants: cancelamento e recusas de parametros e tamanho");
