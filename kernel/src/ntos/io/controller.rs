@@ -10,149 +10,13 @@
 //!   Tail.Overlay.DeviceQueueEntry e ordenado pela SortKey (o
 //!   KeInsertByKeyDeviceQueue do IoStartPacket).
 //!
-//! A KDEVICE_QUEUE é a do NT (layout dos símbolos): lista em DeviceListHead,
-//! KSPIN_LOCK em Lock e Busy; inserção e retirada acontecem com o Lock retido
-//! em DISPATCH_LEVEL, então o teste-e-marca de Busy é atômico como no
-//! KeInsertDeviceQueue.
-
-/// Operações da KDEVICE_QUEUE (KeInitializeDeviceQueue, KeInsertDeviceQueue,
-/// KeInsertByKeyDeviceQueue, KeRemoveDeviceQueue) sobre o layout do NT.
-mod device_queue {
-    use core::mem::offset_of;
-    use core::sync::atomic::Ordering;
-
-    use crate::hal::cpu;
-    use crate::ntos::inc::types::{KdeviceQueue, KdeviceQueueEntry, ListEntry, NtStruct};
-    use crate::ntos::ke::irql;
-
-    /// DeviceQueueObject.
-    const DEVICE_QUEUE_OBJECT: i16 = 0x14;
-
-    /// Lock da fila retido em DISPATCH_LEVEL.
-    struct Held<'a> {
-        queue: &'a KdeviceQueue,
-        previous: u8,
-    }
-
-    impl Drop for Held<'_> {
-        fn drop(&mut self) {
-            self.queue.lock.atomic().store(0, Ordering::Release);
-            irql::lower_irql(self.previous as u64);
-        }
-    }
-
-    fn lock(queue: &KdeviceQueue) -> Held<'_> {
-        let previous = irql::raise_at_least(irql::DISPATCH_LEVEL);
-        while queue.lock.atomic().compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            cpu::pause();
-        }
-        Held { queue, previous }
-    }
-
-    fn entry_at(address: u64) -> &'static KdeviceQueueEntry {
-        // SAFETY: os elos da lista são KDEVICE_QUEUE_ENTRY inseridas por aqui.
-        unsafe { KdeviceQueueEntry::at(address) }
-    }
-
-    fn link_at(address: u64) -> &'static ListEntry {
-        // SAFETY: elo da lista (cabeça da fila ou DeviceListEntry de uma entrada).
-        unsafe { ListEntry::at(address) }
-    }
-
-    /// Entrada que contém um elo (CONTAINING_RECORD).
-    fn entry_of_link(link: u64) -> &'static KdeviceQueueEntry {
-        entry_at(link - offset_of!(KdeviceQueueEntry, device_list_entry) as u64)
-    }
-
-    /// KeInitializeDeviceQueue.
-    pub fn initialize(queue: &KdeviceQueue) {
-        queue.type_.set(DEVICE_QUEUE_OBJECT);
-        queue.size.set(KdeviceQueue::SIZE as i16);
-        let head = queue.device_list_head.address();
-        queue.device_list_head.flink.set(head);
-        queue.device_list_head.blink.set(head);
-        queue.lock.set(0);
-        queue.busy.set(0);
-    }
-
-    /// Fila nunca inicializada (DEVICE_OBJECT zerado): zeros contam como vazia.
-    pub fn ensure_initialized(queue: &KdeviceQueue) {
-        if queue.device_list_head.flink.get() == 0 {
-            initialize(queue);
-        }
-    }
-
-    /// Insere antes de `next` (InsertTailList quando `next` é a cabeça).
-    fn link_before(next: u64, entry: &KdeviceQueueEntry) {
-        let link = &entry.device_list_entry;
-        let previous = link_at(next).blink.get();
-        link.flink.set(next);
-        link.blink.set(previous);
-        link_at(previous).flink.set(link.address());
-        link_at(next).blink.set(link.address());
-    }
-
-    /// KeInsertDeviceQueue (`key = None`, no fim) / KeInsertByKeyDeviceQueue
-    /// (depois de todas as entradas com SortKey <= key). Fila livre: marca
-    /// Busy e devolve false (o chamador inicia já); ocupada: enfileira e
-    /// devolve true.
-    pub fn insert(queue: &KdeviceQueue, entry: &KdeviceQueueEntry, key: Option<u32>) -> bool {
-        let _held = lock(queue);
-        if queue.busy.get() == 0 {
-            queue.busy.set(1);
-            entry.inserted.set(0);
-            return false;
-        }
-        let head = queue.device_list_head.address();
-        let mut next = head;
-        if let Some(key) = key {
-            entry.sort_key.set(key);
-            next = queue.device_list_head.flink.get();
-            while next != head && entry_of_link(next).sort_key.get() <= key {
-                next = link_at(next).flink.get();
-            }
-        }
-        link_before(next, entry);
-        entry.inserted.set(1);
-        true
-    }
-
-    /// KeRemoveDeviceQueue: a primeira entrada, ou 0 com a fila vazia (que
-    /// então deixa de estar ocupada).
-    pub fn remove(queue: &KdeviceQueue) -> u64 {
-        let _held = lock(queue);
-        let head = queue.device_list_head.address();
-        let first = queue.device_list_head.flink.get();
-        if first == head {
-            queue.busy.set(0);
-            return 0;
-        }
-        let next = link_at(first).flink.get();
-        queue.device_list_head.flink.set(next);
-        link_at(next).blink.set(head);
-        let entry = entry_of_link(first);
-        entry.inserted.set(0);
-        entry.address()
-    }
-
-    /// Entradas na fila (diagnóstico e testes).
-    pub fn count(queue: &KdeviceQueue) -> usize {
-        let _held = lock(queue);
-        let head = queue.device_list_head.address();
-        let mut count = 0;
-        let mut link = queue.device_list_head.flink.get();
-        while link != head && link != 0 {
-            count += 1;
-            link = link_at(link).flink.get();
-        }
-        count
-    }
-}
+//! As duas usam a KDEVICE_QUEUE do Ke (`ke/device_queue.rs`), como o I/O
+//! Manager do NT usa os KeInsert*/KeRemove*DeviceQueue.
 
 pub mod controller {
     use core::mem::offset_of;
 
-    use super::device_queue;
+    use crate::ntos::ke::device_queue;
     use crate::hal::amd64::native_call;
     use crate::ntos::inc::types::{ControllerObject, DeviceObject, DeviceObjectQueueView1, NtStruct, WaitContextBlock};
     use crate::ntos::mm::guest_memory as guest;
@@ -211,7 +75,7 @@ pub mod controller {
         let block = wait_block(target);
         block.device_routine.set(routine);
         block.device_context.set(context);
-        if device_queue::insert(&controller_at(controller).device_wait_queue, &block.wait_queue_entry, None) {
+        if device_queue::insert(&controller_at(controller).device_wait_queue, &block.wait_queue_entry) {
             return;
         }
         if run(target) == DEALLOCATE_OBJECT {
@@ -223,14 +87,10 @@ pub mod controller {
     /// enquanto ela devolver DeallocateObject.
     pub fn free(controller: u64) {
         let queue = &controller_at(controller).device_wait_queue;
-        loop {
-            let entry = device_queue::remove(queue);
-            if entry == 0 {
-                return;
-            }
+        while let Some(entry) = device_queue::remove(queue) {
             // A entrada é DeviceObject->Queue.Wcb.WaitQueueEntry.
             let offset = offset_of!(DeviceObject, queue) + offset_of!(DeviceObjectQueueView1, wcb) + offset_of!(WaitContextBlock, wait_queue_entry);
-            if run(device_at(entry - offset as u64)) != DEALLOCATE_OBJECT {
+            if run(device_at(entry.address() - offset as u64)) != DEALLOCATE_OBJECT {
                 return;
             }
         }
@@ -248,25 +108,52 @@ pub mod controller {
 }
 
 pub mod start_io {
-    use core::mem::offset_of;
+    //! IoStartPacket, IoStartNextPacket(ByKey) e IoSetStartIoAttributes,
+    //! como o I/O Manager do NT: o IRP entra na DeviceQueue do DEVICE_OBJECT
+    //! pela Tail.Overlay.DeviceQueueEntry (KeInsertByKeyDeviceQueue com
+    //! chave, KeInsertDeviceQueue sem) e, com a fila livre, vira CurrentIrp e
+    //! vai ao DriverStartIo na hora. A rotina de cancelamento é instalada
+    //! com o spin lock de cancelamento retido; um IRP que entrou na fila já
+    //! cancelado vai direto a ela. Com DOE_SIO_DEFERRED (IoSetStartIoAttributes)
+    //! um IoStartNextPacket chamado de dentro de um StartIo só registra o
+    //! pedido no StartIoCount/StartIoFlags/StartIoKey da DEVOBJ_EXTENSION, e
+    //! o laço de fora o executa, sem recursão.
 
-    use super::device_queue;
+    use core::mem::offset_of;
+    use core::sync::atomic::Ordering;
+
     use crate::hal::amd64::native_call;
     use crate::ntos::inc::field::Field;
-    use crate::ntos::inc::types::{DeviceObject, DevobjExtension, DriverObject, Irp, IrpTail, IrpTailOverlay, NtStruct};
+    use crate::ntos::inc::types::{DeviceObject, DevobjExtension, DriverObject, Irp, IrpTail, IrpTailOverlay, KdeviceQueueEntry, NtStruct};
+    use crate::ntos::io::cancel;
+    use crate::ntos::ke::{device_queue, irql};
+    use crate::rtl::KernelError;
 
-    /// DEVOBJ_EXTENSION.StartIoFlags (bits do IoSetStartIoAttributes).
+    /// DEVOBJ_EXTENSION.StartIoFlags.
+    const DOE_SIO_NO_KEY: u32 = 0x20;
+    const DOE_SIO_WITH_KEY: u32 = 0x40;
+    const DOE_SIO_CANCELABLE: u32 = 0x80;
     const DOE_SIO_DEFERRED: u32 = 0x100;
     const DOE_SIO_NO_CANCEL: u32 = 0x200;
+    /// Os três bits de um pedido adiado.
+    const DOE_SIO_REQUEST: u32 = DOE_SIO_NO_KEY | DOE_SIO_WITH_KEY | DOE_SIO_CANCELABLE;
 
     fn device_at(device: u64) -> &'static DeviceObject {
         // SAFETY: DEVICE_OBJECT vivo do chamador.
         unsafe { DeviceObject::at(device) }
     }
 
-    /// IRP que contém a Tail.Overlay.DeviceQueueEntry em `entry`.
-    fn irp_of_entry(entry: u64) -> u64 {
-        entry - (offset_of!(Irp, tail) + offset_of!(IrpTail, overlay) + offset_of!(IrpTailOverlay, device_queue_entry)) as u64
+    /// DeviceObject->DeviceObjectExtension (todo DEVICE_OBJECT do IoCreateDevice tem).
+    fn extension_of(device: &DeviceObject) -> &'static DevobjExtension {
+        // SAFETY: a DEVOBJ_EXTENSION de um DEVICE_OBJECT vivo.
+        unsafe { DevobjExtension::at(device.device_object_extension.get()) }
+    }
+
+    /// IRP que contém a Tail.Overlay.DeviceQueueEntry `entry`.
+    fn irp_of_entry(entry: &KdeviceQueueEntry) -> &'static Irp {
+        let offset = (offset_of!(Irp, tail) + offset_of!(IrpTail, overlay) + offset_of!(IrpTailOverlay, device_queue_entry)) as u64;
+        // SAFETY: as entradas da DeviceQueue são IRPs do IoStartPacket.
+        unsafe { Irp::at(entry.address() - offset) }
     }
 
     /// KeInitializeDeviceQueue na fila embutida do DEVICE_OBJECT.
@@ -275,42 +162,134 @@ pub mod start_io {
     }
 
     /// DriverStartIo(DeviceObject, Irp) do driver dono.
-    fn call_start_io(device: &DeviceObject, packet: u64) {
+    fn call_start_io(device: &DeviceObject, irp: &Irp) {
         // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
         let routine = unsafe { DriverObject::at(device.driver_object.get()) }.driver_start_io.get();
         if routine != 0 {
-            native_call::call(routine, &[device.address(), packet, 0]);
+            native_call::call(routine, &[device.address(), irp.address()]);
         }
     }
 
-    /// IoStartPacket(Device, Irp, PULONG Key, CancelFunction): livre vira
-    /// CurrentIrp e roda o StartIo; ocupado entra na fila ordenada pela chave
-    /// (sem chave, no fim).
-    pub fn start_packet(device: u64, packet: u64, sort_key: u64, _cancel_routine: u64) {
-        let target = device_at(device);
-        device_queue::ensure_initialized(&target.device_queue);
-        // SAFETY: PULONG Key do driver e o IRP vivo que ele entrega.
-        let (key, irp) = unsafe { ((sort_key != 0).then(|| Field::<u32>::at(sort_key).get()), Irp::at(packet)) };
-        if device_queue::insert(&target.device_queue, &irp.tail.overlay.device_queue_entry, Some(key.unwrap_or(u32::MAX))) {
-            return;
+    /// O IRP vai ao StartIo: CurrentIrp, a rotina de cancelamento retirada
+    /// com DOE_SIO_NO_CANCEL e o lock de cancelamento solto antes do
+    /// DriverStartIo.
+    fn dispatch(device: &DeviceObject, irp: &Irp, cancel_irql: Option<u8>) -> Result<(), KernelError> {
+        device.current_irp.set(irp.address());
+        if let Some(previous) = cancel_irql {
+            if extension_of(device).start_io_flags.get() & DOE_SIO_NO_CANCEL != 0 {
+                irp.cancel_routine.set(0);
+            }
+            cancel::release(previous)?;
         }
-        target.current_irp.set(packet);
-        call_start_io(target, packet);
+        call_start_io(device, irp);
+        Ok(())
     }
 
-    /// IoStartNextPacket: tira o primeiro da fila (KeRemoveDeviceQueue) e
-    /// dispara; fila vazia deixa o dispositivo livre.
-    pub fn start_next_packet(device: u64, _cancelable: bool) {
+    /// IoStartPacket(DeviceObject, Irp, PULONG Key, CancelFunction) em
+    /// DISPATCH_LEVEL: fila livre vira CurrentIrp e roda o StartIo; ocupada
+    /// guarda o IRP, ordenado pela chave quando há uma.
+    pub fn start_packet(device: u64, packet: u64, key: u64, cancel_function: u64) -> Result<(), KernelError> {
         let target = device_at(device);
-        device_queue::ensure_initialized(&target.device_queue);
+        // SAFETY: o IRP vivo que o driver entrega.
+        let irp = unsafe { Irp::at(packet) };
+        let previous = irql::raise_irql(irql::DISPATCH_LEVEL);
+        let result = (|| {
+            let cancel_irql = if cancel_function != 0 {
+                let held = cancel::acquire()?;
+                irp.cancel_routine.set(cancel_function);
+                Some(held)
+            } else {
+                None
+            };
+            let entry = &irp.tail.overlay.device_queue_entry;
+            let inserted = if key != 0 {
+                // SAFETY: PULONG Key do driver.
+                device_queue::insert_by_key(&target.device_queue, entry, unsafe { Field::<u32>::at(key) }.get())
+            } else {
+                device_queue::insert(&target.device_queue, entry)
+            };
+            match cancel_irql {
+                _ if !inserted => dispatch(target, irp, cancel_irql),
+                // Cancelado antes de entrar na fila: a rotina recebe o IRP
+                // com o lock retido e o solta.
+                Some(held) if irp.cancel.get() != 0 => {
+                    irp.cancel_routine.set(0);
+                    irp.cancel_irql.set(held);
+                    native_call::call(cancel_function, &[device, packet]);
+                    Ok(())
+                }
+                Some(held) => cancel::release(held),
+                None => Ok(()),
+            }
+        })();
+        irql::lower_irql(previous as u64);
+        result
+    }
+
+    /// IopStartNextPacket / IopStartNextPacketByKey: CurrentIrp zerado, o
+    /// próximo da fila (KeRemoveDeviceQueue, ou KeRemoveByKeyDeviceQueue com
+    /// chave) vira CurrentIrp e vai ao StartIo; fila vazia fica livre.
+    fn start_next(target: &DeviceObject, cancelable: bool, key: Option<u32>) -> Result<(), KernelError> {
+        let cancel_irql = if cancelable { Some(cancel::acquire()?) } else { None };
         target.current_irp.set(0);
-        let entry = device_queue::remove(&target.device_queue);
-        if entry == 0 {
-            return;
+        let next = match key {
+            Some(key) => device_queue::remove_by_key(&target.device_queue, key),
+            None => device_queue::remove(&target.device_queue),
+        };
+        match next {
+            Some(entry) => dispatch(target, irp_of_entry(entry), cancel_irql),
+            None => cancel_irql.map_or(Ok(()), cancel::release),
         }
-        let next = irp_of_entry(entry);
-        target.current_irp.set(next);
-        call_start_io(target, next);
+    }
+
+    /// IopStartNextPacketByKeyEx (DOE_SIO_DEFERRED): só a chamada de fora
+    /// (StartIoCount 1) executa; as aninhadas registram o pedido nos
+    /// StartIoFlags/StartIoKey, e quem sai por último executa o que ficou.
+    fn start_next_deferred(target: &DeviceObject, key: u32, flags: u32) -> Result<(), KernelError> {
+        let extension = extension_of(target);
+        let (mut key, mut flags) = (key, flags);
+        loop {
+            let count = extension.start_io_count.atomic().fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if count > 1 {
+                extension.start_io_flags.set(extension.start_io_flags.get() | flags);
+                extension.start_io_key.set(key as i32);
+            } else {
+                extension.start_io_flags.set(extension.start_io_flags.get() & !DOE_SIO_REQUEST);
+                extension.start_io_key.set(0);
+                let cancelable = flags & DOE_SIO_CANCELABLE != 0;
+                if flags & DOE_SIO_WITH_KEY != 0 {
+                    start_next(target, cancelable, Some(key))?;
+                } else if flags & DOE_SIO_NO_KEY != 0 {
+                    start_next(target, cancelable, None)?;
+                }
+            }
+            if extension.start_io_count.atomic().fetch_sub(1, Ordering::SeqCst) != 1 {
+                return Ok(());
+            }
+            flags = extension.start_io_flags.get() & DOE_SIO_REQUEST;
+            key = extension.start_io_key.get() as u32;
+            if flags & (DOE_SIO_NO_KEY | DOE_SIO_WITH_KEY) == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// IoStartNextPacket(DeviceObject, Cancelable).
+    pub fn start_next_packet(device: u64, cancelable: bool) -> Result<(), KernelError> {
+        let target = device_at(device);
+        if extension_of(target).start_io_flags.get() & DOE_SIO_DEFERRED != 0 {
+            return start_next_deferred(target, 0, DOE_SIO_NO_KEY | if cancelable { DOE_SIO_CANCELABLE } else { 0 });
+        }
+        start_next(target, cancelable, None)
+    }
+
+    /// IoStartNextPacketByKey(DeviceObject, Cancelable, Key).
+    pub fn start_next_packet_by_key(device: u64, cancelable: bool, key: u32) -> Result<(), KernelError> {
+        let target = device_at(device);
+        if extension_of(target).start_io_flags.get() & DOE_SIO_DEFERRED != 0 {
+            return start_next_deferred(target, key, DOE_SIO_WITH_KEY | if cancelable { DOE_SIO_CANCELABLE } else { 0 });
+        }
+        start_next(target, cancelable, Some(key))
     }
 
     /// IoSetStartIoAttributes: DOE_SIO_DEFERRED / DOE_SIO_NO_CANCEL no
@@ -324,10 +303,10 @@ pub mod start_io {
         // SAFETY: DeviceObjectExtension de um DEVICE_OBJECT vivo.
         let flags = &unsafe { DevobjExtension::at(extension) }.start_io_flags;
         if deferred_start_io {
-            flags.atomic().fetch_or(DOE_SIO_DEFERRED, core::sync::atomic::Ordering::SeqCst);
+            flags.atomic().fetch_or(DOE_SIO_DEFERRED, Ordering::SeqCst);
         }
         if non_cancelable {
-            flags.atomic().fetch_or(DOE_SIO_NO_CANCEL, core::sync::atomic::Ordering::SeqCst);
+            flags.atomic().fetch_or(DOE_SIO_NO_CANCEL, Ordering::SeqCst);
         }
     }
 }

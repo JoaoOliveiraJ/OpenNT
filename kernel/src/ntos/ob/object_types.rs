@@ -104,6 +104,11 @@ fn native(pointer: u64) -> &'static nt::ObjectType {
     unsafe { nt::ObjectType::at(pointer) }
 }
 
+/// TypeInfo.InvalidAttributes do tipo (os OBJ_* que os objetos dele recusam).
+pub fn invalid_attributes(object_type: &ObjectType) -> u32 {
+    native(object_type.pointer).type_info.invalid_attributes.get()
+}
+
 /// Espelha as contagens (a fonte é o registro, sob TYPES) no OBJECT_TYPE.
 fn publish_counts(record: &TypeRecord) {
     let body = native(record.info.pointer);

@@ -1066,3 +1066,62 @@ pub mod ke_processor_support {
         data_exports: &[],
     };
 }
+
+pub mod ke_device_queue {
+    //! A família KDEVICE_QUEUE; a lógica mora em `ke/device_queue`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{KdeviceQueue, KdeviceQueueEntry, NtStruct};
+    use crate::ntos::ke::device_queue;
+    use crate::rtl::KernelError;
+
+    fn queue(address: u64) -> &'static KdeviceQueue {
+        // SAFETY: PKDEVICE_QUEUE do chamador de modo kernel.
+        unsafe { KdeviceQueue::at(address) }
+    }
+    fn entry(address: u64) -> &'static KdeviceQueueEntry {
+        // SAFETY: PKDEVICE_QUEUE_ENTRY do chamador de modo kernel.
+        unsafe { KdeviceQueueEntry::at(address) }
+    }
+    fn pointer(found: Option<&KdeviceQueueEntry>) -> u64 {
+        found.map_or(0, |entry| entry.address())
+    }
+
+    fn initialize_device_queue(call: &Call) -> Result<u64, KernelError> {
+        device_queue::initialize(queue(call.arg(1)));
+        Ok(0)
+    }
+    fn insert_device_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(device_queue::insert(queue(call.arg(1)), entry(call.arg(2))) as u64)
+    }
+    fn insert_by_key_device_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(device_queue::insert_by_key(queue(call.arg(1)), entry(call.arg(2)), call.arg(3) as u32) as u64)
+    }
+    fn remove_device_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(pointer(device_queue::remove(queue(call.arg(1)))))
+    }
+    fn remove_by_key_device_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(pointer(device_queue::remove_by_key(queue(call.arg(1)), call.arg(2) as u32)))
+    }
+    fn remove_by_key_device_queue_if_busy(call: &Call) -> Result<u64, KernelError> {
+        Ok(pointer(device_queue::remove_by_key_if_busy(queue(call.arg(1)), call.arg(2) as u32)))
+    }
+    fn remove_entry_device_queue(call: &Call) -> Result<u64, KernelError> {
+        Ok(device_queue::remove_entry(queue(call.arg(1)), entry(call.arg(2))) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-device-queue",
+        names: &[
+            "KeInitializeDeviceQueue",
+            "KeInsertDeviceQueue",
+            "KeInsertByKeyDeviceQueue",
+            "KeRemoveDeviceQueue",
+            "KeRemoveByKeyDeviceQueue",
+            "KeRemoveByKeyDeviceQueueIfBusy",
+            "KeRemoveEntryDeviceQueue",
+        ],
+        handlers: &[initialize_device_queue, insert_device_queue, insert_by_key_device_queue, remove_device_queue, remove_by_key_device_queue, remove_by_key_device_queue_if_busy, remove_entry_device_queue],
+        data_exports: &[],
+    };
+}

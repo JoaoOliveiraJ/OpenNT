@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1844 && abi_names::GROUP_LAYOUT.len() == 405 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1844 exports em 405 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1853 && abi_names::GROUP_LAYOUT.len() == 408 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1853 exports em 408 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1455,7 +1455,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1844 && exports::export_names().len() == 1844, "ntoskrnl: 405 grupos com os 1844 exports implementados");
+    assert(exports::implemented() == 1853 && exports::export_names().len() == 1853, "ntoskrnl: 408 grupos com os 1853 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11279,6 +11279,169 @@ fn whea_error_source_exports(assert: Assert) {
     assert(call_export("WheaReportHwError", &[packet]) == Some(signed_status(0xC000_000D)), "whea-error-source: pacote sem 'ErPt' recusado");
 }
 
+/// A família KDEVICE_QUEUE pelos exports, com os vetores do modelo da
+/// desmontagem do ntoskrnl (ordem por chave, o Hint do
+/// KeRemoveByKeyDeviceQueue, a retirada por entrada e o Busy).
+fn ke_device_queue_exports(assert: Assert) {
+    let queue_address = guest::alloc_bytes(nt::KdeviceQueue::SIZE);
+    guest::write_bytes(queue_address, &[0xFF; nt::KdeviceQueue::SIZE as usize]);
+    let entries = guest::alloc_bytes(6 * 0x20);
+    guest::write_bytes(entries, &[0; 6 * 0x20]);
+    let e = |index: u64| entries + index * 0x20;
+    let entry = |index: u64| at::<nt::KdeviceQueueEntry>(e(index));
+    let queue = at::<nt::KdeviceQueue>(queue_address);
+    let head = queue.device_list_head.address();
+    let order = || {
+        let mut found = Vec::new();
+        let mut link = queue.device_list_head.flink.get();
+        while link != head && found.len() < 8 {
+            found.push((link - entries) / 0x20);
+            link = at::<nt::ListEntry>(link).flink.get();
+        }
+        found
+    };
+    let hint = || ((queue.bitfield_20.get() as i64) >> 8) as u64;
+    let call = |name: &str, arguments: &[u64]| call_export(name, arguments).unwrap_or(u64::MAX);
+    call("KeInitializeDeviceQueue", &[queue_address]);
+    assert(queue.type_.get() == 0x14 && queue.size.get() == 0x28 && order().is_empty() && queue.device_list_head.blink.get() == head && queue.lock.get() == 0 && queue.bitfield_20.get() == 0, "ke-device-queue: KeInitializeDeviceQueue zera Lock, Busy e Hint");
+    // Livre: não insere e marca Busy; ocupada: chaves 10, 5, 10, sem chave e 7.
+    entry(4).sort_key.set(0x7777);
+    let first = call("KeInsertDeviceQueue", &[queue_address, e(0)]);
+    assert(first & 0xFF == 0 && queue.busy.get() == 1 && entry(0).inserted.get() == 0, "ke-device-queue: fila livre fica ocupada sem inserir");
+    let inserted = [call("KeInsertByKeyDeviceQueue", &[queue_address, e(1), 10]), call("KeInsertByKeyDeviceQueue", &[queue_address, e(2), 5]), call("KeInsertByKeyDeviceQueue", &[queue_address, e(3), 10]), call("KeInsertDeviceQueue", &[queue_address, e(4)]), call("KeInsertByKeyDeviceQueue", &[queue_address, e(5), 7])];
+    assert(inserted.iter().all(|&value| value & 0xFF == 1) && order() == [2, 5, 1, 3, 4] && entry(4).sort_key.get() == 0x7777 && entry(5).sort_key.get() == 7 && (1..6).all(|index| entry(index).inserted.get() == 1), "ke-device-queue: inserção por chave depois das iguais, sem chave no fim");
+    // Por chave: a primeira >= 8 é E1 e o Hint passa a ser E5; a próxima busca parte dele.
+    let by_eight = call("KeRemoveByKeyDeviceQueue", &[queue_address, 8]);
+    assert(by_eight == e(1) && hint() == e(5) && queue.busy.get() == 1 && entry(1).inserted.get() == 0, "ke-device-queue: KeRemoveByKeyDeviceQueue grava o Hint");
+    let by_nine = call("KeRemoveByKeyDeviceQueue", &[queue_address, 9]);
+    assert(by_nine == e(3) && hint() == e(5) && order() == [2, 5, 4], "ke-device-queue: busca por chave a partir do Hint");
+    // A retirada da entrada do Hint o zera; repetir devolve FALSE.
+    let removed = (call("KeRemoveEntryDeviceQueue", &[queue_address, e(5)]), call("KeRemoveEntryDeviceQueue", &[queue_address, e(5)]));
+    assert(removed.0 & 0xFF == 1 && removed.1 & 0xFF == 0 && hint() == 0 && queue.bitfield_20.get() == 1 && order() == [2, 4], "ke-device-queue: KeRemoveEntryDeviceQueue e o Hint");
+    // Nenhuma chave alcança 0x8000: sai a primeira.
+    let beyond = call("KeRemoveByKeyDeviceQueue", &[queue_address, 0x8000]);
+    assert(beyond == e(2) && hint() == 0 && order() == [4], "ke-device-queue: chave acima de todas tira a primeira");
+    let busy = [call("KeRemoveByKeyDeviceQueueIfBusy", &[queue_address, 1]), call("KeRemoveByKeyDeviceQueueIfBusy", &[queue_address, 1])];
+    let busy_after = queue.busy.get();
+    let idle = call("KeRemoveByKeyDeviceQueueIfBusy", &[queue_address, 1]);
+    assert(busy == [e(4), 0] && busy_after == 0 && idle == 0 && queue.busy.get() == 0, "ke-device-queue: KeRemoveByKeyDeviceQueueIfBusy esvazia e libera, livre não mexe");
+    assert(call("KeRemoveDeviceQueue", &[queue_address]) == 0 && queue.busy.get() == 0, "ke-device-queue: KeRemoveDeviceQueue com a fila vazia");
+    // FIFO do KeRemoveDeviceQueue.
+    let fifo = [call("KeInsertDeviceQueue", &[queue_address, e(0)]) & 0xFF, call("KeInsertDeviceQueue", &[queue_address, e(1)]) & 0xFF, call("KeInsertDeviceQueue", &[queue_address, e(2)]) & 0xFF, call("KeRemoveDeviceQueue", &[queue_address]), call("KeRemoveDeviceQueue", &[queue_address]), call("KeRemoveDeviceQueue", &[queue_address])];
+    assert(fifo == [0, 1, 1, e(1), e(2), 0] && queue.busy.get() == 0, "ke-device-queue: KeRemoveDeviceQueue em ordem de chegada");
+    // IfBusy sem chave que alcance: sai a primeira.
+    let _ = (call("KeInsertDeviceQueue", &[queue_address, e(0)]), call("KeInsertByKeyDeviceQueue", &[queue_address, e(1), 3]), call("KeInsertByKeyDeviceQueue", &[queue_address, e(2), 4]));
+    assert(call("KeRemoveByKeyDeviceQueueIfBusy", &[queue_address, 9]) == e(1) && order() == [2], "ke-device-queue: IfBusy sem chave que alcance tira a primeira");
+    guest::free_bytes(queue_address);
+    guest::free_bytes(entries);
+}
+
+/// O que o StartIo e a rotina de cancelamento de teste viram.
+static START_IO_SEEN: crate::rtl::SpinLock<Vec<(u64, u64)>> = crate::rtl::SpinLock::new(Vec::new());
+static START_IO_DEPTH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static START_IO_MAX_DEPTH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Chave com que o StartIo de teste encadeia o IoStartNextPacketByKey (0 = não encadeia).
+static START_IO_CHAIN_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CANCEL_SEEN: crate::rtl::SpinLock<Vec<(u64, u64)>> = crate::rtl::SpinLock::new(Vec::new());
+
+/// DriverStartIo de teste: registra (IRP, CancelRoutine) e, com uma chave
+/// de encadeamento, pede o próximo por IoStartNextPacketByKey de dentro.
+extern "win64" fn test_start_io_by_key(device: u64, irp: u64) -> u64 {
+    use core::sync::atomic::Ordering::SeqCst;
+    let depth = START_IO_DEPTH.fetch_add(1, SeqCst) + 1;
+    START_IO_MAX_DEPTH.fetch_max(depth, SeqCst);
+    START_IO_SEEN.lock().push((irp, at::<nt::Irp>(irp).cancel_routine.get()));
+    let key = START_IO_CHAIN_KEY.load(SeqCst);
+    if key != 0 {
+        let _ = call_export("IoStartNextPacketByKey", &[device, 0, key]);
+    }
+    START_IO_DEPTH.fetch_sub(1, SeqCst);
+    0
+}
+
+/// Rotina de cancelamento de teste: tira o IRP da DeviceQueue e solta o
+/// spin lock de cancelamento no Irp->CancelIrql.
+extern "win64" fn test_cancel_routine(device: u64, irp: u64) {
+    let request = at::<nt::Irp>(irp);
+    let queue = at::<nt::DeviceObject>(device).device_queue.address();
+    let removed = call_export("KeRemoveEntryDeviceQueue", &[queue, request.tail.overlay.device_queue_entry.address()]).unwrap_or(0) & 0xFF;
+    CANCEL_SEEN.lock().push((irp, removed));
+    let _ = call_export("IoReleaseCancelSpinLock", &[request.cancel_irql.get() as u64]);
+}
+
+/// IoStartNextPacketByKey (e o IoStartPacket com cancelamento e
+/// DOE_SIO_NO_CANCEL/DOE_SIO_DEFERRED) sobre um DEVICE_OBJECT sintético.
+fn io_start_packet_by_key_exports(assert: Assert) {
+    use core::sync::atomic::Ordering::SeqCst;
+    let device = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    guest::write_bytes(device, &[0; nt::DeviceObject::SIZE as usize]);
+    let driver = guest::alloc_bytes(nt::DriverObject::SIZE);
+    guest::write_bytes(driver, &[0; nt::DriverObject::SIZE as usize]);
+    let extension = guest::alloc_bytes(nt::DevobjExtension::SIZE);
+    guest::write_bytes(extension, &[0; nt::DevobjExtension::SIZE as usize]);
+    let device_object = at::<nt::DeviceObject>(device);
+    let flags = &at::<nt::DevobjExtension>(extension).start_io_flags;
+    at::<nt::DriverObject>(driver).driver_start_io.set(test_start_io_by_key as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    device_object.driver_object.set(driver);
+    device_object.device_object_extension.set(extension);
+    let queue = device_object.device_queue.address();
+    let _ = call_export("KeInitializeDeviceQueue", &[queue]);
+    let irps: Vec<u64> = (0..6).map(|_| guest::alloc_bytes(nt::Irp::SIZE)).collect();
+    for &irp in &irps {
+        guest::write_bytes(irp, &[0; nt::Irp::SIZE as usize]);
+    }
+    let keys = guest::alloc_bytes(16);
+    for (index, key) in [30u32, 10, 20].iter().enumerate() {
+        guest::write32(keys + index as u64 * 4, *key);
+    }
+    let seen = || START_IO_SEEN.lock().iter().map(|&(irp, _)| irp).collect::<Vec<u64>>();
+    START_IO_SEEN.lock().clear();
+    START_IO_CHAIN_KEY.store(0, SeqCst);
+    // I0 com a fila livre vai ao StartIo; I1..I3 entram com as chaves 30, 10 e 20.
+    let _ = call_export("IoStartPacket", &[device, irps[0], 0, 0]);
+    for index in 1..4 {
+        let _ = call_export("IoStartPacket", &[device, irps[index], keys + (index as u64 - 1) * 4, 0]);
+    }
+    assert(seen() == [irps[0]] && device_object.current_irp.get() == irps[0], "io-start-packet-by-key: fila livre roda o StartIo, ocupada guarda");
+    for key in [15, 25, 0, 0] {
+        let _ = call_export("IoStartNextPacketByKey", &[device, 0, key]);
+    }
+    assert(seen() == [irps[0], irps[3], irps[1], irps[2]] && device_object.current_irp.get() == 0 && device_object.device_queue.busy.get() == 0, "io-start-packet-by-key: IoStartNextPacketByKey pela chave e pelo Hint, fila vazia libera");
+    // Rotina de cancelamento: sem DOE_SIO_NO_CANCEL o StartIo a recebe, com ele não.
+    let cancel = test_cancel_routine as extern "win64" fn(u64, u64) as usize as u64;
+    START_IO_SEEN.lock().clear();
+    let _ = call_export("IoStartPacket", &[device, irps[4], 0, cancel]);
+    let kept = START_IO_SEEN.lock().clone();
+    let _ = call_export("IoStartNextPacketByKey", &[device, 1, 0]);
+    flags.set(flags.get() | 0x200);
+    START_IO_SEEN.lock().clear();
+    let _ = call_export("IoStartPacket", &[device, irps[4], 0, cancel]);
+    let cleared = START_IO_SEEN.lock().clone();
+    assert(kept == [(irps[4], cancel)] && cleared == [(irps[4], 0)] && !crate::ntos::io::cancel::is_held(), "io-start-packet-by-key: DOE_SIO_NO_CANCEL retira a rotina antes do StartIo");
+    // Ocupado e já cancelado: a rotina recebe o IRP com o lock retido e o tira da fila.
+    CANCEL_SEEN.lock().clear();
+    at::<nt::Irp>(irps[5]).cancel.set(1);
+    let _ = call_export("IoStartPacket", &[device, irps[5], 0, cancel]);
+    assert(*CANCEL_SEEN.lock() == [(irps[5], 1)] && at::<nt::Irp>(irps[5]).cancel_routine.get() == 0 && device_object.device_queue.device_list_head.flink.get() == queue + 8 && !crate::ntos::io::cancel::is_held(), "io-start-packet-by-key: IRP cancelado na fila vai à rotina de cancelamento");
+    let _ = call_export("IoStartNextPacketByKey", &[device, 0, 0]);
+    // DOE_SIO_DEFERRED: o StartIo que encadeia o próximo não aninha.
+    flags.set(0x100);
+    START_IO_SEEN.lock().clear();
+    START_IO_MAX_DEPTH.store(0, SeqCst);
+    let _ = call_export("IoStartPacket", &[device, irps[0], 0, 0]);
+    for index in 1..4 {
+        let _ = call_export("IoStartPacket", &[device, irps[index], keys + (index as u64 - 1) * 4, 0]);
+    }
+    START_IO_CHAIN_KEY.store(15, SeqCst);
+    let _ = call_export("IoStartNextPacketByKey", &[device, 0, 15]);
+    START_IO_CHAIN_KEY.store(0, SeqCst);
+    let extension_state = at::<nt::DevobjExtension>(extension);
+    assert(seen() == [irps[0], irps[3], irps[1], irps[2]] && START_IO_MAX_DEPTH.load(SeqCst) == 1 && extension_state.start_io_count.get() == 0 && extension_state.start_io_key.get() == 0 && flags.get() == 0x100 && device_object.device_queue.busy.get() == 0, "io-start-packet-by-key: DOE_SIO_DEFERRED executa os pedidos aninhados no laço de fora");
+    for pointer in irps.into_iter().chain([device, driver, extension, keys]) {
+        guest::free_bytes(pointer);
+    }
+}
+
 /// RtlSelfRelativeToAbsoluteSD2: conversão no próprio buffer (vetores do
 /// modelo da desmontagem) e as recusas de parâmetro.
 fn rtl_self_relative_sd2_exports(assert: Assert) {
@@ -13235,6 +13398,8 @@ pub fn run(assert: Assert) {
     rtl_unicode_prefix_exports(assert);
     rtl_app_container_exports(assert);
     ps_paged_pool_quota_exports(assert);
+    ke_device_queue_exports(assert);
+    io_start_packet_by_key_exports(assert);
     rtl_self_relative_sd2_exports(assert);
     fsrtl_ecp_initialize_exports(assert);
     zw_adjust_privileges_token_exports(assert);

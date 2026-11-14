@@ -813,30 +813,29 @@ fn io_controller_and_start_io(assert: Assert) {
     unsafe { DriverObject::at(driver) }.driver_start_io.set(test_start_io as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64);
     guest::write_bytes(device, &[0; DeviceObject::SIZE as usize]);
     device_object.driver_object.set(driver);
+    // O que o IoCreateDevice prepara: DEVOBJ_EXTENSION e DeviceQueue inicializada.
+    let extension = guest::alloc_bytes(DevobjExtension::SIZE);
+    guest::write_bytes(extension, &[0; DevobjExtension::SIZE as usize]);
+    let object_extension = unsafe { DevobjExtension::at(extension) };
+    device_object.device_object_extension.set(extension);
+    start_io::queue_initialize(device);
     START_IO_ORDER.lock().clear();
     let packets: alloc::vec::Vec<u64> = (0..4).map(|_| guest::alloc_bytes(Irp::SIZE)).collect();
     let queue_entry = |index: usize| &unsafe { Irp::at(packets[index]) }.tail.overlay.device_queue_entry;
     let keys = guest::alloc_bytes(8);
     guest::write32(keys, 5);
     guest::write32(keys + 4, 2);
-    start_io::start_packet(device, packets[0], 0, 0);
+    let first = start_io::start_packet(device, packets[0], 0, 0).is_ok();
     let queue = &device_object.device_queue;
-    assert(device_object.current_irp.get() == packets[0] && queue.busy.get() == 1 && queue.type_.get() == 0x14 && queue.size.get() == 0x28 && *START_IO_ORDER.lock() == alloc::vec![packets[0]], "startio: dispositivo livre roda o StartIo na hora");
-    start_io::start_packet(device, packets[1], keys, 0);
-    start_io::start_packet(device, packets[2], keys + 4, 0);
-    start_io::start_packet(device, packets[3], 0, 0);
+    assert(first && device_object.current_irp.get() == packets[0] && queue.busy.get() == 1 && queue.type_.get() == 0x14 && queue.size.get() == 0x28 && *START_IO_ORDER.lock() == alloc::vec![packets[0]], "startio: dispositivo livre roda o StartIo na hora");
+    let queued = start_io::start_packet(device, packets[1], keys, 0).is_ok() && start_io::start_packet(device, packets[2], keys + 4, 0).is_ok() && start_io::start_packet(device, packets[3], 0, 0).is_ok();
     // KeInsertByKeyDeviceQueue grava a SortKey; sem chave o IRP entra no fim.
-    assert(START_IO_ORDER.lock().len() == 1 && queue_entry(1).sort_key.get() == 5 && queue_entry(2).sort_key.get() == 2 && (1..4).all(|index| queue_entry(index).inserted.get() == 1), "startio: ocupado entra na fila com a chave");
-    for _ in 0..4 {
-        start_io::start_next_packet(device, false);
-    }
-    assert(*START_IO_ORDER.lock() == alloc::vec![packets[0], packets[2], packets[1], packets[3]] && device_object.current_irp.get() == 0 && queue.busy.get() == 0 && (1..4).all(|index| queue_entry(index).inserted.get() == 0), "startio: fila ordenada pela chave e esvaziada");
+    assert(queued && START_IO_ORDER.lock().len() == 1 && queue_entry(1).sort_key.get() == 5 && queue_entry(2).sort_key.get() == 2 && (1..4).all(|index| queue_entry(index).inserted.get() == 1), "startio: ocupado entra na fila com a chave");
+    let drained = (0..4).all(|_| start_io::start_next_packet(device, false).is_ok());
+    assert(drained && *START_IO_ORDER.lock() == alloc::vec![packets[0], packets[2], packets[1], packets[3]] && device_object.current_irp.get() == 0 && queue.busy.get() == 0 && (1..4).all(|index| queue_entry(index).inserted.get() == 0), "startio: fila ordenada pela chave e esvaziada");
     // IoSetStartIoAttributes: DOE_SIO_DEFERRED (0x100) e DOE_SIO_NO_CANCEL
     // (0x200) no StartIoFlags da DEVOBJ_EXTENSION; só liga bits e não toca
     // nas Characteristics.
-    let extension = guest::alloc_bytes(DevobjExtension::SIZE);
-    let object_extension = unsafe { DevobjExtension::at(extension) };
-    device_object.device_object_extension.set(extension);
     device_object.characteristics.set(0x100);
     start_io::set_start_io_attributes(device, true, false);
     let deferred = object_extension.start_io_flags.get();

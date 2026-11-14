@@ -206,11 +206,11 @@ fn io_free_controller(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn io_start_packet(call: &Call) -> Result<u64, KernelError> {
-    start_io::start_packet(call.arg(1), call.arg(2), call.arg(3), call.arg(4));
+    start_io::start_packet(call.arg(1), call.arg(2), call.arg(3), call.arg(4))?;
     Ok(0)
 }
 fn io_start_next_packet(call: &Call) -> Result<u64, KernelError> {
-    start_io::start_next_packet(call.arg(1), call.arg(2) & 0xFF != 0);
+    start_io::start_next_packet(call.arg(1), call.arg(2) & 0xFF != 0)?;
     Ok(0)
 }
 fn io_set_start_io_attributes(call: &Call) -> Result<u64, KernelError> {
@@ -2065,4 +2065,20 @@ pub mod io_extra_create_parameter {
     }
 
     pub static GROUP: Group = Group { name: "io-extra-create-parameter", names: &["IoGetIrpExtraCreateParameter"], handlers: &[get_irp_extra_create_parameter], data_exports: &[] };
+}
+
+pub mod io_start_packet_by_key {
+    //! IoStartNextPacketByKey; a lógica mora em `io/controller` (start_io).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::controller::start_io;
+    use crate::rtl::KernelError;
+
+    /// IoStartNextPacketByKey(DeviceObject, Cancelable, Key).
+    fn start_next_packet_by_key(call: &Call) -> Result<u64, KernelError> {
+        start_io::start_next_packet_by_key(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-start-packet-by-key", names: &["IoStartNextPacketByKey"], handlers: &[start_next_packet_by_key], data_exports: &[] };
 }

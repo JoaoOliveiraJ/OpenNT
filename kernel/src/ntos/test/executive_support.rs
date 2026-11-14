@@ -368,7 +368,17 @@ pub fn run_user(assert: Assert) {
             status(call_export("ObSetHandleAttributes", &[handle, flags, mode]))
         };
         let attributes = set(signaled, 1, 1, 1) == 0 && state::get_user_handle(signaled).is_some_and(|entry| entry.attributes() & 3 == 3) && set(signaled, 0, 0, 1) == 0 && state::get_user_handle(signaled).is_some_and(|entry| entry.attributes() & 3 == 0);
-        let refused = set(0x7FF0, 1, 0, 1) == 0xC000_0008 && set(0xFFFF_FFFF_8000_0F00, 1, 0, 1) == 0xC000_0008;
+        // Handle que a tabela não tem: STATUS_ACCESS_DENIED (o ExMapHandleToPointer falhou).
+        let refused = set(0x7FF0, 1, 0, 1) == 0xC000_0022 && set(0xFFFF_FFFF_8000_0F00, 1, 0, 1) == 0xC000_0022;
+        // ZwSetInformationObject (KernelMode): ObjectHandleFlagInformation com exatamente 2 bytes.
+        let zw = |handle: u64, class: u64, inherit: u8, protect: u8, length: u64| {
+            guest::write8(flags, inherit);
+            guest::write8(flags + 1, protect);
+            status(call_export("ZwSetInformationObject", &[handle, class, flags, length]))
+        };
+        let held = |handle: u64| state::get_user_handle(handle).map_or(u32::MAX, |entry| entry.attributes() & 3);
+        let zw_set = zw(signaled, 4, 0, 1, 2) == 0 && held(signaled) == 1 && zw(signaled, 4, 1, 0, 2) == 0 && held(signaled) == 2 && zw(signaled, 4, 1, 1, 3) == 0xC000_0004 && zw(signaled, 5, 1, 1, 2) == 0xC000_0003 && zw(0x7FF0, 4, 0, 1, 2) == 0xC000_0022 && held(signaled) == 2 && zw(signaled, 4, 0, 0, 2) == 0 && held(signaled) == 0;
+        let refused = refused && zw_set;
         let zero = guest::alloc_bytes(8);
         guest::write64(zero, 0);
         let single = status(call_export("ObWaitForSingleObject", &[signaled, 1, 0, 0, zero])) == 0 && status(call_export("ObWaitForSingleObject", &[waiting, 1, 0, 0, zero])) == 0x102 && status(call_export("ObWaitForSingleObject", &[0x7FF0, 1, 0, 0, zero])) == 0xC000_0008;
@@ -413,7 +423,7 @@ pub fn run_user(assert: Assert) {
         assert(false, "ob: processo de teste com eventos de usuario");
         return;
     };
-    assert(created && attributes && refused, "ob: ObSetHandleAttributes troca Inherit e ProtectFromClose do handle e recusa handle ausente e de kernel em UserMode");
+    assert(created && attributes && refused, "ob: ObSetHandleAttributes e ZwSetInformationObject trocam Inherit e ProtectFromClose do handle e recusam handle ausente, de kernel em UserMode, classe e tamanho errados");
     assert(single && any == 1 && all == 0x102 && invalid == 0xC000_000D, "ob: ObWaitForSingleObject e ObWaitForMultipleObjects (WaitAny no indice sinalizado, WaitAll com prazo zero) sobre handles de usuario");
     assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado), ZwSetIoCompletionEx (reserva recusada) e ZwCancelWaitCompletionPacket tirando o pacote da fila");
 }

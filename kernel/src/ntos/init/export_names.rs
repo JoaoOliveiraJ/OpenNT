@@ -411,6 +411,9 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("rtl-self-relative-sd2", 1840, 1),
     ("fsrtl-ecp-initialize", 1841, 2),
     ("kd-break-point", 1843, 1),
+    ("ke-device-queue", 1844, 7),
+    ("io-start-packet-by-key", 1851, 1),
+    ("zw-set-information-object", 1852, 1),
 ];
 
 /// Os 1776 exports de função, na ordem da ABI.
@@ -2259,4 +2262,13 @@ pub static EXPORT_NAMES: &[&str] = &[
     "FsRtlInitializeExtraCreateParameterList",
     "FsRtlInitializeExtraCreateParameter",
     "DbgBreakPoint",
+    "KeInitializeDeviceQueue",
+    "KeInsertDeviceQueue",
+    "KeInsertByKeyDeviceQueue",
+    "KeRemoveDeviceQueue",
+    "KeRemoveByKeyDeviceQueue",
+    "KeRemoveByKeyDeviceQueueIfBusy",
+    "KeRemoveEntryDeviceQueue",
+    "IoStartNextPacketByKey",
+    "ZwSetInformationObject",
 ];

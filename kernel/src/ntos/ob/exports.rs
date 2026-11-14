@@ -573,3 +573,22 @@ pub mod ob_object_type_ex {
 
     pub static GROUP: Group = Group { name: "ob-object-type-ex", names: &["ObCreateObjectTypeEx"], handlers: &[create_object_type_ex], data_exports: &[] };
 }
+
+pub mod zw_set_information_object {
+    //! ZwSetInformationObject; a lógica mora em `ob/handle_attributes`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{NtStruct, ObjectHandleFlagInformation};
+    use crate::ntos::ob::handle_attributes;
+    use crate::rtl::KernelError;
+
+    /// ZwSetInformationObject(Handle, ObjectInformationClass,
+    /// ObjectInformation, ObjectInformationLength).
+    fn set_information_object(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o buffer do chamador de kernel (lido só na classe 4, com 2 bytes).
+        let information = unsafe { ObjectHandleFlagInformation::at(call.arg(3)) };
+        Ok(signed_status(handle_attributes::set_information_object(call.arg(1), call.arg(2) as u32, information, call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-set-information-object", names: &["ZwSetInformationObject"], handlers: &[set_information_object], data_exports: &[] };
+}
