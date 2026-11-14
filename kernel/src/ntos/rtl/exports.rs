@@ -2295,3 +2295,165 @@ pub mod rtl_copy_non_temporal {
 
     pub static GROUP: Group = Group { name: "rtl-copy-non-temporal", names: &["RtlCopyMemoryNonTemporal"], handlers: &[copy_memory_non_temporal], data_exports: &[] };
 }
+
+pub mod rtl_range_lists {
+    //! Listas de faixas; a lógica mora em `rtl/range_list.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::extra_rtl::{RtlRangeList, RtlRangeListIterator};
+    use crate::ntos::rtl::range_list::{self, Availability, FindRequest, InvertedRange, NewRange};
+    use crate::rtl::KernelError;
+
+    fn list(address: u64) -> &'static RtlRangeList {
+        // SAFETY: a RTL_RANGE_LIST do chamador de kernel.
+        unsafe { RtlRangeList::at(address) }
+    }
+    fn iterator(address: u64) -> &'static RtlRangeListIterator {
+        // SAFETY: o RTL_RANGE_LIST_ITERATOR do chamador.
+        unsafe { RtlRangeListIterator::at(address) }
+    }
+    fn out<T: Copy + 'static>(address: u64) -> &'static Field<T> {
+        // SAFETY: parâmetro de saída do chamador de kernel.
+        unsafe { Field::<T>::at(address) }
+    }
+
+    fn initialize_range_list(call: &Call) -> Result<u64, KernelError> {
+        range_list::initialize(list(call.arg(1)));
+        Ok(0)
+    }
+    fn free_range_list(call: &Call) -> Result<u64, KernelError> {
+        range_list::free(list(call.arg(1)));
+        Ok(0)
+    }
+    fn copy_range_list(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::copy(list(call.arg(1)), list(call.arg(2)))))
+    }
+    fn add_range(call: &Call) -> Result<u64, KernelError> {
+        let request = NewRange { start: call.arg(2), end: call.arg(3), attributes: call.arg(4) as u8, flags: call.arg(5) as u32, user_data: call.arg(6), owner: call.arg(7) };
+        Ok(signed_status(range_list::add(list(call.arg(1)), &request)))
+    }
+    fn delete_range(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::delete(list(call.arg(1)), call.arg(2), call.arg(3), call.arg(4))))
+    }
+    fn delete_owners_ranges(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::delete_owners(list(call.arg(1)), call.arg(2))))
+    }
+    // Length e Alignment são lidos com os 64 bits do registrador e do slot,
+    // como no original.
+    fn find_range(call: &Call) -> Result<u64, KernelError> {
+        let request = FindRequest { minimum: call.arg(2), maximum: call.arg(3), length: call.arg(4), alignment: call.arg(5) };
+        let criteria = Availability::new(call.arg(6) as u8 as u32, call.arg(7) as u8, call.arg(8), call.arg(9));
+        Ok(signed_status(range_list::find(list(call.arg(1)), &request, &criteria, out::<u64>(call.arg(10)))))
+    }
+    fn is_range_available(call: &Call) -> Result<u64, KernelError> {
+        let criteria = Availability::new(call.arg(4) as u8 as u32, call.arg(5) as u8, call.arg(6), call.arg(7));
+        Ok(signed_status(range_list::is_range_available(list(call.arg(1)), call.arg(2), call.arg(3), &criteria, out::<u8>(call.arg(8)))))
+    }
+    fn get_first_range(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::get_first(list(call.arg(1)), iterator(call.arg(2)), out::<u64>(call.arg(3)))))
+    }
+    fn get_next_range(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::get_next(iterator(call.arg(1)), out::<u64>(call.arg(2)), call.arg(3) as u8 != 0)))
+    }
+    fn invert_range_list(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(range_list::invert(list(call.arg(1)), list(call.arg(2)), &InvertedRange { attributes: 0, user_data: 0, owner: 0 })))
+    }
+    fn invert_range_list_ex(call: &Call) -> Result<u64, KernelError> {
+        let fill = InvertedRange { attributes: call.arg(3) as u8, user_data: call.arg(4), owner: call.arg(5) };
+        Ok(signed_status(range_list::invert(list(call.arg(1)), list(call.arg(2)), &fill)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-range-lists",
+        names: &["RtlInitializeRangeList", "RtlFreeRangeList", "RtlCopyRangeList", "RtlAddRange", "RtlDeleteRange", "RtlDeleteOwnersRanges", "RtlFindRange", "RtlIsRangeAvailable", "RtlGetFirstRange", "RtlGetNextRange", "RtlInvertRangeList", "RtlInvertRangeListEx"],
+        handlers: &[initialize_range_list, free_range_list, copy_range_list, add_range, delete_range, delete_owners_ranges, find_range, is_range_available, get_first_range, get_next_range, invert_range_list, invert_range_list_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_resource_encoding {
+    //! Descritores de memória e porta; a lógica mora em
+    //! `rtl/resource_encoding.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::inc::types::{CmPartialResourceDescriptor, IoResourceDescriptor};
+    use crate::ntos::rtl::resource_encoding::{self, IoDecodeOutputs, IoEncodeRequest};
+    use crate::rtl::KernelError;
+
+    fn cm_descriptor(address: u64) -> &'static CmPartialResourceDescriptor {
+        // SAFETY: o CM_PARTIAL_RESOURCE_DESCRIPTOR do chamador.
+        unsafe { CmPartialResourceDescriptor::at(address) }
+    }
+    fn io_descriptor(address: u64) -> &'static IoResourceDescriptor {
+        // SAFETY: o IO_RESOURCE_DESCRIPTOR do chamador.
+        unsafe { IoResourceDescriptor::at(address) }
+    }
+    fn optional(address: u64) -> Option<&'static Field<u64>> {
+        // SAFETY: PULONGLONG opcional do chamador.
+        (address != 0).then(|| unsafe { Field::<u64>::at(address) })
+    }
+
+    fn cm_decode(call: &Call) -> Result<u64, KernelError> {
+        Ok(resource_encoding::cm_decode(cm_descriptor(call.arg(1)), optional(call.arg(2))))
+    }
+    fn cm_encode(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(resource_encoding::cm_encode(cm_descriptor(call.arg(1)), call.arg(2) as u8, call.arg(3), call.arg(4))))
+    }
+    fn io_decode(call: &Call) -> Result<u64, KernelError> {
+        let outputs = IoDecodeOutputs { alignment: optional(call.arg(2)), minimum: optional(call.arg(3)), maximum: optional(call.arg(4)) };
+        Ok(resource_encoding::io_decode(io_descriptor(call.arg(1)), &outputs))
+    }
+    fn io_encode(call: &Call) -> Result<u64, KernelError> {
+        let request = IoEncodeRequest { kind: call.arg(2) as u8, length: call.arg(3), alignment: call.arg(4), minimum: call.arg(5), maximum: call.arg(6) };
+        Ok(signed_status(resource_encoding::io_encode(io_descriptor(call.arg(1)), &request)))
+    }
+    fn find_closest_encodable_length(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONGLONG de saída do chamador.
+        let rounded = unsafe { Field::<u64>::at(call.arg(2)) };
+        Ok(signed_status(resource_encoding::find_closest_encodable_length(call.arg(1), rounded)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-resource-encoding",
+        names: &["RtlCmDecodeMemIoResource", "RtlCmEncodeMemIoResource", "RtlIoDecodeMemIoResource", "RtlIoEncodeMemIoResource", "RtlFindClosestEncodableLength"],
+        handlers: &[cm_decode, cm_encode, io_decode, io_encode, find_closest_encodable_length],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_bitmap_copy {
+    //! RtlCopyBitMap; a lógica mora em `rtl/bitmap.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::inc::types::{NtStruct, RtlBitmap};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    fn copy_bit_map(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: os cabeçalhos RTL_BITMAP do chamador.
+        let (source, destination) = unsafe { (RtlBitmap::at(call.arg(1)), RtlBitmap::at(call.arg(2))) };
+        bitmap::copy(source, destination, call.arg(3) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-bitmap-copy", names: &["RtlCopyBitMap"], handlers: &[copy_bit_map], data_exports: &[] };
+}
+
+pub mod crt_string_conversion {
+    //! _strtoui64 e strtok_s; a lógica mora em `rtl/crt.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    fn strtoui64(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::strtoui64(call.arg(1), call.arg(2), call.arg(3) as u32))
+    }
+    fn strtok_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::strtok_s(call.arg(1), call.arg(2), call.arg(3)))
+    }
+
+    pub static GROUP: Group = Group { name: "crt-string-conversion", names: &["_strtoui64", "strtok_s"], handlers: &[strtoui64, strtok_s], data_exports: &[] };
+}

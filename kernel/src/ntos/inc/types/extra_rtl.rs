@@ -1,9 +1,12 @@
-//! Estruturas do Rtl usadas pelas tabelas de átomos, pelo heap e pelas
-//! tabelas de página de código, no mesmo estilo das geradas.
+//! Estruturas do Rtl usadas pelas tabelas de átomos, pelo heap, pelas
+//! tabelas de página de código e pelas listas de faixas, no mesmo estilo
+//! das geradas.
 //!
 //! As de átomo (`_RTL_ATOM_TABLE`, `_RTL_ATOM_TABLE_ENTRY`,
-//! `_RTL_ATOM_TABLE_REFERENCE`) vêm dos símbolos do ntoskrnl 19041; as
-//! demais são públicas e não constam dos símbolos: `RTL_HEAP_PARAMETERS`
+//! `_RTL_ATOM_TABLE_REFERENCE`) e as de lista de faixas (`_RTL_RANGE_LIST`,
+//! `_RTLP_RANGE_LIST_ENTRY`) vêm dos símbolos do ntoskrnl 19041; as demais
+//! são públicas e não constam dos símbolos: `RTL_RANGE_LIST_ITERATOR`
+//! (ntddk.h), `RTL_HEAP_PARAMETERS`
 //! (ntifs.h/ntddk.h), `CPTABLEINFO` (ntnls.h) e os blocos de tabela de
 //! mensagens `MESSAGE_RESOURCE_*` (winnt.h). Tamanho e offsets conferidos em
 //! compilação.
@@ -127,6 +130,80 @@ pub struct MessageResourceEntry {
 }
 
 unsafe impl NtStruct for MessageResourceEntry {}
+
+/// `_RTL_RANGE_LIST` (símbolos do ntoskrnl 19041).
+#[repr(C)]
+pub struct RtlRangeList {
+    pub list_head: ListEntry,
+    pub flags: Field<u32>,
+    pub count: Field<u32>,
+    pub stamp: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for RtlRangeList {}
+
+/// `_RTLP_RANGE_LIST_ENTRY` (símbolos do ntoskrnl 19041). Os primeiros 0x22
+/// bytes são o `RTL_RANGE` público que os iteradores entregam. A união
+/// `Allocated`/`Merged`: `user_data`/`owner` numa faixa comum; numa faixa
+/// fundida os mesmos 16 bytes são a LIST_ENTRY da sublista
+/// ([`RtlpRangeListEntry::merged_list_head`]).
+#[repr(C)]
+pub struct RtlpRangeListEntry {
+    pub start: Field<u64>,
+    pub end: Field<u64>,
+    /// `Allocated.UserData` (ou `Merged.ListHead.Flink`).
+    pub user_data: Field<u64>,
+    /// `Allocated.Owner` (ou `Merged.ListHead.Blink`).
+    pub owner: Field<u64>,
+    pub attributes: Field<u8>,
+    pub public_flags: Field<u8>,
+    pub private_flags: Field<u16>,
+    _pad_24: Reserved<0x4>,
+    pub list_entry: ListEntry,
+}
+
+unsafe impl NtStruct for RtlpRangeListEntry {}
+
+impl RtlpRangeListEntry {
+    /// `Merged.ListHead`: a LIST_ENTRY da sublista, sobre `user_data`/`owner`.
+    pub fn merged_list_head(&self) -> &ListEntry {
+        // SAFETY: os 16 bytes em +0x10 são a LIST_ENTRY da união Merged.
+        unsafe { ListEntry::at(self.user_data.address()) }
+    }
+}
+
+/// `RTL_RANGE_LIST_ITERATOR` (ntddk.h).
+#[repr(C)]
+pub struct RtlRangeListIterator {
+    /// -> `LIST_ENTRY` (a cabeça da RTL_RANGE_LIST)
+    pub range_list_head: Field<u64>,
+    /// -> `LIST_ENTRY` (a sublista da faixa fundida em curso, ou NULL)
+    pub merged_head: Field<u64>,
+    /// -> `RTL_RANGE`
+    pub current: Field<u64>,
+    pub stamp: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for RtlRangeListIterator {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlRangeList>() == 0x20);
+    assert!(core::mem::offset_of!(RtlRangeList, flags) == 0x10);
+    assert!(core::mem::offset_of!(RtlRangeList, count) == 0x14);
+    assert!(core::mem::offset_of!(RtlRangeList, stamp) == 0x18);
+    assert!(core::mem::size_of::<RtlpRangeListEntry>() == 0x38);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, user_data) == 0x10);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, owner) == 0x18);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, attributes) == 0x20);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, public_flags) == 0x21);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, private_flags) == 0x22);
+    assert!(core::mem::offset_of!(RtlpRangeListEntry, list_entry) == 0x28);
+    assert!(core::mem::size_of::<RtlRangeListIterator>() == 0x20);
+    assert!(core::mem::offset_of!(RtlRangeListIterator, current) == 0x10);
+    assert!(core::mem::offset_of!(RtlRangeListIterator, stamp) == 0x18);
+};
 
 const _: () = {
     assert!(core::mem::size_of::<RtlAtomTable>() == 0x28);

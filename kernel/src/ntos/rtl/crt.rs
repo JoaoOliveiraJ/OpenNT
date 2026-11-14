@@ -693,6 +693,135 @@ pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
     if negative { number.wrapping_neg() } else { number }
 }
 
+/// Classes de letra do `pctype` (_UPPER | _LOWER | _ALPHA).
+const CRT_CLASS_LETTER: u16 = 0x103;
+
+/// _strtoui64(String, EndPtr, Base) = strtoxq(FL_UNSIGNED) no locale C:
+/// brancos de `pctype`, sinal, prefixo 0x (Base 0/16), octal com 0 inicial
+/// em Base 0, dígitos ASCII ou letras; estouro satura em _UI64_MAX e o '-'
+/// nega o valor final (inclusive o saturado); sem dígitos, *EndPtr =
+/// String e retorno 0. Base fora de 0 e 2..36 ou String NULL é parâmetro
+/// inválido (o handler do kernel volta) e devolve 0.
+pub fn strtoui64(text: u64, end: u64, requested: u32) -> u64 {
+    // SAFETY: char** EndPtr do chamador (opcional).
+    let end_pointer = (end != 0).then(|| unsafe { Field::<u64>::at(end) });
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(text);
+    }
+    if text == 0 || (requested != 0 && requested.wrapping_sub(2) > 34) {
+        return 0;
+    }
+    let mut character = guest::read8(text);
+    let mut cursor = text + 1;
+    while narrow_class(character as u32) & CRT_CLASS_SPACE != 0 {
+        character = guest::read8(cursor);
+        cursor += 1;
+    }
+    let negative = character == b'-';
+    if negative || character == b'+' {
+        character = guest::read8(cursor);
+        cursor += 1;
+    }
+    let is_x = |candidate: u8| candidate.wrapping_sub(b'X') & 0xDF == 0;
+    let mut base = requested as u64;
+    if base == 0 {
+        base = if character != b'0' {
+            10
+        } else if is_x(guest::read8(cursor)) {
+            16
+        } else {
+            8
+        };
+    }
+    if base == 16 && character == b'0' && is_x(guest::read8(cursor)) {
+        character = guest::read8(cursor + 1);
+        cursor += 2;
+    }
+    let (limit, remainder) = (u64::MAX / base, u64::MAX % base);
+    let (mut number, mut read_digit, mut overflow) = (0u64, false, false);
+    loop {
+        let class = narrow_class(character as u32);
+        let digit = if class & CRT_CLASS_DIGIT != 0 {
+            (character as i8 as i64 - 0x30) as u64
+        } else if class & CRT_CLASS_LETTER != 0 {
+            let upper = if character.wrapping_sub(b'a') <= 0x19 { character as i8 as i64 - 0x20 } else { character as i8 as i64 };
+            (upper - 0x37) as u64
+        } else {
+            break;
+        };
+        if digit >= base {
+            break;
+        }
+        read_digit = true;
+        if number < limit || (number == limit && digit <= remainder) {
+            number = number * base + digit;
+        } else {
+            overflow = true;
+            if end == 0 {
+                break;
+            }
+        }
+        character = guest::read8(cursor);
+        cursor += 1;
+    }
+    let mut stop = cursor - 1;
+    if !read_digit {
+        stop = text;
+        number = 0;
+    } else if overflow {
+        number = u64::MAX;
+    }
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(stop);
+    }
+    if negative { number.wrapping_neg() } else { number }
+}
+
+/// strtok_s(String, Delimiters, Context): o mapa de 256 bits dos
+/// delimitadores (o NUL incluído), pula os delimitadores iniciais, corta o
+/// token no primeiro delimitador seguinte (que vira NUL) e guarda em
+/// *Context a posição depois dele. Sem Context, sem Delimiters ou sem
+/// String e *Context é parâmetro inválido: NULL. Token vazio: NULL.
+pub fn strtok_s(text: u64, delimiters: u64, context: u64) -> u64 {
+    if context == 0 || delimiters == 0 {
+        return 0;
+    }
+    // SAFETY: char** Context do chamador.
+    let context = unsafe { Field::<u64>::at(context) };
+    if text == 0 && context.get() == 0 {
+        return 0;
+    }
+    let mut map = [0u8; 32];
+    let mut cursor = delimiters;
+    loop {
+        let character = guest::read8(cursor);
+        map[(character >> 3) as usize] |= 1 << (character & 7);
+        cursor += 1;
+        if character == 0 {
+            break;
+        }
+    }
+    let is_delimiter = |character: u8| map[(character >> 3) as usize] & (1 << (character & 7)) != 0;
+    let mut position = if text != 0 { text } else { context.get() };
+    let mut character = guest::read8(position);
+    while is_delimiter(character) && character != 0 {
+        position += 1;
+        character = guest::read8(position);
+    }
+    let token = position;
+    while character != 0 {
+        if is_delimiter(character) {
+            guest::write8(position, 0);
+            position += 1;
+            break;
+        }
+        position += 1;
+        character = guest::read8(position);
+    }
+    context.set(position);
+    if token == position { 0 } else { token }
+}
+
 /// isspace(c): bit _SPACE do `pctype`.
 pub fn isspace(character: u32) -> u32 {
     (narrow_class(character) & CRT_CLASS_SPACE) as u32

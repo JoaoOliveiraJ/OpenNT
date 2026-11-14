@@ -17,3 +17,4 @@ pub mod resource_search_fixtures;
 pub mod cc_fixture;
 pub mod rtl_atom_heap_nls;
 pub mod device_removal;
+pub mod rtl_ranges_resources;

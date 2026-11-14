@@ -627,6 +627,31 @@ pub fn extract(source: &RtlBitmap, destination: &RtlBitmap, target_bit: u32, bit
     crate::ntos::mm::guest_memory::write_bytes(destination.buffer.get(), &bytes);
 }
 
+/// RtlCopyBitMap(Source, Destination, TargetBit): copia os primeiros
+/// min(Source.Size, Destination.Size - TargetBit) bits da origem para o
+/// destino a partir de `TargetBit` (a subtração é a ULONG do original);
+/// os demais bits do destino ficam. Origem e destino podem se sobrepor: a
+/// origem é lida inteira antes da escrita, o efeito da cópia de trás para a
+/// frente que o original faz nesse caso.
+pub fn copy(source: &RtlBitmap, destination: &RtlBitmap, target_bit: u32) {
+    let count = source.size_of_bit_map.get().min(destination.size_of_bit_map.get().wrapping_sub(target_bit));
+    if count == 0 {
+        return;
+    }
+    let source_bytes = storage_bytes(source, 0, count.div_ceil(8) as usize);
+    let first = (target_bit / 8) as u64;
+    let last = (target_bit as u64 + count as u64 - 1) / 8;
+    let mut bytes = storage_bytes(destination, first, (last - first + 1) as usize);
+    let shift = target_bit % 8;
+    for offset in 0..count {
+        let bit = (source_bytes[(offset / 8) as usize] >> (offset % 8)) & 1;
+        let to = shift + offset;
+        let byte = &mut bytes[(to / 8) as usize];
+        *byte = (*byte & !(1 << (to % 8))) | (bit << (to % 8));
+    }
+    crate::ntos::mm::guest_memory::write_bytes(destination.buffer.get() + first, &bytes);
+}
+
 /// Estado do RtlFindClearRuns: os runs (StartingIndex, NumberOfBits) achados.
 struct ClearRuns {
     runs: alloc::vec::Vec<(u32, u32)>,
