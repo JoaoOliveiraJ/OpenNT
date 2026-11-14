@@ -32,6 +32,7 @@ use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{Eprocess, Ethread, Kthread, LargeInteger, ListEntry};
 use crate::ntos::ps::silo::query::INHERIT as INHERIT_PROCESS_SILO;
 
+use crate::ntos::ps::cid;
 use crate::ntos::ps::notify::{process as process_notify, thread as thread_notify};
 use crate::ntos::ps::user::process_state;
 
@@ -265,18 +266,29 @@ fn unlink_thread(thread: u64) -> Result<(), KernelError> {
     })
 }
 
-/// EPROCESS completo para o kernel 19041 correspondente.
+/// EPROCESS completo para o kernel 19041 correspondente. `process_id` é o
+/// PID pedido (o System, autotestes) ou `cid::ALLOCATE`, o próximo id livre
+/// da tabela de ids de cliente; o PID fica com o EPROCESS até ele ser
+/// recolhido.
 pub fn create_process(process_id: u64, image_name: &str, image_base: u64, executable: Option<&Executable>) -> Result<u64, KernelError> {
     let process_type = object_types::process_type();
+    let process_id = cid::claim(process_id, cid::Kind::Process)?;
     let process = guest::alloc_bytes(Eprocess::SIZE);
     if process == 0 {
+        cid::release(process_id, 0);
         return Err(KernelError::new("EPROCESS allocation failed"));
+    }
+    if let Err(error) = cid::bind(process_id, cid::Kind::Process, process) {
+        cid::release(process_id, 0);
+        guest::free_bytes(process);
+        return Err(error);
     }
     let provider = STATE.lock().image_provider;
     let parent_token = get_primary_token(get_current_process());
     let primary_token = match tokens::create(parent_token, None) {
         Ok(token) => token,
         Err(error) => {
+            cid::release(process_id, process);
             guest::free_bytes(process);
             return Err(error);
         }
@@ -291,6 +303,7 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
                 Ok(image) => Some(image),
                 Err(error) => {
                     let _ = tokens::release(primary_token);
+                    cid::release(process_id, process);
                     guest::free_bytes(process);
                     return Err(error);
                 }
@@ -310,6 +323,7 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
             (provider.destroy)(image);
         }
         let _ = tokens::release(primary_token);
+        cid::release(process_id, process);
         guest::free_bytes(process);
         return Err(error);
     }
@@ -395,14 +409,23 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
 }
 
 /// Cria um KTHREAD real ligado ao processo (ApcState.Process + Cid).
+/// `thread_id` é o TID pedido, um id já reservado por `cid::allocate` ou
+/// `cid::ALLOCATE`; o TID fica com o ETHREAD até ele ser recolhido.
 pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, previous_mode: u8, initial_stack: Option<u64>) -> Result<u64, KernelError> {
     if previous_mode > 1 {
         return Err(KernelError::new("invalid initial thread mode"));
     }
     let thread_type = object_types::thread_type();
+    let thread_id = cid::claim(thread_id, cid::Kind::Thread)?;
     let thread = guest::alloc_bytes(Ethread::SIZE);
     if thread == 0 {
+        cid::release(thread_id, 0);
         return Err(KernelError::new("ETHREAD allocation failed"));
+    }
+    if let Err(error) = cid::bind(thread_id, cid::Kind::Thread, thread) {
+        cid::release(thread_id, 0);
+        guest::free_bytes(thread);
+        return Err(error);
     }
     let owner = eprocess(process);
     let process_id = owner.unique_process_id.get();
@@ -476,6 +499,7 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
             release_thread(thread)?;
         } else {
             STATE.lock().threads.remove(&thread);
+            cid::release(thread_id, thread);
             object_types::account(&thread_type.name, -1, 0)?;
             guest::free_bytes(thread);
         }
@@ -675,6 +699,7 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
         }
     }
     object_types::account("Process", -1, 0)?;
+    cid::release(eprocess(process).unique_process_id.get(), process);
     guest::free_bytes(process);
     Ok(())
 }
@@ -766,7 +791,12 @@ pub fn forget_thread(thread: u64) -> Result<(), KernelError> {
         return Err(error);
     }
     thread_tokens::release(thread)?;
-    let process = STATE.lock().threads.remove(&thread).map(|record| record.process);
+    let removed = STATE.lock().threads.remove(&thread);
+    // Fora do registro, o TID volta à tabela de ids de cliente.
+    if let Some(record) = &removed {
+        cid::release(record.id, thread);
+    }
+    let process = removed.map(|record| record.process);
     object_types::account("Thread", -1, 0)?;
     if let Some(process) = process {
         collect_process(process)?;

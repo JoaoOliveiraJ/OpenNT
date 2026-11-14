@@ -134,7 +134,8 @@ fn create_workers(factory: &Arc<Factory>, desired: u32) -> Result<u32, KernelErr
                 commit: factory.commit(),
                 reserve: factory.reserve(),
             };
-            let created = if state::with(|state| state.current_process_id) != factory.process_id() { Err(0xC000_00BB) } else { process_context::with_process(factory.process_pointer(), || threads::create_user_thread(&request))? };
+            // Só um processo de usuário vivo recebe workers.
+            let created = if !state::is_user_process_id(factory.process_id()) { Err(0xC000_00BB) } else { process_context::with_process(factory.process_pointer(), || threads::create_user_thread(&request))? };
             let thread = match created {
                 Ok(thread) => {
                     factory.set_last_status(0);
@@ -626,10 +627,10 @@ fn nt_shutdown_worker_factory(handle: u64, pending_count: u64, _: u64, _: u64, _
     Ok(0)
 }
 
-pub fn release_process() {
-    let current = state::with(|state| state.current_process_id);
+/// As fábricas do processo `process_id`, que saiu.
+pub fn release_process(process_id: u64) {
     let factories = FACTORIES.lock().clone();
-    for factory in factories.iter().filter(|factory| factory.process_id() == current) {
+    for factory in factories.iter().filter(|factory| factory.process_id() == process_id) {
         shutdown(factory);
     }
 }

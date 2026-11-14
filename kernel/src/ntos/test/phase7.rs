@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types as nt;
 use crate::ntos::ps::user::state::{self, NativeBody, UserObject};
+use crate::ntos::test::multiprocess::identity::{with_test_process, TestProcess};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -235,7 +236,7 @@ fn user_memory_helpers(assert: Assert) {
     guest::write64(block + 0x28 + 0x08, 0x1234);
     assert(state::stack_arg(block, 6) == 0x1234 && state::stack_arg32(block, 6) == 0x1234, "user: argumento de pilha do syscall");
     guest::free_bytes(block);
-    assert(state::with(|state| state.next_process_id == 300 || state.next_process_id > 300) && state::handler("NtNaoExiste").is_none(), "user: estado inicial e tabela de handlers");
+    assert(crate::ntos::ps::cid::lookup(crate::ntos::ps::process::SYSTEM_PROCESS_ID).is_some_and(|entry| entry.object == crate::ntos::ps::process::get_system_process()) && state::handler("NtNaoExiste").is_none(), "user: estado inicial (tabela de ids a partir do System) e tabela de handlers");
 }
 
 fn map_view_parameter_validation(assert: Assert) {
@@ -1378,9 +1379,7 @@ fn user_io_completion(assert: Assert) {
     guest::write64(raw + 16, 0x1122_3344_5566_7788);
     guest::write64(raw + 24, 0xAABB_CCDD_0000_0001);
     guest::write64(rsp + 0x28, 0x99);
-    state::with(|state| state.service_raw_arguments = raw);
-    let posted = call("NtSetIoCompletion", handle, 0, 0, 0x103);
-    state::with(|state| state.service_raw_arguments = 0);
+    let posted = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtSetIoCompletion", handle, 0, 0, 0x103));
     let front = port.as_ref().and_then(|port| port.with(|state| state.packets.front().map(|packet| packet.values())));
     assert(posted == 0 && front == Some((0x1122_3344_5566_7788, 0xAABB_CCDD_0000_0001, 0x103, 0x99)), "usercompletion: pacote com chave, contexto, status e informacao");
     guest::write64(rsp + 0x28, 0);
@@ -1430,6 +1429,12 @@ fn user_io_completion(assert: Assert) {
 static THREAD_WAIT_CLEANUP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn user_threads(assert: Assert) {
+    // As threads nascem num processo de usuário real, com PEB própria.
+    let ran = with_test_process("threads.exe", None, |test| user_threads_in(assert, test));
+    assert(ran.is_some(), "userthreads: processo de usuario do teste");
+}
+
+fn user_threads_in(assert: Assert, test: &TestProcess) {
     use crate::ntos::ke::{thread_dispatch, thread_priority};
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::threads::{self, Wait};
@@ -1439,16 +1444,15 @@ fn user_threads(assert: Assert) {
         assert(false, "userthreads: memoria de usuario");
         return;
     };
-    let (out, info, list, cid, teb_out, timeout, image, peb, rsp) = (block, block + 0x40, block + 0x100, block + 0x180, block + 0x190, block + 0x1A0, block + 0x1000, block + 0x2000, block + 0x3000);
+    let (out, info, list, cid, teb_out, timeout, image, peb, rsp) = (block, block + 0x40, block + 0x100, block + 0x180, block + 0x190, block + 0x1A0, block + 0x1000, test.peb, block + 0x3000);
     let (client_id, delay) = unsafe { (nt::ClientId::at(cid), nt::LargeInteger::at(timeout)) };
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
-    // PEB e cabeçalho de imagem mínimos: reserva de pilha de 0x20000.
+    // PEB do processo e cabeçalho de imagem mínimos: reserva de pilha de 0x20000.
     unsafe { nt::Peb::at(peb) }.image_base_address.set(image);
     unsafe { nt::ImageDosHeader::at(image) }.e_lfanew.set(0x80);
     unsafe { nt::ImageNtHeaders64::at(image + 0x80) }.optional_header.size_of_stack_reserve.set(0x20000);
-    let saved_peb = state::with(|state| core::mem::replace(&mut state.current_peb_va, peb));
     let known = threads::all().len();
-    let process_pointer = process::get_current_process();
+    let process_pointer = test.process;
     let baseline = unsafe { nt::Eprocess::at(process_pointer) }.active_threads.get();
     if baseline == 0 {
         process::add_thread(process_pointer);
@@ -1477,7 +1481,6 @@ fn user_threads(assert: Assert) {
     let Some(thread) = thread.filter(|_| created == 0) else {
         assert(false, "userthreads: NtCreateThreadEx suspensa e oculta");
         threads::set_running(false, None);
-        state::with(|state| state.current_peb_va = saved_peb);
         return;
     };
     let (pointer, teb) = (thread.pointer(), thread.with(|thread| thread.teb_va));
@@ -1531,9 +1534,7 @@ fn user_threads(assert: Assert) {
     guest::write64(raw + 16, 0xABCD);
     guest::write64(raw + 24, 0x1234);
     guest::write64(rsp + 0x28, 0x10);
-    state::with(|state| state.service_raw_arguments = raw);
-    let _ = call("NtSetIoCompletion", port_handle, 0, 0, 0x55);
-    state::with(|state| state.service_raw_arguments = 0);
+    let _ = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtSetIoCompletion", port_handle, 0, 0, 0x55));
     guest::write64(rsp + 0x28, 0);
     let removed = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);
     assert(removed == 0 && guest::read64(info) == 0xABCD && guest::read64(info + 8) == 0x1234 && unsafe { nt::IoStatusBlock::at(info + 16) }.status.get() == 0x55 && unsafe { nt::IoStatusBlock::at(info + 16) }.information.get() == 0x10 && port.as_ref().is_some_and(|port| port.with(|state| state.active.contains(&pointer) && state.associated.contains(&pointer) && state.waiters.is_empty())), "userthreads: NtRemoveIoCompletion entrega o pacote e ativa a thread");
@@ -1556,7 +1557,6 @@ fn user_threads(assert: Assert) {
     if baseline == 0 {
         process::remove_thread(process_pointer);
     }
-    state::with(|state| state.current_peb_va = saved_peb);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -1594,10 +1594,7 @@ fn user_wait_packets(assert: Assert) {
         guest::write64(rsp + 0x38, 0x99);
         guest::write64(rsp + 0x40, already);
         guest::write8(already, 0xFF);
-        state::with(|state| state.service_raw_arguments = raw);
-        let status = call("NtAssociateWaitCompletionPacket", packet_handle, port_handle, target, 0);
-        state::with(|state| state.service_raw_arguments = 0);
-        status
+        state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtAssociateWaitCompletionPacket", packet_handle, port_handle, target, 0))
     };
     assert(associate(event) == 0 && guest::read8(already) == 0 && phase() == 1 && guest::read64(packet + 0x20) != 0 && depth() == 0, "userwaitpackets: associacao pendente com evento nao sinalizado");
     assert(associate(event) == 0xC000_000D && associate(port_handle) == 0xC000_000D, "userwaitpackets: pacote ja associado");
@@ -1759,39 +1756,40 @@ fn user_system_services(assert: Assert) {
         }
     }
     guest::free_bytes(destination);
-    // Estruturas de processo para o loader da ntdll.
-    let process_pointer = guest::alloc_bytes(nt::Eprocess::SIZE);
-    guest::write_bytes(process_pointer, &alloc::vec![0u8; nt::Eprocess::SIZE as usize]);
-    let (saved_peb, saved_ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
-    let regions_before = memory::Space::current().regions().len();
-    let built = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, process_pointer, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44, stack_base: 0x20_0000, stack_top: 0x30_0000 });
-    if let Ok(teb) = built {
-        let (peb, ldr) = state::with(|state| (state.current_peb_va, state.current_ldr_va));
-        let (teb_view, peb_view, ldr_data) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr)) };
-        let rupp = peb_view.process_parameters.get();
-        let parameters = unsafe { nt::RtlUserProcessParameters::at(rupp) };
-        assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == 0x6F0 && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && unsafe { nt::Eprocess::at(process_pointer) }.peb.get() == peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada) e PEB publicados");
-        assert(peb_view.image_base_address.get() == 0x1_4000_0000 && peb_view.ldr.get() == ldr && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2");
-        assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
-        let image_path = parameters.image_path_name.buffer.get();
-        assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && parameters.environment.get() > rupp, "userservices: parametros auto-relativos com ambiente absoluto");
-        let entry = guest::alloc_bytes(nt::LdrDataTableEntry::SIZE);
-        structures::insert_list_tail(ldr, core::mem::offset_of!(nt::PebLdrData, in_load_order_module_list) as u64, entry, core::mem::offset_of!(nt::LdrDataTableEntry, in_load_order_links) as u64);
-        assert(ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == entry && unsafe { nt::LdrDataTableEntry::at(entry) }.in_load_order_links.flink.get() == ldr_data.in_load_order_module_list.address(), "userservices: insercao no fim da lista LDR");
-        structures::write_list_head(ldr_data.in_load_order_module_list.address());
-        guest::free_bytes(entry);
-    } else {
-        assert(false, "userservices: estruturas de processo");
-    }
-    state::with(|state| {
-        state.current_peb_va = saved_peb;
-        state.current_ldr_va = saved_ldr;
+    // Estruturas de processo para o loader da ntdll, num processo real: a
+    // PEB vai para o EPROCESS e a PEB_LDR_DATA para o estado do processo.
+    let built = with_test_process("estruturas.exe", None, |test| {
+        let regions_before = memory::Space::current().regions().len();
+        let built = structures::build_process_structures(&structures::ProcessDescription { process_id: test.process_id, thread_id: test.thread_id, process_pointer: test.process, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0x44, stack_base: 0x20_0000, stack_top: 0x30_0000 });
+        if let Ok(teb) = built {
+            let peb = unsafe { nt::Eprocess::at(test.process) }.peb.get();
+            let ldr = crate::ntos::ps::user::process_state::get(test.process).map_or(0, |identity| identity.ldr());
+            let (teb_view, peb_view, ldr_data) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr)) };
+            let rupp = peb_view.process_parameters.get();
+            let parameters = unsafe { nt::RtlUserProcessParameters::at(rupp) };
+            assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == test.thread_id && teb_view.client_id.unique_process.get() == test.process_id && teb_view.process_environment_block.get() == peb && peb == teb + 0x2000 && peb != test.peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada e o CLIENT_ID do processo) e PEB publicada no EPROCESS");
+            assert(ldr != 0 && peb_view.image_base_address.get() == 0x1_4000_0000 && peb_view.ldr.get() == ldr && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32, "userservices: campos do PEB 24H2 e PEB_LDR_DATA no estado do processo");
+            assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
+            let image_path = parameters.image_path_name.buffer.get();
+            assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && parameters.environment.get() > rupp, "userservices: parametros auto-relativos com ambiente absoluto");
+            let entry = guest::alloc_bytes(nt::LdrDataTableEntry::SIZE);
+            structures::insert_list_tail(ldr, core::mem::offset_of!(nt::PebLdrData, in_load_order_module_list) as u64, entry, core::mem::offset_of!(nt::LdrDataTableEntry, in_load_order_links) as u64);
+            assert(ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == entry && unsafe { nt::LdrDataTableEntry::at(entry) }.in_load_order_links.flink.get() == ldr_data.in_load_order_module_list.address(), "userservices: insercao no fim da lista LDR");
+            structures::write_list_head(ldr_data.in_load_order_module_list.address());
+            guest::free_bytes(entry);
+        } else {
+            assert(false, "userservices: estruturas de processo");
+        }
+        let added: alloc::vec::Vec<_> = memory::Space::current().regions().split_off(regions_before);
+        for region in &added {
+            memory::release_private_region(region);
+        }
     });
-    let added: alloc::vec::Vec<_> = memory::Space::current().regions().split_off(regions_before);
-    for region in &added {
-        memory::release_private_region(region);
-    }
-    guest::free_bytes(process_pointer);
+    // Sem estado de processo não há onde publicar a PEB_LDR_DATA.
+    let orphan = guest::alloc_bytes(nt::Eprocess::SIZE);
+    let refused = structures::build_process_structures(&structures::ProcessDescription { process_id: 0x6F0, thread_id: 0x6F4, process_pointer: orphan, image_base: 0x1_4000_0000, dos_path: "C:\\teste.exe", detached: true, console_handle: 0, stack_base: 0x20_0000, stack_top: 0x30_0000 }).is_err();
+    guest::free_bytes(orphan);
+    assert(built.is_some() && refused, "userservices: estruturas so para um processo real");
 }
 
 /// Executável mínimo que importa NtTerminateProcess da ntdll pelo nome.
@@ -1861,18 +1859,20 @@ fn user_loader(assert: Assert) {
         let mut image = image;
         let _ = image.release();
     }
-    // Entradas LDR numa PEB_LDR_DATA própria.
-    let space = memory::Space::current();
-    let saved_ldr = state::with(|state| state.current_ldr_va);
-    let saved_strings = space.with_vad(|vad| vad.ldr_strings).unwrap_or_default();
-    let regions_before = space.regions().len();
-    if let Ok(ldr) = memory::map_user_region(0x1000) {
+    // Sem PEB_LDR_DATA do kernel no processo corrente, nenhuma entrada.
+    assert(loader::create_ldr_entry(&ntdll).is_err(), "userloader: entrada LDR exige a PEB_LDR_DATA do processo");
+    // Entradas LDR na PEB_LDR_DATA do estado de um processo real, com VAD
+    // (e cursor das strings LDR) próprio.
+    let ran = with_test_process("loader.exe", None, |test| {
+        let regions_before = memory::Space::current().regions().len();
+        let Ok(ldr) = memory::map_user_region(0x1000) else { return };
         let ldr_data = unsafe { nt::PebLdrData::at(ldr) };
         for head in [&ldr_data.in_load_order_module_list, &ldr_data.in_memory_order_module_list, &ldr_data.in_initialization_order_module_list] {
             crate::ntos::ps::user::structures::write_list_head(head.address());
         }
-        state::with(|state| state.current_ldr_va = ldr);
-        space.with_vad(|vad| vad.ldr_strings.0 = 0);
+        if let Some(identity) = crate::ntos::ps::user::process_state::get(test.process) {
+            identity.set_ldr(ldr);
+        }
         let entry = loader::create_ldr_entry(&ntdll).unwrap_or(0);
         let exe = loader::Module { name: alloc::string::String::from("teste.exe"), full_name: alloc::string::String::from("C:\\teste.exe"), image_base: 0x1_4000_0000, size_of_image: 0x2000, entry_point: 0x1_4000_1000, exports: Default::default(), is_exe: true, notification_source: None };
         let second = loader::create_ldr_entry(&exe).unwrap_or(0);
@@ -1880,13 +1880,12 @@ fn user_loader(assert: Assert) {
         let full = dll.full_dll_name.buffer.get();
         assert(entry != 0 && dll.dll_base.get() == ntdll.image_base && dll.entry_point.get() == ntdll.entry_point && dll.flags.get() == 0x4006 && dll.obsolete_load_count.get() == 0xFFFF && dll.full_dll_name.length.get() == 58 && guest::read16(full) == b'C' as u16, "userloader: entrada LDR da DLL com nomes e flags");
         assert(second != 0 && exe_entry.entry_point.get() == 0 && exe_entry.flags.get() == 0x4002 && ldr_data.in_load_order_module_list.flink.get() == entry && ldr_data.in_load_order_module_list.blink.get() == second && dll.in_load_order_links.flink.get() == second && ldr_data.in_initialization_order_module_list.flink.get() == dll.in_initialization_order_links.address(), "userloader: exe sem EntryPoint e listas na ordem de carga");
-    }
-    state::with(|state| state.current_ldr_va = saved_ldr);
-    space.with_vad(|vad| vad.ldr_strings = saved_strings);
-    let added: alloc::vec::Vec<_> = space.regions().split_off(regions_before);
-    for region in &added {
-        memory::release_private_region(region);
-    }
+        let added: alloc::vec::Vec<_> = memory::Space::current().regions().split_off(regions_before);
+        for region in &added {
+            memory::release_private_region(region);
+        }
+    });
+    assert(ran.is_some(), "userloader: processo de usuario do teste");
 }
 
 fn user_nls(assert: Assert) {
@@ -1967,7 +1966,9 @@ fn user_syscalls_core(assert: Assert) {
     guest::write64(string, 0x1234);
     assert(call("NtRaiseHardError", 0xC000_0135, 5, 0, string) == 0xC000_000D && call("NtRaiseHardError", 0xC000_0135, 1, 0, string) == 0 && guest::read32(info) == 2, "usercore: HARDERROR responde ResponseAbort");
     guest::write64(rsp + 0x28, info);
-    let (peb, process_id) = state::with(|state| (state.current_peb_va, state.current_process_id));
+    // O processo corrente pelo EPROCESS (aqui o System, sem PEB).
+    let current = unsafe { nt::Eprocess::at(crate::ntos::ps::process::get_current_process()) };
+    let (peb, process_id) = (current.peb.get(), current.unique_process_id.get());
     assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x30) == 0 && { let basic = unsafe { nt::ProcessBasicInformation::at(buffer) }; basic.exit_status.get() == 0x103 && basic.peb_base_address.get() == peb && basic.unique_process_id.get() == process_id } && guest::read32(info) == 0x30, "usercore: ProcessBasicInformation");
     assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x40) == 0 && { let extended = unsafe { nt::ProcessExtendedBasicInformation::at(buffer) }; extended.size.get() == 0x40 && extended.basic_info.exit_status.get() == 0x103 } && call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x20) == 0xC000_0004 && guest::read32(info) == 0x30, "usercore: informacao basica estendida e tamanho invalido");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
@@ -2055,7 +2056,7 @@ fn user_index(assert: Assert) {
             process::set_current_thread(thread);
             let displayed = native_call::call(gateways + 0x27 * 10, &[string]);
             let terminated = native_call::call(gateways + 0x2C * 10, &[u64::MAX, 0x55]);
-            let restored = state::with(|state| state.service_raw_arguments == 0 && state.service_stack.is_none());
+            let restored = state::syscall_record() == state::SyscallRecord::default();
             process::set_current_thread(previous);
             let _ = process::release_thread(thread);
             assert(displayed == 0 && terminated as u32 == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x55 && restored, "userindex: syscall de UserMode pelo descritor ate o handler, com o contexto restaurado");
@@ -2348,18 +2349,28 @@ fn user_windows_process(assert: Assert) {
     // Executável que encerra o processo com 0x5A pela syscall.
     let entry: &[u8] = &[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0xBA, 0x5A, 0x00, 0x00, 0x00, 0x49, 0x89, 0xCA, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE];
     let exe = single_section_image(0x1_4000_0000, 0x0022, b".text", 0x6000_0020, 0x1000, entry);
-    // Onde o processo ficou: a imagem principal, a PEB e a base da pilha
-    // da primeira thread (StackLimit da TEB, logo abaixo da PEB).
+    // Onde o processo ficou: a imagem principal, a PEB (do EPROCESS) e a
+    // base da pilha da primeira thread (StackLimit da TEB, logo abaixo da
+    // PEB). Com o processo vivo, também o caminho da imagem no estado do
+    // processo e os ids da primeira thread.
     let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
     let owner = core::cell::Cell::new(0u64);
     let system_regions = memory::Space::system().regions().len();
+    let identity = core::cell::RefCell::new((alloc::string::String::new(), false));
     let created = |process_id: u64| -> Result<(), KernelError> {
-        let pointer = crate::ntos::ps::process::list_active_processes().into_iter().find(|entry| entry.pid == process_id).map_or(0, |entry| entry.address);
+        let active = crate::ntos::ps::process::list_active_processes().into_iter().find(|entry| entry.pid == process_id);
+        let pointer = active.as_ref().map_or(0, |entry| entry.address);
         owner.set(pointer);
         let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
-        let peb = state::with(|state| state.current_peb_va);
-        let stack = if peb != 0 { unsafe { nt::Teb::at(peb - 0x2000) }.nt_tib.stack_limit.get() } else { 0 };
+        let peb = if pointer != 0 { unsafe { nt::Eprocess::at(pointer) }.peb.get() } else { 0 };
+        let teb = (peb != 0).then(|| unsafe { nt::Teb::at(peb - 0x2000) });
+        let stack = teb.map_or(0, |teb| teb.nt_tib.stack_limit.get());
         placed.set((exe_base, peb, stack));
+        let image = crate::ntos::ps::user::process_state::get(pointer).map(|identity| identity.image_path()).unwrap_or_default();
+        // A primeira thread tem TID próprio, o mesmo na TEB e no ETHREAD.
+        let thread_ids: Vec<u64> = active.map(|entry| entry.threads.iter().filter_map(|&thread| crate::ntos::ps::process::thread_record(thread).map(|record| record.id)).collect()).unwrap_or_default();
+        let distinct = thread_ids.len() == 1 && thread_ids[0] != process_id && teb.is_some_and(|teb| teb.client_id.unique_thread.get() == thread_ids[0] && teb.client_id.unique_process.get() == process_id);
+        *identity.borrow_mut() = (image, distinct);
         Ok(())
     };
     let result = process::run_windows_process(Some(exe), "opennt-teste.exe", "C:\\opennt-teste.exe", None, process::RunOptions { on_process_created: Some(&created), ..process::RunOptions::default() });
@@ -2368,7 +2379,9 @@ fn user_windows_process(assert: Assert) {
         crate::debug_print!("[userprocess] resultado {:?}", result.as_ref().map_err(|error| alloc::format!("{error}")));
     }
     assert(ran, "userprocess: runWindowsProcess passa por LdrInitializeThunk, entra no exe e sai com o codigo");
-    assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0) && state.current_image_path == "C:\\opennt-teste.exe") && crate::ntos::ps::user::threads::all().len() == 1, "userprocess: apiset, NLS, caminho da imagem e thread principal do processo");
+    let (image_path, distinct_ids) = identity.borrow().clone();
+    assert(state::with(|state| state.api_set_map_va != 0 && state.nls_vas.is_some_and(|vas| vas.ansi != 0 && vas.oem != 0 && vas.unicode != 0)) && image_path == "C:\\opennt-teste.exe" && crate::ntos::ps::user::threads::all().len() == 1, "userprocess: apiset, NLS, caminho da imagem e thread principal do processo");
+    assert(distinct_ids, "userprocess: PID e TID da thread principal distintos, o mesmo TID na TEB e no ETHREAD");
     assert(owner.get() != 0 && crate::ntos::ps::user::process_state::get(owner.get()).is_none() && memory::Space::of(owner.get()).regions().is_empty() && memory::Space::system().regions().len() == system_regions, "userprocess: o VAD do processo volta no termino e nada dele foi para o System");
     let (exe_base, peb, stack) = placed.get();
     let user = |address: u64| crate::ntos::mm::memory_map::is_user_range(address, 0x1000);
@@ -2416,9 +2429,7 @@ fn user_tokens(assert: Assert) {
         guest::write64(raw + (index as u64 + 1) * 8, value);
     }
     guest::write64(rsp + 0x28, returned);
-    state::with(|state| state.service_raw_arguments = raw);
-    let statistics = call("NtQueryInformationToken", token, 10, buffer, 56);
-    state::with(|state| state.service_raw_arguments = 0);
+    let statistics = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtQueryInformationToken", token, 10, buffer, 56));
     assert(statistics == 0 && guest::read32(returned) == 56, "usertokens: TokenStatistics pela variante de syscall");
     assert(call("NtOpenThreadToken", (-2i64) as u64, 8, 0, out) == 0xC000_007C, "usertokens: thread sem impersonacao nao tem token");
     guest::write32(rsp + 0x28, 0);
@@ -2443,50 +2454,37 @@ fn user_query_object(assert: Assert) {
         guest::write64(rsp + 0x28, returned);
         call("NtQueryObject", handle, class, buffer, length)
     };
-    // O handle é aberto e consultado na tabela do processo de usuário.
-    let previous = crate::ntos::ps::process::get_current_thread();
-    let saved_pid = state::with(|state| state.current_process_id);
-    let Ok(owner) = crate::ntos::ps::process::create_process(0x7F20, "consulta.exe", 0, None) else {
-        assert(false, "userquery: processo de usuario");
-        return;
-    };
-    let Ok(thread) = crate::ntos::ps::process::create_kernel_thread(owner, 0x7F24, true, 1, None) else {
-        assert(false, "userquery: thread do processo");
-        return;
-    };
-    crate::ntos::ps::process::set_current_thread(thread);
-    state::with(|state| state.current_process_id = 0x7F20);
-    // Evento nomeado do processo.
-    state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
-    state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
-    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
-    guest::write64(rsp + 0x28, 0);
-    let created = call("NtCreateEvent", out, 0x1F_0003, attributes, 0);
-    let event = guest::read64(out);
-    assert(created == 0, "userquery: evento nomeado");
-    assert(query(event, 0, 56) == 0 && { let basic = unsafe { nt::ObjectBasicInformation::at(buffer) }; basic.granted_access.get() == 0x1F_0003 && basic.handle_count.get() == 1 && basic.pointer_count.get() >= 1 }, "userquery: OBJECT_BASIC_INFORMATION com acesso e handles");
-    let named = query(event, 1, 0x100);
-    let name_info = unsafe { nt::ObjectNameInformation::at(buffer) };
-    let length = name_info.name.length.get() as u64;
-    assert(named == 0 && length == 36 && name_info.name.buffer.get() == buffer + nt::ObjectNameInformation::SIZE && state::read_user_wide_string(name_info.name.buffer.get(), length / 2) == "\\OpenNtEventoQuery", "userquery: nome do objeto pelo namespace");
-    let typed = query(event, 2, 0x200);
-    assert(typed == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Event", "userquery: OBJECT_TYPE_INFORMATION do evento");
-    assert(query(event, 4, 2) == 0 && query(event, 5, 8) == 0xC000_0003 && query(event, 0, 40) == 0xC000_0004 && query(event, 1, 8) == 0xC000_0004 && guest::read32(returned) == 54, "userquery: flags, classe e tamanhos invalidos com o tamanho exigido");
-    assert(query(event, 3, 0x2000) == 0 && unsafe { nt::ObjectTypesInformation::at(buffer) }.number_of_types.get() as usize == crate::ntos::ob::object_types::all().len(), "userquery: lista de todos os tipos");
-    // Pseudo-handle do processo, handles inválidos e alinhamento.
-    let process = query(u64::MAX, 2, 0x200);
-    assert(process == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Process", "userquery: pseudo-handle do processo corrente");
-    guest::write64(rsp + 0x28, returned);
-    assert(query(0x7FF0, 0, 56) == 0xC000_0008 && query(0x8000_0000, 0, 56) == 0xC000_0008 && call("NtQueryObject", event, 0, buffer + 1, 56) == 0x8000_0002, "userquery: handles invalidos e saida desalinhada");
-    // ZwQueryObject pelo caminho de kernel.
-    let kernel = guest::alloc_bytes(0x100);
-    assert(query_object::query(u64::MAX, 0, kernel, 56, 0).ok() == Some(0) && unsafe { nt::ObjectBasicInformation::at(kernel) }.granted_access.get() == crate::ntos::ob::object_types::process_type().valid_access, "userquery: ZwQueryObject do processo corrente em KernelMode");
-    guest::free_bytes(kernel);
-    let _ = call("NtClose", event, 0, 0, 0);
-    crate::ntos::ps::process::set_current_thread(previous);
-    state::with(|state| state.current_process_id = saved_pid);
-    let _ = crate::ntos::ps::process::release_thread(thread);
-    let _ = crate::ntos::ps::process::terminate_process(owner, 0);
+    // O handle é aberto e consultado na tabela de um processo de usuário real.
+    let ran = with_test_process("consulta.exe", None, |_| {
+        // Evento nomeado do processo.
+        state::write_user_wide(attributes + 0x80, "\\OpenNtEventoQuery");
+        state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\OpenNtEventoQuery");
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);
+        guest::write64(rsp + 0x28, 0);
+        let created = call("NtCreateEvent", out, 0x1F_0003, attributes, 0);
+        let event = guest::read64(out);
+        assert(created == 0, "userquery: evento nomeado");
+        assert(query(event, 0, 56) == 0 && { let basic = unsafe { nt::ObjectBasicInformation::at(buffer) }; basic.granted_access.get() == 0x1F_0003 && basic.handle_count.get() == 1 && basic.pointer_count.get() >= 1 }, "userquery: OBJECT_BASIC_INFORMATION com acesso e handles");
+        let named = query(event, 1, 0x100);
+        let name_info = unsafe { nt::ObjectNameInformation::at(buffer) };
+        let length = name_info.name.length.get() as u64;
+        assert(named == 0 && length == 36 && name_info.name.buffer.get() == buffer + nt::ObjectNameInformation::SIZE && state::read_user_wide_string(name_info.name.buffer.get(), length / 2) == "\\OpenNtEventoQuery", "userquery: nome do objeto pelo namespace");
+        let typed = query(event, 2, 0x200);
+        assert(typed == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Event", "userquery: OBJECT_TYPE_INFORMATION do evento");
+        assert(query(event, 4, 2) == 0 && query(event, 5, 8) == 0xC000_0003 && query(event, 0, 40) == 0xC000_0004 && query(event, 1, 8) == 0xC000_0004 && guest::read32(returned) == 54, "userquery: flags, classe e tamanhos invalidos com o tamanho exigido");
+        assert(query(event, 3, 0x2000) == 0 && unsafe { nt::ObjectTypesInformation::at(buffer) }.number_of_types.get() as usize == crate::ntos::ob::object_types::all().len(), "userquery: lista de todos os tipos");
+        // Pseudo-handle do processo, handles inválidos e alinhamento.
+        let process = query(u64::MAX, 2, 0x200);
+        assert(process == 0 && { let type_info = unsafe { nt::ObjectTypeInformation::at(buffer) }; state::read_user_wide_string(type_info.type_name.buffer.get(), type_info.type_name.length.get() as u64 / 2) } == "Process", "userquery: pseudo-handle do processo corrente");
+        guest::write64(rsp + 0x28, returned);
+        assert(query(0x7FF0, 0, 56) == 0xC000_0008 && query(0x8000_0000, 0, 56) == 0xC000_0008 && call("NtQueryObject", event, 0, buffer + 1, 56) == 0x8000_0002, "userquery: handles invalidos e saida desalinhada");
+        // ZwQueryObject pelo caminho de kernel.
+        let kernel = guest::alloc_bytes(0x100);
+        assert(query_object::query(u64::MAX, 0, kernel, 56, 0).ok() == Some(0) && unsafe { nt::ObjectBasicInformation::at(kernel) }.granted_access.get() == crate::ntos::ob::object_types::process_type().valid_access, "userquery: ZwQueryObject do processo corrente em KernelMode");
+        guest::free_bytes(kernel);
+        let _ = call("NtClose", event, 0, 0, 0);
+    });
+    assert(ran.is_some(), "userquery: processo de usuario");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -2509,9 +2507,7 @@ fn user_remove_completion(assert: Assert) {
         guest::write64(raw + 16, key);
         guest::write64(raw + 24, key + 1);
         guest::write64(rsp + 0x28, key + 2);
-        state::with(|state| state.service_raw_arguments = raw);
-        let _ = call("NtSetIoCompletion", port, 0, 0, 0);
-        state::with(|state| state.service_raw_arguments = 0);
+        let _ = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtSetIoCompletion", port, 0, 0, 0));
     }
     // Lote de dois em UserMode: FILE_IO_COMPLETION_INFORMATION de 32 bytes.
     unsafe { nt::LargeInteger::at(timeout) }.quad_part.set(0);
@@ -3838,45 +3834,32 @@ fn user_wnf(assert: Assert) {
     assert(updated == Some(0) && queried == Some(0) && read == (1, 4, 0xFEED_BEEF) && untyped == Some(0xC000_000D) && short == Some(0xC000_0023) && short_length == 4 && bad_stamp == Some(0xC000_0005), "userwnf: NtQueryWnfStateData pela captura de usuario");
     // Inscrição e evento pertencem a um processo de usuário: um assinante do
     // System seria despachado como inscrição de kernel (callback em +0x50).
-    let previous = crate::ntos::ps::process::get_current_thread();
-    let saved_pid = state::with(|state| state.current_process_id);
-    let Ok(owner) = crate::ntos::ps::process::create_process(0x7F30, "wnf.exe", 0, None) else {
-        assert(false, "userwnf: processo de usuario");
-        return;
-    };
-    let Ok(thread) = crate::ntos::ps::process::create_kernel_thread(owner, 0x7F34, true, 1, None) else {
-        assert(false, "userwnf: thread do processo");
-        return;
-    };
-    crate::ntos::ps::process::set_current_thread(thread);
-    state::with(|state| state.current_process_id = 0x7F30);
-    // NtSubscribeWnfStateChange.
-    let identifier = block + 0x100;
-    guest::write64(identifier, 0x1234);
-    let subscribed = call("NtSubscribeWnfStateChange", name, 0, 1, identifier);
-    let subscription = guest::read64(identifier);
-    let mask = call("NtSubscribeWnfStateChange", name, 0, 0x20, identifier);
-    invalid_name.data[0].set(0xA3BC_0876);
-    invalid_name.data[1].set(0x0280_032E);
-    guest::write64(identifier, 0x1234);
-    let bad_name = call("NtSubscribeWnfStateChange", invalid_name.address(), 0, 1, identifier);
-    let zeroed = guest::read64(identifier);
-    let bad_pointer = call("NtSubscribeWnfStateChange", 0x10, 0, 1, 0);
-    assert(subscribed == Some(0) && subscription != 0 && mask == Some(0xC000_000D) && bad_name == Some(0xC000_000D) && zeroed == 0 && bad_pointer == Some(0xC000_0005), "userwnf: NtSubscribeWnfStateChange e recusas");
-    // NtSetWnfProcessNotificationEvent: uma única inscrição por processo.
-    guest::write64(rsp + 0x28, 0);
-    let created = call("NtCreateEvent", block + 0x108, 0x1F_0003, 0, 0);
-    let event = guest::read64(block + 0x108);
-    let registered = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
-    let again = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
-    let invalid = call("NtSetWnfProcessNotificationEvent", 0x7FFF_0000, 0, 0, 0);
-    assert(created == Some(0) && registered == Some(0) && again == Some(0xC000_0718) && invalid.is_some_and(|status| status & 0x8000_0000 != 0), "userwnf: evento de notificacao do processo registrado uma vez");
-    // O encerramento devolve inscrições, contexto e a referência do evento.
-    let _ = call("NtClose", event, 0, 0, 0);
-    crate::ntos::ps::process::set_current_thread(previous);
-    state::with(|state| state.current_process_id = saved_pid);
-    let _ = crate::ntos::ps::process::release_thread(thread);
-    let _ = crate::ntos::ps::process::terminate_process(owner, 0);
+    let ran = with_test_process("wnf.exe", None, |_| {
+        // NtSubscribeWnfStateChange.
+        let identifier = block + 0x100;
+        guest::write64(identifier, 0x1234);
+        let subscribed = call("NtSubscribeWnfStateChange", name, 0, 1, identifier);
+        let subscription = guest::read64(identifier);
+        let mask = call("NtSubscribeWnfStateChange", name, 0, 0x20, identifier);
+        invalid_name.data[0].set(0xA3BC_0876);
+        invalid_name.data[1].set(0x0280_032E);
+        guest::write64(identifier, 0x1234);
+        let bad_name = call("NtSubscribeWnfStateChange", invalid_name.address(), 0, 1, identifier);
+        let zeroed = guest::read64(identifier);
+        let bad_pointer = call("NtSubscribeWnfStateChange", 0x10, 0, 1, 0);
+        assert(subscribed == Some(0) && subscription != 0 && mask == Some(0xC000_000D) && bad_name == Some(0xC000_000D) && zeroed == 0 && bad_pointer == Some(0xC000_0005), "userwnf: NtSubscribeWnfStateChange e recusas");
+        // NtSetWnfProcessNotificationEvent: uma única inscrição por processo.
+        guest::write64(rsp + 0x28, 0);
+        let created = call("NtCreateEvent", block + 0x108, 0x1F_0003, 0, 0);
+        let event = guest::read64(block + 0x108);
+        let registered = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
+        let again = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
+        let invalid = call("NtSetWnfProcessNotificationEvent", 0x7FFF_0000, 0, 0, 0);
+        assert(created == Some(0) && registered == Some(0) && again == Some(0xC000_0718) && invalid.is_some_and(|status| status & 0x8000_0000 != 0), "userwnf: evento de notificacao do processo registrado uma vez");
+        // O encerramento devolve inscrições, contexto e a referência do evento.
+        let _ = call("NtClose", event, 0, 0, 0);
+    });
+    assert(ran.is_some(), "userwnf: processo de usuario");
     assert(service::shutdown().is_ok() && !service::exists(), "userwnf: encerramento do servico");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
@@ -4114,7 +4097,6 @@ fn user_process_information_hooks(assert: Assert) {
     assert(slot_ok && swap_ok && tls_refusals == (Some(0xC000_000D), Some(0xC000_0004), Some(0xC000_000D)), "userinfo: troca de slot e de vetor TLS das threads");
     // ProcessDebugPort (7) pelos argumentos brutos da syscall.
     let raw = guest::alloc_bytes(0x40);
-    let saved_raw = state::with(|state| core::mem::replace(&mut state.service_raw_arguments, raw));
     let out = block + 0x500;
     let returned = block + 0x510;
     guest::write64(rsp + 0x28, returned);
@@ -4123,7 +4105,7 @@ fn user_process_information_hooks(assert: Assert) {
         guest::write64(raw + 16, 7);
         guest::write64(raw + 24, target);
         guest::write64(raw + 32, length);
-        call("NtQueryInformationProcess", handle, 7, target, length)
+        state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtQueryInformationProcess", handle, 7, target, length))
     };
     guest::write64(out, 0x55);
     let none = query(u64::MAX, out, 8);
@@ -4136,7 +4118,6 @@ fn user_process_information_hooks(assert: Assert) {
     let debugged_value = guest::read64(out);
     current_process.debug_port.set(saved_port);
     let refusals = (query(u64::MAX, out, 4), query(u64::MAX, out + 1, 8), query(u64::MAX - 1, out, 8), query(0x7FF0, out, 8));
-    state::with(|state| state.service_raw_arguments = saved_raw);
     guest::free_bytes(raw);
     assert(none == Some(0) && none_value == 0 && guest::read32(returned) == 8 && debugged == Some(0) && debugged_value == u64::MAX && refusals == (Some(0xC000_0004), Some(0x8000_0002), Some(0xC000_0024), Some(0xC000_0008)), "userinfo: ProcessDebugPort indica a porta sem expor o ponteiro");
     // Captura de chamada: pedido nas células da HAL, consumo e limpeza.
@@ -4169,7 +4150,7 @@ fn section_image_views(assert: Assert) {
     use crate::ntos::mm::{memory_map, paging};
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::sections;
-    use crate::ntos::ps::user::state::{self, RegionKind};
+    use crate::ntos::ps::user::state::RegionKind;
     // Base preferida acima de 4 GB, alinhada a 64 KB.
     let preferred = 0x6_5432_0000u64;
     let mut bytes = minimal_image();
@@ -4187,7 +4168,8 @@ fn section_image_views(assert: Assert) {
     let code = paging::translate(first.view.base + 0x1000);
     let images = || crate::ntos::ps::user::memory::Space::of(owner).images();
     let listed = images().iter().any(|region| region.base() == first.view.base && region.name().as_deref() == Some("\\Device\\HarddiskVolume1\\opennt-secao.bin") && region.allocation_protect() == 0x80);
-    let exports = state::with(|state| state.mapped_image_exports.contains_key("opennt-secao.bin"));
+    // Os exports da imagem ficam no estado do processo dono da vista.
+    let exports = crate::ntos::ps::user::process_state::get(owner).is_some_and(|identity| identity.with_mapped_image_exports(|mapped| mapped.contains_key("opennt-secao.bin")));
     assert(first.view.base == preferred && first.status == 0 && code != 0 && physical::read8(code) == 0xC3 && listed && exports, "imageview: imagem inteira na base preferida, listada e com exports publicados");
     // A base preferida ocupada: a vista vai para outro endereço e o status
     // informa STATUS_IMAGE_NOT_AT_BASE.
@@ -4209,7 +4191,9 @@ fn section_image_views(assert: Assert) {
     if let Ok(Ok(view)) = partial {
         released &= section_views::unmap(&OwnedView::Image(view.view)).is_ok();
     }
-    state::with(|state| state.mapped_image_exports.remove("opennt-secao.bin"));
+    if let Some(identity) = crate::ntos::ps::user::process_state::get(owner) {
+        identity.with_mapped_image_exports(|mapped| mapped.remove("opennt-secao.bin"));
+    }
     let unlisted = !images().iter().any(|region| region.base() == first.view.base || region.base() == second.view.base);
     drop(section);
     assert(released && unlisted && sections::by_pointer(pointer).is_none(), "imageview: vistas soltas e secao destruida na ultima");
@@ -4218,7 +4202,6 @@ fn section_image_views(assert: Assert) {
 fn memory_partition(assert: Assert) {
     use crate::ntos::mm::{partition, pfn};
     use crate::ntos::ob::object_manager;
-    use crate::ntos::ps::process;
     use crate::ntos::ps::user::memory;
     // Corpo publicado no namespace, espelhando o PFN e as contagens.
     let Some(body) = partition::get() else {
@@ -4249,58 +4232,45 @@ fn memory_partition(assert: Assert) {
         let length = write_wide(text, name);
         set_unicode(unsafe { nt::UnicodeString::at(unicode) }, length, length + 2, text);
     };
-    let saved_pid = state::with(|state| state.current_process_id);
-    let previous = process::get_current_thread();
-    let Ok(owner) = process::create_process(0x7DC0, "partition.exe", 0, None) else {
-        assert(false, "partition: processo de usuario");
-        return;
-    };
-    let Ok(thread) = process::create_kernel_thread(owner, 0x7DC4, true, 1, None) else {
-        assert(false, "partition: thread do processo");
-        return;
-    };
-    process::set_current_thread(thread);
-    state::with(|state| state.current_process_id = 0x7DC0);
-    set_name("\\KernelObjects\\MemoryPartition0", 0x42, 0);
-    let opened = call("NtOpenPartition", result, 3, attributes, 0);
-    let handle = guest::read64(result);
-    let counted = (guest::read64(body), guest::read32(body + 8));
-    let resolved = partition::resolve(handle, 2, 1);
-    assert(opened == Some(0) && handle != 0 && counted == (base_refs + 1, base_handles + 1) && resolved == Ok(body), "partition: NtOpenPartition pelo nome abre o alocador real");
-    // Seção ligada à partição: a seção retém o corpo.
-    unsafe { nt::LargeInteger::at(maximum) }.quad_part.set(4096);
-    guest::write64(rsp + 40, 4);
-    guest::write64(rsp + 48, 0x804_0000);
-    guest::write64(rsp + 56, handle);
-    let created = call("NtCreateSection", result, 7, 0, maximum);
-    let section = guest::read64(result);
-    let retained = guest::read64(body) == base_refs + 2;
-    let section_resolved = crate::ntos::mm::section::handles::reference(section, crate::ntos::mm::section::handles::Kind::Section, 4, 1).is_ok_and(|reference| {
-        let partitioned = reference.section.as_ref().is_some_and(|section| section.state.lock().partition.is_some());
-        let _ = reference.release();
-        partitioned
+    let ran = with_test_process("partition.exe", None, |_| {
+        set_name("\\KernelObjects\\MemoryPartition0", 0x42, 0);
+        let opened = call("NtOpenPartition", result, 3, attributes, 0);
+        let handle = guest::read64(result);
+        let counted = (guest::read64(body), guest::read32(body + 8));
+        let resolved = partition::resolve(handle, 2, 1);
+        assert(opened == Some(0) && handle != 0 && counted == (base_refs + 1, base_handles + 1) && resolved == Ok(body), "partition: NtOpenPartition pelo nome abre o alocador real");
+        // Seção ligada à partição: a seção retém o corpo.
+        unsafe { nt::LargeInteger::at(maximum) }.quad_part.set(4096);
+        guest::write64(rsp + 40, 4);
+        guest::write64(rsp + 48, 0x804_0000);
+        guest::write64(rsp + 56, handle);
+        let created = call("NtCreateSection", result, 7, 0, maximum);
+        let section = guest::read64(result);
+        let retained = guest::read64(body) == base_refs + 2;
+        let section_resolved = crate::ntos::mm::section::handles::reference(section, crate::ntos::mm::section::handles::Kind::Section, 4, 1).is_ok_and(|reference| {
+            let partitioned = reference.section.as_ref().is_some_and(|section| section.state.lock().partition.is_some());
+            let _ = reference.release();
+            partitioned
+        });
+        assert(created == Some(0) && retained && section_resolved, "partition: secao da particao retem o corpo");
+        // Recusas da captura e do acesso.
+        let zero = call("NtOpenPartition", result, 0, attributes, 0);
+        set_name("KernelObjects\\MemoryPartition0", 0x40, 0);
+        let relative = call("NtOpenPartition", result, 3, attributes, 0);
+        set_name("\\KernelObjects\\MemoryPartition9", 0x40, 0);
+        let missing = call("NtOpenPartition", result, 3, attributes, 0);
+        set_name("\\KernelObjects\\LowMemoryCondition", 0x40, 0);
+        let wrong = call("NtOpenPartition", result, 3, attributes, 0);
+        set_name("\\KernelObjects\\MemoryPartition0", 0x1, 0);
+        let flags = call("NtOpenPartition", result, 3, attributes, 0);
+        set_name("\\KernelObjects\\MemoryPartition0\\x", 0x40, 0);
+        let through = call("NtOpenPartition", result, 3, attributes, 0);
+        let output = call("NtOpenPartition", 0x10, 3, attributes, 0);
+        assert((zero, relative, missing, wrong, flags, through, output) == (Some(0xC000_0022), Some(0xC000_003B), Some(0xC000_0034), Some(0xC000_0024), Some(0xC000_000D), Some(0xC000_003A), Some(0xC000_0005)), "partition: recusas de acesso, nome, tipo, flags e saida");
     });
-    assert(created == Some(0) && retained && section_resolved, "partition: secao da particao retem o corpo");
-    // Recusas da captura e do acesso.
-    let zero = call("NtOpenPartition", result, 0, attributes, 0);
-    set_name("KernelObjects\\MemoryPartition0", 0x40, 0);
-    let relative = call("NtOpenPartition", result, 3, attributes, 0);
-    set_name("\\KernelObjects\\MemoryPartition9", 0x40, 0);
-    let missing = call("NtOpenPartition", result, 3, attributes, 0);
-    set_name("\\KernelObjects\\LowMemoryCondition", 0x40, 0);
-    let wrong = call("NtOpenPartition", result, 3, attributes, 0);
-    set_name("\\KernelObjects\\MemoryPartition0", 0x1, 0);
-    let flags = call("NtOpenPartition", result, 3, attributes, 0);
-    set_name("\\KernelObjects\\MemoryPartition0\\x", 0x40, 0);
-    let through = call("NtOpenPartition", result, 3, attributes, 0);
-    let output = call("NtOpenPartition", 0x10, 3, attributes, 0);
-    assert((zero, relative, missing, wrong, flags, through, output) == (Some(0xC000_0022), Some(0xC000_003B), Some(0xC000_0034), Some(0xC000_0024), Some(0xC000_000D), Some(0xC000_003A), Some(0xC000_0005)), "partition: recusas de acesso, nome, tipo, flags e saida");
+    assert(ran.is_some(), "partition: processo de usuario");
     // O encerramento do processo fecha a partição e a seção da tabela
     // nativa; a seção destruída solta a referência da partição.
-    process::set_current_thread(previous);
-    state::with(|state| state.current_process_id = saved_pid);
-    let _ = process::release_thread(thread);
-    let _ = process::terminate_process(owner, 0);
     let restored = (guest::read64(body), guest::read32(body + 8)) == (base_refs, base_handles);
     assert(restored && partition::get() == Some(body), "partition: o fim do processo fecha particao e secao e o alocador fica");
     if let Some(region) = memory::find_region(block) {
@@ -4712,216 +4682,207 @@ fn usermode_syscalls_exports(assert: Assert) {
     // Argumentos de pilha 5.. (ULONG_PTR em [rsp+0x28]...).
     let stack = |index: u64, value: u64| unsafe { nt::Field::<u64>::at(rsp + 0x28 + (index - 5) * 8) }.set(value);
     let (dispatcher, routine, routine2, oa, cid, out, timeout, name, getbuf, uctx) = (block + 0x100, block + 0x180, block + 0x1C0, block + 0x500, block + 0x540, block + 0x580, block + 0x5C0, block + 0x5D0, block + 0x1000, block + 0x1800);
-    // Processo e threads de usuário simulados (não de sistema).
-    let previous_thread = process::get_current_thread();
-    let saved = state::with(|state| (state.current_process_id, state.ntdll_exports.clone()));
+    // Processo e threads de usuário (não de sistema) num processo real; a
+    // thread do processo de teste é a corrente.
+    let saved_exports = state::with(|state| state.ntdll_exports.clone());
     let snapshot = threads::all();
     let previous_current = threads::current();
-    let Ok(owner) = process::create_process(0x7DD0, "apc.exe", 0, None) else {
-        assert(false, "userapc: processo de usuario");
-        return;
-    };
-    let (Ok(first), Ok(second)) = (process::create_kernel_thread(owner, 0x7DD4, true, 1, None), process::create_kernel_thread(owner, 0x7DD8, true, 1, None)) else {
-        assert(false, "userapc: threads do processo");
-        return;
-    };
-    let thread = threads::UserThread::new(0x7DD4, first, 0, 0);
-    let other = threads::UserThread::new(0x7DD8, second, 0, 0);
-    let live = guest::alloc_aligned(nt::Context::SIZE, 16, true);
-    thread.with(|state| state.context = live);
-    threads::clear();
-    threads::push(thread.clone());
-    threads::push(other.clone());
-    process::set_current_thread(first);
-    threads::set_running(true, Some(thread.clone()));
-    state::with(|state| {
-        state.current_process_id = 0x7DD0;
-        state.ntdll_exports = Some([(alloc::string::String::from("KiUserApcDispatcher"), dispatcher)].into_iter().collect());
-    });
-    let (live_context, target) = unsafe { (nt::Context::at(live), nt::Kthread::at(first)) };
-    let reset = || {
-        threads::initialize_context(live, block + 0x200, block + 0x3000, 0, 0);
-        live_context.rax.set(0xC0);
-    };
-    reset();
-    let handle = threads::thread_handle(&thread, 0x1F_FFFF, 0).unwrap_or(0);
-    let limited = threads::thread_handle(&thread, 0x40, 0).unwrap_or(0);
-    let head = &target.apc_state.apc_list_head[1];
-    let pending = || target.apc_state.user_apc_pending_all.get();
-    // Frame do KiUserApcDispatcher: MACHINE_FRAME alinhado logo abaixo da
-    // pilha; CONTEXT 0x530 bytes antes (CONTEXT + CONTEXT_EX/KCONTINUE_ARGUMENT/APC_CALLBACK_DATA, 0x20 cada).
-    let machine = (block + 0x3000 - nt::MachineFrame::SIZE) & !15;
-    let frame = machine - (nt::Context::SIZE + 0x60);
-    let (apc_frame, continuation, callback, machine_frame) = unsafe { (nt::Context::at(frame), KcontinueArgument::at(frame + 0x4F0), ApcCallbackData::at(frame + 0x510), nt::MachineFrame::at(machine)) };
-    let homes = |context: &nt::Context, values: [u64; 5]| [&context.p1_home, &context.p2_home, &context.p3_home, &context.p4_home, &context.p5_home].iter().zip(values).all(|(field, value)| field.get() == value);
+    let ran = with_test_process("apc.exe", None, |test| {
+        let (owner, process_id, first, first_id) = (test.process, test.process_id, test.thread, test.thread_id);
+        let Ok(second) = process::create_kernel_thread(owner, crate::ntos::ps::cid::ALLOCATE, true, 1, None) else {
+            assert(false, "userapc: threads do processo");
+            return;
+        };
+        let second_id = unsafe { nt::Ethread::at(second) }.cid.unique_thread.get();
+        let thread = threads::UserThread::new(first_id, first, 0, 0);
+        let other = threads::UserThread::new(second_id, second, 0, 0);
+        let live = guest::alloc_aligned(nt::Context::SIZE, 16, true);
+        thread.with(|state| state.context = live);
+        threads::clear();
+        threads::push(thread.clone());
+        threads::push(other.clone());
+        threads::set_running(true, Some(thread.clone()));
+        state::with(|state| state.ntdll_exports = Some([(alloc::string::String::from("KiUserApcDispatcher"), dispatcher)].into_iter().collect()));
+        let (live_context, target) = unsafe { (nt::Context::at(live), nt::Kthread::at(first)) };
+        let reset = || {
+            threads::initialize_context(live, block + 0x200, block + 0x3000, 0, 0);
+            live_context.rax.set(0xC0);
+        };
+        reset();
+        let handle = threads::thread_handle(&thread, 0x1F_FFFF, 0).unwrap_or(0);
+        let limited = threads::thread_handle(&thread, 0x40, 0).unwrap_or(0);
+        let head = &target.apc_state.apc_list_head[1];
+        let pending = || target.apc_state.user_apc_pending_all.get();
+        // Frame do KiUserApcDispatcher: MACHINE_FRAME alinhado logo abaixo da
+        // pilha; CONTEXT 0x530 bytes antes (CONTEXT + CONTEXT_EX/KCONTINUE_ARGUMENT/APC_CALLBACK_DATA, 0x20 cada).
+        let machine = (block + 0x3000 - nt::MachineFrame::SIZE) & !15;
+        let frame = machine - (nt::Context::SIZE + 0x60);
+        let (apc_frame, continuation, callback, machine_frame) = unsafe { (nt::Context::at(frame), KcontinueArgument::at(frame + 0x4F0), ApcCallbackData::at(frame + 0x510), nt::MachineFrame::at(machine)) };
+        let homes = |context: &nt::Context, values: [u64; 5]| [&context.p1_home, &context.p2_home, &context.p3_home, &context.p4_home, &context.p5_home].iter().zip(values).all(|(field, value)| field.get() == value);
 
-    // NtQueueApcThread*: recusas na ordem do NtQueueApcThreadEx2.
-    stack(5, 0x33);
-    stack(6, 0);
-    stack(7, 0);
-    assert(call("NtQueueApcThreadEx2", handle, 0, 2, routine) == 0xC000_000D && call("NtQueueApcThreadEx2", handle, 4, 1, routine) == 0xC000_000D && call("NtQueueApcThread", limited, routine, 0x11, 0x22) == 0xC000_0022 && call("NtQueueApcThreadEx", handle, 0x7FF0, routine, 0x11) == 0xC000_0008, "userapc: flags, reserva com especial, acesso e reserva inexistente");
-    // APC normal: na fila nativa, sem pendência (thread fora de espera alertável).
-    let queued = call("NtQueueApcThread", handle, routine, 0x11, 0x22);
-    let packet = head.flink.get().wrapping_sub(offset_of!(nt::Kapc, apc_list_entry) as u64);
-    let kapc = unsafe { nt::Kapc::at(packet) };
-    assert(queued == 0 && head.flink.get() != head.address() && kapc.reserved[2].get() == routine && kapc.normal_context.get() == 0x11 && kapc.system_argument1.get() == 0x22 && kapc.system_argument2.get() == 0x33 && kapc.apc_mode.get() == 1 && kapc.inserted.get() == 1 && pending() == 0, "userapc: KAPC de usuario na fila nativa sem pendencia");
-    assert(thread_alert::consume(first, 1, false).is_none() && user_apc::deliver(&thread) == 0 && live_context.rip.get() == block + 0x200, "userapc: sem pendencia nada e entregue nem espera nao alertavel interrompida");
-    // SleepEx(..., TRUE): a espera alertável de UserMode volta com STATUS_USER_APC.
-    unsafe { nt::LargeInteger::at(timeout) }.quad_part.set(-10_000_000);
-    assert(call("NtDelayExecution", 1, timeout, 0, 0) == 0xC0 && pending() & 2 != 0 && thread_alert::consume(first, 1, false) == Some(0xC0), "userapc: espera alertavel interrompida e UserApcPending publicado");
-    // Entrega no retorno ao modo usuário.
-    let delivered = user_apc::deliver(&thread);
-    let context_ok = apc_frame.context_flags.get() == 0x10_001B && apc_frame.rip.get() == block + 0x200 && apc_frame.rsp.get() == block + 0x3000 && apc_frame.rax.get() == 0xC0 && apc_frame.e_flags.get() == 0x202;
-    let tail_ok = continuation.continue_type.get() == 1 && continuation.continue_flags.get() == 3 && machine_frame.rip.get() == block + 0x200 && machine_frame.rsp.get() == block + 0x3000;
-    let redirected = live_context.rsp.get() == frame && live_context.rip.get() == dispatcher && live_context.seg_cs.get() == 0x33;
-    assert(delivered == 0 && homes(apc_frame, [0x11, 0x22, 0x33, routine, 1]) && context_ok && tail_ok && redirected && head.flink.get() == head.address() && pending() == 0 && !kernel_pool::owns(packet), "userapc: frame CONTEXT/KCONTINUE_ARGUMENT/MACHINE_FRAME e KAPC liberada");
-    // APC especial (NtQueueApcThreadEx com 1): entregue sem espera alertável.
-    reset();
-    stack(5, 0x55);
-    stack(6, 0x66);
-    let special = call("NtQueueApcThreadEx", handle, 1, routine2, 0x44);
-    let marked = pending() & 1 != 0;
-    let delivered = user_apc::deliver(&thread);
-    assert(special == 0 && marked && delivered == 0 && homes(apc_frame, [0x44, 0x55, 0x66, routine2, 2]) && continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
-    // APC_CALLBACK_DATA (Ex2 com 0x10000) e NtTestAlert publicando a pendência.
-    reset();
-    stack(5, 0x77);
-    stack(6, 0x88);
-    stack(7, 0x99);
-    let queued_callback = call("NtQueueApcThreadEx2", handle, 0, 0x1_0000, routine);
-    let tested = call("NtTestAlert", 0, 0, 0, 0);
-    let delivered = user_apc::deliver(&thread);
-    let callback_ok = callback.parameter.get() == 0x88 && callback.context_record.get() == frame;
-    assert(queued_callback == 0 && tested == 0 && delivered == 0 && callback_ok && homes(apc_frame, [0x77, frame + 0x510, 0x99, routine, 5]), "userapc: NtTestAlert publica a pendencia e APC_CALLBACK_DATA substitui o argumento 1");
-    // NtTestAlert consome o alerta de usuário.
-    let _ = thread_alert::alert(first, 1);
-    assert(call("NtTestAlert", 0, 0, 0, 0) == 0x101 && target.alerted[1].get() == 0 && call("NtTestAlert", 0, 0, 0, 0) == 0, "userapc: NtTestAlert consome o alerta de usuario");
+        // NtQueueApcThread*: recusas na ordem do NtQueueApcThreadEx2.
+        stack(5, 0x33);
+        stack(6, 0);
+        stack(7, 0);
+        assert(call("NtQueueApcThreadEx2", handle, 0, 2, routine) == 0xC000_000D && call("NtQueueApcThreadEx2", handle, 4, 1, routine) == 0xC000_000D && call("NtQueueApcThread", limited, routine, 0x11, 0x22) == 0xC000_0022 && call("NtQueueApcThreadEx", handle, 0x7FF0, routine, 0x11) == 0xC000_0008, "userapc: flags, reserva com especial, acesso e reserva inexistente");
+        // APC normal: na fila nativa, sem pendência (thread fora de espera alertável).
+        let queued = call("NtQueueApcThread", handle, routine, 0x11, 0x22);
+        let packet = head.flink.get().wrapping_sub(offset_of!(nt::Kapc, apc_list_entry) as u64);
+        let kapc = unsafe { nt::Kapc::at(packet) };
+        assert(queued == 0 && head.flink.get() != head.address() && kapc.reserved[2].get() == routine && kapc.normal_context.get() == 0x11 && kapc.system_argument1.get() == 0x22 && kapc.system_argument2.get() == 0x33 && kapc.apc_mode.get() == 1 && kapc.inserted.get() == 1 && pending() == 0, "userapc: KAPC de usuario na fila nativa sem pendencia");
+        assert(thread_alert::consume(first, 1, false).is_none() && user_apc::deliver(&thread) == 0 && live_context.rip.get() == block + 0x200, "userapc: sem pendencia nada e entregue nem espera nao alertavel interrompida");
+        // SleepEx(..., TRUE): a espera alertável de UserMode volta com STATUS_USER_APC.
+        unsafe { nt::LargeInteger::at(timeout) }.quad_part.set(-10_000_000);
+        assert(call("NtDelayExecution", 1, timeout, 0, 0) == 0xC0 && pending() & 2 != 0 && thread_alert::consume(first, 1, false) == Some(0xC0), "userapc: espera alertavel interrompida e UserApcPending publicado");
+        // Entrega no retorno ao modo usuário.
+        let delivered = user_apc::deliver(&thread);
+        let context_ok = apc_frame.context_flags.get() == 0x10_001B && apc_frame.rip.get() == block + 0x200 && apc_frame.rsp.get() == block + 0x3000 && apc_frame.rax.get() == 0xC0 && apc_frame.e_flags.get() == 0x202;
+        let tail_ok = continuation.continue_type.get() == 1 && continuation.continue_flags.get() == 3 && machine_frame.rip.get() == block + 0x200 && machine_frame.rsp.get() == block + 0x3000;
+        let redirected = live_context.rsp.get() == frame && live_context.rip.get() == dispatcher && live_context.seg_cs.get() == 0x33;
+        assert(delivered == 0 && homes(apc_frame, [0x11, 0x22, 0x33, routine, 1]) && context_ok && tail_ok && redirected && head.flink.get() == head.address() && pending() == 0 && !kernel_pool::owns(packet), "userapc: frame CONTEXT/KCONTINUE_ARGUMENT/MACHINE_FRAME e KAPC liberada");
+        // APC especial (NtQueueApcThreadEx com 1): entregue sem espera alertável.
+        reset();
+        stack(5, 0x55);
+        stack(6, 0x66);
+        let special = call("NtQueueApcThreadEx", handle, 1, routine2, 0x44);
+        let marked = pending() & 1 != 0;
+        let delivered = user_apc::deliver(&thread);
+        assert(special == 0 && marked && delivered == 0 && homes(apc_frame, [0x44, 0x55, 0x66, routine2, 2]) && continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
+        // APC_CALLBACK_DATA (Ex2 com 0x10000) e NtTestAlert publicando a pendência.
+        reset();
+        stack(5, 0x77);
+        stack(6, 0x88);
+        stack(7, 0x99);
+        let queued_callback = call("NtQueueApcThreadEx2", handle, 0, 0x1_0000, routine);
+        let tested = call("NtTestAlert", 0, 0, 0, 0);
+        let delivered = user_apc::deliver(&thread);
+        let callback_ok = callback.parameter.get() == 0x88 && callback.context_record.get() == frame;
+        assert(queued_callback == 0 && tested == 0 && delivered == 0 && callback_ok && homes(apc_frame, [0x77, frame + 0x510, 0x99, routine, 5]), "userapc: NtTestAlert publica a pendencia e APC_CALLBACK_DATA substitui o argumento 1");
+        // NtTestAlert consome o alerta de usuário.
+        let _ = thread_alert::alert(first, 1);
+        assert(call("NtTestAlert", 0, 0, 0, 0) == 0x101 && target.alerted[1].get() == 0 && call("NtTestAlert", 0, 0, 0, 0) == 0, "userapc: NtTestAlert consome o alerta de usuario");
 
-    // NtContinueEx: alinhamentos, entrega no próprio CONTEXT e continuação.
-    guest::write_bytes(uctx, &[0u8; 0x530]);
-    let (user_context, user_continuation) = unsafe { (nt::Context::at(uctx), KcontinueArgument::at(uctx + 0x4F0)) };
-    user_context.context_flags.set(0x10_0001); // sem INTEGER: a restauração recusa
-    user_continuation.continue_type.set(1);
-    user_continuation.continue_flags.set(3);
-    assert(call("NtContinueEx", uctx, uctx + 0x4F4, 0, 0) == 0x8000_0002 && call("NtContinueEx", uctx + 8, 0, 0, 0) == 0x8000_0002 && call("NtContinue", 0, 1, 0, 0) == 0xC000_0005, "userapc: NtContinueEx alinhamentos e NtContinue sem contexto");
-    stack(5, 0xA3);
-    let self_queued = call("NtQueueApcThread", (-2i64) as u64, routine, 0xA1, 0xA2);
-    let in_place = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
-    let in_place_homes = homes(user_context, [0xA1, 0xA2, 0xA3, routine, 1]);
-    let restored = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
-    assert(self_queued == 0 && in_place == 0 && in_place_homes && head.flink.get() == head.address() && pending() == 0 && restored == 0xC000_000D, "userapc: DELIVER_APC entrega no proprio CONTEXT e sem APC segue para a restauracao");
+        // NtContinueEx: alinhamentos, entrega no próprio CONTEXT e continuação.
+        guest::write_bytes(uctx, &[0u8; 0x530]);
+        let (user_context, user_continuation) = unsafe { (nt::Context::at(uctx), KcontinueArgument::at(uctx + 0x4F0)) };
+        user_context.context_flags.set(0x10_0001); // sem INTEGER: a restauração recusa
+        user_continuation.continue_type.set(1);
+        user_continuation.continue_flags.set(3);
+        assert(call("NtContinueEx", uctx, uctx + 0x4F4, 0, 0) == 0x8000_0002 && call("NtContinueEx", uctx + 8, 0, 0, 0) == 0x8000_0002 && call("NtContinue", 0, 1, 0, 0) == 0xC000_0005, "userapc: NtContinueEx alinhamentos e NtContinue sem contexto");
+        stack(5, 0xA3);
+        let self_queued = call("NtQueueApcThread", (-2i64) as u64, routine, 0xA1, 0xA2);
+        let in_place = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
+        let in_place_homes = homes(user_context, [0xA1, 0xA2, 0xA3, routine, 1]);
+        let restored = call("NtContinueEx", uctx, uctx + 0x4F0, 0, 0);
+        assert(self_queued == 0 && in_place == 0 && in_place_homes && head.flink.get() == head.address() && pending() == 0 && restored == 0xC000_000D, "userapc: DELIVER_APC entrega no proprio CONTEXT e sem APC segue para a restauracao");
 
-    // NtGetContextThread/NtSetContextThread na thread corrente (-2).
-    reset();
-    live_context.rax.set(0x1234);
-    live_context.dr0.set(0x1111);
-    guest::write_bytes(getbuf, &[0xEE; nt::Context::SIZE as usize]);
-    let buffer = unsafe { nt::Context::at(getbuf) };
-    let current = (-2i64) as u64;
-    buffer.context_flags.set(0x10_0003);
-    let got = call("NtGetContextThread", current, getbuf, 0, 0);
-    let control_ok = buffer.rip.get() == block + 0x200 && buffer.rsp.get() == block + 0x3000 && buffer.seg_cs.get() == 0x33 && buffer.e_flags.get() == 0x202 && buffer.rax.get() == 0x1234;
-    assert(got == 0 && control_ok && buffer.context_flags.get() == 0x10_0003 && buffer.flt_save.control_word.get() == 0xEEEE, "userctx2: NtGetContextThread copia so os grupos pedidos");
-    buffer.context_flags.set(0x10_0014);
-    let segments = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.seg_ds.get() == 0x2B && buffer.seg_es.get() == 0x2B && buffer.seg_fs.get() == 0x53 && buffer.seg_gs.get() == 0x2B && buffer.dr0.get() == 0;
-    live_context.dr7.set(1);
-    let debug = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.dr0.get() == 0x1111 && buffer.dr7.get() == 1;
-    buffer.context_flags.set(0x4010_0001);
-    let reporting = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.context_flags.get() == 0xD010_0001;
-    // getbuf+8 lê ContextFlags em getbuf+0x38 (SegCs/SegDs...): válido, para chegar ao alinhamento.
-    unsafe { nt::Field::<u32>::at(getbuf + 0x38) }.set(0x10_0001);
-    buffer.context_flags.set(0x10_0040);
-    let refusals = call("NtGetContextThread", current, getbuf, 0, 0) == 0xC000_00BB && call("NtGetContextThread", current, getbuf + 8, 0, 0) == 0x8000_0002 && call("NtGetContextThread", limited, getbuf, 0, 0) == 0xC000_0022;
-    assert(segments && debug && reporting && refusals, "userctx2: segmentos fixos, banco de depuracao ativo, REPORTING|SERVICE_ACTIVE e recusas");
-    buffer.context_flags.set(0x10_0002);
-    buffer.rax.set(0xCAFE);
-    let set = call("NtSetContextThread", current, getbuf, 0, 0);
-    let applied = live_context.rax.get() == 0xCAFE && live_context.rip.get() == block + 0x200;
-    let restrict = unsafe { nt::Eprocess::at(owner) };
-    restrict.set_restrict_set_thread_context(1);
-    let restricted = call("NtSetContextThread", current, getbuf, 0, 0);
-    restrict.set_restrict_set_thread_context(0);
-    assert(set == 0 && applied && restricted == 0xC000_060A && call("NtSetContextThread", limited, getbuf, 0, 0) == 0xC000_0022, "userctx2: NtSetContextThread aplica INTEGER e RestrictSetThreadContext recusa");
+        // NtGetContextThread/NtSetContextThread na thread corrente (-2).
+        reset();
+        live_context.rax.set(0x1234);
+        live_context.dr0.set(0x1111);
+        guest::write_bytes(getbuf, &[0xEE; nt::Context::SIZE as usize]);
+        let buffer = unsafe { nt::Context::at(getbuf) };
+        let current = (-2i64) as u64;
+        buffer.context_flags.set(0x10_0003);
+        let got = call("NtGetContextThread", current, getbuf, 0, 0);
+        let control_ok = buffer.rip.get() == block + 0x200 && buffer.rsp.get() == block + 0x3000 && buffer.seg_cs.get() == 0x33 && buffer.e_flags.get() == 0x202 && buffer.rax.get() == 0x1234;
+        assert(got == 0 && control_ok && buffer.context_flags.get() == 0x10_0003 && buffer.flt_save.control_word.get() == 0xEEEE, "userctx2: NtGetContextThread copia so os grupos pedidos");
+        buffer.context_flags.set(0x10_0014);
+        let segments = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.seg_ds.get() == 0x2B && buffer.seg_es.get() == 0x2B && buffer.seg_fs.get() == 0x53 && buffer.seg_gs.get() == 0x2B && buffer.dr0.get() == 0;
+        live_context.dr7.set(1);
+        let debug = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.dr0.get() == 0x1111 && buffer.dr7.get() == 1;
+        buffer.context_flags.set(0x4010_0001);
+        let reporting = call("NtGetContextThread", current, getbuf, 0, 0) == 0 && buffer.context_flags.get() == 0xD010_0001;
+        // getbuf+8 lê ContextFlags em getbuf+0x38 (SegCs/SegDs...): válido, para chegar ao alinhamento.
+        unsafe { nt::Field::<u32>::at(getbuf + 0x38) }.set(0x10_0001);
+        buffer.context_flags.set(0x10_0040);
+        let refusals = call("NtGetContextThread", current, getbuf, 0, 0) == 0xC000_00BB && call("NtGetContextThread", current, getbuf + 8, 0, 0) == 0x8000_0002 && call("NtGetContextThread", limited, getbuf, 0, 0) == 0xC000_0022;
+        assert(segments && debug && reporting && refusals, "userctx2: segmentos fixos, banco de depuracao ativo, REPORTING|SERVICE_ACTIVE e recusas");
+        buffer.context_flags.set(0x10_0002);
+        buffer.rax.set(0xCAFE);
+        let set = call("NtSetContextThread", current, getbuf, 0, 0);
+        let applied = live_context.rax.get() == 0xCAFE && live_context.rip.get() == block + 0x200;
+        let restrict = unsafe { nt::Eprocess::at(owner) };
+        restrict.set_restrict_set_thread_context(1);
+        let restricted = call("NtSetContextThread", current, getbuf, 0, 0);
+        restrict.set_restrict_set_thread_context(0);
+        assert(set == 0 && applied && restricted == 0xC000_060A && call("NtSetContextThread", limited, getbuf, 0, 0) == 0xC000_0022, "userctx2: NtSetContextThread aplica INTEGER e RestrictSetThreadContext recusa");
 
-    // NtOpenProcess.
-    let (attributes, client) = unsafe { (nt::ObjectAttributes::at(oa), nt::ClientId::at(cid)) };
-    set_object_attributes(attributes, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
-    client.unique_process.set(0x7DD0);
-    client.unique_thread.set(0);
-    let opened_handle = unsafe { nt::Field::<u64>::at(out) };
-    let pointer_of = |handle: u64| state::get_user_handle(handle).and_then(|entry| entry.downcast::<UserProcess>().map(|object| (object.pointer, object.process_id)));
-    let access_of = |handle: u64| state::get_user_handle(handle).map(|entry| (entry.kind(), entry.access()));
-    let opened = call("NtOpenProcess", out, 0x1000, oa, cid);
-    let process_handle = opened_handle.get();
-    let entry_ok = access_of(process_handle) == Some(("process", 0x1000)) && pointer_of(process_handle) == Some((owner, 0x7DD0));
-    let maximum = call("NtOpenProcess", out, 0x0200_0000, oa, cid) == 0 && access_of(opened_handle.get()) == Some(("process", 0x1F_FFFF));
-    let maximum_handle = opened_handle.get();
-    client.unique_process.set(0);
-    client.unique_thread.set(0x7DD8);
-    let by_thread = call("NtOpenProcess", out, 0x1400, oa, cid) == 0 && pointer_of(opened_handle.get()).is_some_and(|(pointer, _)| pointer == owner);
-    let query_handle = opened_handle.get();
-    client.unique_process.set(0x7DD4);
-    let wrong_owner = call("NtOpenProcess", out, 0x1000, oa, cid);
-    client.unique_process.set(0x7FFF_FFF0);
-    client.unique_thread.set(0);
-    let missing = call("NtOpenProcess", out, 0x1000, oa, cid);
-    assert(opened == 0 && entry_ok && maximum && by_thread && wrong_owner == 0xC000_000B && missing == 0xC000_000B, "userproc: NtOpenProcess por PID, MAXIMUM_ALLOWED, pela thread e CLIENT_ID invalidos");
-    client.unique_process.set(0x7DD0);
-    let no_cid = call("NtOpenProcess", out, 0x1000, oa, 0);
-    attributes.object_name.set(name);
-    let named = call("NtOpenProcess", out, 0x1000, oa, cid);
-    attributes.object_name.set(0);
-    assert(no_cid == 0xC000_0030 && named == 0xC000_0030 && call("NtOpenProcess", out, 0x1000, 0, cid) == 0xC000_0005 && call("NtOpenProcess", out, 0x1000, oa + 2, cid) == 0x8000_0002 && call("NtOpenProcess", out, 0x1000, oa, cid + 2) == 0x8000_0002 && call("NtOpenProcess", 0, 0x1000, oa, cid) == 0xC000_0005, "userproc: NtOpenProcess recusas de mistura, nome, alinhamento e sonda");
-    // NtGetNextProcess: começo, para trás/frente a partir do processo e Flags inválido.
-    let list: Vec<u64> = process::list_active_processes().into_iter().map(|entry| entry.address).collect();
-    let pointer = |handle: u64| pointer_of(handle).map(|(pointer, _)| pointer);
-    stack(5, out);
-    let from_start = call("NtGetNextProcess", 0, 0, 0, 0) == 0 && pointer(opened_handle.get()) == list.first().copied();
-    let start_handle = opened_handle.get();
-    let index = list.iter().position(|&address| address == owner).unwrap_or(0);
-    let backward = call("NtGetNextProcess", process_handle, 0, 0, 1);
-    let backward_ok = if index == 0 { backward == 0x8000_001A } else { backward == 0 && pointer(opened_handle.get()) == Some(list[index - 1]) };
-    let backward_handle = opened_handle.get();
-    let forward = call("NtGetNextProcess", process_handle, 0, 0, 0);
-    let forward_ok = if index + 1 == list.len() { forward == 0x8000_001A && opened_handle.get() == 0 } else { forward == 0 && pointer(opened_handle.get()) == Some(list[index + 1]) };
-    let forward_handle = opened_handle.get();
-    let bad_flags = call("NtGetNextProcess", 0, 0, 0, 2);
-    stack(5, 0);
-    assert(from_start && backward_ok && forward_ok && bad_flags == 0xC000_000D && call("NtGetNextProcess", 0, 0, 0, 0) == 0xC000_0005, "userproc: NtGetNextProcess pela PsActiveProcessHead");
-    // NtGetNextThread: ordem de criação dentro do processo.
-    stack(5, 0);
-    stack(6, out);
-    let first_thread = call("NtGetNextThread", query_handle, 0, 0x40, 0) == 0 && threads::resolve(opened_handle.get(), 0x40).is_ok_and(|found| Arc::ptr_eq(&found, &thread));
-    let first_handle = opened_handle.get();
-    let second_thread = call("NtGetNextThread", query_handle, first_handle, 0x0200_0000, 0) == 0 && threads::resolve(opened_handle.get(), 0x1F_FFFF).is_ok_and(|found| Arc::ptr_eq(&found, &other));
-    let second_handle = opened_handle.get();
-    let end = call("NtGetNextThread", query_handle, second_handle, 0x40, 0);
-    let denied = call("NtGetNextThread", process_handle, 0, 0x40, 0);
-    stack(5, 1);
-    let bad_thread_flags = call("NtGetNextThread", query_handle, 0, 0x40, 0);
-    assert(first_thread && second_thread && end == 0x8000_001A && denied == 0xC000_0022 && bad_thread_flags == 0xC000_000D, "userproc: NtGetNextThread na ordem de criacao, fim, acesso ao processo e Flags");
+        // NtOpenProcess.
+        let (attributes, client) = unsafe { (nt::ObjectAttributes::at(oa), nt::ClientId::at(cid)) };
+        set_object_attributes(attributes, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
+        client.unique_process.set(process_id);
+        client.unique_thread.set(0);
+        let opened_handle = unsafe { nt::Field::<u64>::at(out) };
+        let pointer_of = |handle: u64| state::get_user_handle(handle).and_then(|entry| entry.downcast::<UserProcess>().map(|object| (object.pointer, object.process_id)));
+        let access_of = |handle: u64| state::get_user_handle(handle).map(|entry| (entry.kind(), entry.access()));
+        let opened = call("NtOpenProcess", out, 0x1000, oa, cid);
+        let process_handle = opened_handle.get();
+        let entry_ok = access_of(process_handle) == Some(("process", 0x1000)) && pointer_of(process_handle) == Some((owner, process_id));
+        let maximum = call("NtOpenProcess", out, 0x0200_0000, oa, cid) == 0 && access_of(opened_handle.get()) == Some(("process", 0x1F_FFFF));
+        let maximum_handle = opened_handle.get();
+        client.unique_process.set(0);
+        client.unique_thread.set(second_id);
+        let by_thread = call("NtOpenProcess", out, 0x1400, oa, cid) == 0 && pointer_of(opened_handle.get()).is_some_and(|(pointer, _)| pointer == owner);
+        let query_handle = opened_handle.get();
+        client.unique_process.set(first_id);
+        let wrong_owner = call("NtOpenProcess", out, 0x1000, oa, cid);
+        client.unique_process.set(0x7FFF_FFF0);
+        client.unique_thread.set(0);
+        let missing = call("NtOpenProcess", out, 0x1000, oa, cid);
+        assert(opened == 0 && entry_ok && maximum && by_thread && wrong_owner == 0xC000_000B && missing == 0xC000_000B, "userproc: NtOpenProcess por PID, MAXIMUM_ALLOWED, pela thread e CLIENT_ID invalidos");
+        client.unique_process.set(process_id);
+        let no_cid = call("NtOpenProcess", out, 0x1000, oa, 0);
+        attributes.object_name.set(name);
+        let named = call("NtOpenProcess", out, 0x1000, oa, cid);
+        attributes.object_name.set(0);
+        assert(no_cid == 0xC000_0030 && named == 0xC000_0030 && call("NtOpenProcess", out, 0x1000, 0, cid) == 0xC000_0005 && call("NtOpenProcess", out, 0x1000, oa + 2, cid) == 0x8000_0002 && call("NtOpenProcess", out, 0x1000, oa, cid + 2) == 0x8000_0002 && call("NtOpenProcess", 0, 0x1000, oa, cid) == 0xC000_0005, "userproc: NtOpenProcess recusas de mistura, nome, alinhamento e sonda");
+        // NtGetNextProcess: começo, para trás/frente a partir do processo e Flags inválido.
+        let list: Vec<u64> = process::list_active_processes().into_iter().map(|entry| entry.address).collect();
+        let pointer = |handle: u64| pointer_of(handle).map(|(pointer, _)| pointer);
+        stack(5, out);
+        let from_start = call("NtGetNextProcess", 0, 0, 0, 0) == 0 && pointer(opened_handle.get()) == list.first().copied();
+        let start_handle = opened_handle.get();
+        let index = list.iter().position(|&address| address == owner).unwrap_or(0);
+        let backward = call("NtGetNextProcess", process_handle, 0, 0, 1);
+        let backward_ok = if index == 0 { backward == 0x8000_001A } else { backward == 0 && pointer(opened_handle.get()) == Some(list[index - 1]) };
+        let backward_handle = opened_handle.get();
+        let forward = call("NtGetNextProcess", process_handle, 0, 0, 0);
+        let forward_ok = if index + 1 == list.len() { forward == 0x8000_001A && opened_handle.get() == 0 } else { forward == 0 && pointer(opened_handle.get()) == Some(list[index + 1]) };
+        let forward_handle = opened_handle.get();
+        let bad_flags = call("NtGetNextProcess", 0, 0, 0, 2);
+        stack(5, 0);
+        assert(from_start && backward_ok && forward_ok && bad_flags == 0xC000_000D && call("NtGetNextProcess", 0, 0, 0, 0) == 0xC000_0005, "userproc: NtGetNextProcess pela PsActiveProcessHead");
+        // NtGetNextThread: ordem de criação dentro do processo.
+        stack(5, 0);
+        stack(6, out);
+        let first_thread = call("NtGetNextThread", query_handle, 0, 0x40, 0) == 0 && threads::resolve(opened_handle.get(), 0x40).is_ok_and(|found| Arc::ptr_eq(&found, &thread));
+        let first_handle = opened_handle.get();
+        let second_thread = call("NtGetNextThread", query_handle, first_handle, 0x0200_0000, 0) == 0 && threads::resolve(opened_handle.get(), 0x1F_FFFF).is_ok_and(|found| Arc::ptr_eq(&found, &other));
+        let second_handle = opened_handle.get();
+        let end = call("NtGetNextThread", query_handle, second_handle, 0x40, 0);
+        let denied = call("NtGetNextThread", process_handle, 0, 0x40, 0);
+        stack(5, 1);
+        let bad_thread_flags = call("NtGetNextThread", query_handle, 0, 0x40, 0);
+        assert(first_thread && second_thread && end == 0x8000_001A && denied == 0xC000_0022 && bad_thread_flags == 0xC000_000D, "userproc: NtGetNextThread na ordem de criacao, fim, acesso ao processo e Flags");
 
-    // Restaura o runtime e libera tudo.
-    for value in [handle, limited, process_handle, maximum_handle, query_handle, start_handle, backward_handle, forward_handle, first_handle, second_handle] {
-        if value != 0 {
-            let _ = call("NtClose", value, 0, 0, 0);
+        // Restaura o runtime e libera tudo.
+        for value in [handle, limited, process_handle, maximum_handle, query_handle, start_handle, backward_handle, forward_handle, first_handle, second_handle] {
+            if value != 0 {
+                let _ = call("NtClose", value, 0, 0, 0);
+            }
         }
-    }
-    let _ = apc::rundown(first);
-    threads::set_running(false, previous_current);
-    process::set_current_thread(previous_thread);
-    threads::clear();
-    for saved_thread in snapshot {
-        threads::push(saved_thread);
-    }
-    state::with(|state| {
-        state.current_process_id = saved.0;
-        state.ntdll_exports = saved.1;
+        let _ = apc::rundown(first);
+        threads::set_running(false, previous_current);
+        threads::clear();
+        for saved_thread in snapshot {
+            threads::push(saved_thread);
+        }
+        state::with(|state| state.ntdll_exports = saved_exports);
+        guest::free_bytes(live);
+        let _ = process::release_thread(second);
     });
-    guest::free_bytes(live);
-    let _ = process::release_thread(first);
-    let _ = process::release_thread(second);
-    let _ = process::terminate_process(owner, 0);
+    assert(ran.is_some(), "userapc: processo de usuario");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -4934,6 +4895,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::handles::run(assert);
     crate::ntos::test::multiprocess::per_cpu::run(assert);
     crate::ntos::test::multiprocess::vad::run(assert);
+    crate::ntos::test::multiprocess::identity::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

@@ -47,8 +47,7 @@ pub(crate) fn target(handle: u64) -> Result<(u64, bool), u32> {
         return Err(BAD_HANDLE);
     }
     let current = process::get_current_process();
-    let pid = eprocess(current).unique_process_id.get();
-    let user = if state::with(|state| state.current_process_id) == pid { state::get_user_handle(handle) } else { None };
+    let user = if state::is_user_process(current) { state::get_user_handle(handle) } else { None };
     if let Some(user) = user {
         if user.kind() != "process" {
             return Err(0xC000_0024);

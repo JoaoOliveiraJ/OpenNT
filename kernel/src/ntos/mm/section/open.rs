@@ -22,7 +22,7 @@ use core::mem::offset_of;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::section::create::{caller_read, caller_units};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{Eprocess, ObjectAttributes, SecurityDescriptor, SecurityQualityOfService, UnicodeString};
+use crate::ntos::inc::types::{ObjectAttributes, SecurityDescriptor, SecurityQualityOfService, UnicodeString};
 
 fn readable(pointer: u64, length: u64) -> bool {
     state::probe_user_read(pointer, length)
@@ -124,8 +124,7 @@ fn root_directory(handle: u64, mode: u8) -> Result<NodeId, u32> {
     }
     let current = process::get_current_process();
     if !kernel && current != process::get_system_process() {
-        // SAFETY: o processo corrente.
-        let entry = if state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() { state::get_user_handle(handle) } else { None };
+        let entry = if state::is_user_process(current) { state::get_user_handle(handle) } else { None };
         let Some(entry) = entry else { return Err(0xC000_0008) };
         if entry.kind() != "directory" {
             return Err(0xC000_0024);

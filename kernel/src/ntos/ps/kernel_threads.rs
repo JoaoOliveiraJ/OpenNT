@@ -17,9 +17,9 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
-use super::{enum_process_threads, lookup_thread, process, scheduler};
+use super::{cid, enum_process_threads, lookup_thread, process, scheduler};
 use crate::ntos::ps::notify::{image as image_notify, process as process_notify, thread as thread_notify};
 use crate::hal::amd64::win32_thunk;
 use crate::ntos::cm::callbacks as registry_callbacks;
@@ -102,7 +102,6 @@ type Shared = Arc<SpinLock<Thread>>;
 
 static BY_POINTER: SpinLock<BTreeMap<u64, Shared>> = SpinLock::new(BTreeMap::new());
 static CURRENT: SpinLock<Option<Shared>> = SpinLock::new(None);
-static NEXT_ID: AtomicU64 = AtomicU64::new(0x804);
 
 fn lookup(pointer: u64) -> Option<Shared> {
     BY_POINTER.lock().get(&pointer).cloned()
@@ -729,12 +728,9 @@ pub struct HandleOptions {
 /// PsCreateSystemThread: KTHREAD do System, pilha de 64 KiB, contexto com
 /// a rotina inicial e a continuação de retorno; devolve o handle publicado.
 pub fn create_system_thread(output_handle: u64, start_routine: u64, context_pointer: u64, access: u32, client_id: u64, handle_options: Option<HandleOptions>) -> Result<u64, KernelError> {
-    let id = NEXT_ID.load(Ordering::Acquire);
-    let mut next = id + 4;
-    if next & 0x3FC == 0 {
-        next += 4;
-    }
-    NEXT_ID.store(next, Ordering::Release);
+    // O TID é reservado na tabela de ids de cliente antes do KTHREAD, que o
+    // recebe na criação.
+    let id = cid::allocate(cid::Kind::Thread)?;
     let mut allocated: Vec<u64> = Vec::new();
     let mut registered = 0u64;
     let mut handle = 0u32;
@@ -828,6 +824,8 @@ pub fn create_system_thread(output_handle: u64, start_routine: u64, context_poin
         Ok(published)
     })();
     if result.is_err() {
+        // Uma reserva que não chegou ao KTHREAD volta à tabela.
+        cid::release(id, 0);
         if registered != 0 {
             BY_POINTER.lock().remove(&registered);
             let _ = process::forget_thread(registered);

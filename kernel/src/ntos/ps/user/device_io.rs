@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use super::events::{self, EventObject};
 use super::files::UserDevice;
+use super::process_state;
 use super::state::{self, UserHandle};
 use super::threads::{self, UserThread, Wait};
 use crate::ntos::io::{cancel, io_manager};
@@ -60,7 +61,9 @@ fn finish(request: &Arc<Request>) {
         count = 0;
     }
     let abandoned = request.state.lock().abandoned;
-    if !abandoned && request.pid == state::with(|state| state.current_process_id) {
+    // A conclusão roda no contexto de quem bombeia: a cópia para o usuário
+    // exige o processo da requisição ainda vivo.
+    if !abandoned && process_state::by_id(request.pid).is_some() {
         if !state::probe_user_write(request.iosb, 16) || (!request.write && count != 0 && !state::probe_user_write(request.user_buffer, count)) {
             status = 0xC000_0005;
             count = 0;
@@ -178,7 +181,7 @@ pub fn transfer(entry: &Arc<UserHandle>, event_handle: u64, iosb: u64, user_buff
         guest::write_bytes(buffer, data);
     }
     let thread = threads::current();
-    let request = Arc::new(Request { entry: entry.clone(), event: event.clone(), thread: thread.clone(), iosb, user_buffer, length, offset, write, irp: packet, buffer, pid: state::with(|state| state.current_process_id), state: SpinLock::new(RequestState { done: false, finished: false, abandoned: false, status: 0x103, count: 0 }) });
+    let request = Arc::new(Request { entry: entry.clone(), event: event.clone(), thread: thread.clone(), iosb, user_buffer, length, offset, write, irp: packet, buffer, pid: state::current_process_id(), state: SpinLock::new(RequestState { done: false, finished: false, abandoned: false, status: 0x103, count: 0 }) });
     state::retain_user_handle_reference(entry);
     if let Some(thread) = &thread {
         threads::retain_thread(thread);
@@ -267,7 +270,7 @@ fn same_object(entry: &UserHandle, object: *const UserDevice) -> bool {
 /// Cancela as requisições do objeto (por IOSB alvo e/ou thread chamadora).
 pub fn cancel_entry(object: &UserDevice, target: u64, calling_thread_only: bool) -> bool {
     let current = threads::current();
-    let process_id = state::with(|state| state.current_process_id);
+    let process_id = state::current_process_id();
     let mut found = false;
     let pending = PENDING.lock().clone();
     for request in pending {

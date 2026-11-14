@@ -18,11 +18,11 @@ use super::memory;
 use super::state::{self, probe_user_read, probe_user_write, NativeBody, Region, UserHandle, UserObject};
 use crate::ntos::ke::{apc, clock, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
-use crate::ntos::ps::{alert_thread, process, query_thread, set_thread_information, system_process_information};
+use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_information, system_process_information};
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{ClientId, Context, Eprocess, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
+use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
 use core::mem::offset_of;
 
 pub const CONTEXT_SIZE: u64 = Context::SIZE;
@@ -79,6 +79,9 @@ pub struct ThreadMut {
     pub worker_ready: bool,
     pub priority: u32,
     pub base_priority: u32,
+    /// Instantâneo diagnóstico da pilha de usuário quando esta thread
+    /// encerrou o processo (NtTerminateProcess ou exceção sem tratamento).
+    pub termination_rsp: u64,
     wait: Option<Wait>,
     /// Há uma espera instalada (mesmo enquanto é sondada fora da trava).
     waiting: bool,
@@ -117,6 +120,7 @@ impl UserThread {
                 worker_ready: false,
                 priority: 0,
                 base_priority: 0,
+                termination_rsp: 0,
                 wait: None,
                 waiting: false,
             }),
@@ -789,7 +793,7 @@ fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<
     };
     // PHANDLE de saída e os atributos de saída, todos sondados acima.
     guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?)?;
-    let (process_id, teb) = (state::with(|state| state.current_process_id), thread.with(|thread| thread.teb_va));
+    let (process_id, teb) = (state::current_process_id(), thread.with(|thread| thread.teb_va));
     for (attribute, target, returned, size) in outputs {
         if attribute == 0x10003 {
             // PS_ATTRIBUTE_CLIENT_ID.
@@ -813,9 +817,11 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
     if !RUNNING.load(Ordering::Acquire) || !probe_user_read(request.start, 1) {
         return Err(0xC000_0005);
     }
-    let (peb, stack_top, process_id, exports, ntdll_base) = state::with(|state| {
+    // A PEB e o PID são do processo corrente (o EPROCESS).
+    let (peb, process_id) = (state::current_peb(), state::current_process_id());
+    let (stack_top, exports, ntdll_base) = state::with(|state| {
         let exports = state.ntdll_exports.as_ref().map(|exports| (exports.get("RtlUserThreadStart").copied().unwrap_or(0), exports.get("LdrInitializeThunk").copied().unwrap_or(0)));
-        (state.current_peb_va, state.syscall_stack_top, state.current_process_id, exports.unwrap_or((0, 0)), state.ntdll_image_base)
+        (state.syscall_stack_top, exports.unwrap_or((0, 0)), state.ntdll_image_base)
     });
     // SizeOfStackReserve da imagem: a PEB e os cabeçalhos estão em memória
     // de usuário, então cada passo é sondado.
@@ -860,15 +866,13 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             return Err(0xC000_0017);
         }
         let process_pointer = process::get_current_process();
-        let id = state::with(|state| {
-            let id = state.next_process_id;
-            state.next_process_id += 4;
-            id
-        });
-        thread_pointer = process::create_kernel_thread(process_pointer, id, true, 1, Some(stack_top).filter(|&top| top != 0)).map_err(|_| 0xC000_0017u32)?;
+        // O TID sai da tabela de ids de cliente, a mesma dos PIDs.
+        thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, Some(stack_top).filter(|&top| top != 0)).map_err(|_| 0xC000_0017u32)?;
         if thread_pointer == 0 {
             return Err(0xC000_0017);
         }
+        // SAFETY: ETHREAD recém-criado acima.
+        let id = unsafe { Ethread::at(thread_pointer) }.cid.unique_thread.get();
         dispatcher::initialize_event(thread_pointer, 6, false);
         let thread = UserThread::new(id, thread_pointer, teb, request.start);
         thread.with(|thread| {
@@ -932,7 +936,7 @@ fn nt_open_thread(out: u64, access: u64, attributes: u64, cid: u64, _rsp: u64) -
     };
     let (pid, tid) = client;
     let thread = all().into_iter().find(|thread| thread.thread_id == tid && thread.with(|thread| !thread.dead || thread.handles != 0));
-    let Some(thread) = thread.filter(|_| pid == 0 || pid == state::with(|state| state.current_process_id)) else { return Ok(0xC000_000B) };
+    let Some(thread) = thread.filter(|thread| pid == 0 || pid == owner_process_id(thread)) else { return Ok(0xC000_000B) };
     // PHANDLE de saída (sondado acima).
     if guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?).is_err() {
         return Ok(0xC000_0005);
@@ -1018,9 +1022,19 @@ fn nt_terminate_thread(handle: u64, status: u64, _a3: u64, _a4: u64, _rsp: u64) 
     Ok(0)
 }
 
+/// O PID do CLIENT_ID da thread (ETHREAD.Cid); uma thread já recolhida
+/// pertencia ao processo corrente, dono do handle por onde foi achada.
+fn owner_process_id(thread: &UserThread) -> u64 {
+    match thread.pointer() {
+        0 => state::current_process_id(),
+        // SAFETY: ETHREAD vivo, retido pela thread de usuário.
+        pointer => unsafe { Ethread::at(pointer) }.cid.unique_process.get(),
+    }
+}
+
 /// A classe 24 tem validação nativa própria sobre a mesma ETHREAD.
 fn requested_class(class: u64) -> u32 {
-    let raw = state::with(|state| state.service_raw_arguments);
+    let raw = state::service_raw_arguments();
     if raw != 0 {
         guest::read32(raw + 16)
     } else {
@@ -1064,7 +1078,7 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
                 let information = state::user_struct::<ThreadBasicInformation>(out)?;
                 information.exit_status.probe_set(exit_status as i32)?;
                 information.teb_base_address.probe_set(if dead { 0 } else { teb })?;
-                information.client_id.unique_process.probe_set(state::with(|state| state.current_process_id))?;
+                information.client_id.unique_process.probe_set(owner_process_id(&thread))?;
                 information.client_id.unique_thread.probe_set(thread.thread_id)?;
                 information.affinity_mask.probe_set((1u64 << smp::online_cpu_count()) - 1)?;
                 information.priority.probe_set(thread_priority::query_priority(pointer) as i32)?;
@@ -1089,7 +1103,7 @@ fn nt_delay_execution(alertable: u64, timeout: u64, _a3: u64, _a4: u64, _rsp: u6
 }
 
 fn nt_alert_thread(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    let raw = state::with(|state| state.service_raw_arguments);
+    let raw = state::service_raw_arguments();
     alert_thread::alert(if raw != 0 { guest::read64(raw + 8) } else { handle }, 1)
 }
 

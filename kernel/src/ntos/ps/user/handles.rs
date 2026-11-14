@@ -159,7 +159,7 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
             (Some(entry), false) => state::duplicate_user_handle(entry, access, attributes)?,
             _ => {
                 let current = process::get_current_process();
-                state::alloc_user_handle(Arc::new(UserProcess { pointer: current, process_id: state::with(|state| state.current_process_id) }), access, attributes)?
+                state::alloc_user_handle(Arc::new(UserProcess { pointer: current, process_id: state::current_process_id() }), access, attributes)?
             }
         };
         new_handle = Some(handle);

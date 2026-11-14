@@ -196,21 +196,14 @@ pub fn dispatch(id: u64, args: &[u64; 14], return_address: u64, frame: u64, cont
         if value >= 0xFFFF_FFFF_8000_0000 { value as i32 as i64 as u64 } else { value }
     });
     let stack_pointer = block.stack_pointer.get();
-    let (previous_raw, previous_stack) = state::with(|state| {
-        let saved = (state.service_raw_arguments, state.service_stack);
-        state.service_raw_arguments = raw;
-        state.service_stack = Some(state::ServiceStack { rsp: stack_pointer, bytes: service_abi::stack_arguments(&binding.name).unwrap_or(0) as u64 * 8 });
-        saved
-    });
     // O retorno é o RIP do usuário salvo pela entrada de syscall, quando há.
     let service_frame = crate::hal::amd64::usermode::user_service_frame();
     // O quadro de serviço guarda o retorno do stub em +8.
     let return_address = if service_frame != 0 { guest::read64(service_frame + 8) } else { block.return_address.get() };
-    let result = invoker(&binding.name, values, return_address, stack_pointer);
-    state::with(|state| {
-        state.service_raw_arguments = previous_raw;
-        state.service_stack = previous_stack;
-    });
+    // O registro é da thread que entrou no serviço; um serviço aninhado
+    // devolve o de fora ao sair.
+    let record = state::SyscallRecord { raw_arguments: raw, stack: Some(state::ServiceStack { rsp: stack_pointer, bytes: service_abi::stack_arguments(&binding.name).unwrap_or(0) as u64 * 8 }) };
+    let result = state::with_syscall_record(record, || invoker(&binding.name, values, return_address, stack_pointer));
     guest::free_bytes(raw);
     result.map(|status| status as u64)
 }

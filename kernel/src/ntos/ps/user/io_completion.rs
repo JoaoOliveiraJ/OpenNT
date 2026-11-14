@@ -49,7 +49,7 @@ pub fn enqueue(port: &Port, packet: Packet) {
 
 /// O frame bruto conserva os ponteiros de 64 bits.
 fn nt_create_io_completion(output: u64, access: u64, attributes: u64, concurrency: u64, _rsp: u64) -> Result<u32, KernelError> {
-    let raw = state::with(|state| state.service_raw_arguments);
+    let raw = state::service_raw_arguments();
     let output = if raw != 0 { guest::read64(raw + 8) } else { output };
     let attributes = if raw != 0 { guest::read64(raw + 24) } else { attributes };
     create_completion::create(output, access as u32, attributes, concurrency as u32, 1)
@@ -216,7 +216,7 @@ fn nt_remove_io_completion_ex(handle: u64, out: u64, count: u64, removed: u64, r
     if !state::probe_syscall_stack(rsp, 16) {
         return Ok(0xC000_0005);
     }
-    let raw = state::with(|state| state.service_raw_arguments);
+    let raw = state::service_raw_arguments();
     let (handle, out, removed) = if raw != 0 { (guest::read64(raw + 8), guest::read64(raw + 16), guest::read64(raw + 32)) } else { (handle, out, removed) };
     let consumer = threads::current().map(|thread| thread.pointer());
     let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6) as u8 != 0, 1, false, consumer)?;

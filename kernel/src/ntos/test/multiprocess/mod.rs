@@ -6,3 +6,4 @@ pub mod page_table_root;
 pub mod address_space;
 pub mod handles;
 pub mod vad;
+pub mod identity;

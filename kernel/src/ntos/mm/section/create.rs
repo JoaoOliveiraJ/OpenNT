@@ -26,7 +26,7 @@ use core::mem::offset_of;
 
 use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{Acl, Eprocess, ObjectAttributes, SecurityDescriptor, SecurityDescriptorRelative, Sid, UnicodeString};
+use crate::ntos::inc::types::{Acl, ObjectAttributes, SecurityDescriptor, SecurityDescriptorRelative, Sid, UnicodeString};
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 
@@ -162,8 +162,7 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
         }
         let mut directory = if root <= 0x7FFF_FFFF { object_manager::get_object(root as u32) } else { None };
         let current = process::get_current_process();
-        // SAFETY: o processo corrente.
-        if root <= 0x7FFF_FFFF && current != process::get_system_process() && state::with(|state| state.current_process_id) == unsafe { Eprocess::at(current) }.unique_process_id.get() {
+        if root <= 0x7FFF_FFFF && current != process::get_system_process() && state::is_user_process(current) {
             if let Some(entry) = state::get_user_handle(root) {
                 if entry.kind() != "directory" {
                     return Err(0xC000_0024);

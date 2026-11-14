@@ -6,6 +6,10 @@
 //! handlers de syscall por nome; o despacho usa o mapa SSN→nome lido dos
 //! stubs reais da ntdll carregada.
 //!
+//! A identidade do processo não mora aqui: PID, PEB e cookie são do EPROCESS
+//! corrente, o caminho da imagem e a PEB_LDR_DATA do `ProcessState`, e o
+//! registro do serviço em curso é de cada thread (`SyscallRecord`).
+//!
 //! Modelo: cada objeto de usuário é um `Arc<dyn UserObject>` (tipo, corpo
 //! nativo, ganchos e estado próprio recuperado por downcast) e cada handle um
 //! `Arc<UserHandle>` com acesso, atributos e referências de espera próprios;
@@ -32,11 +36,12 @@ use crate::ntos::ob::handle_table::HandleDescription;
 use crate::ntos::ob::object_manager::ObjectData;
 use crate::ntos::ob::handles::process::{self as process_handles, Binding};
 use crate::ntos::ob::{callbacks, handle_ids};
+use crate::ntos::ps::process;
 use crate::ntos::ps::user::process_state::{self, ProcessState};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::status::STATUS_ACCESS_VIOLATION;
-use crate::ntos::inc::types::{Field, IoStatusBlock, NtStruct, UnicodeString};
+use crate::ntos::inc::types::{Eprocess, Field, IoStatusBlock, NtStruct, UnicodeString};
 
 /// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
@@ -150,37 +155,20 @@ pub struct State {
     pub name_by_number: BTreeMap<u32, String>,
     /// Topo da pilha de syscall (o frame fica no topo).
     pub syscall_stack_top: u64,
-    pub current_peb_va: u64,
-    pub current_process_id: u64,
-    pub current_process_cookie: u32,
-    pub current_image_path: String,
-    pub current_thread_hidden_from_debugger: bool,
     /// Diagnóstico: primeiras ocorrências.
     pub seen_syscalls: BTreeSet<String>,
     /// Exports da ntdll mapeada (nome → VA de usuário).
     pub ntdll_exports: Option<BTreeMap<String, u64>>,
     /// Base da imagem da ntdll mapeada.
     pub ntdll_image_base: u64,
-    /// Imagens nativas mapeadas por NtMapViewOfSection (nome minúsculo →
-    /// exports), registradas pela vista de imagem.
-    pub mapped_image_exports: BTreeMap<String, BTreeMap<String, u64>>,
-    /// PIDs no estilo NT (múltiplos de 4, depois do System).
-    pub next_process_id: u64,
     pub nls_vas: Option<NlsVas>,
     /// Captura opcional de uma chamada de export nativo.
     pub capture_export: String,
     pub capture_limit: u32,
-    pub instrumentation_callback: u64,
-    /// Instantâneo diagnóstico da saída explícita do processo.
-    pub termination_rsp: u64,
     /// O apiset schema real, mapeado como dado.
     pub api_set_map_va: u64,
     /// contrato → DLL hospedeira (minúsculas).
     pub api_set_hosts: Option<BTreeMap<String, String>>,
-    /// A PEB_LDR_DATA do processo corrente.
-    pub current_ldr_va: u64,
-    pub service_stack: Option<ServiceStack>,
-    pub service_raw_arguments: u64,
 }
 
 impl State {
@@ -208,26 +196,14 @@ impl State {
             section_kernel_views: alloc::vec::Vec::new(),
             name_by_number: BTreeMap::new(),
             syscall_stack_top: 0,
-            current_peb_va: 0,
-            current_process_id: 0,
-            current_process_cookie: 0,
-            current_image_path: String::new(),
-            current_thread_hidden_from_debugger: false,
             seen_syscalls: BTreeSet::new(),
             ntdll_exports: None,
-            mapped_image_exports: BTreeMap::new(),
             ntdll_image_base: 0,
-            next_process_id: 300,
             nls_vas: None,
             capture_export: String::new(),
             capture_limit: 1,
-            instrumentation_callback: 0,
-            termination_rsp: 0,
             api_set_map_va: 0,
             api_set_hosts: None,
-            current_ldr_va: 0,
-            service_stack: None,
-            service_raw_arguments: 0,
         }
     }
 }
@@ -237,6 +213,94 @@ static S: SpinLock<State> = SpinLock::new(State::new());
 /// Acesso ao estado; o lock não pode atravessar chamadas que voltem aqui.
 pub fn with<R>(body: impl FnOnce(&mut State) -> R) -> R {
     body(&mut S.lock())
+}
+
+// ---- identidade do processo ----------------------------------------------
+
+fn eprocess(process: u64) -> &'static Eprocess {
+    // SAFETY: EPROCESS vivo (o corrente ou um do registro por processo).
+    unsafe { Eprocess::at(process) }
+}
+
+/// EPROCESS.UniqueProcessId do processo corrente (o anexado, quando há
+/// attach, como as tabelas que ele escolhe).
+pub fn current_process_id() -> u64 {
+    eprocess(process::get_current_process()).unique_process_id.get()
+}
+
+/// EPROCESS.Peb do processo corrente (0 nos processos de sistema).
+pub fn current_peb() -> u64 {
+    eprocess(process::get_current_process()).peb.get()
+}
+
+/// O processo é um processo de usuário vivo: tem estado próprio e PEB. Os
+/// processos de sistema (o System, os do escalonador e os de teste sem PEB)
+/// não têm PEB, como no NT. Enquanto as tabelas de handles e de regiões
+/// forem globais, elas pertencem ao processo de usuário.
+pub fn is_user_process(process: u64) -> bool {
+    process != 0 && process_state::get(process).is_some() && eprocess(process).peb.get() != 0
+}
+
+/// [`is_user_process`] pelo PID.
+pub fn is_user_process_id(process_id: u64) -> bool {
+    process_state::by_id(process_id).is_some_and(|state| is_user_process(state.process))
+}
+
+// ---- registro do serviço em curso, por thread ----------------------------
+
+/// O serviço de usuário em curso numa thread: o vetor bruto de argumentos de
+/// `ex/system_services` e a pilha de argumentos sondada (o que o NT guarda no
+/// quadro de trap e na pilha de kernel da thread). Vazio fora de um serviço.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyscallRecord {
+    pub raw_arguments: u64,
+    pub stack: Option<ServiceStack>,
+}
+
+impl SyscallRecord {
+    /// Só o vetor bruto, sem pilha sondada.
+    pub const fn raw(raw_arguments: u64) -> Self {
+        Self { raw_arguments, stack: None }
+    }
+}
+
+/// KTHREAD → registro do serviço em curso. A chave é o KTHREAD porque um
+/// serviço com PreviousMode UserMode também roda em thread sem `UserThread`
+/// (uma thread de kernel em modo usuário); a de uma thread de usuário é o
+/// KTHREAD dela.
+static SYSCALL_RECORDS: SpinLock<BTreeMap<u64, SyscallRecord>> = SpinLock::new(BTreeMap::new());
+
+/// O registro da thread corrente.
+pub fn syscall_record() -> SyscallRecord {
+    SYSCALL_RECORDS.lock().get(&process::get_current_thread()).copied().unwrap_or_default()
+}
+
+/// Grava o registro de `thread` e devolve o anterior; o vazio sai do mapa.
+fn replace_syscall_record(thread: u64, record: SyscallRecord) -> SyscallRecord {
+    let mut records = SYSCALL_RECORDS.lock();
+    let previous = records.get(&thread).copied().unwrap_or_default();
+    if record == SyscallRecord::default() {
+        records.remove(&thread);
+    } else {
+        records.insert(thread, record);
+    }
+    previous
+}
+
+/// Executa `body` com `record` como registro da thread corrente; ao sair, a
+/// mesma thread volta ao registro anterior (o do serviço de fora, quando há
+/// aninhamento), mesmo que o corpo tenha trocado a thread corrente.
+pub fn with_syscall_record<R>(record: SyscallRecord, body: impl FnOnce() -> R) -> R {
+    let thread = process::get_current_thread();
+    let previous = replace_syscall_record(thread, record);
+    let result = body();
+    replace_syscall_record(thread, previous);
+    result
+}
+
+/// O vetor bruto do serviço em curso na thread corrente (0 sem ele).
+pub fn service_raw_arguments() -> u64 {
+    syscall_record().raw_arguments
 }
 
 // ---- handlers de syscall por nome ----------------------------------------
@@ -379,7 +443,7 @@ pub fn stack_arg32(user_rsp: u64, index: u64) -> u32 {
 /// O despachante nativo sonda a pilha antes de copiá-la; os handlers
 /// validam aqui a extensão de argumentos de que precisam.
 pub fn probe_syscall_stack(rsp: u64, bytes: u64) -> bool {
-    let captured = S.lock().service_stack;
+    let captured = syscall_record().stack;
     if let Some(captured) = captured.filter(|captured| captured.rsp == rsp) {
         return bytes <= captured.bytes;
     }
@@ -423,7 +487,7 @@ pub fn syscall_frame() -> &'static SyscallFrame {
 /// ULONG_PTR opaco em duas palavras (os quatro primeiros vêm dos argumentos
 /// brutos ou do frame salvo; os demais da pilha de usuário).
 pub fn syscall_arg_words(user_rsp: u64, index: u64) -> [u32; 2] {
-    let raw = S.lock().service_raw_arguments;
+    let raw = service_raw_arguments();
     // Uma carga de qword: o argumento nunca é observado pela metade.
     let value = if index <= 4 {
         // Vetor bruto do despacho ou frame do syscall: memória do kernel.

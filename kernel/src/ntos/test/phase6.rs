@@ -1874,7 +1874,7 @@ fn kernel_system_threads(assert: Assert) {
     let created = kernel_threads::create_system_thread(0, image.image_base + 0x1300, block, 0x1F_FFFF, client_id, None);
     let handle = *created.as_ref().unwrap_or(&0);
     let pointer = kernel_threads::of_handle(handle).unwrap_or(0);
-    assert(created.is_ok() && pointer != 0 && at::<nt::ClientId>(client_id).unique_thread.get() >= 0x804 && at::<nt::Kthread>(pointer).header.type_.get() == 6 && kernel_threads::get_current_thread_handle() == 0, "kthreads: PsCreateSystemThread publica handle, KTHREAD e CLIENT_ID");
+    assert(created.is_ok() && pointer != 0 && crate::ntos::ps::cid::lookup(at::<nt::ClientId>(client_id).unique_thread.get()) == Some(crate::ntos::ps::cid::Entry { kind: crate::ntos::ps::cid::Kind::Thread, object: pointer }) &&at::<nt::Kthread>(pointer).header.type_.get() == 6 && kernel_threads::get_current_thread_handle() == 0, "kthreads: PsCreateSystemThread publica handle, KTHREAD e CLIENT_ID");
     let finished = pump(&|| guest::read32(block) == 0x1234 && pointer != 0 && at::<nt::Kthread>(pointer).header.signal_state.get() == 1);
     assert(finished && kernel_threads::is_terminated(pointer), "kthreads: thread roda o codigo nativo, retorna e sinaliza o objeto");
     let _ = object_manager::close(handle as u32);

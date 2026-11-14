@@ -21,24 +21,29 @@
 //! um estado destruído é liberado fora dela. Ordem: `PROCESSES` antes do
 //! `vad` de um estado.
 //!
-//! Já mora aqui a tabela de handles de usuário (`handles`, operada por
-//! `state.rs`) e a raiz das tabelas de páginas (`directory_table_base`,
-//! gravada por `mm::process_address_space`); o resto do estado global de
-//! `state.rs` continua valendo para o
-//! processo de usuário em execução, e os campos entram aqui à medida que saem
-//! de lá.
+//! Moram aqui a tabela de handles de usuário (`handles`, operada por
+//! `state.rs`), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
+//! gravada por `mm::process_address_space`) e a parte da identidade do
+//! processo de usuário que não cabe no EPROCESS (caminho da imagem,
+//! PEB_LDR_DATA do kernel, exports das imagens mapeadas); PID, PEB e cookie
+//! são do próprio EPROCESS. O resto do estado global de `state.rs` entra aqui
+//! à medida que sai de lá.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::memory::{self, Vad};
 use crate::ntos::mm::process_address_space;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
 use crate::rtl::{KernelError, SpinLock};
+
+/// Exports de uma imagem mapeada (nome → VA de usuário).
+pub type Exports = BTreeMap<String, u64>;
 
 /// O estado de um processo.
 pub struct ProcessState {
@@ -54,6 +59,38 @@ pub struct ProcessState {
     /// a do System até `mm::process_address_space::create` dar ao processo
     /// uma própria.
     pub directory_table_base: AtomicU64,
+    /// Caminho DOS da imagem (o ImagePathName dos parâmetros do processo).
+    image_path: SpinLock<String>,
+    /// A PEB_LDR_DATA montada pelo kernel, onde o loader do kernel insere
+    /// as entradas LDR (a PEB.Ldr fica com a da ntdll).
+    ldr: AtomicU64,
+    /// Imagens nativas mapeadas no processo por NtMapViewOfSection (nome
+    /// minúsculo → exports), registradas pela vista de imagem.
+    mapped_image_exports: SpinLock<BTreeMap<String, Exports>>,
+}
+
+impl ProcessState {
+    pub fn image_path(&self) -> String {
+        self.image_path.lock().clone()
+    }
+
+    pub fn set_image_path(&self, path: &str) {
+        *self.image_path.lock() = String::from(path);
+    }
+
+    pub fn ldr(&self) -> u64 {
+        self.ldr.load(Ordering::Acquire)
+    }
+
+    pub fn set_ldr(&self, ldr: u64) {
+        self.ldr.store(ldr, Ordering::Release);
+    }
+
+    /// Acesso aos exports das imagens mapeadas; a trava não atravessa
+    /// chamadas que voltem ao estado.
+    pub fn with_mapped_image_exports<R>(&self, body: impl FnOnce(&mut BTreeMap<String, Exports>) -> R) -> R {
+        body(&mut self.mapped_image_exports.lock())
+    }
 }
 
 static PROCESSES: SpinLock<BTreeMap<u64, Arc<ProcessState>>> = SpinLock::new(BTreeMap::new());
@@ -70,6 +107,9 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         handles: SpinLock::new(UserHandleTable::new()),
         vad: SpinLock::new(Vad::default()),
         directory_table_base: AtomicU64::new(process_address_space::SYSTEM_ROOT),
+        image_path: SpinLock::new(String::new()),
+        ldr: AtomicU64::new(0),
+        mapped_image_exports: SpinLock::new(BTreeMap::new()),
     });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {
@@ -82,6 +122,12 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
 /// O estado do EPROCESS `process`, se ele estiver vivo.
 pub fn get(process: u64) -> Option<Arc<ProcessState>> {
     PROCESSES.lock().get(&process).cloned()
+}
+
+/// O estado do processo vivo com o PID `process_id` (os PIDs são únicos na
+/// tabela de ids de cliente).
+pub fn by_id(process_id: u64) -> Option<Arc<ProcessState>> {
+    PROCESSES.lock().values().find(|state| state.process_id == process_id).cloned()
 }
 
 /// O estado do processo corrente (o anexado, quando há attach). `None`

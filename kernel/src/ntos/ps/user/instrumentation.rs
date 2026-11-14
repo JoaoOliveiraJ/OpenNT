@@ -9,7 +9,8 @@ use super::{state, syscalls_core};
 use crate::hal::amd64::usermode;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::ProcessInstrumentationCallbackInformation;
+use crate::ntos::inc::types::{Eprocess, NtStruct, ProcessInstrumentationCallbackInformation};
+use crate::ntos::ps::process;
 
 /// Só o processo corrente.
 fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelError> {
@@ -40,17 +41,19 @@ fn set_information(process: u64, input: u64, length: u64) -> Result<u32, KernelE
     if callback != 0 && !state::probe_user_read(callback, 1) {
         return Ok(0xC000_0005);
     }
-    let process_id = state::with(|state| {
-        state.instrumentation_callback = callback;
-        state.current_process_id
-    });
+    // KPROCESS.InstrumentationCallback do processo corrente; o bloco de
+    // execução da CPU guarda a cópia que a HAL lê no retorno de syscall.
+    // SAFETY: o EPROCESS do processo corrente.
+    unsafe { Eprocess::at(process::get_current_process()) }.pcb.instrumentation_callback.set(callback);
+    let process_id = state::current_process_id();
     usermode::block().instrumentation.set(callback);
     crate::debug_print!("[instrumentation] pid={} callback=0x{:x}", process_id, callback);
     Ok(0)
 }
 
+/// O callback do processo encerrado sai do bloco de execução da CPU (o
+/// KPROCESS some com ele).
 pub fn release_process() {
-    state::with(|state| state.instrumentation_callback = 0);
     usermode::block().instrumentation.set(0);
 }
 

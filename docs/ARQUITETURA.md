@@ -478,6 +478,21 @@ o último dereference de um processo com espaço próprio o libera.
   tabelas. No término, a drenagem da HANDLE_TABLE nativa fecha cada handle
   pela tabela do processo dono, e `process_state::destroy` fecha o que sobrou
   (handles sem linha nativa). Teste: `ntos/test/multiprocess/handles.rs`.
+- **Identidade do processo**: PID, PEB e cookie são os campos do EPROCESS
+  corrente (`state::current_process_id`, `state::current_peb`, o
+  `EPROCESS.Cookie`); o caminho da imagem, a PEB_LDR_DATA do kernel e os
+  exports das imagens mapeadas ficam no `ProcessState`. Um processo de
+  usuário é um processo vivo com PEB (`state::is_user_process`); o System e
+  os processos do escalonador não têm PEB, como no NT.
+- **Ids de cliente**: PIDs e TIDs saem de uma tabela só, `ps/cid.rs` (o papel
+  da PspCidTable). `create_process`/`create_kernel_thread` recebem
+  `cid::ALLOCATE` para o próximo id livre, ou um id fixo (o System, os
+  autotestes); o id fica com o objeto até ele ser recolhido, e um id em uso
+  é recusado para outro processo ou thread.
+- **Registro do serviço em curso**: o vetor bruto de argumentos e a pilha
+  sondada de um serviço de usuário são da thread que o executa
+  (`state::SyscallRecord`, por KTHREAD), gravados por
+  `ex/system_services.rs` e lidos por `state::service_raw_arguments`.
 - O `xtask` lê três fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
@@ -489,6 +504,11 @@ o último dereference de um processo com espaço próprio o libera.
 - **Autotestes no QEMU** ficam em `ntos/test/` e rodam conforme
   `--kernel-test-scope`. A suíte completa:
   `cargo xtask test-boot PHASE3_SELFTEST_OK 240000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK ... --expect=KBDTEST_OK --expect=SELFTEST_OK`.
+- **Processo de usuário nos autotestes**: um teste que precisa rodar como
+  processo de usuário usa `with_test_process`
+  (`ntos/test/multiprocess/identity.rs`), que cria um EPROCESS real com
+  estado, PEB e uma thread corrente dele e o termina no fim. Identidade
+  forjada (PID ou PEB escritos à mão num global) não existe.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
   `--trace-driver-api` mostra cada export chamado (veja o README).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,

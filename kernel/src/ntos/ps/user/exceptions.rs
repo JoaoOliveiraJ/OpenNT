@@ -171,7 +171,9 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
         if first_chance & 0xFF == 0 {
             let code = u32_at(&captured, offset_of!(ExceptionRecord, exception_code));
             let rsp = state::user_struct::<Context>(context)?.rsp.probe_get()?;
-            state::with(|state| state.termination_rsp = rsp);
+            if let Some(thread) = threads::current() {
+                thread.with(|thread| thread.termination_rsp = rsp);
+            }
             crate::debug_print!("[exception] unhandled 0x{:x} @0x{:x}", code, u64_at(&captured, offset_of!(ExceptionRecord, exception_address)));
             usermode::block().exit_code.set(code);
             return Ok(state::TERMINATE_MAGIC);

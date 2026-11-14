@@ -339,16 +339,17 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
     })
 }
 
-/// Fim do processo de usuário: devolve o VAD do processo (vistas de seção e
-/// de imagem e regiões privadas), se o término ainda não o devolveu. As
-/// liberações de `device_io`, `worker_factory`, instrumentação, mutantes,
-/// threads, win32k, `cm::service::rpc` e `system_process_information`, nesta
-/// ordem. Os handles não passam por aqui: a tabela é do processo e o término
-/// dele a esvazia (`process_state::destroy`).
-pub fn release_user_resources() {
-    let process_id = state::with(|state| state.current_process_id);
+/// Fim do processo de usuário `process_id`: devolve o VAD do processo
+/// (vistas de seção e de imagem e regiões privadas), se o término ainda não o
+/// devolveu. As liberações de `device_io`, `worker_factory`, instrumentação,
+/// mutantes, threads, win32k, `cm::service::rpc` e
+/// `system_process_information`, nesta ordem; as com dono são as do processo
+/// `process_id`, que em geral já saiu e não é o corrente. Os handles não
+/// passam por aqui: a tabela é do processo e o término dele a esvazia
+/// (`process_state::destroy`).
+pub fn release_user_resources(process_id: u64) {
     super::device_io::release_process(process_id);
-    super::worker_factory::release_process();
+    super::worker_factory::release_process(process_id);
     super::instrumentation::release_process();
     super::mutants::release_process();
     super::threads::release_process();

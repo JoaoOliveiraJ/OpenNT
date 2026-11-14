@@ -764,7 +764,7 @@ fn transfer_virtual_memory(process: u64, address: u64, buffer: u64, size: u64, r
         if entry.access() & if write { 0x20 } else { 0x10 } == 0 {
             return Ok(0xC000_0022);
         }
-        if entry.object.callback_data().process_id != Some(state::with(|state| state.current_process_id)) {
+        if entry.object.callback_data().process_id != Some(state::current_process_id()) {
             return Ok(0xC000_00BB);
         }
     }

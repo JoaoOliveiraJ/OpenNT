@@ -17,7 +17,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use super::process;
+use super::{cid, process};
 use crate::ntos::ke::{clock, thread_dispatch};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::inc::field::NtStruct;
@@ -113,9 +113,10 @@ pub fn spawn(name: &str, body: impl Future<Output = u32> + Send + 'static) -> u3
 }
 
 pub fn try_spawn(name: &str, future: ProcessFuture) -> Result<u32, KernelError> {
-    let pid = STATE.lock().next_pid;
-    let process_pointer = process::create_process(pid as u64, name, 0, None)?;
-    let thread_pointer = process::create_kernel_thread(process_pointer, pid as u64 * 4, false, 0, None)?;
+    // PID e TID do EPROCESS/KTHREAD vêm da tabela de ids de cliente; o pid
+    // do escalonador é outra numeração.
+    let process_pointer = process::create_process(cid::ALLOCATE, name, 0, None)?;
+    let thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, false, 0, None)?;
     let pid = push(&mut STATE.lock(), name, future, process_pointer, thread_pointer, true, None);
     process::describe_thread(thread_pointer, Some(pid), false);
     thread_dispatch::register(thread_pointer, pid as u64)?;
@@ -354,7 +355,7 @@ fn priority_changed() {
 pub fn init() -> Result<(), KernelError> {
     process::init()?;
     // A "thread do System" (contexto de boot/drivers): gs:[0x188] inicial.
-    let system_thread = process::create_kernel_thread(process::get_system_process(), 4, false, 0, None)?;
+    let system_thread = process::create_kernel_thread(process::get_system_process(), cid::ALLOCATE, false, 0, None)?;
     process::set_current_thread(system_thread);
     STATE.lock().system_thread = system_thread;
     // O contexto de boot está executando; não representa o processo Idle.

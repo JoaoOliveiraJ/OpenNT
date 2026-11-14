@@ -9,6 +9,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::state::{self, probe_user_read, probe_user_write, stack_arg, UserHandle, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, TERMINATE_MAGIC};
 use super::threads;
@@ -23,7 +24,7 @@ use crate::ntos::se::{code_integrity_information, object_security, secure_boot_i
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
-use crate::ntos::inc::types::{Context, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemLogicalProcessorInformationEx, SystemNumaInformation, UnicodeString, XsaveFormat};
+use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemLogicalProcessorInformationEx, SystemNumaInformation, UnicodeString, XsaveFormat};
 
 /// Gancho: (userRsp, retLen*) → status.
 pub type StackQuery = fn(u64, u64) -> Result<u32, KernelError>;
@@ -112,7 +113,10 @@ fn nt_display_string(string: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Re
 
 /// NtTerminateProcess(handle, exitCode): a HAL faz o longjmp de volta.
 fn nt_terminate_process(_handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    state::with(|state| state.termination_rsp = pcr::current().user_rsp.get());
+    if let Some(thread) = threads::current() {
+        let rsp = pcr::current().user_rsp.get();
+        thread.with(|thread| thread.termination_rsp = rsp);
+    }
     crate::debug_print!("[usermode] NtTerminateProcess(exit={:#x})", exit_code as u32);
     usermode::block().exit_code.set(exit_code as u32);
     Ok(TERMINATE_MAGIC)
@@ -529,7 +533,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             } else {
                 state::user_struct::<ProcessBasicInformation>(buffer)?
             };
-            let (peb, process_id) = state::with(|state| (state.current_peb_va, state.current_process_id));
+            let (peb, process_id) = (state::current_peb(), state::current_process_id());
             basic.exit_status.probe_set(0x103)?; // processo vivo: STATUS_PENDING
             basic.peb_base_address.probe_set(peb)?;
             basic.affinity_mask.probe_set(1)?; // o escalonador de usuário roda no BSP
@@ -548,7 +552,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         37 => query_image_information(rsp),
         // ProcessImageFileName: UNICODE_STRING seguido do texto.
         27 => {
-            let path = state::with(|state| state.current_image_path.clone());
+            let path = super::process_state::current().map(|identity| identity.image_path()).unwrap_or_default();
             let path = if path.is_empty() { String::from("C:\\usertest.exe") } else { path };
             let need = UnicodeString::SIZE + (path.encode_utf16().count() as u64 + 1) * 2;
             if length < need {
@@ -584,14 +588,20 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             if !probe_user_write(buffer, 4) {
                 return Ok(0xC000_0005);
             }
-            let cookie = state::with(|state| {
-                if state.current_process_cookie == 0 {
-                    let tsc = cpu::rdtsc();
-                    let mixed = (tsc as u32) ^ (((tsc >> 32) as u32) << 16) ^ (state.current_process_id as u32).wrapping_mul(0x9E37);
-                    state.current_process_cookie = if mixed == 0 { 0x5A17_C0DE } else { mixed };
-                }
-                state.current_process_cookie
-            });
+            // EPROCESS.Cookie, gerado na primeira consulta e trocado uma vez
+            // só (InterlockedCompareExchange).
+            // SAFETY: o EPROCESS do processo corrente.
+            let cell = unsafe { Eprocess::at(process::get_current_process()) }.cookie.atomic();
+            let mut cookie = cell.load(Ordering::Acquire);
+            if cookie == 0 {
+                let tsc = cpu::rdtsc();
+                let mixed = (tsc as u32) ^ (((tsc >> 32) as u32) << 16) ^ (state::current_process_id() as u32).wrapping_mul(0x9E37);
+                let fresh = if mixed == 0 { 0x5A17_C0DE } else { mixed };
+                cookie = match cell.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => fresh,
+                    Err(existing) => existing,
+                };
+            }
             guest::try_write::<u32>(buffer, cookie)?;
             set_returned(4)?;
             Ok(STATUS_SUCCESS)

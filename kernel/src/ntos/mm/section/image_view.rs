@@ -136,9 +136,10 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     section_views::register(owned.clone(), process, true);
     let finish = || -> Result<(), KernelError> {
         let dll_name = file.base_name().unwrap_or_else(|| String::from(&name[name.rfind(['\\', '/']).map_or(0, |at| at + 1)..]));
-        // Os exports publicados são os do processo do runtime em execução.
-        if offset == 0 && size == section.size && regions == RegionKind::ProcessImages && process == crate::ntos::ps::process::get_current_process() {
-            state::with(|state| state.mapped_image_exports.insert(dll_name.to_ascii_lowercase(), exports.clone()));
+        if offset == 0 && size == section.size && regions == RegionKind::ProcessImages {
+            if let Some(owner) = crate::ntos::ps::user::process_state::get(process) {
+                owner.with_mapped_image_exports(|mapped| mapped.insert(dll_name.to_ascii_lowercase(), exports.clone()));
+            }
             if state::with(|state| !state.capture_export.is_empty()) {
                 crate::ntos::ps::user::call_capture::arm(&dll_name, &exports);
             }

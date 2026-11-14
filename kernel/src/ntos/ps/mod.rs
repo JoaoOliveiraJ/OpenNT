@@ -1,6 +1,7 @@
 //! Process Manager (Ps).
 
 pub mod scheduler;
+pub mod cid;
 pub mod user_probe;
 pub mod process;
 pub mod context;

@@ -13,6 +13,7 @@ use core::mem::offset_of;
 
 use super::loader::{self, BytesSource, ImageRegion, Module};
 use super::memory::{self, Space};
+use super::process_state;
 use super::state::{self, RegionKind};
 use super::structures::{self, ProcessDescription};
 use super::{files, threads};
@@ -24,11 +25,12 @@ use crate::ntos::mm::{paging, pfn};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions};
+use crate::ntos::ps::cid;
 use crate::ntos::ps::process::{self, Executable};
 use crate::ntos::ps::process_context;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{Context, LdrDataTableEntry, ListEntry, NtStruct, Peb, PebLdrData};
+use crate::ntos::inc::types::{Context, Eprocess, LdrDataTableEntry, ListEntry, NtStruct, Peb, PebLdrData};
 use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 
@@ -117,14 +119,6 @@ fn initial_stack() -> Result<(u64, u64, u64), KernelError> {
     Ok((base, top, top - 8))
 }
 
-fn next_process_id() -> u64 {
-    state::with(|state| {
-        let id = state.next_process_id;
-        state.next_process_id += 4;
-        id
-    })
-}
-
 fn syscall_stack() -> Option<u64> {
     Some(state::with(|state| state.syscall_stack_top)).filter(|&top| top != 0)
 }
@@ -135,22 +129,22 @@ pub fn load_process(bytes: Vec<u8>, image_name: &str) -> Result<Loaded, KernelEr
     loader::ensure_ntdll()?;
     let image = MainImage(pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?);
     let (entry_point, image_base, size_of_image) = (image.0.entry_point, image.0.image_base, image.0.size_of_image);
-    let process_id = next_process_id();
     let source: Arc<dyn FileSource> = Arc::new(BytesSource { name: format!("\\BootBundle\\apps\\{image_name}"), bytes: Arc::new(bytes) });
     let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: Some(image.0.image_information.to_vec()), command_line: None };
-    let process_pointer = process::create_process(process_id, image_name, image_base, Some(&executable))?;
+    let process_pointer = process::create_process(cid::ALLOCATE, image_name, image_base, Some(&executable))?;
+    let process_id = process_id_of(process_pointer);
     // A imagem e a pilha entram no VAD do processo novo, anexado.
     let stack = process_context::with_process(process_pointer, || {
         push_image(image_base, size_of_image, source.name());
         initial_stack()
     })
     .and_then(|stack| stack);
-    let thread = stack.and_then(|(_, _, stack_top)| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| (thread, stack_top))));
+    let thread = stack.and_then(|(_, _, stack_top)| process::create_kernel_thread(process_pointer, cid::ALLOCATE, true, 1, syscall_stack()).and_then(|thread| process::notify_thread_created(thread).map(|_| (thread, stack_top))));
     let (thread_pointer, stack_top) = match thread {
         Ok(thread) => thread,
         Err(error) => {
             let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
-            files::release_user_resources();
+            files::release_user_resources(process_id);
             return Err(error);
         }
     };
@@ -169,10 +163,25 @@ pub fn notify_initial_images(process_pointer: u64, image: Image, source: &Arc<dy
     Ok(())
 }
 
+/// EPROCESS.UniqueProcessId.
+fn process_id_of(process: u64) -> u64 {
+    // SAFETY: EPROCESS recém-criado, retido pelo chamador.
+    unsafe { Eprocess::at(process) }.unique_process_id.get()
+}
+
+/// Recursos que um processo anterior deixou nas tabelas globais. Um
+/// processo de usuário que saiu por erro antes do término ainda tem PEB e
+/// estado: os recursos com dono saem pelo PID dele.
+fn release_leftovers() {
+    let leftover = process::list_active_processes().into_iter().find(|entry| state::is_user_process(entry.address)).map_or(0, |entry| entry.pid);
+    files::release_user_resources(leftover);
+}
+
 /// Entrada direta em anel 3 (sem TEB): volta no NtTerminateProcess.
 pub fn run_process(bytes: Vec<u8>, image_name: &str) -> Result<u32, KernelError> {
-    files::release_user_resources();
+    release_leftovers();
     let loaded = load_process(bytes, image_name)?;
+    let process_id = process_id_of(loaded.process_pointer);
     let previous = process::get_current_thread();
     process::set_current_thread(loaded.thread_pointer);
     notify_initial_images(loaded.process_pointer, Image { image_base: loaded.image_base, size_of_image: loaded.size_of_image }, &loaded.source)?;
@@ -182,7 +191,7 @@ pub fn run_process(bytes: Vec<u8>, image_name: &str) -> Result<u32, KernelError>
     process::set_current_thread(previous);
     let _ = process::release_thread(loaded.thread_pointer);
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
-    files::release_user_resources();
+    files::release_user_resources(process_id);
     Ok(exit_code)
 }
 
@@ -198,11 +207,8 @@ pub struct RunOptions<'a> {
 /// Estado por processo (um processo de usuário por vez nesta camada). As
 /// regiões são do VAD de cada processo e voltam no término dele.
 fn reset_process_state() {
-    files::release_user_resources();
+    release_leftovers();
     threads::clear();
-    state::with(|state| {
-        state.mapped_image_exports.clear();
-    });
     loader::reset_loaded_modules();
 }
 
@@ -241,38 +247,43 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     // Desfeita na saída desta função, depois do processo e dos recursos.
     let main_image = MainImage(main_image);
     let image = &main_image.0;
-    let process_id = next_process_id();
-    state::with(|state| {
-        state.current_process_id = process_id;
-        state.current_process_cookie = 0;
-        state.current_image_path = String::from(dos_path);
-    });
     let executable = Executable { source: source.clone(), image_size: image.size_of_image, image_information: Some(image.image_information.to_vec()), command_line: Some(format!("\"{dos_path}\"")) };
-    let process_pointer = process::create_process(process_id, image_name, image.image_base, Some(&executable))?;
+    // O PID sai da tabela de ids de cliente; o caminho da imagem fica no
+    // estado do processo.
+    let process_pointer = process::create_process(cid::ALLOCATE, image_name, image.image_base, Some(&executable))?;
+    let process_id = process_id_of(process_pointer);
+    if let Some(identity) = process_state::get(process_pointer) {
+        identity.set_image_path(dos_path);
+    }
     // O espaço do processo novo, anexado (como o MmCreatePeb): a ntdll e o
     // exe no VAD dele, a pilha da primeira thread, a PEB real (antes das
-    // notificações da primeira thread) e a região do CONTEXT inicial.
-    let built = process_context::with_process(process_pointer, || -> Result<(u64, u64, u64), KernelError> {
-        push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
-        push_image(image.image_base, image.size_of_image, dos_path);
-        let (stack_base, stack_end, stack_top) = initial_stack()?;
-        let teb = structures::build_process_structures(&ProcessDescription { process_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output, stack_base, stack_top: stack_end })?;
-        Ok((teb, stack_top, memory::map_user_region(0x1000)?))
-    })
-    .and_then(|built| built);
-    let created = built.and_then(|(teb, stack_top, context)| process::create_kernel_thread(process_pointer, process_id, true, 1, syscall_stack()).map(|thread| (teb, thread, stack_top, context)));
-    let (teb, thread_pointer, stack_top, context) = match created {
+    // notificações da primeira thread) e a região do CONTEXT inicial. O TID
+    // da primeira thread sai da mesma tabela dos PIDs, reservado antes porque
+    // a TEB o recebe antes de a thread existir.
+    let built = cid::allocate(cid::Kind::Thread).and_then(|thread_id| {
+        process_context::with_process(process_pointer, || -> Result<(u64, u64, u64, u64), KernelError> {
+            push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
+            push_image(image.image_base, image.size_of_image, dos_path);
+            let (stack_base, stack_end, stack_top) = initial_stack()?;
+            let teb = structures::build_process_structures(&ProcessDescription { process_id, thread_id, process_pointer, image_base: image.image_base, dos_path, detached: !options.attached, console_handle: options.standard_output, stack_base, stack_top: stack_end })?;
+            Ok((thread_id, teb, stack_top, memory::map_user_region(0x1000)?))
+        })
+        .and_then(|built| built)
+        .inspect_err(|_| cid::release(thread_id, 0))
+    });
+    let created = built.and_then(|(thread_id, teb, stack_top, context)| process::create_kernel_thread(process_pointer, thread_id, true, 1, syscall_stack()).map(|thread| (thread_id, teb, thread, stack_top, context)).inspect_err(|_| cid::release(thread_id, 0)));
+    let (thread_id, teb, thread_pointer, stack_top, context) = match created {
         Ok(created) => created,
         Err(error) => {
             let _ = process::terminate_process(process_pointer, if error.status != 0 { error.status } else { 0xC000_0001 });
-            files::release_user_resources();
+            files::release_user_resources(process_id);
             if error.status != 0 {
                 return Ok(error.status);
             }
             return Err(error);
         }
     };
-    let main = threads::UserThread::new(process_id, thread_pointer, teb, image.entry_point);
+    let main = threads::UserThread::new(thread_id, thread_pointer, teb, image.entry_point);
     threads::push(main.clone());
     process::set_thread_start(thread_pointer, image.entry_point);
     process::notify_thread_created(thread_pointer)?;
@@ -281,7 +292,8 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     }
     // A ntdll inicializa PEB.Ldr e carrega as dependências; o heap e o
     // runtime vêm antes dos DllMain.
-    let peb = state::with(|state| state.current_peb_va);
+    // SAFETY: o EPROCESS do processo em montagem.
+    let peb = unsafe { Eprocess::at(process_pointer) }.peb.get();
     // SAFETY: a PEB do processo em montagem, criada pelo kernel.
     unsafe { Peb::at(peb) }.ldr.set(0);
     let (start, initialize) = state::with(|state| {
@@ -309,7 +321,6 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     process::set_current_thread(thread_pointer);
     notify_initial_images(process_pointer, Image { image_base: image.image_base, size_of_image: image.size_of_image }, &source)?;
     crate::debug_print!("[usermode] {}: LdrInitializeThunk em {:#x} (exe entry {:#x}, teb {:#x})", image_name, initialize, image.entry_point, teb);
-    state::with(|state| state.termination_rsp = 0);
     let result = threads::run(&main, initialize, stack_top, context, ntdll.image_base);
     if capturing {
         super::call_capture::finish();
@@ -318,7 +329,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
         Ok(code) => code,
         Err(error) => {
             process::set_current_thread(previous);
-            files::release_user_resources();
+            files::release_user_resources(process_id);
             return Err(error);
         }
     };
@@ -332,14 +343,15 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     crate::debug_print!("[usermode] {} saiu: codigo {:#x}", image_name, exit_code);
     let (heap_total, heap_used) = kmalloc::info();
     crate::debug_print!("[mm] process exit: PFN used={}/{}, kernel heap={}/{}", pfn::total_count() - pfn::free_count(), pfn::total_count(), heap_used, heap_total);
-    files::release_user_resources();
+    files::release_user_resources(process_id);
     Ok(exit_code)
 }
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha
 /// publicada pela HAL e o Ldr real do processo.
 fn post_mortem(process_pointer: u64) {
-    let termination = state::with(|state| state.termination_rsp);
+    // A pilha da thread que encerrou o processo.
+    let termination = threads::all().iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);
     let images: Vec<(u64, u64, String)> = Space::of(process_pointer).images().iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect();
     if termination != 0 {
         let mut matches = 0;
@@ -366,8 +378,10 @@ fn post_mortem(process_pointer: u64) {
     if fault_cr2 != 0 {
         crate::debug_print!("[usermode] CR2={:#x} -> pagina traduz p/ {:#x}", fault_cr2, paging::translate(fault_cr2 & !0xFFF));
     }
-    // O Ldr real do processo, em memória de usuário: cada passo é sondado.
-    let peb = state::with(|state| state.current_peb_va);
+    // O Ldr real do processo (pela PEB do EPROCESS), em memória de usuário:
+    // cada passo é sondado.
+    // SAFETY: o EPROCESS do processo, ainda antes do término.
+    let peb = unsafe { Eprocess::at(process_pointer) }.peb.get();
     let ldr = if state::probe_user_read(peb, Peb::SIZE) { state::user_struct::<Peb>(peb).and_then(|peb| peb.ldr.probe_get()).unwrap_or(0) } else { 0 };
     if ldr != 0 && state::probe_user_read(ldr, PebLdrData::SIZE) {
         let lists = [("InLoad", offset_of!(PebLdrData, in_load_order_module_list), offset_of!(LdrDataTableEntry, in_load_order_links)), ("InMem", offset_of!(PebLdrData, in_memory_order_module_list), offset_of!(LdrDataTableEntry, in_memory_order_links)), ("InInit", offset_of!(PebLdrData, in_initialization_order_module_list), offset_of!(LdrDataTableEntry, in_initialization_order_links))];

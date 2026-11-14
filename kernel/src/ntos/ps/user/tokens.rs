@@ -46,7 +46,7 @@ pub fn lookup(handle: u64, access: u32) -> Result<u64, u32> {
 
 /// O frame bruto conserva handles, ponteiros e os bits baixos dos ULONGs.
 fn token_argument(index: u64, fallback: u64) -> u64 {
-    let raw = state::with(|state| state.service_raw_arguments);
+    let raw = state::service_raw_arguments();
     if raw != 0 {
         guest::read64(raw + index * 8)
     } else {

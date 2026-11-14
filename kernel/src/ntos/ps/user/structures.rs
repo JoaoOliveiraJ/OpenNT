@@ -7,8 +7,8 @@
 use alloc::format;
 use alloc::vec::Vec;
 
-use super::memory;
 use super::state::{self, write_user_wide};
+use super::{memory, process_state};
 use crate::ntos::ke::smp;
 use crate::ntos::ps::session;
 use crate::rtl::KernelError;
@@ -18,6 +18,8 @@ use crate::ntos::inc::types::{Eprocess, ListEntry, NtStruct, Peb, PebLdrData, Rt
 /// Processo sendo montado (por `run_windows_process`).
 pub struct ProcessDescription<'a> {
     pub process_id: u64,
+    /// O TID da primeira thread, reservado na tabela de ids de cliente.
+    pub thread_id: u64,
     pub process_pointer: u64,
     pub image_base: u64,
     pub dos_path: &'a str,
@@ -62,8 +64,12 @@ fn units(text: &str) -> u64 {
 
 /// Regiões separadas como no NT: PEB/TEB/Ldr pertencem ao kernel pela vida
 /// do processo; o bloco de parâmetros (que o loader pode normalizar e
-/// substituir) vive na própria região. Devolve a TEB da primeira thread.
+/// substituir) vive na própria região. A PEB vai para EPROCESS.Peb e a
+/// PEB_LDR_DATA para o estado do processo. Devolve a TEB da primeira thread.
 pub fn build_process_structures(process: &ProcessDescription) -> Result<u64, KernelError> {
+    let Some(identity) = process_state::get(process.process_pointer) else {
+        return Err(KernelError::new("estruturas de processo sem estado do processo"));
+    };
     let core = memory::map_user_region(0x8000)?;
     // A TEB x64 passa de 0x1800 (TLS/FLS/SameTebFlags): sua segunda página
     // nunca pode coincidir com a PEB.
@@ -83,7 +89,7 @@ pub fn build_process_structures(process: &ProcessDescription) -> Result<u64, Ker
     teb_block.nt_tib.stack_limit.set(process.stack_base);
     teb_block.nt_tib.self_.set(teb);
     teb_block.client_id.unique_process.set(process.process_id);
-    teb_block.client_id.unique_thread.set(process.process_id); // tid = pid na primeira thread
+    teb_block.client_id.unique_thread.set(process.thread_id);
     teb_block.process_environment_block.set(peb);
     teb_block.deallocation_stack.set(process.stack_base);
 
@@ -159,10 +165,7 @@ pub fn build_process_structures(process: &ProcessDescription) -> Result<u64, Ker
     peb_block.os_build_number.set(26100);
     peb_block.os_platform_id.set(2); // VER_PLATFORM_WIN32_NT
     peb_block.session_id.set(session::query(process.process_pointer));
-    state::with(|state| {
-        state.current_peb_va = peb;
-        state.current_ldr_va = ldr;
-    });
+    identity.set_ldr(ldr);
     // SAFETY: o EPROCESS do processo em montagem.
     unsafe { Eprocess::at(process.process_pointer) }.peb.set(peb);
     Ok(teb)

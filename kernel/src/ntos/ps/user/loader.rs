@@ -12,8 +12,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use super::memory::{self, Space};
 use super::state::{self, write_unicode_string, write_user_bytes, write_user_wide, RegionKind, UserRegion};
+use super::memory::{self, Space};
+use super::process_state;
 use super::structures::insert_tail_list;
 use super::syscall_scan;
 use crate::hal::bundle;
@@ -292,6 +293,11 @@ pub fn place_user_string(text: &str) -> Result<u64, KernelError> {
 /// A mesma entrada para o exe, a ntdll e as DLLs carregadas; a ordem de
 /// inicialização é a de carga (dependências primeiro).
 pub fn create_ldr_entry(module: &Module) -> Result<u64, KernelError> {
+    // A PEB_LDR_DATA que o kernel montou para o processo corrente.
+    let ldr = process_state::current().map_or(0, |identity| identity.ldr());
+    if ldr == 0 {
+        return Err(KernelError::new("processo corrente sem PEB_LDR_DATA do kernel"));
+    }
     let entry = memory::map_user_region(LdrDataTableEntry::SIZE)?;
     // SAFETY: região do processo recém-comprometida pelo kernel.
     let record = unsafe { LdrDataTableEntry::at(entry) };
@@ -308,7 +314,7 @@ pub fn create_ldr_entry(module: &Module) -> Result<u64, KernelError> {
     record.flags.set(0x4002 | if module.is_exe { 0 } else { 0x4 });
     record.obsolete_load_count.set(0xFFFF);
     // SAFETY: o PEB_LDR_DATA do processo corrente, montado pelo kernel.
-    let ldr = unsafe { PebLdrData::at(state::with(|state| state.current_ldr_va)) };
+    let ldr = unsafe { PebLdrData::at(ldr) };
     insert_tail_list(&ldr.in_load_order_module_list, &record.in_load_order_links);
     insert_tail_list(&ldr.in_memory_order_module_list, &record.in_memory_order_links);
     insert_tail_list(&ldr.in_initialization_order_module_list, &record.in_initialization_order_links);
