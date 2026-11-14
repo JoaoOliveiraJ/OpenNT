@@ -5061,6 +5061,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::own_root::run(assert);
     crate::ntos::test::multiprocess::process_tables::run(assert);
     crate::ntos::test::multiprocess::heap_nx::run(assert);
+    crate::ntos::test::multiprocess::session_space::run(assert);
     crate::ntos::test::multiprocess::create_path::run(assert);
     crate::ntos::test::multiprocess::all_processes::run(assert);
     crate::ntos::test::multiprocess::cross_handles::run(assert);

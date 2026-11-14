@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod ownership;
 pub mod blocking_wait;
 pub mod own_root;
+pub mod session_space;
 pub mod create_path;
 pub mod all_processes;
 pub mod cross_handles;
