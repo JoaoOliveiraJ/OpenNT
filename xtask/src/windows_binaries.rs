@@ -5,9 +5,10 @@
 //! de export que elas importam (wmilib.sys e WppRecorder.sys) entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em
 //! memória). O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
-//! e a lista de revogação), o runtime do KMDF com um cliente (WdfLdr.sys,
-//! Wdf01000.sys, SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os
-//! assinam, os arquivos que o vgk.sys abre pelo caminho
+//! e a lista de revogação), os file systems de pipes e mailslots (npfs.sys e
+//! msfs.sys), o runtime do KMDF com um cliente (WdfLdr.sys, Wdf01000.sys,
+//! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, os
+//! arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
 //!
@@ -72,6 +73,10 @@ const NTFS_FILES: &[(&str, &str)] = &[
     // sessão (MmLoadSystemImage com MM_LOAD_IMAGE_IN_SESSION): só importa do
     // ntoskrnl e tem uma seção .data gravável.
     ("BOOTVID.DLL", "System32/BOOTVID.DLL"),
+    // Os file systems de pipes nomeados e mailslots: serviços de sistema
+    // (Start 1, grupo "File system") que todo boot carrega.
+    ("NPFS.SYS", "System32/drivers/npfs.sys"),
+    ("MSFS.SYS", "System32/drivers/msfs.sys"),
     // Esquema de API sets: os imports ext-ms-* das imagens de kernel.
     ("APISETSCHEMA.DLL", "System32/apisetschema.dll"),
     // A CI lê a lista de revogação pelo caminho completo.
@@ -143,12 +148,8 @@ const NTFS_FILES: &[(&str, &str)] = &[
 
 /// Os programas de modo usuário do caminho do smss (`--initial-process=smss`):
 /// smss.exe, csrss.exe, as DLLs de servidor (csrsrv, basesrv, winsrv com o
-/// winsrvext, sxssrv) e o fecho dos imports delas, incluindo a ntdll; e os
-/// file systems de pipes e mailslots (npfs.sys e msfs.sys, serviços de
-/// System32\Drivers que o boot carrega antes do smss).
+/// winsrvext, sxssrv) e o fecho dos imports delas, incluindo a ntdll.
 const SMSS_PROGRAMS: &[&str] = &[
-    "drivers/npfs.sys",
-    "drivers/msfs.sys",
     "smss.exe",
     "csrss.exe",
     "csrsrv.dll",

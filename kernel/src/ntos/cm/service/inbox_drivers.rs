@@ -40,6 +40,12 @@
 //! Type, Start, ErrorControl e DisplayName (quando há), sem ImagePath, como
 //! na instalação.
 //!
+//! Os file systems de pipes nomeados (Npfs) e de mailslots (Msfs) também
+//! entram como na instalação, sem diferença: Type 2, Start 1
+//! (SERVICE_SYSTEM_START, carregados pelo boot com os outros drivers de
+//! sistema), ErrorControl 1, Group "File system" e sem ImagePath; o Npfs
+//! leva a subchave Aliases, que o npfs.sys lê no DriverEntry.
+//!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada driver com os
 //! valores que o banco de serviços grava numa instalação seguidos de Group,
 //! Tag e os DWORDs próprios.
@@ -55,6 +61,9 @@ const SERVICE_FILE_SYSTEM_DRIVER: u32 = 2;
 /// Os file systems da instalação (chaves sem ImagePath).
 const FILE_SYSTEMS: &[&str] = &["Ntfs", "fastfat"];
 const SERVICE_RECOGNIZER_DRIVER: u32 = 8;
+/// `Npfs\Aliases`: (pipe, aliases) como REG_MULTI_SZ.
+const NPFS_ALIASES: &[(&str, &[&str])] = &[("lsass", &["protected_storage", "netlogon", "lsarpc", "samr"]), ("ntsvcs", &["svcctl"])];
+const SERVICE_SYSTEM_START: u32 = 1;
 const SERVICE_DEMAND_START: u32 = 3;
 
 /// Uma chave de serviço de driver da instalação.
@@ -93,6 +102,8 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "Null", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(1), dwords: &[] },
     InboxDriver { name: "Beep", display_name: Some("Beep"), service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(2), dwords: &[] },
     InboxDriver { name: "Fs_Rec", display_name: None, service_type: SERVICE_RECOGNIZER_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 0, group: "File System", tag: None, dwords: &[] },
+    InboxDriver { name: "Npfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
+    InboxDriver { name: "Msfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
     InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\Wdf01000.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
     InboxDriver { name: "msisadrv", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\msisadrv.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
@@ -148,5 +159,10 @@ pub fn seed_keys() -> Vec<SeedKey> {
         };
         keys.push(key);
     }
+    let mut aliases = SeedKey::new("CurrentControlSet\\Services\\Npfs\\Aliases");
+    for &(pipe, names) in NPFS_ALIASES {
+        aliases.strings(pipe, names);
+    }
+    keys.push(aliases);
     keys
 }

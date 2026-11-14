@@ -1,9 +1,10 @@
 //! Chaves de serviço dos drivers .sys que o boot instala (como
 //! `\System\CurrentControlSet\Services` no NT): a pilha de teclado e mouse
-//! sob demanda, a de armazenamento no boot (port -> class -> Mount Manager),
-//! o vgk e o watchdog sob demanda e, no boot do processo inicial real, os
-//! file systems de pipes nomeados e mailslots; os parâmetros do i8042prt e
-//! as classes de teclado e mouse com os filtros superiores.
+//! sob demanda, a de armazenamento no boot (port -> class -> Mount Manager)
+//! e o vgk e o watchdog sob demanda; os parâmetros do i8042prt e as classes
+//! de teclado e mouse com os filtros superiores. Os file systems de pipes
+//! nomeados e mailslots entram em todo boot com as chaves da instalação
+//! (`inbox_drivers.rs`).
 //!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada serviço com os
 //! valores que o banco de serviços grava numa instalação (Type, Start,
@@ -18,7 +19,6 @@ use super::super::seed::{SeedKey, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ};
 
 const SERVICES: &str = "CurrentControlSet\\Services";
 const SERVICE_KERNEL_DRIVER: u32 = 1;
-const SERVICE_FILE_SYSTEM_DRIVER: u32 = 2;
 
 /// (serviço, arquivo em System32\Drivers, Start, Type).
 const DRIVERS: &[(&str, &str, u32, u32)] = &[
@@ -40,10 +40,6 @@ const DRIVERS: &[(&str, &str, u32, u32)] = &[
     // watchdog.sys: dependência do stack de vídeo (dxgkrnl/BasicDisplay).
     ("watchdog", "watchdog.sys", 3, SERVICE_KERNEL_DRIVER),
 ];
-
-/// Os file systems de pipes nomeados e mailslots (SYSTEM_START), que o smss
-/// abre para criar os prefixos protegidos.
-const SMSS_DRIVERS: &[(&str, &str, u32, u32)] = &[("Npfs", "npfs.sys", 1, SERVICE_FILE_SYSTEM_DRIVER), ("Msfs", "msfs.sys", 1, SERVICE_FILE_SYSTEM_DRIVER)];
 
 /// Os parâmetros do i8042prt que o INF criaria.
 const I8042PRT_PARAMETERS: &[(&str, u32)] = &[
@@ -72,10 +68,6 @@ fn driver_list(drivers: &[(&str, &str, u32, u32)]) -> Vec<SeedKey> {
 
 pub fn driver_keys() -> Vec<SeedKey> {
     driver_list(DRIVERS)
-}
-
-pub fn smss_driver_keys() -> Vec<SeedKey> {
-    driver_list(SMSS_DRIVERS)
 }
 
 pub fn parameter_keys() -> Vec<SeedKey> {

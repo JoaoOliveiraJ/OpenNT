@@ -1375,12 +1375,13 @@ discos. Sem a opção nada disso roda.
   `\SystemRoot\System32\smss.exe` real (`init/initial_process.rs`), criado
   pelo caminho único com PS_PROTECTION WinTcb-Light (0x61) e
   BreakOnTermination, com a ntdll real. O build põe no volume os binários da
-  cadeia (smss, csrss, csrsrv, basesrv, winsrv, sxssrv, npfs.sys, msfs.sys e
-  as DLLs que eles importam), e a hive SYSTEM desse build (ou a semente em
+  cadeia (smss, csrss, csrsrv, basesrv, winsrv, sxssrv e as DLLs que eles
+  importam; o npfs.sys e o msfs.sys, com os serviços Npfs e Msfs, vão em
+  todo boot), e a hive SYSTEM desse build (ou a semente em
   memória, sem o arquivo) leva o Registro que eles leem: a
   chave Session Manager (`cm/session_manager.rs`: SubSystems com a linha do
   csrss, KnownDLLs, DOS Devices, Environment; sem Kmode, BootExecute nem
-  arquivos de paginação) e os serviços Npfs e Msfs; em memória ficam a
+  arquivos de paginação); em memória ficam a
   árvore `IniFileMapping` da hive SOFTWARE que o basesrv lê
   (`cm/ini_file_mapping.rs`) e, na hive de hardware, o
   `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID

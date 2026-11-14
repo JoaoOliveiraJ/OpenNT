@@ -71,9 +71,6 @@ pub fn multi(strings: &[&str]) -> Vec<u8> {
 pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::service::boot_services::driver_keys();
     keys.extend(super::service::inbox_drivers::seed_keys());
-    if smss_boot {
-        keys.extend(super::service::boot_services::smss_driver_keys());
-    }
     keys.extend(super::service::boot_services::parameter_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
