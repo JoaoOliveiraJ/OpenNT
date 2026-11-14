@@ -15,8 +15,8 @@
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
 //!   0x083000-0x08CFFF    tabelas da imagem do kernel e da pilha de boot
-//!   0x100000-0xDFFFFF    frames da imagem do kernel (cap de build: 13MB)
-//!   0xE01000-0xF7FFFF    frames da pilha de boot
+//!   0x100000-0xE7FFFF    frames da imagem do kernel (cap de build: 13,5MB)
+//!   0xE81000-0xFFFFFF    frames da pilha de boot
 //!   0x1000000-0x1FFFFFF  sem uso
 //!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
@@ -113,14 +113,14 @@ pub const fn is_user_range(base: u64, size: u64) -> bool {
 //
 // A pilha de boot (a do BSP até o escalonador assumir) também é uma VA de
 // sistema, na mesma PD da imagem: 383 páginas de RW e NX que terminam em
-// `BOOT_STACK_TOP`, sobre os frames físicos logo abaixo de 15,5 MB, com uma
+// `BOOT_STACK_TOP`, sobre os frames físicos logo abaixo de 16 MB, com uma
 // página de guarda sem mapeamento embaixo. O stage2 entra no kernel com
 // RSP = BOOT_STACK_TOP - 8 (alinhamento de quem acabou de receber um CALL).
 
 /// Endereço físico onde o stage2 carrega o PE do kernel.
 pub const KERNEL_IMAGE_PHYS: u64 = 0x10_0000;
-/// Teto do SizeOfImage do kernel (frames físicos 1 MB a 14 MB).
-pub const KERNEL_IMAGE_MAX: u64 = 13 * 1024 * 1024;
+/// Teto do SizeOfImage do kernel (frames físicos 1 MB a 14,5 MB).
+pub const KERNEL_IMAGE_MAX: u64 = 13 * 1024 * 1024 + 512 * 1024;
 /// ImageBase do kernel: o endereço em que ele é ligado e executa.
 pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_F800_4000_0000;
 /// Slot da PML4 da imagem (o mesmo da KPCR e da janela de imagens de sistema).
@@ -139,7 +139,7 @@ pub const BOOT_STACK_SIZE: u64 = 0x17_F000;
 /// Página mais baixa da pilha; a de baixo dela é a guarda.
 pub const BOOT_STACK_LIMIT: u64 = BOOT_STACK_TOP - BOOT_STACK_SIZE;
 /// Frames físicos da pilha: [BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE, BOOT_STACK_PHYS_TOP).
-pub const BOOT_STACK_PHYS_TOP: u64 = 0xF8_0000;
+pub const BOOT_STACK_PHYS_TOP: u64 = 0x100_0000;
 pub const BOOT_STACK_PHYS_BASE: u64 = BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE;
 
 /// A VA pertence à faixa reservada da imagem do kernel.

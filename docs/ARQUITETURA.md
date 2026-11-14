@@ -257,7 +257,8 @@ confere o cabeçalho (ImageBase, SizeOfImage, entrada) e mapeia exatamente
 SizeOfImage páginas de 4 KB de supervisor, RW e executáveis na ImageBase, com
 tabelas fixas em 0x83000-0x8BFFF (PDPT, PD e sete PTs). A pilha de boot é
 outra VA de sistema na mesma PD: 383 páginas RW e NX terminando em
-`BOOT_STACK_TOP`, sobre os frames logo abaixo de 15,5 MB, com uma página de
+`BOOT_STACK_TOP`, sobre os frames logo abaixo de 16 MB (a imagem pode ir até
+13,5 MB, nos frames de 1 MB a 14,5 MB), com uma página de
 guarda sem mapeamento embaixo (PT em 0x8C000). O stage2 carrega o GDTR pela VA
 do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8.
 
