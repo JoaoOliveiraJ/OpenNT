@@ -52,6 +52,8 @@ const USER_PROBE_LIMIT: u64 = 0x7FFF_FFFF_0000;
 /// O buffer de nome do ObpNameBufferLookasideList (nomes de até 0xF6 bytes).
 const NAME_LOOKASIDE_SIZE: u32 = 0xF8;
 const NON_PAGED_POOL_NX: u32 = 0x200;
+/// SE_CREATE_PERMANENT_PRIVILEGE: exigido para OBJ_PERMANENT em UserMode.
+const SE_CREATE_PERMANENT_PRIVILEGE: u64 = 16;
 const PAGED_POOL: u32 = 1;
 /// TypeInfo.ObjectTypeFlags: SecurityRequired.
 const TYPE_SECURITY_REQUIRED: u8 = 0x08;
@@ -291,7 +293,7 @@ pub fn create(probe_mode: u8, type_pointer: u64, attributes: u64, owner_mode: u8
     if flags & object_type.type_info.invalid_attributes.get() != 0 {
         return failure(STATUS_INVALID_PARAMETER);
     }
-    if flags & OBJ_PERMANENT != 0 && !privilege::single_privilege_check(probe_mode as u32) {
+    if flags & OBJ_PERMANENT != 0 && !privilege::single_privilege_check(SE_CREATE_PERMANENT_PRIVILEGE, probe_mode as u32) {
         return failure(STATUS_PRIVILEGE_NOT_HELD);
     }
     create.paged_pool_charge.set(if paged_charge != 0 { paged_charge } else { object_type.type_info.default_paged_pool_charge.get() });
