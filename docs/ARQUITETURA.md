@@ -19,8 +19,9 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 kernel/src/
 ├── main.rs            entrada (kernel_main), BSS, panic_handler
 ├── hal/               HAL: portas, serial, CPU, memória física, LAPIC, RTC, heap,
-│   │                  ACPI, PCI, firmware, HalPrivateDispatchTable, HalDispatchTable
-│   │                  (HaliQuerySystemInformation) e exports Hal*
+│   │                  ACPI (tabelas e a tabela de energia do acpi.sys), PCI,
+│   │                  firmware, o driver PnP da HAL, HalPrivateDispatchTable,
+│   │                  HalDispatchTable (HaliQuerySystemInformation) e exports Hal*
 │   ├── amd64/         código x64: interrupções, anel 3, trampolim dos APs, chamadas
 │   │                  MS-ABI, trampolins dos exports, entradas privadas, serviços
 │   └── x86bios/       interface x86 BIOS (x86Bios*): o BIOS de vídeo da máquina num
@@ -1101,6 +1102,54 @@ DxgkDdiAddDevice do miniport, e DpiFdoHandleStartDevice). O dxgkrnl deixa o
 início do adaptador (DpiFdoStartAdapterThread, com o DxgkDdiStartDevice)
 para a criação da primeira sessão, que o win32k.sys anuncia
 (watchdog!SMgrNotifySessionChange no NtUserInitialize).
+
+Com `--pnp-root=acpi` (`drivers/bus/acpi_stack.rs`) a raiz da árvore é a
+de um PC ACPI do Windows, no lugar do barramento PCI interno:
+
+- **A HAL** (`hal/pnp.rs`, o HalpDispatchPnp) relata o computador
+  `ROOT\ACPI_HAL\0000` (HardwareID `acpiapic`; o kernel é o driver dele) e,
+  como filho, o AcpiRootPdo `ACPI_HAL\PNP0C08\0` (FILE_DEVICE_BUS_EXTENDER,
+  UniqueID, os ids `ACPI_HAL\PNP0C08`/`*PNP0C08`). Os requisitos e a
+  configuração de boot dele são os vetores da IDT de dispositivos
+  (0x37-0xCC, um descritor exclusivo por vetor), que o acpi.sys guarda como
+  os vetores da raiz. O PnP o instala pelo acpi.inf (`*pnp0c08`, serviço
+  ACPI com Tag 2 e Group Core; `install.rs`, `ACPI_ROOT_DRIVERS`).
+- **A tabela de energia da HAL** (`hal/acpi_pm.rs`): o HalInitPowerManagement
+  do HalDispatchTable (slot +0x68) troca a tabela do acpi.sys pela
+  HalAcpiDispatchTable ('HAL ', versão 4, 21 rotinas, na ordem da do
+  ntoskrnl 19041): as tabelas do firmware pelo cache da HAL (cópias da
+  RSDT, DSDT e das demais; a lista do GetAllTables sem DSDT/RSDT/XSDT/FACS;
+  a FACS mapeada), os registradores de PM da FADT (PM1a/b, PM_TMR, PM2,
+  GPE0/1 e RESET_REG, com as regras do HalpAcpiSetupPmRegisterLegacy), a
+  configuração PCI, o modelo de interrupção APIC para o `_PIC` e a versão
+  dos IOAPICs da MADT (`hal/interrupt_lines.rs`). O HalQuerySystemInformation
+  (slot +0x08, `hal/system_information.rs`) responde a BadIOAddrList (com o
+  tratador de 0xCF8), as informações de depurador, de controladores
+  secundários e o limite de MSI. As rotinas vão por ponteiro pelos stubs de
+  `routine_stubs.rs` (agora 128).
+- **O que o carregador do NT deixa e o acpi.sys lê**: o adaptador
+  `HARDWARE\DESCRIPTION\System\MultifunctionAdapter\1` "ACPI BIOS" com a
+  RSDT e o mapa E820 (`cm/hw_description.rs`) e, na hive SYSTEM,
+  `Control\Arbiters` da instalação (`cm/arbiters.rs`), de onde os árbitros
+  do acpi.sys tiram a ordem de alocação e as faixas reservadas.
+- **A SCI**: o acpi.sys grava os dados de conexão da interrupção no
+  AcpiRootPdo (INTERRUPT_CONNECTION_DATA_PKEY) e chama o IoConnectInterruptEx
+  LINE_BASED; como o IopConnectLineBasedInterrupt, a conexão usa esses dados
+  (a GSIV 9 da FADT, entregue pelo 8259 no vetor 0x29).
+- **Destinos de interrupção** (`hal/interrupt_targets.rs`): HalGetProcessorIdByNtNumber,
+  HalGetInterruptTargetInformation (modo físico), HalGetMessageRoutingInfo,
+  HalConvertDeviceIdtToIrql e HalGetMemoryCachingRequirements, que o acpi.sys
+  importa pela hal.dll.
+
+O acpi.sys carrega a DSDT no interpretador AML dele e as BusRelations da
+raiz são os dispositivos do namespace do QEMU: `ACPI\PNP0A03\0` (o PCI0,
+com UID 0), `ACPI\PNP0103` (HPET), `ACPI\ACPI0010` (o contêiner dos
+processadores) e `ACPI\FixedButton`; o prefixo de instância que o PnP
+deriva do AcpiRootPdo (`2&daba3ff&0`) é o mesmo da instalação desta
+máquina. O nó PNP0A03 recebe o pci.sys pelo pci.inf (PCI_ROOT); a pshed.dll
+que ele importa carrega como DLL de modo kernel do volume. O barramento PCI
+interno do kernel fica fora dessa árvore; as funções dos drivers internos
+seriam reconhecidas pelos ids de classe do pci.sys (`device_tree.rs`).
 
 Sem as opções nada disso roda.
 
