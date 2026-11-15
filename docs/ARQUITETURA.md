@@ -1225,9 +1225,20 @@ com UID 0), `ACPI\PNP0103` (HPET), `ACPI\ACPI0010` (o contêiner dos
 processadores) e `ACPI\FixedButton`; o prefixo de instância que o PnP
 deriva do AcpiRootPdo (`2&daba3ff&0`) é o mesmo da instalação desta
 máquina. O nó PNP0A03 recebe o pci.sys pelo pci.inf (PCI_ROOT); a pshed.dll
-que ele importa carrega como DLL de modo kernel do volume. O barramento PCI
+que ele importa carrega como DLL de modo kernel do volume. O DriverEntry
+do pci.sys consulta o Errata Manager (as regras de PCI da FADT, FALSE no
+QEMU) e registra o provedor do PCIDevice; o AddDevice abre o
+`Control\PnP\Pci\CardList` (`cm/pnp_control.rs`); o START recebe as janelas
+do `_CRS` do PCI0 e o pci.sys lê a configuração das funções pela interface
+de barramento PCI que o acpi.sys dá ao PDO, avalia as regras de PCIDevice
+com os próprios callbacks e relata as funções com os ids dele
+(`PCI_ROOT_OK`). A ponte PCI-ISA recebe o msisadrv.sys e o filtro do
+acpi.sys sobre o PDO dela relata os dispositivos ISA do namespace
+(PNP0303, PNP0F13, PNP0700, PNP0400, PNP0501, PNP0B00). O barramento PCI
 interno do kernel fica fora dessa árvore; as funções dos drivers internos
-seriam reconhecidas pelos ids de classe do pci.sys (`device_tree.rs`).
+são reconhecidas pelos ids de classe do pci.sys (`device_tree.rs`). Os
+filhos do pci.sys ainda passam pelo árbitro plano do PnP manager, e não
+pelos árbitros dos drivers de barramento.
 
 Sem as opções nada disso roda.
 
@@ -1411,11 +1422,38 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   SignalState 1 (Timer2Notification/Synchronization nas esperas de
   `ke/dispatcher.rs`), periódico de volta para agora + Period e o callback
   em DISPATCH_LEVEL.
-- **Errata Manager** (`em/`): provedores e avaliação de regras sobre o
-  banco do INF de errata. O carregador do OpenNT não entrega o INF, então
-  o banco é vazio como no ntoskrnl sem ele: só o provedor sem entradas nem
-  callbacks é registrado, e as regras não existem (STATUS_NOT_FOUND com
-  STATE_UNKNOWN).
+- **Errata Manager** (`em/`): o banco do `\SystemRoot\INF\errata.inf`
+  desta máquina, os provedores e a avaliação das regras, como no ntoskrnl
+  19041. O carregador entrega a imagem do INF (o EmInfFileImage do
+  LOADER_PARAMETER_EXTENSION): o OpenNT a lê do volume de boot logo depois
+  de montá-lo (`em::loader_inf_image`) e o EmInitSystem a interpreta com o
+  interpretador de INF do Cm (`cm/inf_parse.rs`, o CmpParseInfBuffer:
+  tokens, seções, linhas, continuação e `%nome%` da [Strings]) e o
+  EmpParseInfDatabase (`em/parse.rs`): tipos de entrada, callbacks com as
+  contagens de argumentos do [CallbackDef], regras com a expressão
+  pós-fixa do [Rule] (`?Callback(c)(n)(e)`, `%Regra(...)`, `&`, `|`, os
+  índices decimais validados contra a regra que contém o termo; uma regra
+  só referencia as definidas antes), a tabela de cadeias e as regras-alvo
+  com os conjuntos de argumentos (cadeias pelo nome da chave em [Strings],
+  números hexadecimais do RtlCharToInteger). Depois registra os callbacks
+  da HAL (`hal/errata.rs`: OEMID, OEM Table ID e revisões das tabelas ACPI
+  e o IAPC_BOOT_ARCH da FADT) e os embutidos (`em/builtin.rs`: data do
+  BIOS do endereço físico 0xFFFF5 no boot por BIOS, CPU da KPRCB,
+  arquitetura, sempre verdadeiro/falso); o banco fica sob o
+  EmpDatabaseLock (um `SharedLock` exclusivo, que os callbacks dos drivers
+  atravessam). O EmProviderRegister liga as rotinas dos drivers aos
+  callbacks (outra rotina no mesmo callback colide) e conta os provedores
+  dos tipos; cada registro enfileira a atualização das regras que os usam,
+  que o work item do Errata Manager processa (`em/evaluate.rs`:
+  EmpUpdateRuleState, prontidão por provedores, rotinas e regras
+  referenciadas). O EmClientQueryRuleState atualiza e avalia a regra-alvo
+  (a avaliação UNKNOWN vira FALSE) e o EmClientRuleEvaluate avalia com as
+  entradas do chamador e devolve o estado cru; a avaliação percorre os
+  conjuntos, com `&`/`|` em curto-circuito, os índices remapeando os
+  argumentos e o callback do driver chamado na ABI do EM_CALLBACK_ROUTINE.
+  No QEMU, as regras de máquina da FADT (OEMID "BOCHS ") são FALSE; o
+  pci.sys, o acpi.sys e o ataport.sys recebem as respostas reais e o pci.sys
+  avalia as regras de PCIDevice com os callbacks dele.
 - **Jobs** (`ps/job.rs` e `ps/job/`): o EJOB real (o corpo de 0x640
   bytes do ObCreateObject com PsJobType, CloseProcedure PspJobClose e
   DeleteProcedure PspJobDelete pelas rotinas privadas), na PspJobList e com
@@ -1901,7 +1939,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   montagem postada à FSP do NTFS) confere a espera antes de rodar os itens
   enfileirados por ele — um deles pode esperar pelo que essa thread retém
   (o DeviceLock da montagem em curso). Teste:
-  `work_items_one_worker_per_item` na fase 6.
+  `work_items_one_worker_per_item` na fase 6. Como o
+  ExpWorkerThreadBalanceManager, quando a worker desta CPU está bloqueada
+  numa espera dentro de um item, o item comum que já espera há 1 s ganha
+  uma worker dinâmica (uma thread de sistema que o executa e termina):
+  o acpi.sys repassa o START da ponte PCI-ISA ao pci.sys numa worker e
+  espera o work item que o pci.sys enfileira. Teste: `stalled_worker`
+  (`test/platform_support.rs`).
 - **Lazy writer do Cache Manager** (`cc/lazy_writer.rs`): o
   CcScheduleLazyWriteScan arma o ScanTimer (CcFirstDelay, 3 s; FastScan
   acorda já), a DPC dele acorda a thread do lazy writer — uma thread de
