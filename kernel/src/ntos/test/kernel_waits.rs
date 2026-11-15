@@ -358,12 +358,18 @@ fn alpc_kernel_pair(assert: Assert) {
 // ---- o tick que não aninha ------------------------------------------------
 
 /// [0] status da espera, [1] estado da thread depois de ser dada como
-/// pronta em execução, [2] ciclos durante a espera, [3] pronto.
-static NESTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// pronta em execução, [2] despachos da thread durante a espera, [3] pronto,
+/// [4] a KTHREAD.
+static NESTED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 const NESTED_EXIT: u32 = 0x5A;
+
+fn context_switches(thread: u64) -> u64 {
+    process::thread_record(thread).map_or(0, |record| record.context_switches as u64)
+}
 
 async fn nested_body() -> u32 {
     let me = process::get_current_thread();
+    NESTED[4].store(me, Ordering::SeqCst);
     // Algo dá a thread em execução como pronta (o que punha o shell na
     // fila enquanto ele rodava): ela continua em execução, fora da fila.
     let _ = thread_dispatch::make_ready(me);
@@ -373,9 +379,9 @@ async fn nested_body() -> u32 {
     let timeout = guest::alloc_bytes(8);
     dispatcher::initialize_event(event, 0, false);
     guest::write64(timeout, (-500_000i64) as u64);
-    let before = thread_dispatch::query_total_cycle_time(me, None);
+    let before = context_switches(me);
     let status = dispatcher::wait_for_single_object(event, timeout, 0, false);
-    let after = thread_dispatch::query_total_cycle_time(me, None);
+    let after = context_switches(me);
     guest::free_bytes(event);
     guest::free_bytes(timeout);
     NESTED[0].store(status as u64, Ordering::SeqCst);
@@ -384,24 +390,58 @@ async fn nested_body() -> u32 {
     NESTED_EXIT
 }
 
+/// A contabilidade da própria thread enquanto ela espera, vista de fora a
+/// cada volta do despachante: quantas vezes estava Waiting e se o
+/// KTHREAD.CycleTime ficou o mesmo em todas (nenhum ciclo cobrado dela
+/// parada, qualquer que seja a carga do hospedeiro).
+#[derive(Default)]
+struct BlockedSamples {
+    count: u64,
+    first: u64,
+    constant: bool,
+}
+
+impl BlockedSamples {
+    fn sample(&mut self, thread: u64) {
+        if thread == 0 || thread_dispatch::thread_state(thread) != thread_dispatch::state::WAITING {
+            return;
+        }
+        let cycles = thread_dispatch::query_total_cycle_time(thread, None);
+        if self.count == 0 {
+            self.first = cycles;
+            self.constant = true;
+        } else if cycles != self.first {
+            self.constant = false;
+        }
+        self.count += 1;
+    }
+}
+
 fn nested_tick(assert: Assert) {
     for slot in &NESTED {
         slot.store(0, Ordering::SeqCst);
     }
     let pid = scheduler::spawn("kwait-nested", nested_body());
     let exit = core::cell::Cell::new(None);
+    let blocked = core::cell::RefCell::new(BlockedSamples::default());
     let finished = pump(5000, &|| {
         if let Some(info) = scheduler::list().into_iter().find(|info| info.pid == pid) {
             exit.set(info.exit_status);
         }
+        if NESTED[3].load(Ordering::SeqCst) == 0 {
+            blocked.borrow_mut().sample(NESTED[4].load(Ordering::SeqCst));
+        }
         NESTED[3].load(Ordering::SeqCst) == 1 && !scheduler::list().iter().any(|info| info.pid == pid)
     });
-    // O prazo de 50 ms gasto parado: bem menos ciclos que 50 ms de CPU.
-    let frequency = clock::tsc_frequency_hz();
-    let spent = NESTED[2].load(Ordering::SeqCst);
-    debug_print!("[kwait] tick aninhado: fim={} estado={} espera={:#x} ciclos={} saida={:?}", finished, NESTED[1].load(Ordering::SeqCst), NESTED[0].load(Ordering::SeqCst), spent, exit.get());
+    // Parada pelo prazo de 50 ms, a thread não roda: nenhum ciclo cobrado
+    // dela enquanto Waiting e um único despacho, o que a acorda (uma espera
+    // que girasse o escalonador na pilha dela nunca ficaria Waiting, e uma
+    // sondada seria despachada a cada tick).
+    let blocked = blocked.into_inner();
+    let dispatches = NESTED[2].load(Ordering::SeqCst);
+    debug_print!("[kwait] tick aninhado: fim={} estado={} espera={:#x} amostras paradas={} ciclos constantes={} despachos={} saida={:?}", finished, NESTED[1].load(Ordering::SeqCst), NESTED[0].load(Ordering::SeqCst), blocked.count, blocked.constant, dispatches, exit.get());
     assert(
-        finished && NESTED[1].load(Ordering::SeqCst) == thread_dispatch::state::RUNNING as u64 && NESTED[0].load(Ordering::SeqCst) == 0x102 && spent < frequency / 200 && exit.get().is_none_or(|status| status == NESTED_EXIT),
+        finished && NESTED[1].load(Ordering::SeqCst) == thread_dispatch::state::RUNNING as u64 && NESTED[0].load(Ordering::SeqCst) == 0x102 && blocked.count > 0 && blocked.constant && dispatches == 1 && exit.get().is_none_or(|status| status == NESTED_EXIT),
         "kwait: um processo de kernel dado como pronto em execucao segue fora da fila, e a espera dele deixa a CPU sem tick aninhado, vencendo pelo prazo",
     );
 }
