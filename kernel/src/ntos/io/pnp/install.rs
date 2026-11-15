@@ -175,6 +175,43 @@ const PCI_ROOT_RESOURCE_PICKER: &[RegValue] = &[
 /// pci.inf `[PCI_BRIDGE_HW.AddReg]` (`[PCI_ROOT.HW]`, HKR = Device Parameters).
 const PCI_ROOT_HARDWARE: &[RegValue] = &[RegValue { subkey: "", name: "UINumberDescFormat", data: RegData::Text("PCI Slot %1!u!") }];
 
+/// keyboard.inf `[Version]` (a classe Keyboard; c_keyboard.inf põe o
+/// kbdclass como filtro superior da classe).
+pub const CLASS_KEYBOARD: ClassSpec = ClassSpec { guid: "{4D36E96B-E325-11CE-BFC1-08002BE10318}", name: "Keyboard", upper_filters: &["kbdclass"], lower_filters: &[] };
+/// msmouse.inf `[Version]` (a classe Mouse, com o mouclass).
+pub const CLASS_MOUSE: ClassSpec = ClassSpec { guid: "{4D36E96F-E325-11CE-BFC1-08002BE10318}", name: "Mouse", upper_filters: &["mouclass"], lower_filters: &[] };
+/// keyboard.inf `[STANDARD_i8042prt_Service_Inst]` com o
+/// `[STANDARD_i8042prt_Service_AddReg]`.
+const SERVICE_I8042PRT: ServiceSpec = ServiceSpec {
+    name: "i8042prt",
+    display_name: Some("@keyboard.inf,%i8042prt.SvcDesc%;i8042 Keyboard and PS/2 Mouse Port Driver"),
+    start: 3,
+    error_control: 1,
+    binary: "i8042prt.sys",
+    group: Some("Keyboard Port"),
+    owner: "keyboard.inf",
+    values: &[
+        RegValue { subkey: "Parameters", name: "LayerDriver JPN", data: RegData::Text("kbd101.dll") },
+        RegValue { subkey: "Parameters", name: "LayerDriver KOR", data: RegData::Text("kbd101a.dll") },
+    ],
+};
+/// keyboard.inf `[STANDARD_AddReg]` (HKR = chave do driver).
+const KEYBOARD_DRIVER: &[RegValue] = &[RegValue { subkey: "", name: "LocationInformationOverride", data: RegData::Text("plugged into keyboard port") }];
+/// keyboard.inf `[KbdClass_HW_AddReg]` (HKR = Device Parameters).
+const KEYBOARD_HARDWARE: &[RegValue] = &[RegValue { subkey: "", name: "KeyboardDataQueueSize", data: RegData::Dword(100) }, RegValue { subkey: "", name: "PollStatusIterations", data: RegData::Dword(1) }];
+/// msmouse.inf `[PS2_Inst.AddReg]`.
+const MOUSE_DRIVER: &[RegValue] = &[RegValue { subkey: "", name: "LocationInformationOverride", data: RegData::Text("plugged into PS/2 mouse port") }];
+/// msmouse.inf `[PS2_Inst.HW.AddReg]`.
+const MOUSE_HARDWARE: &[RegValue] = &[
+    RegValue { subkey: "", name: "EnableWheelDetection", data: RegData::Dword(2) },
+    RegValue { subkey: "", name: "MouseDataQueueSize", data: RegData::Dword(100) },
+    RegValue { subkey: "", name: "MouseResolution", data: RegData::Dword(3) },
+    RegValue { subkey: "", name: "MouseSynchIn100ns", data: RegData::Dword(20_000_000) },
+    RegValue { subkey: "", name: "SampleRate", data: RegData::Dword(100) },
+    RegValue { subkey: "", name: "WheelDetectionTimeout", data: RegData::Dword(1500) },
+    RegValue { subkey: "", name: "MouseInitializePolled", data: RegData::Dword(0) },
+];
+
 /// mshdc.inf `[intelChannelEnableCheck_AddReg.HW]`, referenciado pelo
 /// `AddReg` de `[intelide_Inst]` (HKR = chave do driver).
 const INTEL_CHANNEL_ENABLE_CHECK: &[RegValue] = &[
@@ -389,8 +426,9 @@ pub const DRIVERS: &[InfDriver] = &[
     },
 ];
 
-/// As linhas de modelo do acpi.inf (`*pnp0c08` e `pnp0c08`, seção ACPI_Inst)
-/// e do pci.inf (`*PNP0A03` e `*PNP0A08`, seção PCI_ROOT), que só a árvore
+/// As linhas de modelo do acpi.inf (`*pnp0c08` e `pnp0c08`, seção ACPI_Inst),
+/// do pci.inf (`*PNP0A03` e `*PNP0A08`, seção PCI_ROOT), do keyboard.inf
+/// (`*PNP0303`) e do msmouse.inf (`*PNP0F13`), que só a árvore
 /// com a raiz ACPI (`--pnp-root=acpi`) usa: o acpi.sys no dispositivo ACPI da
 /// HAL e o pci.sys no barramento PCI que ele enumera.
 pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
@@ -456,6 +494,41 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
         class: &CLASS_SYSTEM,
         driver_values: PCI_ROOT_RESOURCE_PICKER,
         device_values: PCI_ROOT_HARDWARE,
+        exclude_ids: &[],
+    },
+    // O teclado e o mouse PS/2 que o acpi.sys relata sob a ponte PCI-ISA:
+    // keyboard.inf `*PNP0303` (STANDARD_Inst) e msmouse.inf `*PNP0F13`
+    // (PS2_Inst), os dois com o i8042prt e os filtros de classe.
+    InfDriver {
+        inf: "keyboard.inf",
+        section: "STANDARD_Inst",
+        id: "*PNP0303",
+        description_key: "*PNP0303.DeviceDesc",
+        description: "Standard PS/2 Keyboard",
+        manufacturer_key: "Std-Keyboards",
+        manufacturer: "(Standard keyboards)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.1",
+        service: Some(&SERVICE_I8042PRT),
+        class: &CLASS_KEYBOARD,
+        driver_values: KEYBOARD_DRIVER,
+        device_values: KEYBOARD_HARDWARE,
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "msmouse.inf",
+        section: "PS2_Inst",
+        id: "*PNP0F13",
+        description_key: "*pnp0f13.DeviceDesc",
+        description: "PS/2 Compatible Mouse",
+        manufacturer_key: "StdMfg",
+        manufacturer: "(Standard mouse types)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.1",
+        service: Some(&SERVICE_I8042PRT),
+        class: &CLASS_MOUSE,
+        driver_values: MOUSE_DRIVER,
+        device_values: MOUSE_HARDWARE,
         exclude_ids: &[],
     },
 ];

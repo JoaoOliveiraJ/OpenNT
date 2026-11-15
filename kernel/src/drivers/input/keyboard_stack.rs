@@ -28,6 +28,14 @@ pub fn initialize() -> Result<Option<NodeId>, KernelError> {
     if let Some(stack) = *KEYBOARD_STACK.lock() {
         return Ok(stack);
     }
+    if crate::drivers::bus::acpi_stack::ENABLED {
+        let stack = acpi_keyboard_stack();
+        if let Some(fdo) = stack {
+            open_port(fdo)?;
+        }
+        *KEYBOARD_STACK.lock() = Some(stack);
+        return Ok(stack);
+    }
     let _ = lifecycle::load_driver("/kbdclass.sys", &DriverOptions::default());
     let _ = lifecycle::load_driver("/i8042prt.sys", &DriverOptions::default());
     if object_manager::lookup("\\Driver\\kbdclass").is_none() || object_manager::lookup("\\Driver\\i8042prt").is_none() {
@@ -48,12 +56,28 @@ pub fn initialize() -> Result<Option<NodeId>, KernelError> {
         }
     }
     if let Some(fdo) = keyboard_stack {
-        let path = object_manager::path_of(fdo).unwrap_or_default();
-        let opened = io_manager::open_device(&path, false)?;
-        if opened.status != 0 {
-            return Err(KernelError::new(format!("CREATE na porta i8042 falhou: 0x{:x}", opened.status as u32)));
-        }
+        open_port(fdo)?;
     }
     *KEYBOARD_STACK.lock() = Some(keyboard_stack);
     Ok(keyboard_stack)
+}
+
+/// Abre a porta do teclado (o CREATE do i8042prt habilita os scancodes).
+fn open_port(fdo: NodeId) -> Result<(), KernelError> {
+    let path = object_manager::path_of(fdo).unwrap_or_default();
+    let opened = io_manager::open_device(&path, false)?;
+    if opened.status != 0 {
+        return Err(KernelError::new(format!("CREATE na porta i8042 falhou: 0x{:x}", opened.status as u32)));
+    }
+    Ok(())
+}
+
+/// Com a raiz ACPI (`--pnp-root=acpi`) a pilha do teclado é a que o PnP
+/// montou no ACPI\PNP0303 que o filtro do acpi.sys relata sob a ponte
+/// PCI-ISA (o i8042prt pelo keyboard.inf, com o kbdclass da classe): o FDO
+/// do i8042prt do nó iniciado.
+fn acpi_keyboard_stack() -> Option<NodeId> {
+    use crate::ntos::io::pnp::devnode;
+    let node = devnode::all().into_iter().find(|node| node.device_id.eq_ignore_ascii_case("ACPI\\PNP0303") && node.state == devnode::State::Started && node.service.as_deref() == Some("i8042prt"))?;
+    io_manager::devices().into_iter().find(|(_, entry)| entry.native_device == node.function_device && node.function_device != 0).map(|(device, _)| device)
 }
