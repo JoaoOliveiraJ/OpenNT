@@ -511,7 +511,7 @@ impl Tx<'_> {
         put64(&mut value, 48, size);
         put32(&mut value, 56, if file_attributes != 0 { file_attributes } else if directory { 0x10 } else { 0x20 } as u64);
         value[64] = (units.len() / 2) as u8;
-        value[65] = 1;
+        value[65] = name_space(name);
         value[66..].copy_from_slice(&units);
         Ok(value)
     }
@@ -1120,4 +1120,18 @@ impl Ntfs {
             Ok(Space { clusters: allocation.clusters, free_clusters: free, cluster_size: tx.cluster(), sector_size: tx.sector(), sectors_per_cluster: tx.volume.geometry.sectors_per_cluster })
         })
     }
+}
+
+/// O espaço de nomes do $FILE_NAME: um nome que já é um nome curto do DOS
+/// (8.3, maiúsculo) é Win32 e DOS ao mesmo tempo (3, como o NTFS grava);
+/// os demais vão no espaço POSIX (0), que dispensa o par de nome curto que
+/// um nome só Win32 (1) exige do ntfs.sys.
+fn name_space(name: &str) -> u8 {
+    let legal = |part: &str| part.chars().all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || "!#$%&'()-@^_`{}~".contains(character));
+    let (base, extension) = match name.split_once('.') {
+        Some((base, extension)) => (base, Some(extension)),
+        None => (name, None),
+    };
+    let short = (1..=8).contains(&base.len()) && legal(base) && extension.is_none_or(|extension| (1..=3).contains(&extension.len()) && legal(extension));
+    if short { 3 } else { 0 }
 }

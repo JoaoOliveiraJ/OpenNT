@@ -317,6 +317,25 @@ fn file_name_value(parent: u64, name: &str, file_attributes: u32, allocated: u64
     Ok(value)
 }
 
+/// O espaço de nomes do $FILE_NAME: um nome que já é um nome curto do DOS
+/// (8.3, maiúsculo) é Win32 e DOS ao mesmo tempo (3, como o NTFS grava);
+/// os demais vão no espaço POSIX (0), que dispensa o par de nome curto que
+/// um nome só Win32 (1) exige do ntfs.sys.
+fn name_space(name: &str) -> u8 {
+    if is_short_name(name) { 3 } else { 0 }
+}
+
+/// Nome curto válido do DOS: base de 1 a 8 e extensão de até 3 caracteres
+/// maiúsculos, dígitos ou símbolos permitidos.
+fn is_short_name(name: &str) -> bool {
+    let legal = |part: &str| part.chars().all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || "!#$%&'()-@^_`{}~".contains(character));
+    let (base, extension) = match name.split_once('.') {
+        Some((base, extension)) => (base, Some(extension)),
+        None => (name, None),
+    };
+    (1..=8).contains(&base.len()) && legal(base) && extension.is_none_or(|extension| (1..=3).contains(&extension.len()) && legal(extension))
+}
+
 fn file_name_attribute(value: Vec<u8>) -> Attribute {
     Attribute { kind: 0x30, name: "", body: Body::Resident(value, true) }
 }
@@ -662,7 +681,7 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
         records.push((number, IN_USE, vec![standard_information(HIDDEN_SYSTEM), resident(0x80, "", Vec::new())]));
     }
     // HELLO.TXT e os arquivos extras.
-    let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, 1)?;
+    let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, name_space(HELLO_NAME))?;
     children.entry(ROOT).or_default().push((HELLO_RECORD, hello.clone()));
     records.push((HELLO_RECORD, IN_USE, vec![standard_information(0), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
     for (index, (name, blob)) in extras.iter().enumerate() {
@@ -673,7 +692,7 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
             Some((lcn, count)) => (nonresident(0x80, "", vec![(Some(lcn), count)], blob.len() as u64), count * CLUSTER as u64),
             None => (resident(0x80, "", Vec::new()), 0),
         };
-        let value = file_name_value(parent, &leaf, FILE_ARCHIVE, allocated, blob.len() as u64, 1)?;
+        let value = file_name_value(parent, &leaf, FILE_ARCHIVE, allocated, blob.len() as u64, name_space(&leaf))?;
         children.entry(parent).or_default().push((number, value.clone()));
         records.push((number, IN_USE, vec![standard_information(0), file_name_attribute(value), data]));
     }
@@ -681,7 +700,7 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
     let mut directory_names = Vec::new();
     for directory in &directories {
         let (parent_path, leaf) = split(directory);
-        let value = file_name_value(directory_record(&parent_path), &leaf, DIRECTORY_DUPLICATE, 0, 0, 1)?;
+        let value = file_name_value(directory_record(&parent_path), &leaf, DIRECTORY_DUPLICATE, 0, 0, name_space(&leaf))?;
         children.entry(directory_record(&parent_path)).or_default().push((directory_record(directory), value.clone()));
         directory_names.push((directory_record(directory), value));
     }
