@@ -402,6 +402,16 @@ fn apply_values(root: &str, values: &[RegValue]) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// O ImagePath que o AddService grava: relativo a \SystemRoot para um
+/// binário de `%12%`, o caminho NT inteiro para um do repositório de drivers.
+pub fn service_image_path(service: &ServiceSpec) -> String {
+    if service.binary.starts_with('\\') {
+        String::from(service.binary)
+    } else {
+        format!("System32\\drivers\\{}", service.binary)
+    }
+}
+
 /// Chave do serviço como o AddService a cria: Type, Start, ErrorControl,
 /// ImagePath (relativo a \SystemRoot, como o instalador grava), Group,
 /// DisplayName e Owners. Um serviço já presente fica como está.
@@ -412,7 +422,7 @@ pub fn install_service(service: &ServiceSpec) -> Result<(), KernelError> {
         service_type: Some(1),
         start: Some(service.start),
         error_control: Some(service.error_control),
-        image_path: Some(if service.binary.starts_with('\\') { String::from(service.binary) } else { format!("System32\\drivers\\{}", service.binary) }),
+        image_path: Some(service_image_path(service)),
         ..ConfigurationInput::default()
     };
     match service_database::install(&input, true) {

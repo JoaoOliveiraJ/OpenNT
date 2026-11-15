@@ -21,6 +21,10 @@
 //!   o vetor 0x2E no IRQL 14).
 //! - Um devnode sintético responde IoGetDeviceProperty e
 //!   IoOpenDeviceRegistryKey pela árvore do PnP.
+//! - As linhas do display.inf (BasicDisplay.sys do repositório de drivers
+//!   para PCI\CC_0300, com o ExcludeID da seção) e do machine.inf
+//!   (msisadrv.sys para PCI\CC_0601), e o BAR pré-buscável do adaptador VGA
+//!   com CM_RESOURCE_MEMORY_PREFETCHABLE.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -395,10 +399,45 @@ fn io_support(assert: Assert) {
     }
 }
 
+/// As linhas do display.inf e do machine.inf (com o ExcludeID da seção
+/// MSBDA e o ImagePath do repositório de drivers) e o BAR pré-buscável do
+/// adaptador VGA nos requisitos do PDO.
+fn display_and_bridge_rows(assert: Assert) {
+    let ids = |list: &[&str]| list.iter().map(|id| String::from(*id)).collect::<Vec<String>>();
+    let vga = install::select_driver(&ids(&["PCI\\VEN_1234&DEV_1111&SUBSYS_11001AF4&REV_02", "PCI\\VEN_1234&DEV_1111&CC_0300"]), &ids(&["PCI\\VEN_1234&DEV_1111", "PCI\\CC_030000", "PCI\\CC_0300"]));
+    let basic_display = "\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicdisplay.inf_amd64_19e58b6267591a82\\BasicDisplay.sys";
+    assert(vga.is_some_and(|driver| driver.inf == "display.inf" && driver.section == "MSBDA" && driver.class.name == "Display" && driver.service.is_some_and(|service| service.name == "BasicDisplay" && install::service_image_path(service) == basic_display)), "pnp-storage: PCI\\CC_0300 instala o BasicDisplay.sys do repositorio de drivers (display.inf)");
+    assert(install::select_driver(&ids(&["PCI\\VEN_1414&DEV_5353&SUBSYS_00000000&REV_00"]), &ids(&["PCI\\VEN_1414&DEV_5353", "PCI\\CC_0300"])).is_none(), "pnp-storage: o ExcludeID da secao MSBDA recusa o adaptador do Hyper-V");
+    let bridge = install::select_driver(&ids(&["PCI\\VEN_8086&DEV_7000&SUBSYS_11001AF4&REV_00"]), &ids(&["PCI\\VEN_8086&DEV_7000", "PCI\\CC_060100", "PCI\\CC_0601"]));
+    assert(bridge.is_some_and(|driver| driver.inf == "machine.inf" && driver.class.name == "System" && driver.service.is_some_and(|service| service.name == "msisadrv" && install::service_image_path(service) == "System32\\drivers\\msisadrv.sys")), "pnp-storage: PCI\\CC_0601 instala o msisadrv.sys (machine.inf)");
+    let Some(adapter) = pci::devices().into_iter().find(|function| function.class_code == 0x03 && function.sub_class == 0x00) else {
+        assert(false, "pnp-storage: adaptador VGA enumerado");
+        return;
+    };
+    let (status, list) = pnp_irp(adapter.pdo_pointer, 0x0B, |_| {});
+    if status != 0 || list == 0 {
+        assert(false, "pnp-storage: requisitos do adaptador VGA");
+        return;
+    }
+    // SAFETY: lista devolvida pelo barramento.
+    let header = unsafe { IoResourceRequirementsList::at(list) };
+    let alternative = &header.list[0];
+    // SAFETY: os descritores da lista.
+    let descriptors = unsafe { IoResourceDescriptor::array_at(alternative.descriptors[0].address(), alternative.count.get() as usize) };
+    let memory: Vec<&pci::Bar> = adapter.bars.iter().filter(|bar| bar.value & 1 == 0 && bar.size != 0).collect();
+    let flags_match = memory.iter().enumerate().all(|(index, bar)| {
+        let expected = if bar.value & 0x8 != 0 { 4 } else { 0 };
+        descriptors.get(index * 2).is_some_and(|descriptor| descriptor.type_.get() == 3 && descriptor.flags.get() == expected) && descriptors.get(index * 2 + 1).is_some_and(|descriptor| descriptor.flags.get() == expected)
+    });
+    assert(memory.iter().any(|bar| bar.value & 0x8 != 0) && flags_match, "pnp-storage: BAR pre-buscavel do adaptador VGA com CM_RESOURCE_MEMORY_PREFETCHABLE (preferido e alternativa)");
+    guest::free_bytes(list);
+}
+
 pub fn run(assert: Assert) {
     io_attribution(assert);
     io_support(assert);
     pci_function_pdo(assert);
+    display_and_bridge_rows(assert);
     dma_adapter(assert);
     tree_support(assert);
     devnode_properties(assert);
