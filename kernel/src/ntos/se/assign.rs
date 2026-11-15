@@ -61,15 +61,15 @@ fn captured_from(pointer: u64) -> Option<Captured> {
     })
 }
 
-/// Token do subject context: o primário, com recuo ao cliente e ao token
-/// do processo corrente.
+/// Token do subject context: o efetivo (o cliente quando há impersonação,
+/// senão o primário), com recuo ao token do processo corrente.
 fn subject_token(subject: u64) -> u64 {
     let mut token = 0;
     if subject != 0 {
         // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador.
         let context = unsafe { SecuritySubjectContext::at(subject) };
-        let primary = context.primary_token.get();
-        token = if primary != 0 { primary } else { context.client_token.get() };
+        let client = context.client_token.get();
+        token = if client != 0 { client } else { context.primary_token.get() };
     }
     if token == 0 {
         token = process::get_primary_token(process::get_current_process()).unwrap_or(0);
@@ -77,19 +77,18 @@ fn subject_token(subject: u64) -> u64 {
     token
 }
 
-/// Owner/group padrão para CREATOR OWNER/GROUP: do token do subject
-/// context e, em último caso, o SYSTEM.
-fn subject_owner_group(subject: u64) -> (Vec<u8>, Vec<u8>) {
+/// Owner/group padrão para CREATOR OWNER/GROUP: do token e, em último
+/// caso, o SYSTEM.
+fn token_owner_group(token: u64) -> (Vec<u8>, Vec<u8>) {
     let default = || sid(5, &[18]);
-    tokens::with(subject_token(subject), |token| (token.owner.clone(), token.primary_group.clone()))
+    tokens::with(token, |token| (token.owner.clone(), token.primary_group.clone()))
         .map(|(owner, group)| (if owner.is_empty() { default() } else { owner }, if group.is_empty() { default() } else { group }))
         .unwrap_or_else(|| (default(), default()))
 }
 
-/// A DACL padrão do token do subject context, codificada (`None` = o token
-/// não tem DACL padrão).
-fn subject_default_dacl(subject: u64) -> Option<Vec<u8>> {
-    let token = subject_token(subject);
+/// A DACL padrão do token, codificada (`None` = o token não tem DACL
+/// padrão).
+fn token_default_dacl(token: u64) -> Option<Vec<u8>> {
     tokens::with(token, |_| ())?;
     crate::ntos::se::policy_descriptor::capture(&crate::ntos::ob::object_access::capture(Some(token))).ok()?.dacl
 }
@@ -157,7 +156,13 @@ pub fn assign(parent_ptr: u64, explicit_ptr: u64, out: u64, container: bool, aut
 /// RtlpNewSecurityObject: sem DACL explícita, a DACL padrão do token entra
 /// com DACL_DEFAULTED (a herança do pai prevalece sobre ela).
 pub fn assign_components(parent: Option<&Captured>, explicit: Option<&Captured>, mapping: &[u32; 4], container: bool, auto_flags: u32, subject: u64) -> Result<Captured, u32> {
-    let (owner_default, group_default) = subject_owner_group(subject);
+    assign_components_for_token(parent, explicit, mapping, container, auto_flags, subject_token(subject))
+}
+
+/// [`assign_components`] com o token de quem cria já resolvido (o efetivo
+/// do contexto do sujeito: o de impersonação, quando há, senão o primário).
+pub fn assign_components_for_token(parent: Option<&Captured>, explicit: Option<&Captured>, mapping: &[u32; 4], container: bool, auto_flags: u32, token: u64) -> Result<Captured, u32> {
+    let (owner_default, group_default) = token_owner_group(token);
     let mut creator = Captured {
         control: explicit.map_or(0, |captured| captured.control),
         owner: explicit.filter(|captured| !captured.owner.is_empty()).map_or(owner_default, |captured| captured.owner.clone()),
@@ -166,7 +171,7 @@ pub fn assign_components(parent: Option<&Captured>, explicit: Option<&Captured>,
         sacl: explicit.and_then(|captured| captured.sacl.clone()),
     };
     if creator.control & DACL_PRESENT == 0 {
-        if let Some(dacl) = subject_default_dacl(subject) {
+        if let Some(dacl) = token_default_dacl(token) {
             creator.control |= DACL_PRESENT | DACL_DEFAULTED;
             creator.dacl = Some(dacl);
         }

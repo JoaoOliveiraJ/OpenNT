@@ -38,7 +38,7 @@ impl Retained {
     /// Política de segurança do corpo (donos genéricos de abertura por ponteiro).
     pub fn security(&self) -> Option<crate::ntos::se::model::SecurityPolicy> {
         match &self.owner {
-            Owner::Described(described) => Some(described.owner.security(self.pointer)),
+            Owner::Described(described) => Some(crate::ntos::ob::object_security::described_policy(described)),
             _ => None,
         }
     }

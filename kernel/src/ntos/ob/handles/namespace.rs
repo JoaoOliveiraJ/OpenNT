@@ -12,7 +12,6 @@ use core::mem::offset_of;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::objects::namespace as namespace_objects;
 use crate::ntos::ob::open_pointer;
-use crate::ntos::ex::callback_security;
 use crate::ntos::ex::callbacks as executive_callbacks;
 use crate::ntos::ps::user_probe;
 use crate::ntos::inc::types::{NtStruct, ObjectAttributes, ObjectDirectoryInformation, UnicodeString};
@@ -178,6 +177,13 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
             let (parent, parent_rest) = object_manager::resolve_from(&parts.join("\\"), 0, input.case_insensitive, false, input.start);
             let parent = parent.filter(|&parent| object_manager::node(parent).is_some_and(|node| node.type_name == "Directory") && parent_rest.is_none());
             let Some(parent) = parent else { return 0xC000_003A };
+            // DIRECTORY_CREATE_SUBDIRECTORY ou DIRECTORY_CREATE_OBJECT no pai
+            // (ObCheckCreateObjectAccess), só para quem vem de UserMode.
+            if from_user_mode {
+                if let Err(status) = crate::ntos::ob::object_security::check_create_in(parent, kind == "Directory") {
+                    return status;
+                }
+            }
             let data = link_target.map(object_manager::ObjectData::symlink);
             let Some(inserted) = object_manager::insert_named(parent, name, kind, data, input.case_insensitive) else {
                 return 0xC000_0035;
@@ -197,12 +203,12 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
         Err(error) => return if error.status != 0 { error.status } else { 0xC000_0001 },
     };
     if created.is_some() {
-        let descriptor = input.security_descriptor;
-        if descriptor != 0 {
-            match callback_security::capture(descriptor) {
-                Ok(policy) => namespace_objects::set_security(body, policy),
-                Err(status) => return status,
-            }
+        // O descritor do objeto novo: o explícito, a herança do diretório
+        // pai e o token de quem cria (SeAssignSecurity).
+        let parent = object_manager::node(node).and_then(|snapshot| snapshot.parent);
+        let assigned = crate::ntos::ob::object_security::assign_named(body, parent, input.security_descriptor, from_user_mode);
+        if assigned != 0 {
+            return assigned;
         }
     }
     let object_type = open_pointer::describe(body).map_or(0, |item| item.object_type.pointer);

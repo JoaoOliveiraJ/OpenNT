@@ -336,6 +336,18 @@ fn name_target(root: u64, name: &str, from_user_mode: bool) -> Result<(object_ma
     Ok((directory, alloc::string::String::from(leaf)))
 }
 
+/// O descritor de um diretório do namespace, publicado como cópia
+/// self-relative (o chamador libera), ou 0.
+fn directory_descriptor(directory: object_manager::NodeId) -> u64 {
+    let Ok(owned) = crate::ntos::se::policy_descriptor::capture(&crate::ntos::se::object_security::directory(directory)) else { return 0 };
+    let bytes = crate::ntos::se::set_security::serialize_owned(&owned);
+    let pointer = guest::alloc_bytes(bytes.len() as u64);
+    if pointer != 0 {
+        guest::write_bytes(pointer, &bytes);
+    }
+    pointer
+}
+
 /// O corpo do OBJECT_DIRECTORY de um nó do namespace (0 se não tem).
 fn directory_body(node: object_manager::NodeId) -> u64 {
     object_manager::node(node).and_then(|node| node.data).map_or(0, |data| if data.native_body != 0 { data.native_body } else { data.native_pointer })
@@ -345,7 +357,7 @@ fn directory_body(node: object_manager::NodeId) -> u64 {
 /// (a entrada retém o objeto e o NameInfo aponta o diretório); um nome já
 /// presente é o objeto existente com OBJ_OPENIF (do mesmo tipo) ou
 /// STATUS_OBJECT_NAME_COLLISION.
-fn insert_name(object: u64, root: u64, attributes: u32, from_user_mode: bool) -> Result<Option<u64>, u32> {
+fn insert_name(object: u64, root: u64, attributes: u32, from_user_mode: bool, directory_out: &mut Option<object_manager::NodeId>) -> Result<Option<u64>, u32> {
     let info = object_header::name_info(object);
     // SAFETY: NameInfo do cabeçalho do objeto.
     let name = crate::ntos::rtl::guest_strings::read_unicode_string(unsafe { ObjectHeaderNameInfo::at(info) }.name.address());
@@ -355,6 +367,7 @@ fn insert_name(object: u64, root: u64, attributes: u32, from_user_mode: bool) ->
     match object_manager::insert_named(directory, &leaf, &object_type.name, Some(ObjectData::pointer(object)), case_insensitive) {
         Some(node) => {
             object_header::attach_name(object, node, directory_body(directory), &leaf);
+            *directory_out = Some(directory);
             Ok(None)
         }
         None => {
@@ -373,8 +386,8 @@ fn insert_name(object: u64, root: u64, attributes: u32, from_user_mode: bool) ->
 /// mapeamento do tipo; o handle conta no cabeçalho (ObpIncrementHandleCountEx
 /// com ObCreateHandle e a OpenProcedure) antes do nome; o nome entra no
 /// diretório com o descritor atribuído (ObpInsertOrLocateNamedObject e
-/// ObpAssignSecurity; o namespace do OpenNT não guarda descritor de
-/// diretório para herdar) e uma colisão desfaz a contagem
+/// ObpAssignSecurity, com a herança do descritor do diretório) e uma
+/// colisão desfaz a contagem
 /// (ObpDecrementHandleCount, com a CloseProcedure); depois os callbacks de
 /// objeto do tipo e a linha na tabela do System (OBJ_KERNEL_HANDLE) ou do
 /// processo corrente. Devolve o status e o handle.
@@ -393,9 +406,16 @@ fn create_handle(object: u64, desired: u32, attributes: u32, mode: u8, root: u64
     let mut target = object;
     let mut status = STATUS_SUCCESS;
     if named {
-        match insert_name(object, root, attributes, mode != 0) {
+        let mut directory = None;
+        match insert_name(object, root, attributes, mode != 0, &mut directory) {
             Ok(None) => {
-                let assigned = object_security::assign_object_security(object, 0, descriptor, 0, mode);
+                // O descritor do diretório pai entra na herança (o
+                // ParentDescriptor do ObpAssignSecurity).
+                let parent = directory.map_or(0, directory_descriptor);
+                let assigned = object_security::assign_object_security(object, parent, descriptor, 0, mode);
+                if parent != 0 {
+                    guest::free_bytes(parent);
+                }
                 if assigned != STATUS_SUCCESS {
                     object_header::detach_name(object);
                     created::close_handle(object, owner);

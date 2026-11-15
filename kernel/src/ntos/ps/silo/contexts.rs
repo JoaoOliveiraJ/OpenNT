@@ -220,6 +220,9 @@ impl ObjectOwner for SiloOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         STATE.lock().records.get(&pointer).map(|record| record.security.clone()).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        STATE.lock().records.get_mut(&pointer).map(|record| record.security = security).is_some()
+    }
     fn data(&self, _pointer: u64) -> ObjectData {
         ObjectData::default()
     }

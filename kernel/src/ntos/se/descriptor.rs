@@ -353,6 +353,35 @@ pub fn capture(input: u64, output: u64) -> u32 {
     0
 }
 
+/// SeCaptureSecurityDescriptor com o RequestorMode: em UserMode o cabeçalho
+/// e os componentes são sondados e copiados para uma cópia self-relative do
+/// kernel, e a validação (RtlValidSid/RtlValidAcl) é feita sobre a cópia,
+/// nunca sobre a memória do processo; em KernelMode é o [`capture`].
+pub fn capture_mode(input: u64, mode: u8, output: u64) -> u32 {
+    if mode == 0 || input == 0 {
+        return capture(input, output);
+    }
+    if !crate::ntos::mm::section::create::descriptor_probe(input) {
+        return 0xC000_0005;
+    }
+    if guest::try_read::<u8>(input).ok() != Some(1) {
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    let Some(owned) = super::query_descriptor::read_descriptor(input) else { return STATUS_INVALID_SECURITY_DESCR };
+    let bytes = super::set_security::serialize_owned(&owned);
+    let captured = guest::alloc_bytes(bytes.len() as u64);
+    if captured == 0 {
+        return 0xC000_009A;
+    }
+    guest::write_bytes(captured, &bytes);
+    if !valid(captured) {
+        guest::free_bytes(captured);
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    out::<u64>(output).set(captured);
+    0
+}
+
 /// SeReleaseSecurityDescriptor: libera a cópia feita pela captura.
 pub fn release_captured(captured: u64) {
     if captured != 0 {

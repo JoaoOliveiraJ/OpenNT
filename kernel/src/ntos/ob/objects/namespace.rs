@@ -3,9 +3,10 @@
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
 //! ponteiro. O corpo privado (64 bytes) guarda referências (+0), handles
 //! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10), o
-//! número de filhos (+0x20) e, num diretório, o SessionId do
-//! OBJECT_DIRECTORY (+0x28). As contagens vivem só na memória do corpo e
-//! mudam por operações atômicas, como o PointerCount/HandleCount do NT.
+//! número de filhos (+0x20) e, num diretório, o SessionId (+0x28) e o
+//! SessionObject (+0x30) do OBJECT_DIRECTORY. As contagens vivem só na
+//! memória do corpo e mudam por operações atômicas, como o
+//! PointerCount/HandleCount do NT.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -35,7 +36,11 @@ struct NamespaceBody {
     /// ObpCreateDirectoryObject; o NtSetInformationObject
     /// (ObjectSessionInformation) grava a sessão de quem chama.
     session_id: Field<u32>,
-    _reserved: Reserved<0x14>,
+    _pad_2c: Reserved<4>,
+    /// OBJECT_DIRECTORY.SessionObject: o objeto Session ligado pelo
+    /// NtSetInformationObject (ObjectSessionObjectInformation), retido.
+    session_object: Field<u64>,
+    _reserved: Reserved<0x8>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -46,6 +51,7 @@ const _: () = {
     assert!(core::mem::offset_of!(NamespaceBody, link_target) == 0x10);
     assert!(core::mem::offset_of!(NamespaceBody, children) == 0x20);
     assert!(core::mem::offset_of!(NamespaceBody, session_id) == 0x28);
+    assert!(core::mem::offset_of!(NamespaceBody, session_object) == 0x30);
 };
 
 /// SessionId de diretório sem sessão.
@@ -149,6 +155,10 @@ fn collect(pointer: u64) {
         return;
     }
     let Some(body) = BODIES.lock().remove(&pointer) else { return };
+    let session_object = self::body(pointer).session_object.atomic().swap(0, Ordering::SeqCst);
+    if session_object != 0 {
+        crate::ntos::ob::object_header::dereference(session_object, true);
+    }
     object_manager::set_native_namespace(body.node, 0);
     object_types::unbind_native(pointer);
     object_manager::track_namespace(body.node, false);
@@ -270,6 +280,21 @@ pub fn get(pointer: u64) -> Option<(NodeId, bool)> {
     BODIES.lock().get(&pointer).map(|body| (body.node, body.directory))
 }
 
+/// O ObjectSessionObjectInformation num diretório: o SessionObject recebe
+/// `object` (com a referência de quem chama) se ainda está vazio; `false`
+/// quando já há um (o NT devolve STATUS_ACCESS_DENIED).
+pub fn attach_session_object(pointer: u64, object: u64) -> bool {
+    if !BODIES.lock().get(&pointer).is_some_and(|body| body.directory) {
+        return false;
+    }
+    body(pointer).session_object.atomic().compare_exchange(0, object, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+/// O SessionObject de um diretório (0 sem objeto).
+pub fn session_object(pointer: u64) -> u64 {
+    if BODIES.lock().contains_key(&pointer) { body(pointer).session_object.get() } else { 0 }
+}
+
 pub fn security(pointer: u64) -> Option<SecurityPolicy> {
     BODIES.lock().get(&pointer).map(|body| body.security.clone())
 }
@@ -284,9 +309,19 @@ pub fn sync_types() {
     }
 }
 
-/// Substitui a política do corpo (descritor capturado na criação).
-pub fn set_security(pointer: u64, policy: SecurityPolicy) {
-    if let Some(body) = BODIES.lock().get_mut(&pointer) {
-        body.security = policy;
+/// Substitui o descritor do corpo (o atribuído na criação ou o do
+/// NtSetSecurityObject); o do nó, que as buscas pelo namespace leem, muda
+/// junto. `false` sem o corpo.
+pub fn set_security(pointer: u64, policy: SecurityPolicy) -> bool {
+    let node = BODIES.lock().get_mut(&pointer).map(|body| {
+        body.security = policy.clone();
+        body.node
+    });
+    match node {
+        Some(node) => {
+            object_security::replace(node, policy);
+            true
+        }
+        None => false,
     }
 }

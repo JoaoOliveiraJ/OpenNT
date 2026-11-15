@@ -335,31 +335,32 @@ fn duplicate_object_manager_handle(source: u64, source_handle: u64, target_proce
     result
 }
 
-/// O tipo do corpo de um handle do processo corrente, na tabela do Object
-/// Manager ou na de usuário.
-fn handle_type_name(handle: u64) -> Result<alloc::string::String, u32> {
-    match open_pointer::resolve(handle, true) {
-        Some(Ok(resolved)) => Ok(resolved.item.object_type.name.clone()),
-        Some(Err(status)) => Err(status),
-        None => state::get_user_handle(handle).and_then(|entry| entry.object.native_body()).map(|body| body.type_name).ok_or(BAD_HANDLE),
-    }
-}
-
-/// NtSetInformationObject(ObjectSessionObjectInformation, 6): com
-/// SeTcbPrivilege, liga um diretório ao objeto Session da sessão de quem
-/// chama (o MmGetSessionObjectById). Os espaços de sessão daqui ainda não
-/// têm o objeto Session do MiSessionObjectCreate: como no NT quando a
-/// sessão não tem objeto, STATUS_OBJECTID_EXISTS, que o csrss aceita.
+/// NtSetInformationObject(ObjectSessionObjectInformation, 6), como no
+/// ntoskrnl 19041: com SeTcbPrivilege, o diretório do handle (o
+/// ObReferenceObjectByHandle sem acesso pedido, tipo Directory) recebe o
+/// objeto Session da sessão de quem chama (MmGetSessionObjectById, retido
+/// pelo diretório); sessão sem objeto dá 0xC0000455 e um diretório que já
+/// tem objeto, STATUS_ACCESS_DENIED.
 fn set_session_object_information(handle: u64) -> Result<u32, KernelError> {
     // SeTcbPrivilege.
     if !crate::ntos::se::privilege::single_privilege_check(7, 1) {
         return Ok(0xC000_0061);
     }
-    match handle_type_name(handle) {
-        Ok(name) if name == "Directory" => Ok(0xC000_0455),
-        Ok(_) => Ok(0xC000_0024),
-        Err(status) => Ok(status),
+    let directory = match crate::ntos::ob::object_security::resolve_user_handle(handle) {
+        Ok((pointer, name, _)) if name == "Directory" => pointer,
+        Ok(_) => return Ok(0xC000_0024),
+        Err(status) => return Ok(status),
+    };
+    let session_id = crate::ntos::mm::session::session_id_ex(process::get_current_process());
+    let object = if session_id == u32::MAX { 0 } else { crate::ntos::mm::session_object::by_id(session_id) };
+    if object == 0 {
+        return Ok(0xC000_0455);
     }
+    if crate::ntos::ob::objects::namespace::attach_session_object(directory, object) {
+        return Ok(0);
+    }
+    crate::ntos::ob::object_header::dereference(object, false);
+    Ok(0xC000_0022)
 }
 
 /// NtSetInformationObject: ObjectHandleFlagInformation (Inherit e
@@ -452,10 +453,11 @@ pub fn init() {
 //   (senão STATUS_INVALID_PARAMETER); abre a próxima thread do processo.
 // Só as threads de usuário têm objeto de handle (threads de kernel não têm):
 // NtOpenThread não as acha (STATUS_INVALID_CID) e NtGetNextThread não as abre
-// (STATUS_NO_MORE_ENTRIES num processo sem threads de usuário). O descritor
-// de segurança de uma thread é o do processo dela: os dois vêm do DACL
-// padrão do token primário do processo na criação, como os objetos que o NT
-// cria sem descritor explícito.
+// (STATUS_NO_MORE_ENTRIES num processo sem threads de usuário). Processo e
+// thread têm cada um o seu descritor (os dois nascem do DACL padrão do
+// token primário do processo, como os objetos que o NT cria sem descritor
+// explícito), e a OpenProcedure dos dois tipos (`ps/open_procedure.rs`)
+// acrescenta os direitos implícitos a cada handle.
 
 use alloc::vec::Vec;
 use core::mem::offset_of;
@@ -540,10 +542,13 @@ pub(crate) fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
     open_access(&object_types::process_type(), &process_policy(pointer), requested)
 }
 
-/// Direitos de um novo handle de thread: o descritor é o do processo dela.
+/// Direitos de um novo handle de thread pelo descritor da ETHREAD (o da
+/// criação, do DACL padrão do token primário do processo, ou o do
+/// NtSetSecurityObject); sem ETHREAD viva, o do processo dela.
 pub(crate) fn thread_access(thread: &threads::UserThread, requested: u32) -> Result<u32, u32> {
-    let owner = thread.with(|thread| thread.process_pointer);
-    open_access(&object_types::thread_type(), &process_policy(owner), requested)
+    let (pointer, owner) = thread.with(|thread| (thread.thread_pointer, thread.process_pointer));
+    let policy = process::thread_record(pointer).map_or_else(|| process_policy(owner), |record| record.security);
+    open_access(&object_types::thread_type(), &policy, requested)
 }
 
 /// O que PsOpenProcess/PsOpenThread capturam de UserMode: os atributos do

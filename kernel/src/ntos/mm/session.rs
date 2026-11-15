@@ -404,7 +404,31 @@ pub fn create(process: u64) -> Result<u32, KernelError> {
     add_process(process, pointer, root, true);
     drop(sessions);
     crate::debug_print!("[mm] sessao {} criada para o processo {:#x} (topo {:#x}, VA global {:#x})", id, process, built.top_level, pointer);
+    // MiSessionObjectCreate: o objeto Session da sessão.
+    if let Err(error) = super::session_object::create(pointer) {
+        crate::debug_print!("[mm] sessao {}: objeto Session nao criado: {}", id, error);
+    }
     Ok(id)
+}
+
+/// A sessão de VA global `pointer` está viva.
+pub fn is_live(pointer: u64) -> bool {
+    SESSIONS.lock().contains_key(&pointer)
+}
+
+/// A VA global do MM_SESSION_SPACE da sessão `id`.
+pub fn find(id: u32) -> Option<u64> {
+    SESSIONS.lock().iter().find(|(_, state)| state.id == id).map(|(&pointer, _)| pointer)
+}
+
+/// MiReleaseProcessReferenceToSessionDataPage: uma ProcessReferenceToSession
+/// a menos.
+pub fn release_process_reference(pointer: u64) {
+    let sessions = SESSIONS.lock();
+    if sessions.contains_key(&pointer) {
+        let session = space(pointer);
+        session.process_reference_to_session.set(session.process_reference_to_session.get().saturating_sub(1));
+    }
 }
 
 /// MiJoinSession: o processo novo entra na sessão de `parent` (nenhuma se o
@@ -476,6 +500,7 @@ pub fn leave(process: u64) {
 /// retida (com aviso), nunca liberada debaixo de quem a usa.
 fn destroy(pointer: u64) {
     let id = space(pointer).session_id.get();
+    super::session_object::release(pointer);
     super::session_image::release_session(pointer);
     super::session_pool::release_session(pointer);
     let core_pages: Vec<u64> = (0..CORE_PAGES as u64).map(|index| map::SESSION_CORE_BASE + index * PAGE).collect();

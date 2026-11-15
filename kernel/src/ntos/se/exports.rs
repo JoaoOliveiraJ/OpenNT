@@ -277,7 +277,7 @@ pub mod se_descriptor {
 
     /// SeCaptureSecurityDescriptor(Sd, Mode, Pool, Force, *Captured).
     fn capture(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(descriptor::capture(call.arg(1), call.arg(5))))
+        Ok(signed_status(descriptor::capture_mode(call.arg(1), call.arg(2) as u8, call.arg(5))))
     }
 
     fn release(call: &Call) -> Result<u64, KernelError> {

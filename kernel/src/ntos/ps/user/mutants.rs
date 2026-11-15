@@ -102,6 +102,10 @@ fn nt_create_mutant(out: u64, access: u64, attributes: u64, initial_owner: u64, 
             debug_print!("[usermode] NtCreateMutant missing directory: {}", name);
             return Ok(0xC000_003A);
         }
+        // DIRECTORY_CREATE_OBJECT no diretório pai (ObCheckCreateObjectAccess).
+        if let Err(status) = crate::ntos::ob::object_security::check_create_in_path(&parent, false) {
+            return Ok(status);
+        }
     }
     let pointer = guest::alloc_bytes(0x38);
     if pointer == 0 {

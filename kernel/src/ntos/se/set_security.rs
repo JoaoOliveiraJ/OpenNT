@@ -182,7 +182,8 @@ fn read_mapping(mapping: u64) -> Option<[u32; 4]> {
     })
 }
 
-/// Descritor self-relative: cabeçalho, SACL, DACL, owner, group.
+/// Descritor self-relative: cabeçalho, SACL, DACL, owner, group (um SID
+/// vazio fica ausente, com offset zero).
 fn serialize(control: u16, sacl: Option<&Vec<u8>>, dacl: Option<&Vec<u8>>, owner: &[u8], group: &[u8]) -> Vec<u8> {
     let mut bytes = alloc::vec![0u8; SecurityDescriptorRelative::SIZE as usize];
     bytes[offset_of!(SecurityDescriptorRelative, revision)] = SECURITY_DESCRIPTOR_REVISION;
@@ -191,8 +192,8 @@ fn serialize(control: u16, sacl: Option<&Vec<u8>>, dacl: Option<&Vec<u8>>, owner
     let components = [
         (offset_of!(SecurityDescriptorRelative, sacl), sacl.map(Vec::as_slice)),
         (offset_of!(SecurityDescriptorRelative, dacl), dacl.map(Vec::as_slice)),
-        (offset_of!(SecurityDescriptorRelative, owner), Some(owner)),
-        (offset_of!(SecurityDescriptorRelative, group), Some(group)),
+        (offset_of!(SecurityDescriptorRelative, owner), (!owner.is_empty()).then_some(owner)),
+        (offset_of!(SecurityDescriptorRelative, group), (!group.is_empty()).then_some(group)),
     ];
     for (field, component) in components {
         if let Some(component) = component {
@@ -205,33 +206,23 @@ fn serialize(control: u16, sacl: Option<&Vec<u8>>, dacl: Option<&Vec<u8>>, owner
     bytes
 }
 
-/// SeSetSecurityDescriptorInfoEx(Object, *SecurityInformation, Modification,
-/// *ObjectsSecurityDescriptor, AutoInheritFlags, PoolType, GenericMapping).
-pub fn set_security_descriptor_info(information_pointer: u64, modification: u64, object_descriptor: u64, auto_inherit_flags: u32, mapping: u64) -> u32 {
-    let information = out::<u32>(information_pointer).get();
-    let slot = out::<u64>(object_descriptor);
-    let old = slot.get();
-    if old == 0 {
-        return STATUS_NO_SECURITY_ON_OBJECT;
-    }
-    if descriptor::control(old) & SE_SELF_RELATIVE == 0 {
-        return STATUS_BAD_DESCRIPTOR_FORMAT;
-    }
-    let current = query_descriptor::read_descriptor(old).unwrap_or_default();
-    let modified: OwnedDescriptor = query_descriptor::read_descriptor(modification).unwrap_or_default();
+/// O RtlpSetSecurityObject sobre componentes já lidos: o descritor que
+/// resulta de trocar em `current` as partes de `information` pelas de
+/// `modified` (com as ACLs finais mapeadas por `generic`). `Err(NTSTATUS)`.
+pub fn merge(current: &OwnedDescriptor, information: u32, modified: &OwnedDescriptor, auto_inherit_flags: u32, generic: Option<[u32; 4]>) -> Result<OwnedDescriptor, u32> {
     let owner = if information & OWNER_SECURITY_INFORMATION != 0 {
         match modified.owner.as_deref() {
             Some(owner) if valid_sid(owner) && (auto_inherit_flags & SEF_AVOID_OWNER_CHECK != 0 || owner_assignable(owner)) => owner.to_vec(),
-            _ => return STATUS_INVALID_OWNER,
+            _ => return Err(STATUS_INVALID_OWNER),
         }
     } else {
         match current.owner.as_deref() {
             Some(owner) if valid_sid(owner) => owner.to_vec(),
-            _ => return STATUS_INVALID_OWNER,
+            _ => return Err(STATUS_INVALID_OWNER),
         }
     };
     let group_source = if information & GROUP_SECURITY_INFORMATION != 0 { &modified.group } else { &current.group };
-    let Some(group) = group_source.as_deref().filter(|group| valid_sid(group)).map(<[u8]>::to_vec) else { return STATUS_INVALID_PRIMARY_GROUP };
+    let Some(group) = group_source.as_deref().filter(|group| valid_sid(group)).map(<[u8]>::to_vec) else { return Err(STATUS_INVALID_PRIMARY_GROUP) };
 
     let mut control = SE_SELF_RELATIVE;
     let mut dacl = if information & DACL_SECURITY_INFORMATION != 0 {
@@ -288,11 +279,37 @@ pub fn set_security_descriptor_info(information_pointer: u64, modification: u64,
     if information & GROUP_SECURITY_INFORMATION == 0 {
         control |= current.control & SE_GROUP_DEFAULTED;
     }
-    let generic = read_mapping(mapping);
     for acl in [dacl.as_mut(), sacl.as_mut()].into_iter().flatten() {
         apply_acl_to_object(acl, generic);
     }
-    let bytes = serialize(control, sacl.as_ref(), dacl.as_ref(), &owner, &group);
+    Ok(OwnedDescriptor { control, owner: Some(owner), group: Some(group), dacl, sacl })
+}
+
+/// O descritor self-relative de componentes já lidos (cabeçalho, SACL,
+/// DACL, owner, group, como o RtlpSetSecurityObject o monta).
+pub fn serialize_owned(descriptor: &OwnedDescriptor) -> Vec<u8> {
+    serialize(descriptor.control | SE_SELF_RELATIVE, descriptor.sacl.as_ref(), descriptor.dacl.as_ref(), descriptor.owner.as_deref().unwrap_or_default(), descriptor.group.as_deref().unwrap_or_default())
+}
+
+/// SeSetSecurityDescriptorInfoEx(Object, *SecurityInformation, Modification,
+/// *ObjectsSecurityDescriptor, AutoInheritFlags, PoolType, GenericMapping).
+pub fn set_security_descriptor_info(information_pointer: u64, modification: u64, object_descriptor: u64, auto_inherit_flags: u32, mapping: u64) -> u32 {
+    let information = out::<u32>(information_pointer).get();
+    let slot = out::<u64>(object_descriptor);
+    let old = slot.get();
+    if old == 0 {
+        return STATUS_NO_SECURITY_ON_OBJECT;
+    }
+    if descriptor::control(old) & SE_SELF_RELATIVE == 0 {
+        return STATUS_BAD_DESCRIPTOR_FORMAT;
+    }
+    let current = query_descriptor::read_descriptor(old).unwrap_or_default();
+    let modified: OwnedDescriptor = query_descriptor::read_descriptor(modification).unwrap_or_default();
+    let merged = match merge(&current, information, &modified, auto_inherit_flags, read_mapping(mapping)) {
+        Ok(merged) => merged,
+        Err(status) => return status,
+    };
+    let bytes = serialize_owned(&merged);
     let pointer = guest::alloc_bytes(bytes.len() as u64);
     if pointer == 0 {
         return STATUS_NO_MEMORY;

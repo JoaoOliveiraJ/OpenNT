@@ -93,7 +93,7 @@ fn from_body(pointer: u64, attributes: u32, access: u32) -> Result<Collected, u3
     let exclusive = item.owner.exclusive_process(pointer) != 0;
     let mut collected = information(item.object_type.clone(), record.name, attributes, access, record.handles.unwrap_or_else(|| handle_count(pointer)), record.references);
     collected.object_flags = (if record.permanent { 0x10 } else { 0 }) | (if exclusive { 0x20 } else { 0 });
-    collected.security_length = security_length(&item.owner.security(pointer), access);
+    collected.security_length = security_length(&crate::ntos::ob::object_security::described_policy(&item), access);
     if let Some(allocation) = allocation {
         if allocation.paged {
             collected.paged_charge = allocation.bytes as u32;

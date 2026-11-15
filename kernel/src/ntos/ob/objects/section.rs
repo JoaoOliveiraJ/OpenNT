@@ -78,6 +78,9 @@ impl ObjectOwner for SectionOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         SECTIONS.lock().get(&pointer).map(|record| record.security.clone()).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        SECTIONS.lock().get_mut(&pointer).map(|record| record.security = security).is_some()
+    }
     /// O processo que criou a seção com OBJ_EXCLUSIVE (0 = compartilhada),
     /// como o OBJECT_HEADER_PROCESS_INFO do NT.
     fn exclusive_process(&self, pointer: u64) -> u64 {

@@ -118,6 +118,10 @@ fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, r
         if object_manager::lookup(&parent).and_then(object_manager::node).is_none_or(|node| node.type_name != "Directory") {
             return Ok(0xC000_003A);
         }
+        // DIRECTORY_CREATE_OBJECT no diretório pai (ObCheckCreateObjectAccess).
+        if let Err(status) = crate::ntos::ob::object_security::check_create_in_path(&parent, false) {
+            return Ok(status);
+        }
     }
     let pointer = guest::alloc_bytes(0x40);
     if pointer == 0 {

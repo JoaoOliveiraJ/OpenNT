@@ -1000,6 +1000,12 @@ pub fn thread_record(pointer: u64) -> Option<ThreadRecord> {
     STATE.lock().threads.get(&pointer).cloned()
 }
 
+/// Troca o descritor de uma thread viva (o SetSecurityDescriptor do tipo
+/// Thread); `false` sem a thread.
+pub fn set_thread_security(pointer: u64, security: SecurityPolicy) -> bool {
+    STATE.lock().threads.get_mut(&pointer).map(|record| record.security = security).is_some()
+}
+
 pub fn account_thread_handle(delta: i64) -> Result<(), KernelError> {
     object_types::account("Thread", 0, delta)
 }

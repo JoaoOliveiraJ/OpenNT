@@ -15,7 +15,6 @@ use crate::ntos::ob::object_manager::{ObjectData, ObjectHooks};
 use crate::ntos::ob::object_types::{self, ObjectType};
 use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
 use crate::ntos::ob::object_access;
-use crate::ntos::ex::callback_security;
 use crate::ntos::mm::section::create as create_section;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::tokens;
@@ -89,6 +88,9 @@ impl ObjectOwner for DispatcherOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         security(pointer).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        BODIES.lock().get_mut(&pointer).map(|body| body.security = security).is_some()
+    }
     fn data(&self, pointer: u64) -> ObjectData {
         data(pointer)
     }
@@ -116,7 +118,10 @@ pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -
     if descriptor != 0 && from_user_mode && !create_section::descriptor_probe(descriptor) {
         return Err(status(0xC000_0005));
     }
-    let policy = if descriptor != 0 { callback_security::capture(descriptor).map_err(status)? } else { object_access::capture(subject) };
+    // O SeAssignSecurity do objeto novo: o descritor explícito sobre o dono,
+    // o grupo e a DACL padrão do token efetivo (a herança do diretório entra
+    // quando o nome é publicado).
+    let policy = if descriptor != 0 { crate::ntos::ob::object_security::assign_new(&object_type, None, descriptor, from_user_mode).map_err(status)? } else { object_access::capture(subject) };
     if from_user_mode && policy.sacl.as_deref().is_some_and(crate::ntos::se::model::sacl_requires_security_privilege) {
         let privileged = subject.and_then(|token| tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0))).unwrap_or(false);
         if !privileged {

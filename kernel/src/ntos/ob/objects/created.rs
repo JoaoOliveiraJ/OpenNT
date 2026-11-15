@@ -38,9 +38,10 @@ impl ObjectOwner for CreatedOwner {
         close_handle(pointer, process);
     }
 
-    /// Sem descritor no cabeçalho o acesso não é restrito (DACL nula).
-    fn security(&self, _pointer: u64) -> SecurityPolicy {
-        SecurityPolicy::default()
+    /// O descritor do cabeçalho (sem descritor o acesso não é restrito: DACL
+    /// nula, como o ObCheckObjectAccess sem descritor).
+    fn security(&self, pointer: u64) -> SecurityPolicy {
+        crate::ntos::ob::object_security::object_policy(pointer).unwrap_or_default()
     }
 
     fn exclusive_process(&self, pointer: u64) -> u64 {

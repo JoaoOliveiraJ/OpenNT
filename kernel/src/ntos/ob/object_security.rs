@@ -1,10 +1,11 @@
 //! Segurança dos objetos — ObSetSecurityObjectByPointer, ObGetObjectSecurity,
 //! ObReleaseObjectSecurity e ObCheckObjectAccess.
 //!
-//! O descritor escrito por ObSetSecurityObjectByPointer fica numa tabela
-//! lateral por objeto (o slot do OBJECT_HEADER no NT); ObGetObjectSecurity o
-//! devolve sem alocar. A checagem de acesso usa a política capturada pelo
-//! dono do corpo e o mapeamento genérico do tipo.
+//! O descritor de cada objeto (o OBJECT_HEADER.SecurityDescriptor do NT):
+//! o do cabeçalho, o da tabela lateral (dispositivos e drivers) ou o que o
+//! dono do corpo guarda; as aberturas, as consultas e o NtSetSecurityObject
+//! usam o mesmo. A checagem de acesso é o SeAccessCheck
+//! (`se/access_evaluation.rs`) com o mapeamento genérico do tipo.
 
 use alloc::collections::BTreeMap;
 
@@ -12,6 +13,9 @@ use crate::ntos::inc::types::{AccessState, Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::type_procedures::{self, SecurityOperation};
 use crate::ntos::ob::{object_access, object_create, object_header, object_types, open_pointer};
+use crate::ntos::se::inherit_descriptor::Captured;
+use crate::ntos::se::model::SecurityPolicy;
+use crate::ntos::se::{policy_descriptor, query_descriptor};
 use crate::rtl::SpinLock;
 
 const STATUS_SUCCESS: u32 = 0;
@@ -24,7 +28,9 @@ fn out<T: Copy>(address: u64) -> &'static Field<T> {
     unsafe { Field::<T>::at(address) }
 }
 
-/// Descritor escrito por ObSetSecurityObjectByPointer, por objeto.
+/// Descritor escrito por ObSetSecurityObjectByPointer, por objeto: o dos
+/// objetos sem OBJECT_HEADER cujo dono não guarda descritor próprio
+/// (dispositivos e drivers, `io/device_security.rs`).
 static SECURITY_DESCRIPTORS: SpinLock<BTreeMap<u64, u64>> = SpinLock::new(BTreeMap::new());
 
 /// O descritor do objeto: o do OBJECT_HEADER (sem as referências do
@@ -52,6 +58,77 @@ pub fn set_security_object_by_pointer(object: u64, descriptor: u64) -> u32 {
     STATUS_SUCCESS
 }
 
+// ---- O descritor de cada objeto ------------------------------------------------
+//
+// Todo objeto tem um descritor (o OBJECT_HEADER.SecurityDescriptor do NT):
+// - com OBJECT_HEADER, o que o SecurityProcedure do tipo guarda (o
+//   SeDefaultObjectMethod: uma entrada do cache no EX_FAST_REF);
+// - dispositivos e drivers, o da tabela lateral (`io/device_security.rs`);
+// - os demais objetos do OpenNT, o que o dono do corpo guarda no registro
+//   dele (processos, threads, tokens, objetos de despacho, diretórios e
+//   links, seções...), atribuído na criação e trocado pelo
+//   NtSetSecurityObject (`ObjectOwner::set_security`).
+// A abertura por nome ou por ponteiro, a duplicação e as consultas leem
+// esse mesmo descritor.
+
+/// O descritor efetivo de `object`, como política (`None` sem dono).
+pub fn object_policy(object: u64) -> Option<SecurityPolicy> {
+    if object_header::is_object(object) {
+        let descriptor = header_descriptor(object);
+        return Some(query_descriptor::read_descriptor(descriptor).map(|owned| policy_descriptor::policy_of(&owned)).unwrap_or_default());
+    }
+    let side = SECURITY_DESCRIPTORS.lock().get(&object).copied();
+    if let Some(owned) = side.and_then(query_descriptor::read_descriptor) {
+        return Some(policy_descriptor::policy_of(&owned));
+    }
+    open_pointer::describe(object).map(|described| described.owner.security(object))
+}
+
+/// O descritor efetivo de um objeto já descrito.
+pub fn described_policy(described: &open_pointer::Described) -> SecurityPolicy {
+    object_policy(described.pointer).unwrap_or_else(|| described.owner.security(described.pointer))
+}
+
+/// O SetSecurityDescriptor do SecurityProcedure de `object` (o
+/// ObSetSecurityObjectByPointer do NtSetSecurityObject): as partes de
+/// `information` do descritor capturado `captured` trocam as do descritor
+/// corrente (SeSetSecurityDescriptorInfo, com o mapeamento genérico do tipo
+/// e a validação do dono pelo token efetivo) e o resultado passa a ser o
+/// descritor do objeto, no mesmo lugar de onde as aberturas o leem.
+pub fn set_object_security(object: u64, information: u32, captured: u64) -> u32 {
+    if object == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    if object_header::is_object(object) || SECURITY_DESCRIPTORS.lock().contains_key(&object) {
+        return set_security_object_by_pointer_merged(object, information, captured);
+    }
+    if let Some(body) = crate::ntos::cm::key::objects::get(object) {
+        return crate::ntos::cm::key::security::set(body.node, information, captured);
+    }
+    let Some(described) = open_pointer::describe(object) else { return STATUS_INVALID_HANDLE };
+    let current = match object_access::descriptor_of(&described.owner.security(object), &described.object_type) {
+        Ok(current) => current,
+        Err(status) => return status,
+    };
+    let modified = query_descriptor::read_descriptor(captured).unwrap_or_default();
+    let merged = match crate::ntos::se::set_security::merge(&current, information, &modified, 0, Some(described.object_type.mapping)) {
+        Ok(merged) => merged,
+        Err(status) => return status,
+    };
+    if described.owner.set_security(object, policy_descriptor::policy_of(&merged)) {
+        return STATUS_SUCCESS;
+    }
+    // Um dono sem descritor próprio: a cópia mesclada vai para a tabela
+    // lateral.
+    let bytes = crate::ntos::se::set_security::serialize_owned(&merged);
+    let pointer = guest::alloc_bytes(bytes.len() as u64);
+    if pointer == 0 {
+        return 0xC000_009A;
+    }
+    guest::write_bytes(pointer, &bytes);
+    set_security_object_by_pointer(object, pointer)
+}
+
 /// ObSetSecurityObjectByPointer(Object, SecurityInformation,
 /// SecurityDescriptor): como o procedimento de segurança do tipo com
 /// SetSecurityDescriptor, o descritor corrente do objeto mescla os
@@ -61,6 +138,9 @@ pub fn set_security_object_by_pointer(object: u64, descriptor: u64) -> u32 {
 pub fn set_security_object_by_pointer_merged(object: u64, information: u32, descriptor: u64) -> u32 {
     if object == 0 {
         return STATUS_INVALID_HANDLE;
+    }
+    if !object_header::is_object(object) && !SECURITY_DESCRIPTORS.lock().contains_key(&object) && open_pointer::describe(object).is_some() {
+        return set_object_security(object, information, descriptor);
     }
     let object_type = object_header::object_type_info(object).or_else(|| object_types::bound(object)).or_else(|| object_create::created_type(object));
     let mapping = object_type.as_ref().map_or(0, mapping_block);
@@ -75,40 +155,220 @@ pub fn set_security_object_by_pointer_merged(object: u64, information: u32, desc
     status
 }
 
-// --- ObCheckObjectAccess --------------------------------------------------
-// BOOLEAN ObCheckObjectAccess(PVOID Object, PSECURITY_SUBJECT_CONTEXT,
-//   BOOLEAN LockHeld, KPROCESSOR_MODE Mode, PACCESS_MASK GrantedAccess,
-//   PNTSTATUS Status). GrantedAccess is in/out (desired on entry, granted
-//   on exit). Wraps object_access::check against the type generic-mapping.
-pub fn check_object_access(object: u64, mode: u8, granted_out: u64, status_out: u64) -> bool {
-    let desired = if granted_out != 0 { out::<u32>(granted_out).get() } else { 0 };
-    let (object_type, policy) = if let Some(described) = open_pointer::describe(object) {
-        (described.object_type.clone(), described.owner.security(object))
-    } else if let Some(object_type) = object_types::bound(object).or_else(|| object_create::created_type(object)) {
-        (object_type, object_access::capture(None))
-    } else {
-        if status_out != 0 {
-            out::<u32>(status_out).set(STATUS_INVALID_HANDLE);
+/// O descritor efetivo de `object`, publicado como cópia self-relative no
+/// convidado (o chamador libera), ou 0.
+pub fn published_descriptor(object: u64) -> u64 {
+    let Some(policy) = object_policy(object) else { return 0 };
+    let Ok(owned) = policy_descriptor::capture(&policy) else { return 0 };
+    let bytes = crate::ntos::se::set_security::serialize_owned(&owned);
+    let pointer = guest::alloc_bytes(bytes.len() as u64);
+    if pointer != 0 {
+        guest::write_bytes(pointer, &bytes);
+    }
+    pointer
+}
+
+/// Herança de um diretório para um objeto nomeado recém-inserido nele (o
+/// SeAssignSecurity do ObInsertObject com o descritor do diretório pai):
+/// quando o pai tem ACEs herdáveis para o tipo do objeto (OBJECT_INHERIT
+/// para os demais, CONTAINER_INHERIT para diretórios) e a DACL do objeto
+/// veio da DACL padrão do token (não de um descritor explícito), a DACL
+/// passa a ser a herdada.
+pub fn inherit_from_directory(object: u64, directory: crate::ntos::ob::object_manager::NodeId) {
+    // O diretório primeiro: sem ACE herdável (o caso dos diretórios do boot)
+    // o objeto nem é consultado, então quem publica o nome com a trava do
+    // próprio registro não volta a ela.
+    let parent = crate::ntos::se::object_security::directory(directory);
+    let Ok(parent) = policy_descriptor::capture(&parent) else { return };
+    let flags = parent.dacl.as_deref().map_or(0, |dacl| acl_entries(dacl).iter().fold(0u8, |flags, &(entry, _)| flags | entry));
+    if flags & 0x3 == 0 {
+        return;
+    }
+    let Some(described) = open_pointer::describe(object) else { return };
+    let container = described.object_type.name == "Directory";
+    let inheritable = if container { 0x2 } else { 0x1 };
+    if flags & inheritable == 0 {
+        return;
+    }
+    let current = described.owner.security(object);
+    let explicit_dacl = current.control.is_some_and(|control| control & 0x0004 != 0 && control & 0x0008 == 0);
+    if explicit_dacl {
+        return;
+    }
+    let Some(token) = object_access::subject() else { return };
+    let creator = Captured { control: 0, owner: current.owner.clone(), group: current.group.clone().unwrap_or_default(), dacl: None, sacl: current.sacl.clone() };
+    let parent = Captured { control: parent.control, owner: parent.owner.unwrap_or_default(), group: parent.group.unwrap_or_default(), dacl: parent.dacl, sacl: parent.sacl };
+    let Ok(assigned) = crate::ntos::se::assign::assign_components_for_token(Some(&parent), Some(&creator), &described.object_type.mapping, container, 0, token) else { return };
+    let owned = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: assigned.control, owner: Some(assigned.owner), group: Some(assigned.group), dacl: assigned.dacl, sacl: assigned.sacl };
+    described.owner.set_security(object, policy_descriptor::policy_of(&owned));
+}
+
+/// O SeAssignSecurity de um diretório ou link criado pelo nome (o
+/// ObInsertObject do NtCreateDirectoryObject/NtCreateSymbolicLinkObject): o
+/// descritor explícito dos OBJECT_ATTRIBUTES, a herança do diretório pai e
+/// o token efetivo de quem cria (dono, grupo e DACL padrão), com o
+/// mapeamento do tipo. Em UserMode o dono explícito precisa ser atribuível
+/// pelo token (STATUS_INVALID_OWNER) e uma SACL de auditoria pede
+/// SeSecurityPrivilege. O resultado é o descritor do corpo.
+pub fn assign_named(object: u64, parent: Option<crate::ntos::ob::object_manager::NodeId>, explicit: u64, from_user_mode: bool) -> u32 {
+    let Some(described) = open_pointer::describe(object) else { return STATUS_INVALID_PARAMETER };
+    match assign_new(&described.object_type, parent, explicit, from_user_mode) {
+        Ok(policy) => {
+            described.owner.set_security(object, policy);
+            STATUS_SUCCESS
         }
+        Err(status) => status,
+    }
+}
+
+/// O descritor de um objeto novo do tipo `object_type` pelo SeAssignSecurity
+/// (o explícito, a herança do diretório `parent` e o token efetivo de quem
+/// cria), com as validações de UserMode do [`assign_named`].
+pub fn assign_new(object_type: &object_types::ObjectType, parent: Option<crate::ntos::ob::object_manager::NodeId>, explicit: u64, from_user_mode: bool) -> Result<SecurityPolicy, u32> {
+    let explicit = capture_descriptor(explicit, from_user_mode)?;
+    let token = object_access::subject().or_else(|| crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process())).unwrap_or(0);
+    if from_user_mode {
+        if let Some(owner) = explicit.as_ref().and_then(|explicit| explicit.owner.as_ref()) {
+            let assignable = crate::ntos::se::token::tokens::with(token, |token| {
+                token.user == *owner || token.groups.iter().any(|group| group.sid == *owner && group.attributes & 0x8 != 0) || token.privileges.iter().any(|privilege| privilege.id == 18 && privilege.attributes & 2 != 0)
+            });
+            if assignable != Some(true) {
+                return Err(0xC000_005A);
+            }
+        }
+        let audit = explicit.as_ref().and_then(|explicit| explicit.sacl.as_deref()).is_some_and(crate::ntos::se::model::sacl_requires_security_privilege);
+        let privileged = crate::ntos::se::token::tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0)).unwrap_or(false);
+        if audit && !privileged {
+            return Err(0xC000_0061);
+        }
+    }
+    let container = object_type.name == "Directory";
+    let parent = parent.and_then(|node| policy_descriptor::capture(&crate::ntos::se::object_security::directory(node)).ok()).map(|parent| Captured { control: parent.control, owner: parent.owner.unwrap_or_default(), group: parent.group.unwrap_or_default(), dacl: parent.dacl, sacl: parent.sacl });
+    let explicit = explicit.map(|explicit| Captured { control: explicit.control, owner: explicit.owner.unwrap_or_default(), group: explicit.group.unwrap_or_default(), dacl: explicit.dacl, sacl: explicit.sacl });
+    let assigned = crate::ntos::se::assign::assign_components_for_token(parent.as_ref(), explicit.as_ref(), &object_type.mapping, container, 0, token)?;
+    let owned = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: assigned.control, owner: Some(assigned.owner), group: Some(assigned.group), dacl: assigned.dacl, sacl: assigned.sacl };
+    Ok(policy_descriptor::policy_of(&owned))
+}
+
+/// O ObCheckCreateObjectAccess do ObpLookupObjectName de uma criação por
+/// nome em UserMode: DIRECTORY_CREATE_OBJECT (ou
+/// DIRECTORY_CREATE_SUBDIRECTORY para um diretório) no diretório pai, pelo
+/// descritor dele e o token efetivo. `Err(NTSTATUS)` na recusa.
+pub fn check_create_in(directory: crate::ntos::ob::object_manager::NodeId, subdirectory: bool) -> Result<(), u32> {
+    let policy = crate::ntos::se::object_security::directory(directory);
+    let access = if subdirectory { 0x8 } else { 0x4 };
+    object_access::check(&policy, object_access::subject(), access, &object_types::directory_type(), false).map(|_| ())
+}
+
+/// [`check_create_in`] pelo caminho do diretório pai.
+pub fn check_create_in_path(directory: &str, subdirectory: bool) -> Result<(), u32> {
+    match crate::ntos::ob::object_manager::lookup(directory) {
+        Some(node) => check_create_in(node, subdirectory),
+        None => Ok(()),
+    }
+}
+
+/// O SeCaptureSecurityDescriptor do descritor dos OBJECT_ATTRIBUTES: a
+/// cópia self-relative no kernel (sondada em UserMode), validada antes de os
+/// componentes serem lidos dela. `None` sem descritor.
+fn capture_descriptor(descriptor: u64, from_user_mode: bool) -> Result<Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>, u32> {
+    if descriptor == 0 {
+        return Ok(None);
+    }
+    let output = guest::alloc_bytes(8);
+    let status = crate::ntos::init::exports::invoke_handler("SeCaptureSecurityDescriptor", &[descriptor, from_user_mode as u64, 1, 1, output]).map_or(0xC000_0079, |status| status as u32);
+    let captured = out::<u64>(output).get();
+    guest::free_bytes(output);
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+    let valid = captured != 0 && crate::ntos::se::descriptor::valid(captured);
+    let owned = if valid { query_descriptor::read_descriptor(captured) } else { None };
+    if captured != 0 {
+        guest::free_bytes(captured);
+    }
+    if !valid {
+        return Err(0xC000_0079);
+    }
+    Ok(owned)
+}
+
+/// (AceFlags, AceType) das ACEs de uma ACL.
+fn acl_entries(acl: &[u8]) -> alloc::vec::Vec<(u8, u8)> {
+    let count = u16::from_le_bytes([acl[4], acl[5]]) as usize;
+    let mut list = alloc::vec::Vec::new();
+    let mut offset = 8usize;
+    for _ in 0..count {
+        if offset + 4 > acl.len() {
+            break;
+        }
+        let size = u16::from_le_bytes([acl[offset + 2], acl[offset + 3]]) as usize;
+        list.push((acl[offset + 1], acl[offset]));
+        if size < 4 {
+            break;
+        }
+        offset += size;
+    }
+    list
+}
+
+// --- ObCheckObjectAccess --------------------------------------------------
+// BOOLEAN ObCheckObjectAccess(PVOID Object, PACCESS_STATE AccessState,
+//   BOOLEAN TypeMutexLocked, KPROCESSOR_MODE AccessMode, PNTSTATUS
+//   AccessStatus), como no ntoskrnl 19041 (rva 0x5d9860): sem descritor, o
+// RemainingDesiredAccess passa todo ao PreviouslyGrantedAccess; senão o
+// SeAccessCheck do descritor do objeto com o contexto do sujeito do
+// ACCESS_STATE, o RemainingDesiredAccess, o PreviouslyGrantedAccess e o
+// mapeamento do tipo; o acesso concedido entra no PreviouslyGrantedAccess e
+// sai do RemainingDesiredAccess (com MAXIMUM_ALLOWED).
+pub fn check_object_access(object: u64, access_state: u64, mode: u8, status_out: u64) -> bool {
+    use crate::ntos::se::access_evaluation;
+    let set_status = |status: u32| {
+        if status_out != 0 {
+            out::<u32>(status_out).set(status);
+        }
+    };
+    let object_type = open_pointer::describe(object).map(|described| described.object_type).or_else(|| object_types::bound(object)).or_else(|| object_create::created_type(object));
+    let (Some(object_type), true) = (object_type, access_state != 0) else {
+        set_status(STATUS_INVALID_HANDLE);
         return false;
     };
-    match object_access::check(&policy, object_access::subject(), desired, &object_type, mode == 0) {
+    // SAFETY: PACCESS_STATE de um chamador de kernel.
+    let state = unsafe { AccessState::at(access_state) };
+    let remaining = state.remaining_desired_access.get();
+    let previous = state.previously_granted_access.get();
+    let policy = if object_header::is_object(object) && header_descriptor(object) == 0 { None } else { object_policy(object) };
+    let Some(policy) = policy else {
+        state.previously_granted_access.set(previous | remaining);
+        state.remaining_desired_access.set(0);
+        set_status(STATUS_SUCCESS);
+        return true;
+    };
+    let result = if mode == 0 {
+        Ok(access_evaluation::kernel_mode_grant(remaining, previous, &object_type.mapping))
+    } else {
+        let context = &state.subject_security_context;
+        let client = context.client_token.get();
+        if client != 0 && context.impersonation_level.get().0 < 2 {
+            Err(0xC000_00A5)
+        } else {
+            let token = if client != 0 { client } else { context.primary_token.get() };
+            match (crate::ntos::se::access_check::subject_of_token(token), object_access::descriptor_of(&policy, &object_type)) {
+                (Some(subject), Ok(descriptor)) => access_evaluation::access_check(Some(&descriptor), &subject, remaining, previous, &object_type.mapping),
+                (None, _) => Err(0xC000_0022),
+                (_, Err(status)) => Err(status),
+            }
+        }
+    };
+    match result {
         Ok(granted) => {
-            if granted_out != 0 {
-                out::<u32>(granted_out).set(granted);
-            }
-            if status_out != 0 {
-                out::<u32>(status_out).set(STATUS_SUCCESS);
-            }
+            state.previously_granted_access.set(previous | granted);
+            state.remaining_desired_access.set(remaining & !(granted | 0x0200_0000));
+            set_status(STATUS_SUCCESS);
             true
         }
         Err(status) => {
-            if granted_out != 0 {
-                out::<u32>(granted_out).set(0);
-            }
-            if status_out != 0 {
-                out::<u32>(status_out).set(status);
-            }
+            set_status(status);
             false
         }
     }
@@ -315,11 +575,9 @@ pub fn dereference_security_descriptor(descriptor: u64, count: u32) -> Result<()
 //   arquivos o IopGetSetSecurityObject envia IRP_MJ_SET_SECURITY ao dispositivo
 //   do arquivo (Parameters.SetSecurity { SecurityInformation, SecurityDescriptor });
 //   os demais tipos trocam o descritor do objeto.
-// No OpenNT os tipos não-arquivo usam a tabela lateral do
-// ObSetSecurityObjectByPointer acima (o slot do OBJECT_HEADER). Diferença
-// honesta: chaves de registro e objetos com política própria continuam
-// respondendo às consultas pela política do dono (o registro do OpenNT não
-// regrava o descritor da chave).
+// No OpenNT os tipos não-arquivo passam pelo `set_object_security`: o
+// descritor do cabeçalho, o da tabela lateral, o do nó da chave ou o do dono
+// do corpo recebe a mescla, e as aberturas e consultas seguintes o leem.
 
 const SET_SECURITY_STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const SET_SECURITY_STATUS_INVALID_OWNER: u32 = 0xC000_005A;
@@ -382,29 +640,39 @@ fn set_security_access_mask(information: u32) -> u32 {
 /// objeto do namespace) com o acesso que as partes pedem, o descritor
 /// capturado em UserMode e aplicado como no ZwSetSecurityObject (um arquivo
 /// recebe o IRP_MJ_SET_SECURITY no driver dele).
-pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
+/// O corpo, o nome do tipo e o acesso concedido de um handle de modo usuário
+/// (o ObReferenceObjectByHandle em UserMode dos serviços de segurança): os
+/// pseudo-handles do processo e da thread correntes (com acesso total), a
+/// tabela de usuário do processo ou o handle nativo do Object Manager.
+pub fn resolve_user_handle(handle: u64) -> Result<(u64, alloc::string::String, u32), u32> {
     const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
     const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+    if handle == u64::MAX {
+        return Ok((crate::ntos::ps::process::get_current_process(), object_types::process_type().name, 0x1F_FFFF));
+    }
+    if handle == u64::MAX - 1 {
+        return Ok((crate::ntos::ps::process::get_current_thread(), object_types::thread_type().name, 0x1F_FFFF));
+    }
+    if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(handle) {
+        let Some(body) = entry.object.native_body() else { return Err(STATUS_OBJECT_TYPE_MISMATCH) };
+        return Ok((body.pointer, body.type_name, entry.access()));
+    }
+    match crate::ntos::ob::open_pointer::resolve(handle, true) {
+        Some(Ok(resolved)) => Ok((resolved.item.pointer, resolved.item.object_type.name.clone(), resolved.access)),
+        Some(Err(status)) => Err(status),
+        None => Err(STATUS_INVALID_HANDLE),
+    }
+}
+
+pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
+    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
     if descriptor == 0 {
         return Ok(SET_SECURITY_STATUS_ACCESS_VIOLATION);
     }
     let desired = set_security_access_mask(information);
-    // NtCurrentProcess/NtCurrentThread: o corpo corrente, com o acesso total
-    // que os pseudo-handles têm.
-    let (pointer, type_name, access) = if handle == u64::MAX {
-        (crate::ntos::ps::process::get_current_process(), object_types::process_type().name, 0x1F_FFFF)
-    } else if handle == u64::MAX - 1 {
-        (crate::ntos::ps::process::get_current_thread(), object_types::thread_type().name, 0x1F_FFFF)
-    } else if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(handle) {
-        let Some(body) = entry.object.native_body() else { return Ok(STATUS_OBJECT_TYPE_MISMATCH) };
-        (body.pointer, body.type_name, entry.access())
-    } else {
-        match crate::ntos::ob::open_pointer::resolve(handle, true) {
-            Some(Ok(resolved)) => (resolved.item.pointer, resolved.item.object_type.name.clone(), resolved.access),
-            Some(Err(status)) => return Ok(status),
-            None => return Ok(STATUS_INVALID_HANDLE),
-        }
+    let (pointer, type_name, access) = match resolve_user_handle(handle) {
+        Ok(resolved) => resolved,
+        Err(status) => return Ok(status),
     };
     if access & desired != desired {
         return Ok(STATUS_ACCESS_DENIED);
@@ -431,7 +699,9 @@ pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: 
         guest::free_bytes(captured);
         return status;
     }
-    Ok(set_security_object_by_pointer(pointer, captured))
+    let status = set_object_security(pointer, information, captured);
+    guest::free_bytes(captured);
+    Ok(status)
 }
 
 /// ZwSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor).
@@ -466,8 +736,10 @@ pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Re
             guest::free_bytes(captured);
             return status;
         }
-        // O descritor capturado passa a ser o do objeto.
-        Ok(set_security_object_by_pointer(reference.pointer, captured))
+        // As partes pedidas do descritor capturado entram no do objeto.
+        let status = set_object_security(reference.pointer, information, captured);
+        guest::free_bytes(captured);
+        Ok(status)
     })();
     reference.release()?;
     result
@@ -523,7 +795,8 @@ pub fn assign_security(access_state: &AccessState, parent: u64, object: u64, obj
 // SeSetSecurityDescriptorInfo mescla os componentes pedidos e o novo
 // descritor vira o do objeto e vai para *ObjectsSecurityDescriptor.
 pub fn set_security_descriptor_info(object: u64, information: u64, descriptor: u64, objects_descriptor: u64, mapping: u64) -> u32 {
-    let current = security_descriptor(object).unwrap_or_else(|| out::<u64>(objects_descriptor).get());
+    let published = if security_descriptor(object).is_none() && out::<u64>(objects_descriptor).get() == 0 { published_descriptor(object) } else { 0 };
+    let current = security_descriptor(object).unwrap_or_else(|| if published != 0 { published } else { out::<u64>(objects_descriptor).get() });
     let slot = guest::alloc_bytes(8);
     out::<u64>(slot).set(current);
     let status = crate::ntos::se::set_security::set_security_descriptor_info(information, descriptor, slot, 0, mapping);
@@ -546,13 +819,22 @@ pub fn set_security_descriptor_info(object: u64, information: u64, descriptor: u
                     }
                 }
             }
+            // Um dono com descritor próprio recebe a mescla; os demais, a
+            // tabela lateral.
             None => {
-                set_security_object_by_pointer(object, new);
+                let owned_by_owner = !SECURITY_DESCRIPTORS.lock().contains_key(&object)
+                    && open_pointer::describe(object).zip(query_descriptor::read_descriptor(new)).is_some_and(|(described, owned)| described.owner.set_security(object, policy_descriptor::policy_of(&owned)));
+                if !owned_by_owner {
+                    set_security_object_by_pointer(object, new);
+                }
                 out::<u64>(objects_descriptor).set(new);
             }
         }
     }
     guest::free_bytes(slot);
+    if published != 0 {
+        guest::free_bytes(published);
+    }
     status
 }
 
@@ -564,7 +846,7 @@ pub fn set_security_descriptor_info(object: u64, information: u64, descriptor: u
 // KernelMode tudo é concedido. FALSE com o status da recusa.
 pub fn check_create_object_access(directory: u64, create_access: u32, mode: u8, status_out: u64) -> bool {
     let object_type = type_of(directory).unwrap_or_else(object_types::directory_type);
-    let policy = open_pointer::describe(directory).map_or_else(|| object_access::capture(None), |described| described.owner.security(directory));
+    let policy = open_pointer::describe(directory).map_or_else(|| object_access::capture(None), |described| described_policy(&described));
     let result = object_access::check(&policy, object_access::subject(), create_access, &object_type, mode == 0);
     if status_out != 0 {
         out::<u32>(status_out).set(result.err().unwrap_or(STATUS_SUCCESS));

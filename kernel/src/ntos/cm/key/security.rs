@@ -131,3 +131,24 @@ pub fn query(body: u64, information: u32, buffer: u64, capacity: u32) -> Result<
     }
     Ok(query_descriptor::query_descriptor(Some(&owned(&snapshot.1)), information, buffer, capacity))
 }
+
+/// O CmpSecurityMethod com SetSecurityDescriptor (o NtSetSecurityObject de
+/// uma chave): as partes de `information` do descritor capturado trocam as
+/// do descritor do nó (SeSetSecurityDescriptorInfo com o mapeamento do tipo
+/// Key), e as aberturas seguintes leem o descritor novo. Uma chave apagada
+/// dá STATUS_KEY_DELETED.
+pub fn set(node: registry::NodeId, information: u32, captured: u64) -> u32 {
+    let Some((deleted, current)) = registry::with_node(node, |key| (key.deleted, owned(&key.security))) else { return 0xC000_0034 };
+    if deleted {
+        return 0xC000_017C;
+    }
+    let modified = query_descriptor::read_descriptor(captured).unwrap_or_default();
+    match crate::ntos::se::set_security::merge(&current, information, &modified, 0, Some(object_types::key_type().mapping)) {
+        Ok(merged) => {
+            let security = Captured { control: merged.control & 0x7FFF, owner: merged.owner.unwrap_or_default(), group: merged.group.unwrap_or_default(), dacl: merged.dacl, sacl: merged.sacl };
+            registry::with_node_mut(node, |key| key.security = security);
+            0
+        }
+        Err(status) => status,
+    }
+}

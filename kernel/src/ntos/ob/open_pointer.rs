@@ -88,8 +88,15 @@ pub trait ObjectOwner: Send + Sync {
     /// O fechamento de um handle aberto por `open_handle_for`, no processo
     /// dono da tabela.
     fn close_handle_from(&self, _pointer: u64, _process: u64) {}
-    /// Segurança capturada na criação do corpo.
+    /// O descritor de segurança do corpo (atribuído na criação e trocado
+    /// pelo NtSetSecurityObject).
     fn security(&self, pointer: u64) -> SecurityPolicy;
+    /// O SetSecurityDescriptor do SecurityProcedure do tipo: o descritor
+    /// novo passa a ser o do corpo. `false` quando o dono não guarda
+    /// descritor próprio (o Ob usa então a tabela lateral).
+    fn set_security(&self, _pointer: u64, _security: SecurityPolicy) -> bool {
+        false
+    }
     /// Processo dono de um objeto exclusivo (0 = compartilhado).
     fn exclusive_process(&self, _pointer: u64) -> u64 {
         0
@@ -177,6 +184,9 @@ impl ObjectOwner for ProcessOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         process::with_record(pointer, |record| record.security.clone()).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        process::update_record(pointer, |record| record.security = security).is_some()
+    }
     fn data(&self, pointer: u64) -> ObjectData {
         ObjectData { native_pointer: pointer, process_id: Some(process_id(pointer)), ..ObjectData::default() }
     }
@@ -206,6 +216,9 @@ impl ObjectOwner for ThreadOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         process::thread_record(pointer).map(|record| record.security).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        process::set_thread_security(pointer, security)
+    }
     fn data(&self, pointer: u64) -> ObjectData {
         ObjectData::pointer(pointer)
     }
@@ -223,6 +236,9 @@ impl ObjectOwner for TokenOwner {
     }
     fn security(&self, pointer: u64) -> SecurityPolicy {
         tokens::with(pointer, |token| token.security.clone()).unwrap_or_default()
+    }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        tokens::update(pointer, |token| token.security = security).is_some()
     }
     fn exclusive_process(&self, pointer: u64) -> u64 {
         tokens::with(pointer, |token| token.exclusive_process).unwrap_or(0)
@@ -257,6 +273,9 @@ impl ObjectOwner for NamespaceOwner {
     }
     fn security(&self, pointer: u64) -> SecurityPolicy {
         namespace_objects::security(pointer).unwrap_or_default()
+    }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        namespace_objects::set_security(pointer, security)
     }
     fn data(&self, pointer: u64) -> ObjectData {
         ObjectData::pointer(pointer)
@@ -415,7 +434,7 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     } else if enforce && thread_tokens::get(process::get_current_thread()).is_some_and(|impersonation| impersonation.level < 2) {
         return Ok(0xC000_00A5);
     }
-    let rights = match object_access::check(&item.owner.security(pointer), subject, remaining, &item.object_type, !enforce) {
+    let rights = match object_access::check(&super::object_security::described_policy(&item), subject, remaining, &item.object_type, !enforce) {
         Ok(access) => access,
         Err(status) => return Ok(status),
     };
@@ -437,6 +456,8 @@ pub fn insert(item: &Described, granted: u32, attributes: u32, owner: u64) -> Re
 /// OBJECT_HEADER) o faz antes de o nó existir, com o acesso que ele pode
 /// ajustar; uma falha depois disso desfaz pelo fechamento do dono.
 pub fn insert_with(item: &Described, granted: u32, attributes: u32, owner: u64, reason: OpenReason, access_mode: u8) -> Result<u32, KernelError> {
+    // A OpenProcedure de processos e threads (PspProcessOpen/PspThreadOpen).
+    let granted = crate::ntos::ps::open_procedure::apply(&item.object_type.name, access_mode, item.pointer, granted).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))?;
     let mut open = HandleOpen { reason, access_mode, process: owner, granted, attributes };
     let counted = match item.owner.open_handle_for(item.pointer, &mut open) {
         Some(Ok(())) => true,

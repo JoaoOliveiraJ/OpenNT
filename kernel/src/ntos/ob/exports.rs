@@ -254,9 +254,9 @@ pub mod ob_object_lifecycle {
         object_reference::reference_by_handle_with_tag(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u8, call.arg(5) as u32, call.arg(6), call.arg(7))
     }
 
-    /// ObCheckObjectAccess(Object, SubjectContext, LockHeld, Mode, GrantedAccess, Status).
+    /// ObCheckObjectAccess(Object, AccessState, TypeMutexLocked, AccessMode, AccessStatus).
     fn check_object_access(call: &Call) -> Result<u64, KernelError> {
-        Ok(object_security::check_object_access(call.arg(1), call.arg(4) as u8, call.arg(5), call.arg(6)) as u64)
+        Ok(object_security::check_object_access(call.arg(1), call.arg(2), call.arg(4) as u8, call.arg(5)) as u64)
     }
 
     fn get_object_security(call: &Call) -> Result<u64, KernelError> {

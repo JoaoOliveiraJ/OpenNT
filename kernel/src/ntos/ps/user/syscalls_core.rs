@@ -20,7 +20,7 @@ use crate::ntos::mm::{memory_map, pfn};
 use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ps::{image_information, system_process_information};
 use crate::ntos::ps::context::registers as thread_context_registers;
-use crate::ntos::se::{code_integrity_information, object_security, secure_boot_information};
+use crate::ntos::se::{code_integrity_information, secure_boot_information};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
@@ -819,33 +819,9 @@ fn nt_set_security_object(handle: u64, information: u64, descriptor: u64, _a4: u
 }
 
 /// NtQuerySecurityObject(handle, flags, out, length, returned*).
+/// O descritor do objeto pelo SecurityProcedure do tipo (`ob/query_security.rs`).
 fn nt_query_security_object(handle: u64, flags: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
-    let Some(entry) = state::get_user_handle(handle) else { return Ok(0xC000_0008) };
-    let Some(security) = entry.object.security() else { return Ok(0xC000_00BB) };
-    let flags = flags as u32;
-    if flags & !0x1F != 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    let needed = (if flags & 0x17 != 0 { 0x2_0000 } else { 0 }) | (if flags & 8 != 0 { 0x100_0000 } else { 0 });
-    if entry.access() & needed != needed {
-        return Ok(0xC000_0022);
-    }
-    let returned = stack_arg(rsp, 5);
-    if !probe_user_write(returned, 4) {
-        return Ok(0xC000_0005);
-    }
-    let bytes = object_security::encode(&security, flags);
-    if guest::try_write::<u32>(returned, bytes.len() as u32).is_err() {
-        return Ok(0xC000_0005);
-    }
-    if (length as u32 as usize) < bytes.len() {
-        return Ok(0xC000_0023);
-    }
-    if !probe_user_write(out, bytes.len() as u64) {
-        return Ok(0xC000_0005);
-    }
-    state::write_user_bytes(out, &bytes)?;
-    Ok(0)
+    crate::ntos::ob::query_security::query_from_user(handle, flags as u32, out, length as u32, stack_arg(rsp, 5))
 }
 
 fn nt_open_partition(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {

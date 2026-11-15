@@ -389,6 +389,11 @@ pub fn create_object(parent_path: &str, name: &str, type_name: &str, data: Optio
         object_types::bind_native(native, "Event")?;
     }
     if let Some(parent) = parent {
+        // O objeto nomeado herda as ACEs herdáveis do diretório (os
+        // dispositivos têm o descritor do IoCreateDevice).
+        if native != 0 && type_name != "Device" {
+            crate::ntos::ob::object_security::inherit_from_directory(native, parent);
+        }
         notify_changed(parent);
     }
     if is_namespace_type(type_name) {

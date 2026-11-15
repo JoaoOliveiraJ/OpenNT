@@ -4586,6 +4586,48 @@ fn se_access_exports(assert: Assert) {
     let null_sd = call_export("SeAccessCheck", &[0, context, 1, 1, 0, 0, mapping, 1, granted, status]);
     assert(kernel == Some(1) && null_sd == Some(0) && guest::read32(status) == 0xC000_0022, "se-access: KernelMode concede, SD nulo nega");
 
+    // O SeAccessCheckWithHint do NT: privilégio, OWNER RIGHTS, integridade e
+    // o MAXIMUM_ALLOWED de KernelMode (GenericAll, sem STANDARD_RIGHTS_ALL).
+    // ACCESS_SYSTEM_SECURITY com o SeSecurityPrivilege desabilitado no token
+    // do System: STATUS_PRIVILEGE_NOT_HELD.
+    let system_security = call_export("SeAccessCheck", &[descriptor, context, 1, 0x0100_0000, 0, 0, mapping, 1, granted, status]);
+    assert(system_security == Some(0) && guest::read32(status) == 0xC000_0061, "se-access: ACCESS_SYSTEM_SECURITY sem SeSecurityPrivilege habilitado e STATUS_PRIVILEGE_NOT_HELD");
+    let narrow = guest::alloc_bytes(16);
+    let narrow_mapping = at::<nt::GenericMapping>(narrow);
+    narrow_mapping.generic_all.set(0x1FF);
+    let kernel_maximum = call_export("SeAccessCheck", &[descriptor, context, 1, 0x0200_0000, 0x0010_0000, 0, narrow, 0, granted, status]);
+    assert(kernel_maximum == Some(1) && guest::read32(granted) == 0x0010_01FF, "se-access: MAXIMUM_ALLOWED em KernelMode e o GenericAll mais o ja concedido");
+    guest::free_bytes(narrow);
+    // OWNER RIGHTS (S-1-3-4) com READ_CONTROL: o dono (SYSTEM) perde o
+    // WRITE_DAC implícito.
+    let owner_rights: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+    let restricted_owner = guest::alloc_bytes(0x80);
+    let mut owner_bytes = bytes.clone();
+    owner_bytes[44..48].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+    owner_bytes[48..60].copy_from_slice(&owner_rights);
+    guest::write_bytes(restricted_owner, &owner_bytes);
+    let write_dac = call_export("SeAccessCheck", &[restricted_owner, context, 1, 0x0004_0000, 0, 0, mapping, 1, granted, status]);
+    let read_control = call_export("SeAccessCheck", &[restricted_owner, context, 1, 0x0002_0000, 0, 0, mapping, 1, granted, status]);
+    assert(write_dac == Some(0) && read_control == Some(1) && guest::read32(granted) == 0x0002_0000, "se-access: a ACE de OWNER RIGHTS tira do dono o WRITE_DAC implicito");
+    guest::free_bytes(restricted_owner);
+    // Rótulo obrigatório 0x5000 (acima do System) com NO_WRITE_UP na SACL: o
+    // token do System não domina; escrever (FILE_WRITE_DATA, do
+    // GenericWrite) é negado, ler continua concedido pela DACL.
+    let labeled = guest::alloc_bytes(0x80);
+    let mut label_bytes = bytes.clone();
+    label_bytes[2..4].copy_from_slice(&0x8014u16.to_le_bytes());
+    label_bytes[12..16].copy_from_slice(&60u32.to_le_bytes());
+    label_bytes[44..48].copy_from_slice(&0x0012_01FFu32.to_le_bytes());
+    label_bytes.extend_from_slice(&[2, 0, 28, 0, 1, 0, 0, 0, 0x11, 0, 20, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 16, 0, 0x50, 0, 0]);
+    guest::write_bytes(labeled, &label_bytes);
+    let write_up = call_export("SeAccessCheck", &[labeled, context, 1, 0x2, 0, 0, mapping, 1, granted, status]);
+    let write_status = guest::read32(status);
+    let read_up = call_export("SeAccessCheck", &[labeled, context, 1, 0x1, 0, 0, mapping, 1, granted, status]);
+    let maximum_up = call_export("SeAccessCheck", &[labeled, context, 1, 0x0200_0000, 0, 0, mapping, 1, granted, status]);
+    assert(write_up == Some(0) && write_status == 0xC000_0022 && read_up == Some(1), "se-access: rotulo acima do token nega a escrita (NO_WRITE_UP) e deixa a leitura");
+    assert(maximum_up == Some(1) && guest::read32(granted) & 0x2 == 0 && guest::read32(granted) & 0x1 != 0, "se-access: o MAXIMUM_ALLOWED sob o rotulo fica sem os direitos de escrita");
+    guest::free_bytes(labeled);
+
     // SeAccessCheckFromState: TOKEN_ACCESS_INFORMATION montado à mão (SidHash
     // com SidCount=1 e SidAttr apontando [ {SYSTEM, enabled} ]).
     let sid_buffer = guest::alloc_bytes(12);
@@ -5162,10 +5204,25 @@ fn ob_object_lifecycle_exports(assert: Assert) {
     let referenced = call_export("ObReferenceObjectByHandleWithTag", &[handle, 0, 0, 0, tag, out_ref, out_info]);
     assert(referenced == Some(0) && guest::read64(out_ref) == body, "ob-object-lifecycle: ObReferenceObjectByHandleWithTag devolve o corpo");
 
-    // 7. ObCheckObjectAccess grants in kernel mode (desired within valid-access).
-    guest::write32(granted, 0x0001);
-    let checked = call_export("ObCheckObjectAccess", &[body, 0, 0, 0, granted, status]);
-    assert(checked == Some(1) && guest::read32(status) == 0 && guest::read32(granted) & 0x0001 != 0, "ob-object-lifecycle: ObCheckObjectAccess concede em modo kernel");
+    // 7. ObCheckObjectAccess(Object, AccessState, TypeMutexLocked, Mode,
+    // Status): o objeto sem nome e sem segurança obrigatória não tem
+    // descritor, então o RemainingDesiredAccess passa todo ao
+    // PreviouslyGrantedAccess, mesmo em UserMode.
+    let _ = granted;
+    let access_state = guest::alloc_bytes(nt::AccessState::SIZE);
+    let aux = guest::alloc_bytes(0x100);
+    let mapping_block = guest::alloc_bytes(16);
+    let state_mapping = at::<nt::GenericMapping>(mapping_block);
+    state_mapping.generic_read.set(0x120001);
+    state_mapping.generic_all.set(0x1F0003);
+    let state_created = call_export("SeCreateAccessState", &[access_state, aux, 0x0001, mapping_block]) == Some(0);
+    let checked = call_export("ObCheckObjectAccess", &[body, access_state, 0, 1, status]);
+    let state = at::<nt::AccessState>(access_state);
+    assert(state_created && checked == Some(1) && guest::read32(status) == 0 && state.previously_granted_access.get() == 0x0001 && state.remaining_desired_access.get() == 0, "ob-object-lifecycle: ObCheckObjectAccess sem descritor concede o pedido no ACCESS_STATE");
+    call_export("SeDeleteAccessState", &[access_state]);
+    for block in [access_state, aux, mapping_block] {
+        guest::free_bytes(block);
+    }
 
     // 8. ObIsKernelHandle: bit test, pseudo-handles excluded.
     assert(call_export("ObIsKernelHandle", &[0xFFFF_FFFF_8000_0004]) == Some(1) && call_export("ObIsKernelHandle", &[0x4]) == Some(0) && call_export("ObIsKernelHandle", &[0xFFFF_FFFF_FFFF_FFFF]) == Some(0), "ob-object-lifecycle: ObIsKernelHandle");
@@ -6890,10 +6947,12 @@ fn io_top_level_irp_exports(assert: Assert) {
 
 fn se_access_from_state_exports(assert: Assert) {
     let system_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-    let admins_sid: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0];
+    // O grupo de integridade (SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED)
+    // é um SID de rótulo obrigatório: S-1-16-16384 (System).
+    let integrity_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0, 0x40, 0, 0];
     let sids = guest::alloc_bytes(32);
     guest::write_bytes(sids, &system_sid);
-    guest::write_bytes(sids + 16, &admins_sid);
+    guest::write_bytes(sids + 16, &integrity_sid);
     let sid_attr = guest::alloc_bytes(2 * nt::SidAndAttributes::SIZE);
     let groups = [at::<nt::SidAndAttributes>(sid_attr), at::<nt::SidAndAttributes>(sid_attr + nt::SidAndAttributes::SIZE)];
     groups[0].sid.set(sids);
@@ -6934,9 +6993,9 @@ fn se_access_from_state_exports(assert: Assert) {
     let fields_ok = built.authentication_id.low_part.get() == 0x3E7 && built.token_type.get() == nt::TokenType::TOKEN_PRIMARY && built.user_and_group_count.get() == 2 && built.user_and_groups.get() == sid_attr && built.token_flags.get() == 0x2000 && built.mandatory_policy.get() == 1 && built.integrity_level_index.get() == 1;
     let privileges_ok = built.privileges.present.get() == 1 << 20 && built.privileges.enabled.get() == 1 << 20 && built.privileges.enabled_by_default.get() == 1 << 20;
     // SidHash: S-1-5-18 (byte 0x12) -> Hash[2] e Hash[16+1] bit 0;
-    // S-1-5-32-544 (byte 0x20) -> Hash[0] e Hash[16+2] bit 1.
+    // S-1-16-16384 (byte 0x00) -> Hash[0] e Hash[16+0] bit 1.
     let hash = &built.sid_hash;
-    let hash_ok = hash.sid_count.get() == 2 && hash.sid_attr.get() == sid_attr && hash.hash[2].get() == 1 && hash.hash[17].get() == 1 && hash.hash[0].get() == 2 && hash.hash[18].get() == 2;
+    let hash_ok = hash.sid_count.get() == 2 && hash.sid_attr.get() == sid_attr && hash.hash[2].get() == 1 && hash.hash[17].get() == 1 && hash.hash[0].get() == 2 && hash.hash[16].get() == 2;
     assert(fields_ok && privileges_ok && hash_ok, "se-access-from-state: campos, privilegios e SidHash do TOKEN montado");
 
     // SD self-relative: dono SYSTEM, DACL com ACCESS_ALLOWED 0x1FF para SYSTEM.
@@ -12123,7 +12182,16 @@ fn ob_set_security_exports(assert: Assert) {
     assert(call_export("ZwSetSecurityObject", &[handle, 4, 0]) == Some(signed_status(0xC000_0005)), "ob-set-security: SD NULL = STATUS_ACCESS_VIOLATION");
     assert(call_export("ZwSetSecurityObject", &[handle, 1, descriptor]) == Some(signed_status(0xC000_005A)), "ob-set-security: OWNER pedido sem Owner = STATUS_INVALID_OWNER");
     assert(call_export("ZwSetSecurityObject", &[handle, 2, descriptor]) == Some(signed_status(0xC000_005B)), "ob-set-security: GROUP pedido sem Group = STATUS_INVALID_PRIMARY_GROUP");
-    assert(call_export("ZwSetSecurityObject", &[handle, 4, descriptor]) == Some(0) && object_security::security_descriptor(key).is_some_and(|stored| stored != descriptor && at::<nt::SecurityDescriptorRelative>(stored).control.get() & 0x8004 == 0x8004), "ob-set-security: DACL gravada como copia capturada");
+    // A DACL nula vai para o descritor do nó da chave (o CmpSecurityMethod),
+    // que a consulta seguinte devolve.
+    let queried = guest::alloc_bytes(0x100);
+    let needed = guest::alloc_bytes(4);
+    let set = call_export("ZwSetSecurityObject", &[handle, 4, descriptor]);
+    let query = call_export("ZwQuerySecurityObject", &[handle, 4, queried, 0x100, needed]);
+    let stored = at::<nt::SecurityDescriptorRelative>(queried);
+    assert(set == Some(0) && query == Some(0) && stored.control.get() & 0x8004 == 0x8004 && stored.dacl.get() == 0 && object_security::security_descriptor(key).is_none(), "ob-set-security: a DACL nula entra no descritor da chave e volta na consulta");
+    guest::free_bytes(queried);
+    guest::free_bytes(needed);
     assert(call_export("ZwSetSecurityObject", &[0x7FFF_FFF0, 4, descriptor]) == Some(signed_status(0xC000_0008)), "ob-set-security: handle invalido recusado");
     let _ = call_export("ZwDeleteKey", &[handle]);
     let _ = call_export("ZwClose", &[handle]);

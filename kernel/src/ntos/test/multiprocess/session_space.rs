@@ -5,7 +5,14 @@
 //! - duas sessões com ids distintos; o filho entra na sessão do pai; o
 //!   System fica fora (MmGetSessionIdEx -1); ProcessInSession nos três e
 //!   SessionMaster só nos dois que criaram as sessões; as contagens e a
-//!   ProcessList do MM_SESSION_SPACE;
+//!   ProcessList do MM_SESSION_SPACE (a ProcessReferenceToSession conta
+//!   também a do objeto Session);
+//! - o objeto Session de cada sessão (MiSessionObjectCreate): do tipo
+//!   Session, nomeado `\KernelObjects\Session<id>`, com o handle de kernel
+//!   e o bit 0x40 no MM_SESSION_SPACE; o MmGetSessionObjectById o devolve;
+//!   o NtSetInformationObject(ObjectSessionObjectInformation) de um processo
+//!   da sessão liga o objeto a um diretório uma vez (a segunda dá
+//!   STATUS_ACCESS_DENIED);
 //! - cada sessão tem a própria tabela de topo, ligada no slot de sessão da
 //!   raiz de cada processo dela (o filho divide a do pai) e ausente na raiz
 //!   do System; o MM_SESSION_SPACE está em SessionCore, na mesma VA, com o id
@@ -181,7 +188,42 @@ pub fn run(assert: Assert) {
     assert(in_session(a) && in_session(b) && in_session(c) && !in_session(system) && master(a) && master(b) && !master(c), "sessao: ProcessInSession nos tres, SessionMaster so em quem criou a sessao");
     let counts = |pointer: u64| (space(pointer).reference_count.get(), space(pointer).process_reference_to_session.get());
     let listed_a = members(sa);
-    assert(counts(sa) == (2, 2) && counts(sb) == (1, 1) && listed_a.len() == 2 && listed_a.contains(&a) && listed_a.contains(&c) && members(sb) == alloc::vec![b], "sessao: ReferenceCount, ProcessReferenceToSession e ProcessList de cada sessao");
+    assert(counts(sa) == (2, 3) && counts(sb) == (1, 2) && listed_a.len() == 2 && listed_a.contains(&a) && listed_a.contains(&c) && members(sb) == alloc::vec![b], "sessao: ReferenceCount, ProcessReferenceToSession (com a do objeto Session) e ProcessList de cada sessao");
+
+    // O objeto Session de cada sessão.
+    let object_a = space(sa).session_object.get();
+    let named_a = crate::ntos::ob::object_manager::lookup(&format!("\\KernelObjects\\Session{id_a}")).and_then(crate::ntos::ob::object_manager::node).and_then(|node| node.data).is_some_and(|data| data.native_pointer == object_a);
+    let typed_a = crate::ntos::ob::object_header::object_type_info(object_a).is_some_and(|object_type| object_type.name == "Session" && object_type.valid_access == 0x1F_0003);
+    assert(object_a != 0 && typed_a && named_a && space(sa).session_object_handle.get() != 0 && space(sa).u.long_flags.get() & 0x40 != 0 && space(sb).session_object.get() != 0 && space(sb).session_object.get() != object_a, "sessao: objeto Session de cada sessao, nomeado \\KernelObjects\\Session<id>, com o handle de kernel e o bit 0x40");
+    let by_id = crate::ntos::mm::session_object::by_id(id_a);
+    if by_id != 0 {
+        crate::ntos::ob::object_header::dereference(by_id, false);
+    }
+    assert(by_id == object_a && crate::ntos::mm::session_object::by_id(0x7FFF) == 0, "sessao: MmGetSessionObjectById devolve o objeto da sessao (e nada para uma sessao inexistente)");
+    let linked = inside(a, || {
+        let block = crate::ntos::ps::user::memory::map_user_region(0x1000).ok()?;
+        let (attributes, text, unicode, handle, rsp) = (block, block + 0x100, block + 0x80, block + 0x200, block + 0x800);
+        crate::ntos::ps::user::state::write_user_wide(text, "\\OpenNtSessaoDir");
+        crate::ntos::ps::user::state::write_unicode_string(unicode, text, "\\OpenNtSessaoDir");
+        // SAFETY: OBJECT_ATTRIBUTES no bloco do processo da sessão.
+        let object_attributes = unsafe { crate::ntos::inc::types::ObjectAttributes::at(attributes) };
+        object_attributes.length.set(crate::ntos::inc::types::ObjectAttributes::SIZE as u32);
+        object_attributes.object_name.set(unicode);
+        object_attributes.attributes.set(0x40);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map_or(1, |handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1));
+        let created = call("NtCreateDirectoryObject", handle, 0xF_000F, attributes, 0);
+        let directory = guest::read64(handle);
+        let first = call("NtSetInformationObject", directory, 6, 0, 0);
+        let second = call("NtSetInformationObject", directory, 6, 0, 0);
+        let attached = crate::ntos::ob::object_security::resolve_user_handle(directory).ok().map_or(0, |(pointer, _, _)| crate::ntos::ob::objects::namespace::session_object(pointer));
+        call("NtClose", directory, 0, 0, 0);
+        if let Some(region) = crate::ntos::ps::user::memory::find_region(block) {
+            crate::ntos::ps::user::memory::release_private_region(&region);
+        }
+        Some((created, first, second, attached))
+    })
+    .flatten();
+    assert(linked == Some((0, 0, 0xC000_0022, object_a)), "sessao: ObjectSessionObjectInformation liga o objeto Session da sessao ao diretorio uma vez; a segunda e STATUS_ACCESS_DENIED");
 
     // Tabela de topo por sessão, ligada na raiz de cada processo dela.
     let (top_a, top_b) = (session::tables(sa).map_or(0, |(top, _)| top), session::tables(sb).map_or(0, |(top, _)| top));

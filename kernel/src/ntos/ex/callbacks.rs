@@ -745,6 +745,9 @@ impl ObjectOwner for CallbackOwner {
     fn security(&self, pointer: u64) -> SecurityPolicy {
         STATE.lock().objects.get(&pointer).map(|item| item.security.clone()).unwrap_or_default()
     }
+    fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
+        STATE.lock().objects.get_mut(&pointer).map(|item| item.security = security).is_some()
+    }
     fn data(&self, _pointer: u64) -> ObjectData {
         ObjectData::default()
     }
