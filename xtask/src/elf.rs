@@ -55,7 +55,36 @@ fn c_string(table: &[u8], offset: usize) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&tail[..end]).into_owned())
 }
 
+/// Símbolo definido da tabela, com tamanho e tipo (STT_FUNC = 2).
+#[derive(Clone, Debug)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub kind: u8,
+}
+
 impl<'a> Elf<'a> {
+    /// Todos os símbolos definidos e nomeados, com tamanho e tipo.
+    pub fn symbol_entries(&self) -> Result<Vec<SymbolEntry>, String> {
+        let mut entries = Vec::new();
+        for table in self.sections.iter().filter(|section| section.kind == SHT_SYMTAB) {
+            let symbols = self.range(table.offset, table.size)?;
+            let names = self.sections.get(table.link as usize).ok_or("kernel ELF: strings de simbolos ausentes")?;
+            let names = self.range(names.offset, names.size)?;
+            for entry in symbols.chunks_exact(24) {
+                if u16_at(entry, 6) == 0 {
+                    continue;
+                }
+                let name = c_string(names, u32_at(entry, 0) as usize)?;
+                if !name.is_empty() {
+                    entries.push(SymbolEntry { name, address: u64_at(entry, 8), size: u64_at(entry, 16), kind: entry[4] & 15 });
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     pub fn range(&self, offset: u64, size: u64) -> Result<&'a [u8], String> {
         let start = offset as usize;
         let end = start.checked_add(size as usize).ok_or("kernel ELF: faixa invalida")?;

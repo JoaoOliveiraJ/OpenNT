@@ -2,7 +2,11 @@
 //!
 //! `run` abre a janela do QEMU com a serial no terminal. `test-boot` roda
 //! sem tela, espera um marcador na serial, opcionalmente digita comandos no
-//! shell pelo monitor HMP (`sendkey`) e confere a saída esperada.
+//! shell pelo monitor HMP (`sendkey`) e confere a saída esperada. Com o
+//! depurador do kernel (`--kd`), a segunda porta serial (COM2) vira um
+//! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
+//! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
+//! `test-boot` e a falha dela derruba o teste.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,6 +21,33 @@ pub struct MachineOptions {
     pub accelerator: String,
     pub memory_mb: u32,
     pub smp: u32,
+    /// Porta TCP da COM2 (o depurador do kernel), se houver.
+    pub kd_port: Option<u16>,
+}
+
+/// A COM2 como servidor TCP local, depois da COM1 (a ordem dos `-serial`
+/// é a das portas).
+fn kd_serial(machine: &MachineOptions) -> Vec<String> {
+    match machine.kd_port {
+        Some(port) => vec!["-serial".to_string(), format!("tcp:127.0.0.1:{port},server=on,wait=off")],
+        None => Vec::new(),
+    }
+}
+
+/// Sessão paralela ao teste (o roteiro do depurador): recebe a saída da
+/// COM1 acumulada.
+pub type Session = Box<dyn FnOnce(Arc<Mutex<String>>) -> Result<(), String> + Send>;
+
+/// Espera a thread terminar, até o prazo.
+fn wait_finished<T>(handle: &thread::JoinHandle<T>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    true
 }
 
 /// Localiza o QEMU: variável `QEMU`, PATH, ou a instalação padrão.
@@ -74,11 +105,26 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
     arguments
 }
 
+/// QEMU com janela em segundo plano, a COM1 num arquivo (o terminal fica
+/// para o prompt do depurador) e a COM2 no socket do depurador.
+pub fn spawn_window(image: &Path, machine: &MachineOptions, log: &Path) -> Result<Child, String> {
+    let qemu = find_qemu()?;
+    let mut arguments = machine_arguments(image, machine);
+    arguments.extend(["-serial".to_string(), format!("file:{}", log.display())]);
+    arguments.extend(kd_serial(machine));
+    println!("QEMU com o log do kernel em {}", log.display());
+    Command::new(&qemu).args(&arguments).stdin(Stdio::null()).spawn().map_err(|error| format!("{}: {error}", qemu.display()))
+}
+
 /// Shell interativo numa janela do QEMU; a serial fica neste terminal.
 pub fn run(image: &Path, machine: &MachineOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
     let mut arguments = machine_arguments(image, machine);
     arguments.extend(["-serial".to_string(), "stdio".to_string()]);
+    arguments.extend(kd_serial(machine));
+    if let Some(port) = machine.kd_port {
+        eprintln!("depurador do kernel: COM2 em 127.0.0.1:{port} (cargo xtask debug --connect=127.0.0.1:{port}, ou target remote no GDB)");
+    }
     let status = Command::new(&qemu)
         .args(&arguments)
         .status()
@@ -148,7 +194,7 @@ fn key_name(character: char) -> Option<String> {
     }
 }
 
-fn free_port() -> Result<u16, String> {
+pub fn free_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
     Ok(listener.local_addr().map_err(|error| error.to_string())?.port())
 }
@@ -197,7 +243,8 @@ pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FAL
 
 /// Boot sem tela: sucesso quando o marcador (e as saídas esperadas depois
 /// das teclas) aparecem na serial antes do prazo.
-pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log: &Path) -> Result<(), String> {
+/// Com `session` (o roteiro do depurador), ela roda em paralelo ao teste.
+pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log: &Path, session: Option<Session>) -> Result<(), String> {
     let qemu = find_qemu()?;
     let port = free_port()?;
     let mut arguments = machine_arguments(image, machine);
@@ -209,6 +256,7 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         "-monitor".to_string(),
         format!("tcp:127.0.0.1:{port},server=on,wait=off"),
     ]);
+    arguments.extend(kd_serial(machine));
     let mut child = Command::new(&qemu)
         .args(&arguments)
         .stdin(Stdio::null())
@@ -235,8 +283,24 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
     });
 
     let deadline = Instant::now() + test.timeout;
+    // A sessão roda numa thread; o erro dela encerra as esperas.
+    let session_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let session_thread = session.map(|session| {
+        let serial = Arc::clone(&output);
+        let failure = Arc::clone(&session_failure);
+        thread::spawn(move || {
+            let result = session(serial);
+            if let Err(error) = &result {
+                *failure.lock().unwrap() = Some(error.clone());
+            }
+            result
+        })
+    });
     let wait_for = |needle: &str, from: usize| -> Result<usize, String> {
         loop {
+            if let Some(error) = session_failure.lock().unwrap().clone() {
+                return Err(format!("sessao do depurador: {error}"));
+            }
             {
                 let text = output.lock().unwrap();
                 if let Some(failure) = FAILURE_MARKERS.iter().find(|marker| text[from.min(text.len())..].contains(*marker)) {
@@ -285,6 +349,16 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         Ok(())
     })();
 
+    // A sessão termina antes do veredito (ela é parte do teste).
+    let result = match (result, session_thread) {
+        (Ok(()), Some(handle)) if !wait_finished(&handle, Duration::from_secs(30)) => Err("sessao do depurador nao terminou".to_string()),
+        (Ok(()), Some(handle)) => match handle.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("sessao do depurador: {error}")),
+            Err(_) => Err("sessao do depurador: a thread entrou em panico".to_string()),
+        },
+        (result, _) => result,
+    };
     drop(process);
     let text = output.lock().unwrap().clone();
     std::fs::write(log, &text).map_err(|error| format!("{}: {error}", log.display()))?;

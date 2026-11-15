@@ -43,6 +43,9 @@ pub struct BuildOptions {
     /// `--pnp-root=acpi`: a raiz da árvore de dispositivos é o acpi.sys real
     /// sobre o dispositivo ACPI da HAL, com o pci.sys real no barramento PCI.
     pub pnp_root: String,
+    /// `--kd=com2`: o depurador do kernel nessa porta serial (vazio = sem
+    /// depurador).
+    pub kd: String,
 }
 
 pub struct BuildOutput {
@@ -114,7 +117,8 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         .env("OPENNT_INITIAL_PROCESS", &options.initial_process)
         .env("OPENNT_STORAGE", &options.storage)
         .env("OPENNT_DISPLAY", &options.display)
-        .env("OPENNT_PNP_ROOT", &options.pnp_root);
+        .env("OPENNT_PNP_ROOT", &options.pnp_root)
+        .env("OPENNT_KD", &options.kd);
     if options.trace_driver_api {
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {

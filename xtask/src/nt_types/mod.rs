@@ -14,7 +14,7 @@
 
 mod emit;
 mod layout;
-mod pdb;
+pub(crate) mod pdb;
 mod proofs;
 #[cfg(test)]
 mod tests;

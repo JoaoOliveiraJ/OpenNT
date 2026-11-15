@@ -1,0 +1,89 @@
+# Roteiro do teste `kd` (cargo xtask test-boot --kd=com2 --script=xtask/scripts/kd.txt):
+# o cliente do depurador do kernel anexa pela COM2, para a máquina, consulta
+# o estado do OpenNT, lê e grava memória, pede a parada com a máquina
+# rodando, usa breakpoints de software e de hardware num ponto do laço
+# principal do kernel, dá um passo e se desliga; a máquina segue até o fim
+# do boot (os marcadores da COM1 são do comando do teste).
+
+# Anexar: o primeiro pacote com a máquina rodando a para no tique seguinte.
+attach
+expect-stop SIGINT
+kd
+expect KdDebuggerEnabled=1 KdDebuggerNotPresent=0
+cpulist
+expect processadores parados: 1,2,3,4
+cpus
+
+# Memória: o cabeçalho do PE do kernel na VA em que ele roda, e uma escrita
+# num byte sem uso do cabeçalho DOS, conferida e desfeita.
+expect-eq word[0xfffff80040000000] 0x5a4d
+save cabecalho dword[0xfffff80040000040]
+poke 4 0xfffff80040000040 0xdeadbeef
+expect-eq dword[0xfffff80040000040] 0xdeadbeef
+poke 4 0xfffff80040000040 $cabecalho
+expect-eq dword[0xfffff80040000040] $cabecalho
+
+# Pedido de parada (0x03) com a máquina rodando.
+continue
+sleep 1500
+break
+expect-stop SIGINT
+
+# Breakpoint de software numa função do laço principal do kernel.
+bp kernel::ntos::ke::run_kernel_tasks
+continue
+wait-stop 600000
+expect-stop swbreak
+expect-eq %rip kernel::ntos::ke::run_kernel_tasks
+
+# A saída do DbgPrint do ksecdd.sys real chegou durante o boot.
+expect-console SspiInitAsyncInterface
+log
+expect SspiInitAsyncInterface
+
+# Estado do OpenNT na parada.
+ps
+expect System
+threads
+# Uma thread de kernel bloqueada (a de trabalho do msrpc.sys real, esperando
+# uma porta de conclusão): registradores e pilha pelo quadro de troca da
+# pilha de kernel dela, até o código do driver.
+save-word esperando Waiting 2
+context $esperando
+expect quadro de troca
+btt $esperando
+expect kernel::ntos::ke::wait::
+expect msrpc.sys!
+lm
+expect ksecdd.sys
+cpus
+irql
+obj \Device
+expect tipo Directory
+bt
+expect kernel::ntos::init::main::kmain
+
+# Um passo: o `push rbp` do prólogo.
+save rsp0 %rsp
+save rbp0 %rbp
+step
+expect-stop SIGTRAP
+expect-eq %rsp $rsp0-8
+expect-eq [%rsp] $rbp0
+bc all
+
+# Breakpoint de hardware (DR0) na mesma função.
+hbp kernel::ntos::ke::run_kernel_tasks
+bl
+expect DR0
+continue
+wait-stop 60000
+expect-stop hwbreak
+expect-eq %rip kernel::ntos::ke::run_kernel_tasks
+hbc kernel::ntos::ke::run_kernel_tasks
+
+# Desliga: a máquina segue até o fim do boot (o shell e o serviço de
+# teclado lendo do driver real, em qualquer ordem).
+detach
+wait-serial [shell] pronto
+wait-serial [kbd] lendo teclas do driver real

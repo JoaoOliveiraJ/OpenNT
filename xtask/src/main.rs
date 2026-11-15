@@ -4,8 +4,9 @@
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
-//!                        [--build-only|--no-build]
+//!                        [--build-only|--no-build] [--kd=com2 --script=ARQ]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
+//! cargo xtask debug      [opções] [--connect=HOST:PORTA]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -13,14 +14,17 @@
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
-//! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`.
-//! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
+//! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`, `--kd=com2` (o depurador do
+//! kernel na COM2).
+//! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`
+//! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter.
 
 // As tabelas de semente do kernel (`hive_image`) usam `alloc::`.
 extern crate alloc;
 
 mod build;
+mod debug;
 mod elf;
 mod hive_image;
 mod kernel_pe;
@@ -31,18 +35,20 @@ mod windows_binaries;
 mod status;
 mod test_all;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|status|nt-types> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|debug|status|nt-types> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
   test-all   suites e todos os [[teste]] do components.toml em paralelo (cargo xtask test-all --help)
+  debug      depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
+             (--connect=HOST:PORTA so conecta; --script=ARQ roda o roteiro como teste)
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
@@ -50,10 +56,12 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --trace-driver-api --initial-process=smss --storage=real --display=basic
                    --windows-dir=DIR (binarios do Windows do bundle; padrao <build-dir>/windows)
                    --pnp-root=acpi
-opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
+                   --kd=com2 (depurador do kernel na COM2)
+opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
-                   --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)";
+                   --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
+                   --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)";
 
 struct Arguments {
     command: String,
@@ -68,6 +76,8 @@ struct Arguments {
     build_only: bool,
     /// `--no-build`: o test-boot usa a imagem já montada em `--build-dir`.
     no_build: bool,
+    script: Option<String>,
+    connect: Option<String>,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -88,8 +98,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             display: String::new(),
             windows_dir: None,
             pnp_root: String::new(),
+            kd: String::new(),
         },
-        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4 },
+        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None },
         positional: Vec::new(),
         keys: None,
         expect: Vec::new(),
@@ -97,6 +108,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         console_mirror_set: false,
         build_only: false,
         no_build: false,
+        script: None,
+        connect: None,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -120,6 +133,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--display" => parsed.build.display = required()?,
             "--windows-dir" => parsed.build.windows_dir = Some(PathBuf::from(required()?)),
             "--pnp-root" => parsed.build.pnp_root = required()?,
+            "--kd" => parsed.build.kd = required()?,
+            "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
+            "--script" => parsed.script = Some(required()?),
+            "--connect" => parsed.connect = Some(required()?),
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -140,6 +157,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi") {
         return Err(format!("--pnp-root aceita apenas acpi ({} recebido)", parsed.build.pnp_root));
+    }
+    if !matches!(parsed.build.kd.as_str(), "" | "com2" | "com3" | "com4") {
+        return Err(format!("--kd aceita com2, com3 ou com4 ({} recebido; a COM1 e o log do kernel)", parsed.build.kd));
     }
     if parsed.machine.memory_mb < 128 {
         return Err("--memory-mb deve cobrir o heap do kernel (minimo 128)".into());
@@ -178,8 +198,13 @@ fn execute(arguments: Arguments) -> Result<(), String> {
         "build" => build::build(&arguments.build).map(|_| ()),
         "run" => {
             let output = build::build(&arguments.build)?;
-            qemu::run(&output.image, &arguments.machine)
+            let mut machine = arguments.machine.clone();
+            if !arguments.build.kd.is_empty() && machine.kd_port.is_none() {
+                machine.kd_port = Some(1234);
+            }
+            qemu::run(&output.image, &machine)
         }
+        "debug" => debug_command(arguments),
         "test-boot" => {
             let options = test_build_options(&arguments);
             let (marker, timeout_ms) = marker_and_timeout(&arguments)?;
@@ -199,9 +224,14 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                 return Ok(());
             }
             let log = image.with_file_name("serial.log");
+            let mut machine = arguments.machine.clone();
+            if !options.kd.is_empty() && machine.kd_port.is_none() {
+                machine.kd_port = Some(qemu::free_port()?);
+            }
+            let session = script_session(&arguments, &options, &machine)?;
             qemu::test_boot(
                 &image,
-                &arguments.machine,
+                &machine,
                 &TestOptions {
                     marker,
                     timeout: Duration::from_millis(timeout_ms),
@@ -210,10 +240,70 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     hold: Duration::from_millis(arguments.hold_ms),
                 },
                 &log,
+                session,
             )
         }
         other => Err(format!("comando desconhecido: {other}\n{USAGE}")),
     }
+}
+
+/// `test-boot --kd=com2 --script=ARQ`: o roteiro do cliente do depurador
+/// roda contra a COM2 em paralelo ao teste (a falha dele derruba o teste).
+fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &MachineOptions) -> Result<Option<qemu::Session>, String> {
+    let Some(script) = &arguments.script else { return Ok(None) };
+    let (Some(port), false) = (machine.kd_port, options.kd.is_empty()) else {
+        return Err("--script exige --kd=com2 (o depurador do kernel)".into());
+    };
+    let root = build::workspace_root();
+    let path = if Path::new(script).is_absolute() { PathBuf::from(script) } else { root.join(script) };
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let elf = debug::kernel_elf(&build::in_workspace(&options.build_dir));
+    let address = format!("127.0.0.1:{port}");
+    Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial)))))
+}
+
+/// `cargo xtask debug`: conecta a um QEMU aberto (`--connect`), roda um
+/// roteiro como teste (`--script`, o mesmo do `test-boot --kd=com2
+/// --script`) ou abre o QEMU e o prompt do cliente.
+fn debug_command(arguments: Arguments) -> Result<(), String> {
+    let root = build::workspace_root();
+    let build_dir = if arguments.build.build_dir.is_absolute() { arguments.build.build_dir.clone() } else { root.join(&arguments.build.build_dir) };
+    let elf = debug::kernel_elf(&build_dir);
+    if let Some(address) = &arguments.connect {
+        return match &arguments.script {
+            Some(script) => {
+                let text = std::fs::read_to_string(script).map_err(|error| format!("{script}: {error}"))?;
+                debug::run_script(address, &root, &elf, &text, None)
+            }
+            None => debug::interactive(address, &root, &elf),
+        };
+    }
+    let mut options = arguments.build.clone();
+    if options.kd.is_empty() {
+        options.kd = "com2".into();
+    }
+    let mut machine = arguments.machine.clone();
+    let port = match machine.kd_port {
+        Some(port) => port,
+        None => qemu::free_port()?,
+    };
+    machine.kd_port = Some(port);
+    let address = format!("127.0.0.1:{port}");
+    if arguments.script.is_some() {
+        // O teste com roteiro é o test-boot com o depurador.
+        let mut arguments = arguments;
+        arguments.command = "test-boot".into();
+        arguments.build.kd = options.kd;
+        arguments.machine.kd_port = Some(port);
+        return execute(arguments);
+    }
+    let output = build::build(&options)?;
+    let log = output.image.with_file_name("serial.log");
+    let mut qemu = qemu::spawn_window(&output.image, &machine, &log)?;
+    let result = debug::interactive(&address, &root, &elf);
+    let _ = qemu.kill();
+    let _ = qemu.wait();
+    result
 }
 
 fn main() -> ExitCode {
