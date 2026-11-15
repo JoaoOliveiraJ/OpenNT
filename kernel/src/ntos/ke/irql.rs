@@ -1,16 +1,18 @@
 //! Nível de interrupção de cada processador.
 //!
-//! Como no NT, o IRQL é da CPU, não do sistema: cada uma guarda o seu na
-//! própria KPCR (KPCR.Irql, lido e gravado pelo GS), e elevar ou baixar o
-//! nível numa CPU não muda o que outra vê. Antes da KPCR do BSP (o começo da
-//! fase 0) só existe o processador de boot, e o nível fica numa célula de
-//! partida que a KPCR herda ao ser publicada (`pcr::init`). Uma thread que
-//! deixa a CPU leva o seu IRQL (KTHREAD.WaitIrql) e o recoloca ao voltar
-//! (`context_switch`).
+//! Como no x64 do NT 19041, o IRQL é o CR8 da CPU: o KeGetCurrentIrql é um
+//! `mov rax, cr8` e o KfRaiseIrql, o KeRaiseIrqlToDpcLevel e o KeLowerIrql
+//! gravam o CR8, o mesmo registrador que os drivers leem e gravam inline
+//! (`mov rax, cr8`/`mov cr8, rcx`, o KeGetCurrentIrql e o KzLowerIrql do
+//! wdm.h). Nada mais guarda o nível (o ntoskrnl não usa KPCR.Irql): um
+//! driver que sobe pelo export e desce inline, ou o contrário, deixa o
+//! kernel vendo o nível verdadeiro. O CR8 é a classe de prioridade do TPR
+//! do LAPIC (TPR[7:4]): um IRQL `n` retém no LAPIC os vetores de classe até
+//! `n` (vetor < 16 * (n + 1)), como no NT; o ExtINT do PIC e as NMIs não
+//! passam pelo TPR. Cada CPU tem o seu desde a partida (o INIT o zera), e
+//! uma thread que deixa a CPU leva o seu (KTHREAD.WaitIrql) e o recoloca ao
+//! voltar (`context_switch`).
 
-use core::sync::atomic::{AtomicU8, Ordering};
-
-use super::pcr;
 use crate::hal::cpu;
 use crate::ntos::inc::types::{Field, NtStruct};
 
@@ -21,35 +23,21 @@ pub const DISPATCH_LEVEL: u8 = 2;
 pub const SYNCH_LEVEL: u8 = 12;
 pub const HIGH_LEVEL: u8 = 15;
 
-/// O nível do processador de boot antes da KPCR dele.
-static BOOT: AtomicU8 = AtomicU8::new(PASSIVE_LEVEL);
-
-/// O nível da CPU corrente.
+/// O nível da CPU corrente: KeGetCurrentIrql (ntoskrnl 19041 rva 0x21fa90,
+/// `mov rax, cr8`).
 pub fn get_irql() -> u8 {
-    if pcr::get_pcr_address() == 0 {
-        return BOOT.load(Ordering::Relaxed);
-    }
-    pcr::current_irql()
+    cpu::read_cr8() as u8
 }
 
-/// Publica `level` como o nível da CPU corrente.
+/// Publica `level` como o nível da CPU corrente (`mov cr8`).
 fn publish(level: u8) {
-    if pcr::get_pcr_address() == 0 {
-        BOOT.store(level, Ordering::Relaxed);
-    } else {
-        pcr::set_current_irql(level);
-    }
+    cpu::write_cr8(level as u64 & 0xF);
 }
 
 /// KeGetEffectiveIrql (ntoskrnl 19041 rva 0x25edf0): com as interrupções
 /// ligadas, o IRQL corrente; desligadas, HIGH_LEVEL (nada interrompe a CPU).
 pub fn effective_irql() -> u8 {
     if crate::hal::cpu::interrupts_enabled() { get_irql() } else { HIGH_LEVEL }
-}
-
-/// O nível de partida, que a KPCR do BSP herda (`pcr::init`).
-pub fn boot_level() -> u8 {
-    BOOT.load(Ordering::Relaxed)
 }
 
 /// Exige um nível não inferior ao atual; devolve o anterior. Direção
@@ -95,11 +83,10 @@ pub fn raise_irql_saving(level: u8, old_irql: u64) {
     }
 }
 
-/// KfRaiseIrql: devolve o IRQL anterior.
+/// KfRaiseIrql (rva 0x21fa60: `mov rax, cr8; mov cr8, r11`): devolve o
+/// IRQL anterior.
 pub fn kf_raise_irql(level: u8) -> u8 {
-    let previous = get_irql();
-    raise_irql(level);
-    previous
+    raise_irql(level)
 }
 
 /// Sobe a `level` (nunca desce) e devolve o IRQL anterior.

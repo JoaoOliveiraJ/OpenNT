@@ -14456,6 +14456,7 @@ pub fn run(assert: Assert) {
     zw_write_file(assert);
     kernel_system_threads(assert);
     super::kernel_waits::run(assert);
+    super::irql_cr8::run(assert);
     zw_group_exports(assert);
     pnp_and_boot_services(assert);
     super::device_api::run(assert);

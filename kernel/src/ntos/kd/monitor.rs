@@ -161,7 +161,7 @@ pub fn describe_processor(number: usize, out: &mut Payload) {
         let _ = write!(out, "CPU {} (rodando)", number);
         return;
     }
-    let irql = memory::read_u8(cr3, pcr + offset_of!(Kpcr, irql) as u64).unwrap_or(0xFF);
+    let irql = stop::processor_irql(number);
     let thread = read_u64(cr3, pcr + (offset_of!(Kpcr, prcb) + offset_of!(Kprcb, current_thread)) as u64);
     let process = if thread != 0 { read_u64(cr3, thread + (offset_of!(Kthread, apc_state) + offset_of!(KapcState, process)) as u64) } else { 0 };
     let mut name = [0u8; 16];
@@ -178,7 +178,7 @@ fn processors(out: &mut Payload) {
         }
         let pcr = stop::processor_control_region(number);
         let cr3 = stop::address_space(number);
-        let irql = if pcr != 0 { memory::read_u8(cr3, pcr + offset_of!(Kpcr, irql) as u64).unwrap_or(0xFF) } else { 0xFF };
+        let irql = stop::processor_irql(number);
         let thread = if pcr != 0 { read_u64(cr3, pcr + (offset_of!(Kpcr, prcb) + offset_of!(Kprcb, current_thread)) as u64) } else { 0 };
         let process = if thread != 0 { read_u64(cr3, thread + (offset_of!(Kthread, apc_state) + offset_of!(KapcState, process)) as u64) } else { 0 };
         let rip = stop::view(number).map_or(0, |view| view.rip());

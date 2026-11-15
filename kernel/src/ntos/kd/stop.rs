@@ -80,6 +80,8 @@ struct Processor {
     frozen: AtomicBool,
     pcr: AtomicU64,
     cr3: AtomicU64,
+    /// O CR8 (IRQL) do processador parado, como o KSPECIAL_REGISTERS.Cr8.
+    irql: AtomicU8,
     locks: AtomicU32,
     segments: AtomicU64,
     fs_base: AtomicU64,
@@ -95,6 +97,7 @@ impl Processor {
             frozen: AtomicBool::new(false),
             pcr: AtomicU64::new(0),
             cr3: AtomicU64::new(0),
+            irql: AtomicU8::new(0),
             locks: AtomicU32::new(0),
             segments: AtomicU64::new(0),
             fs_base: AtomicU64::new(0),
@@ -277,6 +280,11 @@ pub fn address_space(number: usize) -> u64 {
     PROCESSORS[number.min(MAX_CPUS - 1)].cr3.load(Ordering::Relaxed)
 }
 
+/// IRQL (CR8) do processador parado `number`.
+pub fn processor_irql(number: usize) -> u8 {
+    PROCESSORS[number.min(MAX_CPUS - 1)].irql.load(Ordering::Relaxed)
+}
+
 /// KPCR do processador parado `number`.
 pub fn processor_control_region(number: usize) -> u64 {
     PROCESSORS[number.min(MAX_CPUS - 1)].pcr.load(Ordering::Relaxed)
@@ -323,6 +331,7 @@ fn capture(number: usize, frame: u64, fx: u64, error_code: bool) {
     record.fx.store(fx, Ordering::Relaxed);
     record.pcr.store(if pcr::get_pcr_address() != 0 { pcr::current_address() } else { 0 }, Ordering::Relaxed);
     record.cr3.store(cpu::read_cr3(), Ordering::Relaxed);
+    record.irql.store(crate::ntos::ke::irql::get_irql(), Ordering::Relaxed);
     record.locks.store(crate::rtl::sync::spin_locks_held() + crate::rtl::sync::shared_locks_held(), Ordering::Relaxed);
     record.segments.store(read_segments(), Ordering::Relaxed);
     record.fs_base.store(cpu::read_msr(0xC000_0100), Ordering::Relaxed);

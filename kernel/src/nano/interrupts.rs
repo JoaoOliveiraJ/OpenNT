@@ -138,7 +138,9 @@ pub fn init() {
 fn start_lapic_timer() {
     // habilita o LAPIC PRIMEIRO (SVR: spurious 0xFF + software enable)
     lapic::write(LAPIC_SPURIOUS, 0x1FF);
-    lapic::write(LAPIC_TPR, 0); // TPR = 0 (nada mascarado)
+    // O TPR é o CR8, o IRQL desta CPU (`ke::irql`): habilitar o LAPIC não o
+    // muda, e aqui ele só é regravado com o próprio nível (classe = IRQL).
+    lapic::write(LAPIC_TPR, (crate::ntos::ke::irql::get_irql() as u32) << 4);
     // LINT0 = ExtINT (0x700, NÃO mascarado): o caminho do PIC 8259 -> CPU
     // (virtual wire mode) — sem isso a IRQ1 do teclado não chega no LAPIC
     lapic::write(LAPIC_LVT_LINT0, 0x700);

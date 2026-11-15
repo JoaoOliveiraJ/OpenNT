@@ -56,6 +56,19 @@ pub fn read_cr4() -> u64 {
     value
 }
 
+/// CR8: a prioridade de tarefa (TPR[7:4] do LAPIC), o IRQL do x64.
+pub fn read_cr8() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr8", out(reg) value, options(nomem, nostack, preserves_flags)) }
+    value
+}
+
+/// Grava CR8. Sem `nomem`: os acessos à memória que o nível protege não
+/// atravessam a troca.
+pub fn write_cr8(value: u64) {
+    unsafe { asm!("mov cr8, {}", in(reg) value, options(nostack, preserves_flags)) }
+}
+
 /// Recarrega CR3 (esvazia a TLB não global).
 pub fn reload_cr3() {
     unsafe { asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) }

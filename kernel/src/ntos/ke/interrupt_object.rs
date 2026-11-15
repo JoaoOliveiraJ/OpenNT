@@ -125,7 +125,10 @@ pub fn service_during_wait() {
 }
 
 /// Percorre os objetos do vetor chamando as ISRs nativas. Para quando uma
-/// ISR trata a interrupção e Mode vale zero (latched).
+/// ISR trata a interrupção e Mode vale zero (latched). Como o despacho
+/// encadeado do ntoskrnl 19041 (rva 0x3ff080), cada ISR roda no IRQL do
+/// objeto — o SynchronizeIrql, quando maior —, gravado no CR8, com o
+/// ActualLock retido; a saída devolve o nível anterior.
 fn dispatch_chain(vector: u8, _count: u32) {
     let mut pointer = CHAINS.lock().get(&(vector as u32)).copied().unwrap_or(0);
     while pointer != 0 {
@@ -133,8 +136,13 @@ fn dispatch_chain(vector: u8, _count: u32) {
         let routine = object.service_routine.get();
         let context = object.service_context.get();
         let mode = object.mode.get();
+        let lock = object.actual_lock.get();
+        let previous = irql::raise_at_least(object.synchronize_irql.get().max(object.irql.get()));
+        spin_lock::acquire_at_dpc_level(lock);
         // BOOLEAN de retorno: só AL é significativo.
         let handled = native_call::call(routine, &[pointer, context]) & 0xFF != 0;
+        spin_lock::release_from_dpc_level(lock);
+        irql::lower_irql(previous as u64);
         if handled && mode == 0 {
             return;
         }

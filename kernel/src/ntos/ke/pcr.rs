@@ -39,7 +39,6 @@ pub mod layout {
     pub const LOCK_ARRAY: u64 = offset_of!(KpcrView1, lock_array) as u64;
     pub const USED_SELF: u64 = offset_of!(KpcrView1, used_self) as u64;
     pub const IDT_BASE: u64 = offset_of!(Kpcr, idt_base) as u64;
-    pub const IRQL: u64 = offset_of!(Kpcr, irql) as u64;
     pub const MAJOR_VERSION: u64 = offset_of!(Kpcr, major_version) as u64;
     pub const MINOR_VERSION: u64 = offset_of!(Kpcr, minor_version) as u64;
     pub const STALL_SCALE_FACTOR: u64 = offset_of!(Kpcr, stall_scale_factor) as u64;
@@ -142,7 +141,8 @@ fn unmap_reservation(base: u64, pages: &[u64]) {
 }
 
 /// Campos iniciais comuns a toda KPCR (o KiInitializePcr): referências
-/// próprias, a LockQueue, IRQL, versão, MXCSR e o número do processador.
+/// próprias, a LockQueue, versão, MXCSR e o número do processador. O IRQL
+/// não mora aqui: é o CR8 de cada CPU (`irql`).
 fn initialize(kpcr: &Kpcr, number: u32, io_database_lock: u64, vpb_lock: u64) -> Result<(), KernelError> {
     let base = kpcr.address();
     kpcr.self_.set(base);
@@ -167,7 +167,6 @@ fn initialize(kpcr: &Kpcr, number: u32, io_database_lock: u64, vpb_lock: u64) ->
         lock_queue[LOCK_QUEUE_IO_VPB].lock.set(vpb_lock);
     }
     kpcr.used_self.set(base);
-    kpcr.irql.set(0);
     kpcr.major_version.set(1);
     kpcr.minor_version.set(1);
     kpcr.prcb.mx_csr.set(0x1F80);
@@ -197,8 +196,6 @@ pub fn init() -> Result<(), KernelError> {
     // TssBase fica zerado; isso não descreve a TSS configurada em outras camadas.
     kpcr.tss_base.set(0);
     initialize(kpcr, 0, pcr.io_database_lock, pcr.vpb_lock)?;
-    // O nível que o processador de boot tinha antes da KPCR.
-    kpcr.irql.set(super::irql::boot_level());
     kpcr.idt_base.set(crate::nano::interrupts::IDT_VIRTUAL_ADDRESS);
     drop(pcr);
 
@@ -286,21 +283,6 @@ pub fn set_current_thread(thread: u64) {
     if ADDRESS.load(Ordering::Acquire) != 0 {
         current().prcb.current_thread.set(thread);
     }
-}
-
-/// KPCR.Irql da CPU corrente (gs:[50h]), o KeGetCurrentIrql por CPU.
-pub fn current_irql() -> u8 {
-    let level: u8;
-    // SAFETY: leitura de um byte da KPCR desta CPU, mapeada desde que o GS a
-    // publica (quem chama confere a publicação).
-    unsafe { core::arch::asm!("mov {}, byte ptr gs:[{}]", out(reg_byte) level, const layout::IRQL, options(nostack, readonly, preserves_flags)) };
-    level
-}
-
-/// Grava KPCR.Irql da CPU corrente, nunca o de outra.
-pub fn set_current_irql(level: u8) {
-    // SAFETY: escrita de um byte da KPCR desta CPU (publicada).
-    unsafe { core::arch::asm!("mov byte ptr gs:[{}], {}", const layout::IRQL, in(reg_byte) level, options(nostack, preserves_flags)) };
 }
 
 pub fn get_pcr_address() -> u64 {
