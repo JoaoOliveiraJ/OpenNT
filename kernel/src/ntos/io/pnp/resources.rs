@@ -11,12 +11,13 @@
 //!   atribuídas a outros nós (CmResourceShareShared divide). Portas,
 //!   memória, IRQs, canais de DMA e números de barramento têm árbitros;
 //!   CmResourceTypeDevicePrivate passa direto para a lista. Portas,
-//!   memória e números de barramento de um nó sob um barramento que recebeu
-//!   janelas desse tipo (as faixas com CM_RESOURCE_PORT_WINDOW_DECODE ou
-//!   CM_RESOURCE_MEMORY_WINDOW_DECODE e os números de barramento: as do
-//!   _CRS do PCI0) ficam dentro delas, e as faixas desse barramento e dos
-//!   ancestrais dele não colidem com as dos filhos, como no árbitro do
-//!   barramento que aloca os filhos nas janelas dele.
+//!   memória e números de barramento de um nó sob uma ponte (o primeiro
+//!   ancestral com números de barramento atribuídos: o PCI0 com o _CRS)
+//!   ficam dentro das faixas desse tipo atribuídas à ponte, as janelas
+//!   dela, e as faixas dela e dos ancestrais dela não colidem com as dos
+//!   filhos, como no árbitro do barramento que aloca os filhos nas janelas
+//!   dele. O BAR de um dispositivo sem números de barramento (a
+//!   controladora IDE dos canais) não é janela.
 //! - `translate` é o tradutor da HAL: portas e memória não mudam (PC, sem
 //!   janela de I/O deslocada); a IRQ de linha `n` (Level = Vector = n na lista
 //!   bruta) vira o vetor do IDT `0x20 + n` com IRQL `n`, a convenção da HAL
@@ -302,32 +303,16 @@ impl Requester {
         Requester { owner, ancestors }
     }
 
-    /// As janelas do barramento que produz o tipo para o nó: as faixas de
-    /// janela (WINDOW_DECODE; todo número de barramento) atribuídas ao
-    /// primeiro ancestral que as tem (o barramento PCI com o _CRS), e
-    /// quantos ancestrais ficam abaixo dele. Um árbitro de barramento aloca
-    /// os filhos dentro delas, e não contra elas; sem barramento produtor,
-    /// `None`.
+    /// As janelas da ponte acima do nó: o primeiro ancestral com números de
+    /// barramento atribuídos (o barramento PCI com o _CRS), as faixas do
+    /// tipo atribuídas a ele e quantos ancestrais ficam abaixo dele. O
+    /// árbitro da ponte aloca os filhos dentro delas, e não contra elas; sem
+    /// ponte acima, `None`.
     fn windows(&self, resource_type: u8) -> Option<(usize, Vec<(u64, u64)>)> {
         let assigned = ASSIGNED.lock();
-        self.ancestors.iter().enumerate().find_map(|(position, &ancestor)| {
-            let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type && is_window(resource)).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
-            (!ranges.is_empty()).then_some((position, ranges))
-        })
-    }
-}
-
-/// CM_RESOURCE_PORT_WINDOW_DECODE e CM_RESOURCE_MEMORY_WINDOW_DECODE.
-const PORT_WINDOW_DECODE: u16 = 0x0080;
-const MEMORY_WINDOW_DECODE: u16 = 0x0040;
-
-/// A faixa é uma janela que o barramento repassa aos filhos.
-fn is_window(resource: &Resource) -> bool {
-    match resource.resource_type {
-        resource_type::PORT => resource.flags & PORT_WINDOW_DECODE != 0,
-        resource_type::MEMORY => resource.flags & MEMORY_WINDOW_DECODE != 0,
-        resource_type::BUS_NUMBER => true,
-        _ => false,
+        let (position, bridge) = self.ancestors.iter().enumerate().find(|&(_, &ancestor)| assigned.iter().any(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type::BUS_NUMBER))?;
+        let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| holder == bridge && resource.resource_type == resource_type).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
+        Some((position, ranges))
     }
 }
 

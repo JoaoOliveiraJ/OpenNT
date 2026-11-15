@@ -219,7 +219,7 @@ fn tree_support(assert: Assert) {
     devnode::insert(devnode::DeviceNode::new(bus, 0, 1));
     devnode::insert(devnode::DeviceNode::new(child, bus, 2));
     devnode::insert(devnode::DeviceNode::new(sibling, bus, 2));
-    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0x81, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
+    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::BUS_NUMBER, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0, start: 0x40, length: 1, extra: [0; 3] }, resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
     resources::reserve(bus, &window);
     let anywhere = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice(0, 0xFFFF, 0x10)]]] };
     let inside = resources::assign(child, &anywhere);
