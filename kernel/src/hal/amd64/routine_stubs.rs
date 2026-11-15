@@ -50,7 +50,7 @@ pub struct Routine {
 /// Tabela das rotinas, na ordem dos slots. Cada assunto expõe as suas
 /// (`hal::dma`, `drivers::bus::pci_interface`) e só entra aqui pela lista.
 fn routines() -> &'static [&'static [Routine]] {
-    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES]
+    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES, crate::hal::system_information::ROUTINES]
 }
 
 /// Slot global da rotina `name` (busca linear: chamada na montagem das tabelas).

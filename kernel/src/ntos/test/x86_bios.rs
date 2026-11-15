@@ -1,6 +1,9 @@
 //! Autotestes (fase 6) da interface x86 BIOS da HAL, chamada pelos exports
-//! x86Bios* (os mesmos que o BasicDisplay.sys importa).
+//! x86Bios* (os mesmos que o BasicDisplay.sys importa) e pelo
+//! HalQuerySystemInformation da HalDispatchTable.
 //!
+//! - O HaliQuerySystemInformation(HalDisplayBiosInformation) informa o BIOS
+//!   emulado (1), com o tamanho copiado no ReturnedLength.
 //! - x86BiosAllocateBuffer/FreeBuffer com as regras do ntoskrnl 19041: o
 //!   buffer inteiro (2000:0000, 8 KB) uma vez só, a liberação pelo endereço
 //!   linear 20000h (2000:0000 ou 1FFF:0010).
@@ -27,10 +30,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::phase6::call_export;
-use crate::hal::{pci_config, physical, port, rtc};
+use crate::hal::amd64::native_call;
+use crate::hal::{pci_config, physical, port, public_dispatch, rtc};
 use crate::ntos::inbv::display as inbv;
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_hal::X86BiosRegisters;
+use crate::ntos::inc::types::HalDispatch;
 use crate::ntos::mm::guest_memory as guest;
 
 type Assert = fn(bool, &str);
@@ -38,6 +43,7 @@ type Assert = fn(bool, &str);
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009A;
+const STATUS_NOT_SUPPORTED: u64 = 0xC000_00BB;
 /// Vetor livre da IVT para o código de teste.
 const TEST_VECTOR: u32 = 0x60;
 /// Onde o código de teste fica no buffer de transferência.
@@ -150,10 +156,32 @@ fn vga_adapter() -> Option<(u32, u32, u32, u32)> {
 }
 
 pub fn run(assert: Assert) {
+    query_system_information(assert);
     transfer_buffer(assert);
     memory_map(assert);
     emulated_code(assert);
     video_bios(assert);
+}
+
+/// HalDispatchTable->HalQuerySystemInformation(HalDisplayBiosInformation).
+fn query_system_information(assert: Assert) {
+    // SAFETY: a HalDispatchTable publicada pela HAL.
+    let routine = unsafe { HalDispatch::at(public_dispatch::table_address()) }.hal_query_system_information.get();
+    let (buffer, returned) = (guest::alloc_bytes(8), guest::alloc_bytes(4));
+    guest::write64(buffer, u64::MAX);
+    guest::write32(returned, 0xFFFF_FFFF);
+    let full = native_call::call(routine, &[9, 8, buffer, returned]) as u32 as u64;
+    let (value, length) = (guest::read64(buffer), guest::read32(returned));
+    guest::write64(buffer, u64::MAX);
+    let short = native_call::call(routine, &[9, 2, buffer, returned]) as u32 as u64;
+    let (short_value, short_length) = (guest::read64(buffer), guest::read32(returned));
+    let other = native_call::call(routine, &[1, 8, buffer, returned]) as u32 as u64;
+    assert(
+        full == STATUS_SUCCESS && value == 0xFFFF_FFFF_0000_0001 && length == 4 && short == STATUS_SUCCESS && short_value == 0xFFFF_FFFF_FFFF_0001 && short_length == 2 && other == STATUS_NOT_SUPPORTED && guest::read32(returned) == 0,
+        "x86bios: HalQuerySystemInformation(HalDisplayBiosInformation) = HalDisplayEmulatedBios (4 bytes, ou o tamanho do buffer)",
+    );
+    guest::free_bytes(buffer);
+    guest::free_bytes(returned);
 }
 
 /// x86BiosAllocateBuffer/x86BiosFreeBuffer.

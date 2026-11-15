@@ -4713,9 +4713,10 @@ fn hal_dispatch_table_exports(assert: Assert) {
         _ => 0,
     };
     let stub = private_entries::entry("hal_default_not_supported").and_then(|entry| crate::ntos::mm::kernel_address::image_address(entry).ok()).unwrap_or(0);
-    let slots_ok = stub != 0 && (0..public_dispatch::SLOT_COUNT as u64).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
-    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok, "hal: HalDispatchTable publicada (versao 4, slots no stub seguro)");
-    assert(native_call::call(at::<nt::HalDispatch>(table).hal_query_system_information.get(), &[0, 0, 0, 0]) == 0xC000_00BB, "hal: HalQuerySystemInformation (slot 1) devolve STATUS_NOT_SUPPORTED");
+    let query = crate::hal::amd64::routine_stubs::address("HaliQuerySystemInformation").unwrap_or(0);
+    let slots_ok = stub != 0 && guest::read64(table + 0x08) == query && (1..public_dispatch::SLOT_COUNT as u64).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
+    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok, "hal: HalDispatchTable publicada (versao 4, HalQuerySystemInformation na rotina da HAL, demais slots no stub seguro)");
+    assert(native_call::call(at::<nt::HalDispatch>(table).hal_query_system_information.get(), &[0, 0, 0, 0]) as u32 == 0xC000_00BB, "hal: HalQuerySystemInformation de classe nao atendida devolve STATUS_NOT_SUPPORTED");
 }
 
 fn fsrtl_core_exports(assert: Assert) {

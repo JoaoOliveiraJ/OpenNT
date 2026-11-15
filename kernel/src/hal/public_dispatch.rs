@@ -8,12 +8,13 @@
 //! (slot 3) etc. Tamanho e versão conferidos no `.data` do ntoskrnl 19041
 //! (HalDispatchTable no RVA 0xc00a60, seguida do KdDebuggerDataBlock em 0xc00b20).
 //!
-//! Esta plataforma não oferece nenhuma rotina do HAL_DISPATCH público
-//! (consulta de sistema legada, tabela de partição MBR, espelhamento de
-//! memória, arbitragem de barramento), então todos os slots de função apontam
-//! para o mesmo corpo nativo `hal_default_not_supported` (`mov eax,
-//! 0xC00000BB; ret` = STATUS_NOT_SUPPORTED): qualquer slot que um driver
-//! indexe é um ponteiro válido que falha de forma limpa.
+//! O slot HalQuerySystemInformation aponta para o HaliQuerySystemInformation
+//! (`hal::system_information`, uma rotina por ponteiro de
+//! `amd64::routine_stubs`). Os outros slots (tabela de partição MBR,
+//! espelhamento de memória, arbitragem de barramento...) esta plataforma não
+//! oferece: apontam para o mesmo corpo nativo `hal_default_not_supported`
+//! (`mov eax, 0xC00000BB; ret` = STATUS_NOT_SUPPORTED), então qualquer slot
+//! que um driver indexe é um ponteiro válido que falha de forma limpa.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,8 +35,9 @@ fn native(symbol: &str) -> Result<u64, KernelError> {
     kernel_address::image_address(entry)
 }
 
-/// HalInitSystem: grava a versão e aponta todos os slots de função para o
-/// stub seguro, como a HAL preenche a tabela no boot do NT.
+/// HalInitSystem: grava a versão, aponta os slots de função para o stub
+/// seguro e o HalQuerySystemInformation para a rotina da HAL, como a HAL
+/// preenche a tabela no boot do NT.
 pub fn initialize() -> Result<(), KernelError> {
     let table = kernel_data::address("HalDispatchTable")?;
     let stub = native("hal_default_not_supported")?;
@@ -49,8 +51,9 @@ pub fn initialize() -> Result<(), KernelError> {
     for slot in slots {
         slot.set(stub);
     }
+    dispatch.hal_query_system_information.set(crate::hal::amd64::routine_stubs::address("HaliQuerySystemInformation")?);
     TABLE.store(table, Ordering::SeqCst);
-    crate::debug_print!("[hal] HalDispatchTable versao {} em {:#x}: {} slots -> STATUS_NOT_SUPPORTED", VERSION, table, SLOT_COUNT);
+    crate::debug_print!("[hal] HalDispatchTable versao {} em {:#x}: HalQuerySystemInformation -> HaliQuerySystemInformation, {} slots -> STATUS_NOT_SUPPORTED", VERSION, table, SLOT_COUNT - 1);
     Ok(())
 }
 
