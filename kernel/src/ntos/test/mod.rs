@@ -32,3 +32,4 @@ pub mod fsrtl_fs_support;
 pub mod boot_drivers;
 pub mod fs_driver_imports;
 pub mod registry_hive;
+pub mod x86_bios;

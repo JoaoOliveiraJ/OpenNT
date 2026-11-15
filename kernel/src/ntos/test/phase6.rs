@@ -4013,10 +4013,9 @@ fn io_diagnostics_exports(assert: Assert) {
     assert(ntstatus(call_export("ZwFlushBuffersFileEx", &[0x7FF0, 0, 0, 0, io_status])) == Some(0xC000_0008), "watchdog: ZwFlushBuffersFileEx valida o handle");
 }
 
-/// Exports do BasicDisplay.sys real: bit-scan, _strnicmp, bloqueio de sono e os
-/// x86Bios (sem VBIOS emulado, falham de forma tolerada).
+/// Exports do BasicDisplay.sys real: bit-scan, _strnicmp e bloqueio de sono;
+/// os x86Bios* têm os testes de `x86_bios`.
 fn x86bios_sleep_misc_exports(assert: Assert) {
-    let ntstatus = |result: Option<u64>| result.map(|value| value as u32);
     let signed = |result: Option<u64>| result.map(|value| value as i64);
     let (first, second) = (guest::alloc_bytes(8), guest::alloc_bytes(8));
     guest::write_bytes(first, b"Abc\0");
@@ -4031,11 +4030,10 @@ fn x86bios_sleep_misc_exports(assert: Assert) {
             && equal == Some(0)
             && less == Some(-1)
             && handle != 0
-            && call_export("PoReenableSleepStates", &[handle]) == Some(0)
-            && call_export("x86BiosCall", &[0, 0]) == Some(0)
-            && ntstatus(call_export("x86BiosReadMemory", &[0, 0, 0, 0])) == Some(0xC000_0002),
-        "basicdisplay: bit-scan/_strnicmp/sono/x86Bios",
+            && call_export("PoReenableSleepStates", &[handle]) == Some(0),
+        "basicdisplay: bit-scan/_strnicmp/sono",
     );
+    super::x86_bios::run(assert);
 }
 
 /// Captura/validação/deassign de SECURITY_DESCRIPTOR (grupo se-descriptor).
@@ -13514,7 +13512,9 @@ fn io_space_activity_exports(assert: Assert) {
     // Uma página de I/O sem RAM, abaixo do limite do mapa direto.
     let io = 0xFEB0_0000u64;
     let active = |address: u64, size: u64| call_export("MmIsIoSpaceActive", &[address, size]).map(|value| value as u8);
-    assert(!physical_layout::contains_ram_range(io, 0x1000) && active(io, 0x1000) == Some(0) && active(0, 0) == Some(0), "io-space-activity: pagina de I/O sem mapeamento inativa");
+    // A janela VGA fica mapeada desde a inicialização do BIOS x86 (o
+    // MmMapIoSpaceEx do HalInitializeBios), como no Windows.
+    assert(!physical_layout::contains_ram_range(io, 0x1000) && active(io, 0x1000) == Some(0) && active(0xA_0000, 0x2_0000) == Some(1), "io-space-activity: pagina de I/O sem mapeamento inativa; janela VGA do BIOS x86 ativa");
     let first = call_export("MmMapIoSpace", &[io + 0x10, 0x20, 0]).unwrap_or(0);
     let second = call_export("MmMapIoSpaceEx", &[io, 0x2000, 4]).unwrap_or(0);
     assert(first != 0 && second != 0 && active(io, 0x1000) == Some(1) && active(io + 0x1FFF, 1) == Some(1) && active(io + 0x10, 0) == Some(1) && active(0, 0xFFFF_FFFF) == Some(1), "io-space-activity: MmMapIoSpace(Ex) referenciam as paginas de I/O");

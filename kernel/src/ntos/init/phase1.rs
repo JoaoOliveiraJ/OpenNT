@@ -31,6 +31,10 @@ pub fn init() {
     crate::hal::private_dispatch::initialize().unwrap_or_else(|error| panic!("HAL privada: {error}"));
     // HalDispatchTable pública, preenchida como na inicialização da HAL do NT.
     crate::hal::public_dispatch::initialize().unwrap_or_else(|error| panic!("HAL publica: {error}"));
+    // HalInitializeBios: o BIOS de vídeo da máquina para os x86Bios*.
+    if let Err(error) = crate::hal::x86bios::initialize() {
+        debug_print!("[hal] BIOS x86 indisponivel: {}", error);
+    }
     // NTFS no segundo disco IDE (ata-pio): o carregador de imagens e o
     // ZwCreateFile resolvem a mesma montagem em \NTFS (D:).
     if matches!(crate::drivers::storage::ata_pio::present(1), Ok(true)) {

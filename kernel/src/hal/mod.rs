@@ -6,8 +6,9 @@
 //! arquivos embutidos (`bundle`) e a arena dos convidados (`host`). O código
 //! x64 (interrupções, anel 3, APs, chamadas MS-ABI e trampolins) fica em
 //! `amd64`. As interfaces vistas pelo executive — ACPI, PCI, firmware, a
-//! HalPrivateDispatchTable, a interface de hypervisor e os exports Hal* —
-//! vêm em seguida.
+//! HalPrivateDispatchTable, a interface de hypervisor, a interface x86 BIOS
+//! (`x86bios`: o BIOS de vídeo num processador de modo real emulado) e os
+//! exports Hal* — vêm em seguida.
 
 pub mod amd64;
 pub mod bundle;
@@ -33,4 +34,5 @@ pub mod private_dispatch;
 pub mod public_dispatch;
 pub mod hypervisor;
 pub mod dma;
+pub mod x86bios;
 pub mod exports;

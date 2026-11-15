@@ -93,6 +93,47 @@ pub mod hal_platform {
     };
 }
 
+pub mod x86_bios {
+    //! Adaptadores dos x86Bios* (`hal::x86bios`). Os nomes ficam no grupo
+    //! `x86bios-sleep-misc` da ABI (`ntos::io::exports`), que usa estes
+    //! handlers.
+
+    use crate::hal::x86bios;
+    use crate::ntos::inc::types::extra_hal::X86BiosRegisters;
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call};
+    use crate::rtl::KernelError;
+
+    /// x86BiosCall(InterruptNumber, Registers) -> BOOLEAN.
+    pub fn call(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PX86_BIOS_REGISTERS do driver, como no NT.
+        let registers = unsafe { X86BiosRegisters::at(call.arg(2)) };
+        Ok(x86bios::call(call.arg(1) as u32, registers) as u64)
+    }
+
+    /// x86BiosAllocateBuffer(Size, Segment, Offset) -> NTSTATUS.
+    pub fn allocate_buffer(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG e PUSHORT de saída do driver.
+        let (size, segment, offset) = unsafe { (Field::<u32>::at(call.arg(1)), Field::<u16>::at(call.arg(2)), Field::<u16>::at(call.arg(3))) };
+        Ok(signed_status(x86bios::allocate_buffer(size, segment, offset)))
+    }
+
+    /// x86BiosFreeBuffer(Segment, Offset) -> NTSTATUS.
+    pub fn free_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(x86bios::free_buffer(call.arg(1) as u16, call.arg(2) as u16)))
+    }
+
+    /// x86BiosReadMemory(Segment, Offset, Buffer, Size) -> NTSTATUS.
+    pub fn read_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(x86bios::read_memory(call.arg(1) as u16, call.arg(2) as u16, call.arg(3), call.arg(4) as u32)))
+    }
+
+    /// x86BiosWriteMemory(Segment, Offset, Buffer, Size) -> NTSTATUS.
+    pub fn write_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(x86bios::write_memory(call.arg(1) as u16, call.arg(2) as u16, call.arg(3), call.arg(4) as u32)))
+    }
+}
+
 pub mod hal_bus_translation {
     //! HalTranslateBusAddress — adaptador de `hal::pci_native`.
 

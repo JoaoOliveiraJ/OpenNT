@@ -834,12 +834,12 @@ pub mod io_diagnostics {
 pub mod x86bios_sleep_misc {
     //! Exports que o BasicDisplay.sys real (Microsoft Basic Display, driver de
     //! vídeo display-only) importa e que faltavam: o bit-scan e a comparação da
-    //! CRT, o bloqueio de sono do Po e os x86Bios. Não há emulador de VBIOS de
-    //! 16 bits aqui, então a chamada de BIOS falha de modo tolerado, como numa
-    //! máquina sem VGA BIOS legado.
+    //! CRT, o bloqueio de sono do Po e os x86Bios. O grupo da ABI junta os
+    //! nove nomes; os x86Bios* são da HAL e os handlers deles ficam em
+    //! `hal::exports::x86_bios`.
 
-    use crate::ntos::inc::status::STATUS_NOT_IMPLEMENTED;
-    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::hal::exports::x86_bios;
+    use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::po::power_manager;
     use crate::ntos::rtl::{bitmap, crt};
     use crate::rtl::KernelError;
@@ -860,19 +860,6 @@ pub mod x86bios_sleep_misc {
         Ok(0)
     }
 
-    /// x86BiosCall: sem VBIOS emulado, devolve FALSE; o BasicDisplay tolera.
-    fn x86_bios_call(_: &Call) -> Result<u64, KernelError> {
-        Ok(0)
-    }
-    /// x86BiosFreeBuffer: nada a liberar — STATUS_SUCCESS.
-    fn x86_bios_free_buffer(_: &Call) -> Result<u64, KernelError> {
-        Ok(0)
-    }
-    /// x86BiosAllocateBuffer/ReadMemory/WriteMemory: recurso de VBIOS ausente.
-    fn x86_bios_not_implemented(_: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(STATUS_NOT_IMPLEMENTED))
-    }
-
     pub static GROUP: Group = Group {
         name: "x86bios-sleep-misc",
         names: &[
@@ -881,7 +868,7 @@ pub mod x86bios_sleep_misc {
         ],
         handlers: &[
             find_least_significant_bit, strnicmp, disable_sleep_states, reenable_sleep_states,
-            x86_bios_not_implemented, x86_bios_call, x86_bios_free_buffer, x86_bios_not_implemented, x86_bios_not_implemented,
+            x86_bios::allocate_buffer, x86_bios::call, x86_bios::free_buffer, x86_bios::read_memory, x86_bios::write_memory,
         ],
         data_exports: &[],
     };
