@@ -106,10 +106,21 @@ fn join(words: [u32; 2]) -> u64 {
 /// Fase associada: a porta e o alvo retidos pelos handles.
 #[derive(Clone)]
 pub struct Association {
-    pub port_entry: Arc<UserHandle>,
+    pub port_entry: Held,
     pub port: Arc<Port>,
-    pub target: Arc<UserHandle>,
+    pub target: Held,
     pub target_pointer: u64,
+}
+
+/// Um objeto que a associação retém: pelo handle da tabela de usuário ou,
+/// para um handle da tabela do Object Manager (de kernel, ou aberto em modo
+/// kernel no processo, como a IOCP e o evento que o win32k cria para cada
+/// thread GUI), pela referência do ObReferenceObjectByHandle ao corpo, solta
+/// pelo ObDereferenceObject.
+#[derive(Clone)]
+pub enum Held {
+    Handle(Arc<UserHandle>),
+    Object(u64),
 }
 
 /// Fase enfileirada: a porta que possui o pacote até a retirada.

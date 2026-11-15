@@ -1857,7 +1857,7 @@ pub mod zw_wait_completion_packets {
     /// ApcContext, IoStatus, IoStatusInformation, AlreadySignaled*).
     fn associate(call: &Call) -> Result<u64, KernelError> {
         let completion = (words(call.arg(4)), words(call.arg(5)), call.arg(6) as u32, words(call.arg(7)));
-        Ok(signed_status(match wait_packets::associate(call.arg(1), call.arg(2), call.arg(3), completion) {
+        Ok(signed_status(match wait_packets::associate(call.arg(1), call.arg(2), call.arg(3), completion, 0) {
             Ok(signaled) => {
                 if call.arg(8) != 0 {
                     // SAFETY: o BOOLEAN* opcional do chamador de kernel.

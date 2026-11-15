@@ -12,7 +12,7 @@
 //! (InvalidAttributes) não muda nada e devolve sucesso.
 
 use crate::ntos::inc::types::{NtStruct, ObjectHandleFlagInformation};
-use crate::ntos::ob::object_types;
+use crate::ntos::ob::{object_manager, object_types};
 use crate::ntos::ps::user::state;
 use crate::ntos::ps::{process, process_context};
 use crate::rtl::KernelError;
@@ -37,7 +37,7 @@ const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 /// Os atributos na tabela corrente: ExSetHandleAttributes com a máscara
 /// OBJ_INHERIT | OBJ_PROTECT_CLOSE.
 fn apply(handle: u64, inherit: bool, protect_from_close: bool) -> Result<u32, KernelError> {
-    let Some(entry) = state::get_user_handle(handle) else { return Ok(STATUS_ACCESS_DENIED) };
+    let Some(entry) = state::get_user_handle(handle) else { return apply_object_manager(handle, inherit, protect_from_close) };
     if inherit && object_types::user_type(entry.kind()).is_some_and(|object_type| object_types::invalid_attributes(&object_type) & OBJ_INHERIT != 0) {
         return Ok(0);
     }
@@ -46,6 +46,31 @@ fn apply(handle: u64, inherit: bool, protect_from_close: bool) -> Result<u32, Ke
         STATUS_INVALID_HANDLE => STATUS_ACCESS_DENIED,
         status => status,
     })
+}
+
+/// Um handle da tabela do Object Manager: os que um chamador de kernel abre
+/// sem OBJ_KERNEL_HANDLE (ObOpenObjectByPointer, como o evento do
+/// ZwCreateEvent que o xxxCreateThreadInfo do win32k protege contra
+/// fechamento pelo ObSetHandleAttributes com PreviousMode UserMode) ficam no
+/// processo corrente; os de OBJ_KERNEL_HANDLE, no System. A linha de outro
+/// dono não é desta tabela: STATUS_ACCESS_DENIED.
+fn apply_object_manager(handle: u64, inherit: bool, protect_from_close: bool) -> Result<u32, KernelError> {
+    let value = handle & !3;
+    let kernel_handle = value & KERNEL_HANDLE_MASK == KERNEL_HANDLE_MASK;
+    if !kernel_handle && value > 0x7FFF_FFFF {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    let identifier = (value & 0x7FFF_FFFF) as u32;
+    let Some(record) = object_manager::handle_record(identifier) else { return Ok(STATUS_ACCESS_DENIED) };
+    let owned = if kernel_handle { record.options.kernel_handle } else { !record.options.kernel_handle && record.options.owner_process == Some(process::get_current_process()) };
+    if !owned || record.pointer == 0 {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    if inherit && record.type_name.as_deref().and_then(object_types::by_name).is_some_and(|object_type| object_types::invalid_attributes(&object_type) & OBJ_INHERIT != 0) {
+        return Ok(0);
+    }
+    let attributes = (if inherit { OBJ_INHERIT } else { 0 }) | (if protect_from_close { OBJ_PROTECT_CLOSE } else { 0 });
+    Ok(if object_manager::change_attributes(identifier, attributes)? { 0 } else { STATUS_ACCESS_DENIED })
 }
 
 /// ObSetHandleAttributes(Handle, HandleFlags, PreviousMode).

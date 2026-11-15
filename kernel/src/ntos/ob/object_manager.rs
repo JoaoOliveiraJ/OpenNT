@@ -645,6 +645,28 @@ pub fn close(handle: u32) -> Result<bool, KernelError> {
     Ok(true)
 }
 
+/// Troca os atributos (OBJ_INHERIT | OBJ_PROTECT_CLOSE) da linha de um handle
+/// do Object Manager, como o ExSetHandleAttributes sobre a entrada da tabela
+/// do dono. `false` = handle desconhecido ou linha que já saiu da tabela.
+pub fn change_attributes(handle: u32, attributes: u32) -> Result<bool, KernelError> {
+    let Some(record) = handle_record(handle) else { return Ok(false) };
+    let binding = with_state(|state| state.bindings.get(&handle).copied());
+    let mut commit = || {
+        with_state(|state| {
+            if let Some(options) = state.options.get_mut(&handle) {
+                options.attributes = Some(attributes);
+            }
+        })
+    };
+    match binding {
+        Some(binding) => process_handles::change(&binding, attributes, record.access, Some(&mut commit)),
+        None => {
+            commit();
+            Ok(true)
+        }
+    }
+}
+
 /// Os handles de `process` marcados OBJ_INHERIT, para a herança do
 /// ObInitProcess: (valor, corpo nativo, acesso, atributos). Os de kernel e os
 /// sem corpo nativo ficam de fora.

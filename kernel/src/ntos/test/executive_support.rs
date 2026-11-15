@@ -244,17 +244,24 @@ fn executive_support(assert: Assert) {
     // MmPrefetchVirtualAddresses: validação do pedido.
     let request = block + 0x200;
     let ranges = block + 0x240;
-    let fill = |version: u32, flags: u32| {
+    let prefetch = |version: u32, flags: u32, handle: u64| {
         guest::write32(request, version);
         guest::write32(request + 4, flags);
-        guest::write64(request + 8, process::get_system_process());
+        guest::write64(request + 8, handle);
         guest::write64(request + 0x10, 1);
         guest::write64(request + 0x18, ranges);
         status(call_export("MmPrefetchVirtualAddresses", &[request]))
     };
+    let fill = |version: u32, flags: u32| prefetch(version, flags, u64::MAX);
     guest::write64(ranges, 0);
     guest::write64(ranges + 8, 0);
     assert(fill(2, 0) == 0xC000_00EF && fill(1, 8) == 0xC000_00EF && fill(1, 6) == 0xC000_00EF && fill(1, 0) == 0, "mm: MmPrefetchVirtualAddresses confere Version e Flags e aceita o pedido valido");
+    // O Process do pedido é um HANDLE (MmPrefetchVirtualMemory): nulo é o
+    // sistema; NtCurrentSession (-3) exige o processo corrente numa sessão
+    // (o System não está: STATUS_NOT_MAPPED_VIEW); um handle de usuário é
+    // STATUS_INVALID_PARAMETER_1 (ObIsKernelHandle).
+    let session = prefetch(1, 0, (-3i64) as u64);
+    assert(prefetch(1, 0, 0) == 0 && session == 0xC000_0019 && prefetch(1, 0, 4) == 0xC000_00EF, "mm: MmPrefetchVirtualAddresses trata Process como handle (sistema, sessao corrente, handle de kernel)");
 
     // NtDeviceIoControlFile em KernelMode: o mesmo caminho do Zw.
     let iosb = block + 0x300;
@@ -402,7 +409,7 @@ pub fn run_user(assert: Assert) {
         let all = status(call_export("ObWaitForMultipleObjects", &[2, handles, 1, 0, 0, 0, zero]));
         let invalid = status(call_export("ObWaitForMultipleObjects", &[0, handles, 1, 1, 0, 0, zero]));
         // Pacotes de espera e a IOCP pelos Zw, com saídas na memória do kernel.
-        let kernel = guest::alloc_bytes(0x40);
+        let kernel = guest::alloc_bytes(0x60);
         // A IOCP de usuário (tabela do processo) e uma criada em modo kernel
         // (tabela nativa).
         let port_created = crate::ntos::io::completion::create::create(page + 0x100, 0x1F_0003, 0, 0, 1).unwrap_or(1) == 0 && crate::ntos::io::completion::create::create(kernel + 0x18, 0x1F_0003, 0, 0, 0).unwrap_or(1) == 0;
@@ -419,6 +426,40 @@ pub fn run_user(assert: Assert) {
         let cancelled = status(call_export("ZwCancelWaitCompletionPacket", &[packet, 1])) == 0 && depth(port) == 1;
         let packets = port_created && packet_created && associated && posted && queued && cancelled;
         crate::debug_print!("[suporte-zw] iocp={} pacote={} associado={} postado={} fila={} cancelado={}", port_created, packet_created, associated, posted, queued, cancelled);
+        // Handles da tabela do Object Manager (o caminho do xxxCreateThreadInfo
+        // do win32k): o evento do ZwCreateEvent sem OBJ_KERNEL_HANDLE fica no
+        // processo e o ObSetHandleAttributes de UserMode o protege; o de
+        // OBJ_KERNEL_HANDLE (já sinalizado) é o alvo do
+        // ZwAssociateWaitCompletionPacket.
+        let unnamed = guest::alloc_bytes(0x40);
+        at::<nt::ObjectAttributes>(unnamed).length.set(48);
+        at::<nt::ObjectAttributes>(unnamed).attributes.set(0x200);
+        let made = status(call_export("ZwCreateEvent", &[kernel + 0x20, 0x1F_0003, 0, 1, 0])) == 0 && status(call_export("ZwCreateEvent", &[kernel + 0x28, 0x1F_0003, unnamed, 0, 1])) == 0;
+        let (process_event, kernel_event) = (guest::read64(kernel + 0x20), guest::read64(kernel + 0x28));
+        let record_attributes = |handle: u64| crate::ntos::ob::object_manager::handle_record((handle & 0x7FFF_FFFF) as u32).map_or(u32::MAX, |record| record.attributes & 3);
+        let protected = made && set(process_event, 0, 1, 1) == 0 && record_attributes(process_event) == 1 && set(process_event, 0, 0, 1) == 0 && record_attributes(process_event) == 0;
+        // ObDuplicateObject com OBJ_KERNEL_HANDLE em KernelMode e o próprio
+        // processo como destino: a cópia é um handle de kernel (o destino
+        // vira o System).
+        let current = crate::ntos::ps::process::get_current_process();
+        let duplicated = status(call_export("ObDuplicateObject", &[current, process_event, current, kernel + 0x40, 0, 0x200, 2, 0])) == 0;
+        let kernel_copy = guest::read64(kernel + 0x40);
+        let protected = protected && duplicated && kernel_copy & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000;
+        if duplicated {
+            let _ = call_export("ZwClose", &[kernel_copy]);
+        }
+        let second_packet = status(call_export("ZwCreateWaitCompletionPacket", &[kernel + 0x30, 1, 0])) == 0;
+        guest::write8(kernel + 0x38, 0xFF);
+        let kernel_target = second_packet && status(call_export("ZwAssociateWaitCompletionPacket", &[guest::read64(kernel + 0x30), port, kernel_event, 1, 2, 3, 4, kernel + 0x38])) == 0 && guest::read8(kernel + 0x38) == 1;
+        for handle in [process_event, kernel_event] {
+            let _ = call_export("ZwClose", &[handle]);
+        }
+        if second_packet {
+            let _ = state::close_user_handle(guest::read64(kernel + 0x30), true, false);
+        }
+        guest::free_bytes(unnamed);
+        let packets = packets && protected && kernel_target;
+        crate::debug_print!("[suporte-zw] handles do Ob: atributos={} alvo de kernel={}", protected, kernel_target);
         for handle in [signaled, waiting, port, packet] {
             let _ = state::close_user_handle(handle, true, false);
         }
@@ -438,5 +479,5 @@ pub fn run_user(assert: Assert) {
     };
     assert(created && attributes && refused, "ob: ObSetHandleAttributes e ZwSetInformationObject trocam Inherit e ProtectFromClose do handle e recusam handle ausente, de kernel em UserMode, classe e tamanho errados, e a ObjectSessionInformation grava a sessao no diretorio");
     assert(single && any == 1 && all == 0x102 && invalid == 0xC000_000D, "ob: ObWaitForSingleObject e ObWaitForMultipleObjects (WaitAny no indice sinalizado, WaitAll com prazo zero) sobre handles de usuario");
-    assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado), ZwSetIoCompletionEx (reserva recusada) e ZwCancelWaitCompletionPacket tirando o pacote da fila");
+    assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado, tambem com alvo de handle de kernel), ZwSetIoCompletionEx (reserva recusada), ZwCancelWaitCompletionPacket tirando o pacote da fila e ObSetHandleAttributes num handle da tabela do Ob");
 }

@@ -46,8 +46,9 @@ fn attached<T>(target: u64, body: impl FnOnce() -> T) -> Result<T, KernelError> 
 //   ULONG HandleAttributes, ULONG Options, KPROCESSOR_MODE PreviousMode)
 //
 // O handle de origem é procurado na tabela do processo de origem (anexado a
-// ele); a cópia entra na tabela do destino (do System com OBJ_KERNEL_HANDLE)
-// como ObDuplicateHandle, com o acesso da origem (DUPLICATE_SAME_ACCESS) ou o
+// ele); a cópia entra na tabela do destino (na do System com
+// OBJ_KERNEL_HANDLE e PreviousMode KernelMode, para qualquer destino) como
+// ObDuplicateHandle, com o acesso da origem (DUPLICATE_SAME_ACCESS) ou o
 // pedido — em UserMode, direitos que a origem não tem são negados — e os
 // atributos da origem (DUPLICATE_SAME_ATTRIBUTES) ou os pedidos.
 // DUPLICATE_CLOSE_SOURCE fecha a origem no processo de origem, também quando
@@ -80,7 +81,10 @@ pub fn duplicate(source_process: u64, source_handle: u64, target_process: u64, t
         return Ok(STATUS_ACCESS_DENIED);
     }
     let attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { resolved.attributes } else { handle_attributes & HANDLE_ATTRIBUTE_MASK };
-    let kernel = handle_attributes & OBJ_KERNEL_HANDLE != 0 && target_process == process::get_system_process();
+    // OBJ_KERNEL_HANDLE em KernelMode troca o destino pelo System
+    // (PsInitialSystemProcess, a tabela de handles de kernel), qualquer que
+    // seja o TargetProcess; em UserMode o bit só é descartado.
+    let kernel = handle_attributes & OBJ_KERNEL_HANDLE != 0 && mode == 0;
     let owner = if kernel { process::get_system_process() } else { target_process };
     let open_attributes = attributes | if kernel { OBJ_KERNEL_HANDLE } else { 0 };
     let identifier = open_pointer::insert_with(&resolved.item, access, open_attributes, owner, OpenReason::Duplicate, mode)?;

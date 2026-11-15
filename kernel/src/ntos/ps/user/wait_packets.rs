@@ -14,7 +14,8 @@ use super::threads::{self, pump};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet};
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
-use crate::ntos::ob::objects::work::{self as work_objects, Association, Queued, WaitPacket};
+use crate::ntos::ob::objects::work::{self as work_objects, Association, Held, Queued, WaitPacket};
+use crate::ntos::ob::{object_reference, open_pointer, reference_trace};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::ObjectAttributes;
@@ -41,8 +42,8 @@ fn detach(packet: &Arc<WaitPacket>, remove_queued: bool) -> u32 {
     if let Some(association) = packet.association() {
         packet.set_association(None);
         forget(packet);
-        let _ = state::release_user_handle_reference(&association.target);
-        let _ = state::release_user_handle_reference(&association.port_entry);
+        release(&association.target);
+        release(&association.port_entry);
         let _ = dispatcher_objects::dereference(packet.pointer);
         return 0;
     }
@@ -111,14 +112,14 @@ fn poll(packet: &Arc<WaitPacket>) -> bool {
                 return;
             }
             owner.set_queued(None);
-            let _ = state::release_user_handle_reference(&port_entry);
+            release(&port_entry);
             let _ = dispatcher_objects::dereference(owner.pointer);
         })),
         ..Packet::default()
     };
     packet.set_queued(Some(Queued { port: port.clone() }));
     completion_objects::enqueue(&port, item);
-    let _ = state::release_user_handle_reference(&association.target);
+    release(&association.target);
     let _ = dispatcher_objects::dereference(pointer);
     true
 }
@@ -134,7 +135,7 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
         return Ok(0xC000_0005);
     }
     let completion = (state::syscall_arg_words(rsp, 4), state::syscall_arg_words(rsp, 5), state::stack_arg32(rsp, 6), state::syscall_arg_words(rsp, 7));
-    let signaled = match associate(handle, port_handle, target_handle, completion) {
+    let signaled = match associate(handle, port_handle, target_handle, completion, 1) {
         Ok(signaled) => signaled,
         Err(status) => return Ok(status),
     };
@@ -149,27 +150,93 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
 /// ao objeto esperável e à IOCP, com a conclusão (chave, contexto, status e
 /// informação) que vai para a fila quando o objeto sinaliza. Devolve se ele
 /// já estava sinalizado (o pacote foi para a fila na hora).
-pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: ([u32; 2], [u32; 2], u32, [u32; 2])) -> Result<bool, u32> {
+/// `previous_mode`: o do Nt (UserMode) ou do Zw (KernelMode), para o alvo
+/// fora da tabela de usuário.
+pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: ([u32; 2], [u32; 2], u32, [u32; 2]), previous_mode: u8) -> Result<bool, u32> {
     let packet = resolve(handle)?;
     if packet.association().is_some() || packet.queued().is_some() {
         return Err(0xC000_000D);
     }
-    let (port_entry, port) = io_completion::resolve(port_handle, 2)?;
-    let Some(target) = state::get_user_handle(target_handle) else { return Err(0xC000_0008) };
-    if !["event", "timer", "semaphore", "thread"].contains(&target.kind()) {
-        return Err(0xC000_0024);
-    }
-    if target.access() & 0x10_0000 == 0 {
-        return Err(0xC000_0022);
-    }
+    let (port_entry, port) = match state::get_user_handle(port_handle) {
+        Some(_) => {
+            let (entry, port) = io_completion::resolve(port_handle, IO_COMPLETION_MODIFY_STATE)?;
+            (Held::Handle(entry), port)
+        }
+        None => {
+            let pointer = reference_object(port_handle, IO_COMPLETION_MODIFY_STATE, previous_mode)?;
+            match completion_objects::port_of(pointer) {
+                Some(port) => (Held::Object(pointer), port),
+                None => {
+                    release(&Held::Object(pointer));
+                    return Err(0xC000_0024);
+                }
+            }
+        }
+    };
+    let target = match state::get_user_handle(target_handle) {
+        Some(target) if !["event", "timer", "semaphore", "thread"].contains(&target.kind()) => Err(0xC000_0024),
+        Some(target) if target.access() & SYNCHRONIZE == 0 => Err(0xC000_0022),
+        Some(target) => Ok((target.object.native_body().map_or(0, |body| body.pointer), Held::Handle(target))),
+        None => reference_object(target_handle, SYNCHRONIZE, previous_mode).and_then(|pointer| {
+            if open_pointer::type_name(pointer).is_some_and(|name| ["Event", "Timer", "Semaphore", "Thread"].contains(&name.as_str())) {
+                Ok((pointer, Held::Object(pointer)))
+            } else {
+                release(&Held::Object(pointer));
+                Err(0xC000_0024)
+            }
+        }),
+    };
+    let (target_pointer, target) = match target {
+        Ok(target) => target,
+        Err(status) => {
+            if let Held::Object(_) = port_entry {
+                release(&port_entry);
+            }
+            return Err(status);
+        }
+    };
     packet.set_completion(completion.0, completion.1, completion.2, completion.3);
-    let target_pointer = target.object.native_body().map_or(0, |body| body.pointer);
-    state::retain_user_handle_reference(&port_entry);
-    state::retain_user_handle_reference(&target);
+    for held in [&port_entry, &target] {
+        if let Held::Handle(entry) = held {
+            state::retain_user_handle_reference(entry);
+        }
+    }
     let _ = dispatcher_objects::reference(packet.pointer);
     packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
     PENDING.lock().push(packet.clone());
     Ok(poll(&packet))
+}
+
+/// SYNCHRONIZE, o direito que o alvo de uma associação exige, e
+/// IO_COMPLETION_MODIFY_STATE, o da IOCP.
+const SYNCHRONIZE: u32 = 0x10_0000;
+const IO_COMPLETION_MODIFY_STATE: u32 = 2;
+
+/// Um objeto fora da tabela de usuário (um handle do Object Manager, de
+/// kernel ou do processo corrente): ObReferenceObjectByHandle com `access`
+/// no modo de quem chama. A referência fica com a associação.
+fn reference_object(handle: u64, access: u32, previous_mode: u8) -> Result<u64, u32> {
+    let slot = guest::alloc_bytes(8);
+    let referenced = object_reference::reference_by_handle(handle, access, 0, previous_mode, slot, 0);
+    let pointer = guest::read64(slot);
+    guest::free_bytes(slot);
+    let status = referenced.map_err(|error| if error.status != 0 { error.status } else { 0xC000_0008 })? as u32;
+    if status & 0x8000_0000 != 0 {
+        return Err(status);
+    }
+    Ok(pointer)
+}
+
+/// Solta um objeto retido por uma associação.
+fn release(held: &Held) {
+    match held {
+        Held::Handle(entry) => {
+            let _ = state::release_user_handle_reference(entry);
+        }
+        Held::Object(pointer) => {
+            let _ = object_reference::dereference_with_tag(*pointer, reference_trace::DEFAULT_TAG, false);
+        }
+    }
 }
 
 /// O núcleo do NtCancelWaitCompletionPacket (e do Zw).

@@ -90,7 +90,8 @@ fn duplicate_namespace_handle(source_handle: u64, target: u64, target_handle: u6
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { record.access } else { desired };
     let handle_attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { record.attributes } else { attributes & HANDLE_ATTRIBUTE_MASK };
-    let kernel = attributes & OBJ_KERNEL_HANDLE != 0 && target == process::get_system_process();
+    // KernelMode (ObDuplicateObject): OBJ_KERNEL_HANDLE leva a cópia à tabela do System.
+    let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
     let open_options = OpenOptions {
         access: Some(access),
         attributes: Some(handle_attributes),
@@ -159,7 +160,8 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { resolved.access } else { map_generic(desired, &resolved.item.object_type.mapping) & (resolved.item.object_type.valid_access | 0x0100_0000) };
     let handle_attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { resolved.attributes } else { attributes & HANDLE_ATTRIBUTE_MASK };
-    let kernel = attributes & OBJ_KERNEL_HANDLE != 0 && target == process::get_system_process();
+    // KernelMode (ObDuplicateObject): OBJ_KERNEL_HANDLE leva a cópia à tabela do System.
+    let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
     let owner = if kernel { process::get_system_process() } else { target };
     let open_attributes = handle_attributes | if kernel { OBJ_KERNEL_HANDLE } else { 0 };
     let identifier = open_pointer::insert_with(&resolved.item, access, open_attributes, owner, crate::ntos::ob::object_header::OpenReason::Duplicate, 0)?;

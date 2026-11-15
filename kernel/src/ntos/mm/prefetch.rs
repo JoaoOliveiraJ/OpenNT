@@ -32,12 +32,19 @@
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::memory_map;
-use crate::ntos::ps::process_context;
+use crate::ntos::ob::handles::inserted;
+use crate::ntos::ob::{object_reference, object_types, reference_trace};
+use crate::ntos::ps::{process, process_context};
 use crate::rtl::KernelError;
-use crate::ntos::inc::types::{ControlArea, FileObject, SectionObjectPointers};
+use crate::ntos::inc::types::{ControlArea, Eprocess, FileObject, SectionObjectPointers};
 
 pub const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const PAGE: u64 = 0x1000;
+/// NtCurrentProcess() e NtCurrentSession().
+const NT_CURRENT_PROCESS: u64 = u64::MAX;
+const NT_CURRENT_SESSION: u64 = (-3i64) as u64;
+const PROCESS_VM_OPERATION: u32 = 0x8;
 
 /// O pedido de pré-busca.
 #[repr(C)]
@@ -67,12 +74,24 @@ const MAXIMUM_PAGES_PER_RANGE: u64 = 0x1_0000;
 
 /// MmPrefetchVirtualAddresses(Request). Devolve o NTSTATUS e as páginas
 /// lidas.
+///
+/// O Process do pedido é um HANDLE, como no MmPrefetchVirtualMemory: nulo
+/// é o working set do sistema; NtCurrentProcess (-1), o processo corrente;
+/// NtCurrentSession (-3), o espaço de sessão do processo corrente (que tem
+/// de estar numa sessão: STATUS_NOT_MAPPED_VIEW); outro valor tem de ser um
+/// handle de kernel (STATUS_INVALID_PARAMETER_1) de um processo, referenciado
+/// com PROCESS_VM_OPERATION em KernelMode, e as faixas são lidas anexado a
+/// ele. As VAs de sistema e de sessão do OpenNT estão sempre residentes: a
+/// pré-busca delas não lê nada. O win32k pede a de sessão (-3) para a tabela
+/// de handles do GDI (HmgPrefetchAllObjt). O OpenNT ainda não tem o objeto
+/// Session, o segundo tipo que o NT aceita no handle: o status da
+/// referência como processo volta.
 pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64), KernelError> {
     let flags = request.flags.get();
     if request.version.get() != 1 || flags >= 8 || flags & 6 == 6 {
         return Ok((STATUS_INVALID_PARAMETER_1, 0));
     }
-    let (process, count, entries) = (request.process.get(), request.number_of_entries.get(), request.virtual_addresses.get());
+    let (handle, count, entries) = (request.process.get(), request.number_of_entries.get(), request.virtual_addresses.get());
     let ranges: alloc::vec::Vec<(u64, u64)> = (0..count)
         .map(|index| {
             // SAFETY: o vetor de faixas do chamador de kernel.
@@ -80,7 +99,29 @@ pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64
             (entry.virtual_address.get(), entry.number_of_bytes.get())
         })
         .collect();
-    Ok((0, prefetch_ranges(process, &ranges)?))
+    match handle {
+        0 => Ok((0, 0)),
+        NT_CURRENT_PROCESS => Ok((0, prefetch_ranges(process::get_current_process(), &ranges)?)),
+        NT_CURRENT_SESSION => {
+            // SAFETY: o EPROCESS corrente.
+            let in_session = unsafe { Eprocess::at(process::get_current_process()) }.process_in_session() != 0;
+            Ok(if in_session { (0, 0) } else { (STATUS_NOT_MAPPED_VIEW, 0) })
+        }
+        _ if !inserted::is_kernel_handle(handle) => Ok((STATUS_INVALID_PARAMETER_1, 0)),
+        _ => {
+            let slot = guest::alloc_bytes(8);
+            let status = object_reference::reference_by_handle(handle, PROCESS_VM_OPERATION, object_types::process_type().pointer, 0, slot, 0)? as u32;
+            // SAFETY: célula PVOID recém-alocada.
+            let target = unsafe { Field::<u64>::at(slot) }.get();
+            guest::free_bytes(slot);
+            if status & 0x8000_0000 != 0 {
+                return Ok((status, 0));
+            }
+            let touched = prefetch_ranges(target, &ranges);
+            object_reference::dereference_with_tag(target, reference_trace::DEFAULT_TAG, false)?;
+            Ok((0, touched?))
+        }
+    }
 }
 
 /// Traz cada página de usuário das faixas (VirtualAddress, NumberOfBytes)
@@ -187,16 +228,16 @@ pub fn set_information_virtual_memory(process_handle: u64, class: u32, count: u6
             if unsafe { Field::<u32>::at(information) }.get() != 0 {
                 return Ok(STATUS_INVALID_PARAMETER_5);
             }
-            let request = guest::alloc_bytes(PrefetchRequest::SIZE);
-            // SAFETY: bloco recém-alocado do tamanho do pedido.
-            let prefetch = unsafe { PrefetchRequest::at(request) };
-            prefetch.version.set(1);
-            prefetch.process.set(process);
-            prefetch.number_of_entries.set(count);
-            prefetch.virtual_addresses.set(entries);
-            let result = prefetch_virtual_addresses(prefetch);
-            guest::free_bytes(request);
-            Ok(result?.0)
+            // As faixas vão ao processo já referenciado (o pedido do
+            // MmPrefetchVirtualAddresses leva um handle, não o EPROCESS).
+            let ranges: alloc::vec::Vec<(u64, u64)> = (0..count)
+                .map(|index| {
+                    // SAFETY: o vetor de faixas do chamador de kernel.
+                    let entry = unsafe { MemoryRangeEntry::at(entries + index * MemoryRangeEntry::SIZE) };
+                    (entry.virtual_address.get(), entry.number_of_bytes.get())
+                })
+                .collect();
+            prefetch_ranges(process, &ranges).map(|_| 0)
         }
         1..=4 => Ok(STATUS_NOT_SUPPORTED),
         _ => Ok(STATUS_INVALID_PARAMETER_2),
