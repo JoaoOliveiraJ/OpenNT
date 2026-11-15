@@ -916,7 +916,7 @@ dentro dele) que não é compartilhado entre as raízes:
   livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
   relocadas), também sobre frames do PFN.
 
-### 3.5 Plug and Play e a pilha de armazenamento real
+### 3.5 Plug and Play e as pilhas reais de armazenamento e de vídeo
 
 A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
 
@@ -939,10 +939,15 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   duas listas; QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE; enumeração. O
   IoInvalidateDeviceRelations de um nó da árvore enfileira a reenumeração.
 - `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
-  hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf), com o
-  serviço, a classe e os AddReg de cada seção. O posto segue o instalador
-  (HardwareIDs antes de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o
-  intelide.sys antes do pciide.sys de PCI\CC_0101.
+  hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf, o
+  display.inf com o BasicDisplay.sys para PCI\CC_0300 e o machine.inf com
+  o msisadrv.sys para PCI\CC_0601), com o serviço, a classe, os AddReg e
+  o ExcludeID de cada seção. O posto segue o instalador (HardwareIDs antes
+  de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o intelide.sys antes do
+  pciide.sys de PCI\CC_0101. O ServiceBinary de um driver do repositório
+  de drivers (`%13%`, como o BasicDisplay.sys) vai inteiro para o
+  ImagePath (`\SystemRoot\System32\DriverStore\FileRepository\...`),
+  que o carregador resolve sob `\NTFS\Windows`.
 - `resources.rs`: as listas do NT, os árbitros (primeira opção livre,
   alternativas, compartilhamento) e o tradutor da HAL (IRQ de linha `n` →
   vetor `0x20 + n`, IRQL `n`).
@@ -953,7 +958,8 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
 
 Os PDOs do barramento PCI respondem como o pci.sys (`drivers/bus/pci_pnp.rs`
 e `pci_interface.rs`): ids, capacidades, requisitos dos BARs (sem os do canal
-IDE legado), BUS_INTERFACE_STANDARD e PCI_BUS_INTERFACE_STANDARD,
+IDE legado; um BAR pré-buscável com CM_RESOURCE_MEMORY_PREFETCHABLE),
+BUS_INTERFACE_STANDARD e PCI_BUS_INTERFACE_STANDARD,
 READ/WRITE_CONFIG. As rotinas que um driver recebe por ponteiro (interfaces
 de barramento, DMA_OPERATIONS) são stubs nativos de `hal/amd64/
 routine_stubs.rs` (ids privados 0x80000400+). O adaptador de DMA é o da HAL
@@ -963,10 +969,30 @@ IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
 `\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
 devnode.
 
-Com `--storage=real` (`drivers/storage/storage_stack.rs`), o fim da fase 1
-monta a árvore e sobe a pilha IDE real: intelide.sys/pciidex.sys na
-controladora, atapi.sys/ataport.sys nos canais, disk.sys/classpnp.sys nos
-discos. Sem a opção nada disso roda.
+A árvore sobe no fim da fase 1 com `--storage=real` ou `--display=basic`.
+`drivers/bus/device_tree.rs` prepara a raiz com o barramento PCI interno e
+deixa com nó do kernel (sem instalação nem AddDevice, como um dispositivo
+com driver de boot) as funções que um driver interno já serve naquele
+boot: a controladora IDE sem `--storage=real` (o driver ATA interno serve o
+volume do boot) e o adaptador VGA sem `--display=basic` (o console em modo
+texto). As demais funções seguem o caminho comum; a ponte PCI-ISA recebe o
+msisadrv.sys, um driver KMDF, e passa pelo AddDevice e pelo START do
+framework.
+
+Com `--storage=real` (`drivers/storage/storage_stack.rs`) sobe a pilha IDE
+real: intelide.sys/pciidex.sys na controladora, atapi.sys/ataport.sys nos
+canais, disk.sys/classpnp.sys nos discos.
+
+Com `--display=basic` (`drivers/video/display_stack.rs`) o adaptador VGA
+recebe o BasicDisplay.sys real. O DriverEntry dele carrega o dxgkrnl.sys
+real (ZwLoadDriver do DXGKrnl) e se registra nele (DxgkInitialize); o
+AddDevice e o START_DEVICE vão ao dxgkrnl (DpiAddDevice, com o
+DxgkDdiAddDevice do miniport, e DpiFdoHandleStartDevice). O dxgkrnl deixa o
+início do adaptador (DpiFdoStartAdapterThread, com o DxgkDdiStartDevice)
+para a criação da primeira sessão, que o win32k.sys anuncia
+(watchdog!SMgrNotifySessionChange no NtUserInitialize).
+
+Sem as opções nada disso roda.
 
 ## 4. Dependências
 
