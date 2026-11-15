@@ -28,6 +28,7 @@ pub mod volatile;
 pub mod acpi;
 pub mod acpi_native;
 pub mod acpi_pm;
+pub mod errata;
 pub mod interrupt_lines;
 pub mod interrupt_targets;
 pub mod pci_config;

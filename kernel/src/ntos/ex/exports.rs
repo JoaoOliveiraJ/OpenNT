@@ -261,8 +261,8 @@ fn uuid_create(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 /// O banco de regras do Error Management está vazio: STATUS_NOT_FOUND.
-fn em_client_query_rule_state(_: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(0xC000_0225))
+fn em_client_query_rule_state(call: &Call) -> Result<u64, KernelError> {
+    crate::ntos::em::exports::em_errata::query_rule_state(call)
 }
 
 // ---- push locks ----------------------------------------------------------

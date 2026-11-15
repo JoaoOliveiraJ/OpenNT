@@ -1869,7 +1869,7 @@ fn ntoskrnl_ex_group(assert: Assert) {
     guest::write64(output, 0);
     assert(call_export("ExRegisterExtension", &[output, 1, registration]) == Some(0xFFFF_FFFF_C000_000D) && guest::read64(output) == 0, "ex: ExRegisterExtension recusa a versao de registro sem 0x10000");
     at::<nt::LargeInteger>(block + 0x1B8).quad_part.set(0x01DA_0000_1234_5678);
-    assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_0225), "ex: hora local sem fuso e regra inexistente");
+    assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_000D), "ex: hora local sem fuso e regra nula");
     // EX_TIMER e ExEventObjectType.
     let timer = call_export("ExAllocateTimer", &[0x1234, 0x5678, 0]).unwrap_or(0);
     assert(timer != 0 && guest::read64(timer + 0x80) == 0x1234 && call_export("ExCancelTimer", &[timer]) == Some(0) && call_export("ExDeleteTimer", &[timer, 1, 0, 0]) == Some(0), "ex: EX_TIMER alocado, cancelado e removido");

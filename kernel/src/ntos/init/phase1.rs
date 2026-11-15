@@ -63,6 +63,15 @@ pub fn init() {
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));
+    // EmInitSystem: o banco do Errata Manager a partir da imagem do
+    // \SystemRoot\INF\errata.inf que o carregador entrega (lida do volume
+    // de boot, agora montado), os callbacks da HAL e os embutidos; o work
+    // item do Errata Manager atualiza as regras antes dos drivers. A falha
+    // é o PHASE1_INITIALIZATION_FAILED do NT.
+    let errata = crate::ntos::em::loader_inf_image();
+    crate::ntos::em::initialize_system(errata.as_deref()).unwrap_or_else(|status| panic!("EmInitSystem: {status:#x}"));
+    crate::ntos::em::initialize_dynamic();
+    crate::ntos::io::work_items::run_queue();
     // IopInitializePlugPlayServices: o driver embutido \Driver\DeviceApi
     // (PiDaInit), com o \Device\DeviceApi que o cfgmgr32 abre.
     match crate::ntos::io::pnp::device_api::initialize() {

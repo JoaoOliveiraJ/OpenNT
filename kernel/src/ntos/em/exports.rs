@@ -1,5 +1,6 @@
 //! Adaptadores do Errata Manager; a lógica mora em `em/provider.rs` e
-//! `em/rule.rs`.
+//! `em/rule.rs` (o EmClientQueryRuleState fica no grupo `ex`, com o
+//! adaptador [`em_errata::query_rule_state`]).
 
 pub mod em_errata {
     use crate::ntos::em::{provider, rule};
@@ -12,6 +13,10 @@ pub mod em_errata {
         (address != 0).then(|| unsafe { Field::<T>::at(address) })
     }
 
+    /// EmClientQueryRuleState(RuleId, State).
+    pub fn query_rule_state(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(rule::query_rule_state(call.arg(1), optional::<u32>(call.arg(2)))))
+    }
     fn client_rule_evaluate(call: &Call) -> Result<u64, KernelError> {
         Ok(signed_status(rule::evaluate(call.arg(1), call.arg(2), call.arg(3) as u32, optional::<u32>(call.arg(4)))))
     }

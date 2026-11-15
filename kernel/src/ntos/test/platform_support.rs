@@ -169,19 +169,82 @@ fn kd_exports(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// EM_CALLBACK_ROUTINE de teste: grava Entries | Strings | Numerics e o
+/// total de argumentos no contexto e devolve TRUE.
+extern "win64" fn errata_callback(entries: u64, entry_count: u32, strings: u64, string_count: u32, numerics: u64, numeric_count: u32, context: u64) -> u32 {
+    guest::write64(context, entries | strings | numerics);
+    guest::write32(context + 8, entry_count + string_count + numeric_count);
+    2
+}
+
+/// Outra rotina para o mesmo callback (a colisão do registro).
+extern "win64" fn errata_other_callback(_: u64, _: u32, _: u64, _: u32, _: u64, _: u32, _: u64) -> u32 {
+    0
+}
+
+type ErrataCallback = extern "win64" fn(u64, u32, u64, u32, u64, u32, u64) -> u32;
+
+/// O interpretador de INF do Cm: seções (o nome repetido continua a
+/// seção), chaves, linhas sem chave, aspas, comentários, a continuação
+/// com a barra invertida, o valor vazio entre vírgulas, a substituição
+/// `%nome%` pela seção [Strings] e o erro de sintaxe com a linha.
+fn inf_parser(assert: Assert) {
+    use crate::ntos::cm::inf_parse;
+    let text = concat!("; cabecalho\r\n[Data] ; secao\r\nKey1 = a, \"b c\", \\   ; continua\r\n   d\r\nNoKey\r\n", "[strings]\r\nName = \"valor\"\r\n[DATA]\r\nKey2 = %Name%,,x\r\n");
+    let parsed = inf_parse::parse(text.as_bytes());
+    let checked = parsed.as_ref().is_ok_and(|inf| {
+        let values = |line: u32| (0..inf.value_count("data", line)).map(|index| inf.value("data", line, index).unwrap_or("?")).collect::<alloc::vec::Vec<_>>();
+        inf.line_count("Data") == 3 && inf.key_name("Data", 0) == Some("Key1") && values(0) == ["a", "b c", "d"] && inf.key_name("Data", 1).is_none() && values(1) == ["NoKey"] && values(2) == ["valor", "", "x"] && inf.value_by_key("Data", "Key") == Some(("a", 0))
+    });
+    let error = inf_parse::parse(b"[Ok]\nA = 1\n[Bad\n");
+    let trailing = inf_parse::parse(b"[S]\nA = 1,\n");
+    assert(checked && error.err() == Some(3) && trailing.err() == Some(2), "cm: CmpParseInfBuffer (secoes, chaves, aspas, continuacao, %nome% e erro com a linha)");
+}
+
 fn errata_exports(assert: Assert) {
+    inf_parser(assert);
     let Some(driver) = io_manager::devices().into_iter().filter(|(_, entry)| entry.native_device != 0).map(|(_, entry)| guest::read64(entry.native_device + 8)).find(|&driver| driver != 0) else {
         assert(false, "em: nenhum DRIVER_OBJECT de dispositivo");
         return;
     };
-    let block = guest::alloc_bytes(0x100);
+    const STATE_FALSE: u32 = 0;
+    const STATE_UNKNOWN: u32 = 1;
+    const STATE_TRUE: u32 = 2;
+    const STATUS_OBJECT_NAME_COLLISION: u64 = 0xC000_0035;
+    let block = guest::alloc_bytes(0x200);
     let (guid, entries, callbacks, handle, state) = (block, block + 0x10, block + 0x40, block + 0x70, block + 0x78);
+    let (rule_guid, record, other_handle) = (block + 0x80, block + 0x90, block + 0xA0);
+    let write_guid = |address: u64, text: &str| guest::write_bytes(address, &crate::ntos::em::database::guid_from_text(text).unwrap_or([0; 16]));
+    let query = |text: &str| {
+        write_guid(rule_guid, text);
+        guest::write32(state, 7);
+        (status("EmClientQueryRuleState", &[rule_guid, state]), guest::read32(state))
+    };
+    // Validação e o banco do errata.inf: as regras da FADT (OEMID "BOCHS "
+    // fora de todos os conjuntos; IAPC_BOOT_ARCH sem o bit 3) são FALSE; a
+    // regra sem [TargetRuleDef] é NOT_FOUND com UNKNOWN.
+    guest::write32(state, 7);
+    let invalid_query = [status("EmClientQueryRuleState", &[0, state]), status("EmClientQueryRuleState", &[rule_guid, 0])];
+    let query_untouched = guest::read32(state) == 7;
+    let pci_range = query("{F4E014A2-815B-4be8-9665-40FFF9CDFD5A}");
+    let basic_machine = query("{669D0E2E-D602-4f6c-A848-CD78CAEDCE50}");
+    let msi = query("{CBC747F0-F1D8-4C8A-AAA7-0CAE4F4AE246}");
+    assert(invalid_query == [STATUS_INVALID_PARAMETER; 2] && query_untouched && pci_range == (0, STATE_FALSE) && basic_machine == (STATUS_NOT_FOUND, STATE_UNKNOWN) && msi == (0, STATE_FALSE), "em: EmClientQueryRuleState sobre o banco do errata.inf (IgnorePciRootBusNumberRange e DisableMSI FALSE, BasicMachineID sem regra-alvo)");
+    // EmClientRuleEvaluate: validação, regra desconhecida, contagem de
+    // entradas errada e a regra do PCIDevice sem o provedor (UNKNOWN).
     guest::write_bytes(guid, &[0x11; 16]);
     guest::write32(state, 7);
     let invalid = [status("EmClientRuleEvaluate", &[0, entries, 1, state]), status("EmClientRuleEvaluate", &[guid, entries, 0, state]), status("EmClientRuleEvaluate", &[guid, entries, 1, 0])];
     let state_untouched = guest::read32(state) == 7;
     let missing = status("EmClientRuleEvaluate", &[guid, entries, 1, state]);
-    assert(invalid == [STATUS_INVALID_PARAMETER; 3] && state_untouched && missing == STATUS_NOT_FOUND && guest::read32(state) == 1, "em: EmClientRuleEvaluate sem regras no banco: STATE_UNKNOWN e STATUS_NOT_FOUND");
+    let missing_state = guest::read32(state);
+    write_guid(rule_guid, "{11BC7F8A-A266-4829-BD0C-442EE5B18653}");
+    guest::write64(entries, record);
+    guest::write64(record, 0x1234);
+    guest::write32(record + 8, 8);
+    let wrong_count = status("EmClientRuleEvaluate", &[rule_guid, entries, 2, state]);
+    let unregistered = status("EmClientRuleEvaluate", &[rule_guid, entries, 1, state]);
+    assert(invalid == [STATUS_INVALID_PARAMETER; 3] && state_untouched && missing == STATUS_NOT_FOUND && missing_state == STATE_UNKNOWN && wrong_count == STATUS_INVALID_PARAMETER && unregistered == 0 && guest::read32(state) == STATE_UNKNOWN, "em: EmClientRuleEvaluate valida, recusa a regra desconhecida e a contagem errada e da UNKNOWN sem o provedor do PCIDevice");
     guest::write64(entries, guid);
     guest::write64(entries + 8, 0);
     guest::write64(callbacks, guid);
@@ -195,13 +258,32 @@ fn errata_exports(assert: Assert) {
     let unknown_entry = status("EmProviderRegister", &[driver, entries, 1, 0, 0, handle]);
     guest::write64(callbacks + 8, 0x1000);
     let unknown_callback = status("EmProviderRegister", &[driver, 0, 0, callbacks, 1, handle]);
+    assert(rejected == [STATUS_INVALID_PARAMETER; 4] && unknown_entry == STATUS_NOT_FOUND && unknown_callback == STATUS_NOT_FOUND, "em: EmProviderRegister valida e recusa entradas e callbacks fora do banco");
+    // DisableFastS4 = ?GraphicsDisableFastS4()()(): sem provedor a regra não
+    // está pronta (UNKNOWN); com o callback registrado a consulta o chama
+    // sem argumentos e dá TRUE; outra rotina no mesmo callback colide; sem
+    // o provedor (e com a fila de atualização processada) volta a UNKNOWN.
+    let fast_s4 = "{E0574D1D-B89D-461c-A5C5-A0998B7C70C2}";
+    let before = query(fast_s4);
+    write_guid(guid, "{A380467C-D907-4716-8B9B-17584E34256C}");
+    guest::write64(callbacks, guid);
+    guest::write64(callbacks + 8, errata_callback as ErrataCallback as usize as u64);
+    guest::write64(callbacks + 0x10, record);
+    guest::write64(record, u64::MAX);
+    guest::write32(record + 8, u32::MAX);
     guest::write64(handle, 0);
-    let registered = status("EmProviderRegister", &[driver, 0, 0, 0, 0, handle]);
+    let registered = status("EmProviderRegister", &[driver, 0, 0, callbacks, 1, handle]);
     let provider = guest::read64(handle);
     let owner = if provider != 0 { guest::read64(provider) } else { 0 };
+    let evaluated = query(fast_s4);
+    let arguments = (guest::read64(record), guest::read32(record + 8));
+    guest::write64(callbacks + 8, errata_other_callback as ErrataCallback as usize as u64);
+    let collision = status("EmProviderRegister", &[driver, 0, 0, callbacks, 1, other_handle]);
     let _ = call_export("EmProviderDeregister", &[provider]);
     let _ = call_export("EmProviderDeregister", &[0]);
-    assert(rejected == [STATUS_INVALID_PARAMETER; 4] && unknown_entry == STATUS_NOT_FOUND && unknown_callback == STATUS_NOT_FOUND && registered == 0 && provider != 0 && owner == driver, "em: EmProviderRegister valida, recusa entradas e callbacks fora do banco e registra o provedor vazio");
+    work_items::run_queue();
+    let after = query(fast_s4);
+    assert(before == (0, STATE_UNKNOWN) && registered == 0 && provider != 0 && owner == driver && evaluated == (0, STATE_TRUE) && arguments == (0, 0) && collision == STATUS_OBJECT_NAME_COLLISION && after == (0, STATE_UNKNOWN), "em: o callback registrado avalia a regra (DisableFastS4 TRUE), a outra rotina colide e sem o provedor a regra volta a UNKNOWN");
     guest::free_bytes(block);
 }
 
