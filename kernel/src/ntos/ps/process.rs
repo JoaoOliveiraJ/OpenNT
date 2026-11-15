@@ -1208,6 +1208,12 @@ pub fn get_active_process_head() -> u64 {
     STATE.lock().active_head
 }
 
+/// A PsActiveProcessHead sem esperar a trava (o depurador do kernel com a
+/// máquina parada): `None` se ela estava tomada.
+pub fn try_active_process_head() -> Option<u64> {
+    STATE.try_lock().map(|state| state.active_head).filter(|&head| head != 0)
+}
+
 /// PsAcquireProcessExitSynchronization: a RundownProtect do EPROCESS, que
 /// o término do processo espera esvaziar; com o processo já saindo,
 /// STATUS_PROCESS_IS_TERMINATING.

@@ -37,3 +37,8 @@ pub const INITIAL_PROCESS: &str = or_default(option_env!("OPENNT_INITIAL_PROCESS
 
 /// O boot do processo inicial real (`--initial-process=smss`).
 pub const SMSS_BOOT: bool = matches!(INITIAL_PROCESS.as_bytes(), b"smss");
+
+/// `--kd=com2` (ou `com3`, `com4`): o depurador do kernel atende um host pelo
+/// protocolo remoto do GDB nessa porta serial (`ntos::kd`); vazio = sem
+/// depurador, como um boot do Windows sem /DEBUG.
+pub const KERNEL_DEBUGGER: &str = or_default(option_env!("OPENNT_KD"), "");

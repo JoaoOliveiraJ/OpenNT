@@ -54,6 +54,46 @@ global_asm!(
     r#"
 .pushsection .text.irq, "ax", @progbits
 
+# Entrada do depurador do kernel (`ntos::kd::stop`), com EDX = motivo e a
+# pilha no formato de `irq_common` (R11..RAX, vetor e o quadro do hardware):
+# completa o TrapFrame, guarda o x87/SSE numa area FXSAVE64 entregue ao
+# depurador, e devolve em EAX o resultado de `rs_kd_trap` (1 = voltar com o
+# quadro, possivelmente alterado pelo host; 0 = seguir o caminho comum).
+.macro OPENNT_KD_ENTER
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbp, rsp
+    and rsp, -16
+    sub rsp, 512
+    fxsave64 [rsp]
+    mov r12, [rip + opennt_kernel_native_active]
+    mov r13, [rip + opennt_kernel_native_host_rsp]
+    mov r14, [rip + opennt_kernel_sync_active]
+    mov qword ptr [rip + opennt_kernel_native_active], 0
+    mov qword ptr [rip + opennt_kernel_sync_active], 0
+    cld
+    mov rdi, rbp
+    mov rsi, rsp
+    call rs_kd_trap
+    mov r15d, eax
+    mov [rip + opennt_kernel_native_host_rsp], r13
+    mov [rip + opennt_kernel_native_active], r12
+    mov [rip + opennt_kernel_sync_active], r14
+    fxrstor64 [rsp]
+    mov eax, r15d
+    mov rsp, rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+.endm
+
 .global irq_stub_table
 .balign 16
 irq_stub_table:
@@ -194,6 +234,22 @@ irq_master_eoi:
     mov al, 0x20
     out 0x20, al
 irq_restore:
+    # Pedido de parada do depurador do kernel: no tique do relogio no anel 0,
+    # um byte no LSR da porta do depurador (o KdPollBreakIn do relogio).
+    cmp edi, 0x40
+    jne irq_restore_interval
+    movzx edx, word ptr [rip + opennt_kd_poll_port]
+    test edx, edx
+    jz irq_restore_interval
+    cmp word ptr [rsp + 88], 0x10
+    jne irq_restore_interval
+    in al, dx
+    test al, 1
+    jz irq_restore_interval
+    mov edx, 0x40
+    OPENNT_KD_ENTER
+    mov edi, 0x40
+irq_restore_interval:
     # Fim do intervalo de usuario pelo timer: volta ao escalonador (tipo 2).
     cmp edi, 0x40
     jne irq_restore_registers
@@ -363,6 +419,33 @@ irq_hex_emit:
     ret
 
 irq_kernel_exception:
+    # Depurador do kernel ligado: #DB, NMI e #BP do anel 0 vao primeiro a
+    # ele, antes do SEH (o KiDebugRoutine da primeira chance).
+    cmp byte ptr [rip + opennt_kd_trap_active], 0
+    je irq_kernel_exception_common
+    cmp r10d, 1
+    jb irq_kernel_exception_common
+    cmp r10d, 3
+    ja irq_kernel_exception_common
+    mov edx, r10d
+    OPENNT_KD_ENTER
+    test eax, eax
+    jz irq_kernel_kd_declined
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 8                      # vetor (1, 2 e 3 nao tem codigo de erro)
+    iretq
+irq_kernel_kd_declined:
+    movzx r10d, byte ptr [rsp + 72]
+    mov r11d, 88
+irq_kernel_exception_common:
     # #PF do anel 0: os provedores de residencia (pagina paginavel
     # despejada, copia na escrita) tratam a falta antes do SEH e do
     # diagnostico, como o MmAccessFault; resolvida, a instrucao repete.
@@ -701,6 +784,8 @@ fn describe_stack_fault(address: u64) {
 /// Diagnóstico de exceção de kernel. Não aloca nem adquire locks.
 #[no_mangle]
 extern "C" fn rs_kernel_exception(frame: &TrapFrame) -> ! {
+    // Com o depurador do kernel ligado, a máquina para antes do diagnóstico.
+    crate::ntos::kd::stop::fatal_exception(frame);
     let vector = (frame.vector & 0xFF) as u8;
     let (error_code, rest) = if has_error_code(vector) {
         (Some(frame.hardware[0]), &frame.hardware[1..])

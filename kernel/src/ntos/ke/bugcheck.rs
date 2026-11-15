@@ -43,6 +43,9 @@ pub fn set_handler(handler: fn(u32, u64, u64, u64, u64) -> !) {
 }
 
 pub fn bug_check_ex(code: u32, first: u64, second: u64, third: u64, fourth: u64) -> ! {
+    // Com o depurador do kernel ligado, a máquina para antes do STOP (o
+    // KeBugCheck2 com KdDebuggerEnabled).
+    crate::ntos::kd::stop::bug_check(code, [first, second, third, fourth]);
     let handler = HANDLER.load(Ordering::Acquire);
     if handler != 0 {
         let handler: fn(u32, u64, u64, u64, u64) -> ! = unsafe { core::mem::transmute(handler) };

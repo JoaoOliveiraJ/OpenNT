@@ -196,6 +196,51 @@ ap_park:
 
 .global ap_tlb_nmi
 ap_tlb_nmi:
+    # Congelamento do depurador do kernel: o AP fica preso em
+    # `rs_kd_freeze_processor` com o quadro completo (o TrapFrame dos
+    # trampolins: R15..RAX, vetor 2 e o quadro do hardware) publicado; no
+    # degelo, um shootdown postado nesse meio-tempo e atendido na saida.
+    cmp byte ptr [rip + opennt_kd_freeze_active], 0
+    je ap_tlb_nmi_service
+    push 2
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbp, rsp
+    and rsp, -16
+    mov rdi, rbp
+    cld
+    call rs_kd_freeze_processor
+    mov rsp, rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 8
+ap_tlb_nmi_service:
     push rax
     push rcx
     push rdx

@@ -347,6 +347,17 @@ pub fn list() -> Vec<LoadedImage> {
     REGISTRY.lock().enumerated()
 }
 
+/// Percorre as imagens na ordem da lista sem esperar a trava nem alocar:
+/// `false` se a trava estava tomada (o depurador do kernel, com a máquina
+/// parada, não pode esperar o dono dela).
+pub fn try_for_each(mut each: impl FnMut(&LoadedImage)) -> bool {
+    let Some(registry) = REGISTRY.try_lock() else { return false };
+    for image in &registry.images {
+        each(image);
+    }
+    true
+}
+
 pub fn kernel() -> Option<LoadedImage> {
     let registry = REGISTRY.lock();
     let id = registry.kernel?;

@@ -504,6 +504,26 @@ pub fn has_active_jobs() -> bool {
     STATE.lock().online_slots.iter().any(|&slot| physical::read32(slot_address(slot) + SLOT_JOB_COMPLETED) == 0)
 }
 
+/// NMI a cada processador de aplicação online, lido direto dos slots da
+/// mailbox, sem a trava do estado (o depurador do kernel congela os outros
+/// processadores com a máquina parada, e o código interrompido pode ser o
+/// dono dela). Devolve quantos foram sinalizados.
+pub fn send_nmi_to_application_processors() -> u32 {
+    let own = lapic::read(0x20) >> 24;
+    let mut sent = 0;
+    for slot in 0..map::MAX_CPUS - 1 {
+        let record = slot_address(slot);
+        if physical::read32(record + SLOT_ONLINE) != 1 {
+            continue;
+        }
+        let identifier = physical::read32(record + SLOT_CONTROLLER_IDENTIFIER);
+        if identifier != own && matches!(send_processor_interrupt(identifier, 0x4400), Ok(true)) {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 /// NMI direcionada aos processadores online e espera da confirmação da
 /// geração de invalidação; `flush_caches` pede WBINVD também. A espera é
 /// medida em tempo ([`stall_on_targets`]): um processador que não confirma

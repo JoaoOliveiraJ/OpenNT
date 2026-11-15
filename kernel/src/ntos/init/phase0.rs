@@ -49,6 +49,7 @@ pub fn init() {
     crate::hal::pci_config::init().unwrap_or_else(|error| panic!("{error}")); // lock CF8/CFC antes dos APs
     shared_user_data::init(); // página KUSER_SHARED_DATA mapeada (drivers WDK)
     smp::init().unwrap_or_else(|error| panic!("SMP: {error}")); // ACPI MADT + INIT-SIPI dos APs (LAPIC)
+    crate::ntos::kd::initialize(); // depurador do kernel (`--kd`): KdInitSystem com o transporte serial
     crate::ntos::mm::user_half::assert_user_only(); // trampolim desfeito: nada do kernel abaixo de MmSystemRangeStart
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)

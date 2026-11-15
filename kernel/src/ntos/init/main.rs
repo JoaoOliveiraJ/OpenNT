@@ -146,6 +146,11 @@ pub fn kmain() -> ! {
         start_boot_driver(name);
     }
 
+    // Com o depurador do kernel (`--kd`), o contrato que os drivers veem.
+    if !boot_config::KERNEL_DEBUGGER.is_empty() {
+        crate::ntos::test::kernel_debugger::run();
+    }
+
     debug_print!("KERNEL_RS_OK"); // kernel Rust montado e executando
 
     if let Err(error) = crate::ntos::ps::user::index::init() {

@@ -1,6 +1,6 @@
 //! Família Kd* (depurador do kernel).
 //!
-//! Só adaptadores: o estado de um boot sem /DEBUG mora em
+//! Só adaptadores: o estado do depurador visto pelos drivers mora em
 //! `ntos::kd::debugger`. Os slots históricos de dado mantêm os ids; o EAT
 //! publica as variáveis reais.
 
@@ -20,8 +20,10 @@ fn refresh_debugger_not_present(_: &Call) -> Result<u64, KernelError> {
     Ok(debugger::refresh_debugger_not_present())
 }
 
-fn change_option(_: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(debugger::change_option()))
+/// (Option, InBufferBytes, InBuffer, OutBufferBytes, OutBuffer,
+/// OutBufferNeeded).
+fn change_option(call: &Call) -> Result<u64, KernelError> {
+    Ok(signed_status(debugger::change_option(call.arg(1) as u32, call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6))))
 }
 
 fn break_point_with_status(call: &Call) -> Result<u64, KernelError> {

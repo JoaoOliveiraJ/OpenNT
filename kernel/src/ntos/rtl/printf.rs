@@ -154,6 +154,7 @@ pub fn debug_print_with_prefix(prefix: u64, format: u64, va_list: u64) -> Result
     let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut arguments, false)?;
     let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(&text);
     debug_print!("{}{}", prefix, text);
+    crate::ntos::kd::print_log::output(&alloc::format!("{}{}", prefix, text));
     Ok(())
 }
 
@@ -173,6 +174,7 @@ pub fn debug_print_ex_va(component_id: u32, format: u64, va_list: u64) -> Result
 pub fn debug_print_ex_text(component_id: u32, text: &str) {
     let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(text);
     debug_print!("[driver:{}] {}", component_id, text);
+    crate::ntos::kd::print_log::output(text);
 }
 
 // ---- sprintf_s e vsprintf_s (crt-formatting) -------------------------------

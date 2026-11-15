@@ -3,7 +3,8 @@
 //! O formato printf do convidado é expandido com os argumentos variáveis da
 //! chamada e vai para o log do kernel com um prefixo; a quebra de linha
 //! final (`\n` ou `\r\n`) sai. O nível do DbgPrintEx chega pela ABI, mas
-//! ainda não filtra.
+//! ainda não filtra. O texto (sem o prefixo do log) também vai ao depurador
+//! do kernel (`kd::print_log`).
 
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
@@ -13,6 +14,7 @@ fn print_formatted(prefix: &str, format_pointer: u64, arguments: &[u64]) -> Resu
     let text = guest_strings::format_guest_text(&format_text, &mut |index| arguments.get(index).copied().unwrap_or(0), false)?;
     let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(&text);
     debug_print!("{}{}", prefix, text);
+    crate::ntos::kd::print_log::output(text);
     Ok(())
 }
 

@@ -1452,7 +1452,9 @@ fn ntoskrnl_medium_groups(assert: Assert) {
         _ => 0,
     };
     assert(data("KdDebuggerEnabled") == kernel_data::address("KdDebuggerEnabled").unwrap_or(1) && data("KdEnteredDebugger") == kernel_data::address("KdEnteredDebugger").unwrap_or(1), "kd: KdDebuggerEnabled e KdEnteredDebugger resolvem para os dados reais");
-    assert(call_export("KdEnableDebugger", &[]) == Some(0xFFFF_FFFF_C000_0022) && call_export("KdChangeOption", &[0, 0, 0, 0, 0]) == Some(0xFFFF_FFFF_C000_0354) && call_export("KdRefreshDebuggerNotPresent", &[]) == Some(1), "kd: sem depurador (ACCESS_DENIED, DEBUGGER_INACTIVE, nao presente)");
+    // KdPitchDebugger vem antes de tudo no KdEnableDebuggerWithLock e no
+    // KdChangeOption: STATUS_DEBUGGER_INACTIVE nos dois.
+    assert(call_export("KdEnableDebugger", &[]) == Some(0xFFFF_FFFF_C000_0354) && call_export("KdChangeOption", &[0, 0, 0, 0, 0, 0]) == Some(0xFFFF_FFFF_C000_0354) && call_export("KdRefreshDebuggerNotPresent", &[]) == Some(1), "kd: sem depurador (DEBUGGER_INACTIVE, DEBUGGER_INACTIVE, nao presente)");
     // process-query: proteção e níveis de assinatura.
     let process = guest::alloc_bytes(nt::Eprocess::SIZE);
     let eprocess = at::<nt::Eprocess>(process);

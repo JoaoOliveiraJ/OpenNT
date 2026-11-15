@@ -70,5 +70,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     hal::serial::puts("\n*** PANIC: ");
     rtl::print::write_args(format_args!("{}", info));
     hal::serial::puts(" ***\n");
+    // Com o depurador do kernel ligado, a máquina para antes de travar.
+    ntos::kd::stop::panic_stop();
     hal::cpu::halt_forever()
 }

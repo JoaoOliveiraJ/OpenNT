@@ -8,11 +8,16 @@
 //!   0x20 bytes de NonPagedPoolNx com a tag 'KdIo' (LIST_ENTRY, rotina e
 //!   contexto), inserido no fim sob a KdpPowerSpinLock em HIGH_LEVEL. O
 //!   handle devolvido é o próprio bloco.
-//! - KdPowerTransitionEx e KdDisableDebugger: o KdPitchDebugger de um boot
-//!   sem /DEBUG faz a transição devolver STATUS_SUCCESS sem tocar no
-//!   transporte (os tratadores registrados só são chamados pela energia do
-//!   transporte, que não existe) e o disable devolver
-//!   STATUS_DEBUGGER_INACTIVE.
+//! - KdPowerTransitionEx(PowerState, AcquireLock): com o KdPitchDebugger
+//!   de um boot sem depurador, STATUS_SUCCESS sem tocar no transporte (os
+//!   tratadores registrados só são chamados pela energia do transporte).
+//!   Com o depurador do OpenNT (`--kd`), como o ntoskrnl: o bit 30 força a
+//!   transição mesmo com KdDebuggerEnabled desligado (senão ela não faz
+//!   nada), o bit 31 sai do estado, e sob a KdDebuggerLock (com
+//!   AcquireLock) PowerDeviceD0 (1) reprograma a UART do transporte e
+//!   D1-D3 (2-4) a deixam como está; outro estado é
+//!   STATUS_INVALID_PARAMETER.
+//! - KdDisableDebugger: a lógica mora em `kd/debugger.rs`.
 //! - DbgCommandString(Name, Command): o serviço de depuração
 //!   BREAKPOINT_COMMAND_STRING (5) pelo `int 0x2D`, com os dois STRINGs
 //!   montados pelo corpo nativo; sem KD, o serviço só avança o contexto.
@@ -24,6 +29,7 @@ use crate::hal::amd64::{native_call, private_entries};
 use crate::ntos::ex::pool_allocation;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::ListEntry;
+use super::{debugger, transport};
 use crate::ntos::ke::{irql, spin_lock};
 use crate::ntos::mm::kernel_address;
 use crate::rtl::{KernelError, SpinLock};
@@ -31,13 +37,10 @@ use crate::rtl::{KernelError, SpinLock};
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
-const STATUS_DEBUGGER_INACTIVE: u32 = 0xC000_0354;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const NON_PAGED_POOL_NX: u32 = 0x200;
 const POWER_HANDLER_TAG: u32 = u32::from_le_bytes(*b"KdIo");
 const HIGH_LEVEL: u8 = 15;
-
-/// KdPitchDebugger: o boot do OpenNT não tem /DEBUG.
-const PITCH_DEBUGGER: bool = true;
 
 /// A KSPIN_LOCK KdDebuggerLock.
 static DEBUGGER_LOCK: AtomicU64 = AtomicU64::new(0);
@@ -73,6 +76,17 @@ pub fn acquire_debugger_lock(old_irql: &Field<u8>) {
 pub fn release_debugger_lock(old_irql: u8) {
     spin_lock::release_from_dpc_level(debugger_lock());
     irql::lower_irql(old_irql as u64);
+}
+
+/// Executa `body` com a KdDebuggerLock em DISPATCH_LEVEL (o par
+/// KeRaiseIrql/KeAcquireSpinLockAtDpcLevel dos Kd*WithLock).
+pub fn with_debugger_lock<T>(body: impl FnOnce() -> T) -> T {
+    let previous = irql::raise_irql(irql::DISPATCH_LEVEL);
+    spin_lock::acquire_at_dpc_level(debugger_lock());
+    let result = body();
+    spin_lock::release_from_dpc_level(debugger_lock());
+    irql::lower_irql(previous as u64);
+    result
 }
 
 /// A trava está tomada (autotestes).
@@ -133,20 +147,32 @@ pub fn registered_power_handlers() -> Vec<u64> {
     POWER_HANDLERS.lock().clone()
 }
 
-/// KdPowerTransitionEx(PowerState, AcquireLock): sem /DEBUG, nada a fazer.
-pub fn power_transition(_power_state: u32, _acquire_lock: bool) -> u32 {
-    if PITCH_DEBUGGER {
+/// KdPowerTransitionEx(PowerState, AcquireLock).
+pub fn power_transition(power_state: u32, acquire_lock: bool) -> u32 {
+    if debugger::pitched() {
         return STATUS_SUCCESS;
     }
-    STATUS_SUCCESS
+    let forced = power_state & 0x4000_0000;
+    let state = power_state ^ forced;
+    if forced == 0 && !debugger::enabled() {
+        return STATUS_SUCCESS;
+    }
+    let state = state & !0x8000_0000;
+    let transition = || match state {
+        // PowerDeviceD0: a UART volta ao estado do transporte.
+        1 => {
+            transport::initialize(transport::base());
+            STATUS_SUCCESS
+        }
+        2..=4 => STATUS_SUCCESS,
+        _ => STATUS_INVALID_PARAMETER,
+    };
+    if acquire_lock { with_debugger_lock(transition) } else { transition() }
 }
 
-/// KdDisableDebugger: o depurador foi descartado no boot.
+/// KdDisableDebugger.
 pub fn disable_debugger() -> u32 {
-    if PITCH_DEBUGGER {
-        return STATUS_DEBUGGER_INACTIVE;
-    }
-    STATUS_SUCCESS
+    debugger::disable_debugger()
 }
 
 /// DbgCommandString(Name, Command): o corpo nativo com `int 0x2D`.
