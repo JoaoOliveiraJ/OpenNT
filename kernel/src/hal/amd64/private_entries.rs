@@ -140,6 +140,19 @@ opennt_exp_delete_timer:
     mov eax, 0x8000000E
     jmp opennt_win32_common
 
+# CloseProcedure e DeleteProcedure do tipo Job.
+.balign 16
+.global opennt_psp_job_close
+opennt_psp_job_close:
+    mov eax, 0x8000000F
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_psp_job_delete
+opennt_psp_job_delete:
+    mov eax, 0x80000010
+    jmp opennt_win32_common
+
 .balign 16
 .global opennt_psp_context_operation_apc
 opennt_psp_context_operation_apc:
@@ -352,6 +365,8 @@ extern "C" {
     static opennt_psp_io_mini_packet_callback_routine: u8;
     static opennt_exp_timer_apc_routine: u8;
     static opennt_exp_delete_timer: u8;
+    static opennt_psp_job_close: u8;
+    static opennt_psp_job_delete: u8;
     static opennt_hal_private_stubs: u8;
     static opennt_hal_default_zero: u8;
     static opennt_hal_default_not_supported: u8;
@@ -391,6 +406,8 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "PspIoMiniPacketCallbackRoutine" => core::ptr::addr_of!(opennt_psp_io_mini_packet_callback_routine),
             "ExpTimerApcRoutine" => core::ptr::addr_of!(opennt_exp_timer_apc_routine),
             "ExpDeleteTimer" => core::ptr::addr_of!(opennt_exp_delete_timer),
+            "PspJobClose" => core::ptr::addr_of!(opennt_psp_job_close),
+            "PspJobDelete" => core::ptr::addr_of!(opennt_psp_job_delete),
             "hal_private_stubs" => core::ptr::addr_of!(opennt_hal_private_stubs),
             "hal_default_zero" => core::ptr::addr_of!(opennt_hal_default_zero),
             "hal_default_not_supported" => core::ptr::addr_of!(opennt_hal_default_not_supported),

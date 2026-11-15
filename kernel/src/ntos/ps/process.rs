@@ -755,6 +755,9 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     // (o MmCleanProcessAddressSpace); o EPROCESS pode continuar retido por
     // referências.
     process_state::destroy(process);
+    // O fim do PspRundownSingleProcess de um membro de job: a saída da
+    // cadeia e os jobs que ficaram vazios.
+    crate::ntos::ps::job::membership::process_exited(process);
     if let Some(record) = STATE.lock().processes.get_mut(&process) {
         record.terminated = true;
     }
@@ -781,8 +784,9 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     if let (Some(image), Some(provider)) = (&record.image, provider) {
         (provider.destroy)(image);
     }
-    // O papel do PspProcessDelete: a saída da sessão e a raiz própria do
-    // processo, se houver.
+    // O papel do PspProcessDelete: o job, a saída da sessão e a raiz própria
+    // do processo, se houver.
+    crate::ntos::ps::job::membership::process_deleted(process);
     crate::ntos::mm::session::leave(process);
     if process_address_space::root_of(process).is_some() {
         if let Err(error) = process_address_space::delete(process) {
@@ -1017,6 +1021,16 @@ pub fn account_thread(thread: u64, kernel: bool, elapsed_100ns: u64) {
             process.user_time += elapsed_100ns;
         }
     }
+}
+
+/// Os tempos de kernel e de usuário do processo (100 ns, as threads que já
+/// saíram incluídas) e as trocas de contexto das threads dele: o que o
+/// PsQueryStatisticsProcess soma.
+pub fn statistics(process: u64) -> (u64, u64, u64) {
+    let state = STATE.lock();
+    let (kernel, user) = state.processes.get(&process).map_or((0, 0), |record| (record.kernel_time, record.user_time));
+    let switches = state.threads.values().filter(|record| record.process == process).map(|record| record.context_switches as u64).sum();
+    (kernel, user, switches)
 }
 
 pub fn dispatch_thread(thread: u64) {

@@ -17,9 +17,10 @@
 //!   InheritedFromUniqueProcessId), PriorityClass e as saídas ClientId,
 //!   TebAddress e ImageInfo (o SECTION_IMAGE_INFORMATION da imagem na base
 //!   real) e ProtectionLevel (o PS_PROTECTION, com
-//!   PROCESS_CREATE_FLAGS_PROTECTED_PROCESS); recusa com
-//!   STATUS_NOT_SUPPORTED o que mudaria o processo sem suporte aqui
-//!   (DebugObject, Token, SecureProcess, JobList, UmsThread); aceita sem
+//!   PROCESS_CREATE_FLAGS_PROTECTED_PROCESS) e JobList (os handles de job,
+//!   referenciados com JOB_OBJECT_ASSIGN_PROCESS: Size múltiplo de 8, não
+//!   nulo); recusa com STATUS_NOT_SUPPORTED o que mudaria o processo sem
+//!   suporte aqui (DebugObject, Token, SecureProcess, UmsThread); aceita sem
 //!   efeito, com registro no log, os demais
 //!   que o kernel32 passa (StdHandleInfo, HandleList, ErrorMode, afinidade,
 //!   mitigações e políticas); um número desconhecido, um atributo repetido,
@@ -40,7 +41,14 @@
 //!   STATUS_INVALID_PARAMETER); com INHERIT_HANDLES o processo novo recebe, com
 //!   os mesmos valores, os handles OBJ_INHERIT do pai declarado
 //!   (ParentProcess) ou, sem ele, de quem chama;
-//!   THREAD_CREATE_FLAGS_CREATE_SUSPENDED cria a thread principal suspensa.
+//!   THREAD_CREATE_FLAGS_CREATE_SUSPENDED cria a thread principal suspensa;
+//!   PROCESS_CREATE_FLAGS_FORCE_BREAKAWAY pede SeTcbPrivilege (senão
+//!   STATUS_PRIVILEGE_NOT_HELD, o PspAllocateProcess).
+//! - Os jobs (PspInsertProcess e PspInsertThread), com o processo inteiro e
+//!   ainda parado: o processo herda o job do pai declarado ou de quem chama
+//!   (`ps/job/membership.rs`, com PROCESS_CREATE_FLAGS_BREAKAWAY e
+//!   FORCE_BREAKAWAY) e é atribuído a cada job da JobList; uma recusa
+//!   termina o processo novo e é o status da criação.
 //!
 //! Depois: `create::create_user_process` cria o processo e a thread
 //! principal, o processo entra no despachante
@@ -106,6 +114,12 @@ const PROTECTION_TYPE_MAX: u8 = 2;
 const PROTECTION_SIGNER_MAX: u8 = 8;
 /// PROCESS_CREATE_FLAGS_INHERIT_HANDLES.
 const PROCESS_INHERIT_HANDLES: u32 = 0x4;
+/// PROCESS_CREATE_FLAGS_BREAKAWAY e PROCESS_CREATE_FLAGS_FORCE_BREAKAWAY.
+const PROCESS_BREAKAWAY: u32 = 0x1;
+const PROCESS_FORCE_BREAKAWAY: u32 = 0x400;
+/// SeTcbPrivilege (o FORCE_BREAKAWAY) e STATUS_PRIVILEGE_NOT_HELD.
+const SE_TCB_PRIVILEGE: u64 = 7;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 /// THREAD_CREATE_FLAGS_* aceitas (as mesmas do NtCreateThreadEx).
 const THREAD_FLAGS_KNOWN: u32 = 0x77;
 /// Entradas de uma PS_ATTRIBUTE_LIST.
@@ -160,6 +174,18 @@ struct Output {
     return_length: u64,
 }
 
+/// Os jobs do PS_ATTRIBUTE_JOB_LIST, referenciados até o fim da criação.
+#[derive(Default)]
+struct JobList(Vec<u64>);
+
+impl Drop for JobList {
+    fn drop(&mut self) {
+        for &job in &self.0 {
+            crate::ntos::ps::job::dereference_job(job);
+        }
+    }
+}
+
 /// A lista de atributos capturada.
 #[derive(Default)]
 struct Attributes {
@@ -171,6 +197,8 @@ struct Attributes {
     image_info: Option<Output>,
     /// PS_PROTECTION pedido (PsAttributeProtectionLevel).
     protection: Option<u8>,
+    /// PsAttributeJobList.
+    jobs: JobList,
 }
 
 /// O NTSTATUS de um erro de sonda ou de criação.
@@ -331,7 +359,23 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 }
                 captured.protection = Some(level);
             }
-            attribute::DEBUG_OBJECT | attribute::TOKEN | attribute::UMS_THREAD | attribute::SECURE_PROCESS | attribute::JOB_LIST => {
+            attribute::JOB_LIST => {
+                expect(attribute::INPUT)?;
+                // HANDLE[Size / 8]: Size não nulo, múltiplo de 8 e de no
+                // máximo 0x7FFFFFFF8 bytes (o PspBuildCreateProcessContext).
+                if size == 0 || size % 8 != 0 || size > 0x7_FFFF_FFF8 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                if !state::probe_user_read(inline, size) {
+                    return Err(STATUS_ACCESS_VIOLATION);
+                }
+                let handles = guest::try_read_bytes(inline, size as usize).map_err(|error| status_of(&error))?;
+                for handle in handles.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))) {
+                    let job = crate::ntos::ps::job::object::reference_by_handle(handle, crate::ntos::ps::job::JOB_OBJECT_ASSIGN_PROCESS, 1)?;
+                    captured.jobs.0.push(job);
+                }
+            }
+            attribute::DEBUG_OBJECT | attribute::TOKEN | attribute::UMS_THREAD | attribute::SECURE_PROCESS => {
                 crate::debug_print!("[ps] NtCreateUserProcess: atributo {:#x} sem suporte", value);
                 return Err(STATUS_NOT_SUPPORTED);
             }
@@ -430,6 +474,28 @@ fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, created: 
     info.state.probe_set(PsCreateInfo::SUCCESS)
 }
 
+/// O job do pai do processo novo, retido durante a criação.
+struct CreatorJob(u64);
+
+impl Drop for CreatorJob {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            crate::ntos::ps::job::dereference_job(self.0);
+        }
+    }
+}
+
+/// O EPROCESS.Job de quem cria (o pai declarado ou quem chama), referenciado.
+fn creator_job(creator: u64) -> CreatorJob {
+    // SAFETY: quem cria está retido pela própria chamada (o corrente ou o pai
+    // declarado, referenciado pelo handle).
+    let job = unsafe { Eprocess::at(creator) }.job.get();
+    if job != 0 {
+        crate::ntos::ps::job::reference_job(job);
+    }
+    CreatorJob(job)
+}
+
 /// O corpo do NtCreateUserProcess (o cabeçalho do módulo). Devolve o
 /// NTSTATUS; as falhas de sonda viram ACCESS_VIOLATION.
 pub fn create(request: &UserCreateRequest) -> Result<u32, KernelError> {
@@ -450,6 +516,9 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         crate::debug_print!("[ps] NtCreateUserProcess: flags de processo {:#x} sem suporte", request.process_flags & PROCESS_FLAGS_UNSUPPORTED);
         return Err(STATUS_NOT_SUPPORTED);
     }
+    if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, 1) {
+        return Err(STATUS_PRIVILEGE_NOT_HELD);
+    }
     let process_handle_attributes = capture_object_attributes(request.process_attributes)?;
     let thread_handle_attributes = capture_object_attributes(request.thread_attributes)?;
     let attributes = capture_attributes(request.attribute_list)?;
@@ -466,9 +535,28 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     // quem chama.
     let inherit_handles_from = (request.process_flags & PROCESS_INHERIT_HANDLES != 0).then(|| attributes.parent.unwrap_or_else(process::get_current_process));
 
+    // Os jobs do processo novo, com ele inteiro e ainda parado: o do pai
+    // declarado (ou de quem chama), pelo PspImplicitAssignProcessToJob, e os
+    // da JobList, pelo PspAssignProcessToJobList.
+    let creator_job = creator_job(attributes.parent.unwrap_or_else(process::get_current_process));
+    let job_flags = request.process_flags & (PROCESS_BREAKAWAY | PROCESS_FORCE_BREAKAWAY);
+    let jobs = &attributes.jobs;
+    let assign_jobs = |process_id: u64| -> Result<(), KernelError> {
+        let Some(process) = crate::ntos::ps::cid::lookup(process_id).map(|entry| entry.object).filter(|&object| object != 0) else { return Ok(()) };
+        let status = crate::ntos::ps::job::membership::implicit_assign(creator_job.0, process, job_flags);
+        if status & 0x8000_0000 != 0 {
+            return Err(KernelError::with_status("o job do pai recusou o processo novo", status));
+        }
+        let status = crate::ntos::ps::job::membership::assign_job_list(process, &jobs.0);
+        if status & 0x8000_0000 != 0 {
+            return Err(KernelError::with_status("um job da JobList recusou o processo novo", status));
+        }
+        Ok(())
+    };
+
     // A criação: daqui em diante só a memória do kernel e o processo novo.
     let short_name = String::from(dos_path.rsplit('\\').next().unwrap_or(&dos_path));
-    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: None, inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0 };
+    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: Some(&assign_jobs), inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0 };
     let created = match create::create_user_process(&create_request) {
         Ok(created) => created,
         Err(failure) => {

@@ -102,14 +102,27 @@ pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, s
     }
 }
 
+/// ObReferenceObjectByHandle(handle, `access`, IoCompletionObjectType): o
+/// corpo da IOCP com uma referência (solta com
+/// `dispatcher::dereference`), da tabela do processo corrente ou da nativa.
+pub fn reference_port(handle: u64, access: u32) -> Result<u64, u32> {
+    let port = resolve_port_with(handle, access)?;
+    dispatcher_objects::reference(port.pointer).map_err(|_| 0xC000_0008u32)?;
+    Ok(port.pointer)
+}
+
 /// A IOCP do handle (IO_COMPLETION_MODIFY_STATE): a tabela do processo
 /// corrente ou a nativa.
 fn resolve_port(handle: u64) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
-    match crate::ntos::ps::user::io_completion::resolve(handle, 2) {
+    resolve_port_with(handle, 2)
+}
+
+fn resolve_port_with(handle: u64, access: u32) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
+    match crate::ntos::ps::user::io_completion::resolve(handle, access) {
         Ok((_, port)) => Ok(port),
         Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, false) {
             Some(Ok(opened)) if opened.item.object_type.name == "IoCompletion" => match completion_objects::port_of(opened.item.pointer) {
-                Some(port) if opened.access & 2 != 0 => Ok(port),
+                Some(port) if opened.access & access == access => Ok(port),
                 Some(_) => Err(0xC000_0022),
                 None => Err(0xC000_0008),
             },

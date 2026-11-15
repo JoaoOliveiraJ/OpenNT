@@ -15,6 +15,7 @@ pub mod semaphore;
 pub mod mutants;
 pub mod timer_objects;
 pub mod io_completion;
+pub mod jobs;
 pub mod lpc;
 pub mod alpc;
 pub mod csr;

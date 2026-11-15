@@ -432,6 +432,7 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("nt-create-file", 1882, 1),
     ("hal-bus-translation", 1883, 1),
     ("cm-callback-objects", 1884, 7),
+    ("ps-jobs", 1891, 7),
 ];
 
 /// Os 1891 exports de função, na ordem da ABI.
@@ -2327,4 +2328,11 @@ pub static EXPORT_NAMES: &[&str] = &[
     "CmSetCallbackObjectContext",
     "CmGetBoundTransaction",
     "CmGetCallbackVersion",
+    "ZwCreateJobObject",
+    "ZwOpenJobObject",
+    "ZwAssignProcessToJobObject",
+    "ZwTerminateJobObject",
+    "ZwIsProcessInJob",
+    "ZwSetInformationJobObject",
+    "PsAssignProcessToJobObject",
 ];

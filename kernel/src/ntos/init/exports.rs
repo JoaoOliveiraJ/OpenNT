@@ -53,8 +53,9 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 426] {
+fn groups() -> [&'static Group; 427] {
     [
+        &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
         &crate::ntos::alpc::exports::lpc::GROUP,
         &crate::ntos::ex::exports::zw_timer::GROUP,
@@ -620,6 +621,7 @@ pub fn init() {
     crate::ntos::ps::user::process_debug::init();
     crate::ntos::ps::user::call_capture::init();
     crate::ntos::ps::user::io_completion::init();
+    crate::ntos::ps::user::jobs::init();
     crate::ntos::ps::user::threads::init();
     crate::ntos::ps::user::process::init();
     crate::ntos::ps::user::user_apc::init();
@@ -909,6 +911,8 @@ pub mod private_routines {
     pub const RESERVE_PACKET_CALLBACK_ID: u64 = ID + 12;
     pub const TIMER_APC_ID: u64 = ID + 13;
     pub const DELETE_TIMER_ID: u64 = ID + 14;
+    pub const JOB_CLOSE_ID: u64 = ID + 15;
+    pub const JOB_DELETE_ID: u64 = ID + 16;
 
     pub fn name(id: u64) -> Option<&'static str> {
         use crate::hal::private_dispatch;
@@ -934,6 +938,8 @@ pub mod private_routines {
             RESERVE_PACKET_CALLBACK_ID => "PspIoMiniPacketCallbackRoutine",
             TIMER_APC_ID => "ExpTimerApcRoutine",
             DELETE_TIMER_ID => "ExpDeleteTimer",
+            JOB_CLOSE_ID => "PspJobClose",
+            JOB_DELETE_ID => "PspJobDelete",
             _ => return None,
         })
     }
@@ -966,6 +972,15 @@ pub mod private_routines {
             RESERVE_PACKET_CALLBACK_ID => crate::ntos::ps::memory_reserve::completion_packet_returned(call.arg(1), call.arg(2)),
             TIMER_APC_ID => crate::ntos::ex::timer_object::timer_apc_routine(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5)).map(|()| 0),
             DELETE_TIMER_ID => crate::ntos::ex::timer_object::delete_timer(call.arg(1)).map(|()| 0),
+            // PspJobClose(Process, Job, ProcessHandleCount, SystemHandleCount).
+            JOB_CLOSE_ID => {
+                crate::ntos::ps::job::object::close_procedure(call.arg(2), call.arg(4));
+                Ok(0)
+            }
+            JOB_DELETE_ID => {
+                crate::ntos::ps::job::object::delete_procedure(call.arg(1));
+                Ok(0)
+            }
             _ => Err(KernelError::new(alloc::format!("private routine {} enters with its module", name(id).unwrap_or("?")))),
         }
     }

@@ -1466,17 +1466,64 @@ pub mod zw_locale {
 }
 
 pub mod zw_job_query {
-    //! ZwQueryInformationJobObject; a lógica mora em `ps/job`.
+    //! ZwQueryInformationJobObject; a lógica mora em `ps/job/information`.
 
     use crate::ntos::init::exports::{signed_status, Call, Group};
-    use crate::ntos::ps::job;
+    use crate::ntos::ps::job::information;
+    use crate::ntos::ps::previous_mode;
     use crate::rtl::KernelError;
 
     fn query_information_job_object(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(job::query_information_job_object(call.arg(1), call.arg(2) as u32)))
+        Ok(signed_status(previous_mode::with_kernel(|| information::query(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), 0))??))
     }
 
     pub static GROUP: Group = Group { name: "zw-job-query", names: &["ZwQueryInformationJobObject"], handlers: &[query_information_job_object], data_exports: &[] };
+}
+
+pub mod ps_jobs {
+    //! Os Zw* de job (PreviousMode KernelMode) e PsAssignProcessToJobObject;
+    //! a lógica mora em `ps/job`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::job::{information, membership, object};
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    fn create_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| object::create(call.arg(1), call.arg(2) as u32, call.arg(3), 0))??))
+    }
+
+    fn open_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| object::open(call.arg(1), call.arg(2) as u32, call.arg(3), 0))??))
+    }
+
+    fn assign_process_to_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| membership::assign_by_handles(call.arg(1), call.arg(2), 0))??))
+    }
+
+    fn terminate_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| membership::terminate_job(call.arg(1), call.arg(2) as u32, 0))?))
+    }
+
+    fn is_process_in_job(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| membership::is_process_in_job_by_handles(call.arg(1), call.arg(2), 0))?))
+    }
+
+    fn set_information_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| information::set(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, 0))??))
+    }
+
+    /// PsAssignProcessToJobObject(Job, Process, Reserved).
+    fn ps_assign_process_to_job_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(membership::assign_process(call.arg(1), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-jobs",
+        names: &["ZwCreateJobObject", "ZwOpenJobObject", "ZwAssignProcessToJobObject", "ZwTerminateJobObject", "ZwIsProcessInJob", "ZwSetInformationJobObject", "PsAssignProcessToJobObject"],
+        handlers: &[create_job_object, open_job_object, assign_process_to_job_object, terminate_job_object, is_process_in_job, set_information_job_object, ps_assign_process_to_job_object],
+        data_exports: &[],
+    };
 }
 
 pub mod ps_resume_process {

@@ -35,7 +35,7 @@ pub fn insert_tail(head: &ListEntry, entry: &ListEntry) {
 
 /// RemoveEntryList com a checagem dos vizinhos: devolve o Flink antigo, ou
 /// `None` (sem tocar em nada) se os vizinhos não apontam de volta.
-pub(super) fn remove(entry: &ListEntry) -> Option<u64> {
+pub fn remove(entry: &ListEntry) -> Option<u64> {
     let next = at(entry.flink.get());
     let previous = at(entry.blink.get());
     if next.blink.get() != entry.address() || previous.flink.get() != entry.address() {

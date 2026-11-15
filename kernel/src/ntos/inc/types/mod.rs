@@ -71,6 +71,7 @@ pub mod extra_fs_ntfs;
 pub mod extra_fsrtl;
 pub mod extra_hal;
 pub mod extra_io;
+pub mod extra_jobs;
 pub mod extra_ke_misc;
 pub mod extra_keex;
 pub mod extra_ob_alpc;

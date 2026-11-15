@@ -67,6 +67,7 @@ use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
 use crate::ntos::mm::copy_virtual;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
+use crate::ntos::mm::process_commit;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::ntos::ke::context_switch;
@@ -437,6 +438,12 @@ pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&Priv
     true
 }
 
+/// As páginas de `[base, base + size)` ainda sem commit na região.
+fn uncommitted_pages(owner: &PrivateRegion, base: u64, size: u64) -> u64 {
+    let state = owner.state.lock();
+    (base..base + size).step_by(PAGE as usize).filter(|&va| !state.committed_pages.contains(&((va - owner.base) / PAGE))).count() as u64
+}
+
 pub fn map_region_pages(root: u64, region: &PrivateRegion) -> bool {
     map_user_page_range(root, region.base, region.size, Some(region), 0)
 }
@@ -500,8 +507,16 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                     if status != 0 {
                         return Ok(status);
                     }
-                } else if !map_user_page_range(space.root(), base, size, private(&existing), protect) {
-                    return Ok(0xC000_0017);
+                } else if let Some(owner) = private(&existing) {
+                    let pages = uncommitted_pages(owner, base, size);
+                    let charged = process_commit::charge(space.process(), pages);
+                    if charged != 0 {
+                        return Ok(charged);
+                    }
+                    if !map_user_page_range(space.root(), base, size, Some(owner), protect) {
+                        process_commit::release(space.process(), pages);
+                        return Ok(0xC000_0017);
+                    }
                 }
                 guest::try_write::<u64>(base_pointer, base)?;
                 guest::try_write::<u64>(size_pointer, size)?;
@@ -530,13 +545,22 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         Err(status) => return Ok(status),
     };
     let region = PrivateRegion::new(base, size, protect, allocation_type);
-    if allocation_type & MEM_COMMIT != 0 && !map_region_pages(space.root(), &region) {
-        return Ok(0xC000_0017);
+    if allocation_type & MEM_COMMIT != 0 {
+        // O commit da região inteira é cobrado do processo (e dos jobs dele)
+        // antes das páginas.
+        let charged = process_commit::charge(space.process(), size / PAGE);
+        if charged != 0 {
+            return Ok(charged);
+        }
+        if !map_region_pages(space.root(), &region) {
+            process_commit::release(space.process(), size / PAGE);
+            return Ok(0xC000_0017);
+        }
     }
     let entry: Region = region.clone();
     if !space.insert(RegionKind::User, entry) {
         // O processo saiu no meio da alocação: as páginas voltam ao PFN.
-        free_region_pages(space.root(), &region);
+        free_region_pages(space.process(), space.root(), &region);
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
     guest::try_write::<u64>(base_pointer, base)?;
@@ -556,12 +580,17 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
     }
     let base = find_free(space, size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
     let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE);
+    let charged = process_commit::charge(space.process(), size / PAGE);
+    if charged != 0 {
+        return Err(KernelError::with_status("commit da regiao de usuario acima do limite", charged));
+    }
     if !map_region_pages(space.root(), &region) {
+        process_commit::release(space.process(), size / PAGE);
         return Err(KernelError::new("PFN esgotado na regiao de usuario"));
     }
     let entry: Region = region.clone();
     if !space.insert(RegionKind::User, entry) {
-        free_region_pages(space.root(), &region);
+        free_region_pages(space.process(), space.root(), &region);
         return Err(KernelError::with_status("processo saiu durante a regiao de usuario", STATUS_PROCESS_IS_TERMINATING));
     }
     Ok(region)
@@ -866,11 +895,13 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let mut va = first;
+    let mut decommitted = 0;
     while va < end {
         let index = (va - owner.base) / PAGE;
         let frame = {
             let mut state = owner.state.lock();
             if state.committed_pages.remove(&index) {
+                decommitted += 1;
                 state.page_protects.remove(&index);
                 state.protected_frames.remove(&index);
                 state.frames.remove(&index)
@@ -884,6 +915,7 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
         }
         va += PAGE;
     }
+    process_commit::release(space.process(), decommitted);
     if release {
         space.remove(&region);
     }
@@ -1039,20 +1071,22 @@ pub fn release_private_region(region: &Region) {
     let Some(owner) = private(region) else { return };
     let holder = process_state::all().into_iter().find(|state| state.vad.lock().remove(RegionKind::User, region));
     if let Some(holder) = holder {
-        free_region_pages(holder.directory_table_base.load(core::sync::atomic::Ordering::Acquire), owner);
+        free_region_pages(holder.process, holder.directory_table_base.load(core::sync::atomic::Ordering::Acquire), owner);
     }
 }
 
 /// Desmapeia da raiz `root` e devolve ao PFN as páginas comitadas de uma
-/// região privada.
-fn free_region_pages(root: u64, owner: &PrivateRegion) {
-    let pages: Vec<(u64, u64)> = {
+/// região privada de `process`, devolvendo o commit delas.
+fn free_region_pages(process: u64, root: u64, owner: &PrivateRegion) {
+    let (pages, committed): (Vec<(u64, u64)>, u64) = {
         let mut state = owner.state.lock();
         let pages = state.committed_pages.iter().filter_map(|&index| state.frames.get(&index).map(|&frame| (index, frame))).collect();
+        let committed = state.committed_pages.len() as u64;
         state.committed_pages.clear();
         state.frames.clear();
-        pages
+        (pages, committed)
     };
+    process_commit::release(process, committed);
     for (index, frame) in pages {
         paging::unmap_page_in(root, owner.base + index * PAGE, MapOptions::default());
         pfn::free_page(frame);
@@ -1074,7 +1108,7 @@ pub fn release_vad(state: &ProcessState) {
     };
     for region in &regions {
         if let Some(owner) = private(region) {
-            free_region_pages(root, owner);
+            free_region_pages(state.process, root, owner);
         } else if let Some(view) = view_of(region) {
             if let Err(error) = sections::unmap(&view, None) {
                 debug_print!("[usermode] vista em 0x{:x} retida no termino do processo: {}", view.base, error);

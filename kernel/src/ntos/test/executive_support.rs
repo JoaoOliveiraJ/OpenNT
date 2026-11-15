@@ -327,8 +327,9 @@ fn zw_support(assert: Assert) {
     let ui_refused = status(call_export("ZwSetDefaultUILanguage", &[0])) == 0xC000_000D;
     let _ = call_export("ZwSetDefaultUILanguage", &[0x409]);
     assert(ui && ui_set && ui_refused, "zw: ZwQueryDefaultUILanguage/ZwSetDefaultUILanguage trocam o idioma de interface");
-    let job = |handle: u64, class: u64| status(call_export("ZwQueryInformationJobObject", &[handle, class, block, 0x40, 0]));
-    assert(job(0, 2) == 0xC000_0022 && job(0, 0x1F) == 0xC000_00BB && job(0x7FF0, 2) == 0xC000_0008, "zw: ZwQueryInformationJobObject sem job (ACCESS_DENIED fora das classes de silo) e handle invalido");
+    let job = |handle: u64, class: u64, length: u64| status(call_export("ZwQueryInformationJobObject", &[handle, class, block, length, 0]));
+    assert(job(0, 2, 0x40) == 0xC000_0022 && job(0, 0x1F, 0x90) == 0xC000_00BB && job(0x7FF0, 2, 0x40) == 0xC000_0008, "zw: ZwQueryInformationJobObject sem job (ACCESS_DENIED fora das classes de silo) e handle invalido");
+    assert(job(0, 0x1F, 0x40) == 0xC000_0004 && job(0, 2, 0x3C) == 0xC000_0004 && job(0, 0x30, 0x40) == 0xC000_0003, "zw: ZwQueryInformationJobObject confere o tamanho da classe antes do job e recusa a classe fora da faixa");
     guest::write64(block + 0x100, 0x5555);
     assert(status(call_export("ZwCancelIoFile", &[0x7FF0, block + 0x100])) == 0xC000_0008 && guest::read64(block + 0x100) == 0x5555, "zw: ZwCancelIoFile recusa o handle que nao e de arquivo sem tocar no IOSB");
     let flags = block + 0x140;

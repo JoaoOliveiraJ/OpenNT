@@ -496,6 +496,9 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     process::notify_thread_created(thread_pointer).map_err(fail)?;
     let image = Image { image_base: built.image_base, size_of_image: built.size_of_image };
     process_context::with_process(process_pointer, || notify_initial_images(process_pointer, process_id, image, &source, &ntdll)).and_then(|notified| notified).map_err(fail)?;
+    // PspInsertProcess: o processo está inserido (EPROCESS.Flags.ProcessInserted).
+    // SAFETY: EPROCESS recém-criado, retido até o término.
+    unsafe { Eprocess::at(process_pointer) }.flags.atomic().fetch_or(Eprocess::PROCESS_INSERTED_MASK, core::sync::atomic::Ordering::SeqCst);
     if let Some(on_created) = request.on_created {
         on_created(process_id).map_err(fail)?;
     }
