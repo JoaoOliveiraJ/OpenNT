@@ -328,10 +328,22 @@ da saída, NtContinue, falta, captura de chamada, os bancos de depuração e o
 callback de instrumentação) é o `UserExecutionBlock` da CPU
 (`hal/amd64/usermode.rs`, campos `Field<T>`), na cauda da reserva, depois da
 KPCR de 0xB080 bytes: os stubs o endereçam por `gs:` e o Rust por
-`usermode::block()` e `pcr::current()`. O IRQL também é da CPU, como no NT:
-KPCR.Irql da própria CPU, lido e gravado pelo GS (`ke/irql.rs`); antes da
-KPCR do BSP só existe o processador de boot, numa célula de partida que a
-KPCR herda. A execução em curso do `ke/thread_dispatch` (o contexto ativo, a
+`usermode::block()` e `pcr::current()`. O IRQL também é da CPU, e é o CR8
+dela, como no x64 do NT 19041 (`ke/irql.rs`): o KeGetCurrentIrql é um
+`mov rax, cr8` e o KfRaiseIrql, o KeRaiseIrqlToDpcLevel e o KeLowerIrql
+gravam o CR8 (o ntoskrnl não usa a KPCR.Irql), o mesmo registrador que os
+drivers leem e gravam inline (o KeGetCurrentIrql do wdm.h, como os 156
+`mov rax, cr8` do tcpip.sys): subir pelo export e descer inline, ou ler
+inline depois de subir pelo export, vê o nível verdadeiro. O CR8 é a classe
+de prioridade do TPR do LAPIC: um IRQL `n` retém no LAPIC os vetores de
+classe até `n` (o timer do LAPIC, vetor 0x40, a partir de 4), como no NT; o
+ExtINT do PIC e as NMIs não passam pelo TPR, e a partida do LAPIC regrava o
+TPR com o próprio IRQL. As ISRs nativas rodam no IRQL do objeto (o
+SynchronizeIrql, quando maior) com o ActualLock retido, como o despacho
+encadeado do ntoskrnl (`interrupt_object::dispatch_chain`). Uma thread que
+deixa a CPU leva o CR8 em KTHREAD.WaitIrql e o recoloca ao voltar
+(`context_switch`); cada CPU parte com o seu em 0 (o INIT o zera), e o
+depurador do kernel lê o de cada processador parado. A execução em curso do `ke/thread_dispatch` (o contexto ativo, a
 pilha de execuções aninhadas e o início da contagem de ciclos) é de cada CPU;
 as filas prontas, a NextThread e o lock delas são os da KPRCB do processador
 que despacha as threads (o de boot, no M0), de onde quer que venha a
@@ -370,6 +382,15 @@ dos APs (INIT/SIPI) usa o mesmo envio e devolve erro ao boot. O autoteste
 `ntos/test/multiprocess/ipi_stall.rs` confere que uma resposta que chega
 em 50 ms num prazo de 200 ms é aceita, que um alvo mudo é detectado depois
 dos 30 ms do prazo, não antes, com contadores coerentes, e o shootdown real.
+A confirmação do shootdown vem pela NMI, que nem o IF nem o IRQL (o CR8) do
+alvo retêm: o mesmo autoteste faz um AP girar com as interrupções
+desligadas em HIGH_LEVEL e confirma 64 shootdowns seguidos (na casa das
+dezenas de microssegundos no TCG). Os 100 ms e 5 s valem em hardware e sob
+hipervisor; num emulador (o TCG do QEMU, "TCGTCGTCGTCG" na leaf 0x40000000,
+`hal::hypervisor::is_emulator`) valem 12 vezes mais: lá cada CPU virtual é
+uma thread comum do hospedeiro, a entrega da NMI e o tratador dela passam
+pela trava global do emulador, e com o hospedeiro carregado a thread de um
+alvo fica segundos sem rodar, o que nada no convidado evita.
 
 **Frequência do TSC.** O relógio do kernel (`ke/clock.rs`) é o TSC. A
 frequência vem da folha CPUID 0x15 quando ela traz o cristal e a razão;
@@ -438,7 +459,7 @@ KTHREAD.KernelStack; a primitiva simétrica é `hal/amd64/context_switch.rs::
 swap`, e uma thread nova recebe um quadro inicial que entra na rotina dela);
 a thread devolve a CPU por outra troca (`switch_out`) ao ceder a vez, ao
 esperar ou ao terminar. Cada lado da troca leva o seu estado da CPU: o IRQL
-(KTHREAD.WaitIrql numa espera), a posse de execução nativa, as posses de
+(KTHREAD.WaitIrql numa espera), as chamadas nativas em curso, as posses de
 SharedLock (o `rtl::sync::SharedLock` é da thread, não do processador) e a
 thread corrente com a raiz do processo dela. A rotina de uma thread de
 sistema roda pelo caminho síncrono dos exports, como o DriverEntry: cada API
@@ -446,7 +467,21 @@ que o código nativo chama é servida na pilha da própria thread (as chamadas
 em curso, `rtl/native_context.rs`, são achadas pela pilha, não pela CPU); na
 entrada de cada export, uma thread que gastou o quantum (KTHREAD.CycleTime
 alcançou o QuantumTarget, como no KiQuantumEnd) cede a vez antes do serviço
-e recebe as APCs de kernel pendentes; a rotina que retorna termina a thread,
+e recebe as APCs de kernel pendentes. As chamadas nativas em curso são da
+thread (`hal/amd64/native_call.rs`): o contexto nativo agendado em execução
+(o `run_kernel_context` dos handlers e funclets de SEH, cujo código sai para
+o hospedeiro a cada export) e a posse de execução nativa síncrona (só faltas
+numa execução possuída entram no SEH de kernel) são duas células da CPU na
+reserva da KPCR, que os trampolins leem por `gs:` e a troca de thread leva
+com a thread que sai; o RSP do hospedeiro para onde a saída de um contexto
+agendado volta fica no próprio quadro dele. Duas threads que se intercalam
+dentro de chamadas nativas, ou duas CPUs ao mesmo tempo, nunca veem o
+estado uma da outra (uma célula única do sistema mandaria o export de um AP
+para a saída do contexto do BSP, pela pilha do hospedeiro dele). O autoteste
+`ntos/test/multiprocess/native_interleave.rs` intercala duas threads de
+sistema dentro dos próprios contextos agendados, por eventos esperados de
+dentro deles, e faz um AP chamar um export enquanto o BSP está num contexto
+agendado. A rotina que retorna termina a thread,
 e o PsTerminateSystemThread termina de dentro do serviço pela última troca.
 Pedido de dentro de uma thread de kernel (o pump de uma espera genérica, o
 ZwYieldExecution com outra pronta, um SharedLock disputado), o tick não
@@ -486,7 +521,14 @@ lock, rundown, `context_switch::acquire_signaled`) esperam com um bloco de
 notificação no evento em que a requisição estacionou (o Event do FAST_MUTEX,
 o WakeEvent do bloco do push lock e do rundown, o evento do bloco do
 ERESOURCE): o KeSetEvent de quem solta acorda a thread, que confere a palavra
-de novo, como o laço do ExpAcquireFastMutexContended. A retirada de uma porta
+de novo, como o laço do ExpAcquireFastMutexContended. Todo ERESOURCE fica
+na SystemResourcesList desde o ExInitializeResourceLite, e o
+ExDeleteResourceLite o tira dela mesmo com dono ou espera, zerando os
+vínculos, como o ntoskrnl (rva 0x275720): o ntfs.sys apaga assim a tabela de
+reinício do NtfsCheckpointVolume, dois ERESOURCE na pilha dele, com o
+primeiro ainda adquirido, e um recurso de pilha esquecido na lista faria as
+inserções e remoções seguintes gravarem na pilha de outra chamada (o
+autoteste `eresource_deleted_while_owned`, na fase 6). A retirada de uma porta
 de conclusão (ZwRemoveIoCompletion[Ex]) e as esperas do ALPC
 (`alpc::kernel_entry::wait_transport`: a recepção, a conexão, a resposta de
 um pedido síncrono) são esperas explícitas (`wait::wait_woken`): a entrega dos
@@ -507,7 +549,10 @@ WaitListHead, fica Waiting e não gasta ciclo nem troca de contexto enquanto o
 sistema gira; o sinal a apronta na hora; o KeInsertQueue entrega a entrada
 direto, com a lista vazia e a vaga ocupada), um servidor e um cliente ALPC
 de kernel em threads de sistema e um processo de kernel em execução dado como
-pronto, que segue fora da fila e espera um prazo sem gastar CPU.
+pronto, que segue fora da fila e espera um prazo sem gastar CPU: pela
+contabilidade da própria thread, o KTHREAD.CycleTime não muda em nenhuma das
+amostras tiradas enquanto ela está Waiting e ela é despachada uma única vez
+(a que a acorda), o que a carga do hospedeiro não altera.
 
 **Esperas que bloqueiam.** Uma thread de usuário que espera dentro de uma
 syscall deixa a CPU, como no KiSwapContext do NT, em vez de girar o
@@ -527,7 +572,7 @@ união das convenções do kernel e MS x64) fica na pilha da thread, o RSP vai
 para KTHREAD.KernelStack, e a CPU sai pelo fim do intervalo
 (`user_terminate_current`) com o tipo de saída 4; a thread leva na pilha o
 estado por CPU do serviço (CONTEXT do intervalo, quadro e faixas preservadas
-da syscall, KPCR.UserRsp, NtContinue, posse de execução nativa). O
+da syscall, KPCR.UserRsp, NtContinue, chamadas nativas em curso). O
 despachante de `ps/user/threads.rs` segue com as outras threads, sonda a
 espera no contexto da bloqueada (thread corrente e CR3 dela) e, quando ela
 conclui, retoma o
