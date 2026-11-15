@@ -1222,6 +1222,38 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o banco é vazio como no ntoskrnl sem ele: só o provedor sem entradas nem
   callbacks é registrado, e as regras não existem (STATUS_NOT_FOUND com
   STATE_UNKNOWN).
+- **Jobs** (`ps/job.rs` e `ps/job/`): o EJOB real (o corpo de 0x640
+  bytes do ObCreateObject com PsJobType, CloseProcedure PspJobClose e
+  DeleteProcedure PspJobDelete pelas rotinas privadas), na PspJobList e com
+  JobId; `object` cria, abre, fecha (KILL_ON_JOB_CLOSE termina a hierarquia
+  e a porta é desassociada no último handle) e apaga; `membership` faz a
+  atribuição pelas disposições do PspGetJobAssignmentDisposition (sem job,
+  já no job, descer para um descendente, aninhar um job vazio sob o do
+  processo: a hierarquia do Windows 8, com ParentJob, RootJob,
+  NestingDepth e o vetor de ancestrais), os limites da cadeia (processos
+  ativos: STATUS_QUOTA_EXCEEDED e ACTIVE_PROCESS_LIMIT), os contadores e
+  NEW_PROCESS, a herança na criação (o `on_created` do NtCreateUserProcess:
+  PspImplicitAssignProcessToJob com BREAKAWAY_OK/SILENT_BREAKAWAY_OK e
+  PROCESS_CREATE_FLAGS_BREAKAWAY, e a JobList), a saída (EXIT_PROCESS ou
+  ABNORMAL_EXIT_PROCESS nas rotinas de saída de processo; depois do
+  KPROCESS sinalizado, a contabilidade somada a cada job e
+  ACTIVE_PROCESS_ZERO), a deleção (o job solto no PspProcessDelete), o
+  NtTerminateJobObject e o NtIsProcessInJob; `limits` faz os limites
+  efetivos de um job aninhado, o teto de commit de cada processo
+  (EPROCESS.CommitChargeLimit) e o commit do job
+  (PspChangeJobMemoryUsageByProcess, com JOB_MEMORY_LIMIT); `information`
+  responde às classes de consulta e alteração. O commit privado de cada
+  processo (EPROCESS.CommitCharge, `mm/process_commit.rs`, o
+  MiChargeFullProcessCommitment e o MiReturnFullProcessCharges) é cobrado
+  pelas páginas privadas que o NtAllocateVirtualMemory comita e pelas
+  regiões que o kernel monta (pilha, PEB, TEB), e devolvido no decommit, na
+  liberação e no fim do espaço; acima do teto do processo ou do limite do
+  job o commit é STATUS_COMMITMENT_LIMIT. Ficam registrados no job, sem
+  efeito no escalonador, os limites de tempo, working set, afinidade,
+  prioridade e classe de escalonamento; o controle de CPU, de rede e de
+  E/S, o congelamento e os silos respondem STATUS_NOT_SUPPORTED. As
+  notificações vão para a IOCP fora da trava dos jobs (o `Outbox`). Teste:
+  `ntos/test/multiprocess/jobs.rs` (`JOBS_OK`).
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o
   KdPitchDebugger de um boot sem /DEBUG, KdPowerTransitionEx sem efeito e
@@ -1461,8 +1493,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   uma vez (honra ImageName, ParentProcess com PROCESS_CREATE_PROCESS,
   PriorityClass, ProtectionLevel (o processo novo recebe o PS_PROTECTION
   pedido se quem cria for protegido e o dominar) e as saídas ClientId,
-  TebAddress e ImageInfo; recusa com STATUS_NOT_SUPPORTED DebugObject,
-  Token, SecureProcess, JobList e UmsThread; aceita sem efeito, no log, os demais que o kernel32
+  TebAddress e ImageInfo, e JobList (os handles de job referenciados com
+  JOB_OBJECT_ASSIGN_PROCESS); recusa com STATUS_NOT_SUPPORTED DebugObject,
+  Token, SecureProcess e UmsThread; aceita sem efeito, no log, os demais que o kernel32
   passa; número desconhecido, repetido ou tamanho errado dão
   STATUS_INVALID_PARAMETER), o RTL_USER_PROCESS_PARAMETERS normalizado ou não
   (`process_parameters::capture`: a estrutura copiada até o Length, cada
@@ -1914,7 +1947,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `PIPES_OK` (o
   servidor e o cliente de pipes e mailslot pelos npfs.sys e msfs.sys reais,
-  na fase 7, depois do `MULTIPROCESS_OK`), `KBDTEST_OK`,
+  na fase 7, depois do `MULTIPROCESS_OK`), `JOBS_OK` (os jobs com
+  processos de usuário reais, na fase 7, depois do `PIPES_OK`), `KBDTEST_OK`,
   `[shell] pronto`, `FILE_SYSTEM_MOUNT_OK name=<serviço>` (um arquivo do
   volume aberto e lido pelo file system real iniciado com `--start-driver`),
   `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
