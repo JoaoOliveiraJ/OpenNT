@@ -1,29 +1,32 @@
 //! Verificação de acesso contra um SECURITY_DESCRIPTOR e a identidade do
-//! sujeito (SeAccessCheck e SeAccessCheckFromState).
+//! sujeito: SeAccessCheck, SeAccessCheckFromState(Ex), SeAccessCheckEx e
+//! SeAccessCheckWithHint.
 //!
-//! Reusa a avaliação ordenada de DACL do `token/access.rs`/`object_security.rs`,
-//! dirigida aqui por um descritor e pelo GENERIC_MAPPING do chamador em vez do
-//! mapeamento fixo de token.
-//!
-//! Lacuna honesta: não há caminho de concessão por privilégio ligado a
-//! descritores (SeSecurityPrivilege para ACCESS_SYSTEM_SECURITY,
-//! SeTakeOwnership para WRITE_OWNER); `*Privileges` sai NULL e esse ramo é
-//! pulado — igual ao `token/access.rs`, que só honra 8/9 habilitados no
-//! objeto token.
+//! A avaliação é a do `se/access_evaluation.rs` (o SeAccessCheckWithHint
+//! do NT: rótulo de confiança, integridade obrigatória, direitos implícitos
+//! do dono, privilégios, DACL, passagens restrita e de pacote); aqui ficam o
+//! contrato dos exports, o token efetivo do SECURITY_SUBJECT_CONTEXT (o
+//! cliente com SecurityImpersonation ou mais, senão o primário) e a
+//! identidade lida de um token do OpenNT, de um TOKEN_ACCESS_INFORMATION ou
+//! de um `_TOKEN` montado por SeTokenFromAccessInformation. O acesso pedido
+//! não é mapeado (o NT exige quem chama já o ter mapeado) e `*Privileges`
+//! sai NULL: o OpenNT não monta o PRIVILEGE_SET dos privilégios usados.
 
 use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use crate::ntos::inc::types::{
-    AccessAllowedAce, AceHeader, Acl, GenericMapping, NtStruct, SecurityImpersonationLevel, SecuritySubjectContext,
-    SidAndAttributes, SidAndAttributesHash, TokenAccessInformation,
+    AccessAllowedAce, AceHeader, Acl, GenericMapping, LuidAndAttributes, NtStruct, SecurityImpersonationLevel, SecuritySubjectContext,
+    SidAndAttributes, SidAndAttributesHash, TokenAccessInformation, TokenPrivileges,
 };
 use crate::ntos::inc::types::{AccessReasons, AccessState, Field};
 use crate::ntos::inc::types::extra_fs_ntfs::{SeAccessReply, SeAccessRequest, SeSecurityDescriptor};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_types;
+use crate::ntos::se::access_evaluation::{self, Subject};
 use crate::ntos::se::acl;
 use crate::ntos::se::model::Sid;
+use crate::ntos::se::query_descriptor;
 use crate::ntos::se::token::tokens;
 use crate::ntos::se::{descriptor, out, sid};
 
@@ -31,29 +34,15 @@ const SECURITY_IMPERSONATION: SecurityImpersonationLevel = SecurityImpersonation
 
 // ACCESS_MASK bits.
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-const READ_CONTROL: u32 = 0x0002_0000;
-const WRITE_DAC: u32 = 0x0004_0000;
-const STANDARD_RIGHTS_ALL: u32 = 0x001F_0000;
-const GENERIC_MASK: u32 = 0xF000_0000;
 
-// SECURITY_DESCRIPTOR control + ACE/ACL + group attribute bits.
-const DACL_PRESENT: u16 = 0x0004;
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
-const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
-const SE_GROUP_ENABLED: u32 = 0x04;
-const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+// Atributos de grupo e TokenFlags.
+const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x40;
+const TOKEN_WRITE_RESTRICTED: u32 = 0x08;
+const TOKEN_IS_RESTRICTED: u32 = 0x10;
 
 // NTSTATUS.
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
-
-/// Identidade efetiva usada na avaliação da DACL: SID do usuário e os
-/// grupos (SID + atributos). Vale tanto para um objeto token quanto para um
-/// TOKEN_ACCESS_INFORMATION capturado.
-struct Subject {
-    user: Sid,
-    groups: Vec<(Sid, u32)>,
-}
 
 /// Lê um SID do convidado (cabeçalho de 8 bytes + 4 por subautoridade).
 fn read_sid(pointer: u64) -> Sid {
@@ -61,40 +50,18 @@ fn read_sid(pointer: u64) -> Sid {
     guest::read_bytes(pointer, 8 + 4 * count)
 }
 
-/// RtlMapGenericMask: expande os quatro bits genéricos pelo GENERIC_MAPPING
-/// do chamador (Read/Write/Execute/All em 0/4/8/12) e os remove.
-fn map_generic(mut mask: u32, mapping: u64) -> u32 {
-    if mapping != 0 {
-        let mapping = generic_mapping(mapping);
-        if mask & 0x8000_0000 != 0 {
-            mask |= mapping.generic_read.get();
-        }
-        if mask & 0x4000_0000 != 0 {
-            mask |= mapping.generic_write.get();
-        }
-        if mask & 0x2000_0000 != 0 {
-            mask |= mapping.generic_execute.get();
-        }
-        if mask & 0x1000_0000 != 0 {
-            mask |= mapping.generic_all.get();
-        }
-    }
-    mask & !GENERIC_MASK
-}
-
 fn generic_mapping(mapping: u64) -> &'static GenericMapping {
     // SAFETY: PGENERIC_MAPPING do chamador de SeAccessCheck.
     unsafe { GenericMapping::at(mapping) }
 }
 
-/// Conjunto "todo o acesso" para MAXIMUM_ALLOWED: GenericAll do mapeamento
-/// mais os direitos padrão.
-fn all_access(mapping: u64) -> u32 {
-    if mapping != 0 {
-        generic_mapping(mapping).generic_all.get() | STANDARD_RIGHTS_ALL
-    } else {
-        STANDARD_RIGHTS_ALL | 0x1FF
+/// O GENERIC_MAPPING do chamador (Read, Write, Execute, All); nulo é zero.
+fn read_mapping(mapping: u64) -> [u32; 4] {
+    if mapping == 0 {
+        return [0; 4];
     }
+    let mapping = generic_mapping(mapping);
+    [mapping.generic_read.get(), mapping.generic_write.get(), mapping.generic_execute.get(), mapping.generic_all.get()]
 }
 
 fn write_result(granted_out: u64, status_out: u64, granted: u32, status: u32) {
@@ -106,106 +73,51 @@ fn write_result(granted_out: u64, status_out: u64, granted: u32, status: u32) {
     }
 }
 
-/// KernelMode concede o pedido inteiro (ou tudo, com MAXIMUM_ALLOWED), como
-/// o SeAccessCheck real antes de qualquer avaliação de DACL.
+/// KernelMode concede o pedido inteiro (GenericAll com MAXIMUM_ALLOWED) sem
+/// olhar o descritor.
 fn kernel_grant(desired: u32, previous: u32, mapping: u64, granted_out: u64, status_out: u64) -> bool {
-    let granted = if desired & MAXIMUM_ALLOWED != 0 {
-        all_access(mapping) | (desired & !MAXIMUM_ALLOWED) | previous
-    } else {
-        desired | previous
-    };
-    write_result(granted_out, status_out, granted, 0);
+    write_result(granted_out, status_out, access_evaluation::kernel_mode_grant(desired, previous, &read_mapping(mapping)), 0);
     true
 }
 
-/// Avaliação ordenada da DACL do descritor pela identidade `subject`.
-/// `None` = DACL nula (ausente ou ponteiro nulo) → concede tudo; `Some(m)` =
-/// máscara acumulada de concessões (deny acumula à parte, respeitando a
-/// ordem das ACEs, como em `token/access.rs`).
-fn evaluate(descriptor: u64, subject: &Subject) -> Option<u32> {
-    let control = descriptor::control(descriptor);
-    // O dono recebe READ_CONTROL e WRITE_DAC de saída.
-    let owner = descriptor::component(descriptor, control, 0);
-    let mut granted = if owner != 0 && read_sid(owner) == subject.user { READ_CONTROL | WRITE_DAC } else { 0 };
-    if control & DACL_PRESENT == 0 {
-        return None;
-    }
-    let dacl = descriptor::component(descriptor, control, 3);
-    if dacl == 0 {
-        return None;
-    }
-    let mut denied = 0u32;
-    // SAFETY: componente DACL do descritor (PACL alinhada a WORD).
-    let count = unsafe { Acl::at(dacl) }.ace_count.get();
-    let mut cursor = dacl + Acl::SIZE;
-    // A DACL não é revalidada aqui: com um AceSize ímpar a entrada seguinte
-    // fica desalinhada, então os campos são lidos pelo offset do layout.
-    for _ in 0..count {
-        let ace_type = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_type) as u64);
-        let ace_size = guest::read::<u16>(cursor + offset_of!(AceHeader, ace_size) as u64) as u64;
-        if ace_size == 0 {
-            break;
-        }
-        if ace_type == ACCESS_ALLOWED_ACE_TYPE || ace_type == ACCESS_DENIED_ACE_TYPE {
-            let mask = guest::read::<u32>(cursor + offset_of!(AccessAllowedAce, mask) as u64);
-            let ace_sid = read_sid(cursor + offset_of!(AccessAllowedAce, sid_start) as u64);
-            let deny = ace_type == ACCESS_DENIED_ACE_TYPE;
-            let matches = ace_sid == subject.user
-                || subject.groups.iter().any(|(sid, attributes)| {
-                    let attributes = *attributes;
-                    *sid == ace_sid
-                        && ((attributes & SE_GROUP_ENABLED != 0 && attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0)
-                            || (deny && attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0))
-                });
-            if matches {
-                if deny {
-                    denied |= mask & !granted;
-                } else {
-                    granted |= mask & !denied;
-                }
-            }
-        }
-        cursor += ace_size;
-    }
-    Some(granted)
-}
-
-/// Decisão comum de SeAccessCheck/SeAccessCheckFromState depois de resolver
-/// a identidade e já com `desired` mapeado. `subject` ausente (sujeito não
-/// resolvido) nega.
+/// A decisão comum dos exports em UserMode: o descritor do convidado e a
+/// identidade resolvida (`None` nega).
 fn decide(descriptor: u64, subject: Option<Subject>, desired: u32, previous: u32, mapping: u64, granted_out: u64, status_out: u64) -> bool {
     let Some(subject) = subject else {
         write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
         return false;
     };
-    let maximum = desired & MAXIMUM_ALLOWED != 0;
-    let explicit = desired & !MAXIMUM_ALLOWED;
-    match evaluate(descriptor, &subject) {
-        // DACL nula: todos têm acesso total.
-        None => {
-            let granted = if maximum { all_access(mapping) | explicit | previous } else { explicit | previous };
+    let components = query_descriptor::read_descriptor(descriptor);
+    match access_evaluation::access_check(components.as_ref(), &subject, desired, previous, &read_mapping(mapping)) {
+        Ok(granted) => {
             write_result(granted_out, status_out, granted, 0);
             true
         }
-        Some(dacl) => {
-            let accumulated = dacl | previous;
-            if maximum {
-                if accumulated == 0 {
-                    write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
-                    false
-                } else {
-                    write_result(granted_out, status_out, accumulated, 0);
-                    true
-                }
-            } else if explicit & !accumulated != 0 {
-                write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
-                false
-            } else {
-                write_result(granted_out, status_out, explicit | previous, 0);
-                true
-            }
+        Err(status) => {
+            write_result(granted_out, status_out, 0, status);
+            false
         }
     }
+}
+
+/// O token efetivo de um SECURITY_SUBJECT_CONTEXT: o cliente (que precisa de
+/// SecurityImpersonation ou mais) ou o primário.
+fn effective_token(subject_context: u64) -> Result<u64, u32> {
+    // SAFETY: PSECURITY_SUBJECT_CONTEXT capturado pelo chamador.
+    let context = unsafe { SecuritySubjectContext::at(subject_context) };
+    let client = context.client_token.get();
+    if client != 0 {
+        if context.impersonation_level.get().0 < SECURITY_IMPERSONATION.0 {
+            return Err(STATUS_BAD_IMPERSONATION_LEVEL);
+        }
+        return Ok(client);
+    }
+    Ok(context.primary_token.get())
+}
+
+/// A identidade de um token do OpenNT pelo ponteiro.
+pub fn subject_of_token(token: u64) -> Option<Subject> {
+    tokens::with(token, Subject::from_token)
 }
 
 /// SeAccessCheck(Sd, Subj, SubjLocked, Desired, PrevGranted, Privileges**,
@@ -213,8 +125,6 @@ fn decide(descriptor: u64, subject: Option<Subject>, desired: u32, previous: u32
 /// Devolve o BOOLEAN do resultado.
 #[allow(clippy::too_many_arguments)]
 pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previous: u32, privileges_out: u64, mapping: u64, mode: u32, granted_out: u64, status_out: u64) -> bool {
-    let mut desired = desired;
-    // Sem caminho de concessão por privilégio: nenhum privilégio foi usado.
     if privileges_out != 0 {
         out::<u64>(privileges_out).set(0);
     }
@@ -225,62 +135,77 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
         write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
         return false;
     }
-    if desired & GENERIC_MASK != 0 {
-        desired = map_generic(desired, mapping);
-    }
-    // Token efetivo: ClientToken ao personificar (>= Impersonation), senão
-    // PrimaryToken. Personificação fraca com ClientToken nega.
-    // SAFETY: PSECURITY_SUBJECT_CONTEXT capturado pelo chamador.
-    let context = unsafe { SecuritySubjectContext::at(subject_context) };
-    let client = context.client_token.get();
-    let token = if client != 0 {
-        if context.impersonation_level.get().0 < SECURITY_IMPERSONATION.0 {
-            write_result(granted_out, status_out, 0, STATUS_BAD_IMPERSONATION_LEVEL);
+    let token = match effective_token(subject_context) {
+        Ok(token) => token,
+        Err(status) => {
+            write_result(granted_out, status_out, 0, status);
             return false;
         }
-        client
-    } else {
-        context.primary_token.get()
     };
-    let subject = tokens::with(token, |token| Subject {
-        user: token.user.clone(),
-        groups: token.groups.iter().map(|group| (group.sid.clone(), group.attributes)).collect(),
-    });
-    decide(descriptor, subject, desired, previous, mapping, granted_out, status_out)
+    decide(descriptor, subject_of_token(token), desired, previous, mapping, granted_out, status_out)
 }
 
-/// Lê um TOKEN_ACCESS_INFORMATION capturado num `Subject`. SidHash@0 →
-/// (SidCount@0, SidAttr@8); SID_AND_ATTRIBUTES = (Sid@0, Attributes@8),
-/// stride 0x10; o primeiro SID é o usuário, os demais são grupos.
+/// Os SIDs de um SID_AND_ATTRIBUTES_HASH (SidAttr com SidCount entradas).
+fn hash_entries(hash: u64) -> Vec<(Sid, u32)> {
+    if hash == 0 {
+        return Vec::new();
+    }
+    // SAFETY: PSID_AND_ATTRIBUTES_HASH do mesmo bloco do chamador.
+    let hash = unsafe { SidAndAttributesHash::at(hash) };
+    let (count, array) = (hash.sid_count.get(), hash.sid_attr.get());
+    if array == 0 || count == 0 {
+        return Vec::new();
+    }
+    // SAFETY: SidAttr tem SidCount entradas.
+    unsafe { SidAndAttributes::array_at(array, count as usize) }.iter().filter(|entry| entry.sid.get() != 0).map(|entry| (read_sid(entry.sid.get()), entry.attributes.get())).collect()
+}
+
+/// O SID de integridade de uma lista de usuário e grupos: o primeiro com
+/// SE_GROUP_INTEGRITY_ENABLED (o IntegrityLevelIndex do token).
+fn integrity_of(sids: &[(Sid, u32)]) -> Sid {
+    sids.iter().find(|(_, attributes)| attributes & SE_GROUP_INTEGRITY_ENABLED != 0).map(|(sid, _)| sid.clone()).unwrap_or_default()
+}
+
+/// Lê um TOKEN_ACCESS_INFORMATION capturado num `Subject`: o primeiro SID
+/// do SidHash é o usuário e os demais os grupos; os SIDs restritos, os
+/// privilégios habilitados, o MandatoryPolicy, as flags de restrição, o
+/// pacote e as capacidades.
 fn subject_from_access_information(information: u64) -> Option<Subject> {
     if information == 0 {
         return None;
     }
     // SAFETY: PTOKEN_ACCESS_INFORMATION capturado pelo chamador.
-    let hash = unsafe { TokenAccessInformation::at(information) }.sid_hash.get();
-    if hash == 0 {
-        return None;
-    }
-    // SAFETY: SidHash aponta para o SID_AND_ATTRIBUTES_HASH do mesmo bloco.
-    let hash = unsafe { SidAndAttributesHash::at(hash) };
-    let count = hash.sid_count.get();
-    let array = hash.sid_attr.get();
-    if array == 0 || count == 0 {
-        return None;
-    }
-    let mut sids: Vec<(Sid, u32)> = Vec::new();
-    // SAFETY: SidAttr tem SidCount entradas.
-    for entry in unsafe { SidAndAttributes::array_at(array, count as usize) } {
-        let sid = entry.sid.get();
-        if sid != 0 {
-            sids.push((read_sid(sid), entry.attributes.get()));
-        }
-    }
+    let information = unsafe { TokenAccessInformation::at(information) };
+    let mut sids = hash_entries(information.sid_hash.get());
     if sids.is_empty() {
         return None;
     }
-    let user = sids.remove(0).0;
-    Some(Subject { user, groups: sids })
+    let integrity = integrity_of(&sids);
+    let (user, user_attributes) = sids.remove(0);
+    let flags = information.flags.get();
+    let mut privileges = Vec::new();
+    let set = information.privileges.get();
+    if set != 0 {
+        // SAFETY: Privileges aponta para o TOKEN_PRIVILEGES do mesmo bloco.
+        let header = unsafe { TokenPrivileges::at(set) };
+        // SAFETY: PrivilegeCount entradas LUID_AND_ATTRIBUTES seguem o contador.
+        let entries = unsafe { LuidAndAttributes::array_at(header.privileges[0].address(), header.privilege_count.get() as usize) };
+        privileges = entries.iter().filter(|entry| entry.attributes.get() & 2 != 0).map(|entry| entry.luid.low_part.get() as u64).collect();
+    }
+    let package = information.package_sid.get();
+    Some(Subject {
+        user,
+        user_attributes,
+        groups: sids,
+        restricted_sids: if flags & TOKEN_IS_RESTRICTED != 0 { hash_entries(information.restricted_sid_hash.get()) } else { Vec::new() },
+        write_restricted: flags & TOKEN_WRITE_RESTRICTED != 0,
+        privileges,
+        integrity,
+        mandatory_policy: information.mandatory_policy.policy.get(),
+        package: (package != 0).then(|| read_sid(package)),
+        capabilities: hash_entries(information.capabilities_hash.get()),
+        less_privileged_app_container: false,
+    })
 }
 
 /// SeAccessCheckFromState(Sd, PrimaryTokenInfo, ClientTokenInfo, Desired,
@@ -288,7 +213,6 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
 /// mesmo algoritmo, com a identidade vinda de um TOKEN_ACCESS_INFORMATION.
 #[allow(clippy::too_many_arguments)]
 pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: u64, desired: u32, previous: u32, privileges_out: u64, mapping: u64, mode: u32, granted_out: u64, status_out: u64) -> bool {
-    let mut desired = desired;
     if privileges_out != 0 {
         out::<u64>(privileges_out).set(0);
     }
@@ -298,9 +222,6 @@ pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: 
     if descriptor == 0 {
         write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
         return false;
-    }
-    if desired & GENERIC_MASK != 0 {
-        desired = map_generic(desired, mapping);
     }
     // ImpersonationLevel do TOKEN_ACCESS_INFORMATION do cliente.
     let information = if client_info != 0 {
@@ -313,8 +234,7 @@ pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: 
     } else {
         primary_info
     };
-    let subject = subject_from_access_information(information);
-    decide(descriptor, subject, desired, previous, mapping, granted_out, status_out)
+    decide(descriptor, subject_from_access_information(information), desired, previous, mapping, granted_out, status_out)
 }
 
 // ---- Token montado de um TOKEN_ACCESS_INFORMATION e o access check "Ex" -------
@@ -326,7 +246,6 @@ pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: 
 // campos que o SepTokenFromAccessInformation preenche.
 
 const STATUS_BUFFER_TOO_SMALL_TOKEN: u32 = 0xC000_0023;
-const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x40;
 
 /// RtlSidHashInitialize(SidAttr, Count, Hash): zera o hash; com SidAttr e
 /// Count, grava ambos e marca, para os primeiros 64 SIDs, o bit i em
@@ -441,32 +360,49 @@ pub fn token_from_access_information_checked(information: u64, token: u64, lengt
 }
 
 /// Identidade de um TOKEN: o token real pela tabela de tokens; um token
-/// montado por SeTokenFromAccessInformation pelos campos UserAndGroups
-/// (o primeiro SID é o usuário).
+/// montado por SeTokenFromAccessInformation pelos campos do `_TOKEN` (o
+/// primeiro SID de UserAndGroups é o usuário, o IntegrityLevelIndex, o
+/// bitmap Enabled dos privilégios, as flags de restrição, o pacote e as
+/// capacidades).
 fn subject_from_token(token: u64) -> Option<Subject> {
     if token == 0 {
         return None;
     }
-    if let Some(subject) = tokens::with(token, |token| Subject {
-        user: token.user.clone(),
-        groups: token.groups.iter().map(|group| (group.sid.clone(), group.attributes)).collect(),
-    }) {
+    if let Some(subject) = subject_of_token(token) {
         return Some(subject);
     }
     // SAFETY: token montado no buffer do chamador (layout `_TOKEN`).
     let native = unsafe { crate::ntos::inc::types::Token::at(token) };
-    let (count, array) = (native.user_and_group_count.get(), native.user_and_groups.get());
-    if count == 0 || array == 0 {
-        return None;
-    }
-    // SAFETY: UserAndGroups tem UserAndGroupCount entradas.
-    let entries = unsafe { SidAndAttributes::array_at(array, count as usize) };
-    let mut sids: Vec<(Sid, u32)> = entries.iter().filter(|entry| entry.sid.get() != 0).map(|entry| (read_sid(entry.sid.get()), entry.attributes.get())).collect();
+    let read_array = |array: u64, count: u32| -> Vec<(Sid, u32)> {
+        if array == 0 || count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: o array SID_AND_ATTRIBUTES do `_TOKEN` com `count` entradas.
+        unsafe { SidAndAttributes::array_at(array, count as usize) }.iter().filter(|entry| entry.sid.get() != 0).map(|entry| (read_sid(entry.sid.get()), entry.attributes.get())).collect()
+    };
+    let mut sids = read_array(native.user_and_groups.get(), native.user_and_group_count.get());
     if sids.is_empty() {
         return None;
     }
-    let user = sids.remove(0).0;
-    Some(Subject { user, groups: sids })
+    let index = native.integrity_level_index.get();
+    let integrity = sids.get(index as usize).map(|(sid, _)| sid.clone()).unwrap_or_default();
+    let (user, user_attributes) = sids.remove(0);
+    let flags = native.token_flags.get();
+    let enabled = native.privileges.enabled.get();
+    let package = native.package.get();
+    Some(Subject {
+        user,
+        user_attributes,
+        groups: sids,
+        restricted_sids: if flags & TOKEN_IS_RESTRICTED != 0 { read_array(native.restricted_sids.get(), native.restricted_sid_count.get()) } else { Vec::new() },
+        write_restricted: flags & TOKEN_WRITE_RESTRICTED != 0,
+        privileges: (0..64u64).filter(|bit| enabled >> bit & 1 != 0).collect(),
+        integrity,
+        mandatory_policy: native.mandatory_policy.get(),
+        package: (package != 0).then(|| read_sid(package)),
+        capabilities: read_array(native.capabilities.get(), native.capability_count.get()),
+        less_privileged_app_container: false,
+    })
 }
 
 /// Nível de personificação de um TOKEN (tabela de tokens ou campo nativo).
@@ -485,7 +421,6 @@ fn token_impersonation_level(token: u64) -> i32 {
 /// `access_check`, com a identidade lida de cada TOKEN.
 #[allow(clippy::too_many_arguments)]
 pub fn access_check_from_state_ex(descriptor: u64, primary_token: u64, client_token: u64, desired: u32, previous: u32, privileges_out: u64, mapping: u64, mode: u32, granted_out: u64, status_out: u64) -> bool {
-    let mut desired = desired;
     if privileges_out != 0 {
         out::<u64>(privileges_out).set(0);
     }
@@ -495,9 +430,6 @@ pub fn access_check_from_state_ex(descriptor: u64, primary_token: u64, client_to
     if descriptor == 0 {
         write_result(granted_out, status_out, 0, STATUS_ACCESS_DENIED);
         return false;
-    }
-    if desired & GENERIC_MASK != 0 {
-        desired = map_generic(desired, mapping);
     }
     let token = if client_token != 0 {
         if token_impersonation_level(client_token) < SECURITY_IMPERSONATION.0 {

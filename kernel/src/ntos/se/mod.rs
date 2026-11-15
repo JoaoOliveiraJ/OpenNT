@@ -35,6 +35,7 @@ pub mod subject_context;
 pub mod audit;
 pub mod privilege;
 pub mod access_check;
+pub mod access_evaluation;
 pub mod assign;
 pub mod exports;
 pub mod client_security;

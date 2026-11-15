@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::model::{equal_sids, sid, Ace, SecurityPolicy};
+use super::model::{sid, Ace, SecurityPolicy};
 use crate::ntos::se::token::tokens;
 use crate::ntos::ob::object_manager::NodeId;
 use crate::rtl::SpinLock;
@@ -48,52 +48,22 @@ pub fn namespace(node: NodeId, is_directory: bool) -> SecurityPolicy {
     }
 }
 
+/// O descritor novo de um nó (o do corpo do diretório ou link trocado).
+pub fn replace(node: NodeId, policy: SecurityPolicy) {
+    POLICIES.lock().insert(node, policy);
+}
+
 /// O nó foi recolhido: a política deixa de existir.
 pub fn forget(node: NodeId) {
     POLICIES.lock().remove(&node);
 }
 
-/// Expande direitos genéricos, reúne as concessões aplicáveis e limita
-/// escritas pela integridade do token. `Ok(máscara)` ou `Err(NTSTATUS)`.
+/// O acesso de `token` a um diretório do namespace pelo SeAccessCheck
+/// (`se/access_evaluation.rs`), com o mapeamento do tipo Directory.
+/// `Ok(máscara)` ou `Err(NTSTATUS)`.
 pub fn access(policy: &SecurityPolicy, token: u64, requested: u32) -> Result<u32, u32> {
-    let mut mask = requested;
-    if mask & 0x8000_0000 != 0 {
-        mask |= 0x20001;
-    }
-    if mask & 0x4000_0000 != 0 {
-        mask |= 0x2000C;
-    }
-    if mask & 0x2000_0000 != 0 {
-        mask |= 0x20002;
-    }
-    if mask & 0x1000_0000 != 0 {
-        mask |= 0xF000F;
-    }
-    mask &= 0x0FFF_FFFF;
-    let Some((user, groups, integrity)) = tokens::with(token, |token| (token.user.clone(), token.groups.clone(), token.integrity.clone())) else {
-        return Err(0xC000_0022);
-    };
-    // O dono já dispõe de READ_CONTROL e WRITE_DAC; as ACEs acrescentam o resto.
-    let mut allowed = if equal_sids(&policy.owner, &user) { 0x60000 } else { 0 };
-    for ace in policy.dacl.iter().flatten() {
-        let Some(ace_sid) = &ace.sid else { continue };
-        let member = equal_sids(ace_sid, &user) || groups.iter().any(|group| group.attributes & 4 != 0 && group.attributes & 0x10 == 0 && equal_sids(&group.sid, ace_sid));
-        if member {
-            allowed |= ace.mask;
-        }
-    }
-    // A primeira subautoridade do SID de integridade contém o nível.
-    let level = if integrity.len() >= 12 { u32::from_le_bytes([integrity[8], integrity[9], integrity[10], integrity[11]]) } else { 0x2000 };
-    if level < policy.integrity.unwrap_or(0x2000) {
-        allowed &= !0xD000C;
-    }
-    if mask & 0x0200_0000 != 0 {
-        mask = (mask & !0x0200_0000) | allowed;
-    }
-    if mask & !allowed != 0 {
-        return Err(0xC000_0022);
-    }
-    Ok(mask)
+    let Some(subject) = tokens::get(token) else { return Err(0xC000_0022) };
+    crate::ntos::ob::object_access::check_token(policy, &subject, requested, &crate::ntos::ob::object_types::directory_type())
 }
 
 /// Cabeçalho ACL e ACEs do tipo pedido, cada uma com máscara e SID.

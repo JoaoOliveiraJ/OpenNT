@@ -4,7 +4,9 @@
 
 use super::object_types::ObjectType;
 use crate::ntos::ps::process;
+use crate::ntos::se::access_evaluation::{self, Subject};
 use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
+use crate::ntos::se::policy_descriptor::{self, OwnedDescriptor};
 use crate::ntos::se::token::{thread as thread_tokens, tokens};
 
 /// Dono, grupo e DACL padrão do token; sem token, a identidade de sistema.
@@ -62,72 +64,28 @@ pub fn check(policy: &SecurityPolicy, token: Option<u64>, requested: u32, object
     check_token(policy, &token, requested, object_type)
 }
 
+/// O descritor da política de um objeto com as ACEs mapeadas pelo tipo
+/// (como o SeAssignSecurity as grava): os componentes que a avaliação lê.
+pub fn descriptor_of(policy: &SecurityPolicy, object_type: &ObjectType) -> Result<OwnedDescriptor, u32> {
+    let mut descriptor = policy_descriptor::capture(policy).map_err(|_| 0xC000_00BBu32)?;
+    if let Some(dacl) = descriptor.dacl.as_mut() {
+        access_evaluation::map_acl_generics(dacl, &object_type.mapping);
+    }
+    Ok(descriptor)
+}
+
 /// Avaliação em modo usuário de um sujeito já montado (o token real ou um
-/// derivado: sem usuário, com SIDs restritos ou com o pacote do AppContainer).
+/// derivado: sem usuário, com SIDs restritos ou com o pacote do AppContainer)
+/// pelo SeAccessCheck (`se/access_evaluation.rs`): o pedido mapeado pelo
+/// tipo, os direitos fora do tipo recusados e o MAXIMUM_ALLOWED limitado aos
+/// direitos válidos do tipo.
 pub fn check_token(policy: &SecurityPolicy, token: &tokens::Token, requested: u32, object_type: &ObjectType) -> AccessResult {
     let mask = map_generic_access(requested, object_type);
-    let maximum_allowed = mask & 0x0200_0000 != 0;
     let explicit = mask & !0x0200_0000;
     if explicit & !(object_type.valid_access | 0x0100_0000) != 0 {
         return Err(0xC000_0022);
     }
-    let has_privilege = |id: u64| token.privileges.iter().any(|privilege| privilege.id == id && privilege.attributes & 2 != 0);
-    if explicit & 0x0100_0000 != 0 && !has_privilege(8) {
-        return Err(0xC000_0061);
-    }
-    // O dono recebe READ_CONTROL e WRITE_DAC; as entradas seguem a ordem da DACL.
-    let mut allowed = if policy.owner == token.user { 0x60000 } else { 0 };
-    let mut denied = 0u32;
-    if has_privilege(9) {
-        allowed |= 0x80000;
-    }
-    match &policy.dacl {
-        None => allowed |= object_type.valid_access,
-        Some(dacl) => {
-            for entry in dacl {
-                if entry.flags & 8 != 0 {
-                    continue;
-                }
-                let Some(entry_sid) = &entry.sid else {
-                    if maximum_allowed || explicit & !allowed != 0 {
-                        return Err(0xC000_00BB);
-                    }
-                    continue;
-                };
-                let matches = *entry_sid == token.user
-                    || token.groups.iter().any(|group| {
-                        group.sid == *entry_sid
-                            && ((group.attributes & 4 != 0 && group.attributes & 16 == 0) || (entry.deny && group.attributes & 16 != 0))
-                    });
-                if !matches {
-                    continue;
-                }
-                let rights = map_generic_access(entry.mask, object_type) & object_type.valid_access;
-                if entry.deny {
-                    denied |= rights & !allowed;
-                } else {
-                    allowed |= rights & !denied;
-                }
-            }
-        }
-    }
-    allowed &= object_type.valid_access;
-    // Integridade abaixo do nível do objeto restringe escrita.
-    if let Some(required) = policy.integrity {
-        let level = if token.integrity.len() >= 12 {
-            u32::from_le_bytes([token.integrity[8], token.integrity[9], token.integrity[10], token.integrity[11]])
-        } else {
-            0x2000
-        };
-        if level < required {
-            allowed &= !(0xD0000 | (object_type.mapping[1] & 0xFFFF));
-        }
-    }
-    if explicit & 0x0100_0000 != 0 {
-        allowed |= 0x0100_0000;
-    }
-    if explicit & !allowed != 0 {
-        return Err(0xC000_0022);
-    }
-    Ok(explicit | if maximum_allowed { allowed } else { 0 })
+    let descriptor = descriptor_of(policy, object_type)?;
+    let granted = access_evaluation::access_check(Some(&descriptor), &Subject::from_token(token), mask, 0, &object_type.mapping)?;
+    Ok(if mask & 0x0200_0000 != 0 { granted & (object_type.valid_access | 0x0100_0000) } else { granted })
 }
