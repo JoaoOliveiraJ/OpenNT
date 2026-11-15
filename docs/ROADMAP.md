@@ -122,7 +122,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl |
-| win32k.sys, win32kbase.sys e win32kfull.sys | Planejado | — |
+| win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k.sys real carregado pelo smss.exe |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | Driver dxgkrnl.sys real, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
 | ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | Driver ntfs.sys real |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | Driver ndis.sys real (com o netio.sys), Driver afd.sys real (depois do NDIS) |
