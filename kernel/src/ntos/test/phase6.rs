@@ -1751,6 +1751,40 @@ fn ntoskrnl_ex_group(assert: Assert) {
     assert(pool != 0 && call_export("ExFreePoolWithTag", &[pool, tag]) == Some(0), "ex: ExAllocatePoolWithTag/ExFreePoolWithTag");
     let modern = call_export("ExAllocatePool2", &[0x40, 32, tag]).unwrap_or(0);
     assert(modern != 0 && guest::read64(modern) == 0 && call_export("ExFreePool2", &[modern, tag]) == Some(0), "ex: ExAllocatePool2 zerado e ExFreePool2");
+    // POOL_TYPE decodificado bit a bit como o ExAllocateHeapPool 19041:
+    // PagedPool|POOL_NX_ALLOCATION (0x201, o DpiFdoStartAdapterThread),
+    // MustSucceed/RAISE/QUOTA ignorados, 0x44 apaga o CacheAligned e a tag
+    // nula vira 'Bad0'.
+    {
+        use crate::ntos::ex::pool_allocation::{decode_pool_type, DecodedPoolType};
+        use crate::ntos::mm::kernel_pool;
+        let decoded = |paged, session, nx, cache_aligned| DecodedPoolType { paged, session, nx, cache_aligned };
+        let table = [
+            (0x0, decoded(false, false, false, false)),
+            (0x1, decoded(true, false, false, false)),
+            (0x2, decoded(false, false, false, false)),
+            (0x3, decoded(true, false, false, false)),
+            (0x6, decoded(false, false, false, true)),
+            (0x7, decoded(true, false, false, true)),
+            (0x1A, decoded(false, false, false, false)),
+            (0x21, decoded(true, true, false, false)),
+            (0x44, decoded(false, false, false, false)),
+            (0x201, decoded(true, false, true, false)),
+            (0x204, decoded(false, false, true, true)),
+            (0x220, decoded(false, true, true, false)),
+            (0x611, decoded(true, false, true, false)),
+        ];
+        assert(table.iter().all(|&(pool_type, expected)| decode_pool_type(pool_type) == expected), "ex: POOL_TYPE decodificado pelos bits como o ExAllocateHeapPool");
+        let paged_nx = call_export("ExAllocatePoolWithTag", &[0x201, 0x40, tag]).unwrap_or(0);
+        let paged_nx_info = kernel_pool::info(paged_nx);
+        assert(paged_nx != 0 && paged_nx_info.as_ref().is_some_and(|info| info.paged && info.nx) && call_export("ExFreePoolWithTag", &[paged_nx, tag]) == Some(0), "ex: PagedPool|POOL_NX_ALLOCATION sai do pool paginado");
+        let must_succeed = call_export("ExAllocatePoolWithTag", &[0x16, 0x40, tag]).unwrap_or(0);
+        let must_succeed_info = kernel_pool::info(must_succeed);
+        assert(must_succeed != 0 && must_succeed_info.as_ref().is_some_and(|info| !info.paged && !info.nx && must_succeed % 64 == 0) && call_export("ExFreePoolWithTag", &[must_succeed, tag]) == Some(0), "ex: MustSucceed|CacheAligned|RAISE vira o não paginado alinhado");
+        let untagged = call_export("ExAllocatePoolWithTag", &[0x200, 0x40, 0]).unwrap_or(0);
+        let untagged_info = kernel_pool::info(untagged);
+        assert(untagged != 0 && untagged_info.as_ref().is_some_and(|info| info.tag == 0x3064_6142) && call_export("ExFreePool", &[untagged]) == Some(0), "ex: tag nula vira 'Bad0'");
+    }
     // Fast mutex: dono, APC_LEVEL e liberação.
     let block = guest::alloc_bytes(0x200);
     let mutex = block;

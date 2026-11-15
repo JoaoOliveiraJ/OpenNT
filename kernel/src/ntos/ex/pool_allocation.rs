@@ -37,33 +37,53 @@ fn reject(message: &str, pool_type: u32, bytes: u64, tag: u32) -> ! {
     bugcheck::bug_check_ex(0xC2, 0x99, pool_type as u64, bytes, tag as u64)
 }
 
+/// Tag que o ExAllocateHeapPool põe no lugar de uma tag nula ('Bad0').
+const BAD_TAG: u32 = 0x3064_6142;
+
+/// Como o ExAllocateHeapPool do ntoskrnl 19041 (rva 0x2bc8a0) lê o
+/// POOL_TYPE: não há lista de tipos válidos, cada bit decide uma coisa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedPoolType {
+    /// Bit 0: pool paginado.
+    pub paged: bool,
+    /// Bit 5 (SessionPoolMask): pool de sessão (o paginado de sessão é o
+    /// heap da sessão; o não paginado leva a contabilidade da sessão).
+    pub session: bool,
+    /// Bit 9 (POOL_NX_ALLOCATION): o não paginado sai do heap NX.
+    pub nx: bool,
+    /// Bit 2 (CacheAligned), que cai quando o bit 6 também está ligado.
+    pub cache_aligned: bool,
+}
+
+/// Decodifica o tipo: `(t & 0x44) == 0x44` apaga o CacheAligned; MustSucceed
+/// (2), POOL_QUOTA_FAIL_INSTEAD_OF_RAISE (8), RAISE (0x10), frio (0x100) e
+/// zero (0x400) não escolhem pool (o cabeçalho guarda `t & 0x6D`). O tipo
+/// 3 (DontUseThisType) é, pelos bits, paginado; o 6 e o 7, os alinhados.
+pub fn decode_pool_type(pool_type: u32) -> DecodedPoolType {
+    let pool_type = if pool_type & 0x44 == 0x44 { pool_type & !4 } else { pool_type };
+    DecodedPoolType { paged: pool_type & 1 != 0, session: pool_type & session_pool::SESSION_POOL_MASK != 0, nx: pool_type & 0x200 != 0, cache_aligned: pool_type & 4 != 0 }
+}
+
 /// Valida tipo, tag, prioridade e IRQL e pede memória ao pool. `layout`
 /// (prefixo, sufixo, alinhamento) substitui as opções derivadas do tipo.
 pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, layout: Option<(u64, u64, u64)>) -> u64 {
-    let base = pool_type & !(RAISE_ON_ALLOCATION_FAILURE | COLD_ALLOCATION | ZERO_ALLOCATION);
-    // Tipos reservados e MustSucceed não são pools comuns; os de sessão são
-    // os comuns com SessionPoolMask. O bit NX (0x200) também vale num tipo
-    // paginado (513, 517: o win32k pede PagedPoolSession | 0x200), que o
-    // ExAllocateHeapPool trata como sem execução, o que o paginado já é.
-    let session_type = session_pool::is_session_type(base);
-    if ![0, 1, 4, 5, 512, 513, 516, 517].contains(&(base & !session_pool::SESSION_POOL_MASK)) {
-        reject("unsupported or reserved POOL_TYPE", pool_type, bytes, tag);
-    }
-    if session_type && session::current() == 0 {
+    let decoded = decode_pool_type(pool_type);
+    // O heap da sessão é o do processo corrente: fora de uma sessão o NT
+    // acharia um ponteiro nulo; aqui é a falha de pool do sistema.
+    if decoded.session && session::current() == 0 {
         reject("session pool requested outside a session", pool_type, bytes, tag);
     }
-    if tag == 0 {
-        reject("pool tag must be nonzero", pool_type, bytes, tag);
-    }
+    // Uma tag nula (sem o bit de protegida) vira 'Bad0'.
+    let tag = if tag & 0x7FFF_FFFF == 0 { BAD_TAG } else { tag };
     if ![0, 8, 9, 16, 24, 25, 32, 40, 41].contains(&priority) {
         reject("invalid pool priority", pool_type, bytes, tag);
     }
-    let pageable = base & 1 != 0;
+    let pageable = decoded.paged;
     if irql::get_irql() > if pageable { 1 } else { 2 } {
         reject("pool allocation at invalid IRQL", pool_type, bytes, tag);
     }
-    let (prefix_bytes, suffix_bytes, alignment) = layout.unwrap_or((0, 0, if base & 4 != 0 { 64 } else { 16 }));
-    if session_pool::is_paged_session_type(base) {
+    let (prefix_bytes, suffix_bytes, alignment) = layout.unwrap_or((0, 0, if decoded.cache_aligned { 64 } else { 16 }));
+    if decoded.session && decoded.paged {
         return match session_pool::allocate_paged(bytes, tag, alignment, pool_type & ZERO_ALLOCATION != 0) {
             Some(Ok(pointer)) => pointer,
             Some(Err(error)) => {
@@ -75,7 +95,7 @@ pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, lay
     }
     let options = AllocateOptions {
         paged: pageable,
-        nx: pageable || base & 512 != 0,
+        nx: pageable || decoded.nx,
         alignment,
         tag,
         priority,
@@ -86,7 +106,7 @@ pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, lay
     };
     match kernel_pool::allocate(bytes, options) {
         Ok(pointer) => {
-            if session_type && pointer != 0 && !session_pool::track_nonpaged(pointer, bytes, tag) {
+            if decoded.session && pointer != 0 && !session_pool::track_nonpaged(pointer, bytes, tag) {
                 reject("session pool requested outside a session", pool_type, bytes, tag);
             }
             pointer
@@ -115,11 +135,12 @@ const POOL_FLAG_CACHE_ALIGNED: u64 = 0x8;
 const POOL_FLAG_RAISE_ON_FAILURE: u64 = 0x20;
 const POOL_FLAG_NON_PAGED_EXECUTE: u64 = 0x80;
 
-/// O tipo (sem os modificadores de RAISE, frio e zero) é de pool não
-/// paginado executável: NonPagedPool/NonPagedPoolExecute (0) ou
-/// NonPagedPoolCacheAligned (4).
+/// O tipo é de pool não paginado executável (sem o bit de paginado nem o
+/// POOL_NX_ALLOCATION): NonPagedPool/NonPagedPoolExecute (0),
+/// NonPagedPoolCacheAligned (4) e os mesmos com MustSucceed ou sessão.
 pub fn executable_pool_type(pool_type: u32) -> bool {
-    matches!(pool_type & !(RAISE_ON_ALLOCATION_FAILURE | COLD_ALLOCATION | ZERO_ALLOCATION), 0 | 4)
+    let decoded = decode_pool_type(pool_type);
+    !decoded.paged && !decoded.nx
 }
 
 /// ExAllocatePool2(Flags, NumberOfBytes, Tag). Com POOL_FLAG_NON_PAGED_EXECUTE
