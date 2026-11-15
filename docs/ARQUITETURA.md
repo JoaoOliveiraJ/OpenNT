@@ -1079,6 +1079,24 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Um
   IoReportDetectedDevice com a árvore montada vira um devnode
   `ROOT\<serviço>\NNNN` já iniciado.
+- `device_api.rs`: o driver embutido `\Driver\DeviceApi` que o
+  IopInitializePlugPlayServices cria em todo boot (PiDaInit, pelo
+  IoCreateDriver): o PiDaDriverEntry põe o PiDaDispatch em CREATE, CLOSE,
+  DEVICE_CONTROL e CLEANUP, uma FAST_IO_DISPATCH de 0xE0 bytes com o
+  FastIoDeviceControl e cria o `\Device\DeviceApi`. O nome aberto abaixo
+  dele escolhe o tratador da IrpHandlingTable (`\Dev\Query`,
+  `\Dev\NoState`, `\CMApi`, `\SwDevice`, `\CMNotify`), guardado no
+  FsContext; as rotinas do driver são stubs de `hal/amd64/routine_stubs.rs`.
+- `cm_api.rs`: o `\CMApi` do cfgmgr32.dll (PiCMDispatch e
+  PiCMHandleIoctl). Os IOCTLs (CTL_CODE(0x47, 0x200 + n, METHOD_NEITHER))
+  só chegam pelo Fast I/O, com o pedido de objeto capturado
+  (PiCMCaptureObjectInputData) e o resultado gravado no buffer de saída
+  ({tamanho, status, ...}): GetDeviceStatus (DN_* e problema pelo nó),
+  ValidateDeviceInstance (CM_Locate_DevNode), GetDeviceDepth e
+  GetRelatedDeviceInstance sobre a árvore de `devnode.rs`; os demais
+  códigos conhecidos ainda respondem STATUS_NOT_IMPLEMENTED.
+- `cm_notify.rs`: o `\CMNotify` (PiUEventDispatch), que abre e fecha; os
+  IOCTLs de registro de notificações ainda não têm suporte.
 
 Os PDOs do barramento PCI respondem como o pci.sys (`drivers/bus/pci_pnp.rs`
 e `pci_interface.rs`): ids, capacidades, requisitos dos BARs (sem os do canal
@@ -1951,12 +1969,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sai quando o DriverEntry volta STATUS_SUCCESS com a tabela 1 do
   KeServiceDescriptorTableShadow e os callouts no lugar. Com
   `--trace-driver-api`, o DriverEntry do driver de sessão imprime cada
-  export que chama. O teste é o [[teste]] `win32k`. Depois do NtGdiInit o
-  user32 inicializa no csrss, mas o cfgmgr32.dll, que o winsrvext importa,
-  recusa a carga (CMApiEntry) sem o `\Device\DeviceApi\CMApi`, a interface
-  de dispositivos do PnP do ntoskrnl (PiCMHandleIoctl), que o OpenNT ainda
-  não cria; o winsrv volta STATUS_NOT_IMPLEMENTED antes do NtUserInitialize
-  e o csrss sai.
+  export que chama, e depois do `SMSS_CSRSS_OK` todos os exports são
+  impressos. O teste é o [[teste]] `win32k`. Depois do NtGdiInit o user32
+  inicializa no csrss e o cfgmgr32.dll, que o winsrvext importa, abre o
+  `\Device\DeviceApi\CMApi` no CMApiEntry (`io/pnp/device_api.rs`); o
+  csrss usa o NtNotifyChangeKey (`cm/notify.rs`) e o NtQueryLicenseValue
+  (`ex/license/values.rs::query_user`) de modo usuário, e o winsrvext
+  chama o NtUserInitialize. A sessão do dxgkrnl
+  (DpiSessionCreateCallback) espera o primeiro adaptador de vídeo
+  iniciado, como no Windows: sem `--display=basic` o csrss fica ali. Com
+  `--display=basic` o vídeo de boot do carregador
+  (`bgk/graphics_information.rs`, o modo VBE pelo BIOS emulado) dá ao
+  DxgkDdiStartDevice do BasicDisplay o framebuffer, o adaptador inicia
+  (`ADAPTER_STARTED`, observado na interface de chegada de dispositivo de
+  vídeo em `drivers/video/display_stack.rs`) e o InitVideo do win32k
+  enumera o `\Device\Video0`, mas ainda volta sem configuração de exibição
+  e o win32k para com VIDEO_DRIVER_INIT_FAILURE (0xB4).
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
@@ -2164,7 +2192,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1`),
   `WIN32K_LOADED` (no mesmo boot: o win32k.sys real carregado pelo smss,
   com a tabela 1 e os callouts;
-  `cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"`);
+  `cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"`),
+  `ADAPTER_STARTED` (com `--initial-process=smss --display=basic`: a sessão
+  do win32k faz o dxgkrnl iniciar o adaptador do BasicDisplay, que
+  habilita a interface de chegada de dispositivo de vídeo;
+  `cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss --display=basic --build-dir=build/win32k-display --smp=1 --expect=SMSS_CSRSS_OK --expect=ADAPTER_STARTED`)
+  e `USER_INITIALIZED` (o NtUserInitialize do csrss volta com sucesso,
+  `initial_process::win32k_service_returned`; ainda não sai: o InitVideo
+  do win32k para com 0xB4);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx). O `test-boot` procura falhas desde o boot até
   a última saída esperada e, com `--hold=MS`, por mais MS milissegundos.
