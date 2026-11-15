@@ -343,7 +343,8 @@ a.stat:hover{border-color:var(--accent)}.stat b{display:block;font-size:1.7rem;l
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;min-width:0}
 .card header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px}
 .card p{margin:0}.card .stop{color:var(--muted)}.card .stop b{color:var(--fg);font-weight:600}
-.shot{margin:4px 0 0}.shot img{display:block;width:100%;height:auto;border-radius:6px;border:1px solid var(--line);background:#000}
+.shot{margin:4px 0 0}.shot img{display:block;width:100%;height:auto;max-height:300px;object-fit:contain;border-radius:6px;border:1px solid var(--line);background:#000}
+.shot.tool img{max-height:none;background:none}
 .shot figcaption{font-size:.8rem;color:var(--muted);margin-top:4px}
 .serial summary{font-size:.85rem}.serial pre{font-size:.72rem;line-height:1.45;max-height:22rem;margin:4px 0 0}.shot.none{font-size:.85rem;color:var(--muted);border:1px dashed var(--line);border-radius:6px;padding:10px;margin-top:4px}
 .filter{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:12px 0;padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:10px}

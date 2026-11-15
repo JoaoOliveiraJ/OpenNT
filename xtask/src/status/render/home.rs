@@ -108,7 +108,7 @@ pub fn page(report: &Report) -> String {
                     .as_ref()
                     .map(|picture| {
                         format!(
-                            "<figure class=\"shot\"><a href=\"{href}\"><img src=\"{href}\" width=\"{w}\" height=\"{h}\" \
+                            "<figure class=\"shot tool\"><a href=\"{href}\"><img src=\"{href}\" width=\"{w}\" height=\"{h}\" \
                              loading=\"lazy\" decoding=\"async\" alt=\"{caption}\"></a><figcaption>{caption}</figcaption></figure>",
                             href = escape(&picture.href),
                             w = picture.width,
