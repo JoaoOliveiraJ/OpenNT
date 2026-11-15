@@ -2,10 +2,12 @@
 #
 # Os crates `boot` e `kernel` são freestanding (alvo x86_64-unknown-none) e
 # só compilam pelo `cargo xtask`, que escolhe o alvo, empacota o kernel como
-# PE32+ e monta a imagem de disco. O `xtask` roda no host.
+# PE32+ e monta a imagem de disco. O `xtask` roda no host. As ferramentas de
+# desenvolvimento ficam em `tools/`: `kd-client` (o cliente do depurador do
+# kernel, só a biblioteca padrão, usado pelo `xtask`).
 [workspace]
 resolver = "2"
-members = ["boot", "kernel", "xtask"]
+members = ["boot", "kernel", "xtask", "tools/kd-client"]
 default-members = ["xtask"]
 
 [workspace.package]

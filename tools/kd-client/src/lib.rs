@@ -1,0 +1,64 @@
+//! Cliente do depurador do kernel do OpenNT, compartilhado pelo `cargo
+//! xtask debug` (texto) e pelo `opennt-dbg` (gráfico, `tools/kd-gui`).
+//!
+//! O kernel com `--kd=com2` atende o protocolo remoto do GDB na COM2, que o
+//! QEMU expõe num socket TCP, com as extensões do OpenNT pelo `qRcmd`
+//! (`ps`, `threads`, `lm`, `cpus`, `context`, `obj`, `log`, `bl`,
+//! `bugcheck`, `kd`). Módulos:
+//!
+//! - `rsp`: os pacotes (`$dados#cs`, confirmação, `O`, compressão `x*n`) e a
+//!   conexão TCP;
+//! - `stop`: a resposta de parada (`T05thread:1;swbreak:;`);
+//! - `registers`: a ordem do pacote `g` do GDB para x86-64;
+//! - `symbols`, `elf`, `msf`, `demangle`: os símbolos do `kernel.elf` (com
+//!   os nomes do Rust legíveis), dos exports dos PEs desta máquina e dos
+//!   públicos de um PDB já no cache;
+//! - `unwind`: a pilha pelos frame pointers sobre qualquer leitor de
+//!   memória (o alvo ou uma pilha capturada);
+//! - `x86`: o mínimo de decodificação para o passo por cima (o tamanho de
+//!   um `call`) e para o prólogo;
+//! - `monitor`: as tabelas do `qRcmd` em estruturas;
+//! - `client`: a sessão (comandos de texto e a API tipada que a interface
+//!   gráfica usa).
+
+pub mod client;
+pub mod demangle;
+pub mod elf;
+pub mod monitor;
+pub mod msf;
+pub mod registers;
+pub mod rsp;
+pub mod stop;
+pub mod symbols;
+pub mod unwind;
+pub mod x86;
+
+pub use client::{Breakpoint, BreakpointKind, Client};
+pub use symbols::Symbols;
+
+/// Número em hexadecimal (`0x...`, com `` ` `` ou `_` como separadores) ou
+/// decimal.
+pub fn parse_number(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(&hex.replace('`', "").replace('_', ""), 16).ok()
+    } else if text.chars().all(|character| character.is_ascii_digit()) && !text.is_empty() {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_number;
+
+    #[test]
+    fn numbers() {
+        assert_eq!(parse_number("0x10"), Some(16));
+        assert_eq!(parse_number("0xfffff800`40000000"), Some(0xfffff800_40000000));
+        assert_eq!(parse_number("42"), Some(42));
+        assert_eq!(parse_number("x"), None);
+        assert_eq!(parse_number(""), None);
+    }
+}

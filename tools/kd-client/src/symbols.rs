@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::demangle::demangle;
-use crate::elf::Elf;
-use crate::nt_types::pdb::Msf;
+use super::elf::{Elf, SHF_ALLOC};
+use super::msf::Msf;
 
 #[derive(Clone, Debug)]
 pub struct Symbol {
@@ -24,7 +24,7 @@ pub struct Symbol {
     pub function: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Module {
     pub name: String,
     pub path: String,
@@ -36,11 +36,14 @@ pub struct Module {
     pub source: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Symbols {
     pub modules: Vec<Module>,
     /// Índice do módulo do kernel (o ELF).
     kernel: Option<usize>,
+    /// Muda a cada troca de módulos (quem guarda uma cópia sabe quando
+    /// renovar).
+    pub generation: u64,
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
@@ -200,11 +203,17 @@ impl Symbols {
             .map(|entry| Symbol { address: entry.address, size: entry.size, name: demangle(&entry.name).unwrap_or(entry.name), function: entry.kind == 2 })
             .collect();
         symbols.sort_by_key(|symbol| symbol.address);
-        let allocated = elf.sections.iter().filter(|section| section.flags & crate::elf::SHF_ALLOC != 0 && section.address != 0);
+        let allocated = elf.sections.iter().filter(|section| section.flags & SHF_ALLOC != 0 && section.address != 0);
         let base = allocated.clone().map(|section| section.address).min().unwrap_or(0) & !0xFFF;
         let end = allocated.map(|section| section.address + section.size).max().unwrap_or(0);
         let count = symbols.len();
         let module = Module { name: "kernel".into(), path: elf_path.display().to_string(), base, end, symbols, source: "ELF do kernel".into() };
+        self.set_kernel(module);
+        Ok(count)
+    }
+
+    /// O módulo do kernel (os símbolos do ELF, sem prefixo de módulo).
+    pub fn set_kernel(&mut self, module: Module) {
         match self.kernel {
             Some(index) => self.modules[index] = module,
             None => {
@@ -212,12 +221,25 @@ impl Symbols {
                 self.modules.push(module);
             }
         }
-        Ok(count)
+        self.generation += 1;
+    }
+
+    /// Acrescenta um módulo já com os símbolos (ordenados pelo endereço).
+    pub fn add_module(&mut self, module: Module) {
+        self.modules.push(module);
+        self.generation += 1;
+    }
+
+    /// O módulo do kernel, se o ELF foi carregado.
+    pub fn kernel(&self) -> Option<&Module> {
+        self.kernel.map(|index| &self.modules[index])
     }
 
     /// Troca os módulos carregados (fora o kernel) pela lista do alvo:
     /// (base, fim, caminho). `root` é a raiz do repositório (o cache de PDBs).
     pub fn set_modules(&mut self, list: &[(u64, u64, String)], root: &Path) {
+        let signature = |modules: &[Module]| -> Vec<(u64, u64, String)> { modules.iter().map(|module| (module.base, module.end, module.name.clone())).collect() };
+        let before = signature(&self.modules);
         let kernel = self.kernel.map(|index| self.modules.swap_remove(index));
         let mut previous: HashMap<(u64, String), Module> = self.modules.drain(..).map(|module| ((module.base, module.path.clone()), module)).collect();
         self.kernel = None;
@@ -243,6 +265,9 @@ impl Symbols {
             }
             self.modules.push(Self::load_module(*base, *end, path, root));
         }
+        if signature(&self.modules) != before {
+            self.generation += 1;
+        }
     }
 
     fn load_module(base: u64, end: u64, path: &str, root: &Path) -> Module {
@@ -267,8 +292,28 @@ impl Symbols {
         module
     }
 
-    fn module_at(&self, address: u64) -> Option<&Module> {
+    pub fn module_at(&self, address: u64) -> Option<&Module> {
         self.modules.iter().find(|module| address >= module.base && address < module.end)
+    }
+
+    /// O símbolo de função que contém o endereço (ou o mais próximo antes
+    /// dele, quando o tamanho não é conhecido): o começo e o nome
+    /// (`módulo!nome` fora do kernel).
+    pub fn function_at(&self, address: u64) -> Option<(u64, String)> {
+        let module = self.module_at(address)?;
+        let kernel = self.kernel.is_some_and(|index| std::ptr::eq(&self.modules[index], module));
+        let index = module.symbols.partition_point(|symbol| symbol.address <= address);
+        let symbol = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && (symbol.size == 0 || address < symbol.address + symbol.size))?;
+        let prefix = if kernel { String::new() } else { format!("{}!", module.name) };
+        Some((symbol.address, format!("{prefix}{}", symbol.name)))
+    }
+
+    /// O nome de um endereço quando ele cai num símbolo (`None` quando o
+    /// `describe` só teria o número ou `módulo+0xRVA`).
+    pub fn name_at(&self, address: u64) -> Option<String> {
+        let text = self.describe(address);
+        let module = self.module_at(address)?;
+        (!text.starts_with("0x") && !text.starts_with(&format!("{}+0x", module.name))).then_some(text)
     }
 
     /// `módulo!símbolo+0x10`, `símbolo+0x10` (kernel) ou `módulo+0xRVA`.
@@ -356,5 +401,91 @@ impl Symbols {
             return result;
         }
         Err(format!("{query}: simbolo nao encontrado"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(address: u64, size: u64, name: &str) -> Symbol {
+        Symbol { address, size, name: name.into(), function: true }
+    }
+
+    fn sample() -> Symbols {
+        let mut symbols = Symbols::default();
+        symbols.set_kernel(Module {
+            name: "kernel".into(),
+            path: "build/kernel.elf".into(),
+            base: 0xfffff800_40000000,
+            end: 0xfffff800_41000000,
+            symbols: vec![
+                symbol(0xfffff800_40001000, 0x100, "kernel::ntos::init::main::kmain"),
+                symbol(0xfffff800_40002000, 0x80, "kernel::ntos::ke::run_kernel_tasks"),
+                symbol(0xfffff800_40003000, 0x40, "<kernel::ntos::io::Irp as core::fmt::Debug>::fmt"),
+                symbol(0xfffff800_40004000, 0x40, "kernel::ntos::ps::create<u64>"),
+            ],
+            source: "teste".into(),
+        });
+        symbols.add_module(Module {
+            name: "ksecdd.sys".into(),
+            path: r"\SystemRoot\System32\Drivers\ksecdd.sys".into(),
+            base: 0xfffff800_42000000,
+            end: 0xfffff800_42010000,
+            // Exports sem tamanho.
+            symbols: vec![symbol(0xfffff800_42001000, 0, "SspiInitAsyncInterface"), symbol(0xfffff800_42002000, 0, "KSecRegisterSecurityProvider")],
+            source: "teste".into(),
+        });
+        symbols
+    }
+
+    #[test]
+    fn describes_addresses() {
+        let symbols = sample();
+        assert_eq!(symbols.describe(0xfffff800_40002000), "kernel::ntos::ke::run_kernel_tasks");
+        assert_eq!(symbols.describe(0xfffff800_40002010), "kernel::ntos::ke::run_kernel_tasks+0x10");
+        // Depois do fim da função (tamanho conhecido): só módulo+RVA.
+        assert_eq!(symbols.describe(0xfffff800_40002100), "kernel+0x2100");
+        assert_eq!(symbols.describe(0xfffff800_42001004), "ksecdd.sys!SspiInitAsyncInterface+0x4");
+        assert_eq!(symbols.describe(0x1234), "0x1234");
+        assert_eq!(symbols.name_at(0xfffff800_40002100), None);
+        assert_eq!(symbols.name_at(0xfffff800_40001008).as_deref(), Some("kernel::ntos::init::main::kmain+0x8"));
+    }
+
+    #[test]
+    fn return_addresses_use_the_call_byte() {
+        let symbols = sample();
+        // Um retorno logo depois do fim da função (chamada que não volta)
+        // ainda é da função que chamou.
+        assert_eq!(symbols.describe_return(0xfffff800_40001100), "kernel::ntos::init::main::kmain+0x100");
+        assert_eq!(symbols.describe_return(0xfffff800_40001005), "kernel::ntos::init::main::kmain+0x5");
+        assert_eq!(symbols.describe_return(0x1234), "0x1234");
+    }
+
+    #[test]
+    fn looks_up_names() {
+        let symbols = sample();
+        assert_eq!(symbols.lookup("kernel::ntos::ke::run_kernel_tasks"), Ok(0xfffff800_40002000));
+        assert_eq!(symbols.lookup("run_kernel_tasks"), Ok(0xfffff800_40002000));
+        assert_eq!(symbols.lookup("kernel::ntos::ps::create"), Ok(0xfffff800_40004000));
+        assert_eq!(symbols.lookup("ksecdd!SspiInitAsyncInterface"), Ok(0xfffff800_42001000));
+        assert_eq!(symbols.lookup("ksecdd.sys!KSecRegisterSecurityProvider"), Ok(0xfffff800_42002000));
+        assert!(symbols.lookup("nada!x").is_err());
+        assert!(symbols.lookup("inexistente").is_err());
+    }
+
+    #[test]
+    fn functions_and_generation() {
+        let mut symbols = sample();
+        assert_eq!(symbols.function_at(0xfffff800_40002040), Some((0xfffff800_40002000, "kernel::ntos::ke::run_kernel_tasks".into())));
+        assert_eq!(symbols.function_at(0xfffff800_42001800), Some((0xfffff800_42001000, "ksecdd.sys!SspiInitAsyncInterface".into())));
+        let generation = symbols.generation;
+        // A mesma lista não muda a geração; um módulo a menos muda.
+        let list = vec![(0xfffff800_42000000, 0xfffff800_42010000, r"\SystemRoot\System32\Drivers\ksecdd.sys".to_string())];
+        symbols.set_modules(&list, Path::new("."));
+        assert_eq!(symbols.generation, generation);
+        symbols.set_modules(&[], Path::new("."));
+        assert_eq!(symbols.generation, generation + 1);
+        assert_eq!(symbols.modules.len(), 1);
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "kd-client"
+description = "Cliente do depurador do kernel do OpenNT: protocolo, simbolos e pilha (usado pelo cargo xtask debug e pelo opennt-dbg)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Só a biblioteca padrão: o `xtask` depende deste crate e continua sem
+# dependências externas.
+[dependencies]

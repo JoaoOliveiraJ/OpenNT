@@ -6,7 +6,7 @@
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build] [--kd=com2 --script=ARQ]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
-//! cargo xtask debug      [opções] [--connect=HOST:PORTA]
+//! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -25,7 +25,6 @@ extern crate alloc;
 
 mod build;
 mod debug;
-mod elf;
 mod hive_image;
 mod kernel_pe;
 mod nt_types;
@@ -37,6 +36,9 @@ mod test_all;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+// O leitor de ELF é o do cliente do depurador (símbolos e linhas).
+use kd_client::elf;
 use std::time::Duration;
 
 use build::BuildOptions;
@@ -48,7 +50,9 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|debug|status
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
   test-all   suites e todos os [[teste]] do components.toml em paralelo (cargo xtask test-all --help)
   debug      depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
-             (--connect=HOST:PORTA so conecta; --script=ARQ roda o roteiro como teste)
+             (--connect=HOST:PORTA so conecta; --script=ARQ roda o roteiro como teste;
+             --launch --no-client so compila e abre o QEMU para outro cliente, com
+             --headless sem janela; o opennt-dbg --launch usa este modo)
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
@@ -78,6 +82,10 @@ struct Arguments {
     no_build: bool,
     script: Option<String>,
     connect: Option<String>,
+    /// `debug --no-client`: só o build e o QEMU (o cliente é outro).
+    no_client: bool,
+    /// `debug --no-client --headless`: o QEMU sem janela.
+    headless: bool,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -110,6 +118,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         no_build: false,
         script: None,
         connect: None,
+        no_client: false,
+        headless: false,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -137,6 +147,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--script" => parsed.script = Some(required()?),
             "--connect" => parsed.connect = Some(required()?),
+            // O padrão do `debug`; explícito no comando que o opennt-dbg roda.
+            "--launch" if parsed.command == "debug" => {}
+            "--no-client" if parsed.command == "debug" => parsed.no_client = true,
+            "--headless" if parsed.command == "debug" => parsed.headless = true,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -169,6 +183,12 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
+    }
+    if parsed.headless && !parsed.no_client {
+        return Err("--headless e opcao do debug --no-client (o prompt precisa da janela do QEMU)".into());
+    }
+    if parsed.no_client && (parsed.connect.is_some() || parsed.script.is_some()) {
+        return Err("--no-client so abre o QEMU (sem --connect nem --script)".into());
     }
     Ok(parsed)
 }
@@ -299,7 +319,11 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     }
     let output = build::build(&options)?;
     let log = output.image.with_file_name("serial.log");
-    let mut qemu = qemu::spawn_window(&output.image, &machine, &log)?;
+    if arguments.no_client {
+        let qemu = qemu::spawn(&output.image, &machine, &log, !arguments.headless)?;
+        return debug::serve(qemu, &address);
+    }
+    let mut qemu = qemu::spawn(&output.image, &machine, &log, true)?;
     let result = debug::interactive(&address, &root, &elf);
     let _ = qemu.kill();
     let _ = qemu.wait();

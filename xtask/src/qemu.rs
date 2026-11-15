@@ -105,11 +105,15 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
     arguments
 }
 
-/// QEMU com janela em segundo plano, a COM1 num arquivo (o terminal fica
-/// para o prompt do depurador) e a COM2 no socket do depurador.
-pub fn spawn_window(image: &Path, machine: &MachineOptions, log: &Path) -> Result<Child, String> {
+/// QEMU em segundo plano (com janela, ou sem tela com `window` falso), a
+/// COM1 num arquivo (o terminal fica para o prompt do depurador) e a COM2
+/// no socket do depurador.
+pub fn spawn(image: &Path, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
     let qemu = find_qemu()?;
     let mut arguments = machine_arguments(image, machine);
+    if !window {
+        arguments.extend(["-display".to_string(), "none".to_string()]);
+    }
     arguments.extend(["-serial".to_string(), format!("file:{}", log.display())]);
     arguments.extend(kd_serial(machine));
     println!("QEMU com o log do kernel em {}", log.display());

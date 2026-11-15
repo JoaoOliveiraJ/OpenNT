@@ -7,3 +7,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# O cliente do depurador do kernel (só a biblioteca padrão), compartilhado
+# com o opennt-dbg.
+kd-client = { path = "../tools/kd-client" }

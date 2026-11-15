@@ -7,9 +7,16 @@ name = "boot"
 version = "0.6.0"
 
 [[package]]
+name = "kd-client"
+version = "0.6.0"
+
+[[package]]
 name = "kernel"
 version = "0.6.0"
 
 [[package]]
 name = "xtask"
 version = "0.6.0"
+dependencies = [
+ "kd-client",
+]

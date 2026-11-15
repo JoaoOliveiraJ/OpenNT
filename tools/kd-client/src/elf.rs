@@ -1,5 +1,6 @@
 //! Leitura mínima de ELF64 little-endian x86-64: seções e símbolos, o
-//! suficiente para empacotar o kernel como PE32+.
+//! suficiente para empacotar o kernel como PE32+ (`cargo xtask build`) e
+//! para os símbolos e as linhas de código do depurador.
 
 use std::collections::HashMap;
 
@@ -83,6 +84,16 @@ impl<'a> Elf<'a> {
             }
         }
         Ok(entries)
+    }
+
+    /// O conteúdo de uma seção pelo nome (`.debug_line`...); vazio para
+    /// SHT_NOBITS.
+    pub fn section_bytes(&self, name: &str) -> Option<&'a [u8]> {
+        let section = self.sections.iter().find(|section| section.name == name)?;
+        if section.kind == SHT_NOBITS {
+            return Some(&[]);
+        }
+        self.range(section.offset, section.size).ok()
     }
 
     pub fn range(&self, offset: u64, size: u64) -> Result<&'a [u8], String> {

@@ -1,12 +1,16 @@
-//! `cargo xtask debug`: o cliente do depurador do kernel do OpenNT.
+//! `cargo xtask debug`: o cliente de texto do depurador do kernel do OpenNT.
 //!
 //! O kernel com `--kd=com2` atende o protocolo remoto do GDB na COM2, que o
 //! QEMU expõe como um socket TCP (`-serial tcp:...`, a segunda porta serial;
 //! a primeira continua sendo o log do kernel). Modos:
 //!
-//! - `cargo xtask debug [opções de build e de máquina]`: compila com o
-//!   depurador, abre o QEMU (log da COM1 em `<build>/serial.log`) e um
+//! - `cargo xtask debug [--launch] [opções de build e de máquina]`: compila
+//!   com o depurador, abre o QEMU (log da COM1 em `<build>/serial.log`) e um
 //!   prompt de comandos;
+//! - `cargo xtask debug --launch --no-client [--headless]`: só o build e o
+//!   QEMU, para outro cliente (o `opennt-dbg --launch` roda este comando):
+//!   imprime `KD_READY 127.0.0.1:PORTA` quando o socket existe e fecha o
+//!   QEMU quando a entrada padrão fecha (o cliente saiu);
 //! - `cargo xtask debug --connect=HOST:PORTA`: só o cliente, contra um QEMU
 //!   já aberto (`cargo xtask run --kd=com2`, porta 1234 por padrão; o GDB
 //!   também entra por ali: `target remote HOST:PORTA`);
@@ -16,46 +20,53 @@
 //!   paralelo; o roteiro falhando derruba o teste. Com `--connect`, o
 //!   roteiro roda contra um QEMU já aberto.
 //!
-//! Os símbolos vêm do `<build>/kernel.elf` e dos PEs desta máquina
-//! (`symbols`); os comandos estão em `client`.
-
-pub mod client;
-pub mod demangle;
-pub mod rsp;
-pub mod symbols;
+//! O protocolo, os símbolos (`<build>/kernel.elf` e os PEs desta máquina),
+//! a pilha e os comandos são do crate `kd-client` (`tools/kd-client`), o
+//! mesmo do depurador gráfico.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use client::Client;
-use rsp::Connection;
+use kd_client::rsp::Connection;
+use kd_client::Client;
 
 /// Abre a sessão: conecta e negocia.
-fn open(address: &str, root: &Path, elf: &Path, echo: bool, deadline: Instant) -> Result<Client, String> {
+fn open(address: &str, root: &Path, elf: &Path, deadline: Instant) -> Result<Client, String> {
     let connection = Connection::connect(address, deadline)?;
-    Ok(Client::new(connection, root.to_path_buf(), elf.to_path_buf(), echo))
+    Ok(Client::new(connection, root.to_path_buf(), elf.to_path_buf()))
 }
 
 /// Roteiro contra o socket da COM2 (o lado do teste); `serial` é a saída
 /// da COM1, quando o QEMU é do próprio teste.
 pub fn run_script(address: &str, root: &Path, elf: &Path, script: &str, serial: Option<Arc<Mutex<String>>>) -> Result<(), String> {
-    let mut client = open(address, root, elf, false, Instant::now() + Duration::from_secs(60))?;
+    let mut client = open(address, root, elf, Instant::now() + Duration::from_secs(60))?;
     if let Some(serial) = serial {
         client.set_serial(serial);
     }
     client.run_script(script)
 }
 
+/// A saída do DbgPrint que chegou, no terminal.
+fn print_console(client: &mut Client) {
+    let text = client.take_console();
+    if !text.is_empty() {
+        print!("{text}");
+    }
+}
+
 /// Prompt interativo.
 pub fn interactive(address: &str, root: &Path, elf: &Path) -> Result<(), String> {
-    let mut client = open(address, root, elf, true, Instant::now() + Duration::from_secs(60))?;
+    let mut client = open(address, root, elf, Instant::now() + Duration::from_secs(60))?;
     println!("depurador do kernel em {address}; anexando (a maquina para)...");
     match client.attach(Duration::from_secs(120)) {
         Ok(text) => println!("{text}"),
         Err(error) => println!("erro: {error}"),
     }
+    print_console(&mut client);
     let (sender, receiver) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -84,7 +95,9 @@ pub fn interactive(address: &str, root: &Path, elf: &Path) -> Result<(), String>
                     }
                     return Ok(());
                 }
-                match client.execute(&line) {
+                let result = client.execute(&line);
+                print_console(&mut client);
+                match result {
                     Ok(text) if !text.is_empty() => println!("{}", text.trim_end()),
                     Ok(_) => {}
                     Err(error) => println!("erro: {error}"),
@@ -92,13 +105,47 @@ pub fn interactive(address: &str, root: &Path, elf: &Path) -> Result<(), String>
                 prompt(&client);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(stop) = client.poll_console(Duration::from_millis(10))? {
+                let stop = client.poll(Duration::from_millis(10))?;
+                print_console(&mut client);
+                if let Some(stop) = stop {
                     println!("\n{stop}");
                     prompt(&client);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
+    }
+}
+
+/// `--no-client`: o QEMU já aberto, para outro cliente. Anuncia o socket e
+/// espera o QEMU terminar ou a entrada padrão fechar (quem rodou o comando
+/// saiu ou pediu o reinício); nos dois casos o QEMU não fica para trás.
+pub fn serve(mut qemu: Child, address: &str) -> Result<(), String> {
+    use std::io::Write;
+    println!("KD_READY {address}");
+    let _ = std::io::stdout().flush();
+    let closed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&closed);
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        while matches!(lock.read_line(&mut sink), Ok(count) if count > 0) {
+            sink.clear();
+        }
+        flag.store(true, Ordering::Release);
+    });
+    loop {
+        if let Ok(Some(status)) = qemu.try_wait() {
+            println!("KD_QEMU_EXITED {status}");
+            return Ok(());
+        }
+        if closed.load(Ordering::Acquire) {
+            let _ = qemu.kill();
+            let _ = qemu.wait();
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
