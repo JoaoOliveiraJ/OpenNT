@@ -1233,6 +1233,29 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   despacha os Pcw* para ele), a autorização (id 2, o ksecdd.sys) e o BCrypt
   (id 3, o cng.sys) do Se (`se/extension_hosts.rs`) e o controle de taxa de
   rede (id 4, o tcpip.sys) do Ps (`ps/net_rate_control.rs`).
+- **Consultas de token** (`se/token/query.rs`): o NtQueryInformationToken
+  e o ZwQueryInformationToken serializam cada classe do registro do token,
+  com os ponteiros internos relativos ao buffer do chamador; o ReturnLength
+  recebe o tamanho exigido antes da comparação com o Length, e um buffer
+  curto devolve STATUS_BUFFER_TOO_SMALL sem nenhum byte gravado nele (o
+  serviço de usuário, em `ps/user/tokens.rs`, só resolve o handle e sonda).
+  A TokenAccessInformation (classe 22) segue o SepCopyTokenAccessInformation:
+  o TOKEN_ACCESS_INFORMATION, os três SID_AND_ATTRIBUTES_HASH (com o hash do
+  RtlSidHashInitialize), o PackageSid, os atributos de segurança no formato
+  interno do token (o AUTHZBASEP_SECURITY_ATTRIBUTES_INFORMATION e os
+  registros de `inc/types/extra_obpsse.rs`, montados e lidos por
+  `se/security_attributes.rs`) e o TOKEN_PRIVILEGES na ordem do LUID. O
+  SeTokenFromAccessInformation e o SeQuerySecurityAttributesTokenAccessInformation
+  consomem esse bloco. O SeQueryInformationToken grava a TokenSessionId e a
+  TokenIsAppContainer direto no ULONG de saída, sem alocar.
+- **MDLs**: o IoAllocateMdl (`io/mdl.rs`) só descreve o buffer (Size,
+  StartVa, ByteOffset, ByteCount e MDL_ALLOCATED_FIXED_SIZE até 17 páginas) e
+  o liga ao IRP; os PFNs e os outros flags vêm de quem descreve as páginas
+  (`mm/mdl.rs`): o MmBuildMdlForNonPagedPool (MDL_SOURCE_IS_NONPAGED_POOL e a
+  VA de sistema, sem travar), o MmProbeAndLockPages (MDL_PAGES_LOCKED), o
+  IoBuildPartialMdl (os bits herdáveis da origem e a VA deslocada) e o
+  MmMapLockedPagesSpecifyCache (MDL_MAPPED_TO_SYSTEM_VA). Os pedidos com
+  DO_DIRECT_IO do I/O Manager fazem IoAllocateMdl + MmProbeAndLockPages.
 - **Filas de dispositivo e StartIo**: a KDEVICE_QUEUE é do Ke
   (`ke/device_queue.rs`, os sete KeInsert*/KeRemove*DeviceQueue com o
   layout x64 do NT, inclusive o Hint do KeRemoveByKeyDeviceQueue no qword
