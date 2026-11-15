@@ -28,6 +28,8 @@ struct NativeDriver {
     name: String,
     node: NodeId,
     name_buffer: u64,
+    /// DriverName (`\Driver\<nome>`).
+    object_name_buffer: u64,
     initialized: bool,
     exports: BTreeMap<String, u64>,
     image: Option<PeImage>,
@@ -143,6 +145,7 @@ fn destroy_driver(driver: u64) {
         }
     }
     guest::free_bytes(entry.name_buffer);
+    guest::free_bytes(entry.object_name_buffer);
     super::device_security::release(driver);
     guest::free_bytes(driver);
 }
@@ -156,6 +159,13 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
     // A extensão ocupa a região adicional da mesma alocação.
     let extension = driver + DriverObject::SIZE;
     guest_strings::write_wide_string(name_buffer, name);
+    // DriverName: o nome do objeto, `\Driver\<serviço>`, como o
+    // IopLoadDriver e o IoCreateDriver o gravam (o dxgkrnl reconhece o
+    // BasicDisplay por ele).
+    let object_name = format!("\\Driver\\{name}");
+    let object_units: Vec<u16> = object_name.encode_utf16().collect();
+    let object_name_buffer = guest::alloc_bytes(object_units.len() as u64 * 2 + 2);
+    guest_strings::write_wide_string(object_name_buffer, &object_name);
     // SAFETY: alocação zerada do DRIVER_OBJECT mais a extensão.
     let (object, driver_extension) = unsafe { (DriverObject::at(driver), DriverExtension::at(extension)) };
     object.type_.set(IO_TYPE_DRIVER);
@@ -164,9 +174,9 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
     // DriverStart é PVOID: a VA inteira da imagem.
     object.driver_start.set(image_base);
     object.driver_size.set(image_size as u32);
-    object.driver_name.length.set(name_units.len() as u16 * 2);
-    object.driver_name.maximum_length.set(name_units.len() as u16 * 2 + 2);
-    object.driver_name.buffer.set(name_buffer);
+    object.driver_name.length.set(object_units.len() as u16 * 2);
+    object.driver_name.maximum_length.set(object_units.len() as u16 * 2 + 2);
+    object.driver_name.buffer.set(object_name_buffer);
     object.driver_init.set(entry_point);
     object.driver_unload.set(0);
     // DRIVER_EXTENSION real: o driver registra AddDevice aqui.
@@ -182,11 +192,12 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
         Ok(node) => node,
         Err(error) => {
             guest::free_bytes(name_buffer);
+            guest::free_bytes(object_name_buffer);
             guest::free_bytes(driver);
             return Err(error);
         }
     };
-    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), node, name_buffer, initialized: false, exports: BTreeMap::new(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
+    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), node, name_buffer, object_name_buffer, initialized: false, exports: BTreeMap::new(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
     *CURRENT.lock() = Some(driver);
     // A imagem e as alocações só são liberadas quando o provedor remove a
     // última referência, inclusive depois de um unload já concluído.
@@ -195,6 +206,7 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
         io_manager::forget_driver(node);
         DRIVERS.lock().remove(&driver);
         guest::free_bytes(name_buffer);
+        guest::free_bytes(object_name_buffer);
         guest::free_bytes(driver);
         return Err(error);
     }

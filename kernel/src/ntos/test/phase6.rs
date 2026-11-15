@@ -2062,7 +2062,7 @@ fn ntoskrnl_driver_lifecycle(assert: Assert) {
     let driver = node.and_then(|node| object_manager::node(node)).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
     let base = if driver != 0 { at::<nt::DriverObject>(driver).driver_start.get() } else { 0 };
     assert(loaded.as_ref().is_ok_and(|&value| value) && driver != 0 && at::<nt::DriverObject>(driver).type_.get() == 4 && base != 0, "lifecycle: DriverEntry executado e \\Driver publicado com o DRIVER_OBJECT");
-    assert(at::<nt::DriverObject>(driver).driver_unload.get() == base + 0x1320 && guest_strings_read(at::<nt::DriverObject>(driver).driver_name.address()) == "opennt-lc-a" && lifecycle::get_driver_export("opennt-lc-a", "Alpha") == base + 0x1010, "lifecycle: DriverUnload registrado, DriverName e export do driver");
+    assert(at::<nt::DriverObject>(driver).driver_unload.get() == base + 0x1320 && guest_strings_read(at::<nt::DriverObject>(driver).driver_name.address()) == "\\Driver\\opennt-lc-a" && lifecycle::get_driver_export("opennt-lc-a", "Alpha") == base + 0x1010, "lifecycle: DriverUnload registrado, DriverName e export do driver");
     assert(lifecycle::load_driver("/opennt-lc-a.sys", &options).is_err_and(|error| error.win32_error == 1056), "lifecycle: driver ja carregado (1056)");
     assert(lifecycle::unload_driver("opennt-lc-a") && guest::read32(counter) == 1 && object_manager::lookup("\\Driver\\opennt-lc-a").is_none() && loaded_images::find(base + 0x1000).is_none(), "lifecycle: unload chama DriverUnload e libera a imagem");
     let failed = lifecycle::load_driver("/opennt-lc-b.sys", &options);
