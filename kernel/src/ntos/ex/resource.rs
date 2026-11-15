@@ -179,28 +179,36 @@ pub fn reinitialize(resource: u64) -> Result<u32, KernelError> {
     })
 }
 
-/// ExDeleteResourceLite.
+/// ExDeleteResourceLite (ntoskrnl 19041 rva 0x275720): em DISPATCH_LEVEL e
+/// sob a trava da lista do sistema, tira o ERESOURCE da SystemResourcesList
+/// (com a checagem dos vizinhos) e zera os vínculos, e devolve a tabela de
+/// donos; devolve STATUS_SUCCESS. Como no ntoskrnl, donos e esperas não
+/// impedem a remoção: um driver apaga um ERESOURCE que ainda tem (o ntfs.sys
+/// apaga a tabela de reinício do NtfsCheckpointVolume, que mora na pilha
+/// dele, com o recurso ainda adquirido), e um ERESOURCE de pilha que
+/// ficasse na lista seria regravado pelas inserções e remoções seguintes
+/// depois de a pilha ter outro uso.
 pub fn delete(resource: u64) -> Result<u32, KernelError> {
     require_irql(2)?;
     let body = resource_at(resource);
-    with_lock(&body.spin_lock, || {
-        if has_owners_or_waiters(body) {
-            return Ok(STATUS_INVALID_PARAMETER);
-        }
-        let list = *RESOURCE_LIST.lock();
-        if list == 0 {
-            return Err(KernelError::new("ERESOURCE was not initialized"));
-        }
-        // SAFETY: a cabeça global vive até o fim.
-        let list = unsafe { ResourceList::at(list) };
-        with_lock(&list.lock, || remove_entry(&body.system_resources_list))?;
-        let table = body.owner_table.get();
-        if table != 0 {
-            guest::free_bytes(table);
-        }
-        body.owner_table.set(0);
-        Ok(0)
-    })
+    let list = *RESOURCE_LIST.lock();
+    if list == 0 {
+        return Err(KernelError::new("ERESOURCE was not initialized"));
+    }
+    // SAFETY: a cabeça global vive até o fim.
+    let list = unsafe { ResourceList::at(list) };
+    with_lock(&list.lock, || {
+        list_entry::remove(&body.system_resources_list).ok_or_else(|| KernelError::new("corrupt ERESOURCE list"))?;
+        body.system_resources_list.flink.set(0);
+        body.system_resources_list.blink.set(0);
+        Ok(())
+    })?;
+    let table = body.owner_table.get();
+    if table != 0 {
+        guest::free_bytes(table);
+    }
+    body.owner_table.set(0);
+    Ok(0)
 }
 
 /// Entrada embutida e depois a tabela extra; `None` = sem posse nem reserva.

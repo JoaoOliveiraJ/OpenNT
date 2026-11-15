@@ -791,7 +791,6 @@ fn executive_resources(assert: Assert) {
     // Exclusivo com recursão; compartilhado do dono exclusivo também recursa.
     assert(matches!(resource::acquire_exclusive(lock, true), Ok(1)) && matches!(resource::acquire_exclusive(lock, true), Ok(1)), "eresource: exclusivo recursivo");
     assert(matches!(resource::acquire_shared(lock, true), Ok(1)) && matches!(resource::is_acquired_shared(lock), Ok(3)) && matches!(resource::is_acquired_exclusive(lock), Ok(true)), "eresource: recursao do dono exclusivo");
-    assert(matches!(resource::delete(lock), Ok(0xC000_000D)), "eresource: exclusao com dono recusada");
     // A segunda thread não adquire sem espera e enfileira com espera.
     process::set_current_thread(second);
     assert(matches!(resource::acquire_shared(lock, false), Ok(0)), "eresource: sem espera devolve FALSE");

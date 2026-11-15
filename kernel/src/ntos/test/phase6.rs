@@ -1740,6 +1740,37 @@ fn ntoskrnl_thread_information(assert: Assert) {
     guest::free_bytes(buffer);
 }
 
+/// ExDeleteResourceLite de um ERESOURCE ainda adquirido, como o ntfs.sys
+/// apaga a tabela de reinício do NtfsCheckpointVolume (dois ERESOURCE na
+/// pilha dele, apagados pelo NtfsFreeRestartTable sem soltar o exclusivo):
+/// como no ntoskrnl, devolve STATUS_SUCCESS e sai da SystemResourcesList com
+/// os vínculos zerados, e a memória dele, que ganha outro uso (a pilha do
+/// chamador segue), não é mais tocada pelas inserções e remoções seguintes
+/// da lista.
+fn eresource_deleted_while_owned(assert: Assert) {
+    let block = guest::alloc_bytes(0x200);
+    let (first, owned, next) = (block, block + 0x80, block + 0x100);
+    call_export("ExInitializeResourceLite", &[first]);
+    call_export("ExInitializeResourceLite", &[owned]);
+    let acquired = call_export("ExAcquireResourceExclusiveLite", &[owned, 1]) == Some(1);
+    let status = call_export("ExDeleteResourceLite", &[owned]);
+    let links = &at::<nt::Eresource>(owned).system_resources_list;
+    let unlinked = links.flink.get() == 0 && links.blink.get() == 0 && at::<nt::Eresource>(first).system_resources_list.flink.get() != owned;
+    // A memória do apagado ganha outro uso.
+    guest::write_bytes(owned, &[0x5A; 0x68]);
+    call_export("ExInitializeResourceLite", &[next]);
+    let untouched_by_insert = guest::read_bytes(owned, 0x68).iter().all(|&byte| byte == 0x5A);
+    let mut untouched = untouched_by_insert;
+    if unlinked {
+        call_export("ExDeleteResourceLite", &[next]);
+        call_export("ExDeleteResourceLite", &[first]);
+        untouched &= guest::read_bytes(owned, 0x68).iter().all(|&byte| byte == 0x5A);
+    }
+    debug_print!("[ex] ERESOURCE apagado com dono: adquirido={} status={:x?} fora da lista={} memoria intocada={}", acquired, status, unlinked, untouched);
+    assert(acquired && status == Some(0) && unlinked && untouched, "ex: ExDeleteResourceLite de um ERESOURCE ainda adquirido o tira da lista do sistema, e a memoria dele deixa de ser tocada");
+    guest::free_bytes(block);
+}
+
 fn ntoskrnl_ex_group(assert: Assert) {
     use crate::ntos::ke::irql;
     use crate::ntos::ps::process;
@@ -1800,6 +1831,7 @@ fn ntoskrnl_ex_group(assert: Assert) {
     let eresource = block + 0x40;
     assert(call_export("ExInitializeResourceLite", &[eresource]) == Some(0) && call_export("ExAcquireResourceExclusiveLite", &[eresource, 1]) == Some(1) && call_export("ExIsResourceAcquiredExclusiveLite", &[eresource]) == Some(1), "ex: ERESOURCE exclusivo");
     assert(call_export("ExReleaseResourceLite", &[eresource]) == Some(0) && call_export("ExIsResourceAcquiredExclusiveLite", &[eresource]) == Some(0) && call_export("ExDeleteResourceLite", &[eresource]) == Some(0), "ex: ERESOURCE liberado e removido");
+    eresource_deleted_while_owned(assert);
     // Rundown.
     let rundown = block + 0x100;
     call_export("ExInitializeRundownProtection", &[rundown]);
