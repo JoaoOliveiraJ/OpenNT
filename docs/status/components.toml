@@ -1340,9 +1340,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "O adaptador de vídeo inicia pela sessão do win32k: o csrss.exe real chama o NtUserInitialize, o win32k.sys real anuncia a sessão e o dxgkrnl.sys inicia o BasicDisplay.sys, que cria o \\Device\\Video0."
+atual = "O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k."
 teste = "win32k-display"
-proximo = "O InitVideo do win32k montar a configuração de exibição sobre o \\Device\\Video0 (hoje ele para com VIDEO_DRIVER_INIT_FAILURE, 0xB4) e a sessão gráfica seguir."
+proximo = "O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \\Windows\\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK)."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1360,8 +1360,8 @@ faz = "O smss da sessão carrega o win32k.sys, o win32kbase.sys e o win32kfull.s
 nome = "Adaptador de vídeo iniciado"
 grupo = "marco"
 teste = "win32k-display"
-faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0."
-para = "Em seguida o InitVideo do win32k para com VIDEO_DRIVER_INIT_FAILURE (0xB4)."
+faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0; o InitVideo da sessão 0 termina e o NtUserInitialize do csrss volta com sucesso."
+para = "Depois o csrss para no NtCreatePort da \\Windows\\SbApiPort, antes de o smss executar o wininit.exe."
 
 [[roda]]
 nome = "O ntfs.sys monta e grava"
@@ -1398,7 +1398,7 @@ para = "O pci.sys sobre o barramento que ele relata ainda não inicia."
 nome = "Área de trabalho na tela"
 grupo = "marco"
 faz = "Ainda não há sessão gráfica: nenhuma janela é desenhada."
-para = "Falta o InitVideo do win32k montar a configuração de exibição."
+para = "A sessão 0 é a de serviços e usa o dispositivo de exibição desconectado; a tela é da sessão do console (winlogon), que ainda não existe."
 
 [[roda]]
 nome = "Programas Win32 (.exe)"
@@ -1589,21 +1589,21 @@ nome = "dxgkrnl.sys"
 grupo = "driver"
 teste = ["win32k-display", "dxgkrnl"]
 faz = "Cria o \\Device\\DxgKrnl; com o BasicDisplay, inicia o adaptador quando o win32k anuncia a sessão e cria o \\Device\\Video0."
-para = "Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4."
+para = "Nada aparece na tela ainda: a sessão 0 usa o dispositivo de exibição desconectado do win32k."
 
 [[roda]]
 nome = "BasicDisplay.sys"
 grupo = "driver"
 teste = ["win32k-display", "basicdisplay"]
 faz = "Instalado pelo PnP no adaptador VGA do QEMU; registra-se no dxgkrnl e o DxgkDdiStartDevice usa o framebuffer VBE 1024x768."
-para = "Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4."
+para = "Nada aparece na tela ainda: a sessão 0 usa o dispositivo de exibição desconectado do win32k."
 
 [[roda]]
 nome = "win32k.sys, win32kbase.sys e win32kfull.sys"
 grupo = "driver"
 teste = ["win32k-display", "win32k"]
 faz = "Carregados pelo smss no espaço de sessão; atendem o csrss (thread GUI, NtGdiInit, NtUserInitialize) e anunciam a sessão ao dxgkrnl."
-para = "O InitVideo enumera o \\Device\\Video0, mas não monta a configuração de exibição e para com 0xB4."
+para = "O NtUserInitialize da sessão 0 termina sobre o dispositivo desconectado; as Desktops (pela ParseProcedure da WindowStation) esperam o wininit.exe."
 
 [[roda]]
 nome = "acpi.sys"
@@ -1666,8 +1666,8 @@ para = "No boot comum, os testes de modo usuário usam uma ntdll mínima gerada 
 nome = "csrss.exe"
 grupo = "programa"
 teste = ["win32k-display", "smss-csrss"]
-faz = "Cria o \\Windows\\ApiPort e a seção compartilhada, carrega os servidores e chama o NtUserInitialize do win32k."
-para = "Para junto com a sessão: com vídeo, o win32k cai com 0xB4; sem vídeo, a sessão espera o primeiro adaptador."
+faz = "Cria o \\Windows\\ApiPort e a seção compartilhada, carrega os servidores (basesrv, winsrv, sxssrv) e o NtUserInitialize do win32k volta com sucesso."
+para = "Com vídeo, para no NtCreatePort da \\Windows\\SbApiPort (porta LPC de servidor em modo usuário); sem vídeo, a sessão espera o primeiro adaptador."
 
 [[roda]]
 nome = "basesrv.dll"
