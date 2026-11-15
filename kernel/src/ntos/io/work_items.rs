@@ -77,9 +77,16 @@ struct Queue {
     next_sequence: u64,
     kernel_routines: BTreeMap<u64, KernelWorkRoutine>,
     readiness: BTreeMap<u64, fn() -> bool>,
+    /// O instante (ms desde o boot) da chegada de cada item.
+    arrival: BTreeMap<u64, u64>,
 }
 
-static QUEUE: SpinLock<Queue> = SpinLock::new(Queue { entries: Vec::new(), sequence: BTreeMap::new(), next_sequence: 0, kernel_routines: BTreeMap::new(), readiness: BTreeMap::new() });
+static QUEUE: SpinLock<Queue> = SpinLock::new(Queue { entries: Vec::new(), sequence: BTreeMap::new(), next_sequence: 0, kernel_routines: BTreeMap::new(), readiness: BTreeMap::new(), arrival: BTreeMap::new() });
+/// Os itens entregues a uma worker dinâmica: (item, tipo, rotina interna).
+static HANDOFF: SpinLock<Vec<(u64, Kind, Option<KernelWorkRoutine>)>> = SpinLock::new(Vec::new());
+/// Quanto um item espera, com a worker desta CPU bloqueada, até ganhar uma
+/// worker dinâmica (o intervalo do ExpWorkerThreadBalanceManager).
+const BALANCE_INTERVAL_MS: u64 = 1000;
 /// As CPUs (pela KPCR) com um item em execução na pilha.
 static RUNNING_ON: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 
@@ -88,6 +95,7 @@ fn push(queue: &mut Queue, item: u64, kind: Kind) {
     let sequence = queue.next_sequence;
     queue.next_sequence += 1;
     queue.sequence.insert(item, sequence);
+    queue.arrival.insert(item, crate::ntos::ke::clock::uptime_ms());
     queue.entries.push((item, kind));
 }
 
@@ -186,6 +194,7 @@ pub fn unqueue(item: u64) {
     let mut queue = QUEUE.lock();
     let kind = queue.entries.iter().position(|&(queued, _)| queued == item).map(|index| queue.entries.remove(index).1);
     queue.sequence.remove(&item);
+    queue.arrival.remove(&item);
     forget_kernel_routine(&mut queue, item);
     if kind != Some(Kind::Ex) {
         body_at(item).queued.set(0);
@@ -208,10 +217,16 @@ pub fn run_queue() {
             let free = !RUNNING_ON.lock().contains(&processor);
             let sequence = &queue.sequence;
             let Some(index) = queue.entries.iter().position(|(item, _)| sequence.get(item).is_some_and(|&arrival| arrival < snapshot) && readiness.get(item).map_or(free, |ready| ready())) else {
+                let stalled = if free { None } else { take_stalled(&mut queue, snapshot) };
+                drop(queue);
+                if let Some(stalled) = stalled {
+                    start_dynamic_worker(stalled);
+                }
                 return;
             };
             let (item, kind) = queue.entries.remove(index);
             queue.sequence.remove(&item);
+            queue.arrival.remove(&item);
             let routine = queue.kernel_routines.remove(&item);
             queue.readiness.remove(&item);
             (item, kind, routine)
@@ -228,6 +243,59 @@ pub fn run_queue() {
         if outermost {
             RUNNING_ON.lock().retain(|&entry| entry != processor);
         }
+    }
+}
+
+/// O ExpWorkerThreadBalanceManager: com a worker desta CPU bloqueada numa
+/// espera dentro de um item, o item comum que já espera há um intervalo
+/// inteiro ganha uma worker dinâmica (uma thread de sistema que o executa
+/// e termina), como as threads que o NT cria quando as workers de uma fila
+/// estão todas bloqueadas. Assim o item que a worker bloqueada espera (o
+/// work item que outro driver enfileirou no caminho do pedido dela) anda
+/// sem rodar aninhado na pilha dela.
+fn take_stalled(queue: &mut Queue, snapshot: u64) -> Option<(u64, Kind, Option<KernelWorkRoutine>)> {
+    if crate::ntos::ps::process::get_system_process() == 0 {
+        return None;
+    }
+    let now = crate::ntos::ke::clock::uptime_ms();
+    let (sequence, arrival, readiness) = (&queue.sequence, &queue.arrival, &queue.readiness);
+    let index = queue.entries.iter().position(|(item, _)| sequence.get(item).is_some_and(|&order| order < snapshot) && !readiness.contains_key(item) && arrival.get(item).is_some_and(|&time| now.saturating_sub(time) >= BALANCE_INTERVAL_MS))?;
+    let (item, kind) = queue.entries.remove(index);
+    queue.sequence.remove(&item);
+    queue.arrival.remove(&item);
+    let routine = queue.kernel_routines.remove(&item);
+    Some((item, kind, routine))
+}
+
+/// Cria a worker dinâmica do item (fora da trava da fila); sem a thread, o
+/// item volta à fila.
+fn start_dynamic_worker((item, kind, routine): (u64, Kind, Option<KernelWorkRoutine>)) {
+    HANDOFF.lock().push((item, kind, routine));
+    let entry: extern "win64" fn(u64) = dynamic_worker;
+    let started = crate::ntos::mm::kernel_address::image_address(entry as usize as u64).ok().and_then(|start| crate::ntos::ps::kernel_threads::create_system_thread(0, start, item, 0x1F_FFFF, 0, None).ok());
+    match started {
+        Some(handle) => {
+            let _ = crate::ntos::ob::object_manager::close(handle as u32);
+        }
+        None => {
+            HANDOFF.lock().retain(|&(handed, _, _)| handed != item);
+            let mut queue = QUEUE.lock();
+            push(&mut queue, item, kind);
+            if let Some(routine) = routine {
+                queue.kernel_routines.insert(item, routine);
+            }
+        }
+    }
+}
+
+/// A rotina da worker dinâmica: executa o item entregue e termina.
+extern "win64" fn dynamic_worker(item: u64) {
+    let handed = {
+        let mut handoff = HANDOFF.lock();
+        handoff.iter().position(|&(handed, _, _)| handed == item).map(|index| handoff.remove(index))
+    };
+    if let Some((item, kind, routine)) = handed {
+        run_item(item, kind, routine);
     }
 }
 

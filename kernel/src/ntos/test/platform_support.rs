@@ -296,6 +296,40 @@ fn work_item_exports(assert: Assert) {
     work_items::run_queue();
     assert(queued == Some(1) && WORK_PARAMETER.load(Ordering::SeqCst) == 0xABCD, "ex: ExTryQueueWorkItem enfileira e o worker roda com o Parameter");
     guest::free_bytes(item);
+    stalled_worker(assert);
+}
+
+static STALLED_WAIT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// O item de dentro: sinaliza o evento do bloco.
+extern "win64" fn stalled_inner(block: u64) {
+    let _ = call_export("KeSetEvent", &[block, 0, 0]);
+}
+
+/// O item de fora: enfileira o de dentro e espera (até 5 s) o evento que
+/// ele sinaliza, como o acpi.sys que repassa o START ao pci.sys numa worker
+/// e espera o work item do pci.sys.
+extern "win64" fn stalled_outer(block: u64) {
+    let _ = call_export("ExInitializeWorkItem", &[block + 0x20, stalled_inner as extern "win64" fn(u64) as usize as u64, block]);
+    let _ = call_export("ExQueueWorkItem", &[block + 0x20, 1]);
+    guest::write64(block + 0x40, (-50_000_000i64) as u64);
+    STALLED_WAIT.store(call_export("KeWaitForSingleObject", &[block, 0, 0, 0, block + 0x40]).unwrap_or(u64::MAX), Ordering::SeqCst);
+}
+
+/// A worker bloqueada numa espera dentro de um item: o item que ela espera
+/// ganha uma worker dinâmica depois de um intervalo (o balance manager) e a
+/// espera termina com sucesso, sem o item rodar aninhado na pilha dela.
+fn stalled_worker(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    let _ = call_export("KeInitializeEvent", &[block, 0, 0]);
+    let _ = call_export("ExInitializeWorkItem", &[block + 0x60, stalled_outer as extern "win64" fn(u64) as usize as u64, block]);
+    STALLED_WAIT.store(u64::MAX, Ordering::SeqCst);
+    let started = clock::uptime_ms();
+    let _ = call_export("ExQueueWorkItem", &[block + 0x60, 1]);
+    work_items::run_queue();
+    let elapsed = clock::uptime_ms() - started;
+    assert(STALLED_WAIT.load(Ordering::SeqCst) == 0 && (1000..5000).contains(&elapsed), "ex: a worker bloqueada esperando um item da fila ganha uma worker dinamica depois do intervalo do balance manager");
+    guest::free_bytes(block);
 }
 
 pub fn run(assert: Assert) {
