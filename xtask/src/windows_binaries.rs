@@ -7,7 +7,9 @@
 //! memória). O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
 //! e a lista de revogação), os file systems de pipes e mailslots (npfs.sys e
 //! msfs.sys), o runtime do KMDF com um cliente (WdfLdr.sys, Wdf01000.sys,
-//! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, os
+//! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, a
+//! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys do
+//! repositório de drivers), os
 //! arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
@@ -45,8 +47,17 @@ const BUNDLED: &[&str] = &[
 /// Arquivos do volume NTFS: (caminho no volume, origem no Windows).
 const NTFS_FILES: &[(&str, &str)] = &[
     ("CNG.SYS", "System32/drivers/cng.sys"),
-    // O núcleo gráfico (DXGKrnl), iniciado por `--start-driver=DXGKrnl`.
+    // O núcleo gráfico (DXGKrnl), iniciado por `--start-driver=DXGKrnl`, e o
+    // gerenciador de memória de vídeo que ele carrega quando um adaptador
+    // inicia.
     ("DXGKRNL.SYS", "System32/drivers/dxgkrnl.sys"),
+    ("DXGMMS2.SYS", "System32/drivers/dxgmms2.sys"),
+    // O driver de vídeo básico (`--display=basic`), no repositório de drivers
+    // onde a instalação o deixa (o ImagePath do serviço BasicDisplay).
+    (
+        "Windows/System32/DriverStore/FileRepository/basicdisplay.inf_amd64_19e58b6267591a82/BasicDisplay.sys",
+        "System32/DriverStore/FileRepository/basicdisplay.inf_amd64_19e58b6267591a82/BasicDisplay.sys",
+    ),
     // A CI original e a sua dependência, carregadas do volume.
     ("CI.DLL", "System32/ci.dll"),
     ("MSRPC.SYS", "System32/drivers/msrpc.sys"),

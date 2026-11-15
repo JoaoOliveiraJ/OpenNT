@@ -10,7 +10,8 @@
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
-//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`.
+//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
+//! `--display=basic`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
@@ -42,7 +43,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status|nt-types> [opc
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
-                   --trace-driver-api --initial-process=smss --storage=real
+                   --trace-driver-api --initial-process=smss --storage=real --display=basic
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)";
@@ -73,6 +74,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             trace_driver_api: false,
             initial_process: String::new(),
             storage: String::new(),
+            display: String::new(),
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4 },
         positional: Vec::new(),
@@ -100,6 +102,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
+            "--display" => parsed.build.display = required()?,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?

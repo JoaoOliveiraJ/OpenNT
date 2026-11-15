@@ -90,4 +90,9 @@ pub fn init() {
     if crate::drivers::storage::storage_stack::ENABLED {
         crate::drivers::storage::storage_stack::initialize();
     }
+    // `--display=basic`: o BasicDisplay.sys real sobe pelo PnP no adaptador
+    // VGA, sobre o dxgkrnl.sys real.
+    if crate::drivers::video::display_stack::ENABLED {
+        crate::drivers::video::display_stack::initialize();
+    }
 }

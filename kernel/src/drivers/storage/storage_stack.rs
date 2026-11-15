@@ -165,19 +165,10 @@ pub fn initialize() {
         debug_print!("[storage] Registro: {}", error);
         return;
     }
-    let root_bus = match crate::drivers::bus::pci::create_root_bus() {
-        Ok(pdo) => pdo,
-        Err(error) => {
-            debug_print!("[storage] barramento raiz: {}", error);
-            return;
-        }
-    };
-    if let Err(error) = pnp::tree::initialize() {
+    if let Err(error) = crate::drivers::bus::device_tree::prepare() {
         debug_print!("[storage] raiz do PnP: {}", error);
         return;
     }
-    pnp::root::add_platform_bus(root_bus);
-    pnp::tree::mark_internal(root_bus);
     // Os drivers de boot sem dispositivo a esperar, na ordem dos grupos
     // (Boot Bus Extender, System Bus Extender): o volmgr.sys relata o
     // próprio dispositivo raiz (IoReportDetectedDevice) no DriverEntry.

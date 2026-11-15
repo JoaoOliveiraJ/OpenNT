@@ -33,6 +33,9 @@ pub struct BuildOptions {
     pub initial_process: String,
     /// `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
     pub storage: String,
+    /// `--display=basic`: o PnP instala o BasicDisplay.sys real no adaptador
+    /// VGA e o inicia sobre o dxgkrnl.sys real.
+    pub display: String,
 }
 
 pub struct BuildOutput {
@@ -93,7 +96,8 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         .env("OPENNT_KERNEL_TEST_SCOPE", &options.kernel_test_scope)
         .env("OPENNT_START_DRIVER", &options.start_driver)
         .env("OPENNT_INITIAL_PROCESS", &options.initial_process)
-        .env("OPENNT_STORAGE", &options.storage);
+        .env("OPENNT_STORAGE", &options.storage)
+        .env("OPENNT_DISPLAY", &options.display);
     if options.trace_driver_api {
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {
