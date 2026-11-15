@@ -34,6 +34,8 @@ pub mod scm_flags {
     pub const MODIFIED_WRITE_DISABLED: u32 = 0x200;
     /// PinAccess do CcInitializeCacheMap (o encolhimento não purga).
     pub const PIN_ACCESS: u32 = 0x4;
+    /// O lazy writer está gravando o mapa.
+    pub const WRITE_QUEUED: u32 = 0x20;
     /// CcGetFileObjectFromSectionPtrs marca o bit 20.
     pub const FILE_OBJECT_QUERIED: u32 = 1 << 20;
     /// CcSetParallelFlushFile.

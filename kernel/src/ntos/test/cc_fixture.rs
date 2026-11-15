@@ -148,7 +148,12 @@ pub fn close(file: u64) {
     let _ = file_objects::dereference(file);
 }
 
+/// Um mapa que o teste deixou para o lazy writer sai antes de o arquivo e o
+/// dispositivo voltarem à memória.
 pub fn destroy(fixture: Fixture) {
+    if crate::ntos::cc::cache_map::info(fixture.pointers).is_some() {
+        crate::ntos::cc::lazy_writer::wait_for_current_lazy_writer_activity();
+    }
     close(fixture.file);
     for block in [fixture.driver, fixture.device, fixture.pointers, fixture.sizes] {
         guest::free_bytes(block);

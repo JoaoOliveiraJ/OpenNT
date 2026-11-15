@@ -6831,6 +6831,20 @@ fn cc_cache_map_exports(assert: Assert) {
     dispatcher::initialize_event(kevent, 0, false);
     assert(call_export("CcUninitializeCacheMap", &[f.file, 0, event]) == Some(0) && dispatcher::read_state(kevent) == 1, "cc: CcUninitializeCacheMap sem cache devolve FALSE e sinaliza o evento");
     assert(call_export("CcSetFileSizesEx", &[f.file, sizes]) == Some(0) && call_export("CcGetFileObjectFromSectionPtrs", &[f.pointers]) == Some(0), "cc: sem mapa, CcSetFileSizesEx e CcGetFileObjectFromSectionPtrs");
+    // O último CcUninitializeCacheMap sem evento: com PinAccess e sem
+    // páginas sujas o mapa sai na hora (TRUE) e solta a referência do
+    // FILE_OBJECT; sem PinAccess fica para o lazy writer (FALSE), com a
+    // referência retida até a passada.
+    let references = crate::ntos::ob::objects::file::reference_count(f.file).unwrap_or(0);
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 1, 0, 0]);
+    let held = crate::ntos::ob::objects::file::reference_count(f.file) == Some(references + 1);
+    let pinned = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    assert(held && pinned == Some(1) && cache_map::info(f.pointers).is_none() && crate::ntos::ob::objects::file::reference_count(f.file) == Some(references), "cc: mapa com PinAccess sem paginas sujas apagado no ultimo CcUninitializeCacheMap");
+    let _ = call_export("CcInitializeCacheMap", &[f.file, f.sizes, 0, 0, 0]);
+    let unpinned = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let scheduled = crate::ntos::cc::lazy_writer::scan_scheduled();
+    let waited = call_export("CcWaitForCurrentLazyWriterActivity", &[]);
+    assert(unpinned == Some(0) && scheduled && waited == Some(0) && cache_map::info(f.pointers).is_none() && crate::ntos::ob::objects::file::reference_count(f.file) == Some(references), "cc: mapa sem PinAccess fica para o lazy writer, que o apaga e solta o FILE_OBJECT");
     guest::free_bytes(event);
     guest::free_bytes(sizes);
     fixture::close(other);
@@ -6897,10 +6911,16 @@ fn cc_copy_exports(assert: Assert) {
     let routine = crate::ntos::mm::kernel_address::image_address(routine).unwrap_or(routine);
     let _ = call_export("CcDeferWrite", &[f.file, routine, 0x1234_0000, 0x5678, 0x1000, 0]);
     assert(POSTED.load(Ordering::SeqCst) == 0x1234_5678, "cc-copy: CcDeferWrite posta na hora quando pode escrever");
-    // O último CcUninitializeCacheMap grava as quatro páginas sujas.
-    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    // O último CcUninitializeCacheMap de um mapa sujo o deixa para o lazy
+    // writer (FALSE), que grava as quatro páginas e apaga o mapa, soltando
+    // então a referência do FILE_OBJECT.
+    let references = crate::ntos::ob::objects::file::reference_count(f.file).unwrap_or(0);
+    let deferred = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    assert(deferred == Some(0), "cc-copy: ultimo CcUninitializeCacheMap com paginas sujas fica para o lazy writer (FALSE)");
+    let waited = call_export("CcWaitForCurrentLazyWriterActivity", &[]);
     let on_disk = (0..0x100u64).all(|index| fixture::disk_byte(0x2080 + index) == Some((index as u8) ^ 0x5A)) && fixture::disk_byte(0x207F) == Some(fixture::pattern(0x207F)) && fixture::disk_byte(0x2_0000) == Some(0x77) && fixture::disk_byte(0x2_0FFF) == Some(0x77);
-    assert(deleted == Some(1) && fixture::WRITES.load(Ordering::SeqCst) == 4 && on_disk && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-copy: ultimo CcUninitializeCacheMap grava os dados sujos por paginacao");
+    let released = crate::ntos::ob::objects::file::reference_count(f.file) == Some(references - 1);
+    assert(waited == Some(0) && cache_map::info(f.pointers).is_none() && released && fixture::WRITES.load(Ordering::SeqCst) == 4 && on_disk && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-copy: o lazy writer grava os dados sujos por paginacao, apaga o mapa e solta o FILE_OBJECT");
     guest::free_bytes(block);
     fixture::destroy(f);
 }
@@ -6984,8 +7004,9 @@ fn cc_pin_exports(assert: Assert) {
     let _ = call_export("CcUnpinDataForThread", &[first_address, crate::ntos::ps::process::get_current_thread()]);
     let _ = call_export("CcUnpinData", &[written_address]);
     assert(cache_map::info(f.pointers).is_some_and(|info| info.bcbs == 1 && info.dirty_pages == 1), "cc-pin: unpin solta o BCB limpo e mantem o sujo ate a escrita");
-    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
-    assert(deleted == Some(1) && fixture::disk_byte(0x2_0000) == Some(0) && fixture::disk_byte(0x2_0FFF) == Some(0) && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-pin: o BCB sujo vai ao disco no ultimo CcUninitializeCacheMap");
+    let deferred = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let waited = call_export("CcWaitForCurrentLazyWriterActivity", &[]);
+    assert(deferred == Some(0) && waited == Some(0) && cache_map::info(f.pointers).is_none() && fixture::disk_byte(0x2_0000) == Some(0) && fixture::disk_byte(0x2_0FFF) == Some(0) && fixture::BAD_IRPS.load(Ordering::SeqCst) == 0, "cc-pin: o mapa com o BCB sujo fica para o lazy writer, que o grava e apaga o mapa");
     guest::free_bytes(block);
     fixture::destroy(f);
 }
@@ -7056,7 +7077,11 @@ fn cc_flush_exports(assert: Assert) {
     let views = cache_map::info(f.pointers).map_or(0, |info| info.views);
     let unmapped = call_export("CcUnmapFileOffsetFromSystemCache", &[f.file, offset, 0x4_0000]);
     assert(views != 0 && unmapped == Some(1) && cache_map::info(f.pointers).is_some_and(|info| info.views < views), "cc-flush: CcUnmapFileOffsetFromSystemCache retira as vistas ociosas");
-    let _ = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    // Sem PinAccess nem evento, o mapa limpo também fica para o lazy writer
+    // apagar.
+    let deferred = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let _ = call_export("CcWaitForCurrentLazyWriterActivity", &[]);
+    assert(deferred == Some(0) && cache_map::info(f.pointers).is_none(), "cc-flush: mapa sem PinAccess apagado pelo lazy writer");
     // Sem cache map, CcZeroData grava zeros direto por paginação.
     start_offset.set(0x4000);
     end_offset.set(0x5000);
@@ -7118,8 +7143,9 @@ fn cc_mdl_exports(assert: Assert) {
     let _ = call_export("CcPrepareMdlWrite", &[f.file, offset, 0x1000, chain, iosb]);
     let _ = call_export("CcMdlWriteAbort", &[f.file, chain_head.get()]);
     assert(cache_map::info(f.pointers).is_some_and(|info| info.dirty_pages == 1), "cc-mdl: CcMdlWriteAbort descarta sem sujar");
-    let deleted = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
-    assert(deleted == Some(1) && fixture::disk_byte(0x6000) == Some(0x3C) && fixture::disk_byte(0x6FFF) == Some(0x3C) && fixture::disk_byte(0x8000) == Some(fixture::pattern(0x8000)), "cc-mdl: a escrita por MDL vai ao disco");
+    let deferred = call_export("CcUninitializeCacheMap", &[f.file, 0, 0]);
+    let _ = call_export("CcWaitForCurrentLazyWriterActivity", &[]);
+    assert(deferred == Some(0) && cache_map::info(f.pointers).is_none() && fixture::disk_byte(0x6000) == Some(0x3C) && fixture::disk_byte(0x6FFF) == Some(0x3C) && fixture::disk_byte(0x8000) == Some(fixture::pattern(0x8000)), "cc-mdl: a escrita por MDL vai ao disco pelo lazy writer");
     guest::free_bytes(block);
     fixture::destroy(f);
 }

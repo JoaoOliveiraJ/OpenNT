@@ -8,11 +8,11 @@
 //! FlushToLsnRoutine(LogHandle, NewestLsn). Uma falha devolve as páginas ao
 //! estado sujo e o status sai no IoStatus (CcFlushCache não levanta).
 //!
-//! Sem thread de lazy writer: os dados sujos saem por CcFlushCache, pelo
-//! write-through, pelo último CcUninitializeCacheMap e por
-//! [`lazy_write_pass`], que roda (com AcquireForLazyWrite/ReleaseFromLazyWrite
-//! sem espera e o TopLevelIrp preservado) quando o CcCanIWrite passa do
-//! limite de páginas sujas.
+//! Os dados sujos saem por CcFlushCache, pelo write-through, pelo lazy
+//! writer (`lazy_writer.rs`) e por [`lazy_write_pass`], que roda (com
+//! AcquireForLazyWrite/ReleaseFromLazyWrite sem espera e o TopLevelIrp
+//! preservado) no lugar do escritor estrangulado quando o CcCanIWrite passa
+//! do limite de páginas sujas.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -260,8 +260,10 @@ pub fn flush_cache_to_lsn(pointers: u64, lsn: u64, io_status: u64) -> CcResult<(
 }
 
 /// CcPurgeCacheSection(SectionObjectPointer, FileOffset, Length, Flags).
-/// UNINITIALIZE_CACHE_MAPS solta os mapas privados de todos os FILE_OBJECTs;
-/// um mapa que fica sem abertos é gravado (o que restou sujo) e apagado.
+/// UNINITIALIZE_CACHE_MAPS solta os mapas privados de todos os FILE_OBJECTs
+/// (o CcUninitializeCacheMap de cada um); um mapa que fica sem abertos
+/// segue a regra do último CcUninitializeCacheMap: fica para o lazy writer
+/// ou é apagado já.
 pub fn purge_cache_section(pointers: u64, offset_pointer: u64, length: u32, flags: u32) -> CcResult<bool> {
     let Some(base) = cache_map::map_of_pointers(pointers) else { return Ok(true) };
     let (start, end) = byte_range(offset_pointer, length, true);
@@ -279,14 +281,22 @@ pub fn purge_cache_section(pointers: u64, offset_pointer: u64, length: u32, flag
         (purged, cache.maps.get(&base).is_some_and(|map| map.open_count == 0))
     };
     if orphaned {
-        let (code, _) = write_range(base, 0, u64::MAX, None)?;
-        let deleted = {
+        let (deferred, deleted) = {
             let mut cache = CACHE.lock();
-            if code >> 30 == 3 {
-                discard_dirty(&mut cache, base);
+            match cache.maps.get_mut(&base) {
+                Some(map) if map.open_count == 0 => {
+                    if cache_map::defer_to_lazy_writer(map, false) {
+                        (true, None)
+                    } else {
+                        (false, cache_map::delete_if_idle(&mut cache, base))
+                    }
+                }
+                _ => (false, None),
             }
-            if cache.maps.get(&base).is_some_and(|map| map.open_count == 0) { cache_map::delete_if_idle(&mut cache, base) } else { None }
         };
+        if deferred {
+            super::lazy_writer::request_other_work(false);
+        }
         if let Some(deleted) = deleted {
             deleted.finish();
         }
@@ -422,10 +432,10 @@ pub fn lazy_write_pass() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// CcWaitForCurrentLazyWriterActivity: nenhuma passada fica pendente neste
-/// modelo síncrono; STATUS_SUCCESS.
+/// CcWaitForCurrentLazyWriterActivity: uma passada rápida do lazy writer e
+/// a espera do fim dela.
 pub fn wait_for_current_lazy_writer_activity() -> u32 {
-    status::SUCCESS
+    super::lazy_writer::wait_for_current_lazy_writer_activity()
 }
 
 /// CcUnmapFileOffsetFromSystemCache(FileObject, FileOffset, Length): retira as

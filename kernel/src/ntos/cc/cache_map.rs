@@ -12,10 +12,11 @@
 //! Contrato de lock: [`CACHE`] nunca fica preso durante uma chamada nativa
 //! (IRP de paginação, callbacks do FS, dereference de FILE_OBJECT).
 //!
-//! Diferença em relação ao Windows: sem lazy writer, o último
-//! CcUninitializeCacheMap grava os dados sujos de forma síncrona e apaga o
-//! cache map na hora (devolve TRUE); o Windows deixa o mapa na lista suja e o
-//! lazy writer o apaga depois.
+//! O último CcUninitializeCacheMap segue o NT: um mapa com páginas sujas,
+//! com escrita do lazy writer em curso ou sem PinAccess (e sem evento de
+//! desinicialização) fica para o lazy writer (`lazy_writer.rs`), que grava
+//! os dados e apaga o mapa depois, soltando então a referência do stream
+//! file (devolve FALSE); os demais são apagados na hora (TRUE).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -93,6 +94,10 @@ pub struct MapState {
     /// CACHE_UNINITIALIZE_EVENTs sinalizados quando o mapa for apagado.
     pub events: Vec<u64>,
     pub delete_pending: bool,
+    /// O lazy writer está gravando o mapa (WRITE_QUEUED).
+    pub write_queued: bool,
+    /// O último CcUninitializeCacheMap deixou o mapa para o lazy writer apagar.
+    pub lazy_delete: bool,
 }
 
 impl MapState {
@@ -196,7 +201,12 @@ pub fn publish(map: &MapState) {
     native.section_size.quad_part.set(map.section_size as i64);
     native.valid_data_length.quad_part.set(map.valid_data_length as i64);
     native.valid_data_goal.quad_part.set(map.valid_data_goal as i64);
-    native.dirty_pages.atomic().store(map.dirty_pages(), Ordering::SeqCst);
+    // Um mapa que ganha páginas sujas entra na mira do lazy writer
+    // (CcSetDirtyInMask: CcScheduleLazyWriteScan sem passada agendada).
+    let dirty = map.dirty_pages();
+    if native.dirty_pages.atomic().swap(dirty, Ordering::SeqCst) == 0 && dirty != 0 {
+        super::lazy_writer::schedule_scan(false);
+    }
     native.num_active_vacb.atomic().store(map.views.values().filter(|view| view.maps != 0).count() as u32, Ordering::SeqCst);
 }
 
@@ -281,6 +291,7 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
     if pointers == 0 || sizes == 0 {
         return Err(Failure::Kernel(KernelError::new("CcInitializeCacheMap without SectionObjectPointer or file sizes")));
     }
+    super::lazy_writer::initialize();
     let (allocation, file_size, valid_data_length) = read_file_sizes(sizes);
     let section_size = round_up(allocation, layout::VIEW_SIZE);
     let shared = &pointers_at(pointers).shared_cache_map;
@@ -309,6 +320,8 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
                 log: LogHandle::default(),
                 events: Vec::new(),
                 delete_pending: false,
+                write_queued: false,
+                lazy_delete: false,
             });
             shared.set(base);
             Some(base)
@@ -347,6 +360,7 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
         map.private_maps.push((file, address));
         map.open_count += 1;
         map.delete_pending = false;
+        map.lazy_delete = false;
     }
     publish(map);
     Ok(())
@@ -425,6 +439,18 @@ pub fn delete_if_idle(cache: &mut CacheManager, base: u64) -> Option<Deleted> {
     Some(Deleted { file: map.file_object, referenced: map.referenced, events: map.events, views })
 }
 
+/// O último FILE_OBJECT saiu do mapa (OpenCount 0): como no
+/// CcUninitializeCacheMap do NT, um mapa sem PinAccess (e sem evento de
+/// desinicialização), com escrita do lazy writer em curso ou com páginas
+/// sujas fica para o lazy writer apagar (TRUE); os demais são apagados já.
+pub fn defer_to_lazy_writer(map: &mut MapState, with_event: bool) -> bool {
+    let deferred = (map.flags() & scm_flags::PIN_ACCESS == 0 && !with_event) || map.write_queued || map.dirty_pages() != 0;
+    if deferred {
+        map.lazy_delete = true;
+    }
+    deferred
+}
+
 /// Libera uma referência de vista e conclui uma remoção pendente.
 pub fn release_view(base: u64, index: u64) {
     let deleted = {
@@ -445,10 +471,13 @@ pub fn release_view(base: u64, index: u64) {
     }
 }
 
-/// CcUninitializeCacheMap: solta o mapa privado do FILE_OBJECT; TruncateSize
-/// encurta o arquivo e descarta o cache além dele; o último mapa privado
-/// grava os dados sujos e apaga o SHARED_CACHE_MAP (TRUE). Sem cache, só
-/// sinaliza o evento (FALSE).
+/// CcUninitializeCacheMap (RVA 0x276f30): solta o mapa privado do
+/// FILE_OBJECT; TruncateSize encurta o arquivo e descarta o cache além dele.
+/// Com outros FILE_OBJECTs no mapa, o evento é sinalizado já (FALSE). No
+/// último, o mapa sem PinAccess e sem evento, com escrita do lazy writer em
+/// curso ou com páginas sujas fica para o lazy writer (FALSE, o evento vai
+/// com o mapa); senão é apagado agora (TRUE). Sem cache, só sinaliza o
+/// evento (FALSE).
 pub fn uninitialize_cache_map(file: u64, truncate_size: u64, event: u64) -> CcResult<bool> {
     let base = match map_of_file(file) {
         Some(base) => base,
@@ -478,22 +507,31 @@ pub fn uninitialize_cache_map(file: u64, truncate_size: u64, event: u64) -> CcRe
             flush::truncate_cached_data(&mut cache, base, size);
         }
         let Some(map) = cache.maps.get_mut(&base) else { return Ok(false) };
+        publish(map);
+        if map.open_count != 0 {
+            // Outros FILE_OBJECTs ainda usam o mapa: o evento é sinalizado
+            // agora se sobra mapa privado, senão vai com o mapa.
+            let signal_now = event != 0 && !map.private_maps.is_empty();
+            if event != 0 && !signal_now {
+                map.events.push(event);
+            }
+            drop(cache);
+            if signal_now {
+                signal_uninitialize_event(event);
+            }
+            return Ok(false);
+        }
         if event != 0 {
             map.events.push(event);
         }
-        publish(map);
-        if map.open_count != 0 {
+        if defer_to_lazy_writer(map, event != 0) {
+            drop(cache);
+            super::lazy_writer::request_other_work(event != 0);
             return Ok(false);
         }
     }
-    // Último mapa privado: o papel do lazy writer, de forma síncrona.
-    let (status, _) = flush::write_range(base, 0, u64::MAX, None)?;
     let deleted = {
         let mut cache = CACHE.lock();
-        if status != 0 {
-            debug_print!("[cc] delayed write failed ({:#x}); dirty data of {:#x} discarded", status, base);
-            flush::discard_dirty(&mut cache, base);
-        }
         if cache.maps.get(&base).is_some_and(|map| map.open_count != 0) {
             return Ok(false);
         }
