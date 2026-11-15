@@ -1575,8 +1575,8 @@ Sem as opções nada disso roda.
   importam; o npfs.sys e o msfs.sys, com os serviços Npfs e Msfs, vão em
   todo boot), e a hive SYSTEM desse build (ou a semente em
   memória, sem o arquivo) leva o Registro que eles leem: a
-  chave Session Manager (`cm/session_manager.rs`: SubSystems com a linha do
-  csrss, KnownDLLs, DOS Devices, Environment; sem Kmode, BootExecute nem
+  chave Session Manager (`cm/session_manager.rs`: SubSystems com o Kmode e
+  a linha do csrss, KnownDLLs, DOS Devices, Environment; sem BootExecute nem
   arquivos de paginação); em memória ficam a
   árvore `IniFileMapping` da hive SOFTWARE que o basesrv lê
   (`cm/ini_file_mapping.rs`) e, na hive de hardware, o
@@ -1614,15 +1614,67 @@ Sem as opções nada disso roda.
   e a pré-busca, `mm/prefetch.rs`; a VmImageHotPatchInformation que a ntdll
   pede a cada DLL é STATUS_NOT_SUPPORTED, sem reserva de hot patch) e o
   MEM_RELEASE com a faixa da região inteira. O marcador `SMSS_CSRSS_OK` sai
-  quando o csrss.exe criado por um smss pede o primeiro serviço do win32k
-  (`ex/service_table.rs::out_of_range` -> `initial_process::win32k_requested`)
+  quando uma thread do csrss.exe criado por um smss pede pela primeira vez
+  um serviço da tabela do win32k (`ex/service_table.rs::out_of_range` ->
+  `initial_process::win32k_requested`, antes da conversão em thread GUI)
   com o smss inicial e o csrss vivos: o csrss carrega o basesrv (diretórios
   `\BaseNamedObjects`, links e o mapeamento de .ini), o winsrv e o
   winsrvext, que importa o user32 real; a inicialização do user32 (com o
   kernelbase, o kernel32, o gdi32 e o gdi32full reais) chega ao NtGdiInit
-  (serviço 0x12e3), o primeiro do win32k, que ainda não está carregado.
+  (serviço 0x12e3), o primeiro do win32k, que o win32k.sys real carregado
+  pelo smss atende (veja o item seguinte).
   Com `OPENNT_TRACE_SYSCALLS`, as linhas `[sys]` dos serviços que abrem ou
   criam objetos por nome mostram o nome do OBJECT_ATTRIBUTES.
+- **O win32k.sys real pelo smss** (`ex/system_information.rs`,
+  `mm/sysload.rs`, `mm/session_image.rs`, `ps/win32.rs`,
+  `po/power_information.rs`): no boot do smss o DXGKrnl tem o Start 1 da
+  instalação (`cm/service/inbox_drivers.rs`) e sobe com os drivers de
+  sistema, depois do `Control\GraphicsDrivers` (`cm/graphics_defaults.rs`),
+  e o build põe no volume o win32k.sys, o win32kbase.sys, o win32kfull.sys,
+  o hidparse.sys e o cdd.dll. O smss da sessão (o mestre da sessão 0) lê o
+  `Kmode` e chama o NtSetSystemInformation(SystemExtendServiceTableInformation)
+  com o SeLoadDriverPrivilege: o ramo de modo usuário sonda o buffer, exige
+  o mestre de sessão (Vm.Flags.SessionMaster), o privilégio e exatamente
+  `\SystemRoot\System32\win32k.sys`, e reentra pelo
+  ZwSetSystemInformation(38) em KernelMode. O ramo de kernel carrega a
+  imagem com LoadFlags 0x80000005 (imagem de sessão e compactação da
+  W32pServiceTable, o MiCompactServiceTable) e chama o ponto de entrada com
+  um DRIVER_OBJECT zerado (ExpInitializeSessionDriver); no sucesso, o
+  MmSessionSetUnloadAddress grava o DriverUnload na sessão, que libera os
+  callouts Win32 dela (MmSessionGetWin32Callouts: só processos de uma
+  sessão com DriverUnload >= 2 usam o PsWin32CallBack). O DriverEntry do
+  win32k resolve os contratos `ext-ms-win-*-win32k-*` pelo ApiSetMap da PEB
+  do smss e carrega os hospedeiros com MmLoadSystemImage(0x80000001): o
+  win32kbase.sys e o win32kfull.sys como imagens de sessão, o hidparse.sys
+  antes pelo SystemLoadGdiDriverInSystemSpace (54) e solto pelo
+  SystemUnloadGdiDriverInformation (27). O import de uma imagem já
+  carregada pelo MmLoadSystemImage (o win32kfull importa do win32kbase e do
+  hidparse) acha a entrada pela lista de imagens carregadas, como o
+  MiResolveImageReferences, e retém o LoadCount dela; a imagem de sistema
+  só sai quando ele zera. Cada sessão conta as cargas de uma imagem de
+  sessão (o ImageCountInThisSession): a segunda carga na mesma sessão
+  devolve sucesso sem LoadCount, e o MmUnloadSystemImage correspondente só
+  desconta. O Win32kBaseDriverEntry cria `\Driver\Win32k`, conecta-se a
+  `\Device\DxgKrnl`, publica a tabela 1 e a filtro (KeAddSystemServiceTable)
+  e os callouts (PsEstablishWin32Callouts, pelo win32k.sys), e pede ao
+  kernel o que o init do GDI e do USER usa: a seção nomeada
+  `\Win32kCrossSessionGlobals` com OBJ_KERNEL_EXCLUSIVE (0x10000, aceito na
+  captura dos atributos e no handle), PagedPoolSession com o bit NX
+  (0x221), ExAllocatePoolWithQuotaTag de PagedPoolSession (a quota vai no
+  bloco do heap da sessão e volta no free), o MmPageEntireDriver de uma
+  imagem de sessão (só a DllBase), as listas LOOKASIDE_LIST_EX (o
+  AllocateEx e o FreeEx recebem a lista) e o ZwPowerInformation de
+  SessionPowerInit (41), SessionPowerCleanup (63) e SystemVideoState (29).
+  O marcador `WIN32K_LOADED` (`initial_process::session_driver_initialized`)
+  sai quando o DriverEntry volta STATUS_SUCCESS com a tabela 1 do
+  KeServiceDescriptorTableShadow e os callouts no lugar. Com
+  `--trace-driver-api`, o DriverEntry do driver de sessão imprime cada
+  export que chama. O teste é o [[teste]] `win32k`. Depois do NtGdiInit o
+  user32 inicializa no csrss, mas o cfgmgr32.dll, que o winsrvext importa,
+  recusa a carga (CMApiEntry) sem o `\Device\DeviceApi\CMApi`, a interface
+  de dispositivos do PnP do ntoskrnl (PiCMHandleIoctl), que o OpenNT ainda
+  não cria; o winsrv volta STATUS_NOT_IMPLEMENTED antes do NtUserInitialize
+  e o csrss sai.
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
@@ -1733,7 +1785,10 @@ Sem as opções nada disso roda.
   volume aberto e lido pelo file system real iniciado com `--start-driver`),
   `SMSS_CSRSS_OK` (com `--initial-process=smss`: o
   csrss.exe real criado pelo smss.exe real chega ao win32k;
-  `cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1`);
+  `cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1`),
+  `WIN32K_LOADED` (no mesmo boot: o win32k.sys real carregado pelo smss,
+  com a tabela 1 e os callouts;
+  `cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"`);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx). O `test-boot` procura falhas desde o boot até
   a última saída esperada e, com `--hold=MS`, por mais MS milissegundos.

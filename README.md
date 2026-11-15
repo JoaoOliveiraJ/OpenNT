@@ -171,6 +171,9 @@ cargo xtask test-boot DRIVER_START_COMPLETED 300000 --start-driver=DXGKrnl --bui
 # O smss.exe real como primeiro processo, até o csrss.exe que ele cria.
 cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1
 
+# O mesmo boot com o win32k.sys real carregado pelo smss da sessão.
+cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"
+
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
 
