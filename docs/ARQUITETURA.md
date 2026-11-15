@@ -64,8 +64,9 @@ kernel/src/
 │   │   │              subchaves, 'sk', 'nk'/'vk'/'db', logs e descarga
 │   │   ├── key/       chaves e serviços Nt/Zw de chave
 │   │   └── service/   serviços e drivers (base, canal, RPC)
-│   ├── rtl/           a Rtl do NT: strings, Unicode, páginas de código, AVL, bitmap,
-│   │   │              exceções, imagens PE, tabelas de átomos (atom), heap (heap)
+│   ├── rtl/           a Rtl do NT: strings, Unicode, páginas de código, AVL, árvore
+│   │   │              rubro-negra (rb_tree), bitmap, exceções, imagens PE, tabelas de
+│   │   │              átomos (atom), heap (heap), CRT (crt, printf, scanf)
 │   │   └── resource/  recursos de imagens (ldrrsrc) e tabelas de mensagens
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── po/ etw/ kd/ dbgk/ fsrtl/
@@ -1022,6 +1023,16 @@ dentro dele) que não é compartilhado entre as raízes:
   abre o arquivo pelo nome da fonte. Um encaminhamento de export de kernel
   não traz a extensão ("NDIS.NdisMatchPdoWithPacket"): como no MiSnapThunk,
   vale a imagem carregada cujo BaseDllName começa com "<módulo>.".
+- **PsLoadedModuleList e PsLoadedModuleResource** (`mm/loaded_images.rs`) são
+  exports de dado: a cabeça LIST_ENTRY e o ERESOURCE moram na `.kdata` do
+  kernel (`mm/kernel_data_layout.rs`). A fase 0, logo depois de o System
+  existir, inicializa o recurso e liga a lista às KLDR_DATA_TABLE_ENTRY já
+  registradas (ntoskrnl primeiro, depois a HAL e os drivers, na ordem de
+  registro); cada carga, descarga, ocultação ou troca de Flags refaz a lista
+  com o recurso exclusivo e a região crítica (como o MiProcessLoaderEntry),
+  e quem percorre a lista (depuradores, antivírus, anti-cheat) a lê sob o
+  recurso compartilhado. Antes da publicação, fora de uma thread ou acima de
+  APC_LEVEL vale só a trava do registro.
 - As imagens de usuário ficam na ImageBase do cabeçalho quando a faixa está
   livre na metade de usuário (ou na primeira faixa livre a partir de 64 KB,
   relocadas), também sobre frames do PFN.
