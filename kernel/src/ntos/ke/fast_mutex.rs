@@ -28,15 +28,15 @@ fn compare_exchange(cell: &core::sync::atomic::AtomicI32, expected: u32, replace
     }
 }
 
-/// Exige IRQL até APC_LEVEL; as variantes inseguras em PASSIVE_LEVEL exigem
-/// as APCs desligadas pela região correspondente.
-fn validate_caller(caller_controls_irql: bool, requires_guarded_region: bool) -> Result<u8, KernelError> {
+/// Exige IRQL até APC_LEVEL. As variantes inseguras deixam as APCs a cargo
+/// do chamador sem conferir, como o ExAcquireFastMutexUnsafe do ntoskrnl
+/// 19041 (o KeAcquireGuardedMutexUnsafe é o mesmo código): o file system
+/// as usa em threads do lazy writer e em worker threads, que entram nele com
+/// as APCs ligadas (o LfsFlushToLsn do ntfs.sys).
+fn validate_caller(_caller_controls_irql: bool, _requires_guarded_region: bool) -> Result<u8, KernelError> {
     let level = irql::get_irql();
     if level > 1 {
         return Err(KernelError::new("fast/guarded mutex IRQL exceeds APC_LEVEL"));
-    }
-    if caller_controls_irql && level == 0 && !(if requires_guarded_region { critical_region::all_disabled() } else { critical_region::disabled() }) {
-        return Err(KernelError::new("unsafe mutex requires APCs disabled by its caller"));
     }
     Ok(level)
 }
