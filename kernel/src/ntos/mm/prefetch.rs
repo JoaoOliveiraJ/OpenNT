@@ -83,9 +83,9 @@ const MAXIMUM_PAGES_PER_RANGE: u64 = 0x1_0000;
 /// com PROCESS_VM_OPERATION em KernelMode, e as faixas são lidas anexado a
 /// ele. As VAs de sistema e de sessão do OpenNT estão sempre residentes: a
 /// pré-busca delas não lê nada. O win32k pede a de sessão (-3) para a tabela
-/// de handles do GDI (HmgPrefetchAllObjt). O OpenNT ainda não tem o objeto
-/// Session, o segundo tipo que o NT aceita no handle: o status da
-/// referência como processo volta.
+/// de handles do GDI (HmgPrefetchAllObjt). Um handle de kernel que não é de
+/// processo pode ser de um objeto Session (SESSION_QUERY_ACCESS), cuja
+/// pré-busca não lê nada; senão volta o status da referência como Session.
 pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64), KernelError> {
     let flags = request.flags.get();
     if request.version.get() != 1 || flags >= 8 || flags & 6 == 6 {
@@ -115,7 +115,18 @@ pub fn prefetch_virtual_addresses(request: &PrefetchRequest) -> Result<(u32, u64
             let target = unsafe { Field::<u64>::at(slot) }.get();
             guest::free_bytes(slot);
             if status & 0x8000_0000 != 0 {
-                return Ok((status, 0));
+                // O segundo tipo aceito é o Session (SESSION_QUERY_ACCESS):
+                // o espaço de sessão está sempre residente.
+                let slot = guest::alloc_bytes(8);
+                let session = object_reference::reference_by_handle(handle, 1, crate::ntos::mm::session_object::session_type(), 0, slot, 0)? as u32;
+                // SAFETY: célula PVOID recém-alocada.
+                let object = unsafe { Field::<u64>::at(slot) }.get();
+                guest::free_bytes(slot);
+                if session & 0x8000_0000 != 0 {
+                    return Ok((session, 0));
+                }
+                object_reference::dereference_with_tag(object, reference_trace::DEFAULT_TAG, false)?;
+                return Ok((0, 0));
             }
             let touched = prefetch_ranges(target, &ranges);
             object_reference::dereference_with_tag(target, reference_trace::DEFAULT_TAG, false)?;
