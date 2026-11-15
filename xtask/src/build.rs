@@ -135,7 +135,11 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
     };
     run(&mut command)?;
     let profile = if options.release { "release" } else { "debug" };
-    Ok(root.join("target").join(TARGET).join(profile).join(package))
+    // O cargo filho herda o CARGO_TARGET_DIR (relativo, vale a partir da
+    // raiz): o binário fica onde ele mandar, e duas rodadas podem compilar
+    // em pastas separadas ao mesmo tempo.
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), |directory| root.join(directory));
+    Ok(target.join(TARGET).join(profile).join(package))
 }
 
 pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
