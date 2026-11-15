@@ -33,6 +33,7 @@ pub const REG_EXPAND_SZ: u32 = 2;
 pub const REG_DWORD: u32 = 4;
 pub const REG_LINK: u32 = 6;
 pub const REG_MULTI_SZ: u32 = 7;
+pub const REG_QWORD: u32 = 11;
 
 /// O conjunto de controle que a hive SYSTEM guarda (`Select\Current`).
 pub const CURRENT_CONTROL_SET: u32 = 1;
@@ -126,12 +127,19 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
 
 /// A hive SOFTWARE: os CSPs que o advapi32/crypt32 leem, as Image File
 /// Execution Options que o loader da ntdll consulta a cada processo e, no
-/// boot do processo inicial real, o `IniFileMapping` que o basesrv.dll lê.
+/// boot do processo inicial real, o `IniFileMapping` que o basesrv.dll lê e
+/// a chave SideBySide do sxssrv.dll.
 pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::crypto_defaults::seed_keys();
     keys.push(SeedKey::new("Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"));
     if smss_boot {
         keys.extend(super::ini_file_mapping::seed_keys());
+        // O sxssrv.dll do csrss abre Microsoft\Windows\CurrentVersion\SideBySide
+        // na inicialização e lê o PublisherPolicyChangeTime (REG_QWORD; o
+        // valor desta máquina); sem a chave o csrss termina.
+        let mut side_by_side = SeedKey::new("Microsoft\\Windows\\CurrentVersion\\SideBySide");
+        side_by_side.value("PublisherPolicyChangeTime", REG_QWORD, 0x01DD_6663_5F9A_F0F7u64.to_le_bytes().to_vec());
+        keys.push(side_by_side);
     }
     keys
 }

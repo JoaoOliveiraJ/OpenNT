@@ -183,6 +183,7 @@ const SMSS_PROGRAMS: &[&str] = &[
     "winsrv.dll",
     "winsrvext.dll",
     "sxssrv.dll",
+    "sxs.dll",
     "ntdll.dll",
     "kernel32.dll",
     "kernelbase.dll",

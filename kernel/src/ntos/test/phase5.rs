@@ -407,7 +407,7 @@ fn registry_boot_providers(assert: Assert) {
     assert(registry::node_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Cryptography\\Configuration\\Local\\Default\\00000005\\DSA").is_some() && registry::node_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Cryptography\\Providers\\Microsoft Primitive Provider\\KM\\00000005").is_some(), "cngdefaults: so algoritmos de usuario entram nos contextos");
     // Definições WNF instaladas no boot.
     let lengths: alloc::vec::Vec<usize> = wnf_defaults::DEFINITIONS.iter().filter_map(|(name, _)| registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Notifications", name)).map(|value| value.data.len()).collect();
-    assert(lengths == [412, 364, 364, 76] && matches!(wnf_defaults::initialize(), Ok(0)), "wnfdefaults: quatro definicoes; reinstalacao preserva");
+    assert(lengths.len() == wnf_defaults::DEFINITIONS.len() && lengths[..4] == [412, 364, 364, 76] && matches!(wnf_defaults::initialize(), Ok(0)), "wnfdefaults: as definicoes instaladas; reinstalacao preserva");
     // RtlGetPersistedStateLocation.
     let source = storage + 0x200;
     let output = storage + 0x300;
