@@ -1519,12 +1519,17 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     // Suspensão, retomada e prioridades.
     assert(call("NtResumeThread", handle, info, 0, 0) == 0 && guest::read32(info) == 1 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::READY, "userthreads: retomada deixa a thread pronta");
     assert(call("NtSuspendThread", handle, info, 0, 0) == 0 && guest::read32(info) == 0 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING, "userthreads: suspensao tira da fila");
+    // ThreadPriority (2) e ThreadBasePriority (3), como na tabela de
+    // classes do NtSetInformationThread 19041; ThreadTimes (1) só consulta.
     guest::write32(info, 10);
-    let priority = call("NtSetInformationThread", handle, 1, info, 4) == 0 && thread_priority::query_priority(pointer) == 10;
+    let priority = call("NtSetInformationThread", handle, 2, info, 4) == 0 && thread_priority::query_priority(pointer) == 10;
     guest::write32(info, 2);
-    let base = call("NtSetInformationThread", handle, 2, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 10;
+    let base = call("NtSetInformationThread", handle, 3, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 10;
+    guest::write32(info, 5);
+    let increment_refused = call("NtSetInformationThread", handle, 3, info, 4) == 0xC000_000D && thread_priority::query_base_priority(pointer) == 10;
+    let times_refused = call("NtSetInformationThread", handle, 1, info, 4) == 0xC000_0003;
     guest::write32(info, 40);
-    assert(priority && base && call("NtSetInformationThread", handle, 1, info, 4) == 0xC000_000D && call("NtSetInformationThread", handle, 17, info, 1) == 0xC000_0004, "userthreads: prioridade, base e recusas");
+    assert(priority && base && increment_refused && times_refused && call("NtSetInformationThread", handle, 2, info, 4) == 0xC000_000D && call("NtSetInformationThread", handle, 17, info, 1) == 0xC000_0004, "userthreads: prioridade, base e recusas");
     teb_view.tls_slots[5].set(0x55);
     guest::write32(info, 5);
     assert(call("NtSetInformationThread", handle, 10, info, 4) == 0 && teb_view.tls_slots[5].get() == 0, "userthreads: ThreadZeroTlsCell zera o indice nas TEBs");

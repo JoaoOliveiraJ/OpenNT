@@ -1820,10 +1820,86 @@ fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64
     Ok(0)
 }
 
+/// THREADINFOCLASS.ThreadPriority e ThreadBasePriority.
+const THREAD_PRIORITY: u64 = 2;
+const THREAD_BASE_PRIORITY: u64 = 3;
+/// THREAD_SET_LIMITED_INFORMATION, o direito das duas classes de prioridade.
+const THREAD_SET_LIMITED_INFORMATION: u32 = 0x400;
+/// SeIncreaseBasePriorityPrivilege.
+const SE_INCREASE_BASE_PRIORITY_PRIVILEGE: u64 = 14;
+/// PROCESS_PRIORITY_CLASS_REALTIME e JOB_OBJECT_LIMIT_PRIORITY_CLASS.
+const PRIORITY_CLASS_REALTIME: u8 = 4;
+const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x20;
+
+/// ThreadPriority (2) e ThreadBasePriority (3) do NtSetInformationThread
+/// 19041, na ordem dele: o tamanho (4 bytes, STATUS_INFO_LENGTH_MISMATCH),
+/// o valor e as checagens dele, e só então o handle, referenciado com
+/// THREAD_SET_LIMITED_INFORMATION.
+///
+/// - ThreadPriority: KPRIORITY de 1 a 31 (STATUS_INVALID_PARAMETER); 16 ou
+///   mais exige SeIncreaseBasePriorityPrivilege; KeSetPriorityThread.
+/// - ThreadBasePriority: o incremento sobre a base do processo vale de -2 a
+///   2 ou ±16 (a saturação); outro valor só num processo da classe de tempo
+///   real (ou o processo da porta de erros padrão do silo, que o OpenNT
+///   ainda não registra), senão STATUS_INVALID_PARAMETER. Num processo de um
+///   job com JOB_OBJECT_LIMIT_PRIORITY_CLASS, fora do tempo real, um
+///   incremento positivo é aceito sem efeito; os demais vão ao
+///   KeSetBasePriorityThread. O csrss.exe pede o incremento 2
+///   (THREAD_PRIORITY_HIGHEST) para as threads do winsrv.
+fn set_priority_class(handle: u64, class: u64, input: u64, length: u64) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(0xC000_0004);
+    }
+    if !probe_user_read(input, 4) {
+        return Ok(0xC000_0005);
+    }
+    // LONG: a prioridade ou o incremento (sondado acima).
+    let value = match guest::try_read::<i32>(input) {
+        Ok(value) => value,
+        Err(error) => return Ok(error.status),
+    };
+    if class == THREAD_PRIORITY {
+        if !(1..=31).contains(&value) {
+            return Ok(0xC000_000D);
+        }
+        if value >= 16 && !crate::ntos::se::privilege::single_privilege_check(SE_INCREASE_BASE_PRIORITY_PRIVILEGE, 1) {
+            return Ok(0xC000_0061);
+        }
+    }
+    let thread = match resolve(handle, THREAD_SET_LIMITED_INFORMATION) {
+        Ok(thread) => thread,
+        Err(status) => return Ok(status),
+    };
+    if thread.dead() {
+        return Ok(THREAD_IS_TERMINATING);
+    }
+    let pointer = thread.pointer();
+    if class == THREAD_PRIORITY {
+        thread_priority::set_priority(pointer, value as u64)?;
+        return Ok(0);
+    }
+    // SAFETY: o EPROCESS dono de uma thread viva.
+    let owner = unsafe { crate::ntos::inc::types::Eprocess::at(kernel_thread(pointer).process.get()) };
+    let realtime = owner.priority_class.get() == PRIORITY_CLASS_REALTIME;
+    if !matches!(value, -16 | -2..=2 | 16) && !realtime {
+        return Ok(0xC000_000D);
+    }
+    let job = owner.job.get();
+    // SAFETY: o EJOB do processo, retido pela participação dele.
+    if job != 0 && unsafe { crate::ntos::inc::types::Ejob::at(job) }.effective_limit_flags.get() & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 && !realtime && value > 0 {
+        return Ok(0);
+    }
+    thread_priority::set_base_priority(pointer, value as i64 as u64)?;
+    Ok(0)
+}
+
 fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     // A classe 24 tem ordem própria e aceita alterar uma ETHREAD retida.
     if requested_class(class) == 24 {
         return set_thread_information::set_user(rsp);
+    }
+    if matches!(class, THREAD_PRIORITY | THREAD_BASE_PRIORITY) {
+        return set_priority_class(handle, class, input, length);
     }
     let thread = match resolve(handle, 0x20) {
         Ok(thread) => thread,
@@ -1889,33 +1965,6 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
                 return Ok(0xC000_0004);
             }
             thread.with(|thread| thread.hidden = true);
-            Ok(0)
-        }
-        1 | 2 => {
-            if length != 4 {
-                return Ok(0xC000_0004);
-            }
-            if !probe_user_read(input, 4) {
-                return Ok(0xC000_0005);
-            }
-            // LONG: a prioridade pedida (sondada acima).
-            let priority = match guest::try_read::<i32>(input) {
-                Ok(priority) => priority,
-                Err(error) => return Ok(error.status),
-            };
-            let pointer = thread.pointer();
-            if class == 1 {
-                if !(1..=31).contains(&priority) {
-                    return Ok(0xC000_000D);
-                }
-                thread_priority::set_priority(pointer, priority as u64)?;
-            } else {
-                if !(-16..=15).contains(&priority) {
-                    return Ok(0xC000_000D);
-                }
-                kernel_thread(pointer).base_priority.set((8 + priority).clamp(1, 15) as i8);
-                thread_priority::set_priority(pointer, thread_priority::query_base_priority(pointer) as u64)?;
-            }
             Ok(0)
         }
         _ => {
