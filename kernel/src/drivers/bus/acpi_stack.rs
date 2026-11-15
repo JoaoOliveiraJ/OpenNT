@@ -81,16 +81,19 @@ fn check_acpi_root() -> Result<String, String> {
 }
 
 /// O barramento PCI: o pci.sys iniciado no ACPI\PNP0A03 e as funções
-/// relatadas por ele.
+/// relatadas por ele (PCI\VEN_...). Os objetos do namespace sob o PCI0 que
+/// não são funções PCI (os PNP0A06 de recursos de hotplug, o fw_cfg) o
+/// acpi.sys acrescenta às BusRelations do barramento, como no Windows.
 fn check_pci_root() -> Result<String, String> {
     let (node, children) = started_bus("pci", "pci")?;
     if !node.device_id.eq_ignore_ascii_case("ACPI\\PNP0A03") {
         return Err(format!("pci.sys em {}", node.instance_path));
     }
-    if children.is_empty() || !children.iter().all(|id| id.starts_with("PCI\\VEN_")) {
-        return Err(format!("{}: funcoes {children:?}", node.instance_path));
+    let functions: Vec<&String> = children.iter().filter(|id| id.starts_with("PCI\\VEN_")).collect();
+    if functions.is_empty() {
+        return Err(format!("{}: sem funcoes PCI entre {children:?}", node.instance_path));
     }
-    Ok(format!("{}: {} funcao(oes) {:?}", node.instance_path, children.len(), children))
+    Ok(format!("{}: {} funcao(oes) PCI {:?}, {} filho(s) no total", node.instance_path, functions.len(), functions, children.len()))
 }
 
 /// Monta a árvore com a raiz ACPI e confere os marcadores.
