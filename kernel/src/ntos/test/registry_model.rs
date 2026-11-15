@@ -214,11 +214,11 @@ fn load_ex(target: u64, file: &str, flags: u64, event: u64, root: bool) -> (u32,
 fn lazy_flusher_and_refresh(assert: Assert) {
     const LAZY: &str = "\\Registry\\Machine\\OpenNTHivePreguicosa";
     const STILL: &str = "\\Registry\\Machine\\OpenNTHiveSemPreguica";
-    let saved = save_source("\\NTFS\\opennt-hive-lazy.dat") && save_source("\\NTFS\\opennt-hive-nolazy.dat");
+    let saved = save_source("\\??\\D:\\opennt-hive-lazy.dat") && save_source("\\??\\D:\\opennt-hive-nolazy.dat");
     lazy_flush::enable(lazy_flush::HOLD_BOOT);
-    let loaded = load(LAZY, "\\NTFS\\opennt-hive-lazy.dat");
+    let loaded = load(LAZY, "\\??\\D:\\opennt-hive-lazy.dat");
     let target = attributes(STILL);
-    let (still_loaded, _) = load_ex(target, "\\NTFS\\opennt-hive-nolazy.dat", hive_list::REG_NO_LAZY_FLUSH as u64, 0, false);
+    let (still_loaded, _) = load_ex(target, "\\??\\D:\\opennt-hive-nolazy.dat", hive_list::REG_NO_LAZY_FLUSH as u64, 0, false);
     guest::free_bytes(target);
     assert(saved && loaded == 0 && still_loaded == 0 && u32_at(&read_volume("/opennt-hive-lazy.dat"), 4) == 1, "cmmodel: copias carregadas para o escritor preguicoso (uma com REG_NO_LAZY_FLUSH)");
     // A mudança arma o escritor; sem NtFlushKey, a hive vai para o disco.
@@ -264,7 +264,7 @@ fn lazy_flusher_and_refresh(assert: Assert) {
 fn app_hives_and_open_handle(assert: Assert) {
     const FIRST: &str = "\\Registry\\A\\{6f70656e-6e74-4000-8000-000000000001}";
     const SECOND: &str = "\\Registry\\A\\{6f70656e-6e74-4000-8000-000000000002}";
-    const FILE: &str = "\\NTFS\\opennt-hive-app.dat";
+    const FILE: &str = "\\??\\D:\\opennt-hive-app.dat";
     let saved = save_source(FILE);
     let target = attributes(FIRST);
     let (loaded, root) = load_ex(target, FILE, 0x10, 0, true);
@@ -323,7 +323,7 @@ fn app_hives_and_open_handle(assert: Assert) {
 
 fn whole_hive_volatile(assert: Assert) {
     let user = open("\\Registry\\User", false);
-    let file = create_file("\\NTFS\\opennt-hive-vol.dat");
+    let file = create_file("\\??\\D:\\opennt-hive-vol.dat");
     let source = open(SOURCE, false);
     let saved = status(call_export("ZwSaveKeyEx", &[source, file, 2]));
     let restored = status(call_export("ZwRestoreKey", &[user, file, 1]));
@@ -420,15 +420,15 @@ fn callback_objects(assert: Assert) {
     // A remoção da inscrição também devolve os contextos.
     let _ = call_export("CmSetCallbackObjectContext", &[other_body, cookie, 0x9ABC, 0]);
     // Notificações dos serviços de hive.
-    let file = create_file("\\NTFS\\opennt-hive-cb.dat");
+    let file = create_file("\\??\\D:\\opennt-hive-cb.dat");
     OBJECT_LOG.lock().clear();
     let flushed = status(call_export("ZwFlushKey", &[other]));
     let saved = status(call_export("ZwSaveKeyEx", &[other, file, 2]));
     zw_files::close_file_entry(file as u32);
-    let loaded = load("\\Registry\\Machine\\OpenNTHiveFiltrada", "\\NTFS\\opennt-hive-cb.dat");
+    let loaded = load("\\Registry\\Machine\\OpenNTHiveFiltrada", "\\??\\D:\\opennt-hive-cb.dat");
     let unloaded = unload("\\Registry\\Machine\\OpenNTHiveFiltrada");
     let target = open("\\Registry\\Machine\\Software\\OpenNTHiveFiltradaDestino", true);
-    let file = create_file("\\NTFS\\opennt-hive-cb2.dat");
+    let file = create_file("\\??\\D:\\opennt-hive-cb2.dat");
     let _ = call_export("ZwSaveKeyEx", &[other, file, 2]);
     let restored = status(call_export("ZwRestoreKey", &[target, file, 0]));
     zw_files::close_file_entry(file as u32);
@@ -440,7 +440,7 @@ fn callback_objects(assert: Assert) {
     }
     assert(flushed == 0 && saved == 0 && loaded == 0 && unloaded == 0 && restored == 0 && in_order && order.contains(&41) && order.contains(&42), "cmmodel: RegNtPre/Post Flush, Save, Load, UnLoad e RestoreKey chegam aos filtros");
     BLOCK_LOAD.store(1, Ordering::SeqCst);
-    let blocked = load("\\Registry\\Machine\\OpenNTHiveFiltrada", "\\NTFS\\opennt-hive-cb.dat");
+    let blocked = load("\\Registry\\Machine\\OpenNTHiveFiltrada", "\\??\\D:\\opennt-hive-cb.dat");
     BLOCK_LOAD.store(0, Ordering::SeqCst);
     assert(blocked == STATUS_ACCESS_DENIED && registry::node_by_path("\\Registry\\Machine\\OpenNTHiveFiltrada").is_none(), "cmmodel: um RegNtPreLoadKey com erro bloqueia o ZwLoadKey");
     let _ = key_services::key_operation(Kind::DeleteKey, target, &fields(&[]), false);
