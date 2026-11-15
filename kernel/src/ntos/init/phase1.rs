@@ -63,6 +63,13 @@ pub fn init() {
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));
+    // IopInitializePlugPlayServices: o driver embutido \Driver\DeviceApi
+    // (PiDaInit), com o \Device\DeviceApi que o cfgmgr32 abre.
+    match crate::ntos::io::pnp::device_api::initialize() {
+        Ok(0) => {}
+        Ok(status) => panic!("\\Driver\\DeviceApi: IoCreateDriver -> {status:#x}"),
+        Err(error) => panic!("\\Driver\\DeviceApi: {error}"),
+    }
     // Barramento PCI primeiro (como o pci.sys): hardware enumerado e PDOs
     // com recursos reais antes dos drivers funcionais.
     match crate::drivers::bus::pci::init() {

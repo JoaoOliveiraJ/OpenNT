@@ -14448,6 +14448,7 @@ pub fn run(assert: Assert) {
     super::kernel_waits::run(assert);
     zw_group_exports(assert);
     pnp_and_boot_services(assert);
+    super::device_api::run(assert);
     io_group_exports(assert);
     ob_group_exports(assert);
     private_routines_and_small_groups(assert);

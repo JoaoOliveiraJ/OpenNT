@@ -37,42 +37,60 @@ fn device_at(device: u64) -> &'static DeviceObject {
     unsafe { DeviceObject::at(device) }
 }
 
-fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: u32, access: u32) -> Result<u32, KernelError> {
-    let (file, output, output_length, method) = {
-        let r = request.lock();
-        (r.file, r.output, r.output_length, r.method)
-    };
-    // FastIoDeviceControl (FAST_IO_DISPATCH+0x50).
+/// Resultado de um FastIoDeviceControl.
+#[derive(Clone, Copy)]
+pub enum FastControl {
+    /// O driver não tem a rotina ou devolveu FALSE: segue pelo IRP.
+    NotHandled,
+    /// Atendido: o IoStatus que o driver gravou.
+    Handled { status: u32, information: u64 },
+    /// Sem memória para o bloco de argumentos.
+    NoMemory,
+}
+
+/// O FastIoDeviceControl (FAST_IO_DISPATCH+0x50) do driver de `device`,
+/// que o IopXxxControlFile tenta antes de montar o IRP, com Wait = TRUE e
+/// os buffers como vieram (o driver captura os de METHOD_NEITHER).
+pub fn fast_device_control(file: u64, device: u64, input: u64, input_length: u32, output: u64, output_length: u32, code: u32) -> FastControl {
     let driver = device_at(device).driver_object.get();
     // SAFETY: DeviceObject->DriverObject de um dispositivo vivo.
     let fast_table = if driver != 0 { unsafe { DriverObject::at(driver) }.fast_io_dispatch.get() } else { 0 };
     // SAFETY: DriverObject->FastIoDispatch do driver vivo.
     let dispatch = (fast_table != 0).then(|| unsafe { FastIoDispatch::at(fast_table) });
     let fast = dispatch.filter(|dispatch| dispatch.size_of_fast_io_dispatch.get() >= FAST_IO_DEVICE_CONTROL_SIZE).map_or(0, |dispatch| dispatch.fast_io_device_control.get());
-    if fast != 0 {
-        let arguments = guest::alloc_bytes(88);
-        if arguments == 0 {
-            return Ok(0xC000_009A);
-        }
-        // SAFETY: IO_STATUS_BLOCK dentro do bloco de argumentos recém-alocado.
-        let iosb = unsafe { IoStatusBlock::at(arguments + FAST_IO_STATUS) };
-        let handled = native_call::call(fast, &[file, 1, input, input_length as u64, output, output_length as u64, code as u64, iosb.address(), device]) & 0xFF != 0;
-        let result = if handled {
-            let status = {
+    if fast == 0 {
+        return FastControl::NotHandled;
+    }
+    let arguments = guest::alloc_bytes(88);
+    if arguments == 0 {
+        return FastControl::NoMemory;
+    }
+    // SAFETY: IO_STATUS_BLOCK dentro do bloco de argumentos recém-alocado.
+    let iosb = unsafe { IoStatusBlock::at(arguments + FAST_IO_STATUS) };
+    let handled = native_call::call(fast, &[file, 1, input, input_length as u64, output, output_length as u64, code as u64, iosb.address(), device]) & 0xFF != 0;
+    let result = if handled { FastControl::Handled { status: iosb.status.get() as u32, information: iosb.information.get() } } else { FastControl::NotHandled };
+    guest::free_bytes(arguments);
+    result
+}
+
+fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: u32, access: u32) -> Result<u32, KernelError> {
+    let (file, output, output_length, method) = {
+        let r = request.lock();
+        (r.file, r.output, r.output_length, r.method)
+    };
+    match fast_device_control(file, device, input, input_length, output, output_length, code) {
+        FastControl::NoMemory => return Ok(0xC000_009A),
+        FastControl::Handled { status, information } => {
+            {
                 let mut r = request.lock();
-                r.status = iosb.status.get() as u32;
-                r.information = iosb.information.get();
+                r.status = status;
+                r.information = information;
                 r.done = true;
-                r.status
-            };
-            file_request::finish(request).map(|_| Some(status))
-        } else {
-            Ok(None)
-        };
-        guest::free_bytes(arguments);
-        if let Some(status) = result? {
+            }
+            file_request::finish(request)?;
             return Ok(status);
         }
+        FastControl::NotHandled => {}
     }
     let count = match device_at(device).stack_size.get() as u8 {
         0 => 1,

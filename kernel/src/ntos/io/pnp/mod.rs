@@ -11,6 +11,9 @@
 //!   (START_DEVICE com a CM_RESOURCE_LIST do PDO) e enumera os filhos, usado
 //!   pela pilha PS/2 da placa-mãe.
 
+pub mod cm_api;
+pub mod cm_notify;
+pub mod device_api;
 pub mod devnode;
 pub mod install;
 pub mod irp;

@@ -18,6 +18,7 @@ use core::any::Any;
 use super::file_io::{self, OpenRequest};
 use super::registry::{parse_user_object_attributes, user_object_attributes};
 use super::state::{self, NativeBody, UserObject, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER};
+use crate::ntos::io::device_control::{self, FastControl};
 use crate::ntos::io::file::{irp_service, pipe_mailslot};
 use crate::ntos::io::io_manager::{self, IoParams, IoResult, RequestContext};
 use crate::ntos::ke::dispatcher;
@@ -329,6 +330,36 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
             dispatcher::set_event(body.pointer);
         }
         return Ok(status);
+    }
+    // O evento do pedido (EVENT_MODIFY_STATE), zerado antes da operação.
+    let event_object = if event != 0 {
+        match super::events::reference(event, 2) {
+            Ok(object) => {
+                dispatcher::reset_event(object.pointer);
+                Some(object)
+            }
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
+    // O FastIoDeviceControl do driver antes de qualquer IRP, como o
+    // IopXxxControlFile: atendido, o IoStatus vai ao IOSB e o evento é
+    // sinalizado.
+    let fast = device_control::fast_device_control(device.file_object, top, input, input_length, output, output_length, code);
+    if let FastControl::Handled { status, information } = fast {
+        let _ = state::set_user_iosb(iosb, status, information);
+        if let Some(object) = &event_object {
+            dispatcher::set_event(object.pointer);
+        }
+    }
+    if let Some(object) = &event_object {
+        super::events::release(object);
+    }
+    match fast {
+        FastControl::NoMemory => return Ok(0xC000_009A),
+        FastControl::Handled { status, .. } => return Ok(status),
+        FastControl::NotHandled => {}
     }
     // Direct I/O exige MDLs fixadas: nunca descrito como METHOD_BUFFERED.
     if code & 3 == 1 || code & 3 == 2 {
