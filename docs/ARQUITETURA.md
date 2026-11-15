@@ -11,7 +11,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | --- | --- |
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
-| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all` e `status` |
+| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `status` e o cliente do depurador do kernel (`debug`) |
 
 ## 2. Árvore do kernel
 
@@ -69,7 +69,9 @@ kernel/src/
 │   │   │              átomos (atom), heap (heap), CRT (crt, printf, scanf)
 │   │   └── resource/  recursos de imagens (ldrrsrc) e tabelas de mensagens
 │   ├── alpc/          ALPC (connect/, message/, resource/)
-│   ├── po/ etw/ kd/ dbgk/ fsrtl/
+│   ├── kd/            depurador do kernel: o estado que os drivers veem e o
+│   │                  próprio depurador do OpenNT (protocolo remoto do GDB)
+│   ├── po/ etw/ dbgk/ fsrtl/
 │   ├── bgk/           console do vídeo de boot (Bgk*)
 │   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
 │   ├── ttm/           Terminal Topology Manager (notificações de dispositivo)
@@ -1340,9 +1342,55 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `ntos/test/multiprocess/jobs.rs` (`JOBS_OK`).
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o
-  KdPitchDebugger de um boot sem /DEBUG, KdPowerTransitionEx sem efeito e
-  KdDisableDebugger com STATUS_DEBUGGER_INACTIVE; DbgCommandString é o
-  serviço 5 do `int 0x2D` num corpo nativo.
+  KdPitchDebugger de um boot sem depurador, KdPowerTransitionEx sem efeito
+  e KdDisableDebugger com STATUS_DEBUGGER_INACTIVE; com o depurador do
+  OpenNT, a transição do ntoskrnl (bit 30 força, D0 reprograma a UART,
+  D1-D3 sem efeito, outro estado recusado). DbgCommandString é o serviço 5
+  do `int 0x2D` num corpo nativo.
+- **Depurador do kernel** (`kd/`): código do próprio OpenNT, ligado por
+  `--kd=com2` (`com3`, `com4`; a COM1 é o log). Sem a opção, o boot é o de
+  um Windows sem /DEBUG (KdPitchDebugger). Com ela, a fase 0 programa a
+  UART (`kd/transport.rs`, E/S programada sem IRQ, FIFO intocada para não
+  perder um pedido que chegou antes) e o estado que os drivers veem fica
+  como o do KdInitSystem com transporte (`kd/debugger.rs`):
+  KdDebuggerEnabled e o bit 0 do KUSER_SHARED_DATA.KdDebuggerEnabled
+  ligados, KdComPortInUse com a porta do transporte (como o transporte
+  serial do NT a grava), KdDebuggerNotPresent TRUE até um host trocar
+  pacotes (então
+  FALSE, com o bit 1), e KdDisableDebugger/KdEnableDebugger/KdChangeOption/
+  KdRefreshDebuggerNotPresent com a lógica do ntoskrnl (KdDisableCount,
+  KdPreviouslyEnabled, KdBlockEnable, a recusa do desligamento com
+  KernelDr7 habilitado). O host fala o protocolo remoto do GDB
+  (`kd/packet.rs`, `kd/session.rs`): cada processador é uma thread do
+  protocolo; `g`/`G`/`p`/`P` sobre o quadro do trap (`kd/registers.rs`, a
+  ordem do GDB para x86-64, x87/SSE da área FXSAVE64 da entrada); `m`/`M`/
+  `X` andam nas tabelas de páginas do CR3 do processador pelo mapa direto,
+  sem travas nem faltas (`kd/memory.rs`); `Z0` grava o 0xCC pelo quadro
+  físico, `Z1`/`Z2`/`Z4` são DR0-DR3 (`kd/breakpoints.rs`, publicados em
+  KPRCB.ProcessorState.SpecialRegisters); `qRcmd` (o `monitor`) traz as
+  consultas do OpenNT (`kd/monitor.rs`: processos e threads pelas listas
+  nativas, os registradores de uma thread fora da CPU pelo quadro de troca
+  que KTHREAD.KernelStack aponta, módulos, processadores com IRQL e thread
+  corrente, objeto por nome, o anel do DbgPrint, breakpoints, bugcheck);
+  `qXfer:libraries:read`
+  dá a lista de módulos ao GDB. As paradas (`kd/stop.rs`) vêm dos
+  trampolins (`hal/amd64/irqstubs.rs`): `int 3` e #DB do anel 0 vão ao
+  depurador antes do SEH (o KiDebugRoutine), o tique do relógio no anel 0
+  consulta o LSR (o 0x03 do host, ou o começo de um pacote, para a máquina,
+  como o KdPollBreakIn), a exceção sem tratador e o KeBugCheckEx param antes
+  do diagnóstico e da tela de STOP, e o pânico antes de travar. O dono da
+  parada congela os outros processadores com NMI pelo código de IPI do Ke
+  (`smp::send_nmi_to_application_processors`; a NMI dos APs prende o
+  processador em `rs_kd_freeze_processor` com o quadro publicado) e só os
+  degela ao continuar; o passo roda só no dono, com o IF mascarado durante
+  a instrução (o original volta depois, e um `pushfq` passo a passo grava o
+  IF original), e continuar de um breakpoint dá antes um passo com o byte
+  original. Nada da parada aloca nem toma trava: as consultas que usam
+  estruturas do Rust (módulos, objeto por nome) só rodam quando nenhum
+  processador parado tinha SpinLock ou SharedLock. O DbgPrint vai ao host
+  como pacote `O` com a máquina rodando (`kd/print_log.rs`). Os APs ainda
+  usam a própria IDT de três vetores: só o BSP trata `int 3`/#DB, e os
+  comparadores de hardware são carregados só no dono da parada.
 - **Pedidos térmicos** (`po/thermal.rs`, `po/reason_context.rs`): a
   extensão de resfriamento de cada alvo recebe a
   GUID_THERMAL_COOLING_INTERFACE por um IRP_MN_QUERY_INTERFACE síncrono ao
@@ -2087,6 +2135,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   IOCTL_BEEP_SET ao `\Device\Beep` do beep.sys pelo StartIo dele
   (`BEEP_DEVICE_OK`), e os reconhecedores do fs_rec.sys respondem a um
   IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
+- **Depurador do kernel**: `cargo xtask debug` compila com `--kd=com2`, abre
+  o QEMU com a COM2 num socket TCP local e o prompt do cliente (`xtask/src/debug`:
+  o protocolo remoto do GDB, símbolos do `kernel.elf` com os nomes do Rust
+  legíveis e dos exports dos PEs desta máquina, mais os públicos de um PDB
+  já no cache do `nt-types`; `bt` pelos frame pointers do kernel);
+  `--connect=HOST:PORTA` só conecta (a um `cargo xtask run --kd=com2`, porta
+  1234, onde o GDB também entra). O teste `kd` é um `test-boot` com
+  `--kd=com2 --script=xtask/scripts/kd.txt`: o roteiro roda contra a COM2
+  em paralelo ao boot e a falha dele derruba o teste. Ele anexa,
+  confere o estado do depurador e os processadores congelados, lê e grava
+  memória, pede a parada com a máquina rodando, para num breakpoint de
+  software no laço principal, confere a saída do DbgPrint do ksecdd.sys real
+  e as consultas do OpenNT (com a pilha de uma thread de kernel bloqueada,
+  pelo quadro de troca), dá um passo, para num breakpoint de hardware e se
+  desliga; o boot segue até o shell, que o roteiro espera na COM1. O boot com `--kd` roda também
+  `ntos/test/kernel_debugger.rs` (`KD_EXPORTS_OK`).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `PIPES_OK` (o
@@ -2129,7 +2193,8 @@ subpasta com outro nome, como `ntos/ex/wnf_name` → `ntos/ex/wnf/name.rs`).
 Banners, prompt do shell (`OpenNT> `), mensagens do `xtask`, rótulo do volume
 em memória, arquivo de paginação (`/$opennt-pool-page-N.sys`) e as variáveis
 de build (`OPENNT_USER_PROGRAM`, `OPENNT_KERNEL_TEST_SCOPE`,
-`OPENNT_CONSOLE_MIRROR`, `OPENNT_START_DRIVER`, `OPENNT_TRACE_DRIVER_API`)
+`OPENNT_CONSOLE_MIRROR`, `OPENNT_START_DRIVER`, `OPENNT_TRACE_DRIVER_API`,
+`OPENNT_KD`)
 usam o nome OpenNT. Continuam iguais: os marcadores de boot, o nome do binário
 `kernel`, os artefatos `build/kernel.elf`, `kernel.pe` e `os.img` e os nomes
 dos pacotes (`kernel`, `boot`).

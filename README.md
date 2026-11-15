@@ -181,6 +181,15 @@ cargo xtask test-all
 cargo xtask test-all --jobs 4 --cpu-friendly
 cargo xtask test-all --only dxgkrnl --repeat 10
 
+# Depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
+# (break, c, s, regs, x, bp/hbp, bt, ps, threads, lm, cpus, obj, log...).
+cargo xtask debug
+# Só o cliente (ou um GDB: target remote 127.0.0.1:1234) contra
+# `cargo xtask run --kd=com2`.
+cargo xtask debug --connect=127.0.0.1:1234
+# O teste automático do depurador (roteiro xtask/scripts/kd.txt).
+cargo xtask test-boot KD_EXPORTS_OK 600000 --kd=com2 --script=xtask/scripts/kd.txt --build-dir=build/kd --start-driver=ksecdd --expect=KERNEL_RS_OK --expect=KD_SESSION_DETACHED --hold=5000
+
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
 

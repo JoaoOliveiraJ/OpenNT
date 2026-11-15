@@ -323,6 +323,12 @@ marcador = "ACPI_ROOT_OK"
 comando = "cargo xtask test-boot ACPI_ROOT_OK 300000 --pnp-root=acpi --build-dir=build/acpi --smp=1 \"--expect=[kbd] lendo teclas do driver real\" --hold=30000"
 descricao = "Com --pnp-root=acpi, a raiz da árvore do PnP é a de um PC ACPI do Windows: a HAL relata o computador (ROOT\\ACPI_HAL\\0000) e o dispositivo ACPI raiz (ACPI_HAL\\PNP0C08\\0), que o acpi.inf instala com o acpi.sys real. O DriverEntry do acpi.sys troca a tabela de energia com a HAL (HalInitPowerManagement) e lê as tabelas ACPI do firmware do QEMU pela HalAcpiDispatchTable; o START carrega a DSDT no interpretador AML dele, entra no modo ACPI pelos registradores de PM da FADT e conecta a SCI (IRQ 9, pelos dados de conexão de interrupção que ele grava no PDO). O ACPI_ROOT_OK sai quando o acpi.sys iniciou a raiz e relatou os dispositivos do namespace, entre eles o barramento PCI (ACPI\\PNP0A03\\0, que o pci.inf instala com o pci.sys); o teclado segue lendo do driver real e o sistema roda 30 s sem falha com a SCI conectada. O pci.sys carrega com a pshed.dll, mas o DriverEntry ainda devolve STATUS_NOT_FOUND: o Errata Manager do OpenNT não tem o banco do errata.inf, e as regras de PCI que o pci.sys consulta (EmClientQueryRuleState) não existem; por isso ainda não há PCI_ROOT_OK."
 
+[[teste]]
+id = "kd"
+titulo = "Depurador do kernel pela COM2"
+marcador = "KD_SESSION_DETACHED"
+comando = "cargo xtask test-boot KD_EXPORTS_OK 600000 --kd=com2 --script=xtask/scripts/kd.txt --build-dir=build/kd --start-driver=ksecdd --expect=KERNEL_RS_OK --expect=KD_SESSION_DETACHED --hold=5000"
+descricao = "Boot com --kd=com2: o depurador do próprio OpenNT atende o protocolo remoto do GDB na COM2, que o QEMU expõe num socket TCP, e o cliente do xtask roda o roteiro xtask/scripts/kd.txt contra ele enquanto o boot segue. O cliente anexa (o primeiro pacote para a máquina), confere que os drivers veem o depurador ligado e presente (KdDebuggerEnabled=1, KdDebuggerNotPresent=0) e que os quatro processadores estão parados (os APs congelados por NMI), lê o cabeçalho do PE do kernel e grava e desfaz quatro bytes nele, continua e pede a parada com o 0x03, arma um breakpoint de software em kernel::ntos::ke::run_kernel_tasks (o laço principal do kernel) e para nele, confere que a saída do DbgPrint do ksecdd.sys real chegou durante o boot (pacotes O e o anel do monitor log), lista processos, threads, módulos, processadores com a IRQL e o diretório \\Device do namespace, faz o backtrace pelos frame pointers até o kmain e o de uma thread fora da CPU pelo quadro de troca da pilha de kernel dela, dá um passo (o push rbp do prólogo, conferido no RSP e na pilha), troca o breakpoint por um de hardware (DR0) e para nele, e se desliga. O boot com o depurador também confere, pelos exports, KdChangeOption, KdDisableDebugger, KdEnableDebugger, KdRefreshDebuggerNotPresent e KdPowerTransitionEx com o depurador ligado (KD_EXPORTS_OK). Depois do desligamento (KD_SESSION_DETACHED) a máquina segue até o shell e o serviço de teclado lendo do driver real (o roteiro espera os dois na COM1) e roda 5 s sem falha."
 
 # ---- componentes e drivers ------------------------------------------------------
 
@@ -345,6 +351,17 @@ estado = "implementado"
 caminhos = ["kernel/src/nano/interrupts.rs", "kernel/src/hal/amd64/irqstubs.rs", "kernel/src/hal/lapic.rs"]
 testes = ["boot", "selftest"]
 fase = "1"
+
+[[componente]]
+nome = "Depurador do kernel"
+categoria = "Núcleo do kernel"
+icone = "terminal"
+descricao = "Depurador do próprio OpenNT: com --kd=com2, atende pela porta serial o protocolo remoto do GDB, com o cliente cargo xtask debug."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/kd/stop.rs", "kernel/src/ntos/kd/session.rs", "kernel/src/ntos/kd/debugger.rs", "xtask/src/debug/client.rs"]
+testes = ["kd"]
+fase = "6"
+notas = "Sem --kd o boot é o de um Windows sem /DEBUG. Com --kd=com2 (com3, com4) o kernel atende o protocolo remoto do GDB na porta, que o QEMU expõe como socket TCP; o cliente é o cargo xtask debug (prompt, --connect a um cargo xtask run --kd=com2 na porta 1234, ou --script para teste), e um GDB comum entra pela mesma porta. Paradas: pedido do host (o 0x03, visto no tique do relógio como o KdPollBreakIn), int 3 do código (DbgBreakPoint, DbgBreakPointWithStatus), breakpoints de software e de hardware (DR0-DR3, execução, escrita e acesso), passo a passo, exceção de kernel sem tratador, KeBugCheckEx antes da tela de STOP e pânico do kernel. Parado, os outros processadores ficam congelados por NMI; o host lê e grava registradores (por processador, com x87/SSE) e memória (pelas tabelas de páginas, sem faltas), e o monitor do OpenNT lista processos (EPROCESS), threads, módulos com base, tamanho e caminho, processadores com IRQL e thread corrente, objeto do namespace por nome, a saída do DbgPrint e o bugcheck. O DbgPrint vai ao host enquanto a máquina roda. Os drivers veem o depurador como no Windows: KdDebuggerEnabled, KdDebuggerNotPresent (FALSE com um host anexado), KUSER_SHARED_DATA.KdDebuggerEnabled e KdComPortInUse (a porta do depurador), e KdDisableDebugger, KdEnableDebugger, KdChangeOption, KdRefreshDebuggerNotPresent e KdPowerTransitionEx com a lógica do ntoskrnl. O cliente mostra os símbolos do kernel (o ELF, com os nomes do Rust legíveis) e dos binários da Microsoft (a tabela de exports de cada PE e, se o PDB já está no cache do nt-types, os nomes públicos). Ainda falta: os processadores secundários usam uma IDT própria de três vetores, então só o processador de boot trata int 3 e #DB; continuar depois de uma exceção fatal não é possível (o diagnóstico segue); nenhum GDB está instalado nesta máquina para conferir a interoperabilidade além do cliente próprio."
 
 [[componente]]
 nome = "Gerência de memória"
@@ -1091,6 +1108,14 @@ icone = "chart"
 descricao = "Relatórios ao vivo do Windows Error Reporting."
 fase = "6"
 notas = "Sem o werkernel.sys, o DbgkWerCaptureLiveKernelDump faz as validações do Windows e falha com STATUS_NOT_SUPPORTED, o status do stub da extensão ausente."
+
+[[subsistema]]
+pasta = "ntos/kd"
+nome = "Depurador do kernel (Kd)"
+icone = "terminal"
+descricao = "O estado do depurador visto pelos drivers e o depurador do próprio OpenNT (protocolo remoto do GDB pela porta serial)."
+fase = "6"
+notas = "Sem --kd, KdPitchDebugger: KdEnableDebugger, KdDisableDebugger e KdChangeOption devolvem STATUS_DEBUGGER_INACTIVE, como o ntoskrnl num boot sem /DEBUG. Com --kd, o depurador do OpenNT fica ligado (teste kd)."
 
 [[subsistema]]
 pasta = "ntos/alpc"
