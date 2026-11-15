@@ -185,8 +185,8 @@ cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=bu
 cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"
 
 # Com o adaptador de vídeo: o NtUserInitialize do csrss faz o dxgkrnl.sys
-# iniciar o BasicDisplay.sys real.
-cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss --display=basic --build-dir=build/win32k-display --smp=1 --expect=SMSS_CSRSS_OK --expect=ADAPTER_STARTED
+# iniciar o BasicDisplay.sys real e volta com sucesso.
+cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss --display=basic --build-dir=build/win32k-display --smp=1 --expect=SMSS_CSRSS_OK --expect=ADAPTER_STARTED --expect=USER_INITIALIZED
 
 # A validação inteira: as duas suítes completas (4 CPUs e 1) e todos os
 # [[teste]] de docs/status/components.toml, em paralelo, cada execução em

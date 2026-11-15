@@ -1660,8 +1660,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     SecurityProcedure (o SeDefaultObjectMethod quando o tipo não traz uma;
     o descritor do cabeçalho é o que as aberturas do corpo verificam) e
     QueryNameProcedure no ObQueryNameString. Open e Close rodam anexados ao
-    processo do handle. A ParseProcedure pertence à busca de nomes do
-    namespace (`ob/handles/namespace.rs`) e ainda não é chamada.
+    processo do handle. A ParseProcedure é chamada pelo ObOpenObjectByName
+    (`ob/object_open.rs`) quando a busca chega a um objeto que não é
+    diretório e cujo tipo tem a rotina: o RootDirectory (o nome todo é o
+    restante) ou o prefixo mais longo de um caminho absoluto que o namespace
+    resolve (o restante começa na barra). O nome completo e o restante vão
+    numa cópia do kernel terminada em NUL, com o ACCESS_STATE de quem chama
+    (ou um local do SeCreateAccessState com o mapeamento do tipo pedido), o
+    ParseContext e o SecurityQualityOfService; o objeto devolvido recebe o
+    handle e a referência da busca é solta.
+  - Os seis tipos Win32 que o executive cria no boot (`ex/win32.rs`:
+    WindowStation, Desktop, Composition, RawInputManager, CoreMessaging,
+    ActivationObject) têm as rotinas ExpWin32Open/OkayToClose/Close/Delete
+    (e a ExpWin32ParseProcedure na WindowStation), rotinas privadas do
+    kernel que montam o bloco de parâmetros e chamam o callout do win32k
+    pelo PsInvokeWin32Callout no modo de sessão: no processo corrente quando
+    ele está na sessão do objeto (o SessionId no primeiro ULONG do corpo),
+    senão anexado a um processo da sessão pelo MmAttachSession
+    (ExCallSessionCallBack); sem a sessão, STATUS_INVALID_PARAMETER.
   - Ficam fora do modelo de cabeçalho (com donos próprios e contagens no
     registro do dono): processos, threads, tokens, arquivos, dispositivos,
     drivers, seções, chaves, eventos e objetos do despachante, diretórios e
@@ -2134,8 +2150,36 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   DxgkDdiStartDevice do BasicDisplay o framebuffer, o adaptador inicia
   (`ADAPTER_STARTED`, observado na interface de chegada de dispositivo de
   vídeo em `drivers/video/display_stack.rs`) e o InitVideo do win32k
-  enumera o `\Device\Video0`, mas ainda volta sem configuração de exibição
-  e o win32k para com VIDEO_DRIVER_INIT_FAILURE (0xB4).
+  enumera o `\Device\Video0`. A sessão 0 é a de serviços
+  (gbNonServiceSession falso): o InitVideo põe o gProtocolType em 0xFFFF e
+  a configuração de exibição usa o dispositivo desconectado do win32k
+  (`\Device\Disc`, DISPLAY_DEVICE_DISCONNECT), que o
+  DrvSetDisconnectedGraphicsDevice cria pela chave
+  `Services\TSDDD\Device0` da instalação (`cm/service/inbox_drivers.rs`);
+  o BasicDisplay fica para a sessão do console. Pelo caminho o win32k pede
+  ao kernel: o default do RtlQueryRegistryValues pelo próprio ponteiro
+  DefaultData (`rtl/registry.rs`; a DrvDriverExtraCallback recebe
+  DefaultLength 0x10000), o MmPrefetchVirtualAddresses de
+  NtCurrentSession (`mm/prefetch.rs`), e, no xxxCreateThreadInfo de cada
+  thread GUI, o ObSetHandleAttributes de UserMode e o
+  ZwAssociateWaitCompletionPacket sobre handles da tabela do Object
+  Manager (o evento do ZwCreateEvent e a IOCP e o evento duplicados como
+  handles de kernel; `ob/handle_attributes.rs`, `ps/user/wait_packets.rs`)
+  e o ObDuplicateObject com OBJ_KERNEL_HANDLE em KernelMode para a tabela
+  do System. O NtUserInitialize do csrss volta com sucesso
+  (`USER_INITIALIZED`); o winsrv pede ThreadBasePriority 2 para as threads
+  dele (NtSetInformationThread, classes 2 e 3 como no NT), o csrss assina
+  os nomes WNF da instalação (`cm/wnf_defaults.rs`) e o sxssrv.dll lê a
+  chave SideBySide (`cm/seed.rs`). Depois o CsrSbApiPortInitialize cria a
+  porta LPC `\Windows\SbApiPort` pelo NtCreatePort, que o OpenNT ainda
+  não tem (as portas LPC de servidor em modo usuário:
+  NtCreatePort/NtReplyWaitReceivePort/NtAcceptConnectPort/
+  NtCompleteConnectPort sobre o ALPC), e o csrss termina com
+  STATUS_NOT_IMPLEMENTED; o smss da sessão não chega ao wininit.exe, que o
+  build já põe no volume com o services.exe e o lsass.exe. O marcador
+  `WINSTA0_OK` (`initial_process::desktop_opened`) sai quando o wininit.exe
+  tem as Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure
+  da WindowStation.
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
@@ -2388,10 +2432,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `ADAPTER_STARTED` (com `--initial-process=smss --display=basic`: a sessão
   do win32k faz o dxgkrnl iniciar o adaptador do BasicDisplay, que
   habilita a interface de chegada de dispositivo de vídeo;
-  `cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss --display=basic --build-dir=build/win32k-display --smp=1 --expect=SMSS_CSRSS_OK --expect=ADAPTER_STARTED`)
-  e `USER_INITIALIZED` (o NtUserInitialize do csrss volta com sucesso,
-  `initial_process::win32k_service_returned`; ainda não sai: o InitVideo
-  do win32k para com 0xB4);
+  `cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss --display=basic --build-dir=build/win32k-display --smp=1 --expect=SMSS_CSRSS_OK --expect=ADAPTER_STARTED --expect=USER_INITIALIZED`)
+  `USER_INITIALIZED` (o NtUserInitialize do csrss volta com sucesso,
+  `initial_process::win32k_service_returned`; no mesmo teste) e
+  `WINSTA0_OK` (o wininit.exe com as Desktops Winlogon e Default da
+  WinSta0; ainda não sai: o csrss para no NtCreatePort);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx). O `test-boot` procura falhas desde o boot até
   a última saída esperada e, com `--hold=MS`, por mais MS milissegundos.
