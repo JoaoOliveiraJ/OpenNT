@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **26 de 51** componentes funcionam; **551 de 774** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.884 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (61,4%).
+Hoje: **27 de 52** componentes funcionam; **551 de 774** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.898 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (61,8%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -108,6 +108,7 @@ Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bib
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
+| Jobs | Funciona | Autoteste do modo usuário |
 | npfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
 | msfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
 | Modo usuário | Parcial | Autoteste do modo usuário |
@@ -121,7 +122,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl |
+| Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl, Driver ntfs.sys real |
 | win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k.sys real carregado pelo smss.exe |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | Driver dxgkrnl.sys real, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys, Autoteste do carregador de PE e do ntoskrnl |
 | ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | Driver ntfs.sys real |
