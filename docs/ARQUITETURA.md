@@ -1315,6 +1315,49 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   SeTokenFromAccessInformation e o SeQuerySecurityAttributesTokenAccessInformation
   consomem esse bloco. O SeQueryInformationToken grava a TokenSessionId e a
   TokenIsAppContainer direto no ULONG de saída, sem alocar.
+- **Controle de acesso** (`se/access_evaluation.rs`): uma avaliação só, a do
+  SeAccessCheckWithHint/SepAccessCheck do ntoskrnl 19041, sobre os
+  componentes de um descritor (`OwnedDescriptor`) e a identidade do token
+  efetivo (`Subject`: usuário, grupos, SIDs restritos, privilégios
+  habilitados, SID de integridade, MandatoryPolicy, pacote e capacidades).
+  Na ordem do NT: rótulo de confiança de processo; integridade obrigatória
+  (SepMandatoryIntegrityCheck: o rótulo é a primeira ACE de rótulo da SACL,
+  Medium com NO_WRITE_UP quando não há; quem não domina só tem GenericRead,
+  GenericExecute, READ_CONTROL e SYNCHRONIZE, menos NO_READ_UP/NO_EXECUTE_UP,
+  mais WRITE_OWNER com SeRelabelPrivilege; o MAXIMUM_ALLOWED é cortado pela
+  mesma máscara); os direitos implícitos do dono (READ_CONTROL e WRITE_DAC,
+  a menos que a DACL tenha OWNER RIGHTS); ACCESS_SYSTEM_SECURITY só com
+  SeSecurityPrivilege; WRITE_OWNER pedido por SeTakeOwnershipPrivilege ou
+  SeRelabelPrivilege (não no MAXIMUM_ALLOWED); DACL nula concede tudo, vazia
+  nega; as passagens SepNormalAccessCheck/SepMaximumAccessCheck com as
+  máscaras das ACEs como estão (deny-only só nas negadas), a segunda passagem
+  de um token restrito (só escrita num WRITE_RESTRICTED) e a de pacote de um
+  token LowBox. Os exports (SeAccessCheck, SeAccessCheckFromState(Ex),
+  SeAccessCheckEx, `se/access_check.rs`), o `object_access::check_token` de
+  todas as aberturas do Object Manager e dos donos de corpos, o token
+  (`se/token/access.rs`) e os diretórios do namespace usam essa avaliação;
+  as ACEs da política de um corpo são mapeadas pelo tipo antes (como o
+  SeAssignSecurity as grava).
+- **O descritor de cada objeto** (`ob/object_security.rs`): o do
+  OBJECT_HEADER (SeDefaultObjectMethod), o da tabela lateral (dispositivos e
+  drivers) ou o que o dono do corpo guarda (processos, threads, tokens,
+  objetos de despacho, diretórios e links, seções, callbacks, contextos de
+  silo; as chaves no nó do registro). `object_policy` o lê para as
+  aberturas por nome e por ponteiro, a duplicação, o ObCheckObjectAccess, o
+  ZwQueryObject e o Nt/ZwQuerySecurityObject (que passa pelo
+  SecurityProcedure de cada tipo: IRP_MJ_QUERY_SECURITY nos arquivos, o
+  DEVICE_OBJECT, o nó da chave, o SeQuerySecurityDescriptorInfo nos demais).
+  O Nt/ZwSetSecurityObject (`set_object_security`) mescla as partes pedidas
+  no descritor corrente (SeSetSecurityDescriptorInfo com o mapeamento do tipo
+  e o dono validado pelo token efetivo) e grava o resultado no mesmo lugar
+  (`ObjectOwner::set_security`), então a abertura seguinte segue o descritor
+  novo. Objetos novos recebem o SeAssignSecurity (`assign_new`: o descritor
+  explícito, o dono, o grupo e a DACL padrão do token efetivo, as validações
+  de UserMode do dono e da SACL); um objeto nomeado herda as ACEs herdáveis
+  do diretório (OBJECT_INHERIT, ou CONTAINER_INHERIT para diretórios) quando
+  a DACL dele veio do token, no ObInsertObject (o ParentDescriptor do
+  ObpAssignSecurity), no NtCreateDirectoryObject/NtCreateSymbolicLinkObject
+  e na publicação do nome pelo `object_manager::create_object`.
 - **MDLs**: o IoAllocateMdl (`io/mdl.rs`) só descreve o buffer (Size,
   StartVa, ByteOffset, ByteCount e MDL_ALLOCATED_FIXED_SIZE até 17 páginas) e
   o liga ao IRP; os PFNs e os outros flags vêm de quem descreve as páginas
@@ -1569,7 +1612,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     CloseProcedure em cada fechamento com as contagens anteriores,
     OkayToCloseProcedure antes do NtClose (FALSE dá
     STATUS_HANDLE_NOT_CLOSABLE), DeleteProcedure na remoção em PASSIVE_LEVEL,
-    SecurityProcedure (o SeDefaultObjectMethod quando o tipo não traz uma) e
+    SecurityProcedure (o SeDefaultObjectMethod quando o tipo não traz uma;
+    o descritor do cabeçalho é o que as aberturas do corpo verificam) e
     QueryNameProcedure no ObQueryNameString. Open e Close rodam anexados ao
     processo do handle. A ParseProcedure pertence à busca de nomes do
     namespace (`ob/handles/namespace.rs`) e ainda não é chamada.
@@ -1605,8 +1649,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (OBJECT_ATTRIBUTES obrigatório, nome ou CLIENT_ID ausente →
     STATUS_INVALID_PARAMETER_MIX, STATUS_INVALID_CID), de qualquer processo;
     o acesso é concedido pelo SeDebugPrivilege do token efetivo ou pela DACL.
-    O descritor de uma thread é o do processo dela (os dois vêm do DACL
-    padrão do token primário do processo), e NtGetNextThread usa o mesmo.
+    Processo e thread têm cada um o seu descritor (os dois nascem do DACL
+    padrão do token primário do processo; o NtSetSecurityObject troca cada
+    um). A OpenProcedure dos dois tipos (`ps/open_procedure.rs`, o
+    PspProcessOpen/PspThreadOpen) roda em todo handle novo, de usuário ou de
+    kernel, depois dos callbacks: PROCESS_QUERY_INFORMATION (ou
+    PROCESS_VM_OPERATION com PROCESS_VM_WRITE) implica
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION implica
+    PROCESS_SET_LIMITED_INFORMATION, PROCESS_TERMINATE de UserMode num
+    processo DisallowUserTerminate é negado; THREAD_QUERY_INFORMATION,
+    THREAD_SET_INFORMATION e THREAD_SUSPEND_RESUME implicam as versões
+    limitadas e THREAD_RESUME.
   - NtQueryInformationProcess(ProcessBasicInformation, ProcessImageFileName)
     lê o EPROCESS do handle (PROCESS_QUERY_LIMITED_INFORMATION): PEB, PID,
     InheritedFromUniqueProcessId, prioridade base e código de saída, ou o
@@ -2324,6 +2377,17 @@ dos pacotes (`kernel`, `boot`).
 
 ## 8. Pontos em aberto
 
+- Segurança dos objetos: só os objetos do ObCreateObject guardam o descritor
+  no OBJECT_HEADER.SecurityDescriptor; os demais (processos, threads,
+  tokens, objetos de despacho, namespace, seções) o guardam no registro do
+  dono como `SecurityPolicy`, convertida de e para os componentes do
+  descritor. A avaliação não interpreta ACEs condicionais (callback) nem
+  listas de tipos de objeto, não audita e não monta o PRIVILEGE_SET dos
+  privilégios usados. A verificação de travessia (ObpCheckTraverseAccess)
+  não é feita: todos os tokens do OpenNT têm SeChangeNotifyPrivilege, com o
+  qual o NT também a pula. Os diretórios criados pelo kernel no boot têm o
+  descritor fixo de `se/object_security.rs` (SYSTEM e Everyone), não os
+  do ObInitSystem/smss.
 - Alguns grupos de exports ainda misturam componentes e moram no `exports.rs`
   de um só: `driver_helpers`, `io_diagnostics` e `x86bios_sleep_misc` em `io`
   (os handlers dos x86Bios* deste já moram em `hal/exports.rs`, mas os nomes
