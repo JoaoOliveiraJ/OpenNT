@@ -95,23 +95,110 @@ pub fn call(routine: u64, arguments: &[u64]) -> u64 {
     result
 }
 
+// ---- as chamadas nativas em curso da CPU -----------------------------------
+//
+// Duas células por CPU, na reserva da KPCR (`pcr::layout::NATIVE_FRAME` e
+// `NATIVE_OWNER`, endereçadas por `gs:` nos trampolins): o contexto nativo
+// agendado que a CPU executa (`win32_thunk::run_kernel_context`; o RSP do
+// hospedeiro para onde a saída volta fica no próprio quadro, não aqui) e a
+// posse de execução nativa síncrona (só faltas numa execução nativa possuída
+// entram no SEH de kernel). São da thread corrente: a troca de thread leva as
+// da que sai e recoloca as da que entra (`NativeState`), então duas threads
+// que se intercalam dentro de chamadas nativas, ou duas CPUs ao mesmo tempo,
+// nunca veem o estado uma da outra. Antes da KPCR do BSP só ele executa, e a
+// posse fica numa célula de partida que a KPCR herda.
+
+use crate::ntos::ke::pcr;
+
+/// A posse do processador de boot antes da KPCR dele.
+static BOOT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+core::arch::global_asm!(
+    r#"
+.pushsection .data.kernel_native, "aw", @progbits
+# Nao zero quando o GS de todo processador que executa o kernel e a KPCR
+# dele: os trampolins de excecao so tocam as celulas `gs:` depois disso.
+.global opennt_native_cells_ready
+opennt_native_cells_ready: .byte 0
+.popsection
+"#
+);
+
 extern "C" {
-    static mut opennt_kernel_sync_active: u64;
+    static mut opennt_native_cells_ready: u8;
+}
+
+fn cells_ready() -> bool {
+    pcr::get_pcr_address() != 0
+}
+
+fn read_cell(offset: u64) -> u64 {
+    let value: u64;
+    // SAFETY: célula da reserva da KPCR desta CPU, publicada (`cells_ready`).
+    unsafe { core::arch::asm!("mov {}, gs:[{}]", out(reg) value, in(reg) offset, options(nostack, readonly, preserves_flags)) };
+    value
+}
+
+fn write_cell(offset: u64, value: u64) {
+    // SAFETY: célula da reserva da KPCR desta CPU, publicada (`cells_ready`).
+    unsafe { core::arch::asm!("mov gs:[{}], {}", in(reg) offset, in(reg) value, options(nostack, preserves_flags)) };
+}
+
+/// A KPCR do BSP acaba de ser publicada no GS: a posse de partida passa para
+/// a célula dela, e os trampolins passam a usar as células `gs:` (os APs
+/// carregam o GS antes de executar qualquer coisa).
+pub fn publish_processor_cells() {
+    write_cell(pcr::layout::NATIVE_FRAME, 0);
+    write_cell(pcr::layout::NATIVE_OWNER, BOOT_OWNER.load(core::sync::atomic::Ordering::Relaxed));
+    // SAFETY: byte da imagem lido pelos trampolins; um store simples.
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(opennt_native_cells_ready), 1) };
+}
+
+/// As chamadas nativas em curso da thread corrente, como a troca de thread
+/// as leva e recoloca.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeState {
+    /// O contexto nativo agendado em execução (0 = nenhum).
+    pub frame: u64,
+    /// A posse de execução nativa síncrona.
+    pub owner: u64,
+}
+
+/// O estado das chamadas nativas da CPU agora.
+pub fn state() -> NativeState {
+    if !cells_ready() {
+        return NativeState { frame: 0, owner: BOOT_OWNER.load(core::sync::atomic::Ordering::Relaxed) };
+    }
+    NativeState { frame: read_cell(pcr::layout::NATIVE_FRAME), owner: read_cell(pcr::layout::NATIVE_OWNER) }
+}
+
+/// Recoloca o estado das chamadas nativas de quem volta a executar.
+pub fn restore_state(state: NativeState) {
+    if !cells_ready() {
+        BOOT_OWNER.store(state.owner, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    write_cell(pcr::layout::NATIVE_FRAME, state.frame);
+    write_cell(pcr::layout::NATIVE_OWNER, state.owner);
+}
+
+/// O contexto nativo agendado que a CPU executa agora (0 = nenhum).
+pub fn scheduled_frame() -> u64 {
+    state().frame
 }
 
 /// A posse de execução nativa síncrona da CPU agora.
 pub fn sync_active() -> u64 {
-    // SAFETY: célula estática da imagem, só lida.
-    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(opennt_kernel_sync_active)) }
+    state().owner
 }
 
 /// Troca a posse de execução nativa síncrona e devolve a anterior: só
 /// faltas numa execução nativa possuída entram no SEH de kernel.
 pub fn set_sync_active(value: u64) -> u64 {
-    unsafe {
-        let cell = core::ptr::addr_of_mut!(opennt_kernel_sync_active);
-        let previous = core::ptr::read_volatile(cell);
-        core::ptr::write_volatile(cell, value);
-        previous
+    if !cells_ready() {
+        return BOOT_OWNER.swap(value, core::sync::atomic::Ordering::Relaxed);
     }
+    let previous = read_cell(pcr::layout::NATIVE_OWNER);
+    write_cell(pcr::layout::NATIVE_OWNER, value);
+    previous
 }

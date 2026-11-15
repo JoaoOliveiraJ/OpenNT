@@ -4994,6 +4994,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::per_cpu::run(assert);
     crate::ntos::test::multiprocess::ipi_stall::run(assert);
     crate::ntos::test::multiprocess::current_thread::run(assert);
+    crate::ntos::test::multiprocess::native_interleave::run(assert);
     crate::ntos::test::multiprocess::vad::run(assert);
     crate::ntos::test::multiprocess::identity::run(assert);
     crate::ntos::test::multiprocess::attach_cr3::run(assert);

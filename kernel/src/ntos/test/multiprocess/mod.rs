@@ -29,3 +29,4 @@ pub mod process_tables;
 pub mod heap_nx;
 pub mod pipes;
 pub mod jobs;
+pub mod native_interleave;

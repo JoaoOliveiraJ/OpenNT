@@ -40,7 +40,10 @@ struct CpuFrame {
     _pad_9c: [Field<u32>; 1],
     /// Dr0..Dr3, Dr6, Dr7 (a ordem do CONTEXT).
     debug: [Field<u64>; 6],
-    _pad_d0: [Field<u64>; 6],
+    /// O RSP do hospedeiro (`run_kernel_context`) para onde a próxima saída
+    /// do contexto volta: de cada quadro, não da CPU.
+    _host_rsp: Field<u64>,
+    _pad_d8: [Field<u64>; 5],
     fx: XsaveFormat,
     /// Quadro bruto: id em +0, argumentos em +8..+112, RIP em +120 e RSP
     /// anterior em +128.
@@ -55,6 +58,7 @@ const _: () = {
     assert!(offset_of!(CpuFrame, rflags) == 0x88);
     assert!(offset_of!(CpuFrame, segments) == 0x90);
     assert!(offset_of!(CpuFrame, debug) == 0xA0);
+    assert!(offset_of!(CpuFrame, _host_rsp) == 0xD0);
     assert!(offset_of!(CpuFrame, fx) == 0x100);
     assert!(offset_of!(CpuFrame, raw) == 0x300);
     assert!(size_of::<CpuFrame>() <= 0x400);

@@ -776,7 +776,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
         assert!((0..4).any(|slot| dr7 & (3 << (slot * 2)) == 0), "user call capture: all four debug slots are in use");
     }
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
-    let native_owned = native_call::sync_active();
+    let native = native_call::state();
     block.context.set(context);
     block.exit_kind.set(0);
     block.continue_flag.set(0);
@@ -785,7 +785,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     load_kernel_stack(fallback);
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
-    native_call::set_sync_active(native_owned);
+    native_call::restore_state(native);
     let mut state = STATE.lock();
     state.frame_context = 0;
     state.running = false;
@@ -802,7 +802,7 @@ pub fn in_service() -> bool {
 /// O estado por CPU do serviço em curso que uma thread bloqueada leva
 /// consigo, na própria pilha, e recoloca ao ser retomada: o CONTEXT do
 /// intervalo, o quadro da syscall, as faixas preservadas do CONTEXT, a pilha
-/// do usuário (KPCR.UserRsp), o NtContinue e a posse de execução nativa. O
+/// do usuário (KPCR.UserRsp), o NtContinue e as chamadas nativas em curso. O
 /// callback de instrumentação é do processo e não viaja com a thread.
 struct SuspendedService {
     context: u64,
@@ -813,7 +813,7 @@ struct SuspendedService {
     continue_flag: u32,
     continue_rcx: u64,
     continue_r11: u64,
-    native_owned: u64,
+    native: native_call::NativeState,
 }
 
 /// A thread corrente bloqueia dentro do serviço em curso (o lado de saída do
@@ -837,7 +837,7 @@ pub fn block_in_service(kernel_stack: &Field<u64>) {
         continue_flag: block.continue_flag.get(),
         continue_rcx: block.continue_rcx.get(),
         continue_r11: block.continue_r11.get(),
-        native_owned: native_call::sync_active(),
+        native: native_call::state(),
     };
     // SAFETY: dentro de um intervalo despachado, na pilha de kernel da
     // própria thread (`ke::context_switch::can_block`), que o ceifador não
@@ -851,7 +851,7 @@ pub fn block_in_service(kernel_stack: &Field<u64>) {
     block.continue_r11.set(saved.continue_r11);
     pcr::current().user_rsp.set(saved.user_rsp);
     *CONTEXT_KEEP.lock() = saved.keep;
-    native_call::set_sync_active(saved.native_owned);
+    native_call::restore_state(saved.native);
     let mut state = STATE.lock();
     state.frame_context = saved.frame_context;
     state.service_frame = saved.service_frame;
@@ -875,7 +875,7 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     load_kernel_stack(stack);
     let block = block();
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
-    let native_owned = native_call::sync_active();
+    let native = native_call::state();
     block.exit_kind.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     // SAFETY: `saved_rsp` é o KernelStack que `block_in_service` gravou na
@@ -884,7 +884,7 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     load_kernel_stack(fallback);
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
-    native_call::set_sync_active(native_owned);
+    native_call::restore_state(native);
     let mut state = STATE.lock();
     state.frame_context = 0;
     state.service_frame = 0;
@@ -898,7 +898,7 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
 /// do despachante (`dispatcher_rsp`, o mesmo que o fim do intervalo
 /// consome), o CONTEXT do intervalo e o quadro da syscall, as faixas
 /// preservadas do CONTEXT, a pilha do usuário (KPCR.UserRsp), o NtContinue,
-/// o tipo de saída, a posse de execução nativa, KPRCB.RspBase/TSS.RSP0, o GS
+/// o tipo de saída, as chamadas nativas em curso, KPRCB.RspBase/TSS.RSP0, o GS
 /// do usuário e o IF — é guardado aqui e volta no fim. O intervalo aninhado
 /// entra no CONTEXT `context` com a pilha de kernel da KTHREAD corrente (a
 /// pilha do callback, que o Ke instalou em InitialStack antes), então as
@@ -924,7 +924,7 @@ pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
         continue_flag: block.continue_flag.get(),
         continue_rcx: block.continue_rcx.get(),
         continue_r11: block.continue_r11.get(),
-        native_owned: native_call::sync_active(),
+        native: native_call::state(),
     };
     let dispatcher_rsp = block.dispatcher_rsp.get();
     let exit_kind = block.exit_kind.get();
@@ -954,7 +954,7 @@ pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
     block.continue_r11.set(saved.continue_r11);
     kpcr.user_rsp.set(saved.user_rsp);
     *CONTEXT_KEEP.lock() = saved.keep;
-    native_call::set_sync_active(saved.native_owned);
+    native_call::restore_state(saved.native);
     {
         let mut state = STATE.lock();
         state.frame_context = saved.frame_context;

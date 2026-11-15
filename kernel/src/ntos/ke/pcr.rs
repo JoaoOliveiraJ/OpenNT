@@ -61,11 +61,16 @@ pub mod layout {
     /// (`rtl::sync`), logo depois do bloco de execução de usuário.
     pub const SPIN_LOCKS_HELD: u64 = (USER_EXECUTION + size_of::<UserExecutionBlock>() as u64 + 15) & !15;
     pub const SHARED_LOCKS_HELD: u64 = SPIN_LOCKS_HELD + 4;
+    /// As chamadas nativas em curso da CPU (`hal::amd64::native_call`): o
+    /// contexto nativo agendado que executa e a posse de execução nativa
+    /// síncrona, células da thread corrente que a troca leva.
+    pub const NATIVE_FRAME: u64 = SPIN_LOCKS_HELD + 8;
+    pub const NATIVE_OWNER: u64 = NATIVE_FRAME + 8;
     pub const SIZE: u64 = 0xC000;
 
     const _: () = assert!(size_of::<Kpcr>() as u64 <= SIZE);
     const _: () = assert!(USER_EXECUTION + size_of::<UserExecutionBlock>() as u64 <= SIZE);
-    const _: () = assert!(SHARED_LOCKS_HELD + 4 <= SIZE);
+    const _: () = assert!(SHARED_LOCKS_HELD + 4 <= NATIVE_FRAME && NATIVE_OWNER + 8 <= SIZE);
     const _: () = assert!(USER_RSP == 0x10 && PRCB_CURRENT_THREAD == 0x188 && PRCB_RSP_BASE == 0x1A8);
 }
 
@@ -202,6 +207,7 @@ pub fn init() -> Result<(), KernelError> {
     // Só depois de materializar os campos ativa a PCR como base de GS.
     cpu::write_msr(GS_BASE_MSR, base);
     ADDRESS.store(base, Ordering::Release);
+    native_call::publish_processor_cells();
     // Daqui em diante toda CPU que executa o kernel tem o GS na sua KPCR (os
     // APs o carregam na entrada): as posses de lock passam a ser contadas.
     crate::rtl::sync::publish_lock_counters(layout::SPIN_LOCKS_HELD, layout::SHARED_LOCKS_HELD);

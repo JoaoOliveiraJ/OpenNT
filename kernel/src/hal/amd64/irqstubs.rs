@@ -54,6 +54,31 @@ global_asm!(
     r#"
 .pushsection .text.irq, "ax", @progbits
 
+# Celulas das chamadas nativas da CPU (`native_call`: o contexto nativo
+# agendado e a posse de execucao nativa sincrona, da thread corrente):
+# guardadas em dois registradores preservados e zeradas enquanto o tratador
+# Rust roda (que pode trocar de thread: a troca leva as celulas de cada
+# uma), recolocadas na volta. Antes da KPCR do BSP nao ha celulas (nenhum
+# codigo nativo roda ainda).
+.macro OPENNT_NATIVE_SAVE scheduled, owner
+    xor \scheduled, \scheduled
+    xor \owner, \owner
+    cmp byte ptr [rip + opennt_native_cells_ready], 0
+    je 7f
+    mov \scheduled, gs:[{native_frame}]
+    mov \owner, gs:[{native_owner}]
+    mov qword ptr gs:[{native_frame}], 0
+    mov qword ptr gs:[{native_owner}], 0
+7:
+.endm
+.macro OPENNT_NATIVE_RESTORE scheduled, owner
+    cmp byte ptr [rip + opennt_native_cells_ready], 0
+    je 7f
+    mov gs:[{native_frame}], \scheduled
+    mov gs:[{native_owner}], \owner
+7:
+.endm
+
 # Entrada do depurador do kernel (`ntos::kd::stop`), com EDX = motivo e a
 # pilha no formato de `irq_common` (R11..RAX, vetor e o quadro do hardware):
 # completa o TrapFrame, guarda o x87/SSE numa area FXSAVE64 entregue ao
@@ -70,19 +95,13 @@ global_asm!(
     and rsp, -16
     sub rsp, 512
     fxsave64 [rsp]
-    mov r12, [rip + opennt_kernel_native_active]
-    mov r13, [rip + opennt_kernel_native_host_rsp]
-    mov r14, [rip + opennt_kernel_sync_active]
-    mov qword ptr [rip + opennt_kernel_native_active], 0
-    mov qword ptr [rip + opennt_kernel_sync_active], 0
+    OPENNT_NATIVE_SAVE r12, r14
     cld
     mov rdi, rbp
     mov rsi, rsp
     call rs_kd_trap
     mov r15d, eax
-    mov [rip + opennt_kernel_native_host_rsp], r13
-    mov [rip + opennt_kernel_native_active], r12
-    mov [rip + opennt_kernel_sync_active], r14
+    OPENNT_NATIVE_RESTORE r12, r14
     fxrstor64 [rsp]
     mov eax, r15d
     mov rsp, rbp
@@ -462,18 +481,12 @@ irq_kernel_exception_common:
     fxsave64 [rsp]
     cld
     mov r12, cr2
-    mov r13, [rip + opennt_kernel_native_active]
-    mov r14, [rip + opennt_kernel_native_host_rsp]
-    mov r15, [rip + opennt_kernel_sync_active]
-    mov qword ptr [rip + opennt_kernel_native_active], 0
-    mov qword ptr [rip + opennt_kernel_sync_active], 0
+    OPENNT_NATIVE_SAVE r13, r15
     mov rdi, r12
     mov rsi, [rbx + 40 + 80]        # codigo de erro do hardware
     mov rdx, [rbx + 40 + 104]       # RFLAGS interrompido
     call rs_kernel_page_fault
-    mov [rip + opennt_kernel_native_host_rsp], r14
-    mov [rip + opennt_kernel_native_active], r13
-    mov [rip + opennt_kernel_sync_active], r15
+    OPENNT_NATIVE_RESTORE r13, r15
     mov cr2, r12                    # faltas aninhadas resolvidas nao mudam o CR2
     fxrstor64 [rsp]
     mov rsp, rbx
@@ -503,9 +516,11 @@ irq_kernel_not_resident:
     # tratador.
     cmp r10d, 0x29
     je irq_kernel_diagnostic
-    cmp qword ptr [rip + opennt_kernel_native_active], 0
+    cmp byte ptr [rip + opennt_native_cells_ready], 0
+    je irq_kernel_diagnostic
+    cmp qword ptr gs:[{native_frame}], 0
     jne irq_kernel_trap_owner
-    cmp qword ptr [rip + opennt_kernel_sync_active], 0
+    cmp qword ptr gs:[{native_owner}], 0
     je irq_kernel_diagnostic
 irq_kernel_trap_owner:
     cmp word ptr [rsp + r11], 0x10
@@ -526,19 +541,13 @@ irq_kernel_trap_owner:
     sub rsp, 528
     fxsave64 [rsp]
     cld
-    mov r12, [rip + opennt_kernel_native_active]
-    mov r13, [rip + opennt_kernel_native_host_rsp]
-    mov r14, [rip + opennt_kernel_sync_active]
-    mov qword ptr [rip + opennt_kernel_native_active], 0
-    mov qword ptr [rip + opennt_kernel_sync_active], 0
+    OPENNT_NATIVE_SAVE r12, r14
     mov edi, r10d
     mov rsi, rbp
     mov rdx, rsp
     call rs_kernel_trap_dispatch
     mov [rsp + 512], eax
-    mov [rip + opennt_kernel_native_host_rsp], r13
-    mov [rip + opennt_kernel_native_active], r12
-    mov [rip + opennt_kernel_sync_active], r14
+    OPENNT_NATIVE_RESTORE r12, r14
     fxrstor64 [rsp]
     mov eax, [rsp + 512]
     cmp ebx, 96
@@ -612,6 +621,8 @@ irq_exception_halt:
     fault_rip = const gs_offset(offset_of!(UserExecutionBlock, fault_rip)),
     fault_rsp = const gs_offset(offset_of!(UserExecutionBlock, fault_rsp)),
     fault_cr2 = const gs_offset(offset_of!(UserExecutionBlock, fault_cr2)),
+    native_frame = const crate::ntos::ke::pcr::layout::NATIVE_FRAME,
+    native_owner = const crate::ntos::ke::pcr::layout::NATIVE_OWNER,
 );
 
 extern "C" {

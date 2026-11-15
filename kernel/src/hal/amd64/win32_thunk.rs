@@ -8,10 +8,12 @@
 //! CONTEXT+0x4D0, a execução retoma no RIP/RSP do contexto (exceções e
 //! unwind); senão restaura os não voláteis e retorna o RAX do handler.
 //!
-//! Quando um contexto nativo agendado está ativo (`kernel_native_active`),
-//! o trampolim comum desvia para `kernel_native_trap`, que salva o estado no
-//! contexto e volta ao `kernel_context_run` do hospedeiro; o despacho da API
-//! acontece fora do contexto (`ntos::rtl::native_context`).
+//! Quando um contexto nativo agendado está ativo na CPU (a célula
+//! `gs:[NATIVE_FRAME]`, da thread corrente: `native_call`), o trampolim comum
+//! desvia para `kernel_native_trap`, que salva o estado no contexto e volta
+//! ao `kernel_context_run` do hospedeiro pelo RSP que ele guardou no próprio
+//! quadro; o despacho da API acontece fora do contexto
+//! (`ntos::rtl::native_context`).
 //!
 //! Ids: 0–31 = kernel32 (modo usuário), >= 32 = exports do ntoskrnl.
 
@@ -43,7 +45,7 @@ opennt_win32_stubs:
 opennt_win32_common:
     # Preserva as flags antes de escolher o caminho síncrono ou o agendado.
     pushfq
-    cmp qword ptr [rip + opennt_kernel_native_active], 0
+    cmp qword ptr gs:[{native_frame}], 0
     jne 5f
     popfq
     push rbp
@@ -139,10 +141,12 @@ opennt_win32_common:
     jmp opennt_kernel_native_trap
 
 # Contexto nativo: 16 GPRs (RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15), RIP
-# +0x80, RFLAGS +0x88, seletores +0x90, DR0..3/DR6/DR7 +0xA0, FXSAVE64
-# +0x100 (512 bytes). Uma CPU executa código nativo agendado por vez; o
-# despacho de APIs acontece com kernel_native_active zerado, permitindo
-# callbacks nativos síncronos.
+# +0x80, RFLAGS +0x88, seletores +0x90, DR0..3/DR6/DR7 +0xA0, o RSP do
+# hospedeiro +0xD0, FXSAVE64 +0x100 (512 bytes). O contexto em execucao e a
+# celula gs:[NATIVE_FRAME] da CPU (da thread corrente; a troca de thread a
+# leva), e o RSP para onde a saida volta e o do proprio quadro: duas threads
+# ou duas CPUs dentro de contextos nativos nao se cruzam. O despacho de APIs
+# acontece com a celula zerada, permitindo callbacks nativos sincronos.
 .balign 16
 .global opennt_kernel_context_run
 opennt_kernel_context_run:
@@ -171,8 +175,8 @@ opennt_kernel_context_run:
     mov rax, dr6
     mov [rsp + 0x220], rax
     fxsave64 [rsp]
-    mov [rip + opennt_kernel_native_host_rsp], rsp
-    mov [rip + opennt_kernel_native_active], rdi
+    mov [rdi + 0xD0], rsp
+    mov gs:[{native_frame}], rdi
     mov rax, [rdi + 0xA0]
     mov dr0, rax
     mov rax, [rdi + 0xA8]
@@ -210,7 +214,7 @@ opennt_kernel_context_run:
 .balign 16
 opennt_kernel_native_trap:
     push r11
-    mov r11, [rip + opennt_kernel_native_active]
+    mov r11, gs:[{native_frame}]
     mov [r11 + 0x00], rax
     mov [r11 + 0x08], rcx
     mov [r11 + 0x10], rdx
@@ -256,8 +260,8 @@ opennt_kernel_native_trap:
     mov rax, dr6
     mov [r11 + 0xC0], rax
     fxsave64 [r11 + 0x100]
-    mov qword ptr [rip + opennt_kernel_native_active], 0
-    mov rsp, [rip + opennt_kernel_native_host_rsp]
+    mov qword ptr gs:[{native_frame}], 0
+    mov rsp, [r11 + 0xD0]
     fxrstor64 [rsp]
     mov rax, [rsp + 0x200]
     mov dr0, rax
@@ -291,19 +295,9 @@ opennt_kernel_thread_return:
     jmp opennt_kernel_native_trap
 .popsection
 
-.pushsection .data.kernel_native, "aw", @progbits
-.balign 8
-.global opennt_kernel_native_active
-opennt_kernel_native_active: .quad 0
-.global opennt_kernel_native_host_rsp
-opennt_kernel_native_host_rsp: .quad 0
-# Uma chamada nativa síncrona está usando o processador; o despacho de
-# volta ao kernel e os callbacks de interrupção suspendem essa posse.
-.global opennt_kernel_sync_active
-opennt_kernel_sync_active: .quad 0
-.popsection
 "#,
     stubs = const MAX_WIN32,
+    native_frame = const crate::ntos::ke::pcr::layout::NATIVE_FRAME,
 );
 
 extern "C" {

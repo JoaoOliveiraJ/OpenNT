@@ -426,22 +426,23 @@ struct CpuSwitch {
 static SWITCH: [CpuSwitch; map::MAX_CPUS] = [const { CpuSwitch { resumer: AtomicU64::new(0), running: AtomicU64::new(0), reason: AtomicU8::new(0) } }; map::MAX_CPUS];
 
 /// O estado da CPU que cada lado de uma troca leva consigo e recoloca ao
-/// voltar a executar: o IRQL, a posse de execução nativa síncrona, as posses
-/// de SharedLock e a thread corrente (com a raiz do processo dela).
+/// voltar a executar: o IRQL (o CR8), as chamadas nativas em curso (o
+/// contexto nativo agendado e a posse de execução nativa síncrona), as
+/// posses de SharedLock e a thread corrente (com a raiz do processo dela).
 struct CarriedState {
     irql: u8,
-    native: u64,
+    native: native_call::NativeState,
     shared: u32,
     thread: u64,
 }
 
 fn carry_out() -> CarriedState {
-    CarriedState { irql: irql::get_irql(), native: native_call::sync_active(), shared: sync::swap_shared_locks_held(0), thread: process::get_current_thread() }
+    CarriedState { irql: irql::get_irql(), native: native_call::state(), shared: sync::swap_shared_locks_held(0), thread: process::get_current_thread() }
 }
 
 fn carry_in(state: CarriedState) {
     irql::swap_irql(state.irql);
-    native_call::set_sync_active(state.native);
+    native_call::restore_state(state.native);
     sync::swap_shared_locks_held(state.shared);
     if process::get_current_thread() != state.thread {
         process::set_current_thread(state.thread);
@@ -499,7 +500,7 @@ pub fn initialize_kernel_thread(thread: u64, entry: extern "C" fn(u64) -> !, arg
 /// que o despachante publicou.
 pub fn begin_kernel_thread() {
     irql::swap_irql(irql::PASSIVE_LEVEL);
-    native_call::set_sync_active(0);
+    native_call::restore_state(native_call::NativeState::default());
     sync::swap_shared_locks_held(0);
 }
 
