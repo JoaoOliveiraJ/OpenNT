@@ -73,8 +73,22 @@ pub fn mark_internal(pdo: u64) {
 
 static INTERNAL: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 
+/// Ids de função cujo driver é o próprio kernel neste boot, para os PDOs
+/// que um driver de barramento real (o pci.sys) relata.
+static INTERNAL_IDS: SpinLock<Option<fn(&[String], &[String]) -> bool>> = SpinLock::new(None);
+
+/// Registra o reconhecimento por ids dos nós do kernel.
+pub fn set_internal_ids(predicate: fn(&[String], &[String]) -> bool) {
+    *INTERNAL_IDS.lock() = Some(predicate);
+}
+
 fn is_internal(pdo: u64) -> bool {
     INTERNAL.lock().contains(&pdo)
+}
+
+fn is_internal_by_ids(hardware_ids: &[String], compatible_ids: &[String]) -> bool {
+    let predicate = *INTERNAL_IDS.lock();
+    predicate.is_some_and(|predicate| predicate(hardware_ids, compatible_ids))
 }
 
 /// PipProcessDevNodeTree a partir da raiz, até a fila de reenumeração
@@ -223,7 +237,7 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
         install::write_text(&key, "LocationInformation", location)?;
     }
     let mut service = install::read_text(&key, "Service");
-    let internal = is_internal(pdo);
+    let internal = is_internal(pdo) || is_internal_by_ids(&hardware_ids, &compatible_ids);
     if service.is_none() && !internal {
         match install::select_driver(&hardware_ids, &compatible_ids) {
             Some(driver) => {

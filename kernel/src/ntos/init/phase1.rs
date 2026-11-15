@@ -95,6 +95,11 @@ pub fn init() {
     }
     // Rotinas de IoRegisterDriverReinitialization, como no NT.
     crate::ntos::io::lifecycle::run_reinitialization_routines();
+    // `--pnp-root=acpi`: a raiz da árvore de dispositivos é o acpi.sys real
+    // sobre o dispositivo ACPI da HAL, com o pci.sys no barramento PCI.
+    if crate::drivers::bus::acpi_stack::ENABLED {
+        crate::drivers::bus::acpi_stack::initialize();
+    }
     // `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
     if crate::drivers::storage::storage_stack::ENABLED {
         crate::drivers::storage::storage_stack::initialize();

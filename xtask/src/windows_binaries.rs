@@ -8,6 +8,7 @@
 //! e a lista de revogação), os file systems de pipes e mailslots (npfs.sys e
 //! msfs.sys), o runtime do KMDF com um cliente (WdfLdr.sys, Wdf01000.sys,
 //! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, a
+//! raiz ACPI da árvore de dispositivos (acpi.sys, pci.sys e a pshed.dll), a
 //! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys do
 //! repositório de drivers), os
 //! arquivos que o vgk.sys abre pelo caminho
@@ -117,6 +118,12 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ("WDF01000.SYS", "System32/drivers/Wdf01000.sys"),
     ("SLEEPSTUDYHELPER.SYS", "System32/drivers/SleepStudyHelper.sys"),
     ("MSISADRV.SYS", "System32/drivers/msisadrv.sys"),
+    // A raiz ACPI da árvore de dispositivos (`--pnp-root=acpi`): o acpi.sys
+    // no dispositivo ACPI da HAL, o pci.sys no barramento PCI que ele
+    // enumera e a pshed.dll que o pci.sys importa.
+    ("ACPI.SYS", "System32/drivers/acpi.sys"),
+    ("PCI.SYS", "System32/drivers/pci.sys"),
+    ("PSHED.DLL", "System32/pshed.dll"),
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0516~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",

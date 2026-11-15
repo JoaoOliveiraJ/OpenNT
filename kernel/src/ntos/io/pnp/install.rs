@@ -62,6 +62,9 @@ pub struct ServiceSpec {
     pub binary: &'static str,
     pub group: Option<&'static str>,
     pub owner: &'static str,
+    /// AddReg do `[*_Service_Inst]` (HKR = a chave do serviço: Tag,
+    /// Parameters...).
+    pub values: &'static [RegValue],
 }
 
 /// Classe de dispositivo (o `[ClassInstall32]` do INF da classe).
@@ -103,21 +106,21 @@ pub const CLASS_SYSTEM: ClassSpec = ClassSpec { guid: "{4d36e97d-e325-11ce-bfc1-
 pub const CLASS_DISPLAY: ClassSpec = ClassSpec { guid: "{4d36e968-e325-11ce-bfc1-08002be10318}", name: "Display", upper_filters: &[], lower_filters: &[] };
 
 /// mshdc.inf `[intelide_Service_Inst]`.
-const SERVICE_INTELIDE: ServiceSpec = ServiceSpec { name: "intelide", display_name: None, start: 0, error_control: 3, binary: "intelide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf" };
+const SERVICE_INTELIDE: ServiceSpec = ServiceSpec { name: "intelide", display_name: None, start: 0, error_control: 3, binary: "intelide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf", values: &[] };
 /// mshdc.inf `[pciide_Service_Inst]`.
-const SERVICE_PCIIDE: ServiceSpec = ServiceSpec { name: "pciide", display_name: None, start: 0, error_control: 3, binary: "pciide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf" };
+const SERVICE_PCIIDE: ServiceSpec = ServiceSpec { name: "pciide", display_name: None, start: 0, error_control: 3, binary: "pciide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf", values: &[] };
 /// mshdc.inf `[atapi_Service_Inst]`.
-const SERVICE_ATAPI: ServiceSpec = ServiceSpec { name: "atapi", display_name: Some("@mshdc.inf,%idechannel.DeviceDesc%;IDE Channel"), start: 0, error_control: 3, binary: "atapi.sys", group: Some("SCSI Miniport"), owner: "mshdc.inf" };
+const SERVICE_ATAPI: ServiceSpec = ServiceSpec { name: "atapi", display_name: Some("@mshdc.inf,%idechannel.DeviceDesc%;IDE Channel"), start: 0, error_control: 3, binary: "atapi.sys", group: Some("SCSI Miniport"), owner: "mshdc.inf", values: &[] };
 /// disk.inf `[disk_ServiceInstallSection]`.
-const SERVICE_DISK: ServiceSpec = ServiceSpec { name: "disk", display_name: Some("@disk.inf,%disk_ServiceDesc%;Disk Driver"), start: 0, error_control: 1, binary: "disk.sys", group: None, owner: "disk.inf" };
+const SERVICE_DISK: ServiceSpec = ServiceSpec { name: "disk", display_name: Some("@disk.inf,%disk_ServiceDesc%;Disk Driver"), start: 0, error_control: 1, binary: "disk.sys", group: None, owner: "disk.inf", values: &[] };
 /// volume.inf `[volume_ServiceInstallSection]`.
-const SERVICE_VOLUME: ServiceSpec = ServiceSpec { name: "volume", display_name: Some("@volume.inf,%VolumeServiceDesc%;Volume driver"), start: 0, error_control: 3, binary: "volume.sys", group: None, owner: "volume.inf" };
+const SERVICE_VOLUME: ServiceSpec = ServiceSpec { name: "volume", display_name: Some("@volume.inf,%VolumeServiceDesc%;Volume driver"), start: 0, error_control: 3, binary: "volume.sys", group: None, owner: "volume.inf", values: &[] };
 /// volmgr.inf `[Volmgr_Service]`.
-const SERVICE_VOLMGR: ServiceSpec = ServiceSpec { name: "volmgr", display_name: Some("@volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver"), start: 0, error_control: 3, binary: "volmgr.sys", group: Some("System Bus Extender"), owner: "volmgr.inf" };
+const SERVICE_VOLMGR: ServiceSpec = ServiceSpec { name: "volmgr", display_name: Some("@volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver"), start: 0, error_control: 3, binary: "volmgr.sys", group: Some("System Bus Extender"), owner: "volmgr.inf", values: &[] };
 /// machine.inf `[msisadrv_ServiceInstallSection]` (StartType
 /// SERVICE_BOOT_START, ErrorControl SERVICE_ERROR_CRITICAL; o AddReg grava o
 /// Tag 2).
-const SERVICE_MSISADRV: ServiceSpec = ServiceSpec { name: "msisadrv", display_name: None, start: 0, error_control: 3, binary: "msisadrv.sys", group: Some("Boot Bus Extender"), owner: "machine.inf" };
+const SERVICE_MSISADRV: ServiceSpec = ServiceSpec { name: "msisadrv", display_name: None, start: 0, error_control: 3, binary: "msisadrv.sys", group: Some("Boot Bus Extender"), owner: "machine.inf", values: &[] };
 /// basicdisplay.inf `[MSBDD_Fallback_Generic_Service_Inst]`, que o
 /// `[MSBDA.Services]` do display.inf inclui (`include=basicdisplay.inf`,
 /// `needs=MSBDD_Fallback.Services`): ServiceBinary `%13%\BasicDisplay.sys`,
@@ -130,7 +133,47 @@ const SERVICE_BASIC_DISPLAY: ServiceSpec = ServiceSpec {
     binary: "\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicdisplay.inf_amd64_19e58b6267591a82\\BasicDisplay.sys",
     group: Some("Video"),
     owner: "display.inf",
+    values: &[],
 };
+
+/// acpi.inf `[ACPI_Service_Inst]` com o `[acpi_ServiceInstallSection_AddReg]`
+/// (Tag 2, Group "Core").
+const SERVICE_ACPI: ServiceSpec = ServiceSpec {
+    name: "ACPI",
+    display_name: Some("@acpi.inf,%ACPI.SvcDesc%;Microsoft ACPI Driver"),
+    start: 0,
+    error_control: 3,
+    binary: "ACPI.sys",
+    group: Some("Core"),
+    owner: "acpi.inf",
+    values: &[RegValue { subkey: "", name: "Tag", data: RegData::Dword(2) }],
+};
+/// pci.inf `[pci_ServiceInstallSection]` com o
+/// `[pci_ServiceInstallSection_AddReg]` (Tag 3 e
+/// Parameters\DmaRemappingCompatible = 1).
+const SERVICE_PCI: ServiceSpec = ServiceSpec {
+    name: "pci",
+    display_name: Some("@pci.inf,%pci_svcdesc%;PCI Bus Driver"),
+    start: 0,
+    error_control: 3,
+    binary: "pci.sys",
+    group: Some("Boot Bus Extender"),
+    owner: "pci.inf",
+    values: &[
+        RegValue { subkey: "", name: "Tag", data: RegData::Dword(3) },
+        RegValue { subkey: "Parameters", name: "DmaRemappingCompatible", data: RegData::Dword(1) },
+    ],
+};
+
+/// acpi.inf `[RP_REG_MUTE_IRQ]` (HKR = chave do driver).
+const ACPI_RESOURCE_PICKER: &[RegValue] = &[RegValue { subkey: "", name: "ResourcePickerExceptions", data: RegData::Text("IRQ:HAL") }];
+/// pci.inf `[PCI_ROOT_REG]` (HKR = chave do driver).
+const PCI_ROOT_RESOURCE_PICKER: &[RegValue] = &[
+    RegValue { subkey: "", name: "ResourcePickerExceptions", data: RegData::Text("IO:HAL,MBRES;MEM:HAL,MBRES") },
+    RegValue { subkey: "", name: "ResourcePickerTags", data: RegData::Text("MBRES") },
+];
+/// pci.inf `[PCI_BRIDGE_HW.AddReg]` (`[PCI_ROOT.HW]`, HKR = Device Parameters).
+const PCI_ROOT_HARDWARE: &[RegValue] = &[RegValue { subkey: "", name: "UINumberDescFormat", data: RegData::Text("PCI Slot %1!u!") }];
 
 /// mshdc.inf `[intelChannelEnableCheck_AddReg.HW]`, referenciado pelo
 /// `AddReg` de `[intelide_Inst]` (HKR = chave do driver).
@@ -346,12 +389,90 @@ pub const DRIVERS: &[InfDriver] = &[
     },
 ];
 
+/// As linhas de modelo do acpi.inf (`*pnp0c08` e `pnp0c08`, seção ACPI_Inst)
+/// e do pci.inf (`*PNP0A03` e `*PNP0A08`, seção PCI_ROOT), que só a árvore
+/// com a raiz ACPI (`--pnp-root=acpi`) usa: o acpi.sys no dispositivo ACPI da
+/// HAL e o pci.sys no barramento PCI que ele enumera.
+pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
+    InfDriver {
+        inf: "acpi.inf",
+        section: "ACPI_Inst",
+        id: "*pnp0c08",
+        description_key: "*pnp0c08.DeviceDesc",
+        description: "Microsoft ACPI-Compliant System",
+        manufacturer_key: "MSFT",
+        manufacturer: "Microsoft",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.6456",
+        service: Some(&SERVICE_ACPI),
+        class: &CLASS_SYSTEM,
+        driver_values: ACPI_RESOURCE_PICKER,
+        device_values: &[],
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "acpi.inf",
+        section: "ACPI_Inst",
+        id: "pnp0c08",
+        description_key: "*pnp0c08.DeviceDesc",
+        description: "Microsoft ACPI-Compliant System",
+        manufacturer_key: "MSFT",
+        manufacturer: "Microsoft",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.6456",
+        service: Some(&SERVICE_ACPI),
+        class: &CLASS_SYSTEM,
+        driver_values: ACPI_RESOURCE_PICKER,
+        device_values: &[],
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "pci.inf",
+        section: "PCI_ROOT",
+        id: "*PNP0A03",
+        description_key: "*pnp0a03.DeviceDesc",
+        description: "PCI Bus",
+        manufacturer_key: "GENDEV_MFG",
+        manufacturer: "(Standard system devices)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.6456",
+        service: Some(&SERVICE_PCI),
+        class: &CLASS_SYSTEM,
+        driver_values: PCI_ROOT_RESOURCE_PICKER,
+        device_values: PCI_ROOT_HARDWARE,
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "pci.inf",
+        section: "PCI_ROOT",
+        id: "*PNP0A08",
+        description_key: "*pnp0a08.DeviceDesc",
+        description: "PCI Express Root Complex",
+        manufacturer_key: "GENDEV_MFG",
+        manufacturer: "(Standard system devices)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.6456",
+        service: Some(&SERVICE_PCI),
+        class: &CLASS_SYSTEM,
+        driver_values: PCI_ROOT_RESOURCE_PICKER,
+        device_values: PCI_ROOT_HARDWARE,
+        exclude_ids: &[],
+    },
+];
+
+/// As linhas que o instalador considera neste boot: as dos INFs da caixa e,
+/// com a raiz ACPI, as do acpi.inf e do pci.inf.
+fn candidates() -> impl Iterator<Item = &'static InfDriver> {
+    let acpi: &'static [InfDriver] = if crate::drivers::bus::acpi_stack::ENABLED { ACPI_ROOT_DRIVERS } else { &[] };
+    DRIVERS.iter().chain(acpi.iter())
+}
+
 /// O driver de melhor posto para os ids: HardwareIDs na ordem, depois os
 /// CompatibleIDs (sem diferenciar maiúsculas).
 pub fn select_driver(hardware_ids: &[String], compatible_ids: &[String]) -> Option<&'static InfDriver> {
     let ids = || hardware_ids.iter().chain(compatible_ids.iter());
     let excluded = |driver: &InfDriver| driver.exclude_ids.iter().any(|exclude| ids().any(|id| id.eq_ignore_ascii_case(exclude)));
-    ids().find_map(|id| DRIVERS.iter().find(|driver| driver.id.eq_ignore_ascii_case(id) && !excluded(driver)))
+    ids().find_map(|id| candidates().find(|driver| driver.id.eq_ignore_ascii_case(id) && !excluded(driver)))
 }
 
 fn multi_sz(items: &[&str]) -> Vec<u8> {
@@ -434,6 +555,7 @@ pub fn install_service(service: &ServiceSpec) -> Result<(), KernelError> {
     if let Some(group) = service.group {
         write_text(&key, "Group", group)?;
     }
+    apply_values(&key, service.values)?;
     if service.owner.is_empty() {
         return Ok(());
     }

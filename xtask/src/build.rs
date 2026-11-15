@@ -40,6 +40,9 @@ pub struct BuildOptions {
     /// bundle do kernel (padrão `<build-dir>/windows`). Builds que dividem a
     /// pasta não recompilam o kernel só porque o caminho dela mudou.
     pub windows_dir: Option<PathBuf>,
+    /// `--pnp-root=acpi`: a raiz da árvore de dispositivos é o acpi.sys real
+    /// sobre o dispositivo ACPI da HAL, com o pci.sys real no barramento PCI.
+    pub pnp_root: String,
 }
 
 pub struct BuildOutput {
@@ -110,7 +113,8 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
         .env("OPENNT_START_DRIVER", &options.start_driver)
         .env("OPENNT_INITIAL_PROCESS", &options.initial_process)
         .env("OPENNT_STORAGE", &options.storage)
-        .env("OPENNT_DISPLAY", &options.display);
+        .env("OPENNT_DISPLAY", &options.display)
+        .env("OPENNT_PNP_ROOT", &options.pnp_root);
     if options.trace_driver_api {
         command.env("OPENNT_TRACE_DRIVER_API", "1");
     } else {

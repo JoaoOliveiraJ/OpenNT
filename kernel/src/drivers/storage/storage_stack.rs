@@ -67,7 +67,7 @@ fn seed_registry() -> Result<(), KernelError> {
     // partmgr: o filtro de classe do DiskDrive (c_diskdrive.inf); a chave do
     // serviço vem da instalação do sistema (Group "Boot Bus Extender",
     // Parameters\SanPolicy 1 e as altitudes dos gerenciadores de volume).
-    install::install_service(&ServiceSpec { name: "partmgr", display_name: Some("@%SystemRoot%\\system32\\drivers\\partmgr.sys,-100"), start: 0, error_control: 3, binary: "partmgr.sys", group: Some("Boot Bus Extender"), owner: "" })?;
+    install::install_service(&ServiceSpec { name: "partmgr", display_name: Some("@%SystemRoot%\\system32\\drivers\\partmgr.sys,-100"), start: 0, error_control: 3, binary: "partmgr.sys", group: Some("Boot Bus Extender"), owner: "", values: &[] })?;
     let parameters = format!("{}\\Services\\partmgr\\Parameters", install::CONTROL_SET);
     install::write_dword(&parameters, "SanPolicy", 1)?;
     for (name, altitude) in [("clusbflt", 4), ("spaceport", 0x10), ("volmgr", 0x20)] {
@@ -76,7 +76,7 @@ fn seed_registry() -> Result<(), KernelError> {
     for class in [&install::CLASS_HDC, &install::CLASS_DISK_DRIVE, &install::CLASS_VOLUME, &install::CLASS_SYSTEM] {
         install::install_class(class)?;
     }
-    install::install_service(&ServiceSpec { name: "volmgr", display_name: Some("@volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver"), start: 0, error_control: 3, binary: "volmgr.sys", group: Some("System Bus Extender"), owner: "volmgr.inf" })?;
+    install::install_service(&ServiceSpec { name: "volmgr", display_name: Some("@volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver"), start: 0, error_control: 3, binary: "volmgr.sys", group: Some("System Bus Extender"), owner: "volmgr.inf", values: &[] })?;
     Ok(())
 }
 

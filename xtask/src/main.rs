@@ -13,7 +13,7 @@
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
-//! `--display=basic`, `--windows-dir=DIR`.
+//! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
@@ -49,6 +49,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real --display=basic
                    --windows-dir=DIR (binarios do Windows do bundle; padrao <build-dir>/windows)
+                   --pnp-root=acpi
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
@@ -86,6 +87,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             storage: String::new(),
             display: String::new(),
             windows_dir: None,
+            pnp_root: String::new(),
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4 },
         positional: Vec::new(),
@@ -117,6 +119,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
             "--windows-dir" => parsed.build.windows_dir = Some(PathBuf::from(required()?)),
+            "--pnp-root" => parsed.build.pnp_root = required()?,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -134,6 +137,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.initial_process.as_str(), "" | "smss") {
         return Err(format!("--initial-process aceita apenas smss ({} recebido)", parsed.build.initial_process));
+    }
+    if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi") {
+        return Err(format!("--pnp-root aceita apenas acpi ({} recebido)", parsed.build.pnp_root));
     }
     if parsed.machine.memory_mb < 128 {
         return Err("--memory-mb deve cobrir o heap do kernel (minimo 128)".into());

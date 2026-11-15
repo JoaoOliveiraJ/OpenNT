@@ -34,6 +34,7 @@ pub mod pci_config;
 pub mod pci_native;
 pub mod firmware_environment;
 pub mod firmware_return;
+pub mod pnp;
 pub mod private_dispatch;
 pub mod public_dispatch;
 pub mod system_information;

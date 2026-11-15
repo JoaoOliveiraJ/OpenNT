@@ -14,11 +14,17 @@
 //! pelos INFs da caixa, AddDevice, recursos e START. As demais funções
 //! também: a ponte PCI-ISA recebe o msisadrv.sys (machine.inf), um driver
 //! KMDF, e `check_kmdf_bus` confere o caminho PnP do framework.
+//!
+//! Com `--pnp-root=acpi` (`acpi_stack`) a raiz é a da HAL: o computador
+//! (`ROOT\ACPI_HAL\0000`, `hal::pnp`) como barramento da plataforma, com o
+//! acpi.sys e o pci.sys reais por baixo; as funções dos drivers internos
+//! são reconhecidas pelos ids que o pci.sys relata (PCI\CC_0101 e
+//! PCI\CC_0300) e ficam igualmente do kernel.
 
 use alloc::format;
 use alloc::string::String;
 
-use crate::drivers::bus::pci;
+use crate::drivers::bus::{acpi_stack, pci};
 use crate::drivers::storage::storage_stack;
 use crate::drivers::video::display_stack;
 use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, NtStruct};
@@ -33,9 +39,24 @@ fn internally_driven(function: &pci::PciFunction) -> bool {
     (ide && !storage_stack::ENABLED) || (vga && !display_stack::ENABLED)
 }
 
+/// Uma função relatada pelo pci.sys que um driver interno do kernel serve
+/// neste boot, pelos ids de classe do pci.sys (PCI\CC_ccss).
+fn internally_driven_ids(hardware_ids: &[String], compatible_ids: &[String]) -> bool {
+    let has = |id: &str| hardware_ids.iter().chain(compatible_ids.iter()).any(|candidate| candidate.eq_ignore_ascii_case(id));
+    (has("PCI\\CC_0101") && !storage_stack::ENABLED) || (has("PCI\\CC_0300") && !display_stack::ENABLED)
+}
+
 /// Cria a raiz da árvore com o barramento PCI interno e marca as funções
-/// dos drivers internos. Idempotente.
+/// dos drivers internos; com a raiz ACPI, o computador da HAL. Idempotente.
 pub fn prepare() -> Result<(), KernelError> {
+    if acpi_stack::ENABLED {
+        let computer = crate::hal::pnp::create()?;
+        pnp::tree::initialize()?;
+        pnp::root::add_platform_bus(computer);
+        pnp::tree::mark_internal(computer);
+        pnp::tree::set_internal_ids(internally_driven_ids);
+        return Ok(());
+    }
     let root_bus = pci::create_root_bus()?;
     pnp::tree::initialize()?;
     pnp::root::add_platform_bus(root_bus);
