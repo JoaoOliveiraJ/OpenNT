@@ -175,9 +175,30 @@ fn interface_subkey(units: &[u16]) -> Result<(String, String), u32> {
     Ok((text(&units[end - 38..end]), format!("##?#{}\\#{reference}", text(&units[4..end]))))
 }
 
+/// Cria a árvore de chaves abaixo de `Control` nível a nível (o
+/// PnpCtxRegCreateTree) e devolve o handle da última.
+fn create_key_tree(path: &str) -> Result<(u32, u64), KernelError> {
+    const CONTROL: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control";
+    let Some(rest) = path.strip_prefix(CONTROL) else { return key_services::open_path(path, true) };
+    let mut current = String::from(CONTROL);
+    let mut opened = (0xC000_0034, 0);
+    for component in rest.split('\\').filter(|component| !component.is_empty()) {
+        if opened.1 != 0 {
+            cm_registry::close_handle(opened.1 as u32);
+        }
+        current.push('\\');
+        current.push_str(component);
+        opened = key_services::open_path(&current, true)?;
+        if opened.0 != 0 {
+            return Ok(opened);
+        }
+    }
+    Ok(opened)
+}
+
 /// Cria a chave (e as de cima) e grava um REG_SZ.
 fn write_text_value(path: &str, name: &str, text: &str) -> Result<(), KernelError> {
-    let (status, handle) = key_services::open_path(path, true)?;
+    let (status, handle) = create_key_tree(path)?;
     if status != 0 {
         return Ok(());
     }
