@@ -6,7 +6,11 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
+use crate::ntos::inc::types::{AuthzbasepSecurityAttributesInformation, Field, NtStruct, UnicodeString};
+use crate::ntos::inc::types::extra_obpsse::{AuthzbasepSecurityAttribute, AuthzbasepSecurityAttributeValue};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::unicode_case;
 use crate::rtl::KernelError;
 
@@ -238,4 +242,195 @@ pub fn encode(attributes: &[SecurityAttribute], base: u64) -> Result<Vec<u8>, u3
     let mut bytes = vec![0u8; size as usize];
     layout_attributes(attributes, base, Some(&mut BufferWriter(&mut bytes)), u64::MAX, present)?;
     Ok(bytes)
+}
+
+// ---- Formato interno do token -------------------------------------------------
+//
+// O TOKEN_ACCESS_INFORMATION carrega o conjunto no formato interno do token,
+// como o AuthzBasepCopyoutInternalSecurityAttributes do ntoskrnl 19041: o
+// AUTHZBASEP_SECURITY_ATTRIBUTES_INFORMATION (contagem, lista de atributos,
+// contagem e lista de trabalho), um AuthzbasepSecurityAttribute por
+// atributo e, depois de todos eles, por atributo, o nome (alinhado a 2) e os
+// valores (AuthzbasepSecurityAttributeValue, alinhados a 8) seguidos dos
+// dados de strings, SIDs e octetos. As listas são LIST_ENTRY com endereços
+// absolutos.
+
+const INTERNAL_HEADER: u64 = AuthzbasepSecurityAttributesInformation::SIZE;
+const INTERNAL_ATTRIBUTE: u64 = AuthzbasepSecurityAttribute::SIZE;
+const INTERNAL_VALUE: u64 = AuthzbasepSecurityAttributeValue::SIZE;
+const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+const HEADER_COUNT: u64 = offset_of!(AuthzbasepSecurityAttributesInformation, security_attribute_count) as u64;
+const HEADER_LIST: u64 = offset_of!(AuthzbasepSecurityAttributesInformation, security_attributes_list) as u64;
+const HEADER_WORKING_LIST: u64 = offset_of!(AuthzbasepSecurityAttributesInformation, working_security_attributes_list) as u64;
+const ATTRIBUTE_NAME: u64 = offset_of!(AuthzbasepSecurityAttribute, name) as u64;
+const ATTRIBUTE_TYPE: u64 = offset_of!(AuthzbasepSecurityAttribute, value_type) as u64;
+const ATTRIBUTE_FLAGS: u64 = offset_of!(AuthzbasepSecurityAttribute, flags) as u64;
+const ATTRIBUTE_VALUE_COUNT: u64 = offset_of!(AuthzbasepSecurityAttribute, value_count) as u64;
+const ATTRIBUTE_VALUES: u64 = offset_of!(AuthzbasepSecurityAttribute, values) as u64;
+const ATTRIBUTE_LIST_60: u64 = offset_of!(AuthzbasepSecurityAttribute, list_60) as u64;
+const VALUE_DATA: u64 = offset_of!(AuthzbasepSecurityAttributeValue, value) as u64;
+const VALUE_NAME: u64 = offset_of!(AuthzbasepSecurityAttributeValue, name) as u64;
+
+fn utf16_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Bytes que o valor deixa depois do vetor de valores do atributo.
+fn internal_value_data(kind: u16, value: &AttributeValue) -> Result<Vec<u8>, u32> {
+    match (kind, value) {
+        (1 | 2 | 6, AttributeValue::Integer(_)) => Ok(Vec::new()),
+        (3, AttributeValue::Text(text)) | (4, AttributeValue::Fqbn { name: text, .. }) => Ok(utf16_bytes(text)),
+        (5 | 0x10, AttributeValue::Bytes(bytes)) => Ok(bytes.clone()),
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
+}
+
+/// Tamanho do formato interno, em ULONG como o
+/// AuthzBasepGetInternalSecurityAttributesCopyoutBufferSize.
+pub fn internal_size(attributes: &[SecurityAttribute]) -> Result<u32, u32> {
+    let add = |size: u32, more: u64| u32::try_from(size as u64 + more).map_err(|_| STATUS_INTEGER_OVERFLOW);
+    let mut size = add(0, INTERNAL_HEADER + attributes.len() as u64 * INTERNAL_ATTRIBUTE)?;
+    for attribute in attributes {
+        size = add(size, 1)? & !1;
+        size = add(size, attribute.name.encode_utf16().count() as u64 * 2)?;
+        size = add(size, 7)? & !7;
+        size = add(size, attribute.values.len() as u64 * INTERNAL_VALUE)?;
+        for value in &attribute.values {
+            size = add(size, internal_value_data(attribute.kind, value)?.len() as u64)?;
+        }
+    }
+    Ok(size)
+}
+
+/// Imagem do formato interno com ponteiros absolutos a partir de `base`.
+struct InternalImage {
+    bytes: Vec<u8>,
+    base: u64,
+}
+
+impl InternalImage {
+    fn put(&mut self, offset: u64, value: &[u8]) {
+        self.bytes[offset as usize..offset as usize + value.len()].copy_from_slice(value);
+    }
+    fn get64(&self, offset: u64) -> u64 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&self.bytes[offset as usize..offset as usize + 8]);
+        u64::from_le_bytes(word)
+    }
+    fn empty_list(&mut self, head: u64) {
+        let address = self.base + head;
+        self.put(head, &address.to_le_bytes());
+        self.put(head + 8, &address.to_le_bytes());
+    }
+    /// InsertTailList(head, entry).
+    fn insert_tail(&mut self, head: u64, entry: u64) {
+        let last = self.get64(head + 8);
+        let (head_address, entry_address) = (self.base + head, self.base + entry);
+        self.put(entry, &head_address.to_le_bytes());
+        self.put(entry + 8, &last.to_le_bytes());
+        self.put(last - self.base, &entry_address.to_le_bytes());
+        self.put(head + 8, &entry_address.to_le_bytes());
+    }
+    /// UNICODE_STRING com MaximumLength igual a Length, sem NUL.
+    fn counted(&mut self, descriptor: u64, length: usize, buffer: u64) {
+        self.put(descriptor + offset_of!(UnicodeString, length) as u64, &(length as u16).to_le_bytes());
+        self.put(descriptor + offset_of!(UnicodeString, maximum_length) as u64, &(length as u16).to_le_bytes());
+        self.put(descriptor + offset_of!(UnicodeString, buffer) as u64, &(self.base + buffer).to_le_bytes());
+    }
+}
+
+/// O conjunto no formato interno, montado para o endereço `base`.
+pub fn encode_internal(attributes: &[SecurityAttribute], base: u64) -> Result<Vec<u8>, u32> {
+    let size = internal_size(attributes)? as usize;
+    let mut image = InternalImage { bytes: vec![0u8; size], base };
+    image.empty_list(HEADER_LIST);
+    image.empty_list(HEADER_WORKING_LIST);
+    let mut cursor = INTERNAL_HEADER + attributes.len() as u64 * INTERNAL_ATTRIBUTE;
+    for (index, attribute) in attributes.iter().enumerate() {
+        let record = INTERNAL_HEADER + index as u64 * INTERNAL_ATTRIBUTE;
+        image.insert_tail(HEADER_LIST, record);
+        image.put(HEADER_COUNT, &(index as u32 + 1).to_le_bytes());
+        image.put(record + ATTRIBUTE_TYPE, &attribute.kind.to_le_bytes());
+        image.put(record + ATTRIBUTE_FLAGS, &attribute.flags.to_le_bytes());
+        image.empty_list(record + ATTRIBUTE_VALUES);
+        image.empty_list(record + ATTRIBUTE_LIST_60);
+        cursor = (cursor + 1) & !1;
+        let name = utf16_bytes(&attribute.name);
+        image.counted(record + ATTRIBUTE_NAME, name.len(), cursor);
+        image.put(cursor, &name);
+        cursor += name.len() as u64;
+        let values = (cursor + 7) & !7;
+        let mut data = values + attribute.values.len() as u64 * INTERNAL_VALUE;
+        for (value_index, value) in attribute.values.iter().enumerate() {
+            let entry = values + value_index as u64 * INTERNAL_VALUE;
+            let payload = internal_value_data(attribute.kind, value)?;
+            match value {
+                AttributeValue::Integer(number) => image.put(entry + VALUE_DATA, &number.to_le_bytes()),
+                AttributeValue::Text(_) => image.counted(entry + VALUE_DATA, payload.len(), data),
+                AttributeValue::Fqbn { version, .. } => {
+                    image.put(entry + VALUE_DATA, &version.to_le_bytes());
+                    image.counted(entry + VALUE_NAME, payload.len(), data);
+                }
+                AttributeValue::Bytes(_) => {
+                    image.put(entry + VALUE_DATA, &(base + data).to_le_bytes());
+                    image.put(entry + VALUE_NAME, &(payload.len() as u32).to_le_bytes());
+                }
+            }
+            image.put(data, &payload);
+            data += payload.len() as u64;
+            image.insert_tail(record + ATTRIBUTE_VALUES, entry);
+            image.put(record + ATTRIBUTE_VALUE_COUNT, &(value_index as u32 + 1).to_le_bytes());
+        }
+        cursor = data;
+    }
+    Ok(image.bytes)
+}
+
+/// Texto de uma UNICODE_STRING do formato interno (unidades inteiras).
+fn counted_text(descriptor: &UnicodeString) -> String {
+    let units: Vec<u16> = guest::read_bytes(descriptor.buffer.get(), descriptor.length.get() as usize & !1).chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Os atributos de um conjunto no formato interno (o
+/// TOKEN_ACCESS_INFORMATION.SecurityAttributes), pelas listas.
+pub fn decode_internal(address: u64) -> Result<Vec<SecurityAttribute>, u32> {
+    if address == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: o conjunto interno do TOKEN_ACCESS_INFORMATION do chamador.
+    let header = unsafe { AuthzbasepSecurityAttributesInformation::at(address) };
+    let head = header.security_attributes_list.address();
+    let mut attributes = Vec::new();
+    let mut link = header.security_attributes_list.flink.get();
+    while link != head {
+        // SAFETY: elo da lista de atributos, no início do registro.
+        let record = unsafe { AuthzbasepSecurityAttribute::at(link) };
+        let kind = record.value_type.get();
+        let mut values = Vec::new();
+        let values_head = record.values.address();
+        let mut value_link = record.values.flink.get();
+        while value_link != values_head {
+            // SAFETY: elo da lista de valores, no início do valor.
+            let value = unsafe { AuthzbasepSecurityAttributeValue::at(value_link) };
+            values.push(match kind {
+                1 | 2 | 6 => AttributeValue::Integer(value.value.get()),
+                // SAFETY: a UNICODE_STRING do STRING começa em `value`.
+                3 => AttributeValue::Text(counted_text(unsafe { UnicodeString::at(value.value.address()) })),
+                4 => AttributeValue::Fqbn { version: value.value.get(), name: counted_text(&value.name) },
+                5 | 0x10 => {
+                    // SAFETY: o ULONG do tamanho ocupa o início de `name`.
+                    let length = unsafe { Field::<u32>::at(value.name.address()) }.get();
+                    AttributeValue::Bytes(guest::read_bytes(value.value.get(), length as usize))
+                }
+                _ => return Err(STATUS_INVALID_PARAMETER),
+            });
+            value_link = value.list_link.flink.get();
+        }
+        attributes.push(SecurityAttribute { name: counted_text(&record.name), kind, flags: record.flags.get(), values });
+        link = record.list_link.flink.get();
+    }
+    Ok(attributes)
 }

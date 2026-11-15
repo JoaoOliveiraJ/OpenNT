@@ -12,10 +12,10 @@ use alloc::vec::Vec;
 
 use super::process;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::UnicodeString;
+use crate::ntos::inc::types::{TokenAccessInformation, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_data;
-use crate::ntos::se::security_attributes::{self, OutputWriter};
+use crate::ntos::se::security_attributes::{self, OutputWriter, SecurityAttribute};
 use crate::ntos::se::token::tokens::{self, Token};
 use crate::rtl::KernelError;
 
@@ -51,12 +51,33 @@ pub fn query_attributes(token_pointer: u64, names_pointer: u64, name_count: u32,
         return Ok(0xC000_000D);
     }
     let token = owned_token(token_pointer, "SeQuerySecurityAttributesToken")?;
+    query_attribute_set(&token.security_attributes, names_pointer, name_count, output, output_length, returned_length)
+}
+
+/// SeQuerySecurityAttributesTokenAccessInformation(TokenAccessInformation,
+/// Attributes, NumberOfAttributes, Buffer, BufferLength, ReturnLength): a
+/// mesma consulta do SeQuerySecurityAttributesToken sobre o TOKEN que o
+/// SepTokenFromAccessInformation monta do bloco, cujo conjunto é o formato
+/// interno apontado por SecurityAttributes.
+pub fn query_attributes_from_access_information(information: u64, names_pointer: u64, name_count: u32, output: u64, output_length: u32, returned_length: u64) -> Result<u32, KernelError> {
+    if (output != 0) != (output_length != 0) {
+        return Ok(0xC000_000D);
+    }
+    // SAFETY: PTOKEN_ACCESS_INFORMATION do chamador de kernel.
+    let internal = unsafe { TokenAccessInformation::at(information) }.security_attributes.get();
+    match security_attributes::decode_internal(internal) {
+        Ok(all) => query_attribute_set(&all, names_pointer, name_count, output, output_length, returned_length),
+        Err(status) => Ok(status),
+    }
+}
+
+/// O SepInternalQuerySecurityAttributesTokenEx sobre um conjunto.
+fn query_attribute_set(all: &[SecurityAttribute], names_pointer: u64, name_count: u32, output: u64, output_length: u32, returned_length: u64) -> Result<u32, KernelError> {
     // SAFETY: PULONG ReturnLength do chamador de kernel.
     let returned_length = unsafe { Field::<u32>::at(returned_length) };
     returned_length.set(0);
     // A seleção começa com todos; os filtros só valem para a lista não vazia.
-    let all = &token.security_attributes;
-    let mut selected = all.clone();
+    let mut selected = all.to_vec();
     if !all.is_empty() && names_pointer != 0 {
         // Valida todos os UNICODE_STRING antes de ler os nomes.
         let mut descriptors = Vec::new();

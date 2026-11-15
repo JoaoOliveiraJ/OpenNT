@@ -88,6 +88,7 @@ fn encode_sid_struct(sid: &[u8], base: u64) -> Vec<u8> {
 }
 
 /// TOKEN_INFORMATION_CLASS das classes que não alocam.
+const TOKEN_SESSION_ID: u32 = 12;
 const TOKEN_VIRTUALIZATION_ALLOWED: u32 = 23;
 const TOKEN_VIRTUALIZATION_ENABLED: u32 = 24;
 const TOKEN_INTEGRITY_LEVEL: u32 = 25;
@@ -123,7 +124,8 @@ fn last_sub_authority(sid: &[u8]) -> u32 {
 /// estrutura da classe e devolve o ponteiro em `*output`. Classes comuns
 /// implementadas; as demais devolvem STATUS_INVALID_INFO_CLASS. Como no
 /// ntoskrnl 19041, as classes escalares não alocam e gravam o ULONG direto
-/// em `*output`: as booleanas de TokenFlags (23, 24, 26, 29), a
+/// em `*output`: a TokenSessionId (12, o SeQuerySessionIdToken que o ndis.sys
+/// pede), as booleanas de TokenFlags (23, 24, 26, 29), a
 /// TokenIntegrityLevel (25, o RID do SID de integridade) e a
 /// TokenAppContainerNumber (32, o número do LowboxNumberEntry; o OpenNT não
 /// atribui números LowBox, então é 0). A TokenAppContainerSid (31) aloca um
@@ -139,6 +141,10 @@ pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, Ker
         return Ok(0);
     }
     match class {
+        TOKEN_SESSION_ID => {
+            out::<u32>(output).set(record.session_id);
+            return Ok(0);
+        }
         TOKEN_INTEGRITY_LEVEL => {
             out::<u32>(output).set(last_sub_authority(&record.integrity));
             return Ok(0);
@@ -244,34 +250,6 @@ pub fn is_admin(token: u64) -> bool {
 }
 
 // ---- Atributos de segurança / claims -------------------------------------
-
-/// SeQuerySecurityAttributesTokenAccessInformation(Token, *AttributesInfo):
-/// aloca um TOKEN_SECURITY_ATTRIBUTES_INFORMATION com o conjunto de
-/// atributos do token e devolve o ponteiro em `*output`. O token do Sistema
-/// tem conjunto vazio → cabeçalho bem-formado de 16 bytes (Version=1,
-/// AttributeCount=0, pAttributeV1=NULL).
-pub fn query_security_attributes_access_information(token: u64, output: u64) -> u32 {
-    let Some(record) = tokens::get(token).filter(|record| record.refs > 0) else {
-        return STATUS_INVALID_PARAMETER;
-    };
-    let size = match security_attributes::measure(&record.security_attributes) {
-        Ok(size) => size,
-        Err(status) => return status,
-    };
-    let base = guest::alloc_bytes(size);
-    if base == 0 {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    match security_attributes::encode(&record.security_attributes, base) {
-        Ok(bytes) => guest::write_bytes(base, &bytes),
-        Err(status) => {
-            guest::free_bytes(base);
-            return status;
-        }
-    }
-    out::<u64>(output).set(base);
-    0
-}
 
 /// SeSecurityAttributePresent(Token, Name): existe o claim nomeado? O
 /// conjunto vazio do token do Sistema devolve FALSE.

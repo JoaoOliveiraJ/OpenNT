@@ -836,3 +836,24 @@ const _: () = {
     assert!(core::mem::offset_of!(SecurityClientContext, server_is_remote) == 0x1a);
     assert!(core::mem::offset_of!(SecurityClientContext, client_token_control) == 0x1c);
 };
+
+/// `_AUTHZBASEP_SECURITY_ATTRIBUTES_INFORMATION` (0x30 bytes).
+#[repr(C)]
+pub struct AuthzbasepSecurityAttributesInformation {
+    pub security_attribute_count: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    pub security_attributes_list: ListEntry,
+    pub working_security_attribute_count: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+    pub working_security_attributes_list: ListEntry,
+}
+
+unsafe impl NtStruct for AuthzbasepSecurityAttributesInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<AuthzbasepSecurityAttributesInformation>() == 0x30);
+    assert!(core::mem::offset_of!(AuthzbasepSecurityAttributesInformation, security_attribute_count) == 0x0);
+    assert!(core::mem::offset_of!(AuthzbasepSecurityAttributesInformation, security_attributes_list) == 0x8);
+    assert!(core::mem::offset_of!(AuthzbasepSecurityAttributesInformation, working_security_attribute_count) == 0x18);
+    assert!(core::mem::offset_of!(AuthzbasepSecurityAttributesInformation, working_security_attributes_list) == 0x20);
+};

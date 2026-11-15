@@ -4215,15 +4215,49 @@ fn se_token_info_exports(assert: Assert) {
     let information = guest::read64(out);
     assert(no_container && container && guest::read64(information) == 0, "se-token-info: TokenAppContainerSid aloca o bloco com o SID nulo sem AppContainer");
     guest::free_bytes(information);
+    // TokenSessionId (12): o ULONG vai direto em *TokenInformation, sem
+    // alocação (os 4 bytes de cima ficam intactos).
+    guest::write64(out, u64::MAX);
+    let session = call_export("SeQueryInformationToken", &[primary, 12, out]) == Some(0) && Some(guest::read32(out)) == tokens::with(primary, |token| token.session_id) && guest::read32(out + 4) == u32::MAX;
+    assert(session, "se-token-info: TokenSessionId grava o ULONG direto");
 
     // Classe não implementada → STATUS_INVALID_INFO_CLASS.
     assert(call_export("SeQueryInformationToken", &[primary, 7, out]) == Some(0xFFFF_FFFF_C000_0003), "se-token-info: classe nao suportada recusada");
 
-    // SeQuerySecurityAttributesTokenAccessInformation: estrutura vazia bem-formada.
-    assert(call_export("SeQuerySecurityAttributesTokenAccessInformation", &[primary, out]) == Some(0) && guest::read64(out) != 0, "se-token-info: AccessInformation aloca o conjunto de atributos");
-    let attributes = guest::read64(out);
-    assert(attributes != 0 && at::<nt::TokenSecurityAttributesInformation>(attributes).version.get() == 1 && at::<nt::TokenSecurityAttributesInformation>(attributes).attribute_count.get() == 0, "se-token-info: conjunto de atributos vazio (Version=1, Count=0)");
-    guest::free_bytes(attributes);
+    // SeQuerySecurityAttributesTokenAccessInformation(Info, Nomes, Contagem,
+    // Buffer, Length, ReturnLength) lê o conjunto interno do
+    // TOKEN_ACCESS_INFORMATION: o do Sistema é vazio (Version=1, Count=0).
+    let access_information = |token: u64| {
+        let block = guest::alloc_bytes(0x1000);
+        let bytes = crate::ntos::se::token::query::encode(token, 22, block).unwrap_or_default();
+        guest::write_bytes(block, &bytes);
+        block
+    };
+    let information = access_information(primary);
+    let attributes = guest::alloc_bytes(0x200);
+    let returned = guest::alloc_bytes(8);
+    let empty = call_export("SeQuerySecurityAttributesTokenAccessInformation", &[information, 0, 0, attributes, 0x200, returned]) == Some(0) && at::<nt::TokenSecurityAttributesInformation>(attributes).version.get() == 1 && at::<nt::TokenSecurityAttributesInformation>(attributes).attribute_count.get() == 0 && guest::read32(returned) == 16;
+    let invalid = call_export("SeQuerySecurityAttributesTokenAccessInformation", &[information, 0, 0, attributes, 0, returned]) == Some(0xFFFF_FFFF_C000_000D);
+    assert(empty && invalid, "se-token-info: conjunto de atributos vazio do TOKEN_ACCESS_INFORMATION (Version=1, Count=0)");
+    // Um atributo UINT64 no formato interno: cabeçalho de 0x30, registro de
+    // 0x70, nome logo depois e o valor alinhado a 8; a consulta o devolve.
+    use crate::ntos::se::security_attributes::{AttributeValue, SecurityAttribute};
+    let tagged = tokens::create(None, Some(&|token: &mut tokens::Token| {
+        token.security_attributes = alloc::vec![SecurityAttribute { name: alloc::string::String::from("TESTE"), kind: 2, flags: 0, values: alloc::vec![AttributeValue::Integer(5)] }];
+    }))
+    .unwrap_or(0);
+    let tagged_information = access_information(tagged);
+    let internal = at::<nt::TokenAccessInformation>(tagged_information).security_attributes.get();
+    let record = internal + 0x30;
+    let layout = guest::read32(internal) == 1 && guest::read64(internal + 8) == record && guest::read64(record) == internal + 8 && guest::read16(record + 0x30) == 2 && guest::read16(record + 0x20) == 10 && guest::read64(record + 0x28) == internal + 0xA0 && guest::read32(record + 0x3C) == 1 && guest::read64(record + 0x48) == internal + 0xB0 && guest::read64(internal + 0xB0 + 0x28) == 5;
+    let queried = call_export("SeQuerySecurityAttributesTokenAccessInformation", &[tagged_information, 0, 0, attributes, 0x200, returned]) == Some(0) && at::<nt::TokenSecurityAttributesInformation>(attributes).attribute_count.get() == 1;
+    let first = at::<nt::TokenSecurityAttributesInformation>(attributes).p_attribute_v1.get();
+    let value = queried && first != 0 && at::<nt::TokenSecurityAttributeV1>(first).value_type.get() == 2 && guest::read64(at::<nt::TokenSecurityAttributeV1>(first).values.get()) == 5;
+    assert(layout && value, "se-token-info: atributo no formato interno do TOKEN_ACCESS_INFORMATION e devolvido pela consulta");
+    let _ = tokens::release(tagged);
+    for block in [tagged_information, information, attributes, returned] {
+        guest::free_bytes(block);
+    }
 
     // SeSecurityAttributePresent: o conjunto vazio do Sistema não tem SYSAPPID.
     let name = "WIN://SYSAPPID";

@@ -103,6 +103,9 @@ pub struct Token {
     /// TokenDefaultDacl: rege os objetos criados por esta identidade.
     pub default_dacl: Option<Vec<Ace>>,
     pub impersonation_level: u32,
+    /// TOKEN_MANDATORY_POLICY (TokenMandatoryPolicy e o campo do
+    /// TOKEN_ACCESS_INFORMATION).
+    pub mandatory_policy: u32,
     /// Processo dono de um token criado com OBJ_EXCLUSIVE (0 = compartilhado).
     pub exclusive_process: u64,
     /// OBJ_PERMANENT: referência de posse independente dos handles.
@@ -209,6 +212,8 @@ pub fn accounting(token_pointer: u64) -> Result<(u64, u64), KernelError> {
 /// SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED.
 const PRIVILEGE_ENABLED: u32 = 3;
 
+const TOKEN_MANDATORY_POLICY_NO_WRITE_UP: u32 = 1;
+
 /// Os privilégios do token do System, na ordem e com os atributos do
 /// SeMakeSystemToken do ntoskrnl 19041: (LUID do privilégio, habilitado).
 const SYSTEM_PRIVILEGES: [(u64, bool); 31] = [
@@ -310,6 +315,9 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
             None => Some(alloc::vec![Ace::allow(user.clone(), 0x1000_0000)]),
         },
         impersonation_level: 2,
+        // O SeMakeSystemToken fixa TOKEN_MANDATORY_POLICY_NO_WRITE_UP no
+        // token do System; as cópias conservam a do pai.
+        mandatory_policy: parent.as_ref().map_or(TOKEN_MANDATORY_POLICY_NO_WRITE_UP, |parent| parent.mandatory_policy),
     };
     // Identidades especiais definem seus campos antes do armazenamento dinâmico.
     if let Some(initialize) = initialize {

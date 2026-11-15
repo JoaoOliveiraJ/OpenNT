@@ -933,7 +933,14 @@ fn token_services(assert: Assert) {
     let (charged, available) = tokens::accounting(system).unwrap_or((0, 0));
     assert(statistics.dynamic_charged.get() as u64 == charged && statistics.dynamic_available.get() as u64 == available, "token: memoria dinamica do token");
     assert(matches!(query_token::query(handle, 10, output, 8, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == 56, "token: buffer pequeno informa o tamanho");
-    assert(matches!(query_token::query(handle, 0, output, 56, returned, 0), Ok(0xC000_0003)) && matches!(query_token::query(handle, 5, output, 56, returned, 0), Ok(0xC000_0002)), "token: classes recusadas e nao implementadas");
+    assert(matches!(query_token::query(handle, 0, output, 56, returned, 0), Ok(0xC000_0003)) && matches!(query_token::query(handle, 14, output, 56, returned, 0), Ok(0xC000_0003)), "token: classes recusadas");
+    // TokenPrimaryGroup pelo caminho de kernel: o buffer curto só recebe o
+    // ReturnLength; com espaço, o ponteiro aponta para o SID logo depois.
+    let group_length = 8 + record.primary_group.len() as u32;
+    guest::write_bytes(output, &[0xCC; 0x40]);
+    let short = matches!(query_token::query(handle, 5, output, group_length - 1, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == group_length && guest::read_bytes(output, 0x40).iter().all(|&byte| byte == 0xCC);
+    let full = matches!(query_token::query(handle, 5, output, 0x40, returned, 0), Ok(0)) && guest::read32(returned) == group_length && guest::read64(output) == output + 8 && guest::read_bytes(output + 8, record.primary_group.len()) == record.primary_group && guest::read_bytes(output + group_length as u64, 0x40 - group_length as usize).iter().all(|&byte| byte == 0xCC);
+    assert(short && full, "token: TokenPrimaryGroup em KernelMode sem escrever alem do tamanho");
     // ZwDuplicateToken para um token de impersonação.
     assert(matches!(duplicate_token::duplicate(handle, 0, 0, false, 3, new_handle, 0), Ok(0xC000_000D)), "token: tipo de token invalido");
     assert(matches!(duplicate_token::duplicate(handle, 0, 0, false, 2, new_handle, 0), Ok(0)), "token: ZwDuplicateToken");
@@ -943,6 +950,82 @@ fn token_services(assert: Assert) {
     assert(om_access(duplicated) == Some(0xA), "token: acesso herdado do handle de origem");
     assert(matches!(close::close(duplicated, Some(0)), Ok(0)) && !tokens::exists(copy), "token: copia liberada no ultimo handle");
     assert(matches!(close::close(handle, Some(0)), Ok(0)), "token: fecha o handle de origem");
+    guest::free_bytes(output);
+}
+
+/// ZwQueryInformationToken com TokenAccessInformation (classe 22) sobre o
+/// token do System, com o tamanho e o layout do
+/// SepGetTokenAccessInformationBufferSize/SepCopyTokenAccessInformation, e o
+/// bloco consumido pelo SeTokenFromAccessInformation.
+fn token_access_information(assert: Assert) {
+    use alloc::vec::Vec;
+    use crate::ntos::inc::types::{LuidAndAttributes, SidAndAttributes, SidAndAttributesHash, TokenAccessInformation, TokenPrivileges};
+    use crate::ntos::ob::close;
+    use crate::ntos::se::token::{handles as th, query as query_token};
+    let system = process::get_primary_token(process::get_system_process()).unwrap_or(0);
+    let Some(record) = tokens::get(system) else {
+        assert(false, "token-access: token do System");
+        return;
+    };
+    let handle = th::create(system, 8, 0x200, false).unwrap_or(0);
+    let output = guest::alloc_bytes(0x1000);
+    let returned = guest::alloc_bytes(8);
+    // UserAndGroups do token: o usuário, os grupos e o rótulo de integridade.
+    let mut groups: Vec<(Vec<u8>, u32)> = alloc::vec![(record.user.clone(), record.user_attributes)];
+    groups.extend(record.groups.iter().map(|group| (group.sid.clone(), group.attributes)));
+    groups.push((record.integrity.clone(), 0x60));
+    let mut privileges: Vec<(u64, u32)> = record.privileges.iter().filter(|privilege| privilege.id < 37).map(|privilege| (privilege.id, privilege.attributes & 3)).collect();
+    privileges.sort_unstable_by_key(|&(id, _)| id);
+    // 0x58 do TOKEN_ACCESS_INFORMATION + três SID_AND_ATTRIBUTES_HASH de 0x110,
+    // os SIDs alinhados a 8, o conjunto vazio de atributos (0x30) e o
+    // TOKEN_PRIVILEGES.
+    let groups_size = groups.len() * 16 + groups.iter().map(|(sid, _)| (sid.len() + 7) & !7).sum::<usize>();
+    let expected = (0x388 + groups_size + 0x30 + 4 + privileges.len() * 12) as u32;
+    guest::write_bytes(output, &[0xCC; 0x1000]);
+    let short = matches!(query_token::query(handle, 22, output, expected - 1, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == expected && guest::read_bytes(output, 0x1000).iter().all(|&byte| byte == 0xCC);
+    assert(short, "token-access: buffer curto devolve o tamanho sem gravar no buffer");
+    let full = matches!(query_token::query(handle, 22, output, 0x1000, returned, 0), Ok(0)) && guest::read32(returned) == expected && guest::read_bytes(output + expected as u64, 0x1000 - expected as usize).iter().all(|&byte| byte == 0xCC);
+    assert(full, "token-access: TokenAccessInformation em KernelMode com o tamanho exigido");
+    let info = unsafe { TokenAccessInformation::at(output) };
+    let sid_hash = output + 0x58;
+    let hash = unsafe { SidAndAttributesHash::at(sid_hash) };
+    let array = sid_hash + 0x110;
+    let entries = unsafe { SidAndAttributes::array_at(array, groups.len()) };
+    let mut sid_at = array + groups.len() as u64 * 16;
+    let mut sids_ok = info.sid_hash.get() == sid_hash && hash.sid_count.get() == groups.len() as u32 && hash.sid_attr.get() == array;
+    let mut expected_hash = [0u64; 32];
+    for (index, ((sid, attributes), entry)) in groups.iter().zip(entries).enumerate() {
+        sids_ok &= entry.sid.get() == sid_at && entry.attributes.get() == *attributes && guest::read_bytes(sid_at, sid.len()) == *sid;
+        sid_at += sid.len() as u64;
+        let byte = sid[4 * sid[1] as usize + 4] as usize;
+        expected_hash[byte & 0xF] |= 1 << index;
+        expected_hash[16 + (byte >> 4)] |= 1 << index;
+    }
+    sids_ok &= hash.hash.iter().zip(expected_hash).all(|(word, value)| word.get() == value);
+    assert(sids_ok, "token-access: UserAndGroups com os SIDs colados e o hash do RtlSidHashInitialize");
+    let restricted = array + groups_size as u64;
+    let capabilities = restricted + 0x110;
+    let attributes = capabilities + 0x110;
+    let empty_hash = |at: u64| unsafe { SidAndAttributesHash::at(at) }.sid_count.get() == 0 && unsafe { SidAndAttributesHash::at(at) }.sid_attr.get() == at + 0x110;
+    let regions = info.restricted_sid_hash.get() == restricted && empty_hash(restricted) && info.capabilities_hash.get() == capabilities && empty_hash(capabilities) && info.package_sid.get() == 0 && info.trust_level_sid.get() == 0;
+    // AUTHZBASEP_SECURITY_ATTRIBUTES_INFORMATION vazio: contagens zero e
+    // as duas listas apontando para si mesmas.
+    let attributes_ok = info.security_attributes.get() == attributes && guest::read32(attributes) == 0 && guest::read64(attributes + 8) == attributes + 8 && guest::read64(attributes + 0x10) == attributes + 8 && guest::read32(attributes + 0x18) == 0 && guest::read64(attributes + 0x20) == attributes + 0x20 && guest::read64(attributes + 0x28) == attributes + 0x20;
+    assert(regions && attributes_ok, "token-access: hashes vazios, sem pacote nem nivel de confianca, atributos internos vazios");
+    let privileges_at = attributes + 0x30;
+    let token_privileges = unsafe { TokenPrivileges::at(privileges_at) };
+    let listed = unsafe { LuidAndAttributes::array_at(token_privileges.privileges[0].address(), privileges.len()) };
+    let privileges_ok = info.privileges.get() == privileges_at && token_privileges.privilege_count.get() == privileges.len() as u32 && listed.iter().zip(&privileges).all(|(entry, &(id, bits))| entry.luid.low_part.get() as u64 == id && entry.luid.high_part.get() == 0 && entry.attributes.get() == bits);
+    let fields = tokens::luid_value(&info.authentication_id) == record.authentication_id && info.token_type.get().0 as u32 == record.kind && info.mandatory_policy.policy.get() == record.mandatory_policy && record.mandatory_policy == 1 && info.app_container_number.get() == 0;
+    assert(privileges_ok && fields, "token-access: privilegios na ordem do LUID e campos fixos do token");
+    // SeTokenFromAccessInformation monta o TOKEN a partir do bloco.
+    let built = guest::alloc_bytes(Token::SIZE);
+    let consumed = crate::ntos::se::access_check::token_from_access_information_checked(output, built, Token::SIZE as u32, returned) == 0;
+    let native = unsafe { Token::at(built) };
+    assert(consumed && native.user_and_group_count.get() == groups.len() as u32 && native.user_and_groups.get() == array && native.integrity_level_index.get() == groups.len() as u32 - 1 && native.p_security_attributes.get() == attributes, "token-access: SeTokenFromAccessInformation consome o bloco");
+    assert(matches!(close::close(handle, Some(0)), Ok(0)), "token-access: fecha o handle");
+    guest::free_bytes(built);
+    guest::free_bytes(returned);
     guest::free_bytes(output);
 }
 
@@ -2177,6 +2260,7 @@ pub fn run(assert: Assert) {
     executive_callbacks(assert);
     token_handles(assert);
     token_services(assert);
+    token_access_information(assert);
     process_tokens_and_membership(assert);
     descriptor_inheritance(assert);
     descriptor_queries(assert);

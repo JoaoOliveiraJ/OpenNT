@@ -341,7 +341,7 @@ pub mod se_token_info {
     }
 
     fn query_access_information(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(information::query_security_attributes_access_information(call.arg(1), call.arg(2))))
+        Ok(signed_status(crate::ntos::ps::security::query_attributes_from_access_information(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6))?))
     }
 
     fn security_attribute_present(call: &Call) -> Result<u64, KernelError> {

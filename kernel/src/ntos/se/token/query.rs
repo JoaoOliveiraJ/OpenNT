@@ -1,19 +1,39 @@
 //! NtQueryInformationToken.
 //!
-//! Contrato observado: TokenStatistics (classe 10), pedido pelo MSRPC
-//! original, também pela variante de syscall de usuário (`query_user`).
+//! Cada classe é serializada do registro do token com os ponteiros internos
+//! relativos ao buffer do chamador (`encode`). Como no ntoskrnl 19041, o
+//! ReturnLength recebe o tamanho exigido antes da comparação com o Length, e
+//! um buffer curto devolve STATUS_BUFFER_TOO_SMALL sem nenhum byte gravado
+//! nele (`write_encoded`). TokenStatistics (classe 10), pedido pelo MSRPC
+//! original, grava campo a campo, também pela variante de syscall de usuário
+//! (`query_user`).
 
-use crate::ntos::se::token::{reference as token_reference, statistics as token_statistics};
+use alloc::vec::Vec;
+use core::mem::offset_of;
+
+use crate::ntos::inc::types::{LuidAndAttributes, NtStruct, SidAndAttributes, SidAndAttributesHash, TokenAccessInformation, TokenMandatoryPolicy, TokenPrivileges};
 use crate::ntos::ke::irql;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{page_residency, paging};
 use crate::ntos::ps::user_probe;
+use crate::ntos::se::model::{Group, Sid};
+use crate::ntos::se::security_attributes;
+use crate::ntos::se::token::tokens::{self, Token};
+use crate::ntos::se::token::{reference as token_reference, statistics as token_statistics};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 
 /// MmUserProbeAddress.
 const USER_PROBE_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 const REJECTED_CLASSES: [u32; 7] = [0, 14, 35, 36, 38, 45, 46];
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// TokenAccessInformation.
+const TOKEN_ACCESS_INFORMATION_CLASS: u32 = 22;
+/// SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED.
+const SE_GROUP_INTEGRITY: u32 = 0x60;
 
 /// Só memória com dono; a falha de um campo preserva os anteriores.
 fn writable(address: u64, length: u64, from_user_mode: bool) -> bool {
@@ -55,41 +75,65 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
         }
     }
     if information_class > 48 || REJECTED_CLASSES.contains(&information_class) {
-        return Ok(0xC000_0003);
+        return Ok(STATUS_INVALID_INFO_CLASS);
     }
-    if information_class != 10 {
-        return Ok(0xC000_0002);
-    }
-    let mut reference = match token_reference::reference(handle, 8, access_mode, true)? {
+    // TokenSource pede TOKEN_QUERY_SOURCE; as demais classes, TOKEN_QUERY.
+    let desired = if information_class == 7 { 0x10 } else { 8 };
+    let mut reference = match token_reference::reference(handle, desired, access_mode, true)? {
         Ok(reference) => reference,
         Err(status) => return Ok(status),
     };
-    let result = (|| -> Result<u32, KernelError> {
-        if !writable(returned, 4, from_user_mode) {
-            return Ok(STATUS_ACCESS_VIOLATION);
-        }
-        if guest::try_write::<u32>(returned, 56).is_err() {
-            return Ok(STATUS_ACCESS_VIOLATION);
-        }
-        if length < 56 {
-            return Ok(0xC000_0023);
-        }
-        // ReturnLength precede os dados, inclusive com endereços sobrepostos.
-        for (offset, width, value) in token_statistics::fields(reference.token)? {
-            let destination = output + offset;
-            if !writable(destination, width as u64, from_user_mode) {
-                return Ok(STATUS_ACCESS_VIOLATION);
-            }
-            // TOKEN_STATISTICS na saída do chamador (sondada campo a campo).
-            let written = if width == 8 { guest::try_write::<u64>(destination, value) } else { guest::try_write::<u32>(destination, value as u32) };
-            if written.is_err() {
-                return Ok(STATUS_ACCESS_VIOLATION);
-            }
-        }
-        Ok(0)
-    })();
+    let result = if information_class == 10 {
+        statistics(reference.token, output, length, returned, from_user_mode)
+    } else {
+        Ok(write_encoded(encode(reference.token, information_class, output), output, length, returned, from_user_mode))
+    };
     reference.release()?;
     result
+}
+
+/// TOKEN_STATISTICS na saída do chamador, sondada campo a campo.
+fn statistics(token: u64, output: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
+    if !writable(returned, 4, from_user_mode) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    if guest::try_write::<u32>(returned, 56).is_err() {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    if length < 56 {
+        return Ok(STATUS_BUFFER_TOO_SMALL);
+    }
+    // ReturnLength precede os dados, inclusive com endereços sobrepostos.
+    for (offset, width, value) in token_statistics::fields(token)? {
+        let destination = output + offset;
+        if !writable(destination, width as u64, from_user_mode) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let written = if width == 8 { guest::try_write::<u64>(destination, value) } else { guest::try_write::<u32>(destination, value as u32) };
+        if written.is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    Ok(0)
+}
+
+/// O tamanho exigido vai para o ReturnLength; com o Length menor, só ele é
+/// gravado e a consulta devolve STATUS_BUFFER_TOO_SMALL.
+pub fn write_encoded(result: Result<Vec<u8>, u32>, output: u64, length: u32, returned: u64, from_user_mode: bool) -> u32 {
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    if !writable(returned, 4, from_user_mode) || guest::try_write::<u32>(returned, bytes.len() as u32).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (length as usize) < bytes.len() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if !bytes.is_empty() && (!writable(output, bytes.len() as u64, from_user_mode) || guest::try_write_bytes(output, &bytes).is_err()) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    0
 }
 
 /// Variante de syscall: os 64 bits dos argumentos vêm do frame bruto ou da
@@ -101,4 +145,296 @@ pub fn query_user(user_rsp: u64) -> Result<u32, KernelError> {
     };
     let low = |index: u64| crate::ntos::ps::user::state::syscall_arg_words(user_rsp, index)[0];
     query(argument(1), low(2), argument(3), low(4), argument(5), 1)
+}
+
+/// Montador de layouts com SIDs anexados depois da parte fixa.
+struct Layout {
+    bytes: Vec<u8>,
+    base: u64,
+}
+
+impl Layout {
+    fn reserve(&mut self, size: usize) -> usize {
+        let offset = self.bytes.len();
+        self.bytes.resize(offset + size, 0);
+        offset
+    }
+    fn u32(&mut self, offset: usize, value: u32) {
+        self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn u64(&mut self, offset: usize, value: u64) {
+        self.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn append_sid(&mut self, pointer_offset: usize, sid: &Sid) {
+        let offset = self.reserve(sid.len());
+        self.bytes[offset..offset + sid.len()].copy_from_slice(sid);
+        self.u64(pointer_offset, self.base + offset as u64);
+    }
+    fn groups(&mut self, entries: &[Group]) {
+        self.reserve(8 + entries.len() * 16);
+        self.u32(0, entries.len() as u32);
+        for (index, group) in entries.iter().enumerate() {
+            self.append_sid(8 + index * 16, &group.sid);
+            self.u32(16 + index * 16, group.attributes);
+        }
+    }
+    fn scalar(&mut self, value: u32) {
+        self.reserve(4);
+        self.u32(0, value);
+    }
+}
+
+/// Layout da classe com ponteiros relativos a `base`, ou o NTSTATUS.
+pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32> {
+    let Some(token) = tokens::get(token_pointer) else { return Err(STATUS_INVALID_HANDLE) };
+    let mut layout = Layout { bytes: Vec::with_capacity(512), base };
+    match class {
+        1 => {
+            layout.reserve(16);
+            layout.append_sid(0, &token.user);
+            layout.u32(8, token.user_attributes);
+        }
+        2 => layout.groups(&token.groups),
+        3 => {
+            layout.reserve(4 + token.privileges.len() * 12);
+            layout.u32(0, token.privileges.len() as u32);
+            for (index, privilege) in token.privileges.iter().enumerate() {
+                layout.u64(4 + index * 12, privilege.id);
+                layout.u32(12 + index * 12, privilege.attributes);
+            }
+        }
+        4 | 5 => {
+            layout.reserve(8);
+            layout.append_sid(0, if class == 4 { &token.owner } else { &token.primary_group });
+        }
+        6 => match &token.default_dacl {
+            None => {
+                layout.reserve(8);
+            }
+            Some(entries) => {
+                let sids: Vec<Sid> = entries.iter().map(|ace| ace.sid.clone().unwrap_or_default()).collect();
+                let size = 8 + sids.iter().map(|sid| 8 + sid.len()).sum::<usize>();
+                layout.reserve(8 + size);
+                layout.u64(0, base + 8);
+                layout.bytes[8] = 2;
+                layout.bytes[10..12].copy_from_slice(&(size as u16).to_le_bytes());
+                layout.bytes[12..14].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+                let mut cursor = 16;
+                for (ace, sid) in entries.iter().zip(&sids) {
+                    layout.bytes[cursor] = if ace.deny { 1 } else { 0 };
+                    layout.bytes[cursor + 1] = ace.flags;
+                    layout.bytes[cursor + 2..cursor + 4].copy_from_slice(&((8 + sid.len()) as u16).to_le_bytes());
+                    layout.u32(cursor + 4, ace.mask);
+                    layout.bytes[cursor + 8..cursor + 8 + sid.len()].copy_from_slice(sid);
+                    cursor += 8 + sid.len();
+                }
+            }
+        },
+        // TOKEN_SOURCE: o contexto de boot do OpenNT.
+        7 => {
+            layout.reserve(16);
+            layout.bytes[..8].copy_from_slice(b"OpenNTbt");
+            layout.u64(8, token.authentication_id);
+        }
+        8 => layout.scalar(token.kind),
+        9 => {
+            if token.kind != 2 {
+                return Err(STATUS_INVALID_INFO_CLASS);
+            }
+            layout.scalar(token.impersonation_level);
+        }
+        10 => return token_statistics::encode(token_pointer).map(|bytes| bytes.to_vec()).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 }),
+        11 => layout.groups(&token.restricted_sids),
+        TOKEN_ACCESS_INFORMATION_CLASS => return access_information(&token, base),
+        28 | 37 | 38 => layout.groups(&[]),
+        30 => layout.groups(&token.capabilities),
+        29 => layout.scalar(token.app_container.is_some() as u32),
+        12 => layout.scalar(token.session_id),
+        17 => {
+            layout.reserve(8);
+            layout.u64(0, token.authentication_id);
+        }
+        // TokenElevationTypeDefault: sem token vinculado ou filtrado.
+        18 => layout.scalar(1),
+        19 => return Err(STATUS_INVALID_PARAMETER),
+        // Contexto LocalSystem de boot.
+        20 => layout.scalar(1),
+        25 => {
+            layout.reserve(16);
+            layout.u32(8, SE_GROUP_INTEGRITY);
+            layout.append_sid(0, &token.integrity);
+        }
+        27 => layout.scalar(token.mandatory_policy),
+        31 => {
+            layout.reserve(8);
+            if let Some(container) = &token.app_container {
+                layout.append_sid(0, container);
+            }
+        }
+        // Sem pacote nem SID de confiança do processo.
+        41 => {
+            layout.reserve(8);
+        }
+        39 => return security_attributes::encode(&token.security_attributes, base),
+        // Versão 1, atributos de segurança vazios.
+        33..=36 | 43 => {
+            layout.reserve(16);
+            layout.bytes[0] = 1;
+        }
+        // Sem isolamento BNO: o namespace nomeado do kernel é compartilhado.
+        44 => {
+            layout.reserve(16);
+        }
+        15 | 21 | 23 | 24 | 26 | 32 | 40 | 42 | 47 | 48 => layout.scalar(0),
+        _ => return Err(STATUS_INVALID_INFO_CLASS),
+    }
+    Ok(layout.bytes)
+}
+
+// ---- TokenAccessInformation (classe 22) -----------------------------------
+//
+// Como o SepGetTokenAccessInformationBufferSize e o
+// SepCopyTokenAccessInformation do ntoskrnl 19041. O bloco começa pelo
+// TOKEN_ACCESS_INFORMATION e segue, nesta ordem: o SID_AND_ATTRIBUTES_HASH
+// dos UserAndGroups com o vetor e os SIDs, o dos SIDs restritos, o das
+// capacidades, o PackageSid, o TrustLevelSid, os atributos de segurança no
+// formato interno do token e o TOKEN_PRIVILEGES. Cada região de SIDs mede
+// Count * 16 mais os SIDs alinhados a 8, mas o RtlCopySidAndAttributesArray
+// os cola sem alinhamento logo depois do vetor. O hash marca, para os 64
+// primeiros SIDs, o bit i em Hash[b & 0xF] e Hash[16 + (b >> 4)], com b o
+// byte baixo da última subautoridade (RtlSidHashInitialize). Os privilégios
+// saem na ordem do LUID (o bitmap Present do token, LUIDs 0 a 36), com
+// SE_PRIVILEGE_ENABLED e SE_PRIVILEGE_ENABLED_BY_DEFAULT. O OpenNT não tem
+// processos protegidos nem números de lowbox: TrustLevelSid nulo e
+// AppContainerNumber zero.
+
+const TAI_SIZE: usize = TokenAccessInformation::SIZE as usize;
+const HASH_SIZE: usize = SidAndAttributesHash::SIZE as usize;
+const ENTRY_SIZE: usize = SidAndAttributes::SIZE as usize;
+const PRIVILEGE_SIZE: usize = LuidAndAttributes::SIZE as usize;
+/// Bits do bitmap Present que o SepTokenPrivilegeCount percorre.
+const PRIVILEGE_BITS: u64 = 37;
+/// Quantos SIDs o hash cobre.
+const HASHED_SIDS: usize = 64;
+
+fn align8(length: usize) -> usize {
+    (length + 7) & !7
+}
+
+/// Região de um vetor de SID_AND_ATTRIBUTES e dos seus SIDs.
+fn sid_region(entries: &[(&Sid, u32)]) -> usize {
+    entries.len() * ENTRY_SIZE + entries.iter().map(|(sid, _)| align8(sid.len())).sum::<usize>()
+}
+
+struct Image {
+    bytes: Vec<u8>,
+    base: u64,
+}
+
+impl Image {
+    fn put(&mut self, offset: usize, value: &[u8]) {
+        self.bytes[offset..offset + value.len()].copy_from_slice(value);
+    }
+    fn put32(&mut self, offset: usize, value: u32) {
+        self.put(offset, &value.to_le_bytes());
+    }
+    fn put64(&mut self, offset: usize, value: u64) {
+        self.put(offset, &value.to_le_bytes());
+    }
+    fn address(&self, offset: usize) -> u64 {
+        self.base + offset as u64
+    }
+    /// SID_AND_ATTRIBUTES_HASH em `hash`, o vetor logo depois e os SIDs
+    /// colados depois do vetor; devolve o fim da região.
+    fn sid_hash(&mut self, hash: usize, entries: &[(&Sid, u32)]) -> usize {
+        let array = hash + HASH_SIZE;
+        self.put32(hash + offset_of!(SidAndAttributesHash, sid_count), entries.len() as u32);
+        self.put64(hash + offset_of!(SidAndAttributesHash, sid_attr), self.address(array));
+        let mut sid_at = array + entries.len() * ENTRY_SIZE;
+        for (index, (sid, attributes)) in entries.iter().enumerate() {
+            let entry = array + index * ENTRY_SIZE;
+            self.put64(entry + offset_of!(SidAndAttributes, sid), self.address(sid_at));
+            self.put32(entry + offset_of!(SidAndAttributes, attributes), *attributes);
+            self.put(sid_at, sid);
+            sid_at += sid.len();
+            if index < HASHED_SIDS {
+                let count = sid.get(1).copied().unwrap_or(0) as usize;
+                let byte = sid.get(4 * count + 4).copied().unwrap_or(0) as usize;
+                let bit = 1u64 << index;
+                for slot in [byte & 0xF, 16 + (byte >> 4)] {
+                    let at = hash + offset_of!(SidAndAttributesHash, hash) + slot * 8;
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(&self.bytes[at..at + 8]);
+                    self.put64(at, u64::from_le_bytes(word) | bit);
+                }
+            }
+        }
+        array + sid_region(entries)
+    }
+}
+
+/// TOKEN_ACCESS_INFORMATION com o bloco que o segue, montado para `base`.
+fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
+    // UserAndGroups: o usuário, os grupos e o rótulo de integridade, que no
+    // token do NT é um grupo SE_GROUP_INTEGRITY.
+    let mut groups: Vec<(&Sid, u32)> = alloc::vec![(&token.user, token.user_attributes)];
+    groups.extend(token.groups.iter().map(|group| (&group.sid, group.attributes)));
+    groups.push((&token.integrity, SE_GROUP_INTEGRITY));
+    let restricted: Vec<(&Sid, u32)> = token.restricted_sids.iter().map(|group| (&group.sid, group.attributes)).collect();
+    let capabilities: Vec<(&Sid, u32)> = token.capabilities.iter().map(|group| (&group.sid, group.attributes)).collect();
+    let mut privileges: Vec<(u64, u32)> = token.privileges.iter().filter(|privilege| privilege.id < PRIVILEGE_BITS).map(|privilege| (privilege.id, privilege.attributes & 3)).collect();
+    privileges.sort_unstable_by_key(|&(id, _)| id);
+    privileges.dedup_by_key(|&mut (id, _)| id);
+    let package_size = token.app_container.as_ref().map_or(0, |sid| align8(sid.len()));
+    let attributes_size = security_attributes::internal_size(&token.security_attributes)? as usize;
+    let privileges_size = if privileges.is_empty() { TokenPrivileges::SIZE as usize } else { offset_of!(TokenPrivileges, privileges) + privileges.len() * PRIVILEGE_SIZE };
+
+    let sid_hash = TAI_SIZE;
+    let restricted_hash = sid_hash + HASH_SIZE + sid_region(&groups);
+    let capabilities_hash = restricted_hash + HASH_SIZE + sid_region(&restricted);
+    let package = capabilities_hash + HASH_SIZE + sid_region(&capabilities);
+    // Sem TrustLevelSid, os atributos seguem o PackageSid.
+    let attributes = package + package_size;
+    let privileges_at = attributes + attributes_size;
+    let total = privileges_at + privileges_size;
+    if total > u32::MAX as usize {
+        return Err(0xC000_0095);
+    }
+
+    let mut image = Image { bytes: alloc::vec![0u8; total], base };
+    image.sid_hash(sid_hash, &groups);
+    image.sid_hash(restricted_hash, &restricted);
+    image.sid_hash(capabilities_hash, &capabilities);
+    let package_sid = match &token.app_container {
+        Some(sid) => {
+            image.put(package, sid);
+            image.address(package)
+        }
+        None => 0,
+    };
+    let internal = security_attributes::encode_internal(&token.security_attributes, image.address(attributes))?;
+    image.put(attributes, &internal);
+    image.put32(privileges_at + offset_of!(TokenPrivileges, privilege_count), privileges.len() as u32);
+    for (index, &(id, bits)) in privileges.iter().enumerate() {
+        let entry = privileges_at + offset_of!(TokenPrivileges, privileges) + index * PRIVILEGE_SIZE;
+        image.put64(entry + offset_of!(LuidAndAttributes, luid), id);
+        image.put32(entry + offset_of!(LuidAndAttributes, attributes), bits);
+    }
+
+    // TokenFlags do corpo, onde o bit TOKEN_LOWBOX acompanha o AppContainer.
+    let flags = tokens::body(token.pointer).token_flags.get();
+    image.put64(offset_of!(TokenAccessInformation, sid_hash), image.address(sid_hash));
+    image.put64(offset_of!(TokenAccessInformation, restricted_sid_hash), image.address(restricted_hash));
+    image.put64(offset_of!(TokenAccessInformation, privileges), image.address(privileges_at));
+    image.put64(offset_of!(TokenAccessInformation, authentication_id), token.authentication_id);
+    image.put32(offset_of!(TokenAccessInformation, token_type), token.kind);
+    image.put32(offset_of!(TokenAccessInformation, impersonation_level), token.impersonation_level);
+    image.put32(offset_of!(TokenAccessInformation, mandatory_policy) + offset_of!(TokenMandatoryPolicy, policy), token.mandatory_policy);
+    image.put32(offset_of!(TokenAccessInformation, flags), flags);
+    image.put32(offset_of!(TokenAccessInformation, app_container_number), 0);
+    image.put64(offset_of!(TokenAccessInformation, package_sid), package_sid);
+    image.put64(offset_of!(TokenAccessInformation, capabilities_hash), image.address(capabilities_hash));
+    image.put64(offset_of!(TokenAccessInformation, trust_level_sid), 0);
+    image.put64(offset_of!(TokenAccessInformation, security_attributes), image.address(attributes));
+    Ok(image.bytes)
 }
