@@ -197,6 +197,8 @@ pub fn init() -> Result<(), KernelError> {
     // TssBase fica zerado; isso não descreve a TSS configurada em outras camadas.
     kpcr.tss_base.set(0);
     initialize(kpcr, 0, pcr.io_database_lock, pcr.vpb_lock)?;
+    // O nível que o processador de boot tinha antes da KPCR.
+    kpcr.irql.set(super::irql::boot_level());
     kpcr.idt_base.set(crate::nano::interrupts::IDT_VIRTUAL_ADDRESS);
     drop(pcr);
 
@@ -286,10 +288,19 @@ pub fn set_current_thread(thread: u64) {
     }
 }
 
-pub fn set_irql(level: u8) {
-    if let Some(kpcr) = kpcr() {
-        kpcr.irql.set(level);
-    }
+/// KPCR.Irql da CPU corrente (gs:[50h]), o KeGetCurrentIrql por CPU.
+pub fn current_irql() -> u8 {
+    let level: u8;
+    // SAFETY: leitura de um byte da KPCR desta CPU, mapeada desde que o GS a
+    // publica (quem chama confere a publicação).
+    unsafe { core::arch::asm!("mov {}, byte ptr gs:[{}]", out(reg_byte) level, const layout::IRQL, options(nostack, readonly, preserves_flags)) };
+    level
+}
+
+/// Grava KPCR.Irql da CPU corrente, nunca o de outra.
+pub fn set_current_irql(level: u8) {
+    // SAFETY: escrita de um byte da KPCR desta CPU (publicada).
+    unsafe { core::arch::asm!("mov byte ptr gs:[{}], {}", const layout::IRQL, in(reg_byte) level, options(nostack, preserves_flags)) };
 }
 
 pub fn get_pcr_address() -> u64 {

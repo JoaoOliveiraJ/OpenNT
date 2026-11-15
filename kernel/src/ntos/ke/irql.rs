@@ -1,12 +1,17 @@
-//! Nível de interrupção do runtime.
+//! Nível de interrupção de cada processador.
 //!
-//! A variável acompanha elevações e reduções; a publicação mantém a célula
-//! física (lida pelo stub de interrupções) e a PCR coerentes.
+//! Como no NT, o IRQL é da CPU, não do sistema: cada uma guarda o seu na
+//! própria KPCR (KPCR.Irql, lido e gravado pelo GS), e elevar ou baixar o
+//! nível numa CPU não muda o que outra vê. Antes da KPCR do BSP (o começo da
+//! fase 0) só existe o processador de boot, e o nível fica numa célula de
+//! partida que a KPCR herda ao ser publicada (`pcr::init`). Uma thread que
+//! deixa a CPU leva o seu IRQL (KTHREAD.WaitIrql) e o recoloca ao voltar
+//! (`context_switch`).
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::pcr;
-use crate::hal::{cpu, physical};
+use crate::hal::cpu;
 use crate::ntos::inc::types::{Field, NtStruct};
 
 pub const PASSIVE_LEVEL: u8 = 0;
@@ -16,18 +21,29 @@ pub const DISPATCH_LEVEL: u8 = 2;
 pub const SYNCH_LEVEL: u8 = 12;
 pub const HIGH_LEVEL: u8 = 15;
 
-/// O stub consulta esta célula para decidir se a IRQ pode preemptar.
-const CURRENT_INTERRUPT_LEVEL_ADDRESS: u64 = 0x81528;
+/// O nível do processador de boot antes da KPCR dele.
+static BOOT: AtomicU8 = AtomicU8::new(PASSIVE_LEVEL);
 
-static CURRENT: AtomicU8 = AtomicU8::new(PASSIVE_LEVEL);
-
-fn publish(level: u8) {
-    physical::write32(CURRENT_INTERRUPT_LEVEL_ADDRESS, level as u32);
-    pcr::set_irql(level);
+/// O nível da CPU corrente.
+pub fn get_irql() -> u8 {
+    if pcr::get_pcr_address() == 0 {
+        return BOOT.load(Ordering::Relaxed);
+    }
+    pcr::current_irql()
 }
 
-pub fn get_irql() -> u8 {
-    CURRENT.load(Ordering::Relaxed)
+/// Publica `level` como o nível da CPU corrente.
+fn publish(level: u8) {
+    if pcr::get_pcr_address() == 0 {
+        BOOT.store(level, Ordering::Relaxed);
+    } else {
+        pcr::set_current_irql(level);
+    }
+}
+
+/// O nível de partida, que a KPCR do BSP herda (`pcr::init`).
+pub fn boot_level() -> u8 {
+    BOOT.load(Ordering::Relaxed)
 }
 
 /// Exige um nível não inferior ao atual; devolve o anterior. Direção
@@ -38,7 +54,6 @@ pub fn raise_irql(level: u8) -> u8 {
         debug_print!("[ke] BUGCHECK: KeRaiseIrql p/ nivel menor ({} < {})", level, previous);
         cpu::halt_forever();
     }
-    CURRENT.store(level, Ordering::Relaxed);
     publish(level);
     previous
 }
@@ -54,8 +69,15 @@ pub fn lower_irql(level: u64) {
         );
         cpu::halt_forever();
     }
-    CURRENT.store(level as u8, Ordering::Relaxed);
     publish(level as u8);
+}
+
+/// Troca o nível da CPU corrente sem conferir a direção: só a troca de
+/// thread (`context_switch`), que recoloca o IRQL de quem volta a executar.
+pub fn swap_irql(level: u8) -> u8 {
+    let previous = get_irql();
+    publish(level);
+    previous
 }
 
 /// KeRaiseIrql: o IRQL anterior vai para a saída opcional.

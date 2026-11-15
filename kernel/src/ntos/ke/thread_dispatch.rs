@@ -1,7 +1,13 @@
-//! Estado de despacho de uma CPU.
+//! Estado de despacho.
 //!
-//! Filas nativas de 32 prioridades na KPRCB, contagem de ciclos próprios e
-//! entrega de contextos. As filas não possuem a ETHREAD: o runtime dono a
+//! Filas nativas de 32 prioridades na KPRCB do processador que despacha, a
+//! contagem de ciclos próprios e a entrega de contextos. No M0 um processador
+//! só despacha threads (o de boot): as filas prontas, a NextThread e o
+//! PrcbLock que as protege são os da KPRCB dele, de onde quer que venha a
+//! prontidão (o sinal de outra CPU entra na mesma fila). A execução em curso
+//! — o contexto ativo, a pilha de execuções aninhadas e o início da contagem
+//! de ciclos — é de cada CPU, como a KPRCB.CurrentThread: o que roda numa CPU
+//! não muda o que outra vê. As filas não possuem a ETHREAD: o runtime dono a
 //! retém (aqui identificado por um número opaco, como o pid do escalonador).
 
 use alloc::collections::BTreeMap;
@@ -10,6 +16,7 @@ use alloc::vec::Vec;
 use super::{clock, pcr};
 use crate::hal::cpu;
 use crate::ntos::inc::types::{Ethread, Field, Kprcb, Kthread, ListEntry, NtStruct};
+use crate::ntos::mm::memory_map as map;
 use crate::rtl::{KernelError, SpinLock};
 
 pub mod state {
@@ -43,10 +50,15 @@ struct Execution {
     started: u64,
 }
 
+/// A execução em curso de uma CPU.
+struct CpuExecution {
+    active: Option<Execution>,
+    stack: Vec<Option<Execution>>,
+}
+
 struct Dispatch {
     owners: BTreeMap<u64, Owner>,
-    stack: Vec<Option<Execution>>,
-    active: Option<Execution>,
+    cpus: [CpuExecution; map::MAX_CPUS],
     queues_initialized: bool,
     priority_observer: Option<fn()>,
     /// Notificação de atividade da porta de conclusão (porta, runtime, ativo).
@@ -55,23 +67,42 @@ struct Dispatch {
 
 static STATE: SpinLock<Dispatch> = SpinLock::new(Dispatch {
     owners: BTreeMap::new(),
-    stack: Vec::new(),
-    active: None,
+    cpus: [const { CpuExecution { active: None, stack: Vec::new() } }; map::MAX_CPUS],
     queues_initialized: false,
     priority_observer: None,
     port_activity: None,
 });
 
+/// O PrcbLock das filas prontas: toda mudança nas listas, no ReadySummary,
+/// nas contagens e na NextThread passa por ele, inclusive a prontidão vinda
+/// de outra CPU.
+static QUEUES: SpinLock<()> = SpinLock::new(());
+
+/// O número da CPU corrente (KPRCB.Number pelo GS; 0 antes da KPCR).
+fn cpu_index() -> usize {
+    if pcr::get_pcr_address() == 0 {
+        return 0;
+    }
+    (pcr::current().prcb.number.get() as usize).min(map::MAX_CPUS - 1)
+}
+
+/// A KPRCB do processador que despacha as threads (o de boot no M0): dona
+/// das filas prontas e da NextThread.
 pub fn processor_address() -> u64 {
     let address = pcr::get_pcr_address();
     assert!(address != 0, "thread dispatch requires initialized PCR");
     address + core::mem::offset_of!(crate::ntos::inc::types::Kpcr, prcb) as u64
 }
 
-/// A KPRCB do processador corrente (embutida na KPCR).
+/// A KPRCB das filas prontas.
 fn processor() -> &'static Kprcb {
-    // SAFETY: a KPCR está mapeada desde `pcr::init`.
+    // SAFETY: a KPCR do processador de boot está mapeada desde `pcr::init`.
     unsafe { Kprcb::at(processor_address()) }
+}
+
+/// A KPRCB da CPU corrente (pelo GS).
+fn current_processor() -> &'static Kprcb {
+    &pcr::current().prcb
 }
 
 fn kthread(thread: u64) -> &'static Kthread {
@@ -113,20 +144,22 @@ pub fn initialize_queues() {
     if STATE.lock().queues_initialized {
         return;
     }
-    let processor = processor();
-    for head in &processor.dispatcher_ready_list_head {
-        head.flink.set(head.address());
-        head.blink.set(head.address());
+    {
+        let _queues = QUEUES.lock();
+        let processor = processor();
+        for head in &processor.dispatcher_ready_list_head {
+            head.flink.set(head.address());
+            head.blink.set(head.address());
+        }
+        processor.ready_summary.set(0);
+        processor.ready_thread_count.set(0);
+        processor.ready_queue_expected_run_time.set(0);
     }
-    processor.ready_summary.set(0);
-    processor.ready_thread_count.set(0);
-    processor.ready_queue_expected_run_time.set(0);
     STATE.lock().queues_initialized = true;
 }
 
 /// Confere os dois vínculos antes de remover; corrupção nunca vira sucesso.
-/// As filas são da CPU corrente (o PrcbLock do NT não tem disputa aqui).
-pub fn remove_ready(thread: u64) -> Result<(), KernelError> {
+fn remove_ready_locked(thread: u64) -> Result<(), KernelError> {
     let processor = processor();
     let entry = &kthread(thread).wait_list_entry;
     let next = entry.flink.get();
@@ -149,8 +182,13 @@ pub fn remove_ready(thread: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-pub fn enqueue_ready(thread: u64, at_front: bool, preserve_wait_time: bool) {
-    initialize_queues();
+/// Tira a thread da fila pronta (sob o PrcbLock).
+pub fn remove_ready(thread: u64) -> Result<(), KernelError> {
+    let _queues = QUEUES.lock();
+    remove_ready_locked(thread)
+}
+
+fn enqueue_ready_locked(thread: u64, at_front: bool, preserve_wait_time: bool) {
     let processor = processor();
     let kthread = kthread(thread);
     let head = &processor.dispatcher_ready_list_head[priority(thread) as usize];
@@ -171,7 +209,13 @@ pub fn enqueue_ready(thread: u64, at_front: bool, preserve_wait_time: bool) {
     }
 }
 
-pub fn highest_ready() -> Result<u64, KernelError> {
+pub fn enqueue_ready(thread: u64, at_front: bool, preserve_wait_time: bool) {
+    initialize_queues();
+    let _queues = QUEUES.lock();
+    enqueue_ready_locked(thread, at_front, preserve_wait_time);
+}
+
+fn highest_ready_locked() -> Result<u64, KernelError> {
     let processor = processor();
     let summary = processor.ready_summary.get();
     if summary == 0 {
@@ -186,12 +230,18 @@ pub fn highest_ready() -> Result<u64, KernelError> {
     Ok(entry - WAIT_LIST_ENTRY)
 }
 
+pub fn highest_ready() -> Result<u64, KernelError> {
+    let _queues = QUEUES.lock();
+    highest_ready_locked()
+}
+
 pub fn take_ready_above(minimum_priority: i32) -> Result<u64, KernelError> {
-    let thread = highest_ready()?;
+    let _queues = QUEUES.lock();
+    let thread = highest_ready_locked()?;
     if thread == 0 || priority(thread) as i32 <= minimum_priority {
         return Ok(0);
     }
-    remove_ready(thread)?;
+    remove_ready_locked(thread)?;
     Ok(thread)
 }
 
@@ -199,7 +249,7 @@ pub fn next_thread() -> u64 {
     processor().next_thread.get()
 }
 
-pub fn reserve_next(thread: u64) {
+fn reserve_next_locked(thread: u64) {
     let kthread = kthread(thread);
     if kthread.state.get() == state::READY {
         let waited = tick_count().wrapping_sub(kthread.wait_time.get());
@@ -207,6 +257,11 @@ pub fn reserve_next(thread: u64) {
     }
     kthread.state.set(state::STANDBY);
     processor().next_thread.set(thread);
+}
+
+pub fn reserve_next(thread: u64) {
+    let _queues = QUEUES.lock();
+    reserve_next_locked(thread);
 }
 
 pub fn defer_ready(thread: u64, deferred: &mut Vec<u64>) {
@@ -245,9 +300,9 @@ pub fn complete_priority_change(deferred: &[u64]) {
     }
 }
 
-/// Soma só os intervalos em que o contexto esteve ativo.
-fn account_active_cycles(dispatch: &mut Dispatch) {
-    let Some(active) = dispatch.active.as_mut() else { return };
+/// Soma só os intervalos em que o contexto esteve ativo nesta CPU.
+fn account_active_cycles(execution: &mut CpuExecution) {
+    let Some(active) = execution.active.as_mut() else { return };
     let now = cpu::rdtsc();
     let elapsed = now.wrapping_sub(active.started);
     let cycles = &kthread(active.pointer).cycle_time;
@@ -256,10 +311,12 @@ fn account_active_cycles(dispatch: &mut Dispatch) {
 }
 
 pub fn sample_cycles(thread: u64) -> u64 {
+    let cpu = cpu_index();
     let mut dispatch = STATE.lock();
-    let nesting = processor().nesting_level.get();
-    if dispatch.active.as_ref().is_some_and(|active| active.pointer == thread) && nesting == 0 {
-        account_active_cycles(&mut dispatch);
+    let nesting = current_processor().nesting_level.get();
+    let execution = &mut dispatch.cpus[cpu];
+    if execution.active.as_ref().is_some_and(|active| active.pointer == thread) && nesting == 0 {
+        account_active_cycles(execution);
     }
     kthread(thread).cycle_time.get()
 }
@@ -277,7 +334,7 @@ pub fn query_runtime_thread(thread: u64, user_time: u64) -> u64 {
 
 /// A thread de boot do System não é o processo Idle.
 pub fn is_idle_thread(thread: u64) -> bool {
-    let idle = processor().idle_thread.get();
+    let idle = current_processor().idle_thread.get();
     idle != 0 && kthread(idle).process.get() == kthread(thread).process.get()
 }
 
@@ -292,28 +349,37 @@ pub fn register(thread: u64, runtime: u64) -> Result<(), KernelError> {
     make_ready(thread)
 }
 
+/// KiReadyThread: põe na fila pronta uma thread que espera (ou recém-criada).
+/// Uma thread já pronta ou reservada fica onde está; uma em execução também
+/// (ela volta à fila, se for o caso, no fim da execução: nunca há duas
+/// entradas da mesma thread na fila).
 pub fn make_ready(thread: u64) -> Result<(), KernelError> {
+    initialize_queues();
+    let _queues = QUEUES.lock();
     let current = thread_state(thread);
-    if current == state::READY || current == state::STANDBY {
+    if current == state::READY || current == state::STANDBY || current == state::RUNNING {
         return Ok(());
     }
     if current == state::TERMINATED {
         return Err(KernelError::new("cannot ready a terminated thread"));
     }
-    enqueue_ready(thread, false, false);
+    enqueue_ready_locked(thread, false, false);
     Ok(())
 }
 
 pub fn suspend(thread: u64, new_state: u8) -> Result<(), KernelError> {
-    if thread_state(thread) == state::READY {
-        remove_ready(thread)?;
+    {
+        let _queues = QUEUES.lock();
+        if thread_state(thread) == state::READY {
+            remove_ready_locked(thread)?;
+        }
+        if next_thread() == thread {
+            processor().next_thread.set(0);
+        }
+        let kthread = kthread(thread);
+        kthread.state.set(new_state);
+        kthread.wait_time.set(tick_count());
     }
-    if next_thread() == thread {
-        processor().next_thread.set(0);
-    }
-    let kthread = kthread(thread);
-    kthread.state.set(new_state);
-    kthread.wait_time.set(tick_count());
     let (owner, notify) = {
         let dispatch = STATE.lock();
         (dispatch.owners.get(&thread).copied(), dispatch.port_activity)
@@ -335,16 +401,20 @@ pub fn unregister(thread: u64) -> Result<(), KernelError> {
 /// NextThread é uma reserva real: uma thread de prioridade maior a substitui.
 pub fn peek() -> Result<Option<(u64, Owner)>, KernelError> {
     initialize_queues();
-    let mut reserved = next_thread();
-    let ready = highest_ready()?;
-    if ready != 0 && (reserved == 0 || priority(ready) > priority(reserved)) {
-        if reserved != 0 {
-            enqueue_ready(reserved, true, false);
+    let reserved = {
+        let _queues = QUEUES.lock();
+        let mut reserved = next_thread();
+        let ready = highest_ready_locked()?;
+        if ready != 0 && (reserved == 0 || priority(ready) > priority(reserved)) {
+            if reserved != 0 {
+                enqueue_ready_locked(reserved, true, false);
+            }
+            remove_ready_locked(ready)?;
+            reserve_next_locked(ready);
+            reserved = ready;
         }
-        remove_ready(ready)?;
-        reserve_next(ready);
-        reserved = ready;
-    }
+        reserved
+    };
     if reserved == 0 {
         return Ok(None);
     }
@@ -353,26 +423,32 @@ pub fn peek() -> Result<Option<(u64, Owner)>, KernelError> {
 }
 
 pub fn begin_execution(thread: u64) -> Result<(), KernelError> {
+    let cpu = cpu_index();
     let (owner, notify) = {
         let mut dispatch = STATE.lock();
-        account_active_cycles(&mut dispatch);
-        let previous = dispatch.active.take();
-        dispatch.stack.push(previous);
-        dispatch.active = Some(Execution { pointer: thread, started: cpu::rdtsc() });
+        let execution = &mut dispatch.cpus[cpu];
+        account_active_cycles(execution);
+        let previous = execution.active.take();
+        execution.stack.push(previous);
+        execution.active = Some(Execution { pointer: thread, started: cpu::rdtsc() });
         (dispatch.owners.get(&thread).copied(), dispatch.port_activity)
     };
     if let (Some(Owner { runtime, io_completion_port: Some(port), .. }), Some(notify)) = (owner, notify) {
         notify(port, runtime, true);
     }
-    if thread_state(thread) == state::READY {
-        remove_ready(thread)?;
-    }
-    if next_thread() == thread {
-        processor().next_thread.set(0);
+    {
+        let _queues = QUEUES.lock();
+        if thread_state(thread) == state::READY {
+            remove_ready_locked(thread)?;
+        }
+        if next_thread() == thread {
+            processor().next_thread.set(0);
+        }
+        let kthread = kthread(thread);
+        kthread.state.set(state::RUNNING);
+        kthread.running.set(1);
     }
     let kthread = kthread(thread);
-    kthread.state.set(state::RUNNING);
-    kthread.running.set(1);
     let cycles = kthread.cycle_time.get();
     if cycles >= kthread.quantum_target.get() {
         let reset = kthread.quantum_reset.get() as u32;
@@ -404,12 +480,14 @@ pub fn compute_quantum_end_priority(thread: u64) -> u8 {
 }
 
 pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
+    let cpu = cpu_index();
     let voluntary_yield = {
         let mut dispatch = STATE.lock();
-        if dispatch.active.as_ref().map(|active| active.pointer) != Some(thread) {
+        let execution = &mut dispatch.cpus[cpu];
+        if execution.active.as_ref().map(|active| active.pointer) != Some(thread) {
             return Err(KernelError::new("thread execution stack mismatch"));
         }
-        account_active_cycles(&mut dispatch);
+        account_active_cycles(execution);
         match dispatch.owners.get_mut(&thread) {
             Some(owner) => core::mem::replace(&mut owner.yield_requested, false),
             None => false,
@@ -428,13 +506,17 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
         kthread.quantum_target.set(cycles);
     }
     if new_state == state::READY {
-        enqueue_ready(thread, !expired && !voluntary_yield, false);
+        // A thread ainda consta como em execução: sai dela direto para a fila.
+        initialize_queues();
+        let _queues = QUEUES.lock();
+        enqueue_ready_locked(thread, !expired && !voluntary_yield, false);
     } else {
         suspend(thread, new_state)?;
     }
     let mut dispatch = STATE.lock();
-    dispatch.active = dispatch.stack.pop().flatten();
-    if let Some(active) = dispatch.active.as_mut() {
+    let execution = &mut dispatch.cpus[cpu];
+    execution.active = execution.stack.pop().flatten();
+    if let Some(active) = execution.active.as_mut() {
         active.started = cpu::rdtsc();
     }
     Ok(())
@@ -458,7 +540,7 @@ pub fn request_yield(thread: u64) -> Result<bool, KernelError> {
 /// ZwYieldExecution fora de uma thread de sistema (o KeYieldExecution(0)):
 /// a thread corrente cede a CPU quando outra pronta tem prioridade igual ou
 /// maior (STATUS_SUCCESS); senão STATUS_NO_YIELD_PERFORMED. As threads de
-/// sistema nativas passam pela interceptação de `ps/kernel_threads`.
+/// kernel com pilha própria cedem de fato (`context_switch`).
 pub fn yield_execution() -> Result<u32, KernelError> {
     let thread = crate::ntos::ps::process::get_current_thread();
     Ok(if request_yield(thread)? { 0 } else { 0x4000_0024 })
@@ -487,16 +569,18 @@ pub fn owner(thread: u64) -> Option<Owner> {
     STATE.lock().owners.get(&thread).copied()
 }
 
-/// A thread da execução em curso (o topo da pilha de execuções), se há uma.
+/// A thread da execução em curso nesta CPU (o topo da pilha de execuções
+/// dela), se há uma.
 pub fn active_thread() -> Option<u64> {
-    STATE.lock().active.as_ref().map(|active| active.pointer)
+    let cpu = cpu_index();
+    STATE.lock().cpus[cpu].active.as_ref().map(|active| active.pointer)
 }
 
 // ---- ciclos de thread e cessão do processador -----------------------------
 //
 // (append de `ke-processors` ao ke/thread_dispatch.rs. Usa o que o arquivo
-// já tem — `pcr`, `cpu`, `processor()`, `kthread()`, `sample_cycles` — sem
-// linhas `use` novas.)
+// já tem — `pcr`, `cpu`, `current_processor()`, `kthread()`, `sample_cycles` —
+// sem linhas `use` novas.)
 
 /// DpcTimeCount e DpcWatchdogCount acima disto pesam no KeShouldYieldProcessor.
 const YIELD_WATCHDOG_THRESHOLD: u32 = 7;
@@ -519,15 +603,16 @@ fn reset_dpc_watchdog(prcb: &Kprcb) {
     prcb.dpc_time_count.set(0);
 }
 
-/// KeShouldYieldProcessor: a árvore de decisão do binário sobre a KPRCB.
-/// Fora de DPC: DPC pedida, fim de quantum ou próxima thread escolhida.
-/// Dentro de DPC: só com DpcTimeCount ou DpcWatchdogCount acima de 7. A fila
-/// do `ke::dpc` entra como DpcNormalDpcPresent (ela não publica o bit).
+/// KeShouldYieldProcessor: a árvore de decisão do binário sobre a KPRCB da
+/// CPU corrente. Fora de DPC: DPC pedida, fim de quantum ou próxima thread
+/// escolhida. Dentro de DPC: só com DpcTimeCount ou DpcWatchdogCount acima de
+/// 7. A fila do `ke::dpc` entra como DpcNormalDpcPresent (ela não publica o
+/// bit).
 pub fn should_yield_processor() -> bool {
     if pcr::get_pcr_address() == 0 {
         return false;
     }
-    let prcb = processor();
+    let prcb = current_processor();
     let summary = prcb.dpc_request_summary.get() as u32;
     let requested = summary & 0x1E != 0 || super::dpc::pending() != 0;
     let watchdog = prcb.dpc_watchdog_count.get() as u32;
