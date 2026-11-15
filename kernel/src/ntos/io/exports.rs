@@ -839,7 +839,7 @@ pub mod x86bios_sleep_misc {
     //! `hal::exports::x86_bios`.
 
     use crate::hal::exports::x86_bios;
-    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::ntos::po::power_manager;
     use crate::ntos::rtl::{bitmap, crt};
     use crate::rtl::KernelError;
@@ -853,10 +853,11 @@ pub mod x86bios_sleep_misc {
         Ok(crt::strnicmp(call.arg(1), call.arg(2), call.arg(3)) as i64 as u64)
     }
 
-    fn disable_sleep_states(_: &Call) -> Result<u64, KernelError> {
-        Ok(power_manager::disable_sleep_states())
+    fn disable_sleep_states(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power_manager::disable_sleep_states(call.arg(1) as u32, call.arg(2) as u32, call.arg(3))))
     }
-    fn reenable_sleep_states(_: &Call) -> Result<u64, KernelError> {
+    fn reenable_sleep_states(call: &Call) -> Result<u64, KernelError> {
+        power_manager::reenable_sleep_states(call.arg(1));
         Ok(0)
     }
 

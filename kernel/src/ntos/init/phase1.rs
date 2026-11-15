@@ -114,6 +114,11 @@ pub fn init() {
     // `--display=basic`: o BasicDisplay.sys real sobe pelo PnP no adaptador
     // VGA, sobre o dxgkrnl.sys real.
     if crate::drivers::video::display_stack::ENABLED {
+        // O vídeo de boot que o carregador deixa numa máquina com adaptador
+        // de vídeo (o BGFX de um boot por BIOS), antes do driver de vídeo.
+        if crate::ntos::bgk::graphics_information::initialize_firmware_display().is_none() {
+            debug_print!("[bgk] sem modo VBE para o video de boot");
+        }
         crate::drivers::video::display_stack::initialize();
     }
 }

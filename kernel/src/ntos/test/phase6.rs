@@ -4175,15 +4175,25 @@ fn x86bios_sleep_misc_exports(assert: Assert) {
     let equal = call_export("_strnicmp", &[first, second, 3]);
     guest::write_bytes(second, b"aBd\0");
     let less = signed(call_export("_strnicmp", &[first, second, 3]));
-    let handle = call_export("PoDisableSleepStates", &[1]).unwrap_or(0);
+    // PoDisableSleepStates(Flags, SleepStates, &Handle): STATUS_SUCCESS e o
+    // handle do pedido na lista ('PoSd', Flags e SleepStates gravados);
+    // PoReenableSleepStates o tira e o libera.
+    let before = crate::ntos::po::power_manager::disabled_sleep_requests();
+    let cell = guest::alloc_bytes(8);
+    let disabled = call_export("PoDisableSleepStates", &[0, 7, cell]);
+    let handle = guest::read64(cell);
+    let recorded = handle != 0 && guest::read32(handle + 0x10) == 0 && guest::read32(handle + 0x14) == 7 && crate::ntos::po::power_manager::disabled_sleep_requests() == before + 1;
+    let reenabled = call_export("PoReenableSleepStates", &[handle]) == Some(0) && crate::ntos::po::power_manager::disabled_sleep_requests() == before;
+    guest::free_bytes(cell);
     assert(
         call_export("RtlFindLeastSignificantBit", &[0x100]) == Some(8)
             && signed(call_export("RtlFindLeastSignificantBit", &[0])) == Some(-1)
             && equal == Some(0)
             && less == Some(-1)
-            && handle != 0
-            && call_export("PoReenableSleepStates", &[handle]) == Some(0),
-        "basicdisplay: bit-scan/_strnicmp/sono",
+            && disabled == Some(0)
+            && recorded
+            && reenabled,
+        "basicdisplay: bit-scan/_strnicmp/sono (PoDisableSleepStates devolve NTSTATUS e o handle por ponteiro)",
     );
     super::x86_bios::run(assert);
 }

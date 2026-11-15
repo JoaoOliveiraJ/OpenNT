@@ -10,7 +10,6 @@
 //! - PoQueryWatchdogTime responde que nenhum watchdog está armado.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::io::io_manager;
@@ -168,16 +167,49 @@ pub fn query_watchdog_time(seconds_out: u64) -> bool {
     false
 }
 
-/// PoDisableSleepStates: o OpenNT não entra em estados de sono; devolve um
-/// identificador opaco não-nulo (um buffer em cache) que o driver guarda e
-/// repassa a PoReenableSleepStates, que é um no-op.
-static SLEEP_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Os pedidos de PoDisableSleepStates vivos (a PopDisableSleepList): cada
+/// um é um bloco de pool 'PoSd' de 0x18 bytes (LIST_ENTRY, Flags e
+/// SleepStates) que o driver recebe como handle.
+static DISABLE_SLEEP_LIST: SpinLock<alloc::vec::Vec<u64>> = SpinLock::new(alloc::vec::Vec::new());
+const DISABLE_SLEEP_TAG: u32 = 0x6453_6F50;
 
-pub fn disable_sleep_states() -> u64 {
-    let mut handle = SLEEP_HANDLE.load(Ordering::Acquire);
-    if handle == 0 {
-        handle = guest::alloc_bytes(16);
-        SLEEP_HANDLE.store(handle, Ordering::Release);
+/// PoDisableSleepStates(Flags, SleepStates, Handle) (ntoskrnl 19041 rva
+/// 0x8e3b90): o pedido entra na lista e o handle vai a *Handle;
+/// STATUS_SUCCESS, ou STATUS_INSUFFICIENT_RESOURCES sem pool. O OpenNT não
+/// entra em estados de sono, então a lista só registra quem os bloqueia.
+pub fn disable_sleep_states(flags: u32, sleep_states: u32, handle_out: u64) -> u32 {
+    let block = crate::ntos::ex::pool_allocation::allocate_tagged(1, 0x18, DISABLE_SLEEP_TAG).unwrap_or(0);
+    if block == 0 {
+        return 0xC000_009A;
     }
-    handle
+    guest::write64(block, 0);
+    guest::write64(block + 8, 0);
+    guest::write32(block + 0x10, flags);
+    guest::write32(block + 0x14, sleep_states);
+    DISABLE_SLEEP_LIST.lock().push(block);
+    // SAFETY: o PVOID* Handle do chamador de modo kernel.
+    unsafe { Field::<u64>::at(handle_out) }.set(block);
+    0
+}
+
+/// PoReenableSleepStates(Handle): o pedido sai da lista e o bloco volta ao
+/// pool; um handle que não está na lista é corrupção da lista
+/// (__fastfail(FAST_FAIL_CORRUPT_LIST_ENTRY) no NT).
+pub fn reenable_sleep_states(handle: u64) {
+    let removed = {
+        let mut list = DISABLE_SLEEP_LIST.lock();
+        let position = list.iter().position(|&block| block == handle);
+        position.map(|index| list.remove(index))
+    };
+    match removed {
+        Some(block) => {
+            let _ = crate::ntos::ex::pool_allocation::free(block, DISABLE_SLEEP_TAG as u64);
+        }
+        None => crate::ntos::ke::bugcheck::bug_check_ex(0x139, 3, handle, 0, 0),
+    }
+}
+
+/// Pedidos de bloqueio de sono vivos (autoteste).
+pub fn disabled_sleep_requests() -> usize {
+    DISABLE_SLEEP_LIST.lock().len()
 }
