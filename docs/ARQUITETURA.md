@@ -1320,7 +1320,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   componentes de um descritor (`OwnedDescriptor`) e a identidade do token
   efetivo (`Subject`: usuário, grupos, SIDs restritos, privilégios
   habilitados, SID de integridade, MandatoryPolicy, pacote e capacidades).
-  Na ordem do NT: rótulo de confiança de processo; integridade obrigatória
+  Na ordem do NT: integridade obrigatória
   (SepMandatoryIntegrityCheck: o rótulo é a primeira ACE de rótulo da SACL,
   Medium com NO_WRITE_UP quando não há; quem não domina só tem GenericRead,
   GenericExecute, READ_CONTROL e SYNCHRONIZE, menos NO_READ_UP/NO_EXECUTE_UP,
@@ -2381,7 +2381,12 @@ dos pacotes (`kernel`, `boot`).
   no OBJECT_HEADER.SecurityDescriptor; os demais (processos, threads,
   tokens, objetos de despacho, namespace, seções) o guardam no registro do
   dono como `SecurityPolicy`, convertida de e para os componentes do
-  descritor. A avaliação não interpreta ACEs condicionais (callback) nem
+  descritor. O rótulo de confiança de processo (SYSTEM_PROCESS_TRUST_LABEL)
+  não é aplicado: sem processos protegidos nenhum token tem TrustLevelSid, e
+  o smss.exe (WinTcb no NT) perderia a escrita no \KnownDlls. A criação
+  num diretório já existente confere o DIRECTORY_CREATE_OBJECT, mas o
+  criador recebe o acesso pedido ao objeto novo sem verificação, como no
+  ObInsertObject. A avaliação não interpreta ACEs condicionais (callback) nem
   listas de tipos de objeto, não audita e não monta o PRIVILEGE_SET dos
   privilégios usados. A verificação de travessia (ObpCheckTraverseAccess)
   não é feita: todos os tokens do OpenNT têm SeChangeNotifyPrivilege, com o

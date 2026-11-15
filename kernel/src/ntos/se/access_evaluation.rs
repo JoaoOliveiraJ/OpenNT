@@ -14,9 +14,10 @@
 //! Em UserMode, na ordem do NT:
 //! 1. descritor nulo, ou nada pedido sem nada já concedido: negado;
 //!    nada pedido com acesso já concedido: o já concedido;
-//! 2. rótulo de confiança de processo (SYSTEM_PROCESS_TRUST_LABEL_ACE da
-//!    SACL): um token que não o domina só recebe a máscara da ACE (mais
-//!    ACCESS_SYSTEM_SECURITY);
+//! 2. (o rótulo de confiança de processo, SYSTEM_PROCESS_TRUST_LABEL_ACE,
+//!    não é aplicado: o OpenNT não tem processos protegidos, e o smss.exe,
+//!    que no NT roda como WinTcb e domina o rótulo do \KnownDlls, ficaria
+//!    sem escrever nele);
 //! 3. integridade obrigatória: o rótulo é a primeira SYSTEM_MANDATORY_LABEL
 //!    da SACL (Medium com NO_WRITE_UP quando não há, ou quando ela é
 //!    inherit-only); o token que não domina o rótulo só pode GenericRead,
@@ -77,7 +78,6 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
 const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
 const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x06;
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
-const SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE: u8 = 0x14;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 /// ACE_OBJECT_TYPE_PRESENT / ACE_INHERITED_OBJECT_TYPE_PRESENT.
 const ACE_OBJECT_TYPE_PRESENT: u32 = 0x1;
@@ -441,27 +441,6 @@ fn dacl_has_owner_rights(descriptor: &OwnedDescriptor) -> bool {
     descriptor.dacl.as_deref().is_some_and(|dacl| entries(dacl).iter().any(|entry| entry.flags & INHERIT_ONLY_ACE == 0 && entry.sid == Some(owner_rights.as_slice())))
 }
 
-/// O rótulo de confiança de processo: a máscara que ele deixa a um token sem
-/// TrustLevelSid (todos os do OpenNT), ou tudo quando ele não restringe. O
-/// token sem nível domina só o SID S-1-19-0-0.
-fn trust_label_mask(descriptor: &OwnedDescriptor) -> u32 {
-    if descriptor.control & SACL_PRESENT == 0 {
-        return u32::MAX;
-    }
-    let Some(sacl) = &descriptor.sacl else { return u32::MAX };
-    for entry in entries(sacl) {
-        if entry.kind != SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE {
-            continue;
-        }
-        if entry.flags & INHERIT_ONLY_ACE != 0 {
-            return u32::MAX;
-        }
-        let dominated = entry.sid.is_some_and(|trust| trust.get(1) == Some(&2) && trust.get(2..8) == Some(&[0, 0, 0, 0, 0, 19][..]) && u32_at(trust, 8) == 0 && u32_at(trust, 12) == 0);
-        return if dominated { u32::MAX } else { entry.mask | ACCESS_SYSTEM_SECURITY };
-    }
-    u32::MAX
-}
-
 /// Os direitos de escrita que um token WRITE_RESTRICTED restringe.
 fn write_restriction_mask(mapping: &[u32; 4]) -> u32 {
     (mapping[1] & !(mapping[0] | mapping[2])) | STANDARD_WRITE
@@ -542,10 +521,6 @@ pub fn access_check(descriptor: Option<&OwnedDescriptor>, subject: &Subject, des
         return if previous == 0 { Err(STATUS_ACCESS_DENIED) } else { Ok(previous) };
     }
     let explicit = desired & !MAXIMUM_ALLOWED;
-    let trust = trust_label_mask(descriptor);
-    if explicit & trust != explicit {
-        return Err(STATUS_ACCESS_DENIED);
-    }
     let mandatory = mandatory_integrity_check(descriptor, subject, mapping)?;
     let lowbox_exempt = subject.lowbox() && mandatory.object_level <= MEDIUM_INTEGRITY;
     if mandatory.policy != 0 && mandatory.mask & explicit != explicit && !lowbox_exempt {
@@ -569,9 +544,6 @@ pub fn access_check(descriptor: Option<&OwnedDescriptor>, subject: &Subject, des
     if desired & MAXIMUM_ALLOWED != 0 {
         if mandatory.policy != 0 && !mandatory.dominates && !lowbox_exempt {
             granted &= mandatory.mask;
-        }
-        if trust != u32::MAX {
-            granted &= trust;
         }
         if granted == 0 {
             return Err(STATUS_ACCESS_DENIED);

@@ -212,7 +212,11 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
         }
     }
     let object_type = open_pointer::describe(body).map_or(0, |item| item.object_type.pointer);
-    let status = match open_pointer::open(body, input.flags, 0, access, object_type, from_user_mode as u8, output_handle) {
+    // Quem cria recebe o acesso pedido sem a verificação do descritor novo
+    // (o ObInsertObject do objeto novo); só a abertura de um nome existente
+    // passa pelo SeAccessCheck.
+    let open_mode = if created.is_some() { 0 } else { from_user_mode as u8 };
+    let status = match open_pointer::open(body, input.flags, 0, access, object_type, open_mode, output_handle) {
         Ok(status) => status,
         Err(error) => return if error.status != 0 { error.status } else { 0xC000_0001 },
     };
