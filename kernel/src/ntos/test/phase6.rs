@@ -14605,6 +14605,7 @@ pub fn run(assert: Assert) {
     super::system_allocations::run(assert, call_export);
     super::system_images::run(assert);
     super::user_half::run(assert);
+    super::support_exports::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 
