@@ -56,7 +56,9 @@ kernel/src/
 │   │   ├── wnf/       Windows Notification Facility
 │   │   └── license/   licenciamento
 │   ├── cm/            Registry: namespace (registry), hives de arquivo (hive_list,
-│   │   │              hive_file, hive_services), tabelas da hive SYSTEM (seed)
+│   │   │              hive_file, hive_services), montagem das hives do boot
+│   │   │              (hive_init), escritor preguiçoso (lazy_flush), tabelas
+│   │   │              das hives de máquina (seed)
 │   │   ├── hive/      formato regf: bloco base, bins e células, listas de
 │   │   │              subchaves, 'sk', 'nk'/'vk'/'db', logs e descarga
 │   │   ├── key/       chaves e serviços Nt/Zw de chave
@@ -1632,9 +1634,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   memória, sem o arquivo) leva o Registro que eles leem: a
   chave Session Manager (`cm/session_manager.rs`: SubSystems com o Kmode e
   a linha do csrss, KnownDLLs, DOS Devices, Environment; sem BootExecute nem
-  arquivos de paginação); em memória ficam a
-  árvore `IniFileMapping` da hive SOFTWARE que o basesrv lê
-  (`cm/ini_file_mapping.rs`) e, na hive de hardware, o
+  arquivos de paginação); a hive SOFTWARE desse build leva a
+  árvore `IniFileMapping` que o basesrv lê
+  (`cm/ini_file_mapping.rs`) e, na hive volátil HARDWARE, fica o
   `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID
   (`cm/hw_description.rs`). Nesse boot ficam desligados a imitação do csrss
   (`ps/user/csr.rs`), o `\KnownDlls` montado pelo kernel, o provisionamento
@@ -1768,10 +1770,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 - O `xtask` lê fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
-  PE) e as tabelas da hive SYSTEM (`ntos/cm/seed.rs`,
-  `ntos/cm/session_manager.rs`, `ntos/cm/service/boot_services.rs` e
+  PE) e as tabelas das hives de máquina (`ntos/cm/seed.rs`,
+  `ntos/cm/session_manager.rs`, `ntos/cm/ini_file_mapping.rs`,
+  `ntos/cm/crypto_defaults.rs`, `ntos/cm/service/boot_services.rs` e
   `ntos/cm/service/inbox_drivers.rs`, na mesma árvore `cm`/`cm::service`
-  de módulos), com que `xtask/src/hive_image.rs` grava o arquivo da hive.
+  de módulos), com que `xtask/src/hive_image.rs` grava os arquivos SYSTEM,
+  SOFTWARE, SAM, SECURITY e DEFAULT de `\SystemRoot\System32\config`.
   Esses arquivos de tabela são dados puros: não usam nada do kernel. O
   `kernel/build.rs` inclui `ntos/ke/services.rs` para gerar a ntdll de
   bring-up.
@@ -1784,13 +1788,56 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   bytes sujos. O NtFlushKey grava o log incremental (.LOG1/.LOG2
   alternados) e as faixas sujas no primário, entre o bloco base
   invalidado e o validado (`hive/sync.rs`); a carga de um primário
-  invalidado aplica os logs (`hive/log.rs`). A hive SYSTEM vem de
-  `\SystemRoot\System32\config\SYSTEM`, gravado pelo build: a fase 1 a
-  carrega logo depois de montar o NTFS (antes dela, nada escreve em
-  `\Registry\Machine\System`); sem o arquivo, as mesmas chaves de
-  `cm/seed.rs` são semeadas em memória. Não há escritor preguiçoso: as
-  hives vão para o arquivo no NtFlushKey, no NtUnloadKey e no
-  NtRestoreKey. As chaves voláteis não ganham célula.
+  invalidado aplica os logs (`hive/log.rs`). As chaves voláteis não ganham
+  célula.
+- **Montagem das hives do boot** (`cm/hive_init.rs`, o CmInitSystem1 e o
+  CmpInitializeHiveList): a fase 0 cria as chaves mestras
+  (`\REGISTRY\MACHINE`, `\REGISTRY\USER` e `\REGISTRY\A`) e a hive volátil
+  HARDWARE (células só na memória, sem arquivo), antes da descrição do
+  hardware que `hw_description` grava nela. A fase 1, logo depois de
+  montar o NTFS (antes dela, nada escreve em `\Registry\Machine\System`),
+  liga a SYSTEM de `\SystemRoot\System32\config\SYSTEM`, cria o
+  `CurrentControlSet` como link volátil para o `ControlSet%03d` do
+  `Select\Current` (CmpCreateControlSet; a hive guarda `ControlSet001`, que
+  as tabelas chamam de `CurrentControlSet`), começa a lista de hives
+  (`CurrentControlSet\Control\hivelist`, volátil: o nome do FILE_OBJECT do
+  primário de cada hive, vazio para as voláteis, fora as de aplicativo) e
+  liga SOFTWARE, SAM, SECURITY e DEFAULT (`\REGISTRY\USER\.DEFAULT`). O
+  build grava as cinco hives com as tabelas de `cm/seed.rs`; sem um
+  arquivo, as mesmas chaves entram em memória.
+- **Links do Registro** (`cm/registry.rs::resolve`): uma chave com
+  KEY_SYM_LINK (REG_OPTION_CREATE_LINK, com KEY_CREATE_LINK no pai) no
+  caminho troca o prefixo percorrido pelo `SymbolicLinkValue` (REG_LINK) e
+  a busca recomeça na raiz, até 64 vezes, como o reparse do CmpDoParseKey;
+  o último componente não é seguido com OBJ_OPENLINK. Os handles guardam o
+  caminho resolvido (o nome real). Numa chave de link só cabe o
+  `SymbolicLinkValue`; CREATE_LINK sobre chave existente é colisão.
+  `\REGISTRY\A` só abre relativo a um handle de hive de aplicativo.
+- **Escritor preguiçoso** (`cm/lazy_flush.rs`): a hive de arquivo que fica
+  suja arma um KTIMER de 60 s (2 s expedito); a DPC enfileira o
+  trabalhador no work item do sistema, que descarrega as hives sujas menos
+  as REG_NO_LAZY_FLUSH (`hive_list::lazy_flush_pass`, sem esperar uma
+  descarga em curso) e rearma se sobrou sujeira. O escritor fica retido 60
+  s depois da montagem das hives (o atraso do boot do CmpCmdInit). O
+  desligamento ordenado (`po/shutdown.rs`) chama o `lazy_flush::shutdown`,
+  o CmShutdownSystem: para o escritor e descarrega todas as hives.
+- **Hives de aplicativo e restaurações especiais** (`cm/hive_list.rs`):
+  REG_APP_HIVE liga a hive em `\REGISTRY\A\{...}`, devolve o handle da
+  raiz, reaproveita a hive já carregada do mesmo arquivo e a descarrega no
+  fechamento do último handle; REG_LOAD_HIVE_OPEN_HANDLE devolve o handle
+  da raiz de uma carga comum e o Event da carga é sinalizado na descarga;
+  REG_WHOLE_HIVE_VOLATILE copia a hive do arquivo para uma hive volátil em
+  `<chave mestra>\<raiz>`; REG_REFRESH_HIVE relê o primário de uma hive
+  REG_NO_LAZY_FLUSH e reconcilia a árvore (os nós que continuam existindo
+  ficam, com os handles).
+- **Filtros de registro** (`cm/callbacks.rs`): CmRegisterCallback(Ex) por
+  altitude (a legada `425000` aceita repetição), as notificações pré e pós
+  das chaves e dos serviços de hive (Flush, Load, UnLoad, Save, Restore),
+  os contextos de objeto (CmSetCallbackObjectContext, no ObjectContext de
+  cada notificação, devolvidos com RegNtCallbackObjectContextCleanup na
+  destruição do corpo ou na remoção do filtro) e a identidade da chave: o
+  CM_KEY_BODY leva 'ky02' e, no KeyControlBlock, um bloco de identidade por
+  nó (`key/objects.rs`) com o nome em cache do CmCallbackGetKeyObjectID.
 
 ## 5. Testes
 
