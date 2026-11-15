@@ -317,7 +317,14 @@ da saída, NtContinue, falta, captura de chamada, os bancos de depuração e o
 callback de instrumentação) é o `UserExecutionBlock` da CPU
 (`hal/amd64/usermode.rs`, campos `Field<T>`), na cauda da reserva, depois da
 KPCR de 0xB080 bytes: os stubs o endereçam por `gs:` e o Rust por
-`usermode::block()` e `pcr::current()`. No M0 só o BSP executa o anel 3
+`usermode::block()` e `pcr::current()`. O IRQL também é da CPU, como no NT:
+KPCR.Irql da própria CPU, lido e gravado pelo GS (`ke/irql.rs`); antes da
+KPCR do BSP só existe o processador de boot, numa célula de partida que a
+KPCR herda. A execução em curso do `ke/thread_dispatch` (o contexto ativo, a
+pilha de execuções aninhadas e o início da contagem de ciclos) é de cada CPU;
+as filas prontas, a NextThread e o lock delas são os da KPRCB do processador
+que despacha as threads (o de boot, no M0), de onde quer que venha a
+prontidão. No M0 só o BSP executa o anel 3
 (assert em `exec_user_mode`/`exec_user_context`); os APs têm KPCR e bloco,
 mas não têm TSS, LSTAR nem pilha reserva. O autoteste
 `ntos/test/multiprocess/per_cpu.rs` confere os blocos distintos de cada CPU
@@ -353,20 +360,32 @@ dos APs (INIT/SIPI) usa o mesmo envio e devolve erro ao boot. O autoteste
 em 50 ms num prazo de 200 ms é aceita, que um alvo mudo é detectado depois
 dos 30 ms do prazo, não antes, com contadores coerentes, e o shootdown real.
 
+**Frequência do TSC.** O relógio do kernel (`ke/clock.rs`) é o TSC. A
+frequência vem da folha CPUID 0x15 quando ela traz o cristal e a razão;
+senão é medida contra o timer de gerenciamento de energia do ACPI (o
+PM_TMR_BLK do FADT, 3,579545 MHz): cada ponta de uma janela de 100 ms lê o
+contador entre duas leituras do TSC e fica com o colchete mais estreito, e
+vale a mediana de três janelas, então uma CPU virtual tirada de execução
+pelo hospedeiro no meio da medida não a distorce. Sem o timer do ACPI, o
+canal 0 do PIT da mesma forma (contagem por latch). O autoteste
+(`self_test.rs`) mede de novo contra a mesma referência e exige até 0,5% de
+diferença.
+
 **Pilhas de kernel por thread.** Toda thread que executa tem pilha de kernel
 própria, do `mm/kernel_stack.rs` (o MmCreateKernelStack/MmDeleteKernelStack):
 uma reserva fixa de 256 KB de VA na janela `KERNEL_STACK_BASE..TOP`, com a
-pilha no topo (64 KB; 128 KB na grande) em frames do PFN não contíguos, PTEs
+pilha no topo (64 KB; 128 KB na grande; a reserva inteira menos a guarda na
+de uma thread de kernel) em frames do PFN não contíguos, PTEs
 de supervisor RW e NX, e a página logo abaixo do StackLimit sem PTE (a
 guarda). `ps::process::create_kernel_thread(.., Some(pilha))` fica dono dela e
 preenche os campos reais da KTHREAD do 19041: StackBase (o topo), StackLimit,
 InitialStack = StackBase - 0x30 (o KERNEL_STACK_CONTROL, com CurrentStackBase
 e ActualLimit) e KernelStack = InitialStack; com `None` a KTHREAD descreve a
-pilha de boot (o kmain, o System e os contextos de kernel do escalonador
-rodam nela). Usam pilha própria as threads de usuário (a primeira, da
-criação em `ps/create.rs`, e as de NtCreateThreadEx), as threads de
-sistema nativas (PsCreateSystemThread, que antes tiravam a pilha da arena) e
-os níveis dos contextos de KeAllocateCalloutStackEx. Como no KiSwapContext, o
+pilha de boot (o kmain e o System rodam nela). Usam pilha própria as threads
+de usuário (a primeira, da criação em `ps/create.rs`, e as de
+NtCreateThreadEx), as threads de kernel (as de sistema dos drivers e os
+processos de kernel do escalonador, veja abaixo) e os níveis dos contextos
+de KeAllocateCalloutStackEx. Como no KiSwapContext, o
 despacho para o anel 3 (`usermode::exec_user_context`/`exec_user_mode`) grava
 em KPRCB.RspBase e TSS.RSP0 a InitialStack da KTHREAD corrente: syscalls,
 IRQs e exceções do anel 3 caem na pilha da própria thread, e o frame da
@@ -393,6 +412,91 @@ syscall de teste cujo RSP fica entre o StackLimit e o InitialStack da thread
 durante a syscall), o IoGetStackLimits de uma thread nativa, o PFN estável
 depois de criar e destruir 8 threads, a IST1 da falta dupla e as pilhas de
 callout.
+
+**Threads de kernel.** Toda thread de kernel — as threads de sistema dos
+drivers (PsCreateSystemThread, `ps/kernel_threads.rs`), os processos de
+kernel do escalonador (o serviço de teclado, o shell, os dos autotestes) e as
+requisições do kernel com thread própria — tem KTHREAD com pilha de kernel
+própria (`kernel_stack::create_for_kernel_thread`: a reserva inteira menos a
+guarda, porque os serviços do kernel que o código nativo chama rodam nela) e
+roda inteira nela. O tick do escalonador (`ps/scheduler.rs`), que roda no
+despachante da CPU — o contexto de boot, nunca a pilha de uma thread de
+kernel —, escolhe pelas filas de prioridade e entra na thread por uma troca
+de contexto (`context_switch::resume`, com o quadro de troca salvo em
+KTHREAD.KernelStack; a primitiva simétrica é `hal/amd64/context_switch.rs::
+swap`, e uma thread nova recebe um quadro inicial que entra na rotina dela);
+a thread devolve a CPU por outra troca (`switch_out`) ao ceder a vez, ao
+esperar ou ao terminar. Cada lado da troca leva o seu estado da CPU: o IRQL
+(KTHREAD.WaitIrql numa espera), a posse de execução nativa, as posses de
+SharedLock (o `rtl::sync::SharedLock` é da thread, não do processador) e a
+thread corrente com a raiz do processo dela. A rotina de uma thread de
+sistema roda pelo caminho síncrono dos exports, como o DriverEntry: cada API
+que o código nativo chama é servida na pilha da própria thread (as chamadas
+em curso, `rtl/native_context.rs`, são achadas pela pilha, não pela CPU); na
+entrada de cada export, uma thread que gastou o quantum (KTHREAD.CycleTime
+alcançou o QuantumTarget, como no KiQuantumEnd) cede a vez antes do serviço
+e recebe as APCs de kernel pendentes; a rotina que retorna termina a thread,
+e o PsTerminateSystemThread termina de dentro do serviço pela última troca.
+Pedido de dentro de uma thread de kernel (o pump de uma espera genérica, o
+ZwYieldExecution com outra pronta, um SharedLock disputado), o tick não
+aninha: a thread cede a vez. Uma thread em execução dada como pronta
+(`thread_dispatch::make_ready`) continua fora da fila, e o despachante a
+recoloca no fim do passo. A espera de uma thread de kernel (`ke/wait.rs`, o
+KiCommitThreadWait do 19041) tira a thread das prontas e troca de contexto;
+cada objeto esperado recebe um KWAIT_BLOCK da KTHREAD (WaitBlock[0..3), ou um
+vetor do pool acima de três) ligado à DISPATCHER_HEADER.WaitListHead, com
+WaitType (WaitAll 0, WaitAny 1, WaitNotification 2, WaitDequeue 3),
+BlockState e WaitKey; o prazo arma o KTIMER da thread (KTHREAD.Timer) com o
+WaitBlock[3] e a chave STATUS_TIMEOUT; a KTHREAD publica State Waiting,
+WaitReason, WaitMode, Alertable, WaitBlockList, WaitBlockCount e o
+KWAIT_STATUS_REGISTER (WaitInProgress até o despachante confirmar a saída da
+CPU, WaitCommitted depois; uma saída antes disso a marca WaitAborted e a
+thread volta direto à fila). Quem apronta é o sinal (o KiWaitTest,
+`wait::signal`): KeSetEvent, KePulseEvent, KeReleaseSemaphore,
+KeReleaseMutex, o vencimento de um timer (o tick vence os timers devidos,
+como a interrupção de relógio), o fim de uma thread ou de um processo
+satisfazem os blocos consumindo pela thread que espera (o evento de
+sincronização, a permissão do semáforo, a posse do mutant; o WaitAll só com
+todos disponíveis), e a saída da espera (o KiUnwaitThread) desliga os blocos,
+cancela o timer, grava KTHREAD.WaitStatus e põe a thread na fila pronta. O
+KeInsertQueue entrega a entrada direto à thread mais recente parada na fila
+(o KiInsertQueue: o bloco WaitDequeue com WrQueue entra na cabeça da
+WaitListHead; com vaga livre e quem insere fora da fila, a entrada não passa
+pela lista e a thread sai da espera ocupando a vaga). Um alerta numa espera
+alertável sai com STATUS_ALERTED; uma APC de usuário numa espera alertável
+de UserMode, com STATUS_USER_APC; uma APC de kernel numa espera em
+PASSIVE_LEVEL, com STATUS_KERNEL_APC (a thread a entrega e espera de novo
+pelo prazo restante). A conclusão de uma requisição de arquivo, que só
+termina no contexto de quem pediu (o papel da APC especial do
+IopCompleteRequest), tira da espera da mesma forma a thread de kernel que
+pediu; uma APC de kernel para uma thread numa espera sondada a põe de volta
+na fila para entregá-la na própria pilha. Os locks do Ex (fast e guarded mutex, ERESOURCE, push
+lock, rundown, `context_switch::acquire_signaled`) esperam com um bloco de
+notificação no evento em que a requisição estacionou (o Event do FAST_MUTEX,
+o WakeEvent do bloco do push lock e do rundown, o evento do bloco do
+ERESOURCE): o KeSetEvent de quem solta acorda a thread, que confere a palavra
+de novo, como o laço do ExpAcquireFastMutexContended. A retirada de uma porta
+de conclusão (ZwRemoveIoCompletion[Ex]) e as esperas do ALPC
+(`alpc::kernel_entry::wait_transport`: a recepção, a conexão, a resposta de
+um pedido síncrono) são esperas explícitas (`wait::wait_woken`): a entrega dos
+pacotes pela porta, uma mensagem na fila de uma porta, um pedido, uma
+resposta, a decisão de uma conexão ou o fecho de uma porta aprontam a thread
+(`wait::wake`), que sonda a operação de novo. As demais esperas genéricas de
+uma condição sem objeto a sinalizar (`context_switch::wait_until`, como a
+remoção de um callback à espera do fim das chamadas em curso) tiram a thread
+das prontas com a condição sondada pelo despachante a cada tick
+(`scheduler::block_polled`). As listas e os registros das esperas ficam sob o
+lock do despachante (`wait::lock`), o mesmo do estado das filas. O
+contexto de boot, que é o próprio despachante da CPU, espera girando o
+`pump_kernel` (interrupções de dispositivo abaixo de DISPATCH_LEVEL, timers,
+DPCs, work items e o tick, que entra nas threads de kernel). O autoteste
+`ntos/test/kernel_waits.rs` (fase 6) roda duas threads de sistema em
+pingue-pongue por dois eventos e por duas KQUEUE (a parada tem o bloco na
+WaitListHead, fica Waiting e não gasta ciclo nem troca de contexto enquanto o
+sistema gira; o sinal a apronta na hora; o KeInsertQueue entrega a entrada
+direto, com a lista vazia e a vaga ocupada), um servidor e um cliente ALPC
+de kernel em threads de sistema e um processo de kernel em execução dado como
+pronto, que segue fora da fila e espera um prazo sem gastar CPU.
 
 **Esperas que bloqueiam.** Uma thread de usuário que espera dentro de uma
 syscall deixa a CPU, como no KiSwapContext do NT, em vez de girar o
@@ -433,9 +537,9 @@ retido com evento de conclusão, a saída de thread com E/S pendente e o
 ZwRemoveIoCompletionEx. O despachante sonda a espera da bloqueada no
 contexto dela e roda o `pump_kernel`, com as interrupções de dispositivo
 abaixo de DISPATCH_LEVEL (`interrupt_object::service_during_wait`), a cada
-volta; fora de uma syscall (boot,
-threads de sistema, APCs e conclusões drenadas pelo despachante) a espera
-continua girando o pump. Como no NT, esperar de fato com prazo não nulo em
+volta; as threads de kernel esperam como descrito acima, e só o contexto de
+boot (com as APCs e conclusões drenadas por ele) continua girando o pump.
+Como no NT, esperar de fato com prazo não nulo em
 DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema (assert).
 Uma thread terminada enquanto bloqueada tem a espera concluída com
 STATUS_THREAD_IS_TERMINATING e é retomada para desfazer o serviço antes de a
