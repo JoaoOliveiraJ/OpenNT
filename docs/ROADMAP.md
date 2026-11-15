@@ -63,7 +63,7 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 | --- | --- | --- |
 | I/O Manager | Parcial | Autoteste de I/O e armazenamento, Teclado real, Pipes nomeados e mailslots entre processos |
 | Console | Parcial | Boot completo, Teste do shell, Driver condrv.sys real |
-| Barramento PCI | Parcial | Autoteste de I/O e armazenamento |
+| Barramento PCI | Parcial | Autoteste de I/O e armazenamento, Pilha de armazenamento real pelo PnP, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
 | Dispositivos da placa-mãe | Parcial | Autoteste de I/O e armazenamento |
 | Disco ATA (interno) | Parcial | Autoteste de I/O e armazenamento |
 | NTFS (leitor do kernel) | Parcial | Autoteste de I/O e armazenamento |
@@ -95,7 +95,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | cng.sys | Funciona | Drivers do Windows no boot comum |
 | ci.dll (Code Integrity) | Funciona | Driver watchdog.sys real |
 | watchdog.sys | Funciona | Driver watchdog.sys real |
-| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | Runtime KMDF real com o msisadrv.sys |
+| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | Runtime KMDF real com o msisadrv.sys, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
 | ksecdd.sys | Funciona | Driver ksecdd.sys real |
 | null.sys | Funciona | Driver null.sys real |
 | beep.sys | Funciona | Driver beep.sys real |
@@ -123,7 +123,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | --- | --- | --- |
 | Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl |
 | win32k.sys, win32kbase.sys e win32kfull.sys | Planejado | — |
-| dxgkrnl.sys e BasicDisplay.sys | Parcial | Driver dxgkrnl.sys real |
+| dxgkrnl.sys e BasicDisplay.sys | Parcial | Driver dxgkrnl.sys real, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
 | ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | Driver ntfs.sys real |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | Driver ndis.sys real (com o netio.sys), Driver afd.sys real (depois do NDIS) |
 
