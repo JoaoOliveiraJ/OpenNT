@@ -1,0 +1,27 @@
+[package]
+name = "kd-gui"
+description = "opennt-dbg: o depurador grafico do kernel do OpenNT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "opennt-dbg"
+path = "src/main.rs"
+
+# Dependências só deste crate: nada aqui entra no build do kernel (alvo
+# x86_64-unknown-none, sem dependências) nem do `xtask` (só o `kd-client`).
+[dependencies]
+kd-client = { path = "../kd-client" }
+# Interface: egui pelo eframe com o backend OpenGL (glow), sem wgpu, sem
+# acessibilidade e sem fontes do sistema (as fontes embutidas do egui).
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }
+egui_dock = "0.21.1"
+# Desmontagem x86-64 com a sintaxe MASM (a do WinDbg).
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "masm"] }
+# Linhas de código do kernel pelo DWARF do kernel.elf (sem o carregador de
+# arquivos: as seções vêm do leitor de ELF do kd-client).
+addr2line = { version = "0.27.1", default-features = false, features = ["std"] }
+# O PNG da captura (já vem com o eframe, para os ícones).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
