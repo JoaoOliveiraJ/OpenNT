@@ -81,6 +81,7 @@ const STATUS_SUCCESS: u32 = 0;
 const STATUS_PENDING: u32 = 0x103;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_PIPE_CONNECTED: u32 = 0xC000_00B2;
 
 /// Direitos e opções (wdm.h/ntifs.h).
 const GENERIC_READ: u64 = 0x8000_0000;
@@ -425,6 +426,25 @@ impl Asm {
         self.fail_on(0x85);
     }
 
+    /// O serviço devolveu `first` ou `second` (senão o processo sai com o que
+    /// veio).
+    fn expect_either(&mut self, first: u32, second: u32) {
+        let compare = |asm: &mut Self, status: u32| {
+            if status == 0 {
+                asm.put(&[0x85, 0xC0]);
+            } else {
+                asm.put(&[0x3D]);
+                asm.imm32(status);
+            }
+        };
+        compare(self, first);
+        // je por cima da segunda comparação e do jne rel32 da falha.
+        let skip = if second == 0 { 2 } else { 5 } + 6;
+        self.put(&[0x74, skip]);
+        compare(self, second);
+        self.fail_on(0x85);
+    }
+
     /// `call` e `expect`.
     fn checked(&mut self, number: u32, args: &[Arg], status: u32) {
         self.call(number, args);
@@ -652,7 +672,10 @@ fn server_program(terminate: u32) -> (Vec<u8>, ServerCells) {
     asm.check_u32(information, 4, 13);
     // O pipe de bytes: escuta, lê 5 e 6 bytes de uma escrita só e responde.
     fs_control(&mut asm, handle_bytes, FSCTL_PIPE_LISTEN, Imm(0), 0, Imm(0), 0);
-    asm.expect(STATUS_SUCCESS);
+    // O cliente pode abrir o pipe de bytes antes desta escuta: o npfs.sys
+    // então devolve STATUS_PIPE_CONNECTED (o ERROR_PIPE_CONNECTED do
+    // ConnectNamedPipe), que também é conexão feita.
+    asm.expect_either(STATUS_SUCCESS, STATUS_PIPE_CONNECTED);
     for (expected, length, step) in [(hello, 5u32, 14u32), (world, 6, 16)] {
         asm.checked(READ_FILE, &[Load(handle_bytes), Imm(0), Imm(0), Imm(0), Addr(iosb), Addr(buffer), Imm(length as u64), Imm(0), Imm(0)], STATUS_SUCCESS);
         asm.check_u32(information, length, step);
