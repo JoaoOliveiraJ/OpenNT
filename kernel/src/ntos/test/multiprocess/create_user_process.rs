@@ -380,7 +380,7 @@ fn absolute(offset: usize) -> u64 {
     IMAGE_BASE + 0x1000 + offset as u64
 }
 
-fn wide(text: &str) -> Vec<u8> {
+pub(super) fn wide(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
@@ -432,7 +432,7 @@ fn build_parameters(at: u64, base: u64, normalized: bool, environment: u64) -> u
 }
 
 /// Uma PS_ATTRIBUTE_LIST em bytes: (atributo, Size, Value, ReturnLength).
-fn attribute_list(entries: &[(u64, u64, u64, u64)]) -> Vec<u8> {
+pub(super) fn attribute_list(entries: &[(u64, u64, u64, u64)]) -> Vec<u8> {
     let header = offset_of!(PsAttributeList, attributes);
     let total = header + entries.len() * PsAttribute::SIZE as usize;
     let mut bytes = alloc::vec![0u8; total];
@@ -448,7 +448,7 @@ fn attribute_list(entries: &[(u64, u64, u64, u64)]) -> Vec<u8> {
 
 /// Um PS_CREATE_INFO de entrada: Size, PsCreateInitialState e o InitState
 /// que o kernel32 passa (WriteOutputOnExit; DLL proibida; leitura extra).
-fn create_info(size: u64) -> Vec<u8> {
+pub(super) fn create_info(size: u64) -> Vec<u8> {
     let mut bytes = alloc::vec![0u8; PsCreateInfo::SIZE as usize];
     bytes[offset_of!(PsCreateInfo, size)..][..8].copy_from_slice(&size.to_le_bytes());
     bytes[0x10..0x14].copy_from_slice(&0x2000_0001u32.to_le_bytes());
@@ -531,12 +531,12 @@ fn parent_image(services: &Services) -> Vec<u8> {
 }
 
 /// Uma região do processo corrente (o System) para as chamadas diretas.
-struct Scratch {
-    block: u64,
+pub(super) struct Scratch {
+    pub(super) block: u64,
 }
 
 impl Scratch {
-    fn new(size: u64) -> Option<Self> {
+    pub(super) fn new(size: u64) -> Option<Self> {
         memory::map_user_region(size).ok().map(|block| Self { block })
     }
 }
@@ -550,7 +550,7 @@ impl Drop for Scratch {
 }
 
 /// Grava (ou remove) um arquivo na raiz do volume, do System.
-fn write_volume_file(path: &str, bytes: &[u8]) -> bool {
+pub(super) fn write_volume_file(path: &str, bytes: &[u8]) -> bool {
     let Some(scratch) = Scratch::new(0x4000) else { return false };
     let (out, iosb, rsp, data) = (scratch.block, scratch.block + 0x20, scratch.block + 0x800, scratch.block + 0x1000);
     let created = file_io::open(out, path, iosb, 5, &OpenRequest { access: 0x4010_0000, share: 0, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
@@ -567,7 +567,7 @@ fn write_volume_file(path: &str, bytes: &[u8]) -> bool {
     created == 0 && written == 0
 }
 
-fn remove_volume_file(path: &str) {
+pub(super) fn remove_volume_file(path: &str) {
     let Some(scratch) = Scratch::new(0x1000) else { return };
     let _ = file_io::open(scratch.block, path, scratch.block + 0x20, 1, &OpenRequest { access: 0x8011_0000, share: 7, options: 0x1020, ..OpenRequest::default() });
     let _ = state::close_user_handle(guest::read64(scratch.block), true, false);
@@ -857,7 +857,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
 
 /// Chama o handler direto, do System, com os buffers em `scratch`; devolve o
 /// status e o handle de processo de saída.
-fn call_create(scratch: &Scratch, process_flags: u32, info: &[u8], attributes: &[u8]) -> (u32, u64) {
+pub(super) fn call_create(scratch: &Scratch, process_flags: u32, info: &[u8], attributes: &[u8]) -> (u32, u64) {
     let (out, info_at, list_at, rsp) = (scratch.block, scratch.block + 0x100, scratch.block + 0x200, scratch.block + 0x800);
     guest::write_bytes(out, &[0u8; 16]);
     guest::write_bytes(info_at, info);

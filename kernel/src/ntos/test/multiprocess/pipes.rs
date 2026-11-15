@@ -64,15 +64,15 @@ use crate::ntos::ps::{process, process_context, scheduler};
 
 type Assert = fn(bool, &str);
 
-const IMAGE_BASE: u64 = 0x1_4000_0000;
+pub(super) const IMAGE_BASE: u64 = 0x1_4000_0000;
 /// Onde começam os dados no conteúdo da seção (o código vem antes).
-const DATA: usize = 0x1000;
+pub(super) const DATA: usize = 0x1000;
 
 const SERVER_CODE: u32 = 0x61;
 const CLIENT_CODE: u32 = 0x62;
 /// Código de saída de uma etapa que falhou (o NTSTATUS do serviço sai como
 /// veio).
-const STEP: u32 = 0xE000_0100;
+pub(super) const STEP: u32 = 0xE000_0100;
 const WAIT_DEADLINE_MS: u64 = 10_000;
 /// Voltas do FSCTL_PIPE_PEEK até a mensagem chegar.
 const PEEK_ROUNDS: u32 = 2000;
@@ -217,56 +217,56 @@ fn restore_services(saved: [u64; 4]) {
 
 /// O NtTerminateProcess pelo número nativo da ntdll carregada (o da tabela
 /// medida, se ela não o publicou).
-fn terminate_number() -> Option<u32> {
+pub(super) fn terminate_number() -> Option<u32> {
     let live = state::with(|state| state.name_by_number.iter().find(|(_, candidate)| candidate.as_str() == "NtTerminateProcess").map(|(&number, _)| number));
     live.or_else(|| service_abi::NATIVE.entries.iter().find(|entry| entry.1 == "NtTerminateProcess").map(|entry| entry.0))
 }
 
 /// O endereço de um deslocamento do conteúdo da seção (RVA 0x1000, na
 /// ImageBase preferida).
-fn absolute(offset: usize) -> u64 {
+pub(super) fn absolute(offset: usize) -> u64 {
     IMAGE_BASE + 0x1000 + offset as u64
 }
 
 // ---- dados dos programas -------------------------------------------------------
 
 /// A área de dados de um programa, a partir de DATA.
-struct Data {
+pub(super) struct Data {
     bytes: Vec<u8>,
 }
 
 impl Data {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { bytes: Vec::new() }
     }
 
-    fn alloc(&mut self, size: usize, align: usize) -> usize {
+    pub(super) fn alloc(&mut self, size: usize, align: usize) -> usize {
         let at = self.bytes.len().div_ceil(align) * align;
         self.bytes.resize(at + size, 0);
         DATA + at
     }
 
-    fn put(&mut self, offset: usize, bytes: &[u8]) {
+    pub(super) fn put(&mut self, offset: usize, bytes: &[u8]) {
         let at = offset - DATA;
         self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
-    fn bytes(&mut self, bytes: &[u8]) -> usize {
+    pub(super) fn bytes(&mut self, bytes: &[u8]) -> usize {
         let at = self.alloc(bytes.len().max(1), 8);
         self.put(at, bytes);
         at
     }
 
-    fn u64(&mut self, value: u64) -> usize {
+    pub(super) fn u64(&mut self, value: u64) -> usize {
         self.bytes(&value.to_le_bytes())
     }
 
-    fn wide(text: &str) -> Vec<u8> {
+    pub(super) fn wide(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()
     }
 
     /// UNICODE_STRING com o texto logo depois.
-    fn unicode(&mut self, text: &str) -> usize {
+    pub(super) fn unicode(&mut self, text: &str) -> usize {
         let wide = Self::wide(text);
         let header = self.alloc(UnicodeString::SIZE as usize, 8);
         let buffer = self.bytes(&wide);
@@ -279,7 +279,7 @@ impl Data {
     }
 
     /// OBJECT_ATTRIBUTES do nome, sem caixa.
-    fn attributes(&mut self, name: &str) -> usize {
+    pub(super) fn attributes(&mut self, name: &str) -> usize {
         let string = self.unicode(name);
         let at = self.alloc(ObjectAttributes::SIZE as usize, 8);
         let mut block = [0u8; 48];
@@ -292,7 +292,7 @@ impl Data {
 
     /// FILE_PIPE_WAIT_FOR_BUFFER do nome (sem a barra), com prazo: o
     /// deslocamento e o tamanho da entrada.
-    fn wait_for(&mut self, name: &str, timeout: i64) -> (usize, u64) {
+    pub(super) fn wait_for(&mut self, name: &str, timeout: i64) -> (usize, u64) {
         let wide = Self::wide(name);
         let header = core::mem::offset_of!(FilePipeWaitForBuffer, name);
         let at = self.alloc(header + wide.len(), 8);
@@ -311,7 +311,7 @@ impl Data {
 /// Um argumento de serviço: imediato, endereço de dado ou o valor (qword)
 /// de uma célula.
 #[derive(Clone, Copy)]
-enum Arg {
+pub(super) enum Arg {
     Imm(u64),
     Addr(usize),
     Load(usize),
@@ -320,7 +320,7 @@ enum Arg {
 use Arg::{Addr, Imm, Load};
 
 /// Montador mínimo de x64, com endereços de dados relativos ao RIP.
-struct Asm {
+pub(super) struct Asm {
     code: Vec<u8>,
     /// Saltos para o caminho de falha (o rel32 a remendar).
     failures: Vec<usize>,
@@ -328,30 +328,30 @@ struct Asm {
 }
 
 impl Asm {
-    fn new(terminate: u32) -> Self {
+    pub(super) fn new(terminate: u32) -> Self {
         let mut asm = Self { code: Vec::new(), failures: Vec::new(), terminate };
         // sub rsp, 0x98
         asm.put(&[0x48, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00]);
         asm
     }
 
-    fn put(&mut self, bytes: &[u8]) {
+    pub(super) fn put(&mut self, bytes: &[u8]) {
         self.code.extend_from_slice(bytes);
     }
 
-    fn imm32(&mut self, value: u32) {
+    pub(super) fn imm32(&mut self, value: u32) {
         self.code.extend_from_slice(&value.to_le_bytes());
     }
 
     /// `prefixo` seguido do disp32 relativo ao RIP até `target`.
-    fn rip(&mut self, prefix: &[u8], target: usize) {
+    pub(super) fn rip(&mut self, prefix: &[u8], target: usize) {
         self.put(prefix);
         let next = self.code.len() + 4;
         self.code.extend_from_slice(&((target as i64 - next as i64) as i32).to_le_bytes());
     }
 
     /// Argumento de registrador (0 = rcx, 1 = rdx, 2 = r8, 3 = r9).
-    fn register(&mut self, index: usize, arg: Arg) {
+    pub(super) fn register(&mut self, index: usize, arg: Arg) {
         const IMM32: [&[u8]; 4] = [&[0xB9], &[0xBA], &[0x41, 0xB8], &[0x41, 0xB9]];
         const SIGNED: [&[u8]; 4] = [&[0x48, 0xC7, 0xC1], &[0x48, 0xC7, 0xC2], &[0x49, 0xC7, 0xC0], &[0x49, 0xC7, 0xC1]];
         const IMM64: [&[u8]; 4] = [&[0x48, 0xB9], &[0x48, 0xBA], &[0x49, 0xB8], &[0x49, 0xB9]];
@@ -376,7 +376,7 @@ impl Asm {
     }
 
     /// Argumento de pilha `number` (5 em diante, em [rsp + 8 * number]).
-    fn stack(&mut self, number: usize, arg: Arg) {
+    pub(super) fn stack(&mut self, number: usize, arg: Arg) {
         let displacement = (number * 8) as u8;
         match arg {
             Imm(value) if value <= i32::MAX as u64 || ((value as i64) < 0 && (value as i64) >= i32::MIN as i64) => {
@@ -395,7 +395,7 @@ impl Asm {
     }
 
     /// Um serviço com os argumentos dados; o status fica em eax.
-    fn call(&mut self, number: u32, args: &[Arg]) {
+    pub(super) fn call(&mut self, number: u32, args: &[Arg]) {
         for (index, &arg) in args.iter().enumerate().skip(4) {
             self.stack(index + 1, arg);
         }
@@ -409,14 +409,14 @@ impl Asm {
     }
 
     /// `jcc rel32` para o caminho de falha.
-    fn fail_on(&mut self, condition: u8) {
+    pub(super) fn fail_on(&mut self, condition: u8) {
         self.put(&[0x0F, condition]);
         self.failures.push(self.code.len());
         self.imm32(0);
     }
 
     /// O serviço devolveu `status` (senão o processo sai com o que veio).
-    fn expect(&mut self, status: u32) {
+    pub(super) fn expect(&mut self, status: u32) {
         if status == 0 {
             self.put(&[0x85, 0xC0]);
         } else {
@@ -446,20 +446,20 @@ impl Asm {
     }
 
     /// `call` e `expect`.
-    fn checked(&mut self, number: u32, args: &[Arg], status: u32) {
+    pub(super) fn checked(&mut self, number: u32, args: &[Arg], status: u32) {
         self.call(number, args);
         self.expect(status);
     }
 
     /// `mov eax, código` (não mexe nas flags) e o salto condicional.
-    fn step_on(&mut self, condition: u8, step: u32) {
+    pub(super) fn step_on(&mut self, condition: u8, step: u32) {
         self.put(&[0xB8]);
         self.imm32(STEP + step);
         self.fail_on(condition);
     }
 
     /// A célula de 32 bits vale `value`.
-    fn check_u32(&mut self, cell: usize, value: u32, step: u32) {
+    pub(super) fn check_u32(&mut self, cell: usize, value: u32, step: u32) {
         self.rip(&[0x8B, 0x05], cell);
         self.put(&[0x3D]);
         self.imm32(value);
@@ -467,14 +467,14 @@ impl Asm {
     }
 
     /// As células de 64 bits são iguais.
-    fn check_cells(&mut self, left: usize, right: usize, step: u32) {
+    pub(super) fn check_cells(&mut self, left: usize, right: usize, step: u32) {
         self.rip(&[0x48, 0x8B, 0x05], left);
         self.rip(&[0x48, 0x3B, 0x05], right);
         self.step_on(0x85, step);
     }
 
     /// Os `length` bytes em `left` e `right` são iguais (repe cmpsb).
-    fn check_bytes(&mut self, left: usize, right: usize, length: u32, step: u32) {
+    pub(super) fn check_bytes(&mut self, left: usize, right: usize, length: u32, step: u32) {
         self.rip(&[0x48, 0x8D, 0x35], left);
         self.rip(&[0x48, 0x8D, 0x3D], right);
         self.put(&[0xB9]);
@@ -483,32 +483,32 @@ impl Asm {
         self.step_on(0x85, step);
     }
 
-    fn here(&self) -> usize {
+    pub(super) fn here(&self) -> usize {
         self.code.len()
     }
 
     /// `jcc rel32` adiante; devolve o ponto a remendar com `bind`.
-    fn forward(&mut self, condition: u8) -> usize {
+    pub(super) fn forward(&mut self, condition: u8) -> usize {
         self.put(&[0x0F, condition]);
         let at = self.code.len();
         self.imm32(0);
         at
     }
 
-    fn bind(&mut self, at: usize) {
+    pub(super) fn bind(&mut self, at: usize) {
         let offset = (self.code.len() as i64 - (at as i64 + 4)) as i32;
         self.code[at..at + 4].copy_from_slice(&offset.to_le_bytes());
     }
 
     /// `jcc rel32` para trás, até `target`.
-    fn back(&mut self, condition: u8, target: usize) {
+    pub(super) fn back(&mut self, condition: u8, target: usize) {
         self.put(&[0x0F, condition]);
         let offset = (target as i64 - (self.code.len() as i64 + 4)) as i32;
         self.imm32(offset as u32);
     }
 
     /// NtTerminateProcess(-1, código); `jmp $`.
-    fn exit(&mut self, code: u32) {
+    pub(super) fn exit(&mut self, code: u32) {
         self.put(&[0xBA]);
         self.imm32(code);
         self.put(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x89, 0xCA, 0xB8]);
@@ -517,7 +517,7 @@ impl Asm {
     }
 
     /// O caminho de falha (sai com eax) e o conteúdo da seção.
-    fn finish(mut self, data: &Data) -> Vec<u8> {
+    pub(super) fn finish(mut self, data: &Data) -> Vec<u8> {
         let here = self.code.len();
         for at in core::mem::take(&mut self.failures) {
             let offset = (here as i64 - (at as i64 + 4)) as i32;
@@ -536,7 +536,7 @@ impl Asm {
 }
 
 /// PE x64 de uma seção gravável e executável com o conteúdo em 0x1000.
-fn image(content: &[u8]) -> Vec<u8> {
+pub(super) fn image(content: &[u8]) -> Vec<u8> {
     let raw = content.len().div_ceil(0x200) * 0x200;
     let virtual_size = content.len().div_ceil(0x1000) * 0x1000;
     let mut image = alloc::vec![0u8; 0x400 + raw];
