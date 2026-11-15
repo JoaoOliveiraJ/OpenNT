@@ -21,10 +21,16 @@
 //!
 //! O portão do M0 (`SMSS_CSRSS_OK`) é uma observação, não um caminho: os
 //! NtCreateUserProcess bem-sucedidos ficam registrados com quem chamou
-//! ([`record_creation`]); quando um processo pede o primeiro serviço da
-//! tabela do win32k ([`win32k_requested`], da conversão para thread GUI que
-//! falha sem o win32k carregado), o marcador sai se ele é o csrss.exe criado
-//! por um smss.exe e o smss inicial e o csrss ainda estão vivos.
+//! ([`record_creation`]); quando uma thread pede pela primeira vez um serviço
+//! da tabela do win32k ([`win32k_requested`], antes da conversão para thread
+//! GUI do KiSystemCall64), o marcador sai se ela é do csrss.exe criado por um
+//! smss.exe e o smss inicial e o csrss ainda estão vivos.
+//!
+//! O `WIN32K_LOADED` ([`session_driver_initialized`]) também é observação: o
+//! smss da sessão carrega o `Kmode` pela SystemExtendServiceTableInformation
+//! e o marcador sai quando o DriverEntry do win32k.sys volta com sucesso, a
+//! tabela 1 do KeServiceDescriptorTableShadow publicada e os callouts Win32
+//! estabelecidos.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -41,6 +47,10 @@ use crate::rtl::{KernelError, SpinLock};
 
 /// NtInitialUserProcess.
 const INITIAL_PROCESS_PATH: &str = "\\SystemRoot\\System32\\smss.exe";
+/// STATUS_ALREADY_WIN32: a repetição da conversão de uma thread já GUI.
+const STATUS_ALREADY_WIN32: u32 = 0x4000_001B;
+/// O `Kmode` do Session Manager.
+const WIN32K_PATH: &str = "\\SystemRoot\\System32\\win32k.sys";
 /// O NtSystemRoot da instalação (KUSER_SHARED_DATA.NtSystemRoot).
 const SYSTEM_ROOT: &str = "C:\\Windows";
 /// PS_PROTECTION do processo inicial: PsProtectedTypeProtectedLight (1) com
@@ -107,15 +117,44 @@ pub fn record_creation(creator_pointer: u64, child_pointer: u64) {
     CREATIONS.lock().push(creation);
 }
 
-/// O processo corrente pediu um serviço da tabela do win32k e a conversão
-/// para thread GUI falhou (o win32k.sys não está carregado).
+/// O driver de sessão da classe 38 voltou do DriverEntry com `status`.
+pub fn session_driver_initialized(name: &str, image_base: u64, status: u32) {
+    if !boot_config::SMSS_BOOT || !name.eq_ignore_ascii_case(WIN32K_PATH) || status & 0x8000_0000 != 0 {
+        return;
+    }
+    let shadow = crate::ntos::ex::service_table::shadow_second_table().unwrap_or([0; 4]);
+    let callouts = crate::ntos::ps::win32::win32_callout();
+    crate::debug_print!("[init] win32k.sys em {:#x}: DriverEntry -> {:#x}, Shadow[1] base {:#x} limite {}, callouts {:#x}", image_base, status, shadow[0], shadow[2] & 0xFFFF_FFFF, callouts.unwrap_or(0));
+    if shadow[0] != 0 && shadow[2] & 0xFFFF_FFFF != 0 && callouts.is_some() {
+        crate::debug_print!("WIN32K_LOADED");
+    }
+}
+
+/// A conversão em thread GUI (PsConvertToGuiThread) de uma thread do
+/// csrss.exe voltou com `status`: a primeira é anotada.
+pub fn gui_thread_converted(status: u32) {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !boot_config::SMSS_BOOT || status == STATUS_ALREADY_WIN32 {
+        return;
+    }
+    let current = process::get_current_process();
+    let name = image_name(current);
+    if !name.eq_ignore_ascii_case("csrss.exe") || NOTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] csrss.exe (pid {}): thread GUI pelo PsConvertToGuiThread -> {:#x}", process::get_current_process_id(), status);
+}
+
+/// Uma thread do processo corrente pediu pela primeira vez um serviço da
+/// tabela do win32k (o KiSystemCall64 vai convertê-la em thread GUI).
 pub fn win32k_requested(service_number: u32) {
     if !boot_config::SMSS_BOOT || GATE_REACHED.load(Ordering::Acquire) {
         return;
     }
     let current = process::get_current_process();
     let name = image_name(current);
-    crate::debug_print!("[init] {} (pid {}) pediu o servico {:#x} da tabela do win32k, que nao esta carregado", name, process::get_current_process_id(), service_number);
+    let loaded = crate::ntos::ps::win32::win32_callout().is_some();
+    crate::debug_print!("[init] {} (pid {}) pediu o servico {:#x} da tabela do win32k ({})", name, process::get_current_process_id(), service_number, if loaded { "carregado" } else { "nao carregado" });
     if !name.eq_ignore_ascii_case("csrss.exe") {
         return;
     }

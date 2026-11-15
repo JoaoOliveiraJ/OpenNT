@@ -63,6 +63,10 @@ struct Record {
     module: Arc<ExportedModule>,
     initialize_status: Option<u32>,
     unload_status: Option<u32>,
+    /// A KLDR_DATA_TABLE_ENTRY de uma imagem do MmLoadSystemImage achada
+    /// pelo import de outra (0 nos demais): cada import retém o LoadCount
+    /// dela.
+    loader_entry: u64,
 }
 
 type Shared = Arc<SpinLock<Record>>;
@@ -89,7 +93,8 @@ fn cached(name: &str) -> Result<Option<Shared>, KernelError> {
     let Some(record) = LOADED.lock().get(name).cloned() else { return Ok(None) };
     let stale = {
         let state = record.lock();
-        state.kind == Kind::Driver && object_manager::lookup(&alloc::format!("\\Driver\\{}", state.driver_name)) != state.driver_node
+        let unloaded_image = state.loader_entry != 0 && loaded_system_image_entry(name) != Some(state.loader_entry);
+        unloaded_image || state.kind == Kind::Driver && object_manager::lookup(&alloc::format!("\\Driver\\{}", state.driver_name)) != state.driver_node
     };
     if stale {
         let mut state = record.lock();
@@ -226,6 +231,27 @@ fn resolving_module(name: &str) -> Option<Arc<ExportedModule>> {
     Some(Arc::new(ExportedModule { name: String::from(name), exports }))
 }
 
+/// Módulo de uma imagem que o MmLoadSystemImage já carregou (de sistema ou
+/// de sessão) com esse nome-base: como no MiResolveImageReferences, o import
+/// de outra imagem acha a entrada na lista de imagens carregadas pelo
+/// BaseDllName e usa os exports dela, sem carregar outra cópia. O registro
+/// devolvido é fixado: a imagem pertence a quem a carregou (o
+/// MmUnloadSystemImage).
+fn loaded_system_image_module(name: &str) -> Option<Shared> {
+    let image = loaded_images::find_by_base_name(name).filter(|image| image.loader_flags & loaded_images::LOAD_IN_PROGRESS == 0)?;
+    if crate::ntos::mm::session_image::exports_of(image.image_base).is_none() && !SYSTEM_IMAGES.lock().values().any(|loaded| loaded.image_base == image.image_base) {
+        return None;
+    }
+    let exports = match crate::ntos::mm::session_image::exports_of(image.image_base) {
+        Some(exports) => exports,
+        None => SYSTEM_IMAGES.lock().values().find(|loaded| loaded.image_base == image.image_base).map(|loaded| loaded.exports.clone())?,
+    };
+    let entry = system_image_entry(image.id).ok().flatten()?;
+    let module = Arc::new(ExportedModule { name: String::from(name), exports });
+    let driver_name = String::from(name.trim_end_matches(".sys"));
+    Some(Arc::new(SpinLock::new(Record { name: String::from(name), driver_name, kind: Kind::Entryless, state: State::Ready, references: 0, pinned: true, driver: 0, driver_node: None, image: None, module, initialize_status: None, unload_status: None, loader_entry: entry })))
+}
+
 /// O registro do módulo, carregando-o na primeira vez. `dependent` = carga
 /// pelo import de outra imagem (o MiLoadImportDll): a imagem nova ganha
 /// DRIVER_DEPENDENT_DLL. O DllInitialize de uma DLL nova roda logo depois da
@@ -242,6 +268,10 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
         }
         return Ok(previous);
     }
+    if let Some(loaded) = loaded_system_image_module(&name) {
+        LOADED.lock().insert(name, loaded.clone());
+        return Ok(loaded);
+    }
     let source = kernel_image_source::source_for(&name)?;
     check_header(&name, &source)?;
     let driver_name = String::from(name.trim_end_matches(".sys"));
@@ -251,7 +281,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
         if let Some(node) = existing {
             let driver = lifecycle::initialized_driver(&driver_name).ok_or_else(|| KernelError::new(alloc::format!("existing driver is not initialized: {name}")))?;
             let exports = lifecycle::driver_exports(&driver_name).unwrap_or_default();
-            return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: true, driver, driver_node: Some(node), image: None, module: exported(&name, exports), initialize_status: None, unload_status: None });
+            return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: true, driver, driver_node: Some(node), image: None, module: exported(&name, exports), initialize_status: None, unload_status: None, loader_entry: 0 });
         }
         let (entry_rva, has_initialize) = pe_loader::file_entry_and_initialize(source.as_ref())?;
         if name.ends_with(".sys") && entry_rva != 0 && !has_initialize {
@@ -261,7 +291,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
             let driver = lifecycle::initialized_driver(&driver_name).unwrap_or(0);
             let driver_node = object_manager::lookup(&alloc::format!("\\Driver\\{driver_name}"));
             let module = exported(&name, lifecycle::driver_exports(&driver_name).unwrap_or_default());
-            return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: false, driver, driver_node, image: None, module, initialize_status: None, unload_status: None });
+            return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: false, driver, driver_node, image: None, module, initialize_status: None, unload_status: None, loader_entry: 0 });
         }
         if !has_initialize && entry_rva != 0 {
             return Err(KernelError::new(alloc::format!("kernel DLL has no DllInitialize: {name}")));
@@ -278,7 +308,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
         }
         let module = Arc::new(ExportedModule { name: name.clone(), exports: image.exports.clone() });
         let kind = if has_initialize { Kind::ExportDriver } else { Kind::Entryless };
-        Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind, state: State::Ready, references: 0, pinned: false, driver: 0, driver_node: None, image: Some(image), module, initialize_status: None, unload_status: None })
+        Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind, state: State::Ready, references: 0, pinned: false, driver: 0, driver_node: None, image: Some(image), module, initialize_status: None, unload_status: None, loader_entry: 0 })
     })();
     LOADING.lock().remove(&name);
     let record = result?;
@@ -327,9 +357,14 @@ impl ImageDependency for Lease {
         if record.driver != 0 {
             lifecycle::add_import_reference(record.driver, 1);
         }
+        // As referências de import contam por símbolo; a imagem do
+        // MmLoadSystemImage ganha uma só no LoadCount enquanto alguma existe.
+        if record.loader_entry != 0 && record.references == 1 {
+            reference_system_image(record.loader_entry);
+        }
     }
     fn release(&self) -> Result<(), KernelError> {
-        let last = {
+        let (last, loader_entry) = {
             let mut record = self.0.lock();
             if record.references == 0 {
                 return Err(KernelError::new("kernel module reference underflow"));
@@ -338,8 +373,11 @@ impl ImageDependency for Lease {
             if record.driver != 0 {
                 lifecycle::add_import_reference(record.driver, -1);
             }
-            record.references == 0
+            (record.references == 0, record.loader_entry)
         };
+        if loader_entry != 0 {
+            return if last { dereference_system_image(loader_entry) } else { Ok(()) };
+        }
         if last {
             unload(&self.0)?;
         }
@@ -842,12 +880,47 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
     Ok(0)
 }
 
-/// MmUnloadSystemImage: descarrega só o que MmLoadSystemImage carregou.
-pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
-    let image = SYSTEM_IMAGES.lock().remove(&handle);
+/// A entrada do loader de uma imagem do MmLoadSystemImage ainda listada
+/// com esse nome-base.
+fn loaded_system_image_entry(name: &str) -> Option<u64> {
+    let image = loaded_images::find_by_base_name(name)?;
+    system_image_entry(image.id).ok().flatten()
+}
+
+/// O import de outra imagem retém uma imagem do MmLoadSystemImage
+/// (MiResolveImageReferences: LoadCount + 1).
+fn reference_system_image(entry: u64) {
+    // SAFETY: a KLDR_DATA_TABLE_ENTRY viva da imagem listada.
+    let count = &unsafe { KldrDataTableEntry::at(entry) }.load_count;
+    count.set(count.get().wrapping_add(1));
+}
+
+/// Solta uma referência de uma imagem do MmLoadSystemImage (o
+/// MiUnloadSystemImage): a imagem de sistema só sai quando o LoadCount
+/// chega a zero, e o import que a retinha a solta depois de um
+/// MmUnloadSystemImage de quem a carregou (o hidparse.sys do win32k, liberado
+/// pela classe 27 com o win32kfull.sys ainda importando dele). A imagem de
+/// sessão sai da sessão pelo MmUnloadSystemImage ou no fim da sessão; o
+/// import só conta.
+fn dereference_system_image(entry: u64) -> Result<(), KernelError> {
+    // SAFETY: a KLDR_DATA_TABLE_ENTRY viva da imagem listada.
+    let count = &unsafe { KldrDataTableEntry::at(entry) }.load_count;
+    let remaining = count.get().saturating_sub(1);
+    count.set(remaining);
+    if remaining != 0 {
+        return Ok(());
+    }
+    let image = SYSTEM_IMAGES.lock().remove(&entry);
     if let Some(mut image) = image {
         image.release()?;
-        return Ok(());
+    }
+    Ok(())
+}
+
+/// MmUnloadSystemImage: descarrega só o que MmLoadSystemImage carregou.
+pub fn unload_system_image(handle: u64) -> Result<(), KernelError> {
+    if SYSTEM_IMAGES.lock().contains_key(&handle) {
+        return dereference_system_image(handle);
     }
     // SAFETY: a KLDR_DATA_TABLE_ENTRY do ImageHandle.
     let base = if handle != 0 { unsafe { KldrDataTableEntry::at(handle) }.dll_base.get() } else { 0 };

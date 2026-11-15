@@ -1580,6 +1580,11 @@ fn ntoskrnl_security_groups(assert: Assert) {
     assert(call_export("SeReleaseSubjectContext", &[context]) == Some(0) && subject.primary_token.get() == 0 && refs(primary) == before, "se: SeReleaseSubjectContext devolve as referencias");
     let luid = guest::alloc_bytes(8);
     assert(call_export("SeQueryAuthenticationIdToken", &[primary, luid]) == Some(0) && Some(luid_at(luid)) == tokens::with(primary, |token| token.authentication_id) && call_export("SeQueryAuthenticationIdToken", &[0x1000, luid]) == Some(0xFFFF_FFFF_C000_0008), "se: AuthenticationId lido do token");
+    // O LUID tem alinhamento de 4: a saída pode estar no meio de uma
+    // estrutura (o win32k pede numa VA múltipla de 4, não de 8).
+    let unaligned = guest::alloc_bytes(16);
+    assert(call_export("SeQueryAuthenticationIdToken", &[primary, unaligned + 4]) == Some(0) && Some(luid_at(unaligned + 4)) == tokens::with(primary, |token| token.authentication_id), "se: AuthenticationId numa saida de alinhamento 4");
+    guest::free_bytes(unaligned);
     assert(call_export("SeSinglePrivilegeCheck", &[luid, 0]) == Some(1) && call_export("SeSinglePrivilegeCheck", &[luid, 1]) == Some(0), "se: privilegio no modo kernel");
     call_export("SeLockSubjectContext", &[context]);
     call_export("SeLockSubjectContext", &[context]);
@@ -4098,6 +4103,27 @@ fn se_token_info_exports(assert: Assert) {
     assert(statistics != 0 && Some(luid_at(at::<nt::TokenStatistics>(statistics).token_id.address())) == tokens::with(primary, |token| token.id), "se-token-info: TOKEN_STATISTICS carrega o TokenId");
     guest::free_bytes(statistics);
 
+    // TokenAppContainerNumber (classe 32): o ULONG vai direto na saída, sem
+    // alocar; sem número LowBox, 0.
+    guest::write64(out, 0xEEEE_EEEE_EEEE_EEEE);
+    assert(call_export("SeQueryInformationToken", &[primary, 32, out]) == Some(0) && guest::read32(out) == 0 && guest::read32(out + 4) == 0xEEEE_EEEE, "se-token-info: TokenAppContainerNumber grava o ULONG na saida, 0 sem LowBox");
+    // TokenIntegrityLevel (25): o RID do SID de integridade, direto na saída.
+    let integrity = tokens::with(primary, |token| token.integrity.clone()).unwrap_or_default();
+    let rid = integrity.len().checked_sub(4).map_or(0, |at| u32::from_le_bytes([integrity[at], integrity[at + 1], integrity[at + 2], integrity[at + 3]]));
+    assert(rid != 0 && call_export("SeQueryInformationToken", &[primary, 25, out]) == Some(0) && guest::read32(out) == rid, "se-token-info: TokenIntegrityLevel devolve o RID do SID de integridade");
+    // TokenUIAccess (26) e TokenIsAppContainer (29): bits de TokenFlags.
+    let flags = tokens::body(primary).token_flags.get();
+    let ui = call_export("SeQueryInformationToken", &[primary, 26, out]) == Some(0) && guest::read32(out) == flags >> 12 & 1;
+    let lowbox = call_export("SeQueryInformationToken", &[primary, 29, out]) == Some(0) && guest::read32(out) == flags >> 14 & 1;
+    assert(ui && lowbox, "se-token-info: TokenUIAccess e TokenIsAppContainer leem os bits de TokenFlags");
+    // TokenAppContainerSid (31): aloca o TOKEN_APPCONTAINER_INFORMATION, com
+    // o ponteiro nulo sem AppContainer.
+    let no_container = tokens::with(primary, |token| token.app_container.is_none()).unwrap_or(false);
+    let container = call_export("SeQueryInformationToken", &[primary, 31, out]) == Some(0) && guest::read64(out) != 0;
+    let information = guest::read64(out);
+    assert(no_container && container && guest::read64(information) == 0, "se-token-info: TokenAppContainerSid aloca o bloco com o SID nulo sem AppContainer");
+    guest::free_bytes(information);
+
     // Classe não implementada → STATUS_INVALID_INFO_CLASS.
     assert(call_export("SeQueryInformationToken", &[primary, 7, out]) == Some(0xFFFF_FFFF_C000_0003), "se-token-info: classe nao suportada recusada");
 
@@ -4866,6 +4892,22 @@ fn ex_lookaside_wnf_exports(assert: Assert) {
     );
     assert(lookaside.l.type_.get().0 == 0x200 && lookaside.l.size.get() == 64, "ex: Type(+0x24) e Size(+0x2C) da lista Ex");
     assert(call_export("ExDeleteLookasideListEx", &[list]) == Some(0), "ex: ExDeleteLookasideListEx desregistra a lista Ex");
+    // O FreeEx de uma lista Ex recebe o bloco e a lista (o FreeEx(Buffer,
+    // Lookaside) das rotinas inline do wdm.h): a exclusão devolve por ele o
+    // bloco que ficou no cache.
+    let seen = guest::alloc_bytes(16);
+    guest::write_bytes(seen, &[0u8; 16]);
+    let mut stub = alloc::vec![0x48, 0xB8];
+    stub.extend_from_slice(&seen.to_le_bytes());
+    stub.extend_from_slice(&[0x48, 0x89, 0x08, 0x48, 0x89, 0x50, 0x08, 0xC3]);
+    let free_ex = super::executable_code::place(&stub);
+    assert(call_export("ExInitializeLookasideListEx", &[list, 0, free_ex, 0x200, 0, 64, tag, 0]) == Some(0), "ex: lista Ex com FreeEx proprio");
+    let block = crate::ntos::ex::lookaside::allocate(list).unwrap_or(0);
+    let cached = block != 0 && crate::ntos::ex::lookaside::free(list, block).is_ok();
+    let deleted = call_export("ExDeleteLookasideListEx", &[list]) == Some(0);
+    assert(cached && deleted && guest::read64(seen) == block && guest::read64(seen + 8) == list, "ex: ExDeleteLookasideListEx chama FreeEx(Buffer, Lookaside) com o bloco do cache");
+    super::executable_code::release(free_ex);
+    guest::free_bytes(seen);
     guest::free_bytes(list);
 
     // WNF: nome indefinido devolve falha (sem faultar).
@@ -13983,6 +14025,7 @@ pub fn run(assert: Assert) {
     pe_primitives(assert);
     pe_loader_kernel_images(assert);
     super::import_cycle::run(assert);
+    super::session_driver_support::run(assert);
     ntoskrnl_exports(assert);
     ntoskrnl_small_groups(assert);
     native_context_execution(assert);

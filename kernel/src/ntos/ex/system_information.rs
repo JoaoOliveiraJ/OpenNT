@@ -216,8 +216,13 @@ fn query_interrupt_steering(input: u64, input_length: u32, output: u64, length: 
 /// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador;
 /// classes desconhecidas = STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
-    if class == SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
-        return extend_service_table(buffer, length).unwrap_or_else(|error| if error.status != 0 { error.status } else { 0xC000_0001 });
+    let status_of = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0001 };
+    match class {
+        SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION => return extend_service_table(buffer, length).unwrap_or_else(status_of),
+        SYSTEM_LOAD_GDI_DRIVER_INFORMATION => return load_gdi_driver(buffer, length, true).unwrap_or_else(status_of),
+        SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE => return load_gdi_driver(buffer, length, false).unwrap_or_else(status_of),
+        SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION => return unload_gdi_driver(buffer, length).unwrap_or_else(status_of),
+        _ => {}
     }
     if class == 131 {
         if (length as u64) < EntropyTimingInformation::SIZE {
@@ -251,7 +256,9 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
 // ExpInitializeSessionDriver chama o ponto de entrada com um DRIVER_OBJECT
 // zerado de 0x150 bytes (só o DriverStart = base) e RegistryPath NULL, e uma
 // falha descarrega a imagem. O MmSessionSetUnloadAddress do sucesso guarda o
-// DriverUnload para o fim da sessão; o OpenNT tem sessão única e não o usa.
+// DriverUnload na sessão corrente (MM_SESSION_SPACE.DriverUnload, 1 sem
+// rotina): é ele que libera os callouts Win32 da sessão
+// (MmSessionGetWin32Callouts) e o MmGetSessionById.
 
 /// SYSTEM_INFORMATION_CLASS SystemExtendServiceTableInformation.
 pub const SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION: u32 = 38;
@@ -276,7 +283,168 @@ fn initialize_session_driver(entry_point: u64, image_base: u64) -> u32 {
     // SAFETY: DRIVER_OBJECT recém-alocado e zerado.
     unsafe { DriverObject::at(address) }.driver_start.set(image_base);
     let status = crate::hal::amd64::native_call::call(entry_point, &[address, 0]) as u32;
+    if status & 0x8000_0000 == 0 {
+        crate::ntos::mm::session::set_unload_address(address);
+    }
     guest::free_bytes(address);
+    status
+}
+
+// ---- Os drivers do GDI: classes 26, 27 e 54 --------------------------------
+//
+// ntoskrnl 19041 (NtSetSystemInformation 0x708300 e 0x707e50), só de modo
+// kernel (de modo usuário, STATUS_PRIVILEGE_NOT_HELD):
+// - SystemLoadGdiDriverInformation (26) e SystemLoadGdiDriverInSystemSpace
+//   (54): SYSTEM_GDI_DRIVER_INFORMATION de 0x38 bytes (senão
+//   STATUS_INFO_LENGTH_MISMATCH); MmLoadSystemImage(DriverName, NULL, NULL,
+//   LoadFlags) com MM_LOAD_IMAGE_IN_SESSION na 26 e 0 na 54 (o hidparse.sys
+//   que o win32k carrega antes do win32kfull.sys). Sem chamar ponto de
+//   entrada nenhum, a saída leva ImageAddress (a base), SectionPointer (o
+//   ImageHandle), EntryPoint (base + AddressOfEntryPoint),
+//   ExportSectionPointer (o diretório de exports mapeado) e ImageLength
+//   (SizeOfImage). Uma falha não preenche nada;
+//   IMAGE_ALREADY_LOADED_AS_DLL vira IMAGE_ALREADY_LOADED.
+// - SystemUnloadGdiDriverInformation (27): um PVOID (senão
+//   STATUS_INFO_LENGTH_MISMATCH), o ImageHandle que o MmUnloadSystemImage
+//   solta; sempre sucesso.
+
+/// SYSTEM_INFORMATION_CLASS dos drivers do GDI.
+pub const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u32 = 26;
+pub const SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION: u32 = 27;
+pub const SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE: u32 = 54;
+/// IMAGE_DIRECTORY_ENTRY_EXPORT.
+const IMAGE_DIRECTORY_ENTRY_EXPORT: u32 = 0;
+
+/// SystemLoadGdiDriverInformation (`session`) e
+/// SystemLoadGdiDriverInSystemSpace: o NTSTATUS.
+pub fn load_gdi_driver(buffer: u64, length: u32, session: bool) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::extra_ps_user::SystemGdiDriverInformation;
+    if length as u64 != SystemGdiDriverInformation::SIZE {
+        return Ok(EXTEND_STATUS_INFO_LENGTH_MISMATCH);
+    }
+    // SAFETY: buffer de modo kernel com o tamanho conferido.
+    let information = unsafe { SystemGdiDriverInformation::at(buffer) };
+    let outputs = guest::alloc_bytes(24);
+    if outputs == 0 {
+        return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let status = crate::ntos::mm::sysload::load_system_image(information.driver_name.address(), 0, 0, session as u32, outputs, outputs + 8);
+    // SAFETY: as duas células PVOID alocadas acima.
+    let (handle, image_base) = unsafe { (Field::<u64>::at(outputs).get(), Field::<u64>::at(outputs + 8).get()) };
+    let status = match status {
+        Ok(status) if status & 0x8000_0000 == 0 => {
+            let exports = crate::ntos::rtl::image::directory_entry(image_base, true, IMAGE_DIRECTORY_ENTRY_EXPORT, outputs + 16);
+            let header = crate::ntos::rtl::image::nt_header(image_base);
+            match (exports, header) {
+                (Ok(exports), Ok(header)) if header != 0 => {
+                    // SAFETY: o cabeçalho NT da imagem recém-carregada.
+                    let optional = &unsafe { crate::ntos::inc::types::ImageNtHeaders64::at(header) }.optional_header;
+                    information.export_section_pointer.set(exports);
+                    information.image_address.set(image_base);
+                    information.section_pointer.set(handle);
+                    information.entry_point.set(image_base + optional.address_of_entry_point.get() as u64);
+                    information.image_length.set(optional.size_of_image.get());
+                    Ok(0)
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+                _ => Ok(EXTEND_STATUS_INVALID_IMAGE_FORMAT),
+            }
+        }
+        Ok(EXTEND_STATUS_IMAGE_ALREADY_LOADED_AS_DLL) => Ok(EXTEND_STATUS_IMAGE_ALREADY_LOADED),
+        other => other,
+    };
+    guest::free_bytes(outputs);
+    status
+}
+
+/// SystemUnloadGdiDriverInformation: MmUnloadSystemImage(*buffer).
+pub fn unload_gdi_driver(buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if length != 8 {
+        return Ok(EXTEND_STATUS_INFO_LENGTH_MISMATCH);
+    }
+    // SAFETY: buffer de modo kernel com um PVOID.
+    let handle = unsafe { Field::<u64>::at(buffer) }.get();
+    crate::ntos::mm::sysload::unload_system_image(handle)?;
+    Ok(0)
+}
+
+// ---- NtSetSystemInformation de modo usuário --------------------------------
+//
+// ntoskrnl 19041 (NtSetSystemInformation 0x707b70) com PreviousMode =
+// UserMode: o buffer é sondado primeiro (alinhamento 4, ou 1 na classe
+// 0x59: STATUS_DATATYPE_MISALIGNMENT; fim acima de MmUserProbeAddress:
+// STATUS_ACCESS_VIOLATION). A classe 38 (0x708159) exige Length 0x10, o
+// processo corrente mestre de uma sessão (EPROCESS.Vm.Flags.SessionMaster) e
+// o SeLoadDriverPrivilege habilitado; a UNICODE_STRING capturada tem de ser
+// exatamente L"\SystemRoot\System32\win32k.sys" (Length 0x3e e memcmp), senão
+// STATUS_PRIVILEGE_NOT_HELD. Passando, o serviço reentra pelo
+// ZwSetSystemInformation(38) com uma UNICODE_STRING local sobre o texto do
+// próprio kernel, já em KernelMode: o DriverEntry do win32k roda com
+// PreviousMode = KernelMode na thread do smss.
+
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+/// SE_LOAD_DRIVER_PRIVILEGE.
+const SE_LOAD_DRIVER_PRIVILEGE: u64 = 10;
+/// A classe cujo buffer só precisa de alinhamento 1.
+const SET_INFORMATION_BYTE_ALIGNED_CLASS: u32 = 0x59;
+
+/// NtSetSystemInformation com PreviousMode = UserMode: o NTSTATUS.
+pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    let alignment = if class == SET_INFORMATION_BYTE_ALIGNED_CLASS { 1 } else { 4 };
+    if length != 0 {
+        if buffer & (alignment - 1) != 0 {
+            return Ok(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let end = buffer.wrapping_add(length as u64);
+        if end > crate::ntos::mm::memory_map::USER_PROBE_ADDRESS || end < buffer {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    if matches!(class, SYSTEM_LOAD_GDI_DRIVER_INFORMATION | SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION | SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE) {
+        let expected = if class == SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION { 8 } else { crate::ntos::inc::types::extra_ps_user::SystemGdiDriverInformation::SIZE as u32 };
+        return Ok(if length != expected { EXTEND_STATUS_INFO_LENGTH_MISMATCH } else { STATUS_PRIVILEGE_NOT_HELD });
+    }
+    if class != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
+        debug_print!("[usermode] NtSetSystemInformation classe {} (sem suporte de modo usuario)", class);
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    if length as u64 != crate::ntos::inc::types::UnicodeString::SIZE {
+        return Ok(EXTEND_STATUS_INFO_LENGTH_MISMATCH);
+    }
+    // SAFETY: o EPROCESS corrente (PsGetCurrentProcess).
+    let process = unsafe { crate::ntos::inc::types::Eprocess::at(crate::ntos::ps::process::get_current_process()) };
+    if process.vm.instance.flags.session_master() == 0 || !crate::ntos::se::privilege::single_privilege_check(SE_LOAD_DRIVER_PRIVILEGE, 1) {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    // A captura da UNICODE_STRING e do texto, sondados (o __try do serviço).
+    let Ok(string) = crate::ntos::inc::types::UnicodeString::try_at(buffer) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let (Ok(name_length), Ok(name_buffer)) = (string.length.probe_get(), string.buffer.probe_get()) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let expected: Vec<u8> = EXTEND_SERVICE_TABLE_WIN32K.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    if name_length as usize != expected.len() {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    let source = name_buffer.min(crate::ntos::mm::memory_map::USER_PROBE_ADDRESS);
+    let Ok(text) = guest::try_read_bytes(source, expected.len()) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    if text != expected {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    // A UNICODE_STRING local do serviço, sobre o texto do kernel.
+    let local = guest::alloc_bytes(crate::ntos::inc::types::UnicodeString::SIZE + expected.len() as u64 + 2);
+    if local == 0 {
+        return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let characters = local + crate::ntos::inc::types::UnicodeString::SIZE;
+    guest::write_bytes(characters, &expected);
+    guest::write_bytes(characters + expected.len() as u64, &[0, 0]);
+    // SAFETY: UNICODE_STRING recém-alocada.
+    let kernel_string = unsafe { crate::ntos::inc::types::UnicodeString::at(local) };
+    kernel_string.length.set(expected.len() as u16);
+    kernel_string.maximum_length.set(expected.len() as u16);
+    kernel_string.buffer.set(characters);
+    let status = crate::ntos::ps::previous_mode::with_kernel(|| set(SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION, local, crate::ntos::inc::types::UnicodeString::SIZE as u32));
+    guest::free_bytes(local);
     status
 }
 
@@ -309,7 +477,18 @@ pub fn extend_service_table(buffer: u64, length: u32) -> Result<u32, KernelError
     }
     // SAFETY: cabeçalho NT da imagem recém-carregada.
     let entry_point = image_base + unsafe { crate::ntos::inc::types::ImageNtHeaders64::at(header) }.optional_header.address_of_entry_point.get() as u64;
+    // `--trace-driver-api` no boot do smss: o DriverEntry do driver de sessão
+    // (o win32k.sys e o que ele carrega) imprime cada export que chama.
+    let trace = crate::ntos::init::boot_config::TRACE_DRIVER_API && crate::ntos::init::boot_config::SMSS_BOOT;
+    if trace {
+        crate::ntos::init::exports::set_api_trace(true);
+    }
     let status = initialize_session_driver(entry_point, image_base);
+    if trace {
+        crate::ntos::init::exports::set_api_trace(false);
+    }
+    debug_print!("[ex] driver de sessao {}: DriverEntry -> {:#x}", name, status);
+    crate::ntos::init::initial_process::session_driver_initialized(&name, image_base, status);
     if status & 0x8000_0000 != 0 {
         sysload::unload_system_image(handle)?;
     }

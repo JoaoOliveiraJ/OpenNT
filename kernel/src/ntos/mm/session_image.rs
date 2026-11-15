@@ -17,14 +17,18 @@
 //!   não pagináveis de uma imagem de sessão (todas as seções graváveis do
 //!   win32k*.sys e do cdd.dll são NOT_PAGED). Duas sessões veem globais
 //!   separados na mesma VA;
-//! - o MmUnloadSystemImage numa sessão ([`unload_from_current`]) e o fim da
-//!   sessão ([`release_session`], o MiSessionUnloadAllImages) desfazem a
-//!   vista da sessão e devolvem as cópias privadas; a última sessão devolve
-//!   a imagem mestra (VA, frames e a entrada do loader).
+//! - cada sessão conta as cargas da imagem (o ImageCountInThisSession do
+//!   nó da imagem na sessão, que o MiSessionInsertImage incrementa quando a
+//!   imagem já está nela: o MmLoadSystemImage devolve sucesso sem mexer no
+//!   LoadCount). O MmUnloadSystemImage numa sessão ([`unload_from_current`])
+//!   desconta uma carga; a última desfaz a vista da sessão e devolve as
+//!   cópias privadas, e o fim da sessão ([`release_session`], o
+//!   MiSessionUnloadAllImages) desfaz tudo de uma vez; a última sessão
+//!   devolve a imagem mestra (VA, frames e a entrada do loader).
 //!
 //! As imagens de sistema (drivers da janela de sistema) não passam por aqui.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::pe_loader::PeImage;
@@ -52,8 +56,8 @@ struct SharedImage {
     /// A KLDR_DATA_TABLE_ENTRY (o ImageHandle).
     entry: u64,
     kinds: Vec<PageKind>,
-    /// As sessões (VA global) que a carregaram.
-    sessions: BTreeSet<u64>,
+    /// As sessões (VA global) que a carregaram, com as cargas de cada uma.
+    sessions: BTreeMap<u64, u32>,
 }
 
 static IMAGES: SpinLock<BTreeMap<u64, SharedImage>> = SpinLock::new(BTreeMap::new());
@@ -142,8 +146,8 @@ pub fn discard_new(image: &PeImage) {
 /// entrada do loader.
 pub fn register(entry: u64, image: PeImage) {
     let kinds = page_kinds(&image);
-    let mut sessions = BTreeSet::new();
-    sessions.insert(session::current());
+    let mut sessions = BTreeMap::new();
+    sessions.insert(session::current(), 1);
     IMAGES.lock().insert(image.image_base, SharedImage { image, entry, kinds, sessions });
 }
 
@@ -157,6 +161,12 @@ pub fn entry_of(base: u64) -> Option<u64> {
     IMAGES.lock().get(&base).map(|image| image.entry)
 }
 
+/// Os exports de uma imagem de sessão (o import de outra imagem a acha na
+/// lista de imagens carregadas).
+pub fn exports_of(base: u64) -> Option<crate::ntos::rtl::image::pe_exports::Exports> {
+    IMAGES.lock().get(&base).map(|image| image.image.exports.clone())
+}
+
 /// O frame mestre da página de `va` (0 fora de uma imagem de sessão).
 pub fn master_frame(va: u64) -> u64 {
     let images = IMAGES.lock();
@@ -165,7 +175,7 @@ pub fn master_frame(va: u64) -> u64 {
 
 /// As sessões que carregaram a imagem `base`.
 pub fn sessions_of(base: u64) -> Vec<u64> {
-    IMAGES.lock().get(&base).map_or(Vec::new(), |image| image.sessions.iter().copied().collect())
+    IMAGES.lock().get(&base).map_or(Vec::new(), |image| image.sessions.keys().copied().collect())
 }
 
 fn adjust_load_count(entry: u64, difference: i32) {
@@ -175,36 +185,43 @@ fn adjust_load_count(entry: u64, difference: i32) {
 }
 
 /// MiSessionInsertImage de uma imagem já carregada: a sessão corrente a
-/// mapeia (LoadCount + 1) se ainda não a tem. Devolve se mapeou agora.
+/// mapeia (LoadCount + 1) se ainda não a tem; se já tem, conta mais uma
+/// carga nela. Devolve se mapeou agora.
 pub fn load_into_current(base: u64) -> Result<bool, KernelError> {
     let pointer = session::current();
     if pointer == 0 {
         return Err(KernelError::with_status("session image load outside a session", STATUS_NO_MEMORY));
     }
     let (masters, kinds, entry) = {
-        let images = IMAGES.lock();
-        let Some(image) = images.get(&base) else { return Err(KernelError::new("not a session image")) };
-        if image.sessions.contains(&pointer) {
+        let mut images = IMAGES.lock();
+        let Some(image) = images.get_mut(&base) else { return Err(KernelError::new("not a session image")) };
+        if let Some(loads) = image.sessions.get_mut(&pointer) {
+            *loads += 1;
             return Ok(false);
         }
         (image.image.pages.clone(), image.kinds.clone(), image.entry)
     };
     map_view(pointer, base, &masters, &kinds)?;
     if let Some(image) = IMAGES.lock().get_mut(&base) {
-        image.sessions.insert(pointer);
+        image.sessions.insert(pointer, 1);
     }
     adjust_load_count(entry, 1);
     Ok(true)
 }
 
-/// Tira a imagem `base` da sessão `pointer` (LoadCount - 1); a última sessão
-/// devolve a imagem mestra.
-fn remove_from(pointer: u64, base: u64) -> Result<(), KernelError> {
+/// Desconta uma carga da imagem `base` na sessão `pointer` (todas, com
+/// `all`); sem cargas, tira a imagem da sessão (LoadCount - 1), e a última
+/// sessão devolve a imagem mestra.
+fn remove_from(pointer: u64, base: u64, all: bool) -> Result<(), KernelError> {
     let (pages, entry) = {
-        let images = IMAGES.lock();
-        let Some(image) = images.get(&base) else { return Ok(()) };
-        if !image.sessions.contains(&pointer) {
+        let mut images = IMAGES.lock();
+        let Some(image) = images.get_mut(&base) else { return Ok(()) };
+        let Some(loads) = image.sessions.get_mut(&pointer) else {
             return Err(KernelError::new("session image not loaded in this session"));
+        };
+        if !all && *loads > 1 {
+            *loads -= 1;
+            return Ok(());
         }
         (image.image.pages.len(), image.entry)
     };
@@ -226,14 +243,14 @@ fn remove_from(pointer: u64, base: u64) -> Result<(), KernelError> {
 
 /// MmUnloadSystemImage de uma imagem de sessão, na sessão corrente.
 pub fn unload_from_current(base: u64) -> Result<(), KernelError> {
-    remove_from(session::current(), base)
+    remove_from(session::current(), base, false)
 }
 
 /// MiSessionUnloadAllImages: as imagens que a sessão carregou saem dela.
 pub fn release_session(pointer: u64) {
-    let bases: Vec<u64> = IMAGES.lock().iter().filter(|(_, image)| image.sessions.contains(&pointer)).map(|(&base, _)| base).collect();
+    let bases: Vec<u64> = IMAGES.lock().iter().filter(|(_, image)| image.sessions.contains_key(&pointer)).map(|(&base, _)| base).collect();
     for base in bases {
-        if let Err(error) = remove_from(pointer, base) {
+        if let Err(error) = remove_from(pointer, base, true) {
             crate::debug_print!("[mm] imagem de sessao {:#x} retida no fim da sessao: {}", base, error);
         }
     }

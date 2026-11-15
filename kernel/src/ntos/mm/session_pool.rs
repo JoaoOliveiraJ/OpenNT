@@ -73,6 +73,8 @@ struct Block {
     span: (u64, u64),
     tag: u32,
     tracked: u64,
+    /// A quota do ExAllocatePoolWithQuotaTag, devolvida no free.
+    quota: Option<super::kernel_pool::PoolQuota>,
 }
 
 #[derive(Default)]
@@ -271,7 +273,7 @@ pub fn allocate_paged(bytes: u64, tag: u32, alignment: u64, zero: bool) -> Optio
                 physical::zero(frame + at % PAGE, 16);
             }
         }
-        pool.blocks.insert(address, Block { region: region_base, span: (address, size), tag, tracked });
+        pool.blocks.insert(address, Block { region: region_base, span: (address, size), tag, tracked, quota: None });
     }
     account_allocation(tag, true, tracked);
     Some(Ok(address))
@@ -304,10 +306,27 @@ pub fn free_paged(address: u64) -> Result<(), (u32, [u64; 4])> {
         (block, emptied)
     };
     account_free(block.tag, true, block.tracked);
+    if let Some(quota) = block.quota {
+        (quota.release)(quota.process_pointer, quota.paged, quota.bytes);
+    }
     if let Some((base, region)) = emptied {
         retire_region(pointer, base, region);
     }
     Ok(())
+}
+
+/// O ExAllocatePoolWithQuotaTag de PagedPoolSession: a cobrança passa ao
+/// bloco vivo `address` da sessão corrente, com os bytes que ele reserva.
+pub fn attach_quota(address: u64, quota: super::kernel_pool::PoolQuota) -> Result<(), KernelError> {
+    let pointer = session::current();
+    let mut pools = POOLS.lock();
+    match pools.get_mut(&pointer).and_then(|pool| pool.blocks.get_mut(&address)) {
+        Some(block) if block.quota.is_none() && quota.bytes == block.span.1 => {
+            block.quota = Some(quota);
+            Ok(())
+        }
+        _ => Err(KernelError::new("invalid session pool quota ownership")),
+    }
 }
 
 fn retire_region(pointer: u64, base: u64, region: Region) {
@@ -359,6 +378,9 @@ pub fn release_session(pointer: u64) {
     let Some(pool) = POOLS.lock().remove(&pointer) else { return };
     if !pool.blocks.is_empty() {
         crate::debug_print!("[pool] sessao encerrada com {} blocos de pool de sessao vivos", pool.blocks.len());
+    }
+    for quota in pool.blocks.into_values().filter_map(|block| block.quota) {
+        (quota.release)(quota.process_pointer, quota.paged, quota.bytes);
     }
     for (base, region) in pool.regions {
         retire_region(pointer, base, region);

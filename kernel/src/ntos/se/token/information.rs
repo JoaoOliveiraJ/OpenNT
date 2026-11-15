@@ -87,13 +87,79 @@ fn encode_sid_struct(sid: &[u8], base: u64) -> Vec<u8> {
     bytes
 }
 
+/// TOKEN_INFORMATION_CLASS das classes que não alocam.
+const TOKEN_VIRTUALIZATION_ALLOWED: u32 = 23;
+const TOKEN_VIRTUALIZATION_ENABLED: u32 = 24;
+const TOKEN_INTEGRITY_LEVEL: u32 = 25;
+const TOKEN_UI_ACCESS: u32 = 26;
+const TOKEN_IS_APP_CONTAINER: u32 = 29;
+const TOKEN_APP_CONTAINER_SID: u32 = 31;
+const TOKEN_APP_CONTAINER_NUMBER: u32 = 32;
+
+/// O bit de TokenFlags de cada classe booleana (TOKEN_VIRTUALIZATION_ALLOWED
+/// 0x200, TOKEN_VIRTUALIZATION_ENABLED 0x400, TOKEN_UIACCESS 0x1000,
+/// TOKEN_LOWBOX 0x4000).
+fn token_flag_bit(class: u32) -> Option<u32> {
+    match class {
+        TOKEN_VIRTUALIZATION_ALLOWED => Some(9),
+        TOKEN_VIRTUALIZATION_ENABLED => Some(10),
+        TOKEN_UI_ACCESS => Some(12),
+        TOKEN_IS_APP_CONTAINER => Some(14),
+        _ => None,
+    }
+}
+
+/// O último SubAuthority de um SID (o RID), 0 sem SubAuthority.
+fn last_sub_authority(sid: &[u8]) -> u32 {
+    let count = sid.get(1).copied().unwrap_or(0) as usize;
+    let at = 8 + 4 * count;
+    if count == 0 || sid.len() < at {
+        return 0;
+    }
+    u32::from_le_bytes([sid[at - 4], sid[at - 3], sid[at - 2], sid[at - 1]])
+}
+
 /// SeQueryInformationToken(Token, Class, *TokenInformation): aloca a
 /// estrutura da classe e devolve o ponteiro em `*output`. Classes comuns
-/// implementadas; as demais devolvem STATUS_INVALID_INFO_CLASS.
+/// implementadas; as demais devolvem STATUS_INVALID_INFO_CLASS. Como no
+/// ntoskrnl 19041, as classes escalares não alocam e gravam o ULONG direto
+/// em `*output`: as booleanas de TokenFlags (23, 24, 26, 29), a
+/// TokenIntegrityLevel (25, o RID do SID de integridade) e a
+/// TokenAppContainerNumber (32, o número do LowboxNumberEntry; o OpenNT não
+/// atribui números LowBox, então é 0). A TokenAppContainerSid (31) aloca um
+/// TOKEN_APPCONTAINER_INFORMATION com o SID do pacote logo depois (só o
+/// ponteiro nulo sem AppContainer). O win32k consulta 25, 26, 31 e 32 no
+/// callout de processo de todo processo GUI.
 pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, KernelError> {
     let Some(record) = tokens::get(token).filter(|record| record.refs > 0) else {
         return Ok(STATUS_INVALID_PARAMETER);
     };
+    if let Some(bit) = token_flag_bit(class) {
+        out::<u32>(output).set(tokens::body(token).token_flags.get() >> bit & 1);
+        return Ok(0);
+    }
+    match class {
+        TOKEN_INTEGRITY_LEVEL => {
+            out::<u32>(output).set(last_sub_authority(&record.integrity));
+            return Ok(0);
+        }
+        TOKEN_APP_CONTAINER_NUMBER => {
+            out::<u32>(output).set(0);
+            return Ok(0);
+        }
+        TOKEN_APP_CONTAINER_SID => {
+            let sid = record.app_container.clone().unwrap_or_default();
+            let base = guest::alloc_bytes(8 + sid.len() as u64);
+            if base == 0 {
+                return Ok(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            guest::write_bytes(base + 8, &sid);
+            guest::write64(base, if sid.is_empty() { 0 } else { base + 8 });
+            out::<u64>(output).set(base);
+            return Ok(0);
+        }
+        _ => {}
+    }
     // Comprimento primeiro: a alocação precede os ponteiros absolutos.
     let length = match class {
         1 => 16 + record.user.len(),
@@ -135,7 +201,10 @@ pub fn query_authentication_id(token: u64, output: u64) -> u32 {
     if tokens::get(token).is_none() {
         return STATUS_INVALID_HANDLE;
     }
-    out::<u64>(output).set(tokens::luid_value(&tokens::body(token).authentication_id));
+    // LUID { ULONG LowPart; LONG HighPart; }: alinhamento de 4 (o win32k
+    // pede a saída dentro de uma estrutura, num endereço múltiplo de 4).
+    // SAFETY: o PLUID de saída vivo do chamador de kernel.
+    tokens::set_luid(unsafe { crate::ntos::inc::types::Luid::at(output) }, tokens::luid_value(&tokens::body(token).authentication_id));
     0
 }
 

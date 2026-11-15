@@ -45,7 +45,7 @@ fn put32(bytes: &mut [u8], offset: usize, value: u32) {
 /// encaminhamentos de kernel: o módulo sem a extensão) e `.idata` com um
 /// import (`peer`!`peer_export`, IAT em 0x3060). O resto de `.idata` (a
 /// partir de 0x3100) é dado gravável.
-fn cycle_dll(export: &str, peer: &str, peer_export: &str, initialize: &[u8], routine: &[u8]) -> Vec<u8> {
+pub(super) fn cycle_dll(export: &str, peer: &str, peer_export: &str, initialize: &[u8], routine: &[u8]) -> Vec<u8> {
     let mut image = alloc::vec![0u8; 0x4000];
     put16(&mut image, 0, 0x5A4D);
     put32(&mut image, 0x3C, 0x40);

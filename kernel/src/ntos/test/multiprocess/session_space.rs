@@ -21,9 +21,10 @@
 //! - o BOOTVID.DLL real carregado como imagem de sessão nas duas sessões: a
 //!   mesma VA e a mesma entrada do loader (LoadCount 2), o código nos mesmos
 //!   frames mestres e sem escrita, a .data em cópias privadas que começam
-//!   iguais à mestra (o cookie) e separam na primeira escrita; fora de uma
-//!   sessão, STATUS_NO_MEMORY; MmUnloadSystemImage tira a imagem de uma
-//!   sessão só;
+//!   iguais à mestra (o cookie) e separam na primeira escrita; uma segunda
+//!   carga na mesma sessão conta uma carga a mais nela, que o
+//!   MmUnloadSystemImage seguinte só desconta; fora de uma sessão,
+//!   STATUS_NO_MEMORY; MmUnloadSystemImage tira a imagem de uma sessão só;
 //! - no fim dos processos, as sessões somem com o pool que sobrou e a imagem
 //!   ainda carregada, e o PFN livre volta ao de antes.
 
@@ -242,6 +243,11 @@ pub fn run(assert: Assert) {
     // SAFETY: a KLDR_DATA_TABLE_ENTRY viva da imagem de sessão.
     let load_count = || if entry != 0 { unsafe { KldrDataTableEntry::at(entry) }.load_count.get() } else { 0 };
     assert(status_a == 0 && status_b == 0 && again == 0 && same && (map::SESSION_IMAGE_BASE..map::SESSION_IMAGE_TOP).contains(&base) && session_image::is_session_image(base) && load_count() == 2, "sessao: o BOOTVID.DLL carregado nas duas sessoes na mesma VA de sessao, com a mesma entrada e LoadCount 2");
+    // A segunda carga na sessão a contou mais uma carga nela (o
+    // ImageCountInThisSession), sem mexer no LoadCount: o primeiro
+    // MmUnloadSystemImage só desconta, e a imagem segue mapeada em a.
+    let discounted = inside(a, || sysload::unload_system_image(entry).is_ok()).unwrap_or(false);
+    assert(discounted && paging::translate_in(root_a, base) != 0 && load_count() == 2 && session_image::sessions_of(base).len() == 2, "sessao: a segunda carga na mesma sessao conta uma carga a mais e o MmUnloadSystemImage seguinte so a desconta");
     assert(load(1) == STATUS_NO_MEMORY && guest::read64(base_out) == 0, "sessao: carga de sessao fora de uma sessao = STATUS_NO_MEMORY");
     let sections = inside(a, || (guest::read16(base), section(base, b".text\0"), section(base, b".data\0"))).unwrap_or((0, None, None));
     let (Some((text, text_flags)), Some((data, data_flags))) = (sections.1, sections.2) else {

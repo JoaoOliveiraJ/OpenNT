@@ -314,6 +314,11 @@ fn nt_serialize_boot(_: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, K
     Ok(crate::ntos::io::pnp::serialize_boot(1))
 }
 
+/// NtSetSystemInformation(class, buffer, length): `ex/system_information`.
+fn nt_set_system_information(class: u64, buffer: u64, length: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ex::system_information::set_from_user_mode(class as u32, buffer, length as u32)
+}
+
 /// NtQuerySystemInformation(class, buffer, length, returnLength*).
 fn nt_query_system_information(class: u64, buffer: u64, length: u64, returned: u64, _rsp: u64) -> Result<u32, KernelError> {
     query_system_information(class as u32, buffer, length as u32 as u64, returned)
@@ -856,7 +861,7 @@ fn nt_create_partition(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Res
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 28] = [
+    let handlers: [(&'static str, state::SyscallHandler); 29] = [
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),
         ("NtDisplayString", nt_display_string),
@@ -868,6 +873,7 @@ pub fn init() {
         ("NtWaitForMultipleObjects", nt_wait_for_multiple_objects),
         ("NtQuerySystemInformation", nt_query_system_information),
         ("NtQuerySystemInformationEx", nt_query_system_information_ex),
+        ("NtSetSystemInformation", nt_set_system_information),
         ("NtSerializeBoot", nt_serialize_boot),
         ("NtTraceEvent", nt_trace_event),
         ("NtRaiseHardError", nt_raise_hard_error),

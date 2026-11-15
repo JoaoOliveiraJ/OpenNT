@@ -1101,6 +1101,15 @@ fn save_syscall_context(frame: *const u64, result: u64) {
     unsafe { user_terminate_current(0) }
 }
 
+/// `OPENNT_TRACE_SYSCALLS`: os serviços da tabela 1 (do win32k) vão direto à
+/// rotina do driver, fora do registro de serviços nativos, e são
+/// impressos aqui.
+fn trace_win32k_service(number: u64, arguments: &[u64], result: u64) {
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS && number & 0x1000 != 0 {
+        crate::debug_print!("[sys] {}:{} win32k#{:#x}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), number, arguments[0], arguments[1], arguments[2], arguments[3], result);
+    }
+}
+
 /// Chamado pelo stub de syscall com o frame: escolhe a entrada real do
 /// descritor da thread (o Shadow só para threads GUI) e chama o alvo MS x64
 /// com os argumentos copiados; um número fora do limite segue o caminho do
@@ -1140,6 +1149,9 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
             result = crate::hal::amd64::native_call::call(target, &packet[..count]);
             STATE.lock().service_frame = previous;
         }
+        trace_win32k_service(number, &packet, result);
+    } else {
+        trace_win32k_service(number, &[0; 4], result);
     }
     // NtTerminateProcess: o código está no bloco da CPU; não volta ao anel 3.
     if result & 0xFFFF_FFFF == TERMINATE_MAGIC {

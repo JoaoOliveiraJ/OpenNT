@@ -27,9 +27,14 @@
 //! [`init`]), na ordem do PspExitThread: o callout de thread, com a thread que
 //! sai como corrente, e depois o de processo.
 //!
-//! Lacunas honestas: (1) o OpenNT não tem MM_SESSION_SPACE, então o portão de
-//! sessão do MmSessionGetWin32Callouts (sessão pronta -> PsWin32CallBack, senão
-//! PsWin32NullCallBack) se reduz a "callouts registrados"; (2) o ramo
+//! O bloco vale por sessão, como no MmSessionGetWin32Callouts: só um processo
+//! cuja sessão já tem o driver de sessão iniciado (MM_SESSION_SPACE.
+//! DriverUnload >= 2, gravado pelo MmSessionSetUnloadAddress depois do
+//! DriverEntry do win32k) usa o PsWin32CallBack; os demais (sem sessão, ou
+//! numa sessão sem o win32k) caem no PsWin32NullCallBack, sem bloco, e o
+//! callout devolve STATUS_INVALID_PARAMETER.
+//!
+//! Lacuna honesta: o ramo
 //! ProcessTimerDelay de PsSetProcessWin32Process (fila de
 //! PspTimerDelayWorkerRoutine quando EPROCESS.ProcessTimerDelay não é zero)
 //! não existe no OpenNT, que nunca escreve esse campo.
@@ -97,10 +102,18 @@ pub fn establish_callouts(dispatch: u64) -> bool {
 /// Parameter)`; sem bloco registrado, STATUS_INVALID_PARAMETER. A rotina é
 /// chamada fora do lock (o NT a protege só pela referência do bloco).
 pub fn invoke_callout(callout_type: i32, parameter: u64) -> u32 {
-    match win32_callout() {
+    match win32_callout().filter(|_| session_callouts_ready()) {
         Some(dispatch) => native_call::call(dispatch, &[0, callout_type as i64 as u64, parameter]) as u32,
         None => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// MmSessionGetWin32Callouts: a sessão do processo corrente
+/// (EPROCESS.Session) tem o DriverUnload do driver de sessão (>= 2).
+fn session_callouts_ready() -> bool {
+    let session = eprocess(process::get_current_process()).session.get();
+    // SAFETY: EPROCESS.Session aponta para o MM_SESSION_SPACE vivo da sessão.
+    session != 0 && unsafe { crate::ntos::inc::types::MmSessionSpace::at(session) }.driver_unload.function.get() >= 2
 }
 
 /// Callout de thread {Thread, CalloutType} (o bloco que o NT monta na pilha).
@@ -160,12 +173,23 @@ pub fn is_gui_thread() -> bool {
     current_thread().is_some_and(|thread| thread.tcb.gui_thread() != 0)
 }
 
-/// PsConvertToGuiThread da thread corrente, na ordem do ntoskrnl 19041:
-/// chamada de KernelMode, thread já GUI, processo com
-/// DisallowWin32kSystemCalls, o callout de processo (Initialize = TRUE)
-/// quando o processo ainda não tem Win32Process, o callout de thread
-/// (PsW32ThreadCalloutInitialize) e só então KTHREAD.GuiThread, ligado por
-/// LOCK OR (ThreadFlags é compartilhado com outras CPUs).
+/// MitigationFlags: DisallowWin32kSystemCalls e o par de filtro de syscalls
+/// Win32k (EnableFilteredWin32kAPIs, AuditFilteredWin32kAPIs).
+const DISALLOW_WIN32K_SYSTEM_CALLS: u32 = 0x1000;
+const FILTERED_WIN32K_APIS: u32 = 0xC000;
+
+/// PsConvertToGuiThread da thread corrente, como o ntoskrnl 19041
+/// (0x683840): chamada de KernelMode = STATUS_INVALID_PARAMETER; thread já
+/// GUI = STATUS_ALREADY_WIN32; DisallowWin32kSystemCalls =
+/// STATUS_ACCESS_DENIED (o AuditDisallowWin32kSystemCalls só audita, e o
+/// OpenNT não tem a auditoria). O callout de processo vai sempre, com Flags
+/// 1 (o valor 2, do nível de assinatura da imagem, vem de um callback da CI
+/// que o OpenNT não registra); falhando, o status volta. Liga
+/// KTHREAD.GuiThread (e RestrictedGuiThread, com o filtro de syscalls Win32k
+/// do processo) por LOCK BTS antes do callout de thread
+/// (PsW32ThreadCalloutInitialize), cujo status é o do serviço; se ele falha,
+/// os dois bits voltam. O KiSystemCall64 só repete a busca no Shadow com o
+/// status exatamente STATUS_SUCCESS.
 pub fn convert_to_gui_thread() -> u32 {
     let Some(thread) = current_thread() else { return STATUS_INVALID_PARAMETER };
     if thread.tcb.previous_mode.get() == 0 {
@@ -176,22 +200,23 @@ pub fn convert_to_gui_thread() -> u32 {
     }
     let process = process::get_current_process();
     let owner = eprocess(process);
-    if owner.mitigation_flags_values.disallow_win32k_system_calls() != 0 {
+    let mitigation = owner.mitigation_flags.get();
+    if mitigation & DISALLOW_WIN32K_SYSTEM_CALLS != 0 {
         return STATUS_ACCESS_DENIED;
     }
-    // Sem o PsEstablishWin32Callouts do win32k, o ExReferenceCallBackBlock
-    // não acha a rotina: STATUS_INVALID_PARAMETER.
-    if owner.win32_process.get() == 0 {
-        let status = process_callout(process, true);
-        if (status as i32) < 0 {
-            return status;
-        }
-    }
-    let status = thread_callout(thread.address(), PS_W32_THREAD_CALLOUT_INITIALIZE);
+    // Sem o PsEstablishWin32Callouts do win32k (ou fora de uma sessão com
+    // ele), o ExReferenceCallBackBlock não acha a rotina:
+    // STATUS_INVALID_PARAMETER.
+    let status = process_callout(process, true);
     if (status as i32) < 0 {
         return status;
     }
-    thread.tcb.thread_flags.atomic().fetch_or(Kthread::GUI_THREAD_MASK as i32, Ordering::SeqCst);
+    let flags = Kthread::GUI_THREAD_MASK | if mitigation & FILTERED_WIN32K_APIS != 0 { Kthread::RESTRICTED_GUI_THREAD_MASK } else { 0 };
+    thread.tcb.thread_flags.atomic().fetch_or(flags as i32, Ordering::SeqCst);
+    let status = thread_callout(thread.address(), PS_W32_THREAD_CALLOUT_INITIALIZE);
+    if (status as i32) < 0 {
+        thread.tcb.thread_flags.atomic().fetch_and(!(flags as i32), Ordering::SeqCst);
+    }
     status
 }
 

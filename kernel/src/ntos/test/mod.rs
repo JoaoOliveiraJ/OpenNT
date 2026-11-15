@@ -27,6 +27,7 @@ pub mod file_system_mount;
 pub mod console_driver;
 pub mod kernel_waits;
 pub mod import_cycle;
+pub mod session_driver_support;
 pub mod fsrtl_fs_support;
 pub mod boot_drivers;
 pub mod fs_driver_imports;

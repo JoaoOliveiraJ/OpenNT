@@ -126,3 +126,86 @@ const _: () = {
     assert!(core::mem::offset_of!(WorkerFactoryDeferredWork, alpc_send_message_flags) == 0x10);
     assert!(core::mem::offset_of!(WorkerFactoryDeferredWork, flags) == 0x14);
 };
+
+/// `_SYSTEM_GDI_DRIVER_INFORMATION` (ZwSetSystemInformation
+/// (SystemLoadGdiDriverInformation, classe 26, e
+/// SystemLoadGdiDriverInSystemSpace, classe 54); 0x38 bytes): o nome da
+/// imagem e o que a carga devolve.
+#[repr(C)]
+pub struct SystemGdiDriverInformation {
+    pub driver_name: UnicodeString,
+    pub image_address: Field<u64>,
+    /// O ImageHandle do MmLoadSystemImage (a entrada do loader).
+    pub section_pointer: Field<u64>,
+    pub entry_point: Field<u64>,
+    pub export_section_pointer: Field<u64>,
+    pub image_length: Field<u32>,
+    pub _padding: Field<u32>,
+}
+
+unsafe impl NtStruct for SystemGdiDriverInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemGdiDriverInformation>() == 0x38);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, driver_name) == 0x0);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, image_address) == 0x10);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, section_pointer) == 0x18);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, entry_point) == 0x20);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, export_section_pointer) == 0x28);
+    assert!(core::mem::offset_of!(SystemGdiDriverInformation, image_length) == 0x30);
+};
+
+/// A saída de 0x40 bytes do ZwPowerInformation(SessionPowerInit, nível 41),
+/// como o NtPowerInformation 19041 a monta (0x6f123a): dois ponteiros para
+/// BOOLEANs do Po que o win32k lê e grava, os valores de configuração de
+/// energia da sessão (de PopPowerSettingValues), o estado do economizador
+/// de energia, a tampa aberta e o TTM ligado. Os nomes seguem a origem de
+/// cada campo.
+#[repr(C)]
+pub struct PowerSessionInit {
+    /// -> PopNoMoreInput (BOOLEAN).
+    pub no_more_input: Field<u64>,
+    /// -> PopHiberBootForceMonitorOff (BOOLEAN).
+    pub hiber_boot_force_monitor_off: Field<u64>,
+    pub reserved: Field<u32>,
+    /// PopPowerSettingValues + 0x10C.
+    pub setting_10c: Field<u32>,
+    /// PopPowerSettingValues + 0xF1 != 0.
+    pub setting_f1_present: Field<u32>,
+    /// PopPowerSettingValues + 0xEC.
+    pub setting_ec: Field<u32>,
+    /// PopPowerSettingValues + 0x110, 0x114 e 0x118.
+    pub setting_110: Field<u32>,
+    pub setting_114: Field<u32>,
+    pub setting_118: Field<u32>,
+    /// PopPowerSettingValues + 0x120.
+    pub setting_120: Field<u32>,
+    /// PopEsState == 1 (economizador de energia ligado).
+    pub energy_saver_on: Field<u8>,
+    /// PopLidOpened.
+    pub lid_opened: Field<u8>,
+    pub _padding: [Field<u8>; 2],
+    /// PopPowerSettingValues + 0x11C.
+    pub setting_11c: Field<u32>,
+    /// TtmpEnabled == 1.
+    pub ttm_enabled: Field<u8>,
+    pub _tail: [Field<u8>; 7],
+}
+
+unsafe impl NtStruct for PowerSessionInit {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PowerSessionInit>() == 0x40);
+    assert!(core::mem::offset_of!(PowerSessionInit, no_more_input) == 0x0);
+    assert!(core::mem::offset_of!(PowerSessionInit, hiber_boot_force_monitor_off) == 0x8);
+    assert!(core::mem::offset_of!(PowerSessionInit, reserved) == 0x10);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_10c) == 0x14);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_f1_present) == 0x18);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_ec) == 0x1C);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_110) == 0x20);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_120) == 0x2C);
+    assert!(core::mem::offset_of!(PowerSessionInit, energy_saver_on) == 0x30);
+    assert!(core::mem::offset_of!(PowerSessionInit, lid_opened) == 0x31);
+    assert!(core::mem::offset_of!(PowerSessionInit, setting_11c) == 0x34);
+    assert!(core::mem::offset_of!(PowerSessionInit, ttm_enabled) == 0x38);
+};

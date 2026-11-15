@@ -381,7 +381,9 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     }
     // OBJ_EXCLUSIVE não transforma uma instância compartilhada já criada.
     let exclusive = item.owner.exclusive_process(pointer);
-    if attributes & !0x1FF2 != 0 || (attributes & 0x20 != 0 && exclusive == 0) {
+    // OBJ_VALID_KERNEL_ATTRIBUTES: o OBJ_KERNEL_EXCLUSIVE (0x10000) das
+    // seções que o win32k cria também chega ao handle.
+    if attributes & !0x11FF2 != 0 || (attributes & 0x20 != 0 && exclusive == 0) {
         return Ok(0xC000_000D);
     }
     if exclusive != 0 && exclusive != process::get_current_process() {

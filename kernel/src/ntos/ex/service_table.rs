@@ -194,15 +194,19 @@ pub fn out_of_range(service_number: u32) -> Result<Result<(u64, u32), u32>, Kern
         return Ok(Err(STATUS_INVALID_SYSTEM_SERVICE));
     }
     let addresses = init()?;
-    while win32::convert_to_gui_thread() == 0 {
+    // O portão do processo inicial real observa o primeiro pedido ao win32k.
+    crate::ntos::init::initial_process::win32k_requested(service_number);
+    loop {
+        let converted = win32::convert_to_gui_thread();
+        crate::ntos::init::initial_process::gui_thread_converted(converted);
+        if converted != 0 {
+            break;
+        }
         let (target, arguments) = inspect(service_number, true)?;
         if target != 0 {
             return Ok(Ok((target, arguments)));
         }
     }
-    // O portão do processo inicial real observa o primeiro pedido ao win32k
-    // que não está carregado.
-    crate::ntos::init::initial_process::win32k_requested(service_number);
     Ok(Err(win32_failure_status(&addresses, service_number)))
 }
 

@@ -413,9 +413,14 @@ pub fn trim(maximum: u64, address: Option<u64>, from_pressure: bool) -> Result<u
 }
 
 /// MmPageEntireDriver: migra (se possível) e marca a imagem inteira como
-/// paginável; devolve a base.
+/// paginável; devolve a base. Uma imagem de sessão (MiGetSystemRegionType =
+/// região de sessão) só devolve a DllBase, como no ntoskrnl 19041: as
+/// páginas dela são da sessão, não do conjunto de trabalho do sistema.
 pub fn make_pageable(address: u64) -> Result<u64, KernelError> {
     low_irql()?;
+    if crate::ntos::mm::session::is_session_address(address) {
+        return Ok(crate::ntos::mm::loaded_images::find(address).map_or(0, |image| image.image_base));
+    }
     let Some(base) = record_for(address, true)? else { return Ok(0) };
     let migrated = STATE.lock().records.get(&base).is_some_and(|record| record.migrated);
     if !migrated && !smp::has_active_jobs() {

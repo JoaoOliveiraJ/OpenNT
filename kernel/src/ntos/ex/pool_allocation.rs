@@ -42,9 +42,11 @@ fn reject(message: &str, pool_type: u32, bytes: u64, tag: u32) -> ! {
 pub fn allocate_storage(pool_type: u32, bytes: u64, tag: u32, priority: u32, layout: Option<(u64, u64, u64)>) -> u64 {
     let base = pool_type & !(RAISE_ON_ALLOCATION_FAILURE | COLD_ALLOCATION | ZERO_ALLOCATION);
     // Tipos reservados e MustSucceed não são pools comuns; os de sessão são
-    // os comuns com SessionPoolMask.
+    // os comuns com SessionPoolMask. O bit NX (0x200) também vale num tipo
+    // paginado (513, 517: o win32k pede PagedPoolSession | 0x200), que o
+    // ExAllocateHeapPool trata como sem execução, o que o paginado já é.
     let session_type = session_pool::is_session_type(base);
-    if ![0, 1, 4, 5, 512, 516].contains(&(base & !session_pool::SESSION_POOL_MASK)) {
+    if ![0, 1, 4, 5, 512, 513, 516, 517].contains(&(base & !session_pool::SESSION_POOL_MASK)) {
         reject("unsupported or reserved POOL_TYPE", pool_type, bytes, tag);
     }
     if session_type && session::current() == 0 {

@@ -121,7 +121,9 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
     let flags: u32 = caller_read(pointer + offset_of!(ObjectAttributes, attributes) as u64, mode)?;
     let root: u64 = caller_read(pointer + offset_of!(ObjectAttributes, root_directory) as u64, mode)?;
     let unicode: u64 = caller_read(pointer + offset_of!(ObjectAttributes, object_name) as u64, mode)?;
-    if flags & !0x1FF2 != 0 || (mode != 0 && flags & 0x200 != 0) {
+    // OBJ_VALID_KERNEL_ATTRIBUTES (0x11FF2, com o OBJ_KERNEL_EXCLUSIVE das
+    // seções do win32k), como o ObpCaptureObjectCreateInformation.
+    if flags & !0x11FF2 != 0 || (mode != 0 && flags & 0x200 != 0) {
         return Err(0xC000_000D);
     }
     let security_descriptor: u64 = caller_read(pointer + offset_of!(ObjectAttributes, security_descriptor) as u64, mode)?;

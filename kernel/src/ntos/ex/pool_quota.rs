@@ -4,7 +4,7 @@
 //! e de quota. Nunca devolve um bloco sem cobrar seu dono.
 
 use super::pool_allocation;
-use crate::ntos::mm::kernel_pool;
+use crate::ntos::mm::{kernel_pool, session, session_pool};
 use crate::ntos::ps::{pool_quota, process};
 use crate::rtl::KernelError;
 
@@ -38,10 +38,17 @@ pub fn allocate(pool_type: u32, bytes: u64, tag: u32) -> Result<u64, KernelError
     if !charged {
         return Ok(pointer);
     }
-    let rounded = kernel_pool::info(pointer).map_or(0, |info| info.rounded);
+    // PagedPoolSession sai do heap da sessão corrente: a cobrança é pelos
+    // bytes que o bloco reserva lá e volta com o free dele.
+    let session_block = session_pool::is_paged_session_type(pool_type);
+    let rounded = if session_block { session_pool::block(session::current(), pointer).map_or(0, |(size, _)| size) } else { kernel_pool::info(pointer).map_or(0, |info| info.rounded) };
     match pool_quota::charge(owner, pool_type & 1 != 0, rounded)? {
         Err(status) => {
-            kernel_pool::free(pointer, Some(tag))?;
+            if session_block {
+                let _ = session_pool::free_paged(pointer);
+            } else {
+                kernel_pool::free(pointer, Some(tag))?;
+            }
             if pool_type & FAIL_INSTEAD_OF_RAISE == 0 {
                 return raise(status);
             }
@@ -49,7 +56,11 @@ pub fn allocate(pool_type: u32, bytes: u64, tag: u32) -> Result<u64, KernelError
         }
         Ok(quota) => {
             if let Some(quota) = quota {
-                kernel_pool::attach_quota(pointer, quota)?;
+                if session_block {
+                    session_pool::attach_quota(pointer, quota)?;
+                } else {
+                    kernel_pool::attach_quota(pointer, quota)?;
+                }
             }
             Ok(pointer)
         }

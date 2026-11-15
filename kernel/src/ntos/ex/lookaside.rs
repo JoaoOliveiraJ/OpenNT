@@ -5,13 +5,13 @@
 //! callbacks padrão são os endereços dos exports ExAllocatePoolWithTag e
 //! ExFreePool, entregues pelo provedor de exports (fase 6).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::{pool_allocation, slist};
 use crate::hal::amd64::native_call;
 use crate::ntos::ke::{clock, irql};
 use crate::ntos::mm::page_residency::{self, FaultResult, Provider};
-use crate::ntos::mm::{kernel_pool, pfn};
+use crate::ntos::mm::pfn;
 use crate::rtl::{KernelError, SpinLock};
 use core::sync::atomic::Ordering;
 
@@ -30,6 +30,11 @@ struct State {
     pressure_registered: bool,
     last_adjustment_ms: u64,
 }
+
+/// As listas LOOKASIDE_LIST_EX (ExInitializeLookasideListEx): o AllocateEx e
+/// o FreeEx recebem também a lista, como as rotinas inline do wdm.h
+/// (AllocateEx(PoolType, Size, Tag, Lookaside), FreeEx(Buffer, Lookaside)).
+static EX_LISTS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
 
 static STATE: SpinLock<State> = SpinLock::new(State { lists: BTreeMap::new(), registry_heads: [0; 2], kernel_provider: None, pressure_registered: false, last_adjustment_ms: 0 });
 
@@ -147,7 +152,9 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
 /// recebem ExAllocatePoolWithTag/ExFreePool (feito dentro de `initialize`,
 /// como nas listas não-Ex). Flags e Depth não têm efeito persistente aqui.
 pub fn initialize_ex(list: u64, allocate_routine: u64, free_routine: u64, pool_type: u32, block_size: u64, tag: u32) -> Result<(), KernelError> {
-    initialize(list, allocate_routine, free_routine, pool_type, block_size, tag, pool_type & 1 != 0)
+    initialize(list, allocate_routine, free_routine, pool_type, block_size, tag, pool_type & 1 != 0)?;
+    EX_LISTS.lock().insert(list);
+    Ok(())
 }
 
 /// A primeira falta chama o alocador verdadeiro; uma entrada do cache
@@ -168,6 +175,9 @@ pub fn allocate(list: u64) -> Result<u64, KernelError> {
     if exported_callback("ExAllocatePoolWithTag").ok() == Some(callback) {
         return pool_allocation::allocate_tagged(pool_type, size as u64, tag);
     }
+    if EX_LISTS.lock().contains(&list) {
+        return Ok(native_call::call(callback, &[pool_type as u64, size as u64, tag as u64, list]));
+    }
     Ok(native_call::call(callback, &[pool_type as u64, size as u64, tag as u64]))
 }
 
@@ -176,7 +186,10 @@ pub fn allocate(list: u64) -> Result<u64, KernelError> {
 fn release_entry(list: u64, block: u64) -> Result<(), KernelError> {
     let callback = lookaside(list).free_ex.get();
     if exported_callback("ExFreePool").ok() == Some(callback) {
-        kernel_pool::free(block, None)
+        pool_allocation::free(block, 0)
+    } else if EX_LISTS.lock().contains(&list) {
+        native_call::call(callback, &[block, list]);
+        Ok(())
     } else {
         native_call::call(callback, &[block]);
         Ok(())
@@ -216,6 +229,7 @@ pub fn delete(list: u64) -> Result<(), KernelError> {
         release_entry(list, block)?;
         block = following;
     }
+    EX_LISTS.lock().remove(&list);
     Ok(())
 }
 
