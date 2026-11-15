@@ -285,29 +285,41 @@ fn pci_location(slot: u32) -> (u32, u32) {
 /// KdGet/SetPciDataByOffset: bytes do espaço de configuração (HaliPciInterface*).
 fn pci_transfer(call: &Call, write: bool) -> u64 {
     let (bus, slot, buffer, offset, length) = (call.arg(1) as u32, call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5) as u32);
-    let (device, function) = pci_location(slot);
-    if buffer == 0 || offset >= 256 || !super::pci_config::valid(bus, device, function) {
+    if buffer == 0 || offset >= 256 {
         return 0;
     }
     let length = length.min(256 - offset);
-    if write {
-        let bytes = guest::read_bytes(buffer, length as usize);
-        for (index, &byte) in bytes.iter().enumerate() {
-            if super::pci_config::write(bus, device, function, offset + index as u32, 1, byte as u32).is_err() {
-                return index as u64;
-            }
-        }
-        return length as u64;
+    let mut bytes = if write { guest::read_bytes(buffer, length as usize) } else { alloc::vec![0u8; length as usize] };
+    let transferred = kd_pci_config(bus, slot, offset, &mut bytes, write);
+    if !write {
+        guest::write_bytes(buffer, &bytes[..transferred as usize]);
     }
-    let mut bytes = alloc::vec::Vec::with_capacity(length as usize);
-    for index in 0..length {
-        match super::pci_config::read(bus, device, function, offset + index, 1) {
-            Ok(value) => bytes.push(value as u8),
-            Err(_) => break,
+    transferred as u64
+}
+
+/// O corpo das rotinas KdGetPciDataByOffset/KdSetPciDataByOffset da tabela
+/// (HalpKdReadPCIConfig/HalpKdWritePCIConfig) sobre um buffer do kernel:
+/// byte a byte a partir de `offset`, até o fim dos 256 bytes; devolve os
+/// bytes transferidos (0 com barramento, dispositivo ou função inválidos).
+/// O PCI BIOS do emulador x86 (XmGetPciData/XmSetPciData) chama por aqui.
+pub fn kd_pci_config(bus: u32, slot: u32, offset: u32, bytes: &mut [u8], write: bool) -> u32 {
+    let (device, function) = pci_location(slot);
+    if offset >= 256 || !super::pci_config::valid(bus, device, function) {
+        return 0;
+    }
+    let length = (bytes.len() as u32).min(256 - offset) as usize;
+    for (index, byte) in bytes[..length].iter_mut().enumerate() {
+        let register = offset + index as u32;
+        let done = if write {
+            super::pci_config::write(bus, device, function, register, 1, *byte as u32).is_ok()
+        } else {
+            super::pci_config::read(bus, device, function, register, 1).map(|value| *byte = value as u8).is_ok()
+        };
+        if !done {
+            return index as u32;
         }
     }
-    guest::write_bytes(buffer, &bytes);
-    bytes.len() as u64
+    length as u32
 }
 
 /// Linha do PIC legado de uma GSIV (as 16 primeiras são as IRQs ISA).
@@ -656,6 +668,13 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
 /// O endereço da tabela publicada (0 antes da inicialização da HAL).
 pub fn table_address() -> u64 {
     TABLE.load(Ordering::SeqCst)
+}
+
+/// O slot `field` (nome do campo do HAL_PRIVATE_DISPATCH) da tabela
+/// publicada tem um ponteiro (`HalPrivateDispatchTable->Campo != NULL`).
+pub fn has_routine(field: &str) -> bool {
+    let table = table_address();
+    table != 0 && SLOTS.iter().find(|slot| slot.1 == field).is_some_and(|&(offset, _, _)| output::<u64>(table + offset).get() != 0)
 }
 
 /// Célula do export de dados HalPrivateDispatchTable na imagem do kernel

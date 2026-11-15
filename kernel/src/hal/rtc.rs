@@ -1,6 +1,29 @@
 //! Relógio de tempo real via CMOS (portas 0x70/0x71).
+//!
+//! O índice (0x70) e o dado (0x71) formam uma transação: quem lê ou grava um
+//! registrador da CMOS o faz sob o lock da CMOS (o HalpSystemHardwareLock que
+//! o HalpAcquireCmosSpinLock do NT toma), com interrupções desligadas: o
+//! relógio e o emulador do BIOS de vídeo (`hal::x86bios`).
 
 use super::port;
+use crate::rtl::SpinLock;
+
+/// Lock da CMOS: uma transação índice + dado de cada vez.
+static CMOS_LOCK: SpinLock<()> = SpinLock::new(());
+
+/// Lê o registrador `register` da CMOS (índice em 0x70, dado em 0x71).
+pub fn cmos_read(register: u8) -> u8 {
+    let _held = CMOS_LOCK.lock();
+    port::write8(0x70, register);
+    port::read8(0x71)
+}
+
+/// Grava o registrador `register` da CMOS.
+pub fn cmos_write(register: u8, value: u8) {
+    let _held = CMOS_LOCK.lock();
+    port::write8(0x70, register);
+    port::write8(0x71, value);
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RealTime {
@@ -10,11 +33,6 @@ pub struct RealTime {
     pub hour: u8,
     pub minute: u8,
     pub second: u8,
-}
-
-fn cmos_read(register: u8) -> u8 {
-    port::write8(0x70, register);
-    port::read8(0x71)
 }
 
 fn bcd(value: u8) -> u8 {
