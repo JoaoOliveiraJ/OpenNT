@@ -11,7 +11,7 @@ use crate::status::toml;
 const COMPONENTS: &str = "docs/status/components.toml";
 
 /// A suíte completa de autoteste, rodada com 4 CPUs e com 1 (`--smp`).
-const SUITE: &[&str] = &[
+pub const SUITE: &[&str] = &[
     "PHASE3_SELFTEST_OK",
     "900000",
     "--kernel-test-scope=all",
@@ -23,7 +23,7 @@ const SUITE: &[&str] = &[
     "--expect=KBDTEST_OK",
     "--expect=SELFTEST_OK",
 ];
-const SUITE_CPUS: &[u32] = &[4, 1];
+pub const SUITE_CPUS: &[u32] = &[4, 1];
 
 /// Folga sobre o prazo e o `--hold` do test-boot antes de dar o processo
 /// como travado.
@@ -58,8 +58,8 @@ impl Test {
         let mut command = vec![String::from("test-boot")];
         command.extend(arguments.iter().cloned());
         let parsed = crate::parse(command).map_err(|error| format!("teste {id}: {error}"))?;
-        if parsed.build_only || parsed.no_build || parsed.build.windows_dir.is_some() {
-            return Err(format!("teste {id}: --windows-dir, --build-only e --no-build sao escolhidos pelo test-all"));
+        if parsed.build_only || parsed.no_build || parsed.build.windows_dir.is_some() || parsed.capture.is_some() {
+            return Err(format!("teste {id}: --windows-dir, --build-only, --no-build e --capture sao escolhidos pelo test-all"));
         }
         let (_, timeout_ms) = crate::marker_and_timeout(&parsed).map_err(|error| format!("teste {id}: {error}"))?;
         let mut options = crate::test_build_options(&parsed);

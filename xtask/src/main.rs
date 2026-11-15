@@ -4,8 +4,9 @@
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
-//!                        [--build-only|--no-build] [--kd=com2 --script=ARQ]
+//!                        [--build-only|--no-build] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
+//! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
@@ -29,6 +30,7 @@ mod hive_image;
 mod kernel_pe;
 mod nt_types;
 mod ntfs_image;
+mod png;
 mod qemu;
 mod windows_binaries;
 mod status;
@@ -44,11 +46,12 @@ use std::time::Duration;
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|debug|status|nt-types> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
   test-all   suites e todos os [[teste]] do components.toml em paralelo (cargo xtask test-all --help)
+  capturas   roda cada [[teste]] e grava a tela do fim em docs/site/capturas/<id>.png (cargo xtask capturas --help)
   debug      depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
              (--connect=HOST:PORTA so conecta; --script=ARQ roda o roteiro como teste;
              --launch --no-client so compila e abre o QEMU para outro cliente, com
@@ -65,7 +68,8 @@ opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
-                   --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)";
+                   --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
+                   --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)";
 
 struct Arguments {
     command: String,
@@ -86,6 +90,8 @@ struct Arguments {
     no_client: bool,
     /// `debug --no-client --headless`: o QEMU sem janela.
     headless: bool,
+    /// `--capture=ARQ.png`: a tela do fim do test-boot.
+    capture: Option<PathBuf>,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -120,6 +126,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         connect: None,
         no_client: false,
         headless: false,
+        capture: None,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -151,6 +158,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--launch" if parsed.command == "debug" => {}
             "--no-client" if parsed.command == "debug" => parsed.no_client = true,
             "--headless" if parsed.command == "debug" => parsed.headless = true,
+            "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -180,6 +188,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if (parsed.build_only || parsed.no_build) && parsed.command != "test-boot" {
         return Err("--build-only e --no-build sao opcoes do test-boot".into());
+    }
+    if parsed.capture.is_some() && (parsed.command != "test-boot" || parsed.build_only) {
+        return Err("--capture e opcao do test-boot que roda o QEMU".into());
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
@@ -258,6 +269,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     keys: arguments.keys,
                     expect: arguments.expect,
                     hold: Duration::from_millis(arguments.hold_ms),
+                    capture: arguments.capture.map(|path| if path.is_absolute() { path } else { build::workspace_root().join(path) }),
                 },
                 &log,
                 session,
@@ -332,12 +344,13 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    // `status`, `nt-types` e `test-all` têm opções próprias; os dois
+    // `status`, `nt-types`, `test-all` e `capturas` têm opções próprias; os dois
     // primeiros não compilam o kernel.
     let result = match arguments.first().map(String::as_str) {
         Some("status") => status::run(&arguments[1..]),
         Some("nt-types") => nt_types::run(&arguments[1..]),
         Some("test-all") => test_all::run(&arguments[1..]),
+        Some("capturas") => test_all::capture(&arguments[1..]),
         _ => parse(arguments).and_then(execute),
     };
     match result {

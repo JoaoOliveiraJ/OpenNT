@@ -6,7 +6,8 @@
 //! depurador do kernel (`--kd`), a segunda porta serial (COM2) vira um
 //! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
 //! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
-//! `test-boot` e a falha dela derruba o teste.
+//! `test-boot` e a falha dela derruba o teste. Com `--capture=ARQ.png`, o
+//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -149,6 +150,122 @@ pub struct TestOptions {
     /// Depois da última saída esperada, o sistema segue rodando por este
     /// tempo sem nenhuma falha na serial (`--hold=MS`).
     pub hold: Duration,
+    /// `--capture=ARQ.png`: no fim do teste (passando ou não), a tela do
+    /// QEMU vai para este PNG, pelo `screendump` do QMP.
+    pub capture: Option<PathBuf>,
+}
+
+/// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
+const CAPTURE_LIMIT: usize = 60 * 1024;
+
+/// Uma linha de resposta do QMP que não é evento: `return` ou `error`.
+fn qmp_reply(reader: &mut impl std::io::BufRead) -> Result<String, String> {
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).map_err(|error| format!("QMP: {error}"))? == 0 {
+            return Err("QMP: conexao fechada".into());
+        }
+        if line.contains("\"return\"") {
+            return Ok(line);
+        }
+        if line.contains("\"error\"") {
+            return Err(format!("QMP: {}", line.trim()));
+        }
+    }
+}
+
+/// Grava a tela do QEMU em PPM pelo `screendump` do QMP (o QEMU desta
+/// máquina não grava PNG: falta a libpng).
+fn qmp_screendump(port: u16, path: &Path) -> Result<(), String> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| format!("QMP: {error}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|error| error.to_string())?;
+    let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut greeting = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut greeting).map_err(|error| format!("QMP: {error}"))?;
+    if !greeting.contains("\"QMP\"") {
+        return Err(format!("QMP: saudacao inesperada: {}", greeting.trim()));
+    }
+    writer.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").map_err(|error| format!("QMP: {error}"))?;
+    qmp_reply(&mut reader)?;
+    let file = path.display().to_string().replace('\\', "/").replace('"', "\\\"");
+    writer
+        .write_all(format!("{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{file}\"}}}}\n").as_bytes())
+        .map_err(|error| format!("QMP: {error}"))?;
+    qmp_reply(&mut reader).map(|_| ())
+}
+
+/// As linhas da serial que provam o teste: a de cada saída esperada (na
+/// ordem em que o test-boot as procura) e as últimas, sem linhas vazias nem
+/// os despejos em hexa das caixas pretas; `...` marca o que ficou de fora.
+fn serial_proof(serial: &str, needles: &[&str]) -> String {
+    const TAIL: usize = 6;
+    const WIDTH: usize = 160;
+    let lines: Vec<&str> = serial
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty() && !line.starts_with("KERNEL_BLACKBOX_BYTES"))
+        .collect();
+    let mut chosen = Vec::new();
+    let mut from = 0;
+    for needle in needles {
+        let found = lines[from..].iter().position(|line| line.contains(needle)).map(|offset| from + offset);
+        if let Some(index) = found.or_else(|| lines.iter().position(|line| line.contains(needle))) {
+            chosen.push(index);
+            from = index;
+        }
+    }
+    chosen.extend(lines.len().saturating_sub(TAIL)..lines.len());
+    chosen.sort_unstable();
+    chosen.dedup();
+    let mut text = String::new();
+    let mut previous: Option<usize> = None;
+    for index in chosen {
+        if previous.map_or(index > 0, |previous| previous + 1 != index) {
+            text.push_str("...\n");
+        }
+        let line = lines[index];
+        text.extend(line.chars().take(WIDTH));
+        if line.chars().count() > WIDTH {
+            text.push_str("...");
+        }
+        text.push('\n');
+        previous = Some(index);
+    }
+    text
+}
+
+/// A captura do fim do teste: PPM do QEMU -> PNG pequeno, com a data, o
+/// resultado e as linhas da serial que provam o teste nos textos do PNG (o
+/// `cargo xtask status` os mostra).
+fn capture_screen(port: u16, target: &Path, result: &Result<(), String>, serial: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let ppm = target.with_extension("ppm");
+    qmp_screendump(port, &ppm)?;
+    let bytes = std::fs::read(&ppm).map_err(|error| format!("{}: {error}", ppm.display()))?;
+    let _ = std::fs::remove_file(&ppm);
+    let image = crate::png::read_ppm(&bytes)?;
+    let outcome = match result {
+        Ok(()) => "passou".to_string(),
+        Err(error) => format!("falhou: {error}"),
+    };
+    let date = crate::png::today();
+    let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-serial", serial)];
+    let png = crate::png::encode_capture(&image, &texts, CAPTURE_LIMIT);
+    std::fs::write(target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
+    let info = crate::png::read_info(&png).ok_or("PNG gerado ilegivel")?;
+    println!(
+        "captura: {} ({}x{} de {}x{}, {} bytes)",
+        target.display(),
+        info.width,
+        info.height,
+        image.width,
+        image.height,
+        png.len()
+    );
+    Ok(())
 }
 
 /// Nome do `sendkey` do HMP para um caractere.
@@ -260,6 +377,15 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         "-monitor".to_string(),
         format!("tcp:127.0.0.1:{port},server=on,wait=off"),
     ]);
+    // O QMP só entra com a captura: o `screendump` sai por ele.
+    let qmp_port = match test.capture {
+        Some(_) => {
+            let qmp = free_port()?;
+            arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{qmp},server=on,wait=off")]);
+            Some(qmp)
+        }
+        None => None,
+    };
     arguments.extend(kd_serial(machine));
     let mut child = Command::new(&qemu)
         .args(&arguments)
@@ -363,6 +489,18 @@ pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log
         },
         (result, _) => result,
     };
+    // A captura sai com o QEMU ainda vivo, passe o teste ou não; se ela
+    // falhar, o resultado do teste não muda.
+    if let (Some(target), Some(qmp)) = (&test.capture, qmp_port) {
+        let alive = matches!(process.0.try_wait(), Ok(None));
+        let mut needles = vec![test.marker.as_str()];
+        needles.extend(test.expect.iter().map(String::as_str));
+        let serial = serial_proof(&output.lock().unwrap(), &needles);
+        let captured = if alive { capture_screen(qmp, target, &result, &serial) } else { Err("o QEMU ja tinha terminado".into()) };
+        if let Err(error) = captured {
+            eprintln!("aviso: sem captura de tela ({}): {error}", target.display());
+        }
+    }
     drop(process);
     let text = output.lock().unwrap().clone();
     std::fs::write(log, &text).map_err(|error| format!("{}: {error}", log.display()))?;

@@ -24,6 +24,11 @@
 //! `espera_falha = true` marca um teste que falha conhecidamente (sai à
 //! parte, sem reprovar a rodada); `coberto_pela_suite = true` marca um teste
 //! cujos marcadores as suítes já conferem (só roda com `--only`).
+//!
+//! `cargo xtask capturas` usa a mesma máquina para as capturas de tela das
+//! páginas: roda cada `[[teste]]` (sem as suítes, com os cobertos por elas)
+//! e passa ao `test-boot --no-build` o `--capture=docs/site/capturas/<id>.png`,
+//! que grava a tela do QEMU no fim do teste, passando ou não.
 
 mod host;
 mod plan;
@@ -58,6 +63,19 @@ pub const USAGE: &str = "uso: cargo xtask test-all [opcoes]
 cada execucao fica em build/test-all/<id> (ou <id>.<n> com --repeat): build.log, test-boot.log, serial.log
 as opcoes aceitam --nome=valor ou --nome valor";
 
+pub const CAPTURE_USAGE: &str = "uso: cargo xtask capturas [opcoes]
+  roda cada [[teste]] de docs/status/components.toml (inclusive os coberto_pela_suite, sem as suites)
+  e grava a tela do QEMU no fim de cada um em docs/site/capturas/<id>.png (passando ou nao)
+  --jobs=N          execucoes em paralelo (padrao: metade das CPUs)
+  --only=ID[,ID]    so estes testes
+  --skip=ID[,ID]    deixa estes de fora
+  --keep            guarda a pasta de toda execucao
+  --cpu-friendly    prioridade abaixo do normal e 4 CPUs logicas livres (Windows)
+  --list            mostra os testes e os comandos, sem rodar";
+
+/// Pasta das capturas de tela, relativa à raiz do workspace.
+pub const CAPTURE_DIR: &str = "docs/site/capturas";
+
 /// Pasta das execuções, relativa à raiz do workspace.
 const OUTPUT_DIR: &str = "build/test-all";
 /// Imagens prontas esperando uma pista: o build adianta pouco, para não
@@ -81,7 +99,9 @@ struct Options {
     list: bool,
 }
 
-fn parse_options(arguments: &[String]) -> Result<Options, String> {
+/// Opções do `test-all`, ou do `capturas` (`capture`), que não aceita
+/// `--repeat`, `--suite` e `--no-suite`.
+fn parse_options(arguments: &[String], capture: bool) -> Result<Options, String> {
     let mut options = Options {
         jobs: None,
         only: Vec::new(),
@@ -106,6 +126,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             _ => Err(format!("{name} espera um numero maior que zero ({text} recebido)")),
         };
         match name {
+            "--repeat" | "--suite" | "--no-suite" if capture => return Err(format!("{name} nao vale no capturas\n{CAPTURE_USAGE}")),
+            "--help" | "-h" if capture => return Err(CAPTURE_USAGE.to_string()),
             "--jobs" | "-j" => options.jobs = Some(number(value()?)?),
             "--only" => options.only.extend(ids(value()?)),
             "--skip" => options.skip.extend(ids(value()?)),
@@ -124,7 +146,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                 options.suites = if name == "--suite" { Suites::Only } else { Suites::Excluded };
             }
             "--help" | "-h" => return Err(USAGE.to_string()),
-            _ => return Err(format!("opcao desconhecida: {argument}\n{USAGE}")),
+            _ => return Err(format!("opcao desconhecida: {argument}\n{}", if capture { CAPTURE_USAGE } else { USAGE })),
         }
     }
     if suite_flag && !options.only.is_empty() {
@@ -161,6 +183,8 @@ struct Context {
     memory_gate: Mutex<()>,
     /// QEMUs rodando agora.
     running: AtomicUsize,
+    /// `capturas`: a pasta dos PNG de cada teste.
+    capture: Option<PathBuf>,
 }
 
 impl Context {
@@ -177,12 +201,17 @@ impl Context {
     fn test_boot(&self, test: &Test, directory: &Path, stage: &str, log: &Path) -> Result<Child, String> {
         let file = File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
         let errors = file.try_clone().map_err(|error| format!("{}: {error}", log.display()))?;
-        Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .arg("test-boot")
             .args(&test.arguments)
             .arg(format!("--build-dir={}", directory.display()))
             .arg(format!("--windows-dir={}", self.root.join(OUTPUT_DIR).join("windows").display()))
-            .arg(stage)
+            .arg(stage);
+        if let (Some(capture), "--no-build") = (&self.capture, stage) {
+            command.arg(format!("--capture={}", capture.join(format!("{}.png", test.id)).display()));
+        }
+        command
             .stdin(Stdio::null())
             .stdout(file)
             .stderr(errors)
@@ -326,6 +355,12 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
                     Err(_) => started.elapsed(),
                 };
                 let console = report::read_lossy(&directory.join("test-boot.log")).unwrap_or_default();
+                if context.capture.is_some() {
+                    // A pasta de quem passou some: o que a captura disse vem para cá.
+                    for line in console.lines().filter(|line| line.starts_with("captura:") || line.starts_with("aviso: sem captura")) {
+                        context.console.say(&format!("{:<14} {}", run.name, line.trim()));
+                    }
+                }
                 // A serial do test-boot; sem ela (processo morto), a saída
                 // dele, que também traz a serial.
                 let serial = report::read_lossy(&directory.join("serial.log"));
@@ -379,10 +414,27 @@ fn list(context: &Context, chosen: &[usize]) {
 }
 
 pub fn run(arguments: &[String]) -> Result<(), String> {
-    let options = parse_options(arguments)?;
+    run_with(parse_options(arguments, false)?, false)
+}
+
+/// `cargo xtask capturas`: cada `[[teste]]` com `--capture`.
+pub fn capture(arguments: &[String]) -> Result<(), String> {
+    let mut options = parse_options(arguments, true)?;
+    options.suites = Suites::Excluded;
+    run_with(options, true)
+}
+
+fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     let root = build::workspace_root();
     let tests = plan::load(&root)?;
+    if capture && options.only.is_empty() {
+        // Todos os [[teste]], inclusive os que só as suítes rodam.
+        options.only = tests.iter().filter(|test| !test.suite).map(|test| test.id.clone()).collect();
+    }
     let chosen = plan::select(&tests, &options.only, &options.skip, options.suites)?;
+    if capture && chosen.iter().any(|&index| tests[index].suite) {
+        return Err("as suites nao tem captura: escolha ids de [[teste]]".into());
+    }
     let runs = plan::runs(&tests, &chosen, options.repeat);
     let width = runs.iter().map(|run| run.name.len()).max().unwrap_or(0);
     let executable = std::env::current_exe().map_err(|error| format!("executavel do xtask: {error}"))?;
@@ -396,6 +448,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         width,
         memory_gate: Mutex::new(()),
         running: AtomicUsize::new(0),
+        capture: capture.then(|| build::workspace_root().join(CAPTURE_DIR)),
     };
     if options.list {
         list(&context, &chosen);
@@ -455,9 +508,51 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     };
     outcomes.sort_by_key(|outcome| order(&outcome.name));
     let failed = report::summary(&outcomes, context.console.started.elapsed());
+    if let Some(directory) = &context.capture {
+        return capture_report(&context, directory);
+    }
     if failed > 0 {
         Err(format!("test-all: {failed} de {} execucoes falharam", outcomes.len()))
     } else {
         Ok(())
+    }
+}
+
+/// As capturas desta rodada: o que cada uma registrou e as que faltaram
+/// (um teste cujo QEMU morreu antes da tela). Uma falha de teste não
+/// reprova o `capturas`: a tela da falha é a captura dele.
+fn capture_report(context: &Context, directory: &Path) -> Result<(), String> {
+    let started = std::time::SystemTime::now() - context.console.started.elapsed();
+    let mut missing = Vec::new();
+    println!();
+    println!("capturas em {CAPTURE_DIR}/:");
+    let mut seen: Vec<&str> = Vec::new();
+    for run in &context.runs {
+        let id = context.tests[run.test].id.as_str();
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        let path = directory.join(format!("{id}.png"));
+        let fresh = fs::metadata(&path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= started);
+        let info = fs::read(&path).ok().and_then(|bytes| crate::png::read_info(&bytes).map(|info| (info, bytes.len())));
+        match (fresh, info) {
+            (true, Some((info, size))) => println!(
+                "  {id:<20} {}x{} {:>6} bytes  {}",
+                info.width,
+                info.height,
+                size,
+                info.text("opennt-resultado").unwrap_or("-")
+            ),
+            _ => {
+                println!("  {id:<20} SEM CAPTURA NOVA");
+                missing.push(id.to_string());
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("capturas: {} sem captura nova: {}", missing.len(), missing.join(", ")))
     }
 }
