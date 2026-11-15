@@ -8,7 +8,9 @@
 //! IopMountVolume, com o IRP_MN_MOUNT_VOLUME ao file system registrado),
 //! ZwReadFile (IRP_MJ_READ ao dispositivo de volume do file system, que lê
 //! pelo Cache Manager) e ZwClose. Os bytes são comparados com os que o
-//! leitor NTFS do kernel lê do mesmo arquivo. A serial mostra cada passo e,
+//! leitor NTFS do kernel lê do mesmo arquivo. Depois um arquivo novo é
+//! criado (FILE_OVERWRITE_IF), gravado, fechado, reaberto e lido de volta
+//! pelo file system (`FILE_SYSTEM_WRITE_OK`). A serial mostra cada passo e,
 //! no fim, `FILE_SYSTEM_MOUNT_OK name=<serviço>` ou a falha.
 //!
 //! `run` (fase 6) cobre o mesmo caminho com dois file systems sintéticos
@@ -31,8 +33,11 @@ use crate::ntos::test::phase6::call_export;
 /// O arquivo de texto que o xtask grava na raiz do volume.
 const KNOWN_FILE: &str = "HELLO.TXT";
 const FILE_GENERIC_READ: u64 = 0x0012_0089;
+const FILE_GENERIC_WRITE: u64 = 0x0012_0116;
+const FILE_ATTRIBUTE_NORMAL: u64 = 0x80;
 const FILE_SHARE_READ: u64 = 1;
 const FILE_OPEN: u64 = 1;
+const FILE_OVERWRITE_IF: u64 = 5;
 const FILE_SYNCHRONOUS_IO_NONALERT: u64 = 0x20;
 const FILE_NON_DIRECTORY_FILE: u64 = 0x40;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
@@ -116,7 +121,57 @@ fn mount_and_read() -> Result<(), alloc::string::String> {
     if closed != 0 {
         return Err(format!("ZwClose devolveu {closed:#x}"));
     }
-    Ok(())
+    write_and_read_back()
+}
+
+/// Um arquivo novo do volume: criado, gravado e fechado pelo file system
+/// (a escrita vai ao Cache Manager), depois reaberto e lido de volta.
+fn write_and_read_back() -> Result<(), alloc::string::String> {
+    use alloc::format;
+    const NEW_FILE: &str = "OPENNT-NOVO.TXT";
+    const CONTENT: &[u8] = b"Gravado pelo ntfs.sys sobre o volume do OpenNT.\r\n";
+    let block = guest::alloc_bytes(0x400);
+    let buffer = guest::alloc_bytes(0x1000);
+    let path = format!("\\Device\\{}\\{}", ata_volume::DEVICE_NAME, NEW_FILE);
+    let attributes = object_attributes(block, &path);
+    let (handle, iosb, offset) = (block + 0x300, block + 0x310, block + 0x320);
+    let result = (|| -> Result<(), alloc::string::String> {
+        let created = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ | FILE_GENERIC_WRITE, attributes, iosb, 0, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0]).unwrap_or(u64::MAX) as u32;
+        debug_print!("[fs-mount] ZwCreateFile({}, FILE_OVERWRITE_IF) -> {:#x}, Information {}", path, created, guest::read64(iosb + 8));
+        if created != 0 {
+            return Err(format!("criacao devolveu {created:#x}"));
+        }
+        let file_handle = guest::read64(handle);
+        guest::write_bytes(buffer, CONTENT);
+        guest::write64(offset, 0);
+        let written = call_export("ZwWriteFile", &[file_handle, 0, 0, 0, iosb, buffer, CONTENT.len() as u64, offset, 0]).unwrap_or(u64::MAX) as u32;
+        let count = guest::read64(iosb + 8);
+        let closed = call_export("ZwClose", &[file_handle]).unwrap_or(u64::MAX) as u32;
+        debug_print!("[fs-mount] ZwWriteFile -> {:#x}, {} bytes; ZwClose -> {:#x}", written, count, closed);
+        if written != 0 || count != CONTENT.len() as u64 || closed != 0 {
+            return Err(format!("escrita {written:#x} com {count} bytes, fechamento {closed:#x}"));
+        }
+        let opened = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0]).unwrap_or(u64::MAX) as u32;
+        if opened != 0 {
+            return Err(format!("reabertura devolveu {opened:#x}"));
+        }
+        let file_handle = guest::read64(handle);
+        guest::write_bytes(buffer, &[0u8; 0x100]);
+        guest::write64(offset, 0);
+        let read = call_export("ZwReadFile", &[file_handle, 0, 0, 0, iosb, buffer, 0x1000, offset, 0]).unwrap_or(u64::MAX) as u32;
+        let count = guest::read64(iosb + 8) as usize;
+        let bytes = guest::read_bytes(buffer, count.min(0x1000));
+        let closed = call_export("ZwClose", &[file_handle]).unwrap_or(u64::MAX) as u32;
+        debug_print!("[fs-mount] releitura -> {:#x}, {} bytes: {:?}; ZwClose -> {:#x}", read, count, core::str::from_utf8(&bytes).unwrap_or("<binario>"), closed);
+        if read != 0 || bytes != CONTENT || closed != 0 {
+            return Err(format!("releitura {read:#x} com {count} bytes diferentes do que foi gravado"));
+        }
+        debug_print!("FILE_SYSTEM_WRITE_OK {}", NEW_FILE);
+        Ok(())
+    })();
+    guest::free_bytes(buffer);
+    guest::free_bytes(block);
+    result
 }
 
 // ---- fase 6: o caminho de montagem com file systems sintéticos -------------
