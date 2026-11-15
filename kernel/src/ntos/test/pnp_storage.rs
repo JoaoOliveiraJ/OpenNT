@@ -211,7 +211,25 @@ fn tree_support(assert: Assert) {
     assert(first.as_ref().is_some_and(|list| list.resources[0].start == 0xF000) && second.as_ref().is_some_and(|list| list.resources[0].start == 0xE000), "pnp-storage: conflito na faixa preferida usa a alternativa");
     resources::release(0x7_7000_0001);
     resources::release(0x7_7000_0002);
-    let interrupt = resources::CmList { interface_type: 1, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::INTERRUPT, share: 1, flags: 1, start: 14, length: 14, extra: [u32::MAX, u32::MAX, 0] }] };
+    // Sob um barramento com janelas atribuídas (o PCI com o _CRS), o filho
+    // fica dentro delas e a janela do pai não colide com ele; o irmão
+    // colide com o filho.
+    use crate::ntos::io::pnp::devnode;
+    let (bus, child, sibling) = (0x7_7000_0010u64, 0x7_7000_0011u64, 0x7_7000_0012u64);
+    devnode::insert(devnode::DeviceNode::new(bus, 0, 1));
+    devnode::insert(devnode::DeviceNode::new(child, bus, 2));
+    devnode::insert(devnode::DeviceNode::new(sibling, bus, 2));
+    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
+    resources::reserve(bus, &window);
+    let anywhere = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice(0, 0xFFFF, 0x10)]]] };
+    let inside = resources::assign(child, &anywhere);
+    let next = resources::assign(sibling, &anywhere);
+    for owner in [bus, child, sibling] {
+        resources::release(owner);
+        let _ = devnode::remove(owner);
+    }
+    assert(inside.as_ref().is_some_and(|list| list.resources[0].start == 0xD000) && next.as_ref().is_some_and(|list| list.resources[0].start == 0xD010), "pnp-storage: o filho do barramento com janela fica dentro dela, sem colidir com a do pai");
+    let interrupt =resources::CmList { interface_type: 1, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::INTERRUPT, share: 1, flags: 1, start: 14, length: 14, extra: [u32::MAX, u32::MAX, 0] }] };
     let translated = resources::translate(&interrupt);
     assert(translated.resources[0].length == 0x2E && translated.resources[0].start == 14, "pnp-storage: IRQ 14 traduzida para o vetor 0x2E no IRQL 14");
     // A lista escrita e relida é a mesma.

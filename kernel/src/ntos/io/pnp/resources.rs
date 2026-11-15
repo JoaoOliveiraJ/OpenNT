@@ -10,7 +10,11 @@
 //!   de [Mínimo, Máximo], alinhada, sem conflito com as faixas exclusivas já
 //!   atribuídas a outros nós (CmResourceShareShared divide). Portas,
 //!   memória, IRQs, canais de DMA e números de barramento têm árbitros;
-//!   CmResourceTypeDevicePrivate passa direto para a lista.
+//!   CmResourceTypeDevicePrivate passa direto para a lista. Portas,
+//!   memória e números de barramento de um nó sob um barramento que recebeu
+//!   janelas desse tipo (o PCI com as do _CRS do PCI0) ficam dentro delas,
+//!   e as faixas dos ancestrais não colidem com as dos filhos, como no
+//!   árbitro do barramento que aloca os filhos nas janelas dele.
 //! - `translate` é o tradutor da HAL: portas e memória não mudam (PC, sem
 //!   janela de I/O deslocada); a IRQ de linha `n` (Level = Vector = n na lista
 //!   bruta) vira o vetor do IDT `0x20 + n` com IRQL `n`, a convenção da HAL
@@ -279,8 +283,41 @@ impl Requirements {
 /// Faixas atribuídas pelos árbitros: (PDO dono, recurso).
 static ASSIGNED: SpinLock<Vec<(u64, Resource)>> = SpinLock::new(Vec::new());
 
-/// A faixa [start, start+length) colide com uma atribuição exclusiva de outro nó.
-fn conflicts(owner: u64, resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
+/// O nó que pede e os ancestrais dele na árvore (o pai primeiro).
+struct Requester {
+    owner: u64,
+    ancestors: Vec<u64>,
+}
+
+impl Requester {
+    fn new(owner: u64) -> Requester {
+        let mut ancestors = Vec::new();
+        let mut current = crate::ntos::io::pnp::devnode::get(owner).map(|node| node.parent);
+        while let Some(parent) = current.filter(|&parent| parent != 0 && parent != owner && !ancestors.contains(&parent)) {
+            ancestors.push(parent);
+            current = crate::ntos::io::pnp::devnode::get(parent).map(|node| node.parent);
+        }
+        Requester { owner, ancestors }
+    }
+
+    /// As janelas do barramento que produz o tipo para o nó: as faixas do
+    /// primeiro ancestral com recursos desse tipo atribuídos (o barramento
+    /// PCI com as janelas do _CRS). Um árbitro de barramento aloca os filhos
+    /// dentro delas, e não contra elas; sem ancestral produtor, `None`.
+    fn windows(&self, resource_type: u8) -> Option<Vec<(u64, u64)>> {
+        let assigned = ASSIGNED.lock();
+        self.ancestors.iter().find_map(|&ancestor| {
+            let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
+            (!ranges.is_empty()).then_some(ranges)
+        })
+    }
+}
+
+/// A faixa [start, start+length) colide com uma atribuição exclusiva de
+/// outro nó; as janelas dos ancestrais (os barramentos acima do nó) não
+/// colidem com os filhos.
+fn conflicts(requester: &Requester, resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
+    let owner = requester.owner;
     let overlaps = |other: &Resource| {
         if other.resource_type != resource_type {
             return false;
@@ -291,11 +328,11 @@ fn conflicts(owner: u64, resource_type: u8, start: u64, length: u64, share: u8, 
         };
         start < other.start + other_length && other.start < start + length && !(share == SHARE_SHARED && other.share == SHARE_SHARED)
     };
-    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && overlaps(other)) || pending.iter().any(overlaps)
+    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && !requester.ancestors.contains(holder) && overlaps(other)) || pending.iter().any(overlaps)
 }
 
 /// A primeira posição livre de uma opção (None = não cabe).
-fn place(owner: u64, choice: &Choice, pending: &[Resource]) -> Option<Resource> {
+fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option<Resource> {
     let share = if choice.share == 0 { SHARE_DEVICE_EXCLUSIVE } else { choice.share };
     let make = |start: u64, length: u32, extra: [u32; 3]| Resource { resource_type: choice.resource_type, share, flags: choice.flags, start, length, extra };
     match choice.resource_type {
@@ -305,9 +342,11 @@ fn place(owner: u64, choice: &Choice, pending: &[Resource]) -> Option<Resource> 
                 return None;
             }
             let alignment = choice.alignment.max(1);
+            let windows = requester.windows(choice.resource_type);
+            let inside = |start: u64| windows.as_ref().is_none_or(|windows| windows.iter().any(|&(low, high)| start >= low && start + length <= high));
             let mut start = choice.minimum.div_ceil(alignment) * alignment;
             while start.checked_add(length - 1).is_some_and(|end| end <= choice.maximum) {
-                if !conflicts(owner, choice.resource_type, start, length, share, pending) {
+                if inside(start) && !conflicts(requester, choice.resource_type, start, length, share, pending) {
                     return Some(make(start, choice.length, [0; 3]));
                 }
                 start += alignment;
@@ -315,7 +354,7 @@ fn place(owner: u64, choice: &Choice, pending: &[Resource]) -> Option<Resource> 
             None
         }
         resource_type::INTERRUPT | resource_type::DMA => {
-            (choice.minimum..=choice.maximum).find(|&value| !conflicts(owner, choice.resource_type, value, 1, share, pending)).map(|value| {
+            (choice.minimum..=choice.maximum).find(|&value| !conflicts(requester, choice.resource_type, value, 1, share, pending)).map(|value| {
                 // Lista bruta: Level = Vector = a linha.
                 let affinity = if choice.affinity == 0 { u64::MAX } else { choice.affinity };
                 make(value, value as u32, [affinity as u32, (affinity >> 32) as u32, 0])
@@ -329,9 +368,10 @@ fn place(owner: u64, choice: &Choice, pending: &[Resource]) -> Option<Resource> 
 /// Arbitra os requisitos de `owner`: a lista bruta atribuída, ou None se
 /// nenhuma lista alternativa cabe. As faixas ficam registradas para o nó.
 pub fn assign(owner: u64, requirements: &Requirements) -> Option<CmList> {
+    let requester = Requester::new(owner);
     for alternative in &requirements.alternatives {
         let mut chosen: Vec<Resource> = Vec::new();
-        let fits = alternative.iter().all(|options| match options.iter().find_map(|choice| place(owner, choice, &chosen)) {
+        let fits = alternative.iter().all(|options| match options.iter().find_map(|choice| place(&requester, choice, &chosen)) {
             Some(resource) => {
                 chosen.push(resource);
                 true
