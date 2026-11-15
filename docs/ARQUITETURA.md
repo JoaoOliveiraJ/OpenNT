@@ -1056,7 +1056,8 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   pciide.sys de PCI\CC_0101. O ServiceBinary de um driver do repositório
   de drivers (`%13%`, como o BasicDisplay.sys) vai inteiro para o
   ImagePath (`\SystemRoot\System32\DriverStore\FileRepository\...`),
-  que o carregador resolve sob `\NTFS\Windows`.
+  que o carregador resolve sob o `\Windows` do volume do kernel
+  (`\Device\KernelVolume1\Windows`, o destino de `\SystemRoot`).
 - `resources.rs`: as listas do NT, os árbitros (primeira opção livre,
   alternativas, compartilhamento) e o tradutor da HAL (IRQ de linha `n` →
   vetor `0x20 + n`, IRQL `n`).
@@ -1288,8 +1289,29 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   configuração existe: STATUS_RETRY.
   Testes: `ntos/test/rtl_ranges_resources.rs`, `ntos/test/platform_support.rs`,
   `ntos/test/power_io_support.rs` e `ntos/test/device_removal.rs`.
+- **Volumes do kernel nos seus dispositivos** (`drivers/fs/volume_device.rs`):
+  como no NT, um volume é alcançado pelo seu dispositivo e por links, não
+  por um nome na raiz. O disco em memória e o leitor NTFS do segundo disco
+  IDE ficam em `\Device\KernelVolume0` e `\Device\KernelVolume1`
+  (DEVICE_OBJECTs FILE_DEVICE_DISK com VPB e DeviceLock), montados pelo
+  file system embutido do kernel: o VPB aponta um dispositivo de volume
+  FILE_DEVICE_DISK_FILE_SYSTEM (DRIVER_OBJECT `\FileSystem\KernelVolume`) e o
+  IopMountInitializeVpb o marca montado. `\FS` e `\??\C:` levam ao
+  primeiro, `\??\D:` e `\SystemRoot` (`...\Windows`) ao segundo; o nó do
+  dispositivo entrega o resto do nome ao volume (`object_manager::mount_device`),
+  e os nomes das fontes de imagem saem do dispositivo (`ntfs::nt_path`).
+  Todo FILE_OBJECT aberto num desses volumes (ZwCreateFile do kernel, as
+  fontes de imagem e os arquivos de usuário) nasce como o do IopParseDevice:
+  DeviceObject = o dispositivo real, Vpb = o VPB (uma referência até a
+  destruição) e FileName = o caminho no volume. O
+  IoGetBaseFileSystemDeviceObject e o IoGetRelatedDeviceObject chegam ao
+  dispositivo de volume (o FltMgr e a CI partem deles); o file system
+  embutido não tem pilha de IRP, então o I/O Manager responde no lugar as
+  operações desses arquivos (`information::related_device` dá 0 para eles)
+  e um IRP mandado ao dispositivo de volume termina com
+  STATUS_INVALID_DEVICE_REQUEST. Teste: `kernel_volume_devices` na fase 6.
 - **Arquivos dos volumes do kernel** (`io/file/lifetime.rs`): os volumes
-  internos (o disco em memória `\FS` e o NTFS) não têm driver de file
+  internos (o disco em memória e o NTFS) não têm driver de file
   system, então o registro de vida faz o papel do FCB: um estado por arquivo
   com o SHARE_ACCESS, a exclusão pendente e o SECTION_OBJECT_POINTERS do
   arquivo. Todo FILE_OBJECT aberto num desses volumes (ZwCreateFile do
@@ -1600,16 +1622,55 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     clipsp.sys pelo DllInitialize. O volume ATA responde o
     IOCTL_MOUNTDEV_QUERY_STABLE_GUID, que o FsRtlVolumeDeviceToCorrelationId
     pede na montagem.
-  - O CDO do ntfs.sys é \Ntfs, na raiz do namespace; como o volume do
-    kernel está montado em \NTFS (nomes sem diferença de caixa), o
-    IoCreateDevice do DriverEntry hoje devolve STATUS_OBJECT_NAME_COLLISION.
-    Com o CDO criado, a montagem pelo ntfs.sys real percorre o NtfsMountVolume inteiro
-    (reinício do LFS, checkpoint, $Secure, $Extend, $UpCase) e para na
-    limpeza final: sem o lazy writer, o último CcUninitializeCacheMap apaga
-    o cache map na hora e solta a referência do stream file, então o
-    IRP_MJ_CLOSE chega dentro do NtfsDeleteInternalAttributeStream (no
-    Windows ele vem depois, do lazy writer) e o NtfsMountVolume usa o SCB
-    já liberado.
+  - O CDO do ntfs.sys é \Ntfs, na raiz do namespace (o volume do kernel
+    fica no seu dispositivo, sem nome na raiz). O DriverEntry registra o
+    file system e o FltMgr se anexa ao CDO pela notificação de registro; o
+    IoGetDeviceObjectPointer que ele faz de \Device\NamedPipe leva o
+    IO_SECURITY_CONTEXT no IRP_MJ_CREATE (todo IRP_MJ_CREATE do I/O Manager
+    leva), e o ObQueryNameString acha objetos nomeados fora de \Device.
+    O mount pelo FltMgr chega ao NtfsFsdFileSystemControl, que posta a
+    montagem à FSP (ExQueueWorkItem) e devolve STATUS_PENDING; o FltMgr
+    espera, e o item roda no pump dessa espera. O NtfsMountVolume vai até o
+    fim: os streams internos sem PinAccess que ele solta ficam para o lazy
+    writer (o IRP_MJ_CLOSE vem depois, como no Windows) e o file system
+    anuncia a montagem (FsRtlNotifyVolumeEventEx); os itens de pós-montagem
+    (EFS, $Extend\$Deleted) rodam depois de o IopMountVolume soltar o
+    DeviceLock. O teste abre e lê HELLO.TXT pelo Cache Manager e cria,
+    grava, fecha, reabre e lê de volta um arquivo novo pelo ntfs.sys; o
+    lazy writer grava depois as páginas sujas pela sobreposição do volume.
+  - O ntfs.sys exige o espaço de nomes certo no $FILE_NAME: um nome só
+    Win32 (1) precisa do par curto do DOS (2), e o NtfsUpdateFileNameInParent
+    dá STATUS_FILE_CORRUPT_ERROR sem ele. O xtask (e o gravador NTFS do
+    kernel) grava os nomes 8.3 maiúsculos como Win32+DOS (3), como o NTFS,
+    e os demais no espaço POSIX (0).
+- **Itens de trabalho como worker threads** (`io/work_items.rs`): a fila
+  do ExQueueWorkItem/IoQueueWorkItem é drenada nos pumps de PASSIVE_LEVEL
+  de quem espera, com duas regras das worker threads do NT: um item não
+  começa enquanto outro roda na mesma CPU (uma worker que espera não roda
+  outros itens) e uma drenagem só roda os itens que já estavam na fila
+  quando ela começou. Assim quem espera pelo fim de um item (o FltMgr pela
+  montagem postada à FSP do NTFS) confere a espera antes de rodar os itens
+  enfileirados por ele — um deles pode esperar pelo que essa thread retém
+  (o DeviceLock da montagem em curso). Teste:
+  `work_items_one_worker_per_item` na fase 6.
+- **Lazy writer do Cache Manager** (`cc/lazy_writer.rs`): o
+  CcScheduleLazyWriteScan arma o ScanTimer (CcFirstDelay, 3 s; FastScan
+  acorda já), a DPC dele acorda a thread do lazy writer — uma thread de
+  sistema do Cc, na própria pilha, criada na primeira CcInitializeCacheMap,
+  cujas esperas (nos recursos do file system, nas escritas) bloqueiam de
+  verdade. A passada
+  (CcLazyWriteScan) faz o CcWriteBehind de cada mapa sujo ou à espera de
+  remoção: AcquireForLazyWrite(Wait=TRUE), escrita das páginas sujas,
+  ReleaseFromLazyWrite e, sem FILE_OBJECTs nem páginas sujas, a remoção do
+  SHARED_CACHE_MAP, que solta a referência do stream file — de onde vem o
+  IRP_MJ_CLOSE do file system. O último CcUninitializeCacheMap segue o
+  NT: mapa sem PinAccess e sem evento, com escrita em curso ou sujo fica
+  para o lazy writer (FALSE); os demais saem na hora (TRUE). Um mapa que
+  ganha páginas sujas agenda a passada, que se reagenda por CcIdleDelay
+  (1 s) enquanto houver trabalho; o CcWaitForCurrentLazyWriterActivity
+  pede uma passada rápida e espera o fim dela. Testes: os de Cc da fase 6
+  (`cc_cache_map_exports`, `cc_copy_exports`, `cc_pin_exports`,
+  `cc_flush_exports`, `cc_mdl_exports`).
 - **Pipes nomeados e mailslots pelos npfs.sys e msfs.sys reais**
   (`cm/service/inbox_drivers.rs`, `io/file/pipe_mailslot.rs`,
   `io/file/irp_service.rs`, a abertura de `ps/user/files.rs`):
