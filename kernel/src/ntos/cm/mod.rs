@@ -30,6 +30,7 @@ pub mod hive_services;
 pub mod network_defaults;
 pub mod notify;
 pub mod hw_description;
+pub mod inf_parse;
 pub mod key;
 pub mod lazy_flush;
 pub mod service;
