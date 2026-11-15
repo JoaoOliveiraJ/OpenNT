@@ -1,6 +1,9 @@
 //! Boot Graphics Kernel (Bgk): o lado do kernel da biblioteca gráfica de
 //! boot — o console de texto sobre o vídeo de boot que o condrv.sys usa
-//! quando o console vai para a tela de boot. Ver `console`.
+//! quando o console vai para a tela de boot (`console`) e a informação do
+//! vídeo de boot da classe SystemBootGraphicsInformation
+//! (`graphics_information`).
 
 pub mod console;
 pub mod exports;
+pub mod graphics_information;

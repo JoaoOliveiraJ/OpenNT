@@ -66,6 +66,8 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
             }
             return Ok(0);
         }
+        // SystemBootGraphicsInformation: a tela de boot (Bgk).
+        126 => return crate::ntos::bgk::graphics_information::query_system_information(output, length, returned),
         5 => {}
         _ => return Ok(0xC000_000D),
     }

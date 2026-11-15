@@ -2528,6 +2528,13 @@ fn zw_group_exports(assert: Assert) {
     assert(status(processes) == 0xC000_0004 && guest::read32(block + 0x2F0) > 256 && status(call_export("NtQuerySystemInformation", &[999, buffer, 8, 0])) == 0xC000_000D, "zw: ZwQuerySystemInformation dimensiona a lista de processos");
     guest::write_bytes(buffer, &[0xAA; 16]);
     assert(status(call_export("ZwQuerySystemInformation", &[117, buffer, 16, block + 0x2F0])) == 0 && guest::read64(buffer) == 0 && guest::read32(block + 0x2F0) == 16, "zw: classe 117 sem operacoes de certificado pendentes");
+    guest::write32(block + 0x2F0, 0);
+    guest::write_bytes(buffer, &[0xAA; 0x20]);
+    let boot_graphics = status(call_export("ZwQuerySystemInformation", &[126, buffer, 0x20, block + 0x2F0]));
+    let returned = guest::read32(block + 0x2F0);
+    guest::write32(block + 0x2F0, 0);
+    let short = status(call_export("ZwQuerySystemInformation", &[126, buffer, 0x10, block + 0x2F0]));
+    assert(boot_graphics == 0xC000_0001 && returned == 0x20 && guest::read64(buffer) == 0xAAAA_AAAA_AAAA_AAAA && short == 0xC000_0004 && guest::read32(block + 0x2F0) == 0x20, "zw: classe 126 (SystemBootGraphicsInformation) sem tela grafica de boot");
     assert(status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 0x40])) == 0 && at::<nt::SystemPowerCapabilities>(buffer).power_button_present.get() == 1 && at::<nt::SystemPowerCapabilities>(buffer).lid_present.get() == 0 && status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 8])) == 0xC000_0023, "zw: ZwPowerInformation (SystemPowerCapabilities)");
     let before = system_information::entropy_registrations().len();
     guest::write64(buffer, 0x1111);
