@@ -34,7 +34,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::Eprocess;
@@ -130,6 +130,87 @@ pub fn session_driver_initialized(name: &str, image_base: u64, status: u32) {
     }
 }
 
+/// O número de serviço do NtUserInitialize (0: ainda não lido).
+static USER_INITIALIZE_SERVICE: AtomicU32 = AtomicU32::new(0);
+static USER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// A base de um módulo no Ldr do processo corrente (PEB->Ldr, memória de
+/// usuário sondada a cada passo).
+fn user_module_base(name: &str) -> Option<u64> {
+    use crate::ntos::inc::types::{LdrDataTableEntry, ListEntry, Peb, PebLdrData};
+    use crate::ntos::ps::user::state;
+    // SAFETY: o EPROCESS corrente.
+    let peb = unsafe { Eprocess::at(process::get_current_process()) }.peb.get();
+    let ldr = state::user_struct::<Peb>(peb).and_then(|peb| peb.ldr.probe_get()).ok()?;
+    let links = core::mem::offset_of!(LdrDataTableEntry, in_load_order_links) as u64;
+    let head = ldr + core::mem::offset_of!(PebLdrData, in_load_order_module_list) as u64;
+    let mut link = state::user_struct::<ListEntry>(head).and_then(|head| head.flink.probe_get()).ok()?;
+    for _ in 0..256 {
+        if link == 0 || link == head {
+            break;
+        }
+        let entry = state::user_struct::<LdrDataTableEntry>(link - links).ok()?;
+        let (base, length, buffer) = (entry.dll_base.probe_get().ok()?, entry.base_dll_name.length.probe_get().ok()? as u64, entry.base_dll_name.buffer.probe_get().ok()?);
+        if state::try_read_user_wide_string(buffer, (length / 2).min(64)).is_ok_and(|module| module.eq_ignore_ascii_case(name)) {
+            return Some(base);
+        }
+        link = state::user_struct::<ListEntry>(link).and_then(|link| link.flink.probe_get()).ok()?;
+    }
+    None
+}
+
+/// O número de serviço de um stub de syscall exportado por um módulo do
+/// processo corrente (`mov r10, rcx; mov eax, número`).
+fn user_service_number(module: &str, export: &str) -> Option<u32> {
+    use crate::ntos::inc::types::{ImageDosHeader, ImageExportDirectory, ImageNtHeaders64};
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ps::user::state;
+    let base = user_module_base(module)?;
+    let nt = base + state::user_struct::<ImageDosHeader>(base).and_then(|dos| dos.e_lfanew.probe_get()).ok()? as u64;
+    let directory = state::user_struct::<ImageNtHeaders64>(nt).and_then(|headers| headers.optional_header.data_directory[0].virtual_address.probe_get()).ok()? as u64;
+    let exports = state::user_struct::<ImageExportDirectory>(base + directory).ok()?;
+    let (count, functions, names, ordinals) = (exports.number_of_names.probe_get().ok()?, exports.address_of_functions.probe_get().ok()? as u64, exports.address_of_names.probe_get().ok()? as u64, exports.address_of_name_ordinals.probe_get().ok()? as u64);
+    let wanted = export.as_bytes();
+    for index in 0..count.min(0x4000) as u64 {
+        let name = base + guest::try_read::<u32>(base + names + index * 4).ok()? as u64;
+        if !state::probe_user_read(name, wanted.len() as u64 + 1) || guest::try_read_bytes(name, wanted.len() + 1).ok()?.as_slice() != [wanted, &[0]].concat().as_slice() {
+            continue;
+        }
+        let ordinal = guest::try_read::<u16>(base + ordinals + index * 2).ok()? as u64;
+        let stub = base + guest::try_read::<u32>(base + functions + ordinal * 4).ok()? as u64;
+        if !state::probe_user_read(stub, 8) {
+            return None;
+        }
+        let code = guest::try_read_bytes(stub, 8).ok()?;
+        return (code[..4] == [0x4C, 0x8B, 0xD1, 0xB8]).then(|| u32::from_le_bytes([code[4], code[5], code[6], code[7]]));
+    }
+    None
+}
+
+/// Um serviço da tabela do win32k voltou ao modo usuário com `result`: o
+/// `USER_INITIALIZED` sai quando o NtUserInitialize do csrss.exe (o número
+/// do stub do win32u.dll dele) volta com sucesso.
+pub fn win32k_service_returned(service_number: u32, result: u64) {
+    if !boot_config::SMSS_BOOT || USER_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    if !image_name(process::get_current_process()).eq_ignore_ascii_case("csrss.exe") {
+        return;
+    }
+    let mut number = USER_INITIALIZE_SERVICE.load(Ordering::Acquire);
+    if number == 0 {
+        number = user_service_number("win32u.dll", "NtUserInitialize").unwrap_or(0);
+        USER_INITIALIZE_SERVICE.store(number, Ordering::Release);
+    }
+    if number == 0 || service_number != number {
+        return;
+    }
+    crate::debug_print!("[init] csrss.exe (pid {}): NtUserInitialize -> {:#x}", process::get_current_process_id(), result as u32);
+    if result as u32 == 0 && !USER_INITIALIZED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("USER_INITIALIZED");
+    }
+}
+
 /// A conversão em thread GUI (PsConvertToGuiThread) de uma thread do
 /// csrss.exe voltou com `status`: a primeira é anotada.
 pub fn gui_thread_converted(status: u32) {
@@ -172,4 +253,9 @@ pub fn win32k_requested(service_number: u32) {
     let child_id = CREATIONS.lock().iter().find(|creation| creation.child_pointer == current).map_or(0, |creation| creation.child_id);
     crate::debug_print!("[init] csrss.exe (pid {}) criado pelo smss.exe (pid {}); smss inicial (pid {}) e csrss vivos ao pedir o win32k", child_id, creator_id, initial.1);
     crate::debug_print!("SMSS_CSRSS_OK");
+    // `--trace-driver-api` no boot do smss: depois do portão, cada export
+    // que os drivers (o win32k, o dxgkrnl e o miniport) chamam é impresso.
+    if boot_config::TRACE_DRIVER_API {
+        crate::ntos::init::exports::set_api_trace(true);
+    }
 }

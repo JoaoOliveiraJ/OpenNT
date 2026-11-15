@@ -53,6 +53,27 @@ pub const ENABLED: bool = equals(option_env!("OPENNT_DISPLAY"), "basic");
 
 /// GUID_DEVINTERFACE_DISPLAY_ADAPTER {5b45201d-f2f2-4f3b-85bb-30ff1f953599}.
 const GUID_DEVINTERFACE_DISPLAY_ADAPTER: [u8; 16] = [0x1D, 0x20, 0x45, 0x5B, 0xF2, 0xF2, 0x3B, 0x4F, 0x85, 0xBB, 0x30, 0xFF, 0x1F, 0x95, 0x35, 0x99];
+/// GUID_DISPLAY_DEVICE_ARRIVAL {1ca05180-a699-450a-9a0c-de4fbe3ddd89}: o
+/// dxgkrnl registra a interface no DpiAddDevice e só a habilita no fim de
+/// um DpiFdoStartAdapter bem-sucedido (depois do DxgkDdiStartDevice).
+const GUID_DISPLAY_DEVICE_ARRIVAL: [u8; 16] = [0x80, 0x51, 0xA0, 0x1C, 0x99, 0xA6, 0x0A, 0x45, 0x9A, 0x0C, 0xDE, 0x4F, 0xBE, 0x3D, 0xDD, 0x89];
+static ADAPTER_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Observação de IoSetDeviceInterfaceState: a interface de chegada de
+/// dispositivo de vídeo de um adaptador do BasicDisplay habilitada é o
+/// adaptador iniciado pelo dxgkrnl (`ADAPTER_STARTED`).
+pub fn interface_enabled(class: &[u8; 16], link: &str) {
+    if !ENABLED || *class != GUID_DISPLAY_DEVICE_ARRIVAL || ADAPTER_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let started = pnp::tree::summary().into_iter().find(|(path, state, _, service)| service.as_deref() == Some("BasicDisplay") && *state == devnode::State::Started && link.to_uppercase().contains(&path.replace('\\', "#").to_uppercase()));
+    if let Some((path, _, _, _)) = started {
+        if !ADAPTER_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            debug_print!("[display] {}: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface {} habilitada", path, link);
+            debug_print!("ADAPTER_STARTED");
+        }
+    }
+}
 /// FILE_DEVICE_VIDEO.
 const FILE_DEVICE_VIDEO: u32 = 0x23;
 /// IRP_MJ_PNP.

@@ -1150,6 +1150,9 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
             STATE.lock().service_frame = previous;
         }
         trace_win32k_service(number, &packet, result);
+        if number & 0x1000 != 0 {
+            crate::ntos::init::initial_process::win32k_service_returned(number as u32, result);
+        }
     } else {
         trace_win32k_service(number, &[0; 4], result);
     }

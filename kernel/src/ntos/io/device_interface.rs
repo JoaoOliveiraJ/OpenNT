@@ -105,6 +105,9 @@ pub fn set_device_interface_state(link_pointer: u64, enabled: bool) -> u32 {
     // Chegada ou remoção só na transição, para os registros da classe.
     if changed {
         pnp_notify::notify_interface_change(enabled, &class, &link);
+        if enabled {
+            crate::drivers::video::display_stack::interface_enabled(&class, &link);
+        }
     }
     0
 }
