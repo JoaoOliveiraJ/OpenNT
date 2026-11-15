@@ -1409,8 +1409,8 @@ para = "O shell ainda não executa .exe e não há sessão de usuário."
 [[roda]]
 nome = "Rede pela placa e1000"
 grupo = "marco"
-faz = "O NDIS e o AFD sobem, mas nenhum pacote sai pela placa do QEMU."
-para = "Falta ligar o miniport E1G6032E.sys e o tcpip.sys terminar o DriverEntry."
+faz = "O NDIS, o TCP/IP e o AFD sobem, mas nenhum pacote sai pela placa do QEMU."
+para = "Falta ligar o miniport E1G6032E.sys à placa e1000."
 
 [[roda]]
 nome = "hal.dll"
@@ -1623,6 +1623,7 @@ para = "O DriverEntry devolve STATUS_NOT_FOUND: falta o banco de erratas (errata
 nome = "ndis.sys e netio.sys"
 grupo = "driver"
 teste = "ndis"
+estado = "roda"
 faz = "Importam um do outro e carregam juntos; o NetIO sobe o NMR, o NSI e a WFP, e o DriverEntry do NDIS tem sucesso."
 para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
 
@@ -1630,7 +1631,6 @@ para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
 nome = "afd.sys e tdi.sys"
 grupo = "driver"
 teste = "afd"
-estado = "parcial"
 faz = "O driver de sockets sobe depois do NDIS, com a tdi.sys carregada pelo import."
 para = "Sem placa de rede ligada, nenhum socket chega a ele."
 
@@ -1638,8 +1638,9 @@ para = "Sem placa de rede ligada, nenhum socket chega a ele."
 nome = "tcpip.sys e fwpkclnt.sys"
 grupo = "driver"
 teste = "tcpip"
-faz = "Carrega com o fltmgr.sys e a fwpkclnt.sys; o DriverEntry registra o NSI e a WFP."
-para = "Para no WfpAleCaptureSecurityInformation: o KeLowerIrql embutido (mov cr8) ainda não chega ao IRQL do kernel."
+estado = "roda"
+faz = "Sobe depois do NDIS, com o fltmgr.sys e a fwpkclnt.sys; o DriverEntry registra o NSI e a WFP e termina com sucesso (state=4)."
+para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
 
 [[roda]]
 nome = "E1G6032E.sys"
