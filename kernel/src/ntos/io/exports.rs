@@ -92,7 +92,7 @@ fn io_queue_work_item_ex(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn io_allocate_mdl(call: &Call) -> Result<u64, KernelError> {
-    Ok(mdl::allocate_mdl(call.arg(1), call.arg(2) as u32))
+    Ok(mdl::allocate_mdl_for_irp(call.arg(1), call.arg(2) as u32, call.arg(3) as u8 != 0, call.arg(5)))
 }
 fn io_free_mdl(call: &Call) -> Result<u64, KernelError> {
     mdl::free_mdl(call.arg(1));

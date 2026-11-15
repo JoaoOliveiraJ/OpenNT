@@ -44,9 +44,10 @@ pub enum Fill {
 }
 
 /// MDL das páginas de sistema [buffer, buffer+length): MmCreateMdl +
-/// MmBuildMdlForNonPagedPool (PAGES_LOCKED | SOURCE_IS_NONPAGED_POOL e os
-/// PFNs reais) com MappedSystemVa, para o MmGetSystemAddressForMdlSafe do
-/// driver devolver o próprio VA; leituras levam MDL_IO_PAGE_READ.
+/// MmBuildMdlForNonPagedPool (SOURCE_IS_NONPAGED_POOL e os PFNs reais) com
+/// MappedSystemVa, para o MmGetSystemAddressForMdlSafe do driver devolver o
+/// próprio VA, e MDL_PAGES_LOCKED, como num MDL de paginação; leituras levam
+/// MDL_IO_PAGE_READ.
 pub fn build_mdl(buffer: u64, length: u64, read: bool) -> u64 {
     let descriptor = mm_mdl::create(0, buffer, length);
     if descriptor == 0 {
@@ -57,6 +58,7 @@ pub fn build_mdl(buffer: u64, length: u64, read: bool) -> u64 {
     let mdl = unsafe { Mdl::at(descriptor) };
     mdl.process.set(0);
     mdl.mapped_system_va.set(buffer);
+    mdl.mdl_flags.set(mdl.mdl_flags.get() | layout::MDL_PAGES_LOCKED);
     if read {
         mdl.mdl_flags.set(mdl.mdl_flags.get() | layout::MDL_IO_PAGE_READ);
     }

@@ -204,12 +204,14 @@ pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, leng
                 irp.flags.set(IRP_BUFFERED_READ);
             }
         } else if flags & DO_DIRECT_IO != 0 {
-            // IoAllocateMdl + IopProbeAndLockPages: a memória do OpenNT já é residente.
+            // IoAllocateMdl + IopProbeAndLockPages: a memória do OpenNT já é
+            // residente; a sondagem põe os PFNs e MDL_PAGES_LOCKED.
             let descriptor = mdl::allocate_mdl(buffer, length);
             if descriptor == 0 {
                 irp_builder::free_irp(packet);
                 return Ok(0);
             }
+            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor);
             irp.mdl_address.set(descriptor);
         } else {
             irp.user_buffer.set(buffer);

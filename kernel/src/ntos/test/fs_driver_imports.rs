@@ -109,13 +109,9 @@ fn change_image_protection(assert: Assert) {
     let (base, size) = (image.image_base, image.size_of_image);
     let page = base + 0x1000;
     let mdl = call_export("IoAllocateMdl", &[page, 0x1000, 0, 0, 0]).unwrap_or(0);
+    // O MDL que o MmProbeAndLockPages deixa num endereço de sistema só tem
+    // MDL_PAGES_LOCKED entre os três bits baixos.
     call_export("MmProbeAndLockPages", &[mdl, 0, 0]);
-    // O MDL que o MmProbeAndLockPages do NT deixa num endereço de sistema só
-    // tem MDL_PAGES_LOCKED entre os três bits baixos; o IoAllocateMdl do
-    // OpenNT já o marca mapeado e de pool não paginado (mapeamento por
-    // identidade), então os dois bits saem aqui.
-    let flags = &at::<nt::Mdl>(mdl).mdl_flags;
-    flags.set(flags.get() & !5);
     let change = |address: u64, length: u64, mode: u64| call_export("MmChangeImageProtection", &[mdl, address, length, mode]);
     let executable = || paging::query_page(page, false).map(|query| !query.nx);
     let invalid = change(page, 0x1000, 3) == Some(signed_status(0xC000_000D)) && change(page, 0x1000, 0) == Some(signed_status(0xC000_000D));
@@ -134,8 +130,6 @@ fn change_image_protection(assert: Assert) {
     let pool = guest::alloc_bytes(0x2000);
     let pool_mdl = call_export("IoAllocateMdl", &[(pool + 0xFFF) & !0xFFF, 0x1000, 0, 0, 0]).unwrap_or(0);
     call_export("MmProbeAndLockPages", &[pool_mdl, 0, 0]);
-    let pool_flags = &at::<nt::Mdl>(pool_mdl).mdl_flags;
-    pool_flags.set(pool_flags.get() & !5);
     let not_image = call_export("MmChangeImageProtection", &[pool_mdl, page, 0x1000, 2]) == Some(signed_status(0xC000_0225));
     assert(entry != 0 && invalid && outside && busy && data_only && approved && settled && not_image, "fs-imports: MmChangeImageProtection valida o MDL e troca a execucao das paginas da imagem");
     let _ = sysload::set_image_protection(page, 0x1000, sysload::MM_EXECUTE_READWRITE);

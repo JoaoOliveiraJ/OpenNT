@@ -1952,7 +1952,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     mdl_header.start_va.set(buffer);
     mdl_header.byte_offset.set(0x10);
     mdl_header.byte_count.set(0x1800);
-    assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 6 && mdl_header.mapped_system_va.get() == mdl_header.start_va.get() + mdl_header.byte_offset.get() as u64, "mm: MmBuildMdlForNonPagedPool com PFNs reais e MappedSystemVa do pool");
+    assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 4 && mdl_header.mapped_system_va.get() == mdl_header.start_va.get() + mdl_header.byte_offset.get() as u64, "mm: MmBuildMdlForNonPagedPool com PFNs reais, MappedSystemVa do pool e sem MDL_PAGES_LOCKED");
     assert(call_export("MmMapLockedPagesSpecifyCache", &[descriptor, 0, 1, 0, 0, 16]) == Some(buffer + 0x10) && mdl_header.mdl_flags.get() & 1 == 1 && call_export("MmUnmapLockedPages", &[buffer + 0x10, descriptor]) == Some(0) && mdl_header.mdl_flags.get() & 1 == 0, "mm: mapeamento do MDL marcado e desfeito");
     assert(call_export("MmGetPhysicalAddress", &[buffer]) == Some(paging::translate(buffer)) && call_export("MmMapLockedPagesWithReservedMapping", &[buffer, 0, descriptor, 1]) == Some(0), "mm: endereco fisico e VA nao reservada recusada");
     let pages = call_export("MmAllocatePagesForMdl", &[0, u64::MAX, 0, 0x2000]).unwrap_or(0);
@@ -2794,11 +2794,33 @@ fn io_group_exports(assert: Assert) {
     call_export("IoSetActivityIdIrp", &[packet, block + 0x500]);
     let activity = call_export("IoGetActivityIdIrp", &[packet, block + 0x520]);
     assert(call_export("IoGetGenericIrpExtension", &[packet]) == Some(0x1234_5678) && status(activity) == 0 && guest::read_bytes(block + 0x520, 16) == [7u8; 16] && call_export("IoSetCancelRoutine", &[packet, 0xABC]) == Some(0) && call_export("IoSetCancelRoutine", &[packet, 0]) == Some(0xABC), "io: extensao generica, activity id e cancel routine do IRP");
+    // IoAllocateMdl só descreve o buffer: Size = 0x30 + 8 * páginas,
+    // MDL_ALLOCATED_FIXED_SIZE até 17 páginas e nada mais nos flags, sem PFNs
+    // nem VA de sistema; o MmBuildMdlForNonPagedPool descreve as páginas.
+    let span = |address: u64, length: u64| ((address & 0xFFF) + length + 0xFFF) >> 12;
+    let mdl = call_export("IoAllocateMdl", &[block + 0x800, 0x1000, 0, 0, packet]).unwrap_or(0);
+    let header = at::<nt::Mdl>(mdl);
+    let pages = span(block + 0x800, 0x1000);
+    let described = mdl != 0 && header.size.get() as u64 == 0x30 + 8 * pages && header.mdl_flags.get() == 0x8 && header.mapped_system_va.get() == 0 && (0..pages).all(|page| mdl_pfn(mdl, page) == 0) && header.start_va.get() == (block + 0x800) & !0xFFF && header.byte_count.get() == 0x1000 && header.byte_offset.get() == ((block + 0x800) & 0xFFF) as u32;
+    let linked = at::<nt::Irp>(packet).mdl_address.get() == mdl;
+    call_export("MmBuildMdlForNonPagedPool", &[mdl]);
+    let built = mdl_pfn(mdl, 0) == paging::translate((block + 0x800) & !0xFFF) / 0x1000 && header.mdl_flags.get() & 0xF == 0xC && header.mapped_system_va.get() == block + 0x800;
+    assert(described && linked && built, "io: IoAllocateMdl so descreve o buffer, liga ao IRP e o MmBuildMdlForNonPagedPool poe os PFNs");
+    // Buffer secundário no fim da cadeia; o MDL grande sai do pool sem flag.
+    let secondary = call_export("IoAllocateMdl", &[block, 0x12000, 1, 0, packet]).unwrap_or(0);
+    assert(secondary != 0 && at::<nt::Irp>(packet).mdl_address.get() == mdl && header.next.get() == secondary && at::<nt::Mdl>(secondary).mdl_flags.get() == 0 && at::<nt::Mdl>(secondary).size.get() as u64 == 0x30 + 8 * span(block, 0x12000), "io: IoAllocateMdl secundario no fim da cadeia do IRP");
+    // IoBuildPartialMdl herda os bits da origem, desloca a VA de sistema e
+    // copia os PFNs da janela.
+    let partial = call_export("IoAllocateMdl", &[block + 0x800, 0x100, 0, 0, 0]).unwrap_or(0);
+    call_export("IoBuildPartialMdl", &[mdl, partial, block + 0x900, 0x100]);
+    let window = at::<nt::Mdl>(partial);
+    let window_page = (((block + 0x900) & !0xFFF) - ((block + 0x800) & !0xFFF)) >> 12;
+    assert(partial != 0 && window.mdl_flags.get() == 0x8 | 0x10 | 0x4 && window.mapped_system_va.get() == block + 0x900 && window.byte_offset.get() == ((block + 0x900) & 0xFFF) as u32 && window.byte_count.get() == 0x100 && mdl_pfn(partial, 0) == mdl_pfn(mdl, window_page), "io: IoBuildPartialMdl herda os bits da origem");
+    at::<nt::Irp>(packet).mdl_address.set(0);
+    for descriptor in [partial, secondary, mdl] {
+        call_export("IoFreeMdl", &[descriptor]);
+    }
     assert(status(call_export("IoFreeIrp", &[packet])) == 0, "io: IoFreeIrp");
-    // MDL com os PFNs reais.
-    let mdl = call_export("IoAllocateMdl", &[block + 0x800, 0x1000, 0, 0, 0]).unwrap_or(0);
-    assert(mdl != 0 && mdl_pfn(mdl, 0) == paging::translate((block + 0x800) & !0xFFF) / 0x1000 && at::<nt::Mdl>(mdl).byte_count.get() == 0x1000 && at::<nt::Mdl>(mdl).byte_offset.get() == ((block + 0x800) & 0xFFF) as u32, "io: IoAllocateMdl com os PFNs das tabelas de pagina");
-    call_export("IoFreeMdl", &[mdl]);
     // Remove lock.
     let lock = block + 0x600;
     call_export("IoInitializeRemoveLockEx", &[lock, 0, 0, 0, 0x58]);

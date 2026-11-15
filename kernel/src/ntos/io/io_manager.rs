@@ -314,7 +314,11 @@ pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length
     let direct = matches!(major, irp_mj::READ | irp_mj::WRITE) && buffer != 0 && device_at(device).flags.get() & DO_DIRECT_IO != 0;
     builder::build(address, &BuildOptions { major, buffer: if direct { 0 } else { buffer }, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, ..Default::default() });
     if direct {
-        irp_at(address).mdl_address.set(super::mdl::allocate_mdl(buffer, length));
+        let descriptor = super::mdl::allocate_mdl(buffer, length);
+        if descriptor != 0 {
+            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor);
+        }
+        irp_at(address).mdl_address.set(descriptor);
     }
     address
 }

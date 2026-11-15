@@ -171,13 +171,14 @@ pub fn advance(descriptor: &Mdl, bytes: u32) -> u32 {
 
 /// MmBuildMdlForNonPagedPool: como o do ntoskrnl 19041 (rva 0x264870),
 /// Process = NULL e MappedSystemVa = StartVa + ByteOffset (o pool já está no
-/// espaço do sistema; um mapeamento anterior do MDL deixa de valer).
+/// espaço do sistema; um mapeamento anterior do MDL deixa de valer), os PFNs
+/// e só MDL_SOURCE_IS_NONPAGED_POOL: as páginas do pool não são travadas.
 pub fn build_for_non_paged_pool(descriptor: u64) {
     let descriptor = mdl(descriptor);
     descriptor.process.set(0);
     descriptor.mapped_system_va.set(descriptor.start_va.get() + descriptor.byte_offset.get() as u64);
     fill_pfn_array(descriptor);
-    set_flags(descriptor, MDL_SOURCE_IS_NONPAGED_POOL | MDL_PAGES_LOCKED, 0);
+    set_flags(descriptor, MDL_SOURCE_IS_NONPAGED_POOL, 0);
 }
 
 /// MmAllocateMappingAddress — VA reservada em páginas inteiras da arena

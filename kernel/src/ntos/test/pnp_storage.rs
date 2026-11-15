@@ -183,6 +183,7 @@ fn dma_adapter(assert: Assert) {
     assert(va != 0 && va & 0xFFF == 0 && guest::read64(logical) == crate::ntos::mm::paging::translate(va), "pnp-storage: buffer comum alinhado com endereco logico fisico");
     // MapTransfer e CalculateScatterGatherList num MDL do buffer comum.
     let mdl = crate::ntos::io::mdl::allocate_mdl(va + 0x100, 0x1000);
+    crate::ntos::mm::mdl::build_for_non_paged_pool(mdl);
     let length = guest::alloc_bytes(4);
     guest::write32(length, 0x1000);
     let physical = native_call::call(operations.map_transfer.get(), &[adapter, mdl, 0, va + 0x100, length, 0]);
