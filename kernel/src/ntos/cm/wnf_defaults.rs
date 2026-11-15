@@ -74,7 +74,20 @@ const KERNELBASE_SECOND_NOTIFICATION: (&str, &str) = (
     ),
 );
 
-pub const DEFINITIONS: [(&str, &str); 3] = [FEATURE_CONFIGURATION_CHANGED, KERNELBASE_NOTIFICATION, KERNELBASE_SECOND_NOTIFICATION];
+/// Nome permanente de escopo de máquina que o csrss.exe assina logo depois
+/// do NtUserInitialize (sem a definição, o NtSubscribeWnfStateChange devolve
+/// STATUS_OBJECT_NAME_NOT_FOUND e o csrss termina) — 76 bytes: o descritor
+/// de segurança e o tamanho máximo dos dados zero, sem GUID de tipo.
+const CSRSS_NOTIFICATION: (&str, &str) = (
+    "0096003DA3BC0875",
+    concat!(
+        "0100048000000000000000000000000014000000020034000200000000001800",
+        "0100000001020000000000052000000021020000000014000300000001010000",
+        "000000051200000000000000",
+    ),
+);
+
+pub const DEFINITIONS: [(&str, &str); 4] = [FEATURE_CONFIGURATION_CHANGED, KERNELBASE_NOTIFICATION, KERNELBASE_SECOND_NOTIFICATION, CSRSS_NOTIFICATION];
 
 pub fn decode(hex: &str) -> Vec<u8> {
     (0..hex.len() / 2).map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap_or(0)).collect()

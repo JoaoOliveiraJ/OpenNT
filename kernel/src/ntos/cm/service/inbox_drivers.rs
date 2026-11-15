@@ -51,6 +51,13 @@
 //! Owners (display.inf e basicdisplay.inf) e o Parameters\SingleDeviceInstall
 //! que o AddReg do basicdisplay.inf grava.
 //!
+//! O dispositivo de exibição desconectado do win32k (`\Device\Disc`, o da
+//! sessão sem console, como a sessão 0 dos serviços) aponta, pelo
+//! HARDWARE\DEVICEMAP\VIDEO que o próprio win32k grava, para
+//! `Services\TSDDD\Device0`; a instalação traz essa chave sem driver, só
+//! com InstalledDisplayDrivers = TSDDD e VgaCompatible = 0, e o win32k a
+//! abre ao criar o dispositivo (DrvSetDisconnectedGraphicsDevice).
+//!
 //! O CLFS (clfs.sys, Start 0 e Group "Filter" na instalação) fica sob
 //! demanda como os outros: ele sobe como dependência de import do ntfs.sys,
 //! e o DriverEntry dele lê Parameters (EventLogLevel, FlushThreshold e
@@ -159,6 +166,8 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\CLFS\\Parameters", "MasterFilePath", Installed::String("\\SystemRoot\\System32\\config")),
     ("Services\\BasicDisplay", "Owners", Installed::Strings(&["display.inf", "basicdisplay.inf"])),
     ("Services\\BasicDisplay\\Parameters", "SingleDeviceInstall", Installed::Dword(1)),
+    ("Services\\TSDDD\\Device0", "InstalledDisplayDrivers", Installed::Strings(&["TSDDD"])),
+    ("Services\\TSDDD\\Device0", "VgaCompatible", Installed::Dword(0)),
 ];
 
 /// As chaves dos drivers inbox, dos file systems e os valores do KMDF.
