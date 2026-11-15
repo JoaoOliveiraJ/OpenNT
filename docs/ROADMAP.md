@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **24 de 49** componentes funcionam; **551 de 774** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.882 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (61,3%).
+Hoje: **26 de 51** componentes funcionam; **551 de 774** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.882 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (61,3%).
 
 Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
 
@@ -61,7 +61,7 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| I/O Manager | Parcial | Autoteste de I/O e armazenamento, Teclado real |
+| I/O Manager | Parcial | Autoteste de I/O e armazenamento, Teclado real, Pipes nomeados e mailslots entre processos |
 | Console | Parcial | Boot completo, Teste do shell, Driver condrv.sys real |
 | Barramento PCI | Parcial | Autoteste de I/O e armazenamento |
 | Dispositivos da placa-mãe | Parcial | Autoteste de I/O e armazenamento |
@@ -108,6 +108,8 @@ Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bib
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
+| npfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
+| msfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
 | Modo usuário | Parcial | Autoteste do modo usuário |
 | ntdll.dll, KERNEL32 e KERNELBASE | Planejado | — |
 | Executáveis .exe (comando exec) | Planejado | — |
