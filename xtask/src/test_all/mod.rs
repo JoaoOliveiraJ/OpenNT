@@ -1,0 +1,395 @@
+//! `cargo xtask test-all` — a validação inteira num comando.
+//!
+//! Roda as duas suítes completas de autoteste (`suite-smp4` e `suite-smp1`)
+//! e cada `[[teste]]` de `docs/status/components.toml` (o `comando` de cada
+//! um é um `cargo xtask test-boot`), cada execução na própria pasta
+//! `build/test-all/<id>`:
+//!
+//! 1. uma thread monta as imagens, uma de cada vez (`test-boot
+//!    --build-only`), com as execuções de mesma configuração de build juntas:
+//!    o kernel só recompila quando as opções que ele embute mudam e nunca há
+//!    dois builds no mesmo `target/`. Os binários do Windows do bundle ficam
+//!    numa pasta só (`build/test-all/windows`), para o caminho dela não
+//!    recompilar o kernel;
+//! 2. `--jobs` pistas pegam as imagens prontas e rodam o QEMU (`test-boot
+//!    --no-build`), com a saída em `test-boot.log` e a serial em
+//!    `serial.log`; a pasta de uma execução que passou é apagada (`--keep`
+//!    guarda todas);
+//! 3. no fim, a tabela com o resultado de cada uma e, para cada falha, o
+//!    trecho da serial que a explica.
+//!
+//! `espera_falha = true` marca um teste que falha conhecidamente (sai à
+//! parte, sem reprovar a rodada); `coberto_pela_suite = true` marca um teste
+//! cujos marcadores as suítes já conferem (só roda com `--only`).
+
+mod host;
+mod plan;
+mod report;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::build;
+use plan::{Run, Suites, Test};
+use report::{Outcome, Verdict};
+
+pub const USAGE: &str = "uso: cargo xtask test-all [opcoes]
+  roda as suites completas (suite-smp4, suite-smp1) e os [[teste]] de docs/status/components.toml
+  --jobs=N          execucoes em paralelo (padrao: metade das CPUs)
+  --only=ID[,ID]    so estes testes (inclusive os coberto_pela_suite)
+  --skip=ID[,ID]    deixa estes de fora
+  --suite           so as duas suites; --no-suite: so os [[teste]]
+  --repeat=N        roda cada teste N vezes (falhas intermitentes)
+  --keep            guarda a pasta de toda execucao (padrao: so das que falharam)
+  --cpu-friendly    prioridade abaixo do normal e 4 CPUs logicas livres (Windows)
+  --list            mostra os testes e os comandos, sem rodar
+cada execucao fica em build/test-all/<id> (ou <id>.<n> com --repeat): build.log, test-boot.log, serial.log
+as opcoes aceitam --nome=valor ou --nome valor";
+
+/// Pasta das execuções, relativa à raiz do workspace.
+const OUTPUT_DIR: &str = "build/test-all";
+/// Imagens prontas esperando uma pista: o build adianta pouco, para não
+/// ocupar disco com pastas que ainda não rodam.
+const READY_AHEAD: usize = 1;
+
+struct Options {
+    jobs: Option<usize>,
+    only: Vec<String>,
+    skip: Vec<String>,
+    suites: Suites,
+    repeat: usize,
+    keep: bool,
+    cpu_friendly: bool,
+    list: bool,
+}
+
+fn parse_options(arguments: &[String]) -> Result<Options, String> {
+    let mut options = Options {
+        jobs: None,
+        only: Vec::new(),
+        skip: Vec::new(),
+        suites: Suites::Included,
+        repeat: 1,
+        keep: false,
+        cpu_friendly: false,
+        list: false,
+    };
+    let mut suite_flag = false;
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        let (name, inline) = match argument.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (argument.as_str(), None),
+        };
+        let mut value = || inline.clone().or_else(|| rest.next().cloned()).ok_or_else(|| format!("{name} exige um valor"));
+        let ids = |text: String| text.split(',').map(str::trim).filter(|id| !id.is_empty()).map(String::from).collect::<Vec<_>>();
+        let number = |text: String| match text.parse::<usize>() {
+            Ok(value) if value > 0 => Ok(value),
+            _ => Err(format!("{name} espera um numero maior que zero ({text} recebido)")),
+        };
+        match name {
+            "--jobs" | "-j" => options.jobs = Some(number(value()?)?),
+            "--only" => options.only.extend(ids(value()?)),
+            "--skip" => options.skip.extend(ids(value()?)),
+            "--repeat" => options.repeat = number(value()?)?,
+            "--keep" | "--suite" | "--no-suite" | "--cpu-friendly" | "--list" if inline.is_some() => {
+                return Err(format!("{name} nao aceita valor"));
+            }
+            "--keep" => options.keep = true,
+            "--cpu-friendly" => options.cpu_friendly = true,
+            "--list" => options.list = true,
+            "--suite" | "--no-suite" => {
+                if suite_flag {
+                    return Err("use --suite ou --no-suite, uma vez".into());
+                }
+                suite_flag = true;
+                options.suites = if name == "--suite" { Suites::Only } else { Suites::Excluded };
+            }
+            "--help" | "-h" => return Err(USAGE.to_string()),
+            _ => return Err(format!("opcao desconhecida: {argument}\n{USAGE}")),
+        }
+    }
+    if suite_flag && !options.only.is_empty() {
+        return Err("--only ja escolhe os testes; tire o --suite/--no-suite".into());
+    }
+    Ok(options)
+}
+
+/// Relógio da rodada no começo de cada linha.
+struct Console {
+    started: Instant,
+    lock: Mutex<()>,
+}
+
+impl Console {
+    fn say(&self, text: &str) {
+        let _guard = self.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seconds = self.started.elapsed().as_secs();
+        println!("[{:02}:{:02}] {text}", seconds / 60, seconds % 60);
+    }
+}
+
+/// Tudo o que as threads dividem.
+struct Context {
+    tests: Vec<Test>,
+    runs: Vec<Run>,
+    root: PathBuf,
+    executable: PathBuf,
+    keep: bool,
+    console: Console,
+    /// Largura da coluna de nomes nas linhas ao vivo.
+    width: usize,
+}
+
+impl Context {
+    fn directory(&self, run: &Run) -> PathBuf {
+        self.root.join(OUTPUT_DIR).join(&run.name)
+    }
+
+    /// O caminho como o integrador o vê, relativo à raiz.
+    fn relative(&self, run: &Run, file: &str) -> String {
+        format!("{OUTPUT_DIR}/{}/{file}", run.name)
+    }
+
+    /// Um `test-boot` do próprio xtask (sem passar de novo pelo cargo).
+    fn test_boot(&self, test: &Test, directory: &Path, stage: &str, log: &Path) -> Result<Child, String> {
+        let file = File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
+        let errors = file.try_clone().map_err(|error| format!("{}: {error}", log.display()))?;
+        Command::new(&self.executable)
+            .arg("test-boot")
+            .args(&test.arguments)
+            .arg(format!("--build-dir={}", directory.display()))
+            .arg(format!("--windows-dir={}", self.root.join(OUTPUT_DIR).join("windows").display()))
+            .arg(stage)
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(errors)
+            .spawn()
+            .map_err(|error| format!("{}: {error}", self.executable.display()))
+    }
+}
+
+/// Uma imagem montada (ou o erro do build), a caminho de uma pista.
+struct Prepared {
+    run: usize,
+    build: Result<Duration, String>,
+}
+
+/// Monta as imagens em sequência; um build que falhou não se repete para as
+/// outras execuções da mesma configuração.
+fn builder(context: &Context, ready: SyncSender<Prepared>) {
+    let mut failed: HashMap<&str, &str> = HashMap::new();
+    for (index, run) in context.runs.iter().enumerate() {
+        let test = &context.tests[run.test];
+        let started = Instant::now();
+        let build = match failed.get(test.build_key.as_str()) {
+            Some(first) => Err(format!("build falhou (mesma configuracao de {first})")),
+            None => prepare(context, run, test),
+        };
+        if build.is_err() {
+            failed.entry(test.build_key.as_str()).or_insert(run.name.as_str());
+        }
+        if ready.send(Prepared { run: index, build: build.map(|()| started.elapsed()) }).is_err() {
+            break;
+        }
+    }
+}
+
+fn prepare(context: &Context, run: &Run, test: &Test) -> Result<(), String> {
+    let directory = context.directory(run);
+    // A pasta de uma rodada anterior (com a serial velha) sai antes.
+    if directory.exists() {
+        fs::remove_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+    }
+    fs::create_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+    let mut child = context.test_boot(test, &directory, "--build-only", &directory.join("build.log"))?;
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("build falhou ({status})"))
+    }
+}
+
+/// Mata o test-boot e o QEMU que ele criou.
+fn kill_tree(child: &mut Child) {
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Roda o QEMU na imagem montada; `Ok(true)` se o test-boot passou.
+fn execute(context: &Context, run: &Run, test: &Test) -> Result<bool, String> {
+    let directory = context.directory(run);
+    let mut child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status.success());
+        }
+        if started.elapsed() > test.limit {
+            kill_tree(&mut child);
+            return Err(format!("o test-boot passou de {} sem terminar e foi morto", report::duration(test.limit)));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Uma pista: pega a próxima imagem pronta, roda e anota o resultado.
+fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<Vec<Outcome>>) {
+    loop {
+        let next = ready.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
+        let Ok(prepared) = next else { break };
+        let run = &context.runs[prepared.run];
+        let test = &context.tests[run.test];
+        let directory = context.directory(run);
+        let width = context.width;
+        let (passed, build, time, reason, excerpt, log) = match prepared.build {
+            Err(error) => {
+                let text = report::read_lossy(&directory.join("build.log")).unwrap_or_default();
+                (false, None, None, error, report::build_excerpt(&text), context.relative(run, "build.log"))
+            }
+            Ok(build) => {
+                context.console.say(&format!("{:<14} {:<width$}  (build {})", "rodando", run.name, report::duration(build)));
+                let started = Instant::now();
+                let result = execute(context, run, test);
+                let time = started.elapsed();
+                let console = report::read_lossy(&directory.join("test-boot.log")).unwrap_or_default();
+                // A serial do test-boot; sem ela (processo morto), a saída
+                // dele, que também traz a serial.
+                let serial = report::read_lossy(&directory.join("serial.log"));
+                let log = if serial.is_some() { context.relative(run, "serial.log") } else { context.relative(run, "test-boot.log") };
+                let excerpt = report::serial_excerpt(serial.as_deref().unwrap_or(&console));
+                match result {
+                    Ok(passed) => (passed, Some(build), Some(time), report::failure_reason(&console), excerpt, log),
+                    Err(error) => (false, Some(build), Some(time), error, excerpt, log),
+                }
+            }
+        };
+        let verdict = match (passed, test.expected_failure) {
+            (true, false) => Verdict::Passed,
+            (false, false) => Verdict::Failed,
+            (false, true) => Verdict::ExpectedFailure,
+            (true, true) => Verdict::UnexpectedPass,
+        };
+        if verdict.passed() && !context.keep {
+            let _ = fs::remove_dir_all(&directory);
+        }
+        let mut outcomes = outcomes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let shown = if verdict.passed() { String::new() } else { format!("  {log}") };
+        context.console.say(&format!(
+            "{:<14} {:<width$}  {}{shown}  ({}/{})",
+            verdict.label(),
+            run.name,
+            time.map(report::duration).unwrap_or_else(|| String::from("-")),
+            outcomes.len() + 1,
+            context.runs.len()
+        ));
+        let repeat_command = if build.is_some() { test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), "--no-build") } else { String::new() };
+        outcomes.push(Outcome { name: run.name.clone(), verdict, build, test: time, reason, excerpt, log, repeat_command });
+    }
+}
+
+fn list(context: &Context, chosen: &[usize]) {
+    for (index, test) in context.tests.iter().enumerate() {
+        let mark = if chosen.contains(&index) { "x" } else { " " };
+        let mut notes = Vec::new();
+        if test.expected_failure {
+            notes.push("espera falha");
+        }
+        if test.covered_by_suite {
+            notes.push("coberto pela suite");
+        }
+        let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) };
+        println!("[{mark}] {}{notes}", test.id);
+        println!("      {}", test.command_line(&format!("{OUTPUT_DIR}/{}", test.id), ""));
+    }
+    println!("{} de {} testes selecionados ([x])", chosen.len(), context.tests.len());
+}
+
+pub fn run(arguments: &[String]) -> Result<(), String> {
+    let options = parse_options(arguments)?;
+    let root = build::workspace_root();
+    let tests = plan::load(&root)?;
+    let chosen = plan::select(&tests, &options.only, &options.skip, options.suites)?;
+    let runs = plan::runs(&tests, &chosen, options.repeat);
+    let width = runs.iter().map(|run| run.name.len()).max().unwrap_or(0);
+    let executable = std::env::current_exe().map_err(|error| format!("executavel do xtask: {error}"))?;
+    let context = Context {
+        tests,
+        runs,
+        root,
+        executable,
+        keep: options.keep,
+        console: Console { started: Instant::now(), lock: Mutex::new(()) },
+        width,
+    };
+    if options.list {
+        list(&context, &chosen);
+        return Ok(());
+    }
+
+    let mut cpus = thread::available_parallelism().map(usize::from).unwrap_or(2);
+    if options.cpu_friendly {
+        let applied = host::cpu_friendly()?;
+        println!(
+            "cpu-friendly: prioridade abaixo do normal; afinidade {:#x} ({} de {} CPUs logicas, {} livres)",
+            applied.mask,
+            applied.cpus,
+            applied.total,
+            applied.total - applied.cpus
+        );
+        cpus = applied.cpus;
+    }
+    let jobs = options.jobs.unwrap_or((cpus / 2).max(1)).min(context.runs.len());
+    let configurations = {
+        let mut keys: Vec<&str> = context.runs.iter().map(|run| context.tests[run.test].build_key.as_str()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    };
+    println!(
+        "test-all: {} execucoes ({} configuracoes de build) em {jobs} pistas; pastas em {OUTPUT_DIR}/",
+        context.runs.len(),
+        configurations
+    );
+
+    let (sender, receiver) = mpsc::sync_channel::<Prepared>(READY_AHEAD);
+    let receiver = Mutex::new(receiver);
+    let outcomes = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        let context = &context;
+        scope.spawn(move || builder(context, sender));
+        for _ in 0..jobs {
+            scope.spawn(|| lane(context, &receiver, &outcomes));
+        }
+    });
+
+    // A tabela na ordem da lista (as suítes e depois o components.toml).
+    let mut outcomes = outcomes.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let order = |name: &str| {
+        let position = context.runs.iter().position(|run| run.name == name).unwrap_or(usize::MAX);
+        (context.runs.get(position).map_or(usize::MAX, |run| run.test), position)
+    };
+    outcomes.sort_by_key(|outcome| order(&outcome.name));
+    let failed = report::summary(&outcomes, context.console.started.elapsed());
+    if failed > 0 {
+        Err(format!("test-all: {failed} de {} execucoes falharam", outcomes.len()))
+    } else {
+        Ok(())
+    }
+}

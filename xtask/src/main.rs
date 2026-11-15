@@ -5,6 +5,7 @@
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build]
+//! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -28,6 +29,7 @@ mod ntfs_image;
 mod qemu;
 mod windows_binaries;
 mod status;
+mod test_all;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,10 +38,11 @@ use std::time::Duration;
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status|nt-types> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|status|nt-types> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
+  test-all   suites e todos os [[teste]] do components.toml em paralelo (cargo xtask test-all --help)
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
@@ -209,10 +212,12 @@ fn execute(arguments: Arguments) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    // `status` e `nt-types` têm opções próprias e não compilam o kernel.
+    // `status`, `nt-types` e `test-all` têm opções próprias; os dois
+    // primeiros não compilam o kernel.
     let result = match arguments.first().map(String::as_str) {
         Some("status") => status::run(&arguments[1..]),
         Some("nt-types") => nt_types::run(&arguments[1..]),
+        Some("test-all") => test_all::run(&arguments[1..]),
         _ => parse(arguments).and_then(execute),
     };
     match result {

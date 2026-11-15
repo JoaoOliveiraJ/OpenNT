@@ -11,7 +11,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | --- | --- |
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
-| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot` e `status` |
+| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all` e `status` |
 
 ## 2. Árvore do kernel
 
@@ -1744,6 +1744,33 @@ Sem as opções nada disso roda.
   `cargo xtask test-boot PHASE3_SELFTEST_OK 240000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK ... --expect=PHASE6_SELFTEST_OK --expect=MULTIPROCESS_OK --expect=PHASE7_SELFTEST_OK --expect=KBDTEST_OK --expect=SELFTEST_OK`
   (os `--expect` são procurados em ordem, cada um depois do anterior: o
   `MULTIPROCESS_OK` sai dentro da fase 7, antes do `PHASE7_SELFTEST_OK`).
+- **Validação inteira**: `cargo xtask test-all` (`xtask/src/test_all/`) roda
+  a suíte completa com 4 CPUs e com 1 (`suite-smp4`, `suite-smp1`, prazo de
+  900 s) e todo `[[teste]]` de `docs/status/components.toml`, cujo `comando`
+  é um `cargo xtask test-boot` completo (o test-all troca só o
+  `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
+  com `--repeat`). Uma thread monta as imagens em sequência
+  (`test-boot --build-only`), com as execuções de mesma configuração de build
+  juntas e as de prazo maior primeiro: as opções do build viram constantes
+  do kernel (`init/boot_config.rs`), então ele recompila uma vez por
+  configuração, e dois builds nunca disputam o `target/`. Os binários do
+  Windows do bundle ficam numa pasta só (`--windows-dir`), e a cópia deles
+  preserva a data do original e pula o que já está em dia, para que nem o
+  caminho nem a cópia recompilem o kernel. `--jobs` pistas rodam o QEMU na
+  imagem pronta (`test-boot --no-build`), com a saída em `test-boot.log` e a
+  serial em `serial.log`; uma execução que passa do prazo do test-boot mais
+  o `--hold` e 2 minutos é morta com o QEMU. A pasta de uma execução que
+  passou é apagada (`--keep` guarda); a de uma falha fica, com o
+  `kernel.elf` para simbolizar endereços. No fim sai a tabela (teste,
+  resultado, build, tempo, log) e, por falha, o motivo dado pelo test-boot, o
+  trecho da serial a partir do primeiro marcador de falha (ou as últimas
+  linhas, num prazo esgotado) e o comando que repete o QEMU na mesma imagem.
+  `espera_falha = true` no `[[teste]]` conta a falha à parte, sem reprovar a
+  rodada (e avisa quando o teste passa); `coberto_pela_suite = true` tira do
+  padrão um teste cujos marcadores as suítes conferem (roda com `--only`).
+  `--cpu-friendly` baixa a prioridade do test-all para BELOW_NORMAL e tira as
+  4 CPUs lógicas de número mais baixo da afinidade dele (kernel32, sem
+  crate); o cargo, o rustc e o QEMU herdam as duas.
 - **Processo de usuário nos autotestes**: um teste que precisa rodar como
   processo de usuário usa `with_test_process`
   (`ntos/test/multiprocess/identity.rs`), que cria um EPROCESS real com

@@ -193,7 +193,7 @@ impl Drop for QemuProcess {
 
 /// Falhas na serial: pânico do Rust, exceção de kernel, autoteste e a parada
 /// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina).
-const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP"];
+pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP"];
 
 /// Boot sem tela: sucesso quando o marcador (e as saídas esperadas depois
 /// das teclas) aparecem na serial antes do prazo.

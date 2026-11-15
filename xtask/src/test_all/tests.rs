@@ -1,0 +1,49 @@
+//! Testes do `test-all`: a leitura dos comandos do `components.toml`, a
+//! seleção e o trecho mostrado de uma falha.
+
+use super::plan::{self, split_words, Suites};
+use super::report;
+
+#[test]
+fn commands_split_like_the_shell() {
+    let words = split_words(r#"cargo xtask test-boot KERNEL_RS_OK 120000 "--keys=run hello\nps\n" "--expect== 42" "--expect=PID  STATE""#).unwrap();
+    assert_eq!(words, ["cargo", "xtask", "test-boot", "KERNEL_RS_OK", "120000", r"--keys=run hello\nps\n", "--expect== 42", "--expect=PID  STATE"]);
+    let words = split_words(r#"a "b \"c\" \\d" 'e f' g\ h"#).unwrap();
+    assert_eq!(words, ["a", r#"b "c" \d"#, "e f", "g h"]);
+    assert!(split_words(r#"a "b"#).is_err());
+}
+
+/// Todo `[[teste]]` do `components.toml` vira um `test-boot` válido, com
+/// id único, e a seleção padrão leva as suítes e deixa de fora os cobertos
+/// por elas.
+#[test]
+fn every_components_test_is_a_valid_test_boot() {
+    let tests = plan::load(&crate::build::workspace_root()).unwrap();
+    assert!(tests.len() > 2);
+    let chosen = plan::select(&tests, &[], &[], Suites::Included).unwrap();
+    for (index, test) in tests.iter().enumerate() {
+        assert!(!test.arguments.iter().any(|word| word.starts_with("--build-dir=")), "{}", test.id);
+        assert_eq!(chosen.contains(&index), !test.covered_by_suite, "{}", test.id);
+    }
+    assert!(chosen.iter().any(|&index| tests[index].id == "suite-smp4"));
+    let only = plan::select(&tests, &[String::from("suite-smp1")], &[], Suites::Included).unwrap();
+    assert_eq!(only.len(), 1);
+    assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included).is_err());
+    // As duas suítes dividem a configuração de build: um kernel só.
+    let runs = plan::runs(&tests, &plan::select(&tests, &[], &[], Suites::Only).unwrap(), 2);
+    let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
+    assert_eq!(names, ["suite-smp4.1", "suite-smp4.2", "suite-smp1.1", "suite-smp1.2"]);
+    assert_eq!(tests[runs[0].test].build_key, tests[runs[3].test].build_key);
+}
+
+#[test]
+fn excerpt_starts_at_the_failure_or_keeps_the_tail() {
+    let serial = "boot\n\na\nb\nfase 1\n[kbd] ok\n*** STOP 0x1e\nKERNEL_BLACKBOX_BYTES {}\nrip=1\n\nrsp=2\n";
+    assert_eq!(report::serial_excerpt(serial), ["a", "b", "fase 1", "[kbd] ok", "*** STOP 0x1e", "rip=1", "rsp=2"]);
+    let timeout: String = (1..=30).map(|line| format!("linha {line}\n")).collect();
+    let excerpt = report::serial_excerpt(&timeout);
+    assert_eq!(excerpt.first().map(String::as_str), Some("linha 19"));
+    assert_eq!(excerpt.last().map(String::as_str), Some("linha 30"));
+    let console = "texto\nTEST-BOOT FALHOU: tempo esgotado esperando \"X\" (serial em s)\n";
+    assert_eq!(report::failure_reason(console), "TEST-BOOT FALHOU: tempo esgotado esperando \"X\"");
+}

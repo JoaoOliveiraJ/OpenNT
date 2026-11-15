@@ -95,6 +95,15 @@ estado = "planejada"
 escopo = "Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dxgkrnl.sys, BasicDisplay.sys), os sistemas de arquivos (ntfs.sys, fastfat.sys, fltmgr.sys) e a rede (ndis.sys, tcpip.sys, E1G6032E.sys), com o kernel dando só o suporte."
 
 # ---- testes automáticos de boot -------------------------------------------------
+#
+# `comando` é um `cargo xtask test-boot` completo; o `cargo xtask test-all` lê
+# daqui a lista e roda cada um na própria pasta (build/test-all/<id>). Campos
+# opcionais que o test-all lê:
+#   espera_falha = true        falha conhecida: sai à parte e não reprova a
+#                              rodada (tire quando o teste passar)
+#   coberto_pela_suite = true  os marcadores já são conferidos pelas suítes
+#                              completas do test-all (suite-smp4, suite-smp1);
+#                              só roda à parte com --only
 
 [[teste]]
 id = "entrada"
@@ -116,6 +125,7 @@ titulo = "Autoteste do kernel"
 marcador = "SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE6_SELFTEST_OK 600000 --kernel-test-scope=all --build-dir=build/tests --expect=MULTIPROCESS_OK --expect=PHASE7_SELFTEST_OK --expect=SELFTEST_OK"
 descricao = "Roda dentro do kernel todas as suítes de autoteste: arquivos em memória, programas de exemplo, memória, escalonador, timer, IPC e serviços; depois as suítes das fases 3 a 7 (objetos e executive, I/O e armazenamento, Registro e serviços, carregador de PE, modo usuário) e o teclado real. Dentro da fase 7, o MULTIPROCESS_OK marca o teste em que um programa de usuário cria outro processo pela chamada de sistema do Windows. O SELFTEST_OK final só aparece se todas passarem. As marcas são procuradas em ordem, cada uma depois da anterior: o comando parte do PHASE6_SELFTEST_OK, espera o MULTIPROCESS_OK (que sai dentro da fase 7) e o PHASE7_SELFTEST_OK, e só então o SELFTEST_OK, porque esse texto também está dentro dos marcadores de cada fase e, sozinho, já casaria com o da fase 3."
+coberto_pela_suite = true
 
 [[teste]]
 id = "fase3"
@@ -123,6 +133,7 @@ titulo = "Autoteste de objetos e executive"
 marcador = "PHASE3_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE3_SELFTEST_OK 60000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Dispatcher, APCs, timers e alertas; push locks e rundown; tabelas de handles, namespace e callbacks de objetos; processos e segurança."
+coberto_pela_suite = true
 
 [[teste]]
 id = "fase4"
@@ -130,6 +141,7 @@ titulo = "Autoteste de I/O e armazenamento"
 marcador = "PHASE4_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE4_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "No hardware emulado do QEMU: configuração e barramento PCI, dispositivos da placa-mãe, disco ATA, leitura e escrita de NTFS, I/O Manager (IRPs, dispositivos e arquivos), energia e ETW."
+coberto_pela_suite = true
 
 [[teste]]
 id = "fase5"
@@ -137,6 +149,7 @@ titulo = "Autoteste de Registro e serviços"
 marcador = "PHASE5_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE5_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Chaves e valores, hives de arquivo no formato regf (a hive SYSTEM carregada do volume, cópia por NtSaveKey e carga por NtLoadKey, descarga com log e recuperação, restauração, privilégios), callbacks do Registro, banco de serviços, WNF, licenciamento e capacidades."
+coberto_pela_suite = true
 
 [[teste]]
 id = "fase6"
@@ -144,6 +157,7 @@ titulo = "Autoteste do carregador de PE e do ntoskrnl"
 marcador = "PHASE6_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE6_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Formato PE, carga de imagens do kernel, os exports do ntoskrnl grupo por grupo (Ke, Mm, Ex, Io, Ob, Rtl, Zw...), ciclo de vida de drivers e tratamento de exceções."
+coberto_pela_suite = true
 
 [[teste]]
 id = "fase7"
@@ -151,6 +165,7 @@ titulo = "Autoteste do modo usuário"
 marcador = "PHASE7_SELFTEST_OK"
 comando = "cargo xtask test-boot PHASE7_SELFTEST_OK 240000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Seções e memória virtual de usuário, arquivos, eventos e threads, chamadas de sistema, entrada no anel 3, ALPC, controle de serviços (sc) e um processo em modo usuário: um executável PE mínimo, gerado pelo próprio teste, que passa pelo LdrInitializeThunk da ntdll de bring-up e sai com o código esperado."
+coberto_pela_suite = true
 
 [[teste]]
 id = "teclado"
@@ -158,6 +173,7 @@ titulo = "Teclado real"
 marcador = "KBDTEST_OK"
 comando = "cargo xtask test-boot KBDTEST_OK 600000 --kernel-test-scope=all --build-dir=build/tests"
 descricao = "Monta pelo PnP as pilhas do i8042prt.sys com kbdclass.sys e mouclass.sys, injeta um scancode pelo controlador 8042 e lê a tecla em \\Device\\KeyboardClass0 (IRQ1, ISR do driver, DPC e callback do kbdclass)."
+coberto_pela_suite = true
 
 [[teste]]
 id = "drivers"
@@ -228,6 +244,7 @@ titulo = "Driver ntfs.sys real"
 marcador = "FILE_SYSTEM_MOUNT_OK"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ntfs --build-dir=build/ntfs --smp=1 \"--expect=name=ntfs state=4 win32=0\" \"--expect=FILE_SYSTEM_MOUNT_OK name=ntfs\""
 descricao = "O gerenciador de serviços inicia o ntfs.sys da Microsoft (o Code Integrity valida a imagem pelo catálogo, o loader resolve os imports e o DriverEntry registra o file system) e o kernel abre HELLO.TXT em \\Device\\AtaVolume1: o IopMountVolume manda o IRP_MN_MOUNT_VOLUME ao ntfs.sys, o IRP_MJ_CREATE e o IRP_MJ_READ vão ao volume montado e a leitura passa pelo Cache Manager. O ntfs.sys carrega com o clfs.sys, o clipsp.sys e o fltmgr.sys, mas hoje o DriverEntry devolve STATUS_OBJECT_NAME_COLLISION: o CDO dele se chama \\Ntfs, na raiz, e o kernel monta o próprio volume em \\NTFS. Sem essa colisão a montagem chega ao fim do NtfsMountVolume e falha na limpeza final, porque sem o lazy writer o IRP_MJ_CLOSE de um stream interno chega antes do que no Windows."
+espera_falha = true
 
 [[teste]]
 id = "kmdf"

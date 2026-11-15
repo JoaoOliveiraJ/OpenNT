@@ -129,7 +129,7 @@ do kernel, no QEMU.
 | `kernel/src/ntos/test/` | Autotestes de boot (`phase3.rs`…`phase7.rs`, `self_test.rs`) |
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
-| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `status` |
+| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `status` |
 | `docs/` | Roadmap, arquitetura e páginas de compatibilidade |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
@@ -174,6 +174,13 @@ cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=bu
 # O mesmo boot com o win32k.sys real carregado pelo smss da sessão.
 cargo xtask test-boot WIN32K_LOADED 420000 --initial-process=smss --build-dir=build/win32k --smp=1 --expect=SMSS_CSRSS_OK "--expect=thread GUI pelo PsConvertToGuiThread -> 0x0"
 
+# A validação inteira: as duas suítes completas (4 CPUs e 1) e todos os
+# [[teste]] de docs/status/components.toml, em paralelo, cada execução em
+# build/test-all/<id>; no fim, a tabela e o trecho da serial de cada falha.
+cargo xtask test-all
+cargo xtask test-all --jobs 4 --cpu-friendly
+cargo xtask test-all --only dxgkrnl --repeat 10
+
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
 
@@ -198,7 +205,24 @@ build põe no volume os binários dessa cadeia e o kernel deixa de montar o
 Opções de máquina: `--accel=tcg|whpx`,
 `--memory-mb=N` (padrão 4096), `--smp=N` (padrão 4). Em `--keys`, `\n` digita
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar
-`*** PANIC`, `*** EXCECAO` ou `SELFTEST FALHOU`.
+`*** PANIC`, `*** EXCECAO` ou `SELFTEST FALHOU`. Com `--build-only` ele só
+monta a imagem do teste; com `--no-build` roda o QEMU na imagem já montada em
+`--build-dir`.
+
+O `test-all` monta as imagens uma de cada vez (`test-boot --build-only`), com
+as execuções de mesma configuração juntas, para o kernel recompilar uma vez
+por configuração e nunca haver dois builds no mesmo `target/`, e roda o QEMU
+em `--jobs=N` pistas (`test-boot --no-build`; padrão: metade das CPUs).
+Opções: `--only=ID,...`, `--skip=ID,...`, `--suite` (só as suítes,
+`suite-smp4` e `suite-smp1`) ou `--no-suite`, `--repeat=N` (cada teste N
+vezes, para caçar falhas intermitentes), `--keep` (guarda a pasta de toda
+execução; sem ele, só as das falhas ficam, com `build.log`, `test-boot.log` e
+`serial.log`), `--cpu-friendly` (o test-all, o cargo e o QEMU com prioridade
+abaixo do normal e sem 4 CPUs lógicas na afinidade) e `--list` (mostra os
+testes e os comandos). No `components.toml`, `espera_falha = true` marca uma
+falha conhecida, contada à parte sem reprovar a rodada, e
+`coberto_pela_suite = true` um teste cujos marcadores as suítes já conferem
+(só roda com `--only`). O comando sai com erro se alguma execução falhar.
 
 Para carregar um driver real, o build copia do Windows da própria máquina os
 `.sys`/`.dll` de que ele precisa (hal.dll, i8042prt, kbdclass, atapi, cng.sys,
