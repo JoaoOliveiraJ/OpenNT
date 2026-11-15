@@ -15,6 +15,9 @@
 //!   /6, FF /7) e os 0F não listados são ilegais; FE usa só o bit baixo do
 //!   campo reg; BSWAP é só o 0F C8 e toma o registrador de um ModRM; ENTER
 //!   aceita nível 0 ou 1;
+//! - os desvios curtos (Jcc rel8, JMP rel8, LOOP, JCXZ) e os Jcc rel16/rel32
+//!   guardam o destino em 16 bits, mesmo com o prefixo 66h; LOOP conta pela
+//!   largura do endereço e JCXZ testa CX ou ECX pela largura do operando;
 //! - INT n empilha FLAGS, CS e IP na largura do operando, sem mexer em IF e
 //!   TF, e lê o vetor da IVT; INT 42h é ignorada e INT 1Ah passa antes pela
 //!   emulação do PCI BIOS ([`Bus::pci_bios`]);
@@ -352,10 +355,16 @@ impl<B: Bus> Machine<'_, B> {
 
     // ---- desvios ------------------------------------------------------------
 
-    /// Desvio relativo: o IP novo na largura do operando.
+    /// JMP/CALL rel16/rel32: o IP novo na largura do operando.
     fn jump_relative(&mut self, displacement: u32) {
         let target = self.cpu.eip.wrapping_add(displacement);
         self.cpu.eip = if self.operand32 { target } else { target & 0xFFFF };
+    }
+
+    /// Desvios curtos (Jcc rel8, JMP rel8, LOOP, JCXZ) e Jcc rel16/rel32: o
+    /// emulador da HAL guarda o destino em 16 bits, mesmo com o prefixo 66h.
+    fn jump_short(&mut self, displacement: u32) {
+        self.cpu.eip = self.cpu.eip.wrapping_add(displacement) & 0xFFFF;
     }
 
     fn jump_near(&mut self, target: u32) {
@@ -510,7 +519,7 @@ impl<B: Bus> Machine<'_, B> {
             0x70..=0x7F => {
                 let displacement = alu::sign_extend(self.fetch8()?, 1);
                 if alu::condition(self.cpu.eflags, opcode & 0xF) {
-                    self.jump_relative(displacement);
+                    self.jump_short(displacement);
                 }
             }
             0x80 | 0x81 | 0x83 => {
@@ -730,9 +739,11 @@ impl<B: Bus> Machine<'_, B> {
             }
             0xE0..=0xE3 => {
                 let displacement = alu::sign_extend(self.fetch8()?, 1);
+                // LOOP conta em CX/ECX pela largura do endereço; o JCXZ do
+                // emulador da HAL testa CX/ECX pela largura do operando.
                 let counter = if self.address32 { 4 } else { 2 };
                 let taken = if opcode == 0xE3 {
-                    self.register(ECX, counter) == 0
+                    self.register(ECX, size) == 0
                 } else {
                     let count = self.register(ECX, counter).wrapping_sub(1);
                     self.set_register(ECX, counter, count);
@@ -745,7 +756,7 @@ impl<B: Bus> Machine<'_, B> {
                         }
                 };
                 if taken {
-                    self.jump_relative(displacement);
+                    self.jump_short(displacement);
                 }
             }
             0xE4 | 0xE5 | 0xEC | 0xED => {
@@ -776,7 +787,7 @@ impl<B: Bus> Machine<'_, B> {
             }
             0xEB => {
                 let displacement = alu::sign_extend(self.fetch8()?, 1);
-                self.jump_relative(displacement);
+                self.jump_short(displacement);
             }
             0xF4 => return Err(Status::Halt),
             0xF5 => self.cpu.eflags ^= CF,
@@ -1095,7 +1106,7 @@ impl<B: Bus> Machine<'_, B> {
             0x80..=0x8F => {
                 let displacement = self.fetch_immediate(size)?;
                 if alu::condition(self.cpu.eflags, opcode & 0xF) {
-                    self.jump_relative(displacement);
+                    self.jump_short(displacement);
                 }
             }
             0x90..=0x9F => {
