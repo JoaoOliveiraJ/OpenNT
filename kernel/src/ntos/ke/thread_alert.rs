@@ -69,8 +69,15 @@ pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
             && target.alertable() != 0
             && mode_index <= target.wait_mode.get() as u8 as i64
         {
-            delivered = signal(thread);
-            target.wait_register.flags.set(register | WAIT_REGISTER_ALERT);
+            // A espera registrada de uma thread de kernel sai pelo
+            // KiUnwaitThread (STATUS_ALERTED, a thread volta à fila); a
+            // sondada é marcada para a próxima sondagem.
+            let woken = super::wait::alert(thread, mode_index as u8);
+            delivered = signal(thread) || woken;
+            if delivered {
+                let register = target.wait_register.flags.get();
+                target.wait_register.flags.set(register | WAIT_REGISTER_ALERT);
+            }
         }
         if !delivered {
             alerted.set(1);

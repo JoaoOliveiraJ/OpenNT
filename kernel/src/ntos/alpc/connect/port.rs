@@ -98,6 +98,7 @@ fn finish_server(request: &Arc<Request>, result: JobResult) -> Result<(), Kernel
     }
     let bytes = if status != 0 { None } else { Some(transport::reply(&result.data, 11, identity, Some(sender))) };
     request.state.lock().connect_result = Some((status, bytes.clone()));
+    crate::ntos::alpc::kernel_entry::notify_waiters();
     port.with(|state| state.connection_state = if status != 0 { port_objects::CONNECTION_REFUSED } else { port_objects::CONNECTION_CONNECTED });
     message_identity::clear_attributes(identity);
     identity.with(|state| state.replied = true);
@@ -110,6 +111,7 @@ fn finish_server(request: &Arc<Request>, result: JobResult) -> Result<(), Kernel
         state.direct = message.direct;
     });
     port.with(|state| state.pending.push(message));
+    crate::ntos::alpc::kernel_entry::notify_waiters();
     if let Some(event) = direct {
         dispatcher::set_event(event);
     } else if let Some(completion) = port.with(|state| state.completion.clone()) {

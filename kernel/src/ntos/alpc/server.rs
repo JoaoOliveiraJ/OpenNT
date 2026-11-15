@@ -44,13 +44,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::offset_of;
 
+use crate::ntos::alpc::kernel_entry;
 use crate::ntos::alpc::message::buffer::{self as message_buffer, Buffer};
 use crate::ntos::alpc::port_reference;
 use crate::ntos::alpc::small::context_attribute;
 use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{AlpcMessageAttributes, AlpcPortAttributes, ObjectAttributes, PortMessage};
-use crate::ntos::ke::{context_switch, dispatcher};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
@@ -153,6 +153,7 @@ impl UserServer {
         if let Some(completion) = self.listener.with(|state| state.completion.clone()) {
             completion.notify();
         }
+        kernel_entry::notify_waiters();
     }
 
     /// O servidor fechou a porta de conexão: as conexões pendentes são
@@ -173,6 +174,7 @@ impl UserServer {
         if let Some(endpoint) = self.endpoint.lock().take() {
             transport::unregister(&endpoint);
         }
+        kernel_entry::notify_waiters();
     }
 }
 
@@ -212,7 +214,7 @@ impl Service for UserServer {
         };
         self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0 });
         let decision = pending.clone();
-        let status = context_switch::wait_until(&mut || decision.decision.lock().as_ref().map(|(status, _)| *status), dispatcher::pump_kernel);
+        let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|(status, _)| *status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
         let (status, data) = pending.decision.lock().take().unwrap_or((status, Vec::new()));
         let server = Sender { process: self.listener.process_id(), thread: self.listener.thread_id(), thread_pointer: 0 };
         {
@@ -358,6 +360,7 @@ fn send_reply(server: &UserServer, input: u64, mode: u8) -> u32 {
     };
     let Some(slot) = slot else { return STATUS_REPLY_MESSAGE_MISMATCH };
     *slot.lock() = Some(JobResult { status: STATUS_SUCCESS, data: captured.data, sender: Some(current_sender()) });
+    kernel_entry::notify_waiters();
     STATUS_SUCCESS
 }
 
@@ -556,6 +559,7 @@ pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_cont
         let Some(pending) = server.state.lock().connections.get(&id).cloned() else { return Ok(STATUS_REPLY_MESSAGE_MISMATCH) };
         if !accept {
             *pending.decision.lock() = Some((STATUS_PORT_CONNECTION_REFUSED, Vec::new()));
+            kernel_entry::notify_waiters();
             return Ok(STATUS_SUCCESS);
         }
         if mode != 0 && !state::probe_user_write(out, 8) {
@@ -582,6 +586,7 @@ pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_cont
             COMMUNICATION.lock().insert(communication.pointer, (server.clone(), client_pointer));
             server.state.lock().links.insert(client_pointer, Link { server_port: communication.clone(), context: port_context });
             *pending.decision.lock() = Some((STATUS_SUCCESS, captured.data.clone()));
+            kernel_entry::notify_waiters();
             Ok(STATUS_SUCCESS)
         });
         crate::ntos::ob::objects::dispatcher::collect(communication.pointer);

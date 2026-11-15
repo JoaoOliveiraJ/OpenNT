@@ -38,6 +38,7 @@ pub mod services;
 pub mod processor_topology;
 pub mod service_tables;
 pub mod queue;
+pub mod wait;
 pub mod cache_flush;
 pub mod timer2;
 pub mod device_queue;

@@ -543,7 +543,13 @@ pub fn request_yield(thread: u64) -> Result<bool, KernelError> {
 /// kernel com pilha própria cedem de fato (`context_switch`).
 pub fn yield_execution() -> Result<u32, KernelError> {
     let thread = crate::ntos::ps::process::get_current_thread();
-    Ok(if request_yield(thread)? { 0 } else { 0x4000_0024 })
+    if !request_yield(thread)? {
+        return Ok(0x4000_0024);
+    }
+    if super::context_switch::on_kernel_thread_stack() == Some(thread) && super::context_switch::kernel_thread_can_block() {
+        super::context_switch::yield_kernel_thread(false);
+    }
+    Ok(0)
 }
 
 pub fn register_priority_change_observer(observer: fn()) -> Result<(), KernelError> {

@@ -141,10 +141,6 @@ impl KernelWait for Delivery {
     fn resume(&mut self, _value: u64) -> Result<(), KernelError> {
         self.notification.resume()
     }
-    fn cancel(&mut self) {
-        let _ = self.notification.cancel();
-        self.release();
-    }
 }
 
 /// Passa um pacote do pool a uma requisição de thread de sistema; no

@@ -177,6 +177,11 @@ pub fn notify(port: &Port) {
             if !waiter.reserve.as_ref().is_some_and(|reserve| reserve()) {
                 break;
             }
+            // Os pacotes foram entregues à espera: a thread de kernel parada
+            // na retirada volta à fila (a de usuário é sondada).
+            if let Some(thread) = waiter.thread {
+                crate::ntos::ke::wait::wake(thread);
+            }
         }
     }
     port.notifying.store(false, Ordering::Release);

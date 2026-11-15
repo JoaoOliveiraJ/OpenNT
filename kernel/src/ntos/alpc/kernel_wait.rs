@@ -128,4 +128,16 @@ impl Request {
     pub fn cancel(&mut self) {
         self.finish(0xC000_0120);
     }
+
+    /// O prazo, o modo e o alertável da espera (o timer da thread de kernel
+    /// que espera vence no prazo capturado).
+    pub fn wait_parameters(&self) -> (crate::ntos::ke::wait::Deadline, u8, bool) {
+        use crate::ntos::ke::wait::Deadline;
+        let deadline = match (self.timeout.relative_deadline, self.timeout.absolute_deadline) {
+            (Some(relative), _) => Deadline::Uptime(relative),
+            (None, Some(absolute)) => Deadline::SystemTime(absolute),
+            (None, None) => Deadline::Infinite,
+        };
+        (deadline, self.wait_mode, self.alertable)
+    }
 }

@@ -17,6 +17,7 @@ use crate::hal::amd64::win32_thunk;
 use crate::hal::lapic;
 use crate::ntos::inc::types::{Context, Field, NtStruct, XsaveFormat};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::{kernel_stack, memory_map};
 use crate::rtl::{KernelError, SpinLock};
 
 /// O CONTEXT ocupa 0x4D0 bytes; a célula de ação pertence ao gateway e fica
@@ -128,9 +129,10 @@ pub fn provider() -> Option<KernelProvider> {
     *PROVIDER.lock()
 }
 
-/// Invocação ativa: contexto e identidade exclusiva do sinal, por CPU.
+/// Invocação ativa: contexto e identidade exclusiva do sinal, pela pilha em
+/// que a chamada roda.
 struct Invocation {
-    cpu: u32,
+    stack: u64,
     context: u64,
     signal: u64,
 }
@@ -138,13 +140,30 @@ struct Invocation {
 static INVOCATIONS: SpinLock<Vec<Invocation>> = SpinLock::new(Vec::new());
 static NEXT_SIGNAL: AtomicU64 = AtomicU64::new(1);
 
-fn current_cpu() -> u32 {
-    lapic::read(0x20) >> 24
+/// A pilha em que a CPU executa: a reserva da pilha de kernel que contém o
+/// RSP (cada thread tem a sua, e uma thread que deixou a CPU no meio de uma
+/// chamada a reencontra ao voltar) ou, fora da janela das pilhas, a CPU (a
+/// pilha de boot e as de reserva).
+fn current_stack() -> u64 {
+    let rsp: u64;
+    // SAFETY: só lê o registrador.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    if memory_map::is_kernel_stack(rsp) {
+        return (1 << 63) | (rsp - memory_map::KERNEL_STACK_BASE) / kernel_stack::SLOT_SIZE;
+    }
+    (lapic::read(0x20) >> 24) as u64
 }
 
 fn top_invocation() -> Option<(u64, u64)> {
-    let cpu = current_cpu();
-    INVOCATIONS.lock().iter().rev().find(|invocation| invocation.cpu == cpu).map(|invocation| (invocation.context, invocation.signal))
+    let stack = current_stack();
+    INVOCATIONS.lock().iter().rev().find(|invocation| invocation.stack == stack).map(|invocation| (invocation.context, invocation.signal))
+}
+
+/// A thread de kernel corrente termina de dentro de uma chamada (o
+/// PsTerminateSystemThread): as invocações da pilha dela não voltam mais.
+pub fn forget_current_stack() {
+    let stack = current_stack();
+    INVOCATIONS.lock().retain(|invocation| invocation.stack != stack);
 }
 
 fn signal_error(signal: u64) -> KernelError {
@@ -159,9 +178,9 @@ pub fn copy(destination: u64, source: u64, length: u64) {
 /// Empilha o contexto de uma chamada e sua identidade de transferência;
 /// captura só o sinal dela e restaura a anterior em qualquer saída.
 pub fn invoke<T: Default>(context: u64, body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
-    let cpu = current_cpu();
+    let stack = current_stack();
     let signal = NEXT_SIGNAL.fetch_add(1, Ordering::Relaxed);
-    INVOCATIONS.lock().push(Invocation { cpu, context, signal });
+    INVOCATIONS.lock().push(Invocation { stack, context, signal });
     let result = body();
     let mut invocations = INVOCATIONS.lock();
     if let Some(index) = invocations.iter().rposition(|invocation| invocation.signal == signal) {

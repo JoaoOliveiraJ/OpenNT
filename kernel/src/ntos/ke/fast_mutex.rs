@@ -134,11 +134,15 @@ impl Request {
     }
 }
 
-/// Espera o evento permitir retomar: numa syscall a thread bloqueia; fora
-/// dela o dispatcher avança entre consultas.
+/// Espera o evento permitir retomar: uma thread de kernel sai das prontas
+/// até o KeSetEvent do Event do mutex (WrFastMutex/WrGuardedMutex) e confere
+/// a palavra de novo; numa syscall a thread bloqueia; no contexto de boot o
+/// dispatcher avança entre consultas.
 fn acquire_with(pointer: u64, caller_controls_irql: bool, requires_guarded_region: bool) -> Result<u32, KernelError> {
     let mut request = begin(pointer, caller_controls_irql, requires_guarded_region)?;
-    super::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
+    let event = mutex_at(pointer).event.address();
+    let reason = if requires_guarded_region { super::wait::reason::WR_GUARDED_MUTEX } else { super::wait::reason::WR_FAST_MUTEX };
+    super::context_switch::acquire_signaled(|| (request.poll(), Some(event)), reason, dispatcher::pump_kernel)
 }
 
 /// Tenta sem publicar espera; a falha restaura o IRQL elevado.

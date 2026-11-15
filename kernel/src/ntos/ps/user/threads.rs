@@ -499,6 +499,7 @@ pub fn can_dispatch() -> bool {
     let installed = EXECUTOR.lock().is_some();
     installed
         && context_switch::processor() == 0
+        && context_switch::on_kernel_thread_stack().is_none()
         && irql::get_irql() == irql::PASSIVE_LEVEL
         && sync::spin_locks_held() == 0
         && sync::shared_locks_held() == 0
@@ -549,6 +550,11 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
 pub fn dispatch_one() -> Result<Dispatched, KernelError> {
     let Some(executor) = *EXECUTOR.lock() else { return Ok(Dispatched::Idle) };
     assert!(context_switch::processor() == 0, "despacho de usuario fora do processador de boot");
+    // O despacho de usuário é do despachante da CPU, nunca da pilha de uma
+    // thread de kernel.
+    if context_switch::on_kernel_thread_stack().is_some() {
+        return Ok(Dispatched::Idle);
+    }
     if RUNNING.swap(true, Ordering::AcqRel) {
         return Ok(Dispatched::Idle);
     }
@@ -741,6 +747,13 @@ pub fn wait_for_process(process: u64) -> Result<u32, KernelError> {
         if done {
             // SAFETY: o EPROCESS é referenciado durante a espera.
             break Ok(unsafe { Eprocess::at(process) }.exit_status.get() as u32);
+        }
+        // Uma thread de kernel não despacha usuário na própria pilha: sai das
+        // prontas até o fim do processo, e o despachante da CPU roda as
+        // threads dele.
+        if context_switch::on_kernel_thread_stack().is_some() {
+            context_switch::wait_until(&mut || matches!(progress(process), Progress::Done).then_some(0), dispatcher::pump_kernel);
+            continue;
         }
         if let Err(error) = dispatch_one() {
             break Err(error);

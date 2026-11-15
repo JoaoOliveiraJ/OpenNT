@@ -199,6 +199,7 @@ pub fn expire_due() {
     for address in expired {
         let timer = timer_at(address);
         timer.header.signal_state.set(1);
+        super::wait::signal(address);
         let callback = decode(timer.callback.get(), address);
         if callback == 0 {
             continue;

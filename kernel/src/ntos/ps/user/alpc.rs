@@ -129,6 +129,7 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
         state.direct = message.direct;
     });
     port.with(|state| state.pending.push(message));
+    crate::ntos::alpc::kernel_entry::notify_waiters();
     if let Some(event) = direct {
         dispatcher::set_event(event);
         if let Some(release) = release_direct {
@@ -215,6 +216,7 @@ fn queue_cancellation(port: &Arc<Port>, request: &Arc<Request>) {
         state.direct = message.direct;
     });
     port.with(|state| state.pending.push(message));
+    crate::ntos::alpc::kernel_entry::notify_waiters();
     if let Some(event) = direct {
         dispatcher::set_event(event);
         if let Some(release) = release_direct {
@@ -424,6 +426,7 @@ fn pump_port(port: &Arc<Port>) -> Result<(), KernelError> {
                 // O envio rejeitado não apaga o pedido ainda pendente no par.
                 request.state.lock().peer_unavailable = true;
                 port.with(|state| state.jobs.push(request.clone()));
+                crate::ntos::alpc::kernel_entry::notify_waiters();
                 awaiting_peer_close = true;
             }
         }
@@ -909,6 +912,7 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
                 let _ = dispatcher_objects::reference(port.pointer);
                 request.state.lock().retained = true;
                 port.with(|state| state.jobs.push(request.clone()));
+                crate::ntos::alpc::kernel_entry::notify_waiters();
                 stored = true;
                 deferred = true;
             }

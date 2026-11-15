@@ -177,6 +177,19 @@ pub fn initialize(apc: u64, thread: u64, environment: u8, kernel_routine: u64, r
 pub fn insert(apc: u64, first: u64, second: u64) -> bool {
     let packet = apc_at(apc);
     let thread = packet.thread.get();
+    let (user_mode, special) = (packet.apc_mode.get() != 0, packet.reserved[NORMAL_ROUTINE].get() == 0);
+    let inserted = insert_locked(apc, first, second);
+    if inserted {
+        // O KiInsertQueueApc: uma thread de kernel parada numa espera que a
+        // APC interrompe sai dela (STATUS_KERNEL_APC/STATUS_USER_APC).
+        super::wait::apc_queued(thread, user_mode, special);
+    }
+    inserted
+}
+
+fn insert_locked(apc: u64, first: u64, second: u64) -> bool {
+    let packet = apc_at(apc);
+    let thread = packet.thread.get();
     thread_lock::with_lock(thread, || {
         if packet.inserted.get() != 0 {
             return false;

@@ -48,6 +48,9 @@ pub fn initialize_timer(timer: u64, timer_type: u32) {
     let object = ktimer(timer);
     object.header.lock.set(timer_type as i32);
     object.header.signal_state.set(0);
+    let wait_list = &object.header.wait_list_head;
+    wait_list.flink.set(wait_list.address());
+    wait_list.blink.set(wait_list.address());
     object.dpc.set(0);
     object.period.set(0);
 }
@@ -129,6 +132,9 @@ pub fn check_timers() {
     }
     for (timer, dpc_pointer) in fired {
         ktimer(timer).header.signal_state.set(1);
+        // O vencimento satisfaz quem espera no timer (inclusive o prazo de
+        // uma espera, no KTHREAD.Timer da thread).
+        super::wait::signal(timer);
         if dpc_pointer != 0 {
             dpc::insert_queue_dpc(dpc_pointer, 0, 0);
         }
@@ -166,11 +172,17 @@ fn throttled_delay_pump() {
 }
 
 /// KeDelayExecutionThread: o prazo relativo usa o uptime, o absoluto
-/// acompanha a hora do sistema. Numa syscall a thread bloqueia até o prazo
-/// (`context_switch::wait_until`); fora dela a espera gira o pump.
+/// acompanha a hora do sistema. Uma thread de kernel deixa a CPU até o
+/// timer dela vencer (`ke::wait`); numa syscall a thread bloqueia até o
+/// prazo (`context_switch::wait_until`); no contexto de boot a espera gira o
+/// pump.
 pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: bool) -> Result<u32, KernelError> {
     // Interval pode vir do modo usuário (NtDelayExecution): leitura sondada.
     let interval = guest::try_read::<i64>(interval_pointer)?;
+    if super::context_switch::kernel_thread_can_block() {
+        let deadline = if interval <= 0 { super::wait::Deadline::after(Some(interval.unsigned_abs())) } else { super::wait::Deadline::SystemTime(interval as u64) };
+        return Ok(super::wait::delay(deadline, wait_mode, alertable));
+    }
     let relative_deadline = (interval <= 0).then(|| clock::uptime_100ns() + interval.unsigned_abs());
     let expired = move || match relative_deadline {
         Some(deadline) => clock::uptime_100ns() >= deadline,

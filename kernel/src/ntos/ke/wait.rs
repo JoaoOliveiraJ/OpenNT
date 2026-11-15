@@ -1,0 +1,692 @@
+//! Esperas que bloqueiam: os blocos de espera do despachante.
+//!
+//! Uma thread de kernel que espera (KeWaitForSingleObject/Multiple,
+//! KeDelayExecutionThread, KeRemoveQueue(Ex), as esperas dos locks do Ex e as
+//! esperas explícitas dos serviços, como a retirada de uma porta de conclusão
+//! e as esperas do ALPC) sai do conjunto de prontas e troca de contexto
+//! (`context_switch::switch_out`), como no KiCommitThreadWait do 19041. Cada
+//! objeto esperado recebe um KWAIT_BLOCK da KTHREAD (WaitBlock[0..3); acima de
+//! três, um vetor do pool) ligado à DISPATCHER_HEADER.WaitListHead dele, com
+//! WaitType (WaitAll 0, WaitAny 1, WaitNotification 2, WaitDequeue 3),
+//! BlockState (WaitBlockActive 4, WaitBlockInactive 5) e WaitKey (o índice do
+//! objeto); o prazo arma o KTIMER da própria thread (KTHREAD.Timer), com o
+//! bloco WaitBlock[3] (o TIMER_WAIT_BLOCK) e a chave STATUS_TIMEOUT (zero
+//! num KeDelayExecutionThread). A thread publica KTHREAD.State = Waiting,
+//! WaitReason, WaitMode, Alertable, WaitTime, WaitBlockList, WaitBlockCount
+//! e o estado da espera no KWAIT_STATUS_REGISTER: WaitInProgress até o
+//! despachante confirmar que ela deixou a CPU ([`commit`], WaitCommitted);
+//! uma saída da espera antes da confirmação a marca WaitAborted, e a thread
+//! volta direto à fila.
+//!
+//! Quem apronta a thread é o sinal (o KiWaitTest, [`signal`]): KeSetEvent,
+//! KePulseEvent, KeReleaseSemaphore, KeReleaseMutex, o vencimento de um
+//! timer e o fim de uma thread ou de um processo percorrem a WaitListHead do
+//! objeto e satisfazem os blocos, consumindo pela thread que espera (o evento
+//! de sincronização, a permissão do semáforo, a posse do mutant) e, num
+//! WaitAll, só quando todos os objetos da thread estão disponíveis; um bloco
+//! de notificação (as esperas dos locks do Ex, que conferem a própria palavra
+//! ao voltar) só acorda. O KeInsertQueue entrega a entrada direto à thread
+//! parada na fila (`ke::queue`, o KiInsertQueue). A saída da espera (o
+//! KiUnwaitThread, [`DispatcherLock::unwait`]) desliga todos os blocos da
+//! thread, cancela o timer, grava KTHREAD.WaitStatus e põe a thread na fila
+//! pronta. Um alerta numa espera alertável sai com STATUS_ALERTED
+//! ([`alert`]); uma APC de usuário numa espera alertável de UserMode, com
+//! STATUS_USER_APC, e uma APC de kernel numa espera em PASSIVE_LEVEL, com
+//! STATUS_KERNEL_APC ([`apc_queued`]): a thread entrega as APCs de kernel ao
+//! voltar e espera de novo pelo prazo restante, como o NT.
+//!
+//! As listas de espera e os registros ficam sob um lock só, o do despachante
+//! ([`lock`]). Os sinalizadores mudam o estado do objeto (atomicamente) e
+//! então testam as esperas sob o lock; quem espera tenta o objeto e liga os
+//! blocos sob o mesmo lock, então nenhum sinal se perde entre a tentativa e
+//! o bloqueio. Só as threads de kernel registram blocos: a thread de usuário
+//! bloqueada numa syscall é sondada pelo despachante de usuário, e o contexto
+//! de boot (o próprio despachante) consulta o objeto entre voltas do pump.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+use super::{apc, bugcheck, clock, context_switch, dispatcher, thread_alert, thread_dispatch, timer};
+use super::context_switch::SwitchReason;
+use crate::ntos::inc::types::{DispatcherHeader, Kthread, KwaitBlock, ListEntry, NtStruct};
+use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::ps::scheduler;
+use crate::rtl::sync::SpinLockGuard;
+use crate::rtl::SpinLock;
+
+pub const STATUS_SUCCESS: u32 = 0;
+pub const STATUS_ABANDONED: u32 = 0x80;
+pub const STATUS_USER_APC: u32 = 0xC0;
+pub const STATUS_KERNEL_APC: u32 = 0x100;
+pub const STATUS_ALERTED: u32 = 0x101;
+pub const STATUS_TIMEOUT: u32 = 0x102;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+/// WAIT_TYPE do 19041.
+pub mod wait_type {
+    pub const ALL: u8 = 0;
+    pub const ANY: u8 = 1;
+    pub const NOTIFICATION: u8 = 2;
+    pub const DEQUEUE: u8 = 3;
+}
+
+/// KWAIT_REASON do 19041 (as que o kernel usa).
+pub mod reason {
+    pub const EXECUTIVE: u8 = 0;
+    pub const DELAY_EXECUTION: u8 = 4;
+    pub const USER_REQUEST: u8 = 6;
+    pub const WR_EXECUTIVE: u8 = 7;
+    pub const WR_QUEUE: u8 = 15;
+    pub const WR_LPC_RECEIVE: u8 = 16;
+    pub const WR_LPC_REPLY: u8 = 17;
+    pub const WR_RESOURCE: u8 = 27;
+    pub const WR_PUSH_LOCK: u8 = 28;
+    pub const WR_FAST_MUTEX: u8 = 34;
+    pub const WR_GUARDED_MUTEX: u8 = 35;
+    pub const WR_RUNDOWN: u8 = 36;
+}
+
+/// KWAIT_BLOCK_STATE.
+const BLOCK_ACTIVE: u8 = 4;
+const BLOCK_INACTIVE: u8 = 5;
+/// THREAD_WAIT_OBJECTS: blocos embutidos para objetos; o quarto é o do timer.
+const THREAD_WAIT_OBJECTS: usize = 3;
+const TIMER_WAIT_BLOCK: usize = 3;
+/// KWAIT_STATE no KWAIT_STATUS_REGISTER (bits 0-2).
+const WAIT_STATE_MASK: u8 = 7;
+const WAIT_IN_PROGRESS: u8 = 1;
+const WAIT_COMMITTED: u8 = 2;
+const WAIT_ABORTED: u8 = 3;
+/// KTHREAD.State Waiting.
+const STATE_WAITING: u8 = 5;
+/// TimerNotificationObject: o KTHREAD.Timer do prazo.
+const TIMER_NOTIFICATION: u32 = 8;
+/// KERNEL_SECURITY_CHECK_FAILURE / FAST_FAIL_CORRUPT_LIST_ENTRY.
+const KERNEL_SECURITY_CHECK_FAILURE: u32 = 0x139;
+const FAST_FAIL_CORRUPT_LIST_ENTRY: u64 = 3;
+
+/// A espera registrada de uma thread.
+struct ActiveWait {
+    /// O primeiro bloco dos objetos (KTHREAD.WaitBlock ou o vetor do pool).
+    blocks: u64,
+    count: usize,
+    allocated: bool,
+    timer: bool,
+    alertable: bool,
+    mode: u8,
+    /// Uma APC de kernel interrompe a espera (WaitIrql em PASSIVE_LEVEL).
+    kernel_apcs: bool,
+    /// Espera explícita: um `wake` a conclui.
+    explicit: bool,
+}
+
+struct WaitTable {
+    waits: BTreeMap<u64, ActiveWait>,
+}
+
+static DISPATCHER: SpinLock<WaitTable> = SpinLock::new(WaitTable { waits: BTreeMap::new() });
+
+fn kthread(thread: u64) -> &'static Kthread {
+    // SAFETY: as esperas só registram KTHREADs vivas (a thread não termina
+    // parada numa espera).
+    unsafe { Kthread::at(thread) }
+}
+
+fn header(object: u64) -> &'static DispatcherHeader {
+    // SAFETY: os objetos esperados começam no DISPATCHER_HEADER e ficam vivos
+    // enquanto há quem espere neles.
+    unsafe { DispatcherHeader::at(object) }
+}
+
+fn block_at(address: u64) -> &'static KwaitBlock {
+    // SAFETY: blocos de espera de uma KTHREAD viva (ou do vetor dela).
+    unsafe { KwaitBlock::at(address) }
+}
+
+fn link(address: u64) -> &'static ListEntry {
+    // SAFETY: vínculos de uma lista de espera conferida.
+    unsafe { ListEntry::at(address) }
+}
+
+fn corrupt_list() -> ! {
+    bugcheck::bug_check_ex(KERNEL_SECURITY_CHECK_FAILURE, FAST_FAIL_CORRUPT_LIST_ENTRY, 0, 0, 0)
+}
+
+/// A WaitListHead é uma lista válida (vazia, ou com os vizinhos da cabeça
+/// apontando de volta para ela).
+fn valid_list(head: &ListEntry) -> bool {
+    let (first, last) = (head.flink.get(), head.blink.get());
+    if first == 0 || last == 0 {
+        return false;
+    }
+    if first == head.address() && last == head.address() {
+        return true;
+    }
+    guest::try_read64(first + 8).is_ok_and(|back| back == head.address()) && guest::try_read64(last).is_ok_and(|forward| forward == head.address())
+}
+
+/// Um objeto cujo cabeçalho nunca teve a lista iniciada (memória zerada que
+/// recebeu só o estado) ganha a lista vazia antes do primeiro bloco.
+fn ensure_list(head: &ListEntry) {
+    if valid_list(head) {
+        return;
+    }
+    if head.flink.get() != 0 {
+        debug_print!("[wait] WaitListHead {:#x} sem lista valida; iniciada vazia", head.address());
+    }
+    head.flink.set(head.address());
+    head.blink.set(head.address());
+}
+
+fn insert(head: &ListEntry, entry: &ListEntry, at_head: bool) {
+    let (previous, next) = if at_head { (head.address(), head.flink.get()) } else { (head.blink.get(), head.address()) };
+    if link(previous).flink.get() != next || link(next).blink.get() != previous {
+        corrupt_list();
+    }
+    entry.flink.set(next);
+    entry.blink.set(previous);
+    link(previous).flink.set(entry.address());
+    link(next).blink.set(entry.address());
+}
+
+fn remove_entry(entry: &ListEntry) {
+    let (next, previous) = (entry.flink.get(), entry.blink.get());
+    if link(next).blink.get() != entry.address() || link(previous).flink.get() != entry.address() {
+        corrupt_list();
+    }
+    link(previous).flink.set(next);
+    link(next).blink.set(previous);
+    entry.flink.set(entry.address());
+    entry.blink.set(entry.address());
+}
+
+/// O lock do despachante. As threads que uma saída de espera apronta entram
+/// na fila depois de o lock ser solto.
+pub struct DispatcherLock {
+    guard: Option<SpinLockGuard<'static, WaitTable>>,
+    ready: Vec<u64>,
+}
+
+/// Toma o lock do despachante.
+pub fn lock() -> DispatcherLock {
+    DispatcherLock { guard: Some(DISPATCHER.lock()), ready: Vec::new() }
+}
+
+impl Drop for DispatcherLock {
+    fn drop(&mut self) {
+        self.guard.take();
+        for thread in core::mem::take(&mut self.ready) {
+            if let Err(error) = thread_dispatch::make_ready(thread) {
+                debug_print!("[wait] thread {:#x} nao entrou na fila pronta: {}", thread, error);
+            }
+            scheduler::thread_readied(thread);
+        }
+    }
+}
+
+/// Os parâmetros de uma espera registrada.
+#[derive(Clone, Copy)]
+pub struct WaitSpec {
+    /// O WAIT_TYPE dos blocos dos objetos.
+    pub kind: u8,
+    /// O prazo relativo, em 100 ns (nenhum = infinito).
+    pub timeout: Option<u64>,
+    /// A chave do bloco do timer (o status quando o prazo vence).
+    pub timeout_key: u32,
+    pub alertable: bool,
+    pub mode: u8,
+    pub reason: u8,
+    /// Os blocos entram na cabeça das listas (a espera de uma fila).
+    pub at_head: bool,
+    /// Um `wake` conclui a espera.
+    pub explicit: bool,
+}
+
+impl WaitSpec {
+    pub fn new(kind: u8, timeout: Option<u64>, mode: u8, alertable: bool, reason: u8) -> Self {
+        WaitSpec { kind, timeout, timeout_key: STATUS_TIMEOUT, alertable, mode, reason, at_head: false, explicit: false }
+    }
+}
+
+impl DispatcherLock {
+    fn table(&mut self) -> &mut WaitTable {
+        self.guard.as_mut().expect("lock do despachante solto")
+    }
+
+    /// A thread tem uma espera registrada.
+    pub fn waiting(&mut self, thread: u64) -> bool {
+        self.table().waits.contains_key(&thread)
+    }
+
+    /// Liga os blocos de `objects` e o do timer e publica a espera de
+    /// `thread` (KTHREAD.State Waiting, WaitInProgress). Falha só sem pool
+    /// para o vetor de blocos.
+    pub fn link_wait(&mut self, thread: u64, objects: &[u64], spec: WaitSpec) -> Result<(), u32> {
+        let target = kthread(thread);
+        let (blocks, allocated) = if objects.len() <= THREAD_WAIT_OBJECTS {
+            (target.wait_block[0].address(), false)
+        } else {
+            let vector = guest::alloc_bytes((objects.len() * KwaitBlock::SIZE as usize) as u64);
+            if vector == 0 {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            (vector, true)
+        };
+        for (index, &object) in objects.iter().enumerate() {
+            let block = block_at(blocks + (index as u64) * KwaitBlock::SIZE);
+            block.wait_type.set(spec.kind);
+            block.block_state.set(BLOCK_ACTIVE);
+            block.wait_key.set(index as u16);
+            block.spare_long.set(0);
+            block.thread.set(thread);
+            block.object.set(object);
+            block.spare_ptr.set(0);
+            let head = &header(object).wait_list_head;
+            ensure_list(head);
+            insert(head, &block.wait_list_entry, spec.at_head);
+        }
+        let timed = match spec.timeout {
+            Some(timeout) => {
+                let timer_address = target.timer.address();
+                timer::initialize_timer(timer_address, TIMER_NOTIFICATION);
+                let block = &target.wait_block[TIMER_WAIT_BLOCK];
+                block.wait_type.set(wait_type::ANY);
+                block.block_state.set(BLOCK_ACTIVE);
+                block.wait_key.set(spec.timeout_key as u16);
+                block.thread.set(thread);
+                block.object.set(timer_address);
+                insert(&target.timer.header.wait_list_head, &block.wait_list_entry, false);
+                timer::set_timer(timer_address, -(timeout.max(1) as i64), 0, 0);
+                true
+            }
+            None => false,
+        };
+        target.wait_block_list.set(if objects.is_empty() { target.wait_block[TIMER_WAIT_BLOCK].address() } else { blocks });
+        target.wait_block_count.set(objects.len() as u8);
+        target.wait_status.set(0);
+        target.wait_mode.set(spec.mode as i8);
+        target.set_alertable(spec.alertable as u32);
+        target.wait_reason.set(spec.reason);
+        target.wait_time.set(thread_dispatch::tick_count());
+        // Uma espera nova começa sem o Alert de uma anterior (bit 7).
+        let register = target.wait_register.flags.get();
+        target.wait_register.flags.set((register & 0x78) | WAIT_IN_PROGRESS);
+        target.state.set(STATE_WAITING);
+        let kernel_apcs = super::irql::get_irql() == super::irql::PASSIVE_LEVEL;
+        self.table().waits.insert(thread, ActiveWait { blocks, count: objects.len(), allocated, timer: timed, alertable: spec.alertable, mode: spec.mode, kernel_apcs, explicit: spec.explicit });
+        Ok(())
+    }
+
+    /// O KiUnwaitThread: desliga os blocos e o timer da espera de `thread`,
+    /// grava KTHREAD.WaitStatus e a apronta (ou, antes da confirmação da
+    /// saída da CPU, marca a espera abortada). `false` sem espera registrada.
+    pub fn unwait(&mut self, thread: u64, status: u64) -> bool {
+        let Some(wait) = self.table().waits.remove(&thread) else { return false };
+        let target = kthread(thread);
+        for index in 0..wait.count {
+            let block = block_at(wait.blocks + (index as u64) * KwaitBlock::SIZE);
+            remove_entry(&block.wait_list_entry);
+            block.block_state.set(BLOCK_INACTIVE);
+        }
+        if wait.timer {
+            let block = &target.wait_block[TIMER_WAIT_BLOCK];
+            remove_entry(&block.wait_list_entry);
+            block.block_state.set(BLOCK_INACTIVE);
+            timer::cancel_timer(target.timer.address());
+        }
+        if wait.allocated {
+            guest::free_bytes(wait.blocks);
+        }
+        target.wait_status.set(status as i64);
+        let register = target.wait_register.flags.get();
+        if register & WAIT_STATE_MASK == WAIT_IN_PROGRESS {
+            target.wait_register.flags.set((register & !WAIT_STATE_MASK) | WAIT_ABORTED);
+        } else {
+            target.wait_register.flags.set(register & !WAIT_STATE_MASK);
+            self.ready.push(thread);
+        }
+        true
+    }
+
+    /// O KiWaitTest: depois de uma mudança de estado de `object`, satisfaz
+    /// os blocos da lista dele na ordem, consumindo pela thread que espera.
+    pub fn wait_test(&mut self, object: u64) {
+        let head = &header(object).wait_list_head;
+        if !valid_list(head) {
+            ensure_list(head);
+            return;
+        }
+        let mut entry = head.flink.get();
+        while entry != head.address() {
+            let block = block_at(entry);
+            let next = block.wait_list_entry.flink.get();
+            let thread = block.thread.get();
+            let key = block.wait_key.get() as u32;
+            match block.wait_type.get() {
+                wait_type::ANY => {
+                    if let Some(status) = dispatcher::acquire_status_for(object, true, thread) {
+                        let status = if status & 0x8000_0000 != 0 { status } else { status + key };
+                        self.unwait(thread, status as u64);
+                    }
+                }
+                wait_type::ALL => self.try_wait_all(thread),
+                wait_type::NOTIFICATION => {
+                    self.unwait(thread, key as u64);
+                }
+                _ => {}
+            }
+            entry = next;
+        }
+    }
+
+    /// Um WaitAll satisfeito só quando todos os objetos da thread estão
+    /// disponíveis para ela; então consome todos.
+    fn try_wait_all(&mut self, thread: u64) {
+        let Some(wait) = self.table().waits.get(&thread) else { return };
+        let objects: Vec<u64> = (0..wait.count).map(|index| block_at(wait.blocks + (index as u64) * KwaitBlock::SIZE).object.get()).collect();
+        if let Some(status) = dispatcher::try_wait_objects_for(&objects, wait_type::ALL as u32, thread) {
+            self.unwait(thread, status as u64);
+        }
+    }
+
+    /// A thread mais recente parada na fila `queue` (o primeiro bloco
+    /// WaitDequeue da WaitListHead, inserida na cabeça), para o KiInsertQueue.
+    pub fn first_dequeue_waiter(&mut self, queue: u64) -> Option<u64> {
+        let head = &header(queue).wait_list_head;
+        if !valid_list(head) || head.flink.get() == head.address() {
+            return None;
+        }
+        let block = block_at(head.flink.get());
+        (block.wait_type.get() == wait_type::DEQUEUE).then(|| block.thread.get())
+    }
+}
+
+/// O KiWaitTest de fora: depois de mudar o estado de `object`, satisfaz quem
+/// espera nele.
+pub fn signal(object: u64) {
+    lock().wait_test(object);
+}
+
+/// O despachante confirma que a thread deixou a CPU numa espera
+/// (WaitCommitted). `false` quando a espera já saiu antes disso (abortada):
+/// a thread volta direto à fila.
+pub fn commit(thread: u64) -> bool {
+    let mut lock = lock();
+    let target = kthread(thread);
+    let register = target.wait_register.flags.get();
+    if lock.waiting(thread) && register & WAIT_STATE_MASK == WAIT_IN_PROGRESS {
+        target.wait_register.flags.set((register & !WAIT_STATE_MASK) | WAIT_COMMITTED);
+        true
+    } else {
+        target.wait_register.flags.set(register & !WAIT_STATE_MASK);
+        false
+    }
+}
+
+/// A thread de kernel corrente (a da pilha em que a CPU está).
+fn current_waiter() -> u64 {
+    context_switch::on_kernel_thread_stack().expect("espera registrada fora de uma thread de kernel")
+}
+
+/// O status de uma espera concluída: KTHREAD.WaitStatus da thread.
+fn wait_status(thread: u64) -> u64 {
+    kthread(thread).wait_status.get() as u64
+}
+
+/// O prazo de uma espera.
+#[derive(Clone, Copy)]
+pub enum Deadline {
+    Infinite,
+    /// Uptime (100 ns) em que vence.
+    Uptime(u64),
+    /// Hora do sistema (100 ns desde 1601) em que vence.
+    SystemTime(u64),
+}
+
+impl Deadline {
+    /// Um prazo relativo em 100 ns a partir de agora.
+    pub fn after(timeout: Option<u64>) -> Deadline {
+        match timeout {
+            None => Deadline::Infinite,
+            Some(timeout) => Deadline::Uptime(clock::uptime_100ns().saturating_add(timeout)),
+        }
+    }
+
+    /// O que falta, em 100 ns (nenhum = infinito).
+    pub fn remaining(self) -> Option<u64> {
+        match self {
+            Deadline::Infinite => None,
+            Deadline::Uptime(deadline) => Some(deadline.saturating_sub(clock::uptime_100ns())),
+            Deadline::SystemTime(deadline) => Some(deadline.saturating_sub(clock::system_time_100ns())),
+        }
+    }
+}
+
+/// O laço de uma espera registrada da thread de kernel corrente: o alerta
+/// pendente primeiro, a tentativa e o registro sob o lock, a troca de
+/// contexto e, numa APC de kernel, a entrega e a espera de novo pelo prazo
+/// restante. `attempt` tenta sob o lock e devolve o status se já concluiu.
+fn wait_loop(objects: &[u64], deadline: Deadline, mut spec: WaitSpec, mut attempt: impl FnMut(&mut DispatcherLock, u64) -> Option<u64>) -> u64 {
+    let thread = current_waiter();
+    context_switch::assert_wait_allowed();
+    loop {
+        if let Some(status) = thread_alert::consume(thread, spec.mode, spec.alertable) {
+            return status as u64;
+        }
+        {
+            let mut lock = lock();
+            if let Some(status) = attempt(&mut lock, thread) {
+                return status;
+            }
+            spec.timeout = deadline.remaining();
+            if spec.timeout == Some(0) {
+                return spec.timeout_key as u64;
+            }
+            if let Err(status) = lock.link_wait(thread, objects, spec) {
+                return status as u64;
+            }
+        }
+        context_switch::switch_out(SwitchReason::Wait);
+        let status = wait_status(thread);
+        if status != STATUS_KERNEL_APC as u64 {
+            return status;
+        }
+        let _ = apc::deliver_all_queued();
+    }
+}
+
+/// KeWaitForSingleObject/KeWaitForMultipleObjects numa thread de kernel: os
+/// objetos (até 64, distintos) por WaitAny ou WaitAll, com o prazo.
+pub fn wait_for_objects(objects: &[u64], wait_all: bool, deadline: Deadline, mode: u8, alertable: bool, wait_reason: u8) -> u32 {
+    let kind = if wait_all { wait_type::ALL } else { wait_type::ANY };
+    let spec = WaitSpec::new(kind, None, mode, alertable, wait_reason);
+    wait_loop(objects, deadline, spec, |_, thread| dispatcher::try_wait_objects_for(objects, kind as u32, thread).map(|status| status as u64)) as u32
+}
+
+/// KeDelayExecutionThread numa thread de kernel: só o timer da thread, com
+/// STATUS_SUCCESS no vencimento.
+pub fn delay(deadline: Deadline, mode: u8, alertable: bool) -> u32 {
+    let spec = WaitSpec { timeout_key: STATUS_SUCCESS, ..WaitSpec::new(wait_type::ANY, None, mode, alertable, reason::DELAY_EXECUTION) };
+    wait_loop(&[], deadline, spec, |_, _| None) as u32
+}
+
+/// O resultado da espera de uma fila.
+pub enum QueueWait {
+    /// A entrada entregue pelo KeInsertQueue (KiInsertQueue).
+    Entry(u64),
+    /// A tentativa concluiu sob o lock (`attempt` devolveu o status).
+    Attempt(u64),
+    /// A espera saiu com o status (prazo, alerta, APC de usuário).
+    Status(u32),
+}
+
+/// A espera de uma fila (KeRemoveQueueEx) numa thread de kernel, como no
+/// 19041: `attempt` tenta a fila sob o lock do despachante; sem entrada,
+/// `on_block` libera a vaga da thread (CurrentCount--, ainda sob o lock), o
+/// bloco WaitDequeue entra na cabeça da WaitListHead da fila (a mais recente
+/// é a primeira atendida) e a thread deixa a CPU. O KeInsertQueue entrega a
+/// entrada direto pelo KTHREAD.WaitStatus e ocupa a vaga por ela; qualquer
+/// outra saída a ocupa aqui (`on_wake`, sob o lock). Uma APC de kernel é
+/// entregue e a espera recomeça pelo prazo restante.
+pub fn wait_queue(queue: u64, deadline: Deadline, mode: u8, alertable: bool, mut attempt: impl FnMut() -> Option<u64>, mut on_block: impl FnMut(), mut on_wake: impl FnMut()) -> QueueWait {
+    let thread = current_waiter();
+    context_switch::assert_wait_allowed();
+    loop {
+        if let Some(status) = thread_alert::consume(thread, mode, alertable) {
+            return QueueWait::Status(status);
+        }
+        {
+            let mut lock = lock();
+            if let Some(result) = attempt() {
+                return QueueWait::Attempt(result);
+            }
+            let timeout = deadline.remaining();
+            if timeout == Some(0) {
+                return QueueWait::Status(STATUS_TIMEOUT);
+            }
+            on_block();
+            let spec = WaitSpec { at_head: true, ..WaitSpec::new(wait_type::DEQUEUE, timeout, mode, alertable, reason::WR_QUEUE) };
+            if let Err(status) = lock.link_wait(thread, &[queue], spec) {
+                on_wake();
+                return QueueWait::Status(status);
+            }
+        }
+        context_switch::switch_out(SwitchReason::Wait);
+        let status = wait_status(thread);
+        // Uma entrada é um ponteiro de sistema; os status são pequenos.
+        if status >= 0xFFFF_8000_0000_0000 {
+            return QueueWait::Entry(status);
+        }
+        {
+            let _lock = lock();
+            on_wake();
+        }
+        if status != STATUS_KERNEL_APC as u64 {
+            return QueueWait::Status(status as u32);
+        }
+        let _ = apc::deliver_all_queued();
+    }
+}
+
+/// Uma espera explícita da thread de kernel corrente: o registro antes da
+/// sondagem (nenhum `wake` se perde entre as duas), a sondagem fora do lock
+/// e a troca de contexto até um [`wake`], o sinal de `watch` (um bloco de
+/// notificação, que não consome), o prazo, um alerta ou uma APC. Devolve o
+/// status de `poll`; um alerta, uma APC de usuário ou o prazo vencido sem a
+/// sondagem concluir devolvem o status da espera.
+pub fn wait_woken(poll: &mut dyn FnMut() -> Option<u32>, watch: Option<u64>, deadline: Deadline, mode: u8, alertable: bool, wait_reason: u8) -> u32 {
+    let thread = current_waiter();
+    context_switch::assert_wait_allowed();
+    loop {
+        if let Some(status) = poll() {
+            return status;
+        }
+        if let Some(status) = thread_alert::consume(thread, mode, alertable) {
+            return status;
+        }
+        if deadline.remaining() == Some(0) {
+            return poll().unwrap_or(STATUS_TIMEOUT);
+        }
+        match wait_once(poll, watch, deadline, mode, alertable, wait_reason) {
+            WaitOnce::Done(status) => return status,
+            WaitOnce::Woken(STATUS_KERNEL_APC) => {
+                let _ = apc::deliver_all_queued();
+            }
+            WaitOnce::Woken(status @ (STATUS_ALERTED | STATUS_USER_APC | STATUS_TIMEOUT)) => return poll().unwrap_or(status),
+            WaitOnce::Woken(_) => {}
+        }
+    }
+}
+
+/// O resultado de uma volta de [`wait_once`].
+pub enum WaitOnce {
+    /// A sondagem concluiu (antes da troca) com o status dela.
+    Done(u32),
+    /// A thread saiu da espera com o status (STATUS_SUCCESS num `wake` ou no
+    /// sinal de `watch`).
+    Woken(u32),
+}
+
+/// Uma volta de espera explícita: registra (bloco de notificação em `watch`,
+/// o timer do prazo), sonda (um `wake` entre o registro e a sondagem não se
+/// perde) e, se a sondagem não concluiu, deixa a CPU até sair da espera.
+pub fn wait_once(poll: &mut dyn FnMut() -> Option<u32>, watch: Option<u64>, deadline: Deadline, mode: u8, alertable: bool, wait_reason: u8) -> WaitOnce {
+    let thread = current_waiter();
+    let objects: &[u64] = match &watch {
+        Some(object) => core::slice::from_ref(object),
+        None => &[],
+    };
+    let spec = WaitSpec { explicit: true, ..WaitSpec::new(wait_type::NOTIFICATION, deadline.remaining(), mode, alertable, wait_reason) };
+    if lock().link_wait(thread, objects, spec).is_err() {
+        return WaitOnce::Done(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    // O registro vem antes da sondagem: um `wake` entre as duas marca a
+    // espera abortada e a troca volta logo.
+    if let Some(status) = poll() {
+        cancel(thread);
+        return WaitOnce::Done(status);
+    }
+    context_switch::switch_out(SwitchReason::Wait);
+    WaitOnce::Woken(wait_status(thread) as u32)
+}
+
+/// Desfaz a espera registrada da thread corrente que não chegou a deixar a
+/// CPU (a condição concluiu entre o registro e a troca).
+fn cancel(thread: u64) {
+    let mut lock = lock();
+    lock.unwait(thread, STATUS_SUCCESS as u64);
+    let target = kthread(thread);
+    let register = target.wait_register.flags.get();
+    target.wait_register.flags.set(register & !WAIT_STATE_MASK);
+    // A thread segue em execução: nada a aprontar.
+    lock.ready.retain(|&ready| ready != thread);
+}
+
+/// Conclui a espera explícita de `thread` (a retirada de uma porta de
+/// conclusão, uma mensagem ALPC que chegou): ela volta à fila e sonda de
+/// novo. Uma espera de objeto não é tocada.
+pub fn wake(thread: u64) -> bool {
+    let mut lock = lock();
+    if !lock.table().waits.get(&thread).is_some_and(|wait| wait.explicit) {
+        return false;
+    }
+    lock.unwait(thread, STATUS_SUCCESS as u64)
+}
+
+/// Um alerta para `thread` (KeAlertThread): uma espera registrada alertável,
+/// de modo igual ou menor que o da espera, sai com STATUS_ALERTED. `true` se
+/// a espera saiu.
+pub fn alert(thread: u64, mode: u8) -> bool {
+    let mut lock = lock();
+    let Some(wait) = lock.table().waits.get(&thread) else { return false };
+    if !wait.alertable || mode > wait.mode {
+        return false;
+    }
+    lock.unwait(thread, STATUS_ALERTED as u64)
+}
+
+/// Uma APC enfileirada para `thread` (o KiInsertQueueApc): a de usuário numa
+/// espera alertável de UserMode publica UserApcPending e sai com
+/// STATUS_USER_APC; a de kernel numa espera em PASSIVE_LEVEL, com as APCs
+/// do tipo dela habilitadas, sai com STATUS_KERNEL_APC.
+pub fn apc_queued(thread: u64, user_mode: bool, special: bool) {
+    let mut lock = lock();
+    let Some(wait) = lock.table().waits.get(&thread) else { return };
+    let target = kthread(thread);
+    if user_mode {
+        if wait.alertable && wait.mode == 1 {
+            target.apc_state.set_user_apc_pending(1);
+            lock.unwait(thread, STATUS_USER_APC as u64);
+        }
+        return;
+    }
+    let enabled = if special { target.special_apc_disable.get() == 0 } else { target.kernel_apc_disable.get() == 0 && target.special_apc_disable.get() == 0 };
+    if wait.kernel_apcs && enabled {
+        lock.unwait(thread, STATUS_KERNEL_APC as u64);
+    }
+}
+
+/// `thread` tem uma espera registrada (diagnóstico e autotestes).
+pub fn is_waiting(thread: u64) -> bool {
+    lock().waiting(thread)
+}

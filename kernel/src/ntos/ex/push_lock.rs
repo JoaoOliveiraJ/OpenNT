@@ -250,11 +250,27 @@ impl PushLockRequest {
     }
 }
 
-/// Numa syscall a thread bloqueia até a posse; fora dela o dispatcher avança
-/// entre consultas.
+impl PushLockRequest {
+    /// O WakeEvent do bloco de espera publicado, enquanto estacionada nele.
+    fn watched(&self) -> Option<u64> {
+        (self.queued && self.parked && self.allocation != 0).then(|| wait_block(self.allocation).wake_event.address())
+    }
+}
+
+/// Uma thread de kernel sai das prontas até o WakeEvent do bloco (WrPushLock);
+/// numa syscall a thread bloqueia até a posse; no contexto de boot o
+/// dispatcher avança entre consultas.
 fn acquire(pointer: u64, shared: bool, flags: u32) -> Result<(), KernelError> {
     let mut request = begin(pointer, shared, flags)?;
-    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel).map(|_| ())
+    crate::ntos::ke::context_switch::acquire_signaled(
+        || {
+            let result = request.poll();
+            (result, request.watched())
+        },
+        crate::ntos::ke::wait::reason::WR_PUSH_LOCK,
+        dispatcher::pump_kernel,
+    )
+    .map(|_| ())
 }
 
 /// O último leitor acompanha a contagem do bloco antigo e assume o despertar.

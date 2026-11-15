@@ -3,17 +3,26 @@
 //! O transporte de `ps/user/alpc` instala as entradas depois da carga dos
 //! módulos, evitando o ciclo entre threads de kernel, transporte ALPC e
 //! escalonamento de usuário. As entradas Zw de troca de mensagens e conexão
-//! bombeiam a operação retomável pelo escalonador de kernel até concluir.
+//! conduzem a operação retomável até concluir: uma thread de kernel sai das
+//! prontas (WrLpcReceive) e volta quando o transporte muda (uma mensagem na
+//! fila de uma porta, um pedido, uma resposta, a decisão de uma conexão, o
+//! fecho de uma porta: [`notify_waiters`]), pelo prazo ou por um alerta, e
+//! sonda a operação de novo; o contexto de boot gira o pump do kernel.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 
-use crate::ntos::ke::dispatcher;
+use crate::ntos::ke::{context_switch, dispatcher, wait};
 use crate::rtl::{KernelError, SpinLock};
 
 /// Operação retomável devolvida pelo transporte.
 pub trait Pending {
     fn poll(&mut self) -> Option<u32>;
     fn cancel(&mut self);
+    /// O prazo, o modo e se a espera é alertável.
+    fn wait_parameters(&self) -> (wait::Deadline, u8, bool) {
+        (wait::Deadline::Infinite, 0, false)
+    }
 }
 
 impl Pending for super::kernel_wait::Request {
@@ -23,6 +32,34 @@ impl Pending for super::kernel_wait::Request {
     fn cancel(&mut self) {
         super::kernel_wait::Request::cancel(self)
     }
+    fn wait_parameters(&self) -> (wait::Deadline, u8, bool) {
+        super::kernel_wait::Request::wait_parameters(self)
+    }
+}
+
+/// As threads de kernel paradas numa espera do ALPC.
+static WAITERS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+/// O transporte mudou: as threads de kernel paradas numa espera do ALPC
+/// voltam à fila e sondam a operação delas de novo.
+pub fn notify_waiters() {
+    let waiters: alloc::vec::Vec<u64> = WAITERS.lock().iter().copied().collect();
+    for thread in waiters {
+        wait::wake(thread);
+    }
+}
+
+/// Uma espera do ALPC: numa thread de kernel, a saída das prontas até
+/// [`notify_waiters`], o prazo ou um alerta (`ke::wait`); fora dela, a
+/// espera sondada do `context_switch`.
+pub fn wait_transport(poll: &mut dyn FnMut() -> Option<u32>, deadline: wait::Deadline, mode: u8, alertable: bool) -> u32 {
+    let Some(thread) = context_switch::on_kernel_thread_stack().filter(|_| context_switch::kernel_thread_can_block()) else {
+        return context_switch::wait_until(poll, dispatcher::pump_kernel);
+    };
+    WAITERS.lock().insert(thread);
+    let status = wait::wait_woken(poll, None, deadline, mode, alertable, wait::reason::WR_LPC_RECEIVE);
+    WAITERS.lock().remove(&thread);
+    status
 }
 
 /// Resultado já decidido.
@@ -81,14 +118,19 @@ pub fn begin_connection_ex(arguments: &[u64; 11]) -> Result<Box<dyn Pending>, Ke
     entry(arguments)
 }
 
-/// Bombeia a operação retomável até concluir; o cancelamento final é
-/// inócuo depois da conclusão.
+/// Conduz a operação retomável até concluir; o cancelamento final é inócuo
+/// depois da conclusão (e desfaz a que a espera deixou pela metade).
 pub fn drive(mut operation: Box<dyn Pending>) -> u32 {
-    let status = loop {
-        if let Some(status) = operation.poll() {
-            break status;
+    let status = if context_switch::kernel_thread_can_block() {
+        let (deadline, mode, alertable) = operation.wait_parameters();
+        wait_transport(&mut || operation.poll(), deadline, mode, alertable)
+    } else {
+        loop {
+            if let Some(status) = operation.poll() {
+                break status;
+            }
+            dispatcher::pump_kernel();
         }
-        dispatcher::pump_kernel();
     };
     operation.cancel();
     status

@@ -412,6 +412,9 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     // (a raiz própria do processo de usuário ou a do System).
     object.pcb.header.lock.set(PROCESS_OBJECT as i32);
     object.pcb.header.signal_state.set(0);
+    let wait_list = &object.pcb.header.wait_list_head;
+    wait_list.flink.set(wait_list.address());
+    wait_list.blink.set(wait_list.address());
     object.pcb.base_priority.set(8);
     object.pcb.directory_table_base.set(process_address_space::root_of(process).unwrap_or(memory_map::PML4_PHYS));
     object.unique_process_id.set(process_id);
@@ -524,7 +527,9 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
         alerted.set(0);
     }
     tcb.misc_flags.set(if previous_mode == 0 { Kthread::SYSTEM_THREAD_MASK as i32 } else { 0 });
-    for head in [&tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list, &object.active_timer_list_head] {
+    // O cabeçalho de objeto de espera da thread e o do timer do prazo das
+    // esperas dela (KTHREAD.Timer) começam com a lista de espera vazia.
+    for head in [&tcb.header.wait_list_head, &tcb.timer.header.wait_list_head, &tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list, &object.active_timer_list_head] {
         head.flink.set(head.address());
         head.blink.set(head.address());
     }
@@ -744,6 +749,7 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     // O KPROCESS é um objeto de espera: sinalizado no término, como o
     // KeTerminateProcess faz; quem espera no handle do processo acorda.
     object.pcb.header.signal_state.set(1);
+    crate::ntos::ke::wait::signal(process);
     remove_from_active_list(object);
     // Fora da lista ativa, o estado por processo some e o VAD volta inteiro
     // (o MmCleanProcessAddressSpace); o EPROCESS pode continuar retido por

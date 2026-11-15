@@ -855,6 +855,9 @@ pub fn fatal_unless_transfer<T>(tag: &str, result: Result<T, KernelError>) -> Re
 /// em vez de devolver zero e pular a operação.
 #[no_mangle]
 pub extern "win64" fn opennt_ntoskrnl_dispatch(id: u64, frame: u64, context: u64) -> u64 {
+    // Uma thread de kernel que gastou o quantum cede a vez antes do serviço
+    // (e recebe as APCs de kernel pendentes), como no fim de quantum do NT.
+    crate::ntos::ke::context_switch::quantum_end_at_service_entry();
     // O CONTEXT e o frame estão na pilha do chamador (kernel).
     let read = |address: u64| unsafe { core::ptr::read_volatile(address as *const u64) };
     let mut args = [0u64; 14];

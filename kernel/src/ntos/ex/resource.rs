@@ -320,7 +320,7 @@ fn wake_shared(resource: &'static Eresource) -> Result<(), KernelError> {
             set_owner(reserve_owner(resource, false)?, thread, 1)?;
         }
         set_owner_count(resource, resource.active_entries.get() + 1);
-        block.event.header.signal_state.set(1);
+        dispatcher::set_event(block.event.address());
     }
     Ok(())
 }
@@ -331,7 +331,7 @@ fn wake_exclusive(resource: &Eresource) -> Result<(), KernelError> {
     set_exclusive(resource, true);
     set_owner_count(resource, 1);
     set_owner(&resource.owner_entry, block.thread.get(), 1)?;
-    block.event.header.signal_state.set(1);
+    dispatcher::set_event(block.event.address());
     Ok(())
 }
 
@@ -445,11 +445,21 @@ impl Request {
     }
 }
 
-/// Numa syscall a thread bloqueia até a posse; fora dela o dispatcher avança
-/// entre consultas.
+/// Uma thread de kernel sai das prontas até o evento do bloco de espera que
+/// a entrega da posse sinaliza (WrResource); numa syscall a thread bloqueia
+/// até a posse; no contexto de boot o dispatcher avança entre consultas.
 fn acquire(resource: u64, mode: Mode, wait: bool, enter_critical: bool) -> Result<u64, KernelError> {
     let mut request = begin(resource, mode, wait, enter_critical)?;
-    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
+    crate::ntos::ke::context_switch::acquire_signaled(
+        || {
+            let result = request.poll();
+            // SAFETY: bloco alocado e publicado pela requisição.
+            let watched = (request.block != 0).then(|| unsafe { WaitBlock::at(request.block) }.event.address());
+            (result, watched)
+        },
+        crate::ntos::ke::wait::reason::WR_RESOURCE,
+        dispatcher::pump_kernel,
+    )
 }
 
 pub fn acquire_exclusive(resource: u64, wait: bool) -> Result<u64, KernelError> {

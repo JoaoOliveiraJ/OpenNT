@@ -123,8 +123,22 @@ fn in_use(stack: &KernelStack) -> bool {
 /// MmCreateKernelStack: uma pilha nova, zerada, com a guarda e o
 /// KERNEL_STACK_CONTROL no InitialStack.
 pub fn create(large: bool) -> Result<KernelStack, KernelError> {
+    create_sized(if large { KERNEL_LARGE_STACK_SIZE } else { KERNEL_STACK_SIZE })
+}
+
+/// A pilha de uma thread de kernel (as threads de sistema dos drivers e os
+/// processos de kernel do escalonador): o serviço do kernel que o código
+/// nativo chama roda nela inteiro, então ela ocupa a reserva toda menos a
+/// guarda.
+pub fn create_for_kernel_thread() -> Result<KernelStack, KernelError> {
+    create_sized(KERNEL_THREAD_STACK_SIZE)
+}
+
+/// O tamanho da pilha de uma thread de kernel ([`create_for_kernel_thread`]).
+pub const KERNEL_THREAD_STACK_SIZE: u64 = SLOT_SIZE - KERNEL_STACK_GUARD;
+
+fn create_sized(size: u64) -> Result<KernelStack, KernelError> {
     reap();
-    let size = if large { KERNEL_LARGE_STACK_SIZE } else { KERNEL_STACK_SIZE };
     let slot = {
         let mut state = STATE.lock();
         match state.free_slots.pop() {

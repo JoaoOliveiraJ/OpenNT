@@ -11,6 +11,7 @@ use crate::ntos::alpc::completion_reference::{self, Reference};
 use crate::ntos::alpc::kernel_wait;
 use crate::ntos::alpc::message::buffer as message_buffer;
 use crate::ntos::ke::{clock, context_switch, dispatcher, thread_alert, thread_dispatch};
+use crate::ntos::ke::wait as ke_wait;
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet, Waiter};
 use crate::ntos::ps::process;
 use crate::ntos::rtl::native_context;
@@ -313,14 +314,31 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
 }
 
 /// ZwRemoveIoCompletionEx: a entrada Zw de seis argumentos (KernelMode).
-/// Numa syscall a thread bloqueia até a retirada concluir (o despachante
-/// sonda a retirada no contexto dela); fora dela a espera gira o
-/// `pump_kernel`. O sinal de transferência continua propagando; outra falha
-/// interna interrompe o sistema.
+/// Uma thread de kernel sai das prontas (WrQueue) até a porta entregar os
+/// pacotes (a reserva feita pelo enfileiramento a apronta), o prazo ou um
+/// alerta; numa syscall a thread bloqueia até a retirada concluir (o
+/// despachante sonda a retirada no contexto dela); no contexto de boot a
+/// espera gira o `pump_kernel`. O sinal de transferência continua
+/// propagando; outra falha interna interrompe o sistema.
 pub fn remove_cooperative(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, alertable: bool) -> Result<u32, KernelError> {
     let result = (|| -> Result<u32, KernelError> {
         let mut request = begin(handle, output, count, removed, timeout, alertable, 0, true, None)?;
         if let Some(status) = request.poll() {
+            return Ok(status);
+        }
+        if context_switch::kernel_thread_can_block() {
+            // O prazo do LARGE_INTEGER: negativo relativo, positivo absoluto.
+            let deadline = match (timeout != 0).then(|| guest::try_read::<i64>(timeout)) {
+                None => ke_wait::Deadline::Infinite,
+                Some(Ok(interval)) if interval <= 0 => ke_wait::Deadline::after(Some(interval.unsigned_abs())),
+                Some(Ok(interval)) => ke_wait::Deadline::SystemTime(interval as u64),
+                Some(Err(_)) => ke_wait::Deadline::after(Some(0)),
+            };
+            let status = ke_wait::wait_woken(&mut || request.poll(), None, deadline, 0, alertable, ke_wait::reason::WR_QUEUE);
+            // A espera saiu (alerta, APC) sem a retirada concluir: desfeita.
+            if request.poll().is_none() {
+                request.cancel();
+            }
             return Ok(status);
         }
         Ok(context_switch::wait_until(&mut || request.poll(), dispatcher::pump_kernel))

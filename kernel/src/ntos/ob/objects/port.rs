@@ -239,6 +239,7 @@ impl Port {
         }
         notify_disconnect(self, false);
         self.cleanup_when_idle();
+        crate::ntos::alpc::kernel_entry::notify_waiters();
         0
     }
 

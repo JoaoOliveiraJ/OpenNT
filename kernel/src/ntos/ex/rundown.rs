@@ -250,11 +250,28 @@ pub fn begin(pointer: u64, cache_aware: bool) -> Result<RundownRequest, KernelEr
     Ok(request)
 }
 
-/// ExWaitForRundownProtectionRelease: numa syscall a thread bloqueia até a
-/// última liberação; fora dela o dispatcher avança entre consultas.
+impl RundownRequest {
+    /// O WakeEvent do bloco de espera de quem possui o encerramento (um
+    /// observador acompanha só a palavra publicada).
+    fn watched(&self) -> Option<u64> {
+        (self.observer == 0 && self.block != 0 && !self.done).then(|| wait_block(self.block).wake_event.address())
+    }
+}
+
+/// ExWaitForRundownProtectionRelease: uma thread de kernel sai das prontas
+/// até o WakeEvent que a última liberação sinaliza (WrRundown); numa syscall
+/// a thread bloqueia até a última liberação; no contexto de boot o
+/// dispatcher avança entre consultas.
 pub fn wait_ex(pointer: u64, cache_aware: bool) -> Result<(), KernelError> {
     let mut request = begin(pointer, cache_aware)?;
-    crate::ntos::ke::context_switch::acquire_until(|| Ok(request.poll().then_some(())), dispatcher::pump_kernel)
+    crate::ntos::ke::context_switch::acquire_signaled(
+        || {
+            let done = request.poll();
+            (Ok(done.then_some(())), request.watched())
+        },
+        crate::ntos::ke::wait::reason::WR_RUNDOWN,
+        dispatcher::pump_kernel,
+    )
 }
 
 pub fn wait(pointer: u64) -> Result<(), KernelError> {

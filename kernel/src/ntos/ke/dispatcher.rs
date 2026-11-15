@@ -1,15 +1,20 @@
 //! Objetos de espera do dispatcher.
 //!
 //! Eventos, semáforos, mutants, timers e threads e processos sinalizados.
-//! Uma espera dentro de uma syscall bloqueia a thread (`context_switch`); as
-//! outras são cooperativas: drenam timers, DPCs, work items e o escalonador
-//! enquanto aguardam o estado ou o prazo.
+//! Toda mudança que pode satisfazer uma espera (KeSetEvent, KePulseEvent,
+//! KeReleaseSemaphore, KeReleaseMutex) testa as esperas registradas no
+//! objeto (`wait::signal`, o KiWaitTest), que aprontam as threads de kernel
+//! paradas nele. A espera de uma thread de kernel registra os blocos e deixa
+//! a CPU (`ke::wait`); a de uma thread de usuário numa syscall bloqueia
+//! (`context_switch`) e é sondada pelo despachante de usuário; a do contexto
+//! de boot drena timers, DPCs, work items e o escalonador enquanto aguarda o
+//! estado ou o prazo.
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::{clock, context_switch, dpc, thread_alert, timer};
+use super::{clock, context_switch, dpc, thread_alert, timer, wait};
 use crate::ntos::inc::types::{DispatcherHeader, Field, Kevent, Kmutant, Ksemaphore, LargeInteger, ListEntry, NtStruct};
 use crate::ntos::io::work_items;
 use crate::ntos::ps::{process, scheduler};
@@ -54,9 +59,13 @@ pub fn initialize_event(event: u64, event_type: u8, initial_state: bool) {
     initialize_list_head(&event.header.wait_list_head);
 }
 
-/// KeSetEvent: devolve o estado anterior (troca atômica do SignalState).
+/// KeSetEvent: devolve o estado anterior (troca atômica do SignalState) e
+/// satisfaz quem espera no evento (o de sincronização volta a não
+/// sinalizado ao entregar o sinal a uma thread).
 pub fn set_event(event: u64) -> u32 {
-    header_at(event).signal_state.atomic().swap(1, Ordering::SeqCst) as u32
+    let previous = header_at(event).signal_state.atomic().swap(1, Ordering::SeqCst) as u32;
+    wait::signal(event);
+    previous
 }
 
 pub fn clear_event(event: u64) {
@@ -111,7 +120,10 @@ pub fn release_semaphore(semaphore: u64, release_count: i64) -> Result<u32, u32>
         }
         let next = (previous as u32).wrapping_add(release_count as u32) as i32;
         match state.atomic().compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return Ok(previous as u32),
+            Ok(_) => {
+                wait::signal(semaphore.address());
+                return Ok(previous as u32);
+            }
             Err(observed) => previous = observed,
         }
     }
@@ -122,17 +134,19 @@ pub fn semaphore_limit(semaphore: u64) -> u32 {
 }
 
 /// KeInitializeSemaphore dos drivers: KSEMAPHORE com Type 5, SignalState =
-/// contagem e Limit (sem tocar no tamanho nem na lista de espera).
+/// contagem, Limit e a lista de espera vazia (sem tocar no tamanho).
 pub fn initialize_driver_semaphore(semaphore: u64, count: u32, limit: u32) {
     let semaphore = semaphore_at(semaphore);
     semaphore.header.type_.set(object_type::SEMAPHORE);
     semaphore.header.signal_state.set(count as i32);
     semaphore.limit.set(limit as i32);
+    initialize_list_head(&semaphore.header.wait_list_head);
 }
 
 /// KeReleaseSemaphore dos drivers: devolve o SignalState anterior; o novo é
 /// anterior + ajuste, limitado ao Limit (num compare-exchange).
 pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
+    let object = semaphore;
     let semaphore = semaphore_at(semaphore);
     let limit = semaphore.limit.get();
     let state = semaphore.header.signal_state.atomic();
@@ -140,7 +154,12 @@ pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
     loop {
         let released = previous.wrapping_add(adjustment).min(limit);
         match state.compare_exchange(previous, released, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return previous,
+            Ok(_) => {
+                if released > 0 {
+                    wait::signal(object);
+                }
+                return previous;
+            }
             Err(observed) => previous = observed,
         }
     }
@@ -191,6 +210,9 @@ pub fn release_mutant(mutex: u64, abandon: bool) -> Result<i32, u32> {
     if abandon {
         mutant.mutant_flags.set(1);
     }
+    if next == 1 {
+        wait::signal(mutex);
+    }
     Ok(previous)
 }
 
@@ -202,10 +224,16 @@ pub fn release_mutex(mutex: u64) -> u32 {
     }
 }
 
-/// Consulta ou consome o estado. `None` = indisponível; senão sucesso,
-/// abandono (0x80) ou erro de limite. Consumir é um compare-exchange no
-/// SignalState: dois waiters nunca satisfazem a mesma permissão ou sinal.
+/// Consulta ou consome o estado pela thread corrente.
 pub fn acquire_status(object: u64, consume: bool) -> Option<u32> {
+    acquire_status_for(object, consume, process::get_current_thread())
+}
+
+/// Consulta ou consome o estado pela thread `owner` (a que espera: um mutant
+/// passa a ser dela). `None` = indisponível; senão sucesso, abandono (0x80)
+/// ou erro de limite. Consumir é um compare-exchange no SignalState: dois
+/// waiters nunca satisfazem a mesma permissão ou sinal.
+pub fn acquire_status_for(object: u64, consume: bool, owner: u64) -> Option<u32> {
     let header = header_at(object);
     let state = &header.signal_state;
     match header.type_.get() {
@@ -235,7 +263,6 @@ pub fn acquire_status(object: u64, consume: bool) -> Option<u32> {
         }
         object_type::MUTANT => {
             let mutant = mutant_at(object);
-            let owner = process::get_current_thread();
             let mut recursion = state.get();
             loop {
                 if recursion <= 0 && mutant.owner_thread.get() != owner {
@@ -301,8 +328,20 @@ fn pump_scheduler() {
 }
 
 /// Interrupções de dispositivo, timers, DPCs, work items, conclusões
-/// registradas e escalonador.
+/// registradas e escalonador: o trabalho do despachante, que só o contexto
+/// de boot gira. Numa thread de kernel o pump não aninha o despachante na
+/// pilha dela: a thread cede a vez (em DISPATCH_LEVEL ou acima, só os
+/// timers e as DPCs andam).
 pub fn pump_kernel() {
+    if context_switch::on_kernel_thread_stack().is_some() {
+        if context_switch::kernel_thread_can_block() {
+            context_switch::yield_kernel_thread(false);
+        } else {
+            timer::check_timers();
+            let _ = dpc::run_queue();
+        }
+        return;
+    }
     super::interrupt_object::service_during_wait();
     timer::check_timers();
     let _ = dpc::run_queue();
@@ -332,10 +371,14 @@ fn expired(timeout: Option<u64>, deadline: Option<u64>) -> bool {
     timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline)
 }
 
-/// KeWaitForSingleObject. Numa syscall a thread bloqueia até o objeto ser
-/// sinalizado ou o prazo vencer (`context_switch::wait_until`); fora dela a
-/// espera gira o `pump_kernel`.
+/// KeWaitForSingleObject. Uma thread de kernel registra o bloco e deixa a
+/// CPU até o sinal ou o prazo (`ke::wait`); numa syscall a thread bloqueia
+/// até o objeto ser sinalizado ou o prazo vencer (`context_switch::wait_until`);
+/// no contexto de boot a espera gira o `pump_kernel`.
 pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
+    if context_switch::kernel_thread_can_block() {
+        return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
+    }
     let (timeout, deadline) = deadline(timeout_pointer);
     let mut poll = || acquire_status(object, true).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     if alertable {
@@ -344,24 +387,29 @@ pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, 
     context_switch::wait_until(&mut poll, pump_kernel)
 }
 
-/// Tentativa sem espera. WaitAny (1) devolve o primeiro índice satisfeito;
-/// WaitAll (0) consulta todos antes de consumir.
+/// Tentativa sem espera pela thread corrente.
 pub fn try_wait_objects(objects: &[u64], wait_type: u32) -> Option<u32> {
+    try_wait_objects_for(objects, wait_type, process::get_current_thread())
+}
+
+/// Tentativa sem espera pela thread `owner`. WaitAny (1) devolve o primeiro
+/// índice satisfeito; WaitAll (0) consulta todos antes de consumir.
+pub fn try_wait_objects_for(objects: &[u64], wait_type: u32, owner: u64) -> Option<u32> {
     if wait_type == 1 {
         for (index, &object) in objects.iter().enumerate() {
-            if let Some(status) = acquire_status(object, true) {
+            if let Some(status) = acquire_status_for(object, true, owner) {
                 return Some(if status & 0x8000_0000 != 0 { status } else { status + index as u32 });
             }
         }
         return None;
     }
-    let states: Vec<Option<u32>> = objects.iter().map(|&object| acquire_status(object, false)).collect();
+    let states: Vec<Option<u32>> = objects.iter().map(|&object| acquire_status_for(object, false, owner)).collect();
     if let Some(error) = states.iter().flatten().find(|&&status| status & 0x8000_0000 != 0) {
         return Some(*error);
     }
     if states.iter().all(Option::is_some) {
         for &object in objects {
-            acquire_status(object, true);
+            acquire_status_for(object, true, owner);
         }
         // Um mutant abandonado preserva STATUS_ABANDONED no resultado conjunto.
         return Some(if states.contains(&Some(0x80)) { 0x80 } else { STATUS_SUCCESS });
@@ -378,6 +426,9 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
     let objects: Vec<u64> = unsafe { Field::<u64>::array_at(objects_pointer, count as usize) }.iter().map(Field::get).collect();
     if objects.iter().collect::<BTreeSet<_>>().len() != objects.len() {
         return 0xC000_000D;
+    }
+    if context_switch::kernel_thread_can_block() {
+        return wait::wait_for_objects(&objects, wait_type == 0, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
     let mut poll = || try_wait_objects(&objects, wait_type).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));

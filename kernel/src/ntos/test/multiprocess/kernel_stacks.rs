@@ -32,7 +32,7 @@ use crate::ntos::inc::types::{Context, Ethread, Kthread, NtStruct};
 use crate::ntos::init::exports;
 use crate::ntos::ke::{callout, clock, pcr};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::mm::kernel_stack::{self, KERNEL_LARGE_STACK_SIZE, KERNEL_STACK_GUARD, KERNEL_STACK_SIZE};
+use crate::ntos::mm::kernel_stack::{self, KERNEL_LARGE_STACK_SIZE, KERNEL_STACK_GUARD, KERNEL_STACK_SIZE, KERNEL_THREAD_STACK_SIZE};
 use crate::ntos::mm::pe_loader::ResolvedImport;
 use crate::ntos::mm::{memory_map as map, paging, pfn};
 use crate::ntos::ob::object_manager;
@@ -275,7 +275,7 @@ fn native_thread_limits(assert: Assert) {
     let _ = object_manager::close(handle as u32);
     let finished = pump(&|| guest::read32(block + 0x18) == 0x77 && kernel_stack::find(base).is_none());
     let (low, high, rsp) = (guest::read64(block), guest::read64(block + 8), guest::read64(block + 0x10));
-    assert(map::is_kernel_stack(limit) && base - limit == KERNEL_STACK_SIZE && initial == base - KernelStackControl::SIZE, "pilhas: a thread nativa tem pilha de kernel propria na janela de sistema");
+    assert(map::is_kernel_stack(limit) && base - limit == KERNEL_THREAD_STACK_SIZE && initial == base - KernelStackControl::SIZE, "pilhas: a thread nativa tem pilha de kernel propria na janela de sistema, do tamanho da de uma thread de kernel");
     assert(guest::read32(block + 0x18) == 0x77 && low == limit && high == base && rsp > low && rsp < initial, "pilhas: IoGetStackLimits de uma thread nativa devolve a faixa real, que contem o RSP do codigo nativo");
     assert(finished, "pilhas: o ceifador da thread nativa devolve a pilha");
     guest::free_bytes(block);

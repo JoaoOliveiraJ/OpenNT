@@ -1,14 +1,20 @@
-//! Despacho de contextos de kernel por prioridade.
+//! Despacho das threads de kernel por prioridade.
 //!
-//! Cada processo é um `Future` que devolve o controle ao kernel: cada
-//! `yield_now().await` devolve `Pending` e o escalonador o retoma depois. O
-//! sinal do passo (espera com continuação de prontidão, manter o quantum)
-//! é publicado pelo future antes de devolver `Pending`.
-//! Estados: ready -> running -> waiting/done/killed (recolhidos pelo kernel).
-//!
-//! Cada processo tem um EPROCESS + KTHREAD reais (`ps/process`); o tick
-//! ajusta a thread corrente (o gs:[0x188] do NT) durante o passo de cada um
-//! e a seleção segue as filas de prioridade do `ke/thread_dispatch`.
+//! Cada entrada do escalonador é uma thread de kernel com EPROCESS/KTHREAD
+//! reais (`ps/process`) e pilha de kernel própria: um processo de kernel
+//! ([`spawn`], um `Future` sondado na pilha da própria thread, que devolve
+//! a CPU a cada `yield_now().await`) ou uma thread de outro processo
+//! ([`spawn_into_process`], com o corpo dado: as threads de sistema dos
+//! drivers e as requisições do kernel no System). O tick ([`tick`]) roda no
+//! despachante da CPU — o contexto de boot, nunca a pilha de uma thread de
+//! kernel —, escolhe pelas filas de prioridade do `ke/thread_dispatch` e
+//! entra na thread por uma troca de contexto (`context_switch::resume`): ela
+//! roda até ceder a vez, esperar ou terminar, e devolve a CPU por outra
+//! troca. Uma espera tira a thread das prontas: a de um objeto do
+//! despachante ou de uma fila (`ke::wait`) até o sinal aprontá-la, e a de
+//! uma condição sondada ([`block_polled`], [`wait_until`]) até o despachante
+//! achar a condição satisfeita. Estados: ready -> running -> waiting/done
+//! (recolhidos pelo kernel).
 //!
 //! As threads de usuário estão nas mesmas filas: quando a mais prioritária
 //! é uma delas, o tick dá intervalos pelo despachante de todos os processos
@@ -21,13 +27,16 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use super::{cid, process};
 use super::user::threads::{self as user_threads, Dispatched};
-use crate::ntos::ke::{clock, thread_dispatch};
+use crate::ntos::ke::context_switch::{self, SwitchReason};
+use crate::ntos::ke::{clock, thread_dispatch, wait};
+use crate::ntos::mm::kernel_stack;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::Ethread;
@@ -35,6 +44,12 @@ use crate::ntos::inc::types::Ethread;
 pub type ProcessFuture = Pin<Box<dyn Future<Output = u32> + Send>>;
 /// Continuação de prontidão: consumida no contexto do dono; `true` = pronta.
 pub type PrepareDispatch = Box<dyn FnMut() -> bool + Send>;
+/// O corpo de uma thread de kernel: roda na pilha dela e devolve o status
+/// de saída.
+pub type ThreadBody = Box<dyn FnOnce() -> u32 + Send>;
+
+/// STATUS_UNSUCCESSFUL: o status de uma thread sem corpo.
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessState {
@@ -60,8 +75,8 @@ impl ProcessState {
 struct Process {
     pid: u32,
     name: String,
-    /// `None` enquanto o processo está sendo executado (fora do lock).
-    future: Option<ProcessFuture>,
+    /// O corpo, até a thread começar (ela o leva para a própria pilha).
+    body: Option<ThreadBody>,
     state: ProcessState,
     exit_status: Option<u32>,
     process_pointer: u64,
@@ -69,6 +84,10 @@ struct Process {
     owns_process: bool,
     on_reap: Option<Box<dyn FnOnce() + Send>>,
     prepare_dispatch: Option<PrepareDispatch>,
+    /// Terminação pedida (`kill`): a thread sai no próximo ponto de cessão.
+    kill_requested: bool,
+    /// A thread fez a última troca: a pilha já pode ser recolhida.
+    exited: bool,
 }
 
 struct SchedulerState {
@@ -78,14 +97,6 @@ struct SchedulerState {
 }
 
 static STATE: SpinLock<SchedulerState> = SpinLock::new(SchedulerState { processes: Vec::new(), next_pid: 8, system_thread: 0 }); // 0-7 reservados (4 = System)
-
-/// O sinal do passo corrente.
-enum StepSignal {
-    Waiting(PrepareDispatch),
-    RetainQuantum,
-}
-
-static STEP: SpinLock<Option<StepSignal>> = SpinLock::new(None);
 
 /// Resumo público de um processo (`list()`).
 #[derive(Clone, Debug)]
@@ -98,13 +109,13 @@ pub struct ProcessInfo {
     pub thread_pointer: u64,
 }
 
-fn push(state: &mut SchedulerState, name: &str, future: ProcessFuture, process_pointer: u64, thread_pointer: u64, owns_process: bool, on_reap: Option<Box<dyn FnOnce() + Send>>) -> u32 {
+fn push(state: &mut SchedulerState, name: &str, make_body: impl FnOnce(u32) -> ThreadBody, process_pointer: u64, thread_pointer: u64, owns_process: bool, on_reap: Option<Box<dyn FnOnce() + Send>>) -> u32 {
     let pid = state.next_pid;
     state.next_pid += 1;
     state.processes.push(Process {
         pid,
         name: String::from(name),
-        future: Some(future),
+        body: Some(make_body(pid)),
         state: ProcessState::Ready,
         exit_status: None,
         process_pointer,
@@ -112,8 +123,62 @@ fn push(state: &mut SchedulerState, name: &str, future: ProcessFuture, process_p
         owns_process,
         on_reap,
         prepare_dispatch: None,
+        kill_requested: false,
+        exited: false,
     });
     pid
+}
+
+/// A entrada de toda thread do escalonador, na pilha dela: leva o corpo
+/// para a pilha, roda e sai pela última troca.
+extern "C" fn thread_entry(pid: u64) -> ! {
+    context_switch::begin_kernel_thread();
+    let pid = pid as u32;
+    let body = STATE.lock().processes.iter_mut().find(|process| process.pid == pid).and_then(|process| process.body.take());
+    let status = match body {
+        Some(body) => body(),
+        None => STATUS_UNSUCCESSFUL,
+    };
+    exit_current_thread(status)
+}
+
+/// A thread do escalonador corrente termina com `status`: a última troca,
+/// de onde quer que ela esteja (o PsTerminateSystemThread sai de dentro do
+/// serviço). O despachante recolhe a pilha depois, fora dela.
+pub fn exit_current_thread(status: u32) -> ! {
+    let thread = context_switch::on_kernel_thread_stack().expect("fim de thread do escalonador fora da pilha dela");
+    let pid = thread_dispatch::owner(thread).map(|owner| owner.runtime as u32);
+    {
+        let mut state = STATE.lock();
+        if let Some(process) = state.processes.iter_mut().find(|process| Some(process.pid) == pid) {
+            if !process.kill_requested || process.exit_status.is_none() {
+                process.exit_status = Some(status);
+            }
+            process.exited = true;
+        }
+    }
+    context_switch::exit_kernel_thread()
+}
+
+fn kill_requested(pid: u32) -> bool {
+    STATE.lock().processes.iter().any(|process| process.pid == pid && process.kill_requested)
+}
+
+/// O corpo de um processo de kernel: sonda o `Future` na pilha da thread; a
+/// cada `Pending` (um `yield_now().await`) a thread cede a vez e volta a
+/// sondar quando retomada. Uma terminação pedida descarta o `Future` no
+/// ponto de cessão seguinte, na própria pilha.
+fn future_body(pid: u32, mut future: ProcessFuture) -> u32 {
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if kill_requested(pid) {
+            return 0;
+        }
+        if let Poll::Ready(status) = future.as_mut().poll(&mut context) {
+            return status;
+        }
+        context_switch::yield_kernel_thread(false);
+    }
 }
 
 /// Cria um processo de kernel (EPROCESS + KTHREAD) e devolve o pid.
@@ -125,41 +190,42 @@ pub fn try_spawn(name: &str, future: ProcessFuture) -> Result<u32, KernelError> 
     // PID e TID do EPROCESS/KTHREAD vêm da tabela de ids de cliente; o pid
     // do escalonador é outra numeração.
     let process_pointer = process::create_process(cid::ALLOCATE, name, 0, None)?;
-    let thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, false, 0, None)?;
-    let pid = push(&mut STATE.lock(), name, future, process_pointer, thread_pointer, true, None);
-    process::describe_thread(thread_pointer, Some(pid), false);
-    thread_dispatch::register(thread_pointer, pid as u64)?;
+    let stack = kernel_stack::create_for_kernel_thread()?;
+    let thread_pointer = process::create_kernel_thread(process_pointer, cid::ALLOCATE, false, 0, Some(stack))?;
+    let pid = push(&mut STATE.lock(), name, move |pid| Box::new(move || future_body(pid, future)), process_pointer, thread_pointer, true, None);
+    start(pid, thread_pointer)?;
     Ok(pid)
 }
 
 /// Thread de kernel dentro de um processo existente (System para drivers,
-/// como o NT): sem EPROCESS novo; o KTHREAD já foi criado pelo chamador.
-pub fn spawn_into_process(name: &str, process_pointer: u64, thread_pointer: u64, future: ProcessFuture, on_reap: Option<Box<dyn FnOnce() + Send>>) -> Result<u32, KernelError> {
+/// como o NT): sem EPROCESS novo; o KTHREAD, com pilha própria, já foi
+/// criado pelo chamador. `body` roda na pilha dele.
+pub fn spawn_into_process(name: &str, process_pointer: u64, thread_pointer: u64, body: ThreadBody, on_reap: Option<Box<dyn FnOnce() + Send>>) -> Result<u32, KernelError> {
     process::add_thread(process_pointer);
-    let pid = push(&mut STATE.lock(), name, future, process_pointer, thread_pointer, false, on_reap);
-    process::describe_thread(thread_pointer, Some(pid), false);
-    thread_dispatch::register(thread_pointer, pid as u64)?;
+    let pid = push(&mut STATE.lock(), name, move |_| body, process_pointer, thread_pointer, false, on_reap);
+    start(pid, thread_pointer)?;
     Ok(pid)
 }
 
+/// O quadro inicial na pilha da thread e a entrada nas filas.
+fn start(pid: u32, thread_pointer: u64) -> Result<(), KernelError> {
+    process::describe_thread(thread_pointer, Some(pid), false);
+    context_switch::initialize_kernel_thread(thread_pointer, thread_entry, pid as u64);
+    thread_dispatch::register(thread_pointer, pid as u64)
+}
+
+/// Pede a terminação de um processo de kernel: a thread sai no próximo
+/// ponto de cessão do corpo dela (um processo de kernel descarta o `Future`
+/// ali), com `exit_status`. Uma thread parada numa espera sai quando ela
+/// conclui, como uma thread de sistema do NT, que só termina por si.
 pub fn kill(pid: u32, exit_status: u32) -> bool {
-    let suspend = {
-        let mut state = STATE.lock();
-        let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) else {
-            return false;
-        };
-        let mut suspend = None;
-        if process.state != ProcessState::Killed && process.state != ProcessState::Done {
-            if process.state != ProcessState::Running {
-                suspend = Some(process.thread_pointer);
-            }
-            process.state = ProcessState::Killed;
-            process.exit_status = Some(exit_status);
-        }
-        suspend
+    let mut state = STATE.lock();
+    let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) else {
+        return false;
     };
-    if let Some(thread) = suspend {
-        let _ = thread_dispatch::suspend(thread, thread_dispatch::state::TERMINATED);
+    if !process.exited && !process.kill_requested {
+        process.kill_requested = true;
+        process.exit_status = Some(exit_status);
     }
     true
 }
@@ -171,13 +237,13 @@ pub fn terminate_by_handle(handle: u64, exit_status: u32) -> u32 {
     if kill(pid as u32, exit_status) { 0 } else { 0xC000_0008 }
 }
 
-/// Recolhe processos terminados. Descartar o `Future` encerra o processo.
+/// Recolhe as threads que fizeram a última troca: a pilha delas já não está
+/// em uso.
 fn reap() {
     loop {
         let finished = {
             let mut state = STATE.lock();
-            // Um processo em execução (sem future) é recolhido depois.
-            let index = state.processes.iter().rposition(|process| matches!(process.state, ProcessState::Done | ProcessState::Killed) && process.future.is_some());
+            let index = state.processes.iter().rposition(|process| process.exited);
             match index {
                 Some(index) => state.processes.remove(index),
                 None => return,
@@ -193,14 +259,16 @@ fn finish(process: Process) -> Result<(), KernelError> {
     // Retira vínculos nativos antes de qualquer callback que destrua a ETHREAD.
     thread_dispatch::unregister(process.thread_pointer)?;
     process::describe_thread(process.thread_pointer, process::thread_record(process.thread_pointer).and_then(|record| record.runtime), true);
-    // Os destrutores do future rodam fora do lock: podem chamar o escalonador.
-    drop(process.future);
+    // Um corpo que nunca rodou é descartado fora do lock.
+    drop(process.body);
     if process.owns_process {
         let previous = process::get_current_thread();
         process::set_current_thread(process.thread_pointer);
         let result = process::terminate_process(process.process_pointer, process.exit_status.unwrap_or(0));
         process::set_current_thread(previous);
         result?;
+        // O ceifador: a pilha própria volta ao Mm, fora dela.
+        process::release_kernel_stack(process.thread_pointer);
         process::release_thread(process.thread_pointer)
     } else {
         process::remove_thread(process.process_pointer);
@@ -209,7 +277,10 @@ fn finish(process: Process) -> Result<(), KernelError> {
                 on_reap();
                 Ok(())
             }
-            None => process::release_thread(process.thread_pointer),
+            None => {
+                process::release_kernel_stack(process.thread_pointer);
+                process::release_thread(process.thread_pointer)
+            }
         }
     }
 }
@@ -217,14 +288,11 @@ fn finish(process: Process) -> Result<(), KernelError> {
 /// Sondar uma espera não executa o contexto. A conclusão é consumida uma
 /// vez, no contexto do dono, e só então a thread volta à fila.
 fn refresh_waiting_threads() -> Result<(), KernelError> {
-    let mut waiting: Vec<(u32, u64)> = STATE.lock().processes.iter().filter(|process| process.state == ProcessState::Waiting).map(|process| (process.pid, process.thread_pointer)).collect();
+    let mut waiting: Vec<(u32, u64)> = STATE.lock().processes.iter().filter(|process| process.state == ProcessState::Waiting && process.prepare_dispatch.is_some()).map(|process| (process.pid, process.thread_pointer)).collect();
     waiting.sort_by_key(|&(_, thread)| core::cmp::Reverse(thread_dispatch::priority(thread)));
     for (pid, thread) in waiting {
-        let prepare = STATE.lock().processes.iter_mut().find(|process| process.pid == pid && process.state == ProcessState::Waiting).map(|process| process.prepare_dispatch.take());
-        let Some(prepare) = prepare else { continue };
-        let Some(mut prepare) = prepare else {
-            return Err(KernelError::new("waiting kernel thread has no readiness continuation"));
-        };
+        let prepare = STATE.lock().processes.iter_mut().find(|process| process.pid == pid && process.state == ProcessState::Waiting).and_then(|process| process.prepare_dispatch.take());
+        let Some(mut prepare) = prepare else { continue };
         let previous = process::get_current_thread();
         process::set_current_thread(thread);
         let ready = prepare();
@@ -242,73 +310,128 @@ fn refresh_waiting_threads() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Um passo do contexto selecionado.
+/// A sondagem de uma thread de kernel parada, emprestada ao despachante:
+/// vive na pilha da thread, que só volta a executar depois que o despachante
+/// a consome.
+struct BorrowedPoll {
+    poll: *mut (dyn FnMut() -> Option<u32> + 'static),
+    result: *const Cell<Option<u32>>,
+}
+
+// SAFETY: a sondagem só é chamada pelo despachante, na CPU da thread parada,
+// enquanto ela não executa.
+unsafe impl Send for BorrowedPoll {}
+
+impl BorrowedPoll {
+    fn call(&mut self) -> bool {
+        // SAFETY: o quadro da thread parada continua vivo até ela ser
+        // retomada, e a continuação é descartada antes disso.
+        unsafe {
+            match (*self.poll)() {
+                Some(status) => {
+                    (*self.result).set(Some(status));
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// A thread de kernel corrente sai das prontas até `poll` concluir, e
+/// devolve o status: o despachante sonda a condição no contexto dela a cada
+/// passo, sem a thread gastar CPU. Para as esperas sem objeto do despachante
+/// a sinalizar (as que são de um objeto ou de uma fila passam por `ke::wait`,
+/// prontas pelo sinal).
+pub fn block_polled(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
+    let thread = context_switch::on_kernel_thread_stack().expect("espera sondada fora de uma thread de kernel");
+    let pid = thread_dispatch::owner(thread).map(|owner| owner.runtime as u32).expect("thread de kernel sem dono no escalonador");
+    let raw: *mut (dyn FnMut() -> Option<u32> + '_) = poll;
+    // SAFETY: só o tempo de vida do objeto muda; a continuação que guarda o
+    // ponteiro é consumida antes de este quadro voltar a rodar.
+    let raw: *mut (dyn FnMut() -> Option<u32> + 'static) = unsafe { core::mem::transmute(raw) };
+    let result = Cell::new(None);
+    loop {
+        let mut borrowed = BorrowedPoll { poll: raw, result: &result };
+        if let Some(process) = STATE.lock().processes.iter_mut().find(|process| process.pid == pid) {
+            process.prepare_dispatch = Some(Box::new(move || borrowed.call()));
+        }
+        context_switch::switch_out(SwitchReason::Wait);
+        if let Some(status) = result.get() {
+            return status;
+        }
+        // SAFETY: a sondagem é da própria thread, que voltou a executar.
+        if let Some(status) = unsafe { (*raw)() } {
+            return status;
+        }
+    }
+}
+
+/// Um passo da thread selecionada: a troca de contexto para ela, até ela
+/// devolver a CPU.
 fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
-    let future = {
+    {
         let mut state = STATE.lock();
         let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) else {
             return Err(KernelError::new("ready thread has no scheduler context"));
         };
+        if process.exited || process.state == ProcessState::Running {
+            return Err(KernelError::new("selected context is already running"));
+        }
         process.state = ProcessState::Running;
-        process.future.take()
-    };
-    let Some(mut future) = future else {
-        return Err(KernelError::new("selected context is already running"));
-    };
+    }
     let previous = process::get_current_thread();
     process::set_current_thread(thread);
     process::dispatch_thread(thread);
     thread_dispatch::begin_execution(thread)?;
     let started = clock::uptime_100ns();
-    let saved_signal = STEP.lock().take();
-    let mut context = Context::from_waker(Waker::noop());
-    let step = future.as_mut().poll(&mut context);
-    let signal = core::mem::replace(&mut *STEP.lock(), saved_signal);
-    let new_state = {
+    let reason = context_switch::resume(thread);
+    process::set_current_thread(previous);
+    let (new_state, yield_requested) = {
         let mut state = STATE.lock();
         let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) else {
             return Err(KernelError::new("running context disappeared"));
         };
-        process.future = Some(future);
-        let mut retain = false;
-        match step {
-            Poll::Ready(exit_status) => {
-                if process.state != ProcessState::Killed {
-                    process.state = ProcessState::Done;
-                    process.exit_status = Some(exit_status);
-                }
+        match reason {
+            SwitchReason::Exit => {
+                process.state = ProcessState::Done;
+                (thread_dispatch::state::TERMINATED, false)
             }
-            Poll::Pending => {
-                match signal {
-                    Some(StepSignal::Waiting(prepare)) => {
-                        process.prepare_dispatch = Some(prepare);
-                        if process.state != ProcessState::Killed {
-                            process.state = ProcessState::Waiting;
-                        }
-                    }
-                    Some(StepSignal::RetainQuantum) => retain = true,
-                    None => {}
-                }
-                if process.state == ProcessState::Running {
+            SwitchReason::Yield { retain } => {
+                process.state = ProcessState::Ready;
+                (thread_dispatch::state::READY, !retain)
+            }
+            SwitchReason::Wait => {
+                // Uma espera sondada fica com o despachante; a de um objeto
+                // (ke::wait) é confirmada aqui, e a já satisfeita entre a
+                // saída da thread e este ponto volta direto à fila.
+                if process.prepare_dispatch.is_some() || wait::commit(thread) {
+                    process.state = ProcessState::Waiting;
+                    (thread_dispatch::state::WAITING, false)
+                } else {
                     process.state = ProcessState::Ready;
+                    (thread_dispatch::state::READY, false)
                 }
             }
-        }
-        let state_now = process.state;
-        drop(state);
-        if state_now == ProcessState::Ready && !retain {
-            thread_dispatch::request_yield(thread)?;
-        }
-        match state_now {
-            ProcessState::Ready => thread_dispatch::state::READY,
-            ProcessState::Waiting => thread_dispatch::state::WAITING,
-            _ => thread_dispatch::state::TERMINATED,
         }
     };
+    if yield_requested {
+        thread_dispatch::request_yield(thread)?;
+    }
     process::account_thread(thread, true, clock::uptime_100ns() - started);
-    let result = thread_dispatch::end_execution(thread, new_state);
-    process::set_current_thread(previous);
-    result
+    thread_dispatch::end_execution(thread, new_state)
+}
+
+/// Uma thread de kernel parada numa espera de objeto foi aprontada pelo
+/// sinal (`ke::wait`): o escalonador a vê pronta.
+pub fn thread_readied(thread: u64) {
+    let pid = thread_dispatch::owner(thread).map(|owner| owner.runtime);
+    let Some(pid) = pid.filter(|&runtime| runtime & thread_dispatch::USER_RUNTIME == 0) else { return };
+    if let Some(process) = STATE.lock().processes.iter_mut().find(|process| process.pid as u64 == pid) {
+        if process.state == ProcessState::Waiting {
+            process.state = ProcessState::Ready;
+        }
+    }
 }
 
 /// Intervalos de usuário que um tick dá, no máximo.
@@ -318,9 +441,20 @@ pub const USER_SLICES_PER_TICK: usize = 16;
 /// vivas. Uma thread de prioridade menor não ganha CPU só porque a maior já
 /// rodou neste tick. Uma thread de usuário selecionada ganha um intervalo
 /// pelo despachante de todos os processos (só no tick comum, sem piso de
-/// prioridade, e quando a CPU pode despachar usuário).
+/// prioridade, e quando a CPU pode despachar usuário). O tick só roda no
+/// despachante: pedido de dentro de uma thread de kernel, ela cede a vez.
 pub fn tick(minimum_priority: i32) {
+    if context_switch::on_kernel_thread_stack().is_some() {
+        if context_switch::kernel_thread_can_block() {
+            context_switch::yield_kernel_thread(false);
+        }
+        return;
+    }
     reap();
+    // Como a interrupção de relógio do NT, cada tick vence os timers devidos
+    // (inclusive o prazo das esperas, no KTHREAD.Timer de cada thread) antes
+    // da seleção: as threads que eles aprontam já entram nela.
+    crate::ntos::ke::timer::check_timers();
     let budget = STATE.lock().processes.len();
     let (mut steps, mut slices) = (0, 0);
     let user_slices = |slices: usize| minimum_priority < 0 && slices < USER_SLICES_PER_TICK && user_threads::can_dispatch();
@@ -360,13 +494,6 @@ pub fn tick(minimum_priority: i32) {
         let pid = owner.runtime as u32;
         if let Err(error) = run_step(pid, thread) {
             debug_print!("[sched] processo {} morreu: {}", pid, error);
-            let mut state = STATE.lock();
-            if let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) {
-                if process.state != ProcessState::Killed {
-                    process.state = ProcessState::Done;
-                    process.exit_status = Some(if error.status != 0 { error.status } else { 0xC000_0001 });
-                }
-            }
         }
     }
     reap();
@@ -376,7 +503,7 @@ pub fn tick(minimum_priority: i32) {
 /// mais prioritárias quando uma prioridade muda.
 fn priority_changed() {
     let caller = process::get_current_thread();
-    if caller == 0 || thread_dispatch::owner(caller).is_some() {
+    if caller == 0 || thread_dispatch::owner(caller).is_some() || context_switch::on_kernel_thread_stack().is_some() {
         return;
     }
     let caller_priority = thread_dispatch::priority(caller);
@@ -397,7 +524,18 @@ pub fn init() -> Result<(), KernelError> {
     // O contexto de boot está executando; não representa o processo Idle.
     thread_dispatch::initialize_queues();
     thread_dispatch::begin_execution(system_thread)?;
+    crate::rtl::sync::set_contention_yield(contention_yield);
     thread_dispatch::register_priority_change_observer(priority_changed)
+}
+
+/// A volta de quem espera um SharedLock com dono: a thread de kernel cede a
+/// vez; o contexto de boot roda um tick.
+fn contention_yield() {
+    if crate::ntos::ke::irql::get_irql() >= crate::ntos::ke::irql::DISPATCH_LEVEL || crate::rtl::sync::spin_locks_held() != 0 {
+        core::hint::spin_loop();
+        return;
+    }
+    tick(-1);
 }
 
 pub fn system_thread() -> u64 {
@@ -412,7 +550,7 @@ pub fn list() -> Vec<ProcessInfo> {
         .map(|process| ProcessInfo {
             pid: process.pid,
             name: process.name.clone(),
-            state: process.state,
+            state: if process.kill_requested { ProcessState::Killed } else { process.state },
             exit_status: process.exit_status,
             process_pointer: process.process_pointer,
             thread_pointer: process.thread_pointer,
@@ -434,30 +572,13 @@ pub fn current_pid() -> u32 {
     unsafe { Ethread::at(thread) }.cid.unique_process.get() as u32
 }
 
-/// Devolve o controle ao escalonador uma vez.
+/// Devolve o controle ao escalonador uma vez (a thread cede a vez).
 pub fn yield_now() -> YieldNow {
-    YieldNow { yielded: false, signal: None }
-}
-
-/// Devolve o controle sem pedir troca (mantém o quantum).
-pub fn yield_retaining_quantum() -> YieldNow {
-    YieldNow { yielded: false, signal: Some(StepSignalKind::RetainQuantum) }
-}
-
-/// A thread espera até que a continuação, sondada pelo escalonador no
-/// contexto do dono, a libere.
-pub fn wait_until(prepare: impl FnMut() -> bool + Send + 'static) -> YieldNow {
-    YieldNow { yielded: false, signal: Some(StepSignalKind::Waiting(Box::new(prepare))) }
-}
-
-enum StepSignalKind {
-    RetainQuantum,
-    Waiting(PrepareDispatch),
+    YieldNow { yielded: false }
 }
 
 pub struct YieldNow {
     yielded: bool,
-    signal: Option<StepSignalKind>,
 }
 
 impl Future for YieldNow {
@@ -468,11 +589,6 @@ impl Future for YieldNow {
             return Poll::Ready(());
         }
         self.yielded = true;
-        *STEP.lock() = match self.signal.take() {
-            Some(StepSignalKind::RetainQuantum) => Some(StepSignal::RetainQuantum),
-            Some(StepSignalKind::Waiting(prepare)) => Some(StepSignal::Waiting(prepare)),
-            None => None,
-        };
         Poll::Pending
     }
 }

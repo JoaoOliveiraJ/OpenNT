@@ -88,5 +88,13 @@ impl UnblockRequest {
 /// dela o dispatcher progride entre consultas.
 pub fn unblock(pointer: u64, wait_block: u64) -> Result<(), KernelError> {
     let mut request = begin(pointer, wait_block);
-    crate::ntos::ke::context_switch::acquire_until(|| request.poll(), dispatcher::pump_kernel)
+    crate::ntos::ke::context_switch::acquire_signaled(
+        || {
+            let result = request.poll();
+            let watched = (request.parked && request.wait_block != 0).then(|| self::wait_block(request.wait_block).wake_event.address());
+            (result, watched)
+        },
+        crate::ntos::ke::wait::reason::WR_PUSH_LOCK,
+        dispatcher::pump_kernel,
+    )
 }
