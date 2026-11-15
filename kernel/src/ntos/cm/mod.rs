@@ -28,6 +28,7 @@ pub mod hive_init;
 pub mod hive_list;
 pub mod hive_services;
 pub mod network_defaults;
+pub mod notify;
 pub mod hw_description;
 pub mod key;
 pub mod lazy_flush;

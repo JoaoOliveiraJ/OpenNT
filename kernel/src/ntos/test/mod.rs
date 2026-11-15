@@ -33,6 +33,7 @@ pub mod boot_drivers;
 pub mod fs_driver_imports;
 pub mod registry_hive;
 pub mod device_api;
+pub mod user_cm_services;
 pub mod x86_bios;
 pub mod registry_model;
 pub mod support_exports;

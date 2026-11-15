@@ -16,6 +16,7 @@ use super::state::{self, NativeBody, UserObject};
 use crate::ntos::cm::key::services::{self as key_services, Kind, UserHandles, UserKeyRecord};
 use crate::ntos::cm::{computer_name, hive_services, registry};
 use crate::ntos::cm::key::objects as key_objects;
+use crate::ntos::cm::notify as cm_notify;
 use crate::ntos::ob::object_types;
 use crate::rtl::KernelError;
 use crate::ntos::inc::types::{NtStruct, ObjectAttributes, UnicodeString};
@@ -230,6 +231,46 @@ fn nt_enumerate_value_key(handle: u64, index: u64, klass: u64, out: u64, rsp: u6
     key_services::key_operation(Kind::EnumerateValue, handle, &arguments(&[("index", index), ("klass", klass), ("out", out), ("length", state::stack_arg32(rsp, 5) as u64), ("returned", state::stack_arg(rsp, 6))]), true)
 }
 
+/// NtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+/// CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous): o
+/// NtNotifyChangeMultipleKeys com Count 0 (`cm/notify`).
+fn nt_notify_change_key(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    cm_notify::notify_change_multiple_keys(&cm_notify::Request {
+        master_key: handle,
+        count: 0,
+        subordinate_objects: 0,
+        event,
+        apc_routine,
+        apc_context,
+        io_status: state::stack_arg(rsp, 5),
+        filter: state::stack_arg32(rsp, 6),
+        watch_tree: state::stack_arg32(rsp, 7) as u8 != 0,
+        buffer: state::stack_arg(rsp, 8),
+        buffer_size: state::stack_arg32(rsp, 9),
+        asynchronous: state::stack_arg32(rsp, 10) as u8 != 0,
+    })
+}
+
+/// NtNotifyChangeMultipleKeys(MasterKeyHandle, Count, SubordinateObjects,
+/// Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter,
+/// WatchTree, Buffer, BufferSize, Asynchronous).
+fn nt_notify_change_multiple_keys(handle: u64, count: u64, subordinate: u64, event: u64, rsp: u64) -> Result<u32, KernelError> {
+    cm_notify::notify_change_multiple_keys(&cm_notify::Request {
+        master_key: handle,
+        count: count as u32,
+        subordinate_objects: subordinate,
+        event,
+        apc_routine: state::stack_arg(rsp, 5),
+        apc_context: state::stack_arg(rsp, 6),
+        io_status: state::stack_arg(rsp, 7),
+        filter: state::stack_arg32(rsp, 8),
+        watch_tree: state::stack_arg32(rsp, 9) as u8 != 0,
+        buffer: state::stack_arg(rsp, 10),
+        buffer_size: state::stack_arg32(rsp, 11),
+        asynchronous: state::stack_arg32(rsp, 12) as u8 != 0,
+    })
+}
+
 // Serviços de hive com PreviousMode de usuário (`cm/hive_services`).
 
 fn nt_load_key(target: u64, source: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -306,4 +347,7 @@ pub fn init() {
     state::register_handler("NtQueryValueKey", nt_query_value_key);
     state::register_handler("NtEnumerateKey", nt_enumerate_key);
     state::register_handler("NtEnumerateValueKey", nt_enumerate_value_key);
+    state::register_handler("NtNotifyChangeKey", nt_notify_change_key);
+    state::register_handler("NtNotifyChangeMultipleKeys", nt_notify_change_multiple_keys);
+    cm_notify::init();
 }

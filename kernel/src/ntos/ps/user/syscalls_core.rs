@@ -860,8 +860,14 @@ fn nt_create_partition(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Res
     Ok(STATUS_INVALID_HANDLE)
 }
 
+/// NtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize).
+fn nt_query_license_value(name: u64, type_pointer: u64, data: u64, data_size: u64, rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ex::license::values::query_user(name, type_pointer, data, data_size as u32, state::stack_arg(rsp, 5))
+}
+
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 29] = [
+    let handlers: [(&'static str, state::SyscallHandler); 30] = [
+        ("NtQueryLicenseValue", nt_query_license_value),
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),
         ("NtDisplayString", nt_display_string),
