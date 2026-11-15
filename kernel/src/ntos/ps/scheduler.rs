@@ -448,7 +448,7 @@ pub const USER_SLICES_PER_TICK: usize = 16;
 /// prioridade, e quando a CPU pode despachar usuário). O tick só roda no
 /// despachante: pedido de dentro de uma thread de kernel, ela cede a vez.
 pub fn tick(minimum_priority: i32) {
-    if context_switch::on_kernel_thread_stack().is_some() {
+    if context_switch::in_kernel_thread() {
         if context_switch::kernel_thread_can_block() {
             context_switch::yield_kernel_thread(false);
         }
@@ -507,7 +507,7 @@ pub fn tick(minimum_priority: i32) {
 /// mais prioritárias quando uma prioridade muda.
 fn priority_changed() {
     let caller = process::get_current_thread();
-    if caller == 0 || thread_dispatch::owner(caller).is_some() || context_switch::on_kernel_thread_stack().is_some() {
+    if caller == 0 || thread_dispatch::owner(caller).is_some() || context_switch::in_kernel_thread() {
         return;
     }
     let caller_priority = thread_dispatch::priority(caller);

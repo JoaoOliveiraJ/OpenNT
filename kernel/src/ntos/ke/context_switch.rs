@@ -467,6 +467,13 @@ pub fn on_kernel_thread_stack() -> Option<u64> {
     (rsp > kthread.stack_limit.get() && rsp <= kthread.stack_base.get()).then_some(running)
 }
 
+/// A CPU está dentro da execução de uma thread de kernel (na pilha dela ou
+/// numa pilha emprestada por ela): o despachante desta CPU está suspenso e
+/// não pode rodar aninhado.
+pub fn in_kernel_thread() -> bool {
+    pcr::get_pcr_address() != 0 && SWITCH[processor()].running.load(Ordering::Acquire) != 0
+}
+
 /// A thread de kernel corrente pode deixar a CPU numa espera: a CPU está na
 /// pilha dela, abaixo de DISPATCH_LEVEL e sem SpinLock retido.
 pub fn kernel_thread_can_block() -> bool {

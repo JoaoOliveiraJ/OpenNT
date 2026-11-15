@@ -333,7 +333,7 @@ fn pump_scheduler() {
 /// pilha dela: a thread cede a vez (em DISPATCH_LEVEL ou acima, só os
 /// timers e as DPCs andam).
 pub fn pump_kernel() {
-    if context_switch::on_kernel_thread_stack().is_some() {
+    if context_switch::in_kernel_thread() {
         if context_switch::kernel_thread_can_block() {
             context_switch::yield_kernel_thread(false);
         } else {
