@@ -249,6 +249,11 @@ pub fn next_thread() -> u64 {
     processor().next_thread.get()
 }
 
+/// Há thread pronta ou reservada (ReadySummary ou NextThread).
+pub fn has_ready_threads() -> bool {
+    pcr::get_pcr_address() != 0 && (processor().ready_summary.get() != 0 || processor().next_thread.get() != 0)
+}
+
 fn reserve_next_locked(thread: u64) {
     let kthread = kthread(thread);
     if kthread.state.get() == state::READY {

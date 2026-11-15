@@ -423,6 +423,21 @@ pub fn commit(thread: u64) -> bool {
     }
 }
 
+/// A troca de contexto de uma espera registrada. Uma thread retomada com a
+/// espera ainda registrada (aprontada por fora do sinal) desfaz o registro e
+/// recomeça a espera, como depois de uma APC de kernel.
+fn switch_waiting(thread: u64) {
+    context_switch::switch_out(SwitchReason::Wait);
+    let mut lock = lock();
+    if lock.waiting(thread) {
+        lock.unwait(thread, STATUS_KERNEL_APC as u64);
+        let target = kthread(thread);
+        let register = target.wait_register.flags.get();
+        target.wait_register.flags.set(register & !WAIT_STATE_MASK);
+        lock.ready.retain(|&ready| ready != thread);
+    }
+}
+
 /// A thread de kernel corrente (a da pilha em que a CPU está).
 fn current_waiter() -> u64 {
     context_switch::on_kernel_thread_stack().expect("espera registrada fora de uma thread de kernel")
@@ -486,7 +501,7 @@ fn wait_loop(objects: &[u64], deadline: Deadline, mut spec: WaitSpec, mut attemp
                 return status as u64;
             }
         }
-        context_switch::switch_out(SwitchReason::Wait);
+        switch_waiting(thread);
         let status = wait_status(thread);
         if status != STATUS_KERNEL_APC as u64 {
             return status;
@@ -551,7 +566,7 @@ pub fn wait_queue(queue: u64, deadline: Deadline, mode: u8, alertable: bool, mut
                 return QueueWait::Status(status);
             }
         }
-        context_switch::switch_out(SwitchReason::Wait);
+        switch_waiting(thread);
         let status = wait_status(thread);
         // Uma entrada é um ponteiro de sistema; os status são pequenos.
         if status >= 0xFFFF_8000_0000_0000 {
@@ -626,7 +641,7 @@ pub fn wait_once(poll: &mut dyn FnMut() -> Option<u32>, watch: Option<u64>, dead
         cancel(thread);
         return WaitOnce::Done(status);
     }
-    context_switch::switch_out(SwitchReason::Wait);
+    switch_waiting(thread);
     WaitOnce::Woken(wait_status(thread) as u32)
 }
 

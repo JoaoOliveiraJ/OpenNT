@@ -264,6 +264,12 @@ pub fn cooperate(thread: u64, wait_mode: u8, alertable: bool, poll: &mut dyn FnM
         if alerts.arm().is_err() {
             break;
         }
+        // Uma thread de kernel sai das prontas com a condição (e os alertas)
+        // sondada pelo despachante.
+        if context_switch::kernel_thread_can_block() {
+            result = crate::ntos::ps::scheduler::block_polled(&mut || alerts.pending().or_else(&mut *poll));
+            break;
+        }
         if context_switch::can_block() {
             result = context_switch::block_current(&mut || alerts.pending().or_else(&mut *poll));
             break;

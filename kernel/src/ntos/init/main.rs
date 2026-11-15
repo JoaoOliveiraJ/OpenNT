@@ -199,6 +199,11 @@ pub fn kmain() -> ! {
             shared_user_data::update_system_times();
             crate::ntos::ke::run_kernel_tasks();
             interrupts::dispatch_pending(); // IRQ do timer -> scheduler::tick
+            // Como o laço ocioso do NT: uma thread aprontada pelo sinal não
+            // espera o próximo tick do relógio.
+            if crate::ntos::ke::thread_dispatch::has_ready_threads() {
+                scheduler::tick(-1);
+            }
             core::hint::spin_loop();
         }
     } else {

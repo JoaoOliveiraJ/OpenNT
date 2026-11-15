@@ -379,6 +379,10 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
             return Err(KernelError::new("selected context is already running"));
         }
         process.state = ProcessState::Running;
+        // Retomada antes de a condição concluir (um alerta a aprontou): a
+        // continuação emprestada da pilha dela não vale mais; ela sonda a
+        // condição de novo ao voltar.
+        process.prepare_dispatch = None;
     }
     let previous = process::get_current_thread();
     process::set_current_thread(thread);
