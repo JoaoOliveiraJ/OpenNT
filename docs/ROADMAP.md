@@ -4,8 +4,6 @@
 
 O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando no QEMU e passando nos testes automáticos daquela parte.
 
-**Estados dos componentes.** *Funciona*: o código existe e um teste automático de boot passa por ele. *Parcial*: só uma parte existe, ou o código existe mas ainda não tem teste automático. *Planejado*: ainda não implementado. *Fora do escopo*: fora do roadmap atual. A coluna *Teste automático* diz qual teste cobre o item.
-
 | Fase | Tema | Estado |
 | --- | --- | --- |
 | 1 | base | concluída |
@@ -17,9 +15,11 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-Hoje: **28 de 54** componentes funcionam; **551 de 774** módulos do plano têm código (537 completos e 14 parciais; isso mede código escrito, não testado); o kernel exporta **1.956 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (63,7%).
+**Marco atual.** O adaptador de vídeo inicia pela sessão do win32k: o csrss.exe real chama o NtUserInitialize, o win32k.sys real anuncia a sessão e o dxgkrnl.sys inicia o BasicDisplay.sys, que cria o \Device\Video0.
 
-Detalhes nas páginas [Componentes e drivers](site/componentes.html), [Testes](site/testes.html), [Módulos do kernel](site/modulos.html) e [Exports do ntoskrnl](site/ntoskrnl.html).
+**Próximo.** O InitVideo do win32k montar a configuração de exibição sobre o \Device\Video0 (hoje ele para com VIDEO_DRIVER_INIT_FAILURE, 0xB4) e a sessão gráfica seguir.
+
+Hoje: **39 de 61** binários da Microsoft rodam (20 parciais); o kernel exporta **1.956 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (63,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -27,13 +27,13 @@ Boot pela BIOS até o modo de 64 bits, HAL, nanokernel (interrupções, canais d
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Boot em 64 bits | Funciona | Entrada no kernel, Boot completo |
-| Interrupções e timer | Funciona | Boot completo, Autoteste do kernel |
-| Vídeo VGA em modo texto | Funciona | Boot completo |
-| Teclado PS/2 | Funciona | Teste do shell |
-| Arquivos em memória | Funciona | Autoteste do kernel, Autoteste de objetos e executive |
-| Shell | Parcial | Teste do shell |
-| Programas hello e pisca | Funciona | Autoteste do kernel, Teste do shell |
+| Boot em 64 bits | Funciona | entrada, boot |
+| Interrupções e timer | Funciona | boot, selftest |
+| Vídeo VGA em modo texto | Funciona | boot |
+| Teclado PS/2 | Funciona | shell |
+| Arquivos em memória | Funciona | selftest, fase3 |
+| Shell | Parcial | shell |
+| Programas hello e pisca | Funciona | selftest, shell |
 
 ## Fase 2 — memória e CPU (concluída)
 
@@ -41,8 +41,8 @@ Banco de páginas físicas, mapeamento recursivo, pool do kernel, variáveis exp
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Gerência de memória | Funciona | Autoteste do kernel |
-| Multiprocessador (SMP) | Funciona | Autoteste do kernel, Autoteste do modo usuário |
+| Gerência de memória | Funciona | selftest |
+| Multiprocessador (SMP) | Funciona | selftest, fase7 |
 
 ## Fase 3 — objetos e executive (concluída)
 
@@ -50,10 +50,10 @@ Object Manager (tipos, handles, namespace, callbacks), biblioteca de runtime, Ex
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Processos e threads | Funciona | Autoteste do kernel, Autoteste de objetos e executive, Autoteste do modo usuário |
-| Sincronização e despacho | Funciona | Autoteste de objetos e executive, Autoteste do modo usuário, Autoteste do kernel |
-| Gerenciador de objetos e namespace | Parcial | Autoteste de objetos e executive |
-| Segurança e tokens | Parcial | Autoteste de objetos e executive |
+| Processos e threads | Funciona | selftest, fase3, fase7 |
+| Sincronização e despacho | Funciona | fase3, fase7, selftest |
+| Gerenciador de objetos e namespace | Parcial | fase3 |
+| Segurança e tokens | Parcial | fase3, fase6, fase7 |
 
 ## Fase 4 — I/O e armazenamento (concluída)
 
@@ -61,12 +61,12 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| I/O Manager | Parcial | Autoteste de I/O e armazenamento, Teclado real, Pipes nomeados e mailslots entre processos |
-| Console | Parcial | Boot completo, Teste do shell, Driver condrv.sys real |
-| Barramento PCI | Parcial | Autoteste de I/O e armazenamento, Pilha de armazenamento real pelo PnP, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
-| Dispositivos da placa-mãe | Parcial | Autoteste de I/O e armazenamento |
-| Disco ATA (interno) | Parcial | Autoteste de I/O e armazenamento |
-| NTFS (leitor do kernel) | Parcial | Autoteste de I/O e armazenamento |
+| I/O Manager | Parcial | fase4, teclado, pipes |
+| Console | Parcial | boot, shell, condrv |
+| Barramento PCI | Parcial | fase4, storage, basicdisplay |
+| Dispositivos da placa-mãe | Parcial | fase4 |
+| Disco ATA (interno) | Parcial | fase4 |
+| NTFS (leitor do kernel) | Parcial | fase4 |
 
 ## Fase 5 — Registro e serviços (concluída)
 
@@ -74,8 +74,8 @@ Configuration Manager (hives, chaves e valores) e o controle de serviços e driv
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Registro | Parcial | Autoteste de Registro e serviços |
-| sc (controle de serviços) | Parcial | Autoteste do modo usuário |
+| Registro | Parcial | fase5 |
+| sc (controle de serviços) | Parcial | fase7 |
 
 ## Fase 6 — loader PE e ntoskrnl (em andamento)
 
@@ -83,25 +83,25 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Depurador do kernel | Funciona | Depurador do kernel pela COM2 |
-| Carregador de PE e exports do kernel | Parcial | Autoteste do carregador de PE e do ntoskrnl, Boot completo |
-| hal.dll | Funciona | Drivers do Windows no boot comum |
-| i8042prt.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
-| kbdclass.sys | Funciona | Teclado real, Drivers do Windows no boot comum, Teste do shell |
-| mouclass.sys | Funciona | Drivers do Windows no boot comum, Teclado real |
-| wmilib.sys e WppRecorder.sys | Funciona | Teclado real, Drivers do Windows no boot comum |
-| atapi.sys e ataport.sys | Parcial | Drivers do Windows no boot comum |
-| disk.sys e classpnp.sys | Parcial | Drivers do Windows no boot comum |
-| mountmgr.sys | Parcial | Drivers do Windows no boot comum |
-| cng.sys | Funciona | Drivers do Windows no boot comum |
-| ci.dll (Code Integrity) | Funciona | Driver watchdog.sys real |
-| watchdog.sys | Funciona | Driver watchdog.sys real |
-| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | Runtime KMDF real com o msisadrv.sys, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys |
-| ksecdd.sys | Funciona | Driver ksecdd.sys real |
-| null.sys | Funciona | Driver null.sys real |
-| beep.sys | Funciona | Driver beep.sys real |
-| fs_rec.sys | Funciona | Driver fs_rec.sys real |
-| ksecpkg.sys | Funciona | Driver ksecpkg.sys real |
+| Depurador do kernel | Funciona | kd |
+| Carregador de PE e exports do kernel | Parcial | fase6, boot |
+| hal.dll | Funciona | drivers |
+| i8042prt.sys | Funciona | teclado, drivers, shell |
+| kbdclass.sys | Funciona | teclado, drivers, shell |
+| mouclass.sys | Funciona | drivers, teclado |
+| wmilib.sys e WppRecorder.sys | Funciona | teclado, drivers |
+| atapi.sys e ataport.sys | Parcial | drivers |
+| disk.sys e classpnp.sys | Parcial | drivers |
+| mountmgr.sys | Parcial | drivers |
+| cng.sys | Funciona | drivers |
+| ci.dll (Code Integrity) | Funciona | watchdog |
+| watchdog.sys | Funciona | watchdog |
+| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | kmdf, basicdisplay |
+| ksecdd.sys | Funciona | ksecdd |
+| null.sys | Funciona | null |
+| beep.sys | Funciona | beep |
+| fs_rec.sys | Funciona | fs_rec |
+| ksecpkg.sys | Funciona | ksecpkg |
 
 ## Fase 7 — modo usuário (em andamento)
 
@@ -109,10 +109,10 @@ Processos e threads de usuário, comunicação ALPC, chamadas de sistema, as bib
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Jobs | Funciona | Autoteste do modo usuário |
-| npfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
-| msfs.sys | Funciona | Pipes nomeados e mailslots entre processos, Drivers do Windows no boot comum, smss.exe e csrss.exe reais |
-| Modo usuário | Parcial | Autoteste do modo usuário |
+| Jobs | Funciona | fase7 |
+| npfs.sys | Funciona | pipes, drivers, smss-csrss |
+| msfs.sys | Funciona | pipes, drivers, smss-csrss |
+| Modo usuário | Parcial | fase7 |
 | ntdll.dll, KERNEL32 e KERNELBASE | Planejado | — |
 | Executáveis .exe (comando exec) | Planejado | — |
 | csrss.exe | Parcial | — |
@@ -123,15 +123,9 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Cache Manager | Parcial | Autoteste do carregador de PE e do ntoskrnl, Driver ntfs.sys real |
-| win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k.sys real carregado pelo smss.exe, Adaptador de vídeo iniciado pela sessão do win32k |
-| acpi.sys e pci.sys | Parcial | acpi.sys real como raiz da árvore de dispositivos |
-| dxgkrnl.sys e BasicDisplay.sys | Parcial | Driver dxgkrnl.sys real, BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys, Adaptador de vídeo iniciado pela sessão do win32k, Autoteste do carregador de PE e do ntoskrnl |
-| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | Driver ntfs.sys real |
-| ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | Driver ndis.sys real (com o netio.sys), Driver afd.sys real (depois do NDIS), Driver tcpip.sys real (depois do NDIS) |
-
-## Sem fase definida
-
-| Componente | Estado | Teste automático |
-| --- | --- | --- |
-| vgk.sys | Parcial | — |
+| Cache Manager | Parcial | fase6, ntfs |
+| win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
+| acpi.sys e pci.sys | Parcial | acpi |
+| dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
+| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs |
+| ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | ndis, afd, tcpip |

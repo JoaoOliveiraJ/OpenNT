@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Os binários reais da Microsoft que o OpenNT carrega: o estado de cada um, onde para, o teste que prova e a tela.">
+<title>O que roda · OpenNT</title>
+<script>try{var t=localStorage.getItem('opennt-tema');if(t==='claro'||t==='escuro')document.documentElement.setAttribute('data-theme',t==='claro'?'light':'dark');}catch(e){}</script>
+<style>
+:root{--bg:#fafaf8;--fg:#1c1c1a;--muted:#5a5954;--line:#dedcd5;--card:#fff;--soft:#f2f1ec;--accent:#1f5fbf;
+--ok:#17692f;--ok-bg:#e3f2e7;--part:#7d5600;--part-bg:#fdf0cf;--no:#555;--no-bg:#ecebe7;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#141413;--fg:#eceae4;--muted:#aaa89f;--line:#36352f;
+--card:#1c1c1a;--soft:#232320;--accent:#8ab4ff;--ok:#6fd08a;--ok-bg:#15301d;--part:#f0c050;--part-bg:#342a10;--no:#b4b2ab;
+--no-bg:#2a2a27;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#141413;--fg:#eceae4;--muted:#aaa89f;--line:#36352f;--card:#1c1c1a;--soft:#232320;
+--accent:#8ab4ff;--ok:#6fd08a;--ok-bg:#15301d;--part:#f0c050;--part-bg:#342a10;--no:#b4b2ab;--no-bg:#2a2a27;color-scheme:dark}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent)}a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:.88em}
+code{background:var(--soft);padding:.05em .3em;border-radius:4px;overflow-wrap:break-word}
+pre{background:var(--soft);padding:10px 12px;border-radius:8px;overflow-x:auto;margin:.5em 0}pre code{background:none;padding:0}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+.skip{position:absolute;left:-999px}.skip:focus{left:16px;top:8px;background:var(--card);padding:6px 10px;z-index:2}
+.top{border-bottom:1px solid var(--line);background:var(--card)}
+.top .wrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;padding-top:10px;padding-bottom:10px}
+.brand{font-weight:700;font-size:1.15rem;color:var(--fg);text-decoration:none}
+nav{display:flex;flex-wrap:wrap;gap:2px 4px}nav a{padding:4px 8px;border-radius:6px;text-decoration:none;color:var(--fg)}
+nav a:hover{background:var(--soft)}nav a[aria-current=page]{background:var(--soft);font-weight:600;box-shadow:inset 0 -2px 0 var(--accent)}
+.theme{margin-left:auto;font:inherit;font-size:.85rem;background:none;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:3px 8px;cursor:pointer}
+main{padding-top:8px;padding-bottom:24px}
+h1{font-size:1.75rem;line-height:1.25;margin:20px 0 8px}h2{font-size:1.3rem;margin:32px 0 8px}h3{font-size:1.02rem;margin:0}
+.lead{font-size:1.08rem;max-width:62rem;margin:0 0 12px}.muted{color:var(--muted)}.small{font-size:.88rem}
+.foot{border-top:1px solid var(--line);color:var(--muted);font-size:.85rem;padding-top:12px;padding-bottom:28px}
+.chip{display:inline-flex;align-items:center;gap:.3em;white-space:nowrap;font-size:.8rem;font-weight:600;line-height:1;padding:4px 8px;border-radius:999px}
+.chip.ok{color:var(--ok);background:var(--ok-bg)}.chip.part{color:var(--part);background:var(--part-bg)}.chip.no{color:var(--no);background:var(--no-bg)}
+.chip.tag{color:var(--muted);background:var(--soft);font-weight:500}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:12px;margin:16px 0}
+.stat{display:block;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;color:var(--fg);text-decoration:none}
+a.stat:hover{border-color:var(--accent)}.stat b{display:block;font-size:1.7rem;line-height:1.2;font-variant-numeric:tabular-nums}
+.stat span{color:var(--muted);font-size:.9rem}
+.bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--no-bg);margin-top:8px}
+.bar i{display:block}.bar .ok{background:var(--ok)}.bar .part{background:var(--part)}
+.mile{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin:12px 0}
+.mile>div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.mile h2{margin:0 0 6px;font-size:1rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.mile p{margin:0 0 8px}
+.cards{list-style:none;padding:0;margin:12px 0;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr));gap:12px}
+.cards.wide{grid-template-columns:repeat(auto-fill,minmax(min(460px,100%),1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.card header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px}
+.card p{margin:0}.card .stop{color:var(--muted)}.card .stop b{color:var(--fg);font-weight:600}
+.shot{margin:4px 0 0}.shot img{display:block;width:100%;height:auto;max-height:300px;object-fit:contain;border-radius:6px;border:1px solid var(--line);background:#000}
+.shot.tool img{max-height:none;background:none}
+.shot figcaption{font-size:.8rem;color:var(--muted);margin-top:4px}
+.serial summary{font-size:.85rem}.serial pre{font-size:.72rem;line-height:1.45;max-height:22rem;margin:4px 0 0}.shot.none{font-size:.85rem;color:var(--muted);border:1px dashed var(--line);border-radius:6px;padding:10px;margin-top:4px}
+.filter{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:12px 0;padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.filter input{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:min(260px,60vw)}
+.seg{display:flex;flex-wrap:wrap;gap:4px}.seg button{font:inherit;font-size:.88rem;padding:3px 10px;border:1px solid var(--line);border-radius:999px;background:var(--bg);color:var(--fg);cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.filter output{color:var(--muted);font-size:.88rem}
+.rows{list-style:none;padding:0;margin:8px 0;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+.rows>li{padding:10px 14px;border-top:1px solid var(--line)}.rows>li:first-child{border-top:0}
+.rows .head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}.rows .head h3{margin-right:auto}
+.rows p{margin:4px 0 0}
+details{margin-top:4px}summary{cursor:pointer;color:var(--accent)}details .more{margin:6px 0 0;font-size:.92rem}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:.85rem;color:var(--muted);font-weight:600}
+td.num,th.num{text-align:right;white-space:nowrap}
+.table{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card);margin:8px 0}
+.table table th:first-child,.table table td:first-child{padding-left:14px}
+.mini{display:inline-block;width:90px;height:7px;border-radius:4px;background:var(--no-bg);vertical-align:middle;overflow:hidden}.mini i{display:block;height:100%;background:var(--ok)}
+.groups details{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:8px 14px;margin:8px 0}
+.groups summary{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;color:var(--fg);list-style:none}.groups summary b{min-width:6rem}
+.groups summary::-webkit-details-marker{display:none}.groups summary::before{content:"▸";color:var(--muted)}.groups details[open]>summary::before{content:"▾"}
+.names{list-style:none;padding:0;margin:6px 0 10px;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(17rem,100%),1fr));gap:2px 16px;font-size:.86rem}
+.names li{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.names.missing li{color:var(--muted)}
+h4{margin:8px 0 2px;font-size:.9rem}
+.phases{list-style:none;padding:0;margin:8px 0;display:grid;gap:6px}
+.phases li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline}.phases .n{font-weight:600;min-width:4.5rem}
+.test{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,320px);gap:6px 16px;align-items:start}
+@media (max-width:760px){.test{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:700px){.mile{grid-template-columns:minmax(0,1fr)}h1{font-size:1.45rem}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<a class="skip" href="#conteudo">Pular para o conteúdo</a>
+<header class="top"><div class="wrap"><a class="brand" href="index.html">OpenNT</a><nav aria-label="Páginas"><a href="index.html">Início</a><a href="o-que-roda.html" aria-current="page">O que roda</a><a href="componentes.html">Componentes</a><a href="ntoskrnl.html">Exports</a><a href="testes.html">Testes</a></nav><button type="button" class="theme" id="tema" hidden>Tema: automático</button></div></header>
+<main id="conteudo" class="wrap">
+<h1>O que roda</h1>
+<p class="lead">Os binários reais da Microsoft que o OpenNT carrega, sem recompilar nem modificar, e os marcos que eles alcançam. Hoje: <b>39 de 61 binários rodam</b>, 20 são parciais e 2 ainda não rodam.</p>
+<ul class="small muted"><li><span class="chip ok"><span aria-hidden="true">●</span> Roda</span> — um teste automático de boot passa e o binário faz o papel dele.</li><li><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span> — carrega e roda até um ponto; o card diz onde para.</li><li><span class="chip no"><span aria-hidden="true">○</span> Não roda</span> — ainda sem teste automático: um alvo, não um resultado.</li></ul>
+<p class="small muted">A captura de cada card é a tela do QEMU no fim do teste que o prova, com as linhas da serial que mostram o resultado. O estado sai dos dados: do teste (uma falha conhecida dá Parcial) e do estado declarado do componente do binário; cada card diz de onde veio.</p>
+<div class="filter" data-filter="itens" hidden><label>Buscar <input type="search" autocomplete="off" spellcheck="false"></label><div class="seg" role="group" aria-label="Estado"><button type="button" data-state="" aria-pressed="true">Todos (54)</button><button type="button" data-state="ok" aria-pressed="false">Roda (36)</button><button type="button" data-state="part" aria-pressed="false">Parcial (13)</button><button type="button" data-state="no" aria-pressed="false">Não roda (5)</button></div><output aria-live="polite"></output></div>
+<div id="itens">
+<section data-group aria-labelledby="marcos"><h2 id="marcos">Marcos</h2><p class="muted">O que o sistema já faz de ponta a ponta com os binários da Microsoft, e o que ainda falta.</p><ul class="cards wide"><li class="card" id="o-smss-exe-cria-o-csrss-exe" data-state="ok" data-text="o smss.exe cria o csrss.exe o smss.exe real é o primeiro processo: monta a sessão e cria o smss da sessão, que carrega o win32k.sys e cria o csrss.exe real, todos com a ntdll real. "><header><h3>O smss.exe cria o csrss.exe</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O smss.exe real é o primeiro processo: monta a sessão e cria o smss da sessão, que carrega o win32k.sys e cria o csrss.exe real, todos com a ntdll real.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: o teste smss-csrss passa.</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li><li class="card" id="o-win32k-sys-atende-o-csrss-exe" data-state="ok" data-text="o win32k.sys atende o csrss.exe o smss da sessão carrega o win32k.sys, o win32kbase.sys e o win32kfull.sys; a thread do csrss vira thread gui e o ntgdiinit e o ntuserinitialize são atendidos. "><header><h3>O win32k.sys atende o csrss.exe</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O smss da sessão carrega o win32k.sys, o win32kbase.sys e o win32kfull.sys; a thread do csrss vira thread GUI e o NtGdiInit e o NtUserInitialize são atendidos.</p><p class="small">Teste: <a href="testes.html#teste-win32k"><code>win32k</code></a></p><p class="small muted">Estado: o teste win32k passa.</p><figure class="shot "><a href="capturas/win32k.png"><img src="capturas/win32k.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k: win32k.sys real carregado pelo smss.exe"></a><figcaption>Tela do QEMU no fim do teste <code>win32k</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+WIN32K_LOADED
+...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK
+[init] csrss.exe (pid 48): thread GUI pelo PsConvertToGuiThread -&gt; 0x0</code></pre></details></figure></li><li class="card" id="adaptador-de-video-iniciado" data-state="ok" data-text="adaptador de vídeo iniciado com o basicdisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer vbe 1024x768 e cria o \device\video0. em seguida o initvideo do win32k para com video_driver_init_failure (0xb4)."><header><h3>Adaptador de vídeo iniciado</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \Device\Video0.</p><p class="stop"><b>Limite:</b> Em seguida o InitVideo do win32k para com VIDEO_DRIVER_INIT_FAILURE (0xB4).</p><p class="small">Teste: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a></p><p class="small muted">Estado: o teste win32k-display passa.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="o-ntfs-sys-monta-e-grava" data-state="ok" data-text="o ntfs.sys monta e grava o ntfs.sys monta o volume ntfs 3.1 do segundo disco, lê um arquivo pelo cache manager e cria, grava e relê outro. "><header><h3>O ntfs.sys monta e grava</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O ntfs.sys monta o volume NTFS 3.1 do segundo disco, lê um arquivo pelo Cache Manager e cria, grava e relê outro.</p><p class="small">Teste: <a href="testes.html#teste-ntfs"><code>ntfs</code></a></p><p class="small muted">Estado: o teste ntfs passa.</p><figure class="shot "><a href="capturas/ntfs.png"><img src="capturas/ntfs.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ntfs: Driver ntfs.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ntfs</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=ntfs state=4 win32=0 ntstatus=0x0
+...
+FILE_SYSTEM_WRITE_OK OPENNT-NOVO.TXT
+FILE_SYSTEM_MOUNT_OK name=ntfs
+...
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+[zw] QuerySystemInformation classe 184 buf=24</code></pre></details></figure></li><li class="card" id="teclado-pela-pilha-ps-2-do-windows" data-state="ok" data-text="teclado pela pilha ps/2 do windows o i8042prt.sys e o kbdclass.sys sobem pelo pnp e as teclas chegam ao shell pela irq 1, pela isr e pelo dpc do driver. "><header><h3>Teclado pela pilha PS/2 do Windows</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O i8042prt.sys e o kbdclass.sys sobem pelo PnP e as teclas chegam ao shell pela IRQ 1, pela ISR e pelo DPC do driver.</p><p class="small">Testes: <a href="testes.html#teste-teclado"><code>teclado</code></a>, <a href="testes.html#teste-shell"><code>shell</code></a></p><p class="small muted">Estado: o teste teclado passa.</p><figure class="shot "><a href="capturas/teclado.png"><img src="capturas/teclado.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste teclado: Teclado real"></a><figcaption>Tela do QEMU no fim do teste <code>teclado</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+KBDTEST_OK
+SELFTEST_OK
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)</code></pre></details></figure></li><li class="card" id="pipes-e-mailslots-entre-processos" data-state="ok" data-text="pipes e mailslots entre processos dois processos de usuário conversam pelos npfs.sys e msfs.sys: pipes de mensagens e de bytes, e/s assíncrona e mailslot. "><header><h3>Pipes e mailslots entre processos</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Dois processos de usuário conversam pelos npfs.sys e msfs.sys: pipes de mensagens e de bytes, E/S assíncrona e mailslot.</p><p class="small">Teste: <a href="testes.html#teste-pipes"><code>pipes</code></a></p><p class="small muted">Estado: o teste pipes passa.</p><figure class="shot "><a href="capturas/pipes.png"><img src="capturas/pipes.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste pipes: Pipes nomeados e mailslots entre processos"></a><figcaption>Tela do QEMU no fim do teste <code>pipes</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+PHASE6_SELFTEST_OK
+...
+PIPES_OK
+...
+PHASE7_SELFTEST_OK
+...
+[pe] relocada p/ 0xfffff80100270000 (13 fixups)
+[pe] security cookie semeado em 0xfffff80100277010
+[pe] imports de ntoskrnl.exe
+[pe] entry point = 0xfffff8010027d010
+[kernel-library] DllInitialize wpprecorder.sys
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\WppRecorder</code></pre></details></figure></li><li class="card" id="disco-lido-pela-pilha-ide-do-windows" data-state="ok" data-text="disco lido pela pilha ide do windows o pnp sobe intelide, atapi, disk e partmgr na controladora do qemu, e os setores lidos pela pilha conferem com os do disco. "><header><h3>Disco lido pela pilha IDE do Windows</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O PnP sobe intelide, atapi, disk e partmgr na controladora do QEMU, e os setores lidos pela pilha conferem com os do disco.</p><p class="small">Teste: <a href="testes.html#teste-storage"><code>storage</code></a></p><p class="small muted">Estado: o teste storage passa.</p><figure class="shot "><a href="capturas/storage.png"><img src="capturas/storage.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste storage: Pilha de armazenamento real pelo PnP"></a><figcaption>Tela do QEMU no fim do teste <code>storage</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[storage] 8 setores do disco 1 pela pilha real == imagem do xtask (OEM &quot;NTFS    &quot;, serie &quot;OPENNT!!&quot;)
+STORAGE_REAL_OK
+[services] tabela nativa nao registrada: ntdll.dll ausente (NTFS e bundle)
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040af4610, pilha reserva ate 0xffffa0070007ffd0, IST da falta dupla ate 0xffffa007000bffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="acpi-sys-como-raiz-dos-dispositivos" data-state="ok" data-text="acpi.sys como raiz dos dispositivos o acpi.sys carrega a dsdt do qemu, entra no modo acpi, conecta a sci e relata os dispositivos do namespace. o pci.sys sobre o barramento que ele relata ainda não inicia."><header><h3>acpi.sys como raiz dos dispositivos</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O acpi.sys carrega a DSDT do QEMU, entra no modo ACPI, conecta a SCI e relata os dispositivos do namespace.</p><p class="stop"><b>Limite:</b> O pci.sys sobre o barramento que ele relata ainda não inicia.</p><p class="small">Teste: <a href="testes.html#teste-acpi"><code>acpi</code></a></p><p class="small muted">Estado: o teste acpi passa.</p><figure class="shot "><a href="capturas/acpi.png"><img src="capturas/acpi.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste acpi: acpi.sys e pci.sys reais como raiz da árvore de dispositivos"></a><figcaption>Tela do QEMU no fim do teste <code>acpi</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+ACPI_ROOT_OK
+...
+[pnp] START_DEVICE \Device\Unnamed7 -&gt; 0x0
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="area-de-trabalho-na-tela" data-state="no" data-text="área de trabalho na tela ainda não há sessão gráfica: nenhuma janela é desenhada. falta o initvideo do win32k montar a configuração de exibição."><header><h3>Área de trabalho na tela</h3><span class="chip no"><span aria-hidden="true">○</span> Não roda</span></header><p>Ainda não há sessão gráfica: nenhuma janela é desenhada.</p><p class="stop"><b>Para:</b> Falta o InitVideo do win32k montar a configuração de exibição.</p><p class="small muted">Nenhum teste automático ainda.</p><p class="small muted">Estado: sem teste automático.</p></li><li class="card" id="programas-win32-exe" data-state="no" data-text="programas win32 (.exe) fora o smss.exe e o csrss.exe, nenhum programa do windows roda ainda. o shell ainda não executa .exe e não há sessão de usuário."><header><h3>Programas Win32 (.exe)</h3><span class="chip no"><span aria-hidden="true">○</span> Não roda</span></header><p>Fora o smss.exe e o csrss.exe, nenhum programa do Windows roda ainda.</p><p class="stop"><b>Para:</b> O shell ainda não executa .exe e não há sessão de usuário.</p><p class="small muted">Nenhum teste automático ainda.</p><p class="small muted">Estado: sem teste automático.</p></li><li class="card" id="rede-pela-placa-e1000" data-state="no" data-text="rede pela placa e1000 o ndis, o tcp/ip e o afd sobem, mas nenhum pacote sai pela placa do qemu. falta ligar o miniport e1g6032e.sys à placa e1000."><header><h3>Rede pela placa e1000</h3><span class="chip no"><span aria-hidden="true">○</span> Não roda</span></header><p>O NDIS, o TCP/IP e o AFD sobem, mas nenhum pacote sai pela placa do QEMU.</p><p class="stop"><b>Para:</b> Falta ligar o miniport E1G6032E.sys à placa e1000.</p><p class="small muted">Nenhum teste automático ainda.</p><p class="small muted">Estado: sem teste automático.</p></li></ul></section>
+<section data-group aria-labelledby="drivers"><h2 id="drivers">Drivers do Windows (modo kernel)</h2><p class="muted">Os .sys e .dll de modo kernel, carregados como estão: o Code Integrity da própria Microsoft valida cada imagem e o carregador do OpenNT resolve os imports contra os exports do kernel.</p><ul class="cards"><li class="card" id="hal-dll" data-state="ok" data-text="hal.dll carrega na fase 1 do boot; os 91 encaminhamentos da imagem ligam aos exports do kernel, que faz o papel da hal. "><header><h3>hal.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Carrega na fase 1 do boot; os 91 encaminhamentos da imagem ligam aos exports do kernel, que faz o papel da HAL.</p><p class="small">Teste: <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste drivers passa.</p><figure class="shot "><a href="capturas/drivers.png"><img src="capturas/drivers.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste drivers: Drivers do Windows no boot comum"></a><figcaption>Tela do QEMU no fim do teste <code>drivers</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[boot] hal.dll carregado (0 exports, 91 encaminhamentos)
+...
+[boot] servicos carregados: 5
+...
+[boot] cng.sys carregado; \Device\CNG publicado
+...
+[pnp] AddDevice do filtro mouclass -&gt; 0x0
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="ci-dll-e-msrpc-sys" data-state="ok" data-text="ci.dll e msrpc.sys a integridade de código do windows valida cada imagem de kernel pela assinatura embutida ou pelo catálogo da microsoft. "><header><h3>ci.dll e msrpc.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>A integridade de código do Windows valida cada imagem de kernel pela assinatura embutida ou pelo catálogo da Microsoft.</p><p class="small">Teste: <a href="testes.html#teste-watchdog"><code>watchdog</code></a></p><p class="small muted">Estado: o teste watchdog passa.</p><figure class="shot "><a href="capturas/watchdog.png"><img src="capturas/watchdog.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste watchdog: Driver watchdog.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>watchdog</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=watchdog state=4 win32=0 ntstatus=0x0
+...
+CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolv...
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="cng-sys" data-state="ok" data-text="cng.sys carrega no boot, registra a fonte de entropia e publica \device\cng. "><header><h3>cng.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Carrega no boot, registra a fonte de entropia e publica \Device\CNG.</p><p class="small">Teste: <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste drivers passa.</p><figure class="shot "><a href="capturas/drivers.png"><img src="capturas/drivers.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste drivers: Drivers do Windows no boot comum"></a><figcaption>Tela do QEMU no fim do teste <code>drivers</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[boot] hal.dll carregado (0 exports, 91 encaminhamentos)
+...
+[boot] servicos carregados: 5
+...
+[boot] cng.sys carregado; \Device\CNG publicado
+...
+[pnp] AddDevice do filtro mouclass -&gt; 0x0
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="i8042prt-sys" data-state="ok" data-text="i8042prt.sys liga-se aos dispositivos ps/2 da placa-mãe pelo pnp, com as isrs nas irqs 1 e 12; é por ele que o shell recebe as teclas. "><header><h3>i8042prt.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Liga-se aos dispositivos PS/2 da placa-mãe pelo PnP, com as ISRs nas IRQs 1 e 12; é por ele que o shell recebe as teclas.</p><p class="small">Testes: <a href="testes.html#teste-teclado"><code>teclado</code></a>, <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste teclado passa.</p><figure class="shot "><a href="capturas/teclado.png"><img src="capturas/teclado.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste teclado: Teclado real"></a><figcaption>Tela do QEMU no fim do teste <code>teclado</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+KBDTEST_OK
+SELFTEST_OK
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)</code></pre></details></figure></li><li class="card" id="kbdclass-sys" data-state="ok" data-text="kbdclass.sys filtro de classe sobre o i8042prt.sys: entrega as teclas em \device\keyboardclass0. "><header><h3>kbdclass.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Filtro de classe sobre o i8042prt.sys: entrega as teclas em \Device\KeyboardClass0.</p><p class="small">Testes: <a href="testes.html#teste-teclado"><code>teclado</code></a>, <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste teclado passa.</p><figure class="shot "><a href="capturas/teclado.png"><img src="capturas/teclado.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste teclado: Teclado real"></a><figcaption>Tela do QEMU no fim do teste <code>teclado</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+KBDTEST_OK
+SELFTEST_OK
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)</code></pre></details></figure></li><li class="card" id="mouclass-sys" data-state="ok" data-text="mouclass.sys anexa-se sobre o i8042prt.sys e a pilha do mouse inicia. nenhum programa lê o mouse ainda."><header><h3>mouclass.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Anexa-se sobre o i8042prt.sys e a pilha do mouse inicia.</p><p class="stop"><b>Limite:</b> Nenhum programa lê o mouse ainda.</p><p class="small">Teste: <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste drivers passa.</p><figure class="shot "><a href="capturas/drivers.png"><img src="capturas/drivers.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste drivers: Drivers do Windows no boot comum"></a><figcaption>Tela do QEMU no fim do teste <code>drivers</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[boot] hal.dll carregado (0 exports, 91 encaminhamentos)
+...
+[boot] servicos carregados: 5
+...
+[boot] cng.sys carregado; \Device\CNG publicado
+...
+[pnp] AddDevice do filtro mouclass -&gt; 0x0
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="wmilib-sys-e-wpprecorder-sys" data-state="ok" data-text="wmilib.sys e wpprecorder.sys bibliotecas de export carregadas pelo primeiro driver que as importa (ataport, kbdclass, i8042prt, mouclass). "><header><h3>wmilib.sys e WppRecorder.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Bibliotecas de export carregadas pelo primeiro driver que as importa (ataport, kbdclass, i8042prt, mouclass).</p><p class="small">Testes: <a href="testes.html#teste-teclado"><code>teclado</code></a>, <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o teste teclado passa.</p><figure class="shot "><a href="capturas/teclado.png"><img src="capturas/teclado.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste teclado: Teclado real"></a><figcaption>Tela do QEMU no fim do teste <code>teclado</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+KBDTEST_OK
+SELFTEST_OK
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)</code></pre></details></figure></li><li class="card" id="watchdog-sys" data-state="ok" data-text="watchdog.sys validado pelo catálogo, o driverentry retorna sucesso; o dxgkrnl.sys e o win32k.sys importam dele. "><header><h3>watchdog.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Validado pelo catálogo, o DriverEntry retorna sucesso; o dxgkrnl.sys e o win32k.sys importam dele.</p><p class="small">Teste: <a href="testes.html#teste-watchdog"><code>watchdog</code></a></p><p class="small muted">Estado: o teste watchdog passa.</p><figure class="shot "><a href="capturas/watchdog.png"><img src="capturas/watchdog.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste watchdog: Driver watchdog.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>watchdog</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=watchdog state=4 win32=0 ntstatus=0x0
+...
+CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolv...
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="ksecdd-sys" data-state="ok" data-text="ksecdd.sys liga-se ao host de autorização do kernel, conversa com o cng.sys por ioctls e publica \device\ksecdd. "><header><h3>ksecdd.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Liga-se ao host de autorização do kernel, conversa com o cng.sys por IOCTLs e publica \Device\KsecDD.</p><p class="small">Teste: <a href="testes.html#teste-ksecdd"><code>ksecdd</code></a></p><p class="small muted">Estado: o teste ksecdd passa.</p><figure class="shot "><a href="capturas/ksecdd.png"><img src="capturas/ksecdd.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ksecdd: Driver ksecdd.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ksecdd</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[pe] imports de HAL.dll
+[pe] imports de msrpc.sys
+[pe] entry point = 0xfffff801003b8010
+[driver] minio\security\base\lsa\security\driver\asyncsspi.cxx - SspiInitAsyncInterface
+DRIVER_START_COMPLETED name=ksecdd state=4 win32=0 ntstatus=0x0
+KERNEL_RS_OK</code></pre></details></figure></li><li class="card" id="ksecpkg-sys" data-state="ok" data-text="ksecpkg.sys o pacote de segurança do kernel (ntlm e ssl) sobe sobre o ksecdd.sys e o cng.sys. "><header><h3>ksecpkg.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O pacote de segurança do kernel (NTLM e SSL) sobe sobre o ksecdd.sys e o cng.sys.</p><p class="small">Teste: <a href="testes.html#teste-ksecpkg"><code>ksecpkg</code></a></p><p class="small muted">Estado: o teste ksecpkg passa.</p><figure class="shot "><a href="capturas/ksecpkg.png"><img src="capturas/ksecpkg.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ksecpkg: Driver ksecpkg.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ksecpkg</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=ksecpkg state=4 win32=0 ntstatus=0x0
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040adbb90, pilha reserva ate 0xffffa0070003ffd0, IST da falta dupla ate 0xffffa0070007ffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)
+[csr] sessao 0: SharedSection e ApiPort prontos
+[scmr] ntsvcs registrado; gerenciador disponivel</code></pre></details></figure></li><li class="card" id="null-sys" data-state="ok" data-text="null.sys publica \device\null; um processo lê (fim de arquivo) e escreve pelo despacho do próprio driver. "><header><h3>null.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Publica \Device\Null; um processo lê (fim de arquivo) e escreve pelo despacho do próprio driver.</p><p class="small">Teste: <a href="testes.html#teste-null"><code>null</code></a></p><p class="small muted">Estado: o teste null passa.</p><figure class="shot "><a href="capturas/null.png"><img src="capturas/null.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste null: Driver null.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>null</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=null state=4 win32=0 ntstatus=0x0
+...
+[csr] sessao 0: SharedSection e ApiPort prontos
+[scmr] ntsvcs registrado; gerenciador disponivel
+[usermode] abre device: \Device\Null
+[null] \Device\Null: abertura=0x0 leitura=0xc0000011 (iosb 0x0, 1 bytes, buffer intacto=true) escrita=0x0 (iosb 0x0, 77 bytes) fechamento=0x0
+NULL_DEVICE_OK leitura=EOF escrita=77
+[ci-loader] validating \FS\kbdclass.sys bytes=71480</code></pre></details></figure></li><li class="card" id="beep-sys" data-state="ok" data-text="beep.sys publica \device\beep; o ioctl_beep_set passa pela fila do dispositivo e pelo startio do driver. "><header><h3>beep.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Publica \Device\Beep; o IOCTL_BEEP_SET passa pela fila do dispositivo e pelo StartIo do driver.</p><p class="small">Teste: <a href="testes.html#teste-beep"><code>beep</code></a></p><p class="small muted">Estado: o teste beep passa.</p><figure class="shot "><a href="capturas/beep.png"><img src="capturas/beep.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste beep: Driver beep.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>beep</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=beep state=4 win32=0 ntstatus=0x0
+...
+[csr] sessao 0: SharedSection e ApiPort prontos
+[scmr] ntsvcs registrado; gerenciador disponivel
+[usermode] abre device: \Device\Beep
+[beep] \Device\Beep: abertura=0x0 redirecionamento=0x103 BEEP_SET=0x0 entregue=(0x0, 8 bytes, 440 Hz, 100 ms) fila=Some((0, 0, true, 0)) sem-redirecionamento=0x...
+BEEP_DEVICE_OK StartIo=440Hz/100ms fila=livre
+[ci-loader] validating \FS\kbdclass.sys bytes=71480</code></pre></details></figure></li><li class="card" id="fs-rec-sys" data-state="ok" data-text="fs_rec.sys registra os reconhecedores de file system; cada um examina o volume ntfs e responde como no windows. "><header><h3>fs_rec.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Registra os reconhecedores de file system; cada um examina o volume NTFS e responde como no Windows.</p><p class="small">Teste: <a href="testes.html#teste-fs-rec"><code>fs_rec</code></a></p><p class="small muted">Estado: o teste fs_rec passa.</p><figure class="shot "><a href="capturas/fs_rec.png"><img src="capturas/fs_rec.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste fs_rec: Driver fs_rec.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>fs_rec</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=fs_rec state=4 win32=0 ntstatus=0x0
+...
+[fs_rec] IRP_MN_MOUNT_VOLUME do volume NTFS -&gt; ReFSRecognizer (fila 8): 0xc000014f
+[fs_rec] IRP_MN_MOUNT_VOLUME do volume NTFS -&gt; ReFSv1Recognizer (fila 8): 0xc000014f
+[fs_rec] IRP_MN_MOUNT_VOLUME do volume NTFS -&gt; UdfsDiskRecognizer (fila 8): 0xc000014f
+[fs_rec] volume NTFS reconhecido pelo NtfsRecognizer: true (reconhecedor presente: true)
+FS_REC_OK reconhecedores=9 ntfs=STATUS_FS_DRIVER_REQUIRED
+[ci-loader] validating \FS\kbdclass.sys bytes=71480</code></pre></details></figure></li><li class="card" id="condrv-sys" data-state="ok" data-text="condrv.sys o driver do console: servidor, referência e conexão abertos como o conhost abre, e a conexão chega ao servidor. "><header><h3>condrv.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O driver do console: servidor, referência e conexão abertos como o conhost abre, e a conexão chega ao servidor.</p><p class="small">Teste: <a href="testes.html#teste-condrv"><code>condrv</code></a></p><p class="small muted">Estado: o teste condrv passa.</p><figure class="shot "><a href="capturas/condrv.png"><img src="capturas/condrv.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste condrv: Driver condrv.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>condrv</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=condrv state=4 win32=0 ntstatus=0x0
+...
+CONDRV_OK
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="npfs-sys" data-state="ok" data-text="npfs.sys sobe em todo boot; processos criam, conectam e trocam dados por pipes nomeados. "><header><h3>npfs.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Sobe em todo boot; processos criam, conectam e trocam dados por pipes nomeados.</p><p class="small">Teste: <a href="testes.html#teste-pipes"><code>pipes</code></a></p><p class="small muted">Estado: o teste pipes passa.</p><figure class="shot "><a href="capturas/pipes.png"><img src="capturas/pipes.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste pipes: Pipes nomeados e mailslots entre processos"></a><figcaption>Tela do QEMU no fim do teste <code>pipes</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+PHASE6_SELFTEST_OK
+...
+PIPES_OK
+...
+PHASE7_SELFTEST_OK
+...
+[pe] relocada p/ 0xfffff80100270000 (13 fixups)
+[pe] security cookie semeado em 0xfffff80100277010
+[pe] imports de ntoskrnl.exe
+[pe] entry point = 0xfffff8010027d010
+[kernel-library] DllInitialize wpprecorder.sys
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\WppRecorder</code></pre></details></figure></li><li class="card" id="msfs-sys" data-state="ok" data-text="msfs.sys sobe em todo boot; processos trocam mensagens por mailslots. "><header><h3>msfs.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Sobe em todo boot; processos trocam mensagens por mailslots.</p><p class="small">Teste: <a href="testes.html#teste-pipes"><code>pipes</code></a></p><p class="small muted">Estado: o teste pipes passa.</p><figure class="shot "><a href="capturas/pipes.png"><img src="capturas/pipes.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste pipes: Pipes nomeados e mailslots entre processos"></a><figcaption>Tela do QEMU no fim do teste <code>pipes</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+PHASE6_SELFTEST_OK
+...
+PIPES_OK
+...
+PHASE7_SELFTEST_OK
+...
+[pe] relocada p/ 0xfffff80100270000 (13 fixups)
+[pe] security cookie semeado em 0xfffff80100277010
+[pe] imports de ntoskrnl.exe
+[pe] entry point = 0xfffff8010027d010
+[kernel-library] DllInitialize wpprecorder.sys
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\WppRecorder</code></pre></details></figure></li><li class="card" id="ntfs-sys" data-state="part" data-text="ntfs.sys monta o volume ntfs 3.1 do segundo disco, lê pelo cache manager e cria, grava e relê um arquivo. só quando o teste o inicia; no boot comum, o volume é servido pelo ntfs do próprio kernel."><header><h3>ntfs.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Monta o volume NTFS 3.1 do segundo disco, lê pelo Cache Manager e cria, grava e relê um arquivo.</p><p class="stop"><b>Para:</b> Só quando o teste o inicia; no boot comum, o volume é servido pelo NTFS do próprio kernel.</p><p class="small">Teste: <a href="testes.html#teste-ntfs"><code>ntfs</code></a></p><p class="small muted">Estado: o componente ntfs.sys, fastfat.sys e fltmgr.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/ntfs.png"><img src="capturas/ntfs.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ntfs: Driver ntfs.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ntfs</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=ntfs state=4 win32=0 ntstatus=0x0
+...
+FILE_SYSTEM_WRITE_OK OPENNT-NOVO.TXT
+FILE_SYSTEM_MOUNT_OK name=ntfs
+...
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+[zw] QuerySystemInformation classe 184 buf=24</code></pre></details></figure></li><li class="card" id="clfs-sys-e-clipsp-sys" data-state="ok" data-text="clfs.sys e clipsp.sys carregam como imports do ntfs.sys, validados pelo catálogo. "><header><h3>clfs.sys e clipsp.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Carregam como imports do ntfs.sys, validados pelo catálogo.</p><p class="small">Teste: <a href="testes.html#teste-ntfs"><code>ntfs</code></a></p><p class="small muted">Estado: o teste ntfs passa.</p><figure class="shot "><a href="capturas/ntfs.png"><img src="capturas/ntfs.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ntfs: Driver ntfs.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ntfs</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=ntfs state=4 win32=0 ntstatus=0x0
+...
+FILE_SYSTEM_WRITE_OK OPENNT-NOVO.TXT
+FILE_SYSTEM_MOUNT_OK name=ntfs
+...
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+[zw] QuerySystemInformation classe 184 buf=24</code></pre></details></figure></li><li class="card" id="fltmgr-sys" data-state="part" data-text="fltmgr.sys o filter manager se anexa ao file system e ao volume montado pelo ntfs.sys. nenhum filtro de file system carrega sobre ele ainda."><header><h3>fltmgr.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>O Filter Manager se anexa ao file system e ao volume montado pelo ntfs.sys.</p><p class="stop"><b>Para:</b> Nenhum filtro de file system carrega sobre ele ainda.</p><p class="small">Teste: <a href="testes.html#teste-ntfs"><code>ntfs</code></a></p><p class="small muted">Estado: o componente ntfs.sys, fastfat.sys e fltmgr.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/ntfs.png"><img src="capturas/ntfs.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ntfs: Driver ntfs.sys real"></a><figcaption>Tela do QEMU no fim do teste <code>ntfs</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=ntfs state=4 win32=0 ntstatus=0x0
+...
+FILE_SYSTEM_WRITE_OK OPENNT-NOVO.TXT
+FILE_SYSTEM_MOUNT_OK name=ntfs
+...
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+[zw] QuerySystemInformation classe 184 buf=24</code></pre></details></figure></li><li class="card" id="fastfat-sys" data-state="no" data-text="fastfat.sys vai para o volume com o catálogo dele. o início sobre um volume fat ainda não foi exercitado."><header><h3>fastfat.sys</h3><span class="chip no"><span aria-hidden="true">○</span> Não roda</span></header><p>Vai para o volume com o catálogo dele.</p><p class="stop"><b>Para:</b> O início sobre um volume FAT ainda não foi exercitado.</p><p class="small muted">Nenhum teste automático ainda.</p><p class="small muted">Estado: sem teste automático.</p></li><li class="card" id="intelide-sys-e-pciidex-sys" data-state="part" data-text="intelide.sys e pciidex.sys instalados pelo pnp na controladora ide piix3 do qemu; relatam os dois canais. só com --storage=real; no boot comum, o disco é servido pelo driver ata do kernel."><header><h3>intelide.sys e pciidex.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Instalados pelo PnP na controladora IDE PIIX3 do QEMU; relatam os dois canais.</p><p class="stop"><b>Para:</b> Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel.</p><p class="small">Teste: <a href="testes.html#teste-storage"><code>storage</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/storage.png"><img src="capturas/storage.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste storage: Pilha de armazenamento real pelo PnP"></a><figcaption>Tela do QEMU no fim do teste <code>storage</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[storage] 8 setores do disco 1 pela pilha real == imagem do xtask (OEM &quot;NTFS    &quot;, serie &quot;OPENNT!!&quot;)
+STORAGE_REAL_OK
+[services] tabela nativa nao registrada: ntdll.dll ausente (NTFS e bundle)
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040af4610, pilha reserva ate 0xffffa0070007ffd0, IST da falta dupla ate 0xffffa007000bffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="atapi-sys-e-ataport-sys" data-state="part" data-text="atapi.sys e ataport.sys ligam-se aos dois canais ide: identify dos discos e do cd-rom, irq 14 e 15 e leituras por dma. só com --storage=real; no boot comum, o disco é servido pelo driver ata do kernel."><header><h3>atapi.sys e ataport.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Ligam-se aos dois canais IDE: IDENTIFY dos discos e do CD-ROM, IRQ 14 e 15 e leituras por DMA.</p><p class="stop"><b>Para:</b> Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel.</p><p class="small">Teste: <a href="testes.html#teste-storage"><code>storage</code></a></p><p class="small muted">Estado: o componente atapi.sys e ataport.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/storage.png"><img src="capturas/storage.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste storage: Pilha de armazenamento real pelo PnP"></a><figcaption>Tela do QEMU no fim do teste <code>storage</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[storage] 8 setores do disco 1 pela pilha real == imagem do xtask (OEM &quot;NTFS    &quot;, serie &quot;OPENNT!!&quot;)
+STORAGE_REAL_OK
+[services] tabela nativa nao registrada: ntdll.dll ausente (NTFS e bundle)
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040af4610, pilha reserva ate 0xffffa0070007ffd0, IST da falta dupla ate 0xffffa007000bffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="disk-sys-classpnp-sys-e-partmgr-sys" data-state="part" data-text="disk.sys, classpnp.sys e partmgr.sys criam \device\harddisk0\dr0 e \device\harddisk1\dr1; as leituras do teste atravessam a pilha até o disco. só com --storage=real; no boot comum, o disco é servido pelo driver ata do kernel."><header><h3>disk.sys, classpnp.sys e partmgr.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Criam \Device\Harddisk0\DR0 e \Device\Harddisk1\DR1; as leituras do teste atravessam a pilha até o disco.</p><p class="stop"><b>Para:</b> Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel.</p><p class="small">Teste: <a href="testes.html#teste-storage"><code>storage</code></a></p><p class="small muted">Estado: o componente disk.sys e classpnp.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/storage.png"><img src="capturas/storage.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste storage: Pilha de armazenamento real pelo PnP"></a><figcaption>Tela do QEMU no fim do teste <code>storage</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[storage] 8 setores do disco 1 pela pilha real == imagem do xtask (OEM &quot;NTFS    &quot;, serie &quot;OPENNT!!&quot;)
+STORAGE_REAL_OK
+[services] tabela nativa nao registrada: ntdll.dll ausente (NTFS e bundle)
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040af4610, pilha reserva ate 0xffffa0070007ffd0, IST da falta dupla ate 0xffffa007000bffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="volmgr-sys" data-state="part" data-text="volmgr.sys carrega e relata o próprio dispositivo raiz. ainda não cria volumes para o mountmgr."><header><h3>volmgr.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Carrega e relata o próprio dispositivo raiz.</p><p class="stop"><b>Para:</b> Ainda não cria volumes para o mountmgr.</p><p class="small">Teste: <a href="testes.html#teste-storage"><code>storage</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/storage.png"><img src="capturas/storage.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste storage: Pilha de armazenamento real pelo PnP"></a><figcaption>Tela do QEMU no fim do teste <code>storage</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[storage] 8 setores do disco 1 pela pilha real == imagem do xtask (OEM &quot;NTFS    &quot;, serie &quot;OPENNT!!&quot;)
+STORAGE_REAL_OK
+[services] tabela nativa nao registrada: ntdll.dll ausente (NTFS e bundle)
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040af4610, pilha reserva ate 0xffffa0070007ffd0, IST da falta dupla ate 0xffffa007000bffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="mountmgr-sys" data-state="part" data-text="mountmgr.sys carrega no boot e o driverentry retorna sucesso. nenhum volume chega a ele: as letras c: e d: são links do próprio kernel."><header><h3>mountmgr.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Carrega no boot e o DriverEntry retorna sucesso.</p><p class="stop"><b>Para:</b> Nenhum volume chega a ele: as letras C: e D: são links do próprio kernel.</p><p class="small">Teste: <a href="testes.html#teste-drivers"><code>drivers</code></a></p><p class="small muted">Estado: o componente mountmgr.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/drivers.png"><img src="capturas/drivers.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste drivers: Drivers do Windows no boot comum"></a><figcaption>Tela do QEMU no fim do teste <code>drivers</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[boot] hal.dll carregado (0 exports, 91 encaminhamentos)
+...
+[boot] servicos carregados: 5
+...
+[boot] cng.sys carregado; \Device\CNG publicado
+...
+[pnp] AddDevice do filtro mouclass -&gt; 0x0
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="wdfldr-sys-e-wdf01000-sys" data-state="ok" data-text="wdfldr.sys e wdf01000.sys o runtime kmdf: a wdfldr.sys liga o driver ao wdf01000.sys, que carrega pela chave do serviço e devolve a tabela de funções. "><header><h3>WdfLdr.sys e Wdf01000.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O runtime KMDF: a WdfLdr.sys liga o driver ao Wdf01000.sys, que carrega pela chave do serviço e devolve a tabela de funções.</p><p class="small">Testes: <a href="testes.html#teste-kmdf"><code>kmdf</code></a>, <a href="testes.html#teste-basicdisplay"><code>basicdisplay</code></a></p><p class="small muted">Estado: o teste kmdf passa.</p><figure class="shot "><a href="capturas/kmdf.png"><img src="capturas/kmdf.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste kmdf: Runtime KMDF real com o msisadrv.sys"></a><figcaption>Tela do QEMU no fim do teste <code>kmdf</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[zw] QuerySystemInformation classe 11 buf=304
+[zw] QuerySystemInformation classe 11 buf=5336
+DRIVER_START_COMPLETED name=msisadrv state=4 win32=0 ntstatus=0x0
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040adbb90, pilha reserva ate 0xffffa0070003ffd0, IST da falta dupla ate 0xffffa0070007ffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="msisadrv-sys" data-state="ok" data-text="msisadrv.sys driver kmdf da ponte pci-isa: sobe pelo serviço e, com --display=basic, pelo pnp (adddevice e start do kmdf). "><header><h3>msisadrv.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Driver KMDF da ponte PCI-ISA: sobe pelo serviço e, com --display=basic, pelo PnP (AddDevice e START do KMDF).</p><p class="small">Testes: <a href="testes.html#teste-kmdf"><code>kmdf</code></a>, <a href="testes.html#teste-basicdisplay"><code>basicdisplay</code></a></p><p class="small muted">Estado: o teste kmdf passa.</p><figure class="shot "><a href="capturas/kmdf.png"><img src="capturas/kmdf.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste kmdf: Runtime KMDF real com o msisadrv.sys"></a><figcaption>Tela do QEMU no fim do teste <code>kmdf</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[zw] QuerySystemInformation classe 11 buf=304
+[zw] QuerySystemInformation classe 11 buf=5336
+DRIVER_START_COMPLETED name=msisadrv state=4 win32=0 ntstatus=0x0
+KERNEL_RS_OK
+[usermode] ring 3 armado: GDT em 0xfffff80040adbb90, pilha reserva ate 0xffffa0070003ffd0, IST da falta dupla ate 0xffffa0070007ffd0, KUSER user em 0x7FFE0000
+[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)</code></pre></details></figure></li><li class="card" id="dxgkrnl-sys" data-state="part" data-text="dxgkrnl.sys cria o \device\dxgkrnl; com o basicdisplay, inicia o adaptador quando o win32k anuncia a sessão e cria o \device\video0. nada aparece na tela ainda: o initvideo do win32k para antes, com 0xb4."><header><h3>dxgkrnl.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Cria o \Device\DxgKrnl; com o BasicDisplay, inicia o adaptador quando o win32k anuncia a sessão e cria o \Device\Video0.</p><p class="stop"><b>Para:</b> Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4.</p><p class="small">Testes: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a>, <a href="testes.html#teste-dxgkrnl"><code>dxgkrnl</code></a></p><p class="small muted">Estado: o componente dxgkrnl.sys e BasicDisplay.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="basicdisplay-sys" data-state="part" data-text="basicdisplay.sys instalado pelo pnp no adaptador vga do qemu; registra-se no dxgkrnl e o dxgkddistartdevice usa o framebuffer vbe 1024x768. nada aparece na tela ainda: o initvideo do win32k para antes, com 0xb4."><header><h3>BasicDisplay.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Instalado pelo PnP no adaptador VGA do QEMU; registra-se no dxgkrnl e o DxgkDdiStartDevice usa o framebuffer VBE 1024x768.</p><p class="stop"><b>Para:</b> Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4.</p><p class="small">Testes: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a>, <a href="testes.html#teste-basicdisplay"><code>basicdisplay</code></a></p><p class="small muted">Estado: o componente dxgkrnl.sys e BasicDisplay.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="win32k-sys-win32kbase-sys-e-win32kfull-sys" data-state="part" data-text="win32k.sys, win32kbase.sys e win32kfull.sys carregados pelo smss no espaço de sessão; atendem o csrss (thread gui, ntgdiinit, ntuserinitialize) e anunciam a sessão ao dxgkrnl. o initvideo enumera o \device\video0, mas não monta a configuração de exibição e para com 0xb4."><header><h3>win32k.sys, win32kbase.sys e win32kfull.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Carregados pelo smss no espaço de sessão; atendem o csrss (thread GUI, NtGdiInit, NtUserInitialize) e anunciam a sessão ao dxgkrnl.</p><p class="stop"><b>Para:</b> O InitVideo enumera o \Device\Video0, mas não monta a configuração de exibição e para com 0xB4.</p><p class="small">Testes: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a>, <a href="testes.html#teste-win32k"><code>win32k</code></a></p><p class="small muted">Estado: o componente win32k.sys, win32kbase.sys e win32kfull.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="acpi-sys" data-state="part" data-text="acpi.sys raiz da árvore de dispositivos: interpretador aml com a dsdt do qemu, modo acpi, sci conectada e os dispositivos relatados. só com --pnp-root=acpi; o teclado ainda sobe nos dispositivos da placa-mãe do kernel."><header><h3>acpi.sys</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Raiz da árvore de dispositivos: interpretador AML com a DSDT do QEMU, modo ACPI, SCI conectada e os dispositivos relatados.</p><p class="stop"><b>Para:</b> Só com --pnp-root=acpi; o teclado ainda sobe nos dispositivos da placa-mãe do kernel.</p><p class="small">Teste: <a href="testes.html#teste-acpi"><code>acpi</code></a></p><p class="small muted">Estado: o componente acpi.sys e pci.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/acpi.png"><img src="capturas/acpi.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste acpi: acpi.sys e pci.sys reais como raiz da árvore de dispositivos"></a><figcaption>Tela do QEMU no fim do teste <code>acpi</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+ACPI_ROOT_OK
+...
+[pnp] START_DEVICE \Device\Unnamed7 -&gt; 0x0
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="pci-sys-e-pshed-dll" data-state="part" data-text="pci.sys e pshed.dll instalado pelo pci.inf no barramento que o acpi.sys relata; carrega com a pshed.dll. o driverentry devolve status_not_found: falta o banco de erratas (errata.inf) que ele consulta."><header><h3>pci.sys e pshed.dll</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Instalado pelo pci.inf no barramento que o acpi.sys relata; carrega com a pshed.dll.</p><p class="stop"><b>Para:</b> O DriverEntry devolve STATUS_NOT_FOUND: falta o banco de erratas (errata.inf) que ele consulta.</p><p class="small">Teste: <a href="testes.html#teste-acpi"><code>acpi</code></a></p><p class="small muted">Estado: o componente acpi.sys e pci.sys está em desenvolvimento.</p><figure class="shot "><a href="capturas/acpi.png"><img src="capturas/acpi.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste acpi: acpi.sys e pci.sys reais como raiz da árvore de dispositivos"></a><figcaption>Tela do QEMU no fim do teste <code>acpi</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+ACPI_ROOT_OK
+...
+[pnp] START_DEVICE \Device\Unnamed7 -&gt; 0x0
+[pnp] \Device\Unnamed7: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="ndis-sys-e-netio-sys" data-state="ok" data-text="ndis.sys e netio.sys importam um do outro e carregam juntos; o netio sobe o nmr, o nsi e a wfp, e o driverentry do ndis tem sucesso. nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."><header><h3>ndis.sys e netio.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Importam um do outro e carregam juntos; o NetIO sobe o NMR, o NSI e a WFP, e o DriverEntry do NDIS tem sucesso.</p><p class="stop"><b>Limite:</b> Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega.</p><p class="small">Teste: <a href="testes.html#teste-ndis"><code>ndis</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/ndis.png"><img src="capturas/ndis.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste ndis: Driver ndis.sys real (com o netio.sys)"></a><figcaption>Tela do QEMU no fim do teste <code>ndis</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=NDIS state=4 win32=0 ntstatus=0x0
+IMPORT_CYCLE_OK ndis.sys&lt;-&gt;netio.sys netio-&gt;ndis=35 ndis-&gt;netio=14
+...
+CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolv...
+...
+[pnp] START_DEVICE \Device\Unnamed2 -&gt; 0x0
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)</code></pre></details></figure></li><li class="card" id="afd-sys-e-tdi-sys" data-state="ok" data-text="afd.sys e tdi.sys o driver de sockets sobe depois do ndis, com a tdi.sys carregada pelo import. sem placa de rede ligada, nenhum socket chega a ele."><header><h3>afd.sys e tdi.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>O driver de sockets sobe depois do NDIS, com a tdi.sys carregada pelo import.</p><p class="stop"><b>Limite:</b> Sem placa de rede ligada, nenhum socket chega a ele.</p><p class="small">Teste: <a href="testes.html#teste-afd"><code>afd</code></a></p><p class="small muted">Estado: o teste afd passa.</p><figure class="shot "><a href="capturas/afd.png"><img src="capturas/afd.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste afd: Driver afd.sys real (depois do NDIS)"></a><figcaption>Tela do QEMU no fim do teste <code>afd</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=NDIS state=4 win32=0 ntstatus=0x0
+...
+DRIVER_START_COMPLETED name=AFD state=4 win32=0 ntstatus=0x0
+...
+CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolv...
+...
+[pnp] \Device\Unnamed2: 0 filho(s) no bus
+OpenNT shell - digite 'help'
+OpenNT&gt; [shell] pronto
+[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)
+[kbd] lendo teclas do driver real (i8042prt+kbdclass)
+[atapio] readSectors lba=16 count=8 drive=1</code></pre></details></figure></li><li class="card" id="tcpip-sys-e-fwpkclnt-sys" data-state="ok" data-text="tcpip.sys e fwpkclnt.sys sobe depois do ndis, com o fltmgr.sys e a fwpkclnt.sys; o driverentry registra o nsi e a wfp e termina com sucesso (state=4). nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."><header><h3>tcpip.sys e fwpkclnt.sys</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Sobe depois do NDIS, com o fltmgr.sys e a fwpkclnt.sys; o DriverEntry registra o NSI e a WFP e termina com sucesso (state=4).</p><p class="stop"><b>Limite:</b> Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega.</p><p class="small">Teste: <a href="testes.html#teste-tcpip"><code>tcpip</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/tcpip.png"><img src="capturas/tcpip.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste tcpip: Driver tcpip.sys real (depois do NDIS)"></a><figcaption>Tela do QEMU no fim do teste <code>tcpip</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+DRIVER_START_COMPLETED name=NDIS state=4 win32=0 ntstatus=0x0
+...
+[zw] QuerySystemInformation classe 76 buf=20
+[zw] QuerySystemInformation classe 76 buf=20
+[zw] QuerySystemInformation classe 77 buf=0
+[zw] QuerySystemInformation classe 77 buf=6402
+DRIVER_START_COMPLETED name=Tcpip state=4 win32=0 ntstatus=0x0
+KERNEL_RS_OK</code></pre></details></figure></li><li class="card" id="e1g6032e-sys" data-state="no" data-text="e1g6032e.sys o miniport intel pro/1000 da placa e1000 do qemu. ainda não é ligado pelo pnp."><header><h3>E1G6032E.sys</h3><span class="chip no"><span aria-hidden="true">○</span> Não roda</span></header><p>O miniport Intel PRO/1000 da placa e1000 do QEMU.</p><p class="stop"><b>Para:</b> Ainda não é ligado pelo PnP.</p><p class="small muted">Nenhum teste automático ainda.</p><p class="small muted">Estado: sem teste automático.</p></li></ul></section>
+<section data-group aria-labelledby="programas"><h2 id="programas">Programas do Windows (modo usuário)</h2><p class="muted">Os .exe e .dll de modo usuário, no anel 3, que falam com o kernel pelas chamadas de sistema do Windows.</p><ul class="cards"><li class="card" id="smss-exe" data-state="ok" data-text="smss.exe primeiro processo, protegido e crítico: lê o session manager, monta \knowndlls, dosdevices e \sessions e cria o smss da sessão. "><header><h3>smss.exe</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Primeiro processo, protegido e crítico: lê o Session Manager, monta \KnownDlls, DosDevices e \Sessions e cria o smss da sessão.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: o teste smss-csrss passa.</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li><li class="card" id="ntdll-dll" data-state="ok" data-text="ntdll.dll roda o smss e o csrss: ldrinitializethunk, carregador, thread pool e alpc. no boot comum, os testes de modo usuário usam uma ntdll mínima gerada pelo build."><header><h3>ntdll.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Roda o smss e o csrss: LdrInitializeThunk, carregador, thread pool e ALPC.</p><p class="stop"><b>Limite:</b> No boot comum, os testes de modo usuário usam uma ntdll mínima gerada pelo build.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li><li class="card" id="csrss-exe" data-state="part" data-text="csrss.exe cria o \windows\apiport e a seção compartilhada, carrega os servidores e chama o ntuserinitialize do win32k. para junto com a sessão: com vídeo, o win32k cai com 0xb4; sem vídeo, a sessão espera o primeiro adaptador."><header><h3>csrss.exe</h3><span class="chip part"><span aria-hidden="true">◐</span> Parcial</span></header><p>Cria o \Windows\ApiPort e a seção compartilhada, carrega os servidores e chama o NtUserInitialize do win32k.</p><p class="stop"><b>Para:</b> Para junto com a sessão: com vídeo, o win32k cai com 0xB4; sem vídeo, a sessão espera o primeiro adaptador.</p><p class="small">Testes: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a>, <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: o componente csrss.exe está em desenvolvimento.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="basesrv-dll" data-state="ok" data-text="basesrv.dll servidor base do csrss: hora do sistema, \basenamedobjects, links da sessão e o mapeamento de arquivos .ini. "><header><h3>basesrv.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Servidor base do csrss: hora do sistema, \BaseNamedObjects, links da sessão e o mapeamento de arquivos .ini.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: o teste smss-csrss passa.</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li><li class="card" id="winsrv-dll-e-winsrvext-dll" data-state="ok" data-text="winsrv.dll e winsrvext.dll servidores de janelas do csrss: com o cfgmgr32.dll aberto pelo \device\deviceapi\cmapi, chamam o ntuserinitialize. "><header><h3>winsrv.dll e winsrvext.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Servidores de janelas do csrss: com o cfgmgr32.dll aberto pelo \Device\DeviceApi\CMApi, chamam o NtUserInitialize.</p><p class="small">Teste: <a href="testes.html#teste-win32k-display"><code>win32k-display</code></a></p><p class="small muted">Estado: o teste win32k-display passa.</p><figure class="shot "><a href="capturas/win32k-display.png"><img src="capturas/win32k-display.png" width="1024" height="768" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste win32k-display: Adaptador de vídeo iniciado pela sessão do win32k"></a><figcaption>Tela do QEMU no fim do teste <code>win32k-display</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+BASICDISPLAY_OK
+...
+SMSS_CSRSS_OK
+...
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers&quot; table=0xffffa007002bf480
+[rtl]   &quot;MiracastUseIhvDriver&quot; flags=0x120 -&gt; default 0x0
+[rtl]   &quot;MiracastForceDisable&quot; flags=0x120 -&gt; default 0x0
+[display] PCI\VEN_1234&amp;DEV_1111&amp;SUBSYS_11001AF4&amp;REV_02\1&amp;ebb567f&amp;0&amp;10: adaptador iniciado pelo dxgkrnl (DxgkDdiStartDevice do BasicDisplay); interface \??\PCI#V...
+ADAPTER_STARTED
+[rtl] QueryRegistry path=&quot;\Registry\Machine\System\CurrentControlSet\Control\GraphicsDrivers\BasicDisplay&quot; table=0xffffa007002bf410</code></pre></details></figure></li><li class="card" id="user32-dll-gdi32-dll-e-gdi32full-dll" data-state="ok" data-text="user32.dll, gdi32.dll e gdi32full.dll inicializam dentro do csrss, com as chamadas ao win32k atendidas. nenhum programa cria janela ainda."><header><h3>user32.dll, gdi32.dll e gdi32full.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Inicializam dentro do csrss, com as chamadas ao win32k atendidas.</p><p class="stop"><b>Limite:</b> Nenhum programa cria janela ainda.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: o teste smss-csrss passa.</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li><li class="card" id="kernel32-dll-e-kernelbase-dll" data-state="ok" data-text="kernel32.dll e kernelbase.dll carregam e inicializam no csrss, puxadas pelo user32.dll. nenhum programa win32 as usa ainda."><header><h3>kernel32.dll e kernelbase.dll</h3><span class="chip ok"><span aria-hidden="true">●</span> Roda</span></header><p>Carregam e inicializam no csrss, puxadas pelo user32.dll.</p><p class="stop"><b>Limite:</b> Nenhum programa Win32 as usa ainda.</p><p class="small">Teste: <a href="testes.html#teste-smss-csrss"><code>smss-csrss</code></a></p><p class="small muted">Estado: declarado à mão no components.toml (os dados não bastam).</p><figure class="shot "><a href="capturas/smss-csrss.png"><img src="capturas/smss-csrss.png" width="480" height="160" loading="lazy" decoding="async" alt="Tela do QEMU no fim do teste smss-csrss: smss.exe e csrss.exe reais"></a><figcaption>Tela do QEMU no fim do teste <code>smss-csrss</code>, 15/11/2026</figcaption><details class="serial"><summary>Serial no fim do teste</summary><pre><code>...
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[usermode] syscall NtTraceControl sem implementacao de modo usuario
+[init] csrss.exe (pid 48) pediu o servico 0x12e3 da tabela do win32k (carregado)
+[init] csrss.exe (pid 48) criado pelo smss.exe (pid 40); smss inicial (pid 24) e csrss vivos ao pedir o win32k
+SMSS_CSRSS_OK</code></pre></details></figure></li></ul></section>
+</div>
+
+</main>
+<footer class="wrap foot"><p>Gerado por <code>cargo xtask status</code> a partir de <code>docs/status/components.toml</code>, da tabela de exports do kernel e das capturas de <code>cargo xtask capturas</code>. Nenhum binário da Microsoft entra no repositório: o build os copia do Windows da máquina.</p></footer>
+<script>(function(){
+var root=document.documentElement,b=document.getElementById('tema');
+if(b){var names={auto:'automático',claro:'claro',escuro:'escuro'};
+var cur=function(){var t=root.getAttribute('data-theme');return t==='light'?'claro':t==='dark'?'escuro':'auto';};
+var show=function(){b.textContent='Tema: '+names[cur()];};
+b.hidden=false;show();
+b.addEventListener('click',function(){var n={auto:'claro',claro:'escuro',escuro:'auto'}[cur()];
+if(n==='auto'){root.removeAttribute('data-theme');}else{root.setAttribute('data-theme',n==='claro'?'light':'dark');}
+try{if(n==='auto'){localStorage.removeItem('opennt-tema');}else{localStorage.setItem('opennt-tema',n);}}catch(e){}
+show();});}
+document.querySelectorAll('[data-filter]').forEach(function(bar){
+var scope=document.getElementById(bar.getAttribute('data-filter'));if(!scope)return;
+var q=bar.querySelector('input[type=search]'),btns=bar.querySelectorAll('button[data-state]'),out=bar.querySelector('output');
+var items=scope.querySelectorAll('[data-text],.names li'),state='';bar.hidden=false;
+var key=function(it){return it.getAttribute('data-text')||it.textContent.toLowerCase();};
+var run=function(){var text=q?q.value.trim().toLowerCase():'',n=0;
+items.forEach(function(it){var ok=(!state||it.getAttribute('data-state')===state)&&(!text||key(it).indexOf(text)>=0);
+it.hidden=!ok;if(ok)n++;});
+scope.querySelectorAll('[data-group]').forEach(function(g){var any=g.querySelector('[data-text]:not([hidden]),.names li:not([hidden])');g.hidden=!any;
+if(g.tagName==='DETAILS'&&text&&any)g.open=true;});
+if(out)out.textContent=n+(n===1?' item':' itens');};
+btns.forEach(function(x){x.addEventListener('click',function(){state=x.getAttribute('data-state');
+btns.forEach(function(y){y.setAttribute('aria-pressed',y===x?'true':'false');});run();});});
+if(q)q.addEventListener('input',run);run();});
+})();</script>
+</body>
+</html>
