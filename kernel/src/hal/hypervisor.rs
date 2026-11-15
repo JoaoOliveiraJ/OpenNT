@@ -30,6 +30,13 @@ pub fn is_microsoft_compatible() -> bool {
     &vendor() == b"Microsoft Hv"
 }
 
+/// A CPU é emulada, não virtualizada: o TCG do QEMU anuncia a interface
+/// "TCGTCGTCGTCG" na leaf 0x40000000. As esperas medidas em tempo que
+/// dependem de outra CPU virtual rodar (`ke::smp`) usam prazos maiores nele.
+pub fn is_emulator() -> bool {
+    is_any_hypervisor_present() && &vendor() == b"TCGTCGTCGTCG"
+}
+
 /// HviGetHypervisorFeatures(&features): HV_X64_HYPERVISOR_FEATURES é o
 /// CPUID 0x40000003 inteiro (EAX:EBX = máscara de privilégios da partição,
 /// ECX e EDX); zeros quando a interface não existe.

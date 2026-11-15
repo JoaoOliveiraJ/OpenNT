@@ -72,10 +72,46 @@ static STATE: SpinLock<Smp> = SpinLock::new(Smp {
 /// IPI_WATCHDOG_TIMEOUT: um processador esperou tempo demais pela resposta
 /// a um IPI.
 pub const IPI_WATCHDOG_TIMEOUT: u32 = 0x1DB;
-/// Prazo para o ICR voltar a ocioso (DeliveryStatus), medido em tempo.
+/// Prazo para o ICR voltar a ocioso (DeliveryStatus), medido em tempo, em
+/// hardware e sob hipervisor.
 const INTERRUPT_DELIVERY_TIMEOUT_MS: u64 = 100;
-/// Prazo das confirmações de um shootdown de TLB.
+/// Prazo das confirmações de um shootdown de TLB, em hardware e sob
+/// hipervisor.
 const SHOOTDOWN_TIMEOUT_MS: u64 = 5_000;
+/// Num emulador (o TCG do QEMU) os prazos valem este múltiplo: cada CPU
+/// virtual é uma thread comum do hospedeiro, e a entrega de uma NMI e a
+/// execução do tratador dela passam pela trava global do emulador, que as
+/// voltas de `pause` das outras CPUs virtuais disputam. Com o hospedeiro
+/// carregado, a thread de um alvo fica segundos sem rodar (o hospedeiro só
+/// promove uma thread faminta depois de alguns segundos), e nada no
+/// convidado o evita: nem o IF nem o IRQL do alvo contam, porque a
+/// confirmação vem pela NMI. Um alvo realmente mudo ainda é detectado.
+const EMULATED_TIMEOUT_SCALE: u64 = 12;
+
+/// O múltiplo dos prazos de IPI desta plataforma (0 = ainda não decidido).
+static TIMEOUT_SCALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn timeout_scale() -> u64 {
+    use core::sync::atomic::Ordering;
+    let scale = TIMEOUT_SCALE.load(Ordering::Relaxed);
+    if scale != 0 {
+        return scale;
+    }
+    let scale = if crate::hal::hypervisor::is_emulator() { EMULATED_TIMEOUT_SCALE } else { 1 };
+    TIMEOUT_SCALE.store(scale, Ordering::Relaxed);
+    scale
+}
+
+/// O prazo do ICR desta plataforma (100 ms em hardware e sob hipervisor).
+pub fn interrupt_delivery_timeout_ms() -> u64 {
+    INTERRUPT_DELIVERY_TIMEOUT_MS * timeout_scale()
+}
+
+/// O prazo das confirmações de um shootdown nesta plataforma (5 s em
+/// hardware e sob hipervisor).
+pub fn shootdown_timeout_ms() -> u64 {
+    SHOOTDOWN_TIMEOUT_MS * timeout_scale()
+}
 
 /// Uma espera de IPI que venceu o prazo. Leva os parâmetros do
 /// IPI_WATCHDOG_TIMEOUT do KiIpiGenericCallTarget do 19041 (a frequência do
@@ -144,7 +180,7 @@ fn own_processor_bit() -> u64 {
 /// Espera, em tempo, a entrega do comando anterior (o bit DeliveryStatus
 /// do ICR deste processador volta a ocioso).
 fn wait_for_interrupt_delivery() -> Result<(), IpiStall> {
-    stall_on_targets(INTERRUPT_DELIVERY_TIMEOUT_MS, || if lapic::read(LAPIC_COMMAND_LOW) & 0x1000 != 0 { own_processor_bit() } else { 0 })
+    stall_on_targets(interrupt_delivery_timeout_ms(), || if lapic::read(LAPIC_COMMAND_LOW) & 0x1000 != 0 { own_processor_bit() } else { 0 })
 }
 
 /// Um identificador x2APIC acima de 255 não pode ser truncado e enviado a
@@ -527,7 +563,7 @@ pub fn send_nmi_to_application_processors() -> u32 {
 /// NMI direcionada aos processadores online e espera da confirmação da
 /// geração de invalidação; `flush_caches` pede WBINVD também. A espera é
 /// medida em tempo ([`stall_on_targets`]): um processador que não confirma
-/// em [`SHOOTDOWN_TIMEOUT_MS`] (ou um ICR que não fica ocioso) para o sistema
+/// em [`shootdown_timeout_ms`] (ou um ICR que não fica ocioso) para o sistema
 /// com o diagnóstico de IPI sem resposta, como o IPI_WATCHDOG_TIMEOUT do NT.
 pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
     let slots = {
@@ -555,7 +591,7 @@ pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
         }
         // O processador de número N é o AP da N-ésima posição entre os online.
         let pending = || slots.iter().enumerate().filter(|&(_, &slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, (index, _)| mask | 1 << (index + 1));
-        if let Err(stall) = stall_on_targets(SHOOTDOWN_TIMEOUT_MS, pending) {
+        if let Err(stall) = stall_on_targets(shootdown_timeout_ms(), pending) {
             ipi_stall_bug_check(&stall, "confirmacao do shootdown de TLB");
         }
         Ok(())
