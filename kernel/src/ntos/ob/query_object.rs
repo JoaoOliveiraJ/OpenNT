@@ -326,7 +326,8 @@ fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
             }
         }
     }
-    None
+    // Um objeto nomeado fora desses diretórios (o CDO \Ntfs na raiz).
+    crate::ntos::ob::open_pointer::namespace_path_of(pointer)
 }
 
 /// ObQueryNameString: o caminho completo do objeto (callbacks pelo nome

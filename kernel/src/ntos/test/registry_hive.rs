@@ -200,7 +200,7 @@ fn custom_descriptor() -> Captured {
 
 pub(super) const SOURCE: &str = "\\Registry\\Machine\\Software\\OpenNTHiveFonte";
 const COPY: &str = "\\Registry\\Machine\\OpenNTHiveCopia";
-const COPY_FILE: &str = "\\NTFS\\opennt-hive-rt.dat";
+const COPY_FILE: &str = "\\??\\D:\\opennt-hive-rt.dat";
 
 /// A árvore de origem: valores de todos os tipos, dados de 0, 4, 5 e 40000
 /// bytes, um nome fora de Latin-1, um descritor próprio e uma chave volátil.
@@ -290,10 +290,10 @@ fn save_load_round_trip(assert: Assert) {
     let expected = |name: &str| registry::node_by_path(name).and_then(|node| registry::with_node(node, |key| key.security.clone())).and_then(|security| descriptors.iter().find(|(known, _)| *known == security).map(|&(_, count)| count));
     assert(layout.is_some_and(|layout| layout.6.is_some() && layout.6 == expected(COPY) && layout.7 == expected(&alloc::format!("{COPY}\\Filho"))), "hive: celulas sk compartilhadas com a contagem de referencias das chaves");
     // REG_STANDARD_FORMAT: versão 1.3, 'lf' e o dado grande numa célula só.
-    let standard = create_file("\\NTFS\\opennt-hive-std.dat");
+    let standard = create_file("\\??\\D:\\opennt-hive-std.dat");
     let saved = status(call_export("ZwSaveKey", &[source, standard]));
     zw_files::close_file_entry(standard as u32);
-    let loaded = load("\\Registry\\Machine\\OpenNTHivePadrao", "\\NTFS\\opennt-hive-std.dat");
+    let loaded = load("\\Registry\\Machine\\OpenNTHivePadrao", "\\??\\D:\\opennt-hive-std.dat");
     let layout = registry::node_by_path("\\Registry\\Machine\\OpenNTHivePadrao").and_then(registry::hive_of).and_then(|(identifier, _)| {
         registry::with_storage(identifier, |storage| {
             let root = storage.root_cell();
@@ -367,7 +367,7 @@ fn flush_unload_reload(assert: Assert) {
         invalid[0x1fc..0x200].copy_from_slice(&sum.to_le_bytes());
         write_volume("/opennt-hive-rec.dat", &invalid) && write_volume("/opennt-hive-rec.dat.LOG1", &log)
     };
-    let recovered = load("\\Registry\\Machine\\OpenNTHiveRecuperada", "\\NTFS\\opennt-hive-rec.dat");
+    let recovered = load("\\Registry\\Machine\\OpenNTHiveRecuperada", "\\??\\D:\\opennt-hive-rec.dat");
     let applied = registry::read_value_by_path("\\Registry\\Machine\\OpenNTHiveRecuperada", "Persistido").is_some_and(|value| value.data == wide("sim"));
     let rewritten = read_volume("/opennt-hive-rec.dat");
     assert(written && recovered == 0 && applied && u32_at(&rewritten, 4) == 2 && u32_at(&rewritten, 8) == 2, "hive: primario invalidado recuperado pelo log na carga");
@@ -380,7 +380,7 @@ fn restore_compress_and_deferred_unload(assert: Assert) {
     let stale = open("\\Registry\\Machine\\Software\\OpenNTHiveRestaurada\\Antiga", true);
     registry::close_handle(stale as u32);
     let source = open(SOURCE, false);
-    let file = create_file("\\NTFS\\opennt-hive-res.dat");
+    let file = create_file("\\??\\D:\\opennt-hive-res.dat");
     let saved = status(call_export("ZwSaveKeyEx", &[source, file, 2]));
     let restored = status(call_export("ZwRestoreKey", &[target, file, 0]));
     zw_files::close_file_entry(file as u32);
@@ -441,7 +441,7 @@ fn machine_hive_load_notifies(assert: Assert) {
     let registered = status(call_export("CmRegisterMachineHiveLoadedNotification", &[callback, counter, mount + 0x40, handle]));
     work_items::run_queue();
     let before = guest::read64(counter);
-    let loaded = load("\\Registry\\Machine\\OSDATA", "\\NTFS\\opennt-hive-std.dat");
+    let loaded = load("\\Registry\\Machine\\OSDATA", "\\??\\D:\\opennt-hive-std.dat");
     work_items::run_queue();
     assert(registered == 0 && before == 0 && loaded == 0 && guest::read64(counter) == 1, "hive: a carga de uma hive no ponto de montagem OSDATA chama a notificacao de hive de maquina");
     let _ = call_export("CmUnregisterMachineHiveLoadedNotification", &[guest::read64(handle)]);
@@ -459,12 +459,12 @@ fn privileges_and_validation(assert: Assert) {
     assert(status(call_export("ZwLoadKey", &[software, file])) == STATUS_OBJECT_NAME_COLLISION, "hive: ZwLoadKey sobre chave existente = STATUS_OBJECT_NAME_COLLISION");
     assert(status(call_export("ZwUnloadKey2", &[target, 2])) == STATUS_INVALID_PARAMETER && status(call_export("ZwUnloadKey", &[software])) == STATUS_INVALID_PARAMETER && status(call_export("ZwUnloadKey", &[missing])) == STATUS_INVALID_PARAMETER, "hive: ZwUnloadKey de flags invalidas, de chave que nao e raiz de hive e de chave ausente = STATUS_INVALID_PARAMETER");
     let key = open(SOURCE, false);
-    let out = create_file("\\NTFS\\opennt-hive-inv.dat");
+    let out = create_file("\\??\\D:\\opennt-hive-inv.dat");
     assert(status(call_export("ZwSaveKeyEx", &[key, out, 3])) == STATUS_INVALID_PARAMETER, "hive: ZwSaveKeyEx com formato 3 = STATUS_INVALID_PARAMETER");
     zw_files::close_file_entry(out as u32);
     registry::close_handle(key as u32);
     let garbage = write_volume("/opennt-hive-inv.dat", &[0x5A; 0x2000]);
-    let corrupt = attributes("\\NTFS\\opennt-hive-inv.dat");
+    let corrupt = attributes("\\??\\D:\\opennt-hive-inv.dat");
     assert(garbage && status(call_export("ZwLoadKey", &[target, corrupt])) == STATUS_REGISTRY_CORRUPT && registry::node_by_path("\\Registry\\Machine\\OpenNTHiveInvalida").is_none(), "hive: arquivo que nao e hive = STATUS_REGISTRY_CORRUPT");
     for block in [target, file, software, missing, corrupt] {
         guest::free_bytes(block);

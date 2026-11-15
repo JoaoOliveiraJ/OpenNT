@@ -273,7 +273,7 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
 }
 
 fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
-    let source_name = if origin == "real (NTFS)" { "\\NTFS\\NTDLL.DLL" } else { "\\BootBundle\\apps\\ntdll.dll" };
+    let source_name = if origin == "real (NTFS)" { crate::drivers::fs::ntfs::nt_path("/NTDLL.DLL") } else { String::from("\\BootBundle\\apps\\ntdll.dll") };
     let image = pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?;
     record_template("ntdll", image.image_base, image.size_of_image)?;
     let exports = image.exports.exports.clone();
@@ -283,7 +283,7 @@ fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
     });
     *NTDLL_IMAGE.lock() = (image.image_base, image.size_of_image);
     crate::ntos::ke::user_callback::set_dispatcher(exports.get("KiUserCallbackDispatcher").copied().unwrap_or(0));
-    push_image(Space::system(), image.image_base, image.size_of_image, String::from(source_name), None);
+    push_image(Space::system(), image.image_base, image.size_of_image, source_name.clone(), None);
     let module = Arc::new(Module {
         name: String::from("ntdll.dll"),
         full_name: String::from("C:\\Windows\\System32\\ntdll.dll"),
@@ -292,7 +292,7 @@ fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
         entry_point: image.entry_point,
         exports: image.exports.clone(),
         is_exe: false,
-        notification_source: Some(Arc::new(BytesSource { name: String::from(source_name), bytes: Arc::new(bytes) })),
+        notification_source: Some(Arc::new(BytesSource { name: source_name, bytes: Arc::new(bytes) })),
     });
     *NTDLL_MODULE.lock() = Some(module);
     system_services::register(&syscall_scan::scan_syscall_stubs(&exports))?;
@@ -331,7 +331,7 @@ fn map_system_api_set_schema() -> Result<(), KernelError> {
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
     *API_SET_IMAGE.lock() = (image.image_base, image.size_of_image);
-    push_image(Space::system(), image.image_base, image.size_of_image, String::from("\\NTFS\\APISETSCHEMA.DLL"), None);
+    push_image(Space::system(), image.image_base, image.size_of_image, crate::drivers::fs::ntfs::nt_path("/APISETSCHEMA.DLL"), None);
     crate::debug_print!("[usermode] apiset schema em {:#x} ({} bytes)", map, section.virtual_size);
     Ok(())
 }
@@ -557,7 +557,7 @@ pub fn load_dll_by_name(dll_name: &str, depth: u32, importer: &str) -> Result<Ar
     let file = volume_files::lookup_volume_file(&alloc::format!("\\??\\C:\\Windows\\System32\\{file_name}"))
         .or_else(|| volume_files::lookup_volume_file(&file_name))
         .ok_or_else(|| KernelError::new(alloc::format!("DLL ausente no volume: {file_name}")))?;
-    let image_name = alloc::format!("\\NTFS{}", file.volume_path().replace('/', "\\"));
+    let image_name = crate::drivers::fs::ntfs::nt_path(&file.volume_path());
     let source: Arc<dyn ImageSource> = Arc::new(VolumeImageSource { name: image_name.clone(), file: file.clone() });
     // A notificação de imagem vem depois de a imagem entrar no VAD do
     // processo corrente, onde os callbacks a leem.

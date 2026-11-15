@@ -685,8 +685,13 @@ pub fn device_route(path: &str) -> Option<(bool, u64)> {
     Some((managed, if entry.stack_top != 0 { entry.stack_top } else { entry.native_device }))
 }
 
+/// O dispositivo com exatamente este nome; um volume do kernel montado no
+/// dispositivo recebe o nome (`resolve` devolve o resto ao volume).
 fn lookup_device(path: &str) -> Option<NodeId> {
-    object_manager::lookup(path).filter(|&node| object_manager::node(node).is_some_and(|node| node.type_name == "Device"))
+    match object_manager::resolve(path) {
+        (Some(node), None) => object_manager::node(node).is_some_and(|node| node.type_name == "Device").then_some(node),
+        _ => None,
+    }
 }
 
 fn device_path(node: NodeId) -> String {
@@ -732,7 +737,10 @@ fn call_native_driver(device: &DeviceEntry, request: &mut IoRequest) -> Result<(
         ioctl: control,
         ..Default::default()
     });
-    let security = match (major, request.params.create) {
+    // Todo IRP_MJ_CREATE leva o IO_SECURITY_CONTEXT (o do IopParseDevice);
+    // uma abertura sem parâmetros é um FILE_OPEN sem acesso pedido.
+    let create = request.params.create.or_else(|| (major == irp_mj::CREATE).then(|| CreateParameters { disposition: 1, ..Default::default() }));
+    let security = match (major, create) {
         (irp_mj::CREATE | irp_mj::CREATE_NAMED_PIPE | irp_mj::CREATE_MAILSLOT, Some(create)) => Some(prepare_create(packet, stack_count, &create)?),
         _ => None,
     };

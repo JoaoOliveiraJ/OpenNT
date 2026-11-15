@@ -1,4 +1,4 @@
-//! Volume de paginação — o volume montado em `\NTFS` que o pool
+//! Volume de paginação — o volume NTFS do kernel (`\Device\KernelVolume1`) que o pool
 //! executivo e a paginação de imagens usam como armazenamento de apoio.
 //!
 //! O NTFS (fase 4) se registra aqui ao ser montado.

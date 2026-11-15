@@ -405,6 +405,13 @@ pub fn mount(path: &str, file_system: &'static dyn FileSystem) -> Result<NodeId,
     Ok(node)
 }
 
+/// Associa um sistema de arquivos a um nó existente (o DEVICE_OBJECT de um
+/// volume do kernel): o resto do caminho depois dele vai ao volume.
+pub fn mount_device(node: NodeId, file_system: &'static dyn FileSystem) {
+    update_node(node, |node| node.mount = Some(file_system));
+    native_file_name::register_mount(file_system, node);
+}
+
 /// Cria um nó SymbolicLink cujo dado é o caminho de destino.
 pub fn create_symlink(path: &str, target: &str) -> Result<NodeId, KernelError> {
     let parts = split_path(path);

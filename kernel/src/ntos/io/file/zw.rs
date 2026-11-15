@@ -276,9 +276,13 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         Ok(path) => path,
         Err(status) => return Ok(status),
     };
-    // Dispositivo: CREATE IRP pelo I/O Manager.
-    if let Some(node) = object_manager::lookup(&object_name).filter(|&node| object_manager::node(node).is_some_and(|node| node.type_name == "Device")) {
-        let _ = node;
+    // Dispositivo: CREATE IRP pelo I/O Manager. O dispositivo de um volume
+    // do kernel entrega o nome (mesmo vazio) ao volume montado nele.
+    let device_node = match object_manager::resolve(&object_name) {
+        (Some(node), None) => object_manager::node(node).is_some_and(|node| node.type_name == "Device"),
+        _ => false,
+    };
+    if device_node {
         let opened = io_manager::open_device(&object_name, true);
         let Ok(opened) = opened.map_err(|_| ()).and_then(|opened| if opened.status == 0 { Ok(opened) } else { Err(()) }) else {
             write_io_status(io_status, STATUS_OBJECT_NAME_NOT_FOUND, 0);
@@ -385,6 +389,14 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
         _ => return Ok(STATUS_INVALID_PARAMETER),
     };
     let file = file_objects::create(0, &object_name)?;
+    // Como o IopParseDevice: o dispositivo do volume, o VPB e o caminho no volume.
+    let binding = match crate::drivers::fs::volume_device::bind_file(file, volume, &path) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let _ = file_objects::dereference(file);
+            return Err(error);
+        }
+    };
     // SAFETY: FILE_OBJECT recém-criado.
     let body = unsafe { FileObject::at(file) };
     body.read_access.set((access & 1 != 0) as u8);
@@ -395,7 +407,13 @@ pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: 
     body.shared_delete.set(((share_access >> 2) & 1) as u8);
     body.flags.set(option_flags(options));
     FILES_BY_OBJECT.lock().insert(file, (volume, path.clone(), options));
-    file_objects::set_callbacks(file, FileCallbacks { destroy: Some(Arc::new(move || { FILES_BY_OBJECT.lock().remove(&file); })), ..Default::default() })?;
+    file_objects::set_callbacks(file, FileCallbacks {
+        destroy: Some(Arc::new(move || {
+            FILES_BY_OBJECT.lock().remove(&file);
+            binding.release();
+        })),
+        ..Default::default()
+    })?;
     file_lifetime::bind(file_lifetime::Entry { access, share: share_access, file_object: file, file: None }, &lifetime, &path)?;
     file_objects::open_handle(file)?;
     file_objects::dereference(file)?;

@@ -36,18 +36,19 @@ pub fn init() {
         debug_print!("[hal] BIOS x86 indisponivel: {}", error);
     }
     // NTFS no segundo disco IDE (ata-pio): o carregador de imagens e o
-    // ZwCreateFile resolvem a mesma montagem em \NTFS (D:).
+    // ZwCreateFile resolvem o mesmo volume, montado no dispositivo
+    // \Device\KernelVolume1 (o D:).
     if matches!(crate::drivers::storage::ata_pio::present(1), Ok(true)) {
         match crate::drivers::fs::ntfs::mount(1) {
             Ok(volume) => {
-                let file_system: &'static crate::drivers::fs::ntfs::Ntfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(volume.clone()));
-                let mounted = crate::ntos::ob::object_manager::mount("\\NTFS", file_system).and_then(|_| crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\D:", "\\NTFS"));
+                crate::drivers::fs::ntfs::set_mounted(Some(volume));
+                let mounted = crate::drivers::fs::ntfs::fixed().ok_or_else(|| crate::rtl::KernelError::new("NTFS sem volume")).and_then(|file_system| crate::drivers::fs::volume_device::mount(crate::drivers::fs::ntfs::DEVICE_INDEX, file_system)).and_then(|device| crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\D:", &device));
                 match mounted {
-                    Ok(_) => {
-                        crate::drivers::fs::ntfs::set_mounted(Some(volume));
-                        debug_print!("[boot] NTFS montado em D:");
+                    Ok(_) => debug_print!("[boot] NTFS montado em D:"),
+                    Err(error) => {
+                        crate::drivers::fs::ntfs::set_mounted(None);
+                        debug_print!("[boot] NTFS falhou: {}", error);
                     }
-                    Err(error) => debug_print!("[boot] NTFS falhou: {}", error),
                 }
             }
             Err(error) => debug_print!("[boot] NTFS falhou: {}", error),

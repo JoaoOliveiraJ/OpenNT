@@ -141,6 +141,9 @@ impl FileSource for UserFileSource {
     fn volume(&self) -> Option<&'static dyn FileSystem> {
         volume_files::fixed_volume().map(|fixed| fixed as &'static dyn FileSystem)
     }
+    fn volume_path(&self) -> Option<String> {
+        Some(self.file.volume_path())
+    }
 }
 
 /// Cria o FILE_OBJECT da descrição (acessos, compartilhamento, flags e

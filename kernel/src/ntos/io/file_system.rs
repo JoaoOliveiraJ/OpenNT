@@ -630,7 +630,7 @@ fn vpb_flags(device: &DeviceObject) -> Result<u16, KernelError> {
 /// VPB_DIRECT_WRITES_ALLOWED quando quem montou foi o RAW), o
 /// dispositivo de volume ganha StackSize = topo da pilha real + 1 e aponta de
 /// volta para o VPB na DEVOBJ_EXTENSION, e o VPB ganha uma referência.
-fn mount_initialize_vpb(device: &DeviceObject, attached: &DeviceObject, raw_mount: bool, mounted_by_raw: bool) -> Result<u64, KernelError> {
+pub fn mount_initialize_vpb(device: &DeviceObject, attached: &DeviceObject, raw_mount: bool, mounted_by_raw: bool) -> Result<u64, KernelError> {
     let irql = guest::alloc_bytes(8);
     crate::ntos::ke::spin_lock::acquire_vpb_spin_lock(irql)?;
     let address = device.vpb.get();
@@ -846,6 +846,15 @@ pub fn check_vpb_mounted(device: &DeviceObject, remaining_empty: bool, related: 
 }
 
 /// IopDereferenceVpbAndFree: a referência da abertura volta ao VPB.
+/// IopIncrementVpbRefCount: uma referência de abertura no VPB.
+pub fn reference_vpb(vpb: u64) -> Result<(), KernelError> {
+    if vpb != 0 {
+        // SAFETY: o VPB de um volume montado.
+        adjust_vpb_references(unsafe { Vpb::at(vpb) }, 1)?;
+    }
+    Ok(())
+}
+
 pub fn dereference_vpb(vpb: u64) -> Result<(), KernelError> {
     if vpb != 0 {
         // SAFETY: o VPB referenciado pela abertura.

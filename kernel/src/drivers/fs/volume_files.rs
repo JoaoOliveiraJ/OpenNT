@@ -97,7 +97,7 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
         path = String::from(&path[2..]);
     }
     let mut path = String::from(path.trim_matches('\\'));
-    for prefix in ["ntfs", "windows\\globalization\\sorting", "systemroot\\globalization\\sorting", "windows\\system32", "systemroot\\system32", "windows", "systemroot"] {
+    for prefix in ["device\\kernelvolume1", "windows\\globalization\\sorting", "systemroot\\globalization\\sorting", "windows\\system32", "systemroot\\system32", "windows", "systemroot"] {
         let lower = path.to_lowercase();
         if lower == prefix {
             path = String::new();
@@ -333,9 +333,17 @@ pub fn volume() -> Option<Arc<Ntfs>> {
 fn volume_entry() -> Option<(Arc<Ntfs>, &'static Ntfs)> {
     let mut volume = VOLUME.lock();
     if volume.is_none() {
-        if let Some(mounted) = ntfs::mounted().or_else(|| ntfs::mount(1).ok()) {
-            let fixed: &'static Ntfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(mounted.clone()));
-            *volume = Some((mounted, fixed));
+        // O volume montado no boot (a mesma identidade do namespace); sem
+        // ele, um volume próprio do segundo disco.
+        let entry = match (ntfs::mounted(), ntfs::fixed()) {
+            (Some(mounted), Some(fixed)) => Some((mounted, fixed)),
+            _ => ntfs::mount(1).ok().map(|mounted| {
+                let fixed: &'static Ntfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(mounted.clone()));
+                (mounted, fixed)
+            }),
+        };
+        if let Some(entry) = entry {
+            *volume = Some(entry);
         }
     }
     volume.clone()

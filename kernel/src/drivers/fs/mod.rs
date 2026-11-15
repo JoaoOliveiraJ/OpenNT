@@ -13,3 +13,4 @@ pub mod ntfs_control;
 pub mod volume_information;
 pub mod filter_callbacks;
 pub mod volume_files;
+pub mod volume_device;

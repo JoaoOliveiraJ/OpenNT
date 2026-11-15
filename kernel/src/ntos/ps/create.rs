@@ -275,6 +275,12 @@ impl FileSource for VolumeSource {
     fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, KernelError> {
         self.file.read_at(offset, length as u64)
     }
+    fn volume(&self) -> Option<&'static dyn crate::drivers::fs::volume::FileSystem> {
+        crate::drivers::fs::volume_files::fixed_volume().map(|fixed| fixed as &'static dyn crate::drivers::fs::volume::FileSystem)
+    }
+    fn volume_path(&self) -> Option<String> {
+        Some(self.file.volume_path())
+    }
 }
 
 /// O mesmo arquivo como fonte de streaming do carregador de PE.
@@ -318,7 +324,7 @@ fn open_image(image: &ImageOrigin, image_name: &str) -> Result<(Arc<dyn ImageSou
             file
         }
     };
-    let name = format!("\\NTFS{}", file.volume_path().replace('/', "\\"));
+    let name = crate::drivers::fs::ntfs::nt_path(&file.volume_path());
     Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file })))
 }
 

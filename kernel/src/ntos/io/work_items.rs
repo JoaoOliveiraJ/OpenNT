@@ -1,7 +1,15 @@
 //! Io Work Items.
 //!
 //! IoAllocateWorkItem/IoQueueWorkItem/ExQueueWorkItem: o kernel drena a fila
-//! em PASSIVE_LEVEL (o papel das worker threads do sistema).
+//! em PASSIVE_LEVEL (o papel das worker threads do sistema) nos pumps de
+//! quem espera. No NT cada item roda na sua worker thread, e uma worker que
+//! espera não executa outros itens: aqui um item não começa enquanto outro
+//! roda na mesma CPU (o pump de dentro de um item não drena a fila), e uma
+//! drenagem só roda os itens que já estavam na fila quando ela começou (os
+//! que um item enfileira ficam para a próxima). Assim quem espera pelo fim
+//! de um item volta a conferir a espera antes de os itens enfileirados por
+//! ele rodarem — um deles pode esperar pelo que essa thread retém (o
+//! DeviceLock de uma montagem em curso, por exemplo).
 //!
 //! O IO_WORKITEM é opaco para os drivers (só IoSizeofWorkItem o dimensiona);
 //! o corpo é o do OpenNT, de 0x30 bytes ([`WorkItemBody`]): o WORK_QUEUE_ITEM
@@ -64,11 +72,30 @@ pub type KernelWorkRoutine = fn(u64, u64);
 
 struct Queue {
     entries: Vec<(u64, Kind)>,
+    /// Ordem de chegada de cada item na fila.
+    sequence: BTreeMap<u64, u64>,
+    next_sequence: u64,
     kernel_routines: BTreeMap<u64, KernelWorkRoutine>,
     readiness: BTreeMap<u64, fn() -> bool>,
 }
 
-static QUEUE: SpinLock<Queue> = SpinLock::new(Queue { entries: Vec::new(), kernel_routines: BTreeMap::new(), readiness: BTreeMap::new() });
+static QUEUE: SpinLock<Queue> = SpinLock::new(Queue { entries: Vec::new(), sequence: BTreeMap::new(), next_sequence: 0, kernel_routines: BTreeMap::new(), readiness: BTreeMap::new() });
+/// As CPUs (pela KPCR) com um item em execução na pilha.
+static RUNNING_ON: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+/// Entra na fila com a ordem de chegada.
+fn push(queue: &mut Queue, item: u64, kind: Kind) {
+    let sequence = queue.next_sequence;
+    queue.next_sequence += 1;
+    queue.sequence.insert(item, sequence);
+    queue.entries.push((item, kind));
+}
+
+/// Um item roda na pilha desta CPU (o pump corrente está dentro dele).
+pub fn nested() -> bool {
+    let processor = crate::ntos::ke::pcr::current_address();
+    RUNNING_ON.lock().contains(&processor)
+}
 
 fn forget_kernel_routine(queue: &mut Queue, item: u64) {
     queue.kernel_routines.remove(&item);
@@ -100,7 +127,7 @@ pub fn queue_work_item_ex(item: u64, routine: u64, queue_type: u32, context: u64
     body.work_item.parameter.set(context);
     body.kind.set(queue_type | if extended { 0x8000_0000 } else { 0 });
     body.queued.set(1);
-    queue.entries.push((item, if extended { Kind::IoEx } else { Kind::Io }));
+    push(&mut queue, item, if extended { Kind::IoEx } else { Kind::Io });
 }
 
 pub fn queue_work_item(item: u64, routine: u64, queue_type: u32, context: u64) {
@@ -150,7 +177,7 @@ pub fn queue_kernel_ex_work_item(item: u64, routine: KernelWorkRoutine, paramete
     queue_item.list.blink.set(0);
     queue_item.worker_routine.set(0);
     queue_item.parameter.set(parameter);
-    queue.entries.push((item, Kind::Ex));
+    push(&mut queue, item, Kind::Ex);
     queue.kernel_routines.insert(item, routine);
 }
 
@@ -158,14 +185,19 @@ pub fn queue_kernel_ex_work_item(item: u64, routine: KernelWorkRoutine, paramete
 pub fn unqueue(item: u64) {
     let mut queue = QUEUE.lock();
     let kind = queue.entries.iter().position(|&(queued, _)| queued == item).map(|index| queue.entries.remove(index).1);
+    queue.sequence.remove(&item);
     forget_kernel_routine(&mut queue, item);
     if kind != Some(Kind::Ex) {
         body_at(item).queued.set(0);
     }
 }
 
-/// Drena a fila em PASSIVE_LEVEL.
+/// Drena em PASSIVE_LEVEL os itens que já estavam na fila. Um item com
+/// predicado de prontidão decide por ele; os demais não começam dentro de
+/// outro item desta CPU.
 pub fn run_queue() {
+    let snapshot = QUEUE.lock().next_sequence;
+    let processor = crate::ntos::ke::pcr::current_address();
     loop {
         let (item, kind, kernel_routine) = {
             let mut queue = QUEUE.lock();
@@ -173,32 +205,51 @@ pub fn run_queue() {
                 return;
             }
             let readiness = queue.readiness.clone();
-            let Some(index) = queue.entries.iter().position(|(item, _)| readiness.get(item).is_none_or(|ready| ready())) else {
+            let free = !RUNNING_ON.lock().contains(&processor);
+            let sequence = &queue.sequence;
+            let Some(index) = queue.entries.iter().position(|(item, _)| sequence.get(item).is_some_and(|&arrival| arrival < snapshot) && readiness.get(item).map_or(free, |ready| ready())) else {
                 return;
             };
             let (item, kind) = queue.entries.remove(index);
+            queue.sequence.remove(&item);
             let routine = queue.kernel_routines.remove(&item);
             queue.readiness.remove(&item);
             (item, kind, routine)
         };
-        if kind != Kind::Ex {
-            body_at(item).queued.set(0);
+        let outermost = {
+            let mut running = RUNNING_ON.lock();
+            let outermost = !running.contains(&processor);
+            if outermost {
+                running.push(processor);
+            }
+            outermost
+        };
+        run_item(item, kind, kernel_routine);
+        if outermost {
+            RUNNING_ON.lock().retain(|&entry| entry != processor);
         }
-        let queue_item = queue_item_at(item);
-        let routine = queue_item.worker_routine.get();
-        let device = if kind == Kind::Ex { 0 } else { body_at(item).device_object.get() };
-        let context = queue_item.parameter.get();
-        match (kernel_routine, kind) {
-            (Some(routine), _) => routine(device, context),
-            (None, Kind::IoEx) => {
-                native_call::call(routine, &[device, context, item, 0]);
-            }
-            (None, Kind::Ex) => {
-                native_call::call(routine, &[context, 0, 0, 0]);
-            }
-            (None, Kind::Io) => {
-                native_call::call(routine, &[device, context, 0, 0]);
-            }
+    }
+}
+
+/// Executa um item retirado da fila.
+fn run_item(item: u64, kind: Kind, kernel_routine: Option<KernelWorkRoutine>) {
+    if kind != Kind::Ex {
+        body_at(item).queued.set(0);
+    }
+    let queue_item = queue_item_at(item);
+    let routine = queue_item.worker_routine.get();
+    let device = if kind == Kind::Ex { 0 } else { body_at(item).device_object.get() };
+    let context = queue_item.parameter.get();
+    match (kernel_routine, kind) {
+        (Some(routine), _) => routine(device, context),
+        (None, Kind::IoEx) => {
+            native_call::call(routine, &[device, context, item, 0]);
+        }
+        (None, Kind::Ex) => {
+            native_call::call(routine, &[context, 0, 0, 0]);
+        }
+        (None, Kind::Io) => {
+            native_call::call(routine, &[device, context, 0, 0]);
         }
     }
 }
@@ -220,7 +271,7 @@ pub fn queue_ex_work_item(item: u64, _queue_type: u32) {
         return;
     }
     forget_kernel_routine(&mut queue, item);
-    queue.entries.push((item, Kind::Ex));
+    push(&mut queue, item, Kind::Ex);
 }
 
 /// WORKER_INVALID.

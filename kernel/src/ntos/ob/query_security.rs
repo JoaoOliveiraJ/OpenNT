@@ -12,14 +12,14 @@ use crate::ntos::io::file::native_security as file_security;
 use crate::ntos::se::policy_descriptor;
 use crate::ntos::se::query_descriptor::{self, QueryResult};
 use crate::rtl::KernelError;
-use crate::ntos::inc::types::{Field, FileObject, NtStruct};
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::io::file::zw as zw_files;
 
 /// Arquivos nativos vão ao driver por IRP; arquivos de volume/fonte sem
-/// ACLs usam o fallback de segurança não suportada.
+/// ACLs (sem pilha de IRP: os volumes do kernel) usam o fallback de
+/// segurança não suportada.
 fn query_file(pointer: u64, information: u32, buffer: u64, capacity: u32) -> Result<QueryResult, KernelError> {
-    // SAFETY: FILE_OBJECT referenciado pelo handle consultado.
-    let device = unsafe { FileObject::at(pointer) }.device_object.get();
+    let device = crate::ntos::io::file::information::related_device(pointer)?;
     if device == 0 && (zw_files::file_backing(pointer).is_some() || file_objects::source(pointer).is_some()) {
         return Ok(file_security::query_unsupported_file(information, buffer, capacity));
     }

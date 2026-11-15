@@ -691,12 +691,32 @@ fn fs_volume_queries(assert: Assert) {
     let seen: alloc::vec::Vec<u64> = FILTER_SEEN.iter().take(4).map(|slot| slot.load(core::sync::atomic::Ordering::SeqCst)).collect();
     filters::release_file_name_information(0xBB);
     assert(previous == 0 && status == 0x1234 && seen == alloc::vec![file_object, 0x101, 0xAA, 0xBB] && FILTER_SEEN[4].load(core::sync::atomic::Ordering::SeqCst) == 0xBB, "filter: callbacks dos slots 0x18 e 0x20");
-    // Arquivo do volume de boot do kernel (sem DeviceObject): o Filter
-    // Manager não é chamado.
-    FILTER_SEEN[0].store(0, core::sync::atomic::Ordering::SeqCst);
-    guest::write64(file_object + core::mem::offset_of!(crate::ntos::inc::types::FileObject, device_object) as u64, 0);
-    assert(filters::get_file_name_information(file_object, 0x101, 0xAA, 0xBB) == 0xC000_00BB && FILTER_SEEN[0].load(core::sync::atomic::Ordering::SeqCst) == 0, "filter: FILE_OBJECT sem pilha de dispositivos nao vai ao Filter Manager");
     guest::free_bytes(file_object);
+    // Um arquivo de um volume do kernel tem DeviceObject e VPB como os de
+    // qualquer volume: a consulta chega ao Filter Manager com ele.
+    FILTER_SEEN[0].store(0, core::sync::atomic::Ordering::SeqCst);
+    let _ = crate::drivers::fs::memory_file_system::write_bytes("/opennt-filter.txt", alloc::vec![1, 2, 3]);
+    let request = guest::alloc_bytes(0x200);
+    let units: alloc::vec::Vec<u16> = "\\FS\\opennt-filter.txt".encode_utf16().collect();
+    guest::write_bytes(request + 0x100, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<alloc::vec::Vec<u8>>());
+    // SAFETY: UNICODE_STRING e OBJECT_ATTRIBUTES no bloco recém-alocado.
+    let (name, attributes) = unsafe { (crate::ntos::inc::types::UnicodeString::at(request + 0x80), crate::ntos::inc::types::ObjectAttributes::at(request)) };
+    name.length.set(units.len() as u16 * 2);
+    name.maximum_length.set(units.len() as u16 * 2);
+    name.buffer.set(request + 0x100);
+    attributes.length.set(48);
+    attributes.object_name.set(name.address());
+    attributes.attributes.set(0x240);
+    let opened = crate::ntos::io::file::zw::create_kernel_file(request + 0x60, 0x120089, request, request + 0x70, 1, 1, 0x20);
+    let handle = opened.is_ok_and(|status| status == 0).then(|| guest::read64(request + 0x60));
+    let volume_file = handle.map_or(0, crate::ntos::io::file::zw::file_object_of_handle);
+    let reached = volume_file != 0 && filters::get_file_name_information(volume_file, 0x101, 0xAA, 0xBB) == 0x1234 && FILTER_SEEN[0].load(core::sync::atomic::Ordering::SeqCst) == volume_file;
+    if let Some(handle) = handle {
+        let _ = crate::ntos::ob::close::close(handle, Some(0));
+    }
+    let _ = crate::drivers::fs::memory_file_system::remove("/opennt-filter.txt");
+    guest::free_bytes(request);
+    assert(reached, "filter: arquivo de um volume do kernel vai ao Filter Manager com o seu FILE_OBJECT");
     assert(filters::exchange_callbacks(previous) == table && filters::current_callbacks() == 0, "filter: dono restaurado");
     guest::free_bytes(table);
 }

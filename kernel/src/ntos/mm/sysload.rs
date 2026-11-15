@@ -611,7 +611,7 @@ pub mod kernel_image_source {
         let Some(volume) = ntfs::mounted() else { return Ok(None) };
         let Some(layout) = volume.file_layout(path)? else { return Ok(None) };
         debug_print!("[ntoskrnl] {} via NTFS ({} bytes, streaming/DMA)", path, layout.size);
-        let source = NtfsSource { name: alloc::format!("\\NTFS{}", path.replace('/', "\\")), size: layout.size, has_runs: layout.runs.is_some(), path: alloc::string::String::from(path), volume };
+        let source = NtfsSource { name: ntfs::nt_path(path), size: layout.size, has_runs: layout.runs.is_some(), path: alloc::string::String::from(path), volume };
         Ok(Some(Arc::new(source)))
     }
 
@@ -627,7 +627,7 @@ pub mod kernel_image_source {
         }
         let volume = ntfs::mounted().ok_or_else(|| KernelError::new(alloc::format!("kernel image not found: {name}")))?;
         let layout = volume.file_layout(&path)?.ok_or_else(|| KernelError::new(alloc::format!("kernel image not found: {name}")))?;
-        Ok(Arc::new(NtfsSource { name: alloc::format!("\\NTFS\\{name}"), size: layout.size, has_runs: layout.runs.is_some(), path, volume }))
+        Ok(Arc::new(NtfsSource { name: ntfs::nt_path(&path), size: layout.size, has_runs: layout.runs.is_some(), path, volume }))
     }
 }
 

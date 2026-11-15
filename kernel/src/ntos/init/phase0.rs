@@ -14,7 +14,7 @@
 
 use crate::hal::bundle;
 use crate::nano::interrupts;
-use crate::drivers::fs::memory_file_system;
+use crate::drivers::fs::{memory_file_system, volume_device};
 use crate::ntos::ke::clock;
 use crate::ntos::cm::state_separation;
 use crate::ntos::ke::{critical_region, pcr, smp};
@@ -127,7 +127,7 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
         object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
     }
     // Destino NT até o diretório instalado no volume de boot (montado na fase 1).
-    object_manager::create_symlink("\\SystemRoot", "\\NTFS\\Windows")?;
+    object_manager::create_symlink("\\SystemRoot", &alloc::format!("{}\\Windows", volume_device::device_path(crate::drivers::fs::ntfs::DEVICE_INDEX)))?;
     // CmpInitializeDriverStores: o diretório e o alias do sistema.
     object_manager::create_directory("\\DriverStores")?;
     object_manager::create_symlink("\\DriverStores\\SYSTEM", "\\SystemRoot")?;
@@ -171,8 +171,11 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     ] {
         crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, signaled)?;
     }
-    object_manager::mount("\\FS", &memory_file_system::VOLUME)?;
-    object_manager::create_symlink("\\DosDevices\\C:", "\\FS")?;
+    // O disco em memória no seu dispositivo (\Device\KernelVolume0), o C:;
+    // \FS é o nome curto que os componentes do boot usam para ele.
+    let memory = volume_device::mount(0, &memory_file_system::VOLUME)?;
+    object_manager::create_symlink("\\FS", &memory)?;
+    object_manager::create_symlink("\\DosDevices\\C:", &memory)?;
     Ok(())
 }
 

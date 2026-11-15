@@ -213,9 +213,22 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
     Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer() }))
 }
 
-/// Volume montado em `\NTFS` (`object_manager::mount` + o volume que o
-/// carregador de imagens e o ZwCreateFile resolvem).
+/// Índice do dispositivo do volume (`\Device\KernelVolume1`, o D:).
+pub const DEVICE_INDEX: u32 = 1;
+
+/// O caminho NT de um arquivo do volume, pelo dispositivo dele.
+pub fn nt_path(volume_path: &str) -> alloc::string::String {
+    let relative = volume_path.replace('/', "\\");
+    alloc::format!("{}\\{}", super::volume_device::device_path(DEVICE_INDEX), relative.trim_start_matches('\\'))
+}
+
+/// Volume montado no dispositivo `\Device\KernelVolume1`
+/// (`volume_device::mount`, o volume que o carregador de imagens e o
+/// ZwCreateFile resolvem).
 static MOUNTED: SpinLock<Option<Arc<Ntfs>>> = SpinLock::new(None);
+/// A forma estática do mesmo volume, a que o namespace e as aberturas de
+/// arquivo usam como identidade (`volume::same`).
+static FIXED: SpinLock<Option<&'static Ntfs>> = SpinLock::new(None);
 
 pub fn set_mounted(volume: Option<Arc<Ntfs>>) {
     *MOUNTED.lock() = volume;
@@ -223,6 +236,16 @@ pub fn set_mounted(volume: Option<Arc<Ntfs>>) {
 
 pub fn mounted() -> Option<Arc<Ntfs>> {
     MOUNTED.lock().clone()
+}
+
+/// A referência estática do volume montado, criada uma vez.
+pub fn fixed() -> Option<&'static Ntfs> {
+    let mut fixed = FIXED.lock();
+    if fixed.is_none() {
+        let volume = mounted()?;
+        *fixed = Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(volume)));
+    }
+    *fixed
 }
 
 impl super::volume::FileSystem for Ntfs {

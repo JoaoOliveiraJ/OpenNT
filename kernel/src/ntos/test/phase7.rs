@@ -754,7 +754,7 @@ fn user_virtual_memory(assert: Assert) {
 
 fn volume_file_lookup(assert: Assert) {
     use crate::drivers::fs::volume_files::{self, nt_path_to_volume_path};
-    assert(nt_path_to_volume_path("\\??\\C:\\Windows\\System32\\ntdll.dll").as_deref() == Some("/ntdll.dll") && nt_path_to_volume_path("C:\\Windows\\Globalization\\Sorting\\SortDefault.nls").as_deref() == Some("/SortDefault.nls") && nt_path_to_volume_path("D:\\dir\\sub\\file.txt").as_deref() == Some("/dir/sub/file.txt") && nt_path_to_volume_path("/ntfs/x.bin").as_deref() == Some("/x.bin"), "volumefiles: prefixos NT/DOS e aliases de instalacao");
+    assert(nt_path_to_volume_path("\\??\\C:\\Windows\\System32\\ntdll.dll").as_deref() == Some("/ntdll.dll") && nt_path_to_volume_path("C:\\Windows\\Globalization\\Sorting\\SortDefault.nls").as_deref() == Some("/SortDefault.nls") && nt_path_to_volume_path("D:\\dir\\sub\\file.txt").as_deref() == Some("/dir/sub/file.txt") && nt_path_to_volume_path("/Device/KernelVolume1/x.bin").as_deref() == Some("/x.bin"), "volumefiles: prefixos NT/DOS e aliases de instalacao");
     assert(nt_path_to_volume_path("E:\\x").is_none() && nt_path_to_volume_path("C:\\a\\..\\b").is_none() && nt_path_to_volume_path("C:\\a?b").is_none() && nt_path_to_volume_path("C:\\Windows").as_deref() == Some("/"), "volumefiles: unidade, travessia e caracteres proibidos recusados");
     let Some(file) = volume_files::lookup_volume_file("C:\\Windows\\System32\\HELLO.TXT") else {
         assert(false, "volumefiles: HELLO.TXT do volume de teste");

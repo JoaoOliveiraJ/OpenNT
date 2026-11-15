@@ -47,6 +47,10 @@ pub trait FileSource: Send + Sync {
     fn volume(&self) -> Option<&'static dyn crate::drivers::fs::volume::FileSystem> {
         None
     }
+    /// Caminho do arquivo no volume (com `volume`).
+    fn volume_path(&self) -> Option<alloc::string::String> {
+        None
+    }
 }
 
 /// Rotinas de vida definidas pelo dono do arquivo.
@@ -294,10 +298,18 @@ pub fn create_source(source: Arc<dyn FileSource>) -> Result<u64, KernelError> {
             return Err(error);
         }
     };
+    // Um arquivo de volume do kernel ganha o dispositivo e o VPB do volume.
+    let binding = match (source.volume(), source.volume_path()) {
+        (Some(volume), Some(path)) => crate::drivers::fs::volume_device::bind_file(pointer, volume, &path).unwrap_or_default(),
+        _ => crate::drivers::fs::volume_device::Binding::default(),
+    };
     let releaser = source.clone();
     if let Some(record) = FILES.lock().get_mut(&pointer) {
         record.source = Some(source);
-        record.callbacks.destroy = Some(Arc::new(move || releaser.release()));
+        record.callbacks.destroy = Some(Arc::new(move || {
+            releaser.release();
+            binding.release();
+        }));
     }
     file(pointer).read_access.set(1);
     file(pointer).shared_read.set(1);
@@ -328,6 +340,34 @@ pub fn reference_count(pointer: u64) -> Option<u32> {
 /// (handles, aberto, cleanup feito, fechando).
 pub fn state(pointer: u64) -> Option<(u32, bool, bool, bool)> {
     FILES.lock().get(&pointer).map(|record| (record.handles, record.opened, record.cleaned, record.closing))
+}
+
+/// FileName novo (UTF-16, na arena do convidado) para um FILE_OBJECT ainda
+/// sem uso: o nome anterior é liberado e a destruição libera o novo.
+pub fn set_name(pointer: u64, name: &str) -> Result<(), KernelError> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let buffer = if units.is_empty() { 0 } else { guest::alloc_bytes((units.len() as u64 + 1) * 2) };
+    if !units.is_empty() && buffer == 0 {
+        return Err(KernelError::with_status("file name allocation failed", STATUS_INSUFFICIENT_RESOURCES));
+    }
+    if buffer != 0 {
+        let mut text: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        text.extend_from_slice(&[0, 0]);
+        guest::write_bytes(buffer, &text);
+    }
+    let old = {
+        let mut files = FILES.lock();
+        let record = files.get_mut(&pointer).ok_or_else(|| KernelError::new("unknown file object"))?;
+        core::mem::replace(&mut record.name_buffer, buffer)
+    };
+    let object = file(pointer);
+    object.file_name.length.set(units.len() as u16 * 2);
+    object.file_name.maximum_length.set(if units.is_empty() { 0 } else { (units.len() as u16 + 1) * 2 });
+    object.file_name.buffer.set(buffer);
+    if old != 0 {
+        guest::free_bytes(old);
+    }
+    Ok(())
 }
 
 /// IoReplaceFileObjectName: FileName.Buffer passou a ser outro bloco da arena

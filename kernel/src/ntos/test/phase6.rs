@@ -2115,7 +2115,7 @@ fn process_information_and_driver_services(assert: Assert) {
     // Caminhos instalados de drivers.
     let configuration = |path: &str| service_database::Configuration { name: alloc::string::String::from("x"), display_name: alloc::string::String::new(), image_path: alloc::string::String::from(path), service_type: 1, start: 3, error_control: 1, object_name: alloc::string::String::new(), dependencies: alloc::vec::Vec::new() };
     assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\Drivers\\a.sys")).is_ok_and(|path| path == "/a.sys") && driver_services::image_path(&configuration("\"C:\\Windows\\System32\\Drivers\\b.sys\"")).is_ok_and(|path| path == "/b.sys") && driver_services::image_path(&configuration("system32\\drivers\\c.sys")).is_ok_and(|path| path == "/c.sys"), "drvsvc: caminhos de System32\\Drivers normalizados (o relativo e relativo a \\SystemRoot)");
-    assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\DriverStore\\FileRepository\\x.inf_amd64_1\\X.sys")).is_ok_and(|path| path == "/Windows/System32/DriverStore/FileRepository/x.inf_amd64_1/X.sys"), "drvsvc: o resto do \\SystemRoot (repositorio de drivers) fica sob \\NTFS\\Windows");
+    assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\DriverStore\\FileRepository\\x.inf_amd64_1\\X.sys")).is_ok_and(|path| path == "/Windows/System32/DriverStore/FileRepository/x.inf_amd64_1/X.sys"), "drvsvc: o resto do \\SystemRoot (repositorio de drivers) fica sob o \\Windows do volume");
     assert(driver_services::image_path(&configuration("D:\\d.sys")).is_err_and(|error| error.win32 == 3) &&driver_services::image_path(&configuration("a\\..\\b.sys")).is_err_and(|error| error.win32 == 123), "drvsvc: unidade indisponivel e travessia recusadas");
     // Serviço de driver real: start/stop e ZwLoadDriver/ZwUnloadDriver.
     let counter = guest::alloc_bytes(8);
@@ -2189,7 +2189,7 @@ fn volume_file_operations(assert: Assert) {
     let path = "/opennt-volume.txt";
     assert(memory.writable() && memory.truncate(path).is_ok() && memory.exists(path) && memory.write_at(path, 0, b"hello").is_ok_and(|written| written == 5), "volume: disco em memoria cria e escreve");
     assert(memory.read_range(path, 1, 3).is_ok_and(|bytes| bytes.as_deref() == Some(b"ell".as_slice())) && memory.size(path) == Some(5) && memory.remove(path).is_some_and(|removed| removed.is_ok_and(|removed| removed)) && !memory.exists(path), "volume: disco em memoria le faixa, mede e remove");
-    // Volume NTFS montado em \NTFS (D:).
+    // Volume NTFS do kernel (\Device\KernelVolume1, D:).
     if let Some(volume) = ntfs::mounted() {
         let ntfs_volume: &dyn FileSystem = volume.as_ref();
         let path = "/opennt-volume.bin";
@@ -2221,6 +2221,100 @@ pub(super) fn object_attributes_for(block: u64, name: &str, flags: u32) -> u64 {
     attributes.object_name.set(unicode);
     attributes.attributes.set(flags);
     block
+}
+
+static WORK_ORDER: crate::rtl::SpinLock<Vec<u64>> = crate::rtl::SpinLock::new(Vec::new());
+static WORK_ITEMS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+/// A CPU do teste (KPCR): os itens só rodam nela, fora de outro item.
+static WORK_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn work_order_ready() -> bool {
+    crate::ntos::ke::pcr::current_address() == WORK_CPU.load(core::sync::atomic::Ordering::SeqCst) && !crate::ntos::io::work_items::nested()
+}
+
+/// Item 1: enfileira o item 3 e drena a fila de dentro dele (o pump de uma
+/// espera dentro do item).
+fn work_order_routine(_device: u64, parameter: u64) {
+    use core::sync::atomic::Ordering;
+    WORK_ORDER.lock().push(parameter);
+    if parameter == 1 {
+        crate::ntos::io::work_items::queue_kernel_work_item(WORK_ITEMS[2].load(Ordering::SeqCst), work_order_routine, 3, Some(work_order_ready));
+        crate::ntos::io::work_items::run_queue();
+    }
+}
+
+/// Como as worker threads do NT: um item não começa dentro de outro na
+/// mesma CPU, e uma drenagem só roda os itens que já estavam na fila (o que
+/// um item enfileira fica para a próxima).
+fn work_items_one_worker_per_item(assert: Assert) {
+    use crate::ntos::io::work_items;
+    use core::sync::atomic::Ordering;
+    let items: Vec<u64> = (0..3).map(|_| work_items::allocate_work_item(0)).collect();
+    for (slot, item) in WORK_ITEMS.iter().zip(items.iter()) {
+        slot.store(*item, Ordering::SeqCst);
+    }
+    WORK_CPU.store(crate::ntos::ke::pcr::current_address(), Ordering::SeqCst);
+    WORK_ORDER.lock().clear();
+    let outside = !work_items::nested();
+    work_items::queue_kernel_work_item(items[0], work_order_routine, 1, Some(work_order_ready));
+    work_items::queue_kernel_work_item(items[1], work_order_routine, 2, Some(work_order_ready));
+    work_items::run_queue();
+    let first = WORK_ORDER.lock().clone();
+    work_items::run_queue();
+    let second = WORK_ORDER.lock().clone();
+    assert(outside && first == [1, 2] && second == [1, 2, 3] && !work_items::nested(), "workitem: sem item dentro de outro na mesma CPU; o enfileirado por um item fica para a drenagem seguinte");
+    for item in items {
+        work_items::free_work_item(item);
+    }
+}
+
+/// Os volumes do kernel nos seus dispositivos (`drivers/fs/volume_device.rs`):
+/// o nó do dispositivo entrega o resto do nome ao volume, o VPB fica montado
+/// pelo file system embutido e o FILE_OBJECT aberto num deles tem o
+/// DeviceObject, o Vpb e o FileName do IopParseDevice.
+fn kernel_volume_devices(assert: Assert) {
+    use crate::drivers::fs::{memory_file_system, ntfs, volume_device};
+    use crate::ntos::io::file::{information, zw as zw_files};
+    use crate::ntos::ob::{close, object_manager as om};
+    let device_node = om::lookup("\\Device\\KernelVolume0");
+    assert(device_node.is_some() && om::lookup("\\FS") == device_node && om::lookup("\\??\\C:") == device_node && device_node.and_then(om::node).is_some_and(|node| node.type_name == "Device"), "kvol: disco em memoria no dispositivo \\Device\\KernelVolume0 (\\FS e C:)");
+    let real = volume_device::real_device(&memory_file_system::VOLUME).unwrap_or(0);
+    if real == 0 {
+        assert(false, "kvol: dispositivo real do disco em memoria");
+        return;
+    }
+    let device = at::<nt::DeviceObject>(real);
+    let vpb_address = device.vpb.get();
+    let vpb = at::<nt::Vpb>(vpb_address);
+    let volume = vpb.device_object.get();
+    assert(device.device_type.get() == 7 && vpb.flags.get() & 1 != 0 && vpb.real_device.get() == real && volume != 0 && at::<nt::DeviceObject>(volume).device_type.get() == 8 && volume_device::is_volume_device(volume), "kvol: VPB montado pelo file system embutido (FILE_DEVICE_DISK_FILE_SYSTEM)");
+    let _ = memory_file_system::write_bytes("/opennt-kvol.txt", b"kvol".to_vec());
+    let before = vpb.reference_count.get();
+    let block = guest::alloc_bytes(0x300);
+    let attributes = object_attributes_for(block, "\\??\\C:\\opennt-kvol.txt", 0x240);
+    let (output, io_status) = (block + 0x200, block + 0x210);
+    let opened = zw_files::create_kernel_file(output, 0x120089, attributes, io_status, 1, 1, 0x20);
+    let handle = guest::read64(output);
+    let file = zw_files::file_object_of_handle(handle);
+    if opened.is_ok_and(|status| status == 0) && file != 0 {
+        let object = at::<nt::FileObject>(file);
+        let name = crate::ntos::rtl::guest_strings::read_unicode_string(object.file_name.address());
+        let base = crate::ntos::io::file_system::base_file_system_device(object);
+        let related = information::related_device_object(file).unwrap_or(0);
+        let routed = information::related_device(file).unwrap_or(1);
+        assert(object.device_object.get() == real && object.vpb.get() == vpb_address && name == "\\opennt-kvol.txt" && base == volume && related == volume && routed == 0 && vpb.reference_count.get() == before + 1, "kvol: FILE_OBJECT com DeviceObject, Vpb e FileName do IopParseDevice; IoGetBaseFileSystemDeviceObject e IoGetRelatedDeviceObject no volume");
+        let _ = close::close(handle, Some(0));
+        assert(vpb.reference_count.get() == before, "kvol: o fechamento solta a referencia do VPB");
+    } else {
+        assert(false, "kvol: abertura pelo C:");
+    }
+    let _ = memory_file_system::remove("/opennt-kvol.txt");
+    if ntfs::mounted().is_some() {
+        let ntfs_node = om::lookup("\\Device\\KernelVolume1");
+        let (system_root, rest) = om::resolve("\\SystemRoot\\System32");
+        assert(ntfs_node.is_some() && om::lookup("\\??\\D:") == ntfs_node && system_root == ntfs_node && rest.as_deref() == Some("Windows/System32") && om::lookup("\\NTFS").is_none(), "kvol: volume NTFS no dispositivo \\Device\\KernelVolume1 (D: e \\SystemRoot), sem nome na raiz");
+    }
+    guest::free_bytes(block);
 }
 
 fn zw_kernel_files(assert: Assert) {
@@ -2342,7 +2436,7 @@ fn zw_read_file(assert: Assert) {
         let _ = ntfs_volume.truncate("/opennt-read.bin");
         let pattern: Vec<u8> = (0..300u32).map(|value| (value * 7) as u8).collect();
         let _ = ntfs_volume.write_at("/opennt-read.bin", 0, &pattern);
-        let attributes = object_attributes_for(block, "\\NTFS\\opennt-read.bin", 0x240);
+        let attributes = object_attributes_for(block, "\\??\\D:\\opennt-read.bin", 0x240);
         let _ = zw_files::create_kernel_file(output, 0x120089, attributes, io_status, 1, 1, 0x20);
         let handle = guest::read64(output);
         let read = read_file::read(handle, 0, 0, 0, io_status, buffer, 300, 0, 0);
@@ -2402,7 +2496,7 @@ fn zw_write_file(assert: Assert) {
     if let Some(volume) = ntfs::mounted() {
         let ntfs_volume: &dyn FileSystem = volume.as_ref();
         let _ = ntfs_volume.truncate("/opennt-write.bin");
-        let attributes = object_attributes_for(block, "\\NTFS\\opennt-write.bin", 0x240);
+        let attributes = object_attributes_for(block, "\\??\\D:\\opennt-write.bin", 0x240);
         let _ = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 3, 1, 0x20);
         let handle = guest::read64(output);
         let pattern: Vec<u8> = (0..200u32).map(|value| (value * 13 + 1) as u8).collect();
@@ -14049,6 +14143,8 @@ pub fn run(assert: Assert) {
     process_information_and_driver_services(assert);
     io_file_information(assert);
     volume_file_operations(assert);
+    kernel_volume_devices(assert);
+    work_items_one_worker_per_item(assert);
     zw_kernel_files(assert);
     zw_query_file(assert);
     zw_read_file(assert);

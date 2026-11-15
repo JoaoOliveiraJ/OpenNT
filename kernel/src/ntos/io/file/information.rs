@@ -50,10 +50,20 @@ pub fn set_object_query(query: ObjectQuery) {
     *OBJECT_QUERY.lock() = Some(query);
 }
 
+/// O dispositivo a que o I/O Manager manda os IRPs do arquivo: o do
+/// IoGetRelatedDeviceObject, salvo nos volumes do próprio kernel, cujo file
+/// system embutido não tem pilha de IRP (`drivers/fs/volume_device.rs`): o
+/// I/O Manager responde no lugar as operações desses arquivos, e aqui o
+/// resultado é 0.
+pub fn related_device(file: u64) -> Result<u64, KernelError> {
+    let device = related_device_object(file)?;
+    Ok(if crate::drivers::fs::volume_device::is_volume_device(device) { 0 } else { device })
+}
+
 /// IoGetRelatedDeviceObject: o dispositivo do VPB (ou o do arquivo, ou o do
 /// volume montado) e o topo da pilha, que uma extensão real de arquivo pode
 /// mandar parar num filtro abaixo do topo.
-pub fn related_device(file: u64) -> Result<u64, KernelError> {
+pub fn related_device_object(file: u64) -> Result<u64, KernelError> {
     let object = file_at(file);
     let vpb = object.vpb.get();
     // SAFETY: FileObject->Vpb de um arquivo vivo.

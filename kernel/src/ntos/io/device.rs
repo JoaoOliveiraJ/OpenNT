@@ -282,13 +282,16 @@ pub fn walk_physical<T>(device: u64, found: impl Fn(u64) -> Option<T>) -> Option
 
 /// IoGetDeviceObjectPointer(name, access, outFileObject, outDeviceObject):
 /// topo da pilha e um FILE_OBJECT real retido.
-pub fn get_device_object_pointer(name_pointer: u64, _access: u32, file_output: u64, device_output: u64) -> Result<u32, KernelError> {
+pub fn get_device_object_pointer(name_pointer: u64, access: u32, file_output: u64, device_output: u64) -> Result<u32, KernelError> {
     let name = guest_strings::read_unicode_string(name_pointer);
     let node = object_manager::lookup(&name).filter(|&node| object_manager::node(node).is_some_and(|node| node.type_name == "Device"));
     let Some(node) = node else { return Ok(0xC000_0034) };
     let entry = io_manager::device(node).unwrap_or_default();
     let device = if entry.stack_top != 0 { entry.stack_top } else { entry.native_device };
-    let opened = io_manager::open_device(&name, false)?;
+    // O ZwOpenFile(DesiredAccess, FILE_NON_DIRECTORY_FILE) do NT: o
+    // IRP_MJ_CREATE leva o IO_SECURITY_CONTEXT com o acesso pedido.
+    let create = io_manager::CreateParameters { access, disposition: 1, options: 0x40, ..Default::default() };
+    let opened = io_manager::open_device_file(&name, "", Some(create), false)?;
     if opened.status != 0 {
         return Ok(opened.status as u32);
     }

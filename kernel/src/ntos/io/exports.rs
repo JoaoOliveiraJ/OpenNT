@@ -121,7 +121,7 @@ fn io_create_file(call: &Call) -> Result<u64, KernelError> {
     Ok(zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32)? as u64)
 }
 fn io_get_related_device_object(call: &Call) -> Result<u64, KernelError> {
-    file_information::related_device(call.arg(1))
+    file_information::related_device_object(call.arg(1))
 }
 fn io_get_io_attribution_handle(call: &Call) -> Result<u64, KernelError> {
     use crate::ntos::inc::field::{Field, NtStruct};
