@@ -1,8 +1,10 @@
 //! Identidades nativas opacas de chaves.
 //!
 //! Respaldadas pelos nós reais da hive. Handles e operações em andamento
-//! mantêm contagens separadas; não se fabricam ponteiros para KCBs privados.
-//! A identidade de um corpo é o seu ponteiro de 104 bytes.
+//! mantêm contagens separadas; não se fabricam KCBs privados. A identidade
+//! de um corpo é o seu ponteiro de 104 bytes; o campo KeyControlBlock do
+//! CM_KEY_BODY guarda o bloco de identidade da chave (um por nó, opaco
+//! para quem o lê), que o CmCallbackGetKeyObjectID devolve como ObjectID.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -29,7 +31,15 @@ pub struct KeyBody {
 struct Bodies {
     by_handle: BTreeMap<u32, u64>,
     by_pointer: BTreeMap<u64, KeyBody>,
+    /// A identidade de cada chave (o papel do KCB): um bloco por nó, com o
+    /// nome em cache do CmCallbackGetKeyObjectID.
+    identities: BTreeMap<NodeId, u64>,
 }
+
+/// 'ky02', o Type de um CM_KEY_BODY vivo.
+pub const KEY_BODY_TYPE: u32 = 0x6b79_3032;
+/// O bloco de identidade de uma chave: o UNICODE_STRING do nome em cache.
+pub const IDENTITY_SIZE: u64 = 0x10;
 
 static BODIES: SpinLock<Option<Bodies>> = SpinLock::new(None);
 
@@ -45,9 +55,18 @@ fn create_body(node: NodeId, path: &str) -> Option<u64> {
     if pointer == 0 {
         return None;
     }
-    // ProcessID do processo criador; o resto do CM_KEY_BODY permanece opaco.
+    // Type 'ky02', a identidade da chave no lugar do KeyControlBlock e o
+    // ProcessID do processo criador; o resto do CM_KEY_BODY é zero (sem
+    // transação: Trans nulo).
+    let Some(identity) = identity(node) else {
+        guest::free_bytes(pointer);
+        return None;
+    };
     // SAFETY: corpo próprio recém-alocado com sizeof(CM_KEY_BODY).
-    unsafe { CmKeyBody::at(pointer) }.process_id.set(process::get_current_process_id());
+    let body = unsafe { CmKeyBody::at(pointer) };
+    body.type_.set(KEY_BODY_TYPE);
+    body.key_control_block.set(identity);
+    body.process_id.set(process::get_current_process_id());
     let key_type = object_types::key_type();
     if object_types::bind_native(pointer, &key_type.name).is_err() {
         guest::free_bytes(pointer);
@@ -67,8 +86,28 @@ fn collect(bodies: &mut Bodies, pointer: u64) -> bool {
 }
 
 fn free_body(pointer: u64) {
+    // RegNtCallbackObjectContextCleanup: os contextos dos filtros neste
+    // objeto saem antes dele.
+    crate::ntos::cm::callbacks::object_destroyed(pointer);
     object_types::unbind_native(pointer);
     guest::free_bytes(pointer);
+}
+
+/// O bloco de identidade do nó (criado no primeiro corpo dele e mantido
+/// enquanto o nó existe na arena).
+pub fn identity(node: NodeId) -> Option<u64> {
+    if let Some(identity) = with(|bodies| bodies.identities.get(&node).copied()) {
+        return Some(identity);
+    }
+    let block = guest::alloc_bytes(IDENTITY_SIZE);
+    if block == 0 {
+        return None;
+    }
+    let chosen = with(|bodies| *bodies.identities.entry(node).or_insert(block));
+    if chosen != block {
+        guest::free_bytes(block);
+    }
+    Some(chosen)
 }
 
 /// Reutiliza a associação do handle ou materializa um corpo para o nó real;

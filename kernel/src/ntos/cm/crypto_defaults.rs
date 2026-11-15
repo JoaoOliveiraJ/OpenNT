@@ -1,60 +1,48 @@
-//! CSPs instalados.
+//! CSPs instalados (`SOFTWARE\Microsoft\Cryptography\Defaults`).
 //!
 //! Registra o RSAENH presente no disco; nomes, tipos e caminho da DLL
 //! correspondem ao catálogo usado pelos binários. Não cria chaves nem
 //! recipientes criptográficos.
+//!
+//! Dados puros da hive SOFTWARE (veja `cm/seed.rs`): o `xtask` grava estas
+//! chaves no arquivo da hive e o kernel só as semeia em memória quando o
+//! arquivo falta.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::format;
+use alloc::vec::Vec;
 
-use super::registry;
-use crate::rtl::KernelError;
+use super::seed::{SeedKey, REG_SZ};
 
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+const DEFAULTS: &str = "Microsoft\\Cryptography\\Defaults";
 
-const DEFAULTS_PATH: &str = "\\Registry\\Machine\\Software\\Microsoft\\Cryptography\\Defaults";
+/// (nome do provedor, tipo).
+const PROVIDERS: &[(&str, u32)] = &[
+    ("Microsoft Base Cryptographic Provider v1.0", 1),
+    ("Microsoft Enhanced Cryptographic Provider v1.0", 1),
+    ("Microsoft Strong Cryptographic Provider", 1),
+    ("Microsoft RSA SChannel Cryptographic Provider", 12),
+    ("Microsoft Enhanced RSA and AES Cryptographic Provider", 24),
+];
 
-enum Data<'a> {
-    Text(&'a str),
-    Number(u32),
-}
+/// (tipo, provedor padrão, descrição do tipo).
+const PROVIDER_TYPES: &[(u32, &str, &str)] = &[
+    (1, "Microsoft Strong Cryptographic Provider", "RSA Full (Signature and Key Exchange)"),
+    (12, "Microsoft RSA SChannel Cryptographic Provider", "RSA SChannel"),
+    (24, "Microsoft Enhanced RSA and AES Cryptographic Provider", "RSA Full and AES"),
+];
 
-fn write_missing_values(relative: &str, defaults: &[(&str, u32, Data)]) -> Result<(), KernelError> {
-    let handle = registry::open_or_create(&(alloc::string::String::from(DEFAULTS_PATH) + relative), None)?;
-    for (name, value_type, data) in defaults {
-        if registry::get_value(handle, name).is_none() {
-            let bytes = match data {
-                Data::Text(text) => registry::encode_wide(text),
-                Data::Number(value) => value.to_le_bytes().to_vec(),
-            };
-            registry::set_value(handle, name, *value_type, bytes);
-        }
+/// As chaves `Provider\<nome>` e `Provider Types\Type NNN`.
+pub fn seed_keys() -> Vec<SeedKey> {
+    let mut keys = Vec::new();
+    for &(name, provider_type) in PROVIDERS {
+        let mut key = SeedKey::new(&format!("{DEFAULTS}\\Provider\\{name}"));
+        key.text("Image Path", REG_SZ, "%SystemRoot%\\system32\\rsaenh.dll").dword("Type", provider_type).dword("SigInFile", 0);
+        keys.push(key);
     }
-    registry::close_handle(handle);
-    Ok(())
-}
-
-/// Publica provedores e tipos ausentes; marca a inicialização só depois de
-/// completar as inscrições.
-pub fn initialize() -> Result<(), KernelError> {
-    if INITIALIZED.load(Ordering::Acquire) {
-        return Ok(());
+    for &(provider_type, name, description) in PROVIDER_TYPES {
+        let mut key = SeedKey::new(&format!("{DEFAULTS}\\Provider Types\\Type {provider_type:03}"));
+        key.text("Name", REG_SZ, name).text("TypeName", REG_SZ, description);
+        keys.push(key);
     }
-    for (name, provider_type) in [
-        ("Microsoft Base Cryptographic Provider v1.0", 1),
-        ("Microsoft Enhanced Cryptographic Provider v1.0", 1),
-        ("Microsoft Strong Cryptographic Provider", 1),
-        ("Microsoft RSA SChannel Cryptographic Provider", 12),
-        ("Microsoft Enhanced RSA and AES Cryptographic Provider", 24),
-    ] {
-        write_missing_values(&(alloc::string::String::from("\\Provider\\") + name), &[("Image Path", 1, Data::Text("%SystemRoot%\\system32\\rsaenh.dll")), ("Type", 4, Data::Number(provider_type)), ("SigInFile", 4, Data::Number(0))])?;
-    }
-    for (provider_type, name, description) in [
-        (1, "Microsoft Strong Cryptographic Provider", "RSA Full (Signature and Key Exchange)"),
-        (12, "Microsoft RSA SChannel Cryptographic Provider", "RSA SChannel"),
-        (24, "Microsoft Enhanced RSA and AES Cryptographic Provider", "RSA Full and AES"),
-    ] {
-        write_missing_values(&alloc::format!("\\Provider Types\\Type {provider_type:03}"), &[("Name", 1, Data::Text(name)), ("TypeName", 1, Data::Text(description))])?;
-    }
-    INITIALIZED.store(true, Ordering::Release);
-    Ok(())
+    keys
 }

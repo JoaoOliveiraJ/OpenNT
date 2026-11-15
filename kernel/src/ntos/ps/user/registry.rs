@@ -14,7 +14,7 @@ use core::any::Any;
 
 use super::state::{self, NativeBody, UserObject};
 use crate::ntos::cm::key::services::{self as key_services, Kind, UserHandles, UserKeyRecord};
-use crate::ntos::cm::{computer_name, crypto_defaults, hive_services, registry};
+use crate::ntos::cm::{computer_name, hive_services, registry};
 use crate::ntos::cm::key::objects as key_objects;
 use crate::ntos::ob::object_types;
 use crate::rtl::KernelError;
@@ -102,11 +102,8 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     set_dword(session_manager, "SafeMode", 0);
     // No boot do processo inicial real, o smss lê a configuração do Session
     // Manager da hive SYSTEM (`cm/session_manager.rs`) e cria ele mesmo o
-    // \KnownDlls; o IniFileMapping (hive SOFTWARE, em memória) é semeado
-    // aqui.
-    if crate::ntos::init::boot_config::SMSS_BOOT {
-        crate::ntos::cm::ini_file_mapping::initialize()?;
-    } else {
+    // \KnownDlls; o IniFileMapping vem da hive SOFTWARE (`cm/seed.rs`).
+    if !crate::ntos::init::boot_config::SMSS_BOOT {
         // KnownDlls: a lista das DLLs conhecidas que o kernel provisiona e o
         // diretório delas.
         let known = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\KnownDlls", None)?;
@@ -125,7 +122,6 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     set_dword(segment_heap, "Enabled", 0);
     let product = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\ProductOptions", None)?;
     set_sz(product, "ProductType", "WinNT");
-    crypto_defaults::initialize()?;
     computer_name::initialize()?;
     // Image File Execution Options existe, vazia.
     registry::open_or_create("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", None)?;

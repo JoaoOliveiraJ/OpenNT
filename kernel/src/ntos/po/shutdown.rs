@@ -62,6 +62,8 @@ fn holds_shutdown_privilege(mode: u8) -> bool {
 /// PopGracefulShutdown e HalReturnToFirmware.
 fn graceful_shutdown(routine: Routine) -> ! {
     debug_print!("[po] desligamento ordenado ({:?})", routine);
+    // CmShutdownSystem: as hives do Registro vão para o disco.
+    crate::ntos::cm::lazy_flush::shutdown();
     shutdown_notification::run_shutdown_notifications();
     if let Err(error) = last_chance::run_last_chance_shutdown_notifications() {
         debug_print!("[po] last chance: {}", error);

@@ -1,9 +1,11 @@
 //! Gera arquivos de hive do Registro (formato regf) para o volume.
 //!
-//! A hive SYSTEM sai das mesmas tabelas que o kernel semeia em memória
-//! quando o arquivo falta (`kernel/src/ntos/cm/seed.rs` e as tabelas que ele
-//! reúne, incluídas aqui por `#[path]` na mesma árvore de módulos), então o
-//! boot com o arquivo e o boot sem ele veem as mesmas chaves e valores.
+//! As hives de máquina (SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT) saem das
+//! mesmas tabelas que o kernel semeia em memória quando um arquivo falta
+//! (`kernel/src/ntos/cm/seed.rs` e as tabelas que ele reúne, incluídas aqui
+//! por `#[path]` na mesma árvore de módulos), então o boot com os arquivos
+//! e o boot sem eles veem as mesmas chaves e valores. Uma chave de link
+//! (o `SAM` da SECURITY) leva KEY_SYM_LINK e o `SymbolicLinkValue`.
 //!
 //! O arquivo segue o formato que o Configuration Manager do Windows 10
 //! grava (o mesmo que o kernel lê e grava em `cm/hive`):
@@ -34,6 +36,10 @@ mod cm {
     pub mod seed;
     #[path = "../../../../kernel/src/ntos/cm/session_manager.rs"]
     pub mod session_manager;
+    #[path = "../../../../kernel/src/ntos/cm/crypto_defaults.rs"]
+    pub mod crypto_defaults;
+    #[path = "../../../../kernel/src/ntos/cm/ini_file_mapping.rs"]
+    pub mod ini_file_mapping;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;
@@ -94,6 +100,8 @@ struct Key {
     name: String,
     values: Vec<(String, u32, Vec<u8>)>,
     children: BTreeMap<String, usize>,
+    /// Chave de link (KEY_SYM_LINK).
+    link: bool,
 }
 
 fn upcase(name: &str) -> Vec<u16> {
@@ -215,7 +223,9 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
         let cell = bins.cell(0x4c + name.len());
         cells[index] = cell;
         bins.put(cell, 0, b"nk");
-        bins.put16(cell, 2, if parent.is_none() { 0x2c } else { 0x20 });
+        // KEY_COMP_NAME; a raiz com KEY_HIVE_ENTRY | KEY_NO_DELETE e um link
+        // com KEY_SYM_LINK.
+        bins.put16(cell, 2, (if parent.is_none() { 0x2c } else { 0x20 }) | if key.link { 0x10 } else { 0 });
         bins.put64(cell, 4, time);
         bins.put32(cell, 0x10, parent.map_or(NIL, |parent| cells[parent]));
         bins.put32(cell, 0x14, key.children.len() as u32);
@@ -322,24 +332,25 @@ fn now_filetime() -> u64 {
     since_unix + 116_444_736_000_000_000
 }
 
-/// A hive SYSTEM com as chaves estáticas do kernel. `smss_boot`: o boot do
-/// processo inicial real (`--initial-process=smss`).
-pub fn system_hive(smss_boot: bool) -> Vec<u8> {
-    let mut keys = vec![Key { name: String::from("ROOT"), values: Vec::new(), children: BTreeMap::new() }];
-    for seed in cm::seed::system_keys(smss_boot) {
+/// Uma hive com as chaves das tabelas de semente (caminhos relativos à
+/// raiz, que se chama ROOT).
+fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str) -> Vec<u8> {
+    let mut keys = vec![Key { name: String::from("ROOT"), values: Vec::new(), children: BTreeMap::new(), link: false }];
+    for seed in seeds {
         let mut current = 0;
         for component in seed.path.split('\\').filter(|component| !component.is_empty()) {
             let lower = component.to_lowercase();
             current = match keys[current].children.get(&lower) {
                 Some(&child) => child,
                 None => {
-                    keys.push(Key { name: String::from(component), values: Vec::new(), children: BTreeMap::new() });
+                    keys.push(Key { name: String::from(component), values: Vec::new(), children: BTreeMap::new(), link: false });
                     let child = keys.len() - 1;
                     keys[current].children.insert(lower, child);
                     child
                 }
             };
         }
+        keys[current].link |= seed.link;
         for (name, value_type, data) in seed.values {
             let values = &mut keys[current].values;
             match values.iter_mut().find(|(existing, _, _)| existing.eq_ignore_ascii_case(&name)) {
@@ -348,5 +359,19 @@ pub fn system_hive(smss_boot: bool) -> Vec<u8> {
             }
         }
     }
-    write_hive(&keys, now_filetime(), "\\SystemRoot\\System32\\config\\SYSTEM")
+    write_hive(&keys, now_filetime(), file_name)
+}
+
+/// As hives de máquina de `\SystemRoot\System32\config`, com o nome do
+/// arquivo: SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT. `smss_boot`: o boot
+/// do processo inicial real (`--initial-process=smss`).
+pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
+    let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
+        ("SYSTEM", cm::seed::system_keys(smss_boot)),
+        ("SOFTWARE", cm::seed::software_keys(smss_boot)),
+        ("SAM", cm::seed::sam_keys()),
+        ("SECURITY", cm::seed::security_keys()),
+        ("DEFAULT", cm::seed::default_keys()),
+    ];
+    hives.into_iter().map(|(name, seeds)| (name, hive_from_seeds(seeds, &format!("\\SystemRoot\\System32\\config\\{name}")))).collect()
 }

@@ -118,3 +118,57 @@ pub mod cm_hive {
         data_exports: &[],
     };
 }
+
+pub mod cm_callback_objects {
+    //! O CmRegisterCallback legado e as rotinas que os filtros de registro
+    //! chamam sobre os objetos das notificações; a lógica mora em
+    //! `cm/callbacks`.
+
+    use crate::ntos::cm::callbacks;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// CmRegisterCallback(Function, Context, Cookie*).
+    fn register_callback(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(callbacks::register_legacy(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    /// CmCallbackGetKeyObjectID(Cookie, Object, ObjectID*, ObjectName**).
+    fn get_key_object_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(callbacks::get_key_object_id(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    /// CmCallbackGetKeyObjectIDEx(Cookie, Object, ObjectID*, ObjectName**, Flags).
+    fn get_key_object_id_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(callbacks::get_key_object_id_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32)))
+    }
+
+    /// CmCallbackReleaseKeyObjectIDEx(ObjectName).
+    fn release_key_object_id_ex(call: &Call) -> Result<u64, KernelError> {
+        callbacks::release_key_object_id_ex(call.arg(1))?;
+        Ok(0)
+    }
+
+    /// CmSetCallbackObjectContext(Object, Cookie*, NewContext, OldContext*).
+    fn set_callback_object_context(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(callbacks::set_object_context(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    /// CmGetBoundTransaction(Cookie, Object).
+    fn get_bound_transaction(call: &Call) -> Result<u64, KernelError> {
+        Ok(callbacks::bound_transaction(call.arg(1), call.arg(2)))
+    }
+
+    /// CmGetCallbackVersion(Major*, Minor*).
+    fn get_callback_version(call: &Call) -> Result<u64, KernelError> {
+        callbacks::callback_version(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "cm-callback-objects",
+        names: &["CmRegisterCallback", "CmCallbackGetKeyObjectID", "CmCallbackGetKeyObjectIDEx", "CmCallbackReleaseKeyObjectIDEx", "CmSetCallbackObjectContext", "CmGetBoundTransaction", "CmGetCallbackVersion"],
+        handlers: &[register_callback, get_key_object_id, get_key_object_id_ex, release_key_object_id_ex, set_callback_object_context, get_bound_transaction, get_callback_version],
+        data_exports: &[],
+    };
+}

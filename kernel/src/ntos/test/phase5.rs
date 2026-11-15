@@ -309,7 +309,7 @@ fn key_services_kernel_mode(assert: Assert) {
     object_attributes(attributes, parent, "\\Registry", 0x240);
     assert(matches!(keys::open(output, 0x20019, attributes, false, 0), Ok(0xC000_003B)), "keyservices: nome absoluto com raiz");
     object_attributes(attributes, parent, "Filho", 0x240);
-    assert(matches!(keys::open(output, 0x20019, attributes, false, 2), Ok(0xC000_00F2)) && matches!(keys::create(output, 0x20019, attributes, 0, 0, 4, 0, false), Ok(0xC000_000D)), "keyservices: opcoes invalidas");
+    assert(matches!(keys::open(output, 0x20019, attributes, false, 2), Ok(0xC000_00F2)) && matches!(keys::create(output, 0x20019, attributes, 0, 0, 0x20, 0, false), Ok(0xC000_000D)), "keyservices: opcoes invalidas");
     unsafe { ObjectAttributes::at(attributes) }.length.set(40);
     assert(matches!(keys::open(output, 0x20019, attributes, false, 0), Ok(0xC000_000D)), "keyservices: OBJECT_ATTRIBUTES com tamanho errado");
     object_attributes(attributes, 0x7FFF_FFF0, "Filho", 0x240);
@@ -365,7 +365,7 @@ fn wide_text(value: &crate::ntos::cm::registry::Value) -> alloc::string::String 
 }
 
 fn registry_boot_providers(assert: Assert) {
-    use crate::ntos::cm::{check_registry_key, cng_defaults, computer_name, crypto_defaults, persisted_state, physical_memory_resources, registry, wnf_defaults};
+    use crate::ntos::cm::{check_registry_key, cng_defaults, computer_name, persisted_state, physical_memory_resources, registry, wnf_defaults};
     use crate::ntos::cm::key::native as native_keys;
     let storage = guest::alloc_bytes(0x400);
     let write_wide = |pointer: u64, text: &str| crate::ntos::rtl::guest_strings::write_wide_string(pointer, text);
@@ -398,7 +398,7 @@ fn registry_boot_providers(assert: Assert) {
     let hostname = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\Tcpip\\Parameters", "Hostname");
     assert(active.as_ref().is_some_and(|value| value.value_type == 1 && wide_text(value) == "OPENNT") && hostname.as_ref().is_some_and(|value| wide_text(value) == "opennt"), "computername: nome ativo copiado do configurado");
     // CSPs e catálogo CNG.
-    assert(crypto_defaults::initialize().is_ok() && registry::read_value_by_path("\\Registry\\Machine\\Software\\Microsoft\\Cryptography\\Defaults\\Provider Types\\Type 012", "Name").is_some_and(|value| wide_text(&value) == "Microsoft RSA SChannel Cryptographic Provider"), "cryptodefaults: tipos de provedor");
+    assert(registry::read_value_by_path("\\Registry\\Machine\\Software\\Microsoft\\Cryptography\\Defaults\\Provider Types\\Type 012", "Name").is_some_and(|value| wide_text(&value) == "Microsoft RSA SChannel Cryptographic Provider"), "cryptodefaults: tipos de provedor");
     assert(registry::read_value_by_path("\\Registry\\Machine\\Software\\Microsoft\\Cryptography\\Defaults\\Provider\\Microsoft Strong Cryptographic Provider", "Type").is_some_and(|value| value.value_type == 4 && value.data == [1, 0, 0, 0]), "cryptodefaults: provedor RSA Full");
     let image = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Cryptography\\Providers\\Microsoft Primitive Provider\\KM", "Image");
     let providers = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Cryptography\\Configuration\\Local\\Default\\00000002\\SHA256", "Providers");

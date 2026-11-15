@@ -106,6 +106,9 @@ pub fn init() {
         }
     }
     namespace().unwrap_or_else(|error| panic!("namespace: {error}"));
+    // CmInitSystem1: as chaves mestras e a hive volátil HARDWARE, antes da
+    // descrição do hardware gravada nela.
+    crate::ntos::cm::hive_init::initialize_hardware_hive().unwrap_or_else(|error| panic!("{error}"));
     crate::ntos::cm::hw_description::seed_hardware_description().unwrap_or_else(|error| panic!("{error}"));
     // mapa real de RAM na hive de hardware, antes de iniciar os drivers
     crate::ntos::cm::physical_memory_resources::initialize().unwrap_or_else(|error| panic!("{error}"));

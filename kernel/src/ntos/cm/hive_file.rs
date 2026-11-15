@@ -120,6 +120,36 @@ impl HiveFile {
         HiveFile { handle: 0, volume: self.volume, path: self.path.clone() }
     }
 
+    /// O caminho do arquivo no volume (a identidade do arquivo, como o
+    /// CmpIsThisSameFile compara os FILE_OBJECTs).
+    pub fn volume_path(&self) -> String {
+        self.path.clone()
+    }
+
+    /// O nome do FILE_OBJECT do handle próprio (o ObjectNameInformation do
+    /// ZwQueryObject), sem o NUL. Um arquivo de um volume do kernel não tem
+    /// QueryNameProcedure: o nome é o da montagem do volume mais o caminho
+    /// (o papel do nome do dispositivo seguido do FileName).
+    pub fn object_name(&self) -> Option<String> {
+        if self.handle == 0 {
+            return None;
+        }
+        let file_object = zw_files::file_object_of_handle(self.handle);
+        if file_object == 0 {
+            return None;
+        }
+        // O buffer de 0x200 bytes do CmpAddToHiveFileList.
+        let buffer = guest::alloc_bytes(0x200);
+        if buffer == 0 {
+            return None;
+        }
+        let status = crate::ntos::ob::query_object::query_name_string(file_object, buffer, 0x200, 0);
+        // SAFETY: OBJECT_NAME_INFORMATION montado no bloco próprio.
+        let name = (status == 0).then(|| guest_strings::read_unicode_string(unsafe { UnicodeString::at(buffer) }.address())).filter(|name| !name.is_empty());
+        guest::free_bytes(buffer);
+        name.or_else(|| crate::drivers::fs::native_file_name::from_volume(self.volume, &self.path))
+    }
+
     pub fn size(&self) -> u64 {
         self.volume.size(&self.path).unwrap_or(0)
     }

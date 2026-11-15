@@ -431,9 +431,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("cm-hive", 1874, 8),
     ("nt-create-file", 1882, 1),
     ("hal-bus-translation", 1883, 1),
+    ("cm-callback-objects", 1884, 7),
 ];
 
-/// Os 1884 exports de função, na ordem da ABI.
+/// Os 1891 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2319,4 +2320,11 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwRestoreKey",
     "NtCreateFile",
     "HalTranslateBusAddress",
+    "CmRegisterCallback",
+    "CmCallbackGetKeyObjectID",
+    "CmCallbackGetKeyObjectIDEx",
+    "CmCallbackReleaseKeyObjectIDEx",
+    "CmSetCallbackObjectContext",
+    "CmGetBoundTransaction",
+    "CmGetCallbackVersion",
 ];

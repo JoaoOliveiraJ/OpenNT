@@ -28,7 +28,7 @@ use crate::drivers::fs::{ntfs, volume::FileSystem};
 use crate::ntos::cm::hive::{base_block, index, key_cells, log};
 use crate::ntos::cm::key::{policy, services as key_services};
 use crate::ntos::cm::registry::{self, NodeId};
-use crate::ntos::cm::{hive_list, seed};
+use crate::ntos::cm::{hive_init, seed};
 use crate::ntos::inc::field::Field;
 use crate::ntos::inc::types::HbaseBlock;
 use crate::ntos::inc::types::{IoStatusBlock, NtStruct, ObjectAttributes, UnicodeString};
@@ -46,13 +46,13 @@ const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
 const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
 const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 
-fn status(result: Option<u64>) -> u32 {
+pub(super) fn status(result: Option<u64>) -> u32 {
     result.map_or(0xFFFF_FFFF, |value| value as u32)
 }
 
 /// OBJECT_ATTRIBUTES (OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE) com o nome,
 /// numa alocação nova.
-fn attributes(name: &str) -> u64 {
+pub(super) fn attributes(name: &str) -> u64 {
     let units: Vec<u16> = name.encode_utf16().collect();
     let block = guest::alloc_bytes(0x80 + units.len() as u64 * 2 + 2);
     guest::write_bytes(block, &[0u8; 0x80]);
@@ -71,7 +71,7 @@ fn attributes(name: &str) -> u64 {
 }
 
 /// ZwCreateFile com FILE_OVERWRITE_IF: um handle de kernel para o arquivo.
-fn create_file(name: &str) -> u64 {
+pub(super) fn create_file(name: &str) -> u64 {
     let oa = attributes(name);
     let block = guest::alloc_bytes(0x20);
     let _ = zw_files::create_kernel_file(block, 0x0012_019F, oa, block + 8, 0, 5, 0x60);
@@ -83,7 +83,7 @@ fn create_file(name: &str) -> u64 {
     handle
 }
 
-fn load(target: &str, file: &str) -> u32 {
+pub(super) fn load(target: &str, file: &str) -> u32 {
     let (target, file) = (attributes(target), attributes(file));
     let result = status(call_export("ZwLoadKey", &[target, file]));
     guest::free_bytes(target);
@@ -91,14 +91,14 @@ fn load(target: &str, file: &str) -> u32 {
     result
 }
 
-fn unload(target: &str) -> u32 {
+pub(super) fn unload(target: &str) -> u32 {
     let target = attributes(target);
     let result = status(call_export("ZwUnloadKey", &[target]));
     guest::free_bytes(target);
     result
 }
 
-fn open(path: &str, create: bool) -> u64 {
+pub(super) fn open(path: &str, create: bool) -> u64 {
     key_services::open_path(path, create).map_or(0, |(status, handle)| if status == 0 { handle } else { 0 })
 }
 
@@ -152,7 +152,7 @@ fn format_vectors(assert: Assert) {
 fn system_hive_from_file(assert: Assert) {
     let root = registry::node_by_path("\\Registry\\Machine\\System");
     let hive = root.and_then(registry::hive_of);
-    assert(hive_list::system_hive_from_file() && hive.is_some_and(|(_, is_root)| is_root), "hive: \\Registry\\Machine\\SYSTEM carregada de \\SystemRoot\\System32\\config\\SYSTEM");
+    assert(hive_init::system_hive_from_file() && hive.is_some_and(|(_, is_root)| is_root), "hive: \\Registry\\Machine\\SYSTEM carregada de \\SystemRoot\\System32\\config\\SYSTEM");
     let Some((identifier, _)) = hive else { return };
     let mut complete = true;
     for key in seed::system_keys(crate::ntos::init::boot_config::SMSS_BOOT) {
@@ -168,7 +168,7 @@ fn system_hive_from_file(assert: Assert) {
     assert(descriptors, "hive: descritores da hive SYSTEM iguais aos da politica do kernel");
     let layout = registry::with_storage(identifier, |storage| {
         let root_cell = storage.root_cell();
-        let services = key_cells::find_child(storage, root_cell, "CurrentControlSet").and_then(|cell| key_cells::find_child(storage, cell, "Services"));
+        let services = key_cells::find_child(storage, root_cell, "ControlSet001").and_then(|cell| key_cells::find_child(storage, cell, "Services"));
         let list = services.and_then(|cell| key_cells::node(storage, cell)).map(|node| node.sub_key_lists[0].get());
         storage.minor() == 5 && list.and_then(|list| index::signature(storage, list)) == Some(index::LH) && !storage.broken
     });
@@ -198,7 +198,7 @@ fn custom_descriptor() -> Captured {
     Captured { control: 0x0004, owner: system.clone(), group: system, dacl: Some(acl), sacl: None }
 }
 
-const SOURCE: &str = "\\Registry\\Machine\\Software\\OpenNTHiveFonte";
+pub(super) const SOURCE: &str = "\\Registry\\Machine\\Software\\OpenNTHiveFonte";
 const COPY: &str = "\\Registry\\Machine\\OpenNTHiveCopia";
 const COPY_FILE: &str = "\\NTFS\\opennt-hive-rt.dat";
 
@@ -308,7 +308,7 @@ fn save_load_round_trip(assert: Assert) {
     registry::close_handle(source as u32);
 }
 
-fn read_volume(path: &str) -> Vec<u8> {
+pub(super) fn read_volume(path: &str) -> Vec<u8> {
     ntfs::mounted().and_then(|volume| {
         let volume: &dyn FileSystem = volume.as_ref();
         volume.read_bytes(path)
@@ -322,7 +322,7 @@ fn write_volume(path: &str, bytes: &[u8]) -> bool {
     })
 }
 
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+pub(super) fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     bytes.get(offset..offset + 4).map_or(0, |word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
 }
 
@@ -435,15 +435,17 @@ fn machine_hive_load_notifies(assert: Assert) {
     let counter = guest::alloc_bytes(8);
     guest::write64(counter, 0);
     let handle = guest::alloc_bytes(8);
-    let mount = attributes("\\Registry\\Machine\\SAM");
+    // OSDATA: um ponto de montagem de máquina que o boot não carrega (as
+    // outras hives de máquina já vêm do volume).
+    let mount = attributes("\\Registry\\Machine\\OSDATA");
     let registered = status(call_export("CmRegisterMachineHiveLoadedNotification", &[callback, counter, mount + 0x40, handle]));
     work_items::run_queue();
     let before = guest::read64(counter);
-    let loaded = load("\\Registry\\Machine\\SAM", "\\NTFS\\opennt-hive-std.dat");
+    let loaded = load("\\Registry\\Machine\\OSDATA", "\\NTFS\\opennt-hive-std.dat");
     work_items::run_queue();
-    assert(registered == 0 && before == 0 && loaded == 0 && guest::read64(counter) == 1, "hive: a carga de uma hive no ponto de montagem SAM chama a notificacao de hive de maquina");
+    assert(registered == 0 && before == 0 && loaded == 0 && guest::read64(counter) == 1, "hive: a carga de uma hive no ponto de montagem OSDATA chama a notificacao de hive de maquina");
     let _ = call_export("CmUnregisterMachineHiveLoadedNotification", &[guest::read64(handle)]);
-    assert(unload("\\Registry\\Machine\\SAM") == 0, "hive: ZwUnloadKey da hive SAM de teste");
+    assert(unload("\\Registry\\Machine\\OSDATA") == 0, "hive: ZwUnloadKey da hive OSDATA de teste");
     guest::free_bytes(mount);
     super::executable_code::release(callback);
 }
@@ -451,7 +453,7 @@ fn machine_hive_load_notifies(assert: Assert) {
 fn privileges_and_validation(assert: Assert) {
     let target = attributes("\\Registry\\Machine\\OpenNTHiveInvalida");
     let file = attributes(COPY_FILE);
-    let software = attributes("\\Registry\\Machine\\Software");
+    let software = attributes("\\Registry\\Machine\\Software\\Microsoft");
     let missing = attributes("\\Registry\\Machine\\OpenNTHiveAusente");
     assert(status(call_export("ZwLoadKeyEx", &[target, file, 1, 0, 0, 0, 0, 0])) == STATUS_INVALID_PARAMETER_3, "hive: ZwLoadKeyEx com REG_WHOLE_HIVE_VOLATILE = STATUS_INVALID_PARAMETER_3");
     assert(status(call_export("ZwLoadKey", &[software, file])) == STATUS_OBJECT_NAME_COLLISION, "hive: ZwLoadKey sobre chave existente = STATUS_OBJECT_NAME_COLLISION");

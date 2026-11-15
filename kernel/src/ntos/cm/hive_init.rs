@@ -1,0 +1,202 @@
+//! A montagem das hives no boot (o CmInitSystem1, o CmpCreateControlSet e o
+//! CmpInitializeHiveList do NT).
+//!
+//! Como no ntoskrnl 19041:
+//! - o CmInitSystem1 cria as chaves mestras `\REGISTRY\MACHINE`,
+//!   `\REGISTRY\USER` e `\REGISTRY\A` (a raiz das hives de aplicativo, que
+//!   não se abre por nome), liga a hive SYSTEM, escolhe o conjunto de
+//!   controle (CmpCreateControlSet) e cria a hive volátil HARDWARE
+//!   (CmpCreateHive com HIVE_VOLATILE e CmpLinkHiveToMaster em
+//!   `\REGISTRY\MACHINE\HARDWARE`);
+//! - o CmpCreateControlSet (rva 0xa58080) abre `\Registry\Machine\SYSTEM`
+//!   e o `Select` dele, lê o `Current` e cria `CurrentControlSet` com
+//!   REG_OPTION_VOLATILE | REG_OPTION_CREATE_LINK e KEY_CREATE_LINK, com o
+//!   `SymbolicLinkValue` REG_LINK = `\Registry\Machine\SYSTEM\ControlSet%03d`
+//!   (o comprimento do texto, sem o NUL);
+//! - as hives de máquina vêm de `\SystemRoot\System32\config`: SOFTWARE,
+//!   SAM, SECURITY e DEFAULT (`\REGISTRY\USER\.DEFAULT`), além da SYSTEM;
+//! - cada hive ligada entra na lista de hives, a chave volátil
+//!   `\registry\machine\system\currentcontrolset\control\hivelist`
+//!   (CmpAddToHiveFileList, rva 0x6a1cfc): um REG_SZ com o nome da raiz da
+//!   hive e, como dado, o nome do FILE_OBJECT do primário (o ZwQueryObject
+//!   com ObjectNameInformation) ou o texto vazio de uma hive volátil. As
+//!   hives de aplicativo ficam fora (CmpLoadKeyCommon com REG_APP_HIVE).
+//!
+//! A HARDWARE é criada no início do boot, antes da descrição do hardware
+//! que o kernel grava nela (`hw_description`); a entrada dela na lista
+//! espera a SYSTEM. As outras hives são ligadas na fase 1, logo depois da
+//! montagem do volume (o Windows liga a SOFTWARE e as demais quando o smss
+//! chama o NtInitializeRegistry; aqui o kernel e os programas reais leem
+//! a SOFTWARE desde a fase 1). Sem o arquivo de uma hive, as chaves das
+//! tabelas de semente (`cm/seed.rs`) entram em memória.
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use crate::ntos::cm::registry;
+use crate::ntos::cm::seed::{self, SeedKey};
+use crate::ntos::cm::{hive_list, lazy_flush, machine_hive};
+use crate::rtl::{KernelError, SpinLock};
+
+/// A raiz das hives de aplicativo.
+pub const APP_HIVE_ROOT: &str = "\\REGISTRY\\A";
+pub const HARDWARE_MOUNT: &str = "\\REGISTRY\\MACHINE\\HARDWARE";
+pub const SYSTEM_MOUNT: &str = "\\REGISTRY\\MACHINE\\SYSTEM";
+const HIVE_LIST: &str = "\\registry\\machine\\system\\currentcontrolset\\control\\hivelist";
+const SYSTEM_FILE: &str = "\\SystemRoot\\System32\\config\\SYSTEM";
+
+/// As outras hives de máquina: ponto de montagem e arquivo.
+const MACHINE_HIVES: [(&str, &str); 4] = [
+    ("\\REGISTRY\\MACHINE\\SOFTWARE", "\\SystemRoot\\System32\\config\\SOFTWARE"),
+    ("\\REGISTRY\\MACHINE\\SAM", "\\SystemRoot\\System32\\config\\SAM"),
+    ("\\REGISTRY\\MACHINE\\SECURITY", "\\SystemRoot\\System32\\config\\SECURITY"),
+    ("\\REGISTRY\\USER\\.DEFAULT", "\\SystemRoot\\System32\\config\\DEFAULT"),
+];
+
+static SYSTEM_FROM_FILE: AtomicBool = AtomicBool::new(false);
+/// O handle interno da lista de hives (o CmpHiveFileListHandle).
+static HIVE_LIST_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// Hives que vieram do arquivo no boot, pelo ponto de montagem.
+static FROM_FILE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+
+/// As chaves mestras (CmInitSystem1). `\REGISTRY\A` é volátil, como toda a
+/// hive mestra.
+fn create_master_keys() -> Result<(), KernelError> {
+    for master in ["\\Registry\\Machine", "\\Registry\\User"] {
+        registry::close_handle(registry::open_or_create(master, None)?);
+    }
+    registry::close_handle(registry::open_or_create_options(APP_HIVE_ROOT, None, true)?);
+    Ok(())
+}
+
+/// O início do CmInitSystem1, antes da descrição do hardware: as chaves
+/// mestras e a hive volátil HARDWARE.
+pub fn initialize_hardware_hive() -> Result<(), KernelError> {
+    create_master_keys()?;
+    match hive_list::create_volatile_hive(HARDWARE_MOUNT) {
+        Ok(_) => Ok(()),
+        Err(status) => Err(KernelError::with_status("hive HARDWARE", status)),
+    }
+}
+
+/// Semeia em memória as chaves de uma hive sem arquivo, sob `root`.
+fn seed_in_memory(root: &str, keys: Vec<SeedKey>) -> Result<(), KernelError> {
+    registry::close_handle(registry::open_or_create(root, None)?);
+    for key in keys {
+        let path = format!("{root}\\{}", key.path);
+        let handle = if key.link {
+            let resolved = registry::resolve_path(&path, true).unwrap_or(path);
+            registry::create_resolved(&resolved, None, false, true)?.0
+        } else {
+            registry::open_or_create(&path, None)?
+        };
+        for (name, value_type, data) in key.values {
+            registry::set_value(handle, &name, value_type, data);
+        }
+        registry::close_handle(handle);
+    }
+    Ok(())
+}
+
+/// Liga uma hive de máquina do arquivo; sem ele, as chaves de semente em
+/// memória. Devolve se veio do arquivo.
+fn load_machine_hive(mount: &str, file: &str, keys: impl FnOnce() -> Vec<SeedKey>) -> Result<bool, KernelError> {
+    match hive_list::load(mount, file, 0) {
+        0 => {
+            FROM_FILE.lock().push(String::from(mount));
+            crate::debug_print!("[cm] hive {} carregada de {}", mount, file);
+            Ok(true)
+        }
+        status => {
+            crate::debug_print!("[cm] hive {} sem arquivo ({:#x}); chaves estaticas semeadas em memoria", mount, status);
+            seed_in_memory(mount, keys())?;
+            machine_hive::notify_loaded(mount);
+            Ok(false)
+        }
+    }
+}
+
+/// CmpCreateControlSet: `CurrentControlSet`, link volátil para o conjunto
+/// que `Select\Current` escolhe.
+pub fn create_control_set() -> Result<(), KernelError> {
+    let select = format!("{SYSTEM_MOUNT}\\Select");
+    let current = registry::read_value_by_path(&select, "Current").filter(|value| value.value_type == seed::REG_DWORD && value.data.len() >= 4).map(|value| u32::from_le_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]));
+    let Some(current) = current else { return Err(KernelError::new("SYSTEM\\Select\\Current ausente")) };
+    let link = format!("{SYSTEM_MOUNT}\\CurrentControlSet");
+    let (handle, _) = registry::create_resolved(&registry::resolve_path(&link, true).unwrap_or(link), None, true, true)?;
+    if handle == 0 {
+        return Err(KernelError::new("CurrentControlSet"));
+    }
+    let target = format!("\\Registry\\Machine\\SYSTEM\\ControlSet{current:03}");
+    registry::set_value(handle, registry::SYMBOLIC_LINK_VALUE, registry::REG_LINK, target.encode_utf16().flat_map(u16::to_le_bytes).collect());
+    registry::close_handle(handle);
+    Ok(())
+}
+
+/// CmInitSystem1 / CmpInitializeHiveList na fase 1: a SYSTEM do arquivo do
+/// volume em `\Registry\Machine\SYSTEM` (sem ele, as chaves estáticas em
+/// memória), o `CurrentControlSet`, as outras hives de máquina e a lista de
+/// hives.
+pub fn initialize_hives() -> Result<(), KernelError> {
+    create_master_keys()?;
+    let smss = crate::ntos::init::boot_config::SMSS_BOOT;
+    let from_file = load_machine_hive(SYSTEM_MOUNT, SYSTEM_FILE, || seed::system_keys(smss))?;
+    SYSTEM_FROM_FILE.store(from_file, Ordering::Release);
+    create_control_set()?;
+    // A lista de hives existe a partir daqui (CmpHiveFileListHandle): as
+    // hives já ligadas entram nela e as próximas entram na carga.
+    hive_list::start_hive_list();
+    let [software, sam, security, default] = MACHINE_HIVES;
+    load_machine_hive(software.0, software.1, || seed::software_keys(smss))?;
+    load_machine_hive(sam.0, sam.1, seed::sam_keys)?;
+    load_machine_hive(security.0, security.1, seed::security_keys)?;
+    load_machine_hive(default.0, default.1, seed::default_keys)?;
+    // CmpCmdInit: os escritores preguiçosos, ainda retidos até o fim do
+    // atraso do boot.
+    lazy_flush::initialize();
+    Ok(())
+}
+
+/// A hive SYSTEM veio do arquivo no boot.
+pub fn system_hive_from_file() -> bool {
+    SYSTEM_FROM_FILE.load(Ordering::Acquire)
+}
+
+/// A hive do ponto de montagem veio do arquivo no boot.
+pub fn hive_from_file(mount: &str) -> bool {
+    FROM_FILE.lock().iter().any(|candidate| candidate.eq_ignore_ascii_case(mount))
+}
+
+/// CmpHiveFileListHandle: a chave da lista, criada volátil no primeiro uso
+/// e mantida aberta.
+fn hive_list_handle() -> Option<u32> {
+    let current = HIVE_LIST_HANDLE.load(Ordering::Acquire);
+    if current != 0 {
+        return Some(current);
+    }
+    let handle = registry::open_or_create_options(HIVE_LIST, None, true).ok().filter(|&handle| handle != 0)?;
+    match HIVE_LIST_HANDLE.compare_exchange(0, handle, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(handle),
+        Err(existing) => {
+            registry::close_handle(handle);
+            Some(existing)
+        }
+    }
+}
+
+/// CmpAddToHiveFileList: o valor da hive na lista (o nome do arquivo, ou o
+/// texto vazio de uma hive volátil).
+pub fn add_to_hive_file_list(mount: &str, file_name: Option<&str>) {
+    if let Some(handle) = hive_list_handle() {
+        registry::set_value(handle, mount, seed::REG_SZ, seed::wide(file_name.unwrap_or("")));
+    }
+}
+
+/// CmpRemoveFromHiveFileList: a hive descarregada sai da lista.
+pub fn remove_from_hive_file_list(mount: &str) {
+    if let Some(handle) = hive_list_handle() {
+        registry::delete_value(handle, mount);
+    }
+}

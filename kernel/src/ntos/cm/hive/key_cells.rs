@@ -115,6 +115,15 @@ fn root_security(storage: &Storage) -> u32 {
     node(storage, storage.root_cell()).map_or(HCELL_NIL, |root| root.security.get())
 }
 
+/// Liga bits de Flags de um 'nk' (KEY_SYM_LINK de uma chave de link, como
+/// o CmpDoCreateChild com REG_OPTION_CREATE_LINK).
+pub fn set_key_flags(storage: &mut Storage, cell: u32, flags: u16) {
+    if let Some(key) = node(storage, cell) {
+        key.flags.set(key.flags.get() | flags);
+        storage.mark_cell_dirty(cell);
+    }
+}
+
 /// Cria um 'nk'. `parent` nil cria a raiz da hive.
 pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Captured, time: u64) -> Option<u32> {
     let name_units = units(name);

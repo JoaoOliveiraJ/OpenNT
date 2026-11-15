@@ -58,6 +58,8 @@ pub struct NewKey {
     pub security: Captured,
     pub values: Vec<Value>,
     pub parent: Option<usize>,
+    /// Chave de link (KEY_SYM_LINK).
+    pub link: bool,
 }
 
 /// Monta uma hive nova com as chaves (a primeira é a raiz). Devolve a hive
@@ -72,6 +74,9 @@ pub fn build(keys: &[NewKey], minor: u32, time: u64, file_name: &str) -> Option<
             None => return None,
         };
         let cell = key_cells::create_key(&mut storage, parent, &key.name, &key.security, time)?;
+        if key.link {
+            key_cells::set_key_flags(&mut storage, cell, key_cells::KEY_SYM_LINK);
+        }
         if parent == HCELL_NIL {
             storage.set_root_cell(cell);
         }

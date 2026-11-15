@@ -336,3 +336,116 @@ const _: () = {
     assert!(core::mem::offset_of!(RegQueryKeySecurityInformation, object_context) == 0x28);
     assert!(core::mem::offset_of!(RegQueryKeySecurityInformation, reserved) == 0x30);
 };
+
+/// `_REG_LOAD_KEY_INFORMATION_V2` (wdm.h, RegNtPreLoadKey) como o
+/// CmLoadDifferencingKey do 19041 a monta: Version = 2 depois do
+/// ObjectContext e o FileAccessToken no fim (0x60 bytes).
+#[repr(C)]
+pub struct RegLoadKeyInformation {
+    /// -> `void` (o corpo da chave raiz do TargetKey, ou nulo)
+    pub object: Field<u64>,
+    /// -> `UNICODE_STRING`
+    pub key_name: Field<u64>,
+    /// -> `UNICODE_STRING`
+    pub source_file: Field<u64>,
+    pub flags: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+    /// -> `void`
+    pub trust_class_object: Field<u64>,
+    /// -> `void` (KEVENT)
+    pub user_event: Field<u64>,
+    pub desired_access: Field<u32>,
+    _pad_34: Reserved<0x4>,
+    /// -> `HANDLE`
+    pub root_handle: Field<u64>,
+    /// -> `void`
+    pub call_context: Field<u64>,
+    /// -> `void`
+    pub object_context: Field<u64>,
+    pub version: Field<u64>,
+    /// -> `void`
+    pub file_access_token: Field<u64>,
+}
+
+unsafe impl NtStruct for RegLoadKeyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegLoadKeyInformation>() == 0x60);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, flags) == 0x18);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, user_event) == 0x28);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, desired_access) == 0x30);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, root_handle) == 0x38);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, call_context) == 0x40);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, object_context) == 0x48);
+    assert!(core::mem::offset_of!(RegLoadKeyInformation, version) == 0x50);
+};
+
+/// `_REG_UNLOAD_KEY_INFORMATION` (wdm.h, RegNtPreUnLoadKey).
+#[repr(C)]
+pub struct RegUnloadKeyInformation {
+    /// -> `void`
+    pub object: Field<u64>,
+    /// -> `void` (KEVENT)
+    pub user_event: Field<u64>,
+    /// -> `void`
+    pub call_context: Field<u64>,
+    /// -> `void`
+    pub object_context: Field<u64>,
+    /// -> `void`
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for RegUnloadKeyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegUnloadKeyInformation>() == 0x28);
+    assert!(core::mem::offset_of!(RegUnloadKeyInformation, call_context) == 0x10);
+    assert!(core::mem::offset_of!(RegUnloadKeyInformation, object_context) == 0x18);
+};
+
+/// `_REG_SAVE_KEY_INFORMATION` (wdm.h, RegNtPreSaveKey);
+/// `_REG_RESTORE_KEY_INFORMATION` tem o mesmo layout, com Flags no lugar de
+/// Format (RegNtPreRestoreKey).
+#[repr(C)]
+pub struct RegSaveKeyInformation {
+    /// -> `void`
+    pub object: Field<u64>,
+    /// -> `HANDLE`
+    pub file_handle: Field<u64>,
+    pub format: Field<u32>,
+    _pad_14: Reserved<0x4>,
+    /// -> `void`
+    pub call_context: Field<u64>,
+    /// -> `void`
+    pub object_context: Field<u64>,
+    /// -> `void`
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for RegSaveKeyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegSaveKeyInformation>() == 0x30);
+    assert!(core::mem::offset_of!(RegSaveKeyInformation, format) == 0x10);
+    assert!(core::mem::offset_of!(RegSaveKeyInformation, call_context) == 0x18);
+    assert!(core::mem::offset_of!(RegSaveKeyInformation, object_context) == 0x20);
+};
+
+/// `_REG_CALLBACK_CONTEXT_CLEANUP_INFORMATION` (wdm.h,
+/// RegNtCallbackObjectContextCleanup).
+#[repr(C)]
+pub struct RegCallbackContextCleanupInformation {
+    /// -> `void`
+    pub object: Field<u64>,
+    /// -> `void`
+    pub object_context: Field<u64>,
+    /// -> `void`
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for RegCallbackContextCleanupInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegCallbackContextCleanupInformation>() == 0x18);
+    assert!(core::mem::offset_of!(RegCallbackContextCleanupInformation, object_context) == 0x8);
+};

@@ -8,16 +8,18 @@
 //! uma chave do usuário (`USR:`) ou da máquina (`SYS:`), com os prefixos de
 //! comportamento (`#`, `!`) do formato. Os textos com `\\` dobrado são assim
 //! no registro de origem. Só o boot do processo inicial real
-//! (`--initial-process=smss`) semeia esta árvore.
+//! (`--initial-process=smss`) leva esta árvore.
+//!
+//! Dados puros da hive SOFTWARE (veja `cm/seed.rs`): o `xtask` grava estas
+//! chaves no arquivo da hive e o kernel só as semeia em memória quando o
+//! arquivo falta.
 
 use alloc::vec::Vec;
 
-use super::registry;
-use crate::rtl::KernelError;
+use super::seed::{SeedKey, REG_SZ};
 
-const ROOT: &str = "\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\IniFileMapping";
-
-const REG_SZ: u32 = 1;
+/// A raiz da árvore, relativa à hive SOFTWARE.
+const ROOT: &str = "Microsoft\\Windows NT\\CurrentVersion\\IniFileMapping";
 
 /// (subchave relativa a `IniFileMapping`, valores REG_SZ; nome vazio é o
 /// valor padrão da chave).
@@ -124,21 +126,16 @@ const TREE: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// UTF-16LE com NUL.
-fn wide_z(text: &str) -> Vec<u8> {
-    text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
-}
-
-/// Semeia a árvore `IniFileMapping` que o basesrv.dll real lê.
-pub fn initialize() -> Result<(), KernelError> {
-    for (relative, values) in TREE {
-        let path = if relative.is_empty() { alloc::string::String::from(ROOT) } else { alloc::format!("{ROOT}\\{relative}") };
-        let handle = registry::open_or_create(&path, None)?;
-        for (name, text) in values.iter() {
-            registry::set_value(handle, name, REG_SZ, wide_z(text));
-        }
-        registry::close_handle(handle);
-    }
-    crate::debug_print!("[cm] IniFileMapping semeado: {} chaves", TREE.len());
-    Ok(())
+/// As chaves da árvore `IniFileMapping` que o basesrv.dll real lê.
+pub fn seed_keys() -> Vec<SeedKey> {
+    TREE.iter()
+        .map(|(relative, values)| {
+            let path = if relative.is_empty() { alloc::string::String::from(ROOT) } else { alloc::format!("{ROOT}\\{relative}") };
+            let mut key = SeedKey::new(&path);
+            for (name, text) in values.iter() {
+                key.text(name, REG_SZ, text);
+            }
+            key
+        })
+        .collect()
 }

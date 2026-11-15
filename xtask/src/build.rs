@@ -185,8 +185,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // Segundo disco IDE (mestre-escravo primário): o volume NTFS de dados.
     let ntfs_path = build_dir.join("ntfs.img");
     let mut ntfs_files = crate::windows_binaries::ntfs_files(&root, &kernel_pe, &options.initial_process)?;
-    // A hive SYSTEM que o kernel carrega no boot, das tabelas de semente dele.
-    ntfs_files.push((String::from("Windows/System32/config/SYSTEM"), crate::hive_image::system_hive(options.initial_process == "smss")));
+    // As hives de máquina que o kernel carrega no boot, das tabelas de
+    // semente dele.
+    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss") {
+        ntfs_files.push((format!("Windows/System32/config/{name}"), image));
+    }
     let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, 32, 256)?;
 
     println!(

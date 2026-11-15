@@ -415,6 +415,27 @@ fn starts_with_registry(path: &str) -> bool {
     lower == "\\registry" || lower.starts_with("\\registry\\")
 }
 
+/// NtCreateKey aceita REG_OPTION_VOLATILE, CREATE_LINK, BACKUP_RESTORE,
+/// OPEN_LINK, DONT_VIRTUALIZE e o bit 24 (CmCreateKey, a máscara 0x100001F);
+/// NtOpenKeyEx, BACKUP_RESTORE, OPEN_LINK e DONT_VIRTUALIZE (CmOpenKey,
+/// 0x1C).
+const CREATE_OPTIONS: u32 = 0x0100_001F;
+const OPEN_OPTIONS: u32 = 0x1C;
+const REG_OPTION_VOLATILE: u32 = 1;
+const REG_OPTION_CREATE_LINK: u32 = 2;
+/// OBJ_OPENLINK: o último componente de link não é seguido.
+const OBJ_OPENLINK: u32 = 0x100;
+/// KEY_CREATE_SUB_KEY e KEY_CREATE_LINK no pai (CmpCheckCreateAccessOnKcbStack
+/// recebe (CreateOptions & REG_OPTION_CREATE_LINK) << 4).
+const KEY_CREATE_SUB_KEY: u32 = 4;
+
+/// `\REGISTRY\A` e o que está abaixo: as hives de aplicativo, que só se
+/// abrem relativas a um handle delas.
+pub fn is_app_hive_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower == "\\registry\\a" || lower.starts_with("\\registry\\a\\")
+}
+
 fn strip_registry(path: &str) -> &str {
     if path.len() >= 9 && path[..9].eq_ignore_ascii_case("\\registry") {
         let rest = &path[9..];
@@ -456,7 +477,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
         if captured::<u32>(attributes_pointer, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
             return Ok(0xC000_000D);
         }
-        if options & !(if create { 1 } else { 12 }) != 0 {
+        if options & !(if create { CREATE_OPTIONS } else { OPEN_OPTIONS }) != 0 {
             return Ok(if create { 0xC000_000D } else { 0xC000_00F2 });
         }
         if class_name != 0 && !read_unicode_string(class_name, previous_mode)?.is_empty() {
@@ -553,7 +574,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                     return Ok(Outcome::from_status(0xC000_003B));
                 }
                 let options = operation["options"] as u32;
-                if options & !(if create { 1 } else { 12 }) != 0 {
+                if options & !(if create { CREATE_OPTIONS } else { OPEN_OPTIONS }) != 0 {
                     return Ok(Outcome::from_status(0xC000_000D));
                 }
                 let enforce = previous_mode || operation["flags"] & 0x400 != 0;
@@ -561,19 +582,41 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                     Ok(required) => required,
                     Err(value) => return Ok(Outcome::from_status(value)),
                 };
-                let existing = registry::node_by_path(&absolute_path);
+                // Os links do caminho (CmpDoParseKey): o último componente
+                // fica sem seguir com OBJ_OPENLINK e na criação de um link.
+                let create_link = create && options & REG_OPTION_CREATE_LINK != 0;
+                let open_link = operation["flags"] as u32 & OBJ_OPENLINK != 0;
+                let resolved = match registry::resolve_path(&absolute_path, open_link || create_link) {
+                    Ok(resolved) => resolved,
+                    Err(value) => return Ok(Outcome::from_status(value)),
+                };
+                // \REGISTRY\A não se abre por nome: só relativo a um handle de
+                // uma hive de aplicativo, sem link no caminho.
+                if is_app_hive_path(&resolved) {
+                    let relative = !key_name.starts_with('\\');
+                    let root_in_app = relative && is_app_hive_path(&absolute_path[..absolute_path.len() - key_name.len()]);
+                    if !(root_in_app && resolved.eq_ignore_ascii_case(&absolute_path)) {
+                        return Ok(Outcome::from_status(0xC000_0022));
+                    }
+                }
+                let existing = registry::node_by_resolved_path(&resolved);
                 let existed = existing.is_some();
+                // REG_OPTION_CREATE_LINK sobre uma chave que existe (link ou
+                // não): STATUS_OBJECT_NAME_COLLISION.
+                if create_link && existed {
+                    return Ok(Outcome::from_status(0xC000_0035));
+                }
                 // Separadores no fim do nome (o "Target0\" do ataport) não abrem um
                 // componente vazio: o pai é o do último componente de verdade.
-                let trimmed = absolute_path.trim_end_matches('\\');
-                let parent_node = registry::node_by_path(&trimmed[..trimmed.rfind('\\').unwrap_or(0)]);
+                let trimmed = resolved.trim_end_matches('\\');
+                let parent_node = registry::node_by_resolved_path(&trimmed[..trimmed.rfind('\\').unwrap_or(0)]);
                 if create && !existed && parent_node.is_none() {
                     return Ok(Outcome::from_status(0xC000_003A));
                 }
                 let mut assigned = None;
                 if create && !existed {
                     let parent_security = registry::with_node(parent_node.unwrap_or(0), |key| key.security.clone()).ok_or(Fail::Status(0xC000_003A))?;
-                    if let Err(value) = key_security::access(&parent_security, 4, enforce) {
+                    if let Err(value) = key_security::access(&parent_security, KEY_CREATE_SUB_KEY | (options & REG_OPTION_CREATE_LINK) << 4, enforce) {
                         return Ok(Outcome::from_status(value));
                     }
                     // O dono e a SACL explícitos só são validados com o
@@ -597,8 +640,9 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                     Ok(granted) => granted,
                     Err(value) => return Ok(Outcome::from_status(value)),
                 };
-                // REG_OPTION_VOLATILE: a chave nova não vai para a hive de arquivo.
-                opened = if create { registry::open_or_create_options(&absolute_path, assigned, options & 1 != 0)? } else { registry::open(&absolute_path)? };
+                // REG_OPTION_VOLATILE: a chave nova não vai para a hive de
+                // arquivo; REG_OPTION_CREATE_LINK: a chave nova é um link.
+                opened = if create { registry::create_resolved(&resolved, assigned, options & REG_OPTION_VOLATILE != 0, create_link)?.0 } else { registry::open_resolved(&resolved)? };
                 if opened == 0 {
                     return Ok(Outcome::from_status(0xC000_0034));
                 }
@@ -831,6 +875,12 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         // Buffer do chamador (sondado) ou a cópia privada.
                         let Ok(bytes) = guest::try_read_bytes(field("data"), length as usize) else { return status(0xC000_0005) };
                         let name = read_unicode_string(field("name"), false)?;
+                        // Numa chave de link só cabe o SymbolicLinkValue
+                        // REG_LINK, com tamanho par até 0xFFFF (CmSetValueKey).
+                        let link_value = field("type") as u32 == registry::REG_LINK && length & 1 == 0 && length <= 0xFFFF && name.eq_ignore_ascii_case(registry::SYMBOLIC_LINK_VALUE);
+                        if registry::with_node(node, |key| key.link).unwrap_or(false) && !link_value {
+                            return Ok(Outcome::from_status(0xC000_0022));
+                        }
                         if registry::set_node_value(node, &path, &name, field("type") as u32, bytes) { 0 } else { 0xC000_017C }
                     }
                     Kind::DeleteValue => {
@@ -1136,4 +1186,43 @@ pub fn open(output: u64, desired: u32, attributes: u64, previous_mode: bool, opt
 #[allow(clippy::too_many_arguments)]
 pub fn create(output: u64, desired: u32, attributes: u64, title_index: u32, class_name: u64, options: u32, disposition: u64, previous_mode: bool) -> Result<u32, KernelError> {
     open_or_create_key(true, output, desired, attributes, title_index, class_name, options, disposition, previous_mode)
+}
+
+/// O handle da raiz de uma hive recém-carregada (o ObOpenObjectByPointer do
+/// CmLoadDifferencingKey com REG_LOAD_HIVE_OPEN_HANDLE ou REG_APP_HIVE): a
+/// chave do caminho resolvido, com o DesiredAccess conferido contra o
+/// descritor dela pelo PreviousMode, e o handle na tabela de quem chamou
+/// (de kernel com OBJ_KERNEL_HANDLE nos atributos).
+pub fn open_hive_root(path: &str, desired: u32, attributes: u32, output: u64, previous_mode: bool) -> Result<u32, KernelError> {
+    install_hooks();
+    with_request(|_request| {
+        let output = probe(output, 8, previous_mode, true)?;
+        let Some(node) = registry::node_by_resolved_path(path) else { return Ok(0xC000_0034) };
+        let security = registry::with_node(node, |key| key.security.clone()).ok_or(Fail::Status(0xC000_0034))?;
+        let required = match resolve_access_mask(desired, 0, previous_mode) {
+            Ok(required) => required,
+            Err(value) => return Ok(value),
+        };
+        let granted = match key_security::access(&security, required, previous_mode) {
+            Ok(granted) => granted,
+            Err(value) => return Ok(value),
+        };
+        let opened = registry::open_resolved(path)?;
+        if opened == 0 {
+            return Ok(0xC000_0034);
+        }
+        let attributes = if previous_mode { attributes & !0x200 } else { attributes };
+        if let Err(fail) = publish_key_handle(output, opened, attributes, granted, previous_mode) {
+            registry::close_raw(opened);
+            return Err(fail);
+        }
+        Ok(0)
+    })
+}
+
+/// O corpo do handle de chave (o Object das notificações dos serviços de
+/// hive), associado ao handle.
+pub fn key_body(handle: u64, previous_mode: bool) -> Option<u64> {
+    let resolved = resolve_key_handle(handle, previous_mode, 0).ok()?;
+    key_objects::for_handle(resolved.khandle)
 }
