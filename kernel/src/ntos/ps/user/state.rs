@@ -719,15 +719,28 @@ pub fn alloc_user_handle_in(table: &ProcessState, object: Arc<dyn UserObject>, a
 /// origem e destino, como o OB_PRE_DUPLICATE_HANDLE_INFORMATION.
 fn alloc_entry(table: &ProcessState, entry: Arc<UserHandle>, duplicate_from: Option<u64>) -> Result<u32, KernelError> {
     let kind = entry.object.kind();
-    if (kind == "process" || kind == "thread") && (!entry.object.opened_natively() || duplicate_from.is_some()) {
-        let mut data = entry.object.callback_data();
-        data.access = Some(entry.access());
+    if kind == "process" || kind == "thread" {
         let route_kind = if kind == "process" { "Process" } else { "Thread" };
-        let (operation, source) = duplicate_from.map_or((1, table.process), |source| (2, source));
-        return callbacks::route_between(route_kind, &data, operation, true, source, table.process, &mut |access| {
-            entry.set_access(access);
-            insert_user_handle(table, &entry, None)
-        });
+        let target = entry.object.native_body().map_or(0, |body| body.pointer);
+        let mode = crate::ntos::ps::previous_mode::get().unwrap_or(1);
+        // A OpenProcedure do tipo (PspProcessOpen/PspThreadOpen) depois dos
+        // callbacks, como o ObpIncrementHandleCountEx.
+        let open = |access: u32| -> Result<u32, KernelError> {
+            if target == 0 {
+                return Ok(access);
+            }
+            crate::ntos::ps::open_procedure::apply(route_kind, mode, target, access).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))
+        };
+        if !entry.object.opened_natively() || duplicate_from.is_some() {
+            let mut data = entry.object.callback_data();
+            data.access = Some(entry.access());
+            let (operation, source) = duplicate_from.map_or((1, table.process), |source| (2, source));
+            return callbacks::route_between(route_kind, &data, operation, true, source, table.process, &mut |access| {
+                entry.set_access(open(access)?);
+                insert_user_handle(table, &entry, None)
+            });
+        }
+        entry.set_access(open(entry.access())?);
     }
     insert_user_handle(table, &entry, None)
 }

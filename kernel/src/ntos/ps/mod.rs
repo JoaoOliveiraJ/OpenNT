@@ -28,6 +28,7 @@ pub mod image_information;
 pub mod process_accessors;
 pub mod thread_accessors;
 pub mod open;
+pub mod open_procedure;
 pub mod security;
 pub mod user;
 pub mod exports;
