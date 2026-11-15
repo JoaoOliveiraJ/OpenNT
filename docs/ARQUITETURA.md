@@ -19,9 +19,12 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 kernel/src/
 ├── main.rs            entrada (kernel_main), BSS, panic_handler
 ├── hal/               HAL: portas, serial, CPU, memória física, LAPIC, RTC, heap,
-│   │                  ACPI, PCI, firmware, HalPrivateDispatchTable e exports Hal*
-│   └── amd64/         código x64: interrupções, anel 3, trampolim dos APs, chamadas
-│                      MS-ABI, trampolins dos exports, entradas privadas, serviços
+│   │                  ACPI, PCI, firmware, HalPrivateDispatchTable, HalDispatchTable
+│   │                  (HaliQuerySystemInformation) e exports Hal*
+│   ├── amd64/         código x64: interrupções, anel 3, trampolim dos APs, chamadas
+│   │                  MS-ABI, trampolins dos exports, entradas privadas, serviços
+│   └── x86bios/       interface x86 BIOS (x86Bios*): o BIOS de vídeo da máquina num
+│                      processador de modo real emulado
 ├── rtl/               suporte do próprio kernel em Rust: debug_print!, SpinLock,
 │                      KernelError, texto, tempo
 ├── nano/              IDT/PIC/timer, canais de IPC, registro de serviços
@@ -1098,6 +1101,58 @@ para a criação da primeira sessão, que o win32k.sys anuncia
 
 Sem as opções nada disso roda.
 
+### 3.6 A interface x86 BIOS
+
+Os drivers de vídeo do Windows chamam o BIOS de vídeo da máquina (as
+funções VBE do INT 10h) pela interface x86 BIOS da HAL: x86BiosCall,
+x86BiosAllocateBuffer, x86BiosFreeBuffer, x86BiosReadMemory e
+x86BiosWriteMemory, exports do ntoskrnl que a hal.dll encaminha (o
+BasicDisplay.sys os importa da HAL.dll; o dxgkrnl.sys, o x86BiosCall). No
+x64 não há modo virtual 8086: o Windows executa o código de 16 bits do BIOS
+num emulador de x86 dentro do kernel. O OpenNT faz o mesmo em `hal/x86bios/`:
+
+- `emulator.rs` e `operations.rs`: o processador do 386 em modo real
+  (operandos e endereços de 16 e 32 bits, SIB, prefixos de segmento,
+  REP/REPNE), com o contrato do emulador do ntoskrnl 19041: limite de 64 KB
+  por segmento (o operando ou a busca de código que passa de FFFFh para a
+  emulação), pilha pelo ESP inteiro, o mapa de opcodes dele (sem x87 nem
+  instruções de sistema; SMSW lê 2Dh, RDTSC lê o contador de desempenho),
+  INT n pela IVT sem mexer em IF/TF, INT 42h ignorada, INT 1Ah pelo PCI BIOS
+  emulado, e o fim da chamada quando um IRET/RET/RETF chega ao quadro falso
+  FFFF:FFFF. Os códigos de parada são os do NT (1 sucesso, 2/3 divisão, 5
+  HLT, 9 porta, 0xC opcode ilegal, 0xE limite, 0xF/0x10 pilha...). O núcleo é
+  puro (um `Bus` dá memória e portas) e foi conferido instrução a instrução
+  contra um processador de referência em todas as chamadas VBE que o
+  BasicDisplay faz ao BIOS de vídeo do QEMU (4F00h, 4F01h de cada modo,
+  4F02h, 4F03h, 4F09h, 4F10h, 4F15h e as trocas de modo 03h, 12h e 101h).
+- `mod.rs`: a inicialização (o HalInitializeBios, logo depois das tabelas
+  da HAL na fase 1) e o mapa de 1 MB que o BIOS vê: a IVT e a BDA copiadas
+  da memória física para um buffer privado (0-800h), memória de rascunho
+  (lê zero), o buffer de transferência de 8 KB em 2000:0000 (também visto em
+  3000h), a janela VGA física (A0000h-BFFFFh, mapeada pelo MmMapIoSpaceEx) e
+  o resto do primeiro megabyte físico (EBDA e ROMs) por uma visão página a
+  página em que a RAM do sistema e a janela VGA viram a página F0000h da ROM
+  — o BIOS nunca enxerga a memória do sistema. Uma chamada empilha o quadro
+  falso em 0000:0800, carrega o vetor da IVT copiada e os registradores do
+  X86_BIOS_REGISTERS (`inc/types/extra_hal.rs`) e devolve TRUE só quando o
+  BIOS volta ao quadro. O estado é um só, atrás de um lock: uma chamada por
+  vez.
+- `io_space.rs`: as portas vão ao hardware, menos o mecanismo de
+  configuração PCI (CF8h/CFCh num latch próprio, com as leituras e escritas
+  pelas rotinas KdGet/SetPciDataByOffset da HalPrivateDispatchTable) e o
+  índice da CMOS (70h num latch, 71h sob o lock da CMOS de `hal/rtc.rs`); o
+  INT 1Ah B1xxh é o PCI BIOS emulado sobre as mesmas rotinas.
+
+O HalQuerySystemInformation da HalDispatchTable (`hal/system_information.rs`)
+responde a classe HalDisplayBiosInformation com HalDisplayEmulatedBios, que
+é o que o BasicDisplay consulta antes de usar o BIOS (sem ela, ele nem tenta
+o VBE). O autoteste `ntos/test/x86_bios.rs` chama os exports pelo nome, roda
+código de teste por um vetor livre da IVT copiada e conversa com o BIOS de
+vídeo real: 4F00h ('VESA', VBE 3.0, a memória e a lista de modos), 4F01h (o
+framebuffer linear no BAR0 do adaptador), 4F02h (os registradores de modo
+do adaptador e da VGA confirmam o modo), 4F03h e a volta ao modo texto com o INT 10h
+AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
+
 ## 4. Dependências
 
 - Os componentes do executive se chamam entre si, como no NT (`ke` ↔ `ps`,
@@ -1857,9 +1912,10 @@ dos pacotes (`kernel`, `boot`).
 ## 8. Pontos em aberto
 
 - Alguns grupos de exports ainda misturam componentes e moram no `exports.rs`
-  de um só: `driver_helpers`, `io_diagnostics` e `x86bios_sleep_misc` em `io`,
-  `ke_ex_sync` em `ke`, e rotinas Se*/Ke* que ficaram em `ps`. Falta separá-los
-  pelo prefixo, conforme a seção 3.1.
+  de um só: `driver_helpers`, `io_diagnostics` e `x86bios_sleep_misc` em `io`
+  (os handlers dos x86Bios* deste já moram em `hal/exports.rs`, mas os nomes
+  seguem no grupo da ABI), `ke_ex_sync` em `ke`, e rotinas Se*/Ke* que
+  ficaram em `ps`. Falta separá-los pelo prefixo, conforme a seção 3.1.
 - `rtl/` (suporte do kernel em Rust) e `ntos/rtl/` (a Rtl do NT) ainda têm o
   mesmo nome.
 - `ntos/ps/user/` reúne os serviços Nt* do modo usuário; no NT cada serviço
