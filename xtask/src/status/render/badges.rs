@@ -1,15 +1,15 @@
-//! Selos (no estilo shields.io) e o gráfico de exports por prefixo. Também
-//! são gravados em `docs/status/` para o README.
+//! Os selos (no estilo shields.io) e o gráfico de exports por prefixo, em
+//! `docs/status/`, para o README.
 
-use super::super::{ExportReport, Report, State};
-use super::common::{escape, int, percent};
-use super::exports::prefix_info;
+use super::super::{ExportReport, Report, RunState};
+use super::exports::prefix_label;
+use super::page::{escape, int, percent};
 
 const FONT: &str = "system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
 
-/// Largura aproximada de um texto em Verdana 11px (só para o espaçamento
-/// dos selos; o `textLength` garante que o texto caiba).
-fn badge_text_width(text: &str) -> f64 {
+/// Largura aproximada de um texto em Verdana 11px (só para o espaçamento;
+/// o `textLength` garante que o texto caiba).
+fn text_width(text: &str) -> f64 {
     text.chars()
         .map(|character| match character {
             ' ' => 3.9,
@@ -27,7 +27,7 @@ fn badge_text_width(text: &str) -> f64 {
 
 /// Selo com segmentos (texto, cor de fundo).
 fn badge(id: &str, title: &str, parts: &[(String, &str)]) -> String {
-    let widths: Vec<f64> = parts.iter().map(|(text, _)| badge_text_width(text).ceil() + 12.0).collect();
+    let widths: Vec<f64> = parts.iter().map(|(text, _)| text_width(text).ceil() + 12.0).collect();
     let total: f64 = widths.iter().sum();
     let mut body = String::new();
     let mut x = 0.0;
@@ -62,7 +62,7 @@ fn badge(id: &str, title: &str, parts: &[(String, &str)]) -> String {
     )
 }
 
-pub fn export_badge(report: &ExportReport, id: &str) -> String {
+pub fn export_badge(report: &ExportReport) -> String {
     let total = &report.total;
     let value = format!("OpenNT {} de {} ({})", int(total.opennt), int(total.reference), percent(total.opennt, total.reference));
     let title = format!(
@@ -71,17 +71,19 @@ pub fn export_badge(report: &ExportReport, id: &str) -> String {
         int(total.reference),
         percent(total.opennt, total.reference)
     );
-    badge(id, &title, &[("exports ntoskrnl".into(), "#555"), (value, "#2a78d6")])
+    badge("selo-ntoskrnl", &title, &[("exports ntoskrnl".into(), "#555"), (value, "#2a78d6")])
 }
 
-pub fn component_badge(report: &Report, id: &str) -> String {
-    let value = format!("{} de {} funcionam", report.count(State::Works), report.components.len());
+pub fn runs_badge(report: &Report) -> String {
+    let runs = report.binaries(RunState::Runs);
+    let partial = report.binaries(RunState::Partial);
+    let value = format!("{runs} rodam, {partial} parciais");
     let title = format!(
-        "Componentes e drivers do OpenNT implementados e cobertos por teste automático de boot: {} de {}",
-        report.count(State::Works),
-        report.components.len()
+        "Binários da Microsoft que o OpenNT carrega: {runs} rodam, {partial} parciais e {} ainda não rodam, de {}",
+        report.binaries(RunState::DoesNotRun),
+        report.binaries_total()
     );
-    badge(id, &title, &[("componentes".into(), "#555"), (value, "#006300")])
+    badge("selo-o-que-roda", &title, &[("binários da Microsoft".into(), "#555"), (value, "#006300")])
 }
 
 /// Barra horizontal com a ponta direita arredondada (4px) e a base reta.
@@ -100,7 +102,8 @@ fn bar_path(x: f64, y: f64, width: f64, height: f64) -> String {
 
 /// Gráfico por prefixo: o comprimento de cada barra é o número de exports
 /// do prefixo no Windows; a parte azul é o que o OpenNT também exporta.
-pub fn prefix_chart(report: &ExportReport, id: &str) -> String {
+pub fn prefix_chart(report: &ExportReport) -> String {
+    let id = "pc";
     let width = 760.0;
     let label_x = 16.0;
     let bars_x = 258.0;
@@ -111,7 +114,6 @@ pub fn prefix_chart(report: &ExportReport, id: &str) -> String {
     let largest = report.buckets.iter().map(|(_, tally)| tally.reference).max().unwrap_or(1).max(1);
     let height = top + report.buckets.len() as f64 * row_height + 12.0;
     let total = &report.total;
-
     let mut body = String::new();
     body.push_str(&format!(
         "<rect class=\"{id}-bg\" width=\"{width}\" height=\"{height}\" rx=\"10\"/>\
@@ -134,7 +136,7 @@ pub fn prefix_chart(report: &ExportReport, id: &str) -> String {
     ));
     for (index, (name, tally)) in report.buckets.iter().enumerate() {
         let y = top + index as f64 * row_height;
-        let info = prefix_info(name);
+        let short = prefix_label(name);
         let track = bars_width * tally.reference as f64 / largest as f64;
         let covered = if tally.reference == 0 { 0.0 } else { track * tally.opennt as f64 / tally.reference as f64 };
         let value = format!("{} de {} · {}", int(tally.opennt), int(tally.reference), percent(tally.opennt, tally.reference));
@@ -145,7 +147,7 @@ pub fn prefix_chart(report: &ExportReport, id: &str) -> String {
              <path class=\"{id}-k\" d=\"{track_path}\"/><path class=\"{id}-a\" d=\"{covered_path}\"/>\
              <text class=\"{id}-v\" x=\"{text_x}\" y=\"{value_y}\">{value}</text></g>",
             name = escape(name),
-            short = escape(info.short),
+            short = escape(short),
             missing = int(tally.missing()),
             name_y = y + 15.0,
             short_y = y + 29.0,

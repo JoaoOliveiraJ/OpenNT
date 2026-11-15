@@ -3,8 +3,7 @@
 #
 # O gerador confere o que dá para conferir: os caminhos citados precisam
 # existir no repositório, e o marcador de cada teste precisa aparecer nas
-# fontes Rust. O que não confere sai como aviso na geração e no fim da página
-# de componentes.
+# fontes Rust. O que não confere sai como aviso na geração.
 #
 # Estado declarado de cada componente:
 #   "implementado"        vira "Funciona" se algum teste listado em `testes`
@@ -1325,3 +1324,373 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 "win32/user_call_evidence" = "diagnóstico"
 "win32/win32" = "kernel32 mínimo de bring-up; o alvo são as DLLs reais do Windows"
 "ntos/ke/tracer" = "diagnóstico fora do escopo"
+
+# ---- o que roda (página O que roda) -------------------------------------------
+#
+# Cada [[roda]] é um binário real da Microsoft (ou um marco) que o OpenNT
+# exercita. O estado sai dos dados:
+#   - sem `teste`: "Não roda";
+#   - um teste com espera_falha = true: "Parcial";
+#   - senão, nos grupos driver e programa, o componente da mesma categoria
+#     cujo nome cita o binário decide: "implementado" = "Roda", qualquer
+#     outro estado = "Parcial"; sem componente (e nos marcos) = "Roda".
+# `estado = "roda" | "parcial" | "nao roda"` só onde os dados não dizem.
+# Campos: nome (binários separados por vírgula e "e"), grupo (marco, driver
+# ou programa), teste (um id ou uma lista; o primeiro dá a captura de tela),
+# faz (uma linha: o que funciona) e para (opcional: onde para).
+
+[marco]
+atual = "O adaptador de vídeo inicia pela sessão do win32k: o csrss.exe real chama o NtUserInitialize, o win32k.sys real anuncia a sessão e o dxgkrnl.sys inicia o BasicDisplay.sys, que cria o \\Device\\Video0."
+teste = "win32k-display"
+proximo = "O InitVideo do win32k montar a configuração de exibição sobre o \\Device\\Video0 (hoje ele para com VIDEO_DRIVER_INIT_FAILURE, 0xB4) e a sessão gráfica seguir."
+
+[[roda]]
+nome = "O smss.exe cria o csrss.exe"
+grupo = "marco"
+teste = "smss-csrss"
+faz = "O smss.exe real é o primeiro processo: monta a sessão e cria o smss da sessão, que carrega o win32k.sys e cria o csrss.exe real, todos com a ntdll real."
+
+[[roda]]
+nome = "O win32k.sys atende o csrss.exe"
+grupo = "marco"
+teste = "win32k"
+faz = "O smss da sessão carrega o win32k.sys, o win32kbase.sys e o win32kfull.sys; a thread do csrss vira thread GUI e o NtGdiInit e o NtUserInitialize são atendidos."
+
+[[roda]]
+nome = "Adaptador de vídeo iniciado"
+grupo = "marco"
+teste = "win32k-display"
+faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0."
+para = "Em seguida o InitVideo do win32k para com VIDEO_DRIVER_INIT_FAILURE (0xB4)."
+
+[[roda]]
+nome = "O ntfs.sys monta e grava"
+grupo = "marco"
+teste = "ntfs"
+faz = "O ntfs.sys monta o volume NTFS 3.1 do segundo disco, lê um arquivo pelo Cache Manager e cria, grava e relê outro."
+
+[[roda]]
+nome = "Teclado pela pilha PS/2 do Windows"
+grupo = "marco"
+teste = ["teclado", "shell"]
+faz = "O i8042prt.sys e o kbdclass.sys sobem pelo PnP e as teclas chegam ao shell pela IRQ 1, pela ISR e pelo DPC do driver."
+
+[[roda]]
+nome = "Pipes e mailslots entre processos"
+grupo = "marco"
+teste = "pipes"
+faz = "Dois processos de usuário conversam pelos npfs.sys e msfs.sys: pipes de mensagens e de bytes, E/S assíncrona e mailslot."
+
+[[roda]]
+nome = "Disco lido pela pilha IDE do Windows"
+grupo = "marco"
+teste = "storage"
+faz = "O PnP sobe intelide, atapi, disk e partmgr na controladora do QEMU, e os setores lidos pela pilha conferem com os do disco."
+
+[[roda]]
+nome = "acpi.sys como raiz dos dispositivos"
+grupo = "marco"
+teste = "acpi"
+faz = "O acpi.sys carrega a DSDT do QEMU, entra no modo ACPI, conecta a SCI e relata os dispositivos do namespace."
+para = "O pci.sys sobre o barramento que ele relata ainda não inicia."
+
+[[roda]]
+nome = "Área de trabalho na tela"
+grupo = "marco"
+faz = "Ainda não há sessão gráfica: nenhuma janela é desenhada."
+para = "Falta o InitVideo do win32k montar a configuração de exibição."
+
+[[roda]]
+nome = "Programas Win32 (.exe)"
+grupo = "marco"
+faz = "Fora o smss.exe e o csrss.exe, nenhum programa do Windows roda ainda."
+para = "O shell ainda não executa .exe e não há sessão de usuário."
+
+[[roda]]
+nome = "Rede pela placa e1000"
+grupo = "marco"
+faz = "O NDIS e o AFD sobem, mas nenhum pacote sai pela placa do QEMU."
+para = "Falta ligar o miniport E1G6032E.sys e o tcpip.sys terminar o DriverEntry."
+
+[[roda]]
+nome = "hal.dll"
+grupo = "driver"
+teste = "drivers"
+faz = "Carrega na fase 1 do boot; os 91 encaminhamentos da imagem ligam aos exports do kernel, que faz o papel da HAL."
+
+[[roda]]
+nome = "ci.dll e msrpc.sys"
+grupo = "driver"
+teste = "watchdog"
+faz = "A integridade de código do Windows valida cada imagem de kernel pela assinatura embutida ou pelo catálogo da Microsoft."
+
+[[roda]]
+nome = "cng.sys"
+grupo = "driver"
+teste = "drivers"
+faz = "Carrega no boot, registra a fonte de entropia e publica \\Device\\CNG."
+
+[[roda]]
+nome = "i8042prt.sys"
+grupo = "driver"
+teste = ["teclado", "drivers"]
+faz = "Liga-se aos dispositivos PS/2 da placa-mãe pelo PnP, com as ISRs nas IRQs 1 e 12; é por ele que o shell recebe as teclas."
+
+[[roda]]
+nome = "kbdclass.sys"
+grupo = "driver"
+teste = ["teclado", "drivers"]
+faz = "Filtro de classe sobre o i8042prt.sys: entrega as teclas em \\Device\\KeyboardClass0."
+
+[[roda]]
+nome = "mouclass.sys"
+grupo = "driver"
+teste = "drivers"
+faz = "Anexa-se sobre o i8042prt.sys e a pilha do mouse inicia."
+para = "Nenhum programa lê o mouse ainda."
+
+[[roda]]
+nome = "wmilib.sys e WppRecorder.sys"
+grupo = "driver"
+teste = ["teclado", "drivers"]
+faz = "Bibliotecas de export carregadas pelo primeiro driver que as importa (ataport, kbdclass, i8042prt, mouclass)."
+
+[[roda]]
+nome = "watchdog.sys"
+grupo = "driver"
+teste = "watchdog"
+faz = "Validado pelo catálogo, o DriverEntry retorna sucesso; o dxgkrnl.sys e o win32k.sys importam dele."
+
+[[roda]]
+nome = "ksecdd.sys"
+grupo = "driver"
+teste = "ksecdd"
+faz = "Liga-se ao host de autorização do kernel, conversa com o cng.sys por IOCTLs e publica \\Device\\KsecDD."
+
+[[roda]]
+nome = "ksecpkg.sys"
+grupo = "driver"
+teste = "ksecpkg"
+faz = "O pacote de segurança do kernel (NTLM e SSL) sobe sobre o ksecdd.sys e o cng.sys."
+
+[[roda]]
+nome = "null.sys"
+grupo = "driver"
+teste = "null"
+faz = "Publica \\Device\\Null; um processo lê (fim de arquivo) e escreve pelo despacho do próprio driver."
+
+[[roda]]
+nome = "beep.sys"
+grupo = "driver"
+teste = "beep"
+faz = "Publica \\Device\\Beep; o IOCTL_BEEP_SET passa pela fila do dispositivo e pelo StartIo do driver."
+
+[[roda]]
+nome = "fs_rec.sys"
+grupo = "driver"
+teste = "fs_rec"
+faz = "Registra os reconhecedores de file system; cada um examina o volume NTFS e responde como no Windows."
+
+[[roda]]
+nome = "condrv.sys"
+grupo = "driver"
+teste = "condrv"
+faz = "O driver do console: servidor, referência e conexão abertos como o conhost abre, e a conexão chega ao servidor."
+
+[[roda]]
+nome = "npfs.sys"
+grupo = "driver"
+teste = "pipes"
+faz = "Sobe em todo boot; processos criam, conectam e trocam dados por pipes nomeados."
+
+[[roda]]
+nome = "msfs.sys"
+grupo = "driver"
+teste = "pipes"
+faz = "Sobe em todo boot; processos trocam mensagens por mailslots."
+
+[[roda]]
+nome = "ntfs.sys"
+grupo = "driver"
+teste = "ntfs"
+faz = "Monta o volume NTFS 3.1 do segundo disco, lê pelo Cache Manager e cria, grava e relê um arquivo."
+para = "Só quando o teste o inicia; no boot comum, o volume é servido pelo NTFS do próprio kernel."
+
+[[roda]]
+nome = "clfs.sys e clipsp.sys"
+grupo = "driver"
+teste = "ntfs"
+faz = "Carregam como imports do ntfs.sys, validados pelo catálogo."
+
+[[roda]]
+nome = "fltmgr.sys"
+grupo = "driver"
+teste = "ntfs"
+faz = "O Filter Manager se anexa ao file system e ao volume montado pelo ntfs.sys."
+para = "Nenhum filtro de file system carrega sobre ele ainda."
+
+[[roda]]
+nome = "fastfat.sys"
+grupo = "driver"
+faz = "Vai para o volume com o catálogo dele."
+para = "O início sobre um volume FAT ainda não foi exercitado."
+
+[[roda]]
+nome = "intelide.sys e pciidex.sys"
+grupo = "driver"
+teste = "storage"
+estado = "parcial"
+faz = "Instalados pelo PnP na controladora IDE PIIX3 do QEMU; relatam os dois canais."
+para = "Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel."
+
+[[roda]]
+nome = "atapi.sys e ataport.sys"
+grupo = "driver"
+teste = "storage"
+faz = "Ligam-se aos dois canais IDE: IDENTIFY dos discos e do CD-ROM, IRQ 14 e 15 e leituras por DMA."
+para = "Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel."
+
+[[roda]]
+nome = "disk.sys, classpnp.sys e partmgr.sys"
+grupo = "driver"
+teste = "storage"
+faz = "Criam \\Device\\Harddisk0\\DR0 e \\Device\\Harddisk1\\DR1; as leituras do teste atravessam a pilha até o disco."
+para = "Só com --storage=real; no boot comum, o disco é servido pelo driver ATA do kernel."
+
+[[roda]]
+nome = "volmgr.sys"
+grupo = "driver"
+teste = "storage"
+estado = "parcial"
+faz = "Carrega e relata o próprio dispositivo raiz."
+para = "Ainda não cria volumes para o mountmgr."
+
+[[roda]]
+nome = "mountmgr.sys"
+grupo = "driver"
+teste = "drivers"
+faz = "Carrega no boot e o DriverEntry retorna sucesso."
+para = "Nenhum volume chega a ele: as letras C: e D: são links do próprio kernel."
+
+[[roda]]
+nome = "WdfLdr.sys e Wdf01000.sys"
+grupo = "driver"
+teste = ["kmdf", "basicdisplay"]
+faz = "O runtime KMDF: a WdfLdr.sys liga o driver ao Wdf01000.sys, que carrega pela chave do serviço e devolve a tabela de funções."
+
+[[roda]]
+nome = "msisadrv.sys"
+grupo = "driver"
+teste = ["kmdf", "basicdisplay"]
+faz = "Driver KMDF da ponte PCI-ISA: sobe pelo serviço e, com --display=basic, pelo PnP (AddDevice e START do KMDF)."
+
+[[roda]]
+nome = "dxgkrnl.sys"
+grupo = "driver"
+teste = ["win32k-display", "dxgkrnl"]
+faz = "Cria o \\Device\\DxgKrnl; com o BasicDisplay, inicia o adaptador quando o win32k anuncia a sessão e cria o \\Device\\Video0."
+para = "Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4."
+
+[[roda]]
+nome = "BasicDisplay.sys"
+grupo = "driver"
+teste = ["win32k-display", "basicdisplay"]
+faz = "Instalado pelo PnP no adaptador VGA do QEMU; registra-se no dxgkrnl e o DxgkDdiStartDevice usa o framebuffer VBE 1024x768."
+para = "Nada aparece na tela ainda: o InitVideo do win32k para antes, com 0xB4."
+
+[[roda]]
+nome = "win32k.sys, win32kbase.sys e win32kfull.sys"
+grupo = "driver"
+teste = ["win32k-display", "win32k"]
+faz = "Carregados pelo smss no espaço de sessão; atendem o csrss (thread GUI, NtGdiInit, NtUserInitialize) e anunciam a sessão ao dxgkrnl."
+para = "O InitVideo enumera o \\Device\\Video0, mas não monta a configuração de exibição e para com 0xB4."
+
+[[roda]]
+nome = "acpi.sys"
+grupo = "driver"
+teste = "acpi"
+faz = "Raiz da árvore de dispositivos: interpretador AML com a DSDT do QEMU, modo ACPI, SCI conectada e os dispositivos relatados."
+para = "Só com --pnp-root=acpi; o teclado ainda sobe nos dispositivos da placa-mãe do kernel."
+
+[[roda]]
+nome = "pci.sys e pshed.dll"
+grupo = "driver"
+teste = "acpi"
+faz = "Instalado pelo pci.inf no barramento que o acpi.sys relata; carrega com a pshed.dll."
+para = "O DriverEntry devolve STATUS_NOT_FOUND: falta o banco de erratas (errata.inf) que ele consulta."
+
+[[roda]]
+nome = "ndis.sys e netio.sys"
+grupo = "driver"
+teste = "ndis"
+faz = "Importam um do outro e carregam juntos; o NetIO sobe o NMR, o NSI e a WFP, e o DriverEntry do NDIS tem sucesso."
+para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
+
+[[roda]]
+nome = "afd.sys e tdi.sys"
+grupo = "driver"
+teste = "afd"
+estado = "parcial"
+faz = "O driver de sockets sobe depois do NDIS, com a tdi.sys carregada pelo import."
+para = "Sem placa de rede ligada, nenhum socket chega a ele."
+
+[[roda]]
+nome = "tcpip.sys e fwpkclnt.sys"
+grupo = "driver"
+teste = "tcpip"
+faz = "Carrega com o fltmgr.sys e a fwpkclnt.sys; o DriverEntry registra o NSI e a WFP."
+para = "Para no WfpAleCaptureSecurityInformation: o KeLowerIrql embutido (mov cr8) ainda não chega ao IRQL do kernel."
+
+[[roda]]
+nome = "E1G6032E.sys"
+grupo = "driver"
+faz = "O miniport Intel PRO/1000 da placa e1000 do QEMU."
+para = "Ainda não é ligado pelo PnP."
+
+[[roda]]
+nome = "smss.exe"
+grupo = "programa"
+teste = "smss-csrss"
+faz = "Primeiro processo, protegido e crítico: lê o Session Manager, monta \\KnownDlls, DosDevices e \\Sessions e cria o smss da sessão."
+
+[[roda]]
+nome = "ntdll.dll"
+grupo = "programa"
+teste = "smss-csrss"
+estado = "roda"
+faz = "Roda o smss e o csrss: LdrInitializeThunk, carregador, thread pool e ALPC."
+para = "No boot comum, os testes de modo usuário usam uma ntdll mínima gerada pelo build."
+
+[[roda]]
+nome = "csrss.exe"
+grupo = "programa"
+teste = ["win32k-display", "smss-csrss"]
+faz = "Cria o \\Windows\\ApiPort e a seção compartilhada, carrega os servidores e chama o NtUserInitialize do win32k."
+para = "Para junto com a sessão: com vídeo, o win32k cai com 0xB4; sem vídeo, a sessão espera o primeiro adaptador."
+
+[[roda]]
+nome = "basesrv.dll"
+grupo = "programa"
+teste = "smss-csrss"
+faz = "Servidor base do csrss: hora do sistema, \\BaseNamedObjects, links da sessão e o mapeamento de arquivos .ini."
+
+[[roda]]
+nome = "winsrv.dll e winsrvext.dll"
+grupo = "programa"
+teste = "win32k-display"
+faz = "Servidores de janelas do csrss: com o cfgmgr32.dll aberto pelo \\Device\\DeviceApi\\CMApi, chamam o NtUserInitialize."
+
+[[roda]]
+nome = "user32.dll, gdi32.dll e gdi32full.dll"
+grupo = "programa"
+teste = "smss-csrss"
+faz = "Inicializam dentro do csrss, com as chamadas ao win32k atendidas."
+para = "Nenhum programa cria janela ainda."
+
+[[roda]]
+nome = "kernel32.dll e kernelbase.dll"
+grupo = "programa"
+teste = "smss-csrss"
+estado = "roda"
+faz = "Carregam e inicializam no csrss, puxadas pelo user32.dll."
+para = "Nenhum programa Win32 as usa ainda."

@@ -1,7 +1,7 @@
 # OpenNT
 
 [![Exports do ntoskrnl.exe do Windows 10 22H2 cobertos pelo OpenNT](docs/status/selo-ntoskrnl.svg)](docs/site/ntoskrnl.html)
-[![Componentes e drivers que funcionam no OpenNT](docs/status/selo-componentes.svg)](docs/site/componentes.html)
+[![Binários da Microsoft que rodam no OpenNT](docs/status/selo-o-que-roda.svg)](docs/site/o-que-roda.html)
 
 **OpenNT** é um kernel x86-64 escrito em Rust `no_std`, com a arquitetura do
 Windows NT, capaz de **carregar e iniciar drivers `.sys` reais do Windows**.
@@ -81,31 +81,40 @@ As fases 6 e 7 seguem crescendo: cada driver real que se tenta carregar revela
 as funções do `ntoskrnl` que ainda faltam, implementadas uma a uma com a
 semântica do NT e cobertas por autoteste.
 
-## Compatibilidade — páginas geradas do código
+## Estado — o site gerado do código
 
-Três páginas HTML estáticas (sem rede, abra os arquivos de `docs/site/` no
-navegador) mostram onde o OpenNT está, sempre a partir do código:
+Cinco páginas HTML estáticas (sem rede: abra os arquivos de `docs/site/` no
+navegador) mostram onde o OpenNT está, sempre a partir dos dados:
 
-- **[Visão geral](docs/site/index.html)** — os números principais, o que já
-  roda e a linha do tempo das fases, com um glossário dos termos.
-- **[Exports do kernel](docs/site/ntoskrnl.html)** — quantas das ~3.070 funções
-  e variáveis do `ntoskrnl.exe` do Windows 10 22H2 o OpenNT oferece, por prefixo
-  (Ke, Mm, Ob, Ps, Io, Ex, Rtl, Se, Zw/Nt…), com busca e paginação.
-- **[Componentes e drivers](docs/site/componentes.html)** — o que cada parte faz,
-  se já funciona, qual autoteste a cobre e em que fase entra.
+- **[Início](docs/site/index.html)** — o que é o OpenNT, os números principais,
+  o marco atual e o próximo.
+- **[O que roda](docs/site/o-que-roda.html)** — cada binário real da Microsoft
+  que o OpenNT carrega (drivers e programas) e os marcos: o estado (Roda,
+  Parcial, Não roda), o que funciona, onde para, o teste que prova e a tela do
+  QEMU no fim desse teste.
+- **[Componentes](docs/site/componentes.html)** — as partes do kernel, o estado
+  de cada uma e o teste que a cobre.
+- **[Exports](docs/site/ntoskrnl.html)** — quantas das ~3.070 funções e
+  variáveis do `ntoskrnl.exe` do Windows 10 22H2 o OpenNT oferece, por prefixo,
+  com busca.
+- **[Testes](docs/site/testes.html)** — como validar (`cargo xtask test-all`) e
+  cada teste de boot, com o comando e o marcador.
 
 ![Exports do ntoskrnl.exe por prefixo](docs/status/ntoskrnl-por-prefixo.svg)
 
-Para regenerar páginas, selos, gráfico e roadmap depois de mudar o kernel:
+Para regenerar páginas, selos, gráfico e roadmap depois de mudar o kernel, e
+as capturas de tela de cada teste:
 
 ```powershell
-cargo xtask status   # não compila o kernel
+cargo xtask status                    # não compila o kernel
+cargo xtask capturas                  # roda cada [[teste]] e grava docs/site/capturas/<id>.png
+cargo xtask capturas --only=ntfs,acpi # só estes
 ```
 
 A lista de referência dos exports do Windows fica em
 [`docs/status/ntoskrnl-exports.def`](docs/status/ntoskrnl-exports.def) (só os
 nomes; nenhum binário da Microsoft entra no repositório). O estado, os testes e
-a fase de cada componente ficam em
+a fase de cada componente, e a lista da página O que roda (`[[roda]]`), ficam em
 [`docs/status/components.toml`](docs/status/components.toml), editado à mão e
 conferido a cada geração.
 
@@ -129,9 +138,9 @@ do kernel, no QEMU.
 | `kernel/src/ntos/test/` | Autotestes de boot (`phase3.rs`…`phase7.rs`, `self_test.rs`) |
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
-| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `status`, `debug` |
+| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `capturas`, `status`, `debug` |
 | `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel) e `kd-gui` (o depurador gráfico `opennt-dbg`) |
-| `docs/` | Roadmap, arquitetura e páginas de compatibilidade |
+| `docs/` | Roadmap, arquitetura e o site de status |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
 estão em **[docs/ARQUITETURA.md](docs/ARQUITETURA.md)**.
@@ -203,8 +212,10 @@ cargo run -p kd-gui --release -- --connect=127.0.0.1:1234
 cargo test -p kd-client
 cargo test -p kd-gui --release -- --ignored --nocapture
 
-# Páginas de compatibilidade, selos e roadmap.
+# O site de status (docs/site), os selos e o roadmap; as capturas de tela
+# do fim de cada [[teste]] (docs/site/capturas/<id>.png).
 cargo xtask status
+cargo xtask capturas
 
 # Estruturas do NT (kernel/src/ntos/inc/types) geradas dos símbolos do
 # ntoskrnl, com a lista em types/nt_types.toml; o PDB vai para build/symbols
@@ -229,7 +240,8 @@ Opções de máquina: `--accel=tcg|whpx`,
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar
 `*** PANIC`, `*** EXCECAO` ou `SELFTEST FALHOU`. Com `--build-only` ele só
 monta a imagem do teste; com `--no-build` roda o QEMU na imagem já montada em
-`--build-dir`.
+`--build-dir`; com `--capture=ARQ.png`, no fim do teste (passando ou não) grava a
+tela do QEMU nesse PNG, pelo `screendump` do QMP.
 
 O `test-all` monta as imagens uma de cada vez (`test-boot --build-only`), com
 as execuções de mesma configuração juntas, para o kernel recompilar uma vez

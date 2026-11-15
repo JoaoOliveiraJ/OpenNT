@@ -1,36 +1,31 @@
-//! HTML, SVG e Markdown das páginas de status. Tudo autocontido: CSS, SVG e
-//! scripts inline, sem fontes nem recursos externos, para funcionar aberto
-//! direto do disco (`file://`). O CSS e os scripts moram em `assets.rs`; as
-//! listas longas têm busca e filtro por um script pequeno e, sem JavaScript,
-//! aparecem inteiras. A saída não tem data/hora, para que duas gerações com
-//! os mesmos dados produzam os mesmos bytes.
+//! HTML, SVG e Markdown do site de status. Tudo autocontido: CSS, SVG e o
+//! script de filtro inline, sem fontes, imagens externas nem CDN, para
+//! funcionar aberto do disco (`file://`); as únicas imagens são as capturas
+//! de `docs/site/capturas/`. Sem JavaScript, as listas aparecem inteiras.
 
-mod assets;
-mod common;
+mod badges;
 mod components;
 mod exports;
-mod modules;
-mod overview;
+mod home;
+mod page;
 mod roadmap;
-mod svg;
+mod runs;
+mod tests;
 
 use super::Report;
 
 /// (arquivo, conteúdo) de cada saída: `.svg` vai para `docs/status/`, `.md`
 /// para `docs/` e `.html` para `docs/site/`.
 pub fn render(report: &Report) -> Vec<(String, String)> {
-    let chart = svg::prefix_chart(&report.exports, "pc");
-    let mut files = vec![
-        ("selo-ntoskrnl.svg".to_string(), svg::export_badge(&report.exports, "selo-ntoskrnl")),
-        ("selo-componentes.svg".to_string(), svg::component_badge(report, "selo-componentes")),
-        ("ntoskrnl-por-prefixo.svg".to_string(), chart),
-        ("index.html".to_string(), overview::page(report)),
+    vec![
+        ("selo-ntoskrnl.svg".to_string(), badges::export_badge(&report.exports)),
+        ("selo-o-que-roda.svg".to_string(), badges::runs_badge(report)),
+        ("ntoskrnl-por-prefixo.svg".to_string(), badges::prefix_chart(&report.exports)),
+        ("index.html".to_string(), home::page(report)),
+        ("o-que-roda.html".to_string(), runs::page(report)),
         ("componentes.html".to_string(), components::page(report)),
-        ("testes.html".to_string(), components::tests_page(report)),
-        ("modulos.html".to_string(), modules::page(report)),
         ("ntoskrnl.html".to_string(), exports::page(report)),
+        ("testes.html".to_string(), tests::page(report)),
         ("ROADMAP.md".to_string(), roadmap::markdown(report)),
-    ];
-    files.extend(exports::group_pages(report));
-    files
+    ]
 }

@@ -11,7 +11,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | --- | --- |
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
-| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `status` e o cliente de texto do depurador do kernel (`debug`) |
+| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `capturas`, `status` e o cliente de texto do depurador do kernel (`debug`) |
 | `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, públicos de PDB), pilha pelos frame pointers, passo por cima e para fora, breakpoints e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
 | `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas do DWARF pelo `addr2line`); as dependências dele não entram no build do kernel nem do `xtask` |
 
@@ -2403,17 +2403,29 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 | `README.md` | o que é o OpenNT, estado por fase, como compilar, rodar e testar |
 | `docs/ROADMAP.md` | fases e estado de cada componente; gerado por `cargo xtask status` |
 | `docs/ARQUITETURA.md` | este documento |
-| `docs/status/components.toml` | dados editados à mão: fases, componentes, testes, subsistemas |
-| `docs/status/modulos-planejados.txt` | módulos planejados por subsistema |
+| `docs/status/components.toml` | dados editados à mão: fases, componentes, testes, a lista `[[roda]]` e o `[marco]` |
 | `docs/status/ntoskrnl-exports.def` | cache dos nomes exportados pelo `ntoskrnl.exe` 19045 |
-| `docs/status/*.svg`, `docs/site/` | gerados por `cargo xtask status`; não editar |
+| `docs/status/*.svg`, `docs/site/*.html` | gerados por `cargo xtask status`; não editar |
+| `docs/site/capturas/<id>.png` | a tela do QEMU no fim de cada `[[teste]]`, gravada por `cargo xtask capturas` |
 | `kernel/src/ntos/inc/types/nt_types.toml` | estruturas do NT que o `cargo xtask nt-types` gera do PDB do ntoskrnl |
 
-O `cargo xtask status` acha o arquivo Rust de cada módulo planejado pela pasta
-e pelo nome (`ntos/ob/object_manager` → `.../ob/object_manager.rs`), por um
-`pub mod <nome> {` dentro de um arquivo do componente, ou pela tabela
-`[correspondencias]` do `components.toml` (usada quando o módulo foi para uma
-subpasta com outro nome, como `ntos/ex/wnf_name` → `ntos/ex/wnf/name.rs`).
+O site tem cinco páginas autocontidas (sem scripts, fontes nem imagens de
+fora): Início, O que roda, Componentes, Exports e Testes. Na página O que roda,
+cada `[[roda]]` é um binário da Microsoft (ou um marco) e o estado sai dos
+dados: sem `teste`, Não roda; um teste com `espera_falha`, Parcial; senão o
+componente do Windows cujo nome cita o binário decide (`implementado` = Roda,
+outro estado = Parcial), e sem componente ou num marco, Roda. O campo `estado`
+só existe onde os dados não dizem; o gerador avisa quando ele repete o que os
+dados já dão, quando um Parcial não diz onde para (`para`) e quando um binário
+de um componente testado não tem `[[roda]]`.
+
+O `cargo xtask capturas` roda os `[[teste]]` com a máquina do `test-all` (um
+build por configuração, pistas em paralelo) e passa a cada `test-boot
+--no-build` o `--capture=docs/site/capturas/<id>.png`: o QEMU ganha um socket
+QMP e, no fim do teste (passando ou não), o `screendump` grava a tela em PPM (o
+QEMU desta máquina não tem a libpng), que o `xtask/src/png.rs` converte em PNG
+sem moldura, com paleta e deflate próprio, abaixo de 60 KB, com a data e o
+resultado nos textos do PNG; o `cargo xtask status` os lê de lá.
 
 ## 7. O nome OpenNT nos arquivos
 

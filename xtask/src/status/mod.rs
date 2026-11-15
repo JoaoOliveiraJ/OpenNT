@@ -1,50 +1,55 @@
-//! `cargo xtask status` — páginas de compatibilidade e roadmap do OpenNT.
+//! `cargo xtask status` — o site de status do OpenNT e o roadmap.
 //!
-//! Gera, a partir de dados verificáveis:
+//! Gera, a partir de dados verificáveis, cinco páginas autocontidas em
+//! `docs/site/`:
 //!
-//! - `docs/site/index.html`: a visão geral e o glossário;
-//! - `docs/site/componentes.html`: componentes e drivers por categoria, com o
-//!   estado, o teste que cobre cada um e a fase do roadmap;
-//! - `docs/site/testes.html`: os testes automáticos de boot e o que cada um
-//!   cobre;
-//! - `docs/site/modulos.html`: os módulos planejados de cada subsistema e
-//!   quais já têm código;
-//! - `docs/site/ntoskrnl.html` e `docs/site/ntoskrnl-<grupo>.html`: quantos
-//!   exports do `ntoskrnl.exe` do Windows 10 22H2 (build 19045) o PE do
-//!   OpenNT também exporta, por prefixo, com a lista de cada grupo;
-//! - `docs/status/*.svg`: selos e gráfico por prefixo, também usados no README;
-//! - `docs/ROADMAP.md`: as fases e o estado de cada componente.
+//! - `index.html` (Início): o que é o OpenNT, os números principais, o marco
+//!   atual e o próximo;
+//! - `o-que-roda.html`: cada binário real da Microsoft que o OpenNT exercita
+//!   (e os marcos), com o estado, o que funciona, onde para, o teste que
+//!   prova e a captura de tela do fim desse teste;
+//! - `componentes.html`: as partes do kernel e o estado de cada uma;
+//! - `ntoskrnl.html`: os exports do `ntoskrnl.exe` do Windows 10 22H2 que o
+//!   kernel do OpenNT também exporta, por prefixo, com busca;
+//! - `testes.html`: como validar (`cargo xtask test-all`) e cada teste.
 //!
-//! As listas que crescem (componentes, módulos, exports) aparecem inteiras,
-//! com busca e filtro por um script inline pequeno (sem JavaScript, só a
-//! busca some).
+//! Também grava os selos e o gráfico de `docs/status/*.svg` (usados no
+//! README) e o `docs/ROADMAP.md`.
 //!
-//! Entradas: o PE de referência (em cache em `docs/status/ntoskrnl-exports.def`),
-//! a lista de módulos planejados (`docs/status/modulos-planejados.txt`), a
-//! árvore Rust do repositório e o arquivo editado à mão
-//! `docs/status/components.toml`.
+//! Entradas: `docs/status/components.toml` (editado à mão), a lista de
+//! exports de referência (`docs/status/ntoskrnl-exports.def`), as tabelas
+//! de exports do próprio kernel, as fontes Rust (onde cada marcador de teste
+//! aparece) e as capturas em `docs/site/capturas/` (gravadas pelo `cargo
+//! xtask capturas`, com a data e o resultado nos textos do PNG). A saída não
+//! tem data/hora própria: duas gerações com os mesmos dados dão os mesmos
+//! bytes.
 
 mod pe;
 mod render;
 mod sources;
 pub mod toml;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use sources::RustIndex;
 
 pub const USAGE: &str = "uso: cargo xtask status [--reference=NTOSKRNL.EXE]
   --reference=ARQ  le os exports deste ntoskrnl.exe e atualiza docs/status/ntoskrnl-exports.def
                    (sem a opcao, usa o cache; sem cache, usa %SystemRoot%\\System32\\ntoskrnl.exe)
-saida: docs/site/{index,componentes,testes,modulos,ntoskrnl,ntoskrnl-*}.html, docs/status/*.svg e docs/ROADMAP.md";
+saida: docs/site/{index,o-que-roda,componentes,ntoskrnl,testes}.html, docs/status/*.svg e docs/ROADMAP.md
+as capturas de tela (docs/site/capturas/<id>.png) vem do cargo xtask capturas";
 
 const COMPONENTS: &str = "docs/status/components.toml";
 const SITE_DIR: &str = "docs/site";
 const STATUS_DIR: &str = "docs/status";
+/// Pasta das capturas, relativa a `docs/site/` (como as páginas a citam).
+pub const CAPTURES: &str = "capturas";
 
-/// Grupos de prefixo, na ordem das páginas.
+/// Categorias de `[[componente]]` que são binários do Windows: o estado de
+/// cada binário fica na página O que roda.
+pub const WINDOWS_CATEGORIES: &[&str] = &["Drivers do Windows", "Programas do Windows"];
+
+/// Grupos de prefixo dos exports, na ordem da página.
 pub const BUCKETS: &[&str] = &[
     "Ke", "Ke*Irql", "Mm", "Ob", "Ps", "Io", "Ex", "Rtl", "Se", "Zw/Nt", "Cm", "Po", "Hal", "Wmi/Etw", "Fs/FsRtl",
     "Kd", "Inbv", "outros",
@@ -92,7 +97,7 @@ pub fn bucket(name: &str) -> &'static str {
         .unwrap_or("outros")
 }
 
-// ---- modelo das páginas ------------------------------------------------------
+// ---- modelo -------------------------------------------------------------------
 
 pub struct ExportRow {
     pub name: String,
@@ -117,27 +122,32 @@ impl Tally {
 
 pub struct ExportReport {
     pub file_version: Option<String>,
-    pub unnamed: usize,
     pub rows: Vec<ExportRow>,
     pub buckets: Vec<(&'static str, Tally)>,
     pub total: Tally,
+    /// Nomes que o OpenNT exporta e o ntoskrnl de referência não.
     pub opennt_extra: Vec<String>,
 }
 
-/// Estado de um componente, como aparece para o leitor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    /// Implementado e coberto por um teste automático de boot.
-    Works,
-    /// Parte implementada, ou implementado sem teste automático.
-    InDevelopment,
-    /// Previsto numa fase do roadmap.
-    Planned,
-    /// Fora do escopo atual.
-    OutOfScope,
+/// A captura de tela do fim de um teste (`docs/site/capturas/<id>.png`).
+pub struct Capture {
+    /// Caminho relativo a `docs/site/`.
+    pub file: String,
+    pub width: u32,
+    pub height: u32,
+    pub date: String,
+    /// "passou" ou "falhou: motivo", como o test-boot registrou.
+    pub result: String,
+    /// As linhas da serial que provam o teste (as das saídas esperadas e as
+    /// últimas), como o test-boot registrou.
+    pub serial: String,
 }
 
-pub const STATES: &[State] = &[State::Works, State::InDevelopment, State::Planned, State::OutOfScope];
+impl Capture {
+    pub fn passed(&self) -> bool {
+        self.result == "passou"
+    }
+}
 
 pub struct TestRow {
     pub id: String,
@@ -145,29 +155,81 @@ pub struct TestRow {
     pub marker: String,
     pub command: String,
     pub description: String,
+    /// `espera_falha = true`: falha conhecida.
+    pub expected_failure: bool,
+    /// `coberto_pela_suite = true`: as suítes já conferem os marcadores.
+    pub covered_by_suite: bool,
     /// Arquivo das fontes Rust em que o marcador aparece.
     pub location: Option<String>,
+    pub capture: Option<Capture>,
 }
 
-/// Um caminho do repositório citado no `components.toml`, conferido.
-pub struct PathRef {
-    pub path: String,
-    pub exists: bool,
+/// Estado de um item da página O que roda.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RunState {
+    Runs,
+    Partial,
+    DoesNotRun,
 }
+
+pub const RUN_STATES: &[RunState] = &[RunState::Runs, RunState::Partial, RunState::DoesNotRun];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Milestone,
+    Driver,
+    Program,
+}
+
+pub const GROUPS: &[Group] = &[Group::Milestone, Group::Driver, Group::Program];
+
+/// Um item da página O que roda: um binário (ou um grupo pequeno de
+/// binários que andam juntos) ou um marco.
+pub struct RunRow {
+    pub name: String,
+    pub group: Group,
+    /// Os binários citados no nome (vazio num marco).
+    pub binaries: Vec<String>,
+    /// Índices em `Report::tests`; o primeiro dá a captura.
+    pub tests: Vec<usize>,
+    pub state: RunState,
+    /// De onde veio o estado, em palavras (vai para o título do selo).
+    pub reason: String,
+    pub does: String,
+    pub stops: String,
+}
+
+/// Estado de um componente do kernel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// Implementado e coberto por um teste automático de boot.
+    Works,
+    /// Parte implementada, ou implementado sem teste automático.
+    Partial,
+    /// Previsto numa fase do roadmap.
+    Planned,
+    /// Fora do escopo atual.
+    OutOfScope,
+}
+
+pub const STATES: &[State] = &[State::Works, State::Partial, State::Planned, State::OutOfScope];
 
 pub struct ComponentRow {
     pub name: String,
     pub category: String,
-    pub icon: String,
     pub description: String,
-    /// Declarado "implementado" sem teste automático aparece como
-    /// `InDevelopment` ("Parcial"); a página diz que falta o teste.
+    pub declared: String,
     pub state: State,
-    pub paths: Vec<PathRef>,
-    /// Índices em `Report::tests` dos testes que cobrem o componente.
+    pub paths: Vec<String>,
+    /// Índices em `Report::tests`.
     pub tests: Vec<usize>,
     pub phase: String,
     pub notes: String,
+}
+
+pub struct CategoryRow {
+    pub name: String,
+    pub description: String,
 }
 
 pub struct PhaseRow {
@@ -177,114 +239,47 @@ pub struct PhaseRow {
     pub scope: String,
 }
 
-/// Estado de um módulo planejado.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ModuleState {
-    /// O arquivo Rust do módulo existe.
-    Done,
-    /// O arquivo existe, mas o módulo está declarado parcial em `[parciais]`.
-    Partial,
-    /// Ainda sem arquivo Rust.
-    Pending,
-    /// Fora da conta (`[fora_do_escopo]`).
-    OutOfScope,
-}
-
-pub const MODULE_STATES: &[ModuleState] =
-    &[ModuleState::Done, ModuleState::Partial, ModuleState::Pending, ModuleState::OutOfScope];
-
-/// Um módulo planejado (`ntos/ob/handle_table`), com o arquivo que o atende.
-pub struct ModuleRow {
-    pub name: String,
-    pub rust: Option<String>,
-    pub state: ModuleState,
-    /// Uma suíte de autoteste importa o arquivo do módulo diretamente.
-    pub tested: bool,
-    /// Motivo declarado em `[parciais]` ou `[fora_do_escopo]`.
-    pub note: String,
-}
-
-pub struct SubsystemRow {
-    pub folder: String,
-    pub name: String,
-    pub description: String,
-    pub icon: String,
-    pub phase: String,
-    pub notes: String,
-    pub is_tests: bool,
-    /// Módulos planejados no escopo, prontos e parciais.
-    pub planned: usize,
-    pub done: usize,
-    pub partial: usize,
-    /// Todos os módulos planejados da pasta, inclusive os fora da conta.
-    pub modules: Vec<ModuleRow>,
-}
-
-impl SubsystemRow {
-    pub fn covered(&self) -> usize {
-        self.done + self.partial
-    }
-
-    pub fn pending(&self) -> usize {
-        self.planned - self.covered()
-    }
-
-    pub fn out_of_scope(&self) -> usize {
-        self.modules.iter().filter(|module| module.state == ModuleState::OutOfScope).count()
-    }
-
-    /// Módulos no escopo cujo arquivo alguma suíte de autoteste importa.
-    pub fn tested(&self) -> usize {
-        self.modules.iter().filter(|module| module.tested && module.state != ModuleState::OutOfScope).count()
-    }
-}
-
-/// Uma categoria de componentes, na ordem em que aparece no `components.toml`.
-pub struct CategoryRow {
-    pub name: String,
-    pub description: String,
-    pub icon: String,
+/// O marco atual e o próximo (`[marco]`).
+pub struct Milestone {
+    pub current: String,
+    pub next: String,
+    /// O teste que prova o marco atual.
+    pub test: Option<usize>,
 }
 
 pub struct Report {
     pub exports: ExportReport,
-    pub subsystems: Vec<SubsystemRow>,
+    pub runs: Vec<RunRow>,
     pub components: Vec<ComponentRow>,
     pub categories: Vec<CategoryRow>,
     pub tests: Vec<TestRow>,
     pub phases: Vec<PhaseRow>,
+    pub milestone: Milestone,
+    /// Os marcadores que as suítes completas do test-all conferem.
+    pub suite_markers: Vec<String>,
     pub warnings: Vec<String>,
 }
 
 impl Report {
-    pub fn count(&self, state: State) -> usize {
-        self.components.iter().filter(|row| row.state == state).count()
+    /// Um componente das categorias do Windows cujo binário tem item na
+    /// página O que roda (o estado dele fica lá).
+    pub fn listed_in_runs(&self, component: &ComponentRow) -> bool {
+        let listed: BTreeSet<String> = self.runs.iter().flat_map(|row| row.binaries.iter().map(|binary| stem(binary))).collect();
+        WINDOWS_CATEGORIES.contains(&component.category.as_str())
+            && binary_names(&component.name).iter().any(|binary| listed.contains(&stem(binary)))
     }
 
-    /// Módulos no escopo citados diretamente por alguma suíte de autoteste.
-    pub fn modules_tested(&self) -> usize {
-        self.subsystems.iter().filter(|row| !row.is_tests).map(SubsystemRow::tested).sum()
+    /// Binários (não marcos) por estado: um item com dois binários conta 2.
+    pub fn binaries(&self, state: RunState) -> usize {
+        self.runs.iter().filter(|row| row.group != Group::Milestone && row.state == state).map(|row| row.binaries.len()).sum()
     }
 
-    /// Componentes que um teste cobre (índices em `components`).
-    pub fn covered_by(&self, test: usize) -> Vec<&ComponentRow> {
-        self.components.iter().filter(|row| row.tests.contains(&test)).collect()
-    }
-
-    /// (prontos, parciais, planejados) somando todos os subsistemas.
-    pub fn module_totals(&self) -> (usize, usize, usize) {
-        let done = self.subsystems.iter().map(|row| row.done).sum();
-        let partial = self.subsystems.iter().map(|row| row.partial).sum();
-        let planned = self.subsystems.iter().map(|row| row.planned).sum();
-        (done, partial, planned)
-    }
-
-    pub fn tests_found(&self) -> usize {
-        self.tests.iter().filter(|test| test.location.is_some()).count()
+    pub fn binaries_total(&self) -> usize {
+        self.runs.iter().filter(|row| row.group != Group::Milestone).map(|row| row.binaries.len()).sum()
     }
 }
 
-// ---- montagem ------------------------------------------------------------------
+// ---- montagem -----------------------------------------------------------------
 
 fn parse_options(arguments: &[String]) -> Result<Option<PathBuf>, String> {
     let mut reference = None;
@@ -301,9 +296,8 @@ fn parse_options(arguments: &[String]) -> Result<Option<PathBuf>, String> {
 fn export_report(reference: &sources::Reference, opennt_exports: &[String]) -> ExportReport {
     let opennt: BTreeSet<&str> = opennt_exports.iter().map(String::as_str).collect();
     let names: BTreeSet<&str> = reference.exports.iter().map(|export| export.name.as_str()).collect();
-
     let mut rows = Vec::new();
-    let mut tallies: BTreeMap<&'static str, Tally> = BTreeMap::new();
+    let mut tallies: std::collections::BTreeMap<&'static str, Tally> = std::collections::BTreeMap::new();
     let mut total = Tally::default();
     for export in &reference.exports {
         let bucket = bucket(&export.name);
@@ -318,199 +312,97 @@ fn export_report(reference: &sources::Reference, opennt_exports: &[String]) -> E
         rows.push(ExportRow { name: export.name.clone(), data: export.data, bucket, opennt: covered });
     }
     let buckets = BUCKETS.iter().map(|name| (*name, tallies.remove(name).unwrap_or_default())).collect();
-    ExportReport {
-        file_version: reference.file_version.clone(),
-        unnamed: reference.unnamed,
-        rows,
-        buckets,
-        total,
-        opennt_extra: opennt_exports.iter().filter(|name| !names.contains(name.as_str())).cloned().collect(),
-    }
+    let mut opennt_extra: Vec<String> = opennt_exports.iter().filter(|name| !names.contains(name.as_str())).cloned().collect();
+    opennt_extra.sort();
+    ExportReport { file_version: reference.file_version.clone(), rows, buckets, total, opennt_extra }
 }
 
-/// (pasta-pai, nome) do módulo Rust, com `mod.rs` no lugar da pasta.
-fn rust_module_key(path: &str) -> Option<(String, String)> {
-    let mut parts: Vec<&str> = path.split('/').collect();
-    let file = parts.pop()?;
-    let stem = file.strip_suffix(".rs").unwrap_or(file);
-    if stem == "mod" || stem == "lib" || stem == "main" {
-        let module = parts.pop()?;
-        let parent = parts.pop().unwrap_or("");
-        return Some((parent.to_string(), module.to_string()));
-    }
-    Some((parts.pop().unwrap_or("").to_string(), stem.to_string()))
+fn flag(entry: &toml::Table, key: &str) -> bool {
+    matches!(entry.get(key), Some(toml::Value::Bool(true)))
 }
 
-fn referenced_by_tests(path: &str, references: &[Vec<String>]) -> bool {
-    let Some((parent, module)) = rust_module_key(path) else { return false };
-    references
-        .iter()
-        .any(|segments| segments.windows(2).any(|pair| pair[0] == parent && pair[1] == module))
-}
-
-/// Quem usa os autotestes. Um grupo de exports (um `pub mod` num
-/// `exports.rs`) conta quando um autoteste chama pelo nome pelo menos um dos
-/// seus exports, como a fase 6 faz com `call_export`, ou cita o submódulo do
-/// grupo pelo caminho; citar só o `exports.rs` não marca todos os grupos do
-/// arquivo. Os demais módulos (e um módulo que é o arquivo inteiro) contam
-/// quando um teste cita o seu caminho Rust.
-fn used_by_tests(root: &Path, path: &str, module: &str, references: &[Vec<String>], export_calls: &BTreeSet<String>) -> bool {
-    if path.ends_with("/exports.rs") {
-        if let Some(names) = sources::group_export_names(root, path, module) {
-            let submodule = format!("{module}_exports");
-            return names.iter().any(|name| export_calls.contains(name))
-                || references
-                    .iter()
-                    .any(|segments| segments.windows(2).any(|pair| pair[0] == "exports" && (pair[1] == module || pair[1] == submodule)));
-        }
-    }
-    referenced_by_tests(path, references)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn subsystem_rows(
-    document: &toml::Document,
-    plan: &[sources::PlannedModule],
-    index: &RustIndex,
-    root: &Path,
-    test_refs: &[Vec<String>],
-    export_calls: &BTreeSet<String>,
-    test_dirs: &[String],
-    warnings: &mut Vec<String>,
-) -> Vec<SubsystemRow> {
-    let aliases = document.table("correspondencias").cloned().unwrap_or_default();
-    let partial = document.table("parciais").cloned().unwrap_or_default();
-    let outside = document.table("fora_do_escopo").cloned().unwrap_or_default();
-
-    let mut by_folder: BTreeMap<String, Vec<ModuleRow>> = BTreeMap::new();
-    for module in plan {
-        let folder = module.path.rsplit_once('/').map(|(folder, _)| folder.to_string()).unwrap_or_default();
-        let rust = match aliases.string(&module.path) {
-            Some("") => None,
-            Some(path) => {
-                if index.files.contains(path) {
-                    Some(path.to_string())
-                } else {
-                    warnings.push(format!("correspondencias: {} -> {path} nao existe", module.path));
-                    None
-                }
-            }
-            None if module.path.starts_with("ntos/test/") => index.find_test(&module.path, test_dirs).map(String::from),
-            None => index.find(&module.path).map(String::from),
-        };
-        let (state, note) = if let Some(reason) = outside.string(&module.path) {
-            (ModuleState::OutOfScope, reason)
-        } else if rust.is_none() {
-            (ModuleState::Pending, "")
-        } else if let Some(reason) = partial.string(&module.path) {
-            (ModuleState::Partial, reason)
-        } else {
-            (ModuleState::Done, "")
-        };
-        let stem = module.path.rsplit('/').next().unwrap_or("");
-        let tested = folder != "ntos/test" && rust.as_deref().is_some_and(|path| used_by_tests(root, path, stem, test_refs, export_calls));
-        by_folder.entry(folder).or_default().push(ModuleRow {
-            name: module.path.clone(),
-            rust,
-            state,
-            tested,
-            note: note.to_string(),
-        });
-    }
-    for table in [&aliases, &partial, &outside] {
-        for (key, _) in &table.entries {
-            if !plan.iter().any(|module| &module.path == key) {
-                warnings.push(format!("components.toml cita modulo planejado inexistente: {key}"));
-            }
-        }
-    }
-
-    let summarize = |mut modules: Vec<ModuleRow>, entry: Option<&toml::Table>, folder: &str| {
-        modules.sort_by(|left, right| left.name.cmp(&right.name));
-        let scope: Vec<&ModuleRow> = modules.iter().filter(|module| module.state != ModuleState::OutOfScope).collect();
-        let text = |key: &str| entry.and_then(|table| table.string(key)).unwrap_or_default().to_string();
-        SubsystemRow {
-            folder: folder.to_string(),
-            name: if entry.is_some() { text("nome") } else { folder.to_string() },
-            description: text("descricao"),
-            icon: entry.and_then(|table| table.string("icone")).unwrap_or("cube").to_string(),
-            phase: text("fase"),
-            notes: text("notas"),
-            is_tests: folder == "ntos/test",
-            planned: scope.len(),
-            done: scope.iter().filter(|module| module.state == ModuleState::Done).count(),
-            partial: scope.iter().filter(|module| module.state == ModuleState::Partial).count(),
-            modules,
-        }
+/// A captura de um teste, se o `cargo xtask capturas` já a gravou.
+fn load_capture(root: &Path, id: &str, warnings: &mut Vec<String>) -> Option<Capture> {
+    let file = format!("{CAPTURES}/{id}.png");
+    let bytes = fs::read(root.join(SITE_DIR).join(&file)).ok()?;
+    let Some(info) = crate::png::read_info(&bytes) else {
+        warnings.push(format!("{SITE_DIR}/{file}: PNG ilegivel"));
+        return None;
     };
+    Some(Capture {
+        width: info.width,
+        height: info.height,
+        date: info.text("opennt-data").unwrap_or_default().to_string(),
+        result: info.text("opennt-resultado").unwrap_or_default().to_string(),
+        serial: info.text("opennt-serial").unwrap_or_default().trim_end().to_string(),
+        file,
+    })
+}
 
-    let mut rows = Vec::new();
-    for entry in document.array("subsistema") {
-        let folder = entry.string("pasta").unwrap_or_default().to_string();
-        let Some(modules) = by_folder.remove(&folder) else {
-            warnings.push(format!("subsistema {folder}: nenhum modulo planejado nessa pasta"));
+fn test_rows(document: &toml::Document, root: &Path, rust: &[(String, String)], warnings: &mut Vec<String>) -> Vec<TestRow> {
+    let mut rows: Vec<TestRow> = Vec::new();
+    for entry in document.array("teste") {
+        let id = entry.string("id").unwrap_or_default().to_string();
+        if rows.iter().any(|row| row.id == id) {
+            warnings.push(format!("[[teste]] repetido: {id}"));
             continue;
-        };
-        rows.push(summarize(modules, Some(entry), &folder));
-    }
-    for (folder, modules) in by_folder {
-        warnings.push(format!("pasta sem [[subsistema]] em components.toml: {folder}"));
-        rows.push(summarize(modules, None, &folder));
+        }
+        let marker = entry.string("marcador").unwrap_or_default().to_string();
+        let location = sources::find_marker(rust, &marker).map(String::from);
+        if location.is_none() {
+            warnings.push(format!("teste {id}: o marcador {marker} nao aparece nas fontes Rust"));
+        }
+        let capture = load_capture(root, &id, warnings);
+        let expected_failure = flag(entry, "espera_falha");
+        match &capture {
+            None => warnings.push(format!("teste {id}: sem captura (cargo xtask capturas --only {id})")),
+            Some(capture) if !capture.passed() && !expected_failure => {
+                warnings.push(format!("teste {id}: a captura de {} registrou falha: {}", capture.date, capture.result))
+            }
+            _ => {}
+        }
+        rows.push(TestRow {
+            title: entry.string("titulo").unwrap_or_default().into(),
+            command: entry.string("comando").unwrap_or_default().into(),
+            description: entry.string("descricao").unwrap_or_default().into(),
+            expected_failure,
+            covered_by_suite: flag(entry, "coberto_pela_suite"),
+            location,
+            capture,
+            marker,
+            id,
+        });
     }
     rows
 }
 
-fn test_rows(document: &toml::Document, root: &Path, rust_dirs: &[String], warnings: &mut Vec<String>) -> Vec<TestRow> {
-    document
-        .array("teste")
-        .iter()
-        .map(|entry| {
-            let marker = entry.string("marcador").unwrap_or_default().to_string();
-            let location = sources::find_marker(root, rust_dirs, &marker).unwrap_or(None);
-            if location.is_none() {
-                warnings.push(format!("marcador {marker} nao aparece nas fontes Rust"));
-            }
-            TestRow {
-                id: entry.string("id").unwrap_or_default().into(),
-                title: entry.string("titulo").unwrap_or_default().into(),
-                command: entry.string("comando").unwrap_or_default().into(),
-                description: entry.string("descricao").unwrap_or_default().into(),
-                location,
-                marker,
-            }
-        })
-        .collect()
+fn test_indexes(owner: &str, ids: &[String], tests: &[TestRow], warnings: &mut Vec<String>) -> Vec<usize> {
+    let mut indexes = Vec::new();
+    for id in ids {
+        match tests.iter().position(|test| &test.id == id) {
+            Some(index) => indexes.push(index),
+            None => warnings.push(format!("{owner}: teste desconhecido: {id}")),
+        }
+    }
+    indexes
 }
 
 fn component_rows(document: &toml::Document, root: &Path, tests: &[TestRow], warnings: &mut Vec<String>) -> Vec<ComponentRow> {
-    let category_icons = document.table("icones_categoria").cloned().unwrap_or_default();
     let mut rows = Vec::new();
     for entry in document.array("componente") {
         let name = entry.string("nome").unwrap_or_default().to_string();
-        let category = entry.string("categoria").unwrap_or("Outros").to_string();
-        let paths: Vec<PathRef> = entry
-            .strings("caminhos")
-            .into_iter()
-            .map(|path| {
-                let exists = root.join(&path).exists();
-                if !exists {
-                    warnings.push(format!("{name}: caminho inexistente: {path}"));
-                }
-                PathRef { path, exists }
-            })
-            .collect();
-        let mut test_indexes = Vec::new();
-        for id in entry.strings("testes") {
-            match tests.iter().position(|test| test.id == id) {
-                Some(index) => test_indexes.push(index),
-                None => warnings.push(format!("{name}: teste desconhecido: {id}")),
+        let paths = entry.strings("caminhos");
+        for path in &paths {
+            if !root.join(path).exists() {
+                warnings.push(format!("{name}: caminho inexistente: {path}"));
             }
         }
-        let tested = test_indexes.iter().any(|&index| tests[index].location.is_some());
-        let declared = entry.string("estado").unwrap_or("planejado");
-        let state = match declared {
+        let indexes = test_indexes(&name, &entry.strings("testes"), tests, warnings);
+        let tested = indexes.iter().any(|&index| tests[index].location.is_some());
+        let declared = entry.string("estado").unwrap_or("planejado").to_string();
+        let state = match declared.as_str() {
             "implementado" if tested => State::Works,
-            "implementado" | "em desenvolvimento" => State::InDevelopment,
+            "implementado" | "em desenvolvimento" => State::Partial,
             "planejado" => State::Planned,
             "fora" => State::OutOfScope,
             other => {
@@ -518,65 +410,173 @@ fn component_rows(document: &toml::Document, root: &Path, tests: &[TestRow], war
                 State::Planned
             }
         };
-        if matches!(state, State::Works | State::InDevelopment) && paths.is_empty() {
-            warnings.push(format!("{name}: estado {declared} sem caminhos no repositorio"));
-        }
-        let icon = entry
-            .string("icone")
-            .or_else(|| category_icons.string(&category))
-            .unwrap_or("cube")
-            .to_string();
         rows.push(ComponentRow {
+            category: entry.string("categoria").unwrap_or("Outros").into(),
             description: entry.string("descricao").unwrap_or_default().into(),
             phase: entry.string("fase").unwrap_or_default().into(),
             notes: entry.string("notas").unwrap_or_default().into(),
+            tests: indexes,
+            declared,
             state,
             paths,
-            tests: test_indexes,
             name,
-            category,
-            icon,
         });
     }
     rows
 }
 
-/// Categorias na ordem da primeira aparição, com descrição e ícone do
-/// `components.toml`.
-fn category_rows(document: &toml::Document, components: &[ComponentRow], warnings: &mut Vec<String>) -> Vec<CategoryRow> {
-    let icons = document.table("icones_categoria").cloned().unwrap_or_default();
+/// Os nomes de binário de um texto (`ci.dll (Code Integrity)`, `ntdll.dll,
+/// KERNEL32 e KERNELBASE`): as palavras com extensão .sys/.dll/.exe e as
+/// palavras em caixa alta com dígito ou de seis letras ou mais.
+pub fn binary_names(text: &str) -> Vec<String> {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_' || character == '.'))
+        .map(|word| word.trim_matches('.'))
+        .filter(|word| {
+            let lower = word.to_ascii_lowercase();
+            [".sys", ".dll", ".exe"].iter().any(|extension| lower.ends_with(extension))
+                || (word.len() >= 6 && word.chars().all(|character| character.is_ascii_uppercase() || character.is_ascii_digit()))
+        })
+        .map(String::from)
+        .collect()
+}
+
+fn stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    lower.rsplit_once('.').map_or(lower.clone(), |(stem, _)| stem.to_string())
+}
+
+/// Os itens da página O que roda, com o estado derivado dos testes e dos
+/// componentes (ver o comentário de `[[roda]]` no `components.toml`).
+fn run_rows(document: &toml::Document, tests: &[TestRow], components: &[ComponentRow], warnings: &mut Vec<String>) -> Vec<RunRow> {
+    let mut rows = Vec::new();
+    for entry in document.array("roda") {
+        let name = entry.string("nome").unwrap_or_default().to_string();
+        let group = match entry.string("grupo").unwrap_or_default() {
+            "marco" => Group::Milestone,
+            "driver" => Group::Driver,
+            "programa" => Group::Program,
+            other => {
+                warnings.push(format!("roda {name}: grupo desconhecido: {other:?} (marco, driver ou programa)"));
+                Group::Driver
+            }
+        };
+        let binaries = if group == Group::Milestone { Vec::new() } else { binary_names(&name) };
+        if group != Group::Milestone && binaries.is_empty() {
+            warnings.push(format!("roda {name}: nenhum binario (.sys, .dll, .exe) no nome"));
+        }
+        let indexes = test_indexes(&format!("roda {name}"), &entry.strings("teste"), tests, warnings);
+        let stems: Vec<String> = binaries.iter().map(|binary| stem(binary)).collect();
+        // Os componentes de binários do Windows que citam um destes binários.
+        let linked: Vec<&ComponentRow> = components
+            .iter()
+            .filter(|component| WINDOWS_CATEGORIES.contains(&component.category.as_str()))
+            .filter(|component| binary_names(&component.name).iter().any(|binary| stems.contains(&stem(binary))))
+            .collect();
+        let (derived, reason) = if indexes.is_empty() {
+            (RunState::DoesNotRun, "sem teste automático".to_string())
+        } else if let Some(&index) = indexes.iter().find(|&&index| tests[index].expected_failure) {
+            (RunState::Partial, format!("o teste {} é uma falha conhecida", tests[index].id))
+        } else if let Some(component) = linked.iter().find(|component| component.declared != "implementado") {
+            (RunState::Partial, format!("o componente {} está {}", component.name, component.declared))
+        } else {
+            (RunState::Runs, format!("o teste {} passa", tests[indexes[0]].id))
+        };
+        let (state, reason) = match entry.string("estado") {
+            None => (derived, reason),
+            Some(text) => {
+                let state = match text {
+                    "roda" => RunState::Runs,
+                    "parcial" => RunState::Partial,
+                    "nao roda" | "não roda" => RunState::DoesNotRun,
+                    other => {
+                        warnings.push(format!("roda {name}: estado desconhecido: {other}"));
+                        derived
+                    }
+                };
+                if state == derived {
+                    warnings.push(format!("roda {name}: estado = {text:?} repete o que os dados ja dizem; tire o campo"));
+                }
+                (state, "declarado à mão no components.toml (os dados não bastam)".to_string())
+            }
+        };
+        let stops = entry.string("para").unwrap_or_default().to_string();
+        if state == RunState::Partial && stops.is_empty() {
+            warnings.push(format!("roda {name}: parcial sem `para` (onde ele para)"));
+        }
+        rows.push(RunRow {
+            does: entry.string("faz").unwrap_or_default().to_string(),
+            tests: indexes,
+            name,
+            group,
+            binaries,
+            state,
+            reason,
+            stops,
+        });
+    }
+    // Todo binário citado num componente do Windows que um teste exercita
+    // aparece na página.
+    let listed: BTreeSet<String> = rows.iter().flat_map(|row| row.binaries.iter().map(|binary| stem(binary))).collect();
+    for component in components.iter().filter(|component| WINDOWS_CATEGORIES.contains(&component.category.as_str())) {
+        for binary in binary_names(&component.name) {
+            if !listed.contains(&stem(&binary)) && !component.tests.is_empty() {
+                warnings.push(format!("{binary} (componente {}) sem [[roda]]", component.name));
+            }
+        }
+    }
+    rows
+}
+
+/// Categorias na ordem da primeira aparição.
+fn category_rows(document: &toml::Document, components: &[ComponentRow]) -> Vec<CategoryRow> {
     let descriptions = document.table("descricoes_categoria").cloned().unwrap_or_default();
     let mut rows: Vec<CategoryRow> = Vec::new();
     for component in components {
-        if rows.iter().any(|row| row.name == component.category) {
-            continue;
+        if !rows.iter().any(|row| row.name == component.category) {
+            rows.push(CategoryRow {
+                name: component.category.clone(),
+                description: descriptions.string(&component.category).unwrap_or_default().to_string(),
+            });
         }
-        let description = descriptions.string(&component.category).unwrap_or_default().to_string();
-        if description.is_empty() {
-            warnings.push(format!("categoria sem texto em [descricoes_categoria]: {}", component.category));
-        }
-        rows.push(CategoryRow {
-            name: component.category.clone(),
-            description,
-            icon: icons.string(&component.category).unwrap_or("cube").to_string(),
-        });
     }
     rows
 }
 
-/// Apaga páginas geradas que esta geração não produziu mais (por exemplo, o
-/// grupo de exports que ficou vazio), para não deixar links velhos.
-fn remove_stale_pages(root: &Path, written: &BTreeSet<String>) -> Result<(), String> {
+/// O marco do `[marco]`; sem ele, as fases em andamento e a próxima.
+fn milestone(document: &toml::Document, phases: &[PhaseRow], tests: &[TestRow], warnings: &mut Vec<String>) -> Milestone {
+    let table = document.table("marco").cloned().unwrap_or_default();
+    let test = table.string("teste").and_then(|id| {
+        let found = tests.iter().position(|test| test.id == id);
+        if found.is_none() {
+            warnings.push(format!("[marco]: teste desconhecido: {id}"));
+        }
+        found
+    });
+    let describe = |phase: &PhaseRow| format!("Fase {} — {}: {}", phase.number, phase.name, phase.scope);
+    let current = table.string("atual").map(String::from).unwrap_or_else(|| {
+        phases.iter().filter(|phase| phase.state == "em andamento").map(describe).collect::<Vec<_>>().join(" ")
+    });
+    let next = table.string("proximo").map(String::from).unwrap_or_else(|| {
+        phases.iter().find(|phase| phase.state.starts_with("planejad")).map(describe).unwrap_or_default()
+    });
+    Milestone { current, next, test }
+}
+
+/// Apaga as páginas de `docs/site/` que esta geração não produziu (o
+/// conjunto antigo), sem tocar nas capturas.
+fn remove_stale_pages(root: &Path, written: &BTreeSet<String>) -> Result<Vec<String>, String> {
     let directory = root.join(SITE_DIR);
-    let Ok(entries) = fs::read_dir(&directory) else { return Ok(()) };
+    let mut removed = Vec::new();
+    let Ok(entries) = fs::read_dir(&directory) else { return Ok(removed) };
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let generated = name.starts_with("ntoskrnl-") && name.ends_with(".html");
-        if generated && !written.contains(&name) {
+        if name.ends_with(".html") && !written.contains(&name) {
             fs::remove_file(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            removed.push(name);
         }
     }
-    Ok(())
+    removed.sort();
+    Ok(removed)
 }
 
 fn write(root: &Path, relative: &str, text: &str) -> Result<(), String> {
@@ -590,30 +590,21 @@ fn write(root: &Path, relative: &str, text: &str) -> Result<(), String> {
 pub fn run(arguments: &[String]) -> Result<(), String> {
     let reference_path = parse_options(arguments)?;
     let root = crate::build::workspace_root();
-
-    let document_text =
-        fs::read_to_string(root.join(COMPONENTS)).map_err(|error| format!("{COMPONENTS}: {error}"))?;
-    let document = toml::parse(&document_text).map_err(|error| format!("{COMPONENTS}: {error}"))?;
-    let sources_table = document.table("fontes").cloned().unwrap_or_default();
-    let mut rust_dirs = sources_table.strings("rust");
+    let text = fs::read_to_string(root.join(COMPONENTS)).map_err(|error| format!("{COMPONENTS}: {error}"))?;
+    let document = toml::parse(&text).map_err(|error| format!("{COMPONENTS}: {error}"))?;
+    let mut rust_dirs = document.table("fontes").map(|table| table.strings("rust")).unwrap_or_default();
     if rust_dirs.is_empty() {
         rust_dirs.push("kernel/src".into());
     }
-    let test_dirs = sources_table.strings("testes");
-
     let reference = sources::load_reference(&root, reference_path.as_deref())?;
-    let plan = sources::load_plan(&root)?;
-    let opennt = sources::opennt_exports();
-    let index = RustIndex::build(&root, &rust_dirs)?;
-    let test_refs = sources::test_references(&root, &test_dirs)?;
-    let export_calls = sources::test_export_calls(&root, &test_dirs)?;
+    let rust = sources::rust_sources(&root, &rust_dirs)?;
 
     let mut warnings = Vec::new();
-    let subsystems = subsystem_rows(&document, &plan, &index, &root, &test_refs, &export_calls, &test_dirs, &mut warnings);
-    let tests = test_rows(&document, &root, &rust_dirs, &mut warnings);
+    let tests = test_rows(&document, &root, &rust, &mut warnings);
     let components = component_rows(&document, &root, &tests, &mut warnings);
-    let categories = category_rows(&document, &components, &mut warnings);
-    let phases = document
+    let categories = category_rows(&document, &components);
+    let runs = run_rows(&document, &tests, &components, &mut warnings);
+    let phases: Vec<PhaseRow> = document
         .array("fase")
         .iter()
         .map(|entry| PhaseRow {
@@ -623,14 +614,24 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             scope: entry.string("escopo").unwrap_or_default().into(),
         })
         .collect();
+    let milestone = milestone(&document, &phases, &tests, &mut warnings);
+    // O marcador da suíte (a primeira palavra) e as saídas esperadas dela.
+    let suite_markers = crate::test_all::SUITE
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| if index == 0 { Some(*word) } else { word.strip_prefix("--expect=") })
+        .map(String::from)
+        .collect();
 
     let report = Report {
-        exports: export_report(&reference, &opennt),
-        subsystems,
+        exports: export_report(&reference, &sources::opennt_exports()),
+        runs,
         components,
         categories,
         tests,
         phases,
+        milestone,
+        suite_markers,
         warnings,
     };
 
@@ -646,24 +647,26 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         };
         write(&root, &relative, &text)?;
     }
-    remove_stale_pages(&root, &pages)?;
+    let removed = remove_stale_pages(&root, &pages)?;
     for warning in &report.warnings {
         eprintln!("aviso: {warning}");
     }
+    if !removed.is_empty() {
+        println!("paginas antigas apagadas: {}", removed.join(", "));
+    }
     let total = &report.exports.total;
-    let (done, partial, planned) = report.module_totals();
+    let captures = report.tests.iter().filter(|test| test.capture.is_some()).count();
     println!(
-        "OK: {SITE_DIR}/ ({} paginas), {STATUS_DIR}/ e docs/ROADMAP.md  (ntoskrnl {}: OpenNT exporta {}, faltam {}; \
-         componentes: {} funcionam de {}; modulos com codigo: {} completos + {} parciais de {})",
+        "OK: {SITE_DIR}/ ({} paginas), {STATUS_DIR}/*.svg e docs/ROADMAP.md  (binarios da Microsoft: {} rodam, {} parciais, \
+         {} nao rodam; ntoskrnl {}: OpenNT exporta {}; testes: {}, {} com captura)",
         pages.len(),
+        report.binaries(RunState::Runs),
+        report.binaries(RunState::Partial),
+        report.binaries(RunState::DoesNotRun),
         total.reference,
         total.opennt,
-        total.missing(),
-        report.count(State::Works),
-        report.components.len(),
-        done,
-        partial,
-        planned
+        report.tests.len(),
+        captures
     );
     Ok(())
 }

@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use crate::build;
 use plan::{Run, Suites, Test};
+pub use plan::{SUITE, SUITE_CPUS};
 use report::{Outcome, Verdict};
 
 pub const USAGE: &str = "uso: cargo xtask test-all [opcoes]
