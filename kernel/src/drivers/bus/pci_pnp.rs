@@ -10,7 +10,8 @@
 //!   D3 nos demais estados, sem wake, sem UniqueID.
 //! - QUERY_RESOURCE_REQUIREMENTS e QUERY_RESOURCES: os BARs (o valor que o
 //!   firmware programou como opção preferida e, como alternativa, qualquer
-//!   posição alinhada de 16/32 bits) e a IRQ de linha, compartilhável e por
+//!   posição alinhada de 16/32 bits; um BAR de memória pré-buscável leva
+//!   CM_RESOURCE_MEMORY_PREFETCHABLE) e a IRQ de linha, compartilhável e por
 //!   nível, se a função tem pino de interrupção. Numa controladora IDE em
 //!   modo de compatibilidade (prog-if com os bits 0/2 limpos) os BARs 0..3
 //!   do canal legado não são decodificados e ficam de fora: as portas e IRQs
@@ -56,10 +57,11 @@ const PCI_BUS: i32 = 5;
 /// IO_RESOURCE_DESCRIPTOR.Option.
 const IO_RESOURCE_PREFERRED: u8 = 1;
 const IO_RESOURCE_ALTERNATIVE: u8 = 8;
-/// CM_RESOURCE_PORT_IO, CM_RESOURCE_MEMORY_READ_WRITE e
-/// CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE.
+/// CM_RESOURCE_PORT_IO, CM_RESOURCE_MEMORY_READ_WRITE,
+/// CM_RESOURCE_MEMORY_PREFETCHABLE e CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE.
 const PORT_IO: u16 = 1;
 const MEMORY_READ_WRITE: u16 = 0;
+const MEMORY_PREFETCHABLE: u16 = 4;
 const INTERRUPT_LEVEL_SENSITIVE: u16 = 0;
 /// PCI_WHICHSPACE_CONFIG.
 const PCI_WHICHSPACE_CONFIG: u32 = 0;
@@ -140,6 +142,18 @@ fn decoded_bars(function: &PciFunction) -> Vec<super::pci::Bar> {
     function.bars.iter().copied().filter(|bar| !((bar.index < 2 && legacy_ide_channel(function, 0)) || ((2..4).contains(&bar.index) && legacy_ide_channel(function, 1)))).collect()
 }
 
+/// Flags do descritor de um BAR: porta de I/O, ou memória com o bit
+/// pré-buscável (bit 3 do BAR) como CM_RESOURCE_MEMORY_PREFETCHABLE.
+fn bar_flags(bar: &super::pci::Bar) -> u16 {
+    if bar.value & 1 != 0 {
+        PORT_IO
+    } else if bar.value & 0x8 != 0 {
+        MEMORY_READ_WRITE | MEMORY_PREFETCHABLE
+    } else {
+        MEMORY_READ_WRITE
+    }
+}
+
 fn bar_start(bar: &super::pci::Bar) -> u64 {
     if bar.value & 1 != 0 {
         (bar.value & 0xFFFF_FFFC) as u64
@@ -155,7 +169,7 @@ pub fn current_resources(function: &PciFunction) -> CmList {
     let mut resources = Vec::new();
     for bar in decoded_bars(function).iter().filter(|bar| bar.size != 0) {
         let io = bar.value & 1 != 0;
-        resources.push(Resource { resource_type: if io { resource_type::PORT } else { resource_type::MEMORY }, share: SHARE_DEVICE_EXCLUSIVE, flags: if io { PORT_IO } else { MEMORY_READ_WRITE }, start: bar_start(bar), length: bar.size, extra: [0; 3] });
+        resources.push(Resource { resource_type: if io { resource_type::PORT } else { resource_type::MEMORY }, share: SHARE_DEVICE_EXCLUSIVE, flags: bar_flags(bar), start: bar_start(bar), length: bar.size, extra: [0; 3] });
     }
     if function.interrupt_pin != 0 && function.irq_line != 0 {
         resources.push(Resource { resource_type: resource_type::INTERRUPT, share: SHARE_SHARED, flags: INTERRUPT_LEVEL_SENSITIVE, start: function.irq_line as u64, length: function.irq_line, extra: [u32::MAX, u32::MAX, 0] });
@@ -181,7 +195,7 @@ fn requirements_list(function: &PciFunction) -> u64 {
     let mut entries: Vec<Entry> = Vec::new();
     for bar in decoded_bars(function).iter().filter(|bar| bar.size != 0) {
         let io = bar.value & 1 != 0;
-        let (resource, flags) = if io { (resource_type::PORT, PORT_IO) } else { (resource_type::MEMORY, MEMORY_READ_WRITE) };
+        let (resource, flags) = (if io { resource_type::PORT } else { resource_type::MEMORY }, bar_flags(bar));
         let start = bar_start(bar);
         let limit = if io { 0xFFFF } else if bar.memory64 { u64::MAX } else { 0xFFFF_FFFF };
         entries.push(Entry { option: IO_RESOURCE_PREFERRED, resource_type: resource, share: SHARE_DEVICE_EXCLUSIVE, flags, length: bar.size, alignment: bar.size, minimum: start, maximum: start + bar.size as u64 - 1 });

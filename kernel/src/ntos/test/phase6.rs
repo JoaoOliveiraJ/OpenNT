@@ -2110,7 +2110,8 @@ fn process_information_and_driver_services(assert: Assert) {
     // Caminhos instalados de drivers.
     let configuration = |path: &str| service_database::Configuration { name: alloc::string::String::from("x"), display_name: alloc::string::String::new(), image_path: alloc::string::String::from(path), service_type: 1, start: 3, error_control: 1, object_name: alloc::string::String::new(), dependencies: alloc::vec::Vec::new() };
     assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\Drivers\\a.sys")).is_ok_and(|path| path == "/a.sys") && driver_services::image_path(&configuration("\"C:\\Windows\\System32\\Drivers\\b.sys\"")).is_ok_and(|path| path == "/b.sys") && driver_services::image_path(&configuration("system32\\drivers\\c.sys")).is_ok_and(|path| path == "/c.sys"), "drvsvc: caminhos de System32\\Drivers normalizados (o relativo e relativo a \\SystemRoot)");
-    assert(driver_services::image_path(&configuration("D:\\d.sys")).is_err_and(|error| error.win32 == 3) && driver_services::image_path(&configuration("a\\..\\b.sys")).is_err_and(|error| error.win32 == 123), "drvsvc: unidade indisponivel e travessia recusadas");
+    assert(driver_services::image_path(&configuration("\\SystemRoot\\System32\\DriverStore\\FileRepository\\x.inf_amd64_1\\X.sys")).is_ok_and(|path| path == "/Windows/System32/DriverStore/FileRepository/x.inf_amd64_1/X.sys"), "drvsvc: o resto do \\SystemRoot (repositorio de drivers) fica sob \\NTFS\\Windows");
+    assert(driver_services::image_path(&configuration("D:\\d.sys")).is_err_and(|error| error.win32 == 3) &&driver_services::image_path(&configuration("a\\..\\b.sys")).is_err_and(|error| error.win32 == 123), "drvsvc: unidade indisponivel e travessia recusadas");
     // Serviço de driver real: start/stop e ZwLoadDriver/ZwUnloadDriver.
     let counter = guest::alloc_bytes(8);
     let entry = [0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00, 0x48, 0x89, 0x41, 0x68, 0x31, 0xC0, 0xC3];

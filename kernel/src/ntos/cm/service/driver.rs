@@ -80,6 +80,10 @@ pub fn image_path(configuration: &Configuration) -> Result<String, DriverService
         String::from(rest)
     } else if let Some(rest) = strip_prefix_ci(&path, "C:\\Windows\\System32\\Drivers\\") {
         String::from(rest)
+    } else if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\") {
+        // O resto da instalação (o repositório de drivers em
+        // System32\DriverStore) fica onde o \SystemRoot aponta: \NTFS\Windows.
+        format!("Windows\\{rest}")
     } else if let Some(rest) = strip_prefix_ci(&path, "C:\\") {
         String::from(rest)
     } else if (path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':') || path.starts_with('\\') {

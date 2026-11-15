@@ -40,6 +40,14 @@
 //! Type, Start, ErrorControl e DisplayName (quando há), sem ImagePath, como
 //! na instalação.
 //!
+//! O driver de vídeo básico (BasicDisplay, Start 1 e Group "Video" na
+//! instalação) também fica sob demanda: o PnP o carrega quando instala o
+//! adaptador VGA pelo display.inf (`--display=basic`). A chave tem o
+//! ImagePath da instalação, no repositório de drivers
+//! (System32\DriverStore\FileRepository\basicdisplay.inf_amd64_...), os
+//! Owners (display.inf e basicdisplay.inf) e o Parameters\SingleDeviceInstall
+//! que o AddReg do basicdisplay.inf grava.
+//!
 //! O CLFS (clfs.sys, Start 0 e Group "Filter" na instalação) fica sob
 //! demanda como os outros: ele sobe como dependência de import do ntfs.sys,
 //! e o DriverEntry dele lê Parameters (EventLogLevel, FlushThreshold e
@@ -113,12 +121,24 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
     InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\Wdf01000.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
     InboxDriver { name: "msisadrv", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\msisadrv.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
+    InboxDriver {
+        name: "BasicDisplay",
+        display_name: None,
+        service_type: SERVICE_KERNEL_DRIVER,
+        image_path: Some("\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicdisplay.inf_amd64_19e58b6267591a82\\BasicDisplay.sys"),
+        start: SERVICE_DEMAND_START,
+        error_control: 0,
+        group: "Video",
+        tag: Some(1),
+        dwords: &[],
+    },
 ];
 
 /// Dado de um valor que a instalação grava fora da chave do serviço.
 enum Installed {
     Dword(u32),
     String(&'static str),
+    Strings(&'static [&'static str]),
 }
 
 /// (chave abaixo de CurrentControlSet, valor, dado).
@@ -129,6 +149,8 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\CLFS\\Parameters", "EventLogLevel", Installed::Dword(2)),
     ("Services\\CLFS\\Parameters", "FlushThreshold", Installed::Dword(0x9C40)),
     ("Services\\CLFS\\Parameters", "MasterFilePath", Installed::String("\\SystemRoot\\System32\\config")),
+    ("Services\\BasicDisplay", "Owners", Installed::Strings(&["display.inf", "basicdisplay.inf"])),
+    ("Services\\BasicDisplay\\Parameters", "SingleDeviceInstall", Installed::Dword(1)),
 ];
 
 /// As chaves dos drivers inbox, dos file systems e os valores do KMDF.
@@ -165,6 +187,7 @@ pub fn seed_keys() -> Vec<SeedKey> {
         match data {
             Installed::Dword(value) => key.dword(name, *value),
             Installed::String(text) => key.text(name, REG_SZ, text),
+            Installed::Strings(strings) => key.strings(name, strings),
         };
         keys.push(key);
     }

@@ -3,7 +3,9 @@
 //!
 //! `DRIVERS` transcreve as linhas de modelo dos INFs do Windows desta
 //! máquina que atendem o hardware emulado (mshdc.inf, disk.inf, volume.inf,
-//! volmgr.inf), com o que cada seção de instalação grava: o serviço
+//! volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
+//! classe VGA, PCI\CC_0300, e o machine.inf, que dá o msisadrv.sys, um
+//! driver KMDF, às pontes PCI-ISA, PCI\CC_0601), com o que cada seção de instalação grava: o serviço
 //! (`[*.Services]`/`AddService`), a classe (`[Version]` e o INF da classe:
 //! c_hdc.inf, c_diskdrive.inf, c_volume.inf, a classe System), os valores
 //! da chave do driver (`AddReg` de `[DDInstall]`, HKR = Control\Class\
@@ -54,6 +56,9 @@ pub struct ServiceSpec {
     pub display_name: Option<&'static str>,
     pub start: u32,
     pub error_control: u32,
+    /// `ServiceBinary`: o arquivo em `%12%` (System32\drivers), gravado como
+    /// ImagePath relativo; ou o caminho NT inteiro de um driver que fica no
+    /// repositório de drivers (`%13%`), que o instalador grava como está.
     pub binary: &'static str,
     pub group: Option<&'static str>,
     pub owner: &'static str,
@@ -84,6 +89,9 @@ pub struct InfDriver {
     pub class: &'static ClassSpec,
     pub driver_values: &'static [RegValue],
     pub device_values: &'static [RegValue],
+    /// `ExcludeID` da seção: um dispositivo com um desses HardwareIDs ou
+    /// CompatibleIDs não instala por esta linha.
+    pub exclude_ids: &'static [&'static str],
 }
 
 pub const CLASS_HDC: ClassSpec = ClassSpec { guid: "{4d36e96a-e325-11ce-bfc1-08002be10318}", name: "hdc", upper_filters: &[], lower_filters: &[] };
@@ -91,6 +99,8 @@ pub const CLASS_HDC: ClassSpec = ClassSpec { guid: "{4d36e96a-e325-11ce-bfc1-080
 pub const CLASS_DISK_DRIVE: ClassSpec = ClassSpec { guid: "{4d36e967-e325-11ce-bfc1-08002be10318}", name: "DiskDrive", upper_filters: &["partmgr"], lower_filters: &[] };
 pub const CLASS_VOLUME: ClassSpec = ClassSpec { guid: "{71a27cdd-812a-11d0-bec7-08002be2092f}", name: "Volume", upper_filters: &[], lower_filters: &[] };
 pub const CLASS_SYSTEM: ClassSpec = ClassSpec { guid: "{4d36e97d-e325-11ce-bfc1-08002be10318}", name: "System", upper_filters: &[], lower_filters: &[] };
+/// display.inf `[Version]` (a classe Display do c_display.inf).
+pub const CLASS_DISPLAY: ClassSpec = ClassSpec { guid: "{4d36e968-e325-11ce-bfc1-08002be10318}", name: "Display", upper_filters: &[], lower_filters: &[] };
 
 /// mshdc.inf `[intelide_Service_Inst]`.
 const SERVICE_INTELIDE: ServiceSpec = ServiceSpec { name: "intelide", display_name: None, start: 0, error_control: 3, binary: "intelide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf" };
@@ -104,6 +114,23 @@ const SERVICE_DISK: ServiceSpec = ServiceSpec { name: "disk", display_name: Some
 const SERVICE_VOLUME: ServiceSpec = ServiceSpec { name: "volume", display_name: Some("@volume.inf,%VolumeServiceDesc%;Volume driver"), start: 0, error_control: 3, binary: "volume.sys", group: None, owner: "volume.inf" };
 /// volmgr.inf `[Volmgr_Service]`.
 const SERVICE_VOLMGR: ServiceSpec = ServiceSpec { name: "volmgr", display_name: Some("@volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver"), start: 0, error_control: 3, binary: "volmgr.sys", group: Some("System Bus Extender"), owner: "volmgr.inf" };
+/// machine.inf `[msisadrv_ServiceInstallSection]` (StartType
+/// SERVICE_BOOT_START, ErrorControl SERVICE_ERROR_CRITICAL; o AddReg grava o
+/// Tag 2).
+const SERVICE_MSISADRV: ServiceSpec = ServiceSpec { name: "msisadrv", display_name: None, start: 0, error_control: 3, binary: "msisadrv.sys", group: Some("Boot Bus Extender"), owner: "machine.inf" };
+/// basicdisplay.inf `[MSBDD_Fallback_Generic_Service_Inst]`, que o
+/// `[MSBDA.Services]` do display.inf inclui (`include=basicdisplay.inf`,
+/// `needs=MSBDD_Fallback.Services`): ServiceBinary `%13%\BasicDisplay.sys`,
+/// no repositório de drivers.
+const SERVICE_BASIC_DISPLAY: ServiceSpec = ServiceSpec {
+    name: "BasicDisplay",
+    display_name: None,
+    start: 1,
+    error_control: 0,
+    binary: "\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicdisplay.inf_amd64_19e58b6267591a82\\BasicDisplay.sys",
+    group: Some("Video"),
+    owner: "display.inf",
+};
 
 /// mshdc.inf `[intelChannelEnableCheck_AddReg.HW]`, referenciado pelo
 /// `AddReg` de `[intelide_Inst]` (HKR = chave do driver).
@@ -139,6 +166,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: INTEL_CHANNEL_ENABLE_CHECK,
         device_values: &[],
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "mshdc.inf",
@@ -154,6 +182,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: &[],
         device_values: &[],
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "mshdc.inf",
@@ -169,6 +198,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: ATAPI_PROPERTY_PROVIDER,
         device_values: ATAPI_HARDWARE,
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "mshdc.inf",
@@ -184,6 +214,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: ATAPI_PROPERTY_PROVIDER,
         device_values: ATAPI_HARDWARE,
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "mshdc.inf",
@@ -199,6 +230,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: ATAPI_PROPERTY_PROVIDER,
         device_values: ATAPI_HARDWARE,
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "disk.inf",
@@ -214,6 +246,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_DISK_DRIVE,
         driver_values: &[],
         device_values: &[],
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "volume.inf",
@@ -229,6 +262,7 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_VOLUME,
         driver_values: &[],
         device_values: &[],
+        exclude_ids: &[],
     },
     InfDriver {
         inf: "volmgr.inf",
@@ -244,13 +278,80 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_SYSTEM,
         driver_values: &[],
         device_values: &[],
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "display.inf",
+        section: "MSBDA",
+        id: "PCI\\CC_0300",
+        description_key: "MSBDAName",
+        description: "Microsoft Basic Display Adapter",
+        manufacturer_key: "Std",
+        manufacturer: "(Standard display types)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.3636",
+        service: Some(&SERVICE_BASIC_DISPLAY),
+        class: &CLASS_DISPLAY,
+        driver_values: &[],
+        device_values: &[],
+        exclude_ids: &["PCI\\VEN_1414&DEV_5353"],
+    },
+    InfDriver {
+        inf: "display.inf",
+        section: "MSBDA",
+        id: "PCI\\CC_0301",
+        description_key: "MSBDAName",
+        description: "Microsoft Basic Display Adapter",
+        manufacturer_key: "Std",
+        manufacturer: "(Standard display types)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.3636",
+        service: Some(&SERVICE_BASIC_DISPLAY),
+        class: &CLASS_DISPLAY,
+        driver_values: &[],
+        device_values: &[],
+        exclude_ids: &["PCI\\VEN_1414&DEV_5353"],
+    },
+    InfDriver {
+        inf: "machine.inf",
+        section: "MSISADRV",
+        id: "PCI\\CC_0601",
+        description_key: "PCI\\CC_0601_Desc",
+        description: "PCI standard ISA bridge",
+        manufacturer_key: "GENDEV_MFG",
+        manufacturer: "(Standard system devices)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.3636",
+        service: Some(&SERVICE_MSISADRV),
+        class: &CLASS_SYSTEM,
+        driver_values: &[],
+        device_values: &[],
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "machine.inf",
+        section: "MSISADRV",
+        id: "PCI\\CC_0602",
+        description_key: "PCI\\CC_0602_Desc",
+        description: "PCI standard EISA bridge",
+        manufacturer_key: "GENDEV_MFG",
+        manufacturer: "(Standard system devices)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.3636",
+        service: Some(&SERVICE_MSISADRV),
+        class: &CLASS_SYSTEM,
+        driver_values: &[],
+        device_values: &[],
+        exclude_ids: &[],
     },
 ];
 
 /// O driver de melhor posto para os ids: HardwareIDs na ordem, depois os
 /// CompatibleIDs (sem diferenciar maiúsculas).
 pub fn select_driver(hardware_ids: &[String], compatible_ids: &[String]) -> Option<&'static InfDriver> {
-    hardware_ids.iter().chain(compatible_ids.iter()).find_map(|id| DRIVERS.iter().find(|driver| driver.id.eq_ignore_ascii_case(id)))
+    let ids = || hardware_ids.iter().chain(compatible_ids.iter());
+    let excluded = |driver: &InfDriver| driver.exclude_ids.iter().any(|exclude| ids().any(|id| id.eq_ignore_ascii_case(exclude)));
+    ids().find_map(|id| DRIVERS.iter().find(|driver| driver.id.eq_ignore_ascii_case(id) && !excluded(driver)))
 }
 
 fn multi_sz(items: &[&str]) -> Vec<u8> {
@@ -311,7 +412,7 @@ pub fn install_service(service: &ServiceSpec) -> Result<(), KernelError> {
         service_type: Some(1),
         start: Some(service.start),
         error_control: Some(service.error_control),
-        image_path: Some(format!("System32\\drivers\\{}", service.binary)),
+        image_path: Some(if service.binary.starts_with('\\') { String::from(service.binary) } else { format!("System32\\drivers\\{}", service.binary) }),
         ..ConfigurationInput::default()
     };
     match service_database::install(&input, true) {

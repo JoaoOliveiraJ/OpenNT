@@ -65,7 +65,10 @@ pub fn initialize() -> Result<u64, KernelError> {
 /// Marca o PDO de um barramento interno: o próprio kernel é o driver dele
 /// (sem serviço nem AddDevice).
 pub fn mark_internal(pdo: u64) {
-    INTERNAL.lock().push(pdo);
+    let mut internal = INTERNAL.lock();
+    if !internal.contains(&pdo) {
+        internal.push(pdo);
+    }
 }
 
 static INTERNAL: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
