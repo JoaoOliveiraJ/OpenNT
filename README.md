@@ -212,7 +212,9 @@ monta a imagem do teste; com `--no-build` roda o QEMU na imagem já montada em
 O `test-all` monta as imagens uma de cada vez (`test-boot --build-only`), com
 as execuções de mesma configuração juntas, para o kernel recompilar uma vez
 por configuração e nunca haver dois builds no mesmo `target/`, e roda o QEMU
-em `--jobs=N` pistas (`test-boot --no-build`; padrão: metade das CPUs).
+em `--jobs=N` pistas (`test-boot --no-build`; padrão: metade das CPUs). Cada
+QEMU compromete toda a memória do convidado ao subir, então um QEMU só
+começa quando o commit livre do host o cobre com folga.
 Opções: `--only=ID,...`, `--skip=ID,...`, `--suite` (só as suítes,
 `suite-smp4` e `suite-smp1`) ou `--no-suite`, `--repeat=N` (cada teste N
 vezes, para caçar falhas intermitentes), `--keep` (guarda a pasta de toda

@@ -1759,7 +1759,12 @@ Sem as opções nada disso roda.
   caminho nem a cópia recompilem o kernel. `--jobs` pistas rodam o QEMU na
   imagem pronta (`test-boot --no-build`), com a saída em `test-boot.log` e a
   serial em `serial.log`; uma execução que passa do prazo do test-boot mais
-  o `--hold` e 2 minutos é morta com o QEMU. A pasta de uma execução que
+  o `--hold` e 2 minutos é morta com o QEMU. Cada QEMU compromete ao subir
+  toda a memória do convidado (uns 5 GB com `-m 4096`), e com o commit do
+  host esgotado processos morrem sem mensagem (o próprio test-all, o cargo,
+  o rustc): os QEMUs começam um de cada vez, só quando o commit livre
+  (GlobalMemoryStatusEx) cobre a memória do convidado, 1 GB do QEMU e uma
+  margem de 6 GB para o build. A pasta de uma execução que
   passou é apagada (`--keep` guarda); a de uma falha fica, com o
   `kernel.elf` para simbolizar endereços. No fim sai a tabela (teste,
   resultado, build, tempo, log) e, por falha, o motivo dado pelo test-boot, o

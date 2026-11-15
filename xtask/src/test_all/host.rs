@@ -1,9 +1,14 @@
+//! O que o test-all consulta e ajusta no host.
+//!
 //! `--cpu-friendly`: o test-all baixa a própria prioridade e tira as CPUs
 //! lógicas de número mais baixo da própria afinidade. Os processos que ele
 //! cria (o test-boot, o cargo e o rustc, o QEMU) herdam as duas coisas: no
 //! Windows, um processo criado sem classe de prioridade explícita herda a
 //! BELOW_NORMAL do pai, e a máscara de afinidade sempre passa ao filho.
 //! As funções vêm direto do kernel32, sem crate.
+//!
+//! `available_commit`: o commit livre do sistema, que o test-all confere
+//! antes de cada QEMU.
 
 /// O que ficou valendo: as CPUs que o test-all e os filhos podem usar, as
 /// que o processo tinha e a máscara nova.
@@ -61,4 +66,50 @@ pub fn cpu_friendly() -> Result<Applied, String> {
 #[cfg(not(windows))]
 pub fn cpu_friendly() -> Result<Applied, String> {
     Err("--cpu-friendly existe so no host Windows".into())
+}
+
+/// Commit que o sistema ainda aceita (o limite de commit menos o que já está
+/// comprometido), em bytes: o `ullAvailPageFile` do GlobalMemoryStatusEx.
+#[cfg(windows)]
+pub fn available_commit() -> Option<u64> {
+    /// MEMORYSTATUSEX; só o `avail_page_file` é lido.
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: a estrutura é local, com o `dwLength` preenchido.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    ok.then_some(status.avail_page_file)
+}
+
+/// Fora do Windows o test-all não confere o commit.
+#[cfg(not(windows))]
+pub fn available_commit() -> Option<u64> {
+    None
 }

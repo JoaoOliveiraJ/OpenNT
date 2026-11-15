@@ -14,7 +14,10 @@
 //! 2. `--jobs` pistas pegam as imagens prontas e rodam o QEMU (`test-boot
 //!    --no-build`), com a saída em `test-boot.log` e a serial em
 //!    `serial.log`; a pasta de uma execução que passou é apagada (`--keep`
-//!    guarda todas);
+//!    guarda todas). Cada QEMU compromete toda a memória do convidado logo
+//!    ao subir; um QEMU só começa quando o commit livre do sistema cobre a
+//!    memória dele e uma margem, porque com o commit esgotado processos
+//!    morrem sem mensagem (o próprio test-all, o cargo, o rustc);
 //! 3. no fim, a tabela com o resultado de cada uma e, para cada falha, o
 //!    trecho da serial que a explica.
 //!
@@ -32,6 +35,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::thread;
@@ -59,6 +63,12 @@ const OUTPUT_DIR: &str = "build/test-all";
 /// Imagens prontas esperando uma pista: o build adianta pouco, para não
 /// ocupar disco com pastas que ainda não rodam.
 const READY_AHEAD: usize = 1;
+/// Commit que fica livre além dos QEMUs: o rustc do build do kernel (até
+/// uns 4 GB) e o resto do sistema.
+const COMMIT_RESERVE: u64 = 6 << 30;
+/// Tempo para um QEMU recém-criado comprometer a memória do convidado antes
+/// de a próxima pista conferir o commit livre.
+const SETTLE: Duration = Duration::from_secs(3);
 
 struct Options {
     jobs: Option<usize>,
@@ -147,6 +157,10 @@ struct Context {
     console: Console,
     /// Largura da coluna de nomes nas linhas ao vivo.
     width: usize,
+    /// Um QEMU começa de cada vez, depois de conferir o commit livre.
+    memory_gate: Mutex<()>,
+    /// QEMUs rodando agora.
+    running: AtomicUsize,
 }
 
 impl Context {
@@ -232,21 +246,62 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Espera o commit livre cobrir o QEMU e a margem. Sem nenhum QEMU nosso
+/// rodando, segue mesmo assim (um de cada vez), para a rodada não parar.
+fn wait_for_memory(context: &Context, run: &Run, test: &Test) {
+    let need = test.memory + COMMIT_RESERVE;
+    let mut warned = false;
+    while let Some(available) = host::available_commit() {
+        if available >= need || context.running.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        if !warned {
+            let width = context.width;
+            context.console.say(&format!(
+                "{:<14} {:<width$}  commit livre {}, precisa {}",
+                "esperando",
+                run.name,
+                gib(available),
+                gib(need)
+            ));
+            warned = true;
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
 /// Roda o QEMU na imagem montada; `Ok(true)` se o test-boot passou.
-fn execute(context: &Context, run: &Run, test: &Test) -> Result<bool, String> {
+fn execute(context: &Context, run: &Run, test: &Test, build: Duration) -> Result<(bool, Duration), String> {
     let directory = context.directory(run);
-    let mut child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"))?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Ok(status.success());
+    let (mut child, started) = {
+        let _gate = context.memory_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        wait_for_memory(context, run, test);
+        let width = context.width;
+        context.console.say(&format!("{:<14} {:<width$}  (build {})", "rodando", run.name, report::duration(build)));
+        let child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"))?;
+        let started = Instant::now();
+        context.running.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(SETTLE);
+        (child, started)
+    };
+    let result = loop {
+        match child.try_wait() {
+            Err(error) => break Err(error.to_string()),
+            Ok(Some(status)) => break Ok((status.success(), started.elapsed())),
+            Ok(None) => {}
         }
         if started.elapsed() > test.limit {
             kill_tree(&mut child);
-            return Err(format!("o test-boot passou de {} sem terminar e foi morto", report::duration(test.limit)));
+            break Err(format!("o test-boot passou de {} sem terminar e foi morto", report::duration(test.limit)));
         }
         thread::sleep(Duration::from_millis(200));
-    }
+    };
+    context.running.fetch_sub(1, Ordering::SeqCst);
+    result
 }
 
 /// Uma pista: pega a próxima imagem pronta, roda e anota o resultado.
@@ -264,10 +319,12 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
                 (false, None, None, error, report::build_excerpt(&text), context.relative(run, "build.log"))
             }
             Ok(build) => {
-                context.console.say(&format!("{:<14} {:<width$}  (build {})", "rodando", run.name, report::duration(build)));
                 let started = Instant::now();
-                let result = execute(context, run, test);
-                let time = started.elapsed();
+                let result = execute(context, run, test, build);
+                let time = match &result {
+                    Ok((_, time)) => *time,
+                    Err(_) => started.elapsed(),
+                };
                 let console = report::read_lossy(&directory.join("test-boot.log")).unwrap_or_default();
                 // A serial do test-boot; sem ela (processo morto), a saída
                 // dele, que também traz a serial.
@@ -275,7 +332,7 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
                 let log = if serial.is_some() { context.relative(run, "serial.log") } else { context.relative(run, "test-boot.log") };
                 let excerpt = report::serial_excerpt(serial.as_deref().unwrap_or(&console));
                 match result {
-                    Ok(passed) => (passed, Some(build), Some(time), report::failure_reason(&console), excerpt, log),
+                    Ok((passed, _)) => (passed, Some(build), Some(time), report::failure_reason(&console), excerpt, log),
                     Err(error) => (false, Some(build), Some(time), error, excerpt, log),
                 }
             }
@@ -337,6 +394,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         keep: options.keep,
         console: Console { started: Instant::now(), lock: Mutex::new(()) },
         width,
+        memory_gate: Mutex::new(()),
+        running: AtomicUsize::new(0),
     };
     if options.list {
         list(&context, &chosen);
@@ -367,6 +426,15 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         context.runs.len(),
         configurations
     );
+    if let Some(available) = host::available_commit() {
+        let largest = context.runs.iter().map(|run| context.tests[run.test].memory).max().unwrap_or(0);
+        println!(
+            "memoria: commit livre {}; cada QEMU compromete ate {} e so comeca com {} de margem",
+            gib(available),
+            gib(largest),
+            gib(COMMIT_RESERVE)
+        );
+    }
 
     let (sender, receiver) = mpsc::sync_channel::<Prepared>(READY_AHEAD);
     let receiver = Mutex::new(receiver);

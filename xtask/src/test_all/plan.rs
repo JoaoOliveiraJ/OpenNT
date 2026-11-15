@@ -28,6 +28,9 @@ const SUITE_CPUS: &[u32] = &[4, 1];
 /// Folga sobre o prazo e o `--hold` do test-boot antes de dar o processo
 /// como travado.
 const GRACE: Duration = Duration::from_secs(120);
+/// O que o QEMU compromete além da memória do convidado (medido: uns 5 GB
+/// de memória privada com `-m 4096`).
+const QEMU_OVERHEAD: u64 = 1 << 30;
 
 pub struct Test {
     pub id: String,
@@ -45,6 +48,9 @@ pub struct Test {
     pub build_key: String,
     /// Tempo máximo do `test-boot --no-build` (prazo + hold + folga).
     pub limit: Duration,
+    /// Commit que o QEMU do teste faz ao subir (a memória do convidado
+    /// inteira e o do próprio QEMU), em bytes.
+    pub memory: u64,
 }
 
 impl Test {
@@ -67,6 +73,7 @@ impl Test {
             // O Debug lista todas as opções, inclusive as que vierem a existir.
             build_key: format!("{options:?}"),
             limit: Duration::from_millis(timeout_ms.saturating_add(parsed.hold_ms)) + GRACE,
+            memory: (u64::from(parsed.machine.memory_mb) << 20) + QEMU_OVERHEAD,
         })
     }
 
