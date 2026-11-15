@@ -179,8 +179,8 @@ fn close_key(handle: u64) {
 /// dado, até 0xFFFE bytes, ou STATUS_NO_MEMORY); até 4 bytes, cópia crua;
 /// acima disso, o primeiro LONG do destino diz o espaço: negativo = buffer
 /// cru de -n bytes, não negativo = {tamanho, tipo, dado}.
-fn query_registry_direct(value_type: u32, data: &[u8], destination: u64) -> u32 {
-    let length = data.len() as u32;
+fn query_registry_direct(value_type: u32, data: &ValueData, range: core::ops::Range<usize>, destination: u64) -> u32 {
+    let length = range.len() as u32;
     if is_string(value_type) {
         let length = length.min(0xFFFE);
         // SAFETY: EntryContext de uma entrada DIRECT de string é uma UNICODE_STRING.
@@ -195,13 +195,13 @@ fn query_registry_direct(value_type: u32, data: &[u8], destination: u64) -> u32 
         } else if length > string.maximum_length.get() as u32 {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        guest::write_bytes(string.buffer.get(), &data[..length as usize]);
+        guest::write_bytes(string.buffer.get(), &data.bytes(range.start, length as usize));
         string.length.set((length as u16).wrapping_sub(2));
         return 0;
     }
     if length <= 4 {
         if length != 0 {
-            guest::write_bytes(destination, data);
+            guest::write_bytes(destination, &data.bytes(range.start, length as usize));
         }
         return 0;
     }
@@ -210,7 +210,7 @@ fn query_registry_direct(value_type: u32, data: &[u8], destination: u64) -> u32 
         if capacity.unsigned_abs() < length {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        guest::write_bytes(destination, data);
+        guest::write_bytes(destination, &data.bytes(range.start, length as usize));
         return 0;
     }
     if (capacity as u64) < length as u64 + 8 {
@@ -218,21 +218,57 @@ fn query_registry_direct(value_type: u32, data: &[u8], destination: u64) -> u32 
     }
     guest::write32(destination, length);
     guest::write32(destination + 4, value_type);
-    guest::write_bytes(destination + 8, data);
+    guest::write_bytes(destination + 8, &data.bytes(range.start, length as usize));
     0
 }
 
-/// Entrega um dado (do valor ou do default) à entrada: DIRECT grava em
-/// EntryContext, senão a QueryRoutine do driver recebe (ValueName,
-/// ValueType, ValueData, ValueLength, Context, EntryContext).
-fn deliver(entry: &RtlQueryRegistryTable, value_name: u64, value_type: u32, data: &[u8], context: u64) -> u32 {
-    if entry.flags.get() & QUERY_REGISTRY_DIRECT != 0 {
-        return query_registry_direct(value_type, data, entry.entry_context.get());
+/// O dado entregue a uma entrada: o do valor lido da chave (no kernel) ou o
+/// default da tabela, que fica onde o driver o pôs (DefaultData,
+/// DefaultLength) e só é lido no que uma entrada DIRECT copia.
+enum ValueData {
+    Read(alloc::vec::Vec<u8>),
+    Default { address: u64, length: u32 },
+}
+
+impl ValueData {
+    fn len(&self) -> usize {
+        match self {
+            ValueData::Read(data) => data.len(),
+            ValueData::Default { length, .. } => *length as usize,
+        }
     }
-    let buffer = guest::alloc_bytes(data.len().max(2) as u64);
-    guest::write_bytes(buffer, data);
-    let status = native_call::call(entry.query_routine.get(), &[value_name, value_type as u64, buffer, data.len() as u64, context, entry.entry_context.get()]) as u32;
-    guest::free_bytes(buffer);
+
+    /// `count` bytes a partir de `start`.
+    fn bytes(&self, start: usize, count: usize) -> alloc::vec::Vec<u8> {
+        match self {
+            ValueData::Read(data) => data[start..start + count].to_vec(),
+            ValueData::Default { address, .. } => if count == 0 { alloc::vec::Vec::new() } else { guest::read_bytes(address + start as u64, count) },
+        }
+    }
+}
+
+/// Entrega um trecho do dado (do valor ou do default) à entrada: DIRECT
+/// grava em EntryContext, senão a QueryRoutine do driver recebe (ValueName,
+/// ValueType, ValueData, ValueLength, Context, EntryContext). Como no
+/// RtlpCallQueryRegistryRoutine, o default vai pelo próprio ponteiro
+/// DefaultData com o DefaultLength da entrada, sem cópia: a rotina do
+/// driver decide quanto lê.
+fn deliver(entry: &RtlQueryRegistryTable, value_name: u64, value_type: u32, data: &ValueData, range: core::ops::Range<usize>, context: u64) -> u32 {
+    if entry.flags.get() & QUERY_REGISTRY_DIRECT != 0 {
+        return query_registry_direct(value_type, data, range, entry.entry_context.get());
+    }
+    let (pointer, temporary) = match data {
+        ValueData::Read(bytes) => {
+            let buffer = guest::alloc_bytes(range.len().max(2) as u64);
+            guest::write_bytes(buffer, &bytes[range.clone()]);
+            (buffer, true)
+        }
+        ValueData::Default { address, .. } => (address + range.start as u64, false),
+    };
+    let status = native_call::call(entry.query_routine.get(), &[value_name, value_type as u64, pointer, range.len() as u64, context, entry.entry_context.get()]) as u32;
+    if temporary {
+        guest::free_bytes(pointer);
+    }
     status
 }
 
@@ -280,7 +316,7 @@ fn call_query_routine(entry: &RtlQueryRegistryTable, value: Option<&RegistryValu
             units.push(0);
             name_copy = guest::alloc_bytes(units.len() as u64 * 2);
             guest::write_bytes(name_copy, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<alloc::vec::Vec<u8>>());
-            (if flags & QUERY_REGISTRY_DIRECT != 0 { entry.name.get() } else { name_copy }, value.value_type, value.data.clone())
+            (if flags & QUERY_REGISTRY_DIRECT != 0 { entry.name.get() } else { name_copy }, value.value_type, ValueData::Read(value.data.clone()))
         }
         None => {
             name_copy = 0;
@@ -295,7 +331,7 @@ fn call_query_routine(entry: &RtlQueryRegistryTable, value: Option<&RegistryValu
                 }
                 length = default_string_length(default_data, default_type == REG_MULTI_SZ);
             }
-            (entry.name.get(), default_type, if length == 0 { alloc::vec::Vec::new() } else { guest::read_bytes(default_data, length as usize) })
+            (entry.name.get(), default_type, ValueData::Default { address: default_data, length })
         }
     };
     let status = (|| {
@@ -310,15 +346,16 @@ fn call_query_routine(entry: &RtlQueryRegistryTable, value: Option<&RegistryValu
         }
         if flags & QUERY_REGISTRY_NOEXPAND == 0 {
             if value_type == REG_MULTI_SZ {
-                let end = data.len().saturating_sub(4);
+                let bytes = data.bytes(0, data.len());
+                let end = bytes.len().saturating_sub(4);
                 let mut start = 0usize;
                 while start < end {
                     let mut stop = start;
-                    while stop + 1 < data.len() && (data[stop] | data[stop + 1]) != 0 {
+                    while stop + 1 < bytes.len() && (bytes[stop] | bytes[stop + 1]) != 0 {
                         stop += 2;
                     }
-                    stop = (stop + 2).min(data.len());
-                    let status = deliver(entry, value_name, REG_SZ, &data[start..stop], context);
+                    stop = (stop + 2).min(bytes.len());
+                    let status = deliver(entry, value_name, REG_SZ, &data, start..stop, context);
                     if status != STATUS_BUFFER_TOO_SMALL && status & 0x8000_0000 != 0 {
                         return status;
                     }
@@ -326,11 +363,11 @@ fn call_query_routine(entry: &RtlQueryRegistryTable, value: Option<&RegistryValu
                 }
                 return 0;
             }
-            if value_type == REG_EXPAND_SZ && data.len() >= 2 && data[..data.len() - 2].chunks_exact(2).any(|pair| pair == [b'%', 0]) {
+            if value_type == REG_EXPAND_SZ && data.len() >= 2 && data.bytes(0, data.len() - 2).chunks_exact(2).any(|pair| pair == [b'%', 0]) {
                 return STATUS_INVALID_PARAMETER;
             }
         }
-        match deliver(entry, value_name, value_type, &data, context) {
+        match deliver(entry, value_name, value_type, &data, 0..data.len(), context) {
             STATUS_BUFFER_TOO_SMALL => 0,
             status => status,
         }

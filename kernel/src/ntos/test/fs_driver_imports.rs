@@ -358,6 +358,24 @@ fn registry_defaults(assert: Assert) {
     // troca por sucesso (cmp eax, 0xC0000023; cmovne em 0x6b9e4f).
     let too_small = query(DIRECT, 11, block + 0x598, 8) == Some(0) && guest::read_bytes(context, 0x10) == [0u8; 0x10];
     assert(overrun && measured && dword && none && sized && too_small, "fs-imports: RtlQueryRegistryValues com os defaults e o DIRECT do RtlpQueryRegistryDirect");
+    // Entrada com QueryRoutine: o default vai pelo próprio DefaultData com o
+    // DefaultLength, sem cópia (RtlpCallQueryRegistryRoutine: mov r8, rdi;
+    // mov r9d, esi). O win32k.sys usa DefaultLength 0x10000 com um DWORD na
+    // pilha e a rotina dele só lê a palavra baixa do tamanho.
+    // mov rax, [rsp+0x30]; mov [rax], r8; mov [rax+8], r9; xor eax, eax; ret
+    let routine = super::executable_code::place(&[0x48, 0x8B, 0x44, 0x24, 0x30, 0x4C, 0x89, 0x00, 0x4C, 0x89, 0x48, 0x08, 0x31, 0xC0, 0xC3]);
+    guest::write_bytes(table, &[0u8; 0xA8]);
+    let entry = at::<nt::RtlQueryRegistryTable>(table);
+    entry.query_routine.set(routine);
+    entry.name.set(value_name);
+    entry.entry_context.set(context);
+    entry.default_type.set(4);
+    entry.default_data.set(block + 0x590);
+    entry.default_length.set(0x1_0000);
+    guest::write_bytes(context, &[0u8; 0x20]);
+    let routed = routine != 0 && call_export("RtlQueryRegistryValues", &[0, path, table, 0, 0]) == Some(0);
+    assert(routed && guest::read64(context) == block + 0x590 && guest::read64(context + 8) == 0x1_0000, "fs-imports: RtlQueryRegistryValues entrega o default a QueryRoutine pelo ponteiro DefaultData");
+    super::executable_code::release(routine);
     guest::free_bytes(block);
 }
 
