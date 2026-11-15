@@ -11,7 +11,9 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | --- | --- |
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
-| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `status` e o cliente do depurador do kernel (`debug`) |
+| `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `status` e o cliente de texto do depurador do kernel (`debug`) |
+| `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, públicos de PDB), pilha pelos frame pointers, passo por cima e para fora, breakpoints e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
+| `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas do DWARF pelo `addr2line`); as dependências dele não entram no build do kernel nem do `xtask` |
 
 ## 2. Árvore do kernel
 
@@ -2164,12 +2166,53 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`BEEP_DEVICE_OK`), e os reconhecedores do fs_rec.sys respondem a um
   IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
 - **Depurador do kernel**: `cargo xtask debug` compila com `--kd=com2`, abre
-  o QEMU com a COM2 num socket TCP local e o prompt do cliente (`xtask/src/debug`:
-  o protocolo remoto do GDB, símbolos do `kernel.elf` com os nomes do Rust
-  legíveis e dos exports dos PEs desta máquina, mais os públicos de um PDB
-  já no cache do `nt-types`; `bt` pelos frame pointers do kernel);
+  o QEMU com a COM2 num socket TCP local e o prompt do cliente; o protocolo
+  remoto do GDB, os símbolos (`kernel.elf` com os nomes do Rust legíveis,
+  exports dos PEs desta máquina e os públicos de um PDB já no cache do
+  `nt-types`), a pilha pelos frame pointers, o passo por cima (`p`, um
+  breakpoint temporário depois do `call`, com o RSP de volta conferido para
+  ignorar uma recursão mais funda) e para fora (`gu`, pelo endereço de
+  retorno do prólogo ou de RBP + 8), os breakpoints do cliente (`bd`/`be`
+  desligam e religam) e os comandos ficam no crate `tools/kd-client`, que o
+  `xtask/src/debug` (o prompt) e o depurador gráfico usam;
   `--connect=HOST:PORTA` só conecta (a um `cargo xtask run --kd=com2`, porta
-  1234, onde o GDB também entra). O teste `kd` é um `test-boot` com
+  1234, onde o GDB também entra), e `--launch --no-client [--headless]` só
+  compila e abre o QEMU para outro cliente (imprime `KD_READY 127.0.0.1:PORTA`
+  e fecha o QEMU quando a entrada padrão fecha). Os testes do cliente
+  (`cargo test -p kd-client`) cobrem os pacotes, a resposta de parada, os
+  registradores, os símbolos, a pilha sobre uma pilha capturada, o tamanho
+  dos `call` e, contra um alvo de mentira num socket local
+  (`tools/kd-client/tests/fake_target.rs`), a sessão inteira com os
+  breakpoints e o passo por cima numa recursão.
+- **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`):
+  `cargo run -p kd-gui --release -- --launch` roda o mesmo build e QEMU do
+  `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA` entra
+  num QEMU aberto. A interface é egui/eframe (Rust puro, backend OpenGL
+  `glow`, sem wgpu) com painéis encaixáveis do `egui_dock`: Comando (os
+  comandos do prompt de texto), Desmontagem (iced-x86, sintaxe MASM, em
+  volta do RIP, com símbolos, destinos dos desvios e a margem que liga e
+  tira breakpoints), Fonte (a linha do DWARF do `kernel.elf` pelo
+  `addr2line`, só para o código do OpenNT), Registradores (por processador
+  ou thread, editáveis com a máquina parada), Memória (hexadecimal e ASCII
+  num endereço ou símbolo, editável), Pilha de chamadas, Módulos, Processos
+  (com os processadores), Threads (escolher uma mostra os registradores e a
+  pilha dela, pelo quadro de troca quando está fora da CPU), Breakpoints
+  (software, hardware e vigias, ligar e desligar), DbgPrint e o log da COM1.
+  Barra: Parar (Ctrl+B), Continuar (F5), Entrar (F11), Passar (F10), Sair
+  (Shift+F11), Reiniciar (fecha o QEMU, recompila e abre de novo) e o estado
+  da conexão. O backend (`backend.rs`) fala com o alvo numa thread e publica
+  um snapshot por parada; a janela nunca espera o socket. O teste de fumaça
+  (`cargo test -p kd-gui --release -- --ignored`, `tests/smoke.rs`) roda o
+  backend sem janela: abre o OpenNT com o QEMU sem tela, anexa, confere
+  registradores, módulos, pilha, desmontagem e a linha de código, pede a
+  parada com a máquina rodando, para num breakpoint em
+  `kernel::ntos::ke::run_kernel_tasks`, passa por cima e sai da função até o
+  `kmain`, roda um comando e desenha a janela fora da tela. A captura
+  `docs/screenshots/kd-gui.png` sai de `opennt-dbg --launch --break-at=EXPR
+  --screenshot=ARQ`: o egui roda sem janela e um rasterizador de software
+  (`offscreen.rs`) pinta os triângulos do `tessellate` com o atlas das
+  fontes, sem GPU.
+- **Teste do depurador**: o teste `kd` é um `test-boot` com
   `--kd=com2 --script=xtask/scripts/kd.txt`: o roteiro roda contra a COM2
   em paralelo ao boot e a falha dele derruba o teste. Ele anexa,
   confere o estado do depurador e os processadores congelados, lê e grava

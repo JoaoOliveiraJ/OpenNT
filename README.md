@@ -129,7 +129,8 @@ do kernel, no QEMU.
 | `kernel/src/ntos/test/` | Autotestes de boot (`phase3.rs`…`phase7.rs`, `self_test.rs`) |
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
-| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `status` |
+| `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `status`, `debug` |
+| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel) e `kd-gui` (o depurador gráfico `opennt-dbg`) |
 | `docs/` | Roadmap, arquitetura e páginas de compatibilidade |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
@@ -194,6 +195,14 @@ cargo xtask debug --connect=127.0.0.1:1234
 # O teste automático do depurador (roteiro xtask/scripts/kd.txt).
 cargo xtask test-boot KD_EXPORTS_OK 600000 --kd=com2 --script=xtask/scripts/kd.txt --build-dir=build/kd --start-driver=ksecdd --expect=KERNEL_RS_OK --expect=KD_SESSION_DETACHED --hold=5000
 
+# O depurador gráfico (opennt-dbg): o mesmo build e QEMU do cargo xtask debug,
+# numa janela no estilo do WinDbg. Opções do xtask passam adiante (--accel=whpx).
+cargo run -p kd-gui --release -- --launch
+cargo run -p kd-gui --release -- --connect=127.0.0.1:1234
+# Testes do cliente e o teste de fumaça do depurador gráfico (abre o QEMU).
+cargo test -p kd-client
+cargo test -p kd-gui --release -- --ignored --nocapture
+
 # Páginas de compatibilidade, selos e roadmap.
 cargo xtask status
 
@@ -246,6 +255,21 @@ de terceiros entra no repositório.**
 
 Comandos do shell: `help`, `version`, `clear`, `echo`, `mem`, `ls`, `cat`,
 `write`, `rm`, `run hello`, `spawn pisca`, `ps`, `kill`, `sc`, `halt`.
+
+### Depurador do kernel
+
+O OpenNT tem o próprio depurador de kernel: com `--kd=com2` o kernel atende o
+protocolo remoto do GDB na COM2, com as consultas do OpenNT (processos,
+threads, módulos, processadores, objetos, DbgPrint). Há dois clientes, com o
+mesmo código de protocolo, símbolos e pilha (`tools/kd-client`): o prompt de
+texto `cargo xtask debug` e o depurador gráfico `opennt-dbg`
+(`cargo run -p kd-gui --release -- --launch`), com desmontagem, fonte (pelo
+DWARF do kernel), registradores e memória editáveis, pilha, módulos,
+processos, threads, breakpoints e o DbgPrint em painéis encaixáveis. Teclas:
+F5 continua, F10 passa por cima, F11 entra, Shift+F11 sai da função, Ctrl+B
+para; um clique na margem da desmontagem liga ou tira um breakpoint.
+
+![opennt-dbg parado num breakpoint no laço principal do kernel](docs/screenshots/kd-gui.png)
 
 ## Fora do escopo
 
