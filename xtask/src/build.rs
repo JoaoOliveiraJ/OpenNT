@@ -36,6 +36,10 @@ pub struct BuildOptions {
     /// `--display=basic`: o PnP instala o BasicDisplay.sys real no adaptador
     /// VGA e o inicia sobre o dxgkrnl.sys real.
     pub display: String,
+    /// `--windows-dir=DIR`: pasta dos binários do Windows copiados para o
+    /// bundle do kernel (padrão `<build-dir>/windows`). Builds que dividem a
+    /// pasta não recompilam o kernel só porque o caminho dela mudou.
+    pub windows_dir: Option<PathBuf>,
 }
 
 pub struct BuildOutput {
@@ -44,6 +48,15 @@ pub struct BuildOutput {
 
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+/// Um caminho relativo das opções vale a partir da raiz do workspace.
+pub fn in_workspace(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root().join(path)
+    }
 }
 
 fn run(command: &mut Command) -> Result<(), String> {
@@ -119,16 +132,12 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
 
 pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     let root = workspace_root();
-    let build_dir = if options.build_dir.is_absolute() {
-        options.build_dir.clone()
-    } else {
-        root.join(&options.build_dir)
-    };
+    let build_dir = in_workspace(&options.build_dir);
     fs::create_dir_all(&build_dir).map_err(|error| format!("{}: {error}", build_dir.display()))?;
 
     // Binários reais do Windows desta máquina, copiados antes do kernel que
     // os embute no bundle.
-    let windows_dir = build_dir.join("windows");
+    let windows_dir = options.windows_dir.as_deref().map(in_workspace).unwrap_or_else(|| build_dir.join("windows"));
     crate::windows_binaries::stage(&windows_dir)?;
     let boot_elf = cargo_build(&root, "boot", options, None)?;
     let kernel_elf = cargo_build(&root, "kernel", options, Some(&windows_dir))?;

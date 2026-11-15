@@ -201,26 +201,55 @@ fn windows_directory() -> PathBuf {
     std::env::var("SystemRoot").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Windows"))
 }
 
+/// Mesmo tamanho e mesma data de modificação: a cópia está em dia.
+fn up_to_date(source: &Path, copy: &Path) -> bool {
+    match (fs::metadata(source), fs::metadata(copy)) {
+        (Ok(source), Ok(copy)) => {
+            source.len() == copy.len() && matches!((source.modified(), copy.modified()), (Ok(left), Ok(right)) if left == right)
+        }
+        _ => false,
+    }
+}
+
 /// Copia as imagens do bundle para `output`; as ausentes ficam de fora com
 /// aviso (o kernel registra a ausência ao carregá-las).
+///
+/// A pasta está no `rerun-if-changed` do build do kernel: uma cópia em dia
+/// fica como está e a cópia nova leva a data do original, para que um build
+/// sem mudança não recompile o kernel.
 pub fn stage(output: &Path) -> Result<usize, String> {
     let windows = windows_directory();
     fs::create_dir_all(output).map_err(|error| format!("{}: {error}", output.display()))?;
     // Remove cópias de um build anterior que não pertencem mais à lista.
+    let names: Vec<&std::ffi::OsStr> = BUNDLED.iter().filter_map(|relative| Path::new(relative).file_name()).collect();
     if let Ok(entries) = fs::read_dir(output) {
         for entry in entries.filter_map(|entry| entry.ok()) {
-            let _ = fs::remove_file(entry.path());
+            if !names.contains(&entry.file_name().as_os_str()) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
     let mut copied = 0;
     for relative in BUNDLED {
         let source = windows.join(relative);
         let name = Path::new(relative).file_name().unwrap_or_default();
+        let copy = output.join(name);
         if !source.exists() {
             println!("AVISO: {} ausente no Windows desta maquina", source.display());
+            let _ = fs::remove_file(&copy);
             continue;
         }
-        fs::copy(&source, output.join(name)).map_err(|error| format!("{}: {error}", source.display()))?;
+        if !up_to_date(&source, &copy) {
+            fs::copy(&source, &copy).map_err(|error| format!("{}: {error}", source.display()))?;
+            let modified = fs::metadata(&source).and_then(|metadata| metadata.modified());
+            if let Ok(modified) = modified {
+                fs::File::options()
+                    .write(true)
+                    .open(&copy)
+                    .and_then(|file| file.set_modified(modified))
+                    .map_err(|error| format!("{}: {error}", copy.display()))?;
+            }
+        }
         copied += 1;
     }
     println!("binarios do Windows no bundle: {copied} de {}", BUNDLED.len());

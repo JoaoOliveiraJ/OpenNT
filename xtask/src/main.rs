@@ -4,6 +4,7 @@
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
+//!                        [--build-only|--no-build]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -11,7 +12,7 @@
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
-//! `--display=basic`.
+//! `--display=basic`, `--windows-dir=DIR`.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`.
 //! Em `--keys`, `\n` digita Enter.
 
@@ -44,9 +45,11 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|status|nt-types> [opc
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real --display=basic
+                   --windows-dir=DIR (binarios do Windows do bundle; padrao <build-dir>/windows)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
-                   --hold=MS (segue rodando MS ms sem falha depois da ultima saida)";
+                   --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
+                   --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)";
 
 struct Arguments {
     command: String,
@@ -57,6 +60,10 @@ struct Arguments {
     expect: Vec<String>,
     hold_ms: u64,
     console_mirror_set: bool,
+    /// `--build-only`: o test-boot monta a imagem e para antes do QEMU.
+    build_only: bool,
+    /// `--no-build`: o test-boot usa a imagem já montada em `--build-dir`.
+    no_build: bool,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -75,6 +82,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
+            windows_dir: None,
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4 },
         positional: Vec::new(),
@@ -82,6 +90,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         expect: Vec::new(),
         hold_ms: 0,
         console_mirror_set: false,
+        build_only: false,
+        no_build: false,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -103,6 +113,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
+            "--windows-dir" => parsed.build.windows_dir = Some(PathBuf::from(required()?)),
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -111,6 +122,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--keys" => parsed.keys = Some(required()?.replace("\\n", "\n")),
             "--expect" => parsed.expect.push(required()?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
+            "--build-only" => parsed.build_only = true,
+            "--no-build" => parsed.no_build = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             _ if name.starts_with("--") => return Err(format!("opcao desconhecida: {name}\n{USAGE}")),
             _ => parsed.positional.push(argument),
@@ -122,7 +135,33 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if parsed.machine.memory_mb < 128 {
         return Err("--memory-mb deve cobrir o heap do kernel (minimo 128)".into());
     }
+    if (parsed.build_only || parsed.no_build) && parsed.command != "test-boot" {
+        return Err("--build-only e --no-build sao opcoes do test-boot".into());
+    }
+    if parsed.build_only && parsed.no_build {
+        return Err("--build-only e --no-build se excluem".into());
+    }
     Ok(parsed)
+}
+
+/// Opções de build de um test-boot: os testes conferem a saída do console
+/// pela serial, então o espelho do console vem ligado.
+fn test_build_options(arguments: &Arguments) -> BuildOptions {
+    let mut options = arguments.build.clone();
+    if !arguments.console_mirror_set {
+        options.console_mirror = true;
+    }
+    options
+}
+
+/// Marcador e prazo do test-boot (posicionais; padrão `KERNEL_RS_OK` em 60 s).
+fn marker_and_timeout(arguments: &Arguments) -> Result<(String, u64), String> {
+    let marker = arguments.positional.first().cloned().unwrap_or_else(|| "KERNEL_RS_OK".into());
+    let timeout_ms = match arguments.positional.get(1) {
+        Some(text) => text.parse().map_err(|_| format!("TIMEOUT_MS invalido: {text}"))?,
+        None => 60_000,
+    };
+    Ok((marker, timeout_ms))
 }
 
 fn execute(arguments: Arguments) -> Result<(), String> {
@@ -133,20 +172,26 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             qemu::run(&output.image, &arguments.machine)
         }
         "test-boot" => {
-            let mut options = arguments.build.clone();
-            // Os testes conferem a saída do console pela serial.
-            if !arguments.console_mirror_set {
-                options.console_mirror = true;
-            }
-            let marker = arguments.positional.first().cloned().unwrap_or_else(|| "KERNEL_RS_OK".into());
-            let timeout_ms: u64 = match arguments.positional.get(1) {
-                Some(text) => text.parse().map_err(|_| format!("TIMEOUT_MS invalido: {text}"))?,
-                None => 60_000,
+            let options = test_build_options(&arguments);
+            let (marker, timeout_ms) = marker_and_timeout(&arguments)?;
+            let image = if arguments.no_build {
+                let image = build::in_workspace(&options.build_dir).join("os.img");
+                if !image.is_file() {
+                    return Err(format!(
+                        "--no-build: {} nao existe (monte antes com o mesmo test-boot e --build-only)",
+                        image.display()
+                    ));
+                }
+                image
+            } else {
+                build::build(&options)?.image
             };
-            let output = build::build(&options)?;
-            let log = output.image.with_file_name("serial.log");
+            if arguments.build_only {
+                return Ok(());
+            }
+            let log = image.with_file_name("serial.log");
             qemu::test_boot(
-                &output.image,
+                &image,
                 &arguments.machine,
                 &TestOptions {
                     marker,
