@@ -42,6 +42,8 @@ mod cm {
     pub mod ini_file_mapping;
     #[path = "../../../../kernel/src/ntos/cm/arbiters.rs"]
     pub mod arbiters;
+    #[path = "../../../../kernel/src/ntos/cm/pnp_control.rs"]
+    pub mod pnp_control;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;
