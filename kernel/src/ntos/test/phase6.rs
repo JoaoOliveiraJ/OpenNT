@@ -551,7 +551,7 @@ extern "win64" fn timer_test_apc(context: u64, low: u64, high: u64) {
 }
 
 /// Um OBJECT_ATTRIBUTES sem nome com OBJ_KERNEL_HANDLE.
-fn kernel_handle_attributes() -> u64 {
+pub(super) fn kernel_handle_attributes() -> u64 {
     let attributes = guest::alloc_bytes(nt::ObjectAttributes::SIZE);
     guest::write_bytes(attributes, &[0; nt::ObjectAttributes::SIZE as usize]);
     let object_attributes = at::<nt::ObjectAttributes>(attributes);
@@ -722,7 +722,7 @@ fn zw_wnf_name_information_exports(assert: Assert) {
 }
 
 /// Um PORT_MESSAGE com quatro bytes de dados em `address`.
-fn port_message_with(address: u64, data: &[u8; 4]) {
+pub(super) fn port_message_with(address: u64, data: &[u8; 4]) {
     guest::write_bytes(address, &[0u8; 0x28]);
     let message = at::<nt::PortMessage>(address);
     message.u1.s1.data_length.set(4);
@@ -2201,7 +2201,7 @@ fn volume_file_operations(assert: Assert) {
 }
 
 /// OBJECT_ATTRIBUTES (48 bytes) com UNICODE_STRING do nome, no bloco dado.
-fn object_attributes_for(block: u64, name: &str, flags: u32) -> u64 {
+pub(super) fn object_attributes_for(block: u64, name: &str, flags: u32) -> u64 {
     let units: Vec<u16> = name.encode_utf16().collect();
     let text = block + 0x80;
         guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
@@ -12541,7 +12541,7 @@ fn native_stub(code: &[u8]) -> u64 {
 }
 
 /// UNICODE_STRING com o texto logo depois, numa alocação nova.
-fn unicode_string_for(text: &str) -> u64 {
+pub(super) fn unicode_string_for(text: &str) -> u64 {
     let units: Vec<u16> = text.encode_utf16().collect();
     let block = guest::alloc_bytes(nt::UnicodeString::SIZE + units.len() as u64 * 2 + 2);
     guest::write_bytes(block + nt::UnicodeString::SIZE, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
@@ -14010,6 +14010,7 @@ pub fn run(assert: Assert) {
     zw_read_file(assert);
     zw_write_file(assert);
     kernel_system_threads(assert);
+    super::kernel_waits::run(assert);
     zw_group_exports(assert);
     pnp_and_boot_services(assert);
     io_group_exports(assert);

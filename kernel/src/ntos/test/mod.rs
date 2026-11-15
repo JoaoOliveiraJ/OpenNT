@@ -25,6 +25,7 @@ pub mod platform_support;
 pub mod power_io_support;
 pub mod file_system_mount;
 pub mod console_driver;
+pub mod kernel_waits;
 pub mod import_cycle;
 pub mod fsrtl_fs_support;
 pub mod boot_drivers;
