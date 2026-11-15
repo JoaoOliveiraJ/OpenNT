@@ -1234,11 +1234,18 @@ de barramento PCI que o acpi.sys dá ao PDO, avalia as regras de PCIDevice
 com os próprios callbacks e relata as funções com os ids dele
 (`PCI_ROOT_OK`). A ponte PCI-ISA recebe o msisadrv.sys e o filtro do
 acpi.sys sobre o PDO dela relata os dispositivos ISA do namespace
-(PNP0303, PNP0F13, PNP0700, PNP0400, PNP0501, PNP0B00). O barramento PCI
+(PNP0303, PNP0F13, PNP0700, PNP0400, PNP0501, PNP0B00); o teclado e o
+mouse PS/2 são instalados pelas linhas do keyboard.inf e do msmouse.inf
+(`io/pnp/install.rs`) com o i8042prt.sys e os filtros de classe, e a
+pilha do teclado do boot é a desse nó (`drivers/input/keyboard_stack.rs`).
+O barramento PCI
 interno do kernel fica fora dessa árvore; as funções dos drivers internos
 são reconhecidas pelos ids de classe do pci.sys (`device_tree.rs`). Os
 filhos do pci.sys ainda passam pelo árbitro plano do PnP manager, e não
-pelos árbitros dos drivers de barramento.
+pelos árbitros dos drivers de barramento; esse árbitro aloca as portas,
+a memória e os números de barramento de um nó dentro das janelas do
+barramento acima dele (o PCI com o `_CRS`), e as janelas do pai não
+colidem com os filhos (`io/pnp/resources.rs`).
 
 Sem as opções nada disso roda.
 
