@@ -211,6 +211,36 @@ pub fn win32k_service_returned(service_number: u32, result: u64) {
     }
 }
 
+/// As Desktops abertas pela ParseProcedure da WinSta0 (`WINSTA0_OK`).
+static WINSTA0_DESKTOPS: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+static WINSTA0_OK: AtomicBool = AtomicBool::new(false);
+
+/// Uma Desktop aberta (criada ou reaberta) pela ParseProcedure de uma
+/// WindowStation, pelo ObOpenObjectByName do win32k (`ob/object_open.rs`):
+/// o `WINSTA0_OK` sai quando o wininit.exe tem as Desktops Winlogon e
+/// Default da WinSta0, como as que ele cria na partida da sessão 0.
+pub fn desktop_opened(window_station: &str, desktop: &str) {
+    if !boot_config::SMSS_BOOT || WINSTA0_OK.load(Ordering::Acquire) {
+        return;
+    }
+    let name = image_name(process::get_current_process());
+    crate::debug_print!("[init] {} (pid {}): Desktop {}\\{} aberta pela ParseProcedure da WindowStation", name, process::get_current_process_id(), window_station, desktop);
+    if !name.eq_ignore_ascii_case("wininit.exe") || !window_station.eq_ignore_ascii_case("WinSta0") {
+        return;
+    }
+    let complete = {
+        let mut desktops = WINSTA0_DESKTOPS.lock();
+        if !desktops.iter().any(|known| known.eq_ignore_ascii_case(desktop)) {
+            desktops.push(String::from(desktop));
+        }
+        ["Winlogon", "Default"].iter().all(|wanted| desktops.iter().any(|known| known.eq_ignore_ascii_case(wanted)))
+    };
+    if complete && !WINSTA0_OK.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] wininit.exe (pid {}): WinSta0 com as Desktops Winlogon e Default", process::get_current_process_id());
+        crate::debug_print!("WINSTA0_OK");
+    }
+}
+
 /// A conversão em thread GUI (PsConvertToGuiThread) de uma thread do
 /// csrss.exe voltou com `status`: a primeira é anotada.
 pub fn gui_thread_converted(status: u32) {

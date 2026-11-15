@@ -153,6 +153,37 @@ opennt_psp_job_delete:
     mov eax, 0x80000010
     jmp opennt_win32_common
 
+# As rotinas dos tipos de objeto Win32 (ExpWin32*Procedure).
+.balign 16
+.global opennt_exp_win32_open_procedure
+opennt_exp_win32_open_procedure:
+    mov eax, 0x80000011
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_exp_win32_okay_to_close_procedure
+opennt_exp_win32_okay_to_close_procedure:
+    mov eax, 0x80000012
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_exp_win32_close_procedure
+opennt_exp_win32_close_procedure:
+    mov eax, 0x80000013
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_exp_win32_delete_procedure
+opennt_exp_win32_delete_procedure:
+    mov eax, 0x80000014
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_exp_win32_parse_procedure
+opennt_exp_win32_parse_procedure:
+    mov eax, 0x80000015
+    jmp opennt_win32_common
+
 .balign 16
 .global opennt_psp_context_operation_apc
 opennt_psp_context_operation_apc:
@@ -367,6 +398,11 @@ extern "C" {
     static opennt_exp_delete_timer: u8;
     static opennt_psp_job_close: u8;
     static opennt_psp_job_delete: u8;
+    static opennt_exp_win32_open_procedure: u8;
+    static opennt_exp_win32_okay_to_close_procedure: u8;
+    static opennt_exp_win32_close_procedure: u8;
+    static opennt_exp_win32_delete_procedure: u8;
+    static opennt_exp_win32_parse_procedure: u8;
     static opennt_hal_private_stubs: u8;
     static opennt_hal_default_zero: u8;
     static opennt_hal_default_not_supported: u8;
@@ -408,6 +444,11 @@ pub fn entry(symbol: &str) -> Option<u64> {
             "ExpDeleteTimer" => core::ptr::addr_of!(opennt_exp_delete_timer),
             "PspJobClose" => core::ptr::addr_of!(opennt_psp_job_close),
             "PspJobDelete" => core::ptr::addr_of!(opennt_psp_job_delete),
+            "ExpWin32OpenProcedure" => core::ptr::addr_of!(opennt_exp_win32_open_procedure),
+            "ExpWin32OkayToCloseProcedure" => core::ptr::addr_of!(opennt_exp_win32_okay_to_close_procedure),
+            "ExpWin32CloseProcedure" => core::ptr::addr_of!(opennt_exp_win32_close_procedure),
+            "ExpWin32DeleteProcedure" => core::ptr::addr_of!(opennt_exp_win32_delete_procedure),
+            "ExpWin32ParseProcedure" => core::ptr::addr_of!(opennt_exp_win32_parse_procedure),
             "hal_private_stubs" => core::ptr::addr_of!(opennt_hal_private_stubs),
             "hal_default_zero" => core::ptr::addr_of!(opennt_hal_default_zero),
             "hal_default_not_supported" => core::ptr::addr_of!(opennt_hal_default_not_supported),

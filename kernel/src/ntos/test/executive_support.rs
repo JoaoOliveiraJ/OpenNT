@@ -77,6 +77,16 @@ fn boot_object_types(assert: Assert) {
         };
         assert(ok, alloc::format!("tipos do boot: {cell} publica o tipo {name} com o inicializador do ntoskrnl").leak());
     }
+    // As rotinas dos seis tipos Win32 são as ExpWin32*Procedure (só a
+    // WindowStation tem a Parse).
+    let routines = ["ExpWin32OpenProcedure", "ExpWin32OkayToCloseProcedure", "ExpWin32CloseProcedure", "ExpWin32DeleteProcedure", "ExpWin32ParseProcedure"].map(crate::ntos::init::exports::private_routines::address);
+    let win32_routines = expected[..6].iter().enumerate().all(|(index, (cell, ..))| {
+        let info = &at::<nt::ObjectType>(guest::read64(kernel_data::address(cell).unwrap_or(0))).type_info;
+        routines.iter().all(|&routine| routine != 0)
+            && [info.open_procedure.get(), info.okay_to_close_procedure.get(), info.close_procedure.get(), info.delete_procedure.get()] == routines[..4]
+            && info.parse_procedure.get() == if index == 0 { routines[4] } else { 0 }
+    });
+    assert(win32_routines, "tipos do boot: rotinas ExpWin32* nos tipos Win32 e a ParseProcedure so na WindowStation");
     let charges = |cell: &str| at::<nt::ObjectType>(guest::read64(kernel_data::address(cell).unwrap_or(0))).type_info.default_non_paged_pool_charge.get();
     assert(charges("ExTimerObjectType") == 0x148 && charges("PsJobType") == 0x640, "tipos do boot: cobranca nao paginavel do Timer e do Job");
 }
@@ -85,7 +95,9 @@ fn boot_object_types(assert: Assert) {
 /// ObSetSecurityDescriptorInfo e ObCheckCreateObjectAccess.
 fn ob_object_support(assert: Assert) {
     let block = guest::alloc_bytes(0x1000);
-    let desktop = guest::read64(kernel_data::address("ExDesktopObjectType").unwrap_or(0));
+    // Um tipo com o inicializador do Desktop e sem rotinas: as do Desktop
+    // (ExpWin32*) chamam os callouts do win32k, que este boot não carrega.
+    let desktop = object_types::ensure(&object_types::TypeTemplate { name: "OpenNTTesteSuporte", mapping: [0x2_0000, 0x2_0000, 0x2_0000, 0xF_0000], valid_access: 0xF_0000, flags: 0x58, object_type_code: 0, invalid_attributes: 0x130, pool_type: 0x200, paged_charge: 0, non_paged_charge: 0 }).pointer;
     let attributes = object_attributes(block, "\\SuporteDesktopTeste", 0x200);
     let (out_object, out_handle, slot) = (block + 0x300, block + 0x308, block + 0x310);
     let created = status(call_export("ObCreateObject", &[0, desktop, attributes, 0, 0, 0x40, 0, 0, out_object]));
@@ -134,6 +146,81 @@ fn ob_object_support(assert: Assert) {
     assert(call_export("ObCheckCreateObjectAccess", &[root, 1, access_state, 0, 0, 0, access_status]) == Some(1) && guest::read32(access_status) == 0, "ob: ObCheckCreateObjectAccess concede a criacao em KernelMode");
     let _ = call_export("ZwClose", &[guest::read64(out_handle)]);
     guest::free_bytes(access_state);
+    guest::free_bytes(block);
+    ob_parse_procedure(assert);
+    win32_procedures_dispatch(assert);
+}
+
+/// ObOpenObjectByName com a ParseProcedure do tipo de um objeto que não é
+/// diretório (o caminho das Desktops pela WindowStation do win32k): pelo
+/// RootDirectory, o nome todo é o restante; num caminho absoluto, o resto
+/// depois do objeto, com a barra. A rotina de teste grava o RemainingName e
+/// o ParseContext que recebe e devolve o próprio ParseObject (com a
+/// referência que a busca solta depois de abrir o handle).
+fn ob_parse_procedure(assert: Assert) {
+    use alloc::string::String;
+    let block = guest::alloc_bytes(0x1000);
+    let record = block + 0xF00;
+    // O RemainingName só vale durante a chamada: a rotina guarda o Length,
+    // os 16 primeiros bytes do texto e o ParseContext.
+    // mov rax, [rsp+0x38]; mov rdx, record; movzx r8d, word [rax]; mov [rdx], r8;
+    // mov r9, [rax+8]; mov r8, [r9]; mov [rdx+0x10], r8; mov r8, [r9+8];
+    // mov [rdx+0x18], r8; mov rax, [rsp+0x40]; mov [rdx+8], rax;
+    // mov rax, [rsp+0x50]; mov [rax], rcx; xor eax, eax; ret
+    let mut code = alloc::vec![0x48, 0x8B, 0x44, 0x24, 0x38, 0x48, 0xBA];
+    code.extend_from_slice(&record.to_le_bytes());
+    code.extend_from_slice(&[0x44, 0x0F, 0xB7, 0x00, 0x4C, 0x89, 0x02, 0x4C, 0x8B, 0x48, 0x08, 0x4D, 0x8B, 0x01, 0x4C, 0x89, 0x42, 0x10, 0x4D, 0x8B, 0x41, 0x08, 0x4C, 0x89, 0x42, 0x18]);
+    code.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x40, 0x48, 0x89, 0x42, 0x08, 0x48, 0x8B, 0x44, 0x24, 0x50, 0x48, 0x89, 0x08, 0x31, 0xC0, 0xC3]);
+    let routine = super::executable_code::place(&code);
+    let object_type = object_types::ensure(&object_types::TypeTemplate { name: "OpenNTTesteParse", mapping: [0x2_0000, 0x2_0000, 0x2_0000, 0xF_0000], valid_access: 0xF_0000, flags: 0, object_type_code: 0, invalid_attributes: 0, pool_type: 0x200, paged_charge: 0, non_paged_charge: 0 }).pointer;
+    if let Some(info) = object_types::type_object(object_type) {
+        info.type_info.parse_procedure.set(routine);
+    }
+    let root_attributes = object_attributes(block, "\\OpenNTTesteParseRaiz", 0x200);
+    let (out_object, out_handle) = (block + 0x300, block + 0x308);
+    let created = status(call_export("ObCreateObject", &[0, object_type, root_attributes, 0, 0, 0x40, 0, 0, out_object])) == 0;
+    let object = guest::read64(out_object);
+    let inserted = created && status(call_export("ObInsertObject", &[object, 0, 0xF_0000, 0, 0, out_handle])) == 0;
+    let root = guest::read64(out_handle);
+    let open = |name: &str, root_directory: u64, output: u64| {
+        let attributes = object_attributes(block + 0x400, name, 0x200);
+        at::<nt::ObjectAttributes>(attributes).root_directory.set(root_directory);
+        guest::write_bytes(record, &[0u8; 0x20]);
+        // A referência que a ParseProcedure de verdade toma no objeto devolvido.
+        let _ = call_export("ObfReferenceObject", &[object]);
+        status(call_export("ObOpenObjectByName", &[attributes, object_type, 0, 0, 0xF_0000, 0x1234, output]))
+    };
+    let remaining = || {
+        let length = (guest::read64(record) as usize).min(16);
+        String::from_utf16_lossy(&guest::read_bytes(record + 0x10, length).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<u16>>())
+    };
+    let relative = open("Filho", root, block + 0x310) == 0 && guest::read64(block + 0x310) != 0 && remaining() == "Filho" && guest::read64(record + 8) == 0x1234;
+    let absolute = open("\\OpenNTTesteParseRaiz\\Neto", 0, block + 0x318) == 0 && guest::read64(block + 0x318) != 0 && remaining() == "\\Neto";
+    for handle in [guest::read64(block + 0x310), guest::read64(block + 0x318), root] {
+        if handle != 0 {
+            let _ = call_export("ZwClose", &[handle]);
+        }
+    }
+    crate::debug_print!("[suporte-ob] ParseProcedure: inserido={} raiz={} absoluto={}", inserted, relative, absolute);
+    assert(inserted && relative && absolute, "ob: ObOpenObjectByName entrega o restante do nome a ParseProcedure do objeto (pelo RootDirectory e no caminho absoluto) e abre o objeto devolvido");
+    super::executable_code::release(routine);
+    guest::free_bytes(block);
+}
+
+/// As rotinas ExpWin32* despacham ao callout do win32k na sessão do objeto
+/// (o primeiro ULONG do corpo): numa sessão que não existe, o
+/// PsInvokeWin32Callout devolve STATUS_INVALID_PARAMETER e a OpenProcedure
+/// da WindowStation recusa o handle do ObInsertObject.
+fn win32_procedures_dispatch(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    let window_station = guest::read64(kernel_data::address("ExWindowStationObjectType").unwrap_or(0));
+    let created = status(call_export("ObCreateObject", &[0, window_station, 0, 0, 0, 0x40, 0, 0, block])) == 0;
+    let object = guest::read64(block);
+    let refused = created && {
+        guest::write32(object, 0x7777);
+        status(call_export("ObInsertObject", &[object, 0, 0xF_0000, 0, 0, block + 8])) == 0xC000_000D
+    };
+    assert(refused, "win32: ExpWin32OpenProcedure chama o callout na sessao do objeto (sessao inexistente: STATUS_INVALID_PARAMETER)");
     guest::free_bytes(block);
 }
 

@@ -16,6 +16,10 @@
 //!   PoolType, GenericMapping, Mode).
 //! - QueryNameProcedure(Object, HasObjectName, ObjectNameInfo, Length,
 //!   ReturnLength, Mode) no ObQueryNameString.
+//! - ParseProcedure(ParseObject, ObjectType, AccessState, AccessMode,
+//!   Attributes, CompleteName, RemainingName, Context, SecurityQos, &Object)
+//!   quando a busca de um nome chega a um objeto que não é diretório
+//!   (`ob/object_open.rs`).
 //!
 //! Open e Close rodam anexados ao processo do handle quando ele não é o
 //! corrente (Open não anexa na herança), como o KiStackAttachProcess do NT.
@@ -110,6 +114,20 @@ pub fn delete(object_type: u64, body: u64) -> bool {
         native_call::call(routine, &[body]);
     }
     routine != 0
+}
+
+/// ParseProcedure(ParseObject, ObjectType, AccessState, AccessMode,
+/// Attributes, CompleteName, RemainingName, Context, SecurityQos, &Object)
+/// do tipo `object_type` (o do ParseObject); `None` quando o tipo não tem
+/// rotina.
+#[allow(clippy::too_many_arguments)]
+pub fn parse(object_type: u64, parse_object: u64, wanted_type: u64, access_state: u64, access_mode: u8, attributes: u32, complete_name: u64, remaining_name: u64, context: u64, security_qos: u64, object: u64) -> Option<u32> {
+    let routine = native(object_type).type_info.parse_procedure.get();
+    if routine == 0 {
+        return None;
+    }
+    let arguments = [parse_object, wanted_type, access_state, access_mode as u64, attributes as u64, complete_name, remaining_name, context, security_qos, object];
+    Some(native_call::call(routine, &arguments) as u32)
 }
 
 /// SecurityProcedure; devolve o NTSTATUS (sem rotina, STATUS_SUCCESS).

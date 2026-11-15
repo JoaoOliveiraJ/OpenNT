@@ -24,7 +24,7 @@ fn reference_object_by_name(call: &Call) -> Result<u64, KernelError> {
 
 /// ObOpenObjectByName (7 argumentos).
 fn open_object_by_name(call: &Call) -> Result<u64, KernelError> {
-    object_open::open_by_name(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(5) as u32, call.arg(7))
+    object_open::open_by_name_ex(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(4), call.arg(5) as u32, call.arg(6), call.arg(7))
 }
 
 /// ObReferenceObjectByHandle(handle, access, type, mode, out, info).

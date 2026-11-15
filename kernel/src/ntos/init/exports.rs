@@ -949,6 +949,11 @@ pub mod private_routines {
     pub const DELETE_TIMER_ID: u64 = ID + 14;
     pub const JOB_CLOSE_ID: u64 = ID + 15;
     pub const JOB_DELETE_ID: u64 = ID + 16;
+    pub const WIN32_OPEN_ID: u64 = ID + 17;
+    pub const WIN32_OKAY_TO_CLOSE_ID: u64 = ID + 18;
+    pub const WIN32_CLOSE_ID: u64 = ID + 19;
+    pub const WIN32_DELETE_ID: u64 = ID + 20;
+    pub const WIN32_PARSE_ID: u64 = ID + 21;
 
     pub fn name(id: u64) -> Option<&'static str> {
         use crate::hal::private_dispatch;
@@ -976,6 +981,11 @@ pub mod private_routines {
             DELETE_TIMER_ID => "ExpDeleteTimer",
             JOB_CLOSE_ID => "PspJobClose",
             JOB_DELETE_ID => "PspJobDelete",
+            WIN32_OPEN_ID => "ExpWin32OpenProcedure",
+            WIN32_OKAY_TO_CLOSE_ID => "ExpWin32OkayToCloseProcedure",
+            WIN32_CLOSE_ID => "ExpWin32CloseProcedure",
+            WIN32_DELETE_ID => "ExpWin32DeleteProcedure",
+            WIN32_PARSE_ID => "ExpWin32ParseProcedure",
             _ => return None,
         })
     }
@@ -1017,6 +1027,18 @@ pub mod private_routines {
                 crate::ntos::ps::job::object::delete_procedure(call.arg(1));
                 Ok(0)
             }
+            // As rotinas dos tipos Win32 (ex/win32.rs), na ABI do OBJECT_TYPE_INITIALIZER.
+            WIN32_OPEN_ID => Ok(super::signed_status(crate::ntos::ex::win32::open_procedure(call.arg(1) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32))),
+            WIN32_OKAY_TO_CLOSE_ID => Ok(crate::ntos::ex::win32::okay_to_close_procedure(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8) as u64),
+            WIN32_CLOSE_ID => {
+                crate::ntos::ex::win32::close_procedure(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32);
+                Ok(0)
+            }
+            WIN32_DELETE_ID => {
+                crate::ntos::ex::win32::delete_procedure(call.arg(1));
+                Ok(0)
+            }
+            WIN32_PARSE_ID => Ok(super::signed_status(crate::ntos::ex::win32::parse_procedure(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8, call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(8), call.arg(9), call.arg(10)))),
             _ => Err(KernelError::new(alloc::format!("private routine {} enters with its module", name(id).unwrap_or("?")))),
         }
     }

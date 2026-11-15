@@ -108,6 +108,37 @@ pub fn invoke_callout(callout_type: i32, parameter: u64) -> u32 {
     }
 }
 
+/// PsInvokeWin32Callout(CalloutType, Parameter, 1, &SessionId), o modo das
+/// rotinas dos tipos Win32 (ExpWin32*Procedure): no processo corrente quando
+/// ele está numa sessão (Flags.ProcessInSession) de mesmo id; senão o
+/// ExCallSessionCallBack anexa a um processo da sessão pedida
+/// (MmGetSessionById + MmAttachSession), chama o callout dela e volta. Sem a
+/// sessão, STATUS_INVALID_PARAMETER; uma falha do attach é o status, e o
+/// sucesso dele devolve o status do callout.
+pub fn invoke_callout_for_session(callout_type: i32, parameter: u64, session_id: u32) -> u32 {
+    let current = process::get_current_process();
+    if eprocess(current).process_in_session() != 0 && super::session::current_process_session_id() == session_id {
+        return invoke_callout(callout_type, parameter);
+    }
+    let target = crate::ntos::mm::session::by_id(session_id);
+    if target == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let apc_state = guest::alloc_bytes(crate::ntos::inc::types::KapcState::SIZE);
+    let status = match crate::ntos::mm::session::attach(target, apc_state) {
+        Ok(0) => {
+            let status = invoke_callout(callout_type, parameter);
+            let _ = crate::ntos::mm::session::detach(target, apc_state);
+            status
+        }
+        Ok(status) => status,
+        Err(_) => STATUS_UNSUCCESSFUL,
+    };
+    guest::free_bytes(apc_state);
+    let _ = process::dereference(target);
+    status
+}
+
 /// MmSessionGetWin32Callouts: a sessão do processo corrente
 /// (EPROCESS.Session) tem o DriverUnload do driver de sessão (>= 2).
 fn session_callouts_ready() -> bool {
