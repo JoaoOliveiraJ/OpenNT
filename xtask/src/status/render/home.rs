@@ -89,6 +89,48 @@ pub fn page(report: &Report) -> String {
          <ul class=\"rows\">{marks}</ul>\n"
     ));
 
+    if !report.tools.is_empty() {
+        let cards: String = report
+            .tools
+            .iter()
+            .map(|tool| {
+                let commands = if tool.commands.is_empty() {
+                    String::new()
+                } else {
+                    format!("<pre><code>{}</code></pre>", escape(&tool.commands.join("\n")))
+                };
+                let test = tool
+                    .test
+                    .map(|index| format!("<p class=\"small\">Teste: {}</p>", test_link(&report.tests[index], "testes.html")))
+                    .unwrap_or_default();
+                let picture = tool
+                    .picture
+                    .as_ref()
+                    .map(|picture| {
+                        format!(
+                            "<figure class=\"shot\"><a href=\"{href}\"><img src=\"{href}\" width=\"{w}\" height=\"{h}\" \
+                             loading=\"lazy\" decoding=\"async\" alt=\"{caption}\"></a><figcaption>{caption}</figcaption></figure>",
+                            href = escape(&picture.href),
+                            w = picture.width,
+                            h = picture.height,
+                            caption = escape(&picture.caption)
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "<li class=\"card\" id=\"ferramenta-{}\"><header><h3>{}</h3></header><p>{}</p>{commands}{test}{picture}</li>",
+                    anchor(&tool.name),
+                    escape(&tool.name),
+                    escape(&tool.description)
+                )
+            })
+            .collect();
+        body.push_str(&format!(
+            "<h2 id=\"ferramentas\">Ferramentas</h2>\n<p class=\"muted\">As ferramentas de desenvolvimento do próprio OpenNT, com \
+             código no repositório.</p>\n<ul class=\"cards wide\">{cards}</ul>\n"
+        ));
+    }
+
     let phases: String = report
         .phases
         .iter()

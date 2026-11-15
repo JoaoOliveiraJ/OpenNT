@@ -247,6 +247,24 @@ pub struct Milestone {
     pub test: Option<usize>,
 }
 
+/// Uma imagem do repositório citada pelas páginas (fora de `docs/site/`).
+pub struct Picture {
+    /// Caminho relativo a `docs/site/` (`../screenshots/x.png`).
+    pub href: String,
+    pub width: u32,
+    pub height: u32,
+    pub caption: String,
+}
+
+/// Uma ferramenta de desenvolvimento do OpenNT (`[[ferramenta]]`).
+pub struct ToolRow {
+    pub name: String,
+    pub description: String,
+    pub commands: Vec<String>,
+    pub picture: Option<Picture>,
+    pub test: Option<usize>,
+}
+
 pub struct Report {
     pub exports: ExportReport,
     pub runs: Vec<RunRow>,
@@ -255,6 +273,7 @@ pub struct Report {
     pub tests: Vec<TestRow>,
     pub phases: Vec<PhaseRow>,
     pub milestone: Milestone,
+    pub tools: Vec<ToolRow>,
     /// Os marcadores que as suítes completas do test-all conferem.
     pub suite_markers: Vec<String>,
     pub warnings: Vec<String>,
@@ -562,6 +581,39 @@ fn milestone(document: &toml::Document, phases: &[PhaseRow], tests: &[TestRow], 
     Milestone { current, next, test }
 }
 
+/// As ferramentas do `[[ferramenta]]`, com a imagem conferida (um PNG do
+/// repositório, citado de onde está, para o README e o site usarem o mesmo
+/// arquivo).
+fn tool_rows(document: &toml::Document, root: &Path, tests: &[TestRow], warnings: &mut Vec<String>) -> Vec<ToolRow> {
+    document
+        .array("ferramenta")
+        .iter()
+        .map(|entry| {
+            let name = entry.string("nome").unwrap_or_default().to_string();
+            let picture = entry.string("imagem").and_then(|path| {
+                let info = fs::read(root.join(path)).ok().and_then(|bytes| crate::png::read_info(&bytes));
+                if info.is_none() {
+                    warnings.push(format!("ferramenta {name}: imagem inexistente ou nao PNG: {path}"));
+                }
+                info.map(|info| Picture {
+                    href: format!("../../{path}"),
+                    width: info.width,
+                    height: info.height,
+                    caption: entry.string("legenda").unwrap_or(&name).to_string(),
+                })
+            });
+            let test = test_indexes(&format!("ferramenta {name}"), &entry.strings("teste"), tests, warnings).first().copied();
+            ToolRow {
+                description: entry.string("descricao").unwrap_or_default().to_string(),
+                commands: entry.strings("comando"),
+                picture,
+                test,
+                name,
+            }
+        })
+        .collect()
+}
+
 /// Apaga as páginas de `docs/site/` que esta geração não produziu (o
 /// conjunto antigo), sem tocar nas capturas.
 fn remove_stale_pages(root: &Path, written: &BTreeSet<String>) -> Result<Vec<String>, String> {
@@ -615,6 +667,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         })
         .collect();
     let milestone = milestone(&document, &phases, &tests, &mut warnings);
+    let tools = tool_rows(&document, &root, &tests, &mut warnings);
     // O marcador da suíte (a primeira palavra) e as saídas esperadas dela.
     let suite_markers = crate::test_all::SUITE
         .iter()
@@ -631,6 +684,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         tests,
         phases,
         milestone,
+        tools,
         suite_markers,
         warnings,
     };

@@ -1694,3 +1694,23 @@ teste = "smss-csrss"
 estado = "roda"
 faz = "Carregam e inicializam no csrss, puxadas pelo user32.dll."
 para = "Nenhum programa Win32 as usa ainda."
+
+# ---- ferramentas (página Início) ----------------------------------------------
+#
+# As ferramentas de desenvolvimento próprias do OpenNT. Campos: nome,
+# descricao, comando (um ou uma lista), imagem (caminho no repositório,
+# opcional), legenda (o texto alternativo da imagem) e teste (opcional).
+
+[[ferramenta]]
+nome = "opennt-dbg"
+descricao = "O depurador gráfico do kernel: desmontagem com breakpoints na margem, fonte pelo DWARF do kernel, registradores e memória editáveis, pilha, módulos, processos, threads e o DbgPrint em painéis encaixáveis. Fala com o depurador do próprio OpenNT pela COM2 (--kd=com2)."
+comando = ["cargo run -p kd-gui --release -- --launch", "cargo run -p kd-gui --release -- --connect=127.0.0.1:1234"]
+imagem = "docs/screenshots/kd-gui.png"
+legenda = "opennt-dbg parado num breakpoint no laço principal do kernel"
+teste = "kd"
+
+[[ferramenta]]
+nome = "cargo xtask debug"
+descricao = "O mesmo depurador em modo texto, com o mesmo código de protocolo, símbolos e pilha: parada, passo, registradores, memória, breakpoints de software e de hardware, pilha, processos, threads, módulos e objetos; com --script, um roteiro roda como teste."
+comando = ["cargo xtask debug", "cargo xtask debug --connect=127.0.0.1:1234"]
+teste = "kd"
