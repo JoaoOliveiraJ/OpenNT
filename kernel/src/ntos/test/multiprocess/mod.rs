@@ -17,6 +17,7 @@ pub mod session_space;
 pub mod create_path;
 pub mod all_processes;
 pub mod cross_handles;
+pub mod access_control;
 pub mod create_user_process;
 pub mod cross_memory;
 pub mod user_callback;

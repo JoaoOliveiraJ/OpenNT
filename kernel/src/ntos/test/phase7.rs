@@ -5067,6 +5067,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::create_path::run(assert);
     crate::ntos::test::multiprocess::all_processes::run(assert);
     crate::ntos::test::multiprocess::cross_handles::run(assert);
+    crate::ntos::test::multiprocess::access_control::run(assert);
     crate::ntos::test::multiprocess::create_user_process::run(assert);
     crate::ntos::test::multiprocess::cross_memory::run(assert);
     crate::ntos::test::rtl_atom_heap_nls::run_phase7(assert);
