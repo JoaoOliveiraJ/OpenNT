@@ -20,7 +20,8 @@
 //! usuário que o smss.exe real e o csrss.exe real carregam, na raiz (o
 //! `C:\Windows\System32` que o modo usuário vê): os dois executáveis, as
 //! DLLs de servidor do csrss e o fecho dos imports delas (estáticos e pelos
-//! API sets do apisetschema.dll desta máquina), e as imagens de kernel do
+//! API sets do apisetschema.dll desta máquina), o wininit.exe da sessão 0
+//! com o services.exe e o lsass.exe que ele cria, e as imagens de kernel do
 //! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys, com o
 //! hidparse.sys e o cdd.dll).
 
@@ -172,7 +173,8 @@ const NTFS_FILES: &[(&str, &str)] = &[
 
 /// Os programas de modo usuário do caminho do smss (`--initial-process=smss`):
 /// smss.exe, csrss.exe, as DLLs de servidor (csrsrv, basesrv, winsrv com o
-/// winsrvext, sxssrv) e o fecho dos imports delas, incluindo a ntdll.
+/// winsrvext, sxssrv) e o fecho dos imports delas, incluindo a ntdll, e o
+/// wininit.exe com o services.exe e o lsass.exe.
 const SMSS_PROGRAMS: &[&str] = &[
     "smss.exe",
     "csrss.exe",
@@ -193,6 +195,34 @@ const SMSS_PROGRAMS: &[&str] = &[
     "combase.dll",
     "rpcrt4.dll",
     "cfgmgr32.dll",
+    // O comando inicial da sessão 0 (wininit.exe, que o smss da sessão
+    // executa depois do csrss) e os processos que ele cria: o gerenciador de
+    // serviços (services.exe) e a autoridade de segurança local (lsass.exe,
+    // que carrega o lsasrv.dll). Os imports estáticos deles e as DLLs que
+    // eles carregam na partida (o advapi32 e o winsta das estações de
+    // janela, o wininitext, o userenv, o sspicli e as dependências do
+    // lsasrv).
+    "wininit.exe",
+    "wininitext.dll",
+    "services.exe",
+    "lsass.exe",
+    "lsasrv.dll",
+    "sechost.dll",
+    "advapi32.dll",
+    "winsta.dll",
+    "userenv.dll",
+    "profapi.dll",
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "cryptbase.dll",
+    "sspicli.dll",
+    "devobj.dll",
+    "dpapi.dll",
+    "eventaggregation.dll",
+    "msasn1.dll",
+    "wldap32.dll",
+    "ws2_32.dll",
+    "msvcrt.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
