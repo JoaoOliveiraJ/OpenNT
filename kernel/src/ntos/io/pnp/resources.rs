@@ -12,9 +12,11 @@
 //!   memória, IRQs, canais de DMA e números de barramento têm árbitros;
 //!   CmResourceTypeDevicePrivate passa direto para a lista. Portas,
 //!   memória e números de barramento de um nó sob um barramento que recebeu
-//!   janelas desse tipo (o PCI com as do _CRS do PCI0) ficam dentro delas,
-//!   e as faixas dos ancestrais não colidem com as dos filhos, como no
-//!   árbitro do barramento que aloca os filhos nas janelas dele.
+//!   janelas desse tipo (as faixas com CM_RESOURCE_PORT_WINDOW_DECODE ou
+//!   CM_RESOURCE_MEMORY_WINDOW_DECODE e os números de barramento: as do
+//!   _CRS do PCI0) ficam dentro delas, e as faixas desse barramento e dos
+//!   ancestrais dele não colidem com as dos filhos, como no árbitro do
+//!   barramento que aloca os filhos nas janelas dele.
 //! - `translate` é o tradutor da HAL: portas e memória não mudam (PC, sem
 //!   janela de I/O deslocada); a IRQ de linha `n` (Level = Vector = n na lista
 //!   bruta) vira o vetor do IDT `0x20 + n` com IRQL `n`, a convenção da HAL
@@ -300,23 +302,39 @@ impl Requester {
         Requester { owner, ancestors }
     }
 
-    /// As janelas do barramento que produz o tipo para o nó: as faixas do
-    /// primeiro ancestral com recursos desse tipo atribuídos (o barramento
-    /// PCI com as janelas do _CRS). Um árbitro de barramento aloca os filhos
-    /// dentro delas, e não contra elas; sem ancestral produtor, `None`.
-    fn windows(&self, resource_type: u8) -> Option<Vec<(u64, u64)>> {
+    /// As janelas do barramento que produz o tipo para o nó: as faixas de
+    /// janela (WINDOW_DECODE; todo número de barramento) atribuídas ao
+    /// primeiro ancestral que as tem (o barramento PCI com o _CRS), e
+    /// quantos ancestrais ficam abaixo dele. Um árbitro de barramento aloca
+    /// os filhos dentro delas, e não contra elas; sem barramento produtor,
+    /// `None`.
+    fn windows(&self, resource_type: u8) -> Option<(usize, Vec<(u64, u64)>)> {
         let assigned = ASSIGNED.lock();
-        self.ancestors.iter().find_map(|&ancestor| {
-            let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
-            (!ranges.is_empty()).then_some(ranges)
+        self.ancestors.iter().enumerate().find_map(|(position, &ancestor)| {
+            let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type && is_window(resource)).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
+            (!ranges.is_empty()).then_some((position, ranges))
         })
     }
 }
 
+/// CM_RESOURCE_PORT_WINDOW_DECODE e CM_RESOURCE_MEMORY_WINDOW_DECODE.
+const PORT_WINDOW_DECODE: u16 = 0x0080;
+const MEMORY_WINDOW_DECODE: u16 = 0x0040;
+
+/// A faixa é uma janela que o barramento repassa aos filhos.
+fn is_window(resource: &Resource) -> bool {
+    match resource.resource_type {
+        resource_type::PORT => resource.flags & PORT_WINDOW_DECODE != 0,
+        resource_type::MEMORY => resource.flags & MEMORY_WINDOW_DECODE != 0,
+        resource_type::BUS_NUMBER => true,
+        _ => false,
+    }
+}
+
 /// A faixa [start, start+length) colide com uma atribuição exclusiva de
-/// outro nó; as janelas dos ancestrais (os barramentos acima do nó) não
-/// colidem com os filhos.
-fn conflicts(requester: &Requester, resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
+/// outro nó; as faixas de `outside` (o barramento produtor e os ancestrais
+/// dele) não colidem com os filhos.
+fn conflicts(requester: &Requester, outside: &[u64], resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
     let owner = requester.owner;
     let overlaps = |other: &Resource| {
         if other.resource_type != resource_type {
@@ -328,7 +346,7 @@ fn conflicts(requester: &Requester, resource_type: u8, start: u64, length: u64, 
         };
         start < other.start + other_length && other.start < start + length && !(share == SHARE_SHARED && other.share == SHARE_SHARED)
     };
-    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && !requester.ancestors.contains(holder) && overlaps(other)) || pending.iter().any(overlaps)
+    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && !outside.contains(holder) && overlaps(other)) || pending.iter().any(overlaps)
 }
 
 /// A primeira posição livre de uma opção (None = não cabe).
@@ -342,11 +360,12 @@ fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option
                 return None;
             }
             let alignment = choice.alignment.max(1);
-            let windows = requester.windows(choice.resource_type);
-            let inside = |start: u64| windows.as_ref().is_none_or(|windows| windows.iter().any(|&(low, high)| start >= low && start + length <= high));
+            let domain = requester.windows(choice.resource_type);
+            let outside: &[u64] = domain.as_ref().map_or(&[], |(position, _)| &requester.ancestors[*position..]);
+            let inside = |start: u64| domain.as_ref().is_none_or(|(_, windows)| windows.iter().any(|&(low, high)| start >= low && start + length <= high));
             let mut start = choice.minimum.div_ceil(alignment) * alignment;
             while start.checked_add(length - 1).is_some_and(|end| end <= choice.maximum) {
-                if inside(start) && !conflicts(requester, choice.resource_type, start, length, share, pending) {
+                if inside(start) && !conflicts(requester, outside, choice.resource_type, start, length, share, pending) {
                     return Some(make(start, choice.length, [0; 3]));
                 }
                 start += alignment;
@@ -354,7 +373,7 @@ fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option
             None
         }
         resource_type::INTERRUPT | resource_type::DMA => {
-            (choice.minimum..=choice.maximum).find(|&value| !conflicts(requester, choice.resource_type, value, 1, share, pending)).map(|value| {
+            (choice.minimum..=choice.maximum).find(|&value| !conflicts(requester, &[], choice.resource_type, value, 1, share, pending)).map(|value| {
                 // Lista bruta: Level = Vector = a linha.
                 let affinity = if choice.affinity == 0 { u64::MAX } else { choice.affinity };
                 make(value, value as u32, [affinity as u32, (affinity >> 32) as u32, 0])

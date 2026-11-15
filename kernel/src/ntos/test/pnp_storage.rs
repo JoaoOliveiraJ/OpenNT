@@ -219,7 +219,7 @@ fn tree_support(assert: Assert) {
     devnode::insert(devnode::DeviceNode::new(bus, 0, 1));
     devnode::insert(devnode::DeviceNode::new(child, bus, 2));
     devnode::insert(devnode::DeviceNode::new(sibling, bus, 2));
-    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
+    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0x81, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
     resources::reserve(bus, &window);
     let anywhere = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice(0, 0xFFFF, 0x10)]]] };
     let inside = resources::assign(child, &anywhere);
@@ -228,7 +228,18 @@ fn tree_support(assert: Assert) {
         resources::release(owner);
         let _ = devnode::remove(owner);
     }
-    assert(inside.as_ref().is_some_and(|list| list.resources[0].start == 0xD000) && next.as_ref().is_some_and(|list| list.resources[0].start == 0xD010), "pnp-storage: o filho do barramento com janela fica dentro dela, sem colidir com a do pai");
+    let device = 0x7_7000_0013u64;
+    devnode::insert(devnode::DeviceNode::new(device, 0, 1));
+    let grandchild = 0x7_7000_0014u64;
+    devnode::insert(devnode::DeviceNode::new(grandchild, device, 2));
+    let bar = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, start: 0xE000, length: 0x10, extra: [0; 3] }] };
+    resources::reserve(device, &bar);
+    let free = resources::assign(grandchild, &anywhere);
+    for owner in [device, grandchild] {
+        resources::release(owner);
+        let _ = devnode::remove(owner);
+    }
+    assert(inside.as_ref().is_some_and(|list| list.resources[0].start == 0xD000) && next.as_ref().is_some_and(|list| list.resources[0].start == 0xD010) && free.as_ref().is_some_and(|list| list.resources[0].start != 0xE000 && !(0xD000..0xE000).contains(&list.resources[0].start)), "pnp-storage: o filho do barramento com janela fica dentro dela, sem colidir com a do pai; o BAR de um dispositivo nao prende os filhos");
     let interrupt =resources::CmList { interface_type: 1, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::INTERRUPT, share: 1, flags: 1, start: 14, length: 14, extra: [u32::MAX, u32::MAX, 0] }] };
     let translated = resources::translate(&interrupt);
     assert(translated.resources[0].length == 0x2E && translated.resources[0].start == 14, "pnp-storage: IRQ 14 traduzida para o vetor 0x2E no IRQL 14");
