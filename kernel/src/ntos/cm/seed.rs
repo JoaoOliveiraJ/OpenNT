@@ -70,7 +70,7 @@ pub fn multi(strings: &[&str]) -> Vec<u8> {
 /// `smss_boot`: o boot do processo inicial real (`--initial-process=smss`).
 pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::service::boot_services::driver_keys();
-    keys.extend(super::service::inbox_drivers::seed_keys());
+    keys.extend(super::service::inbox_drivers::seed_keys(smss_boot));
     keys.extend(super::service::boot_services::parameter_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());

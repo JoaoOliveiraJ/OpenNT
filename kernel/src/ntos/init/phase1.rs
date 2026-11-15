@@ -62,6 +62,10 @@ pub fn init() {
         Ok(count) => debug_print!("[boot] PCI: {} funcoes", count),
         Err(error) => debug_print!("[pci] enumeracao falhou: {}", error),
     }
+    // Control\GraphicsDrivers da instalação, que o dxgkrnl.sys abre no
+    // DriverEntry: antes dos drivers de sistema, entre os quais ele está no
+    // boot do smss.
+    crate::ntos::cm::graphics_defaults::initialize().unwrap_or_else(|error| panic!("GraphicsDrivers: {error}"));
     // Drivers de serviço lidos do Registry + PnP START. O provedor de status
     // dos drivers entra com `cm::service::driver`.
     crate::ntos::cm::service::driver::init();
@@ -73,8 +77,6 @@ pub fn init() {
     // Catálogo CNG publicado antes de qualquer processo de usuário. O cng.sys
     // é o binário real do Windows no volume: o OpenNT não o distribui.
     crate::ntos::cm::cng_defaults::initialize().unwrap_or_else(|error| panic!("CNG: {error}"));
-    // Control\GraphicsDrivers da instalação, que o dxgkrnl.sys abre no DriverEntry.
-    crate::ntos::cm::graphics_defaults::initialize().unwrap_or_else(|error| panic!("GraphicsDrivers: {error}"));
     // Control\Nsi da instalação, o repositório persistente do netio.sys.
     crate::ntos::cm::network_defaults::initialize().unwrap_or_else(|error| panic!("Nsi: {error}"));
     // O cng.sys real do volume, antes de qualquer processo de usuário: imagem,

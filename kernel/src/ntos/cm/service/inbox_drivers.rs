@@ -14,7 +14,10 @@
 //! ainda não fazem parte do boot e sobem quando pedidos (o DriverEntry do
 //! pcw.sys ainda não completa). Com o pcw fora do boot, o
 //! ExpPcwDisabledStatus lê Start != 0 e os Pcw* sem extensão devolvem
-//! sucesso com handle nulo, como num Windows com o pcw desligado. As
+//! sucesso com handle nulo, como num Windows com o pcw desligado. No boot
+//! do processo inicial real (`--initial-process=smss`) o DXGKrnl volta ao
+//! Start 1 da instalação: o boot o carrega com os drivers de sistema, antes
+//! de o smss carregar o win32k.sys, que se conecta a \Device\DxgKrnl. As
 //! subchaves com dados da máquina (Parameters, Linkage, interfaces) não são
 //! copiadas. O NetIO não tem chave: ele carrega como dependência de import
 //! do NDIS e do Tcpip.
@@ -87,6 +90,9 @@ struct InboxDriver {
     /// None: a chave da instalação não tem ImagePath.
     image_path: Option<&'static str>,
     start: u32,
+    /// Start no boot do processo inicial real (`--initial-process=smss`),
+    /// quando ele segue o da instalação e não o sob demanda.
+    smss_start: Option<u32>,
     error_control: u32,
     group: &'static str,
     tag: Option<u32>,
@@ -95,38 +101,40 @@ struct InboxDriver {
 }
 
 const DRIVERS: &[InboxDriver] = &[
-    InboxDriver { name: "pcw", display_name: Some("Performance Counters for Windows Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\pcw.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "System Reserved", tag: None, dwords: &[] },
-    InboxDriver { name: "condrv", display_name: Some("Console Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\condrv.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: None, dwords: &[] },
-    InboxDriver { name: "KSecDD", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\Drivers\\ksecdd.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Base", tag: Some(1), dwords: &[] },
-    InboxDriver { name: "NDIS", display_name: Some("@%SystemRoot%\\system32\\drivers\\ndis.sys,-200"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\ndis.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "NDIS Wrapper", tag: None, dwords: &[] },
+    InboxDriver { name: "pcw", display_name: Some("Performance Counters for Windows Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\pcw.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "System Reserved", tag: None, dwords: &[] },
+    InboxDriver { name: "condrv", display_name: Some("Console Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\condrv.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Base", tag: None, dwords: &[] },
+    InboxDriver { name: "KSecDD", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\Drivers\\ksecdd.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Base", tag: Some(1), dwords: &[] },
+    InboxDriver { name: "NDIS", display_name: Some("@%SystemRoot%\\system32\\drivers\\ndis.sys,-200"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\ndis.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "NDIS Wrapper", tag: None, dwords: &[] },
     InboxDriver {
         name: "Tcpip",
         display_name: Some("@%SystemRoot%\\system32\\drivers\\tcpip.sys,-10001"),
         service_type: SERVICE_KERNEL_DRIVER,
         image_path: Some("System32\\drivers\\tcpip.sys"),
         start: SERVICE_DEMAND_START,
+        smss_start: None,
         error_control: 1,
         group: "PNP_TDI",
         tag: Some(3),
         dwords: &[("BootFlags", 1), ("NdisMajorVersion", 6), ("NdisMinorVersion", 40), ("DriverMajorVersion", 0), ("DriverMinorVersion", 0)],
     },
-    InboxDriver { name: "DXGKrnl", display_name: Some("LDDM Graphics Subsystem"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\System32\\drivers\\dxgkrnl.sys"), start: SERVICE_DEMAND_START, error_control: 0, group: "Video Init", tag: Some(1), dwords: &[] },
-    InboxDriver { name: "KSecPkg", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\Drivers\\ksecpkg.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Cryptography", tag: Some(2), dwords: &[] },
-    InboxDriver { name: "Null", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(1), dwords: &[] },
-    InboxDriver { name: "Beep", display_name: Some("Beep"), service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 1, group: "Base", tag: Some(2), dwords: &[] },
-    InboxDriver { name: "Fs_Rec", display_name: None, service_type: SERVICE_RECOGNIZER_DRIVER, image_path: None, start: SERVICE_DEMAND_START, error_control: 0, group: "File System", tag: None, dwords: &[] },
-    InboxDriver { name: "CLFS", display_name: Some("@%SystemRoot%\\system32\\drivers\\clfs.sys,-100"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\CLFS.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Filter", tag: Some(1), dwords: &[] },
-    InboxDriver { name: "Npfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
-    InboxDriver { name: "Msfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, error_control: 1, group: "File system", tag: None, dwords: &[] },
-    InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
-    InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\Wdf01000.sys"), start: SERVICE_DEMAND_START, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
-    InboxDriver { name: "msisadrv", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\msisadrv.sys"), start: SERVICE_DEMAND_START, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
+    InboxDriver { name: "DXGKrnl", display_name: Some("LDDM Graphics Subsystem"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\System32\\drivers\\dxgkrnl.sys"), start: SERVICE_DEMAND_START, smss_start: Some(SERVICE_SYSTEM_START), error_control: 0, group: "Video Init", tag: Some(1), dwords: &[] },
+    InboxDriver { name: "KSecPkg", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\Drivers\\ksecpkg.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Cryptography", tag: Some(2), dwords: &[] },
+    InboxDriver { name: "Null", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Base", tag: Some(1), dwords: &[] },
+    InboxDriver { name: "Beep", display_name: Some("Beep"), service_type: SERVICE_KERNEL_DRIVER, image_path: None, start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Base", tag: Some(2), dwords: &[] },
+    InboxDriver { name: "Fs_Rec", display_name: None, service_type: SERVICE_RECOGNIZER_DRIVER, image_path: None, start: SERVICE_DEMAND_START, smss_start: None, error_control: 0, group: "File System", tag: None, dwords: &[] },
+    InboxDriver { name: "CLFS", display_name: Some("@%SystemRoot%\\system32\\drivers\\clfs.sys,-100"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\CLFS.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Filter", tag: Some(1), dwords: &[] },
+    InboxDriver { name: "Npfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, smss_start: None, error_control: 1, group: "File system", tag: None, dwords: &[] },
+    InboxDriver { name: "Msfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, smss_start: None, error_control: 1, group: "File system", tag: None, dwords: &[] },
+    InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
+    InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\Wdf01000.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
+    InboxDriver { name: "msisadrv", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\msisadrv.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
     InboxDriver {
         name: "BasicDisplay",
         display_name: None,
         service_type: SERVICE_KERNEL_DRIVER,
         image_path: Some("\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicdisplay.inf_amd64_19e58b6267591a82\\BasicDisplay.sys"),
         start: SERVICE_DEMAND_START,
+        smss_start: None,
         error_control: 0,
         group: "Video",
         tag: Some(1),
@@ -154,14 +162,19 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
 ];
 
 /// As chaves dos drivers inbox, dos file systems e os valores do KMDF.
-pub fn seed_keys() -> Vec<SeedKey> {
+/// `smss_boot`: o boot do processo inicial real (`--initial-process=smss`).
+pub fn seed_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = Vec::new();
     for driver in DRIVERS {
+        let start = match driver.smss_start {
+            Some(start) if smss_boot => start,
+            _ => driver.start,
+        };
         let mut key = match driver.image_path {
-            Some(image_path) => service_key(driver.name, driver.service_type, driver.start, driver.error_control, image_path, driver.display_name.unwrap_or(driver.name)),
+            Some(image_path) => service_key(driver.name, driver.service_type, start, driver.error_control, image_path, driver.display_name.unwrap_or(driver.name)),
             None => {
                 let mut key = SeedKey::new(&format!("CurrentControlSet\\Services\\{}", driver.name));
-                key.dword("Type", driver.service_type).dword("Start", driver.start).dword("ErrorControl", driver.error_control);
+                key.dword("Type", driver.service_type).dword("Start", start).dword("ErrorControl", driver.error_control);
                 if let Some(display_name) = driver.display_name {
                     key.text("DisplayName", REG_SZ, display_name);
                 }

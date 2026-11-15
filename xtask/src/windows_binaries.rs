@@ -18,7 +18,9 @@
 //! usuário que o smss.exe real e o csrss.exe real carregam, na raiz (o
 //! `C:\Windows\System32` que o modo usuário vê): os dois executáveis, as
 //! DLLs de servidor do csrss e o fecho dos imports delas (estáticos e pelos
-//! API sets do apisetschema.dll desta máquina).
+//! API sets do apisetschema.dll desta máquina), e as imagens de kernel do
+//! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys, com o
+//! hidparse.sys e o cdd.dll).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -182,6 +184,19 @@ const SMSS_PROGRAMS: &[&str] = &[
     "cfgmgr32.dll",
 ];
 
+/// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
+/// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
+/// e o win32kfull.sys que ele carrega como imagens de sessão, o hidparse.sys
+/// que vem antes do win32kfull e o cdd.dll (o driver de exibição do GDI).
+/// (caminho no volume, origem no Windows).
+const SMSS_KERNEL_IMAGES: &[(&str, &str)] = &[
+    ("WIN32K.SYS", "System32/win32k.sys"),
+    ("WIN32KBASE.SYS", "System32/win32kbase.sys"),
+    ("WIN32KFULL.SYS", "System32/win32kfull.sys"),
+    ("HIDPARSE.SYS", "System32/drivers/hidparse.sys"),
+    ("CDD.DLL", "System32/cdd.dll"),
+];
+
 fn windows_directory() -> PathBuf {
     std::env::var("SystemRoot").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Windows"))
 }
@@ -280,6 +295,18 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", SMSS_PROGRAMS.len());
+        let mut images = 0;
+        for (name, relative) in SMSS_KERNEL_IMAGES {
+            let source = windows.join(relative);
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    files.push((String::from(*name), bytes));
+                    images += 1;
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+        }
+        println!("imagens de kernel do smss no volume NTFS: {images} de {}", SMSS_KERNEL_IMAGES.len());
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));

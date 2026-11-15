@@ -6,11 +6,13 @@
 //! (um valor por DLL), os dispositivos DOS, o ambiente do sistema, os
 //! diretórios de objetos e os parâmetros do Memory Management.
 //!
-//! Ficam de fora o que pertence a outro marco ou à máquina de origem: o
-//! `Kmode` (a carga do win32k.sys pelo smss), o `BootExecute` (o autochk), os
-//! arquivos de paginação e as renomeações pendentes; do ambiente saem os
-//! caminhos de programas de terceiros. Só o boot do processo inicial real
-//! (`--initial-process=smss`) leva esta configuração.
+//! O `SubSystems` leva o `Kmode` da instalação
+//! (`\SystemRoot\System32\win32k.sys`): o smss da sessão o carrega pela
+//! SystemExtendServiceTableInformation antes de criar o csrss. Ficam de fora
+//! o que pertence a outro marco ou à máquina de origem: o `BootExecute` (o
+//! autochk), os arquivos de paginação e as renomeações pendentes; do
+//! ambiente saem os caminhos de programas de terceiros. Só o boot do
+//! processo inicial real (`--initial-process=smss`) leva esta configuração.
 //!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): o `xtask` grava estas
 //! chaves no arquivo da hive e o kernel só as semeia em memória quando o
@@ -58,10 +60,11 @@ const ROOT: &[(&str, Value)] = &[
     ("AutoChkSkipSystemPartition", Value::Number(0)),
 ];
 
-/// `SubSystems`, sem o `Kmode`.
+/// `SubSystems`.
 const SUBSYSTEMS: &[(&str, Value)] = &[
     ("", Value::Text(REG_SZ, "mnmsrvc")),
     ("Debug", Value::Text(REG_EXPAND_SZ, "")),
+    ("Kmode", Value::Text(REG_EXPAND_SZ, "\\SystemRoot\\System32\\win32k.sys")),
     ("Optional", Value::Strings(&[])),
     ("Required", Value::Strings(&["Debug", "Windows"])),
     (
