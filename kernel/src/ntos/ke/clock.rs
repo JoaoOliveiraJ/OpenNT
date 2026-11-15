@@ -1,12 +1,20 @@
 //! Relógio do kernel baseado no TSC.
 //!
-//! A frequência vem da folha CPUID 0x15, quando válida, ou de calibração com
-//! o PIT. O RTC fornece apenas a referência inicial do relógio de parede.
-//! Os cálculos são inteiros: o kernel Rust é compilado sem SSE.
+//! A frequência vem da folha CPUID 0x15, quando ela traz o cristal e a
+//! razão; senão é medida contra o timer de gerenciamento de energia do ACPI
+//! (o PM_TMR_BLK do FADT, 3,579545 MHz, contador livre), como a calibração
+//! do HAL: cada ponta da janela lê o contador entre duas leituras do TSC e
+//! fica com a leitura de colchete mais estreito, e a janela é longa (100 ms),
+//! então uma CPU virtual tirada de execução pelo hospedeiro no meio da
+//! medida não a distorce (os dois relógios andam juntos enquanto ela está
+//! parada). Três janelas, e vale a mediana. Sem o timer do ACPI, o canal 0
+//! do PIT na mesma forma: contagem lida por latch entre duas leituras do
+//! TSC. O RTC fornece apenas a referência inicial do relógio de parede. Os
+//! cálculos são inteiros: o kernel Rust é compilado sem SSE.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::hal::{cpu, physical, port};
+use crate::hal::{acpi, cpu, physical, port};
 use crate::ntos::inc::types::{Field, LargeInteger, NtStruct};
 use crate::rtl::text::fixed1;
 use crate::rtl::time;
@@ -25,43 +33,176 @@ const CELL_TSC_FREQUENCY: u64 = 0x81534;
 const CELL_TSC_AT_BOOT: u64 = 0x81538;
 const CELL_BOOT_TIME: u64 = 0x81540;
 
-/// Programa o canal zero do PIT para 11931 contagens e mede quantos ticks de
-/// TSC transcorreram até OUT indicar término.
-fn calibrate_with_interval_timer() -> u64 {
-    const INTERVAL_TIMER_COUNT: u64 = 11931;
+/// Frequência do timer de gerenciamento de energia do ACPI.
+const PM_TIMER_HERTZ: u64 = 3_579_545;
+/// Frequência de entrada do PIT 8254.
+const PIT_HERTZ: u64 = 1_193_182;
+/// Duração de cada janela de calibração, em ms.
+const CALIBRATION_WINDOW_MS: u64 = 100;
+/// Janelas de calibração (vale a mediana).
+const CALIBRATION_WINDOWS: usize = 3;
+/// Leituras de colchete por ponta de janela (fica a mais estreita).
+const BRACKET_TRIES: usize = 16;
 
-    // Canal zero, byte baixo/alto, modo one-shot, depois o divisor.
-    port::write8(0x43, 0x30);
-    port::write8(0x40, (INTERVAL_TIMER_COUNT & 0xFF) as u8);
-    port::write8(0x40, ((INTERVAL_TIMER_COUNT >> 8) & 0xFF) as u8);
+/// Um contador de referência livre: lê o valor corrente, a largura em bits
+/// e a frequência; o valor sobe (o PIT, que desce, é invertido na leitura).
+#[derive(Clone, Copy)]
+enum Reference {
+    /// ACPI PM timer: porta e largura (24 ou 32 bits, FADT.TMR_VAL_EXT).
+    PmTimer { port: u16, bits: u32 },
+    /// Canal 0 do PIT em modo 2 com recarga 0x10000 (16 bits).
+    Pit,
+}
 
-    let start = cpu::rdtsc();
-    loop {
-        // No read-back, a seleção do contador é ativa em um: 0xE2 lê o
-        // status do canal zero (0xE0 não selecionaria canal algum).
-        port::write8(0x43, 0xE2);
-        if port::read8(0x40) & 0x80 != 0 {
-            break;
+impl Reference {
+    fn hertz(self) -> u64 {
+        match self {
+            Reference::PmTimer { .. } => PM_TIMER_HERTZ,
+            Reference::Pit => PIT_HERTZ,
         }
     }
-    let elapsed = cpu::rdtsc() - start;
-    (elapsed as u128 * 1_193_182 / INTERVAL_TIMER_COUNT as u128) as u64
+
+    fn bits(self) -> u32 {
+        match self {
+            Reference::PmTimer { bits, .. } => bits,
+            Reference::Pit => 16,
+        }
+    }
+
+    fn read(self) -> u64 {
+        match self {
+            Reference::PmTimer { port, bits } => port::read32(port) as u64 & ((1u64 << bits) - 1),
+            Reference::Pit => {
+                // Latch do canal 0 e leitura byte baixo/alto; a contagem desce.
+                port::write8(0x43, 0x00);
+                let low = port::read8(0x40) as u64;
+                let high = port::read8(0x40) as u64;
+                0xFFFF - ((high << 8) | low)
+            }
+        }
+    }
+
+    /// Diferença `later - earlier` no módulo do contador.
+    fn delta(self, earlier: u64, later: u64) -> u64 {
+        later.wrapping_sub(earlier) & ((1u64 << self.bits()) - 1)
+    }
+}
+
+/// O timer do ACPI pelo FADT: PM_TMR_BLK (+76), PM_TMR_LEN (+91) e
+/// TMR_VAL_EXT (bit 8 das flags em +112).
+fn pm_timer_reference() -> Option<Reference> {
+    let fadt = acpi::get_table("FACP", 0, false)?;
+    let bytes = &fadt.bytes;
+    if bytes.len() < 116 {
+        return None;
+    }
+    let port = u32::from_le_bytes(bytes[76..80].try_into().ok()?);
+    let length = bytes[91];
+    let flags = u32::from_le_bytes(bytes[112..116].try_into().ok()?);
+    if port == 0 || port > 0xFFFC || length < 4 {
+        return None;
+    }
+    Some(Reference::PmTimer { port: port as u16, bits: if flags & (1 << 8) != 0 { 32 } else { 24 } })
+}
+
+/// Uma leitura do contador entre duas do TSC: (TSC no meio do colchete,
+/// valor), da tentativa de colchete mais estreito.
+fn bracketed_sample(reference: Reference) -> (u64, u64) {
+    let mut best = (u64::MAX, 0u64, 0u64);
+    for _ in 0..BRACKET_TRIES {
+        let before = cpu::rdtsc();
+        let value = reference.read();
+        let after = cpu::rdtsc();
+        let width = after.wrapping_sub(before);
+        if width < best.0 {
+            best = (width, before + width / 2, value);
+        }
+    }
+    (best.1, best.2)
+}
+
+/// Uma janela: TSC e contador nas duas pontas, com o contador andando
+/// `CALIBRATION_WINDOW_MS` entre elas (em passos menores que meia volta,
+/// para atravessar as voltas de um contador curto).
+fn measure_window(reference: Reference) -> u64 {
+    let target = reference.hertz() * CALIBRATION_WINDOW_MS / 1000;
+    let half_turn = 1u64 << (reference.bits() - 1);
+    let (start_tsc, start_value) = bracketed_sample(reference);
+    let mut elapsed = 0u64;
+    let mut last = start_value;
+    while elapsed < target {
+        let now = reference.read();
+        let step = reference.delta(last, now);
+        if step < half_turn {
+            elapsed += step;
+            last = now;
+        }
+        core::hint::spin_loop();
+    }
+    let (end_tsc, end_value) = bracketed_sample(reference);
+    let counted = elapsed + reference.delta(last, end_value);
+    if counted == 0 {
+        return 0;
+    }
+    (end_tsc.wrapping_sub(start_tsc) as u128 * reference.hertz() as u128 / counted as u128) as u64
+}
+
+/// A mediana de `CALIBRATION_WINDOWS` janelas contra `reference`.
+fn calibrate_against(reference: Reference) -> u64 {
+    if let Reference::Pit = reference {
+        // Canal 0, byte baixo/alto, modo 2 (gerador de taxa), recarga 0x10000.
+        port::write8(0x43, 0x34);
+        port::write8(0x40, 0);
+        port::write8(0x40, 0);
+    }
+    let mut samples = [0u64; CALIBRATION_WINDOWS];
+    for sample in samples.iter_mut() {
+        *sample = measure_window(reference);
+    }
+    if let Reference::Pit = reference {
+        // De volta ao modo 0 (um disparo só), como o canal ficava antes.
+        port::write8(0x43, 0x30);
+        port::write8(0x40, 0xFF);
+        port::write8(0x40, 0xFF);
+    }
+    samples.sort_unstable();
+    samples[CALIBRATION_WINDOWS / 2]
+}
+
+/// A frequência do TSC pela folha CPUID 0x15 (cristal × razão), quando a
+/// folha traz os três valores.
+fn cpuid_frequency() -> u64 {
+    // Folhas não suportadas podem devolver dados da última folha existente.
+    let maximum_basic_leaf = cpu::cpuid(0)[0];
+    let leaf = if maximum_basic_leaf >= 0x15 { cpu::cpuid(0x15) } else { [0; 4] };
+    if leaf[2] != 0 && leaf[0] != 0 && leaf[1] != 0 {
+        leaf[2] as u64 * leaf[1] as u64 / leaf[0] as u64
+    } else {
+        0
+    }
+}
+
+/// Mede de novo a frequência do TSC contra a mesma referência do boot (o
+/// timer do ACPI ou o PIT): o autoteste confere que ela concorda com a do
+/// boot. `None` quando o boot usou a folha CPUID 0x15.
+pub fn remeasure_tsc_frequency() -> Option<u64> {
+    if cpuid_frequency() != 0 {
+        return None;
+    }
+    Some(calibrate_against(pm_timer_reference().unwrap_or(Reference::Pit)))
 }
 
 /// Descobre ou mede a frequência, captura as referências de boot e publica
 /// os valores usados pelo caminho nativo de atualização de tempo.
 pub fn init() {
-    // Folhas não suportadas podem devolver dados da última folha existente.
-    let maximum_basic_leaf = cpu::cpuid(0)[0];
-    let frequency_leaf = if maximum_basic_leaf >= 0x15 { cpu::cpuid(0x15) } else { [0; 4] };
-
-    let mut frequency = 0u64;
-    if frequency_leaf[2] != 0 && frequency_leaf[0] != 0 && frequency_leaf[1] != 0 {
-        frequency = frequency_leaf[2] as u64 * frequency_leaf[1] as u64 / frequency_leaf[0] as u64;
-    }
+    let mut frequency = cpuid_frequency();
     if frequency == 0 {
-        debug_print!("[clock] CPUID.15 ausente — calibrando TSC via PIT");
-        frequency = calibrate_with_interval_timer().max(1);
+        let (reference, name) = match pm_timer_reference() {
+            Some(reference) => (reference, "timer do ACPI"),
+            None => (Reference::Pit, "PIT"),
+        };
+        debug_print!("[clock] CPUID.15 ausente — calibrando TSC contra o {}", name);
+        frequency = calibrate_against(reference).max(1);
     }
     FREQUENCY_HERTZ.store(frequency, Ordering::Relaxed);
 

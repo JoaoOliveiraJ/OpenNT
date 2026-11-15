@@ -185,6 +185,16 @@ pub fn run() {
         debug_print!("[selftest] IDT nao carregada - tick test pulado");
     }
 
+    // relógio: a frequência do TSC medida de novo contra a mesma referência
+    // do boot (timer do ACPI ou PIT) concorda com a calibrada (até 0,5%):
+    // a calibração não depende de quanto a CPU virtual andou na janela.
+    if let Some(measured) = clock::remeasure_tsc_frequency() {
+        let calibrated = clock::tsc_frequency_hz();
+        let difference = measured.abs_diff(calibrated);
+        debug_print!("[selftest] TSC calibrado {} Hz, medido de novo {} Hz", calibrated, measured);
+        assert(calibrated > 0 && difference * 200 <= calibrated, "TSC: a frequencia medida de novo concorda com a do boot (ate 0,5%)");
+    }
+
     // nanokernel: IPC por canal nomeado
     message_channels::create_channel("teste");
     message_channels::send("teste", "42");
