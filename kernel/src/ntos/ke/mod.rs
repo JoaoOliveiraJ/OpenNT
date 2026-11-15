@@ -43,6 +43,20 @@ pub mod cache_flush;
 pub mod timer2;
 pub mod device_queue;
 
+/// As APCs de kernel da thread corrente, em PASSIVE_LEVEL: as da fila dela e
+/// as conclusões de E/S que só o contexto dela termina (o papel da APC
+/// especial do IopCompleteRequest). Uma thread de kernel as recebe ao sair de
+/// uma espera com STATUS_KERNEL_APC e na entrada dos exports.
+pub fn deliver_thread_apcs() {
+    let _ = apc::deliver_all_queued();
+    crate::ntos::io::file::request::pump();
+}
+
+/// Há APC de kernel ou conclusão de E/S esperando a thread `thread`.
+pub fn thread_apcs_pending(thread: u64) -> bool {
+    apc::has_pending(thread) || crate::ntos::io::file::request::has_completions_for(thread)
+}
+
 /// O kernel drena timers, DPCs, work items e IoTimers no laço ocioso, como o
 /// NT ao cair de DISPATCH_LEVEL.
 pub fn run_kernel_tasks() {

@@ -360,6 +360,10 @@ pub fn block_polled(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
         if let Some(status) = result.get() {
             return status;
         }
+        // Aprontada por uma APC de kernel: entregue aqui, na própria pilha.
+        if crate::ntos::ke::irql::get_irql() == crate::ntos::ke::irql::PASSIVE_LEVEL && crate::ntos::ke::thread_apcs_pending(thread) {
+            crate::ntos::ke::deliver_thread_apcs();
+        }
         // SAFETY: a sondagem é da própria thread, que voltou a executar.
         if let Some(status) = unsafe { (*raw)() } {
             return status;
@@ -424,6 +428,27 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
     }
     process::account_thread(thread, true, clock::uptime_100ns() - started);
     thread_dispatch::end_execution(thread, new_state)
+}
+
+/// Uma APC de kernel para uma thread de kernel parada numa espera sondada:
+/// ela volta à fila, entrega as APCs na própria pilha e sonda a condição de
+/// novo (`block_polled`). `false` se a thread não está numa espera sondada.
+pub fn wake_polled(thread: u64) -> bool {
+    let Some(pid) = thread_dispatch::owner(thread).map(|owner| owner.runtime).filter(|&runtime| runtime & thread_dispatch::USER_RUNTIME == 0) else { return false };
+    let woken = {
+        let mut state = STATE.lock();
+        match state.processes.iter_mut().find(|process| process.pid as u64 == pid) {
+            Some(process) if process.state == ProcessState::Waiting && process.prepare_dispatch.is_some() => {
+                process.state = ProcessState::Ready;
+                true
+            }
+            _ => false,
+        }
+    };
+    if woken {
+        let _ = thread_dispatch::make_ready(thread);
+    }
+    woken
 }
 
 /// Uma thread de kernel parada numa espera de objeto foi aprontada pelo

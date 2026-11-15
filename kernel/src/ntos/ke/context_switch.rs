@@ -572,8 +572,8 @@ pub fn quantum_end_at_service_entry() {
         yield_kernel_thread(false);
     }
     // As APCs de kernel pendentes entram ao cair para PASSIVE_LEVEL.
-    if super::apc::has_pending(thread) {
-        let _ = super::apc::deliver_all_queued();
+    if super::thread_apcs_pending(thread) {
+        super::deliver_thread_apcs();
     }
 }
 

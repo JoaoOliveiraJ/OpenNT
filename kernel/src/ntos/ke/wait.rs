@@ -46,7 +46,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{apc, bugcheck, clock, context_switch, dispatcher, thread_alert, thread_dispatch, timer};
+use super::{bugcheck, clock, context_switch, dispatcher, thread_alert, thread_dispatch, timer};
 use super::context_switch::SwitchReason;
 use crate::ntos::inc::types::{DispatcherHeader, Kthread, KwaitBlock, ListEntry, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
@@ -506,7 +506,7 @@ fn wait_loop(objects: &[u64], deadline: Deadline, mut spec: WaitSpec, mut attemp
         if status != STATUS_KERNEL_APC as u64 {
             return status;
         }
-        let _ = apc::deliver_all_queued();
+        super::deliver_thread_apcs();
     }
 }
 
@@ -579,7 +579,7 @@ pub fn wait_queue(queue: u64, deadline: Deadline, mode: u8, alertable: bool, mut
         if status != STATUS_KERNEL_APC as u64 {
             return QueueWait::Status(status as u32);
         }
-        let _ = apc::deliver_all_queued();
+        super::deliver_thread_apcs();
     }
 }
 
@@ -605,7 +605,7 @@ pub fn wait_woken(poll: &mut dyn FnMut() -> Option<u32>, watch: Option<u64>, dea
         match wait_once(poll, watch, deadline, mode, alertable, wait_reason) {
             WaitOnce::Done(status) => return status,
             WaitOnce::Woken(STATUS_KERNEL_APC) => {
-                let _ = apc::deliver_all_queued();
+                super::deliver_thread_apcs();
             }
             WaitOnce::Woken(status @ (STATUS_ALERTED | STATUS_USER_APC | STATUS_TIMEOUT)) => return poll().unwrap_or(status),
             WaitOnce::Woken(_) => {}
@@ -686,8 +686,17 @@ pub fn alert(thread: u64, mode: u8) -> bool {
 /// do tipo dela habilitadas, sai com STATUS_KERNEL_APC.
 pub fn apc_queued(thread: u64, user_mode: bool, special: bool) {
     let mut lock = lock();
-    let Some(wait) = lock.table().waits.get(&thread) else { return };
     let target = kthread(thread);
+    let Some(wait) = lock.table().waits.get(&thread) else {
+        // Uma thread de kernel numa espera sondada, parada em PASSIVE_LEVEL,
+        // volta à fila para entregar a APC de kernel na própria pilha.
+        drop(lock);
+        let enabled = if special { target.special_apc_disable.get() == 0 } else { target.kernel_apc_disable.get() == 0 && target.special_apc_disable.get() == 0 };
+        if !user_mode && enabled && target.wait_irql.get() == super::irql::PASSIVE_LEVEL {
+            scheduler::wake_polled(thread);
+        }
+        return;
+    };
     if user_mode {
         if wait.alertable && wait.mode == 1 {
             target.apc_state.set_user_apc_pending(1);

@@ -6,11 +6,12 @@
 //! de handles de usuário entram com o estado de modo usuário (fase 7).
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ntos::io::{cancel, io_manager};
-use crate::ntos::ke::{apc, context_switch, dispatcher, irql, thread_alert};
+use crate::ntos::ke::{apc, context_switch, dispatcher, irql, thread_alert, wait};
 use crate::ntos::mm::io_pins::{self, Pin};
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::objects::file as file_objects;
@@ -224,10 +225,14 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
     if r.finished || !r.done {
         return Ok(());
     }
-    if process::get_current_thread() != r.thread || irql::get_irql() > 1 {
-        return Ok(());
-    }
-    if r.process.is_some_and(|owner| owner != process::get_current_process()) {
+    if process::get_current_thread() != r.thread || irql::get_irql() > 1 || r.process.is_some_and(|owner| owner != process::get_current_process()) {
+        // A conclusão é da thread que pediu (o IopCompleteRequest é uma APC
+        // especial de kernel dela): uma thread de kernel parada numa espera
+        // sai dela para concluir no próprio contexto.
+        let thread = r.thread;
+        drop(r);
+        AWAITING.lock().insert(thread);
+        wait::apc_queued(thread, false, true);
         return Ok(());
     }
     let status = r.status;
@@ -265,12 +270,21 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
     cleanup(request)
 }
 
+/// As threads com conclusão pendente que só elas podem terminar.
+static AWAITING: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+/// `thread` tem uma conclusão de E/S esperando o contexto dela.
+pub fn has_completions_for(thread: u64) -> bool {
+    AWAITING.lock().contains(&thread)
+}
+
 /// Bomba de conclusões em PASSIVE_LEVEL com APCs especiais habilitadas.
 pub fn pump() {
     // SAFETY: a thread corrente.
     if irql::get_irql() != 0 || unsafe { Kthread::at(process::get_current_thread()) }.special_apc_disable.get() != 0 {
         return;
     }
+    AWAITING.lock().remove(&process::get_current_thread());
     let pending: Vec<Shared> = REQUESTS.lock().clone();
     for request in pending {
         if let Err(error) = finish(&request) {
