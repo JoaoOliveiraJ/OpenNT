@@ -1708,3 +1708,26 @@ pub mod zw_reserve_object {
 
     pub static GROUP: Group = Group { name: "zw-reserve-object", names: &["ZwAllocateReserveObject"], handlers: &[allocate], data_exports: &[] };
 }
+
+pub mod ps_suspend_process {
+    //! PsSuspendProcess (`ps/suspend_resume`) e PsGetSiloContainerId
+    //! (`ps/silo/query`).
+
+    use crate::ntos::inc::types::{Eprocess, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::{silo::query, suspend_resume};
+    use crate::rtl::KernelError;
+
+    /// PsSuspendProcess(Process) -> NTSTATUS.
+    fn suspend_process(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PEPROCESS referenciado pelo chamador de modo kernel.
+        Ok(signed_status(suspend_resume::suspend_process(unsafe { Eprocess::at(call.arg(1)) })?))
+    }
+
+    /// PsGetSiloContainerId(Silo) -> LPGUID.
+    fn silo_container_id(call: &Call) -> Result<u64, KernelError> {
+        Ok(query::silo_container_id(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-suspend-process", names: &["PsSuspendProcess", "PsGetSiloContainerId"], handlers: &[suspend_process, silo_container_id], data_exports: &[] };
+}

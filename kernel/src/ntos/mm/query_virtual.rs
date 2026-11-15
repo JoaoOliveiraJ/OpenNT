@@ -90,6 +90,12 @@ fn regions(process: u64) -> Context {
     Context { user_regions, process_images, root: space.root() }
 }
 
+/// A região do processo que contém `va` (a descrição do
+/// ZwQueryVirtualMemory).
+pub(crate) fn describe_address(process: u64, va: u64) -> crate::ntos::ps::user::memory_query::Info {
+    memory_query::describe(va, &regions(process))
+}
+
 /// Buffer de kernel ou de usuário presente e gravável (resolve antes um
 /// dono paginado).
 fn writable(pointer: u64, bytes: u64) -> bool {

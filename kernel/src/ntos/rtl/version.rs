@@ -2,7 +2,8 @@
 //! RtlVerifyVersionInfo, VerSetConditionMask), produto (RtlGetNtProductType,
 //! RtlGetProductInfo, RtlGetSuiteMask, RtlIsMultiSessionSku), a raiz do
 //! sistema (RtlGetNtSystemRoot) e os recursos estendidos da CPU
-//! (RtlGetEnabledExtendedFeatures).
+//! (RtlGetEnabledExtendedFeatures) e as versões de DDI que ele aceita
+//! (RtlIsNtDdiVersionAvailable).
 //!
 //! Windows 10.0.26100, Win32 NT, estação de trabalho Professional, sem
 //! multissessão; recursos estendidos x87 e SSE.
@@ -126,6 +127,16 @@ pub fn product_info(product_type: u64) -> bool {
     // SAFETY: PULONG ReturnedProductType do chamador.
     unsafe { Field::<u32>::at(product_type) }.set(PRODUCT_PROFESSIONAL);
     true
+}
+
+/// NTDDI_WIN10_VB: a versão de DDI do ntoskrnl 19041.
+const NTDDI_WIN10_VB: u32 = 0x0A00_0008;
+
+/// RtlIsNtDdiVersionAvailable(Version) (ntoskrnl 19041 0x3cc5e0): os dois
+/// bytes baixos (o service pack de OSVER e o sub-release) precisam ser zero e
+/// a versão não pode passar de NTDDI_WIN10_VB.
+pub fn is_ntddi_version_available(version: u32) -> bool {
+    (version >> 8 | version) & 0xFF == 0 && version <= NTDDI_WIN10_VB
 }
 
 /// RtlGetNtSystemRoot: o texto em KUSER_SHARED_DATA.

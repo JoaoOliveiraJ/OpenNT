@@ -59,3 +59,67 @@ pub fn status_to_dos_error(status: u32) -> u32 {
         _ => 317,
     }
 }
+
+// ---- RtlAssert (ntoskrnl 19041 rva 0x588750) ---------------------------------
+//
+// RtlAssert(VoidFailedAssertion, VoidFileName, LineNumber, MutableMessage):
+// captura o contexto e imprime com DbgPrintEx(DPFLTR_DEFAULT_ID (101),
+// DPFLTR_ERROR_LEVEL, "\n*** Assertion failed: %s%s\n***   Source File: %s,
+// line %ld\n\n", Message ou "", Assertion, File, Line). Só com um depurador
+// ligado (KUSER_SHARED_DATA.KdDebuggerEnabled & 3 == 3) o DbgPrompt pergunta
+// "boipt": B/b e O/o imprimem ".cxr" e param no depurador (O sai depois),
+// I/i sai, P/p termina o processo corrente (PsTerminateProcess com
+// STATUS_UNSUCCESSFUL), T/t termina a thread corrente, qualquer outra
+// resposta repete; sem resposta, o breakpoint e o término do processo. Sem
+// depurador, a função só imprime e volta.
+
+const DPFLTR_DEFAULT_ID: u32 = 101;
+const ASSERT_STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+/// RtlAssert.
+pub fn assert_failed(assertion: u64, file: u64, line: u32, message: u64) -> Result<(), crate::rtl::KernelError> {
+    use crate::ntos::kd::debugger;
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::rtl::{guest_strings, printf};
+    let text = |pointer: u64| if pointer == 0 { alloc::string::String::from("(null)") } else { guest_strings::read_c_string(pointer) };
+    let report = alloc::format!(
+        "\n*** Assertion failed: {}{}\n***   Source File: {}, line {}\n\n",
+        if message == 0 { alloc::string::String::new() } else { text(message) },
+        text(assertion),
+        text(file),
+        line as i32
+    );
+    loop {
+        printf::debug_print_ex_text(DPFLTR_DEFAULT_ID, &report);
+        let debugger_enabled = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.kd_debugger_enabled.get());
+        if debugger_enabled & 3 != 3 {
+            return Ok(());
+        }
+        let prompt = guest::alloc_bytes(96);
+        let response = guest::alloc_bytes(2);
+        crate::ntos::rtl::crt::write_c_text(prompt, "Break repeatedly, break Once, Ignore, terminate Process, or terminate Thread (boipt)? ", None);
+        let answered = debugger::prompt(prompt, response, 2)?;
+        let choice = guest::read8(response);
+        guest::free_bytes(prompt);
+        guest::free_bytes(response);
+        if answered == 0 {
+            debugger::break_point()?;
+            return crate::ntos::ps::process::terminate_process(crate::ntos::ps::process::get_current_process(), ASSERT_STATUS_UNSUCCESSFUL);
+        }
+        match choice {
+            b'B' | b'b' | b'O' | b'o' => {
+                printf::debug_print_ex_text(DPFLTR_DEFAULT_ID, "Execute '.cxr' to dump context\n");
+                debugger::break_point()?;
+                if choice & 0xDF == b'O' {
+                    return Ok(());
+                }
+            }
+            b'I' | b'i' => return Ok(()),
+            b'P' | b'p' => return crate::ntos::ps::process::terminate_process(crate::ntos::ps::process::get_current_process(), ASSERT_STATUS_UNSUCCESSFUL),
+            b'T' | b't' => {
+                crate::ntos::ps::kernel_threads::terminate_current_thread(ASSERT_STATUS_UNSUCCESSFUL)?;
+            }
+            _ => {}
+        }
+    }
+}

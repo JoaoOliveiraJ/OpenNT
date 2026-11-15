@@ -25,6 +25,23 @@ pub fn sprintf(buffer: u64, format: u64, arguments: &[u64]) -> Result<u64, Kerne
     Ok(text.len() as u64)
 }
 
+/// vsprintf(Buffer, Format, ArgList) (ntoskrnl 19041 0x3d3780 ->
+/// _vsprintf_l): Buffer ou Format NULL = -1; senão o texto inteiro (contador
+/// 0x7FFFFFFF) e o NUL; devolve o comprimento.
+pub fn vsprintf(buffer: u64, format: u64, va_list: u64) -> Result<u64, KernelError> {
+    if buffer == 0 || format == 0 {
+        return Ok(-1i64 as u64);
+    }
+    let mut arguments = guest_strings::guest_format_arguments(va_list);
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut arguments, false)?;
+    // Texto estreito: cada `char` é um byte (Latin-1).
+    let mut bytes: Vec<u8> = text.chars().map(|character| character as u32 as u8).collect();
+    let length = bytes.len() as u64;
+    bytes.push(0);
+    guest::write_bytes(buffer, &bytes);
+    Ok(length)
+}
+
 /// _snprintf(buf, count, fmt, ...).
 pub fn snprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
     let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut variadic(arguments), false)?;
@@ -147,9 +164,15 @@ pub fn debug_print_with_prefix(prefix: u64, format: u64, va_list: u64) -> Result
 pub fn debug_print_ex_va(component_id: u32, format: u64, va_list: u64) -> Result<u32, KernelError> {
     let mut arguments = guest_strings::guest_format_arguments(va_list);
     let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut arguments, false)?;
-    let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(&text);
-    debug_print!("[driver:{}] {}", component_id, text);
+    debug_print_ex_text(component_id, &text);
     Ok(0)
+}
+
+/// Saída de um DbgPrintEx já formatado (o kernel imprimindo por conta
+/// própria, como o RtlAssert).
+pub fn debug_print_ex_text(component_id: u32, text: &str) {
+    let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(text);
+    debug_print!("[driver:{}] {}", component_id, text);
 }
 
 // ---- sprintf_s e vsprintf_s (crt-formatting) -------------------------------

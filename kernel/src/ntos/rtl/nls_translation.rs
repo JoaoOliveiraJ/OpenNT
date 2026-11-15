@@ -1,5 +1,5 @@
 //! Traduções entre ANSI e Unicode do Rtl — RtlUnicodeStringToAnsiString,
-//! RtlxAnsiStringToUnicodeSize, RtlMultiByteToUnicodeN,
+//! RtlxAnsiStringToUnicodeSize, RtlxUnicodeStringToAnsiSize, RtlMultiByteToUnicodeN,
 //! RtlAnsiCharToUnicodeChar e RtlUpcaseUnicodeChar.
 //!
 //! As conversões contadas mapeiam byte a byte (byte baixo de cada WCHAR e
@@ -127,18 +127,31 @@ pub fn unicode_to_multi_byte_n(output: u64, maximum: u32, written: u64, source: 
 /// RtlUnicodeToMultiByteSize(BytesInMultiByte*, Unicode, UnicodeBytes): SBCS
 /// = WCHARs; DBCS soma 2 por WCHAR com inicial. Sempre STATUS_SUCCESS.
 pub fn unicode_to_multi_byte_size(output: u64, source: u64, source_bytes: u32) -> Result<u32, KernelError> {
+    out::<u32>(output).set(multi_byte_size(source, source_bytes)?);
+    Ok(0)
+}
+
+/// Bytes ANSI de `source_bytes` bytes UTF-16 na página instalada.
+fn multi_byte_size(source: u64, source_bytes: u32) -> Result<u32, KernelError> {
     let code_page = crate::ntos::rtl::ansi_code_page::current()?;
     let units = source_bytes >> 1;
-    let mut size = units;
-    if code_page.double_byte {
-        size = 0;
-        for index in 0..units as u64 {
-            let code = code_page.unicode_to_multi_byte(guest::read16(source + index * 2))?;
-            size += if code >> 8 != 0 { 2 } else { 1 };
-        }
+    if !code_page.double_byte {
+        return Ok(units);
     }
-    out::<u32>(output).set(size);
-    Ok(0)
+    let mut size = 0;
+    for index in 0..units as u64 {
+        let code = code_page.unicode_to_multi_byte(guest::read16(source + index * 2))?;
+        size += if code >> 8 != 0 { 2 } else { 1 };
+    }
+    Ok(size)
+}
+
+/// RtlxUnicodeStringToAnsiSize(UnicodeString) (ntoskrnl 19041 0x75d2a0):
+/// RtlUnicodeToMultiByteSize do Buffer/Length mais o NUL.
+pub fn unicode_string_to_ansi_size(string: u64) -> Result<u32, KernelError> {
+    // SAFETY: PCUNICODE_STRING do chamador.
+    let string = unsafe { crate::ntos::inc::types::UnicodeString::at(string) };
+    Ok(multi_byte_size(string.buffer.get(), string.length.get() as u32)?.wrapping_add(1))
 }
 
 // ---- RtlAnsiCharToUnicodeChar: intervalo alto pela página (correção) -------

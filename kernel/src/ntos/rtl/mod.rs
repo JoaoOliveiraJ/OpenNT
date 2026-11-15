@@ -62,3 +62,5 @@ pub mod gen8dot3;
 pub mod altitude;
 pub mod compression;
 pub mod format_message;
+pub mod rb_tree;
+pub mod scanf;

@@ -2654,3 +2654,201 @@ pub mod rtl_crt_towupper {
 
     pub static GROUP: Group = Group { name: "rtl-crt-towupper", names: &["towupper"], handlers: &[towupper], data_exports: &[] };
 }
+
+pub mod rtl_ddi_assert {
+    //! RtlIsNtDdiVersionAvailable (`rtl/version`), RtlAssert (`rtl/error`) e
+    //! RtlSetPortableOperatingSystem (`rtl/registry`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::{error, registry, version};
+    use crate::rtl::KernelError;
+
+    /// RtlIsNtDdiVersionAvailable(Version) -> BOOLEAN.
+    fn is_ntddi_version_available(call: &Call) -> Result<u64, KernelError> {
+        Ok(version::is_ntddi_version_available(call.arg(1) as u32) as u64)
+    }
+
+    /// RtlAssert(VoidFailedAssertion, VoidFileName, LineNumber, MutableMessage).
+    fn assert_failed(call: &Call) -> Result<u64, KernelError> {
+        error::assert_failed(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4))?;
+        Ok(0)
+    }
+
+    /// RtlSetPortableOperatingSystem(IsPortable BOOLEAN) -> NTSTATUS.
+    fn set_portable_operating_system(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(registry::set_portable_operating_system(call.arg(1) & 0xFF != 0)?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-ddi-assert",
+        names: &["RtlIsNtDdiVersionAvailable", "RtlAssert", "RtlSetPortableOperatingSystem"],
+        handlers: &[is_ntddi_version_available, assert_failed, set_portable_operating_system],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_rb_tree {
+    //! RtlRbInsertNodeEx e RtlRbRemoveNode; a lógica mora em `rtl/rb_tree`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::rb_tree;
+    use crate::rtl::KernelError;
+
+    /// RtlRbInsertNodeEx(Tree, Parent, Right BOOLEAN, Node).
+    fn insert(call: &Call) -> Result<u64, KernelError> {
+        rb_tree::insert(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0, call.arg(4));
+        Ok(0)
+    }
+
+    /// RtlRbRemoveNode(Tree, Node).
+    fn remove(call: &Call) -> Result<u64, KernelError> {
+        rb_tree::remove(call.arg(1), call.arg(2));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-rb-tree", names: &["RtlRbInsertNodeEx", "RtlRbRemoveNode"], handlers: &[insert, remove], data_exports: &[] };
+}
+
+pub mod crt_scanf {
+    //! sscanf_s e swscanf_s; a lógica mora em `rtl/scanf`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::scanf;
+    use crate::rtl::KernelError;
+
+    /// sscanf_s(Buffer, Format, ...) -> int.
+    fn sscanf_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(scanf::sscanf_s(call.arg(1), call.arg(2), &mut |index| call.variadic_arg(3 + index))? as i64 as u64)
+    }
+
+    /// swscanf_s(Buffer, Format, ...) -> int.
+    fn swscanf_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(scanf::swscanf_s(call.arg(1), call.arg(2), &mut |index| call.variadic_arg(3 + index))? as i64 as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "crt-scanf", names: &["sscanf_s", "swscanf_s"], handlers: &[sscanf_s, swscanf_s], data_exports: &[] };
+}
+
+pub mod crt_integer_strings {
+    //! atol, _itoa_s, strcat_s e srand (`rtl/crt`) e vsprintf (`rtl/printf`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::{crt, printf};
+    use crate::rtl::KernelError;
+
+    /// atol(String) -> long.
+    fn atol(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::atol(call.arg(1))? as i64 as u64)
+    }
+
+    /// _itoa_s(Value, Buffer, Size, Radix) -> errno_t.
+    fn itoa_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::itoa_s(call.arg(1) as i32, call.arg(2), call.arg(3), call.arg(4) as u32)? as u64)
+    }
+
+    /// strcat_s(Destination, Size, Source) -> errno_t.
+    fn strcat_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::strcat_s(call.arg(1), call.arg(2), call.arg(3))? as u64)
+    }
+
+    /// vsprintf(Buffer, Format, ArgList) -> int.
+    fn vsprintf(call: &Call) -> Result<u64, KernelError> {
+        printf::vsprintf(call.arg(1), call.arg(2), call.arg(3))
+    }
+
+    /// srand(Seed).
+    fn srand(call: &Call) -> Result<u64, KernelError> {
+        crt::srand(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "crt-integer-strings",
+        names: &["atol", "_itoa_s", "strcat_s", "vsprintf", "srand"],
+        handlers: &[atol, itoa_s, strcat_s, vsprintf, srand],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_network_address_ansi {
+    //! RtlIpv4/Ipv6AddressToString[Ex]A; a lógica mora em `rtl/network_address`.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::network_address;
+    use crate::rtl::KernelError;
+
+    fn length(address: u64) -> Option<&'static Field<u32>> {
+        // SAFETY: PULONG AddressStringLength vivo e alinhado do chamador.
+        (address != 0).then(|| unsafe { Field::<u32>::at(address) })
+    }
+
+    /// (Addr, S) -> fim da string.
+    fn ipv4_address_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(network_address::ipv4_address_to_string_ansi(call.arg(1), call.arg(2)))
+    }
+
+    /// (Addr, Port, Buffer, Length) -> NTSTATUS.
+    fn ipv4_address_to_string_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv4_address_to_string_ex_ansi(call.arg(1), call.arg(2) as u16, call.arg(3), length(call.arg(4)))))
+    }
+
+    /// (Addr, S) -> fim da string.
+    fn ipv6_address_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(network_address::ipv6_address_to_string_ansi(call.arg(1), call.arg(2)))
+    }
+
+    /// (Addr, ScopeId, Port, Buffer, Length) -> NTSTATUS.
+    fn ipv6_address_to_string_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv6_address_to_string_ex_ansi(call.arg(1), call.arg(2) as u32, call.arg(3) as u16, call.arg(4), length(call.arg(5)))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-network-address-ansi",
+        names: &["RtlIpv4AddressToStringA", "RtlIpv4AddressToStringExA", "RtlIpv6AddressToStringA", "RtlIpv6AddressToStringExA"],
+        handlers: &[ipv4_address_to_string, ipv4_address_to_string_ex, ipv6_address_to_string, ipv6_address_to_string_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_memory_nls_small {
+    //! RtlxUnicodeStringToAnsiSize (`rtl/nls_translation`),
+    //! RtlDowncaseUnicodeChar (`rtl/unicode_case`), RtlCompareMemoryUlong
+    //! (`rtl/memory`) e RtlWrite/FlushNonVolatileMemory (`rtl/non_volatile`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::{memory, nls_translation, non_volatile, unicode_case};
+    use crate::rtl::KernelError;
+
+    /// RtlxUnicodeStringToAnsiSize(UnicodeString) -> ULONG.
+    fn unicode_string_to_ansi_size(call: &Call) -> Result<u64, KernelError> {
+        Ok(nls_translation::unicode_string_to_ansi_size(call.arg(1))? as u64)
+    }
+
+    /// RtlDowncaseUnicodeChar(SourceCharacter) -> WCHAR.
+    fn downcase_unicode_char(call: &Call) -> Result<u64, KernelError> {
+        Ok(unicode_case::nls_downcase(call.arg(1) as u16) as u64)
+    }
+
+    /// RtlCompareMemoryUlong(Source, Length, Pattern) -> SIZE_T.
+    fn compare_memory_ulong(call: &Call) -> Result<u64, KernelError> {
+        Ok(memory::compare_ulong(call.arg(1), call.arg(2), call.arg(3) as u32))
+    }
+
+    /// RtlWriteNonVolatileMemory(NvToken, NvDestination, Source, Size, Flags) -> NTSTATUS.
+    fn write_non_volatile_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(non_volatile::write_memory(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32)))
+    }
+
+    /// RtlFlushNonVolatileMemory(NvToken, NvBuffer, Size, Flags) -> NTSTATUS.
+    fn flush_non_volatile_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(non_volatile::flush_memory(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-memory-nls-small",
+        names: &["RtlxUnicodeStringToAnsiSize", "RtlDowncaseUnicodeChar", "RtlCompareMemoryUlong", "RtlWriteNonVolatileMemory", "RtlFlushNonVolatileMemory"],
+        handlers: &[unicode_string_to_ansi_size, downcase_unicode_char, compare_memory_ulong, write_non_volatile_memory, flush_non_volatile_memory],
+        data_exports: &[],
+    };
+}

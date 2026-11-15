@@ -191,3 +191,18 @@ pub mod etw_stack_walk {
         data_exports: &[],
     };
 }
+
+pub mod etw_provider_enabled {
+    //! EtwProviderEnabled; a lógica mora em `etw/event_enabled`.
+
+    use crate::ntos::etw::event_enabled;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// EtwProviderEnabled(RegHandle, Level UCHAR, Keyword) -> BOOLEAN.
+    fn provider_enabled(call: &Call) -> Result<u64, KernelError> {
+        Ok(event_enabled::provider_enabled(call.arg(1), call.arg(2) as u8, call.arg(3)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "etw-provider-enabled", names: &["EtwProviderEnabled"], handlers: &[provider_enabled], data_exports: &[] };
+}

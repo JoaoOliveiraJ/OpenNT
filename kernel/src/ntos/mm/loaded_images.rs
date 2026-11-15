@@ -4,12 +4,20 @@
 //!
 //! Independe do tempo de vida do DRIVER_OBJECT. Imagens de usuário pertencem
 //! ao loader do processo e nunca são registradas aqui.
+//!
+//! A vista nativa é a PsLoadedModuleList exportada: a cabeça LIST_ENTRY e o
+//! ERESOURCE PsLoadedModuleResource moram na `.kdata` do kernel. A lista é
+//! publicada no boot (ntoskrnl primeiro, depois a HAL e os drivers, na ordem
+//! de registro) e cada carga, descarga ou troca de Flags a refaz com o
+//! recurso exclusivo e a região crítica, como o MiProcessLoaderEntry; quem
+//! percorre a lista (depuradores, antivírus) a lê sob o recurso
+//! compartilhado.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{kernel_address, memory_map as map};
+use super::{kernel_address, kernel_data, memory_map as map};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::NtStruct;
@@ -73,6 +81,51 @@ struct Registry {
     unload_observers: Vec<fn(&LoadedImage)>,
     list_head: u64,
     native_entries: BTreeMap<u64, NativeEntry>,
+}
+
+/// O PsLoadedModuleResource foi inicializado (`publish_module_list`).
+static MODULE_RESOURCE_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PsLoadedModuleList: a cabeça LIST_ENTRY na `.kdata` do kernel.
+pub fn module_list_cell() -> u64 {
+    kernel_data::required_address("PsLoadedModuleList")
+}
+
+/// PsLoadedModuleResource: o ERESOURCE na `.kdata` do kernel.
+pub fn module_resource_cell() -> u64 {
+    kernel_data::required_address("PsLoadedModuleResource")
+}
+
+/// Mudança da lista sob o PsLoadedModuleResource exclusivo. Antes da
+/// publicação, fora de uma thread ou acima de APC_LEVEL vale só a trava do
+/// registro.
+struct ListWriter(bool);
+
+impl ListWriter {
+    fn enter() -> Self {
+        use crate::ntos::ke::irql;
+        let usable = MODULE_RESOURCE_READY.load(core::sync::atomic::Ordering::Acquire) && irql::get_irql() < irql::DISPATCH_LEVEL && crate::ntos::ps::process::get_current_thread() != 0;
+        ListWriter(usable && crate::ntos::ex::resource::enter_exclusive(module_resource_cell()).is_ok())
+    }
+}
+
+impl Drop for ListWriter {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crate::ntos::ex::resource::release_and_leave(module_resource_cell());
+        }
+    }
+}
+
+/// Publica a PsLoadedModuleList no boot: o ERESOURCE inicializado e a vista
+/// nativa materializada com as imagens já registradas.
+pub fn publish_module_list() -> Result<(), KernelError> {
+    let status = crate::ntos::ex::resource::initialize(module_resource_cell())?;
+    if status != 0 {
+        return Err(KernelError::new("PsLoadedModuleResource initialization failed"));
+    }
+    MODULE_RESOURCE_READY.store(true, core::sync::atomic::Ordering::Release);
+    native_list().map(|_| ())
 }
 
 static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
@@ -177,6 +230,7 @@ pub fn register(description: ImageDescription, name: &str) -> Result<LoadedImage
     if base == 0 || size == 0 || base.checked_add(size).is_none() {
         return Err(KernelError::new("invalid kernel image range"));
     }
+    let _writer = ListWriter::enter();
     let mut registry = REGISTRY.lock();
     let overlaps = registry
         .owned
@@ -210,6 +264,7 @@ pub fn unregister(id: u64) -> Result<bool, KernelError> {
     let observers;
     let image;
     {
+        let _writer = ListWriter::enter();
         let mut registry = REGISTRY.lock();
         if Some(id) == registry.kernel {
             return Err(KernelError::new("cannot unload the running kernel"));
@@ -233,6 +288,7 @@ pub fn unregister(id: u64) -> Result<bool, KernelError> {
 /// Liga `set` e desliga `clear` nas Flags da imagem, no registro e na
 /// entrada nativa já materializada; devolve o registro atualizado.
 pub fn update_flags(id: u64, set: u32, clear: u32) -> Option<LoadedImage> {
+    let _writer = ListWriter::enter();
     let mut registry = REGISTRY.lock();
     let flags = {
         let (image, _) = registry.owned.get_mut(&id)?;
@@ -258,6 +314,7 @@ pub fn find_by_base_name(base_name: &str) -> Option<LoadedImage> {
 
 /// Some da enumeração sem liberar o mapeamento (vistas de diagnóstico).
 pub fn hide(id: u64) -> Result<bool, KernelError> {
+    let _writer = ListWriter::enter();
     let mut registry = REGISTRY.lock();
     if Some(id) == registry.kernel {
         return Err(KernelError::new("cannot hide the running kernel"));
@@ -296,14 +353,12 @@ pub fn kernel() -> Option<LoadedImage> {
     registry.owned.get(&id).map(|(image, _)| image.clone())
 }
 
-/// A vista nativa só é materializada quando um consumidor pede o endereço.
+/// A vista nativa (PsLoadedModuleList), materializada na publicação do boot
+/// ou no primeiro consumidor anterior a ela.
 pub fn native_list() -> Result<(u64, Vec<(LoadedImage, u64)>), KernelError> {
     let mut registry = REGISTRY.lock();
     if registry.list_head == 0 {
-        let head = guest::alloc_bytes(16);
-        if head == 0 {
-            return Err(KernelError::new("kernel loader list head allocation failed"));
-        }
+        let head = kernel_data::address("PsLoadedModuleList")?;
         list_entry(head).flink.set(head);
         list_entry(head).blink.set(head);
         registry.list_head = head;

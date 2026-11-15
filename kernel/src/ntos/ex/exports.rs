@@ -1507,3 +1507,20 @@ pub mod ex_update_license_data {
 
     pub static GROUP: Group = Group { name: "ex-update-license-data", names: &["ExUpdateLicenseData"], handlers: &[update_license_data], data_exports: &[] };
 }
+
+pub mod zw_create_wnf_state_name {
+    //! ZwCreateWnfStateName; a lógica mora em `ex/wnf/service`.
+
+    use crate::ntos::ex::wnf::service::{self, CreateName};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ZwCreateWnfStateName(StateName*, NameLifetime, DataScope, PersistData,
+    /// TypeId, MaximumStateSize, SecurityDescriptor) -> NTSTATUS.
+    fn create_state_name(call: &Call) -> Result<u64, KernelError> {
+        let request = CreateName { output: call.arg(1), lifetime: call.arg(2) as u32, scope: call.arg(3) as u32, persist: call.arg(4) & 0xFF != 0, type_identifier: call.arg(5), maximum_size: call.arg(6) as u32, security_descriptor: call.arg(7) };
+        Ok(signed_status(service::create_state_name(&request)?))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-create-wnf-state-name", names: &["ZwCreateWnfStateName"], handlers: &[create_state_name], data_exports: &[] };
+}

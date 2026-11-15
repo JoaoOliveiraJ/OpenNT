@@ -359,3 +359,71 @@ pub mod po_fx_drips_watchdog {
 
     pub static GROUP: Group = Group { name: "po-fx-drips-watchdog", names: &["PoFxRegisterDripsWatchdogCallback"], handlers: &[register_drips_watchdog_callback], data_exports: &[] };
 }
+
+pub mod po_legacy_system_state {
+    //! PoSetSystemState, PoRegisterSystemState, PoUnregisterSystemState,
+    //! PoSetPowerButtonHoldState e PoSetFixedWakeSource; a lógica mora em
+    //! `po/system_state`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::po::system_state;
+    use crate::rtl::KernelError;
+
+    /// PoSetSystemState(Flags).
+    fn set_system_state(call: &Call) -> Result<u64, KernelError> {
+        system_state::set_system_state(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    /// PoRegisterSystemState(StateHandle, Flags) -> PVOID.
+    fn register_system_state(call: &Call) -> Result<u64, KernelError> {
+        Ok(system_state::register_system_state(call.arg(1), call.arg(2) as u32))
+    }
+
+    /// PoUnregisterSystemState(StateHandle).
+    fn unregister_system_state(call: &Call) -> Result<u64, KernelError> {
+        system_state::unregister_system_state(call.arg(1));
+        Ok(0)
+    }
+
+    /// PoSetPowerButtonHoldState(Held BOOLEAN).
+    fn set_power_button_hold_state(call: &Call) -> Result<u64, KernelError> {
+        system_state::set_power_button_hold_state(call.arg(1) & 0xFF != 0);
+        Ok(0)
+    }
+
+    /// PoSetFixedWakeSource(WakeSource).
+    fn set_fixed_wake_source(call: &Call) -> Result<u64, KernelError> {
+        system_state::set_fixed_wake_source(call.arg(1) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-legacy-system-state",
+        names: &["PoSetSystemState", "PoRegisterSystemState", "PoUnregisterSystemState", "PoSetPowerButtonHoldState", "PoSetFixedWakeSource"],
+        handlers: &[set_system_state, register_system_state, unregister_system_state, set_power_button_hold_state, set_fixed_wake_source],
+        data_exports: &[],
+    };
+}
+
+pub mod po_fx_primary_device {
+    //! PoFxSetComponentWake e PoFxRegisterPrimaryDevice; a lógica mora em
+    //! `po/fx.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::fx;
+    use crate::rtl::KernelError;
+
+    /// PoFxSetComponentWake(Handle, Component, WakeHint BOOLEAN).
+    fn set_component_wake(call: &Call) -> Result<u64, KernelError> {
+        fx::set_component_wake(call.arg(1), call.arg(2) as u32, call.arg(3) & 0xFF != 0);
+        Ok(0)
+    }
+
+    /// PoFxRegisterPrimaryDevice(Pdo, Device, Handle*) -> NTSTATUS.
+    fn register_primary_device(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(fx::register_primary_device(call.arg(1), call.arg(2), call.arg(3))))
+    }
+
+    pub static GROUP: Group = Group { name: "po-fx-primary-device", names: &["PoFxSetComponentWake", "PoFxRegisterPrimaryDevice"], handlers: &[set_component_wake, register_primary_device], data_exports: &[] };
+}

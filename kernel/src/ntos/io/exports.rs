@@ -2133,3 +2133,41 @@ pub mod zw_query_ea_file {
 
     pub static GROUP: Group = Group { name: "zw-query-ea-file", names: &["ZwQueryEaFile"], handlers: &[query_ea_file], data_exports: &[] };
 }
+
+pub mod io_interface_key_keep_alive {
+    //! IoOpenDeviceInterfaceRegistryKey (`io/device_interface`),
+    //! IoIncrementKeepAliveCount/IoDecrementKeepAliveCount
+    //! (`io/file/keep_alive`) e IoCreateUnprotectedSymbolicLink (`io/device`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::file::keep_alive;
+    use crate::ntos::io::{device, device_interface};
+    use crate::rtl::KernelError;
+
+    /// IoOpenDeviceInterfaceRegistryKey(SymbolicLinkName, DesiredAccess, DeviceInterfaceKey*).
+    fn open_device_interface_registry_key(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_interface::open_interface_registry_key(call.arg(1), call.arg(3))?))
+    }
+
+    /// IoIncrementKeepAliveCount(FileObject, Process) -> NTSTATUS.
+    fn increment_keep_alive_count(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(keep_alive::increment(call.arg(1), call.arg(2))?))
+    }
+
+    /// IoDecrementKeepAliveCount(FileObject, Process) -> NTSTATUS.
+    fn decrement_keep_alive_count(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(keep_alive::decrement(call.arg(1), call.arg(2))?))
+    }
+
+    /// IoCreateUnprotectedSymbolicLink(SymbolicLinkName, DeviceName) -> NTSTATUS.
+    fn create_unprotected_symbolic_link(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device::create_unprotected_symbolic_link(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-interface-key-keep-alive",
+        names: &["IoOpenDeviceInterfaceRegistryKey", "IoIncrementKeepAliveCount", "IoDecrementKeepAliveCount", "IoCreateUnprotectedSymbolicLink"],
+        handlers: &[open_device_interface_registry_key, increment_keep_alive_count, decrement_keep_alive_count, create_unprotected_symbolic_link],
+        data_exports: &[],
+    };
+}

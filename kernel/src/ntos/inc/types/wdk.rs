@@ -3245,6 +3245,48 @@ const _: () = {
     assert!(core::mem::offset_of!(PoFxDeviceV1, components) == 0x40);
 };
 
+/// O dispositivo primário do PoFxRegisterPrimaryDevice (ntoskrnl 19041
+/// 0x8e4380; 0x70 bytes): Version 1, Flags (bit 0 = sem retomada rápida),
+/// os seis callbacks do PO_FX_DEVICE_V1 mais o de transição crítica de
+/// componente (a ordem do POP_FX_DRIVER_CALLBACKS), o DeviceContext e os
+/// componentes V1 em +0x50.
+#[repr(C)]
+pub struct PoFxPrimaryDeviceV1 {
+    pub version: Field<u32>,
+    pub component_count: Field<u32>,
+    pub flags: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    /// -> `void`
+    pub component_active_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_state_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_required_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_not_required_callback: Field<u64>,
+    /// -> `void`
+    pub power_control_callback: Field<u64>,
+    /// -> `void`
+    pub component_critical_transition_callback: Field<u64>,
+    /// -> `void`
+    pub device_context: Field<u64>,
+    pub components: [PoFxComponentV1; 1],
+}
+
+unsafe impl NtStruct for PoFxPrimaryDeviceV1 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PoFxPrimaryDeviceV1>() == 0x70);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, flags) == 0x8);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, component_active_condition_callback) == 0x10);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, power_control_callback) == 0x38);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, component_critical_transition_callback) == 0x40);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, device_context) == 0x48);
+    assert!(core::mem::offset_of!(PoFxPrimaryDeviceV1, components) == 0x50);
+};
+
 /// `_IO_ERROR_LOG_PACKET` (wdm.h; 0x30 bytes).
 #[repr(C)]
 pub struct IoErrorLogPacket {

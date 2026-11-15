@@ -1,7 +1,8 @@
 //! Endereços IPv4/IPv6 em texto (UTF-16) — ntoskrnl 19041
 //! RtlIpv4StringToAddressW 0x31e430, RtlIpv6StringToAddressW 0x31c670,
 //! RtlIpv4AddressToStringW 0x381600, RtlIpv4AddressToStringExW 0x381560,
-//! RtlIpv6AddressToStringW 0x37dda0, RtlIpv6AddressToStringExW 0x37dcc0.
+//! RtlIpv6AddressToStringW 0x37dda0, RtlIpv6AddressToStringExW 0x37dcc0 e
+//! as variantes ANSI dos formatadores (no fim do arquivo).
 //!
 //! As classes de caractere são as do `pwctype` do ntoskrnl para c < 0x80
 //! (os dois parsers testam `c < 0x80` antes do iswctype): dígitos '0'..'9',
@@ -486,27 +487,19 @@ pub fn ipv6_address_to_string(address: u64, string: u64) -> u64 {
     write_text(string, &format_ipv6(&read_ipv6(address)))
 }
 
-/// RtlIpv4AddressToStringExW(Addr, Port, Buffer, Length): Addr ou Length
-/// NULL, ou Buffer NULL com *Length != 0 = STATUS_INVALID_PARAMETER; Port
-/// (ordem de rede) != 0 acrescenta ":%u". IN_ADDR/IN6_ADDR são lidos como
-/// blocos de bytes (ordem de rede).
-pub fn ipv4_address_to_string_ex(address: u64, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
-    let Some(length) = length.filter(|length| address != 0 && (buffer != 0 || length.get() == 0)) else {
-        return STATUS_INVALID_PARAMETER;
-    };
+/// Texto do RtlIpv4AddressToStringEx[AW]: ":<porta>" com Port (ordem de
+/// rede) != 0.
+fn ipv4_ex_text(address: u64, port: u16) -> String {
     let mut text = format_ipv4(&read_ipv4(address));
     if port != 0 {
         text.push_str(&format!(":{}", port.swap_bytes()));
     }
-    deliver_ex(&text, buffer, length)
+    text
 }
 
-/// RtlIpv6AddressToStringExW(Addr, ScopeId, Port, Buffer, Length): "[" se
-/// Port != 0, o endereço, "%<ScopeId>" se != 0 e "]:<porta>" se Port != 0.
-pub fn ipv6_address_to_string_ex(address: u64, scope_id: u32, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
-    let Some(length) = length.filter(|length| address != 0 && (buffer != 0 || length.get() == 0)) else {
-        return STATUS_INVALID_PARAMETER;
-    };
+/// Texto do RtlIpv6AddressToStringEx[AW]: "[" se Port != 0, o endereço,
+/// "%<ScopeId>" se != 0 e "]:<porta>" se Port != 0.
+fn ipv6_ex_text(address: u64, scope_id: u32, port: u16) -> String {
     let mut text = String::new();
     if port != 0 {
         text.push('[');
@@ -518,5 +511,73 @@ pub fn ipv6_address_to_string_ex(address: u64, scope_id: u32, port: u16, buffer:
     if port != 0 {
         text.push_str(&format!("]:{}", port.swap_bytes()));
     }
-    deliver_ex(&text, buffer, length)
+    text
+}
+
+/// Addr ou Length NULL, ou Buffer NULL com *Length != 0: STATUS_INVALID_PARAMETER.
+fn ex_arguments(address: u64, buffer: u64, length: Option<&Field<u32>>) -> Option<&Field<u32>> {
+    length.filter(|length| address != 0 && (buffer != 0 || length.get() == 0))
+}
+
+/// RtlIpv4AddressToStringExW(Addr, Port, Buffer, Length). IN_ADDR/IN6_ADDR
+/// são lidos como blocos de bytes (ordem de rede).
+pub fn ipv4_address_to_string_ex(address: u64, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
+    let Some(length) = ex_arguments(address, buffer, length) else { return STATUS_INVALID_PARAMETER };
+    deliver_ex(&ipv4_ex_text(address, port), buffer, length)
+}
+
+/// RtlIpv6AddressToStringExW(Addr, ScopeId, Port, Buffer, Length).
+pub fn ipv6_address_to_string_ex(address: u64, scope_id: u32, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
+    let Some(length) = ex_arguments(address, buffer, length) else { return STATUS_INVALID_PARAMETER };
+    deliver_ex(&ipv6_ex_text(address, scope_id, port), buffer, length)
+}
+
+// ---- Variantes ANSI (ntoskrnl 19041) -----------------------------------------
+//
+// RtlIpv4AddressToStringA 0x3906f0 = sprintf_s(S, 16, "%u.%u.%u.%u"),
+// devolvendo S + o comprimento; RtlIpv6AddressToStringA 0x36c2f0 produz o
+// mesmo texto da variante W. RtlIpv4AddressToStringExA 0x58bdc0 e
+// RtlIpv6AddressToStringExA 0x58be80 montam o texto numa área local e o
+// entregam como as W, em bytes: *Length (com o NUL) recebe o necessário e um
+// buffer pequeno dá STATUS_INVALID_PARAMETER sem copiar.
+
+/// Grava o texto estreito com NUL; devolve o endereço do NUL.
+fn write_ansi(destination: u64, text: &str) -> u64 {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(0);
+    guest::write_bytes(destination, &bytes);
+    destination + text.len() as u64
+}
+
+fn deliver_ex_ansi(text: &str, buffer: u64, length: &Field<u32>) -> u32 {
+    let needed = text.len() as u32 + 1;
+    let capacity = length.get();
+    length.set(needed);
+    if capacity < needed {
+        return STATUS_INVALID_PARAMETER;
+    }
+    write_ansi(buffer, text);
+    0
+}
+
+/// RtlIpv4AddressToStringA(Addr, S): devolve o fim (o NUL).
+pub fn ipv4_address_to_string_ansi(address: u64, string: u64) -> u64 {
+    write_ansi(string, &format_ipv4(&read_ipv4(address)))
+}
+
+/// RtlIpv6AddressToStringA(Addr, S): devolve o fim (o NUL).
+pub fn ipv6_address_to_string_ansi(address: u64, string: u64) -> u64 {
+    write_ansi(string, &format_ipv6(&read_ipv6(address)))
+}
+
+/// RtlIpv4AddressToStringExA(Addr, Port, Buffer, Length).
+pub fn ipv4_address_to_string_ex_ansi(address: u64, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
+    let Some(length) = ex_arguments(address, buffer, length) else { return STATUS_INVALID_PARAMETER };
+    deliver_ex_ansi(&ipv4_ex_text(address, port), buffer, length)
+}
+
+/// RtlIpv6AddressToStringExA(Addr, ScopeId, Port, Buffer, Length).
+pub fn ipv6_address_to_string_ex_ansi(address: u64, scope_id: u32, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
+    let Some(length) = ex_arguments(address, buffer, length) else { return STATUS_INVALID_PARAMETER };
+    deliver_ex_ansi(&ipv6_ex_text(address, scope_id, port), buffer, length)
 }

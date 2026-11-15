@@ -143,6 +143,11 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // nulos (o acpi.sys não esconde nenhuma porta COM, ACPIMatchKernelPorts).
     pointer("KdComPortInUse"),
     pointer("KdHvComPortInUse"),
+    // LIST_ENTRY PsLoadedModuleList (a cabeça das KLDR_DATA_TABLE_ENTRY do
+    // loader, `mm/loaded_images`) e o ERESOURCE PsLoadedModuleResource (0x68
+    // bytes) que a guarda; o boot liga a cabeça e inicializa o recurso.
+    KernelDataEntry { name: "PsLoadedModuleList", size: 16, storage_size: 16, alignment: 8, initial: &[0; 16] },
+    KernelDataEntry { name: "PsLoadedModuleResource", size: 0x68, storage_size: 0x68, alignment: 8, initial: &[0; 0x68] },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

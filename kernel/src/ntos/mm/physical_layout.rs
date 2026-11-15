@@ -115,3 +115,45 @@ pub fn contains_ram_range(physical_address: u64, byte_count: u64) -> bool {
 pub fn sixty_four_bit_physical_address_cell() -> u64 {
     super::kernel_data::required_address("Mm64BitPhysicalAddress")
 }
+
+// ---- MmAddPhysicalMemory (ntoskrnl 19041 0x8c6290) ---------------------------
+//
+// MmAddPhysicalMemory(StartAddress*, NumberOfBytes*): um StartAddress fora
+// de página com o bit 0 ligado perde o bit (o pedido de memória espelhada);
+// MiAddPhysicalMemoryChunks anda a faixa em páginas inteiras (NumberOfBytes
+// truncado) e MiAddPhysicalMemory recusa um início fora de página ou uma
+// faixa vazia (STATUS_INVALID_PARAMETER_1), corta o fim no maior PFN
+// possível (o MAXPHYADDR da CPU, no máximo 0xFFFFFFFFF), trata as páginas
+// do topo (>= 0xFFFFFFFFA) e as já presentes como STATUS_CONFLICTING_ADDRESSES
+// e, para memória nova, cria as entradas do banco de PFN e a entrega ao
+// alocador. *NumberOfBytes recebe o que foi acrescentado. O banco de PFN do
+// OpenNT é montado uma vez no boot sobre o mapa direto e não cresce: a
+// memória nova recebe STATUS_INSUFFICIENT_RESOURCES, o status do original
+// quando as entradas novas não podem ser mapeadas.
+
+const ADD_STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+const ADD_STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const ADD_STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+
+/// MmAddPhysicalMemory: (NTSTATUS, bytes acrescentados).
+pub fn add_physical_memory(start: u64, bytes: u64) -> (u32, u64) {
+    let start = if start & 0xFFF != 0 && start & 1 != 0 { start & !1 } else { start };
+    if start & 0xFFF != 0 {
+        return (ADD_STATUS_INVALID_PARAMETER_1, 0);
+    }
+    let first = start >> 12;
+    let width = crate::hal::cpu::cpuid(0x8000_0008)[0] & 0xFF;
+    let highest = if (12..64).contains(&width) { ((1u64 << width) >> 12) - 1 } else { 0xF_FFFF_FFFF }.min(0xF_FFFF_FFFF);
+    let end = first.saturating_add(bytes >> 12).min(highest + 1);
+    if first >= end {
+        return (ADD_STATUS_INVALID_PARAMETER_1, 0);
+    }
+    if end >= 0xF_FFFF_FFFA {
+        return (ADD_STATUS_CONFLICTING_ADDRESSES, 0);
+    }
+    let (low, high) = (first << 12, end << 12);
+    if ranges().iter().any(|&(base, top)| low < top && high > base) {
+        return (ADD_STATUS_CONFLICTING_ADDRESSES, 0);
+    }
+    (ADD_STATUS_INSUFFICIENT_RESOURCES, 0)
+}

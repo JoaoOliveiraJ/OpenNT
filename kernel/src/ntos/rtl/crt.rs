@@ -526,12 +526,12 @@ const CRT_DIGIT_BLOCKS: [u16; 18] = [
 ];
 
 /// Índice do `pctype`: EOF (-1) lê a entrada -1 (zero); o resto usa o byte baixo.
-fn narrow_class(character: u32) -> u16 {
+pub(crate) fn narrow_class(character: u32) -> u16 {
     if character == u32::MAX { 0 } else { CRT_NARROW_CLASS.get((character & 0xFF) as usize).copied().unwrap_or(0) }
 }
 
 /// iswctype(_l): só U+0000..U+00FF têm classe.
-fn wide_class(unit: u16) -> u16 {
+pub(crate) fn wide_class(unit: u16) -> u16 {
     CRT_WIDE_CLASS.get(unit as usize).copied().unwrap_or(0)
 }
 
@@ -970,7 +970,103 @@ pub fn rand() -> u32 {
     }
 }
 
-/// srand(seed): o estado do rand (o export srand ainda não é do OpenNT).
+/// srand(seed) (ntoskrnl 19041 rva 0x3d2be0): grava o estado do rand.
 pub fn srand(seed: u32) {
     RAND_STATE.store(seed, core::sync::atomic::Ordering::Release);
+}
+
+// ---- atol, _itoa_s e strcat_s (ntoskrnl 19041) ------------------------------
+//
+// atol 0x3d1220 = strtolX(s, NULL, 10, sem checagem de estouro): é o mesmo
+// corpo do atoi (que só chama atol). _itoa_s 0x3d62b0 (o mesmo corpo do
+// _ltoa_s) = xtoa_s(valor, Buffer, Size, Radix, Radix == 10 && valor < 0):
+// Buffer NULL ou Size 0 = EINVAL sem tocar; Buffer[0] = 0; Size <= 1 (2 com
+// sinal) = ERANGE; Radix fora de 2..36 = EINVAL; os dígitos são gerados do
+// menos significativo enquanto cabem e, sem espaço para o NUL, Buffer[0] = 0
+// e ERANGE (os dígitos já gravados ficam). strcat_s 0x3d75d0: Dest NULL ou
+// Size 0 = EINVAL; Src NULL, ou Dest sem NUL nos Size bytes, = Dest[0] = 0 e
+// EINVAL; a cópia byte a byte que esgota o espaço deixa o que copiou, zera
+// Dest[0] e dá ERANGE.
+
+/// atol(String): o atoi.
+pub fn atol(source: u64) -> Result<i32, KernelError> {
+    atoi(source)
+}
+
+/// _itoa_s(Value, Buffer, Size, Radix): devolve o errno.
+pub fn itoa_s(value: i32, buffer: u64, size: u64, radix: u32) -> Result<u32, KernelError> {
+    if buffer == 0 || size == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    let negative = radix == 10 && value < 0;
+    guest::try_write8(buffer, 0)?;
+    if size <= if negative { 2 } else { 1 } {
+        return Ok(CRT_ERANGE);
+    }
+    if !(2..=36).contains(&radix) {
+        return Ok(CRT_EINVAL);
+    }
+    let mut written = 0u64;
+    let mut magnitude = value as u32;
+    if negative {
+        guest::try_write8(buffer, b'-')?;
+        written = 1;
+        magnitude = magnitude.wrapping_neg();
+    }
+    let first = written;
+    loop {
+        let digit = magnitude % radix;
+        magnitude /= radix;
+        guest::try_write8(buffer + written, if digit > 9 { digit as u8 - 10 + b'a' } else { digit as u8 + b'0' })?;
+        written += 1;
+        if magnitude == 0 || written >= size {
+            break;
+        }
+    }
+    if written >= size {
+        guest::try_write8(buffer, 0)?;
+        return Ok(CRT_ERANGE);
+    }
+    guest::try_write8(buffer + written, 0)?;
+    // Os dígitos saíram do menos significativo: inverte no lugar.
+    let digits = guest::read_bytes(buffer + first, (written - first) as usize);
+    let reversed: alloc::vec::Vec<u8> = digits.into_iter().rev().collect();
+    guest::try_write_bytes(buffer + first, &reversed)?;
+    Ok(0)
+}
+
+/// strcat_s(Destination, Size, Source): devolve o errno.
+pub fn strcat_s(destination: u64, size: u64, source: u64) -> Result<u32, KernelError> {
+    if destination == 0 || size == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    if source == 0 {
+        guest::try_write8(destination, 0)?;
+        return Ok(CRT_EINVAL);
+    }
+    let mut cursor = destination;
+    let mut available = size;
+    while guest::try_read8(cursor)? != 0 {
+        cursor += 1;
+        available -= 1;
+        if available == 0 {
+            guest::try_write8(destination, 0)?;
+            return Ok(CRT_EINVAL);
+        }
+    }
+    let mut from = source;
+    loop {
+        let byte = guest::try_read8(from)?;
+        guest::try_write8(cursor, byte)?;
+        cursor += 1;
+        from += 1;
+        if byte == 0 {
+            return Ok(0);
+        }
+        available -= 1;
+        if available == 0 {
+            guest::try_write8(destination, 0)?;
+            return Ok(CRT_ERANGE);
+        }
+    }
 }

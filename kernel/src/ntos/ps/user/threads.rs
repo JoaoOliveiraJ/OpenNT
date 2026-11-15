@@ -1616,6 +1616,23 @@ pub fn resume_thread(pointer: u64) -> u32 {
     adjust_suspend_count(&thread, -1)
 }
 
+/// PsSuspendThread(Thread, NULL) na thread de usuário: uma suspensão
+/// (KeSuspendThread), menos numa thread que já sai
+/// (STATUS_THREAD_IS_TERMINATING) ou com a contagem no limite de 127
+/// (STATUS_SUSPEND_COUNT_EXCEEDED). Threads de sistema não têm contagem.
+pub fn suspend_thread(pointer: u64) -> u32 {
+    let Some(thread) = find_by_pointer(pointer) else { return 0 };
+    let (previous, dead) = thread.with(|thread| (thread.suspend_count, thread.dead));
+    if dead {
+        return THREAD_IS_TERMINATING;
+    }
+    if previous == 127 {
+        return 0xC000_004A;
+    }
+    adjust_suspend_count(&thread, 1);
+    0
+}
+
 fn nt_suspend_thread(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     Ok(change_suspend(handle, previous, 1))
 }

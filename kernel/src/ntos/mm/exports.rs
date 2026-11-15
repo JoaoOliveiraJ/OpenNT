@@ -972,3 +972,44 @@ pub mod mm_change_image_protection {
 
     pub static GROUP: Group = Group { name: "mm-change-image-protection", names: &["MmChangeImageProtection"], handlers: &[change_image_protection], data_exports: &[] };
 }
+
+pub mod mm_flush_add_physical {
+    //! ZwFlushVirtualMemory (`mm/virtual_memory_services`) e
+    //! MmAddPhysicalMemory (`mm/physical_layout`).
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::{physical_layout, virtual_memory_services};
+    use crate::rtl::KernelError;
+
+    /// ZwFlushVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*, IoStatus).
+    fn flush_virtual_memory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(virtual_memory_services::flush(call.arg(1), call.arg(2), call.arg(3), call.arg(4))?))
+    }
+
+    /// MmAddPhysicalMemory(StartAddress*, NumberOfBytes*) -> NTSTATUS.
+    fn add_physical_memory(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PPHYSICAL_ADDRESS e PLARGE_INTEGER do chamador de modo kernel.
+        let (start, bytes) = unsafe { (Field::<u64>::at(call.arg(1)), Field::<u64>::at(call.arg(2))) };
+        let (status, added) = physical_layout::add_physical_memory(start.get(), bytes.get());
+        bytes.set(added);
+        Ok(signed_status(status))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-flush-add-physical", names: &["ZwFlushVirtualMemory", "MmAddPhysicalMemory"], handlers: &[flush_virtual_memory, add_physical_memory], data_exports: &[] };
+}
+
+pub mod ps_loaded_module_list {
+    //! Os exports de dado PsLoadedModuleList e PsLoadedModuleResource: as
+    //! células da `.kdata` que `mm/loaded_images` mantém.
+
+    use crate::ntos::init::exports::Group;
+    use crate::ntos::mm::loaded_images;
+
+    pub static GROUP: Group = Group {
+        name: "ps-loaded-module-list",
+        names: &[],
+        handlers: &[],
+        data_exports: &[("PsLoadedModuleList", loaded_images::module_list_cell), ("PsLoadedModuleResource", loaded_images::module_resource_cell)],
+    };
+}

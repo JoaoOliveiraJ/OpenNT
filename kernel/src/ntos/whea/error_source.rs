@@ -207,6 +207,39 @@ pub fn remove_error_source(id: u32) {
     guest::free_bytes(removed.descriptor);
 }
 
+/// Fonte com handles de relatório abertos (o status do original).
+const STATUS_SOURCE_REPORTS_OPEN: u32 = 0xC000_0708;
+
+/// WheaRemoveErrorSourceDeviceDriver(ErrorSourceId) (ntoskrnl 19041
+/// 0x95d080): fonte inexistente = STATUS_SUCCESS; o OpenHandles do
+/// descritor DeviceDriver vai de 0 a -1 (já -1 = remoção feita, sucesso;
+/// outro valor = relatórios abertos, o evento interno do WHEA e
+/// 0xC0000708); os buffers de pacote preparados são liberados e a fonte sai
+/// pelo WheaRemoveErrorSource (que chama a Uninitialize do driver). O
+/// original troca depois Initialize/Uninitialize do descritor por rotinas
+/// vazias; aqui o descritor já foi liberado pela remoção.
+pub fn remove_device_driver_source(id: u32) -> u32 {
+    let descriptor = get_error_source(id);
+    if descriptor == 0 {
+        return STATUS_SUCCESS;
+    }
+    let info = &descriptor_at(descriptor).info.device_driver_descriptor;
+    match info.open_handles.atomic().compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {}
+        Err(-1) => return STATUS_SUCCESS,
+        Err(_) => return STATUS_SOURCE_REPORTS_OPEN,
+    }
+    let buffer = info.packet_buffer.get();
+    if buffer != 0 {
+        guest::free_bytes(buffer);
+        guest::free_bytes(info.packet_state_buffer.get());
+        info.packet_buffer.set(0);
+        info.packet_state_buffer.set(0);
+    }
+    remove_error_source(id);
+    STATUS_SUCCESS
+}
+
 /// WheaConfigureErrorSource(SourceType, Configuration).
 pub fn configure_error_source(source_type: u32, _configuration: u64) -> u32 {
     if source_type > SOURCE_TYPE_DEVICE_DRIVER {

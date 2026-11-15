@@ -39,7 +39,8 @@ const FRAME_TAG: u32 = 0x6E66_6E57;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 /// Estado WNF do host: o mapa de escopos, as raízes de definição por tempo
-/// de vida (handles), a lista de contextos de processo e o lock dela.
+/// de vida (handles), a lista de contextos de processo e o lock dela e o
+/// RuntimeNameSequenceNumber dos nomes gerados no host.
 #[repr(C)]
 struct HostStorage {
     /// -> WNF_SCOPE_MAP do host.
@@ -47,7 +48,7 @@ struct HostStorage {
     root_keys: [Field<u64>; 3],
     process_contexts: ListEntry,
     process_contexts_lock: ExPushLock,
-    _pad_38: Reserved<0x8>,
+    runtime_name_sequence_number: Field<i64>,
 }
 
 /// Entrada do cache de descritores: o contador de referências, o hash e o
@@ -922,4 +923,80 @@ pub fn release_scope(pointer: u64) -> Result<(), KernelError> {
 
 pub fn release_name(state: &NameState) -> Result<(), KernelError> {
     rundown::release(name_at(state.pointer).run_ref.address())
+}
+
+/// O slot da raiz de definições de um tempo de vida (o
+/// ExpWnfGetNameStoreRegistryRoot do silo corrente).
+pub fn definition_root_slot(lifetime: u32) -> Result<u64, KernelError> {
+    root_slot(lifetime)
+}
+
+/// O próximo RuntimeNameSequenceNumber do ExpWnfGenerateStateName (ntoskrnl
+/// 19041 0x60e210), para nomes temporários e persistentes: o do host nos
+/// escopos de máquina (4 e 5) e o do silo de servidor corrente (o host sem
+/// silo) nos outros; o zero é pulado.
+pub fn next_runtime_sequence(scope: u32) -> Result<u64, KernelError> {
+    let silo = if (4..=5).contains(&scope) { 0 } else { silo_query::current_server_silo() };
+    let counter = if silo == 0 {
+        let host = ensure_host_storage()?;
+        if host == 0 {
+            return Err(KernelError::with_status("WNF host storage", STATUS_INSUFFICIENT_RESOURCES));
+        }
+        &host_at(host).runtime_name_sequence_number
+    } else {
+        &silo_state(silo)?.runtime_name_sequence_number
+    };
+    loop {
+        let next = counter.atomic().fetch_add(1, SeqCst).wrapping_add(1);
+        if next != 0 {
+            return Ok(next as u64);
+        }
+    }
+}
+
+/// A sequência dos nomes permanentes do host (o PermanentNameSequenceNumber
+/// e a reserva gravada na hive).
+struct PermanentSequence {
+    loaded: bool,
+    next: u64,
+    reserved: u64,
+}
+
+static PERMANENT_SEQUENCE: crate::rtl::SpinLock<PermanentSequence> = crate::rtl::SpinLock::new(PermanentSequence { loaded: false, next: 0, reserved: 0 });
+
+/// ExpWnfAllocateNextPersistentNameSequence (ntoskrnl 19041 0x733474): a
+/// sequência carregada do valor PermanentNameSequenceNumber (REG_BINARY de 8
+/// bytes; outro tamanho = STATUS_UNSUCCESSFUL) da raiz de nomes permanentes
+/// avança sem o zero; passando da reserva, a reserva sobe 100 e é gravada.
+/// `read` e `write` são o ZwQueryValueKey/ZwSetValueKey do valor.
+pub fn next_permanent_sequence(read: impl FnOnce() -> Result<Result<u64, u32>, KernelError>, write: impl FnOnce(u64) -> Result<u32, KernelError>) -> Result<Result<u64, u32>, KernelError> {
+    if !PERMANENT_SEQUENCE.lock().loaded {
+        let stored = match read()? {
+            Ok(value) => value,
+            Err(status) => return Ok(Err(status)),
+        };
+        let mut sequence = PERMANENT_SEQUENCE.lock();
+        if !sequence.loaded {
+            *sequence = PermanentSequence { loaded: true, next: stored, reserved: stored };
+        }
+    }
+    let (next, reserve) = {
+        let mut sequence = PERMANENT_SEQUENCE.lock();
+        sequence.next = sequence.next.wrapping_add(1);
+        if sequence.next == 0 {
+            sequence.next = 1;
+        }
+        let reserve = (sequence.next > sequence.reserved).then(|| (sequence.reserved + 100).max(sequence.next));
+        if let Some(reserve) = reserve {
+            sequence.reserved = reserve;
+        }
+        (sequence.next, reserve)
+    };
+    if let Some(reserve) = reserve {
+        let status = write(reserve)?;
+        if status != 0 {
+            return Ok(Err(status));
+        }
+    }
+    Ok(Ok(next))
 }

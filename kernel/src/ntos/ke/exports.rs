@@ -1153,3 +1153,18 @@ pub mod ke_device_queue {
         data_exports: &[],
     };
 }
+
+pub mod ke_sweep_local_caches {
+    //! KeSweepLocalCaches; a lógica mora em `ke/cache_flush.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::cache_flush;
+    use crate::rtl::KernelError;
+
+    fn sweep_local_caches(_: &Call) -> Result<u64, KernelError> {
+        cache_flush::sweep_local_caches();
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-sweep-local-caches", names: &["KeSweepLocalCaches"], handlers: &[sweep_local_caches], data_exports: &[] };
+}

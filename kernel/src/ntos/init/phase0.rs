@@ -55,6 +55,7 @@ pub fn init() {
     dump_mdl::init().unwrap_or_else(|error| panic!("dump MDL: {error}"));
     critical_region::init(); // entrega de APCs respeita KernelApcDisable/SpecialApcDisable
     scheduler::init().unwrap_or_else(|error| panic!("Process Manager: {error}")); // EPROCESS System + thread do boot
+    loaded_images::publish_module_list().unwrap_or_else(|error| panic!("PsLoadedModuleList: {error}")); // lista do loader + ERESOURCE
     crate::ntos::po::black_box::init().unwrap_or_else(|error| panic!("{error}")); // diagnóstico antes dos drivers nativos
     // Células de dado públicas do processo inicial e dos tipos de objeto, na
     // ordem de criação dos tipos do boot.

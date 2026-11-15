@@ -1,4 +1,4 @@
-//! Maiúsculas por unidade WCHAR com a tabela NLS instalada.
+//! Maiúsculas e minúsculas por unidade WCHAR com as tabelas NLS instaladas.
 //!
 //! A tabela vem de `C:\Windows\System32\l_intl.nls` no volume montado,
 //! lida no primeiro uso; ausência ou estrutura inválida é erro.
@@ -13,6 +13,7 @@ pub type TableSource = fn() -> Result<Vec<u8>, KernelError>;
 
 static SOURCE: SpinLock<Option<TableSource>> = SpinLock::new(None);
 static TABLE: SpinLock<Option<Vec<u16>>> = SpinLock::new(None);
+static LOWER_TABLE: SpinLock<Option<Vec<u16>>> = SpinLock::new(None);
 
 /// Fonte padrão: o arquivo real do volume de boot (`lookup_volume_file`).
 fn volume_table() -> Result<Vec<u8>, KernelError> {
@@ -38,6 +39,23 @@ pub fn read_uppercase(bytes: &[u8]) -> Result<Vec<u16>, KernelError> {
     Ok((4..end).step_by(2).filter(|offset| offset + 2 <= end).map(word).collect())
 }
 
+/// A tabela de minúsculas que segue a de maiúsculas: o RtlInitNlsTables
+/// (ntoskrnl 19041 0x7cc654) aponta Nls844UnicodeLowercaseTable para depois
+/// da palavra de tamanho dela, em 4 + 2 * tamanho das maiúsculas.
+pub fn read_lowercase(bytes: &[u8]) -> Result<Vec<u16>, KernelError> {
+    let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    read_uppercase(bytes)?;
+    let start = 2 + word(2) as usize * 2;
+    if start + 2 > bytes.len() {
+        return Err(KernelError::new("NLS: lowercase table missing"));
+    }
+    let end = start + word(start) as usize * 2;
+    if end < start + 514 || end > bytes.len() {
+        return Err(KernelError::new("NLS: invalid lowercase size"));
+    }
+    Ok((start + 2..end).step_by(2).filter(|offset| offset + 2 <= end).map(word).collect())
+}
+
 /// Três níveis indexados pelos grupos de 8, 4 e 4 bits fornecem o delta.
 fn lookup(table: &[u16], unit: u16) -> Result<u16, KernelError> {
     let read = |index: usize| table.get(index).copied().ok_or_else(|| KernelError::new("NLS: invalid uppercase trie"));
@@ -52,6 +70,16 @@ pub fn upcase_char(unit: u16) -> Result<u16, KernelError> {
     if table.is_none() {
         let source = (*SOURCE.lock()).unwrap_or(volume_table);
         *table = Some(read_uppercase(&source()?)?);
+    }
+    lookup(table.as_ref().unwrap(), unit)
+}
+
+/// Minúscula de uma unidade pela tabela 8:4:4 do l_intl.nls.
+pub fn downcase_char(unit: u16) -> Result<u16, KernelError> {
+    let mut table = LOWER_TABLE.lock();
+    if table.is_none() {
+        let source = (*SOURCE.lock()).unwrap_or(volume_table);
+        *table = Some(read_lowercase(&source()?)?);
     }
     lookup(table.as_ref().unwrap(), unit)
 }
@@ -75,5 +103,17 @@ pub fn nls_upcase(unit: u16) -> u16 {
         0x61..=0x7A => unit - 0x20,
         0..=0xBF => unit,
         _ => upcase_char(unit).unwrap_or(unit),
+    }
+}
+
+/// NLS_DOWNCASE do ntoskrnl 19041 (0x309740), o RtlDowncaseUnicodeChar:
+/// 'A'..'Z' ganham 0x20, o resto abaixo de U+00C0 fica e daí para cima vale
+/// a tabela de minúsculas (Nls844UnicodeLowercaseTable); sem tabela, o
+/// caractere volta inalterado.
+pub fn nls_downcase(unit: u16) -> u16 {
+    match unit {
+        0x41..=0x5A => unit + 0x20,
+        0..=0xBF => unit,
+        _ => downcase_char(unit).unwrap_or(unit),
     }
 }

@@ -472,6 +472,35 @@ pub fn write_value(relative_to: u32, path: u64, value_name: u64, value_type: u32
     Ok(result?.0)
 }
 
+/// RtlWriteRegistryValue com caminho e nome já em texto; Path vazio (o
+/// Path NULL do original) é a própria raiz do RelativeTo.
+fn write_named_value(relative_to: u32, path: &str, value_name: &str, value_type: u32, data: &[u8]) -> Result<u32, KernelError> {
+    let path = match crate::ntos::cm::check_registry_key::root_path(relative_to as usize) {
+        Some(prefix) if path.is_empty() => prefix,
+        _ => resolve_registry_path(relative_to, path),
+    };
+    let (status, handle) = key_services::open_path(&path, true)?;
+    if status != 0 {
+        return Ok(status);
+    }
+    let result = key_services::named_value(key_services::Kind::Set, handle, value_name, value_type, data);
+    cm_registry::close_handle(handle as u32);
+    Ok(result?.0)
+}
+
+/// RTL_REGISTRY_CONTROL (\Registry\Machine\System\CurrentControlSet\Control).
+const REGISTRY_CONTROL: u32 = 2;
+/// REG_DWORD.
+const REG_DWORD: u32 = 4;
+
+/// RtlSetPortableOperatingSystem(IsPortable) (ntoskrnl 19041 0x5888f0):
+/// RtlWriteRegistryValue(RTL_REGISTRY_CONTROL, NULL,
+/// "PortableOperatingSystem", REG_DWORD, IsPortable != 0, 4); devolve o
+/// NTSTATUS da escrita.
+pub fn set_portable_operating_system(portable: bool) -> Result<u32, KernelError> {
+    write_named_value(REGISTRY_CONTROL, "", "PortableOperatingSystem", REG_DWORD, &(portable as u32).to_le_bytes())
+}
+
 /// RtlCreateRegistryKey: abre criando e fecha o handle.
 pub fn create_key(relative_to: u32, path: u64) -> Result<u32, KernelError> {
     let path = guest_registry_path(relative_to, path);

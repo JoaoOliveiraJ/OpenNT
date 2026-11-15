@@ -313,6 +313,15 @@ pub fn create_symbolic_link(link_pointer: u64, target_pointer: u64) -> Result<u3
     }
 }
 
+/// IoCreateUnprotectedSymbolicLink(SymbolicLinkName, DeviceName) (ntoskrnl
+/// 19041 0x893a30): o mesmo ZwCreateSymbolicLinkObject permanente do
+/// IoCreateSymbolicLink, sem o SePublicDefaultUnrestrictedSd (o link herda a
+/// segurança do diretório). O Object Manager do OpenNT não guarda descritor
+/// em links simbólicos, então a criação é a mesma.
+pub fn create_unprotected_symbolic_link(link_pointer: u64, target_pointer: u64) -> Result<u32, KernelError> {
+    create_symbolic_link(link_pointer, target_pointer)
+}
+
 /// IoDeleteSymbolicLink: falha quando o link não existe.
 pub fn delete_symbolic_link(link_pointer: u64) -> u32 {
     if object_manager::unlink(&guest_strings::read_unicode_string(link_pointer)) { 0 } else { 0xC000_0009 }

@@ -1,5 +1,6 @@
 //! Invalidação dos caches de dados de todos os processadores
-//! (KeInvalidateAllCaches e KeInvalidateRangeAllCaches).
+//! (KeInvalidateAllCaches e KeInvalidateRangeAllCaches) e do processador
+//! corrente (KeSweepLocalCaches).
 //!
 //! Segue o ntoskrnl 19041:
 //! - KeInvalidateAllCaches (0x3a4700) sobe a SYNCH_LEVEL, manda a todos os
@@ -60,4 +61,10 @@ pub fn invalidate_range_all_caches(base: u64, length: u32) -> u64 {
         address += line;
     }
     0
+}
+
+/// KeSweepLocalCaches (ntoskrnl 19041 0x381b30): só o WBINVD do processador
+/// corrente.
+pub fn sweep_local_caches() {
+    cpu::flush_caches();
 }

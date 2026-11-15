@@ -1,6 +1,6 @@
 //! Serviços de memória virtual de um processo alvo, em KernelMode
 //! (ZwAllocateVirtualMemory(Ex), ZwFreeVirtualMemory, ZwProtectVirtualMemory,
-//! ZwUnlockVirtualMemory).
+//! ZwUnlockVirtualMemory, ZwFlushVirtualMemory).
 //!
 //! O processo alvo vem do handle (o pseudo-handle é o processo corrente,
 //! inclusive anexado) e é retido durante a operação; cada serviço age sobre
@@ -31,6 +31,11 @@ const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 
 /// Executa `body` no espaço do processo do handle, com o processo retido.
 fn with_target(handle: u64, body: impl FnOnce(Space) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
+    with_target_process(handle, |pointer| body(Space::of(pointer)))
+}
+
+/// Executa `body` com o EPROCESS do handle retido.
+fn with_target_process(handle: u64, body: impl FnOnce(u64) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
         return Err(KernelError::new("Zw*VirtualMemory requires PASSIVE_LEVEL"));
     }
@@ -45,7 +50,7 @@ fn with_target(handle: u64, body: impl FnOnce(Space) -> Result<u32, KernelError>
     if process::reference(pointer).is_none() {
         return Ok(STATUS_INVALID_HANDLE);
     }
-    let result = body(Space::of(pointer));
+    let result = body(pointer);
     process::dereference(pointer)?;
     result
 }
@@ -163,4 +168,69 @@ pub fn unlock(process_handle: u64, base_pointer: u64, size_pointer: u64, map_typ
         return Ok(STATUS_INVALID_PARAMETER);
     }
     with_target(process_handle, |_space| Ok(STATUS_NOT_LOCKED))
+}
+
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
+const STATUS_NOT_MAPPED_DATA: u32 = 0xC000_0088;
+const MEM_IMAGE: u32 = 0x100_0000;
+
+/// ZwFlushVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*, IoStatus)
+/// (NtFlushVirtualMemory 0x668e50 -> MmFlushVirtualMemory 0x668fb4):
+/// BaseAddress acima de 0x7FFFFFFEFFFF = STATUS_INVALID_PARAMETER_2 e uma
+/// faixa que passa de 0x7FFFFFFF0000 = STATUS_INVALID_PARAMETER_3, sem
+/// gravar nada; com o processo do handle, *BaseAddress volta alinhado à
+/// página e *RegionSize e IoStatus recebem o resultado do Mm, qualquer que
+/// seja: sem VAD ou numa região privada, STATUS_NOT_MAPPED_VIEW (o tamanho
+/// fica); numa vista de imagem ou de seção sem arquivo,
+/// STATUS_NOT_MAPPED_DATA; numa vista de arquivo, a faixa até o fim da
+/// página (RegionSize 0 = até o fim da vista; passar do fim =
+/// STATUS_NOT_MAPPED_VIEW) é gravada de volta e *RegionSize recebe o
+/// tamanho dela. A gravação do OpenNT é a da seção inteira (só os bytes
+/// alterados vão ao arquivo).
+pub fn flush(process_handle: u64, base_pointer: u64, size_pointer: u64, io_status: u64) -> Result<u32, KernelError> {
+    // SAFETY: PVOID*/SIZE_T*/PIO_STATUS_BLOCK de um chamador de modo kernel, não sondados.
+    let (base_field, size_field) = unsafe { (Field::<u64>::at(base_pointer), Field::<u64>::at(size_pointer)) };
+    let (base, size) = (base_field.get(), size_field.get());
+    if base > memory_map::HIGHEST_USER_ADDRESS {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    if memory_map::USER_PROBE_ADDRESS - base < size {
+        return Ok(STATUS_INVALID_PARAMETER_3);
+    }
+    with_target_process(process_handle, |process| {
+        let (status, length) = flush_range(process, base, size)?;
+        size_field.set(length);
+        base_field.set(base & !0xFFF);
+        // SAFETY: IO_STATUS_BLOCK do chamador de modo kernel.
+        let block = unsafe { crate::ntos::inc::types::IoStatusBlock::at(io_status) };
+        block.status.set(status as i32);
+        block.information.set(0);
+        Ok(status)
+    })
+}
+
+/// O MmFlushVirtualMemory: o status e o RegionSize de saída.
+fn flush_range(process: u64, base: u64, size: u64) -> Result<(u32, u64), KernelError> {
+    use crate::ntos::ps::user::sections;
+    let start = base & !0xFFF;
+    let view = sections::views().into_iter().find(|view| view.owner_process == Some(process) && !view.retiring() && base >= view.base && base - view.base < view.size);
+    let Some(view) = view else {
+        let image = query_virtual::describe_address(process, base).kind == MEM_IMAGE;
+        return Ok((if image { STATUS_NOT_MAPPED_DATA } else { STATUS_NOT_MAPPED_VIEW }, size));
+    };
+    let view_end = view.base + view.size - 1;
+    let end = if size == 0 { view_end } else { base.wrapping_add(size - 1) | 0xFFF };
+    if end > view_end {
+        return Ok((STATUS_NOT_MAPPED_VIEW, size));
+    }
+    if view.section.is_image || view.section.file.is_none() {
+        return Ok((STATUS_NOT_MAPPED_DATA, size));
+    }
+    let length = end - start + 1;
+    let status = match sections::flush(&view.section) {
+        Ok(()) => 0,
+        Err(error) => error.status,
+    };
+    Ok((status, length))
 }

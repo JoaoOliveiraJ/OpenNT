@@ -3,13 +3,18 @@
 //!
 //! Cada interface é um link `\DosDevices\#{guid}` para o dispositivo,
 //! registrada desabilitada; habilitar ou desabilitar dispara as
-//! notificações PnP da classe (`pnp_notify`).
+//! notificações PnP da classe (`pnp_notify`). As interfaces de um PDO do PnP
+//! têm as chaves do NT em `Control\DeviceClasses` (a da interface com
+//! DeviceInstance e a da referência, "#" + referência, com SymbolicLink),
+//! onde o IoOpenDeviceInterfaceRegistryKey abre `Device Parameters`.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::ntos::cm::key::services as key_services;
+use crate::ntos::cm::registry as cm_registry;
 use crate::ntos::io::{device, io_manager, pnp_notify};
 use crate::ntos::ob::object_manager;
 use crate::rtl::{KernelError, SpinLock};
@@ -58,6 +63,14 @@ pub fn register_device_interface(physical: u64, guid: u64, reference: u64, outpu
             (format!("\\DosDevices\\#{{{guid_text}}}"), format!("\\Device\\{device}"))
         }
     };
+    if let Some(node) = crate::ntos::io::pnp::devnode::get(physical) {
+        let units: Vec<u16> = link.encode_utf16().collect();
+        if let Ok((class, subkey)) = interface_subkey(&units) {
+            let interface = subkey.split('\\').next().unwrap_or_default();
+            write_text_value(&format!("{DEVICE_CLASSES}\\{class}\\{interface}"), "DeviceInstance", &node.instance_path)?;
+            write_text_value(&format!("{DEVICE_CLASSES}\\{class}\\{subkey}"), "SymbolicLink", &format!("\\\\?\\{}", &link[4..]))?;
+        }
+    }
     // Um link já registrado (o mesmo PDO pedindo a mesma interface) é reusado.
     let known = DEVICE_INTERFACES.lock().contains_key(&link);
     if !known {
@@ -111,4 +124,96 @@ pub fn interface_enabled(link: &str) -> Option<bool> {
 /// DEVICE_INTERFACE_INCLUDE_NONACTIVE (`include_inactive`).
 pub fn class_links(class: &[u8; 16], include_inactive: bool) -> Vec<String> {
     DEVICE_INTERFACES.lock().iter().filter(|(_, entry)| entry.class == *class && (include_inactive || entry.enabled)).map(|(link, _)| link.clone()).collect()
+}
+
+// ---- IoOpenDeviceInterfaceRegistryKey (ntoskrnl 19041 0x7ccc50) --------------
+//
+// IoOpenDeviceInterfaceRegistryKey(SymbolicLinkName, DesiredAccess,
+// DeviceInterfaceKey*): UNICODE_STRING NULL, sem Buffer ou vazia =
+// STATUS_INVALID_PARAMETER; sob o PnpRegistryDeviceResource, o
+// _CmOpenDeviceInterfaceRegKey (tipo 0x32, criando) abre
+// `Control\DeviceClasses\<GUID>\##?#<nome>\#<referência>\Device Parameters`.
+// O nome é validado como no _CmValidateDeviceInterfaceName: ao menos 49
+// caracteres, prefixo "\??\" ou "\\?\" (com caixa), no máximo uma barra
+// depois do prefixo, ao menos 48 caracteres antes dela e o GUID nos 38
+// caracteres finais dessa parte (senão STATUS_OBJECT_NAME_INVALID); a chave
+// da referência precisa existir (interface registrada, senão
+// STATUS_OBJECT_NAME_NOT_FOUND) e `Device Parameters` é criada nela.
+
+const DEVICE_CLASSES: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\DeviceClasses";
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+
+/// "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}", o formato do RtlGUIDFromString.
+fn guid_text(units: &[u16]) -> bool {
+    units.len() == 38
+        && units.iter().enumerate().all(|(index, &unit)| match index {
+            0 => unit == b'{' as u16,
+            37 => unit == b'}' as u16,
+            9 | 14 | 19 | 24 => unit == b'-' as u16,
+            _ => unit < 0x80 && (unit as u8).is_ascii_hexdigit(),
+        })
+}
+
+/// O GUID da classe e o caminho da chave da referência
+/// (`##?#<nome>\#<referência>`) de um link de interface.
+fn interface_subkey(units: &[u16]) -> Result<(String, String), u32> {
+    let prefixed = |prefix: &str| units.len() >= 4 && prefix.encode_utf16().eq(units[..4].iter().copied());
+    if (units.len() * 2) & 0xFFFE < 0x62 || !(prefixed("\\??\\") || prefixed("\\\\?\\")) {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    let slashes: Vec<usize> = units.iter().enumerate().skip(4).filter(|&(_, &unit)| unit == b'\\' as u16).map(|(index, _)| index).collect();
+    if slashes.len() > 1 {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    let end = slashes.first().copied().unwrap_or(units.len());
+    if end < 0x30 || !guid_text(&units[end - 38..end]) {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    let text = |slice: &[u16]| String::from_utf16_lossy(slice);
+    let reference = if end < units.len() { text(&units[end + 1..]) } else { String::new() };
+    Ok((text(&units[end - 38..end]), format!("##?#{}\\#{reference}", text(&units[4..end]))))
+}
+
+/// Cria a chave (e as de cima) e grava um REG_SZ.
+fn write_text_value(path: &str, name: &str, text: &str) -> Result<(), KernelError> {
+    let (status, handle) = key_services::open_path(path, true)?;
+    if status != 0 {
+        return Ok(());
+    }
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    let result = key_services::named_value(key_services::Kind::Set, handle, name, 1, &bytes);
+    cm_registry::close_handle(handle as u32);
+    result.map(|_| ())
+}
+
+/// IoOpenDeviceInterfaceRegistryKey: devolve o NTSTATUS.
+pub fn open_interface_registry_key(link_pointer: u64, output: u64) -> Result<u32, KernelError> {
+    if link_pointer == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: PUNICODE_STRING do chamador de modo kernel.
+    let link = unsafe { UnicodeString::at(link_pointer) };
+    if link.buffer.get() == 0 || link.length.get() == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let units = guest_strings::try_read_unicode_units(link_pointer)?;
+    let (class, subkey) = match interface_subkey(&units) {
+        Ok(found) => found,
+        Err(status) => return Ok(status),
+    };
+    let instance = format!("{DEVICE_CLASSES}\\{class}\\{subkey}");
+    let (status, handle) = key_services::open_path(&instance, false)?;
+    if status != 0 {
+        return Ok(status);
+    }
+    cm_registry::close_handle(handle as u32);
+    let (status, handle) = key_services::open_path(&format!("{instance}\\Device Parameters"), true)?;
+    if status != 0 {
+        return Ok(status);
+    }
+    // SAFETY: PHANDLE de saída do chamador de modo kernel.
+    unsafe { crate::ntos::inc::types::Field::<u64>::at(output) }.set(handle);
+    Ok(0)
 }

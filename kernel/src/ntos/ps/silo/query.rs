@@ -149,3 +149,9 @@ pub fn user_shared_data(silo: u64) -> Option<&'static crate::ntos::inc::types::S
 pub fn silo_identifier(silo: u64) -> u32 {
     if silo == HOST_SILO { 0 } else { ejob(silo).job_id.get() }
 }
+
+/// PsGetSiloContainerId(Silo) (ntoskrnl 19041 rva 0x905a90): o endereço do
+/// GUID EJOB.ContainerId do silo; o silo hospedeiro (NULL) devolve NULL.
+pub fn silo_container_id(silo: u64) -> u64 {
+    if silo == HOST_SILO { 0 } else { ejob(silo).container_id.address() }
+}

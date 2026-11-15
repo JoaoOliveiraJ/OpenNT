@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::types::{Field, NtStruct, PoFxDeviceV1, PopFxDevice};
+use crate::ntos::inc::types::{Field, NtStruct, PoFxDeviceV1, PoFxPrimaryDeviceV1, PopFxDevice};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -35,6 +35,8 @@ const CB_POWER_REQUIRED: usize = 3; // DevicePowerRequiredCallback
 
 struct Component {
     active_refs: u32,
+    /// O último PoFxSetComponentWake.
+    wake_hint: bool,
 }
 
 struct PoFxDevice {
@@ -64,8 +66,6 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
         return STATUS_NOT_SUPPORTED;
     }
 
-    let component_count = description.component_count.get();
-    let device_context = description.device_context.get();
     let callbacks = [
         description.component_active_condition_callback.get(),
         description.component_idle_condition_callback.get(),
@@ -74,7 +74,37 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
         description.device_power_not_required_callback.get(),
         description.power_control_callback.get(),
     ];
+    register(description.component_count.get(), description.device_context.get(), callbacks, 0, handle_out)
+}
 
+/// PoFxRegisterPrimaryDevice(Pdo, Device, Handle*) (ntoskrnl 19041
+/// 0x8e4380): Pdo ou Device NULL, ou Version != 1, = STATUS_INVALID_PARAMETER;
+/// os componentes V1 (em +0x50) são convertidos e o registro é o do
+/// PopFxRegisterDevice com os sete callbacks e o DeviceContext. O bit 0 de
+/// Flags só vale com a errata PopErrataDisablePrimaryDeviceFastResume, que o
+/// OpenNT não liga.
+pub fn register_primary_device(pdo: u64, device: u64, handle_out: u64) -> u32 {
+    if pdo == 0 || device == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: o dispositivo primário do driver.
+    let description = unsafe { PoFxPrimaryDeviceV1::at(device) };
+    if description.version.get() != 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let callbacks = [
+        description.component_active_condition_callback.get(),
+        description.component_idle_condition_callback.get(),
+        description.component_idle_state_callback.get(),
+        description.device_power_required_callback.get(),
+        description.device_power_not_required_callback.get(),
+        description.power_control_callback.get(),
+    ];
+    register(description.component_count.get(), description.device_context.get(), callbacks, description.component_critical_transition_callback.get(), handle_out)
+}
+
+/// O registro comum: o POHANDLE com o layout do POP_FX_DEVICE e os callbacks.
+fn register(component_count: u32, device_context: u64, callbacks: [u64; 6], critical_transition: u64, handle_out: u64) -> u32 {
     // Opaque handle shaped like POP_FX_DEVICE: Status, ComponentCount and
     // Components (POP_FX_COMPONENT**), whose pointer array follows the body.
     let handle = guest::alloc_bytes(PopFxDevice::SIZE + u64::from(component_count) * 8);
@@ -84,6 +114,15 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
     body.status.value.set(0);
     body.component_count.set(component_count);
     body.components.set(array);
+    body.driver_context.set(device_context);
+    let driver_callbacks = &body.callbacks;
+    driver_callbacks.component_active.set(callbacks[CB_ACTIVE_CONDITION]);
+    driver_callbacks.component_idle.set(callbacks[1]);
+    driver_callbacks.component_idle_state.set(callbacks[2]);
+    driver_callbacks.device_power_required.set(callbacks[CB_POWER_REQUIRED]);
+    driver_callbacks.device_power_not_required.set(callbacks[4]);
+    driver_callbacks.power_control.set(callbacks[5]);
+    driver_callbacks.component_critical_transition.set(critical_transition);
 
     let mut components = Vec::new();
     let mut component_buffers = Vec::new();
@@ -92,7 +131,7 @@ pub fn register_device(device: u64, handle_out: u64) -> u32 {
     for pointer in pointers {
         let buffer = guest::alloc_bytes(COMPONENT_SIZE);
         pointer.set(buffer);
-        components.push(Component { active_refs: 0 });
+        components.push(Component { active_refs: 0, wake_hint: false });
         component_buffers.push(buffer);
     }
 
@@ -143,6 +182,21 @@ pub fn activate_component(handle: u64, component: u32) {
             native_call::call(callback, &[context, u64::from(component)]);
         }
     }
+}
+
+/// PoFxSetComponentWake(Handle, Component, WakeHint) (ntoskrnl 19041
+/// 0x5691e0): o PopPepComponentSetWakeHint guarda a dica no componente do
+/// PEP e recalcula o estado ocioso alvo; o motor inerte só guarda a dica (o
+/// componente fica em F0).
+pub fn set_component_wake(handle: u64, component: u32, wake_hint: bool) {
+    if let Some(entry) = DEVICES.lock().get_mut(&handle).and_then(|device| device.components.get_mut(component as usize)) {
+        entry.wake_hint = wake_hint;
+    }
+}
+
+/// A dica de wake de um componente registrado.
+pub fn component_wake_hint(handle: u64, component: u32) -> Option<bool> {
+    DEVICES.lock().get(&handle).and_then(|device| device.components.get(component as usize)).map(|entry| entry.wake_hint)
 }
 
 /// PoFxIdleComponent(POHANDLE, ULONG Component, ULONG Flags): drop the active

@@ -1,4 +1,4 @@
-//! EtwEventEnabled.
+//! EtwEventEnabled e EtwProviderEnabled.
 //!
 //! Consulta os campos nativos medidos no kernel 19041; o registro e a
 //! publicação desses campos pertencem ao dono ETW (`provider_state`).
@@ -63,4 +63,27 @@ pub fn query(registration: u64, descriptor: u64) -> u8 {
     // SAFETY: a entrada do grupo publicada no registro.
     let group = unsafe { EtwGuidEntry::at(registration.group_entry.get()) };
     information_matches(&group.provider_enable_info, descriptor.level.get(), keyword) as u8
+}
+
+/// EtwProviderEnabled(RegHandle, Level, Keyword) (ntoskrnl 19041 0x25f0a0):
+/// REGHANDLE nulo = FALSE; o EtwpLevelKeywordEnabled do ProviderEnableInfo
+/// da ETW_GUID_ENTRY do registro e, se falhar e o registro tiver
+/// GroupEnableMask, o da entrada do grupo.
+pub fn provider_enabled(registration: u64, level: u8, keyword: u64) -> u8 {
+    if registration == 0 {
+        return 0;
+    }
+    // SAFETY: REGHANDLE (ETW_REG_ENTRY) do driver.
+    let registration = unsafe { EtwRegEntry::at(registration) };
+    // SAFETY: a ETW_GUID_ENTRY do registro.
+    let primary = unsafe { EtwGuidEntry::at(registration.guid_entry.get()) };
+    if information_matches(&primary.provider_enable_info, level, keyword) {
+        return 1;
+    }
+    if registration.group_enable_mask.get() == 0 {
+        return 0;
+    }
+    // SAFETY: a entrada do grupo publicada no registro.
+    let group = unsafe { EtwGuidEntry::at(registration.group_entry.get()) };
+    information_matches(&group.provider_enable_info, level, keyword) as u8
 }

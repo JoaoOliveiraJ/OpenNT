@@ -67,3 +67,15 @@ pub fn release_process(tagged: u64) -> Result<(), KernelError> {
     charge(process, flags, index, -1)?;
     Ok(())
 }
+
+/// O índice do contador de keep-alive no WakeCounters.
+const KEEP_ALIVE_COUNTER: u32 = 1;
+
+/// PspAdjustKeepAliveCountProcess(Process, Amount, FileObject, Wake)
+/// (ntoskrnl 19041 0x907b40): o PspChargeProcessWakeCounter do
+/// WakeCounters[1] (Wake) ou do NoWakeCounter, sem a exigência de pai do
+/// PsChargeProcessWakeCounter.
+pub fn adjust_keep_alive(process: &Eprocess, wake: bool, amount: i32) -> Result<(), KernelError> {
+    charge(process, if wake { 0 } else { NO_WAKE_COUNTER }, KEEP_ALIVE_COUNTER, amount)?;
+    Ok(())
+}

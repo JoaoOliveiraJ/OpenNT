@@ -103,6 +103,18 @@ pub fn copy_memory_non_temporal(destination: u64, source: u64, length: u64) {
     volatile::store_fence();
 }
 
+/// RtlCompareMemoryUlong(Source, Length, Pattern) (ntoskrnl 19041 0x407900,
+/// `repe scasd`): bytes do início, em ULONGs inteiros, iguais ao padrão; os
+/// bytes que sobram de Length / 4 não contam.
+pub fn compare_ulong(source: u64, length: u64, pattern: u32) -> u64 {
+    let count = length >> 2;
+    let mut equal = 0;
+    while equal < count && guest::read32(source + equal * 4) == pattern {
+        equal += 1;
+    }
+    equal * 4
+}
+
 /// RtlCompareMemory: bytes iguais do início.
 pub fn compare(left: u64, right: u64, length: u64) -> u64 {
     let mut equal = 0;

@@ -39,6 +39,19 @@ impl Call {
     pub fn arg(&self, index: usize) -> u64 {
         self.args[index - 1]
     }
+
+    /// Argumento 1-based de uma rotina variádica: além dos 14 copiados, a
+    /// pilha do chamador (o quinto em frame + 40); sem frame (chamada
+    /// interna), zero.
+    pub fn variadic_arg(&self, index: usize) -> u64 {
+        if index <= self.args.len() {
+            self.args[index - 1]
+        } else if self.frame != 0 {
+            crate::ntos::mm::guest_memory::read64(self.frame + 40 + (index as u64 - 5) * 8)
+        } else {
+            0
+        }
+    }
 }
 
 pub type Handler = fn(&Call) -> Result<u64, KernelError>;
@@ -53,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 434] {
+fn groups() -> [&'static Group; 450] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -490,6 +503,22 @@ fn groups() -> [&'static Group; 434] {
         &crate::ntos::ke::exports::ke_effective_irql::GROUP,
         &crate::ntos::rtl::exports::rtl_pc_to_file_name::GROUP,
         &crate::ntos::whea::exports::whea_log_internal_event::GROUP,
+        &crate::ntos::rtl::exports::rtl_ddi_assert::GROUP,
+        &crate::ntos::rtl::exports::rtl_rb_tree::GROUP,
+        &crate::ntos::rtl::exports::crt_scanf::GROUP,
+        &crate::ntos::rtl::exports::crt_integer_strings::GROUP,
+        &crate::ntos::rtl::exports::rtl_network_address_ansi::GROUP,
+        &crate::ntos::rtl::exports::rtl_memory_nls_small::GROUP,
+        &crate::ntos::po::exports::po_legacy_system_state::GROUP,
+        &crate::ntos::po::exports::po_fx_primary_device::GROUP,
+        &crate::ntos::etw::exports::etw_provider_enabled::GROUP,
+        &crate::ntos::ke::exports::ke_sweep_local_caches::GROUP,
+        &crate::ntos::whea::exports::whea_remove_device_driver::GROUP,
+        &crate::ntos::ps::exports::ps_suspend_process::GROUP,
+        &crate::ntos::mm::exports::mm_flush_add_physical::GROUP,
+        &crate::ntos::mm::exports::ps_loaded_module_list::GROUP,
+        &crate::ntos::io::exports::io_interface_key_keep_alive::GROUP,
+        &crate::ntos::ex::exports::zw_create_wnf_state_name::GROUP,
     ]
 }
 

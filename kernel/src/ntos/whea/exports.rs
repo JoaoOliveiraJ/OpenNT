@@ -81,3 +81,18 @@ pub mod whea_log_internal_event {
 
     pub static GROUP: Group = Group { name: "whea-log-internal-event", names: &["WheaLogInternalEvent"], handlers: &[log_internal_event], data_exports: &[] };
 }
+
+pub mod whea_remove_device_driver {
+    //! WheaRemoveErrorSourceDeviceDriver; a lógica mora em `whea/error_source`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::whea::error_source;
+    use crate::rtl::KernelError;
+
+    /// WheaRemoveErrorSourceDeviceDriver(ErrorSourceId) -> NTSTATUS.
+    fn remove_error_source_device_driver(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(error_source::remove_device_driver_source(call.arg(1) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "whea-remove-device-driver", names: &["WheaRemoveErrorSourceDeviceDriver"], handlers: &[remove_error_source_device_driver], data_exports: &[] };
+}
