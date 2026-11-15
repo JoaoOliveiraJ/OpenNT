@@ -232,6 +232,11 @@ fn store(key: PropertyKey, property_type: u32, size: u32, data: u64) -> u32 {
     PROPERTY_STATUS_SUCCESS
 }
 
+/// O valor de uma propriedade DEVPROPKEY do PDO (LCID neutro): tipo e bytes.
+pub fn device_property_value(pdo: u64, fmtid: [u8; 16], pid: u32) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    PROPERTIES.lock().get(&(Owner::Device(pdo), fmtid, pid, 0)).cloned()
+}
+
 /// IoSetDevicePropertyData(Pdo, PropertyKey, Lcid, Flags, Type, Size, Data).
 pub fn set_device_property(pdo: u64, key: &Devpropkey, lcid: u32, _flags: u32, property_type: u32, size: u32, data: u64) -> u32 {
     if pdo == 0 {

@@ -132,6 +132,19 @@ pub fn pc_to_file_header(pc: u64, base_out: u64) -> u64 {
     base
 }
 
+/// RtlPcToFileName(PcValue, FileName) (ntoskrnl 19041 rva 0x3cbf30): na
+/// PsLoadedModuleList, sob o lock compartilhado, a entrada cuja faixa
+/// [DllBase, DllBase + SizeOfImage) contém o PC tem o BaseDllName copiado
+/// para FileName (RtlCopyUnicodeString); sem entrada, STATUS_NOT_FOUND.
+pub fn pc_to_file_name(pc: u64, file_name: u64) -> Result<u32, crate::rtl::KernelError> {
+    let (_, entries) = crate::ntos::mm::loaded_images::native_list()?;
+    let Some(&(_, entry)) = entries.iter().find(|(image, _)| pc >= image.image_base && pc < image.image_base + image.size_of_image) else { return Ok(0xC000_0225) };
+    // SAFETY: KLDR_DATA_TABLE_ENTRY viva da lista de módulos.
+    let base_dll_name = unsafe { crate::ntos::inc::types::KldrDataTableEntry::at(entry) }.base_dll_name.address();
+    crate::ntos::rtl::strings::copy_unicode_string(file_name, base_dll_name)?;
+    Ok(0)
+}
+
 /// RtlFindExportedRoutineByName(PVOID ImageBase, PCCH Name): varre a EDATA
 /// de uma imagem carregada e devolve o VA do export (NULL em forwarder).
 pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {

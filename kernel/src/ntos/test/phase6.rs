@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1898 && abi_names::GROUP_LAYOUT.len() == 427 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1898 exports em 427 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1912 && abi_names::GROUP_LAYOUT.len() == 434 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1912 exports em 434 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1930,7 +1930,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1898 && exports::export_names().len() == 1898, "ntoskrnl: 427 grupos com os 1898 exports implementados");
+    assert(exports::implemented() == 1912 && exports::export_names().len() == 1912, "ntoskrnl: 434 grupos com os 1912 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -4794,9 +4794,12 @@ fn ke_ex_sync_exports(assert: Assert) {
     );}
 
 
-/// HalDispatchTable: HAL_DISPATCH público publicado (versão 4); todo slot de
-/// função aponta para o stub seguro, e o slot 1 (HalQuerySystemInformation) é
-/// chamável e devolve STATUS_NOT_SUPPORTED em vez de faultar.
+/// HalDispatchTable: HAL_DISPATCH público publicado (versão 4); o slot +0x68
+/// é o HaliInitPowerManagement e os demais slots de função apontam para o
+/// stub seguro; o slot 1 (HalQuerySystemInformation) é chamável e devolve
+/// STATUS_NOT_SUPPORTED em vez de faultar. O HalInitPowerManagement devolve a
+/// HalAcpiDispatchTable ('HAL ', versão 4, 21 rotinas) com as tabelas ACPI
+/// do firmware e os registradores de PM da FADT.
 fn hal_dispatch_table_exports(assert: Assert) {
     use crate::hal::amd64::{native_call, private_entries};
     use crate::hal::public_dispatch;
@@ -4807,10 +4810,94 @@ fn hal_dispatch_table_exports(assert: Assert) {
         _ => 0,
     };
     let stub = private_entries::entry("hal_default_not_supported").and_then(|entry| crate::ntos::mm::kernel_address::image_address(entry).ok()).unwrap_or(0);
-    let query = crate::hal::amd64::routine_stubs::address("HaliQuerySystemInformation").unwrap_or(0);
-    let slots_ok = stub != 0 && guest::read64(table + 0x08) == query && (1..public_dispatch::SLOT_COUNT as u64).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
-    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok, "hal: HalDispatchTable publicada (versao 4, HalQuerySystemInformation na rotina da HAL, demais slots no stub seguro)");
-    assert(native_call::call(at::<nt::HalDispatch>(table).hal_query_system_information.get(), &[0, 0, 0, 0]) as u32 == 0xC000_00BB, "hal: HalQuerySystemInformation de classe nao atendida devolve STATUS_NOT_SUPPORTED");
+    let power_slot = (core::mem::offset_of!(nt::HalDispatch, hal_init_power_management) as u64 - 8) / 8;
+    let routine = crate::hal::amd64::routine_stubs::address("HaliQuerySystemInformation").unwrap_or(0);
+    let slots_ok = stub != 0 && guest::read64(table + 0x08) == routine && (0..public_dispatch::SLOT_COUNT as u64).filter(|&slot| slot != power_slot && slot != 0).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
+    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok && power_slot == 12, "hal: HalDispatchTable publicada (versao 4, HalQuerySystemInformation e HalInitPowerManagement nas rotinas da HAL, demais slots no stub seguro)");
+    // HaliQuerySystemInformation: classe sem resposta nesta plataforma =
+    // STATUS_NOT_SUPPORTED; a BadIOAddrList (0x10) com o tamanho exigido e a
+    // entrada 0xCF8 com tratador; sem depurador (0x21) STATUS_UNSUCCESSFUL com
+    // 4; o limite de MSI por dispositivo (0x32) = 0x800.
+    let query = at::<nt::HalDispatch>(table).hal_query_system_information.get();
+    let buffer = guest::alloc_bytes(0x200);
+    let length = buffer + 0x1F8;
+    let unsupported = native_call::call(query, &[0, 0, 0, length]) as u32;
+    let small = native_call::call(query, &[0x10, 0, 0, length]) as u32;
+    let required = guest::read32(length);
+    let listed = native_call::call(query, &[0x10, 0x1C8, buffer, length]) as u32;
+    let entry = |index: u64| (guest::read32(buffer + index * 24), guest::read32(buffer + index * 24 + 4), guest::read64(buffer + index * 24 + 16));
+    let list_ok = listed == 0 && guest::read32(length) == 0x1C8 && entry(0) == (0, 0x10, 0) && entry(17).0 == 0xCF8 && entry(17).1 == 8 && entry(17).2 != 0 && entry(18) == (0, 0, 0);
+    let debugger = native_call::call(query, &[0x21, 0, 0, length]) as u32;
+    let debugger_length = guest::read32(length);
+    let secondary = native_call::call(query, &[0x1C, 0x38, buffer, length]) as u32;
+    let secondary_length = guest::read32(length);
+    let msi = native_call::call(query, &[0x32, 2, buffer, length]) as u32;
+    assert(unsupported == 0xC000_00BB && small == 0xC000_0004 && required == 0x1C8 && list_ok && debugger == 0xC000_0001 && debugger_length == 4 && secondary == 0xC000_0001 && secondary_length == 0x38 && msi == 0 && guest::read16(buffer) == 0x800 && guest::read32(length) == 2, "hal: HalQuerySystemInformation responde as classes 0x10, 0x1C, 0x21 e 0x32 como o HaliQuerySystemInformation");
+    // O tratador de 0xCF8: o endereço escrito em 0xCF8 e a leitura em 0xCFC
+    // pelo espaço de configuração (VendorID do host bridge 8086).
+    guest::write32(buffer, 0x8000_0000);
+    let latched = native_call::call(entry(17).2, &[0, 0xCF8, 4, buffer]) as u32;
+    let read = native_call::call(entry(17).2, &[1, 0xCFC, 2, buffer + 8]) as u32;
+    let other = native_call::call(entry(17).2, &[1, 0x80, 1, buffer + 8]) as u32;
+    assert(latched == 0 && read == 0 && guest::read16(buffer + 8) == 0x8086 && other == 0xC000_0001, "hal: HaliHandlePCIConfigSpaceAccess guarda 0xCF8 e le 0xCFC pela configuracao PCI");
+    guest::free_bytes(buffer);
+    hal_acpi_dispatch_table(assert, at::<nt::HalDispatch>(table).hal_init_power_management.get());
+}
+
+/// HalInitPowerManagement -> HalAcpiDispatchTable, como o HaliInitPowerManagement
+/// do ntoskrnl 19041: assinatura 'HAL ' e versão 4; tabelas pelo cache da HAL
+/// (RSDT e DSDT copiadas, FACS mapeada), a lista do GetAllTables sem DSDT,
+/// RSDT, XSDT e FACS, os registradores de PM da FADT (PM1a_EVT, PM_TMR),
+/// o estado do PIC (falso até o RestoreAllControllerState), o modelo de
+/// interrupção APIC e o acesso seguro recusado (STATUS_INVALID_ADDRESS).
+fn hal_acpi_dispatch_table(assert: Assert, init_power_management: u64) {
+    use crate::hal::amd64::native_call;
+    use crate::hal::{acpi, acpi_pm};
+    let out = guest::alloc_bytes(16);
+    let status = native_call::call(init_power_management, &[0, out]);
+    let table = guest::read64(out);
+    let function = |slot: u64| guest::read64(table + 8 + slot * 8);
+    assert(status == 0 && table != 0 && guest::read32(table) == 0x2048_414C && guest::read32(table + 4) == 4 && (0..acpi_pm::FUNCTIONS as u64).all(|slot| function(slot) != 0), "hal: HalInitPowerManagement devolve a HalAcpiDispatchTable ('HAL ', versao 4, 21 rotinas)");
+    let signature = |text: &[u8; 4]| u32::from_le_bytes(*text) as u64;
+    let rsdt = native_call::call(function(10), &[signature(b"RSDT"), 0, 0]);
+    let dsdt = native_call::call(function(10), &[signature(b"DSDT"), 0, 0]);
+    let firmware_dsdt = acpi::get_table("DSDT", 0, false);
+    assert(rsdt != 0 && guest::read32(rsdt) as u64 == signature(b"RSDT") && dsdt != 0 && firmware_dsdt.as_ref().is_some_and(|table| guest::read_bytes(dsdt, table.bytes.len()) == table.bytes) && native_call::call(function(10), &[signature(b"XXXX"), 0, 0]) == 0, "hal: HalAcpiGetTableDispatch devolve as copias da RSDT e da DSDT do firmware");
+    let facs = native_call::call(function(12), &[]);
+    assert(facs != 0 && guest::read32(facs) as u64 == signature(b"FACS") && native_call::call(function(12), &[]) == facs && native_call::call(function(11), &[]) == acpi::rsdp_address(), "hal: FACS mapeada (a mesma a cada chamada) e o RSDP");
+    let list = native_call::call(function(13), &[]);
+    let expected = acpi::enumerate().iter().filter(|table| !["DSDT", "RSDT", "XSDT", "FACS"].contains(&table.signature.as_str())).count();
+    let listed: alloc::vec::Vec<u32> = (0..guest::read32(list) as u64).map(|index| guest::read32(guest::read64(list + 8 + index * 8))).collect();
+    assert(list != 0 && listed.len() == expected && listed.contains(&(signature(b"FACP") as u32)) && native_call::call(function(13), &[]) == list, "hal: HalAcpiGetAllTablesDispatch lista as tabelas da RSDT sem DSDT/RSDT/XSDT/FACS");
+    let fadt = acpi::get_table("FACP", 0, false).map(|table| table.bytes).unwrap_or_default();
+    let pm1a_event = fadt.get(0x38..0x3C).map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+    let register = acpi_pm::pm_register(0).unwrap_or_default();
+    let timer = acpi_pm::pm_register(2).unwrap_or_default();
+    let gpe1_status = if acpi_pm::pm_register(7).unwrap_or_default().present { 0 } else { 0xC000_00BB };
+    assert(native_call::call(function(14), &[0]) == 0 && register.present && register.port as u32 == pm1a_event && register.size == 2 && timer.present && timer.size == 4 && native_call::call(function(14), &[7]) as u32 == gpe1_status, "hal: registradores de PM da FADT (PM1a_EVT de 2 bytes, PM_TMR de 4)");
+    let buffer = guest::alloc_bytes(16);
+    let small = native_call::call(function(15), &[2, 0, buffer, 2, buffer + 8]);
+    let first = native_call::call(function(15), &[2, 0, buffer, 4, buffer + 8]);
+    let tick = guest::read32(buffer) & 0x00FF_FFFF;
+    crate::ntos::ke::clock::stall_execution_processor(100);
+    let second = native_call::call(function(15), &[2, 0, buffer, 4, buffer + 8]);
+    let later = guest::read32(buffer) & 0x00FF_FFFF;
+    assert(small as u32 == 0xC000_0023 && first == 0 && second == 0 && guest::read32(buffer + 8) == 4 && later != tick, "hal: HalpAcpiPmRegisterRead le o PM_TMR (BUFFER_TOO_SMALL com buffer curto)");
+    let model = guest::alloc_bytes(8);
+    guest::write32(model, 0xFFFF_FFFF);
+    native_call::call(function(1), &[0, model]);
+    assert(guest::read32(model) == 1 && acpi_pm::wakeup_state() == 1, "hal: HaliAcpiMachineStateInit devolve o modelo de interrupcao APIC");
+    let intact_before = native_call::call(function(3), &[]) & 0xFF;
+    native_call::call(function(4), &[]);
+    let intact_after = native_call::call(function(3), &[]) & 0xFF;
+    assert(intact_before == 0 && intact_after == 1 && native_call::call(function(17), &[0, buffer, buffer, 4, buffer + 8]) as u32 == 0xC000_0141 && guest::read32(buffer + 8) == 0, "hal: estado do PIC intacto so depois da restauracao e acesso seguro recusado");
+    let vendor = guest::alloc_bytes(8);
+    let read = native_call::call(function(5), &[0, 0, 0, vendor, 0, 2]);
+    assert(read == 2 && guest::read16(vendor) == 0x8086 && native_call::call(function(7), &[0]) as u32 & 0xFF == 0x11 && native_call::call(function(7), &[0x1000]) as u32 == 0xF000_0000 && native_call::call(function(9), &[0]) & 0xFF == 1 && native_call::call(function(9), &[0x1000]) & 0xFF == 0, "hal: configuracao PCI pela tabela (host bridge 8086) e as linhas por GSI dos IOAPICs da MADT");
+    guest::free_bytes(vendor);
+    guest::free_bytes(model);
+    guest::free_bytes(buffer);
+    guest::free_bytes(out);
 }
 
 fn fsrtl_core_exports(assert: Assert) {
@@ -12474,6 +12561,96 @@ fn cm_network_defaults(assert: Assert) {
 /// HalTranslateBusAddress: no Isa (1) e no PCIBus (5) o endereço traduzido
 /// é o de barramento, o resultado é TRUE e o AddressSpace não muda (o
 /// HalTranslateBusAddress e o HalpTranslateBusAddress do ntoskrnl 19041).
+/// Os destinos de interrupção da HAL (modo físico, sem MSI), como as rotinas
+/// do ntoskrnl 19041: HalConvertDeviceIdtToIrql (vetor >> 4 limitado a
+/// [3, 12]; 0x100 em diante dá 3), HalGetProcessorIdByNtNumber (o APIC ID;
+/// índice além dos processadores = STATUS_INVALID_PARAMETER),
+/// HalGetInterruptTargetInformation (tipo 0 com o PROCESSOR_NUMBER do APIC
+/// ID, modo físico; tipo 1 recusado; APIC ID ausente = STATUS_NOT_FOUND),
+/// HalGetMessageRoutingInfo (modo físico com os campos do pedido; modo
+/// lógico recusado) e HalGetMemoryCachingRequirements (boot por BIOS sem
+/// exigências: STATUS_UNSUCCESSFUL com CacheType 0). KdComPortInUse e
+/// KdHvComPortInUse resolvem para células nulas.
+fn hal_interrupt_targets_exports(assert: Assert) {
+    let irql = |vector: u64| call_export("HalConvertDeviceIdtToIrql", &[vector]).map(|value| value as u8);
+    assert(irql(0x21) == Some(3) && irql(0x51) == Some(5) && irql(0xC1) == Some(12) && irql(0xD1) == Some(12) && irql(0x100) == Some(3), "hal-interrupt-targets: HalConvertDeviceIdtToIrql");
+    let block = guest::alloc_bytes(0x100);
+    let bsp = crate::ntos::ke::processor_topology::processor_apic_ids()[0];
+    let count = crate::ntos::ke::processor_group::active_processor_count();
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    guest::write32(block, 0xFFFF_FFFF);
+    let found = status(call_export("HalGetProcessorIdByNtNumber", &[0, block]));
+    let id = guest::read32(block);
+    let beyond = status(call_export("HalGetProcessorIdByNtNumber", &[count, block + 8]));
+    assert(found == Some(0) && id == bsp && beyond == Some(0xC000_000D), "hal-interrupt-targets: HalGetProcessorIdByNtNumber devolve o APIC ID do BSP e recusa indice alem dos processadores");
+    guest::write_bytes(block, &[0xAA; 0x18]);
+    let target = status(call_export("HalGetInterruptTargetInformation", &[0, bsp as u64, block]));
+    let filled = guest::read32(block) == 0 && guest::read32(block + 4) == 0 && guest::read32(block + 8) == 0 && guest::read32(block + 0xC) == 0 && guest::read32(block + 0x14) == 1;
+    let wrong_type = status(call_export("HalGetInterruptTargetInformation", &[1, bsp as u64, block]));
+    let absent = status(call_export("HalGetInterruptTargetInformation", &[0, 0xFE, block]));
+    assert(target == Some(0) && filled && wrong_type == Some(0xC000_000D) && absent == Some(0xC000_0225), "hal-interrupt-targets: HalGetInterruptTargetInformation em modo fisico com o PROCESSOR_NUMBER do BSP");
+    let (request, output) = (block, block + 0x40);
+    guest::write_bytes(block, &[0; 0xC0]);
+    guest::write64(request + 0x10, 1);
+    guest::write32(request + 0x20, 1);
+    guest::write32(request + 0x28, 0x11);
+    guest::write32(request + 0x2C, 0x22);
+    guest::write16(request + 0x30, 0x33);
+    let routed = status(call_export("HalGetMessageRoutingInfo", &[request, output]));
+    let routed_ok = guest::read32(output) == 1 && guest::read32(output + 8) == 1 && guest::read32(output + 0x54) == 0x11 && guest::read32(output + 0x50) == 0x22 && guest::read32(output + 0x58) == 0x33;
+    guest::write32(request + 0x20, 2);
+    let logical = status(call_export("HalGetMessageRoutingInfo", &[request, output]));
+    assert(routed == Some(0) && routed_ok && logical == Some(0xC000_000D), "hal-interrupt-targets: HalGetMessageRoutingInfo em modo fisico e o modo logico recusado");
+    guest::write32(block, 0xFFFF_FFFF);
+    let caching = status(call_export("HalGetMemoryCachingRequirements", &[0x10_0000, 0x1000, block]));
+    let no_output = status(call_export("HalGetMemoryCachingRequirements", &[0x10_0000, 0x1000, 0]));
+    assert(caching == Some(0xC000_0001) && guest::read32(block) == 0 && no_output == Some(0xC000_000D), "hal-interrupt-targets: HalGetMemoryCachingRequirements sem exigencias no boot por BIOS");
+    let data = |name: &str| match crate::ntos::init::exports::lookup("ntoskrnl.exe", name) {
+        Some(crate::ntos::mm::pe_loader::ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    let (com, hv) = (data("KdComPortInUse"), data("KdHvComPortInUse"));
+    assert(com != 0 && hv != 0 && com != hv && guest::read64(com) == 0 && guest::read64(hv) == 0, "hal-interrupt-targets: KdComPortInUse e KdHvComPortInUse nulos (sem depurador por serial)");
+    guest::free_bytes(block);
+    // KeFlushWriteBuffer (pela hal.dll): o corpo vazio do ntoskrnl 19041.
+    assert(call_export("KeFlushWriteBuffer", &[]).is_some(), "ke-flush-write-buffer: KeFlushWriteBuffer retorna sem efeito");
+}
+
+/// O suporte que a pshed.dll importa (pelo pci.sys), como o ntoskrnl 19041:
+/// KeGetEffectiveIrql (o IRQL corrente com interrupções ligadas), as
+/// variáveis de ambiente Ex no BIOS (STATUS_NOT_IMPLEMENTED pelas duas
+/// rotinas Nt e pelas duas da HAL), RtlPcToFileName (o BaseDllName da
+/// imagem que contém o PC; fora de qualquer imagem, STATUS_NOT_FOUND),
+/// WheaLogInternalEvent (aceita só o cabeçalho 'WhLg') e o HalBugCheckSystem
+/// publicado (ele para o sistema, então só a resolução é conferida).
+fn pshed_support_exports(assert: Assert) {
+    let irql = call_export("KeGetEffectiveIrql", &[]).map(|value| value as u8);
+    assert(irql == Some(crate::ntos::ke::irql::get_irql()), "pshed-support: KeGetEffectiveIrql devolve o IRQL corrente com interrupcoes ligadas");
+    let buffer = guest::alloc_bytes(0x100);
+    let status = |name: &str, args: &[u64]| call_export(name, args).map(|value| value as u32);
+    let not_implemented = Some(0xC000_0002);
+    assert(status("NtGetEnvironmentVariableEx", &[buffer, buffer, buffer, buffer + 8, buffer + 16]) == not_implemented && status("NtQueryEnvironmentVariableInfoEx", &[1, buffer, buffer + 8]) == not_implemented && status("HalEnumerateEnvironmentVariablesEx", &[1, buffer, buffer + 8]) == not_implemented && status("HalSetEnvironmentVariableEx", &[buffer, buffer, buffer, 4, 7]) == not_implemented, "pshed-support: variaveis de ambiente Ex no BIOS = STATUS_NOT_IMPLEMENTED");
+    let kernel = crate::ntos::mm::loaded_images::kernel().map_or(0, |image| image.image_base);
+    let name_buffer = buffer + 0x20;
+    let unicode = at::<nt::UnicodeString>(buffer);
+    unicode.length.set(0);
+    unicode.maximum_length.set(0x80);
+    unicode.buffer.set(name_buffer);
+    let found = status("RtlPcToFileName", &[kernel + 0x1000, buffer]);
+    let name = crate::ntos::rtl::guest_strings::read_unicode_string(buffer);
+    let missing = status("RtlPcToFileName", &[0x1000, buffer]);
+    assert(found == Some(0) && name.eq_ignore_ascii_case("ntoskrnl.exe") && missing == Some(0xC000_0225), "pshed-support: RtlPcToFileName da imagem do kernel e de um PC fora das imagens");
+    let before = crate::ntos::whea::logged_internal_events();
+    guest::write_bytes(buffer, &[0; 0x20]);
+    guest::write32(buffer, 0x674C_6857);
+    call_export("WheaLogInternalEvent", &[buffer]);
+    guest::write32(buffer, 0);
+    call_export("WheaLogInternalEvent", &[buffer]);
+    assert(crate::ntos::whea::logged_internal_events() == before + 1, "pshed-support: WheaLogInternalEvent aceita o cabecalho WhLg e ignora o resto");
+    assert(crate::ntos::init::exports::lookup("ntoskrnl.exe", "HalBugCheckSystem").is_some(), "pshed-support: HalBugCheckSystem publicado");
+    guest::free_bytes(buffer);
+}
+
 fn hal_translate_bus_address_exports(assert: Assert) {
     let block = guest::alloc_bytes(0x20);
     let (space, translated) = (block, block + 8);
@@ -14419,6 +14596,8 @@ pub fn run(assert: Assert) {
     super::fs_driver_imports::run(assert);
     nt_create_file_exports(assert);
     hal_translate_bus_address_exports(assert);
+    hal_interrupt_targets_exports(assert);
+    pshed_support_exports(assert);
     cm_kernel_create_explicit_owner(assert);
     io_device_security_descriptors(assert);
     mm_memory_events(assert);

@@ -129,8 +129,61 @@ pub fn seed_hardware_description() -> Result<(), KernelError> {
     // publicam nela os seus dispositivos (RtlWriteRegistryValue com
     // RTL_REGISTRY_DEVICEMAP, como KeyboardClass e PointerClass).
     registry::close_handle(registry::open_or_create(DEVICE_MAP_PATH, None)?);
+    seed_acpi_bios()?;
     seed_central_processors()?;
-    debug_print!("[hwdesc] arvore de hardware descrita (8042 ISA, processadores) semeada");
+    debug_print!("[hwdesc] arvore de hardware descrita (8042 ISA, ACPI BIOS, processadores) semeada");
+    Ok(())
+}
+
+/// REG_FULL_RESOURCE_DESCRIPTOR.
+const REG_FULL_RESOURCE_DESCRIPTOR: u32 = 9;
+/// CmResourceTypeDeviceSpecific.
+const DEVICE_SPECIFIC: u8 = 5;
+
+/// O Configuration Data do adaptador "ACPI BIOS": um CM_FULL_RESOURCE_DESCRIPTOR
+/// (Internal, barramento 0) com um único descritor DeviceSpecific cujo dado é
+/// o ACPI_BIOS_MULTI_NODE: o endereço físico da RSDT, a contagem e as
+/// entradas ACPI_E820_ENTRY (base, tamanho, tipo e um ULONG reservado) do
+/// mapa de memória do firmware.
+pub fn acpi_bios_configuration(rsdt: u64, map: &[crate::ntos::mm::physical_layout::FirmwareRange]) -> Vec<u8> {
+    let mut node = Vec::new();
+    node.extend_from_slice(&rsdt.to_le_bytes());
+    node.extend_from_slice(&(map.len() as u64).to_le_bytes());
+    for range in map {
+        node.extend_from_slice(&range.base.to_le_bytes());
+        node.extend_from_slice(&range.length.to_le_bytes());
+        node.extend_from_slice(&range.range_type.to_le_bytes());
+        node.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut bytes = Vec::new();
+    // InterfaceType Internal, BusNumber 0, Version/Revision 0, Count 1.
+    for value in [0u32, 0, 0, 1] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[DEVICE_SPECIFIC, 0, 0, 0]);
+    bytes.extend_from_slice(&(node.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&node);
+    bytes
+}
+
+/// `MultifunctionAdapter\1` com o Identifier "ACPI BIOS", que o carregador do
+/// NT cria num PC ACPI e o acpi.sys procura (OSReadAcpiConfigurationData):
+/// o Configuration Data com a RSDT e o mapa E820, e o Component Information
+/// de 16 bytes com a afinidade de todos os processadores.
+fn seed_acpi_bios() -> Result<(), KernelError> {
+    let rsdt = crate::hal::acpi::enumerate().iter().find(|table| table.signature == "RSDT" || table.signature == "XSDT").map_or(0, |table| table.address);
+    if rsdt == 0 {
+        return Ok(());
+    }
+    let configuration = acpi_bios_configuration(rsdt, &crate::ntos::mm::physical_layout::firmware_map());
+    let handle = registry::open_or_create(&(String::from(HARDWARE_DESCRIPTION_PATH) + "\\MultifunctionAdapter\\1"), None)?;
+    registry::set_value(handle, "Identifier", 1, registry::encode_wide("ACPI BIOS"));
+    registry::set_value(handle, "Configuration Data", REG_FULL_RESOURCE_DESCRIPTOR, configuration);
+    let mut component = alloc::vec![0u8; 12];
+    component.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    registry::set_value(handle, "Component Information", 3, component);
+    registry::close_handle(handle);
     Ok(())
 }
 

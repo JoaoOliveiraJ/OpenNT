@@ -12,6 +12,18 @@ use crate::rtl::{KernelError, SpinLock};
 
 static ADMITTED: SpinLock<Option<Vec<(u64, u64)>>> = SpinLock::new(None);
 
+/// Uma entrada do mapa de memória do firmware (INT 15h E820), como a BIOS a
+/// entregou: base, tamanho e tipo (1 = RAM, 2 = reservada, 3 = ACPI, 4 = NVS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareRange {
+    pub base: u64,
+    pub length: u64,
+    pub range_type: u32,
+}
+
+/// O mapa E820 habilitado (bit 0 dos atributos estendidos), copiado no boot.
+static FIRMWARE_MAP: SpinLock<Vec<FirmwareRange>> = SpinLock::new(Vec::new());
+
 pub fn init() -> Result<(), KernelError> {
     let count = physical::read16(map::E820_COUNT_PHYS) as u64;
     if count == 0 || count > map::E820_MAX_ENTRIES {
@@ -19,11 +31,13 @@ pub fn init() -> Result<(), KernelError> {
     }
     let mut usable = Vec::new();
     let mut reserved = Vec::new();
+    let mut firmware = Vec::new();
     for index in 0..count {
         let at = map::E820_TABLE_PHYS + index * 24;
         if physical::read32(at + 20) & 1 == 0 {
             continue;
         }
+        firmware.push(FirmwareRange { base: physical::read64(at), length: physical::read64(at + 8), range_type: physical::read32(at + 16) });
         let base = physical::read64(at);
         let length = physical::read64(at + 8);
         let end = base.saturating_add(length);
@@ -67,7 +81,13 @@ pub fn init() -> Result<(), KernelError> {
         .filter(|(base, top)| base < top)
         .collect();
     *ADMITTED.lock() = Some(admitted);
+    *FIRMWARE_MAP.lock() = firmware;
     Ok(())
+}
+
+/// O mapa de memória do firmware, na ordem da BIOS.
+pub fn firmware_map() -> Vec<FirmwareRange> {
+    FIRMWARE_MAP.lock().clone()
 }
 
 pub fn ranges() -> Vec<(u64, u64)> {

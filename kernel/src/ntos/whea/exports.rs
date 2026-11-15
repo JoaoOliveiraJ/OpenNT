@@ -67,3 +67,17 @@ pub mod whea_error_source {
         data_exports: &[],
     };
 }
+
+pub mod whea_log_internal_event {
+    //! WheaLogInternalEvent; a lógica mora em `whea/mod.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn log_internal_event(call: &Call) -> Result<u64, KernelError> {
+        crate::ntos::whea::log_internal_event(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "whea-log-internal-event", names: &["WheaLogInternalEvent"], handlers: &[log_internal_event], data_exports: &[] };
+}

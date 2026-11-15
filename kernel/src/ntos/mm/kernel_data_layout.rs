@@ -138,6 +138,11 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // soma 1 por processador que sobe); o export legado é lido como CCHAR, o
     // byte baixo.
     KernelDataEntry { name: "KeNumberProcessors", size: 4, storage_size: 4, alignment: 4, initial: &[0; 4] },
+    // PUCHAR KdComPortInUse e KdHvComPortInUse: a porta serial do depurador
+    // do kernel e a do depurador do hipervisor; sem depurador por serial,
+    // nulos (o acpi.sys não esconde nenhuma porta COM, ACPIMatchKernelPorts).
+    pointer("KdComPortInUse"),
+    pointer("KdHvComPortInUse"),
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

@@ -41,6 +41,12 @@ fn publish(level: u8) {
     }
 }
 
+/// KeGetEffectiveIrql (ntoskrnl 19041 rva 0x25edf0): com as interrupções
+/// ligadas, o IRQL corrente; desligadas, HIGH_LEVEL (nada interrompe a CPU).
+pub fn effective_irql() -> u8 {
+    if crate::hal::cpu::interrupts_enabled() { get_irql() } else { HIGH_LEVEL }
+}
+
 /// O nível de partida, que a KPCR do BSP herda (`pcr::init`).
 pub fn boot_level() -> u8 {
     BOOT.load(Ordering::Relaxed)

@@ -2625,6 +2625,20 @@ pub mod rtl_self_relative_sd2 {
     pub static GROUP: Group = Group { name: "rtl-self-relative-sd2", names: &["RtlSelfRelativeToAbsoluteSD2"], handlers: &[self_relative_to_absolute_sd2], data_exports: &[] };
 }
 
+pub mod rtl_pc_to_file_name {
+    //! RtlPcToFileName; a lógica mora em `rtl/image.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::image;
+    use crate::rtl::KernelError;
+
+    fn pc_to_file_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(image::pc_to_file_name(call.arg(1), call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-pc-to-file-name", names: &["RtlPcToFileName"], handlers: &[pc_to_file_name], data_exports: &[] };
+}
+
 pub mod rtl_crt_towupper {
     //! towupper: no ntoskrnl 19041 (0x3d36d0) é só a chamada ao
     //! RtlUpcaseUnicodeChar, cuja lógica mora em `rtl/nls_translation.rs`.

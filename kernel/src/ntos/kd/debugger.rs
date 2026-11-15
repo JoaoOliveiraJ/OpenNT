@@ -57,6 +57,18 @@ pub fn entered_debugger_address() -> u64 {
     data_address("KdEnteredDebugger")
 }
 
+/// Célula do export de dados KdComPortInUse (PUCHAR, nulo sem depurador por
+/// serial).
+pub fn com_port_in_use_address() -> u64 {
+    data_address("KdComPortInUse")
+}
+
+/// Célula do export de dados KdHvComPortInUse (PUCHAR, nulo sem depurador do
+/// hipervisor por serial).
+pub fn hv_com_port_in_use_address() -> u64 {
+    data_address("KdHvComPortInUse")
+}
+
 /// DbgBreakPoint: o corpo nativo é o do ntoskrnl 19041 (`int 3; ret`). Sem
 /// KD, a exceção STATUS_BREAKPOINT segue pelo despacho de exceções de kernel:
 /// um handler do chamador a trata; sem handler, KMODE_EXCEPTION_NOT_HANDLED.

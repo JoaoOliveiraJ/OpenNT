@@ -36,6 +36,24 @@ pub fn firmware_type() -> Result<u32, KernelError> {
     }
 }
 
+/// NtGetEnvironmentVariableEx e NtQueryEnvironmentVariableInfoEx (ntoskrnl
+/// 19041): fora do firmware EFI (ExpFirmwareType != 2), STATUS_NOT_IMPLEMENTED
+/// antes de tocar qualquer argumento.
+pub fn nt_environment_variable_ex() -> Result<u32, KernelError> {
+    if firmware_type()? == 1 {
+        return Ok(0xC000_0002);
+    }
+    Err(KernelError::new("firmware variable provider unavailable"))
+}
+
+/// HalSetEnvironmentVariableEx: sem HalFirmwareTypeEfi, STATUS_NOT_IMPLEMENTED.
+/// HalEnumerateEnvironmentVariablesEx(InformationClass, Buffer, BufferLength)
+/// é o HalpEnumerateEnvironmentVariablesWithFilter sem filtro, que no BIOS
+/// também devolve STATUS_NOT_IMPLEMENTED.
+pub fn hal_environment_variable_ex() -> Result<u32, KernelError> {
+    nt_environment_variable_ex()
+}
+
 /// Sem sondagem, conversão de nome, alocação nem modificação de saídas,
 /// inclusive com argumentos NULL ou desalinhados.
 pub fn query(_name: u64, _guid: u64, _value: u64, _length: u64, _attributes: u64) -> Result<u32, KernelError> {

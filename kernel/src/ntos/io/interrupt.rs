@@ -1,9 +1,19 @@
-//! Interrupções dos exports Io* — IoConnectInterruptEx (LINE_BASED pelo
-//! recurso do PDO, FULLY_SPECIFIED pelos campos), IoDisconnectInterruptEx e
-//! IoGetAffinityInterrupt, sobre o KINTERRUPT de `ke::interrupt_object`.
+//! Interrupções dos exports Io* — IoConnectInterruptEx (LINE_BASED pelos
+//! dados de conexão do PDO ou pelo recurso dele, FULLY_SPECIFIED pelos
+//! campos), IoDisconnectInterruptEx e IoGetAffinityInterrupt, sobre o
+//! KINTERRUPT de `ke::interrupt_object`.
+//!
+//! Como o IopConnectLineBasedInterrupt do ntoskrnl 19041, o LINE_BASED usa
+//! primeiro os dados de conexão que o barramento gravou no PDO
+//! (INTERRUPT_CONNECTION_DATA_PKEY, o IopGetInterruptConnectionData: um
+//! ULONG de contagem e os INTERRUPT_VECTOR_DATA de 0x58 bytes; o acpi.sys
+//! grava os da SCI no dispositivo ACPI da HAL). Do vetor de entrada de
+//! controlador vale a GSIV, que a HAL entrega pelo 8259 no vetor fixo da
+//! linha (`resources::translate_interrupt`), com o modo e a polaridade do
+//! próprio dado.
 
 use crate::ntos::init::exports::signed_status;
-use crate::ntos::inc::types::{GroupAffinity, IoConnectInterruptParameters, IoDisconnectInterruptParameters, Kinterrupt, NtStruct};
+use crate::ntos::inc::types::{GroupAffinity, InterruptConnectionType, InterruptVectorData, IoConnectInterruptParameters, IoDisconnectInterruptParameters, Kinterrupt, NtStruct};
 use crate::ntos::io::device_resources;
 use crate::ntos::ke::interrupt_object;
 use crate::rtl::KernelError;
@@ -30,6 +40,12 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     let output = fully.interrupt_object.get();
     if version == CONNECT_LINE_BASED {
         let physical = parameters.line_based.physical_device_object.get();
+        if let Some((gsiv, mode)) = connection_data_line(physical) {
+            let (vector, level) = crate::ntos::io::pnp::resources::translate_interrupt(gsiv);
+            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level as u8, level as u8, mode, true)?;
+            debug_print!("[io] interrupt LINE_BASED pelos dados de conexao: GSIV {} vetor 0x{:x} irql {} -> ISR 0x{:x}", gsiv, vector, level, service_routine);
+            return Ok(status as u64);
+        }
         // PDO da árvore do PnP: as interrupções de linha da lista traduzida
         // do devnode, como o IopConnectInterruptExLineBased.
         if let Some(node) = crate::ntos::io::pnp::devnode::get(physical) {
@@ -71,6 +87,27 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     }
     debug_print!("[io] IoConnectInterruptEx: version {} (MESSAGE_BASED) sem suporte — MSI nao configurado", version);
     Ok(signed_status(0xC000_00BB))
+}
+
+/// INTERRUPT_CONNECTION_DATA_PKEY {f0e20f09-d97a-49a9-8046-bb6e22e6bb2e}, 2.
+const INTERRUPT_CONNECTION_DATA_PKEY: [u8; 16] = [0x09, 0x0F, 0xE2, 0xF0, 0x7A, 0xD9, 0xA9, 0x49, 0x80, 0x46, 0xBB, 0x6E, 0x22, 0xE6, 0xBB, 0x2E];
+/// Tamanho de um INTERRUPT_VECTOR_DATA.
+const VECTOR_DATA_SIZE: usize = core::mem::size_of::<InterruptVectorData>();
+
+/// A GSIV e o modo (0 = LevelSensitive, 1 = Latched) da primeira entrada de
+/// controlador (InterruptTypeControllerInput) dos dados de conexão do PDO.
+fn connection_data_line(pdo: u64) -> Option<(u32, u32)> {
+    let (_, bytes) = crate::ntos::io::device_property::device_property_value(pdo, INTERRUPT_CONNECTION_DATA_PKEY, 2)?;
+    let count = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+    if count == 0 || bytes.len() < 8 + count * VECTOR_DATA_SIZE {
+        return None;
+    }
+    let entry = |index: usize, offset: usize| u32::from_le_bytes(bytes[8 + index * VECTOR_DATA_SIZE + offset..8 + index * VECTOR_DATA_SIZE + offset + 4].try_into().unwrap());
+    let type_offset = core::mem::offset_of!(InterruptVectorData, type_);
+    let mode_offset = core::mem::offset_of!(InterruptVectorData, mode);
+    let gsiv_offset = core::mem::offset_of!(InterruptVectorData, controller_input);
+    let index = (0..count).find(|&index| entry(index, type_offset) == InterruptConnectionType::INTERRUPT_TYPE_CONTROLLER_INPUT.0 as u32)?;
+    Some((entry(index, gsiv_offset), entry(index, mode_offset)))
 }
 
 /// IoDisconnectInterruptEx: o KINTERRUPT em ConnectionContext.

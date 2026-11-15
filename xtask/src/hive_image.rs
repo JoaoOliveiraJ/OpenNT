@@ -40,6 +40,8 @@ mod cm {
     pub mod crypto_defaults;
     #[path = "../../../../kernel/src/ntos/cm/ini_file_mapping.rs"]
     pub mod ini_file_mapping;
+    #[path = "../../../../kernel/src/ntos/cm/arbiters.rs"]
+    pub mod arbiters;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;

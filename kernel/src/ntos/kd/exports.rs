@@ -32,7 +32,7 @@ pub static GROUP: Group = Group {
     name: "kd",
     names: &["KdDebuggerEnabled", "KdEnableDebugger", "KdRefreshDebuggerNotPresent", "KdChangeOption", "DbgBreakPointWithStatus", "KdDebuggerNotPresent"],
     handlers: &[data_slot_called, enable_debugger, refresh_debugger_not_present, change_option, break_point_with_status, data_slot_called],
-    data_exports: &[("KdDebuggerEnabled", debugger::debugger_enabled_address), ("KdDebuggerNotPresent", debugger::debugger_not_present_address), ("KdEnteredDebugger", debugger::entered_debugger_address)],
+    data_exports: &[("KdDebuggerEnabled", debugger::debugger_enabled_address), ("KdDebuggerNotPresent", debugger::debugger_not_present_address), ("KdEnteredDebugger", debugger::entered_debugger_address), ("KdComPortInUse", debugger::com_port_in_use_address), ("KdHvComPortInUse", debugger::hv_com_port_in_use_address)],
 };
 
 pub mod kd_break_point {

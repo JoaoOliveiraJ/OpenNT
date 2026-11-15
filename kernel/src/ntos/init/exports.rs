@@ -53,7 +53,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 427] {
+fn groups() -> [&'static Group; 434] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -483,6 +483,13 @@ fn groups() -> [&'static Group; 427] {
         &crate::ntos::io::exports::zw_query_ea_file::GROUP,
         &crate::ntos::mm::exports::mm_change_image_protection::GROUP,
         &crate::ntos::ex::exports::ex_update_license_data::GROUP,
+        &crate::hal::exports::hal_interrupt_targets::GROUP,
+        &crate::ntos::ke::exports::ke_flush_write_buffer::GROUP,
+        &crate::hal::exports::hal_firmware_errors::GROUP,
+        &crate::ntos::ex::exports::ex_environment_variable_ex::GROUP,
+        &crate::ntos::ke::exports::ke_effective_irql::GROUP,
+        &crate::ntos::rtl::exports::rtl_pc_to_file_name::GROUP,
+        &crate::ntos::whea::exports::whea_log_internal_event::GROUP,
     ]
 }
 

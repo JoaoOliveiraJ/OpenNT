@@ -12,7 +12,7 @@
 //! kernel, que carrega esses arquivos no boot e só semeia as mesmas chaves
 //! em memória quando um arquivo não existe (`cm/hive_init.rs`). Por isso
 //! este arquivo e as tabelas que ele reúne (`cm/session_manager.rs`,
-//! `cm/ini_file_mapping.rs`, `cm/crypto_defaults.rs`,
+//! `cm/ini_file_mapping.rs`, `cm/crypto_defaults.rs`, `cm/arbiters.rs`,
 //! `cm/service/boot_services.rs` e `cm/service/inbox_drivers.rs`) são
 //! dados puros: não usam nada do kernel e o `xtask` os inclui por `#[path]`
 //! na mesma árvore de módulos (`cm`, `cm::service`).
@@ -110,6 +110,7 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::service::boot_services::driver_keys();
     keys.extend(super::service::inbox_drivers::seed_keys(smss_boot));
     keys.extend(super::service::boot_services::parameter_keys());
+    keys.extend(super::arbiters::seed_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
     }

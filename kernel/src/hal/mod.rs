@@ -27,14 +27,17 @@ pub mod volatile;
 // privada (HalPrivateDispatchTable) e os exports Hal*.
 pub mod acpi;
 pub mod acpi_native;
+pub mod acpi_pm;
+pub mod interrupt_lines;
+pub mod interrupt_targets;
 pub mod pci_config;
 pub mod pci_native;
 pub mod firmware_environment;
 pub mod firmware_return;
 pub mod private_dispatch;
 pub mod public_dispatch;
+pub mod system_information;
 pub mod hypervisor;
 pub mod dma;
-pub mod system_information;
 pub mod x86bios;
 pub mod exports;

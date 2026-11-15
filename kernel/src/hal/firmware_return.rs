@@ -8,8 +8,45 @@
 //! - PowerOff: o estado S5 da ACPI: SLP_TYPa do pacote `\_S5_` da DSDT
 //!   gravado com SLP_EN no PM1a_CNT_BLK do FADT. Sem FADT ou sem o pacote,
 //!   cai no Halt.
+//!
+//! O HalBugCheckSystem para o sistema por um erro de hardware fatal
+//! relatado pelo WHEA/PSHED.
 
 use crate::hal::{acpi, cpu, port};
+use crate::ntos::mm::guest_memory as guest;
+
+/// NMI_SECTION_GUID {e71254e7-c1b9-4940-ab76-909703a4320f}.
+const NMI_SECTION_GUID: [u8; 16] = [0xE7, 0x54, 0x12, 0xE7, 0xB9, 0xC1, 0x40, 0x49, 0xAB, 0x76, 0x90, 0x97, 0x03, 0xA4, 0x32, 0x0F];
+/// XPF_MCA_SECTION_GUID {8a1e1d01-42f9-4557-9c33-565e5cce4e5d}.
+const XPF_MCA_SECTION_GUID: [u8; 16] = [0x01, 0x1D, 0x1E, 0x8A, 0xF9, 0x42, 0x57, 0x45, 0x9C, 0x33, 0x56, 0x5E, 0x5C, 0xCE, 0x4E, 0x5D];
+
+/// HalBugCheckSystem(ErrorSource, ErrorRecord) (ntoskrnl 19041 rva
+/// 0x4b90a0): percorre os descritores de seção do WHEA_ERROR_RECORD
+/// (SectionCount em +0xA, descritores de 0x48 bytes a partir de +0x80, o
+/// tipo de seção em +0x10 de cada um). Uma seção NMI sem o bit 0 dos flags
+/// do corpo para com NMI_HARDWARE_FAILURE (0x80, 'TDO'); a primeira seção
+/// MCA dá o MCi_STATUS (corpo +0x28) aos dois últimos parâmetros do
+/// WHEA_UNCORRECTABLE_ERROR (0x124, tipo da fonte em +8, o registro).
+pub fn bug_check_system(error_source: u64, error_record: u64) -> ! {
+    let sections = guest::read16(error_record + 0xA) as u64;
+    let (mut low, mut high) = (0u64, 0u64);
+    for index in 0..sections {
+        let descriptor = error_record + 0x80 + index * 0x48;
+        let section_type = guest::read_bytes(descriptor + 0x10, 16);
+        let body = error_record + guest::read32(descriptor) as u64;
+        if section_type == NMI_SECTION_GUID && guest::read8(body + 8) & 1 == 0 {
+            crate::ntos::ke::bugcheck::bug_check_ex(0x80, 0x004F_4454, 0, 0, 0);
+        }
+        if section_type == XPF_MCA_SECTION_GUID {
+            let status = guest::read64(body + 0x28);
+            low = status & 0xFFFF_FFFF;
+            high = status >> 32;
+            break;
+        }
+    }
+    let source_type = guest::read32(error_source + 8) as i32 as i64 as u64;
+    crate::ntos::ke::bugcheck::bug_check_ex(0x124, source_type, error_record, high, low)
+}
 
 /// FIRMWARE_REENTRY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

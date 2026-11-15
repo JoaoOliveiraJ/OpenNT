@@ -68,6 +68,13 @@ pub fn get_cached_table(signature: u32, oem_id: u64, oem_table_id: u64) -> u64 {
     0
 }
 
+/// A cópia em cache da instância `instance` de uma assinatura (a lista do
+/// HalAcpiGetAllTablesDispatch cobre também as SSDTs repetidas).
+pub fn cached_instance(signature: u32, instance: usize) -> u64 {
+    let name = signature_text(signature);
+    acpi::get_table(&name, instance, false).map_or(0, |table| copy(&table))
+}
+
 /// Inicializado o catálogo, o LoaderBlock não é usado (HalpAcpiTableCacheInit).
 pub fn get_table_ex(_loader_block: u64, signature: u32, oem_id: u64, oem_table_id: u64) -> u64 {
     get_cached_table(signature, oem_id, oem_table_id)

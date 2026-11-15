@@ -1469,6 +1469,30 @@ pub mod ex_try_queue_work_item {
     pub static GROUP: Group = Group { name: "ex-try-queue-work-item", names: &["ExTryQueueWorkItem"], handlers: &[try_queue_work_item], data_exports: &[] };
 }
 
+pub mod ex_environment_variable_ex {
+    //! NtGetEnvironmentVariableEx e NtQueryEnvironmentVariableInfoEx; a lógica
+    //! mora em `hal/firmware_environment.rs`.
+
+    use crate::hal::firmware_environment;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn get_environment_variable_ex(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(firmware_environment::nt_environment_variable_ex()?))
+    }
+
+    fn query_environment_variable_info_ex(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(firmware_environment::nt_environment_variable_ex()?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-environment-variable-ex",
+        names: &["NtGetEnvironmentVariableEx", "NtQueryEnvironmentVariableInfoEx"],
+        handlers: &[get_environment_variable_ex, query_environment_variable_info_ex],
+        data_exports: &[],
+    };
+}
+
 pub mod ex_update_license_data {
     //! ExUpdateLicenseData; a lógica mora em `ex/license/update.rs`.
 

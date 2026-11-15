@@ -433,9 +433,16 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("hal-bus-translation", 1883, 1),
     ("cm-callback-objects", 1884, 7),
     ("ps-jobs", 1891, 7),
+    ("hal-interrupt-targets", 1898, 5),
+    ("ke-flush-write-buffer", 1903, 1),
+    ("hal-firmware-errors", 1904, 3),
+    ("ex-environment-variable-ex", 1907, 2),
+    ("ke-effective-irql", 1909, 1),
+    ("rtl-pc-to-file-name", 1910, 1),
+    ("whea-log-internal-event", 1911, 1),
 ];
 
-/// Os 1891 exports de função, na ordem da ABI.
+/// Os 1912 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2335,4 +2342,18 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwIsProcessInJob",
     "ZwSetInformationJobObject",
     "PsAssignProcessToJobObject",
+    "HalGetMessageRoutingInfo",
+    "HalGetProcessorIdByNtNumber",
+    "HalGetMemoryCachingRequirements",
+    "HalConvertDeviceIdtToIrql",
+    "HalGetInterruptTargetInformation",
+    "KeFlushWriteBuffer",
+    "HalEnumerateEnvironmentVariablesEx",
+    "HalSetEnvironmentVariableEx",
+    "HalBugCheckSystem",
+    "NtGetEnvironmentVariableEx",
+    "NtQueryEnvironmentVariableInfoEx",
+    "KeGetEffectiveIrql",
+    "RtlPcToFileName",
+    "WheaLogInternalEvent",
 ];

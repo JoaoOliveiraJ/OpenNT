@@ -31,6 +31,11 @@ pub fn invalidate_all_caches() -> bool {
     true
 }
 
+/// KeFlushWriteBuffer: no x64 os buffers de escrita já são coerentes com o
+/// barramento; o ntoskrnl 19041 exporta um corpo vazio (`ret 0`, rva
+/// 0x39a2f0, o mesmo da rotina 0 da HalAcpiDispatchTable).
+pub fn flush_write_buffer() {}
+
 /// KPRCB.CFlushSize como o KiSetFeatureBits grava: CPUID(1).EBX[15:8] * 8.
 pub fn cache_flush_line_size() -> u64 {
     ((cpu::cpuid(1)[1] >> 5) & 0x7F8) as u64

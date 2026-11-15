@@ -989,6 +989,35 @@ pub mod ke_cache_flush {
     };
 }
 
+pub mod ke_flush_write_buffer {
+    //! KeFlushWriteBuffer (pela hal.dll); a lógica mora em `ke/cache_flush.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::cache_flush;
+    use crate::rtl::KernelError;
+
+    fn flush_write_buffer(_: &Call) -> Result<u64, KernelError> {
+        cache_flush::flush_write_buffer();
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-flush-write-buffer", names: &["KeFlushWriteBuffer"], handlers: &[flush_write_buffer], data_exports: &[] };
+}
+
+pub mod ke_effective_irql {
+    //! KeGetEffectiveIrql; a lógica mora em `ke/irql.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::irql;
+    use crate::rtl::KernelError;
+
+    fn get_effective_irql(_: &Call) -> Result<u64, KernelError> {
+        Ok(irql::effective_irql() as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-effective-irql", names: &["KeGetEffectiveIrql"], handlers: &[get_effective_irql], data_exports: &[] };
+}
+
 pub mod ke_semaphore_state {
     //! KeReadStateSemaphore: o SignalState do cabeçalho (`ke/dispatcher.rs`).
 

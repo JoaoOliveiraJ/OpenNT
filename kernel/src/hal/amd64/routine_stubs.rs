@@ -15,7 +15,7 @@ use crate::rtl::KernelError;
 /// Primeiro id privado das rotinas por ponteiro.
 pub const BASE: u64 = 0x8000_0400;
 /// Stubs reservados na imagem.
-pub const CAPACITY: usize = 64;
+pub const CAPACITY: usize = 128;
 
 core::arch::global_asm!(
     r#"
@@ -24,7 +24,7 @@ core::arch::global_asm!(
 .global opennt_kernel_routine_stubs
 opennt_kernel_routine_stubs:
 .set opennt_routine_slot, 0
-.rept 64
+.rept 128
     .byte 0xB8
     .long 0x80000400 + opennt_routine_slot
     .byte 0xE9
@@ -48,9 +48,11 @@ pub struct Routine {
 }
 
 /// Tabela das rotinas, na ordem dos slots. Cada assunto expõe as suas
-/// (`hal::dma`, `drivers::bus::pci_interface`) e só entra aqui pela lista.
+/// (`hal::dma`, `drivers::bus::pci_interface`, `hal::acpi_pm`,
+/// `hal::system_information`) e só entra
+/// aqui pela lista.
 fn routines() -> &'static [&'static [Routine]] {
-    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES, crate::hal::system_information::ROUTINES]
+    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES, crate::hal::acpi_pm::ROUTINES, crate::hal::system_information::ROUTINES]
 }
 
 /// Slot global da rotina `name` (busca linear: chamada na montagem das tabelas).

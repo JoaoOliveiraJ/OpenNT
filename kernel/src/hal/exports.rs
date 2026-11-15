@@ -148,6 +148,70 @@ pub mod hal_bus_translation {
     pub static GROUP: Group = Group { name: "hal-bus-translation", names: &["HalTranslateBusAddress"], handlers: &[translate_bus_address], data_exports: &[] };
 }
 
+pub mod hal_interrupt_targets {
+    //! Destinos de interrupção por processador e exigências de cache —
+    //! adaptadores de `hal::interrupt_targets`.
+
+    use crate::hal::interrupt_targets;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn get_message_routing_info(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(interrupt_targets::message_routing_info(call.arg(1), call.arg(2)) as u32))
+    }
+
+    fn get_processor_id_by_nt_number(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(interrupt_targets::get_processor_id_by_nt_number(call.arg(1) as u32, call.arg(2)) as u32))
+    }
+
+    fn get_memory_caching_requirements(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(interrupt_targets::memory_caching_requirements(call.arg(1), call.arg(2), call.arg(3)) as u32))
+    }
+
+    fn convert_device_idt_to_irql(call: &Call) -> Result<u64, KernelError> {
+        Ok(interrupt_targets::device_idt_to_irql(call.arg(1) as u32) as u64)
+    }
+
+    fn get_interrupt_target_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(interrupt_targets::target_information(call.arg(1) as u32, call.arg(2) as u32, call.arg(3)) as u32))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "hal-interrupt-targets",
+        names: &["HalGetMessageRoutingInfo", "HalGetProcessorIdByNtNumber", "HalGetMemoryCachingRequirements", "HalConvertDeviceIdtToIrql", "HalGetInterruptTargetInformation"],
+        handlers: &[get_message_routing_info, get_processor_id_by_nt_number, get_memory_caching_requirements, convert_device_idt_to_irql, get_interrupt_target_information],
+        data_exports: &[],
+    };
+}
+
+pub mod hal_firmware_errors {
+    //! Variáveis de ambiente do firmware e a parada por erro de hardware —
+    //! adaptadores de `hal::firmware_environment` e `hal::firmware_return`.
+
+    use crate::hal::{firmware_environment, firmware_return};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn enumerate_environment_variables_ex(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(firmware_environment::hal_environment_variable_ex()?))
+    }
+
+    fn set_environment_variable_ex(_: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(firmware_environment::hal_environment_variable_ex()?))
+    }
+
+    fn bug_check_system(call: &Call) -> Result<u64, KernelError> {
+        firmware_return::bug_check_system(call.arg(1), call.arg(2))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "hal-firmware-errors",
+        names: &["HalEnumerateEnvironmentVariablesEx", "HalSetEnvironmentVariableEx", "HalBugCheckSystem"],
+        handlers: &[enumerate_environment_variables_ex, set_environment_variable_ex, bug_check_system],
+        data_exports: &[],
+    };
+}
+
 pub mod hvi {
     //! Interface de hypervisor (Hvi*, Sk*, Vsl*).
     //!

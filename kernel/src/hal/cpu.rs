@@ -86,6 +86,14 @@ pub fn save_and_disable_interrupts() -> u64 {
     flags
 }
 
+/// RFLAGS.IF da CPU corrente (o KeAreInterruptsEnabled).
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem)) }
+    flags & 0x200 != 0
+}
+
 /// Reativa IF somente se estava ligada antes.
 #[inline]
 pub fn restore_interrupts(flags: u64) {

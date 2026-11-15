@@ -36,6 +36,7 @@ pub mod persisted_state;
 pub mod physical_memory_resources;
 pub mod primitive_provider;
 pub mod registry;
+pub mod arbiters;
 pub mod seed;
 pub mod session_manager;
 pub mod ini_file_mapping;

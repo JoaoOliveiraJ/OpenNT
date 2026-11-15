@@ -457,6 +457,22 @@ fn hardware_description_and_feature_usage(assert: Assert) {
     let identifier = registry::read_value_by_path(leaf, "Identifier");
     let configuration = registry::read_value_by_path(leaf, "Configuration Data");
     assert(identifier.is_some_and(|value| value.value_type == 1 && value.data == b"AT-Compatible 8042 Keyboard\0") && configuration.is_some_and(|value| value.value_type == 3 && value.data == hw_description::configuration_bytes()), "hwdesc: teclado 8042 na hive de hardware");
+    // O adaptador "ACPI BIOS" que o acpi.sys procura: Identifier REG_SZ,
+    // Configuration Data REG_FULL_RESOURCE_DESCRIPTOR com um DeviceSpecific
+    // cujo ACPI_BIOS_MULTI_NODE leva a RSDT do firmware e o mapa E820.
+    let acpi_bios = "\\Registry\\Machine\\Hardware\\Description\\System\\MultifunctionAdapter\\1";
+    let acpi_identifier = registry::read_value_by_path(acpi_bios, "Identifier");
+    let acpi_data = registry::read_value_by_path(acpi_bios, "Configuration Data").map(|value| (value.value_type, value.data)).unwrap_or_default();
+    let rsdt = crate::hal::acpi::enumerate().iter().find(|table| table.signature == "RSDT" || table.signature == "XSDT").map_or(0, |table| table.address);
+    let firmware = crate::ntos::mm::physical_layout::firmware_map();
+    let read64 = |offset: usize| acpi_data.1.get(offset..offset + 8).map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+    let node_size = acpi_data.1.get(20..24).map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap())) as usize;
+    let entry_ok = firmware.first().is_some_and(|range| read64(48) == range.base && read64(56) == range.length);
+    assert(acpi_identifier.is_some_and(|value| value.value_type == 1 && value.data == crate::ntos::cm::registry::encode_wide("ACPI BIOS")) && acpi_data.0 == 9 && acpi_data.1[16] == 5 && node_size == 16 + 24 * firmware.len() && read64(32) == rsdt && rsdt != 0 && read64(40) == firmware.len() as u64 && entry_ok, "hwdesc: MultifunctionAdapter\\1 'ACPI BIOS' com a RSDT e o mapa E820");
+    // Control\Arbiters da instalação: as listas de requisitos por árbitro.
+    let order = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Arbiters\\AllocationOrder", "Root");
+    let reserved = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Arbiters\\ReservedResources", "Root");
+    assert(order.is_some_and(|value| value.value_type == 10 && value.data.len() == 0x4A8 && value.data[0..4] == [0xA8, 0x04, 0, 0]) && reserved.is_some_and(|value| value.value_type == 1 && value.data == crate::ntos::cm::registry::encode_wide("PCStandard")), "hwdesc: Control\\Arbiters com AllocationOrder e ReservedResources da instalacao");
     let bytes = hw_description::configuration_bytes();
     assert(bytes.len() == 84 && bytes[24] == 2 && bytes[28] == 0x60 && bytes[32] == 0x60 && bytes[64] == 3 && bytes[68] == 1 && bytes[72] == 0x21 && bytes[76..84] == [0xFF, 0, 0, 0, 0xFF, 0, 0, 0], "hwdesc: descritores legados de portas e IRQ");
     // IoQueryDeviceDescription com callout nativo de onze argumentos.

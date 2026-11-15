@@ -483,9 +483,18 @@ fn import(dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
     }
 }
 
-/// Resolvedores do loader de PE: hal.dll pelas bibliotecas e qualquer .sys
+/// Uma DLL de modo kernel que uma imagem do sistema importa (a pshed.dll do
+/// pci.sys, como o MiResolveImageReferences carrega de System32): o arquivo
+/// existe no disco em memória ou no volume. As DLLs de modo usuário (ntdll e
+/// as demais) nunca passam pelo loader de imagens do kernel.
+fn kernel_library(dll: &str) -> bool {
+    let lower = dll.to_lowercase();
+    lower.ends_with(".dll") && lower != "hal.dll" && lower != "ntdll.dll" && kernel_image_source::source_for(&lower).is_ok()
+}
+
+/// Resolvedores do loader de PE: hal.dll pelas bibliotecas, qualquer .sys
 /// (wmilib.sys, WppRecorder.sys...) como driver de export ou driver
-/// importado.
+/// importado e as DLLs de modo kernel presentes no volume.
 pub fn register_resolvers() {
     static REGISTERED: SpinLock<bool> = SpinLock::new(false);
     let mut registered = REGISTERED.lock();
@@ -495,6 +504,7 @@ pub fn register_resolvers() {
     *registered = true;
     pe_loader::register_resolver(|dll| dll.eq_ignore_ascii_case("hal.dll"), Arc::new(import));
     pe_loader::register_resolver(|dll| dll.to_lowercase().ends_with(".sys"), Arc::new(import));
+    pe_loader::register_resolver(kernel_library, Arc::new(import));
 }
 
 /// Estado do módulo (`state`): tipo, estado, referências, fixação e os
