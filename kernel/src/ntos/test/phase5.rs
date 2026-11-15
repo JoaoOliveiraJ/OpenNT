@@ -1368,5 +1368,6 @@ pub fn run(assert: Assert) {
     license_boot_values_and_anonymous(assert);
     capability_policy_and_check(assert);
     super::registry_hive::run(assert);
+    super::registry_model::run(assert);
     debug_print!("PHASE5_SELFTEST_OK");
 }
