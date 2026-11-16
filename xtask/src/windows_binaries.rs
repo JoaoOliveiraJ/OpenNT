@@ -168,6 +168,31 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // Drivers de software sem hardware (`--start-driver`), cujos imports do
+    // ntoskrnl já têm export: o cache de compatibilidade de aplicativos
+    // (ahcache), o IFS do Winsock 2 (ws2ifsl), o navegador de rede (bowser)
+    // e os sockets AF_UNIX (afunix, sobre o NETIO.SYS), com os catálogos
+    // que os cobrem (0519, 05110, 04 e 05112).
+    ("AHCACHE.SYS", "System32/drivers/ahcache.sys"),
+    ("WS2IFSL.SYS", "System32/drivers/ws2ifsl.sys"),
+    ("BOWSER.SYS", "System32/drivers/bowser.sys"),
+    ("AFUNIX.SYS", "System32/drivers/afunix.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package05112~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package05112~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package05110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package05110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),
     ("Windows/System32/win32k.sys", "System32/win32k.sys"),

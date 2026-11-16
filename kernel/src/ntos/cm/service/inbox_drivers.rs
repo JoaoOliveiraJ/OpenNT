@@ -69,6 +69,13 @@
 //! sistema), ErrorControl 1, Group "File system" e sem ImagePath; o Npfs
 //! leva a subchave Aliases, que o npfs.sys lê no DriverEntry.
 //!
+//! Os drivers de software sem hardware também ficam sob demanda, com os
+//! valores da instalação: o cache de compatibilidade de aplicativos
+//! (ahcache, Start 1 e sem Group na instalação: a chave fica sem Group), o
+//! IFS do Winsock 2 (ws2ifsl, Start 4), o navegador de rede (bowser, Type 2,
+//! Group Network, Tag 5) e os sockets AF_UNIX (afunix, Start 1). A subchave
+//! Parameters\Winsock do afunix (do modo usuário) não é copiada.
+//!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada driver com os
 //! valores que o banco de serviços grava numa instalação seguidos de Group,
 //! Tag e os DWORDs próprios.
@@ -147,6 +154,11 @@ const DRIVERS: &[InboxDriver] = &[
         tag: Some(1),
         dwords: &[],
     },
+    // Drivers de software sem hardware (Group "": a chave da instalação não tem Group).
+    InboxDriver { name: "ahcache", display_name: Some("@%systemroot%\\system32\\drivers\\ahcache.sys,-102"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\DRIVERS\\ahcache.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "", tag: None, dwords: &[] },
+    InboxDriver { name: "ws2ifsl", display_name: Some("@%systemroot%\\System32\\drivers\\ws2ifsl.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\ws2ifsl.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
+    InboxDriver { name: "bowser", display_name: Some("@%systemroot%\\system32\\wkssvc.dll,-2001"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("system32\\DRIVERS\\bowser.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: Some(5), dwords: &[] },
+    InboxDriver { name: "afunix", display_name: Some("afunix"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afunix.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
 ];
 
 /// Dado de um valor que a instalação grava fora da chave do serviço.
@@ -190,7 +202,9 @@ pub fn seed_keys(smss_boot: bool) -> Vec<SeedKey> {
                 key
             }
         };
-        key.text("Group", REG_SZ, driver.group);
+        if !driver.group.is_empty() {
+            key.text("Group", REG_SZ, driver.group);
+        }
         if let Some(tag) = driver.tag {
             key.dword("Tag", tag);
         }

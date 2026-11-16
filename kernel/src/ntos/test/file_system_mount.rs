@@ -1,5 +1,6 @@
 //! Montagem de um volume por um file system real, depois do
-//! `--start-driver=<serviço>` de um driver de file system (Type = 2).
+//! `--start-driver=<serviço>` de um driver de file system (Type = 2) que
+//! registra um file system de disco.
 //!
 //! Com o driver rodando, o volume do segundo disco IDE vira um dispositivo
 //! (`drivers/storage/ata_volume.rs`) e um arquivo conhecido do volume é
@@ -68,9 +69,17 @@ fn service_type(name: &str) -> u32 {
     crate::ntos::cm::service::database::read(name).ok().flatten().map_or(0, |configuration| configuration.service_type)
 }
 
+/// Algum CDO de file system de disco (FILE_DEVICE_DISK_FILE_SYSTEM) está
+/// registrado pelo IoRegisterFileSystem: só esses montam volumes de disco
+/// (um redirecionador ou o navegador de rede, também Type = 2, não).
+fn disk_file_system_registered() -> bool {
+    const FILE_DEVICE_DISK_FILE_SYSTEM: u32 = 8;
+    !crate::ntos::io::file_system::registered_file_systems(FILE_DEVICE_DISK_FILE_SYSTEM).is_empty()
+}
+
 /// Depois do início de um driver pelo `--start-driver`.
 pub fn after_driver_start(name: &str) {
-    if service_type(name) != 2 {
+    if service_type(name) != 2 || !disk_file_system_registered() {
         return;
     }
     // Com `--trace-driver-api`, as APIs que o file system chama na montagem
