@@ -19,6 +19,9 @@
 //!   A parte da BGFX não existe sem BGFX. Devolve STATUS_SUCCESS.
 //! - InbvSetVirtualFrameBuffer = o BvgaSetVirtualFrameBuffer:
 //!   STATUS_NOT_IMPLEMENTED (só a BGFX tem framebuffer virtual).
+//! - InbvCheckDisplayOwnership = o BvgaCheckDisplayOwnership (o vídeo não
+//!   foi perdido) e InbvEnableBootDriver = o BvgaEnableBootDriver (liga ou
+//!   desliga o desenho do kernel sem ceder o vídeo).
 //!
 //! Com o vídeo perdido, o console deixa de escrever na memória de texto (o
 //! hardware é do driver de vídeo) e continua no espelho serial.
@@ -85,6 +88,37 @@ pub fn notify_display_ownership_change(owned: bool, _context: u64) -> u32 {
         notify_display_ownership_lost(0);
     }
     0
+}
+
+/// InbvCheckDisplayOwnership = o BvgaCheckDisplayOwnership: TRUE enquanto
+/// o vídeo não foi perdido para o driver de vídeo (estado diferente de 2).
+pub fn check_display_ownership() -> bool {
+    display_state() != DISPLAY_STATE_LOST
+}
+
+/// VidCleanUp do driver de boot: devolve a Bit Mask do Graphics Controller
+/// (índice 8 em 0x3CE) a 0xFF.
+fn video_clean_up() {
+    crate::hal::port::write8(0x3CE, 8);
+    crate::hal::port::write8(0x3CF, 0xFF);
+}
+
+/// InbvEnableBootDriver(Enable) = o BvgaEnableBootDriver. O driver de boot
+/// do OpenNT (o vídeo de texto do console) está inicializado desde o boot,
+/// então vale o caminho do BvgaBootDriverFullyInitialized: com o vídeo
+/// perdido nada muda; senão, sob a trava do driver de boot, o estado "do
+/// kernel" passa pelo VidCleanUp e o estado vira 0 (Enable) ou 1
+/// (desligado). O console só escreve na memória de texto no estado 0.
+pub fn enable_boot_driver(enable: bool) {
+    let mut display = DISPLAY.lock();
+    if display.state >= DISPLAY_STATE_LOST {
+        return;
+    }
+    if display.state == DISPLAY_STATE_OWNED {
+        video_clean_up();
+    }
+    display.state = if enable { DISPLAY_STATE_OWNED } else { DISPLAY_STATE_DISABLED };
+    vga::set_owned(display.state == DISPLAY_STATE_OWNED);
 }
 
 /// InbvSetVirtualFrameBuffer(FrameBuffer, Context).

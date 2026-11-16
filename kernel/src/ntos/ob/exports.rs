@@ -593,3 +593,34 @@ pub mod zw_set_information_object {
 
     pub static GROUP: Group = Group { name: "zw-set-information-object", names: &["ZwSetInformationObject"], handlers: &[set_information_object], data_exports: &[] };
 }
+
+pub mod ob_nt_set_security_object {
+    //! NtSetSecurityObject; a lógica mora em `ob/object_security`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::object_security;
+    use crate::rtl::KernelError;
+
+    /// NtSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor) -> NTSTATUS.
+    fn set_security_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(object_security::nt_set_security_object(call.arg(1), call.arg(2) as u32, call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-nt-set-security-object", names: &["NtSetSecurityObject"], handlers: &[set_security_object], data_exports: &[] };
+}
+
+pub mod ob_nt_wait_single {
+    //! NtWaitForSingleObject no modo anterior do chamador; a lógica mora em
+    //! `ob/wait`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::wait;
+    use crate::rtl::KernelError;
+
+    /// NtWaitForSingleObject(Handle, Alertable, Timeout).
+    fn nt_wait_for_single_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(wait::nt_wait_for_single_object(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-nt-wait-single", names: &["NtWaitForSingleObject"], handlers: &[nt_wait_for_single_object], data_exports: &[] };
+}

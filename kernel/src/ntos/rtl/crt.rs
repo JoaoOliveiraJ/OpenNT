@@ -693,6 +693,77 @@ pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
     if negative { number.wrapping_neg() } else { number }
 }
 
+/// _wcstoui64(String, EndPtr, Base) = wcstoxq(FL_UNSIGNED): as mesmas regras
+/// do [`wcstoul`] com 64 bits; estouro satura em _UI64_MAX (negado se houve
+/// '-').
+pub fn wcstoui64(text: u64, end: u64, requested: u32) -> u64 {
+    // SAFETY: wchar_t** EndPtr do chamador (opcional).
+    let end_pointer = (end != 0).then(|| unsafe { Field::<u64>::at(end) });
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(text);
+    }
+    if text == 0 || (requested != 0 && requested.wrapping_sub(2) > 34) {
+        return 0;
+    }
+    let mut cursor = text + 2;
+    let mut unit = guest::read16(text);
+    while wide_class(unit) & CRT_CLASS_SPACE != 0 {
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let negative = unit == b'-' as u16;
+    if negative || unit == b'+' as u16 {
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let is_x = |candidate: u16| candidate.wrapping_sub(0x58) & 0xFFDF == 0;
+    let mut base = requested as u64;
+    if base == 0 {
+        base = if wide_digit_value(unit) != Some(0) {
+            10
+        } else if is_x(guest::read16(cursor)) {
+            16
+        } else {
+            8
+        };
+    }
+    if base == 16 && wide_digit_value(unit) == Some(0) && is_x(guest::read16(cursor)) {
+        unit = guest::read16(cursor + 2);
+        cursor += 4;
+    }
+    let (limit, remainder) = (u64::MAX / base, u64::MAX % base);
+    let (mut number, mut read_digit, mut overflow) = (0u64, false, false);
+    loop {
+        let digit = match wide_digit_value(unit) {
+            Some(digit) => digit as u64,
+            None if (0x41..=0x5A).contains(&unit) || (0x61..=0x7A).contains(&unit) => (if unit >= 0x61 { unit - 0x20 } else { unit }) as u64 - 0x37,
+            None => break,
+        };
+        if digit >= base {
+            break;
+        }
+        read_digit = true;
+        if number < limit || (number == limit && digit <= remainder) {
+            number = number * base + digit;
+        } else {
+            overflow = true;
+        }
+        unit = guest::read16(cursor);
+        cursor += 2;
+    }
+    let mut stop = cursor - 2;
+    if !read_digit {
+        stop = text;
+        number = 0;
+    } else if overflow {
+        number = u64::MAX;
+    }
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(stop);
+    }
+    if negative { number.wrapping_neg() } else { number }
+}
+
 /// Classes de letra do `pctype` (_UPPER | _LOWER | _ALPHA).
 const CRT_CLASS_LETTER: u16 = 0x103;
 
@@ -1069,4 +1140,228 @@ pub fn strcat_s(destination: u64, size: u64, source: u64) -> Result<u32, KernelE
             return Ok(CRT_ERANGE);
         }
     }
+}
+
+// ---- memchr, memcmp, memmove_s, islower, isxdigit e iswspace (ntoskrnl 19041)
+//
+// memchr 0x3d22b0: compara o byte baixo de `c` até Count bytes; acha = o
+// endereço, senão NULL. memcmp 0x3d22e0: bytes sem sinal, devolve -1/0/1
+// (o `sbb` do original, nunca a diferença). memmove_s 0x3d7490: Count 0 =
+// sucesso; Dest ou Src NULL = EINVAL e Size < Count = ERANGE, sem tocar no
+// destino (ao contrário do memcpy_s); senão o memcpy do kernel, que trata
+// sobreposição. islower 0x3d2000 e isxdigit 0x3d20c0: `_pctype[c] & 2` e
+// `& 0x80` sobre o byte baixo (EOF lê a entrada -1). iswspace 0x3d2150 =
+// iswctype(c, _SPACE) sobre os 16 bits baixos.
+
+const CRT_CLASS_LOWER: u16 = 0x002;
+const CRT_CLASS_HEX: u16 = 0x080;
+const CRT_STRUNCATE: u32 = 80;
+
+/// memchr(Buffer, C, Count).
+pub fn memchr(buffer: u64, character: u8, count: u64) -> Result<u64, KernelError> {
+    for index in 0..count {
+        if guest::try_read8(buffer + index)? == character {
+            return Ok(buffer + index);
+        }
+    }
+    Ok(0)
+}
+
+/// memcmp(Left, Right, Count): lê de oito em oito bytes, parando no
+/// primeiro bloco diferente.
+pub fn memcmp(left: u64, right: u64, count: u64) -> Result<i32, KernelError> {
+    let mut offset = 0u64;
+    while offset < count {
+        let block = (count - offset).min(8) as usize;
+        let a = guest::try_read_bytes(left + offset, block)?;
+        let b = guest::try_read_bytes(right + offset, block)?;
+        if let Some((x, y)) = a.iter().zip(b.iter()).find(|(x, y)| x != y) {
+            return Ok(if x < y { -1 } else { 1 });
+        }
+        offset += block as u64;
+    }
+    Ok(0)
+}
+
+/// memmove_s(Dest, Size, Src, Count): devolve o errno.
+pub fn memmove_s(destination: u64, size: u64, source: u64, count: u64) -> Result<u32, KernelError> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if destination == 0 || source == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    if size < count {
+        return Ok(CRT_ERANGE);
+    }
+    let bytes = guest::try_read_bytes(source, count as usize)?;
+    guest::try_write_bytes(destination, &bytes)?;
+    Ok(0)
+}
+
+/// islower(c): bit _LOWER do `pctype`.
+pub fn islower(character: u32) -> u32 {
+    (narrow_class(character) & CRT_CLASS_LOWER) as u32
+}
+
+/// isxdigit(c): bit _HEX do `pctype`.
+pub fn isxdigit(character: u32) -> u32 {
+    (narrow_class(character) & CRT_CLASS_HEX) as u32
+}
+
+/// iswspace(c) = iswctype(c, _SPACE).
+pub fn iswspace(unit: u16) -> u32 {
+    (wide_class(unit) & CRT_CLASS_SPACE) as u32
+}
+
+// ---- strncat, wcsncat_s e _ui64tow_s (ntoskrnl 19041) -----------------------
+//
+// strncat 0x3d31b0: Count 0 devolve Dest sem tocar em nada; senão anexa até
+// Count bytes de Src no fim de Dest e termina com NUL (o NUL de Src conta
+// como o fim da cópia). wcsncat_s 0x3d7c00 (Size e Count em WCHARs; Count
+// _TRUNCATE = -1): Dest NULL com Size 0 e Count 0 = sucesso; Dest NULL ou
+// Size 0 = EINVAL sem gravar; Src NULL com Count != 0, ou Dest sem NUL nos
+// Size WCHARs, = Dest[0] = 0 e EINVAL; a cópia para no NUL de Src, em Count
+// WCHARs (que recebem o NUL depois) ou quando o espaço acaba: com _TRUNCATE
+// o último WCHAR vira NUL e o retorno é STRUNCATE, senão Dest[0] = 0 e
+// ERANGE. _ui64tow_s 0x3d65e0 = x64tow_s(valor, Buffer, Size, Radix, sem
+// sinal): Buffer NULL ou Size 0 = EINVAL sem tocar; Buffer[0] = 0; Size 1 =
+// ERANGE; Radix fora de 2..36 = EINVAL; dígitos minúsculos gerados do menos
+// significativo enquanto couberem e, sem espaço para o NUL, Buffer[0] = 0 e
+// ERANGE.
+
+/// strncat(Dest, Src, Count): devolve Dest.
+pub fn strncat(destination: u64, source: u64, count: u64) -> Result<u64, KernelError> {
+    if count == 0 {
+        return Ok(destination);
+    }
+    let mut cursor = destination;
+    while guest::try_read8(cursor)? != 0 {
+        cursor += 1;
+    }
+    let mut remaining = count;
+    let mut from = source;
+    loop {
+        let byte = guest::try_read8(from)?;
+        guest::try_write8(cursor, byte)?;
+        if byte == 0 {
+            return Ok(destination);
+        }
+        cursor += 1;
+        from += 1;
+        remaining -= 1;
+        if remaining == 0 {
+            guest::try_write8(cursor, 0)?;
+            return Ok(destination);
+        }
+    }
+}
+
+/// wcsncat_s(Dest, Size, Src, Count): devolve o errno.
+pub fn wcsncat_s(destination: u64, size: u64, source: u64, count: u64) -> Result<u32, KernelError> {
+    if count == 0 && destination == 0 && size == 0 {
+        return Ok(0);
+    }
+    if destination == 0 || size == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    let fail = |status: u32| -> Result<u32, KernelError> {
+        guest::try_write16(destination, 0)?;
+        Ok(status)
+    };
+    if count != 0 && source == 0 {
+        return fail(CRT_EINVAL);
+    }
+    let mut cursor = destination;
+    let mut available = size;
+    while guest::try_read16(cursor)? != 0 {
+        cursor += 2;
+        available -= 1;
+        if available == 0 {
+            break;
+        }
+    }
+    if available == 0 {
+        return fail(CRT_EINVAL);
+    }
+    let mut from = source;
+    if count == u64::MAX {
+        loop {
+            let unit = guest::try_read16(from)?;
+            guest::try_write16(cursor, unit)?;
+            if unit == 0 {
+                break;
+            }
+            cursor += 2;
+            from += 2;
+            available -= 1;
+            if available == 0 {
+                break;
+            }
+        }
+    } else if count == 0 {
+        guest::try_write16(cursor, 0)?;
+    } else {
+        let mut remaining = count;
+        loop {
+            let unit = guest::try_read16(from)?;
+            guest::try_write16(cursor, unit)?;
+            cursor += 2;
+            from += 2;
+            if unit == 0 {
+                break;
+            }
+            available -= 1;
+            if available == 0 {
+                break;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                guest::try_write16(cursor, 0)?;
+                break;
+            }
+        }
+    }
+    if available != 0 {
+        return Ok(0);
+    }
+    if count == u64::MAX {
+        guest::try_write16(destination + size * 2 - 2, 0)?;
+        return Ok(CRT_STRUNCATE);
+    }
+    fail(CRT_ERANGE)
+}
+
+/// _ui64tow_s(Value, Buffer, Size, Radix): devolve o errno.
+pub fn ui64tow_s(value: u64, buffer: u64, size: u64, radix: u32) -> Result<u32, KernelError> {
+    if buffer == 0 || size == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    guest::try_write16(buffer, 0)?;
+    if size <= 1 {
+        return Ok(CRT_ERANGE);
+    }
+    if radix.wrapping_sub(2) > 34 {
+        return Ok(CRT_EINVAL);
+    }
+    let mut digits: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    let mut rest = value;
+    loop {
+        let digit = (rest % radix as u64) as u16;
+        rest /= radix as u64;
+        digits.push(if digit <= 9 { 0x30 + digit } else { 0x57 + digit });
+        if rest == 0 || digits.len() as u64 >= size {
+            break;
+        }
+    }
+    if digits.len() as u64 >= size {
+        // Os dígitos já gravados ficam; só o primeiro WCHAR é zerado.
+        guest::try_write_bytes(buffer, &unit_bytes(digits.iter().copied()))?;
+        guest::try_write16(buffer, 0)?;
+        return Ok(CRT_ERANGE);
+    }
+    digits.reverse();
+    digits.push(0);
+    guest::try_write_bytes(buffer, &unit_bytes(digits))?;
+    Ok(0)
 }

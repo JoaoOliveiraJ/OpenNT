@@ -40,3 +40,51 @@ const _: () = {
     assert!(core::mem::offset_of!(KbugcheckCallbackRecord, state) == 0x38);
 };
 
+/// `_KADDRESS_RANGE` (wdm.h; 0x10 bytes): um bloco de memória do triage dump.
+#[repr(C)]
+pub struct KaddressRange {
+    /// -> `void`
+    pub address: Field<u64>,
+    pub size: Field<u64>,
+}
+
+unsafe impl NtStruct for KaddressRange {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KaddressRange>() == 0x10);
+    assert!(core::mem::offset_of!(KaddressRange, address) == 0x0);
+    assert!(core::mem::offset_of!(KaddressRange, size) == 0x8);
+};
+
+/// `_KTRIAGE_DUMP_DATA_ARRAY` (wdm.h; 0x40 bytes com um bloco): a lista de
+/// blocos que um callback KbCallbackTriageDumpData acrescenta ao triage dump
+/// (KeInitializeTriageDumpDataArray/KeAddTriageDumpDataBlock). `Blocks` tem
+/// `NumBlocksTotal` entradas.
+#[repr(C)]
+pub struct KtriageDumpDataArray {
+    pub list: ListEntry,
+    pub num_blocks_used: Field<u32>,
+    pub num_blocks_total: Field<u32>,
+    pub data_size: Field<u32>,
+    pub max_data_size: Field<u32>,
+    pub component_name_buffer_length: Field<u32>,
+    _pad_24: Reserved<0x4>,
+    /// -> `UCHAR`
+    pub component_name: Field<u64>,
+    pub blocks: [KaddressRange; 1],
+}
+
+unsafe impl NtStruct for KtriageDumpDataArray {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KtriageDumpDataArray>() == 0x40);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, list) == 0x0);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, num_blocks_used) == 0x10);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, num_blocks_total) == 0x14);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, data_size) == 0x18);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, max_data_size) == 0x1c);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, component_name_buffer_length) == 0x20);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, component_name) == 0x28);
+    assert!(core::mem::offset_of!(KtriageDumpDataArray, blocks) == 0x30);
+};
+

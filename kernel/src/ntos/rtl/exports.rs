@@ -44,7 +44,7 @@ fn unicode_string_to_ansi_string(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn free_ansi_string(call: &Call) -> Result<u64, KernelError> {
-    strings_counted::free_string(call.arg(1));
+    strings_counted::free_string(call.arg(1))?;
     Ok(0)
 }
 fn free_unicode_string(call: &Call) -> Result<u64, KernelError> {
@@ -2851,4 +2851,259 @@ pub mod rtl_memory_nls_small {
         handlers: &[unicode_string_to_ansi_size, downcase_unicode_char, compare_memory_ulong, write_non_volatile_memory, flush_non_volatile_memory],
         data_exports: &[],
     };
+}
+
+pub mod crt_memory_ctype {
+    //! memchr, memcmp, memmove_s, islower, isxdigit e iswspace; a lógica
+    //! mora em `rtl/crt`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    /// memchr(Buffer, C, Count) -> void*.
+    fn memchr(call: &Call) -> Result<u64, KernelError> {
+        crt::memchr(call.arg(1), call.arg(2) as u8, call.arg(3))
+    }
+
+    /// memcmp(Buffer1, Buffer2, Count) -> int.
+    fn memcmp(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::memcmp(call.arg(1), call.arg(2), call.arg(3))? as i64 as u64)
+    }
+
+    /// memmove_s(Dest, NumberOfElements, Src, Count) -> errno_t.
+    fn memmove_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::memmove_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4))? as u64)
+    }
+
+    /// islower(C) -> int.
+    fn islower(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::islower(call.arg(1) as u32) as u64)
+    }
+
+    /// isxdigit(C) -> int.
+    fn isxdigit(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::isxdigit(call.arg(1) as u32) as u64)
+    }
+
+    /// iswspace(C) -> int.
+    fn iswspace(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::iswspace(call.arg(1) as u16) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "crt-memory-ctype",
+        names: &["memchr", "memcmp", "memmove_s", "islower", "isxdigit", "iswspace"],
+        handlers: &[memchr, memcmp, memmove_s, islower, isxdigit, iswspace],
+        data_exports: &[],
+    };
+}
+
+pub mod crt_string_append {
+    //! strncat, wcsncat_s e _ui64tow_s (`rtl/crt`) e qsort_s (`rtl/sort`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::{crt, sort};
+    use crate::rtl::KernelError;
+
+    /// strncat(Dest, Src, Count) -> char*.
+    fn strncat(call: &Call) -> Result<u64, KernelError> {
+        crt::strncat(call.arg(1), call.arg(2), call.arg(3))
+    }
+
+    /// wcsncat_s(Dest, NumberOfElements, Src, Count) -> errno_t.
+    fn wcsncat_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wcsncat_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4))? as u64)
+    }
+
+    /// qsort_s(Base, Num, Width, Compare, Context).
+    fn qsort_s(call: &Call) -> Result<u64, KernelError> {
+        sort::sort_elements_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5));
+        Ok(0)
+    }
+
+    /// _ui64tow_s(Value, Buffer, SizeInCharacters, Radix) -> errno_t.
+    fn ui64tow_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::ui64tow_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)? as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "crt-string-append",
+        names: &["strncat", "wcsncat_s", "qsort_s", "_ui64tow_s"],
+        handlers: &[strncat, wcsncat_s, qsort_s, ui64tow_s],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_oem_upcase {
+    //! RtlUpcaseUnicodeStringToOemString, RtlUpcaseUnicodeToOemN e
+    //! RtlxUnicodeStringToOemSize; a lógica mora em `rtl/oem_code_page`.
+
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::inc::types::{NtStruct, String as AnsiString, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::oem_code_page as oem;
+    use crate::rtl::KernelError;
+
+    /// (DestinationString, SourceString, AllocateDestinationString) -> NTSTATUS.
+    fn upcase_unicode_string_to_oem_string(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: OEM_STRING e UNICODE_STRING de kernel do chamador.
+        let (destination, source) = unsafe { (AnsiString::at(call.arg(1)), UnicodeString::at(call.arg(2))) };
+        oem::upcase_unicode_string_to_oem_string(destination, source, call.arg(3) & 0xFF != 0).map(signed_status)
+    }
+
+    /// (OemString, MaxBytesInOemString, BytesInOemString, UnicodeString, BytesInUnicodeString) -> NTSTATUS.
+    fn upcase_unicode_to_oem_n(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG opcional do chamador.
+        let written = (call.arg(3) != 0).then(|| unsafe { Field::<u32>::at(call.arg(3)) });
+        oem::upcase_unicode_to_oem_n(call.arg(1), call.arg(2) as u32, written, call.arg(4), call.arg(5) as u32).map(signed_status)
+    }
+
+    /// (UnicodeString) -> ULONG.
+    fn unicode_string_to_oem_size(call: &Call) -> Result<u64, KernelError> {
+        oem::unicode_string_to_oem_size(call.arg(1)).map(u64::from)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-oem-upcase",
+        names: &["RtlUpcaseUnicodeStringToOemString", "RtlUpcaseUnicodeToOemN", "RtlxUnicodeStringToOemSize"],
+        handlers: &[upcase_unicode_string_to_oem_string, upcase_unicode_to_oem_n, unicode_string_to_oem_size],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_network_string_ansi {
+    //! RtlIpv4StringToAddressA e RtlIpv6StringToAddressA; a lógica mora em
+    //! `rtl/network_address`.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::network_address;
+    use crate::rtl::KernelError;
+
+    fn cell<T: Copy>(address: u64) -> &'static Field<T> {
+        // SAFETY: parâmetro de saída (PCSTR*, PULONG) vivo e alinhado do chamador.
+        unsafe { Field::<T>::at(address) }
+    }
+
+    /// (S, Strict BOOLEAN, Terminator, Addr) -> NTSTATUS.
+    fn ipv4_string_to_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv4_string_to_address_ansi(call.arg(1), call.arg(2) & 0xFF != 0, cell(call.arg(3)), cell(call.arg(4)))))
+    }
+
+    /// (S, Terminator, Addr) -> NTSTATUS.
+    fn ipv6_string_to_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv6_string_to_address_ansi(call.arg(1), cell(call.arg(2)), call.arg(3))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-network-string-ansi",
+        names: &["RtlIpv4StringToAddressA", "RtlIpv6StringToAddressA"],
+        handlers: &[ipv4_string_to_address, ipv6_string_to_address],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_rb_replace {
+    //! RtlRbReplaceNode; a lógica mora em `rtl/rb_tree`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::rb_tree;
+    use crate::rtl::KernelError;
+
+    /// (Tree, Node, ReplacementNode).
+    fn replace_node(call: &Call) -> Result<u64, KernelError> {
+        rb_tree::replace_node(call.arg(1), call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-rb-replace", names: &["RtlRbReplaceNode"], handlers: &[replace_node], data_exports: &[] };
+}
+
+pub mod rtl_sd_control {
+    //! RtlSetControlSecurityDescriptor; a lógica mora em `rtl/security`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::security;
+    use crate::rtl::KernelError;
+
+    /// (SecurityDescriptor, ControlBitsOfInterest, ControlBitsToSet) -> NTSTATUS.
+    fn set_control(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(security::set_control(call.arg(1), call.arg(2) as u16, call.arg(3) as u16)))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-sd-control", names: &["RtlSetControlSecurityDescriptor"], handlers: &[set_control], data_exports: &[] };
+}
+
+pub mod rtl_cloud_files {
+    //! RtlIsCloudFilesPlaceholder; a lógica mora em `rtl/reparse`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::reparse;
+    use crate::rtl::KernelError;
+
+    /// (FileAttributes, ReparseTag) -> BOOLEAN.
+    fn is_cloud_files_placeholder(call: &Call) -> Result<u64, KernelError> {
+        Ok(reparse::is_cloud_files_placeholder(call.arg(1) as u32, call.arg(2) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-cloud-files", names: &["RtlIsCloudFilesPlaceholder"], handlers: &[is_cloud_files_placeholder], data_exports: &[] };
+}
+
+pub mod ldr_resource {
+    //! LdrFindResource_U e LdrAccessResource; a lógica mora em
+    //! `rtl/resource/section`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::resource::section;
+    use crate::rtl::KernelError;
+
+    /// (DllHandle, ResourceIdPath, ResourceIdPathLength, ResourceDataEntry) -> NTSTATUS.
+    fn find_resource(call: &Call) -> Result<u64, KernelError> {
+        section::find_resource(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4)).map(signed_status)
+    }
+
+    /// (DllHandle, ResourceDataEntry, Address, Size) -> NTSTATUS.
+    fn access_resource(call: &Call) -> Result<u64, KernelError> {
+        section::access_resource(call.arg(1), call.arg(2), call.arg(3), call.arg(4)).map(signed_status)
+    }
+
+    pub static GROUP: Group = Group { name: "ldr-resource", names: &["LdrFindResource_U", "LdrAccessResource"], handlers: &[find_resource, access_resource], data_exports: &[] };
+}
+
+pub mod rtl_token_checks {
+    //! RtlCheckTokenCapability e RtlCheckTokenMembershipEx; a lógica mora em
+    //! `se/capability/token_checks`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::capability::token_checks;
+    use crate::rtl::KernelError;
+
+    /// RtlCheckTokenCapability(TokenHandle, CapabilitySidToCheck, HasCapability*) -> NTSTATUS.
+    fn check_capability(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(token_checks::check_capability(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    /// RtlCheckTokenMembershipEx(TokenHandle, SidToCheck, Flags, IsMember*) -> NTSTATUS.
+    fn check_membership(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(token_checks::check_membership(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-token-checks", names: &["RtlCheckTokenCapability", "RtlCheckTokenMembershipEx"], handlers: &[check_capability, check_membership], data_exports: &[] };
+}
+
+pub mod rtl_volume_dos_name {
+    //! RtlVolumeDeviceToDosName: no ntoskrnl o export aponta para o código do
+    //! IoVolumeDeviceToDosName; a lógica mora em `io/volume_dos_name`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::volume_dos_name;
+    use crate::rtl::KernelError;
+
+    /// RtlVolumeDeviceToDosName(VolumeDeviceObject, DosName) -> NTSTATUS.
+    fn volume_device_to_dos_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(volume_dos_name::volume_device_to_dos_name(call.arg(1), call.arg(2))? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-volume-dos-name", names: &["RtlVolumeDeviceToDosName"], handlers: &[volume_device_to_dos_name], data_exports: &[] };
 }

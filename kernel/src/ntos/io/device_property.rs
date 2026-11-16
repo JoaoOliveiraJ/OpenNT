@@ -237,6 +237,19 @@ pub fn device_property_value(pdo: u64, fmtid: [u8; 16], pid: u32) -> Option<(u32
     PROPERTIES.lock().get(&(Owner::Device(pdo), fmtid, pid, 0)).cloned()
 }
 
+/// Grava uma propriedade DEVPROPKEY do PDO (LCID neutro) pelo próprio PnP
+/// (o _PnpSetObjectProperty interno, sem as validações do export);
+/// DEVPROP_TYPE_EMPTY apaga.
+pub fn store_device_property(pdo: u64, fmtid: [u8; 16], pid: u32, property_type: u32, bytes: &[u8]) {
+    let key = (Owner::Device(pdo), fmtid, pid, 0);
+    let mut properties = PROPERTIES.lock();
+    if property_type == PROPERTY_DEVPROP_TYPE_EMPTY {
+        properties.remove(&key);
+    } else {
+        properties.insert(key, (property_type, bytes.to_vec()));
+    }
+}
+
 /// IoSetDevicePropertyData(Pdo, PropertyKey, Lcid, Flags, Type, Size, Data).
 pub fn set_device_property(pdo: u64, key: &Devpropkey, lcid: u32, _flags: u32, property_type: u32, size: u32, data: u64) -> u32 {
     if pdo == 0 {

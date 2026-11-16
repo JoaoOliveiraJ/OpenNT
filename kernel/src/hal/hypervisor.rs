@@ -196,3 +196,55 @@ pub fn query_secure_device(_device: u64, output: u64) -> u32 {
 pub fn secure_pci_alternate_function(_segment: u32, _bus: u8, _device: u8, _function: u8) -> u8 {
     VSL_NO_ALTERNATE_FUNCTION
 }
+
+// ---- Hvl sem conexão ao hipervisor (hvl-hypervisor-queries) ----------------
+//
+// ntoskrnl 19041. O OpenNT nunca se conecta a um hipervisor: não instala a
+// página de hypercall nem o estado de partição raiz, que é a configuração
+// do NT num boot sem hipervisor:
+//   HvlInvokeHypercall (o export é o HvcallInitiateHypercall, 0x38fdc0) chama
+//     o HvcallCodeVa, cujo valor inicial no PE é o HvcallpNoHypervisorPresent
+//     (0x3656d0: `mov eax, 0x1000; ret`), sem tocar nos argumentos.
+//   HvlQueryActiveHypervisorProcessorCount (0x4f1e60) e
+//   HvlQueryHypervisorProcessorNodeNumber (0x4f1f20) exigem o bit 1 do
+//     HvlpFlags (partição raiz com os processadores lógicos do hipervisor);
+//     com HvlpFlags = 0 devolvem STATUS_UNSUCCESSFUL sem escrever a saída.
+//   HviGetPartitionIsolationType (0x3f8cb0) lê o CPUID real: com interface
+//     "Hv#1" e o privilégio Isolation (bit 54 da máscara de privilégios,
+//     EAX:EBX da leaf 0x40000003), o tipo é EBX & 0xF da leaf 0x4000000C;
+//     senão 0 (HV_PARTITION_ISOLATION_TYPE_NONE).
+
+/// O resultado do HvcallpNoHypervisorPresent.
+const HYPERCALL_NO_HYPERVISOR: u64 = 0x1000;
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+const LEAF_FEATURES: u32 = 0x4000_0003;
+const LEAF_ISOLATION_CONFIGURATION: u32 = 0x4000_000C;
+/// HV_PARTITION_PRIVILEGE_MASK.Isolation.
+const PRIVILEGE_ISOLATION: u64 = 1 << 54;
+
+/// HvlInvokeHypercall(InputValue, InputPa, OutputPa): HV_HYPERCALL_RESULT_VALUE.
+pub fn invoke_hypercall(_input_value: u64, _input: u64, _output: u64) -> u64 {
+    HYPERCALL_NO_HYPERVISOR
+}
+
+/// HvlQueryActiveHypervisorProcessorCount(PULONG Count).
+pub fn query_active_hypervisor_processor_count(_count: u64) -> u32 {
+    STATUS_UNSUCCESSFUL
+}
+
+/// HvlQueryHypervisorProcessorNodeNumber(LpIndex, PUSHORT NodeNumber).
+pub fn query_hypervisor_processor_node_number(_lp_index: u32, _node: u64) -> u32 {
+    STATUS_UNSUCCESSFUL
+}
+
+/// HviGetPartitionIsolationType(): HV_PARTITION_ISOLATION_TYPE.
+pub fn partition_isolation_type() -> u32 {
+    if !microsoft_compatible_interface() {
+        return 0;
+    }
+    let features = cpu::cpuid(LEAF_FEATURES);
+    if (u64::from(features[1]) << 32 | u64::from(features[0])) & PRIVILEGE_ISOLATION == 0 {
+        return 0;
+    }
+    cpu::cpuid(LEAF_ISOLATION_CONFIGURATION)[1] & 0xF
+}

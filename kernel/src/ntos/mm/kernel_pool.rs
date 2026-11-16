@@ -571,6 +571,14 @@ pub fn owns(pointer: u64) -> bool {
     POOL.lock().allocations.contains_key(&pointer)
 }
 
+/// A página de `address` pertence a uma região de pool paginado (o
+/// MiVaPagedPool da VA, por região: o pool paginado e o não paginado dividem
+/// a mesma faixa de sistema no OpenNT).
+pub fn is_paged_address(address: u64) -> bool {
+    let pool = POOL.lock();
+    pool.pages_by_va.get(&(address & !4095)).and_then(|&(id, _)| pool.regions.get(&id)).is_some_and(|region| region.paged)
+}
+
 /// Pagina páginas pagináveis para o volume. Reentrância (pool já em uso)
 /// não recupera nada.
 pub fn trim(count: u64) -> Result<u64, KernelError> {

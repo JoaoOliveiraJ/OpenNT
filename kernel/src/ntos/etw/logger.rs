@@ -707,3 +707,50 @@ pub fn counters(logger_id: u16) -> Option<(u32, u32, u32)> {
     let buffers = buffers.lock();
     Some((buffers.events, buffers.events_lost, buffers.buffers_written))
 }
+
+/// EVENT_TRACE_BUFFER_INTERFACE_MODE: a sessão aceita buffers prontos.
+const EVENT_TRACE_BUFFER_INTERFACE_MODE: u32 = 0x4_0000;
+/// WMI_BUFFER_HEADER.BufferType do buffer entregue pelo EtwSendTraceBuffer.
+const SENT_BUFFER_TYPE: u16 = 5;
+/// BufferFlag que preserva o ClientContext.Alignment.
+const BUFFER_FLAG_KEEP_ALIGNMENT: u16 = 0x20;
+
+/// EtwSendTraceBuffer(LoggerId, Buffer, EventsLost, StartTime,
+/// StartPerfClock), ntoskrnl 19041: entrega um buffer pronto
+/// (WMI_BUFFER_HEADER) a uma sessão em EVENT_TRACE_BUFFER_INTERFACE_MODE.
+/// LoggerId fora de MaxLoggers ou sessão sem esse modo dá
+/// STATUS_INVALID_HANDLE; sem a sessão, STATUS_WMI_INSTANCE_NOT_FOUND. O
+/// cabeçalho é preparado como no NT (SavedOffset = Offset, CurrentOffset =
+/// Offset + BufferSize, estado ETW_BUFFER_STATE_FLUSH, tipo 5, a hora de
+/// referência e o TimeStamp do relógio da sessão) e os EventsLost somam no
+/// contador da sessão. A sessão do OpenNT não grava arquivo: o buffer conta
+/// como escrito na hora (BuffersWritten), sem ficar retido.
+pub fn send_trace_buffer(logger_id: u16, buffer: u64, events_lost: u32, start_time: u64, start_perf_clock: u64) -> u32 {
+    if logger_id as u32 >= MAX_LOGGERS {
+        return STATUS_INVALID_HANDLE;
+    }
+    let (mode, buffers) = {
+        let loggers = LOGGERS.lock();
+        let Some(logger) = loggers.get(&logger_id) else { return STATUS_WMI_INSTANCE_NOT_FOUND };
+        (logger.log_file_mode, logger.buffers.clone())
+    };
+    if mode & EVENT_TRACE_BUFFER_INTERFACE_MODE == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let mut buffers = buffers.lock();
+    buffers.events_lost = buffers.events_lost.wrapping_add(events_lost);
+    let header = header(buffer);
+    let offset = header.offset.get();
+    header.saved_offset.set(offset);
+    header.current_offset.set(offset.wrapping_add(header.buffer_size.get()));
+    header.state.set(EtwBufferState::ETW_BUFFER_STATE_FLUSH);
+    header.buffer_type.set(SENT_BUFFER_TYPE);
+    if header.buffer_flag.get() & BUFFER_FLAG_KEEP_ALIGNMENT == 0 {
+        header.client_context.alignment.set(0);
+    }
+    header.reference_time.start_perf_clock.quad_part.set(start_perf_clock as i64);
+    header.reference_time.start_time.quad_part.set(start_time as i64);
+    header.time_stamp.quad_part.set(timestamp(buffers.clock));
+    buffers.buffers_written = buffers.buffers_written.wrapping_add(1);
+    0
+}

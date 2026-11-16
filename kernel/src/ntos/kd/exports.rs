@@ -139,3 +139,18 @@ pub mod kd_debug_filter {
         data_exports: &[],
     };
 }
+
+pub mod kd_poll_break_in {
+    //! KdPollBreakIn; a lógica mora em `kd/debugger`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::kd::debugger;
+    use crate::rtl::KernelError;
+
+    /// KdPollBreakIn() -> BOOLEAN.
+    fn poll_break_in(_call: &Call) -> Result<u64, KernelError> {
+        Ok(debugger::poll_break_in() as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "kd-poll-break-in", names: &["KdPollBreakIn"], handlers: &[poll_break_in], data_exports: &[] };
+}

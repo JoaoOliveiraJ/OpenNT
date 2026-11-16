@@ -105,3 +105,59 @@ pub fn is_active(physical_address: u64, size: u64) -> bool {
     let frames = page_frames(physical_address, size);
     !frames.is_empty() && IO_PAGE_REFERENCES.lock().range(frames).any(|(_, &count)| count != 0)
 }
+
+// ---- MmSetPermanentCacheAttribute (ntoskrnl 19041 rva 0x8c8260) -----------------
+//
+// MmSetPermanentCacheAttribute(StartAddress, NumberOfBytes, CacheType,
+// Flags): só abaixo de APC_LEVEL (senão STATUS_INVALID_PARAMETER); Flags
+// além do bit 0 é STATUS_INVALID_PARAMETER_4, início fora de página
+// STATUS_INVALID_PARAMETER_1, tamanho fora de página ou zero
+// STATUS_INVALID_PARAMETER_2 e só MmCached (1) é aceito
+// (STATUS_INVALID_PARAMETER_3). O registro da faixa ('MiIo', PFN inicial,
+// PFN final e o tipo de cache) entra, por um DPC genérico em todos os
+// processadores, na árvore das faixas permanentes do MiMakeIoRangePermanent:
+// uma faixa que se sobrepõe a uma já permanente, ou uma página de I/O já mapeada
+// com outro tipo de cache, é STATUS_CONFLICTING_ADDRESSES e o registro é
+// liberado. O OpenNT mapeia o I/O space pelo mapa direto sem atributo de
+// cache por página (`map`), então o conflito possível é só com as faixas
+// permanentes; a faixa registrada não sai mais.
+
+const PERMANENT_STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const PERMANENT_STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const PERMANENT_STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const PERMANENT_STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+const PERMANENT_STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+const PERMANENT_STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+/// MEMORY_CACHING_TYPE MmCached.
+const MM_CACHED: u32 = 1;
+
+/// Faixas permanentes: PFN inicial -> (PFN final, tipo de cache).
+static PERMANENT_RANGES: SpinLock<BTreeMap<u64, (u64, u32)>> = SpinLock::new(BTreeMap::new());
+
+/// MmSetPermanentCacheAttribute: devolve o NTSTATUS.
+pub fn set_permanent_cache_attribute(start: u64, bytes: u64, cache_type: u32, flags: u32) -> u32 {
+    if crate::ntos::ke::irql::get_irql() >= 1 {
+        return PERMANENT_STATUS_INVALID_PARAMETER;
+    }
+    if flags & !1 != 0 {
+        return PERMANENT_STATUS_INVALID_PARAMETER_4;
+    }
+    if start & 0xFFF != 0 {
+        return PERMANENT_STATUS_INVALID_PARAMETER_1;
+    }
+    if bytes & 0xFFF != 0 || bytes >> 12 == 0 {
+        return PERMANENT_STATUS_INVALID_PARAMETER_2;
+    }
+    if cache_type != MM_CACHED {
+        return PERMANENT_STATUS_INVALID_PARAMETER_3;
+    }
+    let first = start >> 12;
+    let last = first.wrapping_add(bytes >> 12).wrapping_sub(1);
+    let mut ranges = PERMANENT_RANGES.lock();
+    let overlaps = ranges.iter().any(|(&base, &(end, _))| !(last < base || first > end));
+    if overlaps {
+        return PERMANENT_STATUS_CONFLICTING_ADDRESSES;
+    }
+    ranges.insert(first, (last, cache_type));
+    0
+}

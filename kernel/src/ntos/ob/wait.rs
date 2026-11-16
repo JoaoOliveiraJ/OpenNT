@@ -1,5 +1,6 @@
 //! Espera por handle em modo kernel (ZwWaitForSingleObject,
-//! ZwWaitForMultipleObjects, ObWaitForSingleObject e ObWaitForMultipleObjects).
+//! ZwWaitForMultipleObjects, ObWaitForSingleObject, ObWaitForMultipleObjects
+//! e o export NtWaitForSingleObject, no modo anterior do chamador).
 //!
 //! O handle é resolvido na ordem: a tabela nativa (abertos por ponteiro),
 //! threads de sistema, os eventos abertos pelo núcleo de handles de kernel do
@@ -51,6 +52,8 @@ pub fn wait_for_single_object(handle: u64, alertable: bool, timeout: u64) -> u64
 }
 
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
 const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
 const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
@@ -135,6 +138,29 @@ pub fn ob_wait_for_single_object(handle: u64, previous_mode: u8, wait_mode: u8, 
     };
     held.release();
     status
+}
+
+/// NtWaitForSingleObject(Handle, Alertable, Timeout) chamado por código de
+/// kernel (o export Nt*): o modo anterior da thread é o PreviousMode e o
+/// WaitMode do ObWaitForSingleObject. Em UserMode o LARGE_INTEGER do prazo
+/// é capturado antes (sondado; um endereço do kernel falha como no
+/// ProbeForRead) e a espera usa a cópia.
+pub fn nt_wait_for_single_object(handle: u64, alertable: bool, timeout: u64) -> Result<u32, KernelError> {
+    let previous_mode = crate::ntos::ps::previous_mode::get()?;
+    if timeout == 0 || previous_mode == 0 {
+        return Ok(ob_wait_for_single_object(handle, previous_mode, previous_mode, alertable, timeout));
+    }
+    let limit = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
+    let source = if timeout >= limit { limit } else { timeout };
+    let Ok(value) = guest::try_read::<u64>(source) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let captured = guest::alloc_bytes(8);
+    if captured == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write64(captured, value);
+    let status = ob_wait_for_single_object(handle, previous_mode, previous_mode, alertable, captured);
+    guest::free_bytes(captured);
+    Ok(status)
 }
 
 /// ObWaitForMultipleObjects(Count, Handles, PreviousMode, WaitType,

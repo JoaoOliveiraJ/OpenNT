@@ -56,3 +56,5 @@ pub mod device_removal;
 pub mod root_device;
 pub mod dependency;
 pub mod legacy_resources;
+pub mod io_perf;
+pub mod state_directory;

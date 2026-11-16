@@ -1,6 +1,7 @@
 //! Rotinas de segurança do Rtl sobre estruturas do convidado —
 //! RtlMapGenericMask, RtlAddAce, RtlGetSaclSecurityDescriptor,
-//! Rtl{Get,Set}GroupSecurityDescriptor, RtlSubAuthorityCountSid e RtlCopyLuid.
+//! Rtl{Get,Set}GroupSecurityDescriptor, RtlSetControlSecurityDescriptor,
+//! RtlSubAuthorityCountSid e RtlCopyLuid.
 //!
 //! Validação e leitura dos componentes vêm de `se::{acl, descriptor}`; os
 //! NTSTATUS seguem as convenções do componente `se`. Cada rotina com status
@@ -154,6 +155,25 @@ pub fn set_group(sd: u64, group: u64, defaulted: bool) -> u32 {
     0
 }
 
+/// Bits do SECURITY_DESCRIPTOR_CONTROL que o RtlSetControlSecurityDescriptor
+/// aceita mudar (SE_DACL_UNTRUSTED até SE_SACL_PROTECTED, 0x3FC0).
+const SE_SETTABLE_CONTROL_BITS: u16 = 0x3FC0;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+/// RtlSetControlSecurityDescriptor(PSD, ControlBitsOfInterest,
+/// ControlBitsToSet) (19041 0x773680): os dois parâmetros são de 16 bits;
+/// um bit de interesse fora de 0x3FC0, ou um bit a ligar fora do interesse,
+/// dá STATUS_INVALID_PARAMETER; senão Control = (Control & ~Interesse) |
+/// ToSet, sem olhar a revisão nem o formato do SD.
+pub fn set_control(sd: u64, interest: u16, to_set: u16) -> u32 {
+    if to_set & !interest != 0 || interest & !SE_SETTABLE_CONTROL_BITS != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let descriptor = descriptor_at(sd);
+    descriptor.control.set((descriptor.control.get() & !interest) | to_set);
+    0
+}
+
 /// RtlSubAuthorityCountSid(PSID) = &Sid->SubAuthorityCount (lea rax,[rcx+1]).
 pub fn sub_authority_count(sid: u64) -> u64 {
     sid + 1
@@ -168,23 +188,18 @@ pub fn copy_luid(destination: u64, source: u64) {
 
 // ---- RtlConvertSidToUnicodeString (rtl-strings) ----------------------------
 
-/// RtlConvertSidToUnicodeString(String, Sid, Allocate): SID inválido ou de
-/// revisão != 1 = STATUS_INVALID_SID. O texto é "S-1-" + autoridade (decimal
-/// dos 4 bytes baixos big-endian, ou "0x" + hex maiúsculo dos 6 bytes quando
-/// algum dos dois altos é não nulo) + "-<subautoridade>" decimal. Com
-/// Allocate, RtlCreateUnicodeString (falha = STATUS_NO_MEMORY); senão
-/// RtlCopyUnicodeString se Length < MaximumLength, ou STATUS_BUFFER_OVERFLOW.
-pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool) -> Result<u32, crate::rtl::KernelError> {
-    const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+/// O texto do RtlConvertSidToUnicodeString para o SID em `sid`: SID inválido
+/// (RtlValidSid, que recusa VAs de usuário) ou de revisão != 1 =
+/// STATUS_INVALID_SID.
+pub fn sid_text(sid: u64) -> Result<alloc::string::String, u32> {
     const STATUS_INVALID_SID: u32 = 0xC000_0078;
-    const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
     if !crate::ntos::se::sid::valid(sid) {
-        return Ok(STATUS_INVALID_SID);
+        return Err(STATUS_INVALID_SID);
     }
     // SAFETY: SID validado acima (RtlValidSid).
     let sid = unsafe { Sid::at(sid) };
     if sid.revision.get() != 1 {
-        return Ok(STATUS_INVALID_SID);
+        return Err(STATUS_INVALID_SID);
     }
     let authority: alloc::vec::Vec<u8> = sid.identifier_authority.value.iter().map(Field::get).collect();
     let mut text = alloc::string::String::from("S-1-");
@@ -201,6 +216,22 @@ pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool)
     for sub_authority in unsafe { Field::<u32>::array_at(sid.sub_authority[0].address(), count) } {
         text.push_str(&alloc::format!("-{}", sub_authority.get()));
     }
+    Ok(text)
+}
+
+/// RtlConvertSidToUnicodeString(String, Sid, Allocate): SID inválido ou de
+/// revisão != 1 = STATUS_INVALID_SID. O texto é "S-1-" + autoridade (decimal
+/// dos 4 bytes baixos big-endian, ou "0x" + hex maiúsculo dos 6 bytes quando
+/// algum dos dois altos é não nulo) + "-<subautoridade>" decimal. Com
+/// Allocate, RtlCreateUnicodeString (falha = STATUS_NO_MEMORY); senão
+/// RtlCopyUnicodeString se Length < MaximumLength, ou STATUS_BUFFER_OVERFLOW.
+pub fn convert_sid_to_unicode_string(destination: u64, sid: u64, allocate: bool) -> Result<u32, crate::rtl::KernelError> {
+    const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+    const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    let text = match sid_text(sid) {
+        Ok(text) => text,
+        Err(status) => return Ok(status),
+    };
     // Origem temporária no convidado: UNICODE_STRING (16 bytes) + texto + NUL.
     let bytes = text.len() as u64 * 2;
     let scratch = guest::alloc_bytes(UnicodeString::SIZE + bytes + 2);

@@ -69,6 +69,12 @@ impl CodePage {
         word(&self.table, 6)
     }
 
+    /// TransUniDefaultChar do cabeçalho (word 6): o WCHAR em que o
+    /// DefaultChar da página se traduz (OemTransUniDefaultChar).
+    pub fn trans_uni_default_char(&self) -> Result<u16, KernelError> {
+        word(&self.table, 12)
+    }
+
     /// SBCS: só Length; DBCS: os bytes iniciais contam as unidades WCHAR.
     pub fn unicode_byte_length(&self, source: u64, length: u64) -> u64 {
         if !self.double_byte {

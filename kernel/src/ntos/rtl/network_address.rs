@@ -1,8 +1,9 @@
 //! Endereços IPv4/IPv6 em texto (UTF-16) — ntoskrnl 19041
 //! RtlIpv4StringToAddressW 0x31e430, RtlIpv6StringToAddressW 0x31c670,
 //! RtlIpv4AddressToStringW 0x381600, RtlIpv4AddressToStringExW 0x381560,
-//! RtlIpv6AddressToStringW 0x37dda0, RtlIpv6AddressToStringExW 0x37dcc0 e
-//! as variantes ANSI dos formatadores (no fim do arquivo).
+//! RtlIpv6AddressToStringW 0x37dda0, RtlIpv6AddressToStringExW 0x37dcc0,
+//! os parsers ANSI (RtlIpv4/6StringToAddressA, o mesmo autômato sobre
+//! `char`s) e as variantes ANSI dos formatadores (no fim do arquivo).
 //!
 //! As classes de caractere são as do `pwctype` do ntoskrnl para c < 0x80
 //! (os dois parsers testam `c < 0x80` antes do iswctype): dígitos '0'..'9',
@@ -20,16 +21,28 @@ use crate::ntos::rtl::guest_strings;
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
-/// A string UTF-16 do chamador, lida até o NUL de uma vez (os parsers nunca
-/// olham além do terminador); `unit` devolve 0 a partir do NUL.
+/// A string do chamador, lida até o NUL de uma vez (os parsers nunca olham
+/// além do terminador); `unit` devolve 0 a partir do NUL. As variantes ANSI
+/// (RtlIpv4StringToAddressA 0x390860, RtlIpv6StringToAddressA 0x58c330)
+/// classificam o `char` com sinal pela CRT (_isascii, isdigit, isxdigit,
+/// islower): um byte >= 0x80 vira uma unidade >= 0x80 e cai nos mesmos
+/// testes `c < 0x80` dos parsers UTF-16.
 struct WideText {
     address: u64,
     units: Vec<u16>,
+    /// Bytes por caractere (2 = UTF-16, 1 = ANSI).
+    width: u64,
 }
 
 impl WideText {
     fn read(address: u64) -> Self {
-        Self { address, units: guest_strings::read_wide_units(address) }
+        Self { address, units: guest_strings::read_wide_units(address), width: 2 }
+    }
+
+    fn read_ansi(address: u64) -> Self {
+        // read_c_string guarda cada byte como o `char` de mesmo valor.
+        let units = guest_strings::read_c_string(address).chars().map(|character| character as u16).collect();
+        Self { address, units, width: 1 }
     }
 
     fn unit(&self, index: u64) -> u16 {
@@ -38,7 +51,7 @@ impl WideText {
 
     /// Endereço do caractere `index` (o *Terminator do NT).
     fn pointer(&self, index: u64) -> u64 {
-        self.address + index * 2
+        self.address + index * self.width
     }
 }
 
@@ -73,7 +86,16 @@ fn hex_value(c: u16) -> u32 {
 /// bits; 2 = 8.24; 3 = 8.8.16; 4 = 8.8.8.8. *Terminator recebe o cursor
 /// também em erro; Addr (ordem de rede) só em sucesso.
 pub fn ipv4_string_to_address(string: u64, strict: bool, terminator: &Field<u64>, address_out: &Field<u32>) -> u32 {
-    let text = WideText::read(string);
+    parse_ipv4(WideText::read(string), strict, terminator, address_out)
+}
+
+/// RtlIpv4StringToAddressA(S, Strict, Terminator, Addr): o mesmo autômato
+/// sobre `char`s.
+pub fn ipv4_string_to_address_ansi(string: u64, strict: bool, terminator: &Field<u64>, address_out: &Field<u32>) -> u32 {
+    parse_ipv4(WideText::read_ansi(string), strict, terminator, address_out)
+}
+
+fn parse_ipv4(text: WideText, strict: bool, terminator: &Field<u64>, address_out: &Field<u32>) -> u32 {
     let mut index = 0u64;
     let mut parts: [u32; 4] = [0; 4];
     let mut count = 0usize;
@@ -184,6 +206,8 @@ struct Ipv6Parser {
     compression: u32,
     /// Início do grupo corrente ([rsp+0x20]).
     group_start: Option<u64>,
+    /// Variante ANSI: os grupos hexadecimais passam pelo strtol(grupo, NULL, 16).
+    narrow: bool,
 }
 
 impl Ipv6Parser {
@@ -192,6 +216,9 @@ impl Ipv6Parser {
     }
 
     fn hex_group(&self, start: u64) -> u16 {
+        if self.narrow {
+            return self.strtol_hex(start) as u16;
+        }
         let mut value = 0u32;
         let mut index = start;
         while is_xdigit(self.text.unit(index)) {
@@ -199,6 +226,24 @@ impl Ipv6Parser {
             index += 1;
         }
         value as u16
+    }
+
+    /// strtol(grupo, NULL, 16) da variante ANSI (strtoxl 0x3d0b70): o grupo
+    /// começa num dígito, então não há brancos nem sinal; "0x"/"0X" é pulado
+    /// mesmo sem dígito depois (que então dá 0), os dígitos seguintes são
+    /// todos lidos (também os que ficam depois do fim do grupo, como em
+    /// "::0x12345") e um valor acima de LONG_MAX satura em 0x7FFFFFFF.
+    fn strtol_hex(&self, start: u64) -> u32 {
+        let mut index = start;
+        if self.text.unit(index) == 0x30 && matches!(self.text.unit(index + 1), 0x58 | 0x78) {
+            index += 2;
+        }
+        let mut value = 0u64;
+        while is_xdigit(self.text.unit(index)) {
+            value = (value * 16 + hex_value(self.text.unit(index)) as u64).min(0x1_0000_0000);
+            index += 1;
+        }
+        value.min(0x7FFF_FFFF) as u32
     }
 
     fn decimal_group(&self, start: u64) -> u32 {
@@ -243,9 +288,19 @@ impl Ipv6Parser {
 /// leitura deixa as palavras já gravadas; erros detectados ao converter um
 /// grupo dentro do laço voltam sem gravar *Terminator.
 pub fn ipv6_string_to_address(string: u64, terminator: &Field<u64>, address_out: u64) -> u32 {
+    run_ipv6(WideText::read(string), false, terminator, address_out)
+}
+
+/// RtlIpv6StringToAddressA(S, Terminator, Addr): o mesmo autômato sobre
+/// `char`s, com os grupos hexadecimais convertidos pelo strtol.
+pub fn ipv6_string_to_address_ansi(string: u64, terminator: &Field<u64>, address_out: u64) -> u32 {
+    run_ipv6(WideText::read_ansi(string), true, terminator, address_out)
+}
+
+fn run_ipv6(text: WideText, narrow: bool, terminator: &Field<u64>, address_out: u64) -> u32 {
     let mut initial = [0u8; 16];
     initial.copy_from_slice(&guest::read_bytes(address_out, 16));
-    let mut parser = Ipv6Parser { text: WideText::read(string), address: initial, words: 0, colons: 0, dots: 0, group_length: 0, compression: 0, group_start: None };
+    let mut parser = Ipv6Parser { text, address: initial, words: 0, colons: 0, dots: 0, group_length: 0, compression: 0, group_start: None, narrow };
     let status = parse_ipv6(&mut parser, terminator);
     guest::write_bytes(address_out, &parser.address);
     status

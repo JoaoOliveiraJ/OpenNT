@@ -13,6 +13,8 @@
 //!   IoGetRequestorProcessId        rva 0x3cf2d0
 //!   IoGetRequestorSessionId        rva 0x32be20
 //!   IoGetInitiatorProcess          rva 0x32c4d0 (-> IopGetFileObjectExtension 0x2d6f90, slot 1)
+//!   IoSetFileOrigin                rva 0x379060
+//!   IoIsInitiator32bitProcess      rva 0x36c690 (-> IoIs32bitProcess 0x32d650)
 //!   PsGetIoPriorityThread          rva 0x242180 (prioridade de I/O do IRP assíncrono)
 //!
 //! Reuso: `io_manager::iof_call_driver`, `retained_irp::completion_routine`
@@ -395,4 +397,86 @@ pub fn initiator_process(file_object: u64) -> u64 {
     // SAFETY: FileObjectExtension aponta para a _IOP_FILE_OBJECT_EXTENSION.
     let block = unsafe { IopFileObjectExtension::at(extension) }.fo_ext_per_type_extension[INITIATOR_EXTENSION_SLOT].get();
     if block == 0 { 0 } else { guest::read64(block + INITIATOR_PROCESS) }
+}
+
+// ---- Origem do pedido: arquivo remoto e processo de 32 bits ----------------------
+//
+//   IoSetFileOrigin            rva 0x379060
+//   IoIs32bitProcess           rva 0x32d650
+//   IoIsInitiator32bitProcess  rva 0x36c690
+
+/// FILE_OBJECT.Flags FO_REMOTE_ORIGIN.
+const FO_REMOTE_ORIGIN: u32 = 0x0100_0000;
+const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
+/// IRP.Flags: Overlay.AsynchronousParameters.IssuingProcess guarda o
+/// processo do pedido (os dois bits baixos 1..2 são marcas).
+const IRP_ISSUING_PROCESS: u32 = 0x2000;
+const ISSUING_PROCESS_MARKS: u64 = 6;
+const USER_MODE: i8 = 1;
+const IMAGE_FILE_MACHINE_I386: u16 = 0x14C;
+const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x1C4;
+
+/// IoSetFileOrigin(FileObject, Remote): liga ou desliga FO_REMOTE_ORIGIN;
+/// pedir o estado que o arquivo já tem é STATUS_INVALID_PARAMETER_MIX.
+pub fn set_file_origin(file: &FileObject, remote: bool) -> u32 {
+    let flags = file.flags.get();
+    if (flags & FO_REMOTE_ORIGIN != 0) == remote {
+        return STATUS_INVALID_PARAMETER_MIX;
+    }
+    file.flags.set(if remote { flags | FO_REMOTE_ORIGIN } else { flags & !FO_REMOTE_ORIGIN });
+    0
+}
+
+/// Processo WoW64 (EPROCESS.WoW64Process com Machine i386 ou ARM32).
+fn is_wow64_process(owner: u64) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    // SAFETY: EPROCESS vivo (do IRP, da thread ou do arquivo).
+    let wow64 = unsafe { Eprocess::at(owner) }.wo_w64_process.get();
+    // SAFETY: o EWOW64PROCESS do processo.
+    wow64 != 0 && matches!(unsafe { crate::ntos::inc::types::Ewow64process::at(wow64) }.machine.get(), IMAGE_FILE_MACHINE_I386 | IMAGE_FILE_MACHINE_ARMNT)
+}
+
+/// IoIs32bitProcess(Irp): sem IRP, o processo anexado da thread corrente
+/// quando o modo anterior é usuário; com IRP de modo usuário, o
+/// IssuingProcess (IRP_ISSUING_PROCESS) ou o processo da Tail.Overlay.Thread
+/// pelo ApcEnvironment (0 o próprio, 1 o anexado).
+pub fn is_32bit_requestor(packet: u64) -> bool {
+    if packet == 0 {
+        // SAFETY: a KTHREAD corrente.
+        let thread = unsafe { Kthread::at(process::get_current_thread()) };
+        return thread.previous_mode.get() == USER_MODE && is_wow64_process(thread.apc_state.process.get());
+    }
+    // SAFETY: IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    if irp.requestor_mode.get() != USER_MODE {
+        return false;
+    }
+    let owner = if irp.flags.get() & IRP_ISSUING_PROCESS != 0 {
+        irp.overlay.asynchronous_parameters.issuing_process.get() & !ISSUING_PROCESS_MARKS
+    } else {
+        let thread = irp.tail.overlay.thread.get();
+        if thread == 0 {
+            return false;
+        }
+        // SAFETY: Tail.Overlay.Thread de um IRP vivo.
+        let thread = unsafe { Kthread::at(thread) };
+        match irp.apc_environment.get() {
+            0 => thread.process.get(),
+            1 => thread.apc_state.process.get(),
+            _ => return false,
+        }
+    };
+    is_wow64_process(owner)
+}
+
+/// IoIsInitiator32bitProcess(Irp): o processo iniciador do FILE_OBJECT do
+/// slot corrente decide; sem iniciador, o IoIs32bitProcess do IRP.
+pub fn is_initiator_32bit_process(packet: u64) -> bool {
+    // SAFETY: IRP vivo e o slot corrente dele.
+    let location = unsafe { IoStackLocation::at(Irp::at(packet).tail.overlay.current_stack_location.get()) };
+    let file = location.file_object.get();
+    let initiator = if file == 0 { 0 } else { initiator_process(file) };
+    if initiator != 0 { is_wow64_process(initiator) } else { is_32bit_requestor(packet) }
 }

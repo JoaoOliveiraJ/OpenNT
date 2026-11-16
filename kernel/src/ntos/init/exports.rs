@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 452] {
+fn groups() -> [&'static Group; 495] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -521,6 +521,49 @@ fn groups() -> [&'static Group; 452] {
         &crate::ntos::ex::exports::zw_create_wnf_state_name::GROUP,
         &crate::ntos::etw::exports::etw_write_ex::GROUP,
         &crate::ntos::ke::exports::ke_affinity_ex::GROUP,
+        &crate::ntos::rtl::exports::crt_memory_ctype::GROUP,
+        &crate::ntos::rtl::exports::crt_string_append::GROUP,
+        &crate::ntos::rtl::exports::rtl_oem_upcase::GROUP,
+        &crate::ntos::rtl::exports::rtl_network_string_ansi::GROUP,
+        &crate::ntos::rtl::exports::rtl_rb_replace::GROUP,
+        &crate::ntos::rtl::exports::rtl_sd_control::GROUP,
+        &crate::ntos::rtl::exports::rtl_cloud_files::GROUP,
+        &crate::ntos::rtl::exports::ldr_resource::GROUP,
+        &crate::ntos::se::exports::se_sddl_strings::GROUP,
+        &crate::ntos::se::exports::se_signing_levels::GROUP,
+        &crate::ntos::rtl::exports::rtl_token_checks::GROUP,
+        &crate::ntos::se::exports::zw_open_process_token::GROUP,
+        &crate::ntos::se::exports::lsa_return_buffer::GROUP,
+        &crate::ntos::ob::exports::ob_nt_set_security_object::GROUP,
+        &crate::ntos::alpc::exports::alpc_kernel_security::GROUP,
+        &crate::ntos::io::exports::io_file_object_origin::GROUP,
+        &crate::ntos::io::exports::io_work_item_node::GROUP,
+        &crate::ntos::io::exports::io_delete_driver::GROUP,
+        &crate::ntos::io::exports::io_tracking::GROUP,
+        &crate::ntos::io::exports::io_device_directory::GROUP,
+        &crate::ntos::io::exports::io_interface_alias::GROUP,
+        &crate::ntos::rtl::exports::rtl_volume_dos_name::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_file_acquire::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_mup_provider::GROUP,
+        &crate::ntos::ps::exports::ps_parent_silo::GROUP,
+        &crate::ntos::ps::exports::ps_thread_notify_ex::GROUP,
+        &crate::ntos::ps::exports::ps_wow64_apc::GROUP,
+        &crate::ntos::ps::exports::nt_query_information_process::GROUP,
+        &crate::ntos::ke::exports::ke_alert_thread::GROUP,
+        &crate::ntos::ke::exports::ke_triage_dump_data::GROUP,
+        &crate::ntos::kd::exports::kd_poll_break_in::GROUP,
+        &crate::ntos::mm::exports::mm_mdl_maps::GROUP,
+        &crate::ntos::mm::exports::mm_nonpaged_address::GROUP,
+        &crate::ntos::mm::exports::mm_physical_remove_cache::GROUP,
+        &crate::ntos::ex::exports::ex_lookaside_flush::GROUP,
+        &crate::ntos::ex::exports::ex_boot_device::GROUP,
+        &crate::ntos::ex::exports::ex_set_firmware_variable::GROUP,
+        &crate::ntos::etw::exports::etw_send_trace_buffer::GROUP,
+        &crate::ntos::inbv::exports::inbv_boot_driver::GROUP,
+        &crate::hal::exports::hvl_hypervisor_queries::GROUP,
+        &crate::ntos::ex::exports::ex_nt_create_event::GROUP,
+        &crate::ntos::ob::exports::ob_nt_wait_single::GROUP,
+        &crate::ntos::tm::exports::tm_query_transaction::GROUP,
     ]
 }
 

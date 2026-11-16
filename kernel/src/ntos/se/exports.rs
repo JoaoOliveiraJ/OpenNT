@@ -939,3 +939,90 @@ pub mod zw_adjust_privileges_token {
 
     pub static GROUP: Group = Group { name: "zw-adjust-privileges-token", names: &["ZwAdjustPrivilegesToken"], handlers: &[adjust_privileges_token], data_exports: &[] };
 }
+
+pub mod se_sddl_strings {
+    //! SeConvertSidToStringSid, SeConvertStringSidToSid e
+    //! SeConvertSecurityDescriptorToStringSecurityDescriptor; a lógica mora
+    //! em `se/sddl`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::sddl;
+    use crate::rtl::KernelError;
+
+    /// SeConvertSidToStringSid(Sid, StringSid*) -> NTSTATUS.
+    fn sid_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sddl::convert_sid_to_string(call.arg(1), call.arg(2))))
+    }
+
+    /// SeConvertStringSidToSid(StringSid, Sid*) -> NTSTATUS.
+    fn string_to_sid(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sddl::convert_string_to_sid(call.arg(1), call.arg(2))))
+    }
+
+    /// SeConvertSecurityDescriptorToStringSecurityDescriptor(Sd, Revision,
+    /// SecurityInformation, String*, StringLength*) -> NTSTATUS.
+    fn descriptor_to_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(sddl::convert_descriptor_to_string(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5))))
+    }
+
+    pub static GROUP: Group = Group { name: "se-sddl-strings", names: &["SeConvertSidToStringSid", "SeConvertStringSidToSid", "SeConvertSecurityDescriptorToStringSecurityDescriptor"], handlers: &[sid_to_string, string_to_sid, descriptor_to_string], data_exports: &[] };
+}
+
+pub mod se_signing_levels {
+    //! SeCompareSigningLevels, ZwGetCachedSigningLevel e
+    //! ZwSetCachedSigningLevel; a lógica mora em `se/signing_level`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::signing_level;
+    use crate::rtl::KernelError;
+
+    /// SeCompareSigningLevels(ActualSigningLevel, ExpectedSigningLevel) -> BOOLEAN.
+    fn compare(call: &Call) -> Result<u64, KernelError> {
+        Ok(signing_level::compare(call.arg(1) as u8, call.arg(2) as u8))
+    }
+
+    /// ZwGetCachedSigningLevel(File, Flags*, SigningLevel*, Thumbprint,
+    /// ThumbprintSize*, ThumbprintAlgorithm*) -> NTSTATUS.
+    fn get_cached(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(signing_level::get_cached(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6))?))
+    }
+
+    /// ZwSetCachedSigningLevel(Flags, InputSigningLevel, SourceFiles,
+    /// SourceFileCount, TargetFile) -> NTSTATUS.
+    fn set_cached(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(signing_level::set_cached(call.arg(1) as u32, call.arg(2) as u8, call.arg(3), call.arg(4) as u32, call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "se-signing-levels", names: &["SeCompareSigningLevels", "ZwGetCachedSigningLevel", "ZwSetCachedSigningLevel"], handlers: &[compare, get_cached, set_cached], data_exports: &[] };
+}
+
+pub mod zw_open_process_token {
+    //! ZwOpenProcessToken: o NtOpenProcessTokenEx sem atributos, em
+    //! KernelMode (`se/token/open_process`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::token::open_process as open_process_token;
+    use crate::rtl::KernelError;
+
+    /// ZwOpenProcessToken(ProcessHandle, DesiredAccess, TokenHandle*) -> NTSTATUS.
+    fn open_process_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(open_process_token::open(call.arg(1), call.arg(2) as u32, 0, call.arg(3), 0)? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "zw-open-process-token", names: &["ZwOpenProcessToken"], handlers: &[open_process_token], data_exports: &[] };
+}
+
+pub mod lsa_return_buffer {
+    //! LsaFreeReturnBuffer; a lógica mora em `se/extension_hosts`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::extension_hosts;
+    use crate::rtl::KernelError;
+
+    /// LsaFreeReturnBuffer(Buffer) -> NTSTATUS.
+    fn free_return_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(extension_hosts::free_return_buffer(call.arg(1))?))
+    }
+
+    pub static GROUP: Group = Group { name: "lsa-return-buffer", names: &["LsaFreeReturnBuffer"], handlers: &[free_return_buffer], data_exports: &[] };
+}

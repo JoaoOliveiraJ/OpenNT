@@ -130,6 +130,39 @@ pub fn current_wow64_process() -> Result<u64, KernelError> {
     Ok(wow64_process(unsafe { Ethread::at(thread) }.tcb.apc_state.process.get()))
 }
 
+/// IMAGE_FILE_MACHINE_I386 e IMAGE_FILE_MACHINE_ARMNT: as máquinas WOW64
+/// cujas APCs de usuário passam pelo despacho de 32 bits.
+const MACHINE_I386: u16 = 0x14C;
+const MACHINE_ARMNT: u16 = 0x1C4;
+
+/// PsWrapApcWow64Thread(ApcContext*, ApcRoutine*): quando o processo do
+/// ApcState da thread corrente é WOW64 de x86 ou ARM32
+/// (EWOW64PROCESS.Machine), a rotina vira `-(rotina) << 2`, a forma que o
+/// despacho de APC do WOW64 reconhece; nos demais processos nada muda. O
+/// contexto não é tocado e o status é sempre STATUS_SUCCESS.
+pub fn wrap_apc_wow64_thread(apc_routine: u64) -> Result<u32, KernelError> {
+    let region = pcr::get_pcr_address();
+    if region == 0 {
+        return Err(KernelError::new("PsWrapApcWow64Thread requires an initialized KPCR"));
+    }
+    // SAFETY: a KPCR inicializada do processador corrente.
+    let thread = unsafe { Kpcr::at(region) }.prcb.current_thread.get();
+    // SAFETY: Prcb.CurrentThread é o ETHREAD em execução.
+    let process = unsafe { Ethread::at(thread) }.tcb.apc_state.process.get();
+    let wow64 = eprocess(process).wo_w64_process.get();
+    if wow64 == 0 {
+        return Ok(0);
+    }
+    // SAFETY: EPROCESS.WoW64Process aponta para o EWOW64PROCESS do processo.
+    let machine = unsafe { Ewow64process::at(wow64) }.machine.get();
+    if machine == MACHINE_I386 || machine == MACHINE_ARMNT {
+        // SAFETY: PVOID* ApcRoutine do chamador de kernel.
+        let routine = unsafe { Field::<u64>::at(apc_routine) };
+        routine.set(routine.get().wrapping_neg() << 2);
+    }
+    Ok(0)
+}
+
 /// PsGetProcessInheritedFromUniqueProcessId.
 pub fn inherited_from_unique_process_id(process: u64) -> u64 {
     eprocess(process).inherited_from_unique_process_id.get()

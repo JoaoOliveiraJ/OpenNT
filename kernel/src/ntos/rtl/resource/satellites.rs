@@ -166,6 +166,17 @@ pub fn load(primary: &Primary, primary_configuration: Option<Configuration>, lan
     Ok(result.map(|opened| Alternate { base: opened.base, size: opened.size }))
 }
 
+/// LdrpGetAlternateResourceModuleHandleEx: o satélite já aberto da imagem
+/// cuja vista contém `address`, como handle de vista de arquivo (base | 1).
+pub fn containing(image_base: u64, address: u64) -> Option<u64> {
+    let modules = MODULES.lock();
+    let owner = modules.get(&(image_base & !3))?;
+    owner.resources.values().find_map(|resource| match resource {
+        Ok(opened) if address >= opened.base && address < opened.base + opened.size => Some(opened.base | 1),
+        _ => None,
+    })
+}
+
 pub fn unload(image_base: u64) -> Result<bool, KernelError> {
     let base = image_base & !3;
     let owner = {

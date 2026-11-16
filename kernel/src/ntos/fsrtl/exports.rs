@@ -1775,3 +1775,52 @@ pub mod fsrtl_ecp_initialize {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_file_acquire {
+    //! FsRtlAcquireFileExclusive e FsRtlReleaseFile: a lógica mora em
+    //! `fsrtl/fs_filter`.
+
+    use crate::ntos::fsrtl::fs_filter;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlAcquireFileExclusive(FileObject): o protótipo é VOID, mas o
+    /// RAX volta com o status da aquisição, como no ntoskrnl.
+    fn acquire_file_exclusive(call: &Call) -> Result<u64, KernelError> {
+        Ok(fs_filter::acquire_file_exclusive(call.arg(1))? as u64)
+    }
+
+    /// FsRtlReleaseFile(FileObject).
+    fn release_file(call: &Call) -> Result<u64, KernelError> {
+        fs_filter::release_file(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-file-acquire", names: &["FsRtlAcquireFileExclusive", "FsRtlReleaseFile"], handlers: &[acquire_file_exclusive, release_file], data_exports: &[] };
+}
+
+pub mod fsrtl_mup_provider {
+    //! FsRtlMupGetProviderIdFromName e FsRtlMupGetProviderInfoFromFileObject:
+    //! o despacho pela tabela do MUP mora em `fsrtl/small::mup_calls`.
+
+    use crate::ntos::fsrtl::small::mup_calls;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlMupGetProviderIdFromName(ProviderName, ProviderId) -> NTSTATUS.
+    fn provider_id_from_name(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(mup_calls::provider_id_from_name(call.arg(1), call.arg(2))))
+    }
+
+    /// FsRtlMupGetProviderInfoFromFileObject(FileObject, Level, Buffer, BufferSize) -> NTSTATUS.
+    fn provider_info_from_file_object(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(mup_calls::provider_info_from_file_object(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-mup-provider",
+        names: &["FsRtlMupGetProviderIdFromName", "FsRtlMupGetProviderInfoFromFileObject"],
+        handlers: &[provider_id_from_name, provider_info_from_file_object],
+        data_exports: &[],
+    };
+}

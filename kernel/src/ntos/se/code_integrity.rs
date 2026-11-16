@@ -29,12 +29,20 @@ use core::mem::offset_of;
 struct CiCallbacks {
     /// Tamanho da tabela, informado pelo kernel.
     size: Field<u32>,
-    _reserved_04: Reserved<0x14>,
+    _reserved_04: Reserved<0x4>,
+    /// Grava o nível de assinatura em cache de um arquivo (o
+    /// NtSetCachedSigningLevel2 o chama).
+    set_file_cache: Field<u64>,
+    /// Lê o nível de assinatura em cache (o SeGetCachedSigningLevel).
+    get_file_cache: Field<u64>,
     /// CiQueryInformation (SystemCodeIntegrityInformation).
     query_information: Field<u64>,
     /// CiValidateImageHeader.
     validate_image_header: Field<u64>,
-    _reserved_28: Reserved<0x38>,
+    _reserved_28: Reserved<0x18>,
+    /// Compara dois níveis de assinatura (o SeCompareSigningLevels).
+    compare_signing_levels: Field<u64>,
+    _reserved_48: Reserved<0x18>,
     /// CiInitializePolicy.
     initialize_policy: Field<u64>,
     _reserved_68: Reserved<0x8>,
@@ -98,7 +106,10 @@ unsafe impl NtStruct for ImageRequest {}
 
 const _: () = {
     assert!(core::mem::size_of::<CiCallbacks>() == 0xE8);
+    assert!(offset_of!(CiCallbacks, set_file_cache) == 0x08);
+    assert!(offset_of!(CiCallbacks, get_file_cache) == 0x10);
     assert!(offset_of!(CiCallbacks, query_information) == 0x18);
+    assert!(offset_of!(CiCallbacks, compare_signing_levels) == 0x40);
     assert!(offset_of!(CiCallbacks, validate_image_header) == 0x20);
     assert!(offset_of!(CiCallbacks, initialize_policy) == 0x60);
     assert!(offset_of!(CiCallbacks, required_signing_level) == 0x70);
@@ -419,6 +430,31 @@ pub fn validate_dynamic_code_pages(context: u64, mdl: u64, address: u64, size: u
 /// A CI publicou o CiValidateDynamicCodePages.
 pub fn dynamic_code_validator_present() -> bool {
     callback(|table| &table.validate_dynamic_code_pages).is_ok()
+}
+
+/// Os slots da SeCiCallbacks dos níveis de assinatura em cache.
+#[derive(Clone, Copy)]
+pub enum SigningCallback {
+    SetFileCache,
+    GetFileCache,
+    CompareSigningLevels,
+}
+
+/// O slot como o kernel o lê antes de chamar: 0 antes do CiInitialize (no
+/// NT a SeCiCallbacks é estática e começa zerada).
+pub fn signing_callback(slot: SigningCallback) -> u64 {
+    let callbacks = STATE.lock().callbacks;
+    if callbacks == 0 {
+        return 0;
+    }
+    // SAFETY: tabela própria de 0xE8 bytes, viva enquanto a CI estiver carregada.
+    let table = unsafe { CiCallbacks::at(callbacks) };
+    match slot {
+        SigningCallback::SetFileCache => &table.set_file_cache,
+        SigningCallback::GetFileCache => &table.get_file_cache,
+        SigningCallback::CompareSigningLevels => &table.compare_signing_levels,
+    }
+    .get()
 }
 
 /// Carrega a ci.dll, chama o CiInitialize com os provedores privados reais,

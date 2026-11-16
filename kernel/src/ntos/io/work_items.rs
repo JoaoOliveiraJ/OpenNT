@@ -138,6 +138,17 @@ pub fn queue_work_item_ex(item: u64, routine: u64, queue_type: u32, context: u64
     push(&mut queue, item, if extended { Kind::IoEx } else { Kind::Io });
 }
 
+/// IoQueueWorkItemToNode(IoWorkItem, WorkerRoutine, QueueType, Context,
+/// NodeNumber) (RVA 0x506e00): o IoQueueWorkItemEx num nó NUMA. O
+/// ExpQueueWorkItem troca um nó fora de KeNumberNodes pelo da CPU corrente
+/// e só recusa (FALSE, com o IoObject desreferenciado) quando o pool de
+/// workers do nó não está pronto; o OpenNT tem um nó, cuja fila sempre
+/// aceita: o item entra como o do IoQueueWorkItemEx e o resultado é TRUE.
+pub fn queue_work_item_to_node(item: u64, routine: u64, queue_type: u32, context: u64, _node: u32) -> bool {
+    queue_work_item_ex(item, routine, queue_type, context, true);
+    true
+}
+
 pub fn queue_work_item(item: u64, routine: u64, queue_type: u32, context: u64) {
     queue_work_item_ex(item, routine, queue_type, context, false);
 }

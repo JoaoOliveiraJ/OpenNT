@@ -4,6 +4,8 @@
 //! - `mobile_os` — FsRtlIsMobileOS (RVA 0x6a6490)
 //! - `driver_backing` — FsRtlSetDriverBacking (RVA 0x780880)
 //! - `app_termination` — FsRtlSendModernAppTermination (RVA 0x3c0110)
+//! - `mup_calls` — FsRtlMupGetProviderIdFromName (RVA 0x88b740) e
+//!   FsRtlMupGetProviderInfoFromFileObject (RVA 0x88b770) pela tabela do MUP
 
 /// O FCB do FILE_OBJECT marcado como arquivo de paginação.
 pub mod paging_file {
@@ -114,5 +116,44 @@ pub mod app_termination {
         };
         guest::free_bytes(scratch);
         status
+    }
+}
+
+/// A tabela de rotinas do MUP (pFsRtlpMupCalls): o mup.sys a publica com
+/// FsRtlRegisterMupCalls (`xchg` de um ponteiro, RVA 0x7d5630) e o FsRtl
+/// despacha por ela as consultas de provedor de rede. Entrada 0:
+/// GetProviderInfoFromFileObject(FileObject, Level, Buffer, BufferSize);
+/// entrada 1: GetProviderIdFromName(ProviderName, ProviderId). Sem tabela,
+/// STATUS_NOT_SUPPORTED.
+pub mod mup_calls {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::hal::amd64::native_call;
+    use crate::ntos::inc::field::{Field, NtStruct};
+
+    pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+    static MUP_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// FsRtlRegisterMupCalls(Callbacks) -> a tabela anterior.
+    pub fn register(table: u64) -> u64 {
+        MUP_CALLS.swap(table, Ordering::SeqCst)
+    }
+
+    fn routine(index: u64) -> Option<u64> {
+        let table = MUP_CALLS.load(Ordering::SeqCst);
+        // SAFETY: a tabela de ponteiros de função publicada pelo MUP.
+        (table != 0).then(|| unsafe { Field::<u64>::at(table + index * 8) }.get())
+    }
+
+    /// FsRtlMupGetProviderIdFromName(ProviderName, ProviderId).
+    pub fn provider_id_from_name(name: u64, provider_id: u64) -> u32 {
+        routine(1).map_or(STATUS_NOT_SUPPORTED, |call| native_call::call(call, &[name, provider_id]) as u32)
+    }
+
+    /// FsRtlMupGetProviderInfoFromFileObject(FileObject, Level, Buffer,
+    /// BufferSize*): os quatro registradores seguem intactos para o MUP.
+    pub fn provider_info_from_file_object(file_object: u64, level: u64, buffer: u64, buffer_size: u64) -> u32 {
+        routine(0).map_or(STATUS_NOT_SUPPORTED, |call| native_call::call(call, &[file_object, level, buffer, buffer_size]) as u32)
     }
 }

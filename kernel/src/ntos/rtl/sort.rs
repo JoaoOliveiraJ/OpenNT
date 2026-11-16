@@ -1,8 +1,11 @@
-//! qsort do CRT do kernel.
+//! qsort e qsort_s do CRT do kernel.
 //!
 //! Ordena registros na memória do convidado. O comparador nativo recebe
 //! endereços do próprio array; copiar elementos para buffers auxiliares
-//! mudaria esse contrato.
+//! mudaria esse contrato. O qsort_s (ntoskrnl 19041, 0x3d27a0) é o mesmo
+//! algoritmo, com o Context como primeiro argumento do comparador; Base
+//! NULL com Num != 0, Width 0 ou Compare NULL são parâmetro inválido (o
+//! tratador do kernel volta e nada é ordenado).
 
 use alloc::vec;
 
@@ -13,9 +16,21 @@ pub fn sort_elements(base: u64, count: u64, element_size: u64, comparator: u64) 
     if count < 2 || element_size == 0 {
         return; // qsort é void
     }
-    let element = |index: i64| base.wrapping_add((index as u64).wrapping_mul(element_size));
     // O contrato devolve int: os bits altos de RAX não definem o sinal.
-    let compare = |left: i64, right: i64| native_call::call(comparator, &[element(left), element(right), 0, 0]) as i32;
+    sort_with(base, count, element_size, |left, right| native_call::call(comparator, &[left, right, 0, 0]) as i32);
+}
+
+/// qsort_s(Base, Num, Width, Compare, Context).
+pub fn sort_elements_s(base: u64, count: u64, element_size: u64, comparator: u64, context: u64) {
+    if (base == 0 && count != 0) || element_size == 0 || comparator == 0 || count < 2 {
+        return;
+    }
+    sort_with(base, count, element_size, |left, right| native_call::call(comparator, &[context, left, right, 0]) as i32);
+}
+
+fn sort_with(base: u64, count: u64, element_size: u64, comparator: impl Fn(u64, u64) -> i32) {
+    let element = |index: i64| base.wrapping_add((index as u64).wrapping_mul(element_size));
+    let compare = |left: i64, right: i64| comparator(element(left), element(right));
     let swap = |left: i64, right: i64| {
         if left == right {
             return;

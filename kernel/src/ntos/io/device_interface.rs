@@ -1,5 +1,6 @@
-//! Interfaces de dispositivo — IoRegisterDeviceInterface e
-//! IoSetDeviceInterfaceState.
+//! Interfaces de dispositivo — IoRegisterDeviceInterface,
+//! IoSetDeviceInterfaceState, IoOpenDeviceInterfaceRegistryKey e
+//! IoGetDeviceInterfaceAlias.
 //!
 //! Cada interface é um link `\DosDevices\#{guid}` para o dispositivo,
 //! registrada desabilitada; habilitar ou desabilitar dispara as
@@ -40,6 +41,14 @@ fn guid_string(bytes: &[u8]) -> String {
     format!("{{{data1:08x}-{data2:04x}-{data3:04x}-{:02x}{:02x}-{tail}}}", bytes[8], bytes[9])
 }
 
+/// O nome do link de interface sem a referência (`...#{guid}`).
+fn symbolic_link_base(link: &str) -> &str {
+    match link.find("}\\") {
+        Some(end) => &link[..=end],
+        None => link,
+    }
+}
+
 /// IoRegisterDeviceInterface(PDO, Guid, ReferenceString, SymbolicLinkName).
 /// Num PDO da árvore do PnP o link é o do NT,
 /// `\??\<instância com '\' trocado por '#'>#{guid}[\referência]`, apontando
@@ -71,10 +80,15 @@ pub fn register_device_interface(physical: u64, guid: u64, reference: u64, outpu
             write_text_value(&format!("{DEVICE_CLASSES}\\{class}\\{subkey}"), "SymbolicLink", &format!("\\\\?\\{}", &link[4..]))?;
         }
     }
-    // Um link já registrado (o mesmo PDO pedindo a mesma interface) é reusado.
-    let known = DEVICE_INTERFACES.lock().contains_key(&link);
+    // O link simbólico do Object Manager tem o nome sem a referência: quem
+    // abre `<link>\<referência>` chega ao PDO com a referência como resto do
+    // nome (o FileName do IRP_MJ_CREATE), como no NT. Um link já registrado
+    // (o mesmo PDO pedindo a mesma interface, com qualquer referência) é
+    // reusado.
+    let base = symbolic_link_base(&link);
+    let known = DEVICE_INTERFACES.lock().keys().any(|registered| symbolic_link_base(registered) == base);
     if !known {
-        if let Err(error) = object_manager::create_symlink(&link, &target) {
+        if let Err(error) = object_manager::create_symlink(base, &target) {
             return device::kernel_status(error);
         }
     }
@@ -240,4 +254,104 @@ pub fn open_interface_registry_key(link_pointer: u64, output: u64) -> Result<u32
     // SAFETY: PHANDLE de saída do chamador de modo kernel.
     unsafe { crate::ntos::inc::types::Field::<u64>::at(output) }.set(handle);
     Ok(0)
+}
+
+// ---- IoGetDeviceInterfaceAlias (ntoskrnl 19041 0x72bdf0) ---------------------
+//
+// IoGetDeviceInterfaceAlias(SymbolicLinkName, AliasInterfaceClassGuid,
+// AliasSymbolicLinkName): UNICODE_STRING NULL, sem Buffer ou vazia, ou nome
+// que o _CmValidateDeviceInterfaceName recusa = STATUS_INVALID_PARAMETER (o
+// filtro obrigatório do PiPnpRtl deixa o chamador de kernel ver toda
+// interface). Sob o PnpRegistryDeviceResource: a instância do dispositivo
+// dono (DEVPKEY_Device_InstanceId da interface, o DeviceInstance da chave
+// da interface em DeviceClasses; tipo que não é DEVPROP_TYPE_STRING =
+// STATUS_INVALID_PARAMETER_1), a referência (o que vem depois da barra do
+// nome) e o prefixo do link ("\??\" ou "\\?\", o CmGetDeviceInterfacePathFormat)
+// montam o nome da interface irmã pelo _CmGetDeviceInterfaceName: prefixo +
+// instância + "#" + GUID da classe pedida (em minúsculas), com '\' e '/'
+// depois do prefixo trocados por '#', e "\" + referência (referência com
+// barra = STATUS_OBJECT_NAME_INVALID, mais de 0x102 caracteres =
+// STATUS_INVALID_PARAMETER). A interface irmã precisa estar registrada (a
+// chave da referência, o _CmOpenDeviceInterfaceRegKey tipo 0x30); senão o
+// buffer devolvido é liberado (RtlFreeAnsiString zera o UNICODE_STRING) e o
+// status da abertura volta. Em sucesso o nome fica num buffer do PagedPool
+// ('Pp  ') que o chamador libera.
+
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
+const REG_SZ: u32 = 1;
+/// 'Pp  '.
+const TAG_PNP: u32 = 0x2020_7050;
+const PAGED_POOL: u32 = 1;
+/// Referência mais longa que o _CmGetDeviceInterfaceName aceita.
+const MAXIMUM_REFERENCE: usize = 0x102;
+
+/// IoGetDeviceInterfaceAlias: devolve o NTSTATUS.
+pub fn interface_alias(link_pointer: u64, alias_class: u64, output: u64) -> Result<u32, KernelError> {
+    if link_pointer == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: PUNICODE_STRING do chamador de modo kernel.
+    let link = unsafe { UnicodeString::at(link_pointer) };
+    if link.buffer.get() == 0 || link.length.get() == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let units = guest_strings::try_read_unicode_units(link_pointer)?;
+    let Ok((class, subkey)) = interface_subkey(&units) else { return Ok(STATUS_INVALID_PARAMETER) };
+    let interface = subkey.split('\\').next().unwrap_or_default();
+    let Some(instance) = cm_registry::read_value_by_path(&format!("{DEVICE_CLASSES}\\{class}\\{interface}"), "DeviceInstance") else { return Ok(0xC000_0034) };
+    if instance.value_type != REG_SZ {
+        return Ok(STATUS_INVALID_PARAMETER_1);
+    }
+    let instance: String = String::from_utf16_lossy(&instance.data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect::<Vec<u16>>());
+    let slash = units.iter().skip(4).position(|&unit| unit == b'\\' as u16).map(|index| index + 4);
+    let reference = slash.map(|index| String::from_utf16_lossy(&units[index + 1..]));
+    let prefix = String::from_utf16_lossy(&units[..4]);
+    let alias_guid = guid_string(&guest::read_bytes(alias_class, Guid::SIZE as usize));
+    if let Some(reference) = &reference {
+        if reference.encode_utf16().count() > MAXIMUM_REFERENCE {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        if reference.contains(['\\', '/']) {
+            return Ok(STATUS_OBJECT_NAME_INVALID);
+        }
+    }
+    let body: String = format!("{instance}#{alias_guid}").chars().map(|character| if character == '\\' || character == '/' { '#' } else { character }).collect();
+    let mut alias = format!("{prefix}{body}");
+    if let Some(reference) = &reference {
+        alias = format!("{alias}\\{reference}");
+    }
+    let alias_units: Vec<u16> = alias.encode_utf16().collect();
+    let length = alias_units.len() as u64 * 2;
+    if length > 0xFFFC {
+        return Ok(STATUS_NAME_TOO_LONG);
+    }
+    let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(PAGED_POOL, (length + 2).max(0x400), TAG_PNP)?;
+    if buffer == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest_strings::write_wide_string(buffer, &alias);
+    // SAFETY: PUNICODE_STRING AliasSymbolicLinkName de saída do chamador de modo kernel.
+    let output_string = unsafe { UnicodeString::at(output) };
+    output_string.length.set(length as u16);
+    output_string.maximum_length.set(length as u16 + 2);
+    output_string.buffer.set(buffer);
+    let opened = match interface_subkey(&alias_units) {
+        Ok((alias_class_text, alias_subkey)) => {
+            let (status, handle) = key_services::open_path(&format!("{DEVICE_CLASSES}\\{alias_class_text}\\{alias_subkey}"), false)?;
+            if status == 0 {
+                cm_registry::close_handle(handle as u32);
+            }
+            status
+        }
+        Err(status) => status,
+    };
+    if opened != 0 {
+        crate::ntos::ex::pool_allocation::free(buffer, 0)?;
+        output_string.length.set(0);
+        output_string.maximum_length.set(0);
+        output_string.buffer.set(0);
+    }
+    Ok(opened)
 }

@@ -1524,3 +1524,73 @@ pub mod zw_create_wnf_state_name {
 
     pub static GROUP: Group = Group { name: "zw-create-wnf-state-name", names: &["ZwCreateWnfStateName"], handlers: &[create_state_name], data_exports: &[] };
 }
+
+pub mod ex_lookaside_flush {
+    //! ExFlushLookasideListEx; a lógica mora em `ex/lookaside`.
+
+    use crate::ntos::ex::lookaside;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExFlushLookasideListEx(Lookaside).
+    fn flush_lookaside_list_ex(call: &Call) -> Result<u64, KernelError> {
+        lookaside::flush_ex(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-lookaside-flush", names: &["ExFlushLookasideListEx"], handlers: &[flush_lookaside_list_ex], data_exports: &[] };
+}
+
+pub mod ex_boot_device {
+    //! ExRegisterBootDevice e ExNotifyBootDeviceRemoval; a lógica mora em
+    //! `ex/boot_device`.
+
+    use crate::ntos::ex::boot_device;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExRegisterBootDevice(Registration, Handle) -> NTSTATUS.
+    fn register_boot_device(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(boot_device::register(call.arg(1), call.arg(2))?))
+    }
+
+    /// ExNotifyBootDeviceRemoval(Handle) -> BOOLEAN.
+    fn notify_boot_device_removal(call: &Call) -> Result<u64, KernelError> {
+        Ok(boot_device::notify_removal(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-boot-device", names: &["ExRegisterBootDevice", "ExNotifyBootDeviceRemoval"], handlers: &[register_boot_device, notify_boot_device_removal], data_exports: &[] };
+}
+
+pub mod ex_set_firmware_variable {
+    //! ExSetFirmwareEnvironmentVariable; a lógica mora em
+    //! `hal/firmware_environment`, com a do ExGetFirmwareEnvironmentVariable.
+
+    use crate::hal::firmware_environment;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExSetFirmwareEnvironmentVariable(VariableName, VendorGuid, Value,
+    /// ValueLength, Attributes).
+    fn set_firmware_environment_variable(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(firmware_environment::set(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ex-set-firmware-variable", names: &["ExSetFirmwareEnvironmentVariable"], handlers: &[set_firmware_environment_variable], data_exports: &[] };
+}
+
+pub mod ex_nt_create_event {
+    //! NtCreateEvent no modo anterior do chamador; a lógica mora em
+    //! `ex/event`.
+
+    use crate::ntos::ex::event;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// NtCreateEvent(EventHandle, DesiredAccess, ObjectAttributes, EventType, InitialState).
+    fn nt_create_event(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(event::nt_create(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5) & 0xFF != 0, call.frame)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ex-nt-create-event", names: &["NtCreateEvent"], handlers: &[nt_create_event], data_exports: &[] };
+}

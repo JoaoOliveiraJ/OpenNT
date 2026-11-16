@@ -1,5 +1,6 @@
-//! Drivers embutidos (IoCreateDriver) — DRIVER_OBJECT criado pelo próprio
-//! kernel para um componente sem imagem de serviço (win32k.sys/win32kbase.sys).
+//! Drivers embutidos (IoCreateDriver e IoDeleteDriver) — DRIVER_OBJECT criado
+//! pelo próprio kernel para um componente sem imagem de serviço
+//! (win32k.sys/win32kbase.sys).
 //!
 //! Comportamento conferido contra o ntoskrnl 19041, IoCreateDriver rva 0x7a5250:
 //!   * DriverName NULL -> "\Driver\%08u" (formato em rva 0x7d7ab0) com
@@ -97,4 +98,11 @@ pub fn create(name_pointer: u64, initialize: u64) -> Result<u32, KernelError> {
         guest::free_bytes(service_buffer);
     }
     Ok(status)
+}
+
+/// IoDeleteDriver(DriverObject) (RVA 0x893aa0): o evento de descarga do
+/// provedor de threat intelligence do ETW (EtwTiLogDriverObjectUnLoad, sem
+/// consumidor no OpenNT) e o ObDereferenceObject do DRIVER_OBJECT.
+pub fn delete(driver: u64) -> Result<(), KernelError> {
+    crate::ntos::ob::object_reference::dereference_with_tag(driver, crate::ntos::ob::reference_trace::DEFAULT_TAG, true).map(|_| ())
 }

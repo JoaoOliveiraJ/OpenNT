@@ -47,6 +47,15 @@ pub fn job_silo(job: u64) -> u64 {
     job
 }
 
+/// PsGetParentSilo(Job): o primeiro silo acima do job (o PspGetJobSilo do
+/// ParentJob); NULL para um job nulo ou sem silo ancestral (o hospedeiro).
+pub fn parent_silo(job: u64) -> u64 {
+    if job == 0 {
+        return 0;
+    }
+    job_silo(ejob(job).parent_job.get())
+}
+
 pub fn effective_server_silo(silo: u64) -> u64 {
     let mut silo = silo;
     while silo != 0 && ejob(silo).server_silo_globals.get() == 0 {

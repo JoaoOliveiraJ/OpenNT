@@ -13,7 +13,8 @@
 //! handle pelo ObOpenObjectByPointer (`ob/open_pointer`), na tabela do
 //! System quando OBJ_KERNEL_HANDLE; as operações referenciam o handle com
 //! EVENT_MODIFY_STATE e o tipo do evento (ObReferenceObjectByHandle), chamam
-//! KeSetEvent/KeResetEvent/KeClearEvent e devolvem o estado anterior.
+//! KeSetEvent/KeResetEvent/KeClearEvent e devolvem o estado anterior. O
+//! export NtCreateEvent segue o modo anterior do chamador (`nt_create`).
 
 use alloc::string::String;
 
@@ -123,6 +124,24 @@ pub fn create(handle_output: u64, access: u32, attributes: u64, event_type: u32,
         dispatcher_objects::collect(pointer);
     }
     Ok(status)
+}
+
+/// NtCreateEvent chamado por código de kernel (o export Nt*): segue o modo
+/// anterior da thread, como o serviço do NT. Em KernelMode é a criação
+/// acima (a do ZwCreateEvent); em UserMode é o serviço de usuário
+/// (`ps/user/events`), que sonda o EventHandle, cria o handle na tabela do
+/// processo e lê o InitialState da pilha do chamador: o quadro da chamada
+/// (`frame`, o retorno em +0 e o quinto argumento em +0x28) é entregue como
+/// a pilha do serviço, como o despachante de serviços faz.
+pub fn nt_create(handle_output: u64, access: u32, attributes: u64, event_type: u32, initial_state: bool, frame: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::{index, state};
+    if crate::ntos::ps::previous_mode::get()? == 0 {
+        return create(handle_output, access, attributes, event_type, initial_state);
+    }
+    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 8 }) };
+    // SAFETY: o quadro da chamada nativa, na pilha de kernel do chamador.
+    let return_address = unsafe { Field::<u64>::at(frame) }.get();
+    state::with_syscall_record(record, || index::invoke_service("NtCreateEvent", [handle_output, access as u64, attributes, event_type as u64], return_address, frame))
 }
 
 /// Referencia o KEVENT do handle (ObReferenceObjectByHandle com

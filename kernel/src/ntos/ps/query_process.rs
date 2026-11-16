@@ -105,6 +105,70 @@ pub fn query_information(handle: u64, class: u32, output: u64, length: u32, retu
     Ok(0)
 }
 
+// ---- NtQueryInformationProcess (ntoskrnl 19041 rva 0x6216c0) --------------------
+//
+// O export Nt* usa o PreviousMode da thread. Em KernelMode é o mesmo serviço
+// do ZwQueryInformationProcess. Em UserMode o prólogo sonda os parâmetros
+// antes de qualquer classe: com ProcessInformationLength != 0, o buffer tem
+// de estar alinhado ao da classe (byte para 61, 70, 74 e 87; quadword para
+// 65, 92 e 94; ULONG para as demais), senão STATUS_DATATYPE_MISALIGNMENT, e
+// a faixa inteira abaixo de MmUserProbeAddress, senão
+// STATUS_ACCESS_VIOLATION; um ReturnLength é tocado para escrita (o ULONG em
+// min(ReturnLength, MmUserProbeAddress)). O handle de UserMode não pode ser
+// um handle de kernel (STATUS_INVALID_HANDLE do ObReferenceObjectByHandle).
+
+const STATUS_DATATYPE_MISALIGNMENT_PROBE: u32 = 0x8000_0002;
+const STATUS_ACCESS_VIOLATION_PROBE: u32 = 0xC000_0005;
+/// KernelMode/UserMode do KPROCESSOR_MODE.
+const USER_MODE: u8 = 1;
+
+/// O alinhamento que o prólogo exige do buffer da classe (máscara).
+fn information_alignment(class: u32) -> u64 {
+    match class {
+        61 | 70 | 74 | 87 => 0,
+        65 | 92 | 94 => 7,
+        _ => 3,
+    }
+}
+
+/// NtQueryInformationProcess(ProcessHandle, ProcessInformationClass,
+/// ProcessInformation, ProcessInformationLength, ReturnLength) no modo
+/// anterior `mode`: devolve o NTSTATUS.
+pub fn nt_query_information(handle: u64, class: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
+    if mode == USER_MODE {
+        use crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
+        if length != 0 {
+            if output & information_alignment(class) != 0 {
+                return Ok(STATUS_DATATYPE_MISALIGNMENT_PROBE);
+            }
+            let end = output.wrapping_add(length as u64);
+            if end > USER_PROBE_ADDRESS || end < output {
+                return Ok(STATUS_ACCESS_VIOLATION_PROBE);
+            }
+        }
+        if returned != 0 {
+            let probe = returned.min(USER_PROBE_ADDRESS);
+            if probe >= USER_PROBE_ADDRESS {
+                return Ok(STATUS_ACCESS_VIOLATION_PROBE);
+            }
+            match guest::try_read::<u32>(probe) {
+                Ok(value) => {
+                    if let Err(error) = guest::try_write::<u32>(probe, value) {
+                        return Ok(error.status);
+                    }
+                }
+                Err(error) => return Ok(error.status),
+            }
+        }
+        // As classes atendidas referenciam o handle: um handle de kernel
+        // (bit 63, fora os pseudo-handles) não vale em UserMode.
+        if matches!(class, 0 | 31 | 37) && (handle as i64) < -8 {
+            return Ok(STATUS_INVALID_HANDLE);
+        }
+    }
+    query_information(handle, class, output, length, returned)
+}
+
 // ---- PsQueryProcessCommandLine -------------------------------------------------
 //
 // Como o PsQueryProcessCommandLine do ntoskrnl 19041 (rva 0x3184e0): sob o

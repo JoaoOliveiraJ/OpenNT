@@ -1013,3 +1013,69 @@ pub mod ps_loaded_module_list {
         data_exports: &[("PsLoadedModuleList", loaded_images::module_list_cell), ("PsLoadedModuleResource", loaded_images::module_resource_cell)],
     };
 }
+
+pub mod mm_mdl_maps {
+    //! MmFreePagesFromMdlEx e MmMapMdl (`mm/mdl`) e MmMapMemoryDumpMdlEx
+    //! (`mm/dump_mdl`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::{dump_mdl, mdl};
+    use crate::rtl::KernelError;
+
+    /// MmFreePagesFromMdlEx(MemoryDescriptorList, Flags).
+    fn free_pages_from_mdl_ex(call: &Call) -> Result<u64, KernelError> {
+        mdl::free_pages_ex(call.arg(1), call.arg(2) as u32);
+        Ok(0)
+    }
+
+    /// MmMapMdl(Mdl, Protection, DriverRoutine, DriverContext) -> NTSTATUS.
+    fn map_mdl(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(mdl::map_mdl(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4))))
+    }
+
+    /// MmMapMemoryDumpMdlEx(Va, PageTotal, MemoryDumpMdl, Flags) -> NTSTATUS.
+    fn map_memory_dump_mdl_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(dump_mdl::map_at(call.arg(1), call.arg(3), call.arg(4) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-mdl-maps", names: &["MmFreePagesFromMdlEx", "MmMapMdl", "MmMapMemoryDumpMdlEx"], handlers: &[free_pages_from_mdl_ex, map_mdl, map_memory_dump_mdl_ex], data_exports: &[] };
+}
+
+pub mod mm_nonpaged_address {
+    //! MmIsNonPagedSystemAddressValid; a lógica mora em `mm/small`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::small;
+    use crate::rtl::KernelError;
+
+    /// MmIsNonPagedSystemAddressValid(VirtualAddress) -> BOOLEAN.
+    fn is_non_paged_system_address_valid(call: &Call) -> Result<u64, KernelError> {
+        Ok(small::is_non_paged_system_address_valid(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "mm-nonpaged-address", names: &["MmIsNonPagedSystemAddressValid"], handlers: &[is_non_paged_system_address_valid], data_exports: &[] };
+}
+
+pub mod mm_physical_remove_cache {
+    //! MmRemovePhysicalMemory (`mm/physical_layout`) e
+    //! MmSetPermanentCacheAttribute (`mm/io_space`).
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::{io_space, physical_layout};
+    use crate::rtl::KernelError;
+
+    /// MmRemovePhysicalMemory(StartAddress*, NumberOfBytes*) -> NTSTATUS.
+    fn remove_physical_memory(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PPHYSICAL_ADDRESS e PLARGE_INTEGER do chamador de modo kernel.
+        let (start, bytes) = unsafe { (Field::<u64>::at(call.arg(1)), Field::<u64>::at(call.arg(2))) };
+        Ok(signed_status(physical_layout::remove_physical_memory(start.get(), bytes.get())))
+    }
+
+    /// MmSetPermanentCacheAttribute(StartAddress, NumberOfBytes, CacheType, Flags) -> NTSTATUS.
+    fn set_permanent_cache_attribute(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(io_space::set_permanent_cache_attribute(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-physical-remove-cache", names: &["MmRemovePhysicalMemory", "MmSetPermanentCacheAttribute"], handlers: &[remove_physical_memory, set_permanent_cache_attribute], data_exports: &[] };
+}

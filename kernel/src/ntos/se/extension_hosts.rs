@@ -37,3 +37,19 @@ pub fn authorization_host() -> u64 {
 pub fn bcrypt_host() -> u64 {
     BCRYPT_HOST.load(SeqCst)
 }
+
+/// LsaFreeReturnBuffer(Buffer) (ntoskrnl 19041 rva 0x666530): a terceira
+/// função da tabela de autorização, sob o rundown do host, devolve o status
+/// dela; sem extensão registrada, STATUS_NOT_IMPLEMENTED.
+pub fn free_return_buffer(buffer: u64) -> Result<u32, KernelError> {
+    const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+    let host = authorization_host();
+    let table = extension_host::get_extension_table(host)?;
+    if table == 0 {
+        return Ok(STATUS_NOT_IMPLEMENTED);
+    }
+    let routine = crate::ntos::mm::guest_memory::read64(table + 0x10);
+    let status = crate::hal::amd64::native_call::call(routine, &[buffer]) as u32;
+    extension_host::release_extension_table(host)?;
+    Ok(status)
+}

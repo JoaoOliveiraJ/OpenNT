@@ -38,6 +38,7 @@ pub const STATUS_NOT_FOUND: u32 = 0xC000_0225;
 const IRP_EXTENSION_INLINE: u8 = 0x80;
 const IRP_EXTENSION_ALLOCATED: u8 = 0x40;
 const IRP_EXTENSION_TAG: u32 = 0x5870_7249; // 'IrpX'
+pub const IRP_EXTENSION_TIMESTAMP: u32 = 1;
 pub const IRP_EXTENSION_GENERIC: u32 = 2;
 pub const IRP_EXTENSION_ZEROING_OFFSET: u32 = 4;
 pub const IRP_EXTENSION_TRACK_OFFSET: u32 = 5;
@@ -237,6 +238,40 @@ pub fn irp_extension_combination_valid(irp: u64, kind: u32) -> bool {
     extension.fs_track_offset_blob.set(0);
     extension.types_allocated.set(types & 0xFFFE);
     true
+}
+
+/// Timestamp da extensão de tipo 1 (a união de +0x28), ou `None` sem ela.
+pub fn irp_timestamp(irp: u64) -> Option<&'static Field<i64>> {
+    if !irp_has_extension_type(irp, IRP_EXTENSION_TIMESTAMP) {
+        return None;
+    }
+    Some(&extension_at(irp_extension(irp)).timestamp.quad_part)
+}
+
+/// IopFreeIrpExtension(Irp, Type, TRUE) para um tipo da união sem estado
+/// externo (o Timestamp): limpa o bit do tipo e, sem outro tipo, devolve a
+/// extensão alocada ao pool. O tipo 5 (FsTrackOffset) e o 9 (cópia) têm
+/// limpeza própria no NT e não passam por aqui.
+pub fn free_irp_extension_type(irp: u64, kind: u32) -> Result<(), KernelError> {
+    let packet = irp_at(irp);
+    let flags = packet.allocation_flags.get();
+    if flags & IRP_EXTENSION_INLINE != 0 {
+        packet.irp_extension().set(0);
+        packet.allocation_flags.set(flags & 0x7F);
+        return Ok(());
+    }
+    let address = packet.irp_extension().get();
+    if address == 0 {
+        return Ok(());
+    }
+    let types = &extension_at(address).types_allocated;
+    types.set(types.get() & !(1u16 << kind));
+    if types.get() == 0 && flags & IRP_EXTENSION_ALLOCATED != 0 {
+        kernel_pool::free(address, Some(IRP_EXTENSION_TAG))?;
+        packet.allocation_flags.set(flags & !IRP_EXTENSION_ALLOCATED);
+        packet.irp_extension().set(0);
+    }
+    Ok(())
 }
 
 /// IopFreeIrpExtension(Irp, -1, TRUE) no IoFreeIrp: limpa a genérica

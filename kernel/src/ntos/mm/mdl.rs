@@ -209,6 +209,14 @@ pub fn free_mapping_address(address: u64) {
     guest::free_bytes(address);
 }
 
+/// A faixa [address, address + bytes) cabe numa reserva viva de
+/// MmAllocateMappingAddress.
+pub fn reserved_mapping_covers(address: u64, bytes: u64) -> bool {
+    let Some(end) = address.checked_add(bytes) else { return false };
+    let reservations = RESERVED_MAPPINGS.lock();
+    reservations.range(..=address).next_back().is_some_and(|(&base, &(size, _))| end <= base + size)
+}
+
 /// MmMapLockedPagesWithReservedMapping — exige a VA reservada e remapeia as
 /// páginas dela para as do MDL; 0 em falha.
 pub fn map_locked_pages_with_reserved_mapping(address: u64, descriptor: u64) -> u64 {
@@ -286,6 +294,99 @@ pub fn free_pages(descriptor: u64) {
             pfn::free_page(frame * 0x1000);
         }
     }
+}
+
+// ---- MmFreePagesFromMdlEx e MmMapMdl -----------------------------------------
+//
+// Como no ntoskrnl 19041:
+// - MmFreePagesFromMdlEx(Mdl, Flags) (rva 0x381a10): Flags além de
+//   MM_FREE_MDL_PAGES_ZERO (1) ou ByteCount fora de página é o bugcheck
+//   MEMORY_MANAGEMENT (0x1A) com 0x1302, Mdl, Flags e ByteCount. O
+//   MiFreePagesFromMdl zera as páginas antes de devolvê-las quando a flag
+//   pede (salvo num MDL com MDL_FREE_EXTRA_PTES, que não zera), desfaz o
+//   mapeamento de sistema do MDL e devolve as páginas.
+// - MmMapMdl(Mdl, Protection, DriverRoutine, DriverContext) (rva 0x5374f0):
+//   a proteção passa pelo MiMakeProtectionMask e só leitura ou leitura e
+//   escrita, com ou sem PAGE_NOCACHE/PAGE_WRITECOMBINE, servem (inválida,
+//   NOACCESS, WRITECOPY, executável ou PAGE_GUARD é
+//   STATUS_INVALID_PAGE_PROTECTION). Um MDL já mapeado ou de pool não
+//   paginado chama DriverRoutine(DriverContext, MappedSystemVa) direto;
+//   senão as páginas do MDL ganham PTEs de sistema novos com a proteção
+//   pedida (sem PTEs é STATUS_INSUFFICIENT_RESOURCES), a rotina recebe a VA
+//   (+ ByteOffset) e os PTEs são liberados na volta, sem tocar no MDL. No
+//   OpenNT os PTEs de sistema são uma faixa reservada da janela do heap,
+//   como a do MmAllocateMappingAddress.
+
+const MM_FREE_MDL_PAGES_ZERO: u32 = 1;
+const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_0045;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+/// Tag do MiReservePtes do OpenNT para os PTEs do MmMapMdl ('MmMd').
+const MAP_MDL_TAG: u32 = 0x644D_6D4D;
+
+/// ADDRESS_AND_SIZE_TO_SPAN_PAGES(StartVa + ByteOffset, ByteCount).
+fn span_pages(descriptor: &Mdl) -> u64 {
+    let start = (descriptor.start_va.get() as u32).wrapping_add(descriptor.byte_offset.get()) & 0xFFF;
+    (descriptor.byte_count.get() as u64 + 0xFFF + start as u64) >> 12
+}
+
+/// O zeramento do MiFreePagesFromMdl: cada página que o MDL abrange.
+pub fn zero_pages(descriptor: u64) {
+    let header = mdl(descriptor);
+    for frame in pfn_array(header, span_pages(header)) {
+        crate::hal::physical::zero(frame.get() * 0x1000, 0x1000);
+    }
+}
+
+/// MmFreePagesFromMdlEx(Mdl, Flags).
+pub fn free_pages_ex(descriptor: u64, flags: u32) {
+    let header = mdl(descriptor);
+    let byte_count = header.byte_count.get();
+    if flags & !MM_FREE_MDL_PAGES_ZERO != 0 || byte_count & 0xFFF != 0 {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x1A, 0x1302, descriptor, flags as u64, byte_count as u64);
+    }
+    if flags & MM_FREE_MDL_PAGES_ZERO != 0 && header.mdl_flags.get() & MDL_FREE_EXTRA_PTES == 0 {
+        zero_pages(descriptor);
+    }
+    if header.mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0 {
+        unmap_locked_pages(descriptor);
+    }
+    free_pages(descriptor);
+}
+
+/// Bits de cache da folha para a máscara de proteção (`mask >> 3`: 0
+/// cacheado, 1 não cacheado, 3 write-combine).
+fn mask_cache_flags(mask: u32) -> u64 {
+    match mask >> 3 {
+        1 => 0x18,
+        3 => 0x80,
+        _ => 0,
+    }
+}
+
+/// MmMapMdl: devolve o NTSTATUS.
+pub fn map_mdl(descriptor: u64, protection: u32, routine: u64, context: u64) -> u32 {
+    let Some(mask) = super::protection::make_mask(protection) else { return STATUS_INVALID_PAGE_PROTECTION };
+    // 0x18 sozinho é a máscara de PAGE_NOACCESS.
+    if mask == 0x18 || mask & 7 == 5 || mask & 2 != 0 || mask & !7 == super::protection::MASK_GUARD {
+        return STATUS_INVALID_PAGE_PROTECTION;
+    }
+    let header = mdl(descriptor);
+    if header.mdl_flags.get() & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL) != 0 {
+        crate::hal::amd64::native_call::call(routine, &[context, header.mapped_system_va.get()]);
+        return 0;
+    }
+    let pages = span_pages(header);
+    let base = allocate_mapping_address(pages * 0x1000, MAP_MDL_TAG);
+    if base == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let flags = paging::PAGE_PRESENT | if mask & 7 == 4 { paging::PAGE_RW } else { 0 } | mask_cache_flags(mask);
+    let mapped = pfn_array(header, pages).iter().enumerate().all(|(index, frame)| paging::map_page(base + index as u64 * 0x1000, frame.get() * 0x1000, flags, paging::MapOptions { nx: true, ..paging::MapOptions::default() }));
+    if mapped {
+        crate::hal::amd64::native_call::call(routine, &[context, base + header.byte_offset.get() as u64]);
+    }
+    free_mapping_address(base);
+    if mapped { 0 } else { STATUS_INSUFFICIENT_RESOURCES }
 }
 
 // ---- MDL Ex: alocação por faixa/nó, MmCreateMdl, estado do conteúdo e

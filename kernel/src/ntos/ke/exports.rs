@@ -1275,3 +1275,39 @@ pub mod ke_affinity_ex {
         data_exports: &[],
     };
 }
+
+pub mod ke_alert_thread {
+    //! KeAlertThread; a lógica mora em `ke/thread_alert`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::thread_alert;
+    use crate::rtl::KernelError;
+
+    /// KeAlertThread(Thread, AlertMode) -> BOOLEAN (o Alerted[AlertMode] anterior).
+    fn alert_thread(call: &Call) -> Result<u64, KernelError> {
+        Ok(thread_alert::alert(call.arg(1), call.arg(2) as u8)? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-alert-thread", names: &["KeAlertThread"], handlers: &[alert_thread], data_exports: &[] };
+}
+
+pub mod ke_triage_dump_data {
+    //! KeInitializeTriageDumpDataArray e KeAddTriageDumpDataBlock; a lógica
+    //! mora em `ke/triage_dump_data`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ke::triage_dump_data;
+    use crate::rtl::KernelError;
+
+    /// KeInitializeTriageDumpDataArray(KtriageDumpDataArray, Size) -> NTSTATUS.
+    fn initialize_triage_dump_data_array(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(triage_dump_data::initialize(call.arg(1), call.arg(2) as u32)))
+    }
+
+    /// KeAddTriageDumpDataBlock(KtriageDumpDataArray, Address, Size) -> NTSTATUS.
+    fn add_triage_dump_data_block(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(triage_dump_data::add_block(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ke-triage-dump-data", names: &["KeInitializeTriageDumpDataArray", "KeAddTriageDumpDataBlock"], handlers: &[initialize_triage_dump_data_array, add_triage_dump_data_block], data_exports: &[] };
+}

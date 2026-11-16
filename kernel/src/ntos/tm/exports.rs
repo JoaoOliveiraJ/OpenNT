@@ -154,3 +154,19 @@ pub mod tm_extension {
         data_exports: &[],
     };
 }
+
+pub mod tm_query_transaction {
+    //! ZwQueryInformationTransaction do KTM ausente; a lógica mora em
+    //! `tm::extension`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::tm::extension;
+    use crate::rtl::KernelError;
+
+    /// ZwQueryInformationTransaction(Handle, Class, Information, Length, ReturnLength).
+    fn query_information_transaction(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(extension::query_information_transaction(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5))))
+    }
+
+    pub static GROUP: Group = Group { name: "tm-query-transaction", names: &["ZwQueryInformationTransaction"], handlers: &[query_information_transaction], data_exports: &[] };
+}

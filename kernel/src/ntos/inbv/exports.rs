@@ -24,3 +24,24 @@ pub mod inbv_display_ownership {
         data_exports: &[],
     };
 }
+
+pub mod inbv_boot_driver {
+    //! InbvCheckDisplayOwnership e InbvEnableBootDriver.
+
+    use crate::ntos::inbv::display;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// InbvCheckDisplayOwnership() -> BOOLEAN.
+    fn check_display_ownership(_: &Call) -> Result<u64, KernelError> {
+        Ok(display::check_display_ownership() as u64)
+    }
+
+    /// InbvEnableBootDriver(BOOLEAN Enable).
+    fn enable_boot_driver(call: &Call) -> Result<u64, KernelError> {
+        display::enable_boot_driver(call.arg(1) & 0xFF != 0);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "inbv-boot-driver", names: &["InbvCheckDisplayOwnership", "InbvEnableBootDriver"], handlers: &[check_display_ownership, enable_boot_driver], data_exports: &[] };
+}

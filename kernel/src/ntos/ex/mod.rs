@@ -30,6 +30,7 @@ pub mod timer;
 pub mod timer_object;
 pub mod uuid;
 pub mod event;
+pub mod boot_device;
 pub mod extension_host;
 pub mod system_time;
 pub mod interlocked_list;

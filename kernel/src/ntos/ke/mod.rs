@@ -44,6 +44,7 @@ pub mod wait;
 pub mod cache_flush;
 pub mod timer2;
 pub mod device_queue;
+pub mod triage_dump_data;
 
 /// As APCs de kernel da thread corrente, em PASSIVE_LEVEL: as da fila dela e
 /// as conclusões de E/S que só o contexto dela termina (o papel da APC

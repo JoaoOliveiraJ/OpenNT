@@ -2172,3 +2172,127 @@ pub mod io_interface_key_keep_alive {
         data_exports: &[],
     };
 }
+
+pub mod io_file_object_origin {
+    //! IoIsFileObjectIgnoringSharing (`io/share_access`), IoSetFileOrigin e
+    //! IoIsInitiator32bitProcess (`io/irp_request`).
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::FileObject;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::{irp_request, share_access};
+    use crate::rtl::KernelError;
+
+    fn file_object(address: u64) -> &'static FileObject {
+        // SAFETY: FILE_OBJECT vivo do chamador de modo kernel.
+        unsafe { FileObject::at(address) }
+    }
+
+    /// IoIsFileObjectIgnoringSharing(FileObject) -> BOOLEAN.
+    fn is_file_object_ignoring_sharing(call: &Call) -> Result<u64, KernelError> {
+        Ok(share_access::is_file_object_ignoring_sharing(file_object(call.arg(1))) as u64)
+    }
+
+    /// IoSetFileOrigin(FileObject, Remote) -> NTSTATUS.
+    fn set_file_origin(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(irp_request::set_file_origin(file_object(call.arg(1)), call.arg(2) as u8 != 0)))
+    }
+
+    /// IoIsInitiator32bitProcess(Irp) -> BOOLEAN.
+    fn is_initiator_32bit_process(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_request::is_initiator_32bit_process(call.arg(1)) as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-file-object-origin",
+        names: &["IoIsFileObjectIgnoringSharing", "IoSetFileOrigin", "IoIsInitiator32bitProcess"],
+        handlers: &[is_file_object_ignoring_sharing, set_file_origin, is_initiator_32bit_process],
+        data_exports: &[],
+    };
+}
+
+pub mod io_work_item_node {
+    //! IoQueueWorkItemToNode; a lógica mora em `io/work_items`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::work_items;
+    use crate::rtl::KernelError;
+
+    /// IoQueueWorkItemToNode(IoWorkItem, WorkerRoutine, QueueType, Context, NodeNumber) -> BOOLEAN.
+    fn queue_work_item_to_node(call: &Call) -> Result<u64, KernelError> {
+        Ok(work_items::queue_work_item_to_node(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "io-work-item-node", names: &["IoQueueWorkItemToNode"], handlers: &[queue_work_item_to_node], data_exports: &[] };
+}
+
+pub mod io_delete_driver {
+    //! IoDeleteDriver; a lógica mora em `io/builtin_driver`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::builtin_driver;
+    use crate::rtl::KernelError;
+
+    /// IoDeleteDriver(DriverObject).
+    fn delete_driver(call: &Call) -> Result<u64, KernelError> {
+        builtin_driver::delete(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-delete-driver", names: &["IoDeleteDriver"], handlers: &[delete_driver], data_exports: &[] };
+}
+
+pub mod io_tracking {
+    //! IoRegisterIoTracking e IoUnregisterIoTracking; a lógica mora em
+    //! `io/io_perf`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::io_perf;
+    use crate::rtl::KernelError;
+
+    /// IoRegisterIoTracking(Parameters, Handle*) -> NTSTATUS.
+    fn register_io_tracking(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PVOID* de saída do chamador de modo kernel.
+        let handle = unsafe { Field::<u64>::at(call.arg(2)) };
+        Ok(signed_status(io_perf::register(call.arg(1), handle)?))
+    }
+
+    /// IoUnregisterIoTracking(Handle).
+    fn unregister_io_tracking(call: &Call) -> Result<u64, KernelError> {
+        io_perf::unregister(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-tracking", names: &["IoRegisterIoTracking", "IoUnregisterIoTracking"], handlers: &[register_io_tracking, unregister_io_tracking], data_exports: &[] };
+}
+
+pub mod io_device_directory {
+    //! IoGetDeviceDirectory; a lógica mora em `io/state_directory`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::state_directory;
+    use crate::rtl::KernelError;
+
+    /// IoGetDeviceDirectory(PhysicalDeviceObject, DirectoryType, Flags, Reserved, DeviceDirectoryHandle) -> NTSTATUS.
+    fn get_device_directory(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(state_directory::device_directory(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "io-device-directory", names: &["IoGetDeviceDirectory"], handlers: &[get_device_directory], data_exports: &[] };
+}
+
+pub mod io_interface_alias {
+    //! IoGetDeviceInterfaceAlias; a lógica mora em `io/device_interface`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::device_interface;
+    use crate::rtl::KernelError;
+
+    /// IoGetDeviceInterfaceAlias(SymbolicLinkName, AliasInterfaceClassGuid, AliasSymbolicLinkName) -> NTSTATUS.
+    fn get_device_interface_alias(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_interface::interface_alias(call.arg(1), call.arg(2), call.arg(3))?))
+    }
+
+    pub static GROUP: Group = Group { name: "io-interface-alias", names: &["IoGetDeviceInterfaceAlias"], handlers: &[get_device_interface_alias], data_exports: &[] };
+}

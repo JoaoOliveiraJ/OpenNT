@@ -219,6 +219,32 @@ pub fn change_option(option: u32, in_buffer_bytes: u32, in_buffer: u64, out_buff
     status
 }
 
+/// KdPollBreakIn: o host pediu parada? Como no ntoskrnl 19041, com
+/// KdPitchDebugger (sem depurador no boot) ou KdDebuggerEnabled desligado é
+/// FALSE (o OpenNT não tem o registro de eventos do KD); senão, com as
+/// interrupções mascaradas e a trava do transporte tomada sem esperar (o
+/// KxTryToAcquireSpinLock(KdDebuggerLock)), pergunta ao transporte se há
+/// pedido do host (o KdReceivePacket(PACKET_TYPE_KD_POLL_BREAKIN)) e o
+/// resultado vale só com KdDebuggerEnabled. No transporte do OpenNT o pedido
+/// é qualquer byte do host na porta (o 0x03 ou o começo de um pacote); o
+/// byte fica na porta para a consulta do tique do relógio, que para a
+/// máquina (o papel do KdpControlCPressed). Com a máquina parada ou com a
+/// trava ocupada a resposta é FALSE.
+pub fn poll_break_in() -> bool {
+    if pitched() || !enabled() {
+        return false;
+    }
+    let flags = crate::hal::cpu::save_and_disable_interrupts();
+    let mut requested = false;
+    if !stop::stopped() && super::transport::try_lock(stop::current_processor()) {
+        requested = super::transport::byte_pending();
+        super::transport::unlock();
+    }
+    requested &= enabled();
+    crate::hal::cpu::restore_interrupts(flags);
+    requested
+}
+
 /// DbgBreakPointWithStatus: com o depurador ligado, `int 3` com o status
 /// no RCX e o host decide; sem ele, um INT 3 não tratado vira
 /// KMODE_EXCEPTION_NOT_HANDLED.

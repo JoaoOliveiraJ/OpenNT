@@ -54,6 +54,17 @@ pub fn hal_environment_variable_ex() -> Result<u32, KernelError> {
     nt_environment_variable_ex()
 }
 
+/// ExSetFirmwareEnvironmentVariable(VariableName, VendorGuid, Value,
+/// ValueLength, Attributes): fora do firmware EFI (ExpFirmwareType != 2) o
+/// ntoskrnl devolve STATUS_NOT_IMPLEMENTED antes de converter o nome (o
+/// ExpUnicodeStringToNonpagedWStr) e sem ler o valor.
+pub fn set(_name: u64, _guid: u64, _value: u64, _length: u32, _attributes: u32) -> Result<u32, KernelError> {
+    if firmware_type()? == 1 {
+        return Ok(0xC000_0002);
+    }
+    Err(KernelError::new("firmware variable provider unavailable"))
+}
+
 /// Sem sondagem, conversão de nome, alocação nem modificação de saídas,
 /// inclusive com argumentos NULL ou desalinhados.
 pub fn query(_name: u64, _guid: u64, _value: u64, _length: u64, _attributes: u64) -> Result<u32, KernelError> {

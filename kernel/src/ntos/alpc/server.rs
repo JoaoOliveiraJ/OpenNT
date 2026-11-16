@@ -73,6 +73,8 @@ const STATUS_INVALID_PORT_HANDLE: u32 = 0xC000_0042;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_INVALID_CID: u32 = 0xC000_000B;
 const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
+/// O AlpcpLookupMessage sem mensagem com o MessageId pedido.
+const STATUS_INVALID_MESSAGE: u32 = 0xC000_0702;
 
 /// Tipos de PORT_MESSAGE (o byte baixo de Type).
 const LPC_REQUEST: u16 = 1;
@@ -611,7 +613,7 @@ pub fn open_sender(out: u64, port_handle: u64, message: u64, access: u32, attrib
     let result = (|| -> Result<u32, KernelError> {
         let Some(server) = server_of(&port) else { return Ok(STATUS_INVALID_PORT_HANDLE) };
         let id = state::user_struct::<PortMessage>(message)?.message_id.probe_get()?;
-        let Some(sender) = server.state.lock().senders.get(&id).copied() else { return Ok(STATUS_REPLY_MESSAGE_MISMATCH) };
+        let Some(sender) = server.state.lock().senders.get(&id).copied() else { return Ok(STATUS_INVALID_MESSAGE) };
         let object_flags = if attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.attributes.probe_get()? & OBJ_INHERIT } else { 0 };
         let handle = if thread {
             let found = threads::all().into_iter().find(|candidate| candidate.thread_id == sender.thread && candidate.with(|candidate| !candidate.dead));
@@ -638,6 +640,42 @@ pub fn open_sender(out: u64, port_handle: u64, message: u64, access: u32, attrib
         };
         guest::try_write::<u64>(out, handle)?;
         Ok(STATUS_SUCCESS)
+    })();
+    let _ = reference.release();
+    result
+}
+
+/// ZwAlpcOpenSenderProcess(ProcessHandle*, PortHandle, PortMessage, Flags,
+/// DesiredAccess, ObjectAttributes): o NtAlpcOpenSenderProcess em KernelMode
+/// (ntoskrnl 19041 rva 0x5dffa0). A mensagem e os atributos são do chamador
+/// de kernel, sem sondas; o ClientId do cabeçalho tem de ser o do remetente
+/// (STATUS_INVALID_CID) e o handle sai como no PsOpenProcess, pelo
+/// ObOpenObjectByPointer com os atributos do chamador (OBJ_KERNEL_HANDLE dá
+/// um handle de kernel).
+pub fn open_sender_process_kernel(out: u64, port_handle: u64, message: u64, access: u32, attributes: u64) -> Result<u32, KernelError> {
+    let mut reference = match port_reference::reference(port_handle, 0, 0)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let port = reference.port.clone();
+    let result = (|| -> Result<u32, KernelError> {
+        let Some(server) = server_of(&port) else { return Ok(STATUS_INVALID_PORT_HANDLE) };
+        // SAFETY: PPORT_MESSAGE e POBJECT_ATTRIBUTES de um chamador de kernel.
+        let header = unsafe { PortMessage::at(message) };
+        let Some(sender) = server.state.lock().senders.get(&header.message_id.get()).copied() else { return Ok(STATUS_INVALID_MESSAGE) };
+        if header.client_id.unique_process.get() != sender.process || header.client_id.unique_thread.get() != sender.thread {
+            return Ok(STATUS_INVALID_CID);
+        }
+        let Some(target) = process::list_active_processes().into_iter().find(|entry| entry.pid == sender.process).map(|entry| entry.address) else { return Ok(STATUS_INVALID_CID) };
+        let object_flags = if attributes != 0 { unsafe { ObjectAttributes::at(attributes) }.attributes.get() } else { 0 };
+        let cell = guest::alloc_bytes(8);
+        let status = crate::ntos::init::exports::invoke_handler("ObOpenObjectByPointer", &[target, object_flags as u64, 0, access as u64, crate::ntos::ob::object_types::process_type().pointer, 0, cell])? as u32;
+        if status == STATUS_SUCCESS {
+            // SAFETY: PHANDLE de saída do chamador de kernel.
+            unsafe { crate::ntos::inc::field::Field::<u64>::at(out) }.set(guest::read64(cell));
+        }
+        guest::free_bytes(cell);
+        Ok(status)
     })();
     let _ = reference.release();
     result

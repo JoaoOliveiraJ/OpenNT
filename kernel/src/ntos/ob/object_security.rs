@@ -1057,3 +1057,15 @@ pub fn assign_object_security(object: u64, parent: u64, explicit: u64, subject_c
     }
     status
 }
+
+/// NtSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor)
+/// chamado por um driver: o PreviousMode da thread decide, como no
+/// ntoskrnl 19041 (rva 0x67b860). Em KernelMode é o caminho do
+/// ZwSetSecurityObject; em UserMode o handle e o descritor são do processo.
+pub fn nt_set_security_object(handle: u64, information: u32, descriptor: u64) -> Result<u32, crate::rtl::KernelError> {
+    if crate::ntos::ps::previous_mode::get()? == 0 {
+        set_security_object(handle, information, descriptor)
+    } else {
+        set_security_object_from_user(handle, information, descriptor)
+    }
+}

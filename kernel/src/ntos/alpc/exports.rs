@@ -202,3 +202,33 @@ pub mod lpc {
 
     pub static GROUP: Group = Group { name: "lpc", names: &["ZwSecureConnectPort", "LpcRequestPort", "LpcSendWaitReceivePort"], handlers: &[secure_connect_port, request_port, send_wait_receive_port], data_exports: &[] };
 }
+
+pub mod alpc_kernel_security {
+    //! AlpcCreateSecurityContext, ZwAlpcDeleteResourceReserve e
+    //! ZwAlpcOpenSenderProcess: o ALPC de modo kernel, com a lógica em
+    //! `alpc/resource/services` e `alpc/server`.
+
+    use super::finish;
+    use crate::ntos::alpc::resource::services;
+    use crate::ntos::alpc::server;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// AlpcCreateSecurityContext(PortHandle, Thread, Flags, SecurityAttribute) -> NTSTATUS.
+    fn create_security_context(call: &Call) -> Result<u64, KernelError> {
+        finish("security creation", services::create_security_context_for_thread(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4)))
+    }
+
+    /// ZwAlpcDeleteResourceReserve(PortHandle, Flags, ResourceId) -> NTSTATUS.
+    fn delete_resource_reserve(call: &Call) -> Result<u64, KernelError> {
+        finish("reserve deletion", services::delete_resource_reserve(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, 0))
+    }
+
+    /// ZwAlpcOpenSenderProcess(ProcessHandle*, PortHandle, PortMessage, Flags,
+    /// DesiredAccess, ObjectAttributes) -> NTSTATUS.
+    fn open_sender_process(call: &Call) -> Result<u64, KernelError> {
+        finish("sender process", server::open_sender_process_kernel(call.arg(1), call.arg(2), call.arg(3), call.arg(5) as u32, call.arg(6)))
+    }
+
+    pub static GROUP: Group = Group { name: "alpc-kernel-security", names: &["AlpcCreateSecurityContext", "ZwAlpcDeleteResourceReserve", "ZwAlpcOpenSenderProcess"], handlers: &[create_security_context, delete_resource_reserve, open_sender_process], data_exports: &[] };
+}

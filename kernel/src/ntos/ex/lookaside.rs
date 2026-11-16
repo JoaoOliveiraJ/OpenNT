@@ -233,6 +233,22 @@ pub fn delete(list: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// ExFlushLookasideListEx(Lookaside): esvazia o cache de uma vez (o
+/// ExpInterlockedFlushSList da ListHead) e devolve cada entrada ao FreeEx,
+/// na ordem da cadeia, lendo o próximo vínculo antes de liberar. A lista
+/// continua inicializada e registrada; os contadores e o Depth não mudam, e
+/// não há checagem de IRQL nem do registro, como no ntoskrnl.
+pub fn flush_ex(list: u64) -> Result<(), KernelError> {
+    let mut block = slist::flush(list)?;
+    while block != 0 {
+        // SAFETY: os blocos livres do cache começam pela SLIST_ENTRY.
+        let following = unsafe { SlistEntry::at(block) }.next.get();
+        release_entry(list, block)?;
+        block = following;
+    }
+    Ok(())
+}
+
 /// ExpComputeLookasideDepth: ajusta o cache pelas alocações e faltas desde
 /// a última amostra.
 fn adjust_depth(list: u64, intervals: u64) {

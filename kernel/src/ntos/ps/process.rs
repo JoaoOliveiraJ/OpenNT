@@ -648,7 +648,16 @@ pub fn notify_thread_created(thread: u64) -> Result<(), KernelError> {
         record.creation_notified = true;
         record.process
     };
-    thread_notify::notify(eprocess(process).unique_process_id.get(), ethread(thread).cid.unique_thread.get(), true)
+    let (process_id, thread_id) = (eprocess(process).unique_process_id.get(), ethread(thread).cid.unique_thread.get());
+    // PspInsertThread: as rotinas de sistema, no contexto de quem cria.
+    thread_notify::notify(process_id, thread_id, thread_notify::NotifyPoint::Create)?;
+    // PspInitializeThunkContext: numa thread de usuário (com TEB), as rotinas
+    // de código não de sistema rodam no contexto da thread nova, no processo
+    // dela, antes de ela chegar ao modo usuário.
+    if ethread(thread).tcb.teb.get() != 0 && thread_notify::wants(thread_notify::NotifyPoint::CreateNonSystem) {
+        super::process_context::with_process(process, || as_current(thread, || thread_notify::notify(process_id, thread_id, thread_notify::NotifyPoint::CreateNonSystem)))??;
+    }
+    Ok(())
 }
 
 /// Executa `body` com `thread` como thread corrente, restaurando a anterior.
@@ -697,7 +706,7 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
         }
         record.exit_notified = true;
     }
-    as_current(thread, || thread_notify::notify(eprocess(process).unique_process_id.get(), object.cid.unique_thread.get(), false))
+    as_current(thread, || thread_notify::notify(eprocess(process).unique_process_id.get(), object.cid.unique_thread.get(), thread_notify::NotifyPoint::Exit))
 }
 
 pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelError> {

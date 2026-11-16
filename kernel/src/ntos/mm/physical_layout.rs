@@ -157,3 +157,39 @@ pub fn add_physical_memory(start: u64, bytes: u64) -> (u32, u64) {
     }
     (ADD_STATUS_INSUFFICIENT_RESOURCES, 0)
 }
+
+// ---- MmRemovePhysicalMemory (ntoskrnl 19041 0x8c62e0) ------------------------
+//
+// MmRemovePhysicalMemory(StartAddress*, NumberOfBytes*): o número de páginas
+// é NumberOfBytes >> 12; um StartAddress fora de página com o bit 0 ligado é
+// o pedido de remover páginas ruins (o bit sai). Faixa vazia ou que dá a
+// volta é STATUS_INVALID_PARAMETER_1. As páginas ruins saem da lista de
+// páginas ruins (MiRemoveBadPages), que só existe com o rastreamento de
+// páginas ruins do MiFlags ligado; sem ele é STATUS_NOT_IMPLEMENTED. Para
+// RAM comum, o MiFindContiguousPages tem de tomar todas as páginas da
+// faixa antes de o MiRemovePhysicalMemory tirá-las do bloco de memória
+// física; quando não consegue, o status dele volta e nada muda
+// (STATUS_NO_MEMORY). O OpenNT não tem remoção a quente: o bloco de memória
+// física e o banco de PFN são fixos depois do boot, o rastreamento de
+// páginas ruins fica desligado e nenhuma faixa pode ser tomada, então todo
+// pedido válido termina nesses dois status, como num Windows sem memória
+// removível. *NumberOfBytes só muda num sucesso.
+
+const REMOVE_STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const REMOVE_STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+const REMOVE_STATUS_NO_MEMORY: u32 = 0xC000_0017;
+
+/// MmRemovePhysicalMemory: o NTSTATUS (o OpenNT nunca remove páginas).
+pub fn remove_physical_memory(start: u64, bytes: u64) -> u32 {
+    let pages = bytes >> 12;
+    let bad_pages = start & 0xFFF != 0 && start & 1 != 0;
+    let start = if bad_pages { start & !1 } else { start };
+    let first = start >> 12;
+    if first.checked_add(pages).is_none_or(|end| end <= first) {
+        return REMOVE_STATUS_INVALID_PARAMETER_1;
+    }
+    if bad_pages {
+        return REMOVE_STATUS_NOT_IMPLEMENTED;
+    }
+    REMOVE_STATUS_NO_MEMORY
+}

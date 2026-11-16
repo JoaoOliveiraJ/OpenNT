@@ -228,3 +228,18 @@ pub mod etw_write_ex {
 
     pub static GROUP: Group = Group { name: "etw-write-ex", names: &["EtwWriteEx", "EtwWriteString"], handlers: &[write_ex, write_string], data_exports: &[] };
 }
+
+pub mod etw_send_trace_buffer {
+    //! EtwSendTraceBuffer; a lógica mora em `etw/logger`.
+
+    use crate::ntos::etw::logger;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// EtwSendTraceBuffer(LoggerId, Buffer, EventsLost, StartTime, StartPerfClock).
+    fn send_trace_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logger::send_trace_buffer(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5))))
+    }
+
+    pub static GROUP: Group = Group { name: "etw-send-trace-buffer", names: &["EtwSendTraceBuffer"], handlers: &[send_trace_buffer], data_exports: &[] };
+}

@@ -155,6 +155,8 @@ pub fn init() -> Result<(), KernelError> {
 /// IofCallDriver: CL--, CSL--, grava o DeviceObject no slot e chama
 /// MajorFunction[major] do driver dono do dispositivo alvo.
 pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
+    // Com IoRegisterIoTracking ativo, a hora de entrada na extensão do IRP.
+    super::io_perf::on_call_driver(packet);
     let irp = irp_at(packet);
     let current_location = irp.current_location.get() as u8;
     let stack_count = irp.stack_count.get() as u8;
@@ -216,6 +218,8 @@ fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce(
 /// interrompe. Depois finaliza o IRP síncrono (UserIosb, UserBuffer,
 /// UserEvent, buffer do I/O Manager).
 pub fn iof_complete_request(packet: u64) -> i32 {
+    // Com IoRegisterIoTracking ativo, o tempo do IRP vai aos rastreadores.
+    super::io_perf::on_complete_request(packet);
     let irp = irp_at(packet);
     let stack_count = irp.stack_count.get() as u8 as u32;
     let mut current_location = irp.current_location.get() as u8 as u32;

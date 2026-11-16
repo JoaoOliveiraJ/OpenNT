@@ -357,3 +357,39 @@ pub mod vsl_secure_pci {
         data_exports: &[],
     };
 }
+
+pub mod hvl_hypervisor_queries {
+    //! HvlInvokeHypercall, HviGetPartitionIsolationType e as consultas Hvl de
+    //! processadores do hipervisor; a lógica mora em `hal::hypervisor`.
+
+    use crate::hal::hypervisor;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// HvlInvokeHypercall(InputValue, InputPa, OutputPa) -> HV_HYPERCALL_RESULT_VALUE.
+    fn invoke_hypercall(call: &Call) -> Result<u64, KernelError> {
+        Ok(hypervisor::invoke_hypercall(call.arg(1), call.arg(2), call.arg(3)))
+    }
+
+    /// HviGetPartitionIsolationType() -> HV_PARTITION_ISOLATION_TYPE.
+    fn get_partition_isolation_type(_: &Call) -> Result<u64, KernelError> {
+        Ok(hypervisor::partition_isolation_type() as u64)
+    }
+
+    /// HvlQueryActiveHypervisorProcessorCount(PULONG Count) -> NTSTATUS.
+    fn query_active_hypervisor_processor_count(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hypervisor::query_active_hypervisor_processor_count(call.arg(1))))
+    }
+
+    /// HvlQueryHypervisorProcessorNodeNumber(LpIndex, PUSHORT NodeNumber) -> NTSTATUS.
+    fn query_hypervisor_processor_node_number(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hypervisor::query_hypervisor_processor_node_number(call.arg(1) as u32, call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "hvl-hypervisor-queries",
+        names: &["HvlInvokeHypercall", "HviGetPartitionIsolationType", "HvlQueryActiveHypervisorProcessorCount", "HvlQueryHypervisorProcessorNodeNumber"],
+        handlers: &[invoke_hypercall, get_partition_isolation_type, query_active_hypervisor_processor_count, query_hypervisor_processor_node_number],
+        data_exports: &[],
+    };
+}

@@ -1,5 +1,6 @@
-//! Árvore rubro-negra do Rtl (RTL_RB_TREE) — RtlRbInsertNodeEx e
-//! RtlRbRemoveNode do ntoskrnl 19041 (rva 0x2c0b10 e 0x2c1170).
+//! Árvore rubro-negra do Rtl (RTL_RB_TREE) — RtlRbInsertNodeEx,
+//! RtlRbRemoveNode e RtlRbReplaceNode do ntoskrnl 19041 (rva 0x2c0b10,
+//! 0x2c1170 e 0x2e5850).
 //!
 //! A árvore é a do chamador: RTL_RB_TREE { Root; Min | Encoded:1 } e nós
 //! RTL_BALANCED_NODE { Left, Right, ParentValue (Red no bit 0) }; o
@@ -209,6 +210,42 @@ pub fn insert(tree: u64, parent: u64, right: bool, node: u64) {
         tree.set_red(grandparent, true);
         tree.set_red(top, false);
         return;
+    }
+}
+
+/// RtlRbReplaceNode(Tree, Node, ReplacementNode) (0x2e5850): o substituto
+/// recebe os 24 bytes do nó (filhos, pai e cor); cada filho não nulo passa a
+/// apontar para ele (os dois bits baixos conservados) e, sem filho esquerdo,
+/// o mínimo que era o nó vira o substituto; sem pai, a raiz é o substituto,
+/// senão o elo do pai que guardava o nó. Só a raiz e o mínimo seguem a
+/// codificação da árvore: os elos dos nós são lidos e gravados como estão,
+/// como no original.
+pub fn replace_node(tree: u64, node: u64, replacement: u64) {
+    let tree = Tree::open(tree);
+    let (old, new) = (node_at(node), node_at(replacement));
+    let (left, right, parent_value) = (old.left.get(), old.right.get(), old.parent_value.get());
+    new.left.set(left);
+    new.right.set(right);
+    new.parent_value.set(parent_value);
+    let adopt = |child: u64| {
+        let cell = &node_at(child).parent_value;
+        cell.set((cell.get() & 3) | replacement);
+    };
+    if left != 0 {
+        adopt(left);
+    } else if tree.min() == node {
+        tree.set_min(replacement);
+    }
+    if right != 0 {
+        adopt(right);
+    }
+    let parent = parent_value & !3;
+    if parent == 0 {
+        tree.set_root(replacement);
+    } else if node_at(parent).left.get() == node {
+        node_at(parent).left.set(replacement);
+    } else {
+        node_at(parent).right.set(replacement);
     }
 }
 

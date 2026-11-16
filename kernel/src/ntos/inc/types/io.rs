@@ -4097,6 +4097,248 @@ const _: () = {
     assert!(core::mem::offset_of!(FsFilterCallbacks, post_query_open) == 0x70);
 };
 
+/// `_FS_FILTER_CALLBACK_DATA` (0x40 bytes).
+#[repr(C)]
+pub struct FsFilterCallbackData {
+    pub size_of_fs_filter_callback_data: Field<u32>,
+    pub operation: Field<u8>,
+    pub reserved: Field<u8>,
+    _pad_6: Reserved<0x2>,
+    /// -> `_DEVICE_OBJECT`
+    pub device_object: Field<u64>,
+    /// -> `_FILE_OBJECT`
+    pub file_object: Field<u64>,
+    pub parameters: FsFilterParameters,
+}
+
+unsafe impl NtStruct for FsFilterCallbackData {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterCallbackData>() == 0x40);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, size_of_fs_filter_callback_data) == 0x0);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, operation) == 0x4);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, reserved) == 0x5);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, device_object) == 0x8);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, file_object) == 0x10);
+    assert!(core::mem::offset_of!(FsFilterCallbackData, parameters) == 0x18);
+};
+
+/// `_FS_FILTER_PARAMETERS` (0x28 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `FsFilterParametersView1`..`FsFilterParametersView4`, alcançadas por `Deref`.
+#[repr(C)]
+pub struct FsFilterParameters {
+    pub acquire_for_modified_page_writer: FsFilterParametersAcquireForModifiedPageWriter,
+    _pad_10: Reserved<0x18>,
+}
+
+/// Vista 1 de `_FS_FILTER_PARAMETERS` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct FsFilterParametersView1 {
+    pub release_for_modified_page_writer: FsFilterParametersReleaseForModifiedPageWriter,
+    _pad_8: Reserved<0x20>,
+}
+
+/// Vista 2 de `_FS_FILTER_PARAMETERS` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct FsFilterParametersView2 {
+    pub acquire_for_section_synchronization: FsFilterParametersAcquireForSectionSynchronization,
+    _pad_18: Reserved<0x10>,
+}
+
+/// Vista 3 de `_FS_FILTER_PARAMETERS` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct FsFilterParametersView3 {
+    pub query_open: FsFilterParametersQueryOpen,
+    _pad_20: Reserved<0x8>,
+}
+
+/// Vista 4 de `_FS_FILTER_PARAMETERS` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct FsFilterParametersView4 {
+    pub others: FsFilterParametersOthers,
+}
+
+impl core::ops::Deref for FsFilterParameters {
+    type Target = FsFilterParametersView1;
+    #[inline(always)]
+    fn deref(&self) -> &FsFilterParametersView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<FsFilterParametersView1>() }
+    }
+}
+
+impl core::ops::Deref for FsFilterParametersView1 {
+    type Target = FsFilterParametersView2;
+    #[inline(always)]
+    fn deref(&self) -> &FsFilterParametersView2 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<FsFilterParametersView2>() }
+    }
+}
+
+impl core::ops::Deref for FsFilterParametersView2 {
+    type Target = FsFilterParametersView3;
+    #[inline(always)]
+    fn deref(&self) -> &FsFilterParametersView3 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<FsFilterParametersView3>() }
+    }
+}
+
+impl core::ops::Deref for FsFilterParametersView3 {
+    type Target = FsFilterParametersView4;
+    #[inline(always)]
+    fn deref(&self) -> &FsFilterParametersView4 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<FsFilterParametersView4>() }
+    }
+}
+
+unsafe impl NtStruct for FsFilterParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParameters>() == 0x28);
+    assert!(core::mem::offset_of!(FsFilterParameters, acquire_for_modified_page_writer) == 0x0);
+    assert!(core::mem::size_of::<FsFilterParametersView1>() == 0x28);
+    assert!(core::mem::align_of::<FsFilterParametersView1>() == core::mem::align_of::<FsFilterParameters>());
+    assert!(core::mem::offset_of!(FsFilterParametersView1, release_for_modified_page_writer) == 0x0);
+    assert!(core::mem::size_of::<FsFilterParametersView2>() == 0x28);
+    assert!(core::mem::align_of::<FsFilterParametersView2>() == core::mem::align_of::<FsFilterParameters>());
+    assert!(core::mem::offset_of!(FsFilterParametersView2, acquire_for_section_synchronization) == 0x0);
+    assert!(core::mem::size_of::<FsFilterParametersView3>() == 0x28);
+    assert!(core::mem::align_of::<FsFilterParametersView3>() == core::mem::align_of::<FsFilterParameters>());
+    assert!(core::mem::offset_of!(FsFilterParametersView3, query_open) == 0x0);
+    assert!(core::mem::size_of::<FsFilterParametersView4>() == 0x28);
+    assert!(core::mem::align_of::<FsFilterParametersView4>() == core::mem::align_of::<FsFilterParameters>());
+    assert!(core::mem::offset_of!(FsFilterParametersView4, others) == 0x0);
+};
+
+/// `_FS_FILTER_PARAMETERS::AcquireForModifiedPageWriter` (0x10 bytes).
+#[repr(C)]
+pub struct FsFilterParametersAcquireForModifiedPageWriter {
+    /// -> `_LARGE_INTEGER`
+    pub ending_offset: Field<u64>,
+    /// -> `_ERESOURCE*`
+    pub resource_to_release: Field<u64>,
+}
+
+unsafe impl NtStruct for FsFilterParametersAcquireForModifiedPageWriter {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParametersAcquireForModifiedPageWriter>() == 0x10);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForModifiedPageWriter, ending_offset) == 0x0);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForModifiedPageWriter, resource_to_release) == 0x8);
+};
+
+/// `_FS_FILTER_PARAMETERS::ReleaseForModifiedPageWriter` (0x8 bytes).
+#[repr(C)]
+pub struct FsFilterParametersReleaseForModifiedPageWriter {
+    /// -> `_ERESOURCE`
+    pub resource_to_release: Field<u64>,
+}
+
+unsafe impl NtStruct for FsFilterParametersReleaseForModifiedPageWriter {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParametersReleaseForModifiedPageWriter>() == 0x8);
+    assert!(core::mem::offset_of!(FsFilterParametersReleaseForModifiedPageWriter, resource_to_release) == 0x0);
+};
+
+/// `_FS_FILTER_PARAMETERS::AcquireForSectionSynchronization` (0x18 bytes).
+#[repr(C)]
+pub struct FsFilterParametersAcquireForSectionSynchronization {
+    pub sync_type: Field<FsFilterSectionSyncType>,
+    pub page_protection: Field<u32>,
+    /// -> `_FS_FILTER_SECTION_SYNC_OUTPUT`
+    pub output_information: Field<u64>,
+    pub flags: Field<u32>,
+    _pad_14: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for FsFilterParametersAcquireForSectionSynchronization {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParametersAcquireForSectionSynchronization>() == 0x18);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForSectionSynchronization, sync_type) == 0x0);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForSectionSynchronization, page_protection) == 0x4);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForSectionSynchronization, output_information) == 0x8);
+    assert!(core::mem::offset_of!(FsFilterParametersAcquireForSectionSynchronization, flags) == 0x10);
+};
+
+/// `_FS_FILTER_SECTION_SYNC_TYPE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct FsFilterSectionSyncType(pub i32);
+
+impl FsFilterSectionSyncType {
+    pub const SYNC_TYPE_OTHER: Self = Self(0);
+    pub const SYNC_TYPE_CREATE_SECTION: Self = Self(1);
+}
+
+impl GuestScalar for FsFilterSectionSyncType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
+/// `_FS_FILTER_PARAMETERS::QueryOpen` (0x20 bytes).
+#[repr(C)]
+pub struct FsFilterParametersQueryOpen {
+    /// -> `_IRP`
+    pub irp: Field<u64>,
+    /// -> `void`
+    pub file_information: Field<u64>,
+    /// -> `u32`
+    pub length: Field<u64>,
+    pub file_information_class: Field<FileInformationClass>,
+    pub completion_status: Field<i32>,
+}
+
+unsafe impl NtStruct for FsFilterParametersQueryOpen {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParametersQueryOpen>() == 0x20);
+    assert!(core::mem::offset_of!(FsFilterParametersQueryOpen, irp) == 0x0);
+    assert!(core::mem::offset_of!(FsFilterParametersQueryOpen, file_information) == 0x8);
+    assert!(core::mem::offset_of!(FsFilterParametersQueryOpen, length) == 0x10);
+    assert!(core::mem::offset_of!(FsFilterParametersQueryOpen, file_information_class) == 0x18);
+    assert!(core::mem::offset_of!(FsFilterParametersQueryOpen, completion_status) == 0x1c);
+};
+
+/// `_FS_FILTER_PARAMETERS::Others` (0x28 bytes).
+#[repr(C)]
+pub struct FsFilterParametersOthers {
+    /// -> `void`
+    pub argument1: Field<u64>,
+    /// -> `void`
+    pub argument2: Field<u64>,
+    /// -> `void`
+    pub argument3: Field<u64>,
+    /// -> `void`
+    pub argument4: Field<u64>,
+    /// -> `void`
+    pub argument5: Field<u64>,
+}
+
+unsafe impl NtStruct for FsFilterParametersOthers {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FsFilterParametersOthers>() == 0x28);
+    assert!(core::mem::offset_of!(FsFilterParametersOthers, argument1) == 0x0);
+    assert!(core::mem::offset_of!(FsFilterParametersOthers, argument2) == 0x8);
+    assert!(core::mem::offset_of!(FsFilterParametersOthers, argument3) == 0x10);
+    assert!(core::mem::offset_of!(FsFilterParametersOthers, argument4) == 0x18);
+    assert!(core::mem::offset_of!(FsFilterParametersOthers, argument5) == 0x20);
+};
+
 /// `_DEVICE_RELATIONS` (0x10 bytes).
 #[repr(C)]
 pub struct DeviceRelations {

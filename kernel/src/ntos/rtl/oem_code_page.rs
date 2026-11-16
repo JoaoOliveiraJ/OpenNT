@@ -1,7 +1,9 @@
 //! Página OEM e strings OEM do Rtl (RtlOemToUnicodeN,
 //! RtlOemStringTo[Counted]UnicodeString, RtlUnicodeStringTo[Counted]OemString,
 //! RtlUpcaseUnicodeStringToCountedOemString, RtlxOemStringToUnicodeSize,
-//! RtlUpperString) e os dados NlsMbOemCodePageTag / NlsOemLeadByteInfo.
+//! RtlUpperString, RtlUpcaseUnicodeToOemN, RtlUpcaseUnicodeStringToOemString,
+//! RtlxUnicodeStringToOemSize) e os dados NlsMbOemCodePageTag /
+//! NlsOemLeadByteInfo.
 //!
 //! A tabela é a c_437.nls real do volume (a página OEM de en-US, a mesma que o
 //! carregador NLS instala), decodificada por `ansi_code_page::parse` e pelas
@@ -216,6 +218,111 @@ pub fn unicode_string_to_oem(destination: &AnsiString, source: &UnicodeString, a
         return Ok(STATUS_UNMAPPABLE_CHARACTER);
     }
     Ok(STATUS_SUCCESS)
+}
+
+// ---- RtlUpcaseUnicodeToOemN, RtlUpcaseUnicodeStringToOemString e
+// RtlxUnicodeStringToOemSize (ntoskrnl 19041) ---------------------------------
+//
+// RtlxUnicodeStringToOemSize 0x6790a0: RtlUnicodeToMultiByteSize (que conta
+// pela página ANSI instalada, NlsMbCodePageTag) + 1 — o mesmo cálculo do
+// RtlxUnicodeStringToAnsiSize. RtlUpcaseUnicodeToOemN 0x679000 numa página
+// OEM SBCS (UpcaseUnicodeToSingleByteNHelper 0x206a00): min(WCHARs, Max)
+// bytes, *BytesInOemString = essa quantidade (se não NULL), cada WCHAR vai à
+// página OEM, volta a Unicode pela tabela OEM (o best fit), passa pelo
+// NLS_UPCASE e vai de novo à página; WCHARs além de Max dão
+// STATUS_BUFFER_OVERFLOW. RtlUpcaseUnicodeStringToOemString 0x678b50:
+// tamanho > 0xFFFF = STATUS_INVALID_PARAMETER_2; Destination.Length recebe
+// tamanho - 1 antes de qualquer checagem; com Allocate, MaximumLength =
+// tamanho e o buffer da ExpAllocateStringRoutine (falha = STATUS_NO_MEMORY),
+// senão Length >= MaximumLength = STATUS_BUFFER_OVERFLOW; depois da
+// conversão, RtlpDidUnicodeToOemWork falso = STATUS_UNMAPPABLE_CHARACTER;
+// sucesso termina o texto com NUL e falha com Allocate libera o buffer e
+// zera Buffer. O ramo de processo UTF-8 do original (RtlpIsUtf8Process: PEB
+// sem OemCodePageData) não existe no OpenNT, cujos processos recebem a
+// página instalada.
+
+/// RtlxUnicodeStringToOemSize(UnicodeString): bytes com o NUL.
+pub fn unicode_string_to_oem_size(string: u64) -> Result<u32, KernelError> {
+    crate::ntos::rtl::nls_translation::unicode_string_to_ansi_size(string)
+}
+
+/// RtlUpcaseUnicodeToOemN(OemString, MaxBytesInOemString, BytesInOemString,
+/// UnicodeString, BytesInUnicodeString): os buffers crus.
+pub fn upcase_unicode_to_oem_n(destination: u64, maximum: u32, written: Option<&Field<u32>>, source: u64, source_bytes: u32) -> Result<u32, KernelError> {
+    let units = source_bytes >> 1;
+    let count = units.min(maximum);
+    if let Some(written) = written {
+        written.set(count);
+    }
+    upcase_to_oem(destination, source, count)?;
+    Ok(if units > maximum { STATUS_BUFFER_OVERFLOW } else { STATUS_SUCCESS })
+}
+
+/// Os `count` WCHARs de `source` em maiúsculas OEM (ida, best fit,
+/// NLS_UPCASE e volta pela página).
+fn upcase_to_oem(destination: u64, source: u64, count: u32) -> Result<(), KernelError> {
+    let table = oem()?;
+    let text = units_from_bytes(&guest::try_read_bytes(source, count as usize * 2)?);
+    let mut bytes = Vec::with_capacity(count as usize);
+    for unit in text {
+        let best_fit = table.multi_byte_to_unicode(table.unicode_to_multi_byte(unit)?)?;
+        bytes.push(table.unicode_to_multi_byte(unicode_case::nls_upcase(best_fit))? as u8);
+    }
+    guest::try_write_bytes(destination, &bytes)
+}
+
+/// RtlpDidUnicodeToOemWork (0x678f78) numa página SBCS: um byte igual ao
+/// OemDefaultChar (o byte com sinal contra o código sem sinal, como no
+/// original) cujo WCHAR de origem não é o OemTransUniDefaultChar denuncia
+/// caractere sem mapeamento. Percorre os Length bytes do OEM_STRING.
+fn did_unicode_to_oem_work(table: &CodePage, oem: &AnsiString, unicode: &UnicodeString) -> Result<bool, KernelError> {
+    let default = table.default_char()? as u8 as i32;
+    let translated = table.trans_uni_default_char()?;
+    for index in 0..oem.length.get() as u64 {
+        if guest::try_read8(oem.buffer.get() + index)? as i8 as i32 == default && guest::try_read16(unicode.buffer.get() + index * 2)? != translated {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// RtlUpcaseUnicodeStringToOemString(DestinationString, SourceString,
+/// AllocateDestinationString).
+pub fn upcase_unicode_string_to_oem_string(destination: &AnsiString, source: &UnicodeString, allocate: bool) -> Result<u32, KernelError> {
+    let size = unicode_string_to_oem_size(source.address())?;
+    if size > 0xFFFF {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    let length = (size - 1) as u16;
+    destination.length.set(length);
+    if allocate {
+        destination.maximum_length.set(size as u16);
+        let buffer = allocate_string(size as u64);
+        destination.buffer.set(buffer);
+        if buffer == 0 {
+            return Ok(STATUS_NO_MEMORY);
+        }
+    } else if length >= destination.maximum_length.get() {
+        return Ok(STATUS_BUFFER_OVERFLOW);
+    }
+    let table = oem()?;
+    // RtlUpcaseUnicodeToOemN(Buffer, Length, &Index, Source.Buffer, Source.Length).
+    let units = source.length.get() as u32 >> 1;
+    let index = units.min(length as u32);
+    upcase_to_oem(destination.buffer.get(), source.buffer.get(), index)?;
+    let mut status = if units > length as u32 { STATUS_BUFFER_OVERFLOW } else { STATUS_SUCCESS };
+    if status & 0x8000_0000 == 0 && !did_unicode_to_oem_work(&table, destination, source)? {
+        status = STATUS_UNMAPPABLE_CHARACTER;
+    }
+    if status & 0x8000_0000 == 0 {
+        guest::try_write8(destination.buffer.get() + index as u64, 0)?;
+        return Ok(STATUS_SUCCESS);
+    }
+    if allocate {
+        kernel_pool::free(destination.buffer.get(), None)?;
+        destination.buffer.set(0);
+    }
+    Ok(status)
 }
 
 /// RtlUpperString(Destination, Source): RtlUpperChar por caractere pela

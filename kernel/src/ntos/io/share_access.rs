@@ -29,6 +29,13 @@ fn ignores_share_access(file: &FileObject) -> bool {
     extension != 0 && unsafe { IopFileObjectExtension::at(extension) }.fo_ext_flags.get() & 1 != 0
 }
 
+/// IoIsFileObjectIgnoringSharing(FileObject) (RVA 0x6a61c0): o
+/// IO_IGNORE_SHARE_ACCESS_CHECK da extensão do FILE_OBJECT; sem extensão,
+/// FALSE.
+pub fn is_file_object_ignoring_sharing(file: &FileObject) -> bool {
+    ignores_share_access(file)
+}
+
 fn flag(cell: &Field<u8>) -> u32 {
     (cell.get() != 0) as u32
 }

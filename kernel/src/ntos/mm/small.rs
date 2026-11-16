@@ -19,6 +19,19 @@ pub fn is_address_valid(address: u64) -> Result<bool, KernelError> {
     Ok(paging::access_flags(address) & paging::PAGE_PRESENT != 0)
 }
 
+/// MmIsNonPagedSystemAddressValid: FALSE só quando o tipo de região da VA
+/// (o MiGetSystemRegionType) é o espaço de sessão ou o pool paginado; as
+/// demais VAs de sistema e toda VA da metade de usuário (tipo MiVaUnused)
+/// dão TRUE, sem olhar a tabela de páginas. No OpenNT o espaço de sessão é o
+/// slot da PML4 da sessão e o pool paginado são as regiões paginadas do pool
+/// do kernel.
+pub fn is_non_paged_system_address_valid(address: u64) -> bool {
+    if address < 0xFFFF_8000_0000_0000 {
+        return true;
+    }
+    !(memory_map::is_session_address(address) || super::kernel_pool::is_paged_address(address))
+}
+
 /// ProbeForRead/ProbeForWrite: valida faixa e alinhamento, sem ler a
 /// memória do usuário. Este caminho ainda para a máquina em vez de levantar
 /// uma exceção NT capturável; a permissão de escrita por página continua

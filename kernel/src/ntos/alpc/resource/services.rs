@@ -91,6 +91,36 @@ pub fn create_security_context(handle: u64, flags: u32, attribute: u64, mode: u8
     })
 }
 
+/// AlpcCreateSecurityContext(PortHandle, Thread, Flags, SecurityAttribute)
+/// (ntoskrnl 19041 rva 0x8c2230): o contexto com a identidade da thread
+/// dada, sobre a porta referenciada em KernelMode, com o QoS do atributo ou,
+/// sem ele, o da porta. O atributo é do chamador de kernel, lido sem sonda.
+pub fn create_security_context_for_thread(handle: u64, thread: u64, flags: u32, attribute: u64) -> Result<u32, KernelError> {
+    critical(|| {
+        if flags != 0 {
+            return Ok(INVALID_PARAMETER);
+        }
+        with_port(handle, 0, |port| {
+            let quality_pointer = if attribute != 0 { guest::read64(attribute + offset_of!(AlpcSecurityAttr, p_qos) as u64) } else { 0 };
+            let captured = match security_contexts::quality(quality_pointer, 0) {
+                Ok(captured) => captured,
+                Err(status) => return Ok(status),
+            };
+            let quality = captured.or_else(|| port.with(|state| state.security_quality)).unwrap_or(Quality { level: 2, tracking: 0, effective_only: false });
+            let record = match security_contexts::create_for_thread(port, thread, &quality, true)? {
+                Ok(record) => record,
+                Err(status) => return Ok(status),
+            };
+            let published = write_field::<u64>(attribute, offset_of!(AlpcSecurityAttr, context_handle), record.handle).is_ok();
+            if !published {
+                security_contexts::delete_referenced(&record)?;
+            }
+            security_contexts::release(&record)?;
+            Ok(if published { 0 } else { ACCESS_VIOLATION })
+        })
+    })
+}
+
 pub fn delete_security_context(port_handle: u64, flags: u32, context_handle: u64, mode: u8) -> Result<u32, KernelError> {
     critical(|| {
         if flags != 0 {

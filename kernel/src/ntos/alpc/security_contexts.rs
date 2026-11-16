@@ -156,11 +156,19 @@ fn publish_state(record: &ContextRecord) {
 }
 
 pub fn create(port: &Arc<Port>, quality: &Quality, published: bool) -> Result<Result<Arc<ContextRecord>, u32>, KernelError> {
+    create_for_thread(port, process::get_current_thread(), quality, published)
+}
+
+/// O contexto com a identidade de `thread` (o AlpcCreateSecurityContext
+/// recebe a thread; o NtAlpcCreateSecurityContext passa a corrente). Como o
+/// AlpcpCreateSecurityContext, a cota sai do processo da thread
+/// (IoThreadToProcess).
+pub fn create_for_thread(port: &Arc<Port>, thread: u64, quality: &Quality, published: bool) -> Result<Result<Arc<ContextRecord>, u32>, KernelError> {
     let pointer = guest::alloc_bytes(ContextBody::SIZE);
     if pointer == 0 {
         return Ok(Err(0xC000_009A));
     }
-    let creator = process::get_current_process();
+    let creator = process::thread_record(thread).map_or_else(process::get_current_process, |record| record.process);
     let mut charge: Option<PoolQuota> = None;
     let mut client: Option<Arc<ClientIdentity>> = None;
     let mut process_held = false;
@@ -170,7 +178,7 @@ pub fn create(port: &Arc<Port>, quality: &Quality, published: bool) -> Result<Re
             Ok(quota) => charge = quota,
             Err(status) => return Ok(Err(status)),
         }
-        match capture(process::get_current_thread(), quality)? {
+        match capture(thread, quality)? {
             Ok(identity) => client = Some(identity),
             Err(status) => return Ok(Err(status)),
         }

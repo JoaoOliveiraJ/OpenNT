@@ -1731,3 +1731,65 @@ pub mod ps_suspend_process {
 
     pub static GROUP: Group = Group { name: "ps-suspend-process", names: &["PsSuspendProcess", "PsGetSiloContainerId"], handlers: &[suspend_process, silo_container_id], data_exports: &[] };
 }
+
+pub mod ps_parent_silo {
+    //! PsGetParentSilo; a lógica mora em `ps/silo/query`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::silo::query;
+    use crate::rtl::KernelError;
+
+    /// PsGetParentSilo(Job) -> PESILO.
+    fn get_parent_silo(call: &Call) -> Result<u64, KernelError> {
+        Ok(query::parent_silo(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-parent-silo", names: &["PsGetParentSilo"], handlers: &[get_parent_silo], data_exports: &[] };
+}
+
+pub mod ps_thread_notify_ex {
+    //! PsSetCreateThreadNotifyRoutineEx; a lógica mora em `ps/notify/thread`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::notify::thread as thread_notify;
+    use crate::rtl::KernelError;
+
+    /// PsSetCreateThreadNotifyRoutineEx(NotifyType, NotifyInformation) -> NTSTATUS.
+    fn set_create_thread_notify_routine_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(thread_notify::register_ex(call.arg(1) as u32, call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-thread-notify-ex", names: &["PsSetCreateThreadNotifyRoutineEx"], handlers: &[set_create_thread_notify_routine_ex], data_exports: &[] };
+}
+
+pub mod ps_wow64_apc {
+    //! PsWrapApcWow64Thread; a lógica mora em `ps/process_accessors`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::process_accessors;
+    use crate::rtl::KernelError;
+
+    /// PsWrapApcWow64Thread(ApcContext*, ApcRoutine*) -> NTSTATUS.
+    fn wrap_apc_wow64_thread(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(process_accessors::wrap_apc_wow64_thread(call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-wow64-apc", names: &["PsWrapApcWow64Thread"], handlers: &[wrap_apc_wow64_thread], data_exports: &[] };
+}
+
+pub mod nt_query_information_process {
+    //! NtQueryInformationProcess no modo anterior da thread; a lógica mora
+    //! em `ps/query_process`. Falha interna interrompe o sistema.
+
+    use crate::ntos::init::exports::{fatal_unless_transfer, signed_status, Call, Group};
+    use crate::ntos::ps::{previous_mode, query_process};
+    use crate::rtl::KernelError;
+
+    /// NtQueryInformationProcess(ProcessHandle, Class, Information, Length, ReturnLength) -> NTSTATUS.
+    fn query_information_process(call: &Call) -> Result<u64, KernelError> {
+        let mode = previous_mode::get()?;
+        Ok(signed_status(fatal_unless_transfer("nt-query-information-process", query_process::nt_query_information(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), mode))?))
+    }
+
+    pub static GROUP: Group = Group { name: "nt-query-information-process", names: &["NtQueryInformationProcess"], handlers: &[query_information_process], data_exports: &[] };
+}

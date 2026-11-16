@@ -22,3 +22,4 @@ pub mod heat;
 pub mod tunnel;
 pub mod notify;
 pub mod volume_support;
+pub mod fs_filter;

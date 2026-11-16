@@ -45,3 +45,4 @@ pub mod extension_hosts;
 pub mod logon_session;
 pub mod sddl;
 pub mod system_dacls;
+pub mod signing_level;

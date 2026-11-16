@@ -120,6 +120,14 @@ pub fn query_information_transaction_manager(_handle: u64, _class: u32, _buffer:
     STATUS_NOT_SUPPORTED
 }
 
+/// NtQueryInformationTransaction(HANDLE, TRANSACTION_INFORMATION_CLASS,
+/// PVOID, ULONG, PULONG): o slot `_imp_NtQueryInformationTransaction` (0x1312f0)
+/// também começa no stub 0x36d0e0; nem o buffer nem o ReturnLength são
+/// escritos.
+pub fn query_information_transaction(_handle: u64, _class: u32, _buffer: u64, _length: u32, _return_length: u64) -> u32 {
+    STATUS_NOT_SUPPORTED
+}
+
 /// NtRecoverEnlistment(HANDLE, PVOID EnlistmentKey) / NtRecoverTransactionManager(HANDLE).
 pub fn recover_object(_handle: u64) -> u32 {
     STATUS_NOT_SUPPORTED

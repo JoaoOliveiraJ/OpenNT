@@ -122,16 +122,20 @@ pub fn equal_ansi(left: u64, right: u64, case_insensitive: bool) -> bool {
     left == right
 }
 
-/// RtlFree*String: libera o buffer e zera os campos.
-pub fn free_string(pointer: u64) {
+/// RtlFree*String: libera o buffer pelo ExFreePool (o RtlpFreeStringRoutine,
+/// que vale para qualquer pool: as strings que a Rtl aloca com o
+/// ExpAllocateStringRoutine, como a do RtlUpcaseUnicodeStringToOemString) e
+/// zera os campos.
+pub fn free_string(pointer: u64) -> Result<(), crate::rtl::KernelError> {
     let string = ansi(pointer);
     let buffer = string.buffer.get();
     if buffer != 0 {
-        guest::free_bytes(buffer);
+        crate::ntos::ex::pool_allocation::free(buffer, 0)?;
     }
     string.length.set(0);
     string.maximum_length.set(0);
     string.buffer.set(0);
+    Ok(())
 }
 
 /// RtlAppendStringToString(PSTRING Dest, const STRING* Src): concatena uma
