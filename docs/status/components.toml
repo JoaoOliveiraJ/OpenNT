@@ -342,6 +342,13 @@ marcador = "KD_SESSION_DETACHED"
 comando = "cargo xtask test-boot KD_EXPORTS_OK 600000 --kd=com2 --script=xtask/scripts/kd.txt --build-dir=build/kd --start-driver=ksecdd --expect=KERNEL_RS_OK --expect=KD_SESSION_DETACHED --hold=5000"
 descricao = "Boot com --kd=com2: o depurador do próprio OpenNT atende o protocolo remoto do GDB na COM2, que o QEMU expõe num socket TCP, e o cliente do xtask roda o roteiro xtask/scripts/kd.txt contra ele enquanto o boot segue. O cliente anexa (o primeiro pacote para a máquina), confere que os drivers veem o depurador ligado e presente (KdDebuggerEnabled=1, KdDebuggerNotPresent=0) e que os quatro processadores estão parados (os APs congelados por NMI), lê o cabeçalho do PE do kernel e grava e desfaz quatro bytes nele, continua e pede a parada com o 0x03, arma um breakpoint de software em kernel::ntos::ke::run_kernel_tasks (o laço principal do kernel) e para nele, confere que a saída do DbgPrint do ksecdd.sys real chegou durante o boot (pacotes O e o anel do monitor log), lista processos, threads, módulos, processadores com a IRQL e o diretório \\Device do namespace, faz o backtrace pelos frame pointers até o kmain e o de uma thread fora da CPU pelo quadro de troca da pilha de kernel dela, dá um passo (o push rbp do prólogo, conferido no RSP e na pilha), troca o breakpoint por um de hardware (DR0) e para nele, e se desliga. O boot com o depurador também confere, pelos exports, KdChangeOption, KdDisableDebugger, KdEnableDebugger, KdRefreshDebuggerNotPresent e KdPowerTransitionEx com o depurador ligado (KD_EXPORTS_OK). Depois do desligamento (KD_SESSION_DETACHED) a máquina segue até o shell e o serviço de teclado lendo do driver real (o roteiro espera os dois na COM1) e roda 5 s sem falha."
 
+[[teste]]
+id = "bugcheck"
+titulo = "Tela de bugcheck pelo despejo manual do teclado"
+marcador = "[bugcheck] maquina parada"
+comando = "cargo xtask test-boot \"[shell] pronto\" 300000 --display=basic --build-dir=build/bugcheck \"--keys={ctrl_r-scroll_lock-scroll_lock}\" --expect-stop \"--expect=*** STOP (KeBugCheckEx): 0x000000e2\" \"--expect=[bugcheck] codigo de parada: MANUALLY_INITIATED_CRASH\" \"--expect=[bugcheck] tela de bugcheck: framebuffer 1024x768 (tipo 2), fonte do BIOS carregada\" \"--expect=[bugcheck] callback (motivo 2)\" \"--expect=[bugcheck] coleta de dados do erro: 100%\" \"--expect=[bugcheck] maquina parada\""
+descricao = "Com o vídeo de boot do carregador (--display=basic, o modo VBE 1024x768x32), o teste segura o Ctrl direito e aperta o Scroll Lock duas vezes pelo monitor do QEMU: é o despejo manual pelo teclado do Windows (CrashOnCtrlScroll), e o próprio i8042prt.sys real, na ISR do teclado, chama KeBugCheckEx(MANUALLY_INITIATED_CRASH). O kernel segue o KeBugCheck2: grava o KiBugCheckData, congela os outros processadores pela NMI, acha o nome do código na tabela de mensagens da imagem do kernel, desenha a tela de bugcheck do Windows 10 no framebuffer (fundo azul, o \":(\", o parágrafo e o progresso nos textos do bootres.dll.mui da instalação, o código de parada), roda os callbacks de motivo dos drivers reais, publica os dados do erro na serial com o progresso chegando a 100% e, com o AutoReboot desligado no CrashControl, para a máquina com a tela à vista. A captura do site é essa tela."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -505,7 +512,7 @@ estado = "implementado"
 caminhos = ["kernel/src/drivers/video/vga.rs"]
 testes = ["boot"]
 fase = "1"
-notas = "Suporte de boot do próprio kernel, para as mensagens e o shell; a tela gráfica do Windows é o alvo dxgkrnl.sys e BasicDisplay.sys. Os testes conferem o texto pela serial; a imagem na tela não é conferida."
+notas = "Suporte de boot do próprio kernel, para as mensagens e o shell; a tela gráfica do Windows é o alvo dxgkrnl.sys e BasicDisplay.sys. Sem framebuffer de boot, a tela de bugcheck sai aqui, em branco sobre azul, com os textos do bootres.dll.mui (bgk/bugcheck_screen.rs). Os testes conferem o texto pela serial; a imagem na tela não é conferida."
 
 [[componente]]
 nome = "Console"
@@ -580,9 +587,9 @@ icone = "keyboard"
 descricao = "Driver da Microsoft para a controladora de teclado e mouse PS/2."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/io/pnp/install.rs"]
-testes = ["teclado", "drivers", "shell"]
+testes = ["teclado", "drivers", "shell", "bugcheck"]
 fase = "6"
-notas = "O PnP o anexa aos PDOs PS/2 da placa-mãe, com START_DEVICE e as ISRs nativas conectadas às IRQs 1 e 12; no boot comum, é por ele que o shell recebe as teclas. Sem os binários no build, o teclado usa o driver PS/2 interno."
+notas = "O PnP o anexa aos PDOs PS/2 da placa-mãe, com START_DEVICE e as ISRs nativas conectadas às IRQs 1 e 12; no boot comum, é por ele que o shell recebe as teclas. Com o CrashOnCtrlScroll ligado nos parâmetros do serviço, o Ctrl direito com o Scroll Lock duas vezes faz o próprio driver chamar KeBugCheckEx(MANUALLY_INITIATED_CRASH), como no despejo manual do Windows (teste bugcheck). Sem os binários no build, o teclado usa o driver PS/2 interno."
 
 [[componente]]
 nome = "kbdclass.sys"
@@ -1370,6 +1377,12 @@ grupo = "marco"
 teste = "win32k-display"
 faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0; o InitVideo da sessão 0 termina e o NtUserInitialize do csrss volta com sucesso."
 para = "Depois o csrss para no NtCreatePort da \\Windows\\SbApiPort, antes de o smss executar o wininit.exe."
+
+[[roda]]
+nome = "Tela de bugcheck do Windows 10"
+grupo = "marco"
+teste = "bugcheck"
+faz = "O Ctrl direito com o Scroll Lock duas vezes faz o i8042prt.sys real chamar KeBugCheckEx(0xE2); o kernel congela os processadores, desenha a tela azul do Windows 10 no framebuffer de boot (\":(\", os textos da instalação, o progresso e o código de parada), roda os callbacks dos drivers e para."
 
 [[roda]]
 nome = "O ntfs.sys monta e grava"

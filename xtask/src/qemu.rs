@@ -172,6 +172,9 @@ pub struct TestOptions {
     /// `--capture=ARQ.png`: no fim do teste (passando ou não), a tela do
     /// QEMU vai para este PNG, pelo `screendump` do QMP.
     pub capture: Option<PathBuf>,
+    /// `--expect-stop`: o bugcheck faz parte do teste, e o `*** STOP` na
+    /// serial deixa de ser falha.
+    pub expect_stop: bool,
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -357,9 +360,21 @@ fn connect_monitor(port: u16, deadline: Instant) -> Result<TcpStream, String> {
     }
 }
 
+/// Digita `text`; `{combo}` manda o combo cru ao `sendkey` (nomes de tecla
+/// do QEMU separados por `-`, pressionados em ordem e soltos ao contrário,
+/// como `{ctrl_r-scroll_lock-scroll_lock}`).
 fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
-    for character in text.chars() {
-        let name = key_name(character).ok_or_else(|| format!("tecla sem mapa no sendkey: {character:?}"))?;
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        let name = if character == '{' {
+            let combo: String = characters.by_ref().take_while(|&next| next != '}').collect();
+            if combo.is_empty() || !combo.chars().all(|next| next.is_ascii_alphanumeric() || next == '_' || next == '-') {
+                return Err(format!("combo de teclas invalido: {{{combo}}}"));
+            }
+            combo
+        } else {
+            key_name(character).ok_or_else(|| format!("tecla sem mapa no sendkey: {character:?}"))?
+        };
         monitor
             .write_all(format!("sendkey {name} 30\n").as_bytes())
             .map_err(|error| format!("monitor HMP: {error}"))?;
@@ -432,6 +447,8 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     });
 
     let deadline = Instant::now() + test.timeout;
+    // Com `--expect-stop`, o STOP do bugcheck é o próprio teste.
+    let failure_markers: Vec<&str> = FAILURE_MARKERS.iter().copied().filter(|marker| !(test.expect_stop && *marker == "*** STOP")).collect();
     // A sessão roda numa thread; o erro dela encerra as esperas.
     let session_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let session_thread = session.map(|session| {
@@ -452,7 +469,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             }
             {
                 let text = output.lock().unwrap();
-                if let Some(failure) = FAILURE_MARKERS.iter().find(|marker| text[from.min(text.len())..].contains(*marker)) {
+                if let Some(failure) = failure_markers.iter().find(|marker| text[from.min(text.len())..].contains(*marker)) {
                     // O relatório que segue o marcador (registradores, pilha)
                     // ainda está chegando: um instante para ele entrar no log.
                     drop(text);
@@ -485,7 +502,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         while Instant::now() < hold_end {
             {
                 let text = output.lock().unwrap();
-                if let Some(failure) = FAILURE_MARKERS.iter().find(|marker| text[cursor.min(text.len())..].contains(*marker)) {
+                if let Some(failure) = failure_markers.iter().find(|marker| text[cursor.min(text.len())..].contains(*marker)) {
                     return Err(format!("falha detectada na serial durante os {} ms de espera: {failure}", test.hold.as_millis()));
                 }
             }

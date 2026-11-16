@@ -74,7 +74,7 @@ kernel/src/
 │   ├── kd/            depurador do kernel: o estado que os drivers veem e o
 │   │                  próprio depurador do OpenNT (protocolo remoto do GDB)
 │   ├── po/ etw/ dbgk/ fsrtl/
-│   ├── bgk/           console do vídeo de boot (Bgk*)
+│   ├── bgk/           console do vídeo de boot (Bgk*), fonte e tela de bugcheck
 │   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
 │   ├── ttm/           Terminal Topology Manager (notificações de dispositivo)
 │   ├── em/            Errata Manager (provedores e regras do INF de errata)
@@ -1576,6 +1576,32 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   como pacote `O` com a máquina rodando (`kd/print_log.rs`). Os APs ainda
   usam a própria IDT de três vetores: só o BSP trata `int 3`/#DB, e os
   comparadores de hardware são carregados só no dono da parada.
+- **Bugcheck** (`ke/bugcheck.rs`, `ke/bugcheck_reason.rs`,
+  `bgk/bugcheck_screen.rs`, `bgk/boot_font.rs`): o KeBugCheckEx segue o
+  KeBugCheck2 — KiBugCheckActive (o segundo processador gira até ser
+  congelado; o aninhado soma 4 e para), KiBugCheckData, a linha
+  `*** STOP (KeBugCheckEx)`, a primeira parada do depurador (pulada no
+  0xE2), interrupções desligadas em HIGH_LEVEL, os outros processadores
+  presos pela NMI de congelamento do `kd/stop.rs`, a tela
+  (KiDisplayBlueScreen), os callbacks de entrada (KbCallbackReserved1), o
+  despejo — no OpenNT a serial: os dados secundários dos callbacks de
+  motivo e o black box, com o progresso na tela —, os callbacks de
+  KeRegisterBugCheckCallback (a LIST_ENTRY da cabeça, conferidos antes de
+  rodar) e, pelo `Control\CrashControl` lido no boot (`cm/crash_control.rs`
+  semeia AutoReboot 0 e CrashDumpEnabled 7), o reinício ou a parada com a
+  segunda chance do depurador. O nome do código sai do KiBugCodeMessages: a
+  tabela de mensagens do ntoskrnl.exe da máquina vai para a `.rsrc` do PE
+  do kernel no build (`xtask/src/kernel_pe.rs`) e o kernel a acha pelo
+  próprio diretório de recursos. A tela é a do BgpFwDisplayBugCheckScreen
+  no framebuffer de boot (a tabela de cinco tipos de tela, o fundo
+  0x0077D6, os textos do bootres.dll.mui da instalação que o build põe no
+  bundle, o ":(" desenhado como texto, sem o código QR) com a fonte de 8x16
+  do BIOS de vídeo ampliada com borda suavizada; sem framebuffer, os mesmos
+  textos em branco sobre azul no modo texto do Inbv. O KiBugCheckDriver é a
+  imagem carregada que contém um dos parâmetros (KiDumpParameterImages). O
+  i8042prt.sys tem o CrashOnCtrlScroll ligado: Ctrl direito com Scroll Lock
+  duas vezes faz o próprio driver chamar KeBugCheckEx(0xE2), o teste
+  `bugcheck`.
 - **Pedidos térmicos** (`po/thermal.rs`, `po/reason_context.rs`): a
   extensão de resfriamento de cada alvo recebe a
   GUID_THERMAL_COOLING_INTERFACE por um IRP_MN_QUERY_INTERFACE síncrono ao
@@ -2502,8 +2528,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `WINSTA0_OK` (o wininit.exe com as Desktops Winlogon e Default da
   WinSta0; ainda não sai: o csrss para no NtCreatePort);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
-  (a parada do KeBugCheckEx). O `test-boot` procura falhas desde o boot até
-  a última saída esperada e, com `--hold=MS`, por mais MS milissegundos.
+  (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
+  como no `bugcheck`). O `test-boot` procura falhas desde o boot até
+  a última saída esperada e, com `--hold=MS`, por mais MS milissegundos. No
+  `--keys`, `{combo}` vai cru ao `sendkey` do monitor (teclas pressionadas
+  em ordem e soltas ao contrário, como `{ctrl_r-scroll_lock-scroll_lock}`).
 
 ## 6. Documentação e status
 

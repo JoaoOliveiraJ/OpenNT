@@ -5,6 +5,7 @@
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
+//!                        [--expect-stop]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
@@ -73,7 +74,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --image-dir=DIR (com --no-build: as imagens de DIR, com as opcoes de carga
                    deste teste numa copia do os.img em --build-dir, onde tambem ficam os logs)
                    --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
-                   --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)";
+                   --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
+                   --expect-stop (o *** STOP do bugcheck faz parte do teste, nao e falha)
+                   no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}";
 
 struct Arguments {
     command: String,
@@ -100,6 +103,8 @@ struct Arguments {
     headless: bool,
     /// `--capture=ARQ.png`: a tela do fim do test-boot.
     capture: Option<PathBuf>,
+    /// `--expect-stop`: o STOP do bugcheck faz parte do teste.
+    expect_stop: bool,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -136,6 +141,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         no_client: false,
         headless: false,
         capture: None,
+        expect_stop: false,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -168,6 +174,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--no-client" if parsed.command == "debug" => parsed.no_client = true,
             "--headless" if parsed.command == "debug" => parsed.headless = true,
             "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
+            "--expect-stop" => parsed.expect_stop = true,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -298,6 +305,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     expect: arguments.expect,
                     hold: Duration::from_millis(arguments.hold_ms),
                     capture: arguments.capture.map(|path| if path.is_absolute() { path } else { build::workspace_root().join(path) }),
+                    expect_stop: arguments.expect_stop,
                 },
                 &log,
                 session,
