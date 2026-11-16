@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O wininit.exe criar a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK): o NtUserCreateWindowStation faz callbacks ao user32 do wininit, que precisa dos recursos do user32.dll.mui no idioma da interface (en-US no convidado; esta máquina só tem pt-BR).
 
-Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.064 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,2%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.078 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -85,6 +85,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Depurador do kernel | Funciona | kd |
+| Relógio e fuso horário | Funciona | relogio, selftest, fase6, fase7 |
 | Carregador de PE e exports do kernel | Parcial | fase6, boot |
 | hal.dll | Funciona | drivers |
 | i8042prt.sys | Funciona | teclado, drivers, shell, bugcheck |

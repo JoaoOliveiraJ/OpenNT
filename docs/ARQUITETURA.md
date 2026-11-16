@@ -454,6 +454,36 @@ vale a mediana. Com o hospedeiro carregado, uma janela única chegou a medir
 o contador emulado do LAPIC 18 vezes acima do real, e o quantum e as esperas
 por tempo ficavam 18 vezes mais longos.
 
+**Relógio, fuso e QPC.** O contador de desempenho é o do HAL 19041 com o
+TSC como contador (`ke/clock.rs`): KeQueryPerformanceCounter = alto(TSC ×
+TscScale) + QpcBias, TscScale = 10^7 × 2^64 / frequência, 10 MHz, e o
+QpcBias zera o contador no boot, então o QPC é o tempo de interrupção em
+100 ns. A página de referência (TscSequence 'HalT', TscScale, TscOffset 0,
+`mm/shared_user_data.rs`) é mapeada somente leitura em todo espaço de
+endereçamento numa VA sorteada logo acima da KUSER_SHARED_DATA
+((0x7FFE0 + n) << 12), que a classe 197 do NtQuerySystemInformation devolve;
+com QpcBypassEnabled = 0x03 e o modo de leitura do TSC, o
+RtlQueryPerformanceCounter da ntdll real lê o TSC sem syscall. As duas
+páginas são `shared_user_data::shared_user_pages()`: o VAD as considera
+ocupadas e a metade de usuário de um processo nunca as libera. O tick
+(`clock::update_shared_times`, chamado pelos laços do kernel e pelo
+`ke::timer::check_timers`) faz o KeUpdateSystemTime: InterruptTime e
+SystemTime avançam em múltiplos do KeTimeIncrement corrente, as linhas de
+base QPC vão junto sob o TimeUpdateLock, e o TickCount conta períodos de
+KeMaximumIncrement (15,625 ms) pelo KiTickOffset; as leituras precisas
+(RtlGetSystemTimePrecise, RtlGetInterruptTimePrecise) somam o QPC desde a
+linha de base com o QpcSystemTimeIncrement. A interrupção do LAPIC continua
+a 100 Hz (o quantum); a resolução (`ex/timer_resolution.rs`, de 156250 a
+5000) só muda os passos do tempo publicado. O relógio da CMOS (`hal/rtc.rs`)
+guarda a hora local: a fase 0 a toma como está, e na fase 1
+`ex::time_zone::initialize` faz o que o NT faz com o CmControlVector e no
+Phase1InitializationDiscard (ActiveTimeBias e RealTimeIsUniversal, a hora
+do boot com o viés, o ExpRefreshTimeZoneInformation). O xtask sobe o QEMU
+com `-rtc base=` na hora local do ActiveTimeBias da hive
+(`cm/time_zone_information.rs`, os valores desta máquina) e compara a linha
+`[time] ... UTC=` de cada boot com o relógio do hospedeiro (`*** RELOGIO`
+derruba o teste com mais de 5 s de diferença).
+
 **Pilhas de kernel por thread.** Toda thread que executa tem pilha de kernel
 própria, do `mm/kernel_stack.rs` (o MmCreateKernelStack/MmDeleteKernelStack):
 uma reserva fixa de 256 KB de VA na janela `KERNEL_STACK_BASE..TOP`, com a
