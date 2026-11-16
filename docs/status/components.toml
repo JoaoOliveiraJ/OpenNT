@@ -234,7 +234,7 @@ descricao = "Com o smss real e --display=basic, o boot deixa o vídeo de boot do
 id = "winsta0"
 titulo = "WinSta0 e Desktops do wininit.exe real"
 marcador = "WINSTA0_OK"
-comando = "cargo xtask test-boot WINSTA0_OK 900000 --initial-process=smss --display=basic --build-dir=build/winsta0 --smp=1 --expect=USER_INITIALIZED \"--expect=criou services.exe\""
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/winsta0 --smp=1 --expect=WINSTA0_OK \"--expect=criou services.exe\""
 descricao = "Com o smss real e --display=basic, o csrss.exe da sessão 0 sobe a \\Windows\\SbApiPort e o smss cria o wininit.exe, que registra o processo de logon (o RegisterLogonProcess do win32k pelo RPC de kernel do msrpc.sys) e cria a WinSta0 pelo NtUserCreateWindowStation. O NtUserCreateDesktopEx da Desktop Winlogon manda mensagens à thread da Desktop do csrss, que as recebe pela porta de conclusão da fila de mensagens dela (o pacote de espera do evento da fila alimenta a IOCP que o win32k espera com KeWaitForMultipleObjects; o corpo do IoCompletion é uma KQUEUE); o xxxCreateDisconnectDesktop cria a Desktop Disconnect e a abre no csrss em KernelMode com os direitos fora do tipo descartados, como o ObpCreateHandle. O wininit cria a Desktop Default (WINSTA0_OK), chama o SwitchDesktop, sobe o servidor RPC de pipe nomeado \\PIPE\\InitShutdown (a porta de conclusão e os modos de notificação do arquivo do npfs.sys) e cria o services.exe real pelo CreateProcessW, com o BaseSrvCreateProcess do csrss atendido (ProcessConsoleHostProcess e ProcessSequenceNumber)."
 
 [[teste]]
