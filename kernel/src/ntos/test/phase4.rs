@@ -1077,11 +1077,17 @@ fn io_packets_and_transfer(assert: Assert) {
         return;
     };
     let pattern: alloc::vec::Vec<u8> = (0..70_000u32).map(|index| (index % 253) as u8).collect();
-    let _ = volume.create("/XFER.BIN", false, 0, 0);
-    let _ = volume.write("/XFER.BIN", 0, &pattern);
     let output = guest::alloc_bytes(70_016);
     let source = NtfsFile { volume: volume.clone(), path: alloc::string::String::from("/XFER.BIN") };
-    assert(matches!(transfer::read_into_guest(&source, 0, output, 70_000), Ok(70_000)) && guest::read_bytes(output, 70_000) == pattern, "transfer: blocos de 64 KB por DMA com paginas fixadas");
+    let created = volume.create("/XFER.BIN", false, 0, 0);
+    let written = volume.write("/XFER.BIN", 0, &pattern);
+    let transferred = transfer::read_into_guest(&source, 0, output, 70_000);
+    let back = guest::read_bytes(output, 70_000);
+    let mismatch = back.iter().zip(&pattern).position(|(read, expected)| read != expected);
+    if !matches!(transferred, Ok(70_000)) || mismatch.is_some() {
+        crate::debug_print!("[transfer] criacao={:?} escrita={:?} leitura={:?} primeira diferenca={:?}", created.as_ref().err(), written.as_ref().err(), transferred, mismatch);
+    }
+    assert(matches!(transferred, Ok(70_000)) && mismatch.is_none(), "transfer: blocos de 64 KB por DMA com paginas fixadas");
     guest::write_bytes(output, &[0; 64]);
     assert(matches!(transfer::read_into_guest(&source, 100, output + 3, 20), Ok(20)) && guest::read_bytes(output + 3, 20) == pattern[100..120], "transfer: faixa desalinhada");
     assert(matches!(transfer::read_into_guest(&ShortSource { limit: 10, empty: false }, 0, output, 100), Ok(10)) && guest::read_bytes(output, 10) == (0..10u8).collect::<alloc::vec::Vec<u8>>(), "transfer: leitura curta encerra sem zeros");

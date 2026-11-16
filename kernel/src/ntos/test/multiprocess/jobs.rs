@@ -619,14 +619,23 @@ fn cell(process: u64, offset: usize) -> Option<u32> {
 
 /// Despacha até a célula de etapa do gerente chegar a `stage`.
 fn drive_until_stage(process: u64, offset: usize, stage: u32) -> bool {
-    let deadline = clock::uptime_ms() + STAGE_DEADLINE_MS;
+    let started = clock::uptime_ms();
+    let deadline = started + STAGE_DEADLINE_MS;
     loop {
         match cell(process, offset) {
             Some(value) if value == stage => return true,
             Some(_) => {}
-            None => return false,
+            None => {
+                crate::debug_print!("[jobs] o gerente saiu antes da etapa {} com {:#x} ({} ms)", stage, exit_status(process), clock::uptime_ms() - started);
+                return false;
+            }
         }
-        if clock::uptime_ms() >= deadline || threads::dispatch_one().is_err() {
+        if clock::uptime_ms() >= deadline {
+            crate::debug_print!("[jobs] etapa {} nao alcancada em {} ms (celula {:?})", stage, STAGE_DEADLINE_MS, cell(process, offset));
+            return false;
+        }
+        if let Err(error) = threads::dispatch_one() {
+            crate::debug_print!("[jobs] despacho falhou esperando a etapa {}: {}", stage, error);
             return false;
         }
     }

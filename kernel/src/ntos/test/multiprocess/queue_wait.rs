@@ -10,18 +10,28 @@
 //! - inserção (prazo de 10 s): a 2 vê a 1 bloqueada no kernel (KTHREAD em
 //!   Waiting, quadro salvo na pilha dela), gira 50 ms sem que o CycleTime da
 //!   1 mude e insere uma entrada; a 1 volta com a entrada, bem antes do
-//!   prazo, tendo gastado menos da metade do tempo da espera em ciclos;
-//! - prazo (100 ms, ninguém insere): a 2 roda com a 1 bloqueada, e a 1 volta
-//!   com STATUS_TIMEOUT depois de 100 ms, de novo sem gastar a espera em
-//!   ciclos, e com a vaga da fila de volta;
+//!   prazo, despachada uma única vez durante a espera (a que a acorda);
+//! - prazo (100 ms, ninguém insere): a 2 roda com a 1 bloqueada e gira 50
+//!   ms sem que o CycleTime dela mude; a 1 volta com STATUS_TIMEOUT depois
+//!   de 100 ms, de novo despachada uma única vez durante a espera, e com a
+//!   vaga da fila de volta;
 //! - alerta (KeRemoveQueueEx alertável em UserMode, prazo de 10 s): a 2
 //!   chama NtAlertThread na 1, que volta com STATUS_ALERTED e a vaga de
 //!   volta.
 //!
+//! Que a espera não gasta o tempo dela em ciclos de CPU é medido pela
+//! contabilidade da própria thread, não pelo TSC entre a entrada e a saída
+//! do KeRemoveQueue: esse intervalo inclui o trecho em que a 1 de fato roda
+//! (até deixar a CPU e depois de voltar), e uma CPU virtual que o hospedeiro
+//! deixa sem rodar nesse trecho soma o tempo parado nele e no prazo. A
+//! contabilidade da thread não depende disso: parada, o CycleTime dela não
+//! anda, e ela não é despachada até a espera concluir.
+//!
 //! No código que girava o pump dentro do serviço, a 2 nunca roda durante a
 //! espera: a inserção não chega (a 1 só sai com STATUS_TIMEOUT depois de
-//! 10 s), a 2 não vê a 1 bloqueada, a espera gasta todo o tempo em ciclos e
-//! o alerta não chega.
+//! 10 s), a 2 não vê a 1 bloqueada, a 1 nunca deixa a CPU (nenhum despacho
+//! durante a espera) e o alerta não chega. Uma espera sondada despachando a
+//! 1 a cada volta teria mais de um despacho.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -31,7 +41,7 @@ use super::identity::with_test_process;
 use crate::hal::amd64::usermode;
 use crate::ntos::ex::service_table;
 use crate::ntos::inc::types::{Kqueue, Kthread, LargeInteger, ListEntry, NtStruct};
-use crate::ntos::ke::{clock, queue, thread_dispatch};
+use crate::ntos::ke::{clock, queue};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_stack;
 use crate::ntos::ps::user::threads::{self, KernelState, UserThread};
@@ -49,7 +59,8 @@ const STATUS_TIMEOUT: u64 = 0x102;
 const STATUS_ALERTED: u64 = 0x101;
 /// THREAD_ALERT.
 const THREAD_ALERT: u32 = 0x0004;
-/// Quanto a parceira gira, no cenário da inserção, antes de inserir.
+/// Quanto a parceira gira com a 1 bloqueada (antes de inserir, no cenário
+/// da inserção; dentro do prazo de 100 ms, no do prazo).
 const PARTNER_SPIN_MS: u64 = 50;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,10 +84,13 @@ static TARGET: AtomicU64 = AtomicU64::new(0);
 /// O que os serviços observaram.
 static RESULT: AtomicU64 = AtomicU64::new(UNSET);
 static ELAPSED_MS: AtomicU64 = AtomicU64::new(0);
-static WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Quantas vezes a 1 foi despachada entre entrar no KeRemoveQueue e voltar.
+static WAIT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static SLOT_RESTORED: AtomicBool = AtomicBool::new(false);
 static SAW_BLOCKED: AtomicBool = AtomicBool::new(false);
 static IDLE_WHILE_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// Quanto o CycleTime da 1 andou enquanto a 2 girava.
+static BLOCKED_CYCLES: AtomicU64 = AtomicU64::new(0);
 static PARTNER_STATUS: AtomicU64 = AtomicU64::new(UNSET);
 
 fn scenario() -> Scenario {
@@ -90,6 +104,11 @@ fn scenario() -> Scenario {
 fn kthread(pointer: u64) -> &'static Kthread {
     // SAFETY: KTHREAD viva, criada e retida pelo teste.
     unsafe { Kthread::at(pointer) }
+}
+
+/// Os despachos da thread até aqui (a contagem de trocas de contexto dela).
+fn dispatches(thread: u64) -> u64 {
+    process::thread_record(thread).map_or(0, |record| record.context_switches as u64)
 }
 
 fn kqueue() -> &'static Kqueue {
@@ -115,13 +134,13 @@ extern "win64" fn wait_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
         partner.with(|thread| thread.suspend_count = 0);
     }
     let thread = process::get_current_thread();
-    let (cycles_before, started) = (thread_dispatch::sample_cycles(thread), clock::uptime_ms());
+    let (dispatched_before, started) = (dispatches(thread), clock::uptime_ms());
     let alert = scenario() == Scenario::Alert;
     let entries = queue::remove_entries(kqueue(), TIMEOUT.load(Ordering::SeqCst), 1, alert as u8, alert);
-    let (cycles_after, finished) = (thread_dispatch::sample_cycles(thread), clock::uptime_ms());
+    let (dispatched_after, finished) = (dispatches(thread), clock::uptime_ms());
     let result = entries.ok().and_then(|entries| entries.first().copied()).unwrap_or(0);
     ELAPSED_MS.store(finished - started, Ordering::SeqCst);
-    WAIT_CYCLES.store(cycles_after.wrapping_sub(cycles_before), Ordering::SeqCst);
+    WAIT_DISPATCHES.store(dispatched_after.wrapping_sub(dispatched_before), Ordering::SeqCst);
     SLOT_RESTORED.store(kqueue().current_count.get() == 1, Ordering::SeqCst);
     RESULT.store(result, Ordering::SeqCst);
     // A thread não sai associada a uma fila que o teste vai liberar.
@@ -129,20 +148,31 @@ extern "win64" fn wait_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
     0
 }
 
-/// Confere a 1 bloqueada e, conforme o cenário, gira e insere, só observa
-/// ou alerta.
+/// Gira `PARTNER_SPIN_MS` com a 1 bloqueada e confere, pela KTHREAD dela,
+/// que o CycleTime não andou (nenhum ciclo cobrado dela parada).
+fn spin_beside_blocked_waiter() {
+    let waiter = kthread(WAITER.load(Ordering::SeqCst));
+    let before = waiter.cycle_time.get();
+    clock::spin_ms(PARTNER_SPIN_MS);
+    let after = waiter.cycle_time.get();
+    BLOCKED_CYCLES.store(after.wrapping_sub(before), Ordering::SeqCst);
+    IDLE_WHILE_BLOCKED.store(waiter_blocked() && after == before, Ordering::SeqCst);
+}
+
+/// Confere a 1 bloqueada e, conforme o cenário, gira e insere, só gira ou
+/// alerta.
 extern "win64" fn partner_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
     SAW_BLOCKED.store(waiter_blocked(), Ordering::SeqCst);
     let status = match scenario() {
         Scenario::Insert => {
-            let waiter = kthread(WAITER.load(Ordering::SeqCst));
-            let before = waiter.cycle_time.get();
-            clock::spin_ms(PARTNER_SPIN_MS);
-            IDLE_WHILE_BLOCKED.store(waiter_blocked() && waiter.cycle_time.get() == before, Ordering::SeqCst);
+            spin_beside_blocked_waiter();
             // SAFETY: a LIST_ENTRY do cenário, alocada pelo teste.
             queue::insert_entry(kqueue(), unsafe { ListEntry::at(ENTRY.load(Ordering::SeqCst)) }, false) as u64
         }
-        Scenario::Timeout => 0,
+        Scenario::Timeout => {
+            spin_beside_blocked_waiter();
+            0
+        }
         Scenario::Alert => state::handler("NtAlertThread").map_or(0xC000_0001, |handler| handler(TARGET.load(Ordering::SeqCst), 0, 0, 0, 0).unwrap_or(0xC000_0001)) as u64,
     };
     PARTNER_STATUS.store(status, Ordering::SeqCst);
@@ -154,7 +184,8 @@ struct Outcome {
     ran: bool,
     result: u64,
     elapsed_ms: u64,
-    wait_cycles: u64,
+    dispatches: u64,
+    blocked_cycles: u64,
     slot_restored: bool,
     saw_blocked: bool,
     idle_while_blocked: bool,
@@ -168,7 +199,7 @@ fn run_scenario(which: Scenario, timeout_100ns: i64) -> Option<Outcome> {
         let block = guest::alloc_bytes(0x100);
         let waiter = blocking_wait::user_thread(test.process, code);
         let partner = blocking_wait::user_thread(test.process, code + 0x100);
-        let mut outcome = Outcome { ran: false, result: UNSET, elapsed_ms: 0, wait_cycles: 0, slot_restored: false, saw_blocked: false, idle_while_blocked: false, partner_status: UNSET, dead: false };
+        let mut outcome = Outcome { ran: false, result: UNSET, elapsed_ms: 0, dispatches: 0, blocked_cycles: 0, slot_restored: false, saw_blocked: false, idle_while_blocked: false, partner_status: UNSET, dead: false };
         let mut handle = 0;
         if let (Some(waiter), Some(partner), true) = (waiter.as_ref(), partner.as_ref(), block != 0 && code != 0 && stacks != 0) {
             guest::write_bytes(code, &blocking_wait::program(WAIT_SERVICE, 0, true));
@@ -189,6 +220,9 @@ fn run_scenario(which: Scenario, timeout_100ns: i64) -> Option<Outcome> {
             for flag in [&SLOT_RESTORED, &SAW_BLOCKED, &IDLE_WHILE_BLOCKED] {
                 flag.store(false, Ordering::SeqCst);
             }
+            for cell in [&BLOCKED_CYCLES, &WAIT_DISPATCHES] {
+                cell.store(0, Ordering::SeqCst);
+            }
             if which == Scenario::Alert {
                 handle = threads::thread_handle(waiter, THREAD_ALERT, 0).unwrap_or(0);
                 TARGET.store(handle, Ordering::SeqCst);
@@ -199,7 +233,8 @@ fn run_scenario(which: Scenario, timeout_100ns: i64) -> Option<Outcome> {
             }
             outcome.result = RESULT.load(Ordering::SeqCst);
             outcome.elapsed_ms = ELAPSED_MS.load(Ordering::SeqCst);
-            outcome.wait_cycles = WAIT_CYCLES.load(Ordering::SeqCst);
+            outcome.dispatches = WAIT_DISPATCHES.load(Ordering::SeqCst);
+            outcome.blocked_cycles = BLOCKED_CYCLES.load(Ordering::SeqCst);
             outcome.slot_restored = SLOT_RESTORED.load(Ordering::SeqCst);
             outcome.saw_blocked = SAW_BLOCKED.load(Ordering::SeqCst);
             outcome.idle_while_blocked = IDLE_WHILE_BLOCKED.load(Ordering::SeqCst);
@@ -225,11 +260,22 @@ fn run_scenario(which: Scenario, timeout_100ns: i64) -> Option<Outcome> {
     })
 }
 
-/// A espera não gastou o tempo dela em ciclos de CPU: menos da metade dos
-/// ciclos transcorridos entre a entrada e a saída do KeRemoveQueue.
-fn cheap(outcome: &Outcome) -> bool {
-    let elapsed_cycles = outcome.elapsed_ms * (clock::tsc_frequency_hz() / 1000);
-    outcome.wait_cycles.saturating_mul(2) < elapsed_cycles
+/// A espera não gastou o tempo dela em ciclos de CPU, pela contabilidade
+/// da thread: o CycleTime parado enquanto a 2 girava ao lado dela bloqueada
+/// e um único despacho durante a espera, o que a acorda.
+fn parked(outcome: &Outcome) -> bool {
+    let parked = outcome.idle_while_blocked && outcome.dispatches == 1;
+    if !parked {
+        crate::debug_print!(
+            "[fila] resultado={:#x} decorrido={} ms despachos na espera={} parada={} ciclos parada={}",
+            outcome.result,
+            outcome.elapsed_ms,
+            outcome.dispatches,
+            outcome.saw_blocked,
+            outcome.blocked_cycles
+        );
+    }
+    parked
 }
 
 pub fn run(assert: Assert) {
@@ -267,7 +313,7 @@ pub fn run(assert: Assert) {
     if let Some(outcome) = timed.filter(|_| ok) {
         assert(outcome.saw_blocked, "fila: com KeRemoveQueue esperando, a outra thread roda e a ve bloqueada no kernel");
         assert(outcome.result == STATUS_TIMEOUT && outcome.elapsed_ms >= 100 && outcome.slot_restored, "fila: o prazo de 100 ms devolve STATUS_TIMEOUT e a vaga volta");
-        assert(cheap(&outcome), "fila: a espera ate o prazo nao gasta o tempo dela em ciclos de CPU");
+        assert(parked(&outcome), "fila: a espera ate o prazo nao gasta o tempo dela em ciclos de CPU (CycleTime parado e um unico despacho, o do prazo)");
     }
 
     // Inserção depois de 50 ms, prazo de 10 s.
@@ -277,7 +323,7 @@ pub fn run(assert: Assert) {
     if let Some(outcome) = inserted.filter(|_| ok) {
         assert(outcome.saw_blocked && outcome.idle_while_blocked, "fila: a thread bloqueada fica parada (CycleTime constante) enquanto a outra gira 50 ms");
         assert(outcome.result == ENTRY.load(Ordering::SeqCst) && outcome.partner_status == 0 && outcome.elapsed_ms >= PARTNER_SPIN_MS && outcome.elapsed_ms < 5_000, "fila: KeInsertQueue acorda a thread com a entrada, bem antes do prazo");
-        assert(cheap(&outcome), "fila: a espera ate a insercao nao gasta o tempo dela em ciclos de CPU");
+        assert(parked(&outcome), "fila: a espera ate a insercao nao gasta o tempo dela em ciclos de CPU (CycleTime parado e um unico despacho, o da insercao)");
     }
 
     // KeRemoveQueueEx alertável em UserMode, interrompido por NtAlertThread.
