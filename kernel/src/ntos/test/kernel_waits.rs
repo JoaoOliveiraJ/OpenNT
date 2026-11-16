@@ -245,7 +245,8 @@ fn queue_ping_pong(assert: Assert) {
 /// [0x300] resposta do servidor (0x100), [0x400] mensagem de conexão do
 /// cliente (0x100), [0x500] pedido e resposta do cliente (0x200),
 /// [0x700] OBJECT_ATTRIBUTES com o nome, [0x800] nome UNICODE_STRING do
-/// cliente, [0x900] resultados (status por etapa).
+/// cliente, [0x900] resultados (status por etapa; [10] e [11], as trocas de
+/// contexto do servidor na espera da conexão e do cliente na do pedido).
 const ALPC_PAIR_NAME: &str = "\\OpenNtAlpcPair";
 const RESULTS: u64 = 0x900;
 const PENDING_RESULT: u64 = 0xDEAD;
@@ -264,9 +265,13 @@ extern "win64" fn alpc_server(block: u64) {
         return;
     }
     let server = guest::read64(server_out);
-    // A conexão: a recepção bloqueia até o cliente conectar.
+    // A conexão: a recepção bloqueia até o cliente conectar (a thread sai da
+    // CPU: as trocas de contexto dela sobem durante a espera).
     guest::write64(length, 0x200);
+    let me = process::get_current_thread();
+    let before = context_switches(me);
     let connection = call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 10, context_switches(me).wrapping_sub(before));
     // SAFETY: PORT_MESSAGE recebido.
     let message = unsafe { PortMessage::at(receive) };
     record(block, 1, connection);
@@ -308,7 +313,11 @@ extern "win64" fn alpc_client(block: u64) {
     let client = guest::read64(client_out);
     port_message_with(exchange, b"PING");
     guest::write64(length, 0x200);
+    // O pedido síncrono: o cliente espera a resposta fora da CPU.
+    let me = process::get_current_thread();
+    let before = context_switches(me);
     let exchanged = call_export("ZwAlpcSendWaitReceivePort", &[client, 0x2_0000, exchange, 0, exchange, length, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 11, context_switches(me).wrapping_sub(before));
     record(block, 8, exchanged);
     record(block, 9, guest::read32(exchange + 0x28) as u64);
     call_export("ZwClose", &[client]);
@@ -317,7 +326,7 @@ extern "win64" fn alpc_client(block: u64) {
 fn alpc_kernel_pair(assert: Assert) {
     let block = guest::alloc_bytes(0xA00);
     guest::write_bytes(block, &alloc::vec![0; 0xA00]);
-    for index in 0..10 {
+    for index in 0..12 {
         record(block, index, PENDING_RESULT);
     }
     dispatcher::initialize_event(block + 0x28, 0, false);
@@ -327,19 +336,13 @@ fn alpc_kernel_pair(assert: Assert) {
     guest::write64(block + 0x800, name);
     let (server_handle, server) = start(alpc_server, block);
     let (client_handle, client) = start(alpc_client, block);
-    // As esperas do servidor e do cliente bloqueiam de verdade: entre os
-    // passos, a thread que espera fica parada numa espera registrada.
-    let parked = core::cell::Cell::new(false);
-    let finished = server != 0
-        && client != 0
-        && pump(20_000, &|| {
-            if wait::is_waiting(server) || wait::is_waiting(client) {
-                parked.set(true);
-            }
-            kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client)
-        });
-    let parked = parked.get();
-    let results: Vec<u64> = (0..10).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    // As esperas do servidor e do cliente bloqueiam de verdade: a thread que
+    // espera sai da CPU (as trocas de contexto dela sobem na espera). Um
+    // tick do escalonador pode levar a troca inteira, com outras threads de
+    // sistema existentes: quem confere é cada thread, na própria espera.
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..12).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    let parked = results[10] != PENDING_RESULT && results[10] > 0 && results[11] != PENDING_RESULT && results[11] > 0;
     debug_print!("[kwait] par ALPC: {:x?}", results);
     let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
     assert(

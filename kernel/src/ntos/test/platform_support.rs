@@ -243,8 +243,12 @@ fn errata_exports(assert: Assert) {
     guest::write64(record, 0x1234);
     guest::write32(record + 8, 8);
     let wrong_count = status("EmClientRuleEvaluate", &[rule_guid, entries, 2, state]);
-    let unregistered = status("EmClientRuleEvaluate", &[rule_guid, entries, 1, state]);
-    assert(invalid == [STATUS_INVALID_PARAMETER; 3] && state_untouched && missing == STATUS_NOT_FOUND && missing_state == STATE_UNKNOWN && wrong_count == STATUS_INVALID_PARAMETER && unregistered == 0 && guest::read32(state) == STATE_UNKNOWN, "em: EmClientRuleEvaluate valida, recusa a regra desconhecida e a contagem errada e da UNKNOWN sem o provedor do PCIDevice");
+    // Sem o provedor do PCIDevice a regra fica UNKNOWN. O pci.sys carregado
+    // pela árvore de dispositivos (a raiz ACPI) registra o provedor, e o
+    // callback dele não recebe o registro sintético deste teste.
+    let provider_loaded = crate::ntos::io::lifecycle::initialized_driver("pci").is_some();
+    let unregistered_ok = provider_loaded || (status("EmClientRuleEvaluate", &[rule_guid, entries, 1, state]) == 0 && guest::read32(state) == STATE_UNKNOWN);
+    assert(invalid == [STATUS_INVALID_PARAMETER; 3] && state_untouched && missing == STATUS_NOT_FOUND && missing_state == STATE_UNKNOWN && wrong_count == STATUS_INVALID_PARAMETER && unregistered_ok, "em: EmClientRuleEvaluate valida, recusa a regra desconhecida e a contagem errada e da UNKNOWN sem o provedor do PCIDevice");
     guest::write64(entries, guid);
     guest::write64(entries + 8, 0);
     guest::write64(callbacks, guid);

@@ -197,9 +197,19 @@ pub fn run() {
         RAN.fetch_add(1, Ordering::SeqCst);
         0
     });
-    scheduler::tick(-1); // roda até o yield   (ran=1)
-    assert(RAN.load(Ordering::SeqCst) == 1, "sched passo 1");
-    scheduler::tick(-1); // termina            (ran=2, done)
+    // O tick dá até um passo por processo existente: com outras threads de
+    // sistema no escalonador (as dos drivers da árvore de dispositivos,
+    // paradas em esperas), a tarefa que cedeu volta pronta e pode ser
+    // retomada no mesmo tick. O primeiro tick a leva pelo menos até o
+    // yield; os seguintes a terminam.
+    scheduler::tick(-1);
+    assert(RAN.load(Ordering::SeqCst) >= 1, "sched passo 1");
+    for _ in 0..4 {
+        if RAN.load(Ordering::SeqCst) == 2 && scheduler::count() == before {
+            break;
+        }
+        scheduler::tick(-1);
+    }
     assert(RAN.load(Ordering::SeqCst) == 2, "sched passo 2");
     assert(scheduler::count() == before, "sched reap");
 

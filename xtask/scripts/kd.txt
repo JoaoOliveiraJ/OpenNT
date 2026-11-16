@@ -45,15 +45,16 @@ expect SspiInitAsyncInterface
 ps
 expect System
 threads
-# Uma thread de kernel bloqueada (a de trabalho do msrpc.sys real, esperando
-# uma porta de conclusão): registradores e pilha pelo quadro de troca da
-# pilha de kernel dela, até o código do driver.
+# Uma thread de kernel bloqueada (a primeira da lista é uma thread de
+# sistema do acpi.sys real, criada na árvore de dispositivos, esperando os
+# eventos dela): registradores e pilha pelo quadro de troca da pilha de
+# kernel dela, até o código do driver.
 save-word esperando Waiting 2
 context $esperando
 expect quadro de troca
 btt $esperando
 expect kernel::ntos::ke::wait::
-expect msrpc.sys!
+expect ACPI.sys
 lm
 expect ksecdd.sys
 cpus

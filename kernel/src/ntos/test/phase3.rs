@@ -850,8 +850,12 @@ fn executive_callbacks(assert: Assert) {
     object_attributes(scratch, 0, "\\Callback\\PowerState", 0x40);
     assert(matches!(callbacks::create(output, scratch, false, true), Ok(0)), "excb: ExCreateCallback abre objeto existente");
     let power = guest::read64(output);
-    assert(callbacks::counts(power).is_some_and(|(references, _, _)| references == 1) && callbacks::name(power).as_deref() == Some("\\Callback\\PowerState"), "excb: referencia e nome do objeto do sistema");
-    assert(matches!(callbacks::dereference(power), Ok(Some(0))) && callbacks::exists(power), "excb: objeto permanente sobrevive sem referencias");
+    // Os drivers da árvore de dispositivos (o acpi.sys) também abrem o
+    // \Callback\PowerState e guardam a referência deles: a abertura daqui
+    // soma uma às que já existem, e a liberação a devolve.
+    let references = callbacks::counts(power).map_or(0, |(references, _, _)| references);
+    assert(references >= 1 && callbacks::name(power).as_deref() == Some("\\Callback\\PowerState"), "excb: referencia e nome do objeto do sistema");
+    assert(matches!(callbacks::dereference(power), Ok(Some(remaining)) if remaining == references - 1) && callbacks::exists(power), "excb: objeto permanente sobrevive sem referencias");
     object_attributes(scratch, 0, "\\Callback\\Phase3Cb", 0x40);
     assert(matches!(callbacks::create(output, scratch, false, false), Ok(0xC000_0034)), "excb: nome inexistente sem criacao");
     assert(matches!(callbacks::create(output, scratch, true, false), Ok(0)), "excb: criacao temporaria");

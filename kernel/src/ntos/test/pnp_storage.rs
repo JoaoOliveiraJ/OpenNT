@@ -207,29 +207,35 @@ fn tree_support(assert: Assert) {
     // O prefixo real de um Windows nesta VM: "3&267a616a&0&09" (pai ACPI\PNP0A03\0).
     assert(tree::parent_id_hash("ACPI\\PNP0A03\\0") == 0x267A_616A && tree::parent_id_hash("acpi\\pnp0a03\\0") == 0x267A_616A, "pnp-storage: hash do ParentIdPrefix igual ao do Windows");
     assert(tree::parent_id_hash("PCI_HAL\\PNP0A03\\0") == 0x0EBB_567F, "pnp-storage: hash do barramento raiz do OpenNT");
-    // Arbitragem: a faixa preferida ocupada cai na alternativa.
-    let choice = |minimum: u64, maximum: u64, option_length: u32| resources::Choice { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, length: option_length, alignment: 16, minimum, maximum, private: [0; 3], affinity: 0, address: 0 };
+    // Arbitragem: a faixa preferida ocupada cai na alternativa. Memória acima
+    // de tudo que a raiz já atribuiu (com a raiz ACPI, as janelas do
+    // barramento PCI ocupam as portas e a memória baixa na raiz).
+    const BASE: u64 = 0x30_0000_0000;
+    let choice = |minimum: u64, maximum: u64, option_length: u32| resources::Choice { resource_type: resources::resource_type::MEMORY, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0, length: option_length, alignment: 16, minimum: BASE + minimum, maximum: BASE + maximum, private: [0; 3], affinity: 0, address: 0 };
     let requirements = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice(0xF000, 0xF00F, 16), choice(0xE000, 0xEFFF, 16)]]] };
     let first = resources::assign(0x7_7000_0001, &requirements);
     let second = resources::assign(0x7_7000_0002, &requirements);
-    assert(first.as_ref().is_some_and(|list| list.resources[0].start == 0xF000) && second.as_ref().is_some_and(|list| list.resources[0].start == 0xE000), "pnp-storage: conflito na faixa preferida usa a alternativa");
+    assert(first.as_ref().is_some_and(|list| list.resources[0].start == BASE + 0xF000) && second.as_ref().is_some_and(|list| list.resources[0].start == BASE + 0xE000), "pnp-storage: conflito na faixa preferida usa a alternativa");
     resources::release(0x7_7000_0001);
     resources::release(0x7_7000_0002);
     // Os árbitros da raiz não conhecem janelas de barramento: o filho de um
     // nó com faixas atribuídas na raiz colide com elas (quem aloca dentro
     // das janelas é o árbitro do driver do barramento).
     let (bus, child) = (0x7_7000_0010u64, 0x7_7000_0011u64);
-    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, start: 0xD000, length: 0x1000, extra: [0; 3] }] };
+    let window = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::MEMORY, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0, start: BASE + 0xD000, length: 0x1000, extra: [0; 3] }] };
     resources::reserve(bus, &window);
     let anywhere = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice(0xD000, 0xFFFF, 0x10)]]] };
     let outside = resources::assign(child, &anywhere);
     for owner in [bus, child] {
         resources::release(owner);
     }
-    assert(outside.as_ref().is_some_and(|list| list.resources[0].start == 0xE000), "pnp-storage: a raiz aloca fora das faixas ja atribuidas, sem janelas de barramento");
-    let interrupt =resources::CmList { interface_type: 1, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::INTERRUPT, share: 1, flags: 1, start: 14, length: 14, extra: [u32::MAX, u32::MAX, 0] }] };
+    assert(outside.as_ref().is_some_and(|list| list.resources[0].start == BASE + 0xE000), "pnp-storage: a raiz aloca fora das faixas ja atribuidas, sem janelas de barramento");
+    // O tradutor da raiz: a HAL sem ACPI leva a IRQ 14 ao vetor 0x2E no IRQL
+    // 14; com a raiz ACPI (o tradutor do acpi.sys já traduziu), a identidade.
+    let interrupt = resources::CmList { interface_type: 1, bus_number: 0, resources: alloc::vec![resources::Resource { resource_type: resources::resource_type::INTERRUPT, share: 1, flags: 1, start: 14, length: 14, extra: [u32::MAX, u32::MAX, 0] }] };
     let translated = resources::translate(&interrupt);
-    assert(translated.resources[0].length == 0x2E && translated.resources[0].start == 14, "pnp-storage: IRQ 14 traduzida para o vetor 0x2E no IRQL 14");
+    let expected = if crate::drivers::bus::acpi_stack::enabled() { (14, 14) } else { (14, 0x2E) };
+    assert(resources::translate_interrupt(14) == (0x2E, 14) && (translated.resources[0].start, translated.resources[0].length) == expected, "pnp-storage: IRQ 14 traduzida pela raiz (vetor 0x2E no IRQL 14 sem ACPI, identidade com a raiz ACPI)");
     // A lista escrita e relida é a mesma.
     let written = translated.write();
     assert(resources::CmList::read(written).is_some_and(|list| list.resources == translated.resources && list.interface_type == 1), "pnp-storage: CM_RESOURCE_LIST escrita e relida");
@@ -301,24 +307,26 @@ fn driver_arbiters(assert: Assert) {
     arbiter.size.set(ArbiterInterface::SIZE as u16);
     let handler: extern "win64" fn(u64, u32, u64) -> i32 = test_arbiter_handler;
     arbiter.arbiter_handler.set(handler as usize as u64);
-    // As respostas das pilhas sintéticas: o barramento arbitra portas, sem
+    // As respostas das pilhas sintéticas: o barramento arbitra memória, sem
     // tradutores.
-    pnp::arbiter::remember(bus, true, resources::resource_type::PORT, interface);
-    pnp::arbiter::remember(bus, false, resources::resource_type::PORT, 0);
-    pnp::arbiter::remember(child, false, resources::resource_type::PORT, 0);
+    pnp::arbiter::remember(bus, true, resources::resource_type::MEMORY, interface);
+    pnp::arbiter::remember(bus, false, resources::resource_type::MEMORY, 0);
+    pnp::arbiter::remember(child, false, resources::resource_type::MEMORY, 0);
     for counter in &TEST_ARBITER_CALLS {
         counter.store(0, Ordering::Release);
     }
-    let choice = resources::Choice { resource_type: resources::resource_type::PORT, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 1, length: 0x10, alignment: 0x10, minimum: 0x5000, maximum: 0x5FFF, private: [0; 3], affinity: 0, address: 0 };
+    // Memória acima do que a raiz já atribuiu, para comparar com ela.
+    const BASE: u64 = 0x31_0000_0000;
+    let choice = resources::Choice { resource_type: resources::resource_type::MEMORY, share: resources::SHARE_DEVICE_EXCLUSIVE, flags: 0, length: 0x10, alignment: 0x10, minimum: BASE + 0x5000, maximum: BASE + 0x5FFF, private: [0; 3], affinity: 0, address: 0 };
     let requirements = resources::Requirements { interface_type: 5, bus_number: 0, slot_number: 0, alternatives: alloc::vec![alloc::vec![alloc::vec![choice]]] };
     let lists = pnp::arbiter::allocate(child, &requirements).ok().flatten();
     let tested = TEST_ARBITER_CALLS.iter().map(|counter| counter.load(Ordering::Acquire)).collect::<Vec<_>>();
     let at_root = resources::assign(0x7_7000_0022, &requirements);
     resources::release(0x7_7000_0022);
     assert(
-        lists.as_ref().is_some_and(|(raw, translated)| raw.resources.len() == 1 && raw.resources[0].start == 0x5000 && raw.resources[0].length == 0x10 && translated.resources == raw.resources)
+        lists.as_ref().is_some_and(|(raw, translated)| raw.resources.len() == 1 && raw.resources[0].start == BASE + 0x5000 && raw.resources[0].length == 0x10 && translated.resources == raw.resources)
             && tested == [1, 1, 1, child]
-            && at_root.as_ref().is_some_and(|list| list.resources[0].start == 0x5000),
+            && at_root.as_ref().is_some_and(|list| list.resources[0].start == BASE + 0x5000),
         "pnp-storage: o requisito vai ao arbitro do driver do barramento (TestAllocation com a entrada do PDO, CommitAllocation), nao a raiz",
     );
     pnp::arbiter::release(child);
