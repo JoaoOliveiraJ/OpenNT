@@ -23,9 +23,14 @@
 //! - `x86`: o mínimo de decodificação para o passo por cima (o tamanho de
 //!   um `call`), o prólogo e a classe de uma instrução;
 //! - `monitor`: as tabelas do `qRcmd` em estruturas;
+//! - `user`: os processos de usuário (`.process`, PEB.Ldr, handles, regiões,
+//!   threads de usuário com o CONTEXT salvo);
 //! - `client`, `commands`: a sessão (comandos de texto e a API tipada que a
-//!   interface gráfica usa).
+//!   interface gráfica usa);
+//! - `analysis`: decodificador, grafo de fluxo, referências e strings,
+//!   padrões, roteiros e as notas e patches por módulo + RVA.
 
+pub mod analysis;
 pub mod bugcheck;
 pub mod client;
 pub mod commands;
@@ -44,6 +49,7 @@ pub mod tpi;
 pub mod trace;
 pub mod types;
 pub mod unwind;
+pub mod user;
 pub mod x86;
 
 pub use client::{Breakpoint, BreakpointKind, Client};

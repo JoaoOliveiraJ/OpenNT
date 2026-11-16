@@ -12,6 +12,10 @@
 //! Os módulos aparecem pelo nome sem extensão (`ntfs!NtfsCommonCreate+0x1a3`,
 //! como no WinDbg); a busca aceita o nome com ou sem extensão, e `nt` é o
 //! kernel.
+//!
+//! Os módulos de usuário de um processo (a PEB.Ldr do processo escolhido ou
+//! da parada) entram à parte (`set_user_modules`): a lista de módulos do
+//! kernel não os apaga, e a troca de processo troca só eles.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +56,8 @@ pub struct Module {
     pub pdb: Option<PathBuf>,
     /// O PDB está sendo baixado: o módulo é recarregado quando chegar.
     pub pdb_pending: bool,
+    /// Módulo de usuário (do processo de `Symbols::user_process`).
+    pub user: bool,
 }
 
 impl std::fmt::Debug for Module {
@@ -62,7 +68,7 @@ impl std::fmt::Debug for Module {
 
 impl Module {
     pub fn new(name: &str, path: &str, base: u64, end: u64, symbols: Vec<Symbol>, source: &str) -> Self {
-        Module { name: display_name(name), file_name: base_name(name).to_string(), path: path.to_string(), base, end, symbols, source: source.to_string(), image: None, unwind: None, pdb: None, pdb_pending: false }
+        Module { name: display_name(name), file_name: base_name(name).to_string(), path: path.to_string(), base, end, symbols, source: source.to_string(), image: None, unwind: None, pdb: None, pdb_pending: false, user: false }
     }
 }
 
@@ -76,6 +82,8 @@ pub struct Symbols {
     pub generation: u64,
     /// O cache de PDBs (sem ele, nada de PDB nem download).
     pub store: Option<SymbolStore>,
+    /// O EPROCESS dos módulos de usuário carregados (0 = nenhum).
+    pub user_process: u64,
 }
 
 /// Nome base sem diretório (barras dos dois tipos).
@@ -167,7 +175,8 @@ impl Symbols {
         let signature = |modules: &[Module]| -> Vec<(u64, u64, String, usize)> { modules.iter().map(|module| (module.base, module.end, module.name.clone(), module.symbols.len())).collect() };
         let before = signature(&self.modules);
         let kernel = self.kernel.map(|index| self.modules.swap_remove(index));
-        let mut previous: HashMap<(u64, String), Module> = self.modules.drain(..).map(|module| ((module.base, module.path.clone()), module)).collect();
+        let (user, system): (Vec<Module>, Vec<Module>) = self.modules.drain(..).partition(|module| module.user);
+        let mut previous: HashMap<(u64, String), Module> = system.into_iter().map(|module| ((module.base, module.path.clone()), module)).collect();
         self.kernel = None;
         if let Some(kernel) = kernel {
             self.kernel = Some(0);
@@ -195,9 +204,41 @@ impl Symbols {
             let module = self.load_module(*base, *end, path);
             self.modules.push(module);
         }
+        self.modules.extend(user);
         if signature(&self.modules) != before {
             self.generation += 1;
         }
+    }
+
+    /// Troca os módulos de usuário pelos do processo `process` (EPROCESS):
+    /// (base, fim, caminho). Os de mesma base e caminho ficam como estão.
+    pub fn set_user_modules(&mut self, process: u64, list: &[(u64, u64, String)], root: &Path) {
+        if self.store.is_none() {
+            self.store = Some(SymbolStore::new(root));
+        }
+        let kernel = self.kernel.map(|index| (self.modules[index].base, self.modules[index].path.clone()));
+        let (user, system): (Vec<Module>, Vec<Module>) = self.modules.drain(..).partition(|module| module.user);
+        self.modules = system;
+        self.kernel = kernel.and_then(|(base, path)| self.modules.iter().position(|module| module.base == base && module.path == path));
+        let mut previous: HashMap<(u64, String), Module> = user.into_iter().map(|module| ((module.base, module.path.clone()), module)).collect();
+        for (base, end, path) in list {
+            let module = match previous.remove(&(*base, path.clone())) {
+                Some(module) if !module.pdb_pending || self.store.as_ref().is_some_and(|store| store.busy()) => module,
+                _ => {
+                    let mut module = self.load_module(*base, *end, path);
+                    module.user = true;
+                    module
+                }
+            };
+            self.modules.push(module);
+        }
+        self.user_process = process;
+        self.generation += 1;
+    }
+
+    /// Os módulos de usuário carregados.
+    pub fn user_modules(&self) -> impl Iterator<Item = &Module> {
+        self.modules.iter().filter(|module| module.user)
     }
 
     /// Algum PDB ainda está chegando.

@@ -21,6 +21,7 @@ use super::symbols::Symbols;
 use super::trace::Trace;
 use super::types::{self, TypeDb};
 use super::unwind::{self, Context, Frame, FunctionTable, ReadMemory, Target};
+use super::user::{self, Handle, KernelRange, ProcessContext, Region, UserModule, UserThread};
 use super::x86;
 
 /// Quanto o `p` e o `gu` do prompt esperam a chamada voltar.
@@ -29,6 +30,16 @@ pub(crate) const RUN_TO_WAIT: Duration = Duration::from_secs(120);
 /// Onde o kernel avisa que uma imagem foi carregada (já na lista de
 /// módulos): o breakpoint interno das paradas por carga de módulo.
 const LOAD_HOOKS: [&str; 3] = ["kernel::ntos::ps::notify::image::notify", "kernel::ntos::mm::pe_loader::notify_loaded", "kernel::ntos::mm::loaded_images::register"];
+
+/// Os pontos de evento do kernel (`kd/events.rs`): criação e saída de
+/// processo, de thread e carga de imagem, com os argumentos nos
+/// registradores da convenção sysv64.
+const PROCESS_EVENT: &str = "opennt_kd_process_event";
+const THREAD_EVENT: &str = "opennt_kd_thread_event";
+const IMAGE_EVENT: &str = "opennt_kd_image_event";
+
+/// CS do anel 3: a parada foi numa thread de usuário.
+const USER_CODE_SELECTOR: u64 = 0x33;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BreakpointKind {
@@ -42,12 +53,17 @@ pub enum BreakpointKind {
     Access,
     /// Parada quando um módulo é carregado (`sxe ld:ntfs.sys`).
     Module,
+    /// Parada num evento de processo, thread ou imagem de usuário: `cpr`,
+    /// `epr` (criação e saída de processo, com `:nome` opcional), `ct`, `et`
+    /// (thread, com `:pid` opcional) e `ld:processo!dll` (carga de uma DLL
+    /// num processo; `*` vale qualquer processo).
+    Event,
 }
 
 impl BreakpointKind {
     fn packet_type(self) -> u8 {
         match self {
-            Self::Software | Self::Module => 0,
+            Self::Software | Self::Module | Self::Event => 0,
             Self::Hardware => 1,
             Self::Write => 2,
             Self::Access => 4,
@@ -61,6 +77,7 @@ impl BreakpointKind {
             Self::Write => "escrita",
             Self::Access => "acesso",
             Self::Module => "carga de modulo",
+            Self::Event => "evento",
         }
     }
 
@@ -71,6 +88,7 @@ impl BreakpointKind {
             "escrita" => Self::Write,
             "acesso" => Self::Access,
             "modulo" | "carga de modulo" => Self::Module,
+            "evento" => Self::Event,
             _ => return None,
         })
     }
@@ -102,6 +120,16 @@ pub struct Breakpoint {
     /// O símbolo é de um módulo ainda não carregado: é armado quando ele
     /// aparecer (o `bu` do WinDbg).
     pub pending: bool,
+    /// Breakpoint de log: o texto (com `{expr}`) vai ao console e a máquina
+    /// segue sem parar.
+    pub log: String,
+    /// Comandos (separados por `;`) executados quando ele para.
+    pub command: String,
+    /// O grupo (ligar e desligar juntos).
+    pub group: String,
+    /// O EPROCESS do processo dono de um breakpoint de usuário (0 = o espaço
+    /// do processador).
+    pub process: u64,
 }
 
 /// O que pedir num breakpoint novo.
@@ -115,12 +143,17 @@ pub struct BreakpointRequest {
     /// Aceita um símbolo que ainda não existe.
     pub deferred: bool,
     pub enabled: bool,
+    pub log: String,
+    pub command: String,
+    pub group: String,
+    /// O EPROCESS dono (0 = o processo escolhido no momento, se houver).
+    pub process: u64,
 }
 
 impl BreakpointRequest {
     pub fn new(kind: BreakpointKind, expression: &str) -> Self {
         let length = if matches!(kind, BreakpointKind::Write | BreakpointKind::Access) { 8 } else { 1 };
-        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true }
+        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0 }
     }
 }
 
@@ -193,6 +226,13 @@ pub struct Client {
     /// O último rastro e o de referência (a comparação).
     pub trace: Option<Trace>,
     pub reference: Option<Trace>,
+    /// O processo das leituras (`.process`), reaplicado a cada parada.
+    pub(crate) process_context: Option<ProcessContext>,
+    /// Os breakpoints internos nos pontos de evento: (endereço, símbolo, o
+    /// cliente o gravou).
+    event_hooks: Vec<(u64, &'static str, bool)>,
+    /// Saída dos breakpoints de log e dos comandos de parada.
+    pub(crate) log_lines: Vec<String>,
 }
 
 impl ReadMemory for Client {
@@ -292,6 +332,9 @@ impl Client {
             tracing: false,
             trace: None,
             reference: None,
+            process_context: None,
+            event_hooks: Vec::new(),
+            log_lines: Vec::new(),
         }
     }
 
@@ -366,6 +409,18 @@ impl Client {
         if self.selected.take().is_some() {
             let _ = self.request("Hg0");
         }
+        // Parada numa thread de usuário: o processo dela passa a ser o das
+        // leituras; senão o escolhido antes volta (o alvo o esquece a cada
+        // continuação).
+        if self.register("cs").ok() == Some(USER_CODE_SELECTOR) {
+            if let Ok(text) = self.monitor(".process") {
+                if let Some((eprocess, _)) = user::parse_current_process(&text) {
+                    let _ = self.set_process(Some(&format!("{eprocess:#x}")));
+                }
+            }
+        } else if let Some(context) = self.process_context.clone() {
+            let _ = self.monitor(&format!(".process {:#x}", context.eprocess));
+        }
         if let Some(run_to) = self.run_to.take() {
             let at_target = self.register("rip").ok() == Some(run_to.address) && stop.reasons.contains(&Reason::SoftwareBreak);
             if at_target && self.register("rsp").ok() != Some(run_to.expected_rsp) {
@@ -419,6 +474,16 @@ impl Client {
     fn check_hit(&mut self, stop: &StopReply) -> Hit {
         let Ok(rip) = self.register("rip") else { return Hit::None };
         let software = stop.reasons.contains(&Reason::SoftwareBreak);
+        if software {
+            if let Some(&(_, symbol, _)) = self.event_hooks.iter().find(|(address, _, _)| *address == rip) {
+                let user_here = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == rip);
+                return match self.check_event(symbol) {
+                    Some(text) => Hit::Stop(text),
+                    None if user_here => Hit::None,
+                    None => Hit::Continue,
+                };
+            }
+        }
         if software && self.hook_at(rip) {
             let fresh = self.new_modules();
             self.resolve_pending();
@@ -455,7 +520,7 @@ impl Client {
                     BreakpointKind::Software => software && breakpoint.address == rip,
                     BreakpointKind::Hardware => hardware && breakpoint.address == rip,
                     BreakpointKind::Write | BreakpointKind::Access => watched == Some(breakpoint.address),
-                    BreakpointKind::Module => false,
+                    BreakpointKind::Module | BreakpointKind::Event => false,
                 }
         });
         let Some(index) = index else { return Hit::None };
@@ -464,14 +529,129 @@ impl Client {
         if breakpoint.pass_count > 1 && breakpoint.hits < breakpoint.pass_count {
             return Hit::Continue;
         }
+        let mut text = format!(" (breakpoint #{}, acerto {})", breakpoint.id, breakpoint.hits);
         if !breakpoint.condition.trim().is_empty() {
-            return match self.evaluate(&breakpoint.condition) {
-                Ok(0) => Hit::Continue,
-                Ok(_) => Hit::Stop(format!(" (breakpoint #{}, condicao verdadeira, acerto {})", breakpoint.id, breakpoint.hits)),
-                Err(error) => Hit::Stop(format!(" (breakpoint #{}: erro na condicao: {error})", breakpoint.id)),
-            };
+            match self.evaluate(&breakpoint.condition) {
+                Ok(0) => return Hit::Continue,
+                Ok(_) => text = format!(" (breakpoint #{}, condicao verdadeira, acerto {})", breakpoint.id, breakpoint.hits),
+                Err(error) => return Hit::Stop(format!(" (breakpoint #{}: erro na condicao: {error})", breakpoint.id)),
+            }
         }
-        Hit::Stop(format!(" (breakpoint #{}, acerto {})", breakpoint.id, breakpoint.hits))
+        if !breakpoint.log.trim().is_empty() {
+            let line = format!("[bp #{}] {}", breakpoint.id, self.format_log(&breakpoint.log));
+            self.push_log(line);
+            return Hit::Continue;
+        }
+        Hit::Stop(text)
+    }
+
+    /// Um texto de breakpoint de log: cada `{expr}` vira o valor (`{expr:d}`
+    /// em decimal, `{expr:s}` o símbolo).
+    pub fn format_log(&mut self, format: &str) -> String {
+        let mut output = String::new();
+        let mut rest = format;
+        while let Some(open) = rest.find('{') {
+            output.push_str(&rest[..open]);
+            let Some(close) = rest[open..].find('}') else {
+                output.push_str(&rest[open..]);
+                return output;
+            };
+            let inner = &rest[open + 1..open + close];
+            let (expression, style) = match inner.rsplit_once(':') {
+                Some((expression, style)) if matches!(style, "x" | "d" | "s") => (expression, style),
+                _ => (inner, "x"),
+            };
+            match self.evaluate(expression) {
+                Ok(value) => match style {
+                    "d" => output.push_str(&(value as i64).to_string()),
+                    "s" => output.push_str(&self.symbols.describe(value)),
+                    _ => output.push_str(&format!("{value:#x}")),
+                },
+                Err(error) => output.push_str(&format!("<{error}>")),
+            }
+            rest = &rest[open + close + 1..];
+        }
+        output.push_str(rest);
+        output
+    }
+
+    /// Uma linha de log (breakpoint de log, comando de parada) no console.
+    pub(crate) fn push_log(&mut self, line: String) {
+        self.console.push_str(&line);
+        self.console.push('\n');
+        self.unread_console.push_str(&line);
+        self.unread_console.push('\n');
+        self.log_lines.push(line);
+    }
+
+    /// As linhas dos breakpoints de log da sessão.
+    pub fn log_lines(&self) -> &[String] {
+        &self.log_lines
+    }
+
+    /// Um evento de processo, thread ou imagem: o texto da parada se algum
+    /// breakpoint de evento o pede.
+    fn check_event(&mut self, symbol: &str) -> Option<String> {
+        let read = |client: &mut Client, name: &str| client.register(name).unwrap_or(0);
+        let (rdi, rsi, rdx, rcx, r8) = (read(self, "rdi"), read(self, "rsi"), read(self, "rdx"), read(self, "rcx"), read(self, "r8"));
+        let processes = self.processes().unwrap_or_default();
+        let name_of_pid = |pid: u64| processes.iter().find(|process| process.pid == pid).map(|process| process.name.clone()).unwrap_or_default();
+        let same_process = |wanted: &str, name: &str| {
+            let (wanted, name) = (wanted.to_ascii_lowercase(), name.to_ascii_lowercase());
+            wanted.is_empty() || wanted == "*" || wanted == name || name.strip_suffix(".exe") == Some(wanted.as_str())
+        };
+        let ((code, subject), description) = match symbol {
+            PROCESS_EVENT => {
+                let name = processes.iter().find(|process| process.eprocess == rdi).map(|process| process.name.clone()).unwrap_or_else(|| name_of_pid(rsi));
+                let created = rdx != 0;
+                ((if created { "cpr" } else { "epr" }, name.clone()), format!("processo {} {name} (PID {rsi}, EPROCESS {rdi:#x})", if created { "criado" } else { "saindo" }))
+            }
+            THREAD_EVENT => {
+                let exiting = rdx == 2;
+                ((if exiting { "et" } else { "ct" }, rdi.to_string()), format!("thread {} TID {rsi} no PID {rdi} ({})", if exiting { "saindo" } else { "criada" }, name_of_pid(rdi)))
+            }
+            _ => {
+                let bytes = if rcx != 0 && r8 > 0 && r8 < 0x1000 { self.read_memory(rcx, r8 as usize).unwrap_or_default() } else { Vec::new() };
+                let path = String::from_utf8_lossy(&bytes).to_string();
+                let process = if rdx == 0 { "System".to_string() } else { name_of_pid(rdx) };
+                (("ld", format!("{process}!{}", super::symbols::base_name(&path))), format!("imagem {path} em {rdi:#x} (tamanho {rsi:#x}) no processo {process} (PID {rdx})"))
+            }
+        };
+        let mut matched = None;
+        for breakpoint in self.breakpoints.iter_mut().filter(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Event) {
+            let (wanted_code, wanted) = breakpoint.expression.split_once(':').map_or((breakpoint.expression.as_str(), ""), |(code, rest)| (code, rest));
+            if !wanted_code.eq_ignore_ascii_case(code) {
+                continue;
+            }
+            let hit = match code {
+                "ld" => {
+                    let (wanted_process, wanted_dll) = wanted.split_once('!').unwrap_or(("*", wanted));
+                    let (process, dll) = subject.split_once('!').unwrap_or(("", subject.as_str()));
+                    let dll = dll.to_ascii_lowercase();
+                    let wanted_dll = wanted_dll.to_ascii_lowercase();
+                    same_process(wanted_process, process) && (wanted_dll.is_empty() || dll == wanted_dll || dll.strip_suffix(".dll") == Some(wanted_dll.as_str()))
+                }
+                "cpr" | "epr" => same_process(wanted, &subject),
+                _ => wanted.is_empty() || wanted == subject,
+            };
+            if hit {
+                breakpoint.hits += 1;
+                matched.get_or_insert((breakpoint.id, breakpoint.log.clone()));
+            }
+        }
+        let (id, log) = matched?;
+        if !log.trim().is_empty() {
+            let line = format!("[evento #{id}] {description} {}", self.format_log(&log));
+            self.push_log(line);
+            return None;
+        }
+        // Uma DLL nova num processo: os módulos dele entram nos símbolos.
+        if code == "ld" && rdx != 0 {
+            if let Some(process) = processes.iter().find(|process| process.pid == rdx) {
+                let _ = self.set_process(Some(&format!("{:#x}", process.eprocess)));
+            }
+        }
+        Some(format!(" (evento #{id}: {description})"))
     }
 
     /// Negocia a sessão: o primeiro pacote para a máquina (o depurador do
@@ -815,12 +995,26 @@ impl Client {
     }
 
     fn insert(&mut self, kind: BreakpointKind, address: u64, length: u64, insert: bool) -> Result<(), String> {
+        self.insert_in(kind, address, length, insert, 0)
+    }
+
+    /// Grava ou tira um breakpoint; `process` (EPROCESS, 0 = o escolhido)
+    /// dá a raiz de um endereço de usuário.
+    fn insert_in(&mut self, kind: BreakpointKind, address: u64, length: u64, insert: bool, process: u64) -> Result<(), String> {
         // O breakpoint interno de carga divide o endereço com um do usuário.
-        if kind == BreakpointKind::Software && self.hook_at(address) {
+        if kind == BreakpointKind::Software && (self.hook_at(address) || self.event_hooks.iter().any(|(hook, _, _)| *hook == address)) {
             return Ok(());
         }
-        let reply = self.request(&format!("{}{},{:x},{:x}", if insert { 'Z' } else { 'z' }, kind.packet_type(), address, length))?;
-        match reply.as_str() {
+        let switch = process != 0 && address < 0x8000_0000_0000 && self.process_context.as_ref().is_none_or(|context| context.eprocess != process);
+        if switch {
+            self.monitor(&format!(".process {process:#x}"))?;
+        }
+        let reply = self.request(&format!("{}{},{:x},{:x}", if insert { 'Z' } else { 'z' }, kind.packet_type(), address, length));
+        if switch {
+            let restore = self.process_context.as_ref().map_or("0".to_string(), |context| format!("{:#x}", context.eprocess));
+            let _ = self.monitor(&format!(".process {restore}"));
+        }
+        match reply?.as_str() {
             "OK" => Ok(()),
             "" => Err("tipo de breakpoint sem suporte no alvo".into()),
             other => Err(format!("breakpoint em {address:#x}: {other}")),
@@ -838,6 +1032,23 @@ impl Client {
     pub fn add_breakpoint_with(&mut self, request: &BreakpointRequest) -> Result<Breakpoint, String> {
         self.require_stopped()?;
         let kind = request.kind;
+        if kind == BreakpointKind::Event {
+            let expression = request.expression.trim().to_string();
+            let code = expression.split(':').next().unwrap_or("").to_ascii_lowercase();
+            if !["cpr", "epr", "ct", "et", "ld"].contains(&code.as_str()) {
+                return Err("uso: sxe cpr[:nome] | epr[:nome] | ct[:pid] | et[:pid] | ld:processo!dll".into());
+            }
+            if let Some(existing) = self.breakpoints.iter_mut().find(|breakpoint| breakpoint.kind == kind && breakpoint.expression.eq_ignore_ascii_case(&expression)) {
+                existing.enabled = request.enabled;
+                existing.log = request.log.clone();
+                let copy = existing.clone();
+                self.update_event_hooks()?;
+                return Ok(copy);
+            }
+            let breakpoint = self.push_breakpoint(request, 0, false);
+            self.update_event_hooks()?;
+            return Ok(breakpoint);
+        }
         if kind == BreakpointKind::Module {
             let name = request.expression.trim().to_string();
             if name.is_empty() {
@@ -869,12 +1080,27 @@ impl Client {
             }
             self.breakpoints[index].condition = request.condition.clone();
             self.breakpoints[index].pass_count = request.pass_count;
+            self.breakpoints[index].log = request.log.clone();
+            self.breakpoints[index].command = request.command.clone();
+            self.breakpoints[index].group = request.group.clone();
             return Ok(self.breakpoints[index].clone());
         }
+        let process = if request.process != 0 {
+            request.process
+        } else if address < 0x8000_0000_0000 {
+            self.process_context.as_ref().map_or(0, |context| context.eprocess)
+        } else {
+            0
+        };
         if request.enabled {
-            self.insert(kind, address, request.length, true)?;
+            self.insert_in(kind, address, request.length, true, process)?;
         }
-        Ok(self.push_breakpoint(request, address, false))
+        let mut breakpoint = self.push_breakpoint(request, address, false);
+        if let Some(entry) = self.breakpoints.iter_mut().find(|entry| entry.id == breakpoint.id) {
+            entry.process = process;
+            breakpoint.process = process;
+        }
+        Ok(breakpoint)
     }
 
     fn push_breakpoint(&mut self, request: &BreakpointRequest, address: u64, pending: bool) -> Breakpoint {
@@ -889,6 +1115,10 @@ impl Client {
             pass_count: request.pass_count,
             hits: 0,
             pending,
+            log: request.log.trim().to_string(),
+            command: request.command.trim().to_string(),
+            group: request.group.trim().to_string(),
+            process: request.process,
         };
         self.next_breakpoint += 1;
         self.breakpoints.push(breakpoint.clone());
@@ -953,11 +1183,12 @@ impl Client {
         self.require_stopped()?;
         let index = self.breakpoints.iter().position(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
         let breakpoint = self.breakpoints[index].clone();
-        if breakpoint.enabled && !breakpoint.pending && breakpoint.kind != BreakpointKind::Module {
-            self.insert(breakpoint.kind, breakpoint.address, breakpoint.length, false)?;
+        if breakpoint.enabled && !breakpoint.pending && !matches!(breakpoint.kind, BreakpointKind::Module | BreakpointKind::Event) {
+            self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, false, breakpoint.process)?;
         }
         self.breakpoints.remove(index);
         self.update_load_hook()?;
+        self.update_event_hooks()?;
         Ok(breakpoint)
     }
 
@@ -967,12 +1198,234 @@ impl Client {
         let index = self.breakpoints.iter().position(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
         let breakpoint = self.breakpoints[index].clone();
         if breakpoint.enabled != enabled {
-            if !breakpoint.pending && breakpoint.kind != BreakpointKind::Module {
-                self.insert(breakpoint.kind, breakpoint.address, breakpoint.length, enabled)?;
+            if !breakpoint.pending && !matches!(breakpoint.kind, BreakpointKind::Module | BreakpointKind::Event) {
+                self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, enabled, breakpoint.process)?;
             }
             self.breakpoints[index].enabled = enabled;
         }
-        self.update_load_hook()
+        self.update_load_hook()?;
+        self.update_event_hooks()
+    }
+
+    /// Liga ou desliga todos os breakpoints de um grupo; devolve quantos.
+    pub fn set_group_enabled(&mut self, group: &str, enabled: bool) -> Result<usize, String> {
+        let ids: Vec<u32> = self.breakpoints.iter().filter(|breakpoint| breakpoint.group == group).map(|breakpoint| breakpoint.id).collect();
+        for id in &ids {
+            self.set_breakpoint_enabled(*id, enabled)?;
+        }
+        Ok(ids.len())
+    }
+
+    /// Troca o log, os comandos de parada e o grupo de um breakpoint.
+    pub fn set_breakpoint_actions(&mut self, id: u32, log: &str, command: &str, group: &str) -> Result<(), String> {
+        let breakpoint = self.breakpoints.iter_mut().find(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
+        breakpoint.log = log.trim().to_string();
+        breakpoint.command = command.trim().to_string();
+        breakpoint.group = group.trim().to_string();
+        Ok(())
+    }
+
+    /// Vigia uma faixa de bytes com os comparadores de hardware (escrita ou
+    /// acesso): a faixa vira pedaços alinhados de 8, 4, 2 e 1 bytes, no
+    /// máximo quatro, num grupo próprio.
+    pub fn add_range_watch(&mut self, kind: BreakpointKind, start: u64, length: u64) -> Result<Vec<Breakpoint>, String> {
+        if !matches!(kind, BreakpointKind::Write | BreakpointKind::Access) {
+            return Err("faixa: so escrita ou acesso".into());
+        }
+        let chunks = range_chunks(start, length);
+        if chunks.is_empty() || chunks.len() > 4 {
+            return Err(format!("a faixa {start:#x}+{length:#x} precisa de {} comparadores (o x86 tem 4)", chunks.len()));
+        }
+        let group = format!("faixa {start:#x}+{length:#x}");
+        let mut created = Vec::new();
+        for (address, size) in chunks {
+            let mut request = BreakpointRequest::new(kind, &format!("{address:#x}"));
+            request.length = size;
+            request.group = group.clone();
+            created.push(self.add_breakpoint_with(&request)?);
+        }
+        Ok(created)
+    }
+
+    /// Os comandos de parada do breakpoint que parou a máquina por último
+    /// (o número dele e o texto).
+    pub fn stop_commands(&self) -> Option<(u32, String)> {
+        let id = self.last_stop.split("breakpoint #").nth(1).and_then(|rest| rest.split(|character: char| !character.is_ascii_digit()).next()).and_then(|id| id.parse::<u32>().ok())?;
+        let breakpoint = self.breakpoints.iter().find(|breakpoint| breakpoint.id == id)?;
+        (!breakpoint.command.trim().is_empty()).then(|| (id, breakpoint.command.clone()))
+    }
+
+    /// Arma ou tira os breakpoints internos nos pontos de evento conforme os
+    /// breakpoints de evento ligados.
+    fn update_event_hooks(&mut self) -> Result<(), String> {
+        let wanted: Vec<&'static str> = [PROCESS_EVENT, THREAD_EVENT, IMAGE_EVENT]
+            .into_iter()
+            .filter(|symbol| {
+                let codes: &[&str] = match *symbol {
+                    PROCESS_EVENT => &["cpr", "epr"],
+                    THREAD_EVENT => &["ct", "et"],
+                    _ => &["ld"],
+                };
+                self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Event && codes.iter().any(|code| breakpoint.expression.to_ascii_lowercase().starts_with(code)))
+            })
+            .collect();
+        let mut keep = Vec::new();
+        for (address, symbol, inserted) in std::mem::take(&mut self.event_hooks) {
+            if wanted.contains(&symbol) {
+                keep.push((address, symbol, inserted));
+            } else if inserted && !self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == address) {
+                let _ = self.request(&format!("z0,{address:x},1"));
+            }
+        }
+        self.event_hooks = keep;
+        for symbol in wanted {
+            if self.event_hooks.iter().any(|(_, existing, _)| *existing == symbol) {
+                continue;
+            }
+            let address = self.symbols.lookup(symbol).map_err(|_| format!("o kernel nao tem o ponto de evento {symbol} (kernel antigo?)"))?;
+            let user = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == address);
+            if !user {
+                let reply = self.request(&format!("Z0,{address:x},1"))?;
+                if reply != "OK" {
+                    return Err(format!("breakpoint de evento em {address:#x}: {reply}"));
+                }
+            }
+            self.event_hooks.push((address, symbol, !user));
+        }
+        Ok(())
+    }
+
+    // ---- processos de usuário ------------------------------------------------
+
+    /// Escolhe o processo das leituras (`.process`): PID, EPROCESS ou
+    /// `None` (o espaço do processador). Os módulos de usuário dele (a
+    /// PEB.Ldr e as imagens do VAD) entram nos símbolos.
+    pub fn set_process(&mut self, process: Option<&str>) -> Result<Option<ProcessContext>, String> {
+        let Some(process) = process.map(str::trim).filter(|text| !text.is_empty() && *text != "0") else {
+            self.monitor(".process 0")?;
+            self.process_context = None;
+            return Ok(None);
+        };
+        let text = self.monitor(&format!(".process {process}"))?;
+        let mut context = user::parse_process_context(&text).ok_or_else(|| text.trim().to_string())?;
+        context.name = self.processes().unwrap_or_default().into_iter().find(|entry| entry.eprocess == context.eprocess).map(|entry| entry.name).unwrap_or_default();
+        let changed = self.symbols.user_process != context.eprocess;
+        self.process_context = Some(context.clone());
+        if changed {
+            let _ = self.reload_user_modules();
+        }
+        Ok(Some(context))
+    }
+
+    /// O processo das leituras, se escolhido.
+    pub fn process(&self) -> Option<&ProcessContext> {
+        self.process_context.as_ref()
+    }
+
+    /// A parada é numa thread de usuário (CS do anel 3).
+    pub fn stopped_in_user_mode(&mut self) -> bool {
+        self.register("cs").ok() == Some(USER_CODE_SELECTOR)
+    }
+
+    /// Os módulos do processo escolhido: a PEB.Ldr e, para as imagens que
+    /// ainda não estão nela (uma DLL recém-mapeada), o VAD.
+    pub fn user_modules(&mut self) -> Result<Vec<UserModule>, String> {
+        let context = self.process_context.clone().ok_or("nenhum processo escolhido (.process <pid>)")?;
+        let mut modules = if context.peb != 0 { user::read_loader_list(self, context.peb).unwrap_or_default() } else { Vec::new() };
+        if let Ok(regions) = self.regions(&format!("{:#x}", context.eprocess)) {
+            for region in regions.into_iter().filter(|region| region.kind == "Image" && !region.name.is_empty()) {
+                if !modules.iter().any(|module| module.base == region.base) {
+                    let name = super::symbols::base_name(&region.name).to_string();
+                    modules.push(UserModule { base: region.base, size: region.size, entry: 0, name, path: region.name.clone() });
+                }
+            }
+        }
+        modules.sort_by_key(|module| module.base);
+        Ok(modules)
+    }
+
+    /// Recarrega os módulos de usuário do processo escolhido nos símbolos;
+    /// devolve quantos.
+    pub fn reload_user_modules(&mut self) -> Result<usize, String> {
+        let context = self.process_context.clone().ok_or("nenhum processo escolhido (.process <pid>)")?;
+        let modules = self.user_modules()?;
+        let list: Vec<(u64, u64, String)> = modules.iter().map(|module| (module.base, module.base + module.size.max(0x1000), if module.path.is_empty() { module.name.clone() } else { module.path.clone() })).collect();
+        self.symbols.set_user_modules(context.eprocess, &list, &self.root);
+        Ok(list.len())
+    }
+
+    /// A tabela de handles de um processo (todas as páginas).
+    pub fn handles(&mut self, process: &str) -> Result<Vec<Handle>, String> {
+        let mut handles = Vec::new();
+        let mut start = 0u64;
+        loop {
+            let text = self.monitor(&format!("handles {process} {start}"))?;
+            if handles.is_empty() && !text.contains("HANDLE_TABLE") {
+                return Err(text.trim().to_string());
+            }
+            handles.extend(user::parse_handles(&text));
+            match user::next_page(&text) {
+                Some(next) if next > start && handles.len() < 65536 => start = next,
+                _ => break,
+            }
+        }
+        Ok(handles)
+    }
+
+    /// As regiões de usuário de um processo (todas as páginas).
+    pub fn regions(&mut self, process: &str) -> Result<Vec<Region>, String> {
+        let mut regions = Vec::new();
+        let mut start = 0u64;
+        loop {
+            let text = self.monitor(&format!("vad {process} {start}"))?;
+            if regions.is_empty() && !text.contains("regioes") {
+                return Err(text.trim().to_string());
+            }
+            regions.extend(user::parse_regions(&text));
+            match user::next_page(&text) {
+                Some(next) if next > start && regions.len() < 65536 => start = next,
+                _ => break,
+            }
+        }
+        Ok(regions)
+    }
+
+    /// As threads de usuário de um processo.
+    pub fn user_threads(&mut self, process: &str) -> Result<Vec<UserThread>, String> {
+        let text = self.monitor(&format!("uthreads {process}"))?;
+        if !text.contains("CR3") {
+            return Err(text.trim().to_string());
+        }
+        Ok(user::parse_user_threads(&text))
+    }
+
+    /// As faixas fixas do espaço de sistema.
+    pub fn kernel_ranges(&mut self) -> Result<Vec<KernelRange>, String> {
+        Ok(user::parse_kernel_map(&self.monitor("kmap")?))
+    }
+
+    /// Os registradores de usuário de uma thread pelo CONTEXT salvo dela.
+    pub fn user_thread_registers(&mut self, thread: &UserThread) -> Result<Vec<(String, u64)>, String> {
+        if thread.context == 0 {
+            return Err(format!("thread {}: sem CONTEXT salvo", thread.tid));
+        }
+        let bytes = self.read_memory(thread.context, 0x100)?;
+        Ok(user::context_registers(&bytes).into_iter().map(|(name, value)| (name.to_string(), value)).collect())
+    }
+
+    /// A pilha de usuário de uma thread (o CONTEXT salvo, desenrolado pela
+    /// `.pdata` dos módulos do processo escolhido).
+    pub fn user_thread_backtrace(&mut self, thread: &UserThread, limit: usize) -> Result<(Vec<(String, u64)>, Vec<Frame>), String> {
+        let registers = self.user_thread_registers(thread)?;
+        let rip = registers.iter().find(|(name, _)| name == "rip").map(|(_, value)| *value).unwrap_or(0);
+        let named: Vec<(&str, u64)> = registers.iter().map(|(name, value)| (name.as_str(), *value)).collect();
+        let frames = unwind::walk(self, Context::from_named(rip, &named), false, limit);
+        Ok((registers, frames))
+    }
+
+    /// Parar ou não nas exceções de primeira chance do anel 3.
+    pub fn set_user_exceptions(&mut self, enabled: bool) -> Result<String, String> {
+        self.monitor(if enabled { "uex on" } else { "uex off" })
     }
 
     /// Liga ou tira o breakpoint de software num endereço (o clique na
@@ -994,7 +1447,17 @@ impl Client {
     /// Os breakpoints em texto (o arquivo de sessão): tipo, ligado, tamanho,
     /// contagem, expressão e condição, separados por tabulação.
     pub fn breakpoint_specs(&self) -> String {
-        self.breakpoints.iter().map(|breakpoint| format!("{}\t{}\t{}\t{}\t{}\t{}\n", breakpoint.kind.key(), breakpoint.enabled as u8, breakpoint.length, breakpoint.pass_count, breakpoint.expression, breakpoint.condition)).collect()
+        self.breakpoints
+            .iter()
+            .map(|breakpoint| {
+                let mut line = format!("{}\t{}\t{}\t{}\t{}\t{}", breakpoint.kind.key(), breakpoint.enabled as u8, breakpoint.length, breakpoint.pass_count, breakpoint.expression, breakpoint.condition);
+                if !breakpoint.log.is_empty() || !breakpoint.command.is_empty() || !breakpoint.group.is_empty() {
+                    line.push_str(&format!("\t{}\t{}\t{}", breakpoint.log, breakpoint.command, breakpoint.group));
+                }
+                line.push('\n');
+                line
+            })
+            .collect()
     }
 
     /// Recria os breakpoints de um arquivo de sessão (adiados quando o
@@ -1012,6 +1475,9 @@ impl Client {
             request.length = fields.get(2).and_then(|text| text.parse().ok()).unwrap_or(request.length);
             request.pass_count = fields.get(3).and_then(|text| text.parse().ok()).unwrap_or(0);
             request.condition = fields.get(5).copied().unwrap_or("").to_string();
+            request.log = fields.get(6).copied().unwrap_or("").to_string();
+            request.command = fields.get(7).copied().unwrap_or("").to_string();
+            request.group = fields.get(8).copied().unwrap_or("").to_string();
             request.deferred = true;
             if let Err(error) = self.add_breakpoint_with(&request) {
                 errors.push(format!("{}: {error}", request.expression));
@@ -1107,6 +1573,8 @@ impl Client {
         self.stopped = false;
         self.breakpoints.clear();
         self.load_hook = None;
+        self.event_hooks.clear();
+        self.process_context = None;
         Ok(format!("desligado ({reply})"))
     }
 
@@ -1166,5 +1634,32 @@ impl Client {
             bytes.extend_from_slice(&data);
         }
         Ok(bytes)
+    }
+}
+
+/// Uma faixa em pedaços alinhados de 8, 4, 2 e 1 bytes (os tamanhos que um
+/// comparador de hardware aceita).
+pub fn range_chunks(start: u64, length: u64) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::new();
+    let mut address = start;
+    let end = start.saturating_add(length);
+    while address < end && chunks.len() <= 4 {
+        let size = [8u64, 4, 2, 1].into_iter().find(|size| address % size == 0 && address + size <= end).unwrap_or(1);
+        chunks.push((address, size));
+        address += size;
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_chunks;
+
+    #[test]
+    fn splits_ranges_for_the_comparators() {
+        assert_eq!(range_chunks(0x1000, 16), vec![(0x1000, 8), (0x1008, 8)]);
+        assert_eq!(range_chunks(0x1003, 6), vec![(0x1003, 1), (0x1004, 4), (0x1008, 1)]);
+        assert_eq!(range_chunks(0x1000, 0), vec![]);
+        assert!(range_chunks(0x1001, 64).len() > 4);
     }
 }

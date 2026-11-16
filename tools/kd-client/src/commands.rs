@@ -40,6 +40,15 @@
 //! trace [n] [ate <expr>] [ret] [over] [entra|sai <mod>] [pula <mod>] [vigia <expr> [bytes]]
 //! trace show [de] [n] | trace tree [n] | trace save <arq> | trace diff <arq> | trace ref | trace status
 //! monitor <texto>            comando do OpenNT no alvo
+//! .process [pid|eprocess|0]  processo das leituras e dos breakpoints de usuario
+//! lmu                        modulos de usuario do processo escolhido (PEB.Ldr e VAD)
+//! handles | vad | uthreads <pid> [i]   handles, regioes e threads de usuario de um processo
+//! ustack <tid> [n]           pilha de usuario de uma thread do processo escolhido
+//! kmap | events | uex [on|off]   faixas do sistema, ultimos eventos, excecoes do anel 3
+//! sxe | sxd cpr[:nome] | epr[:nome] | ct[:pid] | et[:pid] | ld:processo!dll   eventos
+//! bp <expr> /log "texto {expr}" | /cmd "r; k" | /g grupo   log, comandos de parada, grupo
+//! bgd | bge <grupo>          desliga / religa um grupo de breakpoints
+//! bar <w|a> <expr> <bytes>   vigia uma faixa com ate quatro comparadores
 //! detach | quit
 //! ```
 //!
@@ -68,6 +77,8 @@ dt <tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload
 ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd | monitor <texto>
 !process [pid|eprocess] | !thread [ethread] | !irp <expr> | !devobj <expr|caminho> | !drvobj <expr|caminho>
 !object <caminho> | !handle <pid> <handle> | !analyze
+.process [pid|eprocess|0] | lmu | handles/vad/uthreads <pid> [i] | ustack <tid> [n] | kmap | events | uex [on|off]
+sxe cpr[:nome]|epr[:nome]|ct[:pid]|et[:pid]|ld:proc!dll | bp <expr> /log \"txt {expr}\" /cmd \"r\" /g grupo | bgd/bge <grupo> | bar <w|a> <expr> <bytes>
 trace [n] [ate <expr>] [ret] [over] [entra|sai <mod>] [pula <mod>] [vigia <expr> [bytes]]
 trace show [de] [n] | trace tree [n] | trace save <arq> | trace diff <arq> | trace ref | trace status
 detach | quit
@@ -157,6 +168,47 @@ fn split_two(text: &str) -> Option<(&str, &str)> {
 }
 
 /// `L<n>` de um comando de memória.
+/// As opções de texto de um `bp`: `/log "..."`, `/cmd "..."` e `/g nome`.
+#[derive(Default)]
+struct BreakpointOptions {
+    log: String,
+    command: String,
+    group: String,
+}
+
+/// Tira as opções `/log`, `/cmd` e `/g` do texto de um `bp` (o resto volta).
+fn breakpoint_options(text: &str) -> (String, BreakpointOptions) {
+    let mut options = BreakpointOptions::default();
+    let mut rest = text.to_string();
+    for (key, slot) in [("/log", 0), ("/cmd", 1), ("/g", 2)] {
+        let Some(start) = rest.find(&format!("{key} ")) else { continue };
+        let after = rest[start + key.len()..].trim_start();
+        let (value, consumed) = if let Some(quoted) = after.strip_prefix('"') {
+            match quoted.find('"') {
+                Some(end) => (quoted[..end].to_string(), rest.len() - after.len() + end + 2),
+                None => (quoted.to_string(), rest.len()),
+            }
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            (after[..end].to_string(), rest.len() - after.len() + end)
+        };
+        match slot {
+            0 => options.log = value,
+            1 => options.command = value,
+            _ => options.group = value,
+        }
+        rest = format!("{} {}", rest[..start].trim_end(), rest[consumed.min(rest.len())..].trim_start()).trim().to_string();
+    }
+    (rest, options)
+}
+
+/// `sxe` de evento (processo, thread ou DLL de usuário), não de módulo do
+/// kernel.
+fn is_event_filter(text: &str) -> bool {
+    let code = text.trim().split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(code.as_str(), "cpr" | "epr" | "ct" | "et") || (code == "ld" && text.contains('!'))
+}
+
 fn length_argument(words: &[&str]) -> Option<u64> {
     words.iter().find_map(|word| word.strip_prefix('L').or_else(|| word.strip_prefix('l')).and_then(|count| parse_number(count).or_else(|| u64::from_str_radix(count, 16).ok())))
 }
@@ -167,6 +219,9 @@ impl Client {
         if breakpoint.kind == BreakpointKind::Module {
             return Ok(format!("para quando {} carregar (#{})", breakpoint.expression, breakpoint.id));
         }
+        if breakpoint.kind == BreakpointKind::Event {
+            return Ok(format!("para no evento {} (#{})", breakpoint.expression, breakpoint.id));
+        }
         if breakpoint.pending {
             return Ok(format!("adiado: {} (#{}), armado quando o modulo carregar", breakpoint.expression, breakpoint.id));
         }
@@ -176,6 +231,18 @@ impl Client {
         }
         if !breakpoint.condition.is_empty() {
             text.push_str(&format!(" se {}", breakpoint.condition));
+        }
+        if !breakpoint.log.is_empty() {
+            text.push_str(&format!(" log \"{}\"", breakpoint.log));
+        }
+        if !breakpoint.command.is_empty() {
+            text.push_str(&format!(" comandos \"{}\"", breakpoint.command));
+        }
+        if !breakpoint.group.is_empty() {
+            text.push_str(&format!(" grupo {}", breakpoint.group));
+        }
+        if breakpoint.process != 0 {
+            text.push_str(&format!(" processo {:#x}", breakpoint.process));
         }
         Ok(text)
     }
@@ -214,6 +281,8 @@ impl Client {
         for breakpoint in &self.breakpoints {
             let place = if breakpoint.kind == BreakpointKind::Module {
                 format!("ld:{}", breakpoint.expression)
+            } else if breakpoint.kind == BreakpointKind::Event {
+                format!("evento {}", breakpoint.expression)
             } else if breakpoint.pending {
                 "(adiado)".to_string()
             } else {
@@ -225,6 +294,18 @@ impl Client {
             }
             if !breakpoint.condition.is_empty() {
                 output.push_str(&format!(" se {}", breakpoint.condition));
+            }
+            if !breakpoint.log.is_empty() {
+                output.push_str(&format!(" log \"{}\"", breakpoint.log));
+            }
+            if !breakpoint.command.is_empty() {
+                output.push_str(&format!(" comandos \"{}\"", breakpoint.command));
+            }
+            if !breakpoint.group.is_empty() {
+                output.push_str(&format!(" grupo {}", breakpoint.group));
+            }
+            if breakpoint.process != 0 {
+                output.push_str(&format!(" processo {:#x}", breakpoint.process));
             }
             output.push_str(&format!(" acertos {}\n", breakpoint.hits));
         }
@@ -603,7 +684,9 @@ impl Client {
                 Ok(format!("{value:#x} em {address:#x}"))
             }
             "bp" | "bu" => {
-                // bp <expr> [N] [/w "condição"]
+                // bp <expr> [N] [/w "condição"] [/log "texto"] [/cmd "comandos"] [/g grupo]
+                let (rest, options) = breakpoint_options(rest);
+                let rest = rest.as_str();
                 let (main, condition) = match rest.split_once("/w") {
                     Some((main, condition)) => (main.trim(), condition.trim().trim_matches('"').to_string()),
                     None => (rest, String::new()),
@@ -617,6 +700,9 @@ impl Client {
                 request.condition = condition;
                 request.pass_count = pass_count;
                 request.deferred = command == "bu";
+                request.log = options.log;
+                request.command = options.command;
+                request.group = options.group;
                 self.breakpoint_command(request)
             }
             "bc" if rest == "all" || rest == "*" => {
@@ -663,8 +749,18 @@ impl Client {
                     self.clear_command(kind, target, length)
                 }
             }
+            "sxe" | "sxd" if is_event_filter(rest) => {
+                let expression = rest.trim().to_string();
+                if command == "sxe" {
+                    self.breakpoint_command(BreakpointRequest::new(BreakpointKind::Event, &expression))
+                } else {
+                    let id = self.breakpoints.iter().find(|breakpoint| breakpoint.kind == BreakpointKind::Event && breakpoint.expression.eq_ignore_ascii_case(&expression)).map(|breakpoint| breakpoint.id).ok_or_else(|| format!("nenhuma parada no evento {expression}"))?;
+                    self.remove_breakpoint(id)?;
+                    Ok(format!("sem parada no evento {expression}"))
+                }
+            }
             "sxe" | "sxd" => {
-                let module = rest.strip_prefix("ld:").or_else(|| rest.strip_prefix("ld ")).ok_or("uso: sxe ld:<modulo>")?.trim();
+                let module = rest.strip_prefix("ld:").or_else(|| rest.strip_prefix("ld ")).ok_or("uso: sxe ld:<modulo> | cpr | epr | ct | et | ld:processo!dll")?.trim();
                 if command == "sxe" {
                     self.breakpoint_command(BreakpointRequest::new(BreakpointKind::Module, module))
                 } else {
@@ -762,6 +858,53 @@ impl Client {
             "!analyze" => Ok(self.analyze()?.text()),
             "trace" => self.trace_command(&words),
             "monitor" => self.monitor(rest),
+            ".process" => {
+                if rest.is_empty() {
+                    return self.monitor(".process");
+                }
+                match self.set_process(Some(rest))? {
+                    Some(context) => {
+                        let modules = self.symbols.user_modules().count();
+                        Ok(format!("processo {} (PID {}) EPROCESS {:#x} CR3 {:#x} PEB {:#x}; {modules} modulos de usuario", context.name, context.pid, context.eprocess, context.cr3, context.peb))
+                    }
+                    None => Ok("processo das leituras: o do processador".into()),
+                }
+            }
+            "lmu" => {
+                let modules = self.user_modules()?;
+                self.reload_user_modules()?;
+                let mut output = String::new();
+                for module in &modules {
+                    let symbols = self.symbols.module_at(module.base).map(|loaded| format!("{} simbolos ({})", loaded.symbols.len(), loaded.source)).unwrap_or_default();
+                    output.push_str(&format!("{:#018x} {:#018x} {:<20} {symbols}\n", module.base, module.base + module.size, module.name));
+                }
+                Ok(output)
+            }
+            "handles" | "vad" | "uthreads" | "kmap" | "events" | "uex" => self.monitor(line),
+            "ustack" => {
+                let tid = words.first().and_then(|text| parse_number(text)).ok_or("uso: ustack <tid> [n] (processo escolhido com .process)")?;
+                let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;
+                let process = self.process().map(|context| format!("{:#x}", context.eprocess)).ok_or("nenhum processo escolhido (.process <pid>)")?;
+                let thread = self.user_threads(&process)?.into_iter().find(|thread| thread.tid == tid).ok_or_else(|| format!("thread {tid} nao e deste processo"))?;
+                let (_, frames) = self.user_thread_backtrace(&thread, limit)?;
+                Ok(self.format_frames_with_stack(&frames))
+            }
+            "bgd" | "bge" => {
+                let count = self.set_group_enabled(rest, command == "bge")?;
+                Ok(format!("grupo {rest}: {count} breakpoints {}", if command == "bge" { "ligados" } else { "desligados" }))
+            }
+            "bar" => {
+                let usage = "uso: bar <w|a> <expr> <bytes>";
+                let kind = match words.first().copied() {
+                    Some("w") => BreakpointKind::Write,
+                    Some("a" | "r") => BreakpointKind::Access,
+                    _ => return Err(usage.into()),
+                };
+                let start = self.evaluate(words.get(1).ok_or(usage)?)?;
+                let length = self.evaluate(words.get(2).ok_or(usage)?)?;
+                let created = self.add_range_watch(kind, start, length)?;
+                Ok(created.iter().map(|breakpoint| format!("#{} {:#x} ({} bytes)", breakpoint.id, breakpoint.address, breakpoint.length)).collect::<Vec<_>>().join("\n"))
+            }
             "modules" => Ok(self.symbols.modules.iter().map(|module| format!("{:#018x} {:#018x} {:<16} {} simbolos ({})\n", module.base, module.end, module.name, module.symbols.len(), module.source)).collect()),
             "detach" => self.detach(),
             "help" => Ok(HELP.to_string()),
@@ -774,6 +917,7 @@ impl Client {
         &[
             "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
+            ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
         ]
     }
 
@@ -881,6 +1025,20 @@ mod tests {
         assert_eq!(options.enter_module, "ACPI");
         assert!(TraceOptions::parse(&["xyz"]).is_err());
         assert!(TraceOptions::parse(&["ate"]).is_err());
+    }
+
+    #[test]
+    fn breakpoint_text_options() {
+        let (rest, options) = breakpoint_options("ntdll!NtClose /log \"fechou {@rcx}\" /g fechar");
+        assert_eq!(rest, "ntdll!NtClose");
+        assert_eq!(options.log, "fechou {@rcx}");
+        assert_eq!(options.group, "fechar");
+        let (rest, options) = breakpoint_options("x 3 /w \"@rax == 1\" /cmd \"r; k 4\"");
+        assert_eq!(rest, "x 3 /w \"@rax == 1\"");
+        assert_eq!(options.command, "r; k 4");
+        assert!(is_event_filter("ld:csrss!winsrv.dll"));
+        assert!(is_event_filter("cpr:winlogon.exe"));
+        assert!(!is_event_filter("ld:ntfs.sys"));
     }
 
     #[test]
