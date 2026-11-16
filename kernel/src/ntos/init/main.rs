@@ -80,7 +80,12 @@ async fn keyboard_service() -> u32 {
                 }
             }
             Some(request) => {
-                if dispatcher::wait_for_single_object(event, zero_timeout, 0, false) == 0 {
+                // O READ pendente: a thread espera o evento da conclusão (sem
+                // prazo, numa thread de kernel a espera bloqueia de verdade),
+                // em vez de sondar e ceder a vez, o que a deixaria sempre
+                // pronta e tiraria a CPU das threads de prioridade menor.
+                let timeout = if crate::ntos::ke::context_switch::kernel_thread_can_block() { 0 } else { zero_timeout };
+                if dispatcher::wait_for_single_object(event, timeout, 0, false) == 0 {
                     // O READ completou: lê os dados ANTES de liberar.
                     let data = request.pending_buffer;
                     // SAFETY: o IRP do READ pendente (liberado só depois).
