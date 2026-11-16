@@ -37,6 +37,7 @@ extern crate alloc;
 mod build;
 mod debug;
 mod hive_image;
+mod host_language;
 mod kernel_pe;
 mod nt_types;
 mod ntfs_image;

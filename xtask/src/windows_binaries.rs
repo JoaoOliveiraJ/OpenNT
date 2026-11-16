@@ -363,7 +363,13 @@ fn boot_resources_mui(windows: &Path) -> Option<PathBuf> {
         .filter(|path| path.is_file())
         .collect();
     candidates.sort();
-    candidates.into_iter().next()
+    // O idioma de interface desta instalação primeiro (`host_language`).
+    let languages = crate::host_language::ui_languages();
+    let preferred = candidates.iter().position(|path| path.parent().and_then(|folder| folder.file_name()).and_then(|name| name.to_str()).is_some_and(|name| languages.iter().any(|language| language.eq_ignore_ascii_case(name))));
+    match preferred {
+        Some(index) => Some(candidates.swap_remove(index)),
+        None => candidates.into_iter().next(),
+    }
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -553,6 +559,22 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("imagens de kernel do smss no volume NTFS: {images} de {}", SMSS_KERNEL_IMAGES.len());
+        // Os recursos dos programas e das imagens de System32 nos idiomas de
+        // interface desta máquina (`System32\<idioma>\<nome>.mui`), que o
+        // carregador de recursos procura pelo idioma do convidado (o mesmo
+        // daqui, `host_language`).
+        let languages = crate::host_language::ui_languages();
+        let names = SMSS_PROGRAMS.iter().copied().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
+        let mut resources = 0;
+        for name in names {
+            for (path, source) in crate::host_language::mui_files(&system32, name, &languages) {
+                if let Ok(bytes) = fs::read(&source) {
+                    files.push((path, bytes));
+                    resources += 1;
+                }
+            }
+        }
+        println!("recursos .mui no volume NTFS: {resources} (idiomas {})", languages.join(", "));
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));

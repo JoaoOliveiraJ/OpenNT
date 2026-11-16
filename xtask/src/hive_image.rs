@@ -378,16 +378,34 @@ fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str) -> Vec<u8> {
     write_hive(&keys, now_filetime(), file_name)
 }
 
+/// Uma chave copiada desta máquina como chave de semente.
+fn seed_of(key: crate::host_language::HostKey) -> cm::seed::SeedKey {
+    let mut seed = cm::seed::SeedKey::new(&key.path);
+    for (name, value_type, data) in key.values {
+        seed.value(&name, value_type, data);
+    }
+    seed
+}
+
 /// As hives de máquina de `\SystemRoot\System32\config`, com o nome do
 /// arquivo: SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT. `smss_boot`: o boot
 /// do processo inicial real (`--initial-process=smss`).
 pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
+    let mut system = cm::seed::system_keys(smss_boot);
+    let mut default = cm::seed::default_keys();
+    // No boot do processo inicial real, o idioma desta instalação
+    // (`host_language`): a SYSTEM e a DEFAULT levam as chaves daqui.
+    if smss_boot {
+        let control_set = format!("ControlSet{:03}", cm::seed::CURRENT_CONTROL_SET);
+        system.extend(crate::host_language::system_keys(&control_set).into_iter().map(seed_of));
+        default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
+    }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
-        ("SYSTEM", cm::seed::system_keys(smss_boot)),
+        ("SYSTEM", system),
         ("SOFTWARE", cm::seed::software_keys(smss_boot)),
         ("SAM", cm::seed::sam_keys()),
         ("SECURITY", cm::seed::security_keys()),
-        ("DEFAULT", cm::seed::default_keys()),
+        ("DEFAULT", default),
     ];
     hives.into_iter().map(|(name, seeds)| (name, hive_from_seeds(seeds, &format!("\\SystemRoot\\System32\\config\\{name}")))).collect()
 }
