@@ -1113,6 +1113,90 @@ pub fn open_sender_process_kernel(out: u64, port_handle: u64, message: u64, acce
     result
 }
 
+/// Um pedido síncrono de kernel na própria porta de conexão de um servidor
+/// de usuário: como no AlpcpProcessSynchronousRequest com a porta de
+/// conexão como destino, a mensagem entra na fila da porta de conexão (um
+/// LPC_REQUEST sem porta de comunicação, PortContext zero) e quem pediu
+/// espera a resposta pelo MessageId; a resposta volta no buffer de recepção
+/// como LPC_REPLY, com o CLIENT_ID de quem respondeu.
+fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Box<dyn crate::ntos::alpc::kernel_entry::Pending> {
+    use crate::ntos::alpc::kernel_entry::Completed;
+    let captured = match message_buffer::capture_message_with(input, server.listener.maximum().max(PortMessage::SIZE as u32), 0, server.legacy()) {
+        Ok(captured) => captured,
+        Err(status) => return Box::new(Completed(status)),
+    };
+    let sender = current_sender();
+    let slot: ReplySlot = Arc::new(SpinLock::new(None));
+    let id = {
+        let mut state = server.state.lock();
+        if state.closed {
+            return Box::new(Completed(STATUS_PORT_DISCONNECTED));
+        }
+        let id = UserServer::next_id(&mut state);
+        state.requests.insert(id, slot.clone());
+        state.senders.insert(id, Origin { sender, client: 0 });
+        id
+    };
+    let message_type = if server.legacy() { LPC_REQUEST } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
+    server.enqueue(Delivery { id, message_type, data: captured.data, sender, port_context: 0, view: None });
+    Box::new(ConnectionRequest { server: server.clone(), id, slot, output: receive.output, length: receive.length, done: false })
+}
+
+/// A espera do pedido de kernel na porta de conexão.
+struct ConnectionRequest {
+    server: Arc<UserServer>,
+    id: u32,
+    slot: ReplySlot,
+    output: u64,
+    length: u64,
+    done: bool,
+}
+
+/// LPC_REPLY.
+const LPC_REPLY: u16 = 2;
+
+impl crate::ntos::alpc::kernel_entry::Pending for ConnectionRequest {
+    fn poll(&mut self) -> Option<u32> {
+        if self.done {
+            return Some(STATUS_SUCCESS);
+        }
+        let result = self.slot.lock().take()?;
+        self.done = true;
+        if result.status != STATUS_SUCCESS || self.output == 0 {
+            return Some(result.status);
+        }
+        let total = PortMessage::SIZE as usize + result.data.len();
+        if self.length != 0 && total as u64 > self.length {
+            return Some(0xC000_0023);
+        }
+        let mut bytes = alloc::vec![0u8; total];
+        let put = |bytes: &mut Vec<u8>, offset: usize, value: &[u8]| bytes[offset..offset + value.len()].copy_from_slice(value);
+        put(&mut bytes, offset_of!(PortMessage, u1.s1.data_length), &(result.data.len() as u16).to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, u1.s1.total_length), &(total as u16).to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, u2.s2.type_), &LPC_REPLY.to_le_bytes());
+        let replier = result.sender.unwrap_or_default();
+        put(&mut bytes, offset_of!(PortMessage, client_id.unique_process), &replier.process.to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, client_id.unique_thread), &replier.thread.to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, message_id), &self.id.to_le_bytes());
+        bytes[PortMessage::SIZE as usize..].copy_from_slice(&result.data);
+        Some(match guest::try_write_bytes(self.output, &bytes) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(_) => STATUS_ACCESS_VIOLATION,
+        })
+    }
+
+    /// Sem resposta (prazo, alerta, saída): o pedido sai da fila de
+    /// respostas, e uma resposta tardia dá STATUS_REPLY_MESSAGE_MISMATCH.
+    fn cancel(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut state = self.server.state.lock();
+        state.requests.remove(&self.id);
+        state.senders.remove(&self.id);
+    }
+}
+
 /// ZwAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
 /// servidor de kernel: a resposta e a recepção como em [`exchange`], com os
 /// buffers do chamador sem sonda e a espera pela continuação de kernel (o
@@ -1122,6 +1206,11 @@ pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: 
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
     if flags & 0x2_0000 != 0 {
+        // O pedido síncrono de kernel direto à porta de conexão (o win32k
+        // manda o LpcSendWaitReceivePort à \Windows\ApiPort do csrss).
+        if input != 0 && SERVERS.lock().get(&port.pointer).is_some_and(|owner| Arc::ptr_eq(owner, &server)) {
+            return Ok(connection_request(&server, input, receive));
+        }
         crate::debug_print!("[alpc] servidor de kernel: pedido sincrono do servidor sem suporte");
         return Ok(Box::new(Completed(STATUS_NOT_SUPPORTED)));
     }
