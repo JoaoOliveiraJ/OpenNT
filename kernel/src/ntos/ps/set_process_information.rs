@@ -26,6 +26,19 @@
 //!   tabela de handles (processo saindo) é STATUS_PROCESS_IS_TERMINATING. O
 //!   ExEnableHandleExceptions liga HANDLE_TABLE.EnableHandleExceptions, que
 //!   não desliga mais depois de ligado.
+//! - ProcessExceptionPort (8): a porta LPC que recebe as exceções não
+//!   tratadas do processo (o csrss põe a dele, a \Windows\ApiPort, em cada
+//!   processo da sessão no CsrSbCreateSession). Como no 19041: um HANDLE (8
+//!   bytes) ou o PROCESS_EXCEPTION_PORT (16 bytes, com o StateFlags de 3
+//!   bits, que volta no buffer com o estado anterior; outro bit dá
+//!   STATUS_INVALID_PARAMETER); outro tamanho dá STATUS_INFO_LENGTH_MISMATCH.
+//!   Exige SeTcbPrivilege (STATUS_PRIVILEGE_NOT_HELD), referencia a porta
+//!   (acesso zero) e o processo com PROCESS_SUSPEND_RESUME, e troca
+//!   EPROCESS.ExceptionPortData (o ponteiro da porta com o estado nos 3 bits
+//!   baixos); pelo HANDLE só, um estado anterior não zero dá
+//!   STATUS_INVALID_PARAMETER. A porta anterior recebe o aviso da troca (o
+//!   datagrama de tipo 13 com o PID) e é solta; o fim do processo solta a
+//!   porta corrente.
 //!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
@@ -50,17 +63,21 @@ const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// SeDebugPrivilege.
 const DEBUG_PRIVILEGE: u64 = 20;
-/// PROCESS_SET_INFORMATION.
+/// PROCESS_SET_INFORMATION e PROCESS_SUSPEND_RESUME.
 const PROCESS_SET_INFORMATION: u32 = 0x200;
+const PROCESS_SUSPEND_RESUME: u32 = 0x800;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+/// SeTcbPrivilege.
+const TCB_PRIVILEGE: u64 = 7;
 /// PROCESSINFOCLASS.
+pub const PROCESS_EXCEPTION_PORT: u32 = 8;
 pub const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
 pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 pub const PROCESS_DEBUG_FLAGS: u32 = 31;
 pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
 /// As classes desta área.
-pub const CLASSES: [u32; 4] = [PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
+pub const CLASSES: [u32; 5] = [PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
 /// PROCESS_DEBUG_INHERIT, o único bit de ProcessDebugFlags.
 const PROCESS_DEBUG_INHERIT: u32 = 1;
 /// SEM_NOALIGNMENTFAULTEXCEPT do modo de erro.
@@ -227,6 +244,7 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
             unsafe { Eprocess::at(process) }.set_no_debug_inherit((value & PROCESS_DEBUG_INHERIT == 0) as u32);
             Ok(0)
         }
+        PROCESS_EXCEPTION_PORT => set_exception_port(mode, buffer, length, process_of),
         _ => {
             crate::debug_print!("[ps] NtSetInformationProcess classe {} (sem suporte)", class);
             Ok(STATUS_INVALID_INFO_CLASS)
@@ -258,4 +276,104 @@ pub fn set_information_kernel(handle: u64, class: u32, buffer: u64, length: u32)
     }
     failure?;
     status
+}
+
+/// O tipo da mensagem que avisa a porta de exceções trocada.
+const LPC_EXCEPTION_PORT_REPLACED: u16 = 13;
+
+/// ProcessExceptionPort: o HANDLE ou o PROCESS_EXCEPTION_PORT.
+fn set_exception_port(mode: u8, buffer: u64, length: u32, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 8 && length != 16 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let read = |offset: u64, size: u64| -> Result<Result<u64, u32>, KernelError> {
+        if mode != 0 {
+            if !user_probe::probe_user_read(buffer + offset, size) {
+                return Ok(Err(STATUS_ACCESS_VIOLATION));
+            }
+            return Ok(Ok(if size == 8 { guest::try_read::<u64>(buffer + offset)? } else { guest::try_read::<u32>(buffer + offset)? as u64 }));
+        }
+        // SAFETY: buffer de entrada de um chamador de modo kernel.
+        Ok(Ok(if size == 8 { unsafe { Field::<u64>::at(buffer + offset) }.get() } else { unsafe { Field::<u32>::at(buffer + offset) }.get() as u64 }))
+    };
+    let handle = match read(0, 8)? {
+        Ok(handle) => handle,
+        Err(status) => return Ok(status),
+    };
+    let flags = if length == 16 {
+        match read(8, 4)? {
+            Ok(flags) if flags & !7 != 0 => return Ok(STATUS_INVALID_PARAMETER),
+            Ok(flags) => flags,
+            Err(status) => return Ok(status),
+        }
+    } else {
+        0
+    };
+    if !crate::ntos::se::privilege::single_privilege_check(TCB_PRIVILEGE, mode as u32) {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    let port = match crate::ntos::alpc::port_reference::reference(handle, 0, mode)? {
+        Ok(reference) => reference.port,
+        Err(status) => return Ok(status),
+    };
+    let release_port = |pointer: u64| {
+        let _ = crate::ntos::ob::objects::dispatcher::dereference(pointer);
+    };
+    let process = match process_of(PROCESS_SUSPEND_RESUME) {
+        Ok(process) => process,
+        Err(status) => {
+            release_port(port.pointer);
+            return Ok(status);
+        }
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou.
+    let data = &unsafe { Eprocess::at(process) }.exception_port_data;
+    let new = port.pointer | flags;
+    let mut old = data.get();
+    loop {
+        if length == 16 {
+            let state = (old & 7) as u32;
+            if mode != 0 {
+                if !user_probe::probe_user_write(buffer + 8, 4) || guest::try_write::<u32>(buffer + 8, state).is_err() {
+                    release_port(port.pointer);
+                    return Ok(STATUS_ACCESS_VIOLATION);
+                }
+            } else {
+                // SAFETY: buffer de um chamador de modo kernel.
+                unsafe { Field::<u32>::at(buffer + 8) }.set(state);
+            }
+        } else if old & 7 != 0 {
+            release_port(port.pointer);
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        match data.atomic().compare_exchange(old, new, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(current) => old = current,
+        }
+    }
+    let previous = old & !7;
+    if previous != 0 {
+        if let Some(replaced) = crate::ntos::ob::objects::port::port_of(previous) {
+            // SAFETY: EPROCESS retido pelo handle.
+            let id = unsafe { Eprocess::at(process) }.unique_process_id.get();
+            let sender = crate::ntos::alpc::transport::Sender { process: crate::ntos::ps::process::get_current_process_id(), thread: crate::ntos::ps::process::get_current_thread_id(), thread_pointer: crate::ntos::ps::process::get_current_thread() };
+            crate::ntos::alpc::server::post_datagram(&replaced, LPC_EXCEPTION_PORT_REPLACED, &id.to_le_bytes(), sender);
+        }
+        release_port(previous);
+    }
+    Ok(0)
+}
+
+/// O fim do processo solta a porta de exceções (PspProcessDelete).
+fn release_exception_port(process: u64) {
+    // SAFETY: o EPROCESS que termina, vivo durante as rotinas de término.
+    let data = &unsafe { Eprocess::at(process) }.exception_port_data;
+    let previous = data.atomic().swap(0, core::sync::atomic::Ordering::SeqCst) & !7;
+    if previous != 0 {
+        let _ = crate::ntos::ob::objects::dispatcher::dereference(previous);
+    }
+}
+
+pub fn init() {
+    crate::ntos::ps::process::register_process_exit_routine(release_exception_port);
 }

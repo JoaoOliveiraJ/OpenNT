@@ -3,8 +3,9 @@
 //! Buffers, identidade de mensagens, recursos da comunicação (seções,
 //! vistas, contextos de segurança e reservas), a referência da IOCP, a
 //! espera retomável, os tipos do transporte e o lado servidor das portas de
-//! modo usuário (`server`). O serviço de portas de usuário entra com
-//! `ps/user/alpc`.
+//! modo usuário (`server`), com as portas LPC de modo usuário sobre ele
+//! (`lpc_ports`). O serviço de portas de usuário entra com `ps/user/alpc` e
+//! `ps/user/lpc`.
 
 pub mod cancel_message;
 pub mod completion_association;
@@ -16,6 +17,7 @@ pub mod kernel_entry;
 pub mod kernel_wait;
 pub mod legacy_service;
 pub mod lpc;
+pub mod lpc_ports;
 pub mod port_reference;
 pub mod port_sections;
 pub mod query_information;

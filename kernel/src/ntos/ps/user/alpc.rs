@@ -112,7 +112,9 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
     let identity = &request.identity;
     message_identity::clear_attributes(identity);
     identity.with(|state| state.replied = true);
-    let buffer = if result.status != 0 { None } else { Some(reply(&result.data, 2, identity, None)) };
+    // O CLIENT_ID da resposta é o de quem respondeu (o servidor), quando o
+    // serviço o informa.
+    let buffer = if result.status != 0 { None } else { Some(reply(&result.data, 2, identity, result.sender)) };
     if let (Some(reserve), Some(buffer)) = (&reserve, &buffer) {
         if buffer.len() as u64 <= resource_reserves::storage_length(reserve) {
             resource_reserves::write(reserve, buffer, 0)?;
@@ -781,19 +783,26 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     if context_address != 0 && !message_buffer::writable(context_address, 32, mode) {
         return Ok(Err(AV));
     }
-    let captured = match message_buffer::capture_message(input, port.maximum(), mode) {
+    // Uma porta LPC (ALPC_PORFLG_LPC_MODE) aceita TotalLength maior que o
+    // necessário (AlpcpValidateMessage do modo LPC).
+    let lpc_port = port.with(|state| state.port_flags) & crate::ntos::alpc::server::LPC_MODE != 0;
+    let captured = match message_buffer::capture_message_with(input, port.maximum(), mode, lpc_port) {
         Ok(captured) => captured,
         Err(status) => return Ok(Err(status)),
     };
     let header = &captured.header;
-    let reserve_id = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+    // Numa porta LPC, Type 0 é um pedido novo, como no AlpcpSendMessage: o
+    // MessageId e o CLIENT_ID que o buffer traz (a resposta anterior, num
+    // buffer reaproveitado pelo CsrClientCallServer) não contam.
+    let lpc_request = lpc_port && header[4] == 0;
+    let reserve_id = if lpc_request { 0 } else { u32::from_le_bytes([header[24], header[25], header[26], header[27]]) };
     // IDs positivos designam associações de mensagem: esta ponta de cliente
     // não tem pedido de servidor correspondente. Reservas têm o bit alto.
     if reserve_id != 0 && reserve_id & 0x8000_0000 == 0 {
         return Ok(Err(0xC000_0702));
     }
     let cid_present = header[8..24].iter().any(|&byte| byte != 0);
-    if !legacy_synchronous && reserve_id == 0 && cid_present {
+    if !legacy_synchronous && !lpc_request && reserve_id == 0 && cid_present {
         return Ok(Err(0xC000_0702));
     }
     let reserve = if reserve_id != 0 { resource_reserves::find(port, reserve_id) } else { None };

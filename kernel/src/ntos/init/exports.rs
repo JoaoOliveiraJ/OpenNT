@@ -695,6 +695,8 @@ pub fn init() {
     crate::ntos::ps::user::timer_objects::init();
     crate::ntos::ob::objects::completion::init();
     crate::ntos::ob::objects::port::init();
+    crate::ntos::ps::termination_ports::init();
+    crate::ntos::ps::set_process_information::init();
     // O fallback LPC registra antes da camada ALPC.
     crate::ntos::ps::user::lpc::init();
     crate::ntos::ps::user::alpc::init();

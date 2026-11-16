@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::sections::{self, MapRequest};
 use super::state;
+use crate::ntos::alpc::lpc_ports;
 use crate::ntos::alpc::transport::{Reply, Service, ServiceReply};
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::ob::object_manager::{self, NodeId};
@@ -184,16 +185,34 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, server_view
     }
 }
 
+/// O nome é o de um serviço hospedado no kernel (o nó `Port`); senão a
+/// conexão vai às portas ALPC de servidor (`alpc/lpc_ports.rs`).
+fn kernel_service_target(name: u64) -> bool {
+    state::guarded(|| Ok(match lpc_ports::connection_target(name)? {
+        Ok((_, type_name)) if type_name == "Port" => 1,
+        _ => 0,
+    }))
+    .is_ok_and(|kernel| kernel == 1)
+}
+
 fn nt_connect_port(out: u64, name: u64, qos: u64, view: u64, rsp: u64) -> Result<u32, KernelError> {
-    connect(out, name, qos, view, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8))
+    let (server_view, max_length, information, information_length) = (state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8));
+    if kernel_service_target(name) {
+        return connect(out, name, qos, view, server_view, max_length, information, information_length);
+    }
+    lpc_ports::connect(out, name, qos, view, 0, server_view, max_length, information, information_length)
 }
 
 fn nt_secure_connect_port(out: u64, name: u64, qos: u64, view: u64, rsp: u64) -> Result<u32, KernelError> {
-    // A validação do SID exige o serviço de token/segurança.
-    if state::stack_arg(rsp, 5) != 0 {
-        return Ok(0xC000_00BB);
+    let (required_sid, server_view, max_length, information, information_length) = (state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8), state::stack_arg(rsp, 9));
+    if kernel_service_target(name) {
+        // A validação do SID exige o serviço de token/segurança.
+        if required_sid != 0 {
+            return Ok(0xC000_00BB);
+        }
+        return connect(out, name, qos, view, server_view, max_length, information, information_length);
     }
-    connect(out, name, qos, view, state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8), state::stack_arg(rsp, 9))
+    lpc_ports::connect(out, name, qos, view, required_sid, server_view, max_length, information, information_length)
 }
 
 /// Pedido síncrono: status e o comprimento a informar.
@@ -246,7 +265,103 @@ pub fn request(handle: u64, input: u64, output: u64, capacity: u64) -> Result<(u
 }
 
 fn nt_request_wait_reply_port(handle: u64, input: u64, output: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
-    request(handle, input, output, 0x1_0000).map(|(status, _)| status)
+    if lpc_ports::kernel_service_handle(handle) {
+        return request(handle, input, output, 0x1_0000).map(|(status, _)| status);
+    }
+    lpc_ports::request_wait_reply(handle, input, output)
+}
+
+// ---- as portas LPC sobre o ALPC (`alpc/lpc_ports.rs`) ---------------------------
+
+/// NtCreatePort(PortHandle*, ObjectAttributes, MaxConnectionInfoLength,
+/// MaxMessageLength, MaxPoolUsage).
+fn nt_create_port(out: u64, attributes: u64, _connection_information: u64, maximum: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::create_port(out, attributes, maximum as u32, false)
+}
+
+fn nt_create_waitable_port(out: u64, attributes: u64, _connection_information: u64, maximum: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::create_port(out, attributes, maximum as u32, true)
+}
+
+/// NtListenPort(PortHandle, ConnectionRequest).
+fn nt_listen_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::listen(handle, message)
+}
+
+/// NtAcceptConnectPort(PortHandle*, PortContext, ConnectionRequest,
+/// AcceptConnection, ServerView, ClientView).
+fn nt_accept_connect_port(out: u64, context: u64, message: u64, accept: u64, rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::accept(out, context, message, accept as u8 != 0, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6))
+}
+
+/// NtCompleteConnectPort(PortHandle).
+fn nt_complete_connect_port(handle: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(lpc_ports::complete_connect(handle))
+}
+
+/// NtRequestPort(PortHandle, RequestMessage).
+fn nt_request_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::request(handle, message)
+}
+
+/// NtReplyPort(PortHandle, ReplyMessage).
+fn nt_reply_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::reply(handle, message)
+}
+
+/// NtReplyWaitReceivePort(PortHandle, PortContext*, ReplyMessage,
+/// ReceiveMessage).
+fn nt_reply_wait_receive_port(handle: u64, context: u64, reply: u64, receive: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::reply_wait_receive(handle, context, reply, receive, 0)
+}
+
+/// NtReplyWaitReceivePortEx(PortHandle, PortContext*, ReplyMessage,
+/// ReceiveMessage, Timeout).
+fn nt_reply_wait_receive_port_ex(handle: u64, context: u64, reply: u64, receive: u64, rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::reply_wait_receive(handle, context, reply, receive, state::stack_arg(rsp, 5))
+}
+
+/// NtReplyWaitReplyPort(PortHandle, ReplyMessage).
+fn nt_reply_wait_reply_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::reply_wait_reply(handle, message)
+}
+
+/// NtImpersonateClientOfPort(PortHandle, Message).
+fn nt_impersonate_client_of_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::impersonate_client(handle, message, true)
+}
+
+/// NtAlpcImpersonateClientOfPort(PortHandle, Message, Flags).
+fn nt_alpc_impersonate_client_of_port(handle: u64, message: u64, _flags: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::impersonate_client(handle, message, false)
+}
+
+/// NtReadRequestData(PortHandle, Message, DataEntryIndex, Buffer,
+/// BufferSize, NumberOfBytesRead).
+fn nt_read_request_data(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::copy_request_data(handle, message, false)
+}
+
+/// NtWriteRequestData(PortHandle, Message, DataEntryIndex, Buffer,
+/// BufferSize, NumberOfBytesWritten).
+fn nt_write_request_data(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::copy_request_data(handle, message, true)
+}
+
+/// NtQueryInformationPort(PortHandle, PortInformationClass,
+/// PortInformation, Length, ReturnLength).
+fn nt_query_information_port(handle: u64, _class: u64, information: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::query_information(handle, information, length as u32, state::stack_arg(rsp, 5))
+}
+
+/// NtRegisterThreadTerminatePort(PortHandle).
+fn nt_register_thread_terminate_port(handle: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ps::termination_ports::register(handle)
+}
+
+/// NtSetDefaultHardErrorPort(DefaultHardErrorPort).
+fn nt_set_default_hard_error_port(handle: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ex::hard_error::set_default_port(handle)
 }
 
 /// Fallback das portas LPC no NtAlpcSendWaitReceivePort.
@@ -277,4 +392,21 @@ pub fn init() {
     state::register_handler("NtSecureConnectPort", nt_secure_connect_port);
     state::register_handler("NtRequestWaitReplyPort", nt_request_wait_reply_port);
     state::register_handler("NtAlpcSendWaitReceivePort", nt_alpc_send_wait_receive_port);
+    state::register_handler("NtCreatePort", nt_create_port);
+    state::register_handler("NtCreateWaitablePort", nt_create_waitable_port);
+    state::register_handler("NtListenPort", nt_listen_port);
+    state::register_handler("NtAcceptConnectPort", nt_accept_connect_port);
+    state::register_handler("NtCompleteConnectPort", nt_complete_connect_port);
+    state::register_handler("NtRequestPort", nt_request_port);
+    state::register_handler("NtReplyPort", nt_reply_port);
+    state::register_handler("NtReplyWaitReceivePort", nt_reply_wait_receive_port);
+    state::register_handler("NtReplyWaitReceivePortEx", nt_reply_wait_receive_port_ex);
+    state::register_handler("NtReplyWaitReplyPort", nt_reply_wait_reply_port);
+    state::register_handler("NtImpersonateClientOfPort", nt_impersonate_client_of_port);
+    state::register_handler("NtAlpcImpersonateClientOfPort", nt_alpc_impersonate_client_of_port);
+    state::register_handler("NtReadRequestData", nt_read_request_data);
+    state::register_handler("NtWriteRequestData", nt_write_request_data);
+    state::register_handler("NtQueryInformationPort", nt_query_information_port);
+    state::register_handler("NtRegisterThreadTerminatePort", nt_register_thread_terminate_port);
+    state::register_handler("NtSetDefaultHardErrorPort", nt_set_default_hard_error_port);
 }

@@ -85,6 +85,13 @@ pub struct Captured {
 /// Tamanhos inconsistentes precedem PORT_MESSAGE_TOO_LONG; o remetente
 /// não é alterado.
 pub fn capture_message(input: u64, maximum_length: u32, access_mode: u8) -> Result<Captured, u32> {
+    capture_message_with(input, maximum_length, access_mode, false)
+}
+
+/// Como [`capture_message`]; numa porta LPC (`legacy`) o TotalLength pode
+/// passar de DataLength + 0x28 e é normalizado para essa soma, como o
+/// AlpcpValidateMessage do modo LPC.
+pub fn capture_message_with(input: u64, maximum_length: u32, access_mode: u8, legacy: bool) -> Result<Captured, u32> {
     if !accessible(input, HEADER_SIZE, access_mode, false) {
         return Err(ACCESS_VIOLATION);
     }
@@ -92,9 +99,15 @@ pub fn capture_message(input: u64, maximum_length: u32, access_mode: u8) -> Resu
     header.copy_from_slice(&read_block(input, HEADER_SIZE)?);
     let field = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]) as u64;
     let data_length = field(core::mem::offset_of!(PortMessage, u1.s1.data_length));
-    let total_length = field(core::mem::offset_of!(PortMessage, u1.s1.total_length));
-    if total_length != HEADER_SIZE + data_length || field(core::mem::offset_of!(PortMessage, u2.s2.data_info_offset)) != 0 {
+    let mut total_length = field(core::mem::offset_of!(PortMessage, u1.s1.total_length));
+    let consistent = if legacy { HEADER_SIZE + data_length <= total_length } else { total_length == HEADER_SIZE + data_length };
+    if !consistent || HEADER_SIZE + data_length > 0xFFFF || field(core::mem::offset_of!(PortMessage, u2.s2.data_info_offset)) != 0 {
         return Err(0xC000_000D);
+    }
+    if legacy {
+        total_length = HEADER_SIZE + data_length;
+        let at = core::mem::offset_of!(PortMessage, u1.s1.total_length);
+        header[at..at + 2].copy_from_slice(&(total_length as u16).to_le_bytes());
     }
     if total_length > maximum_length as u64 {
         return Err(0xC000_002F);
