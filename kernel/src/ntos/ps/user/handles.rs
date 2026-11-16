@@ -212,8 +212,7 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
         return duplicate_object_manager_handle(source, source_handle, target_process, out, requested_access, requested_attributes, options);
     }
     if entry.is_none() && !pseudo_process {
-        // O pseudo-handle de thread entra com `ps/user/threads`.
-        return Ok(BAD_HANDLE);
+        return duplicate_current_thread(target_process, out, requested_access, requested_attributes, options);
     }
     let (source_access, source_attributes) = entry.as_ref().map_or((0x1F_FFFF, 0), |entry| (entry.access(), entry.attributes()));
     let mut new_handle: Option<(u32, u64, Arc<ProcessState>)> = None;
@@ -271,6 +270,52 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
         let _ = attached(source, || state::close_user_handle_in(&source_table, source_handle & !3, true, false));
     }
     result
+}
+
+/// THREAD_ALL_ACCESS, o acesso de DUPLICATE_SAME_ACCESS do pseudo-handle.
+const THREAD_ALL_ACCESS: u32 = 0x1F_FFFF;
+
+/// A duplicação do pseudo-handle da thread corrente (NtCurrentThread): um
+/// handle real da thread de quem chama, com THREAD_ALL_ACCESS
+/// (DUPLICATE_SAME_ACCESS) ou o acesso pedido, como o DuplicateHandle de
+/// GetCurrentThread que o rpcrt4 faz. A cópia vai para o processo
+/// corrente; outro destino ainda não é atendido (STATUS_INVALID_HANDLE, com
+/// registro). DUPLICATE_CLOSE_SOURCE não fecha um pseudo-handle.
+fn duplicate_current_thread(target_process: u64, out: u64, requested_access: u32, requested_attributes: u32, options: u32) -> Result<u32, KernelError> {
+    if target_process == 0 {
+        return Ok(if options & 1 != 0 { 0 } else { INVALID });
+    }
+    let (target, _) = match duplication_process(target_process) {
+        Ok(found) => found,
+        Err(status) => return Ok(status),
+    };
+    if out != 0 && !state::probe_user_write(out, 8) {
+        return Ok(AV);
+    }
+    let attributes = if options & 4 != 0 { 0 } else { requested_attributes };
+    if attributes & !3 != 0 {
+        return Ok(INVALID);
+    }
+    let Some(thread) = super::threads::current() else { return Ok(BAD_HANDLE) };
+    if target != process::get_current_process() {
+        crate::debug_print!("[ob] NtDuplicateObject do pseudo-handle de thread para outro processo sem suporte");
+        return Ok(BAD_HANDLE);
+    }
+    let access = if options & 2 != 0 { THREAD_ALL_ACCESS } else { requested_access };
+    let handle = match super::threads::thread_handle(&thread, access, attributes) {
+        Ok(handle) => handle,
+        Err(error) if error.status != 0 => return Ok(error.status),
+        Err(error) => return Err(error),
+    };
+    if out != 0 {
+        if let Err(error) = guest::try_write::<u64>(out, handle) {
+            if let Some(table) = process_state::get(target) {
+                let _ = state::close_user_handle_in(&table, handle, true, true);
+            }
+            return Ok(error.status);
+        }
+    }
+    Ok(0)
 }
 
 /// A duplicação de um handle da tabela do Object Manager (seções, diretórios,
