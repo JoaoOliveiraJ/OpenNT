@@ -699,7 +699,11 @@ fn namespace_handles(assert: Assert) {
     assert(guest::read32(context) == 1 && crate::ntos::rtl::guest_strings::read_unicode_string(entries[0].name.address()) == "Link" && crate::ntos::rtl::guest_strings::read_unicode_string(entries[0].type_name.address()) == "SymbolicLink", "ns: entrada nome/tipo");
     assert(entries[1].name.length.get() == 0 && entries[1].name.maximum_length.get() == 0 && entries[1].name.buffer.get() == 0, "ns: terminador vazio");
     assert(nh::query_directory(directory, query, 0x100, false, false, context, length) == 0x8000_001A, "ns: STATUS_NO_MORE_ENTRIES");
-    assert(nh::query_directory(directory, query, 40, false, true, context, length) == 0xC000_0023, "ns: buffer insuficiente");
+    // A primeira entrada que não cabe: sem ReturnSingleEntry a varredura
+    // para com STATUS_MORE_ENTRIES e só o terminador (ReturnLength 0x20);
+    // com ele, STATUS_BUFFER_TOO_SMALL e o tamanho da entrada.
+    assert(nh::query_directory(directory, query, 40, false, true, context, length) == 0x105 && guest::read32(length) == 0x20 && guest::read32(context) == 0, "ns: entrada grande demais sem ReturnSingleEntry");
+    assert(nh::query_directory(directory, query, 40, true, true, context, length) == 0xC000_0023 && guest::read32(length) == 100, "ns: buffer insuficiente");
     // O último handle remove o nome do diretório temporário.
     assert(matches!(close::close(link, Some(0)), Ok(0)) && om::unlink("\\Phase3Ns\\Link"), "ns: fecha e remove o link");
     assert(matches!(close::close(reopened, Some(0)), Ok(0)) && om::lookup("\\Phase3Ns").is_some(), "ns: nome vivo enquanto ha handle");
