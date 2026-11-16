@@ -56,18 +56,17 @@ use crate::ntos::alpc::security_contexts::Quality;
 use crate::ntos::alpc::server::{self, ClientView, LegacyViews, LPC_MODE};
 use crate::ntos::alpc::transport::{self, Reply};
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{PortMessage, PortView, RemotePortView, SecurityClientContext, SecurityImpersonationLevel, SecurityQualityOfService, Sid, UnicodeString};
+use crate::ntos::inc::types::{PortMessage, PortView, RemotePortView, SecurityQualityOfService, Sid, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
-use crate::ntos::ob::{object_reference, reference_trace};
 use crate::ntos::ps::process;
+use crate::ntos::ps::security::{self as ps_security, CapturedQuality};
 use crate::ntos::ps::user::alpc::{self as user_alpc, Exchange, ReceiveArguments};
 use crate::ntos::ps::user::sections::{self, MapRequest};
 use crate::ntos::ps::user::state;
-use crate::ntos::se::client_security;
 use crate::rtl::KernelError;
 
 const STATUS_SUCCESS: u32 = 0;
@@ -82,7 +81,6 @@ const STATUS_PORT_MESSAGE_TOO_LONG: u32 = 0xC000_002F;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_PORT_DISCONNECTED: u32 = 0xC000_0037;
-const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
 const STATUS_LPC_REPLY_LOST: u32 = 0xC000_0253;
@@ -696,35 +694,10 @@ pub fn impersonate_client(handle: u64, message: u64, legacy: bool) -> Result<u32
 }
 
 /// SeCreateClientSecurity da thread do cliente com a qualidade dada e
-/// SeImpersonateClientEx na thread corrente; a referência do contexto volta
-/// (SeDeleteClientSecurity).
+/// SeImpersonateClientEx na thread corrente (o corpo do NtImpersonateThread).
 fn impersonate_thread(thread: u64, quality: Quality) -> Result<u32, KernelError> {
-    let size = SecurityClientContext::SIZE + SecurityQualityOfService::SIZE;
-    let block = guest::alloc_bytes(size);
-    if block == 0 {
-        return Ok(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    guest::write_bytes(block, &alloc::vec![0u8; size as usize]);
-    // SAFETY: bloco recém-alocado e zerado, com o tamanho dos dois tipos.
-    let (context, qos) = unsafe { (SecurityClientContext::at(block), SecurityQualityOfService::at(block + SecurityClientContext::SIZE)) };
-    qos.length.set(SecurityQualityOfService::SIZE as u32);
-    qos.impersonation_level.set(SecurityImpersonationLevel(quality.level as i32));
-    qos.context_tracking_mode.set(quality.tracking);
-    qos.effective_only.set(quality.effective_only as u8);
-    let result = (|| -> Result<u32, KernelError> {
-        let status = client_security::create(thread, qos, false, context)?;
-        if status != STATUS_SUCCESS {
-            return Ok(status);
-        }
-        let status = client_security::impersonate_client(context, 0);
-        let token = context.client_token.get();
-        if token != 0 {
-            object_reference::dereference_with_tag(token, reference_trace::DEFAULT_TAG, true)?;
-        }
-        status
-    })();
-    guest::free_bytes(block);
-    result
+    let captured = CapturedQuality { level: quality.level, tracking: quality.tracking, effective_only: quality.effective_only as u8 };
+    ps_security::impersonate_thread(process::get_current_thread(), thread, captured)
 }
 
 /// NtQueryInformationPort(PortHandle, PortInformationClass, PortInformation,

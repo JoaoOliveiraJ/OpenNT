@@ -1541,6 +1541,29 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     let opened = guest::read64(out);
     client_id.unique_process.set(0x7777_0000);
     assert(call("NtOpenThread", out, 0x40, oa, cid) == 0xC000_000B && call("NtSuspendThread", opened, 0, 0, 0) == 0xC000_0022, "userthreads: processo alheio e acesso insuficiente");
+    // NtImpersonateThread, como o csrss impersona o cliente no
+    // CsrImpersonateClient: o QOS desalinhado é recusado; o handle do cliente
+    // (THREAD_DIRECT_IMPERSONATION) é conferido antes do handle do servidor
+    // (THREAD_IMPERSONATE). A thread criada impersona a si mesma no nível
+    // Impersonation com rastreamento estático (uma cópia de impersonação do
+    // primário, CopyOnOpen) e o ThreadImpersonationToken NULL a encerra.
+    let qos_address = block + 0x300;
+    let qos = unsafe { nt::SecurityQualityOfService::at(qos_address) };
+    qos.length.set(nt::SecurityQualityOfService::SIZE as u32);
+    qos.impersonation_level.set(nt::SecurityImpersonationLevel(2));
+    qos.context_tracking_mode.set(0);
+    qos.effective_only.set(0);
+    let refused = call("NtImpersonateThread", handle, handle, qos_address + 2, 0) == 0x8000_0002
+        && call("NtImpersonateThread", 0xDEAD0, opened, qos_address, 0) == 0xC000_0022
+        && call("NtImpersonateThread", 0xDEAD0, handle, qos_address, 0) == 0xC000_0008
+        && call("NtImpersonateThread", opened, handle, qos_address, 0) == 0xC000_0022
+        && crate::ntos::se::token::thread::get(pointer).is_none();
+    let impersonated = call("NtImpersonateThread", handle, handle, qos_address, 0) == 0;
+    let primary = process::get_primary_token(process_pointer);
+    let copied = crate::ntos::se::token::thread::get(pointer).is_some_and(|state| state.level & 3 == 2 && state.copy_on_open && !state.effective_only && Some(state.token) != primary);
+    guest::write64(info, 0);
+    let reverted = call("NtSetInformationThread", handle, 5, info, 8) == 0 && crate::ntos::se::token::thread::get(pointer).is_none();
+    assert(refused && impersonated && copied && reverted, "userthreads: NtImpersonateThread com direitos dos handles, copia estatica e retorno ao proprio token");
     // Alertas por id e esperas, com a thread retomada como corrente (laço real).
     let previous_thread = process::get_current_thread();
     let _ = call("NtResumeThread", handle, 0, 0, 0);

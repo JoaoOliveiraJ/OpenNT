@@ -66,6 +66,42 @@ fn nt_impersonate_anonymous_token(thread: u64, _a2: u64, _a3: u64, _a4: u64, _rs
     impersonate_anonymous::impersonate(token_argument(1, thread), 1)
 }
 
+/// THREAD_IMPERSONATE (a thread servidora) e THREAD_DIRECT_IMPERSONATION (a
+/// thread cliente).
+const THREAD_IMPERSONATE: u32 = 0x100;
+const THREAD_DIRECT_IMPERSONATION: u32 = 0x200;
+
+/// NtImpersonateThread(ServerThreadHandle, ClientThreadHandle, SecurityQos),
+/// como o 19041: o QOS de modo usuário alinhado a 4 (senão
+/// STATUS_DATATYPE_MISALIGNMENT) e sondado, copiado sem conferir o Length; o
+/// handle do cliente referenciado com THREAD_DIRECT_IMPERSONATION antes do
+/// handle do servidor com THREAD_IMPERSONATE; depois o corpo de
+/// `ps::security::impersonate_thread`.
+fn nt_impersonate_thread(server: u64, client: u64, qos: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::SecurityQualityOfService;
+    use crate::ntos::ps::security::{self as ps_security, CapturedQuality};
+    let (server, client, qos) = (token_argument(1, server), token_argument(2, client), token_argument(3, qos));
+    if qos & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !probe_user_read(qos, SecurityQualityOfService::SIZE) {
+        return Ok(0xC000_0005);
+    }
+    let captured = state::user_struct::<SecurityQualityOfService>(qos).and_then(|source| {
+        Ok(CapturedQuality { level: source.impersonation_level.probe_get()?.0 as u32, tracking: source.context_tracking_mode.probe_get()?, effective_only: source.effective_only.probe_get()? })
+    });
+    let Ok(captured) = captured else { return Ok(0xC000_0005) };
+    let client = match super::threads::resolve(client, THREAD_DIRECT_IMPERSONATION) {
+        Ok(thread) => thread,
+        Err(status) => return Ok(status),
+    };
+    let server = match super::threads::resolve(server, THREAD_IMPERSONATE) {
+        Ok(thread) => thread,
+        Err(status) => return Ok(status),
+    };
+    ps_security::impersonate_thread(server.pointer(), client.pointer(), captured)
+}
+
 fn nt_open_thread_token(thread: u64, access: u64, as_self: u64, out: u64, _rsp: u64) -> Result<u32, KernelError> {
     token_handles::open_thread(thread, access as u32, as_self & 0xFF != 0, 0, out, true)
 }
@@ -185,6 +221,7 @@ pub fn init() {
     state::register_handler("NtOpenProcessToken", nt_open_process_token);
     state::register_handler("NtOpenProcessTokenEx", nt_open_process_token_ex);
     state::register_handler("NtImpersonateAnonymousToken", nt_impersonate_anonymous_token);
+    state::register_handler("NtImpersonateThread", nt_impersonate_thread);
     state::register_handler("NtOpenThreadToken", nt_open_thread_token);
     state::register_handler("NtOpenThreadTokenEx", nt_open_thread_token_ex);
     state::register_handler("NtQueryInformationToken", nt_query_information_token);

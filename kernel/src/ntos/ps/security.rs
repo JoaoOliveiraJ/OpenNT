@@ -304,3 +304,52 @@ pub fn dereference_impersonation_token(token: u64) -> Result<(), KernelError> {
     }
     Ok(())
 }
+
+// ---- NtImpersonateThread (ntoskrnl 19041 0x714530) ---------------------------
+
+/// O SECURITY_QUALITY_OF_SERVICE capturado pelo NtImpersonateThread (12
+/// bytes; o Length não é conferido).
+#[derive(Clone, Copy, Debug)]
+pub struct CapturedQuality {
+    pub level: u32,
+    pub tracking: u8,
+    pub effective_only: u8,
+}
+
+/// O corpo do NtImpersonateThread depois das referências das duas threads:
+/// SeCreateClientSecurity da thread cliente com o QOS capturado (servidor
+/// local), SeImpersonateClientEx na thread servidora e ObDereferenceObject do
+/// ClientToken do contexto. Também serve ao NtAlpcImpersonateClientOfPort,
+/// cuja thread servidora é a corrente. Devolve o NTSTATUS.
+pub fn impersonate_thread(server_thread: u64, client_thread: u64, quality: CapturedQuality) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::{SecurityClientContext, SecurityImpersonationLevel, SecurityQualityOfService};
+    use crate::ntos::ob::{object_reference, reference_trace};
+    use crate::ntos::se::client_security;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+    let size = SecurityClientContext::SIZE + SecurityQualityOfService::SIZE;
+    let block = guest::alloc_bytes(size);
+    if block == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(block, &alloc::vec![0u8; size as usize]);
+    // SAFETY: bloco recém-alocado e zerado, com o tamanho dos dois tipos.
+    let (context, qos) = unsafe { (SecurityClientContext::at(block), SecurityQualityOfService::at(block + SecurityClientContext::SIZE)) };
+    qos.length.set(SecurityQualityOfService::SIZE as u32);
+    qos.impersonation_level.set(SecurityImpersonationLevel(quality.level as i32));
+    qos.context_tracking_mode.set(quality.tracking);
+    qos.effective_only.set(quality.effective_only);
+    let result = (|| -> Result<u32, KernelError> {
+        let status = client_security::create(client_thread, qos, false, context)?;
+        if status != 0 {
+            return Ok(status);
+        }
+        let status = client_security::impersonate_client(context, server_thread);
+        let token = context.client_token.get();
+        if token != 0 {
+            object_reference::dereference_with_tag(token, reference_trace::DEFAULT_TAG, true)?;
+        }
+        status
+    })();
+    guest::free_bytes(block);
+    result
+}
