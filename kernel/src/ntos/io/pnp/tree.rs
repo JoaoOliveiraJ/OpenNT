@@ -20,8 +20,12 @@
 //!    QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE à pilha.
 //! 6. PipEnumerateDevice: QUERY_DEVICE_RELATIONS(BusRelations) à pilha; os
 //!    PDOs novos voltam ao passo 1.
-//! IoInvalidateDeviceRelations de um nó desta árvore só enfileira o pedido
-//! (o PipRequestDeviceAction): `process` drena a fila até ela esvaziar.
+//! IoInvalidateDeviceRelations de um nó desta árvore enfileira o pedido (o
+//! PnpRequestDeviceAction): `process` drena a fila até ela esvaziar, com os
+//! work items rodando entre os pedidos; fora dele, o pedido põe na fila de
+//! trabalho atrasada o PnpDeviceActionWorker, que a drena (o volume que o
+//! volmgr.sys relata quando o partmgr.sys lhe entrega uma partição, de um
+//! work item, depois de a árvore já ter sido processada).
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -34,7 +38,8 @@ use super::irp;
 use super::resources::{CmList, Requirements};
 use super::arbiter;
 use crate::ntos::cm::service::system_drivers as services;
-use crate::ntos::inc::types::{BusQueryIdType, DeviceObject, DeviceRelationType, DeviceTextType, NtStruct};
+use crate::ntos::ex::pool_allocation;
+use crate::ntos::inc::types::{BusQueryIdType, DeviceObject, DeviceRelationType, DeviceTextType, NtStruct, WorkQueueItem};
 use crate::ntos::io::{lifecycle, work_items};
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::device as device_objects;
@@ -45,6 +50,17 @@ const DO_BUS_ENUMERATED_DEVICE: u32 = 0x1000;
 
 /// Nós com BusRelations a reenumerar (IoInvalidateDeviceRelations).
 static PENDING: SpinLock<VecDeque<u64>> = SpinLock::new(VecDeque::new());
+
+/// O PnpDeviceActionWorker: o WORK_QUEUE_ITEM (do pool, na primeira vez),
+/// se está na fila e se a fila de pedidos já está sendo drenada (pelo
+/// worker ou por `process`).
+struct ActionWorker {
+    item: u64,
+    queued: bool,
+    active: bool,
+}
+
+static WORKER: SpinLock<ActionWorker> = SpinLock::new(ActionWorker { item: 0, queued: false, active: false });
 
 /// Chave `Enum\<instância>`.
 fn enum_key(instance_path: &str) -> String {
@@ -97,10 +113,29 @@ fn is_internal_by_ids(hardware_ids: &[String], compatible_ids: &[String]) -> boo
 }
 
 /// PipProcessDevNodeTree a partir da raiz, até a fila de reenumeração
-/// esvaziar.
+/// esvaziar. Entre um pedido e outro rodam os work items, como as threads de
+/// trabalho do sistema rodam entre as ações de dispositivo do NT. Um pedido
+/// que chega depois fica com o worker.
 pub fn process() -> Result<(), KernelError> {
     let root = initialize()?;
-    enumerate_device(root)?;
+    let nested = core::mem::replace(&mut WORKER.lock().active, true);
+    let result = enumerate_device(root).and_then(|_| drain());
+    if !nested {
+        WORKER.lock().active = false;
+    }
+    if !PENDING.lock().is_empty() {
+        request_worker();
+    }
+    result
+}
+
+/// Quantos pedidos de reenumeração esperam na fila.
+pub fn pending_requests() -> usize {
+    PENDING.lock().len()
+}
+
+/// Os pedidos de reenumeração na ordem de chegada.
+fn drain() -> Result<(), KernelError> {
     for _ in 0..64 {
         work_items::run_queue();
         let next = PENDING.lock().pop_front();
@@ -110,15 +145,61 @@ pub fn process() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Põe o PnpDeviceActionWorker na DelayedWorkQueue, se ele ainda não está
+/// na fila nem drenando os pedidos.
+fn request_worker() {
+    let mut worker = WORKER.lock();
+    if worker.queued || worker.active {
+        return;
+    }
+    if worker.item == 0 {
+        worker.item = pool_allocation::allocate_tagged(0, WorkQueueItem::SIZE, u32::from_le_bytes(*b"PnPw")).unwrap_or(0);
+        if worker.item == 0 {
+            return;
+        }
+    }
+    worker.queued = true;
+    let item = worker.item;
+    drop(worker);
+    work_items::queue_kernel_ex_work_item(item, device_action_worker, 0);
+}
+
+/// PnpDeviceActionWorker: drena os pedidos em PASSIVE_LEVEL.
+fn device_action_worker(_item: u64, _parameter: u64) {
+    {
+        let mut worker = WORKER.lock();
+        worker.queued = false;
+        if worker.active {
+            return;
+        }
+        worker.active = true;
+    }
+    let result = drain();
+    WORKER.lock().active = false;
+    if let Err(error) = result {
+        debug_print!("[pnp] acao de dispositivo: {}", error);
+    }
+    if !PENDING.lock().is_empty() {
+        request_worker();
+    }
+}
+
 /// IoInvalidateDeviceRelations de um dispositivo desta árvore. Devolve
 /// false se o dispositivo não tem nó (o chamador segue o caminho antigo).
+/// Como no ntoskrnl 19041 (rva 0x36f560), BusRelations (a ação 9 do
+/// PnpRequestDeviceAction, a subárvore) e SingleBusRelations (a ação 8, só o
+/// dispositivo; o volmgr.sys relata assim cada volume novo) pedem a
+/// reenumeração do nó.
 pub fn invalidate_relations(device: u64, relation: u32) -> bool {
     let Some(node) = devnode::of_device(device) else { return false };
-    if relation == DeviceRelationType::BUS_RELATIONS.0 as u32 {
-        let mut pending = PENDING.lock();
-        if !pending.contains(&node.pdo) {
-            pending.push_back(node.pdo);
+    if relation == DeviceRelationType::BUS_RELATIONS.0 as u32 || relation == DeviceRelationType::SINGLE_BUS_RELATIONS.0 as u32 {
+        {
+            let mut pending = PENDING.lock();
+            if !pending.contains(&node.pdo) {
+                pending.push_back(node.pdo);
+            }
         }
+        request_worker();
     }
     debug_print!("[pnp] relacoes {} invalidadas: {}", relation, node.instance_path);
     true

@@ -5452,6 +5452,42 @@ const _: () = {
     assert!(core::mem::offset_of!(ScatterGatherElement, reserved) == 0x10);
 };
 
+/// `_DMA_ADAPTER_INFO` (0x18 bytes).
+#[repr(C)]
+pub struct DmaAdapterInfo {
+    pub version: Field<u32>,
+    pub v1: DmaAdapterInfoV1,
+}
+
+unsafe impl NtStruct for DmaAdapterInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DmaAdapterInfo>() == 0x18);
+    assert!(core::mem::offset_of!(DmaAdapterInfo, version) == 0x0);
+    assert!(core::mem::offset_of!(DmaAdapterInfo, v1) == 0x4);
+};
+
+/// `_DMA_ADAPTER_INFO_V1` (0x14 bytes).
+#[repr(C)]
+pub struct DmaAdapterInfoV1 {
+    pub read_dma_counter_available: Field<u32>,
+    pub scatter_gather_limit: Field<u32>,
+    pub dma_address_width: Field<u32>,
+    pub flags: Field<u32>,
+    pub minimum_transfer_unit: Field<u32>,
+}
+
+unsafe impl NtStruct for DmaAdapterInfoV1 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DmaAdapterInfoV1>() == 0x14);
+    assert!(core::mem::offset_of!(DmaAdapterInfoV1, read_dma_counter_available) == 0x0);
+    assert!(core::mem::offset_of!(DmaAdapterInfoV1, scatter_gather_limit) == 0x4);
+    assert!(core::mem::offset_of!(DmaAdapterInfoV1, dma_address_width) == 0x8);
+    assert!(core::mem::offset_of!(DmaAdapterInfoV1, flags) == 0xc);
+    assert!(core::mem::offset_of!(DmaAdapterInfoV1, minimum_transfer_unit) == 0x10);
+};
+
 /// `_NAMED_PIPE_CREATE_PARAMETERS` (0x28 bytes).
 #[repr(C)]
 pub struct NamedPipeCreateParameters {

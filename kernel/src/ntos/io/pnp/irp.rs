@@ -3,13 +3,17 @@
 //! Todo pedido PnP vai ao topo da pilha do dispositivo
 //! (IoGetAttachedDeviceReference): um IRP de IoAllocateIrp com o tamanho de
 //! pilha do topo, IoStatus.Status = STATUS_NOT_SUPPORTED e Information com o
-//! valor inicial do pedido (a lista de requisitos no
-//! FILTER_RESOURCE_REQUIREMENTS, zero nos demais), RequestorMode KernelMode,
+//! valor inicial do pedido (zero), RequestorMode KernelMode,
 //! Tail.Overlay.Thread a thread corrente, UserIosb/UserEvent locais; o
 //! STATUS_PENDING espera o evento. Os drivers que não tratam um pedido o
 //! repassam sem tocar no status, e o barramento que também não o trata
 //! completa com o status recebido: o STATUS_NOT_SUPPORTED inicial chega de
-//! volta. O NT segura a árvore de devnodes durante os pedidos
+//! volta. O FILTER_RESOURCE_REQUIREMENTS é o do IopFilterResourceRequirementsCall:
+//! com uma lista, o IRP parte com STATUS_SUCCESS e a lista em Information
+//! (sem lista, STATUS_NOT_SUPPORTED), e o barramento que não trata o pedido
+//! (o PciIrpNotSupported do pci.sys) devolve esse sucesso a quem o repassou:
+//! o storport.sys só chama o filtro de recursos do miniport depois de um
+//! repasse bem-sucedido. O NT segura a árvore de devnodes durante os pedidos
 //! (`with_device_tree_lock`).
 
 use alloc::string::String;
@@ -54,6 +58,11 @@ impl Outcome {
 /// IopSynchronousCall: `fill` preenche Parameters da posição do primeiro
 /// driver (a do topo); `information` é o IoStatus.Information inicial.
 pub fn synchronous_call(device: u64, minor: u8, information: u64, fill: impl FnOnce(&IoStackLocation)) -> Result<Outcome, KernelError> {
+    call_with_status(device, minor, STATUS_NOT_SUPPORTED, information, fill)
+}
+
+/// O pedido com o IoStatus inicial dado (Status e Information).
+fn call_with_status(device: u64, minor: u8, initial_status: i32, information: u64, fill: impl FnOnce(&IoStackLocation)) -> Result<Outcome, KernelError> {
     let top = device_objects::attached_reference(device, false)?;
     // SAFETY: DEVICE_OBJECT do topo, referenciado acima.
     let stack_size = unsafe { crate::ntos::inc::types::DeviceObject::at(top) }.stack_size.get();
@@ -67,7 +76,7 @@ pub fn synchronous_call(device: u64, minor: u8, information: u64, fill: impl FnO
     dispatcher::initialize_event(event, 0, false);
     // SAFETY: IRP recém-alocado pelo IoAllocateIrp.
     let irp = unsafe { Irp::at(packet) };
-    irp.io_status.status.set(STATUS_NOT_SUPPORTED);
+    irp.io_status.status.set(initial_status);
     irp.io_status.information.set(information);
     irp.requestor_mode.set(0);
     irp.user_iosb.set(io_status);
@@ -191,14 +200,22 @@ pub fn query_resource_requirements(device: u64) -> Result<u64, KernelError> {
 }
 
 /// IRP_MN_FILTER_RESOURCE_REQUIREMENTS: Information e o parâmetro começam com
-/// a lista corrente; um filtro pode trocá-la por outra em Information.
-/// Devolve a lista resultante (a mesma, se ninguém a trocou).
+/// a lista corrente, e o Status com STATUS_SUCCESS (STATUS_NOT_SUPPORTED sem
+/// lista), como o IopFilterResourceRequirementsCall; um filtro pode trocá-la
+/// por outra em Information. Devolve a lista resultante (a mesma, se
+/// ninguém a trocou).
 pub fn filter_resource_requirements(device: u64, requirements: u64) -> Result<u64, KernelError> {
-    let outcome = synchronous_call(device, irp_mn::FILTER_RESOURCE_REQUIREMENTS, requirements, |location| location.parameters.filter_resource_requirements.io_resource_requirement_list.set(requirements))?;
+    let outcome = filter_resource_requirements_call(device, requirements)?;
     if outcome.succeeded() && outcome.information != 0 {
         return Ok(outcome.information);
     }
     Ok(requirements)
+}
+
+/// O pedido de FILTER_RESOURCE_REQUIREMENTS e o resultado dele.
+pub fn filter_resource_requirements_call(device: u64, requirements: u64) -> Result<Outcome, KernelError> {
+    let initial_status = if requirements != 0 { STATUS_SUCCESS } else { STATUS_NOT_SUPPORTED };
+    call_with_status(device, irp_mn::FILTER_RESOURCE_REQUIREMENTS, initial_status, requirements, |location| location.parameters.filter_resource_requirements.io_resource_requirement_list.set(requirements))
 }
 
 /// IRP_MN_START_DEVICE com as listas bruta e traduzida.

@@ -94,6 +94,10 @@ fn pci_function_pdo(assert: Assert) {
     assert(install::select_driver(&hardware, &compatible).is_some_and(|driver| driver.service.is_some_and(|service| service.name == "intelide")), "pnp-storage: PCI\\VEN_8086&DEV_7010 instala o intelide.sys");
     assert(install::select_driver(&[String::from("Internal_IDE_Channel")], &[String::from("*PNP0600")]).is_some_and(|driver| driver.service.is_some_and(|service| service.name == "atapi")), "pnp-storage: canal IDE instala o atapi.sys");
     assert(install::select_driver(&[String::from("IDE\\DiskQEMU_HARDDISK___________________________2.5+____")], &[String::from("IDE\\Disk"), String::from("GenDisk")]).is_some_and(|driver| driver.class.name == "DiskDrive"), "pnp-storage: GenDisk instala o disk.sys");
+    // O controlador NVMe do QEMU: o stornvme.inf casa pela classe 01.08.02
+    // (PCI\CC_010802), entre os CompatibleIDs, na classe SCSIAdapter.
+    let nvme = install::select_driver(&[String::from("PCI\\VEN_1B36&DEV_0010&SUBSYS_11001AF4&REV_02"), String::from("PCI\\VEN_1B36&DEV_0010&CC_010802")], &[String::from("PCI\\VEN_1B36&DEV_0010"), String::from("PCI\\CC_010802"), String::from("PCI\\CC_0108")]);
+    assert(nvme.is_some_and(|driver| driver.inf == "stornvme.inf" && driver.class.name == "SCSIAdapter" && driver.service.is_some_and(|service| service.name == "stornvme" && service.group == Some("SCSI Miniport"))), "pnp-storage: PCI\\CC_010802 instala o stornvme.sys (stornvme.inf, SCSIAdapter)");
     // QUERY_CAPABILITIES.
     let capabilities = guest::alloc_bytes(DeviceCapabilities::SIZE);
     let (status, _) = pnp_irp(ide.pdo_pointer, 0x09, |location| location.parameters.device_capabilities.capabilities.set(capabilities));
@@ -112,6 +116,12 @@ fn pci_function_pdo(assert: Assert) {
     assert(status == 0 && alternative.count.get() == 2 && descriptors[0].type_.get() == 1 && descriptors[0].u.port.length.get() == 16 && descriptors[0].u.port.minimum_address.quad_part.get() == bar4 && descriptors[1].option.get() == 8, "pnp-storage: requisitos sem os BARs do canal legado");
     let requirements = resources::Requirements::read(list).unwrap_or_default();
     assert(requirements.alternatives.len() == 1 && requirements.alternatives[0].len() == 1 && requirements.alternatives[0][0].len() == 2, "pnp-storage: a alternativa do BAR fica no mesmo requisito");
+    // FILTER_RESOURCE_REQUIREMENTS com a lista parte com STATUS_SUCCESS (o
+    // IopFilterResourceRequirementsCall) e o barramento, que não trata o
+    // pedido, o devolve como chegou: sucesso com a mesma lista.
+    let filtered = pnp::irp::filter_resource_requirements_call(ide.pdo_pointer, list);
+    let without_list = pnp::irp::filter_resource_requirements_call(ide.pdo_pointer, 0);
+    assert(filtered.is_ok_and(|outcome| outcome.status == 0 && outcome.information == list) && without_list.is_ok_and(|outcome| outcome.status == 0xC000_00BBu32 as i32), "pnp-storage: FILTER_RESOURCE_REQUIREMENTS parte com STATUS_SUCCESS e a lista; sem lista, STATUS_NOT_SUPPORTED");
     guest::free_bytes(list);
     // QUERY_BUS_INFORMATION e QUERY_DEVICE_TEXT.
     let (status, information) = pnp_irp(ide.pdo_pointer, 0x15, |_| {});
@@ -141,6 +151,14 @@ fn pci_function_pdo(assert: Assert) {
     let read = guest::alloc_bytes(4);
     let bytes = native_call::call(bus_interface.get_bus_data.get(), &[bus_interface.interface.context.get(), 0, read, 0, 4]);
     assert(status == 0 && bus_interface.interface.context.get() == ide.pdo_pointer && bytes == 4 && guest::read32(read) == 0x7010_8086, "pnp-storage: GetBusData da BUS_INTERFACE_STANDARD le o vendor/device");
+    // O DataType PCIConfiguration (4), que o storport.sys repassa do miniport,
+    // também lê a configuração; o da ROM ('PciR') não lê nada.
+    guest::write32(read, 0);
+    let configuration = native_call::call(bus_interface.get_bus_data.get(), &[ide.pdo_pointer, 4, read, 0, 4]);
+    let configuration_value = guest::read32(read);
+    guest::write32(read, 0);
+    let rom = native_call::call(bus_interface.get_bus_data.get(), &[ide.pdo_pointer, 0x5269_6350, read, 0, 4]);
+    assert(configuration == 4 && configuration_value == 0x7010_8086 && rom == 0 && guest::read32(read) == 0, "pnp-storage: GetBusData com PCIConfiguration le a configuracao, com PCI_WHICHSPACE_ROM nao");
     let before = pci_interface::references(ide.pdo_pointer);
     native_call::call(bus_interface.interface.interface_dereference.get(), &[ide.pdo_pointer]);
     assert(pci_interface::references(ide.pdo_pointer) == before - 1, "pnp-storage: InterfaceDereference");
@@ -201,6 +219,61 @@ fn dma_adapter(assert: Assert) {
     for block in [mdl, length, size, logical, registers, description] {
         guest::free_bytes(block);
     }
+    dma_adapter_v3(assert, ide.pdo_pointer);
+}
+
+/// DEVICE_DESCRIPTION versão 3 (o HalGetAdapterV3 que o storport.sys pede):
+/// a tabela HalpDmaOperationsV3, o GetDmaAdapterInfo com a largura do
+/// DmaAddressWidth, o FlushDmaBuffer e o FlushAdapterBuffersEx; abaixo de 32
+/// bits não há adaptador.
+fn dma_adapter_v3(assert: Assert, pdo: u64) {
+    let description = guest::alloc_bytes(DeviceDescription::SIZE);
+    // SAFETY: bloco recém-alocado.
+    let device_description = unsafe { DeviceDescription::at(description) };
+    device_description.version.set(3);
+    device_description.master.set(1);
+    device_description.scatter_gather.set(1);
+    device_description.interface_type.set(crate::ntos::inc::types::InterfaceType::PCI_BUS);
+    device_description.maximum_length.set(0x20000);
+    device_description.dma_address_width.set(24);
+    let registers = guest::alloc_bytes(4);
+    let narrow = super::phase6::call_export("IoGetDmaAdapter", &[pdo, description, registers]).unwrap_or(1);
+    device_description.dma_address_width.set(64);
+    let adapter = super::phase6::call_export("IoGetDmaAdapter", &[pdo, description, registers]).unwrap_or(0);
+    assert(narrow == 0 && adapter != 0 && crate::hal::dma::is_adapter(adapter) && guest::read32(registers) == 33, "pnp-storage: IoGetDmaAdapter versao 3, 33 registradores para 128 KB; abaixo de 32 bits sem adaptador");
+    if adapter == 0 {
+        guest::free_bytes(registers);
+        guest::free_bytes(description);
+        return;
+    }
+    // SAFETY: DMA_ADAPTER e a tabela V3 devolvidos pela HAL.
+    let operations = unsafe { DmaOperations::at(DmaAdapter::at(adapter).dma_operations.get()) };
+    let slot = |name: &str| routine_stubs::address(name).unwrap_or(1);
+    assert(
+        operations.size.get() == 0x138 && operations.free_common_buffer.get() == slot("HalFreeCommonBufferV3") && operations.build_scatter_gather_list.get() == slot("HalBuildScatterGatherListV3") && operations.get_scatter_gather_list.get() == slot("HalGetScatterGatherList") && operations.get_dma_adapter_info.get() == slot("HalGetDmaAdapterInfo") && operations.flush_dma_buffer.get() == slot("HalFlushDmaBuffer") && operations.get_dma_transfer_info.get() == 0,
+        "pnp-storage: tabela de operacoes V3 (Size 0x138, as variantes V3 e o FlushDmaBuffer)",
+    );
+    // GetDmaAdapterInfo: só a versão 1.
+    let info = guest::alloc_bytes(crate::ntos::inc::types::DmaAdapterInfo::SIZE);
+    guest::write32(info, 2);
+    let unsupported = native_call::call(operations.get_dma_adapter_info.get(), &[adapter, info]) as u32;
+    guest::write32(info, 1);
+    let status = native_call::call(operations.get_dma_adapter_info.get(), &[adapter, info]) as u32;
+    // SAFETY: DMA_ADAPTER_INFO preenchida.
+    let v1 = unsafe { &crate::ntos::inc::types::DmaAdapterInfo::at(info).v1 };
+    assert(unsupported == 0xC000_00BB && status == 0 && v1.dma_address_width.get() == 64 && v1.flags.get() == 3 && v1.scatter_gather_limit.get() == u32::MAX && v1.read_dma_counter_available.get() == 0 && v1.minimum_transfer_unit.get() == 1, "pnp-storage: GetDmaAdapterInfo versao 1 de um bus master de 64 bits");
+    // FlushDmaBuffer e FlushAdapterBuffersEx num MDL de uma página.
+    let buffer = guest::alloc_aligned(0x1000, 0x1000, true);
+    let mdl = crate::ntos::io::mdl::allocate_mdl(buffer, 0x800);
+    crate::ntos::mm::mdl::build_for_non_paged_pool(mdl);
+    let flushed = native_call::call(operations.flush_dma_buffer.get(), &[adapter, mdl, 1]) as u32;
+    let inside = native_call::call(operations.flush_adapter_buffers_ex.get(), &[adapter, mdl, 0, 0x7FF, 1, 1]) as u32;
+    let beyond = native_call::call(operations.flush_adapter_buffers_ex.get(), &[adapter, mdl, 0, 0x800, 1, 1]) as u32;
+    assert(flushed == 0 && inside == 0 && beyond == 0xC000_000D && native_call::call(operations.get_dma_domain.get(), &[adapter]) == 0, "pnp-storage: FlushDmaBuffer e FlushAdapterBuffersEx (Offset alem do ByteCount invalido), sem dominio de DMA");
+    native_call::call(operations.put_dma_adapter.get(), &[adapter]);
+    for block in [mdl, info, registers, description, buffer] {
+        guest::free_bytes(block);
+    }
 }
 
 fn tree_support(assert: Assert) {
@@ -229,6 +302,23 @@ fn tree_support(assert: Assert) {
     for owner in [bus, child] {
         resources::release(owner);
     }
+    // IoInvalidateDeviceRelations de um nó da árvore: BusRelations e
+    // SingleBusRelations enfileiram a reenumeração (RemovalRelations não) e,
+    // fora do `process`, o PnpDeviceActionWorker da fila de trabalho drena o
+    // pedido (o nó ainda não iniciado não recebe IRP).
+    let queued_device = guest::alloc_bytes(DeviceObject::SIZE);
+    guest::write_bytes(queued_device, &[0; DeviceObject::SIZE as usize]);
+    // SAFETY: DEVICE_OBJECT recém-alocado.
+    unsafe { DeviceObject::at(queued_device) }.type_.set(3);
+    let _ = crate::ntos::ob::objects::device::register(queued_device, None, None);
+    devnode::insert(devnode::DeviceNode::new(queued_device, 0, 1));
+    let before = tree::pending_requests();
+    let single = tree::invalidate_relations(queued_device, 5) && tree::pending_requests() == before + 1;
+    let removal = tree::invalidate_relations(queued_device, 3) && tree::pending_requests() == before + 1;
+    crate::ntos::io::work_items::run_queue();
+    let drained = tree::pending_requests() == 0;
+    let _ = devnode::remove(queued_device);
+    assert(single && removal && drained, "pnp-storage: SingleBusRelations enfileira a reenumeracao e o PnpDeviceActionWorker a drena");
     assert(outside.as_ref().is_some_and(|list| list.resources[0].start == BASE + 0xE000), "pnp-storage: a raiz aloca fora das faixas ja atribuidas, sem janelas de barramento");
     // O tradutor da raiz: a HAL sem ACPI leva a IRQ 14 ao vetor 0x2E no IRQL
     // 14; com a raiz ACPI (o tradutor do acpi.sys já traduziu), a identidade.

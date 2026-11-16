@@ -2,15 +2,17 @@
 //! drivers e do instalador de dispositivos do NT).
 //!
 //! `DRIVERS` transcreve as linhas de modelo dos INFs do Windows desta
-//! máquina que atendem o hardware emulado (mshdc.inf, disk.inf, volume.inf,
-//! volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
+//! máquina que atendem o hardware emulado (mshdc.inf, o stornvme.inf, que dá
+//! o stornvme.sys a todo controlador NVMe, PCI\CC_010802, disk.inf,
+//! volume.inf, volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
 //! classe VGA, PCI\CC_0300, e o machine.inf, que dá o msisadrv.sys, um
 //! driver KMDF, às pontes PCI-ISA, PCI\CC_0601, e o driver nulo das seções
 //! NO_DRV às pontes de host, PCI\CC_0600, e, com a raiz ACPI, ao HPET, ao
 //! relógio CMOS, aos barramentos de recursos, ao contêiner dos processadores
 //! e ao botão de função fixa), com o que cada seção de instalação grava: o serviço
 //! (`[*.Services]`/`AddService`), a classe (`[Version]` e o INF da classe:
-//! c_hdc.inf, c_diskdrive.inf, c_volume.inf, a classe System), os valores
+//! c_hdc.inf, c_scsiadapter.inf, c_diskdrive.inf, c_volume.inf, a classe
+//! System), os valores
 //! da chave do driver (`AddReg` de `[DDInstall]`, HKR = Control\Class\
 //! {guid}\NNNN) e os da chave de hardware (`[DDInstall.HW]`, HKR =
 //! Enum\<instância>\Device Parameters).
@@ -107,6 +109,8 @@ pub const CLASS_VOLUME: ClassSpec = ClassSpec { guid: "{71a27cdd-812a-11d0-bec7-
 pub const CLASS_SYSTEM: ClassSpec = ClassSpec { guid: "{4d36e97d-e325-11ce-bfc1-08002be10318}", name: "System", upper_filters: &[], lower_filters: &[] };
 /// display.inf `[Version]` (a classe Display do c_display.inf).
 pub const CLASS_DISPLAY: ClassSpec = ClassSpec { guid: "{4d36e968-e325-11ce-bfc1-08002be10318}", name: "Display", upper_filters: &[], lower_filters: &[] };
+/// stornvme.inf `[Version]` (a classe SCSIAdapter do c_scsiadapter.inf).
+pub const CLASS_SCSI_ADAPTER: ClassSpec = ClassSpec { guid: "{4d36e97b-e325-11ce-bfc1-08002be10318}", name: "SCSIAdapter", upper_filters: &[], lower_filters: &[] };
 
 /// mshdc.inf `[intelide_Service_Inst]`.
 const SERVICE_INTELIDE: ServiceSpec = ServiceSpec { name: "intelide", display_name: None, start: 0, error_control: 3, binary: "intelide.sys", group: Some("System Bus Extender"), owner: "mshdc.inf", values: &[] };
@@ -138,6 +142,42 @@ const SERVICE_BASIC_DISPLAY: ServiceSpec = ServiceSpec {
     owner: "display.inf",
     values: &[],
 };
+
+/// stornvme.inf `[Stornvme_Service_Inst]` com o `[nvme_registry_values]` e
+/// o `[nvme_registry_device_specific_values]` (HKR = a chave do serviço):
+/// a interface de barramento PCIBus (5) no PnpInterface, o BusType NVMe
+/// (0x11), o tempo limite de I/O de 10 s, o DMAR só para dispositivos
+/// externos e o alinhamento de faixa dos controladores da Intel.
+const SERVICE_STORNVME: ServiceSpec = ServiceSpec {
+    name: "stornvme",
+    display_name: Some("@stornvme.inf,%StorNVMe_ServiceDesc%;Microsoft Standard NVM Express Driver"),
+    start: 0,
+    error_control: 3,
+    binary: "stornvme.sys",
+    group: Some("SCSI Miniport"),
+    owner: "stornvme.inf",
+    values: &[
+        RegValue { subkey: "Parameters\\PnpInterface", name: "5", data: RegData::Dword(1) },
+        RegValue { subkey: "Parameters", name: "BusType", data: RegData::Dword(0x11) },
+        RegValue { subkey: "Parameters", name: "IoTimeoutValue", data: RegData::Dword(0xA) },
+        RegValue { subkey: "Parameters", name: "DmaRemappingCompatible", data: RegData::Dword(2) },
+        RegValue {
+            subkey: "Parameters\\Device",
+            name: "IoStripeAlignment",
+            data: RegData::MultiText(&["VEN_8086&DEV_0953&REV_?? 128", "VEN_8086&DEV_0984&REV_?? 128", "VEN_8086&DEV_0A53&REV_?? 128", "VEN_8086&DEV_0A54&REV_?? 128", "VEN_8086&DEV_0A55&REV_?? 128"]),
+        },
+    ],
+};
+
+/// stornvme.inf `[Stornvme_Inst_HW_AddReg]` (`[Stornvme_Inst.HW]`, HKR =
+/// Device Parameters): as propriedades de interrupção do controlador.
+const STORNVME_HARDWARE: &[RegValue] = &[
+    RegValue { subkey: "Interrupt Management\\MessageSignaledInterruptProperties", name: "MSISupported", data: RegData::Dword(1) },
+    RegValue { subkey: "Interrupt Management\\MessageSignaledInterruptProperties", name: "MessageNumberLimit", data: RegData::Dword(65) },
+    RegValue { subkey: "Interrupt Management\\Affinity Policy", name: "DevicePolicy", data: RegData::Dword(5) },
+    RegValue { subkey: "Interrupt Management\\Affinity Policy", name: "DevicePriority", data: RegData::Dword(3) },
+    RegValue { subkey: "Interrupt Management\\Affinity Policy", name: "GroupPolicy", data: RegData::Dword(1) },
+];
 
 /// acpi.inf `[ACPI_Service_Inst]` com o `[acpi_ServiceInstallSection_AddReg]`
 /// (Tag 2, Group "Core").
@@ -346,6 +386,22 @@ pub const DRIVERS: &[InfDriver] = &[
         class: &CLASS_HDC,
         driver_values: ATAPI_PROPERTY_PROVIDER,
         device_values: ATAPI_HARDWARE,
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "stornvme.inf",
+        section: "Stornvme_Inst",
+        id: "PCI\\CC_010802",
+        description_key: "PCI\\CC_010802.DeviceDesc",
+        description: "Standard NVM Express Controller",
+        manufacturer_key: "MS-NVME",
+        manufacturer: "Standard NVM Express Controller",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.4355",
+        service: Some(&SERVICE_STORNVME),
+        class: &CLASS_SCSI_ADAPTER,
+        driver_values: &[],
+        device_values: STORNVME_HARDWARE,
         exclude_ids: &[],
     },
     InfDriver {

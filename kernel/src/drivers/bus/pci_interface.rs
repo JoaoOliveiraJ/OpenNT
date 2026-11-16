@@ -5,7 +5,8 @@
 //!   (identidade no PC: o barramento PCI e o processador veem os mesmos
 //!   endereços de porta e memória), GetDmaAdapter (o adaptador da HAL para a
 //!   DEVICE_DESCRIPTION do driver, `hal::dma`), SetBusData/GetBusData (o
-//!   espaço de configuração da função, só PCI_WHICHSPACE_CONFIG).
+//!   espaço de configuração da função para todo DataType menos o da ROM,
+//!   como o pci.sys).
 //! - GUID_PCI_BUS_INTERFACE_STANDARD (versão 1, 0x40 bytes): ReadConfig e
 //!   WriteConfig por barramento e PCI_SLOT_NUMBER, PinToLine e LineToPin
 //!   (sem efeito: o roteamento de IRQ vem do firmware).
@@ -27,9 +28,9 @@ pub const GUID_BUS_INTERFACE_STANDARD: [u8; 16] = [0x80, 0x82, 0x6B, 0x49, 0x25,
 /// GUID_PCI_BUS_INTERFACE_STANDARD {496B8281-6F25-11D0-BEAF-08002BE2092F}.
 pub const GUID_PCI_BUS_INTERFACE_STANDARD: [u8; 16] = [0x81, 0x82, 0x6B, 0x49, 0x25, 0x6F, 0xD0, 0x11, 0xBE, 0xAF, 0x08, 0x00, 0x2B, 0xE2, 0x09, 0x2F];
 
-/// PCIConfiguration (BUS_DATA_TYPE) da HAL e PCI_WHICHSPACE_CONFIG.
+/// PCIConfiguration (BUS_DATA_TYPE) da HAL e PCI_WHICHSPACE_ROM ('PciR').
 const PCI_CONFIGURATION: u32 = 4;
-const PCI_WHICHSPACE_CONFIG: u32 = 0;
+const PCI_WHICHSPACE_ROM: u32 = 0x5269_6350;
 
 /// Referências de interface por PDO (InterfaceReference/Dereference).
 static REFERENCES: SpinLock<BTreeMap<u64, i64>> = SpinLock::new(BTreeMap::new());
@@ -85,9 +86,21 @@ fn location(pdo: u64) -> Option<(u32, u32)> {
     super::pci::function_of_pdo(pdo).map(|function| (function.bus, function.device | function.function << 5))
 }
 
+/// O espaço do DataType (o WhichSpace do pci.sys): PCI_WHICHSPACE_ROM
+/// ('PciR') é a imagem da ROM de expansão, que este barramento não lê nem
+/// grava (0 bytes); qualquer outro valor é o espaço de configuração. Como o
+/// PciBusInterface_GetBusData/SetBusData do pci.sys 19041, um valor que não
+/// é PCI_WHICHSPACE_CONFIG só vai para o Driver Verifier (VfFailDeviceNode
+/// 0xF6, sem efeito com o verifier desligado) e o acesso segue na
+/// configuração: o storport.sys passa o BusDataType do miniport
+/// (PCIConfiguration, 4) direto à interface.
+fn config_space(data_type: u32) -> bool {
+    data_type != PCI_WHICHSPACE_ROM
+}
+
 /// SetBusData(Context, DataType, Buffer, Offset, Length) -> bytes.
 fn set_bus_data(call: &Call) -> Result<u64, KernelError> {
-    if call.arg(2) as u32 != PCI_WHICHSPACE_CONFIG {
+    if !config_space(call.arg(2) as u32) {
         return Ok(0);
     }
     let Some((bus, slot)) = location(call.arg(1)) else { return Ok(0) };
@@ -96,7 +109,7 @@ fn set_bus_data(call: &Call) -> Result<u64, KernelError> {
 
 /// GetBusData(Context, DataType, Buffer, Offset, Length) -> bytes.
 fn get_bus_data(call: &Call) -> Result<u64, KernelError> {
-    if call.arg(2) as u32 != PCI_WHICHSPACE_CONFIG {
+    if !config_space(call.arg(2) as u32) {
         return Ok(0);
     }
     let Some((bus, slot)) = location(call.arg(1)) else { return Ok(0) };

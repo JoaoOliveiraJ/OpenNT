@@ -1,5 +1,5 @@
-//! Adaptadores de DMA da HAL (o HalGetAdapterV2 e o HalpDmaOperationsV2 do
-//! ntoskrnl 19041).
+//! Adaptadores de DMA da HAL (o HalGetAdapterV2 com o HalpDmaOperationsV2 e
+//! o HalGetAdapterV3 com o HalpDmaOperationsV3 do ntoskrnl 19041).
 //!
 //! O IoGetDmaAdapter pede ao barramento (BUS_INTERFACE_STANDARD.GetDmaAdapter)
 //! e o barramento PCI chega aqui com a DEVICE_DESCRIPTION do driver. Esta
@@ -7,12 +7,17 @@
 //! kernel: um dispositivo bus master enxerga a memória pelo endereço físico,
 //! sem registradores de mapa nem buffers de passagem, e o endereço lógico de
 //! um buffer é o físico. O adaptador é um DMA_ADAPTER (Version 1, Size do
-//! objeto) com a tabela de operações V2 (Size 0x138; as rotinas da versão 3
-//! ficam nulas, como na tabela V2 do NT). Versões de DEVICE_DESCRIPTION
-//! acima de 2 (o HalGetAdapterV3) não são atendidas e devolvem NULL.
+//! objeto). Uma DEVICE_DESCRIPTION das versões 0 a 2 recebe a tabela V2
+//! (Size 0x138; as rotinas da versão 3 ficam nulas, como na tabela V2 do
+//! NT); a versão 3 (o HalGetAdapterV3, pedido pelo storport.sys quando o
+//! miniport prefere o DMA v3) recebe a tabela V3, com a largura de endereço
+//! do DmaAddressWidth. Só adaptadores bus master de pelo menos 32 bits são
+//! atendidos (sem o controlador 8237 nem buffers de passagem); os outros
+//! pedidos devolvem NULL.
 //!
 //! - NumberOfMapRegisters = MaximumLength / 4 KB + 1 (+1 com resto), a conta
-//!   do HalGetAdapterV2 (o bit 31 do MaximumLength é ignorado).
+//!   do HalGetAdapterV2 e do HalGetAdapterV3 (o bit 31 do MaximumLength é
+//!   ignorado).
 //! - AllocateCommonBuffer: memória contígua da arena do kernel (abaixo de
 //!   96 MB), alinhada à página; LogicalAddress = endereço físico.
 //! - AllocateAdapterChannel: chama o ExecutionRoutine(DeviceObject,
@@ -24,7 +29,30 @@
 //!   elemento por trecho físico contíguo do MDL (as páginas do vetor de PFNs
 //!   a partir de CurrentVa), entregue ao ExecutionRoutine(DeviceObject,
 //!   CurrentIrp, lista, Context) em DISPATCH_LEVEL; PutScatterGatherList
-//!   devolve a lista que a HAL alocou.
+//!   devolve a lista que a HAL alocou. Um trecho acima da largura de
+//!   endereço do adaptador é recusado.
+//!
+//! A tabela V3 tem as rotinas da V2 (as variantes V3 do NT — FreeCommonBuffer,
+//! AllocateAdapterChannel, ReadDmaCounter, CalculateScatterGatherList,
+//! BuildScatterGatherList, BuildMdlFromScatterGatherList e
+//! AllocateCommonBufferEx — fazem aqui o mesmo, sem registradores de mapa) e,
+//! das rotinas novas, as que um adaptador sem IOMMU atende como o NT:
+//! - GetDmaAdapterInfo: só a versão 1 (outra = STATUS_NOT_SUPPORTED); a
+//!   largura de endereço, ScatterGatherLimit sem limite, sem contador de DMA,
+//!   unidade mínima 1 e os Flags ADAPTER_INFO_SYNCHRONOUS_CALLBACK |
+//!   ADAPTER_INFO_API_BYPASS de um bus master sem tradução;
+//! - FlushAdapterBuffersEx: MDL nulo ou Offset além do ByteCount =
+//!   STATUS_INVALID_PARAMETER, senão sucesso (nada a copiar);
+//! - FreeAdapterObject: DeallocateObject e DeallocateObjectKeepRegisters
+//!   liberam o canal (IoFreeAdapterChannel);
+//! - FlushDmaBuffer: ByteCount e ByteOffset do MDL alinhados ao alinhamento
+//!   de DMA (HalGetDmaAlignment, 1) e, com a coerência de cache do x64, nada
+//!   a esvaziar;
+//! - GetDmaDomain: sem domínio de DMA (NULL).
+//! As rotinas de transferência estendida (GetDmaTransferInfo,
+//! InitializeDmaTransferContext, AllocateAdapterChannelEx, MapTransferEx,
+//! Get/BuildScatterGatherListEx...) e as de domínio e de vetor de buffers
+//! comuns ainda ficam nulas.
 
 use alloc::collections::BTreeSet;
 
@@ -32,7 +60,7 @@ use crate::hal::amd64::native_call;
 use crate::hal::amd64::routine_stubs::{self, Routine};
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_storage::{DeviceDescription, DmaAdapter, DmaOperations, ScatterGatherElement, ScatterGatherList};
-use crate::ntos::inc::types::{DeviceObject, Mdl};
+use crate::ntos::inc::types::{DeviceObject, DmaAdapterInfo, Mdl};
 use crate::ntos::init::exports::Call;
 use crate::ntos::ke::irql;
 use crate::ntos::mm::guest_memory as guest;
@@ -59,7 +87,10 @@ struct AdapterObject {
     dma64: Field<u8>,
     _pad_1c: Reserved<4>,
     device_object: Field<u64>,
-    _reserved: Reserved<0x18>,
+    /// Largura de endereço do dispositivo (DmaAddressWidth da versão 3;
+    /// 32 ou 64 bits pelos flags das anteriores).
+    address_width: Field<u32>,
+    _reserved: Reserved<0x14>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -69,10 +100,12 @@ const _: () = {
     assert!(core::mem::size_of::<AdapterObject>() == 0x40);
     assert!(core::mem::offset_of!(AdapterObject, map_registers) == 0x10);
     assert!(core::mem::offset_of!(AdapterObject, device_object) == 0x20);
+    assert!(core::mem::offset_of!(AdapterObject, address_width) == 0x28);
 };
 
-/// Tabela V2 (alocada uma vez) e os adaptadores vivos.
+/// Tabelas V2 e V3 (alocadas uma vez) e os adaptadores vivos.
 static OPERATIONS: SpinLock<u64> = SpinLock::new(0);
+static OPERATIONS_V3: SpinLock<u64> = SpinLock::new(0);
 static ADAPTERS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
 /// Listas alocadas pelo GetScatterGatherList (devolvidas no Put).
 static OWNED_LISTS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
@@ -95,6 +128,19 @@ pub const ROUTINES: &[Routine] = &[
     Routine { name: "HalBuildScatterGatherListV2", handler: build_scatter_gather_list },
     Routine { name: "HalBuildMdlFromScatterGatherListV2", handler: build_mdl_from_scatter_gather_list },
     Routine { name: "HalAllocateCommonBufferExV2", handler: allocate_common_buffer_ex },
+    // HalpDmaOperationsV3: as variantes V3 e as rotinas novas.
+    Routine { name: "HalFreeCommonBufferV3", handler: free_common_buffer },
+    Routine { name: "HalRealAllocateAdapterChannelV3", handler: allocate_adapter_channel },
+    Routine { name: "HalReadDmaCounterV3", handler: read_dma_counter },
+    Routine { name: "HalCalculateScatterGatherListSizeV3", handler: calculate_scatter_gather_list },
+    Routine { name: "HalBuildScatterGatherListV3", handler: build_scatter_gather_list },
+    Routine { name: "HalBuildMdlFromScatterGatherListV3", handler: build_mdl_from_scatter_gather_list },
+    Routine { name: "HalAllocateCommonBufferExV3", handler: allocate_common_buffer_ex },
+    Routine { name: "HalGetDmaAdapterInfo", handler: get_dma_adapter_info },
+    Routine { name: "HalFlushAdapterBuffersEx", handler: flush_adapter_buffers_ex },
+    Routine { name: "HalFreeAdapterObject", handler: free_adapter_object },
+    Routine { name: "HalFlushDmaBuffer", handler: flush_dma_buffer },
+    Routine { name: "HalGetDmaDomain", handler: get_dma_domain },
 ];
 
 fn adapter(address: u64) -> &'static AdapterObject {
@@ -132,17 +178,59 @@ fn operations() -> Result<u64, KernelError> {
     Ok(address)
 }
 
-/// HalGetAdapterV2 para o dispositivo `device` (o PDO): o adaptador e o
-/// número de registradores de mapa em *NumberOfMapRegisters. NULL para uma
-/// DEVICE_DESCRIPTION que esta HAL não atende.
+/// A tabela HalpDmaOperationsV3 (Size 0x138), na ordem dos campos do
+/// DMA_OPERATIONS.
+fn operations_v3() -> Result<u64, KernelError> {
+    let mut table = OPERATIONS_V3.lock();
+    if *table != 0 {
+        return Ok(*table);
+    }
+    let address = guest::alloc_bytes(DmaOperations::SIZE);
+    // SAFETY: bloco zerado recém-alocado do tamanho da tabela.
+    let operations = unsafe { DmaOperations::at(address) };
+    let slots: [(&Field<u64>, &str); 21] = [
+        (&operations.put_dma_adapter, "HalPutDmaAdapter"),
+        (&operations.allocate_common_buffer, "HalAllocateCommonBuffer"),
+        (&operations.free_common_buffer, "HalFreeCommonBufferV3"),
+        (&operations.allocate_adapter_channel, "HalRealAllocateAdapterChannelV3"),
+        (&operations.flush_adapter_buffers, "IoFlushAdapterBuffers"),
+        (&operations.free_adapter_channel, "IoFreeAdapterChannel"),
+        (&operations.free_map_registers, "IoFreeMapRegisters"),
+        (&operations.map_transfer, "IoMapTransfer"),
+        (&operations.get_dma_alignment, "HalGetDmaAlignment"),
+        (&operations.read_dma_counter, "HalReadDmaCounterV3"),
+        (&operations.get_scatter_gather_list, "HalGetScatterGatherList"),
+        (&operations.put_scatter_gather_list, "HalPutScatterGatherList"),
+        (&operations.calculate_scatter_gather_list, "HalCalculateScatterGatherListSizeV3"),
+        (&operations.build_scatter_gather_list, "HalBuildScatterGatherListV3"),
+        (&operations.build_mdl_from_scatter_gather_list, "HalBuildMdlFromScatterGatherListV3"),
+        (&operations.get_dma_adapter_info, "HalGetDmaAdapterInfo"),
+        (&operations.allocate_common_buffer_ex, "HalAllocateCommonBufferExV3"),
+        (&operations.flush_adapter_buffers_ex, "HalFlushAdapterBuffersEx"),
+        (&operations.free_adapter_object, "HalFreeAdapterObject"),
+        (&operations.flush_dma_buffer, "HalFlushDmaBuffer"),
+        (&operations.get_dma_domain, "HalGetDmaDomain"),
+    ];
+    operations.size.set(DmaOperations::SIZE as u32);
+    for (slot, name) in slots {
+        slot.set(routine_stubs::address(name)?);
+    }
+    *table = address;
+    Ok(address)
+}
+
+/// HalGetAdapterV2/HalGetAdapterV3 para o dispositivo `device` (o PDO): o
+/// adaptador e o número de registradores de mapa em *NumberOfMapRegisters.
+/// NULL para uma DEVICE_DESCRIPTION que esta HAL não atende.
 pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
     if description == 0 {
         return 0;
     }
     // SAFETY: DEVICE_DESCRIPTION do driver chamador.
     let description = unsafe { DeviceDescription::at(description) };
-    if description.version.get() > 2 {
-        debug_print!("[dma] DEVICE_DESCRIPTION versao {} sem suporte", description.version.get());
+    let version = description.version.get();
+    if version > 3 {
+        debug_print!("[dma] DEVICE_DESCRIPTION versao {} sem suporte", version);
         return 0;
     }
     if description.master.get() == 0 {
@@ -150,7 +238,15 @@ pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
         debug_print!("[dma] adaptador de DMA de sistema pedido (canal {})", description.dma_channel.get());
         return 0;
     }
-    let Ok(table) = operations() else { return 0 };
+    // A largura de endereço: o DmaAddressWidth da versão 3; nas anteriores,
+    // 64 bits com Dma64BitAddresses e 32 bits senão.
+    let address_width = if version == 3 { description.dma_address_width.get() } else if description.dma64_bit_addresses.get() != 0 { 64 } else { 32 };
+    if address_width < 32 {
+        // Abaixo de 32 bits a HAL precisaria de buffers de passagem.
+        debug_print!("[dma] adaptador bus master de {} bits sem suporte", address_width);
+        return 0;
+    }
+    let Ok(table) = (if version == 3 { operations_v3() } else { operations() }) else { return 0 };
     let maximum = description.maximum_length.get() & 0x7FFF_FFFF;
     let count = (maximum >> 12) + 1 + u32::from(maximum & 0xFFF != 0);
     let address = guest::alloc_bytes(AdapterObject::SIZE);
@@ -164,14 +260,15 @@ pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
     // Bus master de 32 bits que também faz scatter/gather.
     object.scatter_gather.set(description.scatter_gather.get() | description.dma32_bit_addresses.get() | description.dma64_bit_addresses.get());
     object.dma32.set(description.dma32_bit_addresses.get());
-    object.dma64.set(description.dma64_bit_addresses.get());
+    object.dma64.set(description.dma64_bit_addresses.get() | u8::from(address_width >= 64));
     object.device_object.set(device);
+    object.address_width.set(address_width);
     ADAPTERS.lock().insert(address);
     if map_registers != 0 {
         // SAFETY: PULONG de saída do driver.
         unsafe { Field::<u32>::at(map_registers) }.set(count);
     }
-    debug_print!("[dma] adaptador {:#x} (master, max {:#x}, {} registradores de mapa)", address, maximum, count);
+    debug_print!("[dma] adaptador {:#x} (versao {}, master de {} bits, max {:#x}, {} registradores de mapa)", address, version, address_width, maximum, count);
     address
 }
 
@@ -334,12 +431,13 @@ fn physical_runs(mdl_address: u64, current_va: u64, length: u32) -> Option<alloc
     Some(runs)
 }
 
-/// Os trechos ficam abaixo de 4 GB para um adaptador sem endereços de 64
-/// bits. Esta plataforma não admite RAM acima de 4 GB (o mapa físico do
-/// kernel termina ali), então não há buffers de passagem a montar; um trecho
-/// acima disso é recusado em vez de entregue truncado ao dispositivo.
+/// Os trechos ficam dentro da largura de endereço do adaptador. Esta
+/// plataforma não admite RAM acima de 4 GB (o mapa físico do kernel termina
+/// ali), então não há buffers de passagem a montar; um trecho além disso é
+/// recusado em vez de entregue truncado ao dispositivo.
 fn reachable(object: u64, runs: &[(u64, u32)]) -> bool {
-    adapter(object).dma64.get() != 0 || runs.iter().all(|&(physical, size)| physical + size as u64 <= 0x1_0000_0000)
+    let width = adapter(object).address_width.get();
+    width >= 64 || runs.iter().all(|&(physical, size)| physical + size as u64 <= 1u64 << width)
 }
 
 /// MapTransfer(Adapter, Mdl, MapRegisterBase, CurrentVa, Length*, WriteToDevice).
@@ -458,4 +556,76 @@ fn build_mdl_from_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
     // SAFETY: PMDL* de saída do driver.
     unsafe { Field::<u64>::at(target) }.set(original);
     Ok(STATUS_SUCCESS)
+}
+
+/// DMA_ADAPTER_INFO_VERSION1 e os ADAPTER_INFO_SYNCHRONOUS_CALLBACK |
+/// ADAPTER_INFO_API_BYPASS de um bus master sem tradução.
+const DMA_ADAPTER_INFO_VERSION1: u32 = 1;
+const ADAPTER_INFO_BUS_MASTER_FLAGS: u32 = 3;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// GetDmaAdapterInfo(Adapter, AdapterInfo) do HalGetDmaAdapterInfo.
+fn get_dma_adapter_info(call: &Call) -> Result<u64, KernelError> {
+    let (object, info) = (call.arg(1), call.arg(2));
+    if !is_adapter(object) || info == 0 {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    // SAFETY: DMA_ADAPTER_INFO do driver chamador.
+    let info = unsafe { DmaAdapterInfo::at(info) };
+    if info.version.get() > DMA_ADAPTER_INFO_VERSION1 {
+        return Ok(STATUS_NOT_SUPPORTED as u64);
+    }
+    let v1 = &info.v1;
+    v1.dma_address_width.set(adapter(object).address_width.get());
+    v1.flags.set(ADAPTER_INFO_BUS_MASTER_FLAGS);
+    v1.scatter_gather_limit.set(u32::MAX);
+    v1.read_dma_counter_available.set(0);
+    v1.minimum_transfer_unit.set(1);
+    Ok(STATUS_SUCCESS)
+}
+
+/// FlushAdapterBuffersEx(Adapter, Mdl, MapRegisterBase, Offset, Length,
+/// WriteToDevice): sem registradores de mapa nem buffers de passagem, nada
+/// a copiar.
+fn flush_adapter_buffers_ex(call: &Call) -> Result<u64, KernelError> {
+    let (mdl, offset) = (call.arg(2), call.arg(4));
+    if mdl == 0 {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    // SAFETY: MDL do driver chamador.
+    if offset >= unsafe { Mdl::at(mdl) }.byte_count.get() as u64 {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    Ok(STATUS_SUCCESS)
+}
+
+/// FreeAdapterObject(Adapter, AllocationAction): DeallocateObject (2) e
+/// DeallocateObjectKeepRegisters (3) liberam o canal.
+fn free_adapter_object(call: &Call) -> Result<u64, KernelError> {
+    if matches!(call.arg(2), 2 | DEALLOCATE_OBJECT_KEEP_REGISTERS) {
+        return free_adapter_channel(call);
+    }
+    Ok(0)
+}
+
+/// FlushDmaBuffer(Adapter, Mdl, ReadOperation): ByteCount e ByteOffset
+/// alinhados ao alinhamento de DMA; o x64 é coerente, o KeFlushIoBuffers não
+/// tem o que fazer.
+fn flush_dma_buffer(call: &Call) -> Result<u64, KernelError> {
+    let (object, mdl) = (call.arg(1), call.arg(2));
+    if object == 0 || mdl == 0 {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    let mask = get_dma_alignment(call)? as u32 - 1;
+    // SAFETY: MDL do driver chamador.
+    let descriptor = unsafe { Mdl::at(mdl) };
+    if descriptor.byte_count.get() & mask != 0 || descriptor.byte_offset.get() & mask != 0 {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    Ok(STATUS_SUCCESS)
+}
+
+/// GetDmaDomain(Adapter): o adaptador não entrou em domínio de DMA.
+fn get_dma_domain(_: &Call) -> Result<u64, KernelError> {
+    Ok(0)
 }
