@@ -379,6 +379,33 @@ fn io_manager_devices(assert: Assert) {
     assert(power.status == status::PENDING && power.pending_irp != 0 && iom::get_device_power_state(native_path) == Some(device_power_state::D0), "iomdev: SET_POWER pendente sem mudar o estado registrado");
     assert(iom::cancel_pending_io_request(&mut power) == 0xC000_0120u32 as i32 && power.pending_irp == 0, "iomdev: IRP de energia pendente cancelado");
     assert(matches!(iom::pnp_start_device(native_node), Ok(status::NOT_SUPPORTED)) && iom::device(native_node).is_some_and(|entry| !entry.pnp_started), "iomdev: START_DEVICE sem rotina PnP nativa");
+    // Abertura de uma pilha: o FILE_OBJECT guarda (e referencia) o
+    // dispositivo do nome, o parseDeviceObject do IopParseDevice; o
+    // IRP_MJ_CREATE vai ao topo, o IoGetRelatedDeviceObject do FILE_OBJECT.
+    for major in [irp_mj::CREATE, irp_mj::CLEANUP, irp_mj::CLOSE] {
+        major_function(driver_object, major, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    }
+    let named_device = guest::alloc_bytes(DeviceObject::SIZE);
+    let upper_device = guest::alloc_bytes(DeviceObject::SIZE);
+    guest::write_bytes(named_device, &[0; DeviceObject::SIZE as usize]);
+    guest::write_bytes(upper_device, &[0; DeviceObject::SIZE as usize]);
+    let (named, upper) = unsafe { (DeviceObject::at(named_device), DeviceObject::at(upper_device)) };
+    named.driver_object.set(native_driver);
+    named.stack_size.set(1);
+    named.attached_device.set(upper_device);
+    upper.driver_object.set(native_driver);
+    upper.stack_size.set(2);
+    let stacked_node = om::create_object("\\Device", "Phase4Stacked", "Device", None).unwrap_or(0);
+    iom::register_device(stacked_node, DeviceEntry { native_device: named_device, stack_top: upper_device, ..Default::default() });
+    record(0, 0);
+    let stacked = iom::open_device("\\Device\\Phase4Stacked", false).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0, information: 0 });
+    let file_device = if stacked.file_object != 0 { unsafe { crate::ntos::inc::types::FileObject::at(stacked.file_object) }.device_object.get() } else { 0 };
+    let related = if stacked.file_object != 0 { crate::ntos::io::file::information::related_device_object(stacked.file_object).unwrap_or(0) } else { 0 };
+    assert(stacked.status == 0 && file_device == named_device && named.reference_count.get() == 1 && upper.reference_count.get() == 0 && seen(0) == upper_device && related == upper_device, "iomdev: FILE_OBJECT.DeviceObject e o dispositivo do nome e o CREATE vai ao topo da pilha");
+    assert(matches!(iom::close_device(stacked.handle), Ok(0)) && named.reference_count.get() == 0, "iomdev: o CLOSE solta a referencia do dispositivo do nome");
+    let _ = om::unlink("\\Device\\Phase4Stacked");
+    guest::free_bytes(named_device);
+    guest::free_bytes(upper_device);
     let _ = om::unlink(native_path);
     let _ = om::unlink(path);
     let _ = om::unlink("\\Driver\\Phase4Echo");

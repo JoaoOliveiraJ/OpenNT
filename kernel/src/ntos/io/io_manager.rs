@@ -1007,8 +1007,12 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
         return Ok(Opened { status: status::NOT_FOUND, handle: 0, file_object: 0, information: 0 });
     };
     let entry = device(node).unwrap_or_default();
-    let top = if entry.stack_top != 0 { entry.stack_top } else { entry.native_device };
-    let file_object = file_objects::create(top, name)?;
+    // FILE_OBJECT.DeviceObject é o dispositivo do nome (o parseDeviceObject
+    // do IopParseDevice, que o IopCheckDeviceAndDriver referencia), não o
+    // topo da pilha: o IRP vai ao topo pelo IoGetRelatedDeviceObject, e quem
+    // abre um link de interface recebe no FILE_OBJECT o PDO que a registrou.
+    let named = if entry.native_device != 0 { entry.native_device } else { entry.stack_top };
+    let file_object = file_objects::create(named, name)?;
     // SAFETY: o FILE_OBJECT recém-criado.
     let object = unsafe { crate::ntos::inc::types::FileObject::at(file_object) };
     object.related_file_object.set(related_file_object);
@@ -1045,9 +1049,9 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
         return Ok(Opened { status: request.status, handle: 0, file_object: 0, information: request.info });
     }
     let information = request.info;
-    if top != 0 {
+    if named != 0 {
         // InterlockedIncrement do DEVICE_OBJECT.ReferenceCount, como o parse.
-        device_at(top).reference_count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        device_at(named).reference_count.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
     update_device(node, |entry| entry.open_count += 1);
     let handle = {
@@ -1069,9 +1073,9 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
             let mut request = make_io_request(irp_mj::CLOSE, IoParams::default());
             request.file_object = file_object;
             let _ = call_driver(&close_path, &mut request);
-            if top != 0 {
-                device_at(top).reference_count.atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-                device_objects::changed(top);
+            if named != 0 {
+                device_at(named).reference_count.atomic().fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                device_objects::changed(named);
             }
             update_device(node, |entry| entry.open_count -= 1);
         })),
