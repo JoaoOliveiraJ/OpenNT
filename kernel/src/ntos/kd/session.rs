@@ -8,8 +8,9 @@
 //! software; `Z1` (execução), `Z2` (escrita) e `Z4` (acesso) são os
 //! comparadores DR0-DR3 (o `Z3`, só leitura, não existe no x86 e volta sem
 //! suporte). As consultas próprias do OpenNT vêm pelo `qRcmd` (`monitor`
-//! no GDB, `kd::monitor`), e a lista de módulos também pelo
-//! `qXfer:libraries:read`.
+//! no GDB, `kd::monitor`), a lista de módulos também pelo
+//! `qXfer:libraries:read`, e os registros do rastro de instruções pelo
+//! `qOpenNTTrace:offset,tamanho` (`kd::trace`).
 //!
 //! Anexar: o primeiro pacote válido do host liga KdDebuggerNotPresent =
 //! FALSE e o bit de presença do KUSER_SHARED_DATA.KdDebuggerEnabled, como o
@@ -554,6 +555,19 @@ fn query(owner: usize, command: &[u8], reply: &mut Payload, text: &mut [u8]) {
             document.len()
         };
         xfer_window(&text[..length], annex, reply);
+    } else if let Some(window) = command.strip_prefix(b"qOpenNTTrace:") {
+        // Os registros do rastro (`kd::trace`), em hexadecimal como o `m`.
+        let Some((offset, length, _)) = split_address_length(window) else {
+            reply.push_str("E01");
+            return;
+        };
+        let length = length.min((PACKET_SIZE - 8) / 2).min(text.len());
+        let done = super::trace::read(offset as usize, &mut text[..length]);
+        if done == 0 && length != 0 {
+            reply.push_str("E01");
+            return;
+        }
+        reply.push_hex(&text[..done]);
     } else if let Some(hex) = command.strip_prefix(b"qRcmd,") {
         let mut line = [0u8; 256];
         let Some(decoded) = packet::decode_hex(hex, &mut line) else {

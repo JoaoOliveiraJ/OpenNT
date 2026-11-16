@@ -6,11 +6,13 @@
 //! `session`), com as paradas, o congelamento dos outros processadores e
 //! os passos em `stop`, os breakpoints em `breakpoints`, o acesso à memória
 //! em `memory`, os registradores em `registers`, as consultas do OpenNT em
-//! `monitor` e a saída do DbgPrint em `print_log`.
+//! `monitor` e `inspect` (objetos do NT), o rastro de instruções em `trace`
+//! e a saída do DbgPrint em `print_log`.
 pub mod breakpoints;
 pub mod debug_filter;
 pub mod debugger;
 pub mod exports;
+pub mod inspect;
 pub mod memory;
 pub mod monitor;
 pub mod packet;
@@ -19,6 +21,7 @@ pub mod print_log;
 pub mod registers;
 pub mod session;
 pub mod stop;
+pub mod trace;
 pub mod transport;
 
 use crate::ntos::init::boot_config;

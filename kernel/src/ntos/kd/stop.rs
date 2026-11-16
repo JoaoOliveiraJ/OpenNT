@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, 
 
 use super::breakpoints::{self, Watch};
 use super::registers::View;
-use super::{memory, session, transport};
+use super::{memory, session, trace, transport};
 use crate::hal::amd64::irqstubs::TrapFrame;
 use crate::hal::cpu;
 use crate::ntos::ke::{clock, pcr, smp};
@@ -474,27 +474,47 @@ fn enter(number: usize, frame: u64, fx: u64, error_code: bool, signal: u8, kind:
     breakpoints::disarm_processor();
     transport::seize(number);
     freeze_others(number);
+    // Outra parada no meio de um rastro encerra o rastro.
+    trace::abandon();
     record_stop(number, signal, kind, data);
     let view = view(number).unwrap_or_default();
-    Some(match session::run(number) {
-        Resume::Step => {
-            // Um passo sobre um breakpoint executa a instrução original.
+    loop {
+        let resume = session::run(number);
+        // Continuar com um rastro armado começa os passos do rastro.
+        if matches!(resume, Resume::Continue { .. }) && trace::armed() {
             let rip = view.rip();
             let over = if breakpoints::inserted_at(rip) && breakpoints::suspend(rip) { rip } else { 0 };
-            prepare_step(number, &view, over, false);
-            HANDLED
-        }
-        Resume::Continue { pass } => {
-            let rip = view.rip();
-            if breakpoints::inserted_at(rip) {
-                breakpoints::suspend(rip);
-                prepare_step(number, &view, rip, true);
+            if trace::begin(number, &view) {
+                prepare_step(number, &view, over, false);
                 return Some(HANDLED);
             }
-            continue_execution(number, &view);
-            if pass { DECLINED } else { HANDLED }
+            if over != 0 {
+                breakpoints::restore(over);
+            }
+            // O lote terminou sem passo: o host recebe a parada de novo.
+            record_stop(number, SIGTRAP, Kind::Signal, 0);
+            continue;
         }
-    })
+        return Some(match resume {
+            Resume::Step => {
+                // Um passo sobre um breakpoint executa a instrução original.
+                let rip = view.rip();
+                let over = if breakpoints::inserted_at(rip) && breakpoints::suspend(rip) { rip } else { 0 };
+                prepare_step(number, &view, over, false);
+                HANDLED
+            }
+            Resume::Continue { pass } => {
+                let rip = view.rip();
+                if breakpoints::inserted_at(rip) {
+                    breakpoints::suspend(rip);
+                    prepare_step(number, &view, rip, true);
+                    return Some(HANDLED);
+                }
+                continue_execution(number, &view);
+                if pass { DECLINED } else { HANDLED }
+            }
+        });
+    }
 }
 
 /// Entrada dos trampolins (vetores 1, 2 e 3 do anel 0 e o tique do relógio
@@ -550,6 +570,17 @@ extern "sysv64" fn rs_kd_trap(frame: *mut TrapFrame, fx: u64, reason: u32) -> u3
                 core::arch::asm!("mov dr6, {}", in(reg) 0xFFFF_0FF0u64, options(nomem, nostack));
             }
             if stepping && status & DR6_SINGLE_STEP != 0 {
+                if trace::active() {
+                    // Um passo do rastro: grava e segue sem voltar ao host.
+                    finish_step(number, &view);
+                    return match trace::after_step(&view) {
+                        trace::Next::Continue => {
+                            prepare_step(number, &view, 0, false);
+                            HANDLED
+                        }
+                        trace::Next::Stop(kind) => enter(number, frame, fx, false, SIGTRAP, kind, 0).unwrap_or(HANDLED),
+                    };
+                }
                 if finish_step(number, &view) {
                     continue_execution(number, &view);
                     return HANDLED;
@@ -568,6 +599,7 @@ extern "sysv64" fn rs_kd_trap(frame: *mut TrapFrame, fx: u64, reason: u32) -> u3
             if stepping {
                 // O passo executou um `int 3`.
                 finish_step(number, &view);
+                trace::abandon();
             }
             let address = view.rip().wrapping_sub(1);
             let cr3 = cpu::read_cr3();

@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{breakpoints, debugger, memory, print_log, stop};
+use super::{breakpoints, debugger, inspect, memory, print_log, stop, trace};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -34,6 +34,13 @@ const HELP: &str = "comandos do OpenNT:
   bl                 breakpoints armados
   bugcheck           codigo e parametros do bugcheck que parou a maquina
   kd                 estado do depurador visto pelos drivers
+  process [pid|end]  EPROCESS e as threads dele (vazio: o processo corrente)
+  thread [ethread]   ETHREAD: estado, motivo da espera, pilha de kernel, IRPs
+  irp <end>          IRP e a pilha de E/S (major/minor, dispositivo, arquivo)
+  devobj <end|nome>  DEVICE_OBJECT e a pilha de dispositivos
+  drvobj <end|nome>  DRIVER_OBJECT, os dispositivos e a tabela de despacho
+  handle <pid> <h>   a entrada da tabela de handles do processo
+  trace start|resume|stop|status   rastro de instrucoes passo a passo no convidado
 ";
 
 fn read_u64(cr3: u64, address: u64) -> u64 {
@@ -305,6 +312,7 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or("help");
     let argument = words.next().unwrap_or("");
+    let rest = line.trim_start().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim());
     match command {
         "ps" => processes(cr3, out),
         "threads" => threads(cr3, argument.parse().ok(), out),
@@ -320,9 +328,30 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
                 out.push_str("nenhum bugcheck\n");
             } else {
                 let _ = writeln!(out, "bugcheck {:#010x} ({:#x}, {:#x}, {:#x}, {:#x})", data[0], data[1], data[2], data[3], data[4]);
+                // O nome do KiBugCodeMessages e o driver de um parâmetro
+                // (KiDumpParameterImages), como a tela de STOP os mostra.
+                if let Some(text) = crate::ntos::ke::bugcheck::bug_message_text(data[0] as u32) {
+                    out.push_str("nome: ");
+                    push_name(out, text.split(|&byte| byte == b'\r' || byte == b'\n').next().unwrap_or(&[]));
+                    out.push(b'\n');
+                }
+                let mut driver = [0u8; 64];
+                let length = crate::ntos::ke::bugcheck::parameter_driver(&[data[1], data[2], data[3], data[4]], &mut driver);
+                if length != 0 {
+                    out.push_str("driver: ");
+                    push_name(out, &driver[..length]);
+                    out.push(b'\n');
+                }
             }
         }
         "kd" => debugger::describe(out),
+        "process" => inspect::process(owner, rest, out),
+        "thread" => inspect::thread(owner, rest, out),
+        "irp" => inspect::irp(owner, rest, out),
+        "devobj" => inspect::device_object(owner, rest, out),
+        "drvobj" => inspect::driver_object(owner, rest, out),
+        "handle" => inspect::handle(owner, rest, out),
+        "trace" => trace::command(owner, rest, out),
         _ => out.push_str(HELP),
     }
 }
