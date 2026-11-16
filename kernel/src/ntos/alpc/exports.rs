@@ -41,7 +41,25 @@ fn connect_port_ex(call: &Call) -> Result<u64, KernelError> {
 
 fn send_wait_receive_port(call: &Call) -> Result<u64, KernelError> {
     let arguments: [u64; 8] = core::array::from_fn(|index| call.arg(index + 1));
-    finish("kernel failure", kernel_entry::send_wait_receive(&arguments))
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+        crate::debug_print!("[alpc-zw] > troca: porta {:#x} flags {:#x} envio {:#x} recepcao {:#x}", arguments[0], arguments[1], arguments[2], arguments[4]);
+        if arguments[2] != 0 {
+            trace_message("envio", arguments[2]);
+        }
+    }
+    let result = finish("kernel failure", kernel_entry::send_wait_receive(&arguments));
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS && arguments[4] != 0 {
+        trace_message("recepcao", arguments[4]);
+    }
+    result
+}
+
+/// O PORT_MESSAGE e o começo dos dados de um buffer de kernel (rastreio).
+fn trace_message(what: &str, message: u64) {
+    use crate::ntos::mm::guest_memory as guest;
+    let Ok(bytes) = guest::try_read_bytes(message, 0x68) else { return };
+    let hex: alloc::string::String = bytes.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
+    crate::debug_print!("[alpc-zw]   {} {}", what, hex);
 }
 
 /// Zw consulta handles no modo kernel sem alterar o PreviousMode do chamador.

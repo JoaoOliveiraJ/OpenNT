@@ -1276,6 +1276,13 @@ fn begin_connection_ex(arguments: &[u64; 11]) -> Result<Box<dyn Pending>, Kernel
 }
 
 fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+    // Rastreio de serviços: o PORT_MESSAGE e o começo dos dados enviados.
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS && input != 0 && state::probe_user_read(input, 0x68) {
+        if let Ok(bytes) = guest::try_read_bytes(input, 0x68) {
+            let hex: alloc::string::String = bytes.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
+            crate::debug_print!("[alpc] envio de usuario {:#x} flags {:#x}: {}", handle, flags as u32, hex);
+        }
+    }
     let status = send_receive(handle, flags, input, attributes, rsp)?;
     if status == INVALID {
         let mut detail = alloc::format!("[alpc] invalid send flags=0x{:x}", flags as u32);
