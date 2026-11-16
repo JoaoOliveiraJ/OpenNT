@@ -1752,6 +1752,49 @@ fn ntoskrnl_thread_information(assert: Assert) {
     assert(call_export("NtSetInformationThread", &[current_handle, 24, buffer, 4]) == Some(0xC000_000D) && call_export("ZwSetInformationThread", &[current_handle, 0, buffer, 4]) == Some(0xC000_0003), "threadinfo: prioridade invalida e classe rejeitada");
     ethread.set_thread_page_priority((saved >> 12) & 7);
     guest::free_bytes(buffer);
+    zw_thread_impersonation_token(assert);
+}
+
+/// ThreadImpersonationToken pela entrada Zw, como o msrpc.sys impersona o
+/// cliente na thread de trabalho: um token de impersonação de handle de
+/// kernel, o fim pela NULL e as recusas de tamanho e de token primário.
+fn zw_thread_impersonation_token(assert: Assert) {
+    use crate::ntos::ps::process;
+    use crate::ntos::se::token::thread as thread_tokens;
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (primary_out, copy_out, input, attributes) = (block, block + 8, block + 0x10, block + 0x40);
+    let object_attributes = at::<nt::ObjectAttributes>(attributes);
+    object_attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+    object_attributes.attributes.set(0x200);
+    // SECURITY_QUALITY_OF_SERVICE: Length 12, SecurityImpersonation.
+    let quality = block + 0x90;
+    guest::write32(quality, 12);
+    guest::write32(quality + 4, 2);
+    object_attributes.security_quality_of_service.set(quality);
+    let current_handle = (-2i64) as u64;
+    let thread = process::get_current_thread();
+    let before = thread_tokens::get(thread).map(|state| state.token);
+    let opened = call_export("ZwOpenProcessTokenEx", &[u64::MAX, 0xF01FF, 0x200, primary_out]);
+    let primary = guest::read64(primary_out);
+    // TokenImpersonation (2) no nível SecurityImpersonation do QOS ausente.
+    let duplicated = call_export("ZwDuplicateToken", &[primary, 0xF01FF, attributes, 0, 2, copy_out]);
+    let copy = guest::read64(copy_out);
+    assert(opened == Some(0) && duplicated == Some(0) && copy != 0, "zw-impersonation: token de impersonacao de handle de kernel");
+    let set = |handle: u64, length: u64| {
+        guest::write64(input, handle);
+        call_export("ZwSetInformationThread", &[current_handle, 5, input, length])
+    };
+    assert(set(copy, 4) == Some(0xC000_0004), "zw-impersonation: tamanho diferente de 8 = STATUS_INFO_LENGTH_MISMATCH");
+    assert(set(primary, 8) == Some(0xC000_00A8), "zw-impersonation: token primario = STATUS_BAD_TOKEN_TYPE");
+    let assigned = set(copy, 8);
+    let impersonating = thread_tokens::get(thread).map(|state| state.token);
+    assert(assigned == Some(0) && impersonating.is_some() && impersonating != before, "zw-impersonation: a thread corrente passa a impersonar o token");
+    let reverted = set(0, 8);
+    assert(reverted == Some(0) && thread_tokens::get(thread).is_none(), "zw-impersonation: o handle NULL encerra a impersonacao");
+    let _ = call_export("ZwClose", &[copy]);
+    let _ = call_export("ZwClose", &[primary]);
+    guest::free_bytes(block);
 }
 
 /// ExDeleteResourceLite de um ERESOURCE ainda adquirido, como o ntfs.sys

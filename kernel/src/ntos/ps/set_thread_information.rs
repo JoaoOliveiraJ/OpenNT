@@ -1,6 +1,7 @@
 //! Zw/NtSetInformationThread.
 //!
 //! ThreadBreakOnTermination liga ou desliga a thread crítica.
+//! ThreadImpersonationToken impersona um token (ou encerra a impersonação).
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração
 //! atômica e liberação. A variante de syscall de usuário (`set_user`) entra
@@ -21,6 +22,13 @@ pub const THREAD_BREAK_ON_TERMINATION: u32 = 18;
 /// SeDebugPrivilege.
 const DEBUG_PRIVILEGE: u64 = 20;
 const THREAD_SET_INFORMATION: u32 = 0x20;
+/// ThreadImpersonationToken, THREAD_SET_THREAD_TOKEN, TOKEN_IMPERSONATE,
+/// TokenImpersonation e SecurityImpersonation.
+const THREAD_IMPERSONATION_TOKEN: u32 = 5;
+const THREAD_SET_THREAD_TOKEN: u32 = 0x80;
+const TOKEN_IMPERSONATE: u32 = 4;
+const TOKEN_TYPE_IMPERSONATION: u32 = 2;
+const SECURITY_IMPERSONATION: u32 = 2;
 const REJECTED_SET_CLASSES: [u32; 17] = [0, 6, 8, 11, 12, 16, 20, 21, 23, 26, 27, 28, 35, 37, 40, 41, 45];
 
 /// A captura aceita memória só de leitura e endereços desalinhados em
@@ -65,6 +73,9 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     if information_class == THREAD_BREAK_ON_TERMINATION {
         return set_break_on_termination(thread_handle, input, input_length, access_mode);
     }
+    if information_class == THREAD_IMPERSONATION_TOKEN {
+        return impersonation_token(thread_handle, input, input_length, access_mode);
+    }
     if information_class != THREAD_PAGE_PRIORITY {
         return Ok(0xC000_0002);
     }
@@ -94,6 +105,47 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     result
 }
 
+/// ThreadImpersonationToken: o HANDLE do token (8 bytes, senão
+/// STATUS_INFO_LENGTH_MISMATCH), capturado uma vez; a thread com
+/// THREAD_SET_THREAD_TOKEN e o PsAssignImpersonationToken. NULL encerra a
+/// impersonação; senão o token, referenciado com TOKEN_IMPERSONATE no modo
+/// do chamador (um handle de kernel na entrada Zw: o msrpc.sys impersona o
+/// cliente na thread de trabalho dele), precisa ser de impersonação
+/// (STATUS_BAD_TOKEN_TYPE) e a thread passa a impersoná-lo no nível dele.
+fn impersonation_token(thread_handle: u64, input: u64, input_length: u32, access_mode: u8) -> Result<u32, KernelError> {
+    use crate::ntos::se::token::{reference as token_reference, tokens};
+    if input_length != 8 {
+        return Ok(0xC000_0004);
+    }
+    if access_mode != 0 && !user_probe::probe_user_read(input, 8) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let Ok(token_handle) = guest::try_read::<u64>(input) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let mut thread = match thread_handles::reference(thread_handle, THREAD_SET_THREAD_TOKEN, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let result = (|| -> Result<u32, KernelError> {
+        if token_handle == 0 {
+            return crate::ntos::ps::security::impersonate_client(thread.pointer, 0, false, false, SECURITY_IMPERSONATION);
+        }
+        let mut token = match token_reference::reference(token_handle, TOKEN_IMPERSONATE, access_mode, false)? {
+            Ok(reference) => reference,
+            Err(status) => return Ok(status),
+        };
+        let assigned = (|| -> Result<u32, KernelError> {
+            let Some((kind, level)) = tokens::with(token.token, |record| (record.kind, record.impersonation_level)) else { return Ok(0xC000_0008) };
+            if kind != TOKEN_TYPE_IMPERSONATION {
+                return Ok(0xC000_00A8);
+            }
+            crate::ntos::ps::security::impersonate_client(thread.pointer, token.token, false, false, level)
+        })();
+        token.release()?;
+        assigned
+    })();
+    thread.release()?;
+    result
+}
 
 /// ThreadBreakOnTermination (ntoskrnl 19041, rva 0x64b41e; o
 /// RtlSetThreadIsCritical): um ULONG (outro tamanho dá
