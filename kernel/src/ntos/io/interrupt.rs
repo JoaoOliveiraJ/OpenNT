@@ -8,9 +8,10 @@
 //! (INTERRUPT_CONNECTION_DATA_PKEY, o IopGetInterruptConnectionData: um
 //! ULONG de contagem e os INTERRUPT_VECTOR_DATA de 0x58 bytes; o acpi.sys
 //! grava os da SCI no dispositivo ACPI da HAL). Do vetor de entrada de
-//! controlador vale a GSIV, que a HAL entrega pelo 8259 no vetor fixo da
-//! linha (`resources::translate_interrupt`), com o modo e a polaridade do
-//! próprio dado.
+//! controlador valem a GSIV e o vetor e o IRQL que o árbitro de IRQ
+//! atribuiu a ela: a HAL registra a linha do 8259 que alimenta o vetor
+//! (`hal::interrupt_lines`); sem vetor atribuído, a linha chega no vetor
+//! fixo dela (`resources::translate_interrupt`). O modo vem do próprio dado.
 
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::inc::types::{GroupAffinity, InterruptConnectionType, InterruptVectorData, IoConnectInterruptParameters, IoDisconnectInterruptParameters, Kinterrupt, NtStruct};
@@ -40,10 +41,17 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     let output = fully.interrupt_object.get();
     if version == CONNECT_LINE_BASED {
         let physical = parameters.line_based.physical_device_object.get();
-        if let Some((gsiv, mode)) = connection_data_line(physical) {
-            let (vector, level) = crate::ntos::io::pnp::resources::translate_interrupt(gsiv);
-            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level as u8, level as u8, mode, true)?;
-            debug_print!("[io] interrupt LINE_BASED pelos dados de conexao: GSIV {} vetor 0x{:x} irql {} -> ISR 0x{:x}", gsiv, vector, level, service_routine);
+        if let Some(line) = connection_data_line(physical) {
+            // O vetor e o IRQL que o árbitro de IRQ atribuiu à GSIV: a HAL
+            // entrega a linha nele; sem vetor atribuído, o vetor fixo da linha.
+            let (vector, level) = if line.vector != 0 {
+                crate::hal::interrupt_lines::route_vector(line.vector, line.gsiv);
+                (line.vector, line.irql as u32)
+            } else {
+                crate::ntos::io::pnp::resources::translate_interrupt(line.gsiv)
+            };
+            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level as u8, level as u8, line.mode, true)?;
+            debug_print!("[io] interrupt LINE_BASED pelos dados de conexao: GSIV {} vetor 0x{:x} irql {} -> ISR 0x{:x}", line.gsiv, vector, level, service_routine);
             return Ok(status as u64);
         }
         // PDO da árvore do PnP: as interrupções de linha da lista traduzida
@@ -94,9 +102,18 @@ const INTERRUPT_CONNECTION_DATA_PKEY: [u8; 16] = [0x09, 0x0F, 0xE2, 0xF0, 0x7A, 
 /// Tamanho de um INTERRUPT_VECTOR_DATA.
 const VECTOR_DATA_SIZE: usize = core::mem::size_of::<InterruptVectorData>();
 
-/// A GSIV e o modo (0 = LevelSensitive, 1 = Latched) da primeira entrada de
-/// controlador (InterruptTypeControllerInput) dos dados de conexão do PDO.
-fn connection_data_line(pdo: u64) -> Option<(u32, u32)> {
+/// Uma entrada de controlador dos dados de conexão: a GSIV, o modo (0 =
+/// LevelSensitive, 1 = Latched), o vetor do IDT e o IRQL atribuídos.
+struct ConnectionLine {
+    gsiv: u32,
+    mode: u32,
+    vector: u32,
+    irql: u8,
+}
+
+/// A primeira entrada de controlador (InterruptTypeControllerInput) dos
+/// dados de conexão do PDO.
+fn connection_data_line(pdo: u64) -> Option<ConnectionLine> {
     let (_, bytes) = crate::ntos::io::device_property::device_property_value(pdo, INTERRUPT_CONNECTION_DATA_PKEY, 2)?;
     let count = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
     if count == 0 || bytes.len() < 8 + count * VECTOR_DATA_SIZE {
@@ -106,8 +123,10 @@ fn connection_data_line(pdo: u64) -> Option<(u32, u32)> {
     let type_offset = core::mem::offset_of!(InterruptVectorData, type_);
     let mode_offset = core::mem::offset_of!(InterruptVectorData, mode);
     let gsiv_offset = core::mem::offset_of!(InterruptVectorData, controller_input);
+    let vector_offset = core::mem::offset_of!(InterruptVectorData, vector);
+    let irql_offset = core::mem::offset_of!(InterruptVectorData, irql);
     let index = (0..count).find(|&index| entry(index, type_offset) == InterruptConnectionType::INTERRUPT_TYPE_CONTROLLER_INPUT.0 as u32)?;
-    Some((entry(index, gsiv_offset), entry(index, mode_offset)))
+    Some(ConnectionLine { gsiv: entry(index, gsiv_offset), mode: entry(index, mode_offset), vector: entry(index, vector_offset), irql: entry(index, irql_offset) as u8 })
 }
 
 /// IoDisconnectInterruptEx: o KINTERRUPT em ConnectionContext.

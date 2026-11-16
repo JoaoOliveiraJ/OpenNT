@@ -104,3 +104,53 @@ pub fn apic_version(gsi: u32) -> u32 {
         None => 0xF000_0000,
     }
 }
+
+// ---- vetores atribuídos e as linhas do 8259 ---------------------------------
+//
+// Com a raiz ACPI, o árbitro de IRQ do acpi.sys escolhe para cada GSI um
+// vetor do IDT do conjunto que a HAL dá ao dispositivo ACPI raiz (GSIs no
+// mesmo IRQL podem dividir um vetor), e o tradutor dele entrega esse vetor
+// na lista traduzida; a HAL do NT programa então a entrada do IOAPIC de cada
+// GSI para o vetor dela quando o driver conecta, e todas as ISRs conectadas
+// ao vetor recebem as interrupções das GSIs que o alimentam. A HAL do
+// OpenNT entrega as linhas pelo 8259, cada uma no vetor fixo
+// `0x20 + linha`: cada linha fica registrada com o vetor atribuído a ela, a
+// conexão num vetor atribuído recebe as interrupções das linhas dele, e o
+// vetor fixo de uma linha despacha a cadeia do vetor atribuído.
+
+/// (vetor atribuído, linha do 8259 que o alimenta); uma linha tem um vetor.
+static ROUTES: SpinLock<Vec<(u32, u32)>> = SpinLock::new(Vec::new());
+/// Vetor do IDT da linha 0 do 8259 na HAL do OpenNT.
+const PIC_VECTOR_BASE: u32 = 0x20;
+/// Linhas do par de 8259.
+const PIC_LINES: u32 = 16;
+
+/// Registra que a linha `line` (a GSI bruta) alimenta o vetor `vector`
+/// atribuído a um dispositivo. Linhas fora do 8259 não têm entrega; o vetor
+/// fixo da própria linha não precisa de registro.
+pub fn route_vector(vector: u32, line: u32) {
+    if line >= PIC_LINES || vector == PIC_VECTOR_BASE + line {
+        return;
+    }
+    let mut routes = ROUTES.lock();
+    routes.retain(|&(_, routed)| routed != line);
+    routes.push((vector, line));
+}
+
+/// Os vetores do IDT em que a HAL entrega as interrupções de um vetor
+/// atribuído: os das linhas do 8259 que o alimentam, ou o próprio vetor.
+pub fn delivery_vectors(vector: u32) -> Vec<u32> {
+    let lines: Vec<u32> = ROUTES.lock().iter().filter(|&&(assigned, _)| assigned == vector).map(|&(_, line)| PIC_VECTOR_BASE + line).collect();
+    if lines.is_empty() {
+        alloc::vec![vector]
+    } else {
+        lines
+    }
+}
+
+/// A cadeia que o vetor do IDT `vector` despacha: a do vetor atribuído à
+/// linha do 8259 dele, ou a do próprio vetor.
+pub fn chain_vector(vector: u32) -> u32 {
+    let Some(line) = vector.checked_sub(PIC_VECTOR_BASE).filter(|&line| line < PIC_LINES) else { return vector };
+    ROUTES.lock().iter().find(|&&(_, routed)| routed == line).map_or(vector, |&(assigned, _)| assigned)
+}

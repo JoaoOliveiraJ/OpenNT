@@ -130,7 +130,9 @@ pub fn service_during_wait() {
 /// objeto — o SynchronizeIrql, quando maior —, gravado no CR8, com o
 /// ActualLock retido; a saída devolve o nível anterior.
 fn dispatch_chain(vector: u8, _count: u32) {
-    let mut pointer = CHAINS.lock().get(&(vector as u32)).copied().unwrap_or(0);
+    // A linha do 8259 despacha a cadeia do vetor atribuído a ela (HAL).
+    let chain = crate::hal::interrupt_lines::chain_vector(vector as u32);
+    let mut pointer = CHAINS.lock().get(&chain).copied().unwrap_or(0);
     while pointer != 0 {
         let object = interrupt_object(pointer);
         let routine = object.service_routine.get();
@@ -164,6 +166,9 @@ pub fn io_connect_interrupt(
     mode: u32,
     share_vector: bool,
 ) -> Result<u32, KernelError> {
+    // Um vetor atribuído pelo árbitro de IRQ chega pelas linhas que a HAL
+    // registrou para ele (`hal::interrupt_lines`); a cadeia fica no vetor.
+    let deliveries = crate::hal::interrupt_lines::delivery_vectors(vector);
     let object = guest::alloc_bytes(InterruptObject::SIZE);
     // Lock do chamador reutilizado; senão, oito bytes para o lock interno.
     let actual_lock = if spin_lock != 0 { spin_lock } else { guest::alloc_bytes(8) };
@@ -192,14 +197,18 @@ pub fn io_connect_interrupt(
     // Insere na cabeça da cadeia antes de habilitar a linha do controlador.
     let previous_head = CHAINS.lock().insert(vector, object).unwrap_or(0);
     body.chain_next.set(previous_head);
-    physical::write32(INTERRUPT_LEVEL_TABLE + vector as u64 * 4, level as u32);
-    clear_and_unmask_controller(vector);
-    if previous_head == 0 {
-        interrupts::register_irq_handler(vector as u8, dispatch_chain);
-        if vector == interrupts::VECTOR_KEYBOARD as u32 {
+    for &delivery in &deliveries {
+        physical::write32(INTERRUPT_LEVEL_TABLE + delivery as u64 * 4, level as u32);
+        clear_and_unmask_controller(delivery);
+        // Uma linha nova de um vetor já conectado também passa a despachar
+        // a cadeia dele.
+        interrupts::register_irq_handler(delivery as u8, dispatch_chain);
+        if delivery == interrupts::VECTOR_KEYBOARD as u32 {
             physical::write8(NATIVE_KEYBOARD_INTERRUPT_FLAG, 1);
         }
-        debug_print!("[intobj] vetor {:#x} conectado a ISR nativa {:#x}", vector, service_routine as u32);
+    }
+    if previous_head == 0 {
+        debug_print!("[intobj] vetor {:#x} (entregue em {:x?}) conectado a ISR nativa {:#x}", vector, deliveries, service_routine as u32);
     }
     // PKINTERRUPT* InterruptObject: um store do ponteiro inteiro.
     // SAFETY: parâmetro de saída do driver.
@@ -229,9 +238,11 @@ pub fn io_disconnect_interrupt(object: u64) {
             interrupt_object(object).connected.set(0);
             guest::free_bytes(object);
             if next == 0 && previous_link == 0 && !CHAINS.lock().contains_key(&vector) {
-                physical::write32(INTERRUPT_LEVEL_TABLE + vector as u64 * 4, 0);
-                if vector == interrupts::VECTOR_KEYBOARD as u32 {
-                    physical::write8(NATIVE_KEYBOARD_INTERRUPT_FLAG, 0);
+                for delivery in crate::hal::interrupt_lines::delivery_vectors(vector) {
+                    physical::write32(INTERRUPT_LEVEL_TABLE + delivery as u64 * 4, 0);
+                    if delivery == interrupts::VECTOR_KEYBOARD as u32 {
+                        physical::write8(NATIVE_KEYBOARD_INTERRUPT_FLAG, 0);
+                    }
                 }
             }
             return;
@@ -335,7 +346,9 @@ fn report_object_active(object: u64, active: bool) {
         }
         all
     };
-    set_legacy_line_masked(vector, all_inactive);
+    for delivery in crate::hal::interrupt_lines::delivery_vectors(vector) {
+        set_legacy_line_masked(delivery, all_inactive);
+    }
 }
 
 /// KeIntSteerIsSteeringEnabled: o KiIntSteerEnabled do NT, que só o
