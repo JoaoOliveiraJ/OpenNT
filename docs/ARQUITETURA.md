@@ -341,7 +341,14 @@ classe até `n` (o timer do LAPIC, vetor 0x40, a partir de 4), como no NT; o
 ExtINT do PIC e as NMIs não passam pelo TPR, e a partida do LAPIC regrava o
 TPR com o próprio IRQL. As ISRs nativas rodam no IRQL do objeto (o
 SynchronizeIrql, quando maior) com o ActualLock retido, como o despacho
-encadeado do ntoskrnl (`interrupt_object::dispatch_chain`). Uma thread que
+encadeado do ntoskrnl (`interrupt_object::dispatch_chain`). O stub de IRQ
+do PIC só conta e dá o EOI, e a ISR roda depois; uma linha sensível a
+nível (um objeto LevelSensitive conectado nela, a INTx do PCI) fica
+mascarada no PIC desde o stub até a cadeia dela rodar (`LEVEL_LINES`), senão
+o dispositivo que ainda segura a linha reentraria sem fim. O
+KeStallExecutionProcessor de um driver atende, durante a espera, as
+interrupções de dispositivo e as DPCs pendentes, como a preempção do NT faz
+com a CPU que gira (o stornvme.sys espera assim pela conclusão das filas). Uma thread que
 deixa a CPU leva o CR8 em KTHREAD.WaitIrql e o recoloca ao voltar
 (`context_switch`); cada CPU parte com o seu em 0 (o INIT o zera), e o
 depurador do kernel lê o de cada processador parado. A execução em curso do `ke/thread_dispatch` (o contexto ativo, a
@@ -1156,7 +1163,12 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   RawDeviceOK (a ponte de host do pci.sys, os PNP0A06, o PNP0B00, o
   ACPI0010 e o botão de função fixa do acpi.sys), e fica sem iniciar, sem
   problema, se não (o HPET), como o PipCallDriverAddDevice. O
-  IoInvalidateDeviceRelations de um nó da árvore enfileira a reenumeração.
+  IoInvalidateDeviceRelations de um nó da árvore (BusRelations ou
+  SingleBusRelations, como o PnpRequestDeviceAction) enfileira a
+  reenumeração: dentro do `process` a fila é drenada ali; fora dele, o
+  pedido põe o PnpDeviceActionWorker na fila de trabalho atrasada, que a
+  drena (o volume que o volmgr.sys relata ao receber uma partição do
+  partmgr.sys chega assim, de um work item).
 - `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
   hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf, o
   display.inf com o BasicDisplay.sys para PCI\CC_0300 e o machine.inf com
@@ -1227,15 +1239,25 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
 Os PDOs do barramento PCI respondem como o pci.sys (`drivers/bus/pci_pnp.rs`
 e `pci_interface.rs`): ids, capacidades, requisitos dos BARs (sem os do canal
 IDE legado; um BAR pré-buscável com CM_RESOURCE_MEMORY_PREFETCHABLE),
-BUS_INTERFACE_STANDARD e PCI_BUS_INTERFACE_STANDARD,
+BUS_INTERFACE_STANDARD (o GetBusData/SetBusData acessa a configuração para
+todo DataType menos o da ROM, como o pci.sys, que só aponta ao Driver
+Verifier um DataType diferente de PCI_WHICHSPACE_CONFIG: o storport.sys passa
+o PCIConfiguration do miniport) e PCI_BUS_INTERFACE_STANDARD,
 READ/WRITE_CONFIG. As rotinas que um driver recebe por ponteiro (interfaces
 de barramento, DMA_OPERATIONS) são stubs nativos de `hal/amd64/
 routine_stubs.rs` (ids privados 0x80000400+). O adaptador de DMA é o da HAL
-(`hal/dma.rs`, o HalGetAdapterV2 com a tabela V2 de operações), alcançado pelo
-IoGetDmaAdapter através da interface do barramento. IoGetDeviceProperty,
+(`hal/dma.rs`: o HalGetAdapterV2 com a tabela V2 de operações e, para uma
+DEVICE_DESCRIPTION da versão 3, o HalGetAdapterV3 com a tabela V3, a
+largura de endereço do DmaAddressWidth, o GetDmaAdapterInfo, o
+FlushDmaBuffer e o FlushAdapterBuffersEx), alcançado pelo IoGetDmaAdapter
+através da interface do barramento. IoGetDeviceProperty,
 IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
 `\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
-devnode.
+devnode; o MESSAGE_BASED, sem interrupções por mensagem atribuídas, conecta
+a linha com o FallBackServiceRoutine e devolve Version = CONNECT_LINE_BASED,
+como o IoConnectInterruptEx do NT. O FILTER_RESOURCE_REQUIREMENTS parte com
+STATUS_SUCCESS e a lista (o IopFilterResourceRequirementsCall), e o
+barramento que não o trata devolve esse sucesso a quem repassou.
 
 A árvore sobe uma vez no fim da fase 1 (`drivers/bus/device_tree.rs`,
 `build`): o que cada pilha pedida precisa antes dela (os setores de
@@ -1258,6 +1280,46 @@ controladora, atapi.sys/ataport.sys nos canais (as IRQs 14 e 15 pelo
 adaptador de DMA chega ao pciidex pela BUS_INTERFACE_STANDARD que o
 acpi.sys pede ao AcpiRootPdo (`hal/pnp.rs`, o HalpQueryInterface, com o
 HalPnpGetDmaAdapter).
+
+Com `--storage=nvme` (`drivers/storage/nvme_stack.rs`) o QEMU ganha um
+controlador NVMe (`-device nvme`, PCI\VEN_1B36&DEV_0010, classe 01.08.02)
+com o disco particionado que o xtask monta (`nvme.img`: MBR com uma
+partição NTFS a partir do LBA 2048, volume do mesmo formato do `ntfs.img`
+com o HiddenSectors da partição). O pci.sys real enumera o controlador sob
+a raiz ACPI (com `--pnp-root=internal`, o barramento PCI interno), e o
+stornvme.inf dá o stornvme.sys ao PCI\CC_010802 (classe SCSIAdapter, com
+os valores do serviço e do hardware da seção); o storport.sys, que ele
+importa, é o driver de porta. O partmgr.sys e o volmgr.sys carregam antes
+da árvore do boot; o IoReportDetectedDevice do DriverEntry do volmgr cria
+na hora o devnode ROOT\VOLMGR\0000 sob a raiz do PnP, que ele monta se
+ainda não existe (no NT o nó raiz existe desde o IoInitSystem), e o
+IoRegisterDeviceInterface do AddDevice acha a instância. No
+FILTER_RESOURCE_REQUIREMENTS o storport repassa ao PDO e chama o filtro do
+miniport (grupos e processadores, que o HwFindAdapter exige); no START o
+HwFindAdapter acha o BAR0 nas AccessRanges e lê a configuração pela
+interface do barramento, o storport cria o adaptador de DMA da versão 3 (o
+miniport prefere o DMA v3) e a extensão não cacheada (MmAllocateContiguousNodeMemory),
+o miniport habilita o controlador e faz os Identify pela fila de
+administração (por varredura), e a interrupção vem do IoConnectInterruptEx
+MESSAGE_BASED com recuo para a linha INTx (a GSIV e o vetor que os árbitros
+atribuíram, pelos dados de conexão do PDO). Um relatório de dispositivo
+falho que o storport faz ao WHEA (WheaReportHwErrorDeviceDriverEx com
+severidade fatal) é registrado, sem parar a máquina, como no NT. O teste
+lê o setor 0 pela pilha do disco (`NVME_DISK_OK`). O partmgr.sys entrega a
+partição ao volmgr.sys (o IoGetDeviceObjectPointer no link de interface do
+volmgr acha o PDO no FILE_OBJECT, o PmGivePartition manda o IOCTL), que cria
+o `\Device\HarddiskVolume1` e relata o devnode STORAGE\Volume por
+SingleBusRelations; no START o volmgr apaga o IsDeleted da chave de
+hardware do volume com RtlDeleteRegistryValue(RTL_REGISTRY_HANDLE), que,
+como o RtlCreateRegistryKey e o RtlWriteRegistryValue, usa a chave do
+handle sem fechá-la. O volume.sys ainda fica fora do bundle: com o volume
+iniciado, o mountmgr.sys enfileira o WorkerThread dele, que espera até
+1000 s pelo `\Device\VolumesSafeForWriteAccess` do smss, e um work item
+ainda roda no contexto de boot (não numa worker thread do sistema), que
+ficaria preso nele. Montar a partição com o ntfs.sys (`NVME_VOLUME_OK`)
+depende disso. Com 4 GB de RAM o
+SeaBIOS põe o BAR0 de 64 bits acima de 4 GB, fora do mapa direto que o
+MmMapIoSpace usa; o teste roda com 3 GB, e o BAR fica na janela de 32 bits.
 
 Com `--display=basic` (`drivers/video/display_stack.rs`) o adaptador VGA
 recebe o BasicDisplay.sys real. O DriverEntry dele carrega o dxgkrnl.sys
@@ -2069,7 +2131,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     o VPB e o dispositivo até o IRP_MJ_CLOSE; leituras e escritas seguem o
     caminho comum (IoGetRelatedDeviceObject pelo VPB). O IoVerifyVolume
     remonta pelo mesmo caminho. Sem RAW nem reconhecedores; a abertura
-    direta de um dispositivo (sem nome restante) não monta.
+    direta de um dispositivo (sem nome restante) não monta. Nela o
+    FILE_OBJECT também guarda (e referencia) o dispositivo do nome, o
+    parseDeviceObject, e não o topo da pilha: quem abre um link de interface
+    (o IoGetDeviceObjectPointer do partmgr.sys no do volmgr.sys) acha no
+    FileObject->DeviceObject o PDO que a registrou, e o IRP vai ao topo.
   - O volume que os file systems reais montam é o segundo disco IDE,
     exposto pelo driver ATA do kernel como `\Device\AtaVolume1` (DEVICE_OBJECT
     nativo respondido pelo próprio kernel, com VPB, DO_DIRECT_IO, geometria
