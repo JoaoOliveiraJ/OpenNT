@@ -115,7 +115,15 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     // TF/DF/RF limpos na entrada do despachante; as flags originais ficam
     // no CONTEXT salvo para a decisão de continuação do tratador.
     live.e_flags.set(eflags & !0x1_0500);
-    crate::debug_print!("[exception] first chance 0x{:x} -> KiUserExceptionDispatcher, frame=0x{:x}", u32_at(record, offset_of!(ExceptionRecord, exception_code)), stack);
+    let information = offset_of!(ExceptionRecord, exception_information);
+    crate::debug_print!(
+        "[exception] first chance 0x{:x} em 0x{:x} (info 0x{:x} 0x{:x}) -> KiUserExceptionDispatcher, frame=0x{:x}",
+        u32_at(record, offset_of!(ExceptionRecord, exception_code)),
+        u64_at(record, offset_of!(ExceptionRecord, exception_address)),
+        u64_at(record, information),
+        u64_at(record, information + 8),
+        stack
+    );
     0
 }
 
