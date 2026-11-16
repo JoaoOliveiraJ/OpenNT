@@ -4,32 +4,45 @@
 //! O kernel com `--kd=com2` atende o protocolo remoto do GDB na COM2, que o
 //! QEMU expõe num socket TCP, com as extensões do OpenNT pelo `qRcmd`
 //! (`ps`, `threads`, `lm`, `cpus`, `context`, `obj`, `log`, `bl`,
-//! `bugcheck`, `kd`). Módulos:
+//! `bugcheck`, `kd`, `process`, `thread`, `irp`, `devobj`, `drvobj`,
+//! `handle`, `trace`) e o `qOpenNTTrace` (os registros do rastro). Módulos:
 //!
 //! - `rsp`: os pacotes (`$dados#cs`, confirmação, `O`, compressão `x*n`) e a
 //!   conexão TCP;
 //! - `stop`: a resposta de parada (`T05thread:1;swbreak:;`);
 //! - `registers`: a ordem do pacote `g` do GDB para x86-64;
-//! - `symbols`, `elf`, `msf`, `demangle`: os símbolos do `kernel.elf` (com
-//!   os nomes do Rust legíveis), dos exports dos PEs desta máquina e dos
-//!   públicos de um PDB já no cache;
-//! - `unwind`: a pilha pelos frame pointers sobre qualquer leitor de
-//!   memória (o alvo ou uma pilha capturada);
+//! - `symbols`, `elf`, `pe`, `msf`, `pdb`, `demangle`: os símbolos do
+//!   `kernel.elf` (com os nomes do Rust legíveis), dos exports dos PEs desta
+//!   máquina e dos públicos dos PDBs (cache e servidor de símbolos);
+//! - `unwind`: a pilha pela `.pdata` dos binários da Microsoft e pelos frame
+//!   pointers do código do OpenNT;
+//! - `tpi`, `types`: os tipos do PDB do ntoskrnl e as vistas tipadas;
+//! - `expr`: as expressões (operadores, memória, símbolos e campos tipados);
+//! - `bugcheck`: a análise de uma parada por bugcheck;
+//! - `trace`: o rastro de instruções (formato, árvore de chamadas, diff);
 //! - `x86`: o mínimo de decodificação para o passo por cima (o tamanho de
-//!   um `call`) e para o prólogo;
+//!   um `call`), o prólogo e a classe de uma instrução;
 //! - `monitor`: as tabelas do `qRcmd` em estruturas;
-//! - `client`: a sessão (comandos de texto e a API tipada que a interface
-//!   gráfica usa).
+//! - `client`, `commands`: a sessão (comandos de texto e a API tipada que a
+//!   interface gráfica usa).
 
+pub mod bugcheck;
 pub mod client;
+pub mod commands;
 pub mod demangle;
 pub mod elf;
+pub mod expr;
 pub mod monitor;
 pub mod msf;
+pub mod pdb;
+pub mod pe;
 pub mod registers;
 pub mod rsp;
 pub mod stop;
 pub mod symbols;
+pub mod tpi;
+pub mod trace;
+pub mod types;
 pub mod unwind;
 pub mod x86;
 

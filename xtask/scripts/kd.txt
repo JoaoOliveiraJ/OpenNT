@@ -2,8 +2,10 @@
 # o cliente do depurador do kernel anexa pela COM2, para a máquina, consulta
 # o estado do OpenNT, lê e grava memória, pede a parada com a máquina
 # rodando, usa breakpoints de software e de hardware num ponto do laço
-# principal do kernel, dá um passo e se desliga; a máquina segue até o fim
-# do boot (os marcadores da COM1 são do comando do teste).
+# principal do kernel, consulta objetos do NT (processo, thread, driver e
+# dispositivo), dá um passo, rastreia instruções passo a passo dentro do
+# convidado e se desliga; a máquina segue até o fim do boot (os marcadores
+# da COM1 são do comando do teste).
 
 # Anexar: o primeiro pacote com a máquina rodando a para no tique seguinte.
 attach
@@ -54,7 +56,7 @@ context $esperando
 expect quadro de troca
 btt $esperando
 expect kernel::ntos::ke::wait::
-expect ACPI.sys
+expect ACPI
 lm
 expect ksecdd.sys
 cpus
@@ -63,6 +65,29 @@ obj \Device
 expect tipo Directory
 bt
 expect kernel::ntos::init::main::kmain
+k 4
+expect Child-SP
+? 1+2*3
+expect = 0x7
+expect-eq poi(@rsp) [%rsp]
+
+# Objetos do NT pelas extensões do depurador: o processo System, a thread
+# bloqueada, o objeto de driver do acpi.sys real e um dispositivo dele com
+# a pilha de dispositivos.
+!process 4
+expect EPROCESS
+expect threads:
+!thread $esperando
+expect motivo da espera
+!drvobj \Driver\ACPI
+expect DRIVER_OBJECT
+expect IRP_MJ_PNP
+save-word dispositivo dispositivos: 1
+!devobj $dispositivo
+expect DEVICE_OBJECT
+expect pilha de dispositivos
+lmv ksecdd
+expect ksecdd.sys
 
 # Um passo: o `push rbp` do prólogo.
 save rsp0 %rsp
@@ -81,6 +106,20 @@ continue
 wait-stop 60000
 expect-stop hwbreak
 expect-eq %rip kernel::ntos::ke::run_kernel_tasks
+
+# Rastro de instruções passo a passo dentro do convidado, a partir da
+# entrada da função: 300 instruções, a árvore de chamadas e o resto da
+# função até o retorno.
+trace 300
+expect 300 instrucoes executadas
+trace show 0 2
+expect kernel::ntos::ke::run_kernel_tasks
+trace tree 10
+expect instrucoes
+trace ret 400000
+expect a funcao retornou
+trace status
+expect retorno da funcao
 hbc kernel::ntos::ke::run_kernel_tasks
 
 # Desliga: a máquina segue até o fim do boot (o shell e o serviço de

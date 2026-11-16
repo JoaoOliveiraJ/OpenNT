@@ -9,7 +9,8 @@
 //!   prompt de comandos;
 //! - `cargo xtask debug --launch --no-client [--headless]`: só o build e o
 //!   QEMU, para outro cliente (o `opennt-dbg --launch` roda este comando):
-//!   imprime `KD_READY 127.0.0.1:PORTA` quando o socket existe e fecha o
+//!   imprime `KD_READY 127.0.0.1:PORTA` quando o socket existe (antes,
+//!   `KD_MONITOR 127.0.0.1:PORTA` com `--monitor-port`) e fecha o
 //!   QEMU quando a entrada padrão fecha (o cliente saiu);
 //! - `cargo xtask debug --connect=HOST:PORTA`: só o cliente, contra um QEMU
 //!   já aberto (`cargo xtask run --kd=com2`, porta 1234 por padrão; o GDB
@@ -120,8 +121,11 @@ pub fn interactive(address: &str, root: &Path, elf: &Path) -> Result<(), String>
 /// `--no-client`: o QEMU já aberto, para outro cliente. Anuncia o socket e
 /// espera o QEMU terminar ou a entrada padrão fechar (quem rodou o comando
 /// saiu ou pediu o reinício); nos dois casos o QEMU não fica para trás.
-pub fn serve(mut qemu: Child, address: &str) -> Result<(), String> {
+pub fn serve(mut qemu: Child, address: &str, monitor: Option<&str>) -> Result<(), String> {
     use std::io::Write;
+    if let Some(monitor) = monitor {
+        println!("KD_MONITOR {monitor}");
+    }
     println!("KD_READY {address}");
     let _ = std::io::stdout().flush();
     let closed = Arc::new(AtomicBool::new(false));

@@ -37,8 +37,8 @@ impl LaunchOptions {
     }
 
     /// Os argumentos do `cargo` (depois do executável).
-    pub fn arguments(&self, port: u16) -> Vec<String> {
-        let mut arguments = vec!["xtask".to_string(), "debug".into(), "--launch".into(), "--no-client".into(), format!("--kd-port={port}"), format!("--build-dir={}", self.build_dir.display())];
+    pub fn arguments(&self, port: u16, monitor: u16) -> Vec<String> {
+        let mut arguments = vec!["xtask".to_string(), "debug".into(), "--launch".into(), "--no-client".into(), format!("--kd-port={port}"), format!("--monitor-port={monitor}"), format!("--build-dir={}", self.build_dir.display())];
         if self.headless {
             arguments.push("--headless".into());
         }
@@ -58,6 +58,8 @@ pub struct Launch {
     child: Child,
     stdin: Option<ChildStdin>,
     pub address: String,
+    /// O monitor HMP do QEMU (o rastro rápido).
+    pub monitor: Option<String>,
     /// Linhas do `xtask` (build e QEMU) que chegam depois do `KD_READY`.
     pub output: mpsc::Receiver<String>,
 }
@@ -67,8 +69,9 @@ impl Launch {
     /// do build. Erro se o processo terminar antes (o build falhou).
     pub fn start(options: &LaunchOptions, mut progress: impl FnMut(&str)) -> Result<Launch, String> {
         let port = free_port()?;
+        let monitor = free_port()?;
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let arguments = options.arguments(port);
+        let arguments = options.arguments(port, monitor);
         progress(&format!("{cargo} {}", arguments.join(" ")));
         let mut child = Command::new(&cargo)
             .args(&arguments)
@@ -92,12 +95,15 @@ impl Launch {
             });
         }
         drop(sender);
-        let mut launch = Launch { child, stdin, address: String::new(), output: receiver };
+        let mut launch = Launch { child, stdin, address: String::new(), monitor: None, output: receiver };
         let mut tail: Vec<String> = Vec::new();
         loop {
             match launch.output.recv_timeout(Duration::from_millis(200)) {
                 Ok(line) => {
                     progress(&line);
+                    if let Some(address) = line.strip_prefix("KD_MONITOR ") {
+                        launch.monitor = Some(address.trim().to_string());
+                    }
                     if let Some(address) = line.strip_prefix("KD_READY ") {
                         launch.address = address.trim().to_string();
                         return Ok(launch);
@@ -149,7 +155,7 @@ mod tests {
     #[test]
     fn xtask_arguments() {
         let options = LaunchOptions { root: PathBuf::from("."), build_dir: PathBuf::from("build/kd-gui"), headless: true, extra: vec!["--accel=whpx".into()] };
-        assert_eq!(options.arguments(4321), vec!["xtask", "debug", "--launch", "--no-client", "--kd-port=4321", "--build-dir=build/kd-gui", "--headless", "--accel=whpx"]);
+        assert_eq!(options.arguments(4321, 4322), vec!["xtask", "debug", "--launch", "--no-client", "--kd-port=4321", "--monitor-port=4322", "--build-dir=build/kd-gui", "--headless", "--accel=whpx"]);
         assert_eq!(options.build_path(), PathBuf::from("./build/kd-gui"));
     }
 }

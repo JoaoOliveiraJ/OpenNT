@@ -3,7 +3,8 @@
 //! paradas roteirizadas. Confere a negociação, a pilha pelos frame
 //! pointers, os breakpoints (ligar, desligar, religar, tirar) e o passo por
 //! cima de um `call`, inclusive o retorno numa recursão mais funda (o
-//! cliente segue sozinho até o RSP certo).
+//! cliente segue sozinho até o RSP certo), o breakpoint condicional e a
+//! parada pela carga de um módulo.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -26,6 +27,10 @@ struct Stop {
     rip: u64,
     rsp: u64,
     packet: &'static str,
+    /// O RAX da parada (as condições dos breakpoints).
+    rax: u64,
+    /// Um módulo que aparece no `lm` a partir desta parada.
+    load: Option<&'static str>,
 }
 
 struct Target {
@@ -33,6 +38,7 @@ struct Target {
     memory: Vec<(u64, Vec<u8>)>,
     stops: VecDeque<Stop>,
     log: Arc<Mutex<Vec<String>>>,
+    modules: Vec<String>,
 }
 
 impl Target {
@@ -77,10 +83,9 @@ impl Target {
         } else if let Some(command) = packet.strip_prefix("qRcmd,") {
             let text = String::from_utf8(unhex(command)).unwrap();
             let output = match text.as_str() {
-                // Um driver que não existe nesta máquina (sem símbolos).
-                "lm" => "              base                fim  nome             caminho\n0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n",
-                "bl" => "nenhum breakpoint\n",
-                _ => "comandos do OpenNT\n",
+                "lm" => format!("              base                fim  nome             caminho\n{}", self.modules.join("")),
+                "bl" => "nenhum breakpoint\n".to_string(),
+                _ => "comandos do OpenNT\n".to_string(),
             };
             stream.write_all(&encode(&format!("O{}", hex(output.as_bytes())))).unwrap();
             "OK".to_string()
@@ -88,6 +93,11 @@ impl Target {
             let stop = self.stops.pop_front().expect("parada roteirizada");
             self.registers[16] = stop.rip;
             self.registers[7] = stop.rsp;
+            self.registers[0] = stop.rax;
+            if let Some(name) = stop.load {
+                let base = 0xfffff800_4300_0000u64 + self.modules.len() as u64 * 0x10000;
+                self.modules.push(format!("{base:#x} {:#x}  {name}   \\SystemRoot\\System32\\drivers\\{name}\n", base + 0x10000));
+            }
             stop.packet.to_string()
         } else if packet == "D" {
             "OK".to_string()
@@ -103,7 +113,9 @@ fn start(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log) };
+    // Um driver que não existe nesta máquina (sem símbolos).
+    let modules = vec!["0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n".to_string()];
+    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log), modules };
     // Pilha: o quadro corrente em STACK + 0x20 com dois chamadores.
     let mut stack = vec![0u8; 0x100];
     let mut put = |offset: usize, value: u64| stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -154,18 +166,19 @@ fn connect(address: &str) -> Client {
     assert!(text.contains("sem os simbolos do kernel"), "{text}");
     assert!(client.is_stopped());
     assert!(client.last_stop().contains("SIGINT"), "{}", client.last_stop());
-    client.symbols.set_kernel(Module {
-        name: "kernel".into(),
-        path: "kernel.elf".into(),
-        base: 0xfffff800_40000000,
-        end: 0xfffff800_41000000,
-        symbols: vec![
+    client.symbols.set_kernel(Module::new(
+        "kernel",
+        "kernel.elf",
+        0xfffff800_40000000,
+        0xfffff800_41000000,
+        vec![
             Symbol { address: CODE, size: 0x100, name: "kernel::alvo::corrente".into(), function: true },
+            Symbol { address: CODE + 0x1000, size: 0x100, name: "kernel::ntos::ps::notify::image::notify".into(), function: true },
             Symbol { address: CODE + 0x2000, size: 0x100, name: "kernel::alvo::chamador".into(), function: true },
             Symbol { address: CODE + 0x3000, size: 0x100, name: "kernel::alvo::kmain".into(), function: true },
         ],
-        source: "teste".into(),
-    });
+        "teste",
+    ));
     client
 }
 
@@ -215,9 +228,9 @@ fn step_over_skips_deeper_recursion() {
     // primeira parada no retorno vem com outro RSP (uma recursão mais
     // funda): o cliente segue sozinho; a segunda é a certa.
     let stops = vec![
-        Stop { rip: CODE + 4, rsp: STACK - 0x20, packet: "T05thread:1;" },
-        Stop { rip: CODE + 9, rsp: STACK - 0x80, packet: "T05thread:1;swbreak:;" },
-        Stop { rip: CODE + 9, rsp: STACK - 0x20, packet: "T05thread:1;swbreak:;" },
+        Stop { rip: CODE + 4, rsp: STACK - 0x20, packet: "T05thread:1;", rax: 0, load: None },
+        Stop { rip: CODE + 9, rsp: STACK - 0x80, packet: "T05thread:1;swbreak:;", rax: 0, load: None },
+        Stop { rip: CODE + 9, rsp: STACK - 0x20, packet: "T05thread:1;swbreak:;", rax: 0, load: None },
     ];
     let (address, log) = start(stops);
     let mut client = connect(&address);
@@ -234,4 +247,55 @@ fn step_over_skips_deeper_recursion() {
     let sent: Vec<String> = log.lock().unwrap().iter().filter(|packet| matches!(packet.as_bytes().first(), Some(b'Z' | b'z' | b'c' | b's'))).cloned().collect();
     assert_eq!(sent, vec!["s", "Z0,fffff80040100009,1", "c", "c", "z0,fffff80040100009,1"]);
     assert!(client.breakpoints().is_empty());
+}
+
+#[test]
+fn conditional_breakpoint_and_pass_count() {
+    // Três acertos em CODE + 0x10: RAX 1, 7 e 7. Com a condição `@rax == 7`
+    // e a contagem 3, só o terceiro para; os outros seguem sozinhos.
+    let stops = vec![
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 1, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 7, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 7, load: None },
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let text = client.execute("bp kernel::alvo::corrente+0x10 3 /w \"@rax == 7\"").unwrap();
+    assert!(text.contains("a partir do acerto 3") && text.contains("se @rax == 7"), "{text}");
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("breakpoint #0, condicao verdadeira, acerto 3"), "{stop}");
+    assert_eq!(client.register("rax").unwrap(), 7);
+    assert_eq!(client.breakpoints()[0].hits, 3);
+    let continues = log.lock().unwrap().iter().filter(|packet| *packet == "c").count();
+    assert_eq!(continues, 3);
+    // A sessão gravada recria o breakpoint com a condição.
+    let specs = client.breakpoint_specs();
+    assert!(specs.starts_with("software\t1\t1\t3\tkernel::alvo::corrente+0x10\t@rax == 7"), "{specs}");
+}
+
+#[test]
+fn stops_when_a_module_loads() {
+    // A notificação de carga para duas vezes: primeiro outro módulo (segue
+    // sozinho), depois o pedido.
+    let hook = CODE + 0x1000;
+    let stops = vec![
+        Stop { rip: hook, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 0, load: Some("outro.sys") },
+        Stop { rip: hook, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 0, load: Some("novo.sys") },
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let text = client.execute("sxe ld:novo").unwrap();
+    assert!(text.contains("para quando novo carregar"), "{text}");
+    // Um breakpoint adiado num módulo que ainda não existe.
+    let text = client.execute("bu novo!Entrada").unwrap();
+    assert!(text.contains("adiado"), "{text}");
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("modulo carregado: novo.sys"), "{stop}");
+    assert!(client.symbols.module_named("novo").is_some());
+    let sent: Vec<String> = log.lock().unwrap().iter().filter(|packet| matches!(packet.as_bytes().first(), Some(b'Z' | b'z' | b'c'))).cloned().collect();
+    assert_eq!(sent, vec!["Z0,fffff80040101000,1", "c", "c"]);
+    let list = client.execute("bl").unwrap();
+    assert!(list.contains("ld:novo") && list.contains("(adiado)"), "{list}");
 }

@@ -32,6 +32,9 @@ pub struct MachineOptions {
     /// `--usb`: a controladora xHCI do QEMU (qemu-xhci, PCI 1B36:000D) com um
     /// teclado e um tablet USB nas portas dela.
     pub usb: bool,
+    /// Porta TCP do monitor HMP (o rastro rápido do depurador gráfico liga
+    /// o log de execução do QEMU por ele), se houver.
+    pub monitor_port: Option<u16>,
 }
 
 /// A COM2 como servidor TCP local, depois da COM1 (a ordem dos `-serial`
@@ -174,6 +177,9 @@ pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) 
     }
     arguments.extend(["-serial".to_string(), format!("file:{}", log.display())]);
     arguments.extend(kd_serial(machine));
+    if let Some(port) = machine.monitor_port {
+        arguments.extend(["-monitor".to_string(), format!("tcp:127.0.0.1:{port},server=on,wait=off")]);
+    }
     println!("QEMU com o log do kernel em {}", log.display());
     Command::new(&qemu).args(&arguments).stdin(Stdio::null()).spawn().map_err(|error| format!("{}: {error}", qemu.display()))
 }

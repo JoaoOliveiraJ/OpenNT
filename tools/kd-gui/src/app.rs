@@ -1,63 +1,107 @@
-//! A janela do depurador: barra de ferramentas, painéis encaixáveis (o
-//! `egui_dock`: arrastar uma aba a solta, junta ou divide a área) e a barra
-//! de estado. Os painéis só leem o `Snapshot` publicado pelo backend e
-//! mandam pedidos; nada aqui espera o alvo.
+//! A janela do depurador: menu, barra de ferramentas, painéis encaixáveis
+//! (o `egui_dock`: arrastar uma aba a solta, junta ou divide a área; o menu
+//! Painéis reabre uma aba fechada) e a barra de estado. Os painéis só leem
+//! o `Snapshot` publicado pelo backend e mandam pedidos; nada aqui espera o
+//! alvo. O arranjo, o tema, as expressões observadas e o histórico de
+//! comandos ficam num arquivo de estado entre uma execução e outra.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, FontId, Key, Modifiers, RichText, Sense, TextStyle, Ui, Vec2, WidgetText};
-use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
-use kd_client::{registers, BreakpointKind};
+use eframe::egui::{self, Align, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, TextStyle, Ui, Vec2, WidgetText};
+use egui_dock::{DockArea, DockState, NodeIndex, NodePath, Style, TabViewer};
+use kd_client::client::BreakpointRequest;
+use kd_client::commands::TraceOptions;
+use kd_client::{registers, BreakpointKind, Client};
+use serde::{Deserialize, Serialize};
 
-use crate::backend::{Backend, Entry, Request, Snapshot, Status, Target, View};
+use crate::backend::{Backend, Entry, QueryKind, Request, Snapshot, Status, Target, TraceView, View};
+use crate::disasm::{self, ValueHint};
 use crate::launcher::LaunchOptions;
 
 /// Os painéis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tab {
     Command,
     Disassembly,
     Source,
     Registers,
+    Watch,
+    Locals,
     Memory,
     CallStack,
+    Breakpoints,
     Modules,
     Processes,
     Threads,
-    Breakpoints,
+    NtObjects,
+    Trace,
+    Bugcheck,
     DbgPrint,
     Serial,
 }
 
 impl Tab {
-    fn title(self) -> &'static str {
+    pub const ALL: [Tab; 17] = [
+        Tab::Disassembly,
+        Tab::Source,
+        Tab::Registers,
+        Tab::Watch,
+        Tab::Locals,
+        Tab::CallStack,
+        Tab::Breakpoints,
+        Tab::Modules,
+        Tab::Threads,
+        Tab::Processes,
+        Tab::NtObjects,
+        Tab::Bugcheck,
+        Tab::Memory,
+        Tab::Trace,
+        Tab::Command,
+        Tab::DbgPrint,
+        Tab::Serial,
+    ];
+
+    pub fn title(self) -> &'static str {
         match self {
-            Tab::Command => "Comando",
+            Tab::Command => "Comandos",
             Tab::Disassembly => "Desmontagem",
-            Tab::Source => "Fonte",
+            Tab::Source => "Código-fonte",
             Tab::Registers => "Registradores",
+            Tab::Watch => "Observação",
+            Tab::Locals => "Variáveis locais",
             Tab::Memory => "Memória",
             Tab::CallStack => "Pilha de chamadas",
-            Tab::Modules => "Módulos",
-            Tab::Processes => "Processos",
-            Tab::Threads => "Threads",
             Tab::Breakpoints => "Breakpoints",
+            Tab::Modules => "Módulos",
+            Tab::Processes => "Processos e CPUs",
+            Tab::Threads => "Threads",
+            Tab::NtObjects => "Objetos do NT",
+            Tab::Trace => "Rastro",
+            Tab::Bugcheck => "Análise do bugcheck",
             Tab::DbgPrint => "DbgPrint",
-            Tab::Serial => "COM1 (log do kernel)",
+            Tab::Serial => "Log da COM1",
         }
     }
 }
 
-/// O arranjo inicial, como o do WinDbg: desmontagem e fonte no centro,
-/// registradores à direita, pilha e listas embaixo à direita, comando e
-/// logs embaixo.
+/// O arranjo padrão: desmontagem e código-fonte no centro, registradores e
+/// observação à direita, pilha, breakpoints e listas embaixo à direita,
+/// comandos e logs embaixo.
 pub fn default_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Disassembly]);
+    let mut dock = DockState::new(vec![Tab::Disassembly, Tab::Bugcheck]);
     let surface = dock.main_surface_mut();
-    let [code, _bottom] = surface.split_below(NodeIndex::root(), 0.64, vec![Tab::Command, Tab::DbgPrint, Tab::Memory, Tab::Serial]);
-    let [code, right] = surface.split_right(code, 0.64, vec![Tab::Registers]);
-    surface.split_below(code, 0.55, vec![Tab::Source]);
-    surface.split_below(right, 0.5, vec![Tab::CallStack, Tab::Breakpoints, Tab::Modules, Tab::Processes, Tab::Threads]);
+    let [top, bottom] = surface.split_below(NodeIndex::root(), 0.70, vec![Tab::Command, Tab::Trace, Tab::Memory]);
+    surface.split_right(bottom, 0.62, vec![Tab::DbgPrint, Tab::Serial]);
+    let [code, right] = surface.split_right(top, 0.66, vec![Tab::Registers, Tab::Watch, Tab::Locals]);
+    surface.split_below(code, 0.58, vec![Tab::Source]);
+    surface.split_below(right, 0.48, vec![Tab::CallStack, Tab::Breakpoints, Tab::Modules, Tab::Threads, Tab::Processes, Tab::NtObjects]);
+    // A desmontagem começa à vista (a análise do bugcheck fica atrás).
+    if let Some(path) = dock.find_tab(&Tab::Disassembly) {
+        let _ = dock.set_active_tab(path);
+    }
     dock
 }
 
@@ -95,6 +139,82 @@ impl LogLines {
     }
 }
 
+/// Como a memória aparece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryFormat {
+    Bytes,
+    Words,
+    Dwords,
+    Qwords,
+    Ascii,
+    Unicode,
+}
+
+impl MemoryFormat {
+    const ALL: [MemoryFormat; 6] = [MemoryFormat::Bytes, MemoryFormat::Words, MemoryFormat::Dwords, MemoryFormat::Qwords, MemoryFormat::Ascii, MemoryFormat::Unicode];
+
+    fn label(self) -> &'static str {
+        match self {
+            MemoryFormat::Bytes => "bytes",
+            MemoryFormat::Words => "words (2)",
+            MemoryFormat::Dwords => "dwords (4)",
+            MemoryFormat::Qwords => "qwords (8)",
+            MemoryFormat::Ascii => "ASCII",
+            MemoryFormat::Unicode => "UTF-16",
+        }
+    }
+
+    fn unit(self) -> usize {
+        match self {
+            MemoryFormat::Words | MemoryFormat::Unicode => 2,
+            MemoryFormat::Dwords => 4,
+            MemoryFormat::Qwords => 8,
+            _ => 1,
+        }
+    }
+}
+
+/// O modo do rastro pedido no painel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraceMode {
+    Count,
+    Until,
+    Return,
+    Enter,
+    Leave,
+}
+
+impl TraceMode {
+    const ALL: [TraceMode; 5] = [TraceMode::Count, TraceMode::Until, TraceMode::Return, TraceMode::Enter, TraceMode::Leave];
+
+    fn label(self) -> &'static str {
+        match self {
+            TraceMode::Count => "N instruções",
+            TraceMode::Until => "até o endereço",
+            TraceMode::Return => "até o retorno",
+            TraceMode::Enter => "até entrar no módulo",
+            TraceMode::Leave => "até sair do módulo",
+        }
+    }
+}
+
+/// O que o painel Rastro mostra.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraceDisplay {
+    Table,
+    Tree,
+    Diff,
+}
+
+/// O estado salvo entre execuções.
+#[derive(Serialize, Deserialize, Default)]
+struct Saved {
+    layout: Option<DockState<Tab>>,
+    light: bool,
+    watches: Vec<String>,
+    history: Vec<String>,
+}
+
 /// O estado da interface (campos de texto, cópias do que o backend
 /// publicou).
 pub struct UiState {
@@ -107,12 +227,24 @@ pub struct UiState {
     serial: LogLines,
     launch_log: LogLines,
     command: String,
+    command_focused: bool,
     history: Vec<String>,
     history_index: Option<usize>,
+    completions: Arc<Vec<String>>,
+    type_names: Arc<Vec<String>>,
+    suggestions: Vec<String>,
     code_address: String,
+    selected_code: Option<u64>,
     memory_address: String,
+    memory_format: MemoryFormat,
+    search_pattern: String,
+    search_length: String,
     breakpoint_expression: String,
     breakpoint_kind: BreakpointKind,
+    breakpoint_condition: String,
+    breakpoint_pass: String,
+    breakpoint_deferred: bool,
+    condition_edit: Option<(u32, String, String)>,
     register_edit: Option<(String, String)>,
     memory_edit: Option<(u64, String)>,
     thread_filter: Option<u64>,
@@ -122,20 +254,84 @@ pub struct UiState {
     scrolled_code: u64,
     scrolled_source: u64,
     requests: Vec<Request>,
+    watches: Vec<String>,
+    watch_input: String,
+    sent_watches: Vec<String>,
+    expanded: BTreeSet<(u64, u32)>,
+    sent_expanded: BTreeSet<(u64, u32)>,
+    query_kind: QueryKind,
+    query_argument: String,
+    trace: Option<Arc<TraceView>>,
+    reference: Option<Arc<TraceView>>,
+    trace_generation: u64,
+    trace_mode: TraceMode,
+    trace_argument: String,
+    trace_count: String,
+    trace_over: bool,
+    trace_skip: String,
+    trace_watch: String,
+    trace_qemu_ms: String,
+    trace_filter: String,
+    trace_display: TraceDisplay,
+    trace_selected: Option<usize>,
+    trace_rows: Vec<usize>,
+    trace_rows_key: (u64, String),
+    trace_scroll: Option<usize>,
+    trace_tree: Option<(u64, Vec<kd_client::trace::CallNode>)>,
+    trace_path: String,
+    reference_path: String,
+    divergence: Option<Option<(usize, usize)>>,
+    light: bool,
+    theme_applied: Option<bool>,
+    /// Painéis a mostrar no próximo quadro.
+    focus_tab: Vec<Tab>,
+    bugcheck_seen: u64,
+    reset_layout: bool,
+    toggle_tab: Option<Tab>,
 }
 
 pub struct DebuggerApp {
     pub backend: Backend,
     dock: DockState<Tab>,
     state: UiState,
+    /// O arquivo de estado (`None`: sem persistência, como na captura).
+    persist: Option<PathBuf>,
+    last_saved: String,
+    last_save: Instant,
 }
 
-const RED: Color32 = Color32::from_rgb(0xE0, 0x4B, 0x4B);
-const YELLOW: Color32 = Color32::from_rgb(0xF2, 0xC1, 0x4E);
-const GREEN: Color32 = Color32::from_rgb(0x5C, 0xC0, 0x6C);
-const BLUE: Color32 = Color32::from_rgb(0x6C, 0xA8, 0xF0);
-const DIM: Color32 = Color32::from_rgb(0x8A, 0x8F, 0x98);
-const FOCUS_FILL: Color32 = Color32::from_rgba_premultiplied(0x50, 0x46, 0x10, 0xA0);
+/// As cores, pelo tema.
+#[derive(Clone, Copy)]
+struct Palette {
+    red: Color32,
+    yellow: Color32,
+    green: Color32,
+    blue: Color32,
+    dim: Color32,
+    focus: Color32,
+}
+
+fn palette(ui: &Ui) -> Palette {
+    if ui.visuals().dark_mode {
+        Palette {
+            red: Color32::from_rgb(0xE8, 0x5C, 0x5C),
+            yellow: Color32::from_rgb(0xF2, 0xC1, 0x4E),
+            green: Color32::from_rgb(0x5C, 0xC0, 0x6C),
+            blue: Color32::from_rgb(0x6C, 0xA8, 0xF0),
+            dim: Color32::from_rgb(0x8A, 0x8F, 0x98),
+            focus: Color32::from_rgba_premultiplied(0x50, 0x46, 0x10, 0xA0),
+        }
+    } else {
+        Palette {
+            red: Color32::from_rgb(0xC0, 0x20, 0x20),
+            yellow: Color32::from_rgb(0x9A, 0x60, 0x00),
+            green: Color32::from_rgb(0x1E, 0x7A, 0x32),
+            blue: Color32::from_rgb(0x1F, 0x5F, 0xBF),
+            dim: Color32::from_rgb(0x70, 0x74, 0x7A),
+            focus: Color32::from_rgba_premultiplied(0xF0, 0xD8, 0x70, 0x90),
+        }
+    }
+}
 
 fn mono(text: impl Into<String>) -> RichText {
     RichText::new(text).monospace()
@@ -149,6 +345,12 @@ fn hex(value: u64) -> String {
 fn parse_hex(text: &str) -> Option<u64> {
     let text = text.trim().trim_start_matches("0x").replace(['`', '_'], "");
     u64::from_str_radix(&text, 16).ok()
+}
+
+/// O arquivo de estado da janela.
+pub fn state_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("opennt-dbg").join("estado.json"))
 }
 
 impl DebuggerApp {
@@ -166,12 +368,24 @@ impl DebuggerApp {
                 serial: LogLines::default(),
                 launch_log: LogLines::default(),
                 command: String::new(),
+                command_focused: false,
                 history: Vec::new(),
                 history_index: None,
+                completions: Arc::new(Vec::new()),
+                type_names: Arc::new(Vec::new()),
+                suggestions: Vec::new(),
                 code_address: String::new(),
+                selected_code: None,
                 memory_address: String::new(),
+                memory_format: MemoryFormat::Bytes,
+                search_pattern: String::new(),
+                search_length: "0x10000".into(),
                 breakpoint_expression: String::new(),
                 breakpoint_kind: BreakpointKind::Software,
+                breakpoint_condition: String::new(),
+                breakpoint_pass: String::new(),
+                breakpoint_deferred: false,
+                condition_edit: None,
                 register_edit: None,
                 memory_edit: None,
                 thread_filter: None,
@@ -180,7 +394,101 @@ impl DebuggerApp {
                 scrolled_code: 0,
                 scrolled_source: 0,
                 requests: Vec::new(),
+                watches: Vec::new(),
+                watch_input: String::new(),
+                sent_watches: Vec::new(),
+                expanded: BTreeSet::new(),
+                sent_expanded: BTreeSet::new(),
+                query_kind: QueryKind::Process,
+                query_argument: String::new(),
+                trace: None,
+                reference: None,
+                trace_generation: 0,
+                trace_mode: TraceMode::Count,
+                trace_argument: String::new(),
+                trace_count: "2000".into(),
+                trace_over: false,
+                trace_skip: String::new(),
+                trace_watch: String::new(),
+                trace_qemu_ms: "500".into(),
+                trace_filter: String::new(),
+                trace_display: TraceDisplay::Table,
+                trace_selected: None,
+                trace_rows: Vec::new(),
+                trace_rows_key: (u64::MAX, String::new()),
+                trace_scroll: None,
+                trace_tree: None,
+                trace_path: "build/opennt-dbg/rastro.csv".into(),
+                reference_path: "build/opennt-dbg/referencia.csv".into(),
+                divergence: None,
+                light: false,
+                theme_applied: None,
+                focus_tab: Vec::new(),
+                bugcheck_seen: 0,
+                reset_layout: false,
+                toggle_tab: None,
             },
+            persist: None,
+            last_saved: String::new(),
+            last_save: Instant::now(),
+        }
+    }
+
+    /// Com arranjo, tema, expressões e histórico salvos em `path`.
+    pub fn with_persistence(mut self, path: PathBuf) -> DebuggerApp {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
+                if let Some(layout) = saved.layout {
+                    self.dock = layout;
+                }
+                self.state.light = saved.light;
+                self.state.watches = saved.watches;
+                self.state.history = saved.history;
+            }
+        }
+        self.persist = Some(path);
+        self
+    }
+
+    /// Expressões na janela de observação (a captura de tela e os testes),
+    /// já pedidas ao backend por quem chama.
+    pub fn set_watches(&mut self, watches: Vec<String>) {
+        self.state.sent_watches = watches.clone();
+        self.state.watches = watches;
+    }
+
+    /// Troca o arranjo dos painéis (a captura de tela do rastro).
+    pub fn set_layout(&mut self, dock: DockState<Tab>) {
+        self.dock = dock;
+    }
+
+    /// Mostra um painel (a captura de tela).
+    pub fn focus(&mut self, tab: Tab) {
+        self.state.focus_tab.push(tab);
+    }
+
+    /// Seleciona um registro do rastro (a captura de tela).
+    pub fn select_trace_record(&mut self, index: usize) {
+        self.state.trace_selected = Some(index);
+        self.state.trace_scroll = Some(index);
+    }
+
+    fn save(&mut self, force: bool) {
+        let Some(path) = &self.persist else { return };
+        if !force && self.last_save.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        self.last_save = Instant::now();
+        let saved = Saved { layout: Some(self.dock.clone()), light: self.state.light, watches: self.state.watches.clone(), history: self.state.history.iter().rev().take(200).rev().cloned().collect() };
+        let Ok(text) = serde_json::to_string(&saved) else { return };
+        if text == self.last_saved {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(path, &text).is_ok() {
+            self.last_saved = text;
         }
     }
 
@@ -192,6 +500,11 @@ impl DebuggerApp {
             state.snapshot = Arc::clone(&shared.snapshot);
             if state.memory_address.is_empty() {
                 state.memory_address = state.snapshot.memory.expression.clone();
+            }
+            // Uma parada por bugcheck abre a análise.
+            if state.snapshot.bugcheck.is_some() && state.bugcheck_seen != state.snapshot.generation {
+                state.bugcheck_seen = state.snapshot.generation;
+                state.focus_tab.push(Tab::Bugcheck);
             }
         }
         state.status = shared.status.clone();
@@ -205,22 +518,108 @@ impl DebuggerApp {
         state.console.sync(&shared.console);
         state.serial.sync(&shared.serial);
         state.launch_log.sync(&shared.launch_log);
+        if !Arc::ptr_eq(&state.completions, &shared.completions) {
+            state.completions = Arc::clone(&shared.completions);
+        }
+        if !Arc::ptr_eq(&state.type_names, &shared.type_names) {
+            state.type_names = Arc::clone(&shared.type_names);
+        }
+        if state.trace_generation != shared.trace_generation {
+            let new_trace = !match (&state.trace, &shared.trace) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            state.trace_generation = shared.trace_generation;
+            state.trace = shared.trace.clone();
+            state.reference = shared.reference.clone();
+            state.divergence = None;
+            if new_trace {
+                let length = state.trace.as_ref().map_or(0, |trace| trace.trace.len());
+                if state.trace_selected.is_some_and(|index| index >= length) {
+                    state.trace_selected = None;
+                }
+                state.trace_tree = None;
+                state.focus_tab.push(Tab::Trace);
+            }
+        }
     }
 
     /// Um quadro inteiro da janela.
     pub fn show(&mut self, ui: &mut Ui) {
         self.sync();
+        if self.state.theme_applied != Some(self.state.light) {
+            crate::apply_theme(ui.ctx(), !self.state.light);
+            self.state.theme_applied = Some(self.state.light);
+        }
         self.shortcuts(ui);
         let state = &mut self.state;
+        let dock = &self.dock;
+        let open: Vec<Tab> = Tab::ALL.iter().copied().filter(|tab| dock.find_tab(tab).is_some()).collect();
+        egui::Panel::top("menu").show(ui, |ui| menu_bar(ui, state, &open));
         egui::Panel::top("toolbar").show(ui, |ui| toolbar(ui, state));
         egui::Panel::bottom("status").show(ui, |ui| status_bar(ui, state));
+        self.layout_requests();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut style = Style::from_egui(ui.style().as_ref());
             style.tab_bar.fill_tab_bar = true;
-            DockArea::new(&mut self.dock).style(style).show_close_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
+            DockArea::new(&mut self.dock).style(style).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
         });
+        // Observação: as expressões e as vistas abertas vão ao backend.
+        if self.state.watches != self.state.sent_watches {
+            self.state.sent_watches = self.state.watches.clone();
+            self.state.requests.push(Request::SetWatches(self.state.watches.clone()));
+        }
+        if self.state.expanded != self.state.sent_expanded {
+            self.state.sent_expanded = self.state.expanded.clone();
+            self.state.requests.push(Request::SetExpanded(self.state.expanded.iter().copied().collect()));
+        }
         for request in self.state.requests.drain(..) {
             self.backend.send(request);
+        }
+        self.save(false);
+    }
+
+    /// Reabrir, fechar e focar painéis; o arranjo padrão.
+    fn layout_requests(&mut self) {
+        if std::mem::take(&mut self.state.reset_layout) {
+            self.dock = default_layout();
+        }
+        if let Some(tab) = self.state.toggle_tab.take() {
+            match self.dock.find_tab(&tab) {
+                Some(path) => {
+                    self.dock.remove_tab(path);
+                }
+                None => self.open_tab(tab),
+            }
+        }
+        for tab in std::mem::take(&mut self.state.focus_tab) {
+            if self.dock.find_tab(&tab).is_none() {
+                self.open_tab(tab);
+            }
+            if let Some(path) = self.dock.find_tab(&tab) {
+                let _ = self.dock.set_active_tab(path);
+                self.dock.set_focused_node_and_surface(NodePath { surface: path.surface, node: path.node });
+            }
+        }
+    }
+
+    /// Abre um painel junto de um vizinho natural (ou na área focada).
+    fn open_tab(&mut self, tab: Tab) {
+        let neighbor = match tab {
+            Tab::Source | Tab::Bugcheck => Tab::Disassembly,
+            Tab::Watch | Tab::Locals => Tab::Registers,
+            Tab::Breakpoints | Tab::Modules | Tab::Threads | Tab::Processes | Tab::NtObjects => Tab::CallStack,
+            Tab::Memory | Tab::Trace => Tab::Command,
+            Tab::Serial => Tab::DbgPrint,
+            _ => Tab::Disassembly,
+        };
+        match self.dock.find_tab(&neighbor) {
+            Some(path) => {
+                self.dock.set_focused_node_and_surface(NodePath { surface: path.surface, node: path.node });
+                self.dock.push_to_focused_leaf(tab);
+            }
+            None => self.dock.push_to_first_leaf(tab),
         }
     }
 
@@ -240,6 +639,14 @@ impl DebuggerApp {
         if stopped && pressed(Modifiers::NONE, Key::F11) {
             self.state.requests.push(Request::StepInto);
         }
+        if stopped && pressed(Modifiers::NONE, Key::F9) {
+            let target = self.state.selected_code.or_else(|| current_rip(&self.state.snapshot));
+            if let Some(address) = target {
+                self.state.requests.push(Request::ToggleBreakpoint(address));
+            }
+        }
+        // O Ctrl+Break não chega ao egui (o Windows o entrega como VK_CANCEL):
+        // a parada é o Ctrl+B.
         if running && pressed(Modifiers::CTRL, Key::B) {
             self.state.requests.push(Request::Break);
         }
@@ -250,32 +657,220 @@ impl eframe::App for DebuggerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save(true);
+    }
+}
+
+fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
+    let stopped = state.status == Status::Stopped;
+    let running = state.status == Status::Running;
+    egui::MenuBar::new().ui(ui, |ui| {
+        ui.menu_button("Sessão", |ui| {
+            if let Some(options) = state.launch.clone() {
+                if ui.button("Abrir o OpenNT (compilar e iniciar o QEMU)").clicked() {
+                    state.requests.push(Request::Start(Target::Launch(options)));
+                }
+            }
+            if ui.add_enabled(state.can_restart, egui::Button::new("Reiniciar (recompilar e abrir de novo)")).clicked() {
+                state.requests.push(Request::Restart);
+            }
+            if ui.button("Desconectar").clicked() {
+                state.requests.push(Request::Disconnect);
+            }
+            ui.separator();
+            if ui.add_enabled(stopped, egui::Button::new("Recarregar símbolos")).clicked() {
+                state.requests.push(Request::ReloadSymbols);
+            }
+        });
+        ui.menu_button("Depurar", |ui| {
+            if ui.add_enabled(stopped, egui::Button::new("Continuar").shortcut_text("F5")).clicked() {
+                state.requests.push(Request::Go);
+            }
+            if ui.add_enabled(running, egui::Button::new("Parar").shortcut_text("Ctrl+B")).clicked() {
+                state.requests.push(Request::Break);
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Entrar").shortcut_text("F11")).clicked() {
+                state.requests.push(Request::StepInto);
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Passar por cima").shortcut_text("F10")).clicked() {
+                state.requests.push(Request::StepOver);
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Sair da função").shortcut_text("Shift+F11")).clicked() {
+                state.requests.push(Request::StepOut);
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Liga/tira breakpoint").shortcut_text("F9")).clicked() {
+                if let Some(address) = state.selected_code.or_else(|| current_rip(&state.snapshot)) {
+                    state.requests.push(Request::ToggleBreakpoint(address));
+                }
+            }
+            ui.separator();
+            if ui.add_enabled(stopped, egui::Button::new("Analisar bugcheck (!analyze)")).clicked() {
+                state.query_kind = QueryKind::Analyze;
+                state.requests.push(Request::Query(QueryKind::Analyze, String::new()));
+                state.focus_tab.push(Tab::NtObjects);
+            }
+        });
+        ui.menu_button("Painéis", |ui| {
+            for tab in Tab::ALL {
+                let mut shown = open.contains(&tab);
+                if ui.checkbox(&mut shown, tab.title()).changed() {
+                    state.toggle_tab = Some(tab);
+                }
+            }
+            ui.separator();
+            if ui.button("Restaurar o arranjo padrão").clicked() {
+                state.reset_layout = true;
+            }
+        });
+        ui.menu_button("Aparência", |ui| {
+            if ui.radio(!state.light, "Tema escuro").clicked() {
+                state.light = false;
+            }
+            if ui.radio(state.light, "Tema claro").clicked() {
+                state.light = true;
+            }
+        });
+    });
+}
+
+/// Os ícones da barra de ferramentas (desenhados, sem fonte de ícones).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Go,
+    Break,
+    StepInto,
+    StepOver,
+    StepOut,
+    Restart,
+    Breakpoint,
+    Trace,
+    Theme,
+}
+
+fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
+    let colors = palette(ui);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(30.0, 26.0), if enabled { Sense::click() } else { Sense::hover() });
+    let painter = ui.painter_at(rect);
+    if enabled && response.hovered() {
+        painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let color = if !enabled {
+        colors.dim.gamma_multiply(0.6)
+    } else {
+        match icon {
+            Icon::Go => colors.green,
+            Icon::Break => colors.yellow,
+            Icon::Breakpoint => colors.red,
+            Icon::Restart | Icon::Trace => colors.blue,
+            _ => ui.visuals().text_color(),
+        }
+    };
+    let stroke = Stroke::new(2.0, color);
+    let center = rect.center();
+    let at = |x: f32, y: f32| Pos2::new(center.x + x, center.y + y);
+    let arrow = |painter: &egui::Painter, tip: Pos2, direction: Vec2| {
+        let direction = direction.normalized();
+        let side = Vec2::new(-direction.y, direction.x);
+        painter.add(egui::Shape::convex_polygon(vec![tip, tip - direction * 6.0 + side * 4.0, tip - direction * 6.0 - side * 4.0], color, Stroke::NONE));
+    };
+    match icon {
+        Icon::Go => {
+            painter.add(egui::Shape::convex_polygon(vec![at(-5.0, -7.0), at(7.0, 0.0), at(-5.0, 7.0)], color, Stroke::NONE));
+        }
+        Icon::Break => {
+            painter.rect_filled(egui::Rect::from_min_size(at(-6.0, -7.0), Vec2::new(4.0, 14.0)), 1.0, color);
+            painter.rect_filled(egui::Rect::from_min_size(at(2.0, -7.0), Vec2::new(4.0, 14.0)), 1.0, color);
+        }
+        Icon::StepInto => {
+            painter.line_segment([at(0.0, -8.0), at(0.0, 2.0)], stroke);
+            arrow(&painter, at(0.0, 4.0), Vec2::new(0.0, 1.0));
+            painter.circle_filled(at(0.0, 8.0), 2.0, color);
+        }
+        Icon::StepOver => {
+            let points: Vec<Pos2> = (0..=12).map(|step| {
+                let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
+                at(7.0 * angle.cos(), 1.0 + 6.0 * angle.sin())
+            }).collect();
+            painter.add(egui::Shape::line(points, stroke));
+            arrow(&painter, at(7.5, 3.0), Vec2::new(0.0, 1.0));
+            painter.circle_filled(at(0.0, 8.0), 2.0, color);
+        }
+        Icon::StepOut => {
+            painter.line_segment([at(0.0, 6.0), at(0.0, -4.0)], stroke);
+            arrow(&painter, at(0.0, -8.0), Vec2::new(0.0, -1.0));
+            painter.line_segment([at(-6.0, 8.0), at(6.0, 8.0)], stroke);
+        }
+        Icon::Restart => {
+            let points: Vec<Pos2> = (0..=16).map(|step| {
+                let angle = 0.6 + 5.0 * step as f32 / 16.0;
+                at(7.0 * angle.cos(), 7.0 * angle.sin())
+            }).collect();
+            let end = *points.last().unwrap();
+            painter.add(egui::Shape::line(points, stroke));
+            arrow(&painter, end + Vec2::new(2.0, 2.0), Vec2::new(1.0, 1.4));
+        }
+        Icon::Breakpoint => {
+            painter.circle_filled(center, 6.5, color);
+        }
+        Icon::Trace => {
+            for (index, width) in [12.0, 8.0, 12.0].iter().enumerate() {
+                let y = -6.0 + index as f32 * 6.0;
+                painter.line_segment([at(-6.0, y), at(-6.0 + width, y)], stroke);
+            }
+            arrow(&painter, at(8.0, 6.0), Vec2::new(1.0, 0.0));
+        }
+        Icon::Theme => {
+            painter.circle_stroke(center, 6.5, stroke);
+            painter.add(egui::Shape::convex_polygon((0..=12).map(|step| {
+                let angle = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * step as f32 / 12.0;
+                at(6.5 * angle.cos(), 6.5 * angle.sin())
+            }).collect(), color, Stroke::NONE));
+        }
+    }
+    let response = response.on_hover_text(tooltip);
+    enabled && response.clicked()
 }
 
 fn toolbar(ui: &mut Ui, state: &mut UiState) {
     let stopped = state.status == Status::Stopped;
     let running = state.status == Status::Running;
+    let colors = palette(ui);
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        if ui.add_enabled(running, egui::Button::new("Parar (Ctrl+B)")).on_hover_text("pede a parada (0x03)").clicked() {
-            state.requests.push(Request::Break);
-        }
-        if ui.add_enabled(stopped, egui::Button::new("Continuar (F5)")).clicked() {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if icon_button(ui, Icon::Go, stopped, "Continuar (F5)") {
             state.requests.push(Request::Go);
         }
-        if ui.add_enabled(stopped, egui::Button::new("Entrar (F11)")).on_hover_text("um passo (entra no call)").clicked() {
+        if icon_button(ui, Icon::Break, running, "Parar a máquina (Ctrl+B)") {
+            state.requests.push(Request::Break);
+        }
+        ui.add_space(6.0);
+        if icon_button(ui, Icon::StepInto, stopped, "Entrar: um passo, entra no call (F11)") {
             state.requests.push(Request::StepInto);
         }
-        if ui.add_enabled(stopped, egui::Button::new("Passar (F10)")).on_hover_text("passo por cima do call").clicked() {
+        if icon_button(ui, Icon::StepOver, stopped, "Passar por cima do call (F10)") {
             state.requests.push(Request::StepOver);
         }
-        if ui.add_enabled(stopped, egui::Button::new("Sair (Shift+F11)")).on_hover_text("até o retorno da função").clicked() {
+        if icon_button(ui, Icon::StepOut, stopped, "Sair da função: até o retorno (Shift+F11)") {
             state.requests.push(Request::StepOut);
         }
-        ui.separator();
-        if ui.add_enabled(state.can_restart, egui::Button::new("Reiniciar")).on_hover_text("fecha o QEMU, recompila e abre de novo").clicked() {
+        ui.add_space(6.0);
+        if icon_button(ui, Icon::Breakpoint, stopped, "Liga/tira o breakpoint na linha escolhida da desmontagem ou no RIP (F9)") {
+            if let Some(address) = state.selected_code.or_else(|| current_rip(&state.snapshot)) {
+                state.requests.push(Request::ToggleBreakpoint(address));
+            }
+        }
+        if icon_button(ui, Icon::Trace, stopped, "Rastro de instruções (painel Rastro)") {
+            state.focus_tab.push(Tab::Trace);
+        }
+        if icon_button(ui, Icon::Restart, state.can_restart, "Reiniciar: fecha o QEMU, recompila e abre de novo") {
             state.requests.push(Request::Restart);
         }
+        if icon_button(ui, Icon::Theme, true, "Alterna o tema claro e o escuro") {
+            state.light = !state.light;
+        }
+        ui.separator();
         let connected = matches!(state.status, Status::Stopped | Status::Running);
         if !connected && !matches!(state.status, Status::Launching(_) | Status::Connecting(_)) {
             if let Some(options) = state.launch.clone() {
@@ -288,34 +883,67 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
                 state.requests.push(Request::Start(Target::Connect(state.connect_address.trim().to_string())));
             }
         }
-        if connected && ui.button("Desconectar").clicked() {
-            state.requests.push(Request::Disconnect);
-        }
         ui.separator();
         let (color, text) = match &state.status {
-            Status::Idle => (DIM, "sem alvo".to_string()),
-            Status::Launching(line) => (YELLOW, format!("abrindo: {line}")),
-            Status::Connecting(address) => (YELLOW, format!("conectando a {address}")),
-            Status::Running => (GREEN, "rodando".to_string()),
-            Status::Stopped => (RED, "parado".to_string()),
-            Status::Disconnected(reason) => (DIM, format!("desconectado: {}", reason.lines().next().unwrap_or(""))),
+            Status::Idle => (colors.dim, "sem alvo".to_string()),
+            Status::Launching(line) => (colors.yellow, format!("abrindo: {line}")),
+            Status::Connecting(address) => (colors.yellow, format!("conectando a {address}")),
+            Status::Running => (colors.green, "rodando".to_string()),
+            Status::Stopped => (colors.red, "parado".to_string()),
+            Status::Disconnected(reason) => (colors.dim, format!("desconectado: {}", reason.lines().next().unwrap_or(""))),
         };
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 5.0, color);
         ui.label(RichText::new(text).color(color).strong());
     });
 }
 
+/// O processador mostrado (o da parada ou o escolhido).
+fn shown_processor(snapshot: &Snapshot) -> Option<&kd_client::monitor::Processor> {
+    let number = match snapshot.view {
+        View::Cpu(thread) => Some(thread.saturating_sub(1)),
+        _ => snapshot.stop_processor,
+    }?;
+    snapshot.processors.iter().find(|processor| processor.number == number)
+}
+
 fn status_bar(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     ui.horizontal(|ui| {
         let snapshot = &state.snapshot;
-        if !snapshot.stop.is_empty() {
-            ui.label(mono(snapshot.stop.split(" [").next().unwrap_or("")).color(DIM));
+        let connection = match &state.status {
+            Status::Stopped | Status::Running => "conectado",
+            Status::Launching(_) | Status::Connecting(_) => "conectando",
+            _ => "desconectado",
+        };
+        ui.label(RichText::new(connection).color(colors.dim));
+        ui.separator();
+        let target = match state.status {
+            Status::Stopped => RichText::new("parado").color(colors.red),
+            Status::Running => RichText::new("rodando").color(colors.green),
+            _ => RichText::new("-").color(colors.dim),
+        };
+        ui.label(target.strong());
+        if state.status == Status::Stopped {
+            if let Some(processor) = shown_processor(snapshot) {
+                ui.separator();
+                ui.label(mono(format!("CPU {}", processor.number)));
+                ui.separator();
+                ui.label(mono(format!("thread {:#x}", processor.thread)));
+                ui.separator();
+                ui.label(mono(format!("processo {}", if processor.process.is_empty() { "-" } else { &processor.process })));
+                ui.separator();
+                ui.label(mono(format!("IRQL {}", processor.irql)));
+            }
+            if !snapshot.stop.is_empty() {
+                ui.separator();
+                ui.label(mono(snapshot.stop.split(" [").next().unwrap_or("")).color(colors.dim));
+            }
         }
         if !state.activity.is_empty() {
             ui.separator();
             ui.spinner();
-            ui.label(RichText::new(&state.activity).color(YELLOW));
+            ui.label(RichText::new(&state.activity).color(colors.yellow));
         }
     });
 }
@@ -342,13 +970,18 @@ impl TabViewer for Viewer<'_> {
             Tab::Disassembly => disassembly_panel(ui, state),
             Tab::Source => source_panel(ui, state),
             Tab::Registers => registers_panel(ui, state),
+            Tab::Watch => watch_panel(ui, state),
+            Tab::Locals => locals_panel(ui, state),
             Tab::Memory => memory_panel(ui, state),
             Tab::CallStack => call_stack_panel(ui, state),
             Tab::Modules => modules_panel(ui, state),
             Tab::Processes => processes_panel(ui, state),
             Tab::Threads => threads_panel(ui, state),
             Tab::Breakpoints => breakpoints_panel(ui, state),
-            Tab::DbgPrint => log_panel(ui, &state.console, "dbgprint", "(nenhuma saida do DbgPrint ainda)"),
+            Tab::NtObjects => nt_objects_panel(ui, state),
+            Tab::Trace => trace_panel(ui, state),
+            Tab::Bugcheck => bugcheck_panel(ui, state),
+            Tab::DbgPrint => log_panel(ui, &state.console, "dbgprint", "(nenhuma saída do DbgPrint ainda)"),
             Tab::Serial => log_panel(ui, &state.serial, "serial", "(o log da COM1 aparece aqui quando o depurador abre o QEMU)"),
         }
     }
@@ -366,12 +999,17 @@ fn scroll_vertically_to(ui: &Ui, rect: egui::Rect) {
 }
 
 fn row_height(ui: &Ui) -> f32 {
-    ui.text_style_height(&TextStyle::Monospace) + 2.0
+    ui.text_style_height(&TextStyle::Monospace) + 3.0
+}
+
+fn hint(ui: &mut Ui, text: &str) {
+    let colors = palette(ui);
+    ui.label(RichText::new(text).color(colors.dim));
 }
 
 fn log_panel(ui: &mut Ui, log: &LogLines, id: &str, empty: &str) {
     if log.count() == 0 {
-        ui.label(RichText::new(empty).color(DIM));
+        hint(ui, empty);
         return;
     }
     let height = row_height(ui);
@@ -382,31 +1020,115 @@ fn log_panel(ui: &mut Ui, log: &LogLines, id: &str, empty: &str) {
     });
 }
 
+/// As sugestões do autocompletar para o texto do prompt: nomes de comando
+/// na primeira palavra, tipos depois de `dt` ou de `(_`, símbolos no resto.
+fn completions_for(state: &UiState) -> (usize, Vec<String>) {
+    let text = &state.command;
+    let start = text.rfind(|character: char| character.is_whitespace() || matches!(character, '(' | '*' | '+' | '-' | ',' | '[')).map_or(0, |index| index + 1);
+    let word = &text[start..];
+    let first = !text[..start].chars().any(|character| !character.is_whitespace());
+    if first {
+        return (start, Client::command_names().iter().filter(|name| name.starts_with(word)).map(|name| name.to_string()).collect());
+    }
+    if word.is_empty() {
+        return (start, Vec::new());
+    }
+    let types = text.trim_start().starts_with("dt ") || word.starts_with('_') || word.starts_with("nt!_");
+    let source: &[String] = if types { &state.type_names } else { &state.completions };
+    let wanted = word.strip_prefix("nt!").filter(|_| types).unwrap_or(word);
+    let from = source.partition_point(|name| name.as_str() < wanted);
+    let mut found: Vec<String> = source[from..].iter().take_while(|name| name.starts_with(wanted)).take(40).cloned().collect();
+    if found.is_empty() && !types {
+        // O fim do caminho do Rust (`run_kernel_tasks` acha `kernel::...::run_kernel_tasks`).
+        let suffix = format!("::{word}");
+        found = source.iter().filter(|name| name.contains(&suffix)).take(40).cloned().collect();
+    }
+    (start, found)
+}
+
+fn common_prefix(names: &[String]) -> String {
+    let Some(first) = names.first() else { return String::new() };
+    let mut length = first.len();
+    for name in &names[1..] {
+        length = length.min(first.bytes().zip(name.bytes()).take_while(|(a, b)| a == b).count());
+    }
+    while !first.is_char_boundary(length) {
+        length -= 1;
+    }
+    first[..length].to_string()
+}
+
 fn command_panel(ui: &mut Ui, state: &mut UiState) {
-    let input_height = row_height(ui) + 12.0;
+    let colors = palette(ui);
+    let suggestions_height = if state.suggestions.is_empty() { 0.0 } else { (state.suggestions.len().min(8) as f32) * row_height(ui) + 8.0 };
+    let input_height = row_height(ui) + 14.0 + suggestions_height;
     let output_height = (ui.available_height() - input_height).max(40.0);
     egui::ScrollArea::vertical().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height(output_height).show(ui, |ui| {
         if state.transcript.is_empty() {
-            ui.label(RichText::new("os comandos do cargo xtask debug (help): bp, bc, bl, x, r, bt, ps, threads, lm, cpus, obj, log, monitor...").color(DIM));
+            hint(ui, "comandos do WinDbg e do cargo xtask debug (help): k, r, db/dq, u, bp, bl, bc, g, p, t, gu, lm, dt, !process, !thread, !irp, !devobj, !drvobj, !object, !analyze, trace... Tab completa comandos e símbolos.");
             for index in 0..state.launch_log.count() {
-                ui.label(mono(state.launch_log.line(index)).color(DIM));
+                ui.label(mono(state.launch_log.line(index)).color(colors.dim));
             }
         }
         for entry in &state.transcript {
-            ui.label(mono(format!("kd> {}", entry.input)).color(BLUE));
+            ui.label(mono(format!("kd> {}", entry.input)).color(colors.blue));
             if !entry.output.trim().is_empty() {
-                ui.label(mono(entry.output.trim_end()).color(if entry.error { RED } else { ui.visuals().text_color() }));
+                ui.label(mono(entry.output.trim_end()).color(if entry.error { colors.red } else { ui.visuals().text_color() }));
             }
         }
     });
+    // Tab: completa (antes do campo, que usaria a tecla para trocar o foco).
+    if state.command_focused && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab)) {
+        let (start, found) = completions_for(state);
+        match found.len() {
+            0 => state.suggestions.clear(),
+            1 => {
+                state.command = format!("{}{}", &state.command[..start], found[0]);
+                if !state.command.ends_with('!') {
+                    state.command.push(' ');
+                }
+                state.suggestions.clear();
+            }
+            _ => {
+                let prefix = common_prefix(&found);
+                if prefix.len() > state.command.len() - start {
+                    state.command = format!("{}{prefix}", &state.command[..start]);
+                }
+                state.suggestions = found;
+            }
+        }
+        move_cursor_to_end(ui, egui::Id::new("kd-command"), state.command.chars().count());
+    }
+    if !state.suggestions.is_empty() {
+        egui::ScrollArea::vertical().id_salt("suggestions").max_height(suggestions_height).show(ui, |ui| {
+            let mut chosen = None;
+            for name in state.suggestions.iter().take(40) {
+                if ui.selectable_label(false, mono(name)).clicked() {
+                    chosen = Some(name.clone());
+                }
+            }
+            if let Some(name) = chosen {
+                let (start, _) = completions_for(state);
+                state.command = format!("{}{name} ", &state.command[..start]);
+                state.suggestions.clear();
+            }
+        });
+    }
     ui.horizontal(|ui| {
         let prompt = if state.status == Status::Stopped { "kd>" } else { "kd (rodando)>" };
-        ui.label(mono(prompt).color(BLUE));
-        let response = ui.add(egui::TextEdit::singleline(&mut state.command).font(TextStyle::Monospace).desired_width(f32::INFINITY).hint_text("comando (help)"));
+        ui.label(mono(prompt).color(colors.blue));
+        let response = ui.add(egui::TextEdit::singleline(&mut state.command).id(egui::Id::new("kd-command")).font(TextStyle::Monospace).desired_width(f32::INFINITY).hint_text("comando (help; Tab completa)"));
+        state.command_focused = response.has_focus();
+        if response.changed() {
+            state.suggestions.clear();
+        }
         if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
             let line = std::mem::take(&mut state.command);
+            state.suggestions.clear();
             if !line.trim().is_empty() {
-                state.history.push(line.clone());
+                if state.history.last() != Some(&line) {
+                    state.history.push(line.clone());
+                }
                 state.history_index = None;
                 state.requests.push(Request::Command(line));
             }
@@ -424,9 +1146,17 @@ fn command_panel(ui: &mut Ui, state: &mut UiState) {
                 };
                 state.history_index = index;
                 state.command = index.map(|index| state.history[index].clone()).unwrap_or_default();
+                move_cursor_to_end(ui, response.id, state.command.chars().count());
             }
         }
     });
+}
+
+fn move_cursor_to_end(ui: &Ui, id: egui::Id, length: usize) {
+    if let Some(mut text_state) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+        text_state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(length))));
+        text_state.store(ui.ctx(), id);
+    }
 }
 
 /// O RIP da visão (o do processador ou da thread escolhida).
@@ -435,6 +1165,7 @@ fn current_rip(snapshot: &Snapshot) -> Option<u64> {
 }
 
 fn disassembly_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     ui.horizontal(|ui| {
         ui.label("Endereço:");
         let response = ui.add(egui::TextEdit::singleline(&mut state.code_address).font(TextStyle::Monospace).desired_width(260.0).hint_text("expressão ou símbolo"));
@@ -443,16 +1174,17 @@ fn disassembly_panel(ui: &mut Ui, state: &mut UiState) {
         }
         if ui.button("Seguir o RIP").clicked() {
             state.code_address.clear();
+            state.selected_code = None;
             state.requests.push(Request::ShowCode(String::new()));
         }
     });
     ui.separator();
     let snapshot = Arc::clone(&state.snapshot);
     if let Some(error) = &snapshot.code.error {
-        ui.label(RichText::new(error).color(RED));
+        ui.label(RichText::new(error).color(colors.red));
     }
     if snapshot.code.lines.is_empty() {
-        ui.label(RichText::new("sem código (a máquina não parou ainda)").color(DIM));
+        hint(ui, "sem código (a máquina não parou ainda)");
         return;
     }
     let rip = current_rip(&snapshot);
@@ -463,68 +1195,77 @@ fn disassembly_panel(ui: &mut Ui, state: &mut UiState) {
     egui::ScrollArea::both().id_salt("code").auto_shrink([false, false]).show(ui, |ui| {
         for line in &snapshot.code.lines {
             if let Some(label) = &line.label {
-                ui.label(mono(format!("{label}:")).color(BLUE).strong());
+                ui.label(mono(format!("{label}:")).color(colors.blue).strong());
             }
-            let breakpoint = snapshot.breakpoints.iter().find(|breakpoint| breakpoint.address == line.address && matches!(breakpoint.kind, BreakpointKind::Software | BreakpointKind::Hardware));
+            let breakpoint = snapshot.breakpoints.iter().find(|breakpoint| breakpoint.address == line.address && !breakpoint.pending && matches!(breakpoint.kind, BreakpointKind::Software | BreakpointKind::Hardware));
+            let selected = state.selected_code == Some(line.address);
             let response = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let (gutter, click) = ui.allocate_exact_size(Vec2::new(30.0, height), Sense::click());
+                let (gutter, click) = ui.allocate_exact_size(Vec2::new(32.0, height), Sense::click());
                 if click.clicked() {
                     state.requests.push(Request::ToggleBreakpoint(line.address));
                 }
-                let click = click.on_hover_text("clique: liga/tira o breakpoint");
+                let click = click.on_hover_text("clique: liga/tira o breakpoint (F9)");
                 let painter = ui.painter();
                 if let Some(breakpoint) = breakpoint {
                     let center = gutter.left_center() + Vec2::new(8.0, 0.0);
                     if breakpoint.enabled {
-                        painter.circle_filled(center, 5.0, RED);
+                        painter.circle_filled(center, 5.0, colors.red);
                     } else {
-                        painter.circle_stroke(center, 5.0, egui::Stroke::new(1.5, RED));
+                        painter.circle_stroke(center, 5.0, Stroke::new(1.5, colors.red));
                     }
                 } else if click.hovered() {
-                    painter.circle_stroke(gutter.left_center() + Vec2::new(8.0, 0.0), 5.0, egui::Stroke::new(1.0, DIM));
+                    painter.circle_stroke(gutter.left_center() + Vec2::new(8.0, 0.0), 5.0, Stroke::new(1.0, colors.dim));
                 }
                 if Some(line.address) == rip {
-                    painter.text(gutter.left_center() + Vec2::new(18.0, 0.0), egui::Align2::LEFT_CENTER, "=>", font.clone(), YELLOW);
+                    painter.text(gutter.left_center() + Vec2::new(18.0, 0.0), Align2::LEFT_CENTER, "=>", font.clone(), colors.yellow);
                 } else if line.address == snapshot.code.focus {
-                    painter.text(gutter.left_center() + Vec2::new(18.0, 0.0), egui::Align2::LEFT_CENTER, "->", font.clone(), GREEN);
+                    painter.text(gutter.left_center() + Vec2::new(18.0, 0.0), Align2::LEFT_CENTER, "->", font.clone(), colors.green);
                 }
                 let mut text = format!("{}  {:<16} {}", hex(line.address), line.bytes.chars().take(16).collect::<String>(), line.text);
                 if let Some(comment) = &line.comment {
                     text.push_str(&format!("  ; {comment}"));
                 }
-                let color = if Some(line.address) == rip { YELLOW } else { ui.visuals().text_color() };
+                let color = if Some(line.address) == rip { colors.yellow } else { ui.visuals().text_color() };
                 let label = ui.add(egui::Label::new(mono(text).color(color)).sense(Sense::click()).extend());
+                if label.clicked() {
+                    state.selected_code = Some(line.address);
+                }
                 if let Some(target) = line.target {
                     if label.double_clicked() {
                         state.code_address = format!("{target:#x}");
                         state.requests.push(Request::ShowCode(state.code_address.clone()));
                     }
-                    label.on_hover_text("clique duplo: vai ao destino");
+                    label.on_hover_text("clique: escolhe a linha (F9); clique duplo: vai ao destino");
                 }
             });
+            let rect = response.response.rect;
             if line.address == snapshot.code.focus {
-                ui.painter().rect_filled(response.response.rect, 0.0, FOCUS_FILL);
+                ui.painter().rect_filled(rect, 0.0, colors.focus);
                 if scroll {
-                    scroll_vertically_to(ui, response.response.rect);
+                    scroll_vertically_to(ui, rect);
                 }
+            } else if selected {
+                ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, colors.blue), egui::StrokeKind::Inside);
             }
         }
     });
 }
 
 fn source_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     let Some(source) = &snapshot.source else {
-        ui.label(RichText::new(snapshot.source_error.as_deref().unwrap_or("sem linha de código")).color(DIM));
+        hint(ui, snapshot.source_error.as_deref().unwrap_or("sem linha de código"));
         return;
     };
     let root = crate::workspace_root();
     let file = std::path::Path::new(&source.file).strip_prefix(&root).map_or_else(|_| source.file.clone(), |relative| relative.display().to_string());
-    ui.label(mono(format!("{file}:{}", source.line)).color(BLUE));
+    ui.label(mono(format!("{file}:{}", source.line)).color(colors.blue));
     ui.separator();
     let scroll = state.scrolled_source != snapshot.generation;
     state.scrolled_source = snapshot.generation;
+    let font = FontId::monospace(ui.text_style_height(&TextStyle::Monospace) - 1.0);
     egui::ScrollArea::both().id_salt("source").auto_shrink([false, false]).show(ui, |ui| {
         let current = source.line as usize;
         let first = current.saturating_sub(400).max(1);
@@ -532,10 +1273,11 @@ fn source_panel(ui: &mut Ui, state: &mut UiState) {
         for number in first..=last {
             let Some(text) = source.text.get(number - 1) else { break };
             let is_current = number == current;
-            let line = mono(format!("{number:>5}  {text}")).color(if is_current { YELLOW } else { ui.visuals().text_color() });
+            let line = mono(format!("   {number:>5}  {text}")).color(if is_current { colors.yellow } else { ui.visuals().text_color() });
             let response = ui.add(egui::Label::new(line).extend());
             if is_current {
-                ui.painter().rect_filled(response.rect, 0.0, FOCUS_FILL);
+                ui.painter().rect_filled(response.rect, 0.0, colors.focus);
+                ui.painter().text(response.rect.left_center(), Align2::LEFT_CENTER, "=>", font.clone(), colors.yellow);
                 if scroll {
                     scroll_vertically_to(ui, response.rect);
                 }
@@ -545,6 +1287,7 @@ fn source_panel(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn registers_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     ui.horizontal(|ui| {
         let selected = match snapshot.view {
@@ -566,11 +1309,11 @@ fn registers_panel(ui: &mut Ui, state: &mut UiState) {
                 }
             }
         });
-        ui.label(RichText::new(&snapshot.view_header).color(DIM));
+        ui.label(RichText::new(&snapshot.view_header).color(colors.dim));
     });
     ui.separator();
     if snapshot.registers.is_empty() {
-        ui.label(RichText::new("sem registradores (a máquina não parou ainda)").color(DIM));
+        hint(ui, "sem registradores (a máquina não parou ainda)");
         return;
     }
     let editable = snapshot.registers_editable && state.status == Status::Stopped;
@@ -583,7 +1326,7 @@ fn registers_panel(ui: &mut Ui, state: &mut UiState) {
             for index in 0..rows {
                 for column in 0..columns {
                     match snapshot.registers.get(index + column * rows) {
-                        Some(row) => register_cell(ui, state, row, editable),
+                        Some(row) => register_cell(ui, state, row, editable, colors),
                         None => {
                             ui.label("");
                             ui.label("");
@@ -593,11 +1336,12 @@ fn registers_panel(ui: &mut Ui, state: &mut UiState) {
                 ui.end_row();
             }
         });
+        hint(ui, "vermelho: mudou desde a parada anterior");
     });
 }
 
-fn register_cell(ui: &mut Ui, state: &mut UiState, row: &crate::backend::RegisterRow, editable: bool) {
-    ui.label(mono(&row.name).color(BLUE));
+fn register_cell(ui: &mut Ui, state: &mut UiState, row: &crate::backend::RegisterRow, editable: bool, colors: Palette) {
+    ui.label(mono(&row.name).color(colors.blue));
     let editing = state.register_edit.as_ref().is_some_and(|(name, _)| *name == row.name);
     if editing {
         let Some((_, text)) = state.register_edit.as_mut() else { return };
@@ -619,17 +1363,129 @@ fn register_cell(ui: &mut Ui, state: &mut UiState, row: &crate::backend::Registe
         Some(value) => hex(value),
         None => "????????????????".into(),
     };
-    let label = ui.add(egui::Label::new(mono(text).color(if row.changed { RED } else { ui.visuals().text_color() })).sense(Sense::click()));
+    let label = ui.add(egui::Label::new(mono(text).color(if row.changed { colors.red } else { ui.visuals().text_color() })).sense(Sense::click()));
     if editable && label.on_hover_text("clique para editar (Enter grava)").clicked() {
         state.register_edit = Some((row.name.clone(), row.value.map(hex).unwrap_or_default()));
     }
 }
 
+/// Uma árvore de campos tipados (a observação e a vista de struct).
+fn typed_tree(ui: &mut Ui, state: &mut UiState, key: (u64, u32), depth: usize) {
+    let colors = palette(ui);
+    let snapshot = Arc::clone(&state.snapshot);
+    match snapshot.typed.get(&key) {
+        None => hint(ui, "lendo..."),
+        Some(Err(error)) => {
+            ui.label(RichText::new(error).color(colors.red));
+        }
+        Some(Ok(fields)) => {
+            for field in fields {
+                let line = format!("+{:#05x} {:<26} {:<22} {}", field.offset, field.name, field.type_name, field.value);
+                if field.expandable && depth < 6 {
+                    let child = (field.address, field.ty);
+                    let response = egui::CollapsingHeader::new(mono(line)).id_salt(("typed", key, child, depth)).show(ui, |ui| {
+                        typed_tree(ui, state, child, depth + 1);
+                    });
+                    if response.openness > 0.0 {
+                        state.expanded.insert(child);
+                    } else {
+                        state.expanded.remove(&child);
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.label(mono(line));
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn watch_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
+    ui.horizontal(|ui| {
+        let response = ui.add(egui::TextEdit::singleline(&mut state.watch_input).font(TextStyle::Monospace).desired_width(ui.available_width() - 90.0).hint_text("expressão: @rcx, poi(@rsp+8), (_IRP*)@rdx, ((_DEVICE_OBJECT*)x)->DriverObject"));
+        if (ui.button("Observar").clicked() || (response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)))) && !state.watch_input.trim().is_empty() {
+            state.watches.push(state.watch_input.trim().to_string());
+            state.watch_input.clear();
+        }
+    });
+    ui.separator();
+    let snapshot = Arc::clone(&state.snapshot);
+    if state.watches.is_empty() {
+        hint(ui, "nenhuma expressão. Um cast para um tipo do NT mostra a struct campo a campo (os tipos vêm do PDB do ntoskrnl).");
+    }
+    if !snapshot.types_note.is_empty() {
+        hint(ui, &snapshot.types_note);
+    }
+    let mut remove = None;
+    egui::ScrollArea::both().id_salt("watch").auto_shrink([false, false]).show(ui, |ui| {
+        for (index, expression) in state.watches.clone().iter().enumerate() {
+            let row = snapshot.watches.iter().find(|row| &row.expression == expression);
+            ui.horizontal(|ui| {
+                if ui.small_button("x").on_hover_text("tira a expressão").clicked() {
+                    remove = Some(index);
+                }
+                ui.label(mono(expression).color(colors.blue));
+                match row.map(|row| &row.value) {
+                    Some(Ok(value)) => {
+                        ui.label(mono(value));
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).color(colors.red));
+                    }
+                    None => hint(ui, "(na próxima parada)"),
+                }
+                if let Some(row) = row {
+                    if !row.type_name.is_empty() {
+                        ui.label(RichText::new(&row.type_name).color(colors.dim));
+                    }
+                }
+            });
+            if let Some(key) = row.and_then(|row| row.typed) {
+                egui::CollapsingHeader::new(mono(format!("campos em {:#x}", key.0))).id_salt(("watch-tree", index, key)).default_open(true).show(ui, |ui| {
+                    typed_tree(ui, state, key, 0);
+                });
+            }
+        }
+    });
+    if let Some(index) = remove {
+        state.watches.remove(index);
+    }
+}
+
+fn locals_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
+    let snapshot = Arc::clone(&state.snapshot);
+    if snapshot.locals.is_empty() {
+        hint(ui, if snapshot.locals_note.is_empty() { "sem variáveis locais" } else { &snapshot.locals_note });
+        return;
+    }
+    egui::ScrollArea::both().id_salt("locals").auto_shrink([false, false]).show(ui, |ui| {
+        egui::Grid::new("locals-grid").num_columns(4).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+            for title in ["nome", "tipo", "onde", "valor"] {
+                ui.label(RichText::new(title).strong());
+            }
+            ui.end_row();
+            for local in &snapshot.locals {
+                ui.label(mono(&local.name).color(if local.parameter { colors.blue } else { ui.visuals().text_color() }));
+                ui.label(mono(&local.type_name).color(colors.dim));
+                ui.label(mono(&local.location));
+                ui.label(mono(&local.value));
+                ui.end_row();
+            }
+        });
+        hint(ui, "azul: parâmetro");
+    });
+}
+
 fn memory_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     ui.horizontal(|ui| {
         ui.label("Endereço:");
-        let response = ui.add(egui::TextEdit::singleline(&mut state.memory_address).font(TextStyle::Monospace).desired_width(260.0).hint_text("expressão: %rsp, símbolo, 0x..."));
+        let response = ui.add(egui::TextEdit::singleline(&mut state.memory_address).font(TextStyle::Monospace).desired_width(240.0).hint_text("%rsp, símbolo, 0x..."));
         if ui.button("Ir").clicked() || (response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
             state.requests.push(Request::ShowMemory(state.memory_address.clone()));
         }
@@ -644,69 +1500,141 @@ fn memory_panel(ui: &mut Ui, state: &mut UiState) {
                 state.requests.push(Request::ShowMemory(state.memory_address.clone()));
             }
         }
+        egui::ComboBox::from_id_salt("memory-format").selected_text(state.memory_format.label()).show_ui(ui, |ui| {
+            for format in MemoryFormat::ALL {
+                ui.selectable_value(&mut state.memory_format, format, format.label());
+            }
+        });
     });
+    ui.horizontal(|ui| {
+        ui.label("Procurar:");
+        ui.add(egui::TextEdit::singleline(&mut state.search_pattern).font(TextStyle::Monospace).desired_width(200.0).hint_text("48 8b 05 | \"texto\" | u\"texto\""));
+        ui.label("bytes:");
+        ui.add(egui::TextEdit::singleline(&mut state.search_length).font(TextStyle::Monospace).desired_width(80.0));
+        if ui.add_enabled(state.status == Status::Stopped, egui::Button::new("Procurar")).on_hover_text("a partir do endereço acima").clicked() {
+            let length = parse_hex(&state.search_length).unwrap_or(0x10000);
+            state.requests.push(Request::SearchMemory { start: state.memory_address.clone(), length, pattern: state.search_pattern.clone() });
+        }
+    });
+    if let Some(search) = &snapshot.search {
+        ui.horizontal_wrapped(|ui| {
+            match &search.error {
+                Some(error) => {
+                    ui.label(RichText::new(error).color(colors.red));
+                }
+                None => {
+                    ui.label(format!("{} ocorrências de {} a partir de {:#x}:", search.hits.len(), search.pattern, search.start));
+                    for &hit in search.hits.iter().take(32) {
+                        if ui.link(mono(format!("{hit:#x}"))).clicked() {
+                            state.memory_address = format!("{hit:#x}");
+                            state.requests.push(Request::ShowMemory(state.memory_address.clone()));
+                        }
+                    }
+                }
+            }
+        });
+    }
     ui.separator();
     if let Some(error) = &snapshot.memory.error {
-        ui.label(RichText::new(error).color(RED));
+        ui.label(RichText::new(error).color(colors.red));
     }
     if snapshot.memory.bytes.is_empty() {
-        ui.label(RichText::new("digite um endereço (clique num byte para editá-lo com a máquina parada)").color(DIM));
+        hint(ui, "digite um endereço (com a máquina parada, clique num byte para editá-lo; clique duplo num qword segue o ponteiro)");
         return;
     }
     let editable = state.status == Status::Stopped;
+    let format = state.memory_format;
     egui::ScrollArea::both().id_salt("memory").auto_shrink([false, false]).show(ui, |ui| {
         for (row, chunk) in snapshot.memory.bytes.chunks(16).enumerate() {
             let base = snapshot.memory.address + row as u64 * 16;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
-                ui.label(mono(hex(base)).color(BLUE));
-                for (column, &byte) in chunk.iter().enumerate() {
-                    let address = base + column as u64;
-                    if state.memory_edit.as_ref().is_some_and(|(at, _)| *at == address) {
-                        let (_, text) = state.memory_edit.as_mut().unwrap();
-                        let response = ui.add(egui::TextEdit::singleline(text).font(TextStyle::Monospace).desired_width(18.0).char_limit(2));
-                        response.request_focus();
-                        if response.lost_focus() {
-                            if ui.input(|input| input.key_pressed(Key::Enter)) {
-                                if let Ok(value) = u8::from_str_radix(text.trim(), 16) {
-                                    state.requests.push(Request::WriteMemory(address, vec![value]));
+                ui.label(mono(hex(base)).color(colors.blue));
+                match format {
+                    MemoryFormat::Bytes => {
+                        for (column, &byte) in chunk.iter().enumerate() {
+                            let address = base + column as u64;
+                            if state.memory_edit.as_ref().is_some_and(|(at, _)| *at == address) {
+                                let Some((_, text)) = state.memory_edit.as_mut() else { return };
+                                let response = ui.add(egui::TextEdit::singleline(text).font(TextStyle::Monospace).desired_width(18.0).char_limit(2));
+                                response.request_focus();
+                                if response.lost_focus() {
+                                    if ui.input(|input| input.key_pressed(Key::Enter)) {
+                                        if let Ok(value) = u8::from_str_radix(text.trim(), 16) {
+                                            state.requests.push(Request::WriteMemory(address, vec![value]));
+                                        }
+                                    }
+                                    state.memory_edit = None;
+                                }
+                            } else {
+                                let label = ui.add(egui::Label::new(mono(format!("{byte:02x}"))).sense(Sense::click()));
+                                if editable && label.clicked() {
+                                    state.memory_edit = Some((address, format!("{byte:02x}")));
                                 }
                             }
-                            state.memory_edit = None;
+                            if column == 7 {
+                                ui.add_space(4.0);
+                            }
                         }
-                    } else {
-                        let label = ui.add(egui::Label::new(mono(format!("{byte:02x}"))).sense(Sense::click()));
-                        if editable && label.clicked() {
-                            state.memory_edit = Some((address, format!("{byte:02x}")));
+                        let text: String = chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect();
+                        ui.add_space(8.0);
+                        ui.label(mono(text).color(colors.dim));
+                    }
+                    MemoryFormat::Words | MemoryFormat::Dwords | MemoryFormat::Qwords => {
+                        let unit = format.unit();
+                        for piece in chunk.chunks(unit) {
+                            let mut raw = [0u8; 8];
+                            raw[..piece.len()].copy_from_slice(piece);
+                            let value = u64::from_le_bytes(raw);
+                            let label = ui.add(egui::Label::new(mono(format!("{value:0width$x}", width = unit * 2))).sense(Sense::click()));
+                            if unit == 8 && label.double_clicked() {
+                                state.memory_address = format!("{value:#x}");
+                                state.requests.push(Request::ShowMemory(state.memory_address.clone()));
+                            }
+                            if unit == 8 {
+                                label.on_hover_text("clique duplo: segue o ponteiro");
+                            }
                         }
                     }
-                    if column == 7 {
-                        ui.add_space(4.0);
+                    MemoryFormat::Ascii => {
+                        let text: String = chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect();
+                        ui.label(mono(text));
+                    }
+                    MemoryFormat::Unicode => {
+                        let text: String = chunk.chunks(2).map(|pair| {
+                            let unit = u16::from_le_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
+                            char::from_u32(unit as u32).filter(|character| !character.is_control()).unwrap_or('.')
+                        }).collect();
+                        ui.label(mono(text));
                     }
                 }
-                let text: String = chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect();
-                ui.add_space(8.0);
-                ui.label(mono(text).color(DIM));
             });
         }
     });
 }
 
 fn call_stack_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     if snapshot.frames.is_empty() {
-        ui.label(RichText::new("sem pilha (a máquina não parou ainda)").color(DIM));
+        hint(ui, "sem pilha (a máquina não parou ainda)");
         return;
     }
     egui::ScrollArea::both().id_salt("stack").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("stack-grid").num_columns(3).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+        egui::Grid::new("stack-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+            for title in ["#", "RSP do quadro", "endereço", "função", "como"] {
+                ui.label(RichText::new(title).strong());
+            }
+            ui.end_row();
             for (index, frame) in snapshot.frames.iter().enumerate() {
                 let selected = index == snapshot.selected_frame;
-                ui.label(mono(format!("#{index:<2}")).color(DIM));
+                ui.label(mono(format!("{index:02}")).color(colors.dim));
+                ui.label(mono(hex(frame.stack)).color(colors.dim));
                 ui.label(mono(hex(frame.address)));
-                if ui.selectable_label(selected, mono(&frame.name)).clicked() {
+                if ui.selectable_label(selected, mono(&frame.name)).on_hover_text("mostra o código deste quadro").clicked() {
                     state.requests.push(Request::SelectFrame(index));
                 }
+                ui.label(RichText::new(frame.method).color(colors.dim));
                 ui.end_row();
             }
         });
@@ -714,19 +1642,36 @@ fn call_stack_panel(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn modules_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(state.status == Status::Stopped, egui::Button::new("Recarregar símbolos")).on_hover_text("lê a lista de módulos de novo e troca os PDBs que chegaram").clicked() {
+            state.requests.push(Request::ReloadSymbols);
+        }
+        let pending = snapshot.modules.iter().filter(|module| module.pending).count();
+        if pending > 0 {
+            ui.spinner();
+            hint(ui, &format!("baixando {pending} PDB(s) do servidor de símbolos"));
+        }
+    });
     egui::ScrollArea::both().id_salt("modules").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("module-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["base", "fim", "nome", "símbolos", "origem"] {
+        egui::Grid::new("module-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+            for title in ["nome", "base", "fim", "símbolos", "PDB", "origem"] {
                 ui.label(RichText::new(title).strong());
             }
             ui.end_row();
             for module in &snapshot.modules {
+                if ui.link(mono(&module.name)).on_hover_text("detalhes do módulo (lmv)").clicked() {
+                    state.query_kind = QueryKind::Module;
+                    state.query_argument = module.name.clone();
+                    state.requests.push(Request::Query(QueryKind::Module, module.name.clone()));
+                    state.focus_tab.push(Tab::NtObjects);
+                }
                 ui.label(mono(hex(module.base)));
                 ui.label(mono(hex(module.end)));
-                ui.label(mono(&module.name).color(BLUE));
                 ui.label(mono(module.symbols.to_string()));
-                ui.label(RichText::new(&module.source).color(DIM));
+                ui.label(if module.pdb { RichText::new("sim").color(colors.green) } else if module.pending { RichText::new("baixando").color(colors.yellow) } else { RichText::new("-").color(colors.dim) });
+                ui.label(RichText::new(&module.source).color(colors.dim));
                 ui.end_row();
             }
         });
@@ -734,9 +1679,10 @@ fn modules_panel(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn processes_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     egui::ScrollArea::both().id_salt("processes").auto_shrink([false, false]).show(ui, |ui| {
-        ui.label(RichText::new("Processos (clique para filtrar as threads)").strong());
+        ui.label(RichText::new("Processos (clique: filtra as threads; botão direito: detalhes)").strong());
         egui::Grid::new("process-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
             for title in ["PID", "EPROCESS", "CR3", "threads", "nome"] {
                 ui.label(RichText::new(title).strong());
@@ -744,13 +1690,23 @@ fn processes_panel(ui: &mut Ui, state: &mut UiState) {
             ui.end_row();
             for process in &snapshot.processes {
                 let selected = state.thread_filter == Some(process.pid);
-                if ui.selectable_label(selected, mono(process.pid.to_string())).clicked() {
+                let response = ui.selectable_label(selected, mono(process.pid.to_string()));
+                if response.clicked() {
                     state.thread_filter = if selected { None } else { Some(process.pid) };
                 }
+                response.context_menu(|ui| {
+                    if ui.button("!process").clicked() {
+                        state.query_kind = QueryKind::Process;
+                        state.query_argument = format!("{:#x}", process.eprocess);
+                        state.requests.push(Request::Query(QueryKind::Process, state.query_argument.clone()));
+                        state.focus_tab.push(Tab::NtObjects);
+                        ui.close();
+                    }
+                });
                 ui.label(mono(hex(process.eprocess)));
                 ui.label(mono(format!("{:x}", process.cr3)));
                 ui.label(mono(process.threads.to_string()));
-                ui.label(mono(&process.name).color(BLUE));
+                ui.label(mono(&process.name).color(colors.blue));
                 ui.end_row();
             }
         });
@@ -778,6 +1734,7 @@ fn processes_panel(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn threads_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     if let Some(pid) = state.thread_filter {
         ui.horizontal(|ui| {
@@ -796,17 +1753,30 @@ fn threads_panel(ui: &mut Ui, state: &mut UiState) {
             for row in snapshot.threads.iter().filter(|row| state.thread_filter.is_none_or(|pid| pid == row.thread.pid)) {
                 let thread = &row.thread;
                 let running = snapshot.processors.iter().find(|processor| processor.thread == thread.ethread).map(|processor| processor.number + 1);
-                let selected = snapshot.view == View::Thread(thread.ethread) || (running.is_some() && running == match snapshot.view {
-                    View::Cpu(cpu) => Some(cpu),
-                    View::Owner => snapshot.stop_processor.map(|number| number + 1),
-                    View::Thread(_) => None,
-                });
+                let selected = snapshot.view == View::Thread(thread.ethread)
+                    || (running.is_some()
+                        && running
+                            == match snapshot.view {
+                                View::Cpu(cpu) => Some(cpu),
+                                View::Owner => snapshot.stop_processor.map(|number| number + 1),
+                                View::Thread(_) => None,
+                            });
                 ui.label(mono(thread.pid.to_string()));
                 ui.label(mono(thread.tid.to_string()));
-                if ui.selectable_label(selected, mono(hex(thread.ethread))).on_hover_text("registradores e pilha desta thread").clicked() {
+                let response = ui.selectable_label(selected, mono(hex(thread.ethread))).on_hover_text("clique: registradores e pilha desta thread; botão direito: !thread");
+                if response.clicked() {
                     state.requests.push(Request::SelectThread(thread.ethread));
                 }
-                ui.label(mono(&thread.state).color(if thread.state == "Running" { GREEN } else { DIM }));
+                response.context_menu(|ui| {
+                    if ui.button("!thread").clicked() {
+                        state.query_kind = QueryKind::Thread;
+                        state.query_argument = format!("{:#x}", thread.ethread);
+                        state.requests.push(Request::Query(QueryKind::Thread, state.query_argument.clone()));
+                        state.focus_tab.push(Tab::NtObjects);
+                        ui.close();
+                    }
+                });
+                ui.label(mono(&thread.state).color(if thread.state == "Running" { colors.green } else { colors.dim }));
                 ui.label(mono(&row.start));
                 ui.label(mono(&thread.process));
                 ui.end_row();
@@ -816,28 +1786,37 @@ fn threads_panel(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn breakpoints_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     let stopped = state.status == Status::Stopped;
-    ui.horizontal(|ui| {
-        let response = ui.add(egui::TextEdit::singleline(&mut state.breakpoint_expression).font(TextStyle::Monospace).desired_width(260.0).hint_text("símbolo ou endereço"));
+    ui.horizontal_wrapped(|ui| {
+        let hint_text = if state.breakpoint_kind == BreakpointKind::Module { "nome do módulo (ntfs.sys)" } else { "símbolo ou endereço" };
+        let response = ui.add(egui::TextEdit::singleline(&mut state.breakpoint_expression).font(TextStyle::Monospace).desired_width(240.0).hint_text(hint_text));
         egui::ComboBox::from_id_salt("breakpoint-kind").selected_text(state.breakpoint_kind.name()).show_ui(ui, |ui| {
-            for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access] {
+            for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access, BreakpointKind::Module] {
                 ui.selectable_value(&mut state.breakpoint_kind, kind, kind.name());
             }
         });
+        ui.add(egui::TextEdit::singleline(&mut state.breakpoint_condition).font(TextStyle::Monospace).desired_width(150.0).hint_text("condição (@rcx==0)"));
+        ui.add(egui::TextEdit::singleline(&mut state.breakpoint_pass).font(TextStyle::Monospace).desired_width(40.0).hint_text("N"));
+        ui.checkbox(&mut state.breakpoint_deferred, "adiado").on_hover_text("aceita um símbolo de um módulo que ainda vai carregar (bu)");
         let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
         if (ui.add_enabled(stopped, egui::Button::new("Adicionar")).clicked() || (submit && stopped)) && !state.breakpoint_expression.trim().is_empty() {
-            state.requests.push(Request::AddBreakpoint(state.breakpoint_kind, state.breakpoint_expression.trim().to_string()));
+            let mut request = BreakpointRequest::new(state.breakpoint_kind, state.breakpoint_expression.trim());
+            request.condition = state.breakpoint_condition.trim().to_string();
+            request.pass_count = state.breakpoint_pass.trim().parse().unwrap_or(0);
+            request.deferred = state.breakpoint_deferred;
+            state.requests.push(Request::AddBreakpointWith(request));
         }
     });
     ui.separator();
     if snapshot.breakpoints.is_empty() {
-        ui.label(RichText::new("nenhum breakpoint (clique na margem da desmontagem para ligar um)").color(DIM));
+        hint(ui, "nenhum breakpoint (clique na margem da desmontagem ou F9; os da sessão voltam no próximo attach)");
         return;
     }
     egui::ScrollArea::both().id_salt("breakpoints").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("breakpoint-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["#", "ligado", "tipo", "endereço", "expressão", ""] {
+        egui::Grid::new("breakpoint-grid").num_columns(8).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+            for title in ["#", "ligado", "tipo", "endereço", "expressão", "condição / N", "acertos", ""] {
                 ui.label(RichText::new(title).strong());
             }
             ui.end_row();
@@ -848,16 +1827,524 @@ fn breakpoints_panel(ui: &mut Ui, state: &mut UiState) {
                     state.requests.push(Request::EnableBreakpoint(breakpoint.id, enabled));
                 }
                 ui.label(breakpoint.kind.name());
-                if ui.add(egui::Label::new(mono(hex(breakpoint.address)).color(BLUE)).sense(Sense::click())).on_hover_text("mostra na desmontagem").clicked() {
+                if breakpoint.kind == BreakpointKind::Module {
+                    ui.label(mono("ao carregar").color(colors.dim));
+                } else if breakpoint.pending {
+                    ui.label(mono("(adiado)").color(colors.yellow));
+                } else if ui.add(egui::Label::new(mono(hex(breakpoint.address)).color(colors.blue)).sense(Sense::click())).on_hover_text("mostra na desmontagem").clicked() {
                     state.code_address = format!("{:#x}", breakpoint.address);
                     state.requests.push(Request::ShowCode(state.code_address.clone()));
                 }
                 ui.label(mono(&breakpoint.expression));
+                let editing = state.condition_edit.as_ref().is_some_and(|(id, _, _)| *id == breakpoint.id);
+                if editing {
+                    ui.horizontal(|ui| {
+                        let Some((id, condition, pass)) = state.condition_edit.as_mut() else { return };
+                        ui.add(egui::TextEdit::singleline(condition).font(TextStyle::Monospace).desired_width(120.0));
+                        ui.add(egui::TextEdit::singleline(pass).font(TextStyle::Monospace).desired_width(36.0));
+                        if ui.button("ok").clicked() {
+                            state.requests.push(Request::SetBreakpointCondition(*id, condition.clone(), pass.trim().parse().unwrap_or(0)));
+                            state.condition_edit = None;
+                        }
+                    });
+                } else {
+                    let text = match (breakpoint.condition.is_empty(), breakpoint.pass_count > 1) {
+                        (true, false) => "-".to_string(),
+                        (false, false) => breakpoint.condition.clone(),
+                        (true, true) => format!("a partir de {}", breakpoint.pass_count),
+                        (false, true) => format!("{} a partir de {}", breakpoint.condition, breakpoint.pass_count),
+                    };
+                    if ui.add(egui::Label::new(mono(text)).sense(Sense::click())).on_hover_text("clique para editar a condição e a contagem").clicked() {
+                        state.condition_edit = Some((breakpoint.id, breakpoint.condition.clone(), if breakpoint.pass_count > 1 { breakpoint.pass_count.to_string() } else { String::new() }));
+                    }
+                }
+                ui.label(mono(breakpoint.hits.to_string()));
                 if ui.add_enabled(stopped, egui::Button::new("remover")).clicked() {
                     state.requests.push(Request::RemoveBreakpoint(breakpoint.id));
                 }
                 ui.end_row();
             }
         });
+    });
+}
+
+/// Uma linha de texto com os endereços clicáveis (memória, desmontagem e
+/// as vistas do NT pelo menu do botão direito).
+fn linked_line(ui: &mut Ui, state: &mut UiState, line: &str, colors: Palette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut rest = line;
+        while let Some(start) = rest.find("0x") {
+            let (before, tail) = rest.split_at(start);
+            let length = 2 + tail[2..].chars().take_while(|character| character.is_ascii_hexdigit()).count();
+            let token = &tail[..length];
+            if !before.is_empty() {
+                ui.label(mono(before));
+            }
+            match kd_client::parse_number(token).filter(|&value| value > 0xffff) {
+                Some(value) => {
+                    let response = ui.add(egui::Label::new(mono(token).color(colors.blue)).sense(Sense::click())).on_hover_text("clique: memória; botão direito: abrir como objeto do NT");
+                    if response.clicked() {
+                        state.memory_address = format!("{value:#x}");
+                        state.requests.push(Request::ShowMemory(state.memory_address.clone()));
+                        state.focus_tab.push(Tab::Memory);
+                    }
+                    response.context_menu(|ui| {
+                        let mut open = |kind: QueryKind| {
+                            state.query_kind = kind;
+                            state.query_argument = format!("{value:#x}");
+                            state.requests.push(Request::Query(kind, state.query_argument.clone()));
+                        };
+                        if ui.button("como IRP").clicked() {
+                            open(QueryKind::Irp);
+                            ui.close();
+                        }
+                        if ui.button("como DEVICE_OBJECT").clicked() {
+                            open(QueryKind::Device);
+                            ui.close();
+                        }
+                        if ui.button("como DRIVER_OBJECT").clicked() {
+                            open(QueryKind::Driver);
+                            ui.close();
+                        }
+                        if ui.button("como ETHREAD").clicked() {
+                            open(QueryKind::Thread);
+                            ui.close();
+                        }
+                        if ui.button("como EPROCESS").clicked() {
+                            open(QueryKind::Process);
+                            ui.close();
+                        }
+                        if ui.button("na desmontagem").clicked() {
+                            state.code_address = format!("{value:#x}");
+                            state.requests.push(Request::ShowCode(state.code_address.clone()));
+                            state.focus_tab.push(Tab::Disassembly);
+                            ui.close();
+                        }
+                        if ui.button("observar").clicked() {
+                            state.watches.push(format!("{value:#x}"));
+                            ui.close();
+                        }
+                    });
+                }
+                None => {
+                    ui.label(mono(token));
+                }
+            }
+            rest = &tail[length..];
+        }
+        if !rest.is_empty() {
+            ui.label(mono(rest));
+        }
+    });
+}
+
+fn nt_objects_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
+    let stopped = state.status == Status::Stopped;
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("query-kind").selected_text(state.query_kind.label()).width(220.0).show_ui(ui, |ui| {
+            for kind in QueryKind::ALL {
+                ui.selectable_value(&mut state.query_kind, kind, kind.label());
+            }
+        });
+        let hint_text = match state.query_kind {
+            QueryKind::Process => "PID ou EPROCESS (vazio: o corrente)",
+            QueryKind::Thread => "ETHREAD (vazio: a corrente)",
+            QueryKind::Irp => "endereço do IRP",
+            QueryKind::Device => "endereço ou \\Device\\Nome",
+            QueryKind::Driver => "endereço, \\Driver\\Nome ou Nome",
+            QueryKind::Object => "\\caminho\\do\\objeto",
+            QueryKind::Handle => "PID handle",
+            QueryKind::Module => "nome do módulo",
+            QueryKind::Type => "_IRP endereço",
+            QueryKind::Analyze => "",
+        };
+        let response = ui.add(egui::TextEdit::singleline(&mut state.query_argument).font(TextStyle::Monospace).desired_width(300.0).hint_text(hint_text));
+        if (ui.add_enabled(stopped, egui::Button::new("Consultar")).clicked() || (stopped && response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)))) && (!state.query_argument.trim().is_empty() || matches!(state.query_kind, QueryKind::Process | QueryKind::Thread | QueryKind::Analyze)) {
+            state.requests.push(Request::Query(state.query_kind, state.query_argument.trim().to_string()));
+        }
+    });
+    ui.separator();
+    let snapshot = Arc::clone(&state.snapshot);
+    let Some(query) = &snapshot.query else {
+        hint(ui, "consultas do NT pelo depurador do OpenNT: processo, thread (estado, motivo da espera, pilha), IRP (pilha de E/S), dispositivo (pilha de dispositivos), driver (tabela de despacho), objeto, handle, módulo e qualquer struct do PDB do ntoskrnl. Os endereços azuis abrem com o botão direito.");
+        return;
+    };
+    ui.label(mono(query.kind.command(&query.argument)).color(colors.blue));
+    egui::ScrollArea::both().id_salt("nt-objects").auto_shrink([false, false]).show(ui, |ui| match &query.text {
+        Ok(text) => {
+            for line in text.lines() {
+                linked_line(ui, state, line, colors);
+            }
+        }
+        Err(error) => {
+            ui.label(RichText::new(error).color(colors.red));
+        }
+    });
+}
+
+fn bugcheck_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
+    let snapshot = Arc::clone(&state.snapshot);
+    let Some(analysis) = &snapshot.bugcheck else {
+        hint(ui, "nenhum bugcheck. Numa parada pelo KeBugCheckEx este painel abre sozinho com o código, os parâmetros explicados, o driver culpado e a pilha.");
+        return;
+    };
+    egui::ScrollArea::both().id_salt("bugcheck").auto_shrink([false, false]).show(ui, |ui| {
+        ui.label(RichText::new(format!("{}  ({:#010x})", analysis.name, analysis.code)).color(colors.red).strong().size(20.0));
+        ui.label(&analysis.summary);
+        ui.add_space(6.0);
+        match &analysis.blamed {
+            Some((module, reason)) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Provável causa:").strong());
+                    ui.label(RichText::new(module).color(colors.yellow).strong());
+                    ui.label(RichText::new(format!("({reason})")).color(colors.dim));
+                });
+            }
+            None => hint(ui, "nenhum driver fora do kernel na pilha nem nos parâmetros"),
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Parâmetros").strong());
+        egui::Grid::new("bugcheck-parameters").num_columns(4).striped(true).spacing([12.0, 3.0]).show(ui, |ui| {
+            for (index, parameter) in analysis.parameters.iter().enumerate() {
+                ui.label(mono(format!("{}", index + 1)).color(colors.dim));
+                ui.label(mono(hex(parameter.value)));
+                ui.label(&parameter.label);
+                ui.label(mono(&parameter.note).color(colors.blue));
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new("Pilha").strong());
+        for (depth, (address, name)) in analysis.stack.iter().enumerate() {
+            let blamed = analysis.blamed.as_ref().is_some_and(|(module, _)| name.starts_with(&format!("{module}!")) || name.starts_with(&format!("{module}+")));
+            let text = mono(format!("{depth:02} {} {name}", hex(*address)));
+            ui.label(if blamed { text.color(colors.yellow).strong() } else { text });
+        }
+    });
+}
+
+/// As linhas do rastro que passam pelo filtro (símbolo, módulo ou
+/// instrução), guardadas até o rastro ou o filtro mudar.
+fn trace_rows(state: &mut UiState, trace: &TraceView) {
+    let key = (state.trace_generation, state.trace_filter.clone());
+    if state.trace_rows_key == key {
+        return;
+    }
+    state.trace_rows_key = key;
+    let filter = state.trace_filter.trim().to_ascii_lowercase();
+    if filter.is_empty() {
+        state.trace_rows = (0..trace.trace.len()).collect();
+        return;
+    }
+    let matching: std::collections::HashSet<u64> = trace
+        .info
+        .iter()
+        .filter(|(_, info)| info.symbol.to_ascii_lowercase().contains(&filter) || info.module.to_ascii_lowercase().contains(&filter) || info.text.to_ascii_lowercase().contains(&filter))
+        .map(|(rip, _)| *rip)
+        .collect();
+    state.trace_rows = trace.trace.records.iter().enumerate().filter(|(_, record)| matching.contains(&record.rip)).map(|(index, _)| index).collect();
+}
+
+fn trace_options(state: &UiState) -> TraceOptions {
+    let mut options = TraceOptions { count: state.trace_count.trim().parse().unwrap_or(2000), over_calls: state.trace_over, ..Default::default() };
+    match state.trace_mode {
+        TraceMode::Count => {}
+        TraceMode::Until => options.until = state.trace_argument.trim().to_string(),
+        TraceMode::Return => options.until_return = true,
+        TraceMode::Enter => options.enter_module = state.trace_argument.trim().to_string(),
+        TraceMode::Leave => options.leave_module = state.trace_argument.trim().to_string(),
+    }
+    options.skip_modules = state.trace_skip.split([',', ' ']).filter(|name| !name.trim().is_empty()).map(|name| name.trim().to_string()).collect();
+    if let Some((expression, size)) = state.trace_watch.rsplit_once(':').and_then(|(expression, size)| Some((expression.to_string(), size.trim().parse::<u64>().ok()?))) {
+        options.watch = expression;
+        options.watch_size = size;
+    } else if !state.trace_watch.trim().is_empty() {
+        options.watch = state.trace_watch.trim().to_string();
+    }
+    options
+}
+
+fn trace_panel(ui: &mut Ui, state: &mut UiState) {
+    let colors = palette(ui);
+    let stopped = state.status == Status::Stopped;
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("trace-mode").selected_text(state.trace_mode.label()).show_ui(ui, |ui| {
+            for mode in TraceMode::ALL {
+                ui.selectable_value(&mut state.trace_mode, mode, mode.label());
+            }
+        });
+        if matches!(state.trace_mode, TraceMode::Until | TraceMode::Enter | TraceMode::Leave) {
+            ui.add(egui::TextEdit::singleline(&mut state.trace_argument).font(TextStyle::Monospace).desired_width(200.0).hint_text(if state.trace_mode == TraceMode::Until { "endereço ou símbolo" } else { "módulo" }));
+        }
+        ui.label("limite:");
+        ui.add(egui::TextEdit::singleline(&mut state.trace_count).font(TextStyle::Monospace).desired_width(70.0));
+        ui.checkbox(&mut state.trace_over, "só a função corrente").on_hover_text("as chamadas executam sem gravar (trace por cima)");
+        ui.label("pular:");
+        ui.add(egui::TextEdit::singleline(&mut state.trace_skip).font(TextStyle::Monospace).desired_width(110.0).hint_text("módulos"));
+        ui.label("vigiar:");
+        ui.add(egui::TextEdit::singleline(&mut state.trace_watch).font(TextStyle::Monospace).desired_width(120.0).hint_text("expr[:tamanho]"));
+        if ui.add_enabled(stopped, egui::Button::new("Rastrear")).on_hover_text("passo a passo dentro do convidado, com os registradores de cada instrução").clicked() {
+            state.requests.push(Request::Trace(trace_options(state)));
+        }
+        ui.separator();
+        ui.add(egui::TextEdit::singleline(&mut state.trace_qemu_ms).font(TextStyle::Monospace).desired_width(50.0)).on_hover_text("milissegundos (ou até o endereço do modo 'até o endereço')");
+        if ui.add_enabled(stopped, egui::Button::new("Rastro rápido (QEMU)")).on_hover_text("o log de execução do QEMU (TCG): só os RIPs, rastros longos").clicked() {
+            let until = if state.trace_mode == TraceMode::Until { state.trace_argument.trim().to_string() } else { String::new() };
+            state.requests.push(Request::QemuTrace { milliseconds: state.trace_qemu_ms.trim().parse().unwrap_or(500), until });
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut state.trace_display, TraceDisplay::Table, "Tabela");
+        ui.selectable_value(&mut state.trace_display, TraceDisplay::Tree, "Árvore de chamadas");
+        ui.selectable_value(&mut state.trace_display, TraceDisplay::Diff, "Comparação");
+        ui.separator();
+        ui.label("filtro:");
+        ui.add(egui::TextEdit::singleline(&mut state.trace_filter).font(TextStyle::Monospace).desired_width(160.0).hint_text("módulo, símbolo ou instrução"));
+        ui.separator();
+        ui.add(egui::TextEdit::singleline(&mut state.trace_path).font(TextStyle::Monospace).desired_width(200.0));
+        if ui.add_enabled(state.trace.is_some(), egui::Button::new("Exportar CSV")).clicked() {
+            state.requests.push(Request::SaveTrace(crate::workspace_root().join(state.trace_path.trim())));
+        }
+        if ui.add_enabled(state.trace.is_some(), egui::Button::new("Usar como referência")).clicked() {
+            state.requests.push(Request::TraceAsReference);
+        }
+        ui.add(egui::TextEdit::singleline(&mut state.reference_path).font(TextStyle::Monospace).desired_width(200.0));
+        if ui.button("Carregar referência").on_hover_text("um CSV exportado antes (outro boot, outra versão)").clicked() {
+            state.requests.push(Request::LoadReference(crate::workspace_root().join(state.reference_path.trim())));
+        }
+    });
+    ui.separator();
+    let Some(trace) = state.trace.clone() else {
+        hint(ui, "nenhum rastro. Modos: N instruções, até um endereço, até o retorno, até entrar ou sair de um módulo; 'só a função corrente' pula as chamadas; 'pular' executa módulos sem gravar. Também pelo comando trace.");
+        return;
+    };
+    ui.label(mono(format!("{}: {}", trace.title, trace.summary.lines().next().unwrap_or(""))).color(colors.dim));
+    match state.trace_display {
+        TraceDisplay::Table => trace_table(ui, state, &trace, colors),
+        TraceDisplay::Tree => trace_tree(ui, state, &trace),
+        TraceDisplay::Diff => trace_diff(ui, state, &trace, colors),
+    }
+}
+
+fn trace_table(ui: &mut Ui, state: &mut UiState, trace: &TraceView, colors: Palette) {
+    trace_rows(state, trace);
+    let available = ui.available_width();
+    let detail_width = (available * 0.40).clamp(300.0, 560.0);
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(available - detail_width - 12.0);
+            let height = row_height(ui);
+            let rows = state.trace_rows.clone();
+            let mut area = egui::ScrollArea::both().id_salt("trace-table").auto_shrink([false, false]);
+            if let Some(index) = state.trace_scroll.take() {
+                if let Some(position) = rows.iter().position(|&row| row == index) {
+                    area = area.vertical_scroll_offset((position as f32 * height - 120.0).max(0.0));
+                }
+            }
+            ui.add(egui::Label::new(mono(format!("{:>7} {:>3} {:<18} {:<40} {}", "#", "cpu", "RIP", "símbolo", "instrução / mudou")).strong()).truncate());
+            area.show_rows(ui, height, rows.len(), |ui, range| {
+                for &index in &rows[range] {
+                    let record = &trace.trace.records[index];
+                    let info = trace.info(record.rip);
+                    let symbol = info.map_or("", |info| info.symbol.as_str());
+                    let text = info.map_or("", |info| info.text.as_str());
+                    let changed: String = trace.trace.changed_at(index).into_iter().take(4).map(|(name, value)| format!(" {name}={value:x}")).collect();
+                    let indent = " ".repeat(record.depth.clamp(0, 12) as usize);
+                    let line = format!("{index:>7} {:>3} {:<18} {indent}{:<width$} {text}{changed}", record.cpu, format!("{:#x}", record.rip), truncate(symbol, 40usize.saturating_sub(indent.len())), width = 40usize.saturating_sub(indent.len()));
+                    let selected = state.trace_selected == Some(index);
+                    let response = ui.add(egui::Label::new(mono(line)).sense(Sense::click()).extend());
+                    if selected {
+                        ui.painter().rect_filled(response.rect, 0.0, colors.focus);
+                    }
+                    if response.clicked() {
+                        state.trace_selected = Some(index);
+                    }
+                }
+            });
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.set_width(detail_width);
+            trace_detail(ui, state, trace, colors);
+        });
+    });
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_string()
+    } else {
+        let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// O estado no registro escolhido: registradores (os que mudaram em
+/// destaque) e os operandos de memória da instrução.
+fn trace_detail(ui: &mut Ui, state: &mut UiState, trace: &TraceView, colors: Palette) {
+    let Some(index) = state.trace_selected.filter(|&index| index < trace.trace.len()) else {
+        hint(ui, "escolha um registro: os registradores e os operandos de memória daquele ponto aparecem aqui");
+        return;
+    };
+    let record = trace.trace.records[index];
+    let info = trace.info(record.rip).cloned().unwrap_or_default();
+    ui.horizontal(|ui| {
+        if ui.add_enabled(index > 0, egui::Button::new("< anterior")).clicked() {
+            state.trace_selected = Some(index - 1);
+            state.trace_scroll = Some(index - 1);
+        }
+        if ui.add_enabled(index + 1 < trace.trace.len(), egui::Button::new("próximo >")).clicked() {
+            state.trace_selected = Some(index + 1);
+            state.trace_scroll = Some(index + 1);
+        }
+        if ui.button("na desmontagem").clicked() {
+            state.code_address = format!("{:#x}", record.rip);
+            state.requests.push(Request::ShowCode(state.code_address.clone()));
+            state.focus_tab.push(Tab::Disassembly);
+        }
+    });
+    ui.label(mono(format!("registro {index}  CPU {}  thread {:#x}  profundidade {}", record.cpu, record.thread, record.depth)).strong());
+    ui.label(mono(format!("{:#x} {}", record.rip, info.symbol)).color(colors.blue));
+    ui.label(mono(&info.text).color(colors.yellow));
+    if let Some(watch) = record.watch {
+        ui.label(mono(format!("vigia = {watch:#x}")));
+    }
+    if record.skipped > 0 {
+        hint(ui, &format!("{} instruções não gravadas antes deste registro (filtro)", record.skipped));
+    }
+    if trace.trace.source != kd_client::trace::Source::Qemu {
+        let registers = trace.trace.registers_at(index);
+        let next = (index + 1 < trace.trace.len()).then(|| trace.trace.registers_at(index + 1));
+        let value_of = |name: &str| kd_client::trace::REGISTERS.iter().position(|register| *register == name).map(|position| registers[position]);
+        ui.add_space(4.0);
+        ui.label(RichText::new("Operandos de memória").strong());
+        let operands = disasm::memory_operands(record.rip, &info.bytes, &value_of);
+        if operands.is_empty() {
+            hint(ui, "nenhum");
+        }
+        let hint_value = disasm::value_hint(record.rip, &info.bytes);
+        for operand in &operands {
+            let mask = if operand.size >= 8 { u64::MAX } else { (1u64 << (8 * operand.size)) - 1 };
+            let value = match (&hint_value, &next) {
+                (Some(ValueHint::LoadInto(register)), Some(next)) if operand.read => kd_client::trace::REGISTERS.iter().position(|name| name == register).map(|position| format!(" = {:#x}", next[position] & mask)),
+                (Some(ValueHint::StoreFrom(register)), _) if operand.write => value_of(register).map(|value| format!(" = {:#x}", value & mask)),
+                (Some(ValueHint::StoreImmediate(value)), _) if operand.write => Some(format!(" = {:#x}", value & mask)),
+                _ => None,
+            }
+            .unwrap_or_default();
+            let access = match (operand.read, operand.write) {
+                (true, true) => "lê e grava",
+                (true, false) => "lê",
+                _ => "grava",
+            };
+            ui.label(mono(format!("{access} [{:#x}] {} bytes{value}", operand.address, operand.size)));
+        }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Registradores (antes da instrução)").strong());
+        let changed = trace.trace.changed_at(index);
+        egui::Grid::new("trace-registers").num_columns(4).spacing([8.0, 1.0]).show(ui, |ui| {
+            for (position, name) in kd_client::trace::REGISTERS.iter().enumerate() {
+                let highlight = changed.iter().any(|(changed_name, _)| changed_name == name);
+                ui.label(mono(*name).color(colors.blue));
+                ui.label(mono(hex(registers[position])).color(if highlight { colors.red } else { ui.visuals().text_color() }));
+                if position % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        hint(ui, "vermelho: mudou na instrução anterior");
+    } else {
+        hint(ui, "rastro do QEMU: só os RIPs (sem registradores)");
+    }
+}
+
+fn trace_tree(ui: &mut Ui, state: &mut UiState, trace: &TraceView) {
+    if state.trace_tree.as_ref().is_none_or(|(generation, _)| *generation != state.trace_generation) {
+        state.trace_tree = Some((state.trace_generation, trace.trace.call_tree()));
+    }
+    let Some((_, nodes)) = state.trace_tree.clone() else { return };
+    if nodes.is_empty() {
+        hint(ui, "rastro vazio");
+        return;
+    }
+    egui::ScrollArea::both().id_salt("trace-tree").auto_shrink([false, false]).show(ui, |ui| {
+        for &child in &nodes[0].children {
+            tree_node(ui, state, trace, &nodes, child);
+        }
+    });
+}
+
+fn tree_node(ui: &mut Ui, state: &mut UiState, trace: &TraceView, nodes: &[kd_client::trace::CallNode], index: usize) {
+    let node = &nodes[index];
+    let name = trace.info(node.address).map_or_else(|| format!("{:#x}", node.address), |info| info.symbol.rsplit_once("+0x").map_or(info.symbol.clone(), |(name, _)| name.to_string()));
+    let label = format!("{name}  ({} instruções, registros {}..{})", node.own, node.start, node.end);
+    if node.children.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(18.0);
+            if ui.selectable_label(state.trace_selected == Some(node.start), mono(label)).clicked() {
+                state.trace_selected = Some(node.start);
+                state.trace_scroll = Some(node.start);
+                state.trace_display = TraceDisplay::Table;
+            }
+        });
+        return;
+    }
+    let response = egui::CollapsingHeader::new(mono(label)).id_salt(("trace-node", index)).default_open(node.depth <= 0).show(ui, |ui| {
+        for &child in &node.children {
+            tree_node(ui, state, trace, nodes, child);
+        }
+    });
+    if response.header_response.double_clicked() {
+        state.trace_selected = Some(node.start);
+        state.trace_scroll = Some(node.start);
+        state.trace_display = TraceDisplay::Table;
+    }
+}
+
+fn trace_diff(ui: &mut Ui, state: &mut UiState, trace: &TraceView, colors: Palette) {
+    let Some(reference) = state.reference.clone() else {
+        hint(ui, "sem referência: 'Usar como referência' guarda o rastro atual; 'Carregar referência' lê um CSV exportado. Depois rode outro rastro e compare.");
+        return;
+    };
+    if state.divergence.is_none() {
+        let a: Vec<u64> = trace.trace.records.iter().map(|record| record.rip).collect();
+        let b: Vec<u64> = reference.trace.records.iter().map(|record| record.rip).collect();
+        state.divergence = Some(kd_client::trace::first_divergence(&a, &b));
+    }
+    let Some(divergence) = state.divergence.flatten() else {
+        ui.label(RichText::new(format!("rastros iguais ({} registros)", trace.trace.len())).color(colors.green).strong());
+        return;
+    };
+    let (x, y) = divergence;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("primeira divergência: registro {x} deste rastro, {y} da referência ({})", reference.title)).color(colors.yellow).strong());
+        if ui.button("ir ao registro").clicked() {
+            state.trace_selected = Some(x.min(trace.trace.len().saturating_sub(1)));
+            state.trace_scroll = state.trace_selected;
+            state.trace_display = TraceDisplay::Table;
+        }
+    });
+    let describe = |view: &TraceView, index: usize| -> String {
+        match view.trace.records.get(index) {
+            Some(record) => format!("{index:>7} {:#018x} {}", record.rip, view.info(record.rip).map_or("", |info| info.symbol.as_str())),
+            None => format!("{index:>7} (fim)"),
+        }
+    };
+    ui.columns(2, |columns| {
+        columns[0].label(RichText::new("este rastro").strong());
+        columns[1].label(RichText::new("referência").strong());
+        for offset in -12i64..=12 {
+            let (a, b) = (x as i64 + offset, y as i64 + offset);
+            if a < 0 || b < 0 {
+                continue;
+            }
+            let color = if offset == 0 { colors.yellow } else if offset < 0 { colors.dim } else { columns[0].visuals().text_color() };
+            columns[0].label(mono(describe(trace, a as usize)).color(color));
+            columns[1].label(mono(describe(&reference, b as usize)).color(color));
+        }
     });
 }

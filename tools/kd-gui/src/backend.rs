@@ -5,25 +5,33 @@
 //!
 //! A cada parada o backend monta um `Snapshot` inteiro: registradores do
 //! processador (ou da thread) escolhido, a pilha, a desmontagem em volta do
-//! quadro escolhido com a linha de código quando o DWARF a tem, a memória
-//! pedida, módulos, processadores, processos, threads e breakpoints.
+//! quadro escolhido com a linha de código e as variáveis locais quando o
+//! DWARF as tem, a memória pedida, as expressões observadas, as vistas
+//! tipadas abertas, a última consulta do NT, a análise do bugcheck, módulos,
+//! processadores, processos, threads e breakpoints. Os rastros ficam fora
+//! do snapshot (`Shared::trace`), com o símbolo e a instrução de cada RIP.
 
-use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use kd_client::client::Resumed;
+use kd_client::bugcheck::Analysis;
+use kd_client::client::{BreakpointRequest, Resumed};
+use kd_client::commands::TraceOptions;
 use kd_client::monitor::{Process, Processor, Thread};
 use kd_client::rsp::Connection;
+use kd_client::trace::{self, Class, Source, Trace};
+use kd_client::types::Field;
 use kd_client::{registers, Breakpoint, BreakpointKind, Client};
 
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions};
-use crate::source::LineTable;
+use crate::source::{Local, LineTable};
 
 /// Onde está o alvo.
 #[derive(Clone, Debug)]
@@ -41,6 +49,58 @@ pub struct Config {
     pub elf: PathBuf,
     /// O log da COM1 (o `serial.log` do build), quando conhecido.
     pub serial_log: Option<PathBuf>,
+    /// Onde gravar e de onde recriar os breakpoints (`None` = sem sessão).
+    pub session: Option<PathBuf>,
+}
+
+/// As consultas da janela Objetos do NT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QueryKind {
+    Process,
+    Thread,
+    Irp,
+    Device,
+    Driver,
+    Object,
+    Handle,
+    Module,
+    Type,
+    Analyze,
+}
+
+impl QueryKind {
+    pub const ALL: [QueryKind; 10] = [QueryKind::Process, QueryKind::Thread, QueryKind::Irp, QueryKind::Device, QueryKind::Driver, QueryKind::Object, QueryKind::Handle, QueryKind::Module, QueryKind::Type, QueryKind::Analyze];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QueryKind::Process => "Processo (EPROCESS)",
+            QueryKind::Thread => "Thread (ETHREAD)",
+            QueryKind::Irp => "IRP",
+            QueryKind::Device => "Dispositivo (DEVICE_OBJECT)",
+            QueryKind::Driver => "Driver (DRIVER_OBJECT)",
+            QueryKind::Object => "Objeto por nome",
+            QueryKind::Handle => "Handle (processo handle)",
+            QueryKind::Module => "Modulo carregado",
+            QueryKind::Type => "Struct do NT (tipo endereco)",
+            QueryKind::Analyze => "Analise do bugcheck",
+        }
+    }
+
+    /// O comando de texto equivalente.
+    pub fn command(self, argument: &str) -> String {
+        match self {
+            QueryKind::Process => format!("!process {argument}"),
+            QueryKind::Thread => format!("!thread {argument}"),
+            QueryKind::Irp => format!("!irp {argument}"),
+            QueryKind::Device => format!("!devobj {argument}"),
+            QueryKind::Driver => format!("!drvobj {argument}"),
+            QueryKind::Object => format!("!object {argument}"),
+            QueryKind::Handle => format!("!handle {argument}"),
+            QueryKind::Module => format!("lmv {argument}"),
+            QueryKind::Type => format!("dt {argument}"),
+            QueryKind::Analyze => "!analyze".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,13 +122,36 @@ pub enum Request {
     SelectFrame(usize),
     ToggleBreakpoint(u64),
     AddBreakpoint(BreakpointKind, String),
+    AddBreakpointWith(BreakpointRequest),
     RemoveBreakpoint(u32),
     EnableBreakpoint(u32, bool),
+    /// Condição e contagem de um breakpoint.
+    SetBreakpointCondition(u32, String, u64),
     /// Desmontagem num endereço ou símbolo (vazio: volta a seguir o RIP).
     ShowCode(String),
     ShowMemory(String),
     WriteMemory(u64, Vec<u8>),
     WriteRegister(String, u64),
+    /// As expressões da janela de observação.
+    SetWatches(Vec<String>),
+    /// As vistas tipadas abertas (endereço, tipo).
+    SetExpanded(Vec<(u64, u32)>),
+    Query(QueryKind, String),
+    /// Procura bytes (hexadecimal, `"texto"` ou `u"texto"`) a partir de uma
+    /// expressão.
+    SearchMemory { start: String, length: u64, pattern: String },
+    /// Rastro passo a passo no convidado.
+    Trace(TraceOptions),
+    /// Rastro pelo log de execução do QEMU (TCG): até o endereço, ou pelo
+    /// tempo.
+    QemuTrace { milliseconds: u64, until: String },
+    SaveTrace(PathBuf),
+    LoadReference(PathBuf),
+    TraceAsReference,
+    ReloadSymbols,
+    /// Teclas pelo monitor HMP do QEMU (`sendkey`, como
+    /// `ctrl_r-scroll_lock-scroll_lock`, o despejo manual do teclado).
+    SendKeys(String),
     Refresh,
     Shutdown,
 }
@@ -108,6 +191,10 @@ pub struct RegisterRow {
 pub struct FrameRow {
     pub address: u64,
     pub name: String,
+    /// O RSP do quadro.
+    pub stack: u64,
+    /// Como o quadro foi achado (`.pdata`, frame pointer...).
+    pub method: &'static str,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,8 +232,36 @@ pub struct ModuleRow {
     pub base: u64,
     pub end: u64,
     pub name: String,
+    pub file_name: String,
     pub symbols: usize,
     pub source: String,
+    pub pdb: bool,
+    pub pending: bool,
+}
+
+/// Uma expressão observada.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchRow {
+    pub expression: String,
+    pub value: Result<String, String>,
+    /// Valor tipado que abre (endereço, tipo) e o nome do tipo.
+    pub typed: Option<(u64, u32)>,
+    pub type_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryResult {
+    pub kind: QueryKind,
+    pub argument: String,
+    pub text: Result<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResult {
+    pub pattern: String,
+    pub start: u64,
+    pub hits: Vec<u64>,
+    pub error: Option<String>,
 }
 
 /// O estado do alvo numa parada.
@@ -157,6 +272,8 @@ pub struct Snapshot {
     pub stop: String,
     /// O processador da parada.
     pub stop_processor: Option<u64>,
+    /// O sinal da parada (6 = bugcheck ou pânico).
+    pub stop_signal: u8,
     pub view: View,
     /// Cabeçalho da thread escolhida (`context`).
     pub view_header: String,
@@ -167,6 +284,8 @@ pub struct Snapshot {
     pub code: CodeView,
     pub source: Option<SourceView>,
     pub source_error: Option<String>,
+    pub locals: Vec<Local>,
+    pub locals_note: String,
     pub memory: MemoryView,
     pub modules: Vec<ModuleRow>,
     pub processors: Vec<Processor>,
@@ -174,6 +293,13 @@ pub struct Snapshot {
     pub processes: Vec<Process>,
     pub threads: Vec<ThreadRow>,
     pub breakpoints: Vec<Breakpoint>,
+    pub watches: Vec<WatchRow>,
+    /// Os campos das vistas tipadas abertas.
+    pub typed: HashMap<(u64, u32), Result<Vec<Field>, String>>,
+    pub query: Option<QueryResult>,
+    pub bugcheck: Option<Analysis>,
+    pub search: Option<SearchResult>,
+    pub types_note: String,
 }
 
 /// Uma entrada do painel de comandos.
@@ -182,6 +308,29 @@ pub struct Entry {
     pub input: String,
     pub output: String,
     pub error: bool,
+}
+
+/// O que um RIP do rastro é: símbolo, módulo, bytes e instrução.
+#[derive(Clone, Debug, Default)]
+pub struct RipInfo {
+    pub symbol: String,
+    pub module: String,
+    pub bytes: Vec<u8>,
+    pub text: String,
+}
+
+/// Um rastro pronto para a janela.
+pub struct TraceView {
+    pub trace: Trace,
+    pub info: HashMap<u64, RipInfo>,
+    pub title: String,
+    pub summary: String,
+}
+
+impl TraceView {
+    pub fn info(&self, rip: u64) -> Option<&RipInfo> {
+        self.info.get(&rip)
+    }
 }
 
 /// O que a interface lê.
@@ -200,6 +349,13 @@ pub struct Shared {
     pub launch_log: String,
     /// Pode reiniciar (o alvo é do próprio depurador).
     pub can_restart: bool,
+    pub trace: Option<Arc<TraceView>>,
+    pub reference: Option<Arc<TraceView>>,
+    /// Muda a cada rastro novo.
+    pub trace_generation: u64,
+    /// Os nomes de símbolo (o autocompletar), por geração dos símbolos.
+    pub completions: Arc<Vec<String>>,
+    pub type_names: Arc<Vec<String>>,
 }
 
 pub struct Backend {
@@ -275,6 +431,12 @@ struct Worker {
     previous_registers: HashMap<String, u64>,
     serial_offset: u64,
     generation: u64,
+    watches: Vec<String>,
+    expanded: Vec<(u64, u32)>,
+    query: Option<(QueryKind, String)>,
+    search: Option<SearchResult>,
+    symbols_generation: u64,
+    types_published: bool,
 }
 
 impl Worker {
@@ -294,6 +456,12 @@ impl Worker {
             previous_registers: HashMap::new(),
             serial_offset: 0,
             generation: 0,
+            watches: Vec::new(),
+            expanded: Vec::new(),
+            query: None,
+            search: None,
+            symbols_generation: u64::MAX,
+            types_published: false,
         }
     }
 
@@ -331,6 +499,11 @@ impl Worker {
             if self.client.as_ref().is_some_and(|client| !client.is_stopped()) {
                 self.poll_target();
             }
+            // Um PDB que chegou: os nomes trocam sem esperar outra parada.
+            if self.client.as_ref().is_some_and(|client| client.is_stopped() && client.symbols.pending() && !client.symbols.store.as_ref().is_some_and(|store| store.busy())) {
+                let _ = self.with_client(|client| client.reload_modules());
+                self.refresh();
+            }
             self.forward_console();
             self.tail_serial();
             if let Some(launch) = self.launch.as_mut() {
@@ -360,6 +533,8 @@ impl Worker {
         self.focus = Focus::Frame;
         self.previous_registers.clear();
         self.serial_offset = 0;
+        self.symbols_generation = u64::MAX;
+        self.types_published = false;
         let address = match &target {
             Target::Connect(address) => {
                 self.publish(|shared| {
@@ -416,6 +591,15 @@ impl Worker {
         match client.attach(Duration::from_secs(180)) {
             Ok(text) => {
                 self.transcript("attach", Ok(text));
+                // Os breakpoints da sessão anterior (os de módulos que ainda
+                // não carregaram ficam adiados).
+                if let Some(path) = &self.config.session {
+                    if let Ok(text) = std::fs::read_to_string(path) {
+                        let errors = client.restore_breakpoints(&text);
+                        let restored = format!("{} breakpoints da sessao anterior ({})", client.breakpoints().len(), path.display());
+                        self.transcript("(sessao)", if errors.is_empty() { Ok(restored) } else { Err(format!("{restored}\n{}", errors.join("\n"))) });
+                    }
+                }
                 self.client = Some(client);
                 self.lines = None;
                 self.refresh();
@@ -506,6 +690,15 @@ impl Worker {
         self.set_status(Status::Disconnected(error));
     }
 
+    /// Grava os breakpoints no arquivo da sessão.
+    fn save_session(&self) {
+        let (Some(path), Some(client)) = (&self.config.session, &self.client) else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, client.breakpoint_specs());
+    }
+
     fn handle(&mut self, request: Request) {
         match request {
             Request::Start(target) => return self.start(target),
@@ -520,19 +713,37 @@ impl Worker {
                 return;
             }
             Request::Shutdown => return,
+            Request::SetWatches(watches) => {
+                self.watches = watches;
+                if self.client.as_ref().is_some_and(Client::is_stopped) {
+                    self.refresh();
+                }
+                return;
+            }
+            Request::SetExpanded(expanded) => {
+                self.expanded = expanded;
+                if self.client.as_ref().is_some_and(Client::is_stopped) {
+                    self.refresh();
+                }
+                return;
+            }
             _ => {}
         }
         if self.client.is_none() {
             return;
         }
         let stopped = self.client.as_ref().is_some_and(Client::is_stopped);
+        let mut breakpoints_changed = false;
         let result: Result<bool, String> = match request {
             Request::Break => self.with_client(|client| client.interrupt()).map(|_| false),
             Request::Go => self.resume(|client| client.go().map(|_| Resumed::Running)),
             Request::StepInto => self.resume(|client| client.step().map(Resumed::Stopped)),
             Request::StepOver => self.resume(Client::step_over),
             Request::StepOut => self.resume(Client::step_out),
-            Request::Command(line) => self.command(&line),
+            Request::Command(line) => {
+                breakpoints_changed = matches!(line.split_whitespace().next(), Some("bp" | "bu" | "bc" | "bd" | "be" | "ba" | "hbp" | "hbc" | "watch" | "unwatch" | "sxe" | "sxd" | ".bpload"));
+                self.command(&line)
+            }
             Request::SelectCpu(thread) => self.with_client(|client| client.select_thread(thread)).map(|_| {
                 self.view = View::Cpu(thread);
                 self.selected_frame = 0;
@@ -545,13 +756,31 @@ impl Worker {
                 self.focus = Focus::Frame;
                 Ok(true)
             }
-            Request::ToggleBreakpoint(address) => self.with_client(|client| client.toggle_breakpoint(address)).map(|_| true),
-            Request::AddBreakpoint(kind, expression) => {
-                let length = if matches!(kind, BreakpointKind::Write | BreakpointKind::Access) { 8 } else { 1 };
-                self.with_client(|client| client.add_breakpoint(kind, &expression, length)).map(|_| true)
+            Request::ToggleBreakpoint(address) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.toggle_breakpoint(address)).map(|_| true)
             }
-            Request::RemoveBreakpoint(id) => self.with_client(|client| client.remove_breakpoint(id)).map(|_| true),
-            Request::EnableBreakpoint(id, enabled) => self.with_client(|client| client.set_breakpoint_enabled(id, enabled)).map(|_| true),
+            Request::AddBreakpoint(kind, expression) => {
+                breakpoints_changed = true;
+                let request = BreakpointRequest::new(kind, &expression);
+                self.with_client(|client| client.add_breakpoint_with(&request)).map(|_| true)
+            }
+            Request::AddBreakpointWith(request) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.add_breakpoint_with(&request)).map(|_| true)
+            }
+            Request::RemoveBreakpoint(id) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.remove_breakpoint(id)).map(|_| true)
+            }
+            Request::EnableBreakpoint(id, enabled) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.set_breakpoint_enabled(id, enabled)).map(|_| true)
+            }
+            Request::SetBreakpointCondition(id, condition, pass_count) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.set_breakpoint_condition(id, &condition, pass_count)).map(|_| true)
+            }
             Request::ShowCode(expression) => {
                 if expression.trim().is_empty() {
                     self.focus = Focus::Frame;
@@ -569,9 +798,42 @@ impl Worker {
             }
             Request::WriteMemory(address, bytes) => self.with_client(|client| client.write_memory(address, &bytes)).map(|_| true),
             Request::WriteRegister(name, value) => self.with_client(|client| client.write_register(&name, value)).map(|_| true),
+            Request::Query(kind, argument) => {
+                self.query = Some((kind, argument));
+                Ok(true)
+            }
+            Request::SearchMemory { start, length, pattern } => {
+                self.set_activity("procurando na memoria");
+                let result = self.search_memory(&start, length, &pattern);
+                self.set_activity("");
+                self.search = Some(result);
+                Ok(true)
+            }
+            Request::Trace(options) => self.trace(&options),
+            Request::QemuTrace { milliseconds, until } => self.qemu_trace(milliseconds, &until),
+            Request::SaveTrace(path) => self.save_trace(&path),
+            Request::LoadReference(path) => self.load_reference(&path),
+            Request::TraceAsReference => {
+                let current = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).trace.clone();
+                match current {
+                    Some(trace) => {
+                        self.publish(|shared| {
+                            shared.reference = Some(trace);
+                            shared.trace_generation += 1;
+                        });
+                        Ok(false)
+                    }
+                    None => Err("nenhum rastro para guardar como referencia".into()),
+                }
+            }
+            Request::ReloadSymbols => self.with_client(|client| client.reload_modules()).map(|_| true),
+            Request::SendKeys(keys) => self.send_keys(&keys).map(|_| false),
             Request::Refresh => Ok(true),
-            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown => Ok(false),
+            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) => Ok(false),
         };
+        if breakpoints_changed && result.is_ok() {
+            self.save_session();
+        }
         match result {
             Ok(true) if stopped || self.client.as_ref().is_some_and(Client::is_stopped) => self.refresh(),
             Ok(_) => {}
@@ -640,6 +902,9 @@ impl Worker {
         if connection {
             return Err(result.err().unwrap_or_default());
         }
+        if word == "trace" && refresh && trimmed.split_whitespace().nth(1).is_none_or(|second| !matches!(second, "show" | "tree" | "save" | "diff" | "status")) {
+            self.publish_client_trace("rastro (comando)");
+        }
         if !self.client.as_ref().is_some_and(Client::is_stopped) {
             self.set_status(Status::Running);
             return Ok(false);
@@ -668,14 +933,50 @@ impl Worker {
         self.set_activity("");
         match snapshot {
             Ok(snapshot) => {
+                let completions = self.completions();
                 self.publish(|shared| {
                     shared.snapshot = Arc::new(snapshot);
                     shared.status = Status::Stopped;
+                    if let Some((symbols, types)) = completions {
+                        if let Some(symbols) = symbols {
+                            shared.completions = Arc::new(symbols);
+                        }
+                        if let Some(types) = types {
+                            shared.type_names = Arc::new(types);
+                        }
+                    }
                 });
             }
             Err(error) if is_connection_error(&error) => self.lost(error),
             Err(error) => self.transcript("(interface)", Err(error)),
         }
+    }
+
+    /// Os nomes do autocompletar, quando os símbolos ou os tipos mudaram.
+    #[allow(clippy::type_complexity)]
+    fn completions(&mut self) -> Option<(Option<Vec<String>>, Option<Vec<String>>)> {
+        let client = self.client.as_mut()?;
+        let symbols = (client.symbols.generation != self.symbols_generation).then(|| {
+            self.symbols_generation = client.symbols.generation;
+            let mut names: Vec<String> = Vec::new();
+            for module in &client.symbols.modules {
+                let prefix = if client.symbols.is_kernel(module) { String::new() } else { format!("{}!", module.name) };
+                names.extend(module.symbols.iter().filter(|symbol| symbol.function).map(|symbol| format!("{prefix}{}", symbol.name)));
+            }
+            names.sort();
+            names.dedup();
+            names
+        });
+        let types = if self.types_published {
+            None
+        } else {
+            // Só quando os tipos já foram carregados por alguma expressão.
+            client.type_database_loaded().map(|database| {
+                self.types_published = true;
+                database.names_starting_with("_", 50_000)
+            })
+        };
+        (symbols.is_some() || types.is_some()).then_some((symbols, types))
     }
 
     fn build_snapshot(&mut self) -> Result<Snapshot, String> {
@@ -686,6 +987,7 @@ impl Worker {
         let Some(client) = self.client.as_mut() else { return Err("sem conexao com o alvo".into()) };
         snapshot.stop = client.last_stop().to_string();
         snapshot.stop_processor = client.stop_reply().and_then(|stop| stop.processor());
+        snapshot.stop_signal = client.stop_reply().map_or(0, |stop| stop.signal);
         snapshot.stopped_threads = client.stopped_threads()?;
         snapshot.processors = client.processors().unwrap_or_default();
         // Registradores e pilha da visão escolhida.
@@ -722,7 +1024,21 @@ impl Worker {
                 client.backtrace(64)?
             }
         };
-        snapshot.frames = frames.iter().map(|frame| FrameRow { address: frame.address, name: client.frame_name(frame) }).collect();
+        snapshot.frames = frames
+            .iter()
+            .map(|frame| FrameRow {
+                address: frame.address,
+                name: client.frame_name(frame),
+                stack: frame.stack,
+                method: match frame.method {
+                    kd_client::unwind::Method::Context => "registradores",
+                    kd_client::unwind::Method::Table => ".pdata",
+                    kd_client::unwind::Method::Leaf => "folha",
+                    kd_client::unwind::Method::Epilog => "epilogo",
+                    kd_client::unwind::Method::FramePointer => "frame pointer",
+                },
+            })
+            .collect();
         if snapshot.selected_frame >= frames.len() {
             snapshot.selected_frame = 0;
         }
@@ -746,28 +1062,385 @@ impl Worker {
                 Err(error) => snapshot.memory.error = Some(error),
             }
         }
-        snapshot.modules = client.symbols.modules.iter().map(|module| ModuleRow { base: module.base, end: module.end, name: module.name.clone(), symbols: module.symbols.len(), source: module.source.clone() }).collect();
+        snapshot.modules = client
+            .symbols
+            .modules
+            .iter()
+            .map(|module| ModuleRow { base: module.base, end: module.end, name: module.name.clone(), file_name: module.file_name.clone(), symbols: module.symbols.len(), source: module.source.clone(), pdb: module.pdb.is_some(), pending: module.pdb_pending })
+            .collect();
         snapshot.processes = client.processes().unwrap_or_default();
         snapshot.threads = client.threads(None).unwrap_or_default().into_iter().map(|thread| ThreadRow { start: client.symbols.describe(thread.start), thread }).collect();
         snapshot.breakpoints = client.breakpoints().to_vec();
-        // Linha de código (só o kernel do OpenNT tem DWARF).
+        // Expressões observadas e as vistas tipadas abertas.
+        for expression in &self.watches {
+            let row = match client.evaluate_value(expression) {
+                Ok(value) => {
+                    let (typed, type_name) = match value.ty {
+                        Some(ty) => {
+                            let database = client.type_database();
+                            let name = database.as_ref().map(|database| format!("{}{}", database.name(ty.index), "*".repeat(ty.pointers as usize))).unwrap_or_default();
+                            // Abre o que aponta para uma struct ou é uma.
+                            let openable = database.as_ref().and_then(|database| {
+                                if ty.pointers == 1 {
+                                    Some((value.number, ty.index))
+                                } else if ty.pointers == 0 {
+                                    match database.kind(ty.index) {
+                                        kd_client::types::Kind::Struct { .. } | kd_client::types::Kind::Array { .. } => Some((value.address.unwrap_or(value.number), ty.index)),
+                                        kd_client::types::Kind::Pointer { target } if matches!(database.kind(target), kd_client::types::Kind::Struct { .. }) => Some((value.number, target)),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            });
+                            (openable, name)
+                        }
+                        None => (None, String::new()),
+                    };
+                    let symbol = client.symbols.name_at(value.number).map(|name| format!(" {name}")).unwrap_or_default();
+                    WatchRow { expression: expression.clone(), value: Ok(format!("{:#x} ({}){symbol}", value.number, value.number as i64)), typed, type_name }
+                }
+                Err(error) => WatchRow { expression: expression.clone(), value: Err(error), typed: None, type_name: String::new() },
+            };
+            snapshot.watches.push(row);
+        }
+        let mut wanted: Vec<(u64, u32)> = self.expanded.clone();
+        wanted.extend(snapshot.watches.iter().filter_map(|row| row.typed));
+        let mut seen = HashSet::new();
+        for (address, ty) in wanted {
+            if seen.insert((address, ty)) {
+                snapshot.typed.insert((address, ty), client.typed_fields(ty, address));
+            }
+        }
+        snapshot.types_note = client.types_note.clone();
+        // A consulta do NT pedida.
+        if let Some((kind, argument)) = self.query.clone() {
+            let text = client.execute(&kind.command(&argument));
+            snapshot.query = Some(QueryResult { kind, argument, text });
+        }
+        // Parada por bugcheck: a análise vem junto.
+        if snapshot.stop_signal == 6 {
+            snapshot.bugcheck = client.analyze().ok();
+        }
+        snapshot.search = self.search.clone();
+        // Linha de código e variáveis locais (só o kernel do OpenNT tem DWARF).
         if self.lines.is_none() {
             self.set_activity("lendo o DWARF do kernel.elf");
             self.lines = Some(LineTable::load(&elf));
         }
+        let Some(client) = self.client.as_mut() else { return Err("sem conexao com o alvo".into()) };
         match self.lines.as_mut() {
-            Some(Ok(table)) => match table.locate(focus) {
-                Some(position) => match table.file(&position.file) {
-                    Some(text) => snapshot.source = Some(SourceView { file: position.file, line: position.line, text }),
-                    None => snapshot.source_error = Some(format!("{}:{} (arquivo indisponivel)", position.file, position.line)),
-                },
-                None => snapshot.source_error = Some(format!("sem linha de codigo para {focus:#x} (so o kernel do OpenNT tem DWARF)")),
-            },
+            Some(Ok(table)) => {
+                match table.locate(focus) {
+                    Some(position) => match table.file(&position.file) {
+                        Some(text) => snapshot.source = Some(SourceView { file: position.file, line: position.line, text }),
+                        None => snapshot.source_error = Some(format!("{}:{} (arquivo indisponivel)", position.file, position.line)),
+                    },
+                    None => snapshot.source_error = Some(format!("sem linha de codigo para {focus:#x} (so o kernel do OpenNT tem DWARF)")),
+                }
+                // As locais do quadro de cima (os registradores são os dele).
+                if snapshot.selected_frame == 0 && matches!(self.focus, Focus::Frame) && !matches!(view, View::Thread(_)) {
+                    let registers: Vec<(String, u64)> = snapshot.registers.iter().filter_map(|row| row.value.map(|value| (row.name.clone(), value))).collect();
+                    match table.locals(focus, &registers, client) {
+                        Ok(locals) => snapshot.locals = locals,
+                        Err(note) => snapshot.locals_note = note,
+                    }
+                } else {
+                    snapshot.locals_note = "variaveis locais so no quadro de cima".into();
+                }
+            }
             Some(Err(error)) => snapshot.source_error = Some(error.clone()),
             None => {}
         }
         Ok(snapshot)
     }
+
+    /// Procura um padrão na memória (em blocos de 64 KB).
+    fn search_memory(&mut self, start: &str, length: u64, pattern: &str) -> SearchResult {
+        let mut result = SearchResult { pattern: pattern.to_string(), ..Default::default() };
+        let needle = match parse_pattern(pattern) {
+            Ok(needle) if !needle.is_empty() => needle,
+            Ok(_) => {
+                result.error = Some("padrao vazio".into());
+                return result;
+            }
+            Err(error) => {
+                result.error = Some(error);
+                return result;
+            }
+        };
+        let Some(client) = self.client.as_mut() else { return result };
+        let base = match client.evaluate(start) {
+            Ok(base) => base,
+            Err(error) => {
+                result.error = Some(error);
+                return result;
+            }
+        };
+        result.start = base;
+        let length = length.clamp(1, 64 << 20);
+        let chunk = 0x10000u64;
+        let mut offset = 0u64;
+        let mut tail: Vec<u8> = Vec::new();
+        while offset < length && result.hits.len() < 256 {
+            let size = chunk.min(length - offset) as usize;
+            let bytes = match client.read_memory(base + offset, size) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    // Página sem mapa: pula para a próxima.
+                    offset = ((base + offset + 0x1000) & !0xFFF) - base;
+                    tail.clear();
+                    continue;
+                }
+            };
+            let mut window = std::mem::take(&mut tail);
+            let window_start = base + offset - window.len() as u64;
+            window.extend_from_slice(&bytes);
+            for position in 0..window.len().saturating_sub(needle.len() - 1) {
+                if window[position..position + needle.len()] == needle[..] {
+                    let address = window_start + position as u64;
+                    if result.hits.last() != Some(&address) {
+                        result.hits.push(address);
+                    }
+                }
+            }
+            tail = window[window.len().saturating_sub(needle.len() - 1)..].to_vec();
+            offset += bytes.len().max(1) as u64;
+            if bytes.len() < size {
+                offset = ((base + offset + 0xFFF) & !0xFFF) - base;
+                tail.clear();
+            }
+        }
+        result
+    }
+
+    /// O rastro do cliente vira um `TraceView` (símbolo e instrução de cada
+    /// RIP, pelo código lido do alvo).
+    fn publish_client_trace(&mut self, title: &str) {
+        let Some(client) = self.client.as_mut() else { return };
+        let Some(trace) = client.trace.clone() else { return };
+        let view = build_trace_view(client, trace, title);
+        self.publish(|shared| {
+            shared.trace = Some(Arc::new(view));
+            shared.trace_generation += 1;
+        });
+    }
+
+    fn trace(&mut self, options: &TraceOptions) -> Result<bool, String> {
+        self.set_activity("rastreando passo a passo no convidado");
+        let result = self.with_client(|client| client.run_trace(options));
+        self.set_activity("");
+        let summary = result?;
+        self.transcript("(rastro)", Ok(summary));
+        self.set_activity("lendo as instrucoes do rastro");
+        self.publish_client_trace("rastro passo a passo");
+        self.set_activity("");
+        Ok(true)
+    }
+
+    /// O caminho rápido: o log de execução do QEMU (`log exec,nochain` pelo
+    /// monitor HMP) enquanto a máquina roda, até o endereço pedido ou pelo
+    /// tempo; cada bloco executado vira as instruções dele.
+    fn qemu_trace(&mut self, milliseconds: u64, until: &str) -> Result<bool, String> {
+        let monitor = self.launch.as_ref().and_then(|launch| launch.monitor.clone()).ok_or("o rastro rapido precisa do QEMU aberto pelo depurador (--launch), com o monitor HMP")?;
+        let log = match &self.target {
+            Some(Target::Launch(options)) => options.build_path().join("qemu-exec.log"),
+            _ => return Err("o rastro rapido precisa do --launch".into()),
+        };
+        let _ = std::fs::remove_file(&log);
+        let mut hmp = TcpStream::connect(&monitor).map_err(|error| format!("monitor HMP {monitor}: {error}"))?;
+        hmp.set_read_timeout(Some(Duration::from_millis(300))).ok();
+        let command = |stream: &mut TcpStream, text: &str| -> Result<(), String> {
+            stream.write_all(format!("{text}\n").as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+            let mut sink = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            Ok(())
+        };
+        command(&mut hmp, &format!("logfile {}", log.display()))?;
+        command(&mut hmp, "log exec,nochain")?;
+        // Até o endereço (um breakpoint temporário) ou pelo tempo.
+        let temporary = if until.trim().is_empty() { None } else { Some(self.with_client(|client| client.add_breakpoint(BreakpointKind::Software, until, 1))?) };
+        self.set_status(Status::Running);
+        self.set_activity("rastro rapido: a maquina roda com o log do QEMU");
+        let run = (|| -> Result<(), String> {
+            self.with_client(|client| client.go())?;
+            match temporary {
+                Some(_) => {
+                    self.with_client(|client| client.wait_stop(Duration::from_millis(milliseconds.max(1000))))?;
+                }
+                None => {
+                    thread::sleep(Duration::from_millis(milliseconds.clamp(10, 60_000)));
+                    self.with_client(|client| client.break_in(Duration::from_secs(60)))?;
+                }
+            }
+            Ok(())
+        })();
+        let _ = command(&mut hmp, "log none");
+        if !self.client.as_ref().is_some_and(Client::is_stopped) {
+            let _ = self.with_client(|client| client.break_in(Duration::from_secs(60)));
+        }
+        if let Some(breakpoint) = temporary {
+            let _ = self.with_client(|client| client.remove_breakpoint(breakpoint.id));
+        }
+        self.set_activity("");
+        run?;
+        self.set_activity("lendo o log do QEMU");
+        let text = std::fs::read(&log).map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(256 << 20)]).into_owned()).unwrap_or_default();
+        let blocks = trace::parse_qemu_exec(&text);
+        if blocks.is_empty() {
+            self.set_activity("");
+            return Err("o log do QEMU veio vazio: o rastro rapido precisa do TCG (--accel=tcg)".into());
+        }
+        let Some(client) = self.client.as_mut() else { return Err("sem conexao com o alvo".into()) };
+        let trace = expand_qemu_blocks(client, &blocks, 2_000_000);
+        let view = build_trace_view(client, trace, &format!("rastro rapido do QEMU ({} blocos)", blocks.len()));
+        self.publish(|shared| {
+            shared.trace = Some(Arc::new(view));
+            shared.trace_generation += 1;
+        });
+        self.set_activity("");
+        Ok(true)
+    }
+
+    fn send_keys(&mut self, keys: &str) -> Result<(), String> {
+        let monitor = self.launch.as_ref().and_then(|launch| launch.monitor.clone()).ok_or("teclas pelo monitor HMP: so com o QEMU aberto pelo depurador (--launch)")?;
+        let mut hmp = TcpStream::connect(&monitor).map_err(|error| format!("monitor HMP {monitor}: {error}"))?;
+        hmp.write_all(format!("sendkey {keys} 30
+").as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+        thread::sleep(Duration::from_millis(300));
+        Ok(())
+    }
+
+    fn save_trace(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        let trace = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).trace.clone().ok_or("nenhum rastro para exportar")?;
+        let csv = trace.trace.to_csv(&|rip| trace.info(rip).map(|info| info.symbol.clone()).unwrap_or_else(|| format!("{rip:#x}")), &|rip| trace.info(rip).map(|info| info.text.clone()).unwrap_or_default());
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, csv).map_err(|error| format!("{}: {error}", path.display()))?;
+        self.transcript("(rastro)", Ok(format!("{} registros em {}", trace.trace.len(), path.display())));
+        Ok(false)
+    }
+
+    fn load_reference(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let trace = Trace::from_csv(&text)?;
+        // Símbolos e instruções do próprio arquivo.
+        let mut info = HashMap::new();
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split(';').collect();
+            if let (Some(rip), Some(symbol), Some(instruction)) = (fields.get(3).and_then(|text| kd_client::parse_number(text)), fields.get(4), fields.get(5)) {
+                info.entry(rip).or_insert_with(|| RipInfo { symbol: symbol.to_string(), module: symbol.split_once('!').map_or("kernel".to_string(), |(module, _)| module.to_string()), bytes: Vec::new(), text: instruction.to_string() });
+            }
+        }
+        let view = TraceView { summary: format!("{} registros de {}", trace.len(), path.display()), title: path.display().to_string(), trace, info };
+        self.publish(|shared| {
+            shared.reference = Some(Arc::new(view));
+            shared.trace_generation += 1;
+        });
+        Ok(false)
+    }
+}
+
+/// Um padrão de busca: bytes em hexadecimal (`48 8b 05`), `"texto"` ou
+/// `u"texto"` (UTF-16).
+pub fn parse_pattern(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if let Some(inner) = text.strip_prefix("u\"").and_then(|rest| rest.strip_suffix('"')) {
+        return Ok(inner.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect());
+    }
+    if let Some(inner) = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return Ok(inner.as_bytes().to_vec());
+    }
+    let digits: String = text.chars().filter(|character| !character.is_whitespace()).collect();
+    if digits.len() % 2 != 0 || !digits.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("padrao: bytes em hexadecimal (48 8b 05), \"texto\" ou u\"texto\"".into());
+    }
+    Ok((0..digits.len() / 2).map(|index| u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16).unwrap_or(0)).collect())
+}
+
+/// Páginas de código lidas do alvo (o rastro desmonta cada RIP uma vez).
+struct CodePages<'a> {
+    client: &'a mut Client,
+    pages: HashMap<u64, Option<Vec<u8>>>,
+}
+
+impl CodePages<'_> {
+    fn bytes(&mut self, address: u64, length: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(length);
+        let mut position = address;
+        while output.len() < length {
+            let page = position & !0xFFF;
+            let entry = self.pages.entry(page).or_insert_with(|| self.client.read_memory(page, 0x1000).ok().filter(|bytes| bytes.len() == 0x1000));
+            let Some(bytes) = entry else { break };
+            let start = (position - page) as usize;
+            let take = (length - output.len()).min(0x1000 - start);
+            output.extend_from_slice(&bytes[start..start + take]);
+            position += take as u64;
+        }
+        output
+    }
+}
+
+/// Símbolo, módulo, bytes e instrução de cada RIP distinto do rastro.
+fn build_trace_view(client: &mut Client, trace: Trace, title: &str) -> TraceView {
+    let mut unique: Vec<u64> = trace.records.iter().map(|record| record.rip).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut info = HashMap::with_capacity(unique.len());
+    let names: Vec<(u64, String, String)> = unique.iter().map(|&rip| (rip, client.symbols.describe(rip), client.symbols.module_at(rip).map_or(String::new(), |module| module.name.clone()))).collect();
+    let mut pages = CodePages { client, pages: HashMap::new() };
+    for (rip, symbol, module) in names {
+        let bytes = pages.bytes(rip, 16);
+        let text = disasm::disassemble(rip, &bytes, None).into_iter().next().map(|line| line.text).unwrap_or_else(|| "(codigo ilegivel)".into());
+        let length = disasm::instruction_length(rip, &bytes).unwrap_or(bytes.len().min(1));
+        info.insert(rip, RipInfo { symbol, module, bytes: bytes[..length.min(bytes.len())].to_vec(), text });
+    }
+    let symbols = &pages.client.symbols;
+    let mut summary = format!("{} registros, {} instrucoes executadas, {} lote(s); fim: {}\n", trace.len(), trace.steps.max(trace.len() as u64), trace.batches, trace.reason.text());
+    for (name, count) in trace::histogram(&trace, &|rip| symbols.describe(rip)).into_iter().take(5) {
+        summary.push_str(&format!("{count:>8}  {name}\n"));
+    }
+    TraceView { trace, info, title: title.to_string(), summary }
+}
+
+/// Os blocos do log do QEMU em instruções: cada bloco vai até o primeiro
+/// desvio ou até o começo do bloco seguinte.
+fn expand_qemu_blocks(client: &mut Client, blocks: &[(u8, u64)], limit: usize) -> Trace {
+    let mut trace = Trace::new(Source::Qemu);
+    let mut pages = CodePages { client, pages: HashMap::new() };
+    let mut depth: HashMap<u8, i32> = HashMap::new();
+    for (index, &(cpu, start)) in blocks.iter().enumerate() {
+        let next = blocks[index + 1..].iter().find(|(other, _)| *other == cpu).map(|(_, pc)| *pc);
+        let code = pages.bytes(start, 512);
+        for (address, flow) in disasm::block(start, &code, next) {
+            let level = depth.entry(cpu).or_insert(0);
+            let class = match flow {
+                kd_client::x86::Flow::Call(_) => Class::Call,
+                kd_client::x86::Flow::Return => Class::Return,
+                kd_client::x86::Flow::Other => Class::Other,
+            };
+            trace.push_rip(cpu, address, class, *level);
+            match class {
+                Class::Call => *level += 1,
+                Class::Return => *level -= 1,
+                Class::Other => {}
+            }
+            if trace.len() >= limit {
+                return trace;
+            }
+        }
+    }
+    trace.steps = trace.len() as u64;
+    trace.reason = trace::Reason::Interrupted;
+    trace.batches = 1;
+    trace
 }
 
 /// A desmontagem em volta de `focus`.
@@ -802,4 +1475,18 @@ fn code_view(client: &mut Client, focus: u64) -> CodeView {
 /// O erro é de conexão (o alvo sumiu), não de um comando.
 fn is_connection_error(error: &str) -> bool {
     error.contains("fechou a conexao") || error.contains("depurador:") || error.contains("os error") || error.contains("nao confirmou")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pattern;
+
+    #[test]
+    fn search_patterns() {
+        assert_eq!(parse_pattern("48 8b 05"), Ok(vec![0x48, 0x8b, 0x05]));
+        assert_eq!(parse_pattern("\"MZ\""), Ok(vec![b'M', b'Z']));
+        assert_eq!(parse_pattern("u\"Nt\""), Ok(vec![b'N', 0, b't', 0]));
+        assert!(parse_pattern("4").is_err());
+        assert!(parse_pattern("zz").is_err());
+    }
 }

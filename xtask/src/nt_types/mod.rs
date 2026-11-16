@@ -22,7 +22,6 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::status::toml;
 use layout::{Generator, Kind};
@@ -223,31 +222,11 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
-/// Baixa o PDB do servidor público de símbolos (`<nome>/<GUID><idade>/<nome>`).
+/// Baixa o PDB do servidor público de símbolos (`<nome>/<GUID><idade>/<nome>`),
+/// pelo mesmo código do cache de símbolos do depurador.
 fn download(config: &Config, destination: &Path) -> Result<(), String> {
-    let url = format!(
-        "{}/{name}/{}{:X}/{name}",
-        config.symbol_server.trim_end_matches('/'),
-        config.pdb_guid,
-        config.pdb_age,
-        name = config.pdb_name
-    );
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    }
-    let partial = destination.with_extension("pdb.part");
-    eprintln!("baixando {url}");
-    let status = Command::new("curl")
-        .args(["--fail", "--location", "--silent", "--show-error", "--user-agent", "symbol-client/1.0", "--output"])
-        .arg(&partial)
-        .arg(&url)
-        .status()
-        .map_err(|error| format!("curl: {error} (instale o curl ou passe --pdb=ARQ)"))?;
-    if !status.success() {
-        let _ = fs::remove_file(&partial);
-        return Err(format!("download do PDB falhou ({status}): {url}"));
-    }
-    fs::rename(&partial, destination).map_err(|error| format!("{}: {error}", destination.display()))
+    eprintln!("baixando {} ({}{:X}) de {}", config.pdb_name, config.pdb_guid, config.pdb_age, config.symbol_server);
+    kd_client::pdb::download(&config.symbol_server, &config.pdb_name, &config.pdb_guid, config.pdb_age, destination).map_err(|error| format!("{error} (instale o curl ou passe --pdb=ARQ)"))
 }
 
 /// Avisa (sem falhar) quando o ntoskrnl.exe desta máquina cita outro PDB.

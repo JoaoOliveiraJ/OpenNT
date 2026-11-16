@@ -24,7 +24,8 @@
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS.
-//! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`
+//! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
+//! `--monitor-port=N` (o monitor HMP do QEMU num socket local, no `debug`)
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter.
 
@@ -73,7 +74,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --usb (controladora xHCI com teclado e tablet USB)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
-opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
+opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N --monitor-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
@@ -142,7 +143,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             shutdown_test: String::new(),
             usb: false,
         },
-        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None, usb: false },
+        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None, usb: false, monitor_port: None },
         positional: Vec::new(),
         keys: None,
         expect: Vec::new(),
@@ -193,6 +194,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
                 parsed.machine.usb = true;
             }
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
+            "--monitor-port" => parsed.machine.monitor_port = Some(required()?.parse().map_err(|_| "--monitor-port invalido")?),
             "--script" => parsed.script = Some(required()?),
             "--connect" => parsed.connect = Some(required()?),
             // O padrão do `debug`; explícito no comando que o opennt-dbg roda.
@@ -411,7 +413,8 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     let log = output.image.with_file_name("serial.log");
     if arguments.no_client {
         let qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, !arguments.headless)?;
-        return debug::serve(qemu, &address);
+        let monitor = machine.monitor_port.map(|port| format!("127.0.0.1:{port}"));
+        return debug::serve(qemu, &address, monitor.as_deref());
     }
     let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, true)?;
     let result = debug::interactive(&address, &root, &elf);

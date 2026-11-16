@@ -8,7 +8,9 @@
 //!   --launch --no-client`);
 //! - `app`: a janela (egui/eframe com painéis encaixáveis do `egui_dock`);
 //! - `disasm`: a desmontagem (iced-x86) com os símbolos do cliente;
-//! - `source`: as linhas de código pelo DWARF do `kernel.elf`;
+//! - `source`: as linhas de código e as variáveis locais pelo DWARF do
+//!   `kernel.elf`;
+//! - `scenario`: roteiros sem janela (o teste de fumaça e as capturas);
 //! - `offscreen`: a janela desenhada sem GPU (a captura de tela).
 
 pub mod app;
@@ -16,6 +18,7 @@ pub mod backend;
 pub mod disasm;
 pub mod launcher;
 pub mod offscreen;
+pub mod scenario;
 pub mod source;
 
 use eframe::egui;
@@ -26,18 +29,25 @@ pub fn workspace_root() -> std::path::PathBuf {
     manifest.ancestors().nth(2).map(std::path::Path::to_path_buf).unwrap_or_else(|| manifest.to_path_buf())
 }
 
-/// O visual da janela (o mesmo na tela e na captura): tema escuro e as
-/// fontes um pouco maiores que as do egui.
+/// O visual da janela (o mesmo na tela e na captura): tema escuro, fontes
+/// um pouco maiores que as do egui e espaçamento uniforme.
 pub fn configure(context: &egui::Context) {
-    context.set_theme(egui::Theme::Dark);
+    apply_theme(context, true);
     context.all_styles_mut(|style| {
         for (text_style, font) in style.text_styles.iter_mut() {
             font.size = match text_style {
                 egui::TextStyle::Monospace => 13.0,
                 egui::TextStyle::Heading => 17.0,
-                egui::TextStyle::Small => 10.0,
+                egui::TextStyle::Small => 10.5,
                 _ => 13.5,
             };
         }
+        style.spacing.item_spacing = egui::vec2(8.0, 3.0);
+        style.spacing.button_padding = egui::vec2(6.0, 2.0);
     });
+}
+
+/// O tema escuro ou o claro.
+pub fn apply_theme(context: &egui::Context, dark: bool) {
+    context.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
 }

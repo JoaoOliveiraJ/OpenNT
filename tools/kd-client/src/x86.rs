@@ -59,6 +59,32 @@ pub fn call_length(code: &[u8]) -> Option<usize> {
     }
 }
 
+/// O que a instrução faz com o fluxo: `call` (com o tamanho), `ret` ou
+/// outra.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Call(usize),
+    Return,
+    Other,
+}
+
+pub fn flow(code: &[u8]) -> Flow {
+    if let Some(length) = call_length(code) {
+        return Flow::Call(length);
+    }
+    let mut index = 0;
+    while index < code.len() && index < 14 && is_legacy_prefix(code[index]) {
+        index += 1;
+    }
+    if code.get(index).is_some_and(|byte| byte & 0xF0 == 0x40) {
+        index += 1;
+    }
+    match code.get(index) {
+        Some(0xC3 | 0xC2 | 0xCB | 0xCA) => Flow::Return,
+        _ => Flow::Other,
+    }
+}
+
 /// Onde está o endereço de retorno da função quando o RIP aponta para
 /// `code`: no topo da pilha antes do `push rbp` e no `ret`, logo acima dele
 /// entre o `push rbp` e o `mov rbp, rsp`; `None` quando o quadro já está
@@ -105,5 +131,14 @@ mod tests {
         assert_eq!(prologue_return_slot(&[0x48, 0x89, 0xE5], 0x1000), Some(0x1008));
         assert_eq!(prologue_return_slot(&[0xC3], 0x1000), Some(0x1000));
         assert_eq!(prologue_return_slot(&[0x48, 0x83, 0xEC, 0x20], 0x1000), None);
+    }
+
+    #[test]
+    fn classifies_flow() {
+        assert_eq!(flow(&[0xE8, 0, 0, 0, 0]), Flow::Call(5));
+        assert_eq!(flow(&[0xC3]), Flow::Return);
+        assert_eq!(flow(&[0xF3, 0xC3]), Flow::Return);
+        assert_eq!(flow(&[0xC2, 0x08, 0x00]), Flow::Return);
+        assert_eq!(flow(&[0x48, 0x89, 0xE5]), Flow::Other);
     }
 }
