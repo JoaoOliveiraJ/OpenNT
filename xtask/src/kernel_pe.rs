@@ -6,7 +6,9 @@
 //! `ntoskrnl.exe`: os slots de função da ABI (na ordem dos grupos) apontam
 //! para os trampolins MS-ABI de dez bytes ou para o corpo x64 próprio dos
 //! exports nativos, seguidos dos exports de dados. Ordinal N = slot N-1, como
-//! no `ntoskrnl.lib` dos drivers.
+//! no `ntoskrnl.lib` dos drivers. A `.rsrc` leva a tabela de mensagens do
+//! ntoskrnl.exe da máquina (os nomes dos códigos de bugcheck), que o kernel
+//! acha pelo próprio diretório de recursos, como o KiBugCodeMessages.
 
 use crate::elf::{Elf, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS};
 
@@ -66,7 +68,29 @@ fn put64(image: &mut [u8], at: usize, value: u64) {
     image[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub fn build_kernel_pe(elf_bytes: &[u8]) -> Result<Vec<u8>, String> {
+/// A seção de recursos: um único recurso [RT_MESSAGETABLE, 1, 1033] com os
+/// bytes de `message_table` (a MESSAGE_RESOURCE_DATA). Diretórios de 16 bytes
+/// com uma entrada de 8, a entrada de dados de 16 e os dados alinhados a 4.
+fn resource_section(rva: u64, message_table: &[u8]) -> Vec<u8> {
+    const DIRECTORY: usize = 16 + 8;
+    let data_entry = 3 * DIRECTORY;
+    let data = data_entry + 16;
+    let mut bytes = vec![0u8; data + message_table.len()];
+    for (level, (identifier, target)) in [(11u32, DIRECTORY as u32 | 0x8000_0000), (1, 2 * DIRECTORY as u32 | 0x8000_0000), (1033, data_entry as u32)].into_iter().enumerate() {
+        let at = level * DIRECTORY;
+        put16(&mut bytes, at + 14, 1);
+        put32(&mut bytes, at + 16, identifier);
+        put32(&mut bytes, at + 20, target);
+    }
+    put32(&mut bytes, data_entry, (rva + data as u64) as u32);
+    put32(&mut bytes, data_entry + 4, message_table.len() as u32);
+    bytes[data..].copy_from_slice(message_table);
+    bytes
+}
+
+/// `message_table`: a tabela de mensagens do ntoskrnl.exe da máquina (os
+/// nomes dos códigos de bugcheck), publicada no diretório de recursos.
+pub fn build_kernel_pe(elf_bytes: &[u8], message_table: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let linked = Elf::parse(elf_bytes)?;
 
     let mut allocated: Vec<_> = linked
@@ -206,7 +230,18 @@ pub fn build_kernel_pe(elf_bytes: &[u8]) -> Result<Vec<u8>, String> {
         characteristics: 0x4000_0040,
         data: &[],
     });
-    let owned_data: Vec<(u64, Vec<u8>)> = vec![(kdata_rva, data), (export_rva, export_data)];
+    let mut owned_data: Vec<(u64, Vec<u8>)> = vec![(kdata_rva, data), (export_rva, export_data)];
+    // ---- .rsrc: a tabela de mensagens (KiBugCodeMessages) ------------------
+    let mut resource_directory = (0u64, 0u64);
+    if let Some(table) = message_table {
+        let resource_rva = top;
+        let bytes = resource_section(resource_rva, table);
+        resource_directory = (resource_rva, bytes.len() as u64);
+        top += align(bytes.len() as u64);
+        check(top <= MAX, "recursos excedem a memoria reservada")?;
+        sections.push(PeSection { name: ".rsrc".into(), rva: resource_rva, size: bytes.len() as u64, raw_size: align(bytes.len() as u64), characteristics: 0x4000_0040, data: &[] });
+        owned_data.push((resource_rva, bytes));
+    }
 
     let executable = |address: u64| {
         sections.iter().any(|section| {
@@ -271,6 +306,8 @@ pub fn build_kernel_pe(elf_bytes: &[u8]) -> Result<Vec<u8>, String> {
     put32(&mut image, optional + 108, 16);
     put32(&mut image, optional + 112, export_rva as u32);
     put32(&mut image, optional + 116, export_size as u32);
+    put32(&mut image, optional + 128, resource_directory.0 as u32);
+    put32(&mut image, optional + 132, resource_directory.1 as u32);
 
     for (index, section) in sections.iter().enumerate() {
         let at = optional + 240 + index * 40;

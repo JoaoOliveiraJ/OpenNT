@@ -4,7 +4,10 @@
 //! O hal.dll, as pilhas de teclado/mouse e de armazenamento e as bibliotecas
 //! de export que elas importam (wmilib.sys e WppRecorder.sys) entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em
-//! memória). O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
+//! memória), com o MUI da biblioteca de recursos de boot (bootres.dll.mui,
+//! os textos da tela de bugcheck no idioma de boot da instalação). A tabela
+//! de mensagens do ntoskrnl.exe (os nomes dos códigos de bugcheck) vai para
+//! a seção de recursos do PE do kernel. O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
 //! e a lista de revogação), os file systems de pipes e mailslots (npfs.sys e
 //! msfs.sys), o runtime do KMDF com um cliente (WdfLdr.sys, Wdf01000.sys,
 //! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, a
@@ -256,6 +259,69 @@ fn up_to_date(source: &Path, copy: &Path) -> bool {
 /// Sufixo das cópias em andamento (`<nome>.parcial-<pid>`).
 const PARTIAL: &str = ".parcial-";
 
+/// O MUI da biblioteca de recursos de boot (os textos da tela de bugcheck,
+/// que o carregador entrega ao kernel): o do idioma de boot desta
+/// instalação, a pasta de `Boot\Resources` que tem o arquivo.
+fn boot_resources_mui(windows: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = fs::read_dir(windows.join("Boot/Resources"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join("bootres.dll.mui"))
+        .filter(|path| path.is_file())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?))
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+/// Os bytes do recurso [tipo, nome, primeiro idioma] de um PE em arquivo
+/// (RVAs convertidas pela tabela de seções).
+fn pe_resource(bytes: &[u8], resource_type: u32, name: u32) -> Option<Vec<u8>> {
+    let pe = u32_at(bytes, 0x3C)? as usize;
+    let sections = u16_at(bytes, pe + 6)? as usize;
+    let optional = pe + 24;
+    let table = optional + u16_at(bytes, pe + 20)? as usize;
+    let to_offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|index| {
+            let at = table + index * 40;
+            let (size, address, raw) = (u32_at(bytes, at + 8)?, u32_at(bytes, at + 12)?, u32_at(bytes, at + 20)?);
+            (rva >= address && rva < address + size).then(|| (rva - address + raw) as usize)
+        })
+    };
+    // O diretório de recursos é o terceiro: em +96 + 16 no PE32 e em
+    // +112 + 16 no PE32+.
+    let directories = if u16_at(bytes, optional)? == 0x10B { optional + 96 } else { optional + 112 };
+    let root = to_offset(u32_at(bytes, directories + 16)?)?;
+    let child = |directory: usize, identifier: Option<u32>| -> Option<u32> {
+        let count = u16_at(bytes, directory + 12)? as usize + u16_at(bytes, directory + 14)? as usize;
+        (0..count).find_map(|index| {
+            let entry = directory + 16 + index * 8;
+            let (id, target) = (u32_at(bytes, entry)?, u32_at(bytes, entry + 4)?);
+            (identifier.is_none_or(|wanted| wanted == id)).then_some(target)
+        })
+    };
+    let names = root + (child(root, Some(resource_type))? & 0x7FFF_FFFF) as usize;
+    let languages = root + (child(names, Some(name))? & 0x7FFF_FFFF) as usize;
+    let data = root + child(languages, None)? as usize;
+    let start = to_offset(u32_at(bytes, data)?)?;
+    Some(bytes.get(start..start + u32_at(bytes, data + 4)? as usize)?.to_vec())
+}
+
+/// A tabela de mensagens do ntoskrnl.exe desta máquina (RT_MESSAGETABLE 1,
+/// com os nomes dos códigos de bugcheck que o KeGetBugMessageText devolve),
+/// para a seção de recursos do PE do kernel.
+pub fn kernel_message_table() -> Option<Vec<u8>> {
+    let bytes = fs::read(windows_directory().join("System32/ntoskrnl.exe")).ok()?;
+    pe_resource(&bytes, 11, 1)
+}
+
 /// Copia as imagens do bundle para `output`; as ausentes ficam de fora com
 /// aviso (o kernel registra a ausência ao carregá-las).
 ///
@@ -265,8 +331,11 @@ const PARTIAL: &str = ".parcial-";
 pub fn stage(output: &Path) -> Result<usize, String> {
     let windows = windows_directory();
     fs::create_dir_all(output).map_err(|error| format!("{}: {error}", output.display()))?;
+    let mut sources: Vec<PathBuf> = BUNDLED.iter().map(|relative| windows.join(relative)).collect();
+    // Os textos da tela de bugcheck, no idioma de boot da instalação.
+    sources.extend(boot_resources_mui(&windows));
     // Remove cópias de um build anterior que não pertencem mais à lista.
-    let names: Vec<&std::ffi::OsStr> = BUNDLED.iter().filter_map(|relative| Path::new(relative).file_name()).collect();
+    let names: Vec<&std::ffi::OsStr> = sources.iter().filter_map(|source| source.file_name()).collect();
     if let Ok(entries) = fs::read_dir(output) {
         for entry in entries.filter_map(|entry| entry.ok()) {
             let partial = entry.file_name().to_string_lossy().contains(PARTIAL);
@@ -276,21 +345,20 @@ pub fn stage(output: &Path) -> Result<usize, String> {
         }
     }
     let mut copied = 0;
-    for relative in BUNDLED {
-        let source = windows.join(relative);
-        let name = Path::new(relative).file_name().unwrap_or_default();
+    for source in &sources {
+        let name = source.file_name().unwrap_or_default();
         let copy = output.join(name);
         if !source.exists() {
             println!("AVISO: {} ausente no Windows desta maquina", source.display());
             let _ = fs::remove_file(&copy);
             continue;
         }
-        if !up_to_date(&source, &copy) {
+        if !up_to_date(source, &copy) {
             // A cópia nasce com outro nome e troca de lugar inteira: outro
             // build que use a mesma pasta nunca embute um arquivo pela metade.
             let partial = output.join(format!("{}{PARTIAL}{}", name.to_string_lossy(), std::process::id()));
-            fs::copy(&source, &partial).map_err(|error| format!("{}: {error}", source.display()))?;
-            let modified = fs::metadata(&source).and_then(|metadata| metadata.modified());
+            fs::copy(source, &partial).map_err(|error| format!("{}: {error}", source.display()))?;
+            let modified = fs::metadata(source).and_then(|metadata| metadata.modified());
             if let Ok(modified) = modified {
                 fs::File::options()
                     .write(true)
@@ -301,14 +369,14 @@ pub fn stage(output: &Path) -> Result<usize, String> {
             if let Err(error) = fs::rename(&partial, &copy) {
                 let _ = fs::remove_file(&partial);
                 // Outro build pôs a mesma cópia no lugar antes.
-                if !up_to_date(&source, &copy) {
+                if !up_to_date(source, &copy) {
                     return Err(format!("{}: {error}", copy.display()));
                 }
             }
         }
         copied += 1;
     }
-    println!("binarios do Windows no bundle: {copied} de {}", BUNDLED.len());
+    println!("binarios do Windows no bundle: {copied} de {}", sources.len());
     Ok(copied)
 }
 

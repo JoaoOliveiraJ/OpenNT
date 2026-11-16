@@ -287,7 +287,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // ---- kernel: ELF -> PE32+ -------------------------------------------------
     let elf = fs::read(&kernel_elf).map_err(|error| format!("{}: {error}", kernel_elf.display()))?;
     link_or_copy(&kernel_elf, &build_dir.join("kernel.elf"))?;
-    let mut kernel = kernel_pe::build_kernel_pe(&elf)?;
+    let mut kernel = kernel_pe::build_kernel_pe(&elf, crate::windows_binaries::kernel_message_table().as_deref())?;
     fs::write(build_dir.join("kernel.pe"), &kernel).map_err(|error| error.to_string())?;
     // O volume leva o PE exatamente como foi gerado (sem o preenchimento).
     let kernel_pe = kernel.clone();
