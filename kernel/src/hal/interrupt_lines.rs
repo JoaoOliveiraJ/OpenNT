@@ -10,7 +10,8 @@
 //! registrador de versão dele declara (MaxRedirectionEntry + 1).
 //!
 //! O OpenNT entrega as interrupções de dispositivo pelo 8259 (vetor
-//! `0x20 + IRQ`), mas o registro de linhas por GSI é o que a MADT descreve,
+//! `0x20 + IRQ`, ligado ao vetor que o árbitro de IRQ atribuiu à GSI; veja
+//! o fim do arquivo), mas o registro de linhas por GSI é o que a MADT descreve,
 //! como o que a HAL do NT monta; é dele que o acpi.sys tira a validade de
 //! uma GSI (HalpInterruptIsGsiValid) e a versão de um IOAPIC
 //! (HalpInterruptGetApicVersion), pela tabela de energia da HAL.

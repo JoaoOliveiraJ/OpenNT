@@ -34,9 +34,10 @@
 //! APIC e sem controladores secundários, de 0xCD menos as entradas da tabela
 //! de remapeamento por processador (150) até 0xCC. O acpi.sys guarda a lista
 //! bruta do START como os vetores da raiz (AcpiIrqGetRootResourceList) e
-//! reserva para os processadores os que ficam fora dela. A entrega real das
-//! interrupções de dispositivo continua pelo 8259 no vetor da linha
-//! (`0x20 + IRQ`); estes vetores só alimentam a contabilidade do acpi.sys.
+//! reserva para os processadores os que ficam fora dela; o árbitro de IRQ
+//! dele atribui esses vetores às GSIs. A HAL entrega cada linha pelo 8259 no
+//! vetor fixo dela (`0x20 + IRQ`) e liga o vetor atribuído à linha que o
+//! alimenta (`hal::interrupt_lines`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
