@@ -474,8 +474,20 @@ const SMSS_PATH_NOTIFICATIONS: [(&str, &str); 48] = [
     )),
 ];
 
-pub const DEFINITIONS: [(&str, &str); 52] = {
-    let mut definitions = [("", ""); 52];
+/// WNF_PO_SCENARIO_CHANGE — 72 bytes: o nome bem conhecido que a
+/// SleepStudyHelper.sys assina no SleepstudyHelper_Initialize (o hidclass.sys
+/// não registra um minidriver sem ela).
+const PO_SCENARIO_CHANGE: (&str, &str) = (
+    "41C6013DA3BC0875",
+    concat!(
+        "0100048000000000000000000000000014000000020030000200000000001400",
+        "0300000001010000000000051200000000001400010000000101000000000001",
+        "0000000018000000",
+    ),
+);
+
+pub const DEFINITIONS: [(&str, &str); 53] = {
+    let mut definitions = [("", ""); 53];
     definitions[0] = FEATURE_CONFIGURATION_CHANGED;
     definitions[1] = KERNELBASE_NOTIFICATION;
     definitions[2] = KERNELBASE_SECOND_NOTIFICATION;
@@ -485,6 +497,7 @@ pub const DEFINITIONS: [(&str, &str); 52] = {
         definitions[4 + index] = SMSS_PATH_NOTIFICATIONS[index];
         index += 1;
     }
+    definitions[4 + SMSS_PATH_NOTIFICATIONS.len()] = PO_SCENARIO_CHANGE;
     definitions
 };
 

@@ -35,7 +35,11 @@
 //! compilado (Parameters\Wdf) e o serviço da biblioteca da versão maior 1
 //! (Control\Wdf\Kmdf\KmdfLibrary\Versions\1), que a WdfLdr procura antes do
 //! nome padrão. O Parameters do Wdf01000 o próprio runtime grava no
-//! DriverEntry; a WdfLdr e a SleepStudyHelper não têm chave.
+//! DriverEntry; a WdfLdr e a SleepStudyHelper não têm chave. A extensão de
+//! classe UCX dos drivers de controladora USB (Ucx01000, Start 3 e Group
+//! "Boot Bus Extender" na instalação, com BootFlags 16) entra igual, com a
+//! chave da versão 1.1 da classe Ucx (Control\Wdf\Kmdf\Ucx\Versions\1\1),
+//! pela qual o WdfVersionBindClass do usbxhci.sys acha o serviço.
 //!
 //! Null, Beep e Fs_Rec não têm ImagePath na instalação
 //! (o I/O Manager usa \SystemRoot\System32\Drivers\<serviço>.sys), e o
@@ -141,6 +145,7 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "Msfs", display_name: None, service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: None, start: SERVICE_SYSTEM_START, smss_start: None, error_control: 1, group: "File system", tag: None, dwords: &[] },
     InboxDriver { name: "AFD", display_name: Some("@%systemroot%\\system32\\drivers\\afd.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afd.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[("BootFlags", 1)] },
     InboxDriver { name: "Wdf01000", display_name: Some("@%SystemRoot%\\system32\\drivers\\Wdf01000.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\Wdf01000.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "WdfLoadGroup", tag: None, dwords: &[] },
+    InboxDriver { name: "Ucx01000", display_name: Some("USB Host Support Library"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\ucx01000.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Boot Bus Extender", tag: None, dwords: &[("BootFlags", 16)] },
     InboxDriver { name: "msisadrv", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\msisadrv.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Boot Bus Extender", tag: Some(2), dwords: &[] },
     InboxDriver {
         name: "BasicDisplay",
@@ -173,6 +178,9 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMajorVersion", Installed::Dword(1)),
     ("Services\\msisadrv\\Parameters\\Wdf", "WdfMinorVersion", Installed::Dword(0xF)),
     ("Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions\\1", "Service", Installed::String("Wdf01000")),
+    ("Control\\Wdf\\Kmdf\\Ucx\\Versions\\1\\1", "Service", Installed::String("ucx01000")),
+    ("Services\\Ucx01000\\Parameters\\Wdf", "WdfMajorVersion", Installed::Dword(1)),
+    ("Services\\Ucx01000\\Parameters\\Wdf", "WdfMinorVersion", Installed::Dword(0xF)),
     ("Services\\CLFS\\Parameters", "EventLogLevel", Installed::Dword(2)),
     ("Services\\CLFS\\Parameters", "FlushThreshold", Installed::Dword(0x9C40)),
     ("Services\\CLFS\\Parameters", "MasterFilePath", Installed::String("\\SystemRoot\\System32\\config")),

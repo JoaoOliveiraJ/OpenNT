@@ -1,7 +1,7 @@
 //! Chaves de serviço dos drivers .sys que o boot instala (como
 //! `\System\CurrentControlSet\Services` no NT): a pilha de teclado e mouse
 //! sob demanda, a de armazenamento no boot (port -> class -> Mount Manager)
-//! e o vgk e o watchdog sob demanda; os parâmetros do i8042prt e as classes
+//! e o vgk e o watchdog sob demanda; os parâmetros do i8042prt e do kbdclass e as classes
 //! de teclado e mouse com os filtros superiores. Os file systems de pipes
 //! nomeados e mailslots entram em todo boot com as chaves da instalação
 //! (`inbox_drivers.rs`).
@@ -55,6 +55,15 @@ const I8042PRT_PARAMETERS: &[(&str, u32)] = &[
     ("CrashOnCtrlScroll", 1),
 ];
 
+/// `Services\kbdclass\Parameters` como uma instalação do Windows a deixa,
+/// lida no DriverEntry do kbdclass. Com ConnectMultiplePorts = 0 cada porta
+/// de teclado (o i8042prt, o kbdhid de cada teclado HID) recebe o próprio FDO
+/// com nome, `\Device\KeyboardClassN`; sem a chave o kbdclass cai no modo
+/// "grand master", com um só dispositivo nomeado e os FDOs das portas sem
+/// nome.
+const KBDCLASS_PARAMETERS: &[(&str, u32)] = &[("ConnectMultiplePorts", 0), ("KeyboardDataQueueSize", 100), ("MaximumPortsServiced", 3), ("SendOutputToAllPorts", 1)];
+const KBDCLASS_DEVICE_BASE_NAME: &str = "KeyboardClass";
+
 /// Classes de dispositivo com os UpperFilters que o PnP anexa sobre o FDO.
 const DEVICE_CLASSES: &[(&str, &[&str])] = &[("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"]), ("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])];
 
@@ -80,6 +89,12 @@ pub fn parameter_keys() -> Vec<SeedKey> {
         parameters.dword(name, value);
     }
     keys.push(parameters);
+    let mut kbdclass = SeedKey::new(&format!("{SERVICES}\\kbdclass\\Parameters"));
+    for &(name, value) in KBDCLASS_PARAMETERS {
+        kbdclass.dword(name, value);
+    }
+    kbdclass.text("KeyboardDeviceBaseName", REG_SZ, KBDCLASS_DEVICE_BASE_NAME);
+    keys.push(kbdclass);
     for &(class, filters) in DEVICE_CLASSES {
         let mut key = SeedKey::new(&format!("Control\\Class\\{class}"));
         key.strings("UpperFilters", filters);
