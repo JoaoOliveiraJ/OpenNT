@@ -1739,6 +1739,8 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     let returned = state::stack_arg(rsp, 5);
     let need = match class {
         0 => 48,
+        // ThreadTimes: o KERNEL_USER_TIMES.
+        1 => 32,
         9 => 8,
         17 => 1,
         12 => 4,
@@ -1769,6 +1771,19 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
                 information.affinity_mask.probe_set((1u64 << smp::online_cpu_count()) - 1)?;
                 information.priority.probe_set(thread_priority::query_priority(pointer) as i32)?;
                 information.base_priority.probe_set(thread_priority::query_base_priority(pointer) as i32)?;
+            }
+            // ThreadTimes: CreateTime e ExitTime da ETHREAD (ExitTime zero
+            // enquanto a thread vive) e os tempos de kernel e de usuário em
+            // 100 ns.
+            1 => {
+                // SAFETY: a ETHREAD retida pelo handle resolvido.
+                let object = unsafe { crate::ntos::inc::types::Ethread::at(pointer) };
+                let quad = |time: &crate::ntos::inc::types::LargeInteger| (time.high_part.get() as u32 as u64) << 32 | time.low_part.get() as u64;
+                let (kernel, user) = process::thread_record(pointer).map_or((0, 0), |record| (record.kernel_time, record.user_time));
+                let times = [quad(&object.create_time), if dead { quad(&object.exit_time) } else { 0 }, kernel, user];
+                for (index, value) in times.iter().enumerate() {
+                    guest::try_write::<u64>(out + index as u64 * 8, *value)?;
+                }
             }
             // ThreadQuerySetWin32StartAddress (PVOID).
             9 => guest::try_write::<u64>(out, start)?,
@@ -1893,6 +1908,50 @@ fn set_priority_class(handle: u64, class: u64, input: u64, length: u64) -> Resul
     Ok(0)
 }
 
+/// ThreadImpersonationToken.
+const THREAD_IMPERSONATION_TOKEN: u64 = 5;
+/// THREAD_SET_THREAD_TOKEN e TOKEN_IMPERSONATE.
+const THREAD_SET_THREAD_TOKEN: u32 = 0x80;
+const TOKEN_IMPERSONATE: u32 = 4;
+
+/// ThreadImpersonationToken: o HANDLE do token (8 bytes, senão
+/// STATUS_INFO_LENGTH_MISMATCH), a thread com THREAD_SET_THREAD_TOKEN e o
+/// PsAssignImpersonationToken: NULL encerra a impersonação (o RevertToSelf);
+/// senão o token, com TOKEN_IMPERSONATE, precisa ser de impersonação
+/// (STATUS_BAD_TOKEN_TYPE) e a thread passa a impersoná-lo no nível dele
+/// (PsImpersonateClient, sem CopyOnOpen nem EffectiveOnly).
+fn set_impersonation_token(handle: u64, input: u64, length: u64) -> Result<u32, KernelError> {
+    if length != 8 {
+        return Ok(0xC000_0004);
+    }
+    if !probe_user_read(input, 8) {
+        return Ok(0xC000_0005);
+    }
+    // HANDLE do token (sondado acima).
+    let token_handle = match guest::try_read::<u64>(input) {
+        Ok(value) => value,
+        Err(error) => return Ok(error.status),
+    };
+    let thread = match resolve(handle, THREAD_SET_THREAD_TOKEN) {
+        Ok(thread) => thread,
+        Err(status) => return Ok(status),
+    };
+    let pointer = thread.pointer();
+    if token_handle == 0 {
+        crate::ntos::ps::security::impersonate_client(pointer, 0, false, false, 2)?;
+        return Ok(0);
+    }
+    let token = match super::tokens::lookup(token_handle, TOKEN_IMPERSONATE) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    let Some((kind, level)) = crate::ntos::se::token::tokens::with(token, |record| (record.kind, record.impersonation_level)) else { return Ok(0xC000_0008) };
+    if kind != 2 {
+        return Ok(0xC000_00A8);
+    }
+    crate::ntos::ps::security::impersonate_client(pointer, token, false, false, level)
+}
+
 fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     // As classes 18 e 24 têm ordem própria (`ps/set_thread_information`) e
     // aceitam alterar uma ETHREAD retida.
@@ -1901,6 +1960,9 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
     }
     if matches!(class, THREAD_PRIORITY | THREAD_BASE_PRIORITY) {
         return set_priority_class(handle, class, input, length);
+    }
+    if class == THREAD_IMPERSONATION_TOKEN {
+        return set_impersonation_token(handle, input, length);
     }
     let thread = match resolve(handle, 0x20) {
         Ok(thread) => thread,
