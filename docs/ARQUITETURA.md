@@ -1358,15 +1358,14 @@ do IDT por processador, e grava ele mesmo os dados de conexão pelo
 IoSetDevicePropertyData), recusa as duas listas do pci.sys: a do MSI-X com
 STATUS_UNSUCCESSFUL e a da linha com STATUS_INVALID_PARAMETER, e o nó fica
 com CM_PROB_NORMAL_CONFLICT; o teste `usb` usa `--pnp-root=internal`.
-O IRP_MN_FILTER_RESOURCE_REQUIREMENTS com lista começa com STATUS_SUCCESS,
-como no IopFilterResourceRequirementsCall: o KMDF do usbxhci.sys troca a
-lista (libera a recebida e devolve outra em Information) e completa com o
-status que veio de baixo; com STATUS_NOT_SUPPORTED o PnP ficava com a lista
-liberada. As
-portas são enumeradas depois do START: o IoInvalidateDeviceRelations do hub
-enfileira a reenumeração e a ação (o PipRequestDeviceAction), que uma
-thread de sistema das ações processa (`tree.rs`, um processamento por vez;
-antes do processo System, um work item). O teclado USB passa a ser o da
+O KMDF do usbxhci.sys troca a lista no IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+(libera a recebida e devolve outra em Information), que por isso começa com
+STATUS_SUCCESS, como no IopFilterResourceRequirementsCall. As portas são
+enumeradas depois do START: o IoInvalidateDeviceRelations do hub enfileira a
+reenumeração e o PnpDeviceActionWorker (`tree.rs`), hospedado numa thread de
+sistema (antes do processo System, num work item da fila atrasada); a pilha
+USB também drena a fila enquanto espera os marcos (`tree::process_pending`),
+um processamento por vez pela mesma marca do worker. O teclado USB passa a ser o da
 máquina: o QEMU entrega a ele as teclas e o serviço de teclado lê do
 kbdclass sobre o kbdhid. A hive leva o `Services\kbdclass\Parameters` de
 uma instalação (ConnectMultiplePorts = 0, KeyboardDeviceBaseName =
