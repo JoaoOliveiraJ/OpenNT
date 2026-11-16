@@ -38,6 +38,7 @@ pub mod user_cm_services;
 pub mod x86_bios;
 pub mod registry_model;
 pub mod support_exports;
+pub mod shutdown;
 pub mod kernel_debugger;
 pub mod rtl_crt_exports;
 pub mod security_alpc_exports;

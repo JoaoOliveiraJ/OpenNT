@@ -6,6 +6,7 @@
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //!                        [--expect-stop]
+//!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
@@ -17,7 +18,7 @@
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`, `--kd=com2` (o depurador do
-//! kernel na COM2). Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão
+//! kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento). Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão
 //! no bloco de opções de carga da imagem de boot (`build.rs`), e o `--initial-process=smss`
 //! também troca o volume NTFS.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`
@@ -67,6 +68,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi
                    --kd=com2 (depurador do kernel na COM2)
+                   --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
@@ -75,6 +77,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    deste teste numa copia do os.img em --build-dir, onde tambem ficam os logs)
                    --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
+                   --expect-poweroff (no fim o QEMU sai sozinho pelo desligamento ACPI)
+                   --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
+                   --allow-reboot (o reinicio do convidado reinicia a maquina)
                    --expect-stop (o *** STOP do bugcheck faz parte do teste, nao e falha)
                    no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}";
 
@@ -105,6 +110,10 @@ struct Arguments {
     capture: Option<PathBuf>,
     /// `--expect-stop`: o STOP do bugcheck faz parte do teste.
     expect_stop: bool,
+    /// `--expect-poweroff`, `--power-cycles=N` e `--allow-reboot`.
+    expect_poweroff: bool,
+    power_cycles: u32,
+    allow_reboot: bool,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -126,6 +135,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             windows_dir: None,
             pnp_root: String::new(),
             kd: String::new(),
+            shutdown_test: String::new(),
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None },
         positional: Vec::new(),
@@ -142,6 +152,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         headless: false,
         capture: None,
         expect_stop: false,
+        expect_poweroff: false,
+        power_cycles: 0,
+        allow_reboot: false,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -166,6 +179,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--windows-dir" => parsed.build.windows_dir = Some(PathBuf::from(required()?)),
             "--pnp-root" => parsed.build.pnp_root = required()?,
             "--kd" => parsed.build.kd = required()?,
+            "--shutdown-test" => parsed.build.shutdown_test = required()?,
+            "--expect-poweroff" => parsed.expect_poweroff = true,
+            "--power-cycles" => parsed.power_cycles = required()?.parse().map_err(|_| "--power-cycles invalido")?,
+            "--allow-reboot" => parsed.allow_reboot = true,
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--script" => parsed.script = Some(required()?),
             "--connect" => parsed.connect = Some(required()?),
@@ -196,6 +213,15 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi") {
         return Err(format!("--pnp-root aceita apenas acpi ({} recebido)", parsed.build.pnp_root));
+    }
+    if !matches!(parsed.build.shutdown_test.as_str(), "" | "poweroff" | "reboot") {
+        return Err(format!("--shutdown-test aceita poweroff ou reboot ({} recebido)", parsed.build.shutdown_test));
+    }
+    if (parsed.expect_poweroff || parsed.power_cycles > 0 || parsed.allow_reboot) && parsed.command != "test-boot" {
+        return Err("--expect-poweroff, --power-cycles e --allow-reboot sao opcoes do test-boot".into());
+    }
+    if parsed.expect_poweroff && parsed.hold_ms > 0 {
+        return Err("--expect-poweroff e --hold se excluem (a maquina desliga)".into());
     }
     if !matches!(parsed.build.kd.as_str(), "" | "com2" | "com3" | "com4") {
         return Err(format!("--kd aceita com2, com3 ou com4 ({} recebido; a COM1 e o log do kernel)", parsed.build.kd));
@@ -306,6 +332,9 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     hold: Duration::from_millis(arguments.hold_ms),
                     capture: arguments.capture.map(|path| if path.is_absolute() { path } else { build::workspace_root().join(path) }),
                     expect_stop: arguments.expect_stop,
+                    power_cycles: arguments.power_cycles,
+                    allow_reboot: arguments.allow_reboot,
+                    expect_poweroff: arguments.expect_poweroff,
                 },
                 &log,
                 session,

@@ -12263,6 +12263,9 @@ fn io_driver_notification_exports(assert: Assert) {
         call_export("IoRegisterLastChanceShutdownNotification", &[device_address]) == Some(0) && device.flags.get() & 0x800 != 0 && shutdown::last_chance_devices().first() == Some(&device_address),
         "io-driver-notification: dispositivo na cabeca da fila de ultima chance",
     );
+    // O dispositivo sintético não fica na fila do desligamento.
+    let _ = call_export("IoUnregisterShutdownNotification", &[device_address]);
+    assert(device.flags.get() & 0x800 == 0 && !shutdown::last_chance_devices().contains(&device_address), "io-driver-notification: IoUnregisterShutdownNotification tira o dispositivo da fila de ultima chance");
 }
 
 
@@ -14010,6 +14013,9 @@ fn po_shutdown_exports(assert: Assert) {
     };
     let real = crate::hal::acpi::get_table("DSDT", 0, false).and_then(|table| firmware_return::s5_sleep_type(&table.bytes));
     assert(firmware_return::s5_sleep_type(&package(&[0x0A, 0x07])) == Some(7) && firmware_return::s5_sleep_type(&package(&[0x00])) == Some(0) && firmware_return::s5_sleep_type(&package(&[0x01])) == Some(1) && firmware_return::s5_sleep_type(b"_S5_\x11").is_none() && real.is_some(), "po-shutdown: SLP_TYPa do pacote \\_S5_ (BytePrefix, ZeroOp, OneOp) e o da DSDT do QEMU");
+    // As filas do I/O Manager, o S5 do HAL, o ShutdownTime, a política e o
+    // modo usuário (`test/shutdown.rs`).
+    super::shutdown::run(assert);
 }
 
 /// PoNotifyVSyncChange: o limite de latência do sistema segue o VSync.

@@ -102,6 +102,15 @@ pub fn initial_process() -> &'static str {
     value(name::INITIAL_PROCESS).unwrap_or("")
 }
 
+/// `SHUTDOWNTEST=poweroff|reboot` (`--shutdown-test`): depois do
+/// `--start-driver=ntfs`, o teste do desligamento (`ntos/test/shutdown.rs`)
+/// grava pelo ntfs.sys e no Registro e chama o NtShutdownSystem com essa
+/// ação; no boot seguinte confere o que sobreviveu e desliga (vazio = sem o
+/// teste).
+pub fn shutdown_test() -> &'static str {
+    value(name::SHUTDOWN_TEST).unwrap_or("")
+}
+
 /// O boot do processo inicial real (`--initial-process=smss`).
 pub fn smss_boot() -> bool {
     initial_process() == "smss"

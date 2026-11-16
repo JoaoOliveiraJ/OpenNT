@@ -162,6 +162,12 @@ pub fn kmain() -> ! {
         crate::ntos::test::boot_drivers::after_start(name);
     }
 
+    // `--shutdown-test`: grava pelo ntfs.sys e no Registro e desliga (ou
+    // confere o que o desligamento anterior deixou e desliga).
+    if !boot_config::shutdown_test().is_empty() {
+        crate::ntos::test::shutdown::run_boot_scenario();
+    }
+
     if boot_config::kernel_test_scope() != "none" {
         crate::ntos::test::self_test::run();
     }

@@ -67,6 +67,9 @@ pub struct BuildOptions {
     /// `--kd=com2`: o depurador do kernel nessa porta serial (vazio = sem
     /// depurador).
     pub kd: String,
+    /// `--shutdown-test=poweroff|reboot`: o teste do desligamento depois do
+    /// `--start-driver=ntfs` (vazio = sem o teste).
+    pub shutdown_test: String,
 }
 
 impl BuildOptions {
@@ -87,6 +90,7 @@ impl BuildOptions {
             (name::STORAGE, self.storage.as_str()),
             (name::DISPLAY, self.display.as_str()),
             (name::PNP_ROOT, self.pnp_root.as_str()),
+            (name::SHUTDOWN_TEST, self.shutdown_test.as_str()),
         ];
         let mut words: Vec<String> = Vec::new();
         if !debug.is_empty() {
@@ -133,6 +137,7 @@ impl BuildOptions {
             display: String::new(),
             pnp_root: String::new(),
             kd: String::new(),
+            shutdown_test: String::new(),
             ..self.clone()
         }
     }
@@ -351,6 +356,7 @@ mod tests {
             windows_dir: None,
             pnp_root: String::new(),
             kd: String::new(),
+            shutdown_test: String::new(),
         }
     }
 
@@ -368,10 +374,11 @@ mod tests {
         options.display = "basic".into();
         options.trace_driver_api = true;
         options.console_mirror = true;
+        options.shutdown_test = "reboot".into();
         let block = options.load_options_block().unwrap();
         assert_eq!(block.len(), load_options::BLOCK_SIZE);
         let text = load_options::text_of(&block).unwrap();
-        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic TRACEDRIVERAPI CONSOLEMIRROR");
+        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR");
         assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror"));
         assert_eq!(load_options::value(text, load_options::START_DRIVER), Some("NDIS,AFD"));
         assert_eq!(load_options::value(text, load_options::STORAGE), None);

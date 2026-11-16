@@ -1653,6 +1653,25 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (PopExecutePowerAction) as ações reais devolvem STATUS_NOT_SUPPORTED, e
   o PoShutdownBugCheck cai no bugcheck pedido. PoSetHiberRange só aceita
   um mapa fechado: o OpenNT não hiberna.
+- **Desligamento e reinício** (`po/shutdown.rs`, `io/shutdown.rs`,
+  `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
+  NtSetSystemPowerState das ações de desligamento, de modo kernel e de
+  usuário (SeShutdownPrivilege habilitado), seguem o PopGracefulShutdown do
+  19041: o PopShutdownEvent e as threads do PoRequestShutdownEvent,
+  ExShutdownSystem(0) (o ShutdownTime em Control\Windows),
+  IoShutdownSystem(0) (IRP_MJ_SHUTDOWN síncrono no topo da pilha de cada
+  IoRegisterShutdownNotification, da cabeça para a cauda), CmShutdownSystem
+  (as hives no disco), IoShutdownSystem(1) (os file systems das filas de
+  disco, CD-ROM e fita, sob o IopDatabaseResource que não é mais solto, e
+  a fila de última chance), CcWaitForCurrentLazyWriterActivity e o
+  PopShutdownSystem, que vai ao HalReturnToFirmware: S5 pelo PM1x_CNT com
+  o HalpShutdownContext do HaliAcpiMachineStateInit (sem o acpi.sys, do
+  `\_S5_` da DSDT) ou o reinício (CMOS 0x0F, 0x472, RESET_REG, 8042). A
+  política DontPowerOffAfterShutdown faz o ShutdownNoReboot parar sem
+  desligar. Os passos de componentes que o OpenNT não tem (Tm, Etw, Mm sem
+  paginação, os IRPs S5 aos dispositivos) ficam de fora. O shell tem
+  `shutdown` e `reboot`; o `--shutdown-test` cobre o caminho inteiro com o
+  ntfs.sys real (testes `shutdown` e `reboot`).
 - **Dependências entre dispositivos** (`io/dependency.rs`): o grafo das
   Pip* (nós 'PnpS' em DEVOBJ_EXTENSION.DependencyNode, arestas com os
   pedidos por dispositivo ou por nome de ligação, ids de ligação). Ficam de
@@ -2002,7 +2021,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     cada IRP_MJ_*, porque um file system pode chamar o MajorFunction do
     dispositivo alvo sem o IofCallDriver). O leitor NTFS do kernel continua dono do disco como D:,
     então as escritas do file system ficam numa sobreposição em memória por
-    página de 4 KB, que as leituras do volume aplicam; o disco não muda.
+    página de 4 KB, que as leituras do volume aplicam; o disco não muda
+    durante o boot. A sobreposição é o cache de escrita do dispositivo: na
+    fila de última chance do desligamento (depois do IRP_MJ_SHUTDOWN dos
+    file systems) o volume grava no disco só os setores que o file system
+    gravou e manda o FLUSH CACHE; dali em diante as escritas vão direto.
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois
@@ -2403,7 +2426,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   descarga em curso) e rearma se sobrou sujeira. O escritor fica retido 60
   s depois da montagem das hives (o atraso do boot do CmpCmdInit). O
   desligamento ordenado (`po/shutdown.rs`) chama o `lazy_flush::shutdown`,
-  o CmShutdownSystem: para o escritor e descarrega todas as hives.
+  o CmShutdownSystem: para o escritor e descarrega todas as hives, depois
+  do ShutdownTime que o ExShutdownSystem(0) grava.
 - **Hives de aplicativo e restaurações especiais** (`cm/hive_list.rs`):
   REG_APP_HIVE liga a hive em `\REGISTRY\A\{...}`, devolve o handle da
   raiz, reaproveita a hive já carregada do mesmo arquivo e a descarrega no
@@ -2454,7 +2478,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   a saída em `test-boot.log` e a serial em `serial.log`, e o volume NTFS da
   pasta de imagens entra com `snapshot=on` (as escritas do convidado ficam
   num arquivo temporário do QEMU), então as pistas o dividem e cada execução
-  começa dele intacto, como o `test-boot` sempre faz; uma execução que passa
+  começa dele intacto, como o `test-boot` sempre faz (o reinício do
+  convidado com `--allow-reboot` fica no mesmo QEMU e no mesmo snapshot; o
+  `--power-cycles`, que sobe outro QEMU depois do desligamento ACPI, usa uma
+  cópia gravável do volume na pasta da execução, apagada no fim); uma execução que passa
   do prazo do test-boot mais o `--hold` e 2 minutos é morta com o QEMU. Cada
   QEMU compromete ao subir toda a memória do convidado (uns 5 GB com
   `-m 4096`), e com o commit do host esgotado processos morrem sem mensagem

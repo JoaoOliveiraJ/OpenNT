@@ -356,6 +356,27 @@ marcador = "DRIVER_START_COMPLETED"
 comando = "cargo xtask test-boot DRIVER_START_COMPLETED 500000 --start-driver=ahcache,ws2ifsl,bowser,afunix --build-dir=build/drivers-software --smp=1 \"--expect=name=ahcache state=4 win32=0\" \"--expect=name=ws2ifsl state=4 win32=0\" \"--expect=name=bowser state=4 win32=0\" \"--expect=name=afunix state=4 win32=0\" \"--expect=[kbd] lendo teclas do driver real\" --hold=30000"
 descricao = "O gerenciador de serviços inicia, um depois do outro, quatro drivers da Microsoft que não precisam de hardware e cujos últimos imports do ntoskrnl eram exports novos: o cache de compatibilidade de aplicativos (ahcache.sys), o IFS do Winsock 2 (ws2ifsl.sys), o navegador de rede (bowser.sys, um driver de file system de rede) e os sockets AF_UNIX (afunix.sys, que carrega o NETIO.SYS como dependência de import). Cada um passa pela CI pelo catálogo que o cobre, sobe pela chave de serviço da instalação e o DriverEntry retorna sucesso (state=4). Depois a pilha PS/2 passa pela validação, o serviço de teclado lê do i8042prt.sys e o sistema segue 30 s sem falha na serial (--hold)."
 
+[[teste]]
+id = "shutdown"
+titulo = "Desligamento limpo pelo NtShutdownSystem"
+marcador = "SHUTDOWN_PERSISTED_OK"
+comando = "cargo xtask test-boot SHUTDOWN_PREPARED 900000 --start-driver=ntfs --shutdown-test=poweroff --build-dir=build/shutdown --smp=1 --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=POWER_OFF --expect=HELLO_KERNEL_OK --expect=SHUTDOWN_PERSISTED_OK --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=POWER_OFF --power-cycles=1 --expect-poweroff"
+descricao = "Com --start-driver=ntfs e --shutdown-test=poweroff, depois da montagem do volume pelo ntfs.sys real o kernel cria OPENNT-DESLIGAMENTO.TXT pelo ntfs.sys e grava um valor novo na hive SYSTEM (SHUTDOWN_PREPARED) e chama o NtShutdownSystem(ShutdownPowerOff). O desligamento ordenado segue o do Windows: o ShutdownTime em Control\\Windows, o IRP_MJ_SHUTDOWN aos dispositivos do IoRegisterShutdownNotification (o mountmgr.sys), as hives descarregadas no disco, o IRP_MJ_SHUTDOWN ao ntfs.sys pela fila de file systems (com o FltMgr anexado), que descarrega e fecha o volume, e o da fila de última chance, em que o volume grava no disco o que o file system escreveu (SHUTDOWN_NOTIFIED); o Cache Manager termina a passada do lazy writer (FLUSHED) e a HAL desliga a máquina pelo S5 da ACPI (POWER_OFF). O QEMU sai sozinho (o evento SHUTDOWN do QMP com o motivo guest-shutdown) e o test-boot o religa sobre o mesmo disco: no segundo boot o arquivo é lido pelo ntfs.sys e pelo leitor NTFS do kernel direto do disco, e o valor do Registro e o ShutdownTime voltam da hive do volume (SHUTDOWN_PERSISTED_OK); o sistema desliga de novo e o QEMU sai pelo desligamento ACPI."
+
+[[teste]]
+id = "reboot"
+titulo = "Reinício pelo NtShutdownSystem"
+marcador = "SHUTDOWN_PERSISTED_OK"
+comando = "cargo xtask test-boot SHUTDOWN_PREPARED 900000 --start-driver=ntfs --shutdown-test=reboot --build-dir=build/reboot --smp=1 --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=REBOOT --expect=HELLO_KERNEL_OK --expect=SHUTDOWN_PERSISTED_OK --expect=POWER_OFF --allow-reboot --expect-poweroff"
+descricao = "Como o teste shutdown, mas com o NtShutdownSystem(ShutdownReboot): depois do desligamento ordenado a HAL reinicia a máquina (o RESET_REG da FADT e o pulso do 8042, REBOOT) e o QEMU, sem -no-reboot, faz o segundo boot na mesma máquina; ele encontra o arquivo gravado pelo ntfs.sys e o valor do Registro (SHUTDOWN_PERSISTED_OK) e desliga a máquina pelo S5 da ACPI."
+
+[[teste]]
+id = "shell-shutdown"
+titulo = "Comando shutdown do shell"
+marcador = "desligando (ShutdownPowerOff)"
+comando = "cargo xtask test-boot KERNEL_RS_OK 240000 \"--keys=shutdown\\n\" \"--expect=desligando (ShutdownPowerOff)\" --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=POWER_OFF --expect-poweroff"
+descricao = "No boot comum, o shell recebe o comando shutdown pelo teclado, que chama o NtShutdownSystem(ShutdownPowerOff) de modo kernel: o desligamento ordenado avisa o mountmgr.sys pela fila do IoRegisterShutdownNotification (SHUTDOWN_NOTIFIED), descarrega as hives e o Cache Manager (FLUSHED) e a HAL desliga a máquina pelo S5 da ACPI (POWER_OFF); o QEMU sai sozinho, com o evento SHUTDOWN do QMP de motivo guest-shutdown."
+
 # ---- componentes e drivers ------------------------------------------------------
 
 [[componente]]
@@ -509,6 +530,17 @@ caminhos = ["kernel/src/ntos/cc"]
 testes = ["fase6", "ntfs"]
 fase = "8"
 notas = "51 das 69 rotinas Cc* do ntoskrnl: SHARED_CACHE_MAP e PRIVATE_CACHE_MAP nativos pendurados no SECTION_OBJECT_POINTERS, vistas de 256 KB lidas por IRPs de paginação à pilha do próprio arquivo, cópias, map/pin com BCBs, MDLs, flush, purge e as rotinas de LSN e log do NTFS. O lazy writer é o do NT: uma thread de sistema do Cc acordada pelo ScanTimer (CcFirstDelay, 3 s, e CcIdleDelay, 1 s, enquanto há trabalho) ou por uma passada rápida, que faz o CcWriteBehind de cada mapa sujo (AcquireForLazyWrite, escrita das páginas com o write-ahead do log, ReleaseFromLazyWrite) e apaga os mapas sem FILE_OBJECTs, soltando a referência do stream file. O último CcUninitializeCacheMap de um mapa sem PinAccess (e sem evento), sujo ou em escrita fica para ele (FALSE), e o CcWaitForCurrentLazyWriterActivity espera a passada. O ntfs.sys real monta, lê e grava por ele (teste ntfs); os autotestes usam um dispositivo sintético. O FsRtlCopyRead/CopyWrite e o MDL genérico do FsRtl já chegam a ele. Ainda falta o FsRtlAcquireFileExclusive em volta da remoção do mapa (o lazy writer do NT adquire o arquivo antes de apagá-lo)."
+
+[[componente]]
+nome = "Desligamento e reinício"
+categoria = "Núcleo do kernel"
+icone = "power"
+descricao = "O desligamento ordenado do NT: avisa drivers e file systems, grava o Registro e os volumes no disco e desliga ou reinicia a máquina pela ACPI."
+estado = "implementado"
+caminhos = ["kernel/src/ntos/po/shutdown.rs", "kernel/src/ntos/io/shutdown.rs", "kernel/src/ntos/ex/shutdown.rs", "kernel/src/hal/firmware_return.rs", "kernel/src/ntos/test/shutdown.rs"]
+testes = ["shutdown", "reboot", "shell-shutdown"]
+fase = "4"
+notas = "NtShutdownSystem e NtSetSystemPowerState (ações de desligamento) de modo kernel e de usuário, com o SeShutdownPrivilege habilitado exigido do modo usuário, seguem o PopGracefulShutdown do ntoskrnl 19041: o PopShutdownEvent e as threads do PoRequestShutdownEvent; o ExShutdownSystem(0), que grava o ShutdownTime em Control\\Windows; o IoShutdownSystem(0), com o IRP_MJ_SHUTDOWN síncrono no topo da pilha de cada dispositivo do IoRegisterShutdownNotification (o último registrado primeiro); o CmShutdownSystem, com todas as hives no disco; o IoShutdownSystem(1), com os file systems das filas de disco, CD-ROM e fita (o ntfs.sys real descarrega e fecha o volume) e a fila de última chance; o CcWaitForCurrentLazyWriterActivity; e o PopShutdownSystem. A HAL desliga pelo S5 (PM1a/PM1b_CNT com o HalpShutdownContext que o acpi.sys dá pelo HaliAcpiMachineStateInit, ou o \\_S5_ da DSDT sem o acpi.sys) e reinicia pelo caminho do HalpPowerWriteResetCommand (CMOS 0x0F, 0x472, RESET_REG da FADT, 8042). A política DontPowerOffAfterShutdown faz o ShutdownNoReboot parar com a máquina ligada. O shell tem os comandos shutdown e reboot. Os testes shutdown e reboot gravam pelo ntfs.sys e no Registro, desligam ou reiniciam, e conferem no boot seguinte o que sobreviveu, com o QEMU saindo sozinho pelo desligamento ACPI. Ficam de fora os passos de componentes que o OpenNT não tem: TmShutdownSystem, EtwShutdown, MmShutdownSystem sem arquivo de paginação, PsWaitForAllProcesses e os IRPs de energia S5 aos dispositivos (PopSetDevicesSystemState); o PoQueueShutdownWorkItem e os tratadores de estado do ZwPowerInformation ainda não existem."
 
 [[componente]]
 nome = "Vídeo VGA em modo texto"
@@ -823,9 +855,9 @@ icone = "folder"
 descricao = "Os drivers de sistema de arquivos do Windows (NTFS e FAT) e o Filter Manager, base dos filtros de sistema de arquivos."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/ntos/io/file_system.rs", "kernel/src/ntos/io/parse.rs", "kernel/src/drivers/storage/ata_volume.rs", "kernel/src/ntos/test/file_system_mount.rs", "kernel/src/ntos/test/fs_driver_imports.rs", "xtask/src/ntfs_image.rs"]
-testes = ["ntfs"]
+testes = ["ntfs", "shutdown", "reboot"]
 fase = "8"
-notas = "O ntfs.sys real monta o volume NTFS 3.1 do segundo disco IDE e serve arquivos (teste ntfs): com `--start-driver=ntfs` o carregador resolve o clfs.sys, o clipsp.sys, o ksecdd.sys e o fltmgr.sys (cada um validado pelo Code Integrity pelo catálogo), o DriverEntry cria o CDO \\Ntfs e o FltMgr se anexa a ele pela notificação de registro (state=4). A abertura de \\Device\\AtaVolume1\\HELLO.TXT monta o volume pelo IopMountVolume: o NtfsFsdFileSystemControl posta a montagem à FSP e o FltMgr espera; o NtfsMountVolume vai até o fim (LFS, reinício e checkpoint, $Secure, $Extend, $UpCase) e os streams internos que ele solta ficam para o lazy writer do Cache Manager, de onde vem o IRP_MJ_CLOSE deles depois, como no Windows. O arquivo é aberto e lido pelo Cache Manager; um arquivo novo é criado, gravado, fechado, reaberto e lido de volta pelo ntfs.sys, com o FltMgr na pilha do volume. Para isso: o volume do kernel saiu da raiz do namespace (\\NTFS colidia com o CDO \\Ntfs) para o seu dispositivo \\Device\\KernelVolume1, e os arquivos dos volumes do kernel ganharam DeviceObject e VPB (o IoGetBaseFileSystemDeviceObject do FltMgr); todo IRP_MJ_CREATE leva o IO_SECURITY_CONTEXT (o IoGetDeviceObjectPointer de \\Device\\NamedPipe do FltMgr derrubava o npfs.sys); o ObQueryNameString acha objetos nomeados na raiz; os itens de trabalho não rodam um dentro do outro e cada drenagem só roda os que já estavam na fila (o item de pós-montagem do NTFS esperava o DeviceLock que a montagem retém); o CcUninitializeCacheMap e o lazy writer seguem o NT; o ExAcquireFastMutexUnsafe não exige APCs desligadas, como no ntoskrnl (o LfsFlushToLsn entra com elas ligadas); o ExDeleteResourceLite tira o recurso da lista do sistema mesmo com dono, como no ntoskrnl (o checkpoint do NTFS apaga a tabela de reinício, que mora na pilha dele, ainda adquirida, e o recurso esquecido na lista fazia as inserções seguintes gravarem na pilha de outra chamada: a falha intermitente do teste no despachante nativo); e o volume do xtask grava os nomes 8.3 no espaço Win32+DOS e os demais no POSIX (um nome só Win32 sem o par curto é corrupção para o ntfs.sys). O fastfat.sys vai para o volume com o catálogo dele; o início dele pelo `--start-driver` sobre um volume FAT ainda não foi exercitado."
+notas = "O ntfs.sys real monta o volume NTFS 3.1 do segundo disco IDE e serve arquivos (teste ntfs): com `--start-driver=ntfs` o carregador resolve o clfs.sys, o clipsp.sys, o ksecdd.sys e o fltmgr.sys (cada um validado pelo Code Integrity pelo catálogo), o DriverEntry cria o CDO \\Ntfs e o FltMgr se anexa a ele pela notificação de registro (state=4). A abertura de \\Device\\AtaVolume1\\HELLO.TXT monta o volume pelo IopMountVolume: o NtfsFsdFileSystemControl posta a montagem à FSP e o FltMgr espera; o NtfsMountVolume vai até o fim (LFS, reinício e checkpoint, $Secure, $Extend, $UpCase) e os streams internos que ele solta ficam para o lazy writer do Cache Manager, de onde vem o IRP_MJ_CLOSE deles depois, como no Windows. O arquivo é aberto e lido pelo Cache Manager; um arquivo novo é criado, gravado, fechado, reaberto e lido de volta pelo ntfs.sys, com o FltMgr na pilha do volume. Para isso: o volume do kernel saiu da raiz do namespace (\\NTFS colidia com o CDO \\Ntfs) para o seu dispositivo \\Device\\KernelVolume1, e os arquivos dos volumes do kernel ganharam DeviceObject e VPB (o IoGetBaseFileSystemDeviceObject do FltMgr); todo IRP_MJ_CREATE leva o IO_SECURITY_CONTEXT (o IoGetDeviceObjectPointer de \\Device\\NamedPipe do FltMgr derrubava o npfs.sys); o ObQueryNameString acha objetos nomeados na raiz; os itens de trabalho não rodam um dentro do outro e cada drenagem só roda os que já estavam na fila (o item de pós-montagem do NTFS esperava o DeviceLock que a montagem retém); o CcUninitializeCacheMap e o lazy writer seguem o NT; o ExAcquireFastMutexUnsafe não exige APCs desligadas, como no ntoskrnl (o LfsFlushToLsn entra com elas ligadas); o ExDeleteResourceLite tira o recurso da lista do sistema mesmo com dono, como no ntoskrnl (o checkpoint do NTFS apaga a tabela de reinício, que mora na pilha dele, ainda adquirida, e o recurso esquecido na lista fazia as inserções seguintes gravarem na pilha de outra chamada: a falha intermitente do teste no despachante nativo); e o volume do xtask grava os nomes 8.3 no espaço Win32+DOS e os demais no POSIX (um nome só Win32 sem o par curto é corrupção para o ntfs.sys). No desligamento (testes shutdown e reboot) o ntfs.sys recebe o IRP_MJ_SHUTDOWN pela fila de file systems, com o FltMgr no topo da pilha do CDO, e descarrega o volume; a sobreposição do volume vai ao disco na fila de última chance e o segundo boot lê pelo ntfs.sys e pelo leitor do kernel o arquivo que ele gravou. O fastfat.sys vai para o volume com o catálogo dele; o início dele pelo `--start-driver` sobre um volume FAT ainda não foi exercitado."
 
 [[componente]]
 nome = "npfs.sys"
@@ -888,9 +920,9 @@ icone = "terminal"
 descricao = "Linha de comando do kernel: arquivos, processos, memória e informações do sistema."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/shell/mod.rs"]
-testes = ["shell"]
+testes = ["shell", "shell-shutdown"]
 fase = "1"
-notas = "exec, loaddriver e objects ainda respondem só “ainda nao implementado” com a parte do sistema de que dependem; o sc já consulta e controla os serviços de verdade."
+notas = "exec, loaddriver e objects ainda respondem só “ainda nao implementado” com a parte do sistema de que dependem; o sc já consulta e controla os serviços de verdade. shutdown e reboot chamam o NtShutdownSystem (ShutdownPowerOff e ShutdownReboot) de modo kernel: o desligamento ordenado e a máquina desligada ou reiniciada pela ACPI; halt só para o processador."
 
 [[componente]]
 nome = "Programas hello e pisca"
@@ -1425,6 +1457,12 @@ nome = "Disco lido pela pilha IDE do Windows"
 grupo = "marco"
 teste = "storage"
 faz = "O PnP sobe intelide, atapi, disk e partmgr na controladora do QEMU, e os setores lidos pela pilha conferem com os do disco."
+
+[[roda]]
+nome = "Desligamento e reinício limpos"
+grupo = "marco"
+teste = ["shutdown", "reboot"]
+faz = "O NtShutdownSystem avisa os drivers, o ntfs.sys descarrega o volume, o Registro vai para o disco e a máquina desliga pela ACPI (ou reinicia); o boot seguinte encontra o que foi gravado."
 
 [[roda]]
 nome = "acpi.sys como raiz dos dispositivos"

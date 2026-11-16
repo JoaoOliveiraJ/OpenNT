@@ -47,6 +47,9 @@ pub const STORAGE: &str = "STORAGE";
 pub const DISPLAY: &str = "DISPLAY";
 /// `acpi`: a raiz da árvore de dispositivos é o acpi.sys real.
 pub const PNP_ROOT: &str = "PNPROOT";
+/// `poweroff` ou `reboot`: o teste do desligamento depois do
+/// `STARTDRIVER=ntfs`.
+pub const SHUTDOWN_TEST: &str = "SHUTDOWNTEST";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

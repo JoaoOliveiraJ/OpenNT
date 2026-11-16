@@ -50,7 +50,7 @@ fn at<T: NtStruct>(address: u64) -> &'static T {
 }
 
 /// OBJECT_ATTRIBUTES com o UNICODE_STRING do nome, no bloco dado.
-fn object_attributes(block: u64, name: &str) -> u64 {
+pub(super) fn object_attributes(block: u64, name: &str) -> u64 {
     let units: Vec<u16> = name.encode_utf16().collect();
     let text = block + 0x80;
     guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());

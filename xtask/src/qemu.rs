@@ -7,7 +7,12 @@
 //! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
 //! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
 //! `test-boot` e a falha dela derruba o teste. Com `--capture=ARQ.png`, o
-//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG.
+//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG. Os
+//! testes do desligamento (`--expect-poweroff`, `--power-cycles=N`,
+//! `--allow-reboot`) recebem os eventos SHUTDOWN por um segundo QMP; o
+//! reinício do convidado fica no mesmo QEMU (e no mesmo snapshot do volume)
+//! e o religamento depois do desligamento ACPI sobe outro QEMU sobre uma
+//! cópia gravável do volume NTFS.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -91,7 +96,9 @@ impl Disks {
     }
 }
 
-fn machine_arguments(disks: &Disks, machine: &MachineOptions) -> Vec<String> {
+/// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
+/// encerrar o QEMU.
+fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -> Vec<String> {
     let mut arguments = vec![
         "-accel".to_string(),
         // No WHPX, um RDMSR/WRMSR de MSR não suportado precisa gerar #GP (como
@@ -115,8 +122,10 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions) -> Vec<String> {
         machine.smp.to_string(),
         "-drive".to_string(),
         format!("format=raw,file={}", disks.boot.display()),
-        "-no-reboot".to_string(),
     ]);
+    if no_reboot {
+        arguments.push("-no-reboot".to_string());
+    }
     // Volume NTFS de dados no mestre-escravo primário, quando gerado.
     if let Some(ntfs) = &disks.data {
         let snapshot = if disks.data_snapshot { ",snapshot=on" } else { "" };
@@ -130,7 +139,7 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions) -> Vec<String> {
 /// no socket do depurador.
 pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
     let qemu = find_qemu()?;
-    let mut arguments = machine_arguments(disks, machine);
+    let mut arguments = machine_arguments(disks, machine, true);
     if !window {
         arguments.extend(["-display".to_string(), "none".to_string()]);
     }
@@ -143,7 +152,7 @@ pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) 
 /// Shell interativo numa janela do QEMU; a serial fica neste terminal.
 pub fn run(disks: &Disks, machine: &MachineOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let mut arguments = machine_arguments(disks, machine);
+    let mut arguments = machine_arguments(disks, machine, true);
     arguments.extend(["-serial".to_string(), "stdio".to_string()]);
     arguments.extend(kd_serial(machine));
     if let Some(port) = machine.kd_port {
@@ -175,6 +184,15 @@ pub struct TestOptions {
     /// `--expect-stop`: o bugcheck faz parte do teste, e o `*** STOP` na
     /// serial deixa de ser falha.
     pub expect_stop: bool,
+    /// `--power-cycles=N`: o QEMU que o convidado desliga é religado sobre o
+    /// mesmo disco, até N vezes.
+    pub power_cycles: u32,
+    /// `--allow-reboot`: o reinício do convidado reinicia a máquina (sem
+    /// `-no-reboot`).
+    pub allow_reboot: bool,
+    /// `--expect-poweroff`: depois das saídas esperadas, o QEMU precisa sair
+    /// sozinho pelo desligamento ACPI.
+    pub expect_poweroff: bool,
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -396,13 +414,131 @@ impl Drop for QemuProcess {
 /// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina).
 pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP"];
 
+/// O motivo de fim da máquina que o QMP anuncia quando o convidado se
+/// desliga pelo ACPI (S5).
+const GUEST_SHUTDOWN: &str = "guest-shutdown";
+
+/// Um QEMU do teste: o processo, a thread que copia a serial e o motivo do
+/// último evento SHUTDOWN do QMP (com `--expect-poweroff`/`--power-cycles`).
+struct Machine {
+    process: QemuProcess,
+    reader: Option<thread::JoinHandle<()>>,
+    shutdown_reason: Arc<Mutex<Option<String>>>,
+}
+
+impl Machine {
+    /// Termina de ler a serial de um QEMU que já saiu.
+    fn drain(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _ = wait_finished(&reader, Duration::from_secs(5));
+        }
+    }
+}
+
+/// O motivo de um evento `SHUTDOWN` do QMP (`"reason": "..."`).
+fn shutdown_reason(line: &str) -> Option<String> {
+    if !line.contains("\"SHUTDOWN\"") {
+        return None;
+    }
+    let after = &line[line.find("\"reason\"")? + "\"reason\"".len()..];
+    let start = after.find('"')? + 1;
+    let end = after[start..].find('"')? + start;
+    Some(after[start..end].to_string())
+}
+
+/// Conecta ao QMP de eventos e anota o motivo de cada `SHUTDOWN`.
+fn watch_shutdown_events(port: u16, reason: Arc<Mutex<Option<String>>>) {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stream = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+                Err(_) => return,
+            }
+        };
+        let Ok(mut writer) = stream.try_clone() else { return };
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut reader, &mut line).is_err() || writer.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").is_err() {
+            return;
+        }
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if let Some(found) = shutdown_reason(&line) {
+                        *reason.lock().unwrap() = Some(found);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Sobe um QEMU com os argumentos dados; a serial vai para `output`.
+fn launch(qemu: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events_port: Option<u16>) -> Result<Machine, String> {
+    let mut child = Command::new(qemu)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("{}: {error}", qemu.display()))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let process = QemuProcess(child);
+    let sink = Arc::clone(output);
+    let reader = thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(count) = stdout.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&buffer[..count]).replace('\r', "");
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            sink.lock().unwrap().push_str(&text);
+        }
+    });
+    let shutdown_reason = Arc::new(Mutex::new(None));
+    if let Some(port) = events_port {
+        watch_shutdown_events(port, Arc::clone(&shutdown_reason));
+    }
+    Ok(Machine { process, reader: Some(reader), shutdown_reason })
+}
+
+/// O volume de dados de um teste que religa o QEMU (`--power-cycles`): uma
+/// cópia gravável do volume, ao lado do log, para o segundo QEMU ver o que o
+/// primeiro gravou.
+fn private_data_disk(disks: &Disks, log: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(original) = &disks.data else { return Ok(None) };
+    let copy = log.with_file_name("ntfs-execucao.img");
+    std::fs::copy(original, &copy).map_err(|error| format!("{} -> {}: {error}", original.display(), copy.display()))?;
+    Ok(Some(copy))
+}
+
 /// Boot sem tela: sucesso quando o marcador (e as saídas esperadas depois
 /// das teclas) aparecem na serial antes do prazo.
 /// Com `session` (o roteiro do depurador), ela roda em paralelo ao teste.
+/// Com `power_cycles`, um QEMU que o convidado desliga pelo ACPI é religado
+/// sobre o mesmo disco (até N vezes) e a serial continua no mesmo log; com
+/// `allow_reboot`, o reinício do convidado reinicia a máquina em vez de
+/// encerrar o QEMU; com `expect_poweroff`, depois das saídas esperadas o
+/// QEMU precisa sair sozinho pelo desligamento ACPI (o evento SHUTDOWN do
+/// QMP com o motivo `guest-shutdown`).
 pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, log: &Path, session: Option<Session>) -> Result<(), String> {
     let qemu = find_qemu()?;
     let port = free_port()?;
-    let mut arguments = machine_arguments(disks, machine);
+    let watches_end = test.allow_reboot || test.power_cycles > 0 || test.expect_poweroff;
+    // O snapshot=on do volume dura um QEMU: o religamento precisa de uma
+    // cópia gravável dele.
+    let data_copy = if test.power_cycles > 0 { private_data_disk(disks, log)? } else { None };
+    let disks = match &data_copy {
+        Some(copy) => Disks { boot: disks.boot.clone(), data: Some(copy.clone()), data_snapshot: false },
+        None => Disks { boot: disks.boot.clone(), data: disks.data.clone(), data_snapshot: disks.data_snapshot },
+    };
+    let mut arguments = machine_arguments(&disks, machine, !test.allow_reboot);
     arguments.extend([
         "-display".to_string(),
         "none".to_string(),
@@ -420,31 +556,18 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         }
         None => None,
     };
+    // Um segundo QMP só para os eventos de fim da máquina.
+    let events_port = if test.expect_poweroff || test.power_cycles > 0 {
+        let events = free_port()?;
+        arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{events},server=on,wait=off")]);
+        Some(events)
+    } else {
+        None
+    };
     arguments.extend(kd_serial(machine));
-    let mut child = Command::new(&qemu)
-        .args(&arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("{}: {error}", qemu.display()))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut process = QemuProcess(child);
-
     let output = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&output);
-    thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        while let Ok(count) = stdout.read(&mut buffer) {
-            if count == 0 {
-                break;
-            }
-            let text = String::from_utf8_lossy(&buffer[..count]).replace('\r', "");
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-            sink.lock().unwrap().push_str(&text);
-        }
-    });
+    let current = std::cell::RefCell::new(launch(&qemu, &arguments, &output, events_port)?);
+    let cycles_left = std::cell::Cell::new(test.power_cycles);
 
     let deadline = Instant::now() + test.timeout;
     // Com `--expect-stop`, o STOP do bugcheck é o próprio teste.
@@ -462,6 +585,22 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             result
         })
     });
+    // O QEMU saiu: religa quando o convidado se desligou e ainda há ciclos;
+    // senão devolve o motivo do fim (None = segue rodando).
+    let supervise = || -> Result<Option<String>, String> {
+        let mut machine = current.borrow_mut();
+        let Ok(Some(status)) = machine.process.0.try_wait() else { return Ok(None) };
+        machine.drain();
+        let reason = machine.shutdown_reason.lock().unwrap().clone();
+        if reason.as_deref() == Some(GUEST_SHUTDOWN) && cycles_left.get() > 0 {
+            cycles_left.set(cycles_left.get() - 1);
+            output.lock().unwrap().push_str("\n[xtask] o convidado desligou a maquina; QEMU religado sobre o mesmo disco\n");
+            println!("\n[xtask] QEMU religado sobre o mesmo disco");
+            *machine = launch(&qemu, &arguments, &output, events_port)?;
+            return Ok(None);
+        }
+        Ok(Some(format!("{status}, evento SHUTDOWN do QMP: {}", reason.as_deref().unwrap_or("nenhum"))))
+    };
     let wait_for = |needle: &str, from: usize| -> Result<usize, String> {
         loop {
             if let Some(error) = session_failure.lock().unwrap().clone() {
@@ -478,6 +617,16 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                 }
                 if let Some(position) = text[from.min(text.len())..].find(needle) {
                     return Ok(from + position + needle.len());
+                }
+            }
+            if watches_end {
+                if let Some(ended) = supervise()? {
+                    // A serial do QEMU que saiu já foi lida inteira.
+                    let text = output.lock().unwrap();
+                    if let Some(position) = text[from.min(text.len())..].find(needle) {
+                        return Ok(from + position + needle.len());
+                    }
+                    return Err(format!("QEMU terminou ({ended}) antes de {needle:?}"));
                 }
             }
             if Instant::now() > deadline {
@@ -497,6 +646,30 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         for expected in &test.expect {
             cursor = wait_for(expected, cursor)?;
         }
+        if test.expect_poweroff {
+            // O convidado precisa desligar a máquina sozinho, pelo ACPI.
+            loop {
+                if let Some(ended) = supervise()? {
+                    let reason = current.borrow().shutdown_reason.lock().unwrap().clone();
+                    if reason.as_deref() != Some(GUEST_SHUTDOWN) {
+                        return Err(format!("o QEMU terminou sem o desligamento ACPI ({ended})"));
+                    }
+                    if cycles_left.get() > 0 {
+                        return Err(format!("o QEMU terminou com {} religamento(s) por fazer", cycles_left.get()));
+                    }
+                    let text = output.lock().unwrap();
+                    if let Some(failure) = failure_markers.iter().find(|marker| text[cursor.min(text.len())..].contains(*marker)) {
+                        return Err(format!("falha detectada na serial antes do desligamento: {failure}"));
+                    }
+                    println!("\n[xtask] o QEMU saiu sozinho: {ended}");
+                    return Ok(());
+                }
+                if Instant::now() > deadline {
+                    return Err("tempo esgotado esperando o convidado desligar a maquina".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
         // O prazo do teste não vale durante a espera: ela tem duração própria.
         let hold_end = Instant::now() + test.hold;
         while Instant::now() < hold_end {
@@ -507,7 +680,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                 }
             }
             // Um triplo fault com -no-reboot encerra o QEMU sem marcador.
-            if let Ok(Some(status)) = process.0.try_wait() {
+            if let Ok(Some(status)) = current.borrow_mut().process.0.try_wait() {
                 return Err(format!("QEMU terminou durante os {} ms de espera ({status})", test.hold.as_millis()));
             }
             thread::sleep(Duration::from_millis(50));
@@ -525,10 +698,11 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         },
         (result, _) => result,
     };
+    let mut machine = current.into_inner();
     // A captura sai com o QEMU ainda vivo, passe o teste ou não; se ela
     // falhar, o resultado do teste não muda.
     if let (Some(target), Some(qmp)) = (&test.capture, qmp_port) {
-        let alive = matches!(process.0.try_wait(), Ok(None));
+        let alive = matches!(machine.process.0.try_wait(), Ok(None));
         let mut needles = vec![test.marker.as_str()];
         needles.extend(test.expect.iter().map(String::as_str));
         let serial = serial_proof(&output.lock().unwrap(), &needles);
@@ -537,7 +711,11 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             eprintln!("aviso: sem captura de tela ({}): {error}", target.display());
         }
     }
-    drop(process);
+    drop(machine.process);
+    machine.reader.take();
+    if let Some(copy) = &data_copy {
+        let _ = std::fs::remove_file(copy);
+    }
     let text = output.lock().unwrap().clone();
     std::fs::write(log, &text).map_err(|error| format!("{}: {error}", log.display()))?;
     println!();
