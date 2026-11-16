@@ -32,7 +32,7 @@ Boot pela BIOS até o modo de 64 bits, HAL, nanokernel (interrupções, canais d
 | Vídeo VGA em modo texto | Funciona | boot |
 | Teclado PS/2 | Funciona | shell |
 | Arquivos em memória | Funciona | selftest, fase3 |
-| Shell | Parcial | shell |
+| Shell | Parcial | shell, shell-shutdown |
 | Programas hello e pisca | Funciona | selftest, shell |
 
 ## Fase 2 — memória e CPU (concluída)
@@ -62,6 +62,7 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | I/O Manager | Parcial | fase4, teclado, pipes |
+| Desligamento e reinício | Funciona | shutdown, reboot, shell-shutdown |
 | Console | Parcial | boot, shell, condrv |
 | Barramento PCI | Parcial | fase4, storage, basicdisplay |
 | Dispositivos da placa-mãe | Parcial | fase4 |
@@ -128,5 +129,5 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
 | acpi.sys e pci.sys | Parcial | acpi |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
-| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs |
+| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | ndis, afd, tcpip |
