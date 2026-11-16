@@ -331,12 +331,15 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
     // Uma instância com classe e sem serviço foi instalada com o driver nulo
     // (as seções NO_DRV do machine.inf).
     let mut installed = service.is_some() || install::read_text(&key, "ClassGUID").is_some();
+    // Instalada agora (com um serviço): os requisitos são pedidos de novo.
+    let mut installed_now = false;
     if !installed && !internal {
         match install::select_driver(&hardware_ids, &compatible_ids) {
             Some(driver) => {
                 let matching = hardware_ids.iter().chain(compatible_ids.iter()).find(|id| id.eq_ignore_ascii_case(driver.id)).cloned().unwrap_or_default();
                 service = install::install_device(&instance_path, driver, &matching)?;
                 installed = true;
+                installed_now = service.is_some();
                 debug_print!("[pnp] {}: instalado por {} [{}] -> {}", instance_path, driver.inf, driver.section, service.as_deref().unwrap_or("sem driver funcional"));
             }
             None => debug_print!("[pnp] {}: sem driver nos INFs", instance_path),
@@ -364,6 +367,19 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
             node.problem = problem::FAILED_INSTALL;
         }
     });
+    // A instalação reinicia o nó no NT (o instalador de dispositivos grava a
+    // chave de hardware e o PnP processa o nó de novo): os requisitos são
+    // pedidos outra vez, já com a chave da instância e os valores do
+    // `[DDInstall.HW]` (o MSISupported que o barramento consulta para pedir
+    // interrupções por mensagem).
+    if installed_now {
+        let requirements = irp::query_resource_requirements(pdo)?;
+        let previous = devnode::get(pdo).map_or(0, |node| node.requirements);
+        devnode::update(pdo, |node| node.requirements = requirements);
+        if previous != 0 && previous != requirements {
+            irp::free_pool(previous);
+        }
+    }
     Ok(())
 }
 
@@ -444,7 +460,10 @@ fn start_device_node(pdo: u64) -> Result<(), KernelError> {
         }
         match Requirements::read(requirements_list) {
             Some(requirements) if requirements.alternatives.iter().any(|alternative| !alternative.is_empty()) => match arbiter::allocate(pdo, &requirements)? {
-                Some((raw, translated)) => (Some(raw), Some(translated)),
+                Some((raw, mut translated)) => {
+                    super::message_interrupts::translate(pdo, &raw, &mut translated);
+                    (Some(raw), Some(translated))
+                }
                 None => {
                     debug_print!("[pnp] {}: conflito de recursos", node.instance_path);
                     devnode::update(pdo, |node| {

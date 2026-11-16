@@ -18,6 +18,7 @@ pub mod device_api;
 pub mod devnode;
 pub mod install;
 pub mod irp;
+pub mod message_interrupts;
 pub mod resources;
 pub mod root;
 pub mod tree;

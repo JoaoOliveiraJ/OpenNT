@@ -15,9 +15,12 @@
 //!   nível, se a função tem pino de interrupção. Numa controladora IDE em
 //!   modo de compatibilidade (prog-if com os bits 0/2 limpos) os BARs 0..3
 //!   do canal legado não são decodificados e ficam de fora: as portas e IRQs
-//!   legadas são dos canais (o pciidex.sys as pede pelos PDOs deles).
+//!   legadas são dos canais (o pciidex.sys as pede pelos PDOs deles). Uma
+//!   função com MSI ou MSI-X cujo INF pediu mensagens (MSISupported) pede
+//!   as mensagens antes da linha (`pci_msi`).
 //! - START_DEVICE: programa os BARs com os recursos atribuídos e liga I/O,
-//!   memória e bus master no registrador de comando.
+//!   memória e bus master no registrador de comando; programa as mensagens
+//!   atribuídas e liga o MSI/MSI-X (`pci_msi`).
 //! - QUERY_BUS_INFORMATION (GUID_BUS_TYPE_PCI, PCIBus, barramento),
 //!   QUERY_DEVICE_TEXT (a descrição da classe da tabela de mensagens do
 //!   pci.sys e "PCI bus %1, device %2, function %3"), QUERY_INTERFACE
@@ -63,6 +66,9 @@ const PORT_IO: u16 = 1;
 const MEMORY_READ_WRITE: u16 = 0;
 const MEMORY_PREFETCHABLE: u16 = 4;
 const INTERRUPT_LEVEL_SENSITIVE: u16 = 0;
+/// CM_RESOURCE_INTERRUPT_LATCHED e CM_RESOURCE_INTERRUPT_MESSAGE.
+const INTERRUPT_LATCHED: u16 = 1;
+const INTERRUPT_MESSAGE: u16 = 2;
 /// PCI_WHICHSPACE_CONFIG.
 const PCI_WHICHSPACE_CONFIG: u32 = 0;
 
@@ -201,8 +207,16 @@ fn requirements_list(function: &PciFunction) -> u64 {
         entries.push(Entry { option: IO_RESOURCE_PREFERRED, resource_type: resource, share: SHARE_DEVICE_EXCLUSIVE, flags, length: bar.size, alignment: bar.size, minimum: start, maximum: start + bar.size as u64 - 1 });
         entries.push(Entry { option: IO_RESOURCE_ALTERNATIVE, resource_type: resource, share: SHARE_DEVICE_EXCLUSIVE, flags, length: bar.size, alignment: bar.size, minimum: 0, maximum: limit });
     }
-    if function.interrupt_pin != 0 && function.irq_line != 0 {
-        entries.push(Entry { option: 0, resource_type: resource_type::INTERRUPT, share: SHARE_SHARED, flags: INTERRUPT_LEVEL_SENSITIVE, length: 0, alignment: 0, minimum: function.irq_line as u64, maximum: function.irq_line as u64 });
+    // As mensagens (MSI/MSI-X) que a função pede vêm antes da linha, que
+    // fica como alternativa ou de fora (`pci_msi`).
+    let has_line = function.interrupt_pin != 0 && function.irq_line != 0;
+    let messages = super::pci_msi::requirement_descriptors(function, function.pdo_pointer, has_line);
+    let line_option = messages.as_ref().map_or(Some(0), |(_, option)| *option);
+    for &(option, minimum, maximum) in messages.iter().flat_map(|(descriptors, _)| descriptors) {
+        entries.push(Entry { option, resource_type: resource_type::INTERRUPT, share: SHARE_DEVICE_EXCLUSIVE, flags: INTERRUPT_LATCHED | INTERRUPT_MESSAGE, length: 0, alignment: 0, minimum: minimum as u64, maximum: maximum as u64 });
+    }
+    if let Some(option) = line_option.filter(|_| has_line) {
+        entries.push(Entry { option, resource_type: resource_type::INTERRUPT, share: SHARE_SHARED, flags: INTERRUPT_LEVEL_SENSITIVE, length: 0, alignment: 0, minimum: function.irq_line as u64, maximum: function.irq_line as u64 });
     }
     if entries.is_empty() {
         return 0;
@@ -258,6 +272,11 @@ fn start_function(function: &PciFunction, raw: u64) {
         }
     }
     let _ = pci_config::enable_command(function.bus, function.device, function.function, 0x07);
+    // As mensagens atribuídas (dados de conexão do PDO) e a capacidade ligada.
+    let programmed = super::pci_msi::program(function, function.pdo_pointer);
+    if programmed != 0 {
+        debug_print!("[pci] {}:{}.{}: {} mensagem(ns) programada(s)", function.bus, function.device, function.function, programmed);
+    }
 }
 
 /// DEVICE_RELATIONS em pool com um PDO referenciado.

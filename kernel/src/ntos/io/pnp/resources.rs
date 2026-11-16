@@ -24,6 +24,9 @@
 //!   IopTranslatorHandlerCm), porque o tradutor de interrupções do acpi.sys
 //!   já traduziu.
 //! - `CmList` escreve e lê CM_RESOURCE_LIST com um FULL descriptor.
+//! - As interrupções por mensagem (CM_RESOURCE_INTERRUPT_MESSAGE) têm
+//!   arbitragem e tradução próprias (`message_interrupts`): não disputam as
+//!   linhas e recebem vetores da HAL na tradução do nó.
 
 use alloc::vec::Vec;
 
@@ -136,7 +139,9 @@ pub fn write_partial(address: u64, resource: &Resource) {
         resource_type::INTERRUPT => {
             let interrupt = &descriptor.u.interrupt;
             interrupt.level.set(resource.start as u16);
-            interrupt.group.set(0);
+            // Group 0; na lista bruta de uma mensagem a mesma posição é o
+            // MessageCount (u.MessageInterrupt.Raw).
+            interrupt.group.set(if super::message_interrupts::is_message(resource) { resource.extra[2] as u16 } else { 0 });
             interrupt.vector.set(resource.length);
             interrupt.affinity.set(resource.extra[0] as u64 | (resource.extra[1] as u64) << 32);
         }
@@ -174,7 +179,9 @@ pub fn read_partial(address: u64) -> Resource {
             resource.start = interrupt.level.get() as u64;
             resource.length = interrupt.vector.get();
             let affinity = interrupt.affinity.get();
-            resource.extra = [affinity as u32, (affinity >> 32) as u32, 0];
+            // MessageCount de uma mensagem bruta (Raw.MessageCount).
+            let messages = if resource.flags & super::message_interrupts::CM_RESOURCE_INTERRUPT_MESSAGE != 0 { interrupt.group.get() as u32 } else { 0 };
+            resource.extra = [affinity as u32, (affinity >> 32) as u32, messages];
         }
         resource_type::DMA => {
             resource.start = descriptor.u.dma.channel.get() as u64;
@@ -343,6 +350,8 @@ pub fn place_at_root(owner: u64, choice: &Choice, pending: &[Resource]) -> Optio
             }
             None
         }
+        // As mensagens não disputam as linhas (`message_interrupts`).
+        resource_type::INTERRUPT if choice.flags & super::message_interrupts::CM_RESOURCE_INTERRUPT_MESSAGE != 0 => Some(super::message_interrupts::place(share, choice.flags, choice.minimum, choice.maximum, choice.affinity)),
         resource_type::INTERRUPT | resource_type::DMA => {
             (choice.minimum..=choice.maximum).find(|&value| !conflicts(owner, choice.resource_type, value, 1, share, pending)).map(|value| {
                 // Lista bruta: Level = Vector = a linha.
@@ -381,12 +390,13 @@ pub fn assign(owner: u64, requirements: &Requirements) -> Option<CmList> {
 /// Registra recursos já em uso (configuração de boot de um nó iniciado
 /// pelo próprio kernel) para os árbitros.
 pub fn reserve(owner: u64, list: &CmList) {
-    ASSIGNED.lock().extend(list.resources.iter().filter(|resource| resource.resource_type != resource_type::DEVICE_PRIVATE).map(|&resource| (owner, resource)));
+    ASSIGNED.lock().extend(list.resources.iter().filter(|resource| resource.resource_type != resource_type::DEVICE_PRIVATE && !super::message_interrupts::is_message(resource)).map(|&resource| (owner, resource)));
 }
 
-/// Devolve as faixas de um nó.
+/// Devolve as faixas de um nó (e os vetores das mensagens dele).
 pub fn release(owner: u64) {
     ASSIGNED.lock().retain(|(holder, _)| *holder != owner);
+    super::message_interrupts::release(owner);
 }
 
 /// Linha de interrupção bruta -> (vetor do IDT, IRQL) na HAL do OpenNT.
@@ -406,7 +416,8 @@ pub fn set_root_line_translation(enabled: bool) {
 /// A tradução da raiz de um recurso bruto que nenhum tradutor de driver
 /// completou: as linhas de interrupção na HAL sem ACPI, o resto igual.
 pub fn translate_at_root(resource: &Resource) -> Resource {
-    if resource.resource_type != resource_type::INTERRUPT || !ROOT_LINE_TRANSLATION.load(Ordering::Acquire) {
+    // As mensagens são traduzidas com o nó (`message_interrupts`).
+    if resource.resource_type != resource_type::INTERRUPT || super::message_interrupts::is_message(resource) || !ROOT_LINE_TRANSLATION.load(Ordering::Acquire) {
         return *resource;
     }
     let (vector, level) = translate_interrupt(resource.length);

@@ -1,6 +1,7 @@
 //! Interrupções dos exports Io* — IoConnectInterruptEx (LINE_BASED pelos
 //! dados de conexão do PDO ou pelo recurso dele, FULLY_SPECIFIED pelos
-//! campos), IoDisconnectInterruptEx e IoGetAffinityInterrupt, sobre o
+//! campos, MESSAGE_BASED em `message_interrupt`), IoDisconnectInterruptEx e
+//! IoGetAffinityInterrupt, sobre o
 //! KINTERRUPT de `ke::interrupt_object`.
 //!
 //! Como o IopConnectLineBasedInterrupt do ntoskrnl 19041, o LINE_BASED usa
@@ -34,18 +35,19 @@ const CONNECT_FULLY_SPECIFIED: u32 = 1;
 const CONNECT_LINE_BASED: u32 = 2;
 const CONNECT_MESSAGE_BASED: u32 = 3;
 const CONNECT_FULLY_SPECIFIED_GROUP: u32 = 4;
-/// STATUS_NOT_SUPPORTED (o versão desconhecida e o MESSAGE_BASED sem
-/// mensagens nem rotina de recuo).
+/// STATUS_NOT_SUPPORTED (a versão desconhecida e o MESSAGE_BASED que não
+/// conecta mensagens nem tem rotina de recuo).
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 
 /// IoConnectInterruptEx: LINE_BASED (2) pelo recurso do PDO; FULLY_SPECIFIED
-/// (1/4) pelos campos; MESSAGE_BASED (3) cai na linha com o
-/// FallBackServiceRoutine. O KINTERRUPT vai para *InterruptObject. Devolve o
+/// (1/4) pelos campos; MESSAGE_BASED (3, MSI/MSI-X) pelos dados de conexão do
+/// PDO (`message_interrupt`), com a linha pelo FallBackServiceRoutine quando
+/// as mensagens não conectam. O KINTERRUPT vai para *InterruptObject. Devolve o
 /// valor do export: as falhas próprias com sinal, o status do
 /// IoConnectInterrupt sem sinal.
-pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
+pub fn connect_interrupt_ex(parameters_address: u64) -> Result<u64, KernelError> {
     // SAFETY: IO_CONNECT_INTERRUPT_PARAMETERS do driver (modo kernel).
-    let parameters = unsafe { IoConnectInterruptParameters::at(parameters) };
+    let parameters = unsafe { IoConnectInterruptParameters::at(parameters_address) };
     let version = parameters.version.get();
     // ServiceRoutine/ServiceContext/SpinLock/InterruptObject têm o mesmo
     // offset nas variantes FullySpecified e LineBased.
@@ -67,18 +69,7 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
         return Ok(interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level, synchronize, mode, share != 0)? as u64);
     }
     if version == CONNECT_MESSAGE_BASED {
-        // Nenhum dispositivo recebe interrupções por mensagem: o
-        // IopConnectMessageBasedInterrupt não tem o que conectar.
-        let message = &parameters.message_based;
-        let fall_back = message.fall_back_service_routine.get();
-        if fall_back == 0 {
-            debug_print!("[io] IoConnectInterruptEx MESSAGE_BASED: sem interrupcoes por mensagem e sem FallBackServiceRoutine");
-            return Ok(signed_status(STATUS_NOT_SUPPORTED));
-        }
-        let status = connect_line_based(message.physical_device_object.get(), message.connection_context.get(), fall_back, message.service_context.get(), message.spin_lock.get())?;
-        parameters.version.set(CONNECT_LINE_BASED);
-        debug_print!("[io] IoConnectInterruptEx MESSAGE_BASED sem mensagens: linha pelo FallBackServiceRoutine 0x{:x} -> {:#x}", fall_back, status as u32);
-        return Ok(status);
+        return super::message_interrupt::connect_interrupt_ex(parameters_address);
     }
     debug_print!("[io] IoConnectInterruptEx: version {} sem suporte", version);
     Ok(signed_status(STATUS_NOT_SUPPORTED))
@@ -164,10 +155,15 @@ fn connection_data_line(pdo: u64) -> Option<ConnectionLine> {
     Some(ConnectionLine { gsiv: entry(index, gsiv_offset), mode: entry(index, mode_offset), vector: entry(index, vector_offset), irql: entry(index, irql_offset) as u8 })
 }
 
-/// IoDisconnectInterruptEx: o KINTERRUPT em ConnectionContext.
+/// IoDisconnectInterruptEx: o KINTERRUPT em ConnectionContext (a tabela de
+/// mensagens com CONNECT_MESSAGE_BASED).
 pub fn disconnect_interrupt_ex(parameters: u64) -> u32 {
     // SAFETY: IO_DISCONNECT_INTERRUPT_PARAMETERS do driver (modo kernel).
-    let object = unsafe { IoDisconnectInterruptParameters::at(parameters) }.connection_context.get();
+    let parameters = unsafe { IoDisconnectInterruptParameters::at(parameters) };
+    let object = parameters.connection_context.get();
+    if parameters.version.get() == CONNECT_MESSAGE_BASED {
+        return super::message_interrupt::disconnect_interrupt_ex(object);
+    }
     if object == 0 {
         return 0xC000_000D;
     }

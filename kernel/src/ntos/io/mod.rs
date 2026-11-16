@@ -29,6 +29,7 @@ pub mod device;
 pub mod device_interface;
 pub mod device_property;
 pub mod interrupt;
+pub mod message_interrupt;
 pub mod irp_extension;
 pub mod mdl;
 pub mod object_types;

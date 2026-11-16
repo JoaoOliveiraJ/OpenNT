@@ -31,6 +31,7 @@ pub mod acpi_pm;
 pub mod errata;
 pub mod interrupt_lines;
 pub mod interrupt_targets;
+pub mod message_interrupts;
 pub mod pci_config;
 pub mod pci_native;
 pub mod firmware_environment;

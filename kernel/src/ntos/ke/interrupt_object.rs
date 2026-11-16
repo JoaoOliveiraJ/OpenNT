@@ -48,7 +48,12 @@ pub struct InterruptObject {
     pub share_disposition: Field<u32>,
     _pad_54: Reserved<4>,
     pub dispatch_address: Field<u64>,
-    _pad_60: Reserved<0xA0>,
+    /// Interrupção por mensagem (IoConnectInterruptEx MESSAGE_BASED): a
+    /// rotina é a MessageServiceRoutine, chamada com o MessageID.
+    pub message_based: Field<u8>,
+    _pad_61: Reserved<3>,
+    pub message_id: Field<u32>,
+    _pad_68: Reserved<0x98>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -66,6 +71,7 @@ const _: () = {
     assert!(core::mem::offset_of!(InterruptObject, number) == 0x48);
     assert!(core::mem::offset_of!(InterruptObject, mode) == 0x4C);
     assert!(core::mem::offset_of!(InterruptObject, dispatch_address) == 0x58);
+    assert!(core::mem::offset_of!(InterruptObject, message_id) == 0x64);
 };
 
 /// KOBJECTS InterruptObject.
@@ -176,8 +182,9 @@ fn run_chain(chain: u32) {
         let lock = object.actual_lock.get();
         let previous = irql::raise_at_least(object.synchronize_irql.get().max(object.irql.get()));
         spin_lock::acquire_at_dpc_level(lock);
-        // BOOLEAN de retorno: só AL é significativo.
-        let handled = native_call::call(routine, &[pointer, context]) & 0xFF != 0;
+        // BOOLEAN de retorno: só AL é significativo. A rotina de uma
+        // mensagem recebe o MessageID (o KiInterruptMessageDispatch).
+        let handled = if object.message_based.get() != 0 { native_call::call(routine, &[pointer, context, object.message_id.get() as u64]) } else { native_call::call(routine, &[pointer, context]) } & 0xFF != 0;
         spin_lock::release_from_dpc_level(lock);
         irql::lower_irql(previous as u64);
         if handled && mode == 0 {
@@ -201,9 +208,34 @@ pub fn io_connect_interrupt(
     mode: u32,
     share_vector: bool,
 ) -> Result<u32, KernelError> {
+    connect(output, service_routine, service_context, spin_lock, vector, level, synchronize_level, mode, share_vector, None)
+}
+
+/// O objeto de uma mensagem (o IopConnectInterrupt das mensagens): a rotina
+/// é a MessageServiceRoutine e recebe `message_id`; borda, sem dividir o
+/// vetor.
+#[allow(clippy::too_many_arguments)]
+pub fn io_connect_message_interrupt(output: u64, message_routine: u64, service_context: u64, spin_lock: u64, vector: u32, level: u8, synchronize_level: u8, message_id: u32) -> Result<u32, KernelError> {
+    connect(output, message_routine, service_context, spin_lock, vector, level, synchronize_level, 1, false, Some(message_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect(
+    output: u64,
+    service_routine: u64,
+    service_context: u64,
+    spin_lock: u64,
+    vector: u32,
+    level: u8,
+    synchronize_level: u8,
+    mode: u32,
+    share_vector: bool,
+    message: Option<u32>,
+) -> Result<u32, KernelError> {
     // Um vetor atribuído pelo árbitro de IRQ chega pelas linhas que a HAL
     // registrou para ele (`hal::interrupt_lines`); a cadeia fica no vetor.
-    let deliveries = crate::hal::interrupt_lines::delivery_vectors(vector);
+    // Uma mensagem chega no próprio vetor, sem linha do controlador.
+    let deliveries = if message.is_some() { alloc::vec![vector] } else { crate::hal::interrupt_lines::delivery_vectors(vector) };
     let object = guest::alloc_bytes(InterruptObject::SIZE);
     // Lock do chamador reutilizado; senão, oito bytes para o lock interno.
     let actual_lock = if spin_lock != 0 { spin_lock } else { guest::alloc_bytes(8) };
@@ -228,6 +260,8 @@ pub fn io_connect_interrupt(
     body.connected.set(1);
     body.mode.set(mode);
     body.share_vector.set(share_vector as u8);
+    body.message_based.set(message.is_some() as u8);
+    body.message_id.set(message.unwrap_or(0));
 
     // Insere na cabeça da cadeia antes de habilitar a linha do controlador.
     let previous_head = CHAINS.lock().insert(vector, object).unwrap_or(0);

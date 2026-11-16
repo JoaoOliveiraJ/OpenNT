@@ -104,7 +104,7 @@ fn call_with_status(device: u64, minor: u8, initial_status: i32, information: u6
 }
 
 /// ExFreePool de um bloco que o driver alocou para o PnP manager.
-fn free_pool(block: u64) {
+pub fn free_pool(block: u64) {
     if let Err(error) = crate::ntos::ex::pool_allocation::free(block, 0) {
         debug_print!("[pnp] ExFreePool({:#x}): {}", block, error);
     }

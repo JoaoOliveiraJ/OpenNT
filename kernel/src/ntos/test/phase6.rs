@@ -12398,6 +12398,95 @@ fn io_interrupt_state_exports(assert: Assert) {
     assert(!interrupt_object::interrupt_reported_inactive(object) && !interrupt_object::interrupt_reported_inactive(second), "io-interrupt-state: MESSAGE_BASED reativa todas as mensagens");
 }
 
+/// Interrupções por mensagem de ponta a ponta sem o dispositivo: a
+/// arbitragem e a tradução do PnP manager (vetores da HAL, a lista bruta com
+/// o MessageCount e os dados de conexão InterruptTypeMessageRequest), a rota
+/// pelo HalGetMessageRoutingInfo, o IoConnectInterruptEx MESSAGE_BASED (a
+/// tabela, o UnifiedIrql e a recusa de um SynchronizeIrql baixo), a entrega
+/// de um vetor de mensagem à MessageServiceRoutine com o MessageID (por um
+/// IPI fixo para o próprio processador, o mesmo caminho do APIC local que a
+/// escrita de uma mensagem usa) e o IoDisconnectInterruptEx da tabela.
+fn io_message_interrupt_exports(assert: Assert) {
+    use crate::ntos::inc::types::extra_storage::{IoInterruptMessageInfo, IoInterruptMessageInfoEntry};
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::io::pnp::{devnode, message_interrupts, resources};
+    use crate::ntos::ke::interrupt_object;
+    let pdo = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    devnode::insert(devnode::DeviceNode::new(pdo, 0, 1));
+    // Requisitos: duas mensagens de MSI-X (token) e um MSI de 4 (token - 3).
+    let token = message_interrupts::MESSAGE_TOKEN as u64;
+    let flags = message_interrupts::CM_RESOURCE_INTERRUPT_LATCHED | message_interrupts::CM_RESOURCE_INTERRUPT_MESSAGE;
+    let raw = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![message_interrupts::place(1, flags, token, token, 0), message_interrupts::place(1, flags, token, token, 0), message_interrupts::place(1, flags, token - 3, token, 0)] };
+    let round_trip = resources::CmList::read(raw.write()).unwrap_or_default();
+    assert(round_trip.resources.iter().map(|resource| (resource.length, resource.extra[2])).collect::<Vec<_>>() == alloc::vec![(token as u32, 1), (token as u32, 1), (token as u32, 4)], "io-message-interrupt: lista bruta com o token e o Raw.MessageCount");
+    let mut translated = raw.clone();
+    let messages = message_interrupts::translate(pdo, &raw, &mut translated);
+    let vectors: Vec<u32> = translated.resources.iter().map(|resource| resource.length).collect();
+    let in_range = vectors.iter().all(|&vector| (crate::hal::message_interrupts::FIRST_VECTOR..=crate::hal::message_interrupts::LAST_VECTOR).contains(&vector));
+    let levels = translated.resources.iter().all(|resource| resource.start == (resource.length >> 4) as u64);
+    assert(
+        messages.len() == 6 && in_range && levels && vectors[2] % 4 == 0 && vectors[0] != vectors[1] && !(vectors[2]..vectors[2] + 4).contains(&vectors[0]) && !(vectors[2]..vectors[2] + 4).contains(&vectors[1]),
+        "io-message-interrupt: vetores da HAL distintos, o bloco do MSI alinhado e o IRQL da classe do vetor",
+    );
+    let apic = crate::hal::message_interrupts::target_processor().1;
+    let routed = message_interrupts::connection_messages(pdo);
+    assert(routed.len() == 6 && routed.iter().zip(&messages).all(|(routed, expected)| routed == expected && routed.address == 0xFEE0_0000 | (apic as u64) << 12 && routed.data == routed.vector), "io-message-interrupt: dados de conexao pelo HalGetMessageRoutingInfo (endereco do APIC e o vetor no dado)");
+    // A MessageServiceRoutine grava o objeto e o MessageID e conta.
+    let routine = super::executable_code::place(&[0x48, 0x89, 0x0A, 0x4C, 0x89, 0x42, 0x08, 0x48, 0xFF, 0x42, 0x10, 0xB0, 0x01, 0xC3]);
+    let record = guest::alloc_bytes(0x18);
+    let table_cell = guest::alloc_bytes(8);
+    let parameters_address = guest::alloc_bytes(nt::IoConnectInterruptParameters::SIZE);
+    let parameters = at::<nt::IoConnectInterruptParameters>(parameters_address);
+    let message_based = &parameters.message_based;
+    parameters.version.set(3);
+    message_based.physical_device_object.set(pdo);
+    message_based.connection_context.set(table_cell);
+    message_based.message_service_routine.set(routine);
+    message_based.service_context.set(record);
+    message_based.synchronize_irql.set(messages.iter().map(|message| message.irql).min().unwrap_or(0).saturating_sub(1).max(1));
+    guest::write64(table_cell, 0x1234);
+    let low = call_export("IoConnectInterruptEx", &[parameters_address]);
+    // O IopConnectMessageBasedInterrupt recusa (STATUS_INVALID_PARAMETER) e,
+    // sem FallBackServiceRoutine, o IoConnectInterruptEx devolve
+    // STATUS_NOT_SUPPORTED.
+    assert(low == Some(signed_status(0xC000_00BB)) && guest::read64(table_cell) == 0, "io-message-interrupt: SynchronizeIrql abaixo de uma mensagem, sem recuo = STATUS_NOT_SUPPORTED");
+    message_based.synchronize_irql.set(0);
+    let connected = call_export("IoConnectInterruptEx", &[parameters_address]);
+    let table_address = guest::read64(table_cell);
+    let (unified, entries): (u8, &[IoInterruptMessageInfoEntry]) = if table_address != 0 {
+        let table = at::<IoInterruptMessageInfo>(table_address);
+        // SAFETY: as MessageCount entradas da tabela devolvida.
+        (table.unified_irql.get(), unsafe { IoInterruptMessageInfoEntry::array_at(table.message_info[0].address(), table.message_count.get() as usize) })
+    } else {
+        (0xFF, &[])
+    };
+    let described = entries.len() == 6 && entries.iter().zip(&messages).all(|(entry, message)| entry.vector.get() == message.vector && entry.irql.get() == message.irql && entry.message_address.get() as u64 == message.address && entry.message_data.get() == message.data && entry.mode.get() == 1 && entry.polarity.get() == 1 && entry.interrupt_object.get() != 0);
+    assert(connected == Some(0) && unified == 0 && described && parameters.version.get() == 3, "io-message-interrupt: IoConnectInterruptEx MESSAGE_BASED monta a IO_INTERRUPT_MESSAGE_INFO");
+    // Um IPI fixo para este processador no vetor da mensagem 1.
+    if let Some(second) = entries.get(1) {
+        crate::hal::lapic::write(0x300, 0x4_0000 | 0x4000 | second.vector.get());
+        for _ in 0..1000 {
+            crate::nano::interrupts::dispatch_pending_devices();
+            if guest::read64(record + 0x10) != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert(guest::read64(record + 0x10) == 1 && guest::read64(record) == second.interrupt_object.get() && guest::read64(record + 8) == 1, "io-message-interrupt: o vetor chega a MessageServiceRoutine com o objeto e o MessageID 1");
+    }
+    let disconnect = guest::alloc_bytes(nt::IoDisconnectInterruptParameters::SIZE);
+    at::<nt::IoDisconnectInterruptParameters>(disconnect).version.set(3);
+    at::<nt::IoDisconnectInterruptParameters>(disconnect).connection_context.set(table_address);
+    let disconnected = call_export("IoDisconnectInterruptEx", &[disconnect]);
+    assert(disconnected == Some(0) && messages.iter().all(|message| !interrupt_object::is_vector_connected(message.vector)), "io-message-interrupt: IoDisconnectInterruptEx desconecta todas as mensagens");
+    resources::release(pdo);
+    assert(messages.iter().all(|message| !crate::hal::message_interrupts::is_message_vector(message.vector)), "io-message-interrupt: os vetores voltam a HAL com os recursos do no");
+    // Sem dados de conexão de mensagem: STATUS_INVALID_PARAMETER.
+    crate::ntos::io::device_property::store_device_property(pdo, message_interrupts::INTERRUPT_CONNECTION_DATA_PKEY, message_interrupts::INTERRUPT_CONNECTION_DATA_PID, 0, &[]);
+    assert(call_export("IoConnectInterruptEx", &[parameters_address]) == Some(signed_status(0xC000_00BB)) && guest::read64(table_cell) == 0, "io-message-interrupt: PDO sem mensagens, sem recuo = STATUS_NOT_SUPPORTED");
+    devnode::remove(pdo);
+    super::executable_code::release(routine);
+}
 
 fn io_pnp_device_exports(assert: Assert) {
     use crate::ntos::inc::types::extra_storage::DeviceDescription;
@@ -15182,6 +15271,7 @@ pub fn run(assert: Assert) {
     io_boot_disk_exports(assert);
     io_driver_notification_exports(assert);
     io_interrupt_state_exports(assert);
+    io_message_interrupt_exports(assert);
     io_pnp_device_exports(assert);
     io_wdm_headless_exports(assert);
     io_work_item_exports(assert);
