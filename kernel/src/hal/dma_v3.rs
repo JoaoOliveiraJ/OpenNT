@@ -387,10 +387,11 @@ fn get_scatter_gather_list_ex(call: &Call) -> Result<u64, KernelError> {
 /// BuildScatterGatherListEx(Adapter, DeviceObject, DmaTransferContext, Mdl,
 /// Offset, Length, Flags, ExecutionRoutine, Context, WriteToDevice,
 /// ScatterGatherBuffer, ScatterGatherLength, DmaCompletionRoutine,
-/// CompletionContext, *ScatterGatherList).
+/// CompletionContext, *ScatterGatherList). São 15 argumentos: o último vem
+/// da pilha do chamador, além dos 14 que o trampolim copia.
 fn build_scatter_gather_list_ex(call: &Call) -> Result<u64, KernelError> {
     let (adapter, device, mdl, offset, length, flags, routine, context, buffer, buffer_length, output) =
-        (call.arg(1), call.arg(2), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7) as u32, call.arg(8), call.arg(9), call.arg(11), call.arg(12) as u32, call.arg(15));
+        (call.arg(1), call.arg(2), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7) as u32, call.arg(8), call.arg(9), call.arg(11), call.arg(12) as u32, call.variadic_arg(15));
     if mdl == 0 || buffer == 0 || state(adapter).is_none() {
         return Ok(STATUS_INVALID_PARAMETER as u64);
     }
