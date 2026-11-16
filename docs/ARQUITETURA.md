@@ -936,7 +936,9 @@ PML4:
   KeAttachProcess e o escopo `ps/process_context.rs::with_process` carregam
   a raiz do destino quando ela difere da carregada;
   KeUnstackDetachProcess e KeDetachProcess, a do processo que o KAPC_STATE
-  salvo devolve, então o aninhamento é o dos KAPC_STATE, como no NT. A
+  salvo devolve, então o aninhamento é o dos KAPC_STATE, como no NT. Como o
+  KiAttachProcess, o attach reinicia só os campos do KAPC_STATE (0x2B bytes):
+  o resto dos 0x30 do ApcState embutido é o KTHREAD (o Priority em +0xC3). A
   CPU também passa de um KPROCESS.ActiveProcessors para o outro. O attach
   recusa, antes de mexer no KAPC_STATE, um processo cuja raiz não é a do
   System nem uma raiz do Mm (`process_address_space::is_root`).
@@ -2503,15 +2505,85 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   dele (NtSetInformationThread, classes 2 e 3 como no NT), o csrss assina
   os nomes WNF da instalação (`cm/wnf_defaults.rs`) e o sxssrv.dll lê a
   chave SideBySide (`cm/seed.rs`). Depois o CsrSbApiPortInitialize cria a
-  porta LPC `\Windows\SbApiPort` pelo NtCreatePort, que o OpenNT ainda
-  não tem (as portas LPC de servidor em modo usuário:
-  NtCreatePort/NtReplyWaitReceivePort/NtAcceptConnectPort/
-  NtCompleteConnectPort sobre o ALPC), e o csrss termina com
-  STATUS_NOT_IMPLEMENTED; o smss da sessão não chega ao wininit.exe, que o
-  build já põe no volume com o services.exe e o lsass.exe. O marcador
-  `WINSTA0_OK` (`initial_process::desktop_opened`) sai quando o wininit.exe
-  tem as Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure
-  da WindowStation.
+  porta LPC `\Windows\SbApiPort` (as portas LPC de modo usuário, no item
+  seguinte), o smss mestre se conecta a ela e o SmpSbCreateSession pede ao
+  csrss a sessão do wininit.exe: o csrss põe a `\Windows\ApiPort` como
+  ProcessExceptionPort do processo novo, lê ThreadTimes e
+  ThreadIsTerminated (NtQueryInformationThread) e retoma a thread; a
+  ProcessDeviceMap do NtQueryInformationProcess dá as letras do
+  `\GLOBAL??` (`ob/device_map.rs`). O wininit.exe conecta à
+  `\Windows\ApiPort` (a ntdll pelo LPC, com PORT_VIEW, e o csrss, servidor
+  ALPC, aceita com a vista), sobe a classe de prioridade
+  (ProcessPriorityClass), registra o servidor RPC `\RPC Control\WMsgKRpc…`
+  e, no CreatePrimaryTerminal do wininitext.dll, chama o
+  RegisterLogonProcess: o win32kbase conecta ao WMsgKRpc pelo msrpc.sys
+  (ZwAlpcConnectPort de uma thread de usuário dentro do serviço, que
+  bloqueia como qualquer espera do ALPC; o contexto de segurança aberto
+  numa thread de trabalho do System que impersona o cliente pela
+  ThreadImpersonationToken da entrada Zw), e o servidor do rpcrt4 aceita o
+  bind quando o TpCallbackMayRunLong (a classe 9 do
+  NtSetInformationWorkerFactory) responde que a fábrica ainda cresce. No
+  CreateWindowStationW, o user32 abre o kbdus.dll e o NtUserCreateWindowStation
+  manda ao csrss um pedido síncrono de kernel direto à porta de conexão
+  `\Windows\ApiPort` (`server::connection_request`); o csrss responde, mas
+  o NtUserCreateWindowStation ainda falha: nos callbacks ao user32 do
+  wininit, o carregador de recursos procura o `en-US\USER32.dll.mui` (o
+  idioma da interface do convidado), que esta máquina não tem (só pt-BR),
+  e o wininit sai com ERROR_MUI_FILE_NOT_LOADED. O smss da sessão 1 cria o
+  csrss e o winlogon.exe (o NtOpenSection relativo ao `\KnownDlls`, aberto
+  pela tabela do Object Manager, e o powrprof.dll e o imm32.dll no
+  volume). O marcador `WINSTA0_OK`
+  (`initial_process::desktop_opened`) sai quando o wininit.exe tem as
+  Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure da
+  WindowStation.
+- **As portas LPC de modo usuário** (`alpc/lpc_ports.rs` sobre
+  `alpc/server.rs`, adaptadores em `ps/user/lpc.rs`): como no 19041, os
+  serviços do LPC antigo são finos sobre o ALPC, e uma porta LPC é uma ALPC
+  Port com o modo LPC (ALPC_PORFLG_LPC_MODE, 0x1000, no Flags dos
+  atributos). NtCreatePort/NtCreateWaitablePort criam a porta de conexão do
+  servidor de usuário (`create_legacy_port`: o MaxMessageLength até o
+  LpcLegacyMaxMessageLength 0x288; MaxConnectionInfoLength e MaxPoolUsage
+  não entram). NtConnectPort/NtSecureConnectPort capturam como o
+  NtSecureConnectPort (PORT_VIEW de 0x30 bytes, REMOTE_PORT_VIEW de 0x18, o
+  QOS e o SID exigido, conferido contra o usuário do token do dono da porta)
+  e criam a porta do cliente com o modo LPC; a seção do PORT_VIEW é mapeada
+  no cliente na conexão e no servidor quando ele recebe a mensagem de
+  conexão pedindo o ALPC_MESSAGE_VIEW_ATTRIBUTE (o csrss, servidor ALPC da
+  `\Windows\ApiPort`, aceita assim a conexão LPC da ntdll) ou a aceita com o
+  REMOTE_PORT_VIEW (`server::ClientView`); a mensagem LPC_CONNECTION_REQUEST
+  leva a informação de conexão e o ClientViewSize, e o cliente acorda com o
+  handle, as bases da vista, o REMOTE_PORT_VIEW da seção do servidor e a
+  informação da resposta. NtListenPort e NtReplyWaitReceivePort(Ex) recebem
+  da fila da porta de conexão (pela porta de conexão ou pela de comunicação),
+  com o PortContext da comunicação e, numa porta LPC, o Type sem os bits
+  internos (máscara 0xC00F do AlpcpReceiveLegacyMessage: o servidor LPC vê
+  LPC_REQUEST, não LPC_REQUEST|LPC_CONTINUATION_REQUIRED); NtReplyPort e a
+  resposta do NtReplyWaitReceivePort respondem pelo MessageId.
+  NtAcceptConnectPort acha a conexão sem a porta de conexão (o MessageId e o
+  CLIENT_ID do PORT_MESSAGE, numa porta de conexão do processo corrente),
+  cria a porta de comunicação com o PortContext e acorda o cliente;
+  NtCompleteConnectPort só devolve STATUS_SUCCESS, como no 19041. Do lado do
+  cliente, NtRequestWaitReplyPort e NtRequestPort usam o transporte ALPC do
+  cliente (`ps/user/alpc.rs`: 0x20000 e 0x10000, com 0xC0000703/0xC0000701
+  trocados por STATUS_PORT_DISCONNECTED/STATUS_LPC_REPLY_LOST); numa porta
+  LPC, Type 0 é sempre um pedido novo, como no AlpcpSendMessage, então o
+  MessageId e o CLIENT_ID que um buffer reaproveitado traz (o
+  CsrClientCallServer manda a mensagem no buffer da resposta anterior) não
+  contam. NtImpersonateClientOfPort e NtAlpcImpersonateClientOfPort
+  impersonam a thread que mandou a mensagem pendente (SeCreateClientSecurity
+  com o QOS da porta do cliente e SeImpersonateClientEx); o
+  NtQueryInformationPort só confere o handle e zera o ReturnLength.
+  NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION
+  (NtReadRequestData/NtWriteRequestData) não existem no transporte:
+  STATUS_NOT_SUPPORTED, com registro. Em volta: NtRegisterThreadTerminatePort
+  (`ps/termination_ports.rs`: o LPC_CLIENT_DIED com o CreateTime para cada
+  porta registrada quando a thread termina), NtSetDefaultHardErrorPort
+  (`ex/hard_error.rs`, só registra a porta) e a ProcessExceptionPort do
+  NtSetInformationProcess (`ps/set_process_information.rs`), que o csrss põe
+  em cada processo da sessão no CsrSbCreateSession. O autoteste
+  `test/multiprocess/lpc_ports.rs` (marcador `LPC_PORTS_OK`, [[teste]]
+  `lpc`) põe um servidor e um cliente de anel 3 conversando por todos esses
+  serviços.
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
@@ -2847,7 +2919,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `USER_INITIALIZED` (o NtUserInitialize do csrss volta com sucesso,
   `initial_process::win32k_service_returned`; no mesmo teste) e
   `WINSTA0_OK` (o wininit.exe com as Desktops Winlogon e Default da
-  WinSta0; ainda não sai: o csrss para no NtCreatePort);
+  WinSta0; ainda não sai: o wininit para no NtUserCreateWindowStation, sem
+  o USER32.dll.mui do idioma da interface);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
   como no `bugcheck`). O `test-boot` procura falhas desde o boot até
