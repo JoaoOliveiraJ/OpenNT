@@ -2150,6 +2150,12 @@ fn user_syscalls_core(assert: Assert) {
     let opened = call("NtOpenDirectoryObject", out, 1, attributes, 0);
     let directory = guest::read64(out);
     assert(opened == 0 && call("NtCreatePartition", 0, 0, 0, 0) == 0xC000_0008, "usercore: diretorio raiz e particao inexistente");
+    // OBJ_KERNEL_HANDLE de UserMode é ignorado (o ObpCaptureObjectCreateInformation
+    // tira o bit), como o services.exe abre o \DriverStores.
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x240);
+    let kernel_flag = call("NtOpenDirectoryObject", out, 1, attributes, 0) == 0 && guest::read64(out) & 0xFFFF_FFFF_8000_0000 == 0;
+    let _ = call("NtClose", guest::read64(out), 0, 0, 0);
+    assert(kernel_flag, "usercore: OBJ_KERNEL_HANDLE de modo usuario ignorado na abertura por nome");
     // NtContinue sobre o frame do syscall.
     assert(call("NtContinue", 0, 0, 0, 0) == 0xC000_0005, "usercore: NtContinue sem contexto");
     let context = block + 0x1000;

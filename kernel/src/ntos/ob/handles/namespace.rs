@@ -88,13 +88,14 @@ fn capture(attributes: u64, from_user_mode: bool) -> Result<Captured, u32> {
     if read_field::<u32>(attributes, offset_of!(ObjectAttributes, length))? != ObjectAttributes::SIZE as u32 {
         return Err(0xC000_000D);
     }
-    let flags = read_field::<u32>(attributes, offset_of!(ObjectAttributes, attributes))?;
+    // O ObpCaptureObjectCreateInformation do ObOpenObjectByNameEx tira o
+    // OBJ_KERNEL_HANDLE de quem vem de UserMode, sem recusar (o
+    // ScInitServiceConfigRoots do services.exe abre o \DriverStores com
+    // 0x240).
+    let flags = read_field::<u32>(attributes, offset_of!(ObjectAttributes, attributes))? & if from_user_mode { !0x200 } else { u32::MAX };
     let root = read_field::<u64>(attributes, offset_of!(ObjectAttributes, root_directory))?;
     let unicode = read_field::<u64>(attributes, offset_of!(ObjectAttributes, object_name))?;
     let security_descriptor = read_field::<u64>(attributes, offset_of!(ObjectAttributes, security_descriptor))?;
-    if from_user_mode && flags & 0x200 != 0 {
-        return Err(STATUS_INVALID_HANDLE);
-    }
     if unicode == 0 {
         return Err(0xC000_0033);
     }
