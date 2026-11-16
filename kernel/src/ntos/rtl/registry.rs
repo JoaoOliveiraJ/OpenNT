@@ -538,8 +538,13 @@ pub fn set_portable_operating_system(portable: bool) -> Result<u32, KernelError>
     write_named_value(REGISTRY_CONTROL, "", "PortableOperatingSystem", REG_DWORD, &(portable as u32).to_le_bytes())
 }
 
-/// RtlCreateRegistryKey: abre criando e fecha o handle.
+/// RtlCreateRegistryKey: abre criando e fecha o handle. Com
+/// RTL_REGISTRY_HANDLE o Path já é a chave aberta do chamador (o
+/// RtlpGetRegistryHandle a devolve como está) e nada muda.
 pub fn create_key(relative_to: u32, path: u64) -> Result<u32, KernelError> {
+    if relative_to & REGISTRY_HANDLE != 0 {
+        return Ok(0);
+    }
     let path = guest_registry_path(relative_to, path);
     let (status, handle) = key_services::open_path(&path, true)?;
     if handle != 0 {
@@ -548,15 +553,19 @@ pub fn create_key(relative_to: u32, path: u64) -> Result<u32, KernelError> {
     Ok(status)
 }
 
-/// RtlDeleteRegistryValue.
+/// RtlDeleteRegistryValue. Com RTL_REGISTRY_HANDLE o Path é a chave aberta
+/// do chamador, que continua dono do handle (o volmgr.sys apaga assim o
+/// IsDeleted da chave de hardware que o IoOpenDeviceRegistryKey lhe abre).
 pub fn delete_value(relative_to: u32, path: u64, value_name: u64) -> Result<u32, KernelError> {
-    let path = guest_registry_path(relative_to, path);
-    let (status, handle) = key_services::open_path(&path, false)?;
+    let by_handle = relative_to & REGISTRY_HANDLE != 0;
+    let (status, handle) = if by_handle { (0, path) } else { key_services::open_path(&guest_registry_path(relative_to, path), false)? };
     if status != 0 {
         return Ok(status);
     }
     let result = key_services::named_value(key_services::Kind::DeleteValue, handle, &guest_strings::read_wide_string(value_name), 0, &[]);
-    cm_registry::close_handle(handle as u32);
+    if !by_handle {
+        cm_registry::close_handle(handle as u32);
+    }
     Ok(result?.0)
 }
 

@@ -3724,6 +3724,14 @@ fn rtl_group_exports(assert: Assert) {
     let written_by_handle = handle != 0 && call("RtlWriteRegistryValue", &[0x4000_0000, handle, value_name, 4, data, 4]) == 0;
     guest::write32(direct, 0);
     assert(written_by_handle && call("RtlQueryRegistryValues", &[0x4000_0000, handle, table, 0, 0]) == 0 && guest::read32(direct) == 0x4321, "rtl: RtlWriteRegistryValue com RTL_REGISTRY_HANDLE");
+    // RtlDeleteRegistryValue e RtlCreateRegistryKey com RTL_REGISTRY_HANDLE
+    // usam a chave do handle (o volmgr.sys apaga assim o IsDeleted da chave
+    // de hardware do volume) e não o fecham.
+    let deleted_by_handle = handle != 0 && call("RtlDeleteRegistryValue", &[0x4000_0000, handle, value_name]) == 0;
+    let already_deleted = handle != 0 && call("RtlDeleteRegistryValue", &[0x4000_0000, handle, value_name]) as u32 == 0xC000_0034;
+    let created_by_handle = handle != 0 && call("RtlCreateRegistryKey", &[0x4000_0000, handle]) == 0;
+    let rewritten = handle != 0 && call("RtlWriteRegistryValue", &[0x4000_0000, handle, value_name, 4, data, 4]) == 0;
+    assert(deleted_by_handle && already_deleted && created_by_handle && rewritten, "rtl: RtlDeleteRegistryValue e RtlCreateRegistryKey com RTL_REGISTRY_HANDLE");
     if handle != 0 {
         crate::ntos::cm::registry::close_handle(handle as u32);
     }
