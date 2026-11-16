@@ -2609,8 +2609,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     abertura de modo usuário leva RequestorMode = UserMode e a thread que
     pede no IRP (o npfs.sys guarda o PID do cliente por ela).
   - NtReadFile/NtWriteFile de um arquivo de driver de neither I/O,
-    NtFsControlFile (o IopXxxControlFile com IRP_MN_USER_FS_REQUEST,
-    METHOD_BUFFERED e METHOD_NEITHER, acesso do código conferido) e
+    NtFsControlFile (o IopXxxControlFile com IRP_MN_USER_FS_REQUEST, acesso
+    do código conferido), o NtDeviceIoControlFile de um driver nativo com
+    METHOD_IN_DIRECT, METHOD_OUT_DIRECT ou com evento (depois do
+    FastIoDeviceControl; a entrada num SystemBuffer e a saída num MDL das
+    páginas de usuário travadas, que a conclusão destrava e libera) e
     NtQueryInformationFile/NtSetInformationFile de qualquer arquivo de
     driver montam o IRP como o I/O Manager: Tail.Overlay.Thread,
     OriginalFileObject, UserMode, UserIosb, UserEvent, UserBuffer, o
@@ -2852,10 +2855,29 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   19041 ele só escolhe o OwnerProcessId, `ps/create_context.rs`), e o
   BaseSrvCreateProcess do csrss lê a ProcessConsoleHostProcess (o
   OwnerProcessId) e a ProcessSequenceNumber do processo novo
-  (`ps/user/syscalls_core.rs`). Ali o caminho para: o CsrImpersonateClient
-  do csrss não acha a thread CSR do cliente no TEB.CsrClientThread e o
-  pedido volta STATUS_BAD_IMPERSONATION_LEVEL, o kernelbase termina o
-  services.exe e o wininit sai com ERROR_BAD_IMPERSONATION_LEVEL. O smss da
+  (`ps/user/syscalls_core.rs`). O CsrImpersonateClient do csrss impersona o
+  wininit pelo NtImpersonateThread e o sxssrv.dll gera o contexto de
+  ativação padrão do sistema com os manifestos de WinSxS que o xtask copia.
+  O pool de threads do wininit espera o fim do services.exe por um pacote de
+  espera sobre o processo, e o wininit cria o lsass.exe. O services.exe
+  roda o SvcctrlMain: as proteções do ProcessMitigationPolicy, o
+  ScGetPrivilege (NtDuplicateToken e NtPrivilegeCheck), o
+  ScInitServiceConfigRoots e o ScInitDatabase com as chaves de serviço;
+  depois espera o `LSA_RPC_SERVER_ACTIVE` do lsass, antes do início
+  automático dos serviços. O lsass.exe pede a base de prioridade 9, abre o
+  `\Security\LSA_AUTHENTICATION_INITIALIZED`, conecta ao Reference Monitor
+  (`LSASS_STARTED`, o teste services), carrega o lsasrv.dll e as extensões e
+  sobe as portas RPC `\RPC Control\lsapolicylookup` e
+  `\RPC Control\lsasspirpc`. O SendRequestForNextAsyncKsecddCall deixa
+  pendente no `\Device\KsecDD` o pedido METHOD_OUT_DIRECT 0x39006a (o
+  ksecdd.sys o põe na fila CSQ dele), e o lsass cria o
+  `LSA_RPC_SERVER_ACTIVE`. O services.exe acorda, faz a primeira chamada
+  RPC ao lsass pela ALPC (`\RPC Control\lsapolicylookup`) e chega ao
+  ScExtInitialize. Ali para: o scesrv.dll do ScesrvInitializeServer não está
+  no volume e o services.exe termina com código 0, antes do
+  ScEnableRpcInterface e do início automático; o svchost do LSM não é
+  criado. Com o scesrv.dll no volume, o heap do kernel (a janela de 64 MB)
+  acaba ao mapear a imagem. O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
@@ -2944,6 +2966,63 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `test/multiprocess/lpc_ports.rs` (marcador `LPC_PORTS_OK`, [[teste]]
   `lpc`) põe um servidor e um cliente de anel 3 conversando por todos esses
   serviços.
+- **A impersonação entre threads** (`ps/security.rs`, adaptador em
+  `ps/user/tokens.rs`): o NtImpersonateThread(ServerThread, ClientThread,
+  SecurityQos) do 19041 copia o QOS de modo usuário (alinhado a 4, sem
+  conferir o Length), referencia o handle do cliente com
+  THREAD_DIRECT_IMPERSONATION antes do handle do servidor com
+  THREAD_IMPERSONATE e faz o SeCreateClientSecurity do cliente e o
+  SeImpersonateClientEx no servidor. É o CsrImpersonateClient do csrsrv.dll
+  (o ThreadHandle da CSR_THREAD do TEB.CsrClientThread). O mesmo corpo serve
+  ao NtAlpcImpersonateClientOfPort, com a thread corrente como servidora.
+- **O que o services.exe e o lsass.exe pedem ao kernel ao iniciar**: o
+  NtDuplicateToken de modo usuário (`ps/user/tokens.rs` sobre
+  `se/token/duplicate.rs`; o RtlAcquirePrivilege da ntdll duplica o próprio
+  token para ligar um privilégio, e o ScGetPrivilege do services.exe sai sem
+  ele); a ProcessMitigationPolicy do processo corrente
+  (`ps/mitigation_policy.rs`: código dinâmico, pontos de extensão,
+  assinatura e fontes, com as recusas do 19041); a ProcessBasePriority
+  (`ps/set_process_information.rs`); o pacote de espera sobre um processo
+  (`ps/user/wait_packets.rs`: o pool de threads do wininit espera assim o
+  fim do services.exe); e o diretório `\Security` com o evento
+  `LSA_AUTHENTICATION_INITIALIZED` do SepInitializationPhase1
+  (`se/initialization.rs`), que o lsass.exe abre. Os dados vêm desta máquina
+  no build: o contexto de ativação padrão do sistema, que o sxssrv.dll gera
+  no primeiro CreateProcessW, precisa das chaves de SideBySide\Winners e dos
+  manifestos de WinSxS do Microsoft.Windows.SystemCompatible e das
+  dependências obrigatórias dele (`xtask/src/side_by_side.rs`); o
+  services.exe lê as chaves de serviço da cadeia do LSM (DcomLaunch,
+  RpcEptMapper, RpcSs e LSM), o Control\ServiceGroupOrder e os grupos do
+  svchost (`xtask/src/user_services.rs`).
+- **O servidor de comandos do Reference Monitor** (`se/reference_monitor.rs`
+  sobre o lado servidor LPC de modo kernel de `alpc/lpc.rs`): o
+  SeRmInitPhase1 cria a porta LPC `\SeRmCommandPort` (ZwCreatePort,
+  MaxMessageLength 0x200) e a thread de sistema do SepRmCommandServerThread
+  antes do primeiro processo de usuário. A thread repete o
+  ZwReplyWaitReceivePort (a resposta do comando anterior e a próxima
+  mensagem, numa espera de kernel sem prazo). O lsass.exe conecta no
+  LsapRmInitializeServer: o SepRmLsaConnectRequest abre o processo dele pelo
+  CLIENT_ID da mensagem, aceita com o PortContext do silo hospedeiro e o
+  REMOTE_PORT_VIEW (ZwAcceptConnectPort e ZwCompleteConnectPort) e conecta de
+  volta à `\SeLsaCommandPort` do lsass (ZwSecureConnectPort com o QOS de
+  impersonação dinâmica), que precisa devolver o MaxMessageLength 0x200; um
+  segundo LSA é recusado. O estado é a SEP_RM_LSA_CONNECTION_STATE dos
+  símbolos. Os comandos RM_COMMAND_MESSAGE (`inc/types/extra_obpsse.rs`) de 1
+  a 12 vão à tabela SepRmCommandDispatch, que grava o ReturnedStatus na
+  resposta: o RmAuditSetCommand põe a política de auditoria
+  (`se/audit.rs::set_policy_from_lsa`, o SepRmSetAuditEventWrkr com o código
+  1/2/4 por categoria), e o RmCreateLogonSession e o RmDeleteLogonSession
+  criam e apagam sessões de logon (`se/logon_session.rs`, com
+  STATUS_LOGON_SESSION_COLLISION e STATUS_BAD_LOGON_SESSION_STATE como no
+  NT). Os comandos 4 a 12 respondem STATUS_NOT_SUPPORTED, com registro. A
+  conexão de volta ainda não leva o PORT_VIEW de 4 KB do NT (o
+  ZwSecureConnectPort de kernel não monta vistas), e o SepRmCallLsa (os
+  comandos do Reference Monitor ao LSA) ainda não existe. O lado servidor
+  LPC de modo kernel são o ZwCreatePort, o ZwReplyWaitReceivePort (a
+  recepção legada com o PortContext, `server::begin_kernel_legacy_receive`),
+  o ZwAcceptConnectPort (o `server::accept_legacy` em KernelMode) e o
+  ZwCompleteConnectPort; o autoteste `test/kernel_waits.rs` põe um servidor e
+  um cliente LPC de kernel em threads de sistema.
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,
@@ -2970,7 +3049,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     ZwAlpcCreatePort, ZwAlpcAcceptConnectPort e a recepção do
     ZwAlpcSendWaitReceivePort pela continuação de kernel) e o LPC de modo
     kernel sobre ele (`alpc/lpc.rs`: LpcRequestPort, LpcSendWaitReceivePort
-    e ZwSecureConnectPort, sem as vistas de seção do LPC);
+    e ZwSecureConnectPort, sem as vistas de seção do LPC, e o lado servidor
+    do Reference Monitor, no item dele);
   - a abertura de kernel de um nome dentro de um dispositivo sem volume e a
     abertura relativa a um handle de arquivo de dispositivo
     (`io/file/zw.rs`, `io/io_manager.rs::open_related_device_file`), com a

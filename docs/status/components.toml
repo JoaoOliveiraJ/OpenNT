@@ -253,6 +253,13 @@ espera_falha = true
 descricao = "O boot do teste winlogon com o xtask lendo a tela do QEMU a cada 2 s (--watch-screen). O vídeo de boot (o modo VBE 1024x768 do BasicDisplay.sys) é todo preto. O marcador FIRST_PIXEL_OK sai quando uma tela gráfica de pelo menos 800x600 mostra 64 pixels ou mais fora do preto, sem ser a tela de bugcheck, e a tela vai para build/primeiro-pixel/primeira-tela.png. Ainda falha: o vídeo físico da sessão 1 só chega ao win32k quando o Local Session Manager (lsm.dll, num svchost do services.exe) conecta a sessão ao console. O csrss faz então o NtUserRemoteConnect, o win32k chama o DxgkSessionConnected e o dxgkrnl entrega o adaptador à sessão, que carrega o cdd.dll. Sem o LSM, o InitVideo da sessão 1 usa só o dispositivo desconectado (\\Device\\Disc) e nada chega ao framebuffer."
 
 [[teste]]
+id = "services"
+titulo = "services.exe e lsass.exe reais na sessão 0"
+marcador = "LSASS_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/services --smp=1 --expect=WINSTA0_OK --expect=LSASS_STARTED"
+descricao = "Com o smss real e --display=basic, o wininit.exe cria o services.exe pelo CreateProcessW: o BaseSrvCreateProcess do csrss impersona o wininit (NtImpersonateThread, o CsrImpersonateClient) e o sxssrv.dll gera o contexto de ativação padrão do sistema pelos manifestos de WinSxS desta instalação. O pool de threads do wininit espera o fim do services.exe por um pacote de espera sobre o processo e o wininit cria o lsass.exe. O services.exe passa do ProcessMitigationPolicy, do NtDuplicateToken e do NtPrivilegeCheck, monta o banco de serviços e espera o LSA_RPC_SERVER_ACTIVE. O lsass.exe pede a base de prioridade 9, abre o \\Security\\LSA_AUTHENTICATION_INITIALIZED que o kernel cria e conecta ao Reference Monitor pela \\SeRmCommandPort; o kernel aceita e conecta de volta à \\SeLsaCommandPort do lsass (LSASS_STARTED). Depois o lsass carrega o lsasrv.dll, sobe as portas RPC lsapolicylookup e lsasspirpc, deixa pendente no \\Device\\KsecDD o pedido METHOD_OUT_DIRECT 0x39006a (o IRP com o MDL das páginas de usuário) e cria o LSA_RPC_SERVER_ACTIVE; o services.exe faz a primeira chamada RPC ao lsass pela ALPC."
+
+[[teste]]
 id = "pagefile"
 titulo = "Arquivo de paginação do smss.exe real e pressão de memória"
 marcador = "PAGEFILE_OK"
@@ -1499,9 +1506,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop. Na sessão 0, o wininit.exe real cria a WinSta0 e as Desktops dele e cria o services.exe real."
+atual = "O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop. Na sessão 0, o wininit.exe real cria a WinSta0 e as Desktops dele e cria o services.exe e o lsass.exe reais; o lsass conecta ao Reference Monitor do kernel e sobe as portas RPC do LSA."
 teste = "winlogon"
-proximo = "O BaseSrvCreateProcess do csrss aceitar o services.exe (o CsrImpersonateClient sem a thread CSR do cliente devolve STATUS_BAD_IMPERSONATION_LEVEL), o services.exe subir o svchost do Local Session Manager (lsm.dll) e o LSM sinalizar o TermSrvReadyEvent e conectar a sessão 1 ao console. O winlogon.exe espera esse evento no WinStationWaitForConnect, e o win32k da sessão 1 só recebe o vídeo físico pelo NtUserRemoteConnect que o csrss faz a pedido do LSM (teste primeiro-pixel)."
+proximo = "O services.exe passar do ScExtInitialize (o scesrv.dll no volume, e o heap do kernel, a janela de 64 MB, com espaço para mapear a imagem) e seguir ao ScEnableRpcInterface e ao início automático: o svchost do DcomLaunch e do Local Session Manager (lsm.dll), que sinaliza o TermSrvReadyEvent e conecta a sessão 1 ao console. O winlogon.exe espera esse evento no WinStationWaitForConnect, e o win32k da sessão 1 só recebe o vídeo físico pelo NtUserRemoteConnect que o csrss faz a pedido do LSM (teste primeiro-pixel)."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1527,7 +1534,7 @@ nome = "A WinSta0 do wininit.exe"
 grupo = "marco"
 teste = "winsta0"
 faz = "O wininit.exe real registra o processo de logon, cria a WinSta0 e as Desktops Winlogon, Disconnect e Default, chama o SwitchDesktop, sobe o servidor RPC \\PIPE\\InitShutdown e cria o services.exe."
-para = "O csrss recusa o services.exe no BaseSrvCreateProcess (STATUS_BAD_IMPERSONATION_LEVEL) e o wininit sai."
+para = "O wininit cria também o lsass.exe e segue (teste services)."
 
 [[roda]]
 nome = "As Desktops do winlogon.exe"
@@ -1607,7 +1614,7 @@ para = "A sessão 0 é a de serviços e usa o dispositivo de exibição desconec
 [[roda]]
 nome = "Programas Win32 (.exe)"
 grupo = "marco"
-faz = "O smss.exe, o csrss.exe, o wininit.exe e o winlogon.exe reais rodam no boot com o smss; o services.exe é criado, mas o csrss o recusa."
+faz = "O smss.exe, o csrss.exe, o wininit.exe, o winlogon.exe, o services.exe e o lsass.exe reais rodam no boot com o smss."
 para = "O shell ainda não executa .exe e não há sessão de usuário."
 
 [[roda]]
