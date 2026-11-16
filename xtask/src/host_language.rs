@@ -25,7 +25,7 @@ pub struct HostKey {
 }
 
 #[cfg(windows)]
-mod registry {
+pub(crate) mod registry {
     use super::HostKey;
 
     type Hkey = isize;

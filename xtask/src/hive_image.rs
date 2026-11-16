@@ -392,17 +392,24 @@ fn seed_of(key: crate::host_language::HostKey) -> cm::seed::SeedKey {
 /// do processo inicial real (`--initial-process=smss`).
 pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
     let mut system = cm::seed::system_keys(smss_boot);
+    let mut software = cm::seed::software_keys(smss_boot);
     let mut default = cm::seed::default_keys();
     // No boot do processo inicial real, o idioma desta instalação
     // (`host_language`): a SYSTEM e a DEFAULT levam as chaves daqui.
     if smss_boot {
         let control_set = format!("ControlSet{:03}", cm::seed::CURRENT_CONTROL_SET);
         system.extend(crate::host_language::system_keys(&control_set).into_iter().map(seed_of));
+        // Os serviços Win32 da cadeia do LSM (`user_services`).
+        system.extend(crate::user_services::system_keys(&control_set).into_iter().map(seed_of));
+        software.extend(crate::user_services::software_keys().into_iter().map(seed_of));
         default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
+        // E a SOFTWARE, os assemblies lado a lado do contexto de ativação
+        // padrão do sistema (`side_by_side`).
+        software.extend(crate::side_by_side::software_keys(&crate::windows_binaries::windows_directory()).into_iter().map(seed_of));
     }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
         ("SYSTEM", system),
-        ("SOFTWARE", cm::seed::software_keys(smss_boot)),
+        ("SOFTWARE", software),
         ("SAM", cm::seed::sam_keys()),
         ("SECURITY", cm::seed::security_keys()),
         ("DEFAULT", default),

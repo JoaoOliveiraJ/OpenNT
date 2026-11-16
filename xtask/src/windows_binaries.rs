@@ -320,6 +320,15 @@ const SMSS_PROGRAMS: &[&str] = &[
     "powrprof.dll",
     "imm32.dll",
     "kbdus.dll",
+    // A cadeia do Local Session Manager que o services.exe inicia
+    // (`user_services`): o svchost.exe, os ServiceDll do DcomLaunch e do
+    // RpcSs (rpcss.dll), do RpcEptMapper (RpcEpMap.dll) e do LSM (lsm.dll),
+    // e o dwmapi.dll que o lsm.dll importa.
+    "svchost.exe",
+    "rpcss.dll",
+    "rpcepmap.dll",
+    "lsm.dll",
+    "dwmapi.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
@@ -335,7 +344,7 @@ const SMSS_KERNEL_IMAGES: &[(&str, &str)] = &[
     ("CDD.DLL", "System32/cdd.dll"),
 ];
 
-fn windows_directory() -> PathBuf {
+pub fn windows_directory() -> PathBuf {
     std::env::var("SystemRoot").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Windows"))
 }
 
@@ -575,6 +584,16 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("recursos .mui no volume NTFS: {resources} (idiomas {})", languages.join(", "));
+        // Os manifestos dos assemblies lado a lado do contexto de ativação
+        // padrão do sistema (`side_by_side`), no caminho de WinSxS.
+        let mut manifests = 0;
+        for (path, source) in crate::side_by_side::manifest_files(&windows) {
+            if let Ok(bytes) = fs::read(&source) {
+                files.push((path, bytes));
+                manifests += 1;
+            }
+        }
+        println!("manifestos de WinSxS no volume NTFS: {manifests}");
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
