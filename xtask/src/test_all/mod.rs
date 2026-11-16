@@ -314,7 +314,8 @@ fn wait_for_memory(context: &Context, run: &Run, test: &Test, recent: &mut Vec<(
         if available >= need + starting || context.running.load(Ordering::SeqCst) == 0 {
             break;
         }
-        if !warned {
+        // A espera curta pelos QEMUs recentes não é falta de memória.
+        if !warned && starting == 0 {
             let width = context.width;
             context.console.say(&format!(
                 "{:<14} {:<width$}  commit livre {}, precisa {}",
