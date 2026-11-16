@@ -1493,6 +1493,38 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   E/S, o congelamento e os silos respondem STATUS_NOT_SUPPORTED. As
   notificações vão para a IOCP fora da trava dos jobs (o `Outbox`). Teste:
   `ntos/test/multiprocess/jobs.rs` (`JOBS_OK`).
+- **ETW** (`ntos/etw/`): um registro único de provedores
+  (`provider_state.rs`): uma ETW_GUID_ENTRY do pool por GUID, silo e tipo
+  (provedor de trace ou GUID de notificação), com os oito TRACE_ENABLE_INFO
+  das sessões e o ProviderEnableInfo agregado que o EtwEventEnabled e o
+  EtwProviderEnabled leem; cada registro é um ETW_REG_ENTRY no RegListHead
+  dela. Os de kernel (EtwRegister, EtwRegisterClassicProvider) vêm do pool
+  e recebem as mudanças pela rotina de habilitação nativa; os de modo
+  usuário (`user_registration.rs`) são o corpo de um objeto
+  EtwRegistration criado pelo NtTraceControl 15 (EtwpRegisterUMGuid) com o
+  handle na tabela do processo, apagados pela DeleteProcedure quando a
+  ntdll fecha o handle, e recebem as mudanças como pacote
+  ETWP_NOTIFICATION_HEADER na fila do processo (o EPROCESS.EtwDataSource
+  guarda o evento que o EtwAddNotificationEvent registrou; a ntdll lê o
+  pacote pelo NtTraceControl 16 e chama o callback do EventRegister). As
+  sessões (`logger.rs`, NtTraceControl 1-7) têm buffers de verdade
+  (WMI_BUFFER_HEADER e registros EVENT_HEADER com HeaderType 0xC013, itens
+  estendidos e dados), Flush e Stop; EtwWrite/EtwWriteTransfer/EtwWriteEx/
+  EtwWriteString e o NtTraceEvent 0x300 da ntdll entregam só às sessões
+  cujo nível e keywords aceitam o evento. EtwSetInformation guarda os
+  traits validados (STATUS_FILE_CORRUPT_ERROR mal formados) e liga o tipo
+  dos descritores; EtwActivityIdControl usa o TEB.ActivityId da thread
+  (thread de sistema: STATUS_NOT_SUPPORTED) e a semente do
+  KPRCB.EtwSupport para IDs novos. O despacho do NtTraceControl valida os
+  43 códigos como o 19041; ficam sem implementação (STATUS_INVALID_DEVICE_REQUEST
+  depois da validação) os consumidores de tempo real, o EnableTraceEx2 de
+  modo usuário (17), as respostas a notificações, as listas de GUIDs e
+  grupos, WDI, compressão e sessões privadas, que nenhum processo do boot
+  usa; os grupos de provedores dos traits, os eventos de imagem do
+  EtwTrackProviderBinary, os loggers clássicos por TRACEHANDLE (NtTraceEvent
+  0x200) e os autologgers do Registro também não existem. Testes:
+  `etw_trace_session` e `etw_user_registration` na fase 6; o marcador
+  `ETW_USER_REGISTRATION_OK` no boot do smss real.
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o
   KdPitchDebugger de um boot sem depurador, KdPowerTransitionEx sem efeito

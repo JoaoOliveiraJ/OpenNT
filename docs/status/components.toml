@@ -203,6 +203,13 @@ comando = "cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --b
 descricao = "Com --initial-process=smss, o primeiro processo de usuário é o smss.exe real, protegido e crítico como no Windows, com a ntdll real. Ele lê a configuração do Session Manager no Registro, monta o \\KnownDlls, os DosDevices, \\Sessions e os prefixos protegidos dos pipes e mailslots, abre o \\SmApiPort e cria pela chamada de sistema do Windows o smss da sessão, numa sessão nova, que herda os handles dele e se conecta ao \\SmApiPort. O marcador sai quando uma thread do csrss.exe criado por esse smss pede pela primeira vez um serviço do win32k.sys (que o smss da sessão já carregou), com o smss inicial e o csrss vivos."
 
 [[teste]]
+id = "etw-user"
+titulo = "Provedores ETW da ntdll real"
+marcador = "ETW_USER_REGISTRATION_OK"
+comando = "cargo xtask test-boot ETW_USER_REGISTRATION_OK 300000 --initial-process=smss --build-dir=build/etw-user --smp=1"
+descricao = "No boot do smss real, o EventRegister da ntdll registra os provedores ETW do processo pelo NtTraceControl como no Windows: o EtwAddNotificationEvent guarda o evento da fila de notificações do processo e o EtwRegisterGuids cria o objeto EtwRegistration de cada provedor, com o handle na tabela do processo e o estado de habilitação das sessões. O marcador sai no primeiro registro de modo usuário, com o GUID do provedor e o handle."
+
+[[teste]]
 id = "win32k"
 titulo = "win32k.sys real carregado pelo smss.exe"
 marcador = "WIN32K_LOADED"
@@ -1105,6 +1112,7 @@ nome = "Rastreamento (Etw)"
 icone = "chart"
 descricao = "Event Tracing for Windows."
 fase = "4"
+notas = "Um registro único de provedores (entradas de GUID com os TRACE_ENABLE_INFO das sessões) para os drivers (EtwRegister, EtwWrite, EtwWriteEx, EtwWriteString, EtwEventEnabled, EtwSetInformation com traits) e para a ntdll real: o NtTraceControl registra os provedores de modo usuário como objetos EtwRegistration com handle no processo e entrega as habilitações como notificação na fila do processo; o NtTraceEvent da ntdll grava nas sessões. As sessões do StartTrace têm buffers de verdade com registros EVENT_HEADER, Flush e Stop. Ainda não há consumidores de tempo real, arquivos .etl, EnableTraceEx2 de modo usuário nem autologgers."
 
 [[subsistema]]
 pasta = "ntos/dbgk"
