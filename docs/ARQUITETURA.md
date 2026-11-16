@@ -1910,6 +1910,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     parado tinha SpinLock ou SharedLock.
   - O DbgPrint vai ao host como pacote `O` com a máquina rodando
     (`kd/print_log.rs`).
+  - Serviço de depuração do modo usuário (`kd/debug_service.rs`). O portão
+    0x2D da IDT tem DPL 3, como o KiDebugServiceTrap. Com um host anexado
+    (bits 0 e 1 do KUSER_SHARED_DATA.KdDebuggerEnabled), o DbgPrint da
+    ntdll faz `int 0x2D` seguido de `int3`. A HAL salva o vetor 0x2D como
+    STATUS_BREAKPOINT. O despacho de primeira chance
+    (`ps/user/exceptions.rs`) monta o registro do trap (endereço depois do
+    `int3`, serviço em ExceptionInformation[0]) e chama o KdTrap antes de
+    entregar ao processo. Sem depurador (KdpStub), os serviços 1, 3, 4 e 5
+    só pulam o `int3`. Com ele (KdpTrap), o serviço 1 é o KdpPrint: o filtro
+    de `kd/debug_filter.rs`, até 512 bytes abaixo de MmUserProbeAddress, o
+    anel do DbgPrint e o host, e o status no RAX. O prompt (serviço 2) segue
+    ao processo, porque o transporte do OpenNT não o atende. O
+    NtQueryDebugFilterState usa o mesmo filtro. Antes, o portão tinha DPL 0
+    e o DbgPrint virava STATUS_ACCESS_VIOLATION no processo. Com o
+    depurador anexado cedo, o csrss.exe morria assim na thread que inicia o
+    RawInputThread: a espera dela numa seção crítica disputada voltava com
+    STATUS_TIMEOUT (a PEB saía com CriticalSectionTimeout 0) e a ntdll
+    avisava pelo DbgPrint.
   - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
     `int 3`/#DB, e os comparadores de hardware são carregados só no
     processador da parada.
@@ -2214,7 +2232,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do pai, se pedida; anexado ao processo
   novo, as cópias de sistema, o executável, a pilha, a PEB
   (`mm/peb_teb.rs`, o MmCreatePeb: imagem, ApiSetMap +0x68, NLS, heap,
-  versão, subsistema da imagem; PEB.Ldr NULL para a ntdll), a PEB_LDR_DATA
+  versão, subsistema da imagem; PEB.Ldr NULL para a ntdll;
+  CriticalSectionTimeout com o MmCriticalSectionTimeout, os segundos do
+  `CriticalSectionTimeout` do Session Manager vezes -10.000.000, 30 dias
+  por padrão; com mais de uma hora a ntdll espera sem prazo numa seção
+  crítica), a PEB_LDR_DATA
   do loader do kernel (`loader::create_kernel_ldr`), os parâmetros
   (`ps/process_parameters.rs`, o RtlCreateProcessParametersEx: bloco
   auto-relativo com ImagePathName, CommandLine, diretório corrente, DLLs,
