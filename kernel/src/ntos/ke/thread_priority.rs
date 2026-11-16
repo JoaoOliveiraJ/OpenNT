@@ -179,3 +179,33 @@ pub fn set_base_priority(thread: u64, requested_increment: u64) -> Result<i32, K
     thread_dispatch::complete_priority_change(&deferred);
     Ok(previous)
 }
+
+/// KeSetPriorityAndQuantumProcess (sem o quantum, que o OpenNT não tem por
+/// processo): a nova base do processo (zero vira 1) e, em cada thread de
+/// `threads`, a base com o mesmo incremento sobre a base do processo (ou a
+/// saturação, nas threads saturadas), pelo KeSetBasePriorityThread, que
+/// limita a faixa e leva a diferença à prioridade dinâmica. Devolve a base
+/// anterior do processo.
+pub fn set_process_base_priority(process: u64, base: i32, threads: &[u64]) -> Result<i32, KernelError> {
+    // SAFETY: KPROCESS vivo do chamador.
+    let kprocess = unsafe { Kprocess::at(process) };
+    let previous = kprocess.base_priority.get() as i32;
+    let base = if base == 0 { 1 } else { base };
+    if base == previous {
+        return Ok(previous);
+    }
+    // Os incrementos são medidos contra a base antiga, antes da troca.
+    let increments: Vec<(u64, i32)> = threads
+        .iter()
+        .filter(|&&thread| !thread_dispatch::is_idle_thread(thread))
+        .map(|&thread| {
+            let saturation = kthread(thread).saturation.get() as i32;
+            (thread, if saturation != 0 { saturation * 16 } else { query_base_priority(thread) - previous })
+        })
+        .collect();
+    kprocess.base_priority.set(base as i8);
+    for (thread, increment) in increments {
+        set_base_priority(thread, increment as i64 as u64)?;
+    }
+    Ok(previous)
+}

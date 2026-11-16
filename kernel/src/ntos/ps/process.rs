@@ -1175,6 +1175,11 @@ pub struct ActiveProcess {
     pub threads: Vec<u64>,
 }
 
+/// As threads vivas do processo (a ThreadListHead do KPROCESS).
+pub fn threads_of_process(process: u64) -> Vec<u64> {
+    STATE.lock().threads.values().filter(|record| record.process == process && !record.runtime_dead).map(|record| record.pointer).collect()
+}
+
 /// Caminha PsActiveProcessHead (como o `!process` do WinDbg).
 pub fn list_active_processes() -> Vec<ActiveProcess> {
     let head = STATE.lock().active_head;

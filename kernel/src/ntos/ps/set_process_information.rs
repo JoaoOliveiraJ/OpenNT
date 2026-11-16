@@ -39,6 +39,20 @@
 //!   STATUS_INVALID_PARAMETER. A porta anterior recebe o aviso da troca (o
 //!   datagrama de tipo 13 com o PID) e é solta; o fim do processo solta a
 //!   porta corrente.
+//! - ProcessPriorityClass (18): o PROCESS_PRIORITY_CLASS de 2 bytes
+//!   (Foreground e PriorityClass; outro tamanho dá
+//!   STATUS_INFO_LENGTH_MISMATCH), o processo com PROCESS_SET_INFORMATION e
+//!   o PspSetProcessPriorityClass: classe acima de ABOVE_NORMAL (6) dá
+//!   STATUS_INVALID_PARAMETER, a de tempo real nova exige
+//!   SeIncreaseBasePriorityPrivilege (STATUS_PRIVILEGE_NOT_HELD) e um job com
+//!   JOB_OBJECT_LIMIT_PRIORITY_CLASS impõe a classe dele; depois o
+//!   PsSetProcessPriorityByClass leva a base da classe ao processo e às
+//!   threads dele (o SetPriorityClass do kernelbase; o wininit pede
+//!   HIGH_PRIORITY_CLASS e sai se não consegue).
+//! - ProcessForegroundInformation (25): um BOOLEAN, o processo com
+//!   PROCESS_SET_LIMITED_INFORMATION e o PsSetProcessPriorityByClass com o
+//!   modo de primeiro plano ou de fundo (o csrss põe os processos novos em
+//!   fundo).
 //!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
@@ -70,14 +84,25 @@ const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 /// SeTcbPrivilege.
 const TCB_PRIVILEGE: u64 = 7;
+/// PROCESS_SET_LIMITED_INFORMATION.
+const PROCESS_SET_LIMITED_INFORMATION: u32 = 0x2000;
+/// SeIncreaseBasePriorityPrivilege.
+const INCREASE_BASE_PRIORITY_PRIVILEGE: u64 = 14;
+/// PROCESS_PRIORITY_CLASS_REALTIME e ABOVE_NORMAL (a maior).
+const PRIORITY_CLASS_REALTIME: u8 = 4;
+const PRIORITY_CLASS_ABOVE_NORMAL: u8 = 6;
+/// JOB_OBJECT_LIMIT_PRIORITY_CLASS.
+const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x20;
 /// PROCESSINFOCLASS.
 pub const PROCESS_EXCEPTION_PORT: u32 = 8;
 pub const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
+pub const PROCESS_PRIORITY_CLASS: u32 = 18;
+pub const PROCESS_FOREGROUND_INFORMATION: u32 = 25;
 pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 pub const PROCESS_DEBUG_FLAGS: u32 = 31;
 pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
 /// As classes desta área.
-pub const CLASSES: [u32; 5] = [PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
+pub const CLASSES: [u32; 7] = [PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
 /// PROCESS_DEBUG_INHERIT, o único bit de ProcessDebugFlags.
 const PROCESS_DEBUG_INHERIT: u32 = 1;
 /// SEM_NOALIGNMENTFAULTEXCEPT do modo de erro.
@@ -245,6 +270,50 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
             Ok(0)
         }
         PROCESS_EXCEPTION_PORT => set_exception_port(mode, buffer, length, process_of),
+        PROCESS_PRIORITY_CLASS => {
+            if length != 2 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            // PROCESS_PRIORITY_CLASS: Foreground e PriorityClass.
+            let captured = if mode != 0 {
+                if !user_probe::probe_user_read(buffer, 2) {
+                    return Ok(STATUS_ACCESS_VIOLATION);
+                }
+                guest::try_read::<u16>(buffer)?
+            } else {
+                // SAFETY: buffer de entrada de um chamador de modo kernel.
+                unsafe { Field::<u16>::at(buffer) }.get()
+            };
+            let process = match process_of(PROCESS_SET_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            let status = set_priority_class(process, (captured >> 8) as u8, mode);
+            if status == 0 {
+                crate::ntos::ps::process_accessors::set_priority_by_class(process, (captured & 0xFF != 0) as u32);
+            }
+            Ok(status)
+        }
+        PROCESS_FOREGROUND_INFORMATION => {
+            if length != 1 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let foreground = if mode != 0 {
+                if !user_probe::probe_user_read(buffer, 1) {
+                    return Ok(STATUS_ACCESS_VIOLATION);
+                }
+                guest::try_read::<u8>(buffer)?
+            } else {
+                // SAFETY: buffer de entrada de um chamador de modo kernel.
+                unsafe { Field::<u8>::at(buffer) }.get()
+            };
+            let process = match process_of(PROCESS_SET_LIMITED_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            crate::ntos::ps::process_accessors::set_priority_by_class(process, (foreground != 0) as u32);
+            Ok(0)
+        }
         _ => {
             crate::debug_print!("[ps] NtSetInformationProcess classe {} (sem suporte)", class);
             Ok(STATUS_INVALID_INFO_CLASS)
@@ -376,4 +445,28 @@ fn release_exception_port(process: u64) {
 
 pub fn init() {
     crate::ntos::ps::process::register_process_exit_routine(release_exception_port);
+}
+
+/// PspSetProcessPriorityClass(Process, PriorityClass, PreviousMode): grava
+/// EPROCESS.PriorityClass. Devolve o NTSTATUS.
+fn set_priority_class(process: u64, class: u8, mode: u8) -> u32 {
+    if class > PRIORITY_CLASS_ABOVE_NORMAL {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: EPROCESS retido pelo handle que o nomeou.
+    let object = unsafe { Eprocess::at(process) };
+    if class == PRIORITY_CLASS_REALTIME && object.priority_class.get() != class && !crate::ntos::se::privilege::single_privilege_check(INCREASE_BASE_PRIORITY_PRIVILEGE, mode as u32) {
+        return STATUS_PRIVILEGE_NOT_HELD;
+    }
+    let mut class = class;
+    let job = object.job.get();
+    if job != 0 {
+        // SAFETY: o EJOB do processo, retido pela participação dele.
+        let job = unsafe { crate::ntos::inc::types::Ejob::at(job) };
+        if job.effective_limit_flags.get() & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 {
+            class = job.effective_priority_class.get();
+        }
+    }
+    object.priority_class.set(class);
+    0
 }

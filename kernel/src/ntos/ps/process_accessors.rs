@@ -250,11 +250,12 @@ const MEMORY_PRIORITY_FOREGROUND: u8 = 2;
 
 /// PsSetProcessPriorityByClass(Process, PriorityMode): o
 /// PspComputeQuantumAndPriority — a prioridade base vem da PspPriorityTable
-/// pela classe do processo e vai para KPROCESS.BasePriority; fora do modo
-/// Spinning, a prioridade de memória (EPROCESS.Vm, MMSUPPORT_FLAGS) fica em
-/// 2 no primeiro plano e 0 no fundo, como o MmSetMemoryPriorityProcess. O
-/// OpenNT não tem quantum por processo nem a fila de pedidos de primeiro
-/// plano do NT: o efeito é o da prioridade.
+/// pela classe do processo e vai para o KeSetPriorityAndQuantumProcess (a
+/// KPROCESS.BasePriority e a base de cada thread, deslocada pela mesma
+/// diferença); fora do modo Spinning, a prioridade de memória (EPROCESS.Vm,
+/// MMSUPPORT_FLAGS) fica em 2 no primeiro plano e 0 no fundo, como o
+/// MmSetMemoryPriorityProcess. O OpenNT não tem quantum por processo nem a
+/// fila de pedidos de primeiro plano do NT: o efeito é o da prioridade.
 pub fn set_priority_by_class(process: u64, mode: u32) {
     let object = eprocess(process);
     if mode != PRIORITY_SPINNING {
@@ -262,7 +263,11 @@ pub fn set_priority_by_class(process: u64, mode: u32) {
         object.vm.instance.flags.memory_priority.set(memory);
     }
     let class = object.priority_class.get() as usize;
-    object.pcb.base_priority.set(PRIORITY_TABLE.get(class).copied().unwrap_or(PRIORITY_TABLE[2]));
+    let base = PRIORITY_TABLE.get(class).copied().unwrap_or(PRIORITY_TABLE[2]);
+    let threads = crate::ntos::ps::process::threads_of_process(process);
+    if crate::ntos::ke::thread_priority::set_process_base_priority(process, base as i32, &threads).is_err() {
+        object.pcb.base_priority.set(base);
+    }
 }
 
 // ---- Contadores de disco do processo (ps-disk-counters) -----------------------------
