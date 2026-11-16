@@ -91,7 +91,9 @@ pub fn build() {
     }
     // `--trace-driver-api` rastreia as APIs que os drivers da árvore chamam.
     crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    let processed = pnp::tree::process();
+    // O processamento roda numa thread de sistema, como as ações do PnP
+    // manager do NT (`tree::process_on_system_thread`).
+    let processed = pnp::tree::process_on_system_thread();
     crate::ntos::init::exports::set_api_trace(false);
     if let Err(error) = processed {
         debug_print!("[pnp] arvore do PnP: {}", error);

@@ -120,8 +120,9 @@ pub fn init() {
     // pilhas pedidas: `--storage=real` (a pilha de armazenamento do Windows),
     // `--storage=nvme` (o storport.sys com o stornvme.sys no controlador
     // NVMe) e `--display=basic` (o BasicDisplay.sys real no adaptador VGA,
-    // sobre o dxgkrnl.sys real).
-    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::storage::nvme_stack::enabled() || crate::drivers::video::display_stack::enabled() {
+    // sobre o dxgkrnl.sys real); com `--usb`, a controladora xHCI recebe o
+    // usbxhci.sys.
+    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::storage::nvme_stack::enabled() || crate::drivers::video::display_stack::enabled() || crate::drivers::bus::usb_stack::enabled() {
         // `--start-driver` liga o Code Integrity: como no NT, ele já valida
         // os drivers que a árvore carrega (acpi.sys, pci.sys, i8042prt.sys...).
         if !crate::ntos::init::boot_config::start_driver().is_empty() {
@@ -131,7 +132,8 @@ pub fn init() {
         }
         crate::drivers::bus::device_tree::build();
     }
-    // `--usb`: a pilha USB 3 e HID real sobe pelo PnP na controladora xHCI.
+    // `--usb`: a pilha USB 3 e HID real, que a árvore instalou na
+    // controladora xHCI, enumera as portas; os marcos saem dela.
     if crate::drivers::bus::usb_stack::enabled() {
         crate::drivers::bus::usb_stack::initialize();
     }

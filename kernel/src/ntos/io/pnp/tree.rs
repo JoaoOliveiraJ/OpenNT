@@ -153,6 +153,39 @@ fn drain() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// O resultado do processamento feito pela thread de sistema.
+static SYSTEM_THREAD_RESULT: SpinLock<Option<Result<(), KernelError>>> = SpinLock::new(None);
+
+/// A thread do processamento do boot: `process` e o sinal para quem espera.
+extern "win64" fn process_thread(done: u64) {
+    let result = process();
+    *SYSTEM_THREAD_RESULT.lock() = Some(result);
+    crate::ntos::ke::dispatcher::set_event(done);
+}
+
+/// O processamento da árvore do boot como as ações do PnP manager do NT,
+/// que rodam numa worker thread do sistema: os AddDevice e os START_DEVICE
+/// (que esperam o hardware e os work items dos drivers) rodam numa thread de
+/// sistema, e quem chama espera o fim dela girando as interrupções, os DPCs,
+/// os work items e o escalonador. Um work item rodado nessa espera não fica
+/// empilhado sobre um START que segura as travas do driver (o KMDF guarda a
+/// máquina de estados PnP do dispositivo durante o START inteiro). Sem
+/// thread de sistema, o processamento roda em quem chama.
+pub fn process_on_system_thread() -> Result<(), KernelError> {
+    // O evento vive enquanto a thread pode tocá-lo: não é liberado.
+    let done = crate::ntos::mm::guest_memory::alloc_bytes(crate::ntos::inc::types::Kevent::SIZE);
+    if done == 0 || crate::ntos::ps::process::get_system_process() == 0 {
+        return process();
+    }
+    crate::ntos::ke::dispatcher::initialize_event(done, 0, false);
+    let entry: extern "win64" fn(u64) = process_thread;
+    let started = crate::ntos::mm::kernel_address::image_address(entry as usize as u64).ok().and_then(|start| crate::ntos::ps::kernel_threads::create_system_thread(0, start, done, 0x1F_FFFF, 0, None).ok());
+    let Some(handle) = started else { return process() };
+    let _ = object_manager::close(handle as u32);
+    crate::ntos::ke::dispatcher::wait_for_single_object(done, 0, 0, false);
+    SYSTEM_THREAD_RESULT.lock().take().unwrap_or(Ok(()))
+}
+
 /// Põe o PnpDeviceActionWorker na DelayedWorkQueue, se ele ainda não está
 /// na fila nem drenando os pedidos.
 fn request_worker() {

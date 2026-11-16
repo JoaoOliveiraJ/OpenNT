@@ -107,22 +107,15 @@ fn log_tree() {
 /// espera pelos marcos, com folga).
 const THREAD_TIMEOUT_MS: i64 = SETTLE_MS as i64 + 120_000;
 
-/// Sobe a pilha e confere os marcos. Só com `--usb`.
+/// Espera a enumeração das portas e confere os marcos. Só com `--usb`,
+/// depois da árvore de dispositivos (`device_tree::build`), que instalou e
+/// iniciou a controladora.
 ///
-/// Como as ações do PnP manager do NT, que rodam numa worker thread do
-/// sistema, o processamento da árvore (os AddDevice e os START_DEVICE, que
-/// esperam o hardware e os work items dos drivers) roda numa thread de
-/// sistema; o contexto de boot espera o fim dela, girando as interrupções,
-/// os DPCs, os work items e o escalonador. Um work item que o contexto de
-/// boot roda durante essa espera não fica empilhado sobre um START que
-/// segura as travas do framework do driver (o KMDF guarda a máquina de
-/// estados PnP do dispositivo durante o START inteiro).
+/// A espera roda numa thread de sistema, como as ações do PnP manager do
+/// NT (as reenumerações que o hub pede); o contexto de boot espera o fim
+/// dela, girando as interrupções, os DPCs, os work items e o escalonador.
 pub fn initialize() {
     debug_print!("[usb] pilha USB 3 e HID real pelo PnP");
-    if let Err(error) = crate::drivers::bus::device_tree::prepare() {
-        debug_print!("[usb] raiz do PnP: {}", error);
-        return;
-    }
     let done = guest::alloc_bytes(crate::ntos::inc::types::Kevent::SIZE);
     crate::ntos::ke::dispatcher::initialize_event(done, 0, false);
     let entry: extern "win64" fn(u64) = stack_thread;
@@ -151,12 +144,9 @@ extern "win64" fn stack_thread(done: u64) {
     crate::ntos::ke::dispatcher::set_event(done);
 }
 
-/// A árvore do PnP, a espera pela enumeração das portas e os marcos.
+/// A espera pela enumeração das portas e os marcos.
 fn run() {
     crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    if let Err(error) = pnp::tree::process() {
-        debug_print!("[usb] arvore do PnP: {}", error);
-    }
     let (mut hub_ok, mut hid_ok) = (false, false);
     let mut waited = 0;
     while waited < SETTLE_MS && !(hub_ok && hid_ok) {
